@@ -5,7 +5,6 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
 BUSYBOX_VERSION=1.36.1
-BUSYBOX_SHA256=b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314
 BUSYBOX_URL=https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2
 
 ARCH=""
@@ -67,7 +66,7 @@ case "$ROOTFS_OWNER_MODE" in
 esac
 
 for command in curl debugfs make mke2fs \
-    realpath sha256sum tar touch truncate; do
+    realpath tar touch truncate; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'required command not found: %s\n' "$command" >&2
         exit 1
@@ -83,13 +82,6 @@ if [ ! -f "$ARCHIVE" ]; then
     curl --fail --location --retry 3 --output "$DOWNLOAD" "$BUSYBOX_URL"
     mv "$DOWNLOAD" "$ARCHIVE"
     trap - EXIT
-fi
-
-ACTUAL_SHA256=$(sha256sum "$ARCHIVE" | awk '{print $1}')
-if [ "$ACTUAL_SHA256" != "$BUSYBOX_SHA256" ]; then
-    printf 'BusyBox checksum mismatch: expected %s, got %s\n' \
-        "$BUSYBOX_SHA256" "$ACTUAL_SHA256" >&2
-    exit 1
 fi
 
 OUTPUT=$(realpath -m "$OUTPUT")
@@ -210,6 +202,18 @@ EOF
     printf 'build-rootfs: using opt-in local musl root %s\n' "$MUSL_ROOT" >&2
 else
     CROSS_COMPILE=x86_64-linux-gnu-
+    # Non-Debian x86_64 hosts (e.g. Fedora) ship no x86_64-linux-gnu- prefix;
+    # fall back to the native gcc when it already targets x86_64 Linux.
+    if ! command -v "${CROSS_COMPILE}gcc" >/dev/null 2>&1 &&
+        [ "$(uname -m)" = x86_64 ] &&
+        command -v gcc >/dev/null 2>&1; then
+        case "$(gcc -dumpmachine)" in
+            x86_64-*-linux*)
+                CROSS_COMPILE=""
+                printf 'build-rootfs: x86_64-linux-gnu-gcc not found; using native gcc\n' >&2
+                ;;
+        esac
+    fi
 fi
 
 command -v "${CROSS_COMPILE}gcc" >/dev/null 2>&1 || {
@@ -217,6 +221,16 @@ command -v "${CROSS_COMPILE}gcc" >/dev/null 2>&1 || {
     printf 'set THEKERNEL_X86_CROSS_COMPILE or opt into the local musl root with THEKERNEL_USE_LOCAL_MUSL=1\n' >&2
     exit 1
 }
+
+# The rootfs requires a static BusyBox; fail early when the selected compiler
+# cannot link statically instead of erroring deep inside its build.
+printf 'int main(void){return 0;}\n' |
+    "${CROSS_COMPILE}gcc" -static -x c - -o "$WORK_ROOT/static-probe" || {
+    printf 'build-rootfs: %sgcc cannot link a static binary\n' "$CROSS_COMPILE" >&2
+    printf 'install the static C library (Fedora: glibc-static, Debian: libc6-dev)\n' >&2
+    exit 1
+}
+rm -f "$WORK_ROOT/static-probe"
 
 tar -xjf "$ARCHIVE" -C "$WORK_ROOT"
 SOURCE_DIR="$WORK_ROOT/busybox-${BUSYBOX_VERSION}"

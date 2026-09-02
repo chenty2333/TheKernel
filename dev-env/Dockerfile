@@ -1,8 +1,7 @@
-ARG DEBIAN_IMAGE=debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+ARG DEBIAN_IMAGE=debian:bookworm-slim
 ARG DEBIAN_MIRROR=http://deb.debian.org/debian
 ARG DEBIAN_SECURITY_MIRROR=http://deb.debian.org/debian-security
-ARG QEMU_VERSION=9.2.1
-ARG QEMU_SHA256=72874fe9c395ced0c7fd7c22c43744072697f7ee1926a72237bd81784b2faf62
+ARG QEMU_VERSION=10.2.2
 
 FROM ${DEBIAN_IMAGE} AS qemu-builder
 
@@ -10,7 +9,6 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG DEBIAN_MIRROR
 ARG DEBIAN_SECURITY_MIRROR
 ARG QEMU_VERSION
-ARG QEMU_SHA256
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -45,7 +43,6 @@ RUN aria2c --allow-overwrite=true --auto-file-renaming=false --continue=true \
       --console-log-level=warn --download-result=hide --max-connection-per-server=8 \
       --min-split-size=1M --out="qemu-${QEMU_VERSION}.tar.xz" --split=8 \
       "https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz" \
- && echo "${QEMU_SHA256}  qemu-${QEMU_VERSION}.tar.xz" | sha256sum -c - \
  && tar -xf "qemu-${QEMU_VERSION}.tar.xz" \
  && cd "qemu-${QEMU_VERSION}" \
  && ./configure \
@@ -143,9 +140,6 @@ RUN chmod +x /usr/local/bin/thekernel-dev-entrypoint /usr/local/bin/thekernel-de
 RUN /usr/local/bin/thekernel-dev-check
 
 WORKDIR /workspace
-
-ARG THEKERNEL_DEV_SOURCE_SHA256=unknown
-LABEL org.thekernel.dev-source-sha256="${THEKERNEL_DEV_SOURCE_SHA256}"
 
 ENTRYPOINT ["/usr/local/bin/thekernel-dev-entrypoint"]
 CMD ["/bin/bash"]

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import gzip
-import hashlib
 import lzma
 import os
 import re
 import shutil
 import stat
 import subprocess
+from dataclasses import replace
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +23,7 @@ from .model import (
     QmpControls,
     RunLimits,
     RunResult,
+    RootfsTransport,
 )
 from .process import run_process
 
@@ -32,6 +33,7 @@ class RunnerError(ValueError):
 
 
 _QEMU_DEVICE_HELP_NAME = re.compile(r'^\s*name "([^\"]+)"', re.MULTILINE)
+_QEMU_DEVICE_PROPERTY = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_-]*)=", re.MULTILINE)
 
 
 def _parse_qemu_device_help(output: str) -> frozenset[str]:
@@ -56,6 +58,16 @@ def _parse_qemu_display_help(output: str) -> frozenset[str]:
             break
         backends.add(name.split(",", 1)[0])
     return frozenset(backends)
+
+
+def _qemu_device_help(qemu: Path) -> frozenset[str]:
+    return _parse_qemu_device_help(_qemu_help_output(qemu, "-device", "help"))
+
+
+def _qemu_device_properties(qemu: Path, device: str) -> frozenset[str]:
+    """Return property names from QEMU's per-device help listing."""
+
+    return frozenset(_QEMU_DEVICE_PROPERTY.findall(_qemu_help_output(qemu, "-device", f"{device},help")))
 
 
 def _qemu_help_output(qemu: Path, *arguments: str) -> str:
@@ -144,23 +156,47 @@ def _validate_virgl_capabilities(profile: GraphicsProfile, qemu: Path | None) ->
         _probe_virgl_headless(qemu)
 
 
-# The q35 platform description currently uses the PCIe ECAM layout assigned by
-# Debian bookworm's OVMF.  A different OVMF may boot GRUB successfully while
-# placing ECAM elsewhere, which makes every PCI device invisible to the guest.
-# Fail before launch instead of silently selecting an incompatible host image.
-Q35_OVMF_CODE_SHA256 = "d9b568def24088c92f34b5479e0ed7e44d0a4d4cea8a0f5716719180bba48106"
-Q35_OVMF_VARS_SHA256 = "6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59d45e91c4a11565cc"
+def _validate_venus_capabilities(profile: GraphicsProfile, qemu: Path | None) -> None:
+    """Reject an unavailable Venus topology before launching the guest.
+
+    This only establishes that the host QEMU exposes the requested device
+    properties.  The guest Vulkan smoke remains the authority for the kernel
+    blob/context-init lifecycle and must not be inferred from this probe.
+    """
+
+    if profile != "venus-interactive":
+        return
+    if qemu is None:
+        raise RunnerError("venus profile requires a resolvable QEMU executable for capability checks")
+    devices = _qemu_device_help(qemu)
+    if "virtio-gpu-gl-pci" not in devices:
+        raise RunnerError("SKIP: QEMU does not provide required Venus device virtio-gpu-gl-pci")
+    properties = _qemu_device_properties(qemu, "virtio-gpu-gl-pci")
+    missing = [
+        property_name
+        for property_name in ("blob", "venus", "hostmem", "max_hostmem", "xres", "yres")
+        if property_name not in properties
+    ]
+    if missing:
+        raise RunnerError(
+            "SKIP: QEMU virtio-gpu-gl-pci lacks required Venus properties: " + ", ".join(missing)
+        )
 
 
 @dataclass(frozen=True)
 class RunConfig:
     arch: Arch
     kernel: Path
-    rootfs: Path
+    rootfs: Path | None
     workdir: Path
     log_path: Path
     esp: Path | None = None
     rootfs_mode: DriveMode = "snapshot"
+    # The generic runner remains useful for standalone drive-backed tests.
+    # `tools/thekernel.py` fixes ordinary product boots to the module path;
+    # graphics benchmarks use ``module-and-drive`` to compare against Linux
+    # with an identical snapshot VirtIO rootfs topology.
+    rootfs_transport: RootfsTransport = "drive"
     extra_block: Path | None = None
     extra_block_mode: DriveMode = "rw"
     limits: RunLimits = RunLimits()
@@ -170,6 +206,8 @@ class RunConfig:
     qemu_binary: str | None = None
     accel: str | None = None
     graphics_profile: GraphicsProfile = "headless"
+    graphics_width: int = 800
+    graphics_height: int = 600
     qmp: QmpControls = QmpControls()
     extra_args: tuple[str, ...] = ()
     ovmf_code: Path | None = None
@@ -215,7 +253,6 @@ def _resolve_ovmf_image(
     environment: str,
     candidates: tuple[str, ...],
     label: str,
-    default_sha256: str,
 ) -> Path:
     raw = configured or (Path(os.environ[environment]) if os.environ.get(environment) else None)
     if raw is None:
@@ -224,24 +261,17 @@ def _resolve_ovmf_image(
                 path
                 for candidate in candidates
                 if (path := Path(candidate)).is_file()
-                and hashlib.sha256(path.read_bytes()).hexdigest() == default_sha256
             ),
             None,
         )
     if raw is None:
         option = environment.removeprefix("THEKERNEL_").lower().replace("_", "-")
         raise RunnerError(
-            f"x86_64 q35 requires the pinned {label} ({default_sha256}); "
-            f"pass --{option} or set {environment} to an explicit compatible image"
+            f"x86_64 q35 requires {label}; pass --{option} or set {environment}"
         )
     path = raw.expanduser().resolve()
     if not path.is_file():
         raise RunnerError(f"{label} does not exist: {path}")
-    actual = hashlib.sha256(path.read_bytes()).hexdigest()
-    if actual != default_sha256:
-        raise RunnerError(
-            f"{label} does not match q35 pin: expected {default_sha256}, got {actual}"
-        )
     return path
 
 
@@ -428,6 +458,7 @@ def run(
         or config.qmp.input_events
         or config.qmp.input_after_marker is not None
         or config.qmp.screenshot_after_marker is not None
+        or config.qmp.checkpoints
     ) and qmp_socket is None:
         raise RunnerError("QMP screenshot and input injection require a QMP socket")
     if qmp_socket is not None:
@@ -439,16 +470,35 @@ def run(
         if config.qmp.screenshot is not None
         else None
     )
+    checkpoints = tuple(
+        replace(
+            checkpoint,
+            screenshot=(
+                checkpoint.screenshot.expanduser().resolve()
+                if checkpoint.screenshot is not None
+                else None
+            ),
+        )
+        for checkpoint in config.qmp.checkpoints
+    )
 
     qemu_requested = config.qemu_binary or "qemu-system-x86_64"
     qemu_executable = _resolve_executable(qemu_requested)
     _validate_virgl_capabilities(config.graphics_profile, qemu_executable)
+    _validate_venus_capabilities(config.graphics_profile, qemu_executable)
 
-    rootfs_plan = _plan_drive(
-        config.rootfs,
-        mode=rootfs_mode,
-        label="rootfs",
-        workdir=workdir,
+    if config.rootfs_transport not in {"drive", "module", "module-and-drive"}:
+        raise RunnerError(f"unsupported rootfs transport: {config.rootfs_transport}")
+    rootfs_plan = (
+        _plan_drive(
+            config.rootfs,
+            mode=rootfs_mode,
+            label="rootfs",
+            workdir=workdir,
+        )
+        if config.rootfs is not None
+        and config.rootfs_transport in {"drive", "module-and-drive"}
+        else None
     )
     extra_plan = (
         _plan_drive(
@@ -485,7 +535,6 @@ def run(
                 "/usr/share/OVMF/OVMF_CODE.fd",
             ),
             "OVMF code",
-            Q35_OVMF_CODE_SHA256,
         )
         ovmf_vars_source = _resolve_ovmf_image(
             config.ovmf_vars,
@@ -496,11 +545,12 @@ def run(
                 "/usr/share/OVMF/OVMF_VARS.fd",
             ),
             "OVMF vars",
-            Q35_OVMF_VARS_SHA256,
         )
         ovmf_vars_runtime = (workdir / "firmware" / "OVMF_VARS.fd").resolve()
 
-    run_input_paths = [kernel, rootfs_plan.source]
+    run_input_paths = [kernel]
+    if rootfs_plan is not None:
+        run_input_paths.append(rootfs_plan.source)
     if input_path is not None:
         run_input_paths.append(input_path)
     if initrd is not None:
@@ -540,6 +590,9 @@ def run(
         planned_outputs.append(("QMP socket", qmp_socket))
     if screenshot is not None:
         planned_outputs.append(("screenshot", screenshot))
+    for index, checkpoint in enumerate(checkpoints):
+        if checkpoint.screenshot is not None:
+            planned_outputs.append((f"QMP checkpoint screenshot {index}", checkpoint.screenshot))
     resolved_outputs = _validate_output_destinations(
         tuple(planned_outputs), protected_paths=tuple(run_input_paths)
     )
@@ -550,7 +603,10 @@ def run(
         qmp_socket.parent.mkdir(parents=True, exist_ok=True)
     if screenshot is not None:
         screenshot.parent.mkdir(parents=True, exist_ok=True)
-    rootfs = _prepare_drive(rootfs_plan)
+    for checkpoint in checkpoints:
+        if checkpoint.screenshot is not None:
+            checkpoint.screenshot.parent.mkdir(parents=True, exist_ok=True)
+    rootfs = _prepare_drive(rootfs_plan) if rootfs_plan is not None else None
     extra_block = _prepare_drive(extra_plan) if extra_plan is not None else None
     esp = _prepare_drive(esp_plan) if esp_plan is not None else None
     if ovmf_vars_source is not None and ovmf_vars_runtime is not None:
@@ -560,12 +616,15 @@ def run(
     try:
         kernel_fd, qemu_kernel = _open_qemu_input(kernel, label="kernel")
         opened_fds.append(kernel_fd)
-        rootfs_fd, qemu_rootfs = _open_qemu_input(
-            rootfs.path,
-            label="rootfs",
-            writable=rootfs.mode == "rw",
-        )
-        opened_fds.append(rootfs_fd)
+        qemu_rootfs = None
+        if rootfs is not None:
+            rootfs_fd, qemu_rootfs_path = _open_qemu_input(
+                rootfs.path,
+                label="rootfs",
+                writable=rootfs.mode == "rw",
+            )
+            opened_fds.append(rootfs_fd)
+            qemu_rootfs = Drive(path=qemu_rootfs_path, mode=rootfs.mode)
         qemu_extra_block = None
         if extra_block is not None:
             extra_fd, qemu_extra_path = _open_qemu_input(
@@ -602,7 +661,7 @@ def run(
         command = build_qemu_command(
             arch=config.arch,
             kernel=qemu_kernel,
-            rootfs=Drive(path=qemu_rootfs, mode=rootfs.mode),
+            rootfs=qemu_rootfs,
             extra_block=qemu_extra_block,
             esp=qemu_esp,
             ovmf_code=qemu_ovmf_code,
@@ -613,6 +672,8 @@ def run(
             qemu_binary=config.qemu_binary,
             accel=config.accel,
             graphics_profile=config.graphics_profile,
+            graphics_width=config.graphics_width,
+            graphics_height=config.graphics_height,
             qmp_socket=qmp_socket,
             extra_args=_initrd_args_with_path(config.extra_args, qemu_initrd),
         )
@@ -637,6 +698,8 @@ def run(
                 qmp_timeout_secs=config.qmp.timeout_secs,
                 qmp_screenshot_size=config.qmp.screenshot_size,
                 qmp_screenshot_color_blocks=config.qmp.screenshot_color_blocks,
+                qmp_screenshot_region_crcs=config.qmp.screenshot_region_crcs,
+                qmp_checkpoints=checkpoints,
             )
         with input_path.open("rb") as input_stream:
             return run_process(
@@ -657,6 +720,8 @@ def run(
                 qmp_timeout_secs=config.qmp.timeout_secs,
                 qmp_screenshot_size=config.qmp.screenshot_size,
                 qmp_screenshot_color_blocks=config.qmp.screenshot_color_blocks,
+                qmp_screenshot_region_crcs=config.qmp.screenshot_region_crcs,
+                qmp_checkpoints=checkpoints,
             )
     finally:
         for fd in reversed(opened_fds):

@@ -9,11 +9,18 @@ from typing import Literal, Mapping
 
 Arch = Literal["x86_64"]
 DriveMode = Literal["snapshot", "readonly", "rw"]
+# ``module-and-drive`` is deliberately a single topology selection rather
+# than an ``extra_block`` convention.  Graphics benchmark comparisons boot
+# TheKernel from its Multiboot module while exposing the *same* rootfs as the
+# Linux oracle's snapshot-backed ``/dev/vda``.  This keeps Q35 PCI discovery
+# and VirtIO device ordering comparable without changing normal product boot.
+RootfsTransport = Literal["drive", "module", "module-and-drive"]
 GraphicsProfile = Literal[
     "headless",
     "interactive",
     "virgl-headless",
     "virgl-interactive",
+    "venus-interactive",
 ]
 
 INTENTIONAL_STOP_RETURN_CODE = 75
@@ -63,6 +70,8 @@ class QmpControls:
     timeout_secs: float = 5.0
     screenshot_size: tuple[int, int] | None = None
     screenshot_color_blocks: tuple["QmpColorBlock", ...] = ()
+    screenshot_region_crcs: tuple["QmpRegionCrc", ...] = ()
+    checkpoints: tuple["QmpCheckpoint", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -74,6 +83,59 @@ class QmpColorBlock:
     width: int
     height: int
     rgb: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class QmpRegionCrc:
+    """CRC-32 for a rectangular RGB region in a QMP PPM screendump."""
+
+    x: int
+    y: int
+    width: int
+    height: int
+    crc32: int
+
+
+@dataclass(frozen=True)
+class QmpCheckpoint:
+    """One marker-gated QMP input and optional pixel checkpoint.
+
+    Checkpoints are executed in declaration order.  This lets a guest client
+    repaint and acknowledge pointer, keyboard, and absolute-tablet input
+    independently instead of treating a mixed input burst as one event.
+    """
+
+    input_after_marker: str
+    # Each entry is one QMP input-send-event batch.  Keeping the outer tuple
+    # aligns checkpoints with QmpControls and prevents a mapping from being
+    # accidentally iterated as its "type" and "data" keys.
+    input_events: tuple[tuple[Mapping[str, object], ...], ...] = ()
+    screenshot: Path | None = None
+    screenshot_after_marker: str | None = None
+    screenshot_size: tuple[int, int] | None = None
+    screenshot_color_blocks: tuple[QmpColorBlock, ...] = ()
+    screenshot_region_crcs: tuple[QmpRegionCrc, ...] = ()
+    pci_hotplug: tuple["QmpPciHotplug", ...] = ()
+    # When set, measure from immediately before QMP input submission until
+    # the guest reports that the input-driven frame became visible.  The
+    # controller appends the host-monotonic sample to the captured log.
+    latency_after_marker: str | None = None
+    latency_index: int | None = None
+
+
+@dataclass(frozen=True)
+class QmpPciHotplug:
+    """One QMP PCI device_add/device_del action at a checkpoint.
+
+    Only the three Q35 VirtIO input devices are accepted.  Keeping the
+    topology typed prevents a graphics smoke run from accidentally exercising
+    an unowned block, network, or MMIO removal path.
+    """
+
+    action: Literal["add", "del"]
+    device_id: str
+    driver: Literal["virtio-keyboard-pci", "virtio-mouse-pci", "virtio-tablet-pci"] | None = None
+    bus: Literal["rp-input-kbd", "rp-input-mouse", "rp-input-tablet"] | None = None
 
 
 @dataclass(frozen=True)

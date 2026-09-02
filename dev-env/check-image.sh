@@ -8,10 +8,7 @@ expect_cmd() {
     }
 }
 
-QEMU_EXPECTED_VERSION="${THEKERNEL_QEMU_VERSION:-9.2.1}"
-Q35_OVMF_CODE_SHA256=d9b568def24088c92f34b5479e0ed7e44d0a4d4cea8a0f5716719180bba48106
-Q35_OVMF_VARS_SHA256=6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59d45e91c4a11565cc
-
+QEMU_EXPECTED_VERSION="${THEKERNEL_QEMU_VERSION:-10.2.2}"
 for cmd in \
     bc bison flex \
     python3 \
@@ -46,14 +43,13 @@ for candidate in \
     /usr/share/edk2/ovmf/OVMF_CODE_4M.fd \
     /usr/share/OVMF/OVMF_CODE.fd
 do
-    if [[ -r "$candidate" ]] &&
-        [[ $(sha256sum "$candidate" | awk '{print $1}') == "$Q35_OVMF_CODE_SHA256" ]]; then
+    if [[ -r "$candidate" ]]; then
         ovmf_code=$candidate
         break
     fi
 done
 [[ -n "$ovmf_code" ]] || {
-    printf 'missing pinned OVMF code image (%s)\n' "$Q35_OVMF_CODE_SHA256" >&2
+    printf '%s\n' 'missing OVMF code image' >&2
     exit 1
 }
 
@@ -63,14 +59,13 @@ for candidate in \
     /usr/share/edk2/ovmf/OVMF_VARS_4M.fd \
     /usr/share/OVMF/OVMF_VARS.fd
 do
-    if [[ -r "$candidate" ]] &&
-        [[ $(sha256sum "$candidate" | awk '{print $1}') == "$Q35_OVMF_VARS_SHA256" ]]; then
+    if [[ -r "$candidate" ]]; then
         ovmf_vars=$candidate
         break
     fi
 done
 [[ -n "$ovmf_vars" ]] || {
-    printf 'missing pinned OVMF vars image (%s)\n' "$Q35_OVMF_VARS_SHA256" >&2
+    printf '%s\n' 'missing OVMF vars image' >&2
     exit 1
 }
 

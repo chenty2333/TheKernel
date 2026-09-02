@@ -8,9 +8,9 @@ UEFI/OVMF.
 ## Checkout and development environment
 
 Create the three-checkout workspace from a single TheKernel clone. The
-bootstrap command reads the immutable repository/ref/path records in
-[`config/source-combination.toml`](config/source-combination.toml), fetches
-each listed commit, and checks out that exact commit detached:
+bootstrap command reads the repository/ref/path configuration in
+[`config/source-combination.toml`](config/source-combination.toml) and checks
+out each repository's `main` branch:
 
 ```bash
 mkdir thekernel-workspace
@@ -21,19 +21,20 @@ python3 scripts/ci/bootstrap_sources.py
 
 The resulting workspace is `thekernel-workspace/{TheKernel,thekernel-ax,thekernel-linux-abi}`.
 On later runs, the bootstrap tool only verifies existing sibling checkouts: it
-never overwrites them, and it refuses a dirty checkout or a different commit.
-Update or remove an existing sibling explicitly before rerunning it. CI uses
-the same source configuration.
+never overwrites them, and it refuses a dirty checkout or any branch other than
+`main`. Update an existing sibling explicitly before rerunning it. CI uses the
+same source configuration.
 
-Use the same immutable development image as CI:
-
-```bash
-export THEKERNEL_DEV_IMAGE=ghcr.io/chenty2333/thekernel-dev@sha256:279c82be5d0a98814293912e3c8f87ccbcc1471a1781690768c1771cefd78fe7
-./scripts/dev-shell.sh -- bash
-```
+CI requires the `THEKERNEL_DEV_IMAGE` repository variable to name an immutable
+image under the project's `ghcr.io` namespace. A host-side prerequisite job
+rejects mutable references before either container job is created, and
+`dev-env/check-image.sh` then validates the expected tools and versions inside
+that image. Publishing the image from the checked-in `dev-env/Dockerfile` and
+updating the repository variable remain explicit maintainer operations.
 
 Alternatively, build the local image from the checked-in `dev-env/Dockerfile`
-and enter it (the script rebuilds when its Dockerfile inputs change):
+and enter it. The local image is built on first use when it is missing; pass
+`--build` to force a rebuild:
 
 ```bash
 export THEKERNEL_DEV_IMAGE=thekernel-dev:local
@@ -70,10 +71,25 @@ cargo install --locked --version 0.2.1 axconfig-gen
 ./tools/thekernel.py lint --smp 4
 ```
 
-Its commands write below `${THEKERNEL_STATE_DIR:-.state}`. With defaults, the
-system kernel and ESP are under
-`.state/out/x86_64/q35-uefi/system/smp4-mem1g/`, and the root filesystem is
-`.state/out/rootfs/x86/rootfs-x86.img`.
+For the ordinary interactive shell workflow, the root Makefile supplies a
+small, resource-bounded wrapper around that same entry point:
+
+```bash
+make run
+make run-existing  # reuse already-built kernel, ESP, and rootfs artifacts
+make build         # build without booting
+make lint          # run Clippy for the product kernel configuration
+make test          # run the host verification suite
+make clean         # remove generated run, output, and cache directories
+make docker-clean  # remove the dev container volume and local image
+```
+
+Its commands write below `${THEKERNEL_STATE_DIR:-~/.cache/thekernel-targets}`.
+With defaults, the system kernel and ESP are under
+`~/.cache/thekernel-targets/out/x86_64/q35-uefi/system/smp4-mem1g/`, and the
+root filesystem is `~/.cache/thekernel-targets/out/rootfs/x86/rootfs-x86.img`. On non-Debian x86_64 hosts the rootfs
+build falls back to the native gcc and needs the static C library (Fedora:
+`glibc-static`, Debian: `libc6-dev`).
 
 ## Verification
 
@@ -84,7 +100,6 @@ uses the same linker settings as CI:
 cargo fmt \
   -p thekernel \
   -p thekernel-kernel \
-  -p axnet-ng \
   -p thekernel-linux-process-adapter \
   -p thekernel-readiness-adapter \
   -- --check
@@ -92,7 +107,7 @@ cargo test --locked -p thekernel-readiness-adapter
 cargo test --locked -p thekernel-linux-process-adapter
 env \
   CC=gcc CXX=g++ AR=ar AS=as OBJCOPY=objcopy OBJDUMP=objdump SIZE=size \
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-T$PWD/third_party/rust-patches/scope-local/percpu.x" \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-T$PWD/../thekernel-ax/crates/thekernel-scope-local/percpu.x" \
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$PWD/scripts/ci/host-test-linker.sh" \
   cargo test --locked --manifest-path kernel/Cargo.toml --tests \
     --features bpf,axtask/test,test-io-control \
@@ -114,10 +129,9 @@ The current bounded product claim is `q35-preview-v0`; it is not a claim of
 complete Linux ABI coverage, distribution/container compatibility, bare-metal
 support, or general performance superiority.
 
-CI may override its checked-in development-image digest with the
-`THEKERNEL_DEV_IMAGE` repository variable. When set, it must be an immutable
-`ghcr.io/...@sha256:...` system-image reference; Rust remains controlled solely
-by the root `rust-toolchain.toml` for product builds and CI.
+The `THEKERNEL_DEV_IMAGE` repository variable must be updated after publishing
+a rebuilt development image. Rust remains controlled solely by the root
+`rust-toolchain.toml` for product builds and CI.
 
 ## Repository layout
 

@@ -3,11 +3,48 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from tools.qemu_runner.command import build_qemu_command, drive_options
+from tools.qemu_runner.command import CommandError, build_qemu_command, drive_options
 from tools.qemu_runner.model import Drive
 
 
 class CommandTests(unittest.TestCase):
+    def test_accelerated_x86_commands_select_a_matching_cpu_model(self) -> None:
+        base = dict(
+            arch="x86_64",
+            kernel=Path("kernel"),
+            rootfs=Drive(Path("root.img"), "snapshot"),
+            direct_kernel=True,
+        )
+        for accel, cpu_model in (("kvm", "host"), ("tcg", "max")):
+            with self.subTest(accel=accel):
+                command = build_qemu_command(**base, accel=accel)
+                self.assertEqual(command.count("-accel"), 1)
+                self.assertEqual(command[command.index("-accel") + 1], accel)
+                self.assertEqual(command.count("-cpu"), 1)
+                self.assertEqual(command[command.index("-cpu") + 1], cpu_model)
+
+    def test_unaccelerated_x86_command_keeps_the_generic_cpu_default(self) -> None:
+        command = build_qemu_command(
+            arch="x86_64",
+            kernel=Path("kernel"),
+            rootfs=Drive(Path("root.img"), "snapshot"),
+            direct_kernel=True,
+        )
+        self.assertNotIn("-cpu", command)
+
+    def test_extra_args_cannot_override_accelerator_or_cpu_model(self) -> None:
+        base = dict(
+            arch="x86_64",
+            kernel=Path("kernel"),
+            rootfs=Drive(Path("root.img"), "snapshot"),
+            direct_kernel=True,
+            accel="kvm",
+        )
+        for argument in ("-cpu", "-cpu=max", "-accel", "-accel=tcg"):
+            with self.subTest(argument=argument):
+                with self.assertRaisesRegex(CommandError, "runner-owned"):
+                    build_qemu_command(**base, extra_args=(argument, "tcg"))
+
     def test_q35_graphics_profiles_are_explicit_and_virtio_only(self) -> None:
         base = dict(
             arch="x86_64", kernel=Path("kernel"), rootfs=Drive(Path("root.img"), "snapshot"),
@@ -43,6 +80,42 @@ class CommandTests(unittest.TestCase):
         self.assertIn("virtio-gpu-gl-pci,max_outputs=1,xres=800,yres=600", interactive_text)
         self.assertNotIn("blob=on", headless_text)
         self.assertNotIn("venus=on", headless_text)
+
+    def test_q35_venus_4g_places_ram_above_the_pci_hole(self) -> None:
+        command = build_qemu_command(
+            arch="x86_64",
+            kernel=Path("kernel-x86_64.elf"),
+            rootfs=Drive(Path("root.img"), "snapshot"),
+            direct_kernel=True,
+            memory="4G",
+            cpus=4,
+            graphics_profile="venus-interactive",
+        )
+        text = " ".join(command)
+        self.assertIn("-machine q35,max-ram-below-4g=2G", text)
+        self.assertIn("-m 4G", text)
+        self.assertIn(
+            "virtio-gpu-gl-pci,blob=on,venus=on,hostmem=1G,"
+            "max_hostmem=1G,max_outputs=1,xres=800,yres=600",
+            text,
+        )
+
+    def test_q35_venus_preserves_requested_scanout_geometry(self) -> None:
+        command = build_qemu_command(
+            arch="x86_64",
+            kernel=Path("kernel-x86_64.elf"),
+            rootfs=Drive(Path("root.img"), "snapshot"),
+            direct_kernel=True,
+            graphics_profile="venus-interactive",
+            graphics_width=3840,
+            graphics_height=2160,
+        )
+        self.assertIn(
+            "virtio-gpu-gl-pci,blob=on,venus=on,hostmem=1G,"
+            "max_hostmem=1G,max_outputs=1,xres=3840,yres=2160",
+            " ".join(command),
+        )
+
     def test_drive_modes_are_explicit(self) -> None:
         path = Path("/tmp/root,image.img")
         self.assertIn("aio=threads", drive_options(path, "rootfs", mode="rw"))

@@ -13,13 +13,31 @@ class CommandError(ValueError):
 
 VALID_DRIVE_MODES = frozenset({"snapshot", "readonly", "rw"})
 VALID_GRAPHICS_PROFILES = frozenset(
-    {"headless", "interactive", "virgl-headless", "virgl-interactive"}
+    {
+        "headless",
+        "interactive",
+        "virgl-headless",
+        "virgl-interactive",
+        "venus-interactive",
+    }
 )
+Q35_MACHINE = "q35,max-ram-below-4g=2G"
+_ACCEL_CPU_MODELS = {"kvm": "host", "tcg": "max"}
+_RUNNER_OWNED_OPTIONS = frozenset({"-accel", "-cpu"})
 
 
 def _escaped_path(path: Path) -> str:
     # QEMU keyval syntax escapes a literal comma as a doubled comma.
     return str(path).replace(",", ",,")
+
+
+def _validate_extra_args(extra_args: tuple[str, ...]) -> None:
+    """Keep runner-owned CPU and accelerator selections non-overridable."""
+
+    for argument in extra_args:
+        option = argument.split("=", 1)[0]
+        if option in _RUNNER_OWNED_OPTIONS:
+            raise CommandError(f"extra_args must not override runner-owned {option}")
 
 
 def drive_options(
@@ -62,7 +80,7 @@ def build_qemu_command(
     *,
     arch: Arch,
     kernel: Path,
-    rootfs: Drive,
+    rootfs: Drive | None,
     extra_block: Drive | None = None,
     esp: Drive | None = None,
     ovmf_code: Path | None = None,
@@ -73,6 +91,8 @@ def build_qemu_command(
     qemu_binary: str | None = None,
     accel: str | None = None,
     graphics_profile: GraphicsProfile = "headless",
+    graphics_width: int = 800,
+    graphics_height: int = 600,
     qmp_socket: Path | None = None,
     extra_args: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
@@ -84,17 +104,20 @@ def build_qemu_command(
         raise CommandError("memory size must not be empty")
     if graphics_profile not in VALID_GRAPHICS_PROFILES:
         raise CommandError(f"unsupported graphics profile: {graphics_profile}")
+    if graphics_width <= 0 or graphics_height <= 0:
+        raise CommandError("graphics dimensions must be positive")
     if qmp_socket is not None and (
         not str(qmp_socket) or any(char in str(qmp_socket) for char in ",\n\r")
     ):
         raise CommandError("QMP socket path must be QEMU-safe")
+    _validate_extra_args(extra_args)
     qemu_argv = [qemu_binary or "qemu-system-x86_64"]
     if arch == "x86_64":
         if direct_kernel:
             command = [
                 *qemu_argv,
                 "-machine",
-                "q35",
+                Q35_MACHINE,
                 "-kernel",
                 str(kernel),
                 "-m",
@@ -116,7 +139,7 @@ def build_qemu_command(
             command = [
                 *qemu_argv,
                 "-machine",
-                "q35",
+                Q35_MACHINE,
                 "-drive",
                 f"if=pflash,format=raw,readonly=on,aio=threads,file={_escaped_path(ovmf_code)}",
                 "-drive",
@@ -147,14 +170,30 @@ def build_qemu_command(
                 ),
                 "-device",
                 (
-                    "virtio-gpu-pci,max_outputs=1,xres=800,yres=600"
+                    f"virtio-gpu-pci,max_outputs=1,xres={graphics_width},yres={graphics_height}"
                     if graphics_profile in {"headless", "interactive"}
-                    else "virtio-gpu-gl-pci,max_outputs=1,xres=800,yres=600"
+                    # Keep this ABI string exact.  The Venus rootfs verifies
+                    # Vulkan capability itself and must never fall back to
+                    # the legacy Virgl device configuration.
+                    else (
+                        "virtio-gpu-gl-pci,blob=on,venus=on,hostmem=1G,"
+                        f"max_hostmem=1G,max_outputs=1,xres={graphics_width},yres={graphics_height}"
+                    )
+                    if graphics_profile == "venus-interactive"
+                    else f"virtio-gpu-gl-pci,max_outputs=1,xres={graphics_width},yres={graphics_height}"
                 ),
                 "-device",
-                "virtio-keyboard-pci",
+                "pcie-root-port,id=rp-input-kbd,slot=2,chassis=2",
                 "-device",
-                "virtio-tablet-pci",
+                "virtio-keyboard-pci,id=input-kbd,bus=rp-input-kbd",
+                "-device",
+                "pcie-root-port,id=rp-input-mouse,slot=3,chassis=3",
+                "-device",
+                "virtio-mouse-pci,id=input-mouse,bus=rp-input-mouse",
+                "-device",
+                "pcie-root-port,id=rp-input-tablet,slot=4,chassis=4",
+                "-device",
+                "virtio-tablet-pci,id=input-tablet,bus=rp-input-tablet",
                 "-object",
                 "rng-random,filename=/dev/urandom,id=rng0",
                 "-device",
@@ -163,9 +202,13 @@ def build_qemu_command(
         )
         if accel is not None:
             command.extend(["-accel", accel])
+            cpu_model = _ACCEL_CPU_MODELS.get(accel)
+            if cpu_model is not None:
+                command.extend(["-cpu", cpu_model])
         if qmp_socket is not None:
             command.extend(["-qmp", f"unix:{qmp_socket},server=on,wait=off"])
-        _append_pci_drive(command, rootfs, "rootfs")
+        if rootfs is not None:
+            _append_pci_drive(command, rootfs, "rootfs")
         command.extend(
             [
                 "-no-reboot",

@@ -62,7 +62,7 @@ case "$OWNER_MODE" in
     *) printf '%s\n' '--owner-mode must be root or preserve' >&2; exit 2 ;;
 esac
 
-for command in debugfs find grep mke2fs mkdir mktemp mv realpath sha256sum \
+for command in debugfs find grep mke2fs mkdir mktemp mv realpath \
     touch truncate wc; do
     command -v "$command" >/dev/null 2>&1 || {
         printf 'required command not found: %s\n' "$command" >&2
@@ -87,9 +87,7 @@ mkdir -p "$(dirname -- "$OUTPUT")"
 find "$STAGE" -xdev -exec \
     touch -h -d "@$SOURCE_DATE_EPOCH" -- {} +
 
-UUID_HEX=$(printf 'thekernel-test-rootfs-v1:%s' "$ARCH" \
-    | sha256sum | awk '{print $1}')
-FS_UUID=${UUID_HEX:0:8}-${UUID_HEX:8:4}-${UUID_HEX:12:4}-${UUID_HEX:16:4}-${UUID_HEX:20:12}
+FS_UUID=00000000-0000-4000-8000-000000000001
 TEMP_IMAGE=$(mktemp "$(dirname -- "$OUTPUT")/.rootfs-image.XXXXXX")
 TEMP_COMMANDS=$(mktemp "$(dirname -- "$OUTPUT")/.rootfs-times.XXXXXX")
 TEMP_DEBUGFS_LOG=$(mktemp "$(dirname -- "$OUTPUT")/.rootfs-debugfs.XXXXXX")

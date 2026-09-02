@@ -14,6 +14,7 @@ GRUB_MKSTANDALONE = shutil.which("grub2-mkstandalone") or shutil.which(
     "grub-mkstandalone"
 )
 REQUIRED_TOOLS = ("parted", "mkfs.fat", "mcopy", "mmd", "mdir")
+TEST_TMP_ROOT = Path.home() / ".cache" / "thekernel-test-tmp"
 
 
 def _missing_tools() -> list[str]:
@@ -29,17 +30,22 @@ def _missing_tools() -> list[str]:
 )
 class X86UefiEspTests(unittest.TestCase):
     def test_builder_creates_gpt_fat32_esp_with_fallback_loader_and_kernel(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as directory:
             root = Path(directory)
             kernel = root / "kernel.elf"
+            rootfs = root / "rootfs.img"
             image = root / "nested" / "esp.img"
             kernel.write_bytes(b"test-multiboot-kernel")
+            rootfs.write_bytes(b"test-rootfs-image")
 
             subprocess.run(
                 [
                     str(ESP_BUILDER),
                     "--kernel",
                     str(kernel),
+                    "--rootfs",
+                    str(rootfs),
                     "--output",
                     str(image),
                 ],
@@ -67,6 +73,7 @@ class X86UefiEspTests(unittest.TestCase):
                 text=True,
             ).stdout
             self.assertIn("TheKernel", root_listing)
+            self.assertIn("rootfs-x86", root_listing)
             grub_listing = subprocess.run(
                 ["mdir", "-i", esp, "::/EFI/BOOT"],
                 check=True,
@@ -76,27 +83,124 @@ class X86UefiEspTests(unittest.TestCase):
             ).stdout
             self.assertIn("BOOTX64", grub_listing)
 
-    def test_builder_preloads_the_required_grub_modules(self) -> None:
+    def test_builder_rejects_an_explicit_esp_too_small_for_the_rootfs(self) -> None:
+        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as directory:
+            root = Path(directory)
+            kernel = root / "kernel.elf"
+            rootfs = root / "rootfs.img"
+            kernel.write_bytes(b"kernel")
+            with rootfs.open("wb") as stream:
+                stream.truncate(256 * 1024 * 1024)
+            result = subprocess.run(
+                [
+                    str(ESP_BUILDER),
+                    "--kernel", str(kernel),
+                    "--rootfs", str(rootfs),
+                    "--output", str(root / "esp.img"),
+                    "--size-mib", "128",
+                ],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("too small for the supplied payloads", result.stderr)
+
+    def test_builder_preloads_only_the_multiboot2_grub_module(self) -> None:
         source = ESP_BUILDER.read_text(encoding="utf-8")
         self.assertIn(
-            "part_gpt fat search search_fs_file multiboot multiboot2 serial terminal",
+            "grub_modules='part_gpt fat search search_fs_file serial terminal all_video'",
             source,
         )
+        self.assertIn('grub_modules="$grub_modules multiboot2"', source)
+        self.assertIn('grub_modules="$grub_modules linux"', source)
+        self.assertNotIn("multiboot multiboot2", source)
         self.assertIn("config/x86_64/grub.cfg", source)
 
-    def test_default_grub_entry_is_multiboot2_with_multiboot1_fallback(self) -> None:
+    def test_linux_mode_stages_only_vmlinuz_and_uses_a_drive_backed_root(self) -> None:
+        source = ESP_BUILDER.read_text(encoding="utf-8")
+        linux_config = (ROOT / "config/x86_64/grub-linux.cfg").read_text(encoding="utf-8")
+        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as directory:
+            root = Path(directory)
+            kernel = root / "vmlinuz"
+            image = root / "linux.esp"
+            kernel.write_bytes(b"test-linux-bzimage")
+            subprocess.run(
+                [
+                    str(ESP_BUILDER),
+                    "--mode", "linux",
+                    "--kernel", str(kernel),
+                    "--output", str(image),
+                ],
+                cwd=ROOT,
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            listing = subprocess.run(
+                ["mdir", "-i", f"{image}@@1M", "::/"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            ).stdout
+            self.assertIn("vmlinuz", listing)
+            self.assertNotIn("rootfs-x86", listing)
+        self.assertIn("--mode {multiboot|multiboot-drive|linux}", source)
+        self.assertIn('mcopy -i "$esp" "$kernel" ::/vmlinuz', source)
+        self.assertIn("--rootfs is only valid with --mode multiboot", source)
+        self.assertIn("linux /vmlinuz root=/dev/vda console=ttyS0", linux_config)
+        self.assertNotIn("rootfs-x86.img", linux_config)
+
+    def test_default_grub_entry_is_only_multiboot2_with_rootfs_module(self) -> None:
         config = (ROOT / "config" / "x86_64" / "grub.cfg").read_text(encoding="utf-8")
         self.assertIn('menuentry "TheKernel (Multiboot2)"', config)
         self.assertIn("multiboot2 /TheKernel.elf", config)
-        self.assertIn('menuentry "TheKernel (Multiboot1 fallback)"', config)
-        self.assertIn("multiboot /TheKernel.elf", config)
+        self.assertIn("module2 /rootfs-x86.img rootfs", config)
+        self.assertIn("insmod all_video", config)
+        self.assertNotIn("Multiboot1", config)
+        self.assertNotIn("multiboot /TheKernel.elf", config)
 
-    def test_multiboot_gate_selects_grub2_file_or_grub_file(self) -> None:
+    def test_multiboot_drive_mode_stages_no_rootfs_module(self) -> None:
+        drive_config = (ROOT / "config/x86_64/grub-drive.cfg").read_text(encoding="utf-8")
+        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as directory:
+            root = Path(directory)
+            kernel = root / "kernel.elf"
+            image = root / "drive.esp"
+            kernel.write_bytes(b"test-multiboot-kernel")
+            subprocess.run(
+                [
+                    str(ESP_BUILDER), "--mode", "multiboot-drive",
+                    "--kernel", str(kernel), "--output", str(image),
+                ],
+                cwd=ROOT,
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            listing = subprocess.run(
+                ["mdir", "-i", f"{image}@@1M", "::/"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            ).stdout
+            self.assertIn("TheKernel", listing)
+            self.assertNotIn("rootfs-x86", listing)
+        self.assertIn("multiboot2 /TheKernel.elf", drive_config)
+        self.assertNotIn("module2", drive_config)
+        self.assertIn("insmod all_video", drive_config)
+
+    def test_multiboot_gate_selects_grub2_file_or_grub_file_for_multiboot2(self) -> None:
         source = MULTIBOOT_GATE.read_text(encoding="utf-8")
         self.assertIn("grub2-file", source)
         self.assertIn("grub-file", source)
-        self.assertIn("--is-x86-multiboot", source)
         self.assertIn("--is-x86-multiboot2", source)
+        self.assertNotIn('"$grub_file" --is-x86-multiboot "$kernel"', source)
 
 
 if __name__ == "__main__":

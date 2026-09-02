@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build a small GPT/FAT32 EFI system partition for the x86_64 Multiboot path.
+# Build a small GPT/FAT32 EFI system partition for either supported x86_64
+# boot protocol.
 #
 # The image deliberately contains only the GRUB standalone EFI binary and the
-# kernel.  The Linux root filesystem remains a separate virtio block device;
-# this keeps the firmware boot contract independent from the kernel's storage
-# driver selection.
+# kernel and, in module mode, the generated root filesystem as a Multiboot2
+# module.  The drive modes leave the rootfs on QEMU's sole virtio-blk device.
 
 set -euo pipefail
 
@@ -13,33 +13,49 @@ REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 
 usage() {
     cat >&2 <<'EOF'
-usage: scripts/build-x86-uefi-esp.sh --kernel PATH --output PATH [options]
+usage: scripts/build-x86-uefi-esp.sh --mode {multiboot|multiboot-drive|linux} --kernel PATH --output PATH [options]
 
-Create a GPT/FAT32 ESP containing GRUB's x86_64 EFI fallback loader and a
-Multiboot kernel named TheKernel.elf.  The default GRUB configuration is
-config/x86_64/grub.cfg.
+Create a GPT/FAT32 ESP containing GRUB's x86_64 EFI fallback loader.
+`multiboot` stages TheKernel.elf and rootfs-x86.img; `multiboot-drive` stages
+only TheKernel.elf and boots its external /dev/vda root filesystem; `linux`
+stages only /vmlinuz and also boots its external rootfs. The default GRUB
+configuration follows the selected mode.
 
 options:
-  --kernel PATH          x86_64 Multiboot ELF to place at ESP root
+  --mode MODE            multiboot, multiboot-drive, or linux (default: multiboot)
+  --kernel PATH          x86_64 kernel image to place on the ESP
+  --rootfs PATH          required only for multiboot; staged as a module
   --output PATH          ESP disk image to create
   --grub-config PATH     GRUB config (default: config/x86_64/grub.cfg)
-  --size-mib N           image size, at least 128 MiB (default: 128)
+  --size-mib N           image size, at least 128 MiB (default: auto-sized)
   --grub-mkstandalone P  grub2-mkstandalone executable to use
 EOF
     exit 2
 }
 
 kernel=
+rootfs=
 output=
-grub_config="$REPO_ROOT/config/x86_64/grub.cfg"
-size_mib=128
+mode=multiboot
+grub_config=
+size_mib=
 grub_mkstandalone=${GRUB_MKSTANDALONE:-}
 
 while (($# > 0)); do
     case "$1" in
+        --mode)
+            (($# >= 2)) || usage
+            mode=$2
+            shift 2
+            ;;
         --kernel)
             (($# >= 2)) || usage
             kernel=$2
+            shift 2
+            ;;
+        --rootfs)
+            (($# >= 2)) || usage
+            rootfs=$2
             shift 2
             ;;
         --output)
@@ -72,16 +88,35 @@ while (($# > 0)); do
     esac
 done
 
+[[ "$mode" == multiboot || "$mode" == multiboot-drive || "$mode" == linux ]] || { printf 'unsupported ESP mode: %s\n' "$mode" >&2; usage; }
 [[ -n "$kernel" && -n "$output" ]] || usage
+if [[ "$mode" == multiboot ]]; then
+    [[ -n "$rootfs" ]] || usage
+elif [[ -n "$rootfs" ]]; then
+    printf '%s\n' '--rootfs is only valid with --mode multiboot; drive modes boot /dev/vda directly' >&2
+    exit 2
+fi
+if [[ -z "$grub_config" ]]; then
+    case "$mode" in
+        multiboot) grub_config="$REPO_ROOT/config/x86_64/grub.cfg" ;;
+        multiboot-drive) grub_config="$REPO_ROOT/config/x86_64/grub-drive.cfg" ;;
+        linux) grub_config="$REPO_ROOT/config/x86_64/grub-linux.cfg" ;;
+    esac
+fi
 [[ -f "$kernel" ]] || { printf 'kernel does not exist: %s\n' "$kernel" >&2; exit 1; }
+if [[ "$mode" == multiboot ]]; then
+    [[ -f "$rootfs" ]] || { printf 'rootfs does not exist: %s\n' "$rootfs" >&2; exit 1; }
+fi
 [[ -f "$grub_config" ]] || {
     printf 'GRUB config does not exist: %s\n' "$grub_config" >&2
     exit 1
 }
-[[ "$size_mib" =~ ^[0-9]+$ && "$size_mib" -ge 128 ]] || {
-    printf 'ESP size must be an integer of at least 128 MiB: %s\n' "$size_mib" >&2
-    exit 1
-}
+if [[ -n "$size_mib" ]]; then
+    [[ "$size_mib" =~ ^[0-9]+$ && "$size_mib" -ge 128 ]] || {
+        printf 'ESP size must be an integer of at least 128 MiB: %s\n' "$size_mib" >&2
+        exit 1
+    }
+fi
 
 if [[ -z "$grub_mkstandalone" ]]; then
     if command -v grub2-mkstandalone >/dev/null 2>&1; then
@@ -102,11 +137,36 @@ for tool in parted mkfs.fat mcopy mmd; do
 done
 
 kernel=$(CDPATH= cd -- "$(dirname -- "$kernel")" && pwd)/$(basename -- "$kernel")
+if [[ "$mode" == multiboot ]]; then
+    rootfs=$(CDPATH= cd -- "$(dirname -- "$rootfs")" && pwd)/$(basename -- "$rootfs")
+fi
 grub_config=$(CDPATH= cd -- "$(dirname -- "$grub_config")" && pwd)/$(basename -- "$grub_config")
 output_parent=$(dirname -- "$output")
 mkdir -p "$output_parent"
 output=$(CDPATH= cd -- "$output_parent" && pwd)/$(basename -- "$output")
 [[ "$kernel" != "$output" ]] || { printf 'output must differ from kernel\n' >&2; exit 1; }
+if [[ "$mode" == multiboot ]]; then
+    [[ "$rootfs" != "$output" ]] || { printf 'output must differ from rootfs\n' >&2; exit 1; }
+fi
+
+# FAT stores the full logical rootfs image in multiboot mode even when ext4 is
+# sparse. Linux mode stages only its kernel.
+# Reserve 64 MiB for the kernel, standalone GRUB image, FAT metadata, and
+# growth, then round the default ESP size up to a 64 MiB boundary.
+payload_bytes=$(stat -c %s "$kernel")
+if [[ "$mode" == multiboot ]]; then
+    payload_bytes=$(( payload_bytes + $(stat -c %s "$rootfs") ))
+fi
+minimum_mib=$(( (payload_bytes + 1048575) / 1048576 + 64 ))
+minimum_mib=$(( (minimum_mib + 63) / 64 * 64 ))
+(( minimum_mib < 128 )) && minimum_mib=128
+if [[ -z "$size_mib" ]]; then
+    size_mib=$minimum_mib
+elif (( size_mib < minimum_mib )); then
+    printf 'ESP size %s MiB is too small for the supplied payloads; need at least %s MiB\n' \
+        "$size_mib" "$minimum_mib" >&2
+    exit 1
+fi
 
 tmp_dir=$(mktemp -d "${output}.tmp.XXXXXX")
 cleanup() {
@@ -126,11 +186,20 @@ parted -s -a optimal "$image" mkpart ESP fat32 1MiB 100%
 parted -s "$image" set 1 esp on
 mkfs.fat -F 32 --invariant -n THEKERNEL --offset=2048 "$image" >/dev/null
 
-# This exact preload set is required because the standalone image must locate
-# /TheKernel.elf on a GPT/FAT ESP before the normal GRUB module path exists.
+# The standalone image needs filesystem discovery plus the selected boot
+# protocol before GRUB's normal module path is available.
+# EFI cannot provide the legacy EGA text console that Multiboot defaults to.
+# Keep GRUB itself on serial, but make the firmware framebuffer available to
+# the Multiboot loader so it can hand the kernel a usable graphics console.
+grub_modules='part_gpt fat search search_fs_file serial terminal all_video'
+if [[ "$mode" == multiboot || "$mode" == multiboot-drive ]]; then
+    grub_modules="$grub_modules multiboot2"
+else
+    grub_modules="$grub_modules linux"
+fi
 "$grub_mkstandalone" \
     -O x86_64-efi \
-    --modules='part_gpt fat search search_fs_file multiboot multiboot2 serial terminal' \
+    --modules="$grub_modules" \
     -o "$grub_efi" \
     "boot/grub/grub.cfg=$grub_config"
 
@@ -138,7 +207,14 @@ esp="$image@@1M"
 mmd -i "$esp" ::/EFI
 mmd -i "$esp" ::/EFI/BOOT
 mcopy -i "$esp" "$grub_efi" ::/EFI/BOOT/BOOTX64.EFI
-mcopy -i "$esp" "$kernel" ::/TheKernel.elf
+if [[ "$mode" == multiboot || "$mode" == multiboot-drive ]]; then
+    mcopy -i "$esp" "$kernel" ::/TheKernel.elf
+    if [[ "$mode" == multiboot ]]; then
+        mcopy -i "$esp" "$rootfs" ::/rootfs-x86.img
+    fi
+else
+    mcopy -i "$esp" "$kernel" ::/vmlinuz
+fi
 
 mv "$image" "$output"
 printf '%s\n' "$output"

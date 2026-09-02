@@ -8,10 +8,13 @@ DEV_ENV_DIR="$REPO_ROOT/dev-env"
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/dev-shell.sh
-  scripts/dev-shell.sh --guest-shell [RUN_ARGS...]
-  scripts/dev-shell.sh -- COMMAND [ARGS...]
-  scripts/dev-shell.sh --service builder -- COMMAND [ARGS...]
+  scripts/dev-shell.sh [--build]
+  scripts/dev-shell.sh [--build] --guest-shell [RUN_ARGS...]
+  scripts/dev-shell.sh [--build] -- COMMAND [ARGS...]
+  scripts/dev-shell.sh [--build] --service builder -- COMMAND [ARGS...]
+
+Options:
+  --build                      Force a rebuild of the default local image
 
 Environment:
   THEKERNEL_DEV_IMAGE        Docker image tag or digest (default: thekernel-dev:local)
@@ -24,9 +27,15 @@ EOF
 }
 
 service="dev"
+force_build=0
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage
     exit 0
+fi
+
+if [[ "${1:-}" == "--build" ]]; then
+    force_build=1
+    shift
 fi
 
 if [[ "${1:-}" == "--service" ]]; then
@@ -51,24 +60,9 @@ export LOCAL_GID="$(id -g)"
 
 run_args=(run --rm --remove-orphans)
 if [[ "$THEKERNEL_DEV_IMAGE" == "thekernel-dev:local" ]]; then
-    # Hash only the local inputs that define the image. Mirror URLs are
-    # transport choices and intentionally do not make an otherwise current
-    # image rebuild on every invocation.
-    THEKERNEL_DEV_SOURCE_SHA256=$(
-        cd "$DEV_ENV_DIR"
-        sha256sum Dockerfile entrypoint.sh check-image.sh \
-            | sha256sum \
-            | awk '{ print $1 }'
-    )
-    export THEKERNEL_DEV_SOURCE_SHA256
-
-    installed_source_sha256=$(docker image inspect "$THEKERNEL_DEV_IMAGE" \
-        --format '{{ index .Config.Labels "org.thekernel.dev-source-sha256" }}' \
-        2>/dev/null || true)
-    if [[ "$installed_source_sha256" != "$THEKERNEL_DEV_SOURCE_SHA256" ]]; then
-        printf 'dev-shell: refreshing %s for source %s\n' \
-            "$THEKERNEL_DEV_IMAGE" "$THEKERNEL_DEV_SOURCE_SHA256" >&2
-        run_args+=(--build)
+    if [[ "$force_build" == 1 ]] ||
+        ! docker image inspect "$THEKERNEL_DEV_IMAGE" >/dev/null 2>&1; then
+        docker compose -f "$DEV_ENV_DIR/compose.yaml" build dev
     fi
 fi
 

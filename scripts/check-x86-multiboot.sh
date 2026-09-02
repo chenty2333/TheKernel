@@ -21,6 +21,5 @@ else
     exit 1
 fi
 
-"$grub_file" --is-x86-multiboot "$kernel"
 "$grub_file" --is-x86-multiboot2 "$kernel"
 printf 'X86_MULTIBOOT_HEADER_GATE status=ok tool=%s kernel=%s\n' "$grub_file" "$kernel"

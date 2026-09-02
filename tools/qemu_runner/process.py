@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import select
 import signal
 import socket
@@ -12,6 +13,8 @@ import sys
 import threading
 import time
 import json
+import zlib
+from collections import deque
 from pathlib import Path
 from typing import BinaryIO, Mapping
 
@@ -20,6 +23,9 @@ from .model import (
     INTENTIONAL_STOP_RETURN_CODE,
     Interaction,
     QmpColorBlock,
+    QmpCheckpoint,
+    QmpPciHotplug,
+    QmpRegionCrc,
     RunLimits,
     RunResult,
 )
@@ -30,6 +36,11 @@ class ProcessError(ValueError):
 
 
 MAX_PENDING_INPUT_BYTES = 64 * 1024
+
+# Kernel log records carry ANSI color chunks that can interleave with guest
+# userspace console output; markers must still match when a stray escape
+# sequence lands on the marker's line.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def _validate_qmp_marker(name: str, marker: str | None) -> None:
@@ -43,10 +54,18 @@ def _validate_color_block(block: QmpColorBlock) -> None:
         raise ProcessError("QMP screenshot color block RGB channels must be in 0..255")
 
 
+def _validate_region_crc(region: QmpRegionCrc) -> None:
+    if region.x < 0 or region.y < 0 or region.width <= 0 or region.height <= 0:
+        raise ProcessError("QMP screenshot CRC region must have non-negative origin and positive size")
+    if region.crc32 < 0 or region.crc32 > 0xFFFF_FFFF:
+        raise ProcessError("QMP screenshot CRC must be in 0..0xffffffff")
+
+
 def _validate_ppm(
     screenshot: Path,
     expected_size: tuple[int, int] | None,
     color_blocks: tuple[QmpColorBlock, ...],
+    region_crcs: tuple[QmpRegionCrc, ...],
 ) -> None:
     """Validate QEMU's P6 screendump before reporting graphics success."""
 
@@ -101,6 +120,15 @@ def _validate_ppm(
             start = (y * width + block.x) * 3
             if pixels[start : start + block.width * 3] != expected * block.width:
                 raise ProcessError("QMP screenshot color block did not match")
+    for region in region_crcs:
+        if region.x + region.width > width or region.y + region.height > height:
+            raise ProcessError("QMP screenshot CRC region is outside the image")
+        rows = bytearray()
+        for y in range(region.y, region.y + region.height):
+            start = (y * width + region.x) * 3
+            rows.extend(pixels[start : start + region.width * 3])
+        if zlib.crc32(rows) != region.crc32:
+            raise ProcessError("QMP screenshot CRC region did not match")
 
 
 class _QmpController:
@@ -117,6 +145,8 @@ class _QmpController:
         timeout_secs: float,
         screenshot_size: tuple[int, int] | None,
         screenshot_color_blocks: tuple[QmpColorBlock, ...],
+        screenshot_region_crcs: tuple[QmpRegionCrc, ...],
+        checkpoints: tuple[QmpCheckpoint, ...],
     ) -> None:
         self.socket_path = socket_path
         self.screenshot = screenshot
@@ -126,13 +156,26 @@ class _QmpController:
         self.timeout_secs = timeout_secs
         self.screenshot_size = screenshot_size
         self.screenshot_color_blocks = screenshot_color_blocks
-        self._input_marker = threading.Event()
-        self._screenshot_marker = threading.Event()
+        self.screenshot_region_crcs = screenshot_region_crcs
+        self.checkpoints = checkpoints or (
+            QmpCheckpoint(
+                input_after_marker=input_after_marker or "",
+                input_events=input_events,
+                screenshot=screenshot,
+                screenshot_after_marker=screenshot_after_marker,
+                screenshot_size=screenshot_size,
+                screenshot_color_blocks=screenshot_color_blocks,
+                screenshot_region_crcs=screenshot_region_crcs,
+            ),
+        )
+        self._markers: set[str] = set()
+        self._marker_condition = threading.Condition()
         self._cancelled = threading.Event()
         self._complete = threading.Event()
         self._finished = threading.Event()
         self._lock = threading.Lock()
         self._client: socket.socket | None = None
+        self.latency_metrics: list[tuple[int, int]] = []
         self.error: ProcessError | None = None
         self._thread = threading.Thread(target=self._run, name="qmp-controls", daemon=True)
 
@@ -144,10 +187,9 @@ class _QmpController:
         return self._complete.is_set()
 
     def observe_marker(self, line: str) -> None:
-        if line == self.input_after_marker:
-            self._input_marker.set()
-        if line == self.screenshot_after_marker:
-            self._screenshot_marker.set()
+        with self._marker_condition:
+            self._markers.add(line)
+            self._marker_condition.notify_all()
 
     def close(self) -> None:
         self._cancelled.set()
@@ -165,12 +207,15 @@ class _QmpController:
 
         self._finished.wait(timeout=0.2)
 
-    def _wait(self, event: threading.Event, description: str, deadline: float) -> None:
-        while not event.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
-            if self._cancelled.is_set():
-                raise ProcessError("QMP controls cancelled")
-            if time.monotonic() >= deadline:
-                raise ProcessError(f"QMP timeout waiting for {description}")
+    def _wait_marker(self, marker: str, description: str, deadline: float) -> None:
+        with self._marker_condition:
+            while marker not in self._markers:
+                if self._cancelled.is_set():
+                    raise ProcessError("QMP controls cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ProcessError(f"QMP timeout waiting for {description}")
+                self._marker_condition.wait(timeout=min(0.05, remaining))
 
     def _connect(self, deadline: float) -> socket.socket:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -204,13 +249,38 @@ class _QmpController:
             if remaining <= 0:
                 raise ProcessError("QMP timeout waiting for a response")
             client.settimeout(remaining)
-            chunk = client.recv(65_536)
+            try:
+                chunk = client.recv(65_536)
+            except socket.timeout:
+                # A socket timeout can race the monotonic deadline by a small
+                # amount.  Recheck it so callers retain their command-specific
+                # timeout diagnostics instead of receiving an OSError wrapper.
+                continue
             if not chunk:
                 raise ProcessError("QMP closed before replying")
             buffer.extend(chunk)
 
+    @staticmethod
+    def _device_deleted_id(event: Mapping[str, object]) -> str | None:
+        """Extract the device id from a well-formed DEVICE_DELETED event."""
+
+        if event.get("event") != "DEVICE_DELETED":
+            return None
+        data = event.get("data")
+        if not isinstance(data, Mapping):
+            return None
+        device_id = data.get("device")
+        return device_id if isinstance(device_id, str) else None
+
     def _request(
-        self, client: socket.socket, buffer: bytearray, command: str, arguments: dict[str, object] | None, sequence: int, deadline: float
+        self,
+        client: socket.socket,
+        buffer: bytearray,
+        command: str,
+        arguments: dict[str, object] | None,
+        sequence: int,
+        deadline: float,
+        device_deleted_events: deque[dict[str, object]],
     ) -> None:
         request_id = f"thekernel-qmp-{sequence}"
         request: dict[str, object] = {"execute": command, "id": request_id}
@@ -219,7 +289,14 @@ class _QmpController:
         client.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\r\n")
         while True:
             response = self._read_json(client, buffer, deadline)
-            if "event" in response or response.get("id") != request_id:
+            if "event" in response:
+                # QMP may emit DEVICE_DELETED before the device_del response.
+                # Preserve it so the completion wait below remains correct for
+                # either legal message ordering.
+                if self._device_deleted_id(response) is not None:
+                    device_deleted_events.append(response)
+                continue
+            if response.get("id") != request_id:
                 continue
             if "error" in response:
                 raise ProcessError(f"QMP rejected {command}: {response['error']}")
@@ -227,29 +304,127 @@ class _QmpController:
                 return
             raise ProcessError(f"QMP sent an invalid response for {command}")
 
+    def _wait_device_deleted(
+        self,
+        client: socket.socket,
+        buffer: bytearray,
+        device_id: str,
+        deadline: float,
+        device_deleted_events: deque[dict[str, object]],
+    ) -> None:
+        """Wait for QEMU to complete a successfully accepted device_del."""
+
+        while True:
+            while device_deleted_events:
+                if self._device_deleted_id(device_deleted_events.popleft()) == device_id:
+                    return
+            try:
+                response = self._read_json(client, buffer, deadline)
+            except ProcessError as error:
+                if str(error) == "QMP timeout waiting for a response":
+                    raise ProcessError(f"QMP timeout waiting for DEVICE_DELETED for device {device_id}") from error
+                raise
+            if "event" in response:
+                deleted_id = self._device_deleted_id(response)
+                if deleted_id == device_id:
+                    return
+                if deleted_id is not None:
+                    device_deleted_events.append(response)
+                continue
+            # QMP replies unrelated to this worker's serialized request may be
+            # interleaved with events.  They cannot confirm this deletion.
+
     def _run(self) -> None:
         deadline = time.monotonic() + self.timeout_secs
         try:
             client = self._connect(deadline)
             buffer = bytearray()
+            device_deleted_events: deque[dict[str, object]] = deque()
             while True:
                 greeting = self._read_json(client, buffer, deadline)
                 if "event" not in greeting:
                     break
             if not isinstance(greeting.get("QMP"), dict):
                 raise ProcessError("QMP sent an invalid greeting")
-            self._request(client, buffer, "qmp_capabilities", None, 0, deadline)
-            if self.input_events:
-                if self.input_after_marker is not None:
-                    self._wait(self._input_marker, f"input marker: {self.input_after_marker}", deadline)
-                for index, events in enumerate(self.input_events, start=1):
-                    self._request(client, buffer, "input-send-event", {"events": list(events)}, index, deadline)
-            if self.screenshot is not None:
-                if self.screenshot_after_marker is not None:
-                    self._wait(self._screenshot_marker, f"screenshot marker: {self.screenshot_after_marker}", deadline)
-                self.screenshot.unlink(missing_ok=True)
-                self._request(client, buffer, "screendump", {"filename": str(self.screenshot)}, len(self.input_events) + 1, deadline)
-                _validate_ppm(self.screenshot, self.screenshot_size, self.screenshot_color_blocks)
+            self._request(client, buffer, "qmp_capabilities", None, 0, deadline, device_deleted_events)
+            sequence = 1
+            for checkpoint in self.checkpoints:
+                if checkpoint.input_events or checkpoint.pci_hotplug:
+                    self._wait_marker(
+                        checkpoint.input_after_marker,
+                        f"checkpoint marker: {checkpoint.input_after_marker}",
+                        deadline,
+                    )
+                for action in checkpoint.pci_hotplug:
+                    if action.action == "add":
+                        self._request(
+                            client,
+                            buffer,
+                            "device_add",
+                            {"driver": action.driver, "id": action.device_id, "bus": action.bus},
+                            sequence,
+                            deadline,
+                            device_deleted_events,
+                        )
+                    else:
+                        self._request(
+                            client,
+                            buffer,
+                            "device_del",
+                            {"id": action.device_id},
+                            sequence,
+                            deadline,
+                            device_deleted_events,
+                        )
+                        self._wait_device_deleted(client, buffer, action.device_id, deadline, device_deleted_events)
+                    sequence += 1
+                if checkpoint.input_events:
+                    latency_started_ns = time.monotonic_ns()
+                    for events in checkpoint.input_events:
+                        self._request(
+                            client,
+                            buffer,
+                            "input-send-event",
+                            {"events": list(events)},
+                            sequence,
+                            deadline,
+                            device_deleted_events,
+                        )
+                        sequence += 1
+                    if checkpoint.latency_after_marker is not None:
+                        self._wait_marker(
+                            checkpoint.latency_after_marker,
+                            f"input-visible marker: {checkpoint.latency_after_marker}",
+                            deadline,
+                        )
+                        assert checkpoint.latency_index is not None
+                        self.latency_metrics.append(
+                            (checkpoint.latency_index, time.monotonic_ns() - latency_started_ns)
+                        )
+                if checkpoint.screenshot is not None:
+                    if checkpoint.screenshot_after_marker is not None:
+                        self._wait_marker(
+                            checkpoint.screenshot_after_marker,
+                            f"screenshot marker: {checkpoint.screenshot_after_marker}",
+                            deadline,
+                        )
+                    checkpoint.screenshot.unlink(missing_ok=True)
+                    self._request(
+                        client,
+                        buffer,
+                        "screendump",
+                        {"filename": str(checkpoint.screenshot)},
+                        sequence,
+                        deadline,
+                        device_deleted_events,
+                    )
+                    sequence += 1
+                    _validate_ppm(
+                        checkpoint.screenshot,
+                        checkpoint.screenshot_size,
+                        checkpoint.screenshot_color_blocks,
+                        checkpoint.screenshot_region_crcs,
+                    )
             self._complete.set()
         except (OSError, ValueError, json.JSONDecodeError) as error:
             if not self._cancelled.is_set():
@@ -265,6 +440,24 @@ class _QmpController:
 def _validate_marker(name: str, marker: str | None) -> None:
     if marker is not None and (not marker or "\n" in marker or "\r" in marker):
         raise ProcessError(f"{name} must be one non-empty console line")
+
+
+_INPUT_HOTPLUG_DRIVERS = frozenset({"virtio-keyboard-pci", "virtio-mouse-pci", "virtio-tablet-pci"})
+_INPUT_HOTPLUG_BUSES = frozenset({"rp-input-kbd", "rp-input-mouse", "rp-input-tablet"})
+
+
+def _validate_pci_hotplug(action: QmpPciHotplug) -> None:
+    if action.action not in {"add", "del"}:
+        raise ProcessError("QMP PCI hotplug action must be add or del")
+    if not action.device_id or any(char in action.device_id for char in ",\n\r"):
+        raise ProcessError("QMP PCI hotplug device id must be QEMU-safe")
+    if action.action == "add":
+        if action.driver not in _INPUT_HOTPLUG_DRIVERS:
+            raise ProcessError("QMP PCI add supports only VirtIO input drivers")
+        if action.bus not in _INPUT_HOTPLUG_BUSES:
+            raise ProcessError("QMP PCI add requires a reserved input root port")
+    elif action.driver is not None or action.bus is not None:
+        raise ProcessError("QMP PCI delete accepts only a device id")
 
 
 def validate_interaction(interaction: Interaction, limits: RunLimits) -> None:
@@ -292,6 +485,8 @@ def validate_qmp_controls(
     timeout_secs: float,
     screenshot_size: tuple[int, int] | None,
     screenshot_color_blocks: tuple[QmpColorBlock, ...],
+    screenshot_region_crcs: tuple[QmpRegionCrc, ...],
+    checkpoints: tuple[QmpCheckpoint, ...],
 ) -> None:
     _validate_qmp_marker("QMP input-after marker", input_after_marker)
     _validate_qmp_marker("QMP screenshot-after marker", screenshot_after_marker)
@@ -305,10 +500,37 @@ def validate_qmp_controls(
         len(screenshot_size) != 2 or any(value <= 0 for value in screenshot_size)
     ):
         raise ProcessError("QMP screenshot dimensions must be positive")
-    if screenshot is None and (screenshot_size is not None or screenshot_color_blocks):
+    if screenshot is None and (screenshot_size is not None or screenshot_color_blocks or screenshot_region_crcs):
         raise ProcessError("QMP screenshot oracle requires a screenshot")
     for block in screenshot_color_blocks:
         _validate_color_block(block)
+    for region in screenshot_region_crcs:
+        _validate_region_crc(region)
+    for checkpoint in checkpoints:
+        _validate_qmp_marker("QMP checkpoint input-after marker", checkpoint.input_after_marker)
+        _validate_qmp_marker("QMP checkpoint screenshot-after marker", checkpoint.screenshot_after_marker)
+        _validate_qmp_marker("QMP checkpoint latency-after marker", checkpoint.latency_after_marker)
+        if (checkpoint.latency_after_marker is None) != (checkpoint.latency_index is None):
+            raise ProcessError("QMP checkpoint latency marker and index must be specified together")
+        if checkpoint.latency_index is not None:
+            if checkpoint.latency_index < 0:
+                raise ProcessError("QMP checkpoint latency index must be non-negative")
+            if not checkpoint.input_events:
+                raise ProcessError("QMP checkpoint latency measurement requires input events")
+        if checkpoint.screenshot_after_marker is not None and checkpoint.screenshot is None:
+            raise ProcessError("QMP checkpoint screenshot-after marker requires a screenshot")
+        if checkpoint.screenshot is None and (
+            checkpoint.screenshot_size is not None
+            or checkpoint.screenshot_color_blocks
+            or checkpoint.screenshot_region_crcs
+        ):
+            raise ProcessError("QMP checkpoint screenshot oracle requires a screenshot")
+        for block in checkpoint.screenshot_color_blocks:
+            _validate_color_block(block)
+        for region in checkpoint.screenshot_region_crcs:
+            _validate_region_crc(region)
+        for action in checkpoint.pci_hotplug:
+            _validate_pci_hotplug(action)
 
 
 def terminate_process_group(process: subprocess.Popen[bytes], sig: int) -> None:
@@ -374,11 +596,12 @@ def _wait_for_process(
             raw_line = bytes(pending_output[: newline + 1])
             del pending_output[: newline + 1]
             exact_line = raw_line.rstrip(b"\r\n").decode("utf-8", errors="replace")
-            if exact_line == interaction.input_after_marker:
+            marker_line = _ANSI_ESCAPE_RE.sub("", exact_line)
+            if marker_line == interaction.input_after_marker:
                 input_ready = True
             if qmp_controller is not None:
-                qmp_controller.observe_marker(exact_line)
-            if exact_line == interaction.stop_after_marker:
+                qmp_controller.observe_marker(marker_line)
+            if marker_line == interaction.stop_after_marker:
                 message = f"QEMU stopped after marker: {interaction.stop_after_marker}"
                 # A graphics smoke marker may be shared with a QMP action.
                 # Keep the guest alive until the worker has acknowledged the
@@ -551,6 +774,8 @@ def run_process(
     qmp_timeout_secs: float = 5.0,
     qmp_screenshot_size: tuple[int, int] | None = None,
     qmp_screenshot_color_blocks: tuple[QmpColorBlock, ...] = (),
+    qmp_screenshot_region_crcs: tuple[QmpRegionCrc, ...] = (),
+    qmp_checkpoints: tuple[QmpCheckpoint, ...] = (),
 ) -> RunResult:
     """Run one explicit QEMU command and capture its complete serial stream."""
 
@@ -563,12 +788,15 @@ def run_process(
         timeout_secs=qmp_timeout_secs,
         screenshot_size=qmp_screenshot_size,
         screenshot_color_blocks=qmp_screenshot_color_blocks,
+        screenshot_region_crcs=qmp_screenshot_region_crcs,
+        checkpoints=qmp_checkpoints,
     )
     if qmp_socket is None and (
         screenshot is not None
         or qmp_input_events
         or qmp_input_after_marker is not None
-        or qmp_screenshot_after_marker is not None
+            or qmp_screenshot_after_marker is not None
+            or qmp_checkpoints
     ):
         raise ProcessError("QMP controls require a QMP socket")
     if any(fd < 0 for fd in pass_fds):
@@ -613,7 +841,7 @@ def run_process(
                 pass_fds=pass_fds,
             )
             launched = True
-            if qmp_socket is not None and (screenshot is not None or qmp_input_events):
+            if qmp_socket is not None and (screenshot is not None or qmp_input_events or qmp_checkpoints):
                 qmp_controller = _QmpController(
                     socket_path=qmp_socket,
                     screenshot=screenshot,
@@ -623,6 +851,8 @@ def run_process(
                     timeout_secs=qmp_timeout_secs,
                     screenshot_size=qmp_screenshot_size,
                     screenshot_color_blocks=qmp_screenshot_color_blocks,
+                    screenshot_region_crcs=qmp_screenshot_region_crcs,
+                    checkpoints=qmp_checkpoints,
                 )
                 qmp_controller.start()
             if proxy_input:
@@ -643,6 +873,14 @@ def run_process(
                 forward_input=proxy_input,
                 qmp_controller=qmp_controller,
             )
+            if qmp_controller is not None:
+                for index, latency_ns in qmp_controller.latency_metrics:
+                    event = json.dumps(
+                        {"kind": "input_to_visible", "index": index, "ns": latency_ns},
+                        separators=(",", ":"),
+                    )
+                    log_file.write(f"THEKERNEL_GRAPHICS_METRIC {event}\n".encode())
+                log_file.flush()
     except KeyboardInterrupt:
         if process is not None:
             _terminate_with_grace(process)

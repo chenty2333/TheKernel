@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import gzip
-import hashlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -11,13 +11,13 @@ from unittest.mock import MagicMock, patch
 
 from tools.qemu_runner.model import Interaction, RunResult
 from tools.qemu_runner.runner import (
-    Q35_OVMF_CODE_SHA256,
     RunConfig,
     RunnerError,
     _resolve_ovmf_image,
     _parse_qemu_device_help,
     _parse_qemu_display_help,
     _probe_virgl_headless,
+    _validate_venus_capabilities,
     _validate_virgl_capabilities,
     run,
 )
@@ -87,31 +87,57 @@ class RunnerTests(unittest.TestCase):
             [("-device", "help"), ("-display", "help")],
         )
 
-    def test_implicit_ovmf_selection_rejects_incompatible_host_firmware(self) -> None:
+    def test_venus_requires_hostmem_limit_and_geometry_properties(self) -> None:
+        device_help = 'name "virtio-gpu-gl-pci", bus PCI\n'
+        property_help = (
+            "virtio-gpu-gl-pci options:\n"
+            "  blob=<bool>\n  venus=<bool>\n  hostmem=<size>\n"
+            "  max_hostmem=<size>\n  xres=<uint32>\n  yres=<uint32>\n"
+        )
+        with patch(
+            "tools.qemu_runner.runner._qemu_help_output",
+            side_effect=(device_help, property_help),
+        ) as capability_help:
+            _validate_venus_capabilities("venus-interactive", Path("/qemu"))
+        self.assertEqual(
+            [call.args[1:] for call in capability_help.call_args_list],
+            [("-device", "help"), ("-device", "virtio-gpu-gl-pci,help")],
+        )
+
+    def test_venus_rejects_qemu_without_hostmem_limit_property(self) -> None:
+        device_help = 'name "virtio-gpu-gl-pci", bus PCI\n'
+        property_help = "virtio-gpu-gl-pci options:\n  blob=<bool>\n  venus=<bool>\n  hostmem=<size>\n"
+        with patch(
+            "tools.qemu_runner.runner._qemu_help_output",
+            side_effect=(device_help, property_help),
+        ):
+            with self.assertRaisesRegex(RunnerError, "max_hostmem, xres, yres"):
+                _validate_venus_capabilities("venus-interactive", Path("/qemu"))
+
+    def test_implicit_ovmf_selection_uses_available_host_firmware(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            incompatible = root / "OVMF_CODE.fd"
-            incompatible.write_bytes(b"host-specific-ecam-layout")
-            with self.assertRaisesRegex(RunnerError, "requires the pinned OVMF code"):
+            image = root / "OVMF_CODE.fd"
+            image.write_bytes(b"host-firmware")
+            self.assertEqual(
                 _resolve_ovmf_image(
                     None,
                     "THEKERNEL_TEST_OVMF_CODE",
-                    (str(incompatible),),
+                    (str(image),),
                     "OVMF code",
-                    Q35_OVMF_CODE_SHA256,
-                )
+                ),
+                image.resolve(),
+            )
 
-    def test_explicit_ovmf_override_cannot_bypass_q35_pin(self) -> None:
+    def test_explicit_ovmf_image_must_exist(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "OVMF_CODE.fd"
-            image.write_bytes(b"explicit")
-            with self.assertRaisesRegex(RunnerError, "does not match q35 pin"):
+            with self.assertRaisesRegex(RunnerError, "does not exist"):
                 _resolve_ovmf_image(
                     image,
                     "THEKERNEL_TEST_OVMF_CODE",
                     (),
                     "OVMF code",
-                    Q35_OVMF_CODE_SHA256,
                 )
 
     def test_initrd_is_passed_to_qemu_after_validation(self) -> None:
@@ -245,19 +271,9 @@ class RunnerTests(unittest.TestCase):
                 kwargs["log_path"].write_bytes(b"guest console\n")
                 return expected
 
-            with (
-                patch(
-                    "tools.qemu_runner.runner.Q35_OVMF_CODE_SHA256",
-                    hashlib.sha256(b"code").hexdigest(),
-                ),
-                patch(
-                    "tools.qemu_runner.runner.Q35_OVMF_VARS_SHA256",
-                    hashlib.sha256(b"vars").hexdigest(),
-                ),
-                patch(
-                    "tools.qemu_runner.runner.run_process", side_effect=complete_run
-                ) as mocked,
-            ):
+            with patch(
+                "tools.qemu_runner.runner.run_process", side_effect=complete_run
+            ) as mocked:
                 run(config)
 
             command = " ".join(mocked.call_args.kwargs["command"])
@@ -268,6 +284,106 @@ class RunnerTests(unittest.TestCase):
             vars_runtime = config.workdir / "firmware" / "OVMF_VARS.fd"
             self.assertEqual(vars_runtime.read_bytes(), b"updated")
             self.assertNotEqual(vars_runtime.resolve(), ovmf_vars.resolve())
+
+    def test_module_rootfs_does_not_open_or_attach_a_virtio_drive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "root.img"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            config = RunConfig(
+                arch="x86_64",
+                kernel=kernel,
+                rootfs=rootfs,
+                rootfs_transport="module",
+                workdir=root / "run",
+                log_path=root / "run" / "console.log",
+                qemu_binary=sys.executable,
+                direct_kernel=True,
+            )
+            expected = RunResult(
+                arch="x86_64", command=("qemu",), returncode=0, duration_ms=1,
+                log_path=config.log_path, workdir=config.workdir,
+            )
+            with patch("tools.qemu_runner.runner.run_process", return_value=expected) as mocked:
+                self.assertIs(run(config), expected)
+            command = " ".join(mocked.call_args.kwargs["command"])
+            self.assertNotIn("drive=rootfs", command)
+            self.assertNotIn("id=rootfs", command)
+
+    def test_module_and_drive_rootfs_keeps_module_boot_and_attaches_snapshot_vda(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "root.img"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            config = RunConfig(
+                arch="x86_64",
+                kernel=kernel,
+                rootfs=rootfs,
+                rootfs_transport="module-and-drive",
+                rootfs_mode="snapshot",
+                workdir=root / "run",
+                log_path=root / "run" / "console.log",
+                qemu_binary=sys.executable,
+                direct_kernel=True,
+            )
+            expected = RunResult(
+                arch="x86_64", command=("qemu",), returncode=0, duration_ms=1,
+                log_path=config.log_path, workdir=config.workdir,
+            )
+            with patch("tools.qemu_runner.runner.run_process", return_value=expected) as mocked:
+                self.assertIs(run(config), expected)
+            command = " ".join(mocked.call_args.kwargs["command"])
+            self.assertIn("id=rootfs,snapshot=on", command)
+            self.assertIn("virtio-blk-pci,drive=rootfs", command)
+
+    def test_graphics_benchmark_drive_matches_linux_snapshot_pci_topology(self) -> None:
+        """TheKernel and Linux boot the same snapshot-backed Q35/VirtIO topology."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            rootfs = root / "benchmark-rootfs.ext2"
+            linux_esp = root / "linux-esp.img"
+            thekernel_esp = root / "thekernel-esp.img"
+            ovmf_code = root / "OVMF_CODE.fd"
+            ovmf_vars = root / "OVMF_VARS.fd"
+            for path in (kernel, rootfs, linux_esp, thekernel_esp, ovmf_code, ovmf_vars):
+                path.write_bytes(path.name.encode())
+            commands: list[tuple[str, ...]] = []
+
+            def capture(**kwargs):
+                commands.append(kwargs["command"])
+                return RunResult(
+                    arch="x86_64", command=kwargs["command"], returncode=0, duration_ms=1,
+                    log_path=kwargs["log_path"], workdir=kwargs["workdir"],
+                )
+
+            common = dict(
+                arch="x86_64", kernel=kernel, rootfs=rootfs, rootfs_mode="snapshot",
+                memory="4G", cpus=4, graphics_profile="virgl-interactive",
+                graphics_width=3840, graphics_height=2160, qemu_binary=sys.executable,
+                ovmf_code=ovmf_code, ovmf_vars=ovmf_vars,
+            )
+            with (
+                patch("tools.qemu_runner.runner._validate_virgl_capabilities"),
+                patch("tools.qemu_runner.runner.run_process", side_effect=capture),
+            ):
+                run(RunConfig(
+                    **common, esp=linux_esp, rootfs_transport="drive",
+                    workdir=root / "linux-run", log_path=root / "linux-run" / "console.log",
+                ))
+                run(RunConfig(
+                    **common, esp=thekernel_esp, rootfs_transport="drive",
+                    workdir=root / "thekernel-run", log_path=root / "thekernel-run" / "console.log",
+                ))
+            self.assertEqual(len(commands), 2)
+            normalize = lambda command: re.sub(r"/proc/self/fd/\d+", "/proc/self/fd/FD", " ".join(command))
+            self.assertEqual(normalize(commands[0]), normalize(commands[1]))
+            self.assertIn("id=rootfs,snapshot=on", normalize(commands[1]))
+            self.assertIn("virtio-blk-pci,drive=rootfs", normalize(commands[1]))
 
     def test_normal_run_uses_run_local_decompression(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -534,17 +650,7 @@ class RunnerTests(unittest.TestCase):
                 ovmf_vars=ovmf_vars,
             )
 
-            with (
-                patch(
-                    "tools.qemu_runner.runner.Q35_OVMF_CODE_SHA256",
-                    hashlib.sha256(b"code").hexdigest(),
-                ),
-                patch(
-                    "tools.qemu_runner.runner.Q35_OVMF_VARS_SHA256",
-                    hashlib.sha256(b"vars").hexdigest(),
-                ),
-                self.assertRaisesRegex(RunnerError, "OVMF vars runtime aliases"),
-            ):
+            with self.assertRaisesRegex(RunnerError, "OVMF vars runtime aliases"):
                 run(config)
             self.assertEqual(kernel.read_bytes(), b"kernel")
 

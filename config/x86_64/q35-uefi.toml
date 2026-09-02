@@ -2,7 +2,7 @@
 # Multiboot x86 PC platform; GRUB supplies its Multiboot handoff.
 arch = "x86_64"
 platform = "x86-pc"
-package = "axplat-x86-pc"
+package = "thekernel-axplat-x86-pc"
 
 [plat]
 # The product q35 profile is an SMP kernel. MADT discovery still determines
@@ -25,14 +25,14 @@ boot-stack-size = 0x0004_0000
 [devices]
 mmio-ranges = [
     [0x8000_0000, 0x2000_0000],       # Fallback 32-bit PCI BAR allocation
-    [0xb000_0000, 0x1000_0000],       # Pinned Debian OVMF PCIe ECAM
+    [0xe000_0000, 0x1000_0000],       # QEMU 10.2.2/OVMF Q35 PCIe ECAM (buses 0-255)
     [0xfec0_0000, 0x0000_1000],       # I/O APIC
     [0xfed0_0000, 0x0000_1000],       # HPET
     [0xfee0_0000, 0x0000_1000],       # Local APIC
     ["0x0000_00c0_0000_0000", 0x0100_0000], # Fallback 64-bit PCI BAR allocation
 ] # [(uint, uint)]
 virtio-mmio-ranges = [] # [(uint, uint)]
-pci-ecam-base = 0xb000_0000
+pci-ecam-base = 0xe000_0000
 pci-bus-end = 0xff
 pci-ranges = [
     [0, 0],
