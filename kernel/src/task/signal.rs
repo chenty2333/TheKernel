@@ -1,28 +1,85 @@
 use alloc::sync::{Arc, Weak};
-use core::{convert::Infallible, mem::MaybeUninit};
+use core::convert::Infallible;
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::{UserContext, UserReturnHookAction};
-use axtask::{LegacyFxsaveImage, TaskInner, current};
+use axtask::{TaskInner, current};
 use linux_raw_sys::general::{RLIMIT_SIGPENDING, SI_TIMER};
 use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_signal::{
     DefaultSignalAction, PreparedSignal, SignalAction, SignalDisposition, SignalInfo,
     SignalOSAction, SignalQueueAccount, SignalRecordGeneration, SignalSet, Signo,
     api::{
-        DeliveredSignal, FpRestore, SignalDeliveryPreflight, SignalDeliveryResult,
-        ThreadSignalManager, ThreadSignalSendOutcome,
+        DeliveredSignal, SignalDeliveryPreflight, SignalDeliveryResult, ThreadSignalManager,
+        ThreadSignalSendOutcome,
     },
-    arch::LegacyFpState64,
+    arch::UserContext as SignalUserContext,
 };
 use thekernel_linux_usercopy::UserMemoryContext;
 
 use super::{
-    AsThread, CetPendingSignalFrame, ContinueResult, Cred, ProcessData, Thread,
-    acknowledge_posix_timer_signal, do_exit, fail_closed_exit, get_process_data, get_process_group,
-    get_task, get_visible_task, linux_pid_from_task_id, process_domain, process_error,
+    AsThread, ContinueResult, Cred, ProcessData, Thread, acknowledge_posix_timer_signal, do_exit,
+    fail_closed_exit, get_process_data, get_process_group, get_task, get_visible_task,
+    linux_pid_from_task_id, process_domain, process_error,
 };
 use crate::{mm::AddressSpaceUserMemory, readiness::block_on_poll_set};
+
+/// Converts the kernel's executable trap context into the signal crate's
+/// x86_64 ABI data contract. TLS bases and return-to-userspace machinery are
+/// deliberately not part of a Linux signal frame.
+pub(crate) fn signal_context_from_kernel(context: &UserContext) -> SignalUserContext {
+    SignalUserContext {
+        rax: context.rax,
+        rcx: context.rcx,
+        rdx: context.rdx,
+        rbx: context.rbx,
+        rbp: context.rbp,
+        rsi: context.rsi,
+        rdi: context.rdi,
+        r8: context.r8,
+        r9: context.r9,
+        r10: context.r10,
+        r11: context.r11,
+        r12: context.r12,
+        r13: context.r13,
+        r14: context.r14,
+        r15: context.r15,
+        vector: context.vector,
+        error_code: context.error_code,
+        rip: context.rip,
+        cs: context.cs,
+        rflags: context.rflags,
+        rsp: context.rsp,
+        ss: context.ss,
+    }
+}
+
+/// Applies the signal crate's ABI register snapshot back to the executable
+/// kernel context after a successful signal delivery or return preparation.
+pub(crate) fn apply_signal_context(context: &mut UserContext, signal: &SignalUserContext) {
+    context.rax = signal.rax;
+    context.rcx = signal.rcx;
+    context.rdx = signal.rdx;
+    context.rbx = signal.rbx;
+    context.rbp = signal.rbp;
+    context.rsi = signal.rsi;
+    context.rdi = signal.rdi;
+    context.r8 = signal.r8;
+    context.r9 = signal.r9;
+    context.r10 = signal.r10;
+    context.r11 = signal.r11;
+    context.r12 = signal.r12;
+    context.r13 = signal.r13;
+    context.r14 = signal.r14;
+    context.r15 = signal.r15;
+    context.vector = signal.vector;
+    context.error_code = signal.error_code;
+    context.rip = signal.rip;
+    context.cs = signal.cs;
+    context.rflags = signal.rflags;
+    context.rsp = signal.rsp;
+    context.ss = signal.ss;
+}
 
 fn notify_tracer_or_parent_stop_continue(proc_data: &ProcessData) {
     let notify_pid = proc_data
@@ -209,46 +266,11 @@ pub(crate) fn prepare_queued_signal_for_process(
     prepare_signal_for_target(target, &target_cred, info, SignalQueuePolicy::QueueRequired)
 }
 
-/// Takes an owned legacy FXSAVE snapshot from the current task.
-///
-/// The axtask session keeps the no-preemption/IRQ guard scoped only to the
-/// architectural save and the copy into an owned image. It is dropped before
-/// the signal manager resumes frame preparation or userspace copyout.
-pub(crate) fn snapshot_current_legacy_fp_state() -> LegacyFpState64 {
-    let mut session = current()
-        .legacy_fxsave_session()
-        .expect("signal FP snapshot requires the current task");
-    LegacyFpState64::from_bytes(session.snapshot().into_bytes())
-}
-
-/// Commits a validated signal-return FP action to the current task.
-///
-/// Callers must perform all usercopy and machine-context validation before
-/// entering this helper. Once a token has been validated, the axtask session
-/// performs the saved-context/live-register commit without a fallible step.
-pub(crate) fn commit_current_legacy_fp_state(restore: &FpRestore) -> AxResult<()> {
-    let session = current()
-        .legacy_fxsave_session()
-        .map_err(|_| AxError::BadState)?;
-    match restore {
-        FpRestore::Reset => session.reset(),
-        FpRestore::Image(image) => {
-            let candidate = LegacyFxsaveImage::from_bytes(image.to_bytes());
-            let token = session
-                .validate(candidate)
-                .map_err(|_| AxError::InvalidInput)?;
-            session.commit(token);
-        }
-    }
-    Ok(())
-}
-
-/// Resets the current task's saved and live legacy FXSAVE state.
-pub(crate) fn reset_current_legacy_fp_state() {
-    current()
-        .legacy_fxsave_session()
-        .expect("signal FP reset requires the current task")
-        .reset();
+/// Resets the complete current-task XSAVE image after exec.
+pub(crate) fn reset_current_xsave_state() {
+    axtask::prepare_current_task_xsave_reset()
+        .expect("XSAVE reset requires initialized xstate")
+        .commit();
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -282,11 +304,13 @@ pub fn check_signals_with_retry(
     let aspace = thr.proc_data.aspace();
     let mut provider = AddressSpaceUserMemory::new(aspace.clone());
     let mut memory = UserMemoryContext::new(&mut provider);
+    let mut signal_uctx = signal_context_from_kernel(uctx);
     let result = thr.signal.check_signals_with_pre_delivery_and_fp_snapshot(
         &mut memory,
-        uctx,
+        &mut signal_uctx,
         restore_blocked,
-        |uctx, sig, _| {
+        |signal_uctx, sig, _| {
+            apply_signal_context(uctx, signal_uctx);
             // A forced SIGSEGV generated by a failed final rseq gate gets one
             // signal-bound bypass. This lets an already-installed handler
             // observe the fault without re-entering the same failing gate;
@@ -298,7 +322,7 @@ pub fn check_signals_with_retry(
             if !preflight_cet_signal_delivery(thr, &aspace) {
                 return SignalDeliveryPreflight::Fatal;
             }
-            match thr.pre_signal_rseq_delivery(uctx, &aspace) {
+            let outcome = match thr.pre_signal_rseq_delivery(uctx, &aspace) {
                 UserReturnHookAction::EnterUser => SignalDeliveryPreflight::Proceed,
                 UserReturnHookAction::Retry => SignalDeliveryPreflight::Retry,
                 UserReturnHookAction::Fault => {
@@ -313,15 +337,23 @@ pub fn check_signals_with_retry(
                         SignalDeliveryPreflight::Fatal
                     }
                 }
-            }
+            };
+            *signal_uctx = signal_context_from_kernel(uctx);
+            outcome
         },
-        snapshot_current_legacy_fp_state,
+        crate::syscall::signal::snapshot_signal_fpstate,
     );
+    apply_signal_context(uctx, &signal_uctx);
     match result {
         SignalDeliveryResult::Delivered(delivered) => {
             #[cfg(target_arch = "x86_64")]
             if matches!(delivered.os_action, SignalOSAction::Handler)
-                && let Err(error) = publish_cet_signal_frame(thr, &mut memory, uctx)
+                && let Err(error) = publish_cet_signal_frame(
+                    thr,
+                    delivered
+                        .handler_restorer
+                        .expect("handler delivery retains its captured restorer"),
+                )
             {
                 // The generic signal crate has already published its ABI
                 // frame.  Do not return to a handler with an unauthenticated
@@ -373,19 +405,8 @@ pub fn check_signals_with_retry(
 }
 
 #[cfg(target_arch = "x86_64")]
-const CET_SIGNAL_METADATA_OFFSET: usize = 40 + 192;
-#[cfg(target_arch = "x86_64")]
-const CET_SIGNAL_MAGIC: u64 = 0x544b_4345_5453_4947;
-
-/// The x86 ABI reserves these eight words in `mcontext`.  Keeping this local
-/// repr(C) record avoids changing the sibling signal crate's public ABI.
-#[cfg(target_arch = "x86_64")]
-#[repr(C)]
-struct CetSignalFrameMetadata([u64; 8]);
-
-#[cfg(target_arch = "x86_64")]
-fn preflight_cet_signal_delivery(
-    thr: &Thread,
+pub(crate) fn preflight_cet_signal_delivery(
+    _thr: &Thread,
     aspace: &alloc::sync::Arc<axsync::Mutex<crate::mm::AddrSpace>>,
 ) -> bool {
     let state = super::current_user_live_cet_state();
@@ -396,91 +417,30 @@ fn preflight_cet_signal_delivery(
         && state
             .pl3_ssp
             .is_multiple_of(core::mem::size_of::<u64>() as u64)
-        && aspace
-            .lock()
-            .cet_default_shadow_stack_contains(thr.kernel_tid(), state.pl3_ssp)
-        && thr.cet_signal_has_capacity()
+        && aspace.lock().cet_signal_frame_fits(state.pl3_ssp)
 }
 
 #[cfg(target_arch = "x86_64")]
-fn cet_signal_token(epoch: u64, nonce: u64, frame: usize, saved_ssp: u64, handler_ssp: u64) -> u64 {
-    epoch.rotate_left(13)
-        ^ nonce.rotate_left(29)
-        ^ (frame as u64).rotate_left(41)
-        ^ saved_ssp.rotate_left(7)
-        ^ handler_ssp.rotate_left(53)
-        ^ CET_SIGNAL_MAGIC
-}
-
-#[cfg(target_arch = "x86_64")]
-fn publish_cet_signal_frame(
-    thr: &Thread,
-    memory: &mut UserMemoryContext<'_, AddressSpaceUserMemory>,
-    handler: &UserContext,
-) -> AxResult<()> {
+pub(crate) fn publish_cet_signal_frame(thr: &Thread, restorer: usize) -> AxResult<()> {
     let state = super::current_user_live_cet_state();
     if state.u_cet & 1 == 0 {
         return Ok(());
     }
-    let frame = handler
-        .sp()
-        .checked_add(core::mem::size_of::<usize>())
-        .ok_or(AxError::BadAddress)?;
-    let metadata = frame
-        .checked_add(CET_SIGNAL_METADATA_OFFSET)
-        .ok_or(AxError::BadAddress)?;
-    memory
-        .validate_write_range(metadata, core::mem::size_of::<CetSignalFrameMetadata>())
-        .map_err(|_| AxError::BadAddress)?;
-    let mut restorer = [MaybeUninit::<u8>::uninit(); 8];
-    memory
-        .read_bytes(handler.sp(), &mut restorer)
-        .map_err(|_| AxError::BadAddress)?;
-    let restorer = u64::from_ne_bytes(restorer.map(|byte| unsafe { byte.assume_init() }));
-    let (epoch, nonce) = thr.cet_signal_reserve().ok_or(AxError::StorageFull)?;
     let saved_ssp = state.pl3_ssp;
-    let shadow_start = saved_ssp.checked_sub(24).ok_or(AxError::BadAddress)?;
-    let handler_ssp = shadow_start.checked_add(8).ok_or(AxError::BadAddress)?;
-    let token = cet_signal_token(epoch, nonce, frame, saved_ssp, shadow_start);
+    let shadow_start = saved_ssp
+        .checked_sub(thekernel_linux_arch_x86_64::CET_SIGNAL_FRAME_SIZE)
+        .ok_or(AxError::BadAddress)?;
+    let token = thekernel_linux_arch_x86_64::cet_signal_restore_token(saved_ssp)
+        .map_err(|_| AxError::BadAddress)?;
     {
         let aspace = thr.proc_data.aspace();
         aspace.lock().write_cet_signal_frame(
-            thr.kernel_tid(),
             saved_ssp,
-            [restorer, nonce, token],
+            // Linux pushes the restorer followed by a tagged token naming
+            // the SSP which predates this signal. Nested handlers naturally
+            // form a LIFO chain in the shadow stack itself.
+            [restorer as u64, token],
         )?;
-    }
-    let metadata = CetSignalFrameMetadata([
-        CET_SIGNAL_MAGIC,
-        1,
-        epoch,
-        nonce,
-        frame as u64,
-        saved_ssp,
-        handler_ssp,
-        token,
-    ]);
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            (&metadata as *const CetSignalFrameMetadata).cast::<u8>(),
-            core::mem::size_of_val(&metadata),
-        )
-    };
-    memory
-        .write_bytes(frame + CET_SIGNAL_METADATA_OFFSET, bytes)
-        .map_err(|_| AxError::BadAddress)?;
-    let pending = CetPendingSignalFrame {
-        frame,
-        saved_ssp,
-        shadow_start,
-        handler_ssp,
-        restorer,
-        epoch,
-        nonce,
-        token,
-    };
-    if !thr.cet_signal_push(pending) {
-        return Err(AxError::BadState);
     }
     super::set_current_user_cet_state(axhal::asm::UserCetState {
         u_cet: state.u_cet,
@@ -527,6 +487,9 @@ pub(crate) fn complete_signal_delivery(
     uctx: &mut UserContext,
     delivered: DeliveredSignal,
 ) {
+    // A signal frame cannot expose the synthetic XOL PC.  Abort before the
+    // frame is built so siginfo/ucontext describe the original instruction.
+    crate::uprobe::abort_xol(uctx);
     acknowledge_posix_timer_signal(&thr.proc_data, &delivered.info);
 
     let signo = delivered.info.signo();
@@ -561,7 +524,7 @@ pub(crate) fn complete_signal_delivery(
             // scheduler image and live registers so the handler starts with
             // the architectural user FP state, while all failed/default
             // paths retain the interrupted state.
-            reset_current_legacy_fp_state();
+            reset_current_xsave_state();
         }
     }
 }
@@ -1263,6 +1226,14 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
         && !proc_data.should_exit_for_exec(tid)
         && proc_data.should_wait_for_stop()
     {
+        // Cgroup freezing reuses the scheduler-backed stop wait but remains
+        // independent from job-control/ptrace state.  A wake caused by the
+        // freezer request reaches this point before the next blocking poll.
+        if proc_data.cgroup_freeze_requested() {
+            thr.enter_cgroup_freezer();
+        } else {
+            thr.leave_cgroup_freezer();
+        }
         match block_on_poll_set(&proc_data.stop_event, || {
             if !proc_data.should_wait_for_stop()
                 || thr.pending_exit()
@@ -1276,6 +1247,12 @@ pub fn wait_if_stopped(thr: &Thread, uctx: &mut UserContext) {
             Ok(()) => {}
             Err(_) => handle_stopped_interrupt(thr, uctx),
         }
+    }
+    // Thaw or terminal exit releases exactly the membership counted above.
+    // A remaining job-control stop keeps the loop parked and therefore does
+    // not let cgroup accounting race an active wait.
+    if !proc_data.cgroup_freeze_requested() || thr.pending_exit() {
+        thr.leave_cgroup_freezer();
     }
 }
 
@@ -1314,11 +1291,9 @@ pub fn notify_ptrace_attach_stop(proc_data: &ProcessData) {
 
 #[cfg(test)]
 mod tests {
-    use axtask::LegacyFxsaveImage;
     use linux_raw_sys::general::SI_MESGQ;
     use thekernel_linux_signal::{
         PreparedSignal, SignalInfo, SignalQueueAccount, SignalRtPayload, SignalTimerPayload, Signo,
-        arch::LegacyFpState64,
     };
 
     use super::{PtraceSignalRecord, SignalQueuePolicy, prepare_signal_with_accounts};
@@ -1391,18 +1366,5 @@ mod tests {
         drop(record);
         assert_eq!(per_user.queued(), 0);
         assert_eq!(global.queued(), 0);
-    }
-
-    #[test]
-    fn legacy_fp_conversion_rejects_bad_mxcsr_without_mutating_image() {
-        let mut bytes = [0; LegacyFpState64::SIZE];
-        bytes[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
-        let signal_image = LegacyFpState64::from_bytes(bytes);
-        let fxsave_image = LegacyFxsaveImage::from_bytes(signal_image.to_bytes());
-
-        assert_eq!(fxsave_image.as_bytes(), &bytes);
-        assert!(fxsave_image.validate().is_err());
-        assert_eq!(fxsave_image.into_bytes(), bytes);
-        assert_eq!(signal_image.to_bytes(), bytes);
     }
 }

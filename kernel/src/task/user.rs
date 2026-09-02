@@ -2,7 +2,8 @@ use axhal::uspace::{
     ExceptionInfo, ExceptionKind, ReturnReason, UserContext, UserReturnHookResult,
 };
 use axtask::{TaskCreateError, TaskInner};
-use linux_raw_sys::general::{BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR};
+use linux_raw_sys::general::{BUS_ADRERR, BUS_MCEERR_AO, BUS_MCEERR_AR, SEGV_ACCERR, SEGV_MAPERR};
+use thekernel_linux_arch_x86_64::SEGV_CPERR;
 use thekernel_linux_process_adapter::{LINUX_PID_MAX, Pid, try_pid_from_task_id};
 use thekernel_linux_signal::{SignalInfo, Signo};
 
@@ -41,6 +42,38 @@ fn map_other_exception(exc_info: &ExceptionInfo) -> Signo {
     Signo::SIGSEGV
 }
 
+/// Preserve the Linux x86 #CP `siginfo_t` ABI instead of reducing the fault
+/// to a generic SI_KERNEL SIGSEGV. `cr2` is the x86 fault-address register,
+/// but #CP does not update it; Linux reports the trapping instruction address
+/// in `si_addr` for that exception.
+fn map_exception_signal_info(exc_info: &ExceptionInfo, instruction_pointer: usize) -> SignalInfo {
+    if exc_info.vector == 21 {
+        return control_protection_signal_info(instruction_pointer);
+    }
+    if exc_info.vector == 18 {
+        // #MC arriving while executing a user image is delivered according
+        // to that thread's PR_MCE_KILL policy. EARLY means action required;
+        // LATE/DEFAULT report action optional and let normal signal policy
+        // decide whether the task can continue.
+        let code = match axtask::current().as_thread().mce_kill_policy() {
+            1 => BUS_MCEERR_AR,
+            _ => BUS_MCEERR_AO,
+        };
+        return SignalInfo::new_fault(Signo::SIGBUS, code as i32, instruction_pointer);
+    }
+    let signo = match exc_info.kind() {
+        ExceptionKind::Misaligned => Signo::SIGBUS,
+        ExceptionKind::Breakpoint => Signo::SIGTRAP,
+        ExceptionKind::IllegalInstruction => Signo::SIGILL,
+        ExceptionKind::Other => map_other_exception(exc_info),
+    };
+    SignalInfo::new_kernel(signo)
+}
+
+fn control_protection_signal_info(instruction_pointer: usize) -> SignalInfo {
+    SignalInfo::new_fault(Signo::SIGSEGV, SEGV_CPERR as i32, instruction_pointer)
+}
+
 fn deliver_fatal_user_signal_info(info: SignalInfo) {
     force_signal_current_thread(info);
 }
@@ -69,6 +102,13 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     .map_err(map_usercopy_error);
             }
             while !thr.pending_exit() {
+                // Cgroup/sysctl clamp writes commit their policy before
+                // attempting every live runqueue transaction. A task that
+                // was migrating during that bounded pass remains marked dirty
+                // and retries here in normal task context, before its next
+                // user entry. This never turns an IRQ/switch hook into a
+                // scheduler-recursive policy path.
+                crate::pseudofs::cgroup::reconcile_current_uclamp_if_stale();
                 // The final rseq gate runs while interrupts are disabled by
                 // `run_with_return_hook`; a Retry returns here with IRQs
                 // restored so task-context scheduling/fault handling can run
@@ -88,6 +128,7 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     }) {
                         UserReturnHookResult::Returned(reason) => break reason,
                         UserReturnHookResult::Retry => {
+                            thr.perf_clock_domain_transition(false);
                             set_timer_state(&curr, TimerState::Kernel);
                             if thr.pending_exit() {
                                 break ReturnReason::Interrupt;
@@ -106,6 +147,7 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                             axtask::resched_if_needed();
                         }
                         UserReturnHookResult::Fault => {
+                            thr.perf_clock_domain_transition(false);
                             set_timer_state(&curr, TimerState::Kernel);
                             // A registered area/descriptor which cannot be
                             // observed without faulting is visible as a fatal
@@ -119,6 +161,10 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     }
                 };
 
+                // We have returned from a ring-3 execution context.  Settle
+                // perf clock sources before any syscall/fault kernel work can
+                // extend that user interval.
+                thr.perf_clock_domain_transition(false);
                 set_timer_state(&curr, TimerState::Kernel);
 
                 match reason {
@@ -138,6 +184,9 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                             );
                             let info = match result {
                                 PageFaultResult::Handled => unreachable!(),
+                                PageFaultResult::Retry => {
+                                    unreachable!("FaultSession consumes file-cache reclaim retries")
+                                }
                                 PageFaultResult::Failed(PageFaultFailure::OutOfMemory) => {
                                     SignalInfo::new_kernel(Signo::SIGKILL)
                                 }
@@ -169,13 +218,11 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     }
                     ReturnReason::Interrupt => {}
                     ReturnReason::Exception(exc_info) => {
-                        let signo = match exc_info.kind() {
-                            ExceptionKind::Misaligned => Signo::SIGBUS,
-                            ExceptionKind::Breakpoint => Signo::SIGTRAP,
-                            ExceptionKind::IllegalInstruction => Signo::SIGILL,
-                            ExceptionKind::Other => map_other_exception(&exc_info),
-                        };
-                        deliver_fatal_user_signal(signo);
+                        crate::uprobe::abort_xol(&mut uctx);
+                        deliver_fatal_user_signal_info(map_exception_signal_info(
+                            &exc_info,
+                            uctx.ip() as usize,
+                        ));
                     }
                     r => {
                         warn!("Unexpected return reason: {r:?}");
@@ -201,25 +248,6 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                     }
                 }
 
-                #[cfg(target_arch = "x86_64")]
-                {
-                    // A shared-mm peer may have unmapped this task's default
-                    // stack.  The MM never takes a Thread lock; this return
-                    // boundary consumes its lease and prevents a stale PL3_SSP
-                    // from reaching userspace.
-                    let cet = super::current_user_live_cet_state();
-                    if cet.u_cet & 1 != 0
-                        && !thr
-                            .proc_data
-                            .aspace()
-                            .lock()
-                            .cet_default_shadow_stack_contains(thr.kernel_tid(), cet.pl3_ssp)
-                    {
-                        thr.clear_cet_signal_frames();
-                        super::reset_current_user_cet_state();
-                    }
-                }
-
                 while check_signals(thr, &mut uctx, None) {}
 
                 // Block if the process has been stopped (by this or another thread).
@@ -237,6 +265,9 @@ pub fn try_new_user_task(name: String, mut uctx: UserContext) -> AxResult<TaskIn
                 }
 
                 thr.finish_signal_resume(&mut uctx);
+                // This is the final user-return boundary; account the kernel
+                // tail before the next interval begins at ring 3.
+                thr.perf_clock_domain_transition(true);
                 if set_timer_state(&curr, TimerState::User) {
                     // The CPU-timer worker became runnable after the earlier
                     // user-return safe point. Consume that wake before leaving
@@ -305,6 +336,14 @@ mod tests {
         assert_eq!(
             task_create_error(TaskCreateError::IdentifierExhausted),
             AxError::WouldBlock
+        );
+    }
+
+    #[test]
+    fn control_protection_fault_uses_the_trapping_instruction_address() {
+        assert_eq!(
+            control_protection_signal_info(0x7fff_1234_5000).fault_address(),
+            0x7fff_1234_5000
         );
     }
 }

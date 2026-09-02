@@ -1,10 +1,14 @@
 use axerrno::{AxError, AxResult, LinuxError};
-use axtask::{TaskState, current, yield_now};
+use axtask::{
+    TaskState, current, replace_inactive_task_user_cet_state,
+    snapshot_inactive_task_user_cet_state, yield_now,
+};
+use thekernel_linux_arch_x86_64::{ARCH_SHSTK_UNLOCK, NT_X86_SHSTK, X86ShstkRegset};
 use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_signal::{SignalInfo, Signo};
 
 use crate::{
-    mm::{UserMemoryCapability, map_usercopy_error},
+    mm::{IoVec, UserMemoryCapability, map_usercopy_error},
     task::{
         AsThread, ProcessData, PtraceAccessMode, PtraceRelationshipOrigin,
         PtraceRelationshipSnapshot, PtraceReverseLink, PtraceSession, TaskParentCredentialPin,
@@ -28,6 +32,7 @@ const PTRACE_SINGLESTEP: u32 = 9;
 const PTRACE_ATTACH: u32 = 16;
 const PTRACE_DETACH: u32 = 17;
 const PTRACE_SYSCALL: u32 = 24;
+const PTRACE_ARCH_PRCTL: u32 = 30;
 const PTRACE_SETOPTIONS: u32 = 0x4200;
 const PTRACE_GETEVENTMSG: u32 = 0x4201;
 const PTRACE_GETSIGINFO: u32 = 0x4202;
@@ -39,6 +44,9 @@ const PTRACE_INTERRUPT: u32 = 0x4207;
 const PTRACE_LISTEN: u32 = 0x4208;
 
 const PTRACE_O_MASK: usize = 0x2f_ffff;
+
+#[cfg(target_arch = "x86_64")]
+const ARCH_SHSTK_FEATURES: usize = 0b11;
 
 fn ptrace_io_error() -> AxError {
     LinuxError::EIO.into()
@@ -190,7 +198,7 @@ fn do_attach(target_thread: &Thread, seized: bool, initial_options: u32) -> AxRe
         ptracer,
         &ptracer_credential,
         PtraceRelationshipOrigin::Attach,
-        &ptracer_credential,
+        ptracer_credential.credential(),
         seized,
         initial_options,
         &authorized_image,
@@ -265,6 +273,129 @@ fn poke_word(
     memory
         .write_value(addr as *mut usize, data)
         .map_err(|_| ptrace_io_error())?;
+    Ok(0)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn canonical_user_address(address: u64) -> bool {
+    // The supported x86_64 product ABI uses canonical 48-bit user addresses.
+    // Keep this check separate from VMA validation so malformed pointers never
+    // reach address-space policy.
+    ((address as i64) << 16 >> 16) as u64 == address
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ptrace_shstk_regset(
+    tracer_memory: &UserMemoryCapability,
+    target_task: &axtask::AxTaskRef,
+    target: &ProcessData,
+    session: PtraceSession,
+    request: u32,
+    note: usize,
+    iov_address: usize,
+) -> AxResult<isize> {
+    // Linux checks tracee-stop authorization before interpreting the regset.
+    check_inactive_tracee(target).and_then(|observed| {
+        (observed == session)
+            .then_some(())
+            .ok_or(AxError::NoSuchProcess)
+    })?;
+    if note != NT_X86_SHSTK {
+        return Err(ptrace_io_error());
+    }
+    if !axhal::asm::user_shadow_stack_enabled() {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    let mut iov = unsafe {
+        tracer_memory
+            .read_value_uninit(iov_address as *const IoVec)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
+    let required = core::mem::size_of::<X86ShstkRegset>();
+    if iov.iov_base == 0 || iov.iov_len < required as i64 {
+        return Err(ptrace_io_error());
+    }
+    match request {
+        PTRACE_GETREGSET => {
+            let state = snapshot_inactive_task_user_cet_state(target_task)
+                .map_err(|_| AxError::NoSuchProcess)?;
+            tracer_memory
+                .write_value(
+                    iov.iov_base as *mut X86ShstkRegset,
+                    X86ShstkRegset { ssp: state.pl3_ssp },
+                )
+                .map_err(map_usercopy_error)?;
+            iov.iov_len = required as i64;
+            tracer_memory
+                .write_value(iov_address as *mut IoVec, iov)
+                .map_err(map_usercopy_error)?;
+            Ok(0)
+        }
+        PTRACE_SETREGSET => {
+            if iov.iov_len != required as i64 {
+                return Err(AxError::InvalidInput);
+            }
+            let regset = tracer_memory
+                .read_value(iov.iov_base as *const X86ShstkRegset)
+                .map_err(map_usercopy_error)?;
+            if !canonical_user_address(regset.ssp) || regset.ssp & 7 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let mut state = snapshot_inactive_task_user_cet_state(target_task)
+                .map_err(|_| AxError::NoSuchProcess)?;
+            if !target
+                .aspace()
+                .lock()
+                .cet_shadow_stack_pointer_valid(regset.ssp)
+            {
+                return Err(AxError::InvalidInput);
+            }
+            state.pl3_ssp = regset.ssp;
+            replace_inactive_task_user_cet_state(target_task, state)
+                .map_err(|_| AxError::NoSuchProcess)?;
+            Ok(0)
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Execute the one x86 arch_prctl operation Linux permits a tracer to apply
+/// to a stopped tracee.  The normal `arch_prctl(ARCH_SHSTK_UNLOCK)` syscall
+/// remains EPERM: permitting it here is deliberately tied to both a live
+/// ptrace relationship and the stop generation checked by
+/// `check_inactive_tracee`.
+#[cfg(target_arch = "x86_64")]
+fn ptrace_arch_prctl(
+    target_task: &axtask::AxTaskRef,
+    target: &ProcessData,
+    session: PtraceSession,
+    code: usize,
+    requested_features: usize,
+) -> AxResult<isize> {
+    // PTRACE_ARCH_PRCTL is a stopped-tracee operation, just like the CET
+    // regset.  Establish that boundary before interpreting the operation or
+    // its feature mask.
+    let observed = check_inactive_tracee(target)?;
+    if observed != session {
+        return Err(AxError::NoSuchProcess);
+    }
+    if i32::try_from(code).ok() != Some(ARCH_SHSTK_UNLOCK) {
+        return Err(ptrace_io_error());
+    }
+    if !axhal::asm::user_shadow_stack_enabled() {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    if requested_features == 0 || requested_features & !ARCH_SHSTK_FEATURES != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    // The outer ptrace action guard prevents a sibling tracer from resuming
+    // or detaching after the stop generation above was observed.
+    let mut state =
+        snapshot_inactive_task_user_cet_state(target_task).map_err(|_| AxError::NoSuchProcess)?;
+    state.locked &= !(requested_features as u64);
+    replace_inactive_task_user_cet_state(target_task, state).map_err(|_| AxError::NoSuchProcess)?;
     Ok(0)
 }
 
@@ -352,7 +483,7 @@ fn sys_ptrace_traceme() -> AxResult<isize> {
                     parent,
                     &parent_credential,
                     PtraceRelationshipOrigin::Traceme,
-                    &child_credential,
+                    child_credential.credential(),
                     false,
                     0,
                     &authorized_image,
@@ -502,9 +633,36 @@ fn sys_ptrace_for_target(
             target.replace_ptrace_signal_info(session, info)?;
             Ok(0)
         }
+        PTRACE_ARCH_PRCTL => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let session = check_tracee(&target)?;
+                return ptrace_arch_prctl(&target_task, &target, session, addr, data);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                Err(ptrace_io_error())
+            }
+        }
         PTRACE_GETREGSET | PTRACE_SETREGSET => {
-            check_inactive_tracee(&target)?;
-            Err(ptrace_io_error())
+            #[cfg(target_arch = "x86_64")]
+            {
+                let session = check_inactive_tracee(&target)?;
+                return ptrace_shstk_regset(
+                    tracer_memory,
+                    &target_task,
+                    &target,
+                    session,
+                    request,
+                    addr,
+                    data,
+                );
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                check_inactive_tracee(&target)?;
+                Err(ptrace_io_error())
+            }
         }
         PTRACE_ATTACH | PTRACE_SEIZE => unreachable!(),
         _ => Err(AxError::InvalidInput),

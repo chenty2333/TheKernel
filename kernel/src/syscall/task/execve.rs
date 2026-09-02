@@ -5,7 +5,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs_ng_vfs::NodeType;
+use axfs_ng_vfs::{FsName, FsPath, FsPathBuf, NodeType};
 use axhal::{
     paging::{MappingFlags, PageSize},
     uspace::UserContext,
@@ -24,8 +24,9 @@ use crate::{
     },
     keyring::{self, KeyTaskOwner},
     mm::{
-        Backend, ExecImageAccess, ExecLayout, copy_from_kernel, finish_prepared_user_app,
-        new_user_aspace_empty, new_user_aspace_with_page_zero, preflight_user_app_at,
+        Backend, ExecImageAccess, ExecLayout, check_rlimit_as_growth, copy_from_kernel,
+        finish_prepared_user_app, new_user_aspace_empty, new_user_aspace_with_page_zero,
+        preflight_user_app_at,
     },
     readiness::block_on_poll_set,
     task::{
@@ -248,12 +249,19 @@ fn exec_arg_too_big() -> AxError {
     LinuxError::E2BIG.into()
 }
 
-fn try_copy_string(value: &str) -> AxResult<String> {
-    let mut copy = String::new();
-    copy.try_reserve_exact(value.len())
+fn try_copy_path(value: &FsPath) -> AxResult<FsPathBuf> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(value.as_bytes().len())
         .map_err(|_| AxError::NoMemory)?;
-    copy.push_str(value);
-    Ok(copy)
+    copy.extend_from_slice(value.as_bytes());
+    Ok(FsPathBuf::from_vec(copy))
+}
+
+/// Task names are diagnostic metadata rather than VFS paths. Preserve exec's
+/// byte pathname independently and give the scheduler a non-failing display
+/// name for non-UTF-8 final components.
+fn task_name_from_fs_name(name: &FsName) -> String {
+    String::from_utf8_lossy(name.as_bytes()).into_owned()
 }
 
 fn map_exec_vm_error(err: UserCopyError) -> AxError {
@@ -265,12 +273,20 @@ fn map_exec_vm_error(err: UserCopyError) -> AxError {
     }
 }
 
-fn vm_load_exec_string<M: UserMemory + ?Sized>(
+fn vm_load_exec_bytes<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ptr: *const c_char,
-) -> AxResult<String> {
-    let bytes = vm_load_until_nul(memory, ptr.cast::<u8>()).map_err(map_exec_vm_error)?;
-    String::from_utf8(bytes).map_err(|_| AxError::IllegalBytes)
+) -> AxResult<Vec<u8>> {
+    vm_load_until_nul(memory, ptr.cast::<u8>()).map_err(map_exec_vm_error)
+}
+
+fn vm_load_exec_path<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    ptr: *const c_char,
+) -> AxResult<FsPathBuf> {
+    Ok(FsPathBuf::from_vec(
+        vm_load_until_nul(memory, ptr.cast::<u8>()).map_err(map_exec_vm_error)?,
+    ))
 }
 
 struct ExecArgSizer {
@@ -305,7 +321,7 @@ impl ExecArgSizer {
         Ok(())
     }
 
-    fn push_string_bytes(&mut self, value: &str) -> AxResult {
+    fn push_string_bytes(&mut self, value: &[u8]) -> AxResult {
         let string_bytes = value.len().checked_add(1).ok_or_else(exec_arg_too_big)?;
         if string_bytes > EXEC_MAX_ARG_STRLEN {
             return Err(exec_arg_too_big());
@@ -321,7 +337,7 @@ impl ExecArgSizer {
         Ok(())
     }
 
-    fn push_str(&mut self, value: &str) -> AxResult {
+    fn push_bytes(&mut self, value: &[u8]) -> AxResult {
         self.push_pointer_slot()?;
         self.push_string_bytes(value)
     }
@@ -400,11 +416,11 @@ fn snapshot_exec_pointer_array<M: UserMemory + ?Sized>(
     Err(exec_arg_too_big())
 }
 
-fn load_exec_string_vec<M: UserMemory + ?Sized>(
+fn load_exec_byte_vec<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ptr: *const *const c_char,
     sizer: &mut ExecArgSizer,
-) -> AxResult<Vec<String>> {
+) -> AxResult<Vec<Vec<u8>>> {
     let ptrs = snapshot_exec_pointer_array(memory, ptr, sizer)?;
     let mut values = Vec::new();
     if !ptrs.is_empty() {
@@ -413,7 +429,7 @@ fn load_exec_string_vec<M: UserMemory + ?Sized>(
             .map_err(|_| AxError::NoMemory)?;
     }
     for ptr in ptrs {
-        let value = vm_load_exec_string(memory, ptr)?;
+        let value = vm_load_exec_bytes(memory, ptr)?;
         sizer.push_string_bytes(&value)?;
         values.push(value);
     }
@@ -424,18 +440,18 @@ fn load_exec_args_env<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     argv: *const *const c_char,
     envp: *const *const c_char,
-) -> AxResult<(Vec<String>, Vec<String>)> {
+) -> AxResult<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
     let mut sizer = ExecArgSizer::new()?;
     let args = if argv.is_null() {
         Vec::new()
     } else {
-        load_exec_string_vec(memory, argv, &mut sizer)?
+        load_exec_byte_vec(memory, argv, &mut sizer)?
     };
     let args = if args.is_empty() {
-        sizer.push_str("")?;
+        sizer.push_bytes(b"")?;
         let mut args = Vec::new();
         args.try_reserve_exact(1).map_err(|_| AxError::NoMemory)?;
-        args.push(String::new());
+        args.push(Vec::new());
         args
     } else {
         args
@@ -444,7 +460,7 @@ fn load_exec_args_env<M: UserMemory + ?Sized>(
     let envs = if envp.is_null() {
         Vec::new()
     } else {
-        load_exec_string_vec(memory, envp, &mut sizer)?
+        load_exec_byte_vec(memory, envp, &mut sizer)?
     };
 
     Ok((args, envs))
@@ -453,8 +469,8 @@ fn load_exec_args_env<M: UserMemory + ?Sized>(
 fn do_execve(
     uctx: &mut UserContext,
     loc: axfs_ng_vfs::Location,
-    args: Vec<String>,
-    envs: Vec<String>,
+    args: Vec<Vec<u8>>,
+    envs: Vec<Vec<u8>>,
     security: &VfsSecurityContext,
 ) -> AxResult<isize> {
     let actor = security.actor_arc();
@@ -470,11 +486,8 @@ fn do_execve(
     )?;
     fanotify::permission_check(&loc, &loc, fanotify::FAN_OPEN_PERM, loc.is_dir(), false)?;
 
-    let abs_path = {
-        let absolute_path = loc.absolute_path()?;
-        try_copy_string(absolute_path.as_str())
-    }?;
-    let task_name = try_copy_string(loc.name())?;
+    let abs_path = try_copy_path(&loc.absolute_path()?)?;
+    let task_name = task_name_from_fs_name(loc.name());
 
     let thr = curr.as_thread();
     let proc_data = &thr.proc_data;
@@ -488,7 +501,7 @@ fn do_execve(
     // ELF entries later, so this does not perform a second executable load.
     let mut prepared_app = preflight_user_app_at(
         loc.clone(),
-        abs_path.as_str(),
+        &abs_path,
         &args,
         credentials,
         actor,
@@ -511,7 +524,7 @@ fn do_execve(
     let source_mode = source_security.mode();
     let final_exe_path = {
         let path = prepared_app.credential_source.absolute_path()?;
-        try_copy_string(path.as_str())?
+        try_copy_path(&path)?
     };
     let file_owner = source_security.owner();
     let nosuid = crate::mounts::is_nosuid(&prepared_app.credential_source)?;
@@ -565,7 +578,7 @@ fn do_execve(
     // identity/security auxv entries installed into the new stack.
     let loaded = finish_prepared_user_app(
         &mut new_aspace,
-        abs_path.as_str(),
+        &abs_path,
         &envs,
         prepared_app,
         effects.aux_identity(),
@@ -579,6 +592,11 @@ fn do_execve(
     if mmap_page_zero {
         install_mmap_page_zero(&mut new_aspace)?;
     }
+    // ELF, interpreter, stack, heap, trampoline, and optional page zero are
+    // prepared off to the side.  Apply the caller's live RLIMIT_AS to their
+    // complete VMA image before fanotify notification or irreversible exec
+    // publication; passing zero deliberately checks the already-built total.
+    check_rlimit_as_growth(proc_data, &new_aspace, 0)?;
     fanotify::notify(
         &loc,
         &loc,
@@ -592,6 +610,11 @@ fn do_execve(
     // the address-space handle nor the procfs cmdline may allocate after the
     // CLOEXEC commit point.
     let new_aspace = Arc::try_new(axsync::Mutex::new(new_aspace)).map_err(|_| AxError::NoMemory)?;
+    // Before this image can cross the irreversible exec handoff, publish its
+    // private executable probe overlays and RX trampoline page.  A failure
+    // leaves the old mm current and the new image wholly unpublished.
+    let uprobe_topology = crate::uprobe::registration_topology_gate();
+    crate::uprobe::install_all_for_mm_gated(&new_aspace)?;
     let new_token = new_aspace.lock().address_space_token();
     let new_cmdline = Arc::try_new(loaded.arguments).map_err(|_| AxError::NoMemory)?;
     let new_task_alias = (!thr.is_thread_group_leader()).then(|| curr.clone());
@@ -661,6 +684,7 @@ fn do_execve(
     sibling_tids.retain(|&tid| tid != curr_tid);
     interrupt_exec_siblings(&sibling_tids);
     wait_for_exec_group(proc_data, thr, uctx, curr_tid, &sibling_tids)?;
+    crate::file::seccomp_notif::cancel_requests_for_task(current().id().as_u64());
     // No-failure commit: the manager retains its old queues/registrations,
     // while the owner swap resets only caught dispositions and leaves
     // sighand-sharing peers on the old owner.
@@ -668,10 +692,12 @@ fn do_execve(
     if let Some(private) = private_fd_table {
         drop(thr.replace_fd_table(crate::task::FdTableSlot::new(private)));
     }
+    thr.perf_on_exec();
     // The selected table owns full-capacity detach and cleanup storage. Commit
     // covers flags/descriptors added after preparation and has no recoverable
     // branch or runtime invariant panic.
     cloexec.commit();
+    crate::syscall::fs::io_uring::release_registered_ring_fds(thr.kernel_tid() as u64);
     crate::file::inotify::wait_current_close_notifications();
 
     crate::syscall::cleanup_process_aio(proc_data.proc.pid());
@@ -687,6 +713,11 @@ fn do_execve(
         mem::take(&mut *timers)
     };
     drop(retired_posix_timers);
+    // CPU-clock POSIX timers contribute a fast-path accounting-worker
+    // admission bit.  The table was detached atomically above, so refresh it
+    // before the new image becomes visible; otherwise an old one-shot could
+    // keep the new image's CPU worker needlessly armed.
+    crate::task::refresh_posix_cpu_timer_armed(&proc_data);
 
     // This is the Linux bprm_committing_creds analogue. Sibling teardown,
     // CLOEXEC, and AIO cleanup have crossed the point of no return; the hook is
@@ -729,6 +760,12 @@ fn do_execve(
     // retirement continues to own the old credential and old image through
     // the hardware page-table-root switch below.
     let mut exec_retirement = exec_commit.complete_post_commit();
+    // Logging policy is attached to the task-owned Landlock domain rather
+    // than the executable object.  Cross the lifecycle boundary only after
+    // exec has committed, so a failed exec cannot change audit behavior.
+    let landlock_domain = thr.landlock_domain().after_exec();
+    thr.replace_landlock_domain(landlock_domain.clone());
+    proc_data.replace_group_leader_landlock_domain(landlock_domain);
     // Freeze the relationship which observed the exec commit while the exec
     // gate still excludes a fresh attach. The action gate keeps that exact
     // relationship stable through stop publication; a later attachment must
@@ -754,7 +791,7 @@ fn do_execve(
     };
     drop(old_cmdline);
 
-    proc_data.set_heap_layout(layout.heap_base());
+    proc_data.reset_mm_layout_for_exec(layout.heap_base(), user_stack_base.as_usize());
     // A successful exec installs a fresh mm, so no nonzero key allocation or
     // stale mapping key can survive into the new image.
     proc_data.reset_pkeys_for_exec();
@@ -767,9 +804,8 @@ fn do_execve(
 
     install_exec_user_context(uctx, entry_point.as_usize(), user_stack_base);
     reset_current_task_extended_state();
-    thr.clear_cet_signal_frames();
     reset_current_user_cet_state();
-    axtask::reset_current_task_pkru();
+    crate::task::reset_current_xsave_state();
     let _ = rseq_exec.commit();
     if let Some(session) = exec_ptrace_session
         && proc_data.ptrace_stop(session, Signo::SIGTRAP as u8)
@@ -788,6 +824,9 @@ fn do_execve(
     exec_admission.release();
     proc_data.release_vfork();
     drop(completed_exec_retirement);
+    // Registration must not observe the new mm before old-mm retirement and
+    // process image publication have completed as one topology transition.
+    drop(uprobe_topology);
     Ok(0)
 }
 
@@ -798,7 +837,7 @@ pub fn sys_execve<M: UserMemory + ?Sized>(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> AxResult<isize> {
-    let path = vm_load_exec_string(memory, path)?;
+    let path = vm_load_exec_path(memory, path)?;
     let (args, envs) = load_exec_args_env(memory, argv, envp)?;
 
     debug!("sys_execve <= path: {path:?}, args: {args:?}, envs: {envs:?}");
@@ -825,7 +864,7 @@ pub fn sys_execveat<M: UserMemory + ?Sized>(
         return Err(AxError::InvalidInput);
     }
 
-    let path = vm_load_exec_string(memory, path)?;
+    let path = vm_load_exec_path(memory, path)?;
     let (args, envs) = load_exec_args_env(memory, argv, envp)?;
     debug!(
         "sys_execveat <= dirfd: {dirfd}, path: {path:?}, args: {args:?}, envs: {envs:?}, flags: \
@@ -834,13 +873,13 @@ pub fn sys_execveat<M: UserMemory + ?Sized>(
 
     // Use one pre-exec view for the initial path and every interpreter lookup.
     let security = VfsSecurityContext::new(current().as_thread().current_cred());
-    let resolved = if path.is_empty() {
+    let resolved = if path.as_bytes().is_empty() {
         if (flags as u32) & AT_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);
         }
         resolve_at_with_security(dirfd, None, flags as u32, &security)?
     } else {
-        resolve_at_with_security(dirfd, Some(path.as_str()), flags as u32, &security)?
+        resolve_at_with_security(dirfd, Some(&path), flags as u32, &security)?
     };
 
     let loc = match resolved {
