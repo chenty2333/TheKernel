@@ -3,6 +3,7 @@
 use alloc::{
     borrow::Cow,
     boxed::Box,
+    collections::BTreeMap,
     sync::{Arc, Weak},
     task::Wake,
     vec::Vec,
@@ -28,34 +29,38 @@ use axfs::{
     PhysicalIoPendingReason, PhysicalIoPublication, PhysicalIoPublishOutcome, PhysicalIoResetProof,
     PhysicalIoSettleOutcome, PreparedPhysicalIoEffect,
 };
-use axfs_ng_vfs::PhysicalIoSegment;
+use axfs_ng_vfs::{FsPathBuf, PhysicalIoSegment, SubmittedFileIo};
 use axhal::paging::PageSize;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable};
 use axsync::Mutex;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
     POLLERR, POLLHUP, POLLIN, POLLMSG, POLLNVAL, POLLOUT, POLLPRI, POLLRDBAND, POLLRDHUP,
-    POLLRDNORM, POLLREMOVE, POLLWRBAND, POLLWRNORM,
+    POLLRDNORM, POLLREMOVE, POLLWRBAND, POLLWRNORM, open_how,
 };
 use ouroboros::self_referencing;
 use spin::Once;
 use thekernel_linux_io_uring::{
     BufferLeaseRelease, BufferSlot, BufferTableId, CancelSelector, CompletionPublication,
     CompletionToken, CopiedSubmission, FileSlot, FileTableId, IoUringError, IssuedRequest,
-    LeaseRelease, MappingRegion, ParsedSubmission, PreparedRequest, ReadWriteRequest,
-    RegisteredBufferLease, RegisteredBufferTable, RegisteredFileLease, RegisteredFileTable,
-    RequestId, RequestIssueError, RequestRegistry, RequestReservation, RingId, RingLayout,
-    TerminalCause,
+    LeaseRelease, MappingRegion, ParsedSubmission, PreparedRequest, ProviderCancelOutcome,
+    ReadWriteRequest, RegisteredBufferLease, RegisteredBufferTable, RegisteredFileLease,
+    RegisteredFileTable, RequestDescriptor, RequestId, RequestIssueError, RequestRegistry,
+    RequestReservation, RingId, RingLayout, SetupFlags, TerminalCause,
 };
+use thekernel_linux_process_adapter::Pid;
+use thekernel_linux_signal::SignalSet;
 
 use super::{
     DescriptionResource, FileDescription, FileHandle, FileLike, FileMmapRequest,
     FixedSharedMmapRegion, IoOperationContext, Kstat, PreparedFileMmap, SharedPages,
-    anon_inode_stat, memfd::MemfdMutationGuard, privilege_metadata::ContentWritePrivilegeGuard,
+    anon_inode_stat, event::EventFd, fanotify::FanotifyEventActor, fd_table::FdTable,
+    memfd::MemfdMutationGuard, permission::VfsSecurityContext,
+    privilege_metadata::ContentWritePrivilegeGuard,
 };
 use crate::mm::{
-    MutationAdmission, PinnedUserSegmentsMut, SharedAtomicU32, UserIoPinProvenance, UserIoPinSegment,
-    UserMemoryCapability, physical_segments_are_disjoint,
+    MutationAdmission, PinnedUserSegments, PinnedUserSegmentsMut, SharedAtomicU32,
+    UserIoPinProvenance, UserIoPinSegment, UserMemoryCapability, physical_segments_are_disjoint,
     try_pin_user_segments_to_user_longterm_with,
 };
 
@@ -388,6 +393,67 @@ const POLL_ALWAYS_REPORTED: IoEvents = IoEvents::ALWAYS;
 /// `WouldBlock`; no unbounded queue or generic async executor is introduced.
 pub(crate) const IO_URING_PENDING_STREAM_CAPACITY: usize = 64;
 const IO_URING_PENDING_STREAM_BUDGET: usize = 8;
+
+/// Explicit execution identity retained by an SQPOLL ring.  A polling worker
+/// is a kernel task and must never inherit its own files, address space, or
+/// credentials for a userspace SQE.  The creator installs this immutable
+/// snapshot before the worker is started; individual SQEs still acquire a
+/// fresh descriptor lease from the retained `files` table, so close/exec
+/// races retain Linux's issue-time lookup behavior.
+#[derive(Clone)]
+pub(crate) struct IoUringSubmissionActor {
+    files: Arc<FdTable>,
+    memory: UserMemoryCapability,
+    security: VfsSecurityContext,
+    fanotify_actor: FanotifyEventActor,
+    process_id: Pid,
+    path_snapshot: crate::task::NamespaceCredentialFsSnapshot,
+    nofile_limit: usize,
+}
+
+impl IoUringSubmissionActor {
+    pub(crate) fn new(
+        files: Arc<FdTable>,
+        memory: UserMemoryCapability,
+        security: VfsSecurityContext,
+        fanotify_actor: FanotifyEventActor,
+        process_id: Pid,
+        path_snapshot: crate::task::NamespaceCredentialFsSnapshot,
+        nofile_limit: usize,
+    ) -> Self {
+        Self {
+            files,
+            memory,
+            security,
+            fanotify_actor,
+            process_id,
+            path_snapshot,
+            nofile_limit,
+        }
+    }
+
+    pub(crate) const fn files(&self) -> &Arc<FdTable> {
+        &self.files
+    }
+    pub(crate) const fn memory(&self) -> &UserMemoryCapability {
+        &self.memory
+    }
+    pub(crate) const fn security(&self) -> &VfsSecurityContext {
+        &self.security
+    }
+    pub(crate) const fn fanotify_actor(&self) -> FanotifyEventActor {
+        self.fanotify_actor
+    }
+    pub(crate) const fn process_id(&self) -> Pid {
+        self.process_id
+    }
+    pub(crate) const fn path_snapshot(&self) -> &crate::task::NamespaceCredentialFsSnapshot {
+        &self.path_snapshot
+    }
+    pub(crate) const fn nofile_limit(&self) -> usize {
+        self.nofile_limit
+    }
+}
 
 fn pending_stream_events() -> IoEvents {
     IoEvents::READABLE | IoEvents::HANGUP | IoEvents::ERROR
@@ -4730,11 +4796,11 @@ struct RegisteredFiles {
 struct RegisteredBuffer {
     address: usize,
     length: usize,
+    capability: UserMemoryCapability,
     pin_start: usize,
     pin_len: usize,
     segment_ends: Vec<usize>,
     pin_segments_disjoint: bool,
-    capability: UserMemoryCapability,
     // Release the lower VM/frame/page-cache pin before making this ring's
     // admission charge reusable. A large unpin can yield enough observable
     // time for another registration to consume the io_uring budget while the
@@ -4753,6 +4819,35 @@ struct RegisteredBuffers {
     table: RegisteredBufferTable<RegisteredBuffer>,
     _charge: RegisteredBufferSlotCharge,
 }
+
+/// A ring-owned user region used exclusively for v6.18 registered wait
+/// records.  Retaining the original capability keeps the region bound to its
+/// registration address space rather than whichever task later enters it.
+struct RegisteredWaitRegion {
+    /// Kernel-owned, zero-filled backing exported at the fixed v6.18
+    /// parameter-region offset.  Keeping both the mapping policy and its
+    /// backing here makes final-close/unmap lifetime purely Arc based.
+    backing: RegisteredWaitBacking,
+    length: usize,
+    wait_arguments: bool,
+}
+
+enum RegisteredWaitBacking {
+    Kernel {
+        region: FixedSharedMmapRegion,
+        pages: Arc<SharedPages>,
+    },
+    User {
+        capability: UserMemoryCapability,
+        address: usize,
+        _pin: PinnedUserSegments,
+    },
+}
+
+/// `IORING_MAP_OFF_PARAM_REGION` is an internal v6.18 mmap selector.  It is
+/// deliberately distinct from the three public SQ/CQ/SQE offsets and the
+/// provided-buffer selector range.
+const IORING_MAP_OFF_PARAM_REGION: u64 = 0x2000_0000;
 
 struct IoUringFinalizer {
     ring: Option<Arc<IoUring>>,
@@ -4777,7 +4872,19 @@ pub(crate) enum IoUringFileLease {
 
 pub(crate) struct IoUringBufferLease {
     ring: Arc<IoUring>,
-    lease: Option<RegisteredBufferLease<RegisteredBuffer>>,
+    owner: IoUringBufferLeaseOwner,
+    provided_return_on_drop: bool,
+}
+
+enum IoUringBufferLeaseOwner {
+    Registered(Option<RegisteredBufferLease<RegisteredBuffer>>),
+    Provided {
+        group: u16,
+        id: u16,
+        address: u64,
+        length: u32,
+        capability: UserMemoryCapability,
+    },
 }
 
 /// The only operations which may consume a prepared physical admission.
@@ -5240,10 +5347,22 @@ impl Drop for PreparedPhysicalIoAdmission {
 
 impl Drop for IoUringBufferLease {
     fn drop(&mut self) {
-        let Some(lease) = self.lease.take() else {
-            return;
-        };
-        self.ring.release_registered_buffer(lease);
+        match &mut self.owner {
+            IoUringBufferLeaseOwner::Registered(lease) => {
+                if let Some(lease) = lease.take() {
+                    self.ring.release_registered_buffer(lease);
+                }
+            }
+            IoUringBufferLeaseOwner::Provided { group, id, .. } => {
+                // `consume_provided` disarms this lease before the caller
+                // can publish a CQE.  A later userspace PROVIDE_BUFFERS may
+                // legitimately reuse the same bid, so an old consumed lease
+                // must never look that bid up again on Drop.
+                if self.provided_return_on_drop {
+                    self.ring.release_provided_buffer(*group, *id);
+                }
+            }
+        }
     }
 }
 
@@ -5307,6 +5426,23 @@ fn locate_physical_segment(segment_ends: &[usize], offset: usize) -> AxResult<(u
 }
 
 impl IoUringBufferLease {
+    pub(crate) fn consume_provided(&mut self) {
+        if self.provided_return_on_drop
+            && let IoUringBufferLeaseOwner::Provided { group, id, .. } = &self.owner
+        {
+            self.ring.consume_provided_buffer(*group, *id);
+            self.provided_return_on_drop = false;
+        }
+    }
+
+    pub(crate) fn rollback_consumed_provided(&mut self) {
+        if !self.provided_return_on_drop
+            && let IoUringBufferLeaseOwner::Provided { group, id, .. } = &self.owner
+        {
+            self.ring.restore_provided_buffer(*group, *id);
+            self.provided_return_on_drop = true;
+        }
+    }
     /// Derives the physical descriptor array from this exact registered
     /// buffer lease. Callers can only provide operation metadata; the SG
     /// addresses themselves are never accepted from an unowned tuple.
@@ -5354,30 +5490,38 @@ impl IoUringBufferLease {
     /// capability: the ring may be submitted through a shared descriptor by
     /// another task or address space.
     pub(crate) fn capability(&self) -> AxResult<UserMemoryCapability> {
-        self.lease
-            .as_ref()
-            .map(|lease| lease.owner().capability.clone())
-            .ok_or(AxError::BadState)
+        match &self.owner {
+            IoUringBufferLeaseOwner::Registered(Some(lease)) => {
+                Ok(lease.owner().capability.clone())
+            }
+            IoUringBufferLeaseOwner::Provided { capability, .. } => Ok(capability.clone()),
+            IoUringBufferLeaseOwner::Registered(None) => Err(AxError::BadState),
+        }
     }
 
     /// Returns the exact subrange validated by the table lookup. Fixed I/O
     /// must derive its address and length from this lease rather than reuse
     /// the caller's raw SQE geometry after admission.
     pub(crate) fn range(&self) -> AxResult<(u64, u32)> {
-        self.lease
-            .as_ref()
-            .map(|lease| {
+        match &self.owner {
+            IoUringBufferLeaseOwner::Registered(Some(lease)) => {
                 let range = lease.range();
-                (range.address(), range.length())
-            })
-            .ok_or(AxError::BadState)
+                Ok((range.address(), range.length()))
+            }
+            IoUringBufferLeaseOwner::Provided {
+                address, length, ..
+            } => Ok((*address, *length)),
+            IoUringBufferLeaseOwner::Registered(None) => Err(AxError::BadState),
+        }
     }
 
     /// Returns the selected fixed-buffer bytes from the physical SG captured
     /// at registration. The lease must remain alive while the returned view is
     /// consumed; it is the owner of the underlying pin.
     pub(crate) fn physical_range(&self) -> AxResult<(&[UserIoPinSegment], usize, usize, bool)> {
-        let lease = self.lease.as_ref().ok_or(AxError::BadState)?;
+        let IoUringBufferLeaseOwner::Registered(Some(lease)) = &self.owner else {
+            return Err(AxError::OperationNotSupported);
+        };
         let range = lease.range();
         let owner = lease.owner();
         let address = usize::try_from(range.address()).map_err(|_| AxError::BadAddress)?;
@@ -5428,7 +5572,9 @@ impl IoUringBufferLease {
     /// direct physical-DMA path only accepts private anonymous pages; callers
     /// must continue to hold this lease while the lower filesystem call runs.
     pub(crate) fn physical_provenance(&self) -> AxResult<UserIoPinProvenance> {
-        let lease = self.lease.as_ref().ok_or(AxError::BadState)?;
+        let IoUringBufferLeaseOwner::Registered(Some(lease)) = &self.owner else {
+            return Err(AxError::OperationNotSupported);
+        };
         let pin = lease
             .owner()
             ._pin_owner
@@ -5436,6 +5582,16 @@ impl IoUringBufferLease {
             .as_ref()
             .ok_or(AxError::BadState)?;
         Ok(pin.provenance())
+    }
+
+    pub(crate) fn provided_id(&self) -> Option<u16> {
+        if !self.provided_return_on_drop {
+            return None;
+        }
+        match &self.owner {
+            IoUringBufferLeaseOwner::Provided { id, .. } => Some(*id),
+            IoUringBufferLeaseOwner::Registered(_) => None,
+        }
     }
 }
 
@@ -6129,6 +6285,7 @@ impl Wake for PollWake {
 struct PollControl {
     request: RequestId,
     events: IoEvents,
+    multishot: bool,
     active: AtomicBool,
     callback: Arc<PollCallbackState>,
     waker: Once<Waker>,
@@ -6142,6 +6299,7 @@ impl PollControl {
         request: RequestId,
         lease: IoUringFileLease,
         events: IoEvents,
+        multishot: bool,
     ) -> Result<Arc<Self>, (AxError, IoUringFileLease)> {
         let callback = match Arc::try_new(PollCallbackState {
             ring,
@@ -6155,6 +6313,7 @@ impl PollControl {
         let control = match Arc::try_new(Self {
             request,
             events,
+            multishot,
             active: AtomicBool::new(true),
             callback: Arc::clone(&callback),
             waker: Once::new(),
@@ -6306,6 +6465,494 @@ struct PendingStreamWork {
     capability: UserMemoryCapability,
 }
 
+/// Socket-only multishot owner.  Unlike `PendingStreamWork`, it never owns a
+/// supplied buffer between shots: recv acquires one when readiness fires and
+/// releases it only after that shot's CQE publication.  The retained OFD and
+/// issued proof make cancellation/final-close a single terminal transition.
+pub(crate) struct SocketMultishotWork {
+    slot: usize,
+    issued: Option<IssuedRequest>,
+    control: Arc<PollControl>,
+    context: IoOperationContext,
+    recv_group: Option<u16>,
+    accepting: bool,
+    accept_flags: u32,
+    recv_request: Option<ReadWriteRequest>,
+}
+
+impl SocketMultishotWork {
+    fn request_id(&self) -> RequestId {
+        self.issued
+            .as_ref()
+            .expect("socket multishot lost issued owner")
+            .id()
+    }
+
+    fn finalise(mut self, ring: &IoUring, result: i32) {
+        let issued = self
+            .issued
+            .take()
+            .expect("socket multishot lost terminal owner");
+        let lease = self.control.deactivate();
+        let _ = ring.state.lock().requests.abort_nonterminal_shot(&issued);
+        if let Err(error) = ring.complete_issued(issued, TerminalCause::Completed, result, 0) {
+            error!("io_uring socket multishot final CQE failed: {error:?}");
+        }
+        drop(lease);
+    }
+}
+
+impl IoUring {
+    /// Weak ownership for an external provider completion bridge.  The
+    /// provider must never keep a closed ring alive merely because it still
+    /// retains an I/O request and its long-term pin.
+    pub(crate) fn weak_owner(&self) -> Weak<IoUring> {
+        self.self_weak
+            .get()
+            .expect("live io_uring missing self weak")
+            .clone()
+    }
+
+    pub(crate) fn uring_cmd_completion(
+        &self,
+        issued: IssuedRequest,
+        file: Option<IoUringFileLease>,
+        iopoll: bool,
+    ) -> super::UringCmdCompletion {
+        let ring = self
+            .self_weak
+            .get()
+            .and_then(Weak::upgrade)
+            .expect("live io_uring issued a URING_CMD without self ownership");
+        super::UringCmdCompletion::new(ring, issued, file, iopoll)
+    }
+
+    pub(crate) fn register_uring_cmd(
+        &self,
+        issued: &IssuedRequest,
+        file: FileHandle<dyn FileLike>,
+        iopoll: bool,
+    ) -> AxResult<()> {
+        let mut state = self.state.lock();
+        let (_, request) = state
+            .requests
+            .request(issued.id())
+            .map_err(map_core_error)?;
+        if !matches!(request, thekernel_linux_io_uring::RequestState::Issued(_)) {
+            return Err(AxError::BadState);
+        }
+        let slot = issued.id().slot() as usize;
+        let entry = state
+            .iopoll_uring_cmd
+            .get_mut(slot)
+            .ok_or(AxError::BadState)?;
+        if entry.is_some() {
+            return Err(AxError::BadState);
+        }
+        *entry = Some(UringCmdOwner {
+            id: issued.id(),
+            file,
+            iopoll,
+            disabled: AtomicBool::new(false),
+            state: UringCmdHandoffState::Prepared,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn complete_uring_cmd(
+        &self,
+        issued: IssuedRequest,
+        cause: TerminalCause,
+        result: i32,
+        flags: u32,
+        _iopoll: bool,
+    ) -> AxResult<()> {
+        {
+            let mut state = self.state.lock();
+            let slot = issued.id().slot() as usize;
+            if state
+                .iopoll_uring_cmd
+                .get(slot)
+                .is_some_and(|entry| entry.as_ref().is_some_and(|owner| owner.id == issued.id()))
+            {
+                state.iopoll_uring_cmd[slot] = None;
+            }
+        }
+        self.complete_issued(issued, cause, result, flags)
+    }
+
+    pub(crate) fn unregister_iopoll_uring_cmd(&self, id: RequestId) {
+        let mut state = self.state.lock();
+        let slot = id.slot() as usize;
+        if state
+            .iopoll_uring_cmd
+            .get(slot)
+            .is_some_and(|entry| entry.as_ref().is_some_and(|owner| owner.id == id))
+        {
+            state.iopoll_uring_cmd[slot] = None;
+        }
+    }
+
+    /// Begins provider handoff. Cancellation may mark this entry pending but
+    /// cannot remove it until the provider has observed the command.
+    pub(crate) fn begin_uring_cmd_handoff(&self, id: RequestId) -> AxResult<bool> {
+        let mut state = self.state.lock();
+        let (_, request) = state.requests.request(id).map_err(map_core_error)?;
+        if !matches!(request, thekernel_linux_io_uring::RequestState::Issued(_)) {
+            return Ok(false);
+        }
+        let owner = state
+            .iopoll_uring_cmd
+            .get_mut(id.slot() as usize)
+            .and_then(Option::as_mut)
+            .filter(|owner| owner.id == id)
+            .ok_or(AxError::BadState)?;
+        if owner.state != UringCmdHandoffState::Prepared {
+            return Ok(false);
+        }
+        owner.state = UringCmdHandoffState::Submitting;
+        Ok(true)
+    }
+
+    pub(crate) fn finish_uring_cmd_handoff(
+        &self,
+        id: RequestId,
+    ) -> AxResult<Option<FileHandle<dyn FileLike>>> {
+        let mut state = self.state.lock();
+        let owner = state
+            .iopoll_uring_cmd
+            .get_mut(id.slot() as usize)
+            .and_then(Option::as_mut)
+            .filter(|owner| owner.id == id)
+            .ok_or(AxError::BadState)?;
+        if owner.state == UringCmdHandoffState::CancelPending {
+            return Ok(Some(owner.file.clone()));
+        }
+        owner.state = UringCmdHandoffState::Active;
+        Ok(None)
+    }
+
+    pub(crate) fn harvest_iopoll_uring_cmd(&self) -> AxResult<()> {
+        // Do not allocate a transient provider list in the GETEVENTS path.
+        // Clone one retained OFD at a time, release ring state, then let the
+        // provider complete/cancel its exact generation without lock nesting.
+        let capacity = self.state.lock().iopoll_uring_cmd.len();
+        for slot in 0..capacity {
+            let provider = self
+                .state
+                .lock()
+                .iopoll_uring_cmd
+                .get(slot)
+                .and_then(Option::as_ref)
+                .and_then(|owner| {
+                    (owner.iopoll && owner.state == UringCmdHandoffState::Active)
+                        .then_some((owner.id, owner.file.clone()))
+                });
+            if let Some((_id, provider)) = provider {
+                provider.harvest_uring_cmd()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies the generic link edge before execution crosses the issue
+    /// boundary.  A follower is retained in its own preallocated slot and
+    /// only released by the predecessor's terminal transition.
+    pub(crate) fn submit_with_dependencies(
+        &self,
+        work: SubmissionWork,
+    ) -> AxResult<DependencyDispatch> {
+        use thekernel_linux_io_uring::SubmissionLink;
+
+        let id = work.id();
+        let dependencies = work.dependencies().unwrap_or_default();
+        let mut state = self.state.lock();
+        let previous = state.link_tail.take();
+        if !matches!(dependencies.link(), SubmissionLink::None) {
+            state.link_tail = Some((id, dependencies.link()));
+        }
+        let (predecessor, hardlink) = match previous {
+            Some((predecessor, link)) => match state
+                .terminal_results
+                .get(predecessor.slot() as usize)
+                .copied()
+                .flatten()
+            {
+                Some((completed, result))
+                    if completed == predecessor
+                        && result < 0
+                        && matches!(link, SubmissionLink::Soft) =>
+                {
+                    return Ok(DependencyDispatch::Cancelled(work));
+                }
+                // A different generation in this reusable slot proves the
+                // predecessor was terminal and reaped; it cannot remain an
+                // outstanding link owner.
+                Some((completed, _)) if completed == predecessor => (None, false),
+                Some(_) => (None, false),
+                None => (Some(predecessor), matches!(link, SubmissionLink::Hard)),
+            },
+            None => (None, false),
+        };
+        if predecessor.is_none()
+            && (!dependencies.drain()
+                || state
+                    .requests
+                    .prior_requests_terminal(id)
+                    .map_err(map_core_error)?)
+        {
+            return Ok(DependencyDispatch::Execute(work));
+        }
+        let slot = id.slot() as usize;
+        let parked = state
+            .parked_submissions
+            .get_mut(slot)
+            .ok_or(AxError::BadState)?;
+        if parked.is_some() {
+            return Err(AxError::BadState);
+        }
+        *parked = Some(ParkedSubmission {
+            work,
+            predecessor,
+            hardlink,
+            drain: dependencies.drain(),
+        });
+        Ok(DependencyDispatch::Parked)
+    }
+
+    fn release_linked_after_terminal(
+        &self,
+        predecessor: RequestId,
+        result: i32,
+    ) -> AxResult<Option<DependencyDispatch>> {
+        let mut state = self.state.lock();
+        let result_slot = predecessor.slot() as usize;
+        *state
+            .terminal_results
+            .get_mut(result_slot)
+            .ok_or(AxError::BadState)? = Some((predecessor, result));
+        let Some(slot) = state.parked_submissions.iter().position(|entry| {
+            entry.as_ref().is_some_and(|parked| {
+                (parked.predecessor == Some(predecessor)
+                    && (!parked.drain
+                        || state
+                            .requests
+                            .prior_requests_terminal(parked.work.id())
+                            .unwrap_or(false)))
+                    || (parked.predecessor.is_none()
+                        && parked.drain
+                        && state
+                            .requests
+                            .prior_requests_terminal(parked.work.id())
+                            .unwrap_or(false))
+            })
+        }) else {
+            return Ok(None);
+        };
+        let parked = state.parked_submissions[slot]
+            .take()
+            .ok_or(AxError::BadState)?;
+        // DRAIN is only an execution barrier.  Only the actual soft-link
+        // predecessor propagates its failure into -ECANCELED.
+        Ok(Some(
+            if parked.predecessor == Some(predecessor) && result < 0 && !parked.hardlink {
+                DependencyDispatch::Cancelled(parked.work)
+            } else {
+                DependencyDispatch::Execute(parked.work)
+            },
+        ))
+    }
+
+    /// Publishes a visible multishot notification without consuming the
+    /// retained issued request.  The core registry keeps its terminal credit
+    /// and request identity live until the owner emits its sole final CQE.
+    fn publish_nonterminal_issued(
+        &self,
+        issued: &IssuedRequest,
+        result: i32,
+        flags: u32,
+    ) -> AxResult<()> {
+        let publication = {
+            let mut state = self.state.lock();
+            state
+                .requests
+                .publish_nonterminal(issued, result, flags)
+                .map_err(map_core_error)?
+        };
+        if self.defer_taskrun && !self.final_close_requested.load(Ordering::Acquire) {
+            let slot = issued.id().slot() as usize;
+            let mut state = self.state.lock();
+            let pending = state
+                .pending_nonterminal_publications
+                .get_mut(slot)
+                .ok_or(AxError::BadState)?;
+            if pending.is_some() {
+                return Err(AxError::BadState);
+            }
+            *pending = Some(publication);
+            self.pending_nonterminal_publication_count
+                .fetch_add(1, Ordering::AcqRel);
+            self.taskrun_pending.store(true, Ordering::Release);
+            return Ok(());
+        }
+        self.publish_nonterminal_publication_now(publication)
+    }
+
+    fn publish_nonterminal_publication_now(
+        &self,
+        publication: CompletionPublication,
+    ) -> AxResult<()> {
+        let published = {
+            let _publication = self.completion_serial.lock();
+            if let Err(error) = self.write_completion(&publication) {
+                // A nonterminal plan never changes request state, so failed
+                // user-ring I/O only clears the registry's in-flight gate.
+                let mut state = self.state.lock();
+                if state
+                    .requests
+                    .rollback_nonterminal_publication(publication)
+                    .is_err()
+                {
+                    return Err(AxError::BadState);
+                }
+                return Err(error);
+            }
+            self.state
+                .lock()
+                .requests
+                .commit_publication(publication)
+                .map_err(map_core_error)?;
+            true
+        };
+        if published {
+            self.completion_wait.wake();
+        }
+        Ok(())
+    }
+
+    /// Takes ownership of an issued socket multishot after the original file
+    /// lease and security snapshot have been admitted.  Failures are terminal
+    /// by construction: the caller must not retain a second path to `issued`.
+    pub(crate) fn admit_socket_multishot(
+        &self,
+        issued: IssuedRequest,
+        file: IoUringFileLease,
+        context: IoOperationContext,
+        accepting: bool,
+        accept_flags: u32,
+        recv_request: Option<ReadWriteRequest>,
+        recv_group: Option<u16>,
+        _capability: UserMemoryCapability,
+    ) -> AxResult<()> {
+        let owner = match self.self_weak.get().and_then(Weak::upgrade) {
+            Some(owner) => owner,
+            None => {
+                return self.complete_issued(
+                    issued,
+                    TerminalCause::PreparationFailed,
+                    -LinuxError::EIO.code(),
+                    0,
+                );
+            }
+        };
+        let id = issued.id();
+        let events = if accepting {
+            IoEvents::READABLE
+        } else {
+            IoEvents::READABLE
+        };
+        let control = match PollControl::try_new(Arc::downgrade(&owner), id, file, events, true) {
+            Ok(control) => control,
+            Err((error, _file)) => {
+                return self.complete_issued(
+                    issued,
+                    TerminalCause::PreparationFailed,
+                    -LinuxError::from(error).code(),
+                    0,
+                );
+            }
+        };
+        let ready = match control.check_arm_check() {
+            Ok(ready) => ready,
+            Err(error) => {
+                drop(control.deactivate());
+                return self.complete_issued(
+                    issued,
+                    TerminalCause::PreparationFailed,
+                    -LinuxError::from(error).code(),
+                    0,
+                );
+            }
+        };
+        let work = SocketMultishotWork {
+            slot: 0,
+            issued: Some(issued),
+            control: Arc::clone(&control),
+            context,
+            recv_group,
+            accepting,
+            accept_flags,
+            recv_request,
+        };
+        if let Err(work) = self.install_socket_multishot(work) {
+            let issued = work
+                .issued
+                .expect("socket multishot installation lost request");
+            drop(work.control.deactivate());
+            return self.complete_issued(
+                issued,
+                TerminalCause::PreparationFailed,
+                -LinuxError::EBUSY.code(),
+                0,
+            );
+        }
+        if !ready.is_empty() || control.has_source_wake() {
+            owner.publish_poll_hint(id);
+        }
+        Ok(())
+    }
+    pub(crate) fn install_socket_multishot(
+        &self,
+        mut work: SocketMultishotWork,
+    ) -> Result<(), SocketMultishotWork> {
+        let mut state = self.state.lock();
+        let Some(slot) = state.socket_multishot.iter().position(Option::is_none) else {
+            return Err(work);
+        };
+        work.slot = slot;
+        state.socket_multishot[slot] = Some(work);
+        Ok(())
+    }
+
+    fn claim_socket_multishot(&self, request: RequestId) -> Option<SocketMultishotWork> {
+        let mut state = self.state.lock();
+        let slot = state.socket_multishot.iter().position(|work| {
+            work.as_ref()
+                .is_some_and(|work| work.request_id() == request)
+        })?;
+        state.socket_multishot[slot].take()
+    }
+
+    fn reinsert_socket_multishot(
+        &self,
+        work: SocketMultishotWork,
+    ) -> Result<(), SocketMultishotWork> {
+        let slot = work.slot;
+        let mut state = self.state.lock();
+        if !work.issued.as_ref().is_some_and(|issued| {
+            state.requests.issued_is_live(issued)
+                || state.requests.issued_shot_publication_pending(issued)
+        }) {
+            return Err(work);
+        }
+        if state.socket_multishot.get(slot).is_none_or(Option::is_some) {
+            return Err(work);
+        }
+        state.socket_multishot[slot] = Some(work);
+        Ok(())
+    }
+}
+
 impl PendingStreamWork {
     fn request_id(&self) -> RequestId {
         self.issued
@@ -6444,6 +7091,7 @@ fn poll_events_to_linux(events: IoEvents) -> u32 {
 enum FinalClosePhase {
     Begin,
     Polls,
+    OwnedFileIo,
     FixedFiles,
     Buffers,
     Completions,
@@ -6484,10 +7132,28 @@ struct RingState {
     admission_in_progress: bool,
     fixed_files: Option<RegisteredFiles>,
     registered_buffers: Option<RegisteredBuffers>,
+    registered_wait_region: Option<RegisteredWaitRegion>,
     next_file_table_id: u64,
     next_buffer_table_id: u64,
     polls: Vec<Option<Arc<PollControl>>>,
+    completion_eventfd: Option<FileHandle<EventFd>>,
+    /// `PROVIDE_BUFFERS` groups.  A slot moves Ready -> Leased -> Ready;
+    /// remove/close may retire only Ready slots, so a multishot completion
+    /// never exposes a buffer which has already been recycled.
+    provided_buffers: BTreeMap<u16, ProvidedBufferGroup>,
     pending_publications: Vec<Option<CompletionToken>>,
+    pending_nonterminal_publications: Vec<Option<CompletionPublication>>,
+    iopoll_uring_cmd: Vec<Option<UringCmdOwner>>,
+    owned_file_io: Vec<Option<OwnedFileIoOwner>>,
+    /// Accepted work held behind an IOSQE_IO_LINK predecessor.  This is sized
+    /// with SQ depth at ring creation, so dependency admission never allocates
+    /// after consuming an SQE.
+    parked_submissions: Vec<Option<ParkedSubmission>>,
+    /// The request whose IOSQE_IO_LINK/HARDLINK flag binds the next SQE.
+    link_tail: Option<(RequestId, thekernel_linux_io_uring::SubmissionLink)>,
+    /// Terminal result retained until its slot can be reused; dependency
+    /// release is deliberately independent of CQ publication/task-work.
+    terminal_results: Vec<Option<(RequestId, i32)>>,
     /// Preallocated physical worker slots.  `physical_work_count` charges
     /// both queued and currently-draining items, so QD cannot be exceeded
     /// while a worker temporarily owns an item outside this array.
@@ -6503,7 +7169,111 @@ struct RingState {
     /// operations which admitted but observed `WouldBlock`.
     pending_stream: Vec<Option<PendingStreamWork>>,
     pending_stream_count: usize,
+    socket_multishot: Vec<Option<SocketMultishotWork>>,
     final_close: FinalCloseProgress,
+}
+
+struct ParkedSubmission {
+    work: SubmissionWork,
+    predecessor: Option<RequestId>,
+    hardlink: bool,
+    drain: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum UringCmdHandoffState {
+    Prepared,
+    Submitting,
+    Active,
+    CancelPending,
+}
+
+struct UringCmdOwner {
+    id: RequestId,
+    file: FileHandle<dyn FileLike>,
+    iopoll: bool,
+    disabled: AtomicBool,
+    state: UringCmdHandoffState,
+}
+
+struct OwnedFileIoBridge {
+    issued: IssuedRequest,
+}
+
+/// Exact provider custody for one reusable request slot.  `generation` is
+/// repeated here deliberately: a stale provider callback must never affect a
+/// later owner of the same slot.
+enum OwnedFileIoControlState {
+    Empty,
+    Publishing {
+        generation: u64,
+        bridge: OwnedFileIoBridge,
+    },
+    Submitted {
+        generation: u64,
+        bridge: OwnedFileIoBridge,
+        control: SubmittedFileIo,
+    },
+    CancelPending {
+        generation: u64,
+        bridge: OwnedFileIoBridge,
+    },
+    /// A provider completion raced with its consuming cancel control.  The
+    /// cancel path owns the registry's nonterminal-shot fence and completes
+    /// this result only after it has restored or terminalized that fence.
+    CompletionPending {
+        generation: u64,
+        bridge: OwnedFileIoBridge,
+        result: i32,
+    },
+    InFlight {
+        generation: u64,
+        bridge: OwnedFileIoBridge,
+    },
+    Terminal,
+}
+
+struct OwnedFileIoOwner {
+    id: RequestId,
+    state: OwnedFileIoControlState,
+    /// Fixed and supplied buffers remain leased until the one terminal
+    /// provider completion is claimed.  In particular, BUFFER_SELECT must
+    /// never recycle its chosen slot before the CQE hands it to userspace.
+    buffer: Option<IoUringBufferLease>,
+}
+
+struct OwnedFileIoTerminal {
+    issued: IssuedRequest,
+    result: i32,
+    buffer: Option<IoUringBufferLease>,
+}
+
+struct ProvidedBuffer {
+    id: u16,
+    address: usize,
+    length: usize,
+    capability: UserMemoryCapability,
+    leased: bool,
+    consumed: bool,
+    retiring: bool,
+}
+
+struct ProvidedBufferGroup {
+    slots: Vec<ProvidedBuffer>,
+}
+
+/// Fully copied OPENAT2 execution input.  The pathname and `open_how` never
+/// outlive usercopy as borrowed addresses; filesystem/credential/files-table
+/// authority is likewise the submitting task's immutable snapshot.
+pub(crate) struct IoUringOpenAt2Work {
+    pub(crate) path: FsPathBuf,
+    pub(crate) how: open_how,
+    pub(crate) flags: i32,
+    /// Linked/drained work can run after `close(2)` has removed the base
+    /// directory from the submitter's table. Retain the issue-time OFD so
+    /// that delayed pathname resolution has stable dirfd authority.
+    pub(crate) dirfd: Option<Arc<FileDescription>>,
+    pub(crate) actor: IoUringSubmissionActor,
 }
 
 type SubmissionWorkParts = (
@@ -6514,7 +7284,9 @@ type SubmissionWorkParts = (
     Option<IoOperationContext>,
     Option<PreparedPhysicalIoAdmission>,
     Option<AxError>,
+    Option<IoUringOpenAt2Work>,
     UserMemoryCapability,
+    Option<axfs::PreparedOwnedFileIo>,
 );
 
 /// One accepted SQ entry after terminal credit and SQ-head publication.
@@ -6532,10 +7304,23 @@ pub(crate) struct SubmissionWork {
     /// already-admitted CQE without repeating fanotify or RLIMIT side effects.
     physical: Option<PreparedPhysicalIoAdmission>,
     admission_error: Option<AxError>,
+    openat2: Option<IoUringOpenAt2Work>,
     capability: UserMemoryCapability,
+    /// Provider-approved generic file I/O prepared while the SQE admission
+    /// still owns the submitter's MM/OFD/actor snapshot.  It is intentionally
+    /// separate from physical I/O: this token may represent cached/direct
+    /// provider work with long-term user pins.
+    owned: Option<axfs::PreparedOwnedFileIo>,
 }
 
 impl SubmissionWork {
+    pub(crate) const fn id(&self) -> RequestId {
+        self.prepared.id()
+    }
+
+    pub(crate) fn dependencies(&self) -> Option<thekernel_linux_io_uring::SubmissionDependencies> {
+        self.parsed.ok().map(ParsedSubmission::dependencies)
+    }
     pub(crate) fn into_parts(self) -> SubmissionWorkParts {
         (
             self.prepared,
@@ -6545,8 +7330,18 @@ impl SubmissionWork {
             self.context,
             self.physical,
             self.admission_error,
+            self.openat2,
             self.capability,
+            self.owned,
         )
+    }
+
+    pub(crate) fn set_owned(&mut self, owned: axfs::PreparedOwnedFileIo) -> AxResult<()> {
+        if self.owned.is_some() {
+            return Err(AxError::BadState);
+        }
+        self.owned = Some(owned);
+        Ok(())
     }
 }
 
@@ -6556,6 +7351,14 @@ pub(crate) enum SubmissionStep<'a> {
     AdmissionBusy,
     Dropped,
     Admission(SubmissionAdmission<'a>),
+}
+
+/// Result of dependency admission/release.  `Cancelled` still owns a fully
+/// admitted request and must be terminally completed by the syscall executor.
+pub(crate) enum DependencyDispatch {
+    Execute(SubmissionWork),
+    Cancelled(SubmissionWork),
+    Parked,
 }
 
 /// Reversible SQ admission which owns terminal credit but no published head.
@@ -6570,13 +7373,44 @@ impl SubmissionAdmission<'_> {
         self.parsed
     }
 
+    /// Generation-scoped identity reserved for this still-unpublished SQE.
+    /// Admission-time owned-I/O preparation uses it to bind its completion
+    /// bridge before any long-term pin can become provider-visible.
+    pub(crate) fn id(&self) -> AxResult<RequestId> {
+        self.reservation
+            .as_ref()
+            .map(RequestReservation::id)
+            .ok_or(AxError::BadState)
+    }
+
     pub(crate) fn commit(
+        self,
+        file: Option<IoUringFileLease>,
+        buffer: Option<IoUringBufferLease>,
+        context: Option<IoOperationContext>,
+        physical: Option<PreparedPhysicalIoAdmission>,
+        admission_error: Option<AxError>,
+        capability: UserMemoryCapability,
+    ) -> AxResult<SubmissionWork> {
+        self.commit_with_openat2(
+            file,
+            buffer,
+            context,
+            physical,
+            admission_error,
+            None,
+            capability,
+        )
+    }
+
+    pub(crate) fn commit_with_openat2(
         mut self,
         file: Option<IoUringFileLease>,
         buffer: Option<IoUringBufferLease>,
         context: Option<IoOperationContext>,
         physical: Option<PreparedPhysicalIoAdmission>,
         admission_error: Option<AxError>,
+        openat2: Option<IoUringOpenAt2Work>,
         capability: UserMemoryCapability,
     ) -> AxResult<SubmissionWork> {
         let _submission = self.ring.submission_serial.lock();
@@ -6598,7 +7432,9 @@ impl SubmissionAdmission<'_> {
             context,
             physical,
             admission_error,
+            openat2,
             capability,
+            owned: None,
         })
     }
 
@@ -6606,10 +7442,11 @@ impl SubmissionAdmission<'_> {
         self,
         lease: IoUringFileLease,
         linux_events: u32,
+        multishot: bool,
         capability: UserMemoryCapability,
     ) -> AxResult<()> {
         let ring = self.ring;
-        ring.commit_poll_admission(self, lease, linux_events, capability)
+        ring.commit_poll_admission(self, lease, linux_events, multishot, capability)
     }
 }
 
@@ -6643,6 +7480,23 @@ pub(crate) struct IoUring {
     cq_head: SharedAtomicU32,
     cq_tail: SharedAtomicU32,
     sq_dropped: SharedAtomicU32,
+    /// Task identity captured at setup for `IORING_SETUP_SINGLE_ISSUER`.
+    single_issuer: Mutex<Option<u64>>,
+    sqpoll: bool,
+    iopoll: bool,
+    disabled: AtomicBool,
+    /// Captured setup actor for the SQ polling task.  It is intentionally
+    /// separate from `RingState`: final close can stop the worker without
+    /// holding request-table ownership across a sleep.
+    sqpoll_actor: Mutex<Option<IoUringSubmissionActor>>,
+    sqpoll_stop: AtomicBool,
+    sqpoll_failed: AtomicBool,
+    sqpoll_started: AtomicBool,
+    sqpoll_worker_task: AtomicU64,
+    sqpoll_wake: PollSet<1>,
+    defer_taskrun: bool,
+    coop_taskrun: bool,
+    taskrun_pending: AtomicBool,
     completion_wait: PollSet<RING_WAITER_SLOTS>,
     self_weak: Once<Weak<IoUring>>,
     submission_serial: Mutex<()>,
@@ -6656,12 +7510,215 @@ pub(crate) struct IoUring {
     close_waiting_on_physical: AtomicBool,
     poll_hint_bits: Vec<AtomicUsize>,
     pending_publication_count: AtomicUsize,
+    pending_nonterminal_publication_count: AtomicUsize,
     state: Mutex<RingState>,
     registered_buffer_budget: Arc<RegisteredBufferPinBudget>,
     _request_charge: RequestSlotCharge,
 }
 
+// `self_weak` is initialized before the ring is published and is immutable
+// afterwards.  It is a self-referential ownership aid, so `spin::Once` cannot
+// derive these auto traits without a circular proof through `Weak<IoUring>`.
+// Every mutable ring field is independently atomic or behind a lock.
+unsafe impl Send for IoUring {}
+unsafe impl Sync for IoUring {}
+
 impl IoUring {
+    pub(crate) fn publish_owned_file_io(
+        &self,
+        issued: IssuedRequest,
+        prepared: axfs::PreparedOwnedFileIo,
+        buffer: Option<IoUringBufferLease>,
+    ) -> Result<
+        (),
+        (
+            AxError,
+            axfs::PreparedOwnedFileIo,
+            Option<IoUringBufferLease>,
+        ),
+    > {
+        let id = issued.id();
+        {
+            let mut state = self.state.lock();
+            let slot = id.slot() as usize;
+            let Some(entry) = state.owned_file_io.get_mut(slot) else {
+                return Err((AxError::BadState, prepared, buffer));
+            };
+            if entry.is_some() {
+                return Err((AxError::BadState, prepared, buffer));
+            }
+            *entry = Some(OwnedFileIoOwner {
+                id,
+                state: OwnedFileIoControlState::Publishing {
+                    generation: id.generation(),
+                    bridge: OwnedFileIoBridge { issued },
+                },
+                buffer,
+            });
+        }
+        match prepared.submit() {
+            Ok(submitted) => {
+                let mut state = self.state.lock();
+                let entry = state
+                    .owned_file_io
+                    .get_mut(id.slot() as usize)
+                    .and_then(Option::as_mut);
+                if let Some(entry) = entry.filter(|entry| entry.id == id) {
+                    let bridge = match core::mem::replace(
+                        &mut entry.state,
+                        OwnedFileIoControlState::Terminal,
+                    ) {
+                        OwnedFileIoControlState::Publishing { generation, bridge }
+                            if generation == id.generation() =>
+                        {
+                            bridge
+                        }
+                        terminal => {
+                            entry.state = terminal;
+                            return Ok(());
+                        }
+                    };
+                    entry.state = OwnedFileIoControlState::Submitted {
+                        generation: id.generation(),
+                        bridge,
+                        control: submitted,
+                    };
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let (request, completion) = (error.request, error.completion);
+                drop((request, completion));
+                self.complete_owned_file_io(id, -LinuxError::from(error.error).code());
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn complete_owned_file_io(&self, id: RequestId, result: i32) {
+        let terminal = {
+            let mut state = self.state.lock();
+            state
+                .owned_file_io
+                .get_mut(id.slot() as usize)
+                .and_then(|entry| {
+                    if entry.as_ref().is_none_or(|owner| owner.id != id) {
+                        return None;
+                    }
+                    let cancellation_pending = entry.as_ref().is_some_and(|owner| {
+                        owner.id == id
+                            && matches!(&owner.state,
+                            OwnedFileIoControlState::CancelPending { generation, .. }
+                                if *generation == id.generation())
+                    });
+                    if cancellation_pending {
+                        let owner = entry.as_mut().expect("owned I/O entry vanished");
+                        let previous =
+                            core::mem::replace(&mut owner.state, OwnedFileIoControlState::Terminal);
+                        let OwnedFileIoControlState::CancelPending { generation, bridge } =
+                            previous
+                        else {
+                            unreachable!("owned I/O cancel state changed under ring lock");
+                        };
+                        owner.state = OwnedFileIoControlState::CompletionPending {
+                            generation,
+                            bridge,
+                            result,
+                        };
+                        return None;
+                    }
+                    if entry.as_ref().is_some_and(|owner| {
+                        owner.id == id
+                            && matches!(
+                                &owner.state,
+                                OwnedFileIoControlState::CompletionPending { .. }
+                            )
+                    }) {
+                        return None;
+                    }
+                    entry.take().and_then(|entry| {
+                        if entry.id != id {
+                            return None;
+                        }
+                        match entry.state {
+                            OwnedFileIoControlState::Publishing { generation, bridge }
+                            | OwnedFileIoControlState::InFlight { generation, bridge }
+                                if generation == id.generation() =>
+                            {
+                                Some(OwnedFileIoTerminal {
+                                    issued: bridge.issued,
+                                    result,
+                                    buffer: entry.buffer,
+                                })
+                            }
+                            OwnedFileIoControlState::Submitted {
+                                generation,
+                                bridge,
+                                control: _,
+                            } if generation == id.generation() => Some(OwnedFileIoTerminal {
+                                issued: bridge.issued,
+                                result,
+                                buffer: entry.buffer,
+                            }),
+                            _ => None,
+                        }
+                    })
+                })
+        };
+        let Some(terminal) = terminal else {
+            return;
+        };
+        let _ = self.complete_owned_terminal(terminal);
+    }
+
+    fn complete_owned_terminal(&self, terminal: OwnedFileIoTerminal) -> AxResult<()> {
+        const IORING_CQE_F_BUFFER: u32 = 1;
+        let OwnedFileIoTerminal {
+            issued,
+            result,
+            mut buffer,
+        } = terminal;
+        let flags = if result >= 0 {
+            buffer
+                .as_ref()
+                .and_then(IoUringBufferLease::provided_id)
+                .map(|id| IORING_CQE_F_BUFFER | (u32::from(id) << 16))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let completed = self.complete_issued_with_claim_hook(
+            issued,
+            TerminalCause::Completed,
+            result,
+            flags,
+            || {
+                if flags & IORING_CQE_F_BUFFER != 0 {
+                    if let Some(buffer) = buffer.as_mut() {
+                        buffer.consume_provided();
+                    }
+                }
+            },
+        );
+        drop(buffer);
+        completed
+    }
+
+    /// Completes an admission-time NOWAIT provider result while preserving a
+    /// supplied/fixed buffer lease through the same terminal-CQE hand-off as
+    /// queued provider work.
+    pub(crate) fn complete_owned_immediate(
+        &self,
+        issued: IssuedRequest,
+        result: i32,
+        buffer: Option<IoUringBufferLease>,
+    ) -> AxResult<()> {
+        self.complete_owned_terminal(OwnedFileIoTerminal {
+            issued,
+            result,
+            buffer,
+        })
+    }
     pub(crate) fn try_new(layout: RingLayout) -> AxResult<Arc<Self>> {
         let id = allocate_ring_id()?;
         let request_slots =
@@ -6709,6 +7766,31 @@ impl IoUring {
             .try_reserve_exact(request_slots)
             .map_err(|_| AxError::NoMemory)?;
         pending_publications.resize_with(request_slots, || None);
+        let mut pending_nonterminal_publications = Vec::new();
+        pending_nonterminal_publications
+            .try_reserve_exact(request_slots)
+            .map_err(|_| AxError::NoMemory)?;
+        pending_nonterminal_publications.resize_with(request_slots, || None);
+        let mut iopoll_uring_cmd = Vec::new();
+        iopoll_uring_cmd
+            .try_reserve_exact(request_slots)
+            .map_err(|_| AxError::NoMemory)?;
+        iopoll_uring_cmd.resize_with(request_slots, || None);
+        let mut owned_file_io = Vec::new();
+        owned_file_io
+            .try_reserve_exact(request_slots)
+            .map_err(|_| AxError::NoMemory)?;
+        owned_file_io.resize_with(request_slots, || None);
+        let mut parked_submissions = Vec::new();
+        parked_submissions
+            .try_reserve_exact(request_slots)
+            .map_err(|_| AxError::NoMemory)?;
+        parked_submissions.resize_with(request_slots, || None);
+        let mut terminal_results = Vec::new();
+        terminal_results
+            .try_reserve_exact(request_slots)
+            .map_err(|_| AxError::NoMemory)?;
+        terminal_results.resize(request_slots, None);
         let mut physical_work = Vec::new();
         physical_work
             .try_reserve_exact(IO_URING_PHYSICAL_MAX_QD)
@@ -6729,6 +7811,11 @@ impl IoUring {
             .try_reserve_exact(IO_URING_PENDING_STREAM_CAPACITY)
             .map_err(|_| AxError::NoMemory)?;
         pending_stream.resize_with(IO_URING_PENDING_STREAM_CAPACITY, || None);
+        let mut socket_multishot = Vec::new();
+        socket_multishot
+            .try_reserve_exact(IO_URING_PENDING_STREAM_CAPACITY)
+            .map_err(|_| AxError::NoMemory)?;
+        socket_multishot.resize_with(IO_URING_PENDING_STREAM_CAPACITY, || None);
         let hint_words = request_slots.div_ceil(usize::BITS as usize);
         let mut poll_hint_bits = Vec::new();
         poll_hint_bits
@@ -6753,6 +7840,23 @@ impl IoUring {
             cq_head,
             cq_tail,
             sq_dropped,
+            single_issuer: Mutex::new(
+                (layout.setup_flags().contains(SetupFlags::SINGLE_ISSUER)
+                    && !layout.setup_flags().contains(SetupFlags::R_DISABLED))
+                .then(|| axtask::current().id().as_u64()),
+            ),
+            sqpoll: layout.setup_flags().contains(SetupFlags::SQPOLL),
+            iopoll: layout.setup_flags().contains(SetupFlags::IOPOLL),
+            disabled: AtomicBool::new(layout.setup_flags().contains(SetupFlags::R_DISABLED)),
+            sqpoll_actor: Mutex::new(None),
+            sqpoll_stop: AtomicBool::new(false),
+            sqpoll_failed: AtomicBool::new(false),
+            sqpoll_started: AtomicBool::new(false),
+            sqpoll_worker_task: AtomicU64::new(0),
+            sqpoll_wake: PollSet::new(),
+            defer_taskrun: layout.setup_flags().contains(SetupFlags::DEFER_TASKRUN),
+            coop_taskrun: layout.setup_flags().contains(SetupFlags::COOP_TASKRUN),
+            taskrun_pending: AtomicBool::new(false),
             completion_wait: PollSet::new(),
             self_weak: Once::new(),
             submission_serial: Mutex::new(()),
@@ -6766,6 +7870,7 @@ impl IoUring {
             close_waiting_on_physical: AtomicBool::new(false),
             poll_hint_bits,
             pending_publication_count: AtomicUsize::new(0),
+            pending_nonterminal_publication_count: AtomicUsize::new(0),
             state: Mutex::new(RingState {
                 requests,
                 sq_head: 0,
@@ -6773,16 +7878,26 @@ impl IoUring {
                 admission_in_progress: false,
                 fixed_files: None,
                 registered_buffers: None,
+                registered_wait_region: None,
                 next_file_table_id: 1,
                 next_buffer_table_id: 1,
                 polls,
+                completion_eventfd: None,
+                provided_buffers: BTreeMap::new(),
                 pending_publications,
+                pending_nonterminal_publications,
+                iopoll_uring_cmd,
+                owned_file_io,
+                parked_submissions,
+                link_tail: None,
+                terminal_results,
                 physical_work,
                 physical_custody,
                 physical_slot_reserved,
                 physical_work_count: 0,
                 pending_stream,
                 pending_stream_count: 0,
+                socket_multishot,
                 final_close: FinalCloseProgress::new(),
             }),
             registered_buffer_budget,
@@ -6795,6 +7910,162 @@ impl IoUring {
 
     pub(crate) const fn layout(&self) -> RingLayout {
         self.layout
+    }
+
+    pub(crate) const fn ring_id(&self) -> RingId {
+        self.id
+    }
+
+    /// Installs the setup-task actor before an SQPOLL worker can consume the
+    /// shared SQ.  Replacing it would silently retarget an existing ring to a
+    /// different process, therefore configuration is strictly one-shot.
+    pub(crate) fn install_sqpoll_actor(&self, actor: IoUringSubmissionActor) -> AxResult<()> {
+        if !self.sqpoll || self.final_close_requested.load(Ordering::Acquire) {
+            return Err(AxError::BadState);
+        }
+        let mut slot = self.sqpoll_actor.lock();
+        if slot.is_some() {
+            return Err(AxError::ResourceBusy);
+        }
+        *slot = Some(actor);
+        Ok(())
+    }
+
+    pub(crate) fn sqpoll_actor(&self) -> AxResult<IoUringSubmissionActor> {
+        if !self.sqpoll
+            || self.sqpoll_stop.load(Ordering::Acquire)
+            || self.sqpoll_failed.load(Ordering::Acquire)
+        {
+            return Err(AxError::BadState);
+        }
+        self.sqpoll_actor.lock().clone().ok_or(AxError::BadState)
+    }
+
+    pub(crate) const fn sqpoll_enabled(&self) -> bool {
+        self.sqpoll
+    }
+    pub(crate) const fn iopoll_enabled(&self) -> bool {
+        self.iopoll
+    }
+    pub(crate) fn disabled(&self) -> bool {
+        self.disabled.load(Ordering::Acquire)
+    }
+    pub(crate) fn enable(&self) -> AxResult<()> {
+        let _registration = self.registration_serial.lock();
+        // Keep R_DISABLED's release transition as the single externally
+        // visible commit point.  An entering issuer observes it with Acquire,
+        // so it cannot see an enabled SINGLE_ISSUER ring before this caller's
+        // identity is fully published.
+        if !self.disabled.load(Ordering::Acquire) {
+            return Err(AxError::from(LinuxError::EBADFD));
+        }
+        if self
+            .layout
+            .setup_flags()
+            .contains(SetupFlags::SINGLE_ISSUER)
+        {
+            *self.single_issuer.lock() = Some(axtask::current().id().as_u64());
+        }
+        self.disabled.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Wakes the SQ worker after a submitter enters the ring.  Userspace may
+    /// also advance SQ tail without entering, so the worker retains its idle
+    /// poll deadline as the liveness backstop.
+    pub(crate) fn wake_sqpoll(&self) {
+        if self.sqpoll {
+            self.sqpoll_wake.wake();
+        }
+    }
+
+    fn set_sqpoll_need_wakeup(&self, enabled: bool) -> AxResult<()> {
+        const IORING_SQ_NEED_WAKEUP: u32 = 1;
+        let value = if enabled { IORING_SQ_NEED_WAKEUP } else { 0 };
+        self.rings.write_bytes(
+            self.layout.sq_offsets().flags() as usize,
+            &value.to_ne_bytes(),
+        )
+    }
+
+    /// Sleeps an idle SQPOLL owner after its polling interval.  A direct tail
+    /// update observed before registration is consumed by the predicate;
+    /// after the interval Linux requires an enter wake, which uses this same
+    /// PollSet. Close/failure wakes the identical wait edge.
+    pub(crate) fn wait_sqpoll_wakeup(&self) -> AxResult<()> {
+        self.set_sqpoll_need_wakeup(true)?;
+        let result = crate::readiness::block_on_poll_set(&self.sqpoll_wake, || {
+            if self.sqpoll_should_stop() {
+                return Err(AxError::BadState);
+            }
+            let head = self.state.lock().sq_head;
+            let tail = self.sq_tail.load_acquire();
+            if self
+                .layout
+                .pending_submissions(head, tail)
+                .map_err(map_core_error)?
+                != 0
+            {
+                Ok(())
+            } else {
+                Err(AxError::WouldBlock)
+            }
+        });
+        self.set_sqpoll_need_wakeup(false)?;
+        result
+    }
+
+    pub(crate) fn sqpoll_has_submissions(&self) -> AxResult<bool> {
+        let head = self.state.lock().sq_head;
+        let tail = self.sq_tail.load_acquire();
+        self.layout
+            .pending_submissions(head, tail)
+            .map(|pending| pending != 0)
+            .map_err(map_core_error)
+    }
+
+    pub(crate) fn sqpoll_should_stop(&self) -> bool {
+        self.sqpoll_stop.load(Ordering::Acquire) || self.sqpoll_failed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn sqpoll_failed(&self) -> bool {
+        self.sqpoll_failed.load(Ordering::Acquire)
+    }
+
+    /// Publishes terminal SQ worker startup/runtime failure.  This is not a
+    /// recoverable fallback to caller-driven submit: continuing on the wrong
+    /// CPU would violate the ring's requested execution contract.
+    pub(crate) fn fail_sqpoll(&self) {
+        self.sqpoll_failed.store(true, Ordering::Release);
+        self.sqpoll_stop.store(true, Ordering::Release);
+        self.sqpoll_wake.wake();
+    }
+
+    pub(crate) fn mark_sqpoll_started(&self) -> AxResult<()> {
+        if !self.sqpoll
+            || self.sqpoll_stop.load(Ordering::Acquire)
+            || self.sqpoll_started.swap(true, Ordering::AcqRel)
+        {
+            return Err(AxError::BadState);
+        }
+        self.sqpoll_worker_task
+            .store(axtask::current().id().as_u64(), Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn mark_sqpoll_stopped(&self) {
+        self.sqpoll_worker_task.store(0, Ordering::Release);
+        self.sqpoll_started.store(false, Ordering::Release);
+    }
+
+    /// Acquires the ring owner for an executor that outlives syscall return.
+    /// All such executors retain the exact ring generation rather than
+    /// rediscovering it through a numeric file descriptor.
+    pub(crate) fn arc_owner(&self) -> AxResult<Arc<Self>> {
+        self.self_weak
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or(AxError::BadState)
     }
 
     pub(crate) fn try_finalizer_resource(self: &Arc<Self>) -> AxResult<DescriptionResource> {
@@ -6824,6 +8095,13 @@ impl IoUring {
         bytes[12..16].copy_from_slice(&completion.flags().to_ne_bytes());
         self.rings.write_bytes(offset, &bytes)?;
         self.cq_tail.store_release(publication.new_tail());
+        let eventfd = self.state.lock().completion_eventfd.clone();
+        if let Some(eventfd) = eventfd {
+            // CQ publication is already visible. Eventfd saturation must not
+            // retroactively roll that CQE back; Linux treats this as a
+            // coalesced wakeup and readers can still observe the CQ tail.
+            let _ = eventfd.signal(1);
+        }
         Ok(())
     }
 
@@ -6840,11 +8118,28 @@ impl IoUring {
         self.flush_pending_publications()?;
         let _publication = self.completion_serial.lock();
         let head = self.cq_head.load_acquire();
-        self.state
+        let consumed = self
+            .state
             .lock()
             .requests
             .observe_completion_head(head)
-            .map_err(map_core_error)
+            .map_err(map_core_error)?;
+        if consumed != 0 {
+            let bits = usize::BITS as usize;
+            let state = self.state.lock();
+            for work in state.socket_multishot.iter().flatten() {
+                let slot = work.request_id().slot() as usize;
+                if let Some(word) = self.poll_hint_bits.get(slot / bits) {
+                    word.fetch_or(1_usize << (slot % bits), Ordering::Release);
+                }
+            }
+            drop(state);
+            self.poll_hint_pending.store(true, Ordering::Release);
+            if let Some(owner) = self.self_weak.get().and_then(Weak::upgrade) {
+                owner.enqueue_deferred();
+            }
+        }
+        Ok(consumed)
     }
 
     pub(crate) fn available_completions(&self) -> AxResult<u32> {
@@ -6856,6 +8151,14 @@ impl IoUring {
     }
 
     pub(crate) fn prepare_submission(&self) -> AxResult<SubmissionStep<'_>> {
+        if let Some(issuer) = *self.single_issuer.lock()
+            && issuer != axtask::current().id().as_u64()
+            && (!self.sqpoll
+                || self.sqpoll_worker_task.load(Ordering::Acquire)
+                    != axtask::current().id().as_u64())
+        {
+            return Err(AxError::PermissionDenied);
+        }
         let _submission = self.submission_serial.lock();
         let head = {
             let state = self.state.lock();
@@ -6928,6 +8231,17 @@ impl IoUring {
         prepared: PreparedRequest,
     ) -> Result<IssuedRequest, RequestIssueError> {
         self.state.lock().requests.issue(prepared)
+    }
+
+    pub(crate) fn issue_request_with_cancellation_mode(
+        &self,
+        prepared: PreparedRequest,
+        mode: thekernel_linux_io_uring::CancellationMode,
+    ) -> Result<IssuedRequest, RequestIssueError> {
+        self.state
+            .lock()
+            .requests
+            .issue_with_cancellation_mode(prepared, Some(mode))
     }
 
     /// Reserves one of the preallocated physical completion slots.  This is
@@ -7781,6 +9095,19 @@ impl IoUring {
     }
 
     fn publish_pending_slot(&self, slot: usize) -> AxResult<bool> {
+        if self.defer_taskrun && !self.final_close_requested.load(Ordering::Acquire) {
+            self.taskrun_pending.store(true, Ordering::Release);
+            return Ok(false);
+        }
+        self.publish_pending_slot_now(slot)
+    }
+
+    /// Publishes one already-terminal request without consulting
+    /// `DEFER_TASKRUN`.  This is intentionally private to an explicit
+    /// task-work/teardown drain: completion producers must use
+    /// [`Self::publish_pending_slot`] so a concurrent producer can never
+    /// observe a temporary, process-wide "defer disabled" state.
+    fn publish_pending_slot_now(&self, slot: usize) -> AxResult<bool> {
         let published = {
             let _publication = self.completion_serial.lock();
             if self.final_close_requested.load(Ordering::Acquire) {
@@ -7837,8 +9164,15 @@ impl IoUring {
         Ok(published)
     }
 
+    /// Attempts normal publication for callers that are not an explicit
+    /// task-work edge.  With DEFER_TASKRUN this only records pending work.
     fn flush_pending_publications(&self) -> AxResult<()> {
-        if self.pending_publication_count.load(Ordering::Acquire) == 0 {
+        if self.pending_publication_count.load(Ordering::Acquire) == 0
+            && self
+                .pending_nonterminal_publication_count
+                .load(Ordering::Acquire)
+                == 0
+        {
             return Ok(());
         }
         for slot in 0..usize::try_from(self.layout.sq_entries()).map_err(|_| AxError::BadState)? {
@@ -7846,6 +9180,73 @@ impl IoUring {
             if self.pending_publication_count.load(Ordering::Acquire) == 0 {
                 break;
             }
+        }
+        self.flush_pending_nonterminal_publications_now(false)?;
+        Ok(())
+    }
+
+    /// Drains the queue at an explicit task-work or close edge, bypassing
+    /// deferred publication for this invocation only.
+    fn flush_pending_publications_now(&self) -> AxResult<()> {
+        if self.pending_publication_count.load(Ordering::Acquire) == 0
+            && self
+                .pending_nonterminal_publication_count
+                .load(Ordering::Acquire)
+                == 0
+        {
+            return Ok(());
+        }
+        for slot in 0..usize::try_from(self.layout.sq_entries()).map_err(|_| AxError::BadState)? {
+            self.publish_pending_slot_now(slot)?;
+            if self.pending_publication_count.load(Ordering::Acquire) == 0 {
+                break;
+            }
+        }
+        self.flush_pending_nonterminal_publications_now(true)?;
+        Ok(())
+    }
+
+    fn flush_pending_nonterminal_publications_now(&self, bypass_defer: bool) -> AxResult<()> {
+        if !bypass_defer
+            && self.defer_taskrun
+            && !self.final_close_requested.load(Ordering::Acquire)
+        {
+            self.taskrun_pending.store(true, Ordering::Release);
+            return Ok(());
+        }
+        for slot in 0..usize::try_from(self.layout.sq_entries()).map_err(|_| AxError::BadState)? {
+            let publication = {
+                let mut state = self.state.lock();
+                state
+                    .pending_nonterminal_publications
+                    .get_mut(slot)
+                    .ok_or(AxError::BadState)?
+                    .take()
+            };
+            let Some(publication) = publication else {
+                continue;
+            };
+            self.pending_nonterminal_publication_count
+                .fetch_sub(1, Ordering::AcqRel);
+            if let Err(error) = self.publish_nonterminal_publication_now(publication) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drains deferred completion task-work at an explicit enter/GETEVENTS
+    /// boundary. Close bypasses DEFER so terminal teardown cannot strand an
+    /// owned CQE behind a task which has already exited.
+    pub(crate) fn run_task_work(&self) -> AxResult<()> {
+        if (self.coop_taskrun && self.taskrun_pending.load(Ordering::Acquire))
+            || self.taskrun_pending.swap(false, Ordering::AcqRel)
+            || self.final_close_requested.load(Ordering::Acquire)
+        {
+            // Do not mutate `defer_taskrun`: it is immutable setup state and
+            // another completion producer may run concurrently.  The drain
+            // selects the private immediate-publication path instead.
+            self.flush_pending_publications_now()?;
         }
         Ok(())
     }
@@ -7858,7 +9259,12 @@ impl IoUring {
         flags: u32,
     ) -> AxResult<()> {
         self.finish_request(id, cause, result, flags)?;
-        self.publish_pending_slot(id.slot() as usize).map(|_| ())
+        let linked = self.release_linked_after_terminal(id, result)?;
+        self.publish_pending_slot(id.slot() as usize)?;
+        if let Some(dispatch) = linked {
+            let _ = crate::syscall::dispatch_dependency_submission(self, dispatch)?;
+        }
+        Ok(())
     }
 
     /// Consumes the sole issued-request proof at the completion boundary.
@@ -7874,7 +9280,50 @@ impl IoUring {
     ) -> AxResult<()> {
         let id = issued.id();
         self.finish_request(id, cause, result, flags)?;
-        self.publish_pending_slot(id.slot() as usize).map(|_| ())
+        let linked = self.release_linked_after_terminal(id, result)?;
+        self.publish_pending_slot(id.slot() as usize)?;
+        if let Some(dispatch) = linked {
+            let _ = crate::syscall::dispatch_dependency_submission(self, dispatch)?;
+        }
+        Ok(())
+    }
+
+    /// Claims terminal ownership before an adjacent resource hand-off (such
+    /// as a supplied buffer becoming userspace-owned). The hook runs after
+    /// cancellation can no longer win, but before the terminal CQE is made
+    /// pending/published.
+    pub(crate) fn complete_issued_with_claim_hook(
+        &self,
+        issued: IssuedRequest,
+        cause: TerminalCause,
+        result: i32,
+        flags: u32,
+        hook: impl FnOnce(),
+    ) -> AxResult<()> {
+        let id = issued.id();
+        let permit = self
+            .state
+            .lock()
+            .requests
+            .claim_terminal(id, cause)
+            .map_err(map_core_error)?;
+        hook();
+        let token = {
+            let mut state = self.state.lock();
+            let token = state
+                .requests
+                .finish_terminal(permit, result, flags)
+                .map_err(map_core_error)?;
+            let slot = token.id().slot() as usize;
+            self.queue_completion_locked(&mut state, token)?;
+            slot
+        };
+        let linked = self.release_linked_after_terminal(id, result)?;
+        self.publish_pending_slot(token)?;
+        if let Some(dispatch) = linked {
+            let _ = crate::syscall::dispatch_dependency_submission(self, dispatch)?;
+        }
+        Ok(())
     }
 
     fn is_ring_description(description: &Arc<FileDescription>) -> bool {
@@ -7933,8 +9382,84 @@ impl IoUring {
             .map_err(map_buffer_lease_error)?;
         Ok(IoUringBufferLease {
             ring,
-            lease: Some(lease),
+            owner: IoUringBufferLeaseOwner::Registered(Some(lease)),
+            provided_return_on_drop: true,
         })
+    }
+
+    /// Atomically select one ready buffer.  The returned lease is the sole
+    /// authority that can recycle the slot, preventing two SQEs (including a
+    /// multishot executor) from observing the same userspace range.
+    pub(crate) fn acquire_provided_buffer(&self, group: u16) -> AxResult<IoUringBufferLease> {
+        let ring = self.arc_owner()?;
+        let mut state = self.state.lock();
+        let slot = state
+            .provided_buffers
+            .get_mut(&group)
+            .and_then(|entry| {
+                entry
+                    .slots
+                    .iter_mut()
+                    .find(|slot| !slot.leased && !slot.retiring && !slot.consumed)
+            })
+            .ok_or_else(|| AxError::from(LinuxError::ENOBUFS))?;
+        slot.leased = true;
+        Ok(IoUringBufferLease {
+            ring,
+            owner: IoUringBufferLeaseOwner::Provided {
+                group,
+                id: slot.id,
+                address: u64::try_from(slot.address).map_err(|_| AxError::BadAddress)?,
+                length: u32::try_from(slot.length).map_err(|_| AxError::BadAddress)?,
+                capability: slot.capability.clone(),
+            },
+            provided_return_on_drop: true,
+        })
+    }
+
+    fn release_provided_buffer(&self, group: u16, id: u16) {
+        let mut state = self.state.lock();
+        let Some(entry) = state.provided_buffers.get_mut(&group) else {
+            return;
+        };
+        if let Some(slot) = entry
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == id && slot.leased)
+        {
+            slot.leased = false;
+        }
+        entry.slots.retain(|slot| !slot.retiring || slot.leased);
+    }
+
+    fn consume_provided_buffer(&self, group: u16, id: u16) {
+        let mut state = self.state.lock();
+        let Some(entry) = state.provided_buffers.get_mut(&group) else {
+            return;
+        };
+        if let Some(slot) = entry
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == id && slot.leased)
+        {
+            slot.leased = false;
+            slot.consumed = true;
+        }
+    }
+
+    fn restore_provided_buffer(&self, group: u16, id: u16) {
+        let mut state = self.state.lock();
+        let Some(entry) = state.provided_buffers.get_mut(&group) else {
+            return;
+        };
+        if let Some(slot) = entry
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == id && slot.consumed)
+        {
+            slot.consumed = false;
+            slot.leased = true;
+        }
     }
 
     fn release_registered_file(&self, lease: RegisteredFileLease<FileDescription>) {
@@ -8011,6 +9536,111 @@ impl IoUring {
         drop(closed);
     }
 
+    /// Publishes the one completion-eventfd owner.  The descriptor handle is
+    /// retained directly so close/reuse of the numeric fd cannot redirect
+    /// completion notifications.
+    pub(crate) fn register_completion_eventfd(&self, eventfd: FileHandle<EventFd>) -> AxResult<()> {
+        let _registration = self.registration_serial.lock();
+        let mut state = self.state.lock();
+        if state.final_close.phase != FinalClosePhase::Begin {
+            return Err(AxError::BadFileDescriptor);
+        }
+        if state.completion_eventfd.is_some() {
+            return Err(AxError::ResourceBusy);
+        }
+        state.completion_eventfd = Some(eventfd);
+        Ok(())
+    }
+
+    pub(crate) fn unregister_completion_eventfd(&self) -> AxResult<()> {
+        let _registration = self.registration_serial.lock();
+        let eventfd = self
+            .state
+            .lock()
+            .completion_eventfd
+            .take()
+            .ok_or_else(|| AxError::from(LinuxError::ENXIO))?;
+        drop(eventfd);
+        Ok(())
+    }
+
+    pub(crate) fn provide_buffers(
+        &self,
+        group: u16,
+        first_id: u16,
+        buffers: Vec<(usize, usize, UserMemoryCapability)>,
+    ) -> AxResult<()> {
+        let mut state = self.state.lock();
+        let entry = state
+            .provided_buffers
+            .entry(group)
+            .or_insert_with(|| ProvidedBufferGroup { slots: Vec::new() });
+        // Validate the complete batch before modifying the group.  A failed
+        // PROVIDE_BUFFERS CQE must never leave a prefix unexpectedly usable.
+        if buffers.iter().any(|(_, length, _)| *length == 0)
+            || buffers.len() > usize::from(u16::MAX) + 1
+            || first_id
+                .checked_add(
+                    u16::try_from(buffers.len().saturating_sub(1))
+                        .map_err(|_| AxError::InvalidInput)?,
+                )
+                .is_none()
+            || (0..buffers.len()).any(|offset| {
+                let Some(id) = first_id.checked_add(offset as u16) else {
+                    return true;
+                };
+                entry
+                    .slots
+                    .iter()
+                    .any(|slot| slot.id == id && !slot.retiring && !slot.consumed)
+            })
+        {
+            return Err(AxError::InvalidInput);
+        }
+        entry
+            .slots
+            .try_reserve(buffers.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for (offset, (address, length, capability)) in buffers.into_iter().enumerate() {
+            let id = first_id
+                .checked_add(offset as u16)
+                .ok_or(AxError::InvalidInput)?;
+            entry
+                .slots
+                .retain(|slot| slot.id != id || !slot.consumed || slot.leased);
+            entry.slots.push(ProvidedBuffer {
+                id,
+                address,
+                length,
+                capability,
+                leased: false,
+                consumed: false,
+                retiring: false,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_buffers(&self, group: u16, count: usize) -> AxResult<usize> {
+        let mut state = self.state.lock();
+        let entry = state
+            .provided_buffers
+            .get_mut(&group)
+            .ok_or(AxError::NotFound)?;
+        let mut removed = 0;
+        for slot in entry.slots.iter_mut().rev() {
+            if removed == count {
+                break;
+            }
+            if !slot.leased && !slot.retiring {
+                slot.retiring = true;
+                removed += 1;
+            }
+        }
+        entry.slots.retain(|slot| !slot.retiring || slot.leased);
+        Ok(removed)
+    }
+
     pub(crate) fn register_files(&self, files: Vec<Option<Arc<FileDescription>>>) -> AxResult<()> {
         let _registration = self.registration_serial.lock();
         if files.is_empty() {
@@ -8068,6 +9698,132 @@ impl IoUring {
             files.table.begin_retire().map_err(map_core_error)?;
         }
         self.drain_registered_files_after_retire()
+    }
+
+    /// Constructs, publishes, and acknowledges the single parameter region
+    /// under one registration transaction.  In particular, `ENABLE_RINGS`
+    /// cannot observe a region whose in/out descriptor has not been copied
+    /// back yet, and a failed acknowledgement retracts that same publication
+    /// before releasing `registration_serial`.
+    pub(crate) fn register_wait_region_transaction(
+        &self,
+        prepare: impl FnOnce() -> AxResult<(
+            usize,
+            bool,
+            Option<(UserMemoryCapability, usize, PinnedUserSegments)>,
+        )>,
+        copyout: impl FnOnce(u32, u64) -> AxResult<()>,
+    ) -> AxResult<()> {
+        let _registration = self.registration_serial.lock();
+        // Reject a duplicate parameter region before any caller-controlled
+        // usercopy or long-term pin.  The same serial is held through the
+        // remainder of preparation and publication, making concurrent
+        // registrations observe this exact ordering.
+        if self.state.lock().registered_wait_region.is_some() {
+            return Err(AxError::ResourceBusy);
+        }
+        let (length, wait_arguments, user_backing) = prepare()?;
+        if wait_arguments && !self.disabled.load(Ordering::Acquire) {
+            return Err(AxError::InvalidInput);
+        }
+        if length < 64 {
+            return Err(AxError::InvalidInput);
+        }
+        let mut state = self.state.lock();
+        debug_assert!(state.registered_wait_region.is_none());
+        let (backing, mmap_offset) = if let Some((capability, address, pin)) = user_backing {
+            (
+                RegisteredWaitBacking::User {
+                    capability,
+                    address,
+                    _pin: pin,
+                },
+                0,
+            )
+        } else {
+            let pages = Arc::try_new(SharedPages::new_fixed(length, PageSize::Size4K)?)
+                .map_err(|_| AxError::NoMemory)?;
+            let region = FixedSharedMmapRegion::try_new_detached(
+                IORING_MAP_OFF_PARAM_REGION,
+                Arc::clone(&pages),
+                super::FileMmapProtection::READ | super::FileMmapProtection::WRITE,
+            )?;
+            (
+                RegisteredWaitBacking::Kernel { region, pages },
+                IORING_MAP_OFF_PARAM_REGION,
+            )
+        };
+        // There is one v6.18 parameter region per ring.  Its zero id is part
+        // of the ABI copyout and no ID is published until the complete object
+        // has been constructed under the registration lock.
+        state.registered_wait_region = Some(RegisteredWaitRegion {
+            backing,
+            length,
+            wait_arguments,
+        });
+        drop(state);
+
+        // The kernel-generated mapping id/offset are not externally visible
+        // until this copyout succeeds.  Keep the serial held across it so a
+        // concurrent REGISTER_ENABLE_RINGS cannot commit a half-registered
+        // parameter region.  Rollback uses the lock already held above;
+        // calling the public unregister helper here would recursively lock.
+        if let Err(error) = copyout(0, mmap_offset) {
+            self.state.lock().registered_wait_region.take();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Copies an exact 64-byte registered wait record.  The returned bytes
+    /// have no transient user pointer and may safely outlive the enter call.
+    pub(crate) fn copy_registered_wait(&self, offset: usize) -> AxResult<[u8; 64]> {
+        let state = self.state.lock();
+        let region = state
+            .registered_wait_region
+            .as_ref()
+            .ok_or(AxError::BadAddress)?;
+        if !region.wait_arguments {
+            return Err(AxError::BadAddress);
+        }
+        if !offset.is_multiple_of(core::mem::size_of::<usize>()) {
+            return Err(AxError::BadAddress);
+        }
+        let end = offset.checked_add(64).ok_or(AxError::BadAddress)?;
+        if end > region.length {
+            return Err(AxError::BadAddress);
+        }
+        let mut bytes = [0u8; 64];
+        match &region.backing {
+            RegisteredWaitBacking::Kernel { pages, .. } => pages.read_bytes(offset, &mut bytes)?,
+            RegisteredWaitBacking::User {
+                capability,
+                address,
+                ..
+            } => {
+                let address = address.checked_add(offset).ok_or(AxError::BadAddress)?;
+                let value = capability
+                    .read_value_uninit(address as *const [u8; 64])
+                    .map_err(crate::mm::map_usercopy_error)?;
+                bytes = unsafe { value.assume_init() };
+            }
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn copy_registered_signal_mask(
+        &self,
+        capability: &UserMemoryCapability,
+        address: usize,
+    ) -> AxResult<SignalSet> {
+        // The wait record itself is kernel-backed, but `sigmask` retains the
+        // UAPI user pointer semantics.  Copy it against this enter caller's
+        // current capability after the record has been copied by value.
+        let value = capability
+            .read_value_uninit(address as *const SignalSet)
+            .map_err(crate::mm::map_usercopy_error)?;
+        // SAFETY: the complete fixed signal set was copied before returning.
+        Ok(unsafe { value.assume_init() })
     }
 
     fn drain_registered_files_after_retire(&self) -> AxResult<()> {
@@ -8263,6 +10019,11 @@ impl IoUring {
 
     fn request_final_close(self: &Arc<Self>) {
         self.final_close_requested.store(true, Ordering::Release);
+        // The SQ worker holds an Arc while it is asleep.  Close is the
+        // terminal wake edge; do not wait for its periodic idle deadline
+        // before beginning descriptor/buffer retirement.
+        self.sqpoll_stop.store(true, Ordering::Release);
+        self.sqpoll_wake.wake();
         self.request_physical_reset_for_final_close();
         self.enqueue_deferred();
     }
@@ -8313,6 +10074,35 @@ impl IoUring {
     fn begin_final_close_step(&self) -> AxResult<bool> {
         let mut state = self.state.lock();
         state.requests.begin_close().map_err(map_core_error)?;
+        // Linked/DRAIN followers have an accepted terminal credit but remain
+        // `Prepared` until their predecessor releases them.  Final close must
+        // detach those owners under this same request-table lock: otherwise a
+        // closed ring can retain a copied OPENAT2 (and its files/MM snapshot)
+        // indefinitely behind an uncancellable predecessor.
+        state.link_tail = None;
+        for slot in 0..state.parked_submissions.len() {
+            let Some(parked) = state.parked_submissions[slot].take() else {
+                continue;
+            };
+            let request = parked.work.id();
+            match state
+                .requests
+                .claim_terminal(request, TerminalCause::Closing)
+            {
+                Ok(permit) => {
+                    let token = state
+                        .requests
+                        .finish_terminal(permit, -LinuxError::ECANCELED.code(), 0)
+                        .map_err(map_core_error)?;
+                    self.queue_completion_locked(&mut state, token)?;
+                }
+                // A terminal callback may have won immediately before the
+                // final-close lock. The detached work is no longer eligible
+                // for dispatch, and that callback owns its sole credit.
+                Err(IoUringError::TerminalAlreadyClaimed | IoUringError::UnknownRequest) => {}
+                Err(error) => return Err(map_core_error(error)),
+            }
+        }
         state.final_close.enter(FinalClosePhase::Polls);
         Ok(false)
     }
@@ -8324,14 +10114,30 @@ impl IoUring {
             (state.final_close.take_slots(capacity), capacity)
         };
 
-        for slot in slots {
-            let control = {
+        for slot in slots.clone() {
+            let (control, pending_stream_work, socket_work) = {
                 let mut state = self.state.lock();
                 let request = state
                     .polls
                     .get(slot)
                     .and_then(Option::as_ref)
-                    .map(|control| control.request);
+                    .map(|control| control.request)
+                    .or_else(|| {
+                        state.socket_multishot.iter().find_map(|entry| {
+                            entry
+                                .as_ref()
+                                .filter(|work| work.request_id().slot() as usize == slot)
+                                .map(SocketMultishotWork::request_id)
+                        })
+                    })
+                    .or_else(|| {
+                        state.pending_stream.iter().find_map(|entry| {
+                            entry
+                                .as_ref()
+                                .filter(|work| work.request_id().slot() as usize == slot)
+                                .map(PendingStreamWork::request_id)
+                        })
+                    });
                 let Some(request) = request else {
                     continue;
                 };
@@ -8345,23 +10151,291 @@ impl IoUring {
                             .finish_terminal(permit, -LinuxError::ECANCELED.code(), 0)
                             .map_err(map_core_error)?;
                         self.queue_completion_locked(&mut state, token)?;
-                        state.polls[slot].take().ok_or(AxError::BadState)?
+                        let control = state.polls[slot].take();
+                        let pending_stream_work = state
+                            .pending_stream
+                            .iter()
+                            .position(|entry| {
+                                entry
+                                    .as_ref()
+                                    .is_some_and(|work| work.request_id() == request)
+                            })
+                            .and_then(|index| {
+                                let work = state.pending_stream[index].take();
+                                if work.is_some() {
+                                    state.pending_stream_count =
+                                        state.pending_stream_count.saturating_sub(1);
+                                }
+                                work
+                            });
+                        let socket_work = state
+                            .socket_multishot
+                            .iter()
+                            .position(|entry| {
+                                entry
+                                    .as_ref()
+                                    .is_some_and(|work| work.request_id() == request)
+                            })
+                            .and_then(|index| state.socket_multishot[index].take());
+                        (control, pending_stream_work, socket_work)
                     }
                     Err(
                         IoUringError::TerminalAlreadyClaimed
                         | IoUringError::UnknownRequest
                         | IoUringError::RequestUncancellable,
-                    ) => state.polls[slot].take().ok_or(AxError::BadState)?,
+                    ) => {
+                        let control = state.polls[slot].take();
+                        let pending_stream_work = state
+                            .pending_stream
+                            .iter()
+                            .position(|entry| {
+                                entry
+                                    .as_ref()
+                                    .is_some_and(|work| work.request_id() == request)
+                            })
+                            .and_then(|index| {
+                                let work = state.pending_stream[index].take();
+                                if work.is_some() {
+                                    state.pending_stream_count =
+                                        state.pending_stream_count.saturating_sub(1);
+                                }
+                                work
+                            });
+                        let socket_work = state
+                            .socket_multishot
+                            .iter()
+                            .position(|entry| {
+                                entry
+                                    .as_ref()
+                                    .is_some_and(|work| work.request_id() == request)
+                            })
+                            .and_then(|index| state.socket_multishot[index].take());
+                        (control, pending_stream_work, socket_work)
+                    }
                     Err(error) => return Err(map_core_error(error)),
                 }
             };
-            drop(control.deactivate());
+            let lease = control.as_ref().and_then(|control| control.deactivate());
+            let pending_stream_lease = pending_stream_work
+                .as_ref()
+                .and_then(|work| work.control.deactivate());
+            let socket_lease = socket_work
+                .as_ref()
+                .and_then(|work| work.control.deactivate());
+            drop(lease);
+            drop(pending_stream_lease);
+            drop(pending_stream_work);
+            drop(socket_lease);
             drop(control);
+            drop(socket_work);
         }
 
+        // Poll controls own a readiness registration and were detached above.
+        // Other cancellable executors (currently relative timeout workers)
+        // have no file lease/control object, but still must be terminally
+        // claimed here: otherwise final close would wait for their original
+        // deadline even though cancellation was already requested.
+        let mut state = self.state.lock();
+        for slot in slots.clone() {
+            let token = match state
+                .requests
+                .claim_cancellable_at_slot(slot as u32, TerminalCause::Closing)
+                .map_err(map_core_error)?
+            {
+                Some(permit) => Some(
+                    state
+                        .requests
+                        .finish_terminal(permit, -LinuxError::ECANCELED.code(), 0)
+                        .map_err(map_core_error)?,
+                ),
+                None => None,
+            };
+            if let Some(token) = token {
+                self.queue_completion_locked(&mut state, token)?;
+            }
+        }
+
+        if state.final_close.cursor >= capacity {
+            state.final_close.enter(FinalClosePhase::OwnedFileIo);
+        }
+        drop(state);
+        // Provider-owned URING_CMD completions are not poll controls, but
+        // they retain an issued token and exact OFD.  Detach each generation
+        // before notifying the provider so close cannot leave an opaque queue
+        // holding the ring alive after its terminal credit was claimed.
+        for slot in slots {
+            let provider = {
+                let mut state = self.state.lock();
+                let terminal = state
+                    .iopoll_uring_cmd
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .and_then(|owner| {
+                        state.requests.request(owner.id).ok().map(|(_, request)| {
+                            !matches!(request, thekernel_linux_io_uring::RequestState::Issued(_))
+                        })
+                    })
+                    .unwrap_or(false);
+                if terminal {
+                    state.iopoll_uring_cmd.get_mut(slot).and_then(Option::take)
+                } else {
+                    None
+                }
+            };
+            if let Some(owner) = provider {
+                let request = owner.id;
+                let provider = owner.file;
+                provider.cancel_uring_cmd(request);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Cancels provider-owned generic I/O after poll controls have been
+    /// detached but before registered files/buffers can release the OFD and
+    /// long-term pins retained by a provider.  Provider controls are always
+    /// invoked outside `RingState`; a worker which already owns an operation
+    /// remains in `InFlight` until its sole completion bridge fires.
+    fn close_owned_file_io_step(&self) -> AxResult<bool> {
+        let (slots, capacity) = {
+            let mut state = self.state.lock();
+            let capacity = state.owned_file_io.len();
+            (state.final_close.take_slots(capacity), capacity)
+        };
+        for slot in slots {
+            let control = {
+                let mut state = self.state.lock();
+                let Some(id) = state
+                    .owned_file_io
+                    .get(slot)
+                    .and_then(Option::as_ref)
+                    .map(|owner| owner.id)
+                else {
+                    continue;
+                };
+                if !matches!(state.owned_file_io.get(slot).and_then(Option::as_ref).map(|owner| &owner.state),
+                    Some(OwnedFileIoControlState::Submitted { generation, .. }) if *generation == id.generation())
+                {
+                    continue;
+                }
+                state
+                    .requests
+                    .begin_provider_cancel(id)
+                    .map_err(map_core_error)?;
+                let owner = state
+                    .owned_file_io
+                    .get_mut(slot)
+                    .and_then(Option::as_mut)
+                    .ok_or(AxError::BadState)?;
+                let previous =
+                    core::mem::replace(&mut owner.state, OwnedFileIoControlState::Terminal);
+                let OwnedFileIoControlState::Submitted {
+                    generation,
+                    bridge,
+                    control,
+                } = previous
+                else {
+                    return Err(AxError::BadState);
+                };
+                owner.state = OwnedFileIoControlState::CancelPending { generation, bridge };
+                Some((id, control))
+            };
+            let Some((id, control)) = control else {
+                continue;
+            };
+            let outcome = control.cancel();
+            let (callback, cancelled) = {
+                let mut state = self.state.lock();
+                let slot = id.slot() as usize;
+                let mut owner = state
+                    .owned_file_io
+                    .get_mut(slot)
+                    .and_then(Option::take)
+                    .filter(|owner| owner.id == id)
+                    .ok_or(AxError::BadState)?;
+                let previous =
+                    core::mem::replace(&mut owner.state, OwnedFileIoControlState::Terminal);
+                let pending = match previous {
+                    OwnedFileIoControlState::CompletionPending {
+                        generation,
+                        bridge,
+                        result,
+                    } if generation == id.generation() => Some((bridge, result)),
+                    state @ OwnedFileIoControlState::CancelPending { .. } => {
+                        owner.state = state;
+                        None
+                    }
+                    state => {
+                        owner.state = state;
+                        None
+                    }
+                };
+                match outcome {
+                    axfs_ng_vfs::FileIoCancelOutcome::Cancelled => {
+                        let permit = state
+                            .requests
+                            .finish_provider_cancel(id, ProviderCancelOutcome::Cancelled)
+                            .map_err(map_core_error)?
+                            .ok_or(AxError::BadState)?;
+                        let token = state
+                            .requests
+                            .finish_terminal(permit, -LinuxError::ECANCELED.code(), 0)
+                            .map_err(map_core_error)?;
+                        self.queue_completion_locked(&mut state, token)?;
+                        drop(owner);
+                        (None, true)
+                    }
+                    axfs_ng_vfs::FileIoCancelOutcome::InFlight
+                    | axfs_ng_vfs::FileIoCancelOutcome::Terminal => {
+                        state
+                            .requests
+                            .finish_provider_cancel(id, ProviderCancelOutcome::InFlight)
+                            .map_err(map_core_error)?;
+                        if let Some((bridge, result)) = pending {
+                            (
+                                Some(OwnedFileIoTerminal {
+                                    issued: bridge.issued,
+                                    result,
+                                    buffer: owner.buffer,
+                                }),
+                                false,
+                            )
+                        } else {
+                            let previous = core::mem::replace(
+                                &mut owner.state,
+                                OwnedFileIoControlState::Terminal,
+                            );
+                            let OwnedFileIoControlState::CancelPending { generation, bridge } =
+                                previous
+                            else {
+                                return Err(AxError::BadState);
+                            };
+                            owner.state = OwnedFileIoControlState::InFlight { generation, bridge };
+                            state.owned_file_io[slot] = Some(owner);
+                            (None, false)
+                        }
+                    }
+                }
+            };
+            if cancelled {
+                let linked =
+                    self.release_linked_after_terminal(id, -LinuxError::ECANCELED.code())?;
+                self.publish_pending_slot(id.slot() as usize)?;
+                if let Some(dispatch) = linked {
+                    let _ = crate::syscall::dispatch_dependency_submission(self, dispatch)?;
+                }
+            }
+            if let Some(terminal) = callback {
+                self.complete_owned_terminal(terminal)?;
+            }
+        }
         let mut state = self.state.lock();
         if state.final_close.cursor >= capacity {
-            state.final_close.enter(FinalClosePhase::FixedFiles);
+            if state.owned_file_io.iter().all(Option::is_none) {
+                state.final_close.enter(FinalClosePhase::FixedFiles);
+            } else {
+                state.final_close.cursor = 0;
+            }
         }
         Ok(false)
     }
@@ -8479,9 +10553,11 @@ impl IoUring {
         }
         state.requests.discard_published().map_err(map_core_error)?;
         state.requests.finish_close().map_err(map_core_error)?;
+        let eventfd = state.completion_eventfd.take();
         state.final_close.enter(FinalClosePhase::Finished);
         drop(state);
         drop(publication);
+        drop(eventfd);
 
         for word in &self.poll_hint_bits {
             word.store(0, Ordering::Release);
@@ -8496,6 +10572,7 @@ impl IoUring {
         match phase {
             FinalClosePhase::Begin => self.begin_final_close_step(),
             FinalClosePhase::Polls => self.close_polls_step(),
+            FinalClosePhase::OwnedFileIo => self.close_owned_file_io_step(),
             FinalClosePhase::FixedFiles => self.close_fixed_files_step(),
             FinalClosePhase::Buffers => self.close_buffers_step(),
             FinalClosePhase::Completions => self.close_completions_step(),
@@ -8560,6 +10637,7 @@ impl IoUring {
             issued.id(),
             file,
             pending_stream_events(),
+            false,
         ) {
             Ok(control) => control,
             Err((error, file)) => {
@@ -8646,6 +10724,23 @@ impl IoUring {
     fn reinsert_pending_stream(&self, work: PendingStreamWork) -> Result<(), PendingStreamWork> {
         let slot = work.slot;
         let mut state = self.state.lock();
+        // A readiness worker temporarily owns the table slot while it tries
+        // one read.  ASYNC_CANCEL/final-close may have consumed the request's
+        // terminal credit during that interval; such work must be dropped,
+        // never rearmed for a second I/O attempt.
+        if !work
+            .issued
+            .as_ref()
+            .is_some_and(|issued| state.requests.issued_is_live(issued))
+        {
+            return Err(work);
+        }
+        // The close cursor can have passed this slot while the worker held
+        // it in ShotInFlight.  Never reintroduce a readable-owner after close
+        // begins; the caller terminalizes this restored Issued request below.
+        if self.final_close_requested.load(Ordering::Acquire) {
+            return Err(work);
+        }
         if state.pending_stream.get(slot).is_none_or(Option::is_some) {
             return Err(work);
         }
@@ -8663,8 +10758,42 @@ impl IoUring {
             .take()
             .expect("pending stream completion lost issued request");
         let lease = work.control.deactivate();
-        if let Err(error) = self.complete_issued(issued, TerminalCause::Completed, result, 0) {
+        // `retry_pending_stream` enters ShotInFlight before its first
+        // externally visible read.  Finish from that state atomically rather
+        // than reopening cancellation between the read and its final CQE.
+        let completed = (|| {
+            let mut state = self.state.lock();
+            let permit = state
+                .requests
+                .claim_terminal_after_nonterminal_shot(&issued, TerminalCause::Completed)
+                .map_err(map_core_error)?;
+            let token = state
+                .requests
+                .finish_terminal(permit, result, 0)
+                .map_err(map_core_error)?;
+            self.queue_completion_locked(&mut state, token)
+        })();
+        if let Err(error) = completed {
             error!("io_uring pending stream completion failed: {error:?}");
+        } else {
+            let id = issued.id();
+            match self.release_linked_after_terminal(id, result) {
+                Ok(linked) => {
+                    if let Err(error) = self.publish_pending_slot(id.slot() as usize) {
+                        error!("io_uring pending stream CQE publication failed: {error:?}");
+                    }
+                    if let Some(dispatch) = linked {
+                        if let Err(error) =
+                            crate::syscall::dispatch_dependency_submission(self, dispatch)
+                        {
+                            error!("io_uring pending stream dependency release failed: {error:?}");
+                        }
+                    }
+                }
+                Err(error) => {
+                    error!("io_uring pending stream dependency accounting failed: {error:?}")
+                }
+            }
         }
         // The CQE publication boundary is above the exact registered-buffer
         // lease drop. Unregister can therefore detach its table while this
@@ -8681,6 +10810,26 @@ impl IoUring {
         self.complete_pending_stream_work(work, -LinuxError::from(error).code());
     }
 
+    /// Fails an owner after it has been returned from ShotInFlight to Issued
+    /// for a readiness rearm.  This path must not use the shot finalizer: it
+    /// intentionally exposes a normal cancellable request again before the
+    /// rearm decision.
+    fn fail_pending_stream_rearm(self: &Arc<Self>, mut work: PendingStreamWork, error: AxError) {
+        let issued = work
+            .issued
+            .take()
+            .expect("pending stream rearm lost issued request");
+        let lease = work.control.deactivate();
+        let _ = self.complete_issued(
+            issued,
+            TerminalCause::PreparationFailed,
+            -LinuxError::from(error).code(),
+            0,
+        );
+        drop(lease);
+        drop(work);
+    }
+
     /// Retries one exact pending stream owner in task context. IRQ/readiness
     /// callbacks only set the source-wake bit and enqueue this ring; all user
     /// memory and pipe consumption happens here under a fixed worker budget.
@@ -8689,6 +10838,19 @@ impl IoUring {
         let Some(work) = self.take_pending_stream(request) else {
             return;
         };
+        let begun = work
+            .issued
+            .as_ref()
+            .map(|issued| self.state.lock().requests.begin_side_effect(issued))
+            .unwrap_or(Err(IoUringError::UnknownRequest));
+        if begun.is_err() {
+            // Cancellation/close (or another execution claimant) has
+            // already won. Do not touch the FIFO or supplied buffer from a
+            // stale readiness hint.
+            drop(work.control.deactivate());
+            drop(work);
+            return;
+        }
         let result = work.control.description().and_then(|description| {
             crate::syscall::io_uring_pending_read_fixed(
                 &work.capability,
@@ -8700,6 +10862,16 @@ impl IoUring {
         match result {
             Ok(result) => self.complete_pending_stream_work(work, result as i32),
             Err(AxError::WouldBlock) => {
+                let aborted = work
+                    .issued
+                    .as_ref()
+                    .map(|issued| self.state.lock().requests.abort_nonterminal_shot(issued))
+                    .unwrap_or(Err(IoUringError::UnknownRequest));
+                if aborted.is_err() {
+                    drop(work.control.deactivate());
+                    drop(work);
+                    return;
+                }
                 let ready = work.control.check_arm_check();
                 match ready {
                     Ok(ready) if !ready.is_empty() || work.control.has_source_wake() => {
@@ -8707,19 +10879,156 @@ impl IoUring {
                             Ok(()) => self.publish_poll_hint(request),
                             Err(work) => {
                                 error!("io_uring pending stream owner lost while rearming");
-                                self.complete_pending_stream_error(work, AxError::BadState);
+                                self.fail_pending_stream_rearm(work, AxError::BadState);
                             }
                         }
                     }
                     Ok(_) => {
                         if let Err(work) = self.reinsert_pending_stream(work) {
-                            self.complete_pending_stream_error(work, AxError::BadState);
+                            self.fail_pending_stream_rearm(work, AxError::BadState);
                         }
                     }
-                    Err(error) => self.complete_pending_stream_error(work, error),
+                    Err(error) => self.fail_pending_stream_rearm(work, error),
                 }
             }
             Err(error) => self.complete_pending_stream_error(work, error),
+        }
+    }
+
+    /// Executes exactly one socket multishot readiness edge.  The owner is
+    /// removed from its fixed slot while a shot runs, preventing cancellation,
+    /// close, and a second wake from observing a duplicate issued proof.
+    fn retry_socket_multishot(self: &Arc<Self>, control: Arc<PollControl>) {
+        const IORING_CQE_F_BUFFER: u32 = 1;
+        const IORING_CQE_F_MORE: u32 = 1 << 1;
+        const IORING_CQE_F_SOCK_NONEMPTY: u32 = 1 << 2;
+        let request = control.request;
+        let Some(work) = self.claim_socket_multishot(request) else {
+            return;
+        };
+        let begun = work
+            .issued
+            .as_ref()
+            .map(|issued| self.state.lock().requests.begin_nonterminal_shot(issued))
+            .unwrap_or(Err(IoUringError::UnknownRequest));
+        if begun.is_err() {
+            // A full CQ reservation is backpressure, not a terminal socket
+            // result. Preserve this exact owner until a reap makes space;
+            // cancellation/close still wins through the normal terminal path.
+            if !self.final_close_requested.load(Ordering::Acquire) {
+                self.rearm_socket_multishot(work);
+                return;
+            }
+            drop(work.control.deactivate());
+            return;
+        }
+        let shot = if work.accepting {
+            work.control.description().and_then(|description| {
+                let socket = crate::file::PinnedSocketDescription::from_description(description)?;
+                crate::syscall::accept_pinned(
+                    &socket,
+                    work.context.security().actor_arc(),
+                    work.accept_flags,
+                )
+                .map(|fd| (fd, 0))
+            })
+        } else {
+            let result = (|| {
+                let group = work.recv_group.ok_or(AxError::BadState)?;
+                let buffer = self.acquire_provided_buffer(group)?;
+                let (address, length) = buffer.range()?;
+                let request = work.recv_request.ok_or(AxError::BadState)?;
+                let capability = buffer.capability()?;
+                let description = work.control.description()?;
+                let socket = crate::file::PinnedSocketDescription::from_description(description)?;
+                let result = crate::syscall::io_uring_recv_pinned(
+                    &capability,
+                    &socket,
+                    address as *mut u8,
+                    usize::try_from(length).map_err(|_| AxError::BadAddress)?,
+                    request.recv_flags(),
+                )?;
+                let mut flags = buffer
+                    .provided_id()
+                    .map(|id| IORING_CQE_F_BUFFER | (u32::from(id) << 16))
+                    .unwrap_or(0);
+                let socket_nonempty = work
+                    .control
+                    .check_arm_check()
+                    .is_ok_and(|ready| !ready.is_empty());
+                if socket_nonempty && !result.eof {
+                    flags |= IORING_CQE_F_SOCK_NONEMPTY;
+                }
+                // The lease returns to its group only after the CQE is
+                // visible; a completion therefore never identifies a buffer
+                // another live shot can concurrently select.
+                Ok::<_, AxError>((result.bytes, flags, result.eof, buffer))
+            })();
+            match result {
+                Ok((result, flags, eof, mut buffer)) => {
+                    if eof {
+                        // EOF is the socket receive terminal condition; do
+                        // not leave an always-readable peer-closed socket
+                        // generating an infinite stream of MORE CQEs.
+                        drop(buffer);
+                        work.finalise(self, 0);
+                        return;
+                    }
+                    let issued = work.issued.as_ref().expect("socket multishot lost request");
+                    // Mark the provided slot consumed before releasing the
+                    // CQ tail. A failed CQ write restores the leased slot so
+                    // the Drop path returns it to Ready without a ghost CQE.
+                    buffer.consume_provided();
+                    let published =
+                        self.publish_nonterminal_issued(issued, result, flags | IORING_CQE_F_MORE);
+                    if published.is_err() {
+                        buffer.rollback_consumed_provided();
+                    }
+                    drop(buffer);
+                    published.map(|_| (0, 0))
+                }
+                Err(error) => Err(error),
+            }
+        };
+        match shot {
+            Ok((result, flags)) if work.accepting => {
+                let issued = work.issued.as_ref().expect("socket multishot lost request");
+                match self.publish_nonterminal_issued(
+                    issued,
+                    i32::try_from(result).unwrap_or(-LinuxError::EOVERFLOW.code()),
+                    flags | IORING_CQE_F_MORE,
+                ) {
+                    Ok(()) => self.rearm_socket_multishot(work),
+                    Err(error) => work.finalise(self, -LinuxError::from(error).code()),
+                }
+            }
+            Ok(_) => self.rearm_socket_multishot(work),
+            Err(AxError::WouldBlock) => {
+                if let Some(issued) = work.issued.as_ref() {
+                    let _ = self.state.lock().requests.abort_nonterminal_shot(issued);
+                }
+                self.rearm_socket_multishot(work)
+            }
+            Err(error) => work.finalise(self, -LinuxError::from(error).code()),
+        }
+    }
+
+    fn rearm_socket_multishot(self: &Arc<Self>, work: SocketMultishotWork) {
+        // Final close may have started while this owner was outside its fixed
+        // slot in ShotInFlight.  Never put it back after that intent: emit
+        // the one terminal cancellation CQE instead.
+        if self.final_close_requested.load(Ordering::Acquire) {
+            work.finalise(self, -LinuxError::ECANCELED.code());
+            return;
+        }
+        let request = work.request_id();
+        match work.control.check_arm_check() {
+            Ok(ready) => match self.reinsert_socket_multishot(work) {
+                Ok(()) if !ready.is_empty() => self.publish_poll_hint(request),
+                Ok(()) => {}
+                Err(work) => work.finalise(self, -LinuxError::EIO.code()),
+            },
+            Err(error) => work.finalise(self, -LinuxError::from(error).code()),
         }
     }
 
@@ -8728,6 +11037,7 @@ impl IoUring {
         mut admission: SubmissionAdmission<'_>,
         lease: IoUringFileLease,
         linux_events: u32,
+        multishot: bool,
         capability: UserMemoryCapability,
     ) -> AxResult<()> {
         let id = admission
@@ -8737,7 +11047,7 @@ impl IoUring {
             .id();
         let ring = self.self_weak.get().ok_or(AxError::BadState)?.clone();
         let events = poll_events_from_linux(linux_events);
-        let control = match PollControl::try_new(ring, id, lease, events) {
+        let control = match PollControl::try_new(ring, id, lease, events, multishot) {
             Ok(control) => control,
             Err((error, lease)) => {
                 drop(lease);
@@ -8794,11 +11104,12 @@ impl IoUring {
             self.sq_head.store_release(state.sq_head);
         }
         if !ready.is_empty() {
-            self.finish_poll_control(
-                &control,
-                TerminalCause::Completed,
-                poll_events_to_linux(ready) as i32,
-            )?;
+            let result = poll_events_to_linux(ready) as i32;
+            if control.multishot {
+                self.publish_multishot_poll(&control, result)?;
+            } else {
+                self.finish_poll_control(&control, TerminalCause::Completed, result)?;
+            }
         }
         if control.has_source_wake()
             && let Some(ring) = self.self_weak.get().and_then(Weak::upgrade)
@@ -8840,10 +11151,57 @@ impl IoUring {
             (id, control)
         };
         let lease = control.deactivate();
+        let linked = self.release_linked_after_terminal(id, result)?;
         let publication = self.publish_pending_slot(id.slot() as usize);
         drop(lease);
         drop(control);
         publication?;
+        if let Some(dispatch) = linked {
+            let _ = crate::syscall::dispatch_dependency_submission(self, dispatch)?;
+        }
+        Ok(true)
+    }
+
+    /// Publishes one `IORING_CQE_F_MORE` notification while retaining the
+    /// original poll request and its readiness registration.  Each visible
+    /// CQE receives a fresh, bounded request slot/credit; the long-lived poll
+    /// itself never reuses an already published terminal slot.
+    fn publish_multishot_poll(&self, expected: &Arc<PollControl>, result: i32) -> AxResult<bool> {
+        const IORING_CQE_F_MORE: u32 = 1 << 1;
+        let token = {
+            let mut state = self.state.lock();
+            let slot = usize::try_from(expected.request.slot()).map_err(|_| AxError::BadState)?;
+            if state
+                .polls
+                .get(slot)
+                .and_then(Option::as_ref)
+                .is_none_or(|control| !Arc::ptr_eq(control, expected))
+            {
+                return Ok(false);
+            }
+            let (original, _) = state
+                .requests
+                .request(expected.request)
+                .map_err(map_core_error)?;
+            let descriptor = RequestDescriptor::new(
+                original.user_data(),
+                thekernel_linux_io_uring::RequestOperation::PollAdd,
+            );
+            let reservation = state.requests.reserve(descriptor).map_err(map_core_error)?;
+            let id = reservation.id();
+            let prepared = state.requests.commit(reservation).map_err(map_core_error)?;
+            let permit = state
+                .requests
+                .claim_terminal(prepared.id(), TerminalCause::Completed)
+                .map_err(map_core_error)?;
+            let token = state
+                .requests
+                .finish_terminal(permit, result, IORING_CQE_F_MORE)
+                .map_err(map_core_error)?;
+            self.queue_completion_locked(&mut state, token)?;
+            id
+        };
+        self.publish_pending_slot(token.slot() as usize)?;
         Ok(true)
     }
 
@@ -8852,13 +11210,221 @@ impl IoUring {
         cancel: IssuedRequest,
         target_user_data: u64,
     ) -> AxResult<()> {
-        let cancel_id = cancel.id();
-        let (target_id, control) = {
+        self.cancel_request_selected(cancel, CancelSelector::UserData(target_user_data))
+    }
+
+    /// `IORING_OP_TIMEOUT_REMOVE` is intentionally narrower than
+    /// `ASYNC_CANCEL`: duplicate user-data values must not let it detach an
+    /// unrelated poll or future cancellable provider request.
+    pub(crate) fn cancel_timeout_request(
+        &self,
+        cancel: IssuedRequest,
+        target_user_data: u64,
+    ) -> AxResult<()> {
+        self.cancel_request_selected(cancel, CancelSelector::TimeoutUserData(target_user_data))
+    }
+
+    fn cancel_request_selected(
+        &self,
+        cancel: IssuedRequest,
+        selector: CancelSelector,
+    ) -> AxResult<()> {
+        // Provider-owned generic file I/O has a consuming control object.
+        // Fence that exact slot/generation before the legacy generic cancel
+        // path can claim an unrelated request with the same user_data.
+        let owned = {
             let mut state = self.state.lock();
-            match state
-                .requests
-                .claim_cancel(CancelSelector::UserData(target_user_data), Some(cancel_id))
-            {
+            let selected = {
+                let RingState {
+                    requests,
+                    owned_file_io,
+                    ..
+                } = &mut *state;
+                requests.select_provider_cancel_candidate(
+                    selector,
+                    Some(cancel.id()),
+                    |id| {
+                        owned_file_io
+                            .get(id.slot() as usize)
+                            .and_then(Option::as_ref)
+                            .is_some_and(|owner| {
+                                owner.id == id
+                                    && matches!(&owner.state, OwnedFileIoControlState::Submitted { generation, .. } if *generation == id.generation())
+                            })
+                    },
+                )
+            };
+            match selected {
+                Ok(id) => {
+                    let owner = state
+                        .owned_file_io
+                        .get_mut(id.slot() as usize)
+                        .and_then(Option::as_mut)
+                        .filter(|owner| owner.id == id)
+                        .ok_or(AxError::BadState)?;
+                    let previous =
+                        core::mem::replace(&mut owner.state, OwnedFileIoControlState::Terminal);
+                    let OwnedFileIoControlState::Submitted {
+                        generation,
+                        bridge,
+                        control,
+                    } = previous
+                    else {
+                        return Err(AxError::BadState);
+                    };
+                    owner.state = OwnedFileIoControlState::CancelPending { generation, bridge };
+                    Some((id, control))
+                }
+                Err(IoUringError::CancellationTargetNotFound) => None,
+                Err(error) => return Err(map_core_error(error)),
+            }
+        };
+        if let Some((target_id, control)) = owned {
+            // `cancel` may synchronously invoke the weak completion bridge.
+            // That bridge records CompletionPending under the same ring lock;
+            // only this path resolves the registry's ShotInFlight fence.
+            let outcome = control.cancel();
+            let (callback, target_cancelled, cancel_result) = {
+                let mut state = self.state.lock();
+                let slot = target_id.slot() as usize;
+                let mut owner = state
+                    .owned_file_io
+                    .get_mut(slot)
+                    .and_then(Option::take)
+                    .filter(|owner| owner.id == target_id)
+                    .ok_or(AxError::BadState)?;
+                let pending =
+                    match core::mem::replace(&mut owner.state, OwnedFileIoControlState::Terminal) {
+                        OwnedFileIoControlState::CompletionPending {
+                            generation,
+                            bridge,
+                            result,
+                        } if generation == target_id.generation() => Some((bridge, result)),
+                        state @ OwnedFileIoControlState::CancelPending { .. }
+                        | state @ OwnedFileIoControlState::InFlight { .. } => {
+                            owner.state = state;
+                            None
+                        }
+                        state => {
+                            owner.state = state;
+                            None
+                        }
+                    };
+                match outcome {
+                    axfs_ng_vfs::FileIoCancelOutcome::Cancelled => {
+                        let permit = state
+                            .requests
+                            .finish_provider_cancel(target_id, ProviderCancelOutcome::Cancelled)
+                            .map_err(map_core_error)?;
+                        let permit = permit.ok_or(AxError::BadState)?;
+                        let token = state
+                            .requests
+                            .finish_terminal(permit, -LinuxError::ECANCELED.code(), 0)
+                            .map_err(map_core_error)?;
+                        self.queue_completion_locked(&mut state, token)?;
+                        drop(owner);
+                        (None, true, 0)
+                    }
+                    axfs_ng_vfs::FileIoCancelOutcome::InFlight => {
+                        if let Some((bridge, result)) = pending {
+                            state
+                                .requests
+                                .finish_provider_cancel(target_id, ProviderCancelOutcome::InFlight)
+                                .map_err(map_core_error)?;
+                            (
+                                Some(OwnedFileIoTerminal {
+                                    issued: bridge.issued,
+                                    result,
+                                    buffer: owner.buffer,
+                                }),
+                                false,
+                                -LinuxError::EALREADY.code(),
+                            )
+                        } else {
+                            state
+                                .requests
+                                .finish_provider_cancel(target_id, ProviderCancelOutcome::InFlight)
+                                .map_err(map_core_error)?;
+                            let previous = core::mem::replace(
+                                &mut owner.state,
+                                OwnedFileIoControlState::Terminal,
+                            );
+                            let OwnedFileIoControlState::CancelPending { generation, bridge } =
+                                previous
+                            else {
+                                return Err(AxError::BadState);
+                            };
+                            owner.state = OwnedFileIoControlState::InFlight { generation, bridge };
+                            state.owned_file_io[slot] = Some(owner);
+                            (None, false, -LinuxError::EALREADY.code())
+                        }
+                    }
+                    axfs_ng_vfs::FileIoCancelOutcome::Terminal => {
+                        if let Some((bridge, result)) = pending {
+                            state
+                                .requests
+                                .finish_provider_cancel(target_id, ProviderCancelOutcome::InFlight)
+                                .map_err(map_core_error)?;
+                            (
+                                Some(OwnedFileIoTerminal {
+                                    issued: bridge.issued,
+                                    result,
+                                    buffer: owner.buffer,
+                                }),
+                                false,
+                                -LinuxError::ENOENT.code(),
+                            )
+                        } else {
+                            // The provider reported a terminal transition but
+                            // did not deliver its bridge.  Keep the exact
+                            // owner fenced rather than manufacturing a second
+                            // CQE or allowing the slot to be reused.
+                            state
+                                .requests
+                                .finish_provider_cancel(target_id, ProviderCancelOutcome::InFlight)
+                                .map_err(map_core_error)?;
+                            let previous = core::mem::replace(
+                                &mut owner.state,
+                                OwnedFileIoControlState::Terminal,
+                            );
+                            let OwnedFileIoControlState::CancelPending { generation, bridge } =
+                                previous
+                            else {
+                                return Err(AxError::BadState);
+                            };
+                            owner.state = OwnedFileIoControlState::InFlight { generation, bridge };
+                            state.owned_file_io[slot] = Some(owner);
+                            (None, false, -LinuxError::ENOENT.code())
+                        }
+                    }
+                }
+            };
+            if target_cancelled {
+                let linked =
+                    self.release_linked_after_terminal(target_id, -LinuxError::ECANCELED.code())?;
+                self.publish_pending_slot(target_id.slot() as usize)?;
+                if let Some(dispatch) = linked {
+                    let _ = crate::syscall::dispatch_dependency_submission(self, dispatch)?;
+                }
+            }
+            if let Some(terminal) = callback {
+                self.complete_owned_terminal(terminal)?;
+            }
+            self.complete_issued(cancel, TerminalCause::Completed, cancel_result, 0)?;
+            return Ok(());
+        }
+        let cancel_id = cancel.id();
+        let (
+            target_id,
+            cancel_completion,
+            control,
+            pending_stream_work,
+            socket_work,
+            parked_work,
+            iopoll_provider,
+        ) = {
+            let mut state = self.state.lock();
+            match state.requests.claim_cancel(selector, Some(cancel_id)) {
                 Ok(target) => {
                     let target_id = target.id();
                     let target_token = state
@@ -8879,7 +11445,80 @@ impl IoUring {
                         .ok()
                         .and_then(|slot| state.polls.get_mut(slot))
                         .and_then(Option::take);
-                    (Some(target_id), control)
+                    // Pending fixed-buffer streams own both a poll
+                    // registration and the supplied-buffer lease outside the
+                    // ordinary poll table.  Claim and remove that exact owner
+                    // under the same lock that consumes the request's one
+                    // terminal credit, so a later readiness edge cannot
+                    // reinsert it after ASYNC_CANCEL has won.
+                    let pending_stream_work = state
+                        .pending_stream
+                        .iter()
+                        .position(|entry| {
+                            entry
+                                .as_ref()
+                                .is_some_and(|work| work.request_id() == target_id)
+                        })
+                        .and_then(|index| {
+                            let work = state.pending_stream[index].take();
+                            if work.is_some() {
+                                state.pending_stream_count =
+                                    state.pending_stream_count.saturating_sub(1);
+                            }
+                            work
+                        });
+                    let socket_work = state
+                        .socket_multishot
+                        .iter()
+                        .position(|entry| {
+                            entry
+                                .as_ref()
+                                .is_some_and(|work| work.request_id() == target_id)
+                        })
+                        .and_then(|index| state.socket_multishot[index].take());
+                    // A linked follower can still be Prepared.  Remove its
+                    // parked owner under the same state lock which claims its
+                    // terminal credit, so a predecessor completion cannot
+                    // resurrect execution after cancellation wins.
+                    let parked_work = state
+                        .parked_submissions
+                        .iter()
+                        .position(|entry| {
+                            entry
+                                .as_ref()
+                                .is_some_and(|work| work.work.id() == target_id)
+                        })
+                        .and_then(|index| state.parked_submissions[index].take());
+                    let iopoll_provider = state
+                        .iopoll_uring_cmd
+                        .get_mut(target_id.slot() as usize)
+                        .and_then(|entry| {
+                            match entry.as_mut().filter(|owner| owner.id == target_id) {
+                                Some(owner)
+                                    if matches!(
+                                        owner.state,
+                                        UringCmdHandoffState::Prepared
+                                            | UringCmdHandoffState::Submitting
+                                    ) =>
+                                {
+                                    owner.state = UringCmdHandoffState::CancelPending;
+                                    None
+                                }
+                                Some(_) => entry
+                                    .take()
+                                    .map(|owner| (owner.id, owner.file, owner.iopoll)),
+                                None => None,
+                            }
+                        });
+                    (
+                        Some(target_id),
+                        0,
+                        control,
+                        pending_stream_work,
+                        socket_work,
+                        parked_work,
+                        iopoll_provider,
+                    )
                 }
                 Err(IoUringError::CancellationTargetNotFound) => {
                     let cancel_permit = state
@@ -8891,12 +11530,31 @@ impl IoUring {
                         .finish_terminal(cancel_permit, -LinuxError::ENOENT.code(), 0)
                         .map_err(map_core_error)?;
                     self.queue_completion_locked(&mut state, cancel_token)?;
-                    (None, None)
+                    (
+                        None,
+                        -LinuxError::ENOENT.code(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
                 }
                 Err(error) => return Err(map_core_error(error)),
             }
         };
         let lease = control.as_ref().and_then(|control| control.deactivate());
+        let pending_stream_lease = pending_stream_work
+            .as_ref()
+            .and_then(|work| work.control.deactivate());
+        let socket_lease = socket_work
+            .as_ref()
+            .and_then(|work| work.control.deactivate());
+        let target_linked = match target_id {
+            Some(id) => self.release_linked_after_terminal(id, -LinuxError::ECANCELED.code())?,
+            None => None,
+        };
+        let cancel_linked = self.release_linked_after_terminal(cancel_id, cancel_completion)?;
         let target_result = match target_id {
             Some(id) => self.publish_pending_slot(id.slot() as usize).map(|_| ()),
             None => Ok(()),
@@ -8905,8 +11563,24 @@ impl IoUring {
             .publish_pending_slot(cancel_id.slot() as usize)
             .map(|_| ());
         drop(lease);
+        drop(pending_stream_lease);
+        drop(pending_stream_work);
+        drop(socket_lease);
+        drop(socket_work);
         drop(control);
-        target_result.and(cancel_result)
+        drop(parked_work);
+        if let Some((request, provider, _iopoll)) = iopoll_provider {
+            provider.cancel_uring_cmd(request);
+            drop(provider);
+        }
+        target_result.and(cancel_result)?;
+        if let Some(dispatch) = target_linked {
+            let _ = crate::syscall::dispatch_dependency_submission(self, dispatch)?;
+        }
+        if let Some(dispatch) = cancel_linked {
+            let _ = crate::syscall::dispatch_dependency_submission(self, dispatch)?;
+        }
+        Ok(())
     }
 
     fn publish_poll_hint(self: &Arc<Self>, request: RequestId) {
@@ -8956,14 +11630,14 @@ impl IoUring {
                 let bit = hinted.trailing_zeros() as usize;
                 hinted &= hinted - 1;
                 let slot = word_index * word_bits + bit;
-                let (control, pending) = {
+                let (control, pending, socket_multishot) = {
                     let state = self.state.lock();
                     if let Some(control) = state
                         .polls
                         .get(slot)
                         .and_then(|control| control.as_ref().map(Arc::clone))
                     {
-                        (Some(control), false)
+                        (Some(control), false, false)
                     } else {
                         let pending = state.pending_stream.iter().find_map(|entry| {
                             entry
@@ -8971,7 +11645,20 @@ impl IoUring {
                                 .filter(|work| work.request_id().slot() as usize == slot)
                                 .map(|work| Arc::clone(&work.control))
                         });
-                        (pending, true)
+                        let pending = pending.or_else(|| {
+                            state.socket_multishot.iter().find_map(|entry| {
+                                entry
+                                    .as_ref()
+                                    .filter(|work| work.request_id().slot() as usize == slot)
+                                    .map(|work| Arc::clone(&work.control))
+                            })
+                        });
+                        let socket_multishot = state.socket_multishot.iter().any(|entry| {
+                            entry
+                                .as_ref()
+                                .is_some_and(|work| work.request_id().slot() as usize == slot)
+                        });
+                        (pending, true, socket_multishot)
                     }
                 };
                 let Some(control) = control else {
@@ -8992,7 +11679,11 @@ impl IoUring {
                     // source bit before the one-shot attempt.
                     control.take_source_wake();
                     control.registration_fired();
-                    self.retry_pending_stream(control);
+                    if socket_multishot {
+                        self.retry_socket_multishot(control);
+                    } else {
+                        self.retry_pending_stream(control);
+                    }
                     continue;
                 }
                 if !control.take_source_wake() {
@@ -9004,9 +11695,13 @@ impl IoUring {
                     Ok(ready) if ready.is_empty() => {}
                     Ok(ready) => {
                         let result = poll_events_to_linux(ready) as i32;
-                        if let Err(error) =
+                        let completed = if control.multishot {
+                            self.publish_multishot_poll(&control, result).map(|_| ())
+                        } else {
                             self.finish_poll_control(&control, TerminalCause::Completed, result)
-                        {
+                                .map(|_| ())
+                        };
+                        if let Err(error) = completed {
                             error!("io_uring poll completion failed: {error:?}");
                         }
                     }
@@ -9031,11 +11726,20 @@ impl FileLike for IoUring {
         Ok(anon_inode_stat())
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok("anon_inode:[io_uring]".into())
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+            b"anon_inode:[io_uring]",
+        )))
     }
 
     fn prepare_mmap(&self, request: FileMmapRequest) -> AxResult<Option<PreparedFileMmap>> {
+        if let Some(region) = self.state.lock().registered_wait_region.as_ref()
+            && let RegisteredWaitBacking::Kernel { region, .. } = &region.backing
+        {
+            if let Some(mapping) = region.prepare(request)? {
+                return Ok(Some(mapping));
+            }
+        }
         match self
             .layout
             .mapping_region(request.offset())
@@ -9364,8 +12068,10 @@ mod adapter_state_tests {
             Ok(Kstat::default())
         }
 
-        fn path(&self) -> AxResult<Cow<'_, str>> {
-            Ok(Cow::Borrowed("io-uring-fixed-file-test"))
+        fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+            Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+                b"io-uring-fixed-file-test",
+            )))
         }
 
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
