@@ -1,0 +1,370 @@
+# Reviewed syscall cells only. Missing v6.18 entries are intentionally unknown.
+schema = 2
+linux_manifest = "linux-v6.18-abi.toml"
+
+[terminal]
+reviewed = 383
+resolved = 383
+implemented = 366
+explicit_enosys = 17
+fallback = 0
+partial = 0
+unknown = 0
+
+[progress]
+reviewed = 27
+resolved = 26
+implemented = 9
+explicit_enosys = 17
+fallback = 0
+partial = 1
+unknown = 356
+
+[[contract]]
+id = "v618-explicit-enosys"
+flags = ["explicit-none"]
+structs = ["explicit-none"]
+multiplexer_commands = ["explicit-none"]
+provider_ioctls = ["explicit-none"]
+errno_order = ["errno:ENOSYS"]
+usercopy = ["explicit-none"]
+state = ["explicit-none"]
+concurrency = ["explicit-none"]
+teardown = ["explicit-none"]
+
+[[contract]]
+id = "v618-bpf-routing-partial"
+flags = ["flag:bpf-command"]
+structs = ["struct:bpf_attr"]
+multiplexer_commands = ["mux:BPF_CMD"]
+provider_ioctls = ["explicit-none"]
+errno_order = ["errno:command decode EINVAL then attr size E2BIG or EINVAL then attr copy EFAULT then command-specific validation"]
+usercopy = ["usercopy:bpf_attr-read"]
+state = ["state:bpf-object-table"]
+concurrency = ["concurrency:bpf-subsystem"]
+teardown = ["teardown:bpf-object-release"]
+
+[[contract]]
+id = "v618-uretprobe"
+flags = ["explicit-none"]
+structs = ["struct:kernel RX trampoline saved frame {r11,rcx,rax}"]
+multiplexer_commands = ["explicit-none"]
+provider_ioctls = ["explicit-none"]
+errno_order = ["errno:external or stale trampoline => SIGILL and return -1", "errno:saved-frame fault => SIGILL and return -1"]
+usercopy = ["usercopy:nofault pin/read all three saved words before consuming return instances", "usercopy:validate saved rax before an all-pinned trampoline-frame rewrite"]
+state = ["state:consume the equal-stack ReturnInstance chain only after provenance and saved-frame validation", "state:restore RIP RSP RAX RCX R11 and publish every retained return hit"]
+concurrency = ["concurrency:mm trampoline generation and per-thread return stack are revalidated before commit"]
+teardown = ["teardown:exec exit detach and last-consumer retirement invalidate trampoline ownership and stale return instances"]
+
+[[contract]]
+id = "v618-uprobe"
+flags = ["explicit-none"]
+structs = ["struct:kernel optimized-call trampoline saved frame {rax,r11,rcx}"]
+multiplexer_commands = ["explicit-none"]
+provider_ioctls = ["explicit-none"]
+errno_order = ["errno:external invocation or stale token => ENXIO", "errno:saved-frame fault after live provenance => SIGILL and return -1"]
+usercopy = ["usercopy:nofault pin/read the complete saved register frame before consuming the pending token"]
+state = ["state:consume exactly one per-thread pending optimized-call token and restore consumer-visible registers"]
+concurrency = ["concurrency:pending token binds task mm id XOL generation token and syscall stack under registry validation"]
+teardown = ["teardown:fork rebinds only authorized pending state while exec exit and XOL replacement invalidate it"]
+
+[[contract]]
+id = "v618-setxattrat"
+flags = ["flag:AT_EMPTY_PATH", "flag:AT_SYMLINK_NOFOLLOW", "flag:XATTR_CREATE", "flag:XATTR_REPLACE"]
+structs = ["struct:xattr_args v0 size 16 with zero extension tail"]
+multiplexer_commands = ["explicit-none"]
+provider_ioctls = ["explicit-none"]
+errno_order = ["errno:structure size EINVAL or E2BIG then structure EFAULT then AT and XATTR flags then name/value copy then pathname/fd resolution then permission/provider"]
+usercopy = ["usercopy:copy_struct_from_user validates nonzero extension before importing name and at-most-64KiB value"]
+state = ["state:provider create replace decision and xattr mutation commit under one inode serialization boundary"]
+concurrency = ["concurrency:AT_EMPTY_PATH retains the OFD mount topology and the provider serializes existence with mutation"]
+teardown = ["teardown:all copied buffers and OFD authority are request-owned and released without mutation on precommit failure"]
+
+[[contract]]
+id = "v618-getxattrat"
+flags = ["flag:AT_EMPTY_PATH", "flag:AT_SYMLINK_NOFOLLOW", "flag:xattr_args.flags must be zero"]
+structs = ["struct:xattr_args v0 size 16 with zero extension tail"]
+multiplexer_commands = ["explicit-none"]
+provider_ioctls = ["explicit-none"]
+errno_order = ["errno:structure size and copy then get flags then AT flags then name copy then pathname/fd resolution then permission/provider then ERANGE or output EFAULT"]
+usercopy = ["usercopy:snapshot provider value before size probe or exact output copy; size zero copies no bytes"]
+state = ["state:read-only snapshot of one named attribute"]
+concurrency = ["concurrency:provider holds size-and-value snapshot together while AT_EMPTY_PATH retains OFD authority"]
+teardown = ["teardown:snapshot and retained description release after output or fault"]
+
+[[contract]]
+id = "v618-listxattrat"
+flags = ["flag:AT_EMPTY_PATH", "flag:AT_SYMLINK_NOFOLLOW"]
+structs = ["explicit-none"]
+multiplexer_commands = ["explicit-none"]
+provider_ioctls = ["explicit-none"]
+errno_order = ["errno:AT flags then pathname/fd copy and resolution then permission/provider snapshot then ERANGE or output EFAULT"]
+usercopy = ["usercopy:copy one provider snapshot of NUL-terminated names; size zero reports required bytes"]
+state = ["state:read-only snapshot of the inode xattr name set"]
+concurrency = ["concurrency:provider list snapshot is serialized against xattr mutation"]
+teardown = ["teardown:name snapshot and retained description release after output or fault"]
+
+[[contract]]
+id = "v618-removexattrat"
+flags = ["flag:AT_EMPTY_PATH", "flag:AT_SYMLINK_NOFOLLOW"]
+structs = ["explicit-none"]
+multiplexer_commands = ["explicit-none"]
+provider_ioctls = ["explicit-none"]
+errno_order = ["errno:AT flags then name copy then pathname/fd resolution then permission and provider missing-name decision"]
+usercopy = ["usercopy:bounded xattr-name and pathname import completes before provider mutation"]
+state = ["state:permission check and named-attribute removal commit against one inode"]
+concurrency = ["concurrency:provider serializes missing-name decision with removal"]
+teardown = ["teardown:precommit failure leaves attribute state unchanged"]
+
+[[contract]]
+id = "v618-open_tree_attr"
+flags = ["flag:OPEN_TREE_CLONE", "flag:OPEN_TREE_CLOEXEC", "flag:AT_EMPTY_PATH", "flag:AT_RECURSIVE", "flag:mount_attr set clear propagation idmap domains"]
+structs = ["struct:mount_attr v0 size 32 with PAGE_SIZE ceiling and zero extension tail"]
+multiplexer_commands = ["explicit-none"]
+provider_ioctls = ["explicit-none"]
+errno_order = ["errno:null attr with nonzero size then open_tree preparation then E2BIG or EINVAL attr size then CAP_SYS_ADMIN then usercopy and mount-attribute validation"]
+usercopy = ["usercopy:pathname is imported by prepare_open_tree; optional mount_attr is copied only after unpublished tree preparation"]
+state = ["state:prepare detached mount FD apply the complete attribute transaction then allocate and publish fd last"]
+concurrency = ["concurrency:mount namespace operation serializes topology and recursive attribute/idmap ledger commit"]
+teardown = ["teardown:unpublished FsMountFd Drop releases detached topology and provider registrations on every pre-fd failure"]
+
+[[contract]]
+id = "v618-file_getattr"
+flags = ["flag:AT_EMPTY_PATH", "flag:AT_SYMLINK_NOFOLLOW"]
+structs = ["struct:file_attr v0 size 24 with zeroed output extension"]
+multiplexer_commands = ["explicit-none"]
+provider_ioctls = ["ioctl:shares native FileAttrProvider snapshot with FS_IOC_FSGETXATTR and FS_IOC_GETFLAGS"]
+errno_order = ["errno:AT flags then output-size plan then pathname/fd resolution then permission/provider then output EFAULT"]
+usercopy = ["usercopy:copy_struct_to_user writes the provider snapshot and zeroes a larger user extension"]
+state = ["state:read-only snapshot of xflags extent hints extent count project id and cow extent hint"]
+concurrency = ["concurrency:stable per-object provider returns one coherent fileattr snapshot"]
+teardown = ["teardown:retained OFD topology and snapshot release after copyout"]
+
+[[contract]]
+id = "v618-file_setattr"
+flags = ["flag:AT_EMPTY_PATH", "flag:AT_SYMLINK_NOFOLLOW", "flag:FS_XFLAG supported mask and read-only field filtering"]
+structs = ["struct:file_attr v0 size 24 with zero extension tail"]
+multiplexer_commands = ["explicit-none"]
+provider_ioctls = ["ioctl:shares FileAttrProvider mutation gate with FS_IOC_FSSETXATTR and FS_IOC_SETFLAGS"]
+errno_order = ["errno:AT flags then structure plan and copy then xflag validation then pathname/fd resolution then userns capability permission and provider constraints"]
+usercopy = ["usercopy:copy_struct_from_user completes and validates extension bytes before acquiring mutation authority"]
+state = ["state:publish xflags project id and allocation hints through one stable per-object update gate"]
+concurrency = ["concurrency:exclusive fileattr update excludes every retained data metadata and range mutation guard"]
+teardown = ["teardown:failed validation permission or provider commit leaves prior attributes visible"]
+
+# Each entry independently binds the pinned Linux number/name to its handler.
+[[cell]]
+number = 134
+name = "uselib"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 321
+name = "bpf"
+status = "partial"
+contract = "v618-bpf-routing-partial"
+handler = "kernel/src/syscall/bpf/mod.rs:sys_bpf"
+conditional = "bpf"
+
+[[cell]]
+number = 335
+name = "uretprobe"
+status = "implemented"
+contract = "v618-uretprobe"
+handler = "kernel/src/syscall/task/uprobe.rs:sys_uretprobe"
+conditional = "explicit-none"
+
+[[cell]]
+number = 336
+name = "uprobe"
+status = "implemented"
+contract = "v618-uprobe"
+handler = "kernel/src/syscall/task/uprobe.rs:sys_uprobe"
+conditional = "explicit-none"
+
+[[cell]]
+number = 463
+name = "setxattrat"
+status = "implemented"
+contract = "v618-setxattrat"
+handler = "kernel/src/syscall/fs/xattr.rs:sys_setxattrat"
+conditional = "explicit-none"
+
+[[cell]]
+number = 464
+name = "getxattrat"
+status = "implemented"
+contract = "v618-getxattrat"
+handler = "kernel/src/syscall/fs/xattr.rs:sys_getxattrat"
+conditional = "explicit-none"
+
+[[cell]]
+number = 465
+name = "listxattrat"
+status = "implemented"
+contract = "v618-listxattrat"
+handler = "kernel/src/syscall/fs/xattr.rs:sys_listxattrat"
+conditional = "explicit-none"
+
+[[cell]]
+number = 466
+name = "removexattrat"
+status = "implemented"
+contract = "v618-removexattrat"
+handler = "kernel/src/syscall/fs/xattr.rs:sys_removexattrat"
+conditional = "explicit-none"
+
+[[cell]]
+number = 467
+name = "open_tree_attr"
+status = "implemented"
+contract = "v618-open_tree_attr"
+handler = "kernel/src/syscall/fs/mount.rs:sys_open_tree_attr"
+conditional = "explicit-none"
+
+[[cell]]
+number = 468
+name = "file_getattr"
+status = "implemented"
+contract = "v618-file_getattr"
+handler = "kernel/src/syscall/fs/fileattr.rs:sys_file_getattr"
+conditional = "explicit-none"
+
+[[cell]]
+number = 469
+name = "file_setattr"
+status = "implemented"
+contract = "v618-file_setattr"
+handler = "kernel/src/syscall/fs/fileattr.rs:sys_file_setattr"
+conditional = "explicit-none"
+
+[[cell]]
+number = 156
+name = "_sysctl"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 174
+name = "create_module"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 177
+name = "get_kernel_syms"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 178
+name = "query_module"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 180
+name = "nfsservctl"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 181
+name = "getpmsg"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 182
+name = "putpmsg"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 183
+name = "afs_syscall"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 184
+name = "tuxcall"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 185
+name = "security"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 205
+name = "set_thread_area"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 211
+name = "get_thread_area"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 212
+name = "lookup_dcookie"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 214
+name = "epoll_ctl_old"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 215
+name = "epoll_wait_old"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"
+
+[[cell]]
+number = 236
+name = "vserver"
+status = "explicit-enosys"
+contract = "v618-explicit-enosys"
+handler = "kernel/src/syscall/dispatch.rs:sys_ni_syscall"
+conditional = "explicit-none"

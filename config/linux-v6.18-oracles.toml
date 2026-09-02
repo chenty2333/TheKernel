@@ -1,0 +1,45 @@
+# Static oracle topology.  These descriptors intentionally name no receipts,
+# hashes, logs, or generated artifacts.
+schema = 1
+
+[shared_guest]
+binary_source = "tests/guest/linux_v618_syscall_oracle.c"
+argv = ["linux-v618-syscall-oracle", "--contract-suite"]
+# The paired command accepts Linux image, TheKernel image, one rootfs image,
+# and this built guest binary. It refuses missing artifacts and does not emit
+# synthetic receipts.
+runner = ["scripts/ci/linux_v618_abi_gate.py", "paired"]
+
+[witness.bpf]
+linux_config = "CONFIG_BPF_SYSCALL=y"
+thekernel_feature = "bpf"
+
+[[oracle]]
+id = "product"
+linux_config = "config/linux/v6.18-product.config"
+thekernel_features = ["bpf"]
+rootfs = "config/rootfs/product"
+qemu_profile = "config/x86_64/q35-uefi.toml"
+binary_source = "tests/guest/linux_v618_syscall_oracle.c"
+argv = ["linux-v618-syscall-oracle", "--contract-suite"]
+witnesses = ["bpf"]
+
+[[oracle]]
+id = "server"
+linux_config = "config/linux/v6.18-server.config"
+thekernel_features = ["bpf"]
+rootfs = "config/rootfs/server"
+qemu_profile = "config/x86_64/q35-server.toml"
+binary_source = "tests/guest/linux_v618_syscall_oracle.c"
+argv = ["linux-v618-syscall-oracle", "--contract-suite"]
+witnesses = ["bpf"]
+
+[[oracle]]
+id = "feature"
+linux_config = "config/linux/v6.18-feature-witness.config"
+thekernel_features = ["bpf"]
+rootfs = "config/rootfs/feature-witness"
+qemu_profile = "config/x86_64/q35-feature-witness.toml"
+binary_source = "tests/guest/linux_v618_syscall_oracle.c"
+argv = ["linux-v618-syscall-oracle", "--contract-suite"]
+witnesses = ["bpf"]
