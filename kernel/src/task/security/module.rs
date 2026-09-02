@@ -107,6 +107,28 @@ pub(super) trait SecurityModule: Send + Sync + 'static {
         self.locked_down_ioport(actor)
     }
 
+    /// Authorizes loading a replacement kernel image after commoncap.
+    /// Implementations may enforce lockdown, measured-boot, or signature
+    /// policy independently for orderly and crash images.
+    fn kernel_load_data(
+        &self,
+        _actor: &CoreCred,
+        _kind: KernelLoadKind,
+        _from_file: bool,
+    ) -> AxResult<()> {
+        Ok(())
+    }
+
+    fn kernel_load_data_with_credential_state(
+        &self,
+        actor: &CoreCred,
+        kind: KernelLoadKind,
+        from_file: bool,
+        _actor_state: &Self::CredentialState,
+    ) -> AxResult<()> {
+        self.kernel_load_data(actor, kind, from_file)
+    }
+
     /// Narrows commoncap authority derived from a fully prepared credential
     /// without treating that credential as an already-live actor.
     fn prepared_credential_capable(
@@ -557,10 +579,7 @@ pub(super) trait SecurityModule: Send + Sync + 'static {
 
     /// Linux `security_task_getscheduler` authorization for one resolved
     /// actor/target pair.
-    fn task_getscheduler(
-        &self,
-        _context: &SecurityTaskGetSchedulerContext<'_>,
-    ) -> AxResult<()> {
+    fn task_getscheduler(&self, _context: &SecurityTaskGetSchedulerContext<'_>) -> AxResult<()> {
         Ok(())
     }
 
@@ -640,6 +659,13 @@ pub(super) trait ErasedSecurityModule: Send + Sync {
     fn locked_down_ioport(
         &self,
         actor: &CoreCred,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()>;
+    fn kernel_load_data(
+        &self,
+        actor: &CoreCred,
+        kind: KernelLoadKind,
+        from_file: bool,
         actor_state: &dyn ErasedOwnedCredentialState,
     ) -> AxResult<()>;
     fn prepared_credential_capable(
@@ -1003,6 +1029,22 @@ impl<M: SecurityModule> ErasedSecurityModule for M {
         SecurityModule::locked_down_ioport_with_credential_state(
             self,
             actor,
+            owned_credential_state(self, actor_state)?,
+        )
+    }
+
+    fn kernel_load_data(
+        &self,
+        actor: &CoreCred,
+        kind: KernelLoadKind,
+        from_file: bool,
+        actor_state: &dyn ErasedOwnedCredentialState,
+    ) -> AxResult<()> {
+        SecurityModule::kernel_load_data_with_credential_state(
+            self,
+            actor,
+            kind,
+            from_file,
             owned_credential_state(self, actor_state)?,
         )
     }

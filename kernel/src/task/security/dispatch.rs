@@ -18,6 +18,8 @@ use super::*;
 pub(crate) fn dispatch_inode_permission(
     context: &InodePermissionSecurityContext<'_, '_>,
 ) -> AxResult<()> {
+    #[cfg(feature = "bpf")]
+    crate::bpf::run_lsm_hook(1)?;
     context
         .actor()
         .security()
@@ -174,6 +176,8 @@ pub(crate) fn dispatch_inode_link(context: &InodeLinkSecurityContext<'_, '_, '_>
 pub(crate) fn dispatch_inode_unlink(
     context: &InodeUnlinkSecurityContext<'_, '_, '_>,
 ) -> AxResult<()> {
+    #[cfg(feature = "bpf")]
+    crate::bpf::run_lsm_hook(2)?;
     context
         .actor()
         .security()
@@ -202,6 +206,8 @@ pub(crate) fn dispatch_inode_rmdir(
 pub(crate) fn dispatch_inode_rename(
     context: &InodeRenameSecurityContext<'_, '_, '_, '_>,
 ) -> AxResult<()> {
+    #[cfg(feature = "bpf")]
+    crate::bpf::run_lsm_hook(3)?;
     context
         .actor()
         .security()
@@ -220,6 +226,8 @@ pub(crate) fn dispatch_inode_rename(
 /// visible. Hooks are allocation-free, nonblocking, and forbidden from
 /// VFS/current/credential or nested open reentry.
 pub(crate) fn dispatch_file_open(context: &FileOpenSecurityContext<'_, '_>) -> AxResult<()> {
+    #[cfg(feature = "bpf")]
+    crate::bpf::run_lsm_hook(6)?;
     context
         .actor()
         .security()
@@ -613,6 +621,19 @@ pub(in crate::task) fn locked_down_ioport(actor: &Cred) -> bool {
         .is_err()
 }
 
+/// Linux `security_kernel_load_data` plus lockdown admission for kexec.
+pub(crate) fn authorize_kernel_load_data(
+    actor: &Cred,
+    kind: KernelLoadKind,
+    from_file: bool,
+) -> AxResult<()> {
+    actor
+        .security()
+        .registry()
+        .registry()
+        .dispatch_kernel_load_data(actor, kind, from_file)
+}
+
 /// Checks namespace-creation authority carried by one exact prepared child.
 /// Commoncap evaluates the proposed credential, while stacked modules receive
 /// both the live source state and the still-private proposed state.
@@ -678,6 +699,8 @@ pub(crate) fn dispatch_ptrace_traceme(context: &PtraceTracemeContext<'_>) -> AxR
 pub(crate) fn dispatch_exec_credential(
     context: &ExecCredentialSecurityContext<'_>,
 ) -> AxResult<()> {
+    #[cfg(feature = "bpf")]
+    crate::bpf::run_lsm_hook(4)?;
     context
         .old()
         .security()
@@ -692,6 +715,8 @@ pub(crate) fn dispatch_exec_credential(
 pub(crate) fn dispatch_exec_executable(
     context: &ExecExecutableSecurityContext<'_>,
 ) -> AxResult<()> {
+    #[cfg(feature = "bpf")]
+    crate::bpf::run_lsm_hook(5)?;
     context
         .actor()
         .security()

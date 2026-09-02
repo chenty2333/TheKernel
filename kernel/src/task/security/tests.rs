@@ -4457,6 +4457,7 @@ fn rmdir_registry_denial_is_once_and_preserves_exact_transaction() {
 
 #[test]
 fn allowed_rmdir_hook_runs_once_before_nonempty_backend_rejection() {
+    let _context = crate::test_support::scheduler_test_context();
     let _guard = reset_removal_vertical_probes();
     let registry = rmdir_vertical_registry(observe_nonempty_rmdir_transaction, None);
     let namespace = UserNamespace::try_new_root().unwrap();

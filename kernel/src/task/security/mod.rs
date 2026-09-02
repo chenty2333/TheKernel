@@ -11,6 +11,7 @@
 //! construction and immutable publication, [`credential`] owns per-credential
 //! state transitions, and [`dispatch`] is what the rest of the kernel calls.
 
+mod audit;
 mod builtin;
 mod contexts;
 mod credential;
@@ -26,6 +27,7 @@ mod tests;
 // what the moved code was written against.
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
+pub(crate) use audit::*;
 pub(crate) use builtin::*;
 pub(crate) use contexts::*;
 pub(crate) use credential::*;
@@ -45,7 +47,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::{Location, Metadata, NodeType};
+use axfs_ng_vfs::{FsName, Location, Metadata, NodeType};
 use axhal::paging::MappingFlags;
 use axsync::Mutex;
 use axtask::AxTaskRef;
@@ -66,6 +68,12 @@ use thekernel_linux_cred::{
     commoncap_ptrace_traceme as external_commoncap_ptrace_traceme,
     commoncap_scheduler as external_commoncap_scheduler,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KernelLoadKind {
+    KexecImage,
+    KexecCrashImage,
+}
 // The crate-facing hook vocabulary. Which names a given build consumes is
 // profile-dependent: the architecture kernel exercises one subset and the
 // host test surface another, so an unused re-export here is a property of
@@ -561,11 +569,11 @@ impl<'location> InodeSetattrCommittedSecurityRef<'location> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PlannedInodeSecurityRef<'name, 'location> {
     pub(super) parent: InodeSecurityRef<'location>,
-    pub(super) name: &'name str,
+    pub(super) name: &'name FsName,
 }
 
 impl<'name, 'location> PlannedInodeSecurityRef<'name, 'location> {
-    pub(crate) const fn new(parent: InodeSecurityRef<'location>, name: &'name str) -> Self {
+    pub(crate) const fn new(parent: InodeSecurityRef<'location>, name: &'name FsName) -> Self {
         Self { parent, name }
     }
 
@@ -573,7 +581,7 @@ impl<'name, 'location> PlannedInodeSecurityRef<'name, 'location> {
         &self.parent
     }
 
-    pub(crate) const fn name(&self) -> &'name str {
+    pub(crate) const fn name(&self) -> &'name FsName {
         self.name
     }
 }
@@ -588,14 +596,14 @@ impl<'name, 'location> PlannedInodeSecurityRef<'name, 'location> {
 pub(crate) struct ExistingInodeSecurityRef<'name, 'location> {
     pub(super) parent: InodeSecurityRef<'location>,
     pub(super) target: InodeSecurityRef<'location>,
-    pub(super) name: &'name str,
+    pub(super) name: &'name FsName,
 }
 
 impl<'name, 'location> ExistingInodeSecurityRef<'name, 'location> {
     pub(crate) const fn new(
         parent: InodeSecurityRef<'location>,
         target: InodeSecurityRef<'location>,
-        name: &'name str,
+        name: &'name FsName,
     ) -> Self {
         Self {
             parent,
@@ -612,7 +620,7 @@ impl<'name, 'location> ExistingInodeSecurityRef<'name, 'location> {
         &self.target
     }
 
-    pub(crate) const fn name(&self) -> &'name str {
+    pub(crate) const fn name(&self) -> &'name FsName {
         self.name
     }
 }
@@ -628,11 +636,11 @@ impl<'name, 'location> ExistingInodeSecurityRef<'name, 'location> {
 pub(crate) struct RenameDestinationSecurityRef<'name, 'location> {
     pub(super) parent: InodeSecurityRef<'location>,
     pub(super) target: Option<InodeSecurityRef<'location>>,
-    pub(super) name: &'name str,
+    pub(super) name: &'name FsName,
 }
 
 impl<'name, 'location> RenameDestinationSecurityRef<'name, 'location> {
-    pub(crate) const fn absent(parent: InodeSecurityRef<'location>, name: &'name str) -> Self {
+    pub(crate) const fn absent(parent: InodeSecurityRef<'location>, name: &'name FsName) -> Self {
         Self {
             parent,
             target: None,
@@ -643,7 +651,7 @@ impl<'name, 'location> RenameDestinationSecurityRef<'name, 'location> {
     pub(crate) const fn existing(
         parent: InodeSecurityRef<'location>,
         target: InodeSecurityRef<'location>,
-        name: &'name str,
+        name: &'name FsName,
     ) -> Self {
         Self {
             parent,
@@ -660,7 +668,7 @@ impl<'name, 'location> RenameDestinationSecurityRef<'name, 'location> {
         self.target.as_ref()
     }
 
-    pub(crate) const fn name(&self) -> &'name str {
+    pub(crate) const fn name(&self) -> &'name FsName {
         self.name
     }
 }

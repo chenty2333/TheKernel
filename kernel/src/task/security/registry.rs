@@ -289,6 +289,26 @@ impl SecurityRegistry {
         Ok(())
     }
 
+    /// Dispatches kernel-image loading and lockdown policy after commoncap.
+    pub(super) fn dispatch_kernel_load_data(
+        &self,
+        actor: &Cred,
+        kind: KernelLoadKind,
+        from_file: bool,
+    ) -> AxResult<()> {
+        let actor_slots = self.credential_slots(actor)?;
+        for (registered, actor_state) in self.modules.iter().zip(actor_slots) {
+            debug_assert_eq!(registered.id, actor_state.module_id);
+            registered.module.kernel_load_data(
+                actor.core(),
+                kind,
+                from_file,
+                actor_state.erased.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn dispatch_prepared_credential_capable(
         &self,
         source: &Cred,
