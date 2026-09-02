@@ -17,4 +17,7 @@ for arg in "$@"; do
     esac
 done
 
-exec "$cc" "$@" -no-pie
+# `scope-local` registers items in an ELF section and obtains its bounds via
+# the GNU __start/__stop symbols.  Recent lld enables start/stop section GC by
+# default, which discards that otherwise unreferenced section in host tests.
+exec "$cc" "$@" -no-pie -Wl,-z,nostart-stop-gc

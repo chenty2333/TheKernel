@@ -4,18 +4,11 @@ members = [
     "kernel",
     "crates/process-adapter",
     "crates/readiness-adapter",
-    "third_party/rust-patches/axsync",
-]
-exclude = [
-    "arceos",
-    "third_party/rust-patches/axalloc",
-    "third_party/rust-patches/axallocator",
 ]
 
 # Lint policy for TheKernel-owned packages. GitHub Actions runs `cargo clippy`
 # directly and promotes every warning not explicitly allowed here to an error.
-# Vendored sources under `third_party/rust-patches/` and maintained sibling
-# workspaces keep their own lint policy and CI.
+# Maintained sibling workspaces keep their own lint policy and CI.
 #
 # Every allowance must state the mechanism that makes the lint wrong for this
 # codebase, not merely that it is inconvenient.
@@ -63,39 +56,65 @@ homepage = "https://github.com/chenty2333/TheKernel"
 repository = "https://github.com/chenty2333/TheKernel"
 
 [workspace.dependencies]
-axfeat = { version = "0.3.0-preview.2" }
+axfeat = { package = "thekernel-axfeat", path = "../thekernel-ax/crates/thekernel-axfeat", version = "0.3.0-preview.2" }
 
-axalloc = { version = "0.3.0-preview.2" }
+axalloc = { package = "thekernel-axalloc", path = "../thekernel-ax/crates/thekernel-axalloc", version = "0.3.0-preview.2" }
 axconfig = { version = "0.3.0-preview.2" }
-axdisplay = { version = "0.3.0-preview.2" }
-axdriver = { version = "0.3.0-preview.2" }
-axdriver_display = { version = "0.1.4-preview.3" }
-axfs = { version = "0.3.0-preview.2", package = "axfs-ng" }
-axhal = { version = "0.3.0-preview.2" }
-axinput = { version = "0.3.0-preview.2" }
+axdisplay = { package = "thekernel-axdisplay", path = "../thekernel-ax/crates/thekernel-axdisplay", version = "0.3.0-preview.2" }
+axdriver = { package = "thekernel-axdriver", path = "../thekernel-ax/crates/thekernel-axdriver", version = "0.3.0-preview.2" }
+axdriver_display = { package = "thekernel-axdriver-display", path = "../thekernel-ax/crates/thekernel-axdriver-display", version = "0.1.4-preview.3" }
+axfs = { package = "thekernel-axfs-ng", path = "../thekernel-ax/crates/thekernel-axfs-ng", version = "0.3.0-preview.2", features = ["btrfs", "overlay", "xfs"] }
+axhal = { package = "thekernel-axhal", path = "../thekernel-ax/crates/thekernel-axhal", version = "0.3.0-preview.2" }
+axinput = { package = "thekernel-axinput", path = "../thekernel-ax/crates/thekernel-axinput", version = "0.3.0-preview.2" }
 axlog = { version = "0.3.0-preview.2" }
-axmm = { version = "0.3.0-preview.2" }
-axnet = { path = "crates/axnet-ng", package = "axnet-ng" }
-axruntime = { version = "0.3.0-preview.2" }
-axsync = { version = "0.3.0-preview.2" }
+axmm = { package = "thekernel-axmm", path = "../thekernel-ax/crates/thekernel-axmm", version = "0.3.0-preview.2" }
+axnet = { package = "thekernel-axnet-ng", path = "../thekernel-ax/crates/thekernel-axnet-ng", version = "0.3.0-preview.2" }
+axruntime = { package = "thekernel-axruntime", path = "../thekernel-ax/crates/thekernel-axruntime", version = "0.3.0-preview.2" }
+axsync = { package = "thekernel-axsync", path = "../thekernel-ax/crates/thekernel-axsync", version = "0.3.0-preview.2" }
+axio = { package = "thekernel-axio", path = "../thekernel-ax/crates/thekernel-axio", version = "0.3.0-pre.1" }
+axfs-ng-vfs = { package = "thekernel-axfs-ng-vfs", path = "../thekernel-ax/crates/thekernel-axfs-ng-vfs", version = "0.1.1" }
+axcpu = { package = "thekernel-axcpu", path = "../thekernel-ax/crates/thekernel-axcpu", version = "0.3.0-preview.8" }
+kernel-elf-parser = { package = "thekernel-kernel-elf-parser", path = "../thekernel-ax/crates/thekernel-kernel-elf-parser", version = "0.3.4" }
+memory_set = { package = "thekernel-memory-set", path = "../thekernel-ax/crates/thekernel-memory-set", version = "0.4.1" }
+page_table_multiarch = { package = "thekernel-page-table-multiarch", path = "../thekernel-ax/crates/thekernel-page-table-multiarch", version = "0.6.1" }
+scope-local = { package = "thekernel-scope-local", path = "../thekernel-ax/crates/thekernel-scope-local", version = "0.1.2" }
 axpoll = { package = "thekernel-readiness-adapter", version = "=0.1.0", path = "crates/readiness-adapter" }
-axcbpf = { package = "thekernel-axcbpf", version = "=0.1.0" }
-axfault = { package = "thekernel-axfault", version = "=0.1.0" }
-axrcu = { package = "thekernel-axrcu", version = "=0.1.0" }
-axpmu = { package = "thekernel-axpmu", version = "=0.1.0", default-features = false }
-axtask = { package = "thekernel-axtask", version = "=0.1.0" }
-linux-vfs = { package = "thekernel-linux-vfs", version = "=0.1.0" }
-thekernel-linux-cred = { version = "=0.1.0", default-features = false }
-thekernel-linux-fd = { version = "=0.1.0" }
-thekernel-linux-io-uring = { version = "=0.1.0", default-features = false }
-thekernel-linux-mm = { version = "=0.1.0", default-features = false }
-thekernel-linux-packet = { version = "=0.1.0", default-features = false }
-thekernel-linux-process = { version = "=0.1.0", default-features = false }
-thekernel-linux-rseq = { version = "=0.1.0", default-features = false }
-thekernel-linux-seccomp = { version = "=0.1.0", default-features = false }
-thekernel-linux-signal = { version = "=0.1.0", default-features = false }
-thekernel-linux-usercopy = { version = "=0.1.0", default-features = false }
-axtlb = { package = "thekernel-axtlb", version = "=0.1.0", default-features = false }
+axcbpf = { package = "thekernel-axcbpf", path = "../thekernel-ax/crates/thekernel-axcbpf", version = "=0.1.0" }
+axfault = { package = "thekernel-axfault", path = "../thekernel-ax/crates/thekernel-axfault", version = "=0.1.0" }
+axrcu = { package = "thekernel-axrcu", path = "../thekernel-ax/crates/thekernel-axrcu", version = "=0.1.0" }
+axpmu = { package = "thekernel-axpmu", path = "../thekernel-ax/crates/thekernel-axpmu", version = "=0.1.0", default-features = false }
+axbpf = { package = "thekernel-axbpf", path = "../thekernel-ax/crates/thekernel-axbpf", version = "=0.1.0", default-features = false }
+axexec = { package = "thekernel-axexec", path = "../thekernel-ax/crates/thekernel-axexec", version = "=0.1.0", default-features = false }
+axgpu = { package = "thekernel-axgpu", path = "../thekernel-ax/crates/thekernel-axgpu", version = "=0.1.0", default-features = false }
+axrandom = { package = "thekernel-axrandom", path = "../thekernel-ax/crates/thekernel-axrandom", version = "=0.1.0", default-features = false }
+axtask = { package = "thekernel-axtask", path = "../thekernel-ax/crates/thekernel-axtask", version = "=0.1.0" }
+linux-vfs = { package = "thekernel-linux-vfs", path = "../thekernel-linux-abi/crates/vfs", version = "=0.1.0" }
+thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred", version = "=0.1.0", default-features = false }
+thekernel-linux-fd = { path = "../thekernel-linux-abi/crates/fd", version = "=0.1.0" }
+thekernel-linux-io-uring = { path = "../thekernel-linux-abi/crates/io-uring", version = "=0.1.0", default-features = false }
+thekernel-linux-mm = { path = "../thekernel-linux-abi/crates/mm", version = "=0.1.0", default-features = false }
+thekernel-linux-packet = { path = "../thekernel-linux-abi/crates/packet", version = "=0.1.0", default-features = false }
+thekernel-linux-process = { path = "../thekernel-linux-abi/crates/process", version = "=0.1.0", default-features = false }
+thekernel-linux-rseq = { path = "../thekernel-linux-abi/crates/rseq", version = "=0.1.0", default-features = false }
+thekernel-linux-seccomp = { path = "../thekernel-linux-abi/crates/seccomp", version = "=0.1.0", default-features = false }
+thekernel-linux-signal = { path = "../thekernel-linux-abi/crates/signal", version = "=0.1.0", default-features = false }
+thekernel-linux-usercopy = { path = "../thekernel-linux-abi/crates/usercopy", version = "=0.1.0", default-features = false }
+thekernel-linux-sched = { path = "../thekernel-linux-abi/crates/sched", version = "=0.1.0", default-features = false }
+thekernel-linux-perf = { path = "../thekernel-linux-abi/crates/perf", version = "=0.1.0", default-features = false }
+thekernel-linux-time = { path = "../thekernel-linux-abi/crates/time", version = "=0.1.0", default-features = false }
+thekernel-linux-net = { path = "../thekernel-linux-abi/crates/net", version = "=0.1.0", default-features = false }
+thekernel-linux-futex = { path = "../thekernel-linux-abi/crates/futex", version = "=0.1.0", default-features = false }
+thekernel-linux-ipc = { path = "../thekernel-linux-abi/crates/ipc", version = "=0.1.0", default-features = false }
+thekernel-linux-arch-x86-64 = { path = "../thekernel-linux-abi/crates/arch-x86-64", version = "=0.1.0", default-features = false }
+thekernel-linux-bpf = { path = "../thekernel-linux-abi/crates/bpf", version = "=0.1.0", default-features = false }
+thekernel-linux-keyring = { path = "../thekernel-linux-abi/crates/keyring", version = "=0.1.0", default-features = false }
+thekernel-linux-landlock = { path = "../thekernel-linux-abi/crates/landlock", version = "=0.1.0", default-features = false }
+thekernel-linux-fsnotify = { path = "../thekernel-linux-abi/crates/fsnotify", version = "=0.1.0", default-features = false }
+thekernel-linux-mount = { path = "../thekernel-linux-abi/crates/mount", version = "=0.1.0", default-features = false }
+thekernel-linux-drm = { path = "../thekernel-linux-abi/crates/drm", version = "=0.1.0", default-features = false }
+thekernel-linux-aio = { path = "../thekernel-linux-abi/crates/aio", version = "=0.1.0", default-features = false }
+thekernel-linux-syslog = { path = "../thekernel-linux-abi/crates/syslog", version = "=0.1.0", default-features = false }
+axtlb = { package = "thekernel-axtlb", path = "../thekernel-ax/crates/thekernel-axtlb", version = "=0.1.0", default-features = false }
 thekernel-linux-process-adapter = { version = "=0.1.0", path = "crates/process-adapter" }
 
 thekernel-kernel = { path = "kernel", version = "=0.2.0-preview.2" }
@@ -118,8 +137,17 @@ repository.workspace = true
 workspace = true
 
 [features]
-default = []
+# `cargo build` is the shipped x86_64 product, not an accidental reduced
+# feature subset. Kernel/library host tests select their own manifests and
+# feature sets explicitly.
+default = ["x86-product"]
 boot-shell = []
+# The shipped x86_64 product keeps its hardware-backed Linux ABI paths in one
+# explicit opt-in.  CET and cachestat have no feature gate: both are always
+# compiled, while their hardware use is capability-gated at runtime.
+# A product ELF is always SMP-capable (bounded to the q35 profile's four
+# logical CPUs) and is also valid when QEMU starts it with one CPU.
+x86-product = ["qemu", "smp", "hwp-uclamp", "pmu", "perf-sampling"]
 asid-fast-switch = ["thekernel-kernel/asid-fast-switch"]
 asid-switch-diagnostics = ["thekernel-kernel/asid-switch-diagnostics"]
 mm-lock-diagnostics = ["thekernel-kernel/mm-lock-diagnostics"]
@@ -133,6 +161,7 @@ qemu = [
     "axfeat/bus-pci",
 
     "axfeat/display",
+    "thekernel-kernel/rootfs-module",
 
     "thekernel-kernel/bpf",
     "thekernel-kernel/input",
@@ -166,54 +195,3 @@ platforms = [
     "x86_64-unknown-none",
 ]
 all-features = true
-
-# Force all direct and transitive users onto the vendored axnet-ng so feature
-# selection stays consistent across axruntime and the kernel.
-[patch.crates-io]
-axalloc = { path = "third_party/rust-patches/axalloc" }
-axallocator = { path = "third_party/rust-patches/axallocator" }
-axhal = { path = "third_party/rust-patches/axhal" }
-axfeat = { path = "third_party/rust-patches/axfeat" }
-axnet-ng = { path = "crates/axnet-ng" }
-axdriver = { path = "third_party/rust-patches/axdriver" }
-axdriver_display = { path = "third_party/rust-patches/axdriver_display" }
-axdriver_input = { path = "third_party/rust-patches/axdriver_input" }
-axdriver_block = { path = "third_party/rust-patches/axdriver_block" }
-axdriver_virtio = { path = "third_party/rust-patches/axdriver_virtio" }
-axio = { path = "third_party/rust-patches/axio" }
-axcpu = { path = "third_party/rust-patches/axcpu" }
-axplat-x86-pc = { path = "third_party/rust-patches/axplat-x86-pc" }
-axfs-ng = { path = "third_party/rust-patches/axfs-ng" }
-axfs-ng-vfs = { path = "third_party/rust-patches/axfs-ng-vfs" }
-scope-local = { path = "third_party/rust-patches/scope-local" }
-axruntime = { path = "third_party/rust-patches/axruntime" }
-axdisplay = { path = "third_party/rust-patches/axdisplay" }
-axsync = { path = "third_party/rust-patches/axsync" }
-thekernel-axsched = { path = "../thekernel-ax/crates/thekernel-axsched" }
-thekernel-axpoll = { path = "../thekernel-ax/crates/thekernel-axpoll" }
-thekernel-axcbpf = { path = "../thekernel-ax/crates/thekernel-axcbpf" }
-thekernel-axfault = { path = "../thekernel-ax/crates/thekernel-axfault" }
-thekernel-axpmu = { path = "../thekernel-ax/crates/thekernel-axpmu" }
-thekernel-axtask = { path = "../thekernel-ax/crates/thekernel-axtask" }
-thekernel-axtlb = { path = "../thekernel-ax/crates/thekernel-axtlb" }
-thekernel-axrcu = { path = "../thekernel-ax/crates/thekernel-axrcu" }
-thekernel-linux-cred = { path = "../thekernel-linux-abi/crates/cred" }
-thekernel-linux-mm = { path = "../thekernel-linux-abi/crates/mm" }
-thekernel-linux-packet = { path = "../thekernel-linux-abi/crates/packet" }
-thekernel-linux-vfs = { path = "../thekernel-linux-abi/crates/vfs" }
-thekernel-linux-fd = { path = "../thekernel-linux-abi/crates/fd" }
-thekernel-linux-io-uring = { path = "../thekernel-linux-abi/crates/io-uring" }
-thekernel-linux-process = { path = "../thekernel-linux-abi/crates/process" }
-thekernel-linux-rseq = { path = "../thekernel-linux-abi/crates/rseq" }
-thekernel-linux-seccomp = { path = "../thekernel-linux-abi/crates/seccomp" }
-thekernel-linux-signal = { path = "../thekernel-linux-abi/crates/signal" }
-thekernel-linux-usercopy = { path = "../thekernel-linux-abi/crates/usercopy" }
-thekernel-readiness-adapter = { path = "crates/readiness-adapter" }
-memory_set = { path = "third_party/rust-patches/memory_set" }
-page_table_multiarch = { path = "third_party/rust-patches/page_table_multiarch" }
-page_table_entry = { path = "third_party/rust-patches/page_table_entry" }
-kernel-elf-parser = { path = "third_party/rust-patches/kernel-elf-parser" }
-lwext4_rust = { path = "third_party/rust-patches/lwext4_rust" }
-starry-smoltcp = { path = "third_party/rust-patches/starry-smoltcp" }
-starry-fatfs = { path = "third_party/rust-patches/starry-fatfs" }
-virtio-drivers = { path = "third_party/rust-patches/virtio-drivers" }

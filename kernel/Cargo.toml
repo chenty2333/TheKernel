@@ -12,11 +12,11 @@ repository.workspace = true
 workspace = true
 
 [features]
-bpf = []
+bpf = ["dep:axbpf", "dep:thekernel-linux-bpf", "perf-sampling"]
 asid-fast-switch = ["axhal/asid-fast-switch"]
 asid-switch-diagnostics = ["asid-fast-switch", "axhal/asid-switch-diagnostics"]
 dev-log = []
-hwp-uclamp = ["axhal/hwp-uclamp"]
+hwp-uclamp = ["axhal/hwp-uclamp", "axruntime/ipi", "axtask/hwp-uclamp"]
 input = ["dep:axinput", "axfeat/input"]
 memtrack = ["axfeat/dwarf", "axalloc/tracking", "dep:gimli"]
 mm-lock-diagnostics = []
@@ -24,6 +24,7 @@ pmu-diagnostics = ["dep:axpmu"]
 pmu = ["axhal/pmu"]
 perf-sampling = ["pmu", "axhal/pmu-sampling", "axruntime/ipi"]
 test-io-control = ["axfs/test-io-control"]
+rootfs-module = ["axdriver/rootfs-module"]
 vsock = ["axfeat/vsock"]
 smp-tlb-shootdown = ["axruntime/ipi", "axtask/remote-resched"]
 irq-continuation-diagnostics = ["axtask/irq-continuation-diagnostics"]
@@ -62,34 +63,54 @@ axconfig.workspace = true
 axdisplay.workspace = true
 axdriver.workspace = true
 axdriver_display.workspace = true
-axfs = { workspace = true, features = ["task-io-accounting"] }
-axhal = { workspace = true, features = ["pkeys"] }
+axfs = { workspace = true, features = ["task-io-accounting", "nfs41"] }
+axhal = { workspace = true, features = ["fp-simd", "pkeys"] }
 axinput = { workspace = true, optional = true }
 axlog.workspace = true
 axmm.workspace = true
 axnet.workspace = true
 axruntime = { workspace = true, features = ["irq-exit"] }
 axsync.workspace = true
-axtask = { workspace = true, features = ["legacy-fxsave", "pkeys"] }
+axtask = { workspace = true, features = ["fp-simd", "pkeys", "scheduler-observer"] }
 
 axbacktrace = "0.1"
 axcbpf.workspace = true
 axerrno = "0.2"
-axfs-ng-vfs = "0.1"
-axio = "0.3.0-pre.1"
+axfs-ng-vfs.workspace = true
+axio.workspace = true
 axpoll.workspace = true
 axfault.workspace = true
 axrcu.workspace = true
 axpmu = { workspace = true, optional = true }
+axbpf = { workspace = true, optional = true }
+axexec.workspace = true
+axgpu.workspace = true
+axrandom.workspace = true
 thekernel-linux-cred.workspace = true
 thekernel-linux-fd.workspace = true
 thekernel-linux-io-uring.workspace = true
 thekernel-linux-mm.workspace = true
 thekernel-linux-packet.workspace = true
+thekernel-linux-process.workspace = true
 thekernel-linux-rseq.workspace = true
 thekernel-linux-seccomp.workspace = true
 thekernel-linux-signal.workspace = true
 thekernel-linux-usercopy = { workspace = true, features = ["alloc"] }
+thekernel-linux-sched.workspace = true
+thekernel-linux-perf.workspace = true
+thekernel-linux-time.workspace = true
+thekernel-linux-net.workspace = true
+thekernel-linux-futex.workspace = true
+thekernel-linux-ipc.workspace = true
+thekernel-linux-arch-x86-64.workspace = true
+thekernel-linux-bpf = { workspace = true, optional = true }
+thekernel-linux-keyring.workspace = true
+thekernel-linux-landlock.workspace = true
+thekernel-linux-fsnotify.workspace = true
+thekernel-linux-mount.workspace = true
+thekernel-linux-drm.workspace = true
+thekernel-linux-aio.workspace = true
+thekernel-linux-syslog.workspace = true
 axtlb.workspace = true
 bitflags = "2.10"
 bitmaps = { version = "3.2", default-features = false }
@@ -97,7 +118,11 @@ bytemuck = { version = "1.23", features = ["unsound_ptr_pod_impl", "derive"] }
 cfg-if = "1.0"
 crate_interface = "0.1"
 chrono = { version = "0.4", default-features = false }
-chacha20 = { version = "0.9.1", default-features = false }
+aes = { version = "0.8.4", default-features = false }
+cipher = { version = "0.4.4", default-features = false }
+hmac = { version = "0.12.1", default-features = false }
+sha1 = { version = "0.10.6", default-features = false }
+sha2 = { version = "0.10.9", default-features = false }
 downcast-rs = { version = "2.0", default-features = false, features = ["sync"] }
 enum_dispatch = "0.3"
 event-listener = { version = "5.4", default-features = false }
@@ -107,8 +132,9 @@ gimli = { version = "0.33", default-features = false, optional = true }
 hashbrown = "0.16"
 indoc = "2"
 inherit-methods-macro = "0.1.0"
+iced-x86 = { version = "1.21.0", default-features = false, features = ["no_std", "decoder", "encoder", "block_encoder", "instr_info"] }
 kernel_guard = "0.1"
-kernel-elf-parser = "0.3.4"
+kernel-elf-parser.workspace = true
 kspin = "0.1"
 lazy_static = { version = "1.5", features = ["spin_no_std"] }
 linkme = "0.3"
@@ -116,6 +142,7 @@ linux-vfs.workspace = true
 linux-raw-sys = { version = "0.12", default-features = false, features = [
     "no_std",
     "general",
+    "if_tun",
     "if_packet",
     "net",
     "prctl",
@@ -127,13 +154,14 @@ linux-raw-sys = { version = "0.12", default-features = false, features = [
 ] }
 lock_api = { version = "0.4", features = ["arc_lock"] }
 memory_addr = "0.4"
-memory_set = "0.4"
+memory_set.workspace = true
+miniz_oxide = { version = "0.8.9", default-features = false, features = ["with-alloc"] }
 num_enum = { version = "0.7", default-features = false }
 ouroboros = { version = "0.18", default-features = false }
 percpu = { version = "0.2.3-preview.1", features = ["non-zero-vma"] }
-rand = { version = "0.10", default-features = false, features = ["alloc"] }
 ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
-scope-local = "0.1"
+ruzstd = { version = "0.8.3", default-features = false }
+scope-local.workspace = true
 slab = { version = "0.4.9", default-features = false }
 spin = "0.10"
 thekernel-linux-process-adapter.workspace = true
@@ -143,16 +171,13 @@ syscalls = { version = "0.8", default-features = false }
 uluru = "3.1.0"
 weak-map = "0.1.1"
 xmas-elf = "0.9"
+xz4rust = { version = "0.2.3", default-features = false, features = ["alloc", "bcj", "crc64", "delta", "no_unsafe"] }
 zerocopy = { version = "0.8", features = ["derive"] }
 
-# Kernel targets use the sleepable signal action/registry mutex.
-[target.'cfg(target_os = "none")'.dependencies]
-thekernel-linux-signal = { workspace = true, features = ["multitask"] }
-
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-axcpu = "=0.3.0-preview.8"
+axcpu.workspace = true
 x86 = "0.52"
-page_table_multiarch = { version = "0.6", features = ["copy-from"] }
+page_table_multiarch = { workspace = true, features = ["copy-from"] }
 
 [target.'cfg(not(target_os = "none"))'.dev-dependencies]
-axcpu = { version = "=0.3.0-preview.8", features = ["host-test-context"] }
+axcpu = { workspace = true, features = ["host-test-context"] }
