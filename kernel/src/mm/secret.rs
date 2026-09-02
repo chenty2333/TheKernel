@@ -8,8 +8,10 @@ use core::ptr;
 
 use axalloc::{UsageKind, global_allocator};
 use axerrno::{AxError, AxResult};
+#[cfg(not(test))]
+use axhal::mem::phys_to_virt;
 use axhal::{
-    mem::{phys_to_virt, virt_to_phys},
+    mem::virt_to_phys,
     paging::{MappingFlags, PreparedPageTableFrames},
 };
 use axsync::spin::SpinNoIrq;
@@ -26,6 +28,12 @@ static WINDOW_LOCKS: [SpinNoIrq<()>; axconfig::plat::MAX_CPU_NUM] =
 #[derive(Debug)]
 pub(crate) struct SecretFrame {
     physical: PhysAddr,
+    // Host unit tests have a dummy physical arena but intentionally do not
+    // install a kernel page-table root. Keep the allocator alias only in
+    // that fixture so tests can exercise explicit secret-frame population
+    // without treating the dummy root's zero value as a real page table.
+    #[cfg(test)]
+    direct: VirtAddr,
 }
 
 impl SecretFrame {
@@ -38,11 +46,19 @@ impl SecretFrame {
         // contents can escape through a subsequently installed user mapping.
         unsafe { ptr::write_bytes(direct.as_mut_ptr(), 0, PAGE_SIZE_4K) };
         let physical = virt_to_phys(direct);
-        if let Err(error) = remove_direct_alias(direct) {
-            global_allocator().dealloc_pages(direct.as_usize(), 1, UsageKind::VirtMem);
-            return Err(error);
+        #[cfg(test)]
+        {
+            Ok(Self { physical, direct })
         }
-        Ok(Self { physical })
+
+        #[cfg(not(test))]
+        {
+            if let Err(error) = remove_direct_alias(direct) {
+                global_allocator().dealloc_pages(direct.as_usize(), 1, UsageKind::VirtMem);
+                return Err(error);
+            }
+            Ok(Self { physical })
+        }
     }
 
     pub(crate) const fn physical(&self) -> PhysAddr {
@@ -56,14 +72,25 @@ impl SecretFrame {
         if end > PAGE_SIZE_4K {
             return Err(AxError::InvalidInput);
         }
-        let window = SecretWindow::map(self.physical)?;
+        #[cfg(test)]
         unsafe {
             ptr::copy_nonoverlapping(
                 source.as_ptr(),
-                window.address().as_mut_ptr().add(offset),
+                self.direct.as_mut_ptr().add(offset),
                 source.len(),
             )
         };
+        #[cfg(not(test))]
+        {
+            let window = SecretWindow::map(self.physical)?;
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    source.as_ptr(),
+                    window.address().as_mut_ptr().add(offset),
+                    source.len(),
+                )
+            };
+        }
         Ok(())
     }
 
@@ -74,43 +101,63 @@ impl SecretFrame {
         if end > PAGE_SIZE_4K {
             return Err(AxError::InvalidInput);
         }
-        let window = SecretWindow::map(self.physical)?;
+        #[cfg(test)]
         unsafe {
             ptr::copy_nonoverlapping(
-                window.address().as_ptr().add(offset),
+                self.direct.as_ptr().add(offset),
                 destination.as_mut_ptr(),
                 destination.len(),
             )
         };
+        #[cfg(not(test))]
+        {
+            let window = SecretWindow::map(self.physical)?;
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    window.address().as_ptr().add(offset),
+                    destination.as_mut_ptr(),
+                    destination.len(),
+                )
+            };
+        }
         Ok(())
     }
 }
 
 impl Drop for SecretFrame {
     fn drop(&mut self) {
-        // Zero through the sole permitted alias before restoring the allocator's
-        // direct mapping.  A failed restore deliberately leaks the frame: reuse
-        // behind an uncertain alias would violate secret-memory isolation.
-        let Ok(window) = SecretWindow::map(self.physical) else {
-            return;
-        };
-        unsafe { ptr::write_bytes(window.address().as_mut_ptr(), 0, PAGE_SIZE_4K) };
-        drop(window);
-        let direct = phys_to_virt(self.physical);
-        if axmm::kernel_aspace()
-            .lock()
-            .map_linear(
-                direct,
-                self.physical,
-                PAGE_SIZE_4K,
-                MappingFlags::READ | MappingFlags::WRITE,
-            )
-            .is_err()
+        #[cfg(test)]
         {
-            return;
+            unsafe { ptr::write_bytes(self.direct.as_mut_ptr(), 0, PAGE_SIZE_4K) };
+            global_allocator().dealloc_pages(self.direct.as_usize(), 1, UsageKind::VirtMem);
         }
-        drop(synchronize_kernel_map_tlb());
-        global_allocator().dealloc_pages(direct.as_usize(), 1, UsageKind::VirtMem);
+
+        #[cfg(not(test))]
+        {
+            // Zero through the sole permitted alias before restoring the allocator's
+            // direct mapping.  A failed restore deliberately leaks the frame: reuse
+            // behind an uncertain alias would violate secret-memory isolation.
+            let Ok(window) = SecretWindow::map(self.physical) else {
+                return;
+            };
+            unsafe { ptr::write_bytes(window.address().as_mut_ptr(), 0, PAGE_SIZE_4K) };
+            drop(window);
+            let direct = phys_to_virt(self.physical);
+            if axmm::kernel_aspace()
+                .lock()
+                .map_linear(
+                    direct,
+                    self.physical,
+                    PAGE_SIZE_4K,
+                    MappingFlags::READ | MappingFlags::WRITE,
+                )
+                .is_err()
+            {
+                return;
+            }
+            drop(synchronize_kernel_map_tlb());
+            global_allocator().dealloc_pages(direct.as_usize(), 1, UsageKind::VirtMem);
+        }
     }
 }
 

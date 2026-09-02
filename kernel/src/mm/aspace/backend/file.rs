@@ -12,16 +12,17 @@ use core::{
 use axerrno::{AxError, AxResult};
 use axfs::{
     CachedFile, CachedFileEvictionOwner, CachedFileIdentity, CachedFilePagePin,
-    CachedFilePinWindow, EvictedPage, FileFlags,
+    CachedFilePinWindow, CachedPageEviction, CachedPageEvictionReservation, FileFlags,
 };
+use axfs_ng_vfs::{VfsError, VfsResult};
 use axhal::paging::{MappingFlags, PageSize, PageTable, PageTableCursor, PagingError};
 use axsync::Mutex;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, BackendRetirement, FutexBackingId, FutexBackingIdentity,
-    FutexWordOffset, MappingStatus, PopulateCallback, PopulateOutcome, page_table_flags, pages_in,
-    preflight_sparse_unmap,
+    super::FileEvictionFenceKey, AddrSpace, Backend, BackendOps, BackendRetirement, FutexBackingId,
+    FutexBackingIdentity, FutexWordOffset, MappingStatus, PopulateOutcome, page_table_flags,
+    pages_in, preflight_sparse_unmap,
 };
 use crate::file::{executable, memfd};
 
@@ -37,15 +38,6 @@ static FILE_FUTEX_HANDLES: FileFutexHandlesMutex<BTreeMap<FileFutexKey, Weak<Fil
 const REGISTERING_LISTENER: usize = usize::MAX;
 const WRITABLE_SEGMENTS_TRANSITIONING: usize = usize::MAX;
 
-#[cfg(test)]
-const DEFERRED_EVICTION_FAIL_RESERVE: u8 = 1;
-#[cfg(test)]
-const DEFERRED_EVICTION_FAIL_STATE: u8 = 2;
-#[cfg(test)]
-const DEFERRED_EVICTION_FAIL_CALLBACK: u8 = 3;
-#[cfg(test)]
-static DEFERRED_EVICTION_PREPARE_FAILPOINT: AtomicU8 = AtomicU8::new(0);
-
 pub(crate) struct FileFutexIdentity {
     key: FileFutexKey,
     /// Keep the real cache alive for the complete futex identity lease.  The
@@ -55,9 +47,79 @@ pub(crate) struct FileFutexIdentity {
     cache: CachedFile,
 }
 
-struct PreparedPopulateEvictions {
-    state: Arc<spin::Mutex<Vec<EvictedPage>>>,
-    callback: PopulateCallback,
+/// One address-space's reversible write-protection of a 4 KiB file alias.
+/// Pageout never calls `commit` until every owner has prepared and backing
+/// writeback has completed; `Drop` of the axfs reservation set calls `abort`.
+struct FileEvictionAlias {
+    vaddr: VirtAddr,
+    paddr: PhysAddr,
+    flags: MappingFlags,
+}
+
+/// One address-space-wide reversible eviction fence.  axfs deliberately
+/// deduplicates listeners by address-space owner, so the selected listener
+/// must retain every alias in that owner, not merely its own VMA.
+struct FileEvictionReservation {
+    aspace: Weak<Mutex<AddrSpace>>,
+    /// The cache owns the completion epoch/wait queue.  Retaining this handle
+    /// makes both commit and abort observable even if no other file handle is
+    /// open while a fault is sleeping outside the address-space mutex.
+    cache: CachedFile,
+    fence: Option<FileEvictionFenceKey>,
+    aliases: Vec<FileEvictionAlias>,
+}
+
+impl CachedPageEvictionReservation for FileEvictionReservation {
+    fn commit(self: Box<Self>) {
+        let cache = self.cache.clone();
+        let Some(aspace_ref) = self.aspace.upgrade() else {
+            cache.notify_eviction_completion();
+            return;
+        };
+        let mut aspace = aspace_ref.lock();
+        for alias in self.aliases {
+            match aspace.page_table_mut().cursor().unmap(alias.vaddr) {
+                Ok((paddr, _, PageSize::Size4K)) if paddr == alias.paddr => {}
+                // Concurrent munmap is permitted while fenced: it already
+                // satisfies the committed no-alias postcondition.
+                Err(PagingError::NotMapped) => {}
+                result => panic!("prepared file eviction lost its 4KiB alias: {result:?}"),
+            }
+        }
+        if let Some(fence) = self.fence {
+            aspace.complete_file_eviction_fence(fence);
+        }
+        cache.notify_eviction_completion();
+        drop(crate::mm::synchronize_tlb());
+    }
+
+    fn abort(self: Box<Self>) {
+        let cache = self.cache.clone();
+        let Some(aspace_ref) = self.aspace.upgrade() else {
+            cache.notify_eviction_completion();
+            return;
+        };
+        let mut aspace = aspace_ref.lock();
+        for alias in self.aliases {
+            match aspace.page_table().query(alias.vaddr) {
+                Ok((paddr, _, PageSize::Size4K)) if paddr == alias.paddr => {
+                    aspace
+                        .page_table_mut()
+                        .cursor()
+                        .remap(alias.vaddr, alias.paddr, page_table_flags(alias.flags))
+                        .expect("prepared file eviction restore must be infallible");
+                }
+                // Do not recreate an alias that munmap removed while fenced.
+                Err(PagingError::NotMapped) => (),
+                result => panic!("prepared file eviction alias changed during abort: {result:?}"),
+            }
+        }
+        if let Some(fence) = self.fence {
+            aspace.complete_file_eviction_fence(fence);
+        }
+        cache.notify_eviction_completion();
+        drop(crate::mm::synchronize_tlb());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,94 +164,6 @@ fn inspect_file_populate(
     })
 }
 
-impl PreparedPopulateEvictions {
-    fn try_new(inner: Arc<FileBackendInner>, page_count: usize) -> AxResult<Self> {
-        #[cfg(test)]
-        if take_deferred_eviction_prepare_failpoint(DEFERRED_EVICTION_FAIL_RESERVE) {
-            return Err(AxError::NoMemory);
-        }
-
-        let mut evictions = Vec::new();
-        evictions
-            .try_reserve_exact(page_count)
-            .map_err(|_| AxError::NoMemory)?;
-
-        #[cfg(test)]
-        if take_deferred_eviction_prepare_failpoint(DEFERRED_EVICTION_FAIL_STATE) {
-            return Err(AxError::NoMemory);
-        }
-
-        let state = Arc::try_new(spin::Mutex::new(evictions)).map_err(|_| AxError::NoMemory)?;
-        let callback_state = state.clone();
-
-        #[cfg(test)]
-        if take_deferred_eviction_prepare_failpoint(DEFERRED_EVICTION_FAIL_CALLBACK) {
-            return Err(AxError::NoMemory);
-        }
-
-        let callback: PopulateCallback = Box::try_new(move |aspace: &mut AddrSpace| {
-            loop {
-                let pn = {
-                    let evictions = callback_state.lock();
-                    evictions.last().map(EvictedPage::page_number)
-                };
-                let Some(pn) = pn else {
-                    break;
-                };
-                assert!(
-                    inner.on_evict_from_locked_aspace(pn, aspace),
-                    "failed to detach aliases for deferred cache eviction"
-                );
-                // The old cache frame remains owned until every PTE in this
-                // address space has been detached above.
-                let evicted = callback_state
-                    .lock()
-                    .pop()
-                    .expect("deferred eviction disappeared during cleanup");
-                drop(evicted);
-            }
-        })
-        .map_err(|_| AxError::NoMemory)?;
-
-        Ok(Self { state, callback })
-    }
-
-    fn push(&self, evicted: EvictedPage) {
-        let mut evictions = self.state.lock();
-        debug_assert!(
-            evictions.len() < evictions.capacity(),
-            "deferred eviction count exceeded the populated page bound"
-        );
-        // Capacity for one possible eviction per populated page was reserved
-        // before cache mutation, so this push cannot allocate.
-        evictions.push(evicted);
-    }
-
-    fn into_callback(self) -> Option<PopulateCallback> {
-        let Self { state, callback } = self;
-        let has_evictions = !state.lock().is_empty();
-        drop(state);
-        has_evictions.then_some(callback)
-    }
-
-    #[cfg(test)]
-    fn capacity(&self) -> usize {
-        self.state.lock().capacity()
-    }
-
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.state.lock().is_empty()
-    }
-}
-
-#[cfg(test)]
-fn take_deferred_eviction_prepare_failpoint(stage: u8) -> bool {
-    DEFERRED_EVICTION_PREPARE_FAILPOINT
-        .compare_exchange(stage, 0, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-}
-
 #[derive(Clone, Copy)]
 struct WritableMappingActivation {
     memfd: bool,
@@ -206,8 +180,11 @@ fn activate_writable_mapping(
         writable_mapping.is_some_and(|registration| registration.is_active());
     let was_executable_mapping_active =
         executable_mapping.is_some_and(executable::WritableMappingRegistration::is_active);
-    let was_swap_mapping_active = swap_mapping.is_some_and(crate::mm::WritableMappingRegistration::is_active);
-    if let Some(registration) = swap_mapping { registration.set_active(true)?; }
+    let was_swap_mapping_active =
+        swap_mapping.is_some_and(crate::mm::WritableMappingRegistration::is_active);
+    if let Some(registration) = swap_mapping {
+        registration.set_active(true)?;
+    }
     if let Some(registration) = writable_mapping {
         // This is the shared linearization point with F_ADD_SEALS. Reserve it
         // before executable admission so a sealed mapping publishes nothing.
@@ -219,7 +196,9 @@ fn activate_writable_mapping(
         if !was_memfd_mapping_active && let Some(registration) = writable_mapping {
             let _ = registration.set_active(false);
         }
-        if !was_swap_mapping_active && let Some(registration) = swap_mapping { let _ = registration.set_active(false); }
+        if !was_swap_mapping_active && let Some(registration) = swap_mapping {
+            let _ = registration.set_active(false);
+        }
         return Err(error);
     }
 
@@ -241,7 +220,9 @@ fn deactivate_writable_mapping(
     if let Some(registration) = writable_mapping {
         registration.set_active(false)?;
     }
-    if let Some(registration) = swap_mapping { registration.set_active(false)?; }
+    if let Some(registration) = swap_mapping {
+        registration.set_active(false)?;
+    }
     Ok(())
 }
 
@@ -261,7 +242,11 @@ fn rollback_writable_mapping_activation(
     {
         registration.set_active(false)?;
     }
-    if activation.swap && let Some(registration) = swap_mapping { registration.set_active(false)?; }
+    if activation.swap
+        && let Some(registration) = swap_mapping
+    {
+        registration.set_active(false)?;
+    }
     Ok(())
 }
 
@@ -522,27 +507,161 @@ impl FileBackendInner {
             return Err(AxError::AlreadyExists);
         }
         let aspace = Arc::downgrade(aspace);
+        let listener_cache = self.cache.clone();
         let handle = self.cache.add_evict_listener(self.owner, {
             let this = Arc::downgrade(self);
-            move |pn, _page| {
+            move |eviction: CachedPageEviction| -> VfsResult<Box<dyn CachedPageEvictionReservation>> {
                 let Some(this) = this.upgrade() else {
-                    return true;
+                    return Ok(Box::new(FileEvictionReservation {
+                        aspace: Weak::new(),
+                        cache: listener_cache.clone(),
+                        fence: None,
+                        aliases: Vec::new(),
+                    }));
                 };
                 let Some(aspace) = aspace.upgrade() else {
-                    // The address space has been dropped, nothing to do.
-                    return true;
+                    return Ok(Box::new(FileEvictionReservation {
+                        aspace: Weak::new(),
+                        cache: this.cache.clone(),
+                        fence: None,
+                        aliases: Vec::new(),
+                    }));
                 };
-                let Some(mut aspace) = aspace.try_lock() else {
-                    // This can happen during the populate process, when new pages
-                    // are being populated and old pages are being evicted. In this
-                    // case, we delegate the unmapping to the populate process.
-                    return false;
-                };
-                this.on_evict(pn, &mut aspace)
+                this.prepare_evict(eviction, aspace)
             }
-        });
+        }).map_err(|_| AxError::NoMemory)?;
         self.handle.store(handle, Ordering::Release);
         Ok(())
+    }
+
+    fn prepare_evict(
+        self: &Arc<Self>,
+        eviction: CachedPageEviction,
+        aspace: Arc<Mutex<AddrSpace>>,
+    ) -> VfsResult<Box<dyn CachedPageEvictionReservation>> {
+        // Count under the address-space lock, reserve outside it, then scan
+        // again.  The second pass is the linearization point: a VMA added in
+        // between is detected by the capacity check and causes a clean retry
+        // before any alias is write protected.
+        let candidate_count = {
+            let guard = aspace.lock();
+            guard
+                .areas
+                .iter()
+                .filter(|area| match area.backend() {
+                    Backend::File(file) => file.0.cache.identity() == eviction.identity,
+                    _ => false,
+                })
+                .count()
+        };
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(candidate_count)
+            .map_err(|_| VfsError::NoMemory)?;
+        let mut aliases = Vec::new();
+        aliases
+            .try_reserve_exact(candidate_count)
+            .map_err(|_| VfsError::NoMemory)?;
+
+        let mut guard = aspace.lock();
+        for area in guard.areas.iter() {
+            let Backend::File(file) = area.backend() else {
+                continue;
+            };
+            if file.0.cache.identity() != eviction.identity {
+                continue;
+            }
+            let Some(relative) = eviction.page_number.checked_sub(file.0.offset_page) else {
+                continue;
+            };
+            let vaddr = file.0.start + relative as usize * PAGE_SIZE_4K;
+            if vaddr < area.start() || vaddr >= area.end() {
+                continue;
+            }
+            if candidates.len() == candidates.capacity() {
+                return Err(VfsError::ResourceBusy);
+            }
+            candidates.push(vaddr);
+        }
+
+        // Publish the generation fence before altering PTE permissions.  Any
+        // file-alias publishing path that observes it must release the
+        // address-space lock and retry after commit/abort.
+        let fence = guard
+            .publish_file_eviction_fence(eviction.identity, eviction.page_number)
+            .map_err(|_| VfsError::NoMemory)?;
+
+        // Complete every fallible check before altering a PTE.  The following
+        // write-protection pass is then fail-stop: under the same aspace lock
+        // a changed PTE is structural corruption, not a retryable race.
+        for &vaddr in &candidates {
+            if guard.range_is_locked(vaddr, PAGE_SIZE_4K) {
+                guard.complete_file_eviction_fence(fence);
+                return Err(VfsError::ResourceBusy);
+            }
+            // A huge alias must be expanded before this 4KiB cache-page can
+            // be fenced.  Failure is before staging and therefore leaves the
+            // cache page resident.
+            if guard
+                .page_table()
+                .query(vaddr)
+                .is_ok_and(|(_, _, size)| size == PageSize::Size2M)
+            {
+                guard
+                    .demote_alias_preserving_2m(VirtAddr::from(
+                        vaddr.as_usize() & !(super::super::COLLAPSE_2M_SIZE - 1),
+                    ))
+                    .map_err(|_| {
+                        guard.complete_file_eviction_fence(fence);
+                        VfsError::ResourceBusy
+                    })?;
+            }
+            match guard.page_table().query(vaddr) {
+                Ok((paddr, _, PageSize::Size4K)) if paddr == eviction.paddr => {}
+                // A concurrent fault/mapping change is not allowed to race a
+                // a staged eviction.  No alias has been fenced yet.
+                Err(PagingError::NotMapped) => (),
+                _ => {
+                    guard.complete_file_eviction_fence(fence);
+                    return Err(VfsError::ResourceBusy);
+                }
+            }
+        }
+        for vaddr in candidates {
+            match guard.page_table().query(vaddr) {
+                Ok((paddr, flags, PageSize::Size4K)) => {
+                    assert_eq!(
+                        paddr, eviction.paddr,
+                        "file eviction PTE changed physical frame"
+                    );
+                    guard
+                        .page_table_mut()
+                        .cursor()
+                        .remap(vaddr, paddr, page_table_flags(flags - MappingFlags::WRITE))
+                        .expect("file eviction write protection changed after locked preflight");
+                    aliases.push(FileEvictionAlias {
+                        vaddr,
+                        paddr,
+                        flags,
+                    });
+                }
+                // A nonresident alias is a normal state: the published
+                // fence prevents it from faulting this retiring cache page
+                // back in until commit/abort has completed.
+                Err(PagingError::NotMapped) => {}
+                result => {
+                    panic!("file eviction PTE changed after its locked preflight: {result:?}")
+                }
+            }
+        }
+        drop(crate::mm::synchronize_tlb());
+        drop(guard);
+        Ok(Box::new(FileEvictionReservation {
+            aspace: Arc::downgrade(&aspace),
+            cache: self.cache.clone(),
+            fence: Some(fence),
+            aliases,
+        }))
     }
 
     fn on_evict(self: &Arc<Self>, pn: u32, aspace: &mut AddrSpace) -> bool {
@@ -686,6 +805,59 @@ impl Drop for WritableMappingAdmission {
     }
 }
 
+/// Fixed-replacement admission for an incoming writable file VMA.
+///
+/// Unlike [`WritableMappingAdmission`], this owns one fully acquired inner
+/// writable segment.  Preparation performs the fallible registration and
+/// segment transition while the old mapping is still intact; commit only
+/// publishes the new backend's outer state bit.  Abandonment releases that
+/// exact segment, which performs the matching final registration rollback
+/// when it was the last holder.
+#[must_use = "prepared fixed writable file admission must be committed or released"]
+pub(crate) struct FixedWritableMappingAdmission {
+    inner: Arc<FileBackendInner>,
+    armed: bool,
+}
+
+impl FixedWritableMappingAdmission {
+    fn begin(backend: &FileBackend) -> AxResult<Self> {
+        if backend.1.load(Ordering::Acquire) != SEGMENT_INACTIVE {
+            return Err(AxError::BadState);
+        }
+        backend.0.acquire_writable_segment()?;
+        Ok(Self {
+            inner: backend.0.clone(),
+            armed: true,
+        })
+    }
+
+    fn commit(mut self, outer: &AtomicU8) {
+        debug_assert_eq!(outer.load(Ordering::Acquire), SEGMENT_INACTIVE);
+        outer.store(SEGMENT_ACTIVE, Ordering::Release);
+        self.armed = false;
+    }
+}
+
+impl Drop for FixedWritableMappingAdmission {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self.inner.release_writable_segment() {
+            error!(
+                "failed to release prepared fixed writable segment: {error}; retaining \
+                 registration fail-closed"
+            );
+            // `release_writable_segment` restored the inner count on failure.
+            // Forgetting this token deliberately preserves the matching Arc
+            // and accounting rather than dropping an inner with live segments.
+            self.armed = false;
+            let retained = self.inner.clone();
+            core::mem::forget(retained);
+        }
+    }
+}
+
 /// File-backed mapping backend.
 const SEGMENT_INACTIVE: u8 = 0;
 const SEGMENT_TRANSITIONING: u8 = 1;
@@ -782,6 +954,34 @@ impl Drop for FileBackend {
 }
 
 impl FileBackend {
+    pub(super) fn preflight_map(&self, range: VirtAddrRange, flags: MappingFlags) -> AxResult {
+        self.validate_range(range)?;
+        self.check_flags(flags)
+    }
+
+    /// Return the backing cache only when `page_number` is an alias of this
+    /// VMA.  Kept separate from the address calculation so callers can first
+    /// compare a published fence identity without touching page tables.
+    pub(in crate::mm::aspace) fn cache_for_eviction_alias(
+        &self,
+        identity: CachedFileIdentity,
+        page_number: u32,
+    ) -> Option<CachedFile> {
+        (self.0.cache.identity() == identity
+            && page_number >= self.0.offset_page
+            && self.eviction_alias_address(page_number).is_some())
+        .then(|| self.0.cache.clone())
+    }
+
+    pub(in crate::mm::aspace) fn eviction_alias_address(
+        &self,
+        page_number: u32,
+    ) -> Option<VirtAddr> {
+        let relative = page_number.checked_sub(self.0.offset_page)?;
+        let offset = (relative as usize).checked_mul(PAGE_SIZE_4K)?;
+        self.0.start.checked_add(offset)
+    }
+
     pub(super) const fn mapping_status(&self) -> &MappingStatus {
         &self.2
     }
@@ -796,6 +996,33 @@ impl FileBackend {
 
     pub(crate) fn begin_writable_mapping_admission(&self) -> AxResult<WritableMappingAdmission> {
         WritableMappingAdmission::begin(self)
+    }
+
+    pub(super) fn begin_fixed_writable_mapping_admission(
+        &self,
+    ) -> AxResult<FixedWritableMappingAdmission> {
+        FixedWritableMappingAdmission::begin(self)
+    }
+
+    pub(super) fn preflight_fixed_readonly_map(&self) -> AxResult {
+        // A fixed replacement must install the same backend instance that was
+        // prepared.  Reusing an already-active file backend for a readonly
+        // incoming VMA would strand its inner writable segment when the outer
+        // state is cleared, so reject it before old PTE withdrawal.
+        (self.1.load(Ordering::Acquire) == SEGMENT_INACTIVE)
+            .then_some(())
+            .ok_or(AxError::BadState)
+    }
+
+    /// Commits an incoming fixed-replacement file VMA from an admission which
+    /// acquired every fallible writable-segment resource before old PTEs were
+    /// withdrawn.  The final atomic state publication cannot fail.
+    pub(super) fn commit_fixed_writable_map(&self, admission: FixedWritableMappingAdmission) {
+        admission.commit(&self.1);
+    }
+
+    pub(super) fn commit_fixed_readonly_map(&self) {
+        self.1.store(SEGMENT_INACTIVE, Ordering::Release);
     }
 
     fn inactive(inner: Arc<FileBackendInner>) -> Self {
@@ -1064,61 +1291,52 @@ impl FileBackend {
         resident
     }
 
+    /// Retains the cache object needed for a lock-external reclaim retry.
+    ///
+    /// File population can discover a full cache while the caller owns an
+    /// address-space mutex.  The actual eviction transaction may lock this
+    /// or another address space through its reverse-map listeners, so the
+    /// fault dispatcher must retain this handle, release the mm lock, and
+    /// only then call `CachedFile::reclaim_one`.
+    pub(crate) fn cache_for_reclaim(&self) -> CachedFile {
+        self.0.cache.clone()
+    }
+
     /// Demotes already resident file-cache pages without faulting them in.
     pub(crate) fn cold_pages(&self, range: VirtAddrRange) -> AxResult<usize> {
-        Ok(self.0.cache.cold_pages(self.cache_page_range(range)?)?)
+        self.0.cache.cold_pages(self.cache_page_range(range)?)
     }
 
     /// Writes back and evicts resident file-cache pages for this mapping.
     /// Missing, pinned, writeback, and in-memory pages are left in place by
     /// the cache layer, matching the advisory nature of pageout.
     pub(crate) fn pageout_pages(&self, range: VirtAddrRange) -> AxResult<usize> {
-        Ok(self.0.cache.pageout_pages(self.cache_page_range(range)?)?)
+        self.0.cache.pageout_pages(self.cache_page_range(range)?)
     }
 
     /// Reads file-backed pages into the inode cache without installing PTEs.
     ///
-    /// A caller holds `aspace`'s lock while this runs.  Cache replacement can
-    /// therefore make this mapping's eviction listener defer PTE detachment;
-    /// use the owner-aware cache insertion path and drain that deferred
-    /// eviction before releasing its retained page.  The ordinary insertion
-    /// path cannot do this: it would either reject the locked listener or
-    /// release an evicted page before its aliases had been detached.
-    pub(crate) fn prefetch(&self, range: VirtAddrRange, aspace: &mut AddrSpace) -> AxResult<usize> {
+    /// This is called after the caller dropped its address-space lock.  It may
+    /// therefore use normal cache replacement, including the reverse-map
+    /// eviction protocol needed to make WILLNEED actually populate a full
+    /// cache rather than silently stopping at `ResourceBusy`.
+    pub(crate) fn prefetch(&self, range: VirtAddrRange) -> AxResult<usize> {
         self.validate_range(range)?;
 
-        self.0.cache.with_direct_io_excluded(|| {
-            let mut prefetched = 0usize;
-            for vaddr in pages_in(range, PageSize::Size4K)? {
-                // A mapping wholly beyond its current file size faults with
-                // SIGBUS.  It has no backing page to bring into cache.
-                if self.faults_with_sigbus(vaddr) {
-                    continue;
-                }
-                let pn = self.page_number_for(vaddr)?;
-                let evicted = self.0.cache.with_page_or_insert_for_owner(
-                    pn,
-                    self.0.owner,
-                    |_, evicted| Ok(evicted),
-                )?;
-                if let Some(evicted) = evicted {
-                    if let Some(owner) = evicted.deferred_owner() {
-                        assert_eq!(owner, self.0.owner);
-                        assert!(
-                            self.0
-                                .on_evict_from_locked_aspace(evicted.page_number(), aspace),
-                            "failed to detach aliases for deferred cache eviction"
-                        );
-                    }
-                    // Keep a deferred page alive until every alias was
-                    // detached above; non-deferred pages were already
-                    // acknowledged by their listeners.
-                    drop(evicted);
-                }
-                prefetched = prefetched.checked_add(1).ok_or(AxError::InvalidInput)?;
+        let mut prefetched = 0usize;
+        for vaddr in pages_in(range, PageSize::Size4K)? {
+            // A mapping wholly beyond its current file size faults with
+            // SIGBUS.  It has no backing page to bring into cache.
+            if self.faults_with_sigbus(vaddr) {
+                continue;
             }
-            Ok(prefetched)
-        })
+            let pn = self.page_number_for(vaddr)?;
+            self.0
+                .cache
+                .with_page_or_insert_lock_external_reclaim(pn, |_| Ok(()))?;
+            prefetched = prefetched.checked_add(1).ok_or(AxError::InvalidInput)?;
+        }
+        Ok(prefetched)
     }
 
     pub(crate) fn begin_user_io_pin_window(&self) -> AxResult<CachedFilePinWindow> {
@@ -1279,6 +1497,11 @@ impl FileBackend {
         self.0.cache.sync(data_only)?;
         Ok(())
     }
+
+    pub(crate) fn sync_range(&self, offset: u64, len: u64, data_only: bool) -> AxResult {
+        self.0.cache.sync_range(offset, len, data_only)?;
+        Ok(())
+    }
 }
 
 impl BackendOps for FileBackend {
@@ -1292,8 +1515,7 @@ impl BackendOps for FileBackend {
         flags: MappingFlags,
         _pt: &mut PageTableCursor,
     ) -> AxResult {
-        self.validate_range(range)?;
-        self.check_flags(flags)?;
+        self.preflight_map(range, flags)?;
         if flags.contains(MappingFlags::WRITE) {
             self.activate_writable_segment()?;
         } else {
@@ -1341,7 +1563,16 @@ impl BackendOps for FileBackend {
         access_flags: MappingFlags,
         pt: &mut PageTableCursor,
     ) -> PopulateOutcome {
-        let (outcome, needs_tlb_sync) = self.0.cache.with_direct_io_excluded(|| {
+        let readahead_pages = self
+            .mapping_status()
+            .madvise_readahead()
+            .cache_window_pages();
+        // `populate` runs under the owning mm lock.  In particular, do not
+        // take direct_io_lock here: PAGEOUT owns direct_io_lock while its
+        // cache eviction listener acquires this same mm, so that order would
+        // deadlock.  Cache misses use the no-reclaim primitive below and the
+        // fault dispatcher performs its existing lock-external retry.
+        let (outcome, needs_tlb_sync) = (|| {
             let plan = match inspect_file_populate(range, access_flags, |addr| {
                 pt.query(addr)
                     .map(|(_, page_flags, page_size)| (page_flags, page_size))
@@ -1367,16 +1598,6 @@ impl BackendOps for FileBackend {
             if plan.already_accessible {
                 return (PopulateOutcome::immediate(Ok(plan.page_count)), false);
             }
-            let deferred_evictions = if plan.missing_count == 0 {
-                None
-            } else {
-                match PreparedPopulateEvictions::try_new(self.0.clone(), plan.missing_count) {
-                    Ok(evictions) => Some(evictions),
-                    Err(error) => return (PopulateOutcome::immediate(Err(error)), false),
-                }
-            };
-
-            let owner = self.0.owner;
             let mut needs_tlb_sync = false;
             let result = (|| {
                 let mut pages = 0;
@@ -1410,52 +1631,37 @@ impl BackendOps for FileBackend {
                         }
                         // If the page is not mapped, try map it.
                         Err(PagingError::NotMapped) => {
-                            let Some(deferred_evictions) = deferred_evictions.as_ref() else {
-                                // The address-space lock makes page-table
-                                // residency stable between inspection and
-                                // mutation. Refuse an impossible late hole
-                                // rather than insert without preallocated
-                                // eviction ownership.
-                                return Err(AxError::BadAddress);
-                            };
+                            // Cache-full replacement is intentionally not
+                            // attempted while this address space is locked.
+                            // The cache reports ResourceBusy as the internal
+                            // NeedsCacheReclaim token; the caller must release
+                            // this lock, run CachedFile::reclaim_one(), then
+                            // revalidate and retry the fault.
                             let map_flags = flags - MappingFlags::WRITE;
-                            self.0.cache.with_page_or_insert_for_owner(
-                                pn,
-                                owner,
-                                |page, evicted| {
-                                    if let Some(evicted) = evicted
-                                        && let Some(deferred_owner) = evicted.deferred_owner()
-                                    {
-                                        assert_eq!(
-                                            deferred_owner, owner,
-                                            "foreign address-space owner deferred cache eviction"
-                                        );
-                                        deferred_evictions.push(evicted);
-                                    }
-                                    pt.map(
-                                        addr,
-                                        page.paddr(),
-                                        PageSize::Size4K,
-                                        page_table_flags(map_flags),
-                                    )?;
-                                    pages += 1;
-                                    Ok(())
-                                },
-                            )?;
+                            self.0
+                                .cache
+                                .with_page_or_insert_without_reclaim_with_readahead(
+                                    pn,
+                                    readahead_pages,
+                                    |page| {
+                                        pt.map(
+                                            addr,
+                                            page.paddr(),
+                                            PageSize::Size4K,
+                                            page_table_flags(map_flags),
+                                        )?;
+                                        pages += 1;
+                                        Ok(())
+                                    },
+                                )?;
                         }
                         Err(_) => return Err(AxError::BadAddress),
                     }
                 }
                 Ok(pages)
             })();
-            (
-                PopulateOutcome::new(
-                    result,
-                    deferred_evictions.and_then(PreparedPopulateEvictions::into_callback),
-                ),
-                needs_tlb_sync,
-            )
-        });
+            (PopulateOutcome::immediate(result), needs_tlb_sync)
+        })();
         if needs_tlb_sync {
             pt.flush();
             drop(crate::mm::synchronize_tlb());
@@ -1666,10 +1872,10 @@ mod tests {
         let backend = test_backend(&location, Arc::new(()));
         let address = VirtAddr::from(0x1000);
         let range = VirtAddrRange::new(address, address + PAGE_SIZE_4K);
-        let mut aspace = AddrSpace::new_empty(address, PAGE_SIZE_4K).unwrap();
+        let aspace = AddrSpace::new_empty(address, PAGE_SIZE_4K).unwrap();
 
         assert!(!backend.cached_page_resident(address));
-        assert_eq!(backend.prefetch(range, &mut aspace), Ok(1));
+        assert_eq!(backend.prefetch(range), Ok(1));
         assert!(backend.cached_page_resident(address));
         assert!(matches!(
             aspace.page_table().query(address),
@@ -1678,50 +1884,23 @@ mod tests {
     }
 
     #[test]
-    fn deferred_eviction_preparation_failpoints_leave_no_callback_owner() {
+    fn file_eviction_fence_blocks_only_its_exact_cache_page_generation() {
         let _context = test_context();
-        executable::init().unwrap();
-        let loc = test_location("deferred-eviction-prepare-failpoints");
-        let backend = test_backend(&loc, Arc::new(()));
-        let baseline_owners = Arc::strong_count(&backend.0);
+        let location = test_location("file-eviction-fence-key");
+        let backend = test_backend(&location, Arc::new(()));
+        let address = VirtAddr::from(0x1000);
+        let mut aspace = AddrSpace::new_empty(address, PAGE_SIZE_4K).unwrap();
+        let identity = backend.0.cache.identity();
 
-        for stage in [
-            DEFERRED_EVICTION_FAIL_RESERVE,
-            DEFERRED_EVICTION_FAIL_STATE,
-            DEFERRED_EVICTION_FAIL_CALLBACK,
-        ] {
-            DEFERRED_EVICTION_PREPARE_FAILPOINT.store(stage, Ordering::Release);
-            assert_eq!(
-                PreparedPopulateEvictions::try_new(backend.0.clone(), 4).err(),
-                Some(AxError::NoMemory)
-            );
-            assert_eq!(
-                DEFERRED_EVICTION_PREPARE_FAILPOINT.load(Ordering::Acquire),
-                0
-            );
-            assert_eq!(Arc::strong_count(&backend.0), baseline_owners);
-        }
-    }
+        let first = aspace.publish_file_eviction_fence(identity, 7).unwrap();
+        assert!(aspace.file_eviction_fenced(identity, 7));
+        assert!(!aspace.file_eviction_fenced(identity, 8));
+        aspace.complete_file_eviction_fence(first);
+        assert!(!aspace.file_eviction_fenced(identity, 7));
 
-    #[test]
-    fn deferred_eviction_preparation_reserves_the_full_page_bound() {
-        let _context = test_context();
-        executable::init().unwrap();
-        let loc = test_location("deferred-eviction-page-bound");
-        let backend = test_backend(&loc, Arc::new(()));
-        let baseline_owners = Arc::strong_count(&backend.0);
-
-        assert_eq!(
-            PreparedPopulateEvictions::try_new(backend.0.clone(), usize::MAX).err(),
-            Some(AxError::NoMemory)
-        );
-        assert_eq!(Arc::strong_count(&backend.0), baseline_owners);
-
-        let prepared = PreparedPopulateEvictions::try_new(backend.0.clone(), 4).unwrap();
-        assert!(prepared.capacity() >= 4);
-        assert!(prepared.is_empty());
-        assert!(prepared.into_callback().is_none());
-        assert_eq!(Arc::strong_count(&backend.0), baseline_owners);
+        let second = aspace.publish_file_eviction_fence(identity, 7).unwrap();
+        assert!(second.generation > first.generation);
+        aspace.complete_file_eviction_fence(second);
     }
 
     #[test]

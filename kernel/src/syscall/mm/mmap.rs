@@ -4,22 +4,27 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{CachedFile, FileBackend, FileFlags};
 use axfs_ng_vfs::Location;
 use axhal::paging::{MappingFlags, PageSize, PreparedPageTableFrames};
+use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::*;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
+use thekernel_linux_arch_x86_64::{ArchPolicyError, PkeyPlan};
 
 use crate::{
     file::{
         Directory, File, FileHandle, FileMmapProtection, FileMmapRequest, FileMmapSharing,
-        executable, get_file_like,
+        executable, get_file_like, inode_flags,
+        permission::{check_inode_permissions_with_security_and_idmap, current_vfs_security},
         privilege_metadata::{
             ContentWritePrivilegeGuard, begin_shared_writable_mapping_privilege_cleanup,
         },
     },
     mm::{
         AddrSpace, Backend, DeferredUffdWake, FileMappingLease, FileMappingSharing,
-        PreparedFixedSharedMapping, PreparedProtect, SharedPages, WritableMappingAdmission,
-        check_memory_overcommit, checked_align_up, checked_align_up_4k, remap_user_mapping,
+        MadviseReadahead, MadviseThp, PreparedFixedSharedMapping, PreparedProtect,
+        SharedFolioDemotionReplacement, SharedFolioPteRedirect,
+        SharedFolioPteReplacement, SharedPages, WritableMappingAdmission, check_memory_overcommit,
+        check_rlimit_as_growth, checked_align_up, checked_align_up_4k, remap_user_mapping,
     },
     pseudofs::{Device, DeviceMmap},
     task::{
@@ -34,12 +39,141 @@ const READ_IMPLIES_EXEC: u32 = 0x0040_0000;
 const ADDR_COMPAT_LAYOUT: u32 = 0x0020_0000;
 const SHADOW_STACK_SET_TOKEN: usize = 1;
 const SHADOW_STACK_MIN_ADDR: usize = 1usize << 32;
+/// One explicit population can cross several file VMAs.  Each retry rechecks
+/// the complete operation after a lock-external eviction transaction; bound
+/// the loop so pinned/full caches retain ordinary ENOMEM behavior rather than
+/// spinning a syscall forever.
+const EXPLICIT_POPULATE_RETRY_LIMIT: usize = 64;
+
+enum MadviseRemoveTarget {
+    File {
+        file: FileHandle<File>,
+        offset: u64,
+        length: u64,
+    },
+    AnonymousShared {
+        pages: Arc<SharedPages>,
+        offset: usize,
+        length: usize,
+    },
+}
+
+/// Captures exact backing ownership while the VMA topology is stable.  The
+/// retained file handles and shared-page Arcs survive fd close, VMA splits and
+/// the lock drop required before filesystem mutation.
+fn collect_madvise_remove_targets(
+    aspace: &AddrSpace,
+    start: VirtAddr,
+    length: usize,
+) -> AxResult<Vec<MadviseRemoveTarget>> {
+    let end = start.checked_add(length).ok_or(AxError::InvalidInput)?;
+    let mut cursor = start;
+    let mut targets = Vec::new();
+
+    while cursor < end {
+        let area = aspace.find_area(cursor).ok_or(AxError::NoMemory)?;
+        if area.start() > cursor {
+            return Err(AxError::NoMemory);
+        }
+        let segment_end = area.end().min(end);
+        let segment_length = segment_end.sub_addr(cursor);
+        match area.backend() {
+            Backend::File(_) => {
+                let lease = area.backend().file_mapping().ok_or(AxError::InvalidInput)?;
+                if lease.sharing() != FileMappingSharing::Shared {
+                    return Err(AxError::InvalidInput);
+                }
+                let offset = lease.file_offset_at(cursor).ok_or(AxError::InvalidInput)?;
+                let length = u64::try_from(segment_length).map_err(|_| AxError::InvalidInput)?;
+                targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                targets.push(MadviseRemoveTarget::File {
+                    file: lease.file().clone(),
+                    offset,
+                    length,
+                });
+            }
+            Backend::Shared(shared)
+                if shared.pages().supports_madv_remove()
+                    && area.backend().file_mapping().is_none() =>
+            {
+                let offset = shared
+                    .backing_offset(cursor.as_usize())
+                    .ok_or(AxError::InvalidInput)?;
+                targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                targets.push(MadviseRemoveTarget::AnonymousShared {
+                    pages: shared.pages().clone(),
+                    offset,
+                    length: segment_length,
+                });
+            }
+            Backend::Linear(_) | Backend::Cow(_) | Backend::Shared(_) => {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        cursor = segment_end;
+    }
+    Ok(targets)
+}
+
+/// Populates an already-installed VMA range without allowing a file-cache
+/// replacement transaction to run under the address-space mutex.
+///
+/// `revalidate` owns the operation-specific VMA/permission checks and runs on
+/// every attempt, including after a successful reclaim.  This is shared by
+/// MAP_POPULATE, MADV_POPULATE and remap_file_pages' post-commit best-effort
+/// fill so `ResourceBusy` stays an internal cache-pressure token.
+fn populate_explicit_with_reclaim(
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
+    start: VirtAddr,
+    size: usize,
+    access_flags: MappingFlags,
+    revalidate: impl Fn(&AddrSpace) -> AxResult<()>,
+) -> AxResult<()> {
+    for _ in 0..EXPLICIT_POPULATE_RETRY_LIMIT {
+        let caches = {
+            let mut aspace = aspace_handle.lock();
+            revalidate(&aspace)?;
+            match aspace.populate_area(start, size, access_flags) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.canonicalize() == AxError::ResourceBusy => {
+                    aspace.file_caches_for_population_retry(start, size)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let mut reclaimed = false;
+        for cache in caches {
+            reclaimed |= cache.reclaim_one()?;
+        }
+        if !reclaimed {
+            return Err(AxError::NoMemory);
+        }
+    }
+    Err(AxError::NoMemory)
+}
 
 fn personality_mmap_protection(personality: u32, mut protection: MappingFlags) -> MappingFlags {
     if personality & READ_IMPLIES_EXEC != 0 && protection.contains(MappingFlags::READ) {
         protection |= MappingFlags::EXECUTE;
     }
     protection
+}
+
+/// Linux MDWE refuses a transition that gains execute permission from a
+/// writable (or potentially writable) VMA.  The check deliberately uses the
+/// VMA's maximum protection as well as its current bits: dropping WRITE first
+/// must not create an execute-gain escape hatch.
+fn mdwe_refuses_execute_gain(
+    proc_data: &ProcessData,
+    old_flags: MappingFlags,
+    new_flags: MappingFlags,
+    may_protect: MappingFlags,
+) -> bool {
+    const PR_MDWE_REFUSE_EXEC_GAIN: u8 = 1;
+    proc_data.mdwe() & PR_MDWE_REFUSE_EXEC_GAIN != 0
+        && new_flags.contains(MappingFlags::EXECUTE)
+        && !old_flags.contains(MappingFlags::EXECUTE)
+        && (old_flags.contains(MappingFlags::WRITE) || may_protect.contains(MappingFlags::WRITE))
 }
 
 /// Select an address for a non-fixed mmap.  Linux's compatibility layout is
@@ -108,7 +242,9 @@ pub fn sys_map_shadow_stack(addr: usize, size: usize, flags: usize) -> AxResult<
     if addr != 0 && !addr.is_multiple_of(PAGE_SIZE_4K) {
         return Err(AxError::InvalidInput);
     }
-    let aspace_handle = current().as_thread().proc_data.aspace();
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let aspace_handle = proc_data.aspace();
     let mut aspace = aspace_handle.lock();
     let start = if addr == 0 {
         let total = size
@@ -130,10 +266,14 @@ pub fn sys_map_shadow_stack(addr: usize, size: usize, flags: usize) -> AxResult<
         }
         start
     };
+    if aspace.mapped_bytes_in_range(start, size)? != 0 {
+        return Err(AxError::AlreadyExists);
+    }
+    check_rlimit_as_growth(proc_data, &aspace, size)?;
     aspace.map(
         start,
         size,
-        MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK,
+        MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE | MappingFlags::SHADOW_STACK,
         false,
         Backend::new_alloc(start, PageSize::Size4K),
     )?;
@@ -159,10 +299,10 @@ pub fn sys_map_shadow_stack(addr: usize, size: usize, flags: usize) -> AxResult<
         }
         Ok(start.as_usize() as isize)
     })();
-    if result.is_err() {
-        if let Ok(wake) = aspace.unmap(start, size) {
-            wake.finish();
-        }
+    if result.is_err()
+        && let Ok(wake) = aspace.unmap(start, size)
+    {
+        wake.finish();
     }
     result
 }
@@ -296,6 +436,7 @@ enum PreparedFileMmapBackend {
         file_end: u64,
     },
     SharedAnonymous {
+        pages: Arc<SharedPages>,
         may_protect: MappingFlags,
     },
     Cow {
@@ -308,6 +449,7 @@ enum PreparedFileMmapBackend {
         physical_start: memory_addr::PhysAddr,
         max_size: usize,
     },
+    DeviceSharedPages(Arc<SharedPages>),
 }
 
 fn prepare_file_mmap_backend(
@@ -338,6 +480,8 @@ fn prepare_file_mmap_backend(
             match device.mmap() {
                 DeviceMmap::None => Err(AxError::NoSuchDevice),
                 DeviceMmap::Anonymous => Ok(PreparedFileMmapBackend::SharedAnonymous {
+                    pages: Arc::try_new(SharedPages::new_shmem(*length, page_size)?)
+                        .map_err(|_| AxError::NoMemory)?,
                     may_protect: may_protect_from_file_flags(inner.flags()),
                 }),
                 DeviceMmap::ReadOnly => Ok(PreparedFileMmapBackend::Cow {
@@ -357,6 +501,11 @@ fn prepare_file_mmap_backend(
                         max_size,
                     })
                 }
+                DeviceMmap::SharedPages(pages) if offset == 0 => {
+                    *length = (*length).min(pages.len().saturating_mul(PAGE_SIZE_4K));
+                    Ok(PreparedFileMmapBackend::DeviceSharedPages(pages))
+                }
+                DeviceMmap::SharedPages(_) => Err(AxError::InvalidInput),
                 DeviceMmap::Cache(cache) => Ok(PreparedFileMmapBackend::SharedFile {
                     cache,
                     flags: inner.flags(),
@@ -385,6 +534,11 @@ fn prepare_file_mmap_backend(
                         max_size,
                     })
                 }
+                Some(DeviceMmap::SharedPages(pages)) if offset == 0 => {
+                    *length = (*length).min(pages.len().saturating_mul(PAGE_SIZE_4K));
+                    Ok(PreparedFileMmapBackend::DeviceSharedPages(pages))
+                }
+                Some(DeviceMmap::SharedPages(_)) => Err(AxError::InvalidInput),
                 Some(DeviceMmap::ReadOnly | DeviceMmap::Cache(_)) | None => {
                     Ok(PreparedFileMmapBackend::Cow {
                         file_end: Some(inner.location().len()?),
@@ -451,6 +605,7 @@ fn preflight_mprotect_geometry(
     if !addr.is_multiple_of(PageSize::Size4K as usize) {
         return Err(AxError::InvalidInput);
     }
+    MmapProt::from_bits(prot).ok_or(AxError::InvalidInput)?;
     if length == 0 {
         return Ok(None);
     }
@@ -588,6 +743,10 @@ bitflags::bitflags! {
         const NORESERVE = MAP_NORESERVE as usize;
         /// Allocation is for a stack.
         const STACK = MAP_STACK as usize;
+        /// x86-64 placement constraint for legacy 32-bit pointer consumers.
+        const BIT32 = MAP_32BIT as usize;
+        /// Suppress MAP_POPULATE I/O; the VMA is still installed normally.
+        const NONBLOCK = MAP_NONBLOCK as usize;
         /// Huge page
         const HUGE = MAP_HUGETLB as usize;
         /// Explicit 2 MiB huge-page size.
@@ -638,9 +797,6 @@ pub fn sys_mmap(
             || map_flags.contains(MmapFlags::HUGE))
     {
         return Err(AxError::OperationNotSupported);
-    }
-    if map_flags.contains(MmapFlags::HUGE) && !is_anonymous_mapping {
-        return Err(AxError::InvalidInput);
     }
     if is_anonymous_mapping && offset != 0 {
         return Err(AxError::InvalidInput);
@@ -725,6 +881,34 @@ pub fn sys_mmap(
         (None, None) => None,
         _ => return Err(AxError::BadState),
     };
+    // MAP_HUGETLB on a file is not a request to promote an ordinary file
+    // mapping.  It is admitted only when that exact FileLike has exported a
+    // prevalidated fixed SharedPages plan with the requested huge geometry.
+    // `prepare_mmap` is the typed provider/VFS capability boundary: it owns
+    // page-size, range, sharing, and protection validation before any VMA
+    // lock is acquired.  A normal file therefore retains Linux's EINVAL
+    // result instead of silently receiving an anonymous huge backing.
+    if map_flags.contains(MmapFlags::HUGE)
+        && !is_anonymous_mapping
+        && prepared_file_like_plan.is_none()
+    {
+        return Err(AxError::InvalidInput);
+    }
+    // A regular-file provider can return a fixed SharedPages plan (hugetlbfs
+    // does). Keep a second typed lease for the VFS/LSM and mount-policy
+    // checks below before the generic handle moves into the prepared owner.
+    // Non-VFS fixed providers remain detached from this optional path.
+    let prepared_vfs_file = prepared_file_like_plan
+        .is_some()
+        .then(|| {
+            pinned_fd
+                .as_ref()
+                .expect("a prepared file-like plan retains its pinned fd")
+                .clone()
+                .downcast::<File>()
+                .ok()
+        })
+        .flatten();
     let prepared_fixed_mapping = match prepared_file_like_plan {
         Some(plan) => Some(PreparedFixedSharedMapping::try_new(
             pinned_fd.take().ok_or(AxError::BadState)?,
@@ -747,8 +931,9 @@ pub fn sys_mmap(
 
     // Keep type errors at the historical backend-construction point, but
     // classify the exact OFD pinned above instead of looking up `fd` again.
-    let file = if prepared_fixed_mapping.is_some() {
-        None
+    let has_prepared_fixed_mapping = prepared_fixed_mapping.is_some();
+    let file = if has_prepared_fixed_mapping {
+        prepared_vfs_file
     } else {
         pinned_fd
             .map(|handle| {
@@ -762,30 +947,56 @@ pub fn sys_mmap(
             })
             .transpose()?
     };
-    if map_type != MmapFlags::PRIVATE && permission_flags.contains(MmapProt::WRITE) {
-        if let Some(file) = file.as_ref() {
-            crate::mm::check_not_active(file.inner().location())?;
-        }
+    if map_type != MmapFlags::PRIVATE
+        && permission_flags.contains(MmapProt::WRITE)
+        && let Some(file) = file.as_ref()
+    {
+        crate::mm::check_not_active(file.inner().location())?;
     }
     let filesystem_owner_user_ns = file
         .as_ref()
         .map(|_| initial_user_namespace(actor.user_ns()));
-    let prepared_file_backend = file
-        .as_ref()
-        .map(|file| {
-            prepare_file_mmap_backend(
-                file,
-                map_type,
-                permission_flags,
-                offset,
-                page_size,
-                &mut length,
-            )
-        })
-        .transpose()?;
+    let prepared_file_backend = if has_prepared_fixed_mapping {
+        None
+    } else {
+        file.as_ref()
+            .map(|file| {
+                prepare_file_mmap_backend(
+                    file,
+                    map_type,
+                    permission_flags,
+                    offset,
+                    page_size,
+                    &mut length,
+                )
+            })
+            .transpose()?
+    };
     if length == 0 {
         return Err(AxError::InvalidInput);
     }
+    // Allocate every anonymous shared backing before alias admission.  A
+    // pending registry generation must exist before MAP_FIXED can retire an
+    // old VMA, while the wait for a THP mutation remains lock-external.
+    let prepared_anonymous_shared_pages = match prepared_file_backend.as_ref() {
+        Some(PreparedFileMmapBackend::SharedAnonymous { pages, .. })
+        | Some(PreparedFileMmapBackend::DeviceSharedPages(pages)) => Some(pages.clone()),
+        None if matches!(map_type, MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE) => Some(
+            Arc::try_new(SharedPages::new_shmem(length, page_size)?)
+                .map_err(|_| AxError::NoMemory)?,
+        ),
+        _ => None,
+    };
+    let pending_alias = prepared_fixed_mapping
+        .as_ref()
+        .map(PreparedFixedSharedMapping::shared_backing_key)
+        .or_else(|| {
+            prepared_anonymous_shared_pages
+                .as_ref()
+                .map(|pages| pages.backing_key())
+        })
+        .map(|key| crate::mm::prepare_shared_alias_binding_lock_external(key, &aspace_handle))
+        .transpose()?;
     // READ_IMPLIES_EXEC is suppressed for noexec mounts: Linux leaves such a
     // mapping readable rather than turning the compatibility bit into an
     // executable-map permission failure.
@@ -799,6 +1010,12 @@ pub fn sys_mmap(
         u32::from(read_implies_exec) * READ_IMPLIES_EXEC,
         requested_protection,
     );
+    if proc_data.mdwe() & 1 != 0
+        && effective_protection.contains(MappingFlags::WRITE)
+        && effective_protection.contains(MappingFlags::EXECUTE)
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
     mmap_file(
         actor,
         file.as_ref().map(|file| {
@@ -814,6 +1031,39 @@ pub fn sys_mmap(
         flags,
     )?;
 
+    // Capture pathname and inode identity while the file lease is still
+    // available. Publication happens only after the VMA transaction below
+    // commits, so failed mappings never leak speculative MMAP records.
+    let mut perf_mmap_name = Vec::new();
+    let (perf_mmap_major, perf_mmap_minor, perf_mmap_ino) = if let Some(file) = file.as_ref() {
+        let location = file.inner().location();
+        let path = location.absolute_path()?;
+        perf_mmap_name
+            .try_reserve_exact(path.as_bytes().len())
+            .map_err(|_| AxError::NoMemory)?;
+        perf_mmap_name.extend_from_slice(path.as_bytes());
+        let metadata = location.metadata()?;
+        let device = crate::mounts::linux_device_id(metadata.device);
+        (device.major(), device.minor(), metadata.inode)
+    } else {
+        (0, 0, 0)
+    };
+    let perf_mmap_prot = u32::from(effective_protection.contains(MappingFlags::READ)) * PROT_READ
+        | u32::from(effective_protection.contains(MappingFlags::WRITE)) * PROT_WRITE
+        | u32::from(effective_protection.contains(MappingFlags::EXECUTE)) * PROT_EXEC;
+    let perf_mmap_info = crate::perf_records::MmapInfo {
+        filename: &perf_mmap_name,
+        major: perf_mmap_major,
+        minor: perf_mmap_minor,
+        ino: perf_mmap_ino,
+        // The VFS has no inode-generation field; zero truthfully denotes an
+        // unavailable generation instead of inventing one from ctime.
+        ino_generation: 0,
+        prot: perf_mmap_prot,
+        flags: flags as u32,
+        executable: effective_protection.contains(MappingFlags::EXECUTE),
+    };
+
     if map_flags.contains(MmapFlags::FIXED) && !map_flags.contains(MmapFlags::FIXED_NOREPLACE) {
         // A replacement can cut through a compound shared folio.  Demote the
         // complete alias set before taking this mm's single-map unmap path.
@@ -827,191 +1077,329 @@ pub fn sys_mmap(
     // All file/object-specific validation, VFS access, backing allocation, and
     // deferred-owner allocation has completed. From this point through VMA
     // publication, the fixed shared path only moves prepared resources.
-    let mut aspace = aspace_handle.lock();
-    let mut deferred_uffd_wake = DeferredUffdWake::empty();
-    let outcome = (|| {
-        let start = if map_flags.intersects(MmapFlags::FIXED | MmapFlags::FIXED_NOREPLACE) {
-            let dst_addr = VirtAddr::from(normalized_start);
-            if !aspace.contains_range(dst_addr, length) {
-                return Err(AxError::NoMemory);
-            }
-            dst_addr
-        } else {
-            let align = page_size as usize;
-            find_nonfixed_mmap_area(
-                &aspace,
-                thread.personality(),
-                VirtAddr::from(normalized_start),
-                length,
-                VirtAddrRange::new(aspace.base(), aspace.end()),
-                align,
-            )
-            .ok_or(AxError::NoMemory)?
-        };
-        mmap_addr(
-            actor,
-            authorized_image.owner_user_ns(),
-            &aspace_handle,
-            start,
-        )?;
-
-        let file_mapping = file.map(|file| {
-            let sharing = if map_type == MmapFlags::PRIVATE {
-                FileMappingSharing::Private
+    let _uprobe_topology = crate::uprobe::registration_topology_gate();
+    let (outcome, deferred_uffd_wake) = {
+        let mut aspace = aspace_handle.lock();
+        let mut deferred_uffd_wake = DeferredUffdWake::empty();
+        let outcome = (|| {
+            let start = if map_flags.intersects(MmapFlags::FIXED | MmapFlags::FIXED_NOREPLACE) {
+                let dst_addr = VirtAddr::from(normalized_start);
+                if !aspace.contains_range(dst_addr, length) {
+                    return Err(AxError::NoMemory);
+                }
+                dst_addr
             } else {
-                FileMappingSharing::Shared
-            };
-            let mut may_protect = match sharing {
-                FileMappingSharing::Shared => may_protect_from_file_flags(file.inner().flags()),
-                FileMappingSharing::Private => {
-                    MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE
-                }
-            };
-            if mmap_noexec {
-                may_protect.remove(MappingFlags::EXECUTE);
-            }
-            FileMappingLease::new(
-                file,
-                filesystem_owner_user_ns.expect("file mappings freeze a filesystem owner"),
-                start,
-                offset as u64,
-                effective_protection,
-                may_protect,
-                sharing,
-            )
-        });
-        let backend = if let Some(prepared) = prepared_fixed_mapping {
-            prepared.into_backend(start)
-        } else {
-            match prepared_file_backend {
-                Some(PreparedFileMmapBackend::SharedFile {
-                    cache,
-                    flags,
-                    file_end,
-                }) => {
-                    // TODO(mivik): file mmap page size
-                    Backend::new_file(start, cache, flags, offset, Some(file_end), &aspace_handle)?
-                }
-                Some(PreparedFileMmapBackend::SharedAnonymous { may_protect }) => {
-                    Backend::new_shared_with_may_protect(
-                        start,
-                        Arc::new(SharedPages::new_shmem(length, PageSize::Size4K)?),
-                        may_protect,
+                let align = page_size as usize;
+                let limit = if map_flags.contains(MmapFlags::BIT32) {
+                    // MAP_32BIT has no effect on MAP_FIXED mappings.  For an
+                    // ordinary x86-64 placement Linux restricts the search to
+                    // the first 2 GiB of the user address space.
+                    VirtAddrRange::new(
+                        aspace.base(),
+                        VirtAddr::from(aspace.end().as_usize().min(1usize << 31)),
                     )
-                }
-                Some(PreparedFileMmapBackend::Cow {
-                    location,
-                    file_end,
-                    sigbus_on_eof,
-                }) => Backend::new_cow(
-                    start,
-                    page_size,
-                    location,
-                    offset as u64,
-                    file_end,
-                    sigbus_on_eof,
-                ),
-                Some(PreparedFileMmapBackend::AnonymousCow) => Backend::new_alloc(start, page_size),
-                Some(PreparedFileMmapBackend::Linear {
-                    physical_start,
-                    max_size,
-                }) => Backend::new_linear(start, physical_start, max_size),
-                None if matches!(map_type, MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE) => {
-                    Backend::new_shared(start, Arc::new(SharedPages::new_shmem(length, page_size)?))
-                }
-                None if map_type == MmapFlags::PRIVATE => Backend::new_alloc(start, page_size),
-                None => return Err(AxError::InvalidInput),
+                } else {
+                    VirtAddrRange::new(aspace.base(), aspace.end())
+                };
+                find_nonfixed_mmap_area(
+                    &aspace,
+                    thread.personality(),
+                    VirtAddr::from(normalized_start),
+                    length,
+                    limit,
+                    align,
+                )
+                .ok_or(AxError::NoMemory)?
+            };
+            mmap_addr(
+                actor,
+                authorized_image.owner_user_ns(),
+                &aspace_handle,
+                start,
+            )?;
+
+            let covered = if map_flags.intersects(MmapFlags::FIXED | MmapFlags::FIXED_NOREPLACE) {
+                aspace.mapped_bytes_in_range(start, length)?
+            } else {
+                0
+            };
+            if map_flags.contains(MmapFlags::FIXED_NOREPLACE) && covered != 0 {
+                return Err(AxError::AlreadyExists);
             }
-        };
-        let growdown_private_anon = map_flags.contains(MmapFlags::GROWDOWN)
-            && map_type == MmapFlags::PRIVATE
-            && is_anonymous_mapping;
-        let backend = match file_mapping {
-            Some(file_mapping) => backend.with_file_mapping(file_mapping),
-            None => backend,
-        };
-        let shared_writable_location = (effective_protection.contains(MappingFlags::WRITE)
-            && backend
-                .file_mapping()
-                .is_some_and(|mapping| mapping.sharing() == FileMappingSharing::Shared))
-        .then(|| backend.shared_file_location().cloned())
-        .flatten();
+            let address_space_growth = if map_flags.contains(MmapFlags::FIXED)
+                && !map_flags.contains(MmapFlags::FIXED_NOREPLACE)
+            {
+                length.checked_sub(covered).ok_or(AxError::BadState)?
+            } else {
+                length
+            };
+            check_rlimit_as_growth(proc_data, &aspace, address_space_growth)?;
 
-        let secret_mapping = backend.is_secret();
-        let locked_mapping = secret_mapping
-            || map_flags.contains(MmapFlags::LOCKED)
-            || aspace.locks_future_mappings();
-        if locked_mapping {
-            check_mmap_memlock_limit(proc_data, has_ipc_lock, &aspace, start, length)?;
-        }
-
-        let populate = map_flags.contains(MmapFlags::POPULATE)
-            || map_flags.contains(MmapFlags::LOCKED)
-            || (aspace.locks_future_mappings()
-                && !aspace.locks_future_mappings_on_fault()
-                && !permission_flags.is_empty());
-        let mapping_admission = if shared_writable_location.is_some() {
-            backend.begin_shared_writable_mapping_admission()?
-        } else {
-            None
-        };
-        let privilege_guard = shared_writable_location
-            .as_ref()
-            .map(|location| {
-                crate::mm::check_not_active(location)?;
-                begin_shared_writable_mapping_privilege_cleanup(location)
-            })
-            .transpose()?;
-        if map_flags.contains(MmapFlags::FIXED) && !map_flags.contains(MmapFlags::FIXED_NOREPLACE) {
-            deferred_uffd_wake.merge(aspace.unmap(start, length)?);
-            proc_data.clear_mempolicy_range(start.as_usize(), length);
-        }
-        let best_effort_secret_populate = secret_mapping && populate;
-        let pending_alias = backend
-            .shared_backing_key()
-            .map(|key| aspace.prepare_shared_alias_binding(key, &aspace_handle))
-            .transpose()?
+            let file_mapping = file.map(|file| {
+                let sharing = if map_type == MmapFlags::PRIVATE {
+                    FileMappingSharing::Private
+                } else {
+                    FileMappingSharing::Shared
+                };
+                let mut may_protect = match sharing {
+                    FileMappingSharing::Shared => may_protect_from_file_flags(file.inner().flags()),
+                    FileMappingSharing::Private => {
+                        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE
+                    }
+                };
+                if mmap_noexec {
+                    may_protect.remove(MappingFlags::EXECUTE);
+                }
+                FileMappingLease::new(
+                    file,
+                    filesystem_owner_user_ns.expect("file mappings freeze a filesystem owner"),
+                    start,
+                    offset as u64,
+                    effective_protection,
+                    may_protect,
+                    sharing,
+                )
+            });
+            let backend = if let Some(prepared) = prepared_fixed_mapping {
+                prepared.into_backend(start)
+            } else {
+                match prepared_file_backend {
+                    Some(PreparedFileMmapBackend::SharedFile {
+                        cache,
+                        flags,
+                        file_end,
+                    }) => {
+                        // TODO(mivik): file mmap page size
+                        Backend::new_file(
+                            start,
+                            cache,
+                            flags,
+                            offset,
+                            Some(file_end),
+                            &aspace_handle,
+                        )?
+                    }
+                    Some(PreparedFileMmapBackend::SharedAnonymous { pages, may_protect }) => {
+                        Backend::new_shared_with_may_protect(start, pages, may_protect)
+                    }
+                    Some(PreparedFileMmapBackend::Cow {
+                        location,
+                        file_end,
+                        sigbus_on_eof,
+                    }) => Backend::new_cow(
+                        start,
+                        page_size,
+                        location,
+                        offset as u64,
+                        file_end,
+                        sigbus_on_eof,
+                    ),
+                    Some(PreparedFileMmapBackend::AnonymousCow) => {
+                        Backend::new_alloc(start, page_size)
+                    }
+                    Some(PreparedFileMmapBackend::Linear {
+                        physical_start,
+                        max_size,
+                    }) => Backend::new_linear(start, physical_start, max_size),
+                    Some(PreparedFileMmapBackend::DeviceSharedPages(pages)) => {
+                        Backend::new_shared(start, pages)
+                    }
+                    None if matches!(map_type, MmapFlags::SHARED | MmapFlags::SHARED_VALIDATE) => {
+                        Backend::new_shared(
+                            start,
+                            prepared_anonymous_shared_pages.expect(
+                                "shared anonymous backing was prepared before alias admission",
+                            ),
+                        )
+                    }
+                    None if map_type == MmapFlags::PRIVATE => Backend::new_alloc(start, page_size),
+                    None => return Err(AxError::InvalidInput),
+                }
+            };
+            let growdown_private_anon = map_flags.contains(MmapFlags::GROWDOWN)
+                && map_type == MmapFlags::PRIVATE
+                && is_anonymous_mapping;
+            let backend = match file_mapping {
+                Some(file_mapping) => backend.with_file_mapping(file_mapping),
+                None => backend,
+            };
+            let shared_writable_location = (effective_protection.contains(MappingFlags::WRITE)
+                && backend
+                    .file_mapping()
+                    .is_some_and(|mapping| mapping.sharing() == FileMappingSharing::Shared))
+            .then(|| backend.shared_file_location().cloned())
             .flatten();
-        aspace.map(
-            start,
-            length,
-            effective_protection,
-            populate && !best_effort_secret_populate,
-            backend,
-        )?;
-        if let Some(pending_alias) = pending_alias {
-            aspace.commit_shared_alias_binding(pending_alias);
-        }
-        if let Err(error) = aspace.sync_shared_alias_bindings(&aspace_handle) {
-            // The reverse-map lease is part of publishing a shared mapping:
-            // never expose a new shmem VMA that a later cross-mm collapse
-            // cannot discover.  This VMA was just installed by this syscall,
-            // so rollback cannot retire an unrelated mapping.
-            deferred_uffd_wake.merge(aspace.unmap(start, length)?);
-            return Err(error);
-        }
-        if best_effort_secret_populate {
-            // EOF is a future SIGBUS fault, not an mmap failure.
-            let _ = aspace.populate_area(start, length, effective_protection);
-        }
-        if let Some(admission) = mapping_admission {
-            admission
-                .complete()
-                .expect("writable mapping admission vanished after mmap commit");
-        }
-        drop(privilege_guard);
-        if secret_mapping || map_flags.contains(MmapFlags::LOCKED) {
-            aspace.set_locked(start, length, true)?;
-        }
-        if growdown_private_anon {
-            aspace.mark_growdown(start);
-        }
 
-        Ok(start.as_usize() as isize)
-    })();
-    drop(aspace);
+            let secret_mapping = backend.is_secret();
+            let locked_mapping = secret_mapping
+                || map_flags.contains(MmapFlags::LOCKED)
+                || aspace.locks_future_mappings();
+            if locked_mapping {
+                check_mmap_memlock_limit(proc_data, has_ipc_lock, &aspace, start, length)?;
+            }
+
+            let populate = (map_flags.contains(MmapFlags::POPULATE)
+                && !map_flags.contains(MmapFlags::NONBLOCK))
+                || map_flags.contains(MmapFlags::LOCKED)
+                || (aspace.locks_future_mappings()
+                    && !aspace.locks_future_mappings_on_fault()
+                    && !permission_flags.is_empty());
+            let fixed_replacement = map_flags.contains(MmapFlags::FIXED)
+                && !map_flags.contains(MmapFlags::FIXED_NOREPLACE);
+            // `replace_mapping_fixed_with` obtains its own prepared fixed file
+            // admission while the exact incoming backend is still detached.  An
+            // ordinary WritableMappingAdmission here would activate that same
+            // registration a second time and make a failed replacement leak the
+            // outer activation.  MAP_FIXED_NOREPLACE remains an ordinary map and
+            // therefore keeps the historical admission path.
+            let mapping_admission = if !fixed_replacement && shared_writable_location.is_some() {
+                backend.begin_shared_writable_mapping_admission()?
+            } else {
+                None
+            };
+            let privilege_guard = shared_writable_location
+                .as_ref()
+                .map(|location| {
+                    crate::mm::check_not_active(location)?;
+                    begin_shared_writable_mapping_privilege_cleanup(location)
+                })
+                .transpose()?;
+            // The participant snapshots every uprobe/XOL authority while both
+            // topology and mm gates are held.  Its rollback runs before the
+            // fixed-replacement guard restores old leaves, so a failed MAP_FIXED
+            // cannot lose an old breakpoint, XOL mapping, or USDT counter byte.
+            let mut fixed_uprobe_transition = fixed_replacement.then(|| {
+                crate::uprobe::PreparedFixedUprobeTransition::prepare_or_defer_locked(
+                    &aspace_handle,
+                    &aspace,
+                    start,
+                    length,
+                    &backend,
+                    effective_protection,
+                )
+            });
+            let best_effort_secret_populate = secret_mapping && populate;
+            if fixed_replacement {
+                let participant = fixed_uprobe_transition
+                    .as_mut()
+                    .expect("fixed replacement prepared its uprobe participant");
+                match aspace.replace_mapping_fixed_with(
+                    start,
+                    length,
+                    effective_protection,
+                    backend,
+                    locked_mapping,
+                    participant,
+                ) {
+                    Ok(wake) => deferred_uffd_wake.merge(wake),
+                    Err(error) => {
+                        // The incoming pending alias lease has not committed, but
+                        // the primitive intentionally keeps all old leases until
+                        // its caller ends the transition.  Prune against the
+                        // restored old topology before returning the preserved
+                        // error.
+                        aspace.finish_shared_alias_binding_transition();
+                        return Err(error.into_error());
+                    }
+                }
+                // A fixed replacement is now visible.  Linux clears policy for
+                // the replaced interval only after mmap_region has published it;
+                // preserving the old policy on a rolled-back participant failure
+                // is required for the old mapping to remain indistinguishable.
+                proc_data.clear_mempolicy_range(start.as_usize(), length);
+            } else if let Err(error) = aspace.map(
+                start,
+                length,
+                effective_protection,
+                // File-cache reclaim may need this or another address-space lock.
+                // Install the VMA first, then populate through the lock-external
+                // retry helper below.
+                false,
+                backend,
+            ) {
+                return Err(error);
+            } else {
+                crate::uprobe::install_mapping_best_effort_locked(
+                    &aspace_handle,
+                    &mut aspace,
+                    start,
+                    length,
+                );
+            }
+            if let Some(pending_alias) = pending_alias {
+                aspace.commit_shared_alias_binding(pending_alias);
+            }
+            if fixed_replacement {
+                // `replace_mapping_fixed_with` preserves old reverse-map leases
+                // through the PTE/VMA transaction.  Finish after committing an
+                // incoming lease regardless of whether the new backend itself is
+                // shared, otherwise a fixed replacement from shared to private
+                // leaves a stale old lease behind.
+                aspace.finish_shared_alias_binding_transition();
+            }
+            // VM_LOCKED and grow-down identity are part of the published VMA,
+            // not post-population annotations.  Install them while this exact
+            // mapping is still protected by the address-space mutex; otherwise a
+            // concurrent unmap/replacement during lock-external population could
+            // make us annotate an unrelated successor VMA.
+            if secret_mapping || map_flags.contains(MmapFlags::LOCKED) {
+                aspace.set_locked(start, length, true)?;
+            }
+            if growdown_private_anon {
+                aspace.mark_growdown(start);
+            }
+            if populate && !best_effort_secret_populate {
+                drop(aspace);
+                // Linux publishes mmap first and then invokes mm_populate() after
+                // dropping mmap_lock; mm_populate's fault/allocation result is
+                // intentionally not returned by mmap(2).  In particular, a
+                // MAP_FIXED replacement stays destructive after this point rather
+                // than silently claiming transactional population atomicity.
+                let _ = populate_explicit_with_reclaim(
+                    &aspace_handle,
+                    start,
+                    length,
+                    effective_protection,
+                    |aspace| {
+                        if !aspace.contains_range(start, length)
+                            || !aspace.can_access_range(start, length, effective_protection)
+                        {
+                            return Err(AxError::BadAddress);
+                        }
+                        Ok(())
+                    },
+                );
+                aspace = aspace_handle.lock();
+            }
+            if best_effort_secret_populate {
+                // EOF is a future SIGBUS fault, not an mmap failure.
+                let _ = aspace.populate_area(start, length, effective_protection);
+            }
+            if let Some(admission) = mapping_admission {
+                admission
+                    .complete()
+                    .expect("writable mapping admission vanished after mmap commit");
+            }
+            drop(privilege_guard);
+
+            Ok(start.as_usize() as isize)
+        })();
+        (outcome, deferred_uffd_wake)
+    };
     deferred_uffd_wake.finish();
-    outcome
+    match outcome {
+        Ok(mapped) => {
+            // PERF_RECORD_MMAP/MMAP2 exposes pgoff in pages, not bytes.
+            thread.perf_emit_mmap(
+                mapped as u64,
+                length as u64,
+                (offset / PAGE_SIZE_4K) as u64,
+                &perf_mmap_info,
+            );
+            Ok(mapped)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub fn sys_munmap(addr: usize, length: usize) -> AxResult<isize> {
@@ -1033,19 +1421,14 @@ pub fn sys_munmap(addr: usize, length: usize) -> AxResult<isize> {
     let length = checked_align_up_4k(length).ok_or(AxError::InvalidInput)?;
     let start_addr = VirtAddr::from(addr);
     ensure_4k_granularity_across_aliases(&aspace_handle, start_addr, length)?;
+    let _uprobe_topology = crate::uprobe::registration_topology_gate();
     let mut aspace = aspace_handle.lock();
     let wake = aspace.unmap(start_addr, length)?;
-    #[cfg(target_arch = "x86_64")]
-    let invalidated_cet_owners = aspace.reconcile_cet_default_shadow_stacks();
     proc_data.clear_mempolicy_range(start_addr.as_usize(), length);
+    let reconcile = crate::uprobe::reconcile_mm_locked_gated(&aspace_handle, &mut aspace);
     drop(aspace);
     wake.finish();
-    #[cfg(target_arch = "x86_64")]
-    if invalidated_cet_owners.contains(&thread.kernel_tid()) {
-        // The current task's default VMA was removed through munmap.  Do not
-        // leave the scheduler image pointing at an invalidated PL3_SSP.
-        crate::task::reset_current_user_cet_state();
-    }
+    reconcile?;
     Ok(0)
 }
 
@@ -1115,6 +1498,13 @@ pub fn sys_remap_file_pages(
     )?;
 
     let mut aspace = aspace_handle.lock();
+    if let Some(retry) = aspace.file_eviction_retry_for_range(start_addr, size) {
+        drop(aspace);
+        retry.wait()?;
+        // The source VMA snapshot, MAP_LOCKED observation and LSM decision
+        // must all be revalidated after a cache eviction terminal edge.
+        return sys_remap_file_pages(start, size, prot, pgoff, flags);
+    }
     let (current_flags, current_lease) = aspace.remap_shared_span_snapshot(start_addr, size)?;
     if current_flags != snapshot_flags || current_lease.ofd_key() != lease.ofd_key() {
         return Err(AxError::InvalidInput);
@@ -1134,17 +1524,31 @@ pub fn sys_remap_file_pages(
         start_addr,
         size,
         pgoff,
-        populate,
+        // Commit the replacement first. Cache eviction may synchronously
+        // walk this same mm, so requested population happens lock-external
+        // below after the replacement transaction has finished.
+        false,
     );
     drop(aspace);
     outcome.finish()?;
     if populate {
         // Linux treats post-commit population faults as best-effort here: the
         // fixed alias remains installed even when a later page cannot be
-        // brought resident.
-        let _ = aspace_handle
-            .lock()
-            .populate_area(start_addr, size, snapshot_flags);
+        // brought resident. ResourceBusy is nevertheless not surfaced or
+        // left as a lock-order violation: reclaim and revalidate internally.
+        let _ = populate_explicit_with_reclaim(
+            &aspace_handle,
+            start_addr,
+            size,
+            snapshot_flags,
+            |aspace| {
+                let (current_flags, current_lease) =
+                    aspace.remap_shared_span_snapshot(start_addr, size)?;
+                (current_flags == snapshot_flags && current_lease.ofd_key() == lease.ofd_key())
+                    .then_some(())
+                    .ok_or(AxError::InvalidInput)
+            },
+        );
     }
     Ok(0)
 }
@@ -1162,8 +1566,7 @@ fn sys_mprotect_inner(
     prot: usize,
     requested_pkey: Option<u8>,
 ) -> AxResult<isize> {
-    // TODO: implement PROT_GROWSUP & PROT_GROWSDOWN
-    let Some((length, end_addr)) = preflight_mprotect_geometry(addr, length, prot)? else {
+    let Some((mut length, end_addr)) = preflight_mprotect_geometry(addr, length, prot)? else {
         return Ok(0);
     };
     let Some(permission_flags) = MmapProt::from_bits(prot) else {
@@ -1171,7 +1574,7 @@ fn sys_mprotect_inner(
     };
     debug!("sys_mprotect <= addr: {addr:#x}, length: {length:x}, prot: {permission_flags:?}");
 
-    if permission_flags.intersects(MmapProt::GROWDOWN | MmapProt::GROWSUP) {
+    if permission_flags.contains(MmapProt::GROWSUP) {
         return Err(AxError::InvalidInput);
     }
 
@@ -1179,81 +1582,147 @@ fn sys_mprotect_inner(
     let thread = curr.as_thread();
     let authorized_image = thread.proc_data.thread_image_access_snapshot(thread)?;
     let aspace_handle = authorized_image.aspace().clone();
-    let start_addr = VirtAddr::from(addr);
-    ensure_4k_granularity_across_aliases(&aspace_handle, start_addr, length)?;
-    let mut aspace = aspace_handle.lock();
-    let requested_protection: MappingFlags = permission_flags.into();
-    let pkey_leaves = requested_pkey
-        .map(|_| aspace.preflight_set_pkey(start_addr, length))
-        .transpose()?;
-
-    // Match Linux's per-VMA order: a successful prefix remains protected if a
-    // later VMA is unmapped, disallows the requested protection, or is sealed.
-    // Re-find each VMA after committing because commit may split or merge it.
-    let mut cursor = start_addr;
-    let mut wake = DeferredUffdWake::empty();
-    let outcome = (|| {
-        while cursor < end_addr {
-            let Some(area) = aspace.find_area(cursor) else {
-                return Err(AxError::NoMemory);
-            };
-            if area.start() > cursor {
-                return Err(AxError::NoMemory);
-            }
-            let segment_end = area.end().min(end_addr);
-            let segment_size = segment_end.sub_addr(cursor);
-            let shadow_stack = area.flags().contains(MappingFlags::SHADOW_STACK);
-            // CET leaves are architecturally W=0,D=1; generic mprotect may
-            // retain read access but never convert them into ordinary pages.
-            if shadow_stack && requested_protection != MappingFlags::READ {
-                return Err(AxError::InvalidInput);
-            }
-            let may_execute = area
-                .backend()
-                .file_mapping()
-                .is_none_or(|mapping| mapping.may_protect().contains(MappingFlags::EXECUTE));
-            let mut effective_protection = if may_execute {
-                personality_mmap_protection(thread.personality(), requested_protection)
-            } else {
-                requested_protection
-            }
-            // mprotect changes ordinary permissions but must retain the VMA's
-            // protection-key attribute so a later demand fault or COW leaf
-            // is coloured exactly like the resident mapping.
-            .with_pkey(requested_pkey.unwrap_or_else(|| area.flags().pkey()));
-            if shadow_stack {
-                effective_protection =
-                    (effective_protection - MappingFlags::EXECUTE) | MappingFlags::SHADOW_STACK;
-            }
-            let plan = aspace.prepare_protect(cursor, segment_size, effective_protection)?;
-            let segment_wake = authorize_then_commit(
-                plan,
-                |plan| {
-                    for segment in plan.segments() {
-                        // LSM authorization deliberately precedes the mseal check,
-                        // as it does in Linux's mprotect VMA walk.
-                        file_mprotect(
-                            authorized_image.credential(),
-                            authorized_image.owner_user_ns(),
-                            segment,
-                            requested_protection,
-                            effective_protection,
-                        )?;
-                        if segment.backend().is_sealed() {
-                            return Err(AxError::OperationNotPermitted);
-                        }
-                    }
-                    Ok(())
-                },
-                |plan| commit_shared_writable_protection(plan, effective_protection),
-            )?;
-            wake.merge(segment_wake);
-            cursor = segment_end;
+    let mut start_addr = VirtAddr::from(addr);
+    if permission_flags.contains(MmapProt::GROWDOWN) {
+        let aspace = aspace_handle.lock();
+        start_addr = aspace
+            .growdown_start_containing(start_addr)
+            .ok_or(AxError::InvalidInput)?;
+        // The requested end is retained: PROT_GROWSDOWN extends only the
+        // lower bound, never the user-supplied upper bound.
+        if end_addr <= start_addr {
+            return Err(AxError::InvalidInput);
         }
-        Ok(0)
-    })();
-    if outcome.is_ok() {
-        if let (Some(key), Some(leaves)) = (requested_pkey, pkey_leaves) {
+        length = end_addr.sub_addr(start_addr);
+    }
+    ensure_4k_granularity_across_aliases(&aspace_handle, start_addr, length)?;
+    // This loop begins each permission-changing walk with the address-space
+    // mutex held, so a newly published eviction fence cannot race the test.
+    // The wait is lock-external and the next iteration revalidates every VMA.
+    loop {
+        let uprobe_topology = crate::uprobe::registration_topology_gate();
+        let mut aspace = aspace_handle.lock();
+        if let Some(retry) = aspace.file_eviction_retry_for_range(start_addr, length) {
+            drop(aspace);
+            drop(uprobe_topology);
+            retry.wait()?;
+            continue;
+        }
+        let requested_protection: MappingFlags = permission_flags.into();
+        let pkey_leaves = requested_pkey
+            .map(|_| aspace.preflight_set_pkey(start_addr, length))
+            .transpose()?;
+
+        // Match Linux's per-VMA order: a successful prefix remains protected if a
+        // later VMA is unmapped, disallows the requested protection, or is sealed.
+        // Re-find each VMA after committing because commit may split or merge it.
+        let mut cursor = start_addr;
+        let mut wake = DeferredUffdWake::empty();
+        let outcome = (|| {
+            while cursor < end_addr {
+                let Some(area) = aspace.find_area(cursor) else {
+                    return Err(AxError::NoMemory);
+                };
+                if area.start() > cursor {
+                    return Err(AxError::NoMemory);
+                }
+                let segment_end = area.end().min(end_addr);
+                let segment_size = segment_end.sub_addr(cursor);
+                let original_protection = area.flags();
+                let shadow_stack = area.flags().contains(MappingFlags::SHADOW_STACK);
+                // CET leaves are architecturally W=0,D=1; generic mprotect may
+                // retain read access but never convert them into ordinary pages.
+                // A shadow stack keeps its type across mprotect.  Access can be
+                // reduced to PROT_NONE or PROT_READ, but ordinary WRITE/EXECUTE
+                // permission is never admitted for a SHSTK VMA.
+                if shadow_stack
+                    && requested_protection != MappingFlags::READ
+                    && requested_protection != (MappingFlags::READ | MappingFlags::WRITE)
+                    && !requested_protection.is_empty()
+                {
+                    return Err(AxError::InvalidInput);
+                }
+                let may_execute = area
+                    .backend()
+                    .file_mapping()
+                    .is_none_or(|mapping| mapping.may_protect().contains(MappingFlags::EXECUTE));
+                let may_protect = area.backend().file_mapping().map_or(
+                    MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
+                    |mapping| mapping.may_protect(),
+                );
+                let mut effective_protection = if may_execute {
+                    personality_mmap_protection(thread.personality(), requested_protection)
+                } else {
+                    requested_protection
+                }
+                // mprotect changes ordinary permissions but must retain the VMA's
+                // protection-key attribute so a later demand fault or COW leaf
+                // is coloured exactly like the resident mapping.
+                .with_pkey(requested_pkey.unwrap_or_else(|| area.flags().pkey()));
+                if shadow_stack {
+                    effective_protection =
+                        (effective_protection - MappingFlags::EXECUTE) | MappingFlags::SHADOW_STACK;
+                }
+                if mdwe_refuses_execute_gain(
+                    &thread.proc_data,
+                    area.flags(),
+                    effective_protection,
+                    may_protect,
+                ) {
+                    return Err(AxError::OperationNotPermitted);
+                }
+                let plan = aspace.prepare_protect(cursor, segment_size, effective_protection)?;
+                let segment_wake = authorize_then_commit(
+                    plan,
+                    |plan| {
+                        for segment in plan.segments() {
+                            // LSM authorization deliberately precedes the mseal check,
+                            // as it does in Linux's mprotect VMA walk.
+                            file_mprotect(
+                                authorized_image.credential(),
+                                authorized_image.owner_user_ns(),
+                                segment,
+                                requested_protection,
+                                effective_protection,
+                            )?;
+                            if segment.backend().is_sealed() {
+                                return Err(AxError::OperationNotPermitted);
+                            }
+                        }
+                        Ok(())
+                    },
+                    |plan| commit_shared_writable_protection(plan, effective_protection),
+                )?;
+                wake.merge(segment_wake);
+                if effective_protection.contains(MappingFlags::WRITE) {
+                    // mprotect has just installed writable PTEs for this
+                    // exact committed span. Consume any MADV_FREE generation
+                    // now; waiting for a write fault would be too late.
+                    aspace.consume_madvise_free_write_range(cursor, segment_size);
+                }
+                if let Err(error) =
+                    crate::uprobe::reconcile_mm_locked_gated(&aspace_handle, &mut aspace)
+                {
+                    // A permission gain may not become visible without its
+                    // registered breakpoint set. Revert only this segment;
+                    // earlier Linux-style successful prefixes were already
+                    // reconciled before their commit edge advanced.
+                    let rollback =
+                        aspace.prepare_protect(cursor, segment_size, original_protection)?;
+                    wake.merge(rollback.commit()?);
+                    // Best effort retires any partial probe installation. If
+                    // it still cannot complete, the original non-executable
+                    // permission remains the fail-closed execution boundary.
+                    let _ = crate::uprobe::reconcile_mm_locked_gated(&aspace_handle, &mut aspace);
+                    return Err(error);
+                }
+                cursor = segment_end;
+            }
+            Ok(0)
+        })();
+        if outcome.is_ok()
+            && let (Some(key), Some(leaves)) = (requested_pkey, pkey_leaves)
+        {
             let pkey = axhal::paging::Pkey::new(key).expect("validated pkey");
             let mut pt = aspace.page_table_mut().cursor();
             for (vaddr, ..) in leaves {
@@ -1263,10 +1732,12 @@ fn sys_mprotect_inner(
             drop(pt);
             aspace.synchronize_pte_mutation();
         }
+        drop(aspace);
+        wake.finish();
+        let result = outcome?;
+        drop(uprobe_topology);
+        return Ok(result);
     }
-    drop(aspace);
-    wake.finish();
-    outcome
 }
 
 /// Linux x86 `pkey_mprotect(2)`.  Key validation happens before the ordinary
@@ -1301,52 +1772,121 @@ pub fn sys_pkey_mprotect(addr: usize, length: usize, prot: usize, pkey: i32) -> 
     // range before the one prepared commit.
     let authorized_image = thread.proc_data.thread_image_access_snapshot(thread)?;
     let aspace_handle = authorized_image.aspace().clone();
-    let mut aspace = aspace_handle.lock();
     let start = VirtAddr::from(addr);
-    let leaves = aspace.preflight_set_pkey(start, length)?;
-    let mut demotion = aspace.prepare_pkey_demotion(start, length)?;
-    let requested: MappingFlags = permission_flags.into();
-    let plan = aspace.prepare_pkey_protect(
-        start,
-        length,
-        requested,
-        pkey as u8,
-        thread.personality() & READ_IMPLIES_EXEC != 0,
-    )?;
-    for segment in plan.segments() {
-        file_mprotect(
-            authorized_image.credential(),
-            authorized_image.owner_user_ns(),
-            segment,
-            requested,
-            segment.new_flags(),
-        )?;
-        if segment.backend().is_sealed() {
-            return Err(AxError::OperationNotPermitted);
+    loop {
+        let uprobe_topology = crate::uprobe::registration_topology_gate();
+        let mut aspace = aspace_handle.lock();
+        if let Some(retry) = aspace.file_eviction_retry_for_range(start, length) {
+            drop(aspace);
+            drop(uprobe_topology);
+            retry.wait()?;
+            continue;
         }
+        aspace.reject_special_mapping_mutation(start, length)?;
+        let leaves = aspace.preflight_set_pkey(start, length)?;
+        let mut demotion = aspace.prepare_pkey_demotion(start, length)?;
+        let requested: MappingFlags = permission_flags.into();
+        let plan = aspace.prepare_pkey_protect(
+            start,
+            length,
+            requested,
+            pkey as u8,
+            thread.personality() & READ_IMPLIES_EXEC != 0,
+        )?;
+        let mut exec_gains = Vec::new();
+        exec_gains
+            .try_reserve(plan.segments().count())
+            .map_err(|_| AxError::NoMemory)?;
+        for segment in plan.segments() {
+            let may_protect = segment.backend().file_mapping().map_or(
+                MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
+                |mapping| mapping.may_protect(),
+            );
+            if mdwe_refuses_execute_gain(
+                &thread.proc_data,
+                segment.flags(),
+                segment.new_flags(),
+                may_protect,
+            ) {
+                return Err(AxError::OperationNotPermitted);
+            }
+            file_mprotect(
+                authorized_image.credential(),
+                authorized_image.owner_user_ns(),
+                segment,
+                requested,
+                segment.new_flags(),
+            )?;
+            if segment.backend().is_sealed() {
+                return Err(AxError::OperationNotPermitted);
+            }
+            if segment.new_flags().contains(MappingFlags::EXECUTE)
+                && !segment.flags().contains(MappingFlags::EXECUTE)
+            {
+                exec_gains.push(segment.affected());
+            }
+        }
+        // The authorization plan borrows the VMA tree. Drop it before the
+        // projected-probe transaction, then rebuild the identical protection
+        // plan under the same mm/topology/credential gates.
+        drop(plan);
+        for range in exec_gains {
+            if let Err(error) = crate::uprobe::install_projected_exec_mapping_locked(
+                &aspace_handle,
+                &mut aspace,
+                range.start,
+                range.end.sub_addr(range.start),
+            ) {
+                let _ = crate::uprobe::reconcile_mm_locked_gated(&aspace_handle, &mut aspace);
+                return Err(error);
+            }
+        }
+        let plan = aspace.prepare_pkey_protect(
+            start,
+            length,
+            requested,
+            pkey as u8,
+            thread.personality() & READ_IMPLIES_EXEC != 0,
+        )?;
+        let key = axhal::paging::Pkey::new(pkey as u8).expect("validated pkey");
+        let wake = match commit_shared_writable_pkey_protection(plan, requested, &mut demotion, key)
+        {
+            Ok(wake) => wake,
+            Err(error) => {
+                let _ = crate::uprobe::reconcile_mm_locked_gated(&aspace_handle, &mut aspace);
+                return Err(error);
+            }
+        };
+        if requested.contains(MappingFlags::WRITE) {
+            aspace.consume_madvise_free_write_range(start, length);
+        }
+        let mut pt = aspace.page_table_mut().cursor();
+        for &(vaddr, ..) in &leaves {
+            pt.set_pkey(vaddr, key)
+                .expect("preflighted pkey leaf must remain mapped");
+        }
+        drop(pt);
+        // `leaves` contains each original huge leaf once. The prepared demotion
+        // has already set all P1 children above; repeating its first child here
+        // is harmless and keeps fully covered huge leaves on the same path.
+        aspace.synchronize_pte_mutation();
+        if crate::uprobe::reconcile_mm_locked_gated(&aspace_handle, &mut aspace).is_err() {
+            // Every newly executable segment already owns its complete probe
+            // set. Remaining stale-counter/retirement work stays registry-owned
+            // and is retried in task context without changing syscall outcome.
+            crate::deferred_work::wake_uprobe_restore_worker();
+        }
+        drop(aspace);
+        wake.finish();
+        drop(uprobe_topology);
+        return Ok(0);
     }
-    let key = axhal::paging::Pkey::new(pkey as u8).expect("validated pkey");
-    let wake = commit_shared_writable_pkey_protection(plan, requested, &mut demotion, key)?;
-    let mut pt = aspace.page_table_mut().cursor();
-    for (vaddr, ..) in leaves {
-        pt.set_pkey(vaddr, key)
-            .expect("preflighted pkey leaf must remain mapped");
-    }
-    drop(pt);
-    // `leaves` contains each original huge leaf once. The prepared demotion
-    // has already set all P1 children above; repeating its first child here
-    // is harmless and keeps fully covered huge leaves on the same path.
-    aspace.synchronize_pte_mutation();
-    drop(aspace);
-    wake.finish();
-    Ok(0)
 }
 
 /// Linux x86 `pkey_alloc(2)`.  Only the two PKRU access-disable bits are
 /// accepted, and allocation always chooses the lowest free nonzero key.
 pub fn sys_pkey_alloc(flags: u32, access_rights: u32) -> AxResult<isize> {
-    const PKEY_ACCESS_MASK: u32 = 0x3;
-    if flags != 0 || access_rights & !PKEY_ACCESS_MASK != 0 {
+    if flags != 0 {
         return Err(AxError::InvalidInput);
     }
     if !axhal::asm::pkeys_enabled() {
@@ -1355,7 +1895,15 @@ pub fn sys_pkey_alloc(flags: u32, access_rights: u32) -> AxResult<isize> {
     let curr = current();
     let thread = curr.as_thread();
     let key = thread.proc_data.allocate_pkey()?;
-    if let Err(error) = thread.set_pkey_access_rights(key, access_rights) {
+    let plan = PkeyPlan::new(key, access_rights).map_err(|error| match error {
+        ArchPolicyError::InvalidPkeyRights
+        | ArchPolicyError::InvalidPkey
+        | ArchPolicyError::DefaultPkey => AxError::InvalidInput,
+        _ => AxError::InvalidInput,
+    });
+    if let Err(error) =
+        plan.and_then(|plan| thread.set_pkey_access_rights(plan.key(), plan.rights()))
+    {
         // Allocation and PKRU initialization are one syscall transaction.
         thread
             .proc_data
@@ -1386,7 +1934,7 @@ pub fn sys_mremap(
          {flags:#x}, new_addr: {new_addr:#x}"
     );
 
-    const SUPPORTED_FLAGS: u32 = MREMAP_MAYMOVE | MREMAP_FIXED;
+    const SUPPORTED_FLAGS: u32 = MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP;
     if !addr.is_multiple_of(PageSize::Size4K as usize) || new_size == 0 {
         return Err(AxError::InvalidInput);
     }
@@ -1396,35 +1944,37 @@ pub fn sys_mremap(
 
     let may_move = flags & MREMAP_MAYMOVE != 0;
     let fixed = flags & MREMAP_FIXED != 0;
+    let dont_unmap = flags & MREMAP_DONTUNMAP != 0;
     if fixed && !may_move {
+        return Err(AxError::InvalidInput);
+    }
+    if fixed && !new_addr.is_multiple_of(PageSize::Size4K as usize) {
+        return Err(AxError::InvalidInput);
+    }
+    if dont_unmap && !may_move {
         return Err(AxError::InvalidInput);
     }
 
     let curr = current();
     let thread = curr.as_thread();
     let proc_data = &thread.proc_data;
-    #[cfg(target_arch = "x86_64")]
-    {
-        let old_len = checked_align_up_4k(old_size).ok_or(AxError::InvalidInput)?;
-        let new_len = checked_align_up_4k(new_size).ok_or(AxError::InvalidInput)?;
-        let aspace = proc_data.aspace();
-        let aspace = aspace.lock();
-        if aspace.cet_default_shadow_stack_intersects(VirtAddr::from(addr), old_len)
-            || (fixed
-                && aspace.cet_default_shadow_stack_intersects(VirtAddr::from(new_addr), new_len))
-        {
-            return Err(AxError::OperationNotPermitted);
-        }
-    }
     let has_ipc_lock = thread.has_effective_capability(CAP_IPC_LOCK);
+    let old_size = checked_align_up_4k(old_size).ok_or(AxError::InvalidInput)?;
+    let new_size = checked_align_up_4k(new_size).ok_or(AxError::InvalidInput)?;
+    // Linux compares the page-rounded lengths.  Byte lengths which differ
+    // inside the same final page are therefore a valid DONTUNMAP duplicate.
+    if dont_unmap && old_size != new_size {
+        return Err(AxError::InvalidInput);
+    }
     remap_user_mapping(
         proc_data,
         has_ipc_lock,
         VirtAddr::from(addr),
-        checked_align_up_4k(old_size).ok_or(AxError::InvalidInput)?,
-        checked_align_up_4k(new_size).ok_or(AxError::InvalidInput)?,
+        old_size,
+        new_size,
         may_move,
         fixed,
+        dont_unmap,
         VirtAddr::from(new_addr),
     )
 }
@@ -1461,6 +2011,7 @@ fn madvise_discard_behavior(advice: u32) -> bool {
             | MADV_REMOVE
             | MADV_DONTFORK
             | MADV_WIPEONFORK
+            | MADV_GUARD_INSTALL
     )
 }
 
@@ -1469,7 +2020,7 @@ fn madvise_discard_behavior(advice: u32) -> bool {
 /// current-task lookup: `process_madvise` must retain the pidfd image it
 /// authorized rather than switching the current address-space context.
 pub(crate) fn process_madvise_willneed(
-    aspace: &mut AddrSpace,
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
     addr: usize,
     length: usize,
 ) -> AxResult {
@@ -1482,21 +2033,31 @@ pub(crate) fn process_madvise_willneed(
     let (start, length) = validate_page_aligned_range(addr, length)?;
     let end = start + length;
     let mut cursor = start;
-
-    // Linux applies advice to the mapped prefix and reports ENOMEM only on
-    // reaching a hole.  Do not preflight the complete range: that would
-    // incorrectly discard useful file-cache work before a later hole.
     while cursor < end {
-        let Some(area) = aspace.find_area(cursor) else {
-            return Err(AxError::NoMemory);
+        // Retain at most one exact VMA segment at a time.  This both avoids a
+        // fallible unbounded snapshot and leaves the mm unlocked while normal
+        // cache replacement may prepare reverse-map eviction reservations.
+        let segment = {
+            let aspace = aspace_handle.lock();
+            let Some(area) = aspace.find_area(cursor) else {
+                return Err(AxError::NoMemory);
+            };
+            if area.start() > cursor {
+                return Err(AxError::NoMemory);
+            }
+            let segment_end = area.end().min(end);
+            (
+                area.backend().clone(),
+                VirtAddrRange::new(cursor, segment_end),
+                segment_end,
+            )
         };
-        if area.start() > cursor {
-            return Err(AxError::NoMemory);
-        }
-        let area_end = area.end().min(end);
-        let backend = area.backend().clone();
-        backend.prefetch_file_backed(VirtAddrRange::new(cursor, area_end), aspace)?;
-        cursor = area_end;
+        let (backend, range, segment_end) = segment;
+        // Backing I/O and cache pressure are advisory, but do not turn a full
+        // cache into a skipped load: backend prefetch uses the normal cache
+        // insertion/replacement path after the mm lock is dropped.
+        let _ = backend.prefetch_file_backed(range);
+        cursor = segment_end;
     }
     Ok(())
 }
@@ -1517,6 +2078,33 @@ pub(crate) fn process_madvise_cold(aspace: &mut AddrSpace, addr: usize, length: 
     })
 }
 
+/// Linux permits file-page eviction only when the caller could write the
+/// inode or owns it (including namespace-relative CAP_FOWNER).  A retained
+/// mapping lease supplies the exact OFD and mount idmap even after fd close or
+/// setns; permission failures make PAGEOUT a no-op for that file VMA rather
+/// than an error visible to the caller.
+fn file_pageout_authorized(backend: &Backend) -> bool {
+    let Some(mapping) = backend.file_mapping() else {
+        return false;
+    };
+    let file = mapping.file();
+    let location = file.inner().location();
+    let Ok(metadata) = location.metadata() else {
+        return false;
+    };
+    let security = current_vfs_security();
+    let idmap = file.vfs_mount_idmap();
+    inode_flags::owner_or_capable_with_idmap(&metadata, &security, idmap.as_deref())
+        || check_inode_permissions_with_security_and_idmap(
+            location,
+            &metadata,
+            W_OK,
+            &security,
+            idmap.as_deref(),
+        )
+        .is_ok()
+}
+
 /// Collects file-cache eviction work while the target VMA layout is stable.
 /// The caller must run the returned work only after dropping the address-space
 /// lock: cache eviction listeners need to detach aliases from that same mm.
@@ -1527,16 +2115,29 @@ pub(crate) fn process_madvise_collect_pageout(
     work: &mut Vec<(Backend, VirtAddrRange)>,
 ) -> AxResult {
     process_madvise_walk(aspace, addr, length, true, |aspace, backend, range| {
+        let file_backed = backend.has_file_cache_backing();
+        let file_pageout_allowed = file_backed && file_pageout_authorized(&backend);
+        // Linux returns success without touching a shared file VMA when the
+        // actor lacks file-page eviction authority. Private mappings may
+        // still demote their process-private COW leaves, but may not use that
+        // path to evict the retained source inode's cache.
+        if file_backed
+            && backend
+                .file_mapping()
+                .is_some_and(|mapping| mapping.sharing() == FileMappingSharing::Shared)
+            && !file_pageout_allowed
+        {
+            return Ok(());
+        }
         // PAGEOUT first demotes resident PTEs. Without swap this is the
         // Linux outcome for private anonymous and shmem leaves: retain data
         // and make it reclaim-eligible, rather than falsely discarding it or
         // rejecting an otherwise valid advisory request.
         aspace.cold_resident_pages(range)?;
-        // File-private COW mappings retain their source cache separately from
-        // their anonymous leaves and therefore need the same PAGEOUT work as
-        // shared file mappings. Anonymous/shmem leaves have no swap target,
-        // so their completed PTE demotion is the real no-swap result.
-        if backend.has_file_cache_backing() {
+        // Only shared file PTEs alias an inode cache page. MAP_PRIVATE COW
+        // pages have already been demoted above but must not turn PAGEOUT
+        // into a source-cache eviction of their original file bytes.
+        if file_pageout_allowed && matches!(backend, Backend::File(_)) {
             work.try_reserve(1).map_err(|_| AxError::NoMemory)?;
             work.push((backend, range));
         }
@@ -1592,6 +2193,33 @@ fn process_madvise_walk(
 /// folio.  A normal alias-preserving PMD can be expanded under one mm lock,
 /// but a `SharedPages` folio owns replacement frames for every alias and must
 /// be demoted as one cross-mm transaction.
+const ALIAS_GRANULARITY_CHUNK: usize = PageSize::Size2M as usize;
+
+fn first_alias_granularity_chunk(start: VirtAddr, aspace_base: VirtAddr) -> AxResult<VirtAddr> {
+    let align_down =
+        |address: VirtAddr| VirtAddr::from(address.as_usize() & !(ALIAS_GRANULARITY_CHUNK - 1));
+    let align_up = |address: VirtAddr| {
+        address
+            .as_usize()
+            .checked_add(ALIAS_GRANULARITY_CHUNK - 1)
+            .map(|address| VirtAddr::from(address & !(ALIAS_GRANULARITY_CHUNK - 1)))
+            .ok_or(AxError::InvalidInput)
+    };
+
+    Ok(align_down(start).max(align_up(aspace_base)?))
+}
+
+fn alias_granularity_chunk_fits(
+    chunk_start: VirtAddr,
+    request_end: VirtAddr,
+    aspace_end: VirtAddr,
+) -> bool {
+    chunk_start < request_end
+        && chunk_start
+            .checked_add(ALIAS_GRANULARITY_CHUNK)
+            .is_some_and(|chunk_end| chunk_end <= aspace_end)
+}
+
 pub(crate) fn ensure_4k_granularity_across_aliases(
     aspace_handle: &Arc<axsync::Mutex<AddrSpace>>,
     start: VirtAddr,
@@ -1601,8 +2229,12 @@ pub(crate) fn ensure_4k_granularity_across_aliases(
         return Ok(());
     }
     let end = start.checked_add(length).ok_or(AxError::InvalidInput)?;
-    let mut cursor = VirtAddr::from(start.as_usize() & !(PageSize::Size2M as usize - 1));
-    while cursor < end {
+    let (aspace_base, aspace_end) = {
+        let aspace = aspace_handle.lock();
+        (aspace.base(), aspace.end())
+    };
+    let mut cursor = first_alias_granularity_chunk(start, aspace_base)?;
+    while alias_granularity_chunk_fits(cursor, end, aspace_end) {
         let compound = {
             let aspace = aspace_handle.lock();
             match (
@@ -1626,12 +2258,21 @@ pub(crate) fn ensure_4k_granularity_across_aliases(
         if let Some((pages, start_index)) = compound {
             demote_shared_folio_across_aliases(aspace_handle, pages, start_index)?;
         } else {
-            aspace_handle
-                .lock()
-                .ensure_4k_granularity(cursor, PageSize::Size2M as usize)?;
+            let mut aspace = aspace_handle.lock();
+            // This helper is used before several permission and remap
+            // transactions.  Close its own probe-to-mutation gap rather than
+            // relying on every caller to remember a second fence check.
+            if let Some(retry) =
+                aspace.file_eviction_retry_for_range(cursor, ALIAS_GRANULARITY_CHUNK)
+            {
+                drop(aspace);
+                retry.wait()?;
+                continue;
+            }
+            aspace.ensure_4k_granularity(cursor, ALIAS_GRANULARITY_CHUNK)?;
         }
         cursor = cursor
-            .checked_add(PageSize::Size2M as usize)
+            .checked_add(ALIAS_GRANULARITY_CHUNK)
             .ok_or(AxError::InvalidInput)?;
     }
     Ok(())
@@ -1669,6 +2310,16 @@ fn demote_shared_folio_across_aliases(
         guards.push(participant.lock());
     }
 
+    demote_shared_folio_locked(&pages, start_index, &mut guards)
+}
+
+/// Demotes one promoted shmem folio while the caller owns the backing's alias
+/// mutation reservation and every participant mm lock.
+fn demote_shared_folio_locked(
+    pages: &Arc<SharedPages>,
+    start_index: usize,
+    guards: &mut [axsync::MutexGuard<'_, AddrSpace>],
+) -> AxResult<()> {
     // Snapshot every fallible backing resource before touching any PTE.  The
     // old 4 KiB frames remain folio-owned until the final commit.
     let frames = pages.demote_4k_folio_frames(start_index)?;
@@ -1692,8 +2343,7 @@ fn demote_shared_folio_across_aliases(
         tables.push(PreparedPageTableFrames::try_new(1).map_err(|_| AxError::NoMemory)?);
     }
 
-    let mut protected = 0usize;
-    for &(guard_index, alias_start, flags) in &plans {
+    for (protected, &(guard_index, alias_start, flags)) in plans.iter().enumerate() {
         if let Err(error) =
             guards[guard_index].write_protect_shared_folio_demotion_2m(alias_start, flags)
         {
@@ -1706,7 +2356,6 @@ fn demote_shared_folio_across_aliases(
             }
             return Err(error);
         }
-        protected += 1;
     }
 
     let mut published = Vec::new();
@@ -1753,6 +2402,89 @@ fn demote_shared_folio_across_aliases(
     Ok(())
 }
 
+/// Creates a sparse anonymous-shmem hole across every address space alias.
+/// Alias publication is frozen, every participant mm is locked in stable ID
+/// order, all PTEs are detached and globally invalidated, and only then are
+/// resident frames returned to the allocator.  Thus no CPU can retain a
+/// writable translation to a freed page and a concurrent fault cannot
+/// repopulate the backing between invalidation and hole publication.
+fn remove_anonymous_shared_across_aliases(
+    target: &Arc<axsync::Mutex<AddrSpace>>,
+    pages: Arc<SharedPages>,
+    offset: usize,
+    length: usize,
+) -> AxResult<()> {
+    let end = offset.checked_add(length).ok_or(AxError::InvalidInput)?;
+    let (_mutation, aliases) = crate::mm::reserve_alias_mutation(pages.backing_key());
+    let mut participants = aliases
+        .into_iter()
+        .filter_map(|alias| {
+            alias
+                .revalidate()
+                .map(|aspace| (alias.address_space_id(), aspace))
+        })
+        .collect::<Vec<_>>();
+    let target_id = target.lock().address_space_id();
+    if !participants
+        .iter()
+        .any(|(_, aspace)| Arc::ptr_eq(aspace, target))
+    {
+        participants.push((target_id, target.clone()));
+    }
+    participants.sort_unstable_by_key(|(id, _)| *id);
+    participants.dedup_by(|(_, left), (_, right)| Arc::ptr_eq(left, right));
+
+    let mut guards = Vec::new();
+    guards
+        .try_reserve_exact(participants.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for (_, participant) in &participants {
+        guards.push(participant.lock());
+    }
+
+    // Keep the same alias reservation and mm lock set from demotion through
+    // hole publication. A concurrent collapse therefore cannot recreate a
+    // folio after demotion but before PTE detachment.
+    let folio_bytes = PageSize::Size2M as usize;
+    let mut folio_offset = offset / folio_bytes * folio_bytes;
+    while folio_offset < end {
+        let start_index = folio_offset / PAGE_SIZE_4K;
+        if pages.has_4k_folio(start_index) {
+            demote_shared_folio_locked(&pages, start_index, &mut guards)?;
+        }
+        folio_offset = folio_offset
+            .checked_add(folio_bytes)
+            .ok_or(AxError::InvalidInput)?;
+    }
+
+    // Allocate and preflight every participant plan before the first PTE is
+    // changed. After this boundary drain_present_leaves is a validated,
+    // allocation-reserved operation.
+    let mut plans = Vec::new();
+    plans
+        .try_reserve_exact(guards.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for guard in &guards {
+        let ranges = guard.shared_backing_alias_ranges(&pages, offset, length)?;
+        guard.preflight_shared_backing_detach(&ranges)?;
+        plans.push(ranges);
+    }
+
+    let mut changed = Vec::new();
+    changed
+        .try_reserve_exact(guards.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for (guard, ranges) in guards.iter_mut().zip(&plans) {
+        changed.push(guard.detach_preflighted_shared_backing_ranges(ranges)?);
+    }
+    for (guard, changed) in guards.iter_mut().zip(changed) {
+        if changed {
+            drop(guard.synchronize_tlb_after_mutation());
+        }
+    }
+    pages.remove_range(offset, length)
+}
+
 /// Returns the PMD-aligned subrange fully contained in a page-rounded
 /// MADV_COLLAPSE request.  `None` is a valid no-op when no full PMD fits.
 fn collapse_full_pmd_range(addr: usize, length: usize) -> AxResult<Option<(usize, usize)>> {
@@ -1781,8 +2513,28 @@ pub(crate) fn process_madvise_collapse(
     addr: usize,
     length: usize,
 ) -> AxResult {
+    // A huge collapse replaces 4 KiB alias PTEs with one compound mapping.
+    // Do not race a pageout fence; restart participant discovery after the
+    // terminal cache edge so every alias set is revalidated.
+    let retry = {
+        let aspace = aspace_handle.lock();
+        aspace.file_eviction_retry_for_range(VirtAddr::from(addr), length)
+    };
+    if let Some(retry) = retry {
+        retry.wait()?;
+        return process_madvise_collapse(aspace_handle, addr, length);
+    }
     let shared_key = {
         let aspace = aspace_handle.lock();
+        // The first probe above is deliberately lock-external while waiting.
+        // Recheck after acquiring the lock used for participant discovery: an
+        // eviction can publish in that gap, and collapse would otherwise
+        // replace its write-protected 4KiB aliases with a new huge leaf.
+        if let Some(retry) = aspace.file_eviction_retry_for_range(VirtAddr::from(addr), length) {
+            drop(aspace);
+            retry.wait()?;
+            return process_madvise_collapse(aspace_handle, addr, length);
+        }
         let Some((mut cursor, end)) = collapse_full_pmd_range(addr, length)? else {
             return Ok(());
         };
@@ -1842,6 +2594,105 @@ pub(crate) fn process_madvise_collapse(
     process_madvise_collapse_locked(&mut aspace, addr, length)
 }
 
+fn restore_shared_collapse_source_permissions(
+    guards: &mut [axsync::MutexGuard<'_, AddrSpace>],
+    target_index: usize,
+    start: VirtAddr,
+    target_flags: MappingFlags,
+    redirects: &[Vec<SharedFolioPteRedirect>],
+    pmd_sources: &[(usize, VirtAddr, MappingFlags)],
+) -> AxResult {
+    // Restoration is best-effort across every participant even if one page
+    // table reports an invariant failure.  Returning after the first error
+    // would strand unrelated aliases read-only and make a later retry observe
+    // a topology created by only half of this transaction.
+    let mut first_error = None;
+    for &(guard_index, pmd_start, pmd_flags) in pmd_sources {
+        if let Err(error) =
+            guards[guard_index].restore_shared_folio_demotion_pmd_permissions(pmd_start, pmd_flags)
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    for (guard_index, redirect) in redirects.iter().enumerate() {
+        if let Err(error) = guards[guard_index].restore_shared_folio_redirect_permissions(redirect)
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    if let Err(error) =
+        guards[target_index].restore_shared_folio_permissions_2m(start, target_flags)
+    {
+        first_error.get_or_insert(error);
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Rolls a promoted shared-folio transaction back without exposing a writable
+/// old alias while the folio is copied into its retained base pages.
+fn rollback_shared_collapse_after_promotion(
+    guards: &mut [axsync::MutexGuard<'_, AddrSpace>],
+    target_index: usize,
+    start: VirtAddr,
+    target_flags: MappingFlags,
+    redirects: &[Vec<SharedFolioPteRedirect>],
+    pmd_sources: &[(usize, VirtAddr, MappingFlags)],
+    redirected_guards: usize,
+    target_replacement: Option<SharedFolioPteReplacement>,
+    pmd_published: &mut Vec<(usize, SharedFolioDemotionReplacement)>,
+    pages: &Arc<SharedPages>,
+    start_index: usize,
+    newly_promoted: bool,
+) -> AxResult {
+    let mut first_error = None;
+
+    // First put every published translation back on the old backing, but
+    // retain the write revocation established before promotion.
+    for rollback in (0..redirected_guards).rev() {
+        if let Err(error) = guards[rollback].rollback_shared_folio_redirects(&redirects[rollback]) {
+            first_error.get_or_insert(error);
+        }
+    }
+    for (guard_index, replacement) in pmd_published.drain(..).rev() {
+        if let Err(error) =
+            guards[guard_index].rollback_shared_folio_demotion_2m_protected(replacement)
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    if let Some(replacement) = target_replacement {
+        if let Err(error) = guards[target_index].rollback_shared_folio_collapse_2m(replacement) {
+            first_error.get_or_insert(error);
+        }
+    }
+
+    // Close every stale writable/new-backing translation before changing
+    // backing ownership.  If page-table rollback itself failed, fail closed:
+    // the folio still owns both representations and all admitted aliases stay
+    // read-only instead of copying through an unknown live mapping.
+    for guard in guards.iter_mut() {
+        drop(guard.synchronize_tlb_after_mutation());
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    if newly_promoted {
+        pages.demote_4k_folio(start_index)?;
+    }
+
+    // Only the backing transition above makes the old frames authoritative
+    // again.  WRITE restoration is therefore the final rollback phase.
+    restore_shared_collapse_source_permissions(
+        guards,
+        target_index,
+        start,
+        target_flags,
+        redirects,
+        pmd_sources,
+    )
+}
+
 fn process_madvise_collapse_shared_locked(
     guards: &mut [axsync::MutexGuard<'_, AddrSpace>],
     target_index: usize,
@@ -1881,65 +2732,227 @@ fn process_madvise_collapse_shared_locked(
         if pages.is_fixed() {
             return Err(AxError::InvalidInput);
         }
-        let mut plans = Vec::new();
-        for (guard_index, guard) in guards.iter().enumerate() {
-            for alias_start in guard.shared_folio_alias_starts(&pages, start_index)? {
-                let flags =
-                    guard.preflight_shared_folio_collapse_2m(alias_start, &pages, start_index)?;
-                plans.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-                plans.push((guard_index, alias_start, flags));
-            }
+        // Only the requesting complete PMD becomes huge.  Other aliases are
+        // prepared as P1 redirects, including aliases in another mm and VMA
+        // fragments which cover merely a subset of this backing folio.
+        if !guards[target_index].forced_thp_collapse_allowed(start, PageSize::Size2M as usize) {
+            return Err(AxError::InvalidInput);
         }
-        if !plans.iter().any(|(guard_index, alias_start, _)| {
-            *guard_index == target_index && *alias_start == start
-        }) {
-            return Err(AxError::BadState);
-        }
-        let mut published = Vec::new();
-        published
-            .try_reserve_exact(plans.len())
-            .map_err(|_| AxError::NoMemory)?;
-        for &(guard_index, alias_start, flags) in &plans {
-            if let Err(error) =
-                guards[guard_index].write_protect_shared_folio_collapse_2m(alias_start, flags)
-            {
-                for &(restore_guard, restore_start, restore_flags) in &plans {
-                    if restore_guard == guard_index && restore_start == alias_start {
-                        break;
-                    }
-                    guards[restore_guard]
-                        .restore_shared_folio_permissions_2m(restore_start, restore_flags)?;
-                }
-                return Err(error);
-            }
-        }
-        let folio = match pages.promote_4k_folio(start_index) {
-            Ok(folio) => folio,
-            Err(error) => {
-                for &(guard_index, alias_start, flags) in &plans {
-                    guards[guard_index].restore_shared_folio_permissions_2m(alias_start, flags)?;
-                }
-                return Err(error);
-            }
+        let existing_folio = pages.has_4k_folio(start_index);
+        let target_is_existing_pmd = if existing_folio {
+            let folio = pages.paddr_at(start_index)?;
+            matches!(guards[target_index].page_table().query(start), Ok((paddr, _, PageSize::Size2M)) if paddr == folio)
+        } else {
+            false
         };
-        for &(guard_index, alias_start, flags) in &plans {
-            match guards[guard_index].publish_shared_folio_collapse_2m(alias_start, folio, flags) {
-                Ok(replacement) => published.push((guard_index, replacement)),
+        if target_is_existing_pmd {
+            // This exact target is already the sole PMD for the folio.  Its
+            // P1 aliases remain valid redirects and must not be sent through
+            // the legacy all-PMD demotion path merely to collapse again.
+            cursor = cursor
+                .checked_add(PageSize::Size2M as usize)
+                .ok_or(AxError::InvalidInput)?;
+            continue;
+        }
+        let target_flags =
+            guards[target_index].preflight_shared_folio_collapse_2m(start, &pages, start_index)?;
+        let mut pmd_plans = Vec::new();
+        pmd_plans
+            .try_reserve_exact(guards.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for (index, guard) in guards.iter().enumerate() {
+            pmd_plans.push(guard.prepare_shared_folio_pmd_redirects_except(
+                &pages,
+                start_index,
+                (index == target_index).then_some(start),
+            )?);
+        }
+        let mut redirects = Vec::new();
+        redirects
+            .try_reserve_exact(guards.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for (guard_index, guard) in guards.iter().enumerate() {
+            let exclude_target = (guard_index == target_index).then_some(start);
+            redirects.push(guard.preflight_shared_folio_redirects_2m(
+                &pages,
+                start_index,
+                exclude_target,
+            )?);
+        }
+        // Reserve the new folio, sparse source frames and backing metadata
+        // before any PTE permission becomes visible.  From the first write
+        // protection onward, publication is allocation-free; dropping this
+        // object on every pre-publication failure returns its temporary RAM.
+        let mut prepared_folio = (!existing_folio)
+            .then(|| pages.prepare_4k_folio_promotion(start_index))
+            .transpose()?;
+        let existing_folio_address = existing_folio
+            .then(|| pages.paddr_at(start_index))
+            .transpose()?;
+        let pmd_plan_count = pmd_plans.iter().try_fold(0usize, |count, plans| {
+            count.checked_add(plans.len()).ok_or(AxError::NoMemory)
+        })?;
+        let mut pmd_sources = Vec::new();
+        pmd_sources
+            .try_reserve_exact(pmd_plan_count)
+            .map_err(|_| AxError::NoMemory)?;
+        for (guard_index, plans) in pmd_plans.iter().enumerate() {
+            for plan in plans {
+                pmd_sources.push((guard_index, plan.start, plan.flags));
+            }
+        }
+        let mut pmd_published = Vec::new();
+        pmd_published
+            .try_reserve_exact(pmd_plan_count)
+            .map_err(|_| AxError::NoMemory)?;
+        if let Err(error) =
+            guards[target_index].write_protect_shared_folio_collapse_2m(start, target_flags)
+        {
+            return Err(error);
+        }
+        for (guard_index, redirect) in redirects.iter().enumerate() {
+            if let Err(error) = guards[guard_index].write_protect_shared_folio_redirects(redirect) {
+                if let Err(rollback_error) = restore_shared_collapse_source_permissions(
+                    guards,
+                    target_index,
+                    start,
+                    target_flags,
+                    &redirects,
+                    &pmd_sources,
+                ) {
+                    return Err(rollback_error);
+                }
+                return Err(error);
+            }
+        }
+        for &(guard_index, pmd_start, pmd_flags) in &pmd_sources {
+            if let Err(error) =
+                guards[guard_index].write_protect_shared_folio_demotion_2m(pmd_start, pmd_flags)
+            {
+                if let Err(rollback_error) = restore_shared_collapse_source_permissions(
+                    guards,
+                    target_index,
+                    start,
+                    target_flags,
+                    &redirects,
+                    &pmd_sources,
+                ) {
+                    return Err(rollback_error);
+                }
+                return Err(error);
+            }
+        }
+        // Every participating mm receives a grace after write protection and
+        // before the backing copy.  This closes stale writable translations.
+        for guard in guards.iter_mut() {
+            drop(guard.synchronize_tlb_after_mutation());
+        }
+        let folio = if let Some(folio) = existing_folio_address {
+            folio
+        } else {
+            pages.commit_4k_folio_promotion(
+                prepared_folio
+                    .take()
+                    .expect("new shmem folio lost its prepared allocation"),
+            )
+        };
+        let target_replacement =
+            match guards[target_index].publish_shared_folio_collapse_2m(start, folio, target_flags)
+            {
+                Ok(replacement) => replacement,
                 Err(error) => {
-                    for (rollback_guard, replacement) in published.drain(..).rev() {
-                        guards[rollback_guard].rollback_shared_folio_collapse_2m(replacement)?;
-                    }
-                    pages.demote_4k_folio(start_index)?;
-                    for &(restore_guard, restore_start, restore_flags) in &plans {
-                        guards[restore_guard]
-                            .restore_shared_folio_permissions_2m(restore_start, restore_flags)?;
-                    }
+                    rollback_shared_collapse_after_promotion(
+                        guards,
+                        target_index,
+                        start,
+                        target_flags,
+                        &redirects,
+                        &pmd_sources,
+                        0,
+                        None,
+                        &mut pmd_published,
+                        &pages,
+                        start_index,
+                        !existing_folio,
+                    )?;
                     return Err(error);
                 }
+            };
+        for (guard_index, plans) in pmd_plans.iter_mut().enumerate() {
+            for plan in plans {
+                match guards[guard_index].publish_shared_folio_pmd_redirect(plan, folio) {
+                    Ok(replacement) => pmd_published.push((guard_index, replacement)),
+                    Err(error) => {
+                        rollback_shared_collapse_after_promotion(
+                            guards,
+                            target_index,
+                            start,
+                            target_flags,
+                            &redirects,
+                            &pmd_sources,
+                            0,
+                            Some(target_replacement),
+                            &mut pmd_published,
+                            &pages,
+                            start_index,
+                            !existing_folio,
+                        )?;
+                        return Err(error);
+                    }
+                }
             }
         }
-        for (commit_guard, replacement) in published {
-            guards[commit_guard].commit_shared_folio_collapse_2m(replacement);
+        let mut redirected = 0usize;
+        for (guard_index, redirect) in redirects.iter().enumerate() {
+            if let Err(error) = guards[guard_index].publish_shared_folio_redirects(redirect, folio)
+            {
+                rollback_shared_collapse_after_promotion(
+                    guards,
+                    target_index,
+                    start,
+                    target_flags,
+                    &redirects,
+                    &pmd_sources,
+                    redirected,
+                    Some(target_replacement),
+                    &mut pmd_published,
+                    &pages,
+                    start_index,
+                    !existing_folio,
+                )?;
+                return Err(error);
+            }
+            redirected += 1;
+        }
+        // Target PMD and every non-target P1 redirect are now read-only and
+        // name the promoted folio.  Wait before releasing retained P1 data,
+        // then restore each original writable contract.
+        for guard in guards.iter_mut() {
+            drop(guard.synchronize_tlb_after_mutation());
+        }
+        guards[target_index].commit_shared_folio_collapse_2m(target_replacement);
+        let mut restore_error = None;
+        for (guard_index, replacement) in pmd_published {
+            if let Err(error) = guards[guard_index]
+                .restore_shared_folio_permissions_2m(replacement.start, replacement.flags)
+            {
+                restore_error.get_or_insert(error);
+            }
+        }
+        if let Err(error) =
+            guards[target_index].restore_shared_folio_demotion_pmd_permissions(start, target_flags)
+        {
+            restore_error.get_or_insert(error);
+        }
+        for (guard_index, redirect) in redirects.iter().enumerate() {
+            if let Err(error) =
+                guards[guard_index].restore_shared_folio_redirect_permissions(redirect)
+            {
+                restore_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = restore_error {
+            return Err(error);
         }
         cursor = cursor
             .checked_add(PageSize::Size2M as usize)
@@ -1995,10 +3008,91 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
         return Err(AxError::OperationNotPermitted);
     }
 
+    if advice == MADV_WILLNEED {
+        // File-cache population can have to reclaim an unrelated cache page
+        // and notify every alias of that page.  The shared helper owns that
+        // lock-external retry protocol, so do not retain this mm lock while
+        // doing real readahead.  Anonymous mappings remain a validated no-op
+        // in Backend::prefetch_file_backed, matching Linux's advisory model.
+        drop(aspace);
+        process_madvise_willneed(&aspace_handle, addr, length)?;
+        return Ok(0);
+    }
+
+    if advice == MADV_COLLAPSE {
+        drop(aspace);
+        process_madvise_collapse(&aspace_handle, addr, length)?;
+        return Ok(0);
+    }
+
+    if advice == MADV_PAGEOUT {
+        let mut work = Vec::new();
+        process_madvise_collect_pageout(&mut aspace, addr, length, &mut work)?;
+        drop(aspace);
+        // Page-cache eviction can synchronously notify every alias, so it
+        // must run after dropping the target mm lock.  The collector above
+        // has already demoted PTEs and captured exact backend/range pairs.
+        for (backend, range) in work {
+            backend.pageout_file_pages(range)?;
+        }
+        return Ok(0);
+    }
+
+    if advice == MADV_GUARD_INSTALL {
+        // Guard installation is a real VMA overlay, not an advisory success:
+        // it discards any resident anonymous pages and turns later faults
+        // into access denials until an explicit GUARD_REMOVE.
+        aspace.install_madvise_guard(start, length)?;
+        return Ok(0);
+    }
+    if advice == MADV_GUARD_REMOVE {
+        aspace.remove_madvise_guard(start, length)?;
+        return Ok(0);
+    }
+    if advice == MADV_HWPOISON {
+        if !curr.as_thread().has_effective_capability(CAP_SYS_ADMIN) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        aspace.install_madvise_hwpoison(start, length)?;
+        return Ok(0);
+    }
+    if advice == MADV_SOFT_OFFLINE {
+        if !curr.as_thread().has_effective_capability(CAP_SYS_ADMIN) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        // There is no NUMA migration target on x86_64 TheKernel.  Retiring
+        // resident pages forces the same allocate-on-next-access migration
+        // outcome without poisoning the virtual address.
+        aspace.discard_pages(start, length)?;
+        return Ok(0);
+    }
+
+    if matches!(advice, MADV_POPULATE_READ | MADV_POPULATE_WRITE) {
+        let access = if advice == MADV_POPULATE_READ {
+            MappingFlags::READ
+        } else {
+            MappingFlags::WRITE
+        };
+        // Population can require a page-cache eviction transaction.  Drop
+        // this mm lock before reclaim and re-run the complete range/permission
+        // check for every retry.
+        drop(aspace);
+        populate_explicit_with_reclaim(&aspace_handle, start, length, access, |aspace| {
+            inspect_madvise_range(aspace, start, length).map(|_| ())
+        })?;
+        return Ok(0);
+    }
+
     match advice {
-        // Hints the kernel may safely ignore once the range is known-valid.
-        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED => {
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL => {
             inspect_madvise_range(&aspace, start, length)?;
+            let policy = match advice {
+                MADV_NORMAL => MadviseReadahead::Normal,
+                MADV_RANDOM => MadviseReadahead::Random,
+                MADV_SEQUENTIAL => MadviseReadahead::Sequential,
+                _ => unreachable!("madvise readahead behavior was matched above"),
+            };
+            aspace.set_madvise_readahead(start, length, policy)?;
             Ok(0)
         }
         MADV_DONTFORK | MADV_DOFORK => {
@@ -2010,16 +3104,7 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
             aspace.set_dontfork(start, length, advice == MADV_DONTFORK)?;
             Ok(0)
         }
-        MADV_POPULATE_READ => {
-            inspect_madvise_range(&aspace, start, length)?;
-            aspace.populate_area(start, length, MappingFlags::READ)?;
-            Ok(0)
-        }
-        MADV_POPULATE_WRITE => {
-            inspect_madvise_range(&aspace, start, length)?;
-            aspace.populate_area(start, length, MappingFlags::WRITE)?;
-            Ok(0)
-        }
+        MADV_POPULATE_READ | MADV_POPULATE_WRITE => unreachable!("handled above"),
         MADV_DONTNEED => {
             let info = inspect_madvise_range(&aspace, start, length)?;
             if info.has_shared_mapping || aspace.range_is_locked(start, length) {
@@ -2033,11 +3118,73 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
             if !info.all_private_anonymous {
                 return Err(AxError::InvalidInput);
             }
+            if aspace.range_is_locked(start, length) {
+                return Err(AxError::ResourceBusy);
+            }
+            aspace.mark_madvise_free(start, length)?;
             Ok(0)
         }
-        MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_REMOVE | MADV_HUGEPAGE | MADV_NOHUGEPAGE
-        | MADV_DONTDUMP | MADV_DODUMP | MADV_COLD | MADV_PAGEOUT | MADV_COLLAPSE => {
-            Err(AxError::InvalidInput)
+        MADV_COLD => {
+            process_madvise_cold(&mut aspace, addr, length)?;
+            Ok(0)
+        }
+        MADV_DONTNEED_LOCKED => {
+            let info = inspect_madvise_range(&aspace, start, length)?;
+            if info.has_shared_mapping {
+                return Err(AxError::InvalidInput);
+            }
+            aspace.discard_pages(start, length)?;
+            Ok(0)
+        }
+        MADV_HUGEPAGE | MADV_NOHUGEPAGE => {
+            inspect_madvise_range(&aspace, start, length)?;
+            aspace.set_madvise_thp(
+                start,
+                length,
+                if advice == MADV_HUGEPAGE {
+                    MadviseThp::Huge
+                } else {
+                    MadviseThp::NoHuge
+                },
+            )?;
+            Ok(0)
+        }
+        // KSM requires global canonical-frame reverse mappings and a
+        // write-fault COW path. Keep these accepted hints separate from THP:
+        // they must not claim the now-observable THP policy implementation.
+        MADV_MERGEABLE | MADV_UNMERGEABLE => {
+            inspect_madvise_range(&aspace, start, length)?;
+            Ok(0)
+        }
+        MADV_DONTDUMP | MADV_DODUMP => {
+            inspect_madvise_range(&aspace, start, length)?;
+            aspace.set_dontdump(start, length, advice == MADV_DONTDUMP)?;
+            Ok(0)
+        }
+        MADV_REMOVE => {
+            let targets = collect_madvise_remove_targets(&aspace, start, length)?;
+            let security = current_vfs_security();
+            drop(aspace);
+            for target in targets {
+                match target {
+                    MadviseRemoveTarget::File {
+                        file,
+                        offset,
+                        length,
+                    } => crate::syscall::punch_hole_file_mapping(&file, &security, offset, length)?,
+                    MadviseRemoveTarget::AnonymousShared {
+                        pages,
+                        offset,
+                        length,
+                    } => remove_anonymous_shared_across_aliases(
+                        &aspace_handle,
+                        pages,
+                        offset,
+                        length,
+                    )?,
+                }
+            }
+            Ok(0)
         }
         MADV_WIPEONFORK => {
             let end = start + length;
@@ -2095,10 +3242,46 @@ pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
         let aspace = aspace_handle.lock();
         if length > 0 {
             let start = VirtAddr::from(addr);
-            let (backends, saw_unmapped) =
+            let (_, saw_unmapped) =
                 aspace.sync_backends_in_range(start, length, fail_on_first_unmapped)?;
             if flags & MS_INVALIDATE != 0 && aspace.range_is_locked(start, length) {
                 return Err(LinuxError::EBUSY.into());
+            }
+            // Linux only calls vfs_fsync_range for MS_SYNC VM_SHARED file
+            // mappings.  In particular, MS_ASYNC starts no I/O and a private
+            // file COW mapping must not flush its source inode merely because
+            // it intersects an msync range.
+            let mut backends = Vec::new();
+            if flags & MS_SYNC != 0 {
+                let end = start + length;
+                let mut cursor = start;
+                while cursor < end {
+                    let Some(area) = aspace.find_area(cursor) else {
+                        break;
+                    };
+                    if area.start() > cursor {
+                        break;
+                    }
+                    if area
+                        .backend()
+                        .file_mapping()
+                        .is_some_and(|lease| lease.sharing() == FileMappingSharing::Shared)
+                    {
+                        backends.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                        let overlap_end = area.end().min(end);
+                        let offset = area
+                            .backend()
+                            .file_mapping()
+                            .and_then(|lease| lease.file_offset_at(cursor))
+                            .ok_or(AxError::BadState)?;
+                        backends.push((
+                            area.backend().clone(),
+                            offset,
+                            overlap_end.sub_addr(cursor) as u64,
+                        ));
+                    }
+                    cursor = area.end().min(end);
+                }
             }
             (backends, saw_unmapped)
         } else {
@@ -2107,8 +3290,19 @@ pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     };
 
     if flags & MS_SYNC != 0 {
-        for backend in backends {
-            backend.sync(false)?;
+        for (backend, offset, length) in backends {
+            backend.sync_range(offset, length, false)?;
+        }
+    }
+
+    // MS_INVALIDATE's only msync-visible effect is the VM_LOCKED rejection.
+    // Recheck after the lock-external filesystem operation so a concurrent
+    // mlock cannot race a successful snapshot into an incorrectly successful
+    // invalidate request.
+    if flags & MS_INVALIDATE != 0 && length > 0 {
+        let aspace = aspace_handle.lock();
+        if aspace.range_is_locked(VirtAddr::from(addr), length) {
+            return Err(LinuxError::EBUSY.into());
         }
     }
 
@@ -2219,19 +3413,56 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     let proc_data = &thread.proc_data;
     let has_ipc_lock = thread.has_effective_capability(CAP_IPC_LOCK);
     let aspace_handle = proc_data.aspace();
-    let mut aspace = aspace_handle.lock();
     let (start, length) = validate_page_aligned_range(addr, length)?;
-    if length > 0 && !aspace.can_access_range(start, length, MappingFlags::empty()) {
-        return Err(AxError::NoMemory);
-    }
+    loop {
+        let mut aspace = aspace_handle.lock();
+        // mlock can fault-in and retain file aliases, so it is an alias-creation
+        // path.  Do not return EBUSY for a transient cache retirement.
+        if let Some(retry) = aspace.file_eviction_retry_for_range(start, length) {
+            drop(aspace);
+            retry.wait()?;
+            continue;
+        }
+        if length > 0 && !aspace.can_access_range(start, length, MappingFlags::empty()) {
+            return Err(AxError::NoMemory);
+        }
 
-    check_mlock_range_limit(proc_data, has_ipc_lock, &aspace, start, length)?;
-    if flags & MLOCK_ONFAULT == 0 {
-        aspace.populate_area(start, length, MappingFlags::empty())?;
-    }
+        check_mlock_range_limit(proc_data, has_ipc_lock, &aspace, start, length)?;
+        if flags & MLOCK_ONFAULT == 0 {
+            drop(aspace);
+            populate_explicit_with_reclaim(
+                &aspace_handle,
+                start,
+                length,
+                MappingFlags::empty(),
+                |aspace| {
+                    if length > 0 && !aspace.can_access_range(start, length, MappingFlags::empty())
+                    {
+                        return Err(AxError::NoMemory);
+                    }
+                    check_mlock_range_limit(proc_data, has_ipc_lock, aspace, start, length)
+                },
+            )?;
+            // The helper revalidated before its successful populate. Take the
+            // lock once more for the state publication; a concurrent VMA
+            // mutation is rechecked rather than locking stale pages.
+            let mut aspace = aspace_handle.lock();
+            if let Some(retry) = aspace.file_eviction_retry_for_range(start, length) {
+                drop(aspace);
+                retry.wait()?;
+                continue;
+            }
+            if length > 0 && !aspace.can_access_range(start, length, MappingFlags::empty()) {
+                continue;
+            }
+            check_mlock_range_limit(proc_data, has_ipc_lock, &aspace, start, length)?;
+            aspace.set_locked(start, length, true)?;
+            return Ok(0);
+        }
 
-    aspace.set_locked(start, length, true)?;
-    Ok(0)
+        aspace.set_locked(start, length, true)?;
+        return Ok(0);
+    }
 }
 
 pub fn sys_munlock(addr: usize, length: usize) -> AxResult<isize> {
@@ -2266,24 +3497,47 @@ pub fn sys_mlockall(flags: u32) -> AxResult<isize> {
     let proc_data = &thread.proc_data;
     let has_ipc_lock = thread.has_effective_capability(CAP_IPC_LOCK);
     let aspace_handle = proc_data.aspace();
-    let mut aspace = aspace_handle.lock();
-
     if flags & MCL_CURRENT != 0 {
+        let aspace = aspace_handle.lock();
         check_mlockall_current_limit(proc_data, has_ipc_lock, &aspace)?;
-        if flags & MCL_ONFAULT == 0 {
-            let ranges: Vec<_> = aspace
+        let ranges: Vec<_> = if flags & MCL_ONFAULT == 0 {
+            aspace
                 .areas()
                 .map(|area| (area.start(), area.size()))
-                .collect();
+                .collect()
+        } else {
+            Vec::new()
+        };
+        drop(aspace);
+        if flags & MCL_ONFAULT == 0 {
             for (start, size) in ranges {
-                aspace.populate_area(start, size, MappingFlags::empty())?;
+                populate_explicit_with_reclaim(
+                    &aspace_handle,
+                    start,
+                    size,
+                    MappingFlags::empty(),
+                    |aspace| {
+                        aspace
+                            .find_area(start)
+                            .filter(|area| {
+                                start.checked_add(size).is_some_and(|end| area.end() >= end)
+                            })
+                            .map(|_| ())
+                            .ok_or(AxError::NoMemory)
+                    },
+                )?;
             }
         }
+        let mut aspace = aspace_handle.lock();
+        check_mlockall_current_limit(proc_data, has_ipc_lock, &aspace)?;
         aspace.lock_current_mappings();
+        aspace.set_lock_future_mappings(flags & MCL_FUTURE != 0, flags & MCL_ONFAULT != 0);
+        return Ok(0);
     } else {
         check_mlockall_future_limit(proc_data, has_ipc_lock)?;
     }
 
+    let mut aspace = aspace_handle.lock();
     aspace.set_lock_future_mappings(flags & MCL_FUTURE != 0, flags & MCL_ONFAULT != 0);
 
     Ok(0)
@@ -2316,6 +3570,39 @@ mod tests {
         pseudofs::tmp::MemoryFs,
         task::UserNamespace,
     };
+
+    #[test]
+    fn alias_granularity_skips_partial_first_address_space_window() {
+        let base = VirtAddr::from(0x1000);
+        let aspace_end = VirtAddr::from(0x400000);
+        let start = VirtAddr::from(0xc3000);
+        let request_end = VirtAddr::from(0xc4000);
+        let first = first_alias_granularity_chunk(start, base).unwrap();
+
+        assert_eq!(first, VirtAddr::from(ALIAS_GRANULARITY_CHUNK));
+        assert!(!alias_granularity_chunk_fits(
+            first,
+            request_end,
+            aspace_end
+        ));
+    }
+
+    #[test]
+    fn alias_granularity_checks_first_full_chunk_crossed_by_request() {
+        let base = VirtAddr::from(0x1000);
+        let first = first_alias_granularity_chunk(VirtAddr::from(0xc3000), base).unwrap();
+
+        assert!(alias_granularity_chunk_fits(
+            first,
+            VirtAddr::from(ALIAS_GRANULARITY_CHUNK + PAGE_SIZE_4K),
+            VirtAddr::from(ALIAS_GRANULARITY_CHUNK * 2),
+        ));
+        assert!(!alias_granularity_chunk_fits(
+            first,
+            VirtAddr::from(ALIAS_GRANULARITY_CHUNK + PAGE_SIZE_4K),
+            VirtAddr::from(ALIAS_GRANULARITY_CHUNK + PAGE_SIZE_4K),
+        ));
+    }
 
     #[test]
     fn compat_layout_uses_bottom_up_mmap_placement() {
@@ -2382,6 +3669,58 @@ mod tests {
     }
 
     #[test]
+    fn process_madvise_pageout_collects_only_file_backed_eviction_work() {
+        let base = VirtAddr::from(0x4000);
+        let mut aspace = AddrSpace::new_empty(base, PAGE_SIZE_4K * 4).unwrap();
+        aspace
+            .map(
+                base,
+                PAGE_SIZE_4K,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                Backend::new_alloc(base, PageSize::Size4K),
+            )
+            .unwrap();
+
+        let mut work = Vec::new();
+        // Anonymous mappings have no swap target. PAGEOUT succeeds by
+        // demoting their resident state, but must not fabricate file-cache
+        // eviction work.
+        assert_eq!(
+            process_madvise_collect_pageout(&mut aspace, 0x4000, PAGE_SIZE_4K, &mut work),
+            Ok(())
+        );
+        assert!(work.is_empty());
+        // Linux accepts a zero-length advisory range without touching the
+        // VMA layout or scheduling any writeback.
+        assert_eq!(
+            process_madvise_collect_pageout(&mut aspace, 0x4000, 0, &mut work),
+            Ok(())
+        );
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn process_madvise_pageout_failure_does_not_publish_partial_work() {
+        let base = VirtAddr::from(0x4000);
+        let mut aspace = AddrSpace::new_empty(base, PAGE_SIZE_4K * 4).unwrap();
+        let mut work = Vec::new();
+
+        // An unmapped interval is an immediate ENOMEM-style failure and may
+        // not leave a stale backend/range pair for the caller to evict.
+        assert_eq!(
+            process_madvise_collect_pageout(&mut aspace, 0x4000, PAGE_SIZE_4K, &mut work),
+            Err(AxError::NoMemory)
+        );
+        assert!(work.is_empty());
+        assert_eq!(
+            process_madvise_collect_pageout(&mut aspace, 0x4001, PAGE_SIZE_4K, &mut work),
+            Err(AxError::InvalidInput)
+        );
+        assert!(work.is_empty());
+    }
+
+    #[test]
     fn collapse_uses_page_rounded_range_and_skips_partial_pmds() {
         let unit = PageSize::Size2M as usize;
 
@@ -2394,7 +3733,10 @@ mod tests {
             collapse_full_pmd_range(0x1000, 2 * unit),
             Ok(Some((unit, 2 * unit)))
         );
-        assert_eq!(collapse_full_pmd_range(unit + 1, unit - 1), Ok(None));
+        assert_eq!(
+            collapse_full_pmd_range(unit + PAGE_SIZE_4K, unit - PAGE_SIZE_4K),
+            Ok(None)
+        );
         assert_eq!(
             collapse_full_pmd_range(unit, unit),
             Ok(Some((unit, 2 * unit)))
@@ -2411,7 +3753,10 @@ mod tests {
             preflight_mprotect_geometry(0x4001, 0, 0),
             Err(AxError::InvalidInput)
         );
-        assert_eq!(preflight_mprotect_geometry(0x4000, 0, usize::MAX), Ok(None));
+        assert_eq!(
+            preflight_mprotect_geometry(0x4000, 0, usize::MAX),
+            Err(AxError::InvalidInput)
+        );
     }
 
     #[test]

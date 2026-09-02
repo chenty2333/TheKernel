@@ -5,7 +5,6 @@
 
 use alloc::{
     collections::BTreeMap,
-    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -17,7 +16,7 @@ use axfs_ng_vfs::{Location, NodeType};
 use axsync::Mutex;
 use spin::Lazy;
 
-use super::AddrSpace;
+use super::{AddrSpace, SharedPages};
 
 const PAGE: usize = 4096;
 const SWAP_SIGNATURE: &[u8] = b"SWAPSPACE2";
@@ -35,7 +34,7 @@ struct SwapArea {
     _activation: SwapActivation,
 }
 struct SwapRegistry {
-    areas: BTreeMap<String, SwapArea>,
+    areas: BTreeMap<Vec<u8>, SwapArea>,
     next_id: u16,
 }
 impl Default for SwapRegistry {
@@ -67,7 +66,11 @@ static MUTATION_STATES: Lazy<Mutex<BTreeMap<MutationKey, Weak<Mutex<MutationStat
     Lazy::new(|| Mutex::new(BTreeMap::new()));
 
 fn mutation_key(location: &Location) -> MutationKey {
-    (location.mountpoint().mount_id(), location.mountpoint().device(), location.inode())
+    (
+        location.mountpoint().mount_id(),
+        location.mountpoint().device(),
+        location.inode(),
+    )
 }
 
 fn mutation_state(location: &Location) -> Arc<Mutex<MutationState>> {
@@ -112,23 +115,37 @@ impl WritableMappingRegistration {
             active: AtomicBool::new(false),
         })
     }
-    pub(crate) fn is_active(&self) -> bool { self.active.load(Ordering::Acquire) }
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
     pub(crate) fn set_active(&self, active: bool) -> AxResult<()> {
         let mut state = self.state.lock();
         let previous = self.active.load(Ordering::Acquire);
-        if previous == active { return Ok(()); }
+        if previous == active {
+            return Ok(());
+        }
         if active {
-            if state.active { return Err(LinuxError::EBUSY.into()); }
-            state.writable_mappings = state.writable_mappings.checked_add(1).ok_or(AxError::NoMemory)?;
+            if state.active {
+                return Err(LinuxError::EBUSY.into());
+            }
+            state.writable_mappings = state
+                .writable_mappings
+                .checked_add(1)
+                .ok_or(AxError::NoMemory)?;
         } else {
-            state.writable_mappings = state.writable_mappings.checked_sub(1).ok_or(AxError::BadState)?;
+            state.writable_mappings = state
+                .writable_mappings
+                .checked_sub(1)
+                .ok_or(AxError::BadState)?;
         }
         self.active.store(active, Ordering::Release);
         Ok(())
     }
 }
 impl Drop for WritableMappingRegistration {
-    fn drop(&mut self) { let _ = self.set_active(false); }
+    fn drop(&mut self) {
+        let _ = self.set_active(false);
+    }
 }
 
 pub(crate) fn admit_mutation(location: &Location) -> AxResult<MutationAdmission> {
@@ -138,7 +155,9 @@ pub(crate) fn admit_mutation(location: &Location) -> AxResult<MutationAdmission>
 
 fn admit_mutation_state(state: Arc<Mutex<MutationState>>) -> AxResult<MutationAdmission> {
     let mut guard = state.lock();
-    if guard.active { return Err(LinuxError::EBUSY.into()); }
+    if guard.active {
+        return Err(LinuxError::EBUSY.into());
+    }
     guard.writers = guard.writers.checked_add(1).ok_or(AxError::NoMemory)?;
     drop(guard);
     Ok(MutationAdmission(state))
@@ -146,7 +165,9 @@ fn admit_mutation_state(state: Arc<Mutex<MutationState>>) -> AxResult<MutationAd
 
 struct SwapActivation(Arc<Mutex<MutationState>>);
 impl Drop for SwapActivation {
-    fn drop(&mut self) { self.0.lock().active = false; }
+    fn drop(&mut self) {
+        self.0.lock().active = false;
+    }
 }
 
 fn admit_activation(location: &Location) -> AxResult<SwapActivation> {
@@ -223,13 +244,19 @@ pub(crate) fn unregister_address_space(aspace: &Arc<Mutex<AddrSpace>>) {
     }
 }
 
-fn live_address_spaces() -> Vec<Arc<Mutex<AddrSpace>>> {
+/// Snapshots every process image that currently owns an address space.
+///
+/// This is also the authoritative live-mm reverse map for facilities such as
+/// system-wide uprobes.  Callers only retain strong references returned by the
+/// snapshot; the registry itself remains weak and therefore cannot extend an
+/// mm's lifetime.
+pub(crate) fn live_address_spaces() -> Vec<Arc<Mutex<AddrSpace>>> {
     let mut live = LIVE_ADDRESS_SPACES.lock();
     let mut spaces = Vec::new();
     let stale: Vec<_> = live
         .entries
         .iter()
-        .filter_map(|(id, (weak, _, _))| {
+        .filter_map(|(id, (weak, ..))| {
             weak.upgrade().map_or(Some(*id), |aspace| {
                 spaces.push(aspace);
                 None
@@ -240,6 +267,22 @@ fn live_address_spaces() -> Vec<Arc<Mutex<AddrSpace>>> {
         live.entries.remove(&id);
     }
     spaces
+}
+
+/// Revokes resident PTEs for exactly one externally owned backing.  The live
+/// process-image registry is a weak reverse map: fork, VMA split, remap, and
+/// teardown need no duplicated lifetime bookkeeping because each operation
+/// changes the authoritative `AddrSpace` area set before this scan observes
+/// it.  Locks are acquired one address space at a time, never while holding a
+/// device/lease registry lock.
+pub(crate) fn revoke_shared_pages(pages: &Arc<SharedPages>) {
+    for aspace in live_address_spaces() {
+        aspace.lock().revoke_external_shared_pages(pages);
+    }
+}
+
+pub(crate) fn revoke_external_shared_pages(pages: &Arc<SharedPages>) {
+    revoke_shared_pages(pages)
 }
 
 /// A software PTE payload.  Bit 63 distinguishes it from a present PFN;
@@ -264,12 +307,13 @@ impl SwapPte {
     }
 }
 
-fn path_key(location: &Location) -> AxResult<String> {
-    let mut path = String::new();
-    path.try_reserve(location.absolute_path()?.as_str().len())
+fn path_key(location: &Location) -> AxResult<Vec<u8>> {
+    let path = location.absolute_path()?;
+    let mut key = Vec::new();
+    key.try_reserve(path.as_bytes().len())
         .map_err(|_| AxError::NoMemory)?;
-    path.push_str(location.absolute_path()?.as_str());
-    Ok(path)
+    key.extend_from_slice(path.as_bytes());
+    Ok(key)
 }
 
 /// Validates a Linux v1 swap header and publishes an empty slot map atomically.
@@ -279,7 +323,7 @@ pub fn activate(location: Location, flags: i32) -> AxResult<()> {
     }
     let activation = admit_activation(&location)?;
     let length = location.len()? as usize;
-    if length < PAGE * 2 || length % PAGE != 0 {
+    if length < PAGE * 2 || !length.is_multiple_of(PAGE) {
         return Err(AxError::InvalidInput);
     }
     let mut header = [0u8; PAGE];
@@ -371,11 +415,9 @@ pub fn deactivate(location: &Location) -> AxResult<()> {
     let mut prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
-            SWAPS
-                .lock()
-                .areas
-                .get_mut(&key)
-                .map(|area| area.draining = false);
+            if let Some(area) = SWAPS.lock().areas.get_mut(&key) {
+                area.draining = false;
+            }
             return Err(error);
         }
     };
@@ -386,7 +428,9 @@ pub fn deactivate(location: &Location) -> AxResult<()> {
     if LIVE_ADDRESS_SPACE_EPOCH.load(Ordering::Acquire) != epoch {
         drop(guards);
         drop(prepared);
-        SWAPS.lock().areas.get_mut(&key).map(|area| area.draining = false);
+        if let Some(area) = SWAPS.lock().areas.get_mut(&key) {
+            area.draining = false;
+        }
         return Err(LinuxError::EBUSY.into());
     }
     if let Some(error) = guards
@@ -396,11 +440,9 @@ pub fn deactivate(location: &Location) -> AxResult<()> {
     {
         drop(guards);
         drop(prepared);
-        SWAPS
-            .lock()
-            .areas
-            .get_mut(&key)
-            .map(|area| area.draining = false);
+        if let Some(area) = SWAPS.lock().areas.get_mut(&key) {
+            area.draining = false;
+        }
         return Err(error);
     }
     for (aspace, pages) in guards.iter_mut().zip(prepared.iter_mut()) {
@@ -412,11 +454,9 @@ pub fn deactivate(location: &Location) -> AxResult<()> {
     let area = swaps.areas.get(&key).ok_or(AxError::InvalidInput)?;
     if area.refs.iter().any(|refs| *refs != 0) {
         drop(swaps);
-        SWAPS
-            .lock()
-            .areas
-            .get_mut(&key)
-            .map(|area| area.draining = false);
+        if let Some(area) = SWAPS.lock().areas.get_mut(&key) {
+            area.draining = false;
+        }
         return Err(LinuxError::EBUSY.into());
     }
     swaps.areas.remove(&key);
@@ -425,12 +465,12 @@ pub fn deactivate(location: &Location) -> AxResult<()> {
 
 /// Allocates a slot from the highest-priority active area.  The returned pair
 /// is stable until `free_slot`; callers use it as the swap-PTE payload.
-pub fn allocate_slot() -> AxResult<(String, usize)> {
+pub fn allocate_slot() -> AxResult<(Vec<u8>, usize)> {
     let mut swaps = SWAPS.lock();
     let key = swaps
         .areas
         .iter()
-        .filter(|(_, area)| !area.draining && area.refs.iter().any(|refs| *refs == 0))
+        .filter(|(_, area)| !area.draining && area.refs.contains(&0))
         .max_by_key(|(_, area)| area.priority)
         .map(|(key, _)| key.clone())
         .ok_or(LinuxError::ENOSPC)?;
@@ -444,7 +484,7 @@ pub fn allocate_slot() -> AxResult<(String, usize)> {
     Ok((key, slot))
 }
 
-fn release_slot(area: &str, slot: usize) -> AxResult<()> {
+fn release_slot(area: &[u8], slot: usize) -> AxResult<()> {
     let mut swaps = SWAPS.lock();
     let area = swaps.areas.get_mut(area).ok_or(AxError::InvalidInput)?;
     let refs = area.refs.get_mut(slot).ok_or(AxError::InvalidInput)?;
@@ -535,7 +575,7 @@ pub(crate) fn read(entry: SwapPte, page: &mut [u8]) -> AxResult<()> {
     if page.len() != PAGE {
         return Err(AxError::InvalidInput);
     }
-    let (key, location) = {
+    let (_key, location) = {
         let swaps = SWAPS.lock();
         let (key, area) = swaps
             .areas
@@ -576,10 +616,14 @@ mod tests {
             writable_mappings: 0,
         }));
         let writer = admit_mutation_state(state.clone()).unwrap();
-        assert!(matches!(admit_activation_state(state.clone()), Err(error) if error == LinuxError::EBUSY.into()));
+        assert!(
+            matches!(admit_activation_state(state.clone()), Err(error) if error == LinuxError::EBUSY.into())
+        );
         drop(writer);
         let activation = admit_activation_state(state.clone()).unwrap();
-        assert!(matches!(admit_mutation_state(state.clone()), Err(error) if error == LinuxError::EBUSY.into()));
+        assert!(
+            matches!(admit_mutation_state(state.clone()), Err(error) if error == LinuxError::EBUSY.into())
+        );
         drop(activation);
         assert!(admit_mutation_state(state).is_ok());
     }

@@ -779,62 +779,55 @@ impl UffdAddressSpaceState {
         }
     }
 
-    /// Preflights pure mapping retirement for one or two bounded ranges.
-    ///
-    /// The ranges are normalized without allocation. Intersecting records are
-    /// removed and up to three survivors are refreshed in the same all-or-none
-    /// table plan. Broker reconciliation is deliberately deferred until the
-    /// main MM transaction and this table plan both commit, at which point
-    /// invalid request ownership is returned as a lock-external wake receipt.
-    pub(crate) fn preflight_unmap_ranges<F>(
+    fn preflight_unmap_ranges_iter<I, F>(
         &mut self,
         slot_index: usize,
-        ranges: [Option<PageRange>; 2],
+        ranges: I,
         mut current: F,
     ) -> AxResult<OptionalUffdPlan>
     where
+        I: IntoIterator<Item = PageRange>,
         F: FnMut(UffdRegistration) -> AxResult<MappingSnapshot>,
     {
         self.reset_unarmed_plan_slot(slot_index)?;
         let result = (|| {
-            let mut normalized = [None, None];
-            let mut count = 0usize;
-            for range in ranges.into_iter().flatten() {
-                if count == 0 {
-                    normalized[0] = Some(range);
-                    count = 1;
-                    continue;
-                }
-                let first = normalized[0].expect("first UFFD retirement range disappeared");
-                if range.page_size() != first.page_size() {
+            let ranges = ranges.into_iter();
+            let mut ordered = Vec::new();
+            ordered
+                .try_reserve(ranges.size_hint().0)
+                .map_err(|_| AxError::NoMemory)?;
+            let mut page_size = None;
+            for range in ranges {
+                if page_size.is_some_and(|page_size| range.page_size() != page_size) {
                     return Err(AxError::InvalidInput);
                 }
-                if range.start() < first.start() {
-                    normalized[1] = normalized[0];
-                    normalized[0] = Some(range);
-                } else {
-                    normalized[1] = Some(range);
-                }
-                count = 2;
+                page_size = Some(range.page_size());
+                ordered.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                ordered.push(range);
             }
-            if count == 2 {
-                let first = normalized[0].expect("first UFFD retirement range disappeared");
-                let second = normalized[1].expect("second UFFD retirement range disappeared");
-                if second.start() <= first.end() {
-                    normalized[0] = Some(
-                        PageRange::with_page_size(
-                            first.start(),
-                            first
+            ordered.sort_unstable_by_key(|range| range.start());
+
+            let mut normalized: Vec<PageRange> = Vec::new();
+            normalized
+                .try_reserve(ordered.len())
+                .map_err(|_| AxError::NoMemory)?;
+            for range in ordered {
+                if let Some(previous) = normalized.last_mut() {
+                    if range.start() <= previous.end() {
+                        *previous = PageRange::with_page_size(
+                            previous.start(),
+                            previous
                                 .end()
-                                .max(second.end())
-                                .checked_sub(first.start())
+                                .max(range.end())
+                                .checked_sub(previous.start())
                                 .ok_or(AxError::BadState)?,
-                            first.page_size(),
+                            previous.page_size(),
                         )
-                        .map_err(uffd_policy_error)?,
-                    );
-                    normalized[1] = None;
+                        .map_err(uffd_policy_error)?;
+                        continue;
+                    }
                 }
+                normalized.push(range);
             }
 
             let Self {
@@ -846,19 +839,17 @@ impl UffdAddressSpaceState {
 
             for registration in registrations.iter() {
                 let registered = registration.range();
-                let mut survivors = [(0usize, 0usize); 3];
-                let mut survivor_count = 0usize;
                 let mut cursor = registered.start();
                 let mut intersects = false;
-                for retirement in normalized.into_iter().flatten() {
+                let mut has_survivor = false;
+                for retirement in &normalized {
                     if retirement.end() <= cursor || registered.end() <= retirement.start() {
                         continue;
                     }
                     intersects = true;
                     let survivor_end = registered.end().min(retirement.start());
                     if cursor < survivor_end {
-                        survivors[survivor_count] = (cursor, survivor_end);
-                        survivor_count += 1;
+                        has_survivor = true;
                     }
                     cursor = cursor.max(retirement.end().min(registered.end()));
                     if cursor == registered.end() {
@@ -869,17 +860,48 @@ impl UffdAddressSpaceState {
                     continue;
                 }
                 if cursor < registered.end() {
-                    survivors[survivor_count] = (cursor, registered.end());
-                    survivor_count += 1;
+                    has_survivor = true;
                 }
                 slot.push_removed(registration.id())?;
 
-                let snapshot = if survivor_count != 0 {
+                let snapshot = if has_survivor {
                     Some(current(registration)?)
                 } else {
                     None
                 };
-                for (start, end) in survivors[..survivor_count].iter().copied() {
+
+                cursor = registered.start();
+                for retirement in &normalized {
+                    if retirement.end() <= cursor || registered.end() <= retirement.start() {
+                        continue;
+                    }
+                    let survivor_end = registered.end().min(retirement.start());
+                    if cursor < survivor_end {
+                        let survivor = PageRange::with_page_size(
+                            cursor,
+                            survivor_end.checked_sub(cursor).ok_or(AxError::BadState)?,
+                            registered.page_size(),
+                        )
+                        .map_err(uffd_policy_error)?;
+                        let request = registration
+                            .refreshed_fragment(
+                                snapshot.expect("surviving UFFD fragment has a current VMA"),
+                                survivor,
+                            )
+                            .map_err(uffd_policy_error)?;
+                        slot.push_replacement(UffdRegistrationReplacement::new(
+                            registration.id(),
+                            request,
+                        ))?;
+                    }
+                    cursor = cursor.max(retirement.end().min(registered.end()));
+                    if cursor == registered.end() {
+                        break;
+                    }
+                }
+                if cursor < registered.end() {
+                    let start = cursor;
+                    let end = registered.end();
                     let survivor = PageRange::with_page_size(
                         start,
                         end.checked_sub(start).ok_or(AxError::BadState)?,
@@ -912,6 +934,34 @@ impl UffdAddressSpaceState {
             Ok(plan) => self.finish_plan_preflight(slot_index, plan),
             Err(error) => self.fail_plan_preflight(slot_index, error),
         }
+    }
+
+    /// Preflights pure mapping retirement for an arbitrary collection of
+    /// bounded ranges. Intersecting records and all surviving fragments are
+    /// published through one all-or-none registration-table plan.
+    pub(crate) fn preflight_unmap_range_slice<F>(
+        &mut self,
+        slot_index: usize,
+        ranges: &[PageRange],
+        current: F,
+    ) -> AxResult<OptionalUffdPlan>
+    where
+        F: FnMut(UffdRegistration) -> AxResult<MappingSnapshot>,
+    {
+        self.preflight_unmap_ranges_iter(slot_index, ranges.iter().copied(), current)
+    }
+
+    /// Preflights pure mapping retirement for one or two bounded ranges.
+    pub(crate) fn preflight_unmap_ranges<F>(
+        &mut self,
+        slot_index: usize,
+        ranges: [Option<PageRange>; 2],
+        current: F,
+    ) -> AxResult<OptionalUffdPlan>
+    where
+        F: FnMut(UffdRegistration) -> AxResult<MappingSnapshot>,
+    {
+        self.preflight_unmap_ranges_iter(slot_index, ranges.into_iter().flatten(), current)
     }
 
     /// One-range compatibility wrapper used by ordinary `munmap`.

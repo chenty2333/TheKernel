@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 use axerrno::AxError;
 use axhal::{paging::MappingFlags, trap::PageFaultFlags};
 use axsync::Mutex;
-use memory_addr::VirtAddr;
+use memory_addr::{MemoryAddr, VirtAddr};
 use thekernel_linux_mm::{FaultAccess, FaultDisposition, FaultFailure as DelegatedFaultFailure};
 
 use super::{
@@ -42,104 +42,167 @@ impl FaultSession {
             user_sp,
         } = self;
 
-        let (admitted, delegated_fault_kind) = {
-            let mut locked = aspace.lock();
-            match locked.admit_uffd_missing_fault(vaddr, fault_access(access_flags)) {
-                // A userfaultfd resolver supplies or zero-fills the page in
-                // task context; the kernel did not perform backing I/O for
-                // this fault, so its successful completion is minor.
-                Ok(Some(admitted)) => (admitted, Some(PageFaultKind::Minor)),
-                Ok(None) => {
-                    let fault_candidate = locked.fault_needs_accounting(vaddr, access_flags);
-                    let read_before = axtask::current()
-                        .try_as_thread()
-                        .map(|thread| thread.backing_read_bytes());
-                    let result =
-                        locked.handle_page_fault_result(vaddr, access_flags, Some(user_sp));
-                    if result == PageFaultResult::Handled && fault_candidate {
-                        if let (Some(thread), Some(read_before)) =
-                            (axtask::current().try_as_thread(), read_before)
+        // A file-cache eviction write-protects aliases under the mm lock. A
+        // fault must neither repopulate during that interval nor attempt
+        // cache replacement while owning the mutex: reclaim prepares aliases
+        // in every mapped address space. Keep both retries wholly internal,
+        // releasing the lock and validating the VMA again afterwards.
+        'retry: loop {
+            loop {
+                let retry = {
+                    let locked = aspace.lock();
+                    locked.file_eviction_retry_for_range(vaddr.align_down_4k(), 4096)
+                };
+                let Some(retry) = retry else {
+                    break;
+                };
+                if retry.wait().is_err() {
+                    // Returning to the trap boundary preserves normal pending
+                    // signal/exit processing; userspace will re-execute or take
+                    // that signal rather than observing a fabricated bus fault.
+                    return PageFaultResult::Handled;
+                }
+            }
+
+            let (admitted, delegated_fault_kind) = {
+                let mut locked = aspace.lock();
+                // Close the probe-to-handler gap above.  A retirement can publish
+                // after the first lock was released but before this lock is
+                // acquired; do not let the fault path install or upgrade an alias
+                // in that interval.  Returning Handled after the lock-external
+                // completion wait makes the CPU retry the original instruction,
+                // which re-enters the normal VMA validation path.
+                if let Some(retry) =
+                    locked.file_eviction_retry_for_range(vaddr.align_down_4k(), 4096)
+                {
+                    drop(locked);
+                    let _ = retry.wait();
+                    return PageFaultResult::Handled;
+                }
+                match locked.admit_uffd_missing_fault(vaddr, fault_access(access_flags)) {
+                    // A userfaultfd resolver supplies or zero-fills the page in
+                    // task context; the kernel did not perform backing I/O for
+                    // this fault, so its successful completion is minor.
+                    Ok(Some(admitted)) => (admitted, Some(PageFaultKind::Minor)),
+                    Ok(None) => {
+                        let fault_candidate = locked.fault_needs_accounting(vaddr, access_flags);
+                        let read_before = axtask::current_may_uninit().and_then(|current| {
+                            current
+                                .try_as_thread()
+                                .map(|thread| thread.backing_read_bytes())
+                        });
+                        let result =
+                            locked.handle_page_fault_result(vaddr, access_flags, Some(user_sp));
+                        if result == PageFaultResult::Retry {
+                            let cache = locked.file_cache_reclaim_for_fault(vaddr);
+                            drop(locked);
+                            let Some(cache) = cache else {
+                                return PageFaultResult::Failed(
+                                    PageFaultFailure::InternalInconsistency,
+                                );
+                            };
+                            match cache.reclaim_one() {
+                                Ok(true) => continue 'retry,
+                                // The cache remained full but has no evictable
+                                // page. This is memory pressure, not a fabricated
+                                // backing-I/O failure.
+                                Ok(false) => {
+                                    return PageFaultResult::Failed(PageFaultFailure::OutOfMemory);
+                                }
+                                Err(_) => {
+                                    return PageFaultResult::Failed(
+                                        PageFaultFailure::BackingUnavailable,
+                                    );
+                                }
+                            }
+                        }
+                        if result == PageFaultResult::Handled
+                            && fault_candidate
+                            && let (Some(current), Some(read_before)) =
+                                (axtask::current_may_uninit(), read_before)
+                            && let Some(thread) = current.try_as_thread()
                         {
                             thread.account_resolved_page_fault(read_before);
                         }
+                        return result;
                     }
-                    return result;
+                    Err(error) => return admission_failure(error),
                 }
-                Err(error) => return admission_failure(error),
-            }
-        };
+            };
 
-        // New-request readiness is a lock-external hint. Exact coalescing
-        // carries no duplicate handler wake.
-        let wait = admitted.publish();
-        let waited = block_on_poll_set_interruptible_if(
-            wait.completion(),
-            || aspace.lock().take_uffd_fault_completion(&wait),
-            fault_wait_should_interrupt,
-        );
-        let disposition = match waited {
-            Ok(disposition) => disposition,
-            Err(wait_error) => {
-                let cancelled = {
-                    let mut locked = aspace.lock();
-                    locked.cancel_uffd_fault_wait(&wait)
-                };
-                let cancelled = match cancelled {
-                    Ok(cancelled) => cancelled,
-                    Err(_) => {
-                        return PageFaultResult::Failed(PageFaultFailure::InternalInconsistency);
-                    }
-                };
-                match cancelled.finish() {
-                    Some(disposition) => {
-                        // The terminal result became visible after the wait
-                        // helper's final recheck but before cancellation.
-                        // Completion wins; preserve the consumed task
-                        // interrupt for the next user-return boundary.
-                        if wait_error == AxError::Interrupted {
-                            axtask::current().interrupt();
+            // New-request readiness is a lock-external hint. Exact coalescing
+            // carries no duplicate handler wake.
+            let wait = admitted.publish();
+            let waited = block_on_poll_set_interruptible_if(
+                wait.completion(),
+                || aspace.lock().take_uffd_fault_completion(&wait),
+                fault_wait_should_interrupt,
+            );
+            let disposition = match waited {
+                Ok(disposition) => disposition,
+                Err(wait_error) => {
+                    let cancelled = {
+                        let mut locked = aspace.lock();
+                        locked.cancel_uffd_fault_wait(&wait)
+                    };
+                    let cancelled = match cancelled {
+                        Ok(cancelled) => cancelled,
+                        Err(_) => {
+                            return PageFaultResult::Failed(
+                                PageFaultFailure::InternalInconsistency,
+                            );
                         }
-                        disposition
-                    }
-                    None if wait_error == AxError::Interrupted => {
-                        // The pending signal/exit/exec transition won and this
-                        // waiter no longer owns broker resources. Returning to
-                        // the trap boundary lets normal task policy run.
-                        return PageFaultResult::Handled;
-                    }
-                    None => return wait_failure(wait_error),
-                }
-            }
-        };
-        if matches!(
-            disposition,
-            FaultDisposition::Supply | FaultDisposition::ZeroFill
-        ) {
-            // The resolver may have run on another CPU. Repair this waiter's
-            // current CPU before retrying the original userspace instruction;
-            // each coalesced waiter owns its own local maintenance.
-            repair_local_spurious_fault(vaddr);
-            // The resolver may have populated the target address space from a
-            // different task. Publish the shared mm peak at the completion
-            // edge while the waiter still owns the target image.
-            let locked = aspace.lock();
-            locked.merge_resident_highwater(locked.resident_user_bytes() as u64 / 1024);
-        }
-        let result = disposition_result(disposition);
-        if matches!(
-            disposition,
-            FaultDisposition::Supply | FaultDisposition::ZeroFill
-        ) {
-            if let Some(thread) = axtask::current().try_as_thread() {
-                if let Some(kind) = delegated_fault_kind {
-                    match kind {
-                        PageFaultKind::Minor => thread.account_minor_fault(),
-                        PageFaultKind::Major => thread.account_major_fault(),
+                    };
+                    match cancelled.finish() {
+                        Some(disposition) => {
+                            // The terminal result became visible after the wait
+                            // helper's final recheck but before cancellation.
+                            // Completion wins; preserve the consumed task
+                            // interrupt for the next user-return boundary.
+                            if wait_error == AxError::Interrupted {
+                                axtask::current().interrupt();
+                            }
+                            disposition
+                        }
+                        None if wait_error == AxError::Interrupted => {
+                            // The pending signal/exit/exec transition won and this
+                            // waiter no longer owns broker resources. Returning to
+                            // the trap boundary lets normal task policy run.
+                            return PageFaultResult::Handled;
+                        }
+                        None => return wait_failure(wait_error),
                     }
                 }
+            };
+            if matches!(
+                disposition,
+                FaultDisposition::Supply | FaultDisposition::ZeroFill
+            ) {
+                // The resolver may have run on another CPU. Repair this waiter's
+                // current CPU before retrying the original userspace instruction;
+                // each coalesced waiter owns its own local maintenance.
+                repair_local_spurious_fault(vaddr);
+                // The resolver may have populated the target address space from a
+                // different task. Publish the shared mm peak at the completion
+                // edge while the waiter still owns the target image.
+                let locked = aspace.lock();
+                locked.merge_resident_highwater(locked.resident_user_bytes() as u64 / 1024);
             }
+            let result = disposition_result(disposition);
+            if matches!(
+                disposition,
+                FaultDisposition::Supply | FaultDisposition::ZeroFill
+            ) && let Some(current) = axtask::current_may_uninit()
+                && let Some(thread) = current.try_as_thread()
+                && let Some(kind) = delegated_fault_kind
+            {
+                match kind {
+                    PageFaultKind::Minor => thread.account_minor_fault(),
+                    PageFaultKind::Major => thread.account_major_fault(),
+                }
+            }
+            return result;
         }
-        result
     }
 }
 

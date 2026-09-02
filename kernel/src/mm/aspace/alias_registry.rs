@@ -27,7 +27,7 @@ pub(crate) struct SharedBackingKey(u64);
 impl SharedBackingKey {
     pub(crate) fn allocate() -> AxResult<Self> {
         let key = NEXT_SHARED_BACKING_KEY
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| AxError::ResourceBusy)?;
@@ -72,7 +72,7 @@ static ALIASES: AliasRegistryMutex<AliasRegistry> = AliasRegistryMutex::new(Alia
 
 fn allocate_lease_id() -> AxResult<u64> {
     NEXT_ALIAS_LEASE_ID
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             current.checked_add(1)
         })
         .map_err(|_| AxError::ResourceBusy)
@@ -91,7 +91,7 @@ pub(crate) struct AliasLease {
 /// A pre-publication reverse-map registration.  Dropping it aborts the
 /// registration, while [`Self::commit`] makes the exact same generation live.
 #[must_use = "a pending alias registration must be committed or aborted"]
-pub(crate) struct PendingAliasLease(AliasLease);
+pub(crate) struct PendingAliasLease(Option<AliasLease>);
 
 /// Excludes new alias publication for one backing while a cross-mm folio
 /// mutation owns a stable participant set.
@@ -108,8 +108,9 @@ impl AliasLease {
         address_space: &Arc<Mutex<AddrSpace>>,
         address_space_id: AddressSpaceId,
     ) -> AxResult<Self> {
-        PendingAliasLease::prepare(key, address_space, address_space_id)
-            .map(PendingAliasLease::commit)
+        PendingAliasLease::try_prepare(key, address_space, address_space_id)?
+            .commit()
+            .ok_or(AxError::BadState)
     }
 
     pub(crate) const fn key(&self) -> SharedBackingKey {
@@ -122,22 +123,6 @@ impl AliasLease {
 }
 
 impl PendingAliasLease {
-    /// Reserves a generation before a shared VMA becomes visible.  This is a
-    /// registry transaction, not merely a best-effort hint: snapshots wait
-    /// until this generation is either committed or removed.
-    pub(crate) fn prepare(
-        key: SharedBackingKey,
-        address_space: &Arc<Mutex<AddrSpace>>,
-        address_space_id: AddressSpaceId,
-    ) -> AxResult<Self> {
-        loop {
-            match Self::try_prepare(key, address_space, address_space_id) {
-                Err(AxError::WouldBlock) => core::hint::spin_loop(),
-                result => return result,
-            }
-        }
-    }
-
     /// Attempts one pending-generation admission without waiting.  Fork uses
     /// this form so it can drop the parent mm lock before retrying a backing
     /// currently frozen by a cross-mm folio transaction.
@@ -153,33 +138,68 @@ impl PendingAliasLease {
             return Err(AxError::WouldBlock);
         }
         let aliases = registry.entries.entry(key).or_default();
+        if let Some(existing) = aliases.iter().find(|entry| {
+            entry.address_space_id == address_space_id && entry.address_space.ptr_eq(&weak)
+        }) {
+            return match existing.state {
+                AliasState::Pending { .. } => Err(AxError::WouldBlock),
+                AliasState::Committed { .. } => Ok(Self(None)),
+            };
+        }
         aliases.try_reserve(1).map_err(|_| AxError::NoMemory)?;
         aliases.push(AliasEntry {
             lease_id,
             address_space_id,
             address_space: weak.clone(),
-            state: AliasState::Pending { generation: lease_id },
+            state: AliasState::Pending {
+                generation: lease_id,
+            },
         });
-        Ok(Self(AliasLease {
+        Ok(Self(Some(AliasLease {
             address_space: weak,
             address_space_id,
             key,
             lease_id,
-        }))
+        })))
     }
 
-    pub(crate) fn commit(self) -> AliasLease {
-        let lease = self.0;
+    pub(crate) fn commit(self) -> Option<AliasLease> {
+        let lease = self.0?;
         let mut registry = ALIASES.lock();
         let entry = registry
             .entries
             .get_mut(&lease.key)
-            .and_then(|aliases| aliases.iter_mut().find(|entry| entry.lease_id == lease.lease_id))
+            .and_then(|aliases| {
+                aliases
+                    .iter_mut()
+                    .find(|entry| entry.lease_id == lease.lease_id)
+            })
             .expect("pending alias disappeared before commit");
         entry.state = AliasState::Committed {
             generation: lease.lease_id,
         };
-        lease
+        Some(lease)
+    }
+}
+
+/// Waits until a mapper may retry alias admission for `key`.
+///
+/// Call only after dropping the mm, IPC, and backing locks: a cross-mm folio
+/// mutation can require any of them before it releases its reservation.
+pub(crate) fn wait_for_alias_publication(key: SharedBackingKey) {
+    loop {
+        let registry = ALIASES.lock();
+        let blocked = registry.mutations.contains_key(&key)
+            || registry.entries.get(&key).is_some_and(|aliases| {
+                aliases
+                    .iter()
+                    .any(|entry| matches!(entry.state, AliasState::Pending { .. }))
+            });
+        drop(registry);
+        if !blocked {
+            return;
+        }
+        core::hint::spin_loop();
     }
 }
 
@@ -260,7 +280,9 @@ pub(crate) fn snapshot_aliases(key: SharedBackingKey) -> Vec<AliasSnapshot> {
     let registry = loop {
         let registry = ALIASES.lock();
         if !registry.entries.get(&key).is_some_and(|aliases| {
-            aliases.iter().any(|entry| matches!(entry.state, AliasState::Pending { .. }))
+            aliases
+                .iter()
+                .any(|entry| matches!(entry.state, AliasState::Pending { .. }))
         }) {
             break registry;
         }
@@ -329,10 +351,7 @@ pub(crate) fn reserve_alias_mutation(
                 .cmp(&rhs.address_space_id)
                 .then_with(|| lhs.lease_id.cmp(&rhs.lease_id))
         });
-        return (
-            AliasMutationReservation { key, generation },
-            snapshot,
-        );
+        return (AliasMutationReservation { key, generation }, snapshot);
     }
 }
 
@@ -343,24 +362,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_requires_a_live_matching_lease() {
+    fn registry_keeps_one_lease_per_mm_and_backing() {
         let address_space = Arc::new(Mutex::new(
             AddrSpace::new_empty(VirtAddr::from(0x1000), 0x20_000).unwrap(),
         ));
         let address_space_id = address_space.lock().address_space_id();
         let key = SharedBackingKey::allocate().unwrap();
         let first = AliasLease::try_new(key, &address_space, address_space_id).unwrap();
-        let second = AliasLease::try_new(key, &address_space, address_space_id).unwrap();
+        assert!(matches!(
+            AliasLease::try_new(key, &address_space, address_space_id),
+            Err(AxError::BadState)
+        ));
 
         let snapshot = snapshot_aliases(key);
-        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.len(), 1);
         assert!(snapshot.iter().all(|alias| alias.revalidate().is_some()));
 
         drop(first);
-        assert!(snapshot.iter().any(|alias| alias.revalidate().is_none()));
-        assert_eq!(snapshot_aliases(key).len(), 1);
-
-        drop(second);
         assert!(snapshot_aliases(key).is_empty());
     }
 }

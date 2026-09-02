@@ -3,6 +3,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::time::Duration;
 use core::{
     hint::unlikely,
+    marker::PhantomData,
     mem::MaybeUninit,
     ptr, slice,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -30,8 +31,8 @@ use super::{
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
     syscall::ensure_4k_granularity_across_aliases,
+    task::AsThread,
 };
-use crate::task::AsThread;
 static ENABLE_USER_IO_PIN_COUNTERS: AtomicBool = AtomicBool::new(false);
 static USER_IO_PIN_TO_USER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static USER_IO_PIN_TO_USER_HITS: AtomicU64 = AtomicU64::new(0);
@@ -901,20 +902,73 @@ fn prepare_user_io_pin_with_duration(
     require_contiguous: bool,
     duration: PinDuration,
 ) -> Option<PreparedUserIoPin> {
+    prepare_user_io_pin_with_duration_result(
+        capability,
+        start,
+        len,
+        access_flags,
+        require_contiguous,
+        duration,
+    )
+    .ok()
+}
+
+/// Result-bearing counterpart used by syscall-facing long-term pin owners.
+/// The legacy direct-I/O probes intentionally retain their `Option` surface
+/// above, but an accepted asynchronous submission must not turn every later
+/// MM admission outcome into a fabricated user-pointer fault.
+fn prepare_user_io_pin_with_duration_result(
+    capability: &UserMemoryCapability,
+    start: usize,
+    len: usize,
+    access_flags: MappingFlags,
+    require_contiguous: bool,
+    duration: PinDuration,
+) -> AxResult<PreparedUserIoPin> {
+    let mut failure = AxError::NoMemory;
+    prepare_user_io_pin_with_duration_and_failure(
+        capability,
+        start,
+        len,
+        access_flags,
+        require_contiguous,
+        duration,
+        &mut failure,
+    )
+    .ok_or(failure)
+}
+
+fn prepare_user_io_pin_with_duration_and_failure(
+    capability: &UserMemoryCapability,
+    start: usize,
+    len: usize,
+    access_flags: MappingFlags,
+    require_contiguous: bool,
+    duration: PinDuration,
+    failure: &mut AxError,
+) -> Option<PreparedUserIoPin> {
     if len == 0 {
         reject_user_io_pin(&USER_IO_PIN_REJECT_EMPTY);
+        *failure = AxError::InvalidInput;
         return None;
     }
-    if len < PAGE_SIZE_4K {
+    // Resident direct-I/O fast paths deliberately leave tiny transfers on
+    // their buffered route.  A long-term owner, however, is also the backing
+    // for accepted async requests: it must be able to retain every nonempty
+    // user range, including a sub-page tail of a vectored request.
+    if len < PAGE_SIZE_4K && duration != PinDuration::LongTerm {
         reject_user_io_pin(&USER_IO_PIN_REJECT_UNALIGNED);
+        *failure = AxError::InvalidInput;
         return None;
     }
     if check_access(start, len).is_err() {
         reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+        *failure = AxError::BadAddress;
         return None;
     }
     let Some(end) = start.checked_add(len) else {
         reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+        *failure = AxError::BadAddress;
         return None;
     };
 
@@ -922,6 +976,7 @@ fn prepare_user_io_pin_with_duration(
     let page_start = start_addr.align_down_4k();
     let Some(page_end) = super::checked_align_up_4k(end).map(VirtAddr::from) else {
         reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+        *failure = AxError::BadAddress;
         return None;
     };
     let page_len = page_end - page_start;
@@ -930,8 +985,9 @@ fn prepare_user_io_pin_with_duration(
     // correctly rejects other pins, whereas this reservation would otherwise
     // self-conflict with its pin preflight. Once reserved, the pin fence
     // prevents a concurrent collapse from recreating a compound folio.
-    if ensure_4k_granularity_across_aliases(&aspace_handle, page_start, page_len).is_err() {
+    if let Err(error) = ensure_4k_granularity_across_aliases(&aspace_handle, page_start, page_len) {
         reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+        *failure = error;
         return None;
     }
     let admission = {
@@ -941,10 +997,15 @@ fn prepare_user_io_pin_with_duration(
         // exported as GUP/DMA segments, including long-term registered pins.
         if aspace.has_secret_mapping(start_addr, len) {
             reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+            *failure = AxError::OperationNotSupported;
             return None;
         }
+        let Some(range) = UserRange::new(start, len).ok() else {
+            *failure = AxError::BadAddress;
+            return None;
+        };
         let request = PinRequest::new(
-            UserRange::new(start, len).ok()?,
+            range,
             if access_flags.contains(MappingFlags::WRITE) {
                 PinAccess::Write
             } else {
@@ -958,8 +1019,9 @@ fn prepare_user_io_pin_with_duration(
     };
     let (reservation, system_charge) = match admission {
         Ok(admission) => admission,
-        Err(_) => {
+        Err(error) => {
             reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+            *failure = error;
             return None;
         }
     };
@@ -971,6 +1033,7 @@ fn prepare_user_io_pin_with_duration(
         page_count,
     ) else {
         reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        *failure = AxError::NoMemory;
         return None;
     };
     // A page can introduce one physical SG fragment. Reserve the complete
@@ -979,6 +1042,7 @@ fn prepare_user_io_pin_with_duration(
     let Some(mut segments) = UserIoPinSegments::try_new(page_count) else {
         reject_user_io_pin(&USER_IO_PIN_REJECT_SEGMENTS);
         reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        *failure = AxError::NoMemory;
         return None;
     };
 
@@ -995,7 +1059,7 @@ fn prepare_user_io_pin_with_duration(
         while expectation_cursor < page_end {
             let chunk_end = user_io_pin_scan_chunk_end(expectation_cursor, page_end);
             let expectation_result = {
-                let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinExpectation);
+                let aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinExpectation);
                 aspace.append_user_io_mapping_expectations(
                     expectation_cursor,
                     chunk_end - expectation_cursor,
@@ -1006,6 +1070,7 @@ fn prepare_user_io_pin_with_duration(
             if expectation_result.is_err() {
                 reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
                 reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+                *failure = AxError::BadAddress;
                 return None;
             }
             expectation_cursor = chunk_end;
@@ -1018,9 +1083,12 @@ fn prepare_user_io_pin_with_duration(
     // Long-term windows may populate a previously absent anonymous/COW page
     // while the AddrSpace lock is held. Prepare the physical owner registry
     // before that lock is acquired; ordinary direct-I/O remains resident-only.
-    if (needs_frame_registry || populate_windows) && prepare_physical_pin_registry().is_err() {
+    if (needs_frame_registry || populate_windows)
+        && let Err(error) = prepare_physical_pin_registry()
+    {
         reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
         reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        *failure = error;
         return None;
     }
 
@@ -1033,6 +1101,7 @@ fn prepare_user_io_pin_with_duration(
         .is_err()
     {
         reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        *failure = AxError::NoMemory;
         return None;
     }
 
@@ -1060,8 +1129,9 @@ fn prepare_user_io_pin_with_duration(
         };
         let mut frame_preparation = match PreparedPhysicalFramePins::try_new(frame_capacity) {
             Ok(preparation) => preparation,
-            Err(_) => {
+            Err(error) => {
                 reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+                *failure = error;
                 return None;
             }
         };
@@ -1070,25 +1140,24 @@ fn prepare_user_io_pin_with_duration(
             let mut aspace = super::lock_mm_diagnosed!(aspace_handle, UserPinCollectOwners);
             (|| {
                 if populate_windows {
-                    if aspace
-                        .populate_area(scan_cursor, chunk_end - scan_cursor, access_flags)
-                        .is_err()
+                    if let Err(error) =
+                        aspace.populate_area(scan_cursor, chunk_end - scan_cursor, access_flags)
                     {
                         reject_user_io_pin(&USER_IO_PIN_REJECT_POPULATE);
+                        *failure = error;
                         return None;
                     }
                     let expectation_start = preparation.expectations.len();
-                    aspace
-                        .append_user_io_mapping_expectations(
-                            scan_cursor,
-                            chunk_end - scan_cursor,
-                            access_flags,
-                            &mut preparation.expectations,
-                        )
-                        .map_err(|_| {
-                            reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
-                        })
-                        .ok()?;
+                    if let Err(error) = aspace.append_user_io_mapping_expectations(
+                        scan_cursor,
+                        chunk_end - scan_cursor,
+                        access_flags,
+                        &mut preparation.expectations,
+                    ) {
+                        reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+                        *failure = error;
+                        return None;
+                    }
                     if preparation.expectations()[expectation_start..]
                         .iter()
                         .any(UserIoMappingExpectation::needs_frame_registry)
@@ -1101,17 +1170,20 @@ fn prepare_user_io_pin_with_duration(
                 while window_cursor < chunk_end {
                     let Some(area) = aspace.find_area(window_cursor) else {
                         reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+                        *failure = AxError::BadAddress;
                         return None;
                     };
                     if area.start() > window_cursor {
                         reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+                        *failure = AxError::BadAddress;
                         return None;
                     }
                     match area.backend().begin_user_io_pin_window() {
                         Ok(Some(window)) => pin_windows.push(window),
                         Ok(None) => {}
-                        Err(_) => {
+                        Err(error) => {
                             reject_user_io_pin(&USER_IO_PIN_REJECT_FILE_PIN);
+                            *failure = error;
                             return None;
                         }
                     }
@@ -1120,16 +1192,25 @@ fn prepare_user_io_pin_with_duration(
 
                 let mut vaddr = scan_cursor;
                 while vaddr < chunk_end {
-                    let Ok((paddr, flags, page_size)) = aspace.page_table().query(vaddr) else {
-                        reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
-                        return None;
+                    let (paddr, flags, page_size) = match aspace.page_table().query(vaddr) {
+                        Ok(mapping) => mapping,
+                        Err(error) => {
+                            reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
+                            *failure = match error {
+                                PagingError::NoMemory => AxError::NoMemory,
+                                _ => AxError::BadAddress,
+                            };
+                            return None;
+                        }
                     };
                     if page_size != PageSize::Size4K || !flags.contains(access_flags) {
                         reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
+                        *failure = AxError::BadAddress;
                         return None;
                     }
                     let Some(area) = aspace.find_area(vaddr) else {
                         reject_user_io_pin(&USER_IO_PIN_REJECT_ACCESS);
+                        *failure = AxError::BadAddress;
                         return None;
                     };
                     let backend = area.backend();
@@ -1145,6 +1226,7 @@ fn prepare_user_io_pin_with_duration(
                         }
                         if !frame_preparation.push(paddr) {
                             reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
+                            *failure = AxError::NoMemory;
                             return None;
                         }
                     } else {
@@ -1161,11 +1243,13 @@ fn prepare_user_io_pin_with_duration(
                             Ok(None) => {
                                 record_user_io_backend_pin_reject(backend);
                                 reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
+                                *failure = AxError::OperationNotSupported;
                                 return None;
                             }
-                            Err(_) => {
+                            Err(error) => {
                                 record_user_io_backend_pin_reject(backend);
                                 reject_user_io_pin(&USER_IO_PIN_REJECT_PAGE_CACHE_PIN);
+                                *failure = error;
                                 return None;
                             }
                         }
@@ -1179,6 +1263,7 @@ fn prepare_user_io_pin_with_duration(
                     let chunk_len = (len - copied).min(PAGE_SIZE_4K - page_offset);
                     if !segments.push_or_merge(paddr.as_usize() + page_offset, chunk_len) {
                         reject_user_io_pin(&USER_IO_PIN_REJECT_SEGMENTS);
+                        *failure = AxError::NoMemory;
                         return None;
                     }
                     copied += chunk_len;
@@ -1194,14 +1279,15 @@ fn prepare_user_io_pin_with_duration(
                 }
                 let system_charge = match preparation.admit_frame_pages(frame_preparation.len()) {
                     Ok(charge) => charge,
-                    Err(_) => {
+                    Err(error) => {
                         reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
+                        *failure = error;
                         return None;
                     }
                 };
                 match frame_preparation.publish(system_charge) {
                     Ok(pins) => Some(Some(pins)),
-                    Err(_) => {
+                    Err(error) => {
                         if cow_frame_pages != 0 {
                             reject_user_io_pin(&USER_IO_PIN_REJECT_COW_PIN);
                         }
@@ -1209,6 +1295,7 @@ fn prepare_user_io_pin_with_duration(
                             reject_user_io_pin(&USER_IO_PIN_REJECT_SHARED_PIN);
                         }
                         reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
+                        *failure = error;
                         None
                     }
                 }
@@ -1241,8 +1328,9 @@ fn prepare_user_io_pin_with_duration(
         };
         let consumed = match validation {
             Ok(consumed) => consumed,
-            Err(_) => {
+            Err(error) => {
                 reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+                *failure = error;
                 return None;
             }
         };
@@ -1250,6 +1338,7 @@ fn prepare_user_io_pin_with_duration(
             Some(validated) => validated,
             None => {
                 reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+                *failure = AxError::InvalidInput;
                 return None;
             }
         };
@@ -1259,16 +1348,19 @@ fn prepare_user_io_pin_with_duration(
     if preparation.frame_pins.is_empty() && preparation.page_cache_pins.is_empty() {
         reject_user_io_pin(&USER_IO_PIN_REJECT_FRAME_PIN);
         reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        *failure = AxError::OperationNotSupported;
         return None;
     }
     if copied != len {
         reject_user_io_pin(&USER_IO_PIN_REJECT_PAGETABLE);
         reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        *failure = AxError::BadAddress;
         return None;
     }
     if require_contiguous && segments.len() != 1 {
         reject_user_io_pin(&USER_IO_PIN_REJECT_NONCONTIG);
         reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        *failure = AxError::InvalidInput;
         return None;
     }
     debug_assert_eq!(frame_pin_attempted, needs_frame_registry);
@@ -1283,6 +1375,7 @@ fn prepare_user_io_pin_with_duration(
     debug_assert_eq!(frame_pin_pages + page_cache_pin_pages, page_count);
     if validated_expectations != preparation.expectations().len() {
         reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+        *failure = AxError::BadState;
         return None;
     }
 
@@ -1296,8 +1389,9 @@ fn prepare_user_io_pin_with_duration(
     };
     let token = match publication {
         Ok(token) => token,
-        Err(_) => {
+        Err(error) => {
             reject_user_io_pin(&USER_IO_PIN_VM_RANGE_PIN_REJECTS);
+            *failure = error;
             return None;
         }
     };
@@ -1450,7 +1544,6 @@ impl Drop for PinnedUserSegments {
 
 #[allow(dead_code)]
 pub struct PinnedUserSegmentsMut {
-    _ptr: *mut u8,
     segments: UserIoPinSegments,
     provenance: UserIoPinProvenance,
     _frame_pins: UserIoFramePins,
@@ -1992,9 +2085,71 @@ pub fn try_pin_user_segments_to_user_with(
     record_user_io_pin_counter(&USER_IO_PIN_TO_USER_BYTES, len as u64);
     record_user_io_pin_segments(&prepared.segments);
     Some(PinnedUserSegmentsMut {
-        _ptr: ptr,
         segments: prepared.segments,
         provenance: prepared.provenance,
+        _frame_pins: prepared.frame_pins,
+        _page_cache_pins: prepared.page_cache_pins,
+        _range_pin: prepared.range_pin,
+    })
+}
+
+/// Attempts a long-term source scatter/gather pin for an asynchronous file
+/// write.  Unlike the direct-I/O helper above, the pin may outlive the
+/// submitting syscall and therefore faults every bounded window before
+/// publishing a [`PinDuration::LongTerm`] reservation.
+///
+/// The returned owner must remain alive for every physical read through its
+/// descriptors; it is deliberately not a user-memory slice.
+pub fn try_pin_user_segments_from_user_longterm_with(
+    capability: &UserMemoryCapability,
+    ptr: *const u8,
+    len: usize,
+) -> Option<PinnedUserSegments> {
+    record_user_io_pin_counter(&USER_IO_PIN_FROM_USER_ATTEMPTS, 1);
+    let prepared = prepare_user_io_pin_with_duration(
+        capability,
+        ptr as usize,
+        len,
+        MappingFlags::READ,
+        false,
+        PinDuration::LongTerm,
+    )?;
+    record_user_io_pin_counter(&USER_IO_PIN_FROM_USER_HITS, 1);
+    record_user_io_pin_counter(&USER_IO_PIN_FROM_USER_BYTES, len as u64);
+    record_user_io_pin_segments(&prepared.segments);
+    Some(PinnedUserSegments {
+        _ptr: ptr,
+        segments: prepared.segments,
+        _frame_pins: prepared.frame_pins,
+        _page_cache_pins: prepared.page_cache_pins,
+        _range_pin: prepared.range_pin,
+    })
+}
+
+/// Result-bearing form of [`try_pin_user_segments_from_user_longterm_with`]
+/// for syscall submission.  The initial user-range check preserves `EFAULT`
+/// for a bad pointer; a later pin-admission failure is a retained-resource
+/// failure rather than a second usercopy fault.
+pub fn pin_user_segments_from_user_longterm_with(
+    capability: &UserMemoryCapability,
+    ptr: *const u8,
+    len: usize,
+) -> AxResult<PinnedUserSegments> {
+    record_user_io_pin_counter(&USER_IO_PIN_FROM_USER_ATTEMPTS, 1);
+    let prepared = prepare_user_io_pin_with_duration_result(
+        capability,
+        ptr as usize,
+        len,
+        MappingFlags::READ,
+        false,
+        PinDuration::LongTerm,
+    )?;
+    record_user_io_pin_counter(&USER_IO_PIN_FROM_USER_HITS, 1);
+    record_user_io_pin_counter(&USER_IO_PIN_FROM_USER_BYTES, len as u64);
+    record_user_io_pin_segments(&prepared.segments);
+    Ok(PinnedUserSegments {
+        _ptr: ptr,
+        segments: prepared.segments,
         _frame_pins: prepared.frame_pins,
         _page_cache_pins: prepared.page_cache_pins,
         _range_pin: prepared.range_pin,
@@ -2024,7 +2179,35 @@ pub fn try_pin_user_segments_to_user_longterm_with(
     record_user_io_pin_counter(&USER_IO_PIN_TO_USER_BYTES, len as u64);
     record_user_io_pin_segments(&prepared.segments);
     Some(PinnedUserSegmentsMut {
-        _ptr: ptr,
+        segments: prepared.segments,
+        provenance: prepared.provenance,
+        _frame_pins: prepared.frame_pins,
+        _page_cache_pins: prepared.page_cache_pins,
+        _range_pin: prepared.range_pin,
+    })
+}
+
+/// Result-bearing form of [`try_pin_user_segments_to_user_longterm_with`]
+/// for syscall submission.  See the source counterpart for why a failed
+/// long-term admission is not collapsed into `EFAULT`.
+pub fn pin_user_segments_to_user_longterm_with(
+    capability: &UserMemoryCapability,
+    ptr: *mut u8,
+    len: usize,
+) -> AxResult<PinnedUserSegmentsMut> {
+    record_user_io_pin_counter(&USER_IO_PIN_TO_USER_ATTEMPTS, 1);
+    let prepared = prepare_user_io_pin_with_duration_result(
+        capability,
+        ptr as usize,
+        len,
+        MappingFlags::WRITE,
+        false,
+        PinDuration::LongTerm,
+    )?;
+    record_user_io_pin_counter(&USER_IO_PIN_TO_USER_HITS, 1);
+    record_user_io_pin_counter(&USER_IO_PIN_TO_USER_BYTES, len as u64);
+    record_user_io_pin_segments(&prepared.segments);
+    Ok(PinnedUserSegmentsMut {
         segments: prepared.segments,
         provenance: prepared.provenance,
         _frame_pins: prepared.frame_pins,
@@ -2313,14 +2496,29 @@ fn prepare_user_nofault_span(
                 Err(error) => return Err(classify_nofault_query(error)),
             };
         classify_nofault_page(pte_flags, page_size, access_flags)?;
-        let area = aspace.find_area(VirtAddr::from(page_start)).ok_or(UserNofaultError::BadAddress)?;
+        let area = aspace
+            .find_area(VirtAddr::from(page_start))
+            .ok_or(UserNofaultError::BadAddress)?;
         match area.backend() {
             Backend::Shared(shared) if shared.is_secret() && allow_secret => {
-                let offset = shared.backing_offset(page_start).ok_or(UserNofaultError::BadAddress)?;
-                *page = NofaultPage::Secret { start: page_start, pages: shared.pages().clone(), offset };
+                let offset = shared
+                    .backing_offset(page_start)
+                    .ok_or(UserNofaultError::BadAddress)?;
+                *page = NofaultPage::Secret {
+                    start: page_start,
+                    pages: shared.pages().clone(),
+                    offset,
+                };
             }
-            Backend::Shared(shared) if shared.is_secret() => return Err(UserNofaultError::BadAddress),
-            _ => *page = NofaultPage::Direct { start: page_start, paddr },
+            Backend::Shared(shared) if shared.is_secret() => {
+                return Err(UserNofaultError::BadAddress);
+            }
+            _ => {
+                *page = NofaultPage::Direct {
+                    start: page_start,
+                    paddr,
+                }
+            }
         }
     }
     Ok(page_count)
@@ -2350,8 +2548,14 @@ pub fn try_read_user_nofault(
         return Err(UserNofaultError::Retry);
     };
     let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
-    let page_count =
-        prepare_user_nofault_span(&aspace, start, dst.len(), MappingFlags::READ, current_owns_aspace(aspace_handle), &mut pages)?;
+    let page_count = prepare_user_nofault_span(
+        &aspace,
+        start,
+        dst.len(),
+        MappingFlags::READ,
+        current_owns_aspace(aspace_handle),
+        &mut pages,
+    )?;
     copy_from_user_nofault_pages(start, dst, &pages[..page_count]);
     Ok(())
 }
@@ -2376,8 +2580,14 @@ pub fn try_write_user_nofault(
         return Err(UserNofaultError::Retry);
     };
     let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
-    let page_count =
-        prepare_user_nofault_span(&aspace, start, src.len(), MappingFlags::WRITE, current_owns_aspace(aspace_handle), &mut pages)?;
+    let page_count = prepare_user_nofault_span(
+        &aspace,
+        start,
+        src.len(),
+        MappingFlags::WRITE,
+        current_owns_aspace(aspace_handle),
+        &mut pages,
+    )?;
     copy_to_user_nofault_pages(start, src, &pages[..page_count]);
     Ok(())
 }
@@ -2396,49 +2606,141 @@ pub struct UserNofaultTransaction<'a> {
     allow_secret: bool,
 }
 
-impl UserNofaultTransaction<'_> {
-    /// Copies one fixed-size, resident user span into kernel storage.
-    pub fn read(&self, start: usize, dst: &mut [u8]) -> Result<(), UserNofaultError> {
+/// One resident, permission-checked user span pinned by a
+/// [`UserNofaultTransaction`].  Its translations are captured while the
+/// transaction owns the address-space lock, so copying through this object is
+/// intentionally infallible: it never walks page tables a second time.
+pub struct PinnedUserNofaultSpan<'transaction, 'aspace> {
+    start: usize,
+    len: usize,
+    page_count: usize,
+    pages: [NofaultPage; USER_NOFAULT_PAGE_SLOTS],
+    aspace: *const AddrSpace,
+    // A captured physical translation is usable only while the precise
+    // transaction which pinned it retains the MM lock.  This lifetime makes
+    // returning it from the transaction closure or handing it to a later
+    // transaction impossible at compile time.
+    _transaction: PhantomData<&'transaction UserNofaultTransaction<'aspace>>,
+}
+
+impl<'aspace> UserNofaultTransaction<'aspace> {
+    fn pin<'transaction>(
+        &'transaction self,
+        start: usize,
+        len: usize,
+        access: MappingFlags,
+    ) -> Result<PinnedUserNofaultSpan<'transaction, 'aspace>, UserNofaultError> {
         let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
         let page_count = prepare_user_nofault_span(
             self.aspace,
             start,
-            dst.len(),
-            MappingFlags::READ,
+            len,
+            access,
             self.allow_secret,
             &mut pages,
         )?;
-        copy_from_user_nofault_pages(start, dst, &pages[..page_count]);
+        Ok(PinnedUserNofaultSpan {
+            start,
+            len,
+            page_count,
+            pages,
+            aspace: self.aspace as *const AddrSpace,
+            _transaction: PhantomData,
+        })
+    }
+
+    /// Pins a readable user span for a later, non-fallible staged copy.
+    pub fn pin_read<'transaction>(
+        &'transaction self,
+        start: usize,
+        len: usize,
+    ) -> Result<PinnedUserNofaultSpan<'transaction, 'aspace>, UserNofaultError> {
+        self.pin(start, len, MappingFlags::READ)
+    }
+
+    /// Pins an ordinary user-writable span for a later, non-fallible commit.
+    pub fn pin_user_write<'transaction>(
+        &'transaction self,
+        start: usize,
+        len: usize,
+    ) -> Result<PinnedUserNofaultSpan<'transaction, 'aspace>, UserNofaultError> {
+        self.pin(start, len, MappingFlags::WRITE)
+    }
+
+    /// Pins a kernel-authorized CET shadow-stack write.  It deliberately
+    /// rejects ordinary writable/executable mappings: this authority is only
+    /// for an exact user SHSTK mapping and cannot become a generic bypass of
+    /// user write permissions.
+    pub fn pin_shadow_stack_write<'transaction>(
+        &'transaction self,
+        start: usize,
+        len: usize,
+    ) -> Result<PinnedUserNofaultSpan<'transaction, 'aspace>, UserNofaultError> {
+        if !self.aspace.cet_shadow_stack_span_resident(start, len) {
+            return Err(UserNofaultError::BadAddress);
+        }
+        self.pin(start, len, MappingFlags::READ)
+    }
+
+    /// Copies from an already pinned span.  No page-table walk can fail after
+    /// the transaction has begun its commit edge.
+    pub fn read_pinned<'transaction>(
+        &'transaction self,
+        span: &PinnedUserNofaultSpan<'transaction, 'aspace>,
+        dst: &mut [u8],
+    ) {
+        assert!(core::ptr::eq(self.aspace, span.aspace));
+        assert_eq!(span.len, dst.len());
+        copy_from_user_nofault_pages(span.start, dst, &span.pages[..span.page_count]);
+    }
+
+    /// Commits to an already pinned span.  This is infallible by construction.
+    pub fn write_pinned<'transaction>(
+        &'transaction self,
+        span: &PinnedUserNofaultSpan<'transaction, 'aspace>,
+        src: &[u8],
+    ) {
+        assert!(core::ptr::eq(self.aspace, span.aspace));
+        assert_eq!(span.len, src.len());
+        copy_to_user_nofault_pages(span.start, src, &span.pages[..span.page_count]);
+    }
+
+    /// Copies one fixed-size, resident user span into kernel storage.
+    pub fn read(&self, start: usize, dst: &mut [u8]) -> Result<(), UserNofaultError> {
+        let span = self.pin_read(start, dst.len())?;
+        self.read_pinned(&span, dst);
         Ok(())
     }
 
     /// Checks one fixed-size destination span without changing user memory.
     pub fn preflight_write(&self, start: usize, src: &[u8]) -> Result<(), UserNofaultError> {
-        let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
-        prepare_user_nofault_span(
-            self.aspace,
-            start,
-            src.len(),
-            MappingFlags::WRITE,
-            self.allow_secret,
-            &mut pages,
-        )?;
+        let _ = self.pin_user_write(start, src.len())?;
+        Ok(())
+    }
+
+    /// Preflight a kernel-authorized write such as a CET shadow-stack update.
+    /// Shadow-stack VMAs deliberately do not expose ordinary user WRITE, but
+    /// their resident mappings must still be pinned under this transaction
+    /// before a paired normal-stack commit begins.
+    pub fn preflight_kernel_write(&self, start: usize, src: &[u8]) -> Result<(), UserNofaultError> {
+        let _ = self.pin_shadow_stack_write(start, src.len())?;
         Ok(())
     }
 
     /// Copies one fixed-size kernel span into a destination previously
     /// preflighted by this transaction.
     pub fn write(&self, start: usize, src: &[u8]) -> Result<(), UserNofaultError> {
-        let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
-        let page_count = prepare_user_nofault_span(
-            self.aspace,
-            start,
-            src.len(),
-            MappingFlags::WRITE,
-            self.allow_secret,
-            &mut pages,
-        )?;
-        copy_to_user_nofault_pages(start, src, &pages[..page_count]);
+        let span = self.pin_user_write(start, src.len())?;
+        self.write_pinned(&span, src);
+        Ok(())
+    }
+
+    /// Commit a preflighted kernel-authorized write without re-entering the
+    /// regular user-W permission path. The enclosing transaction retains the
+    /// MM lock, so the validated translation cannot disappear mid-commit.
+    pub fn write_kernel(&self, start: usize, src: &[u8]) -> Result<(), UserNofaultError> {
+        let span = self.pin_shadow_stack_write(start, src.len())?;
+        self.write_pinned(&span, src);
         Ok(())
     }
 }
@@ -2513,8 +2815,14 @@ pub(crate) fn read_user_nofault_task(
     }
     let aspace = aspace_handle.lock();
     let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
-    let page_count =
-        prepare_user_nofault_span(&aspace, start, dst.len(), MappingFlags::READ, current_owns_aspace(aspace_handle), &mut pages)?;
+    let page_count = prepare_user_nofault_span(
+        &aspace,
+        start,
+        dst.len(),
+        MappingFlags::READ,
+        current_owns_aspace(aspace_handle),
+        &mut pages,
+    )?;
     copy_from_user_nofault_pages(start, dst, &pages[..page_count]);
     Ok(())
 }
@@ -2533,8 +2841,13 @@ fn copy_from_user_nofault_pages(start: usize, dst: &mut [u8], pages: &[NofaultPa
                 // SAFETY: the preflight validated this resident direct page.
                 unsafe { ptr::copy_nonoverlapping(source, dst.as_mut_ptr().add(copied), count) };
             }
-            NofaultPage::Secret { pages, offset: backing, .. } => {
-                pages.read_secret_bytes_resident(*backing + offset, &mut dst[copied..copied + count])
+            NofaultPage::Secret {
+                pages,
+                offset: backing,
+                ..
+            } => {
+                pages
+                    .read_secret_bytes_resident(*backing + offset, &mut dst[copied..copied + count])
                     .expect("resident secret PTE lost its frame");
             }
         }
@@ -2560,8 +2873,13 @@ fn copy_to_user_nofault_pages(start: usize, src: &[u8], pages: &[NofaultPage]) {
                 // SAFETY: the preflight validated this resident direct page.
                 unsafe { ptr::copy_nonoverlapping(src.as_ptr().add(copied), destination, count) };
             }
-            NofaultPage::Secret { pages, offset: backing, .. } => {
-                pages.write_secret_bytes_resident(*backing + offset, &src[copied..copied + count])
+            NofaultPage::Secret {
+                pages,
+                offset: backing,
+                ..
+            } => {
+                pages
+                    .write_secret_bytes_resident(*backing + offset, &src[copied..copied + count])
                     .expect("resident secret PTE lost its frame");
             }
         }

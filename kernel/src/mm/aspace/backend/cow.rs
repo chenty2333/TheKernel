@@ -8,7 +8,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axfs::CachedFile;
-use axfs_ng_vfs::Location;
+use axfs_ng_vfs::{Location, VfsError, VfsResult};
 use axhal::{
     mem::phys_to_virt,
     paging::{
@@ -452,6 +452,35 @@ impl Drop for PreparedCowPage {
 /// Materialized COW leaves detached from a page table but not yet reclaimed.
 pub(super) struct CowUnmapRetirement {
     leaves: Vec<(VirtAddr, PhysAddr, MappingFlags, PageSize)>,
+}
+
+impl CowUnmapRetirement {
+    pub(super) fn from_prepared_leaves(
+        leaves: Vec<(VirtAddr, PhysAddr, MappingFlags, PageSize)>,
+    ) -> Self {
+        Self { leaves }
+    }
+
+    /// Restores exact detached COW leaves and disarms this retirement on
+    /// success.  A post-admission failure deliberately leaks the token: the
+    /// fixed-replacement caller is fail-stop at that point and must never let
+    /// this destructor free frames that a partially restored page table names.
+    pub(super) fn restore_prepared(mut self, pt: &mut PageTable) -> bool {
+        let mut cursor = pt.cursor();
+        let restored = self
+            .leaves
+            .iter()
+            .all(|(address, paddr, flags, page_size)| {
+                cursor.map(*address, *paddr, *page_size, *flags).is_ok()
+            });
+        if restored {
+            self.leaves.clear();
+            true
+        } else {
+            core::mem::forget(self);
+            false
+        }
+    }
 }
 
 impl Drop for CowUnmapRetirement {
@@ -1121,23 +1150,49 @@ impl CowBackend {
             if start > 0 {
                 unsafe { core::ptr::write_bytes(buf.as_mut_ptr(), 0, start) };
             }
-            let destination = &mut &mut buf[start..start + max_read];
-            // Page-fault and fork population both run inside the owning
-            // address-space transaction. Until MM can snapshot, drop the lock,
-            // and range-revalidate, it must not suspend after an async submit.
-            let read_result = file.read_at_sync(destination, file_start);
-            let read = match read_result {
-                Ok(read) if read <= max_read => read,
-                Ok(_) => {
-                    dealloc_frame(frame, self.size);
-                    return Err(AxError::Io);
+            // File-backed COW faults run while the owning mm is locked. Load
+            // source pages through the same no-reclaim cache primitive as a
+            // shared mapping: VM_RAND_READ loads only the fault page,
+            // VM_SEQ_READ expands the cache window, and cache pressure is
+            // returned to the lock-external fault retry instead of evicting an
+            // alias under this lock.
+            let readahead_pages = self
+                .mapping_status()
+                .madvise_readahead()
+                .cache_window_pages();
+            // Do not take CachedFile's direct-I/O exclusion lock here.  A
+            // page fault owns the mm mutex, whereas PAGEOUT takes that lock
+            // before preparing eviction listeners which acquire the mm
+            // mutex.  The no-reclaim cache primitive below is safe under the
+            // mm lock and makes cache pressure a lock-external retry instead.
+            let copy_result = (|| -> VfsResult<()> {
+                let mut copied = 0usize;
+                while copied < max_read {
+                    let source_offset = file_start
+                        .checked_add(copied as u64)
+                        .ok_or(VfsError::InvalidInput)?;
+                    let pn = u32::try_from(source_offset / PAGE_SIZE_4K as u64)
+                        .map_err(|_| VfsError::InvalidInput)?;
+                    let in_page = (source_offset % PAGE_SIZE_4K as u64) as usize;
+                    let chunk = (max_read - copied).min(PAGE_SIZE_4K - in_page);
+                    file.with_page_or_insert_without_reclaim_with_readahead(
+                        pn,
+                        if copied == 0 { readahead_pages } else { 1 },
+                        |page| {
+                            buf[start + copied..start + copied + chunk]
+                                .copy_from_slice(&page.data()[in_page..in_page + chunk]);
+                            Ok(())
+                        },
+                    )?;
+                    copied += chunk;
                 }
-                Err(err) => {
-                    dealloc_frame(frame, self.size);
-                    return Err(err);
-                }
-            };
-            let tail_start = start + read;
+                VfsResult::Ok(())
+            })();
+            if let Err(err) = copy_result {
+                dealloc_frame(frame, self.size);
+                return Err(err.into());
+            }
+            let tail_start = start + max_read;
             if tail_start < buf.len() {
                 unsafe {
                     core::ptr::write_bytes(
@@ -1320,23 +1375,27 @@ impl CowBackend {
         };
         let pages = self.cache_page_range(range)?;
         let mut prefetched = 0usize;
-        file.with_direct_io_excluded(|| {
-            for (vaddr, pn) in pages_in(range, PageSize::Size4K)?.zip(pages) {
-                // MAP_PRIVATE mappings preserve the same SIGBUS-at-EOF
-                // boundary as their fault path; there is no backing cache
-                // page to prefetch beyond it.
-                if self.faults_with_sigbus(vaddr) {
-                    continue;
-                }
-                file.with_page_or_insert(pn, |_, evicted| {
-                    drop(evicted);
-                    Ok(())
-                })?;
-                prefetched = prefetched.checked_add(1).ok_or(AxError::InvalidInput)?;
+        // WILLNEED invokes this after dropping the mm lock.  A full source
+        // cache is reclaimed through the cache's staged, lock-external alias
+        // eviction path before retrying insertion.
+        for (vaddr, pn) in pages_in(range, PageSize::Size4K)?.zip(pages) {
+            // MAP_PRIVATE mappings preserve the same SIGBUS-at-EOF boundary
+            // as their fault path; there is no backing cache page to prefetch
+            // beyond it.
+            if self.faults_with_sigbus(vaddr) {
+                continue;
             }
-            Ok::<(), AxError>(())
-        })?;
+            file.with_page_or_insert_lock_external_reclaim(pn, |_| Ok(()))?;
+            prefetched = prefetched.checked_add(1).ok_or(AxError::InvalidInput)?;
+        }
         Ok(prefetched)
+    }
+
+    /// Retains the untouched MAP_PRIVATE file cache for an explicit-prefetch
+    /// retry. Materialized COW leaves have no cache alias and therefore do
+    /// not participate in this path.
+    pub(crate) fn cache_for_reclaim(&self) -> Option<CachedFile> {
+        self.file.as_ref().map(|(file, ..)| file.clone())
     }
 
     /// Demotes resident source-file cache pages for an unmaterialized private
@@ -1346,17 +1405,15 @@ impl CowBackend {
         let Some((file, ..)) = &self.file else {
             return Err(AxError::OperationNotSupported);
         };
-        Ok(file.cold_pages(self.cache_page_range(range)?)?)
+        file.cold_pages(self.cache_page_range(range)?)
     }
 
-    /// Writes back and evicts resident source-file cache pages.  Private COW
-    /// leaves keep their data independently, so eviction is safe and does not
-    /// discard a process-private modification.
-    pub(crate) fn pageout_file_pages(&self, range: VirtAddrRange) -> AxResult<usize> {
-        let Some((file, ..)) = &self.file else {
-            return Err(AxError::OperationNotSupported);
-        };
-        Ok(file.pageout_pages(self.cache_page_range(range)?)?)
+    /// MAP_PRIVATE owns materialized pages as COW frames, while untouched
+    /// bytes are merely a read source in the inode cache.  The MM layer can
+    /// demote the former, but PAGEOUT must not evict the latter through a
+    /// private mapping, regardless of whether this backend has file backing.
+    pub(crate) fn pageout_file_pages(&self, _range: VirtAddrRange) -> AxResult<usize> {
+        Ok(0)
     }
 
     pub(crate) fn clone_for_range(
@@ -1396,6 +1453,44 @@ impl CowBackend {
                     && lhs_end == rhs_end
                     && lhs_sigbus == rhs_sigbus
                     && lhs_backend.ptr_eq(rhs_backend)
+            }
+            _ => false,
+        }
+    }
+
+    /// Proves that two VMA fragments name the same byte of one private COW
+    /// mapping at `address`.
+    ///
+    /// VMA splitting and relocation are allowed to rebase both `start` and a
+    /// file-backed fragment's `file_start`, so comparing those stored origins
+    /// directly is too strict.  Conversely, comparing only `map_id` is too
+    /// weak: two relocated aliases of the same mapping can expose different
+    /// logical offsets.  The affine cursor at the address is the invariant
+    /// needed by a PMD-wide collapse.
+    pub(crate) fn same_mapping_geometry_at(&self, other: &Self, address: VirtAddr) -> bool {
+        if !Arc::ptr_eq(&self.map_id, &other.map_id) || self.size != other.size {
+            return false;
+        }
+        let Some(self_delta) = address.as_usize().checked_sub(self.start.as_usize()) else {
+            return false;
+        };
+        let Some(other_delta) = address.as_usize().checked_sub(other.start.as_usize()) else {
+            return false;
+        };
+        match (&self.file, &other.file) {
+            // Anonymous COW has no external byte cursor.  The map identity
+            // plus a hole-free virtual walk is its complete geometry; VMA
+            // splitting is free to rebase the stored fault origin.
+            (None, None) => true,
+            (
+                Some((self_file, self_start, self_end, self_sigbus)),
+                Some((other_file, other_start, other_end, other_sigbus)),
+            ) => {
+                self_file.ptr_eq(other_file)
+                    && self_end == other_end
+                    && self_sigbus == other_sigbus
+                    && self_start.checked_add(self_delta as u64)
+                        == other_start.checked_add(other_delta as u64)
             }
             _ => false,
         }
@@ -1605,6 +1700,13 @@ impl BackendOps for CowBackend {
                     source_flags,
                     destination_flags: if eager_copy {
                         eager_copy_flags
+                    } else if share_shadow_stack {
+                        // A borrowed vfork CET lease shares the live PTE,
+                        // including its per-leaf pkey after a split
+                        // pkey_mprotect. VMA flags alone may describe the
+                        // neighboring fragment, so do not rebuild this leaf
+                        // from the enclosing area's permissions.
+                        page_table_flags(source_flags)
                     } else {
                         cow_flags
                     },
@@ -1858,7 +1960,7 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_cow_rejects_unimplementable_cold_and_pageout() {
+    fn anonymous_cow_rejects_cold_but_pageout_has_no_source_cache_effect() {
         let Backend::Cow(backend) = Backend::new_alloc(VirtAddr::from(0x8000), PageSize::Size4K)
         else {
             unreachable!()
@@ -1869,10 +1971,7 @@ mod tests {
             backend.cold_file_pages(range),
             Err(AxError::OperationNotSupported)
         );
-        assert_eq!(
-            backend.pageout_file_pages(range),
-            Err(AxError::OperationNotSupported)
-        );
+        assert_eq!(backend.pageout_file_pages(range), Ok(0));
     }
 
     struct MockCowCloneOps {

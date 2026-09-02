@@ -7,7 +7,7 @@ use axerrno::{AxError, AxResult};
 use axfs::{CachedFilePagePin, CachedFilePinWindow};
 use axhal::{
     mem::{phys_to_virt, virt_to_phys},
-    paging::{MappingFlags, PageSize, PageTable, PageTableCursor},
+    paging::{MappingFlags, PageSize, PageTable, PageTableCursor, PreparedPageTableFrames},
 };
 use axsync::Mutex;
 use enum_dispatch::enum_dispatch;
@@ -21,19 +21,24 @@ mod linear;
 mod phys_pin;
 mod shared;
 
-pub use self::shared::{SharedAtomicU32, SharedPages, shmem_resident_pages};
+pub use self::shared::{ExternalPageLease, SharedAtomicU32, SharedPages, shmem_resident_pages};
+#[cfg(feature = "perf-sampling")]
+pub use self::shared::{SharedAtomicU64, SharedFixedView};
 pub(crate) use self::{
     cow::{PreparedCowHugeFrame, PreparedCowPage, register_demoted_huge_backing},
-    file::WritableMappingAdmission,
+    file::{FixedWritableMappingAdmission, WritableMappingAdmission},
     phys_pin::{
         PhysicalFramePins, PreparedPhysicalFramePins, any_frame_pinned,
         prepare_physical_pin_registry,
     },
-    shared::{PreparedFixedSharedMapping, SharedAtomicU64, SharedFixedView},
+    shared::PreparedFixedSharedMapping,
 };
 use super::{
-    AddrSpace,
-    mapping::{FileLikeMappingLease, FileMappingLease, MappingStatus, relocate_affine_origin},
+    AddrSpace, DeferredMappingFinalizer,
+    mapping::{
+        FileLikeMappingLease, FileMappingLease, MadviseReadahead, MadviseThp, MappingStatus,
+        relocate_affine_origin,
+    },
 };
 
 /// The byte offset of a futex word within a shared backing.
@@ -251,6 +256,24 @@ fn preflight_dense_unmap(range: VirtAddrRange, page_size: PageSize, pt: &PageTab
 }
 
 fn page_table_flags(flags: MappingFlags) -> MappingFlags {
+    // SHSTK is VMA type metadata.  Its PTE encoding is independent: Intel
+    // recognizes a shadow-stack leaf only as W=0,D=1.  A VMA with PROT_READ
+    // keeps the type but maps D=0; PROT_NONE retains the type in the VMA but
+    // deliberately leaves no accessible PTE.
+    if flags.contains(MappingFlags::SHADOW_STACK) {
+        if !flags.contains(MappingFlags::READ) {
+            return MappingFlags::empty();
+        }
+        let shadow_write = flags.contains(MappingFlags::WRITE);
+        let mut leaf = flags - MappingFlags::WRITE;
+        if !shadow_write {
+            leaf -= MappingFlags::SHADOW_STACK;
+        }
+        return leaf;
+    }
+    if !flags.intersects(MappingFlags::READ | MappingFlags::EXECUTE) {
+        return MappingFlags::empty();
+    }
     // x86 writable user pages are inherently readable in hardware. Keep VMA
     // flags exact for /proc/maps and mprotect, but normalize the hardware
     // permissions when touching page tables.
@@ -380,17 +403,129 @@ pub enum Backend {
 #[must_use = "detached mapping resources must remain live until TLB grace"]
 pub struct BackendRetirement {
     _cow: Option<cow::CowUnmapRetirement>,
+    /// Exact detached leaf state for a prepared fixed replacement.  Ordinary
+    /// teardown keeps using backend-specific retirement; only the prepared
+    /// path needs a reversible PTE journal.
+    exact_leaves: Option<Vec<(VirtAddr, PhysAddr, MappingFlags, PageSize)>>,
+    fixed_map: Option<PreparedFixedMap>,
+}
+
+enum PreparedFixedMap {
+    Passive,
+    Linear(PreparedPageTableFrames),
+    FileReadonly,
+    FileWritable(FixedWritableMappingAdmission),
 }
 
 impl BackendRetirement {
     const fn empty() -> Self {
-        Self { _cow: None }
+        Self {
+            _cow: None,
+            exact_leaves: None,
+            fixed_map: None,
+        }
     }
 
     fn cow(retirement: cow::CowUnmapRetirement) -> Self {
         Self {
             _cow: Some(retirement),
+            exact_leaves: None,
+            fixed_map: None,
         }
+    }
+
+    fn prepared_exact_snapshot(pt: &PageTable, start: VirtAddr, size: usize) -> Option<Self> {
+        let mut leaves = pt.collect_present_leaves(start, size).ok()?;
+        // `collect_present_leaves` validates full-leaf geometry and reserves
+        // the complete capacity.  Commit clears then refills this exact
+        // buffer through the allocation-free cursor API.
+        leaves.clear();
+        Some(Self {
+            _cow: None,
+            exact_leaves: Some(leaves),
+            fixed_map: None,
+        })
+    }
+
+    fn withdraw_prepared_exact_snapshot(
+        &mut self,
+        pt: &mut PageTable,
+        start: VirtAddr,
+        size: usize,
+    ) -> bool {
+        let Some(leaves) = self.exact_leaves.as_mut() else {
+            return false;
+        };
+        pt.cursor()
+            .drain_present_leaves_into(start, size, leaves)
+            .is_ok()
+    }
+
+    fn restore_prepared_exact_snapshot(
+        self,
+        pt: &mut PageTable,
+        start: VirtAddr,
+        size: usize,
+    ) -> bool {
+        let Self {
+            _cow,
+            exact_leaves,
+            fixed_map,
+        } = self;
+        if fixed_map.is_some() {
+            return false;
+        }
+        if let Some(cow) = _cow {
+            return cow.restore_prepared(pt);
+        }
+        let Some(leaves) = exact_leaves else {
+            return false;
+        };
+        let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
+            return false;
+        };
+        if leaves.iter().any(|(address, _, _, page_size)| {
+            *address < range.start
+                || address
+                    .as_usize()
+                    .checked_add(*page_size as usize)
+                    .map(VirtAddr::from)
+                    .is_none_or(|end| end > range.end)
+        }) {
+            return false;
+        }
+        let mut cursor = pt.cursor();
+        leaves
+            .into_iter()
+            .all(|(address, paddr, flags, page_size)| {
+                cursor.map(address, paddr, page_size, flags).is_ok()
+            })
+    }
+
+    fn promote_prepared_cow_retirement(&mut self) -> bool {
+        if self._cow.is_some() || self.fixed_map.is_some() {
+            return false;
+        }
+        let Some(leaves) = self.exact_leaves.take() else {
+            return false;
+        };
+        self._cow = Some(cow::CowUnmapRetirement::from_prepared_leaves(leaves));
+        true
+    }
+
+    fn prepared_fixed_map(preparation: PreparedFixedMap) -> Self {
+        Self {
+            _cow: None,
+            exact_leaves: None,
+            fixed_map: Some(preparation),
+        }
+    }
+
+    fn take_fixed_map(self) -> Option<PreparedFixedMap> {
+        if self._cow.is_some() || self.exact_leaves.is_some() {
+            return None;
+        }
+        self.fixed_map
     }
 }
 
@@ -405,6 +540,33 @@ impl MappingBackend for Backend {
         };
         if let Err(err) = BackendOps::map(self, range, flags, &mut pt.cursor()) {
             warn!("Failed to map area: {err:?}");
+            false
+        } else {
+            true
+        }
+    }
+
+    fn preflight_map(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+        _pt: &PageTable,
+    ) -> bool {
+        let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
+            return false;
+        };
+        let result = match self {
+            Self::Linear(backend) => backend.preflight_map(range),
+            // COW's VMA installation is deliberately lazy: its map hook has
+            // no page-table or allocator side effect once the range itself
+            // has been checked above.
+            Self::Cow(_) => Ok(()),
+            Self::Shared(backend) => backend.preflight_map(range, flags),
+            Self::File(backend) => backend.preflight_map(range, flags),
+        };
+        if let Err(error) = result {
+            warn!("Failed to preflight area map: {error:?}");
             false
         } else {
             true
@@ -507,6 +669,130 @@ impl DeferredUnmapBackend for Backend {
                 warn!("Failed to defer area unmap: {err:?}");
                 None
             }
+        }
+    }
+
+    fn prepare_deferred_unmap(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        pt: &PageTable,
+    ) -> Option<Self::Retirement> {
+        let range = VirtAddrRange::try_from_start_size(start, size)?;
+        BackendOps::preflight_unmap(self, range, pt).ok()?;
+        BackendRetirement::prepared_exact_snapshot(pt, start, size)
+    }
+
+    fn unmap_deferred_prepared(
+        &self,
+        retirement: &mut Self::Retirement,
+        start: VirtAddr,
+        size: usize,
+        pt: &mut PageTable,
+    ) -> bool {
+        let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
+            return false;
+        };
+        // The sibling transaction has already called both preflight hooks
+        // under the same MM serialization.  The cursor drains into the
+        // snapshot capacity prepared above, so this commit path allocates no
+        // PTE journal storage and preserves flags/accessed/dirty bits exactly.
+        if BackendOps::preflight_unmap(self, range, pt).is_err()
+            || !retirement.withdraw_prepared_exact_snapshot(pt, start, size)
+        {
+            return false;
+        }
+        if matches!(self, Self::Cow(_)) {
+            retirement.promote_prepared_cow_retirement()
+        } else {
+            true
+        }
+    }
+
+    fn preflight_restore_deferred(&self, start: VirtAddr, size: usize, pt: &PageTable) -> bool {
+        let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
+            return false;
+        };
+        // This repeats the structural leaf validation while the old mapping
+        // is still live.  `prepare_deferred_unmap` holds the matching exact
+        // leaf capacity until the consuming restore below.
+        BackendOps::preflight_unmap(self, range, pt).is_ok()
+    }
+
+    fn restore_deferred(
+        &self,
+        retirement: Self::Retirement,
+        start: VirtAddr,
+        size: usize,
+        pt: &mut PageTable,
+    ) -> bool {
+        retirement.restore_prepared_exact_snapshot(pt, start, size)
+    }
+
+    fn prepare_fixed_map(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+        pt: &PageTable,
+    ) -> Option<Self::Retirement> {
+        let range = VirtAddrRange::try_from_start_size(start, size)?;
+        let preparation = match self {
+            Self::Linear(backend) => {
+                PreparedFixedMap::Linear(backend.prepare_fixed_map(range, pt).ok()?)
+            }
+            Self::Cow(_) => PreparedFixedMap::Passive,
+            Self::Shared(backend) => {
+                backend.preflight_map(range, flags).ok()?;
+                PreparedFixedMap::Passive
+            }
+            Self::File(backend) => {
+                backend.preflight_map(range, flags).ok()?;
+                if flags.contains(MappingFlags::WRITE) {
+                    PreparedFixedMap::FileWritable(
+                        backend.begin_fixed_writable_mapping_admission().ok()?,
+                    )
+                } else {
+                    backend.preflight_fixed_readonly_map().ok()?;
+                    PreparedFixedMap::FileReadonly
+                }
+            }
+        };
+        Some(BackendRetirement::prepared_fixed_map(preparation))
+    }
+
+    fn map_fixed_prepared(
+        &self,
+        preparation: Self::Retirement,
+        start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+        pt: &mut PageTable,
+    ) -> bool {
+        let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
+            return false;
+        };
+        match (self, preparation.take_fixed_map()) {
+            (Self::Linear(backend), Some(PreparedFixedMap::Linear(mut tables))) => backend
+                .map_fixed_prepared(range, flags, pt, &mut tables)
+                .is_ok(),
+            (Self::Cow(backend), Some(PreparedFixedMap::Passive)) => {
+                BackendOps::map(backend, range, flags, &mut pt.cursor()).is_ok()
+            }
+            (Self::Shared(backend), Some(PreparedFixedMap::Passive)) => {
+                BackendOps::map(backend, range, flags, &mut pt.cursor()).is_ok()
+            }
+            (Self::File(backend), Some(PreparedFixedMap::FileWritable(admission))) => {
+                let _ = (range, pt);
+                backend.commit_fixed_writable_map(admission);
+                true
+            }
+            (Self::File(backend), Some(PreparedFixedMap::FileReadonly)) => {
+                let _ = (range, pt, flags);
+                backend.commit_fixed_readonly_map();
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -624,7 +910,7 @@ impl Backend {
         match self {
             Backend::Cow(_) if self.file_mapping().is_some() => MappingKind::FilePrivate,
             Backend::Cow(_) => MappingKind::AnonymousPrivate,
-            Backend::Shared(_) if self.mapping_status().has_mapping_owner() => {
+            Backend::Shared(_) if self.mapping_status().has_file_mapping_owner() => {
                 MappingKind::FileShared
             }
             Backend::Shared(_) => MappingKind::AnonymousShared,
@@ -666,13 +952,25 @@ impl Backend {
     }
 
     pub fn is_private_anonymous(&self) -> bool {
-        !self.mapping_status().has_mapping_owner()
+        !self.mapping_status().has_file_mapping_owner()
             && matches!(self, Backend::Cow(backend) if backend.is_private_anonymous())
     }
 
     /// A MAP_PRIVATE anonymous or file-backed COW mapping.
     pub(crate) fn is_private_cow(&self) -> bool {
         matches!(self, Backend::Cow(_))
+    }
+
+    /// Compares the affine backing cursor of two private-COW VMA fragments at
+    /// one virtual address.  This deliberately ignores fragment-local policy
+    /// such as MADV_HUGEPAGE while rejecting holes, rebased aliases and
+    /// discontinuous file offsets.
+    pub(crate) fn same_private_cow_geometry_at(&self, other: &Self, address: VirtAddr) -> bool {
+        matches!(
+            (self, other),
+            (Backend::Cow(lhs), Backend::Cow(rhs))
+                if lhs.same_mapping_geometry_at(rhs, address)
+        )
     }
 
     /// Linux's OOM reaper drops every private COW mapping, including a
@@ -690,8 +988,32 @@ impl Backend {
         self.mapping_status_mut().set_sealed();
     }
 
+    pub(crate) fn set_special_mapping_token(&mut self, token: u64) {
+        self.mapping_status_mut().set_special_token(token);
+    }
+
+    pub(crate) fn special_mapping_token(&self) -> Option<u64> {
+        self.mapping_status().special_token()
+    }
+
     pub(crate) fn clear_sealed(&mut self) {
         self.mapping_status_mut().clear_sealed();
+    }
+
+    pub(crate) fn madvise_readahead(&self) -> MadviseReadahead {
+        self.mapping_status().madvise_readahead()
+    }
+
+    pub(crate) fn set_madvise_readahead(&mut self, policy: MadviseReadahead) {
+        self.mapping_status_mut().set_madvise_readahead(policy);
+    }
+
+    pub(crate) fn madvise_thp(&self) -> MadviseThp {
+        self.mapping_status().madvise_thp()
+    }
+
+    pub(crate) fn set_madvise_thp(&mut self, policy: MadviseThp) {
+        self.mapping_status_mut().set_madvise_thp(policy);
     }
 
     fn mapping_status(&self) -> &MappingStatus {
@@ -723,6 +1045,23 @@ impl Backend {
 
     pub(crate) fn file_like_mapping(&self) -> Option<&FileLikeMappingLease> {
         self.mapping_status().file_like_mapping()
+    }
+
+    pub(crate) fn mapping_finalizer(&self) -> Option<&DeferredMappingFinalizer> {
+        self.mapping_status().mapping_finalizer()
+    }
+
+    pub(crate) fn replace_mapping_finalizer(
+        &mut self,
+        finalizer: Option<DeferredMappingFinalizer>,
+    ) {
+        self.mapping_status_mut()
+            .replace_mapping_finalizer(finalizer);
+    }
+
+    pub(crate) fn with_mapping_finalizer(mut self, finalizer: DeferredMappingFinalizer) -> Self {
+        self.replace_mapping_finalizer(Some(finalizer));
+        self
     }
 
     pub(crate) fn shared_file_location(&self) -> Option<&axfs_ng_vfs::Location> {
@@ -829,6 +1168,9 @@ impl Backend {
     pub(crate) fn pageout_file_pages(&self, range: VirtAddrRange) -> AxResult<usize> {
         match self {
             Self::File(backend) => backend.pageout_pages(range),
+            // MAP_PRIVATE COW leaves are private frames, not inode-cache
+            // aliases.  PAGEOUT may demote those leaves in the MM layer but
+            // must never evict the source file cache through this backend.
             Self::Cow(backend) => backend.pageout_file_pages(range),
             Self::Linear(_) | Self::Shared(_) => Err(AxError::OperationNotSupported),
         }
@@ -986,16 +1328,19 @@ impl Backend {
         }
     }
 
+    pub fn sync_range(&self, offset: u64, len: u64, data_only: bool) -> AxResult {
+        match self {
+            Backend::File(backend) => backend.sync_range(offset, len, data_only),
+            Backend::Linear(_) | Backend::Cow(_) | Backend::Shared(_) => Ok(()),
+        }
+    }
+
     /// Prefetch a file-backed VMA range without changing page-table
     /// residency.  Other backends deliberately remain a no-op: in
     /// particular, this must never manufacture anonymous pages for WILLNEED.
-    pub(crate) fn prefetch_file_backed(
-        &self,
-        range: VirtAddrRange,
-        aspace: &mut AddrSpace,
-    ) -> AxResult<usize> {
+    pub(crate) fn prefetch_file_backed(&self, range: VirtAddrRange) -> AxResult<usize> {
         match self {
-            Backend::File(backend) => backend.prefetch(range, aspace),
+            Backend::File(backend) => backend.prefetch(range),
             Backend::Cow(backend) => backend.prefetch_file_pages(range),
             Backend::Linear(_) | Backend::Shared(_) => Ok(0),
         }

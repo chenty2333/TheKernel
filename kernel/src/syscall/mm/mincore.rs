@@ -11,10 +11,35 @@ use alloc::{sync::Arc, vec::Vec};
 use axerrno::{AxError, AxResult};
 use axhal::paging::MappingFlags;
 use axsync::Mutex;
-use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
+use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+use thekernel_linux_mm::{MincorePlan, MmError};
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, vm_write_slice};
 
-use crate::mm::{AddrSpace, map_usercopy_error};
+use crate::{
+    config::{USER_SPACE_BASE, USER_SPACE_SIZE},
+    mm::{AddrSpace, map_usercopy_error},
+};
+
+fn map_mincore_plan_error(error: MmError) -> AxError {
+    match error {
+        MmError::Unaligned | MmError::InvalidPageSize => AxError::InvalidInput,
+        MmError::AddressOutOfRange | MmError::Overflow => AxError::NoMemory,
+        _ => AxError::InvalidInput,
+    }
+}
+
+/// Linux x86-64's `access_ok` boundary check, including a zero-length range.
+///
+/// A zero-sized range at address zero is valid, but a noncanonical/output
+/// pointer above the user limit is not. Mapping and permissions remain the
+/// responsibility of the later VMA walk or usercopy operation.
+fn mincore_access_ok(start: usize, len: usize) -> bool {
+    const USER_POINTER_LIMIT: usize = USER_SPACE_BASE + USER_SPACE_SIZE - 1;
+
+    start
+        .checked_add(len)
+        .is_some_and(|end| start <= USER_POINTER_LIMIT && end <= USER_POINTER_LIMIT)
+}
 
 fn mincore_snapshot(
     aspace_handle: &Arc<Mutex<AddrSpace>>,
@@ -106,39 +131,37 @@ pub fn sys_mincore<M: UserMemory + ?Sized>(
     length: usize,
     vec: *mut u8,
 ) -> AxResult<isize> {
-    let start_addr = VirtAddr::from(addr);
+    const USER_POINTER_LIMIT: usize = USER_SPACE_BASE + USER_SPACE_SIZE - 1;
+    let plan = MincorePlan::new(addr, length, PAGE_SIZE_4K, USER_POINTER_LIMIT)
+        .map_err(map_mincore_plan_error)?;
 
-    // EINVAL: addr must be a multiple of the page size
-    if !start_addr.is_aligned(PAGE_SIZE_4K) {
-        return Err(AxError::InvalidInput);
+    // Linux computes the output page count before access_ok(vec, pages). A
+    // zero-sized vec accepts NULL but still rejects an out-of-range pointer.
+    if !mincore_access_ok(vec as usize, plan.page_count()) {
+        return Err(AxError::BadAddress);
+    }
+    if plan.is_empty() {
+        return Ok(0);
     }
 
-    // EFAULT: vec must not be null (basic check, vm_write_slice will do full validation)
+    // A nonempty output must name user memory. The ABI plan above computes
+    // this output extent before this usercopy-specific check.
     if vec.is_null() {
         return Err(AxError::BadAddress);
     }
 
     debug!("sys_mincore <= addr: {addr:#x}, length: {length:#x}, vec: {vec:?}");
-
-    // Special case: length=0
-    // According to Linux kernel (mm/mincore.c), length=0 returns success
-    // WITHOUT validating that addr is mapped.  This is intentional behavior
-    // to match POSIX semantics where a zero-length operation is a no-op.
-    if length == 0 {
-        return Ok(0);
-    }
-
-    let rounded_len = length
-        .checked_add(PAGE_SIZE_4K - 1)
-        .ok_or(AxError::NoMemory)?
-        / PAGE_SIZE_4K
-        * PAGE_SIZE_4K;
-    let page_count = rounded_len / PAGE_SIZE_4K;
+    let start_addr = VirtAddr::from(plan.start());
 
     // The supplied address-space handle is captured at dispatch entry and is
     // also used by the explicit user-memory provider. Keep its lock scoped to
     // the residency snapshot; copyout below must not hold it.
-    let result = mincore_snapshot(&aspace_handle, start_addr, rounded_len, page_count)?;
+    let result = mincore_snapshot(
+        &aspace_handle,
+        start_addr,
+        plan.rounded_len(),
+        plan.page_count(),
+    )?;
 
     // EFAULT: Write result to user space only after releasing the address
     // space lock. The explicit provider reacquires the same selected address
@@ -146,4 +169,112 @@ pub fn sys_mincore<M: UserMemory + ?Sized>(
     vm_write_slice(memory, vec, result.as_slice()).map_err(map_usercopy_error)?;
 
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use core::{mem::MaybeUninit, ptr};
+
+    use thekernel_linux_usercopy::{UserCopyError, VmResult};
+
+    use super::*;
+
+    struct AccessProbe {
+        reads: usize,
+        writes: usize,
+    }
+
+    // SAFETY: This probe never dereferences userspace addresses and reports
+    // every attempted access as a fault.
+    unsafe impl UserMemory for AccessProbe {
+        fn read(&mut self, _: usize, _: &mut [MaybeUninit<u8>]) -> VmResult {
+            self.reads += 1;
+            Err(UserCopyError::BadAddress)
+        }
+
+        fn write(&mut self, _: usize, _: &[u8]) -> VmResult {
+            self.writes += 1;
+            Err(UserCopyError::BadAddress)
+        }
+    }
+
+    fn empty_aspace() -> Arc<Mutex<AddrSpace>> {
+        Arc::new(Mutex::new(
+            AddrSpace::new_empty(VirtAddr::from(USER_SPACE_BASE), PAGE_SIZE_4K).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn zero_length_accepts_null_vec_without_mapping_or_usercopy() {
+        let mut provider = AccessProbe {
+            reads: 0,
+            writes: 0,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        assert_eq!(
+            sys_mincore(
+                &mut memory,
+                empty_aspace(),
+                USER_SPACE_BASE,
+                0,
+                ptr::null_mut(),
+            ),
+            Ok(0)
+        );
+        drop(memory);
+
+        assert_eq!(
+            sys_mincore(
+                &mut UserMemoryContext::new(&mut provider),
+                empty_aspace(),
+                0,
+                0,
+                ptr::null_mut(),
+            ),
+            Ok(0)
+        );
+        assert_eq!((provider.reads, provider.writes), (0, 0));
+    }
+
+    #[test]
+    fn zero_length_keeps_alignment_and_address_limit_checks() {
+        let mut provider = AccessProbe {
+            reads: 0,
+            writes: 0,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        assert_eq!(
+            sys_mincore(
+                &mut memory,
+                empty_aspace(),
+                USER_SPACE_BASE + 1,
+                0,
+                ptr::null_mut(),
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            sys_mincore(
+                &mut memory,
+                empty_aspace(),
+                USER_SPACE_BASE + USER_SPACE_SIZE,
+                0,
+                ptr::null_mut(),
+            ),
+            Err(AxError::NoMemory)
+        );
+        assert_eq!(
+            sys_mincore(
+                &mut memory,
+                empty_aspace(),
+                USER_SPACE_BASE,
+                0,
+                (USER_SPACE_BASE + USER_SPACE_SIZE) as *mut u8,
+            ),
+            Err(AxError::BadAddress)
+        );
+        drop(memory);
+        assert_eq!((provider.reads, provider.writes), (0, 0));
+    }
 }

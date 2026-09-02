@@ -1,13 +1,17 @@
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs_ng_vfs::{Location, path::Path};
+use axfs_ng_vfs::{FsPathBuf, Location};
 use axtask::current;
 use linux_raw_sys::general::{AT_FDCWD, CAP_SYS_ADMIN, O_RDWR};
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, vm_load_until_nul};
 
 use crate::{
-    file::{ResolveAtResult, permission::{VfsSecurityContext, check_open_permissions_with_security}, resolve_at_with_security},
+    file::{
+        ResolveAtResult,
+        permission::{VfsSecurityContext, check_open_permissions_with_security},
+        resolve_at_with_security,
+    },
     mm::{activate, deactivate, map_usercopy_error},
     syscall::validate_pathname,
     task::AsThread,
@@ -28,11 +32,10 @@ fn resolve<M: UserMemory + ?Sized>(
     if bytes.is_empty() {
         return Err(LinuxError::ENOENT.into());
     }
-    let path = core::str::from_utf8(&bytes).map_err(|_| AxError::IllegalBytes)?;
-    let path = Path::new(path);
-    validate_pathname(path)?;
+    let path = FsPathBuf::from_vec(bytes);
+    validate_pathname(&path)?;
     let security = VfsSecurityContext::new(current().as_thread().current_cred());
-    match resolve_at_with_security(AT_FDCWD, Some(path.as_str()), 0, &security)? {
+    match resolve_at_with_security(AT_FDCWD, Some(&path), 0, &security)? {
         ResolveAtResult::File(location) => Ok(location),
         ResolveAtResult::Other(_) => Err(AxError::InvalidInput),
     }

@@ -24,6 +24,7 @@ use axsync::Mutex;
 use hashbrown::{HashMap, hash_map::Entry};
 use kernel_guard::NoPreemptIrqSave;
 use kspin::SpinNoIrq;
+use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_STACK};
 use memory_addr::{
     MemoryAddr, PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr, VirtAddrRange, is_aligned_4k,
 };
@@ -37,9 +38,9 @@ use thekernel_linux_mm::{
 };
 
 use super::{
-    DeferredUffdWake, LockExternalUffdOutcome, OptionalUffdPlan, PreparedRemapUffd,
-    PreparedUffdMutation, RemapUffdOutcome, UffdFaultLeafState, UffdIcacheSynchronization,
-    UffdPagePublication, UffdRemapKind, UffdResolverLease,
+    DeferredMappingFinalizer, DeferredUffdWake, LockExternalUffdOutcome, OptionalUffdPlan,
+    PreparedRemapUffd, PreparedUffdMutation, RemapUffdOutcome, UffdFaultLeafState,
+    UffdIcacheSynchronization, UffdPagePublication, UffdRemapKind, UffdResolverLease,
     asid::{AddressSpaceToken, HardwareAddressSpaceId, reserve_hardware_address_space_id},
     checked_align_up_4k,
     ldt::{ENTRIES, Ldt, UserDesc},
@@ -52,11 +53,41 @@ mod mapping;
 
 pub use self::backend::*;
 pub(crate) use self::{
-    alias_registry::{AliasLease, PendingAliasLease, SharedBackingKey, reserve_alias_mutation},
-    mapping::{FileLikeMappingLease, FileMappingLease, FileMappingSharing},
+    alias_registry::{
+        AliasLease, PendingAliasLease, SharedBackingKey, reserve_alias_mutation,
+        wait_for_alias_publication,
+    },
+    mapping::{
+        FileLikeMappingLease, FileMappingLease, FileMappingSharing, MadviseReadahead, MadviseThp,
+    },
 };
 
+/// Acquires a shared-backing publication admission without retaining the mm
+/// mutex while a THP alias mutation is in flight.  The caller must still take
+/// the mm lock and validate its intended VMA transaction before publishing.
+pub(crate) fn prepare_shared_alias_binding_lock_external(
+    key: SharedBackingKey,
+    aspace: &Arc<Mutex<AddrSpace>>,
+) -> AxResult<PendingAliasLease> {
+    loop {
+        let address_space_id = aspace.lock().address_space_id();
+        match PendingAliasLease::try_prepare(key, aspace, address_space_id) {
+            Ok(pending) => return Ok(pending),
+            Err(AxError::WouldBlock) => wait_for_alias_publication(key),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 type SharedFolioPteRun = ReplacedPteRun<X64PTE, PagingHandlerImpl>;
+
+/// Fully prepared advisory-sidecar publication for mremap.  Construction
+/// works on detached maps so commit cannot allocate after VMA/PTE mutation.
+pub(crate) struct PreparedMadviseSidecarRemap {
+    guard_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    hwpoison_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    free_pages: BTreeMap<VirtAddr, LazyFreePage>,
+}
 
 /// A detached P1 run held until every alias has published its matching PMD.
 /// Dropping it commits the page-table half of the transaction; passing it to
@@ -64,6 +95,18 @@ type SharedFolioPteRun = ReplacedPteRun<X64PTE, PagingHandlerImpl>;
 pub(crate) struct SharedFolioPteReplacement {
     start: VirtAddr,
     run: SharedFolioPteRun,
+}
+
+/// A non-target shared alias kept at 4 KiB granularity while another alias
+/// promotes the backing object.  It records the exact pre-promotion leaf so
+/// a failed multi-mm publication can put the old backing back without ever
+/// exposing a PTE to a frame retained only by `SharedFolio::old_pages`.
+#[derive(Clone, Copy)]
+pub(crate) struct SharedFolioPteRedirect {
+    vaddr: VirtAddr,
+    old_paddr: PhysAddr,
+    flags: MappingFlags,
+    backing_index: usize,
 }
 
 /// One alias switched from a shared compound PMD back to protected 4 KiB
@@ -74,9 +117,20 @@ pub(crate) struct SharedFolioDemotionReplacement {
     pub(crate) flags: MappingFlags,
 }
 
+pub(crate) struct PreparedSharedFolioPmdRedirect {
+    pub(crate) start: VirtAddr,
+    pub(crate) flags: MappingFlags,
+    frames: Vec<PhysAddr>,
+    tables: PreparedPageTableFrames,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PageFaultResult {
     Handled,
+    /// Internal only: a file-cache fill found that reclaim must run after the
+    /// address-space mutex is released. `FaultSession` consumes this result
+    /// and retries VMA validation; it is never exposed to user mode.
+    Retry,
     Failed(PageFaultFailure),
 }
 
@@ -150,6 +204,7 @@ fn classify_page_population(result: AxResult<usize>) -> PageFaultResult {
     match result {
         Ok(0) => PageFaultResult::Failed(PageFaultFailure::InternalInconsistency),
         Ok(_) => PageFaultResult::Handled,
+        Err(err) if err.canonicalize() == AxError::ResourceBusy => PageFaultResult::Retry,
         Err(err) if err.canonicalize() == AxError::NoMemory => {
             PageFaultResult::Failed(PageFaultFailure::OutOfMemory)
         }
@@ -231,6 +286,26 @@ const USER_IO_PIN_MAX_PAGES: u64 = USER_IO_PIN_MAX_BYTES / PAGE_SIZE_4K as u64;
 /// transaction.  The latter may allocate and fail; this predicate must be a
 /// side-effect-free proof that no VMA sidecar contract is crossed.
 pub(crate) const COLLAPSE_2M_SIZE: usize = 2 * 1024 * 1024;
+
+/// Linux MMF_DISABLE_THP state.  It belongs to the address space: separate
+/// CLONE_VM process groups must observe the same setting.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ThpDisableMode {
+    #[default]
+    Enabled,
+    Disabled,
+    ExceptAdvised,
+}
+
+impl ThpDisableMode {
+    pub(crate) const fn prctl_value(self) -> usize {
+        match self {
+            Self::Enabled => 0,
+            Self::Disabled => 1,
+            Self::ExceptAdvised => 1 | 2,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Collapse2MCandidateFacts {
@@ -1161,6 +1236,27 @@ impl TlbState {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LazyFreePage {
+    generation: u64,
+    paddr: PhysAddr,
+    restore_flags: MappingFlags,
+}
+
+/// Detached policy state for a prepared fixed replacement.  All fallible
+/// cloning and any B-tree growth needed by an incoming locked map finishes
+/// before old PTE/VMA withdrawal; publication is a plain field swap.
+struct PreparedFixedReplacementSidecars {
+    growdown_starts: BTreeSet<VirtAddr>,
+    madvise_guard_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    madvise_hwpoison_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    madvise_free_pages: BTreeMap<VirtAddr, LazyFreePage>,
+    wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    dontfork_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    dontdump_ranges: Vec<(VirtAddr, VirtAddr)>,
+    locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
+}
+
 pub struct AddrSpace {
     va_range: VirtAddrRange,
     address_space_id: AddressSpaceId,
@@ -1175,6 +1271,10 @@ pub struct AddrSpace {
     /// space rather than ProcessData because separate CLONE_VM process groups
     /// must never concurrently retire the same PTE/backing ownership.
     oom_reap_state: AtomicU8,
+    /// PR_SET_THP_DISABLE is an mm property and therefore naturally shared by
+    /// every CLONE_VM owner. Ordinary fork copies it; exec explicitly carries
+    /// it into the replacement image.
+    thp_disable_mode: ThpDisableMode,
     /// Monotonic PTE invalidation generation and bounded per-CPU residency.
     /// The state is shared with scheduler hooks so they can publish residency
     /// without taking the address-space mutex.
@@ -1184,9 +1284,31 @@ pub struct AddrSpace {
     areas: MemorySet<Backend>,
     mapping_identities: MappingIdentityIndex,
     growdown_starts: BTreeSet<VirtAddr>,
+    /// MADV_GUARD_INSTALL overlays anonymous VMAs with faulting guard ranges
+    /// without splitting their ownership/lineage.  PTEs are discarded at
+    /// installation and page-fault admission consults this sidecar first.
+    madvise_guard_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    /// Software representation of MADV_HWPOISON pages.  The real hardware
+    /// error path and this administrative injection share SIGBUS-class fault
+    /// behavior through `BackingUnavailable` below.
+    madvise_hwpoison_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    /// Pages accepted by MADV_FREE.  A generation is assigned at admission
+    /// and the leaf is write-protected; a later write fault consumes exactly
+    /// that generation before restoring write access.
+    madvise_free_pages: BTreeMap<VirtAddr, LazyFreePage>,
+    next_madvise_free_generation: u64,
     wipe_on_fork_ranges: BTreeMap<VirtAddr, VirtAddr>,
     dontfork_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    /// VM_DONTDUMP policy installed by MADV_DONTDUMP. A sidecar preserves
+    /// partial-VMA byte ranges without inventing a hardware PTE flag.
+    dontdump_ranges: Vec<(VirtAddr, VirtAddr)>,
     locked_ranges: BTreeMap<VirtAddr, VirtAddr>,
+    /// File-cache eviction fences published before aliases are write
+    /// protected.  The address-space mutex protects this table together with
+    /// the VMA/PTE topology, so an alias-publishing mutation can never race a
+    /// prepared cache-page retirement unnoticed.
+    file_eviction_fences: Vec<FileEvictionFenceKey>,
+    next_file_eviction_fence_generation: u64,
     /// CET default shadow stacks are owned by Linux tasks, but the ownership
     /// lives in the mm that owns the VMA.  In particular, CLONE_VM peers may
     /// have distinct ProcessData objects, so keeping this in ProcessData (or
@@ -1214,14 +1336,67 @@ pub struct AddrSpace {
     pt: PageTable,
 }
 
+/// One in-flight file-cache page retirement in this address space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileEvictionFenceKey {
+    pub cache: axfs::CachedFileIdentity,
+    pub page_number: u32,
+    pub generation: u64,
+}
+
+/// Internal, lock-external retry state for an alias mutation that encountered
+/// a cache-page eviction fence.  It is never translated to a userspace errno:
+/// callers drop the `AddrSpace` mutex, wait for this exact cache's terminal
+/// completion edge, then revalidate the VMA and retry their whole operation.
+#[derive(Clone)]
+pub(crate) struct FileEvictionRetry {
+    pub(crate) cache: axfs::CachedFile,
+    pub(crate) key: FileEvictionFenceKey,
+    observed_epoch: u64,
+}
+
+impl FileEvictionRetry {
+    fn new(cache: axfs::CachedFile, key: FileEvictionFenceKey) -> Self {
+        let observed_epoch = cache.eviction_completion_epoch();
+        Self {
+            cache,
+            key,
+            observed_epoch,
+        }
+    }
+
+    pub(crate) fn wait(self) -> AxResult {
+        self.cache
+            .wait_for_eviction_completion(self.observed_epoch)
+            .map_err(|_| AxError::Interrupted)
+    }
+}
+
 /// Kernel-only ownership for one automatically allocated CET shadow stack.
 /// Explicit `map_shadow_stack(2)` mappings never enter this registry.
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CetDefaultShadowStackExtent {
+    pub start: VirtAddr,
+    pub size: usize,
+}
+
+impl CetDefaultShadowStackExtent {
+    fn end(self) -> Option<VirtAddr> {
+        self.start.checked_add(self.size)
+    }
+}
+
+/// `start` and `size` retain the first extent for the small number of
+/// diagnostic callers that only need a normal, contiguous automatic stack.
+/// Cleanup and vfork ownership always use `extents`: peer VMA operations may
+/// split an automatic stack, move an interior range, or duplicate a range.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CetDefaultShadowStackOwner {
     pub task_id: u32,
     pub start: VirtAddr,
     pub size: usize,
+    pub extents: Vec<CetDefaultShadowStackExtent>,
     pub ownership: CetDefaultShadowStackOwnership,
 }
 
@@ -1274,12 +1449,14 @@ impl<'a, B: memory_set::MappingBackend> PreparedAreaProtect<'a, B> {
         self.areas.iter().filter_map(move |area| {
             let affected_start = area.start().max(start);
             let affected_end = area.end().min(end);
-            (affected_start < affected_end).then_some((
-                area,
-                affected_start,
-                affected_end,
-                self.flags_at(affected_start),
-            ))
+            (affected_start < affected_end).then(|| {
+                (
+                    area,
+                    affected_start,
+                    affected_end,
+                    self.flags_at(affected_start),
+                )
+            })
         })
     }
 
@@ -1538,6 +1715,23 @@ impl ExistingLineageMapError {
     }
 }
 
+/// Prepared non-MM work coupled to one installed MAP_FIXED replacement.
+/// Rollback must be allocation-free and restore the participant's exact
+/// pre-install authority before the memory-set guard restores old PTEs.
+pub(crate) trait FixedReplacementParticipant {
+    /// Runs after every fallible MM admission has completed but before the
+    /// incoming PTE/VMA becomes reachable.  Participants use this edge for
+    /// topology identities (for example XOL) which must not describe the new
+    /// mapping even for one runnable peer.
+    fn before_install(&mut self, aspace: &mut AddrSpace) -> AxResult;
+    fn commit(&mut self, aspace: &mut AddrSpace) -> AxResult;
+    /// Undo every participant effect while the incoming VMA/PTEs are still
+    /// live.  The fixed-replacement guard will restore old leaves immediately
+    /// afterwards regardless of this result; an error is reported rather
+    /// than silently converted into a deferred cleanup.
+    fn rollback(&mut self, aspace: &mut AddrSpace) -> AxResult;
+}
+
 const fn classify_existing_lineage_population_failure(
     error: AxError,
     rollback_failed: bool,
@@ -1601,6 +1795,7 @@ struct RemapPolicyPlan {
     growdown: bool,
     wipe_on_fork: Vec<RelativePolicyRange>,
     dontfork: Vec<RelativePolicyRange>,
+    dontdump: Vec<RelativePolicyRange>,
     locked: Vec<RelativePolicyRange>,
 }
 
@@ -1678,6 +1873,87 @@ impl PreparedProtect<'_> {
 
 impl AddrSpace {
     const STACK_GUARD_GAP_PAGES: usize = 256;
+
+    /// Publishes an alias-creation fence before a cache eviction changes any
+    /// PTE permission.  All allocation is done first so reservation abort is
+    /// infallible once write protection has started.
+    pub(crate) fn publish_file_eviction_fence(
+        &mut self,
+        cache: axfs::CachedFileIdentity,
+        page_number: u32,
+    ) -> AxResult<FileEvictionFenceKey> {
+        if self.file_eviction_fences.len() == self.file_eviction_fences.capacity() {
+            self.file_eviction_fences
+                .try_reserve(1)
+                .map_err(|_| AxError::NoMemory)?;
+        }
+        let generation = self
+            .next_file_eviction_fence_generation
+            .checked_add(1)
+            .ok_or(AxError::NoMemory)?;
+        self.next_file_eviction_fence_generation = generation;
+        let key = FileEvictionFenceKey {
+            cache,
+            page_number,
+            generation,
+        };
+        self.file_eviction_fences.push(key);
+        Ok(key)
+    }
+
+    /// True when publishing or upgrading an alias for this cache page must
+    /// retry after the in-flight eviction completes.  Permission revocation
+    /// and unmap intentionally do not consult this table.
+    pub(crate) fn file_eviction_fenced(
+        &self,
+        cache: axfs::CachedFileIdentity,
+        page_number: u32,
+    ) -> bool {
+        self.file_eviction_fences
+            .iter()
+            .any(|key| key.cache == cache && key.page_number == page_number)
+    }
+
+    /// Finds the first cache page fenced inside a prospective alias-creating
+    /// range.  Readers and destructive/revoking paths deliberately do not
+    /// call this: only operations that can create, copy, or upgrade a file
+    /// alias are required to wait.
+    pub(crate) fn file_eviction_retry_for_range(
+        &self,
+        start: VirtAddr,
+        size: usize,
+    ) -> Option<FileEvictionRetry> {
+        let end = start.checked_add(size)?;
+        for key in &self.file_eviction_fences {
+            for area in self.areas.iter() {
+                let Backend::File(file) = area.backend() else {
+                    continue;
+                };
+                if let Some(cache) = file.cache_for_eviction_alias(key.cache, key.page_number)
+                    && let Some(alias) = file.eviction_alias_address(key.page_number)
+                    && alias >= start
+                    && alias < end
+                    && area.start() <= alias
+                    && alias < area.end()
+                {
+                    return Some(FileEvictionRetry::new(cache, *key));
+                }
+            }
+        }
+        None
+    }
+
+    /// Completes one prepare transaction and makes waiting mutations eligible
+    /// to revalidate.  A missing key is an invariant violation: only the
+    /// reservation which published this generation may retire it.
+    pub(crate) fn complete_file_eviction_fence(&mut self, key: FileEvictionFenceKey) {
+        let index = self
+            .file_eviction_fences
+            .iter()
+            .position(|active| *active == key)
+            .expect("file eviction reservation lost its fence");
+        self.file_eviction_fences.swap_remove(index);
+    }
 
     /// Returns the address space base.
     pub const fn base(&self) -> VirtAddr {
@@ -1897,15 +2173,23 @@ impl AddrSpace {
             hardware_asid,
             maxrss_kb: AtomicU64::new(0),
             oom_reap_state: AtomicU8::new(0),
+            thp_disable_mode: ThpDisableMode::Enabled,
             tlb: Arc::try_new(TlbState::new()).map_err(|_| AxError::NoMemory)?,
             topology_mapping_id,
             topology_generation,
             areas: MemorySet::new(),
             mapping_identities: MappingIdentityIndex::new(),
             growdown_starts: BTreeSet::new(),
+            madvise_guard_ranges: BTreeMap::new(),
+            madvise_hwpoison_ranges: BTreeMap::new(),
+            madvise_free_pages: BTreeMap::new(),
+            next_madvise_free_generation: 0,
             wipe_on_fork_ranges: BTreeMap::new(),
             dontfork_ranges: BTreeMap::new(),
+            dontdump_ranges: Vec::new(),
             locked_ranges: BTreeMap::new(),
+            file_eviction_fences: Vec::new(),
+            next_file_eviction_fence_generation: 0,
             cet_default_shadow_stacks: Vec::new(),
             alias_bindings: BTreeMap::new(),
             swapped: BTreeMap::new(),
@@ -2003,26 +2287,20 @@ impl AddrSpace {
         Ok(())
     }
 
-    /// Reserves the reverse-map generation required for one newly published
-    /// shared VMA.  The outer syscall owns the returned guard across map and
-    /// must either commit it immediately after VMA publication or let Drop
-    /// abort it on every failure path.
-    pub(crate) fn prepare_shared_alias_binding(
-        &self,
-        key: SharedBackingKey,
-        aspace: &Arc<Mutex<AddrSpace>>,
-    ) -> AxResult<Option<PendingAliasLease>> {
-        if self.alias_bindings.contains_key(&key) {
-            return Ok(None);
-        }
-        PendingAliasLease::prepare(key, aspace, self.address_space_id).map(Some)
-    }
-
     pub(crate) fn commit_shared_alias_binding(&mut self, pending: PendingAliasLease) {
-        let lease = pending.commit();
+        let Some(lease) = pending.commit() else {
+            return;
+        };
         let key = lease.key();
-        let previous = self.alias_bindings.insert(key, lease);
-        debug_assert!(previous.is_none(), "duplicate shared alias commit");
+        // Registry admission is per-(mm, backing).  A concurrent mapper may
+        // have committed the same binding between lock-external preparation
+        // and this publication; retain its lease and discard this no-longer
+        // needed duplicate ownership instead of overwriting it.
+        if self.alias_bindings.contains_key(&key) {
+            drop(lease);
+        } else {
+            self.alias_bindings.insert(key, lease);
+        }
     }
 
     fn prune_shared_alias_bindings(&mut self) {
@@ -2031,6 +2309,12 @@ impl AddrSpace {
                 .iter()
                 .any(|area| area.backend().shared_backing_key() == Some(*key))
         });
+    }
+
+    /// Completes a caller-owned replacement interval that temporarily kept
+    /// its old reverse-map lease alive across destructive unmap.
+    pub(crate) fn finish_shared_alias_binding_transition(&mut self) {
+        self.prune_shared_alias_bindings();
     }
 
     fn mapping_identity(&self, lineage: MappingLineage) -> AxResult<MappingIdentityState> {
@@ -2055,6 +2339,212 @@ impl AddrSpace {
     pub fn mark_growdown(&mut self, start: VirtAddr) {
         self.growdown_starts.insert(start);
         self.refresh_growdown_starts();
+    }
+
+    /// Installs Linux MADV_GUARD_INSTALL state on an already mapped private
+    /// anonymous interval.  Guard pages retain their VMA identity but are
+    /// deliberately non-resident and reject every subsequent access.
+    pub fn install_madvise_guard(&mut self, start: VirtAddr, size: usize) -> AxResult<()> {
+        self.validate_region(start, size)?;
+        if self.range_is_locked(start, size) {
+            return Err(AxError::ResourceBusy);
+        }
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        let mut cursor = start;
+        while cursor < end {
+            let area = self.areas.find(cursor).ok_or(AxError::NoMemory)?;
+            if area.start() > cursor || !area.backend().is_private_anonymous() {
+                return Err(AxError::InvalidInput);
+            }
+            cursor = area.end().min(end);
+        }
+        self.discard_pages(start, size)?;
+        Self::clear_interval(&mut self.madvise_guard_ranges, start, size);
+        self.madvise_guard_ranges.insert(start, end);
+        Ok(())
+    }
+
+    /// Removes a previously installed MADV guard.  The next access follows
+    /// the ordinary anonymous missing-page path and receives a fresh zeroed
+    /// page; removed guards never resurrect discarded data.
+    pub fn remove_madvise_guard(&mut self, start: VirtAddr, size: usize) -> AxResult<()> {
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        let mut cursor = start;
+        while cursor < end {
+            let Some((&guard_start, &guard_end)) =
+                self.madvise_guard_ranges.range(..=cursor).next_back()
+            else {
+                return Err(AxError::InvalidInput);
+            };
+            if guard_start > cursor || guard_end <= cursor {
+                return Err(AxError::InvalidInput);
+            }
+            cursor = guard_end.min(end);
+        }
+        // A remove request may span adjacent guard records. Split only at
+        // record boundaries; preserving prefix/suffix guards is required for
+        // partial removal.
+        let overlapping: Vec<_> = self
+            .madvise_guard_ranges
+            .range(..end)
+            .filter_map(|(&guard_start, &guard_end)| {
+                (guard_end > start).then_some((guard_start, guard_end))
+            })
+            .collect();
+        for (guard_start, guard_end) in overlapping {
+            self.madvise_guard_ranges.remove(&guard_start);
+            if guard_start < start {
+                self.madvise_guard_ranges.insert(guard_start, start);
+            }
+            if guard_end > end {
+                self.madvise_guard_ranges.insert(end, guard_end);
+            }
+        }
+        Ok(())
+    }
+
+    fn is_madvise_guard(&self, address: VirtAddr) -> bool {
+        self.madvise_guard_ranges
+            .range(..=address)
+            .next_back()
+            .is_some_and(|(_, &end)| address < end)
+    }
+
+    pub fn install_madvise_hwpoison(&mut self, start: VirtAddr, size: usize) -> AxResult<()> {
+        self.validate_region(start, size)?;
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        self.discard_pages(start, size)?;
+        Self::clear_interval(&mut self.madvise_hwpoison_ranges, start, size);
+        self.madvise_hwpoison_ranges.insert(start, end);
+        Ok(())
+    }
+
+    fn is_madvise_hwpoison(&self, address: VirtAddr) -> bool {
+        self.madvise_hwpoison_ranges
+            .range(..=address)
+            .next_back()
+            .is_some_and(|(_, &end)| address < end)
+    }
+
+    /// Relocates advisory fault sidecars after a committed mremap.  These
+    /// ranges are part of a VMA's user-visible fault contract, so leaving
+    /// them at the old virtual address would poison a later unrelated mmap.
+    pub(crate) fn prepare_remap_madvise_sidecars(
+        &self,
+        source: VirtAddr,
+        old_size: usize,
+        destination: VirtAddr,
+        new_size: usize,
+        dont_unmap: bool,
+    ) -> PreparedMadviseSidecarRemap {
+        fn relocate(
+            map: &mut BTreeMap<VirtAddr, VirtAddr>,
+            source: VirtAddr,
+            old_size: usize,
+            destination: VirtAddr,
+            new_size: usize,
+            dont_unmap: bool,
+        ) {
+            let Some(source_end) = source.checked_add(old_size) else {
+                return;
+            };
+            let Some(destination_end) = destination.checked_add(new_size) else {
+                return;
+            };
+            let source_records: Vec<_> = map
+                .range(..source_end)
+                .filter_map(|(&start, &end)| (end > source).then_some((start, end)))
+                .collect();
+            let mut moved = Vec::new();
+            for (start, end) in source_records {
+                let clip_start = start.max(source);
+                let clip_end = end.min(source_end);
+                if clip_start >= clip_end {
+                    continue;
+                }
+                let offset = clip_start.sub_addr(source);
+                let Some(new_start) = destination.checked_add(offset) else {
+                    continue;
+                };
+                let new_end = new_start
+                    .checked_add(clip_end.sub_addr(clip_start))
+                    .map(|end| end.min(destination_end));
+                if let Some(new_end) = new_end.filter(|end| *end > new_start) {
+                    moved.push((new_start, new_end));
+                }
+            }
+            if !dont_unmap {
+                AddrSpace::clear_interval(map, source, old_size);
+            }
+            AddrSpace::clear_interval(map, destination, new_size);
+            for (start, end) in moved {
+                map.insert(start, end);
+            }
+        }
+        let mut guard_ranges = self.madvise_guard_ranges.clone();
+        let mut hwpoison_ranges = self.madvise_hwpoison_ranges.clone();
+        let mut free_pages = self.madvise_free_pages.clone();
+        relocate(
+            &mut guard_ranges,
+            source,
+            old_size,
+            destination,
+            new_size,
+            dont_unmap,
+        );
+        relocate(
+            &mut hwpoison_ranges,
+            source,
+            old_size,
+            destination,
+            new_size,
+            dont_unmap,
+        );
+        let source_end = source.checked_add(old_size);
+        let destination_end = destination.checked_add(new_size);
+        if let (Some(source_end), Some(destination_end)) = (source_end, destination_end) {
+            let moved: Vec<_> = free_pages
+                .range(source..source_end)
+                .map(|(&page, &generation)| (page, generation))
+                .collect();
+            if !dont_unmap {
+                free_pages.retain(|&page, _| page < source || page >= source_end);
+            }
+            free_pages.retain(|&page, _| page < destination || page >= destination_end);
+            for (page, generation) in moved {
+                if let Some(new_page) = destination.checked_add(page.sub_addr(source))
+                    && new_page < destination_end
+                {
+                    free_pages.insert(new_page, generation);
+                }
+            }
+        }
+        PreparedMadviseSidecarRemap {
+            guard_ranges,
+            hwpoison_ranges,
+            free_pages,
+        }
+    }
+
+    pub(crate) fn commit_prepared_madvise_sidecars(
+        &mut self,
+        prepared: PreparedMadviseSidecarRemap,
+    ) {
+        self.madvise_guard_ranges = prepared.guard_ranges;
+        self.madvise_hwpoison_ranges = prepared.hwpoison_ranges;
+        self.madvise_free_pages = prepared.free_pages;
+    }
+
+    /// Returns the current VMA start for a MAP_GROWSDOWN mapping containing
+    /// `address`.  The grow-down identity is deliberately kept out of the
+    /// generic VMA flags: it is fault policy, not a hardware permission bit.
+    /// `mprotect(PROT_GROWSDOWN)` is the one non-fault consumer of that
+    /// identity and must extend its operation to this moving VMA boundary.
+    pub(crate) fn growdown_start_containing(&self, address: VirtAddr) -> Option<VirtAddr> {
+        let area = self.find_area(address)?;
+        self.growdown_starts
+            .contains(&area.start())
+            .then_some(area.start())
     }
 
     fn move_growdown_start(&mut self, old_start: VirtAddr, new_start: VirtAddr) {
@@ -2141,6 +2631,96 @@ impl AddrSpace {
             .any(|(&range_start, &range_end)| range_end > start && range_start < end)
     }
 
+    fn try_clone_interval_vec(
+        ranges: &[(VirtAddr, VirtAddr)],
+        extra_capacity: usize,
+    ) -> AxResult<Vec<(VirtAddr, VirtAddr)>> {
+        let capacity = ranges
+            .len()
+            .checked_add(extra_capacity)
+            .ok_or(AxError::NoMemory)?;
+        let mut cloned = Vec::new();
+        cloned
+            .try_reserve_exact(capacity)
+            .map_err(|_| AxError::NoMemory)?;
+        cloned.extend_from_slice(ranges);
+        Ok(cloned)
+    }
+
+    /// Removes one interval from a pre-reserved sorted vector.  Splitting one
+    /// containing range is the only operation that can grow the vector.
+    fn clear_interval_vec(ranges: &mut Vec<(VirtAddr, VirtAddr)>, start: VirtAddr, size: usize) {
+        if size == 0 {
+            return;
+        }
+        let end = start + size;
+        let mut index = 0usize;
+        while index < ranges.len() {
+            let (range_start, range_end) = ranges[index];
+            if range_end <= start {
+                index += 1;
+                continue;
+            }
+            if range_start >= end {
+                break;
+            }
+            if range_start < start && range_end > end {
+                ranges[index].1 = start;
+                debug_assert!(ranges.len() < ranges.capacity());
+                ranges.insert(index + 1, (end, range_end));
+                break;
+            }
+            if range_start < start {
+                ranges[index].1 = start;
+                index += 1;
+                continue;
+            }
+            if range_end > end {
+                ranges[index] = (end, range_end);
+                break;
+            }
+            ranges.remove(index);
+        }
+    }
+
+    /// Adds one range to a pre-reserved sorted, coalesced interval vector.
+    fn insert_interval_vec(ranges: &mut Vec<(VirtAddr, VirtAddr)>, start: VirtAddr, end: VirtAddr) {
+        if start >= end {
+            return;
+        }
+        let mut new_start = start;
+        let mut new_end = end;
+        let index = ranges.partition_point(|(_, range_end)| *range_end < start);
+        while index < ranges.len() && ranges[index].0 <= new_end {
+            let (range_start, range_end) = ranges.remove(index);
+            new_start = new_start.min(range_start);
+            new_end = new_end.max(range_end);
+        }
+        debug_assert!(ranges.len() < ranges.capacity());
+        ranges.insert(index, (new_start, new_end));
+    }
+
+    fn interval_vec_end_covering(
+        ranges: &[(VirtAddr, VirtAddr)],
+        addr: VirtAddr,
+    ) -> Option<VirtAddr> {
+        let index = ranges.partition_point(|(start, _)| *start <= addr);
+        index
+            .checked_sub(1)
+            .and_then(|index| (ranges[index].1 > addr).then_some(ranges[index].1))
+    }
+
+    fn next_interval_vec_start(
+        ranges: &[(VirtAddr, VirtAddr)],
+        addr: VirtAddr,
+        limit: VirtAddr,
+    ) -> Option<VirtAddr> {
+        let index = ranges.partition_point(|(start, _)| *start <= addr);
+        ranges
+            .get(index)
+            .and_then(|(start, _)| (*start < limit).then_some(*start))
+    }
+
     /// Linux mseal requires a mapped, gap-free range. The metadata transaction
     /// splits boundary VMAs before setting VM_SEALED, with no PTE mutation.
     pub(crate) fn seal(&mut self, start: VirtAddr, size: usize) -> AxResult {
@@ -2179,6 +2759,111 @@ impl AddrSpace {
                 Err(AxError::from(error))
             }
         }
+    }
+
+    /// Installs Linux VM_RAND_READ/VM_SEQ_READ policy on exactly this VMA
+    /// range.  `update_metadata_with_limit` owns boundary splitting and later
+    /// re-merging; keeping the policy in `MappingStatus` makes fork and
+    /// mremap preserve it without an address-keyed compatibility side table.
+    pub(crate) fn set_madvise_readahead(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        policy: MadviseReadahead,
+    ) -> AxResult {
+        self.validate_region(start, size)?;
+        if size == 0 {
+            return Ok(());
+        }
+        if !range_is_fully_mapped(&self.areas, start, size) {
+            return Err(AxError::NoMemory);
+        }
+        let range = VirtAddrRange::new(start, start + size);
+        if self
+            .areas
+            .iter_overlapping(range)
+            .all(|area| area.backend().madvise_readahead() == policy)
+        {
+            return Ok(());
+        }
+
+        let next_topology_generation = self.next_topology_generation()?;
+        let updated = self.areas.update_metadata_with_limit(
+            start,
+            size,
+            |backend| backend.madvise_readahead() != policy,
+            |backend| backend.set_madvise_readahead(policy),
+            MAX_VMA_FRAGMENTS,
+        );
+        match updated {
+            Ok(()) => {
+                self.commit_topology_generation(next_topology_generation);
+                Ok(())
+            }
+            Err(error) => {
+                let (error, changed) = error.into_parts();
+                if changed {
+                    self.commit_topology_generation(next_topology_generation);
+                }
+                Err(AxError::from(error))
+            }
+        }
+    }
+
+    /// Installs VM_HUGEPAGE/VM_NOHUGEPAGE metadata without touching present
+    /// page-table geometry. In particular, NOHUGEPAGE never demotes an
+    /// existing transparent huge leaf merely to split the VMA policy.
+    pub(crate) fn set_madvise_thp(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        policy: MadviseThp,
+    ) -> AxResult {
+        self.validate_region(start, size)?;
+        if size == 0 {
+            return Ok(());
+        }
+        if !range_is_fully_mapped(&self.areas, start, size) {
+            return Err(AxError::NoMemory);
+        }
+        let range = VirtAddrRange::new(start, start + size);
+        if self
+            .areas
+            .iter_overlapping(range)
+            .all(|area| area.backend().madvise_thp() == policy)
+        {
+            return Ok(());
+        }
+
+        let next_topology_generation = self.next_topology_generation()?;
+        let updated = self.areas.update_metadata_with_limit(
+            start,
+            size,
+            |backend| backend.madvise_thp() != policy,
+            |backend| backend.set_madvise_thp(policy),
+            MAX_VMA_FRAGMENTS,
+        );
+        match updated {
+            Ok(()) => {
+                self.commit_topology_generation(next_topology_generation);
+                Ok(())
+            }
+            Err(error) => {
+                let (error, changed) = error.into_parts();
+                if changed {
+                    self.commit_topology_generation(next_topology_generation);
+                }
+                Err(AxError::from(error))
+            }
+        }
+    }
+
+    pub(crate) const fn thp_disable_mode(&self) -> ThpDisableMode {
+        self.thp_disable_mode
+    }
+
+    pub(crate) fn set_thp_disable_mode(&mut self, mode: ThpDisableMode) {
+        self.thp_disable_mode = mode;
     }
 
     pub(crate) fn check_no_seal_overlap(&self, start: VirtAddr, size: usize) -> AxResult {
@@ -2284,8 +2969,36 @@ impl AddrSpace {
         Ok(relative)
     }
 
+    fn collect_relative_policy_ranges_vec(
+        ranges: &[(VirtAddr, VirtAddr)],
+        source_start: VirtAddr,
+        preserve_size: usize,
+    ) -> AxResult<Vec<RelativePolicyRange>> {
+        let source_end = source_start
+            .checked_add(preserve_size)
+            .ok_or(AxError::InvalidInput)?;
+        let mut relative = Vec::new();
+        relative
+            .try_reserve(ranges.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for &(range_start, range_end) in ranges {
+            if range_start >= source_end {
+                break;
+            }
+            let start = range_start.max(source_start);
+            let end = range_end.min(source_end);
+            if start < end {
+                relative.push(RelativePolicyRange {
+                    offset: start.sub_addr(source_start),
+                    size: end.sub_addr(start),
+                });
+            }
+        }
+        Ok(relative)
+    }
+
     fn prepare_remap_policy(
-        &self,
+        &mut self,
         source_start: VirtAddr,
         source_size: usize,
         destination_size: usize,
@@ -2304,6 +3017,11 @@ impl AddrSpace {
         )?;
         let mut dontfork = Self::collect_relative_policy_ranges(
             &self.dontfork_ranges,
+            source_start,
+            preserve_size,
+        )?;
+        let mut dontdump = Self::collect_relative_policy_ranges_vec(
+            &self.dontdump_ranges,
             source_start,
             preserve_size,
         )?;
@@ -2327,6 +3045,13 @@ impl AddrSpace {
                     size: growth,
                 });
             }
+            if Self::interval_vec_end_covering(&self.dontdump_ranges, last_source_byte).is_some() {
+                dontdump.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                dontdump.push(RelativePolicyRange {
+                    offset: source_size,
+                    size: growth,
+                });
+            }
             if self.range_is_fully_locked(source_start, source_size) {
                 locked.try_reserve(1).map_err(|_| AxError::NoMemory)?;
                 locked.push(RelativePolicyRange {
@@ -2336,10 +3061,18 @@ impl AddrSpace {
             }
         }
 
+        // Every topology transaction may split a destination interval, add
+        // each relative source interval, then split the source interval when
+        // a move commits. Reserve that worst case before any VMA/PTE change.
+        self.dontdump_ranges
+            .try_reserve(dontdump.len().saturating_add(2))
+            .map_err(|_| AxError::NoMemory)?;
+
         Ok(RemapPolicyPlan {
             growdown: self.growdown_starts.contains(&source_start),
             wipe_on_fork,
             dontfork,
+            dontdump,
             locked,
         })
     }
@@ -2355,6 +3088,10 @@ impl AddrSpace {
         for range in &plan.dontfork {
             let start = destination_start + range.offset;
             Self::insert_interval(&mut self.dontfork_ranges, start, start + range.size);
+        }
+        for range in &plan.dontdump {
+            let start = destination_start + range.offset;
+            Self::insert_interval_vec(&mut self.dontdump_ranges, start, start + range.size);
         }
         for range in &plan.locked {
             let start = destination_start + range.offset;
@@ -2383,6 +3120,52 @@ impl AddrSpace {
         Ok(())
     }
 
+    pub fn set_dontdump(&mut self, start: VirtAddr, size: usize, enabled: bool) -> AxResult {
+        self.validate_region(start, size)?;
+        let mut next = Self::try_clone_interval_vec(&self.dontdump_ranges, 2)?;
+        Self::clear_interval_vec(&mut next, start, size);
+        if enabled {
+            Self::insert_interval_vec(&mut next, start, start + size);
+        }
+        self.dontdump_ranges = next;
+        Ok(())
+    }
+
+    /// Materializes the exact PT_LOAD ranges eligible for a core image.
+    /// MADV_DONTDUMP may cover only part of one VMA, so filtering whole areas
+    /// would either leak excluded bytes or lose adjacent dumpable bytes.
+    pub(crate) fn coredump_segments(&self) -> AxResult<Vec<(VirtAddr, usize, MappingFlags)>> {
+        let mut segments = Vec::new();
+        segments
+            .try_reserve(self.areas.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for area in self
+            .areas
+            .iter()
+            .filter(|area| area.flags().contains(MappingFlags::USER) && !area.backend().is_secret())
+        {
+            let mut cursor = area.start();
+            while cursor < area.end() {
+                if let Some(excluded_end) =
+                    Self::interval_vec_end_covering(&self.dontdump_ranges, cursor)
+                {
+                    cursor = excluded_end.min(area.end());
+                    continue;
+                }
+                let segment_end =
+                    Self::next_interval_vec_start(&self.dontdump_ranges, cursor, area.end())
+                        .unwrap_or(area.end());
+                if segment_end <= cursor {
+                    return Err(AxError::BadState);
+                }
+                segments.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                segments.push((cursor, segment_end.sub_addr(cursor), area.flags()));
+                cursor = segment_end;
+            }
+        }
+        Ok(segments)
+    }
+
     fn insert_locked_range(&mut self, start: VirtAddr, end: VirtAddr) {
         if start >= end {
             return;
@@ -2405,7 +3188,7 @@ impl AddrSpace {
         self.locked_ranges.insert(new_start, new_end);
     }
 
-    fn clear_locked_range(&mut self, start: VirtAddr, size: usize) {
+    pub(crate) fn clear_locked_range(&mut self, start: VirtAddr, size: usize) {
         if size == 0 {
             return;
         }
@@ -2468,14 +3251,54 @@ impl AddrSpace {
     /// intersection is checked after the source leaves are collected. The
     /// caller still must validate all 4 KiB leaves and commit the replacement
     /// atomically.
+    fn private_cow_fragments_cover(
+        &self,
+        start: VirtAddr,
+        length: usize,
+        page_size: PageSize,
+    ) -> bool {
+        let Some(end) = start.checked_add(length) else {
+            return false;
+        };
+        let Some(source) = self.find_area(start) else {
+            return false;
+        };
+        if source.start() > start
+            || !source.backend().is_private_cow()
+            || source.backend().page_size() != page_size
+        {
+            return false;
+        }
+        let source_backend = source.backend().clone();
+        let source_flags = source.flags();
+        let source_lineage = source.lineage();
+        let mut cursor = start;
+        while cursor < end {
+            let Some(area) = self.find_area(cursor) else {
+                return false;
+            };
+            if area.start() > cursor
+                || area.end() <= cursor
+                || area.lineage() != source_lineage
+                || area.flags() != source_flags
+                || !area.backend().is_private_cow()
+                || area.backend().page_size() != page_size
+                || !source_backend.same_private_cow_geometry_at(area.backend(), cursor)
+            {
+                return false;
+            }
+            cursor = area.end().min(end);
+        }
+        true
+    }
+
     pub(crate) fn collapse_2m_candidate_eligible(&self, start: VirtAddr, length: usize) -> bool {
         let Some(end_raw) = start.as_usize().checked_add(length) else {
             return false;
         };
         let end = VirtAddr::from(end_raw);
-        let area = self.find_area(start);
-        let vma_covers_range = area.is_some_and(|area| area.start() <= start && area.end() >= end);
-        let private_cow = area.is_some_and(|area| area.backend().is_private_cow());
+        let fragmented_private_cow =
+            self.private_cow_fragments_cover(start, length, PageSize::Size4K);
         let range = PageRange::new(start.as_usize(), length, PAGE_SIZE_4K).ok();
         let has_uffd_write_protect = range.is_some_and(|range| {
             self.uffd.as_ref().is_some_and(|state| {
@@ -2492,8 +3315,8 @@ impl AddrSpace {
         collapse_2m_candidate_eligible(Collapse2MCandidateFacts {
             start: start.as_usize(),
             length,
-            vma_covers_range,
-            private_cow,
+            vma_covers_range: fragmented_private_cow,
+            private_cow: fragmented_private_cow,
             has_uffd_write_protect,
             has_locked_pages: self.range_is_locked(start, length),
             // Exact pin ownership is established from the PTE source frames
@@ -2501,6 +3324,100 @@ impl AddrSpace {
             has_exact_long_term_cow_pin: false,
             has_fork_policy,
         })
+    }
+
+    fn background_thp_policy_allows(&self, start: VirtAddr) -> bool {
+        if self.thp_disable_mode == ThpDisableMode::Disabled {
+            return false;
+        }
+        let Some(end) = start.checked_add(COLLAPSE_2M_SIZE) else {
+            return false;
+        };
+        let mut cursor = start;
+        while cursor < end {
+            let Some(area) = self.find_area(cursor) else {
+                return false;
+            };
+            if area.start() > cursor || area.end() <= cursor {
+                return false;
+            }
+            let allowed = match self.thp_disable_mode {
+                ThpDisableMode::Disabled => false,
+                ThpDisableMode::ExceptAdvised => area.backend().madvise_thp() == MadviseThp::Huge,
+                ThpDisableMode::Enabled => area.backend().madvise_thp() != MadviseThp::NoHuge,
+            };
+            if !allowed {
+                return false;
+            }
+            cursor = area.end().min(end);
+        }
+        true
+    }
+
+    /// Forced collapse bypasses EXCEPT_ADVISED/default policy, but Linux
+    /// still rejects a completely disabled mm and every VM_NOHUGEPAGE VMA.
+    pub(crate) fn forced_thp_collapse_allowed(&self, start: VirtAddr, size: usize) -> bool {
+        if self.thp_disable_mode == ThpDisableMode::Disabled || size == 0 {
+            return false;
+        }
+        let Some(end) = start.checked_add(size) else {
+            return false;
+        };
+        let mut cursor = start;
+        while cursor < end {
+            let Some(area) = self.find_area(cursor) else {
+                return false;
+            };
+            if area.start() > cursor || area.backend().madvise_thp() == MadviseThp::NoHuge {
+                return false;
+            }
+            cursor = area.end().min(end);
+        }
+        true
+    }
+
+    fn background_thp_source_is_resident_4k(&self, start: VirtAddr) -> bool {
+        (0..COLLAPSE_2M_SIZE).step_by(PAGE_SIZE_4K).all(|offset| {
+            self.pt
+                .query(start + offset)
+                .is_ok_and(|(_, _, page_size)| page_size == PageSize::Size4K)
+        })
+    }
+
+    /// Scans a bounded number of PMD slots for khugepaged.  Background
+    /// promotion never faults file/anonymous pages in while retaining the mm
+    /// lock: only fully resident 4 KiB runs reach the existing collapse
+    /// transaction. The returned cursor is None after reaching this mm's end.
+    pub(crate) fn collapse_background_thp_budget(
+        &mut self,
+        from: VirtAddr,
+        budget: usize,
+    ) -> Option<VirtAddr> {
+        let start = from.as_usize().max(self.base().as_usize());
+        let mut candidate = start
+            .checked_add(COLLAPSE_2M_SIZE - 1)
+            .map(|value| value & !(COLLAPSE_2M_SIZE - 1))?;
+        let end = self.base().checked_add(self.size())?;
+        let mut scanned = 0usize;
+        while scanned < budget {
+            let candidate_end = candidate.checked_add(COLLAPSE_2M_SIZE)?;
+            if VirtAddr::from(candidate_end) > end {
+                return None;
+            }
+            let address = VirtAddr::from(candidate);
+            if self.background_thp_policy_allows(address)
+                && self.collapse_2m_candidate_eligible(address, COLLAPSE_2M_SIZE)
+                && self.background_thp_source_is_resident_4k(address)
+            {
+                // A concurrent topology change cannot occur under this mm
+                // lock. Resource pressure or a transient pin merely leaves
+                // this PMD for a later pass.
+                let _ = self.collapse_private_cow_2m(address);
+            }
+            scanned += 1;
+            candidate = candidate_end;
+        }
+        (VirtAddr::from(candidate) < end).then_some(VirtAddr::from(candidate))
     }
 
     fn uffd_missing_registered_at(&self, vaddr: VirtAddr) -> bool {
@@ -2528,7 +3445,9 @@ impl AddrSpace {
     /// every detached 4 KiB frame and the former PTE table remain owned until
     /// the replacement's TLB grace completes.
     pub(crate) fn collapse_private_cow_2m(&mut self, start: VirtAddr) -> AxResult {
-        if !self.collapse_2m_candidate_eligible(start, COLLAPSE_2M_SIZE) {
+        if !self.forced_thp_collapse_allowed(start, COLLAPSE_2M_SIZE)
+            || !self.collapse_2m_candidate_eligible(start, COLLAPSE_2M_SIZE)
+        {
             return Err(AxError::InvalidInput);
         }
         self.check_no_user_io_pin_overlap(start, COLLAPSE_2M_SIZE, InvalidationReason::Remap)?;
@@ -2542,7 +3461,7 @@ impl AddrSpace {
             .backend()
             .clone();
         let vma_flags = self.find_area(start).ok_or(AxError::NoMemory)?.flags();
-        let collapsed_backend = source_backend.collapsed_2m_backend()?;
+        let metadata_plan = self.prepare_fragmented_cow_2m_page_size(start, PageSize::Size2M)?;
         let mut leaves = Vec::new();
         leaves
             .try_reserve_exact(COLLAPSE_2M_SIZE / PAGE_SIZE_4K)
@@ -2634,17 +3553,30 @@ impl AddrSpace {
             }
         };
 
-        // Split and update the one affected VMA before publishing the PDE.
-        // A failure here still has the old PTE run installed, so restoring
-        // permissions is sufficient rollback.
-        if let Err(error) =
-            self.replace_collapse_2m_backend_metadata(start, collapsed_backend.clone())
-        {
-            self.restore_collapse_2m_source_permissions(&leaves)?;
-            return Err(error);
-        }
-
-        let replacement = prepared.frame()?;
+        let replacement = match prepared.frame() {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                self.restore_collapse_2m_source_permissions(&leaves)?;
+                return Err(error);
+            }
+        };
+        // Commit is one allocation-free tree swap.  The guard retains the
+        // exact old fragments and rolls them back if PDE publication fails.
+        let metadata = match metadata_plan.commit(&mut self.areas) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                {
+                    let mut cursor = self.pt.cursor();
+                    for (vaddr, _, flags, _) in &leaves {
+                        if !matches!(cursor.protect(*vaddr, *flags), Ok(PageSize::Size4K)) {
+                            return Err(AxError::BadState);
+                        }
+                    }
+                }
+                drop(self.tlb.synchronize_after_mutation());
+                return Err(AxError::from(error));
+            }
+        };
         let replaced = {
             let mut cursor = self.pt.cursor();
             match cursor.replace_2m_pte_run(start, replacement, source_flags) {
@@ -2663,15 +3595,20 @@ impl AddrSpace {
         let replaced = match replaced {
             Ok(replaced) => replaced,
             Err(error) => {
-                // The metadata update is now an exact 2 MiB fragment, so this
-                // cannot allocate or split. Preserve the original lineage and
-                // restore the 4 KiB backend before returning the old PTEs to
-                // userspace.
-                self.replace_collapse_2m_backend_metadata(start, source_backend.clone())?;
-                self.restore_collapse_2m_source_permissions(&leaves)?;
+                metadata.rollback();
+                {
+                    let mut cursor = self.pt.cursor();
+                    for (vaddr, _, flags, _) in &leaves {
+                        if !matches!(cursor.protect(*vaddr, *flags), Ok(PageSize::Size4K)) {
+                            return Err(AxError::BadState);
+                        }
+                    }
+                }
+                drop(self.tlb.synchronize_after_mutation());
                 return Err(error);
             }
         };
+        metadata.finish();
         prepared.commit_frame();
 
         // `leaves` was checked above and belongs to this exact 4 KiB COW
@@ -2704,6 +3641,9 @@ impl AddrSpace {
             return Err(AxError::InvalidInput);
         }
         let end = start + COLLAPSE_2M_SIZE;
+        if !self.forced_thp_collapse_allowed(start, COLLAPSE_2M_SIZE) {
+            return Err(AxError::InvalidInput);
+        }
         let area = self
             .find_area(start)
             .filter(|area| area.start() <= start && area.end() >= end)
@@ -2758,6 +3698,91 @@ impl AddrSpace {
         drop(replaced);
         drop(grace);
         Ok(())
+    }
+
+    /// Returns every virtual alias of one byte range in a shared backing.
+    /// The caller owns the global alias-mutation reservation, so the set
+    /// remains stable until all participant mm locks are released.
+    pub(crate) fn shared_backing_alias_ranges(
+        &self,
+        pages: &Arc<SharedPages>,
+        backing_start: usize,
+        backing_length: usize,
+    ) -> AxResult<Vec<VirtAddrRange>> {
+        let backing_end = backing_start
+            .checked_add(backing_length)
+            .ok_or(AxError::InvalidInput)?;
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(self.areas.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for area in self.areas.iter() {
+            let Backend::Shared(shared) = area.backend() else {
+                continue;
+            };
+            if !Arc::ptr_eq(shared.pages(), pages) {
+                continue;
+            }
+            let area_backing_start = shared
+                .backing_offset(area.start().as_usize())
+                .ok_or(AxError::BadState)?;
+            let area_backing_end = area_backing_start
+                .checked_add(area.size())
+                .ok_or(AxError::BadState)?;
+            let overlap_start = backing_start.max(area_backing_start);
+            let overlap_end = backing_end.min(area_backing_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let virtual_start = area
+                .start()
+                .checked_add(overlap_start - area_backing_start)
+                .ok_or(AxError::InvalidInput)?;
+            let virtual_end = virtual_start
+                .checked_add(overlap_end - overlap_start)
+                .ok_or(AxError::InvalidInput)?;
+            ranges.push(VirtAddrRange::new(virtual_start, virtual_end));
+        }
+        Ok(ranges)
+    }
+
+    /// Preflights and detaches resident PTEs for shared-backing aliases while
+    /// retaining the VMA. The returned boolean tells the caller whether a TLB
+    /// grace period is required before freeing the backing frames.
+    pub(crate) fn detach_shared_backing_range(
+        &mut self,
+        pages: &Arc<SharedPages>,
+        backing_start: usize,
+        backing_length: usize,
+    ) -> AxResult<bool> {
+        let ranges = self.shared_backing_alias_ranges(pages, backing_start, backing_length)?;
+        self.preflight_shared_backing_detach(&ranges)?;
+        self.detach_preflighted_shared_backing_ranges(&ranges)
+    }
+
+    pub(crate) fn preflight_shared_backing_detach(&self, ranges: &[VirtAddrRange]) -> AxResult<()> {
+        for range in ranges {
+            let area = self.areas.find(range.start).ok_or(AxError::BadState)?;
+            BackendOps::preflight_unmap(area.backend(), *range, &self.pt)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn detach_preflighted_shared_backing_ranges(
+        &mut self,
+        ranges: &[VirtAddrRange],
+    ) -> AxResult<bool> {
+        if ranges.is_empty() {
+            return Ok(false);
+        }
+        let mut cursor = self.pt.cursor();
+        for range in ranges.iter().copied() {
+            // SharedPages owns the frames, so the drained leaf descriptors do
+            // not carry a separate retirement resource.
+            drop(cursor.drain_present_leaves(range.start, range.size())?);
+        }
+        cursor.flush();
+        Ok(true)
     }
 
     /// Finds every PMD-aligned mapping of one shared backing folio in this
@@ -2874,6 +3899,272 @@ impl AddrSpace {
         Ok(flags)
     }
 
+    /// Preflights all resident 4 KiB aliases of a shared backing PMD except
+    /// the requesting PMD.  Unlike the target, these aliases may begin/end
+    /// mid-PMD or cross VMA fragments: they retain P1 geometry and are merely
+    /// redirected to the corresponding subpage of the new folio.
+    pub(crate) fn preflight_shared_folio_redirects_2m(
+        &self,
+        pages: &Arc<SharedPages>,
+        start_index: usize,
+        target: Option<VirtAddr>,
+    ) -> AxResult<Vec<SharedFolioPteRedirect>> {
+        let backing_start = start_index
+            .checked_mul(PAGE_SIZE_4K)
+            .ok_or(AxError::InvalidInput)?;
+        let ranges = self.shared_backing_alias_ranges(pages, backing_start, COLLAPSE_2M_SIZE)?;
+        let mut redirects = Vec::new();
+        for range in ranges {
+            // A P1 redirect changes the physical frame observable through
+            // this alias.  It therefore has the same DMA/pin, UFFD-WP and
+            // fork/locking invalidation constraints as the target PMD even
+            // though its VMA is intentionally not promoted.
+            self.check_no_user_io_pin_overlap(
+                range.start,
+                range.size(),
+                InvalidationReason::Remap,
+            )?;
+            if self.range_is_locked(range.start, range.size())
+                || Self::interval_overlaps(&self.wipe_on_fork_ranges, range.start, range.end)
+                || Self::interval_overlaps(&self.dontfork_ranges, range.start, range.end)
+            {
+                return Err(AxError::InvalidInput);
+            }
+            let page_range = PageRange::new(range.start.as_usize(), range.size(), PAGE_SIZE_4K)
+                .map_err(|_| AxError::InvalidInput)?;
+            if self.uffd.as_ref().is_some_and(|state| {
+                state
+                    .registrations
+                    .intersecting(self.address_space_id, page_range)
+                    .any(|registration| {
+                        registration.mode().bits() & UffdRegisterMode::WP.bits() != 0
+                    })
+            }) {
+                return Err(AxError::InvalidInput);
+            }
+            let mut address = range.start;
+            while address < range.end {
+                if target
+                    .is_some_and(|target| address >= target && address < target + COLLAPSE_2M_SIZE)
+                {
+                    address += PAGE_SIZE_4K;
+                    continue;
+                }
+                let offset = self
+                    .shared_backing_offset_at(address)
+                    .ok_or(AxError::BadState)?;
+                let index = offset / PAGE_SIZE_4K;
+                match self.pt.query(address) {
+                    Ok((paddr, flags, PageSize::Size4K)) => {
+                        if paddr != pages.paddr_at(index)? {
+                            return Err(AxError::BadState);
+                        }
+                        redirects.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                        redirects.push(SharedFolioPteRedirect {
+                            vaddr: address,
+                            old_paddr: paddr,
+                            flags,
+                            backing_index: index,
+                        });
+                    }
+                    // Non-target PMDs are represented by a separately
+                    // prepared transactional P1 redirect plan.
+                    Ok((_, _, PageSize::Size2M)) => {}
+                    Ok(_) => return Err(AxError::BadState),
+                    Err(PagingError::NotMapped) => {}
+                    Err(_) => return Err(AxError::BadAddress),
+                }
+                address += PAGE_SIZE_4K;
+            }
+        }
+        Ok(redirects)
+    }
+
+    pub(crate) fn prepare_shared_folio_pmd_redirects_except(
+        &self,
+        pages: &Arc<SharedPages>,
+        start_index: usize,
+        target: Option<VirtAddr>,
+    ) -> AxResult<Vec<PreparedSharedFolioPmdRedirect>> {
+        let backing_start = start_index
+            .checked_mul(PAGE_SIZE_4K)
+            .ok_or(AxError::InvalidInput)?;
+        let ranges = self.shared_backing_alias_ranges(pages, backing_start, COLLAPSE_2M_SIZE)?;
+        let expected = pages.paddr_at(start_index)?;
+        let mut plans = Vec::new();
+        for range in ranges {
+            let mut start = range.start.align_down(PageSize::Size2M);
+            while start < range.end {
+                if target != Some(start)
+                    && matches!(self.pt.query(start), Ok((paddr, _, PageSize::Size2M)) if paddr == expected)
+                    && !plans
+                        .iter()
+                        .any(|plan: &PreparedSharedFolioPmdRedirect| plan.start == start)
+                {
+                    self.check_no_user_io_pin_overlap(
+                        start,
+                        COLLAPSE_2M_SIZE,
+                        InvalidationReason::Remap,
+                    )?;
+                    let range = PageRange::new(start.as_usize(), COLLAPSE_2M_SIZE, PAGE_SIZE_4K)
+                        .map_err(|_| AxError::InvalidInput)?;
+                    if self.range_is_locked(start, COLLAPSE_2M_SIZE)
+                        || Self::interval_overlaps(
+                            &self.wipe_on_fork_ranges,
+                            start,
+                            start + COLLAPSE_2M_SIZE,
+                        )
+                        || Self::interval_overlaps(
+                            &self.dontfork_ranges,
+                            start,
+                            start + COLLAPSE_2M_SIZE,
+                        )
+                        || self.uffd.as_ref().is_some_and(|state| {
+                            state
+                                .registrations
+                                .intersecting(self.address_space_id, range)
+                                .any(|r| r.mode().bits() & UffdRegisterMode::WP.bits() != 0)
+                        })
+                    {
+                        return Err(AxError::InvalidInput);
+                    }
+                    let (_, flags, _) = self.pt.query(start).map_err(|_| AxError::BadState)?;
+                    let mut frames = Vec::new();
+                    frames
+                        .try_reserve_exact(COLLAPSE_2M_SIZE / PAGE_SIZE_4K)
+                        .map_err(|_| AxError::NoMemory)?;
+                    plans.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                    plans.push(PreparedSharedFolioPmdRedirect {
+                        start,
+                        flags,
+                        frames,
+                        tables: PreparedPageTableFrames::try_new(1)
+                            .map_err(|_| AxError::NoMemory)?,
+                    });
+                }
+                start = start + COLLAPSE_2M_SIZE;
+            }
+        }
+        Ok(plans)
+    }
+
+    pub(crate) fn publish_shared_folio_pmd_redirect(
+        &mut self,
+        plan: &mut PreparedSharedFolioPmdRedirect,
+        folio: PhysAddr,
+    ) -> AxResult<SharedFolioDemotionReplacement> {
+        plan.frames.clear();
+        for offset in (0..COLLAPSE_2M_SIZE).step_by(PAGE_SIZE_4K) {
+            plan.frames.push(folio + offset);
+        }
+        self.publish_shared_folio_demotion_2m(
+            plan.start,
+            &plan.frames,
+            plan.flags,
+            &mut plan.tables,
+        )
+    }
+
+    pub(crate) fn write_protect_shared_folio_redirects(
+        &mut self,
+        redirects: &[SharedFolioPteRedirect],
+    ) -> AxResult {
+        let mut cursor = self.pt.cursor();
+        for (index, redirect) in redirects.iter().enumerate() {
+            if !redirect.flags.contains(MappingFlags::WRITE) {
+                continue;
+            }
+            if !matches!(
+                cursor.protect(redirect.vaddr, redirect.flags - MappingFlags::WRITE),
+                Ok(PageSize::Size4K)
+            ) {
+                for restore in &redirects[..=index] {
+                    if restore.flags.contains(MappingFlags::WRITE) {
+                        cursor
+                            .protect(restore.vaddr, restore.flags)
+                            .map_err(|_| AxError::BadState)?;
+                    }
+                }
+                cursor.flush();
+                return Err(AxError::BadState);
+            }
+        }
+        cursor.flush();
+        Ok(())
+    }
+
+    pub(crate) fn publish_shared_folio_redirects(
+        &mut self,
+        redirects: &[SharedFolioPteRedirect],
+        folio: PhysAddr,
+    ) -> AxResult {
+        let mut cursor = self.pt.cursor();
+        for (index, redirect) in redirects.iter().enumerate() {
+            let offset = redirect
+                .backing_index
+                .checked_mul(PAGE_SIZE_4K)
+                .ok_or(AxError::InvalidInput)?;
+            let paddr = folio + (offset % COLLAPSE_2M_SIZE);
+            let flags = redirect.flags - MappingFlags::WRITE;
+            if cursor.remap(redirect.vaddr, paddr, flags).is_err() {
+                for rollback in &redirects[..=index] {
+                    cursor
+                        .remap(
+                            rollback.vaddr,
+                            rollback.old_paddr,
+                            rollback.flags - MappingFlags::WRITE,
+                        )
+                        .map_err(|_| AxError::BadState)?;
+                }
+                cursor.flush();
+                return Err(AxError::BadState);
+            }
+        }
+        cursor.flush();
+        Ok(())
+    }
+
+    pub(crate) fn rollback_shared_folio_redirects(
+        &mut self,
+        redirects: &[SharedFolioPteRedirect],
+    ) -> AxResult {
+        let mut cursor = self.pt.cursor();
+        for redirect in redirects {
+            if cursor
+                .remap(
+                    redirect.vaddr,
+                    redirect.old_paddr,
+                    redirect.flags - MappingFlags::WRITE,
+                )
+                .is_err()
+            {
+                return Err(AxError::BadState);
+            }
+        }
+        cursor.flush();
+        Ok(())
+    }
+
+    pub(crate) fn restore_shared_folio_redirect_permissions(
+        &mut self,
+        redirects: &[SharedFolioPteRedirect],
+    ) -> AxResult {
+        let mut cursor = self.pt.cursor();
+        for redirect in redirects {
+            if !redirect.flags.contains(MappingFlags::WRITE) {
+                continue;
+            }
+            if !matches!(
+                cursor.protect(redirect.vaddr, redirect.flags),
+                Ok(PageSize::Size4K)
+            ) {
+                return Err(AxError::BadState);
+            }
+        }
+        cursor.flush();
+        Ok(())
+    }
+
     pub(crate) fn publish_shared_folio_collapse_2m(
         &mut self,
         start: VirtAddr,
@@ -2893,22 +4184,10 @@ impl AddrSpace {
             PagingError::NoMemory => AxError::NoMemory,
             _ => AxError::BadState,
         })?;
-        if source_flags != flags {
-            let restored = {
-                let mut cursor = self.pt.cursor();
-                cursor.protect(start, flags)
-            };
-            if !matches!(restored, Ok(PageSize::Size2M)) {
-                let rollback = {
-                    let mut cursor = self.pt.cursor();
-                    cursor.rollback_2m_pte_replacement(start, run)
-                };
-                return match rollback {
-                    Ok(()) => Err(AxError::BadState),
-                    Err(_) => Err(AxError::BadState),
-                };
-            }
-        }
+        // Publication is deliberately read-only.  The cross-mm transaction
+        // is not committed until every PMD and P1 alias names the promoted
+        // backing and has passed a global TLB grace period.  Restoring WRITE
+        // here would let a later rollback race `demote_4k_folio()`'s copy.
         Ok(SharedFolioPteReplacement { start, run })
     }
 
@@ -2988,20 +4267,42 @@ impl AddrSpace {
         drop(grace);
     }
 
-    fn replace_collapse_2m_backend_metadata(
-        &mut self,
+    /// Changes only the COW granule of every VMA fragment spanning one PMD.
+    /// Fragment-local policies (THP, readahead, seals and retained mapping
+    /// leases) remain attached to their own backend clone.
+    fn prepare_fragmented_cow_2m_page_size(
+        &self,
         start: VirtAddr,
-        replacement: Backend,
-    ) -> AxResult {
+        target: PageSize,
+    ) -> AxResult<memory_set::PreparedMetadataUpdate<Backend>> {
+        let source = match target {
+            PageSize::Size4K => PageSize::Size2M,
+            PageSize::Size2M => PageSize::Size4K,
+            _ => return Err(AxError::InvalidInput),
+        };
+        if !self.private_cow_fragments_cover(start, COLLAPSE_2M_SIZE, source) {
+            return Err(AxError::InvalidInput);
+        }
+
         self.areas
-            .update_metadata_with_limit(
+            .prepare_metadata_update_with_limit(
                 start,
                 COLLAPSE_2M_SIZE,
                 |_| true,
-                |backend| *backend = replacement.clone(),
+                |backend| {
+                    *backend = match target {
+                        PageSize::Size4K => backend
+                            .demoted_4k_backend()
+                            .expect("preflighted huge COW fragment must demote"),
+                        PageSize::Size2M => backend
+                            .collapsed_2m_backend()
+                            .expect("preflighted 4K COW fragment must restore huge metadata"),
+                        _ => unreachable!("unsupported COW fragment page size was preflighted"),
+                    };
+                },
                 MAX_VMA_FRAGMENTS,
             )
-            .map_err(|error| AxError::from(error.into_parts().0))
+            .map_err(AxError::from)
     }
 
     fn restore_collapse_2m_source_permissions(
@@ -3035,16 +4336,23 @@ impl AddrSpace {
             return Err(AxError::InvalidInput);
         }
         self.check_no_user_io_pin_overlap(start, COLLAPSE_2M_SIZE, InvalidationReason::Remap)?;
-        let end = start + COLLAPSE_2M_SIZE;
         let source_backend = self
             .find_area(start)
-            .filter(|area| area.start() == start && area.end() == end)
+            .filter(|area| area.start() <= start && area.end() > start)
             .ok_or(AxError::NoMemory)?
             .backend()
             .clone();
         if !source_backend.is_private_cow() || source_backend.page_size() != PageSize::Size2M {
             return Err(AxError::InvalidInput);
         }
+        // MADV policy can split VMA metadata without demoting the PMD. Prove
+        // that every fragment retains one lineage, one access contract and a
+        // continuous private-COW backing cursor before changing the hardware
+        // leaf beneath all of them.
+        if !self.private_cow_fragments_cover(start, COLLAPSE_2M_SIZE, PageSize::Size2M) {
+            return Err(AxError::InvalidInput);
+        }
+        let metadata_plan = self.prepare_fragmented_cow_2m_page_size(start, PageSize::Size4K)?;
         let (source_frame, source_flags, source_size) =
             self.pt.query(start).map_err(|error| match error {
                 PagingError::NotMapped if self.uffd_missing_registered_at(start) => {
@@ -3058,7 +4366,6 @@ impl AddrSpace {
             return Err(AxError::BadState);
         }
         let next_topology_generation = self.next_topology_generation()?;
-        let demoted_backend = source_backend.demoted_4k_backend()?;
         let mut tables = PreparedPageTableFrames::try_new(1).map_err(|_| AxError::NoMemory)?;
 
         // The address-space mutex serializes page-table writers, but CPUs
@@ -3087,11 +4394,20 @@ impl AddrSpace {
             }
         };
 
-        // All metadata allocation/splitting is admitted before the PDE store.
-        if let Err(error) = self.replace_collapse_2m_backend_metadata(start, demoted_backend) {
-            self.restore_demote_2m_source_permissions(start, source_flags)?;
-            return Err(error);
-        }
+        // All metadata allocation/splitting was admitted before write
+        // revocation. Commit now is an allocation-free tree swap and retains
+        // the exact huge-backend tree for failure rollback.
+        let metadata = match metadata_plan.commit(&mut self.areas) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let restored = self.pt.cursor().protect(start, source_flags);
+                if !matches!(restored, Ok(PageSize::Size2M)) {
+                    return Err(AxError::BadState);
+                }
+                drop(self.tlb.synchronize_after_mutation());
+                return Err(AxError::from(error));
+            }
+        };
         let published = {
             let mut cursor = self.pt.cursor();
             cursor.replace_2m_huge_leaf_with_pte_run(
@@ -3104,14 +4420,19 @@ impl AddrSpace {
         let published = match published {
             Ok(frame) => frame,
             Err(error) => {
-                self.replace_collapse_2m_backend_metadata(start, source_backend)?;
-                self.restore_demote_2m_source_permissions(start, source_flags)?;
+                metadata.rollback();
+                let restored = self.pt.cursor().protect(start, source_flags);
+                if !matches!(restored, Ok(PageSize::Size2M)) {
+                    return Err(AxError::BadState);
+                }
+                drop(self.tlb.synchronize_after_mutation());
                 return Err(match error {
                     PagingError::NoMemory => AxError::NoMemory,
                     _ => AxError::BadState,
                 });
             }
         };
+        metadata.finish();
         debug_assert_eq!(published, source_frame);
         prepared.commit_frames();
         let retired = source_backend
@@ -3270,6 +4591,20 @@ impl AddrSpace {
         &mut self,
         replacement: SharedFolioDemotionReplacement,
     ) -> AxResult {
+        let start = replacement.start;
+        let flags = replacement.flags;
+        self.rollback_shared_folio_demotion_2m_protected(replacement)?;
+        self.restore_shared_folio_demotion_pmd_permissions(start, flags)
+    }
+
+    /// Restores the old huge leaf while keeping its original WRITE bit
+    /// revoked.  Cross-mm shared-folio rollback uses this phase before it
+    /// restores the base-page backing; permission restoration is a separate,
+    /// final transaction edge after the backing copy and TLB grace.
+    pub(crate) fn rollback_shared_folio_demotion_2m_protected(
+        &mut self,
+        replacement: SharedFolioDemotionReplacement,
+    ) -> AxResult {
         let protected = replacement.flags - MappingFlags::WRITE;
         let run = {
             let mut cursor = self.pt.cursor();
@@ -3279,7 +4614,7 @@ impl AddrSpace {
         let grace = self.synchronize_tlb_after_mutation();
         drop(run);
         drop(grace);
-        self.restore_shared_folio_demotion_pmd_permissions(replacement.start, replacement.flags)
+        Ok(())
     }
 
     /// Restores the source PMD after a demotion failure which occurred before
@@ -3318,11 +4653,14 @@ impl AddrSpace {
         let mut candidate = VirtAddr::from(start.as_usize() & !(COLLAPSE_2M_SIZE - 1));
         while candidate < end {
             let demote_private = self.areas.find(candidate).is_some_and(|area| {
-                area.start() == candidate
-                    && area.size() == COLLAPSE_2M_SIZE
+                area.start() <= candidate
+                    && area.end() > candidate
                     && area.backend().is_private_cow()
                     && area.backend().page_size() == PageSize::Size2M
-            });
+            }) && self
+                .pt
+                .query(candidate)
+                .is_ok_and(|(_, _, page_size)| page_size == PageSize::Size2M);
             if demote_private {
                 self.demote_private_cow_2m(candidate)?;
             } else {
@@ -3338,16 +4676,14 @@ impl AddrSpace {
                     if let (Some(pages), Some(offset)) = (
                         self.shared_pages_at(candidate),
                         self.shared_backing_offset_at(candidate),
-                    ) {
-                        if pages.page_size() == PageSize::Size4K
-                            && offset.is_multiple_of(COLLAPSE_2M_SIZE)
-                            && pages.has_4k_folio(offset / PAGE_SIZE_4K)
-                        {
-                            // A compound shmem folio owns one set of former
-                            // 4 KiB frames for every mm alias.  Its caller
-                            // must use the ordered cross-mm transaction.
-                            return Err(AxError::BadState);
-                        }
+                    ) && pages.page_size() == PageSize::Size4K
+                        && offset.is_multiple_of(COLLAPSE_2M_SIZE)
+                        && pages.has_4k_folio(offset / PAGE_SIZE_4K)
+                    {
+                        // A compound shmem folio owns one set of former
+                        // 4 KiB frames for every mm alias.  Its caller
+                        // must use the ordered cross-mm transaction.
+                        return Err(AxError::BadState);
                     }
                     self.demote_alias_preserving_2m(candidate)?;
                 }
@@ -4049,6 +5385,25 @@ impl AddrSpace {
         self.areas.iter().map(MemoryArea::size).sum()
     }
 
+    /// Returns the number of VMA bytes already present in an exact virtual
+    /// range.  MAP_FIXED uses this to charge only the net address-space
+    /// growth, matching Linux's `pglen - unmapped_pages` accounting.
+    pub fn mapped_bytes_in_range(&self, start: VirtAddr, size: usize) -> AxResult<usize> {
+        if size == 0 {
+            return Ok(0);
+        }
+        let range = VirtAddrRange::try_from_start_size(start, size).ok_or(AxError::NoMemory)?;
+        self.areas
+            .iter_overlapping(range)
+            .try_fold(0usize, |total, area| {
+                let overlap_start = area.start().max(range.start);
+                let overlap_end = area.end().min(range.end);
+                total
+                    .checked_add(overlap_end.sub_addr(overlap_start))
+                    .ok_or(AxError::NoMemory)
+            })
+    }
+
     pub fn resident_user_bytes(&self) -> usize {
         self.areas
             .iter()
@@ -4240,12 +5595,427 @@ impl AddrSpace {
                     )
                 })
         } else {
-            self.find_free_area_avoiding_shadow_stack_guards(limit.start, size, limit, align)
+            self.areas.find_append_area(size, limit, align).or_else(|| {
+                self.find_free_area_avoiding_shadow_stack_guards(limit.start, size, limit, align)
+            })
         }
     }
 
     pub fn find_area(&self, vaddr: VirtAddr) -> Option<&MemoryArea<Backend>> {
         self.areas.find(vaddr)
+    }
+
+    /// Returns the stable kernel-only owner identity of the mapping covering
+    /// `address`.  This is intentionally narrower than exposing a finalizer
+    /// clone: syscall lifetime managers use the identity only to prove that a
+    /// user-supplied address still belongs to the admitted logical mapping.
+    pub(crate) fn mapping_finalizer_identity_at(&self, address: VirtAddr) -> Option<usize> {
+        self.find_area(address)?
+            .backend()
+            .mapping_finalizer()
+            .map(DeferredMappingFinalizer::identity)
+    }
+
+    /// Captures every live VMA fragment owned by one logical mapping lease.
+    ///
+    /// The returned ranges are exact current VMA boundaries in ascending
+    /// order.  Reserving for the complete area count up front makes this safe
+    /// to use as the read-only preparation half of a later teardown
+    /// transaction: allocation cannot fail after a prefix has been captured.
+    pub(crate) fn mapping_ranges_with_finalizer(
+        &self,
+        identity: usize,
+    ) -> AxResult<Vec<VirtAddrRange>> {
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve(self.areas.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for area in self.areas.iter() {
+            if area
+                .backend()
+                .mapping_finalizer()
+                .is_some_and(|finalizer| finalizer.identity() == identity)
+            {
+                ranges.push(area.va_range());
+            }
+        }
+        Ok(ranges)
+    }
+
+    /// Snapshot live finalizer identities without taking any subsystem lock.
+    /// Fork uses this before acquiring IPC metadata so retired SysV records
+    /// awaiting their deferred finalizer cannot be inherited as live VMAs.
+    pub(crate) fn mapping_finalizer_identities(&self) -> AxResult<Vec<usize>> {
+        let mut identities = Vec::new();
+        identities
+            .try_reserve(self.areas.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for area in self.areas.iter() {
+            if let Some(finalizer) = area.backend().mapping_finalizer() {
+                let identity = finalizer.identity();
+                if !identities.contains(&identity) {
+                    identities.push(identity);
+                }
+            }
+        }
+        Ok(identities)
+    }
+
+    /// Retains one lease for each logical mapping owner intersecting `range`.
+    ///
+    /// Fixed replacement callers use these preallocated leases to determine,
+    /// after publication, which owners lost their final VMA fragment.  The
+    /// retained lease prevents the task-context finalizer from racing that
+    /// decision; subsystem metadata can then be retired synchronously after
+    /// the MM lock is released and the deferred finalizer becomes an exact
+    /// no-op.
+    pub(crate) fn mapping_finalizers_in_range(
+        &self,
+        start: VirtAddr,
+        size: usize,
+    ) -> AxResult<Vec<DeferredMappingFinalizer>> {
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        let range = VirtAddrRange::new(start, end);
+        let mut finalizers = Vec::new();
+        finalizers
+            .try_reserve(self.areas.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for area in self.areas.iter() {
+            if !area.va_range().overlaps(range) {
+                continue;
+            }
+            let Some(finalizer) = area.backend().mapping_finalizer() else {
+                continue;
+            };
+            if finalizers
+                .iter()
+                .any(|existing: &DeferredMappingFinalizer| {
+                    existing.identity() == finalizer.identity()
+                })
+            {
+                continue;
+            }
+            finalizers.push(finalizer.clone());
+        }
+        Ok(finalizers)
+    }
+
+    pub(crate) fn has_mapping_finalizer_identity(&self, identity: usize) -> bool {
+        self.areas.iter().any(|area| {
+            area.backend()
+                .mapping_finalizer()
+                .is_some_and(|finalizer| finalizer.identity() == identity)
+        })
+    }
+
+    /// Returns logical-owner candidates whose shared-object page offset has
+    /// the same relation to `address` as Linux's SysV `shmdt` VMA scan.
+    ///
+    /// This intentionally starts at the first VMA at or above `address`.
+    /// Partial munmap/mprotect may remove or split the original first VMA,
+    /// while an mremap may establish a new address whose offset geometry is
+    /// independently valid. Namespace provenance is resolved by the caller
+    /// from the returned finalizer identities.
+    pub(crate) fn sysv_shmdt_finalizer_candidates(
+        &self,
+        address: VirtAddr,
+    ) -> AxResult<Vec<usize>> {
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve(self.areas.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for area in self.areas.iter() {
+            if area.end() <= address || area.start() < address {
+                continue;
+            }
+            let Some(finalizer) = area.backend().mapping_finalizer() else {
+                continue;
+            };
+            let Some(object_offset) = self.shared_backing_offset_at(area.start()) else {
+                continue;
+            };
+            let displacement = area.start().sub_addr(address);
+            if displacement / PAGE_SIZE_4K != object_offset / PAGE_SIZE_4K {
+                continue;
+            }
+            let identity = finalizer.identity();
+            if !candidates.contains(&identity) {
+                candidates.push(identity);
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Captures the exact VMA fragments selected by Linux's SysV `shmdt`
+    /// offset rule after a candidate finalizer has been resolved to a segment.
+    pub(crate) fn sysv_shmdt_mapping_ranges(
+        &self,
+        identity: usize,
+        address: VirtAddr,
+        segment_size: usize,
+    ) -> AxResult<Vec<VirtAddrRange>> {
+        let end = address
+            .checked_add(segment_size)
+            .ok_or(AxError::InvalidInput)?;
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve(self.areas.len())
+            .map_err(|_| AxError::NoMemory)?;
+        let mut found_initial = false;
+        for area in self.areas.iter() {
+            if area.end() <= address || area.start() < address {
+                continue;
+            }
+            if found_initial && area.end() > end {
+                break;
+            }
+            let matches_owner = area
+                .backend()
+                .mapping_finalizer()
+                .is_some_and(|finalizer| finalizer.identity() == identity);
+            let matches_offset =
+                self.shared_backing_offset_at(area.start())
+                    .is_some_and(|object_offset| {
+                        area.start().sub_addr(address) / PAGE_SIZE_4K
+                            == object_offset / PAGE_SIZE_4K
+                    });
+            if matches_owner && matches_offset {
+                ranges.push(area.va_range());
+                found_initial = true;
+            }
+        }
+        Ok(ranges)
+    }
+
+    /// Atomically replaces every inherited reference to one mapping finalizer.
+    ///
+    /// Fork copies VMA backends before the child is published. SysV SHM must
+    /// then give the child its own logical attachment rather than sharing the
+    /// parent's finalizer. The sparse prepared metadata transaction builds a
+    /// complete replacement tree first and commits it with one swap, so an
+    /// allocation failure cannot leave parent and child ownership mixed in the
+    /// same address space.
+    pub(crate) fn rebind_mapping_finalizer(
+        &mut self,
+        old_identity: usize,
+        replacement: DeferredMappingFinalizer,
+    ) -> AxResult<usize> {
+        let matching = self
+            .areas
+            .iter()
+            .filter(|area| {
+                area.backend()
+                    .mapping_finalizer()
+                    .is_some_and(|finalizer| finalizer.identity() == old_identity)
+            })
+            .count();
+        if matching == 0 {
+            return Err(AxError::NotFound);
+        }
+
+        let next_topology_generation = self.next_topology_generation()?;
+        let prepared = self
+            .areas
+            .prepare_matching_metadata_update_with_limit(
+                |backend| {
+                    backend
+                        .mapping_finalizer()
+                        .is_some_and(|finalizer| finalizer.identity() == old_identity)
+                },
+                |backend| backend.replace_mapping_finalizer(Some(replacement.clone())),
+                MAX_VMA_FRAGMENTS,
+            )
+            .map_err(AxError::from)?;
+        if !prepared.changed() {
+            return Err(AxError::BadState);
+        }
+        prepared
+            .commit(&mut self.areas)
+            .map_err(AxError::from)?
+            .finish();
+        self.commit_topology_generation(next_topology_generation);
+        Ok(matching)
+    }
+
+    /// Removes every VMA fragment owned by one logical mapping finalizer.
+    pub(crate) fn unmap_mapping_finalizer_fragments(
+        &mut self,
+        identity: usize,
+    ) -> AxResult<DeferredUffdWake> {
+        let ranges = self.mapping_ranges_with_finalizer(identity)?;
+        self.unmap_mapping_finalizer_ranges(identity, &ranges)
+    }
+
+    /// Removes an exact subset of one logical mapping owner's VMA fragments.
+    ///
+    /// All selected VMA/backend retirements and UFFD/mapping-identity sidecars
+    /// are prepared before the first removal; retired finalizer references are
+    /// released only after one translation grace period covers every range.
+    /// If unselected fragments retain the same owner, its finalizer remains
+    /// live and the higher-level attachment is not detached.
+    pub(crate) fn unmap_mapping_finalizer_ranges(
+        &mut self,
+        identity: usize,
+        ranges: &[VirtAddrRange],
+    ) -> AxResult<DeferredUffdWake> {
+        if ranges.is_empty() {
+            return Err(AxError::NotFound);
+        }
+        let mut previous_end = None;
+        for range in ranges {
+            if range.start >= range.end
+                || previous_end.is_some_and(|previous_end| previous_end > range.start)
+            {
+                return Err(AxError::InvalidInput);
+            }
+            previous_end = Some(range.end);
+            let size = range.end.sub_addr(range.start);
+            self.validate_region(range.start, size)?;
+            self.check_no_seal_overlap(range.start, size)?;
+            self.check_no_user_io_pin_overlap(range.start, size, InvalidationReason::Unmap)?;
+        }
+
+        self.dontdump_ranges
+            .try_reserve(ranges.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for range in ranges {
+            let size = range.end.sub_addr(range.start);
+            crate::uprobe::invalidate_xol_range_locked(self, range.start, size);
+            self.ensure_4k_granularity(range.start, size)?;
+        }
+
+        // 4 KiB restoration may split a selected VMA. Rebuild the complete
+        // exact-area selection after that step while requiring continuous
+        // coverage and the same finalizer identity throughout every requested
+        // range. This is still preparation: no VMA or PTE has been removed.
+        let mut selected_starts = Vec::new();
+        selected_starts
+            .try_reserve(self.areas.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for range in ranges {
+            let mut cursor = range.start;
+            for area in self.areas.iter_overlapping(*range) {
+                if area.start() != cursor || area.end() > range.end {
+                    return Err(AxError::BadState);
+                }
+                if area
+                    .backend()
+                    .mapping_finalizer()
+                    .is_none_or(|finalizer| finalizer.identity() != identity)
+                {
+                    return Err(AxError::BadState);
+                }
+                selected_starts.push(area.start());
+                cursor = area.end();
+            }
+            if cursor != range.end {
+                return Err(AxError::BadState);
+            }
+        }
+
+        let next_generation = self.next_topology_generation()?;
+        let mapping_mutations = prepare_unmap_mapping_mutations_for_ranges(
+            &self.areas,
+            &self.mapping_identities,
+            ranges,
+        )?;
+
+        let mut page_ranges = Vec::new();
+        page_ranges
+            .try_reserve(ranges.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for range in ranges {
+            page_ranges.push(
+                PageRange::new(
+                    range.start.as_usize(),
+                    range.end.sub_addr(range.start),
+                    PAGE_SIZE_4K,
+                )
+                .map_err(mm_error)?,
+            );
+        }
+        let uffd_plan = {
+            let AddrSpace {
+                address_space_id,
+                areas,
+                mapping_identities,
+                uffd,
+                ..
+            } = self;
+            let address_space_id = *address_space_id;
+            if let Some(state) = uffd.as_deref_mut() {
+                match state.preflight_unmap_range_slice(0, &page_ranges, |registration| {
+                    Self::uffd_snapshot_for_registration(
+                        address_space_id,
+                        areas,
+                        mapping_identities,
+                        registration,
+                    )
+                })? {
+                    OptionalUffdPlan::Noop => None,
+                    plan @ OptionalUffdPlan::Armed(_) => Some(plan),
+                }
+            } else {
+                None
+            }
+        };
+
+        self.publish_resident_highwater();
+        let retirement = match self.areas.unmap_selected_deferred_with_limit(
+            &selected_starts,
+            |backend| {
+                backend
+                    .mapping_finalizer()
+                    .is_some_and(|finalizer| finalizer.identity() == identity)
+            },
+            &mut self.pt,
+            MAX_VMA_FRAGMENTS,
+        ) {
+            Ok(retirement) => retirement,
+            Err(error) => {
+                if let Some(plan) = uffd_plan {
+                    self.uffd
+                        .as_mut()
+                        .expect("armed UFFD fragment-unmap plan lost its state")
+                        .abort_plan(plan);
+                }
+                return Err(error.into());
+            }
+        };
+        for range in ranges {
+            self.release_swapped_range(range.start, range.end.sub_addr(range.start));
+        }
+        let grace = self.synchronize_tlb_after_mutation();
+        retirement.release();
+        drop(grace);
+        self.publish_resident_highwater();
+
+        self.refresh_growdown_starts();
+        for range in ranges {
+            let start = range.start;
+            let end = range.end;
+            let size = end.sub_addr(start);
+            self.madvise_free_pages
+                .retain(|&page, _| page < start || page >= end);
+            Self::clear_interval(&mut self.madvise_guard_ranges, start, size);
+            Self::clear_interval(&mut self.madvise_hwpoison_ranges, start, size);
+            Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
+            Self::clear_interval(&mut self.dontfork_ranges, start, size);
+            Self::clear_interval_vec(&mut self.dontdump_ranges, start, size);
+            self.clear_locked_range(start, size);
+        }
+        self.prune_shared_alias_bindings();
+        let wake = if let Some(plan) = uffd_plan {
+            self.uffd
+                .as_mut()
+                .expect("armed UFFD fragment-unmap plan lost its state")
+                .commit_plan(plan)
+        } else {
+            DeferredUffdWake::empty()
+        };
+        commit_mapping_identity_mutations(&mut self.mapping_identities, &mapping_mutations);
+        self.commit_topology_generation(next_generation);
+        Ok(wake)
     }
 
     /// Returns the strong backing identity and byte offset for a mapped
@@ -4352,19 +6122,14 @@ impl AddrSpace {
         populate: bool,
         backend: Backend,
     ) -> AxResult {
-        let result = self.map_with_lock_state(
+        self.map_with_lock_state(
             start,
             size,
             flags,
             populate,
             backend,
             self.lock_future_mappings,
-        );
-        #[cfg(target_arch = "x86_64")]
-        if result.is_ok() {
-            let _invalidated = self.reconcile_cet_default_shadow_stacks();
-        }
-        result
+        )
     }
 
     /// Replace one complete shared VMA at the same virtual address with an
@@ -4544,9 +6309,9 @@ impl AddrSpace {
             self.refresh_growdown_starts();
             Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
             Self::clear_interval(&mut self.dontfork_ranges, start, size);
+            Self::clear_interval_vec(&mut self.dontdump_ranges, start, size);
             self.clear_locked_range(start, size);
-            let mut committed = 0usize;
-            for (_, _, flags, _, _, replacement) in &fragments {
+            for (committed, (_, _, flags, _, _, replacement)) in fragments.iter().enumerate() {
                 let (address, length, ..) = fragments[committed];
                 if let Err(error) = self.map_with_lock_state(
                     address,
@@ -4564,13 +6329,11 @@ impl AddrSpace {
                     )
                     .ok();
                     let restored = self.unmap_areas_with_tlb_grace(start, size).is_ok();
-                    if restored {
-                        if let Some(replacement_mutations) = replacement_mutations {
-                            commit_mapping_identity_mutations(
-                                &mut self.mapping_identities,
-                                &replacement_mutations,
-                            );
-                        }
+                    if restored && let Some(replacement_mutations) = replacement_mutations {
+                        commit_mapping_identity_mutations(
+                            &mut self.mapping_identities,
+                            &replacement_mutations,
+                        );
                     }
                     for (address, length, flags, lineage, rollback, _) in fragments.into_iter() {
                         if self
@@ -4599,7 +6362,6 @@ impl AddrSpace {
                     self.commit_topology_generation(next_topology_generation);
                     return Err(AxError::BadState);
                 }
-                committed += 1;
             }
             self.apply_remap_policy(start, &policy);
             commit_mapping_identity_mutations(&mut self.mapping_identities, &source_mutations);
@@ -4654,6 +6416,343 @@ impl AddrSpace {
             return Err(err);
         }
         Ok(())
+    }
+
+    fn rollback_fixed_replacement_participant<P: FixedReplacementParticipant>(
+        &mut self,
+        participant: &mut P,
+        error: AxError,
+    ) -> ReplaceMappingError {
+        ReplaceMappingError::AddressSpacePreserved(
+            participant.rollback(self).err().unwrap_or(error),
+        )
+    }
+
+    /// Installs one MAP_FIXED-style replacement as a single VMA/PTE
+    /// transaction.
+    ///
+    /// The sibling memory-set guard keeps the exact old VMA tree and prepared
+    /// PTE retirement tokens alive until the incoming mapping has installed.
+    /// Old finalizers/backends are released only after this address space's
+    /// global translation grace.  Every policy sidecar remains untouched until
+    /// that point, so an admitted rollback restores the original mapping and
+    /// its logical ownership without a visible hole.
+    ///
+    /// For a shared incoming backend this deliberately retains old alias
+    /// bindings.  The caller must commit its prepared incoming alias lease and
+    /// then finish the transition while still holding the address-space lock.
+    pub(crate) fn replace_mapping_fixed_with<P: FixedReplacementParticipant>(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        flags: MappingFlags,
+        backend: Backend,
+        locked: bool,
+        participant: &mut P,
+    ) -> Result<DeferredUffdWake, ReplaceMappingError> {
+        if let Err(error) = self.validate_region(start, size) {
+            return Err(self.rollback_fixed_replacement_participant(participant, error));
+        }
+        if size == 0 {
+            return Err(
+                self.rollback_fixed_replacement_participant(participant, AxError::InvalidInput)
+            );
+        }
+        if let Err(error) = self.check_no_seal_overlap(start, size) {
+            return Err(self.rollback_fixed_replacement_participant(participant, error));
+        }
+        if let Err(error) =
+            self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Unmap)
+        {
+            return Err(self.rollback_fixed_replacement_participant(participant, error));
+        }
+        if self.dontdump_ranges.try_reserve(1).is_err() {
+            return Err(self.rollback_fixed_replacement_participant(participant, AxError::NoMemory));
+        }
+
+        // This may make a huge leaf 4 KiB-granular, but does not retire the
+        // VMA, its identity, or any sidecar.  It is the required admission
+        // step before the prepared PTE journal observes individual leaves.
+        if let Err(error) = self.ensure_4k_granularity(start, size) {
+            return Err(self.rollback_fixed_replacement_participant(participant, error));
+        }
+        let sidecars = match self.prepare_fixed_replacement_sidecars(start, size, locked) {
+            Ok(sidecars) => sidecars,
+            Err(error) => {
+                return Err(self.rollback_fixed_replacement_participant(participant, error));
+            }
+        };
+        let next_topology_generation = match self.next_topology_generation() {
+            Ok(generation) => generation,
+            Err(error) => {
+                return Err(self.rollback_fixed_replacement_participant(participant, error));
+            }
+        };
+        let lineage = match self.prepare_fresh_mapping_lineage() {
+            Ok(lineage) => lineage,
+            Err(error) => {
+                return Err(self.rollback_fixed_replacement_participant(participant, error));
+            }
+        };
+        let replacement = MemoryArea::new_with_lineage(start, size, flags, backend, lineage);
+        let prepared = match self.areas.prepare_fixed_replacement_with_limit(
+            replacement,
+            &self.pt,
+            MAX_VMA_FRAGMENTS,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let removed = self.remove_mapping_lineage_if_unused(lineage);
+                debug_assert!(removed);
+                return Err(self.rollback_fixed_replacement_participant(participant, error.into()));
+            }
+        };
+        let mapping_mutations = match prepare_unmap_mapping_mutations(
+            &self.areas,
+            &self.mapping_identities,
+            start,
+            size,
+        ) {
+            Ok(mutations) => mutations,
+            Err(error) => {
+                let removed = self.remove_mapping_lineage_if_unused(lineage);
+                debug_assert!(removed);
+                return Err(self.rollback_fixed_replacement_participant(participant, error));
+            }
+        };
+        let unmap_range = match PageRange::new(start.as_usize(), size, PAGE_SIZE_4K) {
+            Ok(range) => range,
+            Err(error) => {
+                let removed = self.remove_mapping_lineage_if_unused(lineage);
+                debug_assert!(removed);
+                return Err(
+                    self.rollback_fixed_replacement_participant(participant, mm_error(error))
+                );
+            }
+        };
+        let uffd_plan = {
+            let AddrSpace {
+                address_space_id,
+                areas,
+                mapping_identities,
+                uffd,
+                ..
+            } = self;
+            let address_space_id = *address_space_id;
+            if let Some(state) = uffd.as_deref_mut() {
+                match state.preflight_unmap(0, unmap_range, |registration| {
+                    Self::uffd_snapshot_for_registration(
+                        address_space_id,
+                        areas,
+                        mapping_identities,
+                        registration,
+                    )
+                }) {
+                    Ok(OptionalUffdPlan::Noop) => None,
+                    Ok(plan @ OptionalUffdPlan::Armed(_)) => Some(plan),
+                    Err(error) => {
+                        let removed = self.remove_mapping_lineage_if_unused(lineage);
+                        debug_assert!(removed);
+                        return Err(self.rollback_fixed_replacement_participant(participant, error));
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        // Uprobe/XOL state is an externally visible participant in this
+        // transaction.  In particular, clearing an XOL identity here would
+        // make an otherwise failed replacement lose the old trampoline
+        // identity.  Callers performing a user mapping replacement must pass
+        // PreparedFixedUprobeTransition, which owns both invalidation and its
+        // rollback under the uprobe topology gate.
+        if let Err(error) = participant.before_install(self) {
+            let participant_rollback = participant.rollback(self).err();
+            if let Some(plan) = uffd_plan {
+                self.uffd
+                    .as_mut()
+                    .expect("armed UFFD fixed-replace plan lost its state")
+                    .abort_plan(plan);
+            }
+            let removed = self.remove_mapping_lineage_if_unused(lineage);
+            debug_assert!(removed);
+            return Err(ReplaceMappingError::AddressSpacePreserved(
+                participant_rollback.unwrap_or(error),
+            ));
+        }
+        self.publish_resident_highwater();
+        let mut committed = match self
+            .areas
+            .commit_prepared_fixed_replacement(prepared, &mut self.pt)
+        {
+            Ok(committed) => committed,
+            Err(error) => {
+                let participant_rollback = participant.rollback(self).err();
+                if let Some(plan) = uffd_plan {
+                    self.uffd
+                        .as_mut()
+                        .expect("armed UFFD fixed-replace plan lost its state")
+                        .abort_plan(plan);
+                }
+                let removed = self.remove_mapping_lineage_if_unused(lineage);
+                debug_assert!(removed);
+                return Err(ReplaceMappingError::AddressSpacePreserved(
+                    participant_rollback.unwrap_or_else(|| error.into()),
+                ));
+            }
+        };
+        // The sibling guard has admitted incoming mapping resources and all
+        // exact old-leaf restore capacity. Any failure here is therefore a
+        // fail-stop backend contract violation, not a recoverable partial map.
+        committed.install(&mut self.areas, &mut self.pt);
+        if let Err(error) = participant.commit(self) {
+            let participant_rollback = participant.rollback(self).err();
+            let rollback_retirement = committed.rollback(&mut self.areas, &mut self.pt);
+            // Restoring the old leaves invalidates translations cached for
+            // the provisional incoming mapping.  Keep its exact VMA/backend
+            // ownership alive until every CPU has crossed that invalidation
+            // fence; otherwise a stale translation can outlive the incoming
+            // backend which supplied it.
+            let grace = self.synchronize_tlb_after_mutation();
+            rollback_retirement.release();
+            drop(grace);
+            if let Some(plan) = uffd_plan {
+                self.uffd
+                    .as_mut()
+                    .expect("armed UFFD fixed-replace plan lost its state")
+                    .abort_plan(plan);
+            }
+            let removed = self.remove_mapping_lineage_if_unused(lineage);
+            debug_assert!(removed);
+            return Err(ReplaceMappingError::AddressSpacePreserved(
+                participant_rollback.unwrap_or(error),
+            ));
+        }
+        let retirement = committed.finish();
+
+        // The outgoing software swap entries, VMA owners, and backend
+        // finalizers remain live through this single global grace period.
+        self.release_swapped_range(start, size);
+        let grace = self.synchronize_tlb_after_mutation();
+        retirement.release();
+        drop(grace);
+        self.publish_resident_highwater();
+
+        self.commit_prepared_fixed_replacement_sidecars(sidecars);
+        #[cfg(target_arch = "x86_64")]
+        self.remove_cet_default_shadow_stack_extents_for_unmap(start, size);
+        commit_mapping_identity_mutations(&mut self.mapping_identities, &mapping_mutations);
+        self.commit_topology_generation(next_topology_generation);
+        let wake = if let Some(plan) = uffd_plan {
+            self.uffd
+                .as_mut()
+                .expect("armed UFFD fixed-replace plan lost its state")
+                .commit_plan(plan)
+        } else {
+            DeferredUffdWake::empty()
+        };
+        Ok(wake)
+    }
+
+    fn prepare_fixed_replacement_sidecars(
+        &self,
+        start: VirtAddr,
+        size: usize,
+        locked: bool,
+    ) -> AxResult<PreparedFixedReplacementSidecars> {
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        let mut growdown_starts = self.growdown_starts.clone();
+        let mut madvise_guard_ranges = self.madvise_guard_ranges.clone();
+        let mut madvise_hwpoison_ranges = self.madvise_hwpoison_ranges.clone();
+        let mut madvise_free_pages = self.madvise_free_pages.clone();
+        let mut wipe_on_fork_ranges = self.wipe_on_fork_ranges.clone();
+        let mut dontfork_ranges = self.dontfork_ranges.clone();
+        let mut dontdump_ranges = self.dontdump_ranges.clone();
+        let mut locked_ranges = self.locked_ranges.clone();
+
+        growdown_starts.retain(|address| *address < start || *address >= end);
+        madvise_free_pages.retain(|&page, _| page < start || page >= end);
+        Self::clear_interval(&mut madvise_guard_ranges, start, size);
+        Self::clear_interval(&mut madvise_hwpoison_ranges, start, size);
+        Self::clear_interval(&mut wipe_on_fork_ranges, start, size);
+        Self::clear_interval(&mut dontfork_ranges, start, size);
+        Self::clear_interval_vec(&mut dontdump_ranges, start, size);
+        Self::clear_locked_interval(&mut locked_ranges, start, size);
+        if locked {
+            Self::insert_locked_interval(&mut locked_ranges, start, end);
+        }
+        Ok(PreparedFixedReplacementSidecars {
+            growdown_starts,
+            madvise_guard_ranges,
+            madvise_hwpoison_ranges,
+            madvise_free_pages,
+            wipe_on_fork_ranges,
+            dontfork_ranges,
+            dontdump_ranges,
+            locked_ranges,
+        })
+    }
+
+    fn commit_prepared_fixed_replacement_sidecars(
+        &mut self,
+        sidecars: PreparedFixedReplacementSidecars,
+    ) {
+        self.growdown_starts = sidecars.growdown_starts;
+        self.madvise_guard_ranges = sidecars.madvise_guard_ranges;
+        self.madvise_hwpoison_ranges = sidecars.madvise_hwpoison_ranges;
+        self.madvise_free_pages = sidecars.madvise_free_pages;
+        self.wipe_on_fork_ranges = sidecars.wipe_on_fork_ranges;
+        self.dontfork_ranges = sidecars.dontfork_ranges;
+        self.dontdump_ranges = sidecars.dontdump_ranges;
+        self.locked_ranges = sidecars.locked_ranges;
+    }
+
+    fn clear_locked_interval(
+        ranges: &mut BTreeMap<VirtAddr, VirtAddr>,
+        start: VirtAddr,
+        size: usize,
+    ) {
+        if size == 0 {
+            return;
+        }
+        let end = start + size;
+        let overlaps: Vec<_> = ranges
+            .range(..end)
+            .filter_map(|(&range_start, &range_end)| {
+                (range_end > start).then_some((range_start, range_end))
+            })
+            .collect();
+        for (range_start, range_end) in overlaps {
+            ranges.remove(&range_start);
+            if range_start < start {
+                ranges.insert(range_start, start);
+            }
+            if range_end > end {
+                ranges.insert(end, range_end);
+            }
+        }
+    }
+
+    fn insert_locked_interval(
+        ranges: &mut BTreeMap<VirtAddr, VirtAddr>,
+        start: VirtAddr,
+        end: VirtAddr,
+    ) {
+        let mut new_start = start;
+        let mut new_end = end;
+        let overlaps: Vec<_> = ranges
+            .range(..=end)
+            .filter_map(|(&range_start, &range_end)| {
+                (range_end >= start && range_start <= end).then_some((range_start, range_end))
+            })
+            .collect();
+        for (range_start, range_end) in overlaps {
+            ranges.remove(&range_start);
+            new_start = new_start.min(range_start);
+            new_end = new_end.max(range_end);
+        }
+        ranges.insert(new_start, new_end);
     }
 
     fn preflight_existing_lineage_tail_uffd(
@@ -4882,7 +6981,10 @@ impl AddrSpace {
         Ok(())
     }
 
-    fn preflight_transaction_unmap(&self, start: VirtAddr, size: usize) -> AxResult {
+    fn preflight_transaction_unmap(&mut self, start: VirtAddr, size: usize) -> AxResult {
+        self.dontdump_ranges
+            .try_reserve(1)
+            .map_err(|_| AxError::NoMemory)?;
         self.areas
             .preflight_unmap(start, size, &self.pt)
             .map_err(Into::into)
@@ -4938,9 +7040,14 @@ impl AddrSpace {
             return Err(error.into());
         }
         self.refresh_growdown_starts();
+        Self::clear_interval(&mut self.madvise_guard_ranges, start, size);
+        Self::clear_interval(&mut self.madvise_hwpoison_ranges, start, size);
         Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
+        Self::clear_interval_vec(&mut self.dontdump_ranges, start, size);
         self.clear_locked_range(start, size);
+        #[cfg(target_arch = "x86_64")]
+        self.remove_cet_default_shadow_stack_extents_for_unmap(start, size);
         self.prune_shared_alias_bindings();
         if !self.remove_mapping_lineage_if_unused(lineage) {
             return Err(AxError::BadState);
@@ -4951,8 +7058,14 @@ impl AddrSpace {
     fn destroy_remap_destination(&mut self, start: VirtAddr, size: usize) -> AxResult {
         self.unmap_areas_with_tlb_grace(start, size)?;
         self.refresh_growdown_starts();
+        let end = start + size;
+        self.madvise_free_pages
+            .retain(|&page, _| page < start || page >= end);
+        Self::clear_interval(&mut self.madvise_guard_ranges, start, size);
+        Self::clear_interval(&mut self.madvise_hwpoison_ranges, start, size);
         Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
+        Self::clear_interval_vec(&mut self.dontdump_ranges, start, size);
         self.clear_locked_range(start, size);
         self.prune_shared_alias_bindings();
         Ok(())
@@ -5365,6 +7478,11 @@ impl AddrSpace {
                                 source_start,
                                 source_size,
                             );
+                            Self::clear_interval_vec(
+                                &mut self.dontdump_ranges,
+                                source_start,
+                                source_size,
+                            );
                             self.clear_locked_range(source_start, source_size);
                             wake.merge(
                                 self.resolve_remap_uffd(uffd_plan, RemapUffdOutcome::Committed),
@@ -5536,6 +7654,53 @@ impl AddrSpace {
         Ok(())
     }
 
+    /// Removes only resident PTEs backed by one revoked external PCI object.
+    /// The VMA metadata deliberately remains: a later access reaches the
+    /// dead external backend and faults terminally instead of silently
+    /// rebinding a reused BAR page.  Scanning the current area tree makes
+    /// split, fork, mremap and partial-unmap exact without stale range
+    /// registrations.
+    pub(crate) fn revoke_external_shared_pages(&mut self, pages: &Arc<SharedPages>) {
+        let mut cursor_addr = self.base();
+        let mut revoked = false;
+        let mut cursor = self.pt.cursor();
+        loop {
+            let next = self
+                .areas
+                .iter()
+                .find(|area| area.end() > cursor_addr)
+                .map(|area| {
+                    (
+                        area.end(),
+                        area.backend()
+                            .shared_pages()
+                            .is_some_and(|candidate| Arc::ptr_eq(candidate, pages))
+                            .then(|| (area.start(), area.size(), area.backend().clone())),
+                    )
+                });
+            let Some((next_addr, target)) = next else {
+                break;
+            };
+            cursor_addr = next_addr;
+            let Some((start, size, backend)) = target else {
+                continue;
+            };
+            let Some(range) = VirtAddrRange::try_from_start_size(start, size) else {
+                continue;
+            };
+            // SharedBackend::unmap drains present leaves without changing the
+            // VMA. It cannot release PCI pages because SharedPages owns only
+            // the lease, not the physical memory.
+            if backend.unmap(range, &mut cursor).is_ok() {
+                revoked = true;
+            };
+        }
+        drop(cursor);
+        if revoked {
+            drop(self.synchronize_tlb_after_mutation());
+        }
+    }
+
     pub fn discard_pages(&mut self, mut start: VirtAddr, size: usize) -> AxResult {
         self.validate_region(start, size)?;
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Discard)?;
@@ -5584,6 +7749,8 @@ impl AddrSpace {
         // A software swap PTE is already non-present, so backend `unmap`
         // cannot see it.  Discard is nevertheless an ownership drop.
         self.release_swapped_range(discard_start, start.sub_addr(discard_start));
+        self.madvise_free_pages
+            .retain(|&page, _| page < discard_start || page >= end);
         let grace = self.synchronize_tlb_after_mutation();
         drop(retired);
         drop(grace);
@@ -5652,6 +7819,131 @@ impl AddrSpace {
         Ok(cooled)
     }
 
+    /// Implements anonymous MADV_FREE as a lazy-free generation, rather than
+    /// pretending that advice completed while retaining an indistinguishable
+    /// ordinary writable leaf.  Only resident private-anonymous pages enter
+    /// the ledger; absent pages carry no data to reclaim.  Write protection
+    /// gives the fault path one precise cancellation edge before a subsequent
+    /// userspace store can make the page dirty again.
+    pub(crate) fn mark_madvise_free(&mut self, start: VirtAddr, size: usize) -> AxResult<()> {
+        self.validate_region(start, size)?;
+        self.ensure_4k_granularity(start, size)?;
+        let end = start + size;
+        let generation = self
+            .next_madvise_free_generation
+            .checked_add(1)
+            .ok_or(AxError::NoMemory)?;
+        let mut staged = Vec::new();
+        staged
+            .try_reserve_exact(size / PAGE_SIZE_4K)
+            .map_err(|_| AxError::NoMemory)?;
+        let mut page = start;
+        while page < end {
+            let area = self.areas.find(page).ok_or(AxError::NoMemory)?;
+            if area.start() > page || !area.backend().is_private_anonymous() {
+                return Err(AxError::InvalidInput);
+            }
+            if let Ok((paddr, flags, PageSize::Size4K)) = self.pt.query(page)
+                && area.backend().swap_reclaimable(paddr)
+            {
+                // Only an exclusively owned anonymous leaf may be protected
+                // and later restored directly. Shared fork-COW leaves retain
+                // the normal backend write-fault/copy path.
+                staged.push((page, paddr, flags));
+            }
+            page += PAGE_SIZE_4K;
+        }
+        let mut changed = false;
+        let mut cursor = self.pt.cursor();
+        for (index, &(page, paddr, flags)) in staged.iter().enumerate() {
+            let protected = flags & !MappingFlags::WRITE;
+            if protected != flags {
+                if cursor.remap(page, paddr, protected).is_err() {
+                    // No ledger entry is published until every PTE is
+                    // protected. Restore the already changed prefix before
+                    // reporting failure so no ordinary writable page is
+                    // accidentally left behind a stale lazy-free contract.
+                    for &(old_page, old_paddr, old_flags) in &staged[..index] {
+                        cursor
+                            .remap(old_page, old_paddr, old_flags)
+                            .expect("preflighted MADV_FREE PTE rollback must succeed");
+                    }
+                    if changed {
+                        cursor.flush();
+                        drop(cursor);
+                        drop(self.synchronize_tlb_after_mutation());
+                    }
+                    return Err(AxError::BadAddress);
+                }
+                changed = true;
+            }
+        }
+        // This is the single publication point: either every changed PTE is
+        // protected and every resident page has a generation, or neither
+        // state becomes visible to the reclaim/fault paths.
+        for &(page, paddr, flags) in &staged {
+            self.madvise_free_pages.insert(
+                page,
+                LazyFreePage {
+                    generation,
+                    paddr,
+                    restore_flags: flags,
+                },
+            );
+        }
+        self.next_madvise_free_generation = generation;
+        if changed {
+            cursor.flush();
+            drop(cursor);
+            drop(self.synchronize_tlb_after_mutation());
+        }
+        Ok(())
+    }
+
+    /// Returns true only when a write fault consumed a currently lazy-free
+    /// page.  The original VMA permissions are restored before retrying the
+    /// instruction, making a post-MADV_FREE store observable to reclaim as a
+    /// new generation rather than silently losing it.
+    fn consume_madvise_free_write_fault(
+        &mut self,
+        page: VirtAddr,
+        _vma_flags: MappingFlags,
+    ) -> bool {
+        let Some(record) = self.madvise_free_pages.remove(&page) else {
+            return false;
+        };
+        if let Ok((paddr, _flags, PageSize::Size4K)) = self.pt.query(page)
+            && paddr == record.paddr
+            && self
+                .areas
+                .find(page)
+                .is_some_and(|area| area.backend().swap_reclaimable(paddr))
+        {
+            if self
+                .pt
+                .cursor()
+                .remap(page, paddr, record.restore_flags)
+                .is_ok()
+            {
+                drop(self.synchronize_tlb_after_mutation());
+                return true;
+            }
+        }
+        // Identity changed under a mapping transaction; leave the fault to
+        // the normal backend COW/protection path rather than restoring stale
+        // permissions.
+        false
+    }
+
+    /// A successful mprotect which grants WRITE is itself a modification
+    /// boundary: it must consume lazy-free generations because userspace can
+    /// store through the newly writable PTE without taking a page fault.
+    pub(crate) fn consume_madvise_free_write_range(&mut self, start: VirtAddr, size: usize) {
+        let end = start + size;
+        self.madvise_free_pages
+            .retain(|&page, _| page < start || page >= end);
+    }
+
     /// Drops resident private anonymous pages while keeping the VMA layout.
     pub fn discard_private_anonymous_pages(&mut self) {
         let ranges = self
@@ -5681,6 +7973,12 @@ impl AddrSpace {
             return false;
         }
 
+        // Prefer MADV_FREE generations.  Their PTE identity and write-fault
+        // cancellation are serialized by this mm lock, so a successful
+        // discard leaves the normal anonymous missing-page path to zero-fill
+        // on the next access. Pinned/busy/stale leaves are deliberately kept.
+        let _ = self.reclaim_madvise_free_pages();
+
         let ranges = self
             .areas
             .iter()
@@ -5696,6 +7994,38 @@ impl AddrSpace {
             }
         }
         true
+    }
+
+    /// Reclaims only still-current MADV_FREE leaves.  The ledger is a
+    /// capability, not an address hint: both physical identity and exclusive
+    /// anonymous ownership must still match immediately before discard.
+    pub(crate) fn reclaim_madvise_free_pages(&mut self) -> AxResult<usize> {
+        let candidates: Vec<_> = self
+            .madvise_free_pages
+            .iter()
+            .map(|(&page, &record)| (page, record))
+            .collect();
+        let mut reclaimed = 0usize;
+        for (page, record) in candidates {
+            let matches = self.pt.query(page).ok().is_some_and(|(paddr, _, size)| {
+                size == PageSize::Size4K
+                    && paddr == record.paddr
+                    && self
+                        .areas
+                        .find(page)
+                        .is_some_and(|area| area.backend().swap_reclaimable(paddr))
+            });
+            if !matches {
+                self.madvise_free_pages.remove(&page);
+                continue;
+            }
+            match self.discard_pages(page, PAGE_SIZE_4K) {
+                Ok(()) => reclaimed = reclaimed.saturating_add(1),
+                Err(error) if matches!(error.canonicalize(), AxError::ResourceBusy) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(reclaimed)
     }
 
     pub fn sync_backends_in_range(
@@ -5744,12 +8074,41 @@ impl AddrSpace {
     /// Returns an error if the address range is out of the address space or not
     /// aligned.
     pub(crate) fn unmap(&mut self, start: VirtAddr, size: usize) -> AxResult<DeferredUffdWake> {
+        self.unmap_inner(start, size, true)
+    }
+
+    /// Removes a replacement destination while retaining its existing shared
+    /// alias lease until the caller has either published the replacement VMA
+    /// or explicitly pruned it.  This closes the old-lease-to-new-VMA gap of
+    /// MAP_FIXED/SysV replacement transactions.
+    pub(crate) fn unmap_preserving_shared_alias_bindings(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+    ) -> AxResult<DeferredUffdWake> {
+        self.unmap_inner(start, size, false)
+    }
+
+    fn unmap_inner(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        prune_shared_alias_bindings: bool,
+    ) -> AxResult<DeferredUffdWake> {
         self.validate_region(start, size)?;
         if size == 0 {
             return Ok(DeferredUffdWake::empty());
         }
         self.check_no_seal_overlap(start, size)?;
         self.check_no_user_io_pin_overlap(start, size, InvalidationReason::Unmap)?;
+        // Clearing a middle slice of one DONTDUMP interval creates one extra
+        // suffix record. Reserve it before any uprobe/PTE/VMA mutation.
+        self.dontdump_ranges
+            .try_reserve(1)
+            .map_err(|_| AxError::NoMemory)?;
+        // XOL is a kernel-owned special VMA.  Invalidate its registry token
+        // under this destructive transaction lock before any PTE/VMA change.
+        crate::uprobe::invalidate_xol_range_locked(self, start, size);
         self.ensure_4k_granularity(start, size)?;
         let next_generation = self.next_topology_generation()?;
         let mapping_mutations =
@@ -5791,10 +8150,18 @@ impl AddrSpace {
             return Err(error.into());
         }
         self.refresh_growdown_starts();
+        let end = start + size;
+        self.madvise_free_pages
+            .retain(|&page, _| page < start || page >= end);
+        Self::clear_interval(&mut self.madvise_guard_ranges, start, size);
+        Self::clear_interval(&mut self.madvise_hwpoison_ranges, start, size);
         Self::clear_interval(&mut self.wipe_on_fork_ranges, start, size);
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
+        Self::clear_interval_vec(&mut self.dontdump_ranges, start, size);
         self.clear_locked_range(start, size);
-        self.prune_shared_alias_bindings();
+        if prune_shared_alias_bindings {
+            self.prune_shared_alias_bindings();
+        }
         let wake = if let Some(plan) = uffd_plan {
             self.uffd
                 .as_mut()
@@ -5880,6 +8247,96 @@ impl AddrSpace {
             synchronize_executable_publication(MappingFlags::EXECUTE);
         }
         result
+    }
+
+    /// Replaces one byte in a private file-backed executable mapping without
+    /// ever making its user PTE writable.  This is the uprobe overlay
+    /// primitive: `populate_area(WRITE)` first takes the ordinary COW path,
+    /// then the physical byte is changed while the leaf retains its RX VMA
+    /// policy.  Shared mappings are rejected, so an INT3 cannot escape into
+    /// another process or the inode page cache.
+    pub(crate) fn uprobe_cow_patch_byte(&mut self, address: VirtAddr, byte: u8) -> AxResult<u8> {
+        let page = address.align_down(PAGE_SIZE_4K);
+        let (flags, private_file_cow) = {
+            let area = self.areas.find(address).ok_or(AxError::BadAddress)?;
+            (
+                area.flags(),
+                area.flags().contains(MappingFlags::EXECUTE)
+                    && area.backend().is_private_cow()
+                    && area
+                        .backend()
+                        .file_mapping()
+                        .is_some_and(|mapping| mapping.sharing() == FileMappingSharing::Private),
+            )
+        };
+        if !private_file_cow {
+            return Err(AxError::PermissionDenied);
+        }
+
+        // COW's populate implementation treats WRITE as a private-copy
+        // request even when the user VMA itself is RX.  It retains `flags`
+        // for the final PTE, which is precisely the no-user-W/X overlay
+        // invariant required by uprobes.
+        self.populate_area(page, PAGE_SIZE_4K, MappingFlags::WRITE)?;
+        let (_, leaf_flags, leaf_size) = self.pt.query(page).map_err(|_| AxError::BadAddress)?;
+        if leaf_size != PageSize::Size4K
+            || leaf_flags.contains(MappingFlags::WRITE)
+            || !leaf_flags.contains(MappingFlags::EXECUTE)
+        {
+            return Err(AxError::BadState);
+        }
+        let mut previous = 0u8;
+        self.process_area_data(address, 1, |dst, _, _| unsafe {
+            previous = core::ptr::read_volatile(dst.as_ptr());
+            core::ptr::write_volatile(dst.as_mut_ptr(), byte);
+        })?;
+        synchronize_executable_publication(flags);
+        Ok(previous)
+    }
+
+    /// Restores an uprobe byte on the resident RX leaf which just generated a
+    /// user #BP.  Unlike the general installer this path never populates,
+    /// allocates, or sleeps: successful instruction fetch proves the leaf is
+    /// resident, and the private file-COW validation prevents modifying inode
+    /// cache or another mm.  It is used only while the uprobe registry lock
+    /// serializes final-consumer retirement against a new registration.
+    pub(crate) fn uprobe_restore_trapped_byte(
+        &mut self,
+        address: VirtAddr,
+        byte: u8,
+    ) -> AxResult<u8> {
+        let page = address.align_down(PAGE_SIZE_4K);
+        let flags = {
+            let area = self.areas.find(address).ok_or(AxError::BadAddress)?;
+            let private_file_cow = area.flags().contains(MappingFlags::EXECUTE)
+                && area.backend().is_private_cow()
+                && area
+                    .backend()
+                    .file_mapping()
+                    .is_some_and(|mapping| mapping.sharing() == FileMappingSharing::Private);
+            if !private_file_cow {
+                return Err(AxError::PermissionDenied);
+            }
+            area.flags()
+        };
+        let (paddr, leaf_flags, leaf_size) =
+            self.pt.query(page).map_err(|_| AxError::BadAddress)?;
+        if leaf_size != PageSize::Size4K
+            || leaf_flags.contains(MappingFlags::WRITE)
+            || !leaf_flags.contains(MappingFlags::EXECUTE)
+        {
+            return Err(AxError::BadState);
+        }
+        let offset = address.as_usize() - page.as_usize();
+        let target = axhal::mem::phys_to_virt(PhysAddr::from(paddr.as_usize() + offset));
+        let previous = unsafe {
+            let pointer = target.as_mut_ptr();
+            let previous = core::ptr::read_volatile(pointer);
+            core::ptr::write_volatile(pointer, byte);
+            previous
+        };
+        synchronize_executable_publication(flags);
+        Ok(previous)
     }
 
     /// Copies from this address space for the task that currently owns it.
@@ -6037,7 +8494,10 @@ impl AddrSpace {
             if area.flags().contains(MappingFlags::SHADOW_STACK) {
                 // pkey_mprotect may rekey a shadow stack, but never turns it
                 // into a conventional writable/executable mapping.
-                if requested != MappingFlags::READ {
+                if requested != MappingFlags::READ
+                    && requested != (MappingFlags::READ | MappingFlags::WRITE)
+                    && !requested.is_empty()
+                {
                     return Err(AxError::InvalidInput);
                 }
                 flags = (flags - MappingFlags::EXECUTE) | MappingFlags::SHADOW_STACK;
@@ -6158,10 +8618,52 @@ impl AddrSpace {
             if area.start() > start {
                 ax_bail!(NoMemory);
             }
+            if area.backend().special_mapping_token().is_some() {
+                // The special mapping's RX contract and token are immutable;
+                // even a nominal no-op must not split/rekey it. Callers retain
+                // the preceding Linux mprotect prefix, then fail here.
+                ax_bail!(OperationNotPermitted);
+            }
             area.backend().check_protect_flags(flags)?;
             start = area.end().min(end);
         }
 
+        Ok(())
+    }
+
+    /// Preflight used by pkey_mprotect before it prepares huge-leaf demotion
+    /// or PTE changes. A special mapping is never a legal permission target.
+    pub(crate) fn reject_special_mapping_mutation(
+        &self,
+        mut start: VirtAddr,
+        size: usize,
+    ) -> AxResult {
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        while start < end {
+            let Some(area) = self.areas.find(start) else {
+                ax_bail!(NoMemory);
+            };
+            if area.start() > start {
+                ax_bail!(NoMemory);
+            }
+            if area.backend().special_mapping_token().is_some() {
+                ax_bail!(OperationNotPermitted);
+            }
+            start = area.end().min(end);
+        }
+        Ok(())
+    }
+
+    /// Fixed mremap destinations may legitimately contain holes.  Scan only
+    /// existing overlapping VMAs while retaining the same special-mapping
+    /// rejection rule as a fully mapped source range.
+    pub(crate) fn reject_special_mapping_overlap(&self, start: VirtAddr, size: usize) -> AxResult {
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        for area in self.areas.iter_overlapping(VirtAddrRange::new(start, end)) {
+            if area.backend().special_mapping_token().is_some() {
+                ax_bail!(OperationNotPermitted);
+            }
+        }
         Ok(())
     }
 
@@ -6180,6 +8682,7 @@ impl AddrSpace {
         // Reserve the replacement identity before destroying the current
         // image. A sequence-exhaustion failure therefore leaves it untouched.
         let new_policy = new_user_io_policy()?;
+        crate::uprobe::invalidate_xol_range_locked(self, self.base(), self.size());
         self.clear_areas_with_tlb_grace()?;
         // Keep the registry exact even when the Arc survives an exec image
         // replacement.  Otherwise a later cross-mm transaction needlessly
@@ -6188,8 +8691,12 @@ impl AddrSpace {
         self.alias_bindings.clear();
         drop(core::mem::take(&mut self.mapping_identities));
         self.growdown_starts.clear();
+        self.madvise_guard_ranges.clear();
+        self.madvise_hwpoison_ranges.clear();
+        self.madvise_free_pages.clear();
         self.wipe_on_fork_ranges.clear();
         self.dontfork_ranges.clear();
+        self.dontdump_ranges.clear();
         self.locked_ranges.clear();
         debug_assert!(self.active_long_term_cow_pins.is_empty());
         self.user_io_pins.begin_teardown().map_err(mm_error)?;
@@ -6216,35 +8723,43 @@ impl AddrSpace {
         // Linux grows MAP_GROWSDOWN mappings when the fault lands on the guard
         // page immediately below the current lowest mapped page and SP is still
         // within that guard page.
-        let Some((current_start, fault_page, page_size, flags, lineage, backend)) = self
-            .growdown_starts
-            .iter()
-            .copied()
-            .find_map(|current_start| {
-                let area = self.areas.find(current_start)?;
-                if area.start() != current_start {
-                    return None;
-                }
-                let page_size = area.backend().page_size();
-                let fault_page = vaddr.align_down(page_size);
-                if fault_page.checked_add(page_size as usize)? != current_start {
-                    return None;
-                }
-                if !(user_sp >= fault_page && user_sp < current_start) {
-                    return None;
-                }
-                match area.backend() {
-                    Backend::Cow(_) => Some((
-                        current_start,
-                        fault_page,
-                        page_size,
-                        area.flags(),
-                        area.lineage(),
-                        area.backend().clone(),
-                    )),
-                    Backend::Linear(_) | Backend::Shared(_) | Backend::File(_) => None,
-                }
-            })
+        let Some((current_start, current_end, fault_page, page_size, flags, lineage, backend)) =
+            self.growdown_starts
+                .iter()
+                .copied()
+                .find_map(|current_start| {
+                    let area = self.areas.find(current_start)?;
+                    if area.start() != current_start {
+                        return None;
+                    }
+                    let page_size = area.backend().page_size();
+                    let fault_page = vaddr.align_down(page_size);
+                    if fault_page.checked_add(page_size as usize)? != current_start {
+                        return None;
+                    }
+                    // Linux permits a stack fault below RSP by a bounded window;
+                    // compilers commonly probe/allocate before adjusting RSP, and
+                    // RSP may still point inside the old VMA.  Keep the window
+                    // bounded so an arbitrary low-address fault cannot grow it.
+                    const STACK_FAULT_SP_WINDOW: usize = 64 * 1024;
+                    if !(user_sp >= vaddr
+                        && user_sp.sub_addr(vaddr) <= STACK_FAULT_SP_WINDOW.saturating_add(32))
+                    {
+                        return None;
+                    }
+                    match area.backend() {
+                        Backend::Cow(_) => Some((
+                            current_start,
+                            area.end(),
+                            fault_page,
+                            page_size,
+                            area.flags(),
+                            area.lineage(),
+                            area.backend().clone(),
+                        )),
+                        Backend::Linear(_) | Backend::Shared(_) | Backend::File(_) => None,
+                    }
+                })
         else {
             return PageFaultResult::Failed(PageFaultFailure::AddressNotMapped);
         };
@@ -6273,6 +8788,40 @@ impl AddrSpace {
             grow_range,
             page_size as usize,
         ) != Some(fault_page)
+        {
+            return PageFaultResult::Failed(PageFaultFailure::AddressNotMapped);
+        }
+
+        // Linux's automatic stack expansion accounts the extra VMA page
+        // before checking RLIMIT_STACK or attempting population.  This read
+        // is made at the fault edge so a concurrent prlimit applies to the
+        // next growth, while this address-space lock makes the total+growth
+        // comparison atomic with VMA publication.
+        let rlimit_as_allows_growth = axtask::current_may_uninit()
+            .and_then(|task| {
+                task.try_as_thread().map(|thread| {
+                    super::check_rlimit_as_growth(&thread.proc_data, self, page_size as usize)
+                        .is_ok()
+                })
+            })
+            .unwrap_or(false);
+        if !rlimit_as_allows_growth {
+            return PageFaultResult::Failed(PageFaultFailure::OutOfMemory);
+        }
+
+        // MAP_GROWSDOWN is constrained by the task's current stack rlimit,
+        // not merely by free virtual address space.  Read it at the fault
+        // edge so a concurrent prlimit/setrlimit takes effect for the next
+        // expansion; infinity retains the architecture's normal VA limit.
+        let stack_limit = axtask::current_may_uninit()
+            .map(|task| {
+                task.try_as_thread()
+                    .map(|thread| thread.proc_data.rlim.read()[RLIMIT_STACK].current)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        if stack_limit != RLIM_INFINITY as i64 as u64
+            && current_end.sub_addr(fault_page) > stack_limit as usize
         {
             return PageFaultResult::Failed(PageFaultFailure::AddressNotMapped);
         }
@@ -6476,12 +9025,12 @@ impl AddrSpace {
 
     fn release_swapped_range(&mut self, start: VirtAddr, size: usize) {
         let end = start + size;
-        let pages: Vec<_> = self
+        while let Some((page, entry)) = self
             .swapped
             .range(start..end)
+            .next()
             .map(|(page, entry)| (*page, *entry))
-            .collect();
-        for (page, entry) in pages {
+        {
             self.swapped.remove(&page);
             let _ = crate::mm::release(entry);
         }
@@ -6548,6 +9097,57 @@ impl AddrSpace {
         }
     }
 
+    /// Retains a file cache for the fault retry path without starting reclaim
+    /// while `self` is locked.  The returned handle is revalidated by the
+    /// normal fault loop after its transaction finishes.
+    pub(crate) fn file_cache_reclaim_for_fault(&self, vaddr: VirtAddr) -> Option<axfs::CachedFile> {
+        let area = self.areas.find(vaddr)?;
+        match area.backend() {
+            Backend::File(file) => Some(file.cache_for_reclaim()),
+            // A MAP_PRIVATE fault loads original bytes from the inode cache
+            // before materialising its anonymous COW leaf.  It therefore has
+            // the same lock-external reclaim retry source as a shared file
+            // mapping, even though its eventual PTE is not a cache alias.
+            Backend::Cow(cow) => cow.cache_for_reclaim(),
+            Backend::Linear(_) | Backend::Shared(_) => None,
+        }
+    }
+
+    /// Retains every file cache intersecting an explicit population request.
+    ///
+    /// This is called only after `populate_area` returned its internal
+    /// `ResourceBusy` token.  The caller releases the address-space lock
+    /// before reclaiming these caches, then repeats its complete VMA and
+    /// permission validation.  Deduplication keeps a split file VMA from
+    /// turning one retry into redundant eviction transactions.
+    pub(crate) fn file_caches_for_population_retry(
+        &self,
+        start: VirtAddr,
+        size: usize,
+    ) -> AxResult<Vec<axfs::CachedFile>> {
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        let mut caches: Vec<axfs::CachedFile> = Vec::new();
+        for area in self.areas.iter() {
+            if area.end() <= start || area.start() >= end {
+                continue;
+            }
+            let cache = match area.backend() {
+                Backend::File(file) => file.cache_for_reclaim(),
+                Backend::Cow(cow) => match cow.cache_for_reclaim() {
+                    Some(cache) => cache,
+                    None => continue,
+                },
+                Backend::Linear(_) | Backend::Shared(_) => continue,
+            };
+            if caches.iter().any(|existing| existing.ptr_eq(&cache)) {
+                continue;
+            }
+            caches.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            caches.push(cache);
+        }
+        Ok(caches)
+    }
+
     /// Handles a page fault at the given address.
     ///
     /// `access_flags` indicates the access type that caused the page fault.
@@ -6562,8 +9162,26 @@ impl AddrSpace {
         if !self.va_range.contains(vaddr) {
             return PageFaultResult::Failed(PageFaultFailure::AddressNotMapped);
         }
-        if let Some(area) = self.areas.find(vaddr) {
-            let flags = area.flags();
+        if self.is_madvise_guard(vaddr.align_down(PAGE_SIZE_4K)) {
+            return PageFaultResult::Failed(PageFaultFailure::AccessDenied);
+        }
+        if self.is_madvise_hwpoison(vaddr.align_down(PAGE_SIZE_4K)) {
+            return PageFaultResult::Failed(PageFaultFailure::BackingUnavailable);
+        }
+        if let Some((flags, backend, area_end)) = self
+            .areas
+            .find(vaddr)
+            .map(|area| (area.flags(), area.backend().clone(), area.end()))
+        {
+            // PFEC.SS is write-like only for a SHSTK VMA which retained its
+            // shadow-write policy.  A read-only/PROT_NONE SHSTK VMA keeps the
+            // type for later mprotect but cannot instantiate or COW a D=1
+            // leaf merely because the fault carries PFEC.SS.
+            if access_flags.contains(MappingFlags::SHADOW_STACK)
+                && !flags.contains(MappingFlags::WRITE)
+            {
+                return PageFaultResult::Failed(PageFaultFailure::AccessDenied);
+            }
             if flags.contains(access_flags) {
                 // A CET access is permissioned by SHADOW_STACK, but still
                 // has write semantics for private-COW allocation/copy.
@@ -6576,7 +9194,6 @@ impl AddrSpace {
                 };
                 let page = vaddr.align_down(PAGE_SIZE_4K);
                 if let Some(entry) = self.swapped.get(&page).copied() {
-                    let backend = area.backend().clone();
                     let restored = {
                         let mut cursor = self.pt.cursor();
                         backend.restore_swapped_page(page, flags, entry, &mut cursor)
@@ -6595,17 +9212,25 @@ impl AddrSpace {
                         }
                     }
                 }
-                let page_size = area.backend().page_size();
+                let page_size = backend.page_size();
                 let start = vaddr.align_down(page_size);
-                if area.backend().faults_with_sigbus(start) {
+                if backend.faults_with_sigbus(start) {
                     return PageFaultResult::Failed(PageFaultFailure::BackingUnavailable);
                 }
-                let fault_around = area.backend().fault_around_size(populate_access);
-                let fault_around_len = area
-                    .end()
+                let page = vaddr.align_down(PAGE_SIZE_4K);
+                if access_flags.contains(MappingFlags::WRITE)
+                    && self.consume_madvise_free_write_fault(page, flags)
+                {
+                    // The protected lazy-free leaf has been made writable
+                    // again. Retry the exact instruction; no backend/COW
+                    // population is needed for this already resident page.
+                    return PageFaultResult::Handled;
+                }
+                let fault_around = backend.fault_around_size(populate_access);
+                let fault_around_len = area_end
                     .sub_addr(start)
                     .min(fault_around.max(page_size as usize));
-                let leaf_state = match self.pt.query(vaddr.align_down(PAGE_SIZE_4K)) {
+                let leaf_state = match self.pt.query(page) {
                     Ok((_paddr, page_flags, _page_size))
                         if present_leaf_satisfies_fault(page_flags, access_flags) =>
                     {
@@ -6638,7 +9263,7 @@ impl AddrSpace {
                     // violate both boundaries, so fail closed.
                     return PageFaultResult::Failed(PageFaultFailure::InternalInconsistency);
                 }
-                let populate_outcome = area.backend().populate(
+                let populate_outcome = backend.populate(
                     VirtAddrRange::from_start_size(start, len),
                     flags,
                     populate_access,
@@ -6655,6 +9280,10 @@ impl AddrSpace {
                             warn!("No pages populated for {vaddr:?} ({flags:?})");
                         }
                     }
+                    // ResourceBusy is the file cache's internal retry token:
+                    // the fault session reclaims one page and retries, so it
+                    // is not a population failure worth logging.
+                    Err(err) if err.canonicalize() == AxError::ResourceBusy => {}
                     Err(err) => {
                         warn!("Failed to populate pages for {vaddr:?} ({flags:?}): {err}");
                     }
@@ -6673,19 +9302,21 @@ impl AddrSpace {
             return false;
         }
         let fault_candidate = self.fault_needs_accounting(vaddr, access_flags);
-        let read_before = axtask::current()
-            .try_as_thread()
-            .map(|thread| thread.backing_read_bytes());
+        let read_before = axtask::current_may_uninit().and_then(|current| {
+            current
+                .try_as_thread()
+                .map(|thread| thread.backing_read_bytes())
+        });
         let handled = matches!(
             self.handle_page_fault_result(vaddr, access_flags, None),
             PageFaultResult::Handled
         );
-        if handled && fault_candidate {
-            if let (Some(thread), Some(read_before)) =
-                (axtask::current().try_as_thread(), read_before)
-            {
-                thread.account_resolved_page_fault(read_before);
-            }
+        if handled
+            && fault_candidate
+            && let (Some(current), Some(read_before)) = (axtask::current_may_uninit(), read_before)
+            && let Some(thread) = current.try_as_thread()
+        {
+            thread.account_resolved_page_fault(read_before);
         }
         handled
     }
@@ -6729,19 +9360,21 @@ impl AddrSpace {
             return Err(AxError::NoMemory);
         }
         #[cfg(target_arch = "x86_64")]
-        if let Some(owner) = borrowed_shadow_stack {
+        if let Some(owner) = borrowed_shadow_stack.as_ref() {
             // A vfork borrow is an exact lease from this source mm.  Validate
             // it before any COW PTE mutation: pkey_mprotect(PROT_READ) may
             // have split the VMA, but every fragment of the logical extent
             // must remain live SHSTK and no fork policy may punch a child
             // hole through the borrowed stack.
-            let Some(end) = owner.start.checked_add(owner.size) else {
-                return Err(AxError::BadState);
-            };
             if !self.cet_default_shadow_stacks.contains(&owner)
-                || !self.cet_shadow_stack_extent_covers(owner.start, owner.size)
-                || Self::interval_overlaps(&self.dontfork_ranges, owner.start, end)
-                || Self::interval_overlaps(&self.wipe_on_fork_ranges, owner.start, end)
+                || owner.extents.is_empty()
+                || owner.extents.iter().any(|extent| {
+                    extent.end().is_none_or(|end| {
+                        !self.cet_shadow_stack_extent_covers(extent.start, extent.size)
+                            || Self::interval_overlaps(&self.dontfork_ranges, extent.start, end)
+                            || Self::interval_overlaps(&self.wipe_on_fork_ranges, extent.start, end)
+                    })
+                })
             {
                 return Err(AxError::BadState);
             }
@@ -6757,6 +9390,10 @@ impl AddrSpace {
         let new_aspace_clone = new_aspace.clone();
         let wipe_on_fork_ranges = self.wipe_on_fork_ranges.clone();
         let dontfork_ranges = self.dontfork_ranges.clone();
+        let dontdump_ranges =
+            Self::try_clone_interval_vec(&self.dontdump_ranges, self.dontfork_ranges.len())?;
+        let madvise_guard_ranges = self.madvise_guard_ranges.clone();
+        let madvise_hwpoison_ranges = self.madvise_hwpoison_ranges.clone();
 
         // Reserve every child identity before clone_map can COW-protect a
         // parent PTE. Fork does not change the parent's VMA contract, so its
@@ -6819,12 +9456,28 @@ impl AddrSpace {
         // barrier generation. CLONE_VM shares the address space (and hence
         // this state) through the existing Arc path instead.
         guard.tlb = self.tlb.fork_clone()?;
+        guard.thp_disable_mode = self.thp_disable_mode;
         if let Some(old) = self.tlb.snapshot_ldt() {
             guard.tlb.replace_ldt(Some(
                 Arc::try_new(old.copy()?).map_err(|_| AxError::NoMemory)?,
             ));
         }
         guard.growdown_starts = self.growdown_starts.clone();
+        guard.dontdump_ranges = dontdump_ranges;
+        guard.madvise_guard_ranges = madvise_guard_ranges;
+        guard.madvise_hwpoison_ranges = madvise_hwpoison_ranges;
+        // DONTFORK holes have no child VMA.  Do not leave an advisory guard
+        // sidecar there: a later child mmap at that address must not inherit
+        // a parent's fault policy.
+        for (&start, &end) in &dontfork_ranges {
+            Self::clear_interval(&mut guard.madvise_guard_ranges, start, end.sub_addr(start));
+            Self::clear_interval(
+                &mut guard.madvise_hwpoison_ranges,
+                start,
+                end.sub_addr(start),
+            );
+            Self::clear_interval_vec(&mut guard.dontdump_ranges, start, end.sub_addr(start));
+        }
         let mut child_lineages = Vec::new();
         child_lineages
             .try_reserve(child_parent_lineages.len())
@@ -6871,6 +9524,14 @@ impl AddrSpace {
                         MAX_VMA_FRAGMENTS,
                     )?;
                     Self::insert_interval(&mut aspace.wipe_on_fork_ranges, cursor, segment_end);
+                    // WIPEONFORK replaces the parent backing with fresh zero
+                    // pages; fault poison and lazyfree identity belong to the
+                    // retired parent leaves and must not follow it.
+                    Self::clear_interval(&mut aspace.madvise_guard_ranges, cursor, wipe_size);
+                    Self::clear_interval(&mut aspace.madvise_hwpoison_ranges, cursor, wipe_size);
+                    aspace
+                        .madvise_free_pages
+                        .retain(|&page, _| page < cursor || page >= segment_end);
                     cursor = segment_end;
                     continue;
                 }
@@ -6889,18 +9550,18 @@ impl AddrSpace {
 
                 if cursor < segment_end {
                     let segment_size = segment_end.sub_addr(cursor);
-                    let share_shadow_stack = borrowed_shadow_stack.is_some_and(|owner| {
-                        let Some(owner_end) = owner.start.checked_add(owner.size) else {
-                            return false;
-                        };
+                    let share_shadow_stack = borrowed_shadow_stack.as_ref().is_some_and(|owner| {
                         // Each whole SHSTK fragment inside the already
                         // validated logical lease keeps the parent's CET
                         // leaves.  Do not share a merely overlapping VMA:
                         // that could cover a hole, an adjacent explicit
                         // SHSTK mapping, or another owner's extent.
                         area.flags().contains(MappingFlags::SHADOW_STACK)
-                            && owner.start <= cursor
-                            && segment_end <= owner_end
+                            && owner.extents.iter().any(|extent| {
+                                extent
+                                    .end()
+                                    .is_some_and(|end| extent.start <= cursor && segment_end <= end)
+                            })
                     });
                     let new_backend = {
                         let mut new_modify = guard.pt.cursor_no_flush();
@@ -7001,7 +9662,7 @@ impl AddrSpace {
     /// `pkey_mprotect(PROT_READ)` may split its VMA at either boundary while
     /// retaining SHSTK on every fragment; that must not invalidate the SSP
     /// lease merely because no single VMA still has the original size.
-    fn cet_shadow_stack_extent_covers(&self, start: VirtAddr, size: usize) -> bool {
+    pub(crate) fn cet_shadow_stack_extent_covers(&self, start: VirtAddr, size: usize) -> bool {
         let Some(end) = start.checked_add(size) else {
             return false;
         };
@@ -7017,7 +9678,10 @@ impl AddrSpace {
             if area.start() > cursor
                 || !flags
                     .contains(MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK)
-                || flags.intersects(MappingFlags::WRITE | MappingFlags::EXECUTE)
+                // WRITE here is the VMA's shadow-write policy, not ordinary
+                // PTE writability.  A live default SHSTK VMA intentionally
+                // retains it so its leaves encode W=0,D=1.
+                || flags.contains(MappingFlags::EXECUTE)
             {
                 return false;
             }
@@ -7071,12 +9735,54 @@ impl AddrSpace {
         size: usize,
         ownership: CetDefaultShadowStackOwnership,
     ) -> AxResult {
-        if size == 0
+        let mut extents = Vec::new();
+        extents.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        extents.push(CetDefaultShadowStackExtent { start, size });
+        self.register_cet_default_shadow_stack_extents_with_ownership(task_id, extents, ownership)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn register_cet_default_shadow_stack_extents(
+        &mut self,
+        task_id: u32,
+        extents: Vec<CetDefaultShadowStackExtent>,
+    ) -> AxResult {
+        self.register_cet_default_shadow_stack_extents_with_ownership(
+            task_id,
+            extents,
+            CetDefaultShadowStackOwnership::Owned,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn register_borrowed_cet_default_shadow_stack_extents(
+        &mut self,
+        task_id: u32,
+        extents: Vec<CetDefaultShadowStackExtent>,
+    ) -> AxResult {
+        self.register_cet_default_shadow_stack_extents_with_ownership(
+            task_id,
+            extents,
+            CetDefaultShadowStackOwnership::Borrowed,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn register_cet_default_shadow_stack_extents_with_ownership(
+        &mut self,
+        task_id: u32,
+        mut extents: Vec<CetDefaultShadowStackExtent>,
+        ownership: CetDefaultShadowStackOwnership,
+    ) -> AxResult {
+        Self::normalize_cet_default_shadow_stack_extents(&mut extents);
+        if extents.is_empty()
             || self
                 .cet_default_shadow_stacks
                 .iter()
                 .any(|owner| owner.task_id == task_id)
-            || !self.cet_shadow_stack_extent_covers(start, size)
+            || extents.iter().any(|extent| {
+                extent.size == 0 || !self.cet_shadow_stack_extent_covers(extent.start, extent.size)
+            })
         {
             return Err(AxError::InvalidInput);
         }
@@ -7086,8 +9792,9 @@ impl AddrSpace {
         self.cet_default_shadow_stacks
             .push(CetDefaultShadowStackOwner {
                 task_id,
-                start,
-                size,
+                start: extents[0].start,
+                size: extents[0].size,
+                extents,
                 ownership,
             });
         Ok(())
@@ -7114,59 +9821,107 @@ impl AddrSpace {
     ) -> Option<CetDefaultShadowStackOwner> {
         self.cet_default_shadow_stacks
             .iter()
-            .copied()
+            .cloned()
             .find(|owner| owner.task_id == task_id)
     }
 
-    /// Default CET stacks are task SSP leases.  Moving, resizing, or fixed
-    /// replacement cannot safely update every CLONE_VM peer atomically, so
-    /// callers reject any overlap before altering VMAs.
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn cet_default_shadow_stack_intersects(&self, start: VirtAddr, size: usize) -> bool {
-        let Some(end) = start.checked_add(size) else {
-            return true;
-        };
-        self.cet_default_shadow_stacks.iter().any(|owner| {
-            owner
-                .start
-                .checked_add(owner.size)
-                .is_none_or(|owner_end| start < owner_end && owner.start < end)
-        })
-    }
-
-    /// Retires an owner only after its VMA transaction succeeds. Borrowed
+    /// Retires one automatic-stack cleanup record exactly once. Borrowed
     /// vfork aliases name the parent's VMA and therefore only lose the alias.
+    /// A peer may already have unmapped an owned VMA; that is still a complete
+    /// cleanup operation and must not leave a stale record that blocks a later
+    /// disable/re-enable cycle.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn retire_cet_default_shadow_stack(&mut self, task_id: u32) {
-        let Some(owner) = self.cet_default_shadow_stack(task_id) else {
-            return;
+    pub(crate) fn retire_cet_default_shadow_stack(&mut self, task_id: u32) -> DeferredUffdWake {
+        let Some(owner) = self.take_cet_default_shadow_stack(task_id) else {
+            return DeferredUffdWake::empty();
         };
         if owner.ownership == CetDefaultShadowStackOwnership::Owned {
-            let Ok(wake) = self.unmap(owner.start, owner.size) else {
-                return;
-            };
-            let _ = self.take_cet_default_shadow_stack(task_id);
-            wake.finish();
+            // The record is cleanup metadata, never SSP authority. Drop it
+            // before attempting the best-effort VMA retirement so a peer
+            // munmap cannot strand CET state behind stale ownership.
+            let mut wake = DeferredUffdWake::empty();
+            // The registry is removed before touching VMAs, so every extent
+            // is reclaimed at most once even if a peer has already removed
+            // some fragments. Explicit map_shadow_stack VMAs never acquire a
+            // registry extent and therefore cannot be selected here.
+            for extent in owner.extents {
+                if let Ok(fragment_wake) = self.unmap(extent.start, extent.size) {
+                    wake.merge(fragment_wake);
+                }
+            }
+            wake
         } else {
-            let _ = self.take_cet_default_shadow_stack(task_id);
+            DeferredUffdWake::empty()
         }
     }
 
-    /// Tests the current PL3_SSP against this task's still-live default CET
-    /// VMA.  This is intentionally an MM-only lease check: callers perform
-    /// task-local state retirement only after dropping the address-space lock.
+    /// Tests whether an SSP names the end of a live user shadow-stack word.
+    ///
+    /// This deliberately does not consult the default-stack owner registry:
+    /// owner records exist solely to reclaim automatically allocated stacks.
+    /// Users may pivot SSP to an explicit `map_shadow_stack(2)` mapping.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn cet_default_shadow_stack_contains(&self, task_id: u32, ssp: u64) -> bool {
-        let Some(owner) = self.cet_default_shadow_stack(task_id) else {
+    pub(crate) fn cet_shadow_stack_pointer_valid(&self, ssp: u64) -> bool {
+        let Some(start) = (ssp as usize).checked_sub(core::mem::size_of::<u64>()) else {
             return false;
         };
-        let Some(end) = owner.start.as_usize().checked_add(owner.size) else {
+        ssp.is_multiple_of(core::mem::size_of::<u64>() as u64)
+            && self
+                .cet_shadow_stack_extent_covers(VirtAddr::from(start), core::mem::size_of::<u64>())
+    }
+
+    /// Validates one resident, kernel-authorized CET write span while the MM
+    /// lock is held.  Unlike a generic readable span, this accepts only an
+    /// exact user shadow-stack VMA and matching resident SHSTK PTEs; it is the
+    /// nofault transaction gate for paired normal/shadow-stack updates.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn cet_shadow_stack_span_resident(&self, start: usize, len: usize) -> bool {
+        if !matches!(len, 4 | 8 | 32)
+            || start.checked_add(len).is_none()
+            || !self.cet_shadow_stack_extent_covers(VirtAddr::from(start), len)
+        {
+            return false;
+        }
+        let end = start + len;
+        let first = start & !(PAGE_SIZE_4K - 1);
+        let last = (end - 1) & !(PAGE_SIZE_4K - 1);
+        for page in [first, last] {
+            let Some(area) = self.find_area(VirtAddr::from(page)) else {
+                return false;
+            };
+            let vma = area.flags();
+            // Linux keeps SHSTK's kernel-authorized write policy in the VMA
+            // (and strips ordinary user write from the leaf encoding).  Do
+            // not reject that required VMA WRITE bit; the SHSTK PTE identity
+            // below is what prevents this from becoming generic usercopy.
+            if !vma.contains(MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK)
+                || vma.contains(MappingFlags::EXECUTE)
+            {
+                return false;
+            }
+            let Ok((_, pte, size)) = self.page_table().query(VirtAddr::from(page)) else {
+                return false;
+            };
+            if size != PageSize::Size4K
+                || !pte.contains(MappingFlags::USER | MappingFlags::SHADOW_STACK)
+                || pte.intersects(MappingFlags::EXECUTE)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Tests whether a Linux x86 signal transition can push its restorer and
+    /// restore token below `ssp` without leaving a live SHSTK mapping.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn cet_signal_frame_fits(&self, ssp: u64) -> bool {
+        let bytes = core::mem::size_of::<[u64; 2]>();
+        let Some(start) = (ssp as usize).checked_sub(bytes) else {
             return false;
         };
-        let ssp = ssp as usize;
-        ssp >= owner.start.as_usize()
-            && ssp <= end
-            && self.cet_shadow_stack_extent_covers(owner.start, owner.size)
+        ssp.is_multiple_of(core::mem::size_of::<u64>() as u64)
+            && self.cet_shadow_stack_extent_covers(VirtAddr::from(start), bytes)
     }
 
     /// A borrowed vfork stack deliberately shares its physical leaves with
@@ -7176,11 +9931,9 @@ impl AddrSpace {
     fn borrowed_cet_shadow_stack_contains(&self, address: VirtAddr) -> bool {
         self.cet_default_shadow_stacks.iter().any(|owner| {
             owner.ownership == CetDefaultShadowStackOwnership::Borrowed
-                && owner.start <= address
-                && owner
-                    .start
-                    .checked_add(owner.size)
-                    .is_some_and(|end| address < end)
+                && owner.extents.iter().any(|extent| {
+                    extent.start <= address && extent.end().is_some_and(|end| address < end)
+                })
         })
     }
 
@@ -7191,18 +9944,14 @@ impl AddrSpace {
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn write_cet_signal_frame(
         &mut self,
-        task_id: u32,
         saved_ssp: u64,
-        words: [u64; 3],
+        words: [u64; 2],
     ) -> AxResult<u64> {
         let bytes = core::mem::size_of_val(&words);
         let start = (saved_ssp as usize)
             .checked_sub(bytes)
             .ok_or(AxError::BadAddress)?;
-        if !saved_ssp.is_multiple_of(core::mem::size_of::<u64>() as u64)
-            || !self.cet_default_shadow_stack_contains(task_id, saved_ssp)
-            || !self.cet_default_shadow_stack_contains(task_id, start as u64)
-        {
+        if !self.cet_signal_frame_fits(saved_ssp) {
             return Err(AxError::BadAddress);
         }
         let first_page = start & !(PAGE_SIZE_4K - 1);
@@ -7226,7 +9975,7 @@ impl AddrSpace {
                 return Err(AxError::BadAddress);
             }
         }
-        let mut bytes = [0u8; core::mem::size_of::<[u64; 3]>()];
+        let mut bytes = [0u8; core::mem::size_of::<[u64; 2]>()];
         for (index, word) in words.into_iter().enumerate() {
             bytes[index * 8..(index + 1) * 8].copy_from_slice(&word.to_ne_bytes());
         }
@@ -7235,71 +9984,281 @@ impl AddrSpace {
     }
 
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn read_cet_signal_frame(
-        &self,
-        task_id: u32,
-        shadow_start: u64,
-    ) -> AxResult<[u64; 3]> {
-        let end = shadow_start
-            .checked_add(core::mem::size_of::<[u64; 3]>() as u64)
+    pub(crate) fn read_cet_signal_frame(&self, shadow_start: u64) -> AxResult<[u64; 2]> {
+        let _end = shadow_start
+            .checked_add(core::mem::size_of::<[u64; 2]>() as u64)
             .ok_or(AxError::BadAddress)?;
         if !shadow_start.is_multiple_of(core::mem::size_of::<u64>() as u64)
-            || !self.cet_default_shadow_stack_contains(task_id, shadow_start)
-            || !self.cet_default_shadow_stack_contains(task_id, end)
+            || !self.cet_shadow_stack_extent_covers(
+                VirtAddr::from(shadow_start as usize),
+                core::mem::size_of::<[u64; 2]>(),
+            )
         {
             return Err(AxError::BadAddress);
         }
-        let mut bytes = [0u8; core::mem::size_of::<[u64; 3]>()];
+        let mut bytes = [0u8; core::mem::size_of::<[u64; 2]>()];
         self.read(VirtAddr::from(shadow_start as usize), &mut bytes)?;
-        let mut words = [0u64; 3];
+        let mut words = [0u64; 2];
         for (index, word) in words.iter_mut().enumerate() {
             *word = u64::from_ne_bytes(bytes[index * 8..(index + 1) * 8].try_into().unwrap());
         }
         Ok(words)
     }
 
-    /// Reconciles every owner in this mm after an arbitrary successful VMA
-    /// mutation.  The returned task ids are the only information callers may
-    /// use to clear task-local CET signal metadata; this avoids taking task
-    /// locks while holding the mm lock.
+    /// Reads the token consumed by a signal restorer. At this point the
+    /// handler's RET already consumed the preceding restorer word, so `ssp`
+    /// names the token itself rather than a complete signal frame.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn reconcile_cet_default_shadow_stacks(&mut self) -> Vec<u32> {
-        let mut invalidated = Vec::new();
-        let mut index = 0;
-        while index < self.cet_default_shadow_stacks.len() {
-            let owner = self.cet_default_shadow_stacks[index];
-            if self.cet_shadow_stack_extent_covers(owner.start, owner.size) {
-                index += 1;
-            } else {
-                invalidated.push(owner.task_id);
-                self.cet_default_shadow_stacks.swap_remove(index);
-            }
+    pub(crate) fn read_cet_signal_restore_token(&self, ssp: u64) -> AxResult<u64> {
+        let bytes = core::mem::size_of::<u64>();
+        if !ssp.is_multiple_of(bytes as u64)
+            || !self.cet_shadow_stack_extent_covers(VirtAddr::from(ssp as usize), bytes)
+        {
+            return Err(AxError::BadAddress);
         }
-        invalidated
+        let mut raw = [0u8; core::mem::size_of::<u64>()];
+        self.read(VirtAddr::from(ssp as usize), &mut raw)?;
+        Ok(u64::from_ne_bytes(raw))
     }
 
-    /// Reconciles stack records after mremap while still inside its VMA
-    /// transaction. A moved owner's start follows its source offset; all
-    /// unrelated owners are checked against the resulting live VMAs too,
-    /// which covers MREMAP_FIXED replacement in a shared mm.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn reconcile_cet_default_shadow_stacks_after_mremap(
+    fn normalize_cet_default_shadow_stack_extents(extents: &mut Vec<CetDefaultShadowStackExtent>) {
+        extents.retain(|extent| extent.size != 0 && extent.end().is_some());
+        extents.sort_unstable_by_key(|extent| extent.start);
+        let mut output = 0;
+        for index in 0..extents.len() {
+            let extent = extents[index];
+            if output != 0
+                && extents[output - 1]
+                    .end()
+                    .is_some_and(|end| extent.start <= end)
+            {
+                let previous = &mut extents[output - 1];
+                let end = previous
+                    .end()
+                    .expect("normalized CET extent has a checked end")
+                    .max(
+                        extent
+                            .end()
+                            .expect("normalized CET extent has a checked end"),
+                    );
+                previous.size = end.sub_addr(previous.start);
+            } else {
+                extents[output] = extent;
+                output += 1;
+            }
+        }
+        extents.truncate(output);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn refresh_cet_default_shadow_stack_bounds(owner: &mut CetDefaultShadowStackOwner) {
+        if let Some(first) = owner.extents.first().copied() {
+            owner.start = first.start;
+            owner.size = first.size;
+        } else {
+            owner.start = VirtAddr::from(0);
+            owner.size = 0;
+        }
+    }
+
+    /// Remove only the automatic-stack portions invalidated by a peer VMA
+    /// removal. This happens at the mutation boundary, before a later
+    /// explicit map_shadow_stack can reuse the same address; retirement can
+    /// therefore never mistake that new explicit mapping for an old automatic
+    /// extent.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn remove_cet_default_shadow_stack_extents_for_unmap(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+    ) {
+        let Some(end) = start.checked_add(size) else {
+            return;
+        };
+        for owner in &mut self.cet_default_shadow_stacks {
+            let mut output = 0;
+            for index in 0..owner.extents.len() {
+                let extent = owner.extents[index];
+                let extent_end = extent
+                    .end()
+                    .expect("registered CET extent has a checked end");
+                if extent_end <= start || end <= extent.start {
+                    owner.extents[output] = extent;
+                    output += 1;
+                    continue;
+                }
+                if extent.start < start {
+                    owner.extents[output] = CetDefaultShadowStackExtent {
+                        start: extent.start,
+                        size: start.sub_addr(extent.start),
+                    };
+                    output += 1;
+                }
+                if end < extent_end {
+                    owner.extents[output] = CetDefaultShadowStackExtent {
+                        start: end,
+                        size: extent_end.sub_addr(end),
+                    };
+                    output += 1;
+                }
+            }
+            owner.extents.truncate(output);
+            Self::refresh_cet_default_shadow_stack_bounds(owner);
+        }
+    }
+
+    /// Reserve fragmented-owner capacity before an mremap transaction can
+    /// publish the corresponding VMA topology. Rebase below is then strictly
+    /// infallible and cannot leave committed mappings with stale cleanup
+    /// ownership.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn prepare_cet_default_shadow_stacks_for_mremap(
         &mut self,
         source: VirtAddr,
         old_size: usize,
-        destination: VirtAddr,
-    ) -> Vec<u32> {
-        let source_end = source.checked_add(old_size);
+        duplicate: bool,
+    ) -> AxResult {
+        let Some(source_end) = source.checked_add(old_size) else {
+            return Err(AxError::InvalidInput);
+        };
         for owner in &mut self.cet_default_shadow_stacks {
-            if source_end.is_some_and(|end| source <= owner.start && owner.start < end) {
-                if let Some(offset) = owner.start.as_usize().checked_sub(source.as_usize())
-                    && let Some(start) = destination.checked_add(offset)
-                {
-                    owner.start = start;
+            let intersecting = owner
+                .extents
+                .iter()
+                .filter(|extent| {
+                    extent
+                        .end()
+                        .is_some_and(|end| extent.start < source_end && source < end)
+                })
+                .count();
+            // A duplicate adds one destination extent per intersected extent.
+            // A move replaces each intersected extent, with at most two extra
+            // source-side boundary fragments overall.
+            let additional = if duplicate {
+                intersecting
+            } else {
+                intersecting.saturating_add(2)
+            };
+            owner
+                .extents
+                .try_reserve(additional)
+                .map_err(|_| AxError::NoMemory)?;
+        }
+        Ok(())
+    }
+
+    /// Rebase default-stack cleanup records after mremap while still inside
+    /// its VMA transaction. These records are not active-SSP authorization:
+    /// a peer mutation is made visible by the synchronized TLB update and any
+    /// subsequent CET access faults architecturally.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn rebase_cet_default_shadow_stacks_after_mremap(
+        &mut self,
+        source: VirtAddr,
+        old_size: usize,
+        new_size: usize,
+        destination: VirtAddr,
+        duplicate: bool,
+    ) {
+        let Some(source_end) = source.checked_add(old_size) else {
+            return;
+        };
+        let moved_size = old_size.min(new_size);
+        let Some(moved_source_end) = source.checked_add(moved_size) else {
+            return;
+        };
+        for owner in &mut self.cet_default_shadow_stacks {
+            let original_len = owner.extents.len();
+            for index in 0..original_len {
+                let extent = owner.extents[index];
+                let extent_end = extent
+                    .end()
+                    .expect("registered CET extent has a checked end");
+                let overlap_start = extent.start.max(source);
+                let overlap_end = extent_end.min(moved_source_end);
+                if overlap_start >= overlap_end {
+                    continue;
+                }
+                if duplicate {
+                    let offset = overlap_start.sub_addr(source);
+                    if let Some(start) = destination.checked_add(offset) {
+                        owner.extents.push(CetDefaultShadowStackExtent {
+                            start,
+                            size: overlap_end.sub_addr(overlap_start),
+                        });
+                    }
+                    continue;
+                }
+
+                // Replace this source fragment with its surviving left part;
+                // append the moved middle and surviving right part. This
+                // handles a source range beginning or ending in the interior
+                // of an owner extent rather than only rebasing owner.start.
+                let mut replacement = [None, None, None];
+                if extent.start < overlap_start {
+                    replacement[0] = Some(CetDefaultShadowStackExtent {
+                        start: extent.start,
+                        size: overlap_start.sub_addr(extent.start),
+                    });
+                }
+                let offset = overlap_start.sub_addr(source);
+                if let Some(start) = destination.checked_add(offset) {
+                    replacement[1] = Some(CetDefaultShadowStackExtent {
+                        start,
+                        size: overlap_end.sub_addr(overlap_start),
+                    });
+                }
+                if overlap_end < extent_end {
+                    replacement[2] = Some(CetDefaultShadowStackExtent {
+                        start: overlap_end,
+                        size: extent_end.sub_addr(overlap_end),
+                    });
+                }
+                let mut replacements = replacement.into_iter().flatten();
+                if let Some(first) = replacements.next() {
+                    owner.extents[index] = first;
+                    owner.extents.extend(replacements);
+                } else {
+                    owner.extents[index].size = 0;
                 }
             }
+            // A shrinking move removes the old source tail. Its overlap lies
+            // outside `moved_source_end`, so drop it after relocating the
+            // prefix above. Duplication never removes source bytes.
+            if !duplicate && moved_size < old_size {
+                let tail_start = moved_source_end;
+                let mut output = 0;
+                for index in 0..owner.extents.len() {
+                    let extent = owner.extents[index];
+                    let extent_end = extent
+                        .end()
+                        .expect("registered CET extent has a checked end");
+                    if extent_end <= tail_start || source_end <= extent.start {
+                        owner.extents[output] = extent;
+                        output += 1;
+                    } else {
+                        if extent.start < tail_start {
+                            owner.extents[output] = CetDefaultShadowStackExtent {
+                                start: extent.start,
+                                size: tail_start.sub_addr(extent.start),
+                            };
+                            output += 1;
+                        }
+                        if source_end < extent_end {
+                            owner.extents[output] = CetDefaultShadowStackExtent {
+                                start: source_end,
+                                size: extent_end.sub_addr(source_end),
+                            };
+                            output += 1;
+                        }
+                    }
+                }
+                owner.extents.truncate(output);
+            }
+            Self::normalize_cet_default_shadow_stack_extents(&mut owner.extents);
+            Self::refresh_cet_default_shadow_stack_bounds(owner);
         }
-        self.reconcile_cet_default_shadow_stacks()
     }
 
     pub(crate) fn shared_backing_key_at(&self, address: VirtAddr) -> Option<SharedBackingKey> {
@@ -8492,6 +11451,49 @@ mod tests {
     }
 
     #[test]
+    fn prepared_protect_segments_skip_disjoint_and_touching_areas() {
+        let mut areas = MemorySet::new();
+        let mut page_table = vec![0; TEST_SPACE_SIZE];
+        for (start, flags, backend) in [(0x1000, 1, 1), (0x2000, 3, 2), (0x3000, 5, 3)] {
+            map_mock_area(
+                &mut areas,
+                &mut page_table,
+                start,
+                0x1000,
+                flags,
+                backend,
+                mock_lineage(2),
+            );
+        }
+
+        let plan = PreparedAreaProtect {
+            areas: &mut areas,
+            page_table: &mut page_table,
+            start: VirtAddr::from(0x2000),
+            end: VirtAddr::from(0x3000),
+            ranges: vec![PreparedProtectRange {
+                start: VirtAddr::from(0x2000),
+                end: VirtAddr::from(0x3000),
+                flags: 7,
+            }],
+            max_areas: usize::MAX,
+        };
+        let segments: Vec<_> = plan
+            .segments()
+            .map(|(area, start, end, flags)| {
+                (
+                    area.start().as_usize(),
+                    start.as_usize(),
+                    end.as_usize(),
+                    flags,
+                )
+            })
+            .collect();
+
+        assert_eq!(segments, vec![(0x2000, 0x2000, 0x3000, 7)]);
+    }
+
+    #[test]
     fn prepared_protect_commit_splits_and_remerges_areas() {
         let mut areas = MemorySet::new();
         let mut page_table = vec![0; TEST_SPACE_SIZE];
@@ -8849,7 +11851,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    fn cet_default_owners_are_mm_local_and_reconcile_move_shrink_and_replacement() {
+    fn cet_default_owners_rebase_for_cleanup_without_authorizing_ssp() {
         let page = PAGE_SIZE_4K;
         let mut mm = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x20_000).unwrap();
         let first = VirtAddr::from(0x4000);
@@ -8864,24 +11866,19 @@ mod tests {
             .unwrap();
 
         let moved = VirtAddr::from(0xc000);
-        mm.unmap(first, page * 2).unwrap();
+        mm.unmap(first, page * 2).unwrap().finish();
         test_cet_stack(&mut mm, moved, page * 2);
-        assert!(
-            mm.reconcile_cet_default_shadow_stacks_after_mremap(first, page * 2, moved)
-                .is_empty()
-        );
+        mm.rebase_cet_default_shadow_stacks_after_mremap(first, page * 2, page * 2, moved, false);
         assert_eq!(mm.cet_default_shadow_stack(101).unwrap().start, moved);
         assert_eq!(mm.cet_default_shadow_stack(202).unwrap().start, second);
 
-        // Shrinking leaves the low VMA fragment live and updates its exact
-        // extent; replacing the other owner's VMA invalidates only it.
-        mm.unmap(moved + page, page).unwrap();
-        assert!(
-            mm.reconcile_cet_default_shadow_stacks_after_mremap(moved, page * 2, moved)
-                .is_empty()
-        );
+        // Shrinking leaves the low VMA fragment live and updates its cleanup
+        // extent. Replacing another owner's VMA does not produce a CET-state
+        // invalidation receipt: a peer must fault on later hardware access.
+        mm.unmap(moved + page, page).unwrap().finish();
+        mm.rebase_cet_default_shadow_stacks_after_mremap(moved, page * 2, page, moved, false);
         assert_eq!(mm.cet_default_shadow_stack(101).unwrap().size, page);
-        mm.unmap(second, page).unwrap();
+        mm.unmap(second, page).unwrap().finish();
         mm.map(
             second,
             page,
@@ -8890,8 +11887,7 @@ mod tests {
             Backend::new_alloc(second, PageSize::Size4K),
         )
         .unwrap();
-        assert_eq!(mm.reconcile_cet_default_shadow_stacks(), vec![202]);
-        assert!(mm.cet_default_shadow_stack(202).is_none());
+        assert_eq!(mm.cet_default_shadow_stack(202).unwrap().start, second);
     }
 
     #[test]
@@ -8903,10 +11899,130 @@ mod tests {
         test_cet_stack(&mut mm, stack, page);
         mm.register_cet_default_shadow_stack(101, stack, page)
             .unwrap();
-        let owner = mm.take_cet_default_shadow_stack(101).unwrap();
-        mm.unmap(owner.start, owner.size).unwrap();
+        let wake = mm.retire_cet_default_shadow_stack(101);
         assert!(mm.take_cet_default_shadow_stack(101).is_none());
         assert!(mm.find_area(stack).is_none());
+        wake.finish();
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cet_default_owner_detaches_after_peer_unmap() {
+        let page = PAGE_SIZE_4K;
+        let stack = VirtAddr::from(0x4000);
+        let mut mm = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x10_000).unwrap();
+        test_cet_stack(&mut mm, stack, page);
+        mm.register_cet_default_shadow_stack(101, stack, page)
+            .unwrap();
+
+        // A CLONE_VM peer can retire the VMA before this task disables CET.
+        // Cleanup must consume the owner even though its unmap is now stale.
+        mm.unmap(stack, page).unwrap().finish();
+        mm.retire_cet_default_shadow_stack(101).finish();
+        assert!(mm.cet_default_shadow_stack(101).is_none());
+        mm.retire_cet_default_shadow_stack(101).finish();
+        assert!(mm.cet_default_shadow_stack(101).is_none());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cet_default_owner_peer_partial_unmap_does_not_reclaim_reused_explicit_mapping() {
+        let page = PAGE_SIZE_4K;
+        let stack = VirtAddr::from(0x4000);
+        let mut mm = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x10_000).unwrap();
+        test_cet_stack(&mut mm, stack, page * 2);
+        mm.register_cet_default_shadow_stack(101, stack, page * 2)
+            .unwrap();
+
+        // A CLONE_VM peer tears down the upper half, then uses that address
+        // for an explicit map_shadow_stack VMA. The old automatic owner must
+        // retain only the lower fragment and exit must not remove the new
+        // explicit mapping.
+        mm.unmap(stack + page, page).unwrap().finish();
+        test_cet_stack(&mut mm, stack + page, page);
+        let owner = mm.cet_default_shadow_stack(101).unwrap();
+        assert_eq!(
+            owner.extents,
+            vec![CetDefaultShadowStackExtent {
+                start: stack,
+                size: page
+            }]
+        );
+
+        mm.retire_cet_default_shadow_stack(101).finish();
+        assert!(mm.find_area(stack).is_none());
+        assert!(mm.find_area(stack + page).is_some());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cet_default_owner_rebases_interior_move_and_duplicate_extents() {
+        let page = PAGE_SIZE_4K;
+        let stack = VirtAddr::from(0x4000);
+        let moved = VirtAddr::from(0x9000);
+        let copied = VirtAddr::from(0xc000);
+        let mut mm = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x20_000).unwrap();
+        test_cet_stack(&mut mm, stack, page * 4);
+        mm.register_cet_default_shadow_stack(101, stack, page * 4)
+            .unwrap();
+
+        // Model an interior two-page move. The owner has source-side head and
+        // tail fragments plus the relocated middle, all reclaimed on exit.
+        mm.prepare_cet_default_shadow_stacks_for_mremap(stack + page, page * 2, false)
+            .unwrap();
+        mm.rebase_cet_default_shadow_stacks_after_mremap(
+            stack + page,
+            page * 2,
+            page * 2,
+            moved,
+            false,
+        );
+        assert_eq!(
+            mm.cet_default_shadow_stack(101).unwrap().extents,
+            vec![
+                CetDefaultShadowStackExtent {
+                    start: stack,
+                    size: page
+                },
+                CetDefaultShadowStackExtent {
+                    start: stack + page * 3,
+                    size: page
+                },
+                CetDefaultShadowStackExtent {
+                    start: moved,
+                    size: page * 2
+                },
+            ]
+        );
+
+        // DONTUNMAP-style duplication preserves every existing extent and
+        // adds a cleanup extent at the destination.
+        mm.prepare_cet_default_shadow_stacks_for_mremap(moved, page * 2, true)
+            .unwrap();
+        mm.rebase_cet_default_shadow_stacks_after_mremap(moved, page * 2, page * 2, copied, true);
+        assert!(mm.cet_default_shadow_stack(101).unwrap().extents.contains(
+            &CetDefaultShadowStackExtent {
+                start: copied,
+                size: page * 2,
+            }
+        ));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cet_mprotect_none_preserves_shadow_stack_type() {
+        let page = PAGE_SIZE_4K;
+        let stack = VirtAddr::from(0x4000);
+        let mut mm = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x10_000).unwrap();
+        test_cet_stack(&mut mm, stack, page);
+        mm.prepare_protect(stack, page, MappingFlags::USER | MappingFlags::SHADOW_STACK)
+            .unwrap()
+            .commit()
+            .unwrap()
+            .finish();
+        let flags = mm.find_area(stack).unwrap().flags();
+        assert!(flags.contains(MappingFlags::SHADOW_STACK));
+        assert!(!flags.intersects(MappingFlags::READ | MappingFlags::WRITE));
     }
 
     #[test]
@@ -8931,12 +12047,47 @@ mod tests {
         .unwrap()
         .finish();
 
-        assert!(mm.cet_default_shadow_stack_contains(101, (stack + page * 2).as_usize() as u64));
-        assert!(mm.reconcile_cet_default_shadow_stacks().is_empty());
+        assert!(mm.cet_shadow_stack_pointer_valid((stack + page * 2).as_usize() as u64));
         // Fork/vfork registration consumes the same logical extent rather
         // than requiring one unsplit VMA at the recorded start.
         mm.register_cet_default_shadow_stack(202, stack, page * 2)
             .unwrap();
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cet_explicit_shadow_stack_pivot_is_valid_without_default_owner() {
+        let page = PAGE_SIZE_4K;
+        let stack = VirtAddr::from(0x4000);
+        let mut mm = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x10_000).unwrap();
+        test_cet_stack(&mut mm, stack, page);
+
+        // map_shadow_stack(2) mappings are intentionally absent from the
+        // automatic-owner registry, yet an SSP pivot to their top is valid.
+        assert!(mm.cet_default_shadow_stack(101).is_none());
+        assert!(mm.cet_shadow_stack_pointer_valid((stack + page).as_usize() as u64));
+        assert!(!mm.cet_shadow_stack_pointer_valid((stack + page + 8).as_usize() as u64));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn cet_explicit_shadow_stack_accepts_signal_frame_without_owner() {
+        let page = PAGE_SIZE_4K;
+        let stack = VirtAddr::from(0x4000);
+        let mut mm = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x10_000).unwrap();
+        test_cet_stack(&mut mm, stack, page);
+
+        let saved_ssp = (stack + page).as_usize() as u64;
+        let token = saved_ssp | (1 << 63);
+        let frame = mm
+            .write_cet_signal_frame(saved_ssp, [0x1000, token])
+            .unwrap();
+        assert_eq!(frame, saved_ssp - 16);
+        assert_eq!(mm.read_cet_signal_frame(frame).unwrap(), [0x1000, token]);
+        assert_eq!(mm.read_cet_signal_restore_token(frame + 8).unwrap(), token);
+        assert!(mm.cet_signal_frame_fits(saved_ssp));
+        assert!(!mm.cet_signal_frame_fits(stack.as_usize() as u64 + 8));
+        assert!(mm.cet_default_shadow_stack(101).is_none());
     }
 
     #[test]
@@ -8969,10 +12120,12 @@ mod tests {
         .finish();
         let owner = mm.cet_default_shadow_stack(101).unwrap();
 
-        let vfork_child = mm.try_clone_with_shared_shadow_stack(Some(owner)).unwrap();
+        let vfork_child = mm
+            .try_clone_with_shared_shadow_stack(Some(owner.clone()))
+            .unwrap();
         let mut vfork_child = vfork_child.lock();
         vfork_child
-            .register_borrowed_cet_default_shadow_stack(202, owner.start, owner.size)
+            .register_borrowed_cet_default_shadow_stack_extents(202, owner.extents.clone())
             .unwrap();
         for offset in [0, page] {
             let parent_leaf = mm.page_table().query(stack + offset).unwrap();

@@ -1,12 +1,12 @@
 use alloc::sync::Arc;
 
 use axerrno::{AxError, AxResult};
-use axhal::paging::{MappingFlags, PageSize, PageTable, PageTableCursor};
+use axhal::paging::{MappingFlags, PageSize, PageTable, PageTableCursor, PreparedPageTableFrames};
 use axsync::Mutex;
 use memory_addr::{PhysAddr, PhysAddrRange, VirtAddr, VirtAddrRange};
 
 use super::{
-    AddrSpace, Backend, BackendOps, BackendRetirement, MappingStatus, page_table_flags,
+    AddrSpace, Backend, BackendOps, BackendRetirement, MappingStatus, page_table_flags, pages_in,
     preflight_dense_unmap,
 };
 
@@ -23,6 +23,51 @@ pub struct LinearBackend {
 }
 
 impl LinearBackend {
+    pub(super) fn preflight_map(&self, range: VirtAddrRange) -> AxResult {
+        self.check_range(range)?;
+        PhysAddrRange::try_from_start_size(self.pa(range.start), range.size())
+            .ok_or(AxError::InvalidInput)?;
+        Ok(())
+    }
+
+    pub(super) fn prepare_fixed_map(
+        &self,
+        range: VirtAddrRange,
+        pt: &PageTable,
+    ) -> AxResult<PreparedPageTableFrames> {
+        self.preflight_map(range)?;
+        let mut tables = 0usize;
+        for address in pages_in(range, PageSize::Size4K)? {
+            tables = tables
+                .checked_add(pt.required_prepared_frames(address, PageSize::Size4K)?)
+                .ok_or(AxError::NoMemory)?;
+        }
+        PreparedPageTableFrames::try_new(tables).map_err(|_| AxError::NoMemory)
+    }
+
+    pub(super) fn map_fixed_prepared(
+        &self,
+        range: VirtAddrRange,
+        flags: MappingFlags,
+        pt: &mut PageTable,
+        tables: &mut PreparedPageTableFrames,
+    ) -> AxResult {
+        self.preflight_map(range)?;
+        let mut cursor = pt.cursor();
+        for address in pages_in(range, PageSize::Size4K)? {
+            cursor
+                .map_prepared(
+                    address,
+                    self.pa(address),
+                    PageSize::Size4K,
+                    page_table_flags(flags),
+                    tables,
+                )
+                .map_err(|_| AxError::BadState)?;
+        }
+        Ok(())
+    }
+
     pub(super) const fn mapping_status(&self) -> &MappingStatus {
         &self.status
     }
@@ -112,9 +157,9 @@ impl BackendOps for LinearBackend {
     }
 
     fn map(&self, range: VirtAddrRange, flags: MappingFlags, pt: &mut PageTableCursor) -> AxResult {
-        self.check_range(range)?;
+        self.preflight_map(range)?;
         let pa_range = PhysAddrRange::try_from_start_size(self.pa(range.start), range.size())
-            .ok_or(AxError::InvalidInput)?;
+            .expect("preflighted linear physical range disappeared");
         debug!("Linear::map: {range:?} -> {pa_range:?} {flags:?}");
         pt.map_region(
             range.start,

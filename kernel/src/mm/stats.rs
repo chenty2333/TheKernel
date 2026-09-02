@@ -3,7 +3,11 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use axalloc::{UsageKind, global_allocator};
 use axerrno::{AxError, AxResult};
 use axhal::mem::total_ram_size;
+use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_AS};
 use memory_addr::PAGE_SIZE_4K;
+
+use super::aspace::AddrSpace;
+use crate::task::ProcessData;
 
 const OVERCOMMIT_MEMORY_DEFAULT: u32 = 0;
 const OVERCOMMIT_RATIO_DEFAULT: u32 = 50;
@@ -128,5 +132,49 @@ pub fn check_memory_overcommit(bytes: usize) -> AxResult<()> {
                 Ok(())
             }
         }
+    }
+}
+
+/// Enforces the calling process's address-space limit against one prospective
+/// VMA growth while the caller holds this address space's mutation lock.
+///
+/// Linux compares `mm->total_vm + growth` with RLIMIT_AS at the final VMA
+/// admission edge.  In particular, a caller may deliberately pass zero for a
+/// fixed replacement whose new mapping is completely covered: lowering the
+/// limit below the already-mapped total still makes that replacement fail.
+pub fn check_rlimit_as_growth(
+    proc_data: &ProcessData,
+    aspace: &AddrSpace,
+    growth: usize,
+) -> AxResult<()> {
+    check_rlimit_as_replacement(proc_data, aspace, 0, growth)
+}
+
+/// Checks one transaction whose publication removes `released` mapped bytes
+/// before adding `added` bytes.  Linux's fixed MREMAP_DONTUNMAP path has this
+/// unusual order: it unmaps the destination, then performs `may_expand_vm`
+/// for the full duplicate while retaining the source.
+pub fn check_rlimit_as_replacement(
+    proc_data: &ProcessData,
+    aspace: &AddrSpace,
+    released: usize,
+    added: usize,
+) -> AxResult<()> {
+    let limit = proc_data.rlim.read()[RLIMIT_AS].current;
+    if limit == RLIM_INFINITY as i64 as u64 {
+        return Ok(());
+    }
+
+    let current = u64::try_from(aspace.current_mapping_bytes()).map_err(|_| AxError::NoMemory)?;
+    let released = u64::try_from(released).map_err(|_| AxError::NoMemory)?;
+    let added = u64::try_from(added).map_err(|_| AxError::NoMemory)?;
+    if current
+        .checked_sub(released)
+        .and_then(|remaining| remaining.checked_add(added))
+        .is_none_or(|total| total > limit)
+    {
+        Err(AxError::NoMemory)
+    } else {
+        Ok(())
     }
 }

@@ -415,14 +415,7 @@ fn sys_process_vm_rw(
     let target_image =
         check_current_thread_ptrace_image_access(target_thread, PtraceAccessMode::AttachReal)?;
     let target_aspace = target_image.into_aspace();
-    process_vm_copy(
-        &caller,
-        &target_aspace,
-        &local,
-        &remote,
-        copy_len,
-        op,
-    )
+    process_vm_copy(&caller, &target_aspace, &local, &remote, copy_len, op)
 }
 
 pub fn sys_process_vm_readv(
@@ -514,11 +507,11 @@ pub fn sys_process_madvise(
                 .and_then(|_| {
                     let mut aspace = target_aspace.lock();
                     match behavior {
-                        MADV_WILLNEED => crate::syscall::mm::mmap::process_madvise_willneed(
-                            &mut aspace, iov.base, iov.len,
-                        ),
+                        MADV_WILLNEED => unreachable!("WILLNEED owns its lock-external retry"),
                         MADV_COLD => crate::syscall::mm::mmap::process_madvise_cold(
-                            &mut aspace, iov.base, iov.len,
+                            &mut aspace,
+                            iov.base,
+                            iov.len,
                         ),
                         MADV_PAGEOUT => crate::syscall::mm::mmap::process_madvise_collect_pageout(
                             &mut aspace,
@@ -530,10 +523,11 @@ pub fn sys_process_madvise(
                     }
                 })
             }
-            MADV_WILLNEED => {
-                let mut aspace = target_aspace.lock();
-                crate::syscall::mm::mmap::process_madvise_willneed(&mut aspace, iov.base, iov.len)
-            }
+            MADV_WILLNEED => crate::syscall::mm::mmap::process_madvise_willneed(
+                &target_aspace,
+                iov.base,
+                iov.len,
+            ),
             _ => unreachable!("behavior was validated before ptrace access"),
         };
         match result {
@@ -663,7 +657,7 @@ mod tests {
     fn process_vm_iov_descriptors_are_imported_from_explicit_caller_space() {
         let capability = mapped_capability();
         let descriptor = IoVec {
-            iov_base: 0x1000 as *mut u8,
+            iov_base: 0x1000,
             iov_len: 37,
         };
         // SAFETY: IoVec is a complete initialized descriptor and the selected

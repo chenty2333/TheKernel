@@ -16,6 +16,13 @@ pub(crate) fn synchronize_kernel_map_tlb() -> imp::GlobalGrace {
     imp::synchronize_tlb()
 }
 
+/// Acknowledged all-CPU TLB plus instruction-cache rendezvous for a kernel
+/// text mutation.  The writer holds its W^X transaction gate until the grace
+/// is returned, so no CPU may execute a stale instruction through an old leaf.
+pub(crate) fn synchronize_kernel_text_patch() -> imp::GlobalGrace {
+    imp::synchronize_tlb_and_icache()
+}
+
 #[cfg(feature = "smp-tlb-shootdown")]
 mod imp {
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -3,13 +3,15 @@
 use alloc::sync::Arc;
 use core::{mem::MaybeUninit, slice};
 
-use axerrno::AxError;
+use axerrno::{AxError, AxResult, LinuxError};
 use axhal::paging::MappingFlags;
 use axsync::Mutex;
-use bytemuck::NoUninit;
+use bytemuck::{NoUninit, Pod, Zeroable};
 use memory_addr::{MemoryAddr, VirtAddr};
 use thekernel_linux_usercopy::{
-    UserCopyError, UserMemory, UserMemoryContext, VmResult, vm_load_until_nul,
+    CopyStructError, UserCopyError, UserMemory, UserMemoryContext, VmResult,
+    copy_struct_from_user as copy_struct_from_user_context,
+    copy_struct_to_user as copy_struct_to_user_context, vm_load_until_nul,
     vm_load_until_nul_bounded,
 };
 
@@ -151,8 +153,11 @@ impl AddressSpaceUserMemory {
     }
 
     fn targets_current_address_space(&self) -> bool {
-        let current = axtask::current();
-        Arc::ptr_eq(&self.address_space, &current.as_thread().proc_data.aspace())
+        axtask::current_may_uninit().is_some_and(|current| {
+            current
+                .try_as_thread()
+                .is_some_and(|thread| Arc::ptr_eq(&self.address_space, &thread.proc_data.aspace()))
+        })
     }
 }
 
@@ -168,6 +173,41 @@ pub(crate) fn with_user_memory<T>(
     let mut provider = AddressSpaceUserMemory::new(capability.address_space.clone());
     let mut memory = UserMemoryContext::new(&mut provider);
     operation(&mut memory)
+}
+
+/// Copies a versioned userspace structure through the selected user-memory
+/// context.
+///
+/// Syscall-specific minimum-size and `PAGE_SIZE` checks remain the caller's
+/// responsibility.  The underlying helper checks an oversized userspace tail
+/// before copying the common prefix, so a readable non-zero extension yields
+/// `E2BIG` even when the known prefix would fault; a fault in the extension
+/// itself remains `EFAULT`.
+pub(crate) fn copy_struct_from_user<M: UserMemory + ?Sized, T: Pod + Zeroable>(
+    memory: &mut UserMemoryContext<'_, M>,
+    source: *const u8,
+    user_size: usize,
+) -> AxResult<T> {
+    copy_struct_from_user_context(memory, source, user_size).map_err(|error| match error {
+        CopyStructError::UserCopy(_) => AxError::BadAddress,
+        CopyStructError::NonZeroTrailing => LinuxError::E2BIG.into(),
+    })
+}
+
+/// Copies a versioned kernel structure through the selected user-memory
+/// context and reports whether a smaller userspace structure hid non-zero
+/// kernel fields.
+///
+/// When userspace supplies a larger structure, its unknown tail is cleared
+/// before the common prefix is copied.  Callers retain ABI size policy.
+pub(crate) fn copy_struct_to_user<M: UserMemory + ?Sized, T: Pod>(
+    memory: &mut UserMemoryContext<'_, M>,
+    destination: *mut u8,
+    user_size: usize,
+    source: &T,
+) -> AxResult<bool> {
+    copy_struct_to_user_context(memory, destination, user_size, source)
+        .map_err(|_| AxError::BadAddress)
 }
 
 fn map_address_space_error(error: AxError) -> UserCopyError {
@@ -223,7 +263,7 @@ unsafe impl UserMemory for AddressSpaceUserMemory {
         } else {
             address_space.read(start, dst)
         }
-            .map_err(map_address_space_error)
+        .map_err(map_address_space_error)
     }
 
     fn write(&mut self, start: usize, src: &[u8]) -> VmResult {
@@ -237,7 +277,7 @@ unsafe impl UserMemory for AddressSpaceUserMemory {
         } else {
             address_space.write(start, src)
         }
-            .map_err(map_address_space_error)
+        .map_err(map_address_space_error)
     }
 
     fn validate_write(&mut self, start: usize, len: usize) -> VmResult {

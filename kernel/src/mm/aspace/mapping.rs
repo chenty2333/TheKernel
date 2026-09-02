@@ -1,12 +1,13 @@
 use alloc::sync::Arc;
 
 use axerrno::{AxError, AxResult};
-use axfs::FileFlags;
+use axfs::{FileFlags, MMAP_READAHEAD_PAGES, MMAP_SEQUENTIAL_READAHEAD_PAGES};
 use axhal::paging::MappingFlags;
 use memory_addr::VirtAddr;
 
 use crate::{
     file::{DeferredFileLease, File, FileHandle},
+    mm::DeferredMappingFinalizer,
     task::UserNamespace,
 };
 
@@ -36,6 +37,41 @@ pub(super) fn relocate_affine_origin(
 pub(crate) enum FileMappingSharing {
     Shared,
     Private,
+}
+
+/// Linux VM_RAND_READ/VM_SEQ_READ state owned by one VMA lineage.
+///
+/// This deliberately does not reuse the open-file-description fadvise state:
+/// two mappings of the same OFD may carry different madvise policies.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum MadviseReadahead {
+    #[default]
+    Normal,
+    Random,
+    Sequential,
+}
+
+/// Linux VM_HUGEPAGE/VM_NOHUGEPAGE policy owned by one VMA fragment.
+///
+/// The policy is metadata only: installing NOHUGEPAGE must not split an
+/// already-present PMD leaf, while later background promotion must observe
+/// the exact fragment boundaries established by madvise.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum MadviseThp {
+    #[default]
+    Default,
+    Huge,
+    NoHuge,
+}
+
+impl MadviseReadahead {
+    pub(crate) const fn cache_window_pages(self) -> usize {
+        match self {
+            Self::Normal => MMAP_READAHEAD_PAGES,
+            Self::Random => 1,
+            Self::Sequential => MMAP_SEQUENTIAL_READAHEAD_PAGES,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,7 +140,7 @@ impl FileMappingLease {
         let ofd_key = file.open_file_description_key();
         let access_flags = file.inner().flags();
         let status_flags = file.status_flags();
-        let swap_mutation_state = crate::mm::mutation_state_for_mapping(&location);
+        let swap_mutation_state = crate::mm::mutation_state_for_mapping(location);
         Self {
             file,
             ofd_key,
@@ -314,7 +350,14 @@ impl FileLikeMappingLease {
 pub(super) struct MappingStatus {
     file: Option<FileMappingLease>,
     file_like: Option<FileLikeMappingLease>,
+    finalizer: Option<DeferredMappingFinalizer>,
+    madvise_readahead: MadviseReadahead,
+    madvise_thp: MadviseThp,
     sealed: bool,
+    /// Kernel-only identity for an immutable special VMA.  It is deliberately
+    /// VMA metadata rather than an address convention, so user MAP_FIXED
+    /// mappings can never impersonate it.
+    special_token: Option<u64>,
 }
 
 impl MappingStatus {
@@ -334,8 +377,42 @@ impl MappingStatus {
         self.file_like = file;
     }
 
+    pub(super) const fn mapping_finalizer(&self) -> Option<&DeferredMappingFinalizer> {
+        self.finalizer.as_ref()
+    }
+
+    pub(super) fn replace_mapping_finalizer(
+        &mut self,
+        finalizer: Option<DeferredMappingFinalizer>,
+    ) {
+        self.finalizer = finalizer;
+    }
+
     pub(super) const fn has_mapping_owner(&self) -> bool {
+        self.file.is_some() || self.file_like.is_some() || self.finalizer.is_some()
+    }
+
+    /// Backing ownership is distinct from a generic teardown finalizer.  The
+    /// latter keeps a logical VMA lease alive but must not cause anonymous
+    /// storage to masquerade as a file mapping in Linux-visible classifiers.
+    pub(super) const fn has_file_mapping_owner(&self) -> bool {
         self.file.is_some() || self.file_like.is_some()
+    }
+
+    pub(super) const fn madvise_readahead(&self) -> MadviseReadahead {
+        self.madvise_readahead
+    }
+
+    pub(super) fn set_madvise_readahead(&mut self, policy: MadviseReadahead) {
+        self.madvise_readahead = policy;
+    }
+
+    pub(super) const fn madvise_thp(&self) -> MadviseThp {
+        self.madvise_thp
+    }
+
+    pub(super) fn set_madvise_thp(&mut self, policy: MadviseThp) {
+        self.madvise_thp = policy;
     }
 
     pub(super) const fn is_sealed(&self) -> bool {
@@ -352,6 +429,14 @@ impl MappingStatus {
         self.sealed = false;
     }
 
+    pub(super) const fn special_token(&self) -> Option<u64> {
+        self.special_token
+    }
+
+    pub(super) fn set_special_token(&mut self, token: u64) {
+        self.special_token = Some(token);
+    }
+
     pub(super) fn relocated(&self, old_start: VirtAddr, new_start: VirtAddr) -> AxResult<Self> {
         Ok(Self {
             file: self
@@ -364,7 +449,11 @@ impl MappingStatus {
                 .as_ref()
                 .map(|file| file.relocated(old_start, new_start))
                 .transpose()?,
+            finalizer: self.finalizer.clone(),
+            madvise_readahead: self.madvise_readahead,
+            madvise_thp: self.madvise_thp,
             sealed: self.sealed,
+            special_token: self.special_token,
         })
     }
 
@@ -377,7 +466,11 @@ impl MappingStatus {
         Ok(Self {
             file: Some(file.rebased(mapping_start, file_offset)),
             file_like: self.file_like.clone(),
+            finalizer: self.finalizer.clone(),
+            madvise_readahead: self.madvise_readahead,
+            madvise_thp: self.madvise_thp,
             sealed: self.sealed,
+            special_token: self.special_token,
         })
     }
 
@@ -392,7 +485,18 @@ impl MappingStatus {
             (Some(lhs), Some(rhs)) => lhs.compatible_with(rhs),
             (None, Some(_)) | (Some(_), None) => false,
         };
-        file_compatible && file_like_compatible && self.sealed == other.sealed
+        let finalizer_compatible = match (&self.finalizer, &other.finalizer) {
+            (None, None) => true,
+            (Some(lhs), Some(rhs)) => lhs.identity() == rhs.identity(),
+            (None, Some(_)) | (Some(_), None) => false,
+        };
+        file_compatible
+            && file_like_compatible
+            && finalizer_compatible
+            && self.madvise_readahead == other.madvise_readahead
+            && self.madvise_thp == other.madvise_thp
+            && self.sealed == other.sealed
+            && self.special_token == other.special_token
     }
 }
 
@@ -459,8 +563,10 @@ mod tests {
             Err(AxError::InvalidInput)
         }
 
-        fn path(&self) -> AxResult<alloc::borrow::Cow<'_, str>> {
-            Ok(alloc::borrow::Cow::Borrowed("fixed-mapping-owner"))
+        fn path(&self) -> AxResult<alloc::borrow::Cow<'_, axfs_ng_vfs::FsPath>> {
+            Ok(alloc::borrow::Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+                b"fixed-mapping-owner",
+            )))
         }
 
         fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {

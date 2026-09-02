@@ -3,7 +3,7 @@ use core::mem::{self, MaybeUninit};
 
 use axerrno::{AxError, AxResult};
 use axio::prelude::*;
-use bytemuck::AnyBitPattern;
+pub use thekernel_linux_mm::IoVec;
 
 use super::{
     UserMemoryCapability, check_user_readable_with, check_user_writable_with, map_usercopy_error,
@@ -11,16 +11,9 @@ use super::{
 
 const MAX_RW_COUNT: usize = 0x7fff_f000;
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone, AnyBitPattern)]
-pub struct IoVec {
-    pub iov_base: *mut u8,
-    pub iov_len: isize,
-}
-
 const INLINE_IOVEC_CAPACITY: usize = 8;
 const EMPTY_IOVEC: IoVec = IoVec {
-    iov_base: core::ptr::null_mut(),
+    iov_base: 0,
     iov_len: 0,
 };
 
@@ -238,7 +231,10 @@ impl Read for IoVectorBufIo {
             if let Err(error) = self
                 .inner
                 .capability
-                .read_slice(iov.iov_base.wrapping_add(self.offset), dst)
+                .read_slice(
+                    (iov.iov_base as usize).wrapping_add(self.offset) as *const u8,
+                    dst,
+                )
                 .map_err(map_usercopy_error)
             {
                 // A successful prefix is observable progress for axio's
@@ -276,7 +272,7 @@ impl Write for IoVectorBufIo {
                 .inner
                 .capability
                 .write_bytes(
-                    iov.iov_base.wrapping_add(self.offset) as usize,
+                    (iov.iov_base as usize).wrapping_add(self.offset),
                     &buf[count..count + len],
                 )
                 .map_err(map_usercopy_error)
@@ -361,8 +357,8 @@ mod tests {
     fn iovec_descriptor_and_payload_boundaries_use_the_capability() {
         let capability = mapped_capability();
         let descriptor = IoVec {
-            iov_base: 0x3000 as *mut u8,
-            iov_len: PAGE_SIZE_4K as isize,
+            iov_base: 0x3000,
+            iov_len: PAGE_SIZE_4K as i64,
         };
         // The descriptor page is mapped, and the payload page is mapped. The
         // constructor must import both through the selected address space.
@@ -372,7 +368,7 @@ mod tests {
                 .unwrap();
         }
         let imported = IoVectorBuf::new(capability.clone(), 0x1000 as *const IoVec, 1).unwrap();
-        assert_eq!(imported.entry(0).unwrap().iov_len, PAGE_SIZE_4K as isize);
+        assert_eq!(imported.entry(0).unwrap().iov_len, PAGE_SIZE_4K as i64);
         imported.check_readable().unwrap();
 
         // The descriptor itself crosses from the mapped 0x1000 page into an
@@ -385,8 +381,8 @@ mod tests {
         // The descriptor is valid, but a payload one byte beyond the mapped
         // page must be rejected by the separate payload check.
         let crossing = IoVec {
-            iov_base: 0x3000 as *mut u8,
-            iov_len: PAGE_SIZE_4K as isize + 1,
+            iov_base: 0x3000,
+            iov_len: PAGE_SIZE_4K as i64 + 1,
         };
         unsafe {
             capability
@@ -439,11 +435,11 @@ mod tests {
             capability.clone(),
             &[
                 IoVec {
-                    iov_base: 0x1000 as *mut u8,
+                    iov_base: 0x1000,
                     iov_len: 1,
                 },
                 IoVec {
-                    iov_base: 0x2000 as *mut u8,
+                    iov_base: 0x2000,
                     iov_len: 1,
                 },
             ],
@@ -475,11 +471,11 @@ mod tests {
             capability.clone(),
             &[
                 IoVec {
-                    iov_base: 0x1000 as *mut u8,
+                    iov_base: 0x1000,
                     iov_len: 1,
                 },
                 IoVec {
-                    iov_base: 0x2000 as *mut u8,
+                    iov_base: 0x2000,
                     iov_len: 1,
                 },
             ],
@@ -509,7 +505,7 @@ mod tests {
     fn first_iovec_fault_preserves_error_and_state() {
         let capability = mapped_capability();
         let entries = [IoVec {
-            iov_base: 0x2000 as *mut u8,
+            iov_base: 0x2000,
             iov_len: 1,
         }];
 
@@ -532,11 +528,11 @@ mod tests {
         let bad_base = imported_iov(
             &[
                 IoVec {
-                    iov_base: base,
+                    iov_base: base as u64,
                     iov_len: 512,
                 },
                 IoVec {
-                    iov_base: base.wrapping_add(513),
+                    iov_base: base.wrapping_add(513) as u64,
                     iov_len: 512,
                 },
             ],
@@ -547,11 +543,11 @@ mod tests {
         let partial_sector = imported_iov(
             &[
                 IoVec {
-                    iov_base: base,
+                    iov_base: base as u64,
                     iov_len: 768,
                 },
                 IoVec {
-                    iov_base: base.wrapping_add(1024),
+                    iov_base: base.wrapping_add(1024) as u64,
                     iov_len: 512,
                 },
             ],
@@ -562,11 +558,11 @@ mod tests {
         let aligned = imported_iov(
             &[
                 IoVec {
-                    iov_base: base,
+                    iov_base: base as u64,
                     iov_len: 512,
                 },
                 IoVec {
-                    iov_base: base.wrapping_add(1024),
+                    iov_base: base.wrapping_add(1024) as u64,
                     iov_len: 512,
                 },
             ],
