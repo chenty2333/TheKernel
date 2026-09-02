@@ -1,10 +1,12 @@
 //! Task-local seccomp publication and aggregate filter accounting.
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axrcu::{ClearError, PublishError, RcuError};
+use axsync::Mutex;
 use spin::Once;
+use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_seccomp::{
     FilterBudget, FilterChain, SeccompMode, SeccompState, StateTransitionError,
 };
@@ -14,6 +16,11 @@ use crate::rcu::{SECCOMP_RETIRE_CAPACITY, SeccompRcuSlot, SeccompRetireReservati
 
 pub(crate) type ThreadSeccompSlot = SeccompRcuSlot<SeccompState>;
 
+// Every mutation of a thread seccomp slot passes this gate.  TSYNC takes it
+// while it validates and prepares all sibling replacements, making a stale
+// sibling impossible between validation and its group publication.
+static SECCOMP_PUBLICATION_GATE: Mutex<()> = Mutex::new(());
+
 /// A terminal seccomp clear prepared before the task's irreversible exit
 /// publication. The reservation makes the later clear allocation-free and
 /// bounded; the old slot owner is returned only after the clear has queued its
@@ -21,6 +28,23 @@ pub(crate) type ThreadSeccompSlot = SeccompRcuSlot<SeccompState>;
 pub(crate) struct SeccompExitRetirement {
     expected: Arc<SeccompState>,
     reservation: SeccompRetireReservation,
+}
+
+/// One exact live member participating in a TSYNC transaction.  The adapter
+/// pins task membership before constructing these entries, so a recycled TID
+/// cannot redirect a synchronized policy update.
+pub(crate) struct SeccompTsyncTarget<'a> {
+    pub(crate) tid: Pid,
+    pub(crate) thread: &'a Thread,
+}
+
+/// Linux returns the offending thread ID for a normal TSYNC failure.  Keeping
+/// the reason alongside it lets `TSYNC_ESRCH` convert only disappearance into
+/// ESRCH while preserving ordinary ancestry/mode failure reporting.
+#[derive(Debug)]
+pub(crate) struct SeccompTsyncFailure {
+    pub(crate) tid: Pid,
+    pub(crate) error: SeccompPublicationError,
 }
 
 /// Builds the per-thread publication slot and its terminal disabled owner.
@@ -173,6 +197,7 @@ impl Thread {
         &self,
         retirement: Option<SeccompExitRetirement>,
     ) -> AxResult<Arc<SeccompState>> {
+        let _publication = SECCOMP_PUBLICATION_GATE.lock();
         let Some(retirement) = retirement else {
             return Ok(self.seccomp_terminal_disabled.clone());
         };
@@ -200,6 +225,11 @@ impl Thread {
 
     /// Enters irreversible strict mode at the task-local publication point.
     pub(crate) fn try_enter_seccomp_strict(&self) -> Result<(), SeccompPublicationError> {
+        let _publication = SECCOMP_PUBLICATION_GATE.lock();
+        self.try_enter_seccomp_strict_locked()
+    }
+
+    fn try_enter_seccomp_strict_locked(&self) -> Result<(), SeccompPublicationError> {
         if self.seccomp.is_empty() {
             let mut replacement = SeccompState::disabled();
             replacement
@@ -228,6 +258,15 @@ impl Thread {
         expected: &Arc<SeccompState>,
         prepared: &FilterChain,
     ) -> Result<(), SeccompPublicationError> {
+        let _publication = SECCOMP_PUBLICATION_GATE.lock();
+        self.try_publish_seccomp_filter_locked(expected, prepared)
+    }
+
+    fn try_publish_seccomp_filter_locked(
+        &self,
+        expected: &Arc<SeccompState>,
+        prepared: &FilterChain,
+    ) -> Result<(), SeccompPublicationError> {
         let expected_filters = expected.filters();
         let mut replacement = (**expected).clone();
         replacement
@@ -243,6 +282,96 @@ impl Thread {
         }
         let retire = self.reserve_seccomp_retire()?;
         self.publish_seccomp_state(expected.clone(), replacement, retire)?;
+        Ok(())
+    }
+
+    /// Atomically synchronize one already-verified new filter leaf to every
+    /// pinned member of a thread group.  All fallible allocations, ancestry
+    /// checks, and retire reservations complete before the first slot is
+    /// published.  The publication gate also serializes ordinary seccomp
+    /// writers, so the commit phase has no stale-writer path.
+    pub(crate) fn try_publish_seccomp_tsync(
+        &self,
+        expected: &Arc<SeccompState>,
+        prepared: &FilterChain,
+        targets: &[SeccompTsyncTarget<'_>],
+    ) -> Result<(), SeccompTsyncFailure> {
+        let _publication = SECCOMP_PUBLICATION_GATE.lock();
+        let expected_filters = expected.filters();
+        let mut caller_replacement = (**expected).clone();
+        caller_replacement
+            .try_publish_filter(&expected_filters, prepared)
+            .map_err(|error| SeccompTsyncFailure {
+                tid: self.kernel_tid(),
+                error: SeccompPublicationError::Transition(error),
+            })?;
+        let replacement = Arc::try_new(caller_replacement).map_err(|_| SeccompTsyncFailure {
+            tid: self.kernel_tid(),
+            error: SeccompPublicationError::NoMemory,
+        })?;
+
+        struct PreparedTarget<'a> {
+            thread: &'a Thread,
+            expected: Arc<SeccompState>,
+            retire: Option<SeccompRetireReservation>,
+        }
+        let mut plans = Vec::new();
+        plans
+            .try_reserve_exact(targets.len())
+            .map_err(|_| SeccompTsyncFailure {
+                tid: self.kernel_tid(),
+                error: SeccompPublicationError::NoMemory,
+            })?;
+        for target in targets {
+            let current = target.thread.seccomp_snapshot();
+            current
+                .prepare_synchronized_from(&replacement)
+                .map_err(|error| SeccompTsyncFailure {
+                    tid: target.tid,
+                    error: SeccompPublicationError::Transition(error),
+                })?;
+            let retire = if target.thread.seccomp.is_empty() {
+                if !Arc::ptr_eq(&current, &target.thread.seccomp_terminal_disabled) {
+                    return Err(SeccompTsyncFailure {
+                        tid: target.tid,
+                        error: SeccompPublicationError::Stale,
+                    });
+                }
+                None
+            } else {
+                Some(target.thread.reserve_seccomp_retire().map_err(|error| {
+                    SeccompTsyncFailure {
+                        tid: target.tid,
+                        error,
+                    }
+                })?)
+            };
+            plans.push(PreparedTarget {
+                thread: target.thread,
+                expected: current,
+                retire,
+            });
+        }
+
+        // The gate makes every expected pointer stable. A reserved RCU
+        // publication cannot fail from queue pressure, therefore any failure
+        // here is an internal invariant breach rather than a partial Linux
+        // syscall result.
+        for plan in plans {
+            let result = match plan.retire {
+                Some(retire) => {
+                    plan.thread
+                        .publish_seccomp_state(plan.expected, replacement.clone(), retire)
+                }
+                None => plan
+                    .thread
+                    .publish_initial_seccomp_state(replacement.clone())
+                    .map(|()| plan.expected),
+            };
+            if result.is_err() {
+                panic!("seccomp TSYNC publication changed despite publication gate");
+            }
+        }
         Ok(())
     }
 
@@ -328,24 +457,29 @@ mod tests {
     // entry while the domain remains shared across the test process.
     static SECCOMP_TEST_SERIAL: Mutex<()> = Mutex::new(());
 
+    fn allow_filter() -> VerifiedProgram {
+        VerifiedProgram::try_from_vec(vec![ClassicBpfInstruction::new(
+            0x06, // Linux classic BPF_RET | BPF_K.
+            0,
+            0,
+            SECCOMP_RET_ALLOW,
+        )])
+        .unwrap()
+    }
+
+    fn append_allow_filter(root: &FilterChain, budget: &FilterBudget) -> FilterChain {
+        let program = allow_filter();
+        let executor = crate::seccomp_jit::try_compile(&program).unwrap();
+        root.try_append_with_executor(program, FilterMetadata::default(), budget, Some(executor))
+            .unwrap()
+    }
+
     #[test]
     fn filtered_state_can_be_retired_through_its_independent_rcu_slot() {
         let _serial = SECCOMP_TEST_SERIAL.lock();
         let budget = FilterBudget::try_new(usize::MAX).unwrap();
         let root = FilterChain::empty();
-        let leaf = root
-            .try_append(
-                VerifiedProgram::try_from_vec(vec![ClassicBpfInstruction::new(
-                    0x06, // Linux classic BPF_RET | BPF_K.
-                    0,
-                    0,
-                    SECCOMP_RET_ALLOW,
-                )])
-                .unwrap(),
-                FilterMetadata::default(),
-                &budget,
-            )
-            .unwrap();
+        let leaf = append_allow_filter(&root, &budget);
         let mut filtered = SeccompState::disabled();
         filtered.try_publish_filter(&root, &leaf).unwrap();
         drop(leaf);
@@ -379,19 +513,7 @@ mod tests {
         let _serial = SECCOMP_TEST_SERIAL.lock();
         let budget = FilterBudget::try_new(usize::MAX).unwrap();
         let root = FilterChain::empty();
-        let leaf = root
-            .try_append(
-                VerifiedProgram::try_from_vec(vec![ClassicBpfInstruction::new(
-                    0x06, // Linux classic BPF_RET | BPF_K.
-                    0,
-                    0,
-                    SECCOMP_RET_ALLOW,
-                )])
-                .unwrap(),
-                FilterMetadata::default(),
-                &budget,
-            )
-            .unwrap();
+        let leaf = append_allow_filter(&root, &budget);
         let mut filtered = SeccompState::disabled();
         filtered.try_publish_filter(&root, &leaf).unwrap();
         drop(leaf);
@@ -419,19 +541,7 @@ mod tests {
     fn inherited_filter_chain_keeps_budget_owner_alive_independently() {
         let budget = FilterBudget::try_new(usize::MAX).unwrap();
         let root = FilterChain::empty();
-        let leaf = root
-            .try_append(
-                VerifiedProgram::try_from_vec(vec![ClassicBpfInstruction::new(
-                    0x06, // Linux classic BPF_RET | BPF_K.
-                    0,
-                    0,
-                    SECCOMP_RET_ALLOW,
-                )])
-                .unwrap(),
-                FilterMetadata::default(),
-                &budget,
-            )
-            .unwrap();
+        let leaf = append_allow_filter(&root, &budget);
         let mut parent = SeccompState::disabled();
         parent.try_publish_filter(&root, &leaf).unwrap();
         drop(leaf);

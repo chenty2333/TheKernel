@@ -3,14 +3,15 @@
 //! This state is deliberately distinct from the boot-frozen LSM registry:
 //! Landlock domains are created by userspace and snapshot on clone/fork.
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use axerrno::{AxError, AxResult};
-use axsync::Mutex;
 use axnet::unix::UnixEndpointIdentity;
+use axsync::Mutex;
 use spin::Lazy;
 
-use crate::syscall::landlock::LandlockRuleset;
+use super::{AuditLandlockDenied, emit_landlock_denial};
+use crate::task::AsThread;
 
 // Keep these aligned with Linux's LANDLOCK_ACCESS_FS_* UAPI values.  They are
 // intentionally raw bits because rulesets retain the userspace ABI mask.
@@ -30,11 +31,47 @@ pub(crate) const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
 pub(crate) const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
 pub(crate) const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
 pub(crate) const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
+pub(crate) const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1 << 0;
+pub(crate) const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
 pub(crate) const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
 pub(crate) const LANDLOCK_SCOPE_SIGNAL: u64 = 1 << 1;
 
 type AbstractUnixSocketKey = (usize, Vec<u8>);
 const LANDLOCK_MAX_NUM_LAYERS: usize = 16;
+pub(crate) const LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF: u32 = 1 << 0;
+pub(crate) const LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON: u32 = 1 << 1;
+pub(crate) const LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF: u32 = 1 << 2;
+pub(crate) const LANDLOCK_RESTRICT_SELF_LOG_MASK: u32 = LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF
+    | LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON
+    | LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF;
+static NEXT_LANDLOCK_DOMAIN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Kernel-owned resolver adapter for an immutable Landlock ruleset.  The
+/// syscall control plane implements this trait; task security intentionally
+/// never reaches upward into that layer.
+pub(crate) trait LandlockPolicy: Send + Sync {
+    fn scoped(&self) -> u64;
+    fn allows_path(&self, target: &axfs_ng_vfs::Location, access: u64) -> bool;
+    fn allows_net_port(&self, port: u16, access: u64) -> bool;
+    fn destination_is_no_less_restrictive(
+        &self,
+        source: &axfs_ng_vfs::Location,
+        destination: &axfs_ng_vfs::Location,
+        access: u64,
+    ) -> bool;
+}
+
+/// Network operations do not have a VFS object to carry through the generic
+/// permission path.  Keep their Landlock admission at the task-security
+/// boundary, where the task-local domain and its audit lifecycle are stable.
+pub(crate) fn check_current_landlock_net_port(port: u16, access: u64) -> AxResult {
+    if let Some(current) = axtask::current_may_uninit()
+        && let Some(thread) = current.try_as_thread()
+    {
+        return thread.landlock_domain().check_net_port(port, access);
+    }
+    Ok(())
+}
 
 fn check_landlock_layer_limit(layers: usize) -> AxResult<()> {
     if layers >= LANDLOCK_MAX_NUM_LAYERS {
@@ -130,41 +167,139 @@ pub(crate) fn abstract_unix_socket_endpoint_is_in_scope(
         })
 }
 
-#[derive(Clone)]
 struct LandlockLayer {
-    ruleset: Arc<LandlockRuleset>,
+    ruleset: Arc<dyn LandlockPolicy>,
     /// Every restrict_self(2) application is a new hierarchy node, even when
     /// it reuses an existing ruleset FD.
     identity: Arc<()>,
+    id: u64,
+    denial_count: Arc<AtomicU64>,
+    log_same_exec: bool,
+    log_new_exec: bool,
+    log_subdomains: bool,
+    after_exec: bool,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct LandlockDomain {
-    stack: Vec<LandlockLayer>,
+    stack: Vec<Arc<LandlockLayer>>,
 }
 impl LandlockDomain {
-    pub(crate) fn push(&self, ruleset: Arc<LandlockRuleset>) -> AxResult<Self> {
+    pub(crate) fn push(&self, ruleset: Arc<dyn LandlockPolicy>, flags: u32) -> AxResult<Self> {
         check_landlock_layer_limit(self.stack.len())?;
         let mut stack = Vec::new();
         stack
             .try_reserve_exact(self.stack.len() + 1)
             .map_err(|_| AxError::NoMemory)?;
         stack.extend(self.stack.iter().cloned());
-        stack.push(LandlockLayer {
-            ruleset,
-            identity: Arc::try_new(()).map_err(|_| AxError::NoMemory)?,
-        });
+        stack.push(
+            Arc::try_new(LandlockLayer {
+                ruleset,
+                identity: Arc::try_new(()).map_err(|_| AxError::NoMemory)?,
+                id: NEXT_LANDLOCK_DOMAIN_ID.fetch_add(1, Ordering::Relaxed),
+                denial_count: Arc::try_new(AtomicU64::new(0)).map_err(|_| AxError::NoMemory)?,
+                log_same_exec: flags & LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF == 0,
+                log_new_exec: flags & LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON != 0,
+                log_subdomains: flags & LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF == 0,
+                after_exec: false,
+            })
+            .map_err(|_| AxError::NoMemory)?,
+        );
         Ok(Self { stack })
+    }
+    pub(crate) fn mute_subdomains(&self) -> Self {
+        Self {
+            stack: self
+                .stack
+                .iter()
+                .map(|layer| Self::copy_layer(layer, false, layer.after_exec))
+                .collect(),
+        }
+    }
+    pub(crate) fn after_exec(&self) -> Self {
+        Self {
+            stack: self
+                .stack
+                .iter()
+                .map(|layer| Self::copy_layer(layer, layer.log_subdomains, true))
+                .collect(),
+        }
+    }
+    fn copy_layer(
+        layer: &Arc<LandlockLayer>,
+        log_subdomains: bool,
+        after_exec: bool,
+    ) -> Arc<LandlockLayer> {
+        // ABI-7 logging state is credential-local.  Copy it before a task
+        // changes it; ruleset identity and the denial counter stay shared.
+        Arc::new(LandlockLayer {
+            ruleset: layer.ruleset.clone(),
+            identity: layer.identity.clone(),
+            id: layer.id,
+            denial_count: layer.denial_count.clone(),
+            log_same_exec: layer.log_same_exec,
+            log_new_exec: layer.log_new_exec,
+            log_subdomains,
+            after_exec,
+        })
     }
     pub(crate) fn allows_path(&self, target: &axfs_ng_vfs::Location, access: u64) -> bool {
         self.stack
             .iter()
             .all(|layer| layer.ruleset.allows_path(target, access))
     }
+    pub(crate) fn report_path_denial(&self, target: &axfs_ng_vfs::Location, access: u64) {
+        self.report_denial(access, "path", |layer| {
+            !layer.ruleset.allows_path(target, access)
+        });
+    }
     pub(crate) fn allows_net_port(&self, port: u16, access: u64) -> bool {
         self.stack
             .iter()
             .all(|layer| layer.ruleset.allows_net_port(port, access))
+    }
+    pub(crate) fn check_net_port(&self, port: u16, access: u64) -> AxResult {
+        if self.allows_net_port(port, access) {
+            return Ok(());
+        }
+        self.report_denial(access, "net", |layer| {
+            !layer.ruleset.allows_net_port(port, access)
+        });
+        Err(AxError::PermissionDenied)
+    }
+    fn report_denial(
+        &self,
+        access: u64,
+        blocker: &'static str,
+        denies: impl Fn(&LandlockLayer) -> bool,
+    ) {
+        // The youngest denying layer is the one Linux attributes to this
+        // request: exactly one increment and exactly one audit event.
+        let Some((index, layer)) = self
+            .stack
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, layer)| denies(layer))
+        else {
+            return;
+        };
+        layer.denial_count.fetch_add(1, Ordering::Relaxed);
+        let nested = index + 1 != self.stack.len();
+        let log = (!nested || layer.log_subdomains)
+            && if layer.after_exec {
+                layer.log_new_exec
+            } else {
+                layer.log_same_exec
+            };
+        if log {
+            emit_landlock_denial(AuditLandlockDenied {
+                domain_id: layer.id,
+                access,
+                blocker,
+                on_exec: layer.after_exec,
+            });
+        }
     }
     pub(crate) fn destination_is_no_less_restrictive(
         &self,
@@ -195,7 +330,10 @@ impl LandlockDomain {
     /// hierarchy ancestry directly rather than one of Landlock's IPC scopes.
     pub(crate) fn is_ancestor_of(&self, target: &Self) -> bool {
         self.stack.iter().enumerate().all(|(index, layer)| {
-            target.stack.get(index).is_some_and(|peer| Arc::ptr_eq(&layer.identity, &peer.identity))
+            target
+                .stack
+                .get(index)
+                .is_some_and(|peer| Arc::ptr_eq(&layer.identity, &peer.identity))
         })
     }
 }

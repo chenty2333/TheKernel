@@ -1,10 +1,7 @@
 //! Linux seccomp syscall adapter and syscall-entry enforcement.
 
 use alloc::vec::Vec;
-use core::{
-    mem::{self, MaybeUninit},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+use core::mem::{self, MaybeUninit};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
@@ -13,34 +10,30 @@ use linux_raw_sys::general::CAP_SYS_ADMIN;
 use syscalls::Sysno;
 use thekernel_linux_seccomp::{
     ActionClass, BPF_MAXINSNS, ClassicBpfInstruction, FilterInstallError, FilterMetadata,
-    ProgramError, SECCOMP_GET_ACTION_AVAIL, SECCOMP_GET_NOTIF_SIZES, SECCOMP_RET_ALLOW,
-    SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD, SECCOMP_RET_LOG,
-    SECCOMP_RET_TRAP, SECCOMP_SET_MODE_FILTER, SECCOMP_SET_MODE_STRICT, SeccompData, SeccompMode,
-    VerifiedProgram,
+    ProgramError, SECCOMP_FILTER_FLAG_LOG, SECCOMP_FILTER_FLAG_MASK,
+    SECCOMP_FILTER_FLAG_NEW_LISTENER, SECCOMP_FILTER_FLAG_SPEC_ALLOW, SECCOMP_FILTER_FLAG_TSYNC,
+    SECCOMP_FILTER_FLAG_TSYNC_ESRCH, SECCOMP_GET_ACTION_AVAIL, SECCOMP_GET_NOTIF_SIZES,
+    SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD,
+    SECCOMP_RET_LOG, SECCOMP_RET_TRAP, SECCOMP_SET_MODE_FILTER, SECCOMP_SET_MODE_STRICT,
+    SeccompData, SeccompMode, VerifiedProgram,
 };
 use thekernel_linux_signal::{SignalInfo, Signo};
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::{
+    file::{
+        FileDescription, current_fd_table, reserve_fd,
+        seccomp_notif::{NotificationResult, SeccompListener, listener_by_id},
+    },
     mm::map_usercopy_error,
     task::{
-        AsThread, SeccompPublicationError, do_exit, fail_closed_exit, force_signal_current_thread,
-        ns_capable, seccomp_filter_budget,
+        AsThread, SeccompPublicationError, SeccompTsyncFailure, SeccompTsyncTarget, do_exit,
+        fail_closed_exit, force_signal_current_thread, get_task, ns_capable, seccomp_filter_budget,
     },
 };
 
 /// Audit architecture used by the x86_64 syscall ABI.
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
-
-/// Global bound for seccomp diagnostic records emitted from syscall entry.
-///
-/// This prevents an untrusted filter from turning `SECCOMP_RET_LOG` into an
-/// unbounded synchronous logging workload. It is deliberately a fixed boot
-/// budget rather than an implied Linux audit subsystem.
-const SECCOMP_LOG_RECORD_LIMIT: usize = 1024;
-
-static SECCOMP_LOG_RECORDS: AtomicUsize = AtomicUsize::new(0);
-static SECCOMP_LOG_SUPPRESSION_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// All-integer mirror of Linux `struct sock_fprog` on the supported 64-bit
 /// architectures. Arbitrary userspace bytes are valid for every field.
@@ -50,6 +43,14 @@ struct RawSockFprog {
     length: u16,
     padding: [u8; 6],
     filter: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::NoUninit)]
+struct RawNotifSizes {
+    seccomp_notif: u16,
+    seccomp_notif_resp: u16,
+    seccomp_data: u16,
 }
 
 const _: [(); 16] = [(); mem::size_of::<RawSockFprog>()];
@@ -98,6 +99,27 @@ fn map_install_error(error: FilterInstallError) -> AxError {
 
 fn map_seccomp_publication_error(error: SeccompPublicationError) -> AxError {
     error.into_ax_error()
+}
+
+fn map_tsync_failure(error: SeccompTsyncFailure, flags: u32) -> AxResult<isize> {
+    if flags & SECCOMP_FILTER_FLAG_TSYNC_ESRCH != 0 {
+        // Linux's ESRCH mode intentionally hides a transient/reaped sibling
+        // TID.  A real mode/ancestry conflict remains a normal policy error.
+        if matches!(error.error, SeccompPublicationError::Stale) {
+            return Err(LinuxError::ESRCH.into());
+        }
+    }
+    // The ordinary TSYNC ABI reports the exact failing thread ID as a
+    // successful positive syscall result, not a synthetic errno.
+    if error.tid != 0
+        && matches!(
+            error.error,
+            SeccompPublicationError::Transition(_) | SeccompPublicationError::Stale
+        )
+    {
+        return Ok(error.tid as isize);
+    }
+    Err(map_seccomp_publication_error(error.error))
 }
 
 fn copy_filter_program<M: UserMemory + ?Sized>(
@@ -150,10 +172,20 @@ fn install_filter<M: UserMemory + ?Sized>(
     flags: u32,
     args: *const (),
 ) -> AxResult<isize> {
-    // Phase one intentionally supports task-local installation only. TSYNC,
-    // NEW_LISTENER, LOG-at-install and speculative flags require their full
-    // transactions/lifecycles and are rejected rather than partially faked.
-    if flags != 0 {
+    if flags & !SECCOMP_FILTER_FLAG_MASK != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & SECCOMP_FILTER_FLAG_TSYNC_ESRCH != 0 && flags & SECCOMP_FILTER_FLAG_TSYNC == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if flags & thekernel_linux_seccomp::SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV != 0
+        && flags & SECCOMP_FILTER_FLAG_NEW_LISTENER == 0
+    {
+        return Err(AxError::InvalidInput);
+    }
+    // A listener is tied to one filter installation and therefore cannot be
+    // atomically transferred to a whole thread group.
+    if flags & SECCOMP_FILTER_FLAG_TSYNC != 0 && flags & SECCOMP_FILTER_FLAG_NEW_LISTENER != 0 {
         return Err(AxError::InvalidInput);
     }
 
@@ -182,23 +214,90 @@ fn install_filter<M: UserMemory + ?Sized>(
     let thread = curr.as_thread();
     let snapshot = thread.seccomp_snapshot();
     let expected = snapshot.filters();
+    if flags & SECCOMP_FILTER_FLAG_NEW_LISTENER != 0 && expected.has_listener() {
+        return Err(LinuxError::EBUSY.into());
+    }
+    let listener = if flags & SECCOMP_FILTER_FLAG_NEW_LISTENER != 0 {
+        Some(SeccompListener::try_new(
+            flags & thekernel_linux_seccomp::SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV != 0,
+        )?)
+    } else {
+        None
+    };
+    let metadata = FilterMetadata {
+        log: flags & SECCOMP_FILTER_FLAG_LOG != 0,
+        speculative_execution_allowed: flags & SECCOMP_FILTER_FLAG_SPEC_ALLOW != 0,
+        listener_id: listener.as_ref().map_or(0, |listener| listener.id()),
+    };
     let prepared = expected
-        .try_append_with_executor(
-            program,
-            FilterMetadata::default(),
-            seccomp_filter_budget(),
-            executor,
-        )
+        .try_append_with_executor(program, metadata, seccomp_filter_budget(), Some(executor))
         .map_err(map_install_error)?;
     // Reserve the publication accounting before the immutable task pointer
     // can become visible. Any stale/retire failure drops this guard and
     // removes the reservation without exposing a failed program.
     let publication = crate::seccomp_jit::try_reserve_published().ok_or(AxError::NoMemory)?;
-    thread
-        .try_publish_seccomp_filter(&snapshot, &prepared)
-        .map_err(map_seccomp_publication_error)?;
+    // Reserve the userspace name and construct the listener OFD before the
+    // filter becomes visible.  A failed descriptor admission leaves neither
+    // a new filter nor an observable listener.
+    let listener_fd = if let Some(listener) = listener {
+        let reservation = reserve_fd(true)?;
+        let description =
+            FileDescription::new_with_flags(listener, linux_raw_sys::general::O_RDONLY)?;
+        Some(reservation.prepare_publication(description)?)
+    } else {
+        None
+    };
+    if flags & SECCOMP_FILTER_FLAG_TSYNC != 0 {
+        // Prevent membership teardown while resolving exact task objects. The
+        // seccomp publication gate inside the transaction serializes every
+        // seccomp writer after this group snapshot is pinned.
+        let _lifecycle = thread.proc_data.lock_process_lifecycle();
+        let mut tasks = Vec::new();
+        tasks
+            .try_reserve_exact(thread.proc_data.proc.thread_ids().count())
+            .map_err(|_| AxError::NoMemory)?;
+        for tid in thread.proc_data.proc.thread_ids() {
+            let task = match get_task(tid) {
+                Ok(task) => task,
+                Err(_) if flags & SECCOMP_FILTER_FLAG_TSYNC_ESRCH != 0 => {
+                    return Err(LinuxError::ESRCH.into());
+                }
+                Err(_) => return Ok(tid as isize),
+            };
+            let candidate = task.try_as_thread().ok_or(LinuxError::ESRCH)?;
+            if candidate.kernel_tid() != tid
+                || !alloc::sync::Arc::ptr_eq(&candidate.proc_data.proc, &thread.proc_data.proc)
+                || candidate.pending_exit()
+            {
+                if flags & SECCOMP_FILTER_FLAG_TSYNC_ESRCH != 0 {
+                    return Err(LinuxError::ESRCH.into());
+                }
+                return Ok(tid as isize);
+            }
+            tasks.push(task);
+        }
+        let mut targets = Vec::new();
+        targets
+            .try_reserve_exact(tasks.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for task in &tasks {
+            let candidate = task.try_as_thread().expect("validated TSYNC member");
+            targets.push(SeccompTsyncTarget {
+                tid: candidate.kernel_tid(),
+                thread: candidate,
+            });
+        }
+        match thread.try_publish_seccomp_tsync(&snapshot, &prepared, &targets) {
+            Ok(()) => {}
+            Err(error) => return map_tsync_failure(error, flags),
+        }
+    } else {
+        thread
+            .try_publish_seccomp_filter(&snapshot, &prepared)
+            .map_err(map_seccomp_publication_error)?;
+    }
     publication.commit();
-    Ok(0)
+    Ok(listener_fd.map_or(0, |publication| publication.commit() as isize))
 }
 
 fn enter_strict(flags: u32, args: *const ()) -> AxResult<isize> {
@@ -230,6 +329,7 @@ fn get_action_available<M: UserMemory + ?Sized>(
         | SECCOMP_RET_TRAP
         | SECCOMP_RET_ERRNO
         | SECCOMP_RET_LOG
+        | thekernel_linux_seccomp::SECCOMP_RET_USER_NOTIF
         | SECCOMP_RET_ALLOW => Ok(0),
         _ => Err(LinuxError::EOPNOTSUPP.into()),
     }
@@ -250,8 +350,15 @@ pub fn sys_seccomp<M: UserMemory + ?Sized>(
             if flags != 0 {
                 Err(AxError::InvalidInput)
             } else {
-                // No listener FD/request-ID/cancellation lifecycle is exposed.
-                Err(LinuxError::EOPNOTSUPP.into())
+                let sizes = RawNotifSizes {
+                    seccomp_notif: 80,
+                    seccomp_notif_resp: 24,
+                    seccomp_data: 64,
+                };
+                (args as usize as *mut RawNotifSizes)
+                    .vm_write(memory, sizes)
+                    .map_err(map_usercopy_error)?;
+                Ok(0)
             }
         }
         _ => Err(AxError::InvalidInput),
@@ -309,23 +416,14 @@ fn strict_allows(raw_syscall: usize) -> bool {
     )
 }
 
-fn bounded_log(data: &SeccompData, action: u32) {
-    if SECCOMP_LOG_RECORDS
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-            (used < SECCOMP_LOG_RECORD_LIMIT).then_some(used + 1)
-        })
-        .is_ok()
-    {
-        warn!(
-            "seccomp decision: nr={} arch={:#x} ip={:#x} action={:#x}",
-            data.number, data.architecture, data.instruction_pointer, action
-        );
-    } else if !SECCOMP_LOG_SUPPRESSION_REPORTED.swap(true, Ordering::Relaxed) {
-        warn!(
-            "seccomp diagnostic budget exhausted after {SECCOMP_LOG_RECORD_LIMIT} records; \
-             suppressing further entries"
-        );
-    }
+fn audit_seccomp_decision(data: &SeccompData, action: u32, pid: u32) {
+    crate::task::security::emit_seccomp_decision(crate::task::security::AuditSeccompDecision {
+        pid,
+        syscall: data.number,
+        architecture: data.architecture,
+        instruction_pointer: data.instruction_pointer,
+        action,
+    });
 }
 
 fn terminate_for_seccomp(signo: Signo, group_exit: bool) {
@@ -378,18 +476,18 @@ pub(super) fn enforce_syscall_seccomp(uctx: &mut UserContext) -> bool {
         SeccompMode::Filter => {}
     }
     let decision = decision.expect("active seccomp filter state has no evaluation");
-    crate::seccomp_jit::record_interpreter_executed_many(decision.interpreter_executions);
     let class = decision.action.classify();
+    let pid = thread.pid_ns().visible_pid(thread.tid()) as u32;
     if decision.matched_filter.is_some_and(|metadata| metadata.log)
         && !matches!(class, ActionClass::Allow | ActionClass::Log)
     {
-        bounded_log(&data, decision.action.raw());
+        audit_seccomp_decision(&data, decision.action.raw(), pid);
     }
 
     match class {
         ActionClass::Allow => true,
         ActionClass::Log => {
-            bounded_log(&data, decision.action.raw());
+            audit_seccomp_decision(&data, decision.action.raw(), pid);
             true
         }
         ActionClass::Errno { errno } => {
@@ -417,12 +515,49 @@ pub(super) fn enforce_syscall_seccomp(uctx: &mut UserContext) -> bool {
             terminate_for_seccomp(Signo::SIGSYS, true);
             false
         }
-        ActionClass::Trace { .. } | ActionClass::UserNotification { .. } => {
+        ActionClass::Trace { .. } => {
             // Linux skips the syscall with ENOSYS when no tracer/listener owns
             // the request. We do not advertise either action until their
             // complete external ownership lifecycle exists.
             uctx.set_retval((-LinuxError::ENOSYS.code() as isize) as usize);
             false
+        }
+        ActionClass::UserNotification { .. } => {
+            let listener_id = decision
+                .matched_filter
+                .map_or(0, |metadata| metadata.listener_id);
+            let Some(listener) = listener_by_id(listener_id) else {
+                uctx.set_retval((-LinuxError::ENOSYS.code() as isize) as usize);
+                return false;
+            };
+            let target_nofile = thread.proc_data.rlim.read()[linux_raw_sys::general::RLIMIT_NOFILE]
+                .current
+                .min(crate::task::AX_FILE_LIMIT as u64) as usize;
+            // Preserve the stable kernel identity.  The listener's RECV path
+            // will render it in the actual ioctl caller's PID namespace, so a
+            // transferred listener cannot leak or inherit this task's view.
+            match listener.notify(
+                thread.kernel_tid(),
+                thread.pid_ns(),
+                current().id().as_u64(),
+                data,
+                current_fd_table(),
+                target_nofile,
+            ) {
+                Ok(NotificationResult::Continue) => true,
+                Ok(NotificationResult::Value(value)) => {
+                    uctx.set_retval(value as usize);
+                    false
+                }
+                Ok(NotificationResult::Errno(errno)) => {
+                    uctx.set_retval(errno as isize as usize);
+                    false
+                }
+                Err(error) => {
+                    uctx.set_retval((-(LinuxError::from(error).code() as isize)) as usize);
+                    false
+                }
+            }
         }
     }
 }
@@ -455,7 +590,14 @@ mod tests {
     fn adapter_error_mapping_preserves_resource_and_stale_boundaries() {
         assert_eq!(map_program_error(ProgramError::NoMemory), AxError::NoMemory);
         assert_eq!(
-            map_program_error(ProgramError::MissingReturn),
+            crate::seccomp_jit::JitError::InvalidProgram.into_ax_error(),
+            AxError::InvalidInput
+        );
+        assert_eq!(
+            map_program_error(ProgramError::InvalidOpcode {
+                program_counter: 0,
+                code: 0,
+            }),
             AxError::InvalidInput
         );
         assert_eq!(

@@ -5,6 +5,8 @@
 //! Linux-visible shape of a hook is decided; dispatch only walks modules and
 //! can add nothing a context does not already state.
 
+use axfs_ng_vfs::FsPath;
+
 use super::*;
 
 pub(crate) type CorePtraceAccessContext<'a> =
@@ -62,7 +64,7 @@ pub(crate) type CoreInodeSymlinkContext<'context, 'name, 'location> =
         UserNamespace,
         InodeSecurityRef<'location>,
         PlannedInodeSecurityRef<'name, 'location>,
-        str,
+        FsPath,
     >;
 pub(crate) type CoreInodeLinkContext<'context, 'name, 'location> =
     thekernel_linux_cred::InodeLinkContext<
@@ -417,6 +419,10 @@ pub(crate) struct InodePermissionSecurityContext<'context, 'location> {
 pub(crate) enum InodePermissionOperation {
     Generic,
     FchdirMayChdir,
+    /// `security_inode_file_getattr`: metadata attribute retrieval is not a
+    /// DAC read, but LSMs receive a distinct typed operation before a native
+    /// file-attribute provider is consulted.
+    FileGetattr,
 }
 
 impl<'context, 'location> InodePermissionSecurityContext<'context, 'location> {
@@ -873,7 +879,7 @@ impl<'context, 'name, 'location> InodeSymlinkSecurityContext<'context, 'name, 'l
         dac_credential: &'context DacCredentialView,
         target_owner_user_ns: &'context Arc<UserNamespace>,
         new_entry_object: &'context PlannedInodeSecurityRef<'name, 'location>,
-        symlink_target: &'context str,
+        symlink_target: &'context FsPath,
     ) -> Self {
         Self {
             actor,
@@ -914,7 +920,7 @@ impl<'context, 'name, 'location> InodeSymlinkSecurityContext<'context, 'name, 'l
         self.core.new_entry_object()
     }
 
-    pub(crate) const fn symlink_target(&self) -> &'context str {
+    pub(crate) const fn symlink_target(&self) -> &'context FsPath {
         self.core.symlink_target()
     }
 }
