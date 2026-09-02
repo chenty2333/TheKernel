@@ -16,8 +16,8 @@ use crate::{
     pseudofs::cgroup,
     readiness::block_on_poll_set_interruptible_if,
     task::{
-        AsThread, Process, ProcessData, PtraceSession, StopReport, TaskUsage, ZombieSnapshot,
-        get_process_data, has_pending_syscall_signal, process_domain, reap_process,
+        AsThread, PidNamespace, Process, ProcessData, PtraceSession, StopReport, TaskUsage,
+        ZombieSnapshot, get_process_data, has_pending_syscall_signal, process_domain, reap_process,
     },
 };
 
@@ -63,18 +63,40 @@ enum WaitPid {
 }
 
 impl WaitPid {
-    fn apply(&self, child: &Process) -> bool {
+    const fn apply_visible(&self, child_pid: Pid, child_pgid: Pid) -> bool {
         match self {
             WaitPid::Any => true,
-            WaitPid::Pid(pid) => child.pid() == *pid,
-            WaitPid::Pgid(pgid) => child.group().pgid() == *pgid,
+            WaitPid::Pid(pid) => child_pid == *pid,
+            WaitPid::Pgid(pgid) => child_pgid == *pgid,
         }
     }
+}
+
+/// Renders a core process ID in the caller's PID namespace.  The process
+/// registry deliberately uses kernel-wide IDs, but wait(2) arguments and
+/// results are namespace-relative.
+fn visible_process_pid(viewer_pid_ns: &PidNamespace, process: &Process) -> Option<Pid> {
+    let target_pid_ns = process.identity::<Arc<PidNamespace>>()?;
+    viewer_pid_ns.visible_pid_for(target_pid_ns, process.pid())
+}
+
+fn visible_process_pgid(viewer_pid_ns: &PidNamespace, process: &Process) -> Option<Pid> {
+    let target_pid_ns = process.identity::<Arc<PidNamespace>>()?;
+    viewer_pid_ns.visible_pid_for(target_pid_ns, process.group().pgid())
+}
+
+fn wait_pid_applies(viewer_pid_ns: &PidNamespace, pid: WaitPid, child: &Process) -> Option<Pid> {
+    let child_pid = visible_process_pid(viewer_pid_ns, child)?;
+    let child_pgid = visible_process_pgid(viewer_pid_ns, child)?;
+    pid.apply_visible(child_pid, child_pgid)
+        .then_some(child_pid)
 }
 
 #[derive(Clone)]
 struct WaitCandidate {
     process: Arc<Process>,
+    /// Snapshot before reaping: the namespace PID binding is released by reap.
+    visible_pid: Pid,
     allow_exit: bool,
     expected_ptrace_session: Option<PtraceSession>,
 }
@@ -91,6 +113,7 @@ enum WaitEvent {
         proc_data: Arc<ProcessData>,
     },
     Exited {
+        pid: Pid,
         child: Arc<Process>,
         snapshot: Arc<ZombieSnapshot>,
     },
@@ -100,13 +123,15 @@ impl WaitEvent {
     fn pid(&self) -> Pid {
         match self {
             WaitEvent::Stopped { pid, .. } | WaitEvent::Continued { pid, .. } => *pid,
-            WaitEvent::Exited { child, .. } => child.pid(),
+            WaitEvent::Exited { pid, .. } => *pid,
         }
     }
 
     fn waitpid_status(&self) -> i32 {
         match self {
-            WaitEvent::Stopped { stop, .. } => ((stop.signal as i32) << 8) | 0x7f,
+            WaitEvent::Stopped { stop, .. } => {
+                (((stop.signal as i32) | ((stop.ptrace_event as i32) << 8)) << 8) | 0x7f
+            }
             WaitEvent::Continued { .. } => 0xffff,
             WaitEvent::Exited { snapshot, .. } => snapshot.wait_status,
         }
@@ -135,10 +160,10 @@ impl WaitEvent {
                 let uid = viewer_user_ns.from_kuid_munged(proc_data.group_leader_cred().ids().ruid);
                 fill_siginfo(*pid, uid, CLD_CONTINUED, SIGCONT as i32)
             }
-            WaitEvent::Exited { child, snapshot } => {
+            WaitEvent::Exited { pid, snapshot, .. } => {
                 let (si_code, si_status) = decode_exit_code(snapshot.wait_status);
                 let uid = viewer_user_ns.from_kuid_munged(snapshot.credential.ids().ruid);
-                fill_siginfo(child.pid(), uid, si_code, si_status)
+                fill_siginfo(*pid, uid, si_code, si_status)
             }
         }
     }
@@ -191,6 +216,7 @@ fn process_error(error: ProcessError) -> AxError {
 
 fn matching_wait_candidates(
     proc_data: &ProcessData,
+    viewer_pid_ns: &PidNamespace,
     pid: WaitPid,
     options: &WaitOptions,
 ) -> AxResult<Vec<WaitCandidate>> {
@@ -208,9 +234,12 @@ fn matching_wait_candidates(
         .try_reserve_exact(capacity)
         .map_err(|_| AxError::NoMemory)?;
     for process in children {
-        if pid.apply(&process) && should_wait_for_child(&process, options) {
+        if let Some(visible_pid) = wait_pid_applies(viewer_pid_ns, pid, &process)
+            && should_wait_for_child(&process, options)
+        {
             candidates.push(WaitCandidate {
                 process,
+                visible_pid,
                 allow_exit: true,
                 expected_ptrace_session: None,
             });
@@ -230,9 +259,9 @@ fn matching_wait_candidates(
             continue;
         }
         let tracee = &tracee_data.proc;
-        if !pid.apply(tracee) {
+        let Some(visible_pid) = wait_pid_applies(viewer_pid_ns, pid, tracee) else {
             continue;
-        }
+        };
         if let Some(candidate) = candidates
             .iter_mut()
             .find(|candidate| candidate.process.pid() == tracee.pid())
@@ -242,6 +271,7 @@ fn matching_wait_candidates(
         }
         candidates.push(WaitCandidate {
             process: tracee.clone(),
+            visible_pid,
             allow_exit: false,
             expected_ptrace_session: Some(reverse_link.session()),
         });
@@ -266,10 +296,13 @@ fn waitid_pidfd(fd: i32) -> AxResult<FileHandle<PidFd>> {
 
 fn pidfd_wait_candidate(
     proc: &Process,
+    viewer_pid_ns: &PidNamespace,
     pidfd: &PidFd,
     options: &WaitOptions,
 ) -> AxResult<WaitCandidate> {
     let target = pidfd.process()?;
+    let visible_pid =
+        visible_process_pid(viewer_pid_ns, &target).ok_or(AxError::from(LinuxError::ECHILD))?;
 
     if target
         .parent()
@@ -285,6 +318,7 @@ fn pidfd_wait_candidate(
 
     Ok(WaitCandidate {
         process: target,
+        visible_pid,
         allow_exit: true,
         expected_ptrace_session,
     })
@@ -302,7 +336,7 @@ fn select_wait_event(
             && (stop.traced() || options.contains(WaitOptions::WUNTRACED))
         {
             return Some(WaitEvent::Stopped {
-                pid: candidate.process.pid(),
+                pid: candidate.visible_pid,
                 stop,
                 proc_data,
             });
@@ -315,7 +349,7 @@ fn select_wait_event(
                 && proc_data.peek_continued()
             {
                 return Some(WaitEvent::Continued {
-                    pid: candidate.process.pid(),
+                    pid: candidate.visible_pid,
                     proc_data,
                 });
             }
@@ -332,6 +366,7 @@ fn select_wait_event(
                 && let Some(snapshot) = child.zombie_payload()
             {
                 return Some(WaitEvent::Exited {
+                    pid: candidate.visible_pid,
                     child: child.clone(),
                     snapshot,
                 });
@@ -433,11 +468,12 @@ pub fn sys_waitpid(
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
     let proc = &proc_data.proc;
+    let viewer_pid_ns = curr.as_thread().pid_ns();
 
     let pid = if pid == -1 {
         WaitPid::Any
     } else if pid == 0 {
-        WaitPid::Pgid(proc.group().pgid())
+        WaitPid::Pgid(visible_process_pgid(&viewer_pid_ns, proc).ok_or(AxError::NoSuchProcess)?)
     } else if pid > 0 {
         WaitPid::Pid(pid as _)
     } else {
@@ -445,7 +481,7 @@ pub fn sys_waitpid(
     };
     let check_children = || {
         let _wait_guard = proc_data.wait_lock.lock();
-        let candidates = match matching_wait_candidates(proc_data, pid, &options) {
+        let candidates = match matching_wait_candidates(proc_data, &viewer_pid_ns, pid, &options) {
             Ok(candidates) => candidates,
             Err(err) => return Err(err),
         };
@@ -481,12 +517,15 @@ pub fn sys_waitpid(
                 return Err(err);
             }
 
-            if let WaitEvent::Exited { child, snapshot } = &event {
+            if let WaitEvent::Exited {
+                child, snapshot, ..
+            } = &event
+            {
                 let reaped = reap_child(child)?;
                 if !reaped {
                     return Ok(None);
                 }
-                cgroup::detach_process(child.pid());
+                cgroup::detach_process(child);
                 proc_data.account_waited_child(snapshot.total_usage().into());
             }
 
@@ -560,6 +599,7 @@ pub fn sys_waitid(
 
     let curr = current();
     let viewer_user_ns = curr.as_thread().current_user_namespace();
+    let viewer_pid_ns = curr.as_thread().pid_ns();
     let proc_data = &curr.as_thread().proc_data;
     let proc = &proc_data.proc;
     let nowait = options.contains(WaitOptions::WNOWAIT);
@@ -583,7 +623,9 @@ pub fn sys_waitid(
                 return Err(AxError::InvalidInput);
             }
             Some(if pgid == 0 {
-                WaitPid::Pgid(proc.group().pgid())
+                WaitPid::Pgid(
+                    visible_process_pgid(&viewer_pid_ns, proc).ok_or(AxError::NoSuchProcess)?,
+                )
             } else {
                 WaitPid::Pgid(pgid as _)
             })
@@ -597,7 +639,12 @@ pub fn sys_waitid(
             if pidfd_nonblocking {
                 wait_options.insert(WaitOptions::WNOHANG);
             }
-            pidfd_candidate = Some(pidfd_wait_candidate(proc, &pidfd, &wait_options)?);
+            pidfd_candidate = Some(pidfd_wait_candidate(
+                proc,
+                &viewer_pid_ns,
+                &pidfd,
+                &wait_options,
+            )?);
             None
         }
         _ => return Err(AxError::InvalidInput),
@@ -606,7 +653,7 @@ pub fn sys_waitid(
     let check_children = || -> AxResult<Option<isize>> {
         let _wait_guard = proc_data.wait_lock.lock();
         let candidates = if let Some(pid) = pid {
-            matching_wait_candidates(proc_data, pid, &wait_options)?
+            matching_wait_candidates(proc_data, &viewer_pid_ns, pid, &wait_options)?
         } else {
             vec![pidfd_candidate.clone().ok_or(AxError::InvalidInput)?]
         };
@@ -653,11 +700,13 @@ pub fn sys_waitid(
             }
 
             match &event {
-                WaitEvent::Exited { child, snapshot } if !nowait => {
+                WaitEvent::Exited {
+                    child, snapshot, ..
+                } if !nowait => {
                     if !reap_child(child)? {
                         return Ok(None);
                     }
-                    cgroup::detach_process(child.pid());
+                    cgroup::detach_process(child);
                     proc_data.account_waited_child(snapshot.total_usage().into());
                 }
                 _ => {}
@@ -704,7 +753,7 @@ pub fn sys_waitid(
 
 #[cfg(test)]
 mod tests {
-    use super::wait_candidate_accepts_stop;
+    use super::{WaitPid, wait_candidate_accepts_stop};
     use crate::task::{PtraceSession, StopReport};
 
     #[test]
@@ -721,14 +770,17 @@ mod tests {
         };
         let old_stop = StopReport {
             signal: 19,
+            ptrace_event: 0,
             ptrace_session: Some(old),
         };
         let new_stop = StopReport {
             signal: 19,
+            ptrace_event: 0,
             ptrace_session: Some(new),
         };
         let job_control_stop = StopReport {
             signal: 19,
+            ptrace_event: 0,
             ptrace_session: None,
         };
 
@@ -737,5 +789,16 @@ mod tests {
         assert!(!wait_candidate_accepts_stop(None, old_stop));
         assert!(wait_candidate_accepts_stop(None, job_control_stop));
         assert!(wait_candidate_accepts_stop(Some(new), job_control_stop));
+    }
+
+    #[test]
+    fn wait_pid_matches_the_caller_visible_pid_and_pgid() {
+        // The caller sees a child as PID 46 and as member of process group
+        // 12, even though both core IDs differ in the parent namespace.
+        assert!(WaitPid::Pid(46).apply_visible(46, 12));
+        assert!(!WaitPid::Pid(79).apply_visible(46, 12));
+        assert!(WaitPid::Pgid(12).apply_visible(46, 12));
+        assert!(!WaitPid::Pgid(78).apply_visible(46, 12));
+        assert!(WaitPid::Any.apply_visible(46, 12));
     }
 }

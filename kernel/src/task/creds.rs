@@ -579,6 +579,39 @@ impl<'a> CredentialUpdate<'a> {
         self.finish_inner()
     }
 
+    /// Builds a user-namespace credential transition from the exact slot
+    /// snapshot guarded by this transaction.  `setns(CLONE_NEWUSER)` cannot
+    /// reuse the generic mutable builder because the core credential changes
+    /// namespace identity as one operation.
+    pub(crate) fn finish_user_namespace(
+        self,
+        user_ns: Arc<UserNamespace>,
+    ) -> AxResult<PreparedCred<'a>> {
+        let CredentialUpdate {
+            slot,
+            guard,
+            old,
+            builder,
+        } = self;
+        let proposed = Cred::try_prepare_with_user_namespace(&old, user_ns)?;
+        let post_commit = PendingCredentialPostCommit::try_new(
+            &old,
+            &proposed,
+            CredentialStateTransition::UserNamespace,
+        )?;
+        let retire = slot.reserve_retire()?;
+        drop(builder);
+        Ok(PreparedCred {
+            slot,
+            guard,
+            old,
+            proposed,
+            post_commit,
+            retire,
+            requires_dumpability_drop: true,
+        })
+    }
+
     /// Accepts only an external exec proposal derived from this transaction's
     /// exact old `Arc`. Equal-looking credentials from another slot or writer
     /// snapshot are rejected before they can reach the publication token.

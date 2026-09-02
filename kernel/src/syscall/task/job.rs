@@ -67,7 +67,7 @@ fn resolve_getsid_target(pid: Pid, caller_ns: &PidNamespace) -> AxResult<GetsidT
     // TID may still be present in TASK_TABLE.  Looking up the visible task
     // first therefore cannot let that old leader steal getsid(getpid()).
     if let Ok(task) = get_visible_task_including_exiting(global_pid)
-        && caller_ns.contains(&task.as_thread().proc_data.pid_ns())
+        && caller_ns.contains(&task.as_thread().pid_ns())
     {
         return Ok(GetsidTarget::Live(task));
     }
@@ -76,7 +76,7 @@ fn resolve_getsid_target(pid: Pid, caller_ns: &PidNamespace) -> AxResult<GetsidT
     let target_ns = process
         .identity::<alloc::sync::Arc<PidNamespace>>()
         .ok_or(AxError::NoSuchProcess)?;
-    if process.is_zombie() && caller_ns.contains(&target_ns) {
+    if process.is_zombie() && caller_ns.contains(target_ns) {
         Ok(GetsidTarget::Zombie(process))
     } else {
         Err(AxError::NoSuchProcess)
@@ -86,7 +86,7 @@ fn resolve_getsid_target(pid: Pid, caller_ns: &PidNamespace) -> AxResult<GetsidT
 pub fn sys_getsid(pid: Pid) -> AxResult<isize> {
     let caller = current();
     let caller_thread = caller.as_thread();
-    let caller_ns = caller_thread.proc_data.pid_ns();
+    let caller_ns = caller_thread.pid_ns();
     if pid == 0 {
         // Linux returns the caller's session directly for the current-task
         // form; security_task_getsid is only invoked after a nonzero lookup.
@@ -95,7 +95,7 @@ pub fn sys_getsid(pid: Pid) -> AxResult<isize> {
             .identity::<alloc::sync::Arc<PidNamespace>>()
             .ok_or(AxError::NoSuchProcess)?;
         return Ok(caller_ns
-            .visible_pid_for(&target_ns, process.group().session().sid())
+            .visible_pid_for(target_ns, process.group().session().sid())
             .map(|sid| sid as isize)
             .unwrap_or(0));
     }
@@ -108,7 +108,7 @@ pub fn sys_getsid(pid: Pid) -> AxResult<isize> {
     let credential = target.credential()?;
     dispatch_task_getsid(&SecurityTaskGetsidContext::new(&credential))?;
     Ok(caller_ns
-        .visible_pid_for(&target_ns, process.group().session().sid())
+        .visible_pid_for(target_ns, process.group().session().sid())
         .map(|sid| sid as isize)
         .unwrap_or(0))
 }
@@ -118,7 +118,7 @@ pub fn sys_setsid() -> AxResult<isize> {
     let curr = current();
     let thread = curr.as_thread();
     let proc = &thread.proc_data.proc;
-    let pid_ns = thread.proc_data.pid_ns();
+    let pid_ns = thread.pid_ns();
     if proc.group().pgid() == proc.pid() {
         return Err(AxError::OperationNotPermitted);
     }
@@ -148,14 +148,14 @@ pub fn sys_setsid() -> AxResult<isize> {
 pub fn sys_getpgid(pid: Pid) -> AxResult<isize> {
     let caller = current();
     let caller_thread = caller.as_thread();
-    let caller_ns = caller_thread.proc_data.pid_ns();
+    let caller_ns = caller_thread.pid_ns();
     if pid == 0 {
         let process = &caller_thread.proc_data.proc;
         let target_ns = process
             .identity::<alloc::sync::Arc<PidNamespace>>()
             .ok_or(AxError::NoSuchProcess)?;
         return Ok(caller_ns
-            .visible_pid_for(&target_ns, process.group().pgid())
+            .visible_pid_for(target_ns, process.group().pgid())
             .map(|pgid| pgid as isize)
             .unwrap_or(0));
     }
@@ -170,7 +170,7 @@ pub fn sys_getpgid(pid: Pid) -> AxResult<isize> {
     let credential = target.credential()?;
     dispatch_task_getpgid(&SecurityTaskGetpgidContext::new(&credential))?;
     Ok(caller_ns
-        .visible_pid_for(&target_ns, process.group().pgid())
+        .visible_pid_for(target_ns, process.group().pgid())
         .map(|pgid| pgid as isize)
         .unwrap_or(0))
 }
@@ -178,7 +178,9 @@ pub fn sys_getpgid(pid: Pid) -> AxResult<isize> {
 pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
     let _operation = JOB_CONTROL_OPERATION.lock();
     let curr = current();
-    let caller = &curr.as_thread().proc_data.proc;
+    let caller_thread = curr.as_thread();
+    let caller = &caller_thread.proc_data.proc;
+    let caller_ns = caller_thread.pid_ns();
 
     if pgid < 0 {
         return Err(AxError::InvalidInput);
@@ -187,8 +189,19 @@ pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
     let proc = if pid == 0 {
         caller.clone()
     } else if pid > 0 {
-        let target = get_process_data(pid as Pid)?;
+        // `pid` is interpreted in the caller's PID namespace.  Looking it up
+        // in the global process table would allow an otherwise invisible task
+        // in a sibling namespace to be moved into the caller's session when
+        // numeric IDs happen to collide.
+        let global_pid = caller_ns
+            .resolve_visible_pid(pid as Pid)
+            .ok_or(AxError::NoSuchProcess)?;
+        let target = get_process_data(global_pid)?;
         if !target.proc.is_live() {
+            return Err(AxError::from(LinuxError::ESRCH));
+        }
+        let target_ns = target.pid_ns();
+        if !caller_ns.contains(&target_ns) {
             return Err(AxError::from(LinuxError::ESRCH));
         }
         target.proc.clone()
@@ -214,7 +227,16 @@ pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
         return Err(AxError::OperationNotPermitted);
     }
 
-    let pgid = if pgid == 0 { proc.pid() } else { pgid as Pid };
+    // Like `pid`, a nonzero process-group ID is namespace-relative.  Retain
+    // the global identity only after visibility has been established; group
+    // objects themselves deliberately use immutable global leader IDs.
+    let pgid = if pgid == 0 {
+        proc.pid()
+    } else {
+        caller_ns
+            .resolve_visible_pid(pgid as Pid)
+            .ok_or(AxError::OperationNotPermitted)?
+    };
     if pgid == proc.pid() {
         if proc.group().pgid() == pgid {
             return Ok(0);
@@ -238,5 +260,3 @@ pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
 
     Ok(0)
 }
-
-// TODO: job control

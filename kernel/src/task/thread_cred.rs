@@ -9,7 +9,7 @@ use thekernel_linux_cred::{
 };
 
 use super::{
-    Kgid, Kuid, Thread, UserNamespace,
+    FsContextSlot, Kgid, Kuid, Thread, UserNamespace,
     creds::{
         CapabilityState, Cred, CredentialSlot, CredentialSnapshotGuard, CredentialUpdate,
         DacCredentialView, GroupInfo, PreparedCred, SECBIT_KEEP_CAPS,
@@ -302,6 +302,85 @@ impl Thread {
         Ok(self
             .proc_data
             .publish_credential(prepared, self.pdeath_signal_state()))
+    }
+
+    /// Commits a prepared `setns(CLONE_NEWUSER)` credential transition and
+    /// the calling task namespace aggregate in one syscall-owned transaction.
+    /// All fallible user-namespace/security allocation occurs before either
+    /// publication; once the credential slot is changed the aggregate is
+    /// immediately exchanged under its publication lock.
+    pub(crate) fn commit_user_namespace_transition(
+        &self,
+        user_ns: Arc<UserNamespace>,
+        prepared_namespace: super::process::PreparedNamespaceProxyReplacement,
+    ) -> AxResult<()> {
+        let prepared_credential = self.credential.prepare().finish_user_namespace(user_ns)?;
+        let old_proxy = {
+            let _publication = super::fs_context_publication();
+            self.commit_credential(prepared_credential)?;
+            prepared_namespace.commit_under_publication(self)
+        };
+        drop(old_proxy);
+        Ok(())
+    }
+
+    pub(crate) fn commit_user_namespace_transition_with_fs_context(
+        &self,
+        user_ns: Arc<UserNamespace>,
+        prepared_namespace: super::process::PreparedNamespaceProxyReplacement,
+        replacement_fs: Arc<FsContextSlot>,
+    ) -> AxResult<Arc<FsContextSlot>> {
+        let prepared_credential = self.credential.prepare().finish_user_namespace(user_ns)?;
+        let (old_proxy, old_fs) = {
+            let _publication = super::fs_context_publication();
+            self.commit_credential(prepared_credential)?;
+            let old_proxy = prepared_namespace.commit_under_publication(self);
+            let old_fs = self.replace_fs_context(replacement_fs);
+            (old_proxy, old_fs)
+        };
+        drop(old_proxy);
+        Ok(old_fs)
+    }
+
+    /// Publishes the complete resource bundle selected by `setns(pidfd, ...)`.
+    ///
+    /// A pidfd may select several namespace kinds at once.  In particular, a
+    /// user-namespace transition can be combined with mount and IPC changes,
+    /// so the credential slot, namespace aggregate, fs_struct and SEM_UNDO
+    /// attachment must become visible through one publication gate.  All
+    /// allocations and namespace validation have happened before this call.
+    /// Displaced fs/IPC resources are deliberately retired after the gate.
+    pub(crate) fn commit_user_namespace_transition_with_resources(
+        &self,
+        user_ns: Arc<UserNamespace>,
+        prepared_namespace: super::process::PreparedNamespaceProxyReplacement,
+        replacement_fs: Option<Arc<FsContextSlot>>,
+        replacement_sem_undo: Option<Arc<super::process::SemUndoState>>,
+        post_transition_validate: impl FnOnce(&Cred) -> AxResult<()>,
+    ) -> AxResult<()> {
+        let prepared_credential = self.credential.prepare().finish_user_namespace(user_ns)?;
+        post_transition_validate(prepared_credential.proposed())?;
+        let (old_proxy, old_fs, old_sem_undo) = {
+            let _publication = super::fs_context_publication();
+            self.commit_credential(prepared_credential)?;
+            let old_proxy = prepared_namespace.commit_under_publication(self);
+            let old_fs = replacement_fs.map(|replacement| self.replace_fs_context(replacement));
+            let old_sem_undo =
+                replacement_sem_undo.map(|replacement| self.replace_sem_undo_deferred(replacement));
+            (old_proxy, old_fs, old_sem_undo)
+        };
+        drop(old_proxy);
+        drop(old_fs);
+        if let Some(old_sem_undo) = old_sem_undo {
+            Self::retire_sem_undo(old_sem_undo);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_user_namespace(&self, user_ns: Arc<UserNamespace>) -> AxResult<()> {
+        let prepared_namespace =
+            self.prepare_namespace_replacement(|proxy| proxy.replace_user(user_ns.clone()));
+        self.commit_user_namespace_transition(user_ns, prepared_namespace)
     }
 
     pub(crate) fn admit_setgroups(&self) -> AxResult<SetgroupsAdmission> {

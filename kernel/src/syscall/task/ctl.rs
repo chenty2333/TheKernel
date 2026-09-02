@@ -1,18 +1,20 @@
-use alloc::{string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{
     mem::{self, MaybeUninit},
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
+use axfs_ng_vfs::{FsPathBuf, NodeType};
 use axhal::paging::MappingFlags;
 use axtask::{AxTaskRef, current};
 use linux_raw_sys::{
     general::{
         __user_cap_data_struct, __user_cap_header_struct, _LINUX_CAPABILITY_VERSION_1,
-        _LINUX_CAPABILITY_VERSION_2, _LINUX_CAPABILITY_VERSION_3, CAP_SYS_ADMIN, CAP_SYS_NICE,
-        CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS,
-        CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS, CLONE_SYSVSEM,
+        _LINUX_CAPABILITY_VERSION_2, _LINUX_CAPABILITY_VERSION_3, CAP_SYS_ADMIN, CAP_SYS_CHROOT,
+        CAP_SYS_NICE, CAP_SYS_RESOURCE, CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWIPC,
+        CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS,
+        CLONE_SYSVSEM,
     },
     mempolicy::*,
 };
@@ -25,16 +27,17 @@ use thekernel_linux_usercopy::{
 };
 
 use crate::{
-    file::{File, FileDescription, FileLike},
-    mm::map_usercopy_error,
+    file::{File, FileDescription, FileLike, PidFd, epoll::Epoll, executable, get_file_like},
+    mm::{AddrSpace, ThpDisableMode, map_usercopy_error},
     pseudofs::{
         ProcNamespaceKind, ProcNamespaceObject, ProcNamespaceTarget,
         namespace_target_from_proc_file,
     },
     task::{
-        AsThread, Cred, Dumpability, Mempolicy, ProcessData, PtraceAccessMode, cred_error,
-        fs_context_publication, get_process_data, get_visible_task, linux_pid_from_task_id,
-        ns_capable,
+        AsThread, Cred, Dumpability, Mempolicy, ProcessData, ProcessMmLayout, PtraceAccessMode,
+        check_current_process_ptrace_access, check_current_thread_ptrace_image_access, cred_error,
+        get_process_data, get_task, get_visible_task, ns_capable,
+        process_domain, process_error,
     },
 };
 
@@ -51,7 +54,7 @@ const MAX_NODEMASK_BITS: usize = 4096;
 const KCMP_FILE: i32 = 0;
 const KCMP_VM: i32 = 1;
 const KCMP_FILES: i32 = 2;
-const KCMP_POINTER_TYPES: usize = 5;
+const KCMP_POINTER_TYPES: usize = 7;
 static KCMP_POINTER_COOKIES: [AtomicU64; KCMP_POINTER_TYPES] =
     [const { AtomicU64::new(0) }; KCMP_POINTER_TYPES];
 const KCMP_FS: i32 = 3;
@@ -59,7 +62,47 @@ const KCMP_SIGHAND: i32 = 4;
 const KCMP_IO: i32 = 5;
 const KCMP_SYSVSEM: i32 = 6;
 const KCMP_EPOLL_TFD: i32 = 7;
-const UNSHARE_SUPPORTED_FLAGS: u32 = CLONE_FILES | CLONE_FS | CLONE_NEWUTS | CLONE_NEWTIME;
+
+const PRCTL_MM_MAP_SIZE: usize = 104;
+const PRCTL_MM_AUXV_MAX: usize = 4096;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PrctlMmMap {
+    start_code: u64,
+    end_code: u64,
+    start_data: u64,
+    end_data: u64,
+    start_brk: u64,
+    brk: u64,
+    start_stack: u64,
+    arg_start: u64,
+    arg_end: u64,
+    env_start: u64,
+    env_end: u64,
+    auxv: u64,
+    auxv_size: u32,
+    exe_fd: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct KcmpEpollSlot {
+    efd: u32,
+    tfd: u32,
+    toff: u32,
+}
+const UNSHARE_SUPPORTED_FLAGS: u32 = CLONE_FILES
+    | CLONE_FS
+    | CLONE_NEWNS
+    | CLONE_NEWIPC
+    | CLONE_NEWNET
+    | CLONE_NEWCGROUP
+    | CLONE_NEWUSER
+    | CLONE_NEWUTS
+    | CLONE_NEWTIME
+    | CLONE_NEWPID
+    | CLONE_SYSVSEM;
 const UNSHARE_RECOGNIZED_FLAGS: u32 = UNSHARE_SUPPORTED_FLAGS
     | CLONE_NEWNS
     | CLONE_NEWIPC
@@ -69,16 +112,49 @@ const UNSHARE_RECOGNIZED_FLAGS: u32 = UNSHARE_SUPPORTED_FLAGS
     | CLONE_NEWCGROUP
     | CLONE_NEWTIME
     | CLONE_SYSVSEM;
+const SETNS_PIDFD_ALLOWED_FLAGS: u32 = CLONE_NEWNS
+    | CLONE_NEWUTS
+    | CLONE_NEWIPC
+    | CLONE_NEWNET
+    | CLONE_NEWTIME
+    | CLONE_NEWUSER
+    | CLONE_NEWPID
+    | CLONE_NEWCGROUP;
 fn mempolicy_mode(mode_with_flags: usize) -> u32 {
     (mode_with_flags & !SUPPORTED_MODE_FLAGS) as u32
 }
 
 fn unshare_namespace_owner(flags: u32, actor: &Cred) -> AxResult<Arc<crate::task::UserNamespace>> {
     let owner = actor.user_ns().clone();
-    if flags & (CLONE_NEWUTS | CLONE_NEWTIME) != 0 && !ns_capable(actor, &owner, CAP_SYS_ADMIN) {
+    if flags
+        & (CLONE_NEWNS
+            | CLONE_NEWIPC
+            | CLONE_NEWNET
+            | CLONE_NEWCGROUP
+            | CLONE_NEWUTS
+            | CLONE_NEWTIME
+            | CLONE_NEWPID)
+        != 0
+        && flags & CLONE_NEWUSER == 0
+        && !ns_capable(actor, &owner, CAP_SYS_ADMIN)
+    {
         return Err(AxError::OperationNotPermitted);
     }
     Ok(owner)
+}
+
+fn user_namespace_is_strict_descendant(
+    target: &Arc<crate::task::UserNamespace>,
+    ancestor: &Arc<crate::task::UserNamespace>,
+) -> bool {
+    let mut cursor = target.parent();
+    while let Some(namespace) = cursor {
+        if Arc::ptr_eq(&namespace, ancestor) {
+            return true;
+        }
+        cursor = namespace.parent();
+    }
+    false
 }
 
 fn mempolicy_mode_flags(mode_with_flags: usize) -> usize {
@@ -305,10 +381,10 @@ fn kcmp_cookie(type_: i32) -> AxResult<u64> {
     Ok(cookie.load(Ordering::Acquire))
 }
 
-fn kcmp_ptr<T: ?Sized>(type_: i32, left: &Arc<T>, right: &Arc<T>) -> AxResult<isize> {
+fn kcmp_raw_ptr(type_: i32, left: *const (), right: *const ()) -> AxResult<isize> {
     let key = kcmp_cookie(type_)?;
-    let mix = |ptr: *const T| {
-        let value = ptr as *const () as usize;
+    let mix = |ptr: *const ()| {
+        let value = ptr as usize;
         let mut value = (value as u64) ^ key;
         value ^= value >> 30;
         value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -316,8 +392,8 @@ fn kcmp_ptr<T: ?Sized>(type_: i32, left: &Arc<T>, right: &Arc<T>) -> AxResult<is
         value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
         value ^ (value >> 31)
     };
-    let left = mix(Arc::as_ptr(left));
-    let right = mix(Arc::as_ptr(right));
+    let left = mix(left);
+    let right = mix(right);
     Ok(if left == right {
         0
     } else if left < right {
@@ -325,6 +401,28 @@ fn kcmp_ptr<T: ?Sized>(type_: i32, left: &Arc<T>, right: &Arc<T>) -> AxResult<is
     } else {
         2
     })
+}
+
+fn kcmp_ptr<T: ?Sized>(type_: i32, left: &Arc<T>, right: &Arc<T>) -> AxResult<isize> {
+    kcmp_raw_ptr(
+        type_,
+        Arc::as_ptr(left).cast::<()>(),
+        Arc::as_ptr(right).cast::<()>(),
+    )
+}
+
+fn kcmp_optional_ptr<T>(
+    type_: i32,
+    left: &Option<Arc<T>>,
+    right: &Option<Arc<T>>,
+) -> AxResult<isize> {
+    let left = left
+        .as_ref()
+        .map_or(core::ptr::null(), |value| Arc::as_ptr(value).cast::<()>());
+    let right = right
+        .as_ref()
+        .map_or(core::ptr::null(), |value| Arc::as_ptr(value).cast::<()>());
+    kcmp_raw_ptr(type_, left, right)
 }
 
 struct KcmpAuthorizedImage<T> {
@@ -362,7 +460,14 @@ fn kcmp_file_description(
         .get_description_number(u32::try_from(fd).map_err(|_| AxError::BadFileDescriptor)?)
 }
 
-pub fn sys_kcmp(pid1: i32, pid2: i32, type_: i32, idx1: usize, idx2: usize) -> AxResult<isize> {
+pub fn sys_kcmp<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    pid1: i32,
+    pid2: i32,
+    type_: i32,
+    idx1: usize,
+    idx2: usize,
+) -> AxResult<isize> {
     debug!("sys_kcmp <= pid1: {pid1}, pid2: {pid2}, type: {type_}, idx1: {idx1}, idx2: {idx2}");
 
     if pid1 <= 0 || pid2 <= 0 {
@@ -445,8 +550,68 @@ pub fn sys_kcmp(pid1: i32, pid2: i32, type_: i32, idx1: usize, idx2: usize) -> A
             &proc1.signal.shared_actions(),
             &proc2.signal.shared_actions(),
         ),
-        KCMP_IO | KCMP_SYSVSEM => Err(LinuxError::EOPNOTSUPP.into()),
-        KCMP_EPOLL_TFD => Err(LinuxError::EOPNOTSUPP.into()),
+        KCMP_IO => {
+            validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
+                proc1.image_matches(image)
+            })?;
+            validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
+                proc2.image_matches(image)
+            })?;
+            // Do not instantiate an io_context merely to observe it. Linux
+            // compares the existing shared CLONE_IO object, with two absent
+            // contexts comparing equal through the null pointer value.
+            let io1 = thread1.io_context();
+            let io2 = thread2.io_context();
+            validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
+                proc1.image_matches(image)
+            })?;
+            validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
+                proc2.image_matches(image)
+            })?;
+            kcmp_optional_ptr(KCMP_IO, &io1, &io2)
+        }
+        KCMP_SYSVSEM => {
+            validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
+                proc1.image_matches(image)
+            })?;
+            validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
+                proc2.image_matches(image)
+            })?;
+            let undo1 = thread1.sem_undo();
+            let undo2 = thread2.sem_undo();
+            validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
+                proc1.image_matches(image)
+            })?;
+            validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
+                proc2.image_matches(image)
+            })?;
+            kcmp_ptr(KCMP_SYSVSEM, &undo1, &undo2)
+        }
+        KCMP_EPOLL_TFD => {
+            let slot = (idx2 as *const KcmpEpollSlot)
+                .vm_read(memory)
+                .map_err(map_usercopy_error)?;
+            validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
+                proc1.image_matches(image)
+            })?;
+            validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
+                proc2.image_matches(image)
+            })?;
+            let file1 = kcmp_file_description(thread1, idx1)?;
+            let epoll_file = kcmp_file_description(thread2, slot.efd as usize)?;
+            let epoll = epoll_file
+                .inner
+                .downcast_ref::<Epoll>()
+                .ok_or(AxError::InvalidInput)?;
+            let target = epoll.target_description(slot.tfd, slot.toff)?;
+            validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
+                proc1.image_matches(image)
+            })?;
+            validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
+                proc2.image_matches(image)
+            })?;
+            kcmp_ptr(KCMP_FILE, &file1, &target)
+        }
         _ => Err(AxError::InvalidInput),
     }
 }
@@ -460,57 +625,206 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
     if flags & !UNSHARE_SUPPORTED_FLAGS != 0 {
         return Err(AxError::OperationNotSupported);
     }
+    // Linux rejects this incompatible pair before it prepares any namespace
+    // object or touches user-controlled state.
+    if flags & (CLONE_NEWIPC | CLONE_SYSVSEM) == (CLONE_NEWIPC | CLONE_SYSVSEM) {
+        return Err(AxError::InvalidInput);
+    }
+    // Entering a user namespace must not retain a CLONE_FS-shared root/cwd:
+    // unshare(NEWUSER) therefore implies CLONE_FS and commits that replacement
+    // with the credential/proxy transition below.
+    let flags = if flags & CLONE_NEWUSER != 0 {
+        flags | CLONE_FS
+    } else {
+        flags
+    };
     let curr = current();
     let thread = curr.as_thread();
-    let actor_cred = thread.current_cred();
+    let task_snapshot = thread.namespace_credential_fs_snapshot();
+    let actor_cred = task_snapshot.credential;
     let namespace_owner = unshare_namespace_owner(flags, &actor_cred)?;
+    let user_scope_owner = if flags & CLONE_NEWUSER != 0 {
+        Some(
+            thread
+                .proc_data
+                .begin_single_thread_scope_change(thread.kernel_tid())
+                .then_some(thread.kernel_tid())
+                .ok_or(AxError::InvalidInput)?,
+        )
+    } else {
+        None
+    };
     if flags & UNSHARE_SUPPORTED_FLAGS != 0 {
-        // Namespace changes remain group-scoped; FS and FILES are task-local.
-        // Prepare every fallible replacement before committing any of them.
-        let curr_tid = linux_pid_from_task_id(curr.id().as_u64())?;
-        if flags & !(CLONE_FS | CLONE_FILES) != 0
-            && !thread.proc_data.begin_single_thread_scope_change(curr_tid)
-        {
-            return Err(AxError::OperationNotSupported);
-        }
+        // Linux namespace attachments are task-local; FS and FILES are also
+        // task-local. Prepare every fallible replacement before publication.
 
         let result = (|| -> AxResult<()> {
+            let private_user_ns = if flags & CLONE_NEWUSER != 0 {
+                let ids = actor_cred.ids();
+                Some(actor_cred.user_ns().try_fork(
+                    ids.euid,
+                    ids.egid,
+                    actor_cred.has_effective_capability_in_own_user_ns(
+                        linux_raw_sys::general::CAP_SETFCAP,
+                    ),
+                )?)
+            } else {
+                None
+            };
+            let namespace_owner = private_user_ns.clone().unwrap_or(namespace_owner.clone());
             let private_fd_table = if flags & CLONE_FILES != 0 {
                 thread.try_clone_fd_table_if_shared()?
             } else {
                 None
             };
-            // Serialize the COW snapshot and replacement with pivot_root's
-            // all-task fs-context update.
-            let _fs_context_publication = (flags & CLONE_FS != 0).then(fs_context_publication);
-            let private_fs_context = if flags & CLONE_FS != 0 {
+            let mut private_fs_context = if flags & CLONE_FS != 0 {
                 thread.try_clone_fs_context_if_shared()?
             } else {
                 None
             };
             let private_uts_ns = if flags & CLONE_NEWUTS != 0 {
+                Some(thread.uts_ns().try_fork(namespace_owner.clone())?)
+            } else {
+                None
+            };
+            let (private_mount_ns, private_mount_fs_context) = if flags & CLONE_NEWNS != 0 {
+                // Take one stable namespace-topology generation for the
+                // source graph, its idmaps/peer state, and root/cwd rebinding.
+                // Do not retain this mutation serialization through the
+                // namespace/fs publication below: that commit is independent
+                // of topology mutation and may drop old filesystem objects.
+                let _topology_snapshot = crate::mounts::namespace_operation();
+                let mount_ns = thread.mount_ns().try_fork(namespace_owner.clone())?;
+                let root = mount_ns.root_location()?;
+                // CLONE_NEWNS clones a mount topology; it is neither chroot(2)
+                // nor chdir(2).  The cloned topology has distinct VFS mount
+                // instances, so retaining the old Locations would make this
+                // task pathwalk through the namespace it just left.  Rebind
+                // the existing root and cwd independently before either the
+                // namespace proxy or fs_struct is published.  This also
+                // retains the caller's umask/security view while authority
+                // for every mount idmap remains in the cloned topology.
+                let fs_context = thread.prepare_fs_context_for_cloned_mount_namespace(root)?;
+                (Some(mount_ns), Some(fs_context))
+            } else {
+                (None, None)
+            };
+            if let Some(fs_context) = private_mount_fs_context {
+                private_fs_context = Some(fs_context);
+            }
+            let private_ipc_ns = if flags & CLONE_NEWIPC != 0 {
+                Some(crate::syscall::ipc::IpcNamespace::try_new(
+                    namespace_owner.clone(),
+                )?)
+            } else {
+                None
+            };
+            let private_sem_undo = if let Some(ipc_ns) = private_ipc_ns.as_ref() {
+                Some(crate::task::SemUndoState::try_new(ipc_ns.clone())?)
+            } else if flags & CLONE_SYSVSEM != 0 {
+                Some(crate::task::SemUndoState::try_clone_for(
+                    thread.ipc_ns(),
+                    &thread.sem_undo(),
+                )?)
+            } else {
+                None
+            };
+            let private_net_ns = if flags & CLONE_NEWNET != 0 {
+                Some(crate::task::NetworkNamespace::try_new_loopback_only(
+                    namespace_owner.clone(),
+                )?)
+            } else {
+                None
+            };
+            let private_cgroup_ns = if flags & CLONE_NEWCGROUP != 0 {
+                // unshare(CLONE_NEWCGROUP) takes its root from the caller's
+                // present membership, not from the namespace view which the
+                // caller is about to leave.
+                let roots = crate::pseudofs::cgroup::cgroup_namespace_roots_for_pid(
+                    thread.proc_data.proc.pid(),
+                )?;
+                Some(crate::task::CgroupNamespace::try_fork(
+                    &thread.cgroup_ns(),
+                    namespace_owner.clone(),
+                    roots,
+                )?)
+            } else {
+                None
+            };
+            let private_time_ns = if flags & CLONE_NEWTIME != 0 {
                 Some(
                     thread
-                        .proc_data
-                        .uts_ns()
+                        .time_ns_for_children()
                         .try_fork(namespace_owner.clone())?,
                 )
             } else {
                 None
             };
-            let prepared_uts = private_uts_ns
-                .map(|uts_ns| thread.proc_data.prepare_uts_ns_replacement(uts_ns))
-                .transpose()?;
-            let private_time_ns = if flags & CLONE_NEWTIME != 0 {
+            let private_pid_ns = if flags & CLONE_NEWPID != 0 {
+                let reaper_scope = process_domain()?
+                    .try_new_reaper_scope()
+                    .map_err(process_error)?;
                 Some(
                     thread
-                        .proc_data
-                        .try_unshared_time_ns(namespace_owner.clone())?,
+                        .pid_ns_for_children()
+                        .try_fork_for_children(namespace_owner.clone(), reaper_scope)?,
                 )
             } else {
                 None
             };
+            let prepared_namespaces = thread.prepare_namespace_replacement(|proxy| {
+                if let Some(user_ns) = private_user_ns {
+                    proxy.replace_user(user_ns);
+                }
+                if let Some(mount_ns) = private_mount_ns {
+                    proxy.replace_mount(mount_ns);
+                }
+                if let Some(ipc_ns) = private_ipc_ns {
+                    proxy.replace_ipc(ipc_ns);
+                }
+                if let Some(net_ns) = private_net_ns {
+                    proxy.replace_net(net_ns);
+                }
+                if let Some(cgroup_ns) = private_cgroup_ns {
+                    proxy.replace_cgroup(cgroup_ns);
+                }
+                if let Some(uts_ns) = private_uts_ns {
+                    proxy.replace_uts(uts_ns);
+                }
+                if let Some(time_ns) = private_time_ns {
+                    proxy.replace_time_for_children(time_ns);
+                }
+                if let Some(pid_ns) = private_pid_ns {
+                    proxy.replace_pid_for_children(pid_ns);
+                }
+            });
 
+            // The user namespace (when requested) is the only replacement
+            // which also changes credentials. Recover it from the immutable
+            // proxy snapshot before its single commit. This is the final
+            // fallible publication step: fs/files/SEM_UNDO replacements are
+            // already allocated, but must remain untouched if it fails.
+            let target_user_ns = (flags & CLONE_NEWUSER != 0).then(|| namespace_owner.clone());
+            if let Some(user_ns) = target_user_ns {
+                if let Some(replacement_fs) = private_fs_context.take() {
+                    let old = thread.commit_user_namespace_transition_with_fs_context(
+                        user_ns,
+                        prepared_namespaces,
+                        replacement_fs,
+                    )?;
+                    drop(old);
+                } else {
+                    thread.commit_user_namespace_transition(user_ns, prepared_namespaces)?;
+                }
+            } else {
+                if let Some(replacement) = private_fs_context.take() {
+                    let old =
+                        thread.commit_namespace_with_fs_context(prepared_namespaces, replacement);
+                    drop(old);
+                } else {
+                    prepared_namespaces.commit(thread);
+                }
+            }
             let old_fd_table =
                 private_fd_table.map(|replacement| thread.replace_fd_table(replacement));
             let old_fs_context =
@@ -519,16 +833,16 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
             // cleanup. Keep all such work outside the IRQ/preempt-off scope gate.
             drop(old_fd_table);
             drop(old_fs_context);
-            if let Some(prepared_uts) = prepared_uts {
-                prepared_uts.commit(&thread.proc_data);
-            }
-            if let Some(time_ns) = private_time_ns {
-                thread.proc_data.replace_time_ns_for_children(time_ns);
+            // This pointer exchange is infallible and deliberately follows
+            // the namespace/credential publication, so a failed userns
+            // transition cannot detach SEM_UNDO from the old IPC manager.
+            if let Some(replacement) = private_sem_undo {
+                thread.replace_sem_undo(replacement);
             }
             Ok(())
         })();
-        if flags & !CLONE_FS != 0 {
-            thread.proc_data.end_exec(curr_tid);
+        if let Some(owner) = user_scope_owner {
+            thread.proc_data.end_exec(owner);
         }
         result?;
     }
@@ -539,6 +853,15 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
 pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
     debug!("sys_setns <= fd: {fd}, nstype: {nstype:#x}");
 
+    // Since Linux 5.8 a pidfd selects a bundle of namespaces rather than a
+    // single procfs namespace object.  Resolve the descriptor as FileLike
+    // first: a pidfd is not an ordinary VFS File and must not be rejected by
+    // the legacy proc-ns path below.
+    let file_like = get_file_like(fd)?;
+    if let Some(pidfd) = file_like.downcast_ref::<PidFd>() {
+        return sys_setns_pidfd(pidfd, nstype);
+    }
+
     let file = File::from_fd(fd)?;
     let target = match namespace_target_from_proc_file(file.inner().location()) {
         ProcNamespaceTarget::Live(kind, object) => (kind, object),
@@ -546,6 +869,10 @@ pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
     };
     let (kind, object) = target;
     let expected_type = match kind {
+        ProcNamespaceKind::Cgroup => CLONE_NEWCGROUP,
+        ProcNamespaceKind::Ipc => CLONE_NEWIPC,
+        ProcNamespaceKind::Mount => CLONE_NEWNS,
+        ProcNamespaceKind::Net => CLONE_NEWNET,
         ProcNamespaceKind::Pid => CLONE_NEWPID,
         ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren => CLONE_NEWTIME,
         ProcNamespaceKind::User => CLONE_NEWUSER,
@@ -555,44 +882,341 @@ pub fn sys_setns(fd: i32, nstype: u32) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
     enum Replacement {
+        Cgroup(Arc<crate::task::CgroupNamespace>),
+        Ipc(Arc<crate::syscall::ipc::IpcNamespace>),
+        Mount(Arc<crate::task::MountNamespace>),
+        Net(Arc<crate::task::NetworkNamespace>),
+        PidForChildren(Arc<crate::task::PidNamespace>),
+        User(Arc<crate::task::UserNamespace>),
         Uts(Arc<crate::task::UtsNamespace>),
         Time(Arc<crate::task::TimeNamespace>),
     }
 
     let replacement = match (kind, object) {
+        (ProcNamespaceKind::Cgroup, ProcNamespaceObject::Cgroup(cgroup_ns)) => {
+            Replacement::Cgroup(cgroup_ns)
+        }
+        (ProcNamespaceKind::Ipc, ProcNamespaceObject::Ipc(ipc_ns)) => Replacement::Ipc(ipc_ns),
+        (ProcNamespaceKind::Mount, ProcNamespaceObject::Mount(mount_ns)) => {
+            Replacement::Mount(mount_ns)
+        }
+        (ProcNamespaceKind::Net, ProcNamespaceObject::Net(net_ns)) => Replacement::Net(net_ns),
+        (ProcNamespaceKind::Pid, ProcNamespaceObject::Pid(pid_ns)) => {
+            Replacement::PidForChildren(pid_ns)
+        }
+        (ProcNamespaceKind::User, ProcNamespaceObject::User(user_ns)) => Replacement::User(user_ns),
         (ProcNamespaceKind::Uts, ProcNamespaceObject::Uts(uts_ns)) => Replacement::Uts(uts_ns),
         (
             ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren,
             ProcNamespaceObject::Time(time_ns),
         ) => Replacement::Time(time_ns),
-        (ProcNamespaceKind::Pid | ProcNamespaceKind::User, _) => {
-            return Err(LinuxError::EOPNOTSUPP.into());
-        }
         _ => return Err(AxError::InvalidInput),
     };
     let owner_user_ns = match &replacement {
+        Replacement::Cgroup(cgroup_ns) => cgroup_ns.owner_user_ns(),
+        Replacement::Ipc(ipc_ns) => ipc_ns.owner_user_ns(),
+        Replacement::Mount(mount_ns) => mount_ns.owner_user_ns(),
+        Replacement::Net(net_ns) => net_ns.owner_user_ns(),
+        Replacement::PidForChildren(pid_ns) => pid_ns.owner_user_ns(),
+        Replacement::User(user_ns) => user_ns,
         Replacement::Uts(uts_ns) => uts_ns.owner_user_ns(),
         Replacement::Time(time_ns) => time_ns.owner_user_ns(),
     };
     let curr = current();
     let thread = curr.as_thread();
-    let actor_cred = thread.current_cred();
+    let task_snapshot = thread.namespace_credential_fs_snapshot();
+    let actor_cred = task_snapshot.credential;
     if !ns_capable(&actor_cred, owner_user_ns, CAP_SYS_ADMIN) {
         return Err(AxError::OperationNotPermitted);
     }
+    // A mount namespace cannot retain an fs_struct rooted in the namespace
+    // being left.  Resolve and validate the target root before entering the
+    // single-thread publication scope, so no namespace pointer can be
+    // published with an unusable cwd/root pair.
+    let mount_root = match &replacement {
+        Replacement::Mount(mount_ns) => Some(mount_ns.root_location()?),
+        _ => None,
+    };
 
-    let curr_tid = linux_pid_from_task_id(curr.id().as_u64())?;
-    if !thread.proc_data.begin_single_thread_scope_change(curr_tid) {
-        return Err(AxError::OperationNotSupported);
+    if let Replacement::PidForChildren(pid_ns) = &replacement
+        && !task_snapshot.namespaces.pid().contains(pid_ns)
+    {
+        return Err(AxError::OperationNotPermitted);
     }
+    // setns(CLONE_NEWNS) must not retarget a CLONE_FS-shared fs_struct for
+    // sibling tasks which remain in the old namespace.  Clone before the
+    // namespace publication transaction, then reset only this task's root/cwd.
+    let replacement_fs = mount_root
+        .as_ref()
+        .map(|root| thread.prepare_fs_context_for_mount_namespace(root.clone()))
+        .transpose()?;
+    let replacement_sem_undo = match &replacement {
+        Replacement::Ipc(ipc_ns) => Some(crate::task::SemUndoState::try_new(ipc_ns.clone())?),
+        _ => None,
+    };
+    // A user namespace may only be entered from an ancestor, never re-entered
+    // or entered from a sibling/descendant relationship. Linux also requires
+    // this task to be the sole thread and to own an unshared fs_struct, since
+    // both credentials and root interpretation change together.
+    let user_scope_owner = match &replacement {
+        Replacement::User(target) => {
+            if !user_namespace_is_strict_descendant(target, actor_cred.user_ns())
+                || thread.fs_context_is_shared()
+                || !thread
+                    .proc_data
+                    .begin_single_thread_scope_change(thread.kernel_tid())
+            {
+                return Err(AxError::InvalidInput);
+            }
+            Some(thread.kernel_tid())
+        }
+        _ => None,
+    };
     let result = match replacement {
-        Replacement::Uts(uts_ns) => thread.proc_data.replace_uts_ns(uts_ns),
-        Replacement::Time(time_ns) => {
-            thread.proc_data.replace_time_ns(time_ns);
+        // Joining a user namespace changes the calling task's credential
+        // namespace as well as the ProcessData aggregate.  Its helper
+        // prepares both objects before publishing either.
+        Replacement::User(user_ns) => thread.set_user_namespace(user_ns),
+        replacement => {
+            let prepared = thread.prepare_namespace_replacement(|proxy| match replacement {
+                Replacement::Cgroup(cgroup_ns) => proxy.replace_cgroup(cgroup_ns),
+                Replacement::Ipc(ipc_ns) => proxy.replace_ipc(ipc_ns),
+                Replacement::Mount(mount_ns) => proxy.replace_mount(mount_ns),
+                Replacement::Net(net_ns) => proxy.replace_net(net_ns),
+                Replacement::PidForChildren(pid_ns) => proxy.replace_pid_for_children(pid_ns),
+                Replacement::Uts(uts_ns) => proxy.replace_uts(uts_ns),
+                // Linux time-namespace setns is deferred: the caller keeps
+                // its current clock domain and only future children inherit
+                // the selected namespace.  This mirrors unshare(NEWTIME).
+                Replacement::Time(time_ns) => proxy.replace_time_for_children(time_ns),
+                Replacement::User(_) => unreachable!("handled above"),
+            });
+            if let Some(replacement_fs) = replacement_fs {
+                // The fs_struct was fully prepared before the namespace
+                // transaction. Its pointer exchange and the proxy exchange
+                // have no remaining fallible work.
+                let old = thread.commit_namespace_with_fs_context(prepared, replacement_fs);
+                drop(old);
+            } else if let Some(replacement_sem_undo) = replacement_sem_undo {
+                thread.commit_namespace_with_sem_undo(prepared, replacement_sem_undo);
+            } else {
+                prepared.commit(thread);
+            }
             Ok(())
         }
     };
-    thread.proc_data.end_exec(curr_tid);
+    if let Some(owner) = user_scope_owner {
+        thread.proc_data.end_exec(owner);
+    }
+    result?;
+    Ok(0)
+}
+
+/// `setns(2)` pidfd form.  Unlike a `/proc/<pid>/ns/*` fd, `nstype` is a
+/// non-empty bitset and every requested attachment is sampled from one live
+/// target task namespace proxy.
+fn sys_setns_pidfd(pidfd: &PidFd, flags: u32) -> AxResult<isize> {
+    if flags == 0 || flags & !SETNS_PIDFD_ALLOWED_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    // A thread pidfd names one exact task, not the group leader. Its weak
+    // scheduler binding is the PID-reuse-safe authority source. Process
+    // pidfds retain the legacy leader resolution path instead.
+    let target_process_data = pidfd.process_data()?;
+    let target_task = if let Some(task) = pidfd.signal_thread_task()? {
+        let target_thread = task.as_thread();
+        if target_thread.pending_exit()
+            || !Arc::ptr_eq(&target_thread.proc_data, &target_process_data)
+            || !Arc::ptr_eq(&pidfd.process_data()?, &target_process_data)
+        {
+            return Err(AxError::NoSuchProcess);
+        }
+        check_current_thread_ptrace_image_access(target_thread, PtraceAccessMode::ReadReal)?;
+        if target_thread.pending_exit()
+            || !Arc::ptr_eq(&pidfd.process_data()?, &target_process_data)
+        {
+            return Err(AxError::NoSuchProcess);
+        }
+        task
+    } else {
+        // Numeric PID lookup alone is never an authority source: retain and
+        // compare the pidfd ProcessData Arc on both sides of resolution.
+        let target_process = pidfd.process()?;
+        let task = get_task(target_process.pid())?;
+        let target_thread = task.as_thread();
+        if target_thread.pending_exit()
+            || !Arc::ptr_eq(&target_thread.proc_data, &target_process_data)
+            || !Arc::ptr_eq(&pidfd.process_data()?, &target_process_data)
+        {
+            return Err(AxError::NoSuchProcess);
+        }
+        check_current_process_ptrace_access(&target_process_data, PtraceAccessMode::ReadReal)?;
+        if target_thread.pending_exit()
+            || !Arc::ptr_eq(&pidfd.process_data()?, &target_process_data)
+        {
+            return Err(AxError::NoSuchProcess);
+        }
+        task
+    };
+    let target_thread = target_task.as_thread();
+    let target = target_thread.namespace_proxy();
+
+    let curr = current();
+    let thread = curr.as_thread();
+    let task_snapshot = thread.namespace_credential_fs_snapshot();
+    let actor_cred = task_snapshot.credential;
+
+    // nsset's user-namespace admission precedes the generic per-target
+    // capability pass.  Besides enforcing Linux's EINVAL priority for a
+    // same/current user namespace, reserving the single-thread gate here
+    // keeps a concurrent CLONE_THREAD from invalidating that admission.
+    let mut scope_owner = if flags & CLONE_NEWUSER != 0 {
+        if !user_namespace_is_strict_descendant(&target.user(), actor_cred.user_ns())
+            || thread.fs_context_is_shared()
+            || !thread
+                .proc_data
+                .begin_single_thread_scope_change(thread.kernel_tid())
+        {
+            return Err(AxError::InvalidInput);
+        }
+        Some(thread.kernel_tid())
+    } else {
+        None
+    };
+    let result = (|| -> AxResult<()> {
+        let require_owner_admin = |owner: Arc<crate::task::UserNamespace>| -> AxResult<()> {
+            if !ns_capable(&actor_cred, &owner, CAP_SYS_ADMIN) {
+                return Err(AxError::OperationNotPermitted);
+            }
+            Ok(())
+        };
+
+        // Linux's pidfd nsset installation order is explicit.  Keep each
+        // namespace's structural admission next to its owner check so a
+        // later TIME request cannot mask an earlier selected namespace error.
+        if flags & CLONE_NEWUSER != 0 {
+            require_owner_admin(target.user())?;
+        }
+        if flags & CLONE_NEWNS != 0 {
+            require_owner_admin(target.mount().owner_user_ns().clone())?;
+            // The mount authority is relative to the namespace of the
+            // credential which will be installed by nsset. The NEWUSER case
+            // is checked against the prepared credential at commit; without
+            // NEWUSER the current credential is already installed.
+            if flags & CLONE_NEWUSER == 0
+                && !ns_capable(&actor_cred, actor_cred.user_ns(), CAP_SYS_CHROOT)
+            {
+                return Err(AxError::OperationNotPermitted);
+            }
+        }
+        if flags & CLONE_NEWUTS != 0 {
+            require_owner_admin(target.uts().owner_user_ns().clone())?;
+        }
+        if flags & CLONE_NEWIPC != 0 {
+            require_owner_admin(target.ipc().owner_user_ns().clone())?;
+        }
+        if flags & CLONE_NEWPID != 0 {
+            require_owner_admin(target.pid().owner_user_ns().clone())?;
+            if !task_snapshot.namespaces.pid().contains(&target.pid()) {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        if flags & CLONE_NEWCGROUP != 0 {
+            require_owner_admin(target.cgroup().owner_user_ns().clone())?;
+        }
+        if flags & CLONE_NEWNET != 0 {
+            require_owner_admin(target.net().owner_user_ns().clone())?;
+        }
+        if flags & CLONE_NEWTIME != 0 {
+            // NEWTIME's single-thread admission precedes its target-owner
+            // capability check, including for a mixed nsset request. A
+            // NEWUSER request has already reserved the same gate above.
+            if scope_owner.is_none() {
+                if !thread
+                    .proc_data
+                    .begin_single_thread_scope_change(thread.kernel_tid())
+                {
+                    return Err(LinuxError::EUSERS.into());
+                }
+                scope_owner = Some(thread.kernel_tid());
+            }
+            require_owner_admin(target.time().owner_user_ns().clone())?;
+        }
+
+        // VFS and IPC allocations remain before the final publication gate.
+        let replacement_fs = if flags & CLONE_NEWNS != 0 {
+            let root = target.mount().root_location()?;
+            Some(thread.prepare_fs_context_for_mount_namespace(root)?)
+        } else {
+            None
+        };
+        let replacement_sem_undo = if flags & CLONE_NEWIPC != 0 {
+            Some(crate::task::SemUndoState::try_new(target.ipc())?)
+        } else {
+            None
+        };
+        let prepared = thread.prepare_namespace_replacement(|proxy| {
+            if flags & CLONE_NEWCGROUP != 0 {
+                proxy.replace_cgroup(target.cgroup());
+            }
+            if flags & CLONE_NEWIPC != 0 {
+                proxy.replace_ipc(target.ipc());
+            }
+            if flags & CLONE_NEWNS != 0 {
+                proxy.replace_mount(target.mount());
+            }
+            if flags & CLONE_NEWNET != 0 {
+                proxy.replace_net(target.net());
+            }
+            if flags & CLONE_NEWPID != 0 {
+                // setns never changes the caller's current PID namespace.
+                // The target is inherited only by its next child.
+                proxy.replace_pid_for_children(target.pid());
+            }
+            if flags & CLONE_NEWTIME != 0 {
+                // Likewise, time offsets apply to children only.
+                proxy.replace_time_for_children(target.time());
+            }
+            if flags & CLONE_NEWUTS != 0 {
+                proxy.replace_uts(target.uts());
+            }
+            if flags & CLONE_NEWUSER != 0 {
+                proxy.replace_user(target.user());
+            }
+        });
+
+        if flags & CLONE_NEWUSER != 0 {
+            thread.commit_user_namespace_transition_with_resources(
+                target.user(),
+                prepared,
+                replacement_fs,
+                replacement_sem_undo,
+                |post_transition_cred| {
+                    // The second nsset authority check is deliberately
+                    // singular: after NEWUSER every selected attachment is
+                    // installed under the new credential's user namespace,
+                    // not under each object's owner namespace (which the
+                    // pre-transition check above already covered).
+                    if !ns_capable(post_transition_cred, &target.user(), CAP_SYS_ADMIN) {
+                        return Err(AxError::OperationNotPermitted);
+                    }
+                    if flags & CLONE_NEWNS != 0
+                        && !ns_capable(post_transition_cred, &target.user(), CAP_SYS_CHROOT)
+                    {
+                        return Err(AxError::OperationNotPermitted);
+                    }
+                    Ok(())
+                },
+            )
+        } else {
+            thread.commit_namespace_with_resources(prepared, replacement_fs, replacement_sem_undo);
+            Ok(())
+        }
+    })();
+    if let Some(owner) = scope_owner {
+        thread.proc_data.end_exec(owner);
+    }
     result?;
     Ok(0)
 }
@@ -1201,6 +1825,119 @@ fn pr_get_dumpable_value(
     dumpability as isize
 }
 
+fn prctl_mm_capable() -> AxResult<()> {
+    current()
+        .as_thread()
+        .has_effective_capability(CAP_SYS_RESOURCE)
+        .then_some(())
+        .ok_or(AxError::OperationNotPermitted)
+}
+
+fn prctl_mm_address_valid(aspace: &crate::mm::AddrSpace, address: usize) -> bool {
+    address == 0 || (address >= aspace.base().as_usize() && address <= aspace.end().as_usize())
+}
+
+fn validate_prctl_mm_layout(layout: &ProcessMmLayout) -> AxResult<()> {
+    if layout.start_code > layout.end_code
+        || layout.start_data > layout.end_data
+        || layout.start_brk > layout.brk
+        || layout.arg_start > layout.arg_end
+        || layout.env_start > layout.env_end
+        || layout.auxv.len() > PRCTL_MM_AUXV_MAX
+        || !layout
+            .auxv
+            .len()
+            .is_multiple_of(core::mem::size_of::<usize>() * 2)
+    {
+        return Err(AxError::InvalidInput);
+    }
+    let aspace_handle = current().as_thread().proc_data.aspace();
+    let aspace = aspace_handle.lock();
+    for address in [
+        layout.start_code,
+        layout.end_code,
+        layout.start_data,
+        layout.end_data,
+        layout.start_brk,
+        layout.brk,
+        layout.start_stack,
+        layout.arg_start,
+        layout.arg_end,
+        layout.env_start,
+        layout.env_end,
+    ] {
+        if !prctl_mm_address_valid(&aspace, address) {
+            return Err(AxError::InvalidInput);
+        }
+    }
+    Ok(())
+}
+
+fn copy_prctl_mm_auxv<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    address: usize,
+    len: usize,
+) -> AxResult<Vec<u8>> {
+    if len > PRCTL_MM_AUXV_MAX || !len.is_multiple_of(core::mem::size_of::<usize>() * 2) {
+        return Err(AxError::InvalidInput);
+    }
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if address == 0 {
+        return Err(AxError::BadAddress);
+    }
+    let mut auxv = Vec::new();
+    auxv.try_reserve_exact(len).map_err(|_| AxError::NoMemory)?;
+    auxv.resize(len, 0);
+    let destination = unsafe {
+        core::slice::from_raw_parts_mut(auxv.as_mut_ptr().cast::<MaybeUninit<u8>>(), len)
+    };
+    memory
+        .read_bytes(address, destination)
+        .map_err(map_usercopy_error)?;
+    Ok(auxv)
+}
+
+fn prctl_set_mm_executable(fd: i32) -> AxResult<()> {
+    let handle = get_file_like(fd)?;
+    let file = handle
+        .downcast::<File>()
+        .map_err(|_| AxError::InvalidInput)?;
+    let location = file.inner().location();
+    if location.node_type() != NodeType::RegularFile {
+        return Err(AxError::InvalidInput);
+    }
+    let source = location.absolute_path()?;
+    let mut path = Vec::new();
+    path.try_reserve_exact(source.as_bytes().len())
+        .map_err(|_| AxError::NoMemory)?;
+    path.extend_from_slice(source.as_bytes());
+    let key = executable::acquire(location)?;
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    proc_data.replace_executable(key);
+    *proc_data.exe_path.write() = FsPathBuf::from_vec(path);
+    Ok(())
+}
+
+fn prctl_commit_mm_layout(layout: ProcessMmLayout) -> AxResult<()> {
+    validate_prctl_mm_layout(&layout)?;
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    // `brk` is the only PR_SET_MM field with an actual VMA consequence. Run
+    // its real allocator transaction before publishing the new metadata; a
+    // failed growth/shrink leaves the old complete layout visible.
+    if layout.brk != proc_data.get_heap_top() {
+        let observed = crate::syscall::sys_brk_transaction(layout.brk, false)? as usize;
+        if observed != layout.brk {
+            return Err(AxError::NoMemory);
+        }
+    }
+    proc_data.replace_mm_layout(layout);
+    Ok(())
+}
+
 /// prctl() is called with a first argument describing what to do, and further
 /// arguments with a significance depending on the first one.
 /// The first argument can be:
@@ -1281,6 +2018,18 @@ pub fn sys_prctl<M: UserMemory + ?Sized>(
             )
             .map_err(map_usercopy_error)?;
         }
+        PR_GET_TID_ADDRESS => {
+            // This is the same per-thread clear_child_tid word configured by
+            // set_tid_address(2) and CLONE_CHILD_CLEARTID. It remains
+            // observable as an address even if the address cannot currently
+            // be dereferenced; only the output pointer is copied here.
+            VmMutPtr::vm_write(
+                arg2 as *mut usize,
+                memory,
+                current().as_thread().clear_child_tid(),
+            )
+            .map_err(map_usercopy_error)?;
+        }
         PR_SET_TIMERSLACK => {
             current().as_thread().proc_data.set_timerslack_ns(arg2);
         }
@@ -1318,8 +2067,98 @@ pub fn sys_prctl<M: UserMemory + ?Sized>(
             }
             current().as_thread().set_keep_caps(arg2 != 0)?;
         }
-        PR_MCE_KILL | PR_SET_THP_DISABLE | PR_GET_THP_DISABLE => {
-            return Err(AxError::InvalidInput);
+        PR_SET_THP_DISABLE => {
+            const PR_THP_DISABLE_EXCEPT_ADVISED: usize = 1 << 1;
+            if arg4 != 0
+                || arg5 != 0
+                || arg3 & !PR_THP_DISABLE_EXCEPT_ADVISED != 0
+                || (arg2 == 0 && arg3 != 0)
+            {
+                return Err(AxError::InvalidInput);
+            }
+            let mode = if arg2 == 0 {
+                ThpDisableMode::Enabled
+            } else if arg3 == PR_THP_DISABLE_EXCEPT_ADVISED {
+                ThpDisableMode::ExceptAdvised
+            } else {
+                ThpDisableMode::Disabled
+            };
+            let aspace = current().as_thread().proc_data.aspace();
+            AddrSpace::lock_interruptibly(&aspace)?.set_thp_disable_mode(mode);
+        }
+        PR_GET_THP_DISABLE => {
+            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            return Ok(current()
+                .as_thread()
+                .proc_data
+                .aspace()
+                .lock()
+                .thp_disable_mode()
+                .prctl_value() as isize);
+        }
+        PR_SET_MDWE => {
+            if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            current()
+                .as_thread()
+                .proc_data
+                .set_mdwe(u8::try_from(arg2).map_err(|_| AxError::InvalidInput)?)?;
+        }
+        PR_GET_MDWE => {
+            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            return Ok(current().as_thread().proc_data.mdwe() as isize);
+        }
+        PR_SET_IO_FLUSHER => {
+            if arg2 > 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let curr = current();
+            let thread = curr.as_thread();
+            // Enabling the allocator/writeback reserve is privileged. Clearing
+            // a bit that this thread already owns is intentionally permitted.
+            if arg2 != 0 && !thread.has_effective_capability(CAP_SYS_RESOURCE) {
+                return Err(AxError::OperationNotPermitted);
+            }
+            thread.set_io_flusher(arg2 != 0);
+        }
+        PR_GET_IO_FLUSHER => {
+            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            return Ok(current().as_thread().io_flusher() as isize);
+        }
+        PR_MCE_KILL => {
+            // Linux accepts CLEAR or SET plus one of LATE/EARLY/DEFAULT.
+            // This is task-local and feeds the real x86 machine-check signal
+            // bridge; there is deliberately no process-wide shadow setting.
+            if arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let policy = match arg2 as u32 {
+                PR_MCE_KILL_CLEAR => {
+                    if arg3 != 0 {
+                        return Err(AxError::InvalidInput);
+                    }
+                    PR_MCE_KILL_DEFAULT as u8
+                }
+                PR_MCE_KILL_SET => match arg3 as u32 {
+                    PR_MCE_KILL_LATE | PR_MCE_KILL_EARLY | PR_MCE_KILL_DEFAULT => arg3 as u8,
+                    _ => return Err(AxError::InvalidInput),
+                },
+                _ => return Err(AxError::InvalidInput),
+            };
+            current().as_thread().set_mce_kill_policy(policy);
+        }
+        PR_MCE_KILL_GET => {
+            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            return Ok(current().as_thread().mce_kill_policy() as isize);
         }
         PR_CAP_AMBIENT => {
             let curr = current();
@@ -1372,7 +2211,92 @@ pub fn sys_prctl<M: UserMemory + ?Sized>(
             return Ok(current().as_thread().securebits() as isize);
         }
         PR_SET_MM => {
-            return Err(AxError::OperationNotSupported);
+            prctl_mm_capable()?;
+            let subcommand = arg2 as u32;
+            if subcommand == PR_SET_MM_MAP_SIZE {
+                if arg4 != 0 || arg5 != 0 {
+                    return Err(AxError::InvalidInput);
+                }
+                VmMutPtr::vm_write(arg3 as *mut u32, memory, PRCTL_MM_MAP_SIZE as u32)
+                    .map_err(map_usercopy_error)?;
+                return Ok(0);
+            }
+
+            if subcommand == PR_SET_MM_EXE_FILE {
+                if arg4 != 0 || arg5 != 0 {
+                    return Err(AxError::InvalidInput);
+                }
+                return prctl_set_mm_executable(
+                    i32::try_from(arg3).map_err(|_| AxError::BadFileDescriptor)?,
+                )
+                .map(|_| 0);
+            }
+
+            let curr = current();
+            let proc_data = &curr.as_thread().proc_data;
+            let mut layout = proc_data.mm_layout();
+            if subcommand == PR_SET_MM_MAP {
+                if arg5 != 0 || arg4 != PRCTL_MM_MAP_SIZE {
+                    return Err(AxError::InvalidInput);
+                }
+                let map = VmPtr::vm_read(arg3 as *const PrctlMmMap, memory)
+                    .map_err(map_usercopy_error)?;
+                layout.start_code =
+                    usize::try_from(map.start_code).map_err(|_| AxError::InvalidInput)?;
+                layout.end_code =
+                    usize::try_from(map.end_code).map_err(|_| AxError::InvalidInput)?;
+                layout.start_data =
+                    usize::try_from(map.start_data).map_err(|_| AxError::InvalidInput)?;
+                layout.end_data =
+                    usize::try_from(map.end_data).map_err(|_| AxError::InvalidInput)?;
+                layout.start_brk =
+                    usize::try_from(map.start_brk).map_err(|_| AxError::InvalidInput)?;
+                layout.brk = usize::try_from(map.brk).map_err(|_| AxError::InvalidInput)?;
+                layout.start_stack =
+                    usize::try_from(map.start_stack).map_err(|_| AxError::InvalidInput)?;
+                layout.arg_start =
+                    usize::try_from(map.arg_start).map_err(|_| AxError::InvalidInput)?;
+                layout.arg_end = usize::try_from(map.arg_end).map_err(|_| AxError::InvalidInput)?;
+                layout.env_start =
+                    usize::try_from(map.env_start).map_err(|_| AxError::InvalidInput)?;
+                layout.env_end = usize::try_from(map.env_end).map_err(|_| AxError::InvalidInput)?;
+                layout.auxv =
+                    copy_prctl_mm_auxv(memory, map.auxv as usize, map.auxv_size as usize)?;
+                prctl_commit_mm_layout(layout)?;
+                if map.exe_fd != u32::MAX {
+                    prctl_set_mm_executable(
+                        i32::try_from(map.exe_fd).map_err(|_| AxError::BadFileDescriptor)?,
+                    )?;
+                }
+                return Ok(0);
+            }
+
+            if subcommand == PR_SET_MM_AUXV {
+                if arg5 != 0 {
+                    return Err(AxError::InvalidInput);
+                }
+                layout.auxv = copy_prctl_mm_auxv(memory, arg3, arg4)?;
+                return prctl_commit_mm_layout(layout).map(|_| 0);
+            }
+            if arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let value = arg3;
+            match subcommand {
+                PR_SET_MM_START_CODE => layout.start_code = value,
+                PR_SET_MM_END_CODE => layout.end_code = value,
+                PR_SET_MM_START_DATA => layout.start_data = value,
+                PR_SET_MM_END_DATA => layout.end_data = value,
+                PR_SET_MM_START_STACK => layout.start_stack = value,
+                PR_SET_MM_START_BRK => layout.start_brk = value,
+                PR_SET_MM_BRK => layout.brk = value,
+                PR_SET_MM_ARG_START => layout.arg_start = value,
+                PR_SET_MM_ARG_END => layout.arg_end = value,
+                PR_SET_MM_ENV_START => layout.env_start = value,
+                PR_SET_MM_ENV_END => layout.env_end = value,
+                _ => return Err(AxError::InvalidInput),
+            }
+            prctl_commit_mm_layout(layout)?;
         }
         _ => {
             warn!("sys_prctl: unsupported option {option}");

@@ -1,7 +1,6 @@
 use alloc::{
     boxed::Box,
     format,
-    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -14,18 +13,19 @@ use core::{
     time::Duration,
 };
 
-use axerrno::{AxError, AxResult};
-use axhal::time::monotonic_time_nanos;
-use axnet::NetStack;
+use axerrno::{AxError, AxResult, LinuxError};
+use axfs_ng_vfs::FsPathBuf;
+use axhal::{paging::MappingFlags, time::monotonic_time_nanos};
+use axnet::{NetStack, PacketAction, PacketContext, PacketHookPoint};
 use axpoll::PollSet;
 use axsync::{Mutex, spin::SpinNoIrq};
 use axtask::{
-    AxCpuMask, AxTaskRef, SchedClass, SchedState, TaskSchedCommit, current,
-    scheduler_state_snapshot,
+    AxCpuMask, AxTaskRef, SchedClass, SchedState, TaskSchedulingSnapshot, current,
+    task_scheduling_snapshot,
 };
 use hashbrown::HashMap;
 use scope_local::Scope;
-use spin::{Once, RwLock};
+use spin::{Lazy, Once, RwLock};
 use thekernel_linux_cred::{
     USER_NAMESPACE_OVERFLOW_ID, UserNamespaceDomain, UserNamespaceMapState,
 };
@@ -34,6 +34,8 @@ use thekernel_linux_signal::{
     SignalInfo, SignalQueueAccount, Signo,
     api::{ProcessSignalManager, SharedSignalActions, ThreadSignalManager},
 };
+
+use crate::syscall::ipc::{IpcNamespace, SemUndo, apply_sem_undo};
 
 /// x86 protection-key allocation belongs to an mm, not to an individual
 /// thread. Key zero is permanently reserved. `pkey_free` deliberately only
@@ -172,8 +174,8 @@ use super::{
     resources::Rlimits,
     security::LandlockDomain,
     signal::PtraceSignalRecord,
-    thread::{AsThread, TaskParentPublicationGuard, lock_task_parent_publication},
-    timer::{PosixTimer, ProcessITimerWorkNode, ProcessITimers},
+    thread::{TaskParentPublicationGuard, lock_task_parent_publication},
+    timer::{ForeignCpuTimerSubscriberPool, PosixTimer, ProcessITimerWorkNode, ProcessITimers},
 };
 use crate::{
     file::{
@@ -198,6 +200,14 @@ pub(crate) struct ZombieSchedulerSnapshot {
     /// Linux's policy query exposes this flag as part of the returned policy,
     /// including while the group leader is an unreaped zombie.
     pub(crate) reset_on_fork: bool,
+    /// Raw uclamp request plus per-side ownership retained after the live
+    /// scheduler entity disappears.
+    pub(crate) uclamp_min: u16,
+    pub(crate) uclamp_max: u16,
+    pub(crate) uclamp_min_user_defined: bool,
+    pub(crate) uclamp_max_user_defined: bool,
+    pub(crate) uclamp_effective_min: u16,
+    pub(crate) uclamp_effective_max: u16,
     /// The last successfully installed CPU affinity.  The group-leader
     /// identity retains this cell after its live task has exited, matching the
     /// still-addressable unreaped PID lifecycle.
@@ -216,6 +226,12 @@ impl Default for ZombieSchedulerSnapshot {
             nice: 0,
             rt_priority: 0,
             reset_on_fork: false,
+            uclamp_min: 0,
+            uclamp_max: 1024,
+            uclamp_min_user_defined: false,
+            uclamp_max_user_defined: false,
+            uclamp_effective_min: 0,
+            uclamp_effective_max: 1024,
             affinity: AxCpuMask::full(),
             identity_epoch: 0,
             version: 0,
@@ -230,6 +246,12 @@ impl From<SchedState> for ZombieSchedulerSnapshot {
             nice: state.nice,
             rt_priority: state.rt_priority,
             reset_on_fork: false,
+            uclamp_min: 0,
+            uclamp_max: 1024,
+            uclamp_min_user_defined: false,
+            uclamp_max_user_defined: false,
+            uclamp_effective_min: 0,
+            uclamp_effective_max: 1024,
             affinity: AxCpuMask::full(),
             identity_epoch: 0,
             version: 0,
@@ -244,8 +266,8 @@ fn scheduler_version_is_newer_or_equal(candidate: u64, published: u64) -> bool {
 fn scheduler_publication_matches(
     published_token: u64,
     expected_token: u64,
-    commit: TaskSchedCommit,
-    current: Option<TaskSchedCommit>,
+    commit: TaskSchedulingSnapshot,
+    current: Option<TaskSchedulingSnapshot>,
 ) -> bool {
     published_token == expected_token && current == Some(commit)
 }
@@ -479,7 +501,7 @@ pub(crate) fn reap_process(process: &Process) -> AxResult<bool> {
         if !session.is_live() {
             // The last process group left this session. This may release a
             // previously reaped leader's SID binding from a different group.
-            release_dead_session_sid_binding(&session, &pid_ns);
+            release_dead_session_sid_binding(&session, pid_ns);
         }
         if !group_live {
             // PIDTYPE_PGID survives a reaped group leader while another
@@ -642,6 +664,15 @@ static LIVE_USER_NAMESPACES: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct UserNamespaceId(u64);
 
+impl UserNamespaceId {
+    /// Stable scalar form for bounded kernel-owned accounting tables.  IDs
+    /// are allocated once and never reused, so retaining this value does not
+    /// extend the namespace lifetime or permit an ABA match.
+    pub(crate) const fn into_raw(self) -> u64 {
+        self.0
+    }
+}
+
 fn try_increment_bounded(counter: &AtomicUsize, limit: usize) -> bool {
     counter
         .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -672,31 +703,195 @@ impl Drop for UserNamespaceAdmission {
 pub(crate) struct CgroupNamespace {
     id: u64,
     owner_user_ns: Arc<UserNamespace>,
+    /// The cgroup roots which were visible when this namespace was created.
+    ///
+    /// A cgroup namespace is not a second hierarchy: it is an immutable view
+    /// rooted at the creator's live membership.  Retaining the opaque roots
+    /// here keeps that view alive even if the task subsequently migrates, and
+    /// lets the cgroup filesystem apply the same root to proc rendering and
+    /// pathname visibility after setns().
+    roots: crate::pseudofs::cgroup::CgroupNamespaceRoots,
+}
+
+/// Namespace-local mount attachment identity.
+///
+/// Mount topology remains owned by `crate::mounts`; this object is the
+/// process-visible namespace handle and the hand-off point for the topology
+/// implementation.  Keeping the identity separate from the global VFS
+/// mechanisms lets clone/unshare/setns prepare an attach without publishing a
+/// partially changed task namespace set.
+pub(crate) struct MountNamespace {
+    id: u64,
+    owner_user_ns: Arc<UserNamespace>,
+    topology: Arc<crate::mounts::MountTopology>,
+    // FUSE/NFS mount-ID registrations are external provider state.  Keep the
+    // clone-owned IDs with the namespace lifetime so dropping the final task
+    // or nsfd cannot strand a provider registration after namespace teardown.
+    provider_registrations: Mutex<Vec<crate::mounts::ClonedProviderMount>>,
+}
+
+/// Namespace IDs in statmount/listmount are references to live namespace
+/// objects, not an alias for the caller's current mount graph.  Keep only
+/// weak entries: `/proc/*/ns/mnt` and tasks remain the lifetime authority.
+static MOUNT_NAMESPACE_REGISTRY: Lazy<Mutex<HashMap<u64, Weak<MountNamespace>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+impl MountNamespace {
+    pub(crate) fn try_new_root(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+        let id = try_allocate_proc_namespace_id()?;
+        let topology = crate::mounts::MountTopology::try_bootstrap(id)?;
+        let namespace = Arc::try_new(Self {
+            id,
+            owner_user_ns,
+            topology,
+            provider_registrations: Mutex::new(Vec::new()),
+        })
+        .map_err(|_| AxError::NoMemory)?;
+        Self::register(&namespace)?;
+        Ok(namespace)
+    }
+
+    pub(crate) fn try_fork(&self, owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+        let id = try_allocate_proc_namespace_id()?;
+        // A CLONE_NEWNS/UNSHARE_NEWNS paired with a new user namespace must
+        // retain the copied mounts but lock their placement-sensitive state.
+        // This is Linux's `lock_mnt_tree()` restriction, not a move_mount
+        // policy bit; it therefore belongs to topology construction and is
+        // preserved by later namespace clones.
+        let lock_mounts = !Arc::ptr_eq(&self.owner_user_ns, &owner_user_ns);
+        let mut topology = self.topology.try_prepare_clone_namespace(id, lock_mounts)?;
+        let namespace = Arc::try_new(Self {
+            id,
+            owner_user_ns,
+            topology: topology.topology(),
+            provider_registrations: Mutex::new(Vec::new()),
+        })
+        .map_err(|_| AxError::NoMemory)?;
+        // Provider registrations are external state.  Do not activate them
+        // until the clone has an owned namespace object; if either this
+        // activation or nsfs registry admission fails, the prepared clone's
+        // Drop receipt removes every FUSE/NFS registration before the private
+        // topology is released.
+        topology.activate_provider_mounts()?;
+        if let Err(error) = Self::register(&namespace) {
+            return Err(error);
+        }
+        // No fallible work remains after registry admission. Transfer the
+        // active registrations into the namespace lifetime before the
+        // prepared receipt is dropped.
+        *namespace.provider_registrations.lock() = topology.take_active_provider_mounts();
+        Ok(namespace)
+    }
+
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
+    }
+    pub(crate) fn proc_inode(&self) -> u64 {
+        PROC_NS_INO_BASE + self.id.saturating_mul(8)
+    }
+    pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
+        &self.owner_user_ns
+    }
+    pub(crate) fn topology(&self) -> Arc<crate::mounts::MountTopology> {
+        self.topology.clone()
+    }
+
+    pub(crate) fn root_location(&self) -> AxResult<axfs_ng_vfs::Location> {
+        self.topology.root_location()
+    }
+
+    fn register(namespace: &Arc<Self>) -> AxResult<()> {
+        let mut namespaces = MOUNT_NAMESPACE_REGISTRY.lock();
+        namespaces.retain(|_, entry| entry.strong_count() != 0);
+        namespaces.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        namespaces.insert(namespace.id(), Arc::downgrade(namespace));
+        Ok(())
+    }
+
+    /// Resolves the stable namespace ID exposed by statmount/listmount and
+    /// NS_GET_ID.  This is deliberately distinct from the nsfs inode number
+    /// used by `/proc/*/ns/mnt`.
+    pub(crate) fn lookup(id: u64) -> AxResult<Arc<Self>> {
+        MOUNT_NAMESPACE_REGISTRY
+            .lock()
+            .get(&id)
+            .and_then(Weak::upgrade)
+            .ok_or(AxError::NotFound)
+    }
+
+    /// Snapshot every live mount namespace while the caller owns the mount
+    /// namespace operation lock.  Propagation is a relationship between
+    /// mount instances, not merely between tasks in the current namespace;
+    /// keeping this lookup here prevents the mount layer from manufacturing a
+    /// second namespace registry.
+    pub(crate) fn live() -> AxResult<Vec<Arc<Self>>> {
+        let mut namespaces = MOUNT_NAMESPACE_REGISTRY.lock();
+        namespaces.retain(|_, entry| entry.strong_count() != 0);
+        let mut live = Vec::new();
+        live.try_reserve_exact(namespaces.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for entry in namespaces.values() {
+            if let Some(namespace) = entry.upgrade() {
+                live.push(namespace);
+            }
+        }
+        Ok(live)
+    }
+}
+
+impl Drop for MountNamespace {
+    fn drop(&mut self) {
+        crate::mounts::unregister_cloned_provider_mounts(&mut *self.provider_registrations.lock());
+    }
 }
 
 impl CgroupNamespace {
     pub(crate) fn try_new_root(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
-        Self::try_new(owner_user_ns)
+        Self::try_new(
+            owner_user_ns,
+            crate::pseudofs::cgroup::root_namespace_roots()?,
+        )
     }
 
-    fn try_new(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+    fn try_new(
+        owner_user_ns: Arc<UserNamespace>,
+        roots: crate::pseudofs::cgroup::CgroupNamespaceRoots,
+    ) -> AxResult<Arc<Self>> {
         let id = try_allocate_proc_namespace_id()?;
-        Arc::try_new(Self { id, owner_user_ns }).map_err(|_| AxError::NoMemory)
+        Arc::try_new(Self {
+            id,
+            owner_user_ns,
+            roots,
+        })
+        .map_err(|_| AxError::NoMemory)
     }
 
     pub(crate) fn try_fork(
-        self: &Arc<Self>,
+        _source: &Arc<Self>,
         owner_user_ns: Arc<UserNamespace>,
+        roots: crate::pseudofs::cgroup::CgroupNamespaceRoots,
     ) -> AxResult<Arc<Self>> {
-        Self::try_new(owner_user_ns)
+        // The new namespace root is selected from the caller's *current*
+        // membership, not inherited from `self`.  A task may have migrated
+        // after it entered this cgroup namespace, so copying `self.roots`
+        // would incorrectly expose the old subtree to CLONE_NEWCGROUP.
+        Self::try_new(owner_user_ns, roots)
     }
 
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
 
+    pub(crate) fn proc_inode(&self) -> u64 {
+        PROC_NS_INO_BASE + self.id.saturating_mul(8)
+    }
+
     pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
         &self.owner_user_ns
+    }
+
+    pub(crate) fn roots(&self) -> &crate::pseudofs::cgroup::CgroupNamespaceRoots {
+        &self.roots
     }
 }
 
@@ -711,21 +906,57 @@ pub(crate) struct PidNamespace {
     owner_user_ns: Arc<UserNamespace>,
 }
 
-/// Linux reserves PID 0 and uses a bounded positive PID domain. Keeping the
-/// bound below `i32::MAX` also preserves every syscall ABI conversion site.
-const PID_NAMESPACE_MAX_PID: Pid = 0x3fff_ffff;
+/// Linux's initial PID namespace starts with the upstream `PID_MAX_DEFAULT`.
+/// `pid_max` is an exclusive bound, so ordinary allocation uses
+/// `1..pid_max`.
+const PID_MAX_DEFAULT: Pid = 0x8000;
+
+/// x86_64 Linux v6.18's `PID_MAX_LIMIT`.  Child PID namespaces are created
+/// with this limit; the initial namespace may subsequently be constrained by
+/// its `pid_max` sysctl.
+const PID_MAX_LIMIT: Pid = 4 * 1024 * 1024;
+
+/// Linux keeps the low PID region available during the first allocation pass
+/// and restarts cyclic allocation from this point after reaching `pid_max`.
+const RESERVED_PIDS: Pid = 300;
+const PIDS_PER_CPU_DEFAULT: Pid = 1024;
+const PIDS_PER_CPU_MIN: Pid = 8;
+
+fn possible_cpu_count() -> Pid {
+    (axhal::cpu_num().max(1).min(PID_MAX_LIMIT as usize)) as Pid
+}
+
+fn pid_max_min() -> Pid {
+    (RESERVED_PIDS + 1).max(PIDS_PER_CPU_MIN.saturating_mul(possible_cpu_count()))
+}
+
+fn initial_pid_max() -> Pid {
+    PID_MAX_DEFAULT
+        .max(PIDS_PER_CPU_DEFAULT.saturating_mul(possible_cpu_count()))
+        .min(PID_MAX_LIMIT)
+}
 
 struct PidNamespacePids {
     by_global: HashMap<Pid, Pid>,
     by_local: HashMap<Pid, Pid>,
+    /// Exclusive local-PID ceiling for this particular namespace.
+    pid_max: Pid,
     next: Pid,
 }
 
 impl PidNamespacePids {
     fn try_new(init_pid: Option<Pid>) -> AxResult<Self> {
+        Self::try_new_with_pid_max(init_pid, PID_MAX_LIMIT)
+    }
+
+    fn try_new_with_pid_max(init_pid: Option<Pid>, pid_max: Pid) -> AxResult<Self> {
+        if !(pid_max_min()..=PID_MAX_LIMIT).contains(&pid_max) {
+            return Err(AxError::InvalidInput);
+        }
         let mut pids = Self {
             by_global: HashMap::new(),
             by_local: HashMap::new(),
+            pid_max,
             next: 1,
         };
         if let Some(init_pid) = init_pid {
@@ -736,7 +967,7 @@ impl PidNamespacePids {
     }
 
     fn try_insert(&mut self, global_pid: Pid, local_pid: Pid) -> AxResult<()> {
-        if local_pid == 0 || local_pid > PID_NAMESPACE_MAX_PID {
+        if !(1..self.pid_max).contains(&local_pid) {
             return Err(AxError::NoMemory);
         }
         self.by_global
@@ -757,27 +988,61 @@ impl PidNamespacePids {
         if self.by_global.contains_key(&global_pid) {
             return Ok(false);
         }
-        let first = self.next.max(1);
+        // A `pid_max` sysctl write does not reset Linux's IDR cursor.  If
+        // that cursor now lies beyond the new exclusive bound, the next
+        // cyclic allocation wraps through the post-reserved PID range.
+        let first = if self.next >= self.pid_max {
+            RESERVED_PIDS
+        } else {
+            self.next.max(1)
+        };
         let mut candidate = first;
         loop {
             if !self.by_local.contains_key(&candidate) {
                 self.try_insert(global_pid, candidate)?;
-                self.next = if candidate == PID_NAMESPACE_MAX_PID {
-                    1
-                } else {
-                    candidate + 1
-                };
+                // Preserve the actual cyclic cursor, including the exclusive
+                // bound itself.  A later `pid_max` increase must continue at
+                // that former bound rather than prematurely wrap to 300.
+                self.next = candidate + 1;
                 return Ok(true);
             }
-            candidate = if candidate == PID_NAMESPACE_MAX_PID {
-                1
+            candidate = if candidate + 1 == self.pid_max {
+                RESERVED_PIDS
             } else {
                 candidate + 1
             };
             if candidate == first {
-                return Err(AxError::NoMemory);
+                // Linux's PID allocator reports ID-space exhaustion as
+                // EAGAIN. Keep allocation failures from `try_insert` above
+                // as ENOMEM instead.
+                return Err(LinuxError::EAGAIN.into());
             }
         }
+    }
+
+    fn try_reserve_exact(&mut self, global_pid: Pid, local_pid: Pid) -> AxResult<bool> {
+        if !(1..self.pid_max).contains(&local_pid) {
+            return Err(AxError::InvalidInput);
+        }
+        if let Some(existing) = self.by_global.get(&global_pid) {
+            return (*existing == local_pid)
+                .then_some(false)
+                .ok_or(AxError::AlreadyExists);
+        }
+        self.try_insert(global_pid, local_pid)?;
+        Ok(true)
+    }
+
+    fn pid_max(&self) -> Pid {
+        self.pid_max
+    }
+
+    fn try_set_pid_max(&mut self, pid_max: Pid) -> AxResult<()> {
+        if !(pid_max_min()..=PID_MAX_LIMIT).contains(&pid_max) {
+            return Err(AxError::InvalidInput);
+        }
+        self.pid_max = pid_max;
+        Ok(())
     }
 
     fn release(&mut self, global_pid: Pid) {
@@ -839,10 +1104,18 @@ impl PidNamespace {
         owner_user_ns: Arc<UserNamespace>,
     ) -> AxResult<Arc<Self>> {
         let id = try_allocate_proc_namespace_id()?;
+        let nested = parent.is_some();
         Arc::try_new(Self {
             id,
             parent,
-            pids: SpinNoIrq::new(PidNamespacePids::try_new(init_pid)?),
+            pids: SpinNoIrq::new(PidNamespacePids::try_new_with_pid_max(
+                init_pid,
+                if nested {
+                    PID_MAX_LIMIT
+                } else {
+                    initial_pid_max()
+                },
+            )?),
             reaper_scope,
             owner_user_ns,
         })
@@ -855,6 +1128,17 @@ impl PidNamespace {
         owner_user_ns: Arc<UserNamespace>,
     ) -> AxResult<Arc<Self>> {
         Self::try_new(Some(self.clone()), Some(init_pid), None, owner_user_ns)
+    }
+
+    /// `unshare(CLONE_NEWPID)` changes only the PID namespace inherited by
+    /// future children.  The calling task remains in its current namespace,
+    /// so the deferred child namespace intentionally starts without PID 1.
+    pub(crate) fn try_fork_for_children(
+        self: &Arc<Self>,
+        owner_user_ns: Arc<UserNamespace>,
+        reaper_scope: Arc<ProcessReaperScope>,
+    ) -> AxResult<Arc<Self>> {
+        Self::try_new(Some(self.clone()), None, Some(reaper_scope), owner_user_ns)
     }
 
     pub(crate) fn try_fork_with_reaper_scope(
@@ -879,6 +1163,40 @@ impl PidNamespace {
         self.reaper_scope.clone()
     }
 
+    pub(crate) fn has_no_init(&self) -> bool {
+        self.pids.lock().by_global.is_empty()
+    }
+
+    /// Linux disables PID allocation when a namespace's child reaper exits.
+    /// The process core retains the scope-init identity through zombie/reap,
+    /// so its liveness is the authoritative distinction between a newly
+    /// created (not-yet-bound) namespace and a dead namespace.  The latter
+    /// deliberately reports ENOMEM, matching alloc_pid()'s long-standing
+    /// externally visible result rather than leaking a core NotLive detail.
+    fn child_reaper_allows_new_processes(&self) -> bool {
+        match self.reaper_scope() {
+            None => true,
+            Some(scope) => match scope.init_process() {
+                // A CLONE_NEWPID/unshare first child has reserved a namespace
+                // but has not yet atomically published its scope init.
+                None => true,
+                Some(init) => init.is_live(),
+            },
+        }
+    }
+
+    /// The namespace-local, exclusive PID allocation bound.
+    pub(crate) fn pid_max(&self) -> Pid {
+        self.pids.lock().pid_max()
+    }
+
+    /// Applies a validated namespace-local `pid_max` sysctl value. Existing
+    /// bindings remain valid when the ceiling is lowered, as on Linux; only
+    /// future automatic or explicit allocations are constrained by it.
+    pub(crate) fn try_set_pid_max(&self, pid_max: Pid) -> AxResult<()> {
+        self.pids.lock().try_set_pid_max(pid_max)
+    }
+
     /// Reserves one local PID in this namespace and all of its ancestors.
     /// The returned guard must be committed only once the child has reached
     /// process publication; otherwise it restores every newly allocated slot.
@@ -886,6 +1204,9 @@ impl PidNamespace {
         self: &Arc<Self>,
         global_pid: Pid,
     ) -> AxResult<PidNamespaceReservation> {
+        if !self.child_reaper_allows_new_processes() {
+            return Err(AxError::NoMemory);
+        }
         let parent = self
             .parent()
             .map(|parent| parent.reserve_process(global_pid))
@@ -899,6 +1220,85 @@ impl PidNamespace {
             parent,
             committed: false,
         })
+    }
+
+    /// Reserves a clone3 `set_tid` vector from this namespace out through its
+    /// ancestors. The vector is ordered innermost-to-outermost, and the guard
+    /// releases every acquired slot if any later namespace rejects it.
+    pub(crate) fn reserve_process_with_ids(
+        self: &Arc<Self>,
+        global_pid: Pid,
+        requested: &[Pid],
+        actor: &Cred,
+    ) -> AxResult<PidNamespaceReservation> {
+        if !self.child_reaper_allows_new_processes() {
+            return Err(AxError::NoMemory);
+        }
+        fn depth(namespace: &PidNamespace) -> usize {
+            namespace.parent().map_or(1, |parent| depth(&parent) + 1)
+        }
+        if requested.len() > depth(self) {
+            return Err(AxError::InvalidInput);
+        }
+
+        fn reserve(
+            namespace: &Arc<PidNamespace>,
+            global_pid: Pid,
+            requested: &[Pid],
+            actor: &Cred,
+            level: usize,
+        ) -> AxResult<PidNamespaceReservation> {
+            let allocated_here = if let Some(&local_pid) = requested.get(level) {
+                {
+                    let pids = namespace.pids.lock();
+                    if !(1..pids.pid_max()).contains(&local_pid) {
+                        return Err(AxError::InvalidInput);
+                    }
+                    // A namespace can only receive a non-init PID after its
+                    // PID 1 exists. Check this before privilege so malformed
+                    // namespace state does not become an authorization oracle.
+                    if local_pid != 1 && !pids.by_local.contains_key(&1) {
+                        return Err(AxError::InvalidInput);
+                    }
+                }
+                if !crate::task::ns_capable(
+                    actor,
+                    namespace.owner_user_ns(),
+                    linux_raw_sys::general::CAP_CHECKPOINT_RESTORE,
+                ) && !crate::task::ns_capable(
+                    actor,
+                    namespace.owner_user_ns(),
+                    linux_raw_sys::general::CAP_SYS_ADMIN,
+                ) {
+                    return Err(AxError::OperationNotPermitted);
+                }
+                namespace
+                    .pids
+                    .lock()
+                    .try_reserve_exact(global_pid, local_pid)?
+            } else {
+                namespace.pids.lock().try_reserve(global_pid)?
+            };
+            let mut reservation = PidNamespaceReservation {
+                namespace: namespace.clone(),
+                global_pid,
+                allocated_here,
+                parent: None,
+                committed: false,
+            };
+            if let Some(parent) = namespace.parent() {
+                reservation.parent = Some(Box::new(reserve(
+                    &parent,
+                    global_pid,
+                    requested,
+                    actor,
+                    level + 1,
+                )?));
+            }
+            Ok(reservation)
+        }
+
+        reserve(self, global_pid, requested, actor, 0)
     }
 
     /// Releases the namespace PID binding after its final identity owner has
@@ -1352,28 +1752,15 @@ impl UtsState {
 }
 
 pub(crate) struct UtsNamespace {
+    id: u64,
     state: SpinNoIrq<UtsState>,
     owner_user_ns: Arc<UserNamespace>,
-}
-
-/// Prepared UTS namespace pointer replacement.
-pub(crate) struct PreparedUtsNamespaceReplacement {
-    uts_ns: Arc<UtsNamespace>,
-}
-
-impl PreparedUtsNamespaceReplacement {
-    pub(crate) fn commit(self, process: &ProcessData) {
-        let Self { uts_ns } = self;
-        let mut current = process.uts_ns.write();
-        let old_uts = core::mem::replace(&mut *current, uts_ns);
-        drop(current);
-        drop(old_uts);
-    }
 }
 
 impl UtsNamespace {
     pub(crate) fn try_new_root(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
         Arc::try_new(Self {
+            id: try_allocate_proc_namespace_id()?,
             state: SpinNoIrq::new(init_uts_state()),
             owner_user_ns,
         })
@@ -1383,6 +1770,7 @@ impl UtsNamespace {
     pub(crate) fn try_fork(&self, owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
         let state = *self.state.lock();
         Arc::try_new(Self {
+            id: try_allocate_proc_namespace_id()?,
             state: SpinNoIrq::new(state),
             owner_user_ns,
         })
@@ -1391,6 +1779,13 @@ impl UtsNamespace {
 
     pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
         &self.owner_user_ns
+    }
+
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
+    }
+    pub(crate) fn proc_inode(&self) -> u64 {
+        PROC_NS_INO_BASE + self.id.saturating_mul(8)
     }
 
     pub(crate) fn nodename(&self) -> AxResult<Vec<u8>> {
@@ -1430,6 +1825,7 @@ struct TimeNamespaceState {
 }
 
 pub(crate) struct TimeNamespace {
+    id: u64,
     state: SpinNoIrq<TimeNamespaceState>,
     owner_user_ns: Arc<UserNamespace>,
 }
@@ -1437,6 +1833,7 @@ pub(crate) struct TimeNamespace {
 impl TimeNamespace {
     pub(crate) fn try_new_root(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
         Arc::try_new(Self {
+            id: try_allocate_proc_namespace_id()?,
             state: SpinNoIrq::new(TimeNamespaceState::default()),
             owner_user_ns,
         })
@@ -1446,6 +1843,7 @@ impl TimeNamespace {
     pub(crate) fn try_fork(&self, owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
         let state = *self.state.lock();
         Arc::try_new(Self {
+            id: try_allocate_proc_namespace_id()?,
             state: SpinNoIrq::new(state),
             owner_user_ns,
         })
@@ -1454,6 +1852,13 @@ impl TimeNamespace {
 
     pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
         &self.owner_user_ns
+    }
+
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
+    }
+    pub(crate) fn proc_inode(&self) -> u64 {
+        PROC_NS_INO_BASE + self.id.saturating_mul(8)
     }
 
     fn offset_ns(&self, boottime: bool) -> i64 {
@@ -1504,6 +1909,7 @@ impl TimeNamespace {
 /// belongs to this Linux-ABI object so authority remains bound to the object
 /// even after the creating process exits or a socket crosses processes.
 pub(crate) struct NetworkNamespace {
+    id: u64,
     stack: Arc<NetStack>,
     owner_user_ns: Arc<UserNamespace>,
 }
@@ -1513,11 +1919,112 @@ impl NetworkNamespace {
         stack: Arc<NetStack>,
         owner_user_ns: Arc<UserNamespace>,
     ) -> AxResult<Arc<Self>> {
-        Arc::try_new(Self {
+        let namespace = Arc::try_new(Self {
+            id: try_allocate_proc_namespace_id()?,
             stack,
             owner_user_ns,
         })
-        .map_err(|_| AxError::NoMemory)
+        .map_err(|_| AxError::NoMemory)?;
+        // The pre-protocol seam is the XDP ingress point: a socket binding is
+        // never consulted here.  Only a program attached to this exact
+        // namespace/interface can consume the frame through a typed XSKMAP
+        // redirect target.
+        let weak = Arc::downgrade(&namespace);
+        namespace
+            .stack
+            .set_pre_protocol_hook(Some(Arc::new(move |ifindex, packet| {
+                let namespace = weak.upgrade().ok_or(AxError::BadState)?;
+                let Some(program) = crate::bpf::xdp_program_snapshot(&namespace, ifindex) else {
+                    return Ok(PacketAction::Pass);
+                };
+                let terminal = program.run_xdp(
+                    crate::bpf::helpers::XdpContext {
+                        data: 0,
+                        data_end: packet.len().try_into().unwrap_or(u32::MAX),
+                        data_meta: 0,
+                        ingress_ifindex: ifindex,
+                        rx_queue_index: 0,
+                        egress_ifindex: 0,
+                    },
+                    packet,
+                )?;
+                match terminal {
+                    crate::bpf::helpers::XdpExecutionResult::Pass => Ok(PacketAction::Pass),
+                    crate::bpf::helpers::XdpExecutionResult::Redirect(redirect) => {
+                        // The endpoint owns a retained UMEM capability; router
+                        // bytes are copied only after the program selected this
+                        // exact XSKMAP slot.  A full/invalid target is a failed
+                        // redirect, never a fallback to normal protocol input.
+                        if redirect.target.accepts_xdp_redirect(&namespace, ifindex)
+                            && redirect.target.redirect_packet(packet, 0).unwrap_or(false)
+                        {
+                            Ok(PacketAction::RedirectConsumed)
+                        } else {
+                            match redirect.flags & 0x3 {
+                                2 => Ok(PacketAction::Pass),
+                                3 => Ok(PacketAction::Tx),
+                                _ => Ok(PacketAction::Drop),
+                            }
+                        }
+                    }
+                    crate::bpf::helpers::XdpExecutionResult::Tx => Ok(PacketAction::Tx),
+                    crate::bpf::helpers::XdpExecutionResult::Aborted
+                    | crate::bpf::helpers::XdpExecutionResult::Drop
+                    | crate::bpf::helpers::XdpExecutionResult::RedirectMiss
+                    | crate::bpf::helpers::XdpExecutionResult::Invalid(_) => Ok(PacketAction::Drop),
+                }
+            })));
+        let weak = Arc::downgrade(&namespace);
+        namespace
+            .stack
+            .set_packet_hook(Some(Arc::new(move |context: &PacketContext, packet| {
+                let namespace = weak.upgrade().ok_or(AxError::BadState)?;
+                let hook = match context.point {
+                    PacketHookPoint::Prerouting => crate::file::netlink::NftHook::Prerouting,
+                    PacketHookPoint::Input => crate::file::netlink::NftHook::Input,
+                    PacketHookPoint::Forward => crate::file::netlink::NftHook::Forward,
+                    PacketHookPoint::LocalOutput => crate::file::netlink::NftHook::Output,
+                    PacketHookPoint::Postrouting => crate::file::netlink::NftHook::Postrouting,
+                };
+                let ipt_hook = match context.point {
+                    PacketHookPoint::Prerouting => 0,
+                    PacketHookPoint::Input => 1,
+                    PacketHookPoint::Forward => 2,
+                    PacketHookPoint::LocalOutput => 3,
+                    PacketHookPoint::Postrouting => 4,
+                };
+                crate::syscall::iptables_hook_verdict(&namespace, ipt_hook)?;
+                // `nft_packet_hook` owns the ordered NF/BPF traversal.  Keeping
+                // BPF dispatch there prevents a namespace hook from executing a
+                // mutating program twice at one policy seam.
+                crate::file::netlink::nft_packet_hook(&namespace, hook, packet)?;
+                Ok(PacketAction::Pass)
+            })));
+        #[cfg(feature = "bpf")]
+        {
+            let weak = Arc::downgrade(&namespace);
+            namespace
+                .stack
+                .set_packet_defrag_query(Some(Arc::new(move |point, packet| {
+                    let Some(namespace) = weak.upgrade() else {
+                        return false;
+                    };
+                    let hook = match point {
+                        // Linux's BPF netfilter IP_DEFRAG is meaningful before an
+                        // ingress NF hook; other seams already receive a complete
+                        // local/forwarded packet in this stack.
+                        PacketHookPoint::Prerouting => crate::file::bpf::BpfNetworkHook::Prerouting,
+                        PacketHookPoint::Input => crate::file::bpf::BpfNetworkHook::Input,
+                        PacketHookPoint::Forward => crate::file::bpf::BpfNetworkHook::Forward,
+                        PacketHookPoint::LocalOutput => crate::file::bpf::BpfNetworkHook::Output,
+                        PacketHookPoint::Postrouting => {
+                            crate::file::bpf::BpfNetworkHook::Postrouting
+                        }
+                    };
+                    crate::bpf::network_packet_defrag_required(&namespace, hook, packet)
+                })));
+        }
+        Ok(namespace)
     }
 
     pub(crate) fn try_new_loopback_only(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
@@ -1530,6 +2037,197 @@ impl NetworkNamespace {
 
     pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
         &self.owner_user_ns
+    }
+
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
+    }
+    pub(crate) fn proc_inode(&self) -> u64 {
+        PROC_NS_INO_BASE + self.id.saturating_mul(8)
+    }
+}
+
+/// The complete Linux namespace attachment of one task.
+///
+/// Namespace-changing syscalls construct a complete replacement first and
+/// exchange it only at commit, so observers cannot see (for example) a new
+/// user namespace paired with an old IPC or mount namespace.
+#[derive(Clone)]
+pub(crate) struct NamespaceProxy {
+    user: Arc<UserNamespace>,
+    pid: Arc<PidNamespace>,
+    pid_for_children: Arc<PidNamespace>,
+    mount: Arc<MountNamespace>,
+    ipc: Arc<IpcNamespace>,
+    net: Arc<NetworkNamespace>,
+    cgroup: Arc<CgroupNamespace>,
+    uts: Arc<UtsNamespace>,
+    time: Arc<TimeNamespace>,
+    time_for_children: Arc<TimeNamespace>,
+}
+
+impl NamespaceProxy {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        user: Arc<UserNamespace>,
+        pid: Arc<PidNamespace>,
+        mount: Arc<MountNamespace>,
+        ipc: Arc<IpcNamespace>,
+        net: Arc<NetworkNamespace>,
+        cgroup: Arc<CgroupNamespace>,
+        uts: Arc<UtsNamespace>,
+        time: Arc<TimeNamespace>,
+    ) -> AxResult<Self> {
+        // Namespace objects retain their own owner.  Mixed-owner bundles are
+        // valid: CLONE_NEWUSER changes the caller's credential namespace
+        // while inherited mount/net/ipc objects remain owned by the namespace
+        // which created them.
+        Ok(Self {
+            user,
+            pid: pid.clone(),
+            pid_for_children: pid,
+            mount,
+            ipc,
+            net,
+            cgroup,
+            uts,
+            time: time.clone(),
+            time_for_children: time,
+        })
+    }
+
+    pub(crate) fn user(&self) -> Arc<UserNamespace> {
+        self.user.clone()
+    }
+    pub(crate) fn pid(&self) -> Arc<PidNamespace> {
+        self.pid.clone()
+    }
+    pub(crate) fn pid_for_children(&self) -> Arc<PidNamespace> {
+        self.pid_for_children.clone()
+    }
+    pub(crate) fn mount(&self) -> Arc<MountNamespace> {
+        self.mount.clone()
+    }
+    pub(crate) fn ipc(&self) -> Arc<IpcNamespace> {
+        self.ipc.clone()
+    }
+    pub(crate) fn net(&self) -> Arc<NetworkNamespace> {
+        self.net.clone()
+    }
+    pub(crate) fn cgroup(&self) -> Arc<CgroupNamespace> {
+        self.cgroup.clone()
+    }
+    pub(crate) fn uts(&self) -> Arc<UtsNamespace> {
+        self.uts.clone()
+    }
+    pub(crate) fn time(&self) -> Arc<TimeNamespace> {
+        self.time.clone()
+    }
+    pub(crate) fn time_for_children(&self) -> Arc<TimeNamespace> {
+        self.time_for_children.clone()
+    }
+
+    pub(crate) fn replace_uts(&mut self, value: Arc<UtsNamespace>) {
+        self.uts = value;
+    }
+    pub(crate) fn replace_user(&mut self, value: Arc<UserNamespace>) {
+        self.user = value;
+    }
+    pub(crate) fn replace_pid(&mut self, value: Arc<PidNamespace>) {
+        self.pid = value;
+    }
+    pub(crate) fn replace_pid_for_children(&mut self, value: Arc<PidNamespace>) {
+        self.pid_for_children = value;
+    }
+    pub(crate) fn replace_time(&mut self, value: Arc<TimeNamespace>) {
+        self.time = value.clone();
+        self.time_for_children = value;
+    }
+    pub(crate) fn replace_time_for_children(&mut self, value: Arc<TimeNamespace>) {
+        self.time_for_children = value;
+    }
+    pub(crate) fn replace_mount(&mut self, value: Arc<MountNamespace>) {
+        self.mount = value;
+    }
+    pub(crate) fn replace_ipc(&mut self, value: Arc<IpcNamespace>) {
+        self.ipc = value;
+    }
+    pub(crate) fn replace_net(&mut self, value: Arc<NetworkNamespace>) {
+        self.net = value;
+    }
+    pub(crate) fn replace_cgroup(&mut self, value: Arc<CgroupNamespace>) {
+        self.cgroup = value;
+    }
+}
+
+/// Prepared namespace aggregate exchange. Every allocation and authority
+/// check happens before this token is created; it is committed into the
+/// calling task's namespace slot.
+pub(crate) struct PreparedNamespaceProxyReplacement {
+    pub(crate) replacement: NamespaceProxy,
+}
+
+/// Task-owned Linux `sem_undo` list. `CLONE_SYSVSEM` shares this Arc across
+/// task owners; ordinary clone snapshots it. The final owner applies its
+/// adjustments to the IPC namespace that owns the semaphore arrays.
+pub(crate) struct SemUndoState {
+    ipc_ns: Arc<IpcNamespace>,
+    undo: Mutex<Option<SemUndo>>,
+}
+
+impl SemUndoState {
+    pub(crate) fn try_new(ipc_ns: Arc<IpcNamespace>) -> AxResult<Arc<Self>> {
+        Arc::try_new(Self {
+            ipc_ns,
+            undo: Mutex::new(Some(SemUndo::new())),
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
+    pub(crate) fn try_clone_for(
+        ipc_ns: Arc<IpcNamespace>,
+        source: &Arc<Self>,
+    ) -> AxResult<Arc<Self>> {
+        let undo = source
+            .undo
+            .lock()
+            .as_ref()
+            .map(SemUndo::try_clone)
+            .transpose()?;
+        Arc::try_new(Self {
+            ipc_ns,
+            undo: Mutex::new(undo),
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
+    pub(crate) fn undo(&self) -> &Mutex<Option<SemUndo>> {
+        &self.undo
+    }
+
+    pub(crate) fn apply_on_final_exit(&self) {
+        let Some(mut undo) = self.undo.lock().take() else {
+            return;
+        };
+        apply_sem_undo(self.ipc_ns.sem_manager(), &mut undo);
+    }
+}
+
+impl PreparedNamespaceProxyReplacement {
+    pub(crate) fn commit(self, thread: &super::thread::Thread) {
+        let old = {
+            let _publication = super::fs_context_publication();
+            self.commit_under_publication(thread)
+        };
+        drop(old);
+    }
+
+    /// Exchanges only the namespace pointer while the caller already owns the
+    /// publication gate.  Resource retirement is intentionally returned to
+    /// the caller: dropping a proxy can cascade into VFS/IPC teardown and
+    /// must never occur inside the IRQ/preemption-off publication region.
+    pub(crate) fn commit_under_publication(self, thread: &super::thread::Thread) -> NamespaceProxy {
+        core::mem::replace(&mut *thread.namespaces.lock(), self.replacement)
     }
 }
 
@@ -1992,7 +2690,14 @@ impl GroupLeaderIdentityBinding {
     /// Seeds the not-yet-bound initial process identity. The first thread is
     /// constructed before its private endpoint exists, so no live identity
     /// can race this one-time initialization.
-    fn seed_scheduler_state(&self, state: SchedState, reset_on_fork: bool, version: u64) {
+    fn seed_scheduler_state(
+        &self,
+        state: SchedState,
+        reset_on_fork: bool,
+        uclamp: axtask::UclampRequest,
+        utilization_bounds: axtask::UtilizationBounds,
+        version: u64,
+    ) {
         let mut snapshot = self.scheduler.lock();
         debug_assert_eq!(snapshot.identity_epoch, 0);
         // Serial numbers wrap. A candidate is newer when it lies less than
@@ -2002,6 +2707,12 @@ impl GroupLeaderIdentityBinding {
                 identity_epoch: 0,
                 version,
                 reset_on_fork,
+                uclamp_min: uclamp.minimum,
+                uclamp_max: uclamp.maximum,
+                uclamp_min_user_defined: uclamp.minimum_user_defined,
+                uclamp_max_user_defined: uclamp.maximum_user_defined,
+                uclamp_effective_min: utilization_bounds.minimum as u16,
+                uclamp_effective_max: utilization_bounds.maximum as u16,
                 ..state.into()
             };
         }
@@ -2016,7 +2727,7 @@ impl GroupLeaderIdentityBinding {
         registration_tid: Pid,
         token: u64,
         task: &AxTaskRef,
-        commit: TaskSchedCommit,
+        commit: TaskSchedulingSnapshot,
     ) {
         let current = self.current.lock();
         let signal = self.signal.lock();
@@ -2033,7 +2744,7 @@ impl GroupLeaderIdentityBinding {
             identity.scheduler_identity_token,
             token,
             commit,
-            scheduler_state_snapshot(task).ok(),
+            task_scheduling_snapshot(task).ok(),
         ) {
             return;
         }
@@ -2043,7 +2754,13 @@ impl GroupLeaderIdentityBinding {
             *snapshot = ZombieSchedulerSnapshot {
                 identity_epoch: epoch,
                 version: commit.version,
-                reset_on_fork: commit.reset_on_fork,
+                reset_on_fork: commit.reset_on_spawn,
+                uclamp_min: commit.uclamp.minimum,
+                uclamp_max: commit.uclamp.maximum,
+                uclamp_min_user_defined: commit.uclamp.minimum_user_defined,
+                uclamp_max_user_defined: commit.uclamp.maximum_user_defined,
+                uclamp_effective_min: commit.utilization_bounds.minimum as u16,
+                uclamp_effective_max: commit.utilization_bounds.maximum as u16,
                 ..commit.state.into()
             };
         }
@@ -2079,7 +2796,7 @@ impl GroupLeaderIdentityBinding {
         credential: Arc<CredentialSlot>,
         signal: Option<GroupLeaderSignalIdentity>,
         prepared: Option<PreparedCred<'a>>,
-        executor_scheduler: Option<(SchedState, u64, bool)>,
+        executor_scheduler: Option<TaskSchedulingSnapshot>,
     ) -> GroupLeaderCommit<'a> {
         let signal = signal.map(|mut signal| {
             signal.pid_ns = self.pid_ns.clone();
@@ -2119,12 +2836,18 @@ impl GroupLeaderIdentityBinding {
                 .and_then(|signal| signal.as_mut())
                 .expect("replaced leader endpoint must be installed")
                 .scheduler_identity_token = *token;
-            if let Some((state, version, reset_on_fork)) = executor_scheduler {
+            if let Some(commit) = executor_scheduler {
                 *self.scheduler.lock() = ZombieSchedulerSnapshot {
                     identity_epoch: *epoch,
-                    version,
-                    reset_on_fork,
-                    ..state.into()
+                    version: commit.version,
+                    reset_on_fork: commit.reset_on_spawn,
+                    uclamp_min: commit.uclamp.minimum,
+                    uclamp_max: commit.uclamp.maximum,
+                    uclamp_min_user_defined: commit.uclamp.minimum_user_defined,
+                    uclamp_max_user_defined: commit.uclamp.maximum_user_defined,
+                    uclamp_effective_min: commit.utilization_bounds.minimum as u16,
+                    uclamp_effective_max: commit.utilization_bounds.maximum as u16,
+                    ..commit.state.into()
                 };
             }
         }
@@ -2149,6 +2872,53 @@ impl GroupLeaderIdentityBinding {
 pub(crate) enum Dumpability {
     NotDumpable  = 0,
     UserDumpable = 1,
+}
+
+/// The ABI-visible portion of Linux's `mm_struct`.  This is the sole owner of
+/// the `/proc/<pid>/stat` image layout and of PR_SET_MM updates; `brk` uses the
+/// same lock through `ProcessData`, so metadata can never publish a heap end
+/// that differs from the address-space operation which established it.
+#[derive(Clone, Debug)]
+pub(crate) struct ProcessMmLayout {
+    pub start_code: usize,
+    pub end_code: usize,
+    pub start_data: usize,
+    pub end_data: usize,
+    pub start_brk: usize,
+    pub brk: usize,
+    pub start_stack: usize,
+    pub arg_start: usize,
+    pub arg_end: usize,
+    pub env_start: usize,
+    pub env_end: usize,
+    pub auxv: Vec<u8>,
+    // These describe the real initial anonymous heap VMA installed by exec.
+    // PR_SET_MM_START_BRK changes the ABI metadata above but never retargets a
+    // live VMA behind the memory manager's back.
+    heap_mapping_base: usize,
+    heap_mapping_initial_end: usize,
+}
+
+impl ProcessMmLayout {
+    fn initial() -> Self {
+        let start_brk = crate::config::USER_HEAP_BASE;
+        Self {
+            start_code: 0,
+            end_code: 0,
+            start_data: start_brk,
+            end_data: start_brk,
+            start_brk,
+            brk: start_brk + crate::config::USER_HEAP_SIZE,
+            start_stack: crate::config::USER_STACK_TOP,
+            arg_start: 0,
+            arg_end: 0,
+            env_start: 0,
+            env_end: 0,
+            auxv: Vec::new(),
+            heap_mapping_base: start_brk,
+            heap_mapping_initial_end: start_brk + crate::config::USER_HEAP_SIZE,
+        }
+    }
 }
 
 impl TryFrom<usize> for Dumpability {
@@ -2389,7 +3159,7 @@ fn replace_process_image_with_group_handoff<'a, A>(
     credential: Arc<CredentialSlot>,
     signal: Option<GroupLeaderSignalIdentity>,
     prepared: Option<PreparedCred<'a>>,
-    executor_scheduler: Option<(SchedState, u64, bool)>,
+    executor_scheduler: Option<TaskSchedulingSnapshot>,
     new_image: ProcessImageBinding<A>,
     finish_image_publication: impl FnOnce(),
 ) -> (GroupLeaderCommit<'a>, ProcessImageBinding<A>) {
@@ -2633,11 +3403,11 @@ pub struct ProcessData {
     /// queued-signal accounting, and exec handoff behavior.
     group_leader_identity: GroupLeaderIdentityBinding,
     /// The executable path
-    pub exe_path: RwLock<String>,
+    pub exe_path: RwLock<FsPathBuf>,
     /// The inode currently held busy as this process image.
     pub(crate) executable: SpinNoIrq<Option<ExecutableKey>>,
     /// The command line arguments
-    pub cmdline: RwLock<Arc<Vec<String>>>,
+    pub cmdline: RwLock<Arc<Vec<Vec<u8>>>>,
     /// Realtime process creation timestamp, in seconds.
     start_realtime_sec: u64,
     /// Monotonic process creation timestamp, in nanoseconds.
@@ -2653,9 +3423,8 @@ pub struct ProcessData {
     pub scope: RwLock<Scope>,
     /// Real empty files table prepared at process creation for final exit swap.
     exit_fd_table: Arc<FdTable>,
-    /// The user heap top
-    heap_top: AtomicUsize,
-    heap_base: AtomicUsize,
+    /// Authoritative Linux ABI memory layout. See [`ProcessMmLayout`].
+    mm_layout: RwLock<ProcessMmLayout>,
 
     /// The resource limits
     pub rlim: RwLock<Rlimits>,
@@ -2685,6 +3454,10 @@ pub struct ProcessData {
     timerslack_current_ns: AtomicUsize,
     /// Default timer slack in nanoseconds, used when PR_SET_TIMERSLACK is 0.
     timerslack_default_ns: AtomicUsize,
+    /// `PR_SET_MDWE` is an mm property, not a policy hint. Keeping it with
+    /// the address-space owner makes every thread sharing this mm observe the
+    /// same execute-gain prohibition.
+    mdwe: AtomicU8,
     /// POSIX interval timers created by this process.
     pub(crate) posix_timers: SpinNoIrq<Vec<Option<PosixTimer>>>,
     /// Process-wide `setitimer(2)` state. Real-time alarm actions and CPU-time
@@ -2723,6 +3496,9 @@ pub struct ProcessData {
     /// publication out of IRQ-off context-switch accounting.
     pub(crate) process_itimer_work_queued: AtomicBool,
     pub(crate) process_itimer_work_node: ProcessITimerWorkNode,
+    /// Preallocated RCU-published reverse subscriptions for foreign encoded
+    /// CPU-clock POSIX timers targeting this process.
+    pub(crate) foreign_cpu_timer_subscribers: ForeignCpuTimerSubscriberPool,
 
     /// CPU time accumulated from sibling threads that have already exited.
     pub(in crate::task) exited_threads_usage: AtomicTaskUsage,
@@ -2735,6 +3511,11 @@ pub struct ProcessData {
 
     /// Job-control stop state shared by all threads in the process.
     job_ctl: SpinNoIrq<JobControlState>,
+    /// Cgroup freezer state is intentionally independent of job control and
+    /// ptrace stops.  A cgroup thaw must never manufacture SIGCONT-visible
+    /// state or resume a process which was stopped for another reason.
+    cgroup_freeze_requested: AtomicBool,
+    cgroup_frozen_threads: AtomicUsize,
     /// ptrace ownership and options shared by all threads in the process.
     ptrace_ctl: SpinNoIrq<PtraceControlState>,
     /// Sleepable outer gate for ptrace relationship actions.
@@ -2757,18 +3538,15 @@ pub struct ProcessData {
     /// Woken when a vfork child releases the parent.
     pub vfork_event: Arc<PollSet>,
 
-    /// The network namespace (network stack) for this process.
-    pub(crate) net_ns: Arc<NetworkNamespace>,
-    /// Lightweight cgroup namespace identity for cgroup.procs open-time checks.
-    cgroup_ns: Arc<CgroupNamespace>,
-    /// Lightweight PID namespace identity for procfs namespace fd ABI.
-    pid_ns: Arc<PidNamespace>,
-    /// The UTS namespace for this process.
-    uts_ns: RwLock<Arc<UtsNamespace>>,
-    /// The time namespace visible to this process.
-    time_ns: RwLock<Arc<TimeNamespace>>,
-    /// The time namespace inherited by children created after unshare/setns.
-    time_ns_for_children: RwLock<Arc<TimeNamespace>>,
+    /// Group-leader namespace snapshot used only while constructing the first
+    /// task and by process-scoped lifecycle records.  Live namespace ownership
+    /// is task-local in `Thread::namespaces`; do not use this for current-task
+    /// lookup or namespace-changing syscalls.
+    namespaces: RwLock<NamespaceProxy>,
+    /// IPC namespaces in which this process has installed a process-wide SHM
+    /// attachment or mq_notify registration. A registering thread may switch
+    /// namespace or exit before final process teardown.
+    touched_ipc_namespaces: SpinNoIrq<Vec<Arc<IpcNamespace>>>,
 }
 
 /// Composite outer gate for ptrace relationship publication.
@@ -3130,20 +3908,16 @@ impl ProcessData {
         proc: Arc<Process>,
         prepared_zombie_snapshot: PreparedZombieSnapshot,
         group_leader_credential: Arc<CredentialSlot>,
-        exe_path: String,
+        exe_path: FsPathBuf,
         executable: Option<ExecutableKey>,
-        cmdline: Arc<Vec<String>>,
+        cmdline: Arc<Vec<Vec<u8>>>,
         aspace: Arc<Mutex<AddrSpace>>,
         access_state: Arc<ProcessAccessState>,
         scope: Scope,
         exit_fd_table: Arc<FdTable>,
         signal_actions: Arc<SharedSignalActions>,
         exit_signal: Option<Signo>,
-        net_ns: Arc<NetworkNamespace>,
-        cgroup_ns: Arc<CgroupNamespace>,
-        pid_ns: Arc<PidNamespace>,
-        uts_ns: Arc<UtsNamespace>,
-        time_ns: Arc<TimeNamespace>,
+        namespaces: NamespaceProxy,
     ) -> AxResult<Arc<Self>> {
         struct ExecutableRollback(Option<ExecutableKey>);
 
@@ -3169,8 +3943,13 @@ impl ProcessData {
         let vfork_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let group_leader_identity = GroupLeaderIdentityBinding::try_new_with_pid_ns(
             group_leader_credential,
-            Some(pid_ns.clone()),
+            Some(namespaces.pid()),
         )?;
+        let mut touched_ipc_namespaces = Vec::new();
+        touched_ipc_namespaces
+            .try_reserve_exact(1)
+            .map_err(|_| AxError::NoMemory)?;
+        touched_ipc_namespaces.push(namespaces.ipc());
         let image_tlb_state = {
             let image = aspace.lock();
             image.merge_resident_highwater(image.resident_user_bytes() as u64 / 1024);
@@ -3193,10 +3972,7 @@ impl ProcessData {
             image_tlb_state: RwLock::new(image_tlb_state),
             scope: RwLock::new(scope),
             exit_fd_table,
-            heap_top: AtomicUsize::new(
-                crate::config::USER_HEAP_BASE + crate::config::USER_HEAP_SIZE,
-            ),
-            heap_base: AtomicUsize::new(crate::config::USER_HEAP_BASE),
+            mm_layout: RwLock::new(ProcessMmLayout::initial()),
 
             rlim: RwLock::default(),
 
@@ -3214,6 +3990,7 @@ impl ProcessData {
             mempolicy: SpinNoIrq::new(MempolicyState::default()),
             timerslack_current_ns: AtomicUsize::new(50_000),
             timerslack_default_ns: AtomicUsize::new(50_000),
+            mdwe: AtomicU8::new(0),
             posix_timers: SpinNoIrq::new(Vec::new()),
             process_itimers: SpinNoIrq::new(ProcessITimers::new()),
             process_cpu_total_ns: AtomicU64::new(0),
@@ -3230,12 +4007,15 @@ impl ProcessData {
             process_itimer_work_owner_cpu: AtomicUsize::new(0),
             process_itimer_work_queued: AtomicBool::new(false),
             process_itimer_work_node: ProcessITimerWorkNode::new(),
+            foreign_cpu_timer_subscribers: ForeignCpuTimerSubscriberPool::new(),
             exited_threads_usage: AtomicTaskUsage::new(),
             usage_transition_epoch: AtomicU64::new(0),
             waited_children_usage: AtomicTaskUsage::new(),
             wait_lock: Mutex::new(()),
 
             job_ctl: SpinNoIrq::new(JobControlState::default()),
+            cgroup_freeze_requested: AtomicBool::new(false),
+            cgroup_frozen_threads: AtomicUsize::new(0),
             ptrace_ctl: SpinNoIrq::new(PtraceControlState::default()),
             ptrace_actions: Mutex::new(()),
             ptrace_signal: Mutex::new(None),
@@ -3245,12 +4025,8 @@ impl ProcessData {
             stop_event,
             vfork_event,
 
-            net_ns,
-            cgroup_ns,
-            pid_ns,
-            uts_ns: RwLock::new(uts_ns),
-            time_ns: RwLock::new(time_ns.clone()),
-            time_ns_for_children: RwLock::new(time_ns),
+            namespaces: RwLock::new(namespaces),
+            touched_ipc_namespaces: SpinNoIrq::new(touched_ipc_namespaces),
         };
         executable_rollback.0 = None;
         let data = Arc::try_new(data).map_err(|_| AxError::NoMemory)?;
@@ -3385,10 +4161,17 @@ impl ProcessData {
         &self,
         state: SchedState,
         reset_on_fork: bool,
+        uclamp: axtask::UclampRequest,
+        utilization_bounds: axtask::UtilizationBounds,
         version: u64,
     ) {
-        self.group_leader_identity
-            .seed_scheduler_state(state, reset_on_fork, version);
+        self.group_leader_identity.seed_scheduler_state(
+            state,
+            reset_on_fork,
+            uclamp,
+            utilization_bounds,
+            version,
+        );
     }
 
     pub(crate) fn publish_scheduler_state(
@@ -3396,7 +4179,7 @@ impl ProcessData {
         registration_tid: Pid,
         token: u64,
         task: &AxTaskRef,
-        commit: TaskSchedCommit,
+        commit: TaskSchedulingSnapshot,
     ) {
         self.group_leader_identity
             .publish_scheduler_commit(registration_tid, token, task, commit);
@@ -3551,7 +4334,12 @@ impl ProcessData {
         // old image's peak across exec while the new image starts publishing
         // its own resident pages into the shared mm-level counter.
         let old_aspace = self.aspace();
-        let (old_maxrss_kb, cet_wake) = {
+        // Uprobe return instances and XOL mappings belong to the old image.
+        // Retire them before publishing the replacement mm, so no scheduler
+        // return edge can observe a trampoline from an executable that is no
+        // longer this process image.
+        crate::uprobe::on_exec(thread.kernel_tid() as u64, &old_aspace);
+        let (old_maxrss_kb, inherited_thp_disable, cet_wake) = {
             let mut old_image = old_aspace.lock();
             // The record is in the old mm, which remains pinned across the
             // handoff.  Taking it first makes exec teardown exactly-once even
@@ -3559,13 +4347,12 @@ impl ProcessData {
             #[cfg(target_arch = "x86_64")]
             // Keep the lease registered until its VMA transaction succeeds;
             // a vfork alias only retires the alias and leaves the parent VMA.
-            old_image.retire_cet_default_shadow_stack(thread.kernel_tid());
-            let cet_wake: Option<crate::mm::DeferredUffdWake> = None;
+            let cet_wake = Some(old_image.retire_cet_default_shadow_stack(thread.kernel_tid()));
             #[cfg(not(target_arch = "x86_64"))]
             let cet_wake = None;
             let old_maxrss_kb =
                 old_image.merge_resident_highwater(old_image.resident_user_bytes() as u64 / 1024);
-            (old_maxrss_kb, cet_wake)
+            (old_maxrss_kb, old_image.thp_disable_mode(), cet_wake)
         };
         if let Some(wake) = cet_wake {
             wake.finish();
@@ -3573,6 +4360,13 @@ impl ProcessData {
         // Publish the replacement mm to swapoff before making it reachable
         // through the process image. The old registration remains until the
         // image handoff completes, so neither side can escape a snapshot.
+        // PR_SET_THP_DISABLE is preserved across exec.  Snapshot it at the
+        // old-mm handoff linearization point above, not during the fallible
+        // ELF build where a CLONE_VM peer could still change it before exec
+        // commits.
+        new_aspace
+            .lock()
+            .set_thp_disable_mode(inherited_thp_disable);
         register_address_space(&new_aspace);
         let new_tlb_state = {
             let image = new_aspace.lock();
@@ -3580,9 +4374,7 @@ impl ProcessData {
         };
         new_aspace.lock().merge_resident_highwater(old_maxrss_kb);
         let executor = current().clone();
-        let executor_scheduler = scheduler_state_snapshot(&executor)
-            .ok()
-            .map(|commit| (commit.state, commit.version, commit.reset_on_fork));
+        let executor_scheduler = task_scheduling_snapshot(&executor).ok();
         // `publish_exec_image` is the only production image writer. Exec has
         // already drained the thread group to `owner`, so preventing this
         // thread from being switched out closes the only scheduler race: an
@@ -3626,36 +4418,90 @@ impl ProcessData {
 
     /// Get the top address of the user heap.
     pub fn get_heap_top(&self) -> usize {
-        self.heap_top.load(Ordering::Acquire)
+        self.mm_layout.read().brk
     }
 
     pub fn heap_base(&self) -> usize {
-        self.heap_base.load(Ordering::Acquire)
+        self.mm_layout.read().heap_mapping_base
+    }
+
+    pub(crate) fn heap_initial_end(&self) -> usize {
+        self.mm_layout.read().heap_mapping_initial_end
     }
 
     pub(crate) fn set_heap_layout(&self, base: usize) {
-        self.heap_base.store(base, Ordering::Release);
-        self.set_heap_top(base + crate::config::USER_HEAP_SIZE);
+        let mut layout = self.mm_layout.write();
+        layout.start_brk = base;
+        layout.brk = base + crate::config::USER_HEAP_SIZE;
+        layout.start_data = base;
+        layout.end_data = base;
+        layout.heap_mapping_base = base;
+        layout.heap_mapping_initial_end = base + crate::config::USER_HEAP_SIZE;
+    }
+
+    /// Rebuilds ABI layout from the newly published exec address space. This
+    /// reads the same VMA topology that faults and `/proc/<pid>/maps` use;
+    /// no loader-side shadow ranges survive an exec handoff.
+    pub(crate) fn reset_mm_layout_for_exec(&self, heap_base: usize, stack_pointer: usize) {
+        let aspace_handle = self.aspace();
+        let aspace = aspace_handle.lock();
+        let mut start_code = usize::MAX;
+        let mut end_code = 0usize;
+        let mut start_data = usize::MAX;
+        let mut end_data = 0usize;
+        for area in aspace
+            .areas()
+            .filter(|area| area.flags().contains(MappingFlags::USER))
+        {
+            if area.flags().contains(MappingFlags::EXECUTE) {
+                start_code = start_code.min(area.start().as_usize());
+                end_code = end_code.max(area.end().as_usize());
+            }
+            if area.flags().contains(MappingFlags::WRITE) && area.start().as_usize() < heap_base {
+                start_data = start_data.min(area.start().as_usize());
+                end_data = end_data.max(area.end().as_usize());
+            }
+        }
+        drop(aspace);
+        let mut layout = self.mm_layout.write();
+        layout.start_code = (start_code != usize::MAX)
+            .then_some(start_code)
+            .unwrap_or(0);
+        layout.end_code = end_code;
+        layout.start_data = (start_data != usize::MAX)
+            .then_some(start_data)
+            .unwrap_or(heap_base);
+        layout.end_data = end_data.max(heap_base);
+        layout.start_brk = heap_base;
+        layout.brk = heap_base + crate::config::USER_HEAP_SIZE;
+        layout.start_stack = stack_pointer;
+        layout.arg_start = 0;
+        layout.arg_end = 0;
+        layout.env_start = 0;
+        layout.env_end = 0;
+        layout.auxv.clear();
+        layout.heap_mapping_base = heap_base;
+        layout.heap_mapping_initial_end = heap_base + crate::config::USER_HEAP_SIZE;
     }
 
     /// Fallibly snapshots the executable path without allocator work under
     /// the process metadata lock.
-    pub(crate) fn try_exe_path(&self) -> AxResult<String> {
-        let mut path = String::new();
+    pub(crate) fn try_exe_path(&self) -> AxResult<FsPathBuf> {
+        let mut path = Vec::new();
         loop {
             path.clear();
-            let required = self.exe_path.read().len();
+            let required = self.exe_path.read().as_bytes().len();
             if path.capacity() < required {
                 path.try_reserve_exact(required)
                     .map_err(|_| AxError::NoMemory)?;
             }
             let current = self.exe_path.read();
-            if path.capacity() < current.len() {
+            if path.capacity() < current.as_bytes().len() {
                 drop(current);
                 continue;
             }
-            path.push_str(&current);
-            return Ok(path);
+            path.extend_from_slice(current.as_bytes());
+            return Ok(FsPathBuf::from_vec(path));
         }
     }
 
@@ -3683,46 +4529,131 @@ impl ProcessData {
         coredump_image_snapshot(&self.image_binding)
     }
 
-    pub(crate) fn uts_ns(&self) -> Arc<UtsNamespace> {
-        self.uts_ns.read().clone()
+    pub(crate) fn namespace_proxy(&self) -> NamespaceProxy {
+        self.namespaces.read().clone()
     }
 
-    pub(crate) fn cgroup_ns(&self) -> Arc<CgroupNamespace> {
-        self.cgroup_ns.clone()
+    pub(crate) fn user_ns(&self) -> Arc<UserNamespace> {
+        self.namespaces.read().user()
     }
-
-    pub(crate) fn cgroup_ns_id(&self) -> u64 {
-        self.cgroup_ns.id()
-    }
-
     pub(crate) fn pid_ns(&self) -> Arc<PidNamespace> {
-        self.pid_ns.clone()
+        self.namespaces.read().pid()
+    }
+    pub(crate) fn pid_ns_for_children(&self) -> Arc<PidNamespace> {
+        self.namespaces.read().pid_for_children()
+    }
+    pub(crate) fn mount_ns(&self) -> Arc<MountNamespace> {
+        self.namespaces.read().mount()
+    }
+    pub(crate) fn ipc_ns(&self) -> Arc<IpcNamespace> {
+        self.namespaces.read().ipc()
     }
 
-    pub(crate) fn prepare_uts_ns_replacement(
+    pub(crate) fn register_touched_ipc_namespace(
         &self,
-        uts_ns: Arc<UtsNamespace>,
-    ) -> AxResult<PreparedUtsNamespaceReplacement> {
-        Ok(PreparedUtsNamespaceReplacement { uts_ns })
-    }
-
-    pub(crate) fn replace_uts_ns(&self, uts_ns: Arc<UtsNamespace>) -> AxResult<()> {
-        self.prepare_uts_ns_replacement(uts_ns)?.commit(self);
+        namespace: Arc<IpcNamespace>,
+    ) -> AxResult<()> {
+        let mut touched = self.touched_ipc_namespaces.lock();
+        if touched.iter().any(|known| Arc::ptr_eq(known, &namespace)) {
+            return Ok(());
+        }
+        touched.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        touched.push(namespace);
         Ok(())
     }
 
+    /// Fallibly snapshots every IPC namespace that owns process-lifetime
+    /// objects for this process. A fork into a new current IPC namespace must
+    /// still inherit SysV mappings backed by the parent's older namespaces;
+    /// consulting only `ipc_ns()` would silently lose those attachments.
+    pub(crate) fn touched_ipc_namespaces_snapshot(&self) -> AxResult<Vec<Arc<IpcNamespace>>> {
+        let touched = self.touched_ipc_namespaces.lock();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve_exact(touched.len())
+            .map_err(|_| AxError::NoMemory)?;
+        snapshot.extend(touched.iter().cloned());
+        Ok(snapshot)
+    }
+
+    pub(crate) fn cleanup_touched_ipc_namespaces(&self, pid: Pid) {
+        // Exit cannot allocate or keep a SpinNoIrq guard across namespace
+        // cleanup (those paths may take sleepable manager locks). Drain the
+        // already-reserved ownership vector, then release the IRQ-safe guard
+        // before invoking either cleanup operation.
+        let namespaces = {
+            let mut touched = self.touched_ipc_namespaces.lock();
+            core::mem::take(&mut *touched)
+        };
+        for namespace in namespaces {
+            crate::syscall::ipc::cleanup_process_mqueue_notifications_in(&namespace, pid);
+            // Visible SysV attachments are VMA-owned. Their finalizer runs
+            // only after AddrSpace teardown has removed the last fragment and
+            // completed its TLB grace period; deleting the IPC record here
+            // could free an IPC_RMID segment while stale translations or VMA
+            // retirements still retain its backing.
+        }
+    }
+    pub(crate) fn net_ns(&self) -> Arc<NetworkNamespace> {
+        self.namespaces.read().net()
+    }
+    pub(crate) fn cgroup_ns(&self) -> Arc<CgroupNamespace> {
+        self.namespaces.read().cgroup()
+    }
+    pub(crate) fn uts_ns(&self) -> Arc<UtsNamespace> {
+        self.namespaces.read().uts()
+    }
     pub(crate) fn time_ns(&self) -> Arc<TimeNamespace> {
-        self.time_ns.read().clone()
+        self.namespaces.read().time()
     }
-
     pub(crate) fn time_ns_for_children(&self) -> Arc<TimeNamespace> {
-        self.time_ns_for_children.read().clone()
+        self.namespaces.read().time_for_children()
     }
 
-    pub(crate) fn replace_time_ns(&self, time_ns: Arc<TimeNamespace>) {
-        let old_current = core::mem::replace(&mut *self.time_ns.write(), time_ns.clone());
-        let old_children = core::mem::replace(&mut *self.time_ns_for_children.write(), time_ns);
-        drop((old_current, old_children));
+    pub(crate) fn cgroup_ns_id(&self) -> u64 {
+        self.cgroup_ns().id()
+    }
+
+    pub(crate) fn prepare_namespace_replacement(
+        &self,
+        update: impl FnOnce(&mut NamespaceProxy),
+    ) -> PreparedNamespaceProxyReplacement {
+        let mut replacement = self.namespace_proxy();
+        update(&mut replacement);
+        PreparedNamespaceProxyReplacement { replacement }
+    }
+
+    pub(crate) fn prepare_namespace_proxy_replacement(
+        &self,
+        replacement: NamespaceProxy,
+    ) -> PreparedNamespaceProxyReplacement {
+        PreparedNamespaceProxyReplacement { replacement }
+    }
+
+    pub(crate) fn prepare_user_namespace_attach(
+        &self,
+        user_ns: Arc<UserNamespace>,
+    ) -> PreparedNamespaceProxyReplacement {
+        self.prepare_namespace_replacement(|proxy| proxy.replace_user(user_ns))
+    }
+
+    /// Attachment hand-off for the mount topology worker.  The caller plans
+    /// and validates topology in `mounts.rs` first, then commits this token
+    /// alongside its topology publication.
+    pub(crate) fn prepare_mount_namespace_attach(
+        &self,
+        mount_ns: Arc<MountNamespace>,
+    ) -> PreparedNamespaceProxyReplacement {
+        self.prepare_namespace_replacement(|proxy| proxy.replace_mount(mount_ns))
+    }
+
+    /// Attachment hand-off for SysV/POSIX IPC.  IPC subsystem code owns the
+    /// managers; ProcessData owns only the namespace pointer publication.
+    pub(crate) fn prepare_ipc_namespace_attach(
+        &self,
+        ipc_ns: Arc<IpcNamespace>,
+    ) -> PreparedNamespaceProxyReplacement {
+        self.prepare_namespace_replacement(|proxy| proxy.replace_ipc(ipc_ns))
     }
 
     pub(crate) fn try_unshared_time_ns(
@@ -3733,8 +4664,8 @@ impl ProcessData {
     }
 
     pub(crate) fn replace_time_ns_for_children(&self, new_ns: Arc<TimeNamespace>) {
-        let old = core::mem::replace(&mut *self.time_ns_for_children.write(), new_ns);
-        drop(old);
+        let mut namespaces = self.namespaces.write();
+        namespaces.replace_time_for_children(new_ns);
     }
 
     pub(crate) fn start_realtime_sec(&self) -> u64 {
@@ -3764,7 +4695,17 @@ impl ProcessData {
 
     /// Set the top address of the user heap.
     pub fn set_heap_top(&self, top: usize) {
-        self.heap_top.store(top, Ordering::Release)
+        self.mm_layout.write().brk = top;
+    }
+
+    pub(crate) fn mm_layout(&self) -> ProcessMmLayout {
+        self.mm_layout.read().clone()
+    }
+
+    /// Publishes a fully validated layout after its corresponding VMA/heap
+    /// transaction has completed. No caller may mutate individual fields.
+    pub(crate) fn replace_mm_layout(&self, layout: ProcessMmLayout) {
+        *self.mm_layout.write() = layout;
     }
 
     pub fn timerslack_ns(&self) -> usize {
@@ -3784,6 +4725,33 @@ impl ProcessData {
         let value = parent.timerslack_ns();
         self.timerslack_current_ns.store(value, Ordering::Release);
         self.timerslack_default_ns.store(value, Ordering::Release);
+        // PR_MDWE_NO_INHERIT suppresses the complete MDWE state in a newly
+        // created mm. CLONE_VM does not call this method and therefore keeps
+        // sharing the parent's state as Linux does.
+        let parent_mdwe = parent.mdwe.load(Ordering::Acquire);
+        self.mdwe.store(
+            if parent_mdwe & 0b10 == 0 {
+                parent_mdwe
+            } else {
+                0
+            },
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn mdwe(&self) -> u8 {
+        self.mdwe.load(Ordering::Acquire)
+    }
+
+    /// MDWE is monotonic for the lifetime of an mm: a caller can add either
+    /// valid bit but can never weaken a previously installed restriction.
+    pub(crate) fn set_mdwe(&self, flags: u8) -> AxResult<()> {
+        const VALID: u8 = 0b11;
+        if flags & !VALID != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        self.mdwe.fetch_or(flags, Ordering::AcqRel);
+        Ok(())
     }
 }
 
@@ -4059,6 +5027,18 @@ impl ProcessData {
         relationship
     }
 
+    /// Samples the inherited relationship together with its option word and
+    /// seize mode. Clone must never splice a relationship from one generation
+    /// to options observed after a detach/reattach.
+    pub(crate) fn ptrace_clone_snapshot(&self) -> Option<(PtraceRelationshipSnapshot, u32, bool)> {
+        let ptrace_ctl = self.ptrace_ctl.lock();
+        Some((
+            ptrace_ctl.active_relationship()?,
+            ptrace_ctl.options,
+            ptrace_ctl.seized,
+        ))
+    }
+
     pub(crate) fn ptrace_session_if_traced_by(
         &self,
         tracer: Pid,
@@ -4165,9 +5145,11 @@ impl ProcessData {
 
     /// Publishes both directions of one ptrace relationship after revalidating
     /// the exact hook-authorized tasks, actor credential, and target image.
-    /// The ptracer credential guard is acquired before the publication gate;
-    /// the fixed order inside is exec gate, image, access security, exact
-    /// target credential, ptrace control, then tracer reverse links.
+    /// The actor credential guard is acquired before the publication gate;
+    /// `relationship_credential` is either that live credential or the
+    /// immutable relationship-time credential retained by CLONE_PTRACE. The
+    /// fixed order inside is exec gate, image, access security, exact target
+    /// credential, ptrace control, then tracer reverse links.
     pub(crate) fn publish_ptrace_relationship(
         &self,
         publication: &PtracePublicationGuard<'_>,
@@ -4175,7 +5157,7 @@ impl ProcessData {
         ptracer: &super::Thread,
         authorized_ptracer: &CredentialSnapshotGuard<'_>,
         origin: PtraceRelationshipOrigin,
-        relationship_credential: &CredentialSnapshotGuard<'_>,
+        relationship_credential: &Arc<Cred>,
         seized: bool,
         initial_options: u32,
         authorized: &ProcessImageAccessSnapshot,
@@ -4210,10 +5192,13 @@ impl ProcessData {
         let relationship_owner = match origin {
             PtraceRelationshipOrigin::Attach => ptracer,
             PtraceRelationshipOrigin::Traceme => target,
+            PtraceRelationshipOrigin::Inherited => target,
         };
-        let relationship_slot = relationship_owner.credential_slot();
-        if !core::ptr::eq(relationship_credential.slot(), &*relationship_slot) {
-            return Err(AxError::BadState);
+        if origin != PtraceRelationshipOrigin::Inherited {
+            let relationship_slot = relationship_owner.credential_slot();
+            if !Arc::ptr_eq(relationship_credential, &relationship_slot.current()) {
+                return Err(AxError::BadState);
+            }
         }
         if reverse_link.tracer != tracer
             || reverse_link.tracer_kernel_tid != tracer_kernel_tid
@@ -4257,15 +5242,12 @@ impl ProcessData {
             return Err(AxError::OperationNotPermitted);
         }
         if origin == PtraceRelationshipOrigin::Traceme
-            && !Arc::ptr_eq(relationship_credential.credential(), &authorized.credential)
+            && !Arc::ptr_eq(relationship_credential, &authorized.credential)
         {
             return Err(AxError::OperationNotPermitted);
         }
         if origin == PtraceRelationshipOrigin::Attach
-            && !Arc::ptr_eq(
-                relationship_credential.credential(),
-                authorized_ptracer.credential(),
-            )
+            && !Arc::ptr_eq(relationship_credential, authorized_ptracer.credential())
         {
             return Err(AxError::BadState);
         }
@@ -4277,7 +5259,7 @@ impl ProcessData {
             seized,
             initial_options,
             origin,
-            relationship_credential.credential(),
+            relationship_credential,
         ) else {
             return Err(if ptrace_ctl.active_session().is_some() {
                 AxError::OperationNotPermitted
@@ -4335,6 +5317,7 @@ impl ProcessData {
 
         job_ctl.state = StopState::Stopped;
         job_ctl.stop_signal = record.info().signo() as u8;
+        job_ctl.ptrace_event = 0;
         job_ctl.stop_kind = StopKind::Ptrace;
         job_ctl.ptrace_session = Some(session);
         job_ctl.stop_reported = false;
@@ -4466,6 +5449,37 @@ impl ProcessData {
         }
         job_ctl.state = StopState::Stopped;
         job_ctl.stop_signal = signo;
+        job_ctl.ptrace_event = 0;
+        job_ctl.stop_kind = StopKind::Ptrace;
+        job_ctl.ptrace_session = Some(session);
+        job_ctl.stop_reported = false;
+        job_ctl.continued = false;
+        true
+    }
+
+    /// Publishes a clone/fork/vfork event for an already traced parent.  The
+    /// child PID is retained in the ptrace control word for GETEVENTMSG while
+    /// wait status derives its event high byte from the job-control record.
+    pub(crate) fn ptrace_event_stop(
+        &self,
+        session: PtraceSession,
+        event: u8,
+        message: usize,
+    ) -> bool {
+        let mut ptrace_ctl = self.ptrace_ctl.lock();
+        if ptrace_ctl.active_session() != Some(session) {
+            return false;
+        }
+        let mut job_ctl = self.job_ctl.lock();
+        if job_ctl.is_ptrace_inactive_for(session)
+            || (job_ctl.stop_kind == StopKind::Ptrace && job_ctl.state != StopState::Running)
+        {
+            return false;
+        }
+        ptrace_ctl.event_message = message;
+        job_ctl.state = StopState::Stopped;
+        job_ctl.stop_signal = Signo::SIGTRAP as u8;
+        job_ctl.ptrace_event = event;
         job_ctl.stop_kind = StopKind::Ptrace;
         job_ctl.ptrace_session = Some(session);
         job_ctl.stop_reported = false;
@@ -4492,6 +5506,7 @@ impl ProcessData {
         }
         job_ctl.state = StopState::Stopped;
         job_ctl.stop_signal = signo;
+        job_ctl.ptrace_event = 0;
         job_ctl.stop_kind = StopKind::Ptrace;
         job_ctl.ptrace_session = Some(session);
         job_ctl.stop_reported = false;
@@ -4625,6 +5640,44 @@ impl ProcessData {
     /// Returns whether threads should park for a job-control stop.
     pub fn should_wait_for_stop(&self) -> bool {
         self.stop_state() != StopState::Running
+            || self.cgroup_freeze_requested.load(Ordering::Acquire)
+    }
+
+    /// Requests a scheduler-backed cgroup freezer park at every thread's next
+    /// interruptible task boundary.  The caller interrupts live members after
+    /// this release store; user-return and signal paths then enter the shared
+    /// stop wait without exposing job-control state.
+    pub(crate) fn request_cgroup_freeze(&self) {
+        self.cgroup_freeze_requested.store(true, Ordering::Release);
+        self.stop_event.wake();
+    }
+
+    /// Releases only the cgroup freezer reason and wakes its parked threads.
+    pub(crate) fn thaw_cgroup_freeze(&self) {
+        self.cgroup_freeze_requested.store(false, Ordering::Release);
+        self.stop_event.wake();
+    }
+
+    pub(crate) fn cgroup_freeze_requested(&self) -> bool {
+        self.cgroup_freeze_requested.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn enter_cgroup_freezer(&self) {
+        self.cgroup_frozen_threads.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn leave_cgroup_freezer(&self) {
+        let previous = self.cgroup_frozen_threads.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0, "cgroup freezer thread count underflow");
+    }
+
+    /// A process is fully frozen only after every currently live thread has
+    /// entered the scheduler's stopped wait.  A process with no live threads
+    /// is already quiescent, so exit cannot leave a freezing cgroup stuck.
+    pub(crate) fn cgroup_freeze_complete(&self) -> bool {
+        self.cgroup_freeze_requested()
+            && self.cgroup_frozen_threads.load(Ordering::Acquire)
+                >= self.proc.thread_count() as usize
     }
 
     /// Begins a job-control stop transition.
@@ -4635,6 +5688,7 @@ impl ProcessData {
         }
         job_ctl.state = StopState::Stopping;
         job_ctl.stop_signal = signo;
+        job_ctl.ptrace_event = 0;
         job_ctl.stop_kind = StopKind::JobControl;
         job_ctl.ptrace_session = None;
         true
@@ -4811,6 +5865,10 @@ impl ProcessData {
         let established = self.proc.group_exit(exit_code);
         debug_assert!(established, "kernel group-exit gate lost core ownership");
         drop(exec_ctl);
+        // A process CPU-clock sleeper pins ProcessData rather than an
+        // individual runnable thread.  Group exit closes that accounting
+        // domain, so publish the lifecycle edge after releasing exec_ctl.
+        super::notify_cpu_clock_sleepers();
         if cancelled_exec {
             self.exec_event.wake();
         }
@@ -4948,7 +6006,10 @@ mod tests {
 
     use axerrno::AxError;
     use axsync::spin::SpinNoIrq;
-    use axtask::{AxCpuMask, DeadlineConfig, SchedClass, SchedState, TaskSchedCommit};
+    use axtask::{
+        AxCpuMask, DeadlineParameters, RequestedSlice, SchedClass, SchedState,
+        TaskSchedulingSnapshot, UclampRequest, UtilizationBounds,
+    };
     use linux_raw_sys::general::CAP_CHOWN;
     use thekernel_linux_signal::{
         PreparedSignal, SignalInfo, SignalQueueAccount, Signo,
@@ -4958,18 +6019,30 @@ mod tests {
     use super::{
         CgroupNamespace, Dumpability, GroupLeaderIdentityBinding, GroupLeaderSignalIdentity,
         Mempolicy, MempolicyRange, MempolicySnapshot, MempolicyState, NetworkNamespace,
-        PTRACE_REVERSE_LINK_HARD_LIMIT, PidNamespace, PreparedPtraceReverseLink,
-        ProcessAccessState, ProcessImageBinding, PtraceReverseLinkDrain, PtraceReverseLinkNode,
-        PtraceReverseLinks, SIGNAL_QUEUE_GLOBAL_HARD_LIMIT, SIGNAL_QUEUE_PER_USER_HARD_LIMIT,
-        TimeNamespace, UserNamespace, UtsNamespace, ZombieSchedulerSnapshot,
-        coredump_image_snapshot, group_exit_handoff_requires_kill, init_uts_state,
-        ptrace_image_snapshot_if_owned, ptrace_image_snapshot_if_session,
+        PID_MAX_LIMIT, PTRACE_REVERSE_LINK_HARD_LIMIT, PidNamespace, PidNamespacePids,
+        PreparedPtraceReverseLink, ProcessAccessState, ProcessImageBinding, PtraceReverseLinkDrain,
+        PtraceReverseLinkNode, PtraceReverseLinks, SIGNAL_QUEUE_GLOBAL_HARD_LIMIT,
+        SIGNAL_QUEUE_PER_USER_HARD_LIMIT, TimeNamespace, UserNamespace, UtsNamespace,
+        ZombieSchedulerSnapshot, coredump_image_snapshot, group_exit_handoff_requires_kill,
+        init_uts_state, ptrace_image_snapshot_if_owned, ptrace_image_snapshot_if_session,
         ptrace_inactive_image_snapshot_if_session, ptrace_lifecycle_first_key,
         release_exec_control_owner, release_vfork_control_parent,
         replace_process_image_with_group_handoff, retire_group_leader_signal_owner,
         scheduler_publication_matches, scheduler_tlb_state_snapshot, snapshot_credential_image,
         snapshot_group_credential_image, try_allocate_namespace_id, try_increment_bounded,
     };
+
+    fn scheduler_snapshot(state: SchedState, version: u64) -> TaskSchedulingSnapshot {
+        TaskSchedulingSnapshot {
+            state,
+            reset_on_spawn: false,
+            uclamp: UclampRequest::unrestricted(),
+            utilization_bounds: UtilizationBounds::unrestricted(),
+            requested_slice: RequestedSlice::default(),
+            deadline: DeadlineParameters::default(),
+            version,
+        }
+    }
     use crate::task::{
         CapabilityState, Cred, CredentialSlot, IdMap, IdMapInputExtent, Kgid, Kuid,
         creds::capability_state_for_test,
@@ -6176,6 +7249,12 @@ mod tests {
             nice: 19,
             rt_priority: 0,
             reset_on_fork: false,
+            uclamp_min: 0,
+            uclamp_max: 1024,
+            uclamp_min_user_defined: false,
+            uclamp_max_user_defined: false,
+            uclamp_effective_min: 0,
+            uclamp_effective_max: 1024,
             affinity: AxCpuMask::full(),
             identity_epoch: 0,
             version: 0,
@@ -6213,14 +7292,13 @@ mod tests {
             credential_slot(2000),
             Some(GroupLeaderSignalIdentity::new(10, thread_signal_manager())),
             None,
-            Some((
+            Some(scheduler_snapshot(
                 SchedState {
                     class: SchedClass::Fifo,
                     nice: 0,
                     rt_priority: 73,
                 },
                 3,
-                false,
             )),
         );
         drop(handoff.complete_post_commit());
@@ -6237,6 +7315,12 @@ mod tests {
                 nice: 0,
                 rt_priority: 73,
                 reset_on_fork: false,
+                uclamp_min: 0,
+                uclamp_max: 1024,
+                uclamp_min_user_defined: false,
+                uclamp_max_user_defined: false,
+                uclamp_effective_min: 0,
+                uclamp_effective_max: 1024,
                 affinity: AxCpuMask::full(),
                 identity_epoch: 1,
                 version: 3,
@@ -6270,6 +7354,12 @@ mod tests {
                 nice: 4,
                 rt_priority: 0,
                 reset_on_fork: false,
+                uclamp_min: 0,
+                uclamp_max: 1024,
+                uclamp_min_user_defined: false,
+                uclamp_max_user_defined: false,
+                uclamp_effective_min: 0,
+                uclamp_effective_max: 1024,
                 affinity: AxCpuMask::full(),
                 identity_epoch: 1,
                 version: 4,
@@ -6279,32 +7369,22 @@ mod tests {
 
     #[test]
     fn scheduler_handoff_accepts_new_task_version_zero_after_old_version_five() {
-        let old = TaskSchedCommit {
-            state: SchedState {
+        let old = scheduler_snapshot(
+            SchedState {
                 class: SchedClass::Fifo,
                 nice: 0,
                 rt_priority: 1,
             },
-            reset_on_fork: false,
-            util_min: 0,
-            util_max: 1024,
-            fair_runtime_ns: 0,
-            deadline: DeadlineConfig::default(),
-            version: 5,
-        };
-        let new = TaskSchedCommit {
-            state: SchedState {
+            5,
+        );
+        let new = scheduler_snapshot(
+            SchedState {
                 class: SchedClass::Normal,
                 nice: -4,
                 rt_priority: 0,
             },
-            reset_on_fork: false,
-            util_min: 0,
-            util_max: 1024,
-            fair_runtime_ns: 0,
-            deadline: DeadlineConfig::default(),
-            version: 0,
-        };
+            0,
+        );
         // The token changes with identity, so version streams are never
         // compared across the old leader and a new executor.
         assert!(scheduler_publication_matches(18, 18, new, Some(new)));
@@ -6313,32 +7393,22 @@ mod tests {
 
     #[test]
     fn scheduler_publication_rejects_remote_state_version_change() {
-        let committed = TaskSchedCommit {
-            state: SchedState {
+        let committed = scheduler_snapshot(
+            SchedState {
                 class: SchedClass::Normal,
                 nice: 3,
                 rt_priority: 0,
             },
-            reset_on_fork: false,
-            util_min: 0,
-            util_max: 1024,
-            fair_runtime_ns: 0,
-            deadline: DeadlineConfig::default(),
-            version: 7,
-        };
-        let remote = TaskSchedCommit {
-            state: SchedState {
+            7,
+        );
+        let remote = scheduler_snapshot(
+            SchedState {
                 class: SchedClass::Batch,
                 nice: 8,
                 rt_priority: 0,
             },
-            reset_on_fork: false,
-            util_min: 0,
-            util_max: 1024,
-            fair_runtime_ns: 0,
-            deadline: DeadlineConfig::default(),
-            version: 8,
-        };
+            8,
+        );
         assert!(!scheduler_publication_matches(
             4,
             4,
@@ -6349,15 +7419,7 @@ mod tests {
 
     #[test]
     fn delayed_old_leader_scheduler_publication_is_rejected_by_token() {
-        let commit = TaskSchedCommit {
-            state: SchedState::default(),
-            reset_on_fork: false,
-            util_min: 0,
-            util_max: 1024,
-            fair_runtime_ns: 0,
-            deadline: DeadlineConfig::default(),
-            version: 5,
-        };
+        let commit = scheduler_snapshot(SchedState::default(), 5);
         assert!(!scheduler_publication_matches(12, 11, commit, Some(commit)));
     }
 
@@ -6372,7 +7434,7 @@ mod tests {
             credential_slot(2000),
             Some(GroupLeaderSignalIdentity::new(10, thread_signal_manager())),
             None,
-            Some((SchedState::default(), 0, false)),
+            Some(scheduler_snapshot(SchedState::default(), 0)),
         );
         drop(handoff.complete_post_commit());
 
@@ -6392,23 +7454,18 @@ mod tests {
             credential_slot(2000),
             Some(GroupLeaderSignalIdentity::new(10, thread_signal_manager())),
             None,
-            Some((SchedState::default(), 0, false)),
+            Some(scheduler_snapshot(SchedState::default(), 0)),
         );
         drop(handoff.complete_post_commit());
 
-        let commit = TaskSchedCommit {
-            state: SchedState {
+        let commit = scheduler_snapshot(
+            SchedState {
                 class: SchedClass::Batch,
                 nice: 6,
                 rt_priority: 0,
             },
-            reset_on_fork: false,
-            util_min: 0,
-            util_max: 1024,
-            fair_runtime_ns: 0,
-            deadline: DeadlineConfig::default(),
-            version: 1,
-        };
+            1,
+        );
         let token = binding.publication_token_for(10);
         assert_eq!(token, Some(1));
         assert!(scheduler_publication_matches(
@@ -6429,7 +7486,7 @@ mod tests {
             credential_slot(2000),
             Some(GroupLeaderSignalIdentity::new(10, thread_signal_manager())),
             None,
-            Some((SchedState::default(), 0, false)),
+            Some(scheduler_snapshot(SchedState::default(), 0)),
         );
         drop(handoff.complete_post_commit());
 
@@ -6992,7 +8049,12 @@ mod tests {
         let child_weak = Arc::downgrade(&child);
 
         let cgroup_root = CgroupNamespace::try_new_root(root.clone()).unwrap();
-        let cgroup_child = cgroup_root.try_fork(child.clone()).unwrap();
+        let cgroup_child = cgroup_root
+            .try_fork(
+                child.clone(),
+                crate::pseudofs::cgroup::root_namespace_roots().unwrap(),
+            )
+            .unwrap();
         assert!(Arc::ptr_eq(cgroup_root.owner_user_ns(), &root));
         assert!(Arc::ptr_eq(cgroup_child.owner_user_ns(), &child));
 
@@ -7098,20 +8160,69 @@ mod tests {
 
         let live = child.reserve_process(22).unwrap();
         live.commit();
-        assert_eq!(child.visible_pid(22), 2);
-        assert_eq!(child.resolve_visible_pid(2), Some(22));
-        assert_eq!(root.visible_pid_for(&child, 22), Some(3));
+        // Releasing an unpublished reservation does not rewind the allocator:
+        // like Linux's cyclic PID allocator, the next admission advances past
+        // the discarded candidate.
+        assert_eq!(child.visible_pid(22), 3);
+        assert_eq!(child.resolve_visible_pid(3), Some(22));
+        assert_eq!(root.visible_pid_for(&child, 22), Some(4));
         child.release_reaped_process(22);
         assert!(!child.pids.lock().by_global.contains_key(&22));
         assert!(!root.pids.lock().by_global.contains_key(&22));
-        assert_eq!(child.resolve_visible_pid(2), None);
+        assert_eq!(child.resolve_visible_pid(3), None);
 
         // Allocation is cyclic rather than LIFO: a released PID is reusable,
         // but Linux need not return it for the immediately following fork.
         let next = child.reserve_process(23).unwrap();
         next.commit();
-        assert_eq!(child.visible_pid(23), 3);
-        assert_eq!(root.visible_pid_for(&child, 23), Some(4));
+        assert_eq!(child.visible_pid(23), 4);
+        assert_eq!(root.visible_pid_for(&child, 23), Some(5));
+    }
+
+    #[test]
+    fn exact_pid_slots_reject_invalid_and_colliding_values() {
+        let mut pids = PidNamespacePids::try_new(None).unwrap();
+        assert_eq!(pids.try_reserve_exact(10, 42), Ok(true));
+        assert_eq!(pids.by_global.get(&10), Some(&42));
+        assert_eq!(pids.by_local.get(&42), Some(&10));
+        // The preinstalled PID 1 of a new namespace is retried by the common
+        // transaction and must remain part of that transaction without a
+        // duplicate allocation.
+        assert_eq!(pids.try_reserve_exact(10, 42), Ok(false));
+        assert_eq!(pids.try_reserve_exact(11, 42), Err(AxError::AlreadyExists));
+        assert_eq!(pids.try_reserve_exact(12, 0), Err(AxError::InvalidInput));
+        assert_eq!(
+            pids.try_reserve_exact(12, PID_MAX_LIMIT),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn clone3_set_tid_reserves_each_namespace_and_rolls_back_on_outer_collision() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root(owner.clone()).unwrap();
+        let root = PidNamespace::try_new_root(owner.clone()).unwrap();
+        root.reserve_process(100).unwrap().commit();
+        let child = root.try_fork(101, owner).unwrap();
+
+        child
+            .reserve_process_with_ids(102, &[7, 42], &actor)
+            .unwrap()
+            .commit();
+        assert_eq!(child.visible_pid(102), 7);
+        assert_eq!(root.visible_pid_for(&child, 102), Some(42));
+
+        // The inner slot is acquired before the outer collision; dropping
+        // the returned error must nevertheless leave no partial inner slot.
+        assert!(matches!(
+            child.reserve_process_with_ids(103, &[8, 42], &actor),
+            Err(AxError::AlreadyExists)
+        ));
+        assert!(!child.pids.lock().by_global.contains_key(&103));
+        assert!(matches!(
+            child.reserve_process_with_ids(104, &[2, 3, 4], &actor),
+            Err(AxError::InvalidInput)
+        ));
     }
 
     #[test]

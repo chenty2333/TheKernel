@@ -4,6 +4,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{
+    any::Any,
     cell::RefCell,
     ops::Deref,
     sync::atomic::{
@@ -16,7 +17,9 @@ use axerrno::{AxError, AxResult};
 use axfs::FsContext;
 use axpoll::PollSet;
 use axsync::{Mutex, spin::SpinNoIrq};
-use axtask::{SchedState, SwitchReason, TaskExt, TaskInner};
+use axtask::{
+    SchedState, SwitchReason, TaskExt, TaskInner, UclampRequest, UtilizationBounds, current,
+};
 use extern_trait::extern_trait;
 use scope_local::{ActiveScope, Scope};
 use thekernel_linux_process_adapter::Pid;
@@ -28,7 +31,7 @@ use thekernel_linux_signal::{
 };
 
 use super::{
-    ProcessData,
+    NamespaceProxy, ProcessData,
     accounting::{AtomicTaskUsage, TaskUsage},
     creds::{Cred, CredentialSlot, CredentialSnapshotGuard},
     restart::RestartTracker,
@@ -43,151 +46,6 @@ const TASK_PARENT_RELATION_HARD_LIMIT: usize =
 static LIVE_TASK_PARENT_RELATIONS: AtomicUsize = AtomicUsize::new(0);
 static TASK_PARENT_TOPOLOGY: SpinNoIrq<()> = SpinNoIrq::new(());
 
-#[cfg(target_arch = "x86_64")]
-const CET_SIGNAL_FRAME_LIMIT: usize = 64;
-
-/// Kernel-owned authentication record for one CET signal transition.  Nothing
-/// in this record is reconstructed from the user frame on sigreturn.
-#[cfg(target_arch = "x86_64")]
-#[derive(Clone, Copy)]
-pub(crate) struct CetPendingSignalFrame {
-    pub(crate) frame: usize,
-    pub(crate) saved_ssp: u64,
-    pub(crate) shadow_start: u64,
-    pub(crate) handler_ssp: u64,
-    pub(crate) restorer: u64,
-    pub(crate) epoch: u64,
-    pub(crate) nonce: u64,
-    pub(crate) token: u64,
-}
-
-#[cfg(target_arch = "x86_64")]
-#[derive(Clone)]
-struct CetPendingSignalFrames {
-    epoch: u64,
-    next_nonce: u64,
-    frames: [Option<CetPendingSignalFrame>; CET_SIGNAL_FRAME_LIMIT],
-    depth: usize,
-}
-
-#[cfg(target_arch = "x86_64")]
-impl CetPendingSignalFrames {
-    const fn new() -> Self {
-        Self {
-            epoch: 1,
-            next_nonce: 1,
-            frames: [None; CET_SIGNAL_FRAME_LIMIT],
-            depth: 0,
-        }
-    }
-
-    fn reserve(&mut self) -> Option<(u64, u64)> {
-        if self.depth == CET_SIGNAL_FRAME_LIMIT {
-            return None;
-        }
-        let nonce = self.next_nonce;
-        self.next_nonce = self.next_nonce.wrapping_add(1).max(1);
-        Some((self.epoch, nonce))
-    }
-
-    const fn has_capacity(&self) -> bool {
-        self.depth < CET_SIGNAL_FRAME_LIMIT
-    }
-
-    fn push(&mut self, frame: CetPendingSignalFrame) -> bool {
-        if self.depth == CET_SIGNAL_FRAME_LIMIT || frame.epoch != self.epoch {
-            return false;
-        }
-        self.frames[self.depth] = Some(frame);
-        self.depth += 1;
-        true
-    }
-
-    fn top(&self) -> Option<CetPendingSignalFrame> {
-        self.depth
-            .checked_sub(1)
-            .and_then(|index| self.frames[index])
-    }
-
-    fn pop_if(&mut self, frame: CetPendingSignalFrame) -> bool {
-        if self.top().is_some_and(|top| {
-            top.frame == frame.frame
-                && top.epoch == frame.epoch
-                && top.nonce == frame.nonce
-                && top.token == frame.token
-        }) {
-            self.depth -= 1;
-            self.frames[self.depth] = None;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn invalidate(&mut self) {
-        self.depth = 0;
-        self.frames = [None; CET_SIGNAL_FRAME_LIMIT];
-        self.epoch = self.epoch.wrapping_add(1).max(1);
-    }
-}
-
-#[cfg(all(test, target_arch = "x86_64"))]
-mod cet_signal_frame_tests {
-    use super::*;
-
-    fn frame(epoch: u64, nonce: u64) -> CetPendingSignalFrame {
-        CetPendingSignalFrame {
-            frame: nonce as usize,
-            saved_ssp: 0x8000,
-            shadow_start: 0x7fe8,
-            handler_ssp: 0x7ff0,
-            restorer: 0x1000,
-            epoch,
-            nonce,
-            token: nonce ^ 0x55,
-        }
-    }
-
-    #[test]
-    fn cet_signal_frames_are_lifo_and_epoch_bound() {
-        let mut frames = CetPendingSignalFrames::new();
-        let (epoch, first_nonce) = frames.reserve().unwrap();
-        let first = frame(epoch, first_nonce);
-        assert!(frames.push(first));
-        let (_, second_nonce) = frames.reserve().unwrap();
-        let second = frame(epoch, second_nonce);
-        assert!(frames.push(second));
-        assert!(!frames.pop_if(first));
-        assert!(frames.pop_if(second));
-        frames.invalidate();
-        assert!(!frames.push(first));
-        assert!(frames.top().is_none());
-    }
-
-    #[test]
-    fn cet_signal_frames_have_a_hard_bound() {
-        let mut frames = CetPendingSignalFrames::new();
-        let epoch = frames.epoch;
-        for nonce in 0..CET_SIGNAL_FRAME_LIMIT as u64 {
-            assert!(frames.push(frame(epoch, nonce)));
-        }
-        assert!(frames.reserve().is_none());
-        assert!(!frames.push(frame(epoch, 99)));
-    }
-
-    #[test]
-    fn cet_signal_frame_tracks_entry_ret_and_sigreturn_positions() {
-        let saved_ssp = 0x8000;
-        let shadow_start = saved_ssp - 24;
-        let handler_ssp_after_ret = shadow_start + 8;
-        let signal_frame = 0x4000;
-        let handler_rsp = signal_frame - 8;
-        assert_eq!(handler_rsp + 8, signal_frame);
-        assert_eq!(shadow_start + 24, saved_ssp);
-        assert_eq!(handler_ssp_after_ret, shadow_start + 8);
-    }
-}
-
 /// Linux x86 I/O-port state. It is deliberately task-local: threads in one
 /// process may grant different port ranges. The grant bitmap is shared after
 /// fork, while the inline revoke overlay guarantees that removing a permission
@@ -200,6 +58,29 @@ pub(crate) struct IoPortState {
     /// memory pressure.
     revoked: [u8; IO_BITMAP_BYTES],
     iopl: u8,
+}
+
+/// Coherent view for operations which interpret credentials and pathname
+/// state through the task's namespace proxy.  The publication gate is shared
+/// with setns/unshare and fs_struct replacement, so a caller never combines a
+/// pre-transition credential with a post-transition mount namespace.
+#[derive(Clone)]
+pub(crate) struct NamespaceCredentialFsSnapshot {
+    pub(crate) namespaces: NamespaceProxy,
+    /// The mount topology is pathname authority. Deferred work retains the
+    /// submitter's idmap view instead of sampling a worker's namespace.
+    pub(crate) mount_topology: Arc<crate::mounts::MountTopology>,
+    pub(crate) credential: Arc<Cred>,
+    pub(crate) fs_slot: Arc<FsContextSlot>,
+    pub(crate) fs_context: Arc<Mutex<FsContext>>,
+    /// Immutable root/cwd/umask sampled with the namespace publication gate.
+    /// Deferred io_uring pathname work must not observe a later chdir/chroot.
+    pub(crate) fs_snapshot: FsContext,
+    pub(crate) landlock_domain: LandlockDomain,
+    /// The caller's controlling terminal is process-session state, not
+    /// namespace state.  Retain it with the other execution authority so a
+    /// kernel worker cannot accidentally resolve `/dev/tty` against itself.
+    pub(crate) controlling_terminal: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl Default for IoPortState {
@@ -1065,6 +946,17 @@ pub struct Thread {
     /// The process data shared by all threads in the process.
     pub proc_data: Arc<ProcessData>,
 
+    /// Linux namespaces belong to a task, not its thread group.  The process
+    /// keeps a creation snapshot for lifecycle bookkeeping, but all current
+    /// lookup and setns/unshare publication uses this independently locked
+    /// aggregate.  A clone snapshots its calling task before it is published.
+    pub(in crate::task) namespaces: SpinNoIrq<NamespaceProxy>,
+
+    /// SEM_UNDO follows the task's IPC namespace attachment.  It is not a
+    /// ProcessData field: setns/unshare may retarget one task while siblings
+    /// continue to operate on their original IPC manager.
+    sem_undo: SpinNoIrq<Arc<super::process::SemUndoState>>,
+
     /// The task's single atomically published immutable security identity.
     ///
     /// A new thread or fork child starts from one caller snapshot, but owns an
@@ -1152,12 +1044,6 @@ pub struct Thread {
     /// The head of the robust list
     robust_list_head: AtomicUsize,
 
-    /// CET signal frames are deliberately task-local: an address-space
-    /// mutation never reaches back into this lock, and stale mappings are
-    /// rejected when the frame is consumed.
-    #[cfg(target_arch = "x86_64")]
-    cet_signal_frames: SpinNoIrq<CetPendingSignalFrames>,
-
     /// The thread-level signal manager
     pub signal: Arc<ThreadSignalManager>,
 
@@ -1178,9 +1064,10 @@ pub struct Thread {
     io_write_bytes: AtomicU64,
     voluntary_switches: AtomicU64,
     involuntary_switches: AtomicU64,
+    /// Last CPU on which this task entered.  The sentinel avoids treating a
+    /// first dispatch as a migration.
+    perf_last_cpu: AtomicUsize,
     perf_events: SpinNoIrq<Vec<Arc<crate::file::PerfGroup>>>,
-    #[cfg(feature = "perf-sampling")]
-    perf_sampling: SpinNoIrq<Option<Weak<crate::file::PerfSamplingFile>>>,
     /// Scheduler-owned utilization clamps, published as a coherent pair.
     ///
     /// `sched_clamp_sequence` is a tiny seqlock: writers are serialized with
@@ -1189,12 +1076,27 @@ pub struct Thread {
     /// separately so a delayed completion cannot replace a newer clamp.
     #[cfg(feature = "hwp-uclamp")]
     sched_clamp: SchedulerClampCache,
+    /// Even global clamp-policy generation last folded into this task's
+    /// scheduler-owned effective bounds. Zero intentionally means dirty for
+    /// a newly constructed task, closing the first-user-entry race with a
+    /// concurrent cgroup/system clamp write.
+    uclamp_policy_generation: AtomicU64,
     /// Set when the exit path pre-accounts the final TASK_DEAD handoff.
     /// The scheduler Exit callback consumes this marker so `nvcsw` is
     /// published exactly once before the frozen usage snapshot is queued.
     exit_switch_preaccounted: AtomicBool,
     /// Best-effort user-visible blocking state used by procfs.
     proc_state_hint: AtomicU8,
+    /// Nested scheduler I/O-wait ownership.  The depth, outer-entry timestamp,
+    /// and accumulated duration are independent of the procfs hint so wakeup,
+    /// signal, and nested readiness guards cannot lose accounting.
+    iowait_depth: AtomicU32,
+    iowait_started_ns: AtomicU64,
+    iowait_total_ns: AtomicU64,
+    /// Exact per-thread ownership of one cgroup-freezer parked-count slot.
+    /// It prevents repeated signal/user-return checks from double-counting a
+    /// thread while it remains in the scheduler's stop wait.
+    cgroup_freezer_parked: AtomicBool,
 
     /// Linux per-task I/O priority context. Linux does not allocate an
     /// `io_context` until a task first needs one; `None` is therefore a real
@@ -1202,6 +1104,14 @@ pub struct Thread {
     /// reference is shared by `CLONE_IO` children and copied for ordinary
     /// fork/clone children.
     io_context: SpinNoIrq<Option<Arc<AtomicU16>>>,
+
+    /// `PR_SET_IO_FLUSHER` is task-local and intentionally independent from
+    /// the task's Linux I/O priority context.
+    io_flusher: AtomicBool,
+
+    /// Per-thread x86 machine-check kill policy (`PR_MCE_KILL_*`).  This is
+    /// sampled by the #MC-to-user delivery bridge, not a process-global knob.
+    mce_kill_policy: AtomicU8,
 
     /// x86 `ioperm(2)` bitmap and `iopl(2)` emulation state.
     ioport: SpinNoIrq<IoPortState>,
@@ -1231,10 +1141,8 @@ pub struct Thread {
 pub(crate) struct SchedulerSeed {
     pub(crate) state: SchedState,
     pub(crate) reset_on_fork: bool,
-    #[cfg(feature = "hwp-uclamp")]
-    pub(crate) util_min: u16,
-    #[cfg(feature = "hwp-uclamp")]
-    pub(crate) util_max: u16,
+    pub(crate) uclamp: UclampRequest,
+    pub(crate) utilization_bounds: UtilizationBounds,
     pub(crate) version: u64,
 }
 
@@ -1270,9 +1178,10 @@ struct SchedulerClampCache {
 
 #[cfg(feature = "hwp-uclamp")]
 impl SchedulerClampCache {
-    const fn new(min: u16, max: u16, version: u64) -> Self {
+    const fn new(min: u32, max: u32, version: u64) -> Self {
+        debug_assert!(min <= max && max <= 1024);
         Self {
-            packed: AtomicU32::new(pack_sched_clamp(min, max)),
+            packed: AtomicU32::new(pack_sched_clamp(min as u16, max as u16)),
             version: AtomicU64::new(version),
             sequence: AtomicU64::new(0),
         }
@@ -1396,21 +1305,98 @@ impl Thread {
         Ok(())
     }
 
+    /// Copy only attr-authorized perf contexts into a private child scheduler
+    /// state.  The child inherits no descriptor numbers or ring mappings.
+    pub(crate) fn inherit_perf_groups_to(
+        &self,
+        child: &Thread,
+        child_task_id: u64,
+        clone_thread: bool,
+    ) -> AxResult<()> {
+        let groups = self.perf_events.lock();
+        for group in groups.iter() {
+            if let Some(inherited) = group.inherit_for_child(child_task_id, clone_thread)? {
+                child.attach_perf_group(inherited)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn detach_empty_perf_group(&self, group: &Arc<crate::file::PerfGroup>) {
         let mut events = self.perf_events.lock();
         events.retain(|attached| !Arc::ptr_eq(attached, group) || !attached.is_prunable());
     }
 
     fn perf_on_enter(&self) {
-        #[cfg(feature = "perf-sampling")]
-        if let Some(event) = self.perf_sampling.lock().as_ref().and_then(Weak::upgrade) {
-            event.enter_current();
+        self.arbitrate_perf_current(false, true);
+        let mut slots = [None; 4];
+        let mut used = 0;
+        let events = self.perf_events.lock();
+        for group in events.iter() {
+            group.append_debug_breakpoints(&mut slots, &mut used);
         }
-        let mut events = self.perf_events.lock();
-        events.retain(|group| {
-            group.on_enter();
-            !group.is_prunable()
-        });
+        crate::file::PerfGroup::cpu_context_append_debug_breakpoints(
+            axhal::percpu::this_cpu_id(),
+            &mut slots,
+            &mut used,
+        );
+        axcpu::asm::program_perf_debug_registers(slots);
+    }
+
+    /// Take a bounded strong snapshot before entering the CPU PMU arbiter.
+    /// This deliberately releases the task event lock before it takes the
+    /// CPU-context registry, so open/close/control cannot invert scheduler
+    /// locking. `activate` is used only at the real task-enter boundary.
+    pub(crate) fn arbitrate_perf_current(&self, tick: bool, activate: bool) {
+        let mut groups: [Option<Arc<crate::file::PerfGroup>>; crate::file::MAX_GROUPS_PER_THREAD] =
+            core::array::from_fn(|_| None);
+        {
+            let mut events = self.perf_events.lock();
+            if activate {
+                events.retain(|group| {
+                    group.on_enter();
+                    !group.is_prunable()
+                });
+            } else {
+                events.retain(|group| !group.is_prunable());
+            }
+            for (slot, group) in groups.iter_mut().zip(events.iter()) {
+                *slot = Some(group.clone());
+            }
+        }
+        crate::file::PerfGroup::arbitrate_cpu_with_task_slots(
+            axhal::percpu::this_cpu_id(),
+            &groups,
+            tick,
+        );
+    }
+
+    /// Scheduler observer entry supplied with the precise CPL of the timer
+    /// interrupt's saved context. The task extension still handles generic
+    /// scheduler housekeeping; perf accounting lives here so it can share
+    /// that hardware fact with CPU/cgroup contexts.
+    pub(crate) fn perf_on_timer_tick(&self, interrupted_user: bool) {
+        let events = self.perf_events.lock();
+        let now = axhal::time::monotonic_time_nanos();
+        for group in events.iter() {
+            group.account_clock_sources_domain(now, interrupted_user);
+        }
+        drop(events);
+        self.arbitrate_perf_current(true, false);
+    }
+
+    /// Mark an explicit user/kernel execution boundary. This settles the
+    /// preceding interval under its prior domain before beginning the new one.
+    pub(crate) fn perf_clock_domain_transition(&self, user: bool) {
+        let events = self.perf_events.lock();
+        for group in events.iter() {
+            group.account_clock_domain_transition(user);
+        }
+        drop(events);
+        crate::file::PerfGroup::cpu_context_clock_domain_transition(
+            axhal::percpu::this_cpu_id(),
+            user,
+        );
     }
 
     fn perf_on_leave(&self) {
@@ -1421,48 +1407,187 @@ impl Thread {
                 !group.is_prunable()
             });
         }
-        #[cfg(feature = "perf-sampling")]
-        crate::file::PerfSamplingFile::leave_current();
+        // The global scheduler observer has already entered the successor's
+        // CPU/cgroup contexts. Preserve their watchpoints when the successor
+        // is idle or kernel-only; a user successor's on_enter will append its
+        // task-local slots immediately afterwards.
+        let mut slots = [None; 4];
+        let mut used = 0;
+        crate::file::PerfGroup::cpu_context_append_debug_breakpoints(
+            axhal::percpu::this_cpu_id(),
+            &mut slots,
+            &mut used,
+        );
+        axcpu::asm::program_perf_debug_registers(slots);
     }
 
-    #[cfg(feature = "perf-sampling")]
-    pub(crate) fn attach_perf_sampling(
+    fn perf_emit_switch(&self, switch_out: bool, peer: Option<(u32, u32)>) {
+        let own = (self.proc_data.proc.pid() as u32, self.kernel_tid() as u32);
+        for group in self.perf_events.lock().iter() {
+            group.emit_switch_record(switch_out, own, peer);
+        }
+    }
+
+    pub(crate) fn perf_emit_mmap(
         &self,
-        event: &Arc<crate::file::PerfSamplingFile>,
-    ) -> AxResult<()> {
-        let mut sampling = self.perf_sampling.lock();
-        if sampling.as_ref().and_then(Weak::upgrade).is_some() {
-            return Err(AxError::ResourceBusy);
-        }
-        *sampling = Some(Arc::downgrade(event));
-        Ok(())
-    }
-
-    #[cfg(feature = "perf-sampling")]
-    pub(crate) fn detach_perf_sampling(&self, event: &Arc<crate::file::PerfSamplingFile>) {
-        let mut sampling = self.perf_sampling.lock();
-        if sampling
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .is_some_and(|attached| Arc::ptr_eq(&attached, event))
-        {
-            *sampling = None;
+        addr: u64,
+        len: u64,
+        pgoff: u64,
+        info: &crate::perf_records::MmapInfo<'_>,
+    ) {
+        let pid = self.proc_data.proc.pid() as u32;
+        let tid = self.kernel_tid() as u32;
+        for group in self.perf_events.lock().iter() {
+            group.emit_mmap_record(addr, len, pgoff, info, pid, tid);
         }
     }
 
-    #[cfg(feature = "perf-sampling")]
-    pub(crate) fn reconcile_perf_sampling(&self) {
-        if let Some(event) = self.perf_sampling.lock().as_ref().and_then(Weak::upgrade) {
-            event.reconcile_current();
-        }
-    }
-
-    fn perf_on_fault(&self) {
+    pub(crate) fn perf_on_exec(&self) {
+        let pid = self.proc_data.proc.pid() as u32;
+        let tid = self.kernel_tid() as u32;
+        let name = current().try_name().ok();
         let mut events = self.perf_events.lock();
         events.retain(|group| {
-            group.on_fault();
+            group.on_exec(pid, tid, name.as_deref().unwrap_or_default().as_bytes());
             !group.is_prunable()
         });
+    }
+
+    pub(crate) fn perf_emit_fork(&self, child_pid: u32, child_tid: u32) {
+        let parent_pid = self.proc_data.proc.pid() as u32;
+        let parent_tid = self.kernel_tid() as u32;
+        for group in self.perf_events.lock().iter() {
+            group.emit_fork_record(child_pid, parent_pid, child_tid, parent_tid);
+        }
+    }
+
+    fn perf_emit_exit(&self) {
+        let pid = self.proc_data.proc.pid() as u32;
+        let ppid = self
+            .proc_data
+            .proc
+            .parent()
+            .map_or(0, |parent| parent.pid() as u32);
+        let tid = self.kernel_tid() as u32;
+        for group in self.perf_events.lock().iter() {
+            group.emit_exit_record(pid, ppid, tid, ppid);
+        }
+    }
+
+    fn perf_on_minor_fault(&self) {
+        let mut events = self.perf_events.lock();
+        events.retain(|group| {
+            group.on_minor_fault();
+            !group.is_prunable()
+        });
+        crate::file::PerfGroup::cpu_context_minor_fault(axhal::percpu::this_cpu_id());
+    }
+
+    fn perf_on_major_fault(&self) {
+        let mut events = self.perf_events.lock();
+        events.retain(|group| {
+            group.on_major_fault();
+            !group.is_prunable()
+        });
+        crate::file::PerfGroup::cpu_context_major_fault(axhal::percpu::this_cpu_id());
+    }
+
+    fn perf_on_migration(&self) {
+        let mut events = self.perf_events.lock();
+        events.retain(|group| {
+            group.on_migration();
+            !group.is_prunable()
+        });
+    }
+
+    /// Last scheduler CPU observed for an exact task.  Cgroup's membership
+    /// commit uses this only to target its bounded PerfReconcile IPI; the IPI
+    /// handler validates that the task is still current before touching a
+    /// CPU-context group.
+    pub(crate) fn perf_last_cpu_for_reconcile(&self) -> Option<usize> {
+        let cpu = self.perf_last_cpu.load(Ordering::Acquire);
+        (cpu != usize::MAX).then_some(cpu)
+    }
+
+    fn perf_emit_tracepoint(&self, id: u64) {
+        let mut events = self.perf_events.lock();
+        events.retain(|group| {
+            group.emit_tracepoint(id);
+            !group.is_prunable()
+        });
+    }
+
+    /// Trap-side dynamic perf source delivery.  The event descriptor is a
+    /// compact Copy value, so debug/probe dispatch does not allocate or touch
+    /// a user mapping while matching this task's active groups.
+    pub(crate) fn perf_emit_dynamic(&self, event: crate::file::PerfEvent) {
+        self.perf_emit_dynamic_raw(event, &[]);
+    }
+
+    pub(crate) fn perf_emit_dynamic_raw(&self, event: crate::file::PerfEvent, raw: &[u8]) {
+        self.perf_emit_dynamic_raw_at(event, 0, raw);
+    }
+
+    pub(crate) fn perf_emit_dynamic_raw_at(
+        &self,
+        event: crate::file::PerfEvent,
+        ip: u64,
+        raw: &[u8],
+    ) {
+        let mut events = self.perf_events.lock();
+        events.retain(|group| {
+            group.emit_dynamic_raw_at(event, ip, raw);
+            !group.is_prunable()
+        });
+        drop(events);
+        crate::file::PerfGroup::cpu_context_dynamic_raw_at(
+            axhal::percpu::this_cpu_id(),
+            event,
+            ip,
+            raw,
+        );
+    }
+
+    pub(crate) fn perf_emit_tracepoint_raw(&self, id: u64, raw: &[u8]) {
+        let mut events = self.perf_events.lock();
+        events.retain(|group| {
+            group.emit_tracepoint_raw(id, raw);
+            !group.is_prunable()
+        });
+        drop(events);
+        crate::file::PerfGroup::cpu_context_tracepoint(axhal::percpu::this_cpu_id(), id, raw);
+    }
+
+    pub(crate) fn perf_emit_debug_exception(&self, slot_mask: u64, ip: u64, user: bool) {
+        let mut events = self.perf_events.lock();
+        let mut slot = 0;
+        events.retain(|group| {
+            group.emit_debug_exception(slot_mask, &mut slot, ip, user);
+            !group.is_prunable()
+        });
+        drop(events);
+        crate::file::PerfGroup::cpu_context_debug_exception(
+            axhal::percpu::this_cpu_id(),
+            slot_mask,
+            &mut slot,
+            ip,
+            user,
+        );
+    }
+
+    pub(crate) fn refresh_perf_debug_registers(&self) {
+        let events = self.perf_events.lock();
+        let mut slots = [None; 4];
+        let mut used = 0;
+        for group in events.iter() {
+            group.append_debug_breakpoints(&mut slots, &mut used);
+        }
+        crate::file::PerfGroup::cpu_context_append_debug_breakpoints(
+            axhal::percpu::this_cpu_id(),
+            &mut slots,
+            &mut used,
+        );
+        axcpu::asm::program_perf_debug_registers(slots);
     }
 
     /// Create a new [`Thread`].
@@ -1481,6 +1606,7 @@ impl Thread {
             credential,
             seccomp,
             None,
+            false,
             fs_context,
             fd_table,
             0,
@@ -1498,6 +1624,7 @@ impl Thread {
         credential: Arc<CredentialSlot>,
         seccomp: Arc<SeccompState>,
         io_context: Option<Arc<AtomicU16>>,
+        io_flusher: bool,
         fs_context: Arc<FsContextSlot>,
         fd_table: Arc<FdTableSlot>,
         personality: u32,
@@ -1513,6 +1640,8 @@ impl Thread {
             proc_data.seed_scheduler_state(
                 scheduler_seed.state,
                 scheduler_seed.reset_on_fork,
+                scheduler_seed.uclamp,
+                scheduler_seed.utilization_bounds,
                 scheduler_seed.version,
             );
         }
@@ -1528,9 +1657,16 @@ impl Thread {
         let time = TimeManager::new(&proc_data);
         let (seccomp, seccomp_terminal_disabled) = super::seccomp::new_thread_seccomp(seccomp)?;
         let resource_admission = TaskResourceAdmission::new(fs_context.clone(), fd_table.clone());
+        let namespaces = proc_data.namespace_proxy();
+        // SEM_UNDO follows the live task namespace, not ProcessData's leader
+        // snapshot. Clone/unshare may replace this private state before task
+        // publication.
+        let sem_undo = super::process::SemUndoState::try_new(namespaces.ipc())?;
         let thread = Box::try_new(Thread {
             signal,
             proc_data,
+            namespaces: SpinNoIrq::new(namespaces),
+            sem_undo: SpinNoIrq::new(sem_undo),
             credential,
             fs_context: SpinNoIrq::new(Some(fs_context)),
             fd_table: SpinNoIrq::new(Some(fd_table)),
@@ -1547,8 +1683,6 @@ impl Thread {
             kernel_tid: tid,
             task_parent,
             robust_list_head: AtomicUsize::new(0),
-            #[cfg(target_arch = "x86_64")]
-            cet_signal_frames: SpinNoIrq::new(CetPendingSignalFrames::new()),
             time: AssumeSync(RefCell::new(time)),
             live_usage: AtomicTaskUsage::new(),
             minor_faults: AtomicU64::new(0),
@@ -1557,6 +1691,7 @@ impl Thread {
             io_write_bytes: AtomicU64::new(0),
             voluntary_switches: AtomicU64::new(0),
             involuntary_switches: AtomicU64::new(0),
+            perf_last_cpu: AtomicUsize::new(usize::MAX),
             perf_events: SpinNoIrq::new({
                 let mut groups = Vec::new();
                 groups
@@ -1564,17 +1699,22 @@ impl Thread {
                     .map_err(|_| AxError::NoMemory)?;
                 groups
             }),
-            #[cfg(feature = "perf-sampling")]
-            perf_sampling: SpinNoIrq::new(None),
             #[cfg(feature = "hwp-uclamp")]
             sched_clamp: SchedulerClampCache::new(
-                scheduler_seed.util_min,
-                scheduler_seed.util_max,
+                scheduler_seed.utilization_bounds.minimum,
+                scheduler_seed.utilization_bounds.maximum,
                 scheduler_seed.version,
             ),
+            uclamp_policy_generation: AtomicU64::new(0),
             exit_switch_preaccounted: AtomicBool::new(false),
             proc_state_hint: AtomicU8::new(ProcStateHint::None as u8),
+            iowait_depth: AtomicU32::new(0),
+            iowait_started_ns: AtomicU64::new(0),
+            iowait_total_ns: AtomicU64::new(0),
+            cgroup_freezer_parked: AtomicBool::new(false),
             io_context: SpinNoIrq::new(io_context),
+            io_flusher: AtomicBool::new(io_flusher),
+            mce_kill_policy: AtomicU8::new(2),
             ioport: SpinNoIrq::new(IoPortState::default()),
             exit,
             oom_score_adj: AtomicI32::new(200),
@@ -1598,6 +1738,164 @@ impl Thread {
         Ok((thread, registration))
     }
 
+    pub(crate) fn namespace_proxy(&self) -> NamespaceProxy {
+        self.namespaces.lock().clone()
+    }
+
+    pub(crate) fn namespace_credential_fs_snapshot(&self) -> NamespaceCredentialFsSnapshot {
+        let _publication = super::fs_context_publication();
+        let namespaces = self.namespaces.lock().clone();
+        let mount_topology = namespaces.mount().topology();
+        let credential = self.current_cred();
+        let fs_slot = self
+            .fs_context
+            .lock()
+            .as_ref()
+            .expect("retired fs_struct")
+            .clone();
+        let fs_context = fs_slot.context.clone();
+        let fs_snapshot = fs_context.lock().clone();
+        let landlock_domain = self.landlock_domain();
+        let controlling_terminal = self.proc_data.proc.group().session().terminal();
+        NamespaceCredentialFsSnapshot {
+            namespaces,
+            mount_topology,
+            credential,
+            fs_slot,
+            fs_context,
+            fs_snapshot,
+            landlock_domain,
+            controlling_terminal,
+        }
+    }
+
+    pub(crate) fn user_ns(&self) -> Arc<super::process::UserNamespace> {
+        self.namespaces.lock().user()
+    }
+    pub(crate) fn pid_ns(&self) -> Arc<super::process::PidNamespace> {
+        self.namespaces.lock().pid()
+    }
+    pub(crate) fn pid_ns_for_children(&self) -> Arc<super::process::PidNamespace> {
+        self.namespaces.lock().pid_for_children()
+    }
+    pub(crate) fn mount_ns(&self) -> Arc<super::process::MountNamespace> {
+        self.namespaces.lock().mount()
+    }
+    pub(crate) fn ipc_ns(&self) -> Arc<crate::syscall::IpcNamespace> {
+        self.namespaces.lock().ipc()
+    }
+    pub(crate) fn net_ns(&self) -> Arc<super::process::NetworkNamespace> {
+        self.namespaces.lock().net()
+    }
+    pub(crate) fn cgroup_ns(&self) -> Arc<super::process::CgroupNamespace> {
+        self.namespaces.lock().cgroup()
+    }
+    pub(crate) fn uts_ns(&self) -> Arc<super::process::UtsNamespace> {
+        self.namespaces.lock().uts()
+    }
+    pub(crate) fn time_ns(&self) -> Arc<super::process::TimeNamespace> {
+        self.namespaces.lock().time()
+    }
+    pub(crate) fn time_ns_for_children(&self) -> Arc<super::process::TimeNamespace> {
+        self.namespaces.lock().time_for_children()
+    }
+
+    pub(crate) fn prepare_namespace_replacement(
+        &self,
+        update: impl FnOnce(&mut NamespaceProxy),
+    ) -> super::process::PreparedNamespaceProxyReplacement {
+        let mut replacement = self.namespace_proxy();
+        update(&mut replacement);
+        super::process::PreparedNamespaceProxyReplacement { replacement }
+    }
+
+    /// Called only before child task publication.  This is deliberately a
+    /// snapshot rather than a shared slot: a later setns in either sibling
+    /// must not retarget the other task.
+    pub(crate) fn inherit_namespace_proxy_from(&self, source: &Self) {
+        let replacement = source.namespace_proxy();
+        let old = core::mem::replace(&mut *self.namespaces.lock(), replacement);
+        drop(old);
+    }
+
+    pub(crate) fn sem_undo(&self) -> Arc<super::process::SemUndoState> {
+        self.sem_undo.lock().clone()
+    }
+
+    pub(crate) fn replace_sem_undo(&self, replacement: Arc<super::process::SemUndoState>) {
+        let old = self.replace_sem_undo_deferred(replacement);
+        Self::retire_sem_undo(old);
+    }
+
+    /// Exchanges the attachment while an external publication gate is held.
+    /// The caller retires the displaced list only after that gate is released.
+    pub(crate) fn replace_sem_undo_deferred(
+        &self,
+        replacement: Arc<super::process::SemUndoState>,
+    ) -> Arc<super::process::SemUndoState> {
+        core::mem::replace(&mut *self.sem_undo.lock(), replacement)
+    }
+
+    pub(crate) fn retire_sem_undo(old: Arc<super::process::SemUndoState>) {
+        // Leaving an IPC namespace must not silently lose a private SEM_UNDO
+        // adjustment. Shared CLONE_SYSVSEM state remains live until its last
+        // thread owner exits or changes namespace.
+        if Arc::strong_count(&old) == 1 {
+            old.apply_on_final_exit();
+        }
+        drop(old);
+    }
+
+    /// Atomically replace a task's IPC proxy attachment and its matching
+    /// private SEM_UNDO list. The displaced list retains its old manager and
+    /// is retired only after the publication gate is released.
+    pub(crate) fn commit_namespace_with_sem_undo(
+        &self,
+        prepared: super::process::PreparedNamespaceProxyReplacement,
+        replacement: Arc<super::process::SemUndoState>,
+    ) {
+        let (old_proxy, old) = {
+            let _publication = super::fs_context_publication();
+            let old_proxy = prepared.commit_under_publication(self);
+            let old_sem_undo = core::mem::replace(&mut *self.sem_undo.lock(), replacement);
+            (old_proxy, old_sem_undo)
+        };
+        drop(old_proxy);
+        Self::retire_sem_undo(old);
+    }
+
+    /// Publishes a prepared pidfd-setns namespace aggregate and every
+    /// resource attachment coupled to it.  A pidfd request can select mount
+    /// and IPC namespaces together, so the fs_struct and SEM_UNDO pointers
+    /// cannot be committed through separate visibility windows.
+    pub(crate) fn commit_namespace_with_resources(
+        &self,
+        prepared: super::process::PreparedNamespaceProxyReplacement,
+        replacement_fs: Option<Arc<FsContextSlot>>,
+        replacement_sem_undo: Option<Arc<super::process::SemUndoState>>,
+    ) {
+        let (old_proxy, old_fs, old_sem_undo) = {
+            let _publication = super::fs_context_publication();
+            let old_proxy = prepared.commit_under_publication(self);
+            let old_fs = replacement_fs.map(|replacement| self.replace_fs_context(replacement));
+            let old_sem_undo = replacement_sem_undo
+                .map(|replacement| core::mem::replace(&mut *self.sem_undo.lock(), replacement));
+            (old_proxy, old_fs, old_sem_undo)
+        };
+        drop(old_proxy);
+        drop(old_fs);
+        if let Some(old_sem_undo) = old_sem_undo {
+            Self::retire_sem_undo(old_sem_undo);
+        }
+    }
+
+    pub(crate) fn apply_sem_undo_on_exit(&self) {
+        let state = self.sem_undo();
+        if Arc::strong_count(&state) == 2 {
+            state.apply_on_final_exit();
+        }
+    }
+
     pub(crate) fn personality(&self) -> u32 {
         self.personality.load(Ordering::Acquire)
     }
@@ -1615,6 +1913,20 @@ impl Thread {
         self.sched_clamp.publish(min, max, version);
     }
 
+    /// Marks this thread's task-local scheduler clamp as derived from one
+    /// fully committed cgroup/system policy generation.  Writers only call
+    /// this after the runqueue transaction succeeds; failed transactions
+    /// leave the task dirty for a later safe-boundary retry.
+    pub(crate) fn publish_uclamp_policy_generation(&self, generation: u64) {
+        debug_assert_eq!(generation & 1, 0);
+        self.uclamp_policy_generation
+            .store(generation, Ordering::Release);
+    }
+
+    pub(crate) fn uclamp_policy_generation(&self) -> u64 {
+        self.uclamp_policy_generation.load(Ordering::Acquire)
+    }
+
     #[cfg(feature = "hwp-uclamp")]
     fn apply_current_hwp_clamp(&self) {
         let (min, max, _) = self.scheduler_clamp_snapshot();
@@ -1628,43 +1940,10 @@ impl Thread {
         let _ = axhal::hwp::apply_current_clamp(0, 1024);
     }
 
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn cet_signal_reserve(&self) -> Option<(u64, u64)> {
-        self.cet_signal_frames.lock().reserve()
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn cet_signal_has_capacity(&self) -> bool {
-        self.cet_signal_frames.lock().has_capacity()
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn cet_signal_push(&self, frame: CetPendingSignalFrame) -> bool {
-        self.cet_signal_frames.lock().push(frame)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn cet_signal_top(&self) -> Option<CetPendingSignalFrame> {
-        self.cet_signal_frames.lock().top()
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn cet_signal_pop_if(&self, frame: CetPendingSignalFrame) -> bool {
-        self.cet_signal_frames.lock().pop_if(frame)
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn clear_cet_signal_frames(&self) {
-        self.cet_signal_frames.lock().invalidate();
-    }
-
-    /// Fork copies the in-handler CET authentication stack so the child can
-    /// complete its inherited handler with a valid LIFO sigreturn. Pending
-    /// signal delivery state remains owned by the signal managers and is not
-    /// copied here.
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn clone_cet_signal_frames_from(&self, source: &Self) {
-        *self.cet_signal_frames.lock() = source.cet_signal_frames.lock().clone();
+    /// A child which inherits an in-flight signal handler also inherits the
+    /// restart bookkeeping for that handler. CET signal authentication is not
+    /// stored here: its LIFO state lives entirely in the copied shadow stack.
+    pub(crate) fn copy_signal_handler_restart_state_from(&self, source: &Self) {
         self.restart
             .lock()
             .copy_handler_state_from(&source.restart.lock());
@@ -1717,6 +1996,14 @@ impl Thread {
             .table
             .clone()
     }
+
+    /// Pins this task's files table if it has not crossed final files_struct
+    /// retirement.  Cross-task inspection must use this fallible form: a live
+    /// task-table reference can race exit after lookup, and that race is an
+    /// ordinary missing-FD result rather than a kernel invariant failure.
+    pub(crate) fn try_fd_table(&self) -> Option<Arc<crate::file::FdTable>> {
+        self.fd_table.lock().as_ref().map(|slot| slot.table.clone())
+    }
     pub(crate) fn fd_table_is_shared(&self) -> bool {
         self.fd_table
             .lock()
@@ -1752,7 +2039,8 @@ impl Thread {
     }
     pub(crate) fn replace_fd_table(&self, replacement: Arc<FdTableSlot>) -> Arc<FdTableSlot> {
         replacement.acquire_task();
-        let old = core::mem::replace(&mut *self.fd_table.lock(), Some(replacement))
+        let old = (*self.fd_table.lock())
+            .replace(replacement)
             .expect("retired files_struct");
         old.release_task();
         old
@@ -1795,13 +2083,86 @@ impl Thread {
             .transpose()
     }
 
+    pub(crate) fn fs_context_is_shared(&self) -> bool {
+        self.fs_context
+            .lock()
+            .as_ref()
+            .expect("retired fs_struct")
+            .task_users
+            .load(Ordering::Relaxed)
+            != 1
+    }
+
+    /// Prepares a private fs_struct whose root/cwd already point into a mount
+    /// namespace being entered.  No task slot is replaced here: setns can
+    /// therefore complete every fallible path-resolution update before its
+    /// namespace/credential commit becomes visible.
+    pub(crate) fn prepare_fs_context_for_mount_namespace(
+        &self,
+        root: axfs_ng_vfs::Location,
+    ) -> AxResult<Arc<FsContextSlot>> {
+        let mut context = self.fs_context().lock().clone();
+        context.set_root_dir(root.clone())?;
+        context.set_current_dir(root)?;
+        Arc::try_new(FsContextSlot {
+            context: Arc::try_new(Mutex::new(context)).map_err(|_| AxError::NoMemory)?,
+            task_users: AtomicUsize::new(0),
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
+    /// Rebinds the caller's root and cwd to the corresponding dentries in a
+    /// freshly cloned mount tree.  CLONE_NEWNS duplicates the topology; it
+    /// does not perform chroot(2) or chdir(2), so the two paths must be
+    /// preserved independently.
+    pub(crate) fn prepare_fs_context_for_cloned_mount_namespace(
+        &self,
+        namespace_root: axfs_ng_vfs::Location,
+    ) -> AxResult<Arc<FsContextSlot>> {
+        let fs_context = self.fs_context();
+        let source = fs_context.lock();
+        let root_path = source.root_dir().absolute_path()?;
+        let cwd_path = source.current_dir().absolute_path()?;
+        let namespace_view = FsContext::new(namespace_root);
+        let root = namespace_view.resolve(&root_path)?;
+        let cwd = namespace_view.resolve(&cwd_path)?;
+        let mut context = source.clone();
+        drop(source);
+        context.set_root_dir(root)?;
+        context.set_current_dir(cwd)?;
+        Arc::try_new(FsContextSlot {
+            context: Arc::try_new(Mutex::new(context)).map_err(|_| AxError::NoMemory)?,
+            task_users: AtomicUsize::new(0),
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
     /// Replaces this task's `fs_struct`, used by `unshare(CLONE_FS)`.
     pub(crate) fn replace_fs_context(&self, replacement: Arc<FsContextSlot>) -> Arc<FsContextSlot> {
         replacement.acquire_task();
-        let old = core::mem::replace(&mut *self.fs_context.lock(), Some(replacement))
+        let old = (*self.fs_context.lock())
+            .replace(replacement)
             .expect("retired fs_struct");
         old.release_task();
         old
+    }
+
+    /// Publish a prepared mount-namespace proxy and its already validated
+    /// fs_struct under the one gate observers use for root/cwd replacement.
+    /// There is no fallible operation after this gate is acquired.
+    pub(crate) fn commit_namespace_with_fs_context(
+        &self,
+        prepared: super::process::PreparedNamespaceProxyReplacement,
+        replacement: Arc<FsContextSlot>,
+    ) -> Arc<FsContextSlot> {
+        let (old_proxy, old_fs) = {
+            let _publication = super::fs_context_publication();
+            let old_proxy = prepared.commit_under_publication(self);
+            let old_fs = self.replace_fs_context(replacement);
+            (old_proxy, old_fs)
+        };
+        drop(old_proxy);
+        old_fs
     }
 
     /// Removes the exact task owner's fs_struct at authoritative task unlink.
@@ -1819,6 +2180,22 @@ impl Thread {
     /// has already allocated one for this task.
     pub(crate) fn io_context(&self) -> Option<Arc<AtomicU16>> {
         self.io_context.lock().clone()
+    }
+
+    pub(crate) fn io_flusher(&self) -> bool {
+        self.io_flusher.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_io_flusher(&self, enabled: bool) {
+        self.io_flusher.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn mce_kill_policy(&self) -> u8 {
+        self.mce_kill_policy.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_mce_kill_policy(&self, policy: u8) {
+        self.mce_kill_policy.store(policy, Ordering::Release);
     }
 
     /// Returns the raw Linux `ioprio` value stored for this task.
@@ -2129,6 +2506,11 @@ impl Thread {
         // is also used by non-final thread exits and may be called again by
         // defensive teardown paths.
         self.exit.store(true, Ordering::Release);
+        // CPU-clock sleeps retain an Arc to their target.  Its accounting can
+        // no longer make progress after this transition, so wake waiters to
+        // observe the terminal lifetime state instead of leaving them parked
+        // on an unreachable CPU deadline.
+        super::notify_cpu_clock_sleepers();
     }
 
     /// Returns the last published CPU usage snapshot for this thread.
@@ -2146,18 +2528,22 @@ impl Thread {
     /// Publishes a CPU usage snapshot for lock-free readers such as procfs.
     pub fn store_usage_snapshot(&self, usage: TaskUsage) {
         self.live_usage.store(usage);
+        // Publish after the atomic accounting snapshot so CPU-clock sleepers
+        // never wake solely to observe the preceding value.  Keeping this in
+        // the common publisher also covers explicit scheduler timer polls.
+        super::notify_cpu_clock_sleepers();
     }
 
     /// Accounts one successfully handled minor page fault.
     pub(crate) fn account_minor_fault(&self) {
         self.minor_faults.fetch_add(1, Ordering::Relaxed);
-        self.perf_on_fault();
+        self.perf_on_minor_fault();
     }
 
     /// Accounts one successfully handled major page fault.
     pub(crate) fn account_major_fault(&self) {
         self.major_faults.fetch_add(1, Ordering::Relaxed);
-        self.perf_on_fault();
+        self.perf_on_major_fault();
     }
 
     /// Accounts bytes transferred by a real backing read, before conversion
@@ -2233,6 +2619,71 @@ impl Thread {
         );
     }
 
+    /// Enters one nested I/O-wait interval.  Only the outermost holder owns
+    /// elapsed-time accounting; inner readiness retries merely extend it.
+    pub(crate) fn enter_iowait(&self) {
+        if self.iowait_depth.fetch_add(1, Ordering::AcqRel) == 0 {
+            self.iowait_started_ns
+                .store(axhal::time::monotonic_time_nanos(), Ordering::Release);
+        }
+    }
+
+    /// Leaves an I/O-wait interval without permitting a stale wake/exit path
+    /// to underflow the nested counter.  The total is saturating because it is
+    /// an observational scheduler/accounting value.
+    pub(crate) fn leave_iowait(&self) {
+        let mut depth = self.iowait_depth.load(Ordering::Acquire);
+        loop {
+            if depth == 0 {
+                return;
+            }
+            match self.iowait_depth.compare_exchange_weak(
+                depth,
+                depth - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(1) => {
+                    let start = self.iowait_started_ns.swap(0, Ordering::AcqRel);
+                    let elapsed = axhal::time::monotonic_time_nanos().saturating_sub(start);
+                    self.iowait_total_ns
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |total| {
+                            Some(total.saturating_add(elapsed))
+                        })
+                        .ok();
+                    return;
+                }
+                Ok(_) => return,
+                Err(observed) => depth = observed,
+            }
+        }
+    }
+
+    /// Exposes scheduler I/O-wait state to proc/scheduler accounting readers.
+    pub(crate) fn iowait_accounting(&self) -> (u32, u64) {
+        (
+            self.iowait_depth.load(Ordering::Acquire),
+            self.iowait_total_ns.load(Ordering::Acquire),
+        )
+    }
+
+    pub(crate) fn enter_cgroup_freezer(&self) {
+        if self.proc_data.cgroup_freeze_requested()
+            && self
+                .cgroup_freezer_parked
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.proc_data.enter_cgroup_freezer();
+        }
+    }
+
+    pub(crate) fn leave_cgroup_freezer(&self) {
+        if self.cgroup_freezer_parked.swap(false, Ordering::AcqRel) {
+            self.proc_data.leave_cgroup_freezer();
+        }
+    }
+
     fn pause_cpu_accounting_for_switch(&self) {
         let _guard = kernel_guard::NoPreemptIrqSave::new();
         let usage = {
@@ -2298,6 +2749,15 @@ impl Thread {
 
 impl Drop for Thread {
     fn drop(&mut self) {
+        crate::syscall::release_registered_ring_fds(self.kernel_tid() as u64);
+        // Task teardown is a lifecycle edge, not a deferred scheduler hint.
+        // A surviving descriptor (or inherited child-only file) may still
+        // retain a group Arc, so force its exact placement through the same
+        // generation/ack reconcile protocol before dropping task ownership.
+        for group in self.perf_events.get_mut().iter() {
+            group.reconcile_last_descriptor();
+        }
+        self.leave_cgroup_freezer();
         if let Some(slot) = self.fs_context.get_mut().take() {
             slot.release_task();
         }
@@ -2313,6 +2773,8 @@ pub(crate) enum ProcStateHint {
     None            = 0,
     Interruptible   = 1,
     Uninterruptible = 2,
+    /// Interruptible readiness sleep accounted as I/O wait.
+    IoWait          = 3,
 }
 
 impl From<u8> for ProcStateHint {
@@ -2321,6 +2783,7 @@ impl From<u8> for ProcStateHint {
             0 => Self::None,
             1 => Self::Interruptible,
             2 => Self::Uninterruptible,
+            3 => Self::IoWait,
             _ => Self::None,
         }
     }
@@ -2329,9 +2792,12 @@ impl From<u8> for ProcStateHint {
 #[extern_trait]
 impl TaskExt for Box<Thread> {
     fn on_enter(&self, _task: &TaskInner) {
-        #[cfg(feature = "hwp-uclamp")]
-        self.apply_current_hwp_clamp();
         self.perf_on_enter();
+        let cpu = axhal::percpu::this_cpu_id();
+        let previous_cpu = self.perf_last_cpu.swap(cpu, Ordering::AcqRel);
+        if previous_cpu != usize::MAX && previous_cpu != cpu {
+            self.perf_on_migration();
+        }
         let state = self.proc_data.aspace_tlb_state();
         state.enter_current();
         // A scheduler enter is the migration observation consumed by the
@@ -2343,10 +2809,21 @@ impl TaskExt for Box<Thread> {
         self.resume_cpu_accounting_after_switch();
     }
 
+    fn on_switch(
+        &self,
+        _task: &TaskInner,
+        peer: &TaskInner,
+        switch_out: bool,
+        _reason: SwitchReason,
+    ) {
+        let peer_thread = peer.try_as_thread();
+        let peer_pid = peer_thread.map_or(0, |thread| thread.proc_data.proc.pid() as u32);
+        let peer_tid = peer_thread.map_or(0, |_| peer.id().as_u64() as u32);
+        self.perf_emit_switch(switch_out, Some((peer_pid, peer_tid)));
+    }
+
     fn on_leave(&self, task: &TaskInner, reason: SwitchReason) {
         let _ = task;
-        #[cfg(feature = "hwp-uclamp")]
-        Thread::clear_current_hwp_clamp();
         // Every scheduler leave is a preemption observation.  The final
         // return gate decides whether the saved IP was in an active critical
         // section and performs any abort before user entry.
@@ -2357,6 +2834,9 @@ impl TaskExt for Box<Thread> {
             self.account_context_switch(!reason.is_involuntary());
         }
         self.perf_on_leave();
+        if reason == SwitchReason::Exit {
+            self.perf_emit_exit();
+        }
         self.pause_cpu_accounting_for_switch();
         ActiveScope::set_global();
         self.release_active_scope_read();
@@ -2371,11 +2851,7 @@ impl TaskExt for Box<Thread> {
     }
 
     fn on_timer_tick(&self, _task: &TaskInner) -> bool {
-        #[cfg(feature = "hwp-uclamp")]
-        self.apply_current_hwp_clamp();
         super::load_average_sample_now();
-        #[cfg(feature = "perf-sampling")]
-        self.reconcile_perf_sampling();
         self.poll_cpu_accounting_for_tick()
     }
 }

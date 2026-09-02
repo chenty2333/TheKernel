@@ -1,18 +1,19 @@
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::AtomicU16;
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
 use axtask::{
-    AxTaskExt, SchedClass, current, prepare_task_with_sched_from, publish_prepared_task,
-    reclaim_exited_tasks, reserve_prepared_task, scheduler_state_snapshot,
-    set_prepared_task_sched_reset_on_fork, yield_now,
+    AxTaskExt, SchedClass, UtilizationBounds, current, prepare_task_with_sched_from,
+    publish_prepared_task, reclaim_exited_tasks, reserve_prepared_task,
+    set_prepared_task_reset_on_spawn, set_prepared_task_uclamp_request,
+    set_prepared_task_utilization_bounds, task_scheduling_snapshot, yield_now,
 };
-#[cfg(feature = "hwp-uclamp")]
-use axtask::set_prepared_task_sched_util_clamp;
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
+use thekernel_linux_process::{ClonePlan as LinuxClonePlan, ProcessAbiError};
 use thekernel_linux_process_adapter::{Pid, ProcessError};
+use thekernel_linux_sched as linux_sched;
 use thekernel_linux_signal::{
     SignalInfo, Signo,
     api::{SharedSignalActions, SignalActions},
@@ -24,17 +25,48 @@ use crate::{
     mm::{UserMemoryCapability, copy_from_kernel, map_usercopy_error},
     pseudofs::cgroup,
     readiness::block_on_poll_set_uninterruptible,
-    syscall::{prepare_proc_shm_inheritance, task::thread::map_cet_default_shadow_stack},
+    syscall::task::thread::{cet_default_shadow_stack_size, map_cet_default_shadow_stack},
     task::{
         AsThread, Cred, CredentialSlot, Dumpability, FsContextSlot, InitialProcessThreadAdmission,
-        NetworkNamespace, PendingCredentialPublication, PendingThreadPublication,
-        ProcessAccessState, ProcessData, ProcessInitialAdmission, ProcessThreadAdmission,
-        SchedulerSeed, TaskParentChoice, Thread, fs_context_publication, get_process_data,
-        linux_pid_from_task_id, lock_task_parent_publication, prepare_task_table_admission,
-        process_domain, send_signal_thread_inner, set_task_user_address_space, try_new_user_task,
-        try_tasks,
+        NamespaceProxy, NetworkNamespace, PendingCredentialPublication,
+        PendingThreadPublication, ProcessAccessState, ProcessData, ProcessInitialAdmission,
+        ProcessThreadAdmission, PtraceRelationshipOrigin, SchedulerSeed, SemUndoState,
+        TaskParentChoice, Thread, fs_context_publication, get_process_data, get_task,
+        linux_pid_from_task_id, lock_task_parent_publication, notify_ptrace_attach_stop,
+        prepare_task_table_admission, process_domain, send_signal_thread_inner,
+        set_task_user_address_space, try_new_user_task, try_tasks,
     },
 };
+
+const PTRACE_O_TRACEFORK: u32 = 1 << 1;
+const PTRACE_O_TRACEVFORK: u32 = 1 << 2;
+const PTRACE_O_TRACECLONE: u32 = 1 << 3;
+const PTRACE_EVENT_FORK: u8 = 1;
+const PTRACE_EVENT_VFORK: u8 = 2;
+const PTRACE_EVENT_CLONE: u8 = 3;
+
+fn clone_ptrace_event(flags: CloneFlags, options: u32) -> Option<u8> {
+    if flags.contains(CloneFlags::UNTRACED) {
+        return None;
+    }
+    if flags.contains(CloneFlags::VFORK) && options & PTRACE_O_TRACEVFORK != 0 {
+        Some(PTRACE_EVENT_VFORK)
+    } else if flags.contains(CloneFlags::THREAD) && options & PTRACE_O_TRACECLONE != 0 {
+        Some(PTRACE_EVENT_CLONE)
+    } else if !flags.contains(CloneFlags::THREAD) && options & PTRACE_O_TRACEFORK != 0 {
+        Some(PTRACE_EVENT_FORK)
+    } else {
+        None
+    }
+}
+
+fn interrupt_ptrace_stop_siblings(proc_data: &ProcessData) {
+    for tid in proc_data.proc.thread_ids() {
+        if let Ok(task) = get_task(tid) {
+            task.interrupt();
+        }
+    }
+}
 
 fn should_yield_after_clone(flags: CloneFlags) -> bool {
     // VFORK enters the readiness-armed parent wait immediately after publication;
@@ -58,14 +90,19 @@ const fn clone_signal_altstack(flags: CloneFlags) -> crate::task::ForkSignalAltS
 }
 
 /// CET stack handling is intentionally distinct from ordinary address-space
-/// clone handling. A vfork child borrows the parent's active stack lease even
-/// when the raw clone flags do not also request `CLONE_VM`.
+/// clone handling. A vfork child borrows the parent's active stack lease in
+/// the shared address space required by `CLONE_VFORK | CLONE_VM`.
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CetShadowStackCloneMode {
     ForkCow,
     BorrowVfork,
     NewSharedMmThread,
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn clone_inherits_cet_handler_state(flags: CloneFlags) -> bool {
+    !flags.contains(CloneFlags::VM) || flags.contains(CloneFlags::VFORK)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -79,9 +116,24 @@ const fn cet_shadow_stack_clone_mode(flags: CloneFlags) -> CetShadowStackCloneMo
     }
 }
 
+/// Size a private automatic shadow stack for a new shared-mm child.
+///
+/// The legacy `clone(2)` ABI has no stack-size field, so it retains the
+/// RLIMIT_STACK-derived default.  In contrast, `clone3(CLONE_VM)` must carry
+/// an explicit non-zero `stack_size`: the ordinary stack pointer is not a
+/// size, and borrowing the parent's default would make peer teardown unsafe.
+/// Keep this check next to CET's clone-mode decision so failed validation
+/// leaves the shared address space untouched.
 #[cfg(target_arch = "x86_64")]
-const fn clone_inherits_cet_handler_state(flags: CloneFlags) -> bool {
-    !flags.contains(CloneFlags::VM) || flags.contains(CloneFlags::VFORK)
+fn cet_shared_mm_shadow_stack_size(
+    api: CloneApi,
+    stack_size: usize,
+    rlimit_stack: u64,
+) -> AxResult<usize> {
+    if api == CloneApi::Clone3 && stack_size == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    cet_default_shadow_stack_size(stack_size, rlimit_stack)
 }
 
 fn clone_namespace_owner(
@@ -91,7 +143,13 @@ fn clone_namespace_owner(
 ) -> AxResult<Arc<crate::task::UserNamespace>> {
     let owner = child_cred.user_ns().clone();
     if flags.intersects(
-        CloneFlags::NEWCGROUP | CloneFlags::NEWUTS | CloneFlags::NEWPID | CloneFlags::NEWNET,
+        CloneFlags::NEWCGROUP
+            | CloneFlags::NEWNS
+            | CloneFlags::NEWUTS
+            | CloneFlags::NEWIPC
+            | CloneFlags::NEWPID
+            | CloneFlags::NEWNET
+            | CloneFlags::NEWTIME,
     ) && !crate::task::security::prepared_credential_namespace_capable(
         parent_cred,
         child_cred,
@@ -141,29 +199,63 @@ impl CloneThreadPublication {
 /// admissions have completed.  This also matters for CLONE_VM: a failed child
 /// must not leave a stack record in the parent's mm.
 #[cfg(target_arch = "x86_64")]
+#[derive(Default)]
+struct CetStackLease {
+    committed: bool,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl CetStackLease {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+
+    const fn needs_cleanup(&self) -> bool {
+        !self.committed
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 struct PendingCetDefaultShadowStack {
     aspace: Arc<axsync::Mutex<crate::mm::AddrSpace>>,
     tid: u32,
-    committed: bool,
+    lease: CetStackLease,
 }
 
 #[cfg(target_arch = "x86_64")]
 impl PendingCetDefaultShadowStack {
     fn commit(&mut self) {
-        self.committed = true;
+        self.lease.commit();
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 impl Drop for PendingCetDefaultShadowStack {
     fn drop(&mut self) {
-        if !self.committed {
-            crate::syscall::task::thread::unmap_cet_default_shadow_stack(
-                &mut self.aspace.lock(),
-                self.tid,
-            );
+        if self.lease.needs_cleanup() {
+            let wake = {
+                crate::syscall::task::thread::unmap_cet_default_shadow_stack(
+                    &mut self.aspace.lock(),
+                    self.tid,
+                )
+            };
+            wake.finish();
         }
     }
+}
+
+/// A default-stack owner is cleanup metadata only.  In particular, a valid
+/// explicit `map_shadow_stack(2)` pivot remains the child's live SSP even
+/// after a CLONE_VM peer removed the parent's automatic-stack record.
+#[cfg(target_arch = "x86_64")]
+const fn child_cet_state_after_clone(
+    mut parent: axhal::asm::UserCetState,
+    fresh_ssp: Option<u64>,
+) -> axhal::asm::UserCetState {
+    if let Some(ssp) = fresh_ssp {
+        parent.pl3_ssp = ssp;
+    }
+    parent
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -299,6 +391,12 @@ bitflags! {
         const NEWPID = CLONE_NEWPID as u64;
         /// Create the process in a new network namespace.
         const NEWNET = CLONE_NEWNET as u64;
+        /// Create the child in a new time namespace.
+        ///
+        /// The child receives this namespace as both its active time
+        /// namespace and its `time_for_children` attachment, just as Linux's
+        /// copy_time_ns() does for CLONE_NEWTIME.
+        const NEWTIME = CLONE_NEWTIME as u64;
         /// The new process shares an I/O context with the calling process.
         const IO = CLONE_IO as u64;
         /// Clear signal handlers on clone (since Linux 5.5).
@@ -314,6 +412,7 @@ fn check_rlimit_nproc(thread: &Thread) -> AxResult<()> {
     let proc_data = &thread.proc_data;
     let uid = thread.real_uid();
     let cred = thread.current_cred();
+    let user_ns = cred.user_ns().clone();
     if cred.is_initial_root_ruid()
         || cred.has_effective_capability(CAP_SYS_RESOURCE)
         || cred.has_effective_capability(CAP_SYS_ADMIN)
@@ -330,7 +429,13 @@ fn check_rlimit_nproc(thread: &Thread) -> AxResult<()> {
         .into_iter()
         .filter(|task| {
             let thread = task.as_thread();
-            !thread.pending_exit() && thread.real_uid() == uid
+            // RLIMIT_NPROC is charged to the real UID in its owning user
+            // namespace. A raw kuid alone is insufficient: distinct nested
+            // user namespaces can map the same numeric UID and must not
+            // consume one another's process budget.
+            !thread.pending_exit()
+                && thread.real_uid() == uid
+                && Arc::ptr_eq(thread.current_cred().user_ns(), &user_ns)
         })
         .count() as u64;
 
@@ -347,11 +452,20 @@ pub struct CloneArgs {
     pub flags: CloneFlags,
     pub exit_signal: u64,
     pub stack: usize,
+    /// The explicit `clone3.stack_size` paired with `stack`.  `clone(2)` has
+    /// no size field and therefore supplies zero, selecting the RLIMIT_STACK
+    /// based CET default when a shared-mm child needs its own shadow stack.
+    pub stack_size: usize,
     pub tls: usize,
     pub parent_tid: usize,
     pub child_tid: usize,
     pub pidfd: usize,
     pub cgroup_fd: Option<i32>,
+    /// clone3 namespace-local PIDs, ordered innermost-to-outermost.
+    /// The task runtime identity remains opaque; these values are installed
+    /// only in the Linux PID namespace tables during publication.
+    pub set_tid: [Pid; thekernel_linux_process::SetTidPlan::MAX_ENTRIES],
+    pub set_tid_size: usize,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -372,25 +486,25 @@ impl CloneArgs {
     }
 
     pub(super) fn validate_for(&self, api: CloneApi) -> AxResult<()> {
-        let Self { flags, .. } = self;
+        let Self {
+            flags,
+            set_tid_size,
+            set_tid,
+            ..
+        } = self;
 
-        if flags.intersects(
-            CloneFlags::NEWNS | CloneFlags::NEWIPC | CloneFlags::PTRACE | CloneFlags::UNTRACED,
-        ) {
-            return Err(AxError::OperationNotSupported);
+        // This is normally guaranteed by clone3's bounded usercopy plan, but
+        // keep the common clone admission total: no internal caller may turn
+        // a malformed count into an out-of-bounds slice before the namespace
+        // reservation transaction is created.
+        if *set_tid_size > set_tid.len() {
+            return Err(AxError::InvalidInput);
         }
 
         if flags.contains(CloneFlags::THREAD)
             && !flags.contains(CloneFlags::VM | CloneFlags::SIGHAND)
         {
             return Err(AxError::InvalidInput);
-        }
-        // NPTL thread creation includes CLONE_SYSVSEM. Threads already share
-        // one ProcessData, and SEM_UNDO operations remain explicitly
-        // unsupported, so no representable undo state can diverge. A
-        // non-thread clone would require a separately shared undo-list object.
-        if flags.contains(CloneFlags::SYSVSEM) && !flags.contains(CloneFlags::THREAD) {
-            return Err(AxError::OperationNotSupported);
         }
         if flags.contains(CloneFlags::SIGHAND) && !flags.contains(CloneFlags::VM) {
             return Err(AxError::InvalidInput);
@@ -413,27 +527,41 @@ impl CloneArgs {
         if flags.contains(CloneFlags::VFORK | CloneFlags::THREAD) {
             return Err(AxError::InvalidInput);
         }
+        if flags.contains(CloneFlags::VFORK) && !flags.contains(CloneFlags::VM) {
+            return Err(AxError::InvalidInput);
+        }
+        if flags.contains(CloneFlags::NEWIPC | CloneFlags::SYSVSEM) {
+            return Err(AxError::InvalidInput);
+        }
+        // A new mount namespace cannot share the caller's fs_struct. Linux
+        // rejects the contradictory root/cwd ownership request as EINVAL; it
+        // is not an indication that mount namespaces are unsupported.
+        if flags.contains(CloneFlags::NEWNS | CloneFlags::FS) {
+            return Err(AxError::InvalidInput);
+        }
         if flags.contains(CloneFlags::DETACHED) {
             match api {
                 CloneApi::Clone if !flags.contains(CloneFlags::PIDFD) => {}
                 CloneApi::Clone | CloneApi::Clone3 => return Err(AxError::InvalidInput),
             }
         }
-        if flags.contains(CloneFlags::PIDFD | CloneFlags::THREAD) {
-            return Err(AxError::InvalidInput);
-        }
         if flags.contains(CloneFlags::THREAD)
             && flags.intersects(
                 CloneFlags::NEWCGROUP
+                    | CloneFlags::NEWNS
                     | CloneFlags::NEWUTS
+                    | CloneFlags::NEWIPC
                     | CloneFlags::NEWPID
-                    | CloneFlags::NEWNET,
+                    | CloneFlags::NEWNET
+                    | CloneFlags::NEWTIME,
             )
         {
             return Err(AxError::InvalidInput);
         }
 
-        if flags.contains(CloneFlags::INTO_CGROUP) && api != CloneApi::Clone3 {
+        if flags.contains(CloneFlags::INTO_CGROUP)
+            && (api != CloneApi::Clone3 || flags.contains(CloneFlags::THREAD))
+        {
             return Err(AxError::InvalidInput);
         }
 
@@ -452,17 +580,24 @@ impl CloneArgs {
             flags,
             exit_signal,
             stack,
+            stack_size,
             tls,
             parent_tid,
             child_tid,
             pidfd,
             cgroup_fd,
+            set_tid,
+            set_tid_size,
         } = self;
 
         debug!(
             "do_clone <= flags: {flags:?}, exit_signal: {exit_signal}, stack: {stack:#x}, tls: \
              {tls:#x}"
         );
+        const CSIGNAL: u64 = 0x7f;
+        if exit_signal & !CSIGNAL != 0 {
+            return Err(AxError::InvalidInput);
+        }
         let exit_signal = if exit_signal > 0 {
             Some(Signo::from_repr(exit_signal as u8).ok_or(AxError::InvalidInput)?)
         } else {
@@ -484,32 +619,51 @@ impl CloneArgs {
         // never inherit pending records or an in-flight delivery reservation.
         let signal_execution_state = calling_thread.fork_signal_execution_state();
         let signal_altstack = clone_signal_altstack(flags);
-        // Reserve the Linux rseq child snapshot before any fallible clone
-        // construction. The guard cancels automatically on every error path
-        // and is committed only with the final child publication steps.
+        let old_proc_data = &calling_thread.proc_data;
+        // Linux refuses to give either global init or a PID-namespace init a
+        // sibling through CLONE_PARENT.  Such a child would otherwise share
+        // an unreapable parent relation.  `Process::is_init()` is scoped to
+        // the reaper domain, so it covers both cases without a global-PID
+        // special case.
+        if flags.contains(CloneFlags::PARENT) && old_proc_data.proc.is_init() {
+            return Err(AxError::InvalidInput);
+        }
+        // unshare(CLONE_NEWPID) changes only pid_ns_for_children.  A thread
+        // clone must stay in the caller's active PID namespace even when a
+        // different namespace is queued for a future process child.
+        let active_pid_ns = calling_thread.pid_ns();
+        let children_pid_ns = calling_thread.pid_ns_for_children();
+        if flags.contains(CloneFlags::THREAD) && !Arc::ptr_eq(&active_pid_ns, &children_pid_ns) {
+            return Err(AxError::InvalidInput);
+        }
+        // copy_process() does not consume the supplied exit signal for a
+        // CLONE_PARENT process: its group leader inherits the caller's group
+        // leader signal.  Thread clones have no process-level signal slot at
+        // all, so this value is used only by the new-process branch below.
+        let child_exit_signal = if flags.contains(CloneFlags::PARENT) {
+            old_proc_data.proc.exit_signal().and_then(Signo::from_repr)
+        } else {
+            exit_signal
+        };
+        // Reserve the Linux rseq child snapshot only after every clone shape
+        // depending on the caller's live namespace/process identity has been
+        // rejected. The guard cancels automatically on every later failure
+        // path and commits only with final child publication.
         let rseq_fork = calling_thread.prepare_rseq_fork(flags.contains(CloneFlags::VM))?;
         let inherited_seccomp = calling_thread.seccomp_snapshot();
         let calling_tid = linux_pid_from_task_id(curr.id().as_u64())?;
-        let old_proc_data = &calling_thread.proc_data;
+        // CLONE_UNTRACED wins over inherited tracing and suppresses the
+        // parent event. Thread clones share ProcessData and therefore do not
+        // need a second relationship, but still report TRACECLONE.
+        let parent_ptrace = (!flags.contains(CloneFlags::UNTRACED))
+            .then(|| old_proc_data.ptrace_clone_snapshot())
+            .flatten();
         let credential_publication_kind = clone_credential_publication_kind(flags);
         // Every branch derives from one immutable calling-task snapshot.
         // Threads share its exact composite identity; a new process gets a
         // separately prepared module-state clone in its own outer credential.
         let (parent_cred, parent_dumpability, parent_aspace, parent_access_state) =
             old_proc_data.fork_image_credential_snapshot(calling_thread);
-        #[cfg(target_arch = "x86_64")]
-        let vfork_borrowed_shadow_stack = if flags.contains(CloneFlags::VFORK)
-            && !flags.contains(CloneFlags::VM)
-            && crate::task::current_user_live_cet_state().u_cet & 1 != 0
-        {
-            let owner = parent_aspace
-                .lock()
-                .cet_default_shadow_stack(calling_thread.kernel_tid())
-                .ok_or(AxError::BadState)?;
-            Some(owner)
-        } else {
-            None
-        };
         let child_cred = if flags.contains(CloneFlags::NEWUSER) {
             // Match Linux current_chrooted(): creating a user namespace from
             // a restricted filesystem root must not create authority which
@@ -549,13 +703,10 @@ impl CloneArgs {
         reclaim_exited_tasks();
         check_rlimit_nproc(calling_thread)?;
 
-        let parent_sched = scheduler_state_snapshot(&curr).map_err(|_| AxError::NoSuchProcess)?;
+        let parent_sched = task_scheduling_snapshot(&curr).map_err(|_| AxError::NoSuchProcess)?;
         let mut child_sched_state = parent_sched.state;
-        #[cfg(feature = "hwp-uclamp")]
-        let child_util_min = parent_sched.util_min;
-        #[cfg(feature = "hwp-uclamp")]
-        let child_util_max = parent_sched.util_max;
-        let parent_reset_on_fork = parent_sched.reset_on_fork;
+        let mut child_uclamp = parent_sched.uclamp;
+        let parent_reset_on_fork = parent_sched.reset_on_spawn;
         // sched_fork applies RESET_ON_FORK before either a process or a
         // thread child becomes runnable. The child never inherits the flag.
         let child_reset_on_fork = false;
@@ -574,13 +725,38 @@ impl CloneArgs {
                 }
             }
         }
+        if parent_reset_on_fork {
+            child_uclamp = axtask::UclampRequest::unrestricted();
+        }
+        let (mut child_util_min, mut child_util_max) = {
+            let policy = match child_sched_state.class {
+                SchedClass::Fifo => linux_sched::SCHED_FIFO,
+                SchedClass::RoundRobin => linux_sched::SCHED_RR,
+                SchedClass::Normal
+                | SchedClass::Batch
+                | SchedClass::Idle
+                | SchedClass::Deadline => linux_sched::SCHED_NORMAL,
+            };
+            let defaults = linux_sched::UclampRequest::class_default(policy);
+            let minimum = if child_uclamp.minimum_user_defined {
+                child_uclamp.minimum as u32
+            } else {
+                defaults.min
+            };
+            let maximum = if child_uclamp.maximum_user_defined {
+                child_uclamp.maximum as u32
+            } else {
+                defaults.max
+            };
+            (minimum.min(maximum), maximum)
+        };
 
         let task_name = curr.try_name().map_err(|_| AxError::NoMemory)?;
         let mut new_task = try_new_user_task(task_name, new_uctx)?;
         // PKRU is a per-thread architectural register.  It is inherited by
         // both CLONE_THREAD and fork children, independently of the mm-wide
         // allocation bitmap captured below.
-        new_task.inherit_current_pkru();
+        new_task.inherit_current_xsave();
 
         let tid = linux_pid_from_task_id(new_task.id().as_u64())?;
         let child_credential = CredentialSlot::try_new(child_cred.clone())?;
@@ -621,11 +797,41 @@ impl CloneArgs {
                 .map(|parent| parent.lock_process_lifecycle())
         };
 
+        // CLONE_NEWNS prepares its private topology and its matching root/cwd
+        // snapshot before taking fs_context_publication().  `pivot_root()`
+        // owns the inverse global transition in the order
+        // namespace_operation -> fs_context_publication, so nesting these in
+        // the clone path would deadlock.  The topology guard serializes the
+        // source generation; after it is released, the prepared objects stay
+        // private until the later fs/task publication gate.
+        let (mut prepared_clone_mount_ns, prepared_clone_mount_fs_context) =
+            if flags.contains(CloneFlags::NEWNS) {
+                let topology_snapshot = crate::mounts::namespace_operation();
+                let mount_ns = calling_thread
+                    .mount_ns()
+                    .try_fork(namespace_owner.clone())?;
+                let prepared = mount_ns.root_location().and_then(|root| {
+                    calling_thread.prepare_fs_context_for_cloned_mount_namespace(root)
+                });
+                // Never drop a newly cloned topology or fs_struct under the
+                // non-reentrant topology guard.  This also ends the source
+                // snapshot before later clone allocations can fail.
+                drop(topology_snapshot);
+                match prepared {
+                    Ok(fs_context) => (Some(mount_ns), Some(fs_context)),
+                    Err(error) => return Err(error),
+                }
+            } else {
+                (None, None)
+            };
+
         // Hold this through task publication: pivot_root snapshots task
         // fs_structs under the same gate, so a private child cannot publish
         // an old-root clone after that snapshot.
         let _fs_context_publication = fs_context_publication();
-        let child_fs_context = if flags.contains(CloneFlags::FS) {
+        let child_fs_context = if let Some(fs_context) = prepared_clone_mount_fs_context {
+            fs_context
+        } else if flags.contains(CloneFlags::FS) {
             calling_thread.fs_context_for_child()
         } else {
             let cloned = calling_thread.fs_context().lock().clone();
@@ -640,6 +846,12 @@ impl CloneArgs {
                 Arc::try_new(current_fd_table().fork_copy()?).map_err(|_| AxError::NoMemory)?,
             )
         };
+        // A non-CLONE_VM fork registers its pending address space from inside
+        // the MM clone.  Exclude global uprobe publication from before that
+        // clone through child MmProbeState publication, so a registrar cannot
+        // install into the child and then have its metadata overwritten.
+        let _uprobe_fork_topology =
+            (!flags.contains(CloneFlags::VM)).then(crate::uprobe::registration_topology_gate);
         let (new_proc_data, thread_publication, pid_reservation) = if flags
             .contains(CloneFlags::THREAD)
         {
@@ -651,7 +863,11 @@ impl CloneArgs {
             // Threads have distinct Linux TIDs even though they share the
             // process PID. Reserve their namespace identity before core/task
             // admission so `gettid` never observes a global task ID.
-            let tid_reservation = proc_data.pid_ns().reserve_process(tid)?;
+            let tid_reservation = proc_data.pid_ns().reserve_process_with_ids(
+                tid,
+                &set_tid[..set_tid_size],
+                &parent_cred,
+            )?;
             let thread_admission = proc_data.prepare_thread(tid)?;
             (
                 proc_data,
@@ -667,10 +883,20 @@ impl CloneArgs {
                 let aspace = loop {
                     let cloned = {
                         let mut parent_guard = parent_aspace.lock();
+                        // Fork copies file alias metadata/PTEs into a new mm.
+                        // An eviction fence is transient: drop the parent mm
+                        // lock, wait for its cache completion, then rebuild
+                        // the complete child image plan.
+                        if let Some(retry) = parent_guard
+                            .file_eviction_retry_for_range(parent_guard.base(), parent_guard.size())
+                        {
+                            drop(parent_guard);
+                            retry.wait()?;
+                            continue;
+                        }
                         #[cfg(target_arch = "x86_64")]
                         {
-                            parent_guard
-                                .try_clone_with_shared_shadow_stack(vfork_borrowed_shadow_stack)
+                            parent_guard.try_clone_with_shared_shadow_stack(None)
                         }
                         #[cfg(not(target_arch = "x86_64"))]
                         {
@@ -705,44 +931,78 @@ impl CloneArgs {
             let net_ns = if flags.contains(CloneFlags::NEWNET) {
                 NetworkNamespace::try_new_loopback_only(namespace_owner.clone())?
             } else {
-                old_proc_data.net_ns.clone()
+                calling_thread.net_ns()
             };
             let cgroup_ns = if flags.contains(CloneFlags::NEWCGROUP) {
-                old_proc_data
-                    .cgroup_ns()
-                    .try_fork(namespace_owner.clone())?
+                // Linux roots a new cgroup namespace at the caller's live
+                // cgroup membership.  The parent namespace's old root is
+                // intentionally irrelevant after a membership migration.
+                let roots = cgroup::cgroup_namespace_roots_for_pid(old_proc_data.proc.pid())?;
+                crate::task::CgroupNamespace::try_fork(
+                    &calling_thread.cgroup_ns(),
+                    namespace_owner.clone(),
+                    roots,
+                )?
             } else {
-                old_proc_data.cgroup_ns()
+                calling_thread.cgroup_ns()
+            };
+            let mount_ns = if flags.contains(CloneFlags::NEWNS) {
+                prepared_clone_mount_ns.take().ok_or(AxError::BadState)?
+            } else {
+                calling_thread.mount_ns()
+            };
+            let ipc_ns = if flags.contains(CloneFlags::NEWIPC) {
+                crate::syscall::ipc::IpcNamespace::try_new(namespace_owner.clone())?
+            } else {
+                calling_thread.ipc_ns()
             };
             let (pid_ns, child_reaper_scope) = if flags.contains(CloneFlags::NEWPID) {
+                // A CLONE_NEWPID child is installed as the new namespace's
+                // PID 1 before its remaining ancestor bindings are reserved.
+                if set_tid_size != 0 && set_tid[0] != 1 {
+                    return Err(AxError::InvalidInput);
+                }
                 let reaper_scope = process_domain()?
                     .try_new_reaper_scope()
                     .map_err(map_process_error)?;
                 (
-                    old_proc_data.pid_ns().try_fork_with_reaper_scope(
-                        tid,
-                        namespace_owner.clone(),
-                        reaper_scope.clone(),
-                    )?,
+                    calling_thread
+                        .pid_ns_for_children()
+                        .try_fork_with_reaper_scope(
+                            tid,
+                            namespace_owner.clone(),
+                            reaper_scope.clone(),
+                        )?,
                     Some(reaper_scope),
                 )
             } else {
-                (old_proc_data.pid_ns(), None)
+                (calling_thread.pid_ns_for_children(), None)
             };
+            // unshare(CLONE_NEWPID) installs an empty namespace only for
+            // children. Its first clone is its PID 1 and must initialize the
+            // already reserved reaper scope just like CLONE_NEWPID itself.
+            let pid_namespace_init = flags.contains(CloneFlags::NEWPID) || pid_ns.has_no_init();
+            if pid_namespace_init && set_tid_size != 0 && set_tid[0] != 1 {
+                return Err(AxError::InvalidInput);
+            }
             // Reserve this process's locally rendered PID before core process
             // publication. The reservation rolls back on every remaining
             // fallible construction path and is committed with the initial
             // thread/process identity below.
-            let pid_reservation = pid_ns.reserve_process(tid)?;
+            let pid_reservation =
+                pid_ns.reserve_process_with_ids(tid, &set_tid[..set_tid_size], &parent_cred)?;
             let domain = process_domain()?;
-            let process_admission = if let Some(reaper_scope) = child_reaper_scope {
+            let process_admission = if pid_namespace_init {
+                let reaper_scope = child_reaper_scope
+                    .or_else(|| pid_ns.reaper_scope())
+                    .ok_or(AxError::BadState)?;
                 ProcessInitialAdmission::ScopeInit(
                     domain
                         .prepare_fork_as_reaper_scope_init_with_identity(
                             &parent.proc,
                             &reaper_scope,
                             tid,
-                            exit_signal.map(|signo| signo as u8),
+                            child_exit_signal.map(|signo| signo as u8),
                             pid_ns.clone(),
                         )
                         .map_err(map_process_error)?
@@ -757,7 +1017,7 @@ impl CloneArgs {
                             &parent.proc,
                             &reaper_scope,
                             tid,
-                            exit_signal.map(|signo| signo as u8),
+                            child_exit_signal.map(|signo| signo as u8),
                             pid_ns.clone(),
                         )
                         .map_err(map_process_error)?
@@ -767,11 +1027,32 @@ impl CloneArgs {
             };
             let proc = process_admission.process().clone();
             let uts_ns = if flags.contains(CloneFlags::NEWUTS) {
-                old_proc_data.uts_ns().try_fork(namespace_owner)?
+                calling_thread.uts_ns().try_fork(namespace_owner.clone())?
             } else {
-                old_proc_data.uts_ns()
+                calling_thread.uts_ns()
             };
-            let time_ns = old_proc_data.time_ns_for_children();
+            // Unlike unshare(CLONE_NEWTIME), which changes only the
+            // caller's deferred `time_for_children` attachment, clone creates
+            // a namespace for the child itself.  NamespaceProxy::try_new
+            // deliberately initializes both halves from this one value, so
+            // the child's first descendants inherit the same time domain.
+            let time_ns = if flags.contains(CloneFlags::NEWTIME) {
+                calling_thread
+                    .time_ns_for_children()
+                    .try_fork(namespace_owner.clone())?
+            } else {
+                calling_thread.time_ns_for_children()
+            };
+            let namespaces = NamespaceProxy::try_new(
+                child_cred.user_ns().clone(),
+                pid_ns,
+                mount_ns,
+                ipc_ns,
+                net_ns,
+                cgroup_ns,
+                uts_ns,
+                time_ns,
+            )?;
 
             let (child_exe_path, child_cmdline) = (
                 old_proc_data.try_exe_path()?,
@@ -796,12 +1077,8 @@ impl CloneArgs {
                 scope,
                 exit_fd_table,
                 signal_actions,
-                exit_signal,
-                net_ns,
-                cgroup_ns,
-                pid_ns,
-                uts_ns,
-                time_ns,
+                child_exit_signal,
+                namespaces,
             )?;
             proc_data.install_pkey_snapshot(
                 child_pkeys.expect("new process must carry a pkey bitmap snapshot"),
@@ -815,8 +1092,7 @@ impl CloneArgs {
                 inherited_cpu_limit_active,
                 core::sync::atomic::Ordering::Release,
             );
-            proc_data.set_heap_layout(old_proc_data.heap_base());
-            proc_data.set_heap_top(old_proc_data.get_heap_top());
+            proc_data.replace_mm_layout(old_proc_data.mm_layout());
             proc_data.try_inherit_mempolicy_from(old_proc_data)?;
             proc_data.inherit_timerslack_from(old_proc_data);
             let thread_admission = proc_data.prepare_initial_thread_admission(process_admission)?;
@@ -832,6 +1108,7 @@ impl CloneArgs {
             child_credential,
             inherited_seccomp,
             child_io_context,
+            calling_thread.io_flusher(),
             child_fs_context,
             child_fd_table,
             calling_thread.personality(),
@@ -839,25 +1116,55 @@ impl CloneArgs {
             SchedulerSeed {
                 state: child_sched_state,
                 reset_on_fork: child_reset_on_fork,
-                #[cfg(feature = "hwp-uclamp")]
-                util_min: child_util_min as u16,
-                #[cfg(feature = "hwp-uclamp")]
-                util_max: child_util_max as u16,
+                uclamp: child_uclamp,
+                utilization_bounds: UtilizationBounds::new(child_util_min, child_util_max)
+                    .expect("parent scheduler bounds are valid"),
                 // The child owns a fresh scheduler commit stream. Its first
                 // prepared scheduler state is version zero.
                 version: 0,
             },
         )?;
+        // PR_MCE_KILL is a task attribute and forks from the calling thread,
+        // including CLONE_THREAD children which may have diverged already.
+        thr.set_mce_kill_policy(calling_thread.mce_kill_policy());
+        // A CLONE_THREAD child inherits the exact calling task attachment;
+        // ProcessData only carries the initial/group-leader construction
+        // snapshot and may differ after a sibling has entered another ns.
+        if flags.contains(CloneFlags::THREAD) {
+            thr.inherit_namespace_proxy_from(calling_thread);
+        }
+        if !flags.contains(CloneFlags::NEWIPC) {
+            let child_sem_undo = if flags.contains(CloneFlags::SYSVSEM) {
+                calling_thread.sem_undo()
+            } else {
+                // fork/clone starts with no SEM_UNDO adjustments.  Only
+                // CLONE_SYSVSEM shares an existing adjustment list; unshare
+                // is the operation that snapshots it into private state.
+                SemUndoState::try_new(calling_thread.ipc_ns())?
+            };
+            thr.replace_sem_undo(child_sem_undo);
+        }
         // Apply this while the child endpoint is still unpublished, so failed
         // clone admissions cannot expose partially initialized signal state.
         thr.apply_fork_signal_execution_state(signal_execution_state, signal_altstack);
+        // perf inheritance is a child-private scheduler construction step;
+        // it must complete before publication so a failed allocation cannot
+        // expose a partially inherited PMU context.
+        calling_thread.inherit_perf_groups_to(
+            &thr,
+            tid as u64,
+            flags.contains(CloneFlags::THREAD),
+        )?;
+        calling_thread.perf_emit_fork(new_proc_data.proc.pid() as u32, tid as u32);
+        crate::uprobe::on_fork(calling_thread.kernel_tid() as u64, tid as u64);
+        crate::uprobe::on_fork_mm_gated(
+            &old_proc_data.aspace(),
+            &new_proc_data.aspace(),
+            tid as u64,
+        );
         #[cfg(target_arch = "x86_64")]
         if clone_inherits_cet_handler_state(flags) {
-            // A fork or vfork from inside a signal handler inherits the
-            // handler's authenticated CET nesting and restart state, but not
-            // pending signal queues. In particular, a CLONE_VM|CLONE_VFORK
-            // child must be able to complete the inherited rt_sigreturn.
-            thr.clone_cet_signal_frames_from(calling_thread);
+            thr.copy_signal_handler_restart_state_from(calling_thread);
         }
         // Linux inherits ioperm/iopl state for every fork/clone child. The
         // state stays private after this point: the bitmap Arc is copied on
@@ -900,19 +1207,117 @@ impl CloneArgs {
         };
         let cgroup_admission = if !flags.contains(CloneFlags::THREAD) {
             Some(if let Some(fd) = cgroup_fd {
-                cgroup::prepare_fork_charge_into(fd, tid)?
+                cgroup::prepare_fork_charge_into(
+                    old_proc_data.proc.pid(),
+                    fd,
+                    tid,
+                    &new_proc_data.proc,
+                )?
             } else {
-                cgroup::prepare_fork_charge(old_proc_data.proc.pid(), tid)?
+                cgroup::prepare_fork_charge(old_proc_data.proc.pid(), tid, &new_proc_data.proc)?
             })
         } else {
             None
         };
 
-        let shm_admission = (!flags.contains(CloneFlags::THREAD))
-            .then(|| {
-                prepare_proc_shm_inheritance(old_proc_data.proc.pid(), new_proc_data.proc.pid())
-            })
-            .transpose()?;
+        // The child is still private, but a non-thread clone now has its
+        // exact inherited/CLONE_INTO_CGROUP target reserved.  Recompute from
+        // the current system and that target before reserving a runnable task;
+        // the public PID map deliberately cannot answer this for an invisible
+        // fork admission. CLONE_THREAD shares the already-published process
+        // membership and uses its normal lookup.
+        let child_constraints = cgroup_admission
+            .as_ref()
+            .map(cgroup::uclamp_constraints_for_fork_admission)
+            .unwrap_or_else(|| cgroup::uclamp_constraints_for_pid(new_proc_data.proc.pid()));
+        let child_bounds = child_constraints.effective(child_uclamp, child_sched_state.class);
+        child_util_min = child_bounds.minimum;
+        child_util_max = child_bounds.maximum;
+        if !flags.contains(CloneFlags::THREAD) {
+            // ProcessData seeded its durable leader view during Thread
+            // allocation, before the hidden cgroup admission existed. Update
+            // that still-private seed together with the runqueue seed.
+            new_proc_data.seed_scheduler_state(
+                child_sched_state,
+                child_reset_on_fork,
+                child_uclamp,
+                child_bounds,
+                0,
+            );
+        }
+        #[cfg(feature = "hwp-uclamp")]
+        // `Thread` was allocated from the inherited seed above, before the
+        // admission existed.  Replace that private cache now; the task is not
+        // runnable and the prepared scheduler state below receives the same
+        // bounds, so no observer can see a mixed first commit.
+        thr.publish_scheduler_clamp(child_util_min, child_util_max, 0);
+
+        // A distinct mm receives distinct SysV attachment ownership. CLONE_VM
+        // (including vfork) shares the parent's VMA leases and must not rebind
+        // them to a second process. Conversely CLONE_NEWIPC still inherits
+        // mappings backed by every older IPC namespace the parent touched, so
+        // current `ipc_ns()` alone is not an authoritative attachment set.
+        let shm_namespaces = if flags.contains(CloneFlags::VM) {
+            Vec::new()
+        } else {
+            old_proc_data.touched_ipc_namespaces_snapshot()?
+        };
+        // Snapshot the exact child MM image before taking any IPC
+        // transaction. Deferred teardown can leave visible IPC records after
+        // the VMA disappeared, and the parent may change after cloning.
+        let live_shm_finalizers = if flags.contains(CloneFlags::VM) {
+            Vec::new()
+        } else {
+            new_proc_data
+                .aspace()
+                .lock()
+                .mapping_finalizer_identities()?
+        };
+        let mut shm_admissions = Vec::new();
+        shm_admissions
+            .try_reserve_exact(shm_namespaces.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for namespace in &shm_namespaces {
+            new_proc_data.register_touched_ipc_namespace(namespace.clone())?;
+            let admission = crate::syscall::ipc::prepare_proc_shm_in_namespace(
+                namespace,
+                old_proc_data.proc.pid(),
+                new_proc_data.proc.pid(),
+                &live_shm_finalizers,
+            )?;
+            for rebind in admission.finalizer_rebinds() {
+                if rebind.parent.finalizer_identity == 0 {
+                    return Err(AxError::BadState);
+                }
+                let finalizer = crate::syscall::ipc::try_new_sysv_attachment_finalizer(
+                    namespace.clone(),
+                    new_proc_data.proc.pid(),
+                    rebind.child,
+                )?;
+                let finalizer_identity = finalizer.identity();
+                crate::syscall::ipc::bind_shm_attachment_finalizer_identity_in_namespace(
+                    namespace,
+                    new_proc_data.proc.pid(),
+                    rebind.child,
+                    finalizer_identity,
+                )?;
+                match new_proc_data
+                    .aspace()
+                    .lock()
+                    .rebind_mapping_finalizer(rebind.parent.finalizer_identity, finalizer)
+                {
+                    Ok(_) => {}
+                    // The child-mm snapshot admitted this identity, so a
+                    // missing rebind means the clone image changed under us.
+                    // Fail the transaction; dropping its admission removes
+                    // the hidden child record rather than publishing an
+                    // attachment with no VMA owner.
+                    Err(AxError::NotFound) => return Err(AxError::BadState),
+                    Err(error) => return Err(error),
+                }
+            }
+            shm_admissions.push(admission);
+        }
 
         #[cfg(target_arch = "x86_64")]
         let mut pending_cet_stack = if crate::task::current_user_live_cet_state().u_cet & 1 != 0 {
@@ -927,37 +1332,73 @@ impl CloneArgs {
                     // This must precede the !CLONE_VM fork-COW case: a vfork
                     // child borrows the parent's live stack/SSP and its alias
                     // must never unmap the parent's VMA on exit or exec.
-                    let owner = parent_owner.ok_or(AxError::BadState)?;
-                    child_mm.lock().register_borrowed_cet_default_shadow_stack(
-                        tid,
-                        owner.start,
-                        owner.size,
-                    )?;
-                    parent_cet
+                    if let Some(owner) = parent_owner {
+                        if !owner.extents.is_empty()
+                            && owner.extents.iter().all(|extent| {
+                                extent
+                                    .start
+                                    .as_usize()
+                                    .checked_add(extent.size)
+                                    .is_some_and(|end| end > extent.start.as_usize())
+                            })
+                        {
+                            child_mm
+                                .lock()
+                                .register_borrowed_cet_default_shadow_stack_extents(
+                                    tid,
+                                    owner.extents.clone(),
+                                )?;
+                        }
+                    }
+                    child_cet_state_after_clone(parent_cet, None)
                 }
                 CetShadowStackCloneMode::ForkCow => {
                     // fork COW-copies the parent's VMA and inherits its live SSP.
-                    let owner = parent_owner.ok_or(AxError::BadState)?;
-                    child_mm.lock().register_cet_default_shadow_stack(
-                        tid,
-                        owner.start,
-                        owner.size,
-                    )?;
-                    parent_cet
+                    if let Some(owner) = parent_owner {
+                        if !owner.extents.is_empty()
+                            && owner.extents.iter().all(|extent| {
+                                extent
+                                    .start
+                                    .as_usize()
+                                    .checked_add(extent.size)
+                                    .is_some_and(|end| end > extent.start.as_usize())
+                            })
+                        {
+                            child_mm.lock().register_cet_default_shadow_stack_extents(
+                                tid,
+                                owner.extents.clone(),
+                            )?;
+                        }
+                    }
+                    child_cet_state_after_clone(parent_cet, None)
                 }
                 CetShadowStackCloneMode::NewSharedMmThread => {
-                    let mut cet = parent_cet;
-                    let fresh = map_cet_default_shadow_stack(&mut child_mm.lock(), tid)?;
-                    cet.pl3_ssp = fresh.pl3_ssp;
-                    cet
+                    // Linux gives every non-vfork CLONE_VM child a distinct
+                    // automatic shadow stack.  Preserve clone3's explicit
+                    // stack_size instead of accidentally using the ordinary
+                    // stack top.  The legacy clone ABI alone selects
+                    // min(RLIMIT_STACK, 4GiB) when it has no size field.
+                    let size = cet_shared_mm_shadow_stack_size(
+                        api,
+                        stack_size,
+                        old_proc_data.rlim.read()[linux_raw_sys::general::RLIMIT_STACK].current,
+                    )?;
+                    let fresh = map_cet_default_shadow_stack(
+                        old_proc_data,
+                        &mut child_mm.lock(),
+                        tid,
+                        size,
+                    )?;
+                    child_cet_state_after_clone(parent_cet, Some(fresh.pl3_ssp))
                 }
             };
             // The child has not been published: do not write the live MSRs.
             new_task.ctx_mut().set_saved_user_cet_state(cet);
+            new_task.publish_user_cet_status(cet);
             Some(PendingCetDefaultShadowStack {
                 aspace: child_mm,
                 tid,
-                committed: false,
+                lease: CetStackLease::default(),
             })
         } else {
             None
@@ -971,18 +1412,56 @@ impl CloneArgs {
         // task/process/group/session lookup bucket before copying the pidfd
         // number or publishing it into a possibly shared files_struct.
         let task = prepare_task_with_sched_from(new_task, child_sched_state, &curr)?;
-        set_prepared_task_sched_reset_on_fork(&task, child_reset_on_fork);
-        #[cfg(feature = "hwp-uclamp")]
+        set_prepared_task_reset_on_spawn(&task, child_reset_on_fork);
         // The prepared task stays private until every admission succeeds, so
         // seed the scheduler and Thread cache from the same parent snapshot.
-        #[cfg(feature = "hwp-uclamp")]
-        set_prepared_task_sched_util_clamp(&task, child_util_min, child_util_max);
+        set_prepared_task_utilization_bounds(
+            &task,
+            UtilizationBounds::new(child_util_min, child_util_max)
+                .expect("parent scheduler bounds are valid"),
+        );
+        set_prepared_task_uclamp_request(&task, child_uclamp);
         if let Some((_, Some(pidfd))) = pending_pidfd.as_ref() {
             pidfd.bind_thread_task(&task)?;
         }
         let task_publication =
             reserve_prepared_task(task.clone()).map_err(|error| error.into_ax_error())?;
         let task_table_admission = prepare_task_table_admission(&task)?;
+        // Reserve the reverse link while every clone rollback token is still
+        // live.  Later publication is allocation-free, and failure to reserve
+        // a trace relation aborts the otherwise-private clone rather than
+        // exposing a child whose parent claims CLONE_PTRACE but cannot be
+        // detached by its tracer.
+        let clone_ptrace_tracer_task = if parent_ptrace.is_some() {
+            parent_ptrace
+                .as_ref()
+                .and_then(|(relationship, ..)| {
+                    get_task(relationship.session().tracer_kernel_tid).ok()
+                })
+                .filter(|task| {
+                    let tracer = task.as_thread();
+                    parent_ptrace.as_ref().is_some_and(|(relationship, ..)| {
+                        tracer.proc_data.proc.pid() == relationship.session().tracer
+                            && tracer.kernel_tid() == relationship.session().tracer_kernel_tid
+                    })
+                })
+        } else {
+            None
+        };
+        let clone_ptrace_tracer_data = clone_ptrace_tracer_task
+            .as_ref()
+            .map(|task| task.as_thread().proc_data.clone());
+        let mut clone_ptrace_reverse_link = if flags.contains(CloneFlags::PTRACE)
+            && !flags.contains(CloneFlags::THREAD)
+            && let Some(tracer) = clone_ptrace_tracer_data.as_deref()
+        {
+            Some(tracer.try_prepare_ptrace_reverse_link(
+                new_proc_data.proc.pid(),
+                task.as_thread().kernel_tid(),
+            )?)
+        } else {
+            None
+        };
         let credential_publication = match credential_publication_kind {
             None => None,
             Some(CloneCredentialPublicationKind::Fork) => Some(
@@ -1052,6 +1531,69 @@ impl CloneArgs {
         }
         drop(task_parent_publication);
 
+        // CLONE_PTRACE is a real inherited relationship, not merely a fork
+        // event.  Publish it only after the new process has an exact core and
+        // task identity, but before it can reach the runqueue.  A tracer that
+        // exited or detached in this window simply loses the inheritance, as
+        // Linux does; the child itself remains a successful clone.
+        if let (
+            Some((relationship, inherited_options, inherited_seized)),
+            Some(tracer_task),
+            Some(tracer_data),
+            Some(reverse_link),
+        ) = (
+            parent_ptrace.as_ref(),
+            clone_ptrace_tracer_task.as_ref(),
+            clone_ptrace_tracer_data.as_ref(),
+            clone_ptrace_reverse_link.take(),
+        ) && old_proc_data.ptrace_session_if_traced_by(
+            relationship.session().tracer,
+            relationship.session().tracer_kernel_tid,
+        ) == Some(relationship.session())
+        {
+            let tracer = tracer_task.as_thread();
+            let tracer_credential = tracer.lock_credential_snapshot();
+            if let Ok(authorized) = new_proc_data.thread_image_access_snapshot(task.as_thread())
+                && let Ok(publication) = new_proc_data.lock_ptrace_traceme_publication(tracer_data)
+            {
+                let _ = new_proc_data.publish_ptrace_relationship(
+                    &publication,
+                    task.as_thread(),
+                    tracer,
+                    &tracer_credential,
+                    PtraceRelationshipOrigin::Inherited,
+                    relationship.ptracer_cred(),
+                    *inherited_seized,
+                    *inherited_options,
+                    &authorized,
+                    reverse_link,
+                );
+            }
+        }
+
+        // A ptrace fork event belongs to the traced parent, whereas the above
+        // relationship belongs to the child.  Do this after PID namespace
+        // publication so GETEVENTMSG observes the PID rendered in the
+        // tracer's namespace. CLONE_UNTRACED suppressed the snapshot itself.
+        if let Some((relationship, options, _)) = parent_ptrace.as_ref()
+            && let Some(event) = clone_ptrace_event(flags, *options)
+            && old_proc_data.ptrace_session_if_traced_by(
+                relationship.session().tracer,
+                relationship.session().tracer_kernel_tid,
+            ) == Some(relationship.session())
+            && old_proc_data.ptrace_event_stop(
+                relationship.session(),
+                event,
+                clone_ptrace_tracer_task
+                    .as_ref()
+                    .map(|tracer| tracer.as_thread().pid_ns().visible_pid(tid) as usize)
+                    .unwrap_or(0),
+            )
+        {
+            notify_ptrace_attach_stop(old_proc_data);
+            interrupt_ptrace_stop_siblings(old_proc_data);
+        }
+
         // TASK_TABLE is the primary runtime lookup. Cgroup and SysV SHM hidden
         // entries become visible only after it, so their readers can never
         // observe an unpublished child PID. PIDFD follows the same ordering:
@@ -1060,7 +1602,7 @@ impl CloneArgs {
         if let Some(admission) = cgroup_admission {
             admission.commit();
         }
-        if let Some(admission) = shm_admission {
+        for admission in shm_admissions {
             admission.commit();
         }
         if let Some((publication, _)) = pending_pidfd.take() {
@@ -1128,22 +1670,24 @@ pub fn sys_clone(
     child_tid: usize,
     tls: usize,
 ) -> AxResult<isize> {
-    const FLAG_MASK: u32 = 0xff;
-    let clone_flags =
-        CloneFlags::from_bits((flags & !FLAG_MASK) as u64).ok_or(AxError::InvalidInput)?;
-    let exit_signal = (flags & FLAG_MASK) as u64;
-
-    if clone_flags.contains(CloneFlags::PIDFD | CloneFlags::PARENT_SETTID) {
-        return Err(AxError::InvalidInput);
-    }
+    let plan = LinuxClonePlan::from_clone(
+        flags as u64,
+        stack as u64,
+        tls as u64,
+        parent_tid as u64,
+        child_tid as u64,
+    )
+    .map_err(map_clone_abi_error)?;
+    let clone_flags = CloneFlags::from_bits(plan.flags).ok_or(AxError::InvalidInput)?;
 
     let args = CloneArgs {
         flags: clone_flags,
-        exit_signal,
-        stack,
-        tls,
-        parent_tid,
-        child_tid,
+        exit_signal: plan.exit_signal as u64,
+        stack: plan.stack_top as usize,
+        stack_size: 0,
+        tls: plan.tls as usize,
+        parent_tid: plan.parent_tid as usize,
+        child_tid: plan.child_tid as usize,
         // In sys_clone, parent_tid is reused for pidfd when CLONE_PIDFD is set
         pidfd: if clone_flags.contains(CloneFlags::PIDFD) {
             parent_tid
@@ -1151,9 +1695,18 @@ pub fn sys_clone(
             0
         },
         cgroup_fd: None,
+        set_tid: [0; thekernel_linux_process::SetTidPlan::MAX_ENTRIES],
+        set_tid_size: 0,
     };
 
     args.do_clone(uctx, CloneApi::Clone, &caller_memory)
+}
+
+fn map_clone_abi_error(error: ProcessAbiError) -> AxError {
+    match error {
+        ProcessAbiError::InvalidFlags | ProcessAbiError::InvalidExitSignal => AxError::InvalidInput,
+        _ => AxError::InvalidInput,
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1191,7 +1744,9 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     use super::{
-        CetShadowStackCloneMode, cet_shadow_stack_clone_mode, clone_inherits_cet_handler_state,
+        CetShadowStackCloneMode, CetStackLease, cet_shadow_stack_clone_mode,
+        cet_shared_mm_shadow_stack_size, child_cet_state_after_clone,
+        clone_inherits_cet_handler_state,
     };
     use super::{
         CloneApi, CloneArgs, CloneCredentialPublicationKind, CloneFlags, IOPRIO_CLASS_SHIFT,
@@ -1276,17 +1831,68 @@ mod tests {
             cet_shadow_stack_clone_mode(CloneFlags::VM),
             NewSharedMmThread
         );
-        assert_eq!(cet_shadow_stack_clone_mode(CloneFlags::VFORK), BorrowVfork);
         assert_eq!(
             cet_shadow_stack_clone_mode(CloneFlags::VM | CloneFlags::VFORK),
             BorrowVfork
         );
-
         assert!(clone_inherits_cet_handler_state(CloneFlags::empty()));
         assert!(!clone_inherits_cet_handler_state(CloneFlags::VM));
         assert!(clone_inherits_cet_handler_state(
             CloneFlags::VM | CloneFlags::VFORK
         ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cet_clone3_shared_mm_requires_and_uses_explicit_stack_size() {
+        let page = 4096;
+        // clone3(CLONE_VM) cannot silently substitute RLIMIT_STACK when its
+        // ABI argument is empty.
+        assert_eq!(
+            cet_shared_mm_shadow_stack_size(CloneApi::Clone3, 0, 8 * page as u64),
+            Err(AxError::InvalidInput)
+        );
+        // Its size is independently page-aligned and is not capped by the
+        // process default limit.
+        assert_eq!(
+            cet_shared_mm_shadow_stack_size(CloneApi::Clone3, page + 1, 1),
+            Ok(page * 2)
+        );
+        // Legacy clone has no stack_size field and continues to use the
+        // documented RLIMIT_STACK default.
+        assert_eq!(
+            cet_shared_mm_shadow_stack_size(CloneApi::Clone, 0, page as u64 + 1),
+            Ok(page * 2)
+        );
+        assert_eq!(
+            cet_shared_mm_shadow_stack_size(CloneApi::Clone3, usize::MAX, 1),
+            Err(AxError::NoMemory)
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cet_unpublished_stack_allocation_failure_still_requires_exactly_one_cleanup() {
+        let mut lease = CetStackLease::default();
+        // Any later clone admission failure drops the pending object while
+        // this bit is false, so it retires the newly allocated owner/VMA.
+        assert!(lease.needs_cleanup());
+        lease.commit();
+        assert!(!lease.needs_cleanup());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn fork_keeps_explicit_cet_pivot_after_default_owner_peer_unmap() {
+        let parent = axhal::asm::UserCetState {
+            u_cet: 1,
+            // Model an SSP in an explicit map_shadow_stack VMA.  There is no
+            // default-owner record left after a CLONE_VM peer's munmap.
+            pl3_ssp: 0x7fff_0000_1000,
+            locked: 1,
+        };
+        let child = child_cet_state_after_clone(parent, None);
+        assert_eq!(child, parent);
     }
 
     #[test]
@@ -1327,6 +1933,18 @@ mod tests {
     fn clone_validate_rejects_detached_with_pidfd() {
         let args = CloneArgs {
             flags: CloneFlags::from_bits_retain((CLONE_DETACHED | CLONE_PIDFD) as u64),
+            ..Default::default()
+        };
+        assert_eq!(
+            args.validate_for(CloneApi::Clone),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn clone_validate_rejects_vfork_without_shared_mm() {
+        let args = CloneArgs {
+            flags: CloneFlags::VFORK,
             ..Default::default()
         };
         assert_eq!(
@@ -1415,15 +2033,12 @@ mod tests {
     }
 
     #[test]
-    fn clone_validate_rejects_process_sysvsem_without_shared_undo_state() {
+    fn clone_validate_allows_process_sysvsem_with_shared_undo_state() {
         let args = CloneArgs {
             flags: CloneFlags::SYSVSEM,
             ..Default::default()
         };
-        assert_eq!(
-            args.validate_for(CloneApi::Clone),
-            Err(AxError::OperationNotSupported)
-        );
+        assert_eq!(args.validate_for(CloneApi::Clone), Ok(()));
     }
 
     #[test]
