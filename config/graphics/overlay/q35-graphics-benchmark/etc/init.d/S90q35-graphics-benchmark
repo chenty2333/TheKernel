@@ -1,0 +1,167 @@
+#!/bin/sh
+# Fixed-frame graphics workload.  The serial JSONL stream is consumed by the
+# host runner.  The debugfs leaf is a read-only kernel snapshot; Linux oracle
+# boots fall back to the one cross-kernel observable, Weston's FD count.
+set -eu
+
+marker=THEKERNEL_GRAPHICS_BENCHMARK_READY
+hotplug_removed_marker=THEKERNEL_GRAPHICS_INPUT_HOTPLUG_REMOVED
+hotplug_ready_marker=THEKERNEL_GRAPHICS_INPUT_HOTPLUG_READY
+fault=$(cat /etc/thekernel-graphics-fault 2>/dev/null || printf '')
+weston_pid=$(pidof weston | awk '{print $1}')
+[ -n "$weston_pid" ] || { echo "$marker state=FAIL reason=weston"; exit 1; }
+fd_count() { find "/proc/$weston_pid/fd" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' '; }
+metrics_path=/sys/kernel/debug/dri/0/thekernel_metrics
+sample_resources() {
+    if [ -r "$metrics_path" ]; then
+        values=$(cat "$metrics_path")
+    else
+        values=$(printf '{"weston_fd":%s}' "$(fd_count)")
+    fi
+    printf 'THEKERNEL_GRAPHICS_METRIC {"kind":"resources","values":%s}\n' "$values"
+}
+hotplug_observer_pid=
+stop_hotplug_observer() {
+    [ -z "$hotplug_observer_pid" ] || kill "$hotplug_observer_pid" 2>/dev/null || true
+    [ -z "$hotplug_observer_pid" ] || wait "$hotplug_observer_pid" 2>/dev/null || true
+}
+trap 'stop_hotplug_observer' EXIT INT TERM
+wait_weston() {
+    tries=0
+    while [ "$tries" -lt 20 ]; do
+        weston_pid=$(pidof weston | awk '{print $1}')
+        [ -n "$weston_pid" ] && return 0
+        tries=$((tries + 1))
+        sleep 1
+    done
+    return 1
+}
+modeset_fault() {
+    # Weston must release DRM master before the fault helper can perform a
+    # connector/CRTC modeset.  Always restart it, including helper failures,
+    # so the benchmark never leaves the console black.
+    /etc/init.d/S80weston stop
+    if ! /usr/local/bin/q35-drm-modeset-restore; then
+        /etc/init.d/S80weston start
+        wait_weston || return 1
+        return 1
+    fi
+    /etc/init.d/S80weston start
+    wait_weston
+}
+tablet_event() {
+    for event in /dev/input/event*; do
+        [ -c "$event" ] || continue
+        properties=$(udevadm info -q property -n "$event" 2>/dev/null) || continue
+        printf '%s\n' "$properties" | grep -qx 'ID_INPUT=1' || continue
+        printf '%s\n' "$properties" | grep -qx 'ID_SEAT=seat0' || continue
+        printf '%s\n' "$properties" | grep -qx 'WL_SEAT=default' || continue
+        if printf '%s\n' "$properties" | grep -Eq '^ID_INPUT_(TABLET|TOUCHSCREEN)=1$'; then
+            printf '%s\n' "$event"
+            return 0
+        fi
+    done
+    return 1
+}
+weston_uses_input() {
+    event=$1
+    for fd in /proc/"$weston_pid"/fd/*; do
+        [ "$(readlink "$fd" 2>/dev/null || true)" = "$event" ] && return 0
+    done
+    return 1
+}
+start_hotplug_observer() {
+    old_event=$(tablet_event) || return 1
+    (
+        tries=0
+        while [ -e "$old_event" ] && [ "$tries" -lt 30 ]; do
+            tries=$((tries + 1))
+            sleep 1
+        done
+        [ ! -e "$old_event" ] || { echo "$hotplug_ready_marker state=FAIL reason=remove_timeout"; exit 1; }
+        echo "$hotplug_removed_marker event=$old_event"
+
+        tries=0
+        while [ "$tries" -lt 30 ]; do
+            event=$(tablet_event || true)
+            if [ -n "$event" ] && udevadm settle --timeout=1 >/dev/null 2>&1 && weston_uses_input "$event"; then
+                major_hex=$(stat -c %t "$event")
+                minor_hex=$(stat -c %T "$event")
+                udev_data=/run/udev/data/c$((0x$major_hex)):$((0x$minor_hex))
+                if [ -r "$udev_data" ]; then
+                    echo "$hotplug_ready_marker event=$event"
+                    exit 0
+                fi
+            fi
+            tries=$((tries + 1))
+            sleep 1
+        done
+        echo "$hotplug_ready_marker state=FAIL reason=add_or_libinput_timeout"
+        exit 1
+    ) &
+    hotplug_observer_pid=$!
+}
+case "$fault" in
+    modeset) modeset_fault || { echo "$marker state=FAIL reason=modeset"; exit 1; } ;;
+    vt-switch) chvt 1; sleep 1; chvt 2 ;;
+    weston-restart) /etc/init.d/S80weston restart; sleep 2; weston_pid=$(pidof weston | awk '{print $1}') ;;
+    client-crash) ;;
+    input-hotplug) start_hotplug_observer || { echo "$marker state=FAIL reason=input_hotplug_observer"; exit 1; } ;;
+    '') ;;
+    *) echo "$marker state=FAIL reason=fault"; exit 1 ;;
+esac
+renderer=software
+client=/usr/local/bin/q35-wayland-benchmark-client
+virtio_icd=$(find /usr/share/vulkan/icd.d -type f -name 'virtio_icd*.json' -print -quit 2>/dev/null || true)
+if [ -n "$virtio_icd" ] && \
+   VK_DRIVER_FILES="$virtio_icd" VK_ICD_FILENAMES="$virtio_icd" \
+       vulkaninfo --summary >/tmp/thekernel-vulkaninfo.log 2>&1; then
+    renderer=venus
+    client=/usr/local/bin/q35-wayland-vulkan-benchmark-client
+elif /usr/local/bin/q35-virgl-render-oracle >/tmp/thekernel-virgl-probe.log 2>&1; then
+    renderer=virgl
+    client=/usr/local/bin/q35-wayland-egl-benchmark-client
+fi
+[ -x "$client" ] || { echo 'THEKERNEL_GRAPHICS_BENCHMARK state=FAIL reason=renderer_client'; exit 1; }
+printf 'THEKERNEL_GRAPHICS_RENDERER %s\n' "$renderer"
+case "$renderer" in
+    venus)
+        export VK_DRIVER_FILES="$virtio_icd" VK_ICD_FILENAMES="$virtio_icd"
+        unset GALLIUM_DRIVER LIBGL_ALWAYS_SOFTWARE || true
+        ;;
+    virgl)
+        export GALLIUM_DRIVER=virgl LIBGL_ALWAYS_SOFTWARE=0
+        unset VK_DRIVER_FILES VK_ICD_FILENAMES || true
+        ;;
+    software)
+        export LIBGL_ALWAYS_SOFTWARE=1
+        unset GALLIUM_DRIVER VK_DRIVER_FILES VK_ICD_FILENAMES || true
+        ;;
+esac
+sample_resources
+if [ "$fault" = client-crash ]; then
+    crash_log=/tmp/thekernel-client-crash.log
+    ulimit -c 0
+    set +e
+    THEKERNEL_GRAPHICS_BENCHMARK=1 THEKERNEL_GRAPHICS_ABORT_AFTER=100 \
+        start-stop-daemon -S -x "$client" -c weston -- >"$crash_log" 2>&1
+    crash_status=$?
+    set -e
+    cat "$crash_log"
+    [ "$crash_status" -ne 0 ] || { echo 'THEKERNEL_GRAPHICS_BENCHMARK state=FAIL reason=client_crash_status'; exit 1; }
+    grep -qx 'THEKERNEL_GRAPHICS_BENCHMARK_READY' "$crash_log" \
+        || { echo 'THEKERNEL_GRAPHICS_BENCHMARK state=FAIL reason=client_crash_not_ready'; exit 1; }
+fi
+THEKERNEL_GRAPHICS_BENCHMARK=1 THEKERNEL_BENCHMARK_WESTON_PID="$weston_pid" \
+    start-stop-daemon -S -x "$client" -c weston -- \
+    || { echo 'THEKERNEL_GRAPHICS_BENCHMARK state=FAIL'; exit 1; }
+if [ -n "$hotplug_observer_pid" ]; then
+    if ! wait "$hotplug_observer_pid"; then
+        hotplug_observer_pid=
+        echo 'THEKERNEL_GRAPHICS_BENCHMARK state=FAIL reason=input_hotplug_observer'
+        exit 1
+    fi
+    hotplug_observer_pid=
+fi
+sample_resources
+echo 'THEKERNEL_GRAPHICS_BENCHMARK_COMPLETE'

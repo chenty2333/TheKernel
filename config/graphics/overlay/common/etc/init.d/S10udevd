@@ -1,0 +1,48 @@
+#!/bin/sh
+# Graphics images use a deliberately bounded coldplug set.  TheKernel devfs
+# publishes its boot devices directly; udev is needed here for graphics/input
+# policy and libinput metadata, not for probing every unrelated sysfs class.
+
+DAEMON=udevd
+PIDFILE=/var/run/$DAEMON.pid
+UDEVD_ARGS=
+
+[ -r /etc/default/$DAEMON ] && . /etc/default/$DAEMON
+
+start() {
+	printf 'Starting %s: ' "$DAEMON"
+	[ -e /proc/sys/kernel/hotplug ] && printf '\000\000\000\000' > /proc/sys/kernel/hotplug
+	# shellcheck disable=SC2086
+	start-stop-daemon --start --background --make-pidfile \
+		--pidfile "$PIDFILE" --exec "/sbin/$DAEMON" -- $UDEVD_ARGS
+	status=$?
+	[ "$status" -eq 0 ] && echo OK || echo FAIL
+	[ "$status" -eq 0 ] || return "$status"
+
+	# DRM and input policy must be committed before seatd/Weston start.  S90
+	# replays input once more to exercise the required lost-netlink rescan path.
+	for subsystem in drm graphics input; do
+		udevadm trigger --type=devices --action=add \
+			--subsystem-match="$subsystem" || return $?
+	done
+	udevadm settle --timeout=10 || echo 'udevadm settle failed'
+}
+
+stop() {
+	printf 'Stopping %s: ' "$DAEMON"
+	udevadm control --exit || { echo FAIL; return 1; }
+	while start-stop-daemon --stop --test --quiet --pidfile "$PIDFILE" \
+		--exec "/sbin/$DAEMON"; do
+		sleep 0.1
+	done
+	rm -f "$PIDFILE"
+	echo OK
+}
+
+case "${1:-}" in
+	start) start ;;
+	stop) stop ;;
+	restart) stop; start ;;
+	reload) udevadm control --reload ;;
+	*) echo "Usage: $0 {start|stop|restart|reload}"; exit 1 ;;
+esac

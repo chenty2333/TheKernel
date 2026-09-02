@@ -1,0 +1,20 @@
+#!/bin/sh
+# Exercise the direct GBM/EGL/KMS path before Weston obtains DRM master.  A
+# software virtio-gpu has no render node and deliberately skips this phase.
+set -eu
+
+marker=THEKERNEL_Q35_VIRGL_KMSCUBE_READY
+[ -c /dev/dri/renderD128 ] || exit 0
+[ -c /dev/dri/card0 ] || { echo "$marker state=FAIL reason=card0"; exit 1; }
+
+# A blob+venus device is a different profile from legacy Virgl even though it
+# also exposes a render node.  Do not submit a Gallium workload to it.
+if command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/dev/null 2>&1; then
+    exit 0
+fi
+
+MESA_LOADER_DRIVER_OVERRIDE=virgl kmscube --count=120 || {
+    echo "$marker state=FAIL reason=kmscube"
+    exit 1
+}
+echo "$marker"

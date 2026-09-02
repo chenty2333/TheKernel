@@ -1,0 +1,170 @@
+#!/bin/sh
+# This program is entered only after util-linux login's PAM stack has run.
+# libseat must use logind; do not permit a direct-device fallback.
+set -eu
+
+[ "$(id -u)" -ne 0 ]
+case "$(id -un)" in alice|bob) ;; *) exit 1 ;; esac
+[ "${LIBSEAT_BACKEND:-}" = logind ]
+[ -n "${XDG_SESSION_ID:-}" ]
+[ -n "${XDG_RUNTIME_DIR:-}" ]
+[ -d "$XDG_RUNTIME_DIR" ]
+
+export LIBSEAT_BACKEND=logind
+export XDG_CURRENT_DESKTOP=sway
+export XDG_SESSION_DESKTOP=sway
+export XDG_SESSION_TYPE=wayland
+export MOZ_ENABLE_WAYLAND=1
+
+# Keep all session state inside the logind-created runtime directory.  The
+# root cycle controller consumes these files read-only; no privileged control
+# socket is exposed to either graphical user.
+user=$(id -un)
+state_dir="$XDG_RUNTIME_DIR/thekernel-sway"
+mkdir -p "$state_dir"
+chmod 700 "$state_dir"
+log="$state_dir/sway.log"
+client_log="$state_dir/client.log"
+
+json() {
+    printf 'THEKERNEL_Q35_LOGIND_JSON {"kind":"%s","user":"%s"}\n' "$1" "$user"
+}
+
+echo 'THEKERNEL_Q35_LOGIND_SESSION_LAUNCHER_REACHED'
+json session_launcher
+
+# dbus-run-session makes DBUS_SESSION_BUS_ADDRESS available to Sway and to its
+# IPC client.  Sway remains the foreground session leader, while this wrapper
+# owns the readiness contract and fails closed if libseat selected anything
+# except logind.
+exec dbus-run-session sh -eu -c '
+    state_dir="$1"
+    user="$2"
+    log="$state_dir/sway.log"
+    client_log="$state_dir/client.log"
+    json() {
+        printf "THEKERNEL_Q35_LOGIND_JSON {\\\"kind\\\":\\\"%s\\\",\\\"user\\\":\\\"%s\\\"}\\n" "$1" "$user"
+    }
+    fail() {
+        printf "THEKERNEL_Q35_SWAY_READY state=FAIL reason=%s user=%s\\n" "$1" "$user"
+        json "failure_$1"
+        exit 1
+    }
+    sway -d >"$log" 2>&1 &
+    sway_pid=$!
+    printf "%s\\n" "$sway_pid" >"$state_dir/sway.pid"
+    cleanup() {
+        kill "$sway_pid" 2>/dev/null || true
+        [ -z "${lease_manager_pid:-}" ] || kill "$lease_manager_pid" 2>/dev/null || true
+        if [ -r "$state_dir/lease.pids" ]; then
+            while read -r pid; do kill "$pid" 2>/dev/null || true; done <"$state_dir/lease.pids"
+        fi
+    }
+    trap cleanup EXIT INT TERM
+
+    attempt=0
+    while ! grep -Eiq "libseat.*logind|logind.*libseat" "$log" 2>/dev/null; do
+        kill -0 "$sway_pid" 2>/dev/null || fail sway_exited
+        [ "$attempt" -lt 30 ] || fail libseat_backend
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    printf "logind\\n" >"$state_dir/libseat.backend"
+    json libseat_logind
+
+    attempt=0
+    while ! swaymsg -t get_outputs -r 2>/dev/null | grep -q "\\\"name\\\""; do
+        kill -0 "$sway_pid" 2>/dev/null || fail sway_exited
+        [ "$attempt" -lt 30 ] || fail drm_output
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    printf "ready\\n" >"$state_dir/drm.output"
+    json drm_output
+
+    # get_inputs is an IPC round-trip after wlroots has completed libinput
+    # device discovery.  The persistent client below independently completes
+    # a wl_seat round-trip and records every input-driven repaint.
+    swaymsg -t get_inputs -r 2>/dev/null | grep -q "\\\"identifier\\\"" || fail libinput_roundtrip
+    printf "ready\\n" >"$state_dir/libinput.roundtrip"
+    json libinput_roundtrip
+
+    start_lease() {
+        generation=$1
+        lease_dir="$state_dir/lease-$generation"
+        mkdir -p "$lease_dir"
+        chmod 700 "$lease_dir"
+        lease_input=$(find /dev/input -maxdepth 1 -type c -name "event*" -print | head -n 1)
+        [ -n "$lease_input" ] || return 1
+        /usr/local/bin/thekernel-device-lease-probe "$lease_dir" "$lease_input" >"$lease_dir/log" 2>&1 &
+        lease_pid=$!
+        printf "%s\\n" "$lease_pid" >"$lease_dir/pid"
+        printf "%s\\n" "$lease_pid" >>"$state_dir/lease.pids"
+        attempt=0
+        while ! grep -qx "0 ready drm-and-input-usable" "$lease_dir/log" 2>/dev/null; do
+            kill -0 "$lease_pid" 2>/dev/null || return 1
+            [ "$attempt" -lt 30 ] || return 1
+            attempt=$((attempt + 1))
+            sleep 1
+        done
+        printf "%s\\n" "$generation" >"$state_dir/lease.current.next"
+        mv "$state_dir/lease.current.next" "$state_dir/lease.current"
+    }
+    : >"$state_dir/lease.pids"
+    json device_lease_manager_ready
+
+    # A resumed session must open fresh OFDs: the kernel deliberately never
+    # revives descriptors revoked by the preceding seat generation. The root
+    # controller writes a monotonically increasing generation request after
+    # each acquire; old probes remain alive to prove terminal revocation.
+    (
+        observed=-1
+        while kill -0 "$sway_pid" 2>/dev/null; do
+            requested=$(cat "$state_dir/lease.rotate" 2>/dev/null || printf "%s" "$observed")
+            case "$requested" in *[!0-9]*|"") requested=$observed ;; esac
+            if [ "$requested" -gt "$observed" ]; then
+                if ! start_lease "$requested"; then
+                    printf "%s\\n" "$requested" >"$state_dir/lease.rotate.failed"
+                    exit 1
+                fi
+                observed=$requested
+            fi
+            sleep 0.1
+        done
+    ) &
+    lease_manager_pid=$!
+
+    /usr/local/bin/q35-wayland-shm-client 2>&1 | while IFS= read -r line; do
+        printf "%s\\n" "$line"
+        case "$line" in
+            THEKERNEL_Q35_WAYLAND_REPAINT_READY)
+                : >"$state_dir/first-frame"
+                json first_frame
+                ;;
+            THEKERNEL_Q35_WAYLAND_POINTER_REPAINT|THEKERNEL_Q35_WAYLAND_BUTTON_REPAINT|THEKERNEL_Q35_WAYLAND_KEY_REPAINT|THEKERNEL_Q35_WAYLAND_SCROLL_REPAINT)
+                printf "%s\\n" "$line" >>"$state_dir/input-events.jsonl"
+                : >"$state_dir/first-input"
+                printf "THEKERNEL_Q35_SWAY_%s_%s\\n" "$(printf "%s" "$user" | tr "[:lower:]" "[:upper:]")" "${line#THEKERNEL_Q35_WAYLAND_}"
+                json input_repaint
+                ;;
+        esac
+    done | tee "$client_log" &
+    client_pid=$!
+    printf "%s\\n" "$client_pid" >"$state_dir/client.pid"
+
+    attempt=0
+    while [ ! -e "$state_dir/first-frame" ]; do
+        kill -0 "$sway_pid" 2>/dev/null || fail sway_exited
+        [ "$attempt" -lt 30 ] || fail first_frame
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    printf "ready\\n" >"$state_dir/ready"
+    if [ "$user" = alice ]; then
+        echo THEKERNEL_Q35_SWAY_READY
+    else
+        echo THEKERNEL_Q35_SWAY_BOB_READY
+    fi
+    json ready
+    wait "$sway_pid"
+' sh "$state_dir" "$user"

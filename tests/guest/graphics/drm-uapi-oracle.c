@@ -71,7 +71,7 @@ static void abi_oracle(void) {
     ABI_STRUCT(struct drm_wait_vblank_reply); ABI_FIELD(struct drm_wait_vblank_reply, type); ABI_FIELD(struct drm_wait_vblank_reply, sequence); ABI_FIELD(struct drm_wait_vblank_reply, tval_sec); ABI_FIELD(struct drm_wait_vblank_reply, tval_usec); ABI_STRUCT(union drm_wait_vblank);
     ABI_STRUCT(struct drm_syncobj_create); ABI_FIELD(struct drm_syncobj_create, handle); ABI_FIELD(struct drm_syncobj_create, flags);
     ABI_STRUCT(struct drm_syncobj_destroy); ABI_FIELD(struct drm_syncobj_destroy, handle); ABI_FIELD(struct drm_syncobj_destroy, pad);
-    ABI_STRUCT(struct drm_syncobj_handle); ABI_FIELD(struct drm_syncobj_handle, handle); ABI_FIELD(struct drm_syncobj_handle, flags); ABI_FIELD(struct drm_syncobj_handle, fd); ABI_FIELD(struct drm_syncobj_handle, pad); ABI_FIELD(struct drm_syncobj_handle, point);
+    ABI_STRUCT(struct drm_syncobj_handle); ABI_FIELD(struct drm_syncobj_handle, handle); ABI_FIELD(struct drm_syncobj_handle, flags); ABI_FIELD(struct drm_syncobj_handle, fd); ABI_FIELD(struct drm_syncobj_handle, pad);
     ABI_STRUCT(struct drm_syncobj_transfer); ABI_FIELD(struct drm_syncobj_transfer, src_handle); ABI_FIELD(struct drm_syncobj_transfer, dst_handle); ABI_FIELD(struct drm_syncobj_transfer, src_point); ABI_FIELD(struct drm_syncobj_transfer, dst_point); ABI_FIELD(struct drm_syncobj_transfer, flags); ABI_FIELD(struct drm_syncobj_transfer, pad);
     ABI_STRUCT(struct drm_syncobj_wait); ABI_FIELD(struct drm_syncobj_wait, handles); ABI_FIELD(struct drm_syncobj_wait, timeout_nsec); ABI_FIELD(struct drm_syncobj_wait, count_handles); ABI_FIELD(struct drm_syncobj_wait, flags); ABI_FIELD(struct drm_syncobj_wait, first_signaled); ABI_FIELD(struct drm_syncobj_wait, pad); ABI_FIELD(struct drm_syncobj_wait, deadline_nsec);
     ABI_STRUCT(struct drm_syncobj_timeline_wait); ABI_FIELD(struct drm_syncobj_timeline_wait, handles); ABI_FIELD(struct drm_syncobj_timeline_wait, points); ABI_FIELD(struct drm_syncobj_timeline_wait, timeout_nsec); ABI_FIELD(struct drm_syncobj_timeline_wait, count_handles); ABI_FIELD(struct drm_syncobj_timeline_wait, flags); ABI_FIELD(struct drm_syncobj_timeline_wait, first_signaled); ABI_FIELD(struct drm_syncobj_timeline_wait, pad); ABI_FIELD(struct drm_syncobj_timeline_wait, deadline_nsec);
@@ -94,7 +94,10 @@ static void abi_oracle(void) {
     ABI_IOCTL(DRM_IOCTL_VIRTGPU_MAP); ABI_IOCTL(DRM_IOCTL_VIRTGPU_EXECBUFFER); ABI_IOCTL(DRM_IOCTL_VIRTGPU_GETPARAM); ABI_IOCTL(DRM_IOCTL_VIRTGPU_RESOURCE_CREATE); ABI_IOCTL(DRM_IOCTL_VIRTGPU_RESOURCE_INFO); ABI_IOCTL(DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST); ABI_IOCTL(DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST); ABI_IOCTL(DRM_IOCTL_VIRTGPU_WAIT); ABI_IOCTL(DRM_IOCTL_VIRTGPU_GET_CAPS);
 }
 
+static int failures;
+
 static void result(const char *kind, const char *state, int err) {
+    if (strcmp(state, "FAIL") == 0) failures++;
     printf("TK_GRAPHICS kind=%s state=%s errno=%d\n", kind, state, err);
 }
 
@@ -180,5 +183,5 @@ int main(void) {
     if (card < 0) result("drm.card", "SKIP", errno); else { printf("TK_GRAPHICS kind=drm.card state=OK node=card\n"); resources(card); dumb_lifetime(card); close(card); }
     int render = open_drm("renderD", 128, 143, path, sizeof(path));
     if (render < 0) result("drm.render", "SKIP", errno); else { printf("TK_GRAPHICS kind=drm.render state=OK node=render\n"); dumb_lifetime(render); close(render); }
-    return 0;
+    return failures == 0 ? 0 : 1;
 }

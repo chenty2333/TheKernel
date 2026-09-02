@@ -1,0 +1,8 @@
+# The systemd/logind image has real console-login users.  Both use the test
+# password "thekernel" solely for the local Q35 graphics image.
+alice -1 alice -1 $6$thekernel$cxxyUTZiglUvm1QgIXiR7GFwVlbiyZEQdcayFBdNpQZNUIADx20YAXMiO6nJEDMaRV1W84aPfCQJYrv5VeSFW. /home/alice /bin/sh render Graphics test user A
+bob -1 bob -1 $6$thekernel$cxxyUTZiglUvm1QgIXiR7GFwVlbiyZEQdcayFBdNpQZNUIADx20YAXMiO6nJEDMaRV1W84aPfCQJYrv5VeSFW. /home/bob /bin/sh render Graphics test user B
+
+# Render-node access is a static group policy.  card and input access is
+# granted only to the currently active login through logind's device ACLs.
+- - render -1 - - - - -

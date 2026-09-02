@@ -3,15 +3,110 @@ set -eu
 
 marker=THEKERNEL_Q35_WESTON_READY
 virgl_marker=THEKERNEL_Q35_VIRGL_READY
+
+# Emit a small, machine-readable udev snapshot before rejecting an input
+# device.  The full property database can include an unbounded DEVLINKS value;
+# keep the console diagnostic useful without allowing one bad device to flood
+# the serial log.
+report_input_classification_failure() {
+    input_failure_reason=$1
+    input_failure_event=$2
+    printf '%s state=INFO input_event=%s input_properties_begin=1\n' \
+        "$marker" "$input_failure_event"
+    printf '%s\n' "$input_properties"
+    printf '%s state=INFO input_event=%s input_properties_end=1\n' \
+        "$marker" "$input_failure_event"
+    printf '%s state=FAIL reason=%s event=%s\n' \
+        "$marker" "$input_failure_reason" "$input_failure_event"
+    exit 1
+}
+
+settle_input_udev() {
+    udevadm settle --timeout=10 &
+    settle_pid=$!
+    (
+        sleep 15
+        if kill -0 "$settle_pid" 2>/dev/null; then
+            printf '%s state=INFO phase=input_udev_timeout pid=%s\n' \
+                "$marker" "$settle_pid"
+            ps 2>/dev/null | grep -E '(udev|PID)' | head -n 32 || true
+            find /run/udev/queue -maxdepth 1 -print 2>/dev/null | head -n 32 || true
+            kill -TERM "$settle_pid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$settle_pid" 2>/dev/null || true
+        fi
+    ) &
+    settle_watchdog_pid=$!
+    settle_status=0
+    wait "$settle_pid" || settle_status=$?
+    kill "$settle_watchdog_pid" 2>/dev/null || true
+    wait "$settle_watchdog_pid" 2>/dev/null || true
+    return "$settle_status"
+}
+
 [ -S /run/seatd.sock ] || { echo "$marker state=FAIL reason=seatd_socket"; exit 1; }
 pidof seatd >/dev/null || { echo "$marker state=FAIL reason=seatd_process"; exit 1; }
+[ "$(stat -c %U:%G /run/seatd.sock)" = root:seat ] || { echo "$marker state=FAIL reason=seatd_socket_owner"; exit 1; }
+[ "$(stat -c %a /run/seatd.sock)" = 660 ] || { echo "$marker state=FAIL reason=seatd_socket_mode"; exit 1; }
 [ -c /dev/dri/card0 ] || { echo "$marker state=FAIL reason=card0"; exit 1; }
-event=$(find /dev/input -maxdepth 1 -name 'event*' -type c -print -quit)
-[ -n "$event" ] || { echo "$marker state=FAIL reason=input"; exit 1; }
-input_properties=$(udevadm info -q property -n "$event") || { echo "$marker state=FAIL reason=input_classification"; exit 1; }
-printf '%s\n' "$input_properties" | grep -qx 'ID_INPUT=1' || { echo "$marker state=FAIL reason=input_classification"; exit 1; }
-printf '%s\n' "$input_properties" | grep -Eq '^ID_INPUT_(KEY|MOUSE)=1$' || { echo "$marker state=FAIL reason=input_classification"; exit 1; }
+# Replay the input class at the synchronization boundary.  This is the same
+# coldplug path used after a kobject-netlink overrun and closes the race where
+# a dynamically published event node appears after the init script's broad
+# startup enumeration.
+echo "$marker state=INFO phase=input_udev_trigger"
+udevadm control --log-priority=debug || true
+udevadm trigger --verbose --type=devices --action=add --subsystem-match=input || {
+    echo "$marker state=FAIL reason=input_udev_trigger"
+    exit 1
+}
+echo "$marker state=INFO phase=input_udev_settle"
+settle_input_udev || { echo "$marker state=FAIL reason=input_udev_settle"; exit 1; }
+echo "$marker state=INFO phase=input_discovery"
+events=$(find /dev/input -maxdepth 1 -name 'event*' -type c -print)
+[ -n "$events" ] || { echo "$marker state=FAIL reason=input"; exit 1; }
+have_keyboard=0
+have_pointer=0
+for event in $events; do
+    echo "$marker state=INFO phase=input_classification event=$event"
+    event_major_hex=$(stat -c %t "$event")
+    event_minor_hex=$(stat -c %T "$event")
+    event_sysdev=/sys/dev/char/$((0x$event_major_hex)):$((0x$event_minor_hex))
+    echo "$marker state=INFO phase=input_sysdev_link event=$event"
+    readlink "$event_sysdev" | head -c 512
+    echo
+    echo "$marker state=INFO phase=input_sysdev_uevent event=$event"
+    head -c 1024 "$event_sysdev/uevent"
+    echo
+    echo "$marker state=INFO phase=input_udev_path event=$event"
+    udevadm info -q path -n "$event" | head -c 512
+    echo
+    echo "$marker state=INFO phase=input_udev_properties event=$event"
+    input_properties=
+    input_properties=$(udevadm info -q property -n "$event") || \
+        report_input_classification_failure input_udev_query "$event"
+    if ! printf '%s\n' "$input_properties" | grep -qx 'ID_INPUT=1'; then
+        echo "$marker state=INFO phase=input_udev_rule_test event=$event"
+        udevadm test --action=add "$(udevadm info -q path -n "$event")" 2>&1 \
+            | tail -n 120 || true
+        tail -n 120 /var/log/messages 2>/dev/null || true
+        report_input_classification_failure input_missing_id_input "$event"
+    fi
+    printf '%s\n' "$input_properties" | grep -qx 'ID_SEAT=seat0' || \
+        report_input_classification_failure input_missing_seat "$event"
+    printf '%s\n' "$input_properties" | grep -qx 'WL_SEAT=default' || \
+        report_input_classification_failure input_missing_wayland_seat "$event"
+    printf '%s\n' "$input_properties" | grep -Eq '^ID_INPUT_(KEY|MOUSE|TABLET|TOUCHSCREEN)=1$' || \
+        report_input_classification_failure input_missing_type "$event"
+    printf '%s\n' "$input_properties" | grep -qx 'ID_INPUT_KEY=1' && have_keyboard=1
+    printf '%s\n' "$input_properties" | grep -Eq '^ID_INPUT_(MOUSE|TABLET|TOUCHSCREEN)=1$' && have_pointer=1
+    event_database=/run/udev/data/c$((0x$event_major_hex)):$((0x$event_minor_hex))
+    [ -r "$event_database" ] || { echo "$marker state=FAIL reason=input_udev_database"; exit 1; }
+done
+[ "$have_keyboard" -eq 1 ] || { echo "$marker state=FAIL reason=input_keyboard"; exit 1; }
+[ "$have_pointer" -eq 1 ] || { echo "$marker state=FAIL reason=input_pointer"; exit 1; }
+echo "$marker state=INFO phase=weston_contract"
 pidof weston >/dev/null || { echo "$marker state=FAIL reason=weston_process"; exit 1; }
+weston_pid=$(pidof weston | awk '{print $1}')
 weston_uid=$(id -u weston)
 export HOME=/var/lib/weston
 export XDG_RUNTIME_DIR=/run/user/$weston_uid
@@ -23,14 +118,47 @@ runtime_dir_is_private() {
 }
 runtime_dir_is_private || { echo "$marker state=FAIL reason=runtime_dir"; exit 1; }
 [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] || { echo "$marker state=FAIL reason=wayland_socket"; exit 1; }
-grep -q 'drm-backend.so' /proc/"$(pidof weston | awk '{print $1}')"/maps || { echo "$marker state=FAIL reason=drm_backend"; exit 1; }
-start-stop-daemon -S -x /usr/local/bin/q35-wayland-color-client -c weston
+grep -q 'drm-backend.so' /proc/"$weston_pid"/maps || { echo "$marker state=FAIL reason=drm_backend"; exit 1; }
+tr '\0' '\n' </proc/"$weston_pid"/environ | grep -qx 'LIBSEAT_BACKEND=seatd' || { echo "$marker state=FAIL reason=libseat_environment"; exit 1; }
+weston_log=$XDG_RUNTIME_DIR/weston.log
+attempt=0
+while ! grep -Fq "Seat opened with backend 'seatd'" "$weston_log" 2>/dev/null; do
+    [ "$attempt" -lt 10 ] || { echo "$marker state=FAIL reason=libseat_backend"; exit 1; }
+    attempt=$((attempt + 1))
+    sleep 1
+done
+echo "$marker state=INFO phase=uapi_oracles"
+/usr/local/bin/drm-uapi-oracle
+/usr/local/bin/evdev-uapi-oracle
+# A software virtio-gpu device deliberately has no render node; its complete
+# Pixman workload is the SHM client launched in the branch below.
+if [ ! -c /dev/dri/renderD128 ]; then
+    # The SHM client is the authoritative Pixman path.  It keeps running after
+    # the first frame so QMP can inject input and await repaint markers.
+    echo "$marker state=INFO phase=pixman_client"
+    start-stop-daemon -S -x /usr/local/bin/q35-wayland-shm-client -c weston -b
+    exit 0
+fi
 
-# A software virtio-gpu device deliberately has no render node, and the first
-# client above is its complete workload.  A virgl device advertises renderD128;
-# only that topology runs the separate forced-virgl workload.
-[ -c /dev/dri/renderD128 ] || exit 0
+# The canonical seatd image carries both Gallium Virgl and Venus.  Probe the
+# Vulkan loader before starting any GL process: a usable VirtIO ICD denotes the
+# blob+venus topology, whose only renderer workload is the deterministic WSI
+# client.  This keeps profile selection truthful even though the rootfs is
+# intentionally shared.
+if command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/dev/null 2>&1; then
+    echo THEKERNEL_Q35_VENUS_SELECTED
+    start-stop-daemon -S -x /usr/local/bin/q35-wayland-vulkan-client -c weston
+    exit 0
+fi
+
+# Legacy Virgl has already exercised KMS before Weston starts.  Now run the
+# render-node, GLES, Piglit and rootless Xwayland/glamor chain only for this
+# non-Venus topology.  Do not start an independent X server.
 id -nG weston | tr ' ' '\n' | grep -qx render || { echo "$virgl_marker state=FAIL reason=weston_render_group"; exit 1; }
-exec start-stop-daemon -S -x /usr/bin/env -c weston -- \
-    MESA_LOADER_DRIVER_OVERRIDE=virgl THEKERNEL_Q35_VIRGL=1 \
-    /usr/local/bin/q35-wayland-color-client
+attempt=0
+while [ ! -S /tmp/.X11-unix/X0 ] && [ "$attempt" -lt 20 ]; do
+    attempt=$((attempt + 1))
+    sleep 1
+done
+[ -S /tmp/.X11-unix/X0 ] || { echo "$virgl_marker state=FAIL reason=xwayland_socket"; exit 1; }
+start-stop-daemon -S -x /usr/local/bin/q35-virgl-workloads -c weston -b

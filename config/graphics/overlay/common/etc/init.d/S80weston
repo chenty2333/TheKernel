@@ -12,7 +12,26 @@ SESSION=/usr/local/bin/graphics-session
 FLAVOR_FILE=/etc/thekernel-graphics-flavor
 
 running() {
-    [ -r "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+    pid_from_file >/dev/null 2>&1 && kill -0 "$(pid_from_file)" 2>/dev/null
+}
+
+pid_from_file() {
+    [ -r "$PIDFILE" ] || return 1
+    IFS= read -r pid <"$PIDFILE" || return 1
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+        *) printf '%s\n' "$pid" ;;
+    esac
+}
+
+wait_for_exit() {
+    pid=$1
+    tries=0
+    while kill -0 "$pid" 2>/dev/null; do
+        [ "$tries" -lt 10 ] || return 1
+        tries=$((tries + 1))
+        sleep 1
+    done
 }
 
 graphics_flavor() {
@@ -22,7 +41,7 @@ graphics_flavor() {
     }
     flavor=$(cat "$FLAVOR_FILE")
     case "$flavor" in
-        headless-abi-smoke|q35-software-desktop) printf '%s\n' "$flavor" ;;
+        headless-abi-smoke|q35-graphics-seatd|q35-software-desktop|q35-venus-desktop) printf '%s\n' "$flavor" ;;
         *)
             echo "invalid graphics flavor in $FLAVOR_FILE" >&2
             return 1
@@ -43,9 +62,21 @@ start() {
 }
 
 stop() {
-    running || { rm -f "$PIDFILE"; return 0; }
+    pid=$(pid_from_file) || { rm -f "$PIDFILE"; return 0; }
+    kill -0 "$pid" 2>/dev/null || { rm -f "$PIDFILE"; return 0; }
     printf 'Stopping Weston: '
-    start-stop-daemon -K -p "$PIDFILE"
+    kill -TERM "$pid" 2>/dev/null || true
+    if ! wait_for_exit "$pid"; then
+        printf 'TERM timeout; sending KILL: ' >&2
+        kill -KILL "$pid" 2>/dev/null || true
+        if ! wait_for_exit "$pid"; then
+            echo FAIL >&2
+            return 1
+        fi
+    fi
+    # A dead Weston necessarily closed its DRM-master FD.  Do not remove this
+    # PID file before that point: modeset helpers use stop's success as their
+    # ownership hand-off.
     rm -f "$PIDFILE"
     echo OK
 }

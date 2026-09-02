@@ -63,7 +63,9 @@ static void cleanup(struct app *a) {
     if (a->d) wl_display_disconnect(a->d);
 }
 int main(void) {
-    struct app a = { .ed = EGL_NO_DISPLAY, .es = EGL_NO_SURFACE, .ec = EGL_NO_CONTEXT, .marker = getenv("THEKERNEL_Q35_VIRGL") ? "THEKERNEL_Q35_VIRGL_READY" : "THEKERNEL_Q35_WESTON_READY" };
+    const char *marker = getenv("THEKERNEL_Q35_RENDER_MARKER");
+    struct app a = { .ed = EGL_NO_DISPLAY, .es = EGL_NO_SURFACE, .ec = EGL_NO_CONTEXT,
+        .marker = marker ? marker : "THEKERNEL_Q35_WESTON_READY" };
     struct wl_registry *r; int result = 1;
     a.d = wl_display_connect(NULL); if (!a.d) { fail(&a, "wayland_connect"); goto out; }
     r = wl_display_get_registry(a.d); if (!r) { fail(&a, "wayland_registry"); goto out; }

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Xwayland uses glamor by default whenever EGL/DRI3 are available.  Make the
+# choice explicit so a DRM desktop cannot silently request the SHM fallback;
+# the wrapper still delegates all X server argument parsing upstream.
+set -eu
+export XWAYLAND_NO_GLAMOR=0
+exec /usr/bin/Xwayland "$@"

@@ -1,0 +1,4 @@
+# logind owns card and input device access by per-session ACL.  render nodes
+# remain directly accessible to the render group for the render-node ABI.
+SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", GROUP="render", MODE="0660"
+SUBSYSTEM=="input", KERNEL=="event[0-9]*", ENV{ID_SEAT}="seat0", ENV{WL_SEAT}="default"

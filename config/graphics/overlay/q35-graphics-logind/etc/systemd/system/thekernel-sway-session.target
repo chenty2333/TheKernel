@@ -1,0 +1,5 @@
+[Unit]
+Description=TheKernel Sway graphical session readiness target
+After=systemd-logind.service dbus.service
+Wants=systemd-logind.service
+

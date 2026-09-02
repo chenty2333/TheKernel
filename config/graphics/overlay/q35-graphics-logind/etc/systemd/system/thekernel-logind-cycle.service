@@ -1,0 +1,11 @@
+[Unit]
+Description=TheKernel logind Sway A/B session cycle oracle
+After=systemd-logind.service getty@tty1.service getty@tty2.service
+Wants=systemd-logind.service getty@tty1.service getty@tty2.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/thekernel-logind-cycle
+
+[Install]
+WantedBy=multi-user.target

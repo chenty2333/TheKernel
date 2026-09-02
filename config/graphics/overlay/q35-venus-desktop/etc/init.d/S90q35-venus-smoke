@@ -1,0 +1,25 @@
+#!/bin/sh
+# The marker is emitted by the Vulkan client only after a Wayland swapchain
+# image has been presented.  It therefore cannot turn a missing blob/context
+# lifecycle into a false-ready userspace result.
+set -eu
+
+marker=THEKERNEL_Q35_VENUS_READY
+[ -S /run/seatd.sock ] || { echo "$marker state=FAIL reason=seatd_socket"; exit 1; }
+[ -c /dev/dri/card0 ] || { echo "$marker state=FAIL reason=card0"; exit 1; }
+[ -c /dev/dri/renderD128 ] || { echo "$marker state=FAIL reason=render_node"; exit 1; }
+pidof weston >/dev/null || { echo "$marker state=FAIL reason=weston_process"; exit 1; }
+
+weston_uid=$(id -u weston)
+export HOME=/var/lib/weston
+export XDG_RUNTIME_DIR=/run/user/$weston_uid
+export WAYLAND_DISPLAY=wayland-0
+[ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] || {
+    echo "$marker state=FAIL reason=wayland_socket"
+    exit 1
+}
+
+# vulkaninfo establishes loader/ICD discovery before the deterministic WSI
+# workload creates and presents the Wayland Vulkan surface.
+vulkaninfo --summary >/dev/null || { echo "$marker state=FAIL reason=vulkaninfo"; exit 1; }
+exec start-stop-daemon -S -x /usr/local/bin/q35-wayland-vulkan-client -c weston

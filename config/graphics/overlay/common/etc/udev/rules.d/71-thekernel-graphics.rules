@@ -4,4 +4,4 @@
 SUBSYSTEM=="drm", KERNEL=="card[0-9]*", GROUP="video", MODE="0660"
 SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", GROUP="render", MODE="0660"
 SUBSYSTEM=="graphics", KERNEL=="fb[0-9]*", GROUP="video", MODE="0660"
-SUBSYSTEM=="input", KERNEL=="event[0-9]*", GROUP="input", MODE="0660"
+SUBSYSTEM=="input", KERNEL=="event[0-9]*", ENV{ID_SEAT}="seat0", ENV{WL_SEAT}="default", GROUP="input", MODE="0660"

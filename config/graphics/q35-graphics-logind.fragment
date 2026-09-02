@@ -1,0 +1,38 @@
+# Phase-8 image: this is intentionally independent of the seatd/Weston
+# images.  systemd owns udev and logind; libseat is built with its logind
+# backend, but the seatd daemon and its SysV scripts are absent.
+BR2_INIT_SYSTEMD=y
+# BR2_INIT_BUSYBOX is not set
+BR2_PACKAGE_SYSTEMD_LOGIND=y
+BR2_PACKAGE_DBUS=y
+BR2_ENABLE_LOCALE=y
+BR2_GENERATE_LOCALE="en_US.UTF-8"
+BR2_ROOTFS_USERS_TABLES="@REPO_ROOT@/config/graphics/logind-users.table"
+BR2_ROOTFS_OVERLAY="@REPO_ROOT@/config/graphics/overlay/q35-graphics-logind"
+BR2_ROOTFS_POST_BUILD_SCRIPT="@REPO_ROOT@/config/graphics/build-guest-tools.sh @REPO_ROOT@/config/graphics/build-q35-wayland-client.sh"
+
+# systemd provides systemd-udevd.  Do not carry eudev or a seatd daemon into
+# this image; wlroots' libseat client is compiled against logind instead.
+# BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_EUDEV is not set
+# BR2_PACKAGE_EUDEV is not set
+# BR2_PACKAGE_SEATD_DAEMON is not set
+
+BR2_PACKAGE_LINUX_PAM=y
+BR2_PACKAGE_UTIL_LINUX_LOGIN=y
+BR2_PACKAGE_ACL=y
+BR2_PACKAGE_SEATD=y
+BR2_PACKAGE_LIBDRM=y
+BR2_PACKAGE_LIBEVDEV=y
+BR2_PACKAGE_LIBINPUT=y
+BR2_PACKAGE_WAYLAND=y
+BR2_PACKAGE_PIXMAN=y
+BR2_PACKAGE_MESA3D=y
+BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y
+BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y
+BR2_PACKAGE_MESA3D_OPENGL_EGL=y
+BR2_PACKAGE_MESA3D_OPENGL_ES=y
+BR2_PACKAGE_VULKAN_LOADER=y
+BR2_PACKAGE_SWAY=y
+BR2_PACKAGE_FOOT=y
+# BR2_PACKAGE_WESTON is not set
+# BR2_PACKAGE_WLROOTS_XWAYLAND is not set

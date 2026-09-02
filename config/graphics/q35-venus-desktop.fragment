@@ -1,0 +1,13 @@
+# Phase-7 Venus is a separate image and workload: it does not inherit the
+# legacy Gallium Virgl workload or its forced driver override.
+BR2_ROOTFS_OVERLAY="@REPO_ROOT@/config/graphics/overlay/common @REPO_ROOT@/config/graphics/overlay/q35-venus-desktop"
+BR2_ROOTFS_POST_BUILD_SCRIPT="@REPO_ROOT@/config/graphics/build-guest-tools.sh @REPO_ROOT@/config/graphics/build-q35-wayland-vulkan-client.sh"
+BR2_PACKAGE_WESTON_DEFAULT_DRM=y
+BR2_PACKAGE_WESTON_HEADLESS=y
+BR2_PACKAGE_WESTON_DRM=y
+BR2_PACKAGE_MESA3D=y
+BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y
+BR2_PACKAGE_VULKAN_LOADER=y
+BR2_PACKAGE_VULKAN_TOOLS=y
+# BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL is not set
+# BR2_PACKAGE_WLROOTS is not set

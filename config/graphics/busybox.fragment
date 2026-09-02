@@ -1,0 +1,4 @@
+# Graphics session scripts use stat to validate seat and runtime-directory
+# ownership before starting Weston.
+CONFIG_STAT=y
+CONFIG_FEATURE_STAT_FORMAT=y

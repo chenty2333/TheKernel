@@ -1,0 +1,2 @@
+# This image must never fall back to a direct or seatd libseat backend.
+LIBSEAT_BACKEND=logind

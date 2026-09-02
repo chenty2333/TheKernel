@@ -15,6 +15,21 @@ start() {
     mkdir -p /run
     printf 'Starting seatd: '
     start-stop-daemon -S -x "$DAEMON" -p "$PIDFILE" -m -b -- -g seat
+    attempt=0
+    while [ ! -S /run/seatd.sock ]; do
+        if [ "$attempt" -ge 10 ]; then
+            echo FAILED
+            stop 2>/dev/null || true
+            return 1
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    if ! chown root:seat /run/seatd.sock || ! chmod 0660 /run/seatd.sock; then
+        echo FAILED
+        stop 2>/dev/null || true
+        return 1
+    fi
     echo OK
 }
 

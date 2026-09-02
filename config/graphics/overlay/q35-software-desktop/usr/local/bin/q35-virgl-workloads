@@ -1,0 +1,22 @@
+#!/bin/sh
+# This is the legacy-Virgl completion chain.  Its final marker is intentionally
+# emitted only after each bounded command has exited successfully.
+set -eu
+
+marker=THEKERNEL_Q35_VIRGL_READY
+export MESA_LOADER_DRIVER_OVERRIDE=virgl
+
+/usr/local/bin/q35-virgl-render-oracle || { echo "$marker state=FAIL reason=render_uapi"; exit 1; }
+echo THEKERNEL_Q35_VIRGL_RENDER_READY
+
+THEKERNEL_Q35_RENDER_MARKER=THEKERNEL_Q35_VIRGL_GLES_READY \
+    /usr/local/bin/q35-wayland-color-client || { echo "$marker state=FAIL reason=gles"; exit 1; }
+
+/usr/local/bin/q35-piglit-quick || { echo "$marker state=FAIL reason=piglit"; exit 1; }
+
+DISPLAY=:0 /usr/local/bin/q35-xwayland-xcb-client || {
+    echo "$marker state=FAIL reason=xwayland_glamor"
+    exit 1
+}
+echo THEKERNEL_Q35_XWAYLAND_GLAMOR_READY
+echo "$marker"

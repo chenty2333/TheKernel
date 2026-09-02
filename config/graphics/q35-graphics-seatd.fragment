@@ -1,0 +1,29 @@
+# Canonical stage-one desktop image.  The same BusyBox/eudev/seatd/Weston
+# rootfs contains the software, legacy Virgl, and Venus userspaces.  QEMU's
+# explicit graphics profile selects one device topology, while S90 selects only
+# the matching workload; no profile gets a separately assembled rootfs.
+BR2_ROOTFS_OVERLAY="@REPO_ROOT@/config/graphics/overlay/common @REPO_ROOT@/config/graphics/overlay/q35-software-desktop @REPO_ROOT@/config/graphics/overlay/q35-graphics-seatd"
+BR2_ROOTFS_POST_BUILD_SCRIPT="@REPO_ROOT@/config/graphics/build-guest-tools.sh @REPO_ROOT@/config/graphics/build-q35-wayland-client.sh @REPO_ROOT@/config/graphics/build-q35-wayland-vulkan-client.sh"
+BR2_PACKAGE_WESTON_DEFAULT_DRM=y
+BR2_PACKAGE_WESTON_HEADLESS=y
+BR2_PACKAGE_WESTON_DRM=y
+BR2_PACKAGE_WESTON_SHELL_DESKTOP=y
+BR2_PACKAGE_MESA3D=y
+BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y
+BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y
+BR2_PACKAGE_MESA3D_OPENGL_GLX=y
+BR2_PACKAGE_MESA3D_OPENGL_EGL=y
+BR2_PACKAGE_MESA3D_OPENGL_ES=y
+BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y
+BR2_PACKAGE_VULKAN_LOADER=y
+BR2_PACKAGE_VULKAN_TOOLS=y
+BR2_PACKAGE_KMSCUBE=y
+BR2_PACKAGE_PYTHON3=y
+BR2_PACKAGE_PIGLIT=y
+BR2_PACKAGE_XORG7=y
+BR2_PACKAGE_LIBEPOXY=y
+BR2_TARGET_ROOTFS_EXT2_SIZE="3G"
+BR2_PACKAGE_WESTON_XWAYLAND=y
+BR2_PACKAGE_FOOT=y
+BR2_PACKAGE_XTERM=y
+# BR2_PACKAGE_WLROOTS is not set

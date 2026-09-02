@@ -1,0 +1,170 @@
+#!/bin/sh
+# Exercise one complete ownership handoff through logind: Alice -> Bob ->
+# Alice. Each step verifies device ACL movement, terminal revocation of the
+# old device leases, and input isolation for the inactive session.
+set -eu
+
+state_dir() { id -u "$1" | sed 's#^#/run/user/#' | sed 's#$#/thekernel-sway#'; }
+alice_state=$(state_dir alice)
+bob_state=$(state_dir bob)
+
+json() {
+    printf 'THEKERNEL_Q35_LOGIND_JSON {"kind":"%s","cycle":%s,"active":"%s","inactive":"%s"}\n' "$1" "$2" "$3" "$4"
+}
+fail() {
+    printf 'THEKERNEL_Q35_LOGIND_CYCLE state=FAIL reason=%s cycle=%s\n' "$1" "${cycle:-0}"
+    exit 1
+}
+wait_for() {
+    path=$1
+    attempt=0
+    while [ ! -e "$path" ]; do
+        [ "$attempt" -lt 60 ] || fail "wait_${path##*/}"
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+}
+session_for() {
+    loginctl list-sessions --no-legend | awk -v user="$1" '$3 == user { print $1; exit }'
+}
+lease_request() {
+    lease_dir=$1 sequence=$2 operation=$3 expected=$4
+    printf '%s %s\n' "$sequence" "$operation" >"$lease_dir/lease.command"
+    attempt=0
+    while ! grep -q "^$sequence " "$lease_dir/lease.result" 2>/dev/null; do
+        [ "$attempt" -lt 80 ] || fail "lease_${operation}_timeout"
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    lease_result=$(cat "$lease_dir/lease.result")
+    printf 'THEKERNEL_Q35_LOGIND_LEASE sequence=%s result=%s\n' "$sequence" "$lease_result"
+    printf 'THEKERNEL_Q35_LOGIND_JSON {"kind":"device_lease","sequence":%s,"operation":"%s","result":"%s"}\n' "$sequence" "$operation" "$expected"
+    printf '%s\n' "$lease_result" | grep -q "^$sequence $expected " || fail "lease_${operation}"
+}
+rotate_lease() {
+    state=$1
+    previous=$(cat "$state/lease.current" 2>/dev/null || printf '%s' -1)
+    requested=$((previous + 1))
+    rm -f "$state/lease.rotate.failed"
+    printf '%s\n' "$requested" >"$state/lease.rotate"
+    attempt=0
+    while [ "$(cat "$state/lease.current" 2>/dev/null || true)" != "$requested" ]; do
+        [ ! -e "$state/lease.rotate.failed" ] || fail lease_rotate_failed
+        [ "$attempt" -lt 80 ] || fail lease_rotate_timeout
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    fresh_lease_dir="$state/lease-$requested"
+}
+acl_has_user() {
+    getfacl -cp "$2" 2>/dev/null | grep -qx "user:$1:rw-"
+}
+event_node() {
+    find /dev/input -maxdepth 1 -type c -name 'event*' -print | head -n 1
+}
+verify_active() {
+    active=$1 inactive=$2 active_session=$3 inactive_session=$4 active_state=$5 inactive_state=$6 sequence=$7
+    [ "$(loginctl show-session "$active_session" -p Active --value)" = yes ] || fail active_session
+    [ "$(loginctl show-session "$inactive_session" -p Active --value)" = no ] || fail inactive_session
+    card=/dev/dri/card0
+    event=$(event_node)
+    [ -c "$card" ] && [ -n "$event" ] || fail device_nodes
+    acl_has_user "$active" "$card" || fail active_card_acl
+    acl_has_user "$active" "$event" || fail active_input_acl
+    ! acl_has_user "$inactive" "$card" || fail stale_card_acl
+    ! acl_has_user "$inactive" "$event" || fail stale_input_acl
+    active_generation=$(cat "$active_state/lease.current" 2>/dev/null || true)
+    inactive_generation=$(cat "$inactive_state/lease.current")
+    inactive_dir="$inactive_state/lease-$inactive_generation"
+    inactive_lease=$(cat "$inactive_dir/pid")
+    kill -0 "$inactive_lease" 2>/dev/null || fail inactive_lease_exited
+    # The persistent probe owns the original FDs and performs
+    # poll/read/input-ioctl/DRM-ioctl across the handoff. Revocation is a
+    # property of operations on those OFDs, not of when libseat closes them.
+    if [ -n "$active_generation" ]; then
+        active_old_dir="$active_state/lease-$active_generation"
+        active_lease=$(cat "$active_old_dir/pid")
+        kill -0 "$active_lease" 2>/dev/null || fail active_lease_exited
+        lease_request "$active_old_dir" "$((sequence * 10 + 1))" revoked revoked
+    fi
+    lease_request "$inactive_dir" "$((sequence * 10 + 2))" revoked revoked
+    rotate_lease "$active_state"
+    lease_request "$fresh_lease_dir" "$((sequence * 10 + 3))" active active-ok
+    if [ -r "$inactive_state/input-events.before" ]; then
+        before=$(cat "$inactive_state/input-events.before")
+        now=$(wc -l <"$inactive_state/input-events.jsonl" 2>/dev/null || true)
+        [ "$before" = "$now" ] || fail background_input
+    fi
+    inactive_events_before=$(wc -l <"$inactive_state/input-events.jsonl" 2>/dev/null || true)
+    printf '%s\n' "$inactive_events_before" >"$inactive_state/input-events.before"
+}
+activate() {
+    user=$1 tty=$2 session=$3 other_user=$4 other_session=$5 user_state=$6 other_state=$7 sequence=$8
+    chvt "$tty"
+    loginctl activate "$session"
+    attempt=0
+    while [ "$(loginctl show-session "$session" -p Active --value)" != yes ]; do
+        [ "$attempt" -lt 20 ] || fail activate_timeout
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    verify_active "$user" "$other_user" "$session" "$other_session" "$user_state" "$other_state" "$sequence"
+}
+request_host_input() {
+    user=$1 cycle_number=$2 state=$3 inactive_state=$4 kind=$5
+    before=$(wc -l <"$state/input-events.jsonl" 2>/dev/null || true)
+    inactive_before=$(wc -l <"$inactive_state/input-events.jsonl" 2>/dev/null || true)
+    marker=$(printf 'THEKERNEL_Q35_LOGIND_CYCLE_%s_%s_READY_%03d' "$user" "$kind" "$cycle_number")
+    echo "$marker"
+    json input_requested "$cycle_number" "$user" inactive
+    attempt=0
+    while :; do
+        active_now=$(wc -l <"$state/input-events.jsonl" 2>/dev/null || true)
+        inactive_now=$(wc -l <"$inactive_state/input-events.jsonl" 2>/dev/null || true)
+        [ "$inactive_now" = "$inactive_before" ] || fail background_input
+        [ "$active_now" -eq $((before + 1)) ] && break
+        [ "$active_now" -le $((before + 1)) ] || fail active_input_multiple
+        [ "$attempt" -lt 80 ] || fail active_input_timeout
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    printf 'THEKERNEL_Q35_LOGIND_CYCLE_%s_%s_OBSERVED_%03d\n' "$user" "$kind" "$cycle_number"
+    json input_observed "$cycle_number" "$user" inactive
+}
+
+[ ! -e /usr/bin/seatd ] || fail seatd_present
+wait_for "$alice_state/ready"
+wait_for "$bob_state/ready"
+alice_session=$(session_for alice)
+bob_session=$(session_for bob)
+[ -n "$alice_session" ] && [ -n "$bob_session" ] || fail sessions
+
+# The host first injects a pointer event after THEKERNEL_Q35_SWAY_READY.  Do
+# not start the long switch sequence until Alice's compositor has reported
+# that it consumed that event, which gives the QMP runner a deterministic A
+# pixel/input checkpoint before the first handoff.
+wait_for "$alice_state/first-input"
+
+# Alice starts as the foreground session. Establish its generation-zero probe
+# before the first release so the Bob acquire can prove that old lease was
+# terminally revoked.
+rotate_lease "$alice_state"
+lease_request "$fresh_lease_dir" 1 active active-ok
+
+cycle=0
+while [ "$cycle" -lt 1 ]; do
+    cycle=$((cycle + 1))
+    bob_sequence=$((cycle * 2))
+    alice_sequence=$((bob_sequence + 1))
+    activate bob 2 "$bob_session" alice "$alice_session" "$bob_state" "$alice_state" "$bob_sequence"
+    json switched "$cycle" bob alice
+    request_host_input BOB "$cycle" "$bob_state" "$alice_state" POINTER
+    activate alice 1 "$alice_session" bob "$bob_session" "$alice_state" "$bob_state" "$alice_sequence"
+    json switched "$cycle" alice bob
+    request_host_input ALICE "$cycle" "$alice_state" "$bob_state" KEY
+done
+
+# Alice is again foreground.  Its persistent Wayland client remains the
+# pixel/input endpoint for the post-cycle QMP screenshot checkpoint.
+echo THEKERNEL_Q35_LOGIND_CYCLES_COMPLETE
+json cycles_complete 1 alice bob

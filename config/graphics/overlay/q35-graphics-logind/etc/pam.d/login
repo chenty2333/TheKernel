@@ -1,0 +1,10 @@
+# util-linux login creates the logind session.  pam_systemd is deliberately
+# required: a successful password without a logind session is not a graphics
+# session in this image.
+auth       required   pam_unix.so nullok
+account    required   pam_unix.so
+password   required   pam_unix.so nullok
+session    required   pam_limits.so
+session    required   pam_env.so
+session    required   pam_unix.so
+session    required   pam_systemd.so

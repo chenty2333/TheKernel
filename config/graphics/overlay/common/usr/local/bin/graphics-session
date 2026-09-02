@@ -5,6 +5,7 @@ set -eu
 runtime_dir=/run/user/$(id -u)
 export HOME=/var/lib/weston
 export XDG_RUNTIME_DIR="$runtime_dir"
+export LIBSEAT_BACKEND=seatd
 [ "$(id -u)" -ne 0 ]
 [ -d "$XDG_RUNTIME_DIR" ]
 [ "$(stat -c %u "$XDG_RUNTIME_DIR")" = "$(id -u)" ]
@@ -12,13 +13,23 @@ export XDG_RUNTIME_DIR="$runtime_dir"
 
 case "${1:-}" in
     headless-abi-smoke)
-        exec weston --config=/etc/weston/weston-headless.ini
+        exec weston --config=/etc/weston/weston-headless.ini \
+            --log="$XDG_RUNTIME_DIR/weston.log"
         ;;
     q35-software-desktop)
-        exec weston --config=/etc/weston/weston-drm.ini
+        exec weston --config=/etc/weston/weston-drm.ini \
+            --log="$XDG_RUNTIME_DIR/weston.log"
+        ;;
+    q35-graphics-seatd)
+        exec weston --config=/etc/weston/weston-drm.ini \
+            --log="$XDG_RUNTIME_DIR/weston.log"
+        ;;
+    q35-venus-desktop)
+        exec weston --config=/etc/weston/weston-drm.ini \
+            --log="$XDG_RUNTIME_DIR/weston.log"
         ;;
     *)
-        echo "Usage: $0 {headless-abi-smoke|q35-software-desktop}" >&2
+        echo "Usage: $0 {headless-abi-smoke|q35-graphics-seatd|q35-software-desktop|q35-venus-desktop}" >&2
         exit 2
         ;;
 esac

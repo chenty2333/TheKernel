@@ -18,7 +18,12 @@ _Static_assert(sizeof(struct input_event) == 24, "input_event x86_64 ABI");
 _Static_assert(sizeof(struct input_id) == 8, "input_id ABI");
 _Static_assert(sizeof(struct input_absinfo) == 24, "input_absinfo ABI");
 
-static void skip(const char *kind, int error) { printf("TK_GRAPHICS kind=%s state=SKIP errno=%d\n", kind, error); }
+static int failures;
+
+static void result(const char *kind, const char *state, int error) {
+    if (strcmp(state, "FAIL") == 0) failures++;
+    printf("TK_GRAPHICS kind=%s state=%s errno=%d\n", kind, state, error);
+}
 
 static int open_event(void) {
     char path[32];
@@ -44,21 +49,28 @@ int main(void) {
            sizeof(struct input_event), sizeof(struct input_id), sizeof(struct input_absinfo),
            (unsigned long)EVIOCGVERSION, (unsigned long)EVIOCGID, (unsigned long)EVIOCGBIT(0, 64), (unsigned long)EVIOCGABS(ABS_X), (unsigned long)EVIOCSCLOCKID, (unsigned long)EVIOCGRAB);
     int fd = open_event();
-    if (fd < 0) { skip("evdev.open", errno); return 0; }
+    if (fd < 0) { result("evdev.open", "FAIL", errno); return 1; }
     int version = 0, clockid = -1, grab = 1;
     struct input_id id; struct input_absinfo abs; unsigned char bits[64]; char bit_text[129];
     memset(&id, 0, sizeof(id)); memset(&abs, 0, sizeof(abs)); memset(bits, 0, sizeof(bits));
-    if (ioctl(fd, EVIOCGVERSION, &version) == 0) printf("TK_GRAPHICS kind=evdev.version state=OK value=0x%x\n", version); else skip("evdev.version", errno);
-    if (ioctl(fd, EVIOCGID, &id) == 0) printf("TK_GRAPHICS kind=evdev.id state=OK bustype=%u vendor=%u product=%u version=%u\n", id.bustype, id.vendor, id.product, id.version); else skip("evdev.id", errno);
-    if (ioctl(fd, EVIOCGBIT(0, sizeof(bits)), bits) == 0) { bitset_hex(bits, sizeof(bits), bit_text, sizeof(bit_text)); printf("TK_GRAPHICS kind=evdev.bits state=OK data=%s\n", bit_text); } else skip("evdev.bits", errno);
-    if (ioctl(fd, EVIOCGABS(ABS_X), &abs) == 0) printf("TK_GRAPHICS kind=evdev.abs_x state=OK min=%d max=%d fuzz=%d flat=%d resolution=%d\n", abs.minimum, abs.maximum, abs.fuzz, abs.flat, abs.resolution); else skip("evdev.abs_x", errno);
+    if (ioctl(fd, EVIOCGVERSION, &version) == 0) printf("TK_GRAPHICS kind=evdev.version state=OK value=0x%x\n", version); else result("evdev.version", "FAIL", errno);
+    if (ioctl(fd, EVIOCGID, &id) == 0) printf("TK_GRAPHICS kind=evdev.id state=OK bustype=%u vendor=%u product=%u version=%u\n", id.bustype, id.vendor, id.product, id.version); else result("evdev.id", "FAIL", errno);
+    int bit_bytes = ioctl(fd, EVIOCGBIT(0, sizeof(bits)), bits);
+    if (bit_bytes == (int)sizeof(unsigned long)) {
+        bitset_hex(bits, sizeof(bits), bit_text, sizeof(bit_text));
+        printf("TK_GRAPHICS kind=evdev.bits state=OK bytes=%d data=%s\n", bit_bytes, bit_text);
+        if ((bits[EV_ABS / 8] & (1u << (EV_ABS % 8))) != 0) {
+            if (ioctl(fd, EVIOCGABS(ABS_X), &abs) == 0) printf("TK_GRAPHICS kind=evdev.abs_x state=OK min=%d max=%d fuzz=%d flat=%d resolution=%d\n", abs.minimum, abs.maximum, abs.fuzz, abs.flat, abs.resolution);
+            else result("evdev.abs_x", "FAIL", errno);
+        } else result("evdev.abs_x", "SKIP", ENOTSUP);
+    } else result("evdev.bits", "FAIL", bit_bytes < 0 ? errno : EPROTO);
     clockid = CLOCK_MONOTONIC;
     if (ioctl(fd, EVIOCSCLOCKID, &clockid) == 0) {
         int restore_clockid = CLOCK_REALTIME;
         if (ioctl(fd, EVIOCSCLOCKID, &restore_clockid) == 0) printf("TK_GRAPHICS kind=evdev.clockid state=OK\n");
-        else skip("evdev.clockid_restore", errno);
-    } else skip("evdev.clockid", errno);
-    if (ioctl(fd, EVIOCGRAB, &grab) == 0) { grab = 0; if (ioctl(fd, EVIOCGRAB, &grab) == 0) printf("TK_GRAPHICS kind=evdev.grab state=OK\n"); else skip("evdev.grab_release", errno); } else skip("evdev.grab", errno);
+        else result("evdev.clockid_restore", "FAIL", errno);
+    } else result("evdev.clockid", "FAIL", errno);
+    if (ioctl(fd, EVIOCGRAB, &grab) == 0) { grab = 0; if (ioctl(fd, EVIOCGRAB, &grab) == 0) printf("TK_GRAPHICS kind=evdev.grab state=OK\n"); else result("evdev.grab_release", "FAIL", errno); } else result("evdev.grab", "FAIL", errno);
     close(fd);
-    return 0;
+    return failures == 0 ? 0 : 1;
 }
