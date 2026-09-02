@@ -1,7 +1,8 @@
-use alloc::sync::Arc;
-use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use alloc::{collections::BTreeMap, sync::Arc};
+use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use axerrno::{AxError, AxResult, LinuxError};
+use axsync::Mutex;
 
 mod mqueue;
 mod msg;
@@ -16,12 +17,201 @@ use linux_raw_sys::{
 pub use self::{mqueue::*, msg::*, sem::*, shm::*};
 use crate::task::{Cred, Kgid, Kuid, UserNamespace, ns_capable};
 
-static IPC_ID: AtomicI32 = AtomicI32::new(0);
+static IPC_NAMESPACE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// All IPC objects visible through one Linux IPC namespace.
+///
+/// The namespace owns its SysV tables and POSIX mqueue name space.  Nothing
+/// in these managers is global: cloning a process keeps this `Arc`, while
+/// `CLONE_NEWIPC` constructs a fresh instance.  The independent cursors make
+/// ID reuse local to the namespace as Linux requires.
+pub(crate) struct IpcNamespace {
+    id: u64,
+    owner_user_ns: Arc<UserNamespace>,
+    msg: Mutex<MsgManager>,
+    sem: Mutex<SemManager>,
+    shm: Mutex<ShmManager>,
+    shm_transaction: Mutex<()>,
+    mqueue: Mutex<MqManager>,
+    mqueue_notifications: Mutex<MqNotificationRegistry>,
+    shm_locked_bytes: Mutex<BTreeMap<Kuid, usize>>,
+    mq_accounted_bytes: Mutex<BTreeMap<Kuid, usize>>,
+    msg_next_id: AtomicI32,
+    sem_next_id: AtomicI32,
+    shm_next_id: AtomicI32,
+    sequence: AtomicU64,
+}
+
+impl IpcNamespace {
+    pub(crate) fn try_new(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+        let id = IPC_NAMESPACE_ID
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| AxError::from(LinuxError::ENOSPC))?;
+        Arc::try_new(Self {
+            id,
+            owner_user_ns,
+            msg: Mutex::new(MsgManager::new()),
+            sem: Mutex::new(SemManager::new()),
+            shm: Mutex::new(ShmManager::new()),
+            shm_transaction: Mutex::new(()),
+            mqueue: Mutex::new(MqManager::new()),
+            mqueue_notifications: Mutex::new(MqNotificationRegistry::new()),
+            shm_locked_bytes: Mutex::new(BTreeMap::new()),
+            mq_accounted_bytes: Mutex::new(BTreeMap::new()),
+            msg_next_id: AtomicI32::new(-1),
+            sem_next_id: AtomicI32::new(-1),
+            shm_next_id: AtomicI32::new(-1),
+            sequence: AtomicU64::new(0),
+        })
+        .map_err(|_| AxError::NoMemory)
+    }
+
+    pub(crate) fn owner_user_ns(&self) -> &Arc<UserNamespace> {
+        &self.owner_user_ns
+    }
+
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn msg_manager(&self) -> &Mutex<MsgManager> {
+        &self.msg
+    }
+    pub(crate) fn sem_manager(&self) -> &Mutex<SemManager> {
+        &self.sem
+    }
+    pub(crate) fn shm_manager(&self) -> &Mutex<ShmManager> {
+        &self.shm
+    }
+    pub(crate) fn shm_transaction(&self) -> &Mutex<()> {
+        &self.shm_transaction
+    }
+    pub(crate) fn mqueue_manager(&self) -> &Mutex<MqManager> {
+        &self.mqueue
+    }
+    pub(crate) fn mqueue_notifications(&self) -> &Mutex<MqNotificationRegistry> {
+        &self.mqueue_notifications
+    }
+
+    pub(crate) fn next_msg_id(&self) -> &AtomicI32 {
+        &self.msg_next_id
+    }
+    pub(crate) fn next_sem_id(&self) -> &AtomicI32 {
+        &self.sem_next_id
+    }
+    pub(crate) fn next_shm_id(&self) -> &AtomicI32 {
+        &self.shm_next_id
+    }
+
+    pub(crate) fn next_sequence(&self) -> u16 {
+        self.sequence.fetch_add(1, Ordering::Relaxed) as u16
+    }
+
+    /// Charges an SHM_LOCK pin to the caller's real user.  The returned token
+    /// is retained by the segment while it is locked and releases exactly the
+    /// charged bytes on SHM_UNLOCK, IPC_RMID finalization, or namespace drop.
+    pub(crate) fn try_charge_shm_lock(
+        self: &Arc<Self>,
+        user: Kuid,
+        bytes: usize,
+        limit: u64,
+    ) -> AxResult<ShmLockCharge> {
+        let mut charges = self.shm_locked_bytes.lock();
+        let current = charges.get(&user).copied().unwrap_or(0);
+        let next = current.checked_add(bytes).ok_or(AxError::NoMemory)?;
+        if limit != linux_raw_sys::general::RLIM_INFINITY as i64 as u64
+            && u64::try_from(next).map_err(|_| AxError::NoMemory)? > limit
+        {
+            return Err(AxError::from(LinuxError::ENOMEM));
+        }
+        charges.insert(user, next);
+        Ok(ShmLockCharge {
+            namespace: self.clone(),
+            user,
+            bytes,
+        })
+    }
+
+    fn release_shm_lock_charge(&self, user: Kuid, bytes: usize) {
+        let mut charges = self.shm_locked_bytes.lock();
+        let Some(current) = charges.get_mut(&user) else {
+            return;
+        };
+        *current = current.saturating_sub(bytes);
+        if *current == 0 {
+            charges.remove(&user);
+        }
+    }
+
+    /// Reserves POSIX mqueue capacity against the caller's `RLIMIT_MSGQUEUE`.
+    /// The charge token belongs to the queue, rather than an open descriptor,
+    /// so unlink does not release it until the final file reference vanishes.
+    pub(crate) fn try_charge_mqueue(
+        self: &Arc<Self>,
+        user: Kuid,
+        bytes: usize,
+        limit: u64,
+    ) -> AxResult<MqCharge> {
+        let mut charges = self.mq_accounted_bytes.lock();
+        let current = charges.get(&user).copied().unwrap_or(0);
+        let next = current.checked_add(bytes).ok_or(AxError::NoMemory)?;
+        if limit != linux_raw_sys::general::RLIM_INFINITY as i64 as u64
+            && u64::try_from(next).map_err(|_| AxError::NoMemory)? > limit
+        {
+            return Err(AxError::from(LinuxError::EMFILE));
+        }
+        charges.insert(user, next);
+        Ok(MqCharge {
+            namespace: self.clone(),
+            user,
+            bytes,
+        })
+    }
+
+    fn release_mqueue_charge(&self, user: Kuid, bytes: usize) {
+        let mut charges = self.mq_accounted_bytes.lock();
+        let Some(current) = charges.get_mut(&user) else {
+            return;
+        };
+        *current = current.saturating_sub(bytes);
+        if *current == 0 {
+            charges.remove(&user);
+        }
+    }
+}
+
+/// RAII ownership for a real `SHM_LOCK` memlock charge.
+pub(crate) struct ShmLockCharge {
+    namespace: Arc<IpcNamespace>,
+    user: Kuid,
+    bytes: usize,
+}
+
+impl Drop for ShmLockCharge {
+    fn drop(&mut self) {
+        self.namespace
+            .release_shm_lock_charge(self.user, self.bytes);
+    }
+}
+
+/// RAII ownership for one namespace-local POSIX mqueue resource charge.
+pub(crate) struct MqCharge {
+    namespace: Arc<IpcNamespace>,
+    user: Kuid,
+    bytes: usize,
+}
+
+impl Drop for MqCharge {
+    fn drop(&mut self) {
+        self.namespace.release_mqueue_charge(self.user, self.bytes);
+    }
+}
 
 /// Allocate a Linux-visible SysV IPC ID while the caller holds its manager
 /// lock. With `n` live IDs, no more than `n + 1` distinct probes are needed
 /// to find a free ID unless the representable ID space is exhausted.
 pub(crate) fn allocate_ipc_id<F>(
+    cursor: &AtomicI32,
     requested: Option<i32>,
     occupied_count: usize,
     is_occupied: F,
@@ -29,7 +219,7 @@ pub(crate) fn allocate_ipc_id<F>(
 where
     F: FnMut(i32) -> bool,
 {
-    allocate_ipc_id_in_range(&IPC_ID, requested, occupied_count, i32::MAX, is_occupied)
+    allocate_ipc_id_in_range(cursor, requested, occupied_count, i32::MAX, is_occupied)
 }
 
 fn allocate_ipc_id_in_range<F>(
@@ -111,10 +301,13 @@ pub(crate) const SHM_STAT_ANY: i32 = 15;
 // Permission bits
 const USER_READ: c_ushort = 0o400;
 const USER_WRITE: c_ushort = 0o200;
+const USER_EXEC: c_ushort = 0o100;
 const GROUP_READ: c_ushort = 0o040;
 const GROUP_WRITE: c_ushort = 0o020;
+const GROUP_EXEC: c_ushort = 0o010;
 const OTHER_READ: c_ushort = 0o004;
 const OTHER_WRITE: c_ushort = 0o002;
+const OTHER_EXEC: c_ushort = 0o001;
 const IPC_MODE_MASK: c_ushort = 0o777;
 pub(crate) const SHM_DEST: u32 = 0o1000;
 pub(crate) const SHM_LOCKED: u32 = 0o2000;
@@ -188,6 +381,7 @@ pub struct IpcPerm {
 enum IpcAccess {
     Read,
     Write,
+    Execute,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,6 +389,7 @@ struct IpcAuthority {
     access_override: bool,
     control_override: bool,
     resource_override: bool,
+    lock_override: bool,
     chown_override: bool,
 }
 
@@ -203,6 +398,7 @@ impl IpcAuthority {
         access_override: false,
         control_override: false,
         resource_override: false,
+        lock_override: false,
         chown_override: false,
     };
 }
@@ -235,9 +431,10 @@ impl IpcIdentity<'_> {
 }
 
 /// Immutable actor credentials and namespace-relative authority for one SysV
-/// IPC syscall. SysV objects do not yet live in a real IPC namespace, so
-/// callers explicitly bind them to the initial user namespace for now.
-struct IpcAccessContext {
+/// IPC syscall. Dispatch binds this to the owning IPC namespace's user
+/// namespace; the initial-namespace constructor remains only for bootstrap
+/// paths that have not yet been moved through NamespaceProxy.
+pub(crate) struct IpcAccessContext {
     actor: Arc<Cred>,
     governing_user_ns: Arc<UserNamespace>,
     euid: Kuid,
@@ -252,6 +449,7 @@ impl IpcAccessContext {
             access_override: ns_capable(&actor, &governing_user_ns, CAP_IPC_OWNER),
             control_override: ns_capable(&actor, &governing_user_ns, CAP_SYS_ADMIN),
             resource_override: ns_capable(&actor, &governing_user_ns, CAP_SYS_RESOURCE),
+            lock_override: ns_capable(&actor, &governing_user_ns, CAP_IPC_LOCK),
             chown_override: ns_capable(&actor, &governing_user_ns, CAP_CHOWN),
         };
         Self {
@@ -270,6 +468,10 @@ impl IpcAccessContext {
         }
         debug_assert!(governing_user_ns.is_initial());
         Self::new(actor, governing_user_ns)
+    }
+
+    pub(crate) fn for_ipc_namespace(actor: Arc<Cred>, ipc_ns: &IpcNamespace) -> Self {
+        Self::new(actor, ipc_ns.owner_user_ns().clone())
     }
 
     fn identity(&self) -> IpcIdentity<'_> {
@@ -292,8 +494,38 @@ impl IpcAccessContext {
         ipc_mode_allows(self.identity(), self.authority, perm, access)
     }
 
+    /// Match Linux `ipcperms()`: the low permission bits in a get request
+    /// are collapsed across owner/group/other classes, then compared with the
+    /// class selected for this caller.  This intentionally includes execute
+    /// bits even though no SysV data operation consumes an execute access;
+    /// `msgget`/`semget`/`shmget` still pass the complete requested mode to
+    /// the common IPC permission rule.
+    fn allows_requested_mode(&self, perm: &IpcPerm, requested: c_ushort) -> bool {
+        let requested = ((requested >> 6) | (requested >> 3) | requested) & 0o7;
+        let granted = if self.identity().owns_or_created(perm) {
+            perm.mode >> 6
+        } else if self.identity().matches_owner_group(perm) {
+            perm.mode >> 3
+        } else {
+            perm.mode
+        } & 0o7;
+        requested & !granted == 0 || self.authority.access_override
+    }
+
     fn may_control(&self, perm: &IpcPerm) -> bool {
         self.identity().owns_or_created(perm) || self.authority.control_override
+    }
+
+    /// SHM_LOCK/SHM_UNLOCK use their own privilege rule.  Since Linux 2.6.10
+    /// an owner or creator may operate on a segment (subject to memlock for
+    /// lock), while CAP_IPC_LOCK both authorizes it and bypasses that limit;
+    /// CAP_SYS_ADMIN is not a substitute.
+    fn may_lock_shm(&self, perm: &IpcPerm) -> bool {
+        self.identity().owns_or_created(perm) || self.authority.lock_override
+    }
+
+    fn bypasses_shm_memlock_limit(&self) -> bool {
+        self.authority.lock_override
     }
 
     fn may_raise_resource_limit(&self) -> bool {
@@ -361,16 +593,19 @@ fn ipc_mode_allows(
         match access {
             IpcAccess::Read => USER_READ,
             IpcAccess::Write => USER_WRITE,
+            IpcAccess::Execute => USER_EXEC,
         }
     } else if identity.matches_owner_group(perm) {
         match access {
             IpcAccess::Read => GROUP_READ,
             IpcAccess::Write => GROUP_WRITE,
+            IpcAccess::Execute => GROUP_EXEC,
         }
     } else {
         match access {
             IpcAccess::Read => OTHER_READ,
             IpcAccess::Write => OTHER_WRITE,
+            IpcAccess::Execute => OTHER_EXEC,
         }
     };
     perm.mode & bit != 0 || authority.access_override

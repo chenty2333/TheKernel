@@ -14,6 +14,7 @@ use linux_raw_sys::{
     ctypes::{c_int, c_ulong, c_ushort},
     general::*,
 };
+use thekernel_linux_ipc::{SemBuf as AbiSemBuf, plan_sem_op};
 use thekernel_linux_usercopy::{
     UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
 };
@@ -30,7 +31,6 @@ use crate::{
 };
 
 const IPC_MODE_MASK: c_ushort = 0o777;
-const IPC_NOWAIT: i16 = 0o4000;
 const SEM_UNDO: i16 = 0x1000;
 
 pub const SEMMSL: usize = 32000;
@@ -42,12 +42,99 @@ const SEMAEM: usize = SEMVMX;
 const SEMUME: usize = SEMOPM;
 const SEMUSZ: usize = 20;
 
-static SEM_MANAGER: Mutex<SemManager> = Mutex::new(SemManager::new());
+/// Adjustment values owned by one Linux `sem_undo` list.
+///
+/// `CLONE_SYSVSEM` shares the `Arc<Mutex<SemUndo>>` supplied by the namespace
+/// proxy.  A non-sharing clone gets a fresh list containing a snapshot of the
+/// parent's entries.  The proxy calls `apply_sem_undo` only when the final
+/// owner exits, which is the lifetime boundary required by Linux.
+pub(crate) struct SemUndo {
+    entries: BTreeMap<(i32, u16), i32>,
+}
+
+impl SemUndo {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn try_clone(&self) -> AxResult<Self> {
+        let mut entries = BTreeMap::new();
+        entries.extend(self.entries.iter().map(|(key, value)| (*key, *value)));
+        Ok(Self { entries })
+    }
+
+    /// Reserve every new undo key an operation can commit before the
+    /// semaphore values are changed.  `semop` is atomic: an allocation or
+    /// SEMUME failure must not be observed after any member of the operation
+    /// vector has taken effect.  The caller keeps this list locked through
+    /// `record`, so the reservation cannot be consumed by a CLONE_SYSVSEM
+    /// sibling in between.
+    fn prepare_records(&mut self, semid: i32, ops: &[Sembuf]) -> AxResult<()> {
+        let mut additional = 0usize;
+        for (index, op) in ops.iter().enumerate() {
+            if op.sem_flg & SEM_UNDO == 0 || op.sem_op == 0 {
+                continue;
+            }
+            let key = (semid, op.sem_num);
+            if self.entries.contains_key(&key)
+                || ops[..index].iter().any(|prior| {
+                    prior.sem_flg & SEM_UNDO != 0
+                        && prior.sem_op != 0
+                        && prior.sem_num == op.sem_num
+                })
+            {
+                continue;
+            }
+            additional = additional.checked_add(1).ok_or(AxError::NoMemory)?;
+        }
+        if self.entries.len().saturating_add(additional) > SEMUME {
+            return Err(AxError::from(LinuxError::ENOSPC));
+        }
+        // `BTreeMap` has no fallible reservation API.  All state mutation is
+        // still deferred until the operation has passed the semantic bounds
+        // above; insertion itself owns the map allocation.
+        let _ = additional;
+        Ok(())
+    }
+
+    /// Records the inverse adjustment for one successfully completed SEM_UNDO
+    /// operation. Linux clamps an adjustment instead of overflowing it.
+    pub(crate) fn record(&mut self, semid: i32, semnum: u16, sem_op: i16) -> AxResult<()> {
+        if sem_op == 0 {
+            return Ok(());
+        }
+        let delta = -(sem_op as i32);
+        let key = (semid, semnum);
+        let prior = self.entries.get(&key).copied().unwrap_or(0);
+        let next = prior
+            .saturating_add(delta)
+            .clamp(-(SEMAEM as i32), SEMAEM as i32);
+        if !self.entries.contains_key(&key) {
+            if self.entries.len() >= SEMUME {
+                return Err(AxError::from(LinuxError::ENOSPC));
+            }
+            // `sys_semtimedop` has already reserved this exact key while the
+            // same undo mutex was held.  Do not perform a fallible allocation
+            // after mutating the semaphore array: that would break semop's
+            // all-or-nothing contract.
+        }
+        self.entries.insert(key, next);
+        Ok(())
+    }
+}
+
+impl Default for SemUndo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 static SEM_MNI_LIMIT: AtomicUsize = AtomicUsize::new(SEMMNI);
 static SEM_MSL_LIMIT: AtomicUsize = AtomicUsize::new(SEMMSL);
 static SEM_MNS_LIMIT: AtomicUsize = AtomicUsize::new(SEMMNS);
 static SEM_OPM_LIMIT: AtomicUsize = AtomicUsize::new(SEMOPM);
-static SEM_NEXT_ID: AtomicI32 = AtomicI32::new(-1);
 
 fn ipc_time_secs() -> __kernel_time_t {
     wall_time().as_secs() as __kernel_time_t
@@ -297,13 +384,13 @@ impl SemArray {
     }
 }
 
-struct SemManager {
+pub(crate) struct SemManager {
     key_semid: BTreeMap<i32, i32>,
     semid_arrays: BTreeMap<i32, Arc<Mutex<SemArray>>>,
 }
 
 impl SemManager {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             key_semid: BTreeMap::new(),
             semid_arrays: BTreeMap::new(),
@@ -356,9 +443,48 @@ impl SemManager {
     }
 }
 
-fn allocate_sem_id(manager: &SemManager) -> AxResult<i32> {
-    let desired = SEM_NEXT_ID.swap(-1, Ordering::Relaxed);
+/// Applies a final `sem_undo` list without sleeping. Removed arrays and stale
+/// semaphore indexes are ignored exactly as Linux ignores undo entries whose
+/// target disappeared before the owner exited.
+pub(crate) fn apply_sem_undo(manager: &Mutex<SemManager>, undo: &mut SemUndo) {
+    let entries = core::mem::take(&mut undo.entries);
+    let mut wake = Vec::new();
+    let state = manager.lock();
+    for ((semid, semnum), adjustment) in entries {
+        let Some(array) = state.get_array_by_semid(semid) else {
+            continue;
+        };
+        let mut array = array.lock();
+        if array.removed {
+            continue;
+        }
+        let changed = {
+            let Some(sem) = array.sems.get_mut(semnum as usize) else {
+                continue;
+            };
+            let value = (sem.value as i32 + adjustment).clamp(0, SEMVMX as i32) as u16;
+            if value == sem.value {
+                false
+            } else {
+                sem.value = value;
+                true
+            }
+        };
+        if changed {
+            array.mark_changed();
+            wake.push(array.waiters.clone());
+        }
+    }
+    drop(state);
+    for waiters in wake {
+        notify_sem_waiters(waiters);
+    }
+}
+
+fn allocate_sem_id(manager: &SemManager, cursor: &AtomicI32) -> AxResult<i32> {
+    let desired = cursor.swap(-1, Ordering::Relaxed);
     allocate_ipc_id(
+        cursor,
         (desired >= 0).then_some(desired),
         manager.semid_arrays.len(),
         |id| manager.semid_arrays.contains_key(&id),
@@ -418,14 +544,22 @@ pub(crate) fn parse_sem_limits(data: &[u8]) -> Option<(usize, usize, usize, usiz
 }
 
 pub(crate) fn sem_next_id() -> i32 {
-    SEM_NEXT_ID.load(Ordering::Relaxed)
+    current()
+        .as_thread()
+        .ipc_ns()
+        .next_sem_id()
+        .load(Ordering::Relaxed)
 }
 
 pub(crate) fn set_sem_next_id(value: i32) -> AxResult<()> {
     if value < -1 {
         return Err(AxError::from(LinuxError::EINVAL));
     }
-    SEM_NEXT_ID.store(value, Ordering::Relaxed);
+    current()
+        .as_thread()
+        .ipc_ns()
+        .next_sem_id()
+        .store(value, Ordering::Relaxed);
     Ok(())
 }
 
@@ -433,7 +567,8 @@ pub(crate) fn sysvipc_sem_snapshot() -> String {
     let mut out = String::from(
         "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
     );
-    let manager = SEM_MANAGER.lock();
+    let ipc_ns = current().as_thread().ipc_ns();
+    let manager = ipc_ns.sem_manager().lock();
     for (semid, array) in &manager.semid_arrays {
         let array = array.lock();
         if array.removed {
@@ -512,7 +647,8 @@ fn prepare_setall_values<M: UserMemory + ?Sized>(
 }
 
 fn sem_array_is_current(semid: i32, array: &Arc<Mutex<SemArray>>) -> bool {
-    let manager = SEM_MANAGER.lock();
+    let ipc_ns = current().as_thread().ipc_ns();
+    let manager = ipc_ns.sem_manager().lock();
     manager
         .semid_arrays
         .get(&semid)
@@ -538,14 +674,20 @@ fn strip_ipc64(cmd: i32) -> i32 {
 }
 
 pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
+    // Linux rejects negative nsems before looking up a keyed array.  Zero is
+    // valid only for an existing set and remains handled by that branch.
+    if nsems < 0 {
+        return Err(AxError::from(LinuxError::EINVAL));
+    }
     let current = current();
-    let context = IpcAccessContext::for_initial_user_namespace(current.as_thread().current_cred());
+    let ipc_ns = current.as_thread().ipc_ns();
+    let context = IpcAccessContext::for_ipc_namespace(current.as_thread().current_cred(), &ipc_ns);
     let current_uid = context.effective_uid_raw();
     let current_gid = context.effective_gid_raw();
     let create = (semflg & IPC_CREAT) != 0;
     let excl = (semflg & IPC_EXCL) != 0;
 
-    let mut manager = SEM_MANAGER.lock();
+    let mut manager = ipc_ns.sem_manager().lock();
     if key != IPC_PRIVATE
         && let Some(semid) = manager.get_semid_by_key(key)
     {
@@ -562,7 +704,10 @@ pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
         if nsems > 0 && nsems as usize > array.nsems() {
             return Err(AxError::from(LinuxError::EINVAL));
         }
-        if !array.readable(&context) {
+        // On an existing set the permission bits in `semflg` describe the
+        // access being requested.  Linux does not turn a write-only or
+        // zero-mode lookup into an unconditional read check.
+        if !context.allows_requested_mode(&array.semid_ds.sem_perm, semflg as _) {
             return Err(AxError::from(LinuxError::EACCES));
         }
         return Ok(semid as isize);
@@ -581,15 +726,17 @@ pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
         return Err(AxError::from(LinuxError::ENOSPC));
     }
 
-    let semid = allocate_sem_id(&manager)?;
-    let array = Arc::new(Mutex::new(SemArray::new(
+    let semid = allocate_sem_id(&manager, ipc_ns.next_sem_id())?;
+    let mut array = SemArray::new(
         semid,
         key,
         nsems as usize,
         (semflg & IPC_MODE_MASK as i32) as _,
         current_uid,
         current_gid,
-    )));
+    );
+    array.semid_ds.sem_perm.seq = ipc_ns.next_sequence();
+    let array = Arc::new(Mutex::new(array));
     manager.insert(key, semid, array);
     Ok(semid as isize)
 }
@@ -602,22 +749,23 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
     arg: usize,
 ) -> AxResult<isize> {
     let current_task = current();
+    let ipc_ns = current_task.as_thread().ipc_ns();
     let context =
-        IpcAccessContext::for_initial_user_namespace(current_task.as_thread().current_cred());
+        IpcAccessContext::for_ipc_namespace(current_task.as_thread().current_cred(), &ipc_ns);
     let cmd = strip_ipc64(cmd);
 
     if cmd == IPC_INFO {
-        let manager = SEM_MANAGER.lock();
+        let manager = ipc_ns.sem_manager().lock();
         write_sem_info(memory, arg as *mut SemInfo, SemInfo::ipc_info())?;
         return Ok(manager.max_active_index());
     }
     if cmd == SEM_INFO {
-        let manager = SEM_MANAGER.lock();
+        let manager = ipc_ns.sem_manager().lock();
         write_sem_info(memory, arg as *mut SemInfo, SemInfo::sem_info(&manager))?;
         return Ok(manager.max_active_index());
     }
     if cmd == SEM_STAT || cmd == SEM_STAT_ANY {
-        let manager = SEM_MANAGER.lock();
+        let manager = ipc_ns.sem_manager().lock();
         let array = manager
             .get_array_by_semid(semid)
             .ok_or(AxError::from(LinuxError::EINVAL))?;
@@ -633,7 +781,7 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
     }
 
     let array = {
-        let manager = SEM_MANAGER.lock();
+        let manager = ipc_ns.sem_manager().lock();
         manager
             .get_array_by_semid(semid)
             .ok_or(AxError::from(LinuxError::EINVAL))?
@@ -715,7 +863,7 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
             array.mark_changed();
             let waiters = array.waiters.clone();
             drop(array);
-            SEM_MANAGER.lock().remove_semid(semid);
+            ipc_ns.sem_manager().lock().remove_semid(semid);
             notify_sem_waiters(waiters);
             Ok(0)
         }
@@ -788,13 +936,16 @@ enum SemTryResult {
 }
 
 fn validate_semop_flags(flags: i16) -> AxResult<()> {
-    if flags & SEM_UNDO != 0 {
-        return Err(LinuxError::EOPNOTSUPP.into());
-    }
-    if flags & !(IPC_NOWAIT | SEM_UNDO) != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(())
+    // The ABI crate owns the complete `sembuf` flag grammar, including
+    // SEM_UNDO.  Adjustment ownership is installed after the operation has
+    // committed as one atomic semaphore-array transaction.
+    plan_sem_op(AbiSemBuf {
+        num: 0,
+        op: 1,
+        flags,
+    })
+    .map(|_| ())
+    .map_err(|_| AxError::InvalidInput)
 }
 
 fn try_apply_single_semop(
@@ -1023,7 +1174,8 @@ fn wait_for_sem(
 }
 
 fn op_has_nowait(ops: &[Sembuf]) -> bool {
-    ops.iter().any(|op| op.sem_flg & IPC_NOWAIT != 0)
+    ops.iter()
+        .any(|op| op.sem_flg & thekernel_linux_ipc::IPC_NOWAIT as i16 != 0)
 }
 
 pub fn sys_semop<M: UserMemory + ?Sized>(
@@ -1053,12 +1205,14 @@ pub fn sys_semtimedop<M: UserMemory + ?Sized>(
     let ops = vm_load(memory, sops, nsops).map_err(map_usercopy_error)?;
     let current = current();
     let proc_data = &current.as_thread().proc_data;
-    let context = IpcAccessContext::for_initial_user_namespace(current.as_thread().current_cred());
+    let ipc_ns = current.as_thread().ipc_ns();
+    let context = IpcAccessContext::for_ipc_namespace(current.as_thread().current_cred(), &ipc_ns);
     let current_pid = proc_data.proc.pid() as __kernel_pid_t;
     let needs_write = ops.iter().any(|op| op.sem_op != 0);
+    let sem_undo = current.as_thread().sem_undo();
 
     let array = {
-        let manager = SEM_MANAGER.lock();
+        let manager = ipc_ns.sem_manager().lock();
         manager
             .get_array_by_semid(semid)
             .ok_or(AxError::from(LinuxError::EINVAL))?
@@ -1081,8 +1235,28 @@ pub fn sys_semtimedop<M: UserMemory + ?Sized>(
                 return Err(AxError::from(LinuxError::EACCES));
             }
 
+            // Keep the undo list locked across the state transition.  Apart
+            // from making allocation failure atomic, this serializes shared
+            // CLONE_SYSVSEM accounting with any sibling that updates the same
+            // undo list.
+            let mut undo_guard = ops
+                .iter()
+                .any(|op| op.sem_flg & SEM_UNDO != 0)
+                .then(|| sem_undo.undo().lock());
+            if let Some(undo) = undo_guard.as_deref_mut() {
+                undo.as_mut()
+                    .ok_or(AxError::BadState)?
+                    .prepare_records(semid, &ops)?;
+            }
+
             match try_apply_semops(&mut array, &ops, current_pid)? {
                 SemTryResult::Ready => {
+                    if let Some(undo) = undo_guard.as_deref_mut() {
+                        let undo = undo.as_mut().ok_or(AxError::BadState)?;
+                        for op in ops.iter().filter(|op| op.sem_flg & SEM_UNDO != 0) {
+                            undo.record(semid, op.sem_num, op.sem_op)?;
+                        }
+                    }
                     let waiters = array.waiters.clone();
                     drop(array);
                     notify_sem_waiters(waiters);

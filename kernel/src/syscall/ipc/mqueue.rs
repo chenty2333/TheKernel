@@ -1,7 +1,6 @@
 use alloc::{
     borrow::Cow,
     collections::BTreeMap,
-    string::String,
     sync::{Arc, Weak},
     vec::Vec,
 };
@@ -14,6 +13,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
+use axfs_ng_vfs::{FsNameBuf, FsPathBuf};
 use axpoll::{IoEvents, PollSet, Pollable};
 #[cfg(not(test))]
 use axsync::Mutex;
@@ -29,14 +29,17 @@ use linux_raw_sys::general::{
 // mutex; blocking/wakeup behavior remains covered only by kernel/guest tests.
 #[cfg(test)]
 use spin::Mutex;
+use thekernel_linux_ipc::validate_priority;
 use thekernel_linux_signal::{PreparedSignal, SignalInfo, SignalRtPayload, Signo};
 use thekernel_linux_usercopy::{
-    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_load_until_nul, vm_write_slice,
+    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_load_until_nul_bounded,
+    vm_write_slice,
 };
 
+use super::{IpcNamespace, MqCharge};
 use crate::{
     file::{
-        FileHandle, FileLike, Kstat, NetlinkSocket, PseudoInode, add_file_like_with_flags,
+        File, FileHandle, FileLike, Kstat, NetlinkSocket, PseudoInode, add_file_like_with_flags,
         get_typed_file,
     },
     mm::map_usercopy_error,
@@ -50,7 +53,6 @@ use crate::{
     time::TimeValueLike,
 };
 
-const MQ_PRIO_MAX: u32 = 32768;
 const DEFAULT_MQ_MAXMSG: isize = 10;
 const DEFAULT_MQ_MSGSIZE: isize = 8192;
 const DEFAULT_QUEUES_MAX: usize = 256;
@@ -62,9 +64,6 @@ const NOTIFY_WOKENUP: u8 = 1;
 const NOTIFY_REMOVED: u8 = 2;
 const MQ_INODE_SIZE: u64 = 80;
 
-static MQ_MANAGER: Mutex<MqManager> = Mutex::new(MqManager::new());
-static MQ_NOTIFICATION_REGISTRY: Mutex<MqNotificationRegistry> =
-    Mutex::new(MqNotificationRegistry::new());
 static MQ_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
 static MQ_QUEUES_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_QUEUES_MAX);
 static MQ_MSG_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_MSG_MAX);
@@ -116,6 +115,10 @@ struct MqThreadNotifier {
 
 struct MqNotifier {
     pid: u32,
+    // The namespace owns the manager which owns this queue.  This must be a
+    // weak edge or an installed mq_notify registration makes the complete IPC
+    // namespace self-retaining after its last task has gone away.
+    ipc_ns: Option<Weak<IpcNamespace>>,
     notify: i32,
     thread: Option<MqThreadNotifier>,
     signal: Option<MqSignalNotifier>,
@@ -135,9 +138,9 @@ struct MqSignalNotifier {
     prepared: PreparedSignal,
 }
 
-struct PosixMqueue {
+pub(crate) struct PosixMqueue {
     inode: PseudoInode,
-    name: String,
+    name: FsNameBuf,
     mode: __kernel_mode_t,
     uid: u32,
     gid: u32,
@@ -147,15 +150,21 @@ struct PosixMqueue {
     next_sequence: u64,
     notifier: Option<MqNotifier>,
     readiness: Arc<MqReadiness>,
+    /// Weak here avoids manager -> queue -> namespace retention; mqd file
+    /// descriptions retain the namespace strongly while they are usable.
+    ipc_ns: Weak<IpcNamespace>,
+    /// Queue-lifetime RLIMIT_MSGQUEUE reservation. Open descriptors retain the
+    /// queue after unlink, so this must not be tied to its directory name.
+    charge: Option<MqCharge>,
 }
 
-struct MqReadiness {
-    readable: PollSet,
-    writable: PollSet,
+pub(crate) struct MqReadiness {
+    pub(crate) readable: PollSet,
+    pub(crate) writable: PollSet,
 }
 
-struct MqManager {
-    queues: BTreeMap<String, Arc<Mutex<PosixMqueue>>>,
+pub(crate) struct MqManager {
+    queues: BTreeMap<FsNameBuf, Arc<Mutex<PosixMqueue>>>,
 }
 
 struct MqNotificationRegistration {
@@ -164,12 +173,13 @@ struct MqNotificationRegistration {
     token: Arc<MqNotificationToken>,
 }
 
-struct MqNotificationRegistry {
+pub(crate) struct MqNotificationRegistry {
     entries: BTreeMap<u64, MqNotificationRegistration>,
 }
 
 pub struct MqFd {
     queue: Arc<Mutex<PosixMqueue>>,
+    ipc_ns: Arc<IpcNamespace>,
     readiness: Arc<MqReadiness>,
     access: MqAccess,
     nonblocking: AtomicUsize,
@@ -183,15 +193,139 @@ enum MqAccess {
 }
 
 impl MqManager {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             queues: BTreeMap::new(),
         }
     }
+
+    pub(crate) fn names(&self) -> AxResult<Vec<FsNameBuf>> {
+        let mut names = Vec::new();
+        names
+            .try_reserve(self.queues.len())
+            .map_err(|_| AxError::NoMemory)?;
+        for name in self.queues.keys() {
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(name.len())
+                .map_err(|_| AxError::NoMemory)?;
+            bytes.extend_from_slice(name.as_bytes());
+            names.push(FsNameBuf::from_vec(bytes).map_err(AxError::from)?);
+        }
+        Ok(names)
+    }
+
+    pub(crate) fn queue(&self, name: &FsNameBuf) -> Option<Arc<Mutex<PosixMqueue>>> {
+        self.queues.get(name).cloned()
+    }
+}
+
+/// mqueuefs binds a superblock to the IPC namespace active when it is mounted.
+/// These helpers are deliberately namespace-explicit: VFS lookup/open paths
+/// must not accidentally resolve queue names through whichever task happens to
+/// execute a later operation on the mount.
+pub(crate) fn mqueuefs_names(namespace: &IpcNamespace) -> AxResult<Vec<FsNameBuf>> {
+    namespace.mqueue_manager().lock().names()
+}
+
+pub(crate) fn mqueuefs_lookup(
+    namespace: &IpcNamespace,
+    name: &FsNameBuf,
+) -> AxResult<Arc<Mutex<PosixMqueue>>> {
+    namespace
+        .mqueue_manager()
+        .lock()
+        .queue(name)
+        .ok_or(AxError::NotFound)
+}
+
+pub(crate) fn mqueuefs_unlink(namespace: &IpcNamespace, name: &FsNameBuf) -> AxResult<()> {
+    // Keep the name table locked from lookup through removal.  Releasing it
+    // between those two steps lets an unlink of an old queue remove a newly
+    // created queue with the same name: mq_unlink removes the name while old
+    // descriptors retain the queue object, so immediate reuse is legal.
+    // The manager -> queue lock order is also the one used by mq_open.
+    let mut manager = namespace.mqueue_manager().lock();
+    let queue = manager.queue(name).ok_or(AxError::NotFound)?;
+    let queue_guard = queue.lock();
+    let curr = current();
+    let cred = curr.as_thread().current_cred();
+    if Kuid::from_raw(queue_guard.uid) != Some(cred.ids().fsuid)
+        && !cred.has_effective_capability(CAP_FOWNER)
+    {
+        return Err(AxError::PermissionDenied);
+    }
+    drop(queue_guard);
+    // `manager` has remained locked, so this removes exactly the object whose
+    // ownership was checked above rather than a same-name successor.
+    manager.queues.remove(name);
+    Ok(())
+}
+
+pub(crate) fn mqueuefs_metadata(queue: &Arc<Mutex<PosixMqueue>>) -> (u32, u32, u32, u64) {
+    let queue = queue.lock();
+    (queue.mode, queue.uid, queue.gid, MQ_INODE_SIZE)
+}
+
+pub(crate) fn mqueuefs_read(
+    queue: &Arc<Mutex<PosixMqueue>>,
+    destination: &mut [u8],
+) -> AxResult<usize> {
+    let mut queue = queue.lock();
+    if !has_queue_permission(&queue, MqAccess::ReadOnly) {
+        return Err(AxError::PermissionDenied);
+    }
+    if destination.len() < queue.msgsize {
+        return Err(LinuxError::EMSGSIZE.into());
+    }
+    let message = queue.pop_message().ok_or(AxError::WouldBlock)?;
+    destination[..message.data.len()].copy_from_slice(&message.data);
+    queue.readiness.writable.wake();
+    Ok(message.data.len())
+}
+
+pub(crate) fn mqueuefs_write(queue: &Arc<Mutex<PosixMqueue>>, source: &[u8]) -> AxResult<usize> {
+    let mut queue = queue.lock();
+    if !has_queue_permission(&queue, MqAccess::WriteOnly) {
+        return Err(AxError::PermissionDenied);
+    }
+    if source.len() > queue.msgsize {
+        return Err(LinuxError::EMSGSIZE.into());
+    }
+    if queue.messages.len() >= queue.maxmsg {
+        return Err(AxError::WouldBlock);
+    }
+    let sender = current_mq_sender();
+    let mut data = Vec::new();
+    data.try_reserve_exact(source.len())
+        .map_err(|_| AxError::NoMemory)?;
+    data.extend_from_slice(source);
+    let became_readable = queue.insert_message(0, sender.clone(), data);
+    let notifier = became_readable.then(|| queue.notifier.take()).flatten();
+    queue.readiness.readable.wake();
+    drop(queue);
+    maybe_notify(notifier, sender);
+    Ok(source.len())
+}
+
+pub(crate) fn mqueuefs_readiness(queue: &Arc<Mutex<PosixMqueue>>) -> Arc<MqReadiness> {
+    Arc::clone(&queue.lock().readiness)
+}
+
+pub(crate) fn mqueuefs_poll(queue: &Arc<Mutex<PosixMqueue>>) -> IoEvents {
+    let queue = queue.lock();
+    let mut events = IoEvents::empty();
+    if !queue.messages.is_empty() {
+        events |= IoEvents::READABLE;
+    }
+    if queue.messages.len() < queue.maxmsg {
+        events |= IoEvents::WRITABLE;
+    }
+    events
 }
 
 impl MqNotificationRegistry {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
         }
@@ -200,11 +334,12 @@ impl MqNotificationRegistry {
 
 impl PosixMqueue {
     fn new(
-        name: String,
+        name: FsNameBuf,
         mode: __kernel_mode_t,
         uid: u32,
         gid: u32,
         attr: MqAttr,
+        ipc_ns: &Arc<IpcNamespace>,
     ) -> AxResult<Self> {
         let maxmsg = attr.mq_maxmsg as usize;
         let mut messages = Vec::new();
@@ -228,6 +363,8 @@ impl PosixMqueue {
             next_sequence: 0,
             notifier: None,
             readiness,
+            ipc_ns: Arc::downgrade(ipc_ns),
+            charge: None,
         })
     }
 
@@ -272,7 +409,14 @@ impl Drop for PosixMqueue {
     fn drop(&mut self) {
         if let Some(notifier) = self.notifier.as_ref() {
             notifier.registration.active.store(false, Ordering::Release);
-            unregister_notification(notifier.registration.id);
+            // A named queue can outlive its directory entry through open file
+            // descriptions.  Its final drop may consequently run in an
+            // unrelated task and IPC namespace, so never consult `current()`
+            // here: the registration belongs to the namespace captured when
+            // mq_notify installed it.
+            if let Some(ipc_ns) = notifier.ipc_ns.as_ref().and_then(Weak::upgrade) {
+                unregister_notification(&ipc_ns, notifier.registration.id);
+            }
         }
     }
 }
@@ -297,10 +441,16 @@ impl MqAccess {
 }
 
 impl MqFd {
-    fn new(queue: Arc<Mutex<PosixMqueue>>, access: MqAccess, nonblocking: bool) -> Self {
+    fn new(
+        queue: Arc<Mutex<PosixMqueue>>,
+        ipc_ns: Arc<IpcNamespace>,
+        access: MqAccess,
+        nonblocking: bool,
+    ) -> Self {
         let readiness = Arc::clone(&queue.lock().readiness);
         Self {
             queue,
+            ipc_ns,
             readiness,
             access,
             nonblocking: AtomicUsize::new(nonblocking as usize),
@@ -336,17 +486,17 @@ impl FileLike for MqFd {
         Ok(())
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
         // Reserve the protocol maximum before taking the queue lock so path
         // rendering cannot allocate while the queue's spin mutex is held.
-        let mut path = String::new();
+        let mut path = Vec::new();
         path.try_reserve_exact(MQ_NAME_MAX + 1)
             .map_err(|_| AxError::NoMemory)?;
-        path.push('/');
+        path.push(b'/');
         let queue = self.queue.lock();
         debug_assert!(queue.name.len() <= MQ_NAME_MAX);
-        path.push_str(&queue.name);
-        Ok(Cow::Owned(path))
+        path.extend_from_slice(queue.name.as_bytes());
+        Ok(Cow::Owned(FsPathBuf::from_vec(path)))
     }
 
     fn nonblocking(&self) -> bool {
@@ -424,27 +574,32 @@ fn current_mq_sender() -> MqSender {
     MqSender {
         pid: thread.proc_data.proc.pid(),
         real_uid: thread.real_uid(),
-        pid_ns: thread.proc_data.pid_ns(),
+        pid_ns: thread.pid_ns(),
     }
 }
 
 fn normalize_name<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     name: *const c_char,
-) -> AxResult<String> {
-    let raw = vm_load_until_nul(memory, name.cast::<u8>()).map_err(map_usercopy_error)?;
-    let raw = String::from_utf8(raw).map_err(|_| AxError::IllegalBytes)?;
-    if raw.is_empty() {
+) -> AxResult<FsNameBuf> {
+    let raw = vm_load_until_nul_bounded(memory, name.cast::<u8>(), MQ_NAME_MAX + 2)
+        .map_err(map_usercopy_error)?;
+    if raw.first() != Some(&b'/') {
         return Err(AxError::InvalidInput);
     }
-    let inner = raw.strip_prefix('/').unwrap_or(&raw);
-    if inner.is_empty() || inner.as_bytes().contains(&b'/') {
+    let inner = &raw[1..];
+    if inner.is_empty() || inner.contains(&b'/') {
         return Err(AxError::InvalidInput);
     }
     if inner.len() > MQ_NAME_MAX {
         return Err(AxError::NameTooLong);
     }
-    Ok(inner.into())
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(inner.len())
+        .map_err(|_| AxError::NoMemory)?;
+    owned.extend_from_slice(inner);
+    FsNameBuf::from_vec(owned).map_err(Into::into)
 }
 
 fn default_attr() -> MqAttr {
@@ -515,6 +670,20 @@ fn get_mq_fd(fd: i32) -> AxResult<crate::file::FileHandle<MqFd>> {
     get_typed_file::<MqFd>(fd).map_err(|_| AxError::BadFileDescriptor)
 }
 
+/// mq_open creates `MqFd`, while opening the same queue through a mounted
+/// mqueuefs creates the normal VFS `File` wrapper.  Both must resolve to this
+/// one queue object for mq_notify and attribute operations.
+fn get_mq_queue(fd: i32) -> AxResult<(Arc<Mutex<PosixMqueue>>, Arc<IpcNamespace>)> {
+    if let Ok(file) = get_mq_fd(fd) {
+        return Ok((file.queue.clone(), file.ipc_ns.clone()));
+    }
+    let file = get_typed_file::<File>(fd).map_err(|_| AxError::BadFileDescriptor)?;
+    let queue = crate::pseudofs::mqueue::queue_for_location(file.inner().location())
+        .ok_or(AxError::BadFileDescriptor)?;
+    let ipc_ns = queue.lock().ipc_ns.upgrade().ok_or(AxError::BadState)?;
+    Ok((queue, ipc_ns))
+}
+
 fn nonblock_flags(file: &crate::file::FileHandle<MqFd>) -> isize {
     if file.io_status_snapshot().nonblocking() {
         O_NONBLOCK as isize
@@ -577,9 +746,11 @@ fn build_notifier<M: UserMemory + ?Sized>(
 ) -> AxResult<MqNotifier> {
     validate_notify_event(event)?;
     let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
+    let thread_owner = curr.as_thread();
+    let proc_data = &thread_owner.proc_data;
     let mut notifier = MqNotifier {
         pid: proc_data.proc.pid(),
+        ipc_ns: Some(Arc::downgrade(&thread_owner.ipc_ns())),
         notify: event.notify(),
         thread: None,
         signal: None,
@@ -630,8 +801,16 @@ fn wait_mq_operation<T>(
     operation: impl FnMut() -> AxResult<T>,
 ) -> AxResult<T> {
     with_proc_state_hint(ProcStateHint::Interruptible, || {
-        block_on_poll_io_until(file, events, file.is_nonblocking(), deadline, operation)
-            .map_err(|_| AxError::TimedOut)?
+        block_on_poll_io_until(
+            file,
+            events,
+            file.is_nonblocking(),
+            false,
+            false,
+            deadline,
+            operation,
+        )
+        .map_err(|_| AxError::TimedOut)?
     })
 }
 
@@ -641,8 +820,8 @@ fn send_thread_notification(thread: &MqThreadNotifier, state: u8) {
     thread.netlink.enqueue_kernel(Vec::from(cookie));
 }
 
-fn unregister_notification(id: u64) {
-    let removed = MQ_NOTIFICATION_REGISTRY.lock().entries.remove(&id);
+fn unregister_notification(ipc_ns: &IpcNamespace, id: u64) {
+    let removed = ipc_ns.mqueue_notifications().lock().entries.remove(&id);
     // Weak and token Arcs are released outside the registry mutex.
     drop(removed);
 }
@@ -656,7 +835,9 @@ fn claim_notification(notifier: &MqNotifier) -> bool {
     {
         return false;
     }
-    unregister_notification(notifier.registration.id);
+    if let Some(ipc_ns) = notifier.ipc_ns.as_ref().and_then(Weak::upgrade) {
+        unregister_notification(&ipc_ns, notifier.registration.id);
+    }
     true
 }
 
@@ -741,10 +922,10 @@ fn maybe_notify(notifier: Option<MqNotifier>, sender: MqSender) {
 ///
 /// The registry stores a weak queue reference independently of the namespace
 /// name, so this also finds unlinked-but-open queues.
-pub(crate) fn cleanup_process_mqueue_notifications(pid: u32) {
+pub(crate) fn cleanup_process_mqueue_notifications_in(namespace: &IpcNamespace, pid: u32) {
     loop {
         let registration = {
-            let mut registry = MQ_NOTIFICATION_REGISTRY.lock();
+            let mut registry = namespace.mqueue_notifications().lock();
             let id = registry
                 .entries
                 .iter()
@@ -771,6 +952,12 @@ pub(crate) fn cleanup_process_mqueue_notifications(pid: u32) {
     }
 }
 
+pub(crate) fn cleanup_process_mqueue_notifications(pid: u32) {
+    let curr = current();
+    let namespace = curr.as_thread().ipc_ns();
+    cleanup_process_mqueue_notifications_in(&namespace, pid);
+}
+
 pub fn sys_mq_open<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     name: *const c_char,
@@ -784,9 +971,11 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
     let excl = (oflag as u32) & O_EXCL != 0;
     let nonblocking = (oflag as u32) & O_NONBLOCK != 0;
     let cloexec = (oflag as u32) & O_CLOEXEC != 0;
+    let curr = current();
+    let ipc_ns = curr.as_thread().ipc_ns();
 
     let (queue, created) = {
-        let mut manager = MQ_MANAGER.lock();
+        let mut manager = ipc_ns.mqueue_manager().lock();
         if let Some(queue) = manager.queues.get(&name).cloned() {
             if create && excl {
                 return Err(AxError::AlreadyExists);
@@ -807,6 +996,17 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
             }
             let attr = read_create_attr(memory, attr)?;
             let (uid, gid) = current_ids();
+            let curr = current();
+            let thread = curr.as_thread();
+            let charge_bytes = (attr.mq_maxmsg as usize)
+                .checked_mul(attr.mq_msgsize as usize)
+                .and_then(|payload| payload.checked_add(MQ_INODE_SIZE as usize))
+                .ok_or(AxError::NoMemory)?;
+            let charge = ipc_ns.try_charge_mqueue(
+                thread.current_cred().ids().ruid,
+                charge_bytes,
+                thread.proc_data.rlim.read()[linux_raw_sys::general::RLIMIT_MSGQUEUE].current,
+            )?;
             let create_mode = (mode & !crate::task::current_fs_context().lock().umask()) & 0o777;
             let queue = Arc::try_new(Mutex::new(PosixMqueue::new(
                 name.clone(),
@@ -814,20 +1014,27 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
                 uid,
                 gid,
                 attr,
+                &ipc_ns,
             )?))
             .map_err(|_| AxError::NoMemory)?;
+            queue.lock().charge = Some(charge);
             manager.queues.insert(name.clone(), queue.clone());
             (queue, true)
         }
     };
 
-    let mqfd = Arc::new(MqFd::new(queue.clone(), access, nonblocking));
+    let mqfd = Arc::new(MqFd::new(
+        queue.clone(),
+        ipc_ns.clone(),
+        access,
+        nonblocking,
+    ));
     let status_flags = ((oflag as u32) & O_NONBLOCK) | ((oflag as u32) & O_ACCMODE);
     match add_file_like_with_flags(mqfd, cloexec, status_flags) {
         Ok(fd) => Ok(fd as isize),
         Err(err) => {
             if created {
-                let mut manager = MQ_MANAGER.lock();
+                let mut manager = ipc_ns.mqueue_manager().lock();
                 if manager
                     .queues
                     .get(&name)
@@ -846,25 +1053,28 @@ pub fn sys_mq_unlink<M: UserMemory + ?Sized>(
     name: *const c_char,
 ) -> AxResult<isize> {
     let name = normalize_name(memory, name)?;
-    let queue = {
-        let manager = MQ_MANAGER.lock();
-        manager
-            .queues
-            .get(&name)
-            .cloned()
-            .ok_or(AxError::NotFound)?
-    };
+    let curr = current();
+    let ipc_ns = curr.as_thread().ipc_ns();
+    // An old queue remains alive through open descriptors after unlink and a
+    // same name may be recreated immediately.  Make the permission decision
+    // and removal one namespace-manager transaction so an old lookup can
+    // never unlink that successor.
+    let mut manager = ipc_ns.mqueue_manager().lock();
+    let queue = manager
+        .queues
+        .get(&name)
+        .cloned()
+        .ok_or(AxError::NotFound)?;
+    let queue = queue.lock();
+    let curr = current();
+    let cred = curr.as_thread().current_cred();
+    if Kuid::from_raw(queue.uid) != Some(cred.ids().fsuid)
+        && !cred.has_effective_capability(CAP_FOWNER)
     {
-        let queue = queue.lock();
-        let curr = current();
-        let cred = curr.as_thread().current_cred();
-        if Kuid::from_raw(queue.uid) != Some(cred.ids().fsuid)
-            && !cred.has_effective_capability(CAP_FOWNER)
-        {
-            return Err(AxError::PermissionDenied);
-        }
+        return Err(AxError::PermissionDenied);
     }
-    let removed = MQ_MANAGER.lock().queues.remove(&name);
+    drop(queue);
+    let removed = manager.queues.remove(&name);
     drop(removed);
     Ok(0)
 }
@@ -877,9 +1087,7 @@ pub fn sys_mq_timedsend<M: UserMemory + ?Sized>(
     msg_prio: u32,
     abs_timeout: *const timespec,
 ) -> AxResult<isize> {
-    if msg_prio >= MQ_PRIO_MAX {
-        return Err(AxError::InvalidInput);
-    }
+    validate_priority(msg_prio).map_err(|_| AxError::InvalidInput)?;
     let deadline = validate_timespec(memory, abs_timeout)?;
     let file = get_mq_fd(fd)?;
     if !file.access.can_write() {
@@ -974,21 +1182,31 @@ pub fn sys_mq_notify<M: UserMemory + ?Sized>(
     fd: i32,
     notification: *const RawSigevent,
 ) -> AxResult<isize> {
-    let notifier = if notification.is_null() {
+    let mut notifier = if notification.is_null() {
         None
     } else {
         let event =
             RawSigevent::read_from_user(memory, notification).map_err(map_usercopy_error)?;
         Some(build_notifier(memory, &event)?)
     };
-    let file = get_mq_fd(fd)?;
+    let (queue_file, ipc_ns) = get_mq_queue(fd)?;
+    let curr = current();
+    let current_thread = curr.as_thread();
+    if notifier.is_some() {
+        // mq_notify belongs to the process, not the task which happened to
+        // install it. Remember this IPC manager before registry publication.
+        current_thread
+            .proc_data
+            .register_touched_ipc_namespace(ipc_ns.clone())?;
+        notifier.as_mut().expect("checked above").ipc_ns = Some(Arc::downgrade(&ipc_ns));
+    }
 
     let mut rejected = None;
     let mut detached_registration = None;
     let mut busy = false;
     let removed = {
-        let mut registry = MQ_NOTIFICATION_REGISTRY.lock();
-        let mut queue = file.queue.lock();
+        let mut registry = ipc_ns.mqueue_notifications().lock();
+        let mut queue = queue_file.lock();
         if let Some(notifier) = notifier {
             if queue.notifier.is_some() || registry.entries.contains_key(&notifier.registration.id)
             {
@@ -1001,7 +1219,7 @@ pub fn sys_mq_notify<M: UserMemory + ?Sized>(
                     id,
                     MqNotificationRegistration {
                         owner: notifier.pid,
-                        queue: Arc::downgrade(&file.queue),
+                        queue: Arc::downgrade(&queue_file),
                         token: notifier.registration.clone(),
                     },
                 );
@@ -1009,7 +1227,7 @@ pub fn sys_mq_notify<M: UserMemory + ?Sized>(
                 None
             }
         } else {
-            let curr_pid = current().as_thread().proc_data.proc.pid();
+            let curr_pid = current_thread.proc_data.proc.pid();
             if queue
                 .notifier
                 .as_ref()
@@ -1042,7 +1260,6 @@ pub fn sys_mq_getsetattr<M: UserMemory + ?Sized>(
     new_attr: *const MqAttr,
     old_attr: *mut MqAttr,
 ) -> AxResult<isize> {
-    let file = get_mq_fd(fd)?;
     let new = if new_attr.is_null() {
         None
     } else {
@@ -1053,25 +1270,46 @@ pub fn sys_mq_getsetattr<M: UserMemory + ?Sized>(
         Some(attr)
     };
 
+    if let Ok(file) = get_mq_fd(fd) {
+        if !old_attr.is_null() {
+            let flags = nonblock_flags(&file);
+            let queue = file.queue.lock();
+            unsafe { VmMutPtr::vm_write_unchecked(old_attr, memory, queue.attr(flags)) }
+                .map_err(map_usercopy_error)?;
+        }
+        if let Some(attr) = new {
+            let nonblocking = attr.mq_flags & O_NONBLOCK as isize != 0;
+            file.transition_status_flags(
+                |old| (old.raw() & !O_NONBLOCK) | if nonblocking { O_NONBLOCK } else { 0 },
+                |old, new| {
+                    if old.nonblocking() != new.nonblocking() {
+                        file.set_nonblocking(new.nonblocking())?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        return Ok(0);
+    }
+
+    let file = get_typed_file::<File>(fd).map_err(|_| AxError::BadFileDescriptor)?;
+    let queue = crate::pseudofs::mqueue::queue_for_location(file.inner().location())
+        .ok_or(AxError::BadFileDescriptor)?;
+
     if !old_attr.is_null() {
-        let flags = nonblock_flags(&file);
-        let queue = file.queue.lock();
+        let flags = if file.nonblocking() {
+            O_NONBLOCK as isize
+        } else {
+            0
+        };
+        let queue = queue.lock();
         // SAFETY: `MqAttr` is a repr(C) array of initialized isize fields;
         // its reserved words are explicitly zeroed by `attr`.
         unsafe { VmMutPtr::vm_write_unchecked(old_attr, memory, queue.attr(flags)) }
             .map_err(map_usercopy_error)?;
     }
     if let Some(attr) = new {
-        let nonblocking = attr.mq_flags & O_NONBLOCK as isize != 0;
-        file.transition_status_flags(
-            |old| (old.raw() & !O_NONBLOCK) | if nonblocking { O_NONBLOCK } else { 0 },
-            |old, new| {
-                if old.nonblocking() != new.nonblocking() {
-                    file.set_nonblocking(new.nonblocking())?;
-                }
-                Ok(())
-            },
-        )?;
+        file.set_nonblocking(attr.mq_flags & O_NONBLOCK as isize != 0)?;
     }
     Ok(0)
 }
@@ -1259,18 +1497,21 @@ mod tests {
     fn install_accounted_notification(
         pid: u32,
     ) -> (
+        Arc<IpcNamespace>,
         Arc<Mutex<PosixMqueue>>,
         Arc<MqNotificationToken>,
         Arc<thekernel_linux_signal::SignalQueueAccount>,
         Arc<thekernel_linux_signal::SignalQueueAccount>,
     ) {
+        let ipc_ns = IpcNamespace::try_new(UserNamespace::try_new_root().unwrap()).unwrap();
         let queue = Arc::new(Mutex::new(
             PosixMqueue::new(
-                String::from("registry-account-test"),
+                FsNameBuf::from_vec(Vec::from(&b"registry-account-test"[..])).unwrap(),
                 0o600,
                 pid,
                 0,
                 default_attr(),
+                &ipc_ns,
             )
             .unwrap(),
         ));
@@ -1283,6 +1524,7 @@ mod tests {
         let target_pid_ns = PidNamespace::try_new_root(target_user_ns.clone()).unwrap();
         queue.lock().notifier = Some(MqNotifier {
             pid,
+            ipc_ns: Some(Arc::downgrade(&ipc_ns)),
             notify: SIGEV_SIGNAL as i32,
             thread: None,
             signal: Some(MqSignalNotifier {
@@ -1294,7 +1536,7 @@ mod tests {
             }),
             registration: token.clone(),
         });
-        MQ_NOTIFICATION_REGISTRY.lock().entries.insert(
+        ipc_ns.mqueue_notifications().lock().entries.insert(
             token.id,
             MqNotificationRegistration {
                 owner: pid,
@@ -1302,22 +1544,38 @@ mod tests {
                 token: token.clone(),
             },
         );
-        (queue, token, per_user, global)
+        (ipc_ns, queue, token, per_user, global)
     }
 
-    fn install_inert_notification(pid: u32) -> (Arc<Mutex<PosixMqueue>>, Arc<MqNotificationToken>) {
+    fn install_inert_notification(
+        pid: u32,
+    ) -> (
+        Arc<IpcNamespace>,
+        Arc<Mutex<PosixMqueue>>,
+        Arc<MqNotificationToken>,
+    ) {
+        let ipc_ns = IpcNamespace::try_new(UserNamespace::try_new_root().unwrap()).unwrap();
         let queue = Arc::new(Mutex::new(
-            PosixMqueue::new(String::from("registry-test"), 0o600, pid, 0, default_attr()).unwrap(),
+            PosixMqueue::new(
+                FsNameBuf::from_vec(Vec::from(&b"registry-test"[..])).unwrap(),
+                0o600,
+                pid,
+                0,
+                default_attr(),
+                &ipc_ns,
+            )
+            .unwrap(),
         ));
         let token = new_notification_token().unwrap();
         queue.lock().notifier = Some(MqNotifier {
             pid,
+            ipc_ns: Some(Arc::downgrade(&ipc_ns)),
             notify: SIGEV_NONE as i32,
             thread: None,
             signal: None,
             registration: token.clone(),
         });
-        MQ_NOTIFICATION_REGISTRY.lock().entries.insert(
+        ipc_ns.mqueue_notifications().lock().entries.insert(
             token.id,
             MqNotificationRegistration {
                 owner: pid,
@@ -1325,19 +1583,20 @@ mod tests {
                 token: token.clone(),
             },
         );
-        (queue, token)
+        (ipc_ns, queue, token)
     }
 
     #[test]
     fn owner_exit_cancels_unlinked_but_open_notification() {
         let pid = 0xf001;
-        let (queue, token) = install_inert_notification(pid);
-        cleanup_process_mqueue_notifications(pid);
+        let (ipc_ns, queue, token) = install_inert_notification(pid);
+        cleanup_process_mqueue_notifications_in(&ipc_ns, pid);
 
         assert!(queue.lock().notifier.is_none());
         assert!(!token.active.load(Ordering::Acquire));
         assert!(
-            !MQ_NOTIFICATION_REGISTRY
+            !ipc_ns
+                .mqueue_notifications()
                 .lock()
                 .entries
                 .contains_key(&token.id)
@@ -1347,10 +1606,10 @@ mod tests {
     #[test]
     fn owner_exit_wins_against_a_notification_already_taken_for_delivery() {
         let pid = 0xf002;
-        let (queue, token) = install_inert_notification(pid);
+        let (ipc_ns, queue, token) = install_inert_notification(pid);
         let moved = queue.lock().notifier.take().unwrap();
 
-        cleanup_process_mqueue_notifications(pid);
+        cleanup_process_mqueue_notifications_in(&ipc_ns, pid);
         assert!(!claim_notification(&moved));
         assert!(!token.active.load(Ordering::Acquire));
     }
@@ -1358,11 +1617,11 @@ mod tests {
     #[test]
     fn owner_exit_refunds_an_unlinked_queue_signal_reservation() {
         let pid = 0xf003;
-        let (queue, token, per_user, global) = install_accounted_notification(pid);
+        let (ipc_ns, queue, token, per_user, global) = install_accounted_notification(pid);
         assert_eq!(per_user.queued(), 1);
         assert_eq!(global.queued(), 1);
 
-        cleanup_process_mqueue_notifications(pid);
+        cleanup_process_mqueue_notifications_in(&ipc_ns, pid);
         assert!(queue.lock().notifier.is_none());
         assert!(!token.active.load(Ordering::Acquire));
         assert_eq!(per_user.queued(), 0);
@@ -1372,10 +1631,10 @@ mod tests {
     #[test]
     fn exit_cancellation_of_taken_notification_refunds_exactly_on_drop() {
         let pid = 0xf004;
-        let (queue, token, per_user, global) = install_accounted_notification(pid);
+        let (ipc_ns, queue, token, per_user, global) = install_accounted_notification(pid);
         let moved = queue.lock().notifier.take().unwrap();
 
-        cleanup_process_mqueue_notifications(pid);
+        cleanup_process_mqueue_notifications_in(&ipc_ns, pid);
         assert!(!claim_notification(&moved));
         assert!(!token.active.load(Ordering::Acquire));
         assert_eq!(per_user.queued(), 1);
