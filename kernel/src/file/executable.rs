@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -5,9 +6,12 @@ use axfs_ng_vfs::{Location, NodeType};
 #[cfg(not(test))]
 use axsync::Mutex;
 use hashbrown::HashMap;
+use memory_addr::VirtAddr;
 #[cfg(test)]
 use spin::Mutex;
 use spin::Once;
+
+use crate::mm::AddrSpace;
 
 /// A stable inode identity used for Linux ETXTBSY exclusion.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -57,6 +61,19 @@ const MAX_CREDENTIAL_READ_REFS: usize = 65_536;
 const MAX_CREDENTIAL_WRITE_REFS: usize = 65_536;
 
 static EXECUTABLES: Once<Mutex<ExecutableTable>> = Once::new();
+
+/// Creates or updates a process-local uprobe overlay for one private
+/// file-backed executable byte.  The address-space primitive takes the COW
+/// copy before writing and refuses shared/non-executable leaves, so the
+/// executable registry never publishes a probe by modifying inode contents or
+/// another process's mapping.
+pub(crate) fn patch_private_executable_alias(
+    aspace: &Arc<Mutex<AddrSpace>>,
+    address: VirtAddr,
+    replacement: u8,
+) -> AxResult<u8> {
+    aspace.lock().uprobe_cow_patch_byte(address, replacement)
+}
 
 impl ExecutableTable {
     fn try_new(identity_limit: usize, preallocated_capacity: usize) -> AxResult<Self> {
@@ -782,7 +799,9 @@ pub(crate) fn check_not_active(loc: &Location) -> AxResult<()> {
 /// Swap activation uses this to reject a backing inode that is already
 /// writable through a shared mapping.
 pub(crate) fn has_writable_mapping(loc: &Location) -> AxResult<bool> {
-    let Some(key) = key(loc) else { return Ok(false); };
+    let Some(key) = key(loc) else {
+        return Ok(false);
+    };
     Ok(executables()?
         .lock()
         .entries
