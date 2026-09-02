@@ -9,13 +9,16 @@ mod job;
 mod kexec;
 mod keys;
 mod module;
-mod ptrace;
 mod perf;
+mod ptrace;
 mod schedule;
 mod thread;
+mod uprobe;
 mod wait;
 
+pub(crate) use self::perf::*;
+pub(crate) use self::uprobe::*;
 pub use self::{
     acct::*, clone::*, clone3::*, ctl::*, execve::*, exit::*, ioport::*, job::*, kexec::*, keys::*,
-    module::*, perf::*, ptrace::*, schedule::*, thread::*, wait::*,
+    module::*, ptrace::*, schedule::*, thread::*, wait::*,
 };

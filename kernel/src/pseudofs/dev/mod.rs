@@ -2,8 +2,9 @@
 
 mod dri;
 #[cfg(feature = "input")]
-mod event;
+pub(crate) mod event;
 mod fb;
+pub(crate) mod fuse;
 #[cfg(feature = "dev-log")]
 mod log;
 pub(crate) mod r#loop;
@@ -11,6 +12,7 @@ pub(crate) mod r#loop;
 mod memtrack;
 mod rtc;
 pub mod tty;
+pub(crate) mod tun;
 
 use alloc::{format, string::String, sync::Arc};
 use core::any::Any;
@@ -380,6 +382,31 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             Arc::new(Random),
         ),
     );
+    // The FUSE transport is an OFD-owned character device: each daemon open
+    // creates one independent connection which is later selected by fsopen's
+    // `fd=` configuration.  It must not share state across daemon instances.
+    root.add(
+        "fuse",
+        Device::new_with_permissions(
+            fs.clone(),
+            NodeType::CharacterDevice,
+            DeviceId::new(10, 229),
+            NodePermission::from_bits_truncate(0o666),
+            Arc::new(fuse::FuseDevice),
+        ),
+    );
+    let mut net = DirMapping::new();
+    net.add(
+        "tun",
+        Device::new_with_permissions(
+            fs.clone(),
+            NodeType::CharacterDevice,
+            DeviceId::new(10, 200),
+            NodePermission::from_bits_truncate(0o666),
+            Arc::new(tun::TunDevice),
+        ),
+    );
+    root.add("net", SimpleDir::new_maker(fs.clone(), Arc::new(net)));
     root.add(
         "rtc0",
         Device::new(
@@ -389,7 +416,9 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             Arc::new(rtc::Rtc),
         ),
     );
-    if axdisplay::has_display() {
+    // DRM owns VirtIO-GPU scanout before devfs publication. `/dev/fb0` is an
+    // emulation client of that primary device, never a competing raw display.
+    if crate::drm::primary_device().is_some() {
         match fb::FrameBuffer::try_new() {
             Ok(framebuffer) => root.add(
                 "fb0",
@@ -555,7 +584,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     #[cfg(feature = "input")]
     root.add(
         "input",
-        SimpleDir::new_maker(fs.clone(), Arc::new(event::input_devices(fs.clone()))),
+        SimpleDir::new_maker(fs.clone(), event::input_devices(fs.clone())),
     );
 
     SimpleDir::new_maker(fs, Arc::new(root))

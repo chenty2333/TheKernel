@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::ffi::c_char;
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
 use axsync::Mutex;
 use linux_raw_sys::general::AT_FDCWD;
@@ -9,8 +9,6 @@ use syscalls::Sysno;
 use thekernel_linux_signal::SignalSet;
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
 
-#[cfg(feature = "bpf")]
-use super::bpf;
 use super::*;
 use crate::{
     file::IoctlContext,
@@ -78,7 +76,19 @@ pub(super) fn dispatch_syscall(
     uctx: &mut UserContext,
     aspace: impl FnOnce() -> Arc<Mutex<AddrSpace>>,
 ) -> AxResult<isize> {
-    match sysno {
+    crate::perf_sources::emit_raw_syscall_enter(
+        sysno as u64,
+        [
+            uctx.arg0() as u64,
+            uctx.arg1() as u64,
+            uctx.arg2() as u64,
+            uctx.arg3() as u64,
+            uctx.arg4() as u64,
+            uctx.arg5() as u64,
+        ],
+        &uctx.linux_pt_regs(sysno as u64),
+    );
+    let result = match sysno {
         Sysno::restart_syscall => sys_restart_syscall(uctx),
         // fs ctl
         Sysno::ioctl => {
@@ -221,12 +231,36 @@ pub(super) fn dispatch_syscall(
         Sysno::open_tree => with_user_memory(aspace(), |memory| {
             sys_open_tree(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
         }),
-        Sysno::fspick => sys_fspick(uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _),
+        Sysno::open_tree_attr => with_user_memory(aspace(), |memory| {
+            super::fs::sys_open_tree_attr(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+                uctx.arg4() as _,
+            )
+        }),
+        Sysno::fspick => with_user_memory(aspace(), |memory| {
+            sys_fspick(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
+        }),
         Sysno::quotactl => with_user_memory(aspace(), |memory| {
-            sys_quotactl(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _, uctx.arg3() as _)
+            sys_quotactl(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+            )
         }),
         Sysno::quotactl_fd => with_user_memory(aspace(), |memory| {
-            sys_quotactl_fd(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _, uctx.arg3() as _)
+            sys_quotactl_fd(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+            )
         }),
 
         // file ops
@@ -379,6 +413,67 @@ pub(super) fn dispatch_syscall(
         }),
         Sysno::fremovexattr => with_user_memory(aspace(), |memory| {
             sys_fremovexattr(memory, uctx.arg0() as _, uctx.arg1() as _)
+        }),
+        Sysno::setxattrat => with_user_memory(aspace(), |memory| {
+            super::fs::sys_setxattrat(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+                uctx.arg4() as _,
+                uctx.arg5() as _,
+            )
+        }),
+        Sysno::getxattrat => with_user_memory(aspace(), |memory| {
+            super::fs::sys_getxattrat(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+                uctx.arg4() as _,
+                uctx.arg5() as _,
+            )
+        }),
+        Sysno::listxattrat => with_user_memory(aspace(), |memory| {
+            super::fs::sys_listxattrat(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+                uctx.arg4() as _,
+            )
+        }),
+        Sysno::removexattrat => with_user_memory(aspace(), |memory| {
+            super::fs::sys_removexattrat(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+            )
+        }),
+        Sysno::file_getattr => with_user_memory(aspace(), |memory| {
+            super::fs::sys_file_getattr(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+                uctx.arg4() as _,
+            )
+        }),
+        Sysno::file_setattr => with_user_memory(aspace(), |memory| {
+            super::fs::sys_file_setattr(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+                uctx.arg4() as _,
+            )
         }),
         Sysno::readlink => with_user_memory(aspace(), |memory| {
             sys_readlink(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
@@ -1167,13 +1262,16 @@ pub(super) fn dispatch_syscall(
                 uctx.arg5() as _,
             )
         }),
-        Sysno::kcmp => sys_kcmp(
-            uctx.arg0() as _,
-            uctx.arg1() as _,
-            uctx.arg2() as _,
-            uctx.arg3() as _,
-            uctx.arg4() as _,
-        ),
+        Sysno::kcmp => with_user_memory(aspace(), |memory| {
+            sys_kcmp(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+                uctx.arg4() as _,
+            )
+        }),
         Sysno::set_mempolicy => with_user_memory(aspace(), |memory| {
             sys_set_mempolicy(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
         }),
@@ -1377,7 +1475,12 @@ pub(super) fn dispatch_syscall(
             with_user_memory(aspace(), |memory| sys_sysinfo(memory, uctx.arg0() as _))
         }
         Sysno::syslog => with_user_memory(aspace(), |memory| {
-            sys_syslog(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as isize)
+            sys_syslog(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as isize,
+            )
         }),
         Sysno::getrandom => with_user_memory(aspace(), |memory| {
             sys_getrandom(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
@@ -1720,7 +1823,7 @@ pub(super) fn dispatch_syscall(
         // bpf
         #[cfg(feature = "bpf")]
         Sysno::bpf => with_user_memory(aspace(), |memory| {
-            bpf::sys_bpf(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
+            super::bpf::sys_bpf(memory, uctx.arg0() as _, uctx.arg1() as _, uctx.arg2() as _)
         }),
 
         Sysno::perf_event_open => sys_perf_event_open(
@@ -1751,6 +1854,8 @@ pub(super) fn dispatch_syscall(
             )
         }),
         Sysno::timer_delete => sys_timer_delete(uctx.arg0() as _),
+        Sysno::uretprobe => super::task::sys_uretprobe(uctx),
+        Sysno::uprobe => super::task::sys_uprobe(uctx),
 
         // Linux x86_64's native sys_ni_syscall table slots.
         Sysno::uselib
@@ -1775,7 +1880,15 @@ pub(super) fn dispatch_syscall(
             debug!("Unimplemented syscall: {sysno}");
             Err(AxError::Unsupported)
         }
-    }
+    };
+    let raw_exit_result = result.as_ref().map_or_else(
+        |error| -i64::from(LinuxError::from(*error).code()),
+        |value| *value as i64,
+    );
+    let mut raw_exit_regs = uctx.linux_pt_regs(sysno as u64);
+    raw_exit_regs.ax = raw_exit_result as u64;
+    crate::perf_sources::emit_raw_syscall_exit(sysno as u64, raw_exit_result, &raw_exit_regs);
+    result
 }
 
 #[cfg(test)]
@@ -1800,21 +1913,6 @@ mod tests {
     #[test]
     fn legacy_mknod_device_argument_is_truncated_to_u32() {
         assert_eq!(legacy_mknod_dev(0xffff_ffff_1234_5678), 0x1234_5678);
-    }
-
-    #[test]
-    fn unsupported_dispatch_does_not_snapshot_address_space() {
-        let mut context =
-            UserContext::new(0x1234_5678, axhal::mem::VirtAddr::from_usize(0x8000), 0);
-        let snapshots = Cell::new(0);
-
-        let result = dispatch_syscall(Sysno::uretprobe, &mut context, || {
-            snapshots.set(snapshots.get() + 1);
-            panic!("unsupported syscall must not acquire an address space");
-        });
-
-        assert_eq!(result, Err(AxError::Unsupported));
-        assert_eq!(snapshots.get(), 0);
     }
 
     #[test]

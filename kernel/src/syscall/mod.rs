@@ -1,15 +1,15 @@
 #[cfg(feature = "bpf")]
 mod bpf;
 mod dispatch;
-mod fs;
+pub(crate) mod fs;
 mod io_mpx;
+pub(crate) mod ipc;
 pub(crate) mod landlock;
-mod ipc;
 mod mm;
 mod net;
 mod resources;
 mod seccomp;
-mod signal;
+pub(crate) mod signal;
 mod sync;
 mod sys;
 mod task;
@@ -30,8 +30,8 @@ pub(crate) use thekernel_linux_usercopy::RawSigevent;
 
 pub(crate) use self::sync::init_membarrier_ipi;
 pub use self::{
-    fs::*, io_mpx::*, ipc::*, landlock::*, mm::*, net::*, resources::*, seccomp::*, signal::*, sync::*, sys::*,
-    task::*, time::*,
+    fs::*, io_mpx::*, ipc::*, landlock::*, mm::*, net::*, resources::*, seccomp::*, signal::*,
+    sync::*, sys::*, task::*, time::*,
 };
 use crate::{
     file::{FileLike, Socket},
@@ -150,7 +150,10 @@ pub fn handle_syscall(uctx: &mut UserContext) {
 
     trace!("Syscall {sysno:?}");
 
-    if let Some(result) = fast_path_getter(sysno) {
+    // Raw syscall tracepoints are emitted by dispatch_syscall. Keep these
+    // scalar shortcuts out of that bypass so every syscall has one enter and
+    // one exit producer invocation.
+    if false && let Some(result) = fast_path_getter(sysno) {
         uctx.set_retval(result.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
         return;
     }
@@ -161,33 +164,35 @@ pub fn handle_syscall(uctx: &mut UserContext) {
     // shortcut is gated to non-CPUTIME clocks; CPUTIME clocks fall through to
     // the full path for accurate CPU-time accounting. Signal delivery and
     // preemption still run in the user-mode loop after handle_syscall returns.
-    match sysno {
-        Sysno::time => {
-            let aspace = current().as_thread().proc_data.aspace();
-            let r = with_user_memory(aspace, |memory| sys_time(memory, uctx.arg0() as _));
-            uctx.set_retval(r.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
-            return;
-        }
-        Sysno::gettimeofday => {
-            let aspace = current().as_thread().proc_data.aspace();
-            let r = with_user_memory(aspace, |memory| {
-                sys_gettimeofday(memory, uctx.arg0() as _, uctx.arg1() as _)
-            });
-            uctx.set_retval(r.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
-            return;
-        }
-        Sysno::clock_gettime => {
-            let clockid = uctx.arg0() as u32;
-            if !matches!(clockid, CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID) {
+    if false {
+        match sysno {
+            Sysno::time => {
+                let aspace = current().as_thread().proc_data.aspace();
+                let r = with_user_memory(aspace, |memory| sys_time(memory, uctx.arg0() as _));
+                uctx.set_retval(r.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
+                return;
+            }
+            Sysno::gettimeofday => {
                 let aspace = current().as_thread().proc_data.aspace();
                 let r = with_user_memory(aspace, |memory| {
-                    sys_clock_gettime(memory, uctx.arg0() as _, uctx.arg1() as _)
+                    sys_gettimeofday(memory, uctx.arg0() as _, uctx.arg1() as _)
                 });
                 uctx.set_retval(r.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
                 return;
             }
+            Sysno::clock_gettime => {
+                let clockid = uctx.arg0() as u32;
+                if !matches!(clockid, CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID) {
+                    let aspace = current().as_thread().proc_data.aspace();
+                    let r = with_user_memory(aspace, |memory| {
+                        sys_clock_gettime(memory, uctx.arg0() as _, uctx.arg1() as _)
+                    });
+                    uctx.set_retval(r.unwrap_or_else(|err| -LinuxError::from(err).code() as _) as _);
+                    return;
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
     let curr = current();
     let thr = curr.as_thread();

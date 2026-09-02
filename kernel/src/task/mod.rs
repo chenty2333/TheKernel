@@ -13,6 +13,7 @@ mod process;
 mod resources;
 mod restart;
 mod rseq;
+mod scheduler_observer;
 mod seccomp;
 pub(crate) mod security;
 mod signal;
@@ -21,6 +22,7 @@ mod thread;
 mod thread_cred;
 mod timer;
 mod user;
+mod usermode_helper;
 
 // Re-exports from split sub-modules — keep the old `crate::task::*` paths unchanged.
 #[cfg(test)]
@@ -55,21 +57,24 @@ pub(crate) use self::{
     loadavg::{load_average_sample_now, load_average_sysinfo},
     process::{
         CgroupNamespace, CommittedProcessExit, Dumpability, ExecImageCommit,
-        InitialProcessThreadAdmission, MempolicySnapshot, NetworkNamespace,
-        PendingThreadPublication, PidNamespace, Process, ProcessAccessState, ProcessGroup,
-        ProcessImageAccessSnapshot, ProcessInitialAdmission, ProcessReparentBatch,
-        ProcessThreadAdmission, PtraceReverseLink, Session, ThreadExitTransition, TimeNamespace,
-        UTS_FIELD_LEN, UserNamespace, UserNamespaceId, UtsNamespace, ZombieSnapshot,
-        init_process_domain, prepare_session_sid_binding, process_domain, process_error,
-        reap_process, release_dead_session_sid_binding, set_zombie_affinity, set_zombie_ioprio,
-        zombie_ioprio, zombie_pid_ns, zombie_scheduler_state,
+        InitialProcessThreadAdmission, MempolicySnapshot, MountNamespace, NamespaceProxy,
+        NetworkNamespace, PendingThreadPublication, PidNamespace, Process, ProcessAccessState,
+        ProcessGroup, ProcessImageAccessSnapshot, ProcessInitialAdmission, ProcessMmLayout,
+        ProcessReparentBatch, ProcessThreadAdmission, PtraceReverseLink, SemUndoState, Session,
+        ThreadExitTransition, TimeNamespace, UTS_FIELD_LEN, UserNamespace, UserNamespaceId,
+        UtsNamespace, ZombieSnapshot, init_process_domain, prepare_session_sid_binding,
+        process_domain, process_error, reap_process, release_dead_session_sid_binding,
+        set_zombie_ioprio, zombie_ioprio, zombie_pid_ns, zombie_scheduler_state,
     },
     restart::*,
     rseq::{AT_RSEQ_ALIGN, AT_RSEQ_FEATURE_SIZE},
-    seccomp::{SeccompPublicationError, init_seccomp_filter_budget, seccomp_filter_budget},
+    seccomp::{
+        SeccompPublicationError, SeccompTsyncFailure, SeccompTsyncTarget,
+        init_seccomp_filter_budget, seccomp_filter_budget,
+    },
     security::{LandlockDomain, PendingCredentialPublication, SignalTargetKind},
     thread::{
-        CetPendingSignalFrame, ForkSignalAltStack, ProcStateHint, TaskParentChoice,
+        ForkSignalAltStack, NamespaceCredentialFsSnapshot, ProcStateHint, TaskParentChoice,
         TaskParentCredentialPin, TaskParentNode, TaskParentPublicationGuard,
         lock_task_parent_publication,
     },
@@ -86,6 +91,7 @@ pub(crate) fn cred_error(error: CredError) -> axerrno::AxError {
     }
 }
 pub(crate) use self::thread::SchedulerSeed;
+pub(crate) use self::usermode_helper::*;
 pub use self::{
     accounting::*,
     futex::*,
