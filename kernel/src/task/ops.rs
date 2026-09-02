@@ -294,7 +294,7 @@ fn notify_reaper_of_inherited_zombie(child: &Arc<Process>) {
                 }
             }
             ChildExitCompletionStep::Reap => match reap_process(child) {
-                Ok(true) => cgroup::detach_process(child.pid()),
+                Ok(true) => cgroup::detach_process(child),
                 Ok(false) => error!(
                     "inherited zombie {} was already reaped during autoreap",
                     child.pid()
@@ -769,7 +769,7 @@ pub(crate) fn account_published_thread() {
     LIVE_THREADS.fetch_add(1, Ordering::Release);
 }
 pub(crate) fn account_released_thread() {
-    let _ = LIVE_THREADS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    let _ = LIVE_THREADS.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
 }
 
 /// Fallibly snapshots all live process runtime objects.
@@ -839,6 +839,18 @@ struct ProcStateHintGuard<'a> {
     prev: ProcStateHint,
 }
 
+struct IoWaitAccountingGuard<'a> {
+    thread: Option<&'a super::Thread>,
+}
+
+impl Drop for IoWaitAccountingGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread {
+            thread.leave_iowait();
+        }
+    }
+}
+
 impl Drop for ProcStateHintGuard<'_> {
     fn drop(&mut self) {
         if let Some(thread) = self.thread {
@@ -863,6 +875,25 @@ pub fn with_proc_state_hint<R>(hint: ProcStateHint, f: impl FnOnce() -> R) -> R 
     };
     let result = f();
     drop(guard);
+    result
+}
+
+/// Runs a readiness sleep in the task's accounted I/O-wait state.  The two
+/// guards have distinct jobs: the hint is the immediate proc/scheduler state,
+/// while the nested counter preserves elapsed accounting through wakeups,
+/// interruption, and nested waits.
+pub fn with_iowait_proc_state<R>(f: impl FnOnce() -> R) -> R {
+    let curr = current();
+    let accounting = if let Some(thread) = curr.try_as_thread() {
+        thread.enter_iowait();
+        IoWaitAccountingGuard {
+            thread: Some(thread),
+        }
+    } else {
+        IoWaitAccountingGuard { thread: None }
+    };
+    let result = with_proc_state_hint(ProcStateHint::IoWait, f);
+    drop(accounting);
     result
 }
 
@@ -950,7 +981,7 @@ pub fn set_current_user_address_space(token: AddressSpaceToken) {
 /// updates both the saved scheduler image and the registers currently owned by
 /// this CPU, so the next executable cannot inherit the old image's FP state.
 pub fn reset_current_task_extended_state() {
-    super::signal::reset_current_legacy_fp_state();
+    super::signal::reset_current_xsave_state();
 }
 
 /// Returns CET state saved for the running task.
@@ -983,6 +1014,7 @@ pub fn current_user_live_cet_state() -> axhal::asm::UserCetState {
         let mut live = axhal::asm::read_user_cet_state();
         live.locked = context.user_cet.locked;
         context.user_cet = live;
+        curr.publish_user_cet_status(live);
         live
     }
     #[cfg(not(target_os = "none"))]
@@ -1002,6 +1034,7 @@ pub fn set_current_user_cet_state(state: axhal::asm::UserCetState) {
             .ctx_mut()
             .set_current_user_cet_state(state);
     }
+    curr.publish_user_cet_status(state);
 }
 
 /// Clears CET state after an exec image replacement.
@@ -1508,8 +1541,15 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     let curr = current();
     let thr = curr.as_thread();
     thr.set_proc_state_hint(ProcStateHint::None);
+    // Exit may race a cgroup thaw while this thread owns a freezer parking
+    // slot. Release it before core removes the thread from its process count,
+    // so cgroup.events cannot remain indefinitely short of completion.
+    thr.leave_cgroup_freezer();
     let tid = linux_pid_from_task_id(curr.id().as_u64())?;
     let visible_tid = thr.tid();
+    crate::file::seccomp_notif::cancel_requests_for_task(curr.id().as_u64());
+    crate::uprobe::on_exit(thr.kernel_tid() as u64);
+    crate::perf_sources::retire_kretprobe_task(thr.kernel_tid() as u64);
 
     match curr.id_name() {
         Ok(name) => info!("{name} exit with code: {exit_code}"),
@@ -1590,11 +1630,13 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // record and is therefore untouched.
     #[cfg(target_arch = "x86_64")]
     {
-        thr.clear_cet_signal_frames();
         let aspace = thr.proc_data.aspace();
-        aspace
-            .lock()
-            .retire_cet_default_shadow_stack(thr.kernel_tid());
+        let wake = {
+            aspace
+                .lock()
+                .retire_cet_default_shadow_stack(thr.kernel_tid())
+        };
+        wake.finish();
     }
     // The core unlink above is the sole Linux task ownership retirement edge;
     // scheduler Arc destruction is not allowed to define files_struct lifetime.
@@ -1654,6 +1696,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // fully deactivated. Action changes can still flush retained records.
     thr.signal
         .retire_registration(tid, visible_tid == process.pid());
+    thr.apply_sem_undo_on_exit();
     if final_exit.is_some() {
         // The final core admission plus this ProcessData lifecycle guard now
         // exclude every new fork/thread publication. The exact node and its
@@ -1748,7 +1791,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         acct_process_exit(&thr.proc_data, process.exit_code(), self_usage);
         thr.proc_data.release_executable();
         crate::syscall::cleanup_process_aio(process.pid());
-        crate::syscall::cleanup_process_mqueue_notifications(process.pid());
+        thr.proc_data.cleanup_touched_ipc_namespaces(process.pid());
         let closed_fds = retired_fd_table
             .take()
             .expect("final exit retains files_struct");
@@ -1762,7 +1805,6 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         drop(closed_fds);
         crate::file::inotify::wait_current_close_notifications();
         ptrace_retirements.process = Some(detach_ptrace_links_on_process_exit(&thr.proc_data));
-        crate::syscall::clear_proc_shm(process.pid());
         task_parent_publication = Some(lock_task_parent_publication());
         let task_parent_guard = task_parent_publication
             .as_ref()
@@ -1814,7 +1856,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
                     }
                 }
                 ChildExitCompletionStep::Reap => match reap_process(process) {
-                    Ok(true) => cgroup::detach_process(process.pid()),
+                    Ok(true) => cgroup::detach_process(process),
                     Ok(false) => error!(
                         "process {} was already reaped during final autoreap",
                         process.pid()

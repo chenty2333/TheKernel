@@ -4,10 +4,11 @@
 //! (NT_PRSTATUS with register state) and PT_LOAD segments for each
 //! user-accessible memory area.
 
-use alloc::{format, vec, vec::Vec};
+use alloc::{format, vec};
 
 use axerrno::{AxError, AxResult};
 use axfs::{File, OpenOptions};
+use axfs_ng_vfs::FsPathBuf;
 use axhal::{paging::MappingFlags, uspace::UserContext};
 use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_CORE};
 use memory_addr::PAGE_SIZE_4K;
@@ -34,7 +35,9 @@ const NUM_GREGS: usize = 27;
 
 const EHDR_SIZE: usize = 64;
 const PHDR_SIZE: usize = 56;
+const SHDR_SIZE: usize = 64;
 const NHDR_SIZE: usize = 12;
+const PN_XNUM: usize = 0xffff;
 
 // ---- ELF structures ----
 
@@ -76,6 +79,21 @@ struct Elf64Nhdr {
     n_namesz: u32,
     n_descsz: u32,
     n_type: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Elf64Shdr {
+    sh_name: u32,
+    sh_type: u32,
+    sh_flags: u64,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_info: u32,
+    sh_addralign: u64,
+    sh_entsize: u64,
 }
 
 /// Minimal `prstatus` for core dump (architecture-independent layout).
@@ -181,31 +199,30 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         info!("Skipping core dump for pid {pid}: process image is not dumpable");
         return Ok(false);
     };
-    let path = format!("/tmp/core.{pid}");
+    let path = FsPathBuf::from_vec(format!("/tmp/core.{pid}").into_bytes());
     let aspace = aspace_handle.lock();
 
-    // Collect user-accessible memory areas.
-    let user_area_count = aspace
-        .areas()
-        .filter(|a| a.flags().contains(MappingFlags::USER) && !a.backend().is_secret())
-        .count();
-    let mut areas = Vec::new();
-    areas
-        .try_reserve_exact(user_area_count)
-        .map_err(|_| AxError::NoMemory)?;
-    for area in aspace
-        .areas()
-        .filter(|area| area.flags().contains(MappingFlags::USER) && !area.backend().is_secret())
-    {
-        areas.push((area.start(), area.size(), area.flags()));
-    }
+    // Collect exact user-accessible segments.  AddrSpace splits around
+    // MADV_DONTDUMP sidecars so a partial-VMA exclusion cannot leak into the
+    // core or suppress adjacent dumpable bytes.
+    let areas = aspace.coredump_segments()?;
 
     let num_loads = areas.len();
-    let num_phdrs = 1 + num_loads; // 1 PT_NOTE + N PT_LOAD
+    let num_phdrs = num_loads.checked_add(1).ok_or(AxError::NoMemory)?; // 1 PT_NOTE + N PT_LOAD
+    let extended_phnum = num_phdrs >= PN_XNUM;
+    let extended_phnum_value = extended_phnum
+        .then(|| u32::try_from(num_phdrs).map_err(|_| AxError::NoMemory))
+        .transpose()?;
 
     // ---- Layout calculation ----
     let phdrs_offset = EHDR_SIZE;
-    let note_offset = phdrs_offset + PHDR_SIZE * num_phdrs;
+    let phdrs_size = PHDR_SIZE.checked_mul(num_phdrs).ok_or(AxError::NoMemory)?;
+    let phdrs_end = phdrs_offset
+        .checked_add(phdrs_size)
+        .ok_or(AxError::NoMemory)?;
+    let note_offset = phdrs_end
+        .checked_add(usize::from(extended_phnum) * SHDR_SIZE)
+        .ok_or(AxError::NoMemory)?;
 
     let note_name = b"CORE\0";
     let name_aligned = align4(note_name.len());
@@ -213,7 +230,11 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
     let desc_aligned = align4(prstatus_size);
     let note_total = NHDR_SIZE + name_aligned + desc_aligned;
 
-    let load_offset = note_offset + note_total;
+    let load_offset = note_offset
+        .checked_add(note_total)
+        .and_then(|end| end.checked_add(PAGE_SIZE_4K - 1))
+        .map(|end| end & !(PAGE_SIZE_4K - 1))
+        .ok_or(AxError::NoMemory)?;
 
     // ---- Build prstatus ----
     let ppid = proc_data.proc.parent().map_or(0, |p| p.pid() as i32);
@@ -254,13 +275,17 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         e_version: 1,
         e_entry: 0,
         e_phoff: phdrs_offset as u64,
-        e_shoff: 0,
+        e_shoff: if extended_phnum { phdrs_end as u64 } else { 0 },
         e_flags: 0,
         e_ehsize: EHDR_SIZE as u16,
         e_phentsize: PHDR_SIZE as u16,
-        e_phnum: num_phdrs as u16,
-        e_shentsize: 0,
-        e_shnum: 0,
+        e_phnum: if extended_phnum {
+            PN_XNUM as u16
+        } else {
+            num_phdrs as u16
+        },
+        e_shentsize: if extended_phnum { SHDR_SIZE as u16 } else { 0 },
+        e_shnum: if extended_phnum { 1 } else { 0 },
         e_shstrndx: 0,
     };
 
@@ -312,6 +337,17 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
         cur_load_offset += size;
     }
 
+    // ELF stores an extended program-header count in section header zero's
+    // sh_info field.  This keeps alternating page-sized DONTDUMP ranges from
+    // wrapping e_phnum and corrupting every following file offset.
+    if let Some(actual_phnum) = extended_phnum_value {
+        let shdr = Elf64Shdr {
+            sh_info: actual_phnum,
+            ..Elf64Shdr::default()
+        };
+        write_limited(&file, offset, unsafe { as_bytes(&shdr) }, core_limit)?;
+    }
+
     // ---- Write NOTE segment ----
     let nhdr = Elf64Nhdr {
         n_namesz: note_name.len() as u32,
@@ -358,9 +394,15 @@ pub fn generate_core_dump(thr: &Thread, uctx: &UserContext, signo: u8) -> AxResu
     drop(aspace);
 
     if file_offset as usize >= core_limit {
-        info!("Core dump written to {path} (truncated to {core_limit} bytes)");
+        info!(
+            "Core dump written to {:?} (truncated to {core_limit} bytes)",
+            path.as_bytes()
+        );
     } else {
-        info!("Core dump written to {path} ({file_offset} bytes)");
+        info!(
+            "Core dump written to {:?} ({file_offset} bytes)",
+            path.as_bytes()
+        );
     }
     Ok(true)
 }

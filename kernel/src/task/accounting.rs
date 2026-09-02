@@ -330,7 +330,10 @@ mod tests {
     #[test]
     fn clock_tick_conversion_divides_before_multiplying() {
         assert_eq!(nanos_to_clock_ticks(NANOS_PER_SEC), CLOCK_TICKS_PER_SEC);
-        assert_eq!(nanos_to_clock_ticks(u64::MAX), u64::MAX / (NANOS_PER_SEC / CLOCK_TICKS_PER_SEC));
+        assert_eq!(
+            nanos_to_clock_ticks(u64::MAX),
+            u64::MAX / (NANOS_PER_SEC / CLOCK_TICKS_PER_SEC)
+        );
     }
 
     #[test]

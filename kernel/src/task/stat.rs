@@ -38,12 +38,14 @@ pub(crate) fn task_state(task: &AxTaskRef) -> char {
         TaskState::Running => 'R',
         TaskState::Ready => match thread.proc_state_hint() {
             ProcStateHint::Interruptible => 'S',
+            ProcStateHint::IoWait => 'S',
             ProcStateHint::Uninterruptible => 'D',
             ProcStateHint::None => 'R',
         },
         TaskState::Exited => 'Z',
         TaskState::Blocked => match thread.proc_state_hint() {
             ProcStateHint::Interruptible => 'S',
+            ProcStateHint::IoWait => 'S',
             ProcStateHint::Uninterruptible => 'D',
             ProcStateHint::None => 'S',
         },
@@ -116,8 +118,14 @@ pub fn render_task_stat(task: &AxTaskRef) -> AxResult<String> {
     let num_threads = proc.thread_count() as u32;
     let self_usage = process_usage(task, num_threads);
     let child_usage = proc_data.children_usage();
+    // Field 42 is delayacct_blkio_ticks.  io_uring's actual CQ sleep path
+    // contributes its nested I/O-wait accumulator through this normal task
+    // accounting surface rather than a private diagnostic-only counter.
+    let (_, iowait_ns) = thread.iowait_accounting();
+    let iowait_ticks = nanos_to_clock_ticks(iowait_ns);
     let (priority, nice, rt_priority, policy) = task_sched_stat(task);
     let (vsize, rss, rsslim) = process_memory_stat(task);
+    let mm = proc_data.mm_layout();
     let starttime = nanos_to_clock_ticks(proc_data.start_monotonic_ns());
     let processor = task.cpu_id();
     let exit_signal = proc.exit_signal().unwrap_or(Signo::SIGCHLD as u8);
@@ -125,13 +133,24 @@ pub fn render_task_stat(task: &AxTaskRef) -> AxResult<String> {
 
     Ok(format!(
         "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 {utime} {stime} {cutime} \
-         {cstime} {priority} {nice} {num_threads} 0 {starttime} {vsize} {rss} {rsslim} 0 0 0 0 0 \
-         0 0 0 0 0 0 0 {exit_signal} {processor} {rt_priority} {policy} 0 0 0 0 0 0 0 0 0 0 \
-         {exit_code}\n",
+         {cstime} {priority} {nice} {num_threads} 0 {starttime} {vsize} {rss} {rsslim} \
+         {start_code} {end_code} {start_stack} 0 0 0 0 0 0 0 0 0 {exit_signal} {processor} \
+         {rt_priority} {policy} {iowait_ticks} 0 0 {start_data} {end_data} {start_brk} \
+         {arg_start} {arg_end} {env_start} {env_end} {exit_code}\n",
         utime = self_usage.utime_ticks(),
         stime = self_usage.stime_ticks(),
         cutime = child_usage.utime_ticks(),
         cstime = child_usage.stime_ticks(),
+        start_code = mm.start_code,
+        end_code = mm.end_code,
+        start_stack = mm.start_stack,
+        start_data = mm.start_data,
+        end_data = mm.end_data,
+        start_brk = mm.start_brk,
+        arg_start = mm.arg_start,
+        arg_end = mm.arg_end,
+        env_start = mm.env_start,
+        env_end = mm.env_end,
     ))
 }
 
@@ -153,9 +172,9 @@ pub fn render_zombie_stat(process: &Process) -> AxResult<String> {
     let exit_code = snapshot.wait_status;
 
     Ok(format!(
-        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 {} {} {} {} {priority} {nice} \
-         {num_threads} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {exit_signal} 0 {rt_priority} {policy} 0 0 0 0 0 0 0 0 0 0 \
-         {exit_code}\n",
+        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 {} {} {} {} {priority} \
+         {nice} {num_threads} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {exit_signal} 0 {rt_priority} \
+         {policy} 0 0 0 0 0 0 0 0 0 0 {exit_code}\n",
         self_usage.utime_ticks(),
         self_usage.stime_ticks(),
         child_usage.utime_ticks(),

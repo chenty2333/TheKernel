@@ -33,6 +33,10 @@ pub(in crate::task) enum StopKind {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct StopReport {
     pub(crate) signal: u8,
+    /// Linux encodes a ptrace event in the high byte of the stopped signal
+    /// word returned by wait(2).  Keep it separate from the signal itself so
+    /// ordinary signal-delivery stops cannot accidentally look like an event.
+    pub(crate) ptrace_event: u8,
     pub(crate) ptrace_session: Option<PtraceSession>,
 }
 
@@ -53,6 +57,7 @@ pub(crate) enum ContinueResult {
 pub(in crate::task) struct JobControlState {
     pub(in crate::task) state: StopState,
     pub(in crate::task) stop_signal: u8,
+    pub(in crate::task) ptrace_event: u8,
     pub(in crate::task) stop_kind: StopKind,
     /// Exact relationship which published a ptrace stop.
     ///
@@ -86,6 +91,7 @@ impl JobControlState {
         }
         Some(StopReport {
             signal: self.stop_signal,
+            ptrace_event: self.ptrace_event,
             ptrace_session,
         })
     }
@@ -100,6 +106,7 @@ impl JobControlState {
         };
         Some(StopReport {
             signal: self.stop_signal,
+            ptrace_event: self.ptrace_event,
             ptrace_session,
         })
     }
@@ -110,6 +117,7 @@ impl Default for JobControlState {
         Self {
             state: StopState::Running,
             stop_signal: 0,
+            ptrace_event: 0,
             stop_kind: StopKind::JobControl,
             ptrace_session: None,
             continued: false,
@@ -140,6 +148,9 @@ pub(crate) struct PtraceSession {
 pub(crate) enum PtraceRelationshipOrigin {
     Attach,
     Traceme,
+    /// CLONE_PTRACE duplicates an already authorized relationship and keeps
+    /// its relationship-time ptracer credential.
+    Inherited,
 }
 
 /// One atomically observed ptrace relationship and the immutable credential
@@ -351,6 +362,7 @@ mod tests {
         let mut job = JobControlState {
             state: StopState::Stopped,
             stop_signal: 19,
+            ptrace_event: 0,
             stop_kind: StopKind::Ptrace,
             ptrace_session: Some(old),
             continued: false,

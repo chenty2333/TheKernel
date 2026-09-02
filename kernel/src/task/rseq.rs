@@ -12,7 +12,8 @@ use axsync::{Mutex, spin::SpinNoIrq};
 use kernel_guard::NoPreemptIrqSave;
 use thekernel_linux_rseq::{
     ForkMode, ForkPlan, RestartDecision, ResumePlan, RseqArea, RseqCriticalSection, RseqDescriptor,
-    RseqError, RseqEventMask, RseqRegistration, ThreadRseq, UserAddressLimit,
+    RseqError, RseqEventMask, RseqRegistration, ThreadRseq, UserAddressLimit, decode_area,
+    decode_critical_section,
 };
 
 use super::Thread;
@@ -22,9 +23,10 @@ use crate::mm::{
 
 /// Size of the kernel-maintained rseq feature prefix advertised to a new
 /// image. The registration ABI still requires the full 32-byte area, but this
-/// profile does not implement a per-mm `mm_cid` allocator and therefore does
-/// not advertise or publish the offset-24 field.
-pub(crate) const AT_RSEQ_FEATURE_SIZE: usize = 24;
+/// profile publishes the complete base area.  `mm_cid` is currently zero for
+/// the single-mm-cid implementation, but it remains a kernel-owned field and
+/// must be refreshed with the CPU/node tuple on every return-to-user edge.
+pub(crate) const AT_RSEQ_FEATURE_SIZE: usize = 32;
 /// Alignment of the Linux v6.6 rseq ABI area advertised to a new user image.
 pub(crate) const AT_RSEQ_ALIGN: usize = thekernel_linux_rseq::RSEQ_AREA_ALIGN;
 
@@ -285,8 +287,13 @@ impl Thread {
                 Some(address) => address,
                 None => return Ok(UserReturnHookAction::Fault),
             };
+            let mm_cid_address = match area_address.checked_add(24) {
+                Some(address) => address,
+                None => return Ok(UserReturnHookAction::Fault),
+            };
             let cpu_bytes = cpu.to_ne_bytes();
             let node_bytes = 0u32.to_ne_bytes();
+            let mm_cid_bytes = 0u32.to_ne_bytes();
             let clear = [0u8; 8];
             let abort_ip = if resume.decision() == RestartDecision::Abort {
                 match abort_ip {
@@ -299,14 +306,15 @@ impl Thread {
 
             // Every destination is checked while the same address-space guard
             // is held. Only kernel-owned scalar fields are ever written; in
-            // particular, flags, the unsupported mm_cid field, and an active
-            // user rseq_cs are never copied back from the stale area snapshot.
+            // particular, flags and an active user rseq_cs are never copied
+            // back from the stale area snapshot.
             if let Some(clear_address) = clear_address {
                 transaction.preflight_write(clear_address, &clear)?;
             }
             transaction.preflight_write(cpu_id_start_address, &cpu_bytes)?;
             transaction.preflight_write(cpu_id_address, &cpu_bytes)?;
             transaction.preflight_write(node_id_address, &node_bytes)?;
+            transaction.preflight_write(mm_cid_address, &mm_cid_bytes)?;
 
             if let Some(clear_address) = clear_address {
                 transaction.write(clear_address, &clear)?;
@@ -319,6 +327,7 @@ impl Thread {
             transaction.write(cpu_id_start_address, &cpu_bytes)?;
             transaction.write(cpu_id_address, &cpu_bytes)?;
             transaction.write(node_id_address, &node_bytes)?;
+            transaction.write(mm_cid_address, &mm_cid_bytes)?;
 
             resume.commit();
             Ok(UserReturnHookAction::EnterUser)
@@ -469,37 +478,14 @@ fn map_rseq_gate_action(error: RseqError) -> UserReturnHookAction {
     }
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    let end = offset + 4;
-    u32::from_ne_bytes(bytes[offset..end].try_into().expect("fixed rseq field"))
-}
-
-fn read_u64(bytes: &[u8], offset: usize) -> u64 {
-    let end = offset + 8;
-    u64::from_ne_bytes(bytes[offset..end].try_into().expect("fixed rseq field"))
-}
-
 fn decode_rseq_area(bytes: &[u8; thekernel_linux_rseq::RSEQ_AREA_SIZE]) -> RseqArea {
-    RseqArea {
-        cpu_id_start: read_u32(bytes, 0),
-        cpu_id: read_u32(bytes, 4),
-        rseq_cs: read_u64(bytes, 8),
-        flags: read_u32(bytes, 16),
-        node_id: read_u32(bytes, 20),
-        mm_cid: read_u32(bytes, 24),
-    }
+    decode_area(bytes).expect("fixed rseq area has ABI-required size")
 }
 
 fn decode_rseq_critical_section(
     bytes: &[u8; thekernel_linux_rseq::RSEQ_CS_SIZE],
 ) -> RseqCriticalSection {
-    RseqCriticalSection::from_raw(
-        read_u32(bytes, 0),
-        read_u32(bytes, 4),
-        read_u64(bytes, 8),
-        read_u64(bytes, 16),
-        read_u64(bytes, 24),
-    )
+    decode_critical_section(bytes).expect("fixed rseq_cs has ABI-required size")
 }
 
 #[cfg(test)]
@@ -509,6 +495,14 @@ mod tests {
     use thekernel_linux_rseq::RseqRegistrationRequest;
 
     use super::*;
+
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
 
     #[test]
     fn failed_resume_reservation_restores_reserved_abort_events() {
@@ -554,28 +548,28 @@ mod tests {
         area[24..28].copy_from_slice(&0x5a5a_5a5a_u32.to_ne_bytes());
         let original_rseq_cs = read_u64(&area, 8);
         let original_flags = read_u32(&area, 16);
-        let original_mm_cid = read_u32(&area, 24);
 
         // Model the exact scalar writes used by the gate. No 32-byte stale
-        // snapshot is copied back, and mm_cid remains untouched because this
-        // kernel profile has no allocator for it.
+        // snapshot is copied back; mm_cid is refreshed as a kernel-owned
+        // publication field.
         area[0..4].copy_from_slice(&3u32.to_ne_bytes());
         area[4..8].copy_from_slice(&3u32.to_ne_bytes());
         area[20..24].copy_from_slice(&0u32.to_ne_bytes());
+        area[24..28].copy_from_slice(&0u32.to_ne_bytes());
         assert_eq!(read_u64(&area, 8), original_rseq_cs);
         assert_eq!(read_u32(&area, 16), original_flags);
-        assert_eq!(read_u32(&area, 24), original_mm_cid);
+        assert_eq!(read_u32(&area, 24), 0);
 
         // A restart clear is a separate single 8-byte field write.
         area[8..16].fill(0);
         assert_eq!(read_u64(&area, 8), 0);
         assert_eq!(read_u32(&area, 16), original_flags);
-        assert_eq!(read_u32(&area, 24), original_mm_cid);
+        assert_eq!(read_u32(&area, 24), 0);
     }
 
     #[test]
-    fn auxv_feature_size_stops_before_unsupported_mm_cid() {
-        assert_eq!(AT_RSEQ_FEATURE_SIZE, 24);
+    fn auxv_feature_size_includes_the_complete_base_area() {
+        assert_eq!(AT_RSEQ_FEATURE_SIZE, 32);
         assert_eq!(AT_RSEQ_ALIGN, thekernel_linux_rseq::RSEQ_AREA_ALIGN);
         assert_eq!(thekernel_linux_rseq::RSEQ_ABI_SIZE, 32);
     }

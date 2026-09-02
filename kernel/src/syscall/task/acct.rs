@@ -1,8 +1,7 @@
-use alloc::string::String;
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs_ng_vfs::NodeType;
+use axfs_ng_vfs::{FsPathBuf, NodeType};
 use axhal::time::{NANOS_PER_SEC, monotonic_time_nanos};
 use axio::Cursor;
 use axsync::Mutex;
@@ -81,7 +80,7 @@ fn put_u32(record: &mut [u8; ACCT_RECORD_SIZE], offset: usize, value: u32) {
 
 fn build_record(
     proc_data: &ProcessData,
-    command: &str,
+    command: &[u8],
     usage: TaskUsage,
     exit_code: i32,
     owner_uid: u32,
@@ -118,9 +117,8 @@ fn build_record(
     put_u16(&mut record, 30, ACCT_HZ.min(u16::MAX as u64) as u16);
     put_u32(&mut record, 32, exit_code as u32);
 
-    let bytes = command.as_bytes();
-    let copy_len = bytes.len().min(ACCT_COMM);
-    record[36..36 + copy_len].copy_from_slice(&bytes[..copy_len]);
+    let copy_len = command.len().min(ACCT_COMM);
+    record[36..36 + copy_len].copy_from_slice(&command[..copy_len]);
     put_u32(&mut record, 56, owner_uid);
     put_u32(&mut record, 60, owner_gid);
     record
@@ -134,8 +132,8 @@ pub fn acct_process_exit(proc_data: &ProcessData, exit_code: i32, usage: TaskUsa
     let cmdline = proc_data.cmdline.read();
     let command = cmdline
         .first()
-        .and_then(|arg| arg.rsplit('/').next())
-        .unwrap_or("");
+        .and_then(|arg| arg.rsplit(|byte| *byte == b'/').next())
+        .unwrap_or_default();
     let record = build_record(
         proc_data,
         command,
@@ -158,12 +156,11 @@ pub fn sys_acct(memory: UserMemoryCapability, name: *const c_char) -> AxResult<i
         return Ok(0);
     }
 
-    let path = String::from_utf8(
+    let path = FsPathBuf::from_vec(
         memory
             .load_until_nul(name.cast::<u8>())
             .map_err(map_usercopy_error)?,
-    )
-    .map_err(|_| AxError::IllegalBytes)?;
+    );
     let fd = openat_inner(
         linux_raw_sys::general::AT_FDCWD as _,
         &path,

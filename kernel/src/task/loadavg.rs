@@ -38,7 +38,7 @@ pub(crate) fn account_uninterruptible_transition(was: bool, is: bool) {
         }
         (true, false) => {
             let _ = NR_UNINTERRUPTIBLE
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
         }
         _ => {}
     }
