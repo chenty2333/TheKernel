@@ -1,10 +1,9 @@
 //! Time management module.
 
-#[cfg(test)]
-use alloc::vec::Vec;
 use alloc::{
     borrow::ToOwned,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use core::{
     cell::UnsafeCell,
@@ -12,7 +11,7 @@ use core::{
     mem::MaybeUninit,
     pin::Pin,
     ptr,
-    sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -21,7 +20,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axhal::time::{NANOS_PER_SEC, TimeValue, monotonic_time_nanos};
 use axpoll::PollSet;
 use axtask::{
-    TimerCallbackRegisterError, TimerCallbackToken, cancel_timer_callback,
+    AxTaskRef, TimerCallbackRegisterError, TimerCallbackToken, cancel_timer_callback,
     future::{BlockOnError, block_on},
     register_timer_callback,
 };
@@ -36,8 +35,8 @@ use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_signal::{SignalInfo, SignalTimerPayload, Signo};
 
 use super::{
-    ProcessData, send_queued_signal_to_process_data, send_queued_signal_to_visible_thread,
-    send_signal_to_process_data,
+    AsThread, ProcessData, TaskUsage, send_queued_signal_to_process_data,
+    send_queued_signal_to_visible_thread, send_signal_to_process_data, try_processes,
 };
 use crate::time::wall_time;
 
@@ -68,13 +67,20 @@ pub(crate) enum PosixTimerClock {
     Realtime,
     Monotonic,
     Tai,
+    /// Thread-group CPU-time clock.  Expiry is evaluated by the existing
+    /// deferred accounting worker, never by a wall-clock alarm.
+    ProcessCpu,
+    /// CPU-time clock of the thread which created the timer.  POSIX timers
+    /// remain owned by the process, while this immutable kernel TID pins the
+    /// clock source for the timer lifetime.
+    ThreadCpu,
 }
 
 impl PosixTimerClock {
     pub(crate) fn absolute_alarm_clock(self) -> AlarmClock {
         match self {
             Self::Realtime | Self::Tai => AlarmClock::Realtime,
-            Self::Monotonic => AlarmClock::Monotonic,
+            Self::Monotonic | Self::ProcessCpu | Self::ThreadCpu => AlarmClock::Monotonic,
         }
     }
 }
@@ -90,7 +96,6 @@ pub(crate) enum PosixTimerNotify {
     },
 }
 
-#[derive(Debug)]
 pub(crate) struct PosixTimer {
     /// A timer ID is reserved before it is copied to userspace.  Other
     /// threads must not operate on that slot until the successful copy has
@@ -102,7 +107,27 @@ pub(crate) struct PosixTimer {
     pub effective_clock: AlarmClock,
     pub notify: PosixTimerNotify,
     pub interval: Duration,
+    /// The CLOCK_TAI deadline as supplied by userspace for an absolute arm.
+    ///
+    /// `deadline` below is always expressed in the backing alarm clock.  TAI
+    /// is backed by realtime, but its UTC offset is mutable through
+    /// `ADJ_TAI`; retaining the advertised-domain deadline lets that commit
+    /// rebase an already armed timer without treating a relative timer as an
+    /// absolute one.
+    tai_deadline: Option<Duration>,
+    /// Timex generation used to derive `deadline` from `tai_deadline`.
+    tai_offset_generation: u64,
     pub deadline: Option<Duration>,
+    /// Absolute threshold in the advertised CPU-clock domain.  This is kept
+    /// separate from `deadline`: CPU time does not advance while a task is
+    /// descheduled and therefore cannot be represented by AlarmClock.
+    cpu_deadline_ns: Option<u64>,
+    /// Immutable creator thread for CLOCK_THREAD_CPUTIME_ID timers.
+    cpu_target_task: Option<AxTaskRef>,
+    /// Foreign process clock owner for an encoded CPU clock. `None` denotes
+    /// the timer-owning process itself and avoids a self-reference cycle.
+    cpu_target_process: Option<Weak<ProcessData>>,
+    cpu_target_process_pid: Option<Pid>,
     pub sequence: u64,
     pub overrun: i32,
     signal_pending: bool,
@@ -112,10 +137,40 @@ pub(crate) struct PosixTimer {
     retry_alarm: Option<AlarmToken>,
 }
 
+impl core::fmt::Debug for PosixTimer {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("PosixTimer")
+            .field("published", &self.published)
+            .field("clock", &self.clock)
+            .field("effective_clock", &self.effective_clock)
+            .field("notify", &self.notify)
+            .field("interval", &self.interval)
+            .field("tai_deadline", &self.tai_deadline)
+            .field("tai_offset_generation", &self.tai_offset_generation)
+            .field("deadline", &self.deadline)
+            .field("cpu_deadline_ns", &self.cpu_deadline_ns)
+            .field(
+                "cpu_target_task",
+                &self.cpu_target_task.as_ref().map(|_| "task"),
+            )
+            .field("cpu_target_process_pid", &self.cpu_target_process_pid)
+            .field("sequence", &self.sequence)
+            .field("overrun", &self.overrun)
+            .field("signal_pending", &self.signal_pending)
+            .field("signal_retry_pending", &self.signal_retry_pending)
+            .field("signal_token", &self.signal_token)
+            .finish()
+    }
+}
+
 impl PosixTimer {
     pub(crate) fn try_new(
         clock: PosixTimerClock,
         notify: PosixTimerNotify,
+        cpu_target_task: Option<AxTaskRef>,
+        cpu_target_process: Option<Weak<ProcessData>>,
+        cpu_target_process_pid: Option<Pid>,
     ) -> Result<Self, AlarmTokenReserveError> {
         let main_alarm = AlarmToken::try_new()?;
         let retry_alarm = match notify {
@@ -128,7 +183,13 @@ impl PosixTimer {
             effective_clock: clock.absolute_alarm_clock(),
             notify,
             interval: Duration::ZERO,
+            tai_deadline: None,
+            tai_offset_generation: 0,
             deadline: None,
+            cpu_deadline_ns: None,
+            cpu_target_task,
+            cpu_target_process,
+            cpu_target_process_pid,
             sequence: 0,
             overrun: 0,
             signal_pending: false,
@@ -141,6 +202,137 @@ impl PosixTimer {
 
     pub(crate) fn is_published(&self) -> bool {
         self.published
+    }
+
+    pub(crate) const fn is_cpu_clock(&self) -> bool {
+        matches!(
+            self.clock,
+            PosixTimerClock::ProcessCpu | PosixTimerClock::ThreadCpu
+        )
+    }
+
+    fn cpu_now_ns(&self, owner: &ProcessData) -> Option<u64> {
+        match self.clock {
+            PosixTimerClock::ProcessCpu => match self.cpu_target_process_pid {
+                None => Some(process_cpu_usage(owner).total_ns),
+                Some(_) => self
+                    .cpu_target_process
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .map(|target| process_cpu_usage(&target).total_ns),
+            },
+            PosixTimerClock::ThreadCpu => self.cpu_target_task.as_ref().and_then(|task| {
+                let thread = task.try_as_thread()?;
+                let usage = TaskUsage::from_thread(thread);
+                Some(usage.utime_ns.saturating_add(usage.stime_ns))
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn arm_cpu(
+        &mut self,
+        owner: &ProcessData,
+        absolute: bool,
+        value: Duration,
+    ) -> AxResult<()> {
+        debug_assert!(self.is_cpu_clock());
+        self.tai_deadline = None;
+        self.deadline = None;
+        self.cpu_deadline_ns = if value.is_zero() {
+            None
+        } else if absolute {
+            Some(value.as_nanos().min(u64::MAX as u128) as u64)
+        } else {
+            let now = self.cpu_now_ns(owner).ok_or(AxError::NoSuchProcess)?;
+            Some(now.saturating_add(value.as_nanos().min(u64::MAX as u128) as u64))
+        };
+        Ok(())
+    }
+
+    pub(crate) fn remaining(&self, owner: &ProcessData) -> Duration {
+        if let Some(deadline) = self.cpu_deadline_ns {
+            let now = self.cpu_now_ns(owner).unwrap_or(u64::MAX);
+            return Duration::from_nanos(deadline.saturating_sub(now));
+        }
+        if let Some(deadline) = self.tai_deadline {
+            return deadline.saturating_sub(crate::syscall::tai_time());
+        }
+        self.deadline
+            .map(|deadline| deadline.saturating_sub(self.effective_clock.now()))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn timer_now(&self) -> Duration {
+        if self.tai_deadline.is_some() {
+            crate::syscall::tai_time()
+        } else {
+            self.effective_clock.now()
+        }
+    }
+
+    /// Records the advertised TAI deadline together with the exact timex
+    /// generation that supplied its realtime projection.  The caller owns
+    /// `posix_timers`, so this stays paired with the main-alarm publication.
+    pub(crate) fn set_tai_absolute_deadline(
+        &mut self,
+        deadline: Option<Duration>,
+        generation: u64,
+    ) {
+        self.tai_deadline = deadline;
+        self.tai_offset_generation = deadline.map_or(0, |_| generation);
+    }
+
+    fn rebase_tai_absolute_deadline(
+        &mut self,
+        generation: u64,
+        offset_seconds: i64,
+    ) -> Option<Duration> {
+        let deadline = self.tai_deadline?;
+        if self.tai_offset_generation >= generation {
+            return None;
+        }
+        self.tai_offset_generation = generation;
+        Some(tai_deadline_as_realtime(deadline, offset_seconds))
+    }
+
+    /// Arms/disarms an accounting-clock timer.  Returns an expiry delivery
+    /// when this accounting sample crossed the threshold.
+    fn evaluate_cpu(&mut self, owner: &ProcessData) -> Option<TimerSignalDelivery> {
+        let deadline = self.cpu_deadline_ns?;
+        let now = self.cpu_now_ns(owner)?;
+        let terminal_thread = matches!(self.clock, PosixTimerClock::ThreadCpu)
+            && self.cpu_target_task.as_ref().is_none_or(|task| {
+                task.try_as_thread()
+                    .is_none_or(|thread| thread.pending_exit())
+            });
+        if now < deadline {
+            // A thread CPU clock cannot advance after terminal teardown.
+            // Keep the final published usage observable through gettime only
+            // until this worker pass, then retire an unreachable threshold.
+            if terminal_thread {
+                self.cpu_deadline_ns = None;
+            }
+            return None;
+        }
+        let expirations = if self.interval.is_zero() {
+            self.cpu_deadline_ns = None;
+            1
+        } else {
+            let interval = self.interval.as_nanos().min(u64::MAX as u128) as u64;
+            let expirations = now
+                .saturating_sub(deadline)
+                .saturating_div(interval.max(1))
+                .saturating_add(1);
+            self.cpu_deadline_ns =
+                Some(deadline.saturating_add(interval.saturating_mul(expirations)));
+            expirations as u128
+        };
+        let delivery = self.begin_signal_delivery(expirations);
+        if terminal_thread {
+            self.cpu_deadline_ns = None;
+        }
+        delivery
     }
 
     pub(crate) fn publish(&mut self) {
@@ -1190,6 +1382,29 @@ lazy_static! {
     static ref MONOTONIC_ALARM_EVENT: Event = Event::new();
 }
 
+// CPU-clock sleepers cannot be backed by a wall-clock deadline: a task which
+// is not consuming CPU must remain asleep indefinitely.  Keep their wake
+// registrations bounded and allocation-free in the accounting producer path.
+const CPU_CLOCK_SLEEP_WAITER_CAPACITY: usize = 64;
+static CPU_CLOCK_SLEEP_WAITERS: PollSet<CPU_CLOCK_SLEEP_WAITER_CAPACITY> = PollSet::new();
+
+/// Returns the bounded readiness source notified after CPU accounting advances
+/// or a thread begins terminal teardown. Callers retain their target and
+/// predicate; the source intentionally broadcasts rather than keeping
+/// unbounded per-task timer lists in IRQ accounting paths.
+pub(crate) fn cpu_clock_sleep_waiters() -> &'static PollSet<CPU_CLOCK_SLEEP_WAITER_CAPACITY> {
+    &CPU_CLOCK_SLEEP_WAITERS
+}
+
+/// Wakes CPU-clock sleepers to re-evaluate their pinned target.  This is
+/// called only after the new accounting snapshot is published, so observers
+/// cannot wake and read an older target value.
+pub(crate) fn notify_cpu_clock_sleepers() {
+    if !CPU_CLOCK_SLEEP_WAITERS.is_empty() {
+        CPU_CLOCK_SLEEP_WAITERS.wake();
+    }
+}
+
 static REALTIME_TIMER_RUNTIMES: [SpinNoIrq<ClockTimerRuntime>; axconfig::plat::MAX_CPU_NUM] =
     [const { SpinNoIrq::new(ClockTimerRuntime::new()) }; axconfig::plat::MAX_CPU_NUM];
 static MONOTONIC_TIMER_RUNTIMES: [SpinNoIrq<ClockTimerRuntime>; axconfig::plat::MAX_CPU_NUM] =
@@ -1248,18 +1463,18 @@ impl ITimerType {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct ProcessTimerCharge {
     user_ns: usize,
     system_ns: usize,
 }
 
 impl ProcessTimerCharge {
-    fn total_ns(self) -> usize {
+    fn total_ns(&self) -> usize {
         self.user_ns.saturating_add(self.system_ns)
     }
 
-    fn is_empty(self) -> bool {
+    fn is_empty(&self) -> bool {
         self.user_ns == 0 && self.system_ns == 0
     }
 }
@@ -1366,6 +1581,38 @@ fn account_process_cpu(
             charge.total_ns(),
         );
     }
+    notify_foreign_cpu_timer_owners(proc_data);
+}
+
+/// IRQ-side RCU read section for foreign CPU-clock timer owners. Publishers
+/// retain one Arc raw count in each live node; an even generation is stable,
+/// odd is being retired/replaced. No allocation or lock is taken here.
+fn notify_foreign_cpu_timer_owners(target: &ProcessData) {
+    for node in &target.foreign_cpu_timer_subscribers.nodes {
+        let before = node.generation.load(Ordering::Acquire);
+        if before == 0 || before & 1 != 0 {
+            continue;
+        }
+        let owner = node.owner.load(Ordering::Acquire);
+        if owner.is_null() {
+            continue;
+        }
+        // SAFETY: a stable node owns one raw Arc count until its publisher
+        // flips generation odd, clears owner, and waits for IRQ readers.
+        unsafe {
+            Arc::increment_strong_count(owner);
+        }
+        if node.generation.load(Ordering::Acquire) != before {
+            unsafe {
+                drop(Arc::from_raw(owner));
+            }
+            continue;
+        }
+        let owner = unsafe { Arc::from_raw(owner) };
+        if let Some(cpu) = request_process_cpu_evaluation(&owner) {
+            crate::deferred_work::wake_process_timer_worker(cpu);
+        }
+    }
 }
 
 fn process_cpu_usage(proc_data: &ProcessData) -> ProcessCpuUsage {
@@ -1390,18 +1637,118 @@ fn process_cpu_usage(proc_data: &ProcessData) -> ProcessCpuUsage {
     }
 }
 
+/// Republishes whether POSIX CPU-clock timers require accounting-worker
+/// wakeups.  The timer owner calls this only after releasing `posix_timers`;
+/// the worker samples the inverse lock order only after it has completed the
+/// interval-timer evaluation, so no lock cycle is introduced.
+pub(crate) fn refresh_posix_cpu_timer_armed(proc_data: &ProcessData) {
+    let posix_armed = proc_data.posix_timers.lock().iter().flatten().any(|timer| {
+        timer.is_published() && timer.is_cpu_clock() && timer.cpu_deadline_ns.is_some()
+    });
+    let interval_armed = proc_data.process_itimers.lock().cpu_armed_mask();
+    proc_data.process_itimer_cpu_armed.store(
+        interval_armed
+            | if posix_armed {
+                PROCESS_POSIX_CPU_ARMED
+            } else {
+                0
+            },
+        Ordering::Release,
+    );
+}
+
 const PROCESS_ITIMER_VIRTUAL_PENDING: u8 = 1 << 0;
 const PROCESS_ITIMER_PROF_PENDING: u8 = 1 << 1;
 const PROCESS_RLIMIT_CPU_SOFT_PENDING: u8 = 1 << 2;
 const PROCESS_RLIMIT_CPU_HARD_PENDING: u8 = 1 << 3;
 const PROCESS_CPU_EVALUATE_PENDING: u8 = 1 << 4;
+/// At least one POSIX CPU-clock timer is armed.  This is an admission bit,
+/// not a signal bit: accounting only uses it to queue the process worker.
+const PROCESS_POSIX_CPU_ARMED: u8 = 1 << 5;
 const PROCESS_ITIMER_CPU_ARMED_MASK: u8 =
-    PROCESS_ITIMER_VIRTUAL_PENDING | PROCESS_ITIMER_PROF_PENDING;
+    PROCESS_ITIMER_VIRTUAL_PENDING | PROCESS_ITIMER_PROF_PENDING | PROCESS_POSIX_CPU_ARMED;
 const PROCESS_CPU_POLICY_PENDING_MASK: u8 = PROCESS_ITIMER_CPU_ARMED_MASK
     | PROCESS_RLIMIT_CPU_SOFT_PENDING
     | PROCESS_RLIMIT_CPU_HARD_PENDING
     | PROCESS_CPU_EVALUATE_PENDING;
 const PROCESS_ITIMER_WORK_BATCH: usize = 16;
+/// Fixed foreign CPU-clock subscriber capacity per target process.  Nodes are
+/// embedded in ProcessData, so accounting IRQ publication never allocates.
+pub(crate) const FOREIGN_CPU_TIMER_SUBSCRIBERS: usize = 32;
+pub(crate) struct ForeignCpuTimerSubscriber {
+    pub(crate) generation: AtomicU64,
+    pub(crate) owner: AtomicPtr<ProcessData>,
+}
+impl ForeignCpuTimerSubscriber {
+    pub(crate) const fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            owner: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+}
+pub(crate) struct ForeignCpuTimerSubscriberPool {
+    pub(crate) epoch: AtomicU64,
+    pub(crate) nodes: [ForeignCpuTimerSubscriber; FOREIGN_CPU_TIMER_SUBSCRIBERS],
+}
+impl ForeignCpuTimerSubscriberPool {
+    pub(crate) const fn new() -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            nodes: [const { ForeignCpuTimerSubscriber::new() }; FOREIGN_CPU_TIMER_SUBSCRIBERS],
+        }
+    }
+}
+pub(crate) fn publish_foreign_cpu_timer_owner(
+    target: &ProcessData,
+    owner: &Arc<ProcessData>,
+) -> AxResult<usize> {
+    for (index, node) in target
+        .foreign_cpu_timer_subscribers
+        .nodes
+        .iter()
+        .enumerate()
+    {
+        if node
+            .owner
+            .compare_exchange(
+                ptr::null_mut(),
+                Arc::as_ptr(owner).cast_mut(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let generation = target
+                .foreign_cpu_timer_subscribers
+                .epoch
+                .fetch_add(2, Ordering::AcqRel)
+                .saturating_add(2)
+                & !1;
+            let retained = Arc::into_raw(owner.clone()).cast_mut();
+            node.owner.store(retained, Ordering::Release);
+            node.generation.store(generation.max(2), Ordering::Release);
+            return Ok(index);
+        }
+    }
+    Err(AxError::WouldBlock)
+}
+pub(crate) fn retire_foreign_cpu_timer_owner(target: &ProcessData, slot: usize) {
+    let Some(node) = target.foreign_cpu_timer_subscribers.nodes.get(slot) else {
+        return;
+    };
+    let generation = node.generation.load(Ordering::Acquire);
+    node.generation.store(generation | 1, Ordering::Release);
+    let owner = node.owner.swap(ptr::null_mut(), Ordering::AcqRel);
+    // IRQ readers validate generation after retaining their temporary Arc;
+    // this release point prevents new readers from observing this raw owner.
+    node.generation.store(0, Ordering::Release);
+    if !owner.is_null() {
+        unsafe {
+            drop(Arc::from_raw(owner));
+        }
+    }
+}
 /// Intrusive node for one bounded process-timer MPSC ingress. A queued
 /// process retains one strong `Arc` in `owner`; the queue's single consumer
 /// converts that raw strong reference back into an `Arc` after fully unlinking
@@ -2750,9 +3097,10 @@ pub(crate) fn set_process_itimer(
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq)]
 struct ProcessCpuPolicyEvaluation {
     signals: u8,
+    posix_deliveries: Vec<(usize, PosixTimerNotify, TimerSignalDelivery)>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -2789,18 +3137,44 @@ fn evaluate_process_cpu_policy(proc_data: &Arc<ProcessData>) -> ProcessCpuPolicy
     }
 
     let usage = process_cpu_usage(proc_data);
-    let signals = if timer_armed {
+    let (signals, posix_deliveries) = if timer_armed {
         let mut timers = proc_data.process_itimers.lock();
         let signals = timers.evaluate_cpu(usage);
+        let interval_armed = timers.cpu_armed_mask();
+        drop(timers);
+        let mut posix_deliveries = Vec::new();
+        let mut posix_cpu_armed = false;
+        {
+            let mut timers = proc_data.posix_timers.lock();
+            for (timerid, timer) in timers.iter_mut().enumerate() {
+                let Some(timer) = timer.as_mut().filter(|timer| timer.is_published()) else {
+                    continue;
+                };
+                if !timer.is_cpu_clock() {
+                    continue;
+                }
+                if let Some(delivery) = timer.evaluate_cpu(proc_data) {
+                    posix_deliveries.push((timerid, timer.notify, delivery));
+                }
+                posix_cpu_armed |= timer.cpu_deadline_ns.is_some();
+            }
+        }
         // Publish the fast-path mask while still holding the state owner lock.
-        // set_process_itimer() uses the same lock, so a later arm/disarm cannot
-        // be overwritten by an older accounting snapshot after lock release.
-        proc_data
-            .process_itimer_cpu_armed
-            .store(timers.cpu_armed_mask(), Ordering::Release);
-        signals
+        // The POSIX timer owner is separately serialized; both masks describe
+        // state sampled during this worker pass, and the next mutation queues
+        // a fresh evaluation after publication.
+        proc_data.process_itimer_cpu_armed.store(
+            interval_armed
+                | if posix_cpu_armed {
+                    PROCESS_POSIX_CPU_ARMED
+                } else {
+                    0
+                },
+            Ordering::Release,
+        );
+        (signals, posix_deliveries)
     } else {
-        ProcessITimerSignals::default()
+        (ProcessITimerSignals::default(), Vec::new())
     };
 
     let mut pending = 0;
@@ -2844,7 +3218,10 @@ fn evaluate_process_cpu_policy(proc_data: &Arc<ProcessData>) -> ProcessCpuPolicy
         }
     }
 
-    ProcessCpuPolicyEvaluation { signals: pending }
+    ProcessCpuPolicyEvaluation {
+        signals: pending,
+        posix_deliveries,
+    }
 }
 
 /// Publishes a coalescible evaluation request after CPU-clock counters have
@@ -3059,9 +3436,11 @@ impl ProcessITimerWorkConsumer {
                 break;
             };
             let mut pending = proc_data.process_itimer_pending.swap(0, Ordering::SeqCst);
+            let mut posix_deliveries = Vec::new();
             if pending & PROCESS_CPU_EVALUATE_PENDING != 0 {
                 let evaluation = evaluate_process_cpu_policy(&proc_data);
                 pending = (pending & !PROCESS_CPU_EVALUATE_PENDING) | evaluation.signals;
+                posix_deliveries = evaluation.posix_deliveries;
             }
             if pending & PROCESS_RLIMIT_CPU_HARD_PENDING != 0 {
                 // A terminal hard crossing owns this worker pass. Do not
@@ -3093,6 +3472,15 @@ impl ProcessITimerWorkConsumer {
                 let _ = send_signal_to_process_data(
                     &proc_data,
                     Some(SignalInfo::new_kernel(Signo::SIGXCPU)),
+                );
+            }
+            for (timerid, notify, delivery) in posix_deliveries {
+                deliver_posix_timer_signal(
+                    &proc_data,
+                    timerid,
+                    notify,
+                    delivery,
+                    POSIX_TIMER_RETRY_INITIAL,
                 );
             }
             debug_assert_eq!(pending & !PROCESS_CPU_POLICY_PENDING_MASK, 0);
@@ -3802,6 +4190,110 @@ fn saturating_duration_mul(duration: Duration, count: u128) -> Duration {
     Duration::from_nanos(nanos)
 }
 
+/// Projects a CLOCK_TAI deadline onto the realtime alarm heap.  Keep the
+/// conversion signed: a negative TAI offset is valid input to ADJ_TAI.
+fn tai_deadline_as_realtime(deadline: Duration, offset_seconds: i64) -> Duration {
+    if offset_seconds >= 0 {
+        deadline.saturating_sub(Duration::from_secs(offset_seconds as u64))
+    } else {
+        deadline.saturating_add(Duration::from_secs(offset_seconds.unsigned_abs()))
+    }
+}
+
+/// Rebase every live absolute CLOCK_TAI timer after a successful `ADJ_TAI`
+/// commit.  This deliberately snapshots process owners before taking any
+/// timer lock and publishes each registry change only after releasing that
+/// owner lock.  A concurrent `timer_settime` either retains the new timex
+/// generation itself or is observed here and replaced with the same
+/// projection; the per-arm sequence rejects every stale heap dispatch.
+struct TaiTimerRebaseProcess {
+    proc_data: Arc<ProcessData>,
+    publications: Vec<AlarmPublication>,
+}
+
+/// Fully allocated rebase work prepared before the new TAI offset becomes
+/// visible.  The caller holds `TAI_TIMER_REBASE_GATE` throughout prepare and
+/// apply, which prevents timer_settime from adding an armed TAI timer after a
+/// process's capacity was sampled.  Timer creation may still grow a vector,
+/// but cannot create an armed entry without that same gate.
+pub(crate) struct TaiTimerRebasePlan {
+    processes: Vec<TaiTimerRebaseProcess>,
+}
+
+pub(crate) fn prepare_tai_absolute_posix_timer_rebase() -> AxResult<TaiTimerRebasePlan> {
+    let processes = try_processes()?;
+    let mut planned = Vec::new();
+    planned
+        .try_reserve_exact(processes.len())
+        .map_err(|_| AxError::NoMemory)?;
+    for proc_data in processes {
+        let timers = proc_data.posix_timers.lock();
+        let capacity = timers.len();
+        // Rebase is a semantic replacement of every armed absolute TAI
+        // action, so reserve its successor sequence before TIMEX_STATE is
+        // published.  Wrapping would let an ancient queued action collide
+        // with a newly rearmed timer after 2^64 updates.
+        if timers.iter().flatten().any(|timer| {
+            timer.is_published() && timer.tai_deadline.is_some() && timer.sequence == u64::MAX
+        }) {
+            return Err(AxError::OutOfRange);
+        }
+        drop(timers);
+        let mut publications = Vec::new();
+        publications
+            .try_reserve_exact(capacity)
+            .map_err(|_| AxError::NoMemory)?;
+        planned.push(TaiTimerRebaseProcess {
+            proc_data,
+            publications,
+        });
+    }
+    Ok(TaiTimerRebasePlan { processes: planned })
+}
+
+impl TaiTimerRebasePlan {
+    /// Applies a preallocated TAI rebase after the new timex generation is
+    /// published.  This cannot fail or allocate while a timer owner lock is
+    /// held; stale heap actions are excluded by the new sequence value.
+    pub(crate) fn apply(mut self, generation: u64, offset_seconds: i64) {
+        for process in &mut self.processes {
+            {
+                let mut timers = process.proc_data.posix_timers.lock();
+                for (timerid, timer) in timers.iter_mut().enumerate() {
+                    let Some(timer) = timer.as_mut().filter(|timer| timer.is_published()) else {
+                        continue;
+                    };
+                    let Some(deadline) =
+                        timer.rebase_tai_absolute_deadline(generation, offset_seconds)
+                    else {
+                        continue;
+                    };
+                    // Preflight rejected the terminal sequence before the
+                    // timex publication, so this successor is infallible and
+                    // cannot collide with an earlier queued alarm action.
+                    let sequence = timer
+                        .sequence
+                        .checked_add(1)
+                        .expect("TAI rebase preflight admitted a terminal sequence");
+                    timer.sequence = sequence;
+                    timer.effective_clock = AlarmClock::Realtime;
+                    timer.deadline = Some(deadline);
+                    process.publications.push(timer.prepare_main_alarm(
+                        &process.proc_data,
+                        timerid,
+                        AlarmClock::Realtime,
+                        deadline,
+                        sequence,
+                    ));
+                }
+            }
+            for publication in core::mem::take(&mut process.publications) {
+                publication.publish();
+            }
+        }
+    }
+}
+
 fn posix_timer_signal_info(
     signo: Signo,
     timerid: usize,
@@ -3979,15 +4471,16 @@ fn fire_posix_timer(
             return;
         };
 
-        let now = timer.effective_clock.now();
-        if now < deadline {
+        let domain_deadline = timer.tai_deadline.unwrap_or(deadline);
+        let now = timer.timer_now();
+        if now < domain_deadline {
             return;
         }
 
         let expirations = if timer.interval.is_zero() {
             1_u128
         } else {
-            let elapsed = now.saturating_sub(deadline).as_nanos();
+            let elapsed = now.saturating_sub(domain_deadline).as_nanos();
             let interval = timer.interval.as_nanos().max(1);
             1_u128.saturating_add(elapsed / interval)
         };
@@ -3999,11 +4492,20 @@ fn fire_posix_timer(
 
         let next = if timer.interval.is_zero() {
             timer.deadline = None;
+            timer.tai_deadline = None;
             None
         } else {
-            let next_deadline = deadline
+            let next_domain_deadline = domain_deadline
                 .checked_add(saturating_duration_mul(timer.interval, expirations))
                 .unwrap_or(Duration::MAX);
+            let next_deadline = if timer.tai_deadline.is_some() {
+                let (offset_seconds, generation) = crate::syscall::tai_offset_snapshot();
+                timer.tai_deadline = Some(next_domain_deadline);
+                timer.tai_offset_generation = generation;
+                tai_deadline_as_realtime(next_domain_deadline, offset_seconds)
+            } else {
+                next_domain_deadline
+            };
             timer.deadline = Some(next_deadline);
             Some(timer.prepare_main_alarm(
                 &proc_data,
@@ -4043,6 +4545,9 @@ mod posix_timer_signal_tests {
                 target_tid: None,
                 value: Some(7),
             },
+            None,
+            None,
+            None,
         )
         .unwrap()
     }

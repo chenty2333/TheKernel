@@ -8,21 +8,21 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::time::TimeValue;
 use axtask::{
-    AxCpuMask, AxTaskRef, DeadlineConfig, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN,
-    SchedClass, SchedState, TaskSchedAttrUpdate, TaskSchedError, current,
+    AxCpuMask, AxTaskRef, DeadlineParameters, RR_TIMESLICE_TICKS, RT_PRIORITY_MAX, RT_PRIORITY_MIN,
+    RequestedSlice, SchedClass, SchedState, TaskSchedError, TaskSchedulingSnapshot,
+    TaskSchedulingUpdate, current,
     future::{BlockOnError, Interrupted, block_on, interruptible},
-    sched_state, scheduler_attr_snapshot, scheduler_state_snapshot, set_sched_state_versioned,
-    set_sched_state_versioned_with_reset, set_task_affinity, set_task_nice as update_task_nice,
-    update_sched_attr_versioned,
+    sched_state, set_sched_state_versioned_with_uclamp_constraints, set_task_affinity,
+    set_task_nice as update_task_nice, task_scheduling_snapshot, update_task_scheduling,
 };
 use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
     CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS,
-    PRIO_USER, RLIMIT_NICE, RLIMIT_RTPRIO, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO,
-    SCHED_FLAG_KEEP_PARAMS, SCHED_FLAG_KEEP_POLICY, SCHED_FLAG_RESET_ON_FORK, SCHED_IDLE,
+    PRIO_USER, RLIMIT_NICE, RLIMIT_RTPRIO, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE,
     SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
 };
 use thekernel_linux_process_adapter::{Pid, ProcessError};
+use thekernel_linux_sched as linux_sched;
 use thekernel_linux_signal::{DefaultSignalAction, SignalDisposition, Signo};
 use thekernel_linux_usercopy::{
     UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
@@ -30,8 +30,11 @@ use thekernel_linux_usercopy::{
 
 use crate::{
     mm::map_usercopy_error,
+    readiness::block_on_poll_set_interruptible_if,
     task::{
-        AlarmClock, AsThread, Cred, PidNamespace, ProcStateHint, Process, Thread,
+        AlarmClock, AsThread, Cred, PidNamespace, ProcStateHint, Process, PtraceAccessMode,
+        TaskUsage, Thread, check_current_process_ptrace_access,
+        check_current_thread_ptrace_image_access, cpu_clock_sleep_waiters,
         get_process_including_zombie, get_task, get_visible_task, has_pending_syscall_signal,
         ns_capable, prepare_clock_sleep, process_domain,
         security::{
@@ -43,20 +46,6 @@ use crate::{
     time::TimeValueLike,
 };
 
-const SUPPORTED_SCHED_ATTR_FLAGS: u64 = SCHED_FLAG_RESET_ON_FORK as u64;
-const SCHED_ATTR_INPUT_FLAGS: u64 =
-    SUPPORTED_SCHED_ATTR_FLAGS | SCHED_FLAG_KEEP_POLICY as u64 | SCHED_FLAG_KEEP_PARAMS as u64;
-const SCHED_FLAG_RECLAIM: u64 = 0x02;
-const SCHED_FLAG_DL_OVERRUN: u64 = 0x04;
-const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
-const SCHED_FLAG_UTIL_CLAMP_MAX: u64 = 0x40;
-const SCHED_ATTR_KNOWN_FLAGS: u64 = SCHED_ATTR_INPUT_FLAGS
-    | SCHED_FLAG_RECLAIM
-    | SCHED_FLAG_DL_OVERRUN
-    | SCHED_FLAG_UTIL_CLAMP_MIN
-    | SCHED_FLAG_UTIL_CLAMP_MAX;
-const SCHED_ATTR_SIZE_VER0: usize = 48;
-const SCHED_ATTR_MAX_SIZE: usize = 4096;
 const SCHED_RR_TIMESLICE_MS_DEFAULT: u32 = {
     let ms = (RR_TIMESLICE_TICKS * 1000) / axconfig::TICKS_PER_SEC;
     if ms == 0 { 1 } else { ms as u32 }
@@ -179,29 +168,9 @@ fn validate_rt_priority(priority: i32) -> AxResult<u8> {
     }
 }
 
-fn validate_nice(nice: i32) -> AxResult<i8> {
-    if (-20..=19).contains(&nice) {
-        Ok(nice as i8)
-    } else {
-        Err(AxError::InvalidInput)
-    }
-}
-
-fn validate_deadline_parameters(attr: &SchedAttr) -> AxResult<()> {
-    if attr.sched_priority != 0
-        || attr.sched_runtime == 0
-        || attr.sched_deadline == 0
-        || attr.sched_runtime > attr.sched_deadline
-        || (attr.sched_period != 0 && attr.sched_deadline > attr.sched_period)
-    {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(())
-}
-
 fn sched_reset_on_fork(task: &AxTaskRef) -> AxResult<bool> {
-    scheduler_state_snapshot(task)
-        .map(|commit| commit.reset_on_fork)
+    task_scheduling_snapshot(task)
+        .map(|commit| commit.reset_on_spawn)
         .map_err(map_sched_error)
 }
 
@@ -258,13 +227,15 @@ fn write_sched_attr_kernel_size<M: UserMemory + ?Sized>(
 fn read_sched_attr<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     attr: *const SchedAttr,
-) -> AxResult<SchedAttr> {
+) -> AxResult<(SchedAttr, u32, bool)> {
     let mut attr_size =
         VmPtr::vm_read(attr.cast::<u32>(), memory).map_err(map_usercopy_error)? as usize;
     if attr_size == 0 {
-        attr_size = SCHED_ATTR_SIZE_VER0;
+        attr_size = linux_sched::SCHED_ATTR_SIZE_VER0 as usize;
     }
-    if !(SCHED_ATTR_SIZE_VER0..=SCHED_ATTR_MAX_SIZE).contains(&attr_size) {
+    if !(linux_sched::SCHED_ATTR_SIZE_VER0 as usize..=linux_sched::SCHED_ATTR_MAX_SIZE as usize)
+        .contains(&attr_size)
+    {
         // Linux returns E2BIG after a readable size even if this best-effort
         // write-back lands on a read-only mapping.
         let _ = write_sched_attr_kernel_size(memory, attr);
@@ -279,6 +250,7 @@ fn read_sched_attr<M: UserMemory + ?Sized>(
     };
     dst.copy_from_slice(&src);
 
+    let mut tail_nonzero = false;
     if attr_size > size_of::<SchedAttr>() {
         let extra = vm_load(
             memory,
@@ -286,14 +258,30 @@ fn read_sched_attr<M: UserMemory + ?Sized>(
             attr_size - size_of::<SchedAttr>(),
         )
         .map_err(map_usercopy_error)?;
-        if extra.iter().any(|byte| *byte != 0) {
+        tail_nonzero = extra.iter().any(|byte| *byte != 0);
+        if tail_nonzero {
             let _ = write_sched_attr_kernel_size(memory, attr);
-            return Err(LinuxError::E2BIG.into());
         }
     }
+    Ok((out, attr_size as u32, tail_nonzero))
+}
 
-    out.sched_nice = out.sched_nice.clamp(-20, 19);
-    Ok(out)
+fn map_sched_reject(reject: linux_sched::Reject) -> AxError {
+    match reject {
+        linux_sched::Reject::SizeTooSmall
+        | linux_sched::Reject::SizeTooLarge
+        | linux_sched::Reject::NonZeroTail => LinuxError::E2BIG.into(),
+        linux_sched::Reject::UnsupportedDeadline
+        | linux_sched::Reject::UnsupportedUclamp
+        | linux_sched::Reject::UnsupportedFlag => AxError::OperationNotSupported,
+        linux_sched::Reject::UnknownFlags
+        | linux_sched::Reject::InvalidPolicy
+        | linux_sched::Reject::InvalidPriority
+        | linux_sched::Reject::InvalidNice
+        | linux_sched::Reject::InvalidDeadline
+        | linux_sched::Reject::InvalidUclamp
+        | linux_sched::Reject::MissingUtilClampFields => AxError::InvalidInput,
+    }
 }
 
 fn raw_priority_from_nice(nice: i8) -> isize {
@@ -336,23 +324,35 @@ pub fn set_sched_rr_timeslice_ms(value: i32) {
 }
 
 fn apply_sched_state(task: &AxTaskRef, state: SchedState) -> AxResult<isize> {
-    let commit = set_sched_state_versioned(task, state).map_err(|error| match error {
-        TaskSchedError::Unsupported => AxError::OperationNotSupported,
-        TaskSchedError::TaskExited => AxError::NoSuchProcess,
-        TaskSchedError::RunQueueUnavailable(_) => AxError::BadState,
-        TaskSchedError::Scheduler(_) => AxError::InvalidInput,
-    })?;
+    let constraints =
+        crate::pseudofs::cgroup::uclamp_constraints_for_pid(task.as_thread().proc_data.proc.pid());
+    let commit = set_sched_state_versioned_with_uclamp_constraints(task, state, constraints, None)
+        .map_err(|error| match error {
+            TaskSchedError::Unsupported => AxError::OperationNotSupported,
+            TaskSchedError::TaskExited => AxError::NoSuchProcess,
+            TaskSchedError::RunQueueUnavailable(_) => AxError::BadState,
+            TaskSchedError::Scheduler(_) => AxError::InvalidInput,
+        })?;
     publish_sched_commit(task, commit);
     Ok(0)
 }
 
-fn publish_sched_commit(task: &AxTaskRef, commit: axtask::TaskSchedCommit) {
+/// Publishes the scheduler result into the durable Linux task/process views.
+///
+/// Scheduler callers and cgroup live-recompute use this same completion edge:
+/// the runqueue transaction has already updated its aggregate, and this makes
+/// the task cache and zombie-visible process snapshot agree with that commit.
+pub(crate) fn publish_sched_commit(task: &AxTaskRef, commit: TaskSchedulingSnapshot) {
     #[cfg(feature = "hwp-uclamp")]
     if let Some(thread) = task.try_as_thread() {
         // Do this before the durable leader snapshot.  The Thread cache is
         // the CPU-local HWP consumer and rejects a delayed, older commit by
         // serial number, while ProcessData retains the existing zombie view.
-        thread.publish_scheduler_clamp(commit.util_min, commit.util_max, commit.version);
+        thread.publish_scheduler_clamp(
+            commit.utilization_bounds.minimum,
+            commit.utilization_bounds.maximum,
+            commit.version,
+        );
     }
     if let Some(thread) = task.try_as_thread()
         && let Some(token) = thread
@@ -372,8 +372,15 @@ fn apply_sched_state_with_reset(
     state: SchedState,
     reset_on_fork: bool,
 ) -> AxResult<isize> {
-    let commit = set_sched_state_versioned_with_reset(task, state, reset_on_fork)
-        .map_err(map_sched_error)?;
+    let constraints =
+        crate::pseudofs::cgroup::uclamp_constraints_for_pid(task.as_thread().proc_data.proc.pid());
+    let commit = set_sched_state_versioned_with_uclamp_constraints(
+        task,
+        state,
+        constraints,
+        Some(reset_on_fork),
+    )
+    .map_err(map_sched_error)?;
     publish_sched_commit(task, commit);
     Ok(0)
 }
@@ -406,7 +413,7 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
         (policy & !(SCHED_RESET_ON_FORK as i32)) as u32,
         SchedSetAbi::Legacy,
     )?;
-    let thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+    task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
     let old_state = sched_state(task);
     let requested_rt_priority = match class {
         SchedClass::Fifo | SchedClass::RoundRobin => validate_rt_priority(priority)?,
@@ -415,6 +422,11 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
         }
         SchedClass::Deadline => return Err(AxError::InvalidInput),
     };
+    let (actor_task, _) = scheduler_actor_snapshot();
+    let actor_limits = actor_task.as_thread().proc_data.rlim.read();
+    let rlimit_rtprio = actor_limits[RLIMIT_RTPRIO].current;
+    let rlimit_nice = actor_limits[RLIMIT_NICE].current;
+    drop(actor_limits);
     let authority = scheduler_authority_snapshot(task)?;
     authority.authorize(SchedulerSecurityOperation::SetPolicy {
         policy_changed: old_state.class != class,
@@ -425,12 +437,12 @@ fn update_sched_policy(task: &AxTaskRef, policy: i32, priority: i32) -> AxResult
         current_rt_priority: old_state.rt_priority,
         requested_realtime: matches!(class, SchedClass::Fifo | SchedClass::RoundRobin),
         requested_rt_priority,
-        rlimit_rtprio: thread.proc_data.rlim.read()[RLIMIT_RTPRIO].current,
+        rlimit_rtprio,
         current_idle: matches!(old_state.class, SchedClass::Idle),
         requested_idle: matches!(class, SchedClass::Idle),
         current_nice: old_state.nice,
         requested_nice: old_state.nice,
-        rlimit_nice: thread.proc_data.rlim.read()[RLIMIT_NICE].current,
+        rlimit_nice,
         current_reset_on_fork: sched_reset_on_fork(task)?,
         reset_on_fork,
     })?;
@@ -461,7 +473,7 @@ fn update_sched_param(task: &AxTaskRef, priority: i32) -> AxResult<isize> {
         validate_static_priority(priority)?;
         0
     };
-    let rlimit_rtprio = task.as_thread().proc_data.rlim.read()[RLIMIT_RTPRIO].current;
+    let rlimit_rtprio = current().as_thread().proc_data.rlim.read()[RLIMIT_RTPRIO].current;
     scheduler_authority_snapshot(task)?.authorize(SchedulerSecurityOperation::SetParam {
         realtime,
         old_rt_priority: state.rt_priority,
@@ -542,7 +554,7 @@ fn set_task_nice(
 }
 
 pub fn sys_sched_yield() -> AxResult<isize> {
-    axtask::sched_yield();
+    axtask::yield_now();
     Ok(0)
 }
 
@@ -731,6 +743,150 @@ fn remaining_relative_sleep(req: TimeValue, actual: TimeValue) -> Option<TimeVal
     }
 }
 
+// Linux encodes dynamic CPU clocks as `~pid << 3 | clock-type`.  Keep this
+// decoder local to the CPU-sleep implementation: time.rs owns clock reads,
+// while this syscall must pin the target and its access decision for the
+// entire blocking operation.
+const CPUCLOCK_PROF: i32 = 0;
+const CPUCLOCK_VIRT: i32 = 1;
+const CPUCLOCK_SCHED: i32 = 2;
+const CPUCLOCK_MAX: i32 = 3;
+const CPUCLOCK_PERTHREAD_MASK: i32 = 4;
+const CPUCLOCK_CLOCK_MASK: i32 = 3;
+const CLOCKFD: i32 = CPUCLOCK_MAX;
+const CLOCKFD_MASK: i32 = CPUCLOCK_PERTHREAD_MASK | CPUCLOCK_CLOCK_MASK;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CpuSleepScope {
+    Process,
+    Thread,
+}
+
+#[derive(Clone)]
+struct CpuClockSleepTarget {
+    task: AxTaskRef,
+    scope: CpuSleepScope,
+    which: i32,
+}
+
+impl CpuClockSleepTarget {
+    fn now(&self) -> TimeValue {
+        let usage = match self.scope {
+            CpuSleepScope::Process => self.task.as_thread().proc_data.self_usage(),
+            CpuSleepScope::Thread => TaskUsage::from_thread(self.task.as_thread()),
+        };
+        match self.which {
+            CPUCLOCK_VIRT => usage.utime(),
+            CPUCLOCK_PROF | CPUCLOCK_SCHED => usage.utime() + usage.stime(),
+            // Construction has already rejected this; retain a total function
+            // so a corrupted internal value cannot cause a waiter to spin.
+            _ => TimeValue::ZERO,
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        match self.scope {
+            CpuSleepScope::Thread => self.task.as_thread().pending_exit(),
+            // A process CPU clock remains live while sibling threads run;
+            // only the group-exit gate terminates the shared accounting
+            // domain.
+            CpuSleepScope::Process => {
+                self.task.as_thread().proc_data.group_exit_in_progress()
+                    || self.task.as_thread().proc_data.proc.is_zombie()
+            }
+        }
+    }
+}
+
+fn decode_cpu_sleep_clock(clock_id: __kernel_clockid_t) -> AxResult<(CpuSleepScope, u32, i32)> {
+    match clock_id as u32 {
+        CLOCK_PROCESS_CPUTIME_ID => return Ok((CpuSleepScope::Process, 0, CPUCLOCK_SCHED)),
+        CLOCK_THREAD_CPUTIME_ID => return Ok((CpuSleepScope::Thread, 0, CPUCLOCK_SCHED)),
+        _ => {}
+    }
+
+    if clock_id >= 0 || (clock_id & CLOCKFD_MASK) == CLOCKFD {
+        return Err(AxError::InvalidInput);
+    }
+    let which = clock_id & CPUCLOCK_CLOCK_MASK;
+    if which >= CPUCLOCK_MAX {
+        return Err(AxError::InvalidInput);
+    }
+    let id = !(clock_id >> 3);
+    if id < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok((
+        if clock_id & CPUCLOCK_PERTHREAD_MASK != 0 {
+            CpuSleepScope::Thread
+        } else {
+            CpuSleepScope::Process
+        },
+        id as u32,
+        which,
+    ))
+}
+
+fn resolve_cpu_clock_sleep_target(clock_id: __kernel_clockid_t) -> AxResult<CpuClockSleepTarget> {
+    let (scope, id, which) = decode_cpu_sleep_clock(clock_id)?;
+    let task = if id == 0 {
+        current().clone()
+    } else {
+        get_task(id)?
+    };
+
+    match scope {
+        CpuSleepScope::Process => {
+            // CPU-clock access is ptrace-style just like perf's task clock.
+            // The returned target Arc pins ProcessData through the sleep while
+            // the permission decision is made against one coherent image.
+            check_current_process_ptrace_access(
+                &task.as_thread().proc_data,
+                PtraceAccessMode::ReadReal,
+            )?;
+        }
+        CpuSleepScope::Thread => {
+            if task.as_thread().pending_exit() {
+                return Err(AxError::NoSuchProcess);
+            }
+            check_current_thread_ptrace_image_access(task.as_thread(), PtraceAccessMode::ReadReal)?;
+        }
+    }
+
+    Ok(CpuClockSleepTarget { task, scope, which })
+}
+
+fn sleep_cpu_clock_until(
+    target: &CpuClockSleepTarget,
+    deadline: TimeValue,
+) -> AxResult<ClockSleepOutcome> {
+    let waited = with_proc_state_hint(ProcStateHint::Interruptible, || {
+        block_on_poll_set_interruptible_if(
+            cpu_clock_sleep_waiters(),
+            || {
+                if target.is_terminal() {
+                    Err(AxError::NoSuchProcess)
+                } else if target.now() >= deadline {
+                    Ok(())
+                } else {
+                    Err(AxError::WouldBlock)
+                }
+            },
+            || {
+                matches!(
+                    current_clock_sleep_interrupt_disposition(),
+                    ClockSleepInterruptDisposition::Return
+                )
+            },
+        )
+    });
+    match waited {
+        Ok(()) => Ok(ClockSleepOutcome::Completed),
+        Err(AxError::Interrupted) => Ok(ClockSleepOutcome::Interrupted),
+        Err(error) => Err(error),
+    }
+}
+
 /// Sleep some nanoseconds
 pub fn sys_nanosleep<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
@@ -773,12 +929,16 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
     let clock = match clock_id as u32 {
         CLOCK_REALTIME => AlarmClock::Realtime,
         CLOCK_MONOTONIC | CLOCK_BOOTTIME => AlarmClock::Monotonic,
-        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => {
-            return Err(AxError::OperationNotSupported);
-        }
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => AlarmClock::Monotonic,
         _ => {
-            warn!("Unsupported clock_id: {clock_id}");
-            return Err(AxError::InvalidInput);
+            // Negative non-CLOCKFD values may be Linux's encoded CPU clocks.
+            // Resolve them below after user input is copied, so all CPU-clock
+            // variants share target lifetime and permission semantics.
+            if clock_id >= 0 {
+                warn!("Unsupported clock_id: {clock_id}");
+                return Err(AxError::InvalidInput);
+            }
+            AlarmClock::Monotonic
         }
     };
 
@@ -790,18 +950,41 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
     .try_into_time_value()?;
     debug!("sys_clock_nanosleep <= clock_id: {clock_id}, flags: {flags}, req: {req:?}");
 
+    if matches!(
+        clock_id as u32,
+        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID
+    ) || clock_id < 0
+    {
+        let target = resolve_cpu_clock_sleep_target(clock_id)?;
+        let start = target.now();
+        let deadline = if absolute {
+            req
+        } else {
+            start.checked_add(req).unwrap_or(Duration::MAX)
+        };
+        let outcome = sleep_cpu_clock_until(&target, deadline)?;
+        return match outcome {
+            ClockSleepOutcome::Completed => Ok(0),
+            ClockSleepOutcome::Interrupted if absolute || target.now() >= deadline => Ok(0),
+            ClockSleepOutcome::Interrupted => {
+                let actual = target.now() - start;
+                if let Some(diff) = remaining_relative_sleep(req, actual)
+                    && !rem.is_null()
+                {
+                    unsafe {
+                        VmMutPtr::vm_write_unchecked(rem, memory, timespec::from_time_value(diff))
+                            .map_err(map_usercopy_error)?;
+                    }
+                }
+                Err(AxError::Interrupted)
+            }
+        };
+    }
+
     if absolute {
         let deadline = match clock_id as u32 {
-            CLOCK_MONOTONIC => current()
-                .as_thread()
-                .proc_data
-                .time_ns()
-                .host_monotonic_deadline(req),
-            CLOCK_BOOTTIME => current()
-                .as_thread()
-                .proc_data
-                .time_ns()
-                .host_boottime_deadline(req),
+            CLOCK_MONOTONIC => current().as_thread().time_ns().host_monotonic_deadline(req),
+            CLOCK_BOOTTIME => current().as_thread().time_ns().host_boottime_deadline(req),
             _ => req,
         };
         let outcome = sleep_absolute(clock, deadline)?;
@@ -1013,44 +1196,65 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
         return Err(AxError::InvalidInput);
     }
 
-    let attr = read_sched_attr(memory, attr)?;
-    if (attr.sched_policy as i32) < 0 {
-        return Err(AxError::InvalidInput);
-    }
-    let keep_policy = attr.sched_flags & SCHED_FLAG_KEEP_POLICY as u64 != 0;
-    let keep_params = attr.sched_flags & SCHED_FLAG_KEEP_PARAMS as u64 != 0;
+    let (attr, supplied_size, tail_nonzero) = read_sched_attr(memory, attr)?;
     let task = if pid == 0 {
         current().clone()
     } else {
-        let caller_pid_ns = current().as_thread().proc_data.pid_ns();
+        let caller_pid_ns = current().as_thread().pid_ns();
         visible_live_task_for_getpriority(pid as Pid, &caller_pid_ns)
             .filter(|task| !task.as_thread().pending_exit())
             .ok_or(AxError::NoSuchProcess)?
     };
-    if attr.sched_flags & !SCHED_ATTR_KNOWN_FLAGS != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if attr.sched_flags & (SCHED_FLAG_UTIL_CLAMP_MIN | SCHED_FLAG_UTIL_CLAMP_MAX) != 0
-        && (attr.size as usize) < size_of::<SchedAttr>()
-    {
-        return Err(AxError::InvalidInput);
-    }
-    let requested_class = if keep_policy {
-        None
-    } else {
-        if attr.sched_policy == SCHED_DEADLINE {
-            validate_deadline_parameters(&attr)?;
-        }
-        Some(sched_class_for_set(attr.sched_policy, SchedSetAbi::Attr)?)
-    };
-    let reset_on_fork = attr.sched_flags & SUPPORTED_SCHED_ATTR_FLAGS != 0;
     let (actor_task, actor_cred) = scheduler_actor_snapshot();
-    let result = update_sched_attr_versioned(&task, |old| {
-        let class = requested_class.unwrap_or(old.state.class);
+    // Cgroup/system policy is sampled before the scheduler transaction.  In
+    // particular, do not acquire cgroup locks from the runqueue-owned closure.
+    let uclamp_constraints =
+        crate::pseudofs::cgroup::uclamp_constraints_for_pid(task.as_thread().proc_data.proc.pid());
+    let result = update_task_scheduling(&task, |old| {
+        let old_policy = linux_policy_from_class(old.state.class, false) as u32;
+        let before = linux_sched::SchedSnapshot {
+            policy: old_policy,
+            nice: old.state.nice as i32,
+            priority: old.state.rt_priority as u32,
+            reset_on_fork: old.reset_on_spawn,
+            util_min: old.uclamp.minimum as u32,
+            util_max: old.uclamp.maximum as u32,
+            util_min_user_defined: old.uclamp.minimum_user_defined,
+            util_max_user_defined: old.uclamp.maximum_user_defined,
+        };
+        let plan = linux_sched::plan(
+            linux_sched::SchedInput {
+                attr: linux_sched::SchedAttr {
+                    size: attr.size,
+                    policy: attr.sched_policy,
+                    flags: attr.sched_flags,
+                    nice: attr.sched_nice,
+                    priority: attr.sched_priority,
+                    runtime: attr.sched_runtime,
+                    deadline: attr.sched_deadline,
+                    period: attr.sched_period,
+                    util_min: attr.sched_util_min,
+                    util_max: attr.sched_util_max,
+                },
+                supplied_size,
+                tail_nonzero,
+            },
+            before,
+            linux_sched::FeatureSet {
+                deadline: true,
+                util_clamp: true,
+                reclaim: false,
+                dl_overrun: false,
+            },
+        )
+        .map_err(map_sched_reject)?;
+        let class = sched_class_for_set(plan.policy, SchedSetAbi::Attr)?;
         let target_cred = scheduler_target_credential(&actor_task, &actor_cred, &task)?;
-        let target_thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
-        let rlimit_rtprio = target_thread.proc_data.rlim.read()[RLIMIT_RTPRIO].current;
-        let rlimit_nice = target_thread.proc_data.rlim.read()[RLIMIT_NICE].current;
+        task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+        let actor_limits = actor_task.as_thread().proc_data.rlim.read();
+        let rlimit_rtprio = actor_limits[RLIMIT_RTPRIO].current;
+        let rlimit_nice = actor_limits[RLIMIT_NICE].current;
+        drop(actor_limits);
         let mut state = old.state;
         let old_class = state.class;
         let old_nice = state.nice;
@@ -1066,49 +1270,13 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
         let authority = SchedulerAuthoritySnapshot::new(actor_cred.clone(), target_cred);
         match class {
             SchedClass::Fifo | SchedClass::RoundRobin => {
-                state.rt_priority = if keep_params {
-                    validate_rt_priority(old_rt_priority as i32)?
-                } else {
-                    if attr.sched_runtime != 0 || attr.sched_deadline != 0 || attr.sched_period != 0
-                    {
-                        return Err(AxError::InvalidInput);
-                    }
-                    validate_rt_priority(attr.sched_priority as i32)?
-                };
+                state.rt_priority = plan.priority as u8;
             }
             SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
-                if keep_params {
-                    validate_static_priority(0)?;
-                } else {
-                    if attr.sched_runtime != 0 {
-                        return Err(AxError::OperationNotSupported);
-                    }
-                    if attr.sched_deadline != 0 || attr.sched_period != 0 {
-                        return Err(AxError::InvalidInput);
-                    }
-                    validate_static_priority(attr.sched_priority as i32)?;
-                }
                 state.rt_priority = 0;
-                state.nice = if keep_params {
-                    old_nice
-                } else {
-                    validate_nice(attr.sched_nice)?
-                };
+                state.nice = plan.nice as i8;
             }
             SchedClass::Deadline => {
-                let deadline = if keep_params {
-                    old.deadline
-                } else {
-                    validate_deadline_parameters(&attr)?;
-                    DeadlineConfig {
-                        runtime_ns: attr.sched_runtime,
-                        deadline_ns: attr.sched_deadline,
-                        period_ns: attr.sched_period,
-                    }
-                };
-                if deadline.normalized_linux().is_none() {
-                    return Err(AxError::InvalidInput);
-                }
                 state.rt_priority = 0;
                 state.nice = 0;
             }
@@ -1131,52 +1299,48 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
             current_nice: old_nice,
             requested_nice: state.nice,
             rlimit_nice,
-            current_reset_on_fork: old.reset_on_fork,
-            reset_on_fork,
+            current_reset_on_fork: old.reset_on_spawn,
+            reset_on_fork: plan.reset_on_fork,
         })?;
-        let util_min = if attr.sched_flags & SCHED_FLAG_UTIL_CLAMP_MIN != 0 {
-            attr.sched_util_min
-        } else {
-            old.util_min
-        };
-        let util_max = if attr.sched_flags & SCHED_FLAG_UTIL_CLAMP_MAX != 0 {
-            attr.sched_util_max
-        } else {
-            old.util_max
-        };
-        if util_min > util_max || util_max > 1024 {
-            return Err(AxError::InvalidInput);
-        }
-        let fair_runtime_ns = match class {
+        let requested_slice = match class {
             SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
-                if keep_params {
-                    old.fair_runtime_ns
+                if attr.sched_flags & linux_sched::SCHED_FLAG_KEEP_PARAMS != 0 {
+                    old.requested_slice
                 } else {
-                    0
+                    RequestedSlice::profile_default()
                 }
             }
-            SchedClass::Fifo | SchedClass::RoundRobin | SchedClass::Deadline => 0,
+            SchedClass::Fifo | SchedClass::RoundRobin | SchedClass::Deadline => {
+                RequestedSlice::profile_default()
+            }
         };
         let deadline = if matches!(class, SchedClass::Deadline) {
-            if keep_params {
+            if attr.sched_flags & linux_sched::SCHED_FLAG_KEEP_PARAMS != 0 {
                 old.deadline
             } else {
-                DeadlineConfig {
-                    runtime_ns: attr.sched_runtime,
-                    deadline_ns: attr.sched_deadline,
-                    period_ns: attr.sched_period,
+                let deadline = plan.deadline.expect("deadline planner returned parameters");
+                DeadlineParameters {
+                    runtime_ns: deadline.runtime,
+                    deadline_ns: deadline.deadline,
+                    period_ns: deadline.period,
                 }
             }
         } else {
-            DeadlineConfig::default()
+            DeadlineParameters::default()
         };
-        Ok::<_, AxError>(TaskSchedAttrUpdate {
+        let uclamp = axtask::UclampRequest {
+            minimum: plan.uclamp.min as u16,
+            maximum: plan.uclamp.max as u16,
+            minimum_user_defined: plan.uclamp.min_user_defined,
+            maximum_user_defined: plan.uclamp.max_user_defined,
+        };
+        Ok::<_, AxError>(TaskSchedulingUpdate {
             state,
-            reset_on_fork,
-            fair_runtime_ns,
+            reset_on_spawn: plan.reset_on_fork,
+            requested_slice,
             deadline,
-            util_min,
-            util_max,
+            utilization_bounds: uclamp_constraints.effective(uclamp, state.class),
+            uclamp,
         })
     });
     match result {
@@ -1188,6 +1352,8 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
         Err(error) => Err(map_sched_error(error)),
     }
 }
+
+type SchedAttrSnapshot = (SchedState, bool, u64, u64, u64, u64, u32, u32);
 
 enum SchedGetAttrTarget {
     Live(AxTaskRef),
@@ -1208,19 +1374,19 @@ impl SchedGetAttrTarget {
         }
     }
 
-    fn snapshot(&self) -> AxResult<(SchedState, bool, u64, u64, u64, u64, u32, u32)> {
+    fn snapshot(&self) -> AxResult<SchedAttrSnapshot> {
         match self {
-            Self::Live(task) => scheduler_attr_snapshot(task)
+            Self::Live(task) => task_scheduling_snapshot(task)
                 .map(|snapshot| {
                     (
-                        snapshot.commit.state,
-                        snapshot.commit.reset_on_fork,
-                        snapshot.fair_runtime_ns,
-                        snapshot.deadline_runtime_ns,
-                        snapshot.deadline_ns,
-                        snapshot.period_ns,
-                        snapshot.util_min,
-                        snapshot.util_max,
+                        snapshot.state,
+                        snapshot.reset_on_spawn,
+                        snapshot.requested_slice.as_nanos().unwrap_or(0),
+                        snapshot.deadline.runtime_ns,
+                        snapshot.deadline.deadline_ns,
+                        snapshot.deadline.period_ns,
+                        snapshot.uclamp.minimum as u32,
+                        snapshot.uclamp.maximum as u32,
                     )
                 })
                 .map_err(|error| match error {
@@ -1243,8 +1409,8 @@ impl SchedGetAttrTarget {
                     0,
                     0,
                     0,
-                    0,
-                    0,
+                    snapshot.uclamp_min as u32,
+                    snapshot.uclamp_max as u32,
                 ))
             }
         }
@@ -1261,7 +1427,8 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
     let out_size = size as usize;
     if attr.is_null()
         || pid < 0
-        || !(SCHED_ATTR_SIZE_VER0..=SCHED_ATTR_MAX_SIZE).contains(&out_size)
+        || !(linux_sched::SCHED_ATTR_SIZE_VER0 as usize..=linux_sched::SCHED_ATTR_MAX_SIZE as usize)
+            .contains(&out_size)
         || flags != 0
     {
         return Err(AxError::InvalidInput);
@@ -1270,7 +1437,7 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
     let target = if pid == 0 {
         SchedGetAttrTarget::Live(current().clone())
     } else {
-        let caller_pid_ns = current().as_thread().proc_data.pid_ns();
+        let caller_pid_ns = current().as_thread().pid_ns();
         if let Some(task) = visible_live_task_for_getpriority(pid as Pid, &caller_pid_ns) {
             SchedGetAttrTarget::Live(task)
         } else {
@@ -1297,7 +1464,7 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
         size: out_size.min(size_of::<SchedAttr>()) as u32,
         sched_policy: linux_policy_from_state(state, reset_on_fork) as u32 & !SCHED_RESET_ON_FORK,
         sched_flags: if reset_on_fork {
-            SUPPORTED_SCHED_ATTR_FLAGS
+            linux_sched::SCHED_FLAG_RESET_ON_FORK
         } else {
             0
         },
@@ -1313,7 +1480,7 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
         sched_util_min: util_min,
         sched_util_max: util_max,
     };
-    out.sched_flags &= SUPPORTED_SCHED_ATTR_FLAGS;
+    out.sched_flags &= linux_sched::SCHED_FLAG_ALL;
 
     memory
         .validate_write_range(attr as usize, out_size)
@@ -1378,11 +1545,9 @@ fn process_pid_ns_for_getpriority(process: &Arc<Process>) -> Option<Arc<PidNames
     if process.is_zombie() {
         return zombie_pid_ns(process);
     }
-    process.thread_ids().find_map(|tid| {
-        get_task(tid)
-            .ok()
-            .map(|task| task.as_thread().proc_data.pid_ns())
-    })
+    process
+        .thread_ids()
+        .find_map(|tid| get_task(tid).ok().map(|task| task.as_thread().pid_ns()))
 }
 
 fn getpriority_group_nice(
@@ -1429,7 +1594,7 @@ fn getpriority_group_nice(
                 continue;
             };
             let thread = task.as_thread();
-            if caller_pid_ns.contains(&thread.proc_data.pid_ns()) {
+            if caller_pid_ns.contains(&thread.pid_ns()) {
                 record_lower_nice(&mut best, sched_state(&task).nice);
             }
         }
@@ -1470,7 +1635,7 @@ fn getpriority_user_nice(
                 continue;
             };
             let thread = task.as_thread();
-            if caller_pid_ns.contains(&thread.proc_data.pid_ns())
+            if caller_pid_ns.contains(&thread.pid_ns())
                 && getpriority_matches_real_uid(&thread.real_uid(), &uid)
             {
                 record_lower_nice(&mut best, sched_state(&task).nice);
@@ -1486,7 +1651,7 @@ pub fn sys_getpriority(which: usize, who: usize) -> AxResult<isize> {
     debug!("sys_getpriority <= which: {which}, who: {who}");
 
     let caller_task = current().clone();
-    let caller_pid_ns = caller_task.as_thread().proc_data.pid_ns();
+    let caller_pid_ns = caller_task.as_thread().pid_ns();
     match which as u32 {
         PRIO_PROCESS => {
             let nice = if who == 0 {
@@ -1559,7 +1724,7 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
     }
     let new_nice = clamp_nice(prio);
     let (actor_task, actor_cred) = scheduler_actor_snapshot();
-    let caller_pid_ns = actor_task.as_thread().proc_data.pid_ns();
+    let caller_pid_ns = actor_task.as_thread().pid_ns();
     let mut result = Err(AxError::NoSuchProcess);
     match which as u32 {
         PRIO_PROCESS => {
@@ -1603,7 +1768,7 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
                 for tid in process.thread_ids() {
                     if let Ok(task) = get_task(tid)
                         && !task.as_thread().pending_exit()
-                        && caller_pid_ns.contains(&task.as_thread().proc_data.pid_ns())
+                        && caller_pid_ns.contains(&task.as_thread().pid_ns())
                     {
                         setpriority_one(&mut result, &actor_task, &actor_cred, task, new_nice);
                     }
@@ -1628,8 +1793,7 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
                         continue;
                     };
                     let thread = task.as_thread();
-                    if thread.pending_exit() || !caller_pid_ns.contains(&thread.proc_data.pid_ns())
-                    {
+                    if thread.pending_exit() || !caller_pid_ns.contains(&thread.pid_ns()) {
                         continue;
                     }
                     if thread.current_cred().ids().ruid == uid {
@@ -1712,6 +1876,13 @@ fn ioprio_for_task(task: &AxTaskRef) -> AxResult<u16> {
     }
 }
 
+/// Captures the submitting task's effective Linux I/O priority for an
+/// operation queue.  CLASS_NONE is resolved through the scheduler class/nice
+/// default here, before a kernel worker takes ownership of the operation.
+pub(crate) fn current_effective_ioprio() -> AxResult<u16> {
+    ioprio_for_task(&current())
+}
+
 fn ioprio_raw_for_task(task: &AxTaskRef) -> AxResult<u16> {
     task.try_as_thread()
         .ok_or(AxError::NoSuchProcess)
@@ -1769,7 +1940,7 @@ impl IoprioTarget {
 
 fn visible_tid_in_namespace(task: &AxTaskRef, caller_pid_ns: &Arc<PidNamespace>) -> Option<Pid> {
     let thread = task.try_as_thread()?;
-    let target_pid_ns = thread.proc_data.pid_ns();
+    let target_pid_ns = thread.pid_ns();
     // After non-leader exec the visible TID is intentionally rebound to the
     // process PID. Otherwise use the immutable kernel TID so PID-namespace
     // init (whose vpid is one) is rendered correctly.
@@ -1861,7 +2032,7 @@ fn ioprio_multi_targets(
     actor_task: &AxTaskRef,
     actor_cred: &Cred,
 ) -> AxResult<Vec<IoprioTarget>> {
-    let caller_pid_ns = actor_task.as_thread().proc_data.pid_ns();
+    let caller_pid_ns = actor_task.as_thread().pid_ns();
     let tasks = try_tasks()?;
     let mut targets = Vec::new();
     match which {
@@ -1880,7 +2051,7 @@ fn ioprio_multi_targets(
                     let group = thread.proc_data.proc.group();
                     if visible_process_pid_in_namespace(
                         group.pgid(),
-                        &thread.proc_data.pid_ns(),
+                        &thread.pid_ns(),
                         &caller_pid_ns,
                     ) == Some(who)
                     {
@@ -1913,7 +2084,7 @@ fn ioprio_multi_targets(
             let target_group = target_group.ok_or(AxError::NoSuchProcess)?;
             for task in tasks {
                 let thread = task.as_thread();
-                if !caller_pid_ns.contains(&thread.proc_data.pid_ns()) {
+                if !caller_pid_ns.contains(&thread.pid_ns()) {
                     continue;
                 }
                 let group = thread.proc_data.proc.group();
@@ -1943,7 +2114,7 @@ fn ioprio_multi_targets(
             };
             for task in tasks {
                 let thread = task.as_thread();
-                if caller_pid_ns.contains(&thread.proc_data.pid_ns()) && thread.real_uid() == uid {
+                if caller_pid_ns.contains(&thread.pid_ns()) && thread.real_uid() == uid {
                     targets.push(IoprioTarget::Live(task));
                 }
             }
@@ -1989,7 +2160,7 @@ pub fn sys_ioprio_get(which: u32, who: u32) -> AxResult<isize> {
     debug!("sys_ioprio_get <= which: {which}, who: {who}");
     let actor_task = current().clone();
     let actor_cred = actor_task.as_thread().current_cred();
-    let caller_pid_ns = actor_task.as_thread().proc_data.pid_ns();
+    let caller_pid_ns = actor_task.as_thread().pid_ns();
     match which {
         IOPRIO_WHO_PROCESS => {
             Ok(ioprio_process_target(who, &actor_task, &caller_pid_ns)?.raw_priority()? as isize)
@@ -2013,7 +2184,7 @@ pub fn sys_ioprio_set(which: u32, who: u32, ioprio: u32) -> AxResult<isize> {
     debug!("sys_ioprio_set <= which: {which}, who: {who}, ioprio: {ioprio:#x}");
     let actor_task = current().clone();
     let actor_cred = actor_task.as_thread().current_cred();
-    let caller_pid_ns = actor_task.as_thread().proc_data.pid_ns();
+    let caller_pid_ns = actor_task.as_thread().pid_ns();
     // Linux validates the requested class/capability before selecting a
     // target, so an invalid realtime request wins over target lookup errors.
     validate_ioprio(&actor_cred, ioprio)?;

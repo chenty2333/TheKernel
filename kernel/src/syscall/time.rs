@@ -16,6 +16,7 @@ use linux_raw_sys::general::{
     TIMER_ABSTIME, itimerspec, itimerval, timespec, timeval, timezone,
 };
 use thekernel_linux_signal::Signo;
+use thekernel_linux_time as linux_time;
 use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::{
@@ -23,8 +24,8 @@ use crate::{
     syscall::RawSigevent,
     task::{
         AlarmClock, AlarmTokenReserveError, AsThread, ITimerType, PosixTimer, PosixTimerClock,
-        PosixTimerNotify, TaskUsage, get_process_itimer, get_task, poll_timer, set_process_itimer,
-        times_clock_ticks,
+        PosixTimerNotify, TaskUsage, get_process_itimer, get_task, poll_timer,
+        refresh_posix_cpu_timer_armed, set_process_itimer, times_clock_ticks,
     },
     time::{TimeValueLike, set_wall_time, wall_time, wall_time_nanos},
 };
@@ -41,38 +42,6 @@ enum ClockDomain {
 }
 
 const DEFAULT_TAI_OFFSET_SECS: u64 = 37;
-const ADJ_OFFSET: u32 = 0x0001;
-const ADJ_FREQUENCY: u32 = 0x0002;
-const ADJ_MAXERROR: u32 = 0x0004;
-const ADJ_ESTERROR: u32 = 0x0008;
-const ADJ_STATUS: u32 = 0x0010;
-const ADJ_TIMECONST: u32 = 0x0020;
-const ADJ_MICRO: u32 = 0x1000;
-const ADJ_NANO: u32 = 0x2000;
-const ADJ_TICK: u32 = 0x4000;
-const ADJ_OFFSET_SINGLESHOT: u32 = 0x8001;
-const ADJ_OFFSET_SS_READ: u32 = 0xa001;
-const ADJ_ALL: u32 = ADJ_OFFSET
-    | ADJ_FREQUENCY
-    | ADJ_MAXERROR
-    | ADJ_ESTERROR
-    | ADJ_STATUS
-    | ADJ_TIMECONST
-    | ADJ_TICK;
-
-const STA_PLL: i32 = 0x0001;
-const STA_PPSFREQ: i32 = 0x0002;
-const STA_PPSTIME: i32 = 0x0004;
-const STA_FLL: i32 = 0x0008;
-const STA_INS: i32 = 0x0010;
-const STA_DEL: i32 = 0x0020;
-const STA_UNSYNC: i32 = 0x0040;
-const STA_FREQHOLD: i32 = 0x0080;
-const STA_NANO: i32 = 0x2000;
-const STA_MODE: i32 = 0x4000;
-
-const TIME_OK: isize = 0;
-const TIME_ERROR: isize = 5;
 const CPUCLOCK_PROF: i32 = 0;
 const CPUCLOCK_VIRT: i32 = 1;
 const CPUCLOCK_SCHED: i32 = 2;
@@ -81,18 +50,6 @@ const CPUCLOCK_PERTHREAD_MASK: i32 = 4;
 const CPUCLOCK_CLOCK_MASK: i32 = 3;
 const CLOCKFD: i32 = CPUCLOCK_MAX;
 const CLOCKFD_MASK: i32 = CPUCLOCK_PERTHREAD_MASK | CPUCLOCK_CLOCK_MASK;
-
-const TIMEX_SETTABLE_STATUS_BITS: i32 = STA_PLL
-    | STA_PPSFREQ
-    | STA_PPSTIME
-    | STA_FLL
-    | STA_INS
-    | STA_DEL
-    | STA_UNSYNC
-    | STA_FREQHOLD
-    | STA_MODE;
-const TIMEX_SETTABLE_BIT_MODES: u32 = ADJ_ALL | ADJ_MICRO | ADJ_NANO;
-const ADJ_SINGLESHOT_FLAG: u32 = ADJ_OFFSET_SINGLESHOT & !ADJ_OFFSET;
 
 fn clock_domain(clock_id: __kernel_clockid_t) -> AxResult<ClockDomain> {
     if let Some(clock) = decode_cpu_clock_id(clock_id) {
@@ -129,23 +86,23 @@ fn fine_clock_resolution() -> TimeValue {
 
 fn clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
     match clock_id as u32 {
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_COARSE => {
             let now = match clock_id as u32 {
                 CLOCK_MONOTONIC_COARSE => {
                     quantize_clock_reading(monotonic_time(), coarse_clock_resolution())
                 }
                 _ => monotonic_time(),
             };
-            return Ok(current()
-                .as_thread()
-                .proc_data
-                .time_ns()
-                .apply_monotonic_offset(now));
+            return Ok(current().as_thread().time_ns().apply_monotonic_offset(now));
         }
+        // CLOCK_MONOTONIC_RAW is intentionally outside time-namespace
+        // virtualization.  Its contract is the raw hardware monotonic
+        // timeline; applying the namespace offset here makes it disagree
+        // with Linux and defeats clock-domain comparison by userspace.
+        CLOCK_MONOTONIC_RAW => return Ok(monotonic_time()),
         CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => {
             return Ok(current()
                 .as_thread()
-                .proc_data
                 .time_ns()
                 .apply_boottime_offset(monotonic_time()));
         }
@@ -165,9 +122,7 @@ fn clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
         )),
         ClockDomain::ProcessCpu => cpu_clock_now(clock_id),
         ClockDomain::ThreadCpu => cpu_clock_now(clock_id),
-        ClockDomain::Tai => Ok(TimeValue::from_nanos(
-            wall_time_nanos() + DEFAULT_TAI_OFFSET_SECS * NANOS_PER_SEC,
-        )),
+        ClockDomain::Tai => Ok(tai_time()),
     }
 }
 
@@ -220,52 +175,49 @@ pub struct KernelOldTimex {
 
 #[derive(Clone, Copy, Debug)]
 struct TimexState {
-    offset: i64,
-    freq: i64,
-    maxerror: i64,
-    esterror: i64,
-    status: i32,
-    constant: i64,
-    precision: i64,
-    tolerance: i64,
-    tick: i64,
-    tai: i32,
+    version: u64,
+    value: linux_time::Timex,
 }
 
 impl TimexState {
     const fn new() -> Self {
         Self {
-            offset: 0,
-            freq: 0,
-            maxerror: 0,
-            esterror: 0,
-            status: 0,
-            constant: 0,
-            precision: 1,
-            tolerance: 0,
-            tick: (1_000_000 / axconfig::TICKS_PER_SEC as u64) as i64,
-            tai: DEFAULT_TAI_OFFSET_SECS as i32,
-        }
-    }
-
-    fn resolution_mode(self) -> u32 {
-        if self.status & STA_NANO != 0 {
-            ADJ_NANO
-        } else {
-            ADJ_MICRO
-        }
-    }
-
-    fn time_state(self) -> isize {
-        if self.status & STA_UNSYNC != 0 {
-            TIME_ERROR
-        } else {
-            TIME_OK
+            version: 0,
+            value: linux_time::Timex {
+                precision: 1,
+                tick: (1_000_000 / axconfig::TICKS_PER_SEC as u64) as i64,
+                tai: DEFAULT_TAI_OFFSET_SECS as i32,
+                ..linux_time::Timex::ZERO
+            },
         }
     }
 }
 
 static TIMEX_STATE: SpinNoIrq<TimexState> = SpinNoIrq::new(TimexState::new());
+/// Serializes an absolute CLOCK_TAI arm with the preallocated ADJ_TAI rebase
+/// transaction.  The timex lock is never held while timer owners are locked.
+pub(crate) static TAI_TIMER_REBASE_GATE: axsync::Mutex<()> = axsync::Mutex::new(());
+
+/// Returns the currently published TAI-minus-UTC offset.  `ADJ_TAI` updates
+/// the same timex state observed by CLOCK_TAI and POSIX TAI timers; keeping
+/// this in one accessor prevents successful clock_adjtime(2) calls from
+/// leaving a stale fixed offset in the read/timer paths.
+fn tai_offset_seconds() -> i64 {
+    TIMEX_STATE.lock().value.tai as i64
+}
+
+/// Snapshots the TAI offset and the timex publication generation together.
+/// Absolute CLOCK_TAI timers retain this pair so ADJ_TAI can reproject their
+/// realtime-heap deadline without perturbing relative arms.
+pub(crate) fn tai_offset_snapshot() -> (i64, u64) {
+    let state = TIMEX_STATE.lock();
+    (state.value.tai as i64, state.version)
+}
+
+pub(crate) fn tai_time() -> TimeValue {
+    let nanos = wall_time_nanos() as i128 + tai_offset_seconds() as i128 * NANOS_PER_SEC as i128;
+    TimeValue::from_nanos(nanos.clamp(0, u64::MAX as i128) as u64)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CpuClockTarget {
@@ -340,33 +292,6 @@ fn cpu_clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
     Ok(usage_value_for_cpu_clock(usage, decoded.which))
 }
 
-fn timex_tick_bounds() -> (i64, i64) {
-    let hz = axconfig::TICKS_PER_SEC as i64;
-    (900_000 / hz, 1_100_000 / hz)
-}
-
-fn timex_resolution_is_nanos(modes: u32, state: TimexState) -> bool {
-    if modes & ADJ_NANO != 0 {
-        true
-    } else if modes & ADJ_MICRO != 0 {
-        false
-    } else {
-        state.status & STA_NANO != 0
-    }
-}
-
-fn timex_modes_supported(modes: u32) -> bool {
-    match modes {
-        0 | ADJ_OFFSET_SINGLESHOT | ADJ_OFFSET_SS_READ => true,
-        _ if modes & ADJ_SINGLESHOT_FLAG != 0 => false,
-        _ => modes & !TIMEX_SETTABLE_BIT_MODES == 0,
-    }
-}
-
-fn timex_invalid_adjadjtime_mode(modes: u32) -> bool {
-    modes & ADJ_SINGLESHOT_FLAG != 0 && modes & ADJ_OFFSET == 0
-}
-
 fn clock_adjtime_is_realtime(clock_id: __kernel_clockid_t) -> AxResult<bool> {
     if clock_id < 0 {
         // Linux routes every negative non-CLOCKFD id through the CPU-clock
@@ -387,8 +312,18 @@ fn clock_adjtime_is_realtime(clock_id: __kernel_clockid_t) -> AxResult<bool> {
     }
 }
 
-fn fill_timex_output(timex: &mut KernelOldTimex, state: TimexState) {
-    timex.modes = state.resolution_mode();
+fn timex_tick_bounds() -> (i64, i64) {
+    let hz = axconfig::TICKS_PER_SEC as i64;
+    (900_000 / hz, 1_100_000 / hz)
+}
+
+fn fill_timex_output(timex: &mut KernelOldTimex, plan: linux_time::TimexRenderPlan) {
+    let state = plan.value;
+    timex.modes = if state.status & linux_time::STA_NANO != 0 {
+        linux_time::ADJ_NANO
+    } else {
+        linux_time::ADJ_MICRO
+    };
     timex.offset = state.offset;
     timex.freq = state.freq;
     timex.maxerror = state.maxerror;
@@ -410,69 +345,20 @@ fn fill_timex_output(timex: &mut KernelOldTimex, state: TimexState) {
     timex.tai = state.tai;
 }
 
-fn update_timex_state(state: &mut TimexState, timex: &KernelOldTimex) -> AxResult<()> {
-    let modes = timex.modes;
-
-    if !timex_modes_supported(modes) {
-        return Err(AxError::InvalidInput);
+fn timex_input(timex: &KernelOldTimex) -> linux_time::Timex {
+    linux_time::Timex {
+        modes: timex.modes,
+        offset: timex.offset,
+        freq: timex.freq,
+        maxerror: timex.maxerror,
+        esterror: timex.esterror,
+        status: timex.status,
+        constant: timex.constant,
+        precision: timex.precision,
+        tolerance: timex.tolerance,
+        tick: timex.tick,
+        tai: timex.tai,
     }
-
-    if modes & ADJ_MICRO != 0 {
-        state.status &= !STA_NANO;
-    }
-    if modes & ADJ_NANO != 0 {
-        state.status |= STA_NANO;
-    }
-
-    if modes & ADJ_STATUS != 0 {
-        if timex.status & !TIMEX_SETTABLE_STATUS_BITS != 0 {
-            return Err(AxError::InvalidInput);
-        }
-        state.status = (state.status & !TIMEX_SETTABLE_STATUS_BITS)
-            | (timex.status & TIMEX_SETTABLE_STATUS_BITS);
-    }
-
-    if modes & ADJ_OFFSET != 0 {
-        let limit = if timex_resolution_is_nanos(modes, *state) {
-            500_000_i64 * 1000
-        } else {
-            500_000_i64
-        };
-        if timex.offset <= -limit || timex.offset >= limit {
-            return Err(AxError::InvalidInput);
-        }
-        state.offset = timex.offset;
-    }
-
-    if modes & ADJ_FREQUENCY != 0 {
-        state.freq = timex.freq.clamp(-32_768_000, 32_768_000);
-    }
-
-    if modes & ADJ_MAXERROR != 0 {
-        state.maxerror = timex.maxerror;
-    }
-
-    if modes & ADJ_ESTERROR != 0 {
-        state.esterror = timex.esterror;
-    }
-
-    if modes & ADJ_TIMECONST != 0 {
-        state.constant = timex.constant;
-    }
-
-    if modes & ADJ_TICK != 0 {
-        let (min_tick, max_tick) = timex_tick_bounds();
-        if timex.tick < min_tick || timex.tick > max_tick {
-            return Err(AxError::InvalidInput);
-        }
-        state.tick = timex.tick;
-    }
-
-    if modes == ADJ_OFFSET_SINGLESHOT {
-        state.offset = timex.offset;
-    }
-
-    Ok(())
 }
 
 fn sys_do_clock_adjtime<M: UserMemory + ?Sized>(
@@ -489,36 +375,83 @@ fn sys_do_clock_adjtime<M: UserMemory + ?Sized>(
         return Err(AxError::OperationNotSupported);
     }
     let modes = timex.modes;
-    if timex_invalid_adjadjtime_mode(modes) {
-        return Err(AxError::InvalidInput);
-    }
     let privileged = current().as_thread().has_effective_capability(CAP_SYS_TIME);
 
-    if !privileged && modes != 0 && modes != ADJ_OFFSET_SS_READ {
+    if !privileged && modes != 0 && modes != linux_time::ADJ_OFFSET_SS_READ {
         return Err(AxError::OperationNotPermitted);
     }
 
-    let mut state = TIMEX_STATE.lock();
-    if modes != 0 && modes != ADJ_OFFSET_SS_READ {
-        update_timex_state(&mut state, &timex)?;
+    let _tai_timer_gate = TAI_TIMER_REBASE_GATE.lock();
+    let state = TIMEX_STATE.lock();
+    let previous_tai = state.value.tai;
+    let mut next_state = *state;
+    if modes != 0 {
+        let (tick_min, tick_max) = timex_tick_bounds();
+        let adjustment = linux_time::plan_adjust(
+            timex_input(&timex),
+            linux_time::TimexSnapshot {
+                version: next_state.version,
+                value: next_state.value,
+                tick_min,
+                tick_max,
+            },
+        )
+        .map_err(|_| AxError::InvalidInput)?;
+        if modes != linux_time::ADJ_OFFSET_SS_READ {
+            let committed = linux_time::commit_adjust(
+                adjustment,
+                linux_time::TimexSnapshot {
+                    version: next_state.version,
+                    value: next_state.value,
+                    tick_min,
+                    tick_max,
+                },
+            )
+            .map_err(|_| AxError::InvalidInput)?;
+            next_state.version = committed.version;
+            next_state.value = committed.value;
+        }
     }
 
-    fill_timex_output(&mut timex, *state);
+    let render = linux_time::render(linux_time::TimexSnapshot {
+        version: next_state.version,
+        value: next_state.value,
+        tick_min: 0,
+        tick_max: 0,
+    });
+    fill_timex_output(&mut timex, render);
+    let tai_rebase = (next_state.value.tai != previous_tai)
+        .then_some((next_state.version, next_state.value.tai));
+    // Timex and timer owners deliberately have opposing readers: firing and
+    // gettime sample the TAI state while holding a timer owner.  Prepare the
+    // complete allocation budget before publication, but never hold TIMEX
+    // while acquiring those owners.
+    drop(state);
+    let rebase_plan = tai_rebase
+        .map(|_| crate::task::prepare_tai_absolute_posix_timer_rebase())
+        .transpose()?;
+    let mut state = TIMEX_STATE.lock();
+    // The TAI gate excludes another adjusting writer, so the candidate built
+    // above remains current while the preflight allocation ran.
+    state.version = next_state.version;
+    state.value = next_state.value;
+    drop(state);
+    if let (Some((generation, offset_seconds)), Some(plan)) = (tai_rebase, rebase_plan) {
+        plan.apply(generation, offset_seconds as i64);
+    }
     // SAFETY: `timex` was initialized by the preceding copy-in and every
     // field update preserves its fully initialized object representation.
     unsafe { VmMutPtr::vm_write_unchecked(timex_ptr, memory, timex) }
         .map_err(map_usercopy_error)?;
-    Ok(state.time_state())
+    Ok(render.time_state as isize)
 }
 
 fn posix_timer_clock(clock_id: __kernel_clockid_t) -> AxResult<PosixTimerClock> {
     match clock_domain(clock_id)? {
         ClockDomain::Realtime | ClockDomain::RealtimeCoarse => Ok(PosixTimerClock::Realtime),
         ClockDomain::Monotonic | ClockDomain::MonotonicCoarse => Ok(PosixTimerClock::Monotonic),
-        // CPU-clock POSIX timers need an accounting-threshold owner, not a
-        // wall-monotonic alarm. Reject them honestly until that reusable
-        // mechanism exists instead of firing while the target is asleep.
-        ClockDomain::ProcessCpu | ClockDomain::ThreadCpu => Err(AxError::InvalidInput),
+        ClockDomain::ProcessCpu => Ok(PosixTimerClock::ProcessCpu),
+        ClockDomain::ThreadCpu => Ok(PosixTimerClock::ThreadCpu),
         ClockDomain::Tai => Ok(PosixTimerClock::Tai),
     }
 }
@@ -561,6 +494,14 @@ fn saturating_sub_duration(lhs: Duration, rhs: Duration) -> Duration {
     lhs.checked_sub(rhs).unwrap_or(Duration::ZERO)
 }
 
+fn tai_deadline_as_realtime(deadline: Duration, offset_seconds: i64) -> Duration {
+    if offset_seconds >= 0 {
+        saturating_sub_duration(deadline, duration_from_secs(offset_seconds as u64))
+    } else {
+        saturating_add_duration(deadline, duration_from_secs(offset_seconds.unsigned_abs()))
+    }
+}
+
 fn decode_timer_notify(event: Option<RawSigevent>) -> AxResult<PosixTimerNotify> {
     let Some(event) = event else {
         return Ok(PosixTimerNotify::Signal {
@@ -572,7 +513,7 @@ fn decode_timer_notify(event: Option<RawSigevent>) -> AxResult<PosixTimerNotify>
 
     match event.notify() as u32 {
         SIGEV_NONE => Ok(PosixTimerNotify::None),
-        SIGEV_SIGNAL | SIGEV_THREAD => {
+        SIGEV_SIGNAL => {
             let signo = decode_sigevent_signo(event.signo())?;
             Ok(PosixTimerNotify::Signal {
                 signo,
@@ -580,6 +521,11 @@ fn decode_timer_notify(event: Option<RawSigevent>) -> AxResult<PosixTimerNotify>
                 value: Some(event.value_ptr_address()),
             })
         }
+        // SIGEV_THREAD is a libc facility, not a kernel timer notification
+        // mode.  Glibc maps it to an internal SIGEV_THREAD_ID timer and runs
+        // the callback in userspace; accepting it here as a process-directed
+        // signal silently loses that contract.
+        SIGEV_THREAD => Err(AxError::InvalidInput),
         SIGEV_THREAD_ID => {
             let signo = decode_sigevent_signo(event.signo())?;
             let tid = event.thread_id();
@@ -605,13 +551,20 @@ fn timer_absolute_deadline(clock: PosixTimerClock, value: Duration) -> AxResult<
     Ok(match clock {
         PosixTimerClock::Realtime => value,
         PosixTimerClock::Tai => {
-            saturating_sub_duration(value, duration_from_secs(DEFAULT_TAI_OFFSET_SECS))
+            let offset = tai_offset_seconds();
+            if offset >= 0 {
+                saturating_sub_duration(value, duration_from_secs(offset as u64))
+            } else {
+                saturating_add_duration(value, duration_from_secs(offset.unsigned_abs()))
+            }
         }
         PosixTimerClock::Monotonic => current()
             .as_thread()
-            .proc_data
             .time_ns()
             .host_monotonic_deadline(value),
+        // CPU-clock absolute values are already expressed in their accounting
+        // domain; `timer_settime` arms them through PosixTimer::arm_cpu.
+        PosixTimerClock::ProcessCpu | PosixTimerClock::ThreadCpu => value,
     })
 }
 
@@ -627,21 +580,14 @@ fn timer_relative_deadline(value: Duration) -> Duration {
     saturating_add_duration(AlarmClock::Monotonic.now(), value)
 }
 
-fn timer_remaining(timer: &PosixTimer) -> Duration {
-    timer
-        .deadline
-        .map(|deadline| saturating_sub_duration(deadline, timer.effective_clock.now()))
-        .unwrap_or(Duration::ZERO)
-}
-
 /// Converts the process ITIMER_REAL remainder to the unsigned-seconds result
 /// required by alarm(2). Linux adds one second only for a sub-second remainder
 /// or one of at least 500ms, then returns the native unsigned-int low word.
 fn alarm_remaining_seconds_from_nanos(nanos: u128) -> u32 {
     let seconds = nanos / NANOS_PER_SEC as u128;
     let subsecond_nanos = nanos % NANOS_PER_SEC as u128;
-    let round_up = (seconds == 0 && subsecond_nanos != 0)
-        || subsecond_nanos >= (NANOS_PER_SEC / 2) as u128;
+    let round_up =
+        (seconds == 0 && subsecond_nanos != 0) || subsecond_nanos >= (NANOS_PER_SEC / 2) as u128;
     seconds.wrapping_add(u128::from(round_up)) as u32
 }
 
@@ -786,7 +732,9 @@ pub fn sys_timer_create<M: UserMemory + ?Sized>(
     // Main and optional signal-retry alarm leases are acquired atomically
     // before the timer ID becomes visible.  A published timer therefore never
     // needs a fallible alarm allocation during settime or periodic rearm.
-    let candidate = PosixTimer::try_new(clock, notify).map_err(map_posix_timer_admission_error)?;
+    let cpu_target_task = matches!(clock, PosixTimerClock::ThreadCpu).then(|| current().clone());
+    let candidate = PosixTimer::try_new(clock, notify, cpu_target_task, None, None)
+        .map_err(map_posix_timer_admission_error)?;
     let timerid = {
         let mut timers = proc_data.posix_timers.lock();
         if let Some((idx, slot)) = timers
@@ -852,6 +800,15 @@ pub fn sys_timer_settime<M: UserMemory + ?Sized>(
     let curr = current();
     let thr = curr.as_thread();
     let proc_data = thr.proc_data.clone();
+    // An absolute TAI arm must either be included in an in-flight ADJ_TAI
+    // rebase plan or observe the fully published newer offset.  Relative
+    // timers take this gate too to keep the timer-vector capacity proof
+    // simple and never hold it across a blocking operation.
+    let _tai_timer_gate = TAI_TIMER_REBASE_GATE.lock();
+    // Establish one accounting cutoff before sampling a CPU-clock deadline.
+    // This is a no-op for wall clocks and makes a relative CPU arm begin from
+    // all work already performed by the calling thread.
+    poll_timer(&curr);
 
     let (old_interval, old_remaining, retry_publication, main_publication) = {
         let mut timers = proc_data.posix_timers.lock();
@@ -861,13 +818,23 @@ pub fn sys_timer_settime<M: UserMemory + ?Sized>(
             .filter(|timer| timer.is_published())
             .ok_or(AxError::InvalidInput)?;
         let old_interval = timer.interval;
-        let old_remaining = timer_remaining(timer);
+        let old_remaining = timer.remaining(&proc_data);
         let sequence = timer.sequence.checked_add(1).ok_or(AxError::OutOfRange)?;
         let effective_clock = timer_effective_alarm_clock(timer.clock, absolute);
-        let deadline = if value.is_zero() {
+        let cpu_clock = timer.is_cpu_clock();
+        let tai_absolute =
+            matches!(timer.clock, PosixTimerClock::Tai) && absolute && !value.is_zero();
+        let tai_generation = tai_absolute.then(tai_offset_snapshot);
+        let deadline = if cpu_clock {
+            timer.arm_cpu(&proc_data, absolute, value)?;
+            None
+        } else if value.is_zero() {
             None
         } else if absolute {
-            Some(timer_absolute_deadline(timer.clock, value)?)
+            Some(match tai_generation {
+                Some((offset_seconds, _)) => tai_deadline_as_realtime(value, offset_seconds),
+                None => timer_absolute_deadline(timer.clock, value)?,
+            })
         } else {
             Some(timer_relative_deadline(value))
         };
@@ -876,6 +843,10 @@ pub fn sys_timer_settime<M: UserMemory + ?Sized>(
         timer.interval = interval;
         timer.sequence = sequence;
         timer.effective_clock = effective_clock;
+        timer.set_tai_absolute_deadline(
+            tai_absolute.then_some(value),
+            tai_generation.map_or(0, |(_, generation)| generation),
+        );
         timer.deadline = deadline;
         let main_publication = if let Some(deadline) = deadline {
             timer.prepare_main_alarm(
@@ -898,6 +869,15 @@ pub fn sys_timer_settime<M: UserMemory + ?Sized>(
 
     retry_publication.publish();
     main_publication.publish();
+    refresh_posix_cpu_timer_armed(&proc_data);
+    if proc_data
+        .process_itimer_cpu_armed
+        .load(core::sync::atomic::Ordering::Acquire)
+        != 0
+        && let Some(cpu) = crate::task::request_process_cpu_evaluation(&proc_data)
+    {
+        crate::deferred_work::wake_process_timer_worker(cpu);
+    }
 
     if !old_value.is_null() {
         write_timer_spec(
@@ -930,7 +910,7 @@ pub fn sys_timer_gettime<M: UserMemory + ?Sized>(
             .and_then(Option::as_ref)
             .filter(|timer| timer.is_published())
             .ok_or(AxError::InvalidInput)?;
-        (timer.interval, timer_remaining(timer))
+        (timer.interval, timer.remaining(&proc_data))
     };
 
     write_timer_spec(
@@ -981,6 +961,7 @@ pub fn sys_timer_delete(timerid: i32) -> AxResult<isize> {
     // Token drop removes both main and retry deadlines.  Keep all action
     // destruction outside the per-process timer owner lock.
     drop(retired);
+    refresh_posix_cpu_timer_armed(&proc_data);
     Ok(0)
 }
 
@@ -1581,11 +1562,33 @@ mod tests {
     }
 
     #[test]
-    fn timex_modes_reject_invalid_singleshot_marker() {
-        assert!(timex_modes_supported(0));
-        assert!(timex_modes_supported(ADJ_OFFSET_SINGLESHOT));
-        assert!(timex_modes_supported(ADJ_OFFSET_SS_READ));
-        assert!(!timex_modes_supported(ADJ_SINGLESHOT_FLAG));
+    fn timex_planner_accepts_legacy_singleshot_modes() {
+        let snapshot = linux_time::TimexSnapshot {
+            version: 0,
+            value: linux_time::Timex::default(),
+            tick_min: 0,
+            tick_max: i64::MAX,
+        };
+        assert!(
+            linux_time::plan_adjust(
+                linux_time::Timex {
+                    modes: linux_time::ADJ_OFFSET_SINGLESHOT,
+                    ..linux_time::Timex::default()
+                },
+                snapshot,
+            )
+            .is_ok()
+        );
+        assert!(
+            linux_time::plan_adjust(
+                linux_time::Timex {
+                    modes: linux_time::ADJ_OFFSET_SS_READ,
+                    ..linux_time::Timex::default()
+                },
+                snapshot,
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1693,10 +1696,7 @@ mod tests {
             alarm_remaining_seconds_from_nanos(second + second / 2 - 1),
             1
         );
-        assert_eq!(
-            alarm_remaining_seconds_from_nanos(second + second / 2),
-            2
-        );
+        assert_eq!(alarm_remaining_seconds_from_nanos(second + second / 2), 2);
         assert_eq!(
             alarm_remaining_seconds_from_nanos((u128::from(u32::MAX) + 1) * second),
             0
