@@ -1,5 +1,6 @@
-use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
 use core::{
+    any::Any,
     ffi::{c_char, c_int},
     fmt::Write as _,
     mem::{MaybeUninit, size_of, size_of_val},
@@ -11,9 +12,11 @@ use axfs::{
     FileBackend, FileFlags, FsContext, OpenOptions, OpenResult, PathwalkComponent, PathwalkPolicy,
 };
 use axfs_ng_vfs::{
-    DirEntry, ExportHandleDecodeMode, FileNode, Location, MetadataUpdate, NodePermission, NodeType, Reference, path::Path,
+    DirEntry, ExportHandleDecodeMode, FileNode, FsName, FsNameBuf, FsPath, FsPathBuf, Location,
+    MetadataUpdate, NodePermission, NodeType, PreparedInitialAttributes, Reference,
 };
 use axio::{Seek, SeekFrom};
+use axsync::Mutex;
 use axtask::current;
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
@@ -24,13 +27,19 @@ use linux_vfs::{
 use thekernel_linux_cred::{FileOpenAccess, FileOpenOperation};
 use thekernel_linux_signal::Signo;
 
+/// Linux's file-level write hint is inode-scoped, whereas F_GET/SET_RW_HINT
+/// lives on one open file description.  Keep the former in one VFS-identity
+/// table; no pathname is involved, so hard links naturally share it.
+static FILE_RW_HINTS: spin::Lazy<Mutex<BTreeMap<(u64, u64), u64>>> =
+    spin::Lazy::new(|| Mutex::new(BTreeMap::new()));
+
 use super::admit_resize;
 use crate::{
     file::{
         AsyncIoOwner, AsyncIoOwnerType, DescriptionResource, Directory, File, FileDescription,
         FileLike, Pipe, ReservedFd, close_file_like, current_fd_table, dnotify, executable,
         flock::{self, RecordLockOwner},
-        get_file_description, get_file_like, get_typed_file,
+        get_file_description, get_file_like, get_typed_file, inode_flags,
         inotify::{
             WatchKey, notify_exact, notify_parent, notify_parent_with_name,
             wait_current_close_notifications,
@@ -38,13 +47,13 @@ use crate::{
         lease, memfd,
         permission::{
             VfsSecurityContext, authorize_file_open, authorize_named_inode_create,
-            check_create_permissions_with_security, check_landlock_truncate,
-            check_open_permissions_with_security, check_pathwalk_search_permission_with_security,
-            check_writable_mount, initial_named_create_owner_mode_with_security,
-            landlock_allows_access,
+            check_create_permissions_with_vfs_security, check_landlock_truncate_with_vfs_security,
+            check_open_permissions_with_vfs_security,
+            check_pathwalk_search_permission_with_vfs_security, check_writable_mount,
+            initial_named_create_owner_mode_with_security_at,
         },
         pipe::NamedPipe,
-        prepare_file_description_with_open_lease, reserve_fd, resolve_at, with_path_fs,
+        prepare_file_description_with_open_lease, reserve_fd_in, resolve_at, with_path_fs,
     },
     mm::{UserMemoryCapability, map_usercopy_error},
     pseudofs::{Device, dev::tty},
@@ -52,6 +61,36 @@ use crate::{
     task::{AX_FILE_LIMIT, AsThread, Cred, current_fs_context, ns_capable},
     time::wall_time,
 };
+
+/// Exact descriptor-allocation authority captured at open submission.  It is
+/// separate from pathname credentials because `files_struct` and RLIMIT_NOFILE
+/// can change independently of a mount/credential namespace transition.
+#[derive(Clone)]
+pub(crate) struct OpenFdSnapshot {
+    files: Arc<crate::file::FdTable>,
+    nofile_limit: usize,
+}
+
+impl OpenFdSnapshot {
+    pub(crate) fn new(files: Arc<crate::file::FdTable>, nofile_limit: usize) -> Self {
+        Self {
+            files,
+            nofile_limit: nofile_limit.min(AX_FILE_LIMIT),
+        }
+    }
+    fn reserve(&self, cloexec: bool) -> AxResult<crate::file::ReservedFd> {
+        reserve_fd_in(self.files.clone(), self.nofile_limit, cloexec)
+    }
+    pub(crate) const fn files(&self) -> &Arc<crate::file::FdTable> {
+        &self.files
+    }
+}
+
+fn current_open_fd_snapshot() -> OpenFdSnapshot {
+    let current = current();
+    let limit = current.as_thread().proc_data.rlim.read()[RLIMIT_NOFILE].current as usize;
+    OpenFdSnapshot::new(current_fd_table(), limit)
+}
 
 /// Convert open flags to [`OpenOptions`].
 fn flags_to_options(flags: c_int, mode: __kernel_mode_t, (uid, gid): (u32, u32)) -> OpenOptions {
@@ -149,7 +188,10 @@ fn file_open_operation(
 const FCNTL_SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK | FASYNC;
 
 fn fcntl_allowed_on_path_fd(cmd: u32) -> bool {
-    matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL)
+    matches!(
+        cmd,
+        F_DUPFD | F_DUPFD_CLOEXEC | F_DUPFD_QUERY | F_CREATED_QUERY | F_GETFD | F_SETFD | F_GETFL
+    )
 }
 
 fn validate_async_signal(sig: c_int) -> AxResult<u8> {
@@ -164,6 +206,33 @@ fn validate_async_signal(sig: c_int) -> AxResult<u8> {
         .ok_or(AxError::InvalidInput)
 }
 
+fn read_rw_hint(capability: &UserMemoryCapability, arg: usize) -> AxResult<u64> {
+    unsafe {
+        capability
+            .read_value_uninit(arg as *const u64)
+            .map_err(map_usercopy_error)
+            .map(|value| value.assume_init())
+    }
+}
+
+fn write_rw_hint(capability: &UserMemoryCapability, arg: usize, hint: u64) -> AxResult<()> {
+    capability
+        .write_bytes(arg, &hint.to_ne_bytes())
+        .map_err(map_usercopy_error)
+}
+
+fn validate_rw_hint(hint: u64) -> AxResult<()> {
+    if hint > RWH_WRITE_LIFE_EXTREME as u64 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn file_rw_hint_key(description: &FileDescription) -> AxResult<(u64, u64)> {
+    let stat = description.inner.stat()?;
+    Ok((stat.dev, stat.ino))
+}
+
 fn sync_async_io_to_file_flags(description: &FileDescription, fd: c_int, flags: u32) {
     let enabled = flags & FASYNC != 0;
     let state = description.async_io_state();
@@ -174,11 +243,11 @@ fn sync_async_io_to_file_flags(description: &FileDescription, fd: c_int, flags: 
     }
 }
 
-fn trailing_slash_requires_directory(path: &str) -> bool {
-    path.len() > 1 && path.as_bytes().last() == Some(&b'/')
+fn trailing_slash_requires_directory(path: &FsPath) -> bool {
+    path.as_bytes().len() > 1 && path.as_bytes().last() == Some(&b'/')
 }
 
-fn enforce_trailing_slash_directory(path: &str, loc: &Location) -> AxResult<()> {
+fn enforce_trailing_slash_directory(path: &FsPath, loc: &Location) -> AxResult<()> {
     if trailing_slash_requires_directory(path) && !loc.is_dir() {
         return Err(AxError::NotADirectory);
     }
@@ -425,18 +494,28 @@ fn normalize_legacy_open_flags(flags: i32) -> AxResult<i32> {
     Ok(flags as i32)
 }
 
-fn openat2_context(dirfd: c_int, path: &Path, resolve: u64) -> AxResult<FsContext> {
-    let (root, current_dir) = {
-        let fs_context = current_fs_context();
-        let fs = fs_context.lock();
-        (fs.root_dir().clone(), fs.current_dir().clone())
-    };
+fn openat2_context(
+    files: &Arc<crate::file::FdTable>,
+    fs_context: &FsContext,
+    dirfd: c_int,
+    retained_dirfd: Option<&Arc<FileDescription>>,
+    path: &FsPath,
+    resolve: u64,
+) -> AxResult<FsContext> {
+    let root = fs_context.root_dir().clone();
+    let current_dir = fs_context.current_dir().clone();
 
     if resolve & (RESOLVE_IN_ROOT | RESOLVE_BENEATH) as u64 != 0 {
         let base = if dirfd == AT_FDCWD {
             current_dir
         } else {
-            Directory::from_fd(dirfd)?.inner().clone()
+            retained_dirfd
+                .cloned()
+                .unwrap_or(files.get_description(dirfd)?)
+                .file_handle()
+                .downcast::<Directory>()?
+                .inner()
+                .clone()
         };
         return Ok(FsContext::new(base));
     }
@@ -447,7 +526,13 @@ fn openat2_context(dirfd: c_int, path: &Path, resolve: u64) -> AxResult<FsContex
         let base = if dirfd == AT_FDCWD {
             current_dir
         } else {
-            Directory::from_fd(dirfd)?.inner().clone()
+            retained_dirfd
+                .cloned()
+                .unwrap_or(files.get_description(dirfd)?)
+                .file_handle()
+                .downcast::<Directory>()?
+                .inner()
+                .clone()
         };
         FsContext::new(root).with_current_dir(base)
     }
@@ -462,13 +547,40 @@ struct Openat2PathwalkPolicy {
 struct OpenPathSecurityContext {
     vfs: VfsSecurityContext,
     umask: u32,
+    fanotify_actor: crate::file::fanotify::FanotifyEventActor,
+    controlling_terminal: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl OpenPathSecurityContext {
     fn new(actor: Arc<Cred>, umask: u32) -> Self {
-        Self {
-            vfs: VfsSecurityContext::new(actor),
+        let snapshot = current().as_thread().namespace_credential_fs_snapshot();
+        Self::with_execution_actor(
+            actor,
             umask,
+            snapshot.mount_topology,
+            snapshot.landlock_domain,
+            snapshot.controlling_terminal,
+            crate::file::fanotify::FanotifyEventActor::current(),
+        )
+    }
+
+    fn with_execution_actor(
+        actor: Arc<Cred>,
+        umask: u32,
+        mount_topology: Arc<crate::mounts::MountTopology>,
+        landlock_domain: crate::task::security::LandlockDomain,
+        controlling_terminal: Option<Arc<dyn Any + Send + Sync>>,
+        fanotify_actor: crate::file::fanotify::FanotifyEventActor,
+    ) -> Self {
+        Self {
+            vfs: VfsSecurityContext::with_execution_authority(
+                actor,
+                mount_topology,
+                landlock_domain,
+            ),
+            umask,
+            fanotify_actor,
+            controlling_terminal,
         }
     }
 
@@ -487,6 +599,24 @@ impl OpenPathSecurityContext {
     fn vfs_security(&self) -> &VfsSecurityContext {
         &self.vfs
     }
+
+    fn controlling_terminal(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
+        self.controlling_terminal.as_ref()
+    }
+
+    fn fanotify_actor(&self) -> crate::file::fanotify::FanotifyEventActor {
+        self.fanotify_actor
+    }
+}
+
+fn current_controlling_terminal() -> Option<Arc<dyn Any + Send + Sync>> {
+    current()
+        .as_thread()
+        .proc_data
+        .proc
+        .group()
+        .session()
+        .terminal()
 }
 
 impl Openat2PathwalkPolicy {
@@ -627,9 +757,11 @@ impl Drop for ExecutableWriteReservation {
 fn prepare_open_description(
     result: OpenResult,
     flags: u32,
+    created_by_open: bool,
     write_open_key: Option<executable::ExecutableKey>,
     open_lease_admission: lease::OpenLeaseAdmission,
-    open_credential: Arc<Cred>,
+    security: &VfsSecurityContext,
+    controlling_terminal: Option<&Arc<dyn Any + Send + Sync>>,
 ) -> AxResult<Arc<FileDescription>> {
     let mut description_resource: Option<DescriptionResource> = None;
     let f: Arc<dyn FileLike> = match result {
@@ -659,8 +791,10 @@ fn prepare_open_description(
                                 .location()
                                 .parent()
                                 .ok_or(AxError::NotFound)?
-                                .lookup_no_follow("pts")?;
-                            let pty_name = try_pty_name(pty_number)?;
+                                .lookup_no_follow(FsName::new(b"pts"))?;
+                            let pty_name =
+                                FsNameBuf::from_vec(try_pty_name(pty_number)?.into_bytes())
+                                    .map_err(AxError::from)?;
                             let entry = DirEntry::try_new_file(
                                 FileNode::new(master),
                                 NodeType::CharacterDevice,
@@ -668,32 +802,33 @@ fn prepare_open_description(
                             )?;
                             let loc = Location::new(file.location().mountpoint().clone(), entry);
                             file = axfs::File::new(FileBackend::Direct(loc), file.flags());
-                            pty_guard = Some(master_tty.open_description()?);
+                            pty_guard = master_tty.open_transport_description()?;
                         } else if let Some(pty) = inner.downcast_ref::<tty::PtyDriver>() {
                             if pty.is_locked_pty_slave() {
                                 return Err(AxError::Io);
                             }
-                            pty_guard = Some(pty.open_description()?);
+                            pty_guard = pty.open_transport_description()?;
                         } else if inner.is::<tty::CurrentTty>() {
-                            let term = current()
-                                .as_thread()
-                                .proc_data
-                                .proc
-                                .group()
-                                .session()
-                                .terminal()
-                                .ok_or(AxError::NotFound)?;
+                            let term = controlling_terminal.ok_or(AxError::NotFound)?;
                             let dev_dir = file.location().parent().ok_or(AxError::NotFound)?;
                             let loc = if let Some(number) =
                                 tty::VT_MANAGER.number_for_tty(term.as_ref())
                             {
-                                dev_dir.lookup_no_follow(&format!("tty{number}"))?
+                                dev_dir.lookup_no_follow(
+                                    FsNameBuf::from_vec(format!("tty{number}").into_bytes())
+                                        .map_err(AxError::from)?
+                                        .as_name(),
+                                )?
                             } else if let Some(pts) = term.downcast_ref::<tty::PtyDriver>() {
-                                pty_guard = Some(pts.open_description()?);
+                                pty_guard = pts.open_transport_description()?;
                                 let pty_name = try_pty_name(pts.pty_number())?;
                                 dev_dir
-                                    .lookup_no_follow("pts")?
-                                    .lookup_no_follow(&pty_name)?
+                                    .lookup_no_follow(FsName::new(b"pts"))?
+                                    .lookup_no_follow(
+                                        FsNameBuf::from_vec(pty_name.into_bytes())
+                                            .map_err(AxError::from)?
+                                            .as_name(),
+                                    )?
                             } else {
                                 return Err(LinuxError::ENODEV.into());
                             };
@@ -713,11 +848,11 @@ fn prepare_open_description(
                             let ioctl_allowed = !matches!(
                                 file.location().node_type(),
                                 NodeType::CharacterDevice | NodeType::BlockDevice
-                            ) || landlock_allows_access(
+                            ) || security.landlock_allows_access(
                                 file.location(),
                                 crate::task::security::LANDLOCK_ACCESS_FS_IOCTL_DEV,
                             );
-                            let truncate_allowed = landlock_allows_access(
+                            let truncate_allowed = security.landlock_allows_access(
                                 file.location(),
                                 crate::task::security::LANDLOCK_ACCESS_FS_TRUNCATE,
                             );
@@ -738,11 +873,11 @@ fn prepare_open_description(
                     let ioctl_allowed = !matches!(
                         file.location().node_type(),
                         NodeType::CharacterDevice | NodeType::BlockDevice
-                    ) || landlock_allows_access(
+                    ) || security.landlock_allows_access(
                         file.location(),
                         crate::task::security::LANDLOCK_ACCESS_FS_IOCTL_DEV,
                     );
-                    let truncate_allowed = landlock_allows_access(
+                    let truncate_allowed = security.landlock_allows_access(
                         file.location(),
                         crate::task::security::LANDLOCK_ACCESS_FS_TRUNCATE,
                     );
@@ -755,7 +890,9 @@ fn prepare_open_description(
                 }
             }
         }
-        OpenResult::Dir(dir) => Arc::try_new(Directory::new(dir)).map_err(|_| AxError::NoMemory)?,
+        OpenResult::Dir(dir) => {
+            Arc::try_new(Directory::from_opened(dir)).map_err(|_| AxError::NoMemory)?
+        }
     };
     if flags & O_NONBLOCK != 0 {
         f.set_nonblocking(true)?;
@@ -767,7 +904,9 @@ fn prepare_open_description(
         write_open_key,
         description_resource,
         open_lease_admission,
-        open_credential,
+        security.actor_arc().clone(),
+        security.mount_topology(),
+        created_by_open,
     )
 }
 
@@ -779,7 +918,7 @@ fn prepare_open_description(
 pub(crate) fn open_init_description(
     cx: &FsContext,
     options: &mut OpenOptions,
-    path: &str,
+    path: &FsPath,
     status_flags: u32,
 ) -> AxResult<Arc<FileDescription>> {
     let file = options.open(cx, path)?.into_file()?;
@@ -820,10 +959,11 @@ fn commit_open_truncate(
     loc: &Location,
     security: &VfsSecurityContext,
 ) -> AxResult<()> {
+    inode_flags::check_size_change(loc, loc.len()?, 0)?;
     let _memfd_mutation = memfd::begin_resize(loc, 0)?;
     let _privilege_guard = file.begin_content_write_privilege_cleanup(security)?;
     let quota_charge = admit_resize(loc, loc.len()?, 0)?;
-    file.inner().backend()?.set_len(0)?;
+    file.inner().commit_deferred_open_truncate()?;
     quota_charge.commit_actual_blocks(loc)?;
     // A post-truncate metadata failure cannot be reported without lying that
     // this destructive open left the inode untouched. Filesystems should
@@ -848,14 +988,17 @@ fn publish_reserved_open(
     reservation: ReservedFd,
     write_open_key: Option<executable::ExecutableKey>,
     open_lease_admission: lease::OpenLeaseAdmission,
-    open_credential: Arc<Cred>,
+    security: &VfsSecurityContext,
+    controlling_terminal: Option<&Arc<dyn Any + Send + Sync>>,
 ) -> AxResult<i32> {
     let description = prepare_open_description(
         result,
         flags,
+        true,
         write_open_key,
         open_lease_admission,
-        open_credential,
+        security,
+        controlling_terminal,
     )?;
     reservation.publish(description)
 }
@@ -871,13 +1014,12 @@ fn name_to_handle_resolve_flags(flags: i32) -> u32 {
     resolve_flags
 }
 
-fn load_user_string(capability: &UserMemoryCapability, path: *const c_char) -> AxResult<String> {
-    String::from_utf8(
+fn load_user_path(capability: &UserMemoryCapability, path: *const c_char) -> AxResult<FsPathBuf> {
+    Ok(FsPathBuf::from_vec(
         capability
             .load_until_nul(path.cast::<u8>())
             .map_err(map_usercopy_error)?,
-    )
-    .map_err(|_| AxError::IllegalBytes)
+    ))
 }
 
 pub fn sys_name_to_handle_at(
@@ -892,14 +1034,10 @@ pub fn sys_name_to_handle_at(
         return Err(AxError::InvalidInput);
     }
 
-    let path = load_user_string(&capability, path)?;
-    let location = resolve_at(
-        dirfd,
-        Some(path.as_str()),
-        name_to_handle_resolve_flags(flags),
-    )?
-    .into_file()
-    .ok_or(AxError::InvalidInput)?;
+    let path = load_user_path(&capability, path)?;
+    let location = resolve_at(dirfd, Some(&path), name_to_handle_resolve_flags(flags))?
+        .into_file()
+        .ok_or(AxError::InvalidInput)?;
     let exported = location.mountpoint().encode_export_handle(
         &location,
         if flags & AT_HANDLE_FID != 0 {
@@ -1057,7 +1195,7 @@ pub fn sys_open_by_handle_at(
 
     let location = mount
         .mountpoint()
-        .decode_export_handle(header.handle_type, &body, decode_mode)
+        .decode_export_handle(header.handle_type, body, decode_mode)
         .map_err(map_decode_export_handle_error)?;
     // Anonymous decoded references have no parent chain.  Ask the filesystem
     // to verify the stable namespace ancestry from the encoded inode instead.
@@ -1069,17 +1207,34 @@ pub fn sys_open_by_handle_at(
     {
         return Err(LinuxError::ESTALE.into());
     }
+    let task_snapshot = thread.namespace_credential_fs_snapshot();
     let security =
-        OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
+        OpenPathSecurityContext::new(task_snapshot.credential, task_snapshot.fs_snapshot.umask());
     if (flags as u32 & O_TMPFILE) == O_TMPFILE {
         if !location.is_dir() {
             return Err(AxError::NotADirectory);
         }
         let mut fs = FsContext::new(location);
         let mut policy = Openat2PathwalkPolicy::legacy()?;
-        return open_tmpfile_in_fs(&mut fs, ".", flags, 0, &security, &mut policy);
+        return open_tmpfile_in_fs(
+            &mut fs,
+            FsPath::new(b"."),
+            flags,
+            0,
+            &security,
+            &current_open_fd_snapshot(),
+            &mut policy,
+        );
     }
-    open_resolved_location_with_policy("", location, false, flags, 0, &security)
+    open_resolved_location_with_policy(
+        FsPath::new(b""),
+        location,
+        false,
+        flags,
+        0,
+        &security,
+        &current_open_fd_snapshot(),
+    )
 }
 
 fn map_decode_export_handle_error(error: AxError) -> AxError {
@@ -1092,24 +1247,33 @@ fn map_decode_export_handle_error(error: AxError) -> AxError {
 
 fn open_in_fs(
     fs: &mut FsContext,
-    path: &str,
+    path: &FsPath,
     flags: i32,
     mode: __kernel_mode_t,
     security: &OpenPathSecurityContext,
 ) -> AxResult<isize> {
     let mut policy = Openat2PathwalkPolicy::legacy()?;
-    open_in_fs_with_policy(fs, path, flags, mode, security, &mut policy)
+    open_in_fs_with_policy(
+        fs,
+        path,
+        flags,
+        mode,
+        security,
+        &current_open_fd_snapshot(),
+        &mut policy,
+    )
 }
 
 fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
     fs: &mut FsContext,
-    path: &str,
+    path: &FsPath,
     flags: i32,
     mode: __kernel_mode_t,
     security: &OpenPathSecurityContext,
+    fd_snapshot: &OpenFdSnapshot,
     policy: &mut P,
 ) -> AxResult<isize> {
-    validate_pathname(Path::new(path))?;
+    validate_pathname(path)?;
     debug!("sys_openat <= {path:?} {flags:#o} {mode:#o}");
 
     let credentials = security.credentials();
@@ -1120,29 +1284,19 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
     let (loc, created) = resolve_options.resolve_location_with_policy(
         fs,
         path,
-        &mut |dir| {
-            check_pathwalk_search_permission_with_security(
-                dir,
-                security.actor(),
-                credentials,
-                security.filesystem_owner_user_ns(),
-            )
-        },
+        &mut |dir| check_pathwalk_search_permission_with_vfs_security(dir, security.vfs_security()),
         &mut |dir, name, create_options| {
-            check_create_permissions_with_security(
-                dir,
-                security.actor(),
-                credentials,
-                security.filesystem_owner_user_ns(),
-            )?;
+            inode_flags::check_content_mutable(dir)?;
+            check_create_permissions_with_vfs_security(dir, security.vfs_security())?;
             let parent = dir.metadata()?;
-            let (final_mode, owner) = initial_named_create_owner_mode_with_security(
+            let (final_mode, owner) = initial_named_create_owner_mode_with_security_at(
+                dir,
                 &parent,
                 security.vfs_security(),
                 create_options.node_type,
                 requested_mode,
                 security.umask,
-            );
+            )?;
             authorize_named_inode_create(
                 dir,
                 &parent,
@@ -1154,12 +1308,27 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
             )?;
             create_options.permission = final_mode;
             create_options.user = Some(owner);
+            let (project_id, project_inherit) = inode_flags::prepare_inherited_project_id(
+                dir,
+                create_options.node_type == NodeType::Directory,
+            )?;
+            let (access_acl, default_acl) = crate::file::posix_acl::prepare_inherited_default(
+                dir,
+                create_options.node_type,
+                final_mode,
+            )?;
+            create_options.initial_attributes = PreparedInitialAttributes {
+                project_id,
+                project_inherit,
+                access_acl,
+                default_acl,
+            };
             Ok(())
         },
         policy,
     )?;
 
-    open_resolved_location_with_policy(path, loc, created, flags, mode, security)
+    open_resolved_location_with_policy(path, loc, created, flags, mode, security, fd_snapshot)
 }
 
 /// Complete the post-lookup open transaction for an already-resolved inode.
@@ -1169,12 +1338,13 @@ fn open_in_fs_with_policy<P: PathwalkPolicy + ?Sized>(
 /// reservation, LSM/fanotify/lease admission, executable-write accounting,
 /// truncate, and notification ordering as a pathname open.
 fn open_resolved_location_with_policy(
-    path: &str,
+    path: &FsPath,
     loc: Location,
     created: bool,
     flags: i32,
     mode: __kernel_mode_t,
     security: &OpenPathSecurityContext,
+    fd_snapshot: &OpenFdSnapshot,
 ) -> AxResult<isize> {
     let credentials = security.credentials();
     let uid = credentials.uid().into_raw();
@@ -1184,7 +1354,7 @@ fn open_resolved_location_with_policy(
         NodePermission::from_bits_truncate(requested_mode.bits() & !(security.umask as u16));
     // Keep the FD unpublished until every admission and (when requested)
     // destructive side effect has succeeded.
-    let reservation = reserve_fd((flags as u32) & O_CLOEXEC != 0)?;
+    let reservation = fd_snapshot.reserve((flags as u32) & O_CLOEXEC != 0)?;
 
     if created {
         if let Some(parent) = loc.parent() {
@@ -1212,18 +1382,24 @@ fn open_resolved_location_with_policy(
             return Err(AxError::IsADirectory);
         }
         if opened_existing {
-            check_open_permissions_with_security(
+            check_open_permissions_with_vfs_security(
                 &loc,
                 open_access_mask(flags),
-                security.actor(),
-                credentials,
-                security.filesystem_owner_user_ns(),
+                security.vfs_security(),
             )?;
             if open_requires_writable_mount(flags) {
                 check_writable_mount(&loc)?;
             }
+            // Do this only after pathname/DAC/mount admission, matching the
+            // normal open errno ordering.  A write-capable OFD itself is a
+            // forbidden mutation capability for immutable/append-only files;
+            // the latter additionally requires O_APPEND even before a write
+            // chooses a concrete offset.
+            if open_has_data_write(flags as u32) {
+                inode_flags::check_write_open(&loc, (flags as u32 & O_APPEND) != 0)?;
+            }
             if truncates_regular {
-                check_landlock_truncate(&loc)?;
+                check_landlock_truncate_with_vfs_security(&loc, security.vfs_security())?;
             }
         }
 
@@ -1270,12 +1446,13 @@ fn open_resolved_location_with_policy(
                 // -> lease break ordering. None of these fallible operations
                 // runs after the filesystem open or truncate side effect.
                 if (flags as u32) & O_PATH == 0 {
-                    crate::file::fanotify::permission_check(
+                    crate::file::fanotify::permission_check_with_actor(
                         candidate,
                         candidate,
                         crate::file::fanotify::FAN_OPEN_PERM,
                         candidate.is_dir(),
                         false,
+                        security.fanotify_actor(),
                     )?;
                 }
                 let lease_admission = lease::admit_open(candidate, flags)?;
@@ -1300,9 +1477,11 @@ fn open_resolved_location_with_policy(
         let description = prepare_open_description(
             result,
             effective_flags as _,
+            created,
             write_open.transfer_persistent(),
             lease_admission,
-            security.vfs_security().actor_arc().clone(),
+            security.vfs_security(),
+            security.controlling_terminal(),
         )?;
         let publication = reservation.prepare_publication(description.clone())?;
         if truncates_regular {
@@ -1352,20 +1531,35 @@ fn open_resolved_location_with_policy(
 /// return new file descriptor if succeed, or return -1.
 pub(crate) fn openat_inner(
     dirfd: c_int,
-    path: &str,
+    path: &FsPath,
     flags: i32,
     mode: __kernel_mode_t,
 ) -> AxResult<isize> {
     let curr = current();
     let thread = curr.as_thread();
-    let security =
-        OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
+    let task_snapshot = thread.namespace_credential_fs_snapshot();
+    let path_topology = if !path.is_absolute() && dirfd != AT_FDCWD {
+        get_file_description(dirfd)
+            .ok()
+            .and_then(|description| description.vfs_mount_topology())
+            .unwrap_or_else(|| task_snapshot.mount_topology.clone())
+    } else {
+        task_snapshot.mount_topology.clone()
+    };
+    let security = OpenPathSecurityContext::with_execution_actor(
+        task_snapshot.credential,
+        task_snapshot.fs_context.lock().umask(),
+        path_topology,
+        task_snapshot.landlock_domain,
+        task_snapshot.controlling_terminal,
+        crate::file::fanotify::FanotifyEventActor::current(),
+    );
     openat_inner_with_context(dirfd, path, flags, mode, security)
 }
 
 fn openat_inner_with_context(
     dirfd: c_int,
-    path: &str,
+    path: &FsPath,
     flags: i32,
     mode: __kernel_mode_t,
     security: OpenPathSecurityContext,
@@ -1378,78 +1572,72 @@ fn openat_inner_with_context(
         open_requires_namespace_operation(flags as u32, 0).then(crate::mounts::namespace_operation);
     if (flags as u32 & O_TMPFILE) == O_TMPFILE {
         let mut policy = Openat2PathwalkPolicy::legacy()?;
-        return with_path_fs(dirfd, Path::new(path), |fs| {
-            open_tmpfile_in_fs(fs, path, flags, mode, &security, &mut policy)
+        return with_path_fs(dirfd, path, |fs| {
+            open_tmpfile_in_fs(
+                fs,
+                path,
+                flags,
+                mode,
+                &security,
+                &current_open_fd_snapshot(),
+                &mut policy,
+            )
         });
     }
 
-    with_path_fs(dirfd, Path::new(path), |fs| {
+    with_path_fs(dirfd, path, |fs| {
         open_in_fs(fs, path, flags, mode, &security)
     })
 }
 
 fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
     fs: &mut FsContext,
-    path: &str,
+    path: &FsPath,
     flags: i32,
     mode: __kernel_mode_t,
     security: &OpenPathSecurityContext,
+    fd_snapshot: &OpenFdSnapshot,
     policy: &mut P,
 ) -> AxResult<isize> {
     if (flags as u32 & O_ACCMODE) == O_RDONLY {
         return Err(AxError::InvalidInput);
     }
 
-    let path_ref = Path::new(path);
-    validate_pathname(path_ref)?;
-    if path_ref.as_str().is_empty() {
+    validate_pathname(path)?;
+    if path.as_bytes().is_empty() {
         return Err(AxError::NotFound);
     }
     let credentials = security.credentials();
-    let reservation = reserve_fd((flags as u32) & O_CLOEXEC != 0)?;
+    let reservation = fd_snapshot.reserve((flags as u32) & O_CLOEXEC != 0)?;
     let dir_loc = if flags as u32 & O_NOFOLLOW != 0 {
         fs.resolve_no_follow_with_policy(
-            path_ref,
+            path,
             &mut |dir| {
-                check_pathwalk_search_permission_with_security(
-                    dir,
-                    security.actor(),
-                    credentials,
-                    security.filesystem_owner_user_ns(),
-                )
+                check_pathwalk_search_permission_with_vfs_security(dir, security.vfs_security())
             },
             policy,
         )
     } else {
         fs.resolve_with_policy(
-            path_ref,
+            path,
             &mut |dir| {
-                check_pathwalk_search_permission_with_security(
-                    dir,
-                    security.actor(),
-                    credentials,
-                    security.filesystem_owner_user_ns(),
-                )
+                check_pathwalk_search_permission_with_vfs_security(dir, security.vfs_security())
             },
             policy,
         )
     }?;
     dir_loc.check_is_dir()?;
-    check_create_permissions_with_security(
-        &dir_loc,
-        security.actor(),
-        credentials,
-        security.filesystem_owner_user_ns(),
-    )?;
+    check_create_permissions_with_vfs_security(&dir_loc, security.vfs_security())?;
 
     let parent_meta = dir_loc.metadata()?;
-    let (final_mode, owner) = initial_named_create_owner_mode_with_security(
+    let (final_mode, owner) = initial_named_create_owner_mode_with_security_at(
+        &dir_loc,
         &parent_meta,
         security.vfs_security(),
         NodeType::RegularFile,
         NodePermission::from_bits_truncate(mode as u16),
         security.umask,
-    );
+    )?;
 
     let open_flags = flags as u32 & !(O_TMPFILE | O_DIRECTORY | O_EXCL);
     let options = flags_to_options(
@@ -1478,12 +1666,13 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
             )
         },
         |candidate| {
-            crate::file::fanotify::permission_check(
+            crate::file::fanotify::permission_check_with_actor(
                 candidate,
                 candidate,
                 crate::file::fanotify::FAN_OPEN_PERM,
                 false,
                 false,
+                security.fanotify_actor(),
             )?;
             let lease_admission = lease::admit_open(candidate, open_flags as i32)?;
             let late_write_open = if write_open.is_none() {
@@ -1504,7 +1693,8 @@ fn open_tmpfile_in_fs<P: PathwalkPolicy + ?Sized>(
         reservation,
         write_open.transfer_persistent(),
         lease_admission,
-        security.vfs_security().actor_arc().clone(),
+        security.vfs_security(),
+        security.controlling_terminal(),
     )?;
     if let Err(error) = notify_exact(&loc, IN_OPEN) {
         warn!("tmpfile open notification failed: {error}");
@@ -1519,7 +1709,7 @@ pub fn sys_openat(
     flags: i32,
     mode: __kernel_mode_t,
 ) -> AxResult<isize> {
-    let path = load_user_string(&capability, path)?;
+    let path = load_user_path(&capability, path)?;
     openat_inner(dirfd, &path, flags, mode)
 }
 
@@ -1546,6 +1736,19 @@ pub fn sys_openat2(
     how_ptr: *const u8,
     size: usize,
 ) -> AxResult<isize> {
+    let (path, how, flags) = copy_openat2_input(&capability, path, how_ptr, size)?;
+    openat2_copied_current(dirfd, path, how, flags)
+}
+
+/// Performs the complete OPENAT2 user ABI copy/validation phase.  io_uring
+/// calls this while admitting an SQE and retains only the returned owned path
+/// and validated structure for a later worker.
+pub(crate) fn copy_openat2_input(
+    capability: &UserMemoryCapability,
+    path: *const c_char,
+    how_ptr: *const u8,
+    size: usize,
+) -> AxResult<(FsPathBuf, open_how, i32)> {
     if size < OPENAT2_HOW_SIZE {
         return Err(AxError::InvalidInput);
     }
@@ -1569,27 +1772,96 @@ pub fn sys_openat2(
         return Err(AxError::from(LinuxError::EAGAIN));
     }
 
-    let path = load_user_string(&capability, path)?;
-    let path_ref = Path::new(&path);
-    if path.is_empty() {
+    let path = load_user_path(capability, path)?;
+    Ok((path, how, flags))
+}
+
+/// Executes openat2 after the ABI boundary has copied both pathname and
+/// `open_how`.  Async submitters must call this only with their retained
+/// submitter namespace/credential view; this current-task wrapper remains
+/// solely for the synchronous syscall entry point.
+pub(crate) fn openat2_copied_current(
+    dirfd: c_int,
+    path: FsPathBuf,
+    how: open_how,
+    flags: i32,
+) -> AxResult<isize> {
+    let task_snapshot = current().as_thread().namespace_credential_fs_snapshot();
+    openat2_copied_with_snapshot(
+        &current_open_fd_snapshot(),
+        &task_snapshot,
+        dirfd,
+        None,
+        crate::file::fanotify::FanotifyEventActor::current(),
+        path,
+        how,
+        flags,
+    )
+}
+
+/// Checks pathname properties which precede dirfd resolution in Linux's
+/// openat2 ordering.  io_uring runs this after copying the ABI input but
+/// before retaining a dirfd, so its admission errors match the syscall path.
+pub(crate) fn validate_openat2_copied_path(path: &FsPath, how: &open_how) -> AxResult {
+    if path.as_bytes().is_empty() {
         return Err(AxError::NotFound);
     }
-    if how.resolve & RESOLVE_BENEATH as u64 != 0 && path_ref.is_absolute() {
+    if how.resolve & RESOLVE_BENEATH as u64 != 0 && path.is_absolute() {
         return Err(AxError::from(LinuxError::EXDEV));
     }
-    if resolve_cached {
-        return Err(AxError::from(LinuxError::EAGAIN));
-    }
-    let curr = current();
-    let thread = curr.as_thread();
-    let security =
-        OpenPathSecurityContext::new(thread.current_cred(), current_fs_context().lock().umask());
+    Ok(())
+}
+
+/// Copied-input open core. Every authority affecting pathwalk is explicit so
+/// an io_uring worker never samples its own task state.
+pub(crate) fn openat2_copied_with_snapshot(
+    fd_snapshot: &OpenFdSnapshot,
+    task_snapshot: &crate::task::NamespaceCredentialFsSnapshot,
+    dirfd: c_int,
+    retained_dirfd: Option<&Arc<FileDescription>>,
+    fanotify_actor: crate::file::fanotify::FanotifyEventActor,
+    path: FsPathBuf,
+    how: open_how,
+    flags: i32,
+) -> AxResult<isize> {
+    validate_openat2_copied_path(&path, &how)?;
+    // RESOLVE_CACHED is a restriction on *how* the walk may complete, not a
+    // request to fail unconditionally.  `FsContext` resolves from the live
+    // dentry/inode topology and its normal component walk is therefore the
+    // cache-hit path.  Operations which would require namespace mutation
+    // (creation, truncation, tmpfile) were rejected above with EAGAIN.  Keep
+    // the flag in the Linux policy below so a walker which has to restart or
+    // follow a non-cached topology edge returns RetryWithoutCached/EAGAIN.
+    let path_topology = if !path.is_absolute() && dirfd != AT_FDCWD {
+        retained_dirfd
+            .cloned()
+            .or_else(|| fd_snapshot.files().get_description(dirfd).ok())
+            .and_then(|description| description.vfs_mount_topology())
+            .unwrap_or_else(|| task_snapshot.mount_topology.clone())
+    } else {
+        task_snapshot.mount_topology.clone()
+    };
+    let security = OpenPathSecurityContext::with_execution_actor(
+        task_snapshot.credential.clone(),
+        task_snapshot.fs_snapshot.umask(),
+        path_topology,
+        task_snapshot.landlock_domain.clone(),
+        task_snapshot.controlling_terminal.clone(),
+        fanotify_actor,
+    );
     // Use one guard for both scoped pathwalk and creation. Combining the
     // predicates before acquisition avoids recursively locking the non-
     // reentrant namespace mutex when openat2 requests both.
     let mount_namespace = open_requires_namespace_operation(flags as u32, how.resolve)
         .then(crate::mounts::namespace_operation);
-    let mut fs = openat2_context(dirfd, path_ref, how.resolve)?;
+    let mut fs = openat2_context(
+        fd_snapshot.files(),
+        &task_snapshot.fs_snapshot,
+        dirfd,
+        retained_dirfd,
+        &path,
+        how.resolve,
+    )?;
     let context = LinuxPathContext::new(
         security,
         mount_namespace,
@@ -1612,6 +1884,7 @@ pub fn sys_openat2(
             flags,
             how.mode as __kernel_mode_t,
             context.credentials(),
+            fd_snapshot,
             &mut policy,
         )
     } else {
@@ -1621,6 +1894,7 @@ pub fn sys_openat2(
             flags,
             how.mode as __kernel_mode_t,
             context.credentials(),
+            fd_snapshot,
             &mut policy,
         )
     }
@@ -1881,6 +2155,15 @@ pub fn sys_fcntl(
             let description = get_file_description(fd)?;
             dup_fd_at_least(description, arg as c_int, true)
         }
+        F_DUPFD_QUERY => {
+            let description = get_file_description(fd)?;
+            let peer = get_file_description(arg as c_int)?;
+            Ok(Arc::ptr_eq(&description, &peer) as isize)
+        }
+        F_CREATED_QUERY => {
+            let description = get_file_description(fd)?;
+            Ok(description.created_by_open() as isize)
+        }
         F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => {
             let description = get_file_description(fd)?;
             let stat = description.inner.stat()?;
@@ -2017,6 +2300,33 @@ pub fn sys_fcntl(
         F_GETSIG => {
             let description = get_file_description(fd)?;
             Ok(description.async_io_state().signal as isize)
+        }
+        F_GET_RW_HINT => {
+            let description = get_file_description(fd)?;
+            write_rw_hint(&capability, arg, description.rw_hint())?;
+            Ok(0)
+        }
+        F_SET_RW_HINT => {
+            let description = get_file_description(fd)?;
+            let hint = read_rw_hint(&capability, arg)?;
+            validate_rw_hint(hint)?;
+            description.set_rw_hint(hint);
+            Ok(0)
+        }
+        F_GET_FILE_RW_HINT => {
+            let description = get_file_description(fd)?;
+            let key = file_rw_hint_key(&description)?;
+            let hint = FILE_RW_HINTS.lock().get(&key).copied().unwrap_or(0);
+            write_rw_hint(&capability, arg, hint)?;
+            Ok(0)
+        }
+        F_SET_FILE_RW_HINT => {
+            let description = get_file_description(fd)?;
+            let hint = read_rw_hint(&capability, arg)?;
+            validate_rw_hint(hint)?;
+            let key = file_rw_hint_key(&description)?;
+            FILE_RW_HINTS.lock().insert(key, hint);
+            Ok(0)
         }
         F_NOTIFY => {
             let raw_mask = dnotify::mask_from_fcntl_arg(arg);
@@ -2249,7 +2559,15 @@ mod namespace_operation_tests {
             Some(HandleDecodeAuthorization::MountNamespace)
         );
         assert_eq!(
-            classify_handle_decode_authorization(false, true, false, true, true, false, O_DIRECTORY),
+            classify_handle_decode_authorization(
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                O_DIRECTORY
+            ),
             None
         );
         assert_eq!(
@@ -2261,7 +2579,15 @@ mod namespace_operation_tests {
             Some(HandleDecodeAuthorization::Global)
         );
         assert_eq!(
-            classify_handle_decode_authorization(false, true, false, true, false, true, O_DIRECTORY),
+            classify_handle_decode_authorization(
+                false,
+                true,
+                false,
+                true,
+                false,
+                true,
+                O_DIRECTORY
+            ),
             None
         );
     }

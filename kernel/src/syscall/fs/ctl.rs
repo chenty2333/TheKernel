@@ -1,16 +1,13 @@
-use alloc::{ffi::CString, string::String, sync::Arc, vec::Vec};
-use core::{
-    ffi::{c_char, c_int, c_void},
-    time::Duration,
-};
+use alloc::{sync::Arc, vec::Vec};
+use core::ffi::{c_char, c_int, c_void};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::{FileBackend, FileFlags};
 use axfs_ng_vfs::{
-    DeviceId, Location, MetadataUpdate, NodePermission, NodeType, Timestamp,
-    path::{FinalComponent, FinalComponentKind, Path},
+    DeviceId, FsName, FsNameBuf, FsPath, FsPathBuf, Location, MetadataUpdate, NodePermission,
+    NodeType, Timestamp,
+    path::{FinalComponent, FinalComponentKind},
 };
-use super::admit_chown;
 use axhal::power::system_off;
 use axtask::current;
 use linux_raw_sys::{
@@ -26,6 +23,7 @@ use thekernel_linux_usercopy::{
     vm_write_slice,
 };
 
+use super::admit_chown;
 #[cfg(test)]
 use crate::file::permission::{
     chown_hook_mode_for_test, prepare_chmod_metadata_setattr_for_test,
@@ -34,15 +32,16 @@ use crate::file::permission::{
 use crate::{
     file::{
         Directory, File, FileDescription, FileLike, IoctlContext, executable,
-        filesystem_type_catalog, get_file_description,
+        filesystem_type_catalog, get_file_description, inode_flags,
         inotify::location_for_fd,
         namespace_mutation,
         permission::{
             ChmodSetattrPolicy, ChownSetattrPolicy, NamedCreateTerminalType, SecurityFsContextExt,
             TimestampSetattrPolicy, VfsSecurityContext, check_fchdir_permissions_with_security,
-            check_open_permissions_with_security, check_pseudo_inode_permissions_with_security,
-            check_search_permissions_with_security, check_writable_mount,
+            check_pseudo_inode_permissions_with_security, check_search_permissions_with_security,
+            check_writable_mount, idmapped_chown_ids,
         },
+        posix_acl,
         privilege_metadata::probe_inode_setattr_privilege_cleanup,
         resolve_at_with_security, validate_symlink_target, with_path_fs,
     },
@@ -93,7 +92,7 @@ pub fn sys_sysfs<M: UserMemory + ?Sized>(
                 .iter()
                 .position(|entry| entry[..entry.len() - 1] == name)
                 .map(|index| index as isize)
-                .ok_or_else(|| AxError::InvalidInput)
+                .ok_or(AxError::InvalidInput)
         }
         2 => {
             let index = arg1 as usize as u32 as usize;
@@ -108,21 +107,25 @@ pub fn sys_sysfs<M: UserMemory + ?Sized>(
     }
 }
 
-fn try_string(value: &str) -> AxResult<String> {
-    let mut owned = String::new();
-    owned
-        .try_reserve_exact(value.len())
-        .map_err(|_| AxError::NoMemory)?;
-    owned.push_str(value);
-    Ok(owned)
+fn try_name(value: &FsName) -> AxResult<FsNameBuf> {
+    FsNameBuf::from_vec({
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(value.as_bytes().len())
+            .map_err(|_| AxError::NoMemory)?;
+        bytes.extend_from_slice(value.as_bytes());
+        bytes
+    })
+    .map_err(Into::into)
 }
 
 fn load_user_path<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     path: *const c_char,
-) -> AxResult<String> {
-    String::from_utf8(vm_load_until_nul(memory, path.cast::<u8>()).map_err(map_usercopy_error)?)
-        .map_err(|_| AxError::IllegalBytes)
+) -> AxResult<FsPathBuf> {
+    Ok(FsPathBuf::from_vec(
+        vm_load_until_nul(memory, path.cast::<u8>()).map_err(map_usercopy_error)?,
+    ))
 }
 
 fn warn_notification(context: &str, result: AxResult<()>) {
@@ -194,7 +197,15 @@ fn proc_namespace_ioctl(
             (ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren, _) => {
                 Err(AxError::InvalidInput)
             }
-            (ProcNamespaceKind::User | ProcNamespaceKind::Uts, _) => Err(AxError::InvalidInput),
+            (
+                ProcNamespaceKind::Cgroup
+                | ProcNamespaceKind::Ipc
+                | ProcNamespaceKind::Mount
+                | ProcNamespaceKind::Net
+                | ProcNamespaceKind::User
+                | ProcNamespaceKind::Uts,
+                _,
+            ) => Err(AxError::InvalidInput),
             _ => Err(AxError::InvalidInput),
         },
         NS_GET_USERNS => object
@@ -223,6 +234,10 @@ fn proc_namespace_ioctl(
             _ => Err(AxError::InvalidInput),
         },
         NS_GET_NSTYPE => Ok(match kind {
+            ProcNamespaceKind::Cgroup => CLONE_NEWCGROUP,
+            ProcNamespaceKind::Ipc => CLONE_NEWIPC,
+            ProcNamespaceKind::Mount => CLONE_NEWNS,
+            ProcNamespaceKind::Net => CLONE_NEWNET,
             ProcNamespaceKind::Pid => CLONE_NEWPID,
             ProcNamespaceKind::Time | ProcNamespaceKind::TimeForChildren => CLONE_NEWTIME,
             ProcNamespaceKind::User => CLONE_NEWUSER,
@@ -233,18 +248,20 @@ fn proc_namespace_ioctl(
     Some(result)
 }
 
-pub(crate) fn validate_pathname(path: &Path) -> AxResult {
+pub(crate) fn validate_pathname(path: &FsPath) -> AxResult {
     crate::file::validate_pathname(path)
 }
 
-fn proc_self_fd_location(path: &str) -> Option<AxResult<LinkatSource>> {
-    let fd = path.strip_prefix("/proc/self/fd/")?;
-    if fd.is_empty() || fd.as_bytes().iter().any(|byte| !byte.is_ascii_digit()) {
+fn proc_self_fd_location(path: &FsPath) -> Option<AxResult<LinkatSource>> {
+    let fd = path.as_bytes().strip_prefix(b"/proc/self/fd/")?;
+    if fd.is_empty() || fd.iter().any(|byte| !byte.is_ascii_digit()) {
         return Some(Err(AxError::NotFound));
     }
 
     Some(
-        fd.parse::<i32>()
+        core::str::from_utf8(fd)
+            .ok()?
+            .parse::<i32>()
             .map_err(|_| AxError::BadFileDescriptor)
             .and_then(|fd| {
                 let description = get_file_description(fd)?;
@@ -295,12 +312,12 @@ fn check_metadata_description_status(
 /// Linux distinction between direct-fd syscalls and AT_EMPTY_PATH.
 fn resolve_metadata_target(
     dirfd: i32,
-    path: Option<&str>,
+    path: Option<&FsPath>,
     flags: u32,
     source: MetadataTargetSource,
     security: &VfsSecurityContext,
 ) -> AxResult<Location> {
-    if matches!(path, None | Some("")) {
+    if path.is_none_or(|path| path.as_bytes().is_empty()) {
         if flags & AT_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);
         }
@@ -365,7 +382,7 @@ fn pin_linkat_source_description(
 
 fn resolve_hardlink_source_in_fs(
     fs: &axfs::FsContext,
-    path: &Path,
+    path: &FsPath,
     follow_final_symlink: bool,
     security: &VfsSecurityContext,
 ) -> AxResult<Location> {
@@ -378,11 +395,11 @@ fn resolve_hardlink_source_in_fs(
 
 fn resolve_linkat_source(
     old_dirfd: c_int,
-    old_path: &str,
+    old_path: &FsPath,
     flags: u32,
     security: &VfsSecurityContext,
 ) -> AxResult<LinkatSource> {
-    if old_path.is_empty() {
+    if old_path.as_bytes().is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);
         }
@@ -404,7 +421,7 @@ fn resolve_linkat_source(
         return location;
     }
 
-    let path = Path::new(old_path);
+    let path = old_path;
     if path.is_absolute() || old_dirfd == AT_FDCWD {
         return resolve_hardlink_source_in_fs(
             &current_fs_context().lock(),
@@ -460,37 +477,40 @@ fn requested_chown_ids(
     Ok((user, group))
 }
 
-fn path_from_root(loc: Location, root: &Location) -> AxResult<String> {
+fn path_from_root(loc: Location, root: &Location) -> AxResult<FsPathBuf> {
     if loc.ptr_eq(root) {
-        return try_string("/");
+        return Ok(FsPathBuf::from_vec(Vec::from(b"/".as_slice())));
     }
 
-    let loc_path = try_string(loc.absolute_path()?.as_str())?;
+    let loc_path = loc.absolute_path()?;
     if root.is_root() {
         return Ok(loc_path);
     }
 
-    let root_path = try_string(root.absolute_path()?.as_str())?;
+    let root_path = root.absolute_path()?;
     if loc_path == root_path {
-        return try_string("/");
+        return Ok(FsPathBuf::from_vec(Vec::from(b"/".as_slice())));
     }
 
-    let prefix = if root_path == "/" {
-        try_string("/")?
+    let prefix = if root_path.as_bytes() == b"/" {
+        FsPathBuf::from_vec(Vec::from(b"/".as_slice()))
     } else {
-        let mut prefix = try_string(&root_path)?;
+        let mut prefix = root_path.into_vec();
         prefix.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-        prefix.push('/');
-        prefix
+        prefix.push(b'/');
+        FsPathBuf::from_vec(prefix)
     };
-    let rest = loc_path.strip_prefix(&prefix).ok_or(AxError::NotFound)?;
-    let mut result = String::new();
+    let rest = loc_path
+        .as_bytes()
+        .strip_prefix(prefix.as_bytes())
+        .ok_or(AxError::NotFound)?;
+    let mut result = Vec::new();
     result
-        .try_reserve_exact(rest.len().checked_add(1).ok_or(AxError::NoMemory)?)
+        .try_reserve_exact(rest.len().saturating_add(1))
         .map_err(|_| AxError::NoMemory)?;
-    result.push('/');
-    result.push_str(rest);
-    Ok(result)
+    result.push(b'/');
+    result.extend_from_slice(rest);
+    Ok(FsPathBuf::from_vec(result))
 }
 
 /// The ioctl() system call manipulates the underlying device parameters
@@ -522,6 +542,10 @@ pub fn sys_ioctl(context: &IoctlContext, fd: i32, cmd: u32, arg: usize) -> AxRes
         )
         && !file.landlock_ioctl_dev_allowed()
     {
+        crate::file::permission::report_cached_landlock_denial(
+            file.inner().location(),
+            crate::task::security::LANDLOCK_ACCESS_FS_IOCTL_DEV,
+        );
         return Err(AxError::PermissionDenied);
     }
     if let Some(file) = f.downcast_ref::<File>()
@@ -555,7 +579,7 @@ pub fn sys_chdir<M: UserMemory + ?Sized>(
     path: *const c_char,
 ) -> AxResult<isize> {
     let path = load_user_path(memory, path)?;
-    debug!("sys_chdir <= path: {path}");
+    debug!("sys_chdir <= path: {path:?}");
 
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
@@ -603,7 +627,7 @@ pub fn sys_chroot<M: UserMemory + ?Sized>(
     path: *const c_char,
 ) -> AxResult<isize> {
     let path = load_user_path(memory, path)?;
-    debug!("sys_chroot <= path: {path}");
+    debug!("sys_chroot <= path: {path:?}");
 
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
@@ -629,16 +653,16 @@ pub fn sys_mkdirat<M: UserMemory + ?Sized>(
     mode: u32,
 ) -> AxResult<isize> {
     let path = load_user_path(memory, path)?;
-    debug!("sys_mkdirat <= dirfd: {dirfd}, path: {path}, mode: {mode}");
-    if path.is_empty() {
+    debug!("sys_mkdirat <= dirfd: {dirfd}, path: {path:?}, mode: {mode}");
+    if path.as_bytes().is_empty() {
         return Err(AxError::NotFound);
     }
-    validate_pathname(Path::new(&path))?;
+    validate_pathname(&path)?;
 
     let curr = current();
     let requested_mode = NodePermission::from_bits_truncate(mode as u16);
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
-    let path_ref = Path::new(&path);
+    let path_ref = &*path;
     let mount_operation = mounts::namespace_operation();
     let (parent, name) = with_path_fs(dirfd, path_ref, |fs| {
         let (parent, name) = fs.resolve_named_create_security(
@@ -646,8 +670,9 @@ pub fn sys_mkdirat<M: UserMemory + ?Sized>(
             &security,
             NamedCreateTerminalType::Directory,
         )?;
-        Ok((parent, try_string(name)?))
+        Ok((parent, try_name(name)?))
     })?;
+    inode_flags::check_content_mutable(&parent)?;
     let loc = namespace_mutation::create_named(
         &mount_operation,
         &parent,
@@ -692,9 +717,9 @@ pub fn sys_mknodat<M: UserMemory + ?Sized>(
     dev: u64,
 ) -> AxResult<isize> {
     let path = load_user_path(memory, path)?;
-    let path_ref = Path::new(&path);
+    let path_ref = &*path;
     validate_pathname(path_ref)?;
-    debug!("sys_mknodat <= dirfd: {dirfd}, path: {path}, mode: {mode:#o}, dev: {dev}");
+    debug!("sys_mknodat <= dirfd: {dirfd}, path: {path:?}, mode: {mode:#o}, dev: {dev}");
 
     let node_type = decode_mknod_node_type(mode)?;
 
@@ -709,8 +734,9 @@ pub fn sys_mknodat<M: UserMemory + ?Sized>(
             &security,
             NamedCreateTerminalType::NonDirectory,
         )?;
-        Ok((parent, try_string(name)?))
+        Ok((parent, try_name(name)?))
     })?;
+    inode_flags::check_content_mutable(&parent)?;
 
     let rdev = matches!(node_type, NodeType::CharacterDevice | NodeType::BlockDevice)
         .then_some(DeviceId(dev));
@@ -756,10 +782,7 @@ fn getdents_has_room(count: usize, copied: usize, record_len: usize) -> bool {
 }
 
 fn dirent_record_len(format: DirentFormat, name: &[u8]) -> AxResult<usize> {
-    if name.is_empty()
-        || name.len() >= GETDENTS_NAME_PATH_MAX
-        || name.iter().any(|byte| *byte == b'/')
-    {
+    if name.is_empty() || name.len() >= GETDENTS_NAME_PATH_MAX || name.contains(&b'/') {
         return Err(AxError::Io);
     }
     Ok(match format {
@@ -838,7 +861,7 @@ fn sys_getdents_common<M: UserMemory + ?Sized>(
         let mut record = Vec::new();
         let mut last_reclen = 0;
 
-        let iteration = dir.read_dir(*dir_offset, &mut |name: &str, ino, node_type, offset| {
+        let iteration = dir.read_dir(*dir_offset, &mut |name: &FsName, ino, node_type, offset| {
             // Linux only checks signals between already completed records.
             if copied != 0 && has_pending_syscall_signal(current().as_thread()) {
                 return false;
@@ -951,7 +974,7 @@ pub fn sys_linkat<M: UserMemory + ?Sized>(
     let new_path = load_user_path(memory, new_path)?;
     debug!(
         "sys_linkat <= old_dirfd: {old_dirfd}, old_path: {old_path:?}, new_dirfd: {new_dirfd}, \
-         new_path: {new_path}, flags: {flags}"
+         new_path: {new_path:?}, flags: {flags}"
     );
 
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_FOLLOW) != 0 {
@@ -960,18 +983,18 @@ pub fn sys_linkat<M: UserMemory + ?Sized>(
 
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
-    if !old_path.is_empty() {
-        validate_pathname(Path::new(&old_path))?;
+    if !old_path.as_bytes().is_empty() {
+        validate_pathname(&old_path)?;
     }
     let source = resolve_linkat_source(old_dirfd, &old_path, flags, &security)?;
 
-    if new_path.is_empty() {
+    if new_path.as_bytes().is_empty() {
         return Err(AxError::NotFound);
     }
-    validate_pathname(Path::new(&new_path))?;
+    validate_pathname(&new_path)?;
 
     let mount_operation = mounts::namespace_operation();
-    let new_path_ref = Path::new(&new_path);
+    let new_path_ref = &*new_path;
     let (new_dir, new_name) = with_path_fs(new_dirfd, new_path_ref, |fs| {
         fs.resolve_named_create_security(
             new_path_ref,
@@ -991,6 +1014,19 @@ pub fn sys_linkat<M: UserMemory + ?Sized>(
             return Err(AxError::BadState);
         }
     };
+    inode_flags::check_content_mutable(&new_dir)?;
+    // Linking changes the source inode's link count/ctime. Linux rejects this
+    // metadata mutation for immutable and append-only inodes even though no
+    // file data is written.
+    inode_flags::check_nonappend_content_mutable(&old)?;
+    // bpffs object dentries are not ordinary hard-linkable files.  In
+    // particular, accepting a second link would create another pathname with
+    // no independent object-pin lifetime.
+    if mounts::metadata_for_location(&old)?.fs_type == "bpf"
+        || mounts::metadata_for_location(&new_dir)?.fs_type == "bpf"
+    {
+        return Err(LinuxError::EPERM.into());
+    }
 
     let linked = namespace_mutation::link(&mount_operation, &new_dir, new_name, &old, &security)?;
     warn_notification(
@@ -1036,7 +1072,7 @@ fn unlinkat_remove_dir(flags: usize) -> AxResult<bool> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct UnlinkFinalName<'a> {
-    name: &'a str,
+    name: &'a FsName,
     requires_directory: bool,
 }
 
@@ -1063,10 +1099,10 @@ fn unlinkat_final_name(
 
 fn resolve_unlink_target_in_fs(
     fs: &axfs::FsContext,
-    path: &Path,
+    path: &FsPath,
     remove_dir: bool,
     security: &VfsSecurityContext,
-) -> AxResult<(Location, String, Location)> {
+) -> AxResult<(Location, FsNameBuf, Location)> {
     let (_, syntactic_final) = path.split_final_component().ok_or(AxError::NotFound)?;
     if matches!(syntactic_final.kind(), FinalComponentKind::Root) {
         // Linux classifies LAST_ROOT without looking up or admitting the root
@@ -1080,8 +1116,15 @@ fn resolve_unlink_target_in_fs(
     let (parent, final_component) = fs.resolve_parent_preserving_final_security(path, security)?;
     let final_name = unlinkat_final_name(final_component, remove_dir)?;
     check_writable_mount(&parent)?;
-    let name = try_string(final_name.name)?;
+    let name = try_name(final_name.name)?;
     let target = parent.lookup_no_follow_in_mount(&name)?;
+    // Immutable directories reject namespace changes and immutable targets
+    // cannot lose a name.  Do this after lookup, matching vfs_unlink's inode
+    // admission placement rather than turning a missing name into EPERM.
+    // Removing a name is forbidden from an append-only directory, and an
+    // append-only inode may not lose one of its names.
+    inode_flags::check_nonappend_content_mutable(&parent)?;
+    inode_flags::check_nonappend_content_mutable(&target)?;
     if final_name.requires_directory && !remove_dir {
         // filename_unlinkat handles trailing slashes immediately after final
         // lookup, before security_path_unlink or vfs_unlink/may_delete.
@@ -1102,8 +1145,8 @@ pub fn sys_unlinkat<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     let remove_dir = unlinkat_remove_dir(flags)?;
     let path = load_user_path(memory, path)?;
-    let path_ref = Path::new(&path);
-    if path.is_empty() {
+    let path_ref = &*path;
+    if path.as_bytes().is_empty() {
         return Err(AxError::NotFound);
     }
     validate_pathname(path_ref)?;
@@ -1135,6 +1178,12 @@ pub fn sys_unlinkat<M: UserMemory + ?Sized>(
         );
     }
     if outcome.loses_last_link {
+        // bpffs owns a strong BPF-object reference at its final dentry. Drop
+        // that reference in the same successful last-link transition; a
+        // rename never reaches this path and non-final hard-link removal must
+        // not unpin the object.
+        #[cfg(feature = "bpf")]
+        crate::bpf::forget_pinned_object(&loc);
         if !is_dir {
             axfs::mark_cached_file_unlinked(&loc);
         }
@@ -1184,10 +1233,11 @@ pub fn sys_getcwd<M: UserMemory + ?Sized>(
         let fs = fs_context.lock();
         path_from_root(fs.current_dir().clone(), fs.root_dir())?
     };
-    debug!("sys_getcwd => cwd: {cwd}");
+    debug!("sys_getcwd => cwd: {cwd:?}");
 
-    let cwd = CString::new(cwd.as_str()).map_err(|_| AxError::InvalidInput)?;
-    let cwd = cwd.as_bytes_with_nul();
+    let mut cwd = cwd.into_vec();
+    cwd.try_reserve_exact(1).map_err(|_| AxError::NoMemory)?;
+    cwd.push(0);
 
     if cwd.len() > size {
         return Err(AxError::OutOfRange);
@@ -1197,7 +1247,7 @@ pub fn sys_getcwd<M: UserMemory + ?Sized>(
         return Err(AxError::BadAddress);
     }
 
-    vm_write_slice(memory, buf, cwd).map_err(map_usercopy_error)?;
+    vm_write_slice(memory, buf, &cwd).map_err(map_usercopy_error)?;
     Ok(cwd.len() as isize)
 }
 
@@ -1220,10 +1270,10 @@ pub fn sys_symlinkat<M: UserMemory + ?Sized>(
     let linkpath = load_user_path(memory, linkpath)?;
     debug!("sys_symlinkat <= target: {target:?}, new_dirfd: {new_dirfd}, linkpath: {linkpath:?}");
 
-    if linkpath.is_empty() {
+    if linkpath.as_bytes().is_empty() {
         return Err(AxError::NotFound);
     }
-    let linkpath_ref = Path::new(&linkpath);
+    let linkpath_ref = &*linkpath;
     validate_pathname(linkpath_ref)?;
 
     let curr = current();
@@ -1235,8 +1285,9 @@ pub fn sys_symlinkat<M: UserMemory + ?Sized>(
             &security,
             NamedCreateTerminalType::NonDirectory,
         )?;
-        Ok((parent, try_string(name)?))
+        Ok((parent, try_name(name)?))
     })?;
+    inode_flags::check_content_mutable(&parent)?;
     let loc =
         namespace_mutation::create_symlink(&mount_operation, &parent, &name, &target, &security)?;
     warn_notification(
@@ -1276,7 +1327,7 @@ pub fn sys_readlinkat<M: UserMemory + ?Sized>(
         size: usize,
     ) -> AxResult<isize> {
         let link = loc.read_link()?;
-        let read = size.min(link.len());
+        let read = size.min(link.as_bytes().len());
         vm_write_slice(memory, buf, &link.as_bytes()[..read]).map_err(map_usercopy_error)?;
         Ok(read as isize)
     }
@@ -1287,7 +1338,7 @@ pub fn sys_readlinkat<M: UserMemory + ?Sized>(
     if size == 0 {
         return Err(AxError::InvalidInput);
     }
-    if path.is_empty() {
+    if path.as_bytes().is_empty() {
         if dirfd == AT_FDCWD {
             return Err(AxError::NotFound);
         }
@@ -1297,13 +1348,13 @@ pub fn sys_readlinkat<M: UserMemory + ?Sized>(
         }
         return write_readlink_result(memory, &loc, buf, size);
     }
-    validate_pathname(Path::new(&path))?;
+    validate_pathname(&path)?;
 
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
 
-    with_path_fs(dirfd, Path::new(&path), |fs| {
-        let entry = fs.resolve_no_follow_security(path.as_str(), &security)?;
+    with_path_fs(dirfd, &path, |fs| {
+        let entry = fs.resolve_no_follow_security(&path, &security)?;
         write_readlink_result(memory, &entry, buf, size)
     })
 }
@@ -1354,7 +1405,7 @@ pub fn sys_fchownat<M: UserMemory + ?Sized>(
     let path = load_user_path(memory, path)?;
     do_fchownat(
         dirfd,
-        Some(path.as_str()),
+        Some(&path),
         uid,
         gid,
         flags,
@@ -1364,7 +1415,7 @@ pub fn sys_fchownat<M: UserMemory + ?Sized>(
 
 fn do_fchownat(
     dirfd: i32,
-    path: Option<&str>,
+    path: Option<&FsPath>,
     uid: i32,
     gid: i32,
     flags: u32,
@@ -1374,10 +1425,10 @@ fn do_fchownat(
         return Err(AxError::InvalidInput);
     }
     if let Some(path) = path {
-        if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+        if path.as_bytes().is_empty() && flags & AT_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);
         }
-        validate_pathname(Path::new(path))?;
+        validate_pathname(path)?;
     }
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
@@ -1392,7 +1443,10 @@ fn do_fchownat(
     // Linux's mnt_want_write() failure precedes ID conversion, inode locking,
     // security hooks, and setattr_prepare authorization.
     check_writable_mount(&loc)?;
+    inode_flags::check_nonappend_content_mutable(&loc)?;
     let (requested_user, requested_group) = requested_chown_ids(security.actor(), uid, gid)?;
+    let (requested_user, requested_group) =
+        idmapped_chown_ids(&loc, &security, requested_user, requested_group)?;
     executable::with_credential_metadata_unpinned(&loc, || {
         let policy = ChownSetattrPolicy::new(&loc, requested_user, requested_group, &security)?;
         let privilege_cleanup = probe_inode_setattr_privilege_cleanup(&loc, policy.metadata())?;
@@ -1455,18 +1509,12 @@ pub fn sys_fchmodat<M: UserMemory + ?Sized>(
         return Err(AxError::InvalidInput);
     }
     let path = load_user_path(memory, path)?;
-    do_fchmodat(
-        dirfd,
-        Some(path.as_str()),
-        mode,
-        flags,
-        MetadataTargetSource::At,
-    )
+    do_fchmodat(dirfd, Some(&path), mode, flags, MetadataTargetSource::At)
 }
 
 fn do_fchmodat(
     dirfd: i32,
-    path: Option<&str>,
+    path: Option<&FsPath>,
     mode: u32,
     flags: u32,
     source: MetadataTargetSource,
@@ -1475,10 +1523,10 @@ fn do_fchmodat(
         return Err(AxError::InvalidInput);
     }
     if let Some(path) = path {
-        if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+        if path.as_bytes().is_empty() && flags & AT_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);
         }
-        validate_pathname(Path::new(path))?;
+        validate_pathname(path)?;
     }
     let curr = current();
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
@@ -1487,6 +1535,7 @@ fn do_fchmodat(
     let _metadata_writer_fallback = mounts::namespace_operation();
     let loc = resolve_metadata_target(dirfd, path, flags, source, &security)?;
     check_writable_mount(&loc)?;
+    inode_flags::check_nonappend_content_mutable(&loc)?;
     let publishes_setid =
         mode & (NodePermission::SET_UID | NodePermission::SET_GID).bits() as u32 != 0;
     executable::with_setid_metadata_unpinned(&loc, publishes_setid, || {
@@ -1495,7 +1544,12 @@ fn do_fchmodat(
             return Err(LinuxError::EOPNOTSUPP.into());
         }
         let prepared = policy.admit(&security)?.prepare()?;
-        let published = prepared.publish()?;
+        let acl = posix_acl::prepare_chmod(&loc, prepared.committed_mode())?;
+        let (published, _) = if let Some(acl) = acl {
+            prepared.publish_with_staged(|| acl.stage(&loc), |_| acl.rollback(&loc))?
+        } else {
+            (prepared.publish()?, ())
+        };
 
         warn_notification(
             "chmod parent",
@@ -1540,6 +1594,7 @@ fn update_times<M: UserMemory + ?Sized>(
             // Linux's mount-write admission precedes notify_change's DAC and
             // setattr path, so a read-only mount wins over EPERM/EACCES.
             check_writable_mount(&loc)?;
+            inode_flags::check_nonappend_content_mutable(&loc)?;
             let intent = InodeTimestampIntent::new(
                 timestamp_value(atime_intent),
                 timestamp_value(mtime_intent),
@@ -1844,7 +1899,7 @@ pub fn sys_renameat<M: UserMemory + ?Sized>(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RenameFinalName<'a> {
-    name: &'a str,
+    name: &'a FsName,
     requires_directory: bool,
 }
 
@@ -1870,7 +1925,7 @@ fn renameat_final_name(
     }
 }
 
-fn lookup_optional_in_mount(parent: &Location, name: &str) -> AxResult<Option<Location>> {
+fn lookup_optional_in_mount(parent: &Location, name: &FsName) -> AxResult<Option<Location>> {
     match parent.lookup_no_follow_in_mount(name) {
         Ok(location) => Ok(Some(location)),
         Err(AxError::NotFound) => Ok(None),
@@ -1903,11 +1958,11 @@ pub fn sys_renameat2<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     let old_path = load_user_path(memory, old_path)?;
     let new_path = load_user_path(memory, new_path)?;
-    let old_path_ref = Path::new(&old_path);
-    let new_path_ref = Path::new(&new_path);
+    let old_path_ref = &*old_path;
+    let new_path_ref = &*new_path;
     debug!(
         "sys_renameat2 <= old_dirfd: {old_dirfd}, old_path: {old_path:?}, new_dirfd: {new_dirfd}, \
-         new_path: {new_path}, flags: {flags}"
+         new_path: {new_path:?}, flags: {flags}"
     );
 
     if flags & !SUPPORTED_RENAMEAT2_FLAGS != 0 {
@@ -1916,10 +1971,10 @@ pub fn sys_renameat2<M: UserMemory + ?Sized>(
     if flags & RENAME_EXCHANGE != 0 && flags & (RENAME_NOREPLACE | RENAME_WHITEOUT) != 0 {
         return Err(AxError::InvalidInput);
     }
-    if flags & (RENAME_EXCHANGE | RENAME_WHITEOUT) != 0 {
-        return Err(AxError::OperationNotSupported);
+    if flags & RENAME_WHITEOUT != 0 && flags & RENAME_NOREPLACE != 0 {
+        return Err(AxError::InvalidInput);
     }
-    if old_path.is_empty() || new_path.is_empty() {
+    if old_path.as_bytes().is_empty() || new_path.as_bytes().is_empty() {
         return Err(AxError::NotFound);
     }
     validate_pathname(old_path_ref)?;
@@ -1959,6 +2014,37 @@ pub fn sys_renameat2<M: UserMemory + ?Sized>(
     // make both transaction identity checks and the eventual EBUSY wrong.
     let old_loc = old_dir.lookup_no_follow_in_mount(old_final.name)?;
     let new_existing = lookup_optional_in_mount(&new_dir, new_final.name)?;
+    if flags & RENAME_EXCHANGE != 0 && new_existing.is_none() {
+        // Exchange has no create half: both names must have been resolved
+        // under their exact parent mounts before any permission or backend
+        // admission is attempted.
+        return Err(AxError::NotFound);
+    }
+    // A no-replace request reports the existing destination before ordinary
+    // rename's same-inode no-op.  All other modes short-circuit here, before
+    // immutable/append and active-swap admission can reject a mutation that
+    // will not occur.
+    if flags & RENAME_NOREPLACE != 0 && new_existing.is_some() {
+        return Err(AxError::AlreadyExists);
+    }
+    if new_existing
+        .as_ref()
+        .is_some_and(|destination| destination.same_node(&old_loc))
+    {
+        return Ok(0);
+    }
+    inode_flags::check_nonappend_content_mutable(&old_dir)?;
+    if new_existing.is_some() {
+        // Replacing a destination removes a name from this directory. Merely
+        // adding a new name remains permitted for an append-only directory.
+        inode_flags::check_nonappend_content_mutable(&new_dir)?;
+    } else {
+        inode_flags::check_content_mutable(&new_dir)?;
+    }
+    inode_flags::check_nonappend_content_mutable(&old_loc)?;
+    if let Some(destination) = new_existing.as_ref() {
+        inode_flags::check_nonappend_content_mutable(destination)?;
+    }
     // Swap backing is identified by inode, not pathname: prohibit both
     // renaming the active backing and replacing it through the destination.
     crate::mm::check_not_active(&old_loc)?;
@@ -1970,9 +2056,6 @@ pub fn sys_renameat2<M: UserMemory + ?Sized>(
         .as_ref()
         .map(crate::mm::admit_mutation)
         .transpose()?;
-    if flags & RENAME_NOREPLACE != 0 && new_existing.is_some() {
-        return Err(AxError::AlreadyExists);
-    }
 
     // lock_rename() classifies the two directory-topology traps after lookup
     // but before trailing-slash checks, path hooks, DAC, or inode hooks.
@@ -1992,26 +2075,43 @@ pub fn sys_renameat2<M: UserMemory + ?Sized>(
     // the same inode. This includes distinct hard-link names and intentionally
     // precedes may_delete and the inode_rename hook. RENAME_NOREPLACE has
     // already returned EEXIST above.
-    if new_existing
-        .as_ref()
-        .is_some_and(|destination| destination.same_node(&old_loc))
-    {
-        return Ok(0);
-    }
-
     let old_is_dir = old_loc.is_dir();
 
-    let outcome = namespace_mutation::rename(
-        &mount_operation,
-        &old_dir,
-        old_final.name,
-        &old_loc,
-        &new_dir,
-        new_final.name,
-        new_existing.as_ref(),
-        flags & RENAME_NOREPLACE != 0,
-        &security,
-    )?;
+    let outcome = if flags & RENAME_EXCHANGE != 0 {
+        namespace_mutation::rename_exchange(
+            &mount_operation,
+            &old_dir,
+            old_final.name,
+            &old_loc,
+            &new_dir,
+            new_final.name,
+            new_existing.as_ref().ok_or(AxError::NotFound)?,
+            &security,
+        )?
+    } else if flags & RENAME_WHITEOUT != 0 {
+        namespace_mutation::rename_whiteout(
+            &mount_operation,
+            &old_dir,
+            old_final.name,
+            &old_loc,
+            &new_dir,
+            new_final.name,
+            new_existing.as_ref(),
+            &security,
+        )?
+    } else {
+        namespace_mutation::rename(
+            &mount_operation,
+            &old_dir,
+            old_final.name,
+            &old_loc,
+            &new_dir,
+            new_final.name,
+            new_existing.as_ref(),
+            flags & RENAME_NOREPLACE != 0,
+            &security,
+        )?
+    };
     if outcome.replaced_loses_last_link
         && let Some(replaced) = outcome.replaced.as_ref()
     {
@@ -2029,6 +2129,39 @@ pub fn sys_renameat2<M: UserMemory + ?Sized>(
             cookie,
         ),
     );
+    if flags & RENAME_EXCHANGE != 0 {
+        // An exchange is two correlated moves, each with its own cookie; the
+        // paired notifications preserve the identities observed before the
+        // backend's single swap transaction.
+        let destination = new_existing.as_ref().ok_or(AxError::NotFound)?;
+        let exchange_cookie = crate::file::inotify::next_rename_cookie();
+        warn_notification(
+            "rename exchange destination source",
+            crate::file::inotify::notify_parent_with_name(
+                &new_dir,
+                Some(destination),
+                new_final.name,
+                IN_MOVED_FROM,
+                destination.is_dir(),
+                exchange_cookie,
+            ),
+        );
+        warn_notification(
+            "rename exchange destination target",
+            crate::file::inotify::notify_parent_with_name(
+                &old_dir,
+                Some(destination),
+                old_final.name,
+                IN_MOVED_TO,
+                destination.is_dir(),
+                exchange_cookie,
+            ),
+        );
+        warn_notification(
+            "rename exchange self",
+            crate::file::inotify::notify_exact(destination, IN_MOVE_SELF),
+        );
+    }
     warn_notification(
         "rename destination",
         crate::file::inotify::notify_parent_with_name(

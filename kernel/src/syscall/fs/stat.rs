@@ -1,11 +1,10 @@
-use alloc::string::String;
 use core::{
     ffi::{c_char, c_int},
     mem::{align_of, offset_of, size_of},
 };
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::{DeviceId, Location, NodePermission, NodeType, path::Path};
+use axfs_ng_vfs::{DeviceId, FsPathBuf, Location, NodePermission, NodeType};
 use axtask::current;
 use linux_raw_sys::general::{
     __kernel_fsid_t, AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_NO_AUTOMOUNT, AT_STATX_SYNC_TYPE,
@@ -18,25 +17,34 @@ use linux_raw_sys::general::{
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load_until_nul};
 
 use super::ctl::validate_pathname;
+#[cfg(feature = "bpf")]
+use crate::file::bpf::{BpfMapFd, BpfProgFd};
 use crate::{
     file::{
-        AfAlgSocket, Directory, File, FileLike, IoUring, NamedPipe, NetlinkSocket, PacketSocket, Pipe, Socket,
-        UserfaultFile, get_file_like, PidFd,
-        epoll::Epoll, event::EventFd, fanotify::FanotifyFile, inotify::InotifyFile,
+        AfAlgSocket, Directory, File, FileLike, IoUring, NamedPipe, NetlinkSocket, PacketSocket,
+        PidFd, Pipe, Socket, UserfaultFile,
+        epoll::Epoll,
+        event::EventFd,
+        fanotify::FanotifyFile,
+        get_file_like,
+        inotify::InotifyFile,
         permission::{
             SecurityFsContextExt, VfsSecurityContext, check_dac_permissions,
-            check_dac_permissions_with_security, check_inode_permissions_with_security,
+            check_dac_permissions_with_security,
         },
-        signalfd::Signalfd, timerfd::TimerFd,
-        resolve_at, resolve_at_with_security, resolve_at_with_synthetic_credentials, with_path_fs,
+        resolve_at, resolve_at_with_security, resolve_at_with_synthetic_credentials,
+        signalfd::Signalfd,
+        timerfd::TimerFd,
+        with_path_fs,
     },
     mm::map_usercopy_error,
     mounts,
+    syscall::{
+        MqFd,
+        fs::mount::{FsMountFd, FsOpenFd},
+    },
     task::AsThread,
-    syscall::{MqFd, fs::mount::{FsMountFd, FsOpenFd}},
 };
-#[cfg(feature = "bpf")]
-use crate::file::bpf::{BpfMapFd, BpfProgFd};
 
 const SUPPORTED_FACCESSAT_FLAGS: u32 = AT_EACCESS | AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
 const SUPPORTED_FSTATAT_FLAGS: u32 = AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW;
@@ -104,9 +112,10 @@ const _: () = {
 fn load_user_path<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     path: *const c_char,
-) -> AxResult<String> {
-    String::from_utf8(vm_load_until_nul(memory, path.cast::<u8>()).map_err(map_usercopy_error)?)
-        .map_err(|_| AxError::IllegalBytes)
+) -> AxResult<FsPathBuf> {
+    Ok(FsPathBuf::from_vec(
+        vm_load_until_nul(memory, path.cast::<u8>()).map_err(map_usercopy_error)?,
+    ))
 }
 
 fn write_stat<M: UserMemory + ?Sized>(
@@ -298,13 +307,24 @@ pub fn sys_fstatat<M: UserMemory + ?Sized>(
         .map(|path| load_user_path(memory, path))
         .transpose()?;
     if let Some(path) = path.as_deref() {
-        if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+        if path.as_bytes().is_empty() && flags & AT_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);
         }
-        validate_pathname(Path::new(path))?;
+        validate_pathname(path)?;
     }
 
     debug!("sys_fstatat <= dirfd: {dirfd}, path: {path:?}, flags: {flags}");
+
+    if flags & AT_EMPTY_PATH != 0
+        && dirfd != AT_FDCWD
+        && path
+            .as_deref()
+            .is_none_or(|path| path.as_bytes().is_empty())
+    {
+        let stat = get_file_like(dirfd)?.stat_with_open_mount()?;
+        write_stat(memory, statbuf, stat.into())?;
+        return Ok(0);
+    }
 
     let loc = resolve_at(dirfd, path.as_deref(), flags)?;
     write_stat(memory, statbuf, loc.stat()?.into())?;
@@ -368,10 +388,21 @@ pub fn sys_statx<M: UserMemory + ?Sized>(
         return Err(AxError::BadAddress);
     }
     if let Some(path) = path.as_deref() {
-        if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+        if path.as_bytes().is_empty() && flags & AT_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);
         }
-        validate_pathname(Path::new(path))?;
+        validate_pathname(path)?;
+    }
+
+    if flags & AT_EMPTY_PATH != 0
+        && dirfd != AT_FDCWD
+        && path
+            .as_deref()
+            .is_none_or(|path| path.as_bytes().is_empty())
+    {
+        let stat = get_file_like(dirfd)?.stat_with_open_mount()?;
+        write_statx(memory, statxbuf, statx_from_kstat(stat, mask))?;
+        return Ok(0);
     }
 
     let loc = resolve_at(dirfd, path.as_deref(), flags)?;
@@ -428,10 +459,10 @@ pub fn sys_faccessat2<M: UserMemory + ?Sized>(
         return Err(AxError::InvalidInput);
     }
     if let Some(path) = path.as_deref() {
-        if path.is_empty() && flags & AT_EMPTY_PATH == 0 {
+        if path.as_bytes().is_empty() && flags & AT_EMPTY_PATH == 0 {
             return Err(AxError::NotFound);
         }
-        validate_pathname(Path::new(path))?;
+        validate_pathname(path)?;
     }
 
     let curr = current();
@@ -472,7 +503,12 @@ pub fn sys_faccessat2<M: UserMemory + ?Sized>(
             // IDs; it is not an operation on the object and must not consume
             // Landlock rights.
             check_dac_permissions_with_security(
-                perm, metadata.uid, metadata.gid, node_type, mode, security,
+                perm,
+                metadata.uid,
+                metadata.gid,
+                node_type,
+                mode,
+                security,
             )?;
         } else {
             check_dac_permissions_with_security(
@@ -525,16 +561,22 @@ enum SpecialFdFilesystem {
 /// family the kernel exports. Unknown `FileLike` implementations deliberately
 /// receive no synthetic statfs result.
 fn special_fd_filesystem(fd: &dyn FileLike) -> Option<SpecialFdFilesystem> {
-    if fd.downcast_ref::<Pipe>().is_some() { return Some(SpecialFdFilesystem::Pipe); }
+    if fd.downcast_ref::<Pipe>().is_some() {
+        return Some(SpecialFdFilesystem::Pipe);
+    }
     if fd.downcast_ref::<Socket>().is_some()
         || fd.downcast_ref::<NetlinkSocket>().is_some()
         || fd.downcast_ref::<PacketSocket>().is_some()
         || fd.downcast_ref::<AfAlgSocket>().is_some()
-    { return Some(SpecialFdFilesystem::Socket); }
-    if fd.downcast_ref::<MqFd>().is_some() { return Some(SpecialFdFilesystem::Mqueue); }
+    {
+        return Some(SpecialFdFilesystem::Socket);
+    }
+    if fd.downcast_ref::<MqFd>().is_some() {
+        return Some(SpecialFdFilesystem::Mqueue);
+    }
     #[cfg(feature = "bpf")]
-    let bpf_anon_inode = fd.downcast_ref::<BpfMapFd>().is_some()
-        || fd.downcast_ref::<BpfProgFd>().is_some();
+    let bpf_anon_inode =
+        fd.downcast_ref::<BpfMapFd>().is_some() || fd.downcast_ref::<BpfProgFd>().is_some();
     #[cfg(not(feature = "bpf"))]
     let bpf_anon_inode = false;
     if fd.downcast_ref::<EventFd>().is_some()
@@ -549,7 +591,9 @@ fn special_fd_filesystem(fd: &dyn FileLike) -> Option<SpecialFdFilesystem> {
         || fd.downcast_ref::<FsOpenFd>().is_some()
         || fd.downcast_ref::<FsMountFd>().is_some()
         || bpf_anon_inode
-    { return Some(SpecialFdFilesystem::AnonymousInode); }
+    {
+        return Some(SpecialFdFilesystem::AnonymousInode);
+    }
     None
 }
 
@@ -590,10 +634,10 @@ pub fn sys_statfs<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     let path = load_user_path(memory, path)?;
     debug!("sys_statfs <= path: {path:?}");
-    if path.is_empty() {
+    if path.as_bytes().is_empty() {
         return Err(AxError::NotFound);
     }
-    let path_ref = Path::new(&path);
+    let path_ref = &*path;
     validate_pathname(path_ref)?;
 
     let curr = current();

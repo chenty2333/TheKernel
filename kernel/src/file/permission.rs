@@ -1,10 +1,10 @@
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs::FsContext;
 use axfs_ng_vfs::{
-    Location, Metadata, MetadataUpdate, NodePermission, NodeType, Timestamp,
-    path::{FinalComponent, FinalComponentKind, Path},
+    FsName, FsPath, Location, Metadata, MetadataUpdate, NodePermission, NodeType, Timestamp,
+    path::{FinalComponent, FinalComponentKind},
 };
 use linux_raw_sys::general::{
     CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_FSETID, R_OK, W_OK, X_OK,
@@ -26,19 +26,20 @@ use thekernel_linux_cred::{
 };
 
 use crate::{
-    file::privilege_metadata::InodePrivilegeCleanup,
+    file::{posix_acl, privilege_metadata::InodePrivilegeCleanup},
     pseudofs::check_proc_pid_dir_search,
     task::{
-        AsThread, Cred, DacCredentialView, Kgid, Kuid, UserNamespace,
+        AsThread, Cred, DacCredentialView, Kgid, Kuid, UserNamespace, ns_capable,
         security::{
             ExistingInodeSecurityRef, FileOpenSecurityContext, InodeCreateSecurityContext,
             InodeLinkSecurityContext, InodeMkdirSecurityContext, InodeMknodSecurityContext,
             InodePermissionOperation, InodePermissionSecurityContext, InodeRenameSecurityContext,
             InodeRmdirSecurityContext, InodeSecurityRef, InodeSetattrCommittedSecurityRef,
             InodeSetattrSecurityAdmission, InodeSetattrSecurityContext,
-            InodeSymlinkSecurityContext, InodeUnlinkSecurityContext, LANDLOCK_ACCESS_FS_EXECUTE, LANDLOCK_ACCESS_FS_IOCTL_DEV,
-            LANDLOCK_ACCESS_FS_MAKE_BLOCK, LANDLOCK_ACCESS_FS_MAKE_CHAR,
-            LANDLOCK_ACCESS_FS_MAKE_DIR, LANDLOCK_ACCESS_FS_MAKE_FIFO, LANDLOCK_ACCESS_FS_MAKE_REG,
+            InodeSymlinkSecurityContext, InodeUnlinkSecurityContext, LANDLOCK_ACCESS_FS_EXECUTE,
+            LANDLOCK_ACCESS_FS_IOCTL_DEV, LANDLOCK_ACCESS_FS_MAKE_BLOCK,
+            LANDLOCK_ACCESS_FS_MAKE_CHAR, LANDLOCK_ACCESS_FS_MAKE_DIR,
+            LANDLOCK_ACCESS_FS_MAKE_FIFO, LANDLOCK_ACCESS_FS_MAKE_REG,
             LANDLOCK_ACCESS_FS_MAKE_SOCK, LANDLOCK_ACCESS_FS_MAKE_SYM, LANDLOCK_ACCESS_FS_READ_DIR,
             LANDLOCK_ACCESS_FS_READ_FILE, LANDLOCK_ACCESS_FS_REFER, LANDLOCK_ACCESS_FS_REMOVE_DIR,
             LANDLOCK_ACCESS_FS_REMOVE_FILE, LANDLOCK_ACCESS_FS_TRUNCATE,
@@ -54,6 +55,51 @@ use crate::{
 
 static INITIAL_USER_NAMESPACE_DAC_DOMAIN: () = ();
 
+/// Projects on-disk ids through the immutable map selected for this exact
+/// mount.  VFS stores filesystem ids; DAC must instead see the ids visible to
+/// the task in an idmapped mount.  An actor outside the map's user namespace
+/// deliberately receives overflow ids rather than accidental ownership.
+fn idmapped_metadata_for_actor(
+    loc: &Location,
+    metadata: &Metadata,
+    security: &VfsSecurityContext,
+) -> AxResult<Metadata> {
+    let Some(idmap) = security.idmap_for(loc)? else {
+        return Ok(metadata.clone());
+    };
+    Ok(metadata_for_idmap(metadata, security.actor(), Some(&idmap)))
+}
+
+/// Projects metadata through an already selected mount idmap.  Descriptor
+/// operations pass the OFD-pinned snapshot here instead of resolving the
+/// caller's current mount namespace after `setns()`.
+fn metadata_for_idmap(
+    metadata: &Metadata,
+    actor: &Cred,
+    idmap: Option<&crate::mounts::MountIdmap>,
+) -> Metadata {
+    let Some(idmap) = idmap else {
+        return metadata.clone();
+    };
+    let mut projected = metadata.clone();
+    let map = |id: u32, rows: &[crate::mounts::MountIdmapRange]| {
+        rows.iter().find_map(|row| {
+            let end = row.outside.checked_add(row.length)?;
+            (id >= row.outside && id < end)
+                .then_some(row.inside.checked_add(id - row.outside))
+                .flatten()
+        })
+    };
+    if actor.user_ns().identity().into_raw() != idmap.user_namespace().identity().into_raw() {
+        projected.uid = u32::MAX;
+        projected.gid = u32::MAX;
+    } else {
+        projected.uid = map(metadata.uid, &idmap.uid).unwrap_or(u32::MAX);
+        projected.gid = map(metadata.gid, &idmap.gid).unwrap_or(u32::MAX);
+    }
+    projected
+}
+
 /// One immutable actor/DAC/owner-namespace snapshot shared by a complete VFS
 /// operation.
 ///
@@ -67,6 +113,20 @@ pub(crate) struct VfsSecurityContext {
     actor: Arc<Cred>,
     credentials: DacCredentialView,
     filesystem_owner_user_ns: Arc<UserNamespace>,
+    mount_topology: Option<Arc<crate::mounts::MountTopology>>,
+    /// Detached mount FDs are not yet members of a namespace topology, but
+    /// their retained idmaps still govern every pathname walk in that tree.
+    detached_mount_idmaps: Option<Arc<Vec<(u64, Arc<crate::mounts::MountIdmap>)>>>,
+    landlock_domain: Option<crate::task::security::LandlockDomain>,
+}
+
+/// Captures the current task's immutable VFS authority for one synchronous
+/// operation.  MM advice paths use this after retaining a mapped file, where
+/// no fd-table lookup is available but DAC/LSM checks must still observe the
+/// same actor snapshot as ordinary VFS syscalls.
+pub(crate) fn current_vfs_security() -> VfsSecurityContext {
+    let current = axtask::current();
+    VfsSecurityContext::new(current.as_thread().current_cred())
 }
 
 /// Landlock is task-local rather than credential-local.  Fetching its
@@ -74,35 +134,76 @@ pub(crate) struct VfsSecurityContext {
 /// can only append a new layer by returning to userspace and issuing another
 /// syscall.  Denials deliberately use EACCES, matching Linux path rules.
 pub(crate) fn check_landlock_access(location: &Location, access: u64) -> AxResult {
-    if axtask::current()
-        .as_thread()
-        .landlock_domain()
-        .allows_path(location, access)
+    // Landlock restrictions belong to a Linux thread.  Host capability tests
+    // and kernel-internal VFS operations can run without one; in that case
+    // there is no task-local ruleset to enforce.
+    if let Some(current) = axtask::current_may_uninit()
+        && let Some(thread) = current.try_as_thread()
     {
-        Ok(())
-    } else {
-        Err(AxError::PermissionDenied)
+        let domain = thread.landlock_domain();
+        if !domain.allows_path(location, access) {
+            domain.report_path_denial(location, access);
+            return Err(AxError::PermissionDenied);
+        }
     }
+    Ok(())
 }
 
 pub(crate) fn landlock_allows_access(location: &Location, access: u64) -> bool {
-    axtask::current()
-        .as_thread()
-        .landlock_domain()
-        .allows_path(location, access)
+    axtask::current_may_uninit().is_none_or(|current| {
+        current
+            .try_as_thread()
+            .is_none_or(|thread| thread.landlock_domain().allows_path(location, access))
+    })
+}
+
+/// A file description can cache the Landlock decision made at open time for
+/// operations whose object identity cannot change.  The later rejection still
+/// represents an access attempt and must be accounted/audited at that point.
+pub(crate) fn report_cached_landlock_denial(location: &Location, access: u64) {
+    if let Some(current) = axtask::current_may_uninit()
+        && let Some(thread) = current.try_as_thread()
+    {
+        thread
+            .landlock_domain()
+            .report_path_denial(location, access);
+    }
 }
 fn check_landlock_refer_transition(source: &Location, destination: &Location) -> AxResult {
-    let domain = axtask::current().as_thread().landlock_domain();
     let compared_access = if source.is_dir() {
         u64::MAX
     } else {
-        LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_READ_FILE
-            | LANDLOCK_ACCESS_FS_REFER | LANDLOCK_ACCESS_FS_TRUNCATE | LANDLOCK_ACCESS_FS_IOCTL_DEV
+        LANDLOCK_ACCESS_FS_EXECUTE
+            | LANDLOCK_ACCESS_FS_WRITE_FILE
+            | LANDLOCK_ACCESS_FS_READ_FILE
+            | LANDLOCK_ACCESS_FS_REFER
+            | LANDLOCK_ACCESS_FS_TRUNCATE
+            | LANDLOCK_ACCESS_FS_IOCTL_DEV
     };
-    if domain.allows_path(source, LANDLOCK_ACCESS_FS_REFER)
-        && domain.allows_path(destination, LANDLOCK_ACCESS_FS_REFER)
-        && domain.destination_is_no_less_restrictive(source, destination, compared_access)
-    {
+    let Some(current) = axtask::current_may_uninit() else {
+        return Ok(());
+    };
+    let Some(thread) = current.try_as_thread() else {
+        return Ok(());
+    };
+    let domain = thread.landlock_domain();
+    let source_allowed = domain.allows_path(source, LANDLOCK_ACCESS_FS_REFER);
+    let destination_allowed = domain.allows_path(destination, LANDLOCK_ACCESS_FS_REFER);
+    if !source_allowed {
+        domain.report_path_denial(source, LANDLOCK_ACCESS_FS_REFER);
+    }
+    if !destination_allowed {
+        domain.report_path_denial(destination, LANDLOCK_ACCESS_FS_REFER);
+    }
+    // MAKE_*/REMOVE_* admission is checked by the caller before this helper,
+    // which gives those ordinary access denials Linux's EACCES precedence.
+    // REFER itself is the cross-hierarchy constraint: it is denied by default
+    // even when a layer did not declare the bit, and both a missing REFER grant
+    // and a destination which would gain rights are reported as EXDEV.
+    if !source_allowed || !destination_allowed {
+        return Err(LinuxError::EXDEV.into());
+    }
+    if domain.destination_is_no_less_restrictive(source, destination, compared_access) {
         Ok(())
     } else {
         Err(LinuxError::EXDEV.into())
@@ -133,7 +234,89 @@ impl VfsSecurityContext {
             actor,
             credentials,
             filesystem_owner_user_ns,
+            mount_topology: axtask::current_may_uninit().and_then(|task| {
+                task.try_as_thread()
+                    .map(|thread| thread.mount_ns().topology())
+            }),
+            detached_mount_idmaps: None,
+            landlock_domain: axtask::current_may_uninit()
+                .and_then(|task| task.try_as_thread().map(|thread| thread.landlock_domain())),
         }
+    }
+
+    /// Constructs an authority view for deferred pathname work.  No later
+    /// permission or idmap lookup is allowed to consult the executor task.
+    pub(crate) fn with_execution_authority(
+        actor: Arc<Cred>,
+        mount_topology: Arc<crate::mounts::MountTopology>,
+        landlock_domain: crate::task::security::LandlockDomain,
+    ) -> Self {
+        let credentials = actor.fs_dac_credentials();
+        let filesystem_owner_user_ns = initial_user_namespace(actor.user_ns());
+        Self {
+            actor,
+            credentials,
+            filesystem_owner_user_ns,
+            mount_topology: Some(mount_topology),
+            detached_mount_idmaps: None,
+            landlock_domain: Some(landlock_domain),
+        }
+    }
+
+    pub(crate) fn with_detached_mount_authority(
+        actor: Arc<Cred>,
+        detached_mount_idmaps: Vec<(u64, Arc<crate::mounts::MountIdmap>)>,
+        landlock_domain: crate::task::security::LandlockDomain,
+    ) -> AxResult<Self> {
+        let credentials = actor.fs_dac_credentials();
+        let filesystem_owner_user_ns = initial_user_namespace(actor.user_ns());
+        let detached_mount_idmaps =
+            Arc::try_new(detached_mount_idmaps).map_err(|_| AxError::NoMemory)?;
+        Ok(Self {
+            actor,
+            credentials,
+            filesystem_owner_user_ns,
+            mount_topology: None,
+            detached_mount_idmaps: Some(detached_mount_idmaps),
+            landlock_domain: Some(landlock_domain),
+        })
+    }
+
+    fn idmap_for(&self, location: &Location) -> AxResult<Option<Arc<crate::mounts::MountIdmap>>> {
+        let mount_id = location.mountpoint().mount_id();
+        if let Some(topology) = self.mount_topology.as_ref() {
+            match topology.idmap_for_mount(mount_id) {
+                Ok(idmap) => return Ok(idmap),
+                Err(AxError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(self.detached_mount_idmaps.as_ref().and_then(|idmaps| {
+            idmaps
+                .iter()
+                .find(|(candidate, _)| *candidate == mount_id)
+                .map(|(_, idmap)| idmap.clone())
+        }))
+    }
+
+    pub(crate) fn check_landlock_access(&self, location: &Location, access: u64) -> AxResult {
+        if let Some(domain) = self.landlock_domain.as_ref()
+            && !domain.allows_path(location, access)
+        {
+            domain.report_path_denial(location, access);
+            return Err(AxError::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn landlock_allows_access(&self, location: &Location, access: u64) -> bool {
+        self.landlock_domain
+            .as_ref()
+            .is_none_or(|domain| domain.allows_path(location, access))
+    }
+
+    pub(crate) fn mount_topology(&self) -> Option<Arc<crate::mounts::MountTopology>> {
+        self.mount_topology.clone()
     }
 
     pub(crate) fn actor(&self) -> &Cred {
@@ -186,6 +369,25 @@ impl VfsSecurityContext {
         ))
     }
 
+    /// Runs the dedicated `security_inode_file_getattr` pre-hook.  The hook
+    /// intentionally has no DAC access decision attached: file attributes are
+    /// metadata selected after pathname traversal, not a content read.
+    pub(crate) fn inode_file_getattr(
+        &self,
+        location: &Location,
+        metadata: &Metadata,
+    ) -> AxResult<()> {
+        let object = InodeSecurityRef::new(location, metadata);
+        dispatch_inode_permission(&InodePermissionSecurityContext::new_for_operation(
+            self.actor(),
+            self.credentials(),
+            self.filesystem_owner_user_ns(),
+            &object,
+            InodePermissionAccess::READ,
+            InodePermissionOperation::FileGetattr,
+        ))
+    }
+
     pub(crate) fn begin_pseudo_inode_setattr<'context>(
         &'context self,
         metadata: &Metadata,
@@ -225,6 +427,13 @@ pub(crate) struct PreparedInodeSetattr<'context, 'location> {
 }
 
 impl<'context, 'location> PreparedInodeSetattr<'context, 'location> {
+    /// The exact mode which the already-admitted Linux setattr plan will
+    /// publish. Side metadata that must stay coherent with chmod (POSIX ACL
+    /// masks) can be staged against this value before publication.
+    pub(crate) const fn committed_mode(&self) -> NodePermission {
+        self.prepared.committed.mode
+    }
+
     /// Publishes the backend update against the exact location bound during
     /// pre-hook admission. Chown publication first consumes its location-bound
     /// privilege-cleanup token; a later backend failure deliberately does not
@@ -246,6 +455,41 @@ impl<'context, 'location> PreparedInodeSetattr<'context, 'location> {
             location,
             committed: prepared.committed,
         })
+    }
+
+    /// Stage a reversible companion update before publishing inode metadata.
+    /// If the VFS metadata write fails, the staged state is rolled back before
+    /// the security admission is dropped, so no post-hook token is leaked.
+    pub(crate) fn publish_with_staged<T>(
+        self,
+        stage: impl FnOnce() -> AxResult<T>,
+        rollback: impl FnOnce(T) -> AxResult<()>,
+    ) -> AxResult<(PublishedInodeSetattr<'context, 'location>, T)> {
+        let staged = stage()?;
+        let Self {
+            admission,
+            location,
+            prepared,
+            privilege_cleanup,
+        } = self;
+        if let Some(privilege_cleanup) = privilege_cleanup
+            && let Err(error) = privilege_cleanup.apply()
+        {
+            let _ = rollback(staged);
+            return Err(error);
+        }
+        if let Err(error) = location.update_metadata(prepared.update) {
+            let _ = rollback(staged);
+            return Err(error);
+        }
+        Ok((
+            PublishedInodeSetattr {
+                admission: Some(admission),
+                location,
+                committed: prepared.committed,
+            },
+            staged,
+        ))
     }
 }
 
@@ -736,6 +980,9 @@ enum DacCapabilityDispatch<'a> {
     SnapshotOnly,
     /// Normal live VFS operation over one exact pinned composite actor.
     Actor(&'a Cred),
+    /// Descriptor operation whose mount idmap pins the namespace relative to
+    /// which VFS override capabilities are evaluated.
+    ActorInNamespace(&'a Cred, &'a Arc<UserNamespace>),
 }
 
 #[derive(Clone, Copy)]
@@ -759,6 +1006,17 @@ impl<'a> KernelDacCredentials<'a> {
         }
     }
 
+    const fn actor_bound_in_namespace(
+        actor: &'a Cred,
+        credentials: &'a DacCredentialView,
+        namespace: &'a Arc<UserNamespace>,
+    ) -> Self {
+        Self {
+            credentials,
+            capability_dispatch: DacCapabilityDispatch::ActorInNamespace(actor, namespace),
+        }
+    }
+
     fn has_raw_capability(&self, capability: u32) -> bool {
         if !self.credentials.has_capability(capability) {
             return false;
@@ -766,6 +1024,9 @@ impl<'a> KernelDacCredentials<'a> {
         match self.capability_dispatch {
             DacCapabilityDispatch::SnapshotOnly => true,
             DacCapabilityDispatch::Actor(actor) => actor.has_effective_capability(capability),
+            DacCapabilityDispatch::ActorInNamespace(actor, namespace) => {
+                ns_capable(actor, namespace, capability)
+            }
         }
     }
 }
@@ -1000,6 +1261,30 @@ fn check_dac_permissions_with_actor(
     }
 }
 
+fn check_dac_permissions_with_actor_in_namespace(
+    perm: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    node_type: NodeType,
+    requested: u32,
+    actor: &Cred,
+    credentials: &DacCredentialView,
+    namespace: &Arc<UserNamespace>,
+) -> AxResult {
+    if dac_access_allowed_with(
+        perm,
+        owner_uid,
+        owner_gid,
+        node_type,
+        requested,
+        KernelDacCredentials::actor_bound_in_namespace(actor, credentials, namespace),
+    ) {
+        Ok(())
+    } else {
+        Err(AxError::PermissionDenied)
+    }
+}
+
 pub(crate) fn check_dac_permissions_with_security(
     perm: u32,
     owner_uid: u32,
@@ -1084,14 +1369,83 @@ pub(crate) fn check_inode_permissions_with_security(
     let Some(access) = inode_permission_access(requested)? else {
         return Ok(());
     };
-    check_inode_permissions_with_metadata(
+    let projected = idmapped_metadata_for_actor(loc, metadata, security)?;
+    check_inode_permissions_with_projected_metadata(
         loc,
-        metadata,
+        &projected,
         requested,
         access,
         security.actor(),
         security.credentials(),
         security.filesystem_owner_user_ns(),
+        None,
+        Some(security),
+    )
+}
+
+/// Computes the two facts used by Linux's `inode_owner_or_capable()`.
+///
+/// This is deliberately distinct from [`metadata_for_idmap`], whose overflow
+/// projection is a DAC view for one actor.  `inode_owner_or_capable()` first
+/// forms a mount-relative vfsuid, compares it with the current fsuid, then
+/// permits `CAP_FOWNER` only when that vfsuid maps into the caller's current
+/// user namespace.
+pub(crate) fn inode_owner_and_fowner_with_idmap(
+    metadata: &Metadata,
+    security: &VfsSecurityContext,
+    idmap: Option<&crate::mounts::MountIdmap>,
+) -> (bool, bool) {
+    let vfsuid = idmap.map_or_else(
+        || Kuid::from_raw(metadata.uid),
+        |idmap| {
+            idmap
+                .uid
+                .iter()
+                .find_map(|row| {
+                    let end = row.outside.checked_add(row.length)?;
+                    (metadata.uid >= row.outside && metadata.uid < end)
+                        .then_some(row.inside.checked_add(metadata.uid - row.outside))
+                        .flatten()
+                })
+                // Linux's make_vfsuid() wraps map_id_down()'s mount-relative raw
+                // value directly as a vfsuid/kuid. Mapping it back through the
+                // idmap namespace would undo the mount shift and grant ownership
+                // to the wrong fsuid.
+                .and_then(Kuid::from_raw)
+        },
+    );
+    let actor = security.actor();
+    let owner = vfsuid == Some(actor.ids().fsuid);
+    let fowner_capable = vfsuid
+        .is_some_and(|uid| actor.user_ns().kernel_uid_to_user(uid).is_some())
+        && ns_capable(actor, actor.user_ns(), CAP_FOWNER);
+    (owner, fowner_capable)
+}
+
+/// Descriptor counterpart to [`check_inode_permissions_with_security`].
+/// The selected idmap is part of the open file description and therefore
+/// remains stable across mount-namespace changes by the calling task.
+pub(crate) fn check_inode_permissions_with_security_and_idmap(
+    loc: &Location,
+    metadata: &Metadata,
+    requested: u32,
+    security: &VfsSecurityContext,
+    idmap: Option<&crate::mounts::MountIdmap>,
+) -> AxResult {
+    let Some(access) = inode_permission_access(requested)? else {
+        return Ok(());
+    };
+    let projected = metadata_for_idmap(metadata, security.actor(), idmap);
+    check_inode_permissions_with_projected_metadata(
+        loc,
+        &projected,
+        requested,
+        access,
+        security.actor(),
+        security.credentials(),
+        security.filesystem_owner_user_ns(),
+        idmap.map(crate::mounts::MountIdmap::user_namespace),
+        Some(security),
     )
 }
 
@@ -1133,15 +1487,115 @@ fn check_inode_permissions_with_metadata(
     credentials: &DacCredentialView,
     filesystem_owner_user_ns: &Arc<UserNamespace>,
 ) -> AxResult {
-    check_dac_permissions_with_actor(
-        metadata.mode.bits() as u32,
-        metadata.uid,
-        metadata.gid,
-        metadata.node_type,
+    // Non-deferred callers retain their established current-task semantics.
+    // Deferred OPENAT2 uses `check_inode_permissions_with_security` above,
+    // which supplies its captured topology explicitly.
+    let topology = axtask::current_may_uninit().and_then(|task| {
+        task.try_as_thread()
+            .map(|thread| thread.mount_ns().topology())
+    });
+    let idmap = topology
+        .map(|topology| topology.idmap_for_mount(loc.mountpoint().mount_id()))
+        .transpose()?
+        .flatten();
+    let projected_metadata = metadata_for_idmap(metadata, actor, idmap.as_deref());
+    check_inode_permissions_with_projected_metadata(
+        loc,
+        &projected_metadata,
         requested,
+        access,
         actor,
         credentials,
-    )?;
+        filesystem_owner_user_ns,
+        None,
+        None,
+    )
+}
+
+fn check_inode_permissions_with_projected_metadata(
+    loc: &Location,
+    metadata: &Metadata,
+    requested: u32,
+    access: InodePermissionAccess,
+    actor: &Cred,
+    credentials: &DacCredentialView,
+    filesystem_owner_user_ns: &Arc<UserNamespace>,
+    capability_user_ns: Option<&Arc<UserNamespace>>,
+    landlock_security: Option<&VfsSecurityContext>,
+) -> AxResult {
+    if let Some(allowed) = posix_acl::check_access(loc, metadata, requested, credentials)? {
+        // An ACL named entry can grant access which the group mode cannot
+        // express. Conversely, a matching named entry must deny even when a
+        // broad group-mode bit would otherwise allow it. The two DAC override
+        // capabilities retain their normal Linux meaning.
+        let capable = |capability| {
+            capability_user_ns.map_or_else(
+                || actor.has_effective_capability(capability),
+                |namespace| ns_capable(actor, namespace, capability),
+            )
+        };
+        let override_allowed =
+            capable(CAP_DAC_OVERRIDE) || requested & W_OK == 0 && capable(CAP_DAC_READ_SEARCH);
+        if !allowed && !override_allowed {
+            return Err(AxError::PermissionDenied);
+        }
+        if allowed {
+            return check_inode_permission_post_dac(
+                loc,
+                metadata,
+                requested,
+                access,
+                actor,
+                credentials,
+                filesystem_owner_user_ns,
+                landlock_security,
+            );
+        }
+    }
+    if let Some(namespace) = capability_user_ns {
+        check_dac_permissions_with_actor_in_namespace(
+            metadata.mode.bits() as u32,
+            metadata.uid,
+            metadata.gid,
+            metadata.node_type,
+            requested,
+            actor,
+            credentials,
+            namespace,
+        )?;
+    } else {
+        check_dac_permissions_with_actor(
+            metadata.mode.bits() as u32,
+            metadata.uid,
+            metadata.gid,
+            metadata.node_type,
+            requested,
+            actor,
+            credentials,
+        )?;
+    }
+    check_inode_permission_post_dac(
+        loc,
+        metadata,
+        requested,
+        access,
+        actor,
+        credentials,
+        filesystem_owner_user_ns,
+        landlock_security,
+    )
+}
+
+fn check_inode_permission_post_dac(
+    loc: &Location,
+    metadata: &Metadata,
+    requested: u32,
+    access: InodePermissionAccess,
+    actor: &Cred,
+    credentials: &DacCredentialView,
+    filesystem_owner_user_ns: &Arc<UserNamespace>,
+    landlock_security: Option<&VfsSecurityContext>,
+) -> AxResult {
     let requested = requested & (R_OK | W_OK);
     let landlock_access = match metadata.node_type {
         NodeType::Directory if requested & R_OK != 0 => LANDLOCK_ACCESS_FS_READ_DIR,
@@ -1159,7 +1613,11 @@ fn check_inode_permissions_with_metadata(
         }
     };
     if landlock_access != 0 {
-        check_landlock_access(loc, landlock_access)?;
+        if let Some(security) = landlock_security {
+            security.check_landlock_access(loc, landlock_access)?;
+        } else {
+            check_landlock_access(loc, landlock_access)?;
+        }
     }
     let object = InodeSecurityRef::new(loc, metadata);
     dispatch_inode_permission(&InodePermissionSecurityContext::new(
@@ -1202,13 +1660,13 @@ pub(crate) fn authorize_file_open(
 pub(crate) fn authorize_named_inode_create(
     parent: &Location,
     parent_metadata: &Metadata,
-    name: &str,
+    name: &FsName,
     node_type: NodeType,
     mode: NodePermission,
     rdev: Option<axfs_ng_vfs::DeviceId>,
     security: &VfsSecurityContext,
 ) -> AxResult {
-    check_landlock_access(parent, landlock_make_access(node_type)?)?;
+    security.check_landlock_access(parent, landlock_make_access(node_type)?)?;
     let mode = InodeCreateMode::try_from_bits(mode.bits()).ok_or(AxError::BadState)?;
     let parent_object = InodeSecurityRef::new(parent, parent_metadata);
     let planned = PlannedInodeSecurityRef::new(parent_object, name);
@@ -1261,8 +1719,8 @@ pub(crate) fn authorize_named_inode_create(
 pub(crate) fn authorize_symlink_create(
     parent: &Location,
     parent_metadata: &Metadata,
-    name: &str,
-    target: &str,
+    name: &FsName,
+    target: &FsPath,
     security: &VfsSecurityContext,
 ) -> AxResult {
     check_landlock_access(parent, LANDLOCK_ACCESS_FS_MAKE_SYM)?;
@@ -1323,12 +1781,14 @@ pub(crate) fn authorize_hardlink_create(
     source_metadata: &Metadata,
     parent: &Location,
     parent_metadata: &Metadata,
-    name: &str,
+    name: &FsName,
     security: &VfsSecurityContext,
 ) -> AxResult {
     check_landlock_access(parent, LANDLOCK_ACCESS_FS_MAKE_REG)?;
-    if source.parent().as_ref().is_none_or(|source_parent| !source_parent.same_node(parent)) {
-        check_landlock_refer_transition(source, parent)?;
+    if let Some(source_parent) = source.parent()
+        && !source_parent.same_node(parent)
+    {
+        check_landlock_refer_transition(&source_parent, parent)?;
     }
     let source_object = InodeSecurityRef::new(source, source_metadata);
     let parent_object = InodeSecurityRef::new(parent, parent_metadata);
@@ -1354,7 +1814,7 @@ pub(crate) fn authorize_inode_unlink(
     parent_metadata: &Metadata,
     target: &Location,
     target_metadata: &Metadata,
-    name: &str,
+    name: &FsName,
     security: &VfsSecurityContext,
 ) -> AxResult {
     check_landlock_access(parent, LANDLOCK_ACCESS_FS_REMOVE_FILE)?;
@@ -1380,7 +1840,7 @@ pub(crate) fn authorize_inode_rmdir(
     parent_metadata: &Metadata,
     target: &Location,
     target_metadata: &Metadata,
-    name: &str,
+    name: &FsName,
     security: &VfsSecurityContext,
 ) -> AxResult {
     check_landlock_access(parent, LANDLOCK_ACCESS_FS_REMOVE_DIR)?;
@@ -1407,11 +1867,11 @@ pub(crate) fn authorize_inode_rename(
     old_parent_metadata: &Metadata,
     source: &Location,
     source_metadata: &Metadata,
-    old_name: &str,
+    old_name: &FsName,
     new_parent: &Location,
     new_parent_metadata: &Metadata,
     replaced: Option<(&Location, &Metadata)>,
-    new_name: &str,
+    new_name: &FsName,
     security: &VfsSecurityContext,
 ) -> AxResult<()> {
     check_landlock_access(
@@ -1431,7 +1891,7 @@ pub(crate) fn authorize_inode_rename(
         },
     )?;
     if !old_parent.same_node(new_parent) {
-        check_landlock_refer_transition(source, new_parent)?;
+        check_landlock_refer_transition(old_parent, new_parent)?;
     }
     let old_parent_object = InodeSecurityRef::new(old_parent, old_parent_metadata);
     let source_object = InodeSecurityRef::new(source, source_metadata);
@@ -1464,6 +1924,14 @@ pub(crate) fn check_pathwalk_search_permission_with_security(
     check_inode_permissions(dir, X_OK, actor, credentials, filesystem_owner_user_ns)
 }
 
+pub(crate) fn check_pathwalk_search_permission_with_vfs_security(
+    dir: &Location,
+    security: &VfsSecurityContext,
+) -> AxResult {
+    check_proc_pid_dir_search(dir)?;
+    check_inode_permissions_with_security(dir, &dir.metadata()?, X_OK, security)
+}
+
 pub(crate) fn check_create_permissions_with_security(
     dir: &Location,
     actor: &Cred,
@@ -1478,6 +1946,14 @@ pub(crate) fn check_create_permissions_with_security(
         credentials,
         filesystem_owner_user_ns,
     )
+}
+
+pub(crate) fn check_create_permissions_with_vfs_security(
+    dir: &Location,
+    security: &VfsSecurityContext,
+) -> AxResult {
+    check_writable_mount(dir)?;
+    check_inode_permissions_with_security(dir, &dir.metadata()?, W_OK | X_OK, security)
 }
 
 /// Applies named-create mount and parent admission to one caller-frozen
@@ -1511,6 +1987,21 @@ pub(crate) fn check_open_permissions_with_security(
     check_inode_permissions(loc, mask, actor, credentials, filesystem_owner_user_ns)
 }
 
+pub(crate) fn check_open_permissions_with_vfs_security(
+    loc: &Location,
+    mask: u32,
+    security: &VfsSecurityContext,
+) -> AxResult {
+    check_inode_permissions_with_security(loc, &loc.metadata()?, mask, security)
+}
+
+pub(crate) fn check_landlock_truncate_with_vfs_security(
+    location: &Location,
+    security: &VfsSecurityContext,
+) -> AxResult {
+    security.check_landlock_access(location, LANDLOCK_ACCESS_FS_TRUNCATE)
+}
+
 pub(crate) fn check_execute_permissions_with_security(
     loc: &Location,
     actor: &Cred,
@@ -1537,6 +2028,22 @@ pub(crate) fn check_execute_permissions_with_security(
     )
 }
 
+pub(crate) fn check_execute_permissions_with_vfs_security(
+    loc: &Location,
+    security: &VfsSecurityContext,
+) -> AxResult {
+    if crate::mounts::is_noexec(loc)? {
+        return Err(AxError::PermissionDenied);
+    }
+
+    let metadata = loc.metadata()?;
+    if metadata.node_type != NodeType::RegularFile {
+        return Err(AxError::PermissionDenied);
+    }
+    security.check_landlock_access(loc, LANDLOCK_ACCESS_FS_EXECUTE)?;
+    check_inode_permissions_with_security(loc, &metadata, X_OK, security)
+}
+
 pub(crate) fn check_pathwalk_search_permission(
     dir: &Location,
     credentials: &DacCredentialView,
@@ -1561,12 +2068,12 @@ pub(crate) fn check_pathwalk_search_permission(
 pub(crate) trait DacFsContextExt {
     fn resolve_dac(
         &self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<FsPath>,
         credentials: &DacCredentialView,
     ) -> AxResult<Location>;
     fn resolve_no_follow_dac(
         &self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<FsPath>,
         credentials: &DacCredentialView,
     ) -> AxResult<Location>;
 }
@@ -1574,7 +2081,7 @@ pub(crate) trait DacFsContextExt {
 impl DacFsContextExt for FsContext {
     fn resolve_dac(
         &self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<FsPath>,
         credentials: &DacCredentialView,
     ) -> AxResult<Location> {
         self.resolve_with_admission(path, &mut |dir| {
@@ -1584,7 +2091,7 @@ impl DacFsContextExt for FsContext {
 
     fn resolve_no_follow_dac(
         &self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<FsPath>,
         credentials: &DacCredentialView,
     ) -> AxResult<Location> {
         self.resolve_no_follow_with_admission(path, &mut |dir| {
@@ -1603,38 +2110,38 @@ impl DacFsContextExt for FsContext {
 pub(crate) trait SecurityFsContextExt {
     fn resolve_security(
         &self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<FsPath>,
         security: &VfsSecurityContext,
     ) -> AxResult<Location>;
 
     fn resolve_no_follow_security(
         &self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<FsPath>,
         security: &VfsSecurityContext,
     ) -> AxResult<Location>;
 
     fn resolve_security_unobserved(
         &self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<FsPath>,
         security: &VfsSecurityContext,
     ) -> AxResult<Location>;
 
     fn resolve_no_follow_security_unobserved(
         &self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<FsPath>,
         security: &VfsSecurityContext,
     ) -> AxResult<Location>;
 
     fn resolve_named_create_security<'a>(
         &self,
-        path: &'a Path,
+        path: &'a FsPath,
         security: &VfsSecurityContext,
         terminal_type: NamedCreateTerminalType,
-    ) -> AxResult<(Location, &'a str)>;
+    ) -> AxResult<(Location, &'a FsName)>;
 
     fn resolve_parent_preserving_final_security<'a>(
         &self,
-        path: &'a Path,
+        path: &'a FsPath,
         security: &VfsSecurityContext,
     ) -> AxResult<(Location, FinalComponent<'a>)>;
 }
@@ -1653,7 +2160,7 @@ pub(crate) enum NamedCreateTerminalType {
 impl SecurityFsContextExt for FsContext {
     fn resolve_security(
         &self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<FsPath>,
         security: &VfsSecurityContext,
     ) -> AxResult<Location> {
         self.resolve_with_admission(path, &mut |dir| {
@@ -1668,7 +2175,7 @@ impl SecurityFsContextExt for FsContext {
 
     fn resolve_no_follow_security(
         &self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<FsPath>,
         security: &VfsSecurityContext,
     ) -> AxResult<Location> {
         self.resolve_no_follow_with_admission(path, &mut |dir| {
@@ -1683,7 +2190,7 @@ impl SecurityFsContextExt for FsContext {
 
     fn resolve_security_unobserved(
         &self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<FsPath>,
         security: &VfsSecurityContext,
     ) -> AxResult<Location> {
         self.resolve_with_admission_unobserved(path, &mut |dir| {
@@ -1698,7 +2205,7 @@ impl SecurityFsContextExt for FsContext {
 
     fn resolve_no_follow_security_unobserved(
         &self,
-        path: impl AsRef<Path>,
+        path: impl AsRef<FsPath>,
         security: &VfsSecurityContext,
     ) -> AxResult<Location> {
         self.resolve_no_follow_with_admission_unobserved(path, &mut |dir| {
@@ -1713,10 +2220,10 @@ impl SecurityFsContextExt for FsContext {
 
     fn resolve_named_create_security<'a>(
         &self,
-        path: &'a Path,
+        path: &'a FsPath,
         security: &VfsSecurityContext,
         terminal_type: NamedCreateTerminalType,
-    ) -> AxResult<(Location, &'a str)> {
+    ) -> AxResult<(Location, &'a FsName)> {
         let (parent, final_component) =
             self.resolve_parent_preserving_final_security(path, security)?;
         let FinalComponentKind::Normal(name) = final_component.kind() else {
@@ -1736,7 +2243,7 @@ impl SecurityFsContextExt for FsContext {
 
     fn resolve_parent_preserving_final_security<'a>(
         &self,
-        path: &'a Path,
+        path: &'a FsPath,
         security: &VfsSecurityContext,
     ) -> AxResult<(Location, FinalComponent<'a>)> {
         let (_, final_component) = path.split_final_component().ok_or(AxError::NotFound)?;
@@ -1783,7 +2290,7 @@ pub(crate) fn check_fchdir_permissions_with_security(
     loc: &Location,
     security: &VfsSecurityContext,
 ) -> AxResult {
-    let metadata = loc.metadata()?;
+    let metadata = idmapped_metadata_for_actor(loc, &loc.metadata()?, security)?;
     check_dac_permissions_with_actor(
         metadata.mode.bits() as u32,
         metadata.uid,
@@ -1841,6 +2348,87 @@ pub(crate) fn initial_named_create_owner_mode_with_security(
         requested_mode,
         umask,
     )
+}
+
+/// Computes create ownership in the mount's visible id space and translates
+/// the resulting uid/gid back to filesystem ids before the backend sees it.
+/// This is the counterpart to DAC/stat's outside-to-inside projection: an
+/// idmapped mount must never persist the caller-visible ids verbatim.
+pub(crate) fn initial_named_create_owner_mode_with_security_at(
+    parent_location: &Location,
+    parent: &Metadata,
+    security: &VfsSecurityContext,
+    node_type: NodeType,
+    requested_mode: NodePermission,
+    umask: u32,
+) -> AxResult<(NodePermission, (u32, u32))> {
+    let visible_parent = idmapped_metadata_for_actor(parent_location, parent, security)?;
+    let (mode, (uid, gid)) = initial_named_create_owner_mode_with_security(
+        &visible_parent,
+        security,
+        node_type,
+        requested_mode,
+        umask,
+    );
+    let Some(idmap) = security.idmap_for(parent_location)? else {
+        return Ok((mode, (uid, gid)));
+    };
+    if security.actor().user_ns().identity().into_raw()
+        != idmap.user_namespace().identity().into_raw()
+    {
+        return Err(AxError::PermissionDenied);
+    }
+    let outside = |id: u32, rows: &[crate::mounts::MountIdmapRange]| {
+        rows.iter()
+            .find_map(|row| {
+                let end = row.inside.checked_add(row.length)?;
+                (id >= row.inside && id < end)
+                    .then_some(row.outside.checked_add(id - row.inside))
+                    .flatten()
+            })
+            .ok_or(AxError::InvalidInput)
+    };
+    Ok((mode, (outside(uid, &idmap.uid)?, outside(gid, &idmap.gid)?)))
+}
+
+/// Converts a chown request expressed in the caller-visible idmapped mount
+/// space into the filesystem's persistent ids.  `None` deliberately remains
+/// omitted, preserving chown(-1, ...) semantics.
+pub(crate) fn idmapped_chown_ids(
+    location: &Location,
+    security: &VfsSecurityContext,
+    uid: Option<Kuid>,
+    gid: Option<Kgid>,
+) -> AxResult<(Option<Kuid>, Option<Kgid>)> {
+    let Some(idmap) = security.idmap_for(location)? else {
+        return Ok((uid, gid));
+    };
+    if security.actor().user_ns().identity().into_raw()
+        != idmap.user_namespace().identity().into_raw()
+    {
+        return Err(AxError::PermissionDenied);
+    }
+    let outside = |id: u32, rows: &[crate::mounts::MountIdmapRange]| {
+        rows.iter()
+            .find_map(|row| {
+                let end = row.inside.checked_add(row.length)?;
+                (id >= row.inside && id < end)
+                    .then_some(row.outside.checked_add(id - row.inside))
+                    .flatten()
+            })
+            .ok_or(AxError::InvalidInput)
+    };
+    let uid = uid
+        .map(|value| {
+            Kuid::from_raw(outside(value.into_raw(), &idmap.uid)?).ok_or(AxError::InvalidInput)
+        })
+        .transpose()?;
+    let gid = gid
+        .map(|value| {
+            Kgid::from_raw(outside(value.into_raw(), &idmap.gid)?).ok_or(AxError::InvalidInput)
+        })
+        .transpose()?;
+    Ok((uid, gid))
 }
 
 fn initial_named_create_owner_mode_with(

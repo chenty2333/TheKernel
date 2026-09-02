@@ -7,8 +7,9 @@ use axfs_ng_vfs::{Location, Metadata, NodePermission, NodeType, XattrSetMode};
 use linux_raw_sys::general::{CAP_FOWNER, CAP_SETFCAP, CAP_SYS_ADMIN, R_OK, W_OK};
 
 use super::{
-    executable,
+    executable, inode_flags,
     permission::{VfsSecurityContext, check_inode_permissions_with_security, check_writable_mount},
+    posix_acl,
 };
 use crate::task::{
     FileCapabilities, Kuid, SECURITY_CAPABILITY_XATTR_NAME, ns_capable, parse_file_capabilities,
@@ -19,11 +20,7 @@ use crate::task::{
 };
 
 const SECURITY_CAPABILITY_XATTR: &[u8] = SECURITY_CAPABILITY_XATTR_NAME;
-const UNSUPPORTED_ACCESS_CONTROL_XATTRS: [&[u8]; 3] = [
-    b"system.posix_acl_access",
-    b"system.posix_acl_default",
-    b"system.richacl",
-];
+const UNSUPPORTED_ACCESS_CONTROL_XATTRS: [&[u8]; 1] = [b"system.richacl"];
 pub(crate) const XATTR_SIZE_MAX: usize = 65_536;
 
 fn absent_or_unsupported(error: AxError) -> bool {
@@ -123,6 +120,16 @@ fn check_namespace_access(
         return Err(LinuxError::EOPNOTSUPP.into());
     }
 
+    if posix_acl::is_acl_xattr(name) {
+        if write
+            && Kuid::from_raw(metadata.uid) != Some(security.actor().ids().fsuid)
+            && !actor_capable_in_target_namespace(security, CAP_FOWNER)
+        {
+            return Err(LinuxError::EPERM.into());
+        }
+        return Ok(());
+    }
+
     let namespace_end = name
         .iter()
         .position(|byte| *byte == b'.')
@@ -190,7 +197,9 @@ fn with_xattr_security<'context, T>(
 }
 
 fn xattr_set_mode(flags: XattrSetFlags) -> XattrSetMode {
-    if flags == XattrSetFlags::CREATE {
+    if flags.requires_create() && flags.requires_replace() {
+        XattrSetMode::CreateAndReplace
+    } else if flags == XattrSetFlags::CREATE {
         XattrSetMode::Create
     } else if flags == XattrSetFlags::REPLACE {
         XattrSetMode::Replace
@@ -208,6 +217,7 @@ pub(crate) fn set_xattr_with_security(
 ) -> AxResult<()> {
     let transaction = || {
         check_writable_mount(location)?;
+        inode_flags::check_nonappend_content_mutable(location)?;
         let metadata = location.metadata()?;
         check_namespace_access(location, &metadata, name, true, security)?;
         if name == SECURITY_CAPABILITY_XATTR {
@@ -218,7 +228,11 @@ pub(crate) fn set_xattr_with_security(
         let operation =
             InodeXattrOperation::set(name, value, flags).ok_or(AxError::InvalidInput)?;
         with_xattr_security(security, location, &metadata, operation, || {
-            location.set_xattr(name, value, xattr_set_mode(flags))
+            if posix_acl::is_acl_xattr(name) {
+                posix_acl::set(location, &metadata, name, value, xattr_set_mode(flags))
+            } else {
+                location.set_xattr(name, value, xattr_set_mode(flags))
+            }
         })
     };
 
@@ -315,6 +329,7 @@ pub(crate) fn remove_xattr_with_security(
 ) -> AxResult<()> {
     let transaction = || {
         check_writable_mount(location)?;
+        inode_flags::check_nonappend_content_mutable(location)?;
         let metadata = location.metadata()?;
         check_namespace_access(location, &metadata, name, true, security)?;
         if name == SECURITY_CAPABILITY_XATTR {
@@ -322,7 +337,11 @@ pub(crate) fn remove_xattr_with_security(
         }
         let operation = InodeXattrOperation::remove(name).ok_or(AxError::InvalidInput)?;
         with_xattr_security(security, location, &metadata, operation, || {
-            location.remove_xattr(name)
+            if posix_acl::is_acl_xattr(name) {
+                posix_acl::remove(location, &metadata, name)
+            } else {
+                location.remove_xattr(name)
+            }
         })
     };
 

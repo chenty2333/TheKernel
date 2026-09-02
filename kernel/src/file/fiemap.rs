@@ -7,40 +7,13 @@
 use core::mem::size_of;
 
 use axerrno::{AxError, AxResult, LinuxError};
-use bytemuck::{Pod, Zeroable};
-use linux_raw_sys::ioctl::{FIEMAP_FLAG_SYNC, FS_IOC_FIEMAP};
+use linux_raw_sys::ioctl::FS_IOC_FIEMAP;
+use linux_vfs::{
+    FIEMAP_STREAM_BATCH_EXTENTS, Fiemap, FiemapExtent, FiemapExtentState, FiemapRequestError,
+};
 
 use super::IoctlContext;
 use crate::mm::map_usercopy_error;
-
-const FIEMAP_SUPPORTED_FLAGS: u32 = FIEMAP_FLAG_SYNC;
-const FIEMAP_MAX_EXTENTS: u32 = u32::MAX / size_of::<LinuxFiemapExtent>() as u32;
-const FIEMAP_MAX_BYTES: u64 = i64::MAX as u64;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
-struct LinuxFiemap {
-    fm_start: u64,
-    fm_length: u64,
-    fm_flags: u32,
-    fm_mapped_extents: u32,
-    fm_extent_count: u32,
-    fm_reserved: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
-struct LinuxFiemapExtent {
-    fe_logical: u64,
-    fe_physical: u64,
-    fe_length: u64,
-    fe_reserved64: [u64; 2],
-    fe_flags: u32,
-    fe_reserved: [u32; 3],
-}
-
-const _: () = assert!(size_of::<LinuxFiemap>() == 32);
-const _: () = assert!(size_of::<LinuxFiemapExtent>() == 56);
 
 #[inline]
 pub(super) const fn is_fiemap_command(command: u32) -> bool {
@@ -49,16 +22,16 @@ pub(super) const fn is_fiemap_command(command: u32) -> bool {
 
 fn extent_user_address(base: usize, index: usize) -> AxResult<usize> {
     index
-        .checked_mul(size_of::<LinuxFiemapExtent>())
-        .and_then(|offset| size_of::<LinuxFiemap>().checked_add(offset))
+        .checked_mul(size_of::<FiemapExtent>())
+        .and_then(|offset| size_of::<Fiemap>().checked_add(offset))
         .and_then(|offset| base.checked_add(offset))
         .ok_or(AxError::BadAddress)
 }
 
-fn write_header(context: &IoctlContext, address: usize, header: LinuxFiemap) -> AxResult<()> {
+fn write_header(context: &IoctlContext, address: usize, header: Fiemap) -> AxResult<()> {
     context
         .user_memory()
-        .write_value(address as *mut LinuxFiemap, header)
+        .write_value(address as *mut Fiemap, header)
         .map_err(map_usercopy_error)
 }
 
@@ -66,36 +39,29 @@ fn write_extent(
     context: &IoctlContext,
     base: usize,
     index: usize,
-    extent: axfs_ng_vfs::FileExtent,
+    extent: FiemapExtent,
 ) -> AxResult<()> {
     let address = extent_user_address(base, index)?;
-    let raw = LinuxFiemapExtent {
-        fe_logical: extent.logical,
-        fe_physical: extent.physical,
-        fe_length: extent.length,
-        fe_flags: extent.flags,
-        ..LinuxFiemapExtent::default()
-    };
     context
         .user_memory()
-        .write_value(address as *mut LinuxFiemapExtent, raw)
+        .write_value(address as *mut FiemapExtent, extent)
         .map_err(map_usercopy_error)
 }
 
-fn validate_fiemap_request(header: &LinuxFiemap) -> AxResult<u64> {
-    // Check the filesystem-wide offset limit before zero-length, capacity, or
-    // flag handling.  An offset at maxbytes is never an empty successful
-    // query; Linux reports EFBIG for it.
-    if header.fm_start >= FIEMAP_MAX_BYTES {
-        return Err(AxError::from(LinuxError::EFBIG));
-    }
-    if header.fm_extent_count as usize > axfs_ng_vfs::FILE_EXTENT_MAX {
-        return Err(AxError::InvalidInput);
-    }
-    if header.fm_extent_count > FIEMAP_MAX_EXTENTS {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(header.fm_length.min(FIEMAP_MAX_BYTES - header.fm_start))
+fn validate_extent_count(header: &Fiemap) -> AxResult<()> {
+    header.validate_extent_count().map_err(|error| match error {
+        FiemapRequestError::ExtentCapacityTooLarge => AxError::InvalidInput,
+        _ => unreachable!("extent count validation has one failure mode"),
+    })
+}
+
+fn prepare_fiemap_request(header: &mut Fiemap, max_bytes: u64) -> AxResult<u64> {
+    header.prepare(max_bytes).map_err(|error| match error {
+        FiemapRequestError::ZeroLength => AxError::InvalidInput,
+        FiemapRequestError::StartPastMaximum => AxError::from(LinuxError::EFBIG),
+        FiemapRequestError::UnsupportedFlags => AxError::from(LinuxError::EBADR),
+        FiemapRequestError::ExtentCapacityTooLarge => unreachable!("validated before preparation"),
+    })
 }
 
 /// Executes `FS_IOC_FIEMAP` for one regular open file description.
@@ -105,58 +71,33 @@ fn validate_fiemap_request(header: &LinuxFiemap) -> AxResult<u64> {
 /// `EBADR`.  Extents are copied before the final header, matching the kernel's
 /// observable partial-copy ordering on `EFAULT`.
 pub(super) fn ioctl(file: &axfs::File, context: &IoctlContext, address: usize) -> AxResult<usize> {
+    // Match Linux's inode-operation dispatch: unsupported files fail before
+    // any access to the ioctl argument, including a bad user pointer.
+    if !file.supports_extent_mapping()? {
+        return Err(AxError::OperationNotSupported);
+    }
+
     let mut header = context
         .user_memory()
-        .read_value(address as *const LinuxFiemap)
+        .read_value(address as *const Fiemap)
         .map_err(map_usercopy_error)?;
 
-    let query_length = validate_fiemap_request(&header)?;
+    // Linux rejects an unaddressable flexible array before invoking the
+    // filesystem and does not copy the fixed header back in that case.
+    validate_extent_count(&header)?;
 
-    if header.fm_length == 0 {
-        header.fm_mapped_extents = 0;
-        write_header(context, address, header)?;
-        return Err(AxError::InvalidInput);
-    }
-
-    let bad_flags = header.fm_flags & !FIEMAP_SUPPORTED_FLAGS;
-    if bad_flags != 0 {
-        header.fm_flags = bad_flags;
-        header.fm_mapped_extents = 0;
-        write_header(context, address, header)?;
-        return Err(AxError::from(LinuxError::EBADR));
-    }
-
-    let max_extents = if header.fm_extent_count == 0 {
-        0
-    } else {
-        usize::try_from(header.fm_extent_count).unwrap_or(usize::MAX)
+    let operation = match file.max_extent_bytes() {
+        Err(error) => Err(error),
+        Ok(max_bytes) => match prepare_fiemap_request(&mut header, max_bytes) {
+            Err(error) => Err(error),
+            Ok(query_length) => stream_extents(file, context, address, &header, query_length),
+        },
     };
-    let query = file.map_extents(
-        header.fm_start,
-        query_length,
-        max_extents,
-        header.fm_flags & FIEMAP_FLAG_SYNC != 0,
-    );
 
-    let operation = match query {
+    let operation = match operation {
         Ok(mapped) => {
-            if header.fm_extent_count == 0 {
-                header.fm_mapped_extents = mapped.mapped_extents;
-                Ok(())
-            } else {
-                let copy_count = mapped.extents.len().min(header.fm_extent_count as usize);
-                let mut copied = 0usize;
-                let mut copy_result = Ok(());
-                for (index, extent) in mapped.extents.into_iter().take(copy_count).enumerate() {
-                    if let Err(error) = write_extent(context, address, index, extent) {
-                        copy_result = Err(error);
-                        break;
-                    }
-                    copied += 1;
-                }
-                header.fm_mapped_extents = copied as u32;
-                copy_result
-            }
+            header.fm_mapped_extents = mapped;
+            Ok(())
         }
         Err(error) => {
             header.fm_mapped_extents = 0;
@@ -171,16 +112,96 @@ pub(super) fn ioctl(file: &axfs::File, context: &IoctlContext, address: usize) -
     Ok(0)
 }
 
+/// Streams a FIEMAP request through bounded AX extent batches. No batch keeps
+/// more than `FIEMAP_STREAM_BATCH_EXTENTS` entries, regardless of the user
+/// supplied flexible-array capacity.
+fn stream_extents(
+    file: &axfs::File,
+    context: &IoctlContext,
+    address: usize,
+    header: &Fiemap,
+    query_length: u64,
+) -> AxResult<u32> {
+    let query_end = header
+        .fm_start
+        .checked_add(query_length)
+        .ok_or(AxError::InvalidInput)?;
+    let mut cursor = header.fm_start;
+    let mut mapped = 0u32;
+    let mut first_batch = true;
+
+    loop {
+        let batch_capacity = stream_batch_capacity(header.fm_extent_count, mapped);
+        if header.fm_extent_count != 0 && batch_capacity == 0 {
+            return Ok(mapped);
+        }
+        let batch = file.map_extents(
+            cursor,
+            query_end - cursor,
+            batch_capacity,
+            first_batch && header.is_sync(),
+        )?;
+        first_batch = false;
+        if header.fm_extent_count == 0 {
+            mapped = mapped
+                .checked_add(batch.mapped_extents)
+                .ok_or(AxError::InvalidInput)?;
+        } else {
+            let copy_count = batch.extents.len().min(batch_capacity);
+            let last_index = copy_count.saturating_sub(1);
+            for (batch_index, extent) in batch.extents.iter().copied().enumerate().take(copy_count)
+            {
+                let state = match extent.state {
+                    axfs_ng_vfs::FileExtentState::Written => FiemapExtentState::Written,
+                    axfs_ng_vfs::FileExtentState::Unwritten => FiemapExtentState::Unwritten,
+                };
+                let raw = FiemapExtent::from_mapping(
+                    extent.logical,
+                    extent.physical,
+                    extent.length,
+                    state,
+                    batch.complete && batch.reaches_eof && batch_index == last_index,
+                );
+                write_extent(context, address, mapped as usize, raw)?;
+                mapped = mapped.checked_add(1).ok_or(AxError::InvalidInput)?;
+            }
+        }
+        if batch.complete || batch.extents.is_empty() {
+            return Ok(mapped);
+        }
+        let next = batch
+            .extents
+            .last()
+            .and_then(|extent| extent.logical.checked_add(extent.length))
+            .ok_or(AxError::InvalidInput)?;
+        if next <= cursor || next >= query_end {
+            return Ok(mapped);
+        }
+        cursor = next;
+    }
+}
+
+const fn stream_batch_capacity(requested: u32, mapped: u32) -> usize {
+    if requested == 0 {
+        FIEMAP_STREAM_BATCH_EXTENTS
+    } else {
+        let remaining = requested.saturating_sub(mapped) as usize;
+        if remaining < FIEMAP_STREAM_BATCH_EXTENTS {
+            remaining
+        } else {
+            FIEMAP_STREAM_BATCH_EXTENTS
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn linux_fiemap_layout_matches_x86_64_uapi() {
-        assert_eq!(size_of::<LinuxFiemap>(), 32);
-        assert_eq!(size_of::<LinuxFiemapExtent>(), 56);
-        assert_eq!(core::mem::offset_of!(LinuxFiemap, fm_extent_count), 24);
-        assert_eq!(core::mem::offset_of!(LinuxFiemapExtent, fe_flags), 40);
+        assert_eq!(size_of::<Fiemap>(), 32);
+        assert_eq!(size_of::<FiemapExtent>(), 56);
     }
 
     #[test]
@@ -194,50 +215,67 @@ mod tests {
     }
 
     #[test]
-    fn supported_flags_and_capacity_match_linux_contract() {
-        assert_eq!(FIEMAP_SUPPORTED_FLAGS, FIEMAP_FLAG_SYNC);
-        assert_eq!(axfs_ng_vfs::FILE_EXTENT_MAX, 4096);
-        assert_eq!(FIEMAP_MAX_EXTENTS, u32::MAX / 56);
+    fn capacity_above_internal_bound_skips_preparation() {
+        let header = Fiemap {
+            fm_extent_count: linux_vfs::FIEMAP_MAX_EXTENTS + 1,
+            ..Fiemap::default()
+        };
+        assert_eq!(validate_extent_count(&header), Err(AxError::InvalidInput));
     }
 
     #[test]
-    fn maxbytes_is_checked_before_empty_or_capacity_queries() {
-        let header = LinuxFiemap {
-            fm_start: FIEMAP_MAX_BYTES,
+    fn preparation_matches_linux_error_order_and_copyback_state() {
+        let mut zero_length = Fiemap {
+            fm_start: 8,
             fm_length: 0,
-            fm_extent_count: (axfs_ng_vfs::FILE_EXTENT_MAX + 1) as u32,
-            ..LinuxFiemap::default()
+            fm_flags: 2,
+            ..Fiemap::default()
         };
         assert_eq!(
-            validate_fiemap_request(&header),
+            prepare_fiemap_request(&mut zero_length, 8),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(zero_length.fm_flags, 2);
+
+        let mut out_of_range = Fiemap {
+            fm_start: 8,
+            fm_length: 1,
+            fm_flags: 2,
+            ..Fiemap::default()
+        };
+        assert_eq!(
+            prepare_fiemap_request(&mut out_of_range, 8),
             Err(AxError::from(LinuxError::EFBIG))
         );
+        assert_eq!(out_of_range.fm_flags, 2);
+
+        let mut invalid_flags = Fiemap {
+            fm_length: 1,
+            fm_flags: 2,
+            ..Fiemap::default()
+        };
+        assert_eq!(
+            prepare_fiemap_request(&mut invalid_flags, 8),
+            Err(AxError::from(LinuxError::EBADR))
+        );
+        assert_eq!(invalid_flags.fm_flags, 2);
+
+        let mut clipped = Fiemap {
+            fm_start: 7,
+            fm_length: u64::MAX,
+            ..Fiemap::default()
+        };
+        assert_eq!(prepare_fiemap_request(&mut clipped, 8), Ok(1));
     }
 
     #[test]
-    fn capacity_above_internal_bound_is_an_explicit_error() {
-        let header = LinuxFiemap {
-            fm_extent_count: (axfs_ng_vfs::FILE_EXTENT_MAX + 1) as u32,
-            ..LinuxFiemap::default()
-        };
-        assert_eq!(validate_fiemap_request(&header), Err(AxError::InvalidInput));
-    }
-
-    #[test]
-    fn overlong_range_is_clamped_after_a_valid_start() {
-        let full_range = LinuxFiemap {
-            fm_length: u64::MAX,
-            ..LinuxFiemap::default()
-        };
-        assert_eq!(validate_fiemap_request(&full_range), Ok(FIEMAP_MAX_BYTES));
-        assert_eq!(full_range.fm_length, u64::MAX);
-
-        let header = LinuxFiemap {
-            fm_start: FIEMAP_MAX_BYTES - 1,
-            fm_length: u64::MAX,
-            ..LinuxFiemap::default()
-        };
-        assert_eq!(validate_fiemap_request(&header), Ok(1));
-        assert_eq!(header.fm_length, u64::MAX);
+    fn hostile_extent_capacity_never_expands_a_stream_batch() {
+        assert_eq!(
+            stream_batch_capacity(u32::MAX, 0),
+            FIEMAP_STREAM_BATCH_EXTENTS
+        );
+        assert_eq!(stream_batch_capacity(3, 2), 1);
+        assert_eq!(stream_batch_capacity(3, 3), 0);
+        assert_eq!(stream_batch_capacity(0, 0), FIEMAP_STREAM_BATCH_EXTENTS);
     }
 }

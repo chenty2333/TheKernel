@@ -22,125 +22,33 @@ use axpoll::{IoEvents, PollSet, Pollable};
 use axsync::Mutex as BlockingMutex;
 use axtask::current_may_uninit;
 use spin::Mutex;
+pub use thekernel_linux_fsnotify::{
+    ALL_FANOTIFY_EVENT_BITS, FAN_ACCESS, FAN_ACCESS_PERM, FAN_CLASS_PRE_CONTENT, FAN_CLOEXEC,
+    FAN_CLOSE, FAN_ENABLE_AUDIT, FAN_EPIDFD, FAN_EVENT_INFO_TYPE_PIDFD, FAN_EVENT_ON_CHILD,
+    FAN_MARK_DONT_FOLLOW, FAN_MARK_EVICTABLE, FAN_MARK_FILESYSTEM, FAN_MARK_FLUSH, FAN_MARK_IGNORE,
+    FAN_MARK_IGNORED_SURV_MODIFY, FAN_MARK_MOUNT, FAN_MARK_REMOVE, FAN_MODIFY, FAN_NOFD,
+    FAN_NONBLOCK, FAN_NOPIDFD, FAN_ONDIR, FAN_OPEN, FAN_OPEN_EXEC, FAN_OPEN_EXEC_PERM,
+    FAN_OPEN_PERM, FAN_Q_OVERFLOW, FAN_REPORT_PIDFD, FAN_REPORT_TID, FANOTIFY_FID_BITS,
+    FANOTIFY_INIT_FLAGS, FANOTIFY_METADATA_VERSION, FANOTIFY_PERMISSION_CLASSES,
+};
+use thekernel_linux_fsnotify::{
+    FanotifyEventInfoPidfd, FanotifyEventMetadata, FanotifyResponse, FanotifyResponsePlan,
+    FanotifyResponseReject,
+};
 
 use crate::{
     file::{
-        Directory, File, FileDescription, FileHandle, FileLike, IoDst, IoSrc, Kstat, OfdIoStatus,
-        PidFd, ReservedFd, get_file_like, inotify::WatchKey, reserve_fd,
+        Directory, FdTable, File, FileDescription, FileDescriptionId, FileHandle, FileLike, IoDst,
+        IoSrc, Kstat, OfdIoStatus, PidFd, ReservedFd, current_fd_table, get_file_like,
+        inotify::WatchKey, reserve_fd,
     },
     readiness::{block_on_poll_io, block_on_poll_set},
     task::{AsThread, get_process_data},
 };
 
-pub const FAN_ACCESS: u64 = 0x0000_0001;
-pub const FAN_MODIFY: u64 = 0x0000_0002;
-pub const FAN_ATTRIB: u64 = 0x0000_0004;
-pub const FAN_CLOSE_WRITE: u64 = 0x0000_0008;
-pub const FAN_CLOSE_NOWRITE: u64 = 0x0000_0010;
-pub const FAN_OPEN: u64 = 0x0000_0020;
-pub const FAN_MOVED_FROM: u64 = 0x0000_0040;
-pub const FAN_MOVED_TO: u64 = 0x0000_0080;
-pub const FAN_CREATE: u64 = 0x0000_0100;
-pub const FAN_DELETE: u64 = 0x0000_0200;
-pub const FAN_DELETE_SELF: u64 = 0x0000_0400;
-pub const FAN_MOVE_SELF: u64 = 0x0000_0800;
-pub const FAN_OPEN_EXEC: u64 = 0x0000_1000;
-pub const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
-pub const FAN_FS_ERROR: u64 = 0x0000_8000;
-pub const FAN_OPEN_PERM: u64 = 0x0001_0000;
-pub const FAN_ACCESS_PERM: u64 = 0x0002_0000;
-pub const FAN_OPEN_EXEC_PERM: u64 = 0x0004_0000;
-pub const FAN_EVENT_ON_CHILD: u64 = 0x0800_0000;
-pub const FAN_RENAME: u64 = 0x1000_0000;
-pub const FAN_ONDIR: u64 = 0x4000_0000;
-pub const FAN_CLOSE: u64 = FAN_CLOSE_WRITE | FAN_CLOSE_NOWRITE;
-pub const FAN_MOVE: u64 = FAN_MOVED_FROM | FAN_MOVED_TO;
-
-pub const FAN_CLOEXEC: u32 = 0x0000_0001;
-pub const FAN_NONBLOCK: u32 = 0x0000_0002;
-pub const FAN_CLASS_NOTIF: u32 = 0x0000_0000;
-pub const FAN_CLASS_CONTENT: u32 = 0x0000_0004;
-pub const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
-pub const FAN_UNLIMITED_QUEUE: u32 = 0x0000_0010;
-pub const FAN_UNLIMITED_MARKS: u32 = 0x0000_0020;
-pub const FAN_ENABLE_AUDIT: u32 = 0x0000_0040;
-pub const FAN_REPORT_PIDFD: u32 = 0x0000_0080;
-pub const FAN_REPORT_TID: u32 = 0x0000_0100;
-pub const FAN_REPORT_FID: u32 = 0x0000_0200;
-pub const FAN_REPORT_DIR_FID: u32 = 0x0000_0400;
-pub const FAN_REPORT_NAME: u32 = 0x0000_0800;
-pub const FAN_REPORT_TARGET_FID: u32 = 0x0000_1000;
-pub const FAN_REPORT_DFID_NAME: u32 = FAN_REPORT_DIR_FID | FAN_REPORT_NAME;
-pub const FAN_REPORT_DFID_NAME_TARGET: u32 =
-    FAN_REPORT_DFID_NAME | FAN_REPORT_FID | FAN_REPORT_TARGET_FID;
-pub const FAN_ALLOW: u32 = 0x01;
-pub const FAN_DENY: u32 = 0x02;
-pub const FAN_AUDIT: u32 = 0x10;
-pub const FAN_INFO: u32 = 0x20;
-
-pub const FAN_MARK_ADD: u32 = 0x0000_0001;
-pub const FAN_MARK_REMOVE: u32 = 0x0000_0002;
-pub const FAN_MARK_DONT_FOLLOW: u32 = 0x0000_0004;
-pub const FAN_MARK_ONLYDIR: u32 = 0x0000_0008;
-pub const FAN_MARK_MOUNT: u32 = 0x0000_0010;
-pub const FAN_MARK_IGNORED_MASK: u32 = 0x0000_0020;
-pub const FAN_MARK_IGNORED_SURV_MODIFY: u32 = 0x0000_0040;
-pub const FAN_MARK_FLUSH: u32 = 0x0000_0080;
-pub const FAN_MARK_FILESYSTEM: u32 = 0x0000_0100;
-pub const FAN_MARK_EVICTABLE: u32 = 0x0000_0200;
-pub const FAN_MARK_IGNORE: u32 = 0x0000_0400;
-
-pub const FANOTIFY_METADATA_VERSION: u8 = 3;
-pub const FAN_NOFD: i32 = -1;
-pub const FAN_NOPIDFD: i32 = FAN_NOFD;
-pub const FAN_EPIDFD: i32 = -2;
-pub const FAN_EVENT_INFO_TYPE_PIDFD: u8 = 4;
 pub const MAX_QUEUED_EVENTS: usize = 16384;
 pub const MAX_USER_GROUPS: usize = 128;
 pub const MAX_USER_MARKS: usize = 1048576;
-
-const FANOTIFY_PERM_EVENTS: u64 = FAN_OPEN_PERM | FAN_ACCESS_PERM | FAN_OPEN_EXEC_PERM;
-const FANOTIFY_EVENTS: u64 = FAN_ACCESS
-    | FAN_MODIFY
-    | FAN_ATTRIB
-    | FAN_CLOSE
-    | FAN_OPEN
-    | FAN_OPEN_EXEC
-    | FAN_MOVE
-    | FAN_CREATE
-    | FAN_DELETE
-    | FAN_RENAME
-    | FAN_DELETE_SELF
-    | FAN_MOVE_SELF
-    | FAN_FS_ERROR;
-const ALL_FANOTIFY_EVENT_BITS: u64 =
-    FANOTIFY_EVENTS | FANOTIFY_PERM_EVENTS | FAN_Q_OVERFLOW | FAN_ONDIR | FAN_EVENT_ON_CHILD;
-const FANOTIFY_FID_BITS: u32 = FAN_REPORT_DFID_NAME_TARGET;
-const FANOTIFY_ADMIN_INIT_FLAGS: u32 = FAN_CLASS_CONTENT
-    | FAN_CLASS_PRE_CONTENT
-    | FAN_REPORT_TID
-    | FAN_REPORT_PIDFD
-    | FAN_UNLIMITED_QUEUE
-    | FAN_UNLIMITED_MARKS
-    | FAN_ENABLE_AUDIT;
-const FANOTIFY_USER_INIT_FLAGS: u32 =
-    FAN_CLASS_NOTIF | FANOTIFY_FID_BITS | FAN_CLOEXEC | FAN_NONBLOCK;
-const FANOTIFY_INIT_FLAGS: u32 = FANOTIFY_ADMIN_INIT_FLAGS | FANOTIFY_USER_INIT_FLAGS;
-const FANOTIFY_MARK_FLAGS: u32 = FAN_MARK_ADD
-    | FAN_MARK_REMOVE
-    | FAN_MARK_FLUSH
-    | FAN_MARK_DONT_FOLLOW
-    | FAN_MARK_ONLYDIR
-    | FAN_MARK_MOUNT
-    | FAN_MARK_FILESYSTEM
-    | FAN_MARK_IGNORED_MASK
-    | FAN_MARK_IGNORED_SURV_MODIFY
-    | FAN_MARK_EVICTABLE
-    | FAN_MARK_IGNORE;
-const FANOTIFY_RESPONSE_ACCESS: u32 = FAN_ALLOW | FAN_DENY;
-const FANOTIFY_RESPONSE_FLAGS: u32 = FAN_AUDIT | FAN_INFO;
-const FANOTIFY_RESPONSE_VALID_MASK: u32 = FANOTIFY_RESPONSE_ACCESS | FANOTIFY_RESPONSE_FLAGS;
-const FANOTIFY_DIR_ENTRY_EVENTS: u64 = FAN_CREATE | FAN_DELETE | FAN_MOVE | FAN_RENAME;
 
 /// Identity of the task that caused an event. Deferred delivery must carry
 /// this copy-only snapshot instead of attributing the event to whichever
@@ -172,31 +80,6 @@ impl FanotifyEventActor {
     }
 }
 
-#[repr(C)]
-struct FanotifyEventMetadata {
-    event_len: u32,
-    vers: u8,
-    reserved: u8,
-    metadata_len: u16,
-    mask: u64,
-    fd: c_int,
-    pid: c_int,
-}
-
-#[repr(C)]
-struct FanotifyEventInfoPidfd {
-    info_type: u8,
-    pad: u8,
-    len: u16,
-    pidfd: c_int,
-}
-
-#[repr(C)]
-struct FanotifyResponse {
-    fd: c_int,
-    response: u32,
-}
-
 #[derive(Clone, Copy)]
 struct FanotifyMark {
     key: WatchKey,
@@ -224,8 +107,19 @@ struct FanotifyEvent {
 
 struct FanotifyPermissionEvent {
     id: u64,
-    fd: Option<c_int>,
-    response: Option<u32>,
+    fd: Option<FanotifyPermissionFd>,
+    response: Option<FanotifyResponsePlan>,
+}
+
+/// The event fd as it was published, including the immutable OFD identity.
+///
+/// The response ABI carries only a numeric fd.  Rechecking this identity when
+/// consuming a response prevents a close followed by numeric-fd reuse from
+/// answering a different, newer permission event.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FanotifyPermissionFd {
+    number: c_int,
+    description_id: FileDescriptionId,
 }
 
 struct FanotifyState {
@@ -412,37 +306,13 @@ pub(crate) fn drain_deferred_cleanup_work() {
 }
 
 pub fn validate_init_flags(flags: u32, event_f_flags: u32) -> AxResult<()> {
-    if flags & !FANOTIFY_INIT_FLAGS != 0 {
-        return Err(AxError::InvalidInput);
+    match thekernel_linux_fsnotify::fanotify_init_admission(flags, event_f_flags) {
+        Ok(()) => Ok(()),
+        Err(thekernel_linux_fsnotify::FanotifyInitReject::Invalid) => Err(AxError::InvalidInput),
+        Err(thekernel_linux_fsnotify::FanotifyInitReject::Unsupported) => {
+            Err(AxError::OperationNotSupported)
+        }
     }
-    if flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT)
-        == (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT)
-    {
-        return Err(AxError::InvalidInput);
-    }
-    if flags & FAN_REPORT_PIDFD != 0 && flags & FAN_REPORT_TID != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    // TheKernel has no memcg/per-user accounting capable of making Linux's
-    // privileged "unlimited" modes honest. Reject them instead of exposing an
-    // unbounded kernel allocation surface.
-    if flags & (FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS) != 0 {
-        return Err(AxError::OperationNotSupported);
-    }
-    if flags & FANOTIFY_FID_BITS != 0 && flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT) != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if flags & FAN_REPORT_NAME != 0 && flags & FAN_REPORT_DIR_FID == 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if flags & FAN_REPORT_TARGET_FID != 0 && flags & FAN_REPORT_DFID_NAME != FAN_REPORT_DFID_NAME {
-        return Err(AxError::InvalidInput);
-    }
-    if event_f_flags & !(linux_raw_sys::general::O_ACCMODE | linux_raw_sys::general::O_CLOEXEC) != 0
-    {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(())
 }
 
 impl FanotifyFile {
@@ -497,25 +367,39 @@ impl FanotifyFile {
     }
 
     pub fn mark(&self, flags: u32, mask: u64, loc: Option<&Location>) -> AxResult<()> {
-        validate_mark_flags(flags, mask)?;
         let mut state = self.state.lock();
-
-        if flags & FAN_MARK_FLUSH != 0 {
+        let target_is_dir = loc.map(Location::is_dir);
+        let plan =
+            thekernel_linux_fsnotify::plan_fanotify_mark(flags, mask, self.flags, target_is_dir)
+                .map_err(|error| match error {
+                    thekernel_linux_fsnotify::FanotifyMarkReject::Invalid => AxError::InvalidInput,
+                    thekernel_linux_fsnotify::FanotifyMarkReject::NotDirectory => {
+                        AxError::NotADirectory
+                    }
+                    thekernel_linux_fsnotify::FanotifyMarkReject::IsDirectory => {
+                        AxError::IsADirectory
+                    }
+                })?;
+        if plan == thekernel_linux_fsnotify::FanotifyMarkPlan::Flush {
             flush_marks(&mut state, flags);
             return Ok(());
         }
 
         let loc = loc.ok_or(AxError::BadFileDescriptor)?;
-        validate_mark_target(self.flags, flags, mask, loc)?;
         let key = WatchKey::from_location(loc)?;
         let scope = mark_scope(flags, loc)?;
 
-        if flags & (FAN_MARK_IGNORED_MASK | FAN_MARK_IGNORE) != 0 {
-            update_ignored_mark(&mut state, key, scope, flags, mask);
-        } else if flags & FAN_MARK_ADD != 0 {
-            add_mark(&mut state, key, scope, flags, mask, loc)?;
-        } else if flags & FAN_MARK_REMOVE != 0 {
-            remove_mark(&mut state, key, scope, mask)?;
+        match plan {
+            thekernel_linux_fsnotify::FanotifyMarkPlan::Ignored => {
+                update_ignored_mark(&mut state, key, scope, flags, mask);
+            }
+            thekernel_linux_fsnotify::FanotifyMarkPlan::Add => {
+                add_mark(&mut state, key, scope, flags, mask, loc)?;
+            }
+            thekernel_linux_fsnotify::FanotifyMarkPlan::Remove => {
+                remove_mark(&mut state, key, scope, mask)?;
+            }
+            thekernel_linux_fsnotify::FanotifyMarkPlan::Flush => unreachable!("handled above"),
         }
         Ok(())
     }
@@ -553,7 +437,16 @@ impl FanotifyFile {
         if state.released || state.overflowed {
             return false;
         }
-        if state.queue.len() >= MAX_QUEUED_EVENTS || state.queue.try_reserve(2).is_err() {
+        if matches!(
+            thekernel_linux_fsnotify::plan_queue_admission(
+                state.queue.len(),
+                MAX_QUEUED_EVENTS,
+                state.overflowed,
+                event.mask == FAN_Q_OVERFLOW,
+            ),
+            thekernel_linux_fsnotify::QueueAdmission::Overflow
+        ) || state.queue.try_reserve(2).is_err()
+        {
             return Self::enqueue_overflow_locked(state);
         }
         state.queue.push_back(event);
@@ -644,28 +537,52 @@ impl FanotifyFile {
     }
 
     fn handle_permission_response(&self, fd: c_int, response: u32) -> AxResult<()> {
-        if response & !FANOTIFY_RESPONSE_VALID_MASK != 0 {
-            return Err(AxError::InvalidInput);
-        }
-        match response & FANOTIFY_RESPONSE_ACCESS {
-            FAN_ALLOW | FAN_DENY => {}
-            _ => return Err(AxError::InvalidInput),
-        }
-        if response & FAN_AUDIT != 0 && self.flags & FAN_ENABLE_AUDIT == 0 {
-            return Err(AxError::InvalidInput);
-        }
-        if response & FAN_INFO != 0 {
-            return Err(AxError::InvalidInput);
-        }
+        self.handle_permission_response_in_table(&current_fd_table(), fd, response)
+    }
+
+    fn handle_permission_response_in_table(
+        &self,
+        table: &FdTable,
+        fd: c_int,
+        response: u32,
+    ) -> AxResult<()> {
+        let response = thekernel_linux_fsnotify::fanotify_response_admission(
+            response,
+            self.flags & FAN_ENABLE_AUDIT != 0,
+            self.flags & FAN_CLASS_PRE_CONTENT != 0,
+        )
+        .map_err(|reject| match reject {
+            FanotifyResponseReject::Invalid
+            | FanotifyResponseReject::AuditNotEnabled
+            | FanotifyResponseReject::InfoUnsupported => AxError::InvalidInput,
+        })?;
         if fd < 0 {
             return Err(AxError::InvalidInput);
         }
+
+        // This lookup is the response linearization point.  Retain the exact
+        // OFD through the state update so a concurrent close/reuse after this
+        // point cannot turn a valid response into one for a newer descriptor.
+        let Some((current, _description)) = current_permission_fd(table, fd) else {
+            return Err(LinuxError::ENOENT.into());
+        };
+        let expected = {
+            let state = self.state.lock();
+            state
+                .pending_permissions
+                .iter()
+                .find(|event| event.fd == Some(current) && event.response.is_none())
+                .and_then(|event| event.fd)
+        };
+        let Some(expected) = expected else {
+            return Err(LinuxError::ENOENT.into());
+        };
 
         let mut state = self.state.lock();
         let Some(event) = state
             .pending_permissions
             .iter_mut()
-            .find(|event| event.fd == Some(fd) && event.response.is_none())
+            .find(|event| event.fd == Some(expected) && event.response.is_none())
         else {
             return Err(LinuxError::ENOENT.into());
         };
@@ -684,6 +601,7 @@ impl FanotifyFile {
         &self,
         event: &FanotifyEvent,
         published_fd: Option<c_int>,
+        published_description_id: Option<FileDescriptionId>,
         deny_permission: bool,
     ) {
         let mut wake = false;
@@ -696,13 +614,16 @@ impl FanotifyFile {
         {
             if deny_permission {
                 if pending.response.is_none() {
-                    pending.response = Some(FAN_DENY);
+                    pending.response = Some(FanotifyResponsePlan::Deny { errno: None });
                     wake = true;
                 }
             } else if let Some(fd) = published_fd {
-                pending.fd = Some(fd);
+                pending.fd = published_description_id.map(|description_id| FanotifyPermissionFd {
+                    number: fd,
+                    description_id,
+                });
                 if fd == FAN_NOFD && pending.response.is_none() {
-                    pending.response = Some(FAN_ALLOW);
+                    pending.response = Some(FanotifyResponsePlan::Allow);
                     wake = true;
                 }
             }
@@ -750,7 +671,7 @@ impl FanotifyFile {
             let event_fd = match prepared_opened_event_fd(self, event.fd_loc.as_ref()) {
                 Ok(fd) => fd,
                 Err(error) => {
-                    self.finish_consumed_event(&event, None, true);
+                    self.finish_consumed_event(&event, None, None, true);
                     return Self::read_result_after_error(written, error);
                 }
             };
@@ -802,13 +723,14 @@ impl FanotifyFile {
                 // the fd numbers before the denied permission waiter runs.
                 drop(pidfd);
                 drop(event_fd);
-                self.finish_consumed_event(&event, None, true);
+                self.finish_consumed_event(&event, None, None, true);
                 return Self::read_result_after_error(written, error);
             }
 
             // fd publication is deliberately after the complete userspace
             // record copy. ReservedFd makes this allocation-free and prevents
             // another thread from reusing the copied number in between.
+            let published_description_id = event_fd.description_id();
             let published_fd = match event_fd.publish() {
                 Ok(fd) => fd,
                 Err(error) => {
@@ -822,7 +744,7 @@ impl FanotifyFile {
                 error!("fanotify pidfd reservation commit failed: {error:?}");
             }
 
-            self.finish_consumed_event(&event, Some(published_fd), false);
+            self.finish_consumed_event(&event, Some(published_fd), published_description_id, false);
             written += event_len;
         }
 
@@ -832,6 +754,18 @@ impl FanotifyFile {
             Ok(written)
         }
     }
+}
+
+fn current_permission_fd(
+    table: &FdTable,
+    number: c_int,
+) -> Option<(FanotifyPermissionFd, Arc<FileDescription>)> {
+    let description = table.get_description(number).ok()?;
+    let permission_fd = FanotifyPermissionFd {
+        number,
+        description_id: description.id(),
+    };
+    Some((permission_fd, description))
 }
 
 impl Drop for FanotifyFile {
@@ -855,6 +789,31 @@ impl FileLike for FanotifyFile {
         block_on_poll_io(self, IoEvents::READABLE, self.nonblocking(), || {
             self.read_ready(dst)
         })
+    }
+
+    fn read_with_operation_status(&self, status: OfdIoStatus, dst: &mut IoDst) -> AxResult<usize> {
+        // A NOWAIT reader cannot sleep behind another event consumer.
+        let _reader = if status.rwf_nowait() {
+            self.read_gate.try_lock().ok_or(AxError::WouldBlock)?
+        } else {
+            self.read_gate.lock()
+        };
+        block_on_poll_io(
+            self,
+            IoEvents::READABLE,
+            self.nonblocking() || status.rwf_nowait(),
+            || self.read_ready(dst),
+        )
+    }
+
+    fn write_with_operation_status(
+        &self,
+        _status: OfdIoStatus,
+        src: &mut IoSrc,
+    ) -> AxResult<usize> {
+        // Permission replies have no readiness wait: validation and response
+        // publication are one immediate operation.
+        self.write(src)
     }
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
@@ -884,8 +843,10 @@ impl FileLike for FanotifyFile {
         Ok(())
     }
 
-    fn path(&self) -> AxResult<Cow<'_, str>> {
-        Ok("anon_inode:[fanotify]".into())
+    fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
+        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+            b"anon_inode:[fanotify]",
+        )))
     }
 }
 
@@ -908,69 +869,6 @@ impl Pollable for FanotifyFile {
             axpoll::PollRegistration::empty()
         }
     }
-}
-
-fn validate_mark_flags(flags: u32, mask: u64) -> AxResult<()> {
-    if flags & !FANOTIFY_MARK_FLAGS != 0 || mask & !ALL_FANOTIFY_EVENT_BITS != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    let commands = u32::from(flags & FAN_MARK_ADD != 0)
-        + u32::from(flags & FAN_MARK_REMOVE != 0)
-        + u32::from(flags & FAN_MARK_FLUSH != 0);
-    if commands != 1 {
-        return Err(AxError::InvalidInput);
-    }
-    if flags & FAN_MARK_FLUSH != 0 && mask != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if flags & FAN_MARK_IGNORED_MASK != 0 && flags & FAN_MARK_IGNORE != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if flags & FAN_MARK_IGNORE != 0 && flags & FAN_MARK_IGNORED_SURV_MODIFY == 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if flags & FAN_MARK_MOUNT != 0 && flags & FAN_MARK_FILESYSTEM != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(())
-}
-
-fn validate_mark_target(group_flags: u32, flags: u32, mask: u64, loc: &Location) -> AxResult<()> {
-    if flags & FAN_MARK_ONLYDIR != 0 && !loc.is_dir() {
-        return Err(AxError::NotADirectory);
-    }
-    if mask & FANOTIFY_PERM_EVENTS != 0
-        && group_flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT) == 0
-    {
-        return Err(AxError::InvalidInput);
-    }
-    if group_flags & FANOTIFY_FID_BITS == 0
-        && mask & (FAN_ATTRIB | FANOTIFY_DIR_ENTRY_EVENTS | FAN_DELETE_SELF | FAN_MOVE_SELF) != 0
-    {
-        return Err(AxError::InvalidInput);
-    }
-    if group_flags & FAN_REPORT_NAME == 0 && mask & FAN_RENAME != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if flags & FAN_MARK_MOUNT != 0 && mask & FANOTIFY_DIR_ENTRY_EVENTS != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if group_flags & FAN_REPORT_TARGET_FID != 0
-        && !loc.is_dir()
-        && mask & (FAN_DELETE | FAN_RENAME | FAN_ONDIR | FAN_EVENT_ON_CHILD) != 0
-    {
-        return Err(AxError::NotADirectory);
-    }
-    if flags & FAN_MARK_IGNORE != 0
-        && !loc.is_dir()
-        && mask & (FANOTIFY_DIR_ENTRY_EVENTS | FAN_ONDIR | FAN_EVENT_ON_CHILD) != 0
-    {
-        return Err(AxError::NotADirectory);
-    }
-    if flags & FAN_MARK_IGNORE != 0 && flags & FAN_MARK_IGNORED_SURV_MODIFY == 0 && loc.is_dir() {
-        return Err(AxError::IsADirectory);
-    }
-    Ok(())
 }
 
 fn mark_scope(flags: u32, loc: &Location) -> AxResult<FanotifyScope> {
@@ -1124,6 +1022,12 @@ impl PreparedFanotifyFd {
         self.value
     }
 
+    fn description_id(&self) -> Option<FileDescriptionId> {
+        self.publication
+            .as_ref()
+            .map(|(_, description)| description.id())
+    }
+
     fn publish(self) -> AxResult<c_int> {
         match self.publication {
             Some((reservation, description)) => reservation.publish(description),
@@ -1266,8 +1170,11 @@ fn cancel_permission_event(file: &FanotifyFile, id: u64) {
     drop(pending);
 }
 
-fn wait_for_permission_response(file: &Arc<FanotifyFile>, id: u64) -> AxResult<()> {
-    let response = block_on_poll_set(&file.poll_rx, || {
+fn wait_for_permission_response(
+    file: &Arc<FanotifyFile>,
+    id: u64,
+) -> AxResult<FanotifyResponsePlan> {
+    block_on_poll_set(&file.poll_rx, || {
         let mut state = file.state.lock();
         if let Some(idx) = state
             .pending_permissions
@@ -1275,18 +1182,25 @@ fn wait_for_permission_response(file: &Arc<FanotifyFile>, id: u64) -> AxResult<(
             .position(|event| event.id == id && event.response.is_some())
         {
             let event = state.pending_permissions.remove(idx);
-            return Ok(event.response.unwrap_or(FAN_ALLOW));
+            return Ok(event.response.unwrap_or(FanotifyResponsePlan::Allow));
         }
         if !state.pending_permissions.iter().any(|event| event.id == id) || state.released {
-            return Ok(FAN_ALLOW);
+            return Ok(FanotifyResponsePlan::Allow);
         }
         Err(AxError::WouldBlock)
-    })?;
+    })
+}
 
-    match response & FANOTIFY_RESPONSE_ACCESS {
-        FAN_ALLOW => Ok(()),
-        FAN_DENY => Err(LinuxError::EPERM.into()),
-        _ => Err(LinuxError::EPERM.into()),
+fn fanotify_denial_error(errno: Option<u8>) -> AxError {
+    match errno {
+        None | Some(1) => LinuxError::EPERM.into(),
+        Some(5) => LinuxError::EIO.into(),
+        Some(11) => LinuxError::EAGAIN.into(),
+        Some(16) => LinuxError::EBUSY.into(),
+        Some(26) => LinuxError::ETXTBSY.into(),
+        Some(28) => LinuxError::ENOSPC.into(),
+        Some(122) => LinuxError::EDQUOT.into(),
+        Some(_) => LinuxError::EPERM.into(),
     }
 }
 
@@ -1318,63 +1232,75 @@ pub(crate) fn permission_check_with_actor(
     let event_key = WatchKey::from_location(event_loc)?;
     let event_mount_id = event_loc.mountpoint().mount_id();
     let watch_key = WatchKey::from_location(watch_loc)?;
-    let mut waits: Vec<(Arc<FanotifyFile>, u64)> = Vec::new();
-    waits
-        .try_reserve(MAX_USER_GROUPS)
-        .map_err(|_| AxError::NoMemory)?;
+    // Linux dispatches pre-content permission groups before content groups.
+    // Do not expose a lower-priority group to an operation that a higher
+    // priority group already denied; doing so also preserves a pre-content
+    // FAN_DENY_ERRNO result rather than replacing it with a later EPERM.
+    for class in FANOTIFY_PERMISSION_CLASSES {
+        let mut waits: Vec<(Arc<FanotifyFile>, u64)> = Vec::new();
+        waits
+            .try_reserve(MAX_USER_GROUPS)
+            .map_err(|_| AxError::NoMemory)?;
 
-    let slots = fanotify_registry_slots();
-    for slot in 0..slots {
-        let Some(file) = live_fanotify_file(slot) else {
-            continue;
-        };
-        let mut state = file.state.lock();
-        if state.released {
-            continue;
-        }
-        let should_queue = state.marks.iter().any(|mark| {
-            fanotify_mark_matches(
-                mark,
-                event_key,
-                event_mount_id,
-                watch_key,
-                is_dir,
-                parent_event,
-            ) && mask & mark.mask != 0
-                && mark.ignored_mask & mask == 0
-        });
-        if should_queue {
-            let id = match enqueue_permission_event(&file, &mut state, event_loc, mask, actor) {
-                Ok(id) => id,
-                Err(error) => {
-                    drop(state);
-                    for (queued_file, queued_id) in waits.drain(..) {
-                        cancel_permission_event(&queued_file, queued_id);
-                    }
-                    return Err(error);
-                }
+        let slots = fanotify_registry_slots();
+        for slot in 0..slots {
+            let Some(file) = live_fanotify_file(slot) else {
+                continue;
             };
-            waits.push((file.clone(), id));
+            if file.flags & class == 0 {
+                continue;
+            }
+            let mut state = file.state.lock();
+            if state.released {
+                continue;
+            }
+            let should_queue = state.marks.iter().any(|mark| {
+                fanotify_mark_matches(
+                    mark,
+                    event_key,
+                    event_mount_id,
+                    watch_key,
+                    is_dir,
+                    parent_event,
+                ) && mask & mark.mask != 0
+                    && mark.ignored_mask & mask == 0
+            });
+            if should_queue {
+                let id = match enqueue_permission_event(&file, &mut state, event_loc, mask, actor) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        drop(state);
+                        for (queued_file, queued_id) in waits.drain(..) {
+                            cancel_permission_event(&queued_file, queued_id);
+                        }
+                        return Err(error);
+                    }
+                };
+                waits.push((file.clone(), id));
+            }
+            drop(state);
+            if should_queue {
+                file.poll_rx.wake();
+            }
         }
-        drop(state);
-        if should_queue {
-            file.poll_rx.wake();
-        }
-    }
 
-    let mut denied = false;
-    for (file, id) in waits {
-        match wait_for_permission_response(&file, id) {
-            Ok(()) => {}
-            Err(err) if err == AxError::from(LinuxError::EPERM) => denied = true,
-            Err(err) => return Err(err),
+        let mut denial = None;
+        for (file, id) in waits {
+            match wait_for_permission_response(&file, id) {
+                Ok(FanotifyResponsePlan::Allow) => {}
+                Ok(FanotifyResponsePlan::Deny { errno }) => {
+                    if denial.is_none() {
+                        denial = Some(errno);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if let Some(errno) = denial {
+            return Err(fanotify_denial_error(errno));
         }
     }
-    if denied {
-        Err(LinuxError::EPERM.into())
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 pub(crate) fn permission_check_file_like(
@@ -1536,13 +1462,17 @@ mod tests {
     use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
     use core::{ptr, sync::atomic::AtomicPtr};
 
-    use axerrno::{AxError, AxResult};
+    use axerrno::{AxError, AxResult, LinuxError};
     use axio::{IoBufMut, Write};
 
     use super::{
-        FAN_ACCESS, FAN_DENY, FAN_NONBLOCK, FAN_OPEN_PERM, FanotifyCleanupWork, FanotifyEvent,
-        FanotifyFile, FanotifyPermissionEvent, pop_cleanup_from, publish_cleanup_to,
+        FAN_ACCESS, FAN_CLASS_PRE_CONTENT, FAN_NONBLOCK, FAN_OPEN_PERM,
+        FANOTIFY_PERMISSION_CLASSES, FanotifyCleanupWork, FanotifyEvent, FanotifyFile,
+        FanotifyPermissionEvent, FanotifyPermissionFd, FanotifyResponsePlan, current_permission_fd,
+        fanotify_denial_error, pop_cleanup_from, publish_cleanup_to, validate_init_flags,
+        wait_for_permission_response,
     };
+    use crate::file::{FdTable, FileDescription};
 
     struct FaultAfterWrites {
         remaining: usize,
@@ -1650,6 +1580,89 @@ mod tests {
         assert_eq!(file.read_ready(&mut dst), Err(AxError::BadAddress));
         let state = file.state.lock();
         assert!(state.queue.is_empty());
-        assert_eq!(state.pending_permissions[0].response, Some(FAN_DENY));
+        assert_eq!(
+            state.pending_permissions[0].response,
+            Some(FanotifyResponsePlan::Deny { errno: None })
+        );
+    }
+
+    #[test]
+    fn root_enacts_abi_admission_without_redefining_it() {
+        assert_eq!(FAN_ACCESS, thekernel_linux_fsnotify::FAN_ACCESS);
+        assert_eq!(
+            validate_init_flags(thekernel_linux_fsnotify::FAN_UNLIMITED_QUEUE, 0),
+            Err(AxError::OperationNotSupported)
+        );
+
+        let file = FanotifyFile::new(FAN_NONBLOCK, 0).unwrap();
+        let table = FdTable::new().unwrap();
+        assert_eq!(
+            file.handle_permission_response_in_table(
+                &table,
+                0,
+                thekernel_linux_fsnotify::FAN_DENY | thekernel_linux_fsnotify::FAN_AUDIT,
+            ),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn pre_content_deny_errno_is_preserved_for_the_permission_waiter() {
+        assert_eq!(
+            FANOTIFY_PERMISSION_CLASSES,
+            thekernel_linux_fsnotify::FANOTIFY_PERMISSION_CLASSES
+        );
+        let file = FanotifyFile::new(FAN_NONBLOCK | FAN_CLASS_PRE_CONTENT, 0).unwrap();
+        let table = FdTable::new().unwrap();
+        let description = FileDescription::new(file.clone()).unwrap();
+        let description_id = description.id();
+        let event_fd = table.add_at_least(description, 9, 10, false).unwrap();
+        {
+            let mut state = file.state.lock();
+            state.pending_permissions.push(FanotifyPermissionEvent {
+                id: 1,
+                fd: Some(FanotifyPermissionFd {
+                    number: event_fd,
+                    description_id,
+                }),
+                response: None,
+            });
+        }
+
+        file.handle_permission_response_in_table(
+            &table,
+            event_fd,
+            thekernel_linux_fsnotify::fan_deny_errno(5),
+        )
+        .unwrap();
+        assert_eq!(
+            wait_for_permission_response(&file, 1),
+            Ok(FanotifyResponsePlan::Deny { errno: Some(5) })
+        );
+        assert_eq!(fanotify_denial_error(Some(5)), LinuxError::EIO.into());
+        let ordinary = FanotifyFile::new(FAN_NONBLOCK, 0).unwrap();
+        assert_eq!(
+            ordinary.handle_permission_response_in_table(
+                &table,
+                9,
+                thekernel_linux_fsnotify::fan_deny_errno(5),
+            ),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn permission_response_rejects_a_closed_event_fd_reused_for_another_ofd() {
+        let table = FdTable::new().unwrap();
+        let original = FileDescription::new(FanotifyFile::new(FAN_NONBLOCK, 0).unwrap()).unwrap();
+        let expected = FanotifyPermissionFd {
+            number: 9,
+            description_id: original.id(),
+        };
+        let replacement =
+            FileDescription::new(FanotifyFile::new(FAN_NONBLOCK, 0).unwrap()).unwrap();
+        table.add_at_least(replacement, 9, 10, false).unwrap();
+
+        assert!(current_permission_fd(&table, 9).map(|(fd, _)| fd) != Some(expected));
     }
 }

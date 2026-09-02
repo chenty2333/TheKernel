@@ -1,8 +1,10 @@
-use alloc::{string::String, sync::Arc};
+use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult};
+use axfs::FsContext;
 use axfs_ng_vfs::{
-    CreateDisposition, InitialNodeData, NamedCreateOptions, NodePermission, NodeType, path::Path,
+    CreateDisposition, FsName, FsNameBuf, FsPath, InitialNodeData, NamedCreateOptions,
+    NodePermission, NodeType,
 };
 use axnet::unix::{BindSlot, UnixBindReservation, UnixSocket, UnixSocketAddr, UnixSocketTarget};
 use linux_raw_sys::general::{AT_FDCWD, IN_CREATE, W_OK};
@@ -11,24 +13,29 @@ use super::{
     permission::{
         NamedCreateTerminalType, SecurityFsContextExt, VfsSecurityContext,
         authorize_named_inode_create, check_create_permissions_with_frozen_metadata,
-        check_open_permissions_with_security, initial_named_create_owner_mode_with_security,
+        check_open_permissions_with_security, initial_named_create_owner_mode_with_security_at,
     },
-    validate_pathname, with_path_fs,
+    posix_acl, validate_pathname, with_path_fs,
 };
 use crate::{mounts, time::wall_time};
 
-fn try_owned_name(name: &str) -> AxResult<String> {
-    let mut owned = String::new();
+fn try_owned_name(name: &FsName) -> AxResult<FsNameBuf> {
+    let mut owned = Vec::new();
     owned
-        .try_reserve_exact(name.len())
+        .try_reserve_exact(name.as_bytes().len())
         .map_err(|_| AxError::NoMemory)?;
-    owned.push_str(name);
-    Ok(owned)
+    owned.extend_from_slice(name.as_bytes());
+    FsNameBuf::from_vec(owned).map_err(Into::into)
 }
 
 #[cfg(feature = "dev-log")]
-pub(crate) fn try_path(path: &str) -> AxResult<Arc<String>> {
-    Arc::try_new(try_owned_name(path)?).map_err(|_| AxError::NoMemory)
+pub(crate) fn try_path(path: &FsPath) -> AxResult<Arc<Vec<u8>>> {
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(path.as_bytes().len())
+        .map_err(|_| AxError::NoMemory)?;
+    owned.extend_from_slice(path.as_bytes());
+    Arc::try_new(owned).map_err(|_| AxError::NoMemory)
 }
 
 fn map_bind_create_error(error: AxError) -> AxError {
@@ -39,7 +46,7 @@ fn map_bind_create_error(error: AxError) -> AxError {
     }
 }
 
-fn check_bind_name_available(parent: &axfs_ng_vfs::Location, name: &str) -> AxResult<()> {
+fn check_bind_name_available(parent: &axfs_ng_vfs::Location, name: &FsName) -> AxResult<()> {
     match parent.lookup_no_follow_in_mount(name) {
         Ok(_) => Err(AxError::AlreadyExists),
         Err(AxError::NotFound) => Ok(()),
@@ -52,13 +59,14 @@ fn check_bind_name_available(parent: &axfs_ng_vfs::Location, name: &str) -> AxRe
 /// backend has initialized the exact slot and atomically published the name.
 pub(crate) fn bind_path(
     socket: &UnixSocket,
-    path: Arc<String>,
+    path: Arc<Vec<u8>>,
     security: &VfsSecurityContext,
     requested_mode: NodePermission,
     umask: u32,
+    publish: impl FnOnce(axnet::unix::UnixEndpointIdentity),
 ) -> AxResult<()> {
     let result = (|| {
-        let path_ref = Path::new(path.as_ref());
+        let path_ref = FsPath::new(path.as_slice());
         validate_pathname(path_ref)?;
         // This specialized socket/filesystem composite transaction is independent
         // of MutationTransaction: UnixBindReservation keeps transport admission
@@ -86,13 +94,19 @@ pub(crate) fn bind_path(
         if !parent.supports_named_create(NodeType::Socket) {
             return Err(AxError::OperationNotPermitted);
         }
-        let (mode, owner) = initial_named_create_owner_mode_with_security(
+        let (mut mode, owner) = initial_named_create_owner_mode_with_security_at(
+            &parent,
             &parent_metadata,
             security,
             NodeType::Socket,
             requested_mode,
             umask,
-        );
+        )?;
+        if let Some(default_mode) = posix_acl::initial_mode(&parent, requested_mode)? {
+            mode = NodePermission::from_bits_truncate(
+                (mode.bits() & !0o777) | (default_mode.bits() & 0o777),
+            );
+        }
         authorize_named_inode_create(
             &parent,
             &parent_metadata,
@@ -106,7 +120,12 @@ pub(crate) fn bind_path(
         let slot = Arc::try_new(BindSlot::default()).map_err(|_| AxError::NoMemory)?;
         let target = UnixSocketTarget::new(UnixSocketAddr::Path(path), slot.clone())?;
         let reservation: UnixBindReservation<'_> = socket.reserve_bind(target)?;
+        let endpoint = reservation.target_endpoint_identity()?;
         let initial_data = InitialNodeData::from_shared(slot);
+        let (project_id, project_inherit) =
+            super::inode_flags::prepare_inherited_project_id(&parent, false)?;
+        let (access_acl, default_acl) =
+            super::posix_acl::prepare_inherited_default(&parent, NodeType::Socket, mode)?;
 
         let location = parent.create_named(
             &name,
@@ -116,13 +135,19 @@ pub(crate) fn bind_path(
                 owner: Some(owner),
                 rdev: None,
                 initial_data: Some(initial_data),
+                initial_attributes: axfs_ng_vfs::PreparedInitialAttributes {
+                    project_id,
+                    project_inherit,
+                    access_acl,
+                    default_acl,
+                },
             },
             CreateDisposition::Exclusive,
         )?;
-
         // No fallible work is permitted after the backend makes the initialized
         // name visible. Committing only moves/clones already admitted ownership.
         reservation.commit_with_keepalive(location.entry.entry().lifetime_token());
+        publish(endpoint);
         if let Err(error) = crate::file::inotify::notify_parent_with_name(
             &parent,
             Some(&location.entry),
@@ -149,14 +174,13 @@ pub(crate) fn bind_path(
 #[cfg(feature = "dev-log")]
 pub(crate) fn bind_precreated_path(
     socket: &UnixSocket,
-    path: Arc<String>,
+    path: Arc<Vec<u8>>,
     security: &VfsSecurityContext,
+    fs: &FsContext,
 ) -> AxResult<()> {
-    let path_ref = Path::new(path.as_ref());
+    let path_ref = FsPath::new(path.as_slice());
     validate_pathname(path_ref)?;
-    let location = with_path_fs(AT_FDCWD, path_ref, |fs| {
-        fs.resolve_no_follow_security(path_ref, security)
-    })?;
+    let location = fs.resolve_no_follow_security(path_ref, security)?;
     check_open_permissions_with_security(
         &location,
         W_OK,
@@ -181,10 +205,10 @@ pub(crate) fn bind_precreated_path(
 /// Resolves a Linux pathname Unix peer and enforces path-search plus socket
 /// inode write permission using one frozen credential view.
 pub(crate) fn resolve_peer(
-    path: Arc<String>,
+    path: Arc<Vec<u8>>,
     security: &VfsSecurityContext,
 ) -> AxResult<UnixSocketTarget> {
-    let path_ref = Path::new(path.as_ref());
+    let path_ref = FsPath::new(path.as_slice());
     validate_pathname(path_ref)?;
     let location = with_path_fs(AT_FDCWD, path_ref, |fs| {
         fs.resolve_security(path_ref, security)

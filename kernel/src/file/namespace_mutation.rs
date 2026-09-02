@@ -1,38 +1,53 @@
-use alloc::string::String;
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{
-    CreateDisposition, DeviceId, Location, NamedCreateOptions, NamespaceGeneration, NodePermission,
-    NodeType,
+    CreateDisposition, DeviceId, FsName, FsNameBuf, FsPath, FsPathBuf, Location,
+    NamedCreateOptions, NamespaceGeneration, NodePermission, NodeType, PreparedInitialAttributes,
 };
 use linux_raw_sys::general::CAP_MKNOD;
 use linux_vfs::{MutationBackend, MutationTransaction};
 
-use super::permission::{
-    VfsSecurityContext, authorize_hardlink_create, authorize_hardlink_source,
-    authorize_inode_rename, authorize_inode_rmdir, authorize_inode_unlink,
-    authorize_named_inode_create, authorize_symlink_create,
-    check_create_permissions_with_frozen_metadata,
-    check_cross_parent_rename_source_permissions_with_security,
-    check_remove_permissions_with_security, check_rename_parent_permissions_with_security,
-    check_writable_mount, initial_named_create_owner_mode_with_security,
+use super::{
+    inode_flags,
+    permission::{
+        VfsSecurityContext, authorize_hardlink_create, authorize_hardlink_source,
+        authorize_inode_rename, authorize_inode_rmdir, authorize_inode_unlink,
+        authorize_named_inode_create, authorize_symlink_create,
+        check_create_permissions_with_frozen_metadata,
+        check_cross_parent_rename_source_permissions_with_security,
+        check_remove_permissions_with_security, check_rename_parent_permissions_with_security,
+        check_writable_mount, initial_named_create_owner_mode_with_security_at,
+    },
+    posix_acl,
 };
-use crate::mounts::NamespaceOperationGuard;
-use crate::syscall::{admit_inode_create, admit_unlink};
+use crate::{
+    mounts::NamespaceOperationGuard,
+    syscall::{admit_inode_create, admit_unlink},
+};
 
 const GENERATION_SNAPSHOT_RETRIES: usize = 4;
 
-fn try_owned(value: &str) -> AxResult<String> {
-    let mut owned = String::new();
+fn try_owned_path(value: &FsPath) -> AxResult<FsPathBuf> {
+    let mut owned = Vec::new();
     owned
-        .try_reserve_exact(value.len())
+        .try_reserve_exact(value.as_bytes().len())
         .map_err(|_| AxError::NoMemory)?;
-    owned.push_str(value);
-    Ok(owned)
+    owned.extend_from_slice(value.as_bytes());
+    Ok(FsPathBuf::from_vec(owned))
 }
 
-fn lookup_optional(parent: &Location, name: &str) -> AxResult<Option<Location>> {
+fn try_owned_name(value: &FsName) -> AxResult<FsNameBuf> {
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(value.as_bytes().len())
+        .map_err(|_| AxError::NoMemory)?;
+    owned.extend_from_slice(value.as_bytes());
+    FsNameBuf::from_vec(owned).map_err(Into::into)
+}
+
+fn lookup_optional(parent: &Location, name: &FsName) -> AxResult<Option<Location>> {
     match parent.lookup_no_follow_in_mount(name) {
         Ok(location) => Ok(Some(location)),
         Err(AxError::NotFound) => Ok(None),
@@ -42,7 +57,7 @@ fn lookup_optional(parent: &Location, name: &str) -> AxResult<Option<Location>> 
 
 fn stable_lookup(
     parent: &Location,
-    name: &str,
+    name: &FsName,
 ) -> AxResult<(Option<Location>, NamespaceGeneration)> {
     for _ in 0..GENERATION_SNAPSHOT_RETRIES {
         let before = parent.namespace_generation()?;
@@ -70,14 +85,14 @@ fn validate_expected_identity(
 /// Owned name snapshot retained by one prepared namespace mutation.
 struct PreparedName {
     parent: Location,
-    name: String,
+    name: FsNameBuf,
     expected: Option<Location>,
     generation: NamespaceGeneration,
 }
 
 impl PreparedName {
-    fn reserve(parent: &Location, name: &str, expected: Option<&Location>) -> AxResult<Self> {
-        let name = try_owned(name)?;
+    fn reserve(parent: &Location, name: &FsName, expected: Option<&Location>) -> AxResult<Self> {
+        let name = try_owned_name(name)?;
         let (current, generation) = stable_lookup(parent, &name)?;
         validate_expected_identity(current.as_ref(), expected)?;
         Ok(Self {
@@ -156,7 +171,7 @@ fn commit<M: KernelMutationRequest>(request: M) -> AxResult<M::Output> {
 
 struct CreateRequest<'a> {
     parent: &'a Location,
-    name: &'a str,
+    name: &'a FsName,
     node_type: NodeType,
     requested_mode: NodePermission,
     umask: u32,
@@ -177,6 +192,7 @@ struct PreparedCreate {
 struct PreparedCreateAttributes {
     permission: NodePermission,
     owner: (u32, u32),
+    initial_attributes: PreparedInitialAttributes,
 }
 
 fn check_named_create_capability(
@@ -234,13 +250,21 @@ impl KernelMutationRequest for CreateRequest<'_> {
         )?;
         check_named_create_capability(reservation.node_type, &reservation.security)?;
         check_named_create_mechanism(&reservation.name.parent, reservation.node_type)?;
-        let (permission, owner) = initial_named_create_owner_mode_with_security(
+        let (mut permission, owner) = initial_named_create_owner_mode_with_security_at(
+            &reservation.name.parent,
             &parent_metadata,
             &reservation.security,
             reservation.node_type,
             reservation.requested_mode,
             reservation.umask,
-        );
+        )?;
+        if let Some(default_permission) =
+            posix_acl::initial_mode(&reservation.name.parent, reservation.requested_mode)?
+        {
+            permission = NodePermission::from_bits_truncate(
+                (permission.bits() & !0o777) | (default_permission.bits() & 0o777),
+            );
+        }
         authorize_named_inode_create(
             &reservation.name.parent,
             &parent_metadata,
@@ -250,13 +274,34 @@ impl KernelMutationRequest for CreateRequest<'_> {
             reservation.rdev,
             &reservation.security,
         )?;
-        reservation.attributes = Some(PreparedCreateAttributes { permission, owner });
+        let (project_id, project_inherit) = inode_flags::prepare_inherited_project_id(
+            &reservation.name.parent,
+            reservation.node_type == NodeType::Directory,
+        )?;
+        let (access_acl, default_acl) = posix_acl::prepare_inherited_default(
+            &reservation.name.parent,
+            reservation.node_type,
+            permission,
+        )?;
+        reservation.attributes = Some(PreparedCreateAttributes {
+            permission,
+            owner,
+            initial_attributes: PreparedInitialAttributes {
+                project_id,
+                project_inherit,
+                access_acl,
+                default_acl,
+            },
+        });
         Ok(())
     }
 
     fn publish(reservation: &mut Self::Reservation) -> AxResult<Self::Output> {
-        let PreparedCreateAttributes { permission, owner } =
-            reservation.attributes.take().ok_or(AxError::BadState)?;
+        let PreparedCreateAttributes {
+            permission,
+            owner,
+            initial_attributes,
+        } = reservation.attributes.take().ok_or(AxError::BadState)?;
         let mut metadata = reservation.name.parent.metadata()?;
         metadata.uid = owner.0;
         metadata.gid = owner.1;
@@ -275,6 +320,7 @@ impl KernelMutationRequest for CreateRequest<'_> {
                     owner: Some(owner),
                     rdev: reservation.rdev,
                     initial_data: None,
+                    initial_attributes,
                 },
                 CreateDisposition::Exclusive,
             )
@@ -287,7 +333,7 @@ impl KernelMutationRequest for CreateRequest<'_> {
 pub(crate) fn create_named(
     _operation: &NamespaceOperationGuard,
     parent: &Location,
-    name: &str,
+    name: &FsName,
     node_type: NodeType,
     requested_mode: NodePermission,
     umask: u32,
@@ -307,20 +353,21 @@ pub(crate) fn create_named(
 
 struct SymlinkRequest<'a> {
     parent: &'a Location,
-    name: &'a str,
-    target: &'a str,
+    name: &'a FsName,
+    target: &'a FsPath,
     security: &'a VfsSecurityContext,
 }
 
 struct PreparedSymlink {
     name: PreparedName,
-    target: String,
+    target: FsPathBuf,
     security: VfsSecurityContext,
     attributes: Option<PreparedSymlinkAttributes>,
 }
 
 struct PreparedSymlinkAttributes {
     owner: (u32, u32),
+    initial_attributes: PreparedInitialAttributes,
 }
 
 impl KernelMutationRequest for SymlinkRequest<'_> {
@@ -331,7 +378,7 @@ impl KernelMutationRequest for SymlinkRequest<'_> {
         let name = PreparedName::reserve(self.parent, self.name, None)?;
         Ok(PreparedSymlink {
             name,
-            target: try_owned(self.target)?,
+            target: try_owned_path(self.target)?,
             security: self.security.clone(),
             attributes: None,
         })
@@ -366,18 +413,27 @@ impl KernelMutationRequest for SymlinkRequest<'_> {
             &reservation.target,
             &reservation.security,
         )?;
+        let (project_id, project_inherit) =
+            inode_flags::prepare_inherited_project_id(&reservation.name.parent, false)?;
         reservation.attributes = Some(PreparedSymlinkAttributes {
             owner: (
                 reservation.security.credentials().uid().into_raw(),
                 owner_gid,
             ),
+            initial_attributes: PreparedInitialAttributes {
+                project_id,
+                project_inherit,
+                ..Default::default()
+            },
         });
         Ok(())
     }
 
     fn publish(reservation: &mut Self::Reservation) -> AxResult<Self::Output> {
-        let PreparedSymlinkAttributes { owner } =
-            reservation.attributes.take().ok_or(AxError::BadState)?;
+        let PreparedSymlinkAttributes {
+            owner,
+            initial_attributes,
+        } = reservation.attributes.take().ok_or(AxError::BadState)?;
         let mut metadata = reservation.name.parent.metadata()?;
         metadata.uid = owner.0;
         metadata.gid = owner.1;
@@ -385,11 +441,20 @@ impl KernelMutationRequest for SymlinkRequest<'_> {
         metadata.blocks = 0;
         metadata.node_type = NodeType::Symlink;
         let charge = admit_inode_create(&reservation.name.parent, &metadata)?;
-        let created = reservation.name.parent.create_symlink(
+        // Symlink providers receive the same prepared payload through the
+        // named-create contract; a backend that cannot publish these native
+        // attributes atomically must fail before adding the name.
+        let created = reservation.name.parent.create_symlink_prepared(
             &reservation.name.name,
             &reservation.target,
-            NodePermission::from_bits_truncate(0o777),
-            Some(owner),
+            &NamedCreateOptions {
+                node_type: NodeType::Symlink,
+                permission: NodePermission::from_bits_truncate(0o777),
+                owner: Some(owner),
+                rdev: None,
+                initial_data: None,
+                initial_attributes,
+            },
         )?;
         charge.commit();
         Ok(created)
@@ -399,8 +464,8 @@ impl KernelMutationRequest for SymlinkRequest<'_> {
 pub(crate) fn create_symlink(
     _operation: &NamespaceOperationGuard,
     parent: &Location,
-    name: &str,
-    target: &str,
+    name: &FsName,
+    target: &FsPath,
     security: &VfsSecurityContext,
 ) -> AxResult<Location> {
     commit(SymlinkRequest {
@@ -413,7 +478,7 @@ pub(crate) fn create_symlink(
 
 struct LinkRequest<'a> {
     parent: &'a Location,
-    name: &'a str,
+    name: &'a FsName,
     source: LinkRequestSource<'a>,
     security: &'a VfsSecurityContext,
 }
@@ -524,7 +589,7 @@ impl KernelMutationRequest for LinkRequest<'_> {
 pub(crate) fn link(
     _operation: &NamespaceOperationGuard,
     parent: &Location,
-    name: &str,
+    name: &FsName,
     source: &Location,
     security: &VfsSecurityContext,
 ) -> AxResult<Location> {
@@ -546,7 +611,7 @@ pub(crate) fn link(
 pub(crate) fn reject_unnameable_link_source(
     _operation: &NamespaceOperationGuard,
     parent: &Location,
-    name: &str,
+    name: &FsName,
     security: &VfsSecurityContext,
 ) -> AxResult<()> {
     commit(LinkRequest {
@@ -565,7 +630,7 @@ pub(crate) struct UnlinkOutcome {
 
 struct UnlinkRequest<'a> {
     parent: &'a Location,
-    name: &'a str,
+    name: &'a FsName,
     target: &'a Location,
     remove_dir: bool,
     security: &'a VfsSecurityContext,
@@ -710,7 +775,7 @@ impl KernelMutationRequest for UnlinkRequest<'_> {
 pub(crate) fn unlink(
     _operation: &NamespaceOperationGuard,
     parent: &Location,
-    name: &str,
+    name: &FsName,
     target: &Location,
     remove_dir: bool,
     security: &VfsSecurityContext,
@@ -729,14 +794,24 @@ pub(crate) struct RenameOutcome {
     pub(crate) replaced_loses_last_link: bool,
 }
 
+/// The namespace operation being committed.  Keeping these distinct prevents
+/// callers from accidentally lowering `renameat2`'s atomic modes to an
+/// ordinary replacement rename.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RenameMode {
+    Ordinary,
+    Whiteout,
+}
+
 struct RenameRequest<'a> {
     old_parent: &'a Location,
-    old_name: &'a str,
+    old_name: &'a FsName,
     source: &'a Location,
     new_parent: &'a Location,
-    new_name: &'a str,
+    new_name: &'a FsName,
     replaced: Option<&'a Location>,
     no_replace: bool,
+    mode: RenameMode,
     security: &'a VfsSecurityContext,
 }
 
@@ -746,6 +821,7 @@ struct PreparedRename {
     source: Location,
     replaced: Option<Location>,
     no_replace: bool,
+    mode: RenameMode,
     security: VfsSecurityContext,
     admission: Option<PreparedRenameAdmission>,
 }
@@ -787,6 +863,7 @@ impl KernelMutationRequest for RenameRequest<'_> {
             source: self.source.clone(),
             replaced: self.replaced.cloned(),
             no_replace: self.no_replace,
+            mode: self.mode,
             security: self.security.clone(),
             admission: None,
         })
@@ -852,8 +929,24 @@ impl KernelMutationRequest for RenameRequest<'_> {
         // actually supplies an ordinary rename operation before invoking the
         // moved-directory permission check or inode_rename hook.
         validate_rename_types(&source_metadata, replaced_metadata.as_ref())?;
-        if !reservation.source_name.parent.supports_rename() {
-            return Err(AxError::OperationNotPermitted);
+        match reservation.mode {
+            RenameMode::Ordinary if !reservation.source_name.parent.supports_rename() => {
+                return Err(AxError::OperationNotPermitted);
+            }
+            RenameMode::Whiteout if !reservation.security.has_capability(CAP_MKNOD) => {
+                return Err(AxError::OperationNotPermitted);
+            }
+            RenameMode::Whiteout
+                if !reservation
+                    .source_name
+                    .parent
+                    .entry()
+                    .as_dir()?
+                    .supports_rename_whiteout() =>
+            {
+                return Err(AxError::OperationNotSupported);
+            }
+            _ => {}
         }
         check_cross_parent_rename_source_permissions_with_security(
             &reservation.source_name.parent,
@@ -897,13 +990,22 @@ impl KernelMutationRequest for RenameRequest<'_> {
                 replaced_loses_last_link: false,
             });
         };
-        reservation.source_name.parent.rename_checked(
-            &reservation.source_name.name,
-            &reservation.source,
-            &reservation.destination_name.parent,
-            &reservation.destination_name.name,
-            reservation.replaced.as_ref(),
-        )?;
+        match reservation.mode {
+            RenameMode::Ordinary => reservation.source_name.parent.rename_checked(
+                &reservation.source_name.name,
+                &reservation.source,
+                &reservation.destination_name.parent,
+                &reservation.destination_name.name,
+                reservation.replaced.as_ref(),
+            )?,
+            RenameMode::Whiteout => reservation.source_name.parent.rename_whiteout_checked(
+                &reservation.source_name.name,
+                &reservation.source,
+                &reservation.destination_name.parent,
+                &reservation.destination_name.name,
+                reservation.replaced.as_ref(),
+            )?,
+        }
         Ok(RenameOutcome {
             replaced: reservation.replaced.clone(),
             replaced_loses_last_link,
@@ -915,10 +1017,10 @@ impl KernelMutationRequest for RenameRequest<'_> {
 pub(crate) fn rename(
     _operation: &NamespaceOperationGuard,
     old_parent: &Location,
-    old_name: &str,
+    old_name: &FsName,
     source: &Location,
     new_parent: &Location,
-    new_name: &str,
+    new_name: &FsName,
     replaced: Option<&Location>,
     no_replace: bool,
     security: &VfsSecurityContext,
@@ -940,6 +1042,203 @@ pub(crate) fn rename(
         new_name,
         replaced,
         no_replace,
+        mode: RenameMode::Ordinary,
+        security,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rename_whiteout(
+    _operation: &NamespaceOperationGuard,
+    old_parent: &Location,
+    old_name: &FsName,
+    source: &Location,
+    new_parent: &Location,
+    new_name: &FsName,
+    replaced: Option<&Location>,
+    security: &VfsSecurityContext,
+) -> AxResult<RenameOutcome> {
+    commit(RenameRequest {
+        old_parent,
+        old_name,
+        source,
+        new_parent,
+        new_name,
+        replaced,
+        no_replace: false,
+        mode: RenameMode::Whiteout,
+        security,
+    })
+}
+
+struct RenameExchangeRequest<'a> {
+    old_parent: &'a Location,
+    old_name: &'a FsName,
+    source: &'a Location,
+    new_parent: &'a Location,
+    new_name: &'a FsName,
+    destination: &'a Location,
+    security: &'a VfsSecurityContext,
+}
+
+struct PreparedRenameExchange {
+    source_name: PreparedName,
+    destination_name: PreparedName,
+    source: Location,
+    destination: Location,
+    security: VfsSecurityContext,
+    admitted: bool,
+}
+
+impl KernelMutationRequest for RenameExchangeRequest<'_> {
+    type Reservation = PreparedRenameExchange;
+    type Output = RenameOutcome;
+
+    fn reserve(self) -> AxResult<Self::Reservation> {
+        Ok(PreparedRenameExchange {
+            source_name: PreparedName::reserve(self.old_parent, self.old_name, Some(self.source))?,
+            destination_name: PreparedName::reserve(
+                self.new_parent,
+                self.new_name,
+                Some(self.destination),
+            )?,
+            source: self.source.clone(),
+            destination: self.destination.clone(),
+            security: self.security.clone(),
+            admitted: false,
+        })
+    }
+
+    fn revalidate(reservation: &Self::Reservation) -> AxResult<()> {
+        reservation.source_name.revalidate()?;
+        reservation.destination_name.revalidate()
+    }
+
+    fn admit(reservation: &mut Self::Reservation) -> AxResult<()> {
+        if reservation.admitted {
+            return Err(AxError::BadState);
+        }
+        if reservation.source.same_node(&reservation.destination) {
+            reservation.admitted = true;
+            return Ok(());
+        }
+        let old_parent = reservation.source_name.parent.metadata()?;
+        let new_parent = if reservation
+            .source_name
+            .parent
+            .same_node(&reservation.destination_name.parent)
+        {
+            old_parent.clone()
+        } else {
+            reservation.destination_name.parent.metadata()?
+        };
+        let source = reservation.source.metadata()?;
+        let destination = reservation.destination.metadata()?;
+
+        // Exchange has two may_delete roles.  It deliberately skips the
+        // ordinary replacement type matrix: Linux allows e.g. directory ↔
+        // symlink exchanges, subject only to the earlier topology traps.
+        check_rename_parent_permissions_with_security(
+            &reservation.source_name.parent,
+            &old_parent,
+            &source,
+            &reservation.destination_name.parent,
+            &new_parent,
+            Some(&destination),
+            &reservation.security,
+        )?;
+        check_rename_parent_permissions_with_security(
+            &reservation.destination_name.parent,
+            &new_parent,
+            &destination,
+            &reservation.source_name.parent,
+            &old_parent,
+            Some(&source),
+            &reservation.security,
+        )?;
+        if !reservation.source_name.parent.supports_rename_exchange() {
+            return Err(AxError::OperationNotSupported);
+        }
+        check_cross_parent_rename_source_permissions_with_security(
+            &reservation.source_name.parent,
+            &reservation.destination_name.parent,
+            &reservation.source,
+            &source,
+            &reservation.security,
+        )?;
+        check_cross_parent_rename_source_permissions_with_security(
+            &reservation.destination_name.parent,
+            &reservation.source_name.parent,
+            &reservation.destination,
+            &destination,
+            &reservation.security,
+        )?;
+        authorize_inode_rename(
+            &reservation.source_name.parent,
+            &old_parent,
+            &reservation.source,
+            &source,
+            &reservation.source_name.name,
+            &reservation.destination_name.parent,
+            &new_parent,
+            Some((&reservation.destination, &destination)),
+            &reservation.destination_name.name,
+            &reservation.security,
+        )?;
+        authorize_inode_rename(
+            &reservation.destination_name.parent,
+            &new_parent,
+            &reservation.destination,
+            &destination,
+            &reservation.destination_name.name,
+            &reservation.source_name.parent,
+            &old_parent,
+            Some((&reservation.source, &source)),
+            &reservation.source_name.name,
+            &reservation.security,
+        )?;
+        reservation.admitted = true;
+        Ok(())
+    }
+
+    fn publish(reservation: &mut Self::Reservation) -> AxResult<Self::Output> {
+        if !reservation.admitted {
+            return Err(AxError::BadState);
+        }
+        if !reservation.source.same_node(&reservation.destination) {
+            reservation.source_name.parent.rename_exchange_checked(
+                &reservation.source_name.name,
+                &reservation.source,
+                &reservation.destination_name.parent,
+                &reservation.destination_name.name,
+                &reservation.destination,
+            )?;
+        }
+        Ok(RenameOutcome {
+            replaced: None,
+            replaced_loses_last_link: false,
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rename_exchange(
+    _operation: &NamespaceOperationGuard,
+    old_parent: &Location,
+    old_name: &FsName,
+    source: &Location,
+    new_parent: &Location,
+    new_name: &FsName,
+    destination: &Location,
+    security: &VfsSecurityContext,
+) -> AxResult<RenameOutcome> {
+    commit(RenameExchangeRequest {
+        old_parent,
+        old_name,
+        source,
+        new_parent,
+        new_name,
+        destination,
         security,
     })
 }
@@ -1107,20 +1406,20 @@ mod tests {
             Ok(0)
         }
 
-        fn lookup(&self, _name: &str) -> VfsResult<DirEntry> {
+        fn lookup(&self, _name: &FsName) -> VfsResult<DirEntry> {
             Err(VfsError::NotFound)
         }
 
         fn create_named(
             &self,
-            _name: &str,
+            _name: &FsName,
             _options: &NamedCreateOptions,
             _disposition: CreateDisposition,
         ) -> VfsResult<CreateOutcome<DirEntry>> {
             Err(VfsError::Unsupported)
         }
 
-        fn link(&self, _name: &str, _node: &DirEntry) -> VfsResult<DirEntry> {
+        fn link(&self, _name: &FsName, _node: &DirEntry) -> VfsResult<DirEntry> {
             Err(VfsError::Unsupported)
         }
 
@@ -1513,6 +1812,7 @@ mod tests {
 
     #[test]
     fn successful_named_creates_dispatch_one_parent_permission_and_one_typed_leaf() {
+        let _context = crate::test_support::scheduler_test_context();
         let cases = [
             (
                 "regular",
@@ -2109,6 +2409,7 @@ mod tests {
 
     #[test]
     fn symlink_admission_freezes_target_mode_and_sgid_owner_before_publication() {
+        let _context = crate::test_support::scheduler_test_context();
         let namespace = UserNamespace::try_new_root().unwrap();
         let slot = CredentialSlot::new(Cred::try_root(namespace).unwrap());
         let fsuid = Kuid::from_raw(1200).unwrap();
@@ -2163,6 +2464,7 @@ mod tests {
 
     #[test]
     fn unlink_transaction_preserves_other_names_and_reports_exact_link_outcome() {
+        let _context = crate::test_support::scheduler_test_context();
         let root = memory_root();
         let victim = create_file(&root, "victim");
         let alias = root.link("alias", &victim).unwrap();
@@ -2192,6 +2494,7 @@ mod tests {
 
     #[test]
     fn rmdir_hook_admission_leaves_backend_emptiness_after_the_hook_boundary() {
+        let _context = crate::test_support::scheduler_test_context();
         let root = memory_root();
         let directory = create_dir(&root, "directory");
         create_file(&directory, "child");
@@ -2288,6 +2591,7 @@ mod tests {
             new_name: "destination",
             replaced: Some(&destination),
             no_replace: false,
+            mode: RenameMode::Ordinary,
             security: &security,
         }
         .reserve()
