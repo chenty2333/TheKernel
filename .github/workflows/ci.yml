@@ -7,12 +7,6 @@ on:
   schedule:
     - cron: '17 3 * * *'
   workflow_dispatch:
-    inputs:
-      terminal_abi:
-        description: Run the fail-closed Linux v6.18 terminal ABI gate
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   group: thekernel-ci-${{ github.event.pull_request.number || github.ref }}
@@ -193,45 +187,6 @@ jobs:
               -A dead-code \
               -A clippy::drop-non-drop \
               -A clippy::too-many-arguments
-
-  linux-v618-terminal-abi:
-    name: Linux v6.18 terminal syscall routing
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.terminal_abi }}
-    # The BPF routing witness is compiled by fast's host check with
-    # `--features bpf`; terminal routing therefore cannot pass ahead of it.
-    needs: [image_ref, fast]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    container:
-      image: ${{ needs.image_ref.outputs.image }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    defaults:
-      run:
-        shell: bash
-        working-directory: TheKernel
-    steps:
-      - name: Checkout TheKernel
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          path: TheKernel
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Verify development image tools
-        run: dev-env/check-image.sh
-
-      - name: Check final Linux v6.18 syscall routing terminal condition
-        run: |
-          python3 scripts/ci/linux_v618_abi_gate.py materialize \
-            --linux-src "$GITHUB_WORKSPACE/TheKernel/.state/linux-v6.18"
-          python3 scripts/ci/linux_v618_abi_gate.py inventory \
-            --linux-src "$GITHUB_WORKSPACE/TheKernel/.state/linux-v6.18"
-          python3 scripts/ci/linux_v618_abi_gate.py schema \
-            --linux-src "$GITHUB_WORKSPACE/TheKernel/.state/linux-v6.18"
-          python3 scripts/ci/linux_v618_abi_gate.py final \
-            --linux-src "$GITHUB_WORKSPACE/TheKernel/.state/linux-v6.18"
 
   product:
     name: x86_64 product

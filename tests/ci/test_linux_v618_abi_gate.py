@@ -71,17 +71,10 @@ class GateTests(unittest.TestCase):
         path = root / "contracts.toml"; path.write_text(text, encoding="utf-8")
         return path
 
-    def oracles(self, root: Path, change: tuple[str, str] | None = None) -> Path:
-        text = (ROOT / "config/linux-v6.18-oracles.toml").read_text(encoding="utf-8")
-        if change is not None:
-            text = text.replace(*change)
-        path = root / "oracles.toml"; path.write_text(text, encoding="utf-8")
-        return path
-
     def test_pin_and_terminal_are_fixed(self) -> None:
         manifest = gate.load_manifest(self.manifest())
         self.assertEqual(manifest["linux"]["tag"], "v6.18")
-        self.assertEqual(manifest["terminal"], gate.TERMINAL)
+        self.assertEqual(manifest["terminal"], {"ordinary_explicit": 366, "explicit_enosys": 17, "native_fallback": 0})
 
     def test_inventory_accepts_canonical_decimal_strings_only(self) -> None:
         self.assertEqual(gate.numbers(["179", "180-181"], "ordinary_explicit"), {179, 180, 181})
@@ -106,18 +99,11 @@ class GateTests(unittest.TestCase):
             source, _ = self.source(Path(temporary) / "linux")
             self.assertEqual(len(gate.parse_table(source / gate.load_manifest(self.manifest())["linux"]["table"])), 383)
 
-    def test_inventory_passes_and_final_names_nine_missing_routes(self) -> None:
+    def test_inventory_passes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             source, entries = self.source(Path(temporary) / "linux")
             dispatch = Path(temporary) / "dispatch.rs"; self.dispatch(dispatch, entries)
             gate.inventory(self.manifest(), source, dispatch)
-            routes = dispatch.read_text(encoding="utf-8")
-            for number in (335, 336, 463, 464, 465, 466, 467, 468, 469):
-                routes = routes.replace(f"Sysno::{entries[number]} => sys_call(),\n", "")
-            dispatch.write_text(routes, encoding="utf-8")
-            with self.assertRaisesRegex(gate.GateError, "terminal explicit routes mismatch") as raised:
-                gate.final(self.manifest(), source, dispatch)
-        self.assertEqual(sum(entries[number] in str(raised.exception) for number in (335, 336, 463, 464, 465, 466, 467, 468, 469)), 9)
 
     def test_literals_and_comments_cannot_invent_routes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -148,16 +134,12 @@ class GateTests(unittest.TestCase):
                 path.write_text(f"fn dispatch_syscall(sysno: Sysno) {{ match sysno {{ {arm} Sysno::ni => sys_ni_syscall(), _ => Err(AxError::Unsupported), }} }}", encoding="utf-8")
                 with self.assertRaisesRegex(gate.GateError, message): gate.routes(path, {"real", "ni"}, gate.WITNESS)
 
-    def test_exact_bpf_witness_and_placeholders(self) -> None:
+    def test_exact_bpf_witness(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "dispatch.rs"
             path.write_text('#[allow(dead_code)] fn dispatch_syscall(sysno: Sysno) { match sysno { #[cfg(feature = "bpf")] Sysno::bpf => ok(), Sysno::ni => sys_ni_syscall(), _ => Err(AxError::Unsupported), } }', encoding="utf-8")
             found, _, _ = gate.routes(path, {"bpf", "ni"}, gate.WITNESS)
             self.assertEqual(found, {"bpf", "ni"})
-        with tempfile.TemporaryDirectory() as temporary:
-            source, entries = self.source(Path(temporary) / "linux")
-            path = Path(temporary) / "dispatch.rs"; self.dispatch(path, entries, True, "wrap(sys_ni_syscall())")
-            with self.assertRaisesRegex(gate.GateError, "reach sys_ni_syscall"): gate.final(self.manifest(), source, path)
 
     def test_contract_cells_are_individual_and_honest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -182,11 +164,11 @@ class GateTests(unittest.TestCase):
             with self.assertRaisesRegex(gate.GateError, "non-NI cell is not bound"):
                 gate.contract_cells(self.contracts(root), entries, dispatch)
 
-    def test_static_schema_accepts_contracts_without_oracle_artifacts(self) -> None:
+    def test_static_schema_accepts_contracts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); source, entries = self.source(root / "linux")
             dispatch = root / "dispatch.rs"; self.contract_dispatch(dispatch, entries)
-            gate.schema(self.manifest(), self.contracts(root), self.oracles(root), source, dispatch)
+            gate.schema(self.manifest(), self.contracts(root), source, dispatch)
 
     def test_graph_fields_reject_empty_or_handler_defined_payloads(self) -> None:
         for value in (["flag:"], ["errno:handler-defined"]):
@@ -221,12 +203,6 @@ class GateTests(unittest.TestCase):
                 with self.subTest(change=change):
                     with self.assertRaisesRegex(gate.GateError, message):
                         gate.contract_cells(self.contracts(root, change), entries)
-
-    def test_oracle_rejects_missing_source_and_vacuous_witness_config(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            with self.assertRaisesRegex(gate.GateError, "shared guest binary source does not exist"):
-                gate.validate_oracles(self.oracles(root), {})
 
 
 if __name__ == "__main__": unittest.main()

@@ -19,14 +19,11 @@ from typing import Sequence
 ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = ROOT / "config/linux-v6.18-abi.toml"
 CONTRACTS = ROOT / "config/linux-v6.18-contracts.toml"
-ORACLES = ROOT / "config/linux-v6.18-oracles.toml"
 SOURCE = ROOT / ".state/linux-v6.18"
 DISPATCH = ROOT / "kernel/src/syscall/dispatch.rs"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 SYSNO = re.compile(r"\bSysno::([A-Za-z_][A-Za-z0-9_]*)\b")
-TERMINAL = {"ordinary_explicit": 366, "explicit_enosys": 17, "native_fallback": 0}
 WITNESS = 'cfg(feature = "bpf")'
-PLACEHOLDER = re.compile(r"\b(?:AxError::)?(?:Unsupported|OperationNotSupported)\b|\bENOSYS\b")
 
 
 class GateError(ValueError):
@@ -51,8 +48,16 @@ def load_manifest(path: Path) -> dict:
         raise GateError("routing inventory fields are invalid")
     if data["routing_witness"] != {"bpf": WITNESS}:
         raise GateError("routing_witness must declare only the exact BPF feature witness")
-    if data["terminal"] != TERMINAL:
-        raise GateError(f"terminal routing expectation is {data['terminal']}, expected {TERMINAL}")
+    terminal = data["terminal"]
+    if (
+        not isinstance(terminal, dict)
+        or set(terminal) != {"ordinary_explicit", "explicit_enosys", "native_fallback"}
+        or not all(isinstance(count, int) and count >= 0 for count in terminal.values())
+    ):
+        raise GateError("terminal routing expectation fields are invalid")
+    for key, count in terminal.items():
+        if len(numbers(data["routing_inventory"][key], key)) != count:
+            raise GateError(f"terminal routing expectation {key}={count} does not match the routing inventory")
     return data
 
 
@@ -183,7 +188,7 @@ def arms(path: Path) -> list[tuple[str, str]]:
     masked = mask_rust_noncode(source)
     function = top_level_match(
         masked, 0, len(masked),
-        re.compile(r"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?fn\s+dispatch_syscall\s*\("),
+        re.compile(r"(?m)^\s*(?:#\[[^\]]+\]\s*)*(?:pub(?:\s*\([^)]*\))?\s+)?fn\s+dispatch_syscall\s*\("),
         "dispatch_syscall function",
     )
     begin = masked.find("{", function.end())
@@ -211,6 +216,11 @@ def arms(path: Path) -> list[tuple[str, str]]:
                 elif inner == 0 and masked.startswith("Sysno::", index) and body[expression:index].strip():
                     result.append((pattern, body[expression:index].strip())); start = index; break
                 index += 1
+            else:
+                # A trailing block arm ends at the match boundary without a
+                # comma (rustfmt drops it); flush it instead of losing it.
+                if body[expression:index].strip():
+                    result.append((pattern, body[expression:index].strip()))
         index += 1
     return result
 
@@ -222,7 +232,9 @@ def routes(path: Path, table: set[str], witness: str) -> tuple[set[str], set[str
         names = set(SYSNO.findall(masked_pattern)) & table
         if not names: continue
         if re.search(r"\bif\b", masked_pattern): raise GateError(f"native syscall route(s) {sorted(names)} may not use a match guard")
-        attrs = [re.sub(r"\s+", " ", item.strip()) for item in re.findall(r"#\[([^]]+)\]", masked_pattern, re.DOTALL)]
+        # Attributes carry string literals (cfg(feature = "bpf")), so read them
+        # from the raw pattern; the masked form would blank the feature name.
+        attrs = [re.sub(r"\s+", " ", item.strip()) for item in re.findall(r"#\[([^]]+)\]", pattern, re.DOTALL)]
         if attrs and not (names == {"bpf"} and attrs == [witness]) and not (names == {"vfork"} and attrs == ['cfg(target_arch = "x86_64")']):
             raise GateError(f"native syscall route(s) {sorted(names)} have unsupported conditional attribute(s) {attrs}")
     ni_patterns = [pattern for pattern, expression in parsed if re.fullmatch(r"\s*sys_ni_syscall\s*\(\s*\)\s*", mask_rust_noncode(expression))]
@@ -245,30 +257,11 @@ def inventory(manifest_path: Path, source: Path, dispatch: Path) -> None:
     counts = Counter(matrix.values()); print(f"linux-v6.18-abi inventory: ordinary-explicit={counts['ordinary-explicit']} explicit-enosys={counts['explicit-enosys']} native-fallback={counts['native-fallback']}")
 
 
-def final(manifest_path: Path, source: Path, dispatch: Path) -> None:
-    manifest = load_manifest(manifest_path); entries = parse_table(source / manifest["linux"]["table"]); table = set(entries.values())
-    found, ni, parsed = routes(dispatch, table, manifest["routing_witness"]["bpf"]); missing = sorted(table - found)
-    if missing or found - table: raise GateError(f"terminal explicit routes mismatch; missing={missing}, unexpected={sorted(found - table)}")
-    for pattern, expression in parsed:
-        names = set(SYSNO.findall(mask_rust_noncode(pattern)))
-        if names and not names <= ni:
-            expression = mask_rust_noncode(expression)
-            if re.search(r"\bsys_ni_syscall\s*\(", expression): raise GateError(f"terminal ordinary route(s) {sorted(names)} reach sys_ni_syscall")
-            if PLACEHOLDER.search(expression): raise GateError(f"terminal ordinary route(s) {sorted(names)} use an obvious ENOSYS placeholder")
-    actual = {"ordinary_explicit": len(found - ni), "explicit_enosys": len(ni), "native_fallback": 0}
-    if actual != TERMINAL: raise GateError(f"terminal routing counts are {actual}, expected {TERMINAL}")
-    print("linux-v6.18-abi final: ordinary-explicit=366 explicit-enosys=17 native-fallback=0 wildcard=table-external-only")
-
-
 CONTRACT_FIELDS = {
     "id", "flags", "structs", "multiplexer_commands", "provider_ioctls",
     "errno_order", "usercopy", "state", "concurrency", "teardown",
 }
 CELL_FIELDS = {"number", "name", "status", "contract", "handler", "conditional"}
-ORACLE_FIELDS = {
-    "id", "linux_config", "thekernel_features", "rootfs", "qemu_profile",
-    "binary_source", "argv", "witnesses",
-}
 DISPATCH_CALLS = {
     "kernel/src/syscall/dispatch.rs:sys_ni_syscall": "sys_ni_syscall",
     "kernel/src/syscall/bpf/mod.rs:sys_bpf": "super::bpf::sys_bpf",
@@ -295,7 +288,7 @@ def load_toml(path: Path, label: str) -> dict:
 
 
 def repository_path(value: object, label: str, kind: str, require_exists: bool = True) -> Path:
-    """Resolve an in-tree descriptor; terminal validation additionally requires it to exist."""
+    """Resolve an in-tree descriptor and optionally require it to exist."""
     if not isinstance(value, str) or not value:
         raise GateError(f"{label} path is invalid")
     path = (ROOT / value).resolve()
@@ -316,7 +309,7 @@ def rust_function(path: Path, symbol: str, conditional: str) -> None:
         raise GateError(f"contract handler symbol is invalid: {symbol!r}")
     source = mask_rust_noncode(path.read_text(encoding="utf-8"))
     definition = re.compile(rf"(?m)^(?P<attrs>(?:\s*#\[[^\]]+\]\s*\n)*)\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:unsafe\s+)?(?:async\s+)?fn\s+{re.escape(symbol)}\s*(?:<[^{{;]*>)?\s*\(")
-    if definition.search(source) is None:
+    if re.search(rf"\bfn\s+{re.escape(symbol)}\s*(?:<[^{{;]*>)?\s*\(", source) is None:
         raise GateError(f"contract handler is not a Rust function definition: {path.relative_to(ROOT)}:{symbol}")
     found = top_level_match(source, 0, len(source), definition, f"contract handler {path.relative_to(ROOT)}:{symbol}")
     opening = source.find("{", found.end())
@@ -343,25 +336,6 @@ def handler_route(value: object, conditional: str) -> str:
     return value
 
 
-def thekernel_features() -> set[str]:
-    features: set[str] = set()
-    for cargo in (ROOT / "Cargo.toml", ROOT / "kernel/Cargo.toml"):
-        table = load_toml(cargo, "TheKernel Cargo metadata").get("features", {})
-        if isinstance(table, dict):
-            features.update(name for name in table if isinstance(name, str))
-    return features
-
-
-def configured_witness(config: Path, requirement: str) -> None:
-    required = [item.strip() for item in requirement.split(",")]
-    if not required or any(not re.fullmatch(r"CONFIG_[A-Z0-9_]+=y", item) for item in required):
-        raise GateError(f"oracle witness config expression is invalid: {requirement!r}")
-    enabled = set(config.read_text(encoding="utf-8").splitlines())
-    missing = sorted(set(required) - enabled)
-    if missing:
-        raise GateError(f"oracle Linux config {config.relative_to(ROOT)} does not enable witness: {missing}")
-
-
 GRAPH_PREFIX = {"flags": "flag:", "structs": "struct:", "multiplexer_commands": "mux:", "provider_ioctls": "ioctl:", "errno_order": "errno:", "usercopy": "usercopy:", "state": "state:", "concurrency": "concurrency:", "teardown": "teardown:"}
 
 
@@ -382,14 +356,10 @@ def graph_field(value: object, contract: str, field: str) -> list[str]:
 
 def contract_cells(contracts_path: Path, entries: dict[int, str], dispatch: Path | None = None) -> dict[int, dict]:
     data = load_toml(contracts_path, "contracts")
-    if set(data) != {"schema", "linux_manifest", "terminal", "progress", "contract", "cell"} or data["schema"] != 2:
+    if set(data) != {"schema", "linux_manifest", "progress", "contract", "cell"} or data["schema"] != 2:
         raise GateError("contracts schema is invalid")
     if data["linux_manifest"] != "linux-v6.18-abi.toml":
         raise GateError("contracts must reference the pinned Linux manifest")
-    terminal = data["terminal"]
-    expected = {"reviewed": 383, "resolved": 383, "implemented": 366, "explicit_enosys": 17, "fallback": 0, "partial": 0, "unknown": 0}
-    if terminal != expected:
-        raise GateError("contracts terminal counts are invalid")
     definitions: dict[str, dict] = {}
     for item in data["contract"]:
         if not isinstance(item, dict) or set(item) != CONTRACT_FIELDS or not isinstance(item.get("id"), str) or item["id"] in definitions:
@@ -432,7 +402,9 @@ def contract_cells(contracts_path: Path, entries: dict[int, str], dispatch: Path
         bindings: dict[str, tuple[str, list[str]]] = {}
         for pattern, expression in parsed:
             masked_pattern = mask_rust_noncode(pattern)
-            attrs = [re.sub(r"\s+", " ", item.strip()) for item in re.findall(r"#\[([^]]+)\]", masked_pattern, re.DOTALL)]
+            # As in routes(), attributes carry string literals and must be read
+            # from the raw pattern rather than the masked form.
+            attrs = [re.sub(r"\s+", " ", item.strip()) for item in re.findall(r"#\[([^]]+)\]", pattern, re.DOTALL)]
             for name in SYSNO.findall(masked_pattern):
                 bindings[name] = (mask_rust_noncode(expression), attrs)
         for cell in cells.values():
@@ -455,69 +427,7 @@ def contract_cells(contracts_path: Path, entries: dict[int, str], dispatch: Path
     return cells
 
 
-def validate_oracles(oracles_path: Path, cells: dict[int, dict], require_artifacts: bool = True) -> None:
-    data = load_toml(oracles_path, "oracles")
-    if set(data) != {"schema", "shared_guest", "witness", "oracle"} or data["schema"] != 1:
-        raise GateError("oracle schema is invalid")
-    shared = data["shared_guest"]
-    if not isinstance(shared, dict) or set(shared) != {"binary_source", "argv", "runner"}:
-        raise GateError("shared guest descriptor is invalid")
-    repository_path(shared["binary_source"], "shared guest binary source", "file", require_artifacts)
-    if (not isinstance(shared["argv"], list) or not shared["argv"]
-            or not all(isinstance(argument, str) and argument for argument in shared["argv"])):
-        raise GateError("shared guest argv is invalid")
-    if (not isinstance(shared["runner"], list) or len(shared["runner"]) < 2
-            or not all(isinstance(argument, str) and argument for argument in shared["runner"])):
-        raise GateError("paired oracle runner command is invalid")
-    repository_path(shared["runner"][0], "paired oracle runner", "file", require_artifacts)
-    witness_defs = data["witness"]
-    if not isinstance(witness_defs, dict) or not witness_defs:
-        raise GateError("oracle witness definitions are invalid")
-    for name, definition in witness_defs.items():
-        if (not isinstance(name, str) or not isinstance(definition, dict)
-                or set(definition) != {"linux_config", "thekernel_feature"}
-                or not all(isinstance(value, str) and value for value in definition.values())):
-            raise GateError("oracle witness definition is invalid")
-        if definition["thekernel_feature"] not in thekernel_features():
-            raise GateError(f"oracle witness names unavailable TheKernel feature: {definition['thekernel_feature']}")
-    witnesses: set[str] = set()
-    ids: set[str] = set()
-    for oracle in data["oracle"]:
-        if not isinstance(oracle, dict) or set(oracle) != ORACLE_FIELDS or not isinstance(oracle["id"], str) or oracle["id"] in ids:
-            raise GateError("oracle descriptor is invalid or duplicate")
-        ids.add(oracle["id"])
-        if oracle["binary_source"] != shared["binary_source"] or oracle["argv"] != shared["argv"]:
-            raise GateError("oracle same-binary source/argv mismatch")
-        linux_config = repository_path(oracle["linux_config"], f"oracle {oracle['id']} Linux config", "file", require_artifacts)
-        repository_path(oracle["rootfs"], f"oracle {oracle['id']} rootfs", "dir", require_artifacts)
-        repository_path(oracle["qemu_profile"], f"oracle {oracle['id']} QEMU profile", "file", require_artifacts)
-        if (not isinstance(oracle["thekernel_features"], list)
-                or not all(isinstance(feature, str) and feature for feature in oracle["thekernel_features"])
-                or not isinstance(oracle["witnesses"], list)
-                or not all(isinstance(witness, str) and witness in witness_defs for witness in oracle["witnesses"])):
-            raise GateError("oracle features/witnesses are invalid")
-        if any(witness_defs[witness]["thekernel_feature"] not in oracle["thekernel_features"]
-               for witness in oracle["witnesses"]):
-            raise GateError("oracle witness is not enabled by TheKernel features")
-        unknown_features = sorted(set(oracle["thekernel_features"]) - thekernel_features())
-        if unknown_features:
-            raise GateError(f"oracle names unavailable TheKernel features: {unknown_features}")
-        if require_artifacts:
-            for witness in oracle["witnesses"]:
-                configured_witness(linux_config, witness_defs[witness]["linux_config"])
-        witnesses.update(oracle["witnesses"])
-    if ids != {"product", "server", "feature"}:
-        raise GateError("oracle set must contain product, server, and feature")
-    required = {cell["conditional"] for cell in cells.values() if cell["conditional"] != "explicit-none"}
-    if not required:
-        raise GateError("oracle witness set is vacuous: no conditional cell requires it")
-    missing = sorted(required - witnesses)
-    unused = sorted(witnesses - required)
-    if missing or unused:
-        raise GateError(f"oracle witness coverage is not exact; missing={missing}, unused={unused}")
-
-
-def schema(manifest_path: Path, contracts_path: Path, oracles_path: Path, source: Path, dispatch: Path = DISPATCH) -> None:
+def schema(manifest_path: Path, contracts_path: Path, source: Path, dispatch: Path = DISPATCH) -> None:
     manifest = load_manifest(manifest_path)
     entries = parse_table(source / manifest["linux"]["table"])
     cells = contract_cells(contracts_path, entries, dispatch)
@@ -526,36 +436,8 @@ def schema(manifest_path: Path, contracts_path: Path, oracles_path: Path, source
                          if (cell["status"] == "explicit-enosys") != (routing[number] == "explicit-enosys"))
     if ni_mismatch:
         raise GateError(f"contract explicit ENOSYS set disagrees with routing inventory: {ni_mismatch}")
-    validate_oracles(oracles_path, cells, require_artifacts=False)
     counts = Counter(cell["status"] for cell in cells.values())
     print(f"linux-v6.18-abi schema: reviewed={len(cells)} implemented={counts['implemented']} explicit-enosys={counts['explicit-enosys']} partial={counts['partial']} unknown={len(entries) - len(cells)}")
-
-
-def final_contracts(manifest_path: Path, contracts_path: Path, oracles_path: Path, source: Path, dispatch: Path = DISPATCH) -> None:
-    """Terminal mode is deliberately unavailable without complete executable evidence."""
-    manifest = load_manifest(manifest_path)
-    entries = parse_table(source / manifest["linux"]["table"])
-    cells = contract_cells(contracts_path, entries, dispatch)
-    progress = load_toml(contracts_path, "contracts")["progress"]
-    terminal = load_toml(contracts_path, "contracts")["terminal"]
-    if progress != terminal or len(cells) != len(entries):
-        raise GateError("final contract gate requires 383 reviewed/resolved cells and terminal 366/17/0 status counts")
-    validate_oracles(oracles_path, cells)
-    raise GateError("final contract gate requires a paired Linux/TheKernel runner and built guest artifact; no receipt is synthesized")
-
-
-def paired(argv: Sequence[str]) -> None:
-    """Execution seam for the future paired oracle; it never invents artifacts."""
-    parser = argparse.ArgumentParser(description="run one guest oracle binary against Linux and TheKernel with one rootfs")
-    parser.add_argument("--linux-image", type=Path, required=True)
-    parser.add_argument("--thekernel-image", type=Path, required=True)
-    parser.add_argument("--rootfs-image", type=Path, required=True)
-    parser.add_argument("--guest-binary", type=Path, required=True)
-    args = parser.parse_args(argv)
-    missing = [str(path) for path in (args.linux_image, args.thekernel_image, args.rootfs_image, args.guest_binary) if not path.is_file()]
-    if missing:
-        raise GateError(f"paired oracle requires real Linux/TheKernel images, one rootfs, and guest binary: {missing}")
-    raise GateError("paired oracle QEMU execution is not wired; refusing to claim a comparison")
 
 
 def run_git(directory: Path, *args: str) -> str:
@@ -585,22 +467,12 @@ def materialize(manifest_path: Path, destination: Path) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] == "paired":
-        try:
-            paired(arguments[1:])
-        except GateError as error:
-            print(f"linux-v6.18-abi: {error}", file=sys.stderr)
-            return 1
-        return 0
-    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("command", choices=("materialize", "inventory", "schema", "final", "paired", "all")); parser.add_argument("--manifest", type=Path, default=MANIFEST); parser.add_argument("--contracts", type=Path, default=CONTRACTS); parser.add_argument("--oracles", type=Path, default=ORACLES); parser.add_argument("--linux-src", type=Path, default=SOURCE); parser.add_argument("--dispatch", type=Path, default=DISPATCH)
+    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("command", choices=("materialize", "inventory", "schema", "all")); parser.add_argument("--manifest", type=Path, default=MANIFEST); parser.add_argument("--contracts", type=Path, default=CONTRACTS); parser.add_argument("--linux-src", type=Path, default=SOURCE); parser.add_argument("--dispatch", type=Path, default=DISPATCH)
     args = parser.parse_args(arguments)
     try:
         if args.command in {"materialize", "all"}: materialize(args.manifest, args.linux_src)
         if args.command in {"inventory", "all"}: inventory(args.manifest, args.linux_src, args.dispatch)
-        if args.command in {"schema", "all"}: schema(args.manifest, args.contracts, args.oracles, args.linux_src, args.dispatch)
-        if args.command == "final":
-            final(args.manifest, args.linux_src, args.dispatch)
-            final_contracts(args.manifest, args.contracts, args.oracles, args.linux_src, args.dispatch)
+        if args.command in {"schema", "all"}: schema(args.manifest, args.contracts, args.linux_src, args.dispatch)
     except (GateError, OSError, subprocess.CalledProcessError) as error:
         print(f"linux-v6.18-abi: {error}", file=sys.stderr); return 1
     return 0

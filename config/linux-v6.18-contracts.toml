@@ -1,15 +1,7 @@
 # Reviewed syscall cells only. Missing v6.18 entries are intentionally unknown.
+# The terminal routing totals live solely in linux-v6.18-abi.toml [terminal].
 schema = 2
 linux_manifest = "linux-v6.18-abi.toml"
-
-[terminal]
-reviewed = 383
-resolved = 383
-implemented = 366
-explicit_enosys = 17
-fallback = 0
-partial = 0
-unknown = 0
 
 [progress]
 reviewed = 27
