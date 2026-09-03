@@ -2,27 +2,20 @@
 
 from __future__ import annotations
 
-import importlib.util
 import os
-import sys
 import tempfile
 import tomllib
 import unittest
 from pathlib import Path
 
+from tests.support import load_script_module, repo_root
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+
+REPO_ROOT = repo_root()
 
 
 def load_product():
-    spec = importlib.util.spec_from_file_location(
-        "thekernel_product_system_test", REPO_ROOT / "tools" / "thekernel.py"
-    )
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    return load_script_module("thekernel_product", "tools/thekernel.py")
 
 
 class SystemTestGateTests(unittest.TestCase):

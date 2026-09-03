@@ -3,20 +3,17 @@
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SCRIPT_PATH = REPO_ROOT / "scripts/ci/check_cargo_dependency_layers.py"
-SPEC = importlib.util.spec_from_file_location("cargo_dependency_layers", SCRIPT_PATH)
-assert SPEC is not None and SPEC.loader is not None
-cargo_dependency_layers = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = cargo_dependency_layers
-SPEC.loader.exec_module(cargo_dependency_layers)
+from tests.support import load_script_module, repo_root
+
+REPO_ROOT = repo_root()
+cargo_dependency_layers = load_script_module(
+    "cargo_dependency_layers", "scripts/ci/check_cargo_dependency_layers.py"
+)
 
 
 class CargoDependencyLayersTests(unittest.TestCase):

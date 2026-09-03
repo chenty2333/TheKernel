@@ -3,19 +3,14 @@
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = ROOT / "scripts/ci/linux_v618_abi_gate.py"
-SPEC = importlib.util.spec_from_file_location("linux_v618_abi_gate", SCRIPT)
-assert SPEC and SPEC.loader
-gate = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = gate
-SPEC.loader.exec_module(gate)
+from tests.support import load_script_module, repo_root
+
+ROOT = repo_root()
+gate = load_script_module("linux_v618_abi_gate", "scripts/ci/linux_v618_abi_gate.py")
 
 
 class GateTests(unittest.TestCase):

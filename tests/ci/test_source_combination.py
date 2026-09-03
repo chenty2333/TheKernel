@@ -3,28 +3,13 @@
 
 from __future__ import annotations
 
-import importlib.util
-import os
-import sys
-import tempfile
 import unittest
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-SCRIPT_PATH = REPO_ROOT / "scripts/ci/source_combination.py"
-SPEC = importlib.util.spec_from_file_location("source_combination", SCRIPT_PATH)
-assert SPEC is not None and SPEC.loader is not None
-source_combination = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = source_combination
-SPEC.loader.exec_module(source_combination)
-TEST_TMP_ROOT = Path(
-    os.environ.get("THEKERNEL_TEST_TMPDIR", Path.home() / ".cache" / "thekernel-test-tmp")
-)
+from tests.support import load_script_module, repo_root, test_tmpdir
 
-
-def temporary_directory() -> tempfile.TemporaryDirectory[str]:
-    TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-    return tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT)
+REPO_ROOT = repo_root()
+source_combination = load_script_module("source_combination", "scripts/ci/source_combination.py")
 
 
 class SourceCombinationTests(unittest.TestCase):
@@ -58,7 +43,7 @@ class SourceCombinationTests(unittest.TestCase):
             "962DEFE2790C8CEE6E699E66B1B4B7F8BA97E450",
             "962defe2790c8cee6e699e66b1b4b7f8ba97e45",
         ):
-            with self.subTest(ref=ref), temporary_directory() as directory:
+            with self.subTest(ref=ref), test_tmpdir() as directory:
                 config = Path(directory) / "source-combination.toml"
                 config.write_text(
                     f'''schema = 1
@@ -83,7 +68,7 @@ path = "thekernel-linux-abi"
                     source_combination.load(config)
 
     def test_rejects_invalid_repository(self) -> None:
-        with temporary_directory() as directory:
+        with test_tmpdir() as directory:
             config = Path(directory) / "source-combination.toml"
             config.write_text(
                 """schema = 1
@@ -107,7 +92,7 @@ path = "thekernel-linux-abi"
                 source_combination.load(config)
 
     def test_rejects_non_product_source(self) -> None:
-        with temporary_directory() as directory:
+        with test_tmpdir() as directory:
             config = Path(directory) / "source-combination.toml"
             config.write_text(
                 """schema = 1

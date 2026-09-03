@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import pathlib
-import importlib.util
 import subprocess
-import sys
 import tempfile
 import unittest
+from unittest import mock
+
+from tests.support import load_script_module, repo_root
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[3]
+ROOT = repo_root()
 GRAPHICS = ROOT / "config" / "graphics"
 
 
@@ -86,12 +87,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         self.assertIn("return failures == 0 ? 0 : 1", evdev_oracle)
 
     def test_graphics_smoke_hands_an_existing_rootfs_to_the_drive_transport_without_building(self) -> None:
-        spec = importlib.util.spec_from_file_location("thekernel_graphics_no_stale_rootfs", ROOT / "tools/thekernel.py")
-        self.assertIsNotNone(spec)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        module = load_script_module("thekernel_product", "tools/thekernel.py")
         with tempfile.TemporaryDirectory() as directory:
             rootfs = pathlib.Path(directory) / "graphics-rootfs.ext2"
             rootfs.write_bytes(b"rootfs")
@@ -152,36 +148,22 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         )
 
     def test_product_cli_accepts_an_existing_graphics_rootfs(self) -> None:
-        spec = importlib.util.spec_from_file_location("thekernel_graphics_cli", ROOT / "tools/thekernel.py")
-        self.assertIsNotNone(spec)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        module = load_script_module("thekernel_product", "tools/thekernel.py")
         args = module.build_parser().parse_args([
             "run", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
         ])
         self.assertEqual(args.rootfs, "/tmp/graphics-rootfs.ext2")
 
     def test_graphics_smoke_configures_one_marker_for_qmp_and_stop(self) -> None:
-        spec = importlib.util.spec_from_file_location("thekernel_graphics_smoke", ROOT / "tools/thekernel.py")
-        self.assertIsNotNone(spec)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        module = load_script_module("thekernel_product", "tools/thekernel.py")
         args = module.build_parser().parse_args([
             "graphics-smoke", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
             "--screenshot", "/tmp/graphics.ppm",
         ])
         calls: dict[str, object] = {}
         module.run_product = lambda _artifacts, spec: calls.update(spec=spec) or 0
-        original_is_file = pathlib.Path.is_file
-        try:
-            pathlib.Path.is_file = lambda _self: True
+        with mock.patch.object(pathlib.Path, "is_file", lambda _self: True):
             self.assertEqual(module.graphics_smoke_cmd(args), 0)
-        finally:
-            pathlib.Path.is_file = original_is_file
         spec = calls["spec"]
         self.assertEqual(spec.stop_after_marker, "THEKERNEL_GRAPHICS_ABI_SMOKE_READY")
         self.assertEqual(spec.qmp_screenshot_after_marker, "THEKERNEL_GRAPHICS_ABI_SMOKE_READY")
@@ -189,12 +171,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         self.assertEqual(spec.rootfs_transport, "drive")
 
     def test_q35_headless_graphics_smoke_keeps_the_software_marker_and_pixel_oracle(self) -> None:
-        spec = importlib.util.spec_from_file_location("thekernel_q35_headless_smoke", ROOT / "tools/thekernel.py")
-        self.assertIsNotNone(spec)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        module = load_script_module("thekernel_product", "tools/thekernel.py")
         args = module.build_parser().parse_args([
             "graphics-smoke", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
             "--screenshot", "/tmp/graphics.ppm", "--flavor", "q35-graphics-seatd",
@@ -202,12 +179,8 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         ])
         calls: dict[str, object] = {}
         module.run_product = lambda _artifacts, spec: calls.update(spec=spec) or 0
-        original_is_file = pathlib.Path.is_file
-        try:
-            pathlib.Path.is_file = lambda _self: True
+        with mock.patch.object(pathlib.Path, "is_file", lambda _self: True):
             self.assertEqual(module.graphics_smoke_cmd(args), 0)
-        finally:
-            pathlib.Path.is_file = original_is_file
         spec = calls["spec"]
         self.assertEqual(spec.stop_after_marker, "THEKERNEL_Q35_WESTON_READY")
         self.assertEqual(spec.qmp_screenshot_after_marker, "THEKERNEL_Q35_WESTON_READY")
@@ -215,32 +188,18 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         self.assertEqual(spec.qmp_screenshot_color_blocks[0].rgb, (255, 0, 0))
 
     def test_virgl_headless_graphics_smoke_is_rejected_without_a_qmp_pixel_oracle(self) -> None:
-        spec = importlib.util.spec_from_file_location("thekernel_virgl_headless_smoke", ROOT / "tools/thekernel.py")
-        self.assertIsNotNone(spec)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        module = load_script_module("thekernel_product", "tools/thekernel.py")
         args = module.build_parser().parse_args([
             "graphics-smoke", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
             "--screenshot", "/tmp/graphics.ppm", "--flavor", "q35-graphics-seatd",
         ])
         args.graphics_profile = "virgl-headless"
-        original_is_file = pathlib.Path.is_file
-        try:
-            pathlib.Path.is_file = lambda _self: True
+        with mock.patch.object(pathlib.Path, "is_file", lambda _self: True):
             with self.assertRaisesRegex(module.ProductError, "no QMP pixel-oracle surface"):
                 module.graphics_smoke_cmd(args)
-        finally:
-            pathlib.Path.is_file = original_is_file
 
     def test_virgl_graphics_smoke_uses_the_virgl_marker_and_pixel_oracle(self) -> None:
-        spec = importlib.util.spec_from_file_location("thekernel_virgl_smoke", ROOT / "tools/thekernel.py")
-        self.assertIsNotNone(spec)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        module = load_script_module("thekernel_product", "tools/thekernel.py")
         args = module.build_parser().parse_args([
             "graphics-smoke", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
             "--screenshot", "/tmp/graphics.ppm", "--flavor", "q35-graphics-seatd",
@@ -248,12 +207,8 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         ])
         calls: dict[str, object] = {}
         module.run_product = lambda _artifacts, spec: calls.update(spec=spec) or 0
-        original_is_file = pathlib.Path.is_file
-        try:
-            pathlib.Path.is_file = lambda _self: True
+        with mock.patch.object(pathlib.Path, "is_file", lambda _self: True):
             self.assertEqual(module.graphics_smoke_cmd(args), 0)
-        finally:
-            pathlib.Path.is_file = original_is_file
         spec = calls["spec"]
         self.assertEqual(spec.stop_after_marker, "THEKERNEL_Q35_VIRGL_READY")
         self.assertEqual(spec.qmp_screenshot_after_marker, "THEKERNEL_Q35_VIRGL_READY")
@@ -261,12 +216,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         self.assertEqual(spec.qmp_screenshot_color_blocks[0].rgb, (255, 0, 0))
 
     def test_marker_gated_screenshot_is_forwarded_to_qemu_runner(self) -> None:
-        spec = importlib.util.spec_from_file_location("thekernel_graphics_qmp", ROOT / "tools/thekernel.py")
-        self.assertIsNotNone(spec)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        module = load_script_module("thekernel_product", "tools/thekernel.py")
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             artifacts = module.Artifacts(root / "state", module.Variant(memory="128M"))

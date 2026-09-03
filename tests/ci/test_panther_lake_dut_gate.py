@@ -2,35 +2,26 @@
 
 from __future__ import annotations
 
-import importlib.util
 import os
-import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests.support import load_script_module, repo_root, test_tmpdir
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+
+REPO_ROOT = repo_root()
 
 
 def load_gate():
-    spec = importlib.util.spec_from_file_location(
-        "thekernel_panther_lake_dut_gate",
-        REPO_ROOT / "scripts" / "ci" / "panther_lake_dut_gate.py",
+    return load_script_module(
+        "thekernel_panther_lake_dut_gate", "scripts/ci/panther_lake_dut_gate.py"
     )
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 class PantherLakeDutGateTests(unittest.TestCase):
     def temporary_directory(self):
-        cache = Path.home() / ".cache" / "thekernel-targets" / "test-tmp"
-        cache.mkdir(parents=True, exist_ok=True)
-        return tempfile.TemporaryDirectory(dir=cache)
+        return test_tmpdir()
 
     def test_valid_ktap_requires_complete_plan_and_completion_marker(self) -> None:
         gate = load_gate()

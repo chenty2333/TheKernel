@@ -44,10 +44,7 @@ lint:
 	./tools/thekernel.py lint --smp $(SMP) --memory $(MEMORY)
 
 test:
-	python3 -m unittest discover -s tests/ci
-	python3 -m unittest discover -s tests/qemu_runner
-	python3 -m unittest discover -s tests/host/graphics
-	python3 -m unittest tests.test_thekernel_system_test tests.test_x86_uefi_esp
+	python3 -m unittest discover -s tests -t .
 	cargo test --locked -p thekernel-readiness-adapter
 	cargo test --locked -p thekernel-linux-process-adapter
 

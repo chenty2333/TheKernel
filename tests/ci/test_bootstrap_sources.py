@@ -3,24 +3,19 @@
 
 from __future__ import annotations
 
-import importlib.util
-import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from typing import Dict
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests.support import load_script_module, repo_root, test_tmpdir
+
+REPO_ROOT = repo_root()
 CI_DIR = REPO_ROOT / "scripts/ci"
+# bootstrap_sources.py imports its source_combination sibling by name.
 sys.path.insert(0, str(CI_DIR))
-SCRIPT_PATH = CI_DIR / "bootstrap_sources.py"
-SPEC = importlib.util.spec_from_file_location("bootstrap_sources", SCRIPT_PATH)
-assert SPEC is not None and SPEC.loader is not None
-bootstrap_sources = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = bootstrap_sources
-SPEC.loader.exec_module(bootstrap_sources)
+bootstrap_sources = load_script_module("bootstrap_sources", "scripts/ci/bootstrap_sources.py")
 
 
 def run_git(directory: Path, *arguments: str) -> str:
@@ -29,14 +24,7 @@ def run_git(directory: Path, *arguments: str) -> str:
 
 class BootstrapSourcesTests(unittest.TestCase):
     def setUp(self) -> None:
-        temporary_root = Path(
-            os.environ.get(
-                "THEKERNEL_TEST_TMPDIR",
-                Path.home() / ".cache" / "thekernel-test-tmp",
-            )
-        )
-        temporary_root.mkdir(parents=True, exist_ok=True)
-        self.temporary = tempfile.TemporaryDirectory(dir=temporary_root)
+        self.temporary = test_tmpdir()
         self.root = Path(self.temporary.name)
         self.parent = self.root / "parent"
         self.parent.mkdir()

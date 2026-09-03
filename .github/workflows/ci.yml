@@ -140,15 +140,10 @@ jobs:
             -- --check
 
       - name: Test product tools
-        run: |
-          python3 -m unittest discover -s tests/ci -p 'test_*.py' -v
-          python3 -m unittest discover -s tests/qemu_runner -v
-          python3 -m unittest discover -s tests/host/graphics -p 'test_*.py' -v
-          scripts/build-graphics-rootfs.sh --check
-          python3 -m unittest \
-            tests.test_thekernel_system_test \
-            tests.test_x86_uefi_esp \
-            -v
+        run: python3 -m unittest discover -s tests -t . -v
+
+      - name: Validate checked-in graphics rootfs configuration
+        run: scripts/build-graphics-rootfs.sh --check
 
       - name: Test local adapters
         run: |

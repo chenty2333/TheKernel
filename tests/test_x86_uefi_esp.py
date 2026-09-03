@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-import tempfile
 import unittest
 from pathlib import Path
+
+from tests.support import test_tmpdir
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,7 +14,6 @@ GRUB_MKSTANDALONE = shutil.which("grub2-mkstandalone") or shutil.which(
     "grub-mkstandalone"
 )
 REQUIRED_TOOLS = ("parted", "mkfs.fat", "mcopy", "mmd", "mdir")
-TEST_TMP_ROOT = Path.home() / ".cache" / "thekernel-test-tmp"
 
 
 def _missing_tools() -> list[str]:
@@ -29,8 +29,7 @@ def _missing_tools() -> list[str]:
 )
 class X86UefiEspTests(unittest.TestCase):
     def test_builder_creates_gpt_fat32_esp_with_fallback_loader_and_kernel(self) -> None:
-        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel.elf"
             rootfs = root / "rootfs.img"
@@ -83,8 +82,7 @@ class X86UefiEspTests(unittest.TestCase):
             self.assertIn("BOOTX64", grub_listing)
 
     def test_builder_rejects_an_explicit_esp_too_small_for_the_rootfs(self) -> None:
-        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel.elf"
             rootfs = root / "rootfs.img"
@@ -110,8 +108,7 @@ class X86UefiEspTests(unittest.TestCase):
     def test_linux_mode_stages_only_vmlinuz_and_uses_a_drive_backed_root(self) -> None:
         source = ESP_BUILDER.read_text(encoding="utf-8")
         linux_config = (ROOT / "config/x86_64/grub-linux.cfg").read_text(encoding="utf-8")
-        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "vmlinuz"
             image = root / "linux.esp"
@@ -145,8 +142,7 @@ class X86UefiEspTests(unittest.TestCase):
 
     def test_multiboot_drive_mode_stages_no_rootfs_module(self) -> None:
         drive_config = (ROOT / "config/x86_64/grub-drive.cfg").read_text(encoding="utf-8")
-        TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT) as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel.elf"
             image = root / "drive.esp"
