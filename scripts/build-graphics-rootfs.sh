@@ -90,6 +90,18 @@ flavor_session=$(flavor_field SESSION)
 flavor_backend=$(flavor_field BACKEND)
 fragment=$REPO_ROOT/config/graphics/$flavor.fragment
 
+# build-guest-tools.sh glob-discovers its probe sources; the wrapper derives
+# the installed guest names with the same device-lease-probe rename rule.
+graphics_probe_names() {
+    local probe_source probe_name
+    for probe_source in "$REPO_ROOT"/tests/guest/graphics/*.c; do
+        probe_name=${probe_source##*/}
+        probe_name=${probe_name%.c}
+        [ "$probe_name" = device-lease-probe ] && probe_name=thekernel-device-lease-probe
+        printf '%s\n' "$probe_name"
+    done
+}
+
 if [ -n "$fault" ]; then
     # The benchmark fault matrix is single-sourced in tools/qemu_runner/profiles.py.
     command -v python3 >/dev/null || { printf '%s\n' 'python3 is required to validate --fault' >&2; exit 1; }
@@ -121,9 +133,6 @@ validate_checked_in() {
         "$REPO_ROOT/config/graphics/overlay/common/etc/weston/weston-headless.ini" \
         "$REPO_ROOT/config/graphics/overlay/common/etc/weston/weston-drm.ini" \
         "$REPO_ROOT/config/graphics/build-guest-tools.sh" \
-        "$REPO_ROOT/tests/guest/graphics/drm-uapi-oracle.c" \
-        "$REPO_ROOT/tests/guest/graphics/evdev-uapi-oracle.c" \
-        "$REPO_ROOT/tests/guest/graphics/device-lease-probe.c" \
         "$REPO_ROOT/config/graphics/q35-wayland-color-client.c" \
         "$REPO_ROOT/config/graphics/q35-virgl-render-oracle.c" \
         "$REPO_ROOT/config/graphics/build-q35-wayland-client.sh" \
@@ -140,6 +149,9 @@ validate_checked_in() {
         "$REPO_ROOT/config/graphics/overlay/common/etc/init.d/S80weston" \
         "$REPO_ROOT/config/graphics/build-guest-tools.sh"; do
         [ -x "$path" ] || { printf 'graphics executable is not executable: %s\n' "$path" >&2; return 1; }
+    done
+    for probe_source in "$REPO_ROOT"/tests/guest/graphics/*.c; do
+        [ -r "$probe_source" ] || { printf 'missing graphics probe source: %s\n' "$probe_source" >&2; return 1; }
     done
     grep -qx 'BR2_INIT_BUSYBOX=y' "$COMMON"
     ! grep -qx 'BR2_INIT_NONE=y' "$COMMON"
@@ -263,8 +275,6 @@ validate_logind_checked_in() {
         "$fragment" \
         "$REPO_ROOT/config/graphics/logind-users.table" \
         "$REPO_ROOT/config/graphics/build-guest-tools.sh" \
-        "$REPO_ROOT/tests/guest/graphics/drm-uapi-oracle.c" \
-        "$REPO_ROOT/tests/guest/graphics/evdev-uapi-oracle.c" \
         "$REPO_ROOT/config/graphics/overlay/q35-graphics-logind/etc/thekernel-graphics-flavor" \
         "$REPO_ROOT/config/graphics/overlay/q35-graphics-logind/etc/environment" \
         "$REPO_ROOT/config/graphics/overlay/q35-graphics-logind/etc/pam.d/login" \
@@ -280,6 +290,9 @@ validate_logind_checked_in() {
         [ -x "$REPO_ROOT/config/graphics/overlay/q35-graphics-logind/usr/local/bin/$program" ] || {
             printf 'logind program is not executable: %s\n' "$program" >&2; return 1;
         }
+    done
+    for probe_source in "$REPO_ROOT"/tests/guest/graphics/*.c; do
+        [ -r "$probe_source" ] || { printf 'missing graphics probe source: %s\n' "$probe_source" >&2; return 1; }
     done
     grep -qx 'BR2_INIT_SYSTEMD=y' "$fragment"
     grep -qx 'BR2_PACKAGE_SYSTEMD_LOGIND=y' "$fragment"
@@ -338,8 +351,12 @@ validate_build_output() {
     [ -x "$target/etc/init.d/S80weston" ]
     [ -e "$target/etc/weston/weston.ini" ]
     validate_busybox_stat_output "$target"
-    [ -x "$target/usr/local/bin/drm-uapi-oracle" ]
-    [ -x "$target/usr/local/bin/evdev-uapi-oracle" ]
+    local probe_name
+    for probe_name in $(graphics_probe_names); do
+        [ -x "$target/usr/local/bin/$probe_name" ] || {
+            printf 'graphics probe missing from target: %s\n' "$probe_name" >&2; return 1;
+        }
+    done
     [ -f "$target/etc/udev/rules.d/71-thekernel-graphics.rules" ]
     # Buildroot applies BR2_ROOTFS_USERS_TABLES in its fakeroot filesystem-image
     # staging area, not in O/target.  Validate the produced image, where these

@@ -202,22 +202,10 @@ static int run_guest_program(const char *path, const char *argument,
 }
 
 static int test_memory_pressure_reclaim(void) {
-    pid_t child = fork();
-    if (child < 0) {
-        return fail("memory-pressure-fork");
-    }
-    if (child == 0) {
-        execl("/opt/thekernel-tests/bin/thekernel-memory-pressure-smoke",
-              "thekernel-memory-pressure-smoke", (char *)NULL);
-        fprintf(stderr,
-                "THEKERNEL_SYSTEM_TEST_FAIL memory-pressure-exec errno=%d (%s)\n",
-                errno, strerror(errno));
-        _exit(127);
-    }
-    if (wait_for_success(child, "memory-pressure-child") != 0) {
-        return 1;
-    }
-    return 0;
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-memory-pressure-smoke",
+        NULL,
+        "memory-pressure-child");
 }
 
 static int test_process_pipe_and_exec(void) {
@@ -279,40 +267,17 @@ static int test_signal_mask_alias(void) {
 }
 
 static int test_io_uring(void) {
-    pid_t child = fork();
-    if (child < 0) {
-        return fail("io-uring-fork");
-    }
-    if (child == 0) {
-        execl("/opt/thekernel-tests/bin/thekernel-io-uring-smoke",
-              "thekernel-io-uring-smoke", (char *)NULL);
-        fprintf(stderr, "THEKERNEL_SYSTEM_TEST_FAIL io-uring-exec errno=%d (%s)\n",
-                errno, strerror(errno));
-        _exit(127);
-    }
-    if (wait_for_success(child, "io-uring-child") != 0) {
-        return 1;
-    }
-    return 0;
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-io-uring-smoke",
+        NULL,
+        "io-uring-child");
 }
 
 static int test_io_uring_buffers(void) {
-    pid_t child = fork();
-    if (child < 0) {
-        return fail("io-uring-buffers-fork");
-    }
-    if (child == 0) {
-        execl("/opt/thekernel-tests/bin/thekernel-io-uring-buffers-smoke",
-              "thekernel-io-uring-buffers-smoke", (char *)NULL);
-        fprintf(stderr,
-                "THEKERNEL_SYSTEM_TEST_FAIL io-uring-buffers-exec errno=%d (%s)\n",
-                errno, strerror(errno));
-        _exit(127);
-    }
-    if (wait_for_success(child, "io-uring-buffers-child") != 0) {
-        return 1;
-    }
-    return 0;
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-io-uring-buffers-smoke",
+        NULL,
+        "io-uring-buffers-child");
 }
 
 static int test_signal_fp(void) {
@@ -323,60 +288,24 @@ static int test_signal_fp(void) {
 }
 
 static int test_ioprio(void) {
-    pid_t child = fork();
-    if (child < 0) {
-        return fail("ioprio-fork");
-    }
-    if (child == 0) {
-        execl("/opt/thekernel-tests/bin/thekernel-ioprio-smoke",
-              "/opt/thekernel-tests/bin/thekernel-ioprio-smoke",
-              "--linux-host", (char *)NULL);
-        fprintf(stderr, "THEKERNEL_SYSTEM_TEST_FAIL ioprio-exec errno=%d (%s)\n",
-                errno, strerror(errno));
-        _exit(127);
-    }
-    if (wait_for_success(child, "ioprio-child") != 0) {
-        return 1;
-    }
-    return 0;
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-ioprio-smoke",
+        "--linux-host",
+        "ioprio-child");
 }
 
 static int test_membarrier(void) {
-    pid_t child = fork();
-    if (child < 0) {
-        return fail("membarrier-fork");
-    }
-    if (child == 0) {
-        execl("/opt/thekernel-tests/bin/thekernel-membarrier-smoke",
-              "/opt/thekernel-tests/bin/thekernel-membarrier-smoke",
-              "--thekernel", (char *)NULL);
-        fprintf(stderr, "THEKERNEL_SYSTEM_TEST_FAIL membarrier-exec errno=%d (%s)\n",
-                errno, strerror(errno));
-        _exit(127);
-    }
-    if (wait_for_success(child, "membarrier-child") != 0) {
-        return 1;
-    }
-    return 0;
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-membarrier-smoke",
+        "--thekernel",
+        "membarrier-child");
 }
 
 static int test_userfaultfd(void) {
-    pid_t child = fork();
-    if (child < 0) {
-        return fail("userfaultfd-fork");
-    }
-    if (child == 0) {
-        execl("/opt/thekernel-tests/bin/thekernel-userfaultfd-smoke",
-              "thekernel-userfaultfd-smoke", (char *)NULL);
-        fprintf(stderr,
-                "THEKERNEL_SYSTEM_TEST_FAIL userfaultfd-exec errno=%d (%s)\n",
-                errno, strerror(errno));
-        _exit(127);
-    }
-    if (wait_for_success(child, "userfaultfd-child") != 0) {
-        return 1;
-    }
-    return 0;
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-userfaultfd-smoke",
+        NULL,
+        "userfaultfd-child");
 }
 
 static int test_packet_socket(void) {
@@ -402,42 +331,17 @@ static int test_packet_socket(void) {
 }
 
 static int test_seccomp(void) {
-    static const char path[] =
-        "/opt/thekernel-tests/portable/seccomp-smoke";
-    pid_t child = fork();
-    if (child < 0) {
-        return fail("seccomp-fork");
-    }
-    if (child == 0) {
-        execl(path, path, "--thekernel", (char *)NULL);
-        fprintf(stderr,
-                "THEKERNEL_SYSTEM_TEST_FAIL seccomp-exec errno=%d (%s)\n",
-                errno, strerror(errno));
-        _exit(127);
-    }
-    if (wait_for_success(child, "seccomp-child") != 0) {
-        return 1;
-    }
-    return 0;
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/seccomp-smoke",
+        "--thekernel",
+        "seccomp-child");
 }
 
 static int test_signal_wait_boundary(void) {
-    pid_t child = fork();
-    if (child < 0) {
-        return fail("signal-wait-fork");
-    }
-    if (child == 0) {
-        execl("/opt/thekernel-tests/bin/thekernel-signal-wait-boundary",
-              "thekernel-signal-wait-boundary", (char *)NULL);
-        fprintf(stderr,
-                "THEKERNEL_SYSTEM_TEST_FAIL signal-wait-exec errno=%d (%s)\n",
-                errno, strerror(errno));
-        _exit(127);
-    }
-    if (wait_for_success(child, "signal-wait-child") != 0) {
-        return 1;
-    }
-    return 0;
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-signal-wait-boundary",
+        NULL,
+        "signal-wait-child");
 }
 
 static int test_pause(void) {
@@ -448,41 +352,17 @@ static int test_pause(void) {
 }
 
 static int test_alarm(void) {
-    pid_t child = fork();
-    if (child < 0) {
-        return fail("alarm-fork");
-    }
-    if (child == 0) {
-        execl("/opt/thekernel-tests/bin/thekernel-alarm-smoke",
-              "thekernel-alarm-smoke", (char *)NULL);
-        fprintf(stderr,
-                "THEKERNEL_SYSTEM_TEST_FAIL alarm-exec errno=%d (%s)\n",
-                errno, strerror(errno));
-        _exit(127);
-    }
-    if (wait_for_success(child, "alarm-child") != 0) {
-        return 1;
-    }
-    return 0;
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-alarm-smoke",
+        NULL,
+        "alarm-child");
 }
 
 static int test_wait_boundary(void) {
-    pid_t child = fork();
-    if (child < 0) {
-        return fail("wait-boundary-fork");
-    }
-    if (child == 0) {
-        execl("/opt/thekernel-tests/bin/thekernel-wait-boundary",
-              "thekernel-wait-boundary", (char *)NULL);
-        fprintf(stderr,
-                "THEKERNEL_SYSTEM_TEST_FAIL wait-boundary-exec errno=%d (%s)\n",
-                errno, strerror(errno));
-        _exit(127);
-    }
-    if (wait_for_success(child, "wait-boundary-child") != 0) {
-        return 1;
-    }
-    return 0;
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-wait-boundary",
+        NULL,
+        "wait-boundary-child");
 }
 
 static int test_rseq(void) {
