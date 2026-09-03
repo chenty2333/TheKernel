@@ -32,7 +32,7 @@ Buildroot requires and does not suppress Buildroot's check. An explicit prefix
 supplies its `perl` wrapper first on `PATH`.
 
 ```bash
-TASK_CACHE=/home/ava/.cache/thekernel-codex.pJrrL1
+TASK_CACHE="$HOME/.cache/thekernel-graphics-deps"
 PERL_CORE=/path/to/compatible/perl/lib
 scripts/build-graphics-rootfs.sh --flavor headless-abi-smoke \
   --buildroot-dir .state/buildroot/buildroot-2026.05.2 \

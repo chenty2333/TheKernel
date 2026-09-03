@@ -20,13 +20,13 @@ class GraphicsCiGateTests(unittest.TestCase):
         self.assertIn("--buildroot-dir \"$graphics_state/buildroot/buildroot-2026.05.2\"", workflow)
         self.assertIn("--download-dir \"$PWD/.state/ci/graphics-downloads\"", workflow)
         self.assertIn("--output \"$graphics_state/q35-graphics-seatd\"", workflow)
-        self.assertIn('cp "$graphics_state/q35-graphics-seatd/images/rootfs.ext2" "$product_rootfs"', workflow)
+        self.assertNotIn("$product_rootfs", workflow)
         self.assertIn("--machine q35 --firmware uefi --smp 4", workflow)
         self.assertIn("--accel tcg --timeout 300", workflow)
         graphics_step = workflow[workflow.index("Run canonical Q35 seatd Pixman pixel oracle"):]
         graphics_step = graphics_step.split("panther-lake-dut:", 1)[0]
         self.assertNotIn("--no-build", graphics_step)
-        self.assertIn('--rootfs "$THEKERNEL_STATE_DIR/out/rootfs/x86/rootfs-x86.img"', graphics_step)
+        self.assertIn('--rootfs "$graphics_state/q35-graphics-seatd/images/rootfs.ext2"', graphics_step)
         self.assertIn("--graphics-profile headless", workflow)
         self.assertIn("--screenshot \"$graphics_state/q35-graphics-seatd.ppm\"", workflow)
         self.assertIn("--workdir \"$graphics_state/q35-graphics-seatd-run\"", workflow)

@@ -485,9 +485,19 @@ if [ -n "$host_deps_dir" ]; then
 fi
 mkdir -p "$tmpdir"
 export TMPDIR="$tmpdir"
+# Buildroot copies BR2_ROOTFS_OVERLAY trees verbatim and does not honor
+# .gitignore, so stage the overlays without local residue such as __pycache__.
+staged_overlay=$output/.thekernel-overlay
+rm -rf "$staged_overlay"
+mkdir -p "$staged_overlay"
+for overlay_tree in "$REPO_ROOT"/config/graphics/overlay/*/; do
+    tree_name=$(basename -- "$overlay_tree")
+    cp -a "$overlay_tree" "$staged_overlay/$tree_name"
+done
+find "$staged_overlay" -type d -name __pycache__ -prune -exec rm -rf {} +
 generated_config=$output/.thekernel-graphics.config
-sed "s|@REPO_ROOT@|$REPO_ROOT|g" "$COMMON" >"$generated_config"
-sed "s|@REPO_ROOT@|$REPO_ROOT|g" "$fragment" >>"$generated_config"
+sed -e "s|@REPO_ROOT@/config/graphics/overlay|$staged_overlay|g" -e "s|@REPO_ROOT@|$REPO_ROOT|g" "$COMMON" >"$generated_config"
+sed -e "s|@REPO_ROOT@/config/graphics/overlay|$staged_overlay|g" -e "s|@REPO_ROOT@|$REPO_ROOT|g" "$fragment" >>"$generated_config"
 
 make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" defconfig BR2_DEFCONFIG="$generated_config"
 make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" olddefconfig

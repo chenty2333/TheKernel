@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-rootfs= output= profile= fault= kernel= cache=/home/ava/.cache/thekernel-targets/linux-6.12.107-oracle tarball= timeout=1800 qemu=
+rootfs= output= profile= fault= kernel= cache=${THEKERNEL_STATE_DIR:-$HOME/.cache/thekernel-targets}/linux-6.12.107-oracle tarball= timeout=1800 qemu=
 while (($#)); do
     case "$1" in
         --rootfs) rootfs=${2:?}; shift 2 ;;

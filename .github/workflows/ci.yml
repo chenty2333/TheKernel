@@ -313,25 +313,9 @@ jobs:
             hashFiles('TheKernel/config/graphics/pins.env', 'TheKernel/config/graphics/*.config')
             }}
 
-      - name: Build the single product rootfs
-        run: |
-          set -euo pipefail
-          graphics_state="$PWD/.state/ci/graphics"
-          product_rootfs="$THEKERNEL_STATE_DIR/out/rootfs/x86/rootfs-x86.img"
-          scripts/build-graphics-rootfs.sh \
-            --flavor q35-graphics-seatd \
-            --fetch-buildroot \
-            --buildroot-dir "$graphics_state/buildroot/buildroot-2026.05.2" \
-            --output "$graphics_state/q35-graphics-seatd" \
-            --download-dir "$PWD/.state/ci/graphics-downloads"
-          mkdir -p "$(dirname "$product_rootfs")"
-          cp "$graphics_state/q35-graphics-seatd/images/rootfs.ext2" "$product_rootfs"
-          test -s "$product_rootfs"
-
       - name: Build Q35 product image once
         run: |
-          ./tools/thekernel.py build --machine q35 --firmware uefi --smp 4 \
-            --rootfs "$THEKERNEL_STATE_DIR/out/rootfs/x86/rootfs-x86.img"
+          ./tools/thekernel.py build --machine q35 --firmware uefi --smp 4
 
       - name: Lint Q35 product image
         run: |
@@ -363,6 +347,17 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Build the Q35 seatd graphics rootfs
+        run: |
+          set -euo pipefail
+          graphics_state="$PWD/.state/ci/graphics"
+          scripts/build-graphics-rootfs.sh \
+            --flavor q35-graphics-seatd \
+            --fetch-buildroot \
+            --buildroot-dir "$graphics_state/buildroot/buildroot-2026.05.2" \
+            --output "$graphics_state/q35-graphics-seatd" \
+            --download-dir "$PWD/.state/ci/graphics-downloads"
+
       - name: Run canonical Q35 seatd Pixman pixel oracle
         run: |
           set -euo pipefail
@@ -370,7 +365,7 @@ jobs:
           ./tools/thekernel.py graphics-smoke \
             --machine q35 --firmware uefi --smp 4 \
             --accel tcg --timeout 300 \
-            --rootfs "$THEKERNEL_STATE_DIR/out/rootfs/x86/rootfs-x86.img" \
+            --rootfs "$graphics_state/q35-graphics-seatd/images/rootfs.ext2" \
             --flavor q35-graphics-seatd \
             --graphics-profile headless \
             --screenshot "$graphics_state/q35-graphics-seatd.ppm" \

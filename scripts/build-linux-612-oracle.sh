@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the exact Linux reference kernel used by graphics-linux-oracle.sh.
-# All source and output state is intentionally under /home, never tmpfs.
+# All source and output state is intentionally on persistent disk, never tmpfs.
 set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -17,7 +17,7 @@ usage: scripts/build-linux-612-oracle.sh [options]
 Build the checked-in Linux ${LINUX_VERSION} Q35 graphics-oracle configuration.
 
 options:
-  --cache DIR          persistent cache root (default: /home/ava/.cache/thekernel-targets/linux-${LINUX_VERSION}-oracle)
+  --cache DIR          persistent cache root (default: ${THEKERNEL_STATE_DIR:-$HOME/.cache/thekernel-targets}/linux-${LINUX_VERSION}-oracle)
   --tarball PATH       explicit, already downloaded ${TARBALL_NAME} (preferred)
   --output DIR         Linux O= directory (default: CACHE/build-${LINUX_VERSION})
   --jobs N             make parallelism (default: host CPU count)
@@ -26,7 +26,7 @@ EOF
     exit 2
 }
 
-cache=/home/ava/.cache/thekernel-targets/linux-6.12.107-oracle
+cache=${THEKERNEL_STATE_DIR:-$HOME/.cache/thekernel-targets}/linux-${LINUX_VERSION}-oracle
 tarball=
 output=
 jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')

@@ -348,7 +348,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
             check=True,
         )
 
-    def test_ci_embeds_the_graphics_rootfs(self) -> None:
+    def test_ci_hands_the_graphics_rootfs_to_the_pixel_oracle(self) -> None:
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("needs: image_ref", workflow)
         self.assertIn("image: ${{ needs.image_ref.outputs.image }}", workflow)
@@ -356,7 +356,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         graphics_step = graphics_step.split("panther-lake-dut:", 1)[0]
         self.assertNotIn("--no-build", graphics_step)
         self.assertIn("--flavor q35-graphics-seatd", graphics_step)
-        self.assertIn('--rootfs "$THEKERNEL_STATE_DIR/out/rootfs/x86/rootfs-x86.img"', graphics_step)
+        self.assertIn('--rootfs "$graphics_state/q35-graphics-seatd/images/rootfs.ext2"', graphics_step)
 
     def test_product_cli_accepts_an_existing_graphics_rootfs(self) -> None:
         spec = importlib.util.spec_from_file_location("thekernel_graphics_cli", ROOT / "tools/thekernel.py")
