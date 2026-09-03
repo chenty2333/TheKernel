@@ -15,13 +15,10 @@ DriveMode = Literal["snapshot", "readonly", "rw"]
 # Linux oracle's snapshot-backed ``/dev/vda``.  This keeps Q35 PCI discovery
 # and VirtIO device ordering comparable without changing normal product boot.
 RootfsTransport = Literal["drive", "module", "module-and-drive"]
-GraphicsProfile = Literal[
-    "headless",
-    "interactive",
-    "virgl-headless",
-    "virgl-interactive",
-    "venus-interactive",
-]
+# The graphics profile list has exactly one source of truth:
+# ``tools.qemu_runner.profiles.GRAPHICS_PROFILES``.  Annotations therefore
+# use this plain alias instead of a second literal list.
+GraphicsProfile = str
 
 INTENTIONAL_STOP_RETURN_CODE = 75
 

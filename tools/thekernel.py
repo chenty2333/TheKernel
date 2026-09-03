@@ -20,6 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from tools.ktap import COMPLETION_MARKER, KtapError, reject_ktap_skips
 from tools.qemu_runner import (
     Interaction,
     ProcessError,
@@ -35,13 +36,13 @@ from tools.qemu_runner.graphics_benchmark import (
     renderer_for_profile,
 )
 from tools.qemu_runner.graphics_metrics import GraphicsMetricError, enforce_graphics_metrics, parse_graphics_metrics
+from tools.qemu_runner.profiles import BENCHMARK_FAULTS, BENCHMARK_PROFILES, GRAPHICS_PROFILES
 
 
 TARGET = "x86_64-unknown-none"
 PLATFORM = "x86-pc"
 PRODUCT_FEATURE = "x86-product"
 PRODUCT_MAX_CPUS = 4
-COMPLETION_MARKER = "# THEKERNEL_SYSTEM_TEST_COMPLETE"
 SYSTEM_TEST_SHUTDOWN_COMMANDS = "/bin/busybox poweroff -f\nexit\n"
 MAX_KERNEL_BYTES = 800 * 1024 * 1024
 KERNEL_LOAD_PADDR = 2 * 1024 * 1024
@@ -614,15 +615,10 @@ def reject_ktap_skips_in_log(log_path: Path) -> None:
         text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError as error:
         raise ProductError(f"cannot read system-test log: {error}") from error
-    skipped = [
-        line
-        for line in text.splitlines()
-        if re.match(r"^ok\s+[1-9][0-9]*\b.*\s#\s*SKIP(?:\s|$)", line)
-    ]
-    if skipped:
-        raise ProductError(
-            f"system test contains {len(skipped)} KTAP SKIP result(s); pass --allow-skip to inspect a non-gating preview run"
-        )
+    try:
+        reject_ktap_skips(text)
+    except KtapError as error:
+        raise ProductError(str(error)) from error
 
 
 def build_cmd(args: argparse.Namespace) -> int:
@@ -990,7 +986,7 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument(
         "--graphics-profile",
-        choices=("headless", "interactive", "virgl-headless", "virgl-interactive", "venus-interactive"),
+        choices=tuple(GRAPHICS_PROFILES),
         default="headless",
         help="select the explicit QEMU display and virtio-gpu topology",
     )
@@ -1004,10 +1000,42 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+GRAPHICS_FLAVORS_ENV = REPO_ROOT / "config" / "graphics" / "flavors.env"
+
+
+def graphics_flavors() -> tuple[str, ...]:
+    """Read the dual-parsed graphics flavor manifest.
+
+    config/graphics/flavors.env is sourced by bash in the rootfs builder, so
+    it holds only plain KEY=VALUE assignments; values with spaces are
+    double-quoted and lists are space-separated.
+    """
+
+    try:
+        lines = GRAPHICS_FLAVORS_ENV.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise ProductError(f"cannot read graphics flavor manifest: {error}") from error
+    for line in lines:
+        key, separator, value = line.strip().partition("=")
+        if not key or key.startswith("#"):
+            continue
+        if not separator:
+            raise ProductError(f"invalid graphics flavor manifest line: {line.strip()}")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        if key == "FLAVORS":
+            flavors = tuple(value.split())
+            if not flavors:
+                raise ProductError("graphics flavor manifest declares an empty FLAVORS list")
+            return flavors
+    raise ProductError("graphics flavor manifest lacks a FLAVORS list")
+
+
 def add_graphics_smoke_arguments(parser: argparse.ArgumentParser) -> None:
     add_variant_arguments(parser)
     parser.add_argument("--rootfs", required=True, help="existing graphics rootfs.ext2 image")
-    parser.add_argument("--flavor", choices=("headless-abi-smoke", "q35-graphics-seatd", "q35-software-desktop", "q35-venus-desktop", "q35-graphics-logind"), default="headless-abi-smoke")
+    parser.add_argument("--flavor", choices=graphics_flavors(), default="headless-abi-smoke")
     parser.add_argument("--screenshot", required=True, help="QMP screendump PPM output path")
     parser.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     parser.add_argument("--timeout", type=positive_timeout, default=300.0)
@@ -1019,7 +1047,9 @@ def add_graphics_smoke_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--graphics-profile",
-        choices=("headless", "interactive", "virgl-interactive", "venus-interactive"),
+        # virgl-headless stays rejected at runtime: its EGL-headless display
+        # has no QMP pixel-oracle surface for a smoke run.
+        choices=tuple(profile for profile in GRAPHICS_PROFILES if profile != "virgl-headless"),
         default="headless",
         help="QEMU display topology; headless uses QMP screendump without a host window",
     )
@@ -1030,12 +1060,12 @@ def add_graphics_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rootfs", required=True, help="q35-graphics-benchmark rootfs.ext2")
     parser.add_argument("--accel", choices=("kvm",), default="kvm")
     parser.add_argument("--timeout", type=positive_timeout, default=1800.0)
-    parser.add_argument("--fault", choices=("modeset", "client-crash", "vt-switch", "weston-restart", "input-hotplug"))
+    parser.add_argument("--fault", choices=tuple(sorted(BENCHMARK_FAULTS)))
     parser.add_argument("--workdir", required=True)
     parser.add_argument("--linux-oracle-log", required=True)
     parser.add_argument(
         "--graphics-profile",
-        choices=("headless", "virgl-headless", "virgl-interactive", "venus-interactive"),
+        choices=BENCHMARK_PROFILES,
         required=True,
     )
 

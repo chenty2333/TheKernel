@@ -111,6 +111,23 @@ class SystemTestGateTests(unittest.TestCase):
             log.write_text("KTAP version 1\nok 1 - supported\n", encoding="utf-8")
             product.reject_ktap_skips_in_log(log)
 
+    def test_graphics_smoke_flavors_come_from_the_dual_parsed_manifest(self) -> None:
+        product = load_product()
+        flavors = product.graphics_flavors()
+        self.assertEqual(flavors, (
+            "headless-abi-smoke",
+            "q35-graphics-seatd",
+            "q35-software-desktop",
+            "q35-graphics-benchmark",
+            "q35-venus-desktop",
+            "q35-graphics-logind",
+        ))
+        args = product.build_parser().parse_args([
+            "graphics-smoke", "--no-build", "--rootfs", "rootfs.ext2",
+            "--screenshot", "graphics.ppm", "--flavor", "q35-graphics-seatd",
+        ])
+        self.assertEqual(args.flavor, "q35-graphics-seatd")
+
     def test_system_test_configures_marker_gated_shutdown_not_runner_stop(self) -> None:
         product = load_product()
         args = product.build_parser().parse_args(["system-test"])

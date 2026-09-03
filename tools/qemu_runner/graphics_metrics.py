@@ -15,12 +15,12 @@ from pathlib import Path
 from statistics import fmean
 
 from .graphics_benchmark import BENCHMARK_RENDERER_PREFIX
+from .profiles import INPUT_SAMPLES
 
 
 METRIC_PREFIX = "THEKERNEL_GRAPHICS_METRIC "
 WARMUP_FRAMES = 60
 SAMPLE_FRAMES = 600
-INPUT_SAMPLES = 10
 COUNTER_RESOURCE_KEYS = frozenset({"schema", "gpu_present", "atomic_commits", "vblanks"})
 BACKLOG_RESOURCE_KEYS = frozenset({
     "fences_pending", "pending_atomic_commits", "pending_vblank_events",

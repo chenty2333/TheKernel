@@ -5,6 +5,46 @@ from pathlib import Path
 
 from tools.qemu_runner.command import CommandError, build_qemu_command, drive_options
 from tools.qemu_runner.model import Drive
+from tools.qemu_runner.profiles import (
+    BENCHMARK_PROFILES,
+    GRAPHICS_PROFILES,
+    graphics_device,
+)
+
+
+class GraphicsProfileTableTests(unittest.TestCase):
+    def test_profile_table_is_the_single_profile_list(self) -> None:
+        self.assertEqual(tuple(GRAPHICS_PROFILES), (
+            "headless",
+            "interactive",
+            "virgl-headless",
+            "virgl-interactive",
+            "venus-interactive",
+        ))
+        for name, topology in GRAPHICS_PROFILES.items():
+            with self.subTest(profile=name):
+                self.assertTrue(topology.display)
+                self.assertTrue(topology.device.startswith("virtio-gpu"))
+                self.assertIn(topology.renderer, (None, "software", "virgl", "venus"))
+
+    def test_benchmark_profiles_are_exactly_the_renderer_backed_profiles(self) -> None:
+        self.assertEqual(BENCHMARK_PROFILES, (
+            "headless",
+            "virgl-headless",
+            "virgl-interactive",
+            "venus-interactive",
+        ))
+
+    def test_graphics_device_appends_the_requested_scanout_geometry(self) -> None:
+        self.assertEqual(
+            graphics_device("headless", 800, 600),
+            "virtio-gpu-pci,max_outputs=1,xres=800,yres=600",
+        )
+        self.assertEqual(
+            graphics_device("venus-interactive", 3840, 2160),
+            "virtio-gpu-gl-pci,blob=on,venus=on,hostmem=1G,"
+            "max_hostmem=1G,max_outputs=1,xres=3840,yres=2160",
+        )
 
 
 class CommandTests(unittest.TestCase):

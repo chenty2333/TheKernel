@@ -21,10 +21,15 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.ktap import KtapError, clean_shutdown_attested, validate_ktap_log
 
 
 class GateError(RuntimeError):
@@ -32,9 +37,6 @@ class GateError(RuntimeError):
 
 
 REQUIRED_ARTIFACTS = ("kernel-x86_64", "kernel-x86_64.esp", "rootfs-x86.img")
-TEST_LINE = re.compile(r"^(ok|not ok)\s+([1-9][0-9]*)\b", re.IGNORECASE)
-PLAN_LINE = re.compile(r"^1\.\.([1-9][0-9]*)\s*$")
-SKIP_LINE = re.compile(r"^ok\s+[1-9][0-9]*\b.*\s#\s*SKIP(?:\s|$)", re.IGNORECASE)
 
 
 def absolute_non_tmpfs(path: Path, *, name: str) -> Path:
@@ -72,34 +74,21 @@ def required_command(name: str) -> str:
 
 def validate_ktap(log_path: Path) -> None:
     try:
-        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError as error:
         raise GateError(f"cannot read DUT serial log {log_path}: {error}") from error
-    if not any(line.strip() == "KTAP version 1" for line in lines):
-        raise GateError("serial output does not contain KTAP version 1")
-    if any(SKIP_LINE.match(line) for line in lines):
-        raise GateError("serial output contains a KTAP SKIP result")
-    if any(line.lower().startswith("not ok ") for line in lines):
-        raise GateError("serial output contains a failing KTAP result")
-    if any("KTAP suite failed" in line for line in lines):
-        raise GateError("serial output reports a KTAP suite failure")
-    plans = [int(match.group(1)) for line in lines if (match := PLAN_LINE.match(line.strip()))]
-    if len(plans) != 1:
-        raise GateError("serial output must contain exactly one KTAP plan")
-    records = [int(match.group(2)) for line in lines if (match := TEST_LINE.match(line.strip()))]
-    expected = plans[0]
-    if sorted(records) != list(range(1, expected + 1)):
-        raise GateError("KTAP records do not exactly satisfy the declared plan")
-    if "# THEKERNEL_SYSTEM_TEST_COMPLETE" not in lines:
-        raise GateError("serial output lacks the system-test completion marker")
+    try:
+        validate_ktap_log(text)
+    except KtapError as error:
+        raise GateError(str(error)) from error
 
 
 def validate_clean_shutdown(status_path: Path) -> None:
     try:
-        status = status_path.read_text(encoding="utf-8").strip()
+        status = status_path.read_text(encoding="utf-8")
     except OSError as error:
         raise GateError(f"DUT serial hook did not write shutdown status: {error}") from error
-    if status != "clean":
+    if not clean_shutdown_attested(status):
         raise GateError("DUT did not report a normal guest shutdown")
 
 

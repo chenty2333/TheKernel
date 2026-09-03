@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 import unittest
+from pathlib import Path
 
 from tools.qemu_runner.graphics_benchmark import (
     BENCHMARK_INPUT_HOTPLUG_READY_MARKER,
@@ -9,6 +13,10 @@ from tools.qemu_runner.graphics_benchmark import (
     benchmark_checkpoints,
     renderer_for_profile,
 )
+from tools.qemu_runner.profiles import BENCHMARK_FAULTS, INPUT_SAMPLES
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class GraphicsBenchmarkProtocolTests(unittest.TestCase):
@@ -42,6 +50,23 @@ class GraphicsBenchmarkProtocolTests(unittest.TestCase):
         self.assertEqual(renderer_for_profile("venus-interactive"), "venus")
         with self.assertRaisesRegex(ValueError, "unsupported"):
             renderer_for_profile("interactive")
+
+    def test_fault_matrix_and_input_samples_are_single_sourced(self) -> None:
+        self.assertEqual(BENCHMARK_FAULTS, frozenset({
+            "modeset", "client-crash", "vt-switch", "weston-restart", "input-hotplug",
+        }))
+        self.assertEqual(INPUT_SAMPLES, 10)
+        self.assertEqual(BENCHMARK_INPUT_SAMPLES, INPUT_SAMPLES)
+
+    def test_list_faults_prints_the_fault_matrix_as_json(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, "-m", "tools.qemu_runner.graphics_benchmark", "--list-faults"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(set(json.loads(completed.stdout)), set(BENCHMARK_FAULTS))
 
 
 if __name__ == "__main__":

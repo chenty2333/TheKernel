@@ -8,6 +8,7 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 PINS=$REPO_ROOT/config/graphics/pins.env
 COMMON=$REPO_ROOT/config/graphics/common.config
 BUSYBOX_FRAGMENT=$REPO_ROOT/config/graphics/busybox.fragment
+FLAVORS_ENV=$REPO_ROOT/config/graphics/flavors.env
 
 flavor=
 output=
@@ -21,9 +22,15 @@ perl_module_root=${THEKERNEL_GRAPHICS_PERL_MODULE_ROOT:-}
 tmpdir=${THEKERNEL_GRAPHICS_TMPDIR:-}
 fault=
 
+# The flavor manifest is the single source of truth shared with the Python
+# tooling; source it before argument parsing so usage can list the flavors.
+[ -r "$FLAVORS_ENV" ] || { printf 'missing graphics flavor manifest: %s\n' "$FLAVORS_ENV" >&2; exit 1; }
+# shellcheck source=/dev/null
+. "$FLAVORS_ENV"
+
 usage() {
-    cat <<'EOF'
-Usage: scripts/build-graphics-rootfs.sh --flavor {headless-abi-smoke|q35-graphics-seatd|q35-software-desktop|q35-graphics-benchmark|q35-venus-desktop|q35-graphics-logind} --output DIR [options]
+    cat <<EOF
+Usage: scripts/build-graphics-rootfs.sh --flavor {$(printf '%s' "$FLAVORS" | tr ' ' '|')} --output DIR [options]
 
 Options:
   --buildroot-dir DIR   pre-checked-out Buildroot 2026.05.2 source tree
@@ -61,25 +68,44 @@ done
 [ -r "$PINS" ] && [ -r "$COMMON" ] || { printf '%s\n' 'graphics configuration is incomplete' >&2; exit 1; }
 # shellcheck source=/dev/null
 . "$PINS"
-case "$flavor" in
-    headless-abi-smoke) flavor_overlay=headless; fragment=$REPO_ROOT/config/graphics/$flavor.fragment ;;
-    q35-graphics-seatd) flavor_overlay=q35-graphics-seatd; fragment=$REPO_ROOT/config/graphics/$flavor.fragment ;;
-    q35-software-desktop) flavor_overlay=q35-software-desktop; fragment=$REPO_ROOT/config/graphics/$flavor.fragment ;;
-    q35-graphics-benchmark) flavor_overlay=q35-graphics-benchmark; fragment=$REPO_ROOT/config/graphics/$flavor.fragment ;;
-    q35-venus-desktop) flavor_overlay=q35-venus-desktop; fragment=$REPO_ROOT/config/graphics/$flavor.fragment ;;
-    q35-graphics-logind) flavor_overlay=q35-graphics-logind; fragment=$REPO_ROOT/config/graphics/$flavor.fragment ;;
-    '') [ "$check_only" -eq 1 ] || { printf '%s\n' '--flavor is required' >&2; exit 2; }; flavor=headless-abi-smoke; flavor_overlay=headless; fragment=$REPO_ROOT/config/graphics/headless-abi-smoke.fragment ;;
+if [ -z "$flavor" ]; then
+    [ "$check_only" -eq 1 ] || { printf '%s\n' '--flavor is required' >&2; exit 2; }
+    flavor=headless-abi-smoke
+fi
+case " $FLAVORS " in
+    *" $flavor "*) ;;
     *) printf 'unsupported graphics flavor: %s\n' "$flavor" >&2; exit 2 ;;
 esac
+# Per-flavor metadata comes from the sourced manifest; each key is the flavor
+# name uppercased with dashes turned into underscores.
+flavor_key=${flavor^^}
+flavor_key=${flavor_key//-/_}
+flavor_field() {
+    local field=FLAVOR_${flavor_key}_$1
+    [ -n "${!field:-}" ] || { printf 'graphics flavor manifest lacks %s\n' "$field" >&2; exit 1; }
+    printf '%s' "${!field}"
+}
+flavor_overlay=$(flavor_field OVERLAY)
+flavor_session=$(flavor_field SESSION)
+flavor_backend=$(flavor_field BACKEND)
+fragment=$REPO_ROOT/config/graphics/$flavor.fragment
 
-case "$fault" in ''|modeset|client-crash|vt-switch|weston-restart|input-hotplug) ;; *) printf 'unsupported graphics fault: %s\n' "$fault" >&2; exit 2 ;; esac
+if [ -n "$fault" ]; then
+    # The benchmark fault matrix is single-sourced in tools/qemu_runner/profiles.py.
+    command -v python3 >/dev/null || { printf '%s\n' 'python3 is required to validate --fault' >&2; exit 1; }
+    benchmark_faults=$(PYTHONPATH=$REPO_ROOT python3 -c 'from tools.qemu_runner.profiles import BENCHMARK_FAULTS; print(" ".join(sorted(BENCHMARK_FAULTS)))')
+    case " $benchmark_faults " in
+        *" $fault "*) ;;
+        *) printf 'unsupported graphics fault: %s\n' "$fault" >&2; exit 2 ;;
+    esac
+fi
 
 validate_checked_in() {
     [ -r "$BUSYBOX_FRAGMENT" ] || { printf 'missing BusyBox config fragment: %s\n' "$BUSYBOX_FRAGMENT" >&2; return 1; }
     grep -qx 'CONFIG_STAT=y' "$BUSYBOX_FRAGMENT"
     grep -qx 'CONFIG_FEATURE_STAT_FORMAT=y' "$BUSYBOX_FRAGMENT"
     grep -qx 'BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="@REPO_ROOT@/config/graphics/busybox.fragment"' "$COMMON"
-    if [ "$flavor" = q35-graphics-logind ]; then
+    if [ "$flavor_session" = logind ]; then
         validate_logind_checked_in
         return
     fi
@@ -281,9 +307,10 @@ validate_busybox_stat_output() {
 }
 
 validate_build_output() {
-    local target=$output/target resolved=$output/.config libseat backend accounts_image debugfs
+    local target=$output/target resolved=$output/.config libseat accounts_image debugfs
+    local backend=$flavor_backend
     [ -r "$resolved" ]
-    if [ "$flavor" = q35-graphics-logind ]; then
+    if [ "$flavor_session" = logind ]; then
         validate_logind_build_output
         return
     fi
@@ -318,9 +345,8 @@ validate_build_output() {
     readelf -d "$libseat" | grep -q 'SONAME.*libseat\.so'
     ! readelf -d "$libseat" | grep -q 'Shared library: \[libsystemd\.so'
     case "$flavor" in
-        headless-abi-smoke) backend=headless-backend.so ;;
+        headless-abi-smoke) ;;
         q35-software-desktop)
-            backend=drm-backend.so
             grep -qx 'BR2_PACKAGE_WESTON_DRM=y' "$resolved"
             grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' "$resolved"
             grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' "$resolved"
@@ -346,7 +372,6 @@ validate_build_output() {
             find "$target/usr/lib" -type f -name 'libgbm.so*' -print -quit | grep -q .
             ;;
         q35-graphics-seatd)
-            backend=drm-backend.so
             grep -qx 'BR2_PACKAGE_WESTON_DRM=y' "$resolved"
             grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' "$resolved"
             grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' "$resolved"
@@ -375,7 +400,6 @@ validate_build_output() {
             find "$target/usr" -type f -name 'virtio_icd*.json' -print -quit | grep -q .
             ;;
         q35-graphics-benchmark)
-            backend=drm-backend.so
             grep -qx 'BR2_PACKAGE_WESTON_DRM=y' "$resolved"
             grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' "$resolved"
             grep -qx 'BR2_PACKAGE_VULKAN_LOADER=y' "$resolved"
@@ -390,7 +414,6 @@ validate_build_output() {
             find "$target/usr" -type f -name 'virtio_icd*.json' -print -quit | grep -q .
             ;;
         q35-venus-desktop)
-            backend=drm-backend.so
             grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' "$resolved"
             grep -qx 'BR2_PACKAGE_VULKAN_LOADER=y' "$resolved"
             grep -qx 'BR2_PACKAGE_VULKAN_TOOLS=y' "$resolved"
@@ -454,6 +477,21 @@ validate_logind_build_output() {
 
 validate_checked_in
 if [ "$check_only" -eq 1 ]; then
+    # Cross-check the manifest itself: every declared flavor needs its
+    # Buildroot fragment and its overlay directory to exist.
+    for name in $FLAVORS; do
+        [ -r "$REPO_ROOT/config/graphics/$name.fragment" ] || {
+            printf 'flavor manifest names a missing fragment: %s\n' "$name" >&2
+            exit 1
+        }
+        name_key=${name^^}
+        name_key=${name_key//-/_}
+        overlay_field=FLAVOR_${name_key}_OVERLAY
+        [ -d "$REPO_ROOT/config/graphics/overlay/${!overlay_field:-}" ] || {
+            printf 'flavor manifest names a missing overlay: %s\n' "${!overlay_field:-$overlay_field}" >&2
+            exit 1
+        }
+    done
     printf '%s\n' 'graphics rootfs configuration: OK'
     exit 0
 fi

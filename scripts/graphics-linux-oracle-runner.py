@@ -14,7 +14,6 @@ if str(REPO_ROOT) not in sys.path:
 from tools.qemu_runner import Interaction, RunConfig, RunLimits, RunnerError, run
 from tools.qemu_runner.graphics_benchmark import (
     BENCHMARK_COMPLETE_MARKER,
-    BENCHMARK_FAULTS,
     benchmark_checkpoints,
     renderer_for_profile,
 )
@@ -24,6 +23,7 @@ from tools.qemu_runner.graphics_metrics import (
     parse_graphics_metrics,
 )
 from tools.qemu_runner.model import QmpControls
+from tools.qemu_runner.profiles import BENCHMARK_FAULTS, BENCHMARK_PROFILES
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--graphics-profile",
         required=True,
-        choices=("headless", "virgl-headless", "virgl-interactive", "venus-interactive"),
+        choices=BENCHMARK_PROFILES,
     )
     parser.add_argument("--fault", choices=tuple(sorted(BENCHMARK_FAULTS)))
     parser.add_argument("--timeout", type=float, default=1800.0)

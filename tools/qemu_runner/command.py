@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .model import Arch, Drive, DriveMode, GraphicsProfile
+from .profiles import GRAPHICS_PROFILES, graphics_device
 
 
 class CommandError(ValueError):
@@ -12,15 +13,6 @@ class CommandError(ValueError):
 
 
 VALID_DRIVE_MODES = frozenset({"snapshot", "readonly", "rw"})
-VALID_GRAPHICS_PROFILES = frozenset(
-    {
-        "headless",
-        "interactive",
-        "virgl-headless",
-        "virgl-interactive",
-        "venus-interactive",
-    }
-)
 Q35_MACHINE = "q35,max-ram-below-4g=2G"
 _ACCEL_CPU_MODELS = {"kvm": "host", "tcg": "max"}
 _RUNNER_OWNED_OPTIONS = frozenset({"-accel", "-cpu"})
@@ -102,7 +94,7 @@ def build_qemu_command(
         raise CommandError("CPU count must be positive")
     if not memory:
         raise CommandError("memory size must not be empty")
-    if graphics_profile not in VALID_GRAPHICS_PROFILES:
+    if graphics_profile not in GRAPHICS_PROFILES:
         raise CommandError(f"unsupported graphics profile: {graphics_profile}")
     if graphics_width <= 0 or graphics_height <= 0:
         raise CommandError("graphics dimensions must be positive")
@@ -159,29 +151,9 @@ def build_qemu_command(
                 "-serial",
                 "stdio",
                 "-display",
-                (
-                    "none"
-                    if graphics_profile == "headless"
-                    else "gtk"
-                    if graphics_profile == "interactive"
-                    else "egl-headless,gl=on"
-                    if graphics_profile == "virgl-headless"
-                    else "gtk,gl=on"
-                ),
+                GRAPHICS_PROFILES[graphics_profile].display,
                 "-device",
-                (
-                    f"virtio-gpu-pci,max_outputs=1,xres={graphics_width},yres={graphics_height}"
-                    if graphics_profile in {"headless", "interactive"}
-                    # Keep this ABI string exact.  The Venus rootfs verifies
-                    # Vulkan capability itself and must never fall back to
-                    # the legacy Virgl device configuration.
-                    else (
-                        "virtio-gpu-gl-pci,blob=on,venus=on,hostmem=1G,"
-                        f"max_hostmem=1G,max_outputs=1,xres={graphics_width},yres={graphics_height}"
-                    )
-                    if graphics_profile == "venus-interactive"
-                    else f"virtio-gpu-gl-pci,max_outputs=1,xres={graphics_width},yres={graphics_height}"
-                ),
+                graphics_device(graphics_profile, graphics_width, graphics_height),
                 "-device",
                 "pcie-root-port,id=rp-input-kbd,slot=2,chassis=2",
                 "-device",

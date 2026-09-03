@@ -2,29 +2,28 @@
 
 from __future__ import annotations
 
+import argparse
+import json
+
 from .model import QmpCheckpoint, QmpPciHotplug
+from .profiles import BENCHMARK_FAULTS, GRAPHICS_PROFILES, INPUT_SAMPLES
 
 BENCHMARK_READY_MARKER = "THEKERNEL_GRAPHICS_BENCHMARK_READY"
 BENCHMARK_INPUT_HOTPLUG_REMOVED_MARKER = "THEKERNEL_GRAPHICS_INPUT_HOTPLUG_REMOVED"
 BENCHMARK_INPUT_HOTPLUG_READY_MARKER = "THEKERNEL_GRAPHICS_INPUT_HOTPLUG_READY"
 BENCHMARK_COMPLETE_MARKER = "THEKERNEL_GRAPHICS_BENCHMARK_COMPLETE"
-BENCHMARK_INPUT_SAMPLES = 10
 BENCHMARK_RENDERER_PREFIX = "THEKERNEL_GRAPHICS_RENDERER "
-BENCHMARK_FAULTS = frozenset(
-    {"modeset", "client-crash", "vt-switch", "weston-restart", "input-hotplug"}
-)
+# Benchmark-scoped alias; the value itself lives only in profiles.py.
+BENCHMARK_INPUT_SAMPLES = INPUT_SAMPLES
 
 
 def renderer_for_profile(profile: str) -> str:
     """Return the only guest renderer accepted for a fixed QEMU topology."""
 
-    if profile == "headless":
-        return "software"
-    if profile in {"virgl-headless", "virgl-interactive"}:
-        return "virgl"
-    if profile == "venus-interactive":
-        return "venus"
-    raise ValueError(f"unsupported graphics benchmark profile: {profile}")
+    topology = GRAPHICS_PROFILES.get(profile)
+    if topology is None or topology.renderer is None:
+        raise ValueError(f"unsupported graphics benchmark profile: {profile}")
+    return topology.renderer
 
 
 def benchmark_checkpoints(fault: str | None = None) -> tuple[QmpCheckpoint, ...]:
@@ -44,7 +43,7 @@ def benchmark_checkpoints(fault: str | None = None) -> tuple[QmpCheckpoint, ...]
 
     def latency_samples(first_marker: str, *, tablet: bool = False) -> tuple[QmpCheckpoint, ...]:
         checkpoints: list[QmpCheckpoint] = []
-        for index in range(BENCHMARK_INPUT_SAMPLES):
+        for index in range(INPUT_SAMPLES):
             visible = f"THEKERNEL_GRAPHICS_INPUT_VISIBLE_{index:03d}"
             input_events = keyboard_events
             if tablet:
@@ -88,3 +87,20 @@ def benchmark_checkpoints(fault: str | None = None) -> tuple[QmpCheckpoint, ...]
             ),
         ) + latency_samples(BENCHMARK_INPUT_HOTPLUG_READY_MARKER, tablet=True)
     return latency_samples(BENCHMARK_READY_MARKER)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--list-faults",
+        action="store_true",
+        help="print the deterministic benchmark fault matrix as a JSON array",
+    )
+    args = parser.parse_args(argv)
+    if args.list_faults:
+        print(json.dumps(sorted(BENCHMARK_FAULTS)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

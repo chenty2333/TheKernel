@@ -44,6 +44,37 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         )
         self.assertIn('export PATH="$host_deps_dir/bin:$PATH"', wrapper)
 
+    def test_flavor_manifest_matches_the_checked_in_fragments_and_overlays(self) -> None:
+        manifest: dict[str, str] = {}
+        for line in self.read("flavors.env").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, separator, value = line.partition("=")
+            self.assertEqual(separator, "=", line)
+            manifest[key] = value.strip().strip('"')
+        flavors = manifest["FLAVORS"].split()
+        self.assertEqual(flavors, [
+            "headless-abi-smoke",
+            "q35-graphics-seatd",
+            "q35-software-desktop",
+            "q35-graphics-benchmark",
+            "q35-venus-desktop",
+            "q35-graphics-logind",
+        ])
+        for flavor in flavors:
+            self.assertTrue((GRAPHICS / f"{flavor}.fragment").is_file(), flavor)
+            key = flavor.upper().replace("-", "_")
+            overlay = manifest[f"FLAVOR_{key}_OVERLAY"]
+            self.assertTrue((GRAPHICS / "overlay" / overlay).is_dir(), flavor)
+            self.assertIn(manifest[f"FLAVOR_{key}_SESSION"], ("seatd", "logind"))
+            self.assertIn(
+                manifest[f"FLAVOR_{key}_BACKEND"],
+                ("headless-backend.so", "drm-backend.so", "none"),
+            )
+        for flavor in manifest["CI_CHECK_FLAVORS"].split():
+            self.assertIn(flavor, flavors)
+
     def test_seatd_socket_and_device_policy_are_auditable(self) -> None:
         seatd = self.read("overlay/common/etc/init.d/S70seatd")
         rules = self.read("overlay/common/etc/udev/rules.d/71-thekernel-graphics.rules")
