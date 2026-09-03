@@ -9,7 +9,6 @@ UID=$(id -u "$USER")
 RUNTIME_DIR=/run/user/$UID
 PIDFILE=/run/weston.pid
 SESSION=/usr/local/bin/graphics-session
-FLAVOR_FILE=/etc/thekernel-graphics-flavor
 
 running() {
     pid_from_file >/dev/null 2>&1 && kill -0 "$(pid_from_file)" 2>/dev/null
@@ -34,30 +33,13 @@ wait_for_exit() {
     done
 }
 
-graphics_flavor() {
-    [ -r "$FLAVOR_FILE" ] || {
-        echo "missing graphics flavor file: $FLAVOR_FILE" >&2
-        return 1
-    }
-    flavor=$(cat "$FLAVOR_FILE")
-    case "$flavor" in
-        headless-abi-smoke|q35-graphics-seatd|q35-software-desktop|q35-venus-desktop) printf '%s\n' "$flavor" ;;
-        *)
-            echo "invalid graphics flavor in $FLAVOR_FILE" >&2
-            return 1
-            ;;
-    esac
-}
-
 start() {
     running && return 0
-    flavor=$(graphics_flavor)
     mkdir -p "$RUNTIME_DIR"
     chown "$USER:$USER" "$RUNTIME_DIR"
     chmod 0700 "$RUNTIME_DIR"
-    printf 'Starting Weston (%s): ' "$flavor"
-    start-stop-daemon -S -x "$SESSION" -p "$PIDFILE" -m -b -c "$USER" -- \
-        "$flavor"
+    printf 'Starting Weston: '
+    start-stop-daemon -S -x "$SESSION" -p "$PIDFILE" -m -b -c "$USER"
     echo OK
 }
 

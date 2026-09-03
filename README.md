@@ -86,7 +86,7 @@ make docker-clean  # remove the dev container volume and local image
 
 Its commands write below `${THEKERNEL_STATE_DIR:-~/.cache/thekernel-targets}`.
 With defaults, the system kernel and ESP are under
-`~/.cache/thekernel-targets/out/x86_64/q35-uefi/system/smp4-mem1g/`, and the
+`~/.cache/thekernel-targets/out/x86_64/q35-uefi/system/mem1g/`, and the
 root filesystem is `~/.cache/thekernel-targets/out/rootfs/x86/rootfs-x86.img`. On non-Debian x86_64 hosts the rootfs
 build falls back to the native gcc and needs the static C library (Fedora:
 `glibc-static`, Debian: `libc6-dev`).

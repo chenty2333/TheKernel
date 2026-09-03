@@ -3,7 +3,7 @@
 from .command import build_qemu_command, drive_options
 from .model import Drive, Interaction, RunLimits, RunResult
 from .process import ProcessError
-from .runner import RunConfig, RunnerError, normalize_arch, run
+from .runner import RunConfig, RunnerError, run
 
 __all__ = [
     "Drive",
@@ -15,6 +15,5 @@ __all__ = [
     "RunnerError",
     "build_qemu_command",
     "drive_options",
-    "normalize_arch",
     "run",
 ]

@@ -57,12 +57,11 @@ a tmpfs from the Buildroot SysV skeleton; `S80weston` creates
 `/run/user/<weston-uid>` as mode `0700` and starts Weston as the non-root
 `weston` account with `XDG_RUNTIME_DIR` set there.
 
-The init script does not read `/etc/profile.d`: each flavor installs the
-root-readable, single-value `/etc/thekernel-graphics-flavor` file. `S80weston`
-accepts `headless-abi-smoke`, the canonical `q35-graphics-seatd`, and the
-retained compatibility aliases from that
-file and passes it to `graphics-session`, which selects the corresponding
-headless or DRM Weston configuration.
+The init script does not read `/etc/profile.d`. Each flavor overlay links
+`/etc/weston/weston.ini` to the checked-in headless or DRM Weston
+configuration, and `S80weston` starts `graphics-session`, which runs Weston
+with that file. `/etc/thekernel-graphics-flavor` remains a root-readable
+image-identity record only; nothing reads it at boot.
 
 This is explicitly a **seatd + libseat** arrangement, not logind: Buildroot
 does not select systemd/logind, seatd owns `/run/seatd.sock` as `root:seat`,
@@ -80,10 +79,7 @@ libseat actually opened the `seatd` backend.
 Run `/usr/local/bin/graphics-abi-smoke` inside the guest; its
 `THEKERNEL_GRAPHICS_ABI_SMOKE_READY` marker means the S70/S80 path produced a
 Wayland Unix socket while seatd is alive. This is a userspace ABI probe, not a
-rendered-frame or input-device test. The launch profiles are also usable
-directly as `graphics-session headless-abi-smoke` and
-`graphics-session q35-graphics-seatd`; the former uses the headless backend,
-while the latter selects DRM.
+rendered-frame or input-device test.
 
 The headless overlay also runs that probe as `S90graphics-abi-smoke`, so its
 marker is available on the guest serial console without a login shell. Boot the
@@ -127,10 +123,11 @@ profiles: `headless` selects Pixman/SHM on `virtio-gpu-pci`,
 `virgl-interactive` selects `virtio-gpu-gl-pci`, and `venus-interactive`
 selects `virtio-gpu-gl-pci,blob=on,venus=on,hostmem=1G`.  The init workload
 dispatcher uses the exposed render capability to run exactly one of the SHM,
-Virgl, or Venus workloads and emits the corresponding marker.  The older
-`q35-software-desktop` and `q35-venus-desktop` names remain compatibility
-aliases; the only other final graphics image is the independent
-`q35-graphics-logind` Sway image.
+Virgl, or Venus workloads and emits the corresponding marker.  The other final
+graphics images are the independent `q35-software-desktop`,
+`q35-venus-desktop`, `q35-graphics-benchmark`, and `q35-graphics-logind`
+flavors; `graphics-smoke --flavor` accepts only `headless-abi-smoke`,
+`q35-graphics-seatd`, and `q35-graphics-logind`.
 
 For real virgl coverage, run the same flavor with
 `--graphics-profile virgl-interactive`. The tool waits only for

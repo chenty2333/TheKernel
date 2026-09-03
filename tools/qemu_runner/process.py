@@ -13,19 +13,16 @@ import sys
 import threading
 import time
 import json
-import zlib
 from collections import deque
 from pathlib import Path
 from typing import BinaryIO, Mapping
 
 from .model import (
-    Arch,
     INTENTIONAL_STOP_RETURN_CODE,
     Interaction,
     QmpColorBlock,
     QmpCheckpoint,
     QmpPciHotplug,
-    QmpRegionCrc,
     RunLimits,
     RunResult,
 )
@@ -54,18 +51,10 @@ def _validate_color_block(block: QmpColorBlock) -> None:
         raise ProcessError("QMP screenshot color block RGB channels must be in 0..255")
 
 
-def _validate_region_crc(region: QmpRegionCrc) -> None:
-    if region.x < 0 or region.y < 0 or region.width <= 0 or region.height <= 0:
-        raise ProcessError("QMP screenshot CRC region must have non-negative origin and positive size")
-    if region.crc32 < 0 or region.crc32 > 0xFFFF_FFFF:
-        raise ProcessError("QMP screenshot CRC must be in 0..0xffffffff")
-
-
 def _validate_ppm(
     screenshot: Path,
     expected_size: tuple[int, int] | None,
     color_blocks: tuple[QmpColorBlock, ...],
-    region_crcs: tuple[QmpRegionCrc, ...],
 ) -> None:
     """Validate QEMU's P6 screendump before reporting graphics success."""
 
@@ -120,15 +109,6 @@ def _validate_ppm(
             start = (y * width + block.x) * 3
             if pixels[start : start + block.width * 3] != expected * block.width:
                 raise ProcessError("QMP screenshot color block did not match")
-    for region in region_crcs:
-        if region.x + region.width > width or region.y + region.height > height:
-            raise ProcessError("QMP screenshot CRC region is outside the image")
-        rows = bytearray()
-        for y in range(region.y, region.y + region.height):
-            start = (y * width + region.x) * 3
-            rows.extend(pixels[start : start + region.width * 3])
-        if zlib.crc32(rows) != region.crc32:
-            raise ProcessError("QMP screenshot CRC region did not match")
 
 
 class _QmpController:
@@ -145,7 +125,6 @@ class _QmpController:
         timeout_secs: float,
         screenshot_size: tuple[int, int] | None,
         screenshot_color_blocks: tuple[QmpColorBlock, ...],
-        screenshot_region_crcs: tuple[QmpRegionCrc, ...],
         checkpoints: tuple[QmpCheckpoint, ...],
     ) -> None:
         self.socket_path = socket_path
@@ -156,7 +135,6 @@ class _QmpController:
         self.timeout_secs = timeout_secs
         self.screenshot_size = screenshot_size
         self.screenshot_color_blocks = screenshot_color_blocks
-        self.screenshot_region_crcs = screenshot_region_crcs
         self.checkpoints = checkpoints or (
             QmpCheckpoint(
                 input_after_marker=input_after_marker or "",
@@ -165,7 +143,6 @@ class _QmpController:
                 screenshot_after_marker=screenshot_after_marker,
                 screenshot_size=screenshot_size,
                 screenshot_color_blocks=screenshot_color_blocks,
-                screenshot_region_crcs=screenshot_region_crcs,
             ),
         )
         self._markers: set[str] = set()
@@ -423,7 +400,6 @@ class _QmpController:
                         checkpoint.screenshot,
                         checkpoint.screenshot_size,
                         checkpoint.screenshot_color_blocks,
-                        checkpoint.screenshot_region_crcs,
                     )
             self._complete.set()
         except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -465,15 +441,9 @@ def validate_interaction(interaction: Interaction, limits: RunLimits) -> None:
     _validate_marker("stop-after marker", interaction.stop_after_marker)
     if interaction.input_after_marker is not None and not interaction.interactive:
         raise ProcessError("input-after marker requires interactive mode")
-    if limits.ready_timeout_secs is not None and interaction.input_after_marker is None:
-        raise ProcessError("ready timeout requires an input-after marker")
-    for name, value in (
-        ("total timeout", limits.total_timeout_secs),
-        ("idle timeout", limits.idle_timeout_secs),
-        ("ready timeout", limits.ready_timeout_secs),
-    ):
-        if value is not None and (value <= 0 or not math.isfinite(value)):
-            raise ProcessError(f"{name} must be positive")
+    value = limits.total_timeout_secs
+    if value is not None and (value <= 0 or not math.isfinite(value)):
+        raise ProcessError("total timeout must be positive")
 
 
 def validate_qmp_controls(
@@ -485,7 +455,6 @@ def validate_qmp_controls(
     timeout_secs: float,
     screenshot_size: tuple[int, int] | None,
     screenshot_color_blocks: tuple[QmpColorBlock, ...],
-    screenshot_region_crcs: tuple[QmpRegionCrc, ...],
     checkpoints: tuple[QmpCheckpoint, ...],
 ) -> None:
     _validate_qmp_marker("QMP input-after marker", input_after_marker)
@@ -500,12 +469,10 @@ def validate_qmp_controls(
         len(screenshot_size) != 2 or any(value <= 0 for value in screenshot_size)
     ):
         raise ProcessError("QMP screenshot dimensions must be positive")
-    if screenshot is None and (screenshot_size is not None or screenshot_color_blocks or screenshot_region_crcs):
+    if screenshot is None and (screenshot_size is not None or screenshot_color_blocks):
         raise ProcessError("QMP screenshot oracle requires a screenshot")
     for block in screenshot_color_blocks:
         _validate_color_block(block)
-    for region in screenshot_region_crcs:
-        _validate_region_crc(region)
     for checkpoint in checkpoints:
         _validate_qmp_marker("QMP checkpoint input-after marker", checkpoint.input_after_marker)
         _validate_qmp_marker("QMP checkpoint screenshot-after marker", checkpoint.screenshot_after_marker)
@@ -522,13 +489,10 @@ def validate_qmp_controls(
         if checkpoint.screenshot is None and (
             checkpoint.screenshot_size is not None
             or checkpoint.screenshot_color_blocks
-            or checkpoint.screenshot_region_crcs
         ):
             raise ProcessError("QMP checkpoint screenshot oracle requires a screenshot")
         for block in checkpoint.screenshot_color_blocks:
             _validate_color_block(block)
-        for region in checkpoint.screenshot_region_crcs:
-            _validate_region_crc(region)
         for action in checkpoint.pci_hotplug:
             _validate_pci_hotplug(action)
 
@@ -575,7 +539,6 @@ def _wait_for_process(
     qmp_controller: _QmpController | None = None,
 ) -> tuple[int, str | None, bool, str | None]:
     started_at = time.monotonic()
-    last_output_at = started_at
     input_ready = interaction.input_after_marker is None
     input_open = forward_input
     stdout_open = True
@@ -660,7 +623,6 @@ def _wait_for_process(
                 log_file.flush()
                 if interaction.interactive:
                     _write_stream(console_stream, data)
-                last_output_at = time.monotonic()
                 stopped = consume_lines(data)
                 if stopped is not None:
                     return stopped
@@ -728,36 +690,14 @@ def _wait_for_process(
             return returncode, None, False, None
 
         now = time.monotonic()
-        if (
-            not input_ready
-            and limits.ready_timeout_secs is not None
-            and now - started_at >= limits.ready_timeout_secs
-        ):
-            message = (
-                f"QEMU input-ready timeout after {limits.ready_timeout_secs:g}s "
-                f"waiting for marker: {interaction.input_after_marker}"
-            )
-            _terminate_with_grace(process)
-            return 124, message, False, "ready-timeout"
         if limits.total_timeout_secs is not None and now - started_at >= limits.total_timeout_secs:
             message = f"QEMU timed out after {limits.total_timeout_secs:g}s"
             _terminate_with_grace(process)
             return 124, message, False, "total-timeout"
-        if (
-            limits.idle_timeout_secs is not None
-            and now - last_output_at >= limits.idle_timeout_secs
-        ):
-            message = (
-                f"QEMU idle timeout after {limits.idle_timeout_secs:g}s "
-                "without console output"
-            )
-            _terminate_with_grace(process)
-            return 124, message, False, "idle-timeout"
 
 
 def run_process(
     *,
-    arch: Arch,
     command: tuple[str, ...],
     workdir: Path,
     log_path: Path,
@@ -774,7 +714,6 @@ def run_process(
     qmp_timeout_secs: float = 5.0,
     qmp_screenshot_size: tuple[int, int] | None = None,
     qmp_screenshot_color_blocks: tuple[QmpColorBlock, ...] = (),
-    qmp_screenshot_region_crcs: tuple[QmpRegionCrc, ...] = (),
     qmp_checkpoints: tuple[QmpCheckpoint, ...] = (),
 ) -> RunResult:
     """Run one explicit QEMU command and capture its complete serial stream."""
@@ -788,7 +727,6 @@ def run_process(
         timeout_secs=qmp_timeout_secs,
         screenshot_size=qmp_screenshot_size,
         screenshot_color_blocks=qmp_screenshot_color_blocks,
-        screenshot_region_crcs=qmp_screenshot_region_crcs,
         checkpoints=qmp_checkpoints,
     )
     if qmp_socket is None and (
@@ -812,7 +750,6 @@ def run_process(
             input_stream.fileno()
         except (AttributeError, OSError, ValueError) as error:
             raise ProcessError("interactive input stream must expose a file descriptor") from error
-    started_at = time.monotonic()
     process: subprocess.Popen[bytes] | None = None
     proxy_input = interaction.input_after_marker is not None
     launched = False
@@ -851,7 +788,6 @@ def run_process(
                     timeout_secs=qmp_timeout_secs,
                     screenshot_size=qmp_screenshot_size,
                     screenshot_color_blocks=qmp_screenshot_color_blocks,
-                    screenshot_region_crcs=qmp_screenshot_region_crcs,
                     checkpoints=qmp_checkpoints,
                 )
                 qmp_controller.start()
@@ -913,14 +849,9 @@ def run_process(
             if process.stdout is not None and not process.stdout.closed:
                 process.stdout.close()
 
-    duration_ms = int((time.monotonic() - started_at) * 1000)
     return RunResult(
-        arch=arch,
-        command=command,
         returncode=returncode,
-        duration_ms=duration_ms,
         log_path=log_path,
-        workdir=workdir,
         error_message=error_message,
         marker_success=marker_success,
         runner_terminated=(

@@ -68,10 +68,18 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
             overlay = manifest[f"FLAVOR_{key}_OVERLAY"]
             self.assertTrue((GRAPHICS / "overlay" / overlay).is_dir(), flavor)
             self.assertIn(manifest[f"FLAVOR_{key}_SESSION"], ("seatd", "logind"))
+            backend = manifest[f"FLAVOR_{key}_BACKEND"]
             self.assertIn(
-                manifest[f"FLAVOR_{key}_BACKEND"],
+                backend,
                 ("headless-backend.so", "drm-backend.so", "none"),
             )
+            if backend != "none":
+                link = GRAPHICS / "overlay" / overlay / "etc" / "weston" / "weston.ini"
+                self.assertTrue(link.is_symlink(), flavor)
+                expected = "weston-headless.ini" if backend == "headless-backend.so" else "weston-drm.ini"
+                self.assertEqual(link.readlink(), pathlib.Path(expected), flavor)
+        for flavor in manifest["SMOKE_FLAVORS"].split():
+            self.assertIn(flavor, flavors)
         for flavor in manifest["CI_CHECK_FLAVORS"].split():
             self.assertIn(flavor, flavors)
 
@@ -116,11 +124,13 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
             self.read("overlay/headless/etc/thekernel-graphics-flavor").strip(),
             "headless-abi-smoke",
         )
-        self.assertIn("FLAVOR_FILE=/etc/thekernel-graphics-flavor", init)
+        self.assertNotIn("FLAVOR_FILE", init)
         self.assertNotIn("THEKERNEL_GRAPHICS_FLAVOR", init)
-        self.assertIn('"$flavor"', init)
-        self.assertIn("headless-abi-smoke", session)
-        self.assertIn("exec weston --config=/etc/weston/weston-headless.ini", session)
+        self.assertNotIn('"$flavor"', init)
+        link = GRAPHICS / "overlay/headless/etc/weston/weston.ini"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.readlink(), pathlib.Path("weston-headless.ini"))
+        self.assertIn("exec weston --config=/etc/weston/weston.ini", session)
 
     def test_every_graphics_flavor_cross_compiles_the_guest_uapi_oracles(self) -> None:
         headless = self.read("headless-abi-smoke.fragment")
@@ -165,10 +175,11 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
             ])
             calls: dict[str, object] = {}
             module.build_kernel = lambda *_args, **_kwargs: self.fail("--no-build invoked build_kernel")
-            module.run_product = lambda *_args, **kwargs: calls.update(kwargs) or 0
+            module.run_product = lambda _artifacts, spec: calls.update(spec=spec) or 0
             self.assertEqual(module.graphics_smoke_cmd(args), 0)
-        self.assertEqual(calls["rootfs"], rootfs.resolve())
-        self.assertEqual(calls["rootfs_transport"], "drive")
+        spec = calls["spec"]
+        self.assertEqual(spec.rootfs, rootfs.resolve())
+        self.assertEqual(spec.rootfs_transport, "drive")
 
     def test_canonical_q35_seatd_profile_selects_drm_backend_without_a_login_shell(self) -> None:
         init = self.read("overlay/common/etc/init.d/S80weston")
@@ -177,9 +188,11 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
             self.read("overlay/q35-graphics-seatd/etc/thekernel-graphics-flavor").strip(),
             "q35-graphics-seatd",
         )
-        self.assertIn('"$flavor"', init)
-        self.assertIn("q35-graphics-seatd", session)
-        self.assertIn("exec weston --config=/etc/weston/weston-drm.ini", session)
+        self.assertNotIn('"$flavor"', init)
+        link = GRAPHICS / "overlay/q35-graphics-seatd/etc/weston/weston.ini"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.readlink(), pathlib.Path("weston-drm.ini"))
+        self.assertIn("exec weston --config=/etc/weston/weston.ini", session)
 
     def test_q35_smoke_sets_the_weston_session_environment_before_dropping_privileges(self) -> None:
         smoke = self.read("overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke")
@@ -339,7 +352,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         self.assertIn('udevadm info -q property -n "$event"', smoke)
         self.assertIn("ID_INPUT=1", smoke)
         self.assertIn("ID_INPUT_(MOUSE|TABLET|TOUCHSCREEN)=1", smoke)
-        self.assertIn("reason=input_classification", smoke)
+        self.assertIn("phase=input_classification", smoke)
         self.assertIn("udevadm settle --timeout=10", smoke)
         self.assertIn("have_keyboard", smoke)
         self.assertIn("have_pointer", smoke)
@@ -413,17 +426,18 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
             "--screenshot", "/tmp/graphics.ppm",
         ])
         calls: dict[str, object] = {}
-        module.run_product = lambda *_args, **kwargs: calls.update(kwargs) or 0
+        module.run_product = lambda _artifacts, spec: calls.update(spec=spec) or 0
         original_is_file = pathlib.Path.is_file
         try:
             pathlib.Path.is_file = lambda _self: True
             self.assertEqual(module.graphics_smoke_cmd(args), 0)
         finally:
             pathlib.Path.is_file = original_is_file
-        self.assertEqual(calls["stop_after_marker"], "THEKERNEL_GRAPHICS_ABI_SMOKE_READY")
-        self.assertEqual(calls["qmp_screenshot_after_marker"], "THEKERNEL_GRAPHICS_ABI_SMOKE_READY")
-        self.assertEqual(calls["graphics_profile"], "headless")
-        self.assertEqual(calls["rootfs_transport"], "drive")
+        spec = calls["spec"]
+        self.assertEqual(spec.stop_after_marker, "THEKERNEL_GRAPHICS_ABI_SMOKE_READY")
+        self.assertEqual(spec.qmp_screenshot_after_marker, "THEKERNEL_GRAPHICS_ABI_SMOKE_READY")
+        self.assertEqual(spec.graphics_profile, "headless")
+        self.assertEqual(spec.rootfs_transport, "drive")
 
     def test_q35_headless_graphics_smoke_keeps_the_software_marker_and_pixel_oracle(self) -> None:
         spec = importlib.util.spec_from_file_location("thekernel_q35_headless_smoke", ROOT / "tools/thekernel.py")
@@ -438,17 +452,18 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
             "--graphics-profile", "headless",
         ])
         calls: dict[str, object] = {}
-        module.run_product = lambda *_args, **kwargs: calls.update(kwargs) or 0
+        module.run_product = lambda _artifacts, spec: calls.update(spec=spec) or 0
         original_is_file = pathlib.Path.is_file
         try:
             pathlib.Path.is_file = lambda _self: True
             self.assertEqual(module.graphics_smoke_cmd(args), 0)
         finally:
             pathlib.Path.is_file = original_is_file
-        self.assertEqual(calls["stop_after_marker"], "THEKERNEL_Q35_WESTON_READY")
-        self.assertEqual(calls["qmp_screenshot_after_marker"], "THEKERNEL_Q35_WESTON_READY")
-        self.assertEqual(calls["qmp_screenshot_size"], (800, 600))
-        self.assertEqual(calls["qmp_screenshot_color_blocks"][0].rgb, (255, 0, 0))
+        spec = calls["spec"]
+        self.assertEqual(spec.stop_after_marker, "THEKERNEL_Q35_WESTON_READY")
+        self.assertEqual(spec.qmp_screenshot_after_marker, "THEKERNEL_Q35_WESTON_READY")
+        self.assertEqual(spec.qmp_screenshot_size, (800, 600))
+        self.assertEqual(spec.qmp_screenshot_color_blocks[0].rgb, (255, 0, 0))
 
     def test_virgl_headless_graphics_smoke_is_rejected_without_a_qmp_pixel_oracle(self) -> None:
         spec = importlib.util.spec_from_file_location("thekernel_virgl_headless_smoke", ROOT / "tools/thekernel.py")
@@ -483,17 +498,18 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
             "--graphics-profile", "virgl-interactive",
         ])
         calls: dict[str, object] = {}
-        module.run_product = lambda *_args, **kwargs: calls.update(kwargs) or 0
+        module.run_product = lambda _artifacts, spec: calls.update(spec=spec) or 0
         original_is_file = pathlib.Path.is_file
         try:
             pathlib.Path.is_file = lambda _self: True
             self.assertEqual(module.graphics_smoke_cmd(args), 0)
         finally:
             pathlib.Path.is_file = original_is_file
-        self.assertEqual(calls["stop_after_marker"], "THEKERNEL_Q35_VIRGL_READY")
-        self.assertEqual(calls["qmp_screenshot_after_marker"], "THEKERNEL_Q35_VIRGL_READY")
-        self.assertEqual(calls["qmp_screenshot_size"], (800, 600))
-        self.assertEqual(calls["qmp_screenshot_color_blocks"][0].rgb, (255, 0, 0))
+        spec = calls["spec"]
+        self.assertEqual(spec.stop_after_marker, "THEKERNEL_Q35_VIRGL_READY")
+        self.assertEqual(spec.qmp_screenshot_after_marker, "THEKERNEL_Q35_VIRGL_READY")
+        self.assertEqual(spec.qmp_screenshot_size, (800, 600))
+        self.assertEqual(spec.qmp_screenshot_color_blocks[0].rgb, (255, 0, 0))
 
     def test_marker_gated_screenshot_is_forwarded_to_qemu_runner(self) -> None:
         spec = importlib.util.spec_from_file_location("thekernel_graphics_qmp", ROOT / "tools/thekernel.py")
@@ -504,7 +520,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         spec.loader.exec_module(module)
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
-            artifacts = module.Artifacts(root / "state", module.Variant(cpus=1, memory="128M"))
+            artifacts = module.Artifacts(root / "state", module.Variant(memory="128M"))
             for path in (artifacts.kernel, artifacts.esp):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"artifact")
@@ -516,16 +532,21 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
             def fake_run(config):
                 seen["config"] = config
                 return type("Result", (), {
-                    "returncode": 75, "log_path": config.log_path, "intentionally_stopped": True,
+                    "returncode": 75, "error_message": None, "log_path": config.log_path,
+                    "intentionally_stopped": True,
                     "guest_clean_shutdown": False,
                 })()
 
             module.run = fake_run
             self.assertEqual(module.run_product(
-                artifacts, accel="tcg", timeout=30, workdir=root / "run", interactive=False,
-                input_after_marker=None, stop_after_marker="THEKERNEL_GRAPHICS_ABI_SMOKE_READY",
-                commands=None, extra_block=None, rootfs=rootfs, qmp_screenshot=screenshot,
-                qmp_screenshot_after_marker="THEKERNEL_GRAPHICS_ABI_SMOKE_READY",
+                artifacts,
+                module.RunSpec(
+                    accel="tcg", timeout=30, workdir=root / "run", interactive=False,
+                    input_after_marker=None, stop_after_marker="THEKERNEL_GRAPHICS_ABI_SMOKE_READY",
+                    commands=None, extra_block=None, rootfs=rootfs, qmp_screenshot=screenshot,
+                    qmp_screenshot_after_marker="THEKERNEL_GRAPHICS_ABI_SMOKE_READY",
+                    run_cpus=1,
+                ),
             ), 0)
         config = seen["config"]
         self.assertEqual(config.qmp.screenshot, screenshot.resolve())

@@ -21,7 +21,9 @@ class GraphicsCiGateTests(unittest.TestCase):
         self.assertIn("--download-dir \"$PWD/.state/ci/graphics-downloads\"", workflow)
         self.assertIn("--output \"$graphics_state/q35-graphics-seatd\"", workflow)
         self.assertNotIn("$product_rootfs", workflow)
-        self.assertIn("--machine q35 --firmware uefi --smp 4", workflow)
+        self.assertIn("--smp 4", workflow)
+        self.assertNotIn("--machine", workflow)
+        self.assertNotIn("--firmware", workflow)
         self.assertIn("--accel tcg --timeout 300", workflow)
         graphics_step = workflow[workflow.index("Run canonical Q35 seatd Pixman pixel oracle"):]
         graphics_step = graphics_step.split("panther-lake-dut:", 1)[0]

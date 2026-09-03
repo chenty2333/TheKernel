@@ -100,7 +100,6 @@ class ProcessTests(unittest.TestCase):
         input_file.seek(0)
         console = io.BytesIO()
         result = run_process(
-            arch="x86_64",
             command=(sys.executable, "-c", script),
             workdir=root,
             log_path=root / "console.log",
@@ -113,7 +112,7 @@ class ProcessTests(unittest.TestCase):
 
     def test_serial_output_is_logged(self) -> None:
         result, log, _ = self.run_child("print('hello', flush=True)")
-        self.assertTrue(result.ok)
+        self.assertEqual(result.returncode, 0, result.error_message)
         self.assertEqual(log, b"hello\n")
 
     def test_total_timeout_is_bounded(self) -> None:
@@ -124,15 +123,6 @@ class ProcessTests(unittest.TestCase):
         self.assertEqual(result.returncode, 124)
         self.assertIn("timed out", result.error_message or "")
 
-    def test_idle_timeout_tracks_console_activity(self) -> None:
-        result, log, _ = self.run_child(
-            "import time; print('started', flush=True); time.sleep(5)",
-            limits=RunLimits(total_timeout_secs=2.0, idle_timeout_secs=0.15),
-        )
-        self.assertEqual(result.returncode, 124)
-        self.assertIn(b"started", log)
-        self.assertIn("idle timeout", result.error_message or "")
-
     def test_input_is_forwarded_only_after_exact_marker(self) -> None:
         script = (
             "import sys; "
@@ -142,11 +132,11 @@ class ProcessTests(unittest.TestCase):
         )
         result, log, console = self.run_child(
             script,
-            limits=RunLimits(total_timeout_secs=2.0, ready_timeout_secs=1.0),
+            limits=RunLimits(total_timeout_secs=2.0),
             interaction=Interaction(interactive=True, input_after_marker="READY"),
             input_text=b"payload\n",
         )
-        self.assertTrue(result.ok, result.error_message)
+        self.assertEqual(result.returncode, 0, result.error_message)
         self.assertIn(b"GOT:payload", log)
         self.assertEqual(console, log)
 
@@ -161,7 +151,6 @@ class ProcessTests(unittest.TestCase):
         console = io.BytesIO()
 
         result = run_process(
-            arch="x86_64",
             command=(
                 sys.executable,
                 "-c",
@@ -175,23 +164,23 @@ class ProcessTests(unittest.TestCase):
             console_stream=console,
         )
 
-        self.assertTrue(result.ok, result.error_message)
+        self.assertEqual(result.returncode, 0, result.error_message)
         self.assertEqual((root / "console.log").read_bytes(), b"TTY=True\n")
 
     def test_early_guest_exit_does_not_claim_complete_input(self) -> None:
         payload = b"command-padding\n" * 100_000
         result, _, _ = self.run_child(
             "print('READY', flush=True)",
-            limits=RunLimits(total_timeout_secs=2.0, ready_timeout_secs=1.0),
+            limits=RunLimits(total_timeout_secs=2.0),
             interaction=Interaction(interactive=True, input_after_marker="READY"),
             input_text=payload,
         )
-        self.assertTrue(result.ok, result.error_message)
+        self.assertEqual(result.returncode, 0, result.error_message)
 
     def test_nonreading_guest_does_not_bypass_timeout_while_forwarding(self) -> None:
         result, _, _ = self.run_child(
             "import time; print('READY', flush=True); time.sleep(5)",
-            limits=RunLimits(total_timeout_secs=0.25, ready_timeout_secs=1.0),
+            limits=RunLimits(total_timeout_secs=0.25),
             interaction=Interaction(interactive=True, input_after_marker="READY"),
             input_text=b"command-padding\n" * 100_000,
         )
@@ -201,21 +190,12 @@ class ProcessTests(unittest.TestCase):
     def test_near_marker_does_not_open_input(self) -> None:
         result, _, _ = self.run_child(
             "print('READY ', flush=True)",
-            limits=RunLimits(total_timeout_secs=2.0, ready_timeout_secs=1.0),
+            limits=RunLimits(total_timeout_secs=2.0),
             interaction=Interaction(interactive=True, input_after_marker="READY"),
             input_text=b"payload\n",
         )
         self.assertEqual(result.returncode, 4)
         self.assertIn("before input-ready marker", result.error_message or "")
-
-    def test_ready_timeout_terminates_guest(self) -> None:
-        result, _, _ = self.run_child(
-            "import time; print('booting', flush=True); time.sleep(5)",
-            limits=RunLimits(total_timeout_secs=2.0, ready_timeout_secs=0.15),
-            interaction=Interaction(interactive=True, input_after_marker="READY"),
-        )
-        self.assertEqual(result.returncode, 124)
-        self.assertIn("input-ready timeout", result.error_message or "")
 
     def test_stop_after_exact_marker_returns_75(self) -> None:
         result, log, _ = self.run_child(
@@ -234,7 +214,6 @@ class ProcessTests(unittest.TestCase):
             root = Path(directory)
             with self.assertRaisesRegex(ProcessError, "non-negative"):
                 run_process(
-                    arch="x86_64",
                     command=(sys.executable, "-c", "pass"),
                     workdir=root,
                     log_path=root / "console.log",
@@ -251,7 +230,6 @@ class ProcessTests(unittest.TestCase):
             fd = os.open(image, os.O_RDONLY)
             self.addCleanup(os.close, fd)
             result = run_process(
-                arch="x86_64",
                 command=(
                     sys.executable,
                     "-c",
@@ -264,7 +242,7 @@ class ProcessTests(unittest.TestCase):
                 interaction=Interaction(),
                 pass_fds=(fd,),
             )
-            self.assertTrue(result.ok, result.error_message)
+            self.assertEqual(result.returncode, 0, result.error_message)
             self.assertEqual((root / "console.log").read_bytes(), b"opened-once")
 
     def test_qmp_waits_for_serial_markers_and_ignores_events_and_other_ids(self) -> None:
@@ -274,7 +252,6 @@ class ProcessTests(unittest.TestCase):
             screenshot = root / "screen.ppm"
             commands = self.start_qmp_server(qmp_socket)
             result = run_process(
-                arch="x86_64",
                 command=(
                     sys.executable,
                     "-c",
@@ -292,7 +269,7 @@ class ProcessTests(unittest.TestCase):
                 qmp_screenshot_size=(2, 1),
                 qmp_screenshot_color_blocks=(QmpColorBlock(0, 0, 2, 1, (1, 2, 3)),),
             )
-            self.assertTrue(result.ok, result.error_message)
+            self.assertEqual(result.returncode, 0, result.error_message)
             self.assertEqual([command["execute"] for command in commands], ["qmp_capabilities", "input-send-event", "screendump"])
             self.assertFalse(qmp_socket.exists())
 
@@ -302,7 +279,6 @@ class ProcessTests(unittest.TestCase):
             qmp_socket = root / "qmp.sock"
             commands = self.start_qmp_server(qmp_socket, device_deleted_device="input-kbd")
             result = run_process(
-                arch="x86_64",
                 command=(sys.executable, "-c", "import time; print('READY', flush=True); time.sleep(.3)"),
                 workdir=root,
                 log_path=root / "console.log",
@@ -319,7 +295,7 @@ class ProcessTests(unittest.TestCase):
                     ),
                 ),
             )
-            self.assertTrue(result.ok, result.error_message)
+            self.assertEqual(result.returncode, 0, result.error_message)
             self.assertEqual([command["execute"] for command in commands], ["qmp_capabilities", "device_del", "device_add"])
 
     def test_qmp_hotplug_protocol_waits_for_guest_remove_and_add_readiness_before_input(self) -> None:
@@ -328,7 +304,6 @@ class ProcessTests(unittest.TestCase):
             qmp_socket = root / "qmp.sock"
             commands = self.start_qmp_server(qmp_socket, device_deleted_device="input-tablet")
             result = run_process(
-                arch="x86_64",
                 command=(
                     sys.executable,
                     "-c",
@@ -358,7 +333,7 @@ class ProcessTests(unittest.TestCase):
                     ),
                 ),
             )
-            self.assertTrue(result.ok, result.error_message)
+            self.assertEqual(result.returncode, 0, result.error_message)
             self.assertEqual(
                 [command["execute"] for command in commands],
                 ["qmp_capabilities", "device_del", "device_add", "input-send-event"],
@@ -371,7 +346,6 @@ class ProcessTests(unittest.TestCase):
             commands = self.start_qmp_server(qmp_socket)
             event = (({"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}},),)
             result = run_process(
-                arch="x86_64",
                 command=(
                     sys.executable,
                     "-c",
@@ -400,7 +374,7 @@ class ProcessTests(unittest.TestCase):
                     ),
                 ),
             )
-            self.assertTrue(result.ok, result.error_message)
+            self.assertEqual(result.returncode, 0, result.error_message)
             metrics = [
                 json.loads(line.split(" ", 1)[1])
                 for line in (root / "console.log").read_text().splitlines()
@@ -420,7 +394,6 @@ class ProcessTests(unittest.TestCase):
             qmp_socket = root / "qmp.sock"
             commands = self.start_qmp_server(qmp_socket, device_deleted_device="other-input")
             result = run_process(
-                arch="x86_64",
                 command=(sys.executable, "-c", "import time; print('READY', flush=True); time.sleep(5)"),
                 workdir=root,
                 log_path=root / "console.log",
@@ -448,7 +421,6 @@ class ProcessTests(unittest.TestCase):
             qmp_socket = root / "qmp.sock"
             commands = self.start_qmp_server(qmp_socket, reject="device_del")
             result = run_process(
-                arch="x86_64",
                 command=(sys.executable, "-c", "import time; print('READY', flush=True); time.sleep(5)"),
                 workdir=root,
                 log_path=root / "console.log",
@@ -476,7 +448,6 @@ class ProcessTests(unittest.TestCase):
             screenshot = root / "screen.ppm"
             commands = self.start_qmp_server(qmp_socket, screendump_delay_secs=0.1)
             result = run_process(
-                arch="x86_64",
                 command=(
                     sys.executable,
                     "-c",
@@ -510,7 +481,6 @@ class ProcessTests(unittest.TestCase):
             qmp_socket = root / "qmp.sock"
             self.start_qmp_server(qmp_socket, reject="screendump")
             result = run_process(
-                arch="x86_64",
                 command=(
                     sys.executable,
                     "-c",
@@ -534,7 +504,6 @@ class ProcessTests(unittest.TestCase):
             qmp_socket = root / "qmp.sock"
             self.start_qmp_server(qmp_socket, reject="input-send-event")
             result = run_process(
-                arch="x86_64",
                 command=(sys.executable, "-c", "import time; print('READY', flush=True); time.sleep(5)"),
                 workdir=root,
                 log_path=root / "console.log",
@@ -554,7 +523,6 @@ class ProcessTests(unittest.TestCase):
             qmp_socket = root / "qmp.sock"
             self.start_qmp_server(qmp_socket)
             result = run_process(
-                arch="x86_64",
                 command=(sys.executable, "-c", "import time; print('BOOTING', flush=True); time.sleep(5)"),
                 workdir=root,
                 log_path=root / "console.log",

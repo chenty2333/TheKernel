@@ -65,9 +65,7 @@ class SystemTestGateTests(unittest.TestCase):
     def test_product_defaults_and_compile_time_network_match_q35_gate(self) -> None:
         product = load_product()
         args = product.build_parser().parse_args(["system-test"])
-        self.assertEqual((args.machine, args.firmware, args.smp, args.memory), (
-            "q35", "uefi", 4, "1G"
-        ))
+        self.assertEqual((args.smp, args.memory), (4, "1G"))
         with tempfile.TemporaryDirectory() as directory:
             artifacts = product.Artifacts(
                 Path(directory), product.parse_variant(args), "system"
@@ -122,11 +120,21 @@ class SystemTestGateTests(unittest.TestCase):
             "q35-venus-desktop",
             "q35-graphics-logind",
         ))
+        self.assertEqual(product.graphics_smoke_flavors(), (
+            "headless-abi-smoke",
+            "q35-graphics-seatd",
+            "q35-graphics-logind",
+        ))
         args = product.build_parser().parse_args([
             "graphics-smoke", "--no-build", "--rootfs", "rootfs.ext2",
             "--screenshot", "graphics.ppm", "--flavor", "q35-graphics-seatd",
         ])
         self.assertEqual(args.flavor, "q35-graphics-seatd")
+        with self.assertRaises(SystemExit):
+            product.build_parser().parse_args([
+                "graphics-smoke", "--no-build", "--rootfs", "rootfs.ext2",
+                "--screenshot", "graphics.ppm", "--flavor", "q35-graphics-benchmark",
+            ])
 
     def test_system_test_configures_marker_gated_shutdown_not_runner_stop(self) -> None:
         product = load_product()
@@ -136,8 +144,8 @@ class SystemTestGateTests(unittest.TestCase):
         def fake_build(_artifacts):
             return None
 
-        def fake_run_product(*_args, **kwargs):
-            calls.update(kwargs)
+        def fake_run_product(_artifacts, spec):
+            calls["spec"] = spec
             return 0
 
         original_build_kernel = product.build_kernel
@@ -153,21 +161,22 @@ class SystemTestGateTests(unittest.TestCase):
             product.build_rootfs = original_build_rootfs
             product.run_product = original_run_product
 
-        self.assertTrue(calls["shutdown_after_marker"])
-        self.assertTrue(calls["reject_ktap_skips"])
-        self.assertEqual(calls["rootfs_transport"], "module")
-        self.assertIsNone(calls["stop_after_marker"])
+        spec = calls["spec"]
+        self.assertTrue(spec.shutdown_after_marker)
+        self.assertTrue(spec.reject_ktap_skips)
+        self.assertEqual(spec.rootfs_transport, "module")
+        self.assertIsNone(spec.stop_after_marker)
 
-    def test_system_test_run_cpus_overrides_qemu_without_changing_artifact_variant(self) -> None:
+    def test_system_test_run_cpus_selects_the_qemu_cpu_count(self) -> None:
         product = load_product()
         args = product.build_parser().parse_args(
             ["system-test", "--smp", "4", "--run-cpus", "1", "--no-build"]
         )
         observed: dict[str, object] = {}
 
-        def fake_run_product(artifacts, **kwargs):
-            observed["artifact_cpus"] = artifacts.variant.cpus
-            observed.update(kwargs)
+        def fake_run_product(artifacts, spec):
+            observed["variant_name"] = artifacts.variant.name
+            observed["run_cpus"] = spec.run_cpus
             return 0
 
         original_run_product = product.run_product
@@ -177,7 +186,7 @@ class SystemTestGateTests(unittest.TestCase):
         finally:
             product.run_product = original_run_product
 
-        self.assertEqual(observed["artifact_cpus"], 4)
+        self.assertEqual(observed["variant_name"], "mem1g")
         self.assertEqual(observed["run_cpus"], 1)
 
     def test_run_product_uses_run_cpu_override_for_qemu_command(self) -> None:
@@ -185,7 +194,7 @@ class SystemTestGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             artifacts = product.Artifacts(
-                root / "state", product.Variant(cpus=4, memory="1G"), "system"
+                root / "state", product.Variant(memory="1G"), "system"
             )
             for path in (artifacts.kernel, artifacts.esp, artifacts.rootfs):
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,15 +216,17 @@ class SystemTestGateTests(unittest.TestCase):
                 product.run = fake_run
                 self.assertEqual(product.run_product(
                     artifacts,
-                    accel="tcg",
-                    timeout=30,
-                    workdir=root / "run",
-                    interactive=False,
-                    input_after_marker=None,
-                    stop_after_marker=None,
-                    commands=None,
-                    extra_block=None,
-                    run_cpus=1,
+                    product.RunSpec(
+                        accel="tcg",
+                        timeout=30,
+                        workdir=root / "run",
+                        interactive=False,
+                        input_after_marker=None,
+                        stop_after_marker=None,
+                        commands=None,
+                        extra_block=None,
+                        run_cpus=1,
+                    ),
                 ), 0)
             finally:
                 product.run = original_run
@@ -227,7 +238,7 @@ class SystemTestGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             artifacts = product.Artifacts(
-                root / "state", product.Variant(cpus=4, memory="1G"), "system"
+                root / "state", product.Variant(memory="1G"), "system"
             )
             for path in (artifacts.kernel, artifacts.drive_esp, artifacts.rootfs):
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -249,15 +260,18 @@ class SystemTestGateTests(unittest.TestCase):
                 product.run = fake_run
                 self.assertEqual(product.run_product(
                     artifacts,
-                    accel="tcg",
-                    timeout=30,
-                    workdir=root / "run",
-                    interactive=False,
-                    input_after_marker=None,
-                    stop_after_marker=None,
-                    commands=None,
-                    extra_block=None,
-                    rootfs_transport="drive",
+                    product.RunSpec(
+                        accel="tcg",
+                        timeout=30,
+                        workdir=root / "run",
+                        interactive=False,
+                        input_after_marker=None,
+                        stop_after_marker=None,
+                        commands=None,
+                        extra_block=None,
+                        rootfs_transport="drive",
+                        run_cpus=4,
+                    ),
                 ), 0)
             finally:
                 product.run = original_run
@@ -265,23 +279,19 @@ class SystemTestGateTests(unittest.TestCase):
         self.assertEqual(observed["config"].esp, artifacts.drive_esp)
         self.assertEqual(observed["config"].rootfs_transport, "drive")
 
-    def test_run_cpus_rejects_values_outside_artifact_capacity(self) -> None:
+    def test_run_cpus_rejects_values_outside_the_smp_bound(self) -> None:
         product = load_product()
-        artifacts = product.Artifacts(
-            Path("state"), product.Variant(cpus=4, memory="1G"), "system"
-        )
-
         with self.assertRaisesRegex(product.ProductError, "--run-cpus"):
-            product.resolve_run_cpus(artifacts, 0)
+            product.resolve_run_cpus(4, 0)
         with self.assertRaisesRegex(product.ProductError, "--run-cpus"):
-            product.resolve_run_cpus(artifacts, 5)
+            product.resolve_run_cpus(4, 5)
 
     def test_explicit_new_workdir_exists_before_shutdown_commands_are_written(self) -> None:
         product = load_product()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             artifacts = product.Artifacts(
-                root / "state", product.Variant(cpus=4, memory="1G"), "system"
+                root / "state", product.Variant(memory="1G"), "system"
             )
             for path in (artifacts.kernel, artifacts.esp, artifacts.rootfs):
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -309,15 +319,18 @@ class SystemTestGateTests(unittest.TestCase):
                 product.run = fake_run
                 self.assertEqual(product.run_product(
                     artifacts,
-                    accel="tcg",
-                    timeout=30,
-                    workdir=workdir,
-                    interactive=False,
-                    input_after_marker=None,
-                    stop_after_marker=None,
-                    commands=None,
-                    extra_block=None,
-                    shutdown_after_marker=True,
+                    product.RunSpec(
+                        accel="tcg",
+                        timeout=30,
+                        workdir=workdir,
+                        interactive=False,
+                        input_after_marker=None,
+                        stop_after_marker=None,
+                        commands=None,
+                        extra_block=None,
+                        shutdown_after_marker=True,
+                        run_cpus=4,
+                    ),
                 ), 0)
             finally:
                 product.run = original_run

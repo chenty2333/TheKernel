@@ -9,12 +9,7 @@ from typing import Literal, Mapping
 
 Arch = Literal["x86_64"]
 DriveMode = Literal["snapshot", "readonly", "rw"]
-# ``module-and-drive`` is deliberately a single topology selection rather
-# than an ``extra_block`` convention.  Graphics benchmark comparisons boot
-# TheKernel from its Multiboot module while exposing the *same* rootfs as the
-# Linux oracle's snapshot-backed ``/dev/vda``.  This keeps Q35 PCI discovery
-# and VirtIO device ordering comparable without changing normal product boot.
-RootfsTransport = Literal["drive", "module", "module-and-drive"]
+RootfsTransport = Literal["drive", "module"]
 # The graphics profile list has exactly one source of truth:
 # ``tools.qemu_runner.profiles.GRAPHICS_PROFILES``.  Annotations therefore
 # use this plain alias instead of a second literal list.
@@ -33,11 +28,9 @@ class Drive:
 
 @dataclass(frozen=True)
 class RunLimits:
-    """Independent wall-clock limits for one QEMU process."""
+    """Wall-clock limit for one QEMU process."""
 
     total_timeout_secs: float | None = None
-    idle_timeout_secs: float | None = None
-    ready_timeout_secs: float | None = None
 
 
 @dataclass(frozen=True)
@@ -67,7 +60,6 @@ class QmpControls:
     timeout_secs: float = 5.0
     screenshot_size: tuple[int, int] | None = None
     screenshot_color_blocks: tuple["QmpColorBlock", ...] = ()
-    screenshot_region_crcs: tuple["QmpRegionCrc", ...] = ()
     checkpoints: tuple["QmpCheckpoint", ...] = ()
 
 
@@ -80,17 +72,6 @@ class QmpColorBlock:
     width: int
     height: int
     rgb: tuple[int, int, int]
-
-
-@dataclass(frozen=True)
-class QmpRegionCrc:
-    """CRC-32 for a rectangular RGB region in a QMP PPM screendump."""
-
-    x: int
-    y: int
-    width: int
-    height: int
-    crc32: int
 
 
 @dataclass(frozen=True)
@@ -111,7 +92,6 @@ class QmpCheckpoint:
     screenshot_after_marker: str | None = None
     screenshot_size: tuple[int, int] | None = None
     screenshot_color_blocks: tuple[QmpColorBlock, ...] = ()
-    screenshot_region_crcs: tuple[QmpRegionCrc, ...] = ()
     pci_hotplug: tuple["QmpPciHotplug", ...] = ()
     # When set, measure from immediately before QMP input submission until
     # the guest reports that the input-driven frame became visible.  The
@@ -139,28 +119,12 @@ class QmpPciHotplug:
 class RunResult:
     """Process-level result without external result-aggregation policy."""
 
-    arch: Arch
-    command: tuple[str, ...]
     returncode: int
-    duration_ms: int
     log_path: Path
-    workdir: Path
     error_message: str | None = None
     marker_success: bool = False
     runner_terminated: bool = False
     runner_termination_reason: str | None = None
-
-    @property
-    def ok(self) -> bool:
-        return self.returncode == 0
-
-    @property
-    def timed_out(self) -> bool:
-        return self.returncode == 124
-
-    @property
-    def interrupted(self) -> bool:
-        return self.returncode in (130, -2)
 
     @property
     def intentionally_stopped(self) -> bool:
@@ -178,7 +142,3 @@ class RunResult:
         """Whether QEMU exited cleanly without a runner-initiated stop."""
 
         return self.returncode == 0 and not self.runner_terminated
-
-    @property
-    def launch_failed(self) -> bool:
-        return self.returncode == 3 and self.error_message is not None

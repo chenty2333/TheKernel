@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import gzip
-import lzma
 import os
 import re
 import shutil
@@ -193,9 +191,7 @@ class RunConfig:
     esp: Path | None = None
     rootfs_mode: DriveMode = "snapshot"
     # The generic runner remains useful for standalone drive-backed tests.
-    # `tools/thekernel.py` fixes ordinary product boots to the module path;
-    # graphics benchmarks use ``module-and-drive`` to compare against Linux
-    # with an identical snapshot VirtIO rootfs topology.
+    # `tools/thekernel.py` fixes ordinary product boots to the module path.
     rootfs_transport: RootfsTransport = "drive"
     extra_block: Path | None = None
     extra_block_mode: DriveMode = "rw"
@@ -216,15 +212,6 @@ class RunConfig:
     input_path: Path | None = None
 
 
-@dataclass(frozen=True)
-class _DrivePlan:
-    source: Path
-    runtime: Path
-    mode: DriveMode
-    label: str
-    compression_suffix: str | None
-
-
 def _initrd_from_extra_args(extra_args: tuple[str, ...]) -> Path | None:
     """Extract the only supported file-valued initrd option fail-closed."""
 
@@ -240,12 +227,6 @@ def _initrd_from_extra_args(extra_args: tuple[str, ...]) -> Path | None:
     if not path.is_file():
         raise RunnerError(f"initrd does not exist: {path}")
     return path
-
-
-def normalize_arch(value: str) -> Arch:
-    if value in {"x86", "x86_64"}:
-        return "x86_64"
-    raise RunnerError(f"unsupported architecture: {value}")
 
 
 def _resolve_ovmf_image(
@@ -299,54 +280,13 @@ def _plan_drive(
     *,
     mode: DriveMode,
     label: str,
-    workdir: Path,
-) -> _DrivePlan:
+) -> Drive:
     source = source.expanduser().resolve()
     if not source.is_file():
         raise RunnerError(f"{label} image does not exist: {source}")
     if source.stat().st_size == 0:
         raise RunnerError(f"{label} image is empty: {source}")
-    runtime = source
-    compression_suffix = None
-    if source.name.endswith((".xz", ".gz")):
-        compression_suffix = ".xz" if source.name.endswith(".xz") else ".gz"
-        runtime = (
-            workdir
-            / "images"
-            / f"{label}-{source.name.removesuffix(compression_suffix)}"
-        ).resolve()
-    return _DrivePlan(
-        source=source,
-        runtime=runtime,
-        mode=mode,
-        label=label,
-        compression_suffix=compression_suffix,
-    )
-
-
-def _prepare_drive(plan: _DrivePlan) -> Drive:
-    source = plan.source
-    runtime = plan.runtime
-    if plan.compression_suffix is not None:
-        runtime.parent.mkdir(parents=True, exist_ok=True)
-        temporary = runtime.with_name(f".{runtime.name}.tmp")
-        temporary.unlink(missing_ok=True)
-        opener = lzma.open if plan.compression_suffix == ".xz" else gzip.open
-        try:
-            with opener(source, "rb") as input_file, temporary.open("wb") as output_file:
-                shutil.copyfileobj(input_file, output_file, length=1024 * 1024)
-            if temporary.stat().st_size == 0:
-                raise RunnerError(f"decompressed {plan.label} image is empty: {source}")
-            temporary.replace(runtime)
-        except RunnerError:
-            temporary.unlink(missing_ok=True)
-            raise
-        except (OSError, EOFError, lzma.LZMAError) as error:
-            temporary.unlink(missing_ok=True)
-            raise RunnerError(
-                f"could not decompress {plan.label} image {source}: {error}"
-            ) from error
-    return Drive(path=runtime, mode=plan.mode)
+    return Drive(path=source, mode=mode)
 
 
 def _open_qemu_input(
@@ -487,31 +427,20 @@ def run(
     _validate_virgl_capabilities(config.graphics_profile, qemu_executable)
     _validate_venus_capabilities(config.graphics_profile, qemu_executable)
 
-    if config.rootfs_transport not in {"drive", "module", "module-and-drive"}:
+    if config.rootfs_transport not in {"drive", "module"}:
         raise RunnerError(f"unsupported rootfs transport: {config.rootfs_transport}")
-    rootfs_plan = (
-        _plan_drive(
-            config.rootfs,
-            mode=rootfs_mode,
-            label="rootfs",
-            workdir=workdir,
-        )
-        if config.rootfs is not None
-        and config.rootfs_transport in {"drive", "module-and-drive"}
+    rootfs = (
+        _plan_drive(config.rootfs, mode=rootfs_mode, label="rootfs")
+        if config.rootfs is not None and config.rootfs_transport == "drive"
         else None
     )
-    extra_plan = (
-        _plan_drive(
-            config.extra_block,
-            mode=extra_mode,
-            label="extra",
-            workdir=workdir,
-        )
+    extra_block = (
+        _plan_drive(config.extra_block, mode=extra_mode, label="extra")
         if config.extra_block is not None
         else None
     )
 
-    esp_plan = None
+    esp = None
     ovmf_code = None
     ovmf_vars_source = None
     ovmf_vars_runtime = None
@@ -520,12 +449,7 @@ def run(
             raise RunnerError(
                 "x86_64 UEFI boot requires a GPT ESP; pass --esp or use --direct-kernel"
             )
-        esp_plan = _plan_drive(
-            config.esp,
-            mode="snapshot",
-            label="esp",
-            workdir=workdir,
-        )
+        esp = _plan_drive(config.esp, mode="snapshot", label="esp")
         ovmf_code = _resolve_ovmf_image(
             config.ovmf_code,
             "THEKERNEL_OVMF_CODE",
@@ -549,32 +473,24 @@ def run(
         ovmf_vars_runtime = (workdir / "firmware" / "OVMF_VARS.fd").resolve()
 
     run_input_paths = [kernel]
-    if rootfs_plan is not None:
-        run_input_paths.append(rootfs_plan.source)
+    if rootfs is not None:
+        run_input_paths.append(rootfs.path)
     if input_path is not None:
         run_input_paths.append(input_path)
     if initrd is not None:
         run_input_paths.append(initrd)
-    if esp_plan is not None:
-        run_input_paths.append(esp_plan.source)
+    if esp is not None:
+        run_input_paths.append(esp.path)
     if ovmf_code is not None:
         run_input_paths.append(ovmf_code)
     if ovmf_vars_source is not None:
         run_input_paths.append(ovmf_vars_source)
-    if extra_plan is not None:
-        run_input_paths.append(extra_plan.source)
+    if extra_block is not None:
+        run_input_paths.append(extra_block.path)
     if qemu_executable is not None:
         run_input_paths.append(qemu_executable)
 
     planned_outputs: list[tuple[str, Path]] = []
-    for plan in (rootfs_plan, extra_plan, esp_plan):
-        if plan is not None and plan.compression_suffix is not None:
-            planned_outputs.extend(
-                [
-                    (f"{plan.label} runtime", plan.runtime),
-                    (f"{plan.label} runtime temporary", _temporary_destination(plan.runtime)),
-                ]
-            )
     if ovmf_vars_runtime is not None:
         planned_outputs.extend(
             [
@@ -606,9 +522,6 @@ def run(
     for checkpoint in checkpoints:
         if checkpoint.screenshot is not None:
             checkpoint.screenshot.parent.mkdir(parents=True, exist_ok=True)
-    rootfs = _prepare_drive(rootfs_plan) if rootfs_plan is not None else None
-    extra_block = _prepare_drive(extra_plan) if extra_plan is not None else None
-    esp = _prepare_drive(esp_plan) if esp_plan is not None else None
     if ovmf_vars_source is not None and ovmf_vars_runtime is not None:
         ovmf_vars_runtime = _copy_ovmf_vars(ovmf_vars_source, ovmf_vars_runtime)
 
@@ -682,7 +595,6 @@ def run(
 
         if input_path is None:
             return run_process(
-                arch=config.arch,
                 command=command,
                 workdir=workdir,
                 log_path=log_path,
@@ -698,12 +610,10 @@ def run(
                 qmp_timeout_secs=config.qmp.timeout_secs,
                 qmp_screenshot_size=config.qmp.screenshot_size,
                 qmp_screenshot_color_blocks=config.qmp.screenshot_color_blocks,
-                qmp_screenshot_region_crcs=config.qmp.screenshot_region_crcs,
                 qmp_checkpoints=checkpoints,
             )
         with input_path.open("rb") as input_stream:
             return run_process(
-                arch=config.arch,
                 command=command,
                 workdir=workdir,
                 log_path=log_path,
@@ -720,7 +630,6 @@ def run(
                 qmp_timeout_secs=config.qmp.timeout_secs,
                 qmp_screenshot_size=config.qmp.screenshot_size,
                 qmp_screenshot_color_blocks=config.qmp.screenshot_color_blocks,
-                qmp_screenshot_region_crcs=config.qmp.screenshot_region_crcs,
                 qmp_checkpoints=checkpoints,
             )
     finally:

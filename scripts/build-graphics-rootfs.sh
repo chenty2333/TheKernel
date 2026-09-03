@@ -163,12 +163,27 @@ validate_checked_in() {
     grep -qx '.*-g seat' "$REPO_ROOT/config/graphics/overlay/common/etc/init.d/S70seatd"
     grep -Fqx '    if ! chown root:seat /run/seatd.sock || ! chmod 0660 /run/seatd.sock; then' "$REPO_ROOT/config/graphics/overlay/common/etc/init.d/S70seatd"
     grep -qx '.*-c "\$USER".*' "$REPO_ROOT/config/graphics/overlay/common/etc/init.d/S80weston"
-    grep -qx 'FLAVOR_FILE=/etc/thekernel-graphics-flavor' "$REPO_ROOT/config/graphics/overlay/common/etc/init.d/S80weston"
+    ! grep -q 'FLAVOR_FILE' "$REPO_ROOT/config/graphics/overlay/common/etc/init.d/S80weston"
     ! grep -q 'THEKERNEL_GRAPHICS_FLAVOR' "$REPO_ROOT/config/graphics/overlay/common/etc/init.d/S80weston"
     grep -qx 'export XDG_RUNTIME_DIR="\$runtime_dir"' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-session"
     grep -qx 'export LIBSEAT_BACKEND=seatd' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-session"
+    grep -qx 'exec weston --config=/etc/weston/weston.ini \\' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-session"
     grep -qx '/usr/local/bin/drm-uapi-oracle' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-abi-smoke"
     grep -qx '/usr/local/bin/evdev-uapi-oracle' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-abi-smoke"
+    # The session config is flavor-independent; each overlay selects its Weston
+    # configuration through a relative /etc/weston/weston.ini symlink.  The
+    # target may live in another overlay, so check the link, not the content.
+    weston_ini_link() {
+        local link=$REPO_ROOT/config/graphics/overlay/$1/etc/weston/weston.ini
+        [ -L "$link" ] || { printf 'missing weston.ini symlink: %s\n' "$link" >&2; return 1; }
+        [ "$(readlink "$link")" = "$2" ] || {
+            printf 'weston.ini symlink must target %s: %s\n' "$2" "$link" >&2; return 1;
+        }
+    }
+    case "$flavor_backend" in
+        headless-backend.so) weston_ini_link "$flavor_overlay" weston-headless.ini ;;
+        drm-backend.so) weston_ini_link "$flavor_overlay" weston-drm.ini ;;
+    esac
     case "$flavor" in
         headless-abi-smoke)
             grep -qx 'BR2_ROOTFS_POST_BUILD_SCRIPT="@REPO_ROOT@/config/graphics/build-guest-tools.sh"' "$fragment"
@@ -225,7 +240,7 @@ validate_checked_in() {
             grep -qx 'BR2_PACKAGE_VULKAN_LOADER=y' "$fragment"
             grep -qx 'BR2_PACKAGE_VULKAN_TOOLS=y' "$fragment"
             grep -qx 'BR2_TARGET_ROOTFS_EXT2_SIZE="512M"' "$fragment"
-            grep -qx 'q35-software-desktop' "$REPO_ROOT/config/graphics/overlay/q35-graphics-benchmark/etc/thekernel-graphics-flavor"
+            grep -qx 'q35-graphics-benchmark' "$REPO_ROOT/config/graphics/overlay/q35-graphics-benchmark/etc/thekernel-graphics-flavor"
             [ -x "$REPO_ROOT/config/graphics/overlay/q35-graphics-benchmark/etc/init.d/S90q35-graphics-benchmark" ]
             [ -x "$REPO_ROOT/config/graphics/build-q35-graphics-benchmark-tools.sh" ]
             [ -r "$REPO_ROOT/config/graphics/q35-drm-modeset-restore.c" ]
@@ -321,6 +336,7 @@ validate_build_output() {
     [ -x "$target/etc/init.d/S10udevd" ]
     [ -x "$target/etc/init.d/S70seatd" ]
     [ -x "$target/etc/init.d/S80weston" ]
+    [ -e "$target/etc/weston/weston.ini" ]
     validate_busybox_stat_output "$target"
     [ -x "$target/usr/local/bin/drm-uapi-oracle" ]
     [ -x "$target/usr/local/bin/evdev-uapi-oracle" ]

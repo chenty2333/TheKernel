@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gzip
 import re
 import subprocess
 import sys
@@ -159,10 +158,7 @@ class RunnerTests(unittest.TestCase):
                 direct_kernel=True,
                 extra_args=("-initrd", str(initrd)),
             )
-            expected = RunResult(
-                arch="x86_64", command=("qemu",), returncode=0, duration_ms=1,
-                log_path=config.log_path, workdir=config.workdir,
-            )
+            expected = RunResult(returncode=0, log_path=config.log_path)
 
             def complete_run(**kwargs):
                 command = kwargs["command"]
@@ -236,14 +232,7 @@ class RunnerTests(unittest.TestCase):
                 ovmf_code=ovmf_code,
                 ovmf_vars=ovmf_vars,
             )
-            expected = RunResult(
-                arch="x86_64",
-                command=("qemu",),
-                returncode=0,
-                duration_ms=1,
-                log_path=config.log_path,
-                workdir=config.workdir,
-            )
+            expected = RunResult(returncode=0, log_path=config.log_path)
 
             def complete_run(**kwargs):
                 command = kwargs["command"]
@@ -302,43 +291,12 @@ class RunnerTests(unittest.TestCase):
                 qemu_binary=sys.executable,
                 direct_kernel=True,
             )
-            expected = RunResult(
-                arch="x86_64", command=("qemu",), returncode=0, duration_ms=1,
-                log_path=config.log_path, workdir=config.workdir,
-            )
+            expected = RunResult(returncode=0, log_path=config.log_path)
             with patch("tools.qemu_runner.runner.run_process", return_value=expected) as mocked:
                 self.assertIs(run(config), expected)
             command = " ".join(mocked.call_args.kwargs["command"])
             self.assertNotIn("drive=rootfs", command)
             self.assertNotIn("id=rootfs", command)
-
-    def test_module_and_drive_rootfs_keeps_module_boot_and_attaches_snapshot_vda(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            kernel = root / "kernel"
-            rootfs = root / "root.img"
-            kernel.write_bytes(b"kernel")
-            rootfs.write_bytes(b"rootfs")
-            config = RunConfig(
-                arch="x86_64",
-                kernel=kernel,
-                rootfs=rootfs,
-                rootfs_transport="module-and-drive",
-                rootfs_mode="snapshot",
-                workdir=root / "run",
-                log_path=root / "run" / "console.log",
-                qemu_binary=sys.executable,
-                direct_kernel=True,
-            )
-            expected = RunResult(
-                arch="x86_64", command=("qemu",), returncode=0, duration_ms=1,
-                log_path=config.log_path, workdir=config.workdir,
-            )
-            with patch("tools.qemu_runner.runner.run_process", return_value=expected) as mocked:
-                self.assertIs(run(config), expected)
-            command = " ".join(mocked.call_args.kwargs["command"])
-            self.assertIn("id=rootfs,snapshot=on", command)
-            self.assertIn("virtio-blk-pci,drive=rootfs", command)
 
     def test_graphics_benchmark_drive_matches_linux_snapshot_pci_topology(self) -> None:
         """TheKernel and Linux boot the same snapshot-backed Q35/VirtIO topology."""
@@ -356,10 +314,7 @@ class RunnerTests(unittest.TestCase):
 
             def capture(**kwargs):
                 commands.append(kwargs["command"])
-                return RunResult(
-                    arch="x86_64", command=kwargs["command"], returncode=0, duration_ms=1,
-                    log_path=kwargs["log_path"], workdir=kwargs["workdir"],
-                )
+                return RunResult(returncode=0, log_path=kwargs["log_path"])
 
             common = dict(
                 arch="x86_64", kernel=kernel, rootfs=rootfs, rootfs_mode="snapshot",
@@ -385,61 +340,17 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("id=rootfs,snapshot=on", normalize(commands[1]))
             self.assertIn("virtio-blk-pci,drive=rootfs", normalize(commands[1]))
 
-    def test_normal_run_uses_run_local_decompression(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            kernel = root / "kernel"
-            rootfs = root / "root.img.gz"
-            commands = root / "commands"
-            kernel.write_bytes(b"kernel")
-            commands.write_bytes(b"guest command\n")
-            with gzip.open(rootfs, "wb") as output:
-                output.write(b"rootfs")
-            config = RunConfig(
-                arch="x86_64",
-                kernel=kernel,
-                rootfs=rootfs,
-                workdir=root / "run",
-                log_path=root / "run" / "console.log",
-                qemu_binary=sys.executable,
-                direct_kernel=True,
-                input_path=commands,
-                interaction=Interaction(interactive=True, input_after_marker="READY"),
-            )
-            expected = RunResult(
-                arch="x86_64",
-                command=("qemu",),
-                returncode=0,
-                duration_ms=1,
-                log_path=config.log_path,
-                workdir=config.workdir,
-            )
-
-            def complete_run(**kwargs):
-                kwargs["log_path"].write_bytes(b"guest console\n")
-                return expected
-
-            with patch(
-                "tools.qemu_runner.runner.run_process", side_effect=complete_run
-            ) as mocked:
-                self.assertIs(run(config), expected)
-
-            command = " ".join(mocked.call_args.kwargs["command"])
-            runtime_rootfs = config.workdir / "images" / "rootfs-root.img"
-            self.assertIn("/proc/self/fd/", command)
-            self.assertEqual(runtime_rootfs.read_bytes(), b"rootfs")
     def test_explicit_artifacts_are_composed_without_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             kernel = root / "kernel"
             rootfs = root / "root.img"
-            extra = root / "extra.img.gz"
+            extra = root / "extra.img"
             commands = root / "commands"
             kernel.write_bytes(b"kernel")
             rootfs.write_bytes(b"rootfs")
             commands.write_bytes(b"exit\n")
-            with gzip.open(extra, "wb") as output:
-                output.write(b"extra")
+            extra.write_bytes(b"extra")
             config = RunConfig(
                 arch="x86_64",
                 kernel=kernel,
@@ -452,14 +363,7 @@ class RunnerTests(unittest.TestCase):
                 input_path=commands,
                 interaction=Interaction(interactive=True, input_after_marker="READY"),
             )
-            expected = RunResult(
-                arch="x86_64",
-                command=("qemu",),
-                returncode=0,
-                duration_ms=1,
-                log_path=config.log_path,
-                workdir=config.workdir,
-            )
+            expected = RunResult(returncode=0, log_path=config.log_path)
 
             def complete_run(**kwargs):
                 kwargs["log_path"].write_bytes(b"guest console\n")
@@ -489,10 +393,7 @@ class RunnerTests(unittest.TestCase):
                 qemu_binary=sys.executable, direct_kernel=True,
                 extra_args=("-initrd", str(initrd)),
             )
-            expected = RunResult(
-                arch="x86_64", command=("qemu",), returncode=0, duration_ms=1,
-                log_path=config.log_path, workdir=config.workdir,
-            )
+            expected = RunResult(returncode=0, log_path=config.log_path)
 
             def complete_run(**kwargs):
                 for path in (kernel, rootfs, extra, initrd):
@@ -569,58 +470,6 @@ class RunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(RunnerError, "log aliases"):
                     run(config)
             mocked.assert_not_called()
-            self.assertEqual(kernel.read_bytes(), b"kernel")
-
-    def test_compressed_rootfs_runtime_must_not_overwrite_kernel(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            workdir = root / "run"
-            kernel = workdir / "images" / "rootfs-root.img"
-            rootfs = root / "root.img.gz"
-            kernel.parent.mkdir(parents=True)
-            kernel.write_bytes(b"kernel")
-            with gzip.open(rootfs, "wb") as output:
-                output.write(b"rootfs")
-            config = RunConfig(
-                arch="x86_64",
-                kernel=kernel,
-                rootfs=rootfs,
-                workdir=workdir,
-                log_path=workdir / "console.log",
-                qemu_binary=sys.executable,
-                direct_kernel=True,
-            )
-
-            with patch("tools.qemu_runner.runner.run_process") as mocked:
-                with self.assertRaisesRegex(RunnerError, "rootfs runtime aliases"):
-                    run(config)
-            mocked.assert_not_called()
-            self.assertEqual(kernel.read_bytes(), b"kernel")
-
-    def test_compressed_rootfs_runtime_must_not_overwrite_hardlinked_input(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            workdir = root / "run"
-            kernel = root / "kernel"
-            runtime = workdir / "images" / "rootfs-root.img"
-            rootfs = root / "root.img.gz"
-            kernel.write_bytes(b"kernel")
-            runtime.parent.mkdir(parents=True)
-            runtime.hardlink_to(kernel)
-            with gzip.open(rootfs, "wb") as output:
-                output.write(b"rootfs")
-            config = RunConfig(
-                arch="x86_64",
-                kernel=kernel,
-                rootfs=rootfs,
-                workdir=workdir,
-                log_path=workdir / "console.log",
-                qemu_binary=sys.executable,
-                direct_kernel=True,
-            )
-
-            with self.assertRaisesRegex(RunnerError, "rootfs runtime aliases"):
-                run(config)
             self.assertEqual(kernel.read_bytes(), b"kernel")
 
     def test_ovmf_vars_runtime_must_not_overwrite_kernel(self) -> None:

@@ -11,25 +11,7 @@ export LIBSEAT_BACKEND=seatd
 [ "$(stat -c %u "$XDG_RUNTIME_DIR")" = "$(id -u)" ]
 [ "$(stat -c %a "$XDG_RUNTIME_DIR")" = 700 ]
 
-case "${1:-}" in
-    headless-abi-smoke)
-        exec weston --config=/etc/weston/weston-headless.ini \
-            --log="$XDG_RUNTIME_DIR/weston.log"
-        ;;
-    q35-software-desktop)
-        exec weston --config=/etc/weston/weston-drm.ini \
-            --log="$XDG_RUNTIME_DIR/weston.log"
-        ;;
-    q35-graphics-seatd)
-        exec weston --config=/etc/weston/weston-drm.ini \
-            --log="$XDG_RUNTIME_DIR/weston.log"
-        ;;
-    q35-venus-desktop)
-        exec weston --config=/etc/weston/weston-drm.ini \
-            --log="$XDG_RUNTIME_DIR/weston.log"
-        ;;
-    *)
-        echo "Usage: $0 {headless-abi-smoke|q35-graphics-seatd|q35-software-desktop|q35-venus-desktop}" >&2
-        exit 2
-        ;;
-esac
+# Each flavor overlay links /etc/weston/weston.ini to its checked-in headless
+# or DRM configuration, so the session itself is flavor-independent.
+exec weston --config=/etc/weston/weston.ini \
+    --log="$XDG_RUNTIME_DIR/weston.log"

@@ -270,22 +270,22 @@ jobs:
 
       - name: Build Q35 product image once
         run: |
-          ./tools/thekernel.py build --machine q35 --firmware uefi --smp 4
+          ./tools/thekernel.py build --smp 4
 
       - name: Lint Q35 product image
         run: |
-          ./tools/thekernel.py lint --machine q35 --firmware uefi --smp 4
+          ./tools/thekernel.py lint --smp 4
 
       - name: Run Q35 guest system tests
         run: |
-          ./tools/thekernel.py system-test --machine q35 --firmware uefi \
+          ./tools/thekernel.py system-test \
             --smp 4 --accel tcg --no-build
 
       - name: Stage the single Panther Lake product hand-off
         run: |
           set -euo pipefail
           artifact_dir="$PWD/.state/ci/panther-lake-product"
-          product_dir="$THEKERNEL_STATE_DIR/out/x86_64/q35-uefi/system/smp4-mem1g"
+          product_dir="$THEKERNEL_STATE_DIR/out/x86_64/q35-uefi/system/mem1g"
           mkdir -p "$artifact_dir"
           cp "$product_dir/kernel-x86_64" "$artifact_dir/kernel-x86_64"
           cp "$product_dir/kernel-x86_64.esp" "$artifact_dir/kernel-x86_64.esp"
@@ -318,7 +318,7 @@ jobs:
           set -euo pipefail
           graphics_state="$PWD/.state/ci/graphics"
           ./tools/thekernel.py graphics-smoke \
-            --machine q35 --firmware uefi --smp 4 \
+            --smp 4 \
             --accel tcg --timeout 300 \
             --rootfs "$graphics_state/q35-graphics-seatd/images/rootfs.ext2" \
             --flavor q35-graphics-seatd \

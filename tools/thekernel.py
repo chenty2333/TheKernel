@@ -13,8 +13,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -78,7 +79,6 @@ def state_root() -> Path:
 
 @dataclass(frozen=True)
 class Variant:
-    cpus: int
     memory: str
     asid_fast_switch: bool = False
 
@@ -93,7 +93,7 @@ class Variant:
     @property
     def name(self) -> str:
         suffix = "-asid-fast-switch" if self.asid_fast_switch else ""
-        return f"smp{self.cpus}-mem{self.memory.lower()}{suffix}"
+        return f"mem{self.memory.lower()}{suffix}"
 
 
 @dataclass(frozen=True)
@@ -152,7 +152,7 @@ def parse_variant(args: argparse.Namespace) -> Variant:
     memory = args.memory.upper()
     if not MEMORY_RE.fullmatch(memory):
         raise ProductError(f"--memory must be a positive K/M/G size: {args.memory}")
-    variant = Variant(cpus=args.smp, memory=memory, asid_fast_switch=args.asid_fast_switch)
+    variant = Variant(memory=memory, asid_fast_switch=args.asid_fast_switch)
     if variant.memory_bytes <= KERNEL_LOAD_PADDR:
         raise ProductError("--memory must extend beyond the 2 MiB kernel load address")
     if variant.memory_bytes > X86_64_MAX_MEMORY_BYTES:
@@ -166,15 +166,14 @@ def parse_variant(args: argparse.Namespace) -> Variant:
     return variant
 
 
-def resolve_run_cpus(artifacts: Artifacts, run_cpus: int | None) -> int:
-    """Select the QEMU CPU count without changing the built artifact variant."""
+def resolve_run_cpus(max_cpus: int, run_cpus: int | None) -> int:
+    """Select the QEMU CPU count within the --smp bound."""
 
     if run_cpus is None:
-        return artifacts.variant.cpus
-    if run_cpus < 1 or run_cpus > artifacts.variant.cpus:
+        return max_cpus
+    if run_cpus < 1 or run_cpus > max_cpus:
         raise ProductError(
-            "--run-cpus must be an integer between 1 and the artifact "
-            f"--smp value ({artifacts.variant.cpus}): {run_cpus}"
+            f"--run-cpus must be an integer between 1 and --smp ({max_cpus}): {run_cpus}"
         )
     return run_cpus
 
@@ -493,44 +492,46 @@ def prune_run_dirs(runs_root: Path, keep: Path) -> None:
         shutil.rmtree(entry, ignore_errors=True)
 
 
-def run_product(
-    artifacts: Artifacts,
-    *,
-    accel: str,
-    timeout: float,
-    workdir: Path | None,
-    interactive: bool,
-    input_after_marker: str | None,
-    stop_after_marker: str | None,
-    commands: Path | None,
-    extra_block: Path | None,
-    shutdown_after_marker: bool = False,
-    reject_ktap_skips: bool = False,
-    graphics_profile: str = "headless",
-    rootfs: Path | None = None,
-    rootfs_transport: str = "module",
-    qmp_screenshot: Path | None = None,
-    qmp_screenshot_after_marker: str | None = None,
-    qmp_screenshot_size: tuple[int, int] | None = None,
-    qmp_screenshot_color_blocks: tuple[QmpColorBlock, ...] = (),
-    qmp_checkpoints: tuple[QmpCheckpoint, ...] = (),
-    qmp_timeout_secs: float = 5.0,
-    graphics_width: int = 800,
-    graphics_height: int = 600,
-    run_cpus: int | None = None,
-) -> int:
+@dataclass(frozen=True)
+class RunSpec:
+    """One product boot: every run_product input as data."""
+
+    accel: str
+    timeout: float
+    workdir: Path | None
+    interactive: bool
+    input_after_marker: str | None
+    stop_after_marker: str | None
+    commands: Path | None
+    extra_block: Path | None
+    run_cpus: int
+    shutdown_after_marker: bool = False
+    reject_ktap_skips: bool = False
+    graphics_profile: str = "headless"
+    rootfs: Path | None = None
+    rootfs_transport: str = "module"
+    qmp_screenshot: Path | None = None
+    qmp_screenshot_after_marker: str | None = None
+    qmp_screenshot_size: tuple[int, int] | None = None
+    qmp_screenshot_color_blocks: tuple[QmpColorBlock, ...] = ()
+    qmp_checkpoints: tuple[QmpCheckpoint, ...] = ()
+    qmp_timeout_secs: float = 5.0
+    graphics_width: int = 800
+    graphics_height: int = 600
+
+
+def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
     try:
-        selected_esp = artifacts.esp_for_rootfs_transport(rootfs_transport)
+        selected_esp = artifacts.esp_for_rootfs_transport(spec.rootfs_transport)
     except ProductError:
         raise ProductError("the x86 product supports only module or drive rootfs transport") from None
     if not artifacts.kernel.is_file() or not selected_esp.is_file():
         raise ProductError("kernel and ESP are required; run `thekernel.py build` first")
-    selected_rootfs = rootfs if rootfs is not None else artifacts.rootfs
+    selected_rootfs = spec.rootfs if spec.rootfs is not None else artifacts.rootfs
     if not selected_rootfs.is_file():
         raise ProductError("rootfs is required; run `thekernel.py rootfs` first")
-    qemu_cpus = resolve_run_cpus(artifacts, run_cpus)
-    if workdir is not None:
-        run_dir = workdir.expanduser().resolve()
+    if spec.workdir is not None:
+        run_dir = spec.workdir.expanduser().resolve()
     else:
         runs_root = artifacts.root / "runs"
         runs_root.mkdir(parents=True, exist_ok=True)
@@ -540,9 +541,11 @@ def run_product(
         run_dir.mkdir(parents=True, exist_ok=True)
     except OSError as error:
         raise ProductError(f"cannot create run directory: {error}") from error
+    interactive = spec.interactive
+    input_after_marker = spec.input_after_marker
     command_path = None
-    if shutdown_after_marker:
-        if commands is not None or input_after_marker is not None or stop_after_marker is not None:
+    if spec.shutdown_after_marker:
+        if spec.commands is not None or spec.input_after_marker is not None or spec.stop_after_marker is not None:
             raise ProductError("system shutdown-after-marker cannot combine custom marker or command input")
         command_path = run_dir / "system-test-shutdown.commands"
         try:
@@ -551,59 +554,59 @@ def run_product(
             raise ProductError(f"cannot write system-test shutdown command: {error}") from error
         input_after_marker = COMPLETION_MARKER
         interactive = True
-    if commands is not None:
-        command_path = commands.expanduser().resolve()
+    if spec.commands is not None:
+        command_path = spec.commands.expanduser().resolve()
         if not command_path.is_file():
             raise ProductError(f"commands file does not exist: {command_path}")
     qmp = QmpControls()
-    if qmp_screenshot is not None or qmp_checkpoints:
+    if spec.qmp_screenshot is not None or spec.qmp_checkpoints:
         qmp = QmpControls(
             socket=run_dir / "graphics-smoke.qmp",
-            screenshot=(None if qmp_checkpoints else qmp_screenshot.expanduser().resolve()),
-            screenshot_after_marker=(None if qmp_checkpoints else qmp_screenshot_after_marker),
-            screenshot_size=(None if qmp_checkpoints else qmp_screenshot_size),
-            screenshot_color_blocks=( () if qmp_checkpoints else qmp_screenshot_color_blocks),
-            checkpoints=qmp_checkpoints,
-            timeout_secs=qmp_timeout_secs,
+            screenshot=(None if spec.qmp_checkpoints else spec.qmp_screenshot.expanduser().resolve()),
+            screenshot_after_marker=(None if spec.qmp_checkpoints else spec.qmp_screenshot_after_marker),
+            screenshot_size=(None if spec.qmp_checkpoints else spec.qmp_screenshot_size),
+            screenshot_color_blocks=( () if spec.qmp_checkpoints else spec.qmp_screenshot_color_blocks),
+            checkpoints=spec.qmp_checkpoints,
+            timeout_secs=spec.qmp_timeout_secs,
         )
     result = run(
         RunConfig(
             arch="x86_64",
             kernel=artifacts.kernel,
             rootfs=selected_rootfs,
-            rootfs_transport=rootfs_transport,
+            rootfs_transport=spec.rootfs_transport,
             esp=selected_esp,
-            extra_block=extra_block.expanduser().resolve() if extra_block else None,
+            extra_block=spec.extra_block.expanduser().resolve() if spec.extra_block else None,
             input_path=command_path,
             workdir=run_dir,
             log_path=run_dir / "console.log",
-            limits=RunLimits(total_timeout_secs=timeout),
+            limits=RunLimits(total_timeout_secs=spec.timeout),
             interaction=Interaction(
                 interactive=interactive or command_path is not None,
                 input_after_marker=input_after_marker,
-                stop_after_marker=stop_after_marker,
+                stop_after_marker=spec.stop_after_marker,
             ),
             memory=artifacts.variant.memory,
-            cpus=qemu_cpus,
-            accel=accel,
-            graphics_profile=graphics_profile,
-            graphics_width=graphics_width,
-            graphics_height=graphics_height,
+            cpus=spec.run_cpus,
+            accel=spec.accel,
+            graphics_profile=spec.graphics_profile,
+            graphics_width=spec.graphics_width,
+            graphics_height=spec.graphics_height,
             qmp=qmp,
         ),
     )
     print(f"qemu-runner exit={result.returncode} log={result.log_path}", file=sys.stderr)
     if result.error_message is not None:
         print(f"qemu-runner error={result.error_message}", file=sys.stderr)
-    if stop_after_marker is not None:
+    if spec.stop_after_marker is not None:
         if result.intentionally_stopped:
             return 0
         print(
-            f"thekernel: guest exited without completion marker: {stop_after_marker}",
+            f"thekernel: guest exited without completion marker: {spec.stop_after_marker}",
             file=sys.stderr,
         )
         return result.returncode if result.returncode != 0 else 1
-    if result.guest_clean_shutdown and reject_ktap_skips:
+    if result.guest_clean_shutdown and spec.reject_ktap_skips:
         reject_ktap_skips_in_log(result.log_path)
     return result.returncode
 
@@ -635,7 +638,7 @@ def build_cmd(args: argparse.Namespace) -> int:
 
 
 def rootfs_cmd(_args: argparse.Namespace) -> int:
-    artifacts = Artifacts(state_root(), Variant(cpus=1, memory="128M"), "system")
+    artifacts = Artifacts(state_root(), Variant(memory="128M"), "system")
     build_rootfs(artifacts)
     print(artifacts.rootfs)
     return 0
@@ -674,7 +677,7 @@ def clean_cmd(_args: argparse.Namespace) -> int:
 
 def run_cmd(args: argparse.Namespace) -> int:
     artifacts = Artifacts(state_root(), parse_variant(args), args.profile)
-    run_cpus = resolve_run_cpus(artifacts, args.run_cpus)
+    run_cpus = resolve_run_cpus(args.smp, args.run_cpus)
     rootfs = Path(args.rootfs).expanduser().resolve() if args.rootfs else None
     if rootfs is not None and not rootfs.is_file():
         raise ProductError(f"rootfs does not exist: {rootfs}")
@@ -691,42 +694,198 @@ def run_cmd(args: argparse.Namespace) -> int:
         input_after_marker = "THEKERNEL_SHELL_READY"
     return run_product(
         artifacts,
-        accel=args.accel,
-        timeout=args.timeout,
-        workdir=Path(args.workdir) if args.workdir else None,
-        interactive=args.interactive,
-        graphics_profile=args.graphics_profile,
-        input_after_marker=input_after_marker,
-        stop_after_marker=args.stop_after_marker,
-        commands=Path(args.commands) if args.commands else None,
-        extra_block=Path(args.extra_block) if args.extra_block else None,
-        rootfs=rootfs,
-        rootfs_transport="module",
-        run_cpus=run_cpus,
+        RunSpec(
+            accel=args.accel,
+            timeout=args.timeout,
+            workdir=Path(args.workdir) if args.workdir else None,
+            interactive=args.interactive,
+            graphics_profile=args.graphics_profile,
+            input_after_marker=input_after_marker,
+            stop_after_marker=args.stop_after_marker,
+            commands=Path(args.commands) if args.commands else None,
+            extra_block=Path(args.extra_block) if args.extra_block else None,
+            rootfs=rootfs,
+            rootfs_transport="module",
+            run_cpus=run_cpus,
+        ),
     )
 
 
 def system_test_cmd(args: argparse.Namespace) -> int:
     artifacts = Artifacts(state_root(), parse_variant(args), "system")
-    run_cpus = resolve_run_cpus(artifacts, args.run_cpus)
+    run_cpus = resolve_run_cpus(args.smp, args.run_cpus)
     if not args.no_build:
         build_rootfs(artifacts)
         build_kernel(artifacts)
     return run_product(
         artifacts,
-        accel=args.accel,
-        timeout=args.timeout,
-        workdir=Path(args.workdir) if args.workdir else None,
-        interactive=False,
-        graphics_profile="headless",
-        input_after_marker=None,
-        stop_after_marker=None,
-        commands=None,
-        extra_block=None,
-        shutdown_after_marker=True,
-        reject_ktap_skips=not args.allow_skip,
-        rootfs_transport="module",
-        run_cpus=run_cpus,
+        RunSpec(
+            accel=args.accel,
+            timeout=args.timeout,
+            workdir=Path(args.workdir) if args.workdir else None,
+            interactive=False,
+            graphics_profile="headless",
+            input_after_marker=None,
+            stop_after_marker=None,
+            commands=None,
+            extra_block=None,
+            shutdown_after_marker=True,
+            reject_ktap_skips=not args.allow_skip,
+            rootfs_transport="module",
+            run_cpus=run_cpus,
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class SmokeFlavor:
+    """One graphics smoke flavor's marker and pixel oracle as data."""
+
+    marker: str
+    profile_markers: Mapping[str, str] = field(default_factory=dict)
+    screenshot_size: tuple[int, int] | None = None
+    screenshot_color_blocks: tuple[QmpColorBlock, ...] = ()
+    qmp_timeout_secs: float = 120.0
+
+
+SMOKE_FLAVORS = {
+    # Pure boot smoke: the headless ABI guest has no pixel oracle.
+    "headless-abi-smoke": SmokeFlavor(marker="THEKERNEL_GRAPHICS_ABI_SMOKE_READY"),
+    "q35-graphics-seatd": SmokeFlavor(
+        marker="THEKERNEL_Q35_WESTON_READY",
+        profile_markers={
+            "virgl-interactive": "THEKERNEL_Q35_VIRGL_READY",
+            "venus-interactive": "THEKERNEL_Q35_VENUS_READY",
+        },
+        screenshot_size=(800, 600),
+        screenshot_color_blocks=(QmpColorBlock(300, 200, 200, 200, (255, 0, 0)),),
+    ),
+    "q35-graphics-logind": SmokeFlavor(
+        marker="THEKERNEL_Q35_SWAY_READY",
+        qmp_timeout_secs=900.0,
+    ),
+}
+
+
+def _xwayland_smoke_checkpoints(screenshot: Path) -> tuple[QmpCheckpoint, ...]:
+    # The rootless Xwayland client publishes this marker only after its
+    # mapped, drawn, resized, focused, clipboard-owning foreground window
+    # is stacked above the background window.  Inject directly into the
+    # virtio devices while it records the resulting X11 key/pointer events.
+    return (
+        QmpCheckpoint(
+            input_after_marker="THEKERNEL_Q35_XWAYLAND_EVENT_READY",
+            input_events=((
+                {"type": "abs", "data": {"axis": "x", "value": 180}},
+                {"type": "abs", "data": {"axis": "y", "value": 160}},
+                {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}},
+                {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "a"}}},
+            ),),
+            screenshot=screenshot.with_name(f"{screenshot.stem}-xwayland{''.join(screenshot.suffixes)}"),
+            screenshot_after_marker="THEKERNEL_Q35_XWAYLAND_POINTER_EVENT",
+            screenshot_size=(800, 600),
+            screenshot_color_blocks=(QmpColorBlock(160, 150, 32, 32, (255, 32, 64)),),
+        ),
+    )
+
+
+def _logind_smoke_checkpoints(marker: str, screenshot: Path) -> tuple[QmpCheckpoint, ...]:
+    # The guest does not enter its A -> B -> A logind handoff until this
+    # initial pointer checkpoint has reached Alice's persistent Wayland
+    # client.  The final checkpoint observes the same session restored
+    # after all revocation/ACL transitions.
+    checkpoints: list[QmpCheckpoint] = [
+        QmpCheckpoint(
+            input_after_marker=marker,
+            input_events=((
+                {"type": "abs", "data": {"axis": "x", "value": 320}},
+                {"type": "abs", "data": {"axis": "y", "value": 240}},
+            ),),
+            screenshot=screenshot,
+            screenshot_after_marker="THEKERNEL_Q35_SWAY_ALICE_POINTER_REPAINT",
+            screenshot_size=(800, 600),
+            screenshot_color_blocks=(QmpColorBlock(300, 200, 200, 200, (0, 102, 255)),),
+        ),
+    ]
+    for cycle in range(1, 2):
+        checkpoints.append(QmpCheckpoint(
+            input_after_marker=f"THEKERNEL_Q35_LOGIND_CYCLE_BOB_POINTER_READY_{cycle:03d}",
+            input_events=((
+                {"type": "rel", "data": {"axis": "x", "value": 1}},
+            ),),
+        ))
+        checkpoints.append(QmpCheckpoint(
+            input_after_marker=f"THEKERNEL_Q35_LOGIND_CYCLE_ALICE_KEY_READY_{cycle:03d}",
+            input_events=((
+                {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}},
+                {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "a"}}},
+            ),),
+        ))
+    checkpoints.append(
+        QmpCheckpoint(
+            input_after_marker="THEKERNEL_Q35_LOGIND_CYCLES_COMPLETE",
+            screenshot=screenshot.with_name(f"{screenshot.stem}-logind-cycles{''.join(screenshot.suffixes)}"),
+            screenshot_after_marker="THEKERNEL_Q35_LOGIND_CYCLES_COMPLETE",
+            screenshot_size=(800, 600),
+            screenshot_color_blocks=(QmpColorBlock(300, 200, 200, 200, (0, 102, 255)),),
+        )
+    )
+    return tuple(checkpoints)
+
+
+def _seatd_smoke_checkpoints(
+    marker: str,
+    screenshot: Path,
+    size: tuple[int, int],
+    blocks: tuple[QmpColorBlock, ...],
+) -> tuple[QmpCheckpoint, ...]:
+    # QMP drives the virtio keyboard/tablet devices directly.  Every
+    # action waits for the preceding client repaint marker before taking
+    # its own screenshot, so ordering is observable rather than timing
+    # dependent.  The original screenshot remains the initial red SHM
+    # frame; these files carry the later input checkpoints.
+    return (
+        QmpCheckpoint(
+            input_after_marker=marker,
+            screenshot=screenshot,
+            screenshot_after_marker=marker,
+            screenshot_size=size,
+            screenshot_color_blocks=blocks,
+        ),
+        QmpCheckpoint(
+            input_after_marker="THEKERNEL_Q35_WAYLAND_INPUT_READY",
+            input_events=((
+                {"type": "abs", "data": {"axis": "x", "value": 320}},
+                {"type": "abs", "data": {"axis": "y", "value": 240}},
+            ),),
+            screenshot=screenshot.with_name(f"{screenshot.stem}-tablet{''.join(screenshot.suffixes)}"),
+            screenshot_after_marker="THEKERNEL_Q35_WAYLAND_POINTER_REPAINT",
+            screenshot_size=size,
+            screenshot_color_blocks=(QmpColorBlock(300, 200, 200, 200, (0, 102, 255)),),
+        ),
+        QmpCheckpoint(
+            input_after_marker="THEKERNEL_Q35_WAYLAND_POINTER_REPAINT",
+            input_events=((
+                {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}},
+                {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "a"}}},
+            ),),
+            screenshot=screenshot.with_name(f"{screenshot.stem}-key{''.join(screenshot.suffixes)}"),
+            screenshot_after_marker="THEKERNEL_Q35_WAYLAND_KEY_REPAINT",
+            screenshot_size=size,
+            screenshot_color_blocks=(QmpColorBlock(300, 200, 200, 200, (255, 0, 255)),),
+        ),
+        QmpCheckpoint(
+            input_after_marker="THEKERNEL_Q35_WAYLAND_KEY_REPAINT",
+            input_events=((
+                {"type": "rel", "data": {"axis": "x", "value": 8}},
+                {"type": "btn", "data": {"down": True, "button": "left"}},
+                {"type": "btn", "data": {"down": False, "button": "left"}},
+            ),),
+            screenshot=screenshot.with_name(f"{screenshot.stem}-pointer{''.join(screenshot.suffixes)}"),
+            screenshot_after_marker="THEKERNEL_Q35_WAYLAND_BUTTON_REPAINT",
+            screenshot_size=size,
+            screenshot_color_blocks=(QmpColorBlock(300, 200, 200, 200, (0, 204, 102)),),
+        ),
     )
 
 
@@ -746,157 +905,52 @@ def graphics_smoke_cmd(args: argparse.Namespace) -> int:
             "virgl-headless graphics smoke is unsupported: its EGL-headless "
             "display has no QMP pixel-oracle surface; use virgl-interactive"
         )
-    seatd_flavors = {"q35-graphics-seatd", "q35-software-desktop", "q35-venus-desktop"}
-    if args.graphics_profile == "virgl-interactive" and args.flavor not in (seatd_flavors | {"q35-graphics-logind"}):
-        raise ProductError("virgl-interactive graphics smoke requires --flavor q35-graphics-seatd or q35-graphics-logind")
-    if args.graphics_profile == "venus-interactive" and args.flavor not in (seatd_flavors | {"q35-graphics-logind"}):
-        raise ProductError("venus-interactive graphics smoke requires --flavor q35-graphics-seatd or q35-graphics-logind")
+    if (
+        args.graphics_profile in {"virgl-interactive", "venus-interactive"}
+        and args.flavor not in {"q35-graphics-seatd", "q35-graphics-logind"}
+    ):
+        raise ProductError(
+            f"{args.graphics_profile} graphics smoke requires "
+            "--flavor q35-graphics-seatd or q35-graphics-logind"
+        )
     if not args.no_build:
         build_kernel(artifacts, rootfs=rootfs, rootfs_transport="drive")
-    marker = (
-        "THEKERNEL_Q35_SWAY_READY"
-        if args.flavor == "q35-graphics-logind"
-        else "THEKERNEL_Q35_VIRGL_READY"
-        if args.graphics_profile == "virgl-interactive"
-        else "THEKERNEL_Q35_VENUS_READY"
-        if args.graphics_profile == "venus-interactive"
-        else "THEKERNEL_Q35_WESTON_READY"
-        if args.flavor in {"q35-graphics-seatd", "q35-software-desktop"}
-        else "THEKERNEL_GRAPHICS_ABI_SMOKE_READY"
-    )
-    blocks = (QmpColorBlock(300, 200, 200, 200, (255, 0, 0)),) if args.flavor in {"q35-graphics-seatd", "q35-software-desktop"} else ()
-    size = (800, 600) if args.flavor in {"q35-graphics-seatd", "q35-software-desktop"} else None
-    checkpoints: tuple[QmpCheckpoint, ...] = ()
-    if args.flavor in {"q35-graphics-seatd", "q35-software-desktop"} and args.graphics_profile == "virgl-interactive":
-        # The rootless Xwayland client publishes this marker only after its
-        # mapped, drawn, resized, focused, clipboard-owning foreground window
-        # is stacked above the background window.  Inject directly into the
-        # virtio devices while it records the resulting X11 key/pointer events.
-        checkpoints = (
-            QmpCheckpoint(
-                input_after_marker="THEKERNEL_Q35_XWAYLAND_EVENT_READY",
-                input_events=((
-                    {"type": "abs", "data": {"axis": "x", "value": 180}},
-                    {"type": "abs", "data": {"axis": "y", "value": 160}},
-                    {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}},
-                    {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "a"}}},
-                ),),
-                screenshot=screenshot.with_name(f"{screenshot.stem}-xwayland{''.join(screenshot.suffixes)}"),
-                screenshot_after_marker="THEKERNEL_Q35_XWAYLAND_POINTER_EVENT",
-                screenshot_size=(800, 600),
-                screenshot_color_blocks=(QmpColorBlock(160, 150, 32, 32, (255, 32, 64)),),
-            ),
+    descriptor = SMOKE_FLAVORS[args.flavor]
+    marker = descriptor.profile_markers.get(args.graphics_profile, descriptor.marker)
+    if args.flavor == "q35-graphics-logind":
+        checkpoints = _logind_smoke_checkpoints(marker, screenshot)
+    elif args.flavor == "q35-graphics-seatd" and args.graphics_profile == "virgl-interactive":
+        checkpoints = _xwayland_smoke_checkpoints(screenshot)
+    elif args.flavor == "q35-graphics-seatd":
+        size = descriptor.screenshot_size
+        assert size is not None
+        checkpoints = _seatd_smoke_checkpoints(
+            marker, screenshot, size, descriptor.screenshot_color_blocks
         )
-    elif args.flavor == "q35-graphics-logind":
-        # The guest does not enter its A -> B -> A logind handoff until this
-        # initial pointer checkpoint has reached Alice's persistent Wayland
-        # client.  The final checkpoint observes the same session restored
-        # after all revocation/ACL transitions.
-        logind_checkpoints: list[QmpCheckpoint] = [
-            QmpCheckpoint(
-                input_after_marker=marker,
-                input_events=((
-                    {"type": "abs", "data": {"axis": "x", "value": 320}},
-                    {"type": "abs", "data": {"axis": "y", "value": 240}},
-                ),),
-                screenshot=screenshot,
-                screenshot_after_marker="THEKERNEL_Q35_SWAY_ALICE_POINTER_REPAINT",
-                screenshot_size=(800, 600),
-                screenshot_color_blocks=(QmpColorBlock(300, 200, 200, 200, (0, 102, 255)),),
-            ),
-        ]
-        for cycle in range(1, 2):
-            logind_checkpoints.append(QmpCheckpoint(
-                input_after_marker=f"THEKERNEL_Q35_LOGIND_CYCLE_BOB_POINTER_READY_{cycle:03d}",
-                input_events=((
-                    {"type": "rel", "data": {"axis": "x", "value": 1}},
-                ),),
-            ))
-            logind_checkpoints.append(QmpCheckpoint(
-                input_after_marker=f"THEKERNEL_Q35_LOGIND_CYCLE_ALICE_KEY_READY_{cycle:03d}",
-                input_events=((
-                    {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}},
-                    {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "a"}}},
-                ),),
-            ))
-        logind_checkpoints.append(
-            QmpCheckpoint(
-                input_after_marker="THEKERNEL_Q35_LOGIND_CYCLES_COMPLETE",
-                screenshot=screenshot.with_name(f"{screenshot.stem}-logind-cycles{''.join(screenshot.suffixes)}"),
-                screenshot_after_marker="THEKERNEL_Q35_LOGIND_CYCLES_COMPLETE",
-                screenshot_size=(800, 600),
-                screenshot_color_blocks=(QmpColorBlock(300, 200, 200, 200, (0, 102, 255)),),
-            )
-        )
-        checkpoints = tuple(logind_checkpoints)
-    elif args.flavor in {"q35-graphics-seatd", "q35-software-desktop"}:
-        # QMP drives the virtio keyboard/tablet devices directly.  Every
-        # action waits for the preceding client repaint marker before taking
-        # its own screenshot, so ordering is observable rather than timing
-        # dependent.  The original screenshot remains the initial red SHM
-        # frame; these files carry the later input checkpoints.
-        checkpoints = (
-            QmpCheckpoint(
-                input_after_marker=marker,
-                screenshot=screenshot,
-                screenshot_after_marker=marker,
-                screenshot_size=size,
-                screenshot_color_blocks=blocks,
-            ),
-            QmpCheckpoint(
-                input_after_marker="THEKERNEL_Q35_WAYLAND_INPUT_READY",
-                input_events=((
-                    {"type": "abs", "data": {"axis": "x", "value": 320}},
-                    {"type": "abs", "data": {"axis": "y", "value": 240}},
-                ),),
-                screenshot=screenshot.with_name(f"{screenshot.stem}-tablet{''.join(screenshot.suffixes)}"),
-                screenshot_after_marker="THEKERNEL_Q35_WAYLAND_POINTER_REPAINT",
-                screenshot_size=size,
-                screenshot_color_blocks=(QmpColorBlock(300, 200, 200, 200, (0, 102, 255)),),
-            ),
-            QmpCheckpoint(
-                input_after_marker="THEKERNEL_Q35_WAYLAND_POINTER_REPAINT",
-                input_events=((
-                    {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "a"}}},
-                    {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "a"}}},
-                ),),
-                screenshot=screenshot.with_name(f"{screenshot.stem}-key{''.join(screenshot.suffixes)}"),
-                screenshot_after_marker="THEKERNEL_Q35_WAYLAND_KEY_REPAINT",
-                screenshot_size=size,
-                screenshot_color_blocks=(QmpColorBlock(300, 200, 200, 200, (255, 0, 255)),),
-            ),
-            QmpCheckpoint(
-                input_after_marker="THEKERNEL_Q35_WAYLAND_KEY_REPAINT",
-                input_events=((
-                    {"type": "rel", "data": {"axis": "x", "value": 8}},
-                    {"type": "btn", "data": {"down": True, "button": "left"}},
-                    {"type": "btn", "data": {"down": False, "button": "left"}},
-                ),),
-                screenshot=screenshot.with_name(f"{screenshot.stem}-pointer{''.join(screenshot.suffixes)}"),
-                screenshot_after_marker="THEKERNEL_Q35_WAYLAND_BUTTON_REPAINT",
-                screenshot_size=size,
-                screenshot_color_blocks=(QmpColorBlock(300, 200, 200, 200, (0, 204, 102)),),
-            ),
-        )
+    else:
+        checkpoints = ()
     return run_product(
         artifacts,
-        accel=args.accel,
-        timeout=args.timeout,
-        workdir=Path(args.workdir) if args.workdir else None,
-        interactive=False,
-        graphics_profile=args.graphics_profile,
-        input_after_marker=None,
-        stop_after_marker=marker,
-        commands=None,
-        extra_block=None,
-        rootfs=rootfs,
-        rootfs_transport="drive",
-        qmp_screenshot=screenshot,
-        qmp_screenshot_after_marker=marker,
-        qmp_screenshot_size=size,
-        qmp_screenshot_color_blocks=blocks,
-        qmp_checkpoints=checkpoints,
-        qmp_timeout_secs=900.0 if args.flavor == "q35-graphics-logind" else 120.0,
+        RunSpec(
+            accel=args.accel,
+            timeout=args.timeout,
+            workdir=Path(args.workdir) if args.workdir else None,
+            interactive=False,
+            graphics_profile=args.graphics_profile,
+            input_after_marker=None,
+            stop_after_marker=marker,
+            commands=None,
+            extra_block=None,
+            rootfs=rootfs,
+            rootfs_transport="drive",
+            qmp_screenshot=screenshot,
+            qmp_screenshot_after_marker=marker,
+            qmp_screenshot_size=descriptor.screenshot_size,
+            qmp_screenshot_color_blocks=descriptor.screenshot_color_blocks,
+            qmp_checkpoints=checkpoints,
+            qmp_timeout_secs=descriptor.qmp_timeout_secs,
+            run_cpus=args.smp,
+        ),
     )
 
 
@@ -911,32 +965,33 @@ def graphics_benchmark_cmd(args: argparse.Namespace) -> int:
     if not rootfs.is_file():
         raise ProductError(f"rootfs does not exist: {rootfs}")
     build_kernel(artifacts, rootfs=rootfs, rootfs_transport="drive")
-    run_dir = Path(args.workdir).expanduser().resolve() if args.workdir else None
+    run_dir = Path(args.workdir).expanduser().resolve()
     result = run_product(
         artifacts,
-        accel="kvm",
-        timeout=args.timeout,
-        workdir=run_dir,
-        interactive=False,
-        graphics_profile=args.graphics_profile,
-        input_after_marker=None,
-        stop_after_marker=BENCHMARK_COMPLETE_MARKER,
-        commands=None,
-        extra_block=None,
-        rootfs=rootfs,
-        # Graphics boots the same rootfs snapshot from the sole virtio-blk
-        # device as the Linux oracle, so their Q35/VirtIO topology is equal.
-        rootfs_transport="drive",
-        qmp_checkpoints=benchmark_checkpoints(args.fault),
-        qmp_timeout_secs=300.0,
-        graphics_width=3840,
-        graphics_height=2160,
+        RunSpec(
+            accel="kvm",
+            timeout=args.timeout,
+            workdir=run_dir,
+            interactive=False,
+            graphics_profile=args.graphics_profile,
+            input_after_marker=None,
+            stop_after_marker=BENCHMARK_COMPLETE_MARKER,
+            commands=None,
+            extra_block=None,
+            rootfs=rootfs,
+            # Graphics boots the same rootfs snapshot from the sole virtio-blk
+            # device as the Linux oracle, so their Q35/VirtIO topology is equal.
+            rootfs_transport="drive",
+            qmp_checkpoints=benchmark_checkpoints(args.fault),
+            qmp_timeout_secs=300.0,
+            graphics_width=3840,
+            graphics_height=2160,
+            run_cpus=args.smp,
+        ),
     )
     if result:
         return result
-    log = (run_dir / "console.log") if run_dir else None
-    if log is None:
-        raise ProductError("graphics benchmark requires --workdir to retain its metric log")
+    log = run_dir / "console.log"
     try:
         current = parse_graphics_metrics(log)
         oracle = parse_graphics_metrics(Path(args.linux_oracle_log))
@@ -955,8 +1010,6 @@ def graphics_benchmark_cmd(args: argparse.Namespace) -> int:
 
 
 def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = True) -> None:
-    parser.add_argument("--machine", choices=("q35",), default="q35")
-    parser.add_argument("--firmware", choices=("uefi",), default="uefi")
     parser.add_argument("--smp", type=int, default=4)
     parser.add_argument("--memory", default="1G")
     parser.add_argument("--asid-fast-switch", action="store_true")
@@ -1003,7 +1056,7 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
 GRAPHICS_FLAVORS_ENV = REPO_ROOT / "config" / "graphics" / "flavors.env"
 
 
-def graphics_flavors() -> tuple[str, ...]:
+def graphics_flavor_manifest() -> dict[str, tuple[str, ...]]:
     """Read the dual-parsed graphics flavor manifest.
 
     config/graphics/flavors.env is sourced by bash in the rootfs builder, so
@@ -1015,6 +1068,7 @@ def graphics_flavors() -> tuple[str, ...]:
         lines = GRAPHICS_FLAVORS_ENV.read_text(encoding="utf-8").splitlines()
     except OSError as error:
         raise ProductError(f"cannot read graphics flavor manifest: {error}") from error
+    manifest: dict[str, tuple[str, ...]] = {}
     for line in lines:
         key, separator, value = line.strip().partition("=")
         if not key or key.startswith("#"):
@@ -1024,18 +1078,29 @@ def graphics_flavors() -> tuple[str, ...]:
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] == '"':
             value = value[1:-1]
-        if key == "FLAVORS":
-            flavors = tuple(value.split())
-            if not flavors:
-                raise ProductError("graphics flavor manifest declares an empty FLAVORS list")
-            return flavors
-    raise ProductError("graphics flavor manifest lacks a FLAVORS list")
+        manifest[key] = tuple(value.split())
+    return manifest
+
+
+def graphics_flavor_list(key: str) -> tuple[str, ...]:
+    flavors = graphics_flavor_manifest().get(key, ())
+    if not flavors:
+        raise ProductError(f"graphics flavor manifest lacks a {key} list")
+    return flavors
+
+
+def graphics_flavors() -> tuple[str, ...]:
+    return graphics_flavor_list("FLAVORS")
+
+
+def graphics_smoke_flavors() -> tuple[str, ...]:
+    return graphics_flavor_list("SMOKE_FLAVORS")
 
 
 def add_graphics_smoke_arguments(parser: argparse.ArgumentParser) -> None:
     add_variant_arguments(parser)
     parser.add_argument("--rootfs", required=True, help="existing graphics rootfs.ext2 image")
-    parser.add_argument("--flavor", choices=graphics_flavors(), default="headless-abi-smoke")
+    parser.add_argument("--flavor", choices=graphics_smoke_flavors(), default="headless-abi-smoke")
     parser.add_argument("--screenshot", required=True, help="QMP screendump PPM output path")
     parser.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     parser.add_argument("--timeout", type=positive_timeout, default=300.0)
