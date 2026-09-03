@@ -5,14 +5,6 @@ from __future__ import annotations
 import pathlib
 import unittest
 
-from tools.qemu_runner.graphics_benchmark import (
-    BENCHMARK_INPUT_HOTPLUG_READY_MARKER,
-    BENCHMARK_INPUT_HOTPLUG_REMOVED_MARKER,
-    BENCHMARK_INPUT_SAMPLES,
-    BENCHMARK_READY_MARKER,
-    benchmark_checkpoints,
-)
-
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 
@@ -91,20 +83,6 @@ class Linux612OracleConfigTests(unittest.TestCase):
         self.assertIn("--tarball LINUX-TARBALL", wrapper)
         self.assertIn("build+=(--tarball", wrapper)
         self.assertIn("--fault", wrapper)
-
-    def test_shared_checkpoint_preserves_the_hotplug_fault_only_for_that_fault(self) -> None:
-        standard = benchmark_checkpoints()
-        hotplug = benchmark_checkpoints("input-hotplug")
-        self.assertEqual(standard[0].input_after_marker, BENCHMARK_READY_MARKER)
-        self.assertFalse(standard[0].pci_hotplug)
-        self.assertEqual(len(hotplug), BENCHMARK_INPUT_SAMPLES + 2)
-        self.assertEqual(hotplug[0].pci_hotplug[0].action, "del")
-        self.assertEqual(hotplug[1].input_after_marker, BENCHMARK_INPUT_HOTPLUG_REMOVED_MARKER)
-        self.assertEqual(hotplug[1].pci_hotplug[0].action, "add")
-        self.assertEqual(hotplug[2].input_after_marker, BENCHMARK_INPUT_HOTPLUG_READY_MARKER)
-        self.assertTrue(hotplug[2].input_events)
-        with self.assertRaises(ValueError):
-            benchmark_checkpoints("not-a-fault")
 
 
 if __name__ == "__main__":

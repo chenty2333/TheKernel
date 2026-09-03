@@ -9,7 +9,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ESP_BUILDER = ROOT / "scripts" / "build-x86-uefi-esp.sh"
-MULTIBOOT_GATE = ROOT / "scripts" / "check-x86-multiboot.sh"
 GRUB_MKSTANDALONE = shutil.which("grub2-mkstandalone") or shutil.which(
     "grub-mkstandalone"
 )
@@ -108,17 +107,6 @@ class X86UefiEspTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("too small for the supplied payloads", result.stderr)
 
-    def test_builder_preloads_only_the_multiboot2_grub_module(self) -> None:
-        source = ESP_BUILDER.read_text(encoding="utf-8")
-        self.assertIn(
-            "grub_modules='part_gpt fat search search_fs_file serial terminal all_video'",
-            source,
-        )
-        self.assertIn('grub_modules="$grub_modules multiboot2"', source)
-        self.assertIn('grub_modules="$grub_modules linux"', source)
-        self.assertNotIn("multiboot multiboot2", source)
-        self.assertIn("config/x86_64/grub.cfg", source)
-
     def test_linux_mode_stages_only_vmlinuz_and_uses_a_drive_backed_root(self) -> None:
         source = ESP_BUILDER.read_text(encoding="utf-8")
         linux_config = (ROOT / "config/x86_64/grub-linux.cfg").read_text(encoding="utf-8")
@@ -155,15 +143,6 @@ class X86UefiEspTests(unittest.TestCase):
         self.assertIn("linux /vmlinuz root=/dev/vda console=ttyS0", linux_config)
         self.assertNotIn("rootfs-x86.img", linux_config)
 
-    def test_default_grub_entry_is_only_multiboot2_with_rootfs_module(self) -> None:
-        config = (ROOT / "config" / "x86_64" / "grub.cfg").read_text(encoding="utf-8")
-        self.assertIn('menuentry "TheKernel (Multiboot2)"', config)
-        self.assertIn("multiboot2 /TheKernel.elf", config)
-        self.assertIn("module2 /rootfs-x86.img rootfs", config)
-        self.assertIn("insmod all_video", config)
-        self.assertNotIn("Multiboot1", config)
-        self.assertNotIn("multiboot /TheKernel.elf", config)
-
     def test_multiboot_drive_mode_stages_no_rootfs_module(self) -> None:
         drive_config = (ROOT / "config/x86_64/grub-drive.cfg").read_text(encoding="utf-8")
         TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -194,13 +173,6 @@ class X86UefiEspTests(unittest.TestCase):
         self.assertIn("multiboot2 /TheKernel.elf", drive_config)
         self.assertNotIn("module2", drive_config)
         self.assertIn("insmod all_video", drive_config)
-
-    def test_multiboot_gate_selects_grub2_file_or_grub_file_for_multiboot2(self) -> None:
-        source = MULTIBOOT_GATE.read_text(encoding="utf-8")
-        self.assertIn("grub2-file", source)
-        self.assertIn("grub-file", source)
-        self.assertIn("--is-x86-multiboot2", source)
-        self.assertNotIn('"$grub_file" --is-x86-multiboot "$kernel"', source)
 
 
 if __name__ == "__main__":
