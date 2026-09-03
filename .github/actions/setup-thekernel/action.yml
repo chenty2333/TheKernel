@@ -1,0 +1,49 @@
+name: Set up TheKernel workspaces
+description: >-
+  Check out the pinned mechanism and Linux ABI workspaces beside TheKernel,
+  install the repository-pinned Rust toolchain, and trust the mounted
+  checkouts.  The caller must have checked out TheKernel into the "TheKernel"
+  workspace subdirectory and set defaults.run.working-directory to TheKernel.
+runs:
+  using: composite
+  steps:
+    - name: Load source combination
+      id: source_combination
+      shell: bash
+      run: python3 scripts/ci/source_combination.py --github-output "$GITHUB_OUTPUT"
+
+    - name: Checkout mechanism workspace from source combination
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        repository: ${{ steps.source_combination.outputs.ax_repository }}
+        ref: ${{ steps.source_combination.outputs.ax_ref }}
+        path: ${{ steps.source_combination.outputs.ax_path }}
+        fetch-depth: 1
+        persist-credentials: false
+
+    - name: Checkout Linux implementation workspace from source combination
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        repository: ${{ steps.source_combination.outputs.linux_abi_repository }}
+        ref: ${{ steps.source_combination.outputs.linux_abi_ref }}
+        path: ${{ steps.source_combination.outputs.linux_abi_path }}
+        fetch-depth: 1
+        persist-credentials: false
+
+    - name: Install Rust from the repository pin
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+        export PATH="$HOME/.cargo/bin:$PATH"
+        rustup show active-toolchain
+        cargo install --locked --version 0.2.1 axconfig-gen
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+    - name: Trust mounted checkouts
+      shell: bash
+      run: |
+        git config --global --add safe.directory "$GITHUB_WORKSPACE/TheKernel"
+        git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-ax"
+        git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-linux-abi"

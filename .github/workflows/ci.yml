@@ -20,30 +20,14 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: "1"
-  THEKERNEL_DEV_IMAGE: ${{ vars.THEKERNEL_DEV_IMAGE }}
 
 jobs:
-  image_ref:
-    name: Resolve development image reference
-    runs-on: ubuntu-24.04
-    outputs:
-      image: ${{ steps.validate.outputs.image }}
-    steps:
-      - name: Export configured development image
-        id: validate
-        env:
-          IMAGE: ${{ vars.THEKERNEL_DEV_IMAGE }}
-        run: |
-          set -euo pipefail
-          printf 'image=%s\n' "$IMAGE" >> "$GITHUB_OUTPUT"
-
   fast:
     name: Fast checks
-    needs: image_ref
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
-      image: ${{ needs.image_ref.outputs.image }}
+      image: ${{ vars.THEKERNEL_DEV_IMAGE }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -65,43 +49,8 @@ jobs:
       - name: Verify development image tools
         run: dev-env/check-image.sh
 
-      - name: Load source combination
-        id: source_combination
-        run: python3 scripts/ci/source_combination.py --github-output "$GITHUB_OUTPUT"
-
-      - name: Checkout mechanism workspace from source combination
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: ${{ steps.source_combination.outputs.ax_repository }}
-          ref: ${{ steps.source_combination.outputs.ax_ref }}
-          path: ${{ steps.source_combination.outputs.ax_path }}
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Checkout Linux implementation workspace from source combination
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: ${{ steps.source_combination.outputs.linux_abi_repository }}
-          ref: ${{ steps.source_combination.outputs.linux_abi_ref }}
-          path: ${{ steps.source_combination.outputs.linux_abi_path }}
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Install Rust from the repository pin
-        run: |
-          set -euo pipefail
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
-          export PATH="$HOME/.cargo/bin:$PATH"
-          rustup show active-toolchain
-          cargo install --locked --version 0.2.1 axconfig-gen
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Trust mounted checkouts
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE/TheKernel"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-ax"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-linux-abi"
+      - name: Set up TheKernel workspaces
+        uses: ./.github/actions/setup-thekernel
 
       - name: Check Cargo dependency layers
         run: python3 scripts/ci/check_cargo_dependency_layers.py
@@ -185,13 +134,12 @@ jobs:
 
   product:
     name: x86_64 product
-    needs: image_ref
     runs-on: ubuntu-24.04
     # The product gate compiles the kernel, runs its guest suite, and builds a
     # complete Buildroot desktop image from verified sources.
     timeout-minutes: 180
     container:
-      image: ${{ needs.image_ref.outputs.image }}
+      image: ${{ vars.THEKERNEL_DEV_IMAGE }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -213,46 +161,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify development image tools
-        run: dev-env/check-image.sh
-
-      - name: Load source combination
-        id: source_combination
-        run: python3 scripts/ci/source_combination.py --github-output "$GITHUB_OUTPUT"
-
-      - name: Checkout mechanism workspace from source combination
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: ${{ steps.source_combination.outputs.ax_repository }}
-          ref: ${{ steps.source_combination.outputs.ax_ref }}
-          path: ${{ steps.source_combination.outputs.ax_path }}
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Checkout Linux implementation workspace from source combination
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          repository: ${{ steps.source_combination.outputs.linux_abi_repository }}
-          ref: ${{ steps.source_combination.outputs.linux_abi_ref }}
-          path: ${{ steps.source_combination.outputs.linux_abi_path }}
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Install Rust from the repository pin
-        run: |
-          set -euo pipefail
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
-          export PATH="$HOME/.cargo/bin:$PATH"
-          rustup show active-toolchain
-          cargo install --locked --version 0.2.1 axconfig-gen
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Trust mounted checkouts
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE/TheKernel"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-ax"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE/thekernel-linux-abi"
+      - name: Set up TheKernel workspaces
+        uses: ./.github/actions/setup-thekernel
 
       - name: Restore verified Buildroot package downloads
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -358,16 +268,22 @@ jobs:
 
   graphics-fast:
     name: Graphics fast ABI and harness checks
-    needs: image_ref
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container:
-      image: ${{ needs.image_ref.outputs.image }}
+      image: ${{ vars.THEKERNEL_DEV_IMAGE }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: TheKernel
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: TheKernel
+          persist-credentials: false
       - name: Reject incomplete graphics harness configuration
         run: |
           set -euo pipefail
@@ -377,11 +293,18 @@ jobs:
 
   graphics-software:
     name: Graphics software KVM correctness
-    needs: [image_ref, graphics-fast]
+    needs: graphics-fast
     runs-on: [self-hosted, linux, x64, thekernel-kvm]
     timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: TheKernel
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: TheKernel
+          persist-credentials: false
       - name: Run software graphics benchmark
         run: |
           set -euo pipefail
@@ -392,11 +315,18 @@ jobs:
 
   graphics-virgl-venus:
     name: Graphics Virgl and Venus KVM conformance
-    needs: [image_ref, graphics-fast]
+    needs: graphics-fast
     runs-on: [self-hosted, linux, x64, thekernel-kvm-gl-vulkan]
     timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+        working-directory: TheKernel
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: TheKernel
+          persist-credentials: false
       - name: Build canonical seatd rootfs once for all accelerated profiles
         run: |
           set -euo pipefail
@@ -415,11 +345,18 @@ jobs:
 
   graphics-logind:
     name: Graphics logind and Sway session control
-    needs: [image_ref, graphics-fast]
+    needs: graphics-fast
     runs-on: [self-hosted, linux, x64, thekernel-kvm-gl-vulkan]
     timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+        working-directory: TheKernel
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: TheKernel
+          persist-credentials: false
       - name: Require real Sway readiness, not the launcher marker
         run: |
           set -euo pipefail
@@ -429,17 +366,27 @@ jobs:
 
   graphics-nightly:
     name: Graphics deterministic fault matrix
-    needs: [image_ref, graphics-software, graphics-virgl-venus, graphics-logind]
+    needs: [graphics-software, graphics-virgl-venus, graphics-logind]
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, linux, x64, thekernel-kvm-gl-vulkan]
     timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+        working-directory: TheKernel
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: TheKernel
+          persist-credentials: false
       - name: Run each deterministic graphics fault once
         run: |
           set -euo pipefail
           state="$PWD/.state/graphics-nightly"
-          for fault in modeset client-crash vt-switch weston-restart input-hotplug; do
+          # The fault matrix is single-sourced in tools/qemu_runner/profiles.py.
+          faults=$(python3 -m tools.qemu_runner.graphics_benchmark --list-faults \
+            | python3 -c 'import json, sys; print(" ".join(json.load(sys.stdin)))')
+          for fault in $faults; do
             scripts/build-graphics-rootfs.sh --flavor q35-graphics-benchmark --fault "$fault" --output "$state/$fault-rootfs"
             scripts/graphics-linux-oracle.sh --rootfs "$state/$fault-rootfs/images/rootfs.ext2" --graphics-profile virgl-headless --fault "$fault" --output "$state/$fault-linux-oracle"
             ./tools/thekernel.py graphics-benchmark --rootfs "$state/$fault-rootfs/images/rootfs.ext2" --graphics-profile virgl-headless --workdir "$state/$fault" --timeout 1800 --fault "$fault" --linux-oracle-log "$state/$fault-linux-oracle/console.log"
