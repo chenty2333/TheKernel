@@ -18,7 +18,6 @@ fetch_buildroot=0
 source_only=0
 check_only=0
 host_deps_dir=${THEKERNEL_GRAPHICS_HOST_DEPS_DIR:-}
-perl_module_root=${THEKERNEL_GRAPHICS_PERL_MODULE_ROOT:-}
 tmpdir=${THEKERNEL_GRAPHICS_TMPDIR:-}
 fault=
 
@@ -38,7 +37,6 @@ Options:
   --download-dir DIR    Buildroot package-download cache
   --source-only         download package sources, do not build
   --host-deps-dir DIR   optional task-local Perl dependency prefix
-  --perl-module-root DIR trusted installed Perl-module tree used to seed the prefix
   --tmpdir DIR          Buildroot temporary directory (defaults below --output)
   --fault NAME          inject one graphics fault action into a benchmark rootfs
   --check               validate this wrapper and checked-in configurations only
@@ -56,7 +54,6 @@ while (($#)); do
         --download-dir) download_dir=${2:-}; shift 2 ;;
         --source-only) source_only=1; shift ;;
         --host-deps-dir) host_deps_dir=${2:-}; shift 2 ;;
-        --perl-module-root) perl_module_root=${2:-}; shift 2 ;;
         --tmpdir) tmpdir=${2:-}; shift 2 ;;
         --fault) fault=${2:-}; shift 2 ;;
         --check) check_only=1; shift ;;
@@ -112,6 +109,85 @@ if [ -n "$fault" ]; then
     esac
 fi
 
+# Exact BR2 lines that must survive from a checked-in flavor fragment into the
+# resolved Buildroot .config; one table feeds both validation phases.
+flavor_br2_contract() {
+    case "$1" in
+        q35-software-desktop)
+            printf '%s\n' \
+                'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' \
+                'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' \
+                'BR2_PACKAGE_MESA3D_OPENGL_GLX=y' \
+                'BR2_PACKAGE_KMSCUBE=y' \
+                'BR2_PACKAGE_PIGLIT=y' \
+                'BR2_PACKAGE_XORG7=y' \
+                'BR2_PACKAGE_LIBEPOXY=y' \
+                'BR2_TARGET_ROOTFS_EXT2_SIZE="3G"' \
+                'BR2_PACKAGE_WESTON_XWAYLAND=y'
+            ;;
+        q35-graphics-seatd)
+            printf '%s\n' \
+                'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' \
+                'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' \
+                'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' \
+                'BR2_PACKAGE_MESA3D_OPENGL_GLX=y' \
+                'BR2_PACKAGE_PIGLIT=y' \
+                'BR2_PACKAGE_XORG7=y' \
+                'BR2_PACKAGE_LIBEPOXY=y' \
+                'BR2_TARGET_ROOTFS_EXT2_SIZE="3G"' \
+                'BR2_PACKAGE_WESTON_SHELL_DESKTOP=y' \
+                'BR2_PACKAGE_WESTON_XWAYLAND=y' \
+                'BR2_PACKAGE_FOOT=y'
+            ;;
+        q35-graphics-benchmark)
+            printf '%s\n' \
+                'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' \
+                'BR2_PACKAGE_VULKAN_LOADER=y' \
+                'BR2_PACKAGE_VULKAN_TOOLS=y' \
+                'BR2_TARGET_ROOTFS_EXT2_SIZE="512M"'
+            ;;
+        q35-venus-desktop)
+            printf '%s\n' \
+                'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' \
+                'BR2_PACKAGE_VULKAN_LOADER=y' \
+                'BR2_PACKAGE_VULKAN_TOOLS=y'
+            ;;
+    esac
+}
+
+# BR2 lines shared between common.config and the resolved output config of
+# every seatd-session flavor.
+seatd_common_br2_contract() {
+    printf '%s\n' \
+        'BR2_PACKAGE_SEATD_DAEMON=y' \
+        'BR2_TARGET_ROOTFS_EXT2_MKFS_OPTIONS="-O ^64bit,^metadata_csum_seed,^orphan_file"' \
+        'BR2_PACKAGE_LIBINPUT=y'
+}
+
+# BR2 lines shared between the logind flavor fragment and its resolved output.
+logind_br2_contract() {
+    printf '%s\n' \
+        'BR2_INIT_SYSTEMD=y' \
+        'BR2_PACKAGE_SYSTEMD_LOGIND=y' \
+        'BR2_PACKAGE_DBUS=y' \
+        'BR2_PACKAGE_LINUX_PAM=y' \
+        'BR2_PACKAGE_UTIL_LINUX_LOGIN=y' \
+        'BR2_PACKAGE_ACL=y' \
+        'BR2_PACKAGE_SWAY=y' \
+        'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' \
+        'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y'
+}
+
+require_br2_contract() {
+    local file=$1 line
+    while IFS= read -r line; do
+        grep -qxF "$line" "$file" || {
+            printf 'required Buildroot setting missing from %s: %s\n' "$file" "$line" >&2
+            return 1
+        }
+    done
+}
+
 validate_checked_in() {
     [ -r "$BUSYBOX_FRAGMENT" ] || { printf 'missing BusyBox config fragment: %s\n' "$BUSYBOX_FRAGMENT" >&2; return 1; }
     grep -qx 'CONFIG_STAT=y' "$BUSYBOX_FRAGMENT"
@@ -156,17 +232,15 @@ validate_checked_in() {
     grep -qx 'BR2_INIT_BUSYBOX=y' "$COMMON"
     ! grep -qx 'BR2_INIT_NONE=y' "$COMMON"
     grep -qx 'BR2_ROOTFS_USERS_TABLES="@REPO_ROOT@/config/graphics/users.table"' "$COMMON"
-    grep -qx 'BR2_TARGET_ROOTFS_EXT2_MKFS_OPTIONS="-O ^64bit,^metadata_csum_seed,^orphan_file"' "$COMMON"
     grep -qx 'BR2_PACKAGE_LIBDRM=y' "$COMMON"
     grep -qx 'BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_EUDEV=y' "$COMMON"
     grep -qx 'BR2_PACKAGE_EUDEV=y' "$COMMON"
     grep -qx 'BR2_PACKAGE_LIBEVDEV=y' "$COMMON"
-    grep -qx 'BR2_PACKAGE_LIBINPUT=y' "$COMMON"
     grep -qx 'BR2_PACKAGE_SEATD=y' "$COMMON"
-    grep -qx 'BR2_PACKAGE_SEATD_DAEMON=y' "$COMMON"
     grep -qx 'BR2_PACKAGE_WAYLAND=y' "$COMMON"
     grep -qx 'BR2_PACKAGE_PIXMAN=y' "$COMMON"
     grep -qx 'BR2_PACKAGE_WESTON=y' "$COMMON"
+    seatd_common_br2_contract | require_br2_contract "$COMMON"
     grep -qx 'weston -1 weston -1 !\* /var/lib/weston /bin/sh seat,render Weston compositor' "$REPO_ROOT/config/graphics/users.table"
     grep -qx 'SUBSYSTEM=="drm", KERNEL=="card\[0-9\]\*", GROUP="video", MODE="0660"' "$REPO_ROOT/config/graphics/overlay/common/etc/udev/rules.d/71-thekernel-graphics.rules"
     grep -qx 'SUBSYSTEM=="drm", KERNEL=="renderD\[0-9\]\*", GROUP="render", MODE="0660"' "$REPO_ROOT/config/graphics/overlay/common/etc/udev/rules.d/71-thekernel-graphics.rules"
@@ -207,16 +281,8 @@ validate_checked_in() {
         q35-software-desktop)
             grep -qx 'BR2_ROOTFS_POST_BUILD_SCRIPT="@REPO_ROOT@/config/graphics/build-guest-tools.sh @REPO_ROOT@/config/graphics/build-q35-wayland-client.sh"' "$fragment"
             grep -qx 'BR2_PACKAGE_WESTON_DEFAULT_DRM=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_GLX=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_KMSCUBE=y' "$fragment"
             grep -qx 'BR2_PACKAGE_PYTHON3=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_PIGLIT=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_XORG7=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_LIBEPOXY=y' "$fragment"
-            grep -qx 'BR2_TARGET_ROOTFS_EXT2_SIZE="3G"' "$fragment"
-            grep -qx 'BR2_PACKAGE_WESTON_XWAYLAND=y' "$fragment"
+            flavor_br2_contract "$flavor" | require_br2_contract "$fragment"
             grep -qx 'xwayland=true' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/weston/weston-drm.ini"
             grep -qx 'q35-software-desktop' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/thekernel-graphics-flavor"
             grep -qx '/usr/local/bin/drm-uapi-oracle' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke"
@@ -230,28 +296,15 @@ validate_checked_in() {
         q35-graphics-seatd)
             grep -qx 'BR2_ROOTFS_POST_BUILD_SCRIPT="@REPO_ROOT@/config/graphics/build-guest-tools.sh @REPO_ROOT@/config/graphics/build-q35-wayland-client.sh @REPO_ROOT@/config/graphics/build-q35-wayland-vulkan-client.sh"' "$fragment"
             grep -qx 'BR2_PACKAGE_WESTON_DEFAULT_DRM=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_GLX=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_PIGLIT=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_XORG7=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_LIBEPOXY=y' "$fragment"
-            grep -qx 'BR2_TARGET_ROOTFS_EXT2_SIZE="3G"' "$fragment"
-            grep -qx 'BR2_PACKAGE_WESTON_SHELL_DESKTOP=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_WESTON_XWAYLAND=y' "$fragment"
+            flavor_br2_contract "$flavor" | require_br2_contract "$fragment"
             grep -qx 'xwayland=true' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/weston/weston-drm.ini"
-            grep -qx 'BR2_PACKAGE_FOOT=y' "$fragment"
             grep -qx 'q35-graphics-seatd' "$REPO_ROOT/config/graphics/overlay/q35-graphics-seatd/etc/thekernel-graphics-flavor"
             [ -x "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke" ]
             ;;
         q35-graphics-benchmark)
             grep -qx 'BR2_ROOTFS_POST_BUILD_SCRIPT="@REPO_ROOT@/config/graphics/build-q35-graphics-benchmark-tools.sh"' "$fragment"
             grep -qx 'BR2_PACKAGE_WESTON_DEFAULT_DRM=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_VULKAN_LOADER=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_VULKAN_TOOLS=y' "$fragment"
-            grep -qx 'BR2_TARGET_ROOTFS_EXT2_SIZE="512M"' "$fragment"
+            flavor_br2_contract "$flavor" | require_br2_contract "$fragment"
             grep -qx 'q35-graphics-benchmark' "$REPO_ROOT/config/graphics/overlay/q35-graphics-benchmark/etc/thekernel-graphics-flavor"
             [ -x "$REPO_ROOT/config/graphics/overlay/q35-graphics-benchmark/etc/init.d/S90q35-graphics-benchmark" ]
             [ -x "$REPO_ROOT/config/graphics/build-q35-graphics-benchmark-tools.sh" ]
@@ -260,9 +313,7 @@ validate_checked_in() {
             [ -r "$REPO_ROOT/config/graphics/q35-wayland-vulkan-benchmark.c" ]
             ;;
         q35-venus-desktop)
-            grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_VULKAN_LOADER=y' "$fragment"
-            grep -qx 'BR2_PACKAGE_VULKAN_TOOLS=y' "$fragment"
+            flavor_br2_contract "$flavor" | require_br2_contract "$fragment"
             grep -qx '# BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL is not set' "$fragment"
             grep -qx 'q35-venus-desktop' "$REPO_ROOT/config/graphics/overlay/q35-venus-desktop/etc/thekernel-graphics-flavor"
             [ -x "$REPO_ROOT/config/graphics/overlay/q35-venus-desktop/etc/init.d/S90q35-venus-smoke" ]
@@ -294,15 +345,7 @@ validate_logind_checked_in() {
     for probe_source in "$REPO_ROOT"/tests/guest/graphics/*.c; do
         [ -r "$probe_source" ] || { printf 'missing graphics probe source: %s\n' "$probe_source" >&2; return 1; }
     done
-    grep -qx 'BR2_INIT_SYSTEMD=y' "$fragment"
-    grep -qx 'BR2_PACKAGE_SYSTEMD_LOGIND=y' "$fragment"
-    grep -qx 'BR2_PACKAGE_DBUS=y' "$fragment"
-    grep -qx 'BR2_PACKAGE_LINUX_PAM=y' "$fragment"
-    grep -qx 'BR2_PACKAGE_UTIL_LINUX_LOGIN=y' "$fragment"
-    grep -qx 'BR2_PACKAGE_ACL=y' "$fragment"
-    grep -qx 'BR2_PACKAGE_SWAY=y' "$fragment"
-    grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' "$fragment"
-    grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' "$fragment"
+    logind_br2_contract | require_br2_contract "$fragment"
     grep -qx '# BR2_PACKAGE_SEATD_DAEMON is not set' "$fragment"
     grep -qx '# BR2_PACKAGE_WESTON is not set' "$fragment"
     grep -qx 'LIBSEAT_BACKEND=logind' "$REPO_ROOT/config/graphics/overlay/q35-graphics-logind/etc/environment"
@@ -342,9 +385,7 @@ validate_build_output() {
         validate_logind_build_output
         return
     fi
-    grep -qx 'BR2_PACKAGE_SEATD_DAEMON=y' "$resolved"
-    grep -qx 'BR2_TARGET_ROOTFS_EXT2_MKFS_OPTIONS="-O ^64bit,^metadata_csum_seed,^orphan_file"' "$resolved"
-    grep -qx 'BR2_PACKAGE_LIBINPUT=y' "$resolved"
+    seatd_common_br2_contract | require_br2_contract "$resolved"
     ! grep -qx 'BR2_PACKAGE_SYSTEMD_LOGIND=y' "$resolved"
     [ -x "$target/etc/init.d/S10udevd" ]
     [ -x "$target/etc/init.d/S70seatd" ]
@@ -381,15 +422,7 @@ validate_build_output() {
         headless-abi-smoke) ;;
         q35-software-desktop)
             grep -qx 'BR2_PACKAGE_WESTON_DRM=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_GLX=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_KMSCUBE=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_PIGLIT=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_XORG7=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_LIBEPOXY=y' "$resolved"
-            grep -qx 'BR2_TARGET_ROOTFS_EXT2_SIZE="3G"' "$resolved"
-            grep -qx 'BR2_PACKAGE_WESTON_XWAYLAND=y' "$resolved"
+            flavor_br2_contract "$flavor" | require_br2_contract "$resolved"
             [ -x "$target/etc/init.d/S90q35-weston-smoke" ]
             [ -x "$target/usr/local/bin/q35-wayland-color-client" ]
             [ -x "$target/usr/local/bin/q35-virgl-render-oracle" ]
@@ -406,19 +439,9 @@ validate_build_output() {
             ;;
         q35-graphics-seatd)
             grep -qx 'BR2_PACKAGE_WESTON_DRM=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_MESA3D_OPENGL_GLX=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_PIGLIT=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_XORG7=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_LIBEPOXY=y' "$resolved"
-            grep -qx 'BR2_TARGET_ROOTFS_EXT2_SIZE="3G"' "$resolved"
             grep -qx 'BR2_PACKAGE_VULKAN_LOADER=y' "$resolved"
             grep -qx 'BR2_PACKAGE_VULKAN_TOOLS=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_WESTON_XWAYLAND=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_WESTON_SHELL_DESKTOP=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_FOOT=y' "$resolved"
+            flavor_br2_contract "$flavor" | require_br2_contract "$resolved"
             [ -x "$target/etc/init.d/S90q35-weston-smoke" ]
             [ -x "$target/usr/local/bin/q35-wayland-color-client" ]
             [ -x "$target/usr/local/bin/q35-wayland-vulkan-client" ]
@@ -427,17 +450,13 @@ validate_build_output() {
             [ -x "$target/usr/local/bin/q35-virgl-workloads" ]
             [ -x "$target/usr/bin/piglit" ]
             [ -r "$target/usr/lib/piglit/tests/quick.meta.xml" ]
-            [ -r "$target/usr/lib/piglit/tests/quick.meta.xml" ]
             [ -x "$target/usr/bin/vulkaninfo" ]
             validate_mesa_gallium_output "$target"
             find "$target/usr" -type f -name 'virtio_icd*.json' -print -quit | grep -q .
             ;;
         q35-graphics-benchmark)
             grep -qx 'BR2_PACKAGE_WESTON_DRM=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_VULKAN_LOADER=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_VULKAN_TOOLS=y' "$resolved"
-            grep -qx 'BR2_TARGET_ROOTFS_EXT2_SIZE="512M"' "$resolved"
+            flavor_br2_contract "$flavor" | require_br2_contract "$resolved"
             [ -x "$target/etc/init.d/S90q35-graphics-benchmark" ]
             [ -x "$target/usr/local/bin/q35-wayland-shm-client" ]
             [ -x "$target/usr/local/bin/q35-wayland-egl-benchmark-client" ]
@@ -447,9 +466,7 @@ validate_build_output() {
             find "$target/usr" -type f -name 'virtio_icd*.json' -print -quit | grep -q .
             ;;
         q35-venus-desktop)
-            grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_VULKAN_LOADER=y' "$resolved"
-            grep -qx 'BR2_PACKAGE_VULKAN_TOOLS=y' "$resolved"
+            flavor_br2_contract "$flavor" | require_br2_contract "$resolved"
             ! grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' "$resolved"
             [ -x "$target/etc/init.d/S90q35-venus-smoke" ]
             [ -x "$target/usr/local/bin/q35-wayland-vulkan-client" ]
@@ -464,16 +481,8 @@ validate_build_output() {
 
 validate_logind_build_output() {
     local target=$output/target resolved=$output/.config libseat accounts_image debugfs
-    grep -qx 'BR2_INIT_SYSTEMD=y' "$resolved"
     grep -qx 'BR2_TARGET_ROOTFS_EXT2_MKFS_OPTIONS="-O ^64bit,^metadata_csum_seed,^orphan_file"' "$resolved"
-    grep -qx 'BR2_PACKAGE_SYSTEMD_LOGIND=y' "$resolved"
-    grep -qx 'BR2_PACKAGE_DBUS=y' "$resolved"
-    grep -qx 'BR2_PACKAGE_LINUX_PAM=y' "$resolved"
-    grep -qx 'BR2_PACKAGE_UTIL_LINUX_LOGIN=y' "$resolved"
-    grep -qx 'BR2_PACKAGE_ACL=y' "$resolved"
-    grep -qx 'BR2_PACKAGE_SWAY=y' "$resolved"
-    grep -qx 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' "$resolved"
-    grep -qx 'BR2_PACKAGE_MESA3D_VULKAN_DRIVER_VIRTIO=y' "$resolved"
+    logind_br2_contract | require_br2_contract "$resolved"
     ! grep -qx 'BR2_PACKAGE_SEATD_DAEMON=y' "$resolved"
     ! grep -qx 'BR2_PACKAGE_WESTON=y' "$resolved"
     [ -x "$target/lib/systemd/systemd" ]
@@ -542,13 +551,9 @@ fi
 output=$(realpath -m "$output")
 mkdir -p "$output" "$download_dir"
 if [ -z "$tmpdir" ]; then tmpdir=$output/tmp; fi
-if [ -n "$perl_module_root" ]; then
-    if [ -z "$host_deps_dir" ]; then host_deps_dir=$(dirname -- "$download_dir")/graphics-host-deps; fi
-    "$SCRIPT_DIR/setup-graphics-local-deps.sh" --prefix "$host_deps_dir" --module-root "$perl_module_root"
-fi
 if [ -n "$host_deps_dir" ]; then
     [ -x "$host_deps_dir/bin/perl" ] || {
-        printf '%s\n' 'local Buildroot Perl modules unavailable: seed --host-deps-dir or pass --perl-module-root' >&2
+        printf '%s\n' 'local Buildroot Perl modules unavailable: seed --host-deps-dir' >&2
         exit 1
     }
     export PERL5LIB="$host_deps_dir/lib/perl5${PERL5LIB:+:$PERL5LIB}"

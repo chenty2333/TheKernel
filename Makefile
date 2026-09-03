@@ -2,7 +2,9 @@
 # tools/thekernel.py; these defaults only keep ordinary interactive runs safe
 # on the host.
 
-SMP ?= 1
+# Matches the product default in tools/thekernel.py; --smp only bounds the
+# --run-cpus ceiling, so the default run still boots RUN_CPUS processors.
+SMP ?= 4
 RUN_CPUS ?= 1
 # Matches the product default in tools/thekernel.py; 512M guests also boot
 # but run with a much smaller per-file page cache tier.

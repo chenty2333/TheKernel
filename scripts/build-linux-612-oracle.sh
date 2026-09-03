@@ -21,7 +21,6 @@ options:
   --tarball PATH       explicit, already downloaded ${TARBALL_NAME} (preferred)
   --output DIR         Linux O= directory (default: CACHE/build-${LINUX_VERSION})
   --jobs N             make parallelism (default: host CPU count)
-  --check              validate the checked-in version/config contract only
 EOF
     exit 2
 }
@@ -30,14 +29,12 @@ cache=${THEKERNEL_STATE_DIR:-$HOME/.cache/thekernel-targets}/linux-${LINUX_VERSI
 tarball=
 output=
 jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')
-check_only=0
 while (($#)); do
     case "$1" in
         --cache) cache=${2:?}; shift 2 ;;
         --tarball) tarball=${2:?}; shift 2 ;;
         --output) output=${2:?}; shift 2 ;;
         --jobs) jobs=${2:?}; shift 2 ;;
-        --check) check_only=1; shift ;;
         -h|--help) usage ;;
         *) printf 'unknown option: %s\n' "$1" >&2; usage ;;
     esac
@@ -70,10 +67,6 @@ check_settings() {
     done
 }
 check_settings "$CONFIG"
-if (( check_only )); then
-    printf 'Linux %s oracle config: OK\n' "$LINUX_VERSION"
-    exit 0
-fi
 
 cache=$(CDPATH= cd -- "$(dirname -- "$cache")" && pwd)/$(basename -- "$cache")
 mkdir -p "$cache"

@@ -26,11 +26,11 @@ never overwrites them, and it refuses a dirty checkout or any branch other than
 same source configuration.
 
 CI requires the `THEKERNEL_DEV_IMAGE` repository variable to name an immutable
-image under the project's `ghcr.io` namespace. A host-side prerequisite job
-rejects mutable references before either container job is created, and
-`dev-env/check-image.sh` then validates the expected tools and versions inside
-that image. Publishing the image from the checked-in `dev-env/Dockerfile` and
-updating the repository variable remain explicit maintainer operations.
+image under the project's `ghcr.io` namespace. Container jobs reference the
+variable directly, and `dev-env/check-image.sh` validates the expected tools
+and versions inside that image. Publishing the image from the checked-in
+`dev-env/Dockerfile` and updating the repository variable remain explicit
+maintainer operations.
 
 Alternatively, build the local image from the checked-in `dev-env/Dockerfile`
 and enter it. The local image is built on first use when it is missing; pass
@@ -110,7 +110,7 @@ env \
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-T$PWD/../thekernel-ax/crates/thekernel-scope-local/percpu.x" \
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$PWD/scripts/ci/host-test-linker.sh" \
   cargo test --locked --manifest-path kernel/Cargo.toml --tests \
-    --features bpf,axtask/test,test-io-control \
+    --features bpf,axtask/test \
     --target x86_64-unknown-linux-gnu -- --test-threads=1
 ```
 

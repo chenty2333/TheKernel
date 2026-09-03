@@ -26,29 +26,11 @@ scripts/build-graphics-rootfs.sh --flavor q35-graphics-seatd --fetch-buildroot \
 Buildroot keeps its own dependency check enabled. By default the wrapper leaves
 the system Perl, `PATH`, and `PERL5LIB` untouched, so Buildroot's own complete
 dependency check is authoritative. On a machine whose Perl was installed
-without the needed core modules, opt into a task-local module prefix from a
-compatible, already-installed Perl tree. The helper copies the four modules
-Buildroot requires and does not suppress Buildroot's check. An explicit prefix
-supplies its `perl` wrapper first on `PATH`.
-
-```bash
-TASK_CACHE="$HOME/.cache/thekernel-graphics-deps"
-PERL_CORE=/path/to/compatible/perl/lib
-scripts/build-graphics-rootfs.sh --flavor headless-abi-smoke \
-  --buildroot-dir .state/buildroot/buildroot-2026.05.2 \
-  --output "$TASK_CACHE/graphics-rootfs-headless" \
-  --download-dir "$TASK_CACHE/graphics-downloads" \
-  --host-deps-dir "$TASK_CACHE/graphics-host-deps" \
-  --perl-module-root "$PERL_CORE" \
-  --tmpdir "$TASK_CACHE/tmp"
-```
-
-Use a source tree only after independently identifying it as an installed,
-compatible Perl core. This checkout's working host has such files under a
-rootless container-storage path.
-No `sudo`, system package installation, or `BR2_*` dependency-check override
-is used. The second flavor uses the same cache and host-dependency prefix only
-after the headless rootfs build completes.
+without the needed core modules, prepare a task-local prefix that supplies a
+`bin/perl` wrapper and a `lib/perl5` tree with those modules, then pass it as
+`--host-deps-dir`; the wrapper puts its `bin` first on `PATH` and its
+`lib/perl5` on `PERL5LIB`. No `sudo`, system package installation, or `BR2_*`
+dependency-check override is used.
 
 The first flavor includes libdrm, libevdev, libinput, libseat/seatd (daemon), Wayland,
 pixman, and Weston with the headless backend. It is a BusyBox SysV setup: eudev
