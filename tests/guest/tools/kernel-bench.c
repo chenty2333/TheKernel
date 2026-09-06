@@ -1146,21 +1146,28 @@ static void diagnostics(void)
                         "diagnostics bounded syslog capacity");
     if (syscall(SYS_syslog, 6, NULL, 0) < 0) fail("diagnostics console off");
     diagnostics_console_disabled = 1;
-    if (diagnostics_write_filter(narrow)) fail("diagnostics enable syscall log");
-    long pid = syscall(SYS_getpid);
-    if (pid <= 0) fail("diagnostics getpid");
-    /* Stop production before taking the snapshot: the record must survive
-     * filtering being disabled and diagnostic console suppression. */
-    if (diagnostics_write_filter("off")) fail("diagnostics stop syscall log");
-    long n = syscall(SYS_syslog, 3, retained, DIAGNOSTICS_BYTES);
-    if (n < 0) fail("diagnostics read retained log");
-    diagnostics_require(n <= DIAGNOSTICS_BYTES, "diagnostics syslog bound");
-    retained[n] = '\0';
-    char expected[256];
-    snprintf(expected, sizeof(expected),
-             " DEBUG target=thekernel_kernel::syscall module=thekernel_kernel::syscall] "
-             "Syscall getpid return Ok(%ld)", pid);
-    char *record = strstr(retained, expected);
+    char *record = NULL;
+    /* Capture deliberately drops records on producer/store contention instead
+     * of blocking an IRQ. Exercise retention with a bounded number of fresh
+     * records; a single dropped record is not a retention failure. */
+    for (unsigned int attempt = 0; attempt < 32; ++attempt) {
+        if (diagnostics_write_filter(narrow)) fail("diagnostics enable syscall log");
+        long pid = syscall(SYS_getpid);
+        if (pid <= 0) fail("diagnostics getpid");
+        /* The captured record must survive both filter and console suppression. */
+        if (diagnostics_write_filter("off")) fail("diagnostics stop syscall log");
+        long n = syscall(SYS_syslog, 3, retained, DIAGNOSTICS_BYTES);
+        if (n < 0) fail("diagnostics read retained log");
+        diagnostics_require(n <= DIAGNOSTICS_BYTES, "diagnostics syslog bound");
+        retained[n] = '\0';
+        char expected[256];
+        snprintf(expected, sizeof(expected),
+                 " DEBUG target=thekernel_kernel::syscall module=thekernel_kernel::syscall] "
+                 "Syscall getpid return Ok(%ld)", pid);
+        record = strstr(retained, expected);
+        if (record) break;
+        if (sched_yield()) fail("diagnostics yield after dropped record");
+    }
     diagnostics_require(record != NULL, "diagnostics retained structured syscall record");
     char *start = record;
     while (start > retained && start[-1] != '\n') --start;
