@@ -574,7 +574,7 @@ mod tests {
         let location = mount
             .root_location()
             .create(
-                name,
+                axfs_ng_vfs::FsName::new(name.as_bytes()),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )

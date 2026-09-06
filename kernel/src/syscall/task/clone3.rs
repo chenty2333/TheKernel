@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::{mem::MaybeUninit, slice};
 
 use axerrno::{AxError, AxResult};
@@ -6,6 +7,7 @@ use thekernel_linux_process::{
     Clone3Args as LinuxClone3Args, Clone3Plan, ProcessAbiError, SetTidPlan,
 };
 use thekernel_linux_signal::Signo;
+use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use super::clone::{CloneApi, CloneArgs, CloneFlags};
 use crate::{
@@ -66,6 +68,62 @@ fn clone3_stack_top(stack_base: u64, stack_top: u64) -> AxResult<usize> {
     Ok(stack_top)
 }
 
+/// Copies the versioned `clone_args` object with Linux's
+/// `copy_struct_from_user()` ordering.
+///
+/// Unknown extension bytes are checked before the common prefix.  Keeping
+/// this ordering here is necessary because the shared process ABI consumes a
+/// decoded prefix and a kernel-owned tail separately, while Linux exposes the
+/// tail-before-prefix fault precedence as part of clone3's syscall contract.
+fn copy_clone3_wire_args<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    args: *const u8,
+    size: usize,
+) -> AxResult<(LinuxClone3Args, Vec<u8>)> {
+    let known_size = LinuxClone3Args::known_prefix_size(size).map_err(map_clone3_abi_error)?;
+    let tail_size = size - known_size;
+
+    let mut offset = known_size;
+    while offset < size {
+        let count = (size - offset).min(32);
+        let mut bytes = [MaybeUninit::<u8>::uninit(); 32];
+        let address = (args as usize)
+            .checked_add(offset)
+            .ok_or(AxError::BadAddress)?;
+        memory
+            .read_bytes(address, &mut bytes[..count])
+            .map_err(map_usercopy_error)?;
+        if bytes[..count]
+            .iter()
+            .any(|byte| unsafe { byte.assume_init() } != 0)
+        {
+            return Err(AxError::ArgumentListTooLong);
+        }
+        offset += count;
+    }
+
+    let mut buffer = [0u8; LinuxClone3Args::KNOWN_SIZE];
+    // SAFETY: the byte view covers initialized kernel-owned storage and the
+    // provider initializes the requested prefix on success.
+    let buffer_bytes = unsafe {
+        slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<MaybeUninit<u8>>(), known_size)
+    };
+    memory
+        .read_bytes(args as usize, buffer_bytes)
+        .map_err(map_usercopy_error)?;
+    let wire_args = LinuxClone3Args::decode_prefix(size, &buffer[..known_size])
+        .map_err(map_clone3_abi_error)?;
+
+    // `normalize` also verifies the supplied extension length.  The extension
+    // was already copied and proved zero above, so retain only a fallibly
+    // allocated zero snapshot instead of copying it a second time.
+    let mut tail = Vec::new();
+    tail.try_reserve_exact(tail_size)
+        .map_err(|_| AxError::NoMemory)?;
+    tail.resize(tail_size, 0);
+    Ok((wire_args, tail))
+}
+
 impl TryFrom<Clone3Plan> for CloneArgs {
     type Error = axerrno::AxError;
 
@@ -99,39 +157,11 @@ pub fn sys_clone3(
 ) -> AxResult<isize> {
     debug!("sys_clone3 <= args: {args:p}, size: {size}");
 
-    let known_size = LinuxClone3Args::known_prefix_size(size).map_err(map_clone3_abi_error)?;
     if size > LinuxClone3Args::KNOWN_SIZE {
         debug!("sys_clone3: size {size} larger than expected, using known fields only");
     }
-
-    let mut buffer = [0u8; LinuxClone3Args::KNOWN_SIZE];
-    // SAFETY: MaybeUninit<T> is compatible with T, and we're filling in the
-    // buffer with bytes read from the user
-    let buffer_bytes = unsafe {
-        slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<MaybeUninit<u8>>(), known_size)
-    };
-    memory
-        .read_bytes(args as usize, buffer_bytes)
-        .map_err(map_usercopy_error)?;
-    let tail_size = size - known_size;
-    let mut tail = alloc::vec![0_u8; tail_size];
-    let tail_address = (args as usize)
-        .checked_add(known_size)
-        .ok_or(AxError::BadAddress)?;
-    if !tail.is_empty() {
-        let tail_bytes = unsafe {
-            slice::from_raw_parts_mut(tail.as_mut_ptr().cast::<MaybeUninit<u8>>(), tail.len())
-        };
-        memory
-            .read_bytes(tail_address, tail_bytes)
-            .map_err(map_usercopy_error)?;
-    }
-    let wire_args = LinuxClone3Args::decode_prefix(size, &buffer[..known_size])
-        .map_err(map_clone3_abi_error)?;
-    // copy_struct_from_user() verifies an extension tail while copying the
-    // clone_args object, before inspecting its scalar fields or dereferencing
-    // set_tid. Preserve that E2BIG-before-set_tid-usercopy boundary here.
-    LinuxClone3Args::validate_tail(&tail).map_err(map_clone3_abi_error)?;
+    let (wire_args, tail) =
+        memory.with_memory(|memory| copy_clone3_wire_args(memory, args, size))?;
     // copy_clone_args_from_user() rejects the pointer/count shape and the
     // untruncated exit_signal first.  It then copies the set_tid vector
     // *before* clone3_args_valid() examines flag combinations and the stack:
@@ -166,16 +196,93 @@ pub fn sys_clone3(
 
 #[cfg(test)]
 mod tests {
+    use alloc::{vec, vec::Vec};
+    use core::mem::MaybeUninit;
+
     use axerrno::AxError;
     use linux_raw_sys::general::{
         CLONE_DETACHED, CLONE_FS, CLONE_NEWNS, CLONE_NEWPID, CLONE_PIDFD,
     };
+    use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
 
     use super::{
-        CloneApi, CloneArgs, CloneFlags, LinuxClone3Args, clone3_stack_top,
+        CloneApi, CloneArgs, CloneFlags, LinuxClone3Args, clone3_stack_top, copy_clone3_wire_args,
         validate_clone3_wire_args,
     };
     use crate::config::{USER_SPACE_BASE, USER_SPACE_SIZE};
+
+    struct CopyProbe {
+        bytes: Vec<u8>,
+        fault_at: Option<usize>,
+        reads: Vec<(usize, usize)>,
+    }
+
+    impl CopyProbe {
+        fn new(bytes: Vec<u8>, fault_at: Option<usize>) -> Self {
+            Self {
+                bytes,
+                fault_at,
+                reads: Vec::new(),
+            }
+        }
+    }
+
+    // SAFETY: the probe reads only from its owned byte vector and initializes
+    // every requested destination byte on success.
+    unsafe impl UserMemory for CopyProbe {
+        fn read(&mut self, start: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
+            self.reads.push((start, dst.len()));
+            let end = start
+                .checked_add(dst.len())
+                .ok_or(UserCopyError::BadAddress)?;
+            if end > self.bytes.len()
+                || self
+                    .fault_at
+                    .is_some_and(|fault| start <= fault && fault < end)
+            {
+                return Err(UserCopyError::BadAddress);
+            }
+            for (destination, source) in dst.iter_mut().zip(&self.bytes[start..end]) {
+                destination.write(*source);
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, _: usize, _: &[u8]) -> VmResult {
+            Err(UserCopyError::BadAddress)
+        }
+    }
+
+    #[test]
+    fn clone3_copy_checks_extension_before_faulting_common_prefix() {
+        let size = LinuxClone3Args::KNOWN_SIZE + 1;
+
+        let mut nonzero = vec![0; size];
+        nonzero[LinuxClone3Args::KNOWN_SIZE] = 1;
+        let mut provider = CopyProbe::new(nonzero, Some(0));
+        let result = copy_clone3_wire_args(
+            &mut UserMemoryContext::new(&mut provider),
+            core::ptr::null(),
+            size,
+        );
+        assert_eq!(result, Err(AxError::ArgumentListTooLong));
+        assert_eq!(provider.reads, [(LinuxClone3Args::KNOWN_SIZE, 1)]);
+
+        let mut provider = CopyProbe::new(vec![0; size], Some(0));
+        let result = copy_clone3_wire_args(
+            &mut UserMemoryContext::new(&mut provider),
+            core::ptr::null(),
+            size,
+        );
+        assert_eq!(result, Err(AxError::BadAddress));
+        assert_eq!(
+            provider.reads,
+            [
+                (LinuxClone3Args::KNOWN_SIZE, 1),
+                (0, LinuxClone3Args::KNOWN_SIZE)
+            ]
+        );
+    }
 
     #[test]
     fn clone3_accepts_abi_stack_ending_at_user_address_boundary() {

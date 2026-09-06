@@ -456,7 +456,7 @@ impl DrmFile {
         nonblock: bool,
     ) -> DrmResult<()> {
         let (generation, _, next, fb) = super::atomic::propose_legacy(self, changes, mode)?;
-        let completion = fb.as_ref().map(|_| super::fence::Fence::new(false));
+        let completion = fb.as_ref().map(|_| crate::drm::fence::Fence::new(false));
         self.submit_atomic(
             generation,
             next,
@@ -491,7 +491,7 @@ impl DrmFile {
             AtomicSync {
                 inputs: alloc::vec::Vec::new(),
                 predecessors: alloc::vec::Vec::new(),
-                completion: Some(super::fence::Fence::new(false)),
+                completion: Some(crate::drm::fence::Fence::new(false)),
             },
         )
     }
@@ -1432,7 +1432,7 @@ mod tests {
         let object = file.syncobj(handle).unwrap();
         assert!(object.fence().is_err());
 
-        let original = super::fence::Fence::new(false);
+        let original = crate::drm::fence::Fence::new(false);
         object.import_fence(original.clone());
         assert!(!original.is_signaled());
 

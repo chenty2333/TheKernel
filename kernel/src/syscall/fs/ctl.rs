@@ -1824,12 +1824,6 @@ pub fn sys_utimensat<M: UserMemory + ?Sized>(
     times: *const [timespec; 2],
     mut flags: u32,
 ) -> AxResult<isize> {
-    if path.is_null() {
-        if flags != 0 {
-            return Err(AxError::InvalidInput);
-        }
-        flags |= AT_EMPTY_PATH;
-    }
     fn utime_to_timestamp(time: &timespec) -> (Option<AxResult<Timestamp>>, TimeUpdate) {
         match time.tv_nsec {
             val if val == UTIME_OMIT as _ => (None, TimeUpdate::Omit),
@@ -1849,6 +1843,9 @@ pub fn sys_utimensat<M: UserMemory + ?Sized>(
                 .map_err(map_usercopy_error)?
                 .assume_init()
         };
+        if atime.tv_nsec == UTIME_OMIT as _ && mtime.tv_nsec == UTIME_OMIT as _ {
+            return Ok(0);
+        }
         let (atime, atime_intent) = utime_to_timestamp(&atime);
         let (mtime, mtime_intent) = utime_to_timestamp(&mtime);
         (
@@ -1866,6 +1863,12 @@ pub fn sys_utimensat<M: UserMemory + ?Sized>(
             TimeUpdate::Now,
         )
     };
+    if path.is_null() {
+        if flags != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        flags |= AT_EMPTY_PATH;
+    }
     update_times(
         memory,
         dirfd,
@@ -2590,6 +2593,7 @@ mod tests {
 
     #[test]
     fn hardlink_source_resolution_honors_final_follow_and_pinned_relative_start() {
+        let _context = crate::test_support::scheduler_test_context();
         let security = linkat_test_security();
         let filesystem = crate::pseudofs::tmp::MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&filesystem);
@@ -2597,61 +2601,75 @@ mod tests {
         let root = mount.root_location();
         let target = root
             .create(
-                "target",
+                axfs_ng_vfs::FsName::new(b"target"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o666),
             )
             .unwrap();
         let symlink = root
             .create_symlink(
-                "jump",
-                "target",
+                axfs_ng_vfs::FsName::new(b"jump"),
+                axfs_ng_vfs::FsPath::new(b"target"),
                 NodePermission::from_bits_truncate(0o777),
                 Some((0, 0)),
             )
             .unwrap();
         let context = axfs::FsContext::new(root.clone());
 
-        let no_follow =
-            resolve_hardlink_source_in_fs(&context, Path::new("jump"), false, &security).unwrap();
-        let followed =
-            resolve_hardlink_source_in_fs(&context, Path::new("jump"), true, &security).unwrap();
+        let no_follow = resolve_hardlink_source_in_fs(
+            &context,
+            axfs_ng_vfs::FsPath::new(b"jump"),
+            false,
+            &security,
+        )
+        .unwrap();
+        let followed = resolve_hardlink_source_in_fs(
+            &context,
+            axfs_ng_vfs::FsPath::new(b"jump"),
+            true,
+            &security,
+        )
+        .unwrap();
         assert!(no_follow.same_node(&symlink));
         assert!(followed.same_node(&target));
 
         let left = root
             .create(
-                "left",
+                axfs_ng_vfs::FsName::new(b"left"),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o777),
             )
             .unwrap();
         let right = root
             .create(
-                "right",
+                axfs_ng_vfs::FsName::new(b"right"),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o777),
             )
             .unwrap();
         let left_source = left
             .create(
-                "source",
+                axfs_ng_vfs::FsName::new(b"source"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o666),
             )
             .unwrap();
         let right_source = right
             .create(
-                "source",
+                axfs_ng_vfs::FsName::new(b"source"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o666),
             )
             .unwrap();
         let left_context = context.with_current_dir(left).unwrap();
         let pinned_context = left_context.with_current_dir(right).unwrap();
-        let resolved =
-            resolve_hardlink_source_in_fs(&pinned_context, Path::new("source"), false, &security)
-                .unwrap();
+        let resolved = resolve_hardlink_source_in_fs(
+            &pinned_context,
+            axfs_ng_vfs::FsPath::new(b"source"),
+            false,
+            &security,
+        )
+        .unwrap();
         assert!(!resolved.same_node(&left_source));
         assert!(resolved.same_node(&right_source));
     }
@@ -2665,7 +2683,7 @@ mod tests {
 
         let file_location = root
             .create(
-                "file",
+                axfs_ng_vfs::FsName::new(b"file"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2682,7 +2700,7 @@ mod tests {
 
         let directory_location = root
             .create(
-                "directory",
+                axfs_ng_vfs::FsName::new(b"directory"),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o700),
             )
@@ -2696,7 +2714,7 @@ mod tests {
 
         let fifo_location = root
             .create(
-                "fifo",
+                axfs_ng_vfs::FsName::new(b"fifo"),
                 NodeType::Fifo,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2737,18 +2755,19 @@ mod tests {
 
     #[test]
     fn named_create_preserves_trailing_and_special_terminal_syntax() {
+        let _context = crate::test_support::scheduler_test_context();
         let filesystem = crate::pseudofs::tmp::MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&filesystem);
         crate::mounts::initialize_test_mount(&mount, 0).unwrap();
         let root = mount.root_location();
         root.create(
-            "existing-file",
+            axfs_ng_vfs::FsName::new(b"existing-file"),
             NodeType::RegularFile,
             NodePermission::from_bits_truncate(0o600),
         )
         .unwrap();
         root.create(
-            "existing-dir",
+            axfs_ng_vfs::FsName::new(b"existing-dir"),
             NodeType::Directory,
             NodePermission::from_bits_truncate(0o700),
         )
@@ -2758,25 +2777,25 @@ mod tests {
 
         let (parent, name) = context
             .resolve_named_create_security(
-                Path::new("missing"),
+                axfs_ng_vfs::FsPath::new(b"missing"),
                 &security,
                 NamedCreateTerminalType::NonDirectory,
             )
             .unwrap();
         assert!(parent.same_node(&root));
-        assert_eq!(name, "missing");
+        assert_eq!(name.as_bytes(), b"missing");
         let (parent, name) = context
             .resolve_named_create_security(
-                Path::new("missing/"),
+                axfs_ng_vfs::FsPath::new(b"missing/"),
                 &security,
                 NamedCreateTerminalType::Directory,
             )
             .unwrap();
         assert!(parent.same_node(&root));
-        assert_eq!(name, "missing");
+        assert_eq!(name.as_bytes(), b"missing");
         assert!(matches!(
             context.resolve_named_create_security(
-                Path::new("missing/"),
+                axfs_ng_vfs::FsPath::new(b"missing/"),
                 &security,
                 NamedCreateTerminalType::NonDirectory,
             ),
@@ -2785,7 +2804,7 @@ mod tests {
         for path in ["existing-file/", "existing-dir/"] {
             assert!(matches!(
                 context.resolve_named_create_security(
-                    Path::new(path),
+                    axfs_ng_vfs::FsPath::new(path.as_bytes()),
                     &security,
                     NamedCreateTerminalType::NonDirectory,
                 ),
@@ -2799,7 +2818,7 @@ mod tests {
             ] {
                 assert!(matches!(
                     context.resolve_named_create_security(
-                        Path::new(path),
+                        axfs_ng_vfs::FsPath::new(path.as_bytes()),
                         &security,
                         terminal_type,
                     ),
@@ -2810,7 +2829,7 @@ mod tests {
 
         assert!(matches!(
             context.resolve_named_create_security(
-                Path::new("missing/."),
+                axfs_ng_vfs::FsPath::new(b"missing/."),
                 &security,
                 NamedCreateTerminalType::Directory,
             ),
@@ -2818,19 +2837,19 @@ mod tests {
         ));
         assert!(matches!(
             context.resolve_named_create_security(
-                Path::new("existing-file/."),
+                axfs_ng_vfs::FsPath::new(b"existing-file/."),
                 &security,
                 NamedCreateTerminalType::Directory,
             ),
             Err(AxError::NotADirectory)
         ));
         assert!(matches!(
-            root.lookup_no_follow_in_mount("missing"),
+            root.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"missing")),
             Err(AxError::NotFound)
         ));
         assert!(matches!(
             context.resolve_named_create_security(
-                Path::new("existing-dir/."),
+                axfs_ng_vfs::FsPath::new(b"existing-dir/."),
                 &security,
                 NamedCreateTerminalType::Directory,
             ),
@@ -2856,7 +2875,10 @@ mod tests {
     }
 
     fn final_component(path: &str) -> FinalComponent<'_> {
-        Path::new(path).split_final_component().unwrap().1
+        axfs_ng_vfs::FsPath::new(path.as_bytes())
+            .split_final_component()
+            .unwrap()
+            .1
     }
 
     #[test]
@@ -2864,14 +2886,14 @@ mod tests {
         assert_eq!(
             unlinkat_final_name(final_component("file"), false),
             Ok(UnlinkFinalName {
-                name: "file",
+                name: axfs_ng_vfs::FsName::new(b"file"),
                 requires_directory: false,
             })
         );
         assert_eq!(
             unlinkat_final_name(final_component("file/"), false),
             Ok(UnlinkFinalName {
-                name: "file",
+                name: axfs_ng_vfs::FsName::new(b"file"),
                 requires_directory: true,
             })
         );
@@ -2901,14 +2923,14 @@ mod tests {
         assert_eq!(
             renameat_final_name(final_component("entry"), AxError::ResourceBusy),
             Ok(RenameFinalName {
-                name: "entry",
+                name: axfs_ng_vfs::FsName::new(b"entry"),
                 requires_directory: false,
             })
         );
         assert_eq!(
             renameat_final_name(final_component("entry/"), AxError::ResourceBusy),
             Ok(RenameFinalName {
-                name: "entry",
+                name: axfs_ng_vfs::FsName::new(b"entry"),
                 requires_directory: true,
             })
         );
@@ -2954,28 +2976,29 @@ mod tests {
 
     #[test]
     fn unlink_target_resolution_never_retargets_trailing_or_dot_syntax() {
+        let _context = crate::test_support::scheduler_test_context();
         let filesystem = crate::pseudofs::tmp::MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&filesystem);
         crate::mounts::initialize_test_mount(&mount, 0).unwrap();
         let root = mount.root_location();
         let file = root
             .create(
-                "file",
+                axfs_ng_vfs::FsName::new(b"file"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o666),
             )
             .unwrap();
         let directory = root
             .create(
-                "directory",
+                axfs_ng_vfs::FsName::new(b"directory"),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o777),
             )
             .unwrap();
         let symlink = root
             .create_symlink(
-                "symlink",
-                "file",
+                axfs_ng_vfs::FsName::new(b"symlink"),
+                axfs_ng_vfs::FsPath::new(b"file"),
                 NodePermission::from_bits_truncate(0o777),
                 Some((0, 0)),
             )
@@ -2983,54 +3006,98 @@ mod tests {
         let context = axfs::FsContext::new(root.clone());
         let security = linkat_test_security();
 
-        let (parent, name, target) =
-            resolve_unlink_target_in_fs(&context, Path::new("file"), false, &security).unwrap();
+        let (parent, name, target) = resolve_unlink_target_in_fs(
+            &context,
+            axfs_ng_vfs::FsPath::new(b"file"),
+            false,
+            &security,
+        )
+        .unwrap();
         assert!(parent.same_node(&root));
-        assert_eq!(name, "file");
+        assert_eq!(name.as_bytes(), b"file");
         assert!(target.same_node(&file));
 
         for path in ["file/", "symlink/", "file/."] {
             assert!(matches!(
-                resolve_unlink_target_in_fs(&context, Path::new(path), false, &security),
+                resolve_unlink_target_in_fs(
+                    &context,
+                    axfs_ng_vfs::FsPath::new(path.as_bytes()),
+                    false,
+                    &security
+                ),
                 Err(AxError::NotADirectory)
             ));
         }
         for (path, expected) in [("file/", &file), ("symlink/", &symlink)] {
-            let (_, _, target) =
-                resolve_unlink_target_in_fs(&context, Path::new(path), true, &security).unwrap();
+            let (_, _, target) = resolve_unlink_target_in_fs(
+                &context,
+                axfs_ng_vfs::FsPath::new(path.as_bytes()),
+                true,
+                &security,
+            )
+            .unwrap();
             assert!(target.same_node(expected));
         }
         for path in ["directory/", "directory/."] {
             assert!(matches!(
-                resolve_unlink_target_in_fs(&context, Path::new(path), false, &security),
+                resolve_unlink_target_in_fs(
+                    &context,
+                    axfs_ng_vfs::FsPath::new(path.as_bytes()),
+                    false,
+                    &security
+                ),
                 Err(AxError::IsADirectory)
             ));
         }
         assert!(matches!(
-            resolve_unlink_target_in_fs(&context, Path::new("directory/."), true, &security,),
+            resolve_unlink_target_in_fs(
+                &context,
+                axfs_ng_vfs::FsPath::new(b"directory/."),
+                true,
+                &security,
+            ),
             Err(AxError::InvalidInput)
         ));
         assert!(matches!(
-            resolve_unlink_target_in_fs(&context, Path::new("directory/.."), true, &security,),
+            resolve_unlink_target_in_fs(
+                &context,
+                axfs_ng_vfs::FsPath::new(b"directory/.."),
+                true,
+                &security,
+            ),
             Err(AxError::DirectoryNotEmpty)
         ));
         assert!(matches!(
-            resolve_unlink_target_in_fs(&context, Path::new("///"), false, &security),
+            resolve_unlink_target_in_fs(
+                &context,
+                axfs_ng_vfs::FsPath::new(b"///"),
+                false,
+                &security
+            ),
             Err(AxError::IsADirectory)
         ));
         assert!(matches!(
-            resolve_unlink_target_in_fs(&context, Path::new("///"), true, &security),
+            resolve_unlink_target_in_fs(
+                &context,
+                axfs_ng_vfs::FsPath::new(b"///"),
+                true,
+                &security
+            ),
             Err(AxError::ResourceBusy)
         ));
 
-        assert!(root.lookup_no_follow("file").unwrap().same_node(&file));
         assert!(
-            root.lookup_no_follow("directory")
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"file"))
+                .unwrap()
+                .same_node(&file)
+        );
+        assert!(
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"directory"))
                 .unwrap()
                 .same_node(&directory)
         );
         assert!(
-            root.lookup_no_follow("symlink")
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"symlink"))
                 .unwrap()
                 .same_node(&symlink)
         );
@@ -3038,12 +3105,24 @@ mod tests {
 
     #[test]
     fn symlink_target_uses_linux_empty_and_path_max_rules_without_name_max() {
-        assert_eq!(validate_symlink_target(""), Err(AxError::NotFound));
-        assert_eq!(validate_symlink_target("target"), Ok(()));
-        assert_eq!(validate_symlink_target(&"a".repeat(255 + 1)), Ok(()));
-        assert_eq!(validate_symlink_target(&"a".repeat(4095)), Ok(()));
         assert_eq!(
-            validate_symlink_target(&"a".repeat(4096)),
+            validate_symlink_target(axfs_ng_vfs::FsPath::new(b"")),
+            Err(AxError::NotFound)
+        );
+        assert_eq!(
+            validate_symlink_target(axfs_ng_vfs::FsPath::new(b"target")),
+            Ok(())
+        );
+        assert_eq!(
+            validate_symlink_target(axfs_ng_vfs::FsPath::new("a".repeat(255 + 1).as_bytes())),
+            Ok(())
+        );
+        assert_eq!(
+            validate_symlink_target(axfs_ng_vfs::FsPath::new("a".repeat(4095).as_bytes())),
+            Ok(())
+        );
+        assert_eq!(
+            validate_symlink_target(axfs_ng_vfs::FsPath::new("a".repeat(4096).as_bytes())),
             Err(AxError::NameTooLong)
         );
     }
@@ -3357,7 +3436,7 @@ mod tests {
         let file = mount
             .root_location()
             .create(
-                "chown-killpriv",
+                axfs_ng_vfs::FsName::new(b"chown-killpriv"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o755),
             )
@@ -3395,7 +3474,7 @@ mod tests {
         let file = mount
             .root_location()
             .create(
-                "chown-killpriv-backend-failure",
+                axfs_ng_vfs::FsName::new(b"chown-killpriv-backend-failure"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o6755),
             )

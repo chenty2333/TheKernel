@@ -1,0 +1,42 @@
+[package]
+name = "thekernel-linux-signal"
+version = "0.1.0"
+edition = "2024"
+authors = ["朝倉水希 <asakuramizu111@gmail.com>", "Mivik <mivikq@gmail.com>", "陈天意 <hi@tychen.cc>"]
+description = "Bounded signal queues and explicit-usercopy frames for no_std Linux ABI kernels"
+license = "Apache-2.0"
+repository = "https://github.com/chenty2333/thekernel-linux-abi"
+homepage = "https://github.com/chenty2333/thekernel-linux-abi"
+readme = "README.md"
+keywords = ["kernel", "linux", "no-std", "signal"]
+categories = ["no-std", "os"]
+
+[features]
+default = []
+
+[dependencies]
+bitflags = "2.6"
+derive_more = { version = "2.0", default-features = false, features = ["full"] }
+kspin = { version = "0.1", features = ["smp"] }
+linux-raw-sys = { version = "0.12", default-features = false, features = ["general", "no_std"] }
+log = "0.4"
+spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex"] }
+strum = { version = "0.27", default-features = false, features = ["derive"] }
+thekernel-linux-usercopy = { path = "../usercopy", version = "0.1" }
+x86_64 = { version = "=0.15.5", default-features = false }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[package.metadata.thekernel]
+layer = "linux_abi"
+# The workspace selects the rolling nightly toolchain; this crate only needs
+# the allocator_api nightly feature and intentionally does not pin a date.
+toolchain = "nightly"
+nightly-features = ["allocator_api"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

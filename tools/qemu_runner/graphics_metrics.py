@@ -14,11 +14,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import fmean
 
-from .graphics_benchmark import BENCHMARK_RENDERER_PREFIX
-from .profiles import INPUT_SAMPLES
+from .graphics_benchmark import BENCHMARK_COMPLETE_MARKER, BENCHMARK_RENDERER_PREFIX
+from .profiles import BENCHMARK_FAULTS, INPUT_SAMPLES
 
 
 METRIC_PREFIX = "THEKERNEL_GRAPHICS_METRIC "
+FAULT_PREFIX = "THEKERNEL_GRAPHICS_FAULT "
 WARMUP_FRAMES = 60
 SAMPLE_FRAMES = 600
 COUNTER_RESOURCE_KEYS = frozenset({"schema", "gpu_present", "atomic_commits", "vblanks"})
@@ -37,6 +38,7 @@ class GraphicsMetricError(ValueError):
 @dataclass(frozen=True)
 class GraphicsMetrics:
     renderer: str
+    fault: str
     frames: int
     average_fps: float
     frame_p99_ms: float
@@ -66,11 +68,20 @@ def parse_graphics_metrics(log_path: Path) -> GraphicsMetrics:
     expected_input = 0
     resource_samples: list[dict[str, int]] = []
     renderer: str | None = None
+    fault: str | None = None
     try:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as error:
         raise GraphicsMetricError(f"cannot read graphics benchmark log {log_path}: {error}") from error
+    if lines.count(BENCHMARK_COMPLETE_MARKER) != 1:
+        raise GraphicsMetricError("benchmark requires exactly one completion marker")
     for line in lines:
+        if line.startswith(FAULT_PREFIX):
+            candidate = line[len(FAULT_PREFIX):]
+            if candidate not in BENCHMARK_FAULTS | {"none"} or fault is not None:
+                raise GraphicsMetricError("invalid or duplicate graphics fault marker")
+            fault = candidate
+            continue
         if line.startswith(BENCHMARK_RENDERER_PREFIX):
             candidate = line[len(BENCHMARK_RENDERER_PREFIX) :]
             if candidate not in {"software", "virgl", "venus"}:
@@ -119,6 +130,8 @@ def parse_graphics_metrics(log_path: Path) -> GraphicsMetrics:
         )
     if renderer is None:
         raise GraphicsMetricError("benchmark did not emit a graphics renderer marker")
+    if fault is None:
+        raise GraphicsMetricError("benchmark did not emit a graphics fault marker")
     if len(input_ms) != INPUT_SAMPLES:
         raise GraphicsMetricError(
             f"benchmark requires exactly {INPUT_SAMPLES} host input-to-visible samples, got {len(input_ms)}"
@@ -148,6 +161,7 @@ def parse_graphics_metrics(log_path: Path) -> GraphicsMetrics:
     frame_ms = [value / 1_000_000 for value in frames]
     return GraphicsMetrics(
         renderer=renderer,
+        fault=fault,
         frames=len(frames),
         average_fps=1000 / fmean(frame_ms),
         frame_p99_ms=_p99(frame_ms),
@@ -165,6 +179,7 @@ def enforce_graphics_metrics(
     linux_oracle: GraphicsMetrics | None = None,
     *,
     expected_renderer: str | None = None,
+    expected_fault: str = "none",
 ) -> None:
     """Enforce the fixed Q35/KVM acceptance thresholds.
 
@@ -173,6 +188,8 @@ def enforce_graphics_metrics(
     """
 
     failures: list[str] = []
+    if metrics.fault != expected_fault:
+        failures.append(f"fault {metrics.fault} does not match requested {expected_fault}")
     if expected_renderer is not None and metrics.renderer != expected_renderer:
         failures.append(
             f"renderer {metrics.renderer} does not match requested {expected_renderer} topology"
@@ -200,6 +217,8 @@ def enforce_graphics_metrics(
     if nonzero_terminal:
         failures.append("terminal graphics errors/leaks: " + ", ".join(nonzero_terminal))
     if linux_oracle is not None:
+        if metrics.fault != linux_oracle.fault:
+            failures.append(f"fault differs from Linux oracle ({metrics.fault} != {linux_oracle.fault})")
         if metrics.renderer != linux_oracle.renderer:
             failures.append(
                 f"renderer differs from Linux oracle ({metrics.renderer} != {linux_oracle.renderer})"

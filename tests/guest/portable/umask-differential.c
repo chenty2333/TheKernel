@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -42,7 +43,7 @@ static int wait_success(pid_t child, const char *stage) {
 
 static int verify_create(mode_t expected) {
     char path[128];
-    if (snprintf(path, sizeof(path), "/tmp/thekernel-umask-%ld", (long)getpid()) >=
+    if (snprintf(path, sizeof(path), "/root/thekernel-umask-%ld", (long)getpid()) >=
         (int)sizeof(path)) {
         errno = ENAMETOOLONG;
         return fail("create-path");
@@ -56,6 +57,14 @@ static int verify_create(mode_t expected) {
         errno = EPROTO;
         return fail("create-mode");
     }
+    struct statfs filesystem;
+    if (fstatfs(fd, &filesystem) != 0 || filesystem.f_type != 0xef53) {
+        (void)close(fd);
+        (void)unlink(path);
+        errno = EPROTO;
+        return fail("ext4-fixture-required");
+    }
+    puts("THEKERNEL_ABI_ASSERT umask.raw-differential PROVIDER_EXT4 pass");
     if (close(fd) != 0 || unlink(path) != 0) return fail("create-cleanup");
     return 0;
 }
@@ -114,5 +123,6 @@ int main(int argc, char **argv) {
     (void)syscall(SYS_umask, initial);
     puts("THEKERNEL_ABI_ASSERT umask.raw-differential EXEC_PRESERVES_FS pass");
     puts("THEKERNEL_ABI_RESULT umask.raw-differential pass");
+    puts("THEKERNEL_UMASK_OK");
     return 0;
 }

@@ -179,6 +179,7 @@ static int wait_for_exit(pid_t child, const char *stage) {
 }
 
 static int run_exit_case(const char *stage, int (*test)(void)) {
+    printf("THEKERNEL_SECCOMP_CASE_BEGIN %s\n", stage);
     pid_t child = fork();
     if (child < 0) {
         return fail(stage);
@@ -186,7 +187,9 @@ static int run_exit_case(const char *stage, int (*test)(void)) {
     if (child == 0) {
         exit(test());
     }
-    return wait_for_exit(child, stage);
+    int result = wait_for_exit(child, stage);
+    printf("THEKERNEL_SECCOMP_CASE_END %s result=%d\n", stage, result);
+    return result;
 }
 
 static int test_api(void) {
@@ -410,6 +413,7 @@ static int test_trap(void) {
 
 static void *inherited_thread(void *unused) {
     (void)unused;
+    marker("THEKERNEL_SECCOMP_INHERIT_THREAD_BEGIN");
     errno = 0;
     long result = syscall(SYS_getpid);
     if (result != -1 || errno != EACCES ||
@@ -418,6 +422,7 @@ static void *inherited_thread(void *unused) {
         current_thread_seccomp_fields_are_exact(2)) {
         return (void *)(uintptr_t)1;
     }
+    marker("THEKERNEL_SECCOMP_INHERIT_THREAD_END");
     return NULL;
 }
 
@@ -475,11 +480,13 @@ static int test_inheritance(void) {
         install_action(SYS_getpid, SECCOMP_RET_ERRNO | EACCES)) {
         return 1;
     }
+    marker("THEKERNEL_SECCOMP_INHERIT_FILTER_READY");
 
     pthread_t thread;
     if (pthread_create(&thread, NULL, inherited_thread, NULL) != 0) {
         return fail("pthread-create");
     }
+    marker("THEKERNEL_SECCOMP_INHERIT_THREAD_CREATED");
     void *thread_result = NULL;
     if (pthread_join(thread, &thread_result) != 0 || thread_result != NULL) {
         errno = EPROTO;
@@ -605,14 +612,20 @@ static int test_unsupported_lifecycles(void) {
     }
     action = SECCOMP_RET_USER_NOTIF;
     errno = 0;
-    if (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0U, &action) != -1 ||
-        errno != EOPNOTSUPP) {
-        return fail("unsupported-user-notif-query");
+    if (syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0U, &action) != 0) {
+        return fail("user-notif-query");
+    }
+    struct seccomp_notif_sizes sizes = {0};
+    if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0U, &sizes) != 0 ||
+        sizes.seccomp_notif != sizeof(struct seccomp_notif) ||
+        sizes.seccomp_notif_resp != sizeof(struct seccomp_notif_resp) ||
+        sizes.seccomp_data != sizeof(struct seccomp_data)) {
+        return fail("notif-sizes-layout");
     }
     errno = 0;
     if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 0U, NULL) != -1 ||
-        errno != EOPNOTSUPP) {
-        return fail("unsupported-notif-sizes");
+        errno != EFAULT) {
+        return fail("notif-sizes-null");
     }
     errno = 0;
     if (syscall(SYS_seccomp, SECCOMP_GET_NOTIF_SIZES, 1U,
@@ -623,7 +636,12 @@ static int test_unsupported_lifecycles(void) {
     errno = 0;
     if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
                 SECCOMP_FILTER_FLAG_TSYNC, (void *)(uintptr_t)1) != -1 ||
-        errno != EINVAL) {
+        errno != EFAULT) {
+        return fail("tsync-filter-header-fault");
+    }
+    errno = 0;
+    if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER,
+                1U << 31, (void *)(uintptr_t)1) != -1 || errno != EINVAL) {
         return fail("unsupported-filter-flags-precedence");
     }
 
@@ -912,6 +930,8 @@ static int test_resource_release(void) {
         close(exit_pipe[0]);
         char token = 0;
         if (read(ready_pipe[0], &token, 1) != 1 || token != 'R') {
+            fprintf(stderr, "THEKERNEL_SECCOMP_RESOURCE_RELEASE_ITERATION %u\n",
+                    iteration);
             return fail("resource-release-ready");
         }
         char proc_path[64];
@@ -934,6 +954,25 @@ static int test_resource_release(void) {
         close(exit_pipe[1]);
         if (wait_for_exit(child, "resource-release-child")) {
             return 1;
+        }
+        /* This descriptor pins the exact retired Task, not a reused PID.
+         * Separate a still-attached filter from delayed RCU destruction. */
+        char retired_status[4096];
+        ssize_t status_length = pread(status_fd, retired_status,
+                                      sizeof(retired_status) - 1, 0);
+        if (status_length <= 0) {
+            fprintf(stderr, "THEKERNEL_SECCOMP_RESOURCE_RELEASE_ITERATION %u\n",
+                    iteration);
+            return fail("resource-release-retired-status-read");
+        }
+        retired_status[status_length] = '\0';
+        if (strstr(retired_status, "Seccomp:\t0\n") == NULL ||
+            strstr(retired_status, "Seccomp_filters:\t0\n") == NULL) {
+            fprintf(stderr,
+                    "THEKERNEL_SECCOMP_RESOURCE_RELEASE_RETAINED iteration=%u "
+                    "pid=%ld status=\n%s", iteration, (long)child, retired_status);
+            errno = EPROTO;
+            return fail("resource-release-retired-filter-attached");
         }
     }
     for (unsigned int index = 0; index < retained_count; ++index) {

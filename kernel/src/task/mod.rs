@@ -23,6 +23,7 @@ mod thread_cred;
 mod timer;
 mod user;
 mod usermode_helper;
+mod world;
 
 // Re-exports from split sub-modules — keep the old `crate::task::*` paths unchanged.
 #[cfg(test)]
@@ -32,6 +33,7 @@ pub(crate) use thekernel_linux_cred::{
     SECURITY_CAPABILITY_XATTR_NAME, SignalDeliveryScope, SignalNumber, SignalSecurityOperation,
     SignalSecuritySource, UserGid, UserUid, XATTR_NAME_MAX, validate_id_map_input,
 };
+pub(crate) use world::WorldId;
 
 pub(crate) use self::{
     access::{
@@ -108,6 +110,8 @@ pub use self::{
 /// Linearizes creation/replacement of a task's `fs_struct` with namespace-root
 /// replacement. The required lock order is this gate, then an individual
 /// `FsContext` mutex; pivot_root takes the gate before snapshotting tasks.
+/// Clone also nests task-parent publication inside this gate. Exit must release
+/// task-parent publication before acquiring this gate to retire its fs slot.
 pub(crate) static FS_CONTEXT_PUBLICATION: axsync::Mutex<()> = axsync::Mutex::new(());
 
 #[inline]

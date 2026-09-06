@@ -243,6 +243,8 @@ impl FileMappingLease {
 #[derive(Clone)]
 pub(crate) struct FileLikeMappingLease {
     owner: Option<DeferredFileLease>,
+    mapping_lifetime: Option<Arc<dyn core::any::Any + Send + Sync>>,
+    excludes_fork_and_dump: bool,
     owner_identity: usize,
     ofd_key: u64,
     initial_flags: MappingFlags,
@@ -266,6 +268,8 @@ impl FileLikeMappingLease {
         Self {
             owner_identity: owner.identity(),
             owner: Some(owner),
+            mapping_lifetime: None,
+            excludes_fork_and_dump: false,
             ofd_key,
             initial_flags,
             may_protect,
@@ -286,6 +290,8 @@ impl FileLikeMappingLease {
     ) -> Self {
         Self {
             owner: None,
+            mapping_lifetime: None,
+            excludes_fork_and_dump: false,
             owner_identity,
             ofd_key,
             initial_flags,
@@ -295,6 +301,17 @@ impl FileLikeMappingLease {
             object_offset,
         }
     }
+
+    pub(crate) fn with_mapping_lifetime(mut self, lease: Option<Arc<dyn core::any::Any + Send + Sync>>) -> Self {
+        self.mapping_lifetime = lease;
+        self
+    }
+
+    pub(crate) fn with_excluded_fork_and_dump(mut self, excluded: bool) -> Self {
+        self.excludes_fork_and_dump = excluded;
+        self
+    }
+    pub(crate) const fn excludes_fork_and_dump(&self) -> bool { self.excludes_fork_and_dump }
 
     pub(crate) const fn ofd_key(&self) -> u64 {
         self.ofd_key
@@ -335,7 +352,12 @@ impl FileLikeMappingLease {
         matches!(
             (&self.owner, &other.owner),
             (Some(_), Some(_)) | (None, None)
-        ) && self.owner_identity == other.owner_identity
+        ) && match (&self.mapping_lifetime, &other.mapping_lifetime) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        } && self.excludes_fork_and_dump == other.excludes_fork_and_dump
+            && self.owner_identity == other.owner_identity
             && self.ofd_key == other.ofd_key
             && self.initial_flags == other.initial_flags
             && self.may_protect == other.may_protect
@@ -644,7 +666,7 @@ mod tests {
         mount
             .root_location()
             .create(
-                name,
+                axfs_ng_vfs::FsName::new(name.as_bytes()),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -886,6 +908,22 @@ mod tests {
         assert_eq!(final_closes.load(Ordering::Acquire), 1);
         assert_eq!(drops.load(Ordering::Acquire), 1);
         drain_deferred_description_resource_only_for_test();
+    }
+
+    #[test]
+    fn mapping_lifetime_releases_only_after_the_last_fragment() {
+        let lease: Arc<dyn core::any::Any + Send + Sync> = Arc::new(17u64);
+        let weak = Arc::downgrade(&lease);
+        let mapping = FileLikeMappingLease::new_detached(
+            17, 29, VirtAddr::from(0x4000), 0,
+            MappingFlags::READ, MappingFlags::READ, FileMappingSharing::Shared,
+        ).with_mapping_lifetime(Some(lease));
+        let fragment = mapping.clone();
+        assert!(mapping.compatible_with(&fragment));
+        drop(mapping);
+        assert!(weak.upgrade().is_some());
+        drop(fragment);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

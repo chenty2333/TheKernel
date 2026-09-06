@@ -439,7 +439,7 @@ impl ReleaseDrainGuard {
         FILESYSTEM_RELEASE_DRAINING
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-            .then_some(Self)
+            .then(|| Self)
     }
 }
 
@@ -1293,6 +1293,16 @@ pub(crate) fn location_for_fd(fd: i32) -> Option<Location> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rejected_drain_guard_preserves_existing_owner() {
+        let _context = crate::test_support::scheduler_test_context();
+        let first = super::ReleaseDrainGuard::try_enter().expect("first drain owner");
+        assert!(super::ReleaseDrainGuard::try_enter().is_none());
+        assert!(super::ReleaseDrainGuard::try_enter().is_none());
+        drop(first);
+        assert!(super::ReleaseDrainGuard::try_enter().is_some());
+    }
+
     use axerrno::{AxError, AxResult};
     use axio::{IoBufMut, Write};
 
@@ -1318,6 +1328,12 @@ mod tests {
 
         fn flush(&mut self) -> AxResult<()> {
             Ok(())
+        }
+    }
+
+    impl axio::IoBuf for FaultAfterWrites {
+        fn remaining(&self) -> usize {
+            self.remaining
         }
     }
 

@@ -2413,8 +2413,12 @@ pub fn sys_fcntl(
 pub fn sys_flock(fd: c_int, operation: c_int) -> AxResult<isize> {
     debug!("flock <= fd: {fd}, operation: {operation}");
 
-    let description = get_file_description(fd)?;
+    // Linux ignores the obsolete mandatory-lock bit before decoding or fd lookup.
+    if operation & 32 != 0 {
+        return Ok(0);
+    }
     let locks_data = flock_operation_locks_data(operation)?;
+    let description = get_file_description(fd)?;
     let flags = description.status_flags();
     if flags & O_PATH != 0 || (locks_data && flags & O_ACCMODE == O_ACCMODE) {
         return Err(AxError::BadFileDescriptor);
@@ -2658,12 +2662,13 @@ mod namespace_operation_tests {
 
     #[test]
     fn denied_pre_open_admission_cannot_truncate_or_prepare_a_write_lease() {
+        let _context = crate::test_support::scheduler_test_context();
         let fs = MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&fs);
         let loc = mount
             .root_location()
             .create(
-                "deny-before-truncate",
+                axfs_ng_vfs::FsName::new(b"deny-before-truncate"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2690,13 +2695,14 @@ mod namespace_operation_tests {
 
     #[test]
     fn admitted_open_truncate_revokes_capability_before_size_commit() {
+        let _context = crate::test_support::scheduler_test_context();
         executable::init().unwrap();
         let fs = MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&fs);
         let loc = mount
             .root_location()
             .create(
-                "open-truncate-killpriv",
+                axfs_ng_vfs::FsName::new(b"open-truncate-killpriv"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2726,12 +2732,13 @@ mod namespace_operation_tests {
 
     #[test]
     fn read_only_append_stays_read_only_below_the_ofd_status_layer() {
+        let _context = crate::test_support::scheduler_test_context();
         let fs = MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&fs);
         let loc = mount
             .root_location()
             .create(
-                "read-only-append",
+                axfs_ng_vfs::FsName::new(b"read-only-append"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2749,12 +2756,13 @@ mod namespace_operation_tests {
 
     #[test]
     fn reserved_no_data_mode_runs_open_without_read_or_write_access() {
+        let _context = crate::test_support::scheduler_test_context();
         let fs = MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&fs);
         let loc = mount
             .root_location()
             .create(
-                "no-data-open",
+                axfs_ng_vfs::FsName::new(b"no-data-open"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )

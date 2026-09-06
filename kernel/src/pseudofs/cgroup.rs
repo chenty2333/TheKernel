@@ -4386,7 +4386,7 @@ mod tests {
         let mut children = HashMap::new();
         let child = test_cgroup_dir();
         try_reserve_cgroup_child_slot(&mut children, 1, true).unwrap();
-        children.insert("child".to_string(), child);
+        children.insert(FsNameBuf::from_vec(b"child".to_vec()).unwrap(), child);
 
         assert_eq!(
             try_reserve_cgroup_child_slot(&mut children, 1, true),
@@ -4650,7 +4650,7 @@ mod tests {
             .insert(202, Arc::new(CgroupMembershipPublication::new(false)));
 
         assert_eq!(
-            root_dir.unlink("child", true).unwrap_err(),
+            root_dir.unlink(FsName::new(b"child"), true).unwrap_err(),
             VfsError::ResourceBusy
         );
         assert_eq!(

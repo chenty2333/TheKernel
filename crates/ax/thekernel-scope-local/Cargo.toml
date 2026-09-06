@@ -1,0 +1,28 @@
+[package]
+name = "thekernel-scope-local"
+version = "0.1.2"
+edition = "2024"
+description = "Scope local storage"
+authors = ["朝倉水希 <asakuramizu111@gmail.com>"]
+keywords = ["arceos"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Starry-OS/scope-local"
+build = "build.rs"
+
+[dependencies]
+percpu = "0.2.3-preview.1"
+spin = { version = "0.10", default-features = false, features = ["lazy"] }
+
+[dev-dependencies]
+ctor = "0.6"
+percpu = { version = "0.2.3-preview.1", features = ["non-zero-vma"] }
+
+[[test]]
+name = "scope_local"
+path = "tests/scope_local.rs"
+
+[package.metadata.thekernel]
+layer = "platform"
+
+[package.metadata.thekernel.host-test]
+selected = true

@@ -478,7 +478,9 @@ impl FdTable {
     }
 
     fn finish_close(&self, removed: &FileDescriptor) {
-        self.finish_close_for_process(removed, current().as_thread().proc_data.proc.pid());
+        release_posix_locks_on_close(&removed.description);
+        removed.description.descriptor_closed();
+        crate::syscall::collect_scm_rights_cycles();
     }
 
     pub(crate) fn close(&self, fd: c_int) -> AxResult<FileDescriptor> {
@@ -926,10 +928,14 @@ pub(crate) fn prepare_file_description_with_open_lease(
 }
 
 pub(crate) fn release_posix_locks_on_close(description: &FileDescription) {
-    release_posix_locks_on_close_for_process(
-        description,
-        current().as_thread().proc_data.proc.pid(),
-    );
+    // Descriptions without inode metadata cannot own POSIX inode locks.
+    // Resolve the process only after establishing that there is an inode.
+    if let Ok(stat) = description.inner.stat() {
+        flock::release_posix_owner_on_inode(
+            current().as_thread().proc_data.proc.pid(),
+            (stat.dev, stat.ino),
+        );
+    }
 }
 
 pub(crate) fn release_posix_locks_on_close_for_process(description: &FileDescription, pid: Pid) {

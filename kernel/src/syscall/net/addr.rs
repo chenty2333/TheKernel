@@ -48,7 +48,7 @@ const _: [(); 2] = [(); size_of::<__kernel_sa_family_t>()];
 
 #[inline]
 const fn has_sockaddr_prefix(addrlen: socklen_t, required: usize) -> bool {
-    (addrlen as usize) >= required
+    (addrlen as usize) >= required && addrlen <= 128
 }
 
 pub(super) fn read_family(
@@ -56,7 +56,7 @@ pub(super) fn read_family(
     addr: UserConstPtr<sockaddr>,
     addrlen: socklen_t,
 ) -> AxResult<u16> {
-    if size_of::<__kernel_sa_family_t>() > addrlen as usize {
+    if size_of::<__kernel_sa_family_t>() > addrlen as usize || addrlen > 128 {
         return Err(AxError::InvalidInput);
     }
     let mut family = [0u8; size_of::<__kernel_sa_family_t>()];
@@ -471,7 +471,7 @@ mod tests {
             panic!("full pathname sockaddr parsed as a different address kind");
         };
         assert_eq!(path.len(), UNIX_PATH_CAPACITY);
-        assert!(path.as_bytes().iter().all(|byte| *byte == b'p'));
+        assert!(path.iter().all(|byte| *byte == b'p'));
 
         assert_invalid_len(UNIX_SOCKADDR_CAPACITY + 1);
     }
@@ -495,15 +495,16 @@ mod tests {
             panic!("pathname sockaddr parsed as a different address kind");
         };
         snapshot[size_of::<__kernel_sa_family_t>()..].fill(b'x');
-        assert_eq!(path.as_str(), "owned.sock");
+        assert_eq!(path.as_slice(), b"owned.sock");
     }
 
     #[test]
-    fn unix_sockaddr_rejects_invalid_utf8_pathname() {
-        assert_eq!(
-            parse_unix_socket_addr(&unix_snapshot(&[0xff])).unwrap_err(),
-            AxError::InvalidInput
-        );
+    fn unix_sockaddr_preserves_non_utf8_pathname_bytes() {
+        let address = parse_unix_socket_addr(&unix_snapshot(&[0xff])).unwrap();
+        let UnixSocketAddr::Path(path) = address else {
+            panic!("expected pathname address");
+        };
+        assert_eq!(path.as_slice(), &[0xff]);
     }
 
     #[test]
@@ -518,7 +519,7 @@ mod tests {
     #[test]
     fn unix_path_sockaddr_uses_two_byte_family_prefix() {
         let (encoded, len) =
-            serialize_unix_socket_addr(&UnixSocketAddr::Path(Arc::new(String::from("test.sock"))))
+            serialize_unix_socket_addr(&UnixSocketAddr::Path(Arc::new(b"test.sock".to_vec())))
                 .unwrap();
         let encoded = &encoded[..len];
         assert_eq!(
@@ -545,7 +546,7 @@ mod tests {
 
     #[test]
     fn unix_sockaddr_serialization_is_fixed_capacity_and_bounded() {
-        let full_path = UnixSocketAddr::Path(Arc::new("p".repeat(UNIX_PATH_CAPACITY)));
+        let full_path = UnixSocketAddr::Path(Arc::new(alloc::vec![b'p'; UNIX_PATH_CAPACITY]));
         let (_, len) = serialize_unix_socket_addr(&full_path).unwrap();
         assert_eq!(len, UNIX_SOCKADDR_OUTPUT_CAPACITY);
 
@@ -646,5 +647,13 @@ mod tests {
         .unwrap();
         assert_eq!(*parsed.ip(), Ipv6Addr::LOCALHOST);
         assert_eq!(parsed.port(), 9090);
+        assert_eq!(
+            SocketAddrV4::read_from_user(&capability, UserConstPtr::from(0x1ff0), 129),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            SocketAddrV6::read_from_user(&capability, UserConstPtr::from(0x1fe4), 129),
+            Err(AxError::InvalidInput)
+        );
     }
 }

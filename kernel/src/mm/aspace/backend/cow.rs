@@ -28,27 +28,94 @@ use crate::mm::swap::{self, SwapPte};
 
 struct FrameRefCnt {
     references: u32,
-    backing: Option<Arc<DemotedHugeBacking>>,
 }
 
-impl FrameRefCnt {
-    // This function may lock FRAME_TABLE again, so the caller should drop the lock first.
-    fn drop_frame(&mut self, paddr: PhysAddr, page_size: PageSize) {
-        assert!(self.references > 0, "dropping unreferenced frame");
-        self.references -= 1;
-        if self.references == 0 {
-            // Remove the frame from FRAME_TABLE before deallocating it to avoid a race:
-            // if we dealloc the frame first, another thread could allocate the same
-            // physical frame before we remove the table entry. This function assumes
-            // the caller is not holding the FRAME_TABLE lock, so it is safe to lock
-            // FRAME_TABLE here and perform the removal.
-            FRAME_TABLE.lock().remove_frame(paddr, page_size);
-            if let Some(backing) = self.backing.take() {
-                backing.retire(page_size);
-            } else {
-                dealloc_frame(paddr, page_size);
+#[derive(Clone)]
+enum CowFrameOwner {
+    Ordinary(Arc<SpinNoIrq<FrameRefCnt>>),
+    Demoted(Arc<DemotedHugeBacking>),
+}
+
+impl From<Arc<SpinNoIrq<FrameRefCnt>>> for CowFrameOwner {
+    fn from(value: Arc<SpinNoIrq<FrameRefCnt>>) -> Self {
+        Self::Ordinary(value)
+    }
+}
+
+impl CowFrameOwner {
+    fn retain(self, paddr: PhysAddr, size: PageSize) -> AxResult<Self> {
+        // Serialize with migration of the original exact-frame reference.
+        let _registry = FRAME_TABLE.lock();
+        if let Some(backing) = demoted_huge_backing(paddr) {
+            if !backing.contains_extent(paddr, size) {
+                return Err(AxError::BadState);
             }
+            backing.retain(size)?;
+            return Ok(Self::Demoted(backing));
         }
+        let Self::Ordinary(frame) = self else {
+            return Err(AxError::BadState);
+        };
+        {
+            let mut count = frame.lock();
+            count.references = count.references.checked_add(1).ok_or(AxError::BadAddress)?;
+        }
+        Ok(Self::Ordinary(frame))
+    }
+
+    fn retire(&self, paddr: PhysAddr, size: PageSize) {
+        let mut registry = FRAME_TABLE.lock();
+        // An ordinary journal can predate migration by another mm. Ownership
+        // follows the allocation's current registry, never its old geometry.
+        let backing = match self {
+            Self::Demoted(backing) => Some(backing.clone()),
+            Self::Ordinary(_) => demoted_huge_backing(paddr),
+        };
+        if let Some(backing) = backing {
+            assert!(backing.contains_extent(paddr, size));
+            let allocation = backing.retire(size);
+            drop(registry);
+            if let Some((base, size)) = allocation {
+                dealloc_frame(base, size);
+            }
+            return;
+        }
+        let Self::Ordinary(frame) = self else {
+            unreachable!()
+        };
+        let mut count = frame.lock();
+        assert!(count.references > 0, "dropping unreferenced frame");
+        count.references -= 1;
+        if count.references == 0 {
+            registry.remove_frame(paddr, size);
+            drop(count);
+            drop(registry);
+            dealloc_frame(paddr, size);
+        }
+    }
+}
+
+fn retire_cow_frame(paddr: PhysAddr, size: PageSize) {
+    let mut registry = FRAME_TABLE.lock();
+    let allocation = if let Some(backing) = demoted_huge_backing(paddr) {
+        assert!(backing.contains_extent(paddr, size));
+        backing.retire(size)
+    } else if let Some(frame) = registry.get_frame_ref(paddr, size) {
+        let mut count = frame.lock();
+        assert!(count.references > 0, "dropping unreferenced frame");
+        count.references -= 1;
+        if count.references == 0 {
+            registry.remove_frame(paddr, size);
+            Some((paddr, size))
+        } else {
+            None
+        }
+    } else {
+        Some((paddr, size))
+    };
+    drop(registry);
+    if let Some((base, size)) = allocation {
+        dealloc_frame(base, size);
     }
 }
 
@@ -83,7 +150,6 @@ impl FrameTableRefCount {
             .or_insert_with(|| {
                 Arc::new(SpinNoIrq::new(FrameRefCnt {
                     references: Self::INITIAL_CNT,
-                    backing: demoted_huge_backing(paddr),
                 }))
             })
             .clone()
@@ -106,8 +172,7 @@ static FRAME_TABLE: SpinNoIrq<FrameTableRefCount> = SpinNoIrq::new(FrameTableRef
 struct DemotedHugeBacking {
     base: PhysAddr,
     size: PageSize,
-    huge_references: AtomicUsize,
-    subpage_references: AtomicUsize,
+    mapped_units: AtomicUsize,
     released: AtomicBool,
 }
 
@@ -119,26 +184,42 @@ impl DemotedHugeBacking {
         paddr >= self.base && paddr.sub_addr(self.base) < self.size as usize
     }
 
-    fn retire(&self, page_size: PageSize) {
-        let references = match page_size {
-            PageSize::Size4K => &self.subpage_references,
-            PageSize::Size2M | PageSize::Size1G => &self.huge_references,
-            _ => panic!("invalid demoted huge leaf size"),
-        };
-        assert!(
-            references.fetch_sub(1, Ordering::AcqRel) > 0,
-            "dropping unreferenced demoted huge leaf"
-        );
-        if self.huge_references.load(Ordering::Acquire) == 0
-            && self.subpage_references.load(Ordering::Acquire) == 0
+    fn contains_extent(&self, paddr: PhysAddr, size: PageSize) -> bool {
+        self.contains(paddr)
+            && paddr
+                .sub_addr(self.base)
+                .checked_add(size as usize)
+                .is_some_and(|end| end <= self.size as usize)
+    }
+
+    fn retain(&self, page_size: PageSize) -> AxResult {
+        let units = page_size as usize / PAGE_SIZE_4K;
+        self.mapped_units
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(units)
+            })
+            .map(|_| ())
+            .map_err(|_| AxError::NoMemory)
+    }
+
+    fn retire(&self, page_size: PageSize) -> Option<(PhysAddr, PageSize)> {
+        let units = page_size as usize / PAGE_SIZE_4K;
+        let previous = self
+            .mapped_units
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(units)
+            })
+            .expect("dropping unreferenced demoted huge leaf");
+        if previous == units
             && self
                 .released
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
             DEMOTED_HUGE_BACKINGS.lock().remove(&self.base);
-            dealloc_frame(self.base, self.size);
+            return Some((self.base, self.size));
         }
+        None
     }
 }
 
@@ -150,57 +231,41 @@ fn demoted_huge_backing(paddr: PhysAddr) -> Option<Arc<DemotedHugeBacking>> {
         .and_then(|(_, backing)| backing.contains(paddr).then(|| backing.clone()))
 }
 
-/// Transfers one huge-PTE ownership unit into all of its P1 children.  If
-/// fork created sibling huge mappings first, their aggregate reference count
-/// remains attached to the original base frame and is retired independently.
+/// Registers the original allocation before a leaf's geometry changes.
+/// Ownership is measured in mapped 4K units: splitting a leaf preserves the
+/// total, while fork and retirement add/remove the actual leaf's unit count.
 pub(crate) fn register_demoted_huge_backing(base: PhysAddr, size: PageSize) -> AxResult {
     if !matches!(size, PageSize::Size2M | PageSize::Size1G) {
         return Err(AxError::InvalidInput);
     }
-    let subpages = size as usize / PAGE_SIZE_4K;
-    let existing = demoted_huge_backing(base);
-    let was_already_demoted = existing.is_some();
-    let backing = if let Some(backing) = existing {
-        if backing.base != base || backing.size != size {
-            return Err(AxError::BadState);
-        }
-        backing
-    } else {
-        let huge_references = FRAME_TABLE
-            .lock()
-            .get_frame_ref(base, size)
-            .map_or(0, |reference| reference.lock().references.saturating_sub(1));
-        let backing = Arc::try_new(DemotedHugeBacking {
-            base,
-            size,
-            huge_references: AtomicUsize::new(huge_references as usize),
-            subpage_references: AtomicUsize::new(0),
-            released: AtomicBool::new(false),
-        })
-        .map_err(|_| AxError::NoMemory)?;
-        DEMOTED_HUGE_BACKINGS.lock().insert(base, backing.clone());
-        backing
-    };
-
-    // The converting PTE ceases to be a huge reference. Keep the remaining
-    // fork siblings in FRAME_TABLE, but route their eventual final release to
-    // the same backing state.
-    if let Some(reference) = FRAME_TABLE.lock().get_frame_ref(base, size) {
-        let mut reference = reference.lock();
-        assert!(reference.references > 0, "invalid huge COW reference count");
-        reference.references -= 1;
-        reference.backing = Some(backing.clone());
-        if reference.references == 0 {
-            drop(reference);
-            FRAME_TABLE.lock().remove_frame(base, size);
-        }
+    let mut registry = FRAME_TABLE.lock();
+    if let Some(backing) = demoted_huge_backing(base) {
+        return if base
+            .sub_addr(backing.base)
+            .checked_add(size as usize)
+            .is_some_and(|end| end <= backing.size as usize)
+        {
+            Ok(())
+        } else {
+            Err(AxError::BadState)
+        };
     }
-    backing
-        .subpage_references
-        .fetch_add(subpages, Ordering::AcqRel);
-    if was_already_demoted {
-        backing.retire(size);
-    }
+    let references = registry
+        .get_frame_ref(base, size)
+        .map_or(1, |reference| reference.lock().references as usize);
+    let units = references
+        .checked_mul(size as usize / PAGE_SIZE_4K)
+        .ok_or(AxError::NoMemory)?;
+    let backing = Arc::try_new(DemotedHugeBacking {
+        base,
+        size,
+        mapped_units: AtomicUsize::new(units),
+        released: AtomicBool::new(false),
+    })
+    .map_err(|_| AxError::NoMemory)?;
+    // Publication and migration share the same lock as fork retain/retire.
+    DEMOTED_HUGE_BACKINGS.lock().insert(base, backing);
+    registry.table.remove(&(base, size as usize));
     Ok(())
 }
 
@@ -486,14 +551,7 @@ impl CowUnmapRetirement {
 impl Drop for CowUnmapRetirement {
     fn drop(&mut self) {
         for (_vaddr, frame, _flags, page_size) in self.leaves.drain(..) {
-            let frame_ref = { FRAME_TABLE.lock().get_frame_ref(frame, page_size) };
-            if let Some(frame_ref) = frame_ref {
-                frame_ref.lock().drop_frame(frame, page_size);
-            } else if let Some(backing) = demoted_huge_backing(frame) {
-                backing.retire(page_size);
-            } else {
-                dealloc_frame(frame, page_size);
-            }
+            retire_cow_frame(frame, page_size);
         }
     }
 }
@@ -632,7 +690,7 @@ struct CowCloneJournalEntry {
     paddr: PhysAddr,
     source_flags: MappingFlags,
     page_size: PageSize,
-    frame_ref: Option<Arc<SpinNoIrq<FrameRefCnt>>>,
+    frame_ref: Option<CowFrameOwner>,
     frame_retained: bool,
     eager_frame_owned: bool,
     source_protected: bool,
@@ -660,11 +718,7 @@ impl<'a, Ops: CowClonePageTableOps> CowCloneTransaction<'a, Ops> {
         })
     }
 
-    fn share_page(
-        &mut self,
-        page: CowClonePage,
-        frame_ref: Arc<SpinNoIrq<FrameRefCnt>>,
-    ) -> AxResult {
+    fn share_page(&mut self, page: CowClonePage, frame_ref: CowFrameOwner) -> AxResult {
         self.journal.push(CowCloneJournalEntry {
             source_vaddr: page.source_vaddr,
             destination_vaddr: page.destination_vaddr,
@@ -679,20 +733,13 @@ impl<'a, Ops: CowClonePageTableOps> CowCloneTransaction<'a, Ops> {
         });
         let entry = self.journal.last_mut().unwrap();
 
-        {
-            let mut frame = entry
-                .frame_ref
-                .as_ref()
-                .expect("shared COW page lost its frame reference")
-                .lock();
-            assert!(frame.references > 0, "referencing unreferenced frame");
-            let Some(next_refcnt) = frame.references.checked_add(1) else {
-                warn!("frame reference count overflow");
-                return Err(AxError::BadAddress);
-            };
-            frame.references = next_refcnt;
-            entry.frame_retained = true;
-        }
+        let retained = entry
+            .frame_ref
+            .take()
+            .expect("shared COW owner")
+            .retain(page.paddr, page.page_size)?;
+        entry.frame_ref = Some(retained);
+        entry.frame_retained = true;
 
         if page.protect_source {
             let protected_size = self
@@ -771,16 +818,11 @@ impl<Ops: CowClonePageTableOps> Drop for CowCloneTransaction<'_, Ops> {
             }
 
             if entry.frame_retained {
-                let mut frame = entry
+                entry
                     .frame_ref
                     .as_ref()
-                    .expect("retained COW page lost its frame reference")
-                    .lock();
-                assert!(
-                    frame.references > 1,
-                    "COW rollback lost the source frame reference"
-                );
-                frame.drop_frame(entry.paddr, entry.page_size);
+                    .expect("retained COW owner")
+                    .retire(entry.paddr, entry.page_size);
             }
 
             if entry.eager_frame_owned {
@@ -815,7 +857,7 @@ fn clone_pages_transactionally<Ops, Pages, FrameRef>(
 where
     Ops: CowClonePageTableOps,
     Pages: ExactSizeIterator<Item = CowClonePage>,
-    FrameRef: FnMut(PhysAddr, PageSize) -> Arc<SpinNoIrq<FrameRefCnt>>,
+    FrameRef: FnMut(PhysAddr, PageSize) -> CowFrameOwner,
 {
     let mut transaction = CowCloneTransaction::try_new(ops, pages.len())?;
     for page in pages {
@@ -872,12 +914,13 @@ impl CowBackend {
         self.materialized.store(true, Ordering::Relaxed);
     }
 
-    fn get_or_track_frame_ref(
-        &self,
-        paddr: PhysAddr,
-        page_size: PageSize,
-    ) -> Arc<SpinNoIrq<FrameRefCnt>> {
-        FRAME_TABLE.lock().get_or_init_frame(paddr, page_size)
+    fn get_or_track_frame_ref(&self, paddr: PhysAddr, page_size: PageSize) -> CowFrameOwner {
+        let mut registry = FRAME_TABLE.lock();
+        if let Some(backing) = demoted_huge_backing(paddr) {
+            CowFrameOwner::Demoted(backing)
+        } else {
+            CowFrameOwner::Ordinary(registry.get_or_init_frame(paddr, page_size))
+        }
     }
 
     pub(super) fn is_4k_anonymous(&self) -> bool {
@@ -1023,8 +1066,11 @@ impl CowBackend {
         if !self.is_4k_anonymous() {
             return false;
         }
-        FRAME_TABLE
-            .lock()
+        let mut registry = FRAME_TABLE.lock();
+        if demoted_huge_backing(paddr).is_some() {
+            return false;
+        }
+        registry
             .get_frame_ref(paddr, PageSize::Size4K)
             .is_none_or(|frame| frame.lock().references == 1)
     }
@@ -1060,11 +1106,7 @@ impl CowBackend {
     /// Drops the former resident ownership after a swap PTE has been
     /// published and the TLB grace period has elapsed.
     pub(super) fn release_swapped_frame(&self, paddr: PhysAddr) {
-        if let Some(frame) = FRAME_TABLE.lock().get_frame_ref(paddr, self.size) {
-            frame.lock().drop_frame(paddr, self.size);
-        } else {
-            dealloc_frame(paddr, self.size);
-        }
+        retire_cow_frame(paddr, self.size);
     }
 
     /// Atomically publishes one fully initialized anonymous page.
@@ -1219,20 +1261,15 @@ impl CowBackend {
         flags: MappingFlags,
         pt: &mut PageTableCursor,
     ) -> AxResult {
-        let frame = { FRAME_TABLE.lock().get_frame_ref(paddr, page_size) };
-        let backing = (page_size == PageSize::Size4K)
-            .then(|| demoted_huge_backing(paddr))
-            .flatten();
-        // An unsplit fork sibling is one logical owner of every P1 child.
-        // It is not represented by a per-P1 FRAME_TABLE entry, so retain it
-        // explicitly in the COW decision until that sibling is also demoted
-        // or unmapped.
-        let huge_sibling = backing
-            .as_ref()
-            .is_some_and(|backing| backing.huge_references.load(Ordering::Acquire) != 0);
-        let references = frame.as_ref().map_or(1, |frame| frame.lock().references);
-        assert!(references > 0, "invalid frame reference count");
-        if !huge_sibling && references == 1 {
+        let exclusive = {
+            let mut registry = FRAME_TABLE.lock();
+            // Exact-frame counts cannot prove exclusivity across geometries.
+            demoted_huge_backing(paddr).is_none()
+                && registry
+                    .get_frame_ref(paddr, page_size)
+                    .is_none_or(|frame| frame.lock().references == 1)
+        };
+        if exclusive {
             pt.protect(vaddr, page_table_flags(flags))?;
             pt.flush();
             drop(crate::mm::synchronize_tlb());
@@ -1254,11 +1291,7 @@ impl CowBackend {
         }
         pt.flush();
         drop(crate::mm::synchronize_tlb());
-        if let Some(frame) = frame {
-            frame.lock().drop_frame(paddr, page_size);
-        } else if let Some(backing) = backing {
-            backing.retire(PageSize::Size4K);
-        }
+        retire_cow_frame(paddr, page_size);
 
         self.mark_materialized();
         Ok(())
@@ -1533,7 +1566,7 @@ impl CowBackend {
             VirtAddrRange::try_from_start_size(new_start, size).ok_or(AxError::InvalidInput)?;
         pages_in(old_range, self.size)?;
         pages_in(new_range, self.size)?;
-        let materialized = pt.collect_present_leaves(old_start, size)?;
+        let materialized = pt.collect_mapped_leaves(old_start, size)?;
         if !materialized.is_empty() {
             self.mark_materialized();
         }
@@ -1546,7 +1579,10 @@ impl CowBackend {
                         destination_vaddr: new_start + source_vaddr.sub_addr(old_start),
                         paddr,
                         source_flags,
-                        destination_flags: page_table_flags(source_flags),
+                        // Page-table queries return already-normalized leaf
+                        // permissions. Preserve CET's W=0,D=1 encoding and
+                        // the exact pkey instead of treating them as VMA flags.
+                        destination_flags: source_flags,
                         page_size,
                         protect_source: false,
                         eager_copy: false,
@@ -1589,12 +1625,12 @@ impl BackendOps for CowBackend {
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<BackendRetirement> {
         debug!("Cow::unmap: {range:?}");
         // A resident huge COW leaf may have been demoted to P1 entries by
-        // pkey_mprotect. `drain_present_leaves` validates that the requested
+        // pkey_mprotect. `drain_mapped_leaves` validates that the requested
         // VMA range contains complete leaves before changing anything.
         if !self.is_materialized() {
             return Ok(BackendRetirement::empty());
         }
-        let materialized = pt.drain_present_leaves(range.start, range.size())?;
+        let materialized = pt.drain_mapped_leaves(range.start, range.size())?;
         Ok(BackendRetirement::cow(CowUnmapRetirement {
             leaves: materialized,
         }))
@@ -1684,7 +1720,7 @@ impl BackendOps for CowBackend {
                 }
             }
         }
-        let materialized = old_pt.collect_present_leaves(range.start, range.size())?;
+        let materialized = old_pt.collect_mapped_leaves(range.start, range.size())?;
         if !materialized.is_empty() {
             self.mark_materialized();
         }
@@ -1706,7 +1742,7 @@ impl BackendOps for CowBackend {
                         // pkey_mprotect. VMA flags alone may describe the
                         // neighboring fragment, so do not rebuild this leaf
                         // from the enclosing area's permissions.
-                        page_table_flags(source_flags)
+                        source_flags
                     } else {
                         cow_flags
                     },
@@ -1776,6 +1812,83 @@ mod tests {
     use crate::pseudofs::tmp::MemoryFs;
 
     #[test]
+    fn demoted_backing_migrates_three_fork_owners_and_releases_real_2m() {
+        let base = alloc_frame(false, PageSize::Size2M).unwrap();
+        let Backend::Cow(backend) = Backend::new_alloc(VirtAddr::from(0x4000), PageSize::Size2M)
+        else {
+            unreachable!()
+        };
+        let first = backend
+            .get_or_track_frame_ref(base, PageSize::Size2M)
+            .retain(base, PageSize::Size2M)
+            .unwrap();
+        let second = backend
+            .get_or_track_frame_ref(base, PageSize::Size2M)
+            .retain(base, PageSize::Size2M)
+            .unwrap();
+        register_demoted_huge_backing(base, PageSize::Size2M).unwrap();
+        let backing = demoted_huge_backing(base).unwrap();
+        assert_eq!(backing.mapped_units.load(Ordering::Acquire), 3 * 512);
+        assert!(
+            FRAME_TABLE
+                .lock()
+                .get_frame_ref(base, PageSize::Size2M)
+                .is_none()
+        );
+        // These journals were acquired before migration; rollback/release
+        // must follow the current allocation registry, not their stale Arc.
+        first.retire(base, PageSize::Size2M);
+        second.retire(base, PageSize::Size2M);
+        assert_eq!(backing.mapped_units.load(Ordering::Acquire), 512);
+        let child = backend
+            .get_or_track_frame_ref(base, PageSize::Size4K)
+            .retain(base, PageSize::Size4K)
+            .unwrap();
+        assert!(matches!(child, CowFrameOwner::Demoted(_)));
+        child.retire(base, PageSize::Size4K);
+        for index in 0..512 {
+            retire_cow_frame(base + index * PAGE_SIZE_4K, PageSize::Size4K);
+        }
+        assert_eq!(backing.mapped_units.load(Ordering::Acquire), 0);
+        assert!(backing.released.load(Ordering::Acquire));
+        assert!(demoted_huge_backing(base).is_none());
+    }
+
+    #[test]
+    fn synthetic_1g_backing_accounts_mixed_leaf_geometry_without_freeing_fake_pa() {
+        // This is a registry/geometry test, not a physical 1G allocation.
+        // The final release event is inspected directly and never dispatched
+        // to the allocator for this synthetic physical address.
+        let base = PhysAddr::from(0x6000_0000_0000usize);
+        register_demoted_huge_backing(base, PageSize::Size1G).unwrap();
+        let backing = demoted_huge_backing(base).unwrap();
+        backing.retain(PageSize::Size1G).unwrap(); // unsplit fork sibling
+        // One 1G PTE becomes 511 PMDs plus 512 P1 leaves, with no unit change.
+        for index in 0..512 {
+            retire_cow_frame(base + index * PAGE_SIZE_4K, PageSize::Size4K);
+        }
+        for index in 1..512 {
+            retire_cow_frame(base + index * PageSize::Size2M as usize, PageSize::Size2M);
+        }
+        assert_eq!(backing.mapped_units.load(Ordering::Acquire), 262144);
+        // A later pkey operation on a different 2M region must reuse the same
+        // original allocation, regardless of the source leaf's geometry.
+        let middle = base + 17 * PageSize::Size2M as usize;
+        register_demoted_huge_backing(middle, PageSize::Size2M).unwrap();
+        assert!(Arc::ptr_eq(
+            &backing,
+            &demoted_huge_backing(middle).unwrap()
+        ));
+        assert_eq!(backing.mapped_units.load(Ordering::Acquire), 262144);
+        let _registry = FRAME_TABLE.lock();
+        assert_eq!(
+            backing.retire(PageSize::Size1G),
+            Some((base, PageSize::Size1G))
+        );
+        assert!(demoted_huge_backing(base).is_none());
+    }
+
+    #[test]
     fn incomplete_prepared_frame_is_never_publishable() {
         let mut prepared = PreparedCowPage {
             frame: PreparedCowFrame::Incomplete(PhysAddr::from(0x4000)),
@@ -1834,7 +1947,7 @@ mod tests {
         let location = mount
             .root_location()
             .create(
-                "collapse-private-file-cow",
+                axfs_ng_vfs::FsName::new(b"collapse-private-file-cow"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -1898,7 +2011,7 @@ mod tests {
         let location = mount
             .root_location()
             .create(
-                "pin-aware-private-file-cow",
+                axfs_ng_vfs::FsName::new(b"pin-aware-private-file-cow"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -1932,7 +2045,7 @@ mod tests {
         let location = mount
             .root_location()
             .create(
-                "private-cow-madvise-cache",
+                axfs_ng_vfs::FsName::new(b"private-cow-madvise-cache"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2048,7 +2161,6 @@ mod tests {
                     page.paddr,
                     Arc::new(SpinNoIrq::new(FrameRefCnt {
                         references: FrameTableRefCount::INITIAL_CNT,
-                        backing: None,
                     })),
                 )
             })
@@ -2168,7 +2280,7 @@ mod tests {
         let mut ops = mock_clone_ops(&pages, 3);
         assert_eq!(
             clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-                frame_refs.get(&paddr).unwrap().clone()
+                frame_refs.get(&paddr).unwrap().clone().into()
             }),
             Err(AxError::NoMemory)
         );
@@ -2226,7 +2338,7 @@ mod tests {
 
         assert_eq!(
             clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-                frame_refs.get(&paddr).unwrap().clone()
+                frame_refs.get(&paddr).unwrap().clone().into()
             }),
             Err(AxError::NoMemory)
         );
@@ -2259,7 +2371,7 @@ mod tests {
         let mut ops = mock_clone_ops(&pages, usize::MAX);
 
         clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-            frame_refs.get(&paddr).unwrap().clone()
+            frame_refs.get(&paddr).unwrap().clone().into()
         })
         .unwrap();
 
@@ -2290,7 +2402,7 @@ mod tests {
         let mut ops = mock_clone_ops(&pages, usize::MAX);
 
         clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-            frame_refs.get(&paddr).unwrap().clone()
+            frame_refs.get(&paddr).unwrap().clone().into()
         })
         .unwrap();
 
@@ -2322,7 +2434,7 @@ mod tests {
         let mut ops = mock_clone_ops(&pages, usize::MAX);
 
         clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-            frame_refs.get(&paddr).unwrap().clone()
+            frame_refs.get(&paddr).unwrap().clone().into()
         })
         .unwrap();
 
@@ -2352,7 +2464,7 @@ mod tests {
 
         assert_eq!(
             clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-                frame_refs.get(&paddr).unwrap().clone()
+                frame_refs.get(&paddr).unwrap().clone().into()
             }),
             Err(AxError::NoMemory)
         );
@@ -2385,7 +2497,7 @@ mod tests {
 
         assert_eq!(
             clone_pages_transactionally(pages.into_iter(), page_size, &mut ops, |paddr, _| {
-                frame_refs.get(&paddr).unwrap().clone()
+                frame_refs.get(&paddr).unwrap().clone().into()
             }),
             Err(AxError::BadAddress)
         );

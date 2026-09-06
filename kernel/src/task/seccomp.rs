@@ -443,6 +443,7 @@ impl Thread {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use alloc::{sync::Arc, vec};
 
     use spin::Mutex;
@@ -535,6 +536,81 @@ mod tests {
         drop(initial);
         crate::rcu::drain_seccomp_retire(2);
         assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn exit_snapshot_under_lifecycle_observes_concurrent_tsync_publication() {
+        let _serial = SECCOMP_TEST_SERIAL.lock();
+        let lifecycle = Arc::new(std::sync::Mutex::new(()));
+        let budget = FilterBudget::try_new(4096).unwrap();
+        let root = FilterChain::empty();
+        let leaf = append_allow_filter(&root, &budget);
+        let mut filtered = SeccompState::disabled();
+        filtered.try_publish_filter(&root, &leaf).unwrap();
+        drop(leaf);
+        let slot = Arc::new(crate::rcu::seccomp_slot(Some(Arc::new(filtered))).unwrap());
+        let stale_before_lifecycle = slot.load();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let writer_slot = slot.clone();
+        let writer_gate = lifecycle.clone();
+        let writer = std::thread::spawn(move || {
+            let retired;
+            {
+                let _gate = writer_gate.lock().unwrap();
+                let expected = writer_slot.load();
+                let replacement = Arc::new((*expected).clone());
+                let reservation = writer_slot.reserve_retire().unwrap();
+                retired = match writer_slot.publish(replacement, &expected, reservation) {
+                    Ok(retired) => retired,
+                    Err(_) => panic!("serialized TSYNC publication failed"),
+                };
+                published_tx.send(()).unwrap();
+            }
+            drop(retired);
+        });
+        published_rx.recv().unwrap();
+        let retired;
+        {
+            let _gate = lifecycle.lock().unwrap();
+            let expected = slot.load();
+            assert!(!Arc::ptr_eq(&expected, &stale_before_lifecycle));
+            let reservation = slot.reserve_retire().unwrap();
+            retired = slot.clear(&expected, reservation).unwrap();
+            assert!(slot.load_if_present().is_none());
+        }
+        writer.join().unwrap();
+        drop(stale_before_lifecycle);
+        drop(retired);
+        crate::rcu::drain_seccomp_retire(SECCOMP_RETIRE_CAPACITY);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[test]
+    fn retained_terminal_slots_release_filter_budget_before_slot_destruction() {
+        let _serial = SECCOMP_TEST_SERIAL.lock();
+        let budget = FilterBudget::try_new(4096).unwrap();
+        let mut retained_slots = alloc::vec::Vec::new();
+        for _ in 0..72 {
+            let root = FilterChain::empty();
+            let leaf = append_allow_filter(&root, &budget);
+            let mut state = SeccompState::disabled();
+            state.try_publish_filter(&root, &leaf).unwrap();
+            drop(leaf);
+            let slot = crate::rcu::seccomp_slot(Some(Arc::new(state))).unwrap();
+            let expected = slot.load();
+            let reservation = slot.reserve_retire().unwrap();
+            let retirement = slot.clear(&expected, reservation).unwrap();
+            drop(expected);
+            // This is the state observable by a proc owner after zombie
+            // publication, even while exit still holds destructor custody.
+            assert!(slot.load_if_present().is_none());
+            assert!(budget.used_bytes() > 0);
+            retained_slots.push(slot);
+            drop(retirement);
+            crate::rcu::drain_seccomp_retire(SECCOMP_RETIRE_CAPACITY);
+            assert_eq!(budget.used_bytes(), 0);
+        }
+        assert_eq!(retained_slots.len(), 72);
     }
 
     #[test]

@@ -6,13 +6,13 @@ use core::{
 use axerrno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
-    CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, TFD_CLOEXEC, TFD_NONBLOCK, TFD_TIMER_ABSTIME,
-    TFD_TIMER_CANCEL_ON_SET, itimerspec, timespec,
+    CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, O_NONBLOCK, O_RDWR, TFD_CLOEXEC, TFD_NONBLOCK,
+    TFD_TIMER_ABSTIME, TFD_TIMER_CANCEL_ON_SET, itimerspec, timespec,
 };
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::{
-    file::{FileLike, add_file_like, timerfd::TimerFd},
+    file::{FileLike, add_file_like_with_flags, timerfd::TimerFd},
     mm::map_usercopy_error,
     time::TimeValueLike,
 };
@@ -72,7 +72,13 @@ pub fn sys_timerfd_create(clockid: i32, flags: u32) -> AxResult<isize> {
 
     let tfd = TimerFd::try_new(clock)?;
     tfd.set_nonblocking(flags.contains(TimerFdCreateFlags::NONBLOCK))?;
-    add_file_like(tfd as _, flags.contains(TimerFdCreateFlags::CLOEXEC)).map(|fd| fd as _)
+    let status_flags = O_RDWR | (flags.bits() & O_NONBLOCK);
+    add_file_like_with_flags(
+        tfd as _,
+        flags.contains(TimerFdCreateFlags::CLOEXEC),
+        status_flags,
+    )
+    .map(|fd| fd as _)
 }
 
 pub fn sys_timerfd_settime<M: UserMemory + ?Sized>(
@@ -84,6 +90,11 @@ pub fn sys_timerfd_settime<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     debug!("sys_timerfd_settime <= fd: {fd}, flags: {flags}");
 
+    let new_value = unsafe {
+        VmPtr::vm_read_uninit(new_value, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
     let flags = flags as u32;
     if flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) != 0 {
         return Err(AxError::InvalidInput);
@@ -91,11 +102,6 @@ pub fn sys_timerfd_settime<M: UserMemory + ?Sized>(
     let absolute = (flags & TFD_TIMER_ABSTIME) != 0;
     let cancel_on_set = (flags & TFD_TIMER_CANCEL_ON_SET) != 0;
 
-    let new_value = unsafe {
-        VmPtr::vm_read_uninit(new_value, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
     let (interval, value) = itimerspec_to_durations(&new_value)?;
 
     let tfd = TimerFd::from_fd(fd)?;

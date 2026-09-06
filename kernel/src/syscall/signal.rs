@@ -72,7 +72,18 @@ pub(crate) fn parse_signo(signo: u32) -> AxResult<Signo> {
 }
 
 fn current_visible_tid() -> Pid {
-    current().as_thread().tid()
+    let curr = current();
+    let thread = curr.as_thread();
+    thread.pid_ns().visible_pid(thread.tid())
+}
+
+/// Translate only at syscall entry; pinned authorization helpers use global identities.
+fn resolve_signal_pid(pid: Pid) -> AxResult<Pid> {
+    current()
+        .as_thread()
+        .pid_ns()
+        .resolve_visible_pid(pid)
+        .ok_or(AxError::NoSuchProcess)
 }
 
 pub fn sys_rt_sigprocmask<M: UserMemory + ?Sized>(
@@ -130,11 +141,6 @@ pub fn sys_rt_sigaction<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     check_sigset_size(sigsetsize)?;
 
-    let signo = parse_signo(signo)?;
-    if matches!(signo, Signo::SIGKILL | Signo::SIGSTOP) {
-        return Err(AxError::InvalidInput);
-    }
-
     let new_action = if !act.is_null() {
         let mut action: SignalAction = RawSignalAction::read_from_user(memory, act)
             .map_err(map_usercopy_error)?
@@ -145,6 +151,11 @@ pub fn sys_rt_sigaction<M: UserMemory + ?Sized>(
     } else {
         None
     };
+
+    let signo = parse_signo(signo)?;
+    if new_action.is_some() && matches!(signo, Signo::SIGKILL | Signo::SIGSTOP) {
+        return Err(AxError::InvalidInput);
+    }
 
     let curr = current();
     let proc_data = &curr.as_thread().proc_data;
@@ -212,7 +223,7 @@ fn make_siginfo(signo: u32, code: i32) -> AxResult<Option<SignalInfo>> {
     Ok(Some(SignalInfo::new_user(
         signo,
         code,
-        thread.proc_data.proc.pid(),
+        thread.pid_ns().visible_pid(thread.proc_data.proc.pid()),
         uid,
     )))
 }
@@ -965,7 +976,7 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
 
     match pid {
         1.. => {
-            let pid = pid as Pid;
+            let pid = resolve_signal_pid(pid as Pid)?;
             match authorize_process_signal_target(pid, operation) {
                 Ok(target) => {
                     complete_initial_process_signal(target, sig, operation, false)?;
@@ -1035,7 +1046,8 @@ pub fn sys_tkill(tid: i32, signo: u32) -> AxResult<isize> {
         SignalSecuritySource::Thread,
         SignalDeliveryScope::Thread,
     )?;
-    let target = authorize_numeric_thread_signal_target(None, tid as Pid, operation)?;
+    let tid = resolve_signal_pid(tid as Pid)?;
+    let target = authorize_numeric_thread_signal_target(None, tid, operation)?;
     send_signal_to_authorized_numeric_thread(target, sig, true)?;
     Ok(0)
 }
@@ -1050,7 +1062,9 @@ pub fn sys_tgkill(tgid: i32, tid: i32, signo: u32) -> AxResult<isize> {
         SignalSecuritySource::Thread,
         SignalDeliveryScope::Thread,
     )?;
-    let target = authorize_numeric_thread_signal_target(Some(tgid as Pid), tid as Pid, operation)?;
+    let tgid = resolve_signal_pid(tgid as Pid)?;
+    let tid = resolve_signal_pid(tid as Pid)?;
+    let target = authorize_numeric_thread_signal_target(Some(tgid), tid, operation)?;
     send_signal_to_authorized_numeric_thread(target, sig, true)?;
     Ok(0)
 }
@@ -1066,11 +1080,19 @@ fn make_queue_signal_info<M: UserMemory + ?Sized>(
     signo: u32,
     sig: *const SignalInfo,
 ) -> AxResult<QueuedSignalRequest> {
-    let mut sig = unsafe {
+    let sig = unsafe {
         VmPtr::vm_read_uninit(sig, memory)
             .map_err(map_usercopy_error)?
             .assume_init()
     };
+    prepare_queue_signal_info(target_tid, signo, sig)
+}
+
+fn prepare_queue_signal_info(
+    target_tid: Pid,
+    signo: u32,
+    mut sig: SignalInfo,
+) -> AxResult<QueuedSignalRequest> {
     let signo = (signo != 0).then(|| parse_signo(signo)).transpose()?;
     if (sig.code() >= 0 || sig.code() == SI_TKILL) && current_visible_tid() != target_tid {
         return Err(AxError::OperationNotPermitted);
@@ -1102,6 +1124,7 @@ pub fn sys_rt_sigqueueinfo<M: UserMemory + ?Sized>(
     )?;
     let sig = request.signal;
     let queue_required = queued_signal_required(&sig);
+    let pid = resolve_signal_pid(pid)?;
     match authorize_process_signal_target(pid, operation) {
         Ok(target) => {
             complete_initial_process_signal(target, sig, operation, queue_required)?;
@@ -1120,11 +1143,16 @@ pub fn sys_rt_tgsigqueueinfo<M: UserMemory + ?Sized>(
     signo: u32,
     sig: *const SignalInfo,
 ) -> AxResult<isize> {
+    let sig = unsafe {
+        VmPtr::vm_read_uninit(sig, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
     if tgid <= 0 || tid <= 0 {
         return Err(AxError::InvalidInput);
     }
 
-    let request = make_queue_signal_info(memory, tid as Pid, signo, sig)?;
+    let request = prepare_queue_signal_info(tid as Pid, signo, sig)?;
     let operation = signal_operation(
         signal_signo(&request.signal),
         SignalSecuritySource::Queued { code: request.code },
@@ -1132,7 +1160,9 @@ pub fn sys_rt_tgsigqueueinfo<M: UserMemory + ?Sized>(
     )?;
     let sig = request.signal;
     let queue_required = queued_signal_required(&sig);
-    let target = authorize_numeric_thread_signal_target(Some(tgid as Pid), tid as Pid, operation)?;
+    let tgid = resolve_signal_pid(tgid as Pid)?;
+    let tid = resolve_signal_pid(tid as Pid)?;
+    let target = authorize_numeric_thread_signal_target(Some(tgid), tid, operation)?;
     send_signal_to_authorized_numeric_thread(target, sig, queue_required)?;
     Ok(0)
 }
@@ -1874,23 +1904,26 @@ fn prepare_sigaltstack_update(
     current_sp: usize,
     candidate: SignalStack,
 ) -> AxResult<SignalStack> {
-    let valid_flags = SS_DISABLE | SS_AUTODISARM;
-    if candidate.flags & !valid_flags != 0 || candidate.flags & SS_ONSTACK != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if current_stack.contains_sp(current_sp) {
+    if current_stack.flags & SS_AUTODISARM == 0 && current_stack.contains_sp(current_sp) {
         return Err(AxError::OperationNotPermitted);
     }
-    if candidate.flags & SS_DISABLE != 0 {
-        return Ok(SignalStack::default());
+    let mode = candidate.flags & !SS_AUTODISARM;
+    if !matches!(mode, 0 | SS_DISABLE | SS_ONSTACK) {
+        return Err(AxError::InvalidInput);
+    }
+    if mode == SS_DISABLE {
+        return Ok(SignalStack::new(0, candidate.flags, 0));
     }
     if candidate.size < MINSIGSTKSZ as usize {
         return Err(AxError::NoMemory);
     }
-    if candidate.sp.checked_add(candidate.size).is_none() {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(candidate)
+    // Linux stores stack geometry here; actual frame publication separately
+    // validates usable addresses. Clear user-supplied ABI padding as well.
+    Ok(SignalStack::new(
+        candidate.sp,
+        candidate.flags,
+        candidate.size,
+    ))
 }
 
 pub fn sys_sigaltstack<M: UserMemory + ?Sized>(
@@ -1904,7 +1937,7 @@ pub fn sys_sigaltstack<M: UserMemory + ?Sized>(
     let current_stack = sig.stack();
 
     // Read and validate the proposed state before writing `old_ss`. Besides
-    // keeping publication last, this gives overlapping `ss == old_ss` the
+    // this gives overlapping `ss == old_ss` the
     // Linux ordering: the input value is captured before the old state is
     // copied back to the same userspace address.
     let prepared = if let Some(ss) = VmPtr::nullable(ss) {
@@ -1922,9 +1955,22 @@ pub fn sys_sigaltstack<M: UserMemory + ?Sized>(
         None
     };
 
+    if let Some(prepared) = prepared {
+        sig.set_stack(prepared);
+    }
+
     if let Some(old_ss) = VmPtr::nullable(old_ss) {
         let mut visible_stack = current_stack;
-        visible_stack.flags = current_stack.flags_at(uctx.sp());
+        visible_stack.flags = if current_stack.flags & SS_AUTODISARM != 0 {
+            SS_AUTODISARM
+                | if current_stack.disabled() {
+                    SS_DISABLE
+                } else {
+                    0
+                }
+        } else {
+            current_stack.flags_at(uctx.sp())
+        };
         // SAFETY: SignalStack::new/default construction initializes its
         // explicit ABI padding, and the manager returns a fully initialized
         // value before this copyout.
@@ -1934,9 +1980,6 @@ pub fn sys_sigaltstack<M: UserMemory + ?Sized>(
         }
     }
 
-    if let Some(prepared) = prepared {
-        sig.set_stack(prepared);
-    }
     Ok(0)
 }
 
@@ -2332,7 +2375,7 @@ mod tests {
     }
 
     #[test]
-    fn sigaltstack_update_rejects_onstack_mutation_and_wrapping_ranges() {
+    fn sigaltstack_update_rejects_onstack_mutation_but_accepts_stored_geometry() {
         let current = SignalStack::new(0x1000, 0, 0x2000);
         let replacement = SignalStack::new(0x8000, 0, MINSIGSTKSZ as usize);
         assert_eq!(
@@ -2345,8 +2388,9 @@ mod tests {
                 0x4000,
                 SignalStack::new(usize::MAX - 8, 0, MINSIGSTKSZ as usize),
             )
-            .err(),
-            Some(AxError::InvalidInput)
+            .unwrap()
+            .sp,
+            usize::MAX - 8
         );
         assert_eq!(
             prepare_sigaltstack_update(
@@ -2354,8 +2398,9 @@ mod tests {
                 0x4000,
                 SignalStack::new(0x8000, SS_ONSTACK, MINSIGSTKSZ as usize),
             )
-            .err(),
-            Some(AxError::InvalidInput)
+            .unwrap()
+            .flags,
+            SS_ONSTACK
         );
         assert!(
             prepare_sigaltstack_update(&current, 0x4000, SignalStack::new(1, SS_DISABLE, 1),)

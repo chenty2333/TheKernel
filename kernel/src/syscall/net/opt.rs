@@ -1404,9 +1404,12 @@ pub fn sys_getsockopt(
         return Ok(0);
     }
     macro_rules! dispatch {
-        (PeerCredentials as Ucred) => {
+        // The outer dispatcher forwards an opaque `ty` fragment; match it
+        // as a fragment here so the dedicated credential ABI path is selected.
+        (PeerCredentials as $conv:ty) => {
             let mut val = Default::default();
             socket.get_option(GetSocketOption::PeerCredentials(&mut val))?;
+            val.pid = super::socket_credential_pid(snapshot.pid_namespace(), val.pid);
             write_ucred(&capability, optval, &mut optlen, val)?;
         };
         ($which:ident) => {
@@ -1912,7 +1915,9 @@ pub fn sys_setsockopt(
         }
     }
     macro_rules! dispatch {
-        (PeerCredentials as Ucred) => {
+        // The outer dispatcher forwards an opaque `ty` fragment; match it
+        // as a fragment here so the dedicated credential ABI path is selected.
+        (PeerCredentials as $conv:ty) => {
             let val = read_ucred(&capability, optval, optlen)?;
             socket.set_option(SetSocketOption::PeerCredentials(&val))?;
         };

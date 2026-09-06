@@ -21,14 +21,11 @@ use crate::mm::{
     UserNofaultError, fault_user_range_task, read_user_nofault_task, try_user_nofault_transaction,
 };
 
-/// Size of the kernel-maintained rseq feature prefix advertised to a new
-/// image. The registration ABI still requires the full 32-byte area, but this
-/// profile publishes the complete base area.  `mm_cid` is currently zero for
-/// the single-mm-cid implementation, but it remains a kernel-owned field and
-/// must be refreshed with the CPU/node tuple on every return-to-user edge.
-pub(crate) const AT_RSEQ_FEATURE_SIZE: usize = 32;
-/// Alignment of the Linux v6.6 rseq ABI area advertised to a new user image.
-pub(crate) const AT_RSEQ_ALIGN: usize = thekernel_linux_rseq::RSEQ_AREA_ALIGN;
+/// Linux 7.2.3 feature extent, independent of optional slice capabilities.
+/// Legacy length-32 registrations keep their original alignment.
+pub(crate) const AT_RSEQ_FEATURE_SIZE: usize = thekernel_linux_rseq::RSEQ_ABI_SIZE;
+/// Alignment of extended rseq areas advertised to a new user image.
+pub(crate) const AT_RSEQ_ALIGN: usize = thekernel_linux_rseq::RSEQ_ABI_ALIGN;
 
 impl Thread {
     /// Runs one operation against this thread's serialized rseq state.
@@ -569,9 +566,9 @@ mod tests {
 
     #[test]
     fn auxv_feature_size_includes_the_complete_base_area() {
-        assert_eq!(AT_RSEQ_FEATURE_SIZE, 32);
-        assert_eq!(AT_RSEQ_ALIGN, thekernel_linux_rseq::RSEQ_AREA_ALIGN);
-        assert_eq!(thekernel_linux_rseq::RSEQ_ABI_SIZE, 32);
+        assert_eq!(AT_RSEQ_FEATURE_SIZE, 33);
+        assert_eq!(AT_RSEQ_ALIGN, 64);
+        assert_eq!(thekernel_linux_rseq::RSEQ_ABI_SIZE, 33);
     }
 
     #[test]

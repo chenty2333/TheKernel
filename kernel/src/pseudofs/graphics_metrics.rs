@@ -28,7 +28,10 @@ fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
 }
 
 fn snapshot_json() -> String {
+    #[cfg(feature = "input")]
     let (input_devices, input_clients) = super::dev::event::input_metrics();
+    #[cfg(not(feature = "input"))]
+    let (input_devices, input_clients) = (0, 0);
     let (fences_pending, fences_error) = fence_metrics();
     let Some(device) = primary_device() else {
         return format!(

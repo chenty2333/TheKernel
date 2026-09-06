@@ -41,6 +41,11 @@ settle_input_udev() {
     wait "$settle_pid" || settle_status=$?
     kill "$settle_watchdog_pid" 2>/dev/null || true
     wait "$settle_watchdog_pid" 2>/dev/null || true
+    if [ "$settle_status" -ne 0 ]; then
+        printf '%s state=INFO phase=input_udev_failure status=%s\n' "$marker" "$settle_status"
+        ps 2>/dev/null | head -n 32 || true
+        tail -n 80 /var/log/messages 2>/dev/null || true
+    fi
     return "$settle_status"
 }
 
@@ -105,7 +110,30 @@ done
 [ "$have_keyboard" -eq 1 ] || { echo "$marker state=FAIL reason=input_keyboard"; exit 1; }
 [ "$have_pointer" -eq 1 ] || { echo "$marker state=FAIL reason=input_pointer"; exit 1; }
 echo "$marker state=INFO phase=weston_contract"
-pidof weston >/dev/null || { echo "$marker state=FAIL reason=weston_process"; exit 1; }
+report_weston_failure() {
+    printf '%s state=INFO weston_pid=%s runtime_dir=%s\n' \
+        "$marker" "${weston_pid:-unset}" "${XDG_RUNTIME_DIR:-unset}"
+    if [ -n "${weston_pid:-}" ]; then
+        echo "$marker state=INFO phase=weston_cmdline"
+        head -c 2048 "/proc/$weston_pid/cmdline" 2>/dev/null | tr '\0' ' ' || true
+        echo
+        echo "$marker state=INFO phase=weston_maps"
+        head -c 32768 "/proc/$weston_pid/maps" 2>/dev/null || true
+        echo
+    fi
+    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+        echo "$marker state=INFO phase=weston_runtime_sockets"
+        ls -la "$XDG_RUNTIME_DIR" 2>/dev/null | head -c 4096 || true
+        echo
+    fi
+    udevadm info -q property -n /dev/dri/card0 2>/dev/null | head -c 2048 || true
+    udevadm trigger --dry-run --verbose --subsystem-match=drm --sysname-match='card[0-9]*' || true
+    tail -n 80 /run/seatd.log 2>/dev/null || true
+    tail -n 80 /run/user/*/weston.log 2>/dev/null || true
+    echo "$marker state=FAIL reason=$1"
+    exit 1
+}
+pidof weston >/dev/null || report_weston_failure weston_process
 weston_pid=$(pidof weston | awk '{print $1}')
 weston_uid=$(id -u weston)
 export HOME=/var/lib/weston
@@ -117,10 +145,17 @@ runtime_dir_is_private() {
         [ "$(stat -c %a "$XDG_RUNTIME_DIR")" = 700 ]
 }
 runtime_dir_is_private || { echo "$marker state=FAIL reason=runtime_dir"; exit 1; }
-[ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] || { echo "$marker state=FAIL reason=wayland_socket"; exit 1; }
-grep -q 'drm-backend.so' /proc/"$weston_pid"/maps || { echo "$marker state=FAIL reason=drm_backend"; exit 1; }
-tr '\0' '\n' </proc/"$weston_pid"/environ | grep -qx 'LIBSEAT_BACKEND=seatd' || { echo "$marker state=FAIL reason=libseat_environment"; exit 1; }
+attempt=0
+while [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; do
+    kill -0 "$weston_pid" 2>/dev/null || report_weston_failure weston_process
+    [ "$attempt" -lt 10 ] || report_weston_failure wayland_socket
+    attempt=$((attempt + 1))
+    sleep 1
+done
 weston_log=$XDG_RUNTIME_DIR/weston.log
+# Verify the initialized backend and selected device through Weston's log.
+grep -Fq 'initializing drm backend' "$weston_log" &&
+    grep -Fq 'using /dev/dri/card0' "$weston_log" || report_weston_failure drm_backend
 attempt=0
 while ! grep -Fq "Seat opened with backend 'seatd'" "$weston_log" 2>/dev/null; do
     [ "$attempt" -lt 10 ] || { echo "$marker state=FAIL reason=libseat_backend"; exit 1; }
@@ -128,14 +163,37 @@ while ! grep -Fq "Seat opened with backend 'seatd'" "$weston_log" 2>/dev/null; d
     sleep 1
 done
 echo "$marker state=INFO phase=uapi_oracles"
-/usr/local/bin/drm-uapi-oracle
-/usr/local/bin/evdev-uapi-oracle
+/usr/local/bin/drm-uapi-oracle || { echo "$marker state=FAIL reason=drm_uapi_oracle"; exit 1; }
+/usr/local/bin/evdev-uapi-oracle || { echo "$marker state=FAIL reason=evdev_uapi_oracle"; exit 1; }
 # A software virtio-gpu device deliberately has no render node; its complete
 # Pixman workload is the SHM client launched in the branch below.
 if [ ! -c /dev/dri/renderD128 ]; then
     # The SHM client is the authoritative Pixman path.  It keeps running after
     # the first frame so QMP can inject input and await repaint markers.
     echo "$marker state=INFO phase=pixman_client"
+    if grep -qx q35-graphics-seatd /etc/thekernel-graphics-flavor; then
+        grep -Fq 'Using Pixman renderer' "$weston_log" || {
+            echo "$marker state=FAIL reason=pixman_renderer"
+            exit 1
+        }
+        export THEKERNEL_GRAPHICS_SMOKE_EXIT=1
+        start-stop-daemon -S -x /usr/local/bin/q35-wayland-shm-client -c weston ||
+            report_weston_failure pixman_client_exit
+        # Require graceful compositor teardown; a forced kill is not success.
+        kill -TERM "$weston_pid" || { echo "$marker state=FAIL reason=weston_term"; exit 1; }
+        attempt=0
+        while kill -0 "$weston_pid" 2>/dev/null; do
+            [ "$attempt" -lt 10 ] || { echo "$marker state=FAIL reason=weston_exit_timeout"; exit 1; }
+            attempt=$((attempt + 1))
+            sleep 1
+        done
+        rm -f /run/weston.pid
+        echo THEKERNEL_Q35_SOFTWARE_SMOKE_COMPLETE
+        sync
+        poweroff -f
+        echo "$marker state=FAIL reason=poweroff_returned"
+        exit 1
+    fi
     start-stop-daemon -S -x /usr/local/bin/q35-wayland-shm-client -c weston -b
     exit 0
 fi

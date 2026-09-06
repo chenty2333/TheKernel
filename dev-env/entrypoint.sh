@@ -21,10 +21,10 @@ if [[ "$(id -u)" == "0" ]]; then
     fi
 
     if command -v git >/dev/null 2>&1 && [[ -d /workspace/.git ]]; then
-        gosu "$LOCAL_UID:$LOCAL_GID" git config --global --add safe.directory /workspace >/dev/null 2>&1 || true
+        gosu "$LOCAL_UID:$LOCAL_GID" env HOME="$HOME" git config --global --add safe.directory /workspace >/dev/null 2>&1 || true
     fi
 
-    exec gosu "$LOCAL_UID:$LOCAL_GID" "$@"
+    exec gosu "$LOCAL_UID:$LOCAL_GID" env HOME="$HOME" "$@"
 fi
 
 if command -v git >/dev/null 2>&1 && [[ -d /workspace/.git ]] && [[ -w "$HOME" ]]; then

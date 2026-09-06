@@ -10,7 +10,7 @@ expect_cmd() {
 
 QEMU_EXPECTED_VERSION="${THEKERNEL_QEMU_VERSION:-10.2.2}"
 for cmd in \
-    bc bison flex \
+    bc bison flex cpio patch \
     python3 \
     ip unshare \
     qemu-system-x86_64 \

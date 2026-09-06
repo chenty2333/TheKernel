@@ -950,6 +950,14 @@ pub fn sys_get_robust_list(
     let current_task = current();
     let current_thread = current_task.as_thread();
     let current_tid = current_thread.tid();
+    let tid = if tid == 0 {
+        0
+    } else {
+        current_thread
+            .pid_ns()
+            .resolve_visible_pid(tid)
+            .ok_or(AxError::NoSuchProcess)?
+    };
     let (task, authorized_image) = match robust_list_access_mode(tid, current_tid) {
         None => (current_task.clone(), None),
         Some(mode) => {

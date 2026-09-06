@@ -296,14 +296,15 @@ static int test_auxv(void)
     if (read_auxv(&feature_size, &alignment) != 0) {
         return 1;
     }
-    if (feature_size != 24UL || alignment != 32UL) {
+    /* Linux 7.2.3 layout; slice availability is reported separately in flags. */
+    if (feature_size != 33UL || alignment != 64UL) {
         errno = EPROTO;
         fprintf(stderr,
                 "THEKERNEL_RSEQ_FAIL auxv-values feature_size=%lu align=%lu\n",
                 feature_size, alignment);
         return 1;
     }
-    marker("THEKERNEL_RSEQ_AUXV_OK feature_size=24 align=32");
+    marker("THEKERNEL_RSEQ_AUXV_OK feature_size=33 align=64");
     return 0;
 }
 
@@ -381,7 +382,7 @@ static int test_registration(size_t page_size)
 
     if (expect_errno("registration-length", area, RSEQ_AREA_SIZE - 1U, 0,
                      RSEQ_SIG, EINVAL) != 0 ||
-        expect_errno("registration-flags", area, RSEQ_AREA_SIZE, 2U,
+        expect_errno("registration-flags", area, RSEQ_AREA_SIZE, 4U,
                      RSEQ_SIG, EINVAL) != 0) {
         (void)munmap(area, page_size);
         return 1;
@@ -413,6 +414,30 @@ static int test_registration(size_t page_size)
         (void)munmap(area, page_size);
         errno = saved_errno;
         return fail("unregister-success");
+    }
+    /* Legacy 32-byte registrations retain 32-byte alignment. Extended
+     * registrations require 64-byte alignment, including the minimum 33. */
+    struct rseq_area *half_aligned = (struct rseq_area *)((char *)area + 32);
+    if (expect_errno("extended-registration-alignment", half_aligned, 33, 0,
+                     RSEQ_SIG, EINVAL) != 0) {
+        (void)munmap(area, page_size);
+        return 1;
+    }
+    const unsigned int lengths[] = {32, 33, 64};
+    for (unsigned int i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
+        struct rseq_area *candidate = lengths[i] == 32 ? half_aligned : area;
+        memset(candidate, 0xa5, lengths[i]);
+        if (rseq_call(candidate, lengths[i], 2U, RSEQ_SIG) != 0) {
+            return fail("slice-default-registration");
+        }
+        /* Accepting the request does not advertise unsupported slice work. */
+        if (candidate->flags != 0 || candidate->rseq_cs != 0) {
+            errno = EPROTO;
+            return fail("slice-unavailable-flags");
+        }
+        if (rseq_call(candidate, lengths[i], RSEQ_FLAG_UNREGISTER, RSEQ_SIG) != 0) {
+            return fail("extended-unregister");
+        }
     }
     if (munmap(area, page_size) != 0) {
         return fail("registration-munmap");

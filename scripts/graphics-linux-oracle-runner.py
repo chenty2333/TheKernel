@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Linux 6.12.107 graphics benchmark through the product QEMU runner."""
+"""Run the Linux 7.2.3 graphics benchmark through the product QEMU runner."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from tools.qemu_runner.profiles import BENCHMARK_FAULTS, BENCHMARK_PROFILES
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Run the Linux 6.12.107 graphics oracle on the fixed Q35 topology"
+        description="Run the Linux 7.2.3 graphics oracle on the fixed Q35 topology"
     )
     parser.add_argument("--kernel", required=True, type=Path)
     parser.add_argument("--esp", required=True, type=Path)
@@ -92,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
         enforce_graphics_metrics(
             metrics,
             expected_renderer=renderer_for_profile(args.graphics_profile),
+            expected_fault=args.fault or "none",
         )
     except GraphicsMetricError as error:
         print(f"graphics-linux-oracle: {error}", file=sys.stderr)

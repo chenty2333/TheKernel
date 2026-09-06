@@ -48,6 +48,20 @@ class GraphicsProfileTableTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_diagnostics_use_second_serial_with_keyval_escaped_path(self):
+        command = build_qemu_command(arch="x86_64", kernel=Path("kernel"),
+            rootfs=None, direct_kernel=True,
+            diagnostic_log_path=Path("/home/logs,a b/kernel.log"))
+        serials = [command[i + 1] for i, arg in enumerate(command) if arg == "-serial"]
+        self.assertEqual(serials, ["stdio", "chardev:kernel-log"])
+        self.assertIn("file,id=kernel-log,path=/home/logs,,a b/kernel.log,append=on", command)
+
+    def test_serial_topology_cannot_be_overridden(self):
+        for option in ("-serial", "-serial=stdio", "-chardev", "-nographic"):
+            with self.subTest(option=option), self.assertRaises(CommandError):
+                build_qemu_command(arch="x86_64", kernel=Path("kernel"),
+                    rootfs=None, direct_kernel=True, extra_args=(option,))
+
     def test_accelerated_x86_commands_select_a_matching_cpu_model(self) -> None:
         base = dict(
             arch="x86_64",

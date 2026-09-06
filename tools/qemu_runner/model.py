@@ -40,6 +40,10 @@ class Interaction:
     interactive: bool = False
     input_after_marker: str | None = None
     stop_after_marker: str | None = None
+    # Configured protocol names; match a complete prefix token boundary.
+    failure_prefixes: tuple[str, ...] = ()
+    # Command-file input: one newline-terminated command per exact prompt.
+    input_line_after_marker: str | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,8 @@ class QmpControls:
     tablet injection without reintroducing legacy PS/2 devices.
     """
 
+    # Indexed by guest vCPU number; verified before resuming a paused guest.
+    vcpu_host_cpus: tuple[int, ...] = ()
     socket: Path | None = None
     screenshot: Path | None = None
     input_events: tuple[tuple[Mapping[str, object], ...], ...] = ()
@@ -125,6 +131,10 @@ class RunResult:
     marker_success: bool = False
     runner_terminated: bool = False
     runner_termination_reason: str | None = None
+    # (guest CPU index, QEMU host thread ID, pinned host CPU).
+    vcpu_affinity: tuple[tuple[int, int, int], ...] = ()
+
+    diagnostic_log_path: Path | None = None
 
     @property
     def intentionally_stopped(self) -> bool:

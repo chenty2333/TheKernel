@@ -1,0 +1,4 @@
+This package is extracted from TheKernel's transactional Credential v2 work
+and distributed under Apache-2.0. Linux and FreeBSD sources were consulted to
+understand observable credential, user-namespace, capability, and policy
+semantics. No Linux or FreeBSD source text is copied into this package.

@@ -1,0 +1,24 @@
+[package]
+edition = "2024"
+name = "thekernel-axinput"
+version = "0.3.0-preview.2"
+authors = ["Yuekai Jia <equation618@gmail.com>"]
+description = "Input device management for ArceOS"
+license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+homepage = "https://github.com/arceos-org/arceos"
+repository = "https://github.com/arceos-org/arceos"
+keywords = ["arceos", "kernel"]
+categories = ["os", "no-std"]
+
+[lib]
+name = "axinput"
+path = "src/lib.rs"
+
+[dependencies]
+axdriver = { package = "thekernel-axdriver", path = "../thekernel-axdriver", version = "=0.3.0-preview.2", features = ["input"] }
+axsync = { package = "thekernel-axsync", path = "../thekernel-axsync", version = "=0.3.0-preview.2" }
+lazyinit = "0.2"
+log = "0.4"
+
+[package.metadata.thekernel]
+layer = "platform"

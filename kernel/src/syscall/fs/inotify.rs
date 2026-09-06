@@ -7,10 +7,11 @@ use linux_raw_sys::general::{
     IN_CLOSE_WRITE, IN_CREATE, IN_DELETE, IN_DELETE_SELF, IN_DONT_FOLLOW, IN_EXCL_UNLINK,
     IN_IGNORED, IN_ISDIR, IN_MASK_ADD, IN_MASK_CREATE, IN_MODIFY, IN_MOVE_SELF, IN_MOVED_FROM,
     IN_MOVED_TO, IN_NONBLOCK, IN_ONESHOT, IN_ONLYDIR, IN_OPEN, IN_Q_OVERFLOW, IN_UNMOUNT,
+    O_NONBLOCK, O_RDONLY,
 };
 
 use crate::{
-    file::{FileLike, ResolveAtResult, add_file_like, inotify::InotifyFile, resolve_at},
+    file::{FileLike, ResolveAtResult, add_file_like_with_flags, inotify::InotifyFile, resolve_at},
     mm::{UserMemoryCapability, map_usercopy_error},
 };
 
@@ -43,9 +44,10 @@ pub fn sys_inotify_init1(flags: i32) -> AxResult<isize> {
         return Err(AxError::InvalidInput);
     }
 
-    add_file_like(
+    add_file_like_with_flags(
         InotifyFile::new(flags & IN_NONBLOCK != 0)?,
         flags & IN_CLOEXEC != 0,
+        O_RDONLY | (flags & O_NONBLOCK),
     )
     .map(|fd| fd as isize)
 }
@@ -59,11 +61,11 @@ pub fn sys_inotify_add_watch(
     if mask & !ALL_INOTIFY_BITS != 0 || mask & ALL_INOTIFY_BITS == 0 {
         return Err(AxError::InvalidInput);
     }
+    let inotify = crate::file::inotify::InotifyFile::from_fd(fd)?;
     if mask & IN_MASK_ADD != 0 && mask & IN_MASK_CREATE != 0 {
         return Err(AxError::InvalidInput);
     }
 
-    let inotify = crate::file::inotify::InotifyFile::from_fd(fd)?;
     let pathname = FsPathBuf::from_vec(
         memory
             .load_until_nul(pathname.cast::<u8>())

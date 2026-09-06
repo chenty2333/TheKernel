@@ -862,14 +862,20 @@ impl RenameSecurityTestExpectation {
         self.old_parent.assert_matches(context.old_parent_object());
         self.source
             .assert_matches(context.old_entry_object().target_object());
-        assert_eq!(context.old_entry_object().name(), self.old_name);
+        assert_eq!(
+            context.old_entry_object().name().as_bytes(),
+            self.old_name.as_bytes()
+        );
         assert!(core::ptr::eq(
             context.old_parent_object(),
             context.old_entry_object().parent_object()
         ));
 
         self.new_parent.assert_matches(context.new_parent_object());
-        assert_eq!(context.new_entry_object().name(), self.new_name);
+        assert_eq!(
+            context.new_entry_object().name().as_bytes(),
+            self.new_name.as_bytes()
+        );
         assert!(core::ptr::eq(
             context.new_parent_object(),
             context.new_entry_object().parent_object()
@@ -1093,7 +1099,7 @@ impl NamedCreateSecurityTestExpectation {
 
     pub(super) fn assert_planned(&self, object: &PlannedInodeSecurityRef<'_, '_>) {
         self.assert_parent(object.parent_object());
-        assert_eq!(object.name(), self.name);
+        assert_eq!(object.name().as_bytes(), self.name.as_bytes());
     }
 }
 
@@ -1249,7 +1255,7 @@ impl<const KEY: u64> SecurityModule for NamedCreateSecurityTestModule<KEY> {
         let NamedCreateSecurityTestLeaf::Symlink { target } = &self.probe.expectation.leaf else {
             panic!("symlink create dispatched the wrong named-create test leaf")
         };
-        assert_eq!(context.symlink_target(), target);
+        assert_eq!(context.symlink_target().as_bytes(), target.as_bytes());
         self.probe.finish_leaf()
     }
 

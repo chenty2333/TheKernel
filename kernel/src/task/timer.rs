@@ -1637,24 +1637,35 @@ fn process_cpu_usage(proc_data: &ProcessData) -> ProcessCpuUsage {
     }
 }
 
-/// Republishes whether POSIX CPU-clock timers require accounting-worker
-/// wakeups.  The timer owner calls this only after releasing `posix_timers`;
-/// the worker samples the inverse lock order only after it has completed the
-/// interval-timer evaluation, so no lock cycle is introduced.
-pub(crate) fn refresh_posix_cpu_timer_armed(proc_data: &ProcessData) {
-    let posix_armed = proc_data.posix_timers.lock().iter().flatten().any(|timer| {
+/// Updates only one timer owner's admission bits. The caller retains that
+/// owner's state lock through publication; the other owner may publish its
+/// disjoint bits concurrently.
+fn publish_cpu_timer_armed_bits(armed: &AtomicU8, owned: u8, value: u8) {
+    let _ = armed.try_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+        Some((previous & !owned) | (value & owned))
+    });
+}
+
+fn publish_posix_cpu_timer_armed(timers: &[Option<PosixTimer>], armed: &AtomicU8) {
+    let posix_armed = timers.iter().flatten().any(|timer| {
         timer.is_published() && timer.is_cpu_clock() && timer.cpu_deadline_ns.is_some()
     });
-    let interval_armed = proc_data.process_itimers.lock().cpu_armed_mask();
-    proc_data.process_itimer_cpu_armed.store(
-        interval_armed
-            | if posix_armed {
-                PROCESS_POSIX_CPU_ARMED
-            } else {
-                0
-            },
-        Ordering::Release,
+    publish_cpu_timer_armed_bits(
+        armed,
+        PROCESS_POSIX_CPU_ARMED,
+        if posix_armed {
+            PROCESS_POSIX_CPU_ARMED
+        } else {
+            0
+        },
     );
+}
+
+/// Republishes POSIX admission while retaining its state owner. Interval
+/// timer bits belong exclusively to `process_itimers`; no nested lock is needed.
+pub(crate) fn refresh_posix_cpu_timer_armed(proc_data: &ProcessData) {
+    let timers = proc_data.posix_timers.lock();
+    publish_posix_cpu_timer_armed(&timers, &proc_data.process_itimer_cpu_armed);
 }
 
 const PROCESS_ITIMER_VIRTUAL_PENDING: u8 = 1 << 0;
@@ -2128,9 +2139,7 @@ impl ProcessITimers {
         timer.remaining_ns = remaining_ns;
         timer.cpu_deadline_ns = cpu_deadline_ns;
         timer.sequence = sequence;
-        owner
-            .process_itimer_cpu_armed
-            .store(self.cpu_armed_mask(), Ordering::Release);
+        self.publish_cpu_armed(&owner.process_itimer_cpu_armed);
 
         let publication = if ty != ITimerType::Real {
             AlarmPublication::empty()
@@ -2163,6 +2172,14 @@ impl ProcessITimers {
             publication,
             cpu_epoch,
         })
+    }
+
+    fn publish_cpu_armed(&self, armed: &AtomicU8) {
+        publish_cpu_timer_armed_bits(
+            armed,
+            PROCESS_ITIMER_VIRTUAL_PENDING | PROCESS_ITIMER_PROF_PENDING,
+            self.cpu_armed_mask(),
+        );
     }
 
     fn cpu_armed_mask(&self) -> u8 {
@@ -2249,6 +2266,52 @@ mod process_itimer_tests {
         let timer = &mut timers.timers[ty as usize];
         timer.interval_ns = interval;
         timer.cpu_deadline_ns = Some(deadline);
+    }
+
+    #[test]
+    fn real_itimer_publication_preserves_armed_posix_cpu_timer() {
+        let armed = AtomicU8::new(PROCESS_POSIX_CPU_ARMED);
+        let timers = ProcessITimers::new();
+        // setitimer(ITIMER_REAL) publishes this unchanged interval CPU state.
+        timers.publish_cpu_armed(&armed);
+        assert_eq!(armed.load(Ordering::Acquire), PROCESS_POSIX_CPU_ARMED);
+    }
+
+    #[test]
+    fn cpu_timer_owner_publications_preserve_concurrent_arm() {
+        let armed = AtomicU8::new(PROCESS_ITIMER_PROF_PENDING);
+        let mut interval = ProcessITimers::new();
+        let mut posix = PosixTimer::try_new(
+            PosixTimerClock::ProcessCpu,
+            PosixTimerNotify::None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        posix.publish();
+        posix.cpu_deadline_ns = Some(100);
+        let posix = [Some(posix)];
+
+        // Worker expires the interval timer, then a setter arms POSIX before
+        // that worker reaches the POSIX owner. The former whole-mask store
+        // could erase the setter's admission bit using its old snapshot.
+        interval.publish_cpu_armed(&armed);
+        publish_posix_cpu_timer_armed(&posix, &armed);
+        interval.publish_cpu_armed(&armed);
+        assert_eq!(armed.load(Ordering::Acquire), PROCESS_POSIX_CPU_ARMED);
+
+        // A fresh interval arm between the worker's two owner sections also
+        // survives POSIX publication and disarm.
+        arm_cpu_timer(&mut interval, ITimerType::Prof, 0, 200);
+        interval.publish_cpu_armed(&armed);
+        publish_posix_cpu_timer_armed(&posix, &armed);
+        assert_eq!(
+            armed.load(Ordering::Acquire),
+            PROCESS_POSIX_CPU_ARMED | PROCESS_ITIMER_PROF_PENDING
+        );
+        publish_posix_cpu_timer_armed(&[], &armed);
+        assert_eq!(armed.load(Ordering::Acquire), PROCESS_ITIMER_PROF_PENDING);
     }
 
     #[test]
@@ -3140,10 +3203,9 @@ fn evaluate_process_cpu_policy(proc_data: &Arc<ProcessData>) -> ProcessCpuPolicy
     let (signals, posix_deliveries) = if timer_armed {
         let mut timers = proc_data.process_itimers.lock();
         let signals = timers.evaluate_cpu(usage);
-        let interval_armed = timers.cpu_armed_mask();
+        timers.publish_cpu_armed(&proc_data.process_itimer_cpu_armed);
         drop(timers);
         let mut posix_deliveries = Vec::new();
-        let mut posix_cpu_armed = false;
         {
             let mut timers = proc_data.posix_timers.lock();
             for (timerid, timer) in timers.iter_mut().enumerate() {
@@ -3156,22 +3218,9 @@ fn evaluate_process_cpu_policy(proc_data: &Arc<ProcessData>) -> ProcessCpuPolicy
                 if let Some(delivery) = timer.evaluate_cpu(proc_data) {
                     posix_deliveries.push((timerid, timer.notify, delivery));
                 }
-                posix_cpu_armed |= timer.cpu_deadline_ns.is_some();
             }
+            publish_posix_cpu_timer_armed(&timers, &proc_data.process_itimer_cpu_armed);
         }
-        // Publish the fast-path mask while still holding the state owner lock.
-        // The POSIX timer owner is separately serialized; both masks describe
-        // state sampled during this worker pass, and the next mutation queues
-        // a fresh evaluation after publication.
-        proc_data.process_itimer_cpu_armed.store(
-            interval_armed
-                | if posix_cpu_armed {
-                    PROCESS_POSIX_CPU_ARMED
-                } else {
-                    0
-                },
-            Ordering::Release,
-        );
         (signals, posix_deliveries)
     } else {
         (ProcessITimerSignals::default(), Vec::new())
@@ -4450,72 +4499,126 @@ fn retry_posix_timer_signal(
     );
 }
 
+struct PreparedPosixTimerFire {
+    notify: PosixTimerNotify,
+    delivery: Option<TimerSignalDelivery>,
+    next: Option<AlarmPublication>,
+}
+
+/// Prepares one dequeued action under `posix_timers`. `now` is sampled after
+/// dequeue so discontinuous clocks may make the callback early again.
+fn prepare_posix_timer_fire(
+    timer: &mut PosixTimer,
+    proc: Weak<ProcessData>,
+    timerid: usize,
+    owner: AlarmSlotKey,
+    sequence: u64,
+    now: Duration,
+) -> Option<PreparedPosixTimerFire> {
+    if !timer.is_published() {
+        return None;
+    }
+    if !timer.main_alarm_matches(owner) || timer.sequence != sequence {
+        return None;
+    }
+    let deadline = timer.deadline?;
+
+    let domain_deadline = timer.tai_deadline.unwrap_or(deadline);
+    if now < domain_deadline {
+        // Dequeue sampled a due realtime deadline before a backwards clock
+        // step. The action is no longer in the heap: retain the exact owner
+        // and sequence and put it back while the timer state is still locked.
+        let next = timer.main_alarm.prepare_arm(
+            timer.effective_clock,
+            deadline,
+            AlarmAction::PosixTimer {
+                proc,
+                timerid,
+                sequence,
+            },
+        );
+        return Some(PreparedPosixTimerFire {
+            notify: timer.notify,
+            delivery: None,
+            next: Some(next),
+        });
+    }
+
+    let expirations = if timer.interval.is_zero() {
+        1_u128
+    } else {
+        let elapsed = now.saturating_sub(domain_deadline).as_nanos();
+        let interval = timer.interval.as_nanos().max(1);
+        1_u128.saturating_add(elapsed / interval)
+    };
+    let notify = timer.notify;
+    let delivery = match notify {
+        PosixTimerNotify::None => None,
+        PosixTimerNotify::Signal { .. } => timer.begin_signal_delivery(expirations),
+    };
+
+    let next = if timer.interval.is_zero() {
+        timer.deadline = None;
+        timer.tai_deadline = None;
+        None
+    } else {
+        let next_domain_deadline = domain_deadline
+            .checked_add(saturating_duration_mul(timer.interval, expirations))
+            .unwrap_or(Duration::MAX);
+        let next_deadline = if timer.tai_deadline.is_some() {
+            let (offset_seconds, generation) = crate::syscall::tai_offset_snapshot();
+            timer.tai_deadline = Some(next_domain_deadline);
+            timer.tai_offset_generation = generation;
+            tai_deadline_as_realtime(next_domain_deadline, offset_seconds)
+        } else {
+            next_domain_deadline
+        };
+        timer.deadline = Some(next_deadline);
+        Some(timer.main_alarm.prepare_arm(
+            timer.effective_clock,
+            next_deadline,
+            AlarmAction::PosixTimer {
+                proc,
+                timerid,
+                sequence: timer.sequence,
+            },
+        ))
+    };
+    Some(PreparedPosixTimerFire {
+        notify,
+        delivery,
+        next,
+    })
+}
+
 fn fire_posix_timer(
     proc_data: Arc<ProcessData>,
     timerid: usize,
     owner: AlarmSlotKey,
     sequence: u64,
 ) {
-    let (notify, delivery, next) = {
+    let prepared = {
         let mut timers = proc_data.posix_timers.lock();
         let Some(Some(timer)) = timers.get_mut(timerid) else {
             return;
         };
-        if !timer.is_published() {
-            return;
-        }
-        if !timer.main_alarm_matches(owner) || timer.sequence != sequence {
-            return;
-        }
-        let Some(deadline) = timer.deadline else {
-            return;
-        };
-
-        let domain_deadline = timer.tai_deadline.unwrap_or(deadline);
         let now = timer.timer_now();
-        if now < domain_deadline {
-            return;
-        }
-
-        let expirations = if timer.interval.is_zero() {
-            1_u128
-        } else {
-            let elapsed = now.saturating_sub(domain_deadline).as_nanos();
-            let interval = timer.interval.as_nanos().max(1);
-            1_u128.saturating_add(elapsed / interval)
-        };
-        let notify = timer.notify;
-        let delivery = match notify {
-            PosixTimerNotify::None => None,
-            PosixTimerNotify::Signal { .. } => timer.begin_signal_delivery(expirations),
-        };
-
-        let next = if timer.interval.is_zero() {
-            timer.deadline = None;
-            timer.tai_deadline = None;
-            None
-        } else {
-            let next_domain_deadline = domain_deadline
-                .checked_add(saturating_duration_mul(timer.interval, expirations))
-                .unwrap_or(Duration::MAX);
-            let next_deadline = if timer.tai_deadline.is_some() {
-                let (offset_seconds, generation) = crate::syscall::tai_offset_snapshot();
-                timer.tai_deadline = Some(next_domain_deadline);
-                timer.tai_offset_generation = generation;
-                tai_deadline_as_realtime(next_domain_deadline, offset_seconds)
-            } else {
-                next_domain_deadline
-            };
-            timer.deadline = Some(next_deadline);
-            Some(timer.prepare_main_alarm(
-                &proc_data,
-                timerid,
-                timer.effective_clock,
-                next_deadline,
-                timer.sequence,
-            ))
-        };
-        (notify, delivery, next)
+        prepare_posix_timer_fire(
+            timer,
+            Arc::downgrade(&proc_data),
+            timerid,
+            owner,
+            sequence,
+            now,
+        )
+    };
+    let Some(PreparedPosixTimerFire {
+        notify,
+        delivery,
+        next,
+    }) = prepared
+    else {
+        return;
     };
 
     if let Some(publication) = next {
@@ -4550,6 +4653,116 @@ mod posix_timer_signal_tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn backwards_clock_step_restores_dequeued_realtime_and_tai_alarms() {
+        for clock in [PosixTimerClock::Realtime, PosixTimerClock::Tai] {
+            let mut timer = timer();
+            timer.clock = clock;
+            timer.effective_clock = AlarmClock::Realtime;
+            timer.publish();
+            timer.sequence = 7;
+            let deadline = Duration::from_secs(50);
+            timer.deadline = Some(deadline);
+            let domain_deadline = if clock == PosixTimerClock::Tai {
+                let tai = Duration::from_secs(87);
+                timer.tai_deadline = Some(tai);
+                tai
+            } else {
+                deadline
+            };
+            let owner = timer.main_alarm.key;
+            drop(timer.main_alarm.prepare_arm(
+                AlarmClock::Realtime,
+                deadline,
+                AlarmAction::PosixTimer {
+                    proc: Weak::new(),
+                    timerid: 3,
+                    sequence: 7,
+                },
+            ));
+            // Reproduce the exact post-dequeue state for this slot, without
+            // touching unrelated tests' alarms in the shared registry.
+            let dequeued = ALARM_REGISTRY.lock().remove_active(owner.slot);
+            assert!(matches!(
+                dequeued,
+                Some(AlarmAction::PosixTimer { sequence: 7, .. })
+            ));
+            drop(dequeued);
+            let PreparedPosixTimerFire {
+                delivery,
+                next: publication,
+                ..
+            } = prepare_posix_timer_fire(
+                &mut timer,
+                Weak::new(),
+                3,
+                owner,
+                7,
+                domain_deadline - Duration::from_secs(10),
+            )
+            .unwrap();
+            assert!(delivery.is_none());
+            assert!(publication.is_some());
+            drop(publication);
+            {
+                let registry = ALARM_REGISTRY.lock();
+                let slot = &registry.slots[owner.slot];
+                assert!(slot.active);
+                assert!(matches!(
+                    slot.action,
+                    Some(AlarmAction::PosixTimer { sequence: 7, .. })
+                ));
+            }
+            assert_eq!(timer.deadline, Some(deadline));
+            assert!(!timer.signal_pending);
+
+            let dequeued = ALARM_REGISTRY.lock().remove_active(owner.slot);
+            drop(dequeued);
+            let PreparedPosixTimerFire {
+                delivery,
+                next: publication,
+                ..
+            } = prepare_posix_timer_fire(&mut timer, Weak::new(), 3, owner, 7, domain_deadline)
+                .unwrap();
+            assert!(delivery.is_some());
+            assert!(publication.is_none());
+            assert_eq!(timer.deadline, None);
+        }
+    }
+
+    #[test]
+    fn stale_early_callback_cannot_restore_disarmed_or_rearmed_timer() {
+        let mut timer = timer();
+        timer.publish();
+        timer.sequence = 2;
+        timer.deadline = Some(Duration::from_secs(50));
+        let owner = timer.main_alarm.key;
+        assert!(
+            prepare_posix_timer_fire(
+                &mut timer,
+                Weak::new(),
+                0,
+                owner,
+                1,
+                Duration::from_secs(10),
+            )
+            .is_none()
+        );
+        timer.deadline = None;
+        assert!(
+            prepare_posix_timer_fire(
+                &mut timer,
+                Weak::new(),
+                0,
+                owner,
+                2,
+                Duration::from_secs(10),
+            )
+            .is_none()
+        );
+        assert!(!ALARM_REGISTRY.lock().slots[owner.slot].active);
     }
 
     #[test]

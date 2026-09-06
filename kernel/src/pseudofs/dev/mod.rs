@@ -5,8 +5,6 @@ mod dri;
 pub(crate) mod event;
 mod fb;
 pub(crate) mod fuse;
-#[cfg(feature = "dev-log")]
-mod log;
 pub(crate) mod r#loop;
 #[cfg(feature = "memtrack")]
 mod memtrack;
@@ -14,34 +12,240 @@ mod rtc;
 pub mod tty;
 pub(crate) mod tun;
 
-use alloc::{format, string::String, sync::Arc};
-use core::any::Any;
+use alloc::{
+    borrow::Cow,
+    format,
+    string::String,
+    sync::Arc,
+    vec::Vec,
+};
+use core::{
+    any::Any,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use axdriver::{SharedBlockDevice, prelude::DevError};
 use axerrno::AxError;
 use axfs::BlockDeviceInfo;
-use axfs_ng_vfs::{DeviceId, Filesystem, Location, NodeFlags, NodePermission, NodeType, VfsResult};
+use axfs_ng_vfs::{
+    CreateDisposition, CreateOutcome, DeviceId, DirEntry, FileNode, Filesystem, FsName,
+    FsNameBuf, Location, MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission,
+    NodeType, Reference, UnlinkRequest, VfsError, VfsResult,
+};
 use axpoll::Pollable;
+use axsync::Mutex;
+use hashbrown::HashMap;
 use linux_raw_sys::{
     general::CAP_SYS_ADMIN,
     ioctl::{
         BLKGETSIZE, BLKGETSIZE64, BLKRAGET, BLKRASET, BLKROGET, BLKROSET, BLKSSZGET, RNDGETENTCNT,
     },
 };
-#[cfg(feature = "dev-log")]
-pub use log::bind_dev_log;
-
 use crate::{
     file::IoctlContext,
     mm::map_usercopy_error,
     mounts,
-    pseudofs::{Device, DeviceMmap, DeviceOps, DirMaker, DirMapping, SimpleDir, SimpleFs},
+    pseudofs::{
+        ChildNames, Device, DeviceMmap, DeviceOps, DirMaker, DirMapping, NodeOpsMux, SimpleDir,
+        SimpleDirOps, SimpleFile, SimpleFs, try_boxed_names,
+    },
     task::Cred,
 };
 
 const LOOP_NODE_MODE: u16 = 0o600;
 const VT_NODE_MODE: u16 = 0o620;
 const FB_NODE_MODE: u16 = 0o660;
+
+/// The devfs namespace is mostly static, but Linux daemons must be able to
+/// create their own pathname sockets (notably `/dev/log`). Keep those runtime
+/// sockets in the same devfs directory so userspace owns their endpoint and
+/// can unlink it when the daemon exits.
+struct DevRoot {
+    fs: Arc<SimpleFs>,
+    static_entries: DirMapping,
+    sockets: Mutex<HashMap<FsNameBuf, Arc<SimpleFile>>>,
+    namespace_epoch: AtomicU64,
+}
+
+impl DevRoot {
+    fn new(fs: Arc<SimpleFs>) -> Self {
+        Self {
+            fs,
+            static_entries: DirMapping::new(),
+            sockets: Mutex::new(HashMap::new()),
+            namespace_epoch: AtomicU64::new(0),
+        }
+    }
+
+    fn add(&mut self, name: impl AsRef<[u8]>, ops: impl Into<NodeOpsMux>) {
+        self.static_entries.add(name, ops);
+    }
+
+    fn try_owned_name(name: &FsName) -> VfsResult<FsNameBuf> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(name.as_bytes().len())
+            .map_err(|_| VfsError::NoMemory)?;
+        bytes.extend_from_slice(name.as_bytes());
+        FsNameBuf::from_vec(bytes)
+    }
+
+    fn entry_from_ops(
+        parent: &DirEntry,
+        name: &FsName,
+        ops: NodeOpsMux,
+    ) -> VfsResult<DirEntry> {
+        let reference = Reference::try_new(Some(parent.clone()), name)?;
+        match ops {
+            NodeOpsMux::Dir(maker) => Ok(DirEntry::new_dir(
+                |this| axfs_ng_vfs::DirNode::new(maker(this)),
+                reference,
+            )),
+            NodeOpsMux::File(ops) => {
+                let node_type = ops.metadata()?.node_type;
+                DirEntry::try_new_file(FileNode::new(ops), node_type, reference)
+            }
+        }
+    }
+}
+
+impl SimpleDirOps for DevRoot {
+    fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
+        let mut names = Vec::new();
+        for name in self.static_entries.child_names()? {
+            names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            names.push(Self::try_owned_name(name.as_ref())?);
+        }
+        for name in self.sockets.lock().keys() {
+            names.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+            names.push(Self::try_owned_name(name.as_ref())?);
+        }
+        try_boxed_names(names.into_iter().map(Cow::Owned))
+    }
+
+    fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
+        match self.static_entries.lookup_child(name) {
+            Ok(ops) => Ok(ops),
+            Err(VfsError::NotFound) => self
+                .sockets
+                .lock()
+                .get(name)
+                .cloned()
+                .map(|socket| NodeOpsMux::File(socket))
+                .ok_or(VfsError::NotFound),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn is_cacheable(&self) -> bool {
+        true
+    }
+
+    fn namespace_epoch(&self) -> u64 {
+        self.namespace_epoch.load(Ordering::Acquire)
+    }
+
+    fn supports_named_create(&self, node_type: NodeType) -> bool {
+        node_type == NodeType::Socket
+    }
+
+    fn create_named(
+        &self,
+        parent: Option<DirEntry>,
+        name: &FsName,
+        options: &NamedCreateOptions,
+        disposition: CreateDisposition,
+    ) -> VfsResult<CreateOutcome<DirEntry>> {
+        let parent = parent.ok_or(VfsError::NotFound)?;
+        let mut sockets = self.sockets.lock();
+        if let Ok(ops) = self.static_entries.lookup_child(name) {
+            return match disposition {
+                CreateDisposition::OpenOrCreate => Ok(CreateOutcome {
+                    entry: Self::entry_from_ops(&parent, name, ops)?,
+                    created: false,
+                }),
+                CreateDisposition::Exclusive => Err(VfsError::AlreadyExists),
+            };
+        }
+        if let Some(socket) = sockets.get(name) {
+            return match disposition {
+                CreateDisposition::OpenOrCreate => Ok(CreateOutcome {
+                    entry: Self::entry_from_ops(
+                        &parent,
+                        name,
+                        NodeOpsMux::File(socket.clone()),
+                    )?,
+                    created: false,
+                }),
+                CreateDisposition::Exclusive => Err(VfsError::AlreadyExists),
+            };
+        }
+        if options.node_type != NodeType::Socket {
+            return Err(VfsError::OperationNotSupported);
+        }
+        // SimpleFile has no xattr provider, so reject prepared ACL state
+        // rather than publishing a socket with silently incomplete metadata.
+        if options.initial_attributes.project_inherit
+            || options.initial_attributes.access_acl.is_some()
+            || options.initial_attributes.default_acl.is_some()
+        {
+            return Err(VfsError::OperationNotSupported);
+        }
+
+        let owned_name = Self::try_owned_name(name)?;
+        sockets.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
+        let socket = SimpleFile::try_new_with_permission(
+            self.fs.clone(),
+            NodeType::Socket,
+            options.permission,
+            || Ok(b""),
+        )?;
+        socket.update_metadata(MetadataUpdate {
+            owner: options.owner,
+            project_id: options.initial_attributes.project_id,
+            ..Default::default()
+        })?;
+        let entry = Self::entry_from_ops(
+            &parent,
+            name,
+            NodeOpsMux::File(socket.clone()),
+        )?;
+        options.install_initial_data(&entry)?;
+        self.namespace_epoch.fetch_add(1, Ordering::AcqRel);
+        sockets.insert(owned_name, socket);
+        Ok(CreateOutcome {
+            entry,
+            created: true,
+        })
+    }
+
+    fn supports_unlink(&self) -> bool {
+        true
+    }
+
+    fn unlink(&self, request: UnlinkRequest<'_>) -> VfsResult<()> {
+        if request.is_dir {
+            return Err(VfsError::NotADirectory);
+        }
+        let mut sockets = self.sockets.lock();
+        let Some(socket) = sockets.get(request.name) else {
+            return Err(if self.static_entries.lookup_child(request.name).is_ok() {
+                VfsError::OperationNotPermitted
+            } else {
+                VfsError::NotFound
+            });
+        };
+        if request
+            .expected
+            .is_some_and(|expected| expected.object_key() != socket.object_key())
+        {
+            return Err(VfsError::NotFound);
+        }
+        self.namespace_epoch.fetch_add(1, Ordering::AcqRel);
+        sockets.remove(request.name);
+        Ok(())
+    }
+}
 
 /// Devfs-facing VT endpoint.
 ///
@@ -336,7 +540,7 @@ impl DeviceOps for BlockDevice {
 }
 
 fn builder(fs: Arc<SimpleFs>) -> DirMaker {
-    let mut root = DirMapping::new();
+    let mut root = DevRoot::new(fs.clone());
     root.add(
         "null",
         Device::new(
@@ -490,12 +694,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         "pts",
         SimpleDir::new_maker(fs.clone(), Arc::new(tty::PtsDir)),
     );
-    #[cfg(feature = "dev-log")]
-    root.add(
-        "log",
-        crate::pseudofs::SimpleFile::new(fs.clone(), NodeType::Socket, || Ok(b"")),
-    );
-
     #[cfg(feature = "memtrack")]
     root.add(
         "memtrack",
@@ -594,6 +792,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
 mod tests {
     use super::*;
     use crate::task::{Cred, Kgid, Kuid, UserNamespace};
+    use axfs_ng_vfs::FsName;
 
     #[test]
     fn devfs_publishes_linux_virtual_console_nodes() {
@@ -601,8 +800,13 @@ mod tests {
         let root = devfs.root_dir();
         let root = root.as_dir().unwrap();
 
+        assert!(matches!(
+            root.lookup(FsName::new(b"log")),
+            Err(VfsError::NotFound)
+        ));
+
         for number in 0..=63 {
-            let node = root.lookup(&format!("tty{number}")).unwrap();
+            let node = root.lookup(FsName::new(format!("tty{number}").as_bytes())).unwrap();
             let metadata = node.metadata().unwrap();
             assert_eq!(metadata.node_type, NodeType::CharacterDevice);
             assert_eq!(metadata.rdev, DeviceId::new(4, number));
@@ -617,17 +821,34 @@ mod tests {
 
         // These existing character devices are separate Linux ABI nodes.
         assert_eq!(
-            root.lookup("tty").unwrap().metadata().unwrap().rdev,
+            root.lookup(FsName::new(b"tty")).unwrap().metadata().unwrap().rdev,
             DeviceId::new(5, 0)
         );
         assert_eq!(
-            root.lookup("console").unwrap().metadata().unwrap().rdev,
+            root.lookup(FsName::new(b"console")).unwrap().metadata().unwrap().rdev,
             DeviceId::new(5, 1)
         );
-        let console = root.lookup("console").unwrap();
+        let console = root.lookup(FsName::new(b"console")).unwrap();
         let console = console.downcast::<Device>().unwrap();
         let console = console.inner().as_any().downcast_ref::<VtNode>().unwrap();
         assert!(console.0.is_active_alias());
+    }
+
+    #[test]
+    fn devfs_allows_userspace_owned_pathname_sockets() {
+        let devfs = new_devfs();
+        let root = devfs.root_dir();
+        let root = root.as_dir().unwrap();
+        let name = FsName::new(b"log");
+
+        let socket = root
+            .create(name, NodeType::Socket, NodePermission::from_bits_truncate(0o666))
+            .unwrap();
+        assert_eq!(socket.metadata().unwrap().node_type, NodeType::Socket);
+        assert_eq!(root.lookup(name).unwrap().object_key(), socket.object_key());
+
+        root.unlink(name, false).unwrap();
+        assert!(matches!(root.lookup(name), Err(VfsError::NotFound)));
     }
 
     #[test]

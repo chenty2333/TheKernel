@@ -420,11 +420,16 @@ pub fn sys_pidfd_open(pid: i32, flags: u32) -> AxResult<isize> {
     }
     let plan = PidfdPlan::open(pid as u32, flags).map_err(|_| AxError::InvalidInput)?;
 
+    let target = current()
+        .as_thread()
+        .pid_ns()
+        .resolve_visible_pid(plan.target)
+        .ok_or(AxError::NoSuchProcess)?;
     let fd = if plan.thread {
-        let task = get_visible_task(plan.target)?;
+        let task = get_visible_task(target)?;
         PidFd::new_thread(&task)?
     } else {
-        PidFd::new_process(&get_process_data(plan.target)?)
+        PidFd::new_process(&get_process_data(target)?)
     };
     if plan.nonblocking {
         fd.set_nonblocking(true)?;

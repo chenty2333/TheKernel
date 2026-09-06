@@ -1,0 +1,37 @@
+[package]
+name = "thekernel-axsched"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.76"
+authors = [
+    "Yuekai Jia <equation618@gmail.com>",
+    "guoweikang <guoweikang.kernel@gmail.com>",
+]
+description = "Maintained scheduler algorithms for TheKernel and other no_std systems"
+license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+homepage = "https://github.com/chenty2333/thekernel-ax"
+repository = "https://github.com/chenty2333/thekernel-ax"
+documentation = "https://docs.rs/thekernel-axsched"
+readme = "README.md"
+
+[lib]
+name = "axsched"
+path = "src/lib.rs"
+
+[features]
+default = []
+# EEVDF tuning is selected at compile time.  With no profile feature the
+# balanced profile is selected, preserving the historical constants.
+eevdf-balanced = []
+eevdf-latency = []
+eevdf-throughput = []
+# Test-only synchronization for callers that exercise the process-global RR
+# quantum. Kept opt-in so production users do not acquire a test API.
+test-utils = []
+
+[dependencies]
+intrusive-collections = "0.9"
+linked_list_r4l = "0.3"
+
+[package.metadata.thekernel]
+layer = "mechanism"

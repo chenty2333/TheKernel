@@ -1,110 +1,48 @@
-#!/usr/bin/env python3
-"""Focused policy tests for the Cargo dependency-layer CI guard."""
-
-from __future__ import annotations
-
-import tempfile
+"""Exercise metadata policy independently of filesystem layout."""
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from tests.support import load_script_module
 
-from tests.support import load_script_module, repo_root
+gate = load_script_module("cargo_dependency_layers", "scripts/ci/check_cargo_dependency_layers.py")
 
-REPO_ROOT = repo_root()
-cargo_dependency_layers = load_script_module(
-    "cargo_dependency_layers", "scripts/ci/check_cargo_dependency_layers.py"
-)
+
+def package(name, layer, dependencies=()):
+    return {
+        "id": name, "name": name, "manifest_path": f"/workspace/{name}/Cargo.toml",
+        "metadata": {"thekernel": {"layer": layer}},
+        "targets": [{"name": name, "kind": ["lib"]}],
+        "dependencies": [{"name": dep, "path": f"/workspace/{dep}"} for dep in dependencies],
+    }
 
 
 class CargoDependencyLayersTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.directory = tempfile.TemporaryDirectory()
-        root = Path(self.directory.name)
-        self.roots = {
-            "thekernel": root / "TheKernel",
-            "ax": root / "thekernel-ax",
-            "linux_abi": root / "thekernel-linux-abi",
-        }
-        for workspace in self.roots.values():
-            workspace.mkdir()
+    def check(self, packages, members=None):
+        return gate.violations({"packages": packages, "workspace_members": members or [p["id"] for p in packages]}, Path("/workspace"))
 
-    def tearDown(self) -> None:
-        self.directory.cleanup()
+    def test_platform_can_consume_mechanism(self):
+        self.assertEqual(self.check([package("driver", "platform", ["queue"]), package("queue", "mechanism")]), [])
 
-    def check(self, layer: str, dependency_layer: str) -> list[str]:
-        workspace = self.roots[layer]
-        package = {
-            "name": "package",
-            "manifest_path": str(workspace / "crate" / "Cargo.toml"),
-            "dependencies": [
-                {
-                    "name": "dependency",
-                    "path": str(self.roots[dependency_layer] / "crate"),
-                }
-            ],
-        }
-        with patch.object(cargo_dependency_layers, "metadata", return_value={"packages": [package]}):
-            return list(cargo_dependency_layers.violations(workspace, self.roots))
+    def test_mechanism_cannot_consume_runtime(self):
+        self.assertEqual(self.check([package("queue", "mechanism", ["runtime"]), package("runtime", "platform")]), ["queue (mechanism) depends on runtime (platform)"])
 
-    def test_thekernel_can_depend_on_sibling_layers(self) -> None:
-        self.assertEqual(self.check("thekernel", "ax"), [])
-        self.assertEqual(self.check("thekernel", "linux_abi"), [])
+    def test_linux_cannot_consume_platform_even_when_in_same_directory(self):
+        self.assertEqual(self.check([package("abi", "linux_abi", ["task"]), package("task", "platform")]), ["abi (linux_abi) depends on task (platform)"])
 
-    def test_linux_abi_cannot_depend_on_ax(self) -> None:
-        self.assertEqual(
-            self.check("linux_abi", "ax"),
-            ["package (linux_abi) depends on dependency (ax)"],
-        )
+    def test_integration_accepts_all_lower_layers(self):
+        self.assertEqual(self.check([package("kernel", "integration", ["abi", "task", "queue"]), package("abi", "linux_abi"), package("task", "platform"), package("queue", "mechanism")]), [])
 
-    def test_ax_cannot_depend_on_thekernel(self) -> None:
-        self.assertEqual(
-            self.check("ax", "thekernel"),
-            ["package (ax) depends on dependency (thekernel)"],
-        )
+    def test_metadata_required(self):
+        self.assertEqual(self.check([package("queue", None)]), ["queue: missing or invalid package.metadata.thekernel.layer"])
 
-    def test_registry_package_cannot_duplicate_controlled_package(self) -> None:
-        package = {
-            "name": "thekernel-axio",
-            "manifest_path": "/cargo/registry/thekernel-axio/Cargo.toml",
-            "dependencies": [],
-            "targets": [{"name": "axio", "kind": ["lib"]}],
-        }
-        with patch.object(
-            cargo_dependency_layers, "metadata", return_value={"packages": [package]}
-        ):
-            self.assertEqual(
-                list(
-                    cargo_dependency_layers.violations(
-                        self.roots["thekernel"],
-                        self.roots,
-                        frozenset(("thekernel-axio",)),
-                        frozenset(("axio",)),
-                    )
-                ),
-                ["external dependency duplicates controlled sibling package thekernel-axio"],
-            )
+    def test_uncontrolled_optional_dependency_rejected(self):
+        p = package("queue", "mechanism", ["outside"])
+        p["dependencies"][0]["optional"] = True
+        self.assertEqual(self.check([p]), ["queue: uncontrolled path dependency outside"])
 
-    def test_registry_library_cannot_shadow_controlled_target(self) -> None:
-        package = {
-            "name": "axio",
-            "manifest_path": "/cargo/registry/axio/Cargo.toml",
-            "dependencies": [],
-            "targets": [{"name": "axio", "kind": ["lib"]}],
-        }
-        with patch.object(
-            cargo_dependency_layers, "metadata", return_value={"packages": [package]}
-        ):
-            self.assertEqual(
-                list(
-                    cargo_dependency_layers.violations(
-                        self.roots["thekernel"],
-                        self.roots,
-                        frozenset(),
-                        frozenset(("axio",)),
-                    )
-                ),
-                ["external dependency duplicates controlled sibling package axio"],
-            )
+    def test_external_shadow_rejected(self):
+        external = package("queue", "mechanism")
+        external["id"] = "registry-queue"
+        self.assertEqual(self.check([package("queue", "mechanism"), external], ["queue"]), ["external dependency duplicates controlled workspace package queue"])
 
 
 if __name__ == "__main__":

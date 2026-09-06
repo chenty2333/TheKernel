@@ -227,7 +227,7 @@ fn pages_in(range: VirtAddrRange, align: PageSize) -> AxResult<DynPageIter<VirtA
 
 fn preflight_sparse_unmap(range: VirtAddrRange, page_size: PageSize, pt: &PageTable) -> AxResult {
     pages_in(range, page_size)?;
-    for (_, _, _, mapped_size) in pt.collect_present_leaves(range.start, range.size())? {
+    for (_, _, _, mapped_size) in pt.collect_mapped_leaves(range.start, range.size())? {
         if mapped_size != page_size {
             return Err(AxError::BadAddress);
         }
@@ -240,14 +240,14 @@ fn preflight_sparse_unmap(range: VirtAddrRange, page_size: PageSize, pt: &PageTa
 /// later VMA teardown must accept those entries while still rejecting a range
 /// which cuts through a (not-yet-demoted) huge mapping.
 fn preflight_sparse_leaves(range: VirtAddrRange, pt: &PageTable) -> AxResult {
-    pt.collect_present_leaves(range.start, range.size())?;
+    pt.collect_mapped_leaves(range.start, range.size())?;
     Ok(())
 }
 
 fn preflight_dense_unmap(range: VirtAddrRange, page_size: PageSize, pt: &PageTable) -> AxResult {
     preflight_sparse_unmap(range, page_size, pt)?;
     for address in pages_in(range, page_size)? {
-        let (_, _, mapped_size) = pt.query(address)?;
+        let (_, _, mapped_size) = pt.query_mapped(address)?;
         if mapped_size != page_size {
             return Err(AxError::BadAddress);
         }
@@ -262,7 +262,7 @@ fn page_table_flags(flags: MappingFlags) -> MappingFlags {
     // deliberately leaves no accessible PTE.
     if flags.contains(MappingFlags::SHADOW_STACK) {
         if !flags.contains(MappingFlags::READ) {
-            return MappingFlags::empty();
+            return MappingFlags::empty().with_pkey(flags.pkey());
         }
         let shadow_write = flags.contains(MappingFlags::WRITE);
         let mut leaf = flags - MappingFlags::WRITE;
@@ -271,8 +271,8 @@ fn page_table_flags(flags: MappingFlags) -> MappingFlags {
         }
         return leaf;
     }
-    if !flags.intersects(MappingFlags::READ | MappingFlags::EXECUTE) {
-        return MappingFlags::empty();
+    if !flags.intersects(MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE) {
+        return MappingFlags::empty().with_pkey(flags.pkey());
     }
     // x86 writable user pages are inherently readable in hardware. Keep VMA
     // flags exact for /proc/maps and mprotect, but normalize the hardware
@@ -435,8 +435,8 @@ impl BackendRetirement {
     }
 
     fn prepared_exact_snapshot(pt: &PageTable, start: VirtAddr, size: usize) -> Option<Self> {
-        let mut leaves = pt.collect_present_leaves(start, size).ok()?;
-        // `collect_present_leaves` validates full-leaf geometry and reserves
+        let mut leaves = pt.collect_mapped_leaves(start, size).ok()?;
+        // `collect_mapped_leaves` validates full-leaf geometry and reserves
         // the complete capacity.  Commit clears then refills this exact
         // buffer through the allocation-free cursor API.
         leaves.clear();
@@ -457,7 +457,7 @@ impl BackendRetirement {
             return false;
         };
         pt.cursor()
-            .drain_present_leaves_into(start, size, leaves)
+            .drain_mapped_leaves_into(start, size, leaves)
             .is_ok()
     }
 
@@ -640,9 +640,14 @@ impl MappingBackend for Backend {
             }
             return true;
         }
-        cursor
-            .protect_region(start, size, page_table_flags(new_flags))
-            .is_ok()
+        let mut leaf_flags = page_table_flags(new_flags);
+        if matches!(self, Backend::Cow(_)) {
+            // Permission changes must not make fork-shared private frames
+            // writable. The next write fault resolves the COW reference,
+            // including when this restores a retained PROT_NONE leaf.
+            leaf_flags -= MappingFlags::WRITE;
+        }
+        cursor.protect_region(start, size, leaf_flags).is_ok()
     }
 
     fn can_merge(&self, other: &Self) -> bool {
@@ -1440,7 +1445,7 @@ mod tests {
         let location = mount
             .root_location()
             .create(
-                "mapping-status-backends",
+                axfs_ng_vfs::FsName::new(b"mapping-status-backends"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -1524,7 +1529,7 @@ mod tests {
         let location = mount
             .root_location()
             .create(
-                "mapping-protect-lease",
+                axfs_ng_vfs::FsName::new(b"mapping-protect-lease"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )

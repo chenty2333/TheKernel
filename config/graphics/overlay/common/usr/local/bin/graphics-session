@@ -11,7 +11,12 @@ export LIBSEAT_BACKEND=seatd
 [ "$(stat -c %u "$XDG_RUNTIME_DIR")" = "$(id -u)" ]
 [ "$(stat -c %a "$XDG_RUNTIME_DIR")" = 700 ]
 
-# Each flavor overlay links /etc/weston/weston.ini to its checked-in headless
-# or DRM configuration, so the session itself is flavor-independent.
-exec weston --config=/etc/weston/weston.ini \
-    --log="$XDG_RUNTIME_DIR/weston.log"
+# Each flavor overlay selects the backend through its weston.ini symlink.
+set -- --config=/etc/weston/weston.ini --socket=wayland-0 --log="$XDG_RUNTIME_DIR/weston.log"
+# This shared image includes EGL, so AUTO selects GL even on the software
+# device. Select Pixman explicitly for both software desktop flavors.
+if grep -Eqx 'q35-(graphics-seatd|software-desktop)' /etc/thekernel-graphics-flavor &&
+    [ ! -c /dev/dri/renderD128 ]; then
+    set -- "$@" --renderer=pixman
+fi
+exec weston "$@"

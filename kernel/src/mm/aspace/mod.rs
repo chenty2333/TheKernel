@@ -1628,6 +1628,8 @@ pub(crate) struct PreparedProtect<'a> {
 /// leaves both the PTEs and mapping metadata untouched.
 pub(crate) struct PreparedPkeyDemotion {
     leaves: Vec<PreparedPkeyLeaf>,
+    start: VirtAddr,
+    end: VirtAddr,
 }
 
 struct PreparedPkeyLeaf {
@@ -1647,13 +1649,22 @@ impl PreparedPkeyDemotion {
     }
 
     pub(crate) fn commit(&mut self, pt: &mut PageTable) -> AxResult {
-        let mut cursor = pt.cursor();
-        for leaf in &mut self.leaves {
+        // Ownership registration preserves units even if a later registration
+        // fails: the unchanged huge PTE can retire through the same registry.
+        // Finish all fallible registration before publishing any new geometry.
+        for leaf in &self.leaves {
             if leaf.cow_backing {
                 backend::register_demoted_huge_backing(leaf.paddr, leaf.size)?;
             }
+        }
+        let mut cursor = pt.cursor();
+        for leaf in &mut self.leaves {
             cursor
-                .demote_leaf_to_4k_prepared(leaf.vaddr, &mut leaf.tables)
+                .demote_leaf_for_range_prepared(
+                    leaf.vaddr.max(self.start),
+                    (leaf.vaddr + leaf.size as usize).min(self.end) - leaf.vaddr.max(self.start),
+                    &mut leaf.tables,
+                )
                 .map_err(AxError::from)?;
         }
         Ok(())
@@ -1662,11 +1673,9 @@ impl PreparedPkeyDemotion {
     pub(crate) fn apply_key(&self, pt: &mut PageTable, key: Pkey) -> AxResult {
         let mut cursor = pt.cursor();
         for leaf in &self.leaves {
-            for index in 0..(leaf.size as usize / PAGE_SIZE_4K) {
-                cursor
-                    .set_pkey(leaf.vaddr + index * PAGE_SIZE_4K, key)
-                    .map_err(AxError::from)?;
-            }
+            let address = leaf.vaddr.max(self.start);
+            let end = (leaf.vaddr + leaf.size as usize).min(self.end);
+            cursor.set_pkey_region(address, end - address, key).map_err(AxError::from)?;
         }
         Ok(())
     }
@@ -1970,7 +1979,8 @@ impl AddrSpace {
     /// their key is installed by the mapping metadata on first population.
     pub(crate) fn set_pkey(&mut self, start: VirtAddr, size: usize, key: u8) -> AxResult {
         let pkey = Pkey::new(key).ok_or(AxError::InvalidInput)?;
-        let leaves = self.preflight_set_pkey(start, size)?;
+        self.validate_region(start, size)?;
+        let leaves = self.pt.collect_mapped_leaves(start, size)?;
         // The key is VMA state, not merely a currently-resident PTE bit.
         // MemorySet's protected-range transaction splits boundary VMAs before
         // publishing the replacement flags, so later demand faults, COW and
@@ -2007,7 +2017,7 @@ impl AddrSpace {
         self.validate_region(start, size)?;
         // Validate every resident leaf before publishing VMA metadata. A
         // partial huge leaf is handled by `prepare_pkey_demotion`.
-        let leaves = self.pt.collect_present_leaves(start, size)?;
+        let leaves = self.pt.collect_overlapping_mapped_leaves(start, size)?;
         Ok(leaves)
     }
 
@@ -2020,7 +2030,7 @@ impl AddrSpace {
     ) -> AxResult<PreparedPkeyDemotion> {
         self.validate_region(start, size)?;
         let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
-        let present = self.pt.collect_present_leaves(start, size)?;
+        let present = self.pt.collect_overlapping_mapped_leaves(start, size)?;
         let mut leaves = Vec::new();
         leaves
             .try_reserve(present.len())
@@ -2037,7 +2047,16 @@ impl AddrSpace {
             }
             let frames = match page_size {
                 PageSize::Size2M => 1,
-                PageSize::Size1G => 2,
+                PageSize::Size1G => {
+                    let chunk = PageSize::Size2M as usize;
+                    let begin = usize::from(vaddr.max(start));
+                    let finish = usize::from(leaf_end.min(end));
+                    let first = begin / chunk;
+                    let last = (finish - 1) / chunk;
+                    1 + (first..=last).filter(|&index| {
+                        begin > index * chunk || finish < (index + 1) * chunk
+                    }).count()
+                },
                 PageSize::Size4K | PageSize::Size1M => return Err(AxError::InvalidInput),
             };
             leaves.push(PreparedPkeyLeaf {
@@ -2052,7 +2071,7 @@ impl AddrSpace {
                     .map_err(PreparedPkeyDemotion::prepare_table_error)?,
             });
         }
-        Ok(PreparedPkeyDemotion { leaves })
+        Ok(PreparedPkeyDemotion { leaves, start, end })
     }
 
     /// Returns the stable policy identity of this address space.
@@ -2909,6 +2928,13 @@ impl AddrSpace {
     fn fork_fragment_count(&self) -> AxResult<usize> {
         let mut count = 0usize;
         for area in self.areas.iter() {
+            if area
+                .backend()
+                .file_like_mapping()
+                .is_some_and(|mapping| mapping.excludes_fork_and_dump())
+            {
+                continue;
+            }
             let mut cursor = area.start();
             while cursor < area.end() {
                 if let Some(dontfork_end) =
@@ -3142,7 +3168,14 @@ impl AddrSpace {
         for area in self
             .areas
             .iter()
-            .filter(|area| area.flags().contains(MappingFlags::USER) && !area.backend().is_secret())
+            .filter(|area| {
+                area.flags().contains(MappingFlags::USER)
+                    && !area.backend().is_secret()
+                    && !area
+                        .backend()
+                        .file_like_mapping()
+                        .is_some_and(|mapping| mapping.excludes_fork_and_dump())
+            })
         {
             let mut cursor = area.start();
             while cursor < area.end() {
@@ -3779,7 +3812,7 @@ impl AddrSpace {
         for range in ranges.iter().copied() {
             // SharedPages owns the frames, so the drained leaf descriptors do
             // not carry a separate retirement resource.
-            drop(cursor.drain_present_leaves(range.start, range.size())?);
+            drop(cursor.drain_mapped_leaves(range.start, range.size())?);
         }
         cursor.flush();
         Ok(true)
@@ -4354,7 +4387,7 @@ impl AddrSpace {
         }
         let metadata_plan = self.prepare_fragmented_cow_2m_page_size(start, PageSize::Size4K)?;
         let (source_frame, source_flags, source_size) =
-            self.pt.query(start).map_err(|error| match error {
+            self.pt.query_mapped(start).map_err(|error| match error {
                 PagingError::NotMapped if self.uffd_missing_registered_at(start) => {
                     AxError::ResourceBusy
                 }
@@ -4460,7 +4493,7 @@ impl AddrSpace {
         if !matches!(area.backend(), Backend::Shared(_) | Backend::File(_)) {
             return Err(AxError::InvalidInput);
         }
-        let (source, flags, size) = self.pt.query(start).map_err(|error| match error {
+        let (source, flags, size) = self.pt.query_mapped(start).map_err(|error| match error {
             PagingError::NotMapped => AxError::NoMemory,
             _ => AxError::BadAddress,
         })?;
@@ -4516,7 +4549,7 @@ impl AddrSpace {
         }) {
             return Err(AxError::InvalidInput);
         }
-        let (folio, flags, size) = self.pt.query(start).map_err(|error| match error {
+        let (folio, flags, size) = self.pt.query_mapped(start).map_err(|error| match error {
             PagingError::NotMapped => AxError::NoMemory,
             _ => AxError::BadAddress,
         })?;
@@ -4659,7 +4692,7 @@ impl AddrSpace {
                     && area.backend().page_size() == PageSize::Size2M
             }) && self
                 .pt
-                .query(candidate)
+                .query_mapped(candidate)
                 .is_ok_and(|(_, _, page_size)| page_size == PageSize::Size2M);
             if demote_private {
                 self.demote_private_cow_2m(candidate)?;
@@ -4670,7 +4703,7 @@ impl AddrSpace {
                         && matches!(area.backend(), Backend::Shared(_) | Backend::File(_))
                 }) && self
                     .pt
-                    .query(candidate)
+                    .query_mapped(candidate)
                     .is_ok_and(|(_, _, page_size)| page_size == PageSize::Size2M);
                 if demote_alias {
                     if let (Some(pages), Some(offset)) = (
@@ -5408,19 +5441,9 @@ impl AddrSpace {
         self.areas
             .iter()
             .filter(|area| area.flags().contains(MappingFlags::USER))
-            .map(|area| {
-                let page_size = area.backend().page_size() as usize;
-                let mut resident_bytes = 0usize;
-                let mut cursor = area.start();
-                while cursor < area.end() {
-                    let step = page_size.min(area.end().sub_addr(cursor));
-                    if self.pt.query(cursor).is_ok() {
-                        resident_bytes = resident_bytes.saturating_add(step);
-                    }
-                    cursor += page_size;
-                }
-                resident_bytes
-            })
+            // Walk populated page-table branches instead of probing every page
+            // in large, sparsely populated stacks and allocator reservations.
+            .map(|area| self.pt.mapped_bytes(area.start(), area.size()).unwrap_or(0))
             .sum()
     }
 
@@ -8159,6 +8182,8 @@ impl AddrSpace {
         Self::clear_interval(&mut self.dontfork_ranges, start, size);
         Self::clear_interval_vec(&mut self.dontdump_ranges, start, size);
         self.clear_locked_range(start, size);
+        #[cfg(target_arch = "x86_64")]
+        self.remove_cet_default_shadow_stack_extents_for_unmap(start, size);
         if prune_shared_alias_bindings {
             self.prune_shared_alias_bindings();
         }
@@ -9404,6 +9429,13 @@ impl AddrSpace {
             .try_reserve(self.areas.len())
             .map_err(|_| AxError::NoMemory)?;
         for area in self.areas.iter() {
+            if area
+                .backend()
+                .file_like_mapping()
+                .is_some_and(|mapping| mapping.excludes_fork_and_dump())
+            {
+                continue;
+            }
             let mut cursor = area.start();
             let mut has_child_segment = false;
             while cursor < area.end() {
@@ -9431,6 +9463,13 @@ impl AddrSpace {
             .try_reserve(self.areas.len())
             .map_err(|_| AxError::NoMemory)?;
         for area in self.areas.iter() {
+            if area
+                .backend()
+                .file_like_mapping()
+                .is_some_and(|mapping| mapping.excludes_fork_and_dump())
+            {
+                continue;
+            }
             if let Some(key) = area.backend().shared_backing_key() {
                 fork_shared_keys.push(key);
             }
@@ -9466,6 +9505,47 @@ impl AddrSpace {
         guard.dontdump_ranges = dontdump_ranges;
         guard.madvise_guard_ranges = madvise_guard_ranges;
         guard.madvise_hwpoison_ranges = madvise_hwpoison_ranges;
+        let excluded_area_count = self
+            .areas
+            .iter()
+            .filter(|area| {
+                area.backend()
+                    .file_like_mapping()
+                    .is_some_and(|mapping| mapping.excludes_fork_and_dump())
+            })
+            .count();
+        if excluded_area_count != 0 {
+            guard
+                .dontdump_ranges
+                .try_reserve(excluded_area_count)
+                .map_err(|_| AxError::NoMemory)?;
+            // An intrinsically excluded mapping has no child VMA.  Remove any
+            // inherited DONTDUMP interval over it so a later child mmap at
+            // the same address does not inherit policy from the absent VMA.
+            for area in self.areas.iter() {
+                if area
+                    .backend()
+                    .file_like_mapping()
+                    .is_some_and(|mapping| mapping.excludes_fork_and_dump())
+                {
+                    Self::clear_interval(
+                        &mut guard.madvise_guard_ranges,
+                        area.start(),
+                        area.size(),
+                    );
+                    Self::clear_interval(
+                        &mut guard.madvise_hwpoison_ranges,
+                        area.start(),
+                        area.size(),
+                    );
+                    Self::clear_interval_vec(
+                        &mut guard.dontdump_ranges,
+                        area.start(),
+                        area.size(),
+                    );
+                }
+            }
+        }
         // DONTFORK holes have no child VMA.  Do not leave an advisory guard
         // sidecar there: a later child mmap at that address must not inherit
         // a parent's fault policy.
@@ -9491,6 +9571,13 @@ impl AddrSpace {
 
         let mut self_modify = self.pt.cursor();
         for area in self.areas.iter() {
+            if area
+                .backend()
+                .file_like_mapping()
+                .is_some_and(|mapping| mapping.excludes_fork_and_dump())
+            {
+                continue;
+            }
             let child_lineage = child_lineages
                 .binary_search_by_key(&area.lineage(), |(parent, _)| *parent)
                 .ok()
@@ -9608,6 +9695,11 @@ impl AddrSpace {
         for (page, entry) in &self.swapped {
             if Self::interval_end_covering(&dontfork_ranges, *page).is_some()
                 || Self::interval_end_covering(&wipe_on_fork_ranges, *page).is_some()
+                || self.areas.find(*page).is_some_and(|area| {
+                    area.backend()
+                        .file_like_mapping()
+                        .is_some_and(|mapping| mapping.excludes_fork_and_dump())
+                })
             {
                 continue;
             }
@@ -10413,6 +10505,67 @@ mod tests {
     }
 
     #[test]
+    fn pkey_partial_prot_none_huge_preserves_neighbor_keys() {
+        let start = VirtAddr::from(0x4000_0000usize);
+        let mut aspace = AddrSpace::new_empty(start, PageSize::Size2M as usize).unwrap();
+        aspace.pt.cursor().map(start, PhysAddr::from(0usize), PageSize::Size2M,
+            MappingFlags::empty().with_pkey(3)).unwrap();
+        let target = start + PAGE_SIZE_4K;
+        assert_eq!(aspace.preflight_set_pkey(target, PAGE_SIZE_4K).unwrap().len(), 1);
+        let mut demotion = aspace.prepare_pkey_demotion(target, PAGE_SIZE_4K).unwrap();
+        demotion.commit(&mut aspace.pt).unwrap();
+        demotion.apply_key(&mut aspace.pt, Pkey::new(5).unwrap()).unwrap();
+        for (offset, key) in [(0, 3), (PAGE_SIZE_4K, 5), (2 * PAGE_SIZE_4K, 3)] {
+            let (physical, flags, size) = aspace.pt.query_mapped(start + offset).unwrap();
+            assert_eq!(physical, PhysAddr::from(offset));
+            assert_eq!(flags, MappingFlags::empty().with_pkey(key));
+            assert_eq!(size, PageSize::Size4K);
+            assert!(aspace.pt.query(start + offset).is_err());
+        }
+        aspace.pt.cursor().drain_mapped_leaves(start, PageSize::Size2M as usize).unwrap();
+    }
+
+    #[test]
+    fn pkey_partial_1g_middle_and_cross_chunk_geometry() {
+        let start = VirtAddr::from(0x4000_0000usize);
+        let chunk = PageSize::Size2M as usize;
+        for (offset, length) in [(17 * chunk + PAGE_SIZE_4K, PAGE_SIZE_4K),
+                                 (17 * chunk + PAGE_SIZE_4K, 3 * chunk),
+                                 (17 * chunk, 3 * chunk)] {
+            let mut aspace = AddrSpace::new_empty(start, PageSize::Size1G as usize).unwrap();
+            aspace.pt.cursor().map(start, PhysAddr::from(0usize), PageSize::Size1G,
+                MappingFlags::empty().with_pkey(3)).unwrap();
+            let target = start + offset;
+            let mut demotion = aspace.prepare_pkey_demotion(target, length).unwrap();
+            demotion.commit(&mut aspace.pt).unwrap();
+            demotion.apply_key(&mut aspace.pt, Pkey::new(5).unwrap()).unwrap();
+            for (address, key) in [(offset - PAGE_SIZE_4K, 3), (offset, 5),
+                                   (offset + length - PAGE_SIZE_4K, 5), (offset + length, 3)] {
+                let (pa, flags, _) = aspace.pt.query_mapped(start + address).unwrap();
+                assert_eq!(pa, PhysAddr::from(address));
+                assert_eq!(flags, MappingFlags::empty().with_pkey(key));
+            }
+            assert_eq!(aspace.pt.query_mapped(start).unwrap().2, PageSize::Size2M);
+            aspace.pt.cursor().drain_mapped_leaves(start, PageSize::Size1G as usize).unwrap();
+        }
+    }
+
+    #[test]
+    fn resident_bytes_counts_sparse_user_vmas_only() {
+        let start = VirtAddr::from(0x1000);
+        let mut aspace = AddrSpace::new_empty(start, TEST_SPACE_SIZE).unwrap();
+        let user = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+        aspace.map(start, PAGE_SIZE_4K * 4, user, false,
+            Backend::new_alloc(start, PageSize::Size4K)).unwrap();
+        aspace.populate_area(start + PAGE_SIZE_4K, PAGE_SIZE_4K, user).unwrap();
+        let supervisor = start + PAGE_SIZE_4K * 4;
+        aspace.map(supervisor, PAGE_SIZE_4K, MappingFlags::READ | MappingFlags::WRITE,
+            true, Backend::new_alloc(supervisor, PageSize::Size4K)).unwrap();
+        assert!(aspace.pt.query_mapped(supervisor).is_ok());
+        assert_eq!(aspace.resident_user_bytes(), PAGE_SIZE_4K);
+    }
+
+    #[test]
     fn resident_highwater_is_mm_owned_and_monotonic() {
         let aspace = AddrSpace::new_empty(VirtAddr::from(0x1000), TEST_SPACE_SIZE).unwrap();
         assert_eq!(aspace.merge_resident_highwater(12), 12);
@@ -10434,6 +10587,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(aspace.current_mapping_bytes(), PAGE_SIZE_4K * 2);
+        assert_eq!(aspace.resident_user_bytes(), PAGE_SIZE_4K * 2);
+        aspace.pt.cursor().protect_region(start, PAGE_SIZE_4K * 2,
+            MappingFlags::empty()).unwrap();
+        assert!(aspace.pt.query(start).is_err());
         assert_eq!(aspace.resident_user_bytes(), PAGE_SIZE_4K * 2);
 
         assert!(aspace.oom_reap_private_pages());
@@ -10512,6 +10669,37 @@ mod tests {
         assert!(child.is_sealed());
         assert!(child.is_private_anonymous());
         assert!(child.file_mapping().is_none());
+    }
+
+    #[test]
+    fn intrinsic_file_like_mapping_is_skipped_by_fork_and_coredump_selection() {
+        let _context = crate::test_support::scheduler_test_context();
+        let page = PAGE_SIZE_4K;
+        let start = VirtAddr::from(0x4000);
+        let mut aspace = AddrSpace::new_empty(VirtAddr::from(0x1000), 0x10_000).unwrap();
+        let excluded = FileLikeMappingLease::new_detached(
+            17,
+            29,
+            start,
+            0,
+            MappingFlags::USER | MappingFlags::READ,
+            MappingFlags::READ,
+            FileMappingSharing::Shared,
+        )
+        .with_excluded_fork_and_dump(true);
+        aspace
+            .map(
+                start,
+                page,
+                MappingFlags::USER | MappingFlags::READ,
+                false,
+                Backend::new_linear(start, PhysAddr::from(0x8000), page)
+                    .with_file_like_mapping(excluded),
+            )
+            .unwrap();
+
+        assert_eq!(aspace.fork_fragment_count().unwrap(), 0);
+        assert!(aspace.coredump_segments().unwrap().is_empty());
     }
 
     fn mock_lineage(raw: u64) -> MappingLineage {
@@ -11842,7 +12030,10 @@ mod tests {
             .map(
                 start,
                 size,
-                MappingFlags::USER | MappingFlags::READ | MappingFlags::SHADOW_STACK,
+                MappingFlags::USER
+                    | MappingFlags::READ
+                    | MappingFlags::WRITE
+                    | MappingFlags::SHADOW_STACK,
                 false,
                 Backend::new_alloc(start, PageSize::Size4K),
             )
@@ -11866,16 +12057,15 @@ mod tests {
             .unwrap();
 
         let moved = VirtAddr::from(0xc000);
-        mm.unmap(first, page * 2).unwrap().finish();
+        mm.unmap_areas_with_tlb_grace(first, page * 2).unwrap();
         test_cet_stack(&mut mm, moved, page * 2);
         mm.rebase_cet_default_shadow_stacks_after_mremap(first, page * 2, page * 2, moved, false);
         assert_eq!(mm.cet_default_shadow_stack(101).unwrap().start, moved);
         assert_eq!(mm.cet_default_shadow_stack(202).unwrap().start, second);
 
         // Shrinking leaves the low VMA fragment live and updates its cleanup
-        // extent. Replacing another owner's VMA does not produce a CET-state
-        // invalidation receipt: a peer must fault on later hardware access.
-        mm.unmap(moved + page, page).unwrap().finish();
+        // extent through the same raw retirement/rebase sequence as mremap.
+        mm.unmap_areas_with_tlb_grace(moved + page, page).unwrap();
         mm.rebase_cet_default_shadow_stacks_after_mremap(moved, page * 2, page, moved, false);
         assert_eq!(mm.cet_default_shadow_stack(101).unwrap().size, page);
         mm.unmap(second, page).unwrap().finish();
@@ -11887,7 +12077,10 @@ mod tests {
             Backend::new_alloc(second, PageSize::Size4K),
         )
         .unwrap();
-        assert_eq!(mm.cet_default_shadow_stack(202).unwrap().start, second);
+        let detached = mm.cet_default_shadow_stack(202).unwrap();
+        assert!(detached.extents.is_empty());
+        assert_eq!(detached.start, VirtAddr::from(0));
+        assert_eq!(detached.size, 0);
     }
 
     #[test]
@@ -12106,9 +12299,9 @@ mod tests {
         mm.register_cet_default_shadow_stack(101, stack, page * 2)
             .unwrap();
 
-        // Model pkey_mprotect(PROT_READ) on only the upper page.  The owner
-        // remains one logical two-page CET lease even though its VMA is now
-        // split at the pkey boundary.
+        // Model pkey_mprotect(PROT_READ) on only the upper page. The prepared
+        // protection changes the VMA half; the syscall then publishes the
+        // same key in every resident leaf after that commit succeeds.
         mm.prepare_protect(
             stack + page,
             page,
@@ -12118,6 +12311,12 @@ mod tests {
         .commit()
         .unwrap()
         .finish();
+        {
+            let mut page_table = mm.page_table_mut().cursor();
+            page_table
+                .set_pkey(stack + page, Pkey::new(3).unwrap())
+                .unwrap();
+        }
         let owner = mm.cet_default_shadow_stack(101).unwrap();
 
         let vfork_child = mm
@@ -12130,9 +12329,22 @@ mod tests {
         for offset in [0, page] {
             let parent_leaf = mm.page_table().query(stack + offset).unwrap();
             let child_leaf = vfork_child.page_table().query(stack + offset).unwrap();
+            let parent_pkey = mm.page_table_mut().cursor().pkey(stack + offset).unwrap();
+            let child_pkey = vfork_child
+                .page_table_mut()
+                .cursor()
+                .pkey(stack + offset)
+                .unwrap();
             assert_eq!(child_leaf.0, parent_leaf.0);
             assert_eq!(child_leaf.1, parent_leaf.1);
-            assert!(child_leaf.1.contains(MappingFlags::SHADOW_STACK));
+            assert_eq!(child_pkey, parent_pkey);
+            if offset == 0 {
+                assert!(child_leaf.1.contains(MappingFlags::SHADOW_STACK));
+                assert_eq!(parent_pkey.0.get(), 0);
+            } else {
+                assert!(!child_leaf.1.contains(MappingFlags::SHADOW_STACK));
+                assert_eq!(parent_pkey.0.get(), 3);
+            }
         }
         drop(vfork_child);
 

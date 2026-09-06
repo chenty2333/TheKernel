@@ -1,0 +1,9 @@
+TheKernel Linux ABI
+Copyright 2026 TheKernel contributors
+
+The usercopy crate is derived from the StarryOS `starry-vm` crate authored by
+朝倉水希 and Mivik.
+
+The MM crate is a new Apache-2.0 policy extraction. Linux, Zircon, and
+Asterinas snapshots were consulted for observable contracts; no source text
+from those projects is copied into this workspace.

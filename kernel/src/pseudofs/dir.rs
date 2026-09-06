@@ -39,6 +39,41 @@ pub trait SimpleDirOps: Send + Sync + 'static {
         true
     }
 
+    /// Returns the current namespace generation for dynamic directories.
+    /// Static pseudo-directories retain the zero default.
+    fn namespace_epoch(&self) -> u64 {
+        0
+    }
+
+    /// Returns whether this directory can publish a named inode of `node_type`.
+    fn supports_named_create(&self, _node_type: NodeType) -> bool {
+        false
+    }
+
+    /// Atomically publishes a named entry. The default keeps static pseudo-
+    /// directories fail-closed; dynamic providers may use `parent` to build
+    /// the exact dentry before exposing their new name.
+    fn create_named(
+        &self,
+        _parent: Option<DirEntry>,
+        _name: &FsName,
+        _options: &NamedCreateOptions,
+        _disposition: CreateDisposition,
+    ) -> VfsResult<CreateOutcome<DirEntry>> {
+        Err(VfsError::OperationNotPermitted)
+    }
+
+    /// Returns whether this directory supports unlinking a named non-directory.
+    fn supports_unlink(&self) -> bool {
+        false
+    }
+
+    /// Removes one named entry. The default keeps static pseudo-directories
+    /// immutable.
+    fn unlink(&self, _request: UnlinkRequest<'_>) -> VfsResult<()> {
+        Err(VfsError::OperationNotPermitted)
+    }
+
     /// Combines two directories into one.
     fn chain<N: SimpleDirOps>(self, other: N) -> ChainedDirOps<Self, N>
     where
@@ -175,8 +210,13 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
                     .parent()
                     .map_or_else(|| this_entry.metadata(), |parent| parent.metadata()),
                 other => {
-                    let entry = this_dir.lookup(other)?;
-                    entry.metadata()
+                    // Dynamic directories (notably procfs) can lose a child
+                    // after taking the name snapshot. That child is absent
+                    // from this enumeration, not an error for the directory.
+                    match this_dir.lookup(other).and_then(|entry| entry.metadata()) {
+                        Err(error) if error.canonicalize() == VfsError::NotFound => continue,
+                        result => result,
+                    }
                 }
             }?;
             if !sink.accept(&name, metadata.inode, metadata.node_type, i as u64 + 1) {
@@ -207,20 +247,33 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
         self.ops.is_cacheable()
     }
 
+    fn namespace_epoch(&self) -> u64 {
+        self.ops.namespace_epoch()
+    }
+
+    fn supports_named_create(&self, node_type: NodeType) -> bool {
+        self.ops.supports_named_create(node_type)
+    }
+
     fn create_named(
         &self,
-        _name: &FsName,
-        _options: &NamedCreateOptions,
-        _disposition: CreateDisposition,
+        name: &FsName,
+        options: &NamedCreateOptions,
+        disposition: CreateDisposition,
     ) -> VfsResult<CreateOutcome<DirEntry>> {
-        Err(VfsError::OperationNotPermitted)
+        self.ops
+            .create_named(self.this.upgrade(), name, options, disposition)
+    }
+
+    fn supports_unlink(&self) -> bool {
+        self.ops.supports_unlink()
+    }
+
+    fn unlink(&self, request: UnlinkRequest<'_>) -> VfsResult<()> {
+        self.ops.unlink(request)
     }
 
     fn link(&self, _name: &FsName, _node: &DirEntry) -> VfsResult<DirEntry> {
-        Err(VfsError::OperationNotPermitted)
-    }
-
-    fn unlink(&self, _request: UnlinkRequest<'_>) -> VfsResult<()> {
         Err(VfsError::OperationNotPermitted)
     }
 
@@ -232,6 +285,58 @@ impl<O: SimpleDirOps> DirNodeOps for SimpleDir<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ChangingChildren {
+        fs: Arc<SimpleFs>,
+        missing_error: VfsError,
+    }
+
+    impl SimpleDirOps for ChangingChildren {
+        fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
+            try_boxed_names([b"gone".as_slice(), b"kept"].into_iter().map(|name| {
+                Cow::Borrowed(FsName::new(name))
+            }))
+        }
+
+        fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
+            if name.as_bytes() == b"gone" {
+                return Err(self.missing_error);
+            }
+            Ok(SimpleDir::new_maker(self.fs.clone(), Arc::new(DirMapping::new())).into())
+        }
+
+        fn is_cacheable(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn enumeration_skips_disappeared_children_without_hiding_other_errors() {
+        let _test_context = crate::test_support::scheduler_test_context();
+        for missing_error in [
+            VfsError::NotFound,
+            axerrno::LinuxError::ENOENT.into(),
+            VfsError::PermissionDenied,
+        ] {
+            let filesystem = SimpleFs::new_with("changing-dir-test".into(), 0, move |fs| {
+                SimpleDir::new_maker(fs.clone(), Arc::new(ChangingChildren { fs, missing_error }))
+            });
+            let root = filesystem.root_dir();
+            let dir = root.as_dir().unwrap();
+            let mut entries = Vec::new();
+            let result = dir.read_dir(2, &mut |name: &FsName, _, _, offset| {
+                entries.push((name.as_bytes().to_vec(), offset));
+                true
+            });
+            if missing_error.canonicalize() == VfsError::NotFound {
+                assert_eq!(result, Ok(1));
+                assert_eq!(entries, alloc::vec![(b"kept".to_vec(), 4)]);
+            } else {
+                assert_eq!(result, Err(missing_error));
+                assert!(entries.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn simple_dir_exposes_a_stable_writeback_error_source() {

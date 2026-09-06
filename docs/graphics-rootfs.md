@@ -3,7 +3,7 @@
 `scripts/build-graphics-rootfs.sh` is separate from the normal BusyBox test
 rootfs. It uses Buildroot 2026.05.2; the package download directory is explicit
 and reusable. The generated toolchain uses the Linux 6.12 LTS UAPI headers; the
-Linux runtime differential reference remains separately fixed at 6.12.107.
+Linux runtime differential reference remains separately fixed at 7.2.3.
 
 First validate the checked-in inputs without fetching or building anything:
 
@@ -57,6 +57,9 @@ only the `renderD*` node for the separately gated virgl EGL workload.
 `graphics-session` forces `LIBSEAT_BACKEND=seatd`; the q35 smoke also requires
 the socket to be `root:seat 0660` and waits for Weston's log to report that
 libseat actually opened the `seatd` backend.
+The session explicitly listens on `wayland-0` in the private runtime directory;
+the SHM client also creates its temporary backing files there. S80 prepares
+`/tmp/.X11-unix` as `root:root 1777` before starting the unprivileged compositor.
 
 Run `/usr/local/bin/graphics-abi-smoke` inside the guest; its
 `THEKERNEL_GRAPHICS_ABI_SMOKE_READY` marker means the S70/S80 path produced a
@@ -65,19 +68,19 @@ rendered-frame or input-device test.
 
 The headless overlay also runs that probe as `S90graphics-abi-smoke`, so its
 marker is available on the guest serial console without a login shell. Boot the
-already-built graphics image explicitly; `graphics-smoke` always rebuilds the
+already-built graphics image explicitly; `test --suite graphics` always rebuilds the
 drive-only ESP so that the requested rootfs is the sole snapshot-backed
 virtio-blk device, matching the Linux oracle topology:
 
 ```bash
-tools/thekernel.py graphics-smoke --profile system \
+tools/thekernel.py test --suite graphics --profile system \
   --rootfs "$TASK_CACHE/graphics-rootfs-headless/images/rootfs.ext2" \
   --graphics-profile headless \
   --screenshot "$TASK_CACHE/graphics-headless.ppm"
 ```
 
-`headless` is the default graphics-smoke profile. It keeps the virtio GPU and
-virtio input devices attached while avoiding a host window. `graphics-smoke`
+`headless` is the default test --suite graphics profile. It keeps the virtio GPU and
+virtio input devices attached while avoiding a host window. `test --suite graphics`
 binds both its QMP screendump and intentional stop to
 `THEKERNEL_GRAPHICS_ABI_SMOKE_READY`; it preserves the PPM after QMP validates
 the screendump. The general `run --rootfs IMAGE` argument likewise requires an
@@ -92,13 +95,17 @@ uses a 3 GiB ext4 image; desktop OpenGL/GLX is enabled so Piglit builds its GL
 tests. `libepoxy` is selected explicitly so Buildroot retains Weston's rootless
 Xwayland support. Its S90 path first requires seatd and its socket,
 card0, an evdev event node, Weston with `drm-backend.so`, and a Wayland socket.
-Both the software and virgl paths use the same Wayland EGL/GLES client to
-submit a fullscreen 800x600 frame
-with a 200x200 red block at (300,200), and emits
+The software path uses a Wayland SHM client with Pixman; Virgl uses an
+EGL/GLES client. Both submit a fullscreen 800x600 frame
+with a 200x200 red block at (300,200). The software client emits
 `THEKERNEL_Q35_WESTON_READY` only after that frame callback. Use
-`graphics-smoke --flavor q35-graphics-seatd --graphics-profile headless`
+`test --suite graphics --flavor q35-graphics-seatd --graphics-profile headless`
 to bind the QMP 800x600 PPM and exact RGB block oracle to this software KMS
-acceptance marker.
+acceptance marker. The software smoke then validates pointer, keyboard, and
+button repaints. After the final screenshot, QMP sends F12 to the opted-in
+client; the guest waits for the client and Weston to exit, synchronizes storage,
+and powers off. Success requires `THEKERNEL_Q35_SOFTWARE_SMOKE_COMPLETE` and
+normal guest shutdown.
 
 The same `q35-graphics-seatd` rootfs is used for all three explicit QEMU
 profiles: `headless` selects Pixman/SHM on `virtio-gpu-pci`,
@@ -108,7 +115,7 @@ dispatcher uses the exposed render capability to run exactly one of the SHM,
 Virgl, or Venus workloads and emits the corresponding marker.  The other final
 graphics images are the independent `q35-software-desktop`,
 `q35-venus-desktop`, `q35-graphics-benchmark`, and `q35-graphics-logind`
-flavors; `graphics-smoke --flavor` accepts only `headless-abi-smoke`,
+flavors; `test --suite graphics --flavor` accepts only `headless-abi-smoke`,
 `q35-graphics-seatd`, and `q35-graphics-logind`.
 
 For real virgl coverage, run the same flavor with

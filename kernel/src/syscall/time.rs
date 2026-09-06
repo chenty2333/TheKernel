@@ -24,7 +24,7 @@ use crate::{
     syscall::RawSigevent,
     task::{
         AlarmClock, AlarmTokenReserveError, AsThread, ITimerType, PosixTimer, PosixTimerClock,
-        PosixTimerNotify, TaskUsage, get_process_itimer, get_task, poll_timer,
+        PosixTimerNotify, TaskUsage, get_process_itimer, get_visible_task_including_exiting, poll_timer,
         refresh_posix_cpu_timer_armed, set_process_itimer, times_clock_ticks,
     },
     time::{TimeValueLike, set_wall_time, wall_time, wall_time_nanos},
@@ -281,12 +281,34 @@ fn cpu_clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
         CpuClockTarget::Process(0) => current().as_thread().proc_data.self_usage(),
         CpuClockTarget::Thread(0) => TaskUsage::from_thread(current().as_thread()),
         CpuClockTarget::Process(pid) => {
-            let task = get_task(pid)?;
-            task.as_thread().proc_data.self_usage()
+            let curr = current();
+            let caller = curr.as_thread();
+            let tid = caller
+                .pid_ns()
+                .resolve_visible_pid(pid)
+                .ok_or(AxError::InvalidInput)?;
+            let task = get_visible_task_including_exiting(tid).map_err(|_| AxError::InvalidInput)?;
+            let target = task.as_thread();
+            // Linux clock_gettime also accepts the caller's own nonleader
+            // TID as a process clock, but other targets must name a leader.
+            if target.tid() != caller.tid() && !target.is_thread_group_leader() {
+                return Err(AxError::InvalidInput);
+            }
+            target.proc_data.self_usage()
         }
         CpuClockTarget::Thread(tid) => {
-            let task = get_task(tid)?;
-            TaskUsage::from_thread(task.as_thread())
+            let curr = current();
+            let caller = curr.as_thread();
+            let tid = caller
+                .pid_ns()
+                .resolve_visible_pid(tid)
+                .ok_or(AxError::InvalidInput)?;
+            let task = get_visible_task_including_exiting(tid).map_err(|_| AxError::InvalidInput)?;
+            let target = task.as_thread();
+            if target.proc_data.proc.pid() != caller.proc_data.proc.pid() {
+                return Err(AxError::InvalidInput);
+            }
+            TaskUsage::from_thread(target)
         }
     };
     Ok(usage_value_for_cpu_clock(usage, decoded.which))
@@ -447,6 +469,9 @@ fn sys_do_clock_adjtime<M: UserMemory + ?Sized>(
 }
 
 fn posix_timer_clock(clock_id: __kernel_clockid_t) -> AxResult<PosixTimerClock> {
+    if matches!(clock_id as u32, CLOCK_MONOTONIC_RAW | CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE) {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
     match clock_domain(clock_id)? {
         ClockDomain::Realtime | ClockDomain::RealtimeCoarse => Ok(PosixTimerClock::Realtime),
         ClockDomain::Monotonic | ClockDomain::MonotonicCoarse => Ok(PosixTimerClock::Monotonic),
@@ -715,18 +740,15 @@ pub fn sys_timer_create<M: UserMemory + ?Sized>(
     sigevent_ptr: *const RawSigevent,
     timerid_ptr: *mut i32,
 ) -> AxResult<isize> {
-    if timerid_ptr.is_null() {
-        return Err(AxError::BadAddress);
-    }
-
-    let clock = posix_timer_clock(clock_id)?;
-    let notify = if let Some(ptr) = thekernel_linux_usercopy::VmPtr::nullable(sigevent_ptr) {
-        decode_timer_notify(Some(
-            RawSigevent::read_from_user(memory, ptr).map_err(map_timer_usercopy_error)?,
-        ))?
+    // Linux copies the optional event before validating the clock, then
+    // validates notification fields. The output pointer is checked at copyout.
+    let event = if let Some(ptr) = thekernel_linux_usercopy::VmPtr::nullable(sigevent_ptr) {
+        Some(RawSigevent::read_from_user(memory, ptr).map_err(map_timer_usercopy_error)?)
     } else {
-        decode_timer_notify(None)?
+        None
     };
+    let clock = posix_timer_clock(clock_id)?;
+    let notify = decode_timer_notify(event)?;
 
     let proc_data = current().as_thread().proc_data.clone();
     // Main and optional signal-retry alarm leases are acquired atomically
@@ -1675,13 +1697,17 @@ mod tests {
             timer_effective_alarm_clock(PosixTimerClock::Tai, true),
             AlarmClock::Realtime
         );
+    }
+
+    #[test]
+    fn posix_cpu_timers_preserve_the_requested_accounting_domain() {
         assert_eq!(
             posix_timer_clock(CLOCK_PROCESS_CPUTIME_ID as _),
-            Err(AxError::InvalidInput)
+            Ok(PosixTimerClock::ProcessCpu)
         );
         assert_eq!(
             posix_timer_clock(CLOCK_THREAD_CPUTIME_ID as _),
-            Err(AxError::InvalidInput)
+            Ok(PosixTimerClock::ThreadCpu)
         );
     }
 

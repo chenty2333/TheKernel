@@ -68,7 +68,7 @@ static EXECUTABLES: Once<Mutex<ExecutableTable>> = Once::new();
 /// executable registry never publishes a probe by modifying inode contents or
 /// another process's mapping.
 pub(crate) fn patch_private_executable_alias(
-    aspace: &Arc<Mutex<AddrSpace>>,
+    aspace: &Arc<axsync::Mutex<AddrSpace>>,
     address: VirtAddr,
     replacement: u8,
 ) -> AxResult<u8> {

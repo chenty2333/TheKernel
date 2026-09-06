@@ -17,6 +17,6 @@ while [ "$attempt" -lt 50 ]; do
     sleep 1
 done
 [ -S "$runtime_dir/$socket" ]
-/usr/local/bin/drm-uapi-oracle
-/usr/local/bin/evdev-uapi-oracle
+/usr/local/bin/drm-uapi-oracle || { echo "THEKERNEL_GRAPHICS_ABI_SMOKE_READY state=FAIL reason=drm_uapi_oracle"; exit 1; }
+/usr/local/bin/evdev-uapi-oracle || { echo "THEKERNEL_GRAPHICS_ABI_SMOKE_READY state=FAIL reason=evdev_uapi_oracle"; exit 1; }
 echo 'THEKERNEL_GRAPHICS_ABI_SMOKE_READY'

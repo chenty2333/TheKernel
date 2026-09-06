@@ -507,20 +507,13 @@ fn populate_user_range_with(
         return Ok(());
     }
 
-    let start = VirtAddr::from(start);
-    let page_start = start.align_down_4k();
-    let end = start.checked_add(len).ok_or(UserCopyError::BadAddress)?;
-    let page_end = VirtAddr::from(
-        super::checked_align_up_4k(end.as_usize()).ok_or(UserCopyError::BadAddress)?,
-    );
-    let aspace_handle = capability.address_space();
-    let mut aspace = aspace_handle.lock();
-    if !aspace.can_access_range(start, len, access_flags) {
-        return Err(UserCopyError::AccessDenied);
-    }
-    aspace
-        .populate_area(page_start, page_end - page_start, access_flags)
-        .map_err(map_populate_error)
+    super::usercopy::with_populated_user_range(
+        capability.address_space(),
+        start,
+        len,
+        access_flags,
+        |_, _| Ok(()),
+    )
 }
 
 fn reject_user_io_pin(counter: &AtomicU64) {
@@ -1775,6 +1768,7 @@ mod tests {
 
     #[test]
     fn user_io_pin_provenance_is_private_only_for_anonymous_cow() {
+        let _context = crate::test_support::scheduler_test_context();
         let anonymous = Backend::new_alloc(VirtAddr::from(0x4000), PageSize::Size4K);
         assert_eq!(
             user_io_pin_provenance_for_backend(&anonymous),
@@ -1786,7 +1780,7 @@ mod tests {
         let location = mount
             .root_location()
             .create(
-                "pin-provenance-file-cow",
+                axfs_ng_vfs::FsName::new(b"pin-provenance-file-cow"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -1807,6 +1801,7 @@ mod tests {
 
     #[test]
     fn user_io_pin_provenance_rejects_other_and_mixed_backends() {
+        let _context = crate::test_support::scheduler_test_context();
         let shared = Backend::new_shared(
             VirtAddr::from(0x4000),
             Arc::new(SharedPages::new(0, PageSize::Size4K).unwrap()),

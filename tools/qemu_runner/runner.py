@@ -261,7 +261,10 @@ def _copy_ovmf_vars(source: Path, destination: Path) -> Path:
     temporary = destination.with_name(f".{destination.name}.tmp")
     temporary.unlink(missing_ok=True)
     try:
-        shutil.copy2(source, temporary)
+        # Runtime firmware inherits the run directory's security context.
+        # copy2 imports source xattrs, including a previous container's
+        # private SELinux label, preventing reuse from another container.
+        shutil.copyfile(source, temporary)
         temporary.replace(destination)
         destination.chmod(destination.stat().st_mode | 0o600)
     finally:
@@ -392,6 +395,11 @@ def run(
             raise RunnerError(f"input file does not exist: {input_path}")
         if not config.interaction.interactive:
             raise RunnerError("input file requires interactive mode")
+    pinning = config.qmp.vcpu_host_cpus
+    if pinning and (len(pinning) != config.cpus or len(set(pinning)) != len(pinning)
+                    or any(isinstance(cpu, bool) or not isinstance(cpu, int) or cpu < 0 for cpu in pinning)
+                    or not set(pinning) <= os.sched_getaffinity(0)):
+        raise RunnerError("vCPU pinning requires one distinct allowed host CPU per guest CPU")
     qmp_socket = config.qmp.socket
     if (
         config.qmp.screenshot is not None
@@ -399,6 +407,7 @@ def run(
         or config.qmp.input_after_marker is not None
         or config.qmp.screenshot_after_marker is not None
         or config.qmp.checkpoints
+        or pinning
     ) and qmp_socket is None:
         raise RunnerError("QMP screenshot and input injection require a QMP socket")
     if qmp_socket is not None:
@@ -502,6 +511,7 @@ def run(
             ]
         )
     planned_outputs.append(("log", config.log_path))
+    planned_outputs.append(("kernel log", workdir / "kernel.log"))
     if qmp_socket is not None:
         planned_outputs.append(("QMP socket", qmp_socket))
     if screenshot is not None:
@@ -513,15 +523,18 @@ def run(
         tuple(planned_outputs), protected_paths=tuple(run_input_paths)
     )
     log_path = resolved_outputs["log"]
+    diagnostic_log_path = resolved_outputs["kernel log"]
 
     workdir.mkdir(parents=True, exist_ok=True)
     if qmp_socket is not None:
         qmp_socket.parent.mkdir(parents=True, exist_ok=True)
     if screenshot is not None:
         screenshot.parent.mkdir(parents=True, exist_ok=True)
+        screenshot.unlink(missing_ok=True)
     for checkpoint in checkpoints:
         if checkpoint.screenshot is not None:
             checkpoint.screenshot.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.screenshot.unlink(missing_ok=True)
     if ovmf_vars_source is not None and ovmf_vars_runtime is not None:
         ovmf_vars_runtime = _copy_ovmf_vars(ovmf_vars_source, ovmf_vars_runtime)
 
@@ -588,21 +601,30 @@ def run(
             graphics_width=config.graphics_width,
             graphics_height=config.graphics_height,
             qmp_socket=qmp_socket,
-            extra_args=_initrd_args_with_path(config.extra_args, qemu_initrd),
+            diagnostic_log_path=diagnostic_log_path,
+            extra_args=_initrd_args_with_path(config.extra_args, qemu_initrd) + (("-S",) if pinning else ()),
         )
         if qemu_executable is not None:
             command = (str(qemu_executable), *command[1:])
+
+        # Start each run with an empty diagnostic sink, even if launch fails.
+        try:
+            diagnostic_log_path.write_bytes(b"")
+        except OSError as error:
+            raise RunnerError(f"could not prepare kernel log {diagnostic_log_path}: {error}") from error
 
         if input_path is None:
             return run_process(
                 command=command,
                 workdir=workdir,
                 log_path=log_path,
+                diagnostic_log_path=diagnostic_log_path,
                 limits=config.limits,
                 interaction=config.interaction,
                 console_stream=console_stream,
                 pass_fds=tuple(opened_fds),
                 qmp_socket=qmp_socket,
+                qmp_vcpu_host_cpus=pinning,
                 screenshot=screenshot,
                 qmp_input_events=config.qmp.input_events,
                 qmp_input_after_marker=config.qmp.input_after_marker,
@@ -617,12 +639,14 @@ def run(
                 command=command,
                 workdir=workdir,
                 log_path=log_path,
+                diagnostic_log_path=diagnostic_log_path,
                 limits=config.limits,
                 interaction=config.interaction,
                 input_stream=input_stream,
                 console_stream=console_stream,
                 pass_fds=tuple(opened_fds),
                 qmp_socket=qmp_socket,
+                qmp_vcpu_host_cpus=pinning,
                 screenshot=screenshot,
                 qmp_input_events=config.qmp.input_events,
                 qmp_input_after_marker=config.qmp.input_after_marker,

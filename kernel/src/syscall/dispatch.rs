@@ -71,6 +71,15 @@ fn sys_ni_syscall() -> AxResult<isize> {
     Err(AxError::Unsupported)
 }
 
+/// Linux 7.2 additions absent from the syscalls crate's enum.
+/// Keep their unsupported policy explicit until semantic handlers exist.
+pub(super) fn dispatch_new_syscall(number: usize) -> Option<AxResult<isize>> {
+    match number {
+        470 | 471 => Some(sys_ni_syscall()),
+        _ => None,
+    }
+}
+
 pub(super) fn dispatch_syscall(
     sysno: Sysno,
     uctx: &mut UserContext,
@@ -1896,6 +1905,14 @@ mod tests {
     use core::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn linux_72_additions_are_explicitly_unsupported() {
+        assert_eq!(dispatch_new_syscall(470), Some(Err(AxError::Unsupported)));
+        assert_eq!(dispatch_new_syscall(471), Some(Err(AxError::Unsupported)));
+        assert_eq!(dispatch_new_syscall(469), None);
+        assert_eq!(dispatch_new_syscall(472), None);
+    }
 
     #[test]
     fn legacy_epoll_create_requires_a_positive_size() {

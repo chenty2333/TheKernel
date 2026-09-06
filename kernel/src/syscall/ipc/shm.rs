@@ -9,7 +9,7 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axhal::paging::{MappingFlags, PageSize};
 #[cfg(any(not(test), target_os = "none"))]
-use axsync::Mutex;
+pub(super) use axsync::Mutex;
 use axtask::current;
 use hashbrown::HashMap;
 use linux_raw_sys::{
@@ -18,7 +18,7 @@ use linux_raw_sys::{
 };
 use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 #[cfg(all(test, not(target_os = "none")))]
-use spin::Mutex;
+pub(super) use spin::Mutex;
 use thekernel_linux_process_adapter::Pid;
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
@@ -3370,7 +3370,7 @@ mod tests {
             .get_mut(&PARENT_PID)
             .unwrap()
             .entries
-            .get_mut(&ATTACH_ADDR)
+            .get_mut(&admission.record.id)
             .unwrap()
             .publication = Arc::new(ShmForkPublication::new(false));
 

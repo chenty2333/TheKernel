@@ -213,6 +213,9 @@ static int read_proc_text(const char *path, char *buffer, size_t capacity) {
         if (errno == ENOENT || errno == ENOTDIR) {
             return 0;
         }
+        int saved_errno = errno;
+        fprintf(stderr, "proc-text path=%s stage=open errno=%d\n", path, saved_errno);
+        errno = saved_errno;
         return -1;
     }
     size_t length = 0;
@@ -231,6 +234,8 @@ static int read_proc_text(const char *path, char *buffer, size_t capacity) {
                 continue;
             }
             int saved_errno = errno;
+            fprintf(stderr, "proc-text path=%s stage=read errno=%d\n", path,
+                    saved_errno);
             close(fd);
             errno = saved_errno;
             return -1;
@@ -238,6 +243,9 @@ static int read_proc_text(const char *path, char *buffer, size_t capacity) {
         length += (size_t)count;
     }
     if (close(fd) != 0) {
+        int saved_errno = errno;
+        fprintf(stderr, "proc-text path=%s stage=close errno=%d\n", path, saved_errno);
+        errno = saved_errno;
         return -1;
     }
     buffer[length] = '\0';

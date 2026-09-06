@@ -37,7 +37,7 @@ RUN sed -i \
       zlib1g-dev \
  && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /tmp/qemu
+WORKDIR /home/qemu-build
 
 RUN aria2c --allow-overwrite=true --auto-file-renaming=false --continue=true \
       --console-log-level=warn --download-result=hide --max-connection-per-server=8 \
@@ -53,9 +53,9 @@ RUN aria2c --allow-overwrite=true --auto-file-renaming=false --continue=true \
       --disable-bsd-user \
       --disable-linux-user \
       --disable-werror \
- && make -j"$(nproc)" \
+ && make -j2 \
  && make install \
- && rm -rf /tmp/qemu
+ && rm -rf /home/qemu-build
 
 FROM ${DEBIAN_IMAGE}
 
@@ -81,6 +81,7 @@ RUN sed -i \
       ca-certificates \
       clang \
       cmake \
+      cpio \
       curl \
       dosfstools \
       e2fsprogs \
@@ -105,6 +106,7 @@ RUN sed -i \
       make \
       ovmf \
       parted \
+      patch \
       pkg-config \
       python3 \
       python3-venv \

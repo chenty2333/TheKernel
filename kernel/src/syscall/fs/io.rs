@@ -565,13 +565,14 @@ fn io_uring_stream_write_with_context(
             if let Some((segments, offset, fixed_len, ..)) = fixed_segments {
                 let mut source =
                     PinnedPhysicalReader::from_validated_range(segments, offset, fixed_len);
-                write_file_like_with_status(file_handle, status, &mut source, security, false)
+                write_file_like_with_status(file_handle, status, &mut source, security, context.fanotify_actor(), false)
             } else {
                 write_file_like_with_status(
                     file_handle,
                     status,
                     &mut VmBytes::new(capability.clone(), buf, len),
                     security,
+                    context.fanotify_actor(),
                     false,
                 )
             }
@@ -972,11 +973,16 @@ fn read_file_like_with_status_and_nonblocking(
     }
 }
 
+fn socket_write_sender(security: &VfsSecurityContext, actor: FanotifyEventActor) -> axnet::options::SocketCredentials {
+    crate::file::automatic_unix_credentials(security.actor(), actor.process_id())
+}
+
 fn write_file_like_with_status(
     file_like: &FileHandle<dyn FileLike>,
     status: OfdIoStatus,
     src: &mut IoSrc,
     security: &VfsSecurityContext,
+    actor: FanotifyEventActor,
     suppress_sigpipe: bool,
 ) -> AxResult<usize> {
     admit_rwf_nowait_file_like(file_like, status, true)?;
@@ -996,7 +1002,7 @@ fn write_file_like_with_status(
         )
     } else if let Some(socket) = file_like.downcast_ref::<Socket>() {
         let result =
-            socket.write_with_nonblocking(src, status.nonblocking() || status.rwf_nowait());
+            socket.write_with_sender(src, status.nonblocking() || status.rwf_nowait(), socket_write_sender(security, actor));
         if result == Err(AxError::BrokenPipe) && !suppress_sigpipe {
             crate::file::pipe::raise_sigpipe_for_current();
         }
@@ -1111,6 +1117,12 @@ fn regular_ext4_physical_worker_plan(
     offset: u64,
     fixed_segments: Option<IoUringFixedSegments<'_>>,
 ) -> bool {
+    // The physical effect preparation may wait for writeback/cache owners.
+    // RWF_NOWAIT must stay on the try-only pinned-buffer path; O_NONBLOCK
+    // alone does not impose this regular-file operation-local constraint.
+    if status.rwf_nowait() {
+        return false;
+    }
     let Some((segments, offset_in_segments, fixed_len, disjoint, provenance)) = fixed_segments
     else {
         return false;
@@ -2183,6 +2195,7 @@ pub fn sys_write(
 ) -> AxResult<isize> {
     debug!("sys_write <= fd: {fd}, buf: {buf:p}, len: {len}");
     let security = current_vfs_security();
+    let actor = FanotifyEventActor::current();
     let f = get_file_like(fd)?;
     let status = f.io_status_snapshot();
     let socket = PinnedSocketDescription::from_file_handle(&f, status)?;
@@ -2257,6 +2270,7 @@ pub fn sys_write(
                     status,
                     &mut VmBytes::new(capability.clone(), buf, len),
                     &security,
+                    actor,
                     false,
                 )
                 .map(|written| (written, status))
@@ -2281,6 +2295,7 @@ pub fn sys_writev(
 ) -> AxResult<isize> {
     debug!("sys_writev <= fd: {fd}, iovcnt: {iovcnt}");
     let security = current_vfs_security();
+    let actor = FanotifyEventActor::current();
     let iov = IoVectorBuf::new(capability.clone(), iov, iovcnt)?;
     let len = iov.len();
     let imported_iov_count = iov.iovcnt();
@@ -2348,7 +2363,7 @@ pub fn sys_writev(
                 Ok(written)
             } else {
                 let (written, status) = f.with_write_credentials_for_status(status, || {
-                    write_file_like_with_status(&f, status, &mut iov.into_io(), &security, false)
+                    write_file_like_with_status(&f, status, &mut iov.into_io(), &security, actor, false)
                         .map(|written| (written, status))
                 })?;
                 if written > 0 {
@@ -2369,13 +2384,15 @@ pub fn sys_writev(
 
 pub fn sys_readahead(fd: c_int, offset: __kernel_off_t, count: usize) -> AxResult<isize> {
     debug!("sys_readahead <= fd: {fd}, offset: {offset}, count: {count}");
-    if offset < 0 {
-        return Err(AxError::InvalidInput);
-    }
-
     let file_like = get_file_like(fd)?;
+    let access = file_like.status_flags() & linux_raw_sys::general::O_ACCMODE;
+    if file_like.is_path_only()
+        || (access != linux_raw_sys::general::O_RDONLY && access != linux_raw_sys::general::O_RDWR)
+    {
+        return Err(AxError::BadFileDescriptor);
+    }
     if file_like.downcast_ref::<PidFd>().is_some() {
-        return Ok(0);
+        return Err(AxError::InvalidInput);
     }
     match FileLikeKind::from_file_like(file_like.as_ref()) {
         FileLikeKind::Regular => {
@@ -2383,11 +2400,15 @@ pub fn sys_readahead(fd: c_int, offset: __kernel_off_t, count: usize) -> AxResul
                 .downcast_ref::<File>()
                 .ok_or(AxError::InvalidInput)?;
             file.inner().access(FileFlags::READ)?;
+            if offset < 0 {
+                return Err(AxError::InvalidInput);
+            }
             Ok(0)
         }
-        FileLikeKind::Fifo => Err(AxError::from(LinuxError::ESPIPE)),
-        FileLikeKind::Socket => Err(AxError::InvalidInput),
-        FileLikeKind::Directory | FileLikeKind::Other => Err(AxError::InvalidInput),
+        FileLikeKind::Fifo
+        | FileLikeKind::Socket
+        | FileLikeKind::Directory
+        | FileLikeKind::Other => Err(AxError::InvalidInput),
     }
 }
 
@@ -3029,6 +3050,7 @@ fn do_pwritev(
         return Err(AxError::InvalidInput);
     }
     let security = current_vfs_security();
+    let actor = FanotifyEventActor::current();
 
     // Linux reserves offset -1 in pwritev2 for the ordinary writev cursor
     // path.  Do this before requiring a positioned regular-file adapter so
@@ -3059,6 +3081,7 @@ fn do_pwritev(
                             status,
                             &mut io.into_io(),
                             &security,
+                            actor,
                             flags & RWF_NOSIGNAL != 0,
                         )
                     })
@@ -4254,11 +4277,32 @@ pub(crate) fn fallocate_file_like(
     if offset < 0 || len <= 0 {
         return Err(AxError::InvalidInput);
     }
+    let operation = mode & !FALLOC_FL_KEEP_SIZE;
+    let valid_mode = match operation {
+        0 | FALLOC_FL_UNSHARE_RANGE | FALLOC_FL_ZERO_RANGE => true,
+        FALLOC_FL_PUNCH_HOLE => mode & FALLOC_FL_KEEP_SIZE != 0,
+        FALLOC_FL_COLLAPSE_RANGE | FALLOC_FL_INSERT_RANGE => mode & FALLOC_FL_KEEP_SIZE == 0,
+        _ => false,
+    };
+    if !valid_mode {
+        return Err(AxError::OperationNotSupported);
+    }
+    let access = file_like.status_flags() & linux_raw_sys::general::O_ACCMODE;
+    if file_like.is_path_only() || access == linux_raw_sys::general::O_RDONLY {
+        return Err(AxError::BadFileDescriptor);
+    }
     match FileLikeKind::from_file_like(file_like.as_ref()) {
         FileLikeKind::Regular => {}
         FileLikeKind::Directory => return Err(AxError::IsADirectory),
-        FileLikeKind::Fifo | FileLikeKind::Socket | FileLikeKind::Other => {
-            return Err(AxError::InvalidInput);
+        FileLikeKind::Fifo => return Err(AxError::from(LinuxError::ESPIPE)),
+        FileLikeKind::Other
+            if file_like.stat()?.mode & linux_raw_sys::general::S_IFMT
+                == linux_raw_sys::general::S_IFBLK =>
+        {
+            return Err(AxError::OperationNotSupported);
+        }
+        FileLikeKind::Socket | FileLikeKind::Other => {
+            return Err(AxError::from(LinuxError::ENODEV));
         }
     }
 
@@ -4882,11 +4926,20 @@ fn pread64_file_with_context(
     // nonblocking readiness path before any regular-file fast path can enter
     // a blocking cache or backend operation.
     if status.rwf_nowait() {
-        let mut dst = VmBytesMut::new(capability.clone(), buf, len);
-        let read = if let Some(operation) = cancellation {
-            f.read_at_with_status_cancellable(status, &mut dst, offset, operation)?
+        let read_into = |dst: &mut IoDst| {
+            if let Some(operation) = cancellation {
+                f.read_at_with_status_cancellable(status, dst, offset, operation)
+            } else {
+                f.read_at_with_status(status, dst, offset)
+            }
+        };
+        let read = if let Some((segments, offset_in_segments, fixed_len, ..)) = fixed_segments {
+            let mut dst =
+                PinnedPhysicalWriter::from_validated_range(segments, offset_in_segments, fixed_len);
+            read_into(&mut dst)?
         } else {
-            f.read_at_with_status(status, &mut dst, offset)?
+            let mut dst = VmBytesMut::new(capability.clone(), buf, len);
+            read_into(&mut dst)?
         };
         if read > 0 {
             notify_read_file_with_actor(f.as_ref(), context.fanotify_actor());
@@ -5467,6 +5520,7 @@ pub fn sys_pwritev2(
 
 enum SendFile {
     Direct {
+        actor: FanotifyEventActor,
         file: FileHandle<dyn FileLike>,
         status: OfdIoStatus,
         nonblocking: bool,
@@ -5936,6 +5990,7 @@ impl SendFile {
     ) -> AxResult<usize> {
         match self {
             SendFile::Direct {
+                actor,
                 file,
                 status,
                 nonblocking,
@@ -5953,7 +6008,7 @@ impl SendFile {
                     } else if let Some(pipe) = file.downcast_ref::<NamedPipe>() {
                         pipe.write_with_nonblocking(&mut buf, nonblocking, false)
                     } else if let Some(socket) = file.downcast_ref::<Socket>() {
-                        socket.write_with_nonblocking(&mut buf, nonblocking)
+                        socket.write_with_sender(&mut buf, nonblocking, socket_write_sender(security, *actor))
                     } else if let Some(regular) = file.downcast_ref::<File>() {
                         let ofd_key = file.open_file_description_key();
                         let memfd_mutation = memfd_mutation.as_ref().ok_or(AxError::BadState)?;
@@ -5989,7 +6044,7 @@ impl SendFile {
                                 regular.inner().write_at(&data[..allowed], off)
                             })
                     } else {
-                        write_file_like_with_status(file, *status, &mut buf, security, false)
+                        write_file_like_with_status(file, *status, &mut buf, security, *actor, false)
                     }
                 })
             }
@@ -6819,6 +6874,7 @@ pub fn sys_sendfile(
         len
     );
     let security = current_vfs_security();
+    let actor = FanotifyEventActor::current();
 
     // Linux copies an explicit offset before fd admission and keeps one local
     // value for the complete operation. Concurrent userspace stores cannot
@@ -6858,6 +6914,7 @@ pub fn sys_sendfile(
                 }
             } else {
                 SendFile::Direct {
+                    actor,
                     status: src_status,
                     file: src_file.clone().into_file_like(),
                     nonblocking: src_status.nonblocking(),
@@ -6867,6 +6924,7 @@ pub fn sys_sendfile(
             };
 
             let mut destination = SendFile::Direct {
+                actor,
                 file: dst.clone(),
                 status,
                 nonblocking: status.nonblocking(),
@@ -6921,6 +6979,7 @@ pub fn sys_copy_file_range(
         _flags
     );
     let security = current_vfs_security();
+    let actor = FanotifyEventActor::current();
 
     // Pin both numeric descriptors before touching user offsets. Full
     // mode/type/O_APPEND admission follows offset copy, matching Linux while
@@ -7073,6 +7132,7 @@ pub fn sys_copy_file_range(
         }
     } else {
         SendFile::Direct {
+            actor,
             file: src_file.clone().into_file_like(),
             status: src_status,
             nonblocking: src_status.nonblocking(),
@@ -7092,6 +7152,7 @@ pub fn sys_copy_file_range(
         }
     } else {
         SendFile::Direct {
+            actor,
             file: dst_file.clone().into_file_like(),
             status: dst_status,
             nonblocking: dst_status.nonblocking(),
@@ -7160,6 +7221,7 @@ pub fn sys_splice(
         _flags
     );
     let security = current_vfs_security();
+    let actor = FanotifyEventActor::current();
 
     if len == 0 {
         return Ok(0);
@@ -7276,6 +7338,7 @@ pub fn sys_splice(
             return Err(AxError::InvalidInput);
         }
         SendFile::Direct {
+            actor,
             status: src_status,
             file: src_handle,
             nonblocking: source_nonblocking,
@@ -7299,6 +7362,7 @@ pub fn sys_splice(
         }
     } else {
         SendFile::Direct {
+            actor,
             file: dst_handle.clone(),
             status: dst_status,
             nonblocking: destination_nonblocking,
@@ -7837,6 +7901,10 @@ mod tests {
     }
 
     impl FileNodeOps for IoContractNode {
+        fn supports_nowait_read(&self) -> bool {
+            true
+        }
+
         fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
             Ok(0)
         }
@@ -7862,7 +7930,7 @@ mod tests {
             Ok(())
         }
 
-        fn set_symlink(&self, _target: &FsPath) -> VfsResult<()> {
+        fn set_symlink(&self, _target: &axfs_ng_vfs::FsPath) -> VfsResult<()> {
             Err(VfsError::InvalidInput)
         }
     }
@@ -8089,6 +8157,31 @@ mod tests {
         let positioned = open(NodeFlags::NON_CACHEABLE | NodeFlags::POSITIONED_APPEND);
         assert!(!write_uses_inode_append(positioned.inner(), append));
         assert!(write_uses_current_position(positioned.inner(), append));
+    }
+
+    #[test]
+    fn io_uring_nowait_direct_read_requires_residency_before_copy() {
+        let fs = IoContractFs::new(NodeFlags::NON_CACHEABLE, 4096);
+        let mut options = OpenOptions::new();
+        options.read(true).direct(true);
+        let file = File::new(
+            options
+                .open_loc(fs.location())
+                .unwrap()
+                .into_file()
+                .unwrap(),
+        );
+        let status = OfdIoStatus::new(0).with_rwf_nowait(true);
+        let mut bytes = [0xa5; 512];
+        let mut destination = bytes.as_mut_slice();
+        // The provider advertises NOWAIT, but has no resident direct range.
+        // This is EAGAIN before its read_at (which would report EOF), not a
+        // queued effect or a successful zero-length read.
+        assert_eq!(
+            file.read_at_with_status(status, &mut destination, 0),
+            Err(AxError::WouldBlock)
+        );
+        assert_eq!(bytes, [0xa5; 512]);
     }
 
     #[test]

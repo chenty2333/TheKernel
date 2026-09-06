@@ -32,6 +32,7 @@ use crate::{
 pub(crate) const SCHED_SWITCH_TRACEPOINT_ID: u64 = 1;
 pub(crate) const RAW_SYSCALLS_ENTER_TRACEPOINT_ID: u64 = 2;
 pub(crate) const RAW_SYSCALLS_EXIT_TRACEPOINT_ID: u64 = 3;
+pub(crate) const SCHED_WAKEUP_TRACEPOINT_ID: u64 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TracepointInfo {
@@ -43,7 +44,22 @@ pub(crate) struct TracepointInfo {
     pub(crate) raw_arg_count: u8,
 }
 
-const TRACEPOINTS: [TracepointInfo; 3] = [
+const TRACEPOINTS: [TracepointInfo; 4] = [
+    TracepointInfo {
+        id: SCHED_WAKEUP_TRACEPOINT_ID,
+        system: "sched",
+        name: "sched_wakeup",
+        format: "name: sched_wakeup\nID: 4\nformat:\n\tfield:unsigned short \
+                 common_type;\toffset:0;\tsize:2;\tsigned:0;\n\tfield:unsigned char \
+                 common_flags;\toffset:2;\tsize:1;\tsigned:0;\n\tfield:unsigned char \
+                 common_preempt_count;\toffset:3;\tsize:1;\tsigned:0;\n\tfield:int \
+                 common_pid;\toffset:4;\tsize:4;\tsigned:1;\n\tfield:char \
+                 comm[16];\toffset:8;\tsize:16;\tsigned:1;\n\tfield:pid_t \
+                 pid;\toffset:24;\tsize:4;\tsigned:1;\n\tfield:int \
+                 prio;\toffset:28;\tsize:4;\tsigned:1;\n\tfield:int \
+                 target_cpu;\toffset:32;\tsize:4;\tsigned:1;\n",
+        raw_arg_count: 1,
+    },
     TracepointInfo {
         id: SCHED_SWITCH_TRACEPOINT_ID,
         system: "sched",
@@ -94,7 +110,7 @@ const DYNAMIC_TRACEPOINT_SLOTS: usize = 32;
 // Trace entry `common_type` is a u16. Keep dynamically allocated IDs in the
 // ordinary tracefs range rather than inventing an ID which cannot be encoded
 // in the RAW record advertised by its `format` file.
-const DYNAMIC_TRACEPOINT_BASE: u64 = 4;
+const DYNAMIC_TRACEPOINT_BASE: u64 = 5;
 static DYNAMIC_TRACEPOINTS: [AtomicU64; DYNAMIC_TRACEPOINT_SLOTS] =
     [const { AtomicU64::new(0) }; DYNAMIC_TRACEPOINT_SLOTS];
 /// Several `group/event` names may describe the same source. Keep that
@@ -873,12 +889,13 @@ fn emit_dynamic_tracepoints(thread: Option<&crate::task::Thread>, event: PerfEve
         entry[..copied].copy_from_slice(&raw[..copied]);
         trace_common(&mut entry[..8], id as u16);
         if let Some(thread) = thread {
-            thread.perf_emit_tracepoint_raw(id, &entry[..copied.max(8)]);
+            thread.perf_emit_tracepoint_raw(id, &entry[..copied.max(8)], axhal::time::monotonic_time_nanos());
         } else {
             crate::file::PerfGroup::cpu_context_tracepoint(
                 axhal::percpu::this_cpu_id(),
                 id,
                 &entry[..copied.max(8)],
+                axhal::time::monotonic_time_nanos(),
             );
         }
     }
@@ -960,9 +977,9 @@ pub(crate) fn emit_raw_syscall_enter(
             Some(&regs_bytes),
         );
     }
-    axtask::current()
-        .as_thread()
-        .perf_emit_tracepoint_raw(RAW_SYSCALLS_ENTER_TRACEPOINT_ID, &payload);
+    if let Some(thread) = axtask::current().try_as_thread() {
+        thread.perf_emit_tracepoint_raw(RAW_SYSCALLS_ENTER_TRACEPOINT_ID, &payload, axhal::time::monotonic_time_nanos());
+    }
 }
 
 pub(crate) fn emit_raw_syscall_exit(number: u64, result: i64, regs: &axcpu::uspace::LinuxPtRegs) {
@@ -986,9 +1003,9 @@ pub(crate) fn emit_raw_syscall_exit(number: u64, result: i64, regs: &axcpu::uspa
             Some(&regs_bytes),
         );
     }
-    axtask::current()
-        .as_thread()
-        .perf_emit_tracepoint_raw(RAW_SYSCALLS_EXIT_TRACEPOINT_ID, &payload);
+    if let Some(thread) = axtask::current().try_as_thread() {
+        thread.perf_emit_tracepoint_raw(RAW_SYSCALLS_EXIT_TRACEPOINT_ID, &payload, axhal::time::monotonic_time_nanos());
+    }
 }
 
 /// Emit one Linux-shaped `sched:sched_switch` entry at the exact scheduler
@@ -1001,6 +1018,9 @@ pub(crate) fn emit_sched_switch(
     next_tid: u32,
     next_name: &[u8],
     previous_state: u64,
+    timestamp: u64,
+    previous_priority: i32,
+    next_priority: i32,
 ) {
     let mut payload = [0u8; 64];
     payload[..2].copy_from_slice(&(SCHED_SWITCH_TRACEPOINT_ID as u16).to_ne_bytes());
@@ -1009,12 +1029,12 @@ pub(crate) fn emit_sched_switch(
     let previous_name_len = previous_name.len().min(16);
     payload[8..8 + previous_name_len].copy_from_slice(&previous_name[..previous_name_len]);
     payload[24..28].copy_from_slice(&(previous_tid as i32).to_ne_bytes());
-    payload[28..32].copy_from_slice(&120i32.to_ne_bytes());
+    payload[28..32].copy_from_slice(&previous_priority.to_ne_bytes());
     payload[32..40].copy_from_slice(&previous_state.to_ne_bytes());
     let next_name_len = next_name.len().min(16);
     payload[40..40 + next_name_len].copy_from_slice(&next_name[..next_name_len]);
     payload[56..60].copy_from_slice(&(next_tid as i32).to_ne_bytes());
-    payload[60..64].copy_from_slice(&120i32.to_ne_bytes());
+    payload[60..64].copy_from_slice(&next_priority.to_ne_bytes());
     #[cfg(feature = "bpf")]
     {
         // Prototype slots are `(preempt, prev, next, prev_state)`.  Task
@@ -1025,12 +1045,42 @@ pub(crate) fn emit_sched_switch(
         crate::bpf::run_raw_tracepoint_links(SCHED_SWITCH_TRACEPOINT_ID, &mut raw_args);
     }
     if let Some(publisher) = publisher {
-        publisher.perf_emit_tracepoint_raw(SCHED_SWITCH_TRACEPOINT_ID, &payload);
+        publisher.perf_emit_tracepoint_raw(SCHED_SWITCH_TRACEPOINT_ID, &payload, timestamp);
     } else {
         crate::file::PerfGroup::cpu_context_tracepoint(
             axhal::percpu::this_cpu_id(),
             SCHED_SWITCH_TRACEPOINT_ID,
             &payload,
+            timestamp,
+        );
+    }
+}
+
+pub(crate) fn emit_sched_wakeup(
+    publisher: Option<&crate::task::Thread>,
+    waker_tid: u32,
+    target_tid: u32,
+    name: &[u8],
+    target_cpu: usize,
+    timestamp: u64,
+    priority: i32,
+) {
+    let mut payload = [0u8; 36];
+    payload[..2].copy_from_slice(&(SCHED_WAKEUP_TRACEPOINT_ID as u16).to_ne_bytes());
+    payload[4..8].copy_from_slice(&(waker_tid as i32).to_ne_bytes());
+    let name_len = name.len().min(16);
+    payload[8..8 + name_len].copy_from_slice(&name[..name_len]);
+    payload[24..28].copy_from_slice(&(target_tid as i32).to_ne_bytes());
+    payload[28..32].copy_from_slice(&priority.to_ne_bytes());
+    payload[32..36].copy_from_slice(&(target_cpu as i32).to_ne_bytes());
+    if let Some(publisher) = publisher {
+        publisher.perf_emit_tracepoint_raw(SCHED_WAKEUP_TRACEPOINT_ID, &payload, timestamp);
+    } else {
+        crate::file::PerfGroup::cpu_context_tracepoint(
+            axhal::percpu::this_cpu_id(),
+            SCHED_WAKEUP_TRACEPOINT_ID,
+            &payload,
+            timestamp,
         );
     }
 }
@@ -1130,5 +1180,11 @@ mod tests {
                 .contains("ID: 1")
         );
         assert_eq!(tracepoint(99), Err(AxError::OperationNotSupported));
+        assert_eq!(tracefs_id("sched", "sched_wakeup"), Some(super::SCHED_WAKEUP_TRACEPOINT_ID));
+        let wake = tracefs_format("sched", "sched_wakeup").unwrap();
+        assert!(wake.contains("pid;\toffset:24;\tsize:4"));
+        assert!(wake.contains("target_cpu;\toffset:32;\tsize:4"));
+        assert!(super::raw_tracepoint(b"sched_wakeup").is_none());
+        assert!(super::DYNAMIC_TRACEPOINT_BASE > super::SCHED_WAKEUP_TRACEPOINT_ID);
     }
 }

@@ -142,7 +142,21 @@ impl Pollable for Signalfd {
         events: IoEvents,
     ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
         if events.contains(IoEvents::READABLE) {
-            axpoll::PollRegistration::single(&self.poll_rx, context.waker())
+            // The OFD may be shared across fork, but queues belong to the
+            // task performing this registration/read, not the fd creator.
+            // Own the sources so persistent epoll interests do not retain a
+            // Thread or ProcessData and cannot outlive a borrowed task guard.
+            // Sibling sends/mask changes notify this same process source even
+            // when another thread originally installed the epoll interest.
+            let curr = current();
+            let thread = curr.as_thread();
+            let mut registration = axpoll::PreparedPollRegistration::try_new(2)?;
+            registration.arm(&self.poll_rx, context.waker())?;
+            registration.arm_owned(
+                thread.proc_data.signal_pending_event.clone(),
+                context.waker(),
+            )?;
+            registration.commit()
         } else {
             axpoll::PollRegistration::empty()
         }

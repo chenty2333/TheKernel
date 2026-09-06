@@ -1,0 +1,22 @@
+# Selected Linux release facts plus a static dispatch routing inventory. A route only
+# proves that dispatch selects code; it is not semantic implementation evidence.
+schema = 3
+
+[linux]
+repository = "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
+tag = "v7.2.3"
+table = "arch/x86/entry/syscalls/syscall_64.tbl"
+
+[routing_inventory]
+ordinary_explicit = ["0-133", "135-155", "157-173", "175-176", "179", "186-204", "206-210", "213", "216-235", "237-336", "424-469"]
+explicit_enosys = [134, 156, 174, 177, 178, 180, 181, 182, 183, 184, 185, 205, 211, 212, 214, 215, 236, 470, 471]
+native_fallback = []
+
+[routing_witness]
+# Build-routing witness only: fast's host check enables this exact feature.
+bpf = "cfg(feature = \"bpf\")"
+
+[terminal]
+ordinary_explicit = 366
+explicit_enosys = 19
+native_fallback = 0

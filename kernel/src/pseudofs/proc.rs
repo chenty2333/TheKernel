@@ -13,7 +13,7 @@ use axfs::render_io_stats_counters;
 use axfs_ng_vfs::{
     DeviceId, DirEntry, FileNode, FileNodeOps, Filesystem, FilesystemOps, FsName, FsNameBuf,
     FsPath, FsPathBuf, Location, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission,
-    NodeType, Reference, VfsError, VfsResult,
+    NodeType, NodeUserData, Reference, VfsError, VfsResult,
 };
 use axhal::paging::MappingFlags;
 use axpoll::{IoEvents, Pollable};
@@ -904,6 +904,10 @@ impl ProcBpfStatsFile {
 impl NodeOps for ProcBpfStatsFile {
     fn inode(&self) -> u64;
 
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        Some(&self.node.user_data)
+    }
+
     fn metadata(&self) -> VfsResult<Metadata> {
         let mut metadata = self.node.metadata()?;
         metadata.size = self.snapshot_len();
@@ -1586,6 +1590,10 @@ impl ProcUserNamespaceFile {
 
 #[inherit_methods(from = "self.node")]
 impl NodeOps for ProcUserNamespaceFile {
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        Some(&self.node.user_data)
+    }
+
     fn inode(&self) -> u64;
 
     fn metadata(&self) -> VfsResult<Metadata>;
@@ -1836,12 +1844,14 @@ fn is_shared_user_mapping(backend: &Backend) -> bool {
     )
 }
 
-pub fn new_procfs() -> Filesystem {
-    SimpleFs::new_with("proc".into(), 0x9fa0, builder)
+/// The mount retains its PID namespace even when accessed from another namespace.
+pub fn new_procfs(pid_ns: Arc<PidNamespace>) -> Filesystem {
+    SimpleFs::new_with("proc".into(), 0x9fa0, move |fs| builder(fs, pid_ns))
 }
 
 struct ProcessTaskDir {
     fs: Arc<SimpleFs>,
+    pid_ns: Arc<PidNamespace>,
     process: Weak<Process>,
 }
 
@@ -1861,8 +1871,11 @@ impl SimpleDirOps for ProcessTaskDir {
             if task.as_thread().pending_exit() {
                 continue;
             }
+            let Some(tid) = self.pid_ns.visible_pid_checked(task.as_thread().tid()) else {
+                continue;
+            };
             names.push(Cow::Owned(FsNameBuf::from_vec(
-                try_pid_name(task.as_thread().tid())?.into_bytes(),
+                try_pid_name(tid)?.into_bytes(),
             )?));
         }
         try_boxed_names(names.into_iter())
@@ -1874,6 +1887,10 @@ impl SimpleDirOps for ProcessTaskDir {
             .map_err(|_| VfsError::NotFound)?
             .parse::<u32>()
             .map_err(|_| VfsError::NotFound)?;
+        let tid = self
+            .pid_ns
+            .resolve_visible_pid(tid)
+            .ok_or(VfsError::NotFound)?;
         let task = get_visible_task(tid).map_err(|_| VfsError::NotFound)?;
         if task.as_thread().proc_data.proc.pid() != process.pid() {
             return Err(VfsError::NotFound);
@@ -1883,6 +1900,7 @@ impl SimpleDirOps for ProcessTaskDir {
             self.fs.clone(),
             Arc::new(ThreadDir {
                 fs: self.fs.clone(),
+                pid_ns: self.pid_ns.clone(),
                 task: Arc::downgrade(&task),
                 show_task_dir: false,
             }),
@@ -1942,6 +1960,7 @@ fn task_status(
     task: &AxTaskRef,
     process_view: bool,
     viewer_user_ns: &UserNamespace,
+    pid_ns: &PidNamespace,
 ) -> VfsResult<String> {
     let thread = task.as_thread();
     let proc_data = &thread.proc_data;
@@ -1968,7 +1987,7 @@ fn task_status(
         'Z' => "zombie",
         _ => "unknown",
     };
-    let ppid = proc_data.proc.parent().map_or(0, |parent| parent.pid());
+    let ppid = proc_data.proc.parent().and_then(|parent| pid_ns.visible_pid_checked(parent.pid())).unwrap_or(0);
     let threads = proc_data.proc.thread_count();
     let cred = proc_subject_cred(task, process_view);
     let ids = cred.ids();
@@ -2036,8 +2055,8 @@ fn task_status(
         task_name,
         state,
         state_name,
-        proc_data.proc.pid(),
-        if process_view { proc_data.proc.pid() } else { thread.tid() },
+        pid_ns.visible_pid_checked(proc_data.proc.pid()).unwrap_or(0),
+        pid_ns.visible_pid_checked(if process_view { proc_data.proc.pid() } else { thread.tid() }).unwrap_or(0),
         ppid,
         viewer_user_ns.from_kuid_munged(ids.ruid),
         viewer_user_ns.from_kuid_munged(ids.euid),
@@ -2143,7 +2162,7 @@ fn render_task_maps(aspace_handle: &Arc<Mutex<AddrSpace>>, include_smaps: bool) 
             let mut cursor = area.start();
             while cursor < area.end() {
                 let step = page_size.min(area.end().sub_addr(cursor));
-                if aspace.page_table().query(cursor).is_ok() {
+                if aspace.page_table().query_mapped(cursor).is_ok() {
                     resident_bytes += step;
                 }
                 cursor += page_size;
@@ -2239,7 +2258,7 @@ fn render_task_numa_maps(
         let mut cursor = area.start();
         while cursor < area.end() {
             let step = page_size.min(area.end().sub_addr(cursor));
-            if aspace.page_table().query(cursor).is_ok() {
+            if aspace.page_table().query_mapped(cursor).is_ok() {
                 resident_pages += step.div_ceil(PAGE_SIZE_4K);
             }
             cursor += step;
@@ -2529,6 +2548,10 @@ impl ProcNamespaceFile {
 
 #[inherit_methods(from = "self.node")]
 impl NodeOps for ProcNamespaceFile {
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        Some(&self.node.user_data)
+    }
+
     fn inode(&self) -> u64 {
         self.namespace_inode().unwrap_or_else(|| self.node.inode())
     }
@@ -2653,12 +2676,14 @@ impl SimpleDirOps for ThreadNamespaceDir {
 /// The /proc/[pid] directory
 struct ThreadDir {
     fs: Arc<SimpleFs>,
+    pid_ns: Arc<PidNamespace>,
     task: WeakAxTaskRef,
     show_task_dir: bool,
 }
 
 struct ZombieProcessDir {
     fs: Arc<SimpleFs>,
+    pid_ns: Arc<PidNamespace>,
     process: Weak<Process>,
 }
 
@@ -2732,10 +2757,10 @@ pub(crate) fn check_proc_pid_dir_search(loc: &axfs_ng_vfs::Location) -> AxResult
 /// Reads zombie stat only while the canonical identity and payload remain
 /// current.  The second lookup closes the ordinary reap-before-return window;
 /// pointer equality keeps a recycled numeric PID from redirecting the handle.
-fn read_authoritative_zombie_stat(process: &Process) -> VfsResult<Vec<u8>> {
+fn read_authoritative_zombie_stat(process: &Process, pid_ns: &PidNamespace) -> VfsResult<Vec<u8>> {
     let current = authoritative_zombie(process).map_err(zombie_stat_lifecycle_error)?;
     let payload = current.zombie_payload().ok_or(VfsError::NoSuchProcess)?;
-    let stat = render_zombie_stat(&current)?.into_bytes();
+    let stat = render_zombie_stat(&current, pid_ns)?.into_bytes();
     let current_after = authoritative_zombie(process).map_err(zombie_stat_lifecycle_error)?;
     let payload_after = current_after
         .zombie_payload()
@@ -2926,7 +2951,7 @@ impl ProcPagemapFile {
             return 0;
         };
         let aspace = self.aspace.lock();
-        match aspace.page_table().query(vaddr) {
+        match aspace.page_table().query_mapped(vaddr) {
             Ok((paddr, ..)) => {
                 let pfn = if self.show_pfn {
                     paddr.as_usize() as u64 / PAGE_SIZE_4K as u64
@@ -2942,6 +2967,10 @@ impl ProcPagemapFile {
 
 #[inherit_methods(from = "self.node")]
 impl NodeOps for ProcPagemapFile {
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        Some(&self.node.user_data)
+    }
+
     fn inode(&self) -> u64;
 
     fn metadata(&self) -> VfsResult<Metadata>;
@@ -3037,7 +3066,11 @@ impl SimpleDirOps for ZombieProcessDir {
         let fs = self.fs.clone();
         let process = self.process.upgrade().ok_or(VfsError::NotFound)?;
         let _ = authoritative_zombie(&process)?;
-        Ok(SimpleFile::new_regular(fs, move || read_authoritative_zombie_stat(&process)).into())
+        let pid_ns = self.pid_ns.clone();
+        Ok(SimpleFile::new_regular(fs, move || {
+            read_authoritative_zombie_stat(&process, &pid_ns)
+        })
+        .into())
     }
 
     fn is_cacheable(&self) -> bool {
@@ -3090,14 +3123,15 @@ impl SimpleDirOps for ThreadDir {
         let fs = self.fs.clone();
         let task = self.task.upgrade().ok_or(VfsError::NotFound)?;
         let process_view = self.show_task_dir;
+        let pid_ns = self.pid_ns.clone();
         Ok(match name.as_bytes() {
-            b"stat" => {
-                SimpleFile::new_regular(fs, move || Ok(render_task_stat(&task)?.into_bytes()))
-                    .into()
-            }
+            b"stat" => SimpleFile::new_regular(fs, move || {
+                Ok(render_task_stat(&task, &pid_ns, process_view)?.into_bytes())
+            })
+            .into(),
             b"status" => SimpleFile::try_new_regular_with_open_credential(fs, move || {
                 let viewer = current_file_operation_security_credential().ok_or(VfsError::Io)?;
-                task_status(&task, process_view, viewer.user_ns())
+                task_status(&task, process_view, viewer.user_ns(), &pid_ns)
             })?
             .into(),
             b"uid_map" => {
@@ -3176,6 +3210,7 @@ impl SimpleDirOps for ThreadDir {
                 fs.clone(),
                 Arc::new(ProcessTaskDir {
                     fs,
+                    pid_ns,
                     process: Arc::downgrade(&task.as_thread().proc_data.proc),
                 }),
             )
@@ -3348,7 +3383,7 @@ impl SimpleDirOps for ThreadDir {
 }
 
 /// Handles /proc/[pid] & /proc/self
-struct ProcFsHandler(Arc<SimpleFs>);
+struct ProcFsHandler(Arc<SimpleFs>, Arc<PidNamespace>);
 
 impl SimpleDirOps for ProcFsHandler {
     fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
@@ -3365,8 +3400,11 @@ impl SimpleDirOps for ProcFsHandler {
             if process.is_zombie() && process.zombie_payload().is_none() {
                 continue;
             }
+            let Some(pid) = self.1.visible_pid_checked(process.pid()) else {
+                continue;
+            };
             names.push(Cow::Owned(FsNameBuf::from_vec(
-                try_pid_name(process.pid())?.into_bytes(),
+                try_pid_name(pid)?.into_bytes(),
             )?));
         }
         names.push(Cow::Borrowed(FsName::new(b"self")));
@@ -3379,8 +3417,12 @@ impl SimpleDirOps for ProcFsHandler {
             return ProcBpfStatsFile::try_new(self.0.clone()).map(Into::into);
         }
         if name.as_bytes() == b"self" {
-            return Ok(SimpleFile::new(self.0.clone(), NodeType::Symlink, || {
-                Ok(current().as_thread().proc_data.proc.pid().to_string())
+            let pid_ns = self.1.clone();
+            return Ok(SimpleFile::new(self.0.clone(), NodeType::Symlink, move || {
+                let pid = pid_ns
+                    .visible_pid_checked(current().as_thread().proc_data.proc.pid())
+                    .ok_or(VfsError::NotFound)?;
+                Ok(pid.to_string())
             })
             .into());
         }
@@ -3389,11 +3431,16 @@ impl SimpleDirOps for ProcFsHandler {
             .map_err(|_| VfsError::NotFound)?
             .parse::<u32>()
             .map_err(|_| VfsError::NotFound)?;
+        let pid = self
+            .1
+            .resolve_visible_pid(pid)
+            .ok_or(VfsError::NotFound)?;
         if let Ok(task) = proc_task_for_pid(pid) {
             return Ok(NodeOpsMux::Dir(SimpleDir::new_maker(
                 self.0.clone(),
                 Arc::new(ThreadDir {
                     fs: self.0.clone(),
+                    pid_ns: self.1.clone(),
                     task: Arc::downgrade(&task),
                     show_task_dir: true,
                 }),
@@ -3408,6 +3455,7 @@ impl SimpleDirOps for ProcFsHandler {
             self.0.clone(),
             Arc::new(ZombieProcessDir {
                 fs: self.0.clone(),
+                pid_ns: self.1.clone(),
                 process: Arc::downgrade(&process),
             }),
         )))
@@ -3418,7 +3466,7 @@ impl SimpleDirOps for ProcFsHandler {
     }
 }
 
-fn builder(fs: Arc<SimpleFs>) -> DirMaker {
+fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
     fn write_proc_u32(data: &[u8]) -> VfsResult<u32> {
         str::from_utf8(data)
             .ok()
@@ -3881,6 +3929,49 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         sys.add("kernel", {
             let mut kernel = DirMapping::new();
 
+            kernel.add(
+                "log_filter",
+                SimpleFile::new_regular_with_permission(
+                    fs.clone(),
+                    NodePermission::from_bits_truncate(0o644),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => {
+                            let mut out = String::new();
+                            out.try_reserve_exact(1200)
+                                .map_err(|_| VfsError::NoMemory)?;
+                            axruntime::klog::write_filter(&mut out).map_err(|_| VfsError::Io)?;
+                            Ok(Some(out.into_bytes()))
+                        }
+                        SimpleFileOperation::Write(data) => {
+                            // This is a global control, authorized by the live
+                            // caller on every write, including inherited fds.
+                            let actor = current().as_thread().current_cred();
+                            if !actor.has_effective_capability(linux_raw_sys::general::CAP_SYSLOG) {
+                                return Err(VfsError::PermissionDenied);
+                            }
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let text = str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
+                            axruntime::klog::set_filter(text).map_err(|_| VfsError::InvalidInput)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+            kernel.add(
+                "log_stats",
+                SimpleFile::new_regular_with_permission(
+                    fs.clone(),
+                    NodePermission::from_bits_truncate(0o444),
+                    || {
+                        let mut out = String::new();
+                        out.try_reserve_exact(320).map_err(|_| VfsError::NoMemory)?;
+                        axruntime::klog::write_stats(&mut out).map_err(|_| VfsError::Io)?;
+                        Ok(out.into_bytes())
+                    },
+                ),
+            );
             kernel.add(
                 "arch",
                 SimpleFile::new_regular_with_permission(
@@ -4411,7 +4502,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         SimpleDir::new_maker(fs.clone(), Arc::new(sys))
     });
 
-    let proc_dir = ProcFsHandler(fs.clone());
+    let proc_dir = ProcFsHandler(fs.clone(), pid_ns);
     SimpleDir::new_maker(fs, Arc::new(proc_dir.chain(root)))
 }
 
@@ -4630,6 +4721,10 @@ mod tests {
         }
 
         let file = new_file();
+        // OFD construction obtains the stable inode writeback-error cursor,
+        // even for this read-only snapshot file.
+        let errors = file.writeback_error_state().unwrap();
+        assert!(Arc::ptr_eq(&errors, &file.writeback_error_state().unwrap()));
         file.open(true, false).unwrap();
         let length = file.len().unwrap() as usize;
         let mut expected = vec![0; length];

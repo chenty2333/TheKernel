@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <time.h>
 
 #define PAGE_BYTES 4096U
 #define CACHE_PAGES 512U
@@ -19,6 +20,15 @@
 #define POLL_ATTEMPTS 80U
 #define PRESSURE_PATH "/proc/memory_pressure"
 #define CACHE_PATH "/var/tmp/thekernel-mm-pressure-cache"
+
+static struct timespec started;
+
+static uint64_t elapsed_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    int64_t nanos = (now.tv_sec - started.tv_sec) * INT64_C(1000000000) + now.tv_nsec - started.tv_nsec;
+    return (uint64_t)(nanos / 1000000);
+}
 
 struct pressure_snapshot {
     uint64_t total_pages;
@@ -142,6 +152,9 @@ static void release_allocations(void **allocations, size_t count) {
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    if (clock_gettime(CLOCK_MONOTONIC, &started) != 0) return fail("clock-start");
+    puts("THEKERNEL_MM_PRESSURE_BEGIN");
     struct pressure_snapshot worker_before;
     struct pressure_snapshot worker_after;
     if (read_pressure_snapshot(&worker_before) != 0) {
@@ -160,6 +173,7 @@ int main(void) {
         return fail("create-clean-cache");
     }
 
+    puts("THEKERNEL_MM_PRESSURE_CACHE_READY");
     struct pressure_snapshot before;
     if (read_pressure_snapshot(&before) != 0) {
         unlink(CACHE_PATH);
@@ -177,6 +191,10 @@ int main(void) {
     if (max_pages > before.total_pages) {
         max_pages = before.total_pages;
     }
+
+    printf("THEKERNEL_MM_PRESSURE_DRIVE total=%" PRIu64 " free=%" PRIu64
+           " low=%" PRIu64 " target=%" PRIu64 "\n",
+           before.total_pages, before.free_pages, before.low_watermark_pages, max_pages);
 
     void *allocations[MAX_ALLOCATION_CHUNKS] = {0};
     size_t allocation_count = 0;
@@ -197,6 +215,10 @@ int main(void) {
             bytes[page * PAGE_BYTES] = (unsigned char)page;
         }
         allocated_pages += ALLOCATION_CHUNK_PAGES;
+        if (allocation_count % 64 == 0) {
+            printf("THEKERNEL_MM_PRESSURE_PROGRESS allocated_pages=%" PRIu64
+                   " elapsed_ms=%" PRIu64 "\n", allocated_pages, elapsed_ms());
+        }
 
         if (read_pressure_snapshot(&observed) != 0) {
             release_allocations(allocations, allocation_count);
@@ -218,6 +240,8 @@ int main(void) {
         }
     }
 
+    printf("THEKERNEL_MM_PRESSURE_POLL allocated_pages=%" PRIu64
+           " reclaimed=%d elapsed_ms=%" PRIu64 "\n", allocated_pages, reclaimed, elapsed_ms());
     for (size_t attempt = 0; !reclaimed && attempt < POLL_ATTEMPTS; ++attempt) {
         if (usleep(100000) != 0 || read_pressure_snapshot(&observed) != 0) {
             release_allocations(allocations, allocation_count);
@@ -245,7 +269,10 @@ int main(void) {
                 before.reclaimed_pages, observed.reclaimed_pages);
         errno = ETIMEDOUT;
     }
+    printf("THEKERNEL_MM_PRESSURE_RELEASE chunks=%zu elapsed_ms=%" PRIu64 "\n",
+           allocation_count, elapsed_ms());
     release_allocations(allocations, allocation_count);
+    printf("THEKERNEL_MM_PRESSURE_RELEASED elapsed_ms=%" PRIu64 "\n", elapsed_ms());
     if (unlink(CACHE_PATH) != 0 && verify_result == 0) {
         verify_result = -1;
     }

@@ -473,6 +473,68 @@ static int test_exec_oldtid(const char *self)
     return wait_success(supervisor, "exec-oldtid-wait");
 }
 
+struct exited_leader_args {
+    int leader_tid;
+};
+
+static int exited_leader_thread(void *opaque)
+{
+    struct exited_leader_args *args = opaque;
+    const struct timespec timeout = { .tv_sec = 2 };
+    int tid;
+
+    if (setpriority(PRIO_PROCESS, 0, 19) != 0 ||
+        set_process("exited-leader-sibling-none", 0)) {
+        return 1;
+    }
+    while ((tid = __atomic_load_n(&args->leader_tid, __ATOMIC_ACQUIRE)) != 0) {
+        /* clear_child_tid is shared, so use FUTEX_WAIT (not PRIVATE). */
+        if (syscall(SYS_futex, &args->leader_tid, 0, tid, &timeout, NULL, 0) < 0 &&
+            errno != EAGAIN && errno != EINTR) {
+            return fail("exited-leader-wait");
+        }
+    }
+    /* The leader's old BE/0 context was released on exit. Its retained
+     * nice-0 default BE/4 still wins over the sibling's nice-19 BE/7. */
+    if (expect_get("exited-leader-group-default", IOPRIO_WHO_PGRP, 0,
+                   ioprio_value(IOPRIO_CLASS_BE, 4))) {
+        return 1;
+    }
+    return 0;
+}
+
+static int test_exited_leader_group(void)
+{
+    enum { STACK_SIZE = 1 << 20 };
+    pid_t child = fork();
+    if (child < 0) {
+        return fail("exited-leader-fork");
+    }
+    if (child == 0) {
+        struct exited_leader_args args = { .leader_tid = (int)syscall(SYS_gettid) };
+        void *stack = mmap(NULL, STACK_SIZE, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        uintptr_t *thread_stack;
+        if (stack == MAP_FAILED || setpgid(0, 0) != 0 ||
+            setpriority(PRIO_PROCESS, 0, 0) != 0 ||
+            set_process("exited-leader-before-exit", ioprio_value(IOPRIO_CLASS_BE, 0))) {
+            _exit(1);
+        }
+        syscall(SYS_set_tid_address, &args.leader_tid);
+        thread_stack = (uintptr_t *)((uintptr_t)stack + STACK_SIZE);
+        thread_stack = (uintptr_t *)((uintptr_t)thread_stack & ~(uintptr_t)0xf);
+        *--thread_stack = (uintptr_t)&args;
+        *--thread_stack = (uintptr_t)exited_leader_thread;
+        if (raw_clone_thread(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+                             CLONE_THREAD | CLONE_SYSVSEM, thread_stack) < 0) {
+            _exit(fail("exited-leader-clone"));
+        }
+        syscall(SYS_exit, 0);
+        __builtin_unreachable();
+    }
+    return wait_success(child, "exited-leader-wait-child");
+}
+
 static int test_process_group_highest(void)
 {
     int start[2];
@@ -600,7 +662,7 @@ int main(int argc, char **argv)
                    ioprio_value(IOPRIO_CLASS_BE, 4)) ||
         test_fork_and_exec_inheritance(argv[0]) || test_clone_io() ||
         test_zombie_ioprio() || test_zombie_group_scheduler() ||
-        test_exec_oldtid(argv[0]) ||
+        test_exec_oldtid(argv[0]) || test_exited_leader_group() ||
         test_process_group_highest() || test_user_and_errors() ||
         set_process("reset-final", 0) ||
         expect_get("get-final-none", IOPRIO_WHO_PROCESS, 0, 0)) {

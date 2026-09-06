@@ -1142,6 +1142,34 @@ pub fn sys_mq_timedsend<M: UserMemory + ?Sized>(
     })
 }
 
+fn try_mq_receive<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    queue: &Arc<Mutex<PosixMqueue>>,
+    msg_ptr: *mut u8,
+    msg_len: usize,
+    msg_prio: *mut u32,
+) -> AxResult<isize> {
+    let (message, readiness) = {
+        let mut queue = queue.lock();
+        if queue.messages.is_empty() {
+            return Err(AxError::WouldBlock);
+        }
+        if msg_len < queue.msgsize {
+            return Err(AxError::from(LinuxError::EMSGSIZE));
+        }
+        let message = queue.pop_message().ok_or(AxError::BadState)?;
+        (message, Arc::clone(&queue.readiness))
+    };
+    // Dequeue commits free capacity even if either copyout faults.
+    // Linux wakes a waiting sender before copying priority/data to user.
+    readiness.writable.wake();
+    if !msg_prio.is_null() {
+        VmMutPtr::vm_write(msg_prio, memory, message.priority).map_err(map_usercopy_error)?;
+    }
+    vm_write_slice(memory, msg_ptr, &message.data).map_err(map_usercopy_error)?;
+    Ok(message.data.len() as isize)
+}
+
 pub fn sys_mq_timedreceive<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     fd: i32,
@@ -1157,23 +1185,7 @@ pub fn sys_mq_timedreceive<M: UserMemory + ?Sized>(
     }
 
     wait_mq_operation(&file, IoEvents::READABLE, deadline, || {
-        let (message, readiness) = {
-            let mut queue = file.queue.lock();
-            if queue.messages.is_empty() {
-                return Err(AxError::WouldBlock);
-            }
-            if msg_len < queue.msgsize {
-                return Err(AxError::from(LinuxError::EMSGSIZE));
-            }
-            let message = queue.pop_message().ok_or(AxError::BadState)?;
-            (message, Arc::clone(&queue.readiness))
-        };
-        vm_write_slice(memory, msg_ptr, &message.data).map_err(map_usercopy_error)?;
-        if !msg_prio.is_null() {
-            VmMutPtr::vm_write(msg_prio, memory, message.priority).map_err(map_usercopy_error)?;
-        }
-        readiness.writable.wake();
-        Ok(message.data.len() as isize)
+        try_mq_receive(memory, &file.queue, msg_ptr, msg_len, msg_prio)
     })
 }
 
@@ -1323,6 +1335,83 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn receive_copyout_fault_wakes_sender_after_freeing_capacity() {
+        use alloc::task::Wake;
+        use core::{
+            sync::atomic::{AtomicUsize, Ordering},
+            task::Waker,
+        };
+
+        struct SenderWake {
+            count: AtomicUsize,
+            queue: Arc<Mutex<PosixMqueue>>,
+        }
+        impl Wake for SenderWake {
+            fn wake(self: Arc<Self>) {
+                // The sender may immediately lock the queue and retry.
+                let queue = self.queue.try_lock().expect("wake after queue unlock");
+                assert!(queue.messages.len() < queue.maxmsg);
+                self.count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let pid_ns = PidNamespace::try_new_root(user_ns.clone()).unwrap();
+        let ipc_ns = IpcNamespace::try_new(user_ns).unwrap();
+        for priority_fault in [false, true] {
+            let mut attr = default_attr();
+            attr.mq_maxmsg = 1;
+            attr.mq_msgsize = 4;
+            let queue = Arc::new(Mutex::new(
+                PosixMqueue::new(
+                    FsNameBuf::from_vec(b"fault-wakeup".to_vec()).unwrap(),
+                    0o600,
+                    0,
+                    0,
+                    attr,
+                    &ipc_ns,
+                )
+                .unwrap(),
+            ));
+            queue.lock().insert_message(
+                3,
+                MqSender {
+                    pid: 1,
+                    real_uid: Kuid::INITIAL_ROOT,
+                    pid_ns: pid_ns.clone(),
+                },
+                vec![1, 2, 3, 4],
+            );
+            let readiness = queue.lock().readiness.clone();
+            let sender = Arc::new(SenderWake {
+                count: AtomicUsize::new(0),
+                queue: queue.clone(),
+            });
+            let token = readiness
+                .writable
+                .register(&Waker::from(sender.clone()))
+                .unwrap();
+            let mut provider = TestMemory { bytes: vec![0; 4] };
+            let mut memory = UserMemoryContext::new(&mut provider);
+            let (data, priority) = if priority_fault {
+                (0_usize as *mut u8, 8_usize as *mut u32)
+            } else {
+                (8_usize as *mut u8, core::ptr::null_mut())
+            };
+            assert_eq!(
+                try_mq_receive(&mut memory, &queue, data, 4, priority),
+                Err(AxError::BadAddress)
+            );
+            drop(memory);
+            if priority_fault {
+                assert_eq!(provider.bytes, vec![0; 4]);
+            }
+            assert_eq!(sender.count.load(Ordering::Relaxed), 1);
+            assert!(queue.lock().messages.is_empty());
+            readiness.writable.cancel(token);
+        }
+    }
+
     struct TestMemory {
         bytes: Vec<u8>,
     }
@@ -1381,7 +1470,7 @@ mod tests {
             (name, copied_attr)
         };
 
-        assert_eq!(name, "queue");
+        assert_eq!(name.as_bytes(), b"queue");
         assert_eq!(copied_attr.mq_flags, 0);
         assert_eq!(copied_attr.mq_maxmsg, 4);
         assert_eq!(copied_attr.mq_msgsize, 64);
@@ -1588,6 +1677,7 @@ mod tests {
 
     #[test]
     fn owner_exit_cancels_unlinked_but_open_notification() {
+        let _context = crate::test_support::scheduler_test_context();
         let pid = 0xf001;
         let (ipc_ns, queue, token) = install_inert_notification(pid);
         cleanup_process_mqueue_notifications_in(&ipc_ns, pid);
@@ -1605,6 +1695,7 @@ mod tests {
 
     #[test]
     fn owner_exit_wins_against_a_notification_already_taken_for_delivery() {
+        let _context = crate::test_support::scheduler_test_context();
         let pid = 0xf002;
         let (ipc_ns, queue, token) = install_inert_notification(pid);
         let moved = queue.lock().notifier.take().unwrap();
@@ -1616,6 +1707,7 @@ mod tests {
 
     #[test]
     fn owner_exit_refunds_an_unlinked_queue_signal_reservation() {
+        let _context = crate::test_support::scheduler_test_context();
         let pid = 0xf003;
         let (ipc_ns, queue, token, per_user, global) = install_accounted_notification(pid);
         assert_eq!(per_user.queued(), 1);
@@ -1630,6 +1722,7 @@ mod tests {
 
     #[test]
     fn exit_cancellation_of_taken_notification_refunds_exactly_on_drop() {
+        let _context = crate::test_support::scheduler_test_context();
         let pid = 0xf004;
         let (ipc_ns, queue, token, per_user, global) = install_accounted_notification(pid);
         let moved = queue.lock().notifier.take().unwrap();

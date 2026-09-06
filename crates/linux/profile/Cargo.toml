@@ -1,0 +1,12 @@
+[package]
+name = "thekernel-linux-profile"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Static Linux personality composition contracts for independent OS adapters"
+
+[package.metadata.thekernel]
+layer = "linux_abi"
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,19 @@
+[package]
+name = "thekernel-linux-arch-x86-64"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Pure x86_64 Linux ABI policy plans"
+
+[dependencies]
+bytemuck = { version = "1.24", default-features = false, features = ["derive"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[package.metadata.thekernel]
+layer = "linux_abi"

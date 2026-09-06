@@ -2864,40 +2864,108 @@ mod tests {
         render_creates: u32,
         render_detaches: u32,
         render_unrefs: u32,
+        next_fence: u64,
+        completions: Vec<(DriverGpuQueue, DriverGpuCompletion)>,
     }
     impl GpuTransport for FakeTransport {
         fn submit(
             &mut self,
-            _: DriverGpuQueue,
+            queue: DriverGpuQueue,
             batch: DriverGpuBatch,
             _: u64,
         ) -> Result<DriverGpuSubmission, DevError> {
-            if let DriverGpuBatch::Present {
-                resource,
-                width,
-                height,
-                ..
-            } = batch
-            {
-                self.presented.push((resource, width, height));
-                Ok(DriverGpuSubmission {
-                    fence_id: 1,
-                    resource_id: None,
-                    context_id: None,
-                })
-            } else {
-                Err(DevError::Unsupported)
+            let mut resource_id = None;
+            match batch {
+                DriverGpuBatch::Create2d { width, height, .. } => {
+                    self.created.push((width, height, 0, 0));
+                    resource_id = Some(7);
+                }
+                DriverGpuBatch::CreateResource3d { .. } => {
+                    self.render_creates += 1;
+                    self.render_next += 1;
+                    resource_id = Some(100 + self.render_next);
+                }
+                DriverGpuBatch::AttachBacking { resource, entries } => {
+                    if resource == 7 {
+                        let entry = entries.first().ok_or(DevError::InvalidParam)?;
+                        assert_eq!(entry.0 % 4096, 0);
+                        let created = self.created.last_mut().unwrap();
+                        created.2 = entry.0;
+                        created.3 = entries.iter().map(|entry| entry.1).sum();
+                    } else if self.render_attach_fails > 0 {
+                        self.render_attach_fails -= 1;
+                        return Err(DevError::Io);
+                    }
+                }
+                DriverGpuBatch::DetachBacking { resource } => {
+                    if resource == 7 {
+                        self.destroys += 1;
+                        self.destroy_calls.fetch_add(1, Ordering::Relaxed);
+                        if self.destroy_fails {
+                            return Err(DevError::Io);
+                        }
+                    } else {
+                        self.render_detaches += 1;
+                        if self.render_detach_fails > 0 {
+                            self.render_detach_fails -= 1;
+                            return Err(DevError::Io);
+                        }
+                    }
+                }
+                DriverGpuBatch::UnrefResource { .. } => {
+                    self.render_unrefs += 1;
+                    if self.render_unref_fails > 0 {
+                        self.render_unref_fails -= 1;
+                        return Err(DevError::Io);
+                    }
+                }
+                DriverGpuBatch::DestroyResource { .. } => {}
+                DriverGpuBatch::Present {
+                    resource,
+                    width,
+                    height,
+                    ..
+                } => {
+                    self.presented.push((resource, width, height));
+                }
+                _ => return Err(DevError::Unsupported),
             }
+            self.next_fence += 1;
+            self.completions.push((
+                queue,
+                DriverGpuCompletion {
+                    fence_id: self.next_fence,
+                    result: Ok(()),
+                    data: DriverGpuCompletionData::None,
+                },
+            ));
+            Ok(DriverGpuSubmission {
+                fence_id: self.next_fence,
+                resource_id,
+                context_id: None,
+            })
         }
         fn drain_completions(
             &mut self,
-            _: DriverGpuQueue,
-            _: &mut [DriverGpuCompletion],
+            queue: DriverGpuQueue,
+            out: &mut [DriverGpuCompletion],
         ) -> Result<usize, DevError> {
-            Ok(0)
+            let mut count = 0;
+            while count < out.len() {
+                let Some(index) = self.completions.iter().position(|(q, _)| *q == queue) else {
+                    break;
+                };
+                out[count] = self.completions.remove(index).1;
+                count += 1;
+            }
+            Ok(count)
         }
-        fn reset(&mut self, _: DriverGpuQueue, _: &mut [DriverGpuCompletion]) -> usize {
-            0
+        fn reset(&mut self, queue: DriverGpuQueue, out: &mut [DriverGpuCompletion]) -> usize {
+            let count = self.drain_completions(queue, out).unwrap();
+            for completion in &mut out[..count] {
+                completion.result = Err(DevError::Io);
+            }
+            count
         }
     }
 
@@ -2922,7 +2990,7 @@ mod tests {
                 256,
             )
             .unwrap();
-        adapter
+        let completion = adapter
             .present(Scanout {
                 backing,
                 width: 17,
@@ -2945,6 +3013,10 @@ mod tests {
                 damage: None,
             })
             .unwrap();
+        assert!(!completion.is_signaled());
+        adapter.state.service_present_job();
+        adapter.state.service_present_job();
+        assert!(completion.is_signaled());
         assert!(adapter.state.resources.lock().is_empty());
         let transport = adapter.state.transport.lock();
         assert_eq!(transport.created[0].0, 32);
@@ -2972,6 +3044,10 @@ mod tests {
         drop(backing);
         assert_eq!(adapter.state.transport.lock().destroys, 1);
         assert_eq!(adapter.state.retired_2d_resources.lock().len(), 1);
+        adapter.state.transport.lock().destroy_fails = false;
+        adapter.state.retry_retired_2d_resources();
+        assert!(adapter.state.retired_2d_resources.lock().is_empty());
+        assert_eq!(adapter.state.transport.lock().destroys, 2);
     }
 
     #[test]
@@ -3064,16 +3140,25 @@ mod tests {
             nr_samples: 0,
             flags: 0,
         };
-        assert!(
-            render
-                .create_resource(resource, &[(0, 4096)], render_pages())
-                .is_err()
+        let failed_id = render
+            .create_resource(resource, &[(0, 4096)], render_pages())
+            .unwrap();
+        let failed_ready = render.resource_ready(failed_id).unwrap();
+        assert!(!failed_ready.is_signaled());
+        adapter.state.service_render_jobs();
+        assert_eq!(
+            failed_ready.wait(Some(Duration::ZERO)),
+            Err(axerrno::AxError::Io)
         );
         for _ in 0..129 {
             let pages = render_pages();
             let id = render
                 .create_resource(resource, &[(0, 4096)], pages.clone())
                 .unwrap();
+            let ready = render.resource_ready(id).unwrap();
+            adapter.state.service_render_jobs();
+            adapter.state.service_render_jobs();
+            assert!(ready.wait(Some(Duration::ZERO)).is_ok());
             render.retire_resource(id, pages, true);
         }
         let transport = adapter.state.transport.lock();

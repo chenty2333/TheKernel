@@ -215,6 +215,7 @@ pub(crate) fn spawn_usermode_helper(spec: UsermodeHelperSpec) -> AxResult<Usermo
     let actions =
         SharedSignalActions::try_new(SignalActions::default()).map_err(|_| AxError::NoMemory)?;
     let proc_data = ProcessData::try_new(
+        parent.world,
         process,
         ProcessData::try_prepare_zombie_snapshot()?,
         helper_credential.clone(),

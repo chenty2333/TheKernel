@@ -13,7 +13,7 @@ use axnet::options::SocketCredentials;
 use axtask::current;
 
 pub use self::{cmsg::*, io::*, name::*, opt::*, socket::*};
-use crate::task::{AsThread, Cred, NetworkNamespace, security::LandlockDomain};
+use crate::task::{AsThread, Cred, NetworkNamespace, PidNamespace, security::LandlockDomain};
 
 /// Keeps pure socket-output syscalls at the Linux hook boundary: policy sees
 /// the exact pinned socket before the adapter reads any userspace output
@@ -26,6 +26,12 @@ fn import_socket_output_after_policy<T>(
     import_output()
 }
 
+/// Render transport PIDs only at the receiving userspace boundary. Missing
+/// bindings (including identities outside this namespace) are reported as zero.
+fn socket_credential_pid(namespace: &PidNamespace, global_pid: u32) -> u32 {
+    namespace.visible_pid_checked(global_pid as _).unwrap_or(0) as u32
+}
+
 /// One syscall-entry identity snapshot shared by socket policy and every
 /// admitted side effect. Helpers must not resample `current()` after this value
 /// has been created.
@@ -34,6 +40,7 @@ pub(super) struct SocketSyscallSnapshot {
     landlock_domain: LandlockDomain,
     net_namespace: Arc<NetworkNamespace>,
     pid: u32,
+    pid_namespace: Arc<PidNamespace>,
     umask: u32,
     unix_credentials: SocketCredentials,
 }
@@ -51,6 +58,7 @@ impl SocketSyscallSnapshot {
             landlock_domain,
             net_namespace: thread.net_ns(),
             pid,
+            pid_namespace: thread.pid_ns(),
             umask: thread.fs_context().lock().umask(),
             unix_credentials: SocketCredentials::new(pid, ids.euid.into_raw(), ids.egid.into_raw()),
         }
@@ -70,12 +78,20 @@ impl SocketSyscallSnapshot {
         &self.net_namespace
     }
 
+    pub(super) fn pid_namespace(&self) -> &Arc<PidNamespace> {
+        &self.pid_namespace
+    }
+
     pub(super) const fn pid(&self) -> u32 {
         self.pid
     }
 
     pub(super) const fn umask(&self) -> u32 {
         self.umask
+    }
+
+    pub(super) fn automatic_unix_credentials(&self) -> SocketCredentials {
+        crate::file::automatic_unix_credentials(&self.actor, self.pid)
     }
 
     pub(super) const fn unix_credentials(&self) -> SocketCredentials {
@@ -89,7 +105,23 @@ mod tests {
 
     use axerrno::AxError;
 
-    use super::import_socket_output_after_policy;
+    use super::{import_socket_output_after_policy, socket_credential_pid};
+
+    #[test]
+    fn socket_credentials_use_receiver_pid_namespace() {
+        use crate::task::{PidNamespace, UserNamespace};
+        let owner = UserNamespace::try_new_root().unwrap();
+        let root = PidNamespace::try_new_root(owner.clone()).unwrap();
+        root.reserve_process(71).unwrap().commit();
+        let child = root.try_fork(99, owner).unwrap();
+        child.reserve_process(99).unwrap().commit();
+        assert_eq!(socket_credential_pid(&root, 71), 1);
+        assert_eq!(socket_credential_pid(&root, 99), 2);
+        assert_eq!(socket_credential_pid(&child, 99), 1);
+        assert_eq!(socket_credential_pid(&child, 71), 0);
+        assert_eq!(socket_credential_pid(&root, 0), 0);
+        assert_eq!(socket_credential_pid(&root, 12345), 0);
+    }
 
     #[test]
     fn denied_socket_output_policy_wins_over_an_invalid_user_length_pointer() {

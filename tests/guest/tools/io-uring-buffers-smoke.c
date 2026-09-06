@@ -665,9 +665,22 @@ static int test_fork_fixed_cow(void) {
                        ? WEXITSTATUS(child_status) : 128 + WTERMSIG(child_status), 0);
         goto out;
     }
-    if (report.before_child_cow != 'P' || report.after_child_read != 'C' ||
-        report.fixed_read_result != 0 || report.fixed_write_result != 0) {
-        fail_stage("fork-cow-child-pages");
+    if (report.before_child_cow != 'P') {
+        fail_value("fork-cow-child-before", report.before_child_cow, 'P');
+        goto out;
+    }
+    if (report.after_child_read != 'C') {
+        fail_value("fork-cow-child-after-fixed-read", report.after_child_read, 'C');
+        goto out;
+    }
+    if (report.fixed_read_result != 0) {
+        fail_value("fork-cow-child-fixed-read-result",
+                   report.fixed_read_result, 0);
+        goto out;
+    }
+    if (report.fixed_write_result != 0) {
+        fail_value("fork-cow-child-fixed-write-result",
+                   report.fixed_write_result, 0);
         goto out;
     }
     unsigned char output_byte = 0;
@@ -1907,6 +1920,10 @@ int main(int argc, char **argv) {
         return fail_stage("page-size");
     }
     page_bytes = (size_t)system_page;
+    fprintf(stderr,
+            "io_uring_buffers: scope=registered-page-lifetime "
+            "fixture=/tmp guest_provider=MemoryFs direct_io=0 "
+            "physical_dma=not-covered\n");
     if (linux_host) {
         fprintf(stderr,
                 "io_uring_buffers: linux-host differential mode budget=one-page\n");

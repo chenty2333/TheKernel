@@ -402,6 +402,7 @@ const IO_URING_PENDING_STREAM_BUDGET: usize = 8;
 /// races retain Linux's issue-time lookup behavior.
 #[derive(Clone)]
 pub(crate) struct IoUringSubmissionActor {
+    world: crate::task::WorldId,
     files: Arc<FdTable>,
     memory: UserMemoryCapability,
     security: VfsSecurityContext,
@@ -413,6 +414,7 @@ pub(crate) struct IoUringSubmissionActor {
 
 impl IoUringSubmissionActor {
     pub(crate) fn new(
+        world: crate::task::WorldId,
         files: Arc<FdTable>,
         memory: UserMemoryCapability,
         security: VfsSecurityContext,
@@ -422,6 +424,7 @@ impl IoUringSubmissionActor {
         nofile_limit: usize,
     ) -> Self {
         Self {
+            world,
             files,
             memory,
             security,
@@ -430,6 +433,10 @@ impl IoUringSubmissionActor {
             path_snapshot,
             nofile_limit,
         }
+    }
+
+    pub(crate) const fn world(&self) -> crate::task::WorldId {
+        self.world
     }
 
     pub(crate) const fn files(&self) -> &Arc<FdTable> {
@@ -466,6 +473,11 @@ static IO_URING_REGISTERED_BUFFER_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static IO_URING_REGISTERED_BUFFER_PAGES: AtomicUsize = AtomicUsize::new(0);
 static IO_URING_REGISTERED_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(0);
 static DEFERRED_IO_URING_WORK: AtomicPtr<IoUring> = AtomicPtr::new(ptr::null_mut());
+static DEFERRED_POLL_CALLBACKS: AtomicPtr<PollCallbackState> = AtomicPtr::new(ptr::null_mut());
+// Only the policy worker consumes this detached continuation. New IRQ
+// publications remain on DEFERRED_POLL_CALLBACKS until the next bounded batch.
+static DEFERRED_POLL_CONTINUATION: AtomicPtr<PollCallbackState> = AtomicPtr::new(ptr::null_mut());
+const POLL_CALLBACK_BUDGET: usize = 64;
 /// The lower handle/cookie namespace is device-local. Keep the exact shared
 /// queue identity alongside every upper route instead of trying to infer it
 /// from a raw completion handle. This fixed table is deliberately small: the
@@ -4794,6 +4806,7 @@ struct RegisteredFiles {
 /// direct-or-copy fallback; this pin establishes lifetime and mapping fences,
 /// not a claim of hardware DMA support.
 struct RegisteredBuffer {
+    world: crate::task::WorldId,
     address: usize,
     length: usize,
     capability: UserMemoryCapability,
@@ -5426,6 +5439,19 @@ fn locate_physical_segment(segment_ends: &[usize], offset: usize) -> AxResult<(u
 }
 
 impl IoUringBufferLease {
+    fn validate_world(&self, world: crate::task::WorldId) -> AxResult<()> {
+        let owner_world = match &self.owner {
+            IoUringBufferLeaseOwner::Registered(Some(lease)) => lease.owner().world,
+            IoUringBufferLeaseOwner::Registered(None) => return Err(AxError::BadState),
+            IoUringBufferLeaseOwner::Provided { .. } => self.ring.world,
+        };
+        if world.admits(owner_world) && world.admits(self.ring.world) {
+            Ok(())
+        } else {
+            Err(AxError::PermissionDenied)
+        }
+    }
+
     pub(crate) fn consume_provided(&mut self) {
         if self.provided_return_on_drop
             && let IoUringBufferLeaseOwner::Provided { group, id, .. } = &self.owner
@@ -5490,6 +5516,7 @@ impl IoUringBufferLease {
     /// capability: the ring may be submitted through a shared descriptor by
     /// another task or address space.
     pub(crate) fn capability(&self) -> AxResult<UserMemoryCapability> {
+        self.validate_world(self.ring.world)?;
         match &self.owner {
             IoUringBufferLeaseOwner::Registered(Some(lease)) => {
                 Ok(lease.owner().capability.clone())
@@ -5499,10 +5526,39 @@ impl IoUringBufferLease {
         }
     }
 
+    /// Returns the registered capability and exact request range together.
+    ///
+    /// The submission path needs both values for fixed resources. Keeping the
+    /// world/lifetime check at this combined lease boundary avoids validating
+    /// the same retained lease once for the capability and again for its
+    /// range. The lease remains the authority for both values; this does not
+    /// cache a table entry or weaken retirement checks.
+    #[cfg(feature = "io-submit-batch")]
+    pub(crate) fn capability_and_range(&self) -> AxResult<(UserMemoryCapability, (u64, u32))> {
+        self.validate_world(self.ring.world)?;
+        match &self.owner {
+            IoUringBufferLeaseOwner::Registered(Some(lease)) => {
+                let range = lease.range();
+                Ok((
+                    lease.owner().capability.clone(),
+                    (range.address(), range.length()),
+                ))
+            }
+            IoUringBufferLeaseOwner::Provided {
+                address,
+                length,
+                capability,
+                ..
+            } => Ok((capability.clone(), (*address, *length))),
+            IoUringBufferLeaseOwner::Registered(None) => Err(AxError::BadState),
+        }
+    }
+
     /// Returns the exact subrange validated by the table lookup. Fixed I/O
     /// must derive its address and length from this lease rather than reuse
     /// the caller's raw SQE geometry after admission.
     pub(crate) fn range(&self) -> AxResult<(u64, u32)> {
+        self.validate_world(self.ring.world)?;
         match &self.owner {
             IoUringBufferLeaseOwner::Registered(Some(lease)) => {
                 let range = lease.range();
@@ -6256,16 +6312,33 @@ struct PollCallbackState {
     request: RequestId,
     enabled: AtomicBool,
     source_woke: AtomicBool,
+    deferred_next: AtomicPtr<PollCallbackState>,
+    deferred_queued: AtomicBool,
 }
 
 impl PollCallbackState {
-    fn publish_source_wake(&self) {
+    fn publish_source_wake(self: &Arc<Self>) {
         if !self.enabled.load(Ordering::Acquire) {
             return;
         }
         self.source_woke.store(true, Ordering::Release);
-        if let Some(ring) = self.ring.upgrade() {
-            ring.publish_poll_hint(self.request);
+        // A source can call us on the timer IRQ stack. Upgrading the ring
+        // here would allow its final strong reference (and SharedPages) to
+        // drop in IRQ context after a concurrent policy-worker close. Queue
+        // only this callback token; its ring ownership remains weak.
+        if self.deferred_queued.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let node = Arc::into_raw(Arc::clone(self)).cast_mut();
+        let mut head = DEFERRED_POLL_CALLBACKS.load(Ordering::Acquire);
+        loop {
+            self.deferred_next.store(head, Ordering::Relaxed);
+            match DEFERRED_POLL_CALLBACKS.compare_exchange_weak(
+                head, node, Ordering::Release, Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => head = observed,
+            }
         }
     }
 }
@@ -6306,6 +6379,8 @@ impl PollControl {
             request,
             enabled: AtomicBool::new(true),
             source_woke: AtomicBool::new(false),
+            deferred_next: AtomicPtr::new(ptr::null_mut()),
+            deferred_queued: AtomicBool::new(false),
         }) {
             Ok(callback) => callback,
             Err(_) => return Err((AxError::NoMemory, lease)),
@@ -7289,6 +7364,53 @@ type SubmissionWorkParts = (
     Option<axfs::PreparedOwnedFileIo>,
 );
 
+#[cfg(feature = "io-submit-batch")]
+pub(crate) trait SubmissionNotificationFlush {
+    fn flush_notifications(&mut self);
+}
+
+/// A stack-owned notification batch. Only completions explicitly passed this
+/// token can defer waiter notification; asynchronous producers never consult
+/// task-local or ring-global batching state. CQEs and eventfd counts remain
+/// visible immediately.
+#[cfg(feature = "io-submit-batch")]
+pub(crate) struct SubmissionCompletionBatch<'a> {
+    ring: &'a IoUring,
+    pending: u32,
+}
+
+#[cfg(feature = "io-submit-batch")]
+impl<'a> SubmissionCompletionBatch<'a> {
+    pub(crate) fn new(ring: &'a IoUring) -> Self {
+        Self { ring, pending: 0 }
+    }
+    pub(crate) fn flush(&mut self) {
+        if core::mem::take(&mut self.pending) != 0 {
+            self.ring.completion_wait.wake();
+        }
+    }
+    fn record(&mut self) {
+        self.pending += 1;
+        if self.pending == 32 {
+            self.flush();
+        }
+    }
+}
+
+#[cfg(feature = "io-submit-batch")]
+impl SubmissionNotificationFlush for SubmissionCompletionBatch<'_> {
+    fn flush_notifications(&mut self) {
+        self.flush();
+    }
+}
+
+#[cfg(feature = "io-submit-batch")]
+impl Drop for SubmissionCompletionBatch<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 /// One accepted SQ entry after terminal credit and SQ-head publication.
 pub(crate) struct SubmissionWork {
     prepared: PreparedRequest,
@@ -7364,11 +7486,20 @@ pub(crate) enum DependencyDispatch {
 /// Reversible SQ admission which owns terminal credit but no published head.
 pub(crate) struct SubmissionAdmission<'a> {
     ring: &'a IoUring,
+    #[cfg(feature = "io-submit-batch")]
+    notification_flush: Option<&'a mut dyn SubmissionNotificationFlush>,
     reservation: Option<RequestReservation>,
     parsed: Result<ParsedSubmission, IoUringError>,
 }
 
 impl SubmissionAdmission<'_> {
+    #[cfg(feature = "io-submit-batch")]
+    pub(crate) fn flush_notifications(&mut self) {
+        if let Some(flush) = self.notification_flush.as_deref_mut() {
+            flush.flush_notifications();
+        }
+    }
+
     pub(crate) const fn parsed(&self) -> Result<ParsedSubmission, IoUringError> {
         self.parsed
     }
@@ -7413,7 +7544,17 @@ impl SubmissionAdmission<'_> {
         openat2: Option<IoUringOpenAt2Work>,
         capability: UserMemoryCapability,
     ) -> AxResult<SubmissionWork> {
-        let _submission = self.ring.submission_serial.lock();
+        let ring = self.ring;
+        #[cfg(feature = "io-submit-batch")]
+        let _submission = match ring.submission_serial.try_lock() {
+            Some(guard) => guard,
+            None => {
+                self.flush_notifications();
+                ring.submission_serial.lock()
+            }
+        };
+        #[cfg(not(feature = "io-submit-batch"))]
+        let _submission = ring.submission_serial.lock();
         let mut state = self.ring.state.lock();
         if !state.admission_in_progress {
             return Err(AxError::BadState);
@@ -7455,7 +7596,17 @@ impl Drop for SubmissionAdmission<'_> {
         let Some(reservation) = self.reservation.take() else {
             return;
         };
-        let _submission = self.ring.submission_serial.lock();
+        let ring = self.ring;
+        #[cfg(feature = "io-submit-batch")]
+        let _submission = match ring.submission_serial.try_lock() {
+            Some(guard) => guard,
+            None => {
+                self.flush_notifications();
+                ring.submission_serial.lock()
+            }
+        };
+        #[cfg(not(feature = "io-submit-batch"))]
+        let _submission = ring.submission_serial.lock();
         let mut state = self.ring.state.lock();
         if let Err(error) = state.requests.rollback(reservation) {
             error!("io_uring admission rollback lost request ownership: {error:?}");
@@ -7465,6 +7616,7 @@ impl Drop for SubmissionAdmission<'_> {
 }
 
 pub(crate) struct IoUring {
+    world: crate::task::WorldId,
     id: RingId,
     layout: RingLayout,
     rings: Arc<SharedPages>,
@@ -7533,19 +7685,30 @@ impl IoUring {
         (),
         (
             AxError,
+            IssuedRequest,
             axfs::PreparedOwnedFileIo,
             Option<IoUringBufferLease>,
         ),
     > {
+        if let Some(lease) = buffer.as_ref()
+            && let Err(error) = lease.validate_world(self.world)
+        {
+            return Err((error, issued, prepared, buffer));
+        }
         let id = issued.id();
         {
             let mut state = self.state.lock();
+            // Close may have swept the owner table between issue and this
+            // handoff. Do not publish new provider work behind that sweep.
+            if self.final_close_requested.load(Ordering::Acquire) {
+                return Err((AxError::BadState, issued, prepared, buffer));
+            }
             let slot = id.slot() as usize;
             let Some(entry) = state.owned_file_io.get_mut(slot) else {
-                return Err((AxError::BadState, prepared, buffer));
+                return Err((AxError::BadState, issued, prepared, buffer));
             };
             if entry.is_some() {
-                return Err((AxError::BadState, prepared, buffer));
+                return Err((AxError::BadState, issued, prepared, buffer));
             }
             *entry = Some(OwnedFileIoOwner {
                 id,
@@ -7719,7 +7882,22 @@ impl IoUring {
             buffer,
         })
     }
-    pub(crate) fn try_new(layout: RingLayout) -> AxResult<Arc<Self>> {
+    #[cfg(test)]
+    fn try_new(layout: RingLayout) -> AxResult<Arc<Self>> {
+        Self::try_new_in_world(layout, crate::task::WorldId::BOOT)
+    }
+
+    pub(crate) fn try_new_in_world(
+        layout: RingLayout,
+        world: crate::task::WorldId,
+    ) -> AxResult<Arc<Self>> {
+        let profile = world.profile();
+        if !profile.enables(thekernel_linux_profile::Capability::AsyncFileIo) {
+            return Err(AxError::OperationNotSupported);
+        }
+        if layout.sq_entries() > profile.limits().io_uring_entries {
+            return Err(AxError::InvalidInput);
+        }
         let id = allocate_ring_id()?;
         let request_slots =
             usize::try_from(layout.sq_entries()).map_err(|_| AxError::InvalidInput)?;
@@ -7754,8 +7932,9 @@ impl IoUring {
             Arc::clone(&sqes),
             super::FileMmapProtection::READ | super::FileMmapProtection::WRITE,
         )?;
-        let requests = RequestRegistry::new(id, layout.sq_entries(), layout.cq_entries())
+        let mut requests = RequestRegistry::new(id, layout.sq_entries(), layout.cq_entries())
             .map_err(map_core_error)?;
+        requests.set_observer(Some(crate::pseudofs::trace::record_io_uring));
         let mut polls = Vec::new();
         polls
             .try_reserve_exact(request_slots)
@@ -7828,6 +8007,7 @@ impl IoUring {
             Arc::try_new(RegisteredBufferPinBudget::new()).map_err(|_| AxError::NoMemory)?;
 
         let ring = Arc::try_new(Self {
+            world,
             id,
             layout,
             rings,
@@ -7916,10 +8096,20 @@ impl IoUring {
         self.id
     }
 
+    /// Rejects foreign actors before queue or registered-resource access.
+    pub(crate) fn admit_world(&self, actor: crate::task::WorldId) -> AxResult<()> {
+        if self.world.admits(actor) {
+            Ok(())
+        } else {
+            Err(AxError::PermissionDenied)
+        }
+    }
+
     /// Installs the setup-task actor before an SQPOLL worker can consume the
     /// shared SQ.  Replacing it would silently retarget an existing ring to a
     /// different process, therefore configuration is strictly one-shot.
     pub(crate) fn install_sqpoll_actor(&self, actor: IoUringSubmissionActor) -> AxResult<()> {
+        self.admit_world(actor.world)?;
         if !self.sqpoll || self.final_close_requested.load(Ordering::Acquire) {
             return Err(AxError::BadState);
         }
@@ -8150,7 +8340,34 @@ impl IoUring {
             .wrapping_sub(state.requests.completion_head()))
     }
 
-    pub(crate) fn prepare_submission(&self) -> AxResult<SubmissionStep<'_>> {
+    pub(crate) fn prepare_submission(
+        &self,
+        world: crate::task::WorldId,
+    ) -> AxResult<SubmissionStep<'_>> {
+        self.prepare_submission_with_notifications(
+            world,
+            #[cfg(feature = "io-submit-batch")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "io-submit-batch")]
+    pub(crate) fn prepare_submission_batched<'a>(
+        &'a self,
+        world: crate::task::WorldId,
+        batch: &'a mut dyn SubmissionNotificationFlush,
+    ) -> AxResult<SubmissionStep<'a>> {
+        self.prepare_submission_with_notifications(world, Some(batch))
+    }
+
+    fn prepare_submission_with_notifications<'a>(
+        &'a self,
+        world: crate::task::WorldId,
+        #[cfg(feature = "io-submit-batch")] mut notification_flush: Option<
+            &'a mut dyn SubmissionNotificationFlush,
+        >,
+    ) -> AxResult<SubmissionStep<'a>> {
+        self.admit_world(world)?;
         if let Some(issuer) = *self.single_issuer.lock()
             && issuer != axtask::current().id().as_u64()
             && (!self.sqpoll
@@ -8159,6 +8376,17 @@ impl IoUring {
         {
             return Err(AxError::PermissionDenied);
         }
+        #[cfg(feature = "io-submit-batch")]
+        let _submission = match self.submission_serial.try_lock() {
+            Some(guard) => guard,
+            None => {
+                if let Some(flush) = notification_flush.as_deref_mut() {
+                    flush.flush_notifications();
+                }
+                self.submission_serial.lock()
+            }
+        };
+        #[cfg(not(feature = "io-submit-batch"))]
         let _submission = self.submission_serial.lock();
         let head = {
             let state = self.state.lock();
@@ -8221,6 +8449,8 @@ impl IoUring {
         state.admission_in_progress = true;
         Ok(SubmissionStep::Admission(SubmissionAdmission {
             ring: self,
+            #[cfg(feature = "io-submit-batch")]
+            notification_flush,
             reservation: Some(reservation),
             parsed,
         }))
@@ -8746,6 +8976,30 @@ impl IoUring {
         Ok(true)
     }
 
+    /// Release the exact retired lower route while the complete upper owner
+    /// is still recoverable. On mismatch, keep its issued proof and work-slot
+    /// fence in custody; no terminal publication may pass this boundary.
+    fn release_terminal_physical_routes(
+        self: &Arc<Self>,
+        work: PhysicalIoWork,
+        route_handle: Option<u64>,
+    ) -> AxResult<PhysicalIoWork> {
+        let device_identity = work.device_identity();
+        if let Some(request) = work.request_id() {
+            if release_physical_completion_routes_for_device(
+                device_identity,
+                self,
+                request,
+                route_handle,
+            ) {
+                return Ok(work);
+            }
+            quarantine_physical_completion_routes_for_device(device_identity, self, request, None);
+        }
+        self.park_physical_worker_custody(work);
+        Err(AxError::BadState)
+    }
+
     fn publish_terminal_physical_work(
         self: &Arc<Self>,
         work: PhysicalIoWork,
@@ -8777,26 +9031,13 @@ impl IoUring {
             self.park_physical_worker_custody(work);
             return Err(AxError::BadState);
         }
-        // Retire the complete admission and empty work-slot owner before
-        // releasing the route or publishing the IssuedRequest. No physical
-        // owner, route, or QD charge may remain when the CQE becomes visible.
+        // Settlement has already proved lower DMA retirement. Release its
+        // exact route before consuming the upper payload so a route mismatch
+        // retains the whole owner in custody. The worker slot stays fenced
+        // until payload retirement; all owners and charges are gone before CQE.
+        let work = self.release_terminal_physical_routes(work, route_handle)?;
         let payload = PhysicalIoTerminalPayload::from_valid_work(work);
-        let (completion_ring, issued) = match payload.retire() {
-            Ok(retired) => retired,
-            Err(error) => {
-                // Physical retirement is already proven. Even a malformed
-                // upper payload must not leave a route pointing at a dropped
-                // Work owner.
-                release_physical_completion_routes_for_device(
-                    device_identity,
-                    self,
-                    request,
-                    route_handle,
-                );
-                return Err(error);
-            }
-        };
-        release_physical_completion_routes_for_device(device_identity, self, request, route_handle);
+        let (completion_ring, issued) = payload.retire()?;
         let completed_bytes = result.max(0) as usize;
         record_io_uring_physical_completed(completed_bytes);
         match operation {
@@ -9108,7 +9349,30 @@ impl IoUring {
     /// [`Self::publish_pending_slot`] so a concurrent producer can never
     /// observe a temporary, process-wide "defer disabled" state.
     fn publish_pending_slot_now(&self, slot: usize) -> AxResult<bool> {
+        self.publish_pending_slot_with_notification(
+            slot,
+            #[cfg(feature = "io-submit-batch")]
+            None,
+        )
+    }
+
+    fn publish_pending_slot_with_notification(
+        &self,
+        slot: usize,
+        #[cfg(feature = "io-submit-batch")] mut batch: Option<&mut SubmissionCompletionBatch<'_>>,
+    ) -> AxResult<bool> {
         let published = {
+            #[cfg(feature = "io-submit-batch")]
+            let _publication = match self.completion_serial.try_lock() {
+                Some(guard) => guard,
+                None => {
+                    if let Some(batch) = batch.as_deref_mut() {
+                        batch.flush();
+                    }
+                    self.completion_serial.lock()
+                }
+            };
+            #[cfg(not(feature = "io-submit-batch"))]
             let _publication = self.completion_serial.lock();
             if self.final_close_requested.load(Ordering::Acquire) {
                 let phase = self.state.lock().final_close.phase;
@@ -9159,6 +9423,12 @@ impl IoUring {
             true
         };
         if published {
+            #[cfg(feature = "io-submit-batch")]
+            if let Some(batch) = batch {
+                debug_assert!(core::ptr::eq(self, batch.ring));
+                batch.record();
+                return Ok(true);
+            }
             self.completion_wait.wake();
         }
         Ok(published)
@@ -9267,6 +9537,32 @@ impl IoUring {
         Ok(())
     }
 
+    /// Explicit synchronous completion owner; linked dispatch is flushed
+    /// before execution because the released operation may block.
+    #[cfg(feature = "io-submit-batch")]
+    pub(crate) fn complete_request_batched(
+        &self,
+        id: RequestId,
+        cause: TerminalCause,
+        result: i32,
+        flags: u32,
+        batch: &mut SubmissionCompletionBatch<'_>,
+    ) -> AxResult<()> {
+        assert!(core::ptr::eq(self, batch.ring));
+        self.finish_request(id, cause, result, flags)?;
+        let linked = self.release_linked_after_terminal(id, result)?;
+        if self.defer_taskrun && !self.final_close_requested.load(Ordering::Acquire) {
+            self.taskrun_pending.store(true, Ordering::Release);
+        } else {
+            self.publish_pending_slot_with_notification(id.slot() as usize, Some(batch))?;
+        }
+        if let Some(dispatch) = linked {
+            batch.flush();
+            let _ = crate::syscall::dispatch_dependency_submission(self, dispatch)?;
+        }
+        Ok(())
+    }
+
     /// Consumes the sole issued-request proof at the completion boundary.
     /// Physical workers must use this API instead of passing a copied
     /// [`RequestId`], so a stale/duplicate worker cannot manufacture a CQE
@@ -9341,15 +9637,19 @@ impl IoUring {
     }
 
     pub(crate) fn acquire_registered_file(&self, slot: FileSlot) -> AxResult<IoUringFileLease> {
-        let lease = self
-            .state
-            .lock()
-            .fixed_files
-            .as_mut()
-            .ok_or(AxError::BadFileDescriptor)?
-            .table
-            .acquire(slot)
-            .map_err(map_core_error)?;
+        let lease = {
+            let mut state = self.state.lock();
+            let table = &mut state
+                .fixed_files
+                .as_mut()
+                .ok_or(AxError::BadFileDescriptor)?
+                .table;
+            #[cfg(feature = "io-submit-batch")]
+            let lease = table.acquire_current(slot);
+            #[cfg(not(feature = "io-submit-batch"))]
+            let lease = table.acquire(slot);
+            lease.map_err(map_core_error)?
+        };
         let ring = self.self_weak.get().ok_or(AxError::BadState)?.clone();
         Ok(IoUringFileLease::Registered {
             ring,
@@ -9359,10 +9659,12 @@ impl IoUring {
 
     pub(crate) fn acquire_registered_buffer(
         &self,
+        world: crate::task::WorldId,
         slot: BufferSlot,
         address: u64,
         length: u32,
     ) -> AxResult<IoUringBufferLease> {
+        self.admit_world(world)?;
         // Acquire the ring owner before taking a table lease. A failed weak
         // upgrade must not strand the table's lease counter during teardown.
         let ring = self
@@ -9371,15 +9673,19 @@ impl IoUring {
             .ok_or(AxError::BadState)?
             .upgrade()
             .ok_or(AxError::BadState)?;
-        let lease = self
-            .state
-            .lock()
-            .registered_buffers
-            .as_mut()
-            .ok_or(AxError::BadFileDescriptor)?
-            .table
-            .acquire(slot, address, length)
-            .map_err(map_buffer_lease_error)?;
+        let lease = {
+            let mut state = self.state.lock();
+            let table = &mut state
+                .registered_buffers
+                .as_mut()
+                .ok_or(AxError::BadFileDescriptor)?
+                .table;
+            #[cfg(feature = "io-submit-batch")]
+            let lease = table.acquire_current(slot, address, length);
+            #[cfg(not(feature = "io-submit-batch"))]
+            let lease = table.acquire(slot, address, length);
+            lease.map_err(map_buffer_lease_error)?
+        };
         Ok(IoUringBufferLease {
             ring,
             owner: IoUringBufferLeaseOwner::Registered(Some(lease)),
@@ -9859,11 +10165,15 @@ impl IoUring {
 
     pub(crate) fn register_buffers(
         &self,
+        world: crate::task::WorldId,
         capability: &UserMemoryCapability,
         buffers: Vec<(usize, usize)>,
     ) -> AxResult<()> {
+        self.admit_world(world)?;
         let _registration = self.registration_serial.lock();
-        if buffers.is_empty() {
+        if buffers.is_empty()
+            || buffers.len() > self.world.profile().limits().registered_buffers as usize
+        {
             return Err(AxError::InvalidInput);
         }
         let capacity = u32::try_from(buffers.len()).map_err(|_| AxError::InvalidInput)?;
@@ -9941,6 +10251,7 @@ impl IoUring {
                 return Err(AxError::BadState);
             }
             let owner = Arc::try_new(RegisteredBuffer {
+                world: self.world,
                 address,
                 length,
                 pin_start: page_start,
@@ -11784,9 +12095,44 @@ impl Pollable for IoUring {
 
 pub(crate) fn has_deferred_io_uring_work() -> bool {
     !DEFERRED_IO_URING_WORK.load(Ordering::Acquire).is_null()
+        || !DEFERRED_POLL_CALLBACKS.load(Ordering::Acquire).is_null()
+        || !DEFERRED_POLL_CONTINUATION.load(Ordering::Acquire).is_null()
+}
+
+fn drain_deferred_poll_callbacks() {
+    let mut node = DEFERRED_POLL_CONTINUATION.swap(ptr::null_mut(), Ordering::AcqRel);
+    if node.is_null() {
+        node = DEFERRED_POLL_CALLBACKS.swap(ptr::null_mut(), Ordering::AcqRel);
+    }
+    for _ in 0..POLL_CALLBACK_BUDGET {
+        if node.is_null() {
+            break;
+        }
+        // SAFETY: publication transfers one Arc reference; the queued bit
+        // prevents reuse until we have detached this node's next pointer.
+        let callback = unsafe { Arc::from_raw(node) };
+        let next = callback.deferred_next.swap(ptr::null_mut(), Ordering::AcqRel);
+        callback.deferred_queued.store(false, Ordering::Release);
+        if callback.enabled.load(Ordering::Acquire)
+            && let Some(ring) = callback.ring.upgrade()
+        {
+            let state = ring.state.lock();
+            if state.requests.request(callback.request).is_ok()
+                && callback.enabled.load(Ordering::Acquire)
+            {
+                ring.publish_poll_hint(callback.request);
+            }
+        }
+        node = next;
+    }
+    // Keep the unvisited nodes' queue-owned references and queued bits intact.
+    // has_deferred_io_uring_work schedules another pass; ring/close work gets
+    // its turn now even if sources keep publishing more callbacks.
+    DEFERRED_POLL_CONTINUATION.store(node, Ordering::Release);
 }
 
 pub(crate) fn drain_deferred_io_uring_work() {
+    drain_deferred_poll_callbacks();
     let mut node = DEFERRED_IO_URING_WORK.swap(ptr::null_mut(), Ordering::AcqRel);
     while !node.is_null() {
         // SAFETY: enqueue_deferred transferred exactly one strong reference
@@ -11947,6 +12293,48 @@ mod adapter_state_tests {
     static PHYSICAL_COMPLETION_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
     #[test]
+    fn poll_irq_callbacks_queue_weak_tokens_and_preserve_budget_continuation() {
+        let _context = crate::test_support::scheduler_test_context();
+        let _serial = PHYSICAL_COMPLETION_TEST_LOCK.lock();
+        let layout = SetupRequest::new(2, 0, SetupFlags::NO_SQARRAY)
+            .resolve(FeatureFlags::EMPTY)
+            .unwrap();
+        let ring = IoUring::try_new(layout).unwrap();
+        let request = issue_test_request(&ring).id();
+        let weak = Arc::downgrade(&ring);
+        let mut callbacks = Vec::new();
+        for _ in 0..POLL_CALLBACK_BUDGET + 1 {
+            callbacks.push(Arc::new(PollCallbackState {
+                ring: weak.clone(),
+                request,
+                enabled: AtomicBool::new(true),
+                source_woke: AtomicBool::new(false),
+                deferred_next: AtomicPtr::new(ptr::null_mut()),
+                deferred_queued: AtomicBool::new(false),
+            }));
+        }
+        {
+            let irq_gate = SpinNoIrq::new(());
+            let _irq = irq_gate.lock();
+            for callback in &callbacks {
+                callback.publish_source_wake();
+                callback.publish_source_wake(); // one node per token
+            }
+            assert_eq!(Arc::strong_count(&ring), 1);
+            assert!(!ring.poll_hint_pending.load(Ordering::Acquire));
+        }
+        // The callback queue must not postpone task-context destruction or
+        // upgrade a dead ring when its delayed notifications are dispatched.
+        drop(ring);
+        assert!(weak.upgrade().is_none());
+        drain_deferred_poll_callbacks();
+        assert_eq!(callbacks.iter().filter(|callback| callback.deferred_queued.load(Ordering::Acquire)).count(), 1);
+        assert!(has_deferred_io_uring_work());
+        drain_deferred_poll_callbacks();
+        assert!(callbacks.iter().all(|callback| !callback.deferred_queued.load(Ordering::Acquire)));
+    }
+
+    #[test]
     fn successful_physical_write_reports_logical_bytes_to_cqe() {
         assert_eq!(physical_io_completion_result(Ok(4096)), 4096);
     }
@@ -12090,6 +12478,78 @@ mod adapter_state_tests {
         }
     }
 
+    #[cfg(feature = "io-submit-batch")]
+    struct BatchWakeCount(core::sync::atomic::AtomicUsize);
+
+    #[cfg(feature = "io-submit-batch")]
+    impl alloc::task::Wake for BatchWakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "io-submit-batch")]
+    #[test]
+    fn submission_batch_keeps_cq_visible_and_unrelated_completion_notifies() {
+        let _context = crate::test_support::scheduler_test_context();
+        let layout = SetupRequest::new(4, 0, SetupFlags::NO_SQARRAY)
+            .resolve(FeatureFlags::EMPTY)
+            .unwrap();
+        let ring = IoUring::try_new(layout).unwrap();
+        let wakes = Arc::new(BatchWakeCount(core::sync::atomic::AtomicUsize::new(0)));
+        let waker = core::task::Waker::from(wakes.clone());
+        let _registration = ring.completion_wait.register(&waker).unwrap();
+        let mut batch = SubmissionCompletionBatch::new(&ring);
+        let first = issue_test_request(&ring);
+        let id = first.id();
+        drop(first);
+        ring.complete_request_batched(id, TerminalCause::Completed, 11, 0, &mut batch)
+            .unwrap();
+        assert_eq!(ring.cq_tail.load_acquire(), 1);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+        // Models an independent async producer: it has no batch token.
+        let second = issue_test_request(&ring);
+        ring.complete_issued(second, TerminalCause::Completed, 22, 0)
+            .unwrap();
+        assert_eq!(ring.cq_tail.load_acquire(), 2);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        let _registration = ring.completion_wait.register(&waker).unwrap();
+        // An error cannot discard the first completion's deferred wake.
+        assert!(
+            ring.complete_request_batched(id, TerminalCause::Completed, 0, 0, &mut batch)
+                .is_err()
+        );
+        drop(batch);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(feature = "io-submit-batch")]
+    #[test]
+    fn submission_batch_flushes_at_bounded_size() {
+        let _context = crate::test_support::scheduler_test_context();
+        let layout = SetupRequest::new(32, 0, SetupFlags::NO_SQARRAY)
+            .resolve(FeatureFlags::EMPTY)
+            .unwrap();
+        let ring = IoUring::try_new(layout).unwrap();
+        let wakes = Arc::new(BatchWakeCount(core::sync::atomic::AtomicUsize::new(0)));
+        let waker = core::task::Waker::from(wakes.clone());
+        let _registration = ring.completion_wait.register(&waker).unwrap();
+        let mut batch = SubmissionCompletionBatch::new(&ring);
+        for _ in 0..32 {
+            let request = issue_test_request(&ring);
+            let id = request.id();
+            drop(request);
+            ring.complete_request_batched(id, TerminalCause::Completed, 0, 0, &mut batch)
+                .unwrap();
+        }
+        assert_eq!(ring.cq_tail.load_acquire(), 32);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        assert_eq!(batch.pending, 0);
+    }
+
     fn reserve_test_request_id(ring: &IoUring) -> RequestId {
         let mut state = ring.state.lock();
         let reservation = state
@@ -12109,6 +12569,60 @@ mod adapter_state_tests {
             .unwrap();
         let prepared = state.requests.commit(reservation).unwrap();
         state.requests.issue(prepared).unwrap()
+    }
+
+    #[test]
+    fn owned_publishing_cancel_waits_for_real_completion_and_reuses_slot() {
+        let _context = crate::test_support::scheduler_test_context();
+        for result in [4096, -LinuxError::EIO.code()] {
+            let layout = SetupRequest::new(4, 0, SetupFlags::NO_SQARRAY)
+                .resolve(FeatureFlags::EMPTY).unwrap();
+            let ring = IoUring::try_new(layout).unwrap();
+            let id = {
+                let mut state = ring.state.lock();
+                let reservation = state.requests.reserve(
+                    RequestDescriptor::new(7, RequestOperation::Read),
+                ).unwrap();
+                let prepared = state.requests.commit(reservation).unwrap();
+                let issued = state.requests.issue_with_cancellation_mode(
+                    prepared,
+                    Some(thekernel_linux_io_uring::CancellationMode::ProviderControlled),
+                ).unwrap();
+                let id = issued.id();
+                state.owned_file_io[id.slot() as usize] = Some(OwnedFileIoOwner {
+                    id,
+                    state: OwnedFileIoControlState::Publishing {
+                        generation: id.generation(), bridge: OwnedFileIoBridge { issued },
+                    },
+                    buffer: None,
+                });
+                id
+            };
+            // Pause submit at its unlocked Publishing edge. Exercise the
+            // actual adapter's provider-selector -> generic-cancel fallback.
+            let cancel = issue_test_request(&ring);
+            ring.cancel_request(cancel, 7).unwrap();
+            assert_eq!(ring.cq_tail.load_acquire(), 1); // cancel CQE only
+            {
+                let state = ring.state.lock();
+                assert!(state.owned_file_io[id.slot() as usize].is_some());
+                assert_eq!(state.requests.request(id).unwrap().1,
+                    thekernel_linux_io_uring::RequestState::Issued(
+                        thekernel_linux_io_uring::CancellationMode::ProviderControlled));
+            }
+            // Both a callback made synchronously inside submit and submit's
+            // failure-retirement path reach this same real completion bridge.
+            ring.complete_owned_file_io(id, result);
+            assert!(ring.state.lock().owned_file_io[id.slot() as usize].is_none());
+            assert_eq!(ring.cq_tail.load_acquire(), 2);
+            let replacement = issue_test_request(&ring);
+            assert_eq!(replacement.id().slot(), id.slot());
+            assert_ne!(replacement.id().generation(), id.generation());
+            ring.complete_owned_file_io(id, result);
+            assert_eq!(ring.cq_tail.load_acquire(), 2);
+            ring.complete_issued(replacement, TerminalCause::Completed, 0, 0).unwrap();
+            assert_eq!(ring.cq_tail.load_acquire(), 3);
+        }
     }
 
     fn register_terminal_callback_test_slot(generation: u64) -> usize {
@@ -12443,6 +12957,87 @@ mod adapter_state_tests {
             },
         ));
         assert_eq!(&*order.lock(), &["pin", "charge"]);
+    }
+
+    #[test]
+    fn foreign_world_is_rejected_before_submission_or_buffer_lookup() {
+        let _context = crate::test_support::scheduler_test_context();
+        let layout = SetupRequest::new(2, 0, SetupFlags::NO_SQARRAY)
+            .resolve(FeatureFlags::EMPTY)
+            .unwrap();
+        let ring = IoUring::try_new(layout).unwrap();
+        let world = crate::task::WorldId::FOREIGN_TEST;
+        // A zero-filled SQE is a valid NOP. Publish it before trying the
+        // foreign actor so rejection proves pending work was not consumed.
+        ring.sq_tail.store_release(1);
+        let head = ring.state.lock().sq_head;
+        assert_eq!(ring.admit_world(world), Err(AxError::PermissionDenied));
+        assert!(matches!(
+            ring.prepare_submission(world),
+            Err(AxError::PermissionDenied)
+        ));
+        assert_eq!(ring.state.lock().sq_head, head);
+        // Permission failure must precede descriptor lookup even with no
+        // registered table; a foreign actor cannot probe ring resources.
+        assert!(matches!(
+            ring.acquire_registered_buffer(world, BufferSlot::new(0), 0x1000, 32),
+            Err(AxError::PermissionDenied)
+        ));
+        assert!(matches!(
+            ring.prepare_submission(crate::task::WorldId::BOOT),
+            Ok(SubmissionStep::Admission(_))
+        ));
+    }
+
+    #[test]
+    fn registered_world_owner_waits_for_cancel_and_completion_leases() {
+        let world = Arc::new(crate::task::WorldId::BOOT);
+        let weak = Arc::downgrade(&world);
+        let mut table = RegisteredBufferTable::new(
+            RingId::new(1).unwrap(),
+            BufferTableId::new(1).unwrap(),
+            1,
+            2,
+        )
+        .unwrap();
+        table
+            .install(BufferSlot::new(0), 0x1000, 4096, world)
+            .unwrap();
+        table.publish().unwrap();
+        let cancelled = table.acquire(BufferSlot::new(0), 0x1000, 32).unwrap();
+        let completed = table.acquire(BufferSlot::new(0), 0x1020, 32).unwrap();
+        table.begin_retire().unwrap();
+        assert!(table.acquire(BufferSlot::new(0), 0x1000, 32).is_err());
+        assert!(table.finish_retire().is_err());
+        drop(table.release(cancelled).unwrap());
+        assert_eq!(**completed.owner(), crate::task::WorldId::BOOT);
+        assert!(weak.upgrade().is_some());
+        assert!(table.finish_retire().is_err());
+        drop(table.release(completed).unwrap());
+        table.finish_retire().unwrap();
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn retired_buffer_lease_cannot_recover_world_authority() {
+        let _context = crate::test_support::scheduler_test_context();
+        let layout = SetupRequest::new(2, 0, SetupFlags::NO_SQARRAY)
+            .resolve(FeatureFlags::EMPTY)
+            .unwrap();
+        let ring = IoUring::try_new(layout).unwrap();
+        // The lease's owner is consumed by retirement. Retaining a ring Arc
+        // must not make an already consumed buffer usable again.
+        let lease = IoUringBufferLease {
+            ring: ring.clone(),
+            owner: IoUringBufferLeaseOwner::Registered(None),
+            provided_return_on_drop: true,
+        };
+        assert_eq!(lease.validate_world(ring.world), Err(AxError::BadState));
+        assert_eq!(lease.range(), Err(AxError::BadState));
+        assert!(matches!(lease.capability(), Err(AxError::BadState)));
+        ring.request_final_close();
+        assert_eq!(ring.world, crate::task::WorldId::BOOT);
+        assert_eq!(lease.validate_world(ring.world), Err(AxError::BadState));
     }
 
     #[test]
@@ -13120,6 +13715,63 @@ mod adapter_state_tests {
         ));
         assert!(lookup_physical_completion_route(0xA11CE).is_none());
         assert!(lookup_physical_completion_route(0xB0B).is_none());
+    }
+
+    #[test]
+    fn terminal_route_mismatch_retains_work_and_issued_proof_without_cqe() {
+        let _router = PHYSICAL_COMPLETION_TEST_LOCK.lock();
+        let _context = crate::test_support::scheduler_test_context();
+        let layout = SetupRequest::new(2, 0, SetupFlags::NO_SQARRAY)
+            .resolve(FeatureFlags::EMPTY)
+            .unwrap();
+        let ring = IoUring::try_new(layout).unwrap();
+        let issued = issue_test_request(&ring);
+        let request = issued.id();
+        let route = PhysicalCompletionRouteReservation::new(1).unwrap();
+        route.activate_test(&ring, request, 0, 0xA100);
+        {
+            let mut state = ring.state.lock();
+            state.physical_work_count = 1;
+            state.physical_slot_reserved[0] = true;
+        }
+        let work = PhysicalIoWork {
+            ring: Arc::clone(&ring),
+            slot: 0,
+            issued: Some(issued),
+            admission: None,
+            pending_publication: false,
+            test_handle: Some(0xA100),
+        };
+        assert!(matches!(
+            ring.release_terminal_physical_routes(work, Some(0xA101)),
+            Err(AxError::BadState)
+        ));
+        assert_eq!(PHYSICAL_COMPLETION_ROUTER.lock().work_count, 1);
+        let work = {
+            let mut state = ring.state.lock();
+            assert_eq!(state.physical_work_count, 1);
+            assert!(state.physical_slot_reserved[0]);
+            assert_eq!(state.requests.progress().unwrap().completion_pending(), 0);
+            let work = state
+                .physical_custody
+                .iter_mut()
+                .find_map(Option::take)
+                .unwrap();
+            assert!(state.requests.issued_is_live(work.issued().unwrap()));
+            work
+        };
+        // The exact handle can retire the quarantined route, preserving the
+        // issued proof until the caller performs the terminal transition.
+        let mut work = ring
+            .release_terminal_physical_routes(work, Some(0xA100))
+            .unwrap();
+        let issued = work.take_issued().unwrap();
+        drop(work);
+        assert_eq!(PHYSICAL_COMPLETION_ROUTER.lock().work_count, 0);
+        assert_eq!(ring.state.lock().physical_work_count, 0);
+        ring.complete_issued(issued, TerminalCause::Completed, 4096, 0)
+            .unwrap();
+        assert_eq!(ring.cq_tail.load_acquire(), 1);
     }
 
     #[test]

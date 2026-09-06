@@ -1,0 +1,19 @@
+[package]
+name = "thekernel-axbpf"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["TheKernel contributors"]
+description = "Policy-neutral, capability-safe eBPF verifier and interpreter"
+license = "Apache-2.0"
+repository = "https://github.com/chenty2333/thekernel-ax"
+
+[lib]
+name = "axbpf"
+path = "src/lib.rs"
+
+[dependencies]
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
+
+[package.metadata.thekernel]
+layer = "mechanism"

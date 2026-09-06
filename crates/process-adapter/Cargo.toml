@@ -15,3 +15,6 @@ path = "src/lib.rs"
 
 [dependencies]
 thekernel-linux-process.workspace = true
+
+[package.metadata.thekernel]
+layer = "integration"

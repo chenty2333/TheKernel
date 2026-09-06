@@ -252,6 +252,12 @@ mod tests {
         }
     }
 
+    impl axio::IoBuf for SliceDestination {
+        fn remaining(&self) -> usize {
+            self.remaining
+        }
+    }
+
     impl IoBufMut for SliceDestination {
         fn remaining_mut(&self) -> usize {
             self.remaining

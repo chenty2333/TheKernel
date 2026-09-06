@@ -17,7 +17,7 @@ use crate::{
     },
     mm::{UserMemoryCapability, map_usercopy_error},
     perf_security::{
-        PerfAuthority, authorize_open, authorize_sampling_rate, perf_mlock_limit_bypassed_at_open,
+        PerfAuthority, authorize_open, authorize_sampling_rate,
     },
     pmu_registry::{DynamicPmu, dynamic_pmu},
     task::{
@@ -498,6 +498,7 @@ fn perf_capabilities(exact_aux: bool) -> PerfCapabilities {
             | linux_perf::ATTR_TASK
             | linux_perf::ATTR_SAMPLE_ID_ALL
             | linux_perf::ATTR_FREQ
+            | linux_perf::ATTR_USE_CLOCKID
             | linux_perf::ATTR_WATERMARK
             | if exact_aux {
                 linux_perf::ATTR_PRECISE_IP
@@ -680,7 +681,8 @@ pub(crate) fn perf_plan(
         || attr_plan.extensions.config4 != 0
         || attr_plan.extensions.sample_regs_user != 0
         || attr_plan.extensions.sample_stack_user != 0
-        || attr_plan.extensions.clockid.is_some()
+        || (attr.flags & linux_perf::ATTR_USE_CLOCKID != 0
+            && attr_plan.extensions.clockid != Some(linux_raw_sys::general::CLOCK_MONOTONIC as i32))
         || attr_plan.extensions.sample_regs_intr != 0
         || attr_plan.extensions.sample_max_stack != 0
         || attr_plan.extensions.sig_data != 0
@@ -688,6 +690,10 @@ pub(crate) fn perf_plan(
         return Err(AxError::OperationNotSupported);
     }
 
+    // The timestamp backend already implements the admitted monotonic clock.
+    // The V0 record planner has no clock field; do not ask it to interpret
+    // the extension a second time after the complete planner validated it.
+    schema_attr.flags &= !linux_perf::ATTR_USE_CLOCKID;
     let v0 = PerfEventAttrV0::from(schema_attr);
     let legacy = if let Some(plan) = dynamic_source_plan(
         schema_attr,
@@ -721,7 +727,13 @@ pub(crate) fn perf_plan(
                 read_format: linux_perf::PERF_FORMAT_IMPLEMENTED,
                 open_flags: capabilities.open_flags,
                 sample_type: capabilities.sample_type,
-                min_sample_period: 4096,
+                // Software/tracepoint periods count source occurrences and
+                // must allow one record per edge. Only hardware overflows
+                // need the counter interrupt-rate floor.
+                min_sample_period: if matches!(
+                    schema_attr.event_type,
+                    linux_perf::PERF_TYPE_SOFTWARE | linux_perf::PERF_TYPE_TRACEPOINT
+                ) { 1 } else { 4096 },
                 max_wakeup_events: u32::MAX,
                 sampling_read_format: linux_perf::PERF_FORMAT_IMPLEMENTED,
                 sampling_requires_zero_config1: true,
@@ -794,7 +806,6 @@ fn open_sampling(
                 (group, false)
             } else {
                 let group = PerfGroup::new_for_context(context, id)?;
-                PerfGroup::attach_cpu_context(&group)?;
                 (group, true)
             };
             (group, 0, attached_cpu_context)
@@ -811,7 +822,6 @@ fn open_sampling(
                 (group, false)
             } else {
                 let group = PerfGroup::new_for_context(context, id)?;
-                PerfGroup::attach_cpu_context(&group)?;
                 (group, true)
             };
             (group, 0, attached_cpu_context)
@@ -820,7 +830,12 @@ fn open_sampling(
             let task = if pid == 0 {
                 current().clone()
             } else {
-                get_visible_task(pid as u32)?
+                let tid = current()
+                    .as_thread()
+                    .pid_ns()
+                    .resolve_visible_pid(pid as u32)
+                    .ok_or(AxError::NoSuchProcess)?;
+                get_visible_task(tid)?
             };
             target_task = Some(task.clone());
             check_current_thread_ptrace_image_access(task.as_thread(), PtraceAccessMode::ReadReal)?;
@@ -842,7 +857,6 @@ fn open_sampling(
                 (group, false)
             } else {
                 let group = PerfGroup::new_for_context(context, id)?;
-                task.as_thread().attach_perf_group(group.clone())?;
                 attached_task = Some(task.clone());
                 (group, false)
             };
@@ -1000,8 +1014,6 @@ fn open_sampling(
             count_kernel: !plan.exclude_kernel,
             disabled: plan.disabled,
             read_format: plan.read.bits(),
-            mlock_owner: crate::perf_security::PerfMlockOwner::current(),
-            mlock_limit_bypassed: perf_mlock_limit_bypassed_at_open(),
             aux,
             identity: crate::file::perf_sampling::PerfOpenIdentity {
                 attr,
@@ -1078,6 +1090,13 @@ fn open_sampling(
             }
             return Err(error);
         }
+    }
+    // Publish only after the first member exists. Scheduler registry pruning
+    // must never observe a newly opened group as empty during construction.
+    if let Some(task) = attached_task.as_ref() {
+        task.as_thread().attach_perf_group(group.clone())?;
+    } else if attached_cpu_context {
+        PerfGroup::attach_cpu_context(&group)?;
     }
     match add_file_like(file as Arc<dyn crate::file::FileLike>, plan.close_on_exec) {
         Ok(fd) => {
@@ -1409,7 +1428,6 @@ pub(crate) fn sys_perf_event_open(
         let id = NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed);
         let (group, attached_cpu_context) = if group_fd == -1 {
             let group = PerfGroup::new_for_context(context, id)?;
-            PerfGroup::attach_cpu_context(&group)?;
             (group, true)
         } else {
             if flags & PERF_FLAG_FD_NO_GROUP != 0 {
@@ -1442,6 +1460,9 @@ pub(crate) fn sys_perf_event_open(
             }
         };
         install_probe_query_name(&file, &mut lowered);
+        if attached_cpu_context {
+            PerfGroup::attach_cpu_context(&group)?;
+        }
         return match add_file_like(file as Arc<dyn crate::file::FileLike>, plan.close_on_exec) {
             Ok(fd) => Ok(fd as isize),
             Err(error) => {
@@ -1478,7 +1499,6 @@ pub(crate) fn sys_perf_event_open(
         let id = NEXT_PERF_EVENT_ID.fetch_add(1, Ordering::Relaxed);
         let (group, attached_cpu_context) = if group_fd == -1 {
             let group = PerfGroup::new_for_context(context, id)?;
-            PerfGroup::attach_cpu_context(&group)?;
             (group, true)
         } else {
             if flags & PERF_FLAG_FD_NO_GROUP != 0 {
@@ -1511,6 +1531,9 @@ pub(crate) fn sys_perf_event_open(
             }
         };
         install_probe_query_name(&file, &mut lowered);
+        if attached_cpu_context {
+            PerfGroup::attach_cpu_context(&group)?;
+        }
         return match add_file_like(file as Arc<dyn crate::file::FileLike>, plan.close_on_exec) {
             Ok(fd) => Ok(fd as isize),
             Err(error) => {
@@ -1531,7 +1554,12 @@ pub(crate) fn sys_perf_event_open(
     let target_task = if target_is_current {
         current().clone()
     } else {
-        get_visible_task(pid as u32)?
+        let tid = current()
+            .as_thread()
+            .pid_ns()
+            .resolve_visible_pid(pid as u32)
+            .ok_or(AxError::NoSuchProcess)?;
+        get_visible_task(tid)?
     };
     // perf's task attachment has ptrace-style credential access semantics.
     check_current_thread_ptrace_image_access(target_task.as_thread(), PtraceAccessMode::ReadReal)?;
@@ -1701,9 +1729,6 @@ pub(crate) fn sys_perf_event_open(
     {
         return Err(AxError::OperationNotSupported);
     }
-    // The target retains the only long-lived group Arc before the file takes
-    // its weak back-reference. Every failure below removes an empty group.
-    target_task.as_thread().attach_perf_group(group.clone())?;
     let file = match PerfEventFile::new_with_lifecycle_placement_domains(
         id,
         event,
@@ -1752,6 +1777,9 @@ pub(crate) fn sys_perf_event_open(
             return Err(error);
         }
     }
+    // The live member prevents a scheduler edge from pruning the group
+    // between registry publication and descriptor installation.
+    target_task.as_thread().attach_perf_group(group.clone())?;
     let result = add_file_like(file as Arc<dyn crate::file::FileLike>, plan.close_on_exec);
     match result {
         Ok(fd) => {
@@ -1774,6 +1802,67 @@ mod tests {
 
     use super::{PERF_ATTR_MAX_SIZE, PERF_ATTR_SIZE_VER0, attr_copy_len, validate_extension_bytes};
     use crate::file::PerfGroup;
+
+    #[cfg(feature = "perf-sampling")]
+    #[test]
+    fn scheduler_tracepoint_can_sample_every_edge_with_monotonic_time() {
+        let _context = crate::test_support::scheduler_test_context();
+        let attr = super::PerfEventAttr {
+            event_type: thekernel_linux_perf::PERF_TYPE_TRACEPOINT,
+            config: crate::perf_sources::SCHED_WAKEUP_TRACEPOINT_ID,
+            read_format: thekernel_linux_perf::PERF_FORMAT_LOST,
+            sample_period: 1,
+            sample_type: thekernel_linux_perf::PERF_SAMPLE_TIME | thekernel_linux_perf::PERF_SAMPLE_RAW,
+            flags: thekernel_linux_perf::ATTR_USE_CLOCKID,
+            clockid: linux_raw_sys::general::CLOCK_MONOTONIC as i32,
+            ..super::PerfEventAttr::default()
+        };
+        let target = super::PerfOpenTarget {
+            target: super::PerfTarget::Cpu { cpu: 0 },
+            group_fd: -1,
+            output_fd: -1,
+            open_flags: 0,
+        };
+        let (_, plan) = super::perf_plan(attr, thekernel_linux_perf::PERF_ATTR_SIZE_VER3, &[], target).unwrap();
+        assert_eq!(plan.sample.unwrap().period, 1);
+        // The collector uses byte-watermark wakeups; zero event-count wakeups
+        // above remain a separate valid Linux configuration.
+        let collector = super::PerfEventAttr {
+            flags: attr.flags | thekernel_linux_perf::ATTR_WATERMARK,
+            wakeup_events: 64 * 4096 / 2,
+            ..attr
+        };
+        let (schema, _) = super::perf_plan(collector, thekernel_linux_perf::PERF_ATTR_SIZE_VER9, &[], target).unwrap();
+        assert_eq!(schema.wakeup, thekernel_linux_perf::Wakeup::Watermark(131072));
+    }
+
+    #[test]
+    fn perf_clock_selection_accepts_only_the_monotonic_backend_clock() {
+        let _context = crate::test_support::scheduler_test_context();
+        let target = super::PerfOpenTarget {
+            target: super::PerfTarget::Task { pid: 0, cpu: -1 },
+            group_fd: -1,
+            output_fd: -1,
+            open_flags: 0,
+        };
+        let mut attr = super::PerfEventAttr {
+            event_type: thekernel_linux_perf::PERF_TYPE_SOFTWARE,
+            config: thekernel_linux_perf::PERF_COUNT_SW_CPU_CLOCK,
+            flags: thekernel_linux_perf::ATTR_USE_CLOCKID,
+            clockid: linux_raw_sys::general::CLOCK_MONOTONIC as i32,
+            ..super::PerfEventAttr::default()
+        };
+        assert!(super::perf_plan(attr, thekernel_linux_perf::PERF_ATTR_SIZE_VER3, &[], target).is_ok());
+        for clockid in [-1, 0, 2, 4, 7] {
+            attr.clockid = clockid;
+            assert!(matches!(
+                super::perf_plan(attr, thekernel_linux_perf::PERF_ATTR_SIZE_VER3, &[], target),
+                Err(AxError::OperationNotSupported),
+            ));
+        }
+        attr.flags = 0;
+        assert!(super::perf_plan(attr, thekernel_linux_perf::PERF_ATTR_SIZE_VER3, &[], target).is_ok());
+    }
 
     #[test]
     fn perf_group_binds_leader_and_target_task() {
@@ -1827,9 +1916,12 @@ mod tests {
     #[test]
     fn source_sampling_never_accepts_pebs_or_lbr_only_fields() {
         use thekernel_linux_perf::{
-            ATTR_PRECISE_IP, PERF_SAMPLE_ADDR, PERF_SAMPLE_BRANCH_STACK, PERF_SAMPLE_DATA_SRC,
-            PerfEventAttr,
+            PERF_SAMPLE_ADDR, PERF_SAMPLE_BRANCH_STACK, PERF_SAMPLE_DATA_SRC, PerfEventAttr,
         };
+
+        // ATTR_PRECISE_IP is the two-bit field mask (levels 1..3), while the
+        // backend accepts only the level-1 PEBS guarantee.
+        const PRECISE_IP_LEVEL1: u64 = 1 << 15;
 
         let source = crate::file::perf_sampling::SamplingEvent::Source;
         let hardware = crate::file::perf_sampling::SamplingEvent::Cycles;
@@ -1845,7 +1937,7 @@ mod tests {
             assert!(!super::sampling_fields_supported_by_backend(&attr, source));
         }
         let precise = PerfEventAttr {
-            flags: ATTR_PRECISE_IP,
+            flags: PRECISE_IP_LEVEL1,
             ..PerfEventAttr::default()
         };
         assert!(!super::sampling_fields_supported_by_backend(
@@ -1853,11 +1945,19 @@ mod tests {
         ));
 
         let pebs = PerfEventAttr {
-            flags: ATTR_PRECISE_IP,
+            flags: PRECISE_IP_LEVEL1,
             sample_type: PERF_SAMPLE_ADDR | PERF_SAMPLE_DATA_SRC,
             ..PerfEventAttr::default()
         };
         assert!(super::sampling_fields_supported_by_backend(&pebs, hardware));
+        let overprecise = PerfEventAttr {
+            flags: thekernel_linux_perf::ATTR_PRECISE_IP,
+            sample_type: PERF_SAMPLE_ADDR | PERF_SAMPLE_DATA_SRC,
+            ..PerfEventAttr::default()
+        };
+        assert!(!super::sampling_fields_supported_by_backend(
+            &overprecise, hardware
+        ));
         let inexact = PerfEventAttr {
             sample_type: PERF_SAMPLE_ADDR | PERF_SAMPLE_DATA_SRC,
             ..PerfEventAttr::default()

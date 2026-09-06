@@ -4,9 +4,8 @@
 from __future__ import annotations
 
 import argparse
-import glob as glob_module
-import hashlib
 import math
+import json
 import os
 import re
 import shutil
@@ -21,7 +20,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.ktap import COMPLETION_MARKER, KtapError, reject_ktap_skips
+from tools.product_state import (
+    Artifacts, Variant, ProductError, TARGET, PLATFORM, MEMORY_RE,
+    state_root, validate_storage, state_lock, serialized_build, isolated_run,
+    artifact_config_stamp, artifact_config_key, artifact_input_key, validate_artifact_config,
+    rootfs_stamp_path, rootfs_fingerprint,
+)
+from tools.verification import verify_cmd
+from tools.ktap import COMPLETION_MARKER, KtapError, reject_ktap_skips, validate_ktap_log
 from tools.qemu_runner import (
     Interaction,
     ProcessError,
@@ -31,17 +37,18 @@ from tools.qemu_runner import (
     run,
 )
 from tools.qemu_runner.model import QmpCheckpoint, QmpColorBlock, QmpControls
+from tools.qemu_runner.runner import _validate_output_destinations
 from tools.qemu_runner.graphics_benchmark import (
     BENCHMARK_COMPLETE_MARKER,
     benchmark_checkpoints,
     renderer_for_profile,
 )
 from tools.qemu_runner.graphics_metrics import GraphicsMetricError, enforce_graphics_metrics, parse_graphics_metrics
+from tools.qemu_runner.kernel_benchmark import BenchmarkConfig, BenchmarkTarget, run_benchmark_experiment
+from tools.qemu_runner.abi_differential import AbiConfig, CONTRACTS as ABI_CONTRACTS, run_abi_differential
 from tools.qemu_runner.profiles import BENCHMARK_FAULTS, BENCHMARK_PROFILES, GRAPHICS_PROFILES
 
 
-TARGET = "x86_64-unknown-none"
-PLATFORM = "x86-pc"
 PRODUCT_FEATURE = "x86-product"
 PRODUCT_MAX_CPUS = 4
 SYSTEM_TEST_SHUTDOWN_COMMANDS = "/bin/busybox poweroff -f\nexit\n"
@@ -55,104 +62,14 @@ Q35_HIGH_MEMORY_BASE = 4 * GIB
 # Keep generated x86_64 physical-memory maps comfortably below the canonical
 # 48-bit physical-address envelope while allowing a high-RAM Q35 guest.
 X86_64_MAX_MEMORY_BYTES = 1 << 46
-MEMORY_RE = re.compile(r"([1-9][0-9]*)([KMG])", re.IGNORECASE)
-
-
-class ProductError(RuntimeError):
-    """Raised for an invalid or failed product operation."""
-
-
-def state_root() -> Path:
-    configured = os.environ.get("THEKERNEL_STATE_DIR", "").strip()
-    # Product artifacts are intentionally outside the checkout.  Apart from
-    # keeping the tree clean, this keeps all large, regenerable targets on the
-    # host filesystem rather than a transient mount.
-    state = (
-        Path(configured).expanduser()
-        if configured
-        else Path.home() / ".cache" / "thekernel-targets"
-    )
-    if not state.is_absolute():
-        state = REPO_ROOT / state
-    return state.resolve()
-
-
-@dataclass(frozen=True)
-class Variant:
-    memory: str
-    asid_fast_switch: bool = False
-
-    @property
-    def memory_bytes(self) -> int:
-        match = MEMORY_RE.fullmatch(self.memory)
-        assert match is not None
-        value = int(match.group(1))
-        shift = {"K": 10, "M": 20, "G": 30}[match.group(2).upper()]
-        return value << shift
-
-    @property
-    def name(self) -> str:
-        suffix = "-asid-fast-switch" if self.asid_fast_switch else ""
-        return f"mem{self.memory.lower()}{suffix}"
-
-
-@dataclass(frozen=True)
-class Artifacts:
-    root: Path
-    variant: Variant
-    profile: str = "system"
-
-    @property
-    def output_dir(self) -> Path:
-        return self.root / "out" / "x86_64" / "q35-uefi" / self.profile / self.variant.name
-
-    @property
-    def cargo_target_dir(self) -> Path:
-        return self.root / "target" / "thekernel" / "x86_64" / "q35-uefi" / self.profile / self.variant.name
-
-    @property
-    def config_path(self) -> Path:
-        return self.cargo_target_dir / "config" / "axconfig.toml"
-
-    @property
-    def linker_script(self) -> Path:
-        return self.cargo_target_dir / TARGET / "release" / f"linker_{PLATFORM}.lds"
-
-    @property
-    def cargo_elf(self) -> Path:
-        return self.cargo_target_dir / TARGET / "release" / "thekernel"
-
-    @property
-    def kernel(self) -> Path:
-        return self.output_dir / "kernel-x86_64"
-
-    @property
-    def esp(self) -> Path:
-        return self.output_dir / "kernel-x86_64.esp"
-
-    @property
-    def drive_esp(self) -> Path:
-        """UEFI ESP for a rootfs supplied exclusively as virtio-blk."""
-
-        return self.output_dir / "kernel-x86_64-drive.esp"
-
-    def esp_for_rootfs_transport(self, rootfs_transport: str) -> Path:
-        if rootfs_transport == "module":
-            return self.esp
-        if rootfs_transport == "drive":
-            return self.drive_esp
-        raise ProductError(f"unsupported product rootfs transport: {rootfs_transport}")
-
-    @property
-    def rootfs(self) -> Path:
-        return self.root / "out" / "rootfs" / "x86" / "rootfs-x86.img"
 
 
 def parse_variant(args: argparse.Namespace) -> Variant:
     memory = args.memory.upper()
     if not MEMORY_RE.fullmatch(memory):
         raise ProductError(f"--memory must be a positive K/M/G size: {args.memory}")
-    variant = Variant(memory=memory, asid_fast_switch=args.asid_fast_switch)
+    variant = Variant(memory=memory, asid_fast_switch=args.asid_fast_switch,
+                      m5_candidate=getattr(args, "m5_candidate", False))
     if variant.memory_bytes <= KERNEL_LOAD_PADDR:
         raise ProductError("--memory must extend beyond the 2 MiB kernel load address")
     if variant.memory_bytes > X86_64_MAX_MEMORY_BYTES:
@@ -198,14 +115,15 @@ def command_env(artifacts: Artifacts) -> dict[str, str]:
         "-C force-frame-pointers -C debuginfo=2 -C strip=none"
     )
     inherited_rustflags = os.environ.get("RUSTFLAGS", "").strip()
-    return {
+    env = {
         **os.environ,
+        "CARGO_BUILD_JOBS": os.environ.get("CARGO_BUILD_JOBS") or "2",
         "AX_ARCH": "x86_64",
         "AX_PLATFORM": PLATFORM,
         "AX_MODE": "release",
-        # Debugging aid: AX_LOG=debug ./tools/thekernel.py run ... rebuilds
-        # with kernel logging instead of the silent product default.
-        "AX_LOG": os.environ.get("AX_LOG") or "off",
+        # Retain useful diagnostics by default. Kernel logs use COM2 and
+        # never enter the interactive COM1 terminal.
+        "AX_LOG": os.environ.get("AX_LOG") or "info",
         "AX_BACKTRACE": os.environ.get("AX_BACKTRACE") or "n",
         # QEMU user networking's fixed product subnet.  axnet-ng consumes
         # these at compile time and rejects an absent address at boot.
@@ -221,6 +139,10 @@ def command_env(artifacts: Artifacts) -> dict[str, str]:
             part for part in (inherited_rustflags, target_rustflags) if part
         ),
     }
+    # Cargo gives this variable precedence over RUSTFLAGS, including the
+    # product's required linker script. Accept custom flags via RUSTFLAGS only.
+    env.pop("CARGO_ENCODED_RUSTFLAGS", None)
+    return env
 
 
 def run_checked(argv: list[str], *, env: dict[str, str] | None = None) -> None:
@@ -306,9 +228,12 @@ def kernel_features(artifacts: Artifacts) -> str:
         features.append("boot-shell")
     if variant.asid_fast_switch:
         features.append("asid-fast-switch")
+    if variant.m5_candidate:
+        features.extend(("sched-wake-locality", "io-submit-batch"))
     return " ".join(features)
 
 
+@serialized_build
 def build_kernel(
     artifacts: Artifacts,
     *,
@@ -320,6 +245,8 @@ def build_kernel(
         raise ProductError("rootfs is required before building the UEFI ESP")
     if rootfs_transport not in {"module", "drive"}:
         raise ProductError(f"unsupported product rootfs transport: {rootfs_transport}")
+    artifact_config_stamp(artifacts, rootfs_transport).unlink(missing_ok=True)
+    build_inputs = artifact_input_key(artifacts, rootfs, rootfs_transport)
     generate_config(artifacts)
     env = command_env(artifacts)
     run_checked(
@@ -342,21 +269,24 @@ def build_kernel(
     if not artifacts.cargo_elf.is_file():
         raise ProductError(f"Cargo did not produce the expected ELF: {artifacts.cargo_elf}")
     artifacts.output_dir.mkdir(parents=True, exist_ok=True)
+    staged_kernel = artifacts.kernel.with_name(artifacts.kernel.name + ".tmp")
+    staged_kernel.unlink(missing_ok=True)
     run_checked(
-        [str(llvm_objcopy()), "--strip-all", str(artifacts.cargo_elf), str(artifacts.kernel)],
+        [str(llvm_objcopy()), "--strip-all", str(artifacts.cargo_elf), str(staged_kernel)],
         env=env,
     )
-    if not artifacts.kernel.is_file() or artifacts.kernel.stat().st_size == 0:
-        raise ProductError(f"kernel output is empty: {artifacts.kernel}")
-    if artifacts.kernel.stat().st_size > MAX_KERNEL_BYTES:
-        raise ProductError(f"kernel exceeds {MAX_KERNEL_BYTES} bytes: {artifacts.kernel}")
+    if not staged_kernel.is_file() or staged_kernel.stat().st_size == 0:
+        raise ProductError(f"kernel output is empty: {staged_kernel}")
+    if staged_kernel.stat().st_size > MAX_KERNEL_BYTES:
+        raise ProductError(f"kernel exceeds {MAX_KERNEL_BYTES} bytes: {staged_kernel}")
     low_ram_bytes = min(artifacts.variant.memory_bytes, Q35_PCI_HOLE_LOW_RAM_LIMIT)
-    if KERNEL_LOAD_PADDR + artifacts.kernel.stat().st_size > low_ram_bytes:
+    if KERNEL_LOAD_PADDR + staged_kernel.stat().st_size > low_ram_bytes:
         raise ProductError(
             "kernel does not fit below the q35 PCI hole "
             f"({low_ram_bytes // (1024 * 1024)} MiB of low RAM)"
         )
-    run_checked(["bash", str(REPO_ROOT / "scripts" / "check-x86-multiboot.sh"), str(artifacts.kernel)], env=env)
+    run_checked(["bash", str(REPO_ROOT / "scripts" / "check-x86-multiboot.sh"), str(staged_kernel)], env=env)
+    staged_kernel.replace(artifacts.kernel)
     esp_command = [
         "bash",
         str(REPO_ROOT / "scripts" / "build-x86-uefi-esp.sh"),
@@ -376,50 +306,12 @@ def build_kernel(
             "--grub-config", str(REPO_ROOT / "config" / "x86_64" / "grub-drive.cfg"),
         ))
     run_checked(esp_command, env=env)
+    if artifact_input_key(artifacts, rootfs, rootfs_transport) != build_inputs:
+        raise ProductError("kernel configuration or rootfs changed during build; rebuild before running")
+    artifact_config_stamp(artifacts, rootfs_transport).write_text(artifact_config_key(artifacts, rootfs, rootfs_transport) + "\n")
 
 
-# Inputs that change the published rootfs image.  The BusyBox version and
-# download URL live in build-rootfs.sh itself, so hashing the script covers
-# them.
-ROOTFS_INPUT_FILES = (
-    "scripts/build-rootfs.sh",
-    "scripts/create-rootfs-image.sh",
-    "tests/guest/shell-init.sh",
-    "tests/guest/system-init.c",
-)
-ROOTFS_INPUT_GLOBS = (
-    "tests/rootfs/busybox-*.config",
-    "tests/guest/tools/*.c",
-    "tests/guest/portable/*.c",
-)
-# Environment switches that change the toolchain or image ownership.
-ROOTFS_INPUT_ENV = (
-    "THEKERNEL_X86_CROSS_COMPILE",
-    "THEKERNEL_USE_LOCAL_MUSL",
-    "THEKERNEL_MUSL_ROOT",
-    "THEKERNEL_ROOTFS_OWNER_MODE",
-)
-
-
-def rootfs_stamp_path(artifacts: Artifacts) -> Path:
-    return artifacts.rootfs.with_name(artifacts.rootfs.name + ".stamp")
-
-
-def rootfs_fingerprint() -> str:
-    digest = hashlib.sha256()
-    inputs = [REPO_ROOT / relative for relative in ROOTFS_INPUT_FILES]
-    for pattern in ROOTFS_INPUT_GLOBS:
-        inputs.extend(
-            Path(path) for path in sorted(glob_module.glob(str(REPO_ROOT / pattern)))
-        )
-    for path in inputs:
-        digest.update(path.name.encode())
-        digest.update(path.read_bytes())
-    for name in ROOTFS_INPUT_ENV:
-        digest.update(f"{name}={os.environ.get(name, '')}".encode())
-    return digest.hexdigest()
-
-
+@serialized_build
 def build_rootfs(artifacts: Artifacts) -> None:
     artifacts.rootfs.parent.mkdir(parents=True, exist_ok=True)
     fingerprint = rootfs_fingerprint()
@@ -431,6 +323,7 @@ def build_rootfs(artifacts: Artifacts) -> None:
     ):
         print(f"thekernel: rootfs unchanged, reusing {artifacts.rootfs}", file=sys.stderr)
         return
+    stamp.unlink(missing_ok=True)
     env = {
         **os.environ,
         "THEKERNEL_SOURCE_CACHE": str(artifacts.root / "source-cache"),
@@ -446,9 +339,12 @@ def build_rootfs(artifacts: Artifacts) -> None:
         ],
         env=env,
     )
+    if rootfs_fingerprint() != fingerprint:
+        raise ProductError("rootfs build inputs changed during compilation; rebuild before running")
     stamp.write_text(fingerprint + "\n", encoding="utf-8")
 
 
+@serialized_build
 def lint_kernel(artifacts: Artifacts) -> None:
     generate_config(artifacts)
     run_checked(
@@ -471,7 +367,9 @@ def lint_kernel(artifacts: Artifacts) -> None:
             kernel_features(artifacts),
             "--",
             "-D",
-            "warnings",
+            "clippy::correctness",
+            "-D",
+            "clippy::suspicious",
             "-A",
             "dead-code",
             "-A",
@@ -481,15 +379,6 @@ def lint_kernel(artifacts: Artifacts) -> None:
         ],
         env=command_env(artifacts),
     )
-
-
-def prune_run_dirs(runs_root: Path, keep: Path) -> None:
-    # Auto-prune keeps only the run directory it just created; interactive
-    # concurrent runs are not supported by this scheme.
-    for entry in runs_root.iterdir():
-        if entry == keep or not entry.is_dir():
-            continue
-        shutil.rmtree(entry, ignore_errors=True)
 
 
 @dataclass(frozen=True)
@@ -505,7 +394,11 @@ class RunSpec:
     commands: Path | None
     extra_block: Path | None
     run_cpus: int
+    qemu_debug: str | None = None
+    gdb: bool = False
+    failure_prefixes: tuple[str, ...] = ()
     shutdown_after_marker: bool = False
+    completion_after_shutdown: str | None = None
     reject_ktap_skips: bool = False
     graphics_profile: str = "headless"
     rootfs: Path | None = None
@@ -520,6 +413,7 @@ class RunSpec:
     graphics_height: int = 600
 
 
+@isolated_run
 def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
     try:
         selected_esp = artifacts.esp_for_rootfs_transport(spec.rootfs_transport)
@@ -529,18 +423,21 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
         raise ProductError("kernel and ESP are required; run `thekernel.py build` first")
     selected_rootfs = spec.rootfs if spec.rootfs is not None else artifacts.rootfs
     if not selected_rootfs.is_file():
-        raise ProductError("rootfs is required; run `thekernel.py rootfs` first")
+        raise ProductError("rootfs is required; run `thekernel.py build` first")
     if spec.workdir is not None:
         run_dir = spec.workdir.expanduser().resolve()
     else:
         runs_root = artifacts.root / "runs"
         runs_root.mkdir(parents=True, exist_ok=True)
         run_dir = Path(tempfile.mkdtemp(prefix=f"{artifacts.profile}-", dir=runs_root))
-        prune_run_dirs(runs_root, run_dir)
+        # Each invocation owns its directory; clean removes completed runs.
+    validate_storage(run_dir)
     try:
         run_dir.mkdir(parents=True, exist_ok=True)
     except OSError as error:
         raise ProductError(f"cannot create run directory: {error}") from error
+    if spec.gdb:
+        print(f"GDB socket: {run_dir / 'gdb.sock'}", file=sys.stderr, flush=True)
     interactive = spec.interactive
     input_after_marker = spec.input_after_marker
     command_path = None
@@ -584,7 +481,10 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             interaction=Interaction(
                 interactive=interactive or command_path is not None,
                 input_after_marker=input_after_marker,
+                input_line_after_marker=("THEKERNEL_SHELL_READY"
+                    if spec.commands is not None and artifacts.profile == "shell" else None),
                 stop_after_marker=spec.stop_after_marker,
+                failure_prefixes=spec.failure_prefixes,
             ),
             memory=artifacts.variant.memory,
             cpus=spec.run_cpus,
@@ -592,10 +492,15 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             graphics_profile=spec.graphics_profile,
             graphics_width=spec.graphics_width,
             graphics_height=spec.graphics_height,
+            extra_args=(("-d", spec.qemu_debug, "-D", str(run_dir / "qemu-debug.log"))
+                        if spec.qemu_debug else ()) + (
+                ("-gdb", f"unix:{run_dir / 'gdb.sock'},server=on,wait=off",
+                 "-action", "reboot=shutdown,shutdown=pause,panic=pause") if spec.gdb else ()),
             qmp=qmp,
         ),
     )
-    print(f"qemu-runner exit={result.returncode} log={result.log_path}", file=sys.stderr)
+    print(f"qemu-runner exit={result.returncode} log={result.log_path} "
+          f"diagnostics={result.diagnostic_log_path}", file=sys.stderr)
     if result.error_message is not None:
         print(f"qemu-runner error={result.error_message}", file=sys.stderr)
     if spec.stop_after_marker is not None:
@@ -606,8 +511,17 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             file=sys.stderr,
         )
         return result.returncode if result.returncode != 0 else 1
+    if spec.completion_after_shutdown is not None:
+        if (not result.guest_clean_shutdown or result.error_message is not None
+                or spec.completion_after_shutdown not in result.log_path.read_text(
+                    encoding="utf-8", errors="replace").splitlines()):
+            print("thekernel: guest did not complete the smoke and shut down cleanly", file=sys.stderr)
+            return result.returncode or 1
     if result.guest_clean_shutdown and spec.reject_ktap_skips:
-        reject_ktap_skips_in_log(result.log_path)
+        try:
+            validate_ktap_log(result.log_path.read_text(encoding="utf-8", errors="replace"))
+        except KtapError as error:
+            raise ProductError(str(error)) from error
     return result.returncode
 
 
@@ -631,16 +545,10 @@ def build_cmd(args: argparse.Namespace) -> int:
         build_rootfs(artifacts)
     elif not rootfs.is_file():
         raise ProductError(f"rootfs does not exist: {rootfs}")
-    build_kernel(artifacts, rootfs=rootfs)
+    transport = getattr(args, "rootfs_transport", "module")
+    build_kernel(artifacts, rootfs=rootfs, rootfs_transport=transport)
     print(artifacts.kernel)
-    print(artifacts.esp)
-    return 0
-
-
-def rootfs_cmd(_args: argparse.Namespace) -> int:
-    artifacts = Artifacts(state_root(), Variant(memory="128M"), "system")
-    build_rootfs(artifacts)
-    print(artifacts.rootfs)
+    print(artifacts.esp_for_rootfs_transport(transport))
     return 0
 
 
@@ -651,7 +559,7 @@ def lint_cmd(args: argparse.Namespace) -> int:
 
 # Known generated subdirectories below the state root.  The state root itself
 # and anything else under it are user data and are never removed.
-CLEAN_STATE_DIRS = ("runs", "out", "target/thekernel", "source-cache")
+CLEAN_STATE_DIRS = ("test-tmp", "runs", "out", "target/thekernel", "source-cache")
 
 
 def clean_cmd(_args: argparse.Namespace) -> int:
@@ -660,16 +568,9 @@ def clean_cmd(_args: argparse.Namespace) -> int:
     for name in CLEAN_STATE_DIRS:
         path = root / name
         if path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
+            shutil.rmtree(path)
             print(path)
             removed = True
-    tmp_root = REPO_ROOT / ".tmp"
-    if tmp_root.is_dir():
-        for entry in tmp_root.glob("rootfs.*"):
-            if entry.is_dir():
-                shutil.rmtree(entry, ignore_errors=True)
-                print(entry)
-                removed = True
     if not removed:
         print("thekernel: nothing to clean")
     return 0
@@ -684,7 +585,7 @@ def run_cmd(args: argparse.Namespace) -> int:
     if not args.no_build:
         if rootfs is None:
             build_rootfs(artifacts)
-        build_kernel(artifacts, rootfs=rootfs)
+        build_kernel(artifacts, rootfs=rootfs, rootfs_transport=args.rootfs_transport)
     input_after_marker = args.input_after_marker
     if (
         args.commands
@@ -697,6 +598,8 @@ def run_cmd(args: argparse.Namespace) -> int:
         RunSpec(
             accel=args.accel,
             timeout=args.timeout,
+            qemu_debug=getattr(args, "qemu_debug", None),
+            gdb=args.gdb,
             workdir=Path(args.workdir) if args.workdir else None,
             interactive=args.interactive,
             graphics_profile=args.graphics_profile,
@@ -705,7 +608,7 @@ def run_cmd(args: argparse.Namespace) -> int:
             commands=Path(args.commands) if args.commands else None,
             extra_block=Path(args.extra_block) if args.extra_block else None,
             rootfs=rootfs,
-            rootfs_transport="module",
+            rootfs_transport=args.rootfs_transport,
             run_cpus=run_cpus,
         ),
     )
@@ -722,6 +625,7 @@ def system_test_cmd(args: argparse.Namespace) -> int:
         RunSpec(
             accel=args.accel,
             timeout=args.timeout,
+            qemu_debug=getattr(args, "qemu_debug", None),
             workdir=Path(args.workdir) if args.workdir else None,
             interactive=False,
             graphics_profile="headless",
@@ -743,6 +647,7 @@ class SmokeFlavor:
 
     marker: str
     profile_markers: Mapping[str, str] = field(default_factory=dict)
+    failure_markers: tuple[str, ...] = ()
     screenshot_size: tuple[int, int] | None = None
     screenshot_color_blocks: tuple[QmpColorBlock, ...] = ()
     qmp_timeout_secs: float = 120.0
@@ -762,6 +667,7 @@ SMOKE_FLAVORS = {
     ),
     "q35-graphics-logind": SmokeFlavor(
         marker="THEKERNEL_Q35_SWAY_READY",
+        failure_markers=("THEKERNEL_Q35_LOGIND_CYCLE",),
         qmp_timeout_secs=900.0,
     ),
 }
@@ -839,11 +745,11 @@ def _seatd_smoke_checkpoints(
     size: tuple[int, int],
     blocks: tuple[QmpColorBlock, ...],
 ) -> tuple[QmpCheckpoint, ...]:
-    # QMP drives the virtio keyboard/tablet devices directly.  Every
-    # action waits for the preceding client repaint marker before taking
-    # its own screenshot, so ordering is observable rather than timing
-    # dependent.  The original screenshot remains the initial red SHM
-    # frame; these files carry the later input checkpoints.
+    # QMP drives the virtio keyboard/tablet devices directly. Repaint
+    # callbacks gate each action, but can precede scanout: the controller
+    # polls the pixel oracle to verify presentation before advancing.
+    # The original screenshot remains the initial red SHM frame; these
+    # files carry the later input checkpoints.
     return (
         QmpCheckpoint(
             input_after_marker=marker,
@@ -929,16 +835,32 @@ def graphics_smoke_cmd(args: argparse.Namespace) -> int:
         )
     else:
         checkpoints = ()
+    software_exit = args.flavor == "q35-graphics-seatd" and args.graphics_profile == "headless"
+    if software_exit:
+        # Checkpoints execute sequentially: F12 follows the final pixel oracle.
+        checkpoints += (QmpCheckpoint(
+            input_after_marker="THEKERNEL_Q35_WAYLAND_BUTTON_REPAINT",
+            input_events=((
+                {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": "f12"}}},
+                {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": "f12"}}},
+            ),),
+        ),)
     return run_product(
         artifacts,
         RunSpec(
             accel=args.accel,
             timeout=args.timeout,
+            qemu_debug=getattr(args, "qemu_debug", None),
+            gdb=getattr(args, "gdb", False),
             workdir=Path(args.workdir) if args.workdir else None,
             interactive=False,
             graphics_profile=args.graphics_profile,
             input_after_marker=None,
-            stop_after_marker=marker,
+            stop_after_marker=None if software_exit else marker,
+            completion_after_shutdown="THEKERNEL_Q35_SOFTWARE_SMOKE_COMPLETE" if software_exit else None,
+            failure_prefixes=tuple(name + " state=FAIL" for name in
+                dict.fromkeys((descriptor.marker, marker, *descriptor.profile_markers.values(),
+                               *descriptor.failure_markers))),
             commands=None,
             extra_block=None,
             rootfs=rootfs,
@@ -964,13 +886,32 @@ def graphics_benchmark_cmd(args: argparse.Namespace) -> int:
     rootfs = Path(args.rootfs).expanduser().resolve()
     if not rootfs.is_file():
         raise ProductError(f"rootfs does not exist: {rootfs}")
-    build_kernel(artifacts, rootfs=rootfs, rootfs_transport="drive")
     run_dir = Path(args.workdir).expanduser().resolve()
+    oracle_log = Path(args.linux_oracle_log).expanduser().resolve()
+    # Validate aliases before removing the prior generated result: a repeated
+    # failed run must not display old success, or overwrite its Linux oracle.
+    outputs = [("graphics metrics", run_dir / "graphics-metrics.json"),
+               ("console log", run_dir / "console.log"),
+               ("QMP socket", run_dir / "graphics-smoke.qmp"),
+               ("firmware vars", run_dir / "firmware" / "OVMF_VARS.fd")]
+    if getattr(args, "qemu_debug", None):
+        outputs.append(("QEMU debug log", run_dir / "qemu-debug.log"))
+    try:
+        checked = _validate_output_destinations(tuple(outputs), protected_paths=(
+            rootfs, oracle_log, artifacts.kernel, artifacts.drive_esp,
+        ))
+        metrics_path = checked["graphics metrics"]
+        metrics_path.unlink(missing_ok=True)
+    except (RunnerError, OSError) as error:
+        raise ProductError(str(error)) from error
+    if not args.no_build:
+        build_kernel(artifacts, rootfs=rootfs, rootfs_transport="drive")
     result = run_product(
         artifacts,
         RunSpec(
             accel="kvm",
             timeout=args.timeout,
+            qemu_debug=getattr(args, "qemu_debug", None),
             workdir=run_dir,
             interactive=False,
             graphics_profile=args.graphics_profile,
@@ -994,17 +935,18 @@ def graphics_benchmark_cmd(args: argparse.Namespace) -> int:
     log = run_dir / "console.log"
     try:
         current = parse_graphics_metrics(log)
-        oracle = parse_graphics_metrics(Path(args.linux_oracle_log))
+        oracle = parse_graphics_metrics(oracle_log)
         expected_renderer = renderer_for_profile(args.graphics_profile)
-        enforce_graphics_metrics(oracle, expected_renderer=expected_renderer)
+        enforce_graphics_metrics(oracle, expected_renderer=expected_renderer, expected_fault=args.fault or "none")
         enforce_graphics_metrics(
             current,
             oracle,
             expected_renderer=expected_renderer,
+            expected_fault=args.fault or "none",
         )
     except GraphicsMetricError as error:
         raise ProductError(str(error)) from error
-    (run_dir / "graphics-metrics.json").write_text(current.json() + "\n", encoding="utf-8")
+    metrics_path.write_text(current.json() + "\n", encoding="utf-8")
     print(current.json())
     return 0
 
@@ -1013,6 +955,8 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
     parser.add_argument("--smp", type=int, default=4)
     parser.add_argument("--memory", default="1G")
     parser.add_argument("--asid-fast-switch", action="store_true")
+    parser.add_argument("--m5-candidate", action="store_true",
+                        help="build or validate the experimental scheduler/I/O candidate in separate artifact paths")
     if profiles:
         parser.add_argument(
             "--profile",
@@ -1036,6 +980,10 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     parser.add_argument("--timeout", type=positive_timeout, default=300.0)
     parser.add_argument("--workdir")
+    parser.add_argument("--qemu-debug", help="QEMU -d categories; write workdir/qemu-debug.log")
+    parser.add_argument("--gdb", action="store_true",
+                        help="serve workdir/gdb.sock; pause on guest shutdown/reboot/panic for inspection")
+    parser.add_argument("--rootfs-transport", choices=("module", "drive"), default="module")
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument(
         "--graphics-profile",
@@ -1099,9 +1047,9 @@ def graphics_smoke_flavors() -> tuple[str, ...]:
 
 def add_graphics_smoke_arguments(parser: argparse.ArgumentParser) -> None:
     add_variant_arguments(parser)
-    parser.add_argument("--rootfs", required=True, help="existing graphics rootfs.ext2 image")
+    parser.add_argument("--rootfs", help="existing graphics rootfs.ext2 image")
     parser.add_argument("--flavor", choices=graphics_smoke_flavors(), default="headless-abi-smoke")
-    parser.add_argument("--screenshot", required=True, help="QMP screendump PPM output path")
+    parser.add_argument("--screenshot", help="QMP screendump PPM output path")
     parser.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     parser.add_argument("--timeout", type=positive_timeout, default=300.0)
     parser.add_argument("--workdir")
@@ -1121,23 +1069,377 @@ def add_graphics_smoke_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def add_graphics_benchmark_arguments(parser: argparse.ArgumentParser) -> None:
-    add_variant_arguments(parser)
-    parser.add_argument("--rootfs", required=True, help="q35-graphics-benchmark rootfs.ext2")
+    add_variant_arguments(parser, profiles=False)
+    parser.add_argument("--rootfs", help="q35-graphics-benchmark rootfs.ext2")
     parser.add_argument("--accel", choices=("kvm",), default="kvm")
     parser.add_argument("--timeout", type=positive_timeout, default=1800.0)
     parser.add_argument("--fault", choices=tuple(sorted(BENCHMARK_FAULTS)))
-    parser.add_argument("--workdir", required=True)
-    parser.add_argument("--linux-oracle-log", required=True)
+    parser.add_argument("--workdir")
+    parser.add_argument("--linux-oracle-log")
     parser.add_argument(
         "--graphics-profile",
         choices=BENCHMARK_PROFILES,
-        required=True,
+        default="virgl-interactive",
     )
+
+
+
+def component_host_test_command(package: dict) -> list[str]:
+    settings = package.get("metadata", {}).get("thekernel", {}).get("host-test", {})
+    command = ["cargo", "test", "--locked", "-p", package["name"]]
+    features = settings.get("features", [])
+    if not isinstance(features, list) or any(not isinstance(feature, str) or not feature for feature in features):
+        raise ProductError(f"invalid host-test features for {package['name']}")
+    if features:
+        command.extend(("--features", ",".join(features)))
+    if not settings.get("default-features", True):
+        command.append("--no-default-features")
+    if settings.get("all-targets", False):
+        command.append("--all-targets")
+    target = settings.get("target", "x86_64-unknown-linux-gnu")
+    if target is not None:
+        if target != "x86_64-unknown-linux-gnu":
+            raise ProductError(f"unsupported host-test target for {package['name']}: {target}")
+        command.extend(("--target", target))
+    return command
+
+
+def host_test_cmd() -> int:
+    test_tmp = state_root() / "test-tmp"
+    test_tmp.mkdir(parents=True, exist_ok=True)
+    run_checked([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-t", "."], env={**os.environ, "TMPDIR": str(test_tmp)})
+    env = {**os.environ, "CARGO_BUILD_JOBS": os.environ.get("CARGO_BUILD_JOBS") or "2",
+           "RUST_TEST_THREADS": "1", "TMPDIR": str(test_tmp),
+           "CARGO_TARGET_DIR": str(state_root() / "target" / "thekernel" / "host")}
+    # Product build flags can override target-specific host flags, including
+    # the percpu linker script. Host fixtures must always use the hosted ABI.
+    for variable in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_TARGET",
+                     "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"):
+        env.pop(variable, None)
+    env.update({"CC": "gcc", "CXX": "g++", "AR": "ar", "AS": "as",
+                "OBJCOPY": "objcopy", "OBJDUMP": "objdump", "SIZE": "size",
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER":
+                    str(REPO_ROOT / "scripts/ci/host-test-linker.sh")})
+    metadata = subprocess.run(["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps"],
+                              cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False)
+    if metadata.returncode:
+        raise ProductError(metadata.stderr.strip() or "cannot discover component host tests")
+    packages = json.loads(metadata.stdout)["packages"]
+    selected = []
+    for package in packages:
+        settings = package.get("metadata", {}).get("thekernel", {})
+        if (settings.get("layer") in {"mechanism", "linux_abi"}
+                or settings.get("host-test", {}).get("selected", False)
+                or package["name"] in {"thekernel-readiness-adapter", "thekernel-linux-process-adapter"}):
+            selected.append(package)
+    # Separate invocations preserve declared component test features; a
+    # workspace-wide union changes scheduler and platform semantics.
+    for package in sorted(selected, key=lambda item: item["name"]):
+        run_checked(component_host_test_command(package), env=env)
+    env["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"] = (
+        f"-C link-arg=-T{REPO_ROOT / 'crates/ax/thekernel-scope-local/percpu.x'}")
+    run_checked(["cargo", "test", "--locked", "--manifest-path", "kernel/Cargo.toml",
+                 "--tests", "--features", "bpf,perf-sampling,axtask/test", "--target",
+                 "x86_64-unknown-linux-gnu", "--", "--test-threads=1"], env=env)
+    return 0
+
+
+def test_cmd(args: argparse.Namespace) -> int:
+    suites = ("host", "guest", "abi", "graphics", "cpu") if args.suite == "all" else (args.suite,)
+    for suite in suites:
+        if suite == "host":
+            host_test_cmd()
+        elif suite == "guest":
+            result = system_test_cmd(args)
+            if result:
+                return result
+        elif suite == "abi":
+            run_checked([sys.executable, "scripts/ci/linux_abi_gate.py", "all"])
+            result = abi_test_cmd(args)
+            if result:
+                return result
+        elif suite == "graphics":
+            if not args.rootfs or not args.screenshot:
+                raise ProductError("graphics suite requires --rootfs and --screenshot")
+            result = graphics_smoke_cmd(args)
+            if result:
+                return result
+        elif suite == "cpu":
+            result = cpu_test_cmd(args)
+            if result:
+                return result
+    return 0
+
+
+def guest_tool_run(args: argparse.Namespace, command: str, marker: str, cpus: int) -> tuple[int, Path]:
+    artifacts = Artifacts(state_root(), parse_variant(args), "shell")
+    if not args.no_build:
+        build_rootfs(artifacts)
+        build_kernel(artifacts)
+    runs = Path(args.workdir).expanduser().resolve() if args.workdir else state_root() / "runs"
+    validate_storage(runs)
+    runs.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix="suite-", dir=runs))
+    commands = directory / "commands"
+    commands.write_text(f"{command} && echo {marker}\n/bin/busybox poweroff -f\nexit\n", encoding="utf-8")
+    result = run_product(artifacts, RunSpec(
+        accel="kvm", timeout=args.timeout, workdir=directory, interactive=False,
+        input_after_marker="THEKERNEL_SHELL_READY", stop_after_marker=None,
+        commands=commands, extra_block=None, run_cpus=cpus,
+        qemu_debug=args.qemu_debug))
+    log = directory / "console.log"
+    if result == 0 and marker not in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        raise ProductError(f"guest tool failed or missed completion marker; log={log}")
+    return result, log
+
+
+_CPU_VISIBLE_FIELDS = frozenset(
+    ("hypervisor", "apic", "pcid", "invpcid", "xsave", "pku", "cet_ss")
+)
+_CPU_ENABLED_FIELDS = frozenset(
+    ("apic", "apic_software", "x2apic", "pcid", "osxsave", "xcr0", "pke", "cet_cr4", "syscall")
+)
+
+
+def _validate_cpu_capability_reports(text: str, cpus: int, log: Path | None = None) -> None:
+    """Validate the per-CPU boot capability transcript and its implications."""
+
+    def fail(message: str) -> None:
+        suffix = f"; log={log}" if log is not None else ""
+        raise ProductError(f"invalid per-CPU capability report: {message}{suffix}")
+
+    if cpus < 1:
+        fail(f"invalid CPU count {cpus}")
+
+    def parse(category: str, required: frozenset[str]) -> dict[int, dict[str, str]]:
+        records = re.findall(
+            rf"^THEKERNEL_CPU_{category} cpu=(\d+) (.*)$", text, re.MULTILINE
+        )
+        cpu_ids = [int(cpu) for cpu, _ in records]
+        if sorted(cpu_ids) != list(range(cpus)):
+            fail(f"missing or duplicate per-CPU {category} capability report")
+        parsed: dict[int, dict[str, str]] = {}
+        for cpu_text, values in records:
+            cpu = int(cpu_text)
+            fields: dict[str, str] = {}
+            for field in values.split():
+                if "=" not in field:
+                    fail(f"CPU {cpu} has malformed {category} field {field!r}")
+                key, value = field.split("=", 1)
+                if not key or not value or key in fields:
+                    fail(f"CPU {cpu} has malformed or duplicate {category} field {field!r}")
+                fields[key] = value
+            missing = sorted(required - fields.keys())
+            if missing:
+                fail(f"CPU {cpu} is missing {category} fields: {', '.join(missing)}")
+            for key in required - {"xcr0"}:
+                if fields[key] not in {"0", "1"}:
+                    fail(f"CPU {cpu} has non-boolean {category} field {key}={fields[key]!r}")
+            if "xcr0" in required:
+                try:
+                    xcr0 = int(fields["xcr0"], 0)
+                except ValueError:
+                    fail(f"CPU {cpu} has invalid xcr0={fields['xcr0']!r}")
+                if xcr0 < 0:
+                    fail(f"CPU {cpu} has negative xcr0={fields['xcr0']!r}")
+            parsed[cpu] = fields
+        return parsed
+
+    visible = parse("VISIBLE", _CPU_VISIBLE_FIELDS)
+    enabled = parse("ENABLED", _CPU_ENABLED_FIELDS)
+    for cpu in range(cpus):
+        v = visible[cpu]
+        e = enabled[cpu]
+        xcr0 = int(e["xcr0"], 0)
+
+        required_enabled = [
+            key for key in ("apic", "apic_software", "syscall") if e[key] != "1"
+        ]
+        if required_enabled:
+            fail(f"CPU {cpu} lacks required enabled state: {', '.join(required_enabled)}")
+
+        # Privileged state may be disabled despite hardware support being
+        # visible, but an enabled state must have the corresponding contract.
+        implications = (
+            ("apic", "apic"),
+            ("pcid", "pcid"),
+            ("osxsave", "xsave"),
+            ("cet_cr4", "cet_ss"),
+        )
+        for enabled_field, visible_field in implications:
+            if e[enabled_field] == "1" and v[visible_field] != "1":
+                fail(
+                    f"CPU {cpu} has enabled {enabled_field}=1 without "
+                    f"visible {visible_field}=1"
+                )
+        if e["apic_software"] == "1" and e["apic"] != "1":
+            fail(f"CPU {cpu} has apic_software=1 while apic=0")
+        if e["osxsave"] == "0" and xcr0 != 0:
+            fail(f"CPU {cpu} reports xcr0={e['xcr0']} while osxsave=0")
+        if xcr0 != 0 and e["osxsave"] != "1":
+            fail(f"CPU {cpu} reports nonzero xcr0 without osxsave=1")
+        if e["osxsave"] == "1" and xcr0 & 0x3 != 0x3:
+            fail(f"CPU {cpu} has osxsave=1 without x87/SSE state in xcr0")
+        if e["pke"] == "1":
+            if v["pku"] != "1":
+                fail(f"CPU {cpu} has pke=1 without visible pku=1")
+            if e["osxsave"] != "1" or not xcr0 & (1 << 9):
+                fail(f"CPU {cpu} has pke=1 without OSXSAVE PKRU state in xcr0")
+
+
+def cpu_test_cmd(args: argparse.Namespace) -> int:
+    if args.accel != "kvm":
+        raise ProductError("CPU suite requires --accel kvm")
+    if args.smp < 4:
+        raise ProductError("CPU suite requires --smp 4 for its 1/4 vCPU matrix")
+    run_checked(["lscpu"])
+    for cpus in (1, 4):
+        result, log = guest_tool_run(args,
+            f"/opt/thekernel-tests/bin/thekernel-cpu-smoke --expected-cpus {cpus} --require-kvm",
+            "THEKERNEL_CPU_EXIT_ZERO", cpus)
+        if result:
+            return result
+        text = log.read_text()
+        diagnostic_log = log.with_name("kernel.log")
+        try:
+            diagnostics = diagnostic_log.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            raise ProductError(f"cannot read CPU diagnostics: {diagnostic_log}: {error}") from error
+        _validate_cpu_capability_reports(diagnostics, cpus, diagnostic_log)
+        try:
+            validate_ktap_log(text.replace("# THEKERNEL_CPU_TEST_COMPLETE", COMPLETION_MARKER))
+        except KtapError as error:
+            raise ProductError(str(error)) from error
+    return 0
+
+
+def abi_test_cmd(args: argparse.Namespace) -> int:
+    if args.accel != "kvm":
+        raise ProductError("ABI differential requires --accel kvm")
+    artifacts = Artifacts(state_root(), parse_variant(args), "shell")
+    # --rootfs belongs to the graphics suite. ABI always uses the product
+    # shell rootfs, including when test --suite all also exercises graphics.
+    rootfs = artifacts.rootfs
+    if not args.no_build:
+        build_rootfs(artifacts)
+        build_kernel(artifacts, rootfs=rootfs, rootfs_transport="drive")
+    linux_kernel = Path(args.linux_kernel).expanduser().resolve() if args.linux_kernel else None
+    if linux_kernel is None:
+        if args.no_build:
+            raise ProductError("--no-build ABI differential requires --linux-kernel")
+        completed = subprocess.run(
+            ["bash", str(REPO_ROOT / "scripts/build-linux-oracle.sh"), "--jobs",
+             os.environ.get("CARGO_BUILD_JOBS", "2")],
+            cwd=REPO_ROOT, stdout=subprocess.PIPE, text=True, check=False,
+        )
+        if completed.returncode:
+            raise ProductError("Linux oracle build failed")
+        linux_kernel = Path(completed.stdout.strip()).resolve()
+    if not linux_kernel.is_file():
+        raise ProductError(f"Linux oracle kernel is missing: {linux_kernel}")
+    output = Path(args.workdir).expanduser().resolve() if args.workdir else state_root() / "runs"
+    validate_storage(output)
+    linux_esp = state_root() / "out/linux-7.2.3/abi.esp"
+    if not args.no_build:
+        with state_lock("build"):
+            linux_esp.parent.mkdir(parents=True, exist_ok=True)
+            run_checked([
+                "bash", str(REPO_ROOT / "scripts/build-x86-uefi-esp.sh"), "--mode", "linux",
+                "--kernel", str(linux_kernel), "--output", str(linux_esp),
+                "--grub-config", str(REPO_ROOT / "config/x86_64/grub-linux-shell.cfg"),
+            ])
+    elif not linux_esp.is_file():
+        raise ProductError(f"--no-build ABI differential requires existing Linux ESP: {linux_esp}")
+    with state_lock("build", shared=True):
+        validate_artifact_config(artifacts, rootfs, "drive")
+        directory = run_abi_differential(AbiConfig(
+            targets=(BenchmarkTarget("baseline", artifacts.kernel, artifacts.drive_esp),
+                     BenchmarkTarget("linux", linux_kernel, linux_esp)),
+            rootfs=rootfs, workdir=output,
+            cpus=resolve_run_cpus(args.smp, args.run_cpus), memory=args.memory, timeout=args.timeout,
+        ))
+    print(f"ABI portable differential: {len(ABI_CONTRACTS)} contracts passed on both guests; logs={directory}")
+    return 0
+
+
+def bench_cmd(args: argparse.Namespace) -> int:
+    if args.suite == "graphics":
+        if not args.rootfs or not args.workdir or not args.linux_oracle_log:
+            raise ProductError("graphics benchmark requires --rootfs, --workdir and --linux-oracle-log")
+        return graphics_benchmark_cmd(args)
+    if getattr(args, "m5_candidate", False):
+        raise ProductError("benchmark baseline must use default policies; supply prepared candidate kernel and ESP paths")
+    if args.accel != "kvm":
+        raise ProductError("benchmark comparisons require --accel kvm")
+    if not 32 <= args.iterations <= 1_000_000 or args.trials < 1:
+        raise ProductError("benchmark requires 32..1000000 iterations and positive trials")
+    if bool(args.candidate_kernel) != bool(args.candidate_esp):
+        raise ProductError("candidate comparison requires both --candidate-kernel and --candidate-esp")
+    artifacts = Artifacts(state_root(), parse_variant(args), "shell")
+    rootfs = Path(args.rootfs).expanduser().resolve() if args.rootfs else artifacts.rootfs
+    if not args.no_build:
+        if not args.rootfs:
+            build_rootfs(artifacts)
+        build_kernel(artifacts, rootfs=rootfs, rootfs_transport="drive")
+    linux_kernel = Path(args.linux_kernel).expanduser().resolve() if args.linux_kernel else None
+    if linux_kernel is None:
+        if args.no_build:
+            raise ProductError("--no-build comparison requires --linux-kernel")
+        completed = subprocess.run(
+            ["bash", str(REPO_ROOT / "scripts/build-linux-oracle.sh"), "--jobs",
+             os.environ.get("CARGO_BUILD_JOBS", "2")],
+            cwd=REPO_ROOT, capture_output=False, stdout=subprocess.PIPE, text=True,
+            check=False,
+        )
+        if completed.returncode:
+            raise ProductError("Linux oracle build failed")
+        linux_kernel = Path(completed.stdout.strip()).resolve()
+    if not linux_kernel.is_file():
+        raise ProductError(f"Linux oracle kernel is missing: {linux_kernel}")
+    output = Path(args.workdir).expanduser().resolve() if args.workdir else state_root() / "runs"
+    validate_storage(output)
+    linux_esp = state_root() / "out/linux-7.2.3/benchmark.esp"
+    if args.no_build:
+        if not linux_esp.is_file():
+            raise ProductError(f"--no-build comparison requires existing Linux ESP: {linux_esp}")
+    else:
+        with state_lock("build"):
+            linux_esp.parent.mkdir(parents=True, exist_ok=True)
+            run_checked([
+                "bash", str(REPO_ROOT / "scripts/build-x86-uefi-esp.sh"), "--mode", "linux",
+                "--kernel", str(linux_kernel), "--output", str(linux_esp),
+                "--grub-config", str(REPO_ROOT / "config/x86_64/grub-linux-shell.cfg"),
+            ])
+    targets = [BenchmarkTarget("baseline", artifacts.kernel, artifacts.drive_esp),
+               BenchmarkTarget("linux", linux_kernel, linux_esp)]
+    if args.candidate_kernel:
+        targets.append(BenchmarkTarget("candidate", Path(args.candidate_kernel).resolve(),
+                                       Path(args.candidate_esp).resolve()))
+    try:
+        host_cpus = tuple(int(cpu) for cpu in args.host_cpus.split(",")) if args.host_cpus else ()
+    except ValueError as error:
+        raise ProductError("--host-cpus must be a comma-separated list of CPU numbers") from error
+    with state_lock("build", shared=True):
+        validate_artifact_config(artifacts, rootfs, "drive")
+        result = run_benchmark_experiment(BenchmarkConfig(
+            targets=tuple(targets), rootfs=rootfs, workdir=output, suite=args.suite,
+            iterations=args.iterations, trials=args.trials,
+            cpus=resolve_run_cpus(args.smp, args.run_cpus), memory=args.memory,
+            host_cpus=host_cpus, timeout=args.timeout,
+        ))
+    result_path = Path(result["workdir"]) / "results.json"
+    result_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    print(result_path)
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="./tools/thekernel.py")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    verify = sub.add_parser("verify", help="run repository verification (daily, full, hardware)")
+    verify.add_argument("--tier", choices=("daily", "full", "hardware"), default="daily")
+    verify.set_defaults(func=verify_cmd)
 
     build = sub.add_parser("build", help="build the x86_64 q35/UEFI kernel and ESP")
     add_variant_arguments(build)
@@ -1145,10 +1447,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--rootfs",
         help="stage this existing rootfs image as the Multiboot2 module instead of building one",
     )
+    build.add_argument("--rootfs-transport", choices=("module", "drive"), default="module")
     build.set_defaults(func=build_cmd)
-
-    rootfs = sub.add_parser("rootfs", help="build the x86_64 semantic root filesystem")
-    rootfs.set_defaults(func=rootfs_cmd)
 
     lint = sub.add_parser("lint", help="run Clippy for the product kernel configuration")
     add_variant_arguments(lint)
@@ -1161,49 +1461,37 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_arguments(run_parser)
     run_parser.set_defaults(func=run_cmd)
 
-    graphics_smoke = sub.add_parser(
-        "graphics-smoke",
-        help="boot a graphics rootfs and capture a marker-gated QMP screenshot",
-    )
-    add_graphics_smoke_arguments(graphics_smoke)
-    graphics_smoke.set_defaults(func=graphics_smoke_cmd)
-
-    graphics_benchmark = sub.add_parser(
-        "graphics-benchmark",
-        help="run and enforce the short 60 warmup / 600 frame graphics gate",
-    )
-    add_graphics_benchmark_arguments(graphics_benchmark)
-    graphics_benchmark.set_defaults(func=graphics_benchmark_cmd)
-
-    system_test = sub.add_parser("system-test", help="build and run the product system-test suite")
-    add_variant_arguments(system_test, profiles=False)
-    system_test.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
-    system_test.add_argument("--timeout", type=positive_timeout, default=300.0)
-    system_test.add_argument("--workdir")
-    system_test.add_argument(
-        "--run-cpus",
-        type=int,
-        help="boot the --smp artifact with this many QEMU CPUs (1 through --smp)",
-    )
-    system_test.add_argument(
-        "--no-build",
-        action="store_true",
-        help="run existing kernel, ESP, and rootfs artifacts without rebuilding",
-    )
-    system_test.add_argument(
-        "--allow-skip",
-        action="store_true",
-        help="allow KTAP SKIP results for a non-gating preview run",
-    )
-    system_test.set_defaults(func=system_test_cmd)
+    test = sub.add_parser("test", help="run a checked host or guest suite")
+    add_graphics_smoke_arguments(test)
+    test.add_argument("--suite", choices=("host", "guest", "abi", "graphics", "cpu", "all"), required=True)
+    test.add_argument("--run-cpus", type=int)
+    test.add_argument("--allow-skip", action="store_true")
+    test.add_argument("--qemu-debug", help="QEMU -d categories; write workdir/qemu-debug.log")
+    test.add_argument("--gdb", action="store_true",
+                      help="graphics smoke: serve workdir/gdb.sock and pause on guest shutdown/reboot/panic")
+    test.add_argument("--linux-kernel", help="already built Linux 7.2.3 oracle bzImage for ABI differential")
+    test.set_defaults(func=test_cmd)
+    bench = sub.add_parser("bench", help="run scheduler or I/O comparison experiments")
+    add_graphics_benchmark_arguments(bench)
+    bench.add_argument("--no-build", action="store_true")
+    bench.add_argument("--run-cpus", type=int)
+    bench.add_argument("--iterations", type=int, default=1000)
+    bench.add_argument("--trials", type=int, default=10)
+    bench.add_argument("--linux-kernel", help="already built Linux 7.2.3 oracle bzImage")
+    bench.add_argument("--candidate-kernel")
+    bench.add_argument("--candidate-esp")
+    bench.add_argument("--host-cpus", help="common QEMU CPU affinity mask, e.g. 0,1,2,3")
+    bench.add_argument("--suite", choices=("scheduler", "io", "graphics", "all"), required=True)
+    bench.set_defaults(func=bench_cmd)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
-        return int(args.func(args))
-    except (ProductError, RunnerError, ProcessError) as error:
+        with state_lock("activity", shared=args.command != "clean", blocking=args.command != "clean"):
+            return int(args.func(args))
+    except (ProductError, RunnerError, ProcessError, OSError) as error:
         print(f"thekernel: {error}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

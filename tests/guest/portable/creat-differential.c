@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -24,7 +25,7 @@ static int raw_creat(const char *path, mode_t mode) {
 int main(void) {
     puts("THEKERNEL_ABI_CASE creat.raw-differential");
     char path[128];
-    if (snprintf(path, sizeof(path), "/tmp/thekernel-creat-%ld", (long)getpid())
+    if (snprintf(path, sizeof(path), "/root/thekernel-creat-%ld", (long)getpid())
         >= (int)sizeof(path)) {
         errno = ENAMETOOLONG;
         return fail("path");
@@ -37,6 +38,14 @@ int main(void) {
     if (fd < 0) {
         return fail("create");
     }
+    struct statfs filesystem;
+    if (fstatfs(fd, &filesystem) != 0 || filesystem.f_type != 0xef53) {
+        (void)close(fd);
+        (void)unlink(path);
+        errno = EPROTO;
+        return fail("ext4-fixture-required");
+    }
+    puts("THEKERNEL_ABI_ASSERT creat.raw-differential PROVIDER_EXT4 pass");
 
     struct stat statbuf;
     if (fstat(fd, &statbuf) != 0 || (statbuf.st_mode & 0777) != 0640) {

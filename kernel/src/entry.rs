@@ -115,9 +115,14 @@ pub fn init(args: &[String], envs: &[String]) {
     let user_ns = UserNamespace::try_new_root().expect("Failed to allocate init user namespace");
     let root_cred = Cred::try_root_with_registry(security_registry, user_ns.clone())
         .expect("Failed to allocate init credential");
-    let boot_security = crate::file::permission::VfsSecurityContext::new(root_cred.clone());
     let credential =
         CredentialSlot::try_new(root_cred).expect("Failed to allocate init credential slot");
+    let process_domain = init_process_domain().expect("Failed to allocate process domain");
+    let init_pid_ns = PidNamespace::try_new_root_with_reaper_scope(
+        user_ns.clone(),
+        process_domain.root_reaper_scope(),
+    )
+    .expect("Failed to allocate init pid namespace");
     let init_net_stack = axnet::default_stack().clone();
     let init_net_ns = NetworkNamespace::try_new(init_net_stack.clone(), user_ns.clone())
         .expect("Failed to allocate init network namespace");
@@ -132,8 +137,8 @@ pub fn init(args: &[String], envs: &[String]) {
     }
     {
         let fs = FS_CONTEXT.lock();
-        pseudofs::mount_all(&fs, &boot_security, init_net_stack.unix_namespace())
-            .expect("Failed to mount pseudofs");
+        pseudofs::mount_all(&fs, init_pid_ns.clone())
+        .expect("Failed to mount pseudofs");
     }
 
     let loc = FS_CONTEXT
@@ -166,14 +171,8 @@ pub fn init(args: &[String], envs: &[String]) {
 
     let tid = linux_pid_from_task_id(task.id().as_u64())
         .expect("init task identity must fit the Linux PID domain");
-    let process_domain = init_process_domain().expect("Failed to allocate process domain");
     let prepared_zombie_snapshot =
         ProcessData::try_prepare_zombie_snapshot().expect("Failed to reserve init zombie snapshot");
-    let init_pid_ns = PidNamespace::try_new_root_with_reaper_scope(
-        user_ns.clone(),
-        process_domain.root_reaper_scope(),
-    )
-    .expect("Failed to allocate init pid namespace");
     let init_pid_reservation = init_pid_ns
         .reserve_process(INIT_PID)
         .expect("Failed to reserve init pid namespace identity");
@@ -242,6 +241,7 @@ pub fn init(args: &[String], envs: &[String]) {
     )
     .expect("Failed to assemble init namespace proxy");
     let proc = ProcessData::try_new(
+        crate::task::WorldId::BOOT,
         proc,
         prepared_zombie_snapshot,
         credential.clone(),

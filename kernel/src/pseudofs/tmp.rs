@@ -2679,7 +2679,7 @@ mod tests {
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
-        let alias = root.link("xattr-alias", &file).unwrap();
+        let alias = root.link(FsName::new(b"xattr-alias"), &file).unwrap();
 
         assert_eq!(file.get_xattr(b"user.key"), Err(LinuxError::ENODATA.into()));
         file.set_xattr(b"user.key", b"first", XattrSetMode::Create)
@@ -2764,7 +2764,7 @@ mod tests {
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
-        let alias = root.link("xattr-create-alias", &file).unwrap();
+        let alias = root.link(FsName::new(b"xattr-create-alias"), &file).unwrap();
         let start = Arc::new(Barrier::new(3));
         let first_start = start.clone();
         let first = file.clone();
@@ -2810,8 +2810,8 @@ mod tests {
 
     fn directory_names(root: &axfs_ng_vfs::Location) -> Vec<String> {
         let mut names = Vec::new();
-        root.read_dir(0, &mut |name: &str, _, _, _| {
-            names.push(name.to_string());
+        root.read_dir(0, &mut |name: &FsName, _, _, _| {
+            names.push(core::str::from_utf8(name.as_bytes()).unwrap().to_string());
             true
         })
         .unwrap();
@@ -2883,7 +2883,7 @@ mod tests {
             })
             .unwrap();
 
-        let linked = root.link("timestamp-link", &source).unwrap();
+        let linked = root.link(FsName::new(b"timestamp-link"), &source).unwrap();
         let source_metadata = source.metadata().unwrap();
         let linked_metadata = linked.metadata().unwrap();
         let parent_metadata = root.metadata().unwrap();
@@ -2939,11 +2939,11 @@ mod tests {
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
-        let alias = root.link("unlink-last", &source).unwrap();
+        let alias = root.link(FsName::new(b"unlink-last"), &source).unwrap();
         assert_eq!(source.metadata().unwrap().nlink, 2);
 
         install_removal_timestamp_sentinels(&root, &source);
-        root.unlink_checked("unlink-first", false, &source).unwrap();
+        root.unlink_checked(FsName::new(b"unlink-first"), false, &source).unwrap();
         let source_metadata = source.metadata().unwrap();
         let parent_metadata = root.metadata().unwrap();
         assert_eq!(source_metadata.nlink, 1);
@@ -2955,7 +2955,7 @@ mod tests {
         assert_eq!(parent_metadata.ctime, source_metadata.ctime);
 
         install_removal_timestamp_sentinels(&root, &source);
-        root.unlink_checked("unlink-last", false, &alias).unwrap();
+        root.unlink_checked(FsName::new(b"unlink-last"), false, &alias).unwrap();
         let source_metadata = source.metadata().unwrap();
         let parent_metadata = root.metadata().unwrap();
         assert_eq!(source_metadata.nlink, 0);
@@ -2983,7 +2983,7 @@ mod tests {
         assert_eq!(directory.metadata().unwrap().nlink, 2);
 
         install_removal_timestamp_sentinels(&root, &directory);
-        root.unlink_checked("empty-directory", true, &directory)
+        root.unlink_checked(FsName::new(b"empty-directory"), true, &directory)
             .unwrap();
 
         let victim_metadata = directory.metadata().unwrap();
@@ -3022,7 +3022,7 @@ mod tests {
         let victim_before = metadata_state(&victim);
 
         assert_eq!(
-            root.unlink_checked("victim", false, &wrong_identity)
+            root.unlink_checked(FsName::new(b"victim"), false, &wrong_identity)
                 .unwrap_err(),
             VfsError::NotFound
         );
@@ -3030,7 +3030,7 @@ mod tests {
         assert_eq!(metadata_state(&victim), victim_before);
 
         assert_eq!(
-            root.unlink_checked("victim", true, &victim).unwrap_err(),
+            root.unlink_checked(FsName::new(b"victim"), true, &victim).unwrap_err(),
             VfsError::NotADirectory
         );
         assert_eq!(metadata_state(&root), parent_before);
@@ -3055,7 +3055,7 @@ mod tests {
         let directory_before = metadata_state(&directory);
 
         assert_eq!(
-            root.unlink_checked("nonempty-directory", true, &directory)
+            root.unlink_checked(FsName::new(b"nonempty-directory"), true, &directory)
                 .unwrap_err(),
             VfsError::DirectoryNotEmpty
         );
@@ -3094,8 +3094,8 @@ mod tests {
         assert_eq!((anonymous_meta.uid, anonymous_meta.gid), (1000, 1001));
         assert!(!anonymous.entry().is_root_of_mount());
         assert_ne!(
-            anonymous.entry().try_key().unwrap(),
-            root.entry().try_key().unwrap()
+            anonymous.entry().object_key(),
+            root.entry().object_key()
         );
         assert_eq!(
             anonymous.absolute_path().unwrap_err(),
@@ -3109,7 +3109,7 @@ mod tests {
             .unwrap()
             .write_at(b"same inode", 0)
             .unwrap();
-        let linked = root.link("published", &anonymous).unwrap();
+        let linked = root.link(FsName::new(b"published"), &anonymous).unwrap();
         let linked_meta = linked.metadata().unwrap();
         assert_eq!(linked_meta.inode, anonymous_meta.inode);
         assert_eq!(linked_meta.nlink, 1);
@@ -3128,13 +3128,13 @@ mod tests {
         assert!(after.iter().any(|name| name == "published"));
         assert!(!after.iter().any(|name| name.starts_with(".tmpfile-")));
 
-        let second = root.link("published-again", &anonymous).unwrap();
+        let second = root.link(FsName::new(b"published-again"), &anonymous).unwrap();
         assert_eq!(second.metadata().unwrap().nlink, 2);
-        root.unlink("published", false).unwrap();
-        root.unlink("published-again", false).unwrap();
+        root.unlink(FsName::new(b"published"), false).unwrap();
+        root.unlink(FsName::new(b"published-again"), false).unwrap();
         assert_eq!(anonymous.metadata().unwrap().nlink, 0);
         assert_eq!(
-            root.link("resurrected", &anonymous).unwrap_err(),
+            root.link(FsName::new(b"resurrected"), &anonymous).unwrap_err(),
             axfs_ng_vfs::VfsError::NotFound
         );
 
@@ -3142,7 +3142,7 @@ mod tests {
         unpublishable_options.linkable = false;
         let unpublishable = root.create_anonymous(&unpublishable_options).unwrap();
         assert_eq!(
-            root.link("exclusive", &unpublishable).unwrap_err(),
+            root.link(FsName::new(b"exclusive"), &unpublishable).unwrap_err(),
             axfs_ng_vfs::VfsError::NotFound
         );
     }
@@ -3246,14 +3246,14 @@ mod tests {
             axfs_ng_vfs::VfsError::OperationNotPermitted
         );
         assert_eq!(
-            root.lookup_no_follow("empty-link").unwrap_err(),
+            root.lookup_no_follow(FsName::new(b"empty-link")).unwrap_err(),
             axfs_ng_vfs::VfsError::NotFound
         );
 
         let link = root
             .create_symlink(
-                "link",
-                "target",
+                FsName::new(b"link"),
+                axfs_ng_vfs::FsPath::new(b"target"),
                 NodePermission::from_bits_truncate(0o777),
                 Some((1000, 1001)),
             )
@@ -3262,7 +3262,7 @@ mod tests {
         assert_eq!(metadata.node_type, NodeType::Symlink);
         assert_eq!(metadata.mode.bits() & 0o777, 0o777);
         assert_eq!((metadata.uid, metadata.gid), (1000, 1001));
-        assert_eq!(link.read_link().unwrap(), "target");
+        assert_eq!(link.read_link().unwrap().as_bytes(), b"target");
     }
 
     #[test]
@@ -3280,7 +3280,7 @@ mod tests {
         };
 
         let created = root
-            .create_named("device", &options, CreateDisposition::Exclusive)
+            .create_named(FsName::new(b"device"), &options, CreateDisposition::Exclusive)
             .unwrap();
         assert!(created.created);
         let metadata = created.entry.metadata().unwrap();
@@ -3291,7 +3291,7 @@ mod tests {
 
         let existing = root
             .create_named(
-                "device",
+                FsName::new(b"device"),
                 &NamedCreateOptions {
                     owner: Some((2000, 2001)),
                     ..options.clone()
@@ -3311,12 +3311,12 @@ mod tests {
             ..options.clone()
         };
         assert_eq!(
-            root.create_named("invalid", &invalid, CreateDisposition::Exclusive)
+            root.create_named(FsName::new(b"invalid"), &invalid, CreateDisposition::Exclusive)
                 .unwrap_err(),
             axfs_ng_vfs::VfsError::InvalidInput
         );
         assert_eq!(
-            root.lookup_no_follow("invalid").unwrap_err(),
+            root.lookup_no_follow(FsName::new(b"invalid")).unwrap_err(),
             axfs_ng_vfs::VfsError::NotFound
         );
     }
@@ -3331,7 +3331,7 @@ mod tests {
         let marker = Arc::new(Marker(0xfeed_beef));
         let created = root
             .create_named(
-                "socket",
+                FsName::new(b"socket"),
                 &NamedCreateOptions {
                     node_type: NodeType::Socket,
                     permission: NodePermission::from_bits_truncate(0o750),
@@ -3347,7 +3347,7 @@ mod tests {
         assert!(Arc::ptr_eq(&attached, &marker));
         assert_eq!(attached.0, 0xfeed_beef);
 
-        let _alias = root.link("socket-alias", &created.entry).unwrap();
+        let _alias = root.link(FsName::new(b"socket-alias"), &created.entry).unwrap();
         let unrelated = root
             .create(
                 FsName::new(b"unrelated"),
@@ -3355,12 +3355,12 @@ mod tests {
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
-        root.unlink_checked("unrelated", false, &unrelated).unwrap();
+        root.unlink_checked(FsName::new(b"unrelated"), false, &unrelated).unwrap();
 
-        let visible = root.lookup_no_follow("socket").unwrap();
+        let visible = root.lookup_no_follow(FsName::new(b"socket")).unwrap();
         let visible_marker = visible.user_data().get::<Marker>().unwrap();
         assert!(Arc::ptr_eq(&visible_marker, &marker));
-        let alias = root.lookup_no_follow("socket-alias").unwrap();
+        let alias = root.lookup_no_follow(FsName::new(b"socket-alias")).unwrap();
         let alias_marker = alias.user_data().get::<Marker>().unwrap();
         assert!(Arc::ptr_eq(&alias_marker, &marker));
     }
@@ -3382,7 +3382,7 @@ mod tests {
 
         let outcome = root
             .create_named(
-                "existing",
+                FsName::new(b"existing"),
                 &NamedCreateOptions {
                     node_type: NodeType::RegularFile,
                     permission: NodePermission::empty(),
@@ -3429,7 +3429,7 @@ mod tests {
         let alias_dir = alias.as_dir().unwrap();
         alias_dir.lookup(FsName::new(b"victim")).unwrap();
 
-        parent.unlink("victim", false).unwrap();
+        parent.unlink(FsName::new(b"victim"), false).unwrap();
         assert_eq!(
             alias_dir.lookup(FsName::new(b"victim")).unwrap_err(),
             VfsError::NotFound
@@ -3466,10 +3466,10 @@ mod tests {
         let alias_dir = alias.as_dir().unwrap();
         let expected = alias_dir.inner().lookup(FsName::new(b"victim")).unwrap();
         alias_dir
-            .unlink_checked("victim", false, &expected)
+            .unlink_checked(FsName::new(b"victim"), false, &expected)
             .unwrap();
         assert_eq!(
-            parent.lookup_no_follow("victim").unwrap_err(),
+            parent.lookup_no_follow(FsName::new(b"victim")).unwrap_err(),
             VfsError::NotFound
         );
     }
@@ -3486,7 +3486,7 @@ mod tests {
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
-        root.unlink("slot", false).unwrap();
+        root.unlink(FsName::new(b"slot"), false).unwrap();
         let replacement = root
             .create(
                 FsName::new(b"slot"),
@@ -3499,12 +3499,12 @@ mod tests {
             root.entry()
                 .as_dir()
                 .unwrap()
-                .unlink_checked("slot", false, old.entry())
+                .unlink_checked(FsName::new(b"slot"), false, old.entry())
                 .unwrap_err(),
             VfsError::NotFound
         );
         assert_eq!(
-            root.lookup_no_follow("slot").unwrap().inode(),
+            root.lookup_no_follow(FsName::new(b"slot")).unwrap().inode(),
             replacement.inode()
         );
     }
@@ -3536,7 +3536,7 @@ mod tests {
 
         root.rename(FsName::new(b"dir"), &root, FsName::new(b"dir"))
             .unwrap();
-        assert!(root.lookup_no_follow("dir").unwrap().is_dir());
+        assert!(root.lookup_no_follow(FsName::new(b"dir")).unwrap().is_dir());
         assert_eq!(
             root.rename(FsName::new(b"file"), &root, FsName::new(b"dir"))
                 .unwrap_err(),

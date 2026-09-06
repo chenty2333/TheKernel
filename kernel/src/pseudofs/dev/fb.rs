@@ -936,8 +936,8 @@ impl DisplayCore {
         if damage == DAMAGE_CLEAN {
             return;
         }
-        if self.scanout.present().is_err() {
-            warn!("Failed to commit framebuffer scanout");
+        if let Err(error) = self.scanout.present() {
+            warn!("Failed to commit framebuffer scanout: {error:?}");
             // Retain correctness after a transient device failure.
             self.mark_full();
         }

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Run the checked-in Linux 6.12.107 Q35 oracle with the exact graphics rootfs
+# Run the checked-in Linux 7.2.3 Q35 oracle with the exact graphics rootfs
 # and the same QMP benchmark protocol used by TheKernel.
 set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-rootfs= output= profile= fault= kernel= cache=${THEKERNEL_STATE_DIR:-$HOME/.cache/thekernel-targets}/linux-6.12.107-oracle tarball= timeout=1800 qemu=
+rootfs= output= profile= fault= kernel= cache=${THEKERNEL_STATE_DIR:-$HOME/.cache/thekernel-targets}/linux-7.2.3-oracle tarball= timeout=1800 qemu=
 while (($#)); do
     case "$1" in
         --rootfs) rootfs=${2:?}; shift 2 ;;
@@ -24,12 +24,12 @@ mkdir -p "$output"
 cache=$(CDPATH= cd -- "$(dirname -- "$cache")" && pwd)/$(basename -- "$cache")
 mkdir -p "$cache"
 if [ -z "$kernel" ]; then
-    build=("$SCRIPT_DIR/build-linux-612-oracle.sh" --cache "$cache")
+    build=("$SCRIPT_DIR/build-linux-oracle.sh" --cache "$cache")
     [ -z "$tarball" ] || build+=(--tarball "$tarball")
     kernel=$("${build[@]}")
 fi
 [ -r "$kernel" ] || { printf 'Linux oracle kernel does not exist: %s\n' "$kernel" >&2; exit 1; }
-esp="$cache/linux-6.12.107-q35-graphics.esp"
+esp="$cache/linux-7.2.3-q35-graphics.esp"
 if [ ! -s "$esp" ] || [ "$kernel" -nt "$esp" ] || [ "$SCRIPT_DIR/../config/x86_64/grub-linux.cfg" -nt "$esp" ]; then
     "$SCRIPT_DIR/build-x86-uefi-esp.sh" --mode linux --kernel "$kernel" --output "$esp" >/dev/null
 fi

@@ -798,6 +798,9 @@ mod tests {
     }
 
     fn slot() -> Arc<CredentialSlot> {
+        // Host tests have no background retire worker. Drain completed
+        // publications from earlier tests before reserving fresh updates.
+        crate::rcu::drain_credential_retire(crate::rcu::CREDENTIAL_RETIRE_CAPACITY);
         let namespace = UserNamespace::try_new_root().unwrap();
         Arc::new(CredentialSlot::new(Cred::try_root(namespace).unwrap()))
     }

@@ -68,11 +68,13 @@ fn unsupported_access_control_xattr(name: &[u8]) -> bool {
     UNSUPPORTED_ACCESS_CONTROL_XATTRS.contains(&name)
 }
 
-/// Linux permits user.* on regular files, directories, FIFOs, and sockets.
+/// Linux xattr_permission permits direct user.* access on regular files,
+/// directories, and sockets. Other inode types read as ENODATA and reject
+/// mutations with EPERM, even when the lower provider contains a record.
 fn inode_supports_user_xattrs(node_type: NodeType) -> bool {
     matches!(
         node_type,
-        NodeType::RegularFile | NodeType::Directory | NodeType::Fifo | NodeType::Socket
+        NodeType::RegularFile | NodeType::Directory | NodeType::Socket
     )
 }
 
@@ -267,7 +269,10 @@ fn list_name_visible(metadata: &Metadata, name: &[u8], can_access_trusted: bool)
     if name.starts_with(b"trusted.") && !can_access_trusted {
         return false;
     }
-    !name.starts_with(b"user.") || inode_supports_user_xattrs(metadata.node_type)
+    // Listing is a separate provider-name operation; do not apply the
+    // get/set/remove permission gate to its existing visibility policy.
+    !name.starts_with(b"user.") || matches!(metadata.node_type,
+        NodeType::RegularFile | NodeType::Directory | NodeType::Fifo | NodeType::Socket)
 }
 
 fn filter_xattr_list(
@@ -391,7 +396,7 @@ mod tests {
         mount
             .root_location()
             .create(
-                "capability-target",
+                axfs_ng_vfs::FsName::new(b"capability-target"),
                 node_type,
                 NodePermission::from_bits_truncate(0o755),
             )
@@ -410,7 +415,7 @@ mod tests {
         let file = mount
             .root_location()
             .create(
-                "capability-provider",
+                axfs_ng_vfs::FsName::new(b"capability-provider"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -682,9 +687,9 @@ mod tests {
     }
 
     #[test]
-    fn user_namespace_xattrs_include_fifo_and_socket_inodes() {
+    fn user_namespace_xattrs_allow_regular_directory_and_socket_inodes() {
         let security = VfsSecurityContext::new(initial_root());
-        for node_type in [NodeType::Fifo, NodeType::Socket] {
+        for node_type in [NodeType::RegularFile, NodeType::Directory, NodeType::Socket] {
             let node = memory_node(node_type);
             set_xattr_with_security(
                 &security,
@@ -704,6 +709,29 @@ mod tests {
             );
             remove_xattr_with_security(&security, &node, b"user.endpoint").unwrap();
         }
+    }
+
+    #[test]
+    fn fifo_user_xattr_access_denies_reads_and_preserves_provider_records() {
+        let security = VfsSecurityContext::new(initial_root());
+        let fifo = memory_node(NodeType::Fifo);
+        let name = b"user.endpoint";
+        assert_eq!(get_xattr_with_security(&security, &fifo, name),
+                   Err(LinuxError::ENODATA.into()));
+        assert_eq!(set_xattr_with_security(&security, &fifo, name, b"new", XattrSetFlags::NONE),
+                   Err(LinuxError::EPERM.into()));
+        assert_eq!(remove_xattr_with_security(&security, &fifo, name),
+                   Err(LinuxError::EPERM.into()));
+        // An imported lower-provider value is equally inaccessible, and
+        // failed writes/removes must not mutate or delete that value.
+        fifo.set_xattr(name, b"imported", XattrSetMode::Upsert).unwrap();
+        assert_eq!(get_xattr_with_security(&security, &fifo, name),
+                   Err(LinuxError::ENODATA.into()));
+        assert_eq!(set_xattr_with_security(&security, &fifo, name, b"new", XattrSetFlags::NONE),
+                   Err(LinuxError::EPERM.into()));
+        assert_eq!(remove_xattr_with_security(&security, &fifo, name),
+                   Err(LinuxError::EPERM.into()));
+        assert_eq!(fifo.get_xattr(name).unwrap(), b"imported");
     }
 
     #[test]

@@ -1,0 +1,30 @@
+[package]
+name = "thekernel-axmm"
+version = "0.3.0-preview.2"
+edition = "2024"
+authors = ["Yuekai Jia <equation618@gmail.com>"]
+description = "ArceOS virtual memory management module"
+license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+homepage = "https://github.com/arceos-org/arceos"
+repository = "https://github.com/arceos-org/arceos/tree/main/modules/axmm"
+
+[features]
+copy = ["page_table_multiarch/copy-from"]
+
+[lib]
+name = "axmm"
+path = "src/lib.rs"
+
+[dependencies]
+axalloc = { package = "thekernel-axalloc", path = "../thekernel-axalloc", version = "=0.3.0-preview.2" }
+axerrno = "0.2"
+axhal = { package = "thekernel-axhal", path = "../thekernel-axhal", version = "=0.3.0-preview.2", features = ["paging"] }
+kspin = "0.1"
+lazyinit = "0.2"
+log = "0.4"
+memory_addr = "0.4"
+memory_set = { package = "thekernel-memory-set", path = "../thekernel-memory-set", version = "0.4", features = ["axerrno"] }
+page_table_multiarch = { package = "thekernel-page-table-multiarch", path = "../thekernel-page-table-multiarch", version = "0.6", features = ["axerrno"], optional = true }
+
+[package.metadata.thekernel]
+layer = "platform"

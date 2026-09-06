@@ -73,7 +73,7 @@ for command in curl debugfs make mke2fs \
     }
 done
 
-mkdir -p "$SOURCE_CACHE" "$REPO_ROOT/.tmp"
+mkdir -p "$SOURCE_CACHE"
 ARCHIVE="$SOURCE_CACHE/busybox-${BUSYBOX_VERSION}.tar.bz2"
 
 if [ ! -f "$ARCHIVE" ]; then
@@ -86,7 +86,7 @@ fi
 
 OUTPUT=$(realpath -m "$OUTPUT")
 mkdir -p "$(dirname -- "$OUTPUT")"
-WORK_ROOT=$(mktemp -d "$REPO_ROOT/.tmp/rootfs.XXXXXX")
+WORK_ROOT=$(mktemp -d "$(dirname -- "$OUTPUT")/.rootfs-build.XXXXXX")
 trap 'rm -rf "$WORK_ROOT"' EXIT
 
 # mke2fs inherits the host's ext4 defaults.  Recent e2fsprogs enables

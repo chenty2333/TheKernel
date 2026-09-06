@@ -147,6 +147,18 @@ impl SimpleFile {
         Self::new_with_permission_and_flags(fs, ty, permission, NodeFlags::NON_CACHEABLE, ops)
     }
 
+    /// Fallibly creates a simple file for a userspace-triggered publication.
+    /// Dynamic pseudo-filesystems must report allocation failure before
+    /// exposing a new name.
+    pub fn try_new_with_permission(
+        fs: Arc<SimpleFs>,
+        ty: NodeType,
+        permission: NodePermission,
+        ops: impl SimpleFileOps,
+    ) -> VfsResult<Arc<Self>> {
+        Self::try_new_with_permission_and_flags(fs, ty, permission, NodeFlags::NON_CACHEABLE, ops)
+    }
+
     fn new_with_permission_and_flags(
         fs: Arc<SimpleFs>,
         ty: NodeType,

@@ -796,6 +796,42 @@ pub fn sys_connect(
     // closing and reusing the numeric descriptor between those two steps.
     let pinned = PinnedSocketDescription::pin_fd(fd)?;
 
+    if pinned.backend() == Ok(SocketBackendKind::Netlink) {
+        let family = super::addr::read_family(&capability, addr, addrlen)? as u32;
+        let address = if family == AF_UNSPEC {
+            None
+        } else {
+            if family != AF_NETLINK
+                || (addrlen as usize) < size_of::<crate::file::netlink::SockaddrNl>()
+            {
+                return Err(AxError::InvalidInput);
+            }
+            Some(unsafe {
+                capability
+                    .read_value_uninit(
+                        addr.address().as_usize() as *const crate::file::netlink::SockaddrNl
+                    )
+                    .map_err(map_usercopy_error)?
+                    .assume_init()
+            })
+        };
+        let prepared = address.map_or(
+            PreparedSocketAddress::Unspecified,
+            PreparedSocketAddress::Netlink,
+        );
+        let socket_ref = pinned.security_ref()?;
+        dispatch_socket(&SocketSecurityContext::connect(
+            snapshot.actor(),
+            &socket_ref,
+            &prepared,
+            addrlen as usize,
+        ))?;
+        pinned
+            .netlink()?
+            .connect(address, snapshot.actor(), snapshot.pid())?;
+        return Ok(0);
+    }
+
     if pinned.backend() == Ok(SocketBackendKind::Packet) {
         // Linux's generic connect layer copies the complete bounded address,
         // runs the security hook, and only then reaches sock_no_connect.

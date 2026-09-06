@@ -72,7 +72,7 @@ fn mincore_snapshot(
         }
 
         // Query page table with batch awareness.
-        let (is_resident, size) = match aspace.page_table().query(addr) {
+        let (is_resident, size) = match aspace.page_table().query_mapped(addr) {
             Ok((_, _, size)) => {
                 // Physical page exists and is resident.
                 (true, size as _)

@@ -38,8 +38,12 @@ static void poll_delay(void)
 static int proc_root_contains(pid_t pid)
 {
     DIR *directory = opendir("/proc");
-    if (directory == NULL)
+    if (directory == NULL) {
+        int saved_errno = errno;
+        fprintf(stderr, "proc-root stage=opendir errno=%d\n", saved_errno);
+        errno = saved_errno;
         return -1;
+    }
 
     char expected[32];
     int length = snprintf(expected, sizeof(expected), "%ld", (long)pid);
@@ -63,6 +67,7 @@ static int proc_root_contains(pid_t pid)
     if (closedir(directory) != 0)
         return -1;
     if (entry == NULL && saved_errno != 0) {
+        fprintf(stderr, "proc-root stage=readdir errno=%d\n", saved_errno);
         errno = saved_errno;
         return -1;
     }

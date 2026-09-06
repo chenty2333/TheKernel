@@ -42,6 +42,8 @@ use super::{
     prepare_physical_io_effect, prepare_physical_io_plan, prepare_physical_io_write_memfd_guard,
     prepare_physical_io_write_privilege_guard, rwf_status,
 };
+#[cfg(feature = "io-submit-batch")]
+use crate::file::io_uring::SubmissionCompletionBatch;
 
 /// Completion bridge for generic owned file I/O.  The exact request identity
 /// includes the reusable slot generation, while the weak ring link prevents a
@@ -220,6 +222,7 @@ fn current_submission_actor(capability: UserMemoryCapability) -> IoUringSubmissi
     let current = axtask::current();
     let thread = current.as_thread();
     IoUringSubmissionActor::new(
+        thread.proc_data.world,
         current_fd_table(),
         capability,
         VfsSecurityContext::new(thread.current_cred()),
@@ -254,7 +257,7 @@ pub fn sys_io_uring_setup(
     .map_err(map_policy_error)?;
 
     let reservation = reserve_fd(true)?;
-    let ring = IoUring::try_new(layout)?;
+    let ring = IoUring::try_new_in_world(layout, axtask::current().as_thread().proc_data.world)?;
     // Construct the final-close owner before any worker can retain an Arc.
     // Every subsequent setup failure then drops this resource and requests
     // worker termination rather than leaking the actor/mm/files snapshot.
@@ -732,11 +735,13 @@ pub fn sys_io_uring_register(
     } else {
         ring_from_fd(fd)?.clone_object()
     };
+    let world = axtask::current().as_thread().proc_data.world;
+    ring.admit_world(world)?;
     let operation = request.decode().map_err(map_policy_error)?;
     match operation {
         RegistrationOperation::RegisterBuffers { argument, count } => {
             let buffers = copy_registered_buffers(&capability, argument, count)?;
-            ring.register_buffers(&capability, buffers)?;
+            ring.register_buffers(world, &capability, buffers)?;
         }
         RegistrationOperation::UnregisterBuffers => ring.unregister_buffers()?,
         RegistrationOperation::RegisterFiles { argument, count } => {
@@ -917,10 +922,11 @@ fn retain_submission_file(
 
 fn retain_submission_buffer(
     ring: &IoUring,
+    world: crate::task::WorldId,
     fixed: (BufferSlot, u64, u32),
 ) -> AxResult<IoUringBufferLease> {
     let (slot, address, length) = fixed;
-    ring.acquire_registered_buffer(slot, address, length)
+    ring.acquire_registered_buffer(world, slot, address, length)
 }
 
 fn submission_io_capability<T: Clone>(
@@ -951,6 +957,70 @@ fn submission_io_range(
     ))
 }
 
+/// Resolves the userspace geometry and, when required, the capability from a
+/// single retained ring lease. The feature-gated submit path uses this to
+/// avoid validating one registered lease once for `capability()` and again
+/// for `range()`; table lifetime and world checks remain owned by the lease.
+#[cfg(feature = "io-submit-batch")]
+fn submission_io_geometry(
+    caller: &UserMemoryCapability,
+    request: ReadWriteRequest,
+    buffer: Option<&IoUringBufferLease>,
+    lease_capability: bool,
+) -> AxResult<(UserMemoryCapability, (usize, usize))> {
+    if !request.uses_ring_buffer() {
+        let buffer = request.buffer();
+        return Ok((
+            caller.clone(),
+            (
+                usize::try_from(buffer.address()).map_err(|_| AxError::BadAddress)?,
+                usize::try_from(buffer.length()).map_err(|_| AxError::BadAddress)?,
+            ),
+        ));
+    }
+
+    let buffer = buffer.ok_or(AxError::BadAddress)?;
+    let (capability, (address, length)) = if lease_capability {
+        buffer.capability_and_range()?
+    } else {
+        (caller.clone(), buffer.range()?)
+    };
+    Ok((
+        capability,
+        (
+            usize::try_from(address).map_err(|_| AxError::BadAddress)?,
+            usize::try_from(length).map_err(|_| AxError::BadAddress)?,
+        ),
+    ))
+}
+
+fn submission_rwf_status(
+    base: crate::file::OfdIoStatus,
+    operation: SubmissionOperation,
+) -> AxResult<(crate::file::OfdIoStatus, u32)> {
+    let (flags, write) = match operation {
+        SubmissionOperation::Read(request) => (request.rw_flags(), false),
+        SubmissionOperation::Write(request) => (request.rw_flags(), true),
+        SubmissionOperation::Readv(request) => (request.rw_flags(), false),
+        SubmissionOperation::Writev(request) => (request.rw_flags(), true),
+        _ => return Ok((base, 0)),
+    };
+    rwf_status(base, flags, write).map(|status| (status, flags))
+}
+
+/// Generic providers create a new user-address pin. Registered buffers must
+/// instead retain their original physical lease, even after fork or COW.
+fn generic_owned_submission_supported(operation: SubmissionOperation) -> bool {
+    match operation {
+        SubmissionOperation::Read(request) => {
+            !request.multishot() && request.fixed_buffer().is_none()
+        }
+        SubmissionOperation::Write(request) => request.fixed_buffer().is_none(),
+        SubmissionOperation::Readv(_) | SubmissionOperation::Writev(_) => true,
+        _ => false,
+    }
+}
+
 /// Performs the generic owned-file preparation while SQ admission still owns
 /// the exact file lease, frozen actor/status, and submitting address space.
 /// A provider's explicit pre-publication refusal is the only fallback signal.
@@ -963,6 +1033,12 @@ fn prepare_owned_submission(
     operation: SubmissionOperation,
     buffer: Option<&IoUringBufferLease>,
 ) -> Result<Option<axfs::PreparedOwnedFileIo>, AxError> {
+    // This executor is an axfs regular-file provider route. Pipes and
+    // sockets retain their stream executors below; a failed File downcast is
+    // provider refusal, not an operation error that may publish a CQE.
+    if description.file_handle().downcast_ref::<File>().is_none() {
+        return Err(AxError::OperationNotSupported);
+    }
     let operation = match operation {
         SubmissionOperation::Read(request) => {
             let write = false;
@@ -1411,7 +1487,29 @@ impl SubmissionOutcome {
     }
 }
 
-fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<SubmissionOutcome> {
+/// Freeze the executor's cancellation contract before any provider handoff.
+/// Physical DMA and synchronous fixed-file I/O have no consuming cancellation
+/// control: execution must retire buffer owners before terminal claim.
+fn submission_cancellation_mode(
+    requires_retirement: bool,
+    owned: bool,
+    command: Option<thekernel_linux_io_uring::CancellationMode>,
+) -> Option<thekernel_linux_io_uring::CancellationMode> {
+    use thekernel_linux_io_uring::CancellationMode;
+    if requires_retirement {
+        Some(CancellationMode::Uncancellable)
+    } else if owned {
+        Some(CancellationMode::ProviderControlled)
+    } else {
+        command
+    }
+}
+
+fn execute_submission(
+    ring: &IoUring,
+    work: SubmissionWork,
+    #[cfg(feature = "io-submit-batch")] mut batch: Option<&mut SubmissionCompletionBatch<'_>>,
+) -> AxResult<SubmissionOutcome> {
     let (
         prepared,
         parsed,
@@ -1431,6 +1529,12 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
             return Ok(SubmissionOutcome::FailedDuringSubmission);
         }
     };
+    #[cfg(feature = "io-submit-batch")]
+    if !matches!(parsed.operation(), SubmissionOperation::Nop) {
+        if let Some(batch) = batch.as_deref_mut() {
+            batch.flush();
+        }
+    }
     let id = prepared.id();
     let command_cancellation = if let SubmissionOperation::UringCmd(request) = parsed.operation() {
         file.as_ref()
@@ -1454,14 +1558,26 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
         None
     };
     // A generic owned provider request retains an explicit consuming cancel
-    // control.  Reads and writes use the same cancellable registry mode;
-    // without this override WRITE/WRITEV would be invisible to ASYNC_CANCEL
-    // and final close despite having a provider-owned long-term pin.
-    let cancellation_mode = if owned.is_some() {
-        Some(thekernel_linux_io_uring::CancellationMode::Cancellable)
-    } else {
-        command_cancellation
-    };
+    // control. Freeze provider-exclusive cancellation at issue, before the
+    // owner/control is published: generic cancel and close must not return a
+    // terminal CQE while submit or its worker can still touch pinned pages.
+    // A borrowed fixed regular-file read may sleep, but it has no external
+    // cancellation owner to stop its copy. Do not let a concurrent cancel
+    // expose a terminal CQE while that copy can still touch the pinned pages.
+    // FIFO fixed reads keep their dedicated pending-stream cancellation path.
+    let borrowed_fixed_read = matches!(parsed.operation(), SubmissionOperation::Read(request)
+        if request.fixed_buffer().is_some())
+        && file.as_ref().is_some_and(|lease| {
+            lease.description().is_ok_and(|description| {
+                FileLikeKind::from_file_like(description.file_handle().as_ref())
+                    == FileLikeKind::Regular
+            })
+        });
+    let cancellation_mode = submission_cancellation_mode(
+        physical.is_some() || borrowed_fixed_read,
+        owned.is_some(),
+        command_cancellation,
+    );
     let Some(issued) = issue_prepared(ring, prepared, cancellation_mode)? else {
         return Ok(SubmissionOutcome::Accepted);
     };
@@ -1501,19 +1617,28 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                 }
             };
         }
-        return ring
-            .publish_owned_file_io(issued, owned, buffer)
-            .map(|_| SubmissionOutcome::Accepted)
-            .map_err(|(error, prepared, buffer)| {
-                drop((prepared, buffer));
-                error
-            });
+        return match ring.publish_owned_file_io(issued, owned, buffer) {
+            Ok(()) => Ok(SubmissionOutcome::Accepted),
+            Err((error, issued, prepared, buffer)) => {
+                // No provider handoff occurred. Retire the prepared resources
+                // and return the already-admitted request's terminal credit.
+                drop(prepared);
+                ring.complete_owned_immediate(issued, negative_errno(error), buffer)
+                    .map(|_| SubmissionOutcome::Accepted)
+            }
+        };
     }
 
     match parsed.operation() {
         SubmissionOperation::Nop => {
             drop(issued);
             drop((file, buffer));
+            #[cfg(feature = "io-submit-batch")]
+            if let Some(batch) = batch.as_deref_mut() {
+                return ring
+                    .complete_request_batched(id, TerminalCause::Completed, 0, 0, batch)
+                    .map(|_| SubmissionOutcome::Accepted);
+            }
             ring.complete_request(id, TerminalCause::Completed, 0, 0)
         }
         SubmissionOperation::OpenAt2(request) => {
@@ -1987,6 +2112,22 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                 )?;
                 return Ok(SubmissionOutcome::Accepted);
             }
+            #[cfg(feature = "io-submit-batch")]
+            let (io_capability, (io_address, io_length)) =
+                match submission_io_geometry(&capability, request, buffer.as_ref(), true) {
+                    Ok(geometry) => geometry,
+                    Err(_) => {
+                        drop((file, buffer));
+                        ring.complete_issued(
+                            issued,
+                            TerminalCause::PreparationFailed,
+                            -LinuxError::EFAULT.code(),
+                            0,
+                        )?;
+                        return Ok(SubmissionOutcome::Accepted);
+                    }
+                };
+            #[cfg(not(feature = "io-submit-batch"))]
             let io_capability =
                 match submission_io_capability(&capability, request.uses_ring_buffer(), || {
                     buffer.as_ref().ok_or(AxError::BadAddress)?.capability()
@@ -2004,6 +2145,7 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                     }
                 };
             let pending_stream = pending_stream_read_supported(&file, request);
+            #[cfg(not(feature = "io-submit-batch"))]
             let (io_address, io_length) = match submission_io_range(request, buffer.as_ref()) {
                 Ok(range) => range,
                 Err(_) => {
@@ -2094,6 +2236,12 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                 .and_then(IoUringBufferLease::provided_id)
                 .map(|id| IORING_CQE_F_BUFFER | (u32::from(id) << 16))
                 .unwrap_or(0);
+            if request.fixed_buffer().is_some() {
+                drop((file, buffer));
+                return ring
+                    .complete_issued(issued, TerminalCause::Completed, result, flags)
+                    .map(|_| SubmissionOutcome::Accepted);
+            }
             let completed = ring.complete_issued_with_claim_hook(
                 issued,
                 TerminalCause::Completed,
@@ -2154,6 +2302,26 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                 )?;
                 return Ok(SubmissionOutcome::Accepted);
             }
+            #[cfg(feature = "io-submit-batch")]
+            let (io_capability, (io_address, io_length)) = match submission_io_geometry(
+                &capability,
+                request,
+                buffer.as_ref(),
+                request.fixed_buffer().is_some(),
+            ) {
+                Ok(geometry) => geometry,
+                Err(_) => {
+                    drop((file, buffer));
+                    ring.complete_request(
+                        id,
+                        TerminalCause::PreparationFailed,
+                        -LinuxError::EFAULT.code(),
+                        0,
+                    )?;
+                    return Ok(SubmissionOutcome::Accepted);
+                }
+            };
+            #[cfg(not(feature = "io-submit-batch"))]
             let io_capability = match submission_io_capability(
                 &capability,
                 request.fixed_buffer().is_some(),
@@ -2171,6 +2339,7 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                     return Ok(SubmissionOutcome::Accepted);
                 }
             };
+            #[cfg(not(feature = "io-submit-batch"))]
             let (io_address, io_length) = match submission_io_range(request, buffer.as_ref()) {
                 Ok(range) => range,
                 Err(_) => {
@@ -2220,10 +2389,9 @@ fn execute_submission(ring: &IoUring, work: SubmissionWork) -> AxResult<Submissi
                     fixed_segments,
                 )
             }));
-            let completed = ring.complete_request(id, TerminalCause::Completed, result, 0);
             drop(file);
             drop(buffer);
-            completed
+            ring.complete_request(id, TerminalCause::Completed, result, 0)
         }
         SubmissionOperation::AsyncCancel { target_user_data } => {
             drop((file, buffer));
@@ -2260,8 +2428,26 @@ pub(crate) fn dispatch_dependency_submission(
     ring: &IoUring,
     dispatch: DependencyDispatch,
 ) -> AxResult<SubmissionOutcome> {
+    dispatch_submission_with_batch(
+        ring,
+        dispatch,
+        #[cfg(feature = "io-submit-batch")]
+        None,
+    )
+}
+
+fn dispatch_submission_with_batch(
+    ring: &IoUring,
+    dispatch: DependencyDispatch,
+    #[cfg(feature = "io-submit-batch")] batch: Option<&mut SubmissionCompletionBatch<'_>>,
+) -> AxResult<SubmissionOutcome> {
     match dispatch {
-        DependencyDispatch::Execute(work) => execute_submission(ring, work),
+        DependencyDispatch::Execute(work) => execute_submission(
+            ring,
+            work,
+            #[cfg(feature = "io-submit-batch")]
+            batch,
+        ),
         DependencyDispatch::Cancelled(work) => {
             complete_preparation_failure(ring, work.into_parts().0, -LinuxError::ECANCELED.code())?;
             Ok(SubmissionOutcome::Accepted)
@@ -2275,254 +2461,304 @@ fn submit_entries(
     requested: u32,
     actor: &IoUringSubmissionActor,
 ) -> AxResult<(u32, bool)> {
+    ring.admit_world(actor.world())?;
     if ring.disabled() {
         return Err(AxError::from(LinuxError::EBADFD));
     }
+    #[cfg(feature = "io-submit-batch")]
+    let mut completion_batch = SubmissionCompletionBatch::new(ring);
     let mut examined = 0;
     let mut submitted = 0;
     while examined < requested {
-        let step = match ring.prepare_submission() {
-            Ok(step) => step,
-            Err(error) if submitted != 0 => {
-                error!("io_uring stopped after {submitted} accepted SQEs: {error:?}");
-                return Ok((submitted, false));
-            }
-            Err(error) => return Err(error),
-        };
-        match step {
-            SubmissionStep::Empty
-            | SubmissionStep::CompletionQueueFull
-            | SubmissionStep::AdmissionBusy => return Ok((submitted, false)),
-            SubmissionStep::Dropped => {
-                examined += 1;
-            }
-            SubmissionStep::Admission(admission) => {
-                examined += 1;
-                let parsed = admission.parsed();
-                let openat2 = match parsed {
-                    Ok(parsed) => match copy_openat2_submission(actor, parsed) {
-                        Ok(work) => work,
-                        Err(error) => {
-                            let work = match admission.commit(
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                actor.memory().clone(),
-                            ) {
-                                Ok(work) => work,
-                                Err(_) if submitted != 0 => {
-                                    return Ok((submitted, false));
-                                }
-                                Err(commit_error) => return Err(commit_error),
-                            };
-                            submitted += 1;
-                            let (prepared, ..) = work.into_parts();
-                            complete_preparation_failure(ring, prepared, negative_errno(error))?;
-                            continue;
-                        }
-                    },
-                    Err(_) => None,
-                };
-                let mut lease = match parsed.ok().and_then(submission_file) {
-                    Some(target) => match retain_submission_file(ring, actor, target) {
-                        Ok(lease) => Some(lease),
-                        Err(error) => {
-                            let work = match admission.commit(
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                actor.memory().clone(),
-                            ) {
-                                Ok(work) => work,
-                                Err(commit_error) if submitted != 0 => {
+        let dispatch = {
+            let step = {
+                #[cfg(feature = "io-submit-batch")]
+                let preparation =
+                    ring.prepare_submission_batched(actor.world(), &mut completion_batch);
+                #[cfg(not(feature = "io-submit-batch"))]
+                let preparation = ring.prepare_submission(actor.world());
+                match preparation {
+                    Ok(step) => step,
+                    Err(error) if submitted != 0 => {
+                        error!("io_uring stopped after {submitted} accepted SQEs: {error:?}");
+                        return Ok((submitted, false));
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            match step {
+                SubmissionStep::Empty
+                | SubmissionStep::CompletionQueueFull
+                | SubmissionStep::AdmissionBusy => return Ok((submitted, false)),
+                SubmissionStep::Dropped => {
+                    examined += 1;
+                    continue;
+                }
+                SubmissionStep::Admission(admission) => {
+                    #[cfg(feature = "io-submit-batch")]
+                    let mut admission = admission;
+                    examined += 1;
+                    let parsed = admission.parsed();
+                    #[cfg(feature = "io-submit-batch")]
+                    if !parsed
+                        .is_ok_and(|parsed| matches!(parsed.operation(), SubmissionOperation::Nop))
+                    {
+                        // File/socket/metadata execution and preparation may wait
+                        // for another task which first needs an earlier CQE.
+                        admission.flush_notifications();
+                    }
+                    let openat2 = match parsed {
+                        Ok(parsed) => match copy_openat2_submission(actor, parsed) {
+                            Ok(work) => work,
+                            Err(error) => {
+                                let work = match admission.commit(
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    actor.memory().clone(),
+                                ) {
+                                    Ok(work) => work,
+                                    Err(_) if submitted != 0 => {
+                                        return Ok((submitted, false));
+                                    }
+                                    Err(commit_error) => return Err(commit_error),
+                                };
+                                submitted += 1;
+                                let (prepared, ..) = work.into_parts();
+                                complete_preparation_failure(
+                                    ring,
+                                    prepared,
+                                    negative_errno(error),
+                                )?;
+                                continue;
+                            }
+                        },
+                        Err(_) => None,
+                    };
+                    let mut lease = match parsed.ok().and_then(submission_file) {
+                        Some(target) => match retain_submission_file(ring, actor, target) {
+                            Ok(lease) => Some(lease),
+                            Err(error) => {
+                                let work = match admission.commit(
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    actor.memory().clone(),
+                                ) {
+                                    Ok(work) => work,
+                                    Err(commit_error) if submitted != 0 => {
+                                        error!(
+                                            "io_uring stopped before committing a file-binding \
+                                             error: {commit_error:?}"
+                                        );
+                                        return Ok((submitted, false));
+                                    }
+                                    Err(commit_error) => return Err(commit_error),
+                                };
+                                submitted += 1;
+                                let (prepared, ..) = work.into_parts();
+                                if let Err(completion_error) = complete_preparation_failure(
+                                    ring,
+                                    prepared,
+                                    negative_errno(error),
+                                ) {
                                     error!(
-                                        "io_uring stopped before committing a file-binding error: \
-                                         {commit_error:?}"
+                                        "io_uring failed to publish file-binding error after \
+                                         acceptance: {completion_error:?}"
                                     );
                                     return Ok((submitted, false));
                                 }
-                                Err(commit_error) => return Err(commit_error),
-                            };
-                            submitted += 1;
-                            let (prepared, ..) = work.into_parts();
-                            if let Err(completion_error) =
-                                complete_preparation_failure(ring, prepared, negative_errno(error))
-                            {
-                                error!(
-                                    "io_uring failed to publish file-binding error after \
-                                     acceptance: {completion_error:?}"
-                                );
-                                return Ok((submitted, false));
+                                // Linux resolves ordinary and fixed files at issue
+                                // time. An EBADF CQE is therefore not a submission
+                                // preparation failure and does not stop the batch.
+                                continue;
                             }
-                            // Linux resolves ordinary and fixed files at issue
-                            // time. An EBADF CQE is therefore not a submission
-                            // preparation failure and does not stop the batch.
-                            continue;
-                        }
-                    },
-                    None => None,
-                };
+                        },
+                        None => None,
+                    };
 
-                let mut buffer = match parsed.ok().and_then(submission_buffer) {
-                    Some(fixed) => match retain_submission_buffer(ring, fixed) {
-                        Ok(buffer) => Some(buffer),
-                        Err(error) => {
-                            drop(lease);
-                            let work = match admission.commit(
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                actor.memory().clone(),
-                            ) {
-                                Ok(work) => work,
-                                Err(commit_error) if submitted != 0 => {
+                    let mut buffer = match parsed.ok().and_then(submission_buffer) {
+                        Some(fixed) => match retain_submission_buffer(ring, actor.world(), fixed) {
+                            Ok(buffer) => Some(buffer),
+                            Err(error) => {
+                                drop(lease);
+                                let work = match admission.commit(
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    actor.memory().clone(),
+                                ) {
+                                    Ok(work) => work,
+                                    Err(commit_error) if submitted != 0 => {
+                                        error!(
+                                            "io_uring stopped before committing a buffer-binding \
+                                             error: {commit_error:?}"
+                                        );
+                                        return Ok((submitted, false));
+                                    }
+                                    Err(commit_error) => return Err(commit_error),
+                                };
+                                submitted += 1;
+                                let (prepared, ..) = work.into_parts();
+                                if let Err(completion_error) = complete_preparation_failure(
+                                    ring,
+                                    prepared,
+                                    negative_errno(error),
+                                ) {
                                     error!(
-                                        "io_uring stopped before committing a buffer-binding \
-                                         error: {commit_error:?}"
+                                        "io_uring failed to publish buffer-binding error after \
+                                         acceptance: {completion_error:?}"
                                     );
                                     return Ok((submitted, false));
                                 }
-                                Err(commit_error) => return Err(commit_error),
-                            };
-                            submitted += 1;
-                            let (prepared, ..) = work.into_parts();
-                            if let Err(completion_error) =
-                                complete_preparation_failure(ring, prepared, negative_errno(error))
-                            {
-                                error!(
-                                    "io_uring failed to publish buffer-binding error after \
-                                     acceptance: {completion_error:?}"
-                                );
-                                return Ok((submitted, false));
+                                // A bad fixed-buffer index/range is an operation
+                                // error; later SQEs in the default batch remain
+                                // eligible for admission.
+                                continue;
                             }
-                            // A bad fixed-buffer index/range is an operation
-                            // error; later SQEs in the default batch remain
-                            // eligible for admission.
-                            continue;
-                        }
-                    },
-                    None => None,
-                };
+                        },
+                        None => None,
+                    };
 
-                if buffer.is_none()
-                    && let Some(group) = parsed.ok().and_then(submission_provided_buffer)
-                {
-                    match ring.acquire_provided_buffer(group) {
-                        Ok(lease) => buffer = Some(lease),
-                        Err(error) => {
-                            drop(lease);
-                            let work = match admission.commit(
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                actor.memory().clone(),
-                            ) {
-                                Ok(work) => work,
-                                Err(commit_error) if submitted != 0 => {
+                    if buffer.is_none()
+                        && let Some(group) = parsed.ok().and_then(submission_provided_buffer)
+                    {
+                        match ring.acquire_provided_buffer(group) {
+                            Ok(lease) => buffer = Some(lease),
+                            Err(error) => {
+                                drop(lease);
+                                let work = match admission.commit(
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    actor.memory().clone(),
+                                ) {
+                                    Ok(work) => work,
+                                    Err(commit_error) if submitted != 0 => {
+                                        error!(
+                                            "io_uring stopped before committing provided-buffer \
+                                             error: {commit_error:?}"
+                                        );
+                                        return Ok((submitted, false));
+                                    }
+                                    Err(commit_error) => return Err(commit_error),
+                                };
+                                submitted += 1;
+                                let (prepared, ..) = work.into_parts();
+                                if let Err(completion_error) = complete_preparation_failure(
+                                    ring,
+                                    prepared,
+                                    negative_errno(error),
+                                ) {
                                     error!(
-                                        "io_uring stopped before committing provided-buffer \
-                                         error: {commit_error:?}"
+                                        "io_uring failed to publish provided-buffer error after \
+                                         acceptance: {completion_error:?}"
                                     );
                                     return Ok((submitted, false));
                                 }
-                                Err(commit_error) => return Err(commit_error),
-                            };
-                            submitted += 1;
-                            let (prepared, ..) = work.into_parts();
-                            if let Err(completion_error) =
-                                complete_preparation_failure(ring, prepared, negative_errno(error))
-                            {
-                                error!(
-                                    "io_uring failed to publish provided-buffer error after \
-                                     acceptance: {completion_error:?}"
-                                );
-                                return Ok((submitted, false));
+                                continue;
                             }
-                            continue;
                         }
                     }
-                }
 
-                // Capture the immutable actor/OFD snapshot while the SQE is
-                // still being admitted.  The retained lease supplies the
-                // exact description; execution must not recreate this from
-                // whichever task happens to drain a future work item.
-                let mut context = match parsed.ok().map(ParsedSubmission::operation) {
-                    Some(SubmissionOperation::Read(_))
-                    | Some(SubmissionOperation::Write(_))
-                    | Some(SubmissionOperation::Readv(_))
-                    | Some(SubmissionOperation::Writev(_))
-                    | Some(SubmissionOperation::Fallocate(_))
-                    | Some(SubmissionOperation::Shutdown(_))
-                    | Some(SubmissionOperation::Accept(_)) => lease
-                        .as_ref()
-                        .map(|lease| {
-                            lease.description().map(|description| {
-                                capture_io_operation_context_for_actor(
-                                    description,
-                                    actor.security().clone(),
-                                    actor.fanotify_actor(),
-                                )
+                    // Capture the immutable actor/OFD snapshot while the SQE is
+                    // still being admitted.  The retained lease supplies the
+                    // exact description; execution must not recreate this from
+                    // whichever task happens to drain a future work item.
+                    let mut context = match parsed.ok().map(ParsedSubmission::operation) {
+                        Some(SubmissionOperation::Read(_))
+                        | Some(SubmissionOperation::Write(_))
+                        | Some(SubmissionOperation::Readv(_))
+                        | Some(SubmissionOperation::Writev(_))
+                        | Some(SubmissionOperation::Fallocate(_))
+                        | Some(SubmissionOperation::Shutdown(_))
+                        | Some(SubmissionOperation::Accept(_)) => lease
+                            .as_ref()
+                            .map(|lease| {
+                                lease.description().map(|description| {
+                                    capture_io_operation_context_for_actor(
+                                        description,
+                                        actor.security().clone(),
+                                        actor.fanotify_actor(),
+                                    )
+                                })
                             })
-                        })
-                        .transpose()?,
-                    _ => None,
-                };
-
-                // Only a fixed-buffer regular ext4 O_DIRECT request can
-                // receive an owned worker token. Policy failures are carried
-                // into the accepted CQE so execution does not repeat a
-                // fanotify wait or RLIMIT_FSIZE signal.
-                let mut physical = None;
-                let mut owned = None;
-                let mut admission_error = None;
-                if physical_effect_admission_enabled()
-                    && let Ok(parsed) = parsed
-                {
-                    let operation = match parsed.operation() {
-                        SubmissionOperation::Read(request) if request.fixed_buffer().is_some() => {
-                            Some((PreparedPhysicalIoOperation::Read, request))
-                        }
-                        SubmissionOperation::Write(request) if request.fixed_buffer().is_some() => {
-                            Some((PreparedPhysicalIoOperation::Write, request))
-                        }
+                            .transpose()?,
                         _ => None,
                     };
-                    if let Some((operation, request)) = operation
-                        && let (Some(file_lease), Some(buffer_lease), Some(context_ref)) =
-                            (lease.as_ref(), buffer.as_ref(), context.as_ref())
+
+                    // Resolve operation-local flags before choosing an executor.
+                    // Fixed buffers bypass the generic owned provider, so setting
+                    // NOWAIT only there would let physical planning block and
+                    // would also lose flags on the borrowed pinned-buffer path.
+                    let mut admission_error = None;
+                    if let (Some(captured), Ok(parsed)) = (context.take(), parsed) {
+                        match submission_rwf_status(captured.status(), parsed.operation()) {
+                            Ok((status, flags)) => {
+                                context = Some(captured.with_status(status).with_rwf_flags(flags));
+                            }
+                            Err(error) => admission_error = Some(error),
+                        }
+                    }
+
+                    // Only a fixed-buffer regular ext4 O_DIRECT request can
+                    // receive an owned worker token. Policy failures are carried
+                    // into the accepted CQE so execution does not repeat a
+                    // fanotify wait or RLIMIT_FSIZE signal.
+                    let mut physical = None;
+                    let mut owned = None;
+                    if admission_error.is_none()
+                        && physical_effect_admission_enabled()
+                        && let Ok(parsed) = parsed
                     {
-                        match prepare_physical_io_plan(
-                            file_lease,
-                            buffer_lease,
-                            context_ref,
-                            operation,
-                            request.offset(),
-                        ) {
-                            Ok(Some(plan)) => {
-                                match prepare_physical_io_write_memfd_guard(
-                                    file_lease,
-                                    context_ref,
-                                    &plan,
-                                ) {
-                                    Ok(memfd) => {
-                                        match prepare_physical_io_effect(file_lease, &plan) {
-                                            Ok(Some(effect)) => {
-                                                match prepare_physical_io_write_privilege_guard(
-                                                    file_lease,
-                                                    context_ref,
-                                                    &plan,
-                                                ) {
-                                                    Ok(privilege) => {
-                                                        let mutation = if plan.operation()
+                        let operation = match parsed.operation() {
+                            SubmissionOperation::Read(request)
+                                if request.fixed_buffer().is_some() =>
+                            {
+                                Some((PreparedPhysicalIoOperation::Read, request))
+                            }
+                            SubmissionOperation::Write(request)
+                                if request.fixed_buffer().is_some() =>
+                            {
+                                Some((PreparedPhysicalIoOperation::Write, request))
+                            }
+                            _ => None,
+                        };
+                        if let Some((operation, request)) = operation
+                            && let (Some(file_lease), Some(buffer_lease), Some(context_ref)) =
+                                (lease.as_ref(), buffer.as_ref(), context.as_ref())
+                        {
+                            match prepare_physical_io_plan(
+                                file_lease,
+                                buffer_lease,
+                                context_ref,
+                                operation,
+                                request.offset(),
+                            ) {
+                                Ok(Some(plan)) => {
+                                    match prepare_physical_io_write_memfd_guard(
+                                        file_lease,
+                                        context_ref,
+                                        &plan,
+                                    ) {
+                                        Ok(memfd) => {
+                                            match prepare_physical_io_effect(file_lease, &plan) {
+                                                Ok(Some(effect)) => {
+                                                    match prepare_physical_io_write_privilege_guard(
+                                                        file_lease,
+                                                        context_ref,
+                                                        &plan,
+                                                    ) {
+                                                        Ok(privilege) => {
+                                                            let mutation = if plan.operation()
                                                             == PreparedPhysicalIoOperation::Write
                                                         {
                                                             file_lease
@@ -2538,180 +2774,184 @@ fn submit_entries(
                                                         } else {
                                                             None
                                                         };
-                                                        let file_lease = lease
-                                                            .take()
-                                                            .ok_or(AxError::BadState)?;
-                                                        let buffer_lease = buffer
-                                                            .take()
-                                                            .ok_or(AxError::BadState)?;
-                                                        let prepared =
-                                                            PreparedPhysicalIoAdmission::new(
-                                                                file_lease,
-                                                                buffer_lease,
-                                                                context
-                                                                    .take()
-                                                                    .ok_or(AxError::BadState)?,
-                                                                plan,
-                                                                memfd,
-                                                                privilege,
-                                                                mutation,
-                                                                effect,
-                                                            );
-                                                        match prepared {
-                                                            Ok(prepared) => {
-                                                                physical = Some(prepared)
-                                                            }
-                                                            Err(error) => {
-                                                                admission_error = Some(error)
+                                                            let file_lease = lease
+                                                                .take()
+                                                                .ok_or(AxError::BadState)?;
+                                                            let buffer_lease = buffer
+                                                                .take()
+                                                                .ok_or(AxError::BadState)?;
+                                                            let prepared =
+                                                                PreparedPhysicalIoAdmission::new(
+                                                                    file_lease,
+                                                                    buffer_lease,
+                                                                    context
+                                                                        .take()
+                                                                        .ok_or(AxError::BadState)?,
+                                                                    plan,
+                                                                    memfd,
+                                                                    privilege,
+                                                                    mutation,
+                                                                    effect,
+                                                                );
+                                                            match prepared {
+                                                                Ok(prepared) => {
+                                                                    physical = Some(prepared)
+                                                                }
+                                                                Err(error) => {
+                                                                    admission_error = Some(error)
+                                                                }
                                                             }
                                                         }
+                                                        Err(error) => admission_error = Some(error),
                                                     }
-                                                    Err(error) => admission_error = Some(error),
                                                 }
+                                                Ok(None) => {}
+                                                Err(error) => admission_error = Some(error),
                                             }
-                                            Ok(None) => {}
-                                            Err(error) => admission_error = Some(error),
                                         }
+                                        Err(error) => admission_error = Some(error),
                                     }
-                                    Err(error) => admission_error = Some(error),
                                 }
+                                Ok(None) => {}
+                                Err(error) => admission_error = Some(error),
                             }
-                            Ok(None) => {}
-                            Err(error) => admission_error = Some(error),
                         }
                     }
-                }
 
-                // Generic owned I/O pins before SQE publication.  IOPOLL has
-                // no generic provider-harvest contract, so reject before
-                // pinning instead of accepting a request we cannot retire.
-                if physical.is_none()
-                    && admission_error.is_none()
-                    && let Ok(parsed) = parsed
-                    && match parsed.operation() {
-                        SubmissionOperation::Read(request) => !request.multishot(),
-                        SubmissionOperation::Write(_)
-                        | SubmissionOperation::Readv(_)
-                        | SubmissionOperation::Writev(_) => true,
-                        _ => false,
-                    }
-                {
-                    if ring.iopoll_enabled() {
-                        admission_error = Some(AxError::OperationNotSupported);
-                    } else if let (Some(file_lease), Some(context_ref)) =
-                        (lease.as_ref(), context.as_ref())
+                    // Generic owned I/O pins before SQE publication.  IOPOLL has
+                    // no generic provider-harvest contract, so reject before
+                    // pinning instead of accepting a request we cannot retire.
+                    if physical.is_none()
+                        && admission_error.is_none()
+                        && let Ok(parsed) = parsed
+                        && generic_owned_submission_supported(parsed.operation())
                     {
-                        match file_lease.description().and_then(|description| {
-                            prepare_owned_submission(
-                                ring,
-                                admission.id()?,
-                                actor.memory().clone(),
-                                &description,
-                                context_ref.clone(),
-                                parsed.operation(),
-                                buffer.as_ref(),
-                            )
-                        }) {
-                            Ok(prepared) => owned = prepared,
-                            // Only an explicit pre-publication provider
-                            // refusal selects the legacy borrowed route.
-                            Err(AxError::OperationNotSupported) => {}
-                            Err(error) => admission_error = Some(error),
+                        if ring.iopoll_enabled() {
+                            admission_error = Some(AxError::OperationNotSupported);
+                        } else if let (Some(file_lease), Some(context_ref)) =
+                            (lease.as_ref(), context.as_ref())
+                        {
+                            match file_lease.description().and_then(|description| {
+                                prepare_owned_submission(
+                                    ring,
+                                    admission.id()?,
+                                    actor.memory().clone(),
+                                    &description,
+                                    context_ref.clone(),
+                                    parsed.operation(),
+                                    buffer.as_ref(),
+                                )
+                            }) {
+                                Ok(prepared) => owned = prepared,
+                                // Only an explicit pre-publication provider
+                                // refusal selects the legacy borrowed route.
+                                Err(AxError::OperationNotSupported) => {}
+                                Err(error) => admission_error = Some(error),
+                            }
                         }
                     }
-                }
 
-                // IOPOLL is a provider completion contract, not a request
-                // scheduling hint.  Never execute an ordinary buffered,
-                // socket, or metadata operation synchronously on an IOPOLL
-                // ring: it must have reached the bounded physical provider
-                // path above, otherwise its accepted SQE receives the normal
-                // per-operation EOPNOTSUPP CQE.
-                let iopoll_uring_cmd = parsed.ok().is_some_and(|parsed| {
-                    let SubmissionOperation::UringCmd(command) = parsed.operation() else {
-                        return false;
-                    };
-                    lease
-                        .as_ref()
-                        .and_then(|lease| lease.description().ok())
-                        .is_some_and(|description| {
-                            description
-                                .file_handle()
-                                .uring_cmd_manifest()
-                                .iter()
-                                .any(|entry| entry.command() == command.command() && entry.iopoll())
-                        })
-                });
-                if ring.iopoll_enabled()
-                    && physical.is_none()
-                    && !iopoll_uring_cmd
-                    && admission_error.is_none()
-                {
-                    admission_error = Some(AxError::OperationNotSupported);
-                }
+                    // IOPOLL is a provider completion contract, not a request
+                    // scheduling hint.  Never execute an ordinary buffered,
+                    // socket, or metadata operation synchronously on an IOPOLL
+                    // ring: it must have reached the bounded physical provider
+                    // path above, otherwise its accepted SQE receives the normal
+                    // per-operation EOPNOTSUPP CQE.
+                    let iopoll_uring_cmd =
+                        parsed.ok().is_some_and(|parsed| {
+                            let SubmissionOperation::UringCmd(command) = parsed.operation() else {
+                                return false;
+                            };
+                            lease
+                                .as_ref()
+                                .and_then(|lease| lease.description().ok())
+                                .is_some_and(|description| {
+                                    description.file_handle().uring_cmd_manifest().iter().any(
+                                        |entry| {
+                                            entry.command() == command.command() && entry.iopoll()
+                                        },
+                                    )
+                                })
+                        });
+                    if ring.iopoll_enabled()
+                        && physical.is_none()
+                        && !iopoll_uring_cmd
+                        && admission_error.is_none()
+                    {
+                        admission_error = Some(AxError::OperationNotSupported);
+                    }
 
-                if !ring.iopoll_enabled()
-                    && let Ok(parsed) = parsed
-                    && let SubmissionOperation::PollAdd(request) = parsed.operation()
-                {
-                    let lease = lease.ok_or(AxError::BadState)?;
-                    if let Err(error) = admission.commit_poll(
+                    if !ring.iopoll_enabled()
+                        && let Ok(parsed) = parsed
+                        && let SubmissionOperation::PollAdd(request) = parsed.operation()
+                    {
+                        let lease = lease.ok_or(AxError::BadState)?;
+                        if let Err(error) = admission.commit_poll(
+                            lease,
+                            request.events(),
+                            request.multishot(),
+                            actor.memory().clone(),
+                        ) {
+                            if submitted != 0 {
+                                error!("io_uring stopped before POLL admission: {error:?}");
+                                return Ok((submitted, false));
+                            }
+                            return Err(error);
+                        }
+                        submitted += 1;
+                        continue;
+                    }
+
+                    let mut work = match admission.commit_with_openat2(
                         lease,
-                        request.events(),
-                        request.multishot(),
+                        buffer,
+                        context,
+                        physical,
+                        admission_error,
+                        openat2,
                         actor.memory().clone(),
                     ) {
-                        if submitted != 0 {
-                            error!("io_uring stopped before POLL admission: {error:?}");
+                        Ok(work) => work,
+                        Err(error) if submitted != 0 => {
+                            error!("io_uring stopped before SQ admission commit: {error:?}");
                             return Ok((submitted, false));
                         }
-                        return Err(error);
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(owned) = owned {
+                        if let Err(error) = work.set_owned(owned) {
+                            let (prepared, ..) = work.into_parts();
+                            complete_preparation_failure(ring, prepared, negative_errno(error))?;
+                            return Ok((submitted, false));
+                        }
                     }
                     submitted += 1;
-                    continue;
+                    let dispatch = match ring.submit_with_dependencies(work) {
+                        Ok(dispatch) => dispatch,
+                        Err(error) => {
+                            error!(
+                                "io_uring dependency admission failed after acceptance: {error:?}"
+                            );
+                            return Ok((submitted, false));
+                        }
+                    };
+                    dispatch
                 }
-
-                let mut work = match admission.commit_with_openat2(
-                    lease,
-                    buffer,
-                    context,
-                    physical,
-                    admission_error,
-                    openat2,
-                    actor.memory().clone(),
-                ) {
-                    Ok(work) => work,
-                    Err(error) if submitted != 0 => {
-                        error!("io_uring stopped before SQ admission commit: {error:?}");
-                        return Ok((submitted, false));
-                    }
-                    Err(error) => return Err(error),
-                };
-                if let Some(owned) = owned {
-                    if let Err(error) = work.set_owned(owned) {
-                        let (prepared, ..) = work.into_parts();
-                        complete_preparation_failure(ring, prepared, negative_errno(error))?;
-                        return Ok((submitted, false));
-                    }
-                }
-                submitted += 1;
-                let dispatch = match ring.submit_with_dependencies(work) {
-                    Ok(dispatch) => dispatch,
-                    Err(error) => {
-                        error!("io_uring dependency admission failed after acceptance: {error:?}");
-                        return Ok((submitted, false));
-                    }
-                };
-                match dispatch_dependency_submission(ring, dispatch) {
-                    Ok(outcome) if outcome.stops_default_batch() => {
-                        return Ok((submitted, false));
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        error!("io_uring completion failed after acceptance: {error:?}");
-                        return Ok((submitted, false));
-                    }
-                }
+            }
+        };
+        match dispatch_submission_with_batch(
+            ring,
+            dispatch,
+            #[cfg(feature = "io-submit-batch")]
+            Some(&mut completion_batch),
+        ) {
+            Ok(outcome) if outcome.stops_default_batch() => {
+                return Ok((submitted, false));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!("io_uring completion failed after acceptance: {error:?}");
+                return Ok((submitted, false));
             }
         }
     }
@@ -2826,6 +3066,7 @@ pub fn sys_io_uring_enter(
     } else {
         ring_from_fd(fd)?.clone_object()
     };
+    ring.admit_world(axtask::current().as_thread().proc_data.world)?;
     if ring.disabled() {
         return Err(AxError::from(LinuxError::EBADFD));
     }
@@ -3119,6 +3360,58 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn physical_read_handoff_blocks_cancel_and_close_until_retirement() {
+        use thekernel_linux_io_uring::{
+            CancelSelector, CancellationMode, RequestDescriptor, RequestOperation, RequestRegistry,
+            RingId,
+        };
+
+        for physical in [false, true] {
+            let mut requests = RequestRegistry::new(RingId::new(1).unwrap(), 1, 1).unwrap();
+            let reservation = requests
+                .reserve(RequestDescriptor::new(7, RequestOperation::Read))
+                .unwrap();
+            let prepared = requests.commit(reservation).unwrap();
+            let issued = requests
+                .issue_with_cancellation_mode(
+                    prepared,
+                    submission_cancellation_mode(physical, false, None),
+                )
+                .unwrap();
+            let completion = if physical {
+                assert_eq!(issued.cancellation_mode(), CancellationMode::Uncancellable);
+                assert!(matches!(
+                    requests.claim_cancel(CancelSelector::UserData(7), None),
+                    Err(IoUringError::CancellationTargetNotFound)
+                ));
+                assert!(matches!(
+                    requests.claim_terminal(issued.id(), TerminalCause::Closing),
+                    Err(IoUringError::RequestUncancellable)
+                ));
+                assert!(requests.issued_is_live(&issued));
+                assert_eq!(requests.progress().unwrap().completion_pending(), 0);
+                // The executor can claim terminal only at its retirement edge.
+                let permit = requests
+                    .claim_terminal(issued.id(), TerminalCause::Completed)
+                    .unwrap();
+                requests.finish_terminal(permit, 4096, 0).unwrap()
+            } else {
+                assert_eq!(issued.cancellation_mode(), CancellationMode::Cancellable);
+                let permit = requests
+                    .claim_cancel(CancelSelector::UserData(7), None)
+                    .unwrap();
+                requests
+                    .finish_terminal(permit, -LinuxError::ECANCELED.code(), 0)
+                    .unwrap()
+            };
+            requests.begin_close().unwrap();
+            requests.begin_draining().unwrap();
+            requests.discard_completion(completion).unwrap();
+            requests.finish_close().unwrap();
+        }
+    }
+
     #[derive(Clone)]
     struct TestIoCapability {
         address_space: Arc<Mutex<[u8; 1]>>,
@@ -3218,6 +3511,43 @@ mod tests {
     fn default_batch_stops_after_a_submission_failure() {
         assert!(SubmissionOutcome::FailedDuringSubmission.stops_default_batch());
         assert!(!SubmissionOutcome::Accepted.stops_default_batch());
+    }
+
+    #[test]
+    fn fixed_nowait_flags_reach_executor_selection_without_mutating_ofd() {
+        let base = crate::file::OfdIoStatus::new(0);
+        for opcode in [4, 5] {
+            let mut bytes = [0; thekernel_linux_io_uring::SQE_BYTES as usize];
+            bytes[0] = opcode;
+            bytes[28..32].copy_from_slice(&8_u32.to_le_bytes());
+            let operation = ParsedSubmission::parse(bytes).unwrap().operation();
+            let (resolved, flags) = submission_rwf_status(base, operation).unwrap();
+            assert!(resolved.rwf_nowait());
+            assert_eq!(flags, 8);
+            assert!(!base.rwf_nowait());
+            assert!(!generic_owned_submission_supported(operation));
+        }
+    }
+
+    #[test]
+    fn fixed_read_write_never_repin_the_submitting_address_space() {
+        for (opcode, generic) in [
+            (4, false),
+            (5, false),
+            (22, true),
+            (23, true),
+            (1, true),
+            (2, true),
+        ] {
+            let mut bytes = [0; thekernel_linux_io_uring::SQE_BYTES as usize];
+            bytes[0] = opcode;
+            let operation = ParsedSubmission::parse(bytes).unwrap().operation();
+            assert_eq!(
+                generic_owned_submission_supported(operation),
+                generic,
+                "opcode {opcode}"
+            );
+        }
     }
 
     #[test]

@@ -71,6 +71,11 @@ impl FanotifyEventActor {
             .unwrap_or_default()
     }
 
+    pub(crate) const fn process_id(self) -> u32 { self.tgid as u32 }
+
+    #[cfg(test)]
+    pub(crate) const fn test_process(tgid: c_int) -> Self { Self { tid: tgid, tgid } }
+
     fn pid_for(self, file: &FanotifyFile) -> c_int {
         if file.flags & FAN_REPORT_TID != 0 {
             self.tid
@@ -152,7 +157,7 @@ impl FanotifyCleanupDrainGuard {
         FANOTIFY_CLEANUP_DRAINING
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-            .then_some(Self)
+            .then(|| Self)
     }
 }
 
@@ -1459,6 +1464,16 @@ pub(crate) fn notify_with_keys_and_actor(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rejected_drain_guard_preserves_existing_owner() {
+        let _context = crate::test_support::scheduler_test_context();
+        let first = super::FanotifyCleanupDrainGuard::try_enter().expect("first drain owner");
+        assert!(super::FanotifyCleanupDrainGuard::try_enter().is_none());
+        assert!(super::FanotifyCleanupDrainGuard::try_enter().is_none());
+        drop(first);
+        assert!(super::FanotifyCleanupDrainGuard::try_enter().is_some());
+    }
+
     use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
     use core::{ptr, sync::atomic::AtomicPtr};
 
@@ -1491,6 +1506,12 @@ mod tests {
 
         fn flush(&mut self) -> AxResult<()> {
             Ok(())
+        }
+    }
+
+    impl axio::IoBuf for FaultAfterWrites {
+        fn remaining(&self) -> usize {
+            self.remaining
         }
     }
 

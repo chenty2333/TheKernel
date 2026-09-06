@@ -8,7 +8,7 @@ mod atomic;
 mod device;
 mod dmabuf;
 mod fbdev;
-mod fence;
+pub(crate) mod fence;
 mod file;
 mod gem;
 mod ioctl;
