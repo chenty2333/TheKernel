@@ -67,6 +67,8 @@ static DIAGNOSTIC_PRESENT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 #[cfg(target_os = "none")]
 const DIAGNOSTIC_BASE: u16 = 0x2f8;
+#[cfg(target_os = "none")]
+const DIAGNOSTIC_POLL_BUDGET: usize = 1_000_000;
 
 fn init_diagnostic() {
     #[cfg(target_os = "none")]
@@ -102,6 +104,18 @@ fn init_diagnostic() {
 }
 
 #[cfg(any(target_os = "none", test))]
+fn wait_bounded(budget: &mut usize, mut ready: impl FnMut() -> bool) -> bool {
+    while *budget != 0 {
+        *budget -= 1;
+        if ready() {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+#[cfg(any(target_os = "none", test))]
 fn write_bounded(
     bytes: &[u8],
     budget: &mut usize,
@@ -110,20 +124,28 @@ fn write_bounded(
 ) -> usize {
     let mut written = 0;
     for &byte in bytes {
-        while *budget != 0 {
-            *budget -= 1;
-            if ready() {
-                send(byte);
-                written += 1;
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        if *budget == 0 {
+        if !wait_bounded(budget, &mut ready) {
             break;
         }
+        send(byte);
+        written += 1;
     }
     written
+}
+
+/// Gives accepted diagnostic bytes a bounded chance to leave the UART before
+/// power-off. TEMT includes the shift register; THRE alone is insufficient.
+pub(crate) fn flush_diagnostic() {
+    #[cfg(target_os = "none")]
+    if let Some(_guard) = DIAGNOSTIC.try_lock()
+        && diagnostic_available()
+    {
+        let mut budget = DIAGNOSTIC_POLL_BUDGET;
+        let _ = wait_bounded(&mut budget, || unsafe {
+            let status = x86::io::inb(DIAGNOSTIC_BASE + 5);
+            status != 0xff && status & 0x40 != 0
+        });
+    }
 }
 
 #[cfg(target_os = "none")]
@@ -191,7 +213,7 @@ pub fn emergency_diagnostic_print(args: core::fmt::Arguments<'_>) {
             }
         }
         use core::fmt::Write;
-        let _ = Writer(1_000_000).write_fmt(args);
+        let _ = Writer(DIAGNOSTIC_POLL_BUDGET).write_fmt(args);
     }
     let _ = args;
 }
@@ -199,6 +221,30 @@ pub fn emergency_diagnostic_print(args: core::fmt::Arguments<'_>) {
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+
+    #[test]
+    fn terminal_flush_stops_when_transmitter_becomes_empty() {
+        let mut budget = 7;
+        let mut checks = 0;
+        assert!(wait_bounded(&mut budget, || {
+            checks += 1;
+            checks == 3
+        }));
+        assert_eq!(checks, 3);
+        assert_eq!(budget, 4);
+    }
+
+    #[test]
+    fn stalled_terminal_flush_exhausts_shared_budget() {
+        let mut budget = 7;
+        let mut checks = 0;
+        assert!(!wait_bounded(&mut budget, || {
+            checks += 1;
+            false
+        }));
+        assert_eq!(checks, 7);
+        assert_eq!(budget, 0);
+    }
 
     #[test]
     fn stalled_uart_exhausts_shared_budget() {
@@ -236,5 +282,6 @@ mod diagnostic_tests {
         assert!(!diagnostic_available());
         assert_eq!(try_write_diagnostic_bytes(b"host"), 0);
         emergency_diagnostic_print(format_args!("host {}", 42));
+        flush_diagnostic();
     }
 }

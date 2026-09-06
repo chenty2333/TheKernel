@@ -30,8 +30,10 @@ impl PowerIf for PowerImpl {
             axplat::console_println!("System will reboot, press any key to continue ...");
             while super::console::getchar().is_none() {}
             axplat::console_println!("Rebooting ...");
+            crate::console::flush_diagnostic();
             unsafe { PortWriteOnly::new(0x64).write(0xfeu8) };
         } else {
+            crate::console::flush_diagnostic();
             unsafe { PortWriteOnly::new(0x604).write(0x2000u16) };
         }
 
