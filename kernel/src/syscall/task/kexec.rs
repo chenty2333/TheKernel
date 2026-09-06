@@ -772,11 +772,24 @@ fn raw_entry_loaded(entry: usize, image: &[ReservedSegment]) -> bool {
     })
 }
 fn admit_destination_ranges(ranges: &[(usize, usize)], total_pages: usize) -> AxResult<()> {
+    admit_destination_ranges_in(
+        ranges,
+        total_pages,
+        axhal::mem::total_ram_size(),
+        axhal::kexec::boot_memory_regions(),
+    )
+}
+
+fn admit_destination_ranges_in(
+    ranges: &[(usize, usize)],
+    total_pages: usize,
+    total_bytes: usize,
+    memory_regions: &[(usize, usize)],
+) -> AxResult<()> {
     let mut sorted = Vec::new();
     sorted
         .try_reserve_exact(ranges.len())
         .map_err(|_| AxError::NoMemory)?;
-    let total_bytes = axhal::mem::total_ram_size();
     for &(start, bytes) in ranges {
         let end = range_end(start, bytes)?;
         // A raw kexec segment is a physical-RAM destination, not merely a
@@ -787,7 +800,7 @@ fn admit_destination_ranges(ranges: &[(usize, usize)], total_pages: usize) -> Ax
         // includes pages currently occupied by this kernel, which orderly
         // kexec is explicitly allowed to replace.
         let in_ram = end <= total_bytes
-            && axhal::kexec::boot_memory_regions()
+            && memory_regions
                 .iter()
                 .any(|&(base, length)| {
                     base.checked_add(length)
@@ -1718,6 +1731,7 @@ pub(crate) fn disable_kexec_load() -> AxResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
     use super::*;
 
     #[cfg(feature = "smp-tlb-shootdown")]
@@ -1787,15 +1801,31 @@ mod tests {
 
     #[test]
     fn destination_limit_rejects_overlaps_and_allows_adjacent_pages() {
-        assert!(admit_destination_ranges(&[(0, PAGE_SIZE), (PAGE_SIZE, PAGE_SIZE)], 4).is_ok());
+        let memory = [(0, 4 * PAGE_SIZE)];
+        assert!(
+            admit_destination_ranges_in(
+                &[(0, PAGE_SIZE), (PAGE_SIZE, PAGE_SIZE)], 4, 4 * PAGE_SIZE, &memory,
+            ).is_ok()
+        );
         assert!(matches!(
-            admit_destination_ranges(&[(0, PAGE_SIZE), (PAGE_SIZE / 2, PAGE_SIZE)], 4),
+            admit_destination_ranges_in(
+                &[(0, PAGE_SIZE), (PAGE_SIZE / 2, PAGE_SIZE)], 4, 4 * PAGE_SIZE, &memory,
+            ),
             Err(AxError::InvalidInput)
         ));
         assert!(matches!(
-            admit_destination_ranges(&[(0, 3 * PAGE_SIZE)], 4),
+            admit_destination_ranges_in(&[(0, 3 * PAGE_SIZE)], 4, 4 * PAGE_SIZE, &memory),
             Err(AxError::NoMemory)
         ));
+        // A numeric address below total RAM is insufficient when it lies in
+        // a platform memory-map hole.
+        assert_eq!(
+            admit_destination_ranges_in(
+                &[(PAGE_SIZE, PAGE_SIZE)], 4, 4 * PAGE_SIZE,
+                &[(0, PAGE_SIZE), (2 * PAGE_SIZE, 2 * PAGE_SIZE)],
+            ),
+            Err(AxError::InvalidInput)
+        );
     }
 
     #[test]
@@ -1806,6 +1836,7 @@ mod tests {
 
     #[test]
     fn no_loaded_image_is_invalid_for_kexec_reboot() {
+        let _context = crate::test_support::scheduler_test_context();
         *NORMAL.lock() = None;
         assert!(matches!(execute_loaded(), Err(AxError::InvalidInput)));
     }

@@ -35,8 +35,9 @@ use crate::{
         AlarmClock, AsThread, Cred, PidNamespace, ProcStateHint, Process, PtraceAccessMode,
         TaskUsage, Thread, check_current_process_ptrace_access,
         check_current_thread_ptrace_image_access, cpu_clock_sleep_waiters,
-        get_process_including_zombie, get_task, get_visible_task, has_pending_syscall_signal,
-        ns_capable, prepare_clock_sleep, process_domain,
+        get_process_including_zombie, get_task, get_visible_task,
+        get_visible_task_including_exiting, has_pending_syscall_signal, ns_capable,
+        prepare_clock_sleep, process_domain,
         security::{
             SchedulerSecurityOperation, SecuritySchedulerContext, SecurityTaskGetSchedulerContext,
             dispatch_scheduler, dispatch_task_getscheduler,
@@ -79,7 +80,13 @@ fn sched_target(pid: i32) -> AxResult<AxTaskRef> {
     if pid == 0 {
         Ok(current().clone())
     } else {
-        get_task(pid as Pid)
+        // Namespace IDs name Linux threads, not scheduler task allocations.
+        let tid = current()
+            .as_thread()
+            .pid_ns()
+            .resolve_visible_pid(pid as Pid)
+            .ok_or(AxError::NoSuchProcess)?;
+        get_visible_task(tid)
     }
 }
 
@@ -496,6 +503,7 @@ fn linux_priority_bounds(policy: i32) -> AxResult<(isize, isize)> {
     match policy as u32 {
         SCHED_FIFO | SCHED_RR => Ok((RT_PRIORITY_MIN as isize, RT_PRIORITY_MAX as isize)),
         SCHED_NORMAL | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE => Ok((0, 0)),
+        7 => Ok((0, 0)), // Linux SCHED_EXT has no static priority range.
         _ => Err(AxError::InvalidInput),
     }
 }
@@ -832,7 +840,12 @@ fn resolve_cpu_clock_sleep_target(clock_id: __kernel_clockid_t) -> AxResult<CpuC
     let task = if id == 0 {
         current().clone()
     } else {
-        get_task(id)?
+        let tid = current()
+            .as_thread()
+            .pid_ns()
+            .resolve_visible_pid(id)
+            .ok_or(AxError::InvalidInput)?;
+        get_visible_task_including_exiting(tid).map_err(|_| AxError::InvalidInput)?
     };
 
     match scope {
@@ -1013,9 +1026,10 @@ pub fn sys_sched_getaffinity<M: UserMemory + ?Sized>(
     cpusetsize: usize,
     user_mask: *mut u8,
 ) -> AxResult<isize> {
+    let cpusetsize = cpusetsize as u32 as usize;
     let cpu_count = axhal::cpu_num().max(1);
     let kernel_mask_bytes = linux_cpumask_bytes(cpu_count);
-    if cpusetsize < kernel_mask_bytes {
+    if cpusetsize < kernel_mask_bytes || cpusetsize % size_of::<usize>() != 0 {
         return Err(AxError::InvalidInput);
     }
 
@@ -1046,17 +1060,14 @@ pub fn sys_sched_setaffinity<M: UserMemory + ?Sized>(
     cpusetsize: usize,
     user_mask: *const u8,
 ) -> AxResult<isize> {
+    let cpusetsize = cpusetsize as u32 as usize;
     let cpu_count = axhal::cpu_num().max(1);
     let kernel_mask_bytes = linux_cpumask_bytes(cpu_count);
-    if cpusetsize < kernel_mask_bytes {
-        return Err(AxError::InvalidInput);
-    }
-
-    let user_mask = vm_load(memory, user_mask, kernel_mask_bytes).map_err(map_usercopy_error)?;
+    let user_mask = vm_load(memory, user_mask, cpusetsize.min(kernel_mask_bytes)).map_err(map_usercopy_error)?;
     let mut cpu_mask = AxCpuMask::new();
 
     for i in 0..cpu_count {
-        if user_mask[i / 8] & (1 << (i % 8)) != 0 {
+        if user_mask.get(i / 8).copied().unwrap_or(0) & (1 << (i % 8)) != 0 {
             cpu_mask.set(i, true);
         }
     }
@@ -1083,13 +1094,15 @@ pub fn sys_getcpu<M: UserMemory + ?Sized>(
     // the target reaches its migration safe point; reporting an allowed-but-
     // fictional CPU during that window would expose shadow scheduler state.
     let cpu_id = axhal::percpu::this_cpu_id();
+    let mut result = Ok(());
     if !cpu.is_null() {
-        VmMutPtr::vm_write(cpu, memory, cpu_id as u32).map_err(map_usercopy_error)?;
+        result = VmMutPtr::vm_write(cpu, memory, cpu_id as u32).map_err(map_usercopy_error);
     }
     if !node.is_null() {
-        VmMutPtr::vm_write(node, memory, 0).map_err(map_usercopy_error)?;
+        let node_result = VmMutPtr::vm_write(node, memory, 0).map_err(map_usercopy_error);
+        result = result.and(node_result);
     }
-    Ok(0)
+    result.map(|()| 0)
 }
 
 pub fn sys_sched_getscheduler(pid: i32) -> AxResult<isize> {
@@ -1102,7 +1115,7 @@ pub fn sys_sched_setparam<M: UserMemory + ?Sized>(
     pid: i32,
     param: *const SchedParam,
 ) -> AxResult<isize> {
-    if param.is_null() {
+    if pid < 0 || param.is_null() {
         return Err(AxError::InvalidInput);
     }
     let priority = unsafe {
@@ -1122,7 +1135,7 @@ pub fn sys_sched_setscheduler<M: UserMemory + ?Sized>(
     policy: i32,
     param: *const SchedParam,
 ) -> AxResult<isize> {
-    if param.is_null() {
+    if pid < 0 || policy < 0 || param.is_null() {
         return Err(AxError::InvalidInput);
     }
     let priority = unsafe {
@@ -1892,19 +1905,79 @@ fn ioprio_raw_for_task(task: &AxTaskRef) -> AxResult<u16> {
 enum IoprioTarget {
     Live(AxTaskRef),
     Zombie(Arc<Process>),
+    ExitedLeader {
+        runtime: Arc<crate::task::ProcessData>,
+        signal: Arc<thekernel_linux_signal::api::ThreadSignalManager>,
+        credential: Arc<Cred>,
+    },
 }
 
 impl IoprioTarget {
+    fn process(&self) -> &Arc<Process> {
+        match self {
+            Self::Live(task) => &task.as_thread().proc_data.proc,
+            Self::Zombie(process) => process,
+            Self::ExitedLeader { runtime, .. } => &runtime.proc,
+        }
+    }
+
     fn raw_priority(&self) -> AxResult<u16> {
         match self {
-            Self::Live(task) => ioprio_raw_for_task(task),
+            Self::Live(task) => {
+                let thread = task.as_thread();
+                let _lifecycle = thread.proc_data.lock_process_lifecycle();
+                if thread.proc_data.proc.is_zombie() {
+                    zombie_ioprio(&thread.proc_data.proc)
+                } else if thread.pending_exit() {
+                    Ok(0)
+                } else {
+                    ioprio_raw_for_task(task)
+                }
+            }
             Self::Zombie(process) => zombie_ioprio(process),
+            Self::ExitedLeader {
+                runtime, signal, ..
+            } => {
+                let _lifecycle = runtime.lock_process_lifecycle();
+                if runtime.proc.is_zombie() {
+                    zombie_ioprio(&runtime.proc)
+                } else if runtime.group_leader_signal_identity_matches(signal) {
+                    Ok(0)
+                } else {
+                    Err(AxError::NoSuchProcess)
+                }
+            }
         }
     }
 
     fn effective_priority(&self) -> AxResult<u16> {
         match self {
-            Self::Live(task) => ioprio_for_task(task),
+            Self::Live(task) => {
+                let thread = task.as_thread();
+                let _lifecycle = thread.proc_data.lock_process_lifecycle();
+                if thread.proc_data.proc.is_zombie() {
+                    let state = zombie_scheduler_state(&thread.proc_data.proc)?;
+                    Ok(ioprio_default_for_sched(state.class, state.nice))
+                } else if thread.pending_exit() {
+                    let state = sched_state(task);
+                    Ok(ioprio_default_for_sched(state.class, state.nice))
+                } else {
+                    ioprio_for_task(task)
+                }
+            }
+            Self::ExitedLeader {
+                runtime, signal, ..
+            } => {
+                let _lifecycle = runtime.lock_process_lifecycle();
+                let state = if runtime.proc.is_zombie() {
+                    zombie_scheduler_state(&runtime.proc)?
+                } else if runtime.group_leader_signal_identity_matches(signal) {
+                    runtime.group_leader_scheduler_state()?
+                } else {
+                    return Err(AxError::NoSuchProcess);
+                };
+                Ok(ioprio_default_for_sched(state.class, state.nice))
+            }
             Self::Zombie(process) => {
                 let raw = zombie_ioprio(process)?;
                 if ioprio_class(raw as u32) == IOPRIO_CLASS_NONE {
@@ -1919,10 +1992,38 @@ impl IoprioTarget {
 
     fn credential(&self) -> AxResult<Arc<Cred>> {
         match self {
-            Self::Live(task) => task
-                .try_as_thread()
-                .ok_or(AxError::NoSuchProcess)
-                .map(|thread| thread.current_cred()),
+            Self::Live(task) => {
+                let thread = task.as_thread();
+                let _lifecycle = thread.proc_data.lock_process_lifecycle();
+                if thread.proc_data.proc.is_zombie() {
+                    thread
+                        .proc_data
+                        .proc
+                        .zombie_payload()
+                        .map(|snapshot| snapshot.credential.clone())
+                        .ok_or(AxError::NoSuchProcess)
+                } else {
+                    Ok(thread.current_cred())
+                }
+            }
+            Self::ExitedLeader {
+                runtime,
+                signal,
+                credential,
+            } => {
+                let _lifecycle = runtime.lock_process_lifecycle();
+                if runtime.proc.is_zombie() {
+                    runtime
+                        .proc
+                        .zombie_payload()
+                        .map(|snapshot| snapshot.credential.clone())
+                        .ok_or(AxError::NoSuchProcess)
+                } else if runtime.group_leader_signal_identity_matches(signal) {
+                    Ok(credential.clone())
+                } else {
+                    Err(AxError::NoSuchProcess)
+                }
+            }
             Self::Zombie(process) => process
                 .zombie_payload()
                 .ok_or(AxError::NoSuchProcess)
@@ -1932,8 +2033,30 @@ impl IoprioTarget {
 
     fn set_priority(&self, priority: u16) -> AxResult<()> {
         match self {
-            Self::Live(task) => task.as_thread().set_io_priority_raw(priority),
+            Self::Live(task) => {
+                let thread = task.as_thread();
+                let _lifecycle = thread.proc_data.lock_process_lifecycle();
+                if thread.proc_data.proc.is_zombie() {
+                    crate::task::set_zombie_ioprio(&thread.proc_data.proc, priority)
+                } else if thread.pending_exit() {
+                    Ok(())
+                } else {
+                    thread.set_io_priority_raw(priority)
+                }
+            }
             Self::Zombie(process) => crate::task::set_zombie_ioprio(process, priority),
+            Self::ExitedLeader {
+                runtime, signal, ..
+            } => {
+                let _lifecycle = runtime.lock_process_lifecycle();
+                if runtime.proc.is_zombie() {
+                    crate::task::set_zombie_ioprio(&runtime.proc, priority)
+                } else if runtime.group_leader_signal_identity_matches(signal) {
+                    Ok(())
+                } else {
+                    Err(AxError::NoSuchProcess)
+                }
+            }
         }
     }
 }
@@ -2084,7 +2207,7 @@ fn ioprio_multi_targets(
             let target_group = target_group.ok_or(AxError::NoSuchProcess)?;
             for task in tasks {
                 let thread = task.as_thread();
-                if !caller_pid_ns.contains(&thread.pid_ns()) {
+                if thread.pending_exit() || !caller_pid_ns.contains(&thread.pid_ns()) {
                     continue;
                 }
                 let group = thread.proc_data.proc.group();
@@ -2099,6 +2222,15 @@ fn ioprio_multi_targets(
                 if zombie_pid_ns(&process)
                     .is_some_and(|target_pid_ns| caller_pid_ns.contains(&target_pid_ns))
                 {
+                    targets.retain(|target| match target {
+                        IoprioTarget::Live(task) => {
+                            !Arc::ptr_eq(&task.as_thread().proc_data.proc, &process)
+                        }
+                        IoprioTarget::Zombie(existing) => !Arc::ptr_eq(existing, &process),
+                        IoprioTarget::ExitedLeader { runtime, .. } => {
+                            !Arc::ptr_eq(&runtime.proc, &process)
+                        }
+                    });
                     targets.push(IoprioTarget::Zombie(process));
                 }
             }
@@ -2114,7 +2246,10 @@ fn ioprio_multi_targets(
             };
             for task in tasks {
                 let thread = task.as_thread();
-                if caller_pid_ns.contains(&thread.pid_ns()) && thread.real_uid() == uid {
+                if !thread.pending_exit()
+                    && caller_pid_ns.contains(&thread.pid_ns())
+                    && thread.real_uid() == uid
+                {
                     targets.push(IoprioTarget::Live(task));
                 }
             }
@@ -2129,11 +2264,91 @@ fn ioprio_multi_targets(
                     continue;
                 };
                 if caller_pid_ns.contains(&target_pid_ns) && snapshot.credential.ids().ruid == uid {
+                    targets.retain(|target| match target {
+                        IoprioTarget::Live(task) => {
+                            !Arc::ptr_eq(&task.as_thread().proc_data.proc, &process)
+                        }
+                        IoprioTarget::Zombie(existing) => !Arc::ptr_eq(existing, &process),
+                        IoprioTarget::ExitedLeader { runtime, .. } => {
+                            !Arc::ptr_eq(&runtime.proc, &process)
+                        }
+                    });
                     targets.push(IoprioTarget::Zombie(process));
                 }
             }
         }
         _ => return Err(AxError::InvalidInput),
+    }
+    // Linux keeps an exited leader in the process/thread lists until the
+    // final sibling exits. Its io_context is gone, but its scheduler-derived
+    // default still participates in group/user best-priority queries.
+    for runtime in crate::task::try_processes()? {
+        let _lifecycle = runtime.lock_process_lifecycle();
+        if runtime.proc.is_zombie()
+            || !caller_pid_ns.contains(&runtime.pid_ns())
+            || get_visible_task(runtime.proc.pid()).is_ok()
+        {
+            continue;
+        }
+        let (credential, signal) = runtime.group_leader_signal_identity()?;
+        let selected = match which {
+            IOPRIO_WHO_PGRP => {
+                let group = runtime.proc.group();
+                if who == 0 {
+                    Arc::ptr_eq(&group, &actor_task.as_thread().proc_data.proc.group())
+                } else {
+                    visible_process_pid_in_namespace(
+                        group.pgid(),
+                        &runtime.pid_ns(),
+                        &caller_pid_ns,
+                    ) == Some(who)
+                }
+            }
+            IOPRIO_WHO_USER => {
+                let uid = if who == 0 {
+                    actor_cred.ids().ruid
+                } else {
+                    actor_cred
+                        .user_ns()
+                        .make_kuid(who)
+                        .ok_or(AxError::NoSuchProcess)?
+                };
+                credential.ids().ruid == uid
+            }
+            _ => false,
+        };
+        if selected {
+            targets.retain(|target| {
+                !matches!(target,
+                IoprioTarget::Live(task) if Arc::ptr_eq(&task.as_thread().proc_data, &runtime)
+                    && task.as_thread().tid() == runtime.proc.pid())
+            });
+            targets.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            targets.push(IoprioTarget::ExitedLeader {
+                runtime: runtime.clone(),
+                signal,
+                credential,
+            });
+        }
+    }
+    // Exit can publish between the task and process snapshots. Collapse
+    // every observed zombie to its one retained Process identity; never let
+    // a stale task's old io_context compete with the zombie default.
+    let mut index = 0;
+    while index < targets.len() {
+        let process = targets[index].process().clone();
+        if process.is_zombie() {
+            targets[index] = IoprioTarget::Zombie(process.clone());
+            let mut later = index + 1;
+            while later < targets.len() {
+                if Arc::ptr_eq(targets[later].process(), &process) {
+                    targets.remove(later);
+                } else {
+                    later += 1;
+                }
+            }
+        }
+        index += 1;
     }
     if targets.is_empty() {
         Err(AxError::NoSuchProcess)
@@ -2169,7 +2384,11 @@ pub fn sys_ioprio_get(which: u32, who: u32) -> AxResult<isize> {
             let targets = ioprio_multi_targets(which, who, &actor_task, &actor_cred)?;
             let mut highest = None;
             for target in &targets {
-                let priority = target.effective_priority()?;
+                // Linux skips members that disappeared or failed the
+                // per-target query after the group snapshot.
+                let Ok(priority) = target.effective_priority() else {
+                    continue;
+                };
                 highest = Some(highest.map_or(priority, |current: u16| current.min(priority)));
             }
             highest
@@ -2375,6 +2594,7 @@ mod tests {
 
     #[test]
     fn deadline_priority_bounds_remain_queryable() {
+        assert_eq!(linux_priority_bounds(7), Ok((0, 0)));
         assert_eq!(
             linux_priority_bounds(SCHED_DEADLINE as i32).unwrap(),
             (0, 0)

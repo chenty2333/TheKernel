@@ -649,13 +649,14 @@ mod tests {
 
     #[test]
     fn fd_xattr_targeting_is_independent_of_opath_io_access() {
+        let _context = crate::test_support::scheduler_test_context();
         let filesystem = MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&filesystem);
         crate::mounts::initialize_test_mount(&mount, 0).unwrap();
         let location = mount
             .root_location()
             .create(
-                "opath-xattr-target",
+                axfs_ng_vfs::FsName::new(b"opath-xattr-target"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )

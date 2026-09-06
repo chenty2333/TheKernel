@@ -6,7 +6,7 @@
 **/target/
 /.axconfig.*
 *.img
-/.cargo
+/.cargo/*
 /.crates*
 /.state
 /.tmp

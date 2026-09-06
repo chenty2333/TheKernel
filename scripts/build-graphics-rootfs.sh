@@ -253,9 +253,10 @@ validate_checked_in() {
     ! grep -q 'THEKERNEL_GRAPHICS_FLAVOR' "$REPO_ROOT/config/graphics/overlay/common/etc/init.d/S80weston"
     grep -qx 'export XDG_RUNTIME_DIR="\$runtime_dir"' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-session"
     grep -qx 'export LIBSEAT_BACKEND=seatd' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-session"
-    grep -qx 'exec weston --config=/etc/weston/weston.ini \\' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-session"
-    grep -qx '/usr/local/bin/drm-uapi-oracle' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-abi-smoke"
-    grep -qx '/usr/local/bin/evdev-uapi-oracle' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-abi-smoke"
+    grep -Fqx 'set -- --config=/etc/weston/weston.ini --socket=wayland-0 --log="$XDG_RUNTIME_DIR/weston.log"' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-session"
+    grep -Fqx 'exec weston "$@"' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-session"
+    grep -q '^/usr/local/bin/drm-uapi-oracle || { echo .*state=FAIL reason=drm_uapi_oracle' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-abi-smoke"
+    grep -q '^/usr/local/bin/evdev-uapi-oracle || { echo .*state=FAIL reason=evdev_uapi_oracle' "$REPO_ROOT/config/graphics/overlay/common/usr/local/bin/graphics-abi-smoke"
     # The session config is flavor-independent; each overlay selects its Weston
     # configuration through a relative /etc/weston/weston.ini symlink.  The
     # target may live in another overlay, so check the link, not the content.
@@ -285,8 +286,8 @@ validate_checked_in() {
             flavor_br2_contract "$flavor" | require_br2_contract "$fragment"
             grep -qx 'xwayland=true' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/weston/weston-drm.ini"
             grep -qx 'q35-software-desktop' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/thekernel-graphics-flavor"
-            grep -qx '/usr/local/bin/drm-uapi-oracle' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke"
-            grep -qx '/usr/local/bin/evdev-uapi-oracle' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke"
+            grep -q '^/usr/local/bin/drm-uapi-oracle || { echo .*state=FAIL reason=drm_uapi_oracle' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke"
+            grep -q '^/usr/local/bin/evdev-uapi-oracle || { echo .*state=FAIL reason=evdev_uapi_oracle' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke"
             grep -Fq "Seat opened with backend 'seatd'" "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke"
             [ -x "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/init.d/S75q35-virgl-kmscube" ]
             [ -x "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/usr/local/bin/q35-piglit-quick" ]
@@ -543,11 +544,18 @@ if [ -z "$buildroot_dir" ]; then
     buildroot_dir=$REPO_ROOT/.state/buildroot/buildroot-$BUILDROOT_VERSION
 fi
 for command in git make sed; do command -v "$command" >/dev/null || { printf 'required command not found: %s\n' "$command" >&2; exit 1; }; done
-if [ "$fetch_buildroot" -eq 1 ] && [ ! -d "$buildroot_dir/.git" ]; then
+if [ "$fetch_buildroot" -eq 1 ] && [ ! -e "$buildroot_dir" ]; then
     mkdir -p "$(dirname -- "$buildroot_dir")"
-    git clone --no-checkout "$BUILDROOT_URL" "$buildroot_dir"
+    git clone --depth 1 --branch "$BUILDROOT_VERSION" "$BUILDROOT_URL" "$buildroot_dir"
 fi
 [ -d "$buildroot_dir" ] || { printf 'Buildroot source unavailable: %s (pass --buildroot-dir or --fetch-buildroot)\n' "$buildroot_dir" >&2; exit 1; }
+# Accept existing release tarballs and checkouts without switching branches or
+# discarding local changes. The source Makefile declares the release version.
+buildroot_version=$(sed -nE 's/^BR2_VERSION[[:space:]]*[:?]?=[[:space:]]*([^[:space:]]+).*$/\1/p' "$buildroot_dir/Makefile")
+[ "$buildroot_version" = "$BUILDROOT_VERSION" ] || {
+    printf 'Buildroot version mismatch: expected %s, found %s in %s; use a matching source directory\n' "$BUILDROOT_VERSION" "${buildroot_version:-missing}" "$buildroot_dir" >&2
+    exit 1
+}
 output=$(realpath -m "$output")
 mkdir -p "$output" "$download_dir"
 if [ -z "$tmpdir" ]; then tmpdir=$output/tmp; fi
@@ -575,17 +583,17 @@ generated_config=$output/.thekernel-graphics.config
 sed -e "s|@REPO_ROOT@/config/graphics/overlay|$staged_overlay|g" -e "s|@REPO_ROOT@|$REPO_ROOT|g" "$COMMON" >"$generated_config"
 sed -e "s|@REPO_ROOT@/config/graphics/overlay|$staged_overlay|g" -e "s|@REPO_ROOT@|$REPO_ROOT|g" "$fragment" >>"$generated_config"
 
-make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" defconfig BR2_DEFCONFIG="$generated_config"
-make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" olddefconfig
+make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}" defconfig BR2_DEFCONFIG="$generated_config"
+make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}" olddefconfig
 if [ "$source_only" -eq 1 ]; then
-    make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" source
+    make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}" source
     printf 'verified package sources cached in: %s\n' "$download_dir"
 else
-    make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir"
+    make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}"
     if [ -n "$fault" ]; then
         [ "$flavor" = q35-graphics-benchmark ] || { printf '%s\n' '--fault requires q35-graphics-benchmark' >&2; exit 2; }
         printf '%s\n' "$fault" >"$output/target/etc/thekernel-graphics-fault"
-        make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" rootfs-ext2-rebuild
+        make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}" rootfs-ext2-rebuild
     fi
     validate_build_output
     printf 'graphics rootfs output: %s/images/rootfs.ext2\n' "$output"

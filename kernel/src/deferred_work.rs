@@ -69,6 +69,7 @@ impl DeferredWorkAccount {
 // scheduler callback below wakes these dedicated kernel workers at an
 // allocation-free task-context boundary.
 static POLICY_WORKER_WAKE: PollSet = PollSet::new();
+static LOG_WORKER_WAKE: PollSet = PollSet::new();
 static FINALIZER_WORKER_WAKE: PollSet = PollSet::new();
 // Physical completion waiting is allowed to block on the lower shared block
 // device. Keep its sole owner off the policy worker so fanotify/inotify/RCU
@@ -231,6 +232,48 @@ const UCLAMP_RETRY_MAX_MS: u64 = 100;
 
 fn next_uclamp_retry_delay_ms(current: u64) -> u64 {
     current.saturating_mul(2).min(UCLAMP_RETRY_MAX_MS)
+}
+
+// Producers publish only an atomic pending flag. The dispatcher wakes this
+// dedicated consumer outside runqueue/IRQ locks; UART backpressure cannot
+// delay policy work or cause recursively logging producer-side wakeups.
+fn diagnostic_worker() {
+    let mut drain = axruntime::klog::DiagnosticDrain::new();
+    let mut retry_ms = 1;
+    loop {
+        if wait_with_bounded_retry(
+            || wait_for_worker(&LOG_WORKER_WAKE, axruntime::klog::diagnostic_work_pending),
+            axtask::yield_now,
+        )
+        .is_err()
+        {
+            axruntime::klog::retire_diagnostic_sink();
+            axhal::console::emergency_diagnostic_print(format_args!(
+                "kernel diagnostic worker wait failed\n"
+            ));
+            return;
+        }
+        while axruntime::klog::diagnostic_work_pending() {
+            let written = drain.drain_once();
+            retry_ms = if written != 0 { 1 } else { (retry_ms * 2).min(100) };
+            // Back off while a present UART makes no progress. Idle and absent
+            // sinks do not keep a periodic worker running.
+            if axruntime::klog::diagnostic_work_pending() {
+                if wait_with_bounded_retry(
+                    || axtask::sleep(Duration::from_millis(retry_ms)),
+                    axtask::yield_now,
+                )
+                .is_err()
+                {
+                    axruntime::klog::retire_diagnostic_sink();
+                    axhal::console::emergency_diagnostic_print(format_args!(
+                        "kernel diagnostic worker timer failed\n"
+                    ));
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn policy_worker() {
@@ -508,6 +551,13 @@ pub(crate) fn init() {
         axtask::set_deferred_work_dispatcher(dispatch),
         "a different deferred-work dispatcher is already installed"
     );
+    let mut log_name = String::new();
+    log_name
+        .try_reserve_exact("kernel-log".len())
+        .expect("failed to allocate log worker name");
+    log_name.push_str("kernel-log");
+    axtask::try_spawn_with_name(diagnostic_worker, log_name)
+        .expect("failed to start diagnostic worker");
     crate::task::init_process_itimer_work_queues();
     assert!(
         axfs::set_deferred_filesystem_finalizer_waker(note_filesystem_finalizer_work),
@@ -564,6 +614,9 @@ pub(crate) fn init() {
 }
 
 fn dispatch() {
+    if axruntime::klog::diagnostic_work_pending() {
+        LOG_WORKER_WAKE.wake();
+    }
     // This generic scheduler hook is constant-time and allocation-free. Linux
     // inotify/fanotify/dnotify policy, VFS reclamation, and filesystem shutdown
     // execute only in their dedicated task contexts.

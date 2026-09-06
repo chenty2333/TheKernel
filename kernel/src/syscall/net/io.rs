@@ -1110,7 +1110,7 @@ fn send_impl(
         to: network_addr,
         flags: send_flags.ok_or(AxError::BadState)?,
         cmsg,
-        credentials: Some(snapshot.unix_credentials()),
+        credentials: Some(snapshot.automatic_unix_credentials()),
         nonblocking_override: Some(nonblocking),
     };
     if matches!(&socket.inner, AxSocket::Unix(_)) {
@@ -1813,6 +1813,7 @@ impl ImportedRecvMessage {
 
 fn recvmsg_imported(
     capability: &UserMemoryCapability,
+    snapshot: &SocketSyscallSnapshot,
     socket: &PinnedSocketDescription,
     fd: i32,
     imported: ImportedRecvMessage,
@@ -1836,6 +1837,7 @@ fn recvmsg_imported(
             capability.clone(),
             UserPtr::from(msg_hdr.msg_control.cast::<cmsghdr>()),
             &mut msg_hdr.msg_controllen,
+            snapshot.pid_namespace().clone(),
         ))
     };
     let recv_iov = PageProgressIo::new(recv_iov)?;
@@ -1937,6 +1939,7 @@ pub fn sys_recvmsg(
         |imported| {
             recvmsg_imported(
                 &capability,
+                &snapshot,
                 &socket,
                 fd,
                 imported,
@@ -2087,6 +2090,7 @@ pub fn sys_recvmmsg(
         let receive = if idx == 0 {
             recvmsg_imported(
                 &capability,
+                &snapshot,
                 &socket,
                 fd,
                 imported,
@@ -2110,6 +2114,7 @@ pub fn sys_recvmmsg(
                 |imported| {
                     recvmsg_imported(
                         &capability,
+                        &snapshot,
                         &socket,
                         fd,
                         imported,

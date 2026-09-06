@@ -1,5 +1,6 @@
 //! Linux tracefs surface used by perf trace and dynamic probe control.
 
+mod io_uring;
 use alloc::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
@@ -8,8 +9,9 @@ use alloc::{
     sync::Arc,
 };
 
-use axfs_ng_vfs::{Filesystem, FsName, FsNameBuf, VfsError, VfsResult};
+use axfs_ng_vfs::{Filesystem, FsName, FsNameBuf, NodePermission, VfsError, VfsResult};
 use axsync::spin::SpinNoIrq;
+pub(crate) use io_uring::record as record_io_uring;
 
 use crate::{
     perf_sources::{
@@ -18,8 +20,9 @@ use crate::{
     },
     pseudofs::{
         ChildNames, DirMapping, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
-        SimpleFileOperation, SimpleFs, try_boxed_names,
+        SimpleFileOperation, SimpleFileOps, SimpleFs, try_boxed_names,
     },
+    task::AsThread,
 };
 
 static TRACE_ENABLED: SpinNoIrq<bool> = SpinNoIrq::new(true);
@@ -76,8 +79,10 @@ fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
     root.add(
         "available_events",
         SimpleFile::new_regular(fs.clone(), || -> VfsResult<String> {
-            let mut events =
-                String::from("sched:sched_switch\nraw_syscalls:sys_enter\nraw_syscalls:sys_exit\n");
+            let mut events = String::from(
+                "sched:sched_switch\nsched:sched_wakeup\nraw_syscalls:sys_enter\nraw_syscalls:\
+                 sys_exit\n",
+            );
             for name in DYNAMIC_EVENTS.lock().keys() {
                 events.push_str(name);
                 events.push('\n');
@@ -85,38 +90,70 @@ fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
             Ok(events)
         }),
     );
-    root.add("trace", control_file(fs.clone()));
-    root.add(
-        "trace_pipe",
-        SimpleFile::new_regular(fs.clone(), || -> VfsResult<String> {
-            // The perf data ring is the authoritative transport; this endpoint is
-            // a non-seeking text view and intentionally starts empty at mount.
-            Ok(String::new())
-        }),
-    );
+    root.add("io_uring", io_directory(fs.clone()));
     root.add("kprobe_events", probe_control(fs.clone(), false));
     root.add("uprobe_events", probe_control(fs.clone(), true));
     root.add("events", events_dir(fs.clone()));
     SimpleDir::new_maker(fs, Arc::new(root))
 }
 
-fn control_file(fs: Arc<SimpleFs>) -> Arc<SimpleFile> {
-    SimpleFile::new_regular(
-        fs,
-        RwFile::new(move |op| -> VfsResult<Option<String>> {
-            match op {
-                SimpleFileOperation::Read => Ok(Some(if *TRACE_ENABLED.lock() {
-                    "# tracer: nop\n".into()
-                } else {
-                    "# tracer: off\n".into()
-                })),
-                SimpleFileOperation::Write(data) => {
-                    *TRACE_ENABLED.lock() = !data.starts_with(b"0");
-                    Ok(None)
-                }
+// Kernel-private, global diagnostic capture. Do not impersonate a Linux
+// trace event or perf_event_open source. Recheck credentials on every operation,
+// including inherited descriptors opened before a privilege drop.
+struct IoDiagnosticFile(&'static str);
+impl SimpleFileOps for IoDiagnosticFile {
+    fn default_permission(&self) -> NodePermission {
+        NodePermission::from_bits_truncate(0o600)
+    }
+    fn read_all(&self) -> VfsResult<Cow<'_, [u8]>> {
+        require_io_admin()?;
+        let value = match self.0 {
+            "trace" => io_uring::snapshot()?,
+            "enable" => format!("{}\n", u8::from(io_uring::enabled())),
+            "dropped" => format!("{}\n", io_uring::dropped()),
+            _ => return Err(VfsError::NotFound),
+        };
+        Ok(Cow::Owned(value.into_bytes()))
+    }
+    fn write_all(&self, data: &[u8]) -> VfsResult<()> {
+        require_io_admin()?;
+        match self.0 {
+            "trace" => io_uring::clear(),
+            "enable" => {
+                let value = match core::str::from_utf8(data)
+                    .map_err(|_| VfsError::InvalidInput)?
+                    .trim()
+                {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(VfsError::InvalidInput),
+                };
+                io_uring::set_enabled(value);
             }
-        }),
-    )
+            _ => return Err(VfsError::PermissionDenied),
+        }
+        Ok(())
+    }
+}
+fn require_io_admin() -> VfsResult<()> {
+    // SimpleFile does not install an opener security credential. Authorize
+    // the live caller, so inherited descriptors cannot retain root access.
+    let credential = axtask::current().as_thread().current_cred();
+    if credential.has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN) {
+        Ok(())
+    } else {
+        Err(VfsError::PermissionDenied)
+    }
+}
+fn io_directory(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
+    let mut map = DirMapping::new();
+    for name in ["enable", "trace", "dropped"] {
+        map.add(
+            name,
+            SimpleFile::new_regular(fs.clone(), IoDiagnosticFile(name)),
+        );
+    }
+    SimpleDir::new_maker(fs, Arc::new(map))
 }
 
 fn event_leaf(
@@ -237,6 +274,7 @@ impl SimpleDirOps for TraceEventSystemDir {
         match self.system.as_bytes() {
             b"sched" => {
                 names.insert(FsNameBuf::from_vec(b"sched_switch".to_vec())?);
+                names.insert(FsNameBuf::from_vec(b"sched_wakeup".to_vec())?);
             }
             b"raw_syscalls" => {
                 names.insert(FsNameBuf::from_vec(b"sys_enter".to_vec())?);
@@ -258,6 +296,7 @@ impl SimpleDirOps for TraceEventSystemDir {
         if matches!(
             (self.system.as_bytes(), name.as_bytes()),
             (b"sched", b"sched_switch")
+                | (b"sched", b"sched_wakeup")
                 | (b"raw_syscalls", b"sys_enter")
                 | (b"raw_syscalls", b"sys_exit")
         ) {
@@ -269,6 +308,7 @@ impl SimpleDirOps for TraceEventSystemDir {
             };
             let name: &'static str = match name.as_bytes() {
                 b"sched_switch" => "sched_switch",
+                b"sched_wakeup" => "sched_wakeup",
                 b"sys_enter" => "sys_enter",
                 b"sys_exit" => "sys_exit",
                 _ => return Err(VfsError::NotFound),

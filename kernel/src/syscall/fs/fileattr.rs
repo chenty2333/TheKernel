@@ -154,9 +154,8 @@ fn as_vfs(attr: FileAttr) -> AxResult<VfsFileAttr> {
     Ok(VfsFileAttr {
         xflags: attr.fa_xflags,
         extsize: attr.fa_extsize,
-        // Generic fileattr treats this output-only field as an observation.
-        // The shared setter will replace it with the provider's current value.
-        nextents: attr.fa_nextents,
+        // Linux file_attr_to_fileattr does not import this output-only field.
+        nextents: 0,
         project_id: attr.fa_projid,
         cowextsize: attr.fa_cowextsize,
     })

@@ -15,7 +15,7 @@ class CommandError(ValueError):
 VALID_DRIVE_MODES = frozenset({"snapshot", "readonly", "rw"})
 Q35_MACHINE = "q35,max-ram-below-4g=2G"
 _ACCEL_CPU_MODELS = {"kvm": "host", "tcg": "max"}
-_RUNNER_OWNED_OPTIONS = frozenset({"-accel", "-cpu"})
+_RUNNER_OWNED_OPTIONS = frozenset({"-accel", "-cpu", "-serial", "-chardev", "-nographic"})
 
 
 def _escaped_path(path: Path) -> str:
@@ -24,7 +24,7 @@ def _escaped_path(path: Path) -> str:
 
 
 def _validate_extra_args(extra_args: tuple[str, ...]) -> None:
-    """Keep runner-owned CPU and accelerator selections non-overridable."""
+    """Keep runner-owned CPU, accelerator, and serial selections non-overridable."""
 
     for argument in extra_args:
         option = argument.split("=", 1)[0]
@@ -86,6 +86,7 @@ def build_qemu_command(
     graphics_width: int = 800,
     graphics_height: int = 600,
     qmp_socket: Path | None = None,
+    diagnostic_log_path: Path | None = None,
     extra_args: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     """Build the deterministic architecture-specific QEMU topology."""
@@ -172,6 +173,12 @@ def build_qemu_command(
                 "virtio-rng-pci,rng=rng0",
             ]
         )
+        if diagnostic_log_path is not None:
+            command.extend([
+                "-chardev",
+                f"file,id=kernel-log,path={_escaped_path(diagnostic_log_path)},append=on",
+                "-serial", "chardev:kernel-log",
+            ])
         if accel is not None:
             command.extend(["-accel", accel])
             cpu_model = _ACCEL_CPU_MODELS.get(accel)

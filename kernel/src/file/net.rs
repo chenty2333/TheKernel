@@ -220,6 +220,17 @@ impl Socket {
         .map_err(|error| crate::syscall::map_socket_send_error(&self.inner, error))
     }
 
+    pub(crate) fn write_with_sender(
+        &self, src: &mut IoSrc, nonblocking: bool,
+        credentials: axnet::options::SocketCredentials,
+    ) -> AxResult<usize> {
+        self.send(src, SendOptions {
+            nonblocking_override: Some(nonblocking),
+            credentials: Some(credentials),
+            ..SendOptions::default()
+        }).map_err(|error| crate::syscall::map_socket_send_error(&self.inner, error))
+    }
+
     pub(crate) fn retry_transfer<T>(
         &self,
         direction: SocketTransferDirection,
@@ -431,4 +442,11 @@ mod tests {
         drop(socket);
         assert!(weak.upgrade().is_none());
     }
+}
+
+/// Automatic SCM_CREDENTIALS uses the sending actor's real IDs. Peer identity
+/// at connect/socketpair time remains a separate effective-ID snapshot.
+pub(crate) fn automatic_unix_credentials(actor: &crate::task::Cred, pid: u32) -> axnet::options::SocketCredentials {
+    let ids = actor.ids();
+    axnet::options::SocketCredentials::new(pid, ids.ruid.into_raw(), ids.rgid.into_raw())
 }

@@ -1126,6 +1126,10 @@ mod tests {
         }
     }
 
+    impl axio::IoBuf for TestDst {
+        fn remaining(&self) -> usize { self.remaining }
+    }
+
     impl IoBufMut for TestDst {
         fn remaining_mut(&self) -> usize {
             self.remaining

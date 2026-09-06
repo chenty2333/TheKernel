@@ -14,7 +14,7 @@ start() {
     running && return 0
     mkdir -p /run
     printf 'Starting seatd: '
-    start-stop-daemon -S -x "$DAEMON" -p "$PIDFILE" -m -b -- -g seat
+    start-stop-daemon -S -x "$DAEMON" -p "$PIDFILE" -m -b -O /run/seatd.log -- -g seat
     attempt=0
     while [ ! -S /run/seatd.sock ]; do
         if [ "$attempt" -ge 10 ]; then

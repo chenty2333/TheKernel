@@ -125,6 +125,13 @@ pub struct TtyConfig<R, W> {
 pub trait TtyRead: Send + Sync + 'static {
     fn read(&mut self, buf: &mut [u8]) -> AxResult<usize>;
 
+    /// Read local bytes and report transport progress separately. A hardware
+    /// console can route bytes to another discipline without publishing them
+    /// here; that work must still keep the external worker draining its source.
+    fn read_with_progress(&mut self, buf: &mut [u8]) -> AxResult<(usize, bool)> {
+        self.read(buf).map(|read| (read, read != 0))
+    }
+
     /// Returns true only after the producer has permanently closed and every
     /// byte accepted by the underlying transport has been consumed.
     fn input_eof(&self) -> bool {
@@ -226,9 +233,9 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
             return Ok(progressed);
         }
         if self.read_range.is_empty() {
-            let read = self.reader.read(&mut self.read_buf)?;
+            let (read, transport_progress) = self.reader.read_with_progress(&mut self.read_buf)?;
             self.read_range = 0..read;
-            progressed |= read != 0;
+            progressed |= read != 0 || transport_progress;
         }
         let term = self.terminal.load_termios();
         if term.canonical()
@@ -1256,6 +1263,7 @@ mod tests {
             line_buf,
             line_read: None,
             echo_buf,
+            echo_pending: Arc::try_new(AtomicUsize::new(0)).unwrap(),
             empty_eof_pending: Arc::try_new(AtomicBool::new(false)).unwrap(),
             source_drained: Arc::try_new(AtomicBool::new(false)).unwrap(),
         };
@@ -1274,6 +1282,62 @@ mod tests {
             ExternalInputAction::Stop
         );
         assert_eq!(reads.load(Ordering::Relaxed), EXTERNAL_PROGRESS_BUDGET);
+    }
+
+    #[test]
+    fn routed_input_drains_without_duplicate_delivery_and_respects_budget() {
+        struct RoutedReader {
+            remaining: usize,
+            routed: usize,
+        }
+
+        impl TtyRead for RoutedReader {
+            fn read(&mut self, _buf: &mut [u8]) -> AxResult<usize> {
+                panic!("routed transport requires progress-aware reads")
+            }
+
+            fn read_with_progress(&mut self, buf: &mut [u8]) -> AxResult<(usize, bool)> {
+                let consumed = self.remaining.min(buf.len());
+                buf[..consumed].fill(b'a');
+                self.remaining -= consumed;
+                self.routed += consumed;
+                Ok((0, consumed != 0))
+            }
+        }
+
+        let total = BUF_SIZE * (EXTERNAL_PROGRESS_BUDGET + 1);
+        let mut ldisc = LineDiscipline::try_new(
+            Arc::try_new(Terminal::default()).unwrap(),
+            TtyConfig {
+                reader: RoutedReader {
+                    remaining: total,
+                    routed: 0,
+                },
+                writer: Sink,
+                process_mode: ProcessMode::Manual,
+            },
+        )
+        .unwrap();
+        let Processor::Manual(reader) = &mut ldisc.processor else {
+            unreachable!();
+        };
+        let readable = Arc::new(PollSet::new());
+        let control = Arc::new(WorkerControl::try_new().unwrap());
+
+        assert_eq!(
+            drive_external_input(reader, &readable, &control),
+            ExternalInputAction::Yield
+        );
+        assert_eq!(reader.reader.routed, BUF_SIZE * EXTERNAL_PROGRESS_BUDGET);
+        // No further IRQ is needed to drain the final batch and observe empty.
+        assert_eq!(
+            drive_external_input(reader, &readable, &control),
+            ExternalInputAction::Wait
+        );
+        assert_eq!(reader.reader.routed, total);
+        assert!(reader.read_range.is_empty());
+        assert!(reader.line_buf.is_empty());
+        assert!(ldisc.buf_rx.is_empty());
     }
 
     #[test]
@@ -1301,6 +1365,7 @@ mod tests {
             line_buf,
             line_read: None,
             echo_buf,
+            echo_pending: Arc::try_new(AtomicUsize::new(0)).unwrap(),
             empty_eof_pending: Arc::try_new(AtomicBool::new(false)).unwrap(),
             source_drained: source_drained.clone(),
         };
@@ -1505,7 +1570,7 @@ mod tests {
     fn noncanonical_vmin_is_capped_by_read_count() {
         let terminal = Arc::try_new(Terminal::default()).unwrap();
         terminal.termios.lock().set_canonical_for_test(false);
-        terminal.termios.lock().set_special_char_for_test(VMIN, 5);
+        terminal.termios.lock().set_special_char_for_test(linux_raw_sys::general::VMIN, 5);
         let mut ldisc = LineDiscipline::try_new(
             terminal,
             TtyConfig {

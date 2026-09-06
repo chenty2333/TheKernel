@@ -38,6 +38,11 @@ start() {
     mkdir -p "$RUNTIME_DIR"
     chown "$USER:$USER" "$RUNTIME_DIR"
     chmod 0700 "$RUNTIME_DIR"
+    # Weston binds the Xwayland socket before launching Xwayland. Prepare
+    # its shared directory as root before dropping compositor privileges.
+    mkdir -p /tmp/.X11-unix
+    chown root:root /tmp/.X11-unix
+    chmod 1777 /tmp/.X11-unix
     printf 'Starting Weston: '
     start-stop-daemon -S -x "$SESSION" -p "$PIDFILE" -m -b -c "$USER"
     echo OK

@@ -1295,6 +1295,7 @@ impl Thread {
     /// Reservation occurs in perf_event_open, never in a switch callback.
     pub(crate) fn attach_perf_group(&self, group: Arc<crate::file::PerfGroup>) -> AxResult<()> {
         let mut events = self.perf_events.lock();
+        events.retain(|attached| !attached.is_prunable());
         if events.iter().any(|attached| Arc::ptr_eq(attached, &group)) {
             return Ok(());
         }
@@ -1548,14 +1549,14 @@ impl Thread {
         );
     }
 
-    pub(crate) fn perf_emit_tracepoint_raw(&self, id: u64, raw: &[u8]) {
+    pub(crate) fn perf_emit_tracepoint_raw(&self, id: u64, raw: &[u8], timestamp: u64) {
         let mut events = self.perf_events.lock();
         events.retain(|group| {
-            group.emit_tracepoint_raw(id, raw);
+            group.emit_tracepoint_raw(id, raw, timestamp);
             !group.is_prunable()
         });
         drop(events);
-        crate::file::PerfGroup::cpu_context_tracepoint(axhal::percpu::this_cpu_id(), id, raw);
+        crate::file::PerfGroup::cpu_context_tracepoint(axhal::percpu::this_cpu_id(), id, raw, timestamp);
     }
 
     pub(crate) fn perf_emit_debug_exception(&self, slot_mask: u64, ip: u64, user: bool) {

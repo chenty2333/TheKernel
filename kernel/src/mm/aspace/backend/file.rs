@@ -101,7 +101,7 @@ impl CachedPageEvictionReservation for FileEvictionReservation {
         };
         let mut aspace = aspace_ref.lock();
         for alias in self.aliases {
-            match aspace.page_table().query(alias.vaddr) {
+            match aspace.page_table().query_mapped(alias.vaddr) {
                 Ok((paddr, _, PageSize::Size4K)) if paddr == alias.paddr => {
                     aspace
                         .page_table_mut()
@@ -604,7 +604,7 @@ impl FileBackendInner {
             // cache page resident.
             if guard
                 .page_table()
-                .query(vaddr)
+                .query_mapped(vaddr)
                 .is_ok_and(|(_, _, size)| size == PageSize::Size2M)
             {
                 guard
@@ -616,7 +616,7 @@ impl FileBackendInner {
                         VfsError::ResourceBusy
                     })?;
             }
-            match guard.page_table().query(vaddr) {
+            match guard.page_table().query_mapped(vaddr) {
                 Ok((paddr, _, PageSize::Size4K)) if paddr == eviction.paddr => {}
                 // A concurrent fault/mapping change is not allowed to race a
                 // a staged eviction.  No alias has been fenced yet.
@@ -628,7 +628,7 @@ impl FileBackendInner {
             }
         }
         for vaddr in candidates {
-            match guard.page_table().query(vaddr) {
+            match guard.page_table().query_mapped(vaddr) {
                 Ok((paddr, flags, PageSize::Size4K)) => {
                     assert_eq!(
                         paddr, eviction.paddr,
@@ -637,7 +637,7 @@ impl FileBackendInner {
                     guard
                         .page_table_mut()
                         .cursor()
-                        .remap(vaddr, paddr, page_table_flags(flags - MappingFlags::WRITE))
+                        .remap(vaddr, paddr, page_table_flags(flags) - MappingFlags::WRITE)
                         .expect("file eviction write protection changed after locked preflight");
                     aliases.push(FileEvictionAlias {
                         vaddr,
@@ -688,7 +688,7 @@ impl FileBackendInner {
         // that PDE before detaching this one cache-page alias.
         if aspace
             .page_table()
-            .query(vaddr)
+            .query_mapped(vaddr)
             .is_ok_and(|(_, _, size)| size == PageSize::Size2M)
             && aspace
                 .demote_alias_preserving_2m(VirtAddr::from(
@@ -1479,7 +1479,7 @@ impl FileBackend {
             VirtAddrRange::try_from_start_size(new_start, size).ok_or(AxError::InvalidInput)?;
         let new_pages = pages_in(new_range, PageSize::Size4K)?;
         for (old_addr, new_addr) in pages_in(old_range, PageSize::Size4K)?.zip(new_pages) {
-            match pt.query(old_addr) {
+            match pt.query_mapped(old_addr) {
                 Ok((paddr, flags, page_size)) => {
                     if page_size != PageSize::Size4K {
                         return Err(AxError::BadAddress);
@@ -1637,7 +1637,9 @@ impl BackendOps for FileBackend {
                             // NeedsCacheReclaim token; the caller must release
                             // this lock, run CachedFile::reclaim_one(), then
                             // revalidate and retry the fault.
-                            let map_flags = flags - MappingFlags::WRITE;
+                            // Normalize PROT_WRITE to a present readable x86
+                            // leaf before write-protecting for dirty tracking.
+                            let map_flags = page_table_flags(flags) - MappingFlags::WRITE;
                             self.0
                                 .cache
                                 .with_page_or_insert_without_reclaim_with_readahead(
@@ -1648,7 +1650,7 @@ impl BackendOps for FileBackend {
                                             addr,
                                             page.paddr(),
                                             PageSize::Size4K,
-                                            page_table_flags(map_flags),
+                                            map_flags,
                                         )?;
                                         pages += 1;
                                         Ok(())
@@ -1764,7 +1766,7 @@ mod tests {
         mount
             .root_location()
             .create(
-                name,
+                axfs_ng_vfs::FsName::new(name.as_bytes()),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o755),
             )
@@ -1804,6 +1806,56 @@ mod tests {
             MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
             FileMappingSharing::Shared,
         )
+    }
+
+    #[test]
+    fn write_only_file_mapping_preserves_read_fault_then_dirty_write_transition() {
+        use crate::mm::aspace::PageFaultResult;
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let _context = test_context();
+        executable::init().unwrap();
+        let location = test_location("write-only-file-fault");
+        let backend = test_backend(&location, Arc::new(()));
+        let cache = backend.0.cache.clone();
+        cache.set_len(PAGE_SIZE_4K as u64).unwrap();
+        let start = VirtAddr::from(0x1000);
+        let flags = MappingFlags::USER | MappingFlags::WRITE;
+        let mut mm = AddrSpace::new_empty(start, PAGE_SIZE_4K).unwrap();
+        mm.map(start, PAGE_SIZE_4K, flags, false, Backend::File(backend))
+            .unwrap();
+
+        assert_eq!(
+            mm.handle_page_fault_result(start, flags, None),
+            PageFaultResult::Handled
+        );
+        let (physical, first, _) = mm
+            .page_table()
+            .query(start)
+            .expect("write-only file fault installs a present read-only leaf");
+        assert!(first.contains(MappingFlags::USER | MappingFlags::READ));
+        assert!(!first.contains(MappingFlags::WRITE));
+        assert_eq!(cache.cachestat(0, 0).nr_dirty, 0);
+        assert_eq!(mm.find_area(start).unwrap().flags(), flags);
+
+        // The retried store faults on write protection, marks the cache page
+        // dirty, and upgrades the existing leaf instead of mapping it twice.
+        assert_eq!(
+            mm.handle_page_fault_result(start, flags, None),
+            PageFaultResult::Handled
+        );
+        let (second_physical, second, _) = mm.page_table().query(start).unwrap();
+        assert_eq!(second_physical, physical);
+        assert!(second.contains(MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE));
+        assert_eq!(cache.cachestat(0, 0).nr_dirty, 1);
+        mm.write(start, &[0x12, 0x34, 0x56, 0x78]).unwrap();
+        assert_eq!(
+            mm.handle_page_fault_result(start, flags, None),
+            PageFaultResult::Handled
+        );
+        mm.write(start + 1, &[0x9a]).unwrap();
+        let mut bytes = [0; 4];
+        assert_eq!(cache.read_at_slice(&mut bytes, 0).unwrap(), bytes.len());
+        assert_eq!(bytes, [0x12, 0x9a, 0x56, 0x78]);
     }
 
     #[test]

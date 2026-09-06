@@ -1561,11 +1561,27 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         ),
     }
     let process = &thr.proc_data.proc;
+    // Declared before the outer guards so every early unwind also releases
+    // lifecycle/task-parent serialization before any retained credential.
+    // Normal exit performs the same order explicitly at the end below.
+    let mut ptrace_retirements = ExitPtraceRetirements::default();
+    // Declared before the lifecycle guard so unwind also releases every outer
+    // lock before a detached immutable filter chain can run its iterative Drop.
+    let mut seccomp_retirement = None;
+    // Completion below only clears and queues the exact old owner; it never
+    // waits for a grace period while lifecycle serialization is held.
+    // Declare custody before the guard so a failed prepare/unwind cannot
+    // destroy a filter chain under lifecycle serialization.
+    let seccomp_retirement_plan;
+    let lifecycle = thr.proc_data.lock_process_lifecycle();
     // Reserve the bounded terminal-retirement entry before group exit can
     // become irreversible.  A full queue must still be reported while the
     // caller can return without leaving the group-exit gate or peer SIGKILLs
     // behind.
-    let seccomp_retirement_plan = thr.prepare_seccomp_exit_retirement()?;
+    // TSYNC takes this same lifecycle guard before replacing peer slots.
+    // Sampling the expected owner before acquiring it permits a stale clear
+    // after irreversible group exit. Reserve and sample inside the boundary.
+    seccomp_retirement_plan = thr.prepare_seccomp_exit_retirement()?;
     set_timer_state(&curr, TimerState::Kernel);
     // rseq teardown is purely kernel state. Linux does not attempt to repair
     // the registered user area while a task is exiting (the mapping may have
@@ -1581,16 +1597,6 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
             }
         }
     }
-    // Declared before the outer guards so every early unwind also releases
-    // lifecycle/task-parent serialization before any retained credential.
-    // Normal exit performs the same order explicitly at the end below.
-    let mut ptrace_retirements = ExitPtraceRetirements::default();
-    // Declared before the lifecycle guard so unwind also releases every outer
-    // lock before a detached immutable filter chain can run its iterative Drop.
-    let mut seccomp_retirement = None;
-    // Completion below only clears and queues the exact old owner; it never
-    // waits for a grace period while lifecycle serialization is held.
-    let lifecycle = thr.proc_data.lock_process_lifecycle();
     let mut task_parent_publication = Some(lock_task_parent_publication());
     thr.proc_data.begin_usage_transition();
     // Preserve the leader's effective affinity while its zombie remains
@@ -1624,6 +1630,19 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
             fail_closed_exit(error);
         }
     };
+    // Membership is now retired and lifecycle serialization excludes new
+    // clone/TSYNC publications. Clear the slot before a final zombie can be
+    // published: waitpid and a retained proc status FD must not observe the
+    // old filter attached after task ownership has been released. Only detach
+    // here; keep the returned Arc until all outer locks are released below.
+    assert!(
+        seccomp_retirement.is_none(),
+        "seccomp exit ownership retired more than once"
+    );
+    seccomp_retirement = Some(
+        thr.complete_seccomp_exit_retirement(seccomp_retirement_plan)
+            .unwrap_or_else(|error| fail_closed_exit(error)),
+    );
     // CET default stacks are task-owned VMAs in the mm, not Thread-drop
     // state. Retire the authoritative owner at the task-unhash edge while
     // this task still names its old image; a CLONE_VM peer has a distinct
@@ -1637,34 +1656,6 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
                 .retire_cet_default_shadow_stack(thr.kernel_tid())
         };
         wake.finish();
-    }
-    // The core unlink above is the sole Linux task ownership retirement edge;
-    // scheduler Arc destruction is not allowed to define files_struct lifetime.
-    // Keep the slot live while pivot_root walks its task snapshot. The task
-    // table unlink above intentionally precedes this gate, avoiding a
-    // task-table -> fs-publication lock inversion.
-    let retired_fs_context = {
-        let _fs_context_publication = fs_context_publication();
-        thr.retire_fs_context()
-    };
-    let mut retired_fd_table = Some(thr.retire_fd_table());
-    // Do not defer cwd/root release to scheduler Arc destruction.
-    drop(retired_fs_context);
-    if final_exit.is_none() {
-        let retired = retired_fd_table
-            .take()
-            .expect("nonfinal exit retains files_struct");
-        // A private files_struct must take the normal close path while this
-        // exiting task still supplies the POSIX-lock owner context. Shared
-        // CLONE_FILES tables retain another task owner and are left intact.
-        if !retired.has_task_users() {
-            let table = retired.table();
-            let closed = crate::file::close_fd_table(&table)
-                .unwrap_or_else(|_| fail_closed_exit(AxError::BadState));
-            drop(closed);
-            crate::file::inotify::wait_current_close_notifications();
-        }
-        drop(retired);
     }
 
     // A final admission owns the removed membership and restores it on Drop.
@@ -1734,6 +1725,38 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
             deliver_exact_parent_death,
         );
         drop(task_parent_publication.take());
+    }
+
+    // The core unlink above is the sole Linux task ownership retirement edge;
+    // scheduler Arc destruction is not allowed to define files_struct lifetime.
+    // Both exact-parent exit paths have now released task-parent publication.
+    // Clone holds fs publication before acquiring task-parent publication;
+    // taking this gate earlier in exit would deadlock with a concurrent clone.
+    // Keep the slot live while pivot_root walks its task snapshot. Task-table
+    // unlink still precedes this gate, and retirement finishes before zombie
+    // publication, while process lifecycle serialization remains held.
+    let retired_fs_context = {
+        let _fs_context_publication = fs_context_publication();
+        thr.retire_fs_context()
+    };
+    let mut retired_fd_table = Some(thr.retire_fd_table());
+    // Do not defer cwd/root release to scheduler Arc destruction.
+    drop(retired_fs_context);
+    if final_exit.is_none() {
+        let retired = retired_fd_table
+            .take()
+            .expect("nonfinal exit retains files_struct");
+        // A private files_struct must take the normal close path while this
+        // exiting task still supplies the POSIX-lock owner context. Shared
+        // CLONE_FILES tables retain another task owner and are left intact.
+        if !retired.has_task_users() {
+            let table = retired.table();
+            let closed = crate::file::close_fd_table(&table)
+                .unwrap_or_else(|_| fail_closed_exit(AxError::BadState));
+            drop(closed);
+            crate::file::inotify::wait_current_close_notifications();
+        }
+        drop(retired);
     }
 
     // Exit-time usercopy belongs to the image of the thread being torn down,
@@ -1809,6 +1832,10 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         let task_parent_guard = task_parent_publication
             .as_ref()
             .expect("final exit retains the task-parent publication guard");
+        assert!(
+            !thr.seccomp_active(),
+            "waitable zombie publication preceded seccomp slot retirement"
+        );
         let committed = publish_final_process_exit(
             &thr.proc_data,
             process,
@@ -1877,17 +1904,6 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // thread-pidfd resolver must never observe removed membership paired with
     // a still-live task flag and retry the retired task identity.
     thr.set_exit();
-    // The task is now terminal while lifecycle serialization still excludes
-    // clone/TSYNC-style publishers. Only detach under that ordering boundary;
-    // the returned chain is destroyed after every outer guard below.
-    assert!(
-        seccomp_retirement.is_none(),
-        "seccomp exit ownership retired more than once"
-    );
-    seccomp_retirement = Some(
-        thr.complete_seccomp_exit_retirement(seccomp_retirement_plan)
-            .unwrap_or_else(|error| fail_closed_exit(error)),
-    );
     // Both non-final and final paths have released their graph gate by here.
     // Keep this defensive take adjacent to lifecycle release so future exit
     // edits cannot accidentally move credential free callbacks back under it.

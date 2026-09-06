@@ -1,0 +1,67 @@
+# thekernel-axtlb
+
+`thekernel-axtlb` is a `no_std`, allocation-free state machine for bounded
+inter-processor interrupt reasons and synchronous CPU-maintenance shootdown.
+It tracks full-TLB invalidation and instruction-stream synchronization as two
+explicit maintenance classes. It deliberately does not send hardware IPIs or
+execute architecture-specific maintenance instructions; a kernel adapter
+supplies those operations.
+
+The all-online correctness profile targets every online CPU other than the
+issuer. A bounded `CpuSet` also supports exact target selection through
+`issue_after_local_maintenance_for_targets` (and its TLB-only convenience
+variant). Each target owns fixed requested/completed epoch pairs for TLB and
+I-cache maintenance plus one pending-reason bitset. Concurrent requests
+coalesce into one reason bit and the greatest requested epoch for each class. A
+caller receives `ShootdownGrace` only after every target has acknowledged every
+class carried by that request. Each request borrows the domain that issued it,
+so safe code cannot complete it against another domain's epochs.
+
+## Contract
+
+- Construction allocates nothing and all storage is fixed by `MAX_CPUS`.
+- `CpuSet` is bounded by `MAX_CPUS` and allocates nothing. The targeted issue
+  API rejects an empty set, an issuer included in the set, or any target that
+  is offline/already draining. It acquires every target admission before
+  publishing an epoch, so those validation failures do not partially publish a
+  targeted request. The all-online APIs retain their original admission-race
+  behavior and remain the fallback for callers without a fixed target set.
+- IPI reasons are a machine-word bitset; there is no callback queue.
+- Epochs are monotonic and never wrap. Every issue error is reported after the
+  caller has published page-table or executable-data stores and may follow
+  partial mailbox publication, so a kernel adapter must fail-stop.
+- `issue_after_local_maintenance` is called only after the issuer has made its
+  page-table or executable-data stores visible and completed every matching
+  local operation. `issue_after_local_flush` is the TLB-only convenience API.
+- An IPI handler clears pending reason bits and calls `service_maintenance`.
+  One invocation captures one fixed epoch snapshot and invokes its callback at
+  most once, so interrupt work cannot chase an unbounded stream of concurrent
+  publications. Its callback must execute every requested bit and take no
+  address-space, frame, pin, allocator, or mailbox lock. If both bits are
+  present, it executes the full TLB invalidation before instruction-stream
+  synchronization.
+- A publication after the handler clears its reason bit either appears in the
+  fixed service snapshot or leaves a newly posted reason for the next service.
+  Work published after the snapshot is never acknowledged by the earlier local
+  maintenance operation.
+- `ShootdownRequest::target_pending` and `target_complete` report only the
+  target, epoch, and maintenance classes owned by that request. Newer or
+  unrelated mailbox work does not make an older request look incomplete.
+- `ShootdownRequest::needs_kick` selects only the initial hardware IPI caused
+  by a pending-reason `0 -> 1` edge. A kernel adapter may use
+  `target_pending` for bounded recovery kicks within its original deadline.
+  Recovery may race service and produce a harmless spurious IPI, but it must
+  never manufacture completion or extend the grace deadline.
+- CPU offline first closes target admission, waits for outstanding admission
+  readers, drains and acknowledges the mailbox, and only then commits offline.
+- A live request retains its issuer admission through grace; target mailboxes
+  retain their own pending epoch/reason until service.
+- CPU state and admission count share one atomic lifecycle word, so offline
+  cannot miss a reader between a state check and a separate counter increment.
+- Both a request and its grace remain borrowed from the issuing domain.
+- A timeout must not be converted into grace. Continuing to reclaim memory
+  after a timeout is outside this crate's contract.
+
+The crate contains no Linux ABI policy. Mapping semantics, executable
+publication policy, and frame/backend retirement remain the responsibility of
+the consuming MM layer.

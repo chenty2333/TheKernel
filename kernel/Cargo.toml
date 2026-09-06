@@ -15,7 +15,6 @@ workspace = true
 bpf = ["dep:axbpf", "dep:thekernel-linux-bpf", "perf-sampling"]
 asid-fast-switch = ["axhal/asid-fast-switch"]
 asid-switch-diagnostics = ["asid-fast-switch", "axhal/asid-switch-diagnostics"]
-dev-log = []
 hwp-uclamp = ["axhal/hwp-uclamp", "axruntime/ipi", "axtask/hwp-uclamp"]
 input = ["dep:axinput", "axfeat/input"]
 memtrack = ["axfeat/dwarf", "axalloc/tracking", "dep:gimli"]
@@ -36,6 +35,8 @@ eevdf-throughput = ["axtask/eevdf-throughput"]
 # The product's SMP build keeps pull-only idle stealing enabled explicitly;
 # the axtask feature itself supplies the SMP+EEVDF prerequisites.
 idle-steal = ["axtask/idle-steal"]
+sched-wake-locality = ["axtask/sched-wake-locality"]
+io-submit-batch = []
 
 [dependencies]
 axfeat = { workspace = true, features = [
@@ -165,6 +166,7 @@ scope-local.workspace = true
 slab = { version = "0.4.9", default-features = false }
 spin = "0.10"
 thekernel-linux-process-adapter.workspace = true
+thekernel-linux-profile.workspace = true
 strum = { version = "0.28", default-features = false, features = ["derive"] }
 syscalls = { version = "0.8", default-features = false }
 
@@ -181,3 +183,6 @@ page_table_multiarch = { workspace = true, features = ["copy-from"] }
 
 [target.'cfg(not(target_os = "none"))'.dev-dependencies]
 axcpu = { workspace = true, features = ["host-test-context"] }
+
+[package.metadata.thekernel]
+layer = "integration"

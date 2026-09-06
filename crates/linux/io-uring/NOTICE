@@ -1,0 +1,6 @@
+This package is a new extraction of Linux-visible io_uring policy and
+lifecycle contracts designed for TheKernel and distributed under Apache-2.0.
+
+Linux, liburing, and Asterinas sources were consulted to understand observable
+ABI, memory-ordering, request, resource, completion, cancellation, and teardown
+contracts. No source text from those projects is copied into this package.

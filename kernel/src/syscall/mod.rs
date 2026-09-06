@@ -142,6 +142,11 @@ pub fn handle_syscall(uctx: &mut UserContext) {
         return;
     }
 
+    if let Some(result) = dispatch::dispatch_new_syscall(uctx.sysno()) {
+        uctx.set_retval(result.unwrap_or_else(|error| -LinuxError::from(error).code() as isize) as _);
+        return;
+    }
+
     let Some(sysno) = Sysno::new(uctx.sysno()) else {
         warn!("Invalid syscall number: {}", uctx.sysno());
         uctx.set_retval(-LinuxError::ENOSYS.code() as _);

@@ -1,0 +1,39 @@
+[package]
+name = "thekernel-linux-usercopy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["朝倉水希 <asakuramizu111@gmail.com>", "Mivik <mivikq@gmail.com>", "陈天意 <hi@tychen.cc>"]
+description = "Explicit-context, bounded, fallible user-memory access for no_std Linux ABI kernels"
+license = "Apache-2.0"
+repository = "https://github.com/chenty2333/thekernel-linux-abi"
+homepage = "https://github.com/chenty2333/thekernel-linux-abi"
+readme = "README.md"
+keywords = ["kernel", "linux", "no-std", "usercopy"]
+categories = ["no-std", "os"]
+
+[features]
+default = []
+alloc = []
+
+[dependencies]
+bytemuck = { version = "1.24", default-features = false }
+linux-raw-sys = { version = "0.12", default-features = false, features = ["general", "no_std"] }
+
+[dev-dependencies]
+bytemuck = { version = "1.24", default-features = false, features = ["derive"] }
+# Exercise the additive owned APIs in integration tests without making them
+# part of the default no-alloc library build.
+thekernel-linux-usercopy = { path = ".", features = ["alloc"] }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[package.metadata.thekernel]
+layer = "linux_abi"

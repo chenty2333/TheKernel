@@ -9,7 +9,8 @@ use memory_addr::PAGE_SIZE_4K;
 use thekernel_linux_signal::Signo;
 
 use crate::task::{
-    AsThread, ProcStateHint, Process, TaskUsage, nanos_to_clock_ticks, zombie_scheduler_state,
+    AsThread, PidNamespace, ProcStateHint, Process, TaskUsage, nanos_to_clock_ticks,
+    zombie_scheduler_state,
 };
 
 pub(crate) fn task_state(task: &AxTaskRef) -> char {
@@ -101,20 +102,31 @@ fn process_memory_stat(task: &AxTaskRef) -> (usize, isize, u64) {
 ///
 /// Fields without a backing kernel counter remain zero until that counter is
 /// owned by the corresponding task, scheduler, VM, or tty subsystem.
-pub fn render_task_stat(task: &AxTaskRef) -> AxResult<String> {
+pub fn render_task_stat(
+    task: &AxTaskRef,
+    pid_ns: &PidNamespace,
+    process_view: bool,
+) -> AxResult<String> {
     let thread = task.as_thread();
     let proc_data = &thread.proc_data;
     let proc = &proc_data.proc;
-    let pid = proc.pid();
+    let pid = pid_ns
+        .visible_pid_checked(if process_view { proc.pid() } else { thread.tid() })
+        .ok_or(AxError::NoSuchProcess)?;
     let comm = task.try_name().map_err(|error| match error {
         axtask::TaskNameError::OutOfMemory => AxError::NoMemory,
         axtask::TaskNameError::ConcurrentMutation => AxError::ResourceBusy,
     })?;
     let comm = comm[..comm.len().min(16)].to_owned();
     let state = task_state(task);
-    let ppid = proc.parent().map_or(0, |parent| parent.pid());
-    let pgrp = proc.group().pgid();
-    let session = proc.group().session().sid();
+    let ppid = proc
+        .parent()
+        .and_then(|parent| pid_ns.visible_pid_checked(parent.pid()))
+        .unwrap_or(0);
+    let pgrp = pid_ns.visible_pid_checked(proc.group().pgid()).unwrap_or(0);
+    let session = pid_ns
+        .visible_pid_checked(proc.group().session().sid())
+        .unwrap_or(0);
     let num_threads = proc.thread_count() as u32;
     let self_usage = process_usage(task, num_threads);
     let child_usage = proc_data.children_usage();
@@ -154,14 +166,21 @@ pub fn render_task_stat(task: &AxTaskRef) -> AxResult<String> {
     ))
 }
 
-pub fn render_zombie_stat(process: &Process) -> AxResult<String> {
+pub fn render_zombie_stat(process: &Process, pid_ns: &PidNamespace) -> AxResult<String> {
     let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
-    let pid = process.pid();
+    let pid = pid_ns
+        .visible_pid_checked(process.pid())
+        .ok_or(AxError::NoSuchProcess)?;
     let comm = "zombie";
     let state = 'Z';
-    let ppid = process.parent().map_or(0, |parent| parent.pid());
-    let pgrp = process.group().pgid();
-    let session = process.group().session().sid();
+    let ppid = process
+        .parent()
+        .and_then(|parent| pid_ns.visible_pid_checked(parent.pid()))
+        .unwrap_or(0);
+    let pgrp = pid_ns.visible_pid_checked(process.group().pgid()).unwrap_or(0);
+    let session = pid_ns
+        .visible_pid_checked(process.group().session().sid())
+        .unwrap_or(0);
     let num_threads = 1;
     let self_usage: TaskUsage = snapshot.self_usage.into();
     let child_usage: TaskUsage = snapshot.child_usage.into();

@@ -9,6 +9,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+from tests.support import test_tmpdir
 import unittest
 from typing import Any
 
@@ -37,7 +38,7 @@ class PiglitResultCheckTests(unittest.TestCase):
         )
 
     def test_accepts_allowed_results_from_a_results_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with test_tmpdir() as temporary:
             directory = pathlib.Path(temporary)
             self.write_results(
                 directory,
@@ -60,7 +61,7 @@ class PiglitResultCheckTests(unittest.TestCase):
         self.assertEqual(completed.stderr, "")
 
     def test_rejects_failures_from_a_direct_compressed_result_file(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with test_tmpdir() as temporary:
             directory = pathlib.Path(temporary)
             results = self.write_results(
                 directory,
@@ -84,7 +85,7 @@ class PiglitResultCheckTests(unittest.TestCase):
 
     def test_rejects_missing_or_empty_test_mappings_as_invalid_input(self) -> None:
         for document in ({}, {"tests": {}}):
-            with self.subTest(document=document), tempfile.TemporaryDirectory() as temporary:
+            with self.subTest(document=document), test_tmpdir() as temporary:
                 results = self.write_results(pathlib.Path(temporary), document)
                 completed = self.run_checker(results)
 
@@ -93,7 +94,7 @@ class PiglitResultCheckTests(unittest.TestCase):
             self.assertIn("Piglit results must contain a nonempty tests mapping", completed.stderr)
 
     def test_rejects_malformed_result_records_as_invalid_input(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with test_tmpdir() as temporary:
             results = self.write_results(
                 pathlib.Path(temporary),
                 {"tests": {"quick/bad": {"result": 1}}},
@@ -105,7 +106,7 @@ class PiglitResultCheckTests(unittest.TestCase):
         self.assertIn("has no string result", completed.stderr)
 
     def test_rejects_malformed_json_inside_a_compressed_fixture(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with test_tmpdir() as temporary:
             results = pathlib.Path(temporary) / "results.json.bz2"
             with bz2.open(results, "wt", encoding="utf-8") as output:
                 output.write('{"tests":')

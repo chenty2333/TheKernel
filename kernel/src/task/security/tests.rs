@@ -9,7 +9,7 @@ use std::{
     thread,
 };
 
-use axfs_ng_vfs::{MetadataUpdate, Mountpoint, NodePermission, Timestamp};
+use axfs_ng_vfs::{FsName, FsPath, MetadataUpdate, Mountpoint, NodePermission, Timestamp};
 use axhal::paging::PageSize;
 use linux_raw_sys::general::{
     CAP_CHOWN, CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN, CAP_SYS_NICE, CAP_SYS_PTRACE, MAP_ANONYMOUS,
@@ -257,7 +257,7 @@ fn security_test_inode() -> Location {
     mount
         .root_location()
         .create(
-            "security-hook",
+            FsName::new(b"security-hook"),
             NodeType::RegularFile,
             NodePermission::from_bits_truncate(0o640),
         )
@@ -1918,21 +1918,25 @@ fn dispatch_all_hook_families(registry: SecurityRegistry) {
     let parent_location = inode_location.parent().unwrap();
     let parent_metadata = parent_location.metadata().unwrap();
     let parent_object = InodeSecurityRef::new(&parent_location, &parent_metadata);
-    let planned_entry = PlannedInodeSecurityRef::new(parent_object, "planned-entry");
+    let planned_entry = PlannedInodeSecurityRef::new(parent_object, FsName::new(b"planned-entry"));
     let directory_location = parent_location
         .create(
-            "security-hook-directory",
+            FsName::new(b"security-hook-directory"),
             NodeType::Directory,
             NodePermission::from_bits_truncate(0o750),
         )
         .unwrap();
     let directory_metadata = directory_location.metadata().unwrap();
     let directory_object = InodeSecurityRef::new(&directory_location, &directory_metadata);
-    let unlink_entry = ExistingInodeSecurityRef::new(parent_object, inode_object, "security-hook");
-    let rmdir_entry =
-        ExistingInodeSecurityRef::new(parent_object, directory_object, "security-hook-directory");
+    let unlink_entry =
+        ExistingInodeSecurityRef::new(parent_object, inode_object, FsName::new(b"security-hook"));
+    let rmdir_entry = ExistingInodeSecurityRef::new(
+        parent_object,
+        directory_object,
+        FsName::new(b"security-hook-directory"),
+    );
     let rename_destination =
-        RenameDestinationSecurityRef::absent(directory_object, "renamed-entry");
+        RenameDestinationSecurityRef::absent(directory_object, FsName::new(b"renamed-entry"));
     let dac_credential = root.fs_dac_credentials();
     let owner_user_ns = initial_user_namespace(root.user_ns());
     let inode_permission = InodePermissionSecurityContext::new(
@@ -1989,7 +1993,7 @@ fn dispatch_all_hook_families(registry: SecurityRegistry) {
         &dac_credential,
         &owner_user_ns,
         &planned_entry,
-        "../target",
+        FsPath::new(b"../target"),
     );
     let inode_link = InodeLinkSecurityContext::new(
         &root,
@@ -2266,7 +2270,10 @@ fn inode_post_setattr_must_not_run(_context: &InodePostSetattrSecurityContext<'_
 }
 
 fn ordered_inode_create_first(context: &InodeCreateSecurityContext<'_, '_, '_>) -> AxResult<()> {
-    assert_eq!(context.new_entry_object().name(), "ordered-entry");
+    assert_eq!(
+        context.new_entry_object().name(),
+        FsName::new(b"ordered-entry")
+    );
     assert_eq!(context.mode().bits(), 0o640);
     assert_eq!(INODE_CREATE_HOOK_TRACE.swap(1, Ordering::SeqCst), 0);
     Ok(())
@@ -2288,7 +2295,10 @@ fn inode_create_must_not_run(_context: &InodeCreateSecurityContext<'_, '_, '_>) 
 }
 
 fn ordered_inode_mkdir_first(context: &InodeMkdirSecurityContext<'_, '_, '_>) -> AxResult<()> {
-    assert_eq!(context.new_entry_object().name(), "ordered-entry");
+    assert_eq!(
+        context.new_entry_object().name(),
+        FsName::new(b"ordered-entry")
+    );
     assert_eq!(context.mode().bits(), 0o750);
     assert_eq!(INODE_MKDIR_HOOK_TRACE.swap(1, Ordering::SeqCst), 0);
     Ok(())
@@ -2310,7 +2320,10 @@ fn inode_mkdir_must_not_run(_context: &InodeMkdirSecurityContext<'_, '_, '_>) ->
 }
 
 fn ordered_inode_mknod_first(context: &InodeMknodSecurityContext<'_, '_, '_>) -> AxResult<()> {
-    assert_eq!(context.new_entry_object().name(), "ordered-entry");
+    assert_eq!(
+        context.new_entry_object().name(),
+        FsName::new(b"ordered-entry")
+    );
     assert_eq!(context.operation().kind(), InodeMknodKind::CharacterDevice);
     assert_eq!(context.operation().rdev(), Some(0x1234));
     assert_eq!(INODE_MKNOD_HOOK_TRACE.swap(1, Ordering::SeqCst), 0);
@@ -2333,8 +2346,11 @@ fn inode_mknod_must_not_run(_context: &InodeMknodSecurityContext<'_, '_, '_>) ->
 }
 
 fn ordered_inode_symlink_first(context: &InodeSymlinkSecurityContext<'_, '_, '_>) -> AxResult<()> {
-    assert_eq!(context.new_entry_object().name(), "ordered-entry");
-    assert_eq!(context.symlink_target(), "../ordered-target");
+    assert_eq!(
+        context.new_entry_object().name(),
+        FsName::new(b"ordered-entry")
+    );
+    assert_eq!(context.symlink_target(), FsPath::new(b"../ordered-target"));
     assert_eq!(INODE_SYMLINK_HOOK_TRACE.swap(1, Ordering::SeqCst), 0);
     Ok(())
 }
@@ -2357,7 +2373,10 @@ fn inode_symlink_must_not_run(_context: &InodeSymlinkSecurityContext<'_, '_, '_>
 }
 
 fn ordered_inode_link_first(context: &InodeLinkSecurityContext<'_, '_, '_>) -> AxResult<()> {
-    assert_eq!(context.new_entry_object().name(), "ordered-entry");
+    assert_eq!(
+        context.new_entry_object().name(),
+        FsName::new(b"ordered-entry")
+    );
     assert_eq!(context.source_object().node_kind(), NodeType::RegularFile);
     assert_ne!(
         context.source_object().identity(),
@@ -2383,7 +2402,10 @@ fn inode_link_must_not_run(_context: &InodeLinkSecurityContext<'_, '_, '_>) -> A
 }
 
 fn ordered_inode_unlink_first(context: &InodeUnlinkSecurityContext<'_, '_, '_>) -> AxResult<()> {
-    assert_eq!(context.target_entry_object().name(), "security-hook");
+    assert_eq!(
+        context.target_entry_object().name(),
+        FsName::new(b"security-hook")
+    );
     assert_eq!(
         context.target_entry_object().target_object().node_kind(),
         NodeType::RegularFile
@@ -2412,7 +2434,10 @@ fn inode_unlink_must_not_run(_context: &InodeUnlinkSecurityContext<'_, '_, '_>) 
 }
 
 fn ordered_inode_rmdir_first(context: &InodeRmdirSecurityContext<'_, '_, '_>) -> AxResult<()> {
-    assert_eq!(context.target_entry_object().name(), "ordered-rmdir-entry");
+    assert_eq!(
+        context.target_entry_object().name(),
+        FsName::new(b"ordered-rmdir-entry")
+    );
     assert_eq!(
         context.target_entry_object().target_object().node_kind(),
         NodeType::Directory
@@ -2443,12 +2468,18 @@ fn inode_rmdir_must_not_run(_context: &InodeRmdirSecurityContext<'_, '_, '_>) ->
 fn ordered_inode_rename_first(
     context: &InodeRenameSecurityContext<'_, '_, '_, '_>,
 ) -> AxResult<()> {
-    assert_eq!(context.old_entry_object().name(), "security-hook");
+    assert_eq!(
+        context.old_entry_object().name(),
+        FsName::new(b"security-hook")
+    );
     assert_eq!(
         context.old_entry_object().target_object().node_kind(),
         NodeType::RegularFile
     );
-    assert_eq!(context.new_entry_object().name(), "ordered-rename-entry");
+    assert_eq!(
+        context.new_entry_object().name(),
+        FsName::new(b"ordered-rename-entry")
+    );
     assert!(context.new_entry_object().target_object().is_none());
     assert_ne!(
         context.old_parent_object().identity(),
@@ -2542,7 +2573,10 @@ fn assert_metadata_preserved(before: &Metadata, after: &Metadata) {
 }
 
 fn observe_unlink_transaction(context: &InodeUnlinkSecurityContext<'_, '_, '_>) -> AxResult<()> {
-    assert_eq!(context.target_entry_object().name(), "denied-unlink");
+    assert_eq!(
+        context.target_entry_object().name(),
+        FsName::new(b"denied-unlink")
+    );
     assert!(core::ptr::eq(
         context.parent_object(),
         context.target_entry_object().parent_object()
@@ -2576,7 +2610,10 @@ fn observe_rmdir_transaction(
     context: &InodeRmdirSecurityContext<'_, '_, '_>,
     expected_name: &str,
 ) -> AxResult<()> {
-    assert_eq!(context.target_entry_object().name(), expected_name);
+    assert_eq!(
+        context.target_entry_object().name(),
+        FsName::new(expected_name.as_bytes())
+    );
     assert!(core::ptr::eq(
         context.parent_object(),
         context.target_entry_object().parent_object()
@@ -2659,8 +2696,14 @@ fn rmdir_vertical_registry(
 fn deny_symlink_transaction(context: &InodeSymlinkSecurityContext<'_, '_, '_>) -> AxResult<()> {
     assert_eq!(context.parent_object().node_kind(), NodeType::Directory);
     assert_eq!(context.parent_object().mode() & 0o777, 0o777);
-    assert_eq!(context.new_entry_object().name(), "denied-symlink");
-    assert_eq!(context.symlink_target(), "../unresolved-target");
+    assert_eq!(
+        context.new_entry_object().name(),
+        FsName::new(b"denied-symlink")
+    );
+    assert_eq!(
+        context.symlink_target(),
+        FsPath::new(b"../unresolved-target")
+    );
     assert_eq!(SYMLINK_VERTICAL_HOOK_TRACE.swap(1, Ordering::SeqCst), 0);
     Err(AxError::PermissionDenied)
 }
@@ -3120,7 +3163,7 @@ fn named_entry_contexts_bind_exact_source_parent_entry_actor_and_final_facts() {
     let parent = child.parent().unwrap();
     let directory = parent
         .create(
-            "exact-rmdir-target",
+            FsName::new(b"exact-rmdir-target"),
             NodeType::Directory,
             NodePermission::from_bits_truncate(0o750),
         )
@@ -3138,13 +3181,20 @@ fn named_entry_contexts_bind_exact_source_parent_entry_actor_and_final_facts() {
     );
     let parent_object = InodeSecurityRef::new(&parent, &metadata);
     let final_name = std::string::String::from("exact-final-name");
-    let planned_entry = PlannedInodeSecurityRef::new(parent_object, final_name.as_str());
+    let planned_entry =
+        PlannedInodeSecurityRef::new(parent_object, FsName::new(final_name.as_bytes()));
     let unlink_name = std::string::String::from("security-hook");
-    let unlink_entry =
-        ExistingInodeSecurityRef::new(parent_object, source_object, unlink_name.as_str());
+    let unlink_entry = ExistingInodeSecurityRef::new(
+        parent_object,
+        source_object,
+        FsName::new(unlink_name.as_bytes()),
+    );
     let rmdir_name = std::string::String::from("exact-rmdir-target");
-    let rmdir_entry =
-        ExistingInodeSecurityRef::new(parent_object, directory_object, rmdir_name.as_str());
+    let rmdir_entry = ExistingInodeSecurityRef::new(
+        parent_object,
+        directory_object,
+        FsName::new(rmdir_name.as_bytes()),
+    );
 
     metadata.mode = NodePermission::empty();
     metadata.uid = 0;
@@ -3154,8 +3204,11 @@ fn named_entry_contexts_bind_exact_source_parent_entry_actor_and_final_facts() {
     assert_eq!(planned_entry.parent_object().mode(), 0o3770);
     assert_eq!(planned_entry.parent_object().uid(), 1101);
     assert_eq!(planned_entry.parent_object().gid(), 1102);
-    assert!(core::ptr::eq(planned_entry.name(), final_name.as_str()));
-    assert_eq!(planned_entry.name(), "exact-final-name");
+    assert!(core::ptr::eq(
+        planned_entry.name(),
+        FsName::new(final_name.as_bytes())
+    ));
+    assert_eq!(planned_entry.name(), FsName::new(b"exact-final-name"));
 
     let dac_credential = security_test_dac(2101, 2102);
     let owner_user_ns = initial_user_namespace(&child_namespace);
@@ -3194,7 +3247,7 @@ fn named_entry_contexts_bind_exact_source_parent_entry_actor_and_final_facts() {
         &dac_credential,
         &owner_user_ns,
         &planned_entry,
-        symlink_target.as_str(),
+        FsPath::new(symlink_target.as_bytes()),
     );
     let link = InodeLinkSecurityContext::new(
         &credential,
@@ -3259,9 +3312,9 @@ fn named_entry_contexts_bind_exact_source_parent_entry_actor_and_final_facts() {
     assert!(core::ptr::eq(symlink.core().actor(), credential.core()));
     assert!(core::ptr::eq(
         symlink.symlink_target(),
-        symlink_target.as_str()
+        FsPath::new(symlink_target.as_bytes())
     ));
-    assert_eq!(symlink.symlink_target(), "../exact-target");
+    assert_eq!(symlink.symlink_target(), FsPath::new(b"../exact-target"));
 
     assert!(core::ptr::eq(link.actor(), credential.as_ref()));
     assert!(core::ptr::eq(link.dac_credential(), &dac_credential));
@@ -3287,7 +3340,10 @@ fn named_entry_contexts_bind_exact_source_parent_entry_actor_and_final_facts() {
         unlink_entry.target_object(),
         unlink.target_entry_object().target_object()
     ));
-    assert!(core::ptr::eq(unlink_entry.name(), unlink_name.as_str()));
+    assert!(core::ptr::eq(
+        unlink_entry.name(),
+        FsName::new(unlink_name.as_bytes())
+    ));
     assert!(core::ptr::eq(unlink.actor(), credential.as_ref()));
     assert!(core::ptr::eq(unlink.dac_credential(), &dac_credential));
     assert!(Arc::ptr_eq(unlink.target_owner_user_ns(), &namespace));
@@ -3318,7 +3374,10 @@ fn named_entry_contexts_bind_exact_source_parent_entry_actor_and_final_facts() {
         rmdir_entry.target_object(),
         rmdir.target_entry_object().target_object()
     ));
-    assert!(core::ptr::eq(rmdir_entry.name(), rmdir_name.as_str()));
+    assert!(core::ptr::eq(
+        rmdir_entry.name(),
+        FsName::new(rmdir_name.as_bytes())
+    ));
     assert!(core::ptr::eq(rmdir.actor(), credential.as_ref()));
     assert!(core::ptr::eq(rmdir.dac_credential(), &dac_credential));
     assert!(Arc::ptr_eq(rmdir.target_owner_user_ns(), &namespace));
@@ -3338,12 +3397,18 @@ fn named_entry_contexts_bind_exact_source_parent_entry_actor_and_final_facts() {
         &rmdir_entry
     ));
 
-    assert_eq!(unlink.target_entry_object().name(), "security-hook");
+    assert_eq!(
+        unlink.target_entry_object().name(),
+        FsName::new(b"security-hook")
+    );
     assert_eq!(
         unlink.target_entry_object().target_object().node_kind(),
         NodeType::RegularFile
     );
-    assert_eq!(rmdir.target_entry_object().name(), "exact-rmdir-target");
+    assert_eq!(
+        rmdir.target_entry_object().name(),
+        FsName::new(b"exact-rmdir-target")
+    );
     assert_eq!(
         rmdir.target_entry_object().target_object().node_kind(),
         NodeType::Directory
@@ -3372,12 +3437,15 @@ fn inode_rename_context_binds_four_roles_and_absent_or_existing_destination() {
     let old_parent_metadata = old_parent.metadata().unwrap();
     let old_parent_object = InodeSecurityRef::new(&old_parent, &old_parent_metadata);
     let old_name = std::string::String::from("security-hook");
-    let old_entry =
-        ExistingInodeSecurityRef::new(old_parent_object, source_object, old_name.as_str());
+    let old_entry = ExistingInodeSecurityRef::new(
+        old_parent_object,
+        source_object,
+        FsName::new(old_name.as_bytes()),
+    );
 
     let new_parent = old_parent
         .create(
-            "exact-rename-parent",
+            FsName::new(b"exact-rename-parent"),
             NodeType::Directory,
             NodePermission::from_bits_truncate(0o770),
         )
@@ -3386,7 +3454,7 @@ fn inode_rename_context_binds_four_roles_and_absent_or_existing_destination() {
     let new_parent_object = InodeSecurityRef::new(&new_parent, &new_parent_metadata);
     let existing_target = new_parent
         .create(
-            "existing-rename-target",
+            FsName::new(b"existing-rename-target"),
             NodeType::RegularFile,
             NodePermission::from_bits_truncate(0o600),
         )
@@ -3395,12 +3463,14 @@ fn inode_rename_context_binds_four_roles_and_absent_or_existing_destination() {
     let existing_target_object = InodeSecurityRef::new(&existing_target, &existing_target_metadata);
     let absent_name = std::string::String::from("absent-rename-target");
     let existing_name = std::string::String::from("existing-rename-target");
-    let absent_destination =
-        RenameDestinationSecurityRef::absent(new_parent_object, absent_name.as_str());
+    let absent_destination = RenameDestinationSecurityRef::absent(
+        new_parent_object,
+        FsName::new(absent_name.as_bytes()),
+    );
     let existing_destination = RenameDestinationSecurityRef::existing(
         new_parent_object,
         existing_target_object,
-        existing_name.as_str(),
+        FsName::new(existing_name.as_bytes()),
     );
     let dac_credential = security_test_dac(2201, 2202);
     let owner_user_ns = initial_user_namespace(&child_namespace);
@@ -3457,19 +3527,25 @@ fn inode_rename_context_binds_four_roles_and_absent_or_existing_destination() {
         absent.core().new_entry_object(),
         &absent_destination
     ));
-    assert_eq!(absent.old_entry_object().name(), "security-hook");
+    assert_eq!(
+        absent.old_entry_object().name(),
+        FsName::new(b"security-hook")
+    );
     assert!(core::ptr::eq(
         absent.old_entry_object().name(),
-        old_name.as_str()
+        FsName::new(old_name.as_bytes())
     ));
     assert_eq!(
         absent.old_entry_object().target_object().identity(),
         source_object.identity()
     );
-    assert_eq!(absent.new_entry_object().name(), "absent-rename-target");
+    assert_eq!(
+        absent.new_entry_object().name(),
+        FsName::new(b"absent-rename-target")
+    );
     assert!(core::ptr::eq(
         absent.new_entry_object().name(),
-        absent_name.as_str()
+        FsName::new(absent_name.as_bytes())
     ));
     assert!(absent.new_entry_object().target_object().is_none());
     assert_ne!(
@@ -3503,7 +3579,10 @@ fn inode_rename_context_binds_four_roles_and_absent_or_existing_destination() {
             .node_kind(),
         NodeType::RegularFile
     );
-    assert_eq!(existing.new_entry_object().name(), "existing-rename-target");
+    assert_eq!(
+        existing.new_entry_object().name(),
+        FsName::new(b"existing-rename-target")
+    );
     assert_ne!(
         existing.old_entry_object().target_object().identity(),
         existing
@@ -3650,21 +3729,21 @@ fn vfs_security_exec_pathwalk_denies_intermediate_and_symlink_target_before_term
     let root = mount.root_location();
     let denied_directory = root
         .create(
-            "denied-directory",
+            FsName::new(b"denied-directory"),
             NodeType::Directory,
             NodePermission::from_bits_truncate(0o777),
         )
         .unwrap();
     let executable = denied_directory
         .create(
-            "program",
+            FsName::new(b"program"),
             NodeType::RegularFile,
             NodePermission::from_bits_truncate(0o755),
         )
         .unwrap();
     root.create_symlink(
-        "jump",
-        "denied-directory/program",
+        FsName::new(b"jump"),
+        FsPath::new(b"denied-directory/program"),
         NodePermission::from_bits_truncate(0o777),
         Some((0, 0)),
     )
@@ -3691,12 +3770,14 @@ fn vfs_security_exec_pathwalk_denies_intermediate_and_symlink_target_before_term
 
     for path in ["denied-directory/program", "jump"] {
         probe.reset();
-        let result = context.resolve_security(path, &security).and_then(|_| {
-            dispatch_exec_executable(&ExecExecutableSecurityContext::new(
-                security.actor(),
-                &executable_object,
-            ))
-        });
+        let result = context
+            .resolve_security(FsPath::new(path.as_bytes()), &security)
+            .and_then(|_| {
+                dispatch_exec_executable(&ExecExecutableSecurityContext::new(
+                    security.actor(),
+                    &executable_object,
+                ))
+            });
         assert_eq!(result, Err(AxError::PermissionDenied), "path: {path}");
         probe.assert_denied_before_terminal(security.actor());
     }
@@ -3906,7 +3987,7 @@ fn named_entry_hook_stacks_preserve_order_and_stop_on_first_denial() {
     let parent = child.parent().unwrap();
     let directory = parent
         .create(
-            "ordered-rmdir-entry",
+            FsName::new(b"ordered-rmdir-entry"),
             NodeType::Directory,
             NodePermission::from_bits_truncate(0o750),
         )
@@ -3915,10 +3996,14 @@ fn named_entry_hook_stacks_preserve_order_and_stop_on_first_denial() {
     let directory_object = InodeSecurityRef::new(&directory, &directory_metadata);
     let metadata = parent.metadata().unwrap();
     let parent_object = InodeSecurityRef::new(&parent, &metadata);
-    let planned_entry = PlannedInodeSecurityRef::new(parent_object, "ordered-entry");
-    let unlink_entry = ExistingInodeSecurityRef::new(parent_object, source_object, "security-hook");
-    let rmdir_entry =
-        ExistingInodeSecurityRef::new(parent_object, directory_object, "ordered-rmdir-entry");
+    let planned_entry = PlannedInodeSecurityRef::new(parent_object, FsName::new(b"ordered-entry"));
+    let unlink_entry =
+        ExistingInodeSecurityRef::new(parent_object, source_object, FsName::new(b"security-hook"));
+    let rmdir_entry = ExistingInodeSecurityRef::new(
+        parent_object,
+        directory_object,
+        FsName::new(b"ordered-rmdir-entry"),
+    );
     let dac_credential = credential.fs_dac_credentials();
     let owner_user_ns = initial_user_namespace(&namespace);
     let create = InodeCreateSecurityContext::new(
@@ -3952,7 +4037,7 @@ fn named_entry_hook_stacks_preserve_order_and_stop_on_first_denial() {
         &dac_credential,
         &owner_user_ns,
         &planned_entry,
-        "../ordered-target",
+        FsPath::new(b"../ordered-target"),
     );
     let link = InodeLinkSecurityContext::new(
         &credential,
@@ -4098,18 +4183,24 @@ fn inode_rename_hook_stack_preserves_order_and_stops_on_first_denial() {
     let old_parent = source.parent().unwrap();
     let old_parent_metadata = old_parent.metadata().unwrap();
     let old_parent_object = InodeSecurityRef::new(&old_parent, &old_parent_metadata);
-    let old_entry =
-        ExistingInodeSecurityRef::new(old_parent_object, source_object, "security-hook");
+    let old_entry = ExistingInodeSecurityRef::new(
+        old_parent_object,
+        source_object,
+        FsName::new(b"security-hook"),
+    );
     let new_parent = old_parent
         .create(
-            "ordered-rename-parent",
+            FsName::new(b"ordered-rename-parent"),
             NodeType::Directory,
             NodePermission::from_bits_truncate(0o770),
         )
         .unwrap();
     let new_parent_metadata = new_parent.metadata().unwrap();
     let new_parent_object = InodeSecurityRef::new(&new_parent, &new_parent_metadata);
-    let new_entry = RenameDestinationSecurityRef::absent(new_parent_object, "ordered-rename-entry");
+    let new_entry = RenameDestinationSecurityRef::absent(
+        new_parent_object,
+        FsName::new(b"ordered-rename-entry"),
+    );
     let dac_credential = credential.fs_dac_credentials();
     let owner_user_ns = initial_user_namespace(&namespace);
     let rename = InodeRenameSecurityContext::new(
@@ -4192,8 +4283,8 @@ fn symlink_registry_denial_prevents_namespace_publication() {
         namespace_mutation::create_symlink(
             &operation,
             &parent,
-            "denied-symlink",
-            "../unresolved-target",
+            FsName::new(b"denied-symlink"),
+            FsPath::new(b"../unresolved-target"),
             &security,
         ),
         Err(AxError::PermissionDenied)
@@ -4201,7 +4292,7 @@ fn symlink_registry_denial_prevents_namespace_publication() {
     assert_eq!(SYMLINK_VERTICAL_HOOK_TRACE.load(Ordering::SeqCst), 1);
     assert_eq!(parent.namespace_generation().unwrap(), generation);
     assert!(matches!(
-        parent.lookup_no_follow("denied-symlink"),
+        parent.lookup_no_follow(FsName::new(b"denied-symlink")),
         Err(AxError::NotFound)
     ));
 }
@@ -4223,7 +4314,7 @@ fn hardlink_registry_denial_is_once_and_preserves_namespace_and_source() {
     let parent = mount.root_location();
     let source = parent
         .create(
-            "denied-source",
+            FsName::new(b"denied-source"),
             NodeType::RegularFile,
             NodePermission::from_bits_truncate(0o640),
         )
@@ -4240,13 +4331,19 @@ fn hardlink_registry_denial_is_once_and_preserves_namespace_and_source() {
     let operation = crate::mounts::namespace_operation();
 
     assert!(matches!(
-        namespace_mutation::link(&operation, &parent, "denied-hardlink", &source, &security,),
+        namespace_mutation::link(
+            &operation,
+            &parent,
+            FsName::new(b"denied-hardlink"),
+            &source,
+            &security,
+        ),
         Err(AxError::PermissionDenied)
     ));
     assert_eq!(HARDLINK_VERTICAL_HOOK_TRACE.load(Ordering::SeqCst), 1);
     assert_eq!(parent.namespace_generation().unwrap(), generation);
     assert!(matches!(
-        parent.lookup_no_follow("denied-hardlink"),
+        parent.lookup_no_follow(FsName::new(b"denied-hardlink")),
         Err(AxError::NotFound)
     ));
     let source_after = source.metadata().unwrap();
@@ -4272,7 +4369,7 @@ fn hardlink_success_publishes_same_inode_and_only_increments_nlink() {
     let parent = mount.root_location();
     let source = parent
         .create(
-            "success-source",
+            FsName::new(b"success-source"),
             NodeType::RegularFile,
             NodePermission::from_bits_truncate(0o640),
         )
@@ -4291,7 +4388,7 @@ fn hardlink_success_publishes_same_inode_and_only_increments_nlink() {
     let linked = namespace_mutation::link(
         &operation,
         &parent,
-        "successful-hardlink",
+        FsName::new(b"successful-hardlink"),
         &source,
         &security,
     )
@@ -4300,7 +4397,7 @@ fn hardlink_success_publishes_same_inode_and_only_increments_nlink() {
     assert!(linked.same_node(&source));
     assert!(
         parent
-            .lookup_no_follow("successful-hardlink")
+            .lookup_no_follow(FsName::new(b"successful-hardlink"))
             .unwrap()
             .same_node(&source)
     );
@@ -4338,7 +4435,7 @@ fn unlink_registry_denial_is_once_and_preserves_exact_transaction() {
     let parent = mount.root_location();
     let victim = parent
         .create(
-            "denied-unlink",
+            FsName::new(b"denied-unlink"),
             NodeType::RegularFile,
             NodePermission::from_bits_truncate(0o640),
         )
@@ -4370,7 +4467,7 @@ fn unlink_registry_denial_is_once_and_preserves_exact_transaction() {
         namespace_mutation::unlink(
             &operation,
             &parent,
-            "denied-unlink",
+            FsName::new(b"denied-unlink"),
             &victim,
             false,
             &security,
@@ -4383,7 +4480,7 @@ fn unlink_registry_denial_is_once_and_preserves_exact_transaction() {
     assert_metadata_preserved(&victim_before, &victim.metadata().unwrap());
     assert!(
         parent
-            .lookup_no_follow("denied-unlink")
+            .lookup_no_follow(FsName::new(b"denied-unlink"))
             .unwrap()
             .same_node(&victim)
     );
@@ -4404,7 +4501,7 @@ fn rmdir_registry_denial_is_once_and_preserves_exact_transaction() {
     let parent = mount.root_location();
     let victim = parent
         .create(
-            "denied-rmdir",
+            FsName::new(b"denied-rmdir"),
             NodeType::Directory,
             NodePermission::from_bits_truncate(0o750),
         )
@@ -4436,7 +4533,7 @@ fn rmdir_registry_denial_is_once_and_preserves_exact_transaction() {
         namespace_mutation::unlink(
             &operation,
             &parent,
-            "denied-rmdir",
+            FsName::new(b"denied-rmdir"),
             &victim,
             true,
             &security,
@@ -4449,7 +4546,7 @@ fn rmdir_registry_denial_is_once_and_preserves_exact_transaction() {
     assert_metadata_preserved(&victim_before, &victim.metadata().unwrap());
     assert!(
         parent
-            .lookup_no_follow("denied-rmdir")
+            .lookup_no_follow(FsName::new(b"denied-rmdir"))
             .unwrap()
             .same_node(&victim)
     );
@@ -4470,14 +4567,14 @@ fn allowed_rmdir_hook_runs_once_before_nonempty_backend_rejection() {
     let parent = mount.root_location();
     let directory = parent
         .create(
-            "nonempty-directory",
+            FsName::new(b"nonempty-directory"),
             NodeType::Directory,
             NodePermission::from_bits_truncate(0o750),
         )
         .unwrap();
     let child = directory
         .create(
-            "child",
+            FsName::new(b"child"),
             NodeType::RegularFile,
             NodePermission::from_bits_truncate(0o640),
         )
@@ -4488,7 +4585,7 @@ fn allowed_rmdir_hook_runs_once_before_nonempty_backend_rejection() {
         namespace_mutation::unlink(
             &operation,
             &parent,
-            "nonempty-directory",
+            FsName::new(b"nonempty-directory"),
             &directory,
             true,
             &security,
@@ -4498,13 +4595,13 @@ fn allowed_rmdir_hook_runs_once_before_nonempty_backend_rejection() {
     assert_eq!(RMDIR_VERTICAL_HOOK_TRACE.load(Ordering::SeqCst), 1);
     assert!(
         parent
-            .lookup_no_follow("nonempty-directory")
+            .lookup_no_follow(FsName::new(b"nonempty-directory"))
             .unwrap()
             .same_node(&directory)
     );
     assert!(
         directory
-            .lookup_no_follow("child")
+            .lookup_no_follow(FsName::new(b"child"))
             .unwrap()
             .same_node(&child)
     );
@@ -4523,7 +4620,7 @@ fn hardlink_cross_mount_rejection_precedes_inode_link() {
     let source_parent = source_mount.root_location();
     let source = source_parent
         .create(
-            "cross-mount-source",
+            FsName::new(b"cross-mount-source"),
             NodeType::RegularFile,
             NodePermission::from_bits_truncate(0o600),
         )
@@ -4537,18 +4634,22 @@ fn hardlink_cross_mount_rejection_precedes_inode_link() {
     let generation = parent.namespace_generation().unwrap();
     let operation = crate::mounts::namespace_operation();
 
-    let error =
-        match namespace_mutation::link(&operation, &parent, "cross-mount-link", &source, &security)
-        {
-            Ok(_) => panic!("cross-mount hard link unexpectedly succeeded"),
-            Err(error) => error,
-        };
+    let error = match namespace_mutation::link(
+        &operation,
+        &parent,
+        FsName::new(b"cross-mount-link"),
+        &source,
+        &security,
+    ) {
+        Ok(_) => panic!("cross-mount hard link unexpectedly succeeded"),
+        Err(error) => error,
+    };
     assert_eq!(error.canonicalize(), AxError::CrossesDevices);
     assert_eq!(HARDLINK_VERTICAL_HOOK_TRACE.load(Ordering::SeqCst), 0);
     assert_eq!(parent.namespace_generation().unwrap(), generation);
     assert_eq!(source.metadata().unwrap().nlink, source_nlink);
     assert!(matches!(
-        parent.lookup_no_follow("cross-mount-link"),
+        parent.lookup_no_follow(FsName::new(b"cross-mount-link")),
         Err(AxError::NotFound)
     ));
 }
@@ -4568,7 +4669,7 @@ fn protected_hardlink_rejection_precedes_inode_link() {
     let parent = mount.root_location();
     let source = parent
         .create(
-            "protected-source",
+            FsName::new(b"protected-source"),
             NodeType::RegularFile,
             NodePermission::from_bits_truncate(0o600),
         )
@@ -4578,14 +4679,20 @@ fn protected_hardlink_rejection_precedes_inode_link() {
     let operation = crate::mounts::namespace_operation();
 
     assert!(matches!(
-        namespace_mutation::link(&operation, &parent, "protected-link", &source, &security,),
+        namespace_mutation::link(
+            &operation,
+            &parent,
+            FsName::new(b"protected-link"),
+            &source,
+            &security,
+        ),
         Err(AxError::OperationNotPermitted)
     ));
     assert_eq!(HARDLINK_VERTICAL_HOOK_TRACE.load(Ordering::SeqCst), 0);
     assert_eq!(parent.namespace_generation().unwrap(), generation);
     assert_eq!(source.metadata().unwrap().nlink, source_nlink);
     assert!(matches!(
-        parent.lookup_no_follow("protected-link"),
+        parent.lookup_no_follow(FsName::new(b"protected-link")),
         Err(AxError::NotFound)
     ));
 }
@@ -4604,7 +4711,7 @@ fn hardlink_directory_rejection_precedes_inode_link() {
     let parent = mount.root_location();
     let source = parent
         .create(
-            "directory-source",
+            FsName::new(b"directory-source"),
             NodeType::Directory,
             NodePermission::from_bits_truncate(0o777),
         )
@@ -4614,14 +4721,20 @@ fn hardlink_directory_rejection_precedes_inode_link() {
     let operation = crate::mounts::namespace_operation();
 
     assert!(matches!(
-        namespace_mutation::link(&operation, &parent, "directory-link", &source, &security,),
+        namespace_mutation::link(
+            &operation,
+            &parent,
+            FsName::new(b"directory-link"),
+            &source,
+            &security,
+        ),
         Err(AxError::OperationNotPermitted)
     ));
     assert_eq!(HARDLINK_VERTICAL_HOOK_TRACE.load(Ordering::SeqCst), 0);
     assert_eq!(parent.namespace_generation().unwrap(), generation);
     assert_eq!(source.metadata().unwrap().nlink, source_nlink);
     assert!(matches!(
-        parent.lookup_no_follow("directory-link"),
+        parent.lookup_no_follow(FsName::new(b"directory-link")),
         Err(AxError::NotFound)
     ));
 }
@@ -5586,21 +5699,28 @@ fn state_aware_dispatch_uses_exact_layout_and_typed_slots() {
     let parent_location = inode_location.parent().unwrap();
     let parent_metadata = parent_location.metadata().unwrap();
     let parent_object = InodeSecurityRef::new(&parent_location, &parent_metadata);
-    let planned_entry = PlannedInodeSecurityRef::new(parent_object, "state-aware-entry");
+    let planned_entry =
+        PlannedInodeSecurityRef::new(parent_object, FsName::new(b"state-aware-entry"));
     let directory_location = parent_location
         .create(
-            "state-aware-directory",
+            FsName::new(b"state-aware-directory"),
             NodeType::Directory,
             NodePermission::from_bits_truncate(0o750),
         )
         .unwrap();
     let directory_metadata = directory_location.metadata().unwrap();
     let directory_object = InodeSecurityRef::new(&directory_location, &directory_metadata);
-    let unlink_entry = ExistingInodeSecurityRef::new(parent_object, inode_object, "security-hook");
-    let rmdir_entry =
-        ExistingInodeSecurityRef::new(parent_object, directory_object, "state-aware-directory");
-    let rename_destination =
-        RenameDestinationSecurityRef::absent(directory_object, "state-aware-renamed-entry");
+    let unlink_entry =
+        ExistingInodeSecurityRef::new(parent_object, inode_object, FsName::new(b"security-hook"));
+    let rmdir_entry = ExistingInodeSecurityRef::new(
+        parent_object,
+        directory_object,
+        FsName::new(b"state-aware-directory"),
+    );
+    let rename_destination = RenameDestinationSecurityRef::absent(
+        directory_object,
+        FsName::new(b"state-aware-renamed-entry"),
+    );
     let dac_credential = credential.fs_dac_credentials();
     let owner_user_ns = initial_user_namespace(&namespace);
     let inode_permission = InodePermissionSecurityContext::new(
@@ -5666,7 +5786,7 @@ fn state_aware_dispatch_uses_exact_layout_and_typed_slots() {
         &dac_credential,
         &owner_user_ns,
         &planned_entry,
-        "../state-aware-target",
+        FsPath::new(b"../state-aware-target"),
     );
     let inode_link = InodeLinkSecurityContext::new(
         &credential,
@@ -6615,21 +6735,28 @@ fn inode_file_and_named_entry_dispatch_fail_closed_on_wrong_actor_state() {
     let parent = location.parent().unwrap();
     let parent_metadata = parent.metadata().unwrap();
     let parent_object = InodeSecurityRef::new(&parent, &parent_metadata);
-    let planned_entry = PlannedInodeSecurityRef::new(parent_object, "malformed-entry");
+    let planned_entry =
+        PlannedInodeSecurityRef::new(parent_object, FsName::new(b"malformed-entry"));
     let directory = parent
         .create(
-            "malformed-directory",
+            FsName::new(b"malformed-directory"),
             NodeType::Directory,
             NodePermission::from_bits_truncate(0o750),
         )
         .unwrap();
     let directory_metadata = directory.metadata().unwrap();
     let directory_object = InodeSecurityRef::new(&directory, &directory_metadata);
-    let unlink_entry = ExistingInodeSecurityRef::new(parent_object, object, "security-hook");
-    let rmdir_entry =
-        ExistingInodeSecurityRef::new(parent_object, directory_object, "malformed-directory");
-    let rename_destination =
-        RenameDestinationSecurityRef::absent(directory_object, "malformed-rename-entry");
+    let unlink_entry =
+        ExistingInodeSecurityRef::new(parent_object, object, FsName::new(b"security-hook"));
+    let rmdir_entry = ExistingInodeSecurityRef::new(
+        parent_object,
+        directory_object,
+        FsName::new(b"malformed-directory"),
+    );
+    let rename_destination = RenameDestinationSecurityRef::absent(
+        directory_object,
+        FsName::new(b"malformed-rename-entry"),
+    );
     let dac_credential = malformed.fs_dac_credentials();
     let owner_user_ns = initial_user_namespace(&namespace);
     let inode = InodePermissionSecurityContext::new(
@@ -6677,7 +6804,7 @@ fn inode_file_and_named_entry_dispatch_fail_closed_on_wrong_actor_state() {
         &dac_credential,
         &owner_user_ns,
         &planned_entry,
-        "../malformed-target",
+        FsPath::new(b"../malformed-target"),
     );
     let link = InodeLinkSecurityContext::new(
         &malformed,

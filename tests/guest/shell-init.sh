@@ -11,7 +11,12 @@ mountpoint -q /proc || mount -t proc proc /proc
 mountpoint -q /sys || mount -t sysfs sysfs /sys
 mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
 
-echo 'THEKERNEL_SHELL_READY'
+# Emit readiness from the interactive prompt, after the shell has configured
+# its terminal. Start a fresh line even when firmware or a command left a
+# partial line; the runner intentionally accepts only standalone markers.
+export PS1='
+THEKERNEL_SHELL_READY
+# '
 cd /root
 set +e
 /bin/sh -i

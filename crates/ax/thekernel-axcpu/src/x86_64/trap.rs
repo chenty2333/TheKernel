@@ -1,0 +1,140 @@
+use x86::{controlregs::cr2, irq::*};
+use x86_64::structures::idt::PageFaultErrorCode;
+
+use super::{gdt, TrapFrame};
+use crate::trap::PageFaultFlags;
+
+core::arch::global_asm!(
+    include_str!("trap.S"),
+    trapframe_size = const core::mem::size_of::<TrapFrame>(),
+    UDATA = const gdt::UDATA.0,
+    UCODE64 = const gdt::UCODE64.0,
+    SYSCALL_VECTOR = const LEGACY_SYSCALL_VECTOR,
+);
+
+pub(super) const LEGACY_SYSCALL_VECTOR: u8 = 0x80;
+/// x86 Control Protection exception (#CP).  User-mode #CP is returned through
+/// `UserContext` and becomes the kernel signal ABI; only a ring-0 #CP reaches
+/// this interrupt-context dispatcher.
+pub(crate) const CONTROL_PROTECTION_VECTOR: u8 = 21;
+const NON_MASKABLE_INTERRUPT_VECTOR: u8 = 2;
+pub(super) const IRQ_VECTOR_START: u8 = 0x20;
+pub(super) const IRQ_VECTOR_END: u8 = 0xff;
+
+fn handle_page_fault(tf: &mut TrapFrame) {
+    let access_flags = err_code_to_flags(tf.error_code)
+        .unwrap_or_else(|e| panic!("Invalid #PF error code: {:#x}", e));
+    let vaddr = va!(unsafe { cr2() });
+    if handle_trap!(PAGE_FAULT, vaddr, access_flags) {
+        return;
+    }
+    #[cfg(feature = "uspace")]
+    if tf.fixup_exception() {
+        return;
+    }
+    panic!(
+        "Unhandled #PF @ {:#x}, fault_vaddr={:#x}, error_code={:#x} ({:?}):\n{:#x?}\n{}",
+        tf.rip,
+        vaddr,
+        tf.error_code,
+        access_flags,
+        tf,
+        tf.backtrace()
+    );
+}
+
+#[unsafe(no_mangle)]
+fn x86_trap_handler(tf: &mut TrapFrame) {
+    match tf.vector as u8 {
+        NON_MASKABLE_INTERRUPT_VECTOR => {
+            // NMI has its own IST entry and must never participate in the
+            // ordinary IRQ nesting/accounting path.
+            handle_trap!(NMI, tf);
+        }
+        PAGE_FAULT_VECTOR => handle_page_fault(tf),
+        BREAKPOINT_VECTOR => {
+            // Probe/debug consumers are a chain.  The first exact claimant
+            // owns this INT3; an unclaimed one remains visible to diagnostics.
+            if !crate::trap::BREAKPOINT.iter().any(|handler| handler(tf)) {
+                debug!("#BP @ {:#x} ", tf.rip);
+            }
+        }
+        DEBUG_VECTOR => {
+            if !crate::trap::DEBUG.iter().any(|handler| handler(tf)) {
+                panic!("Unhandled #DB @ {:#x}", tf.rip);
+            }
+        }
+        GENERAL_PROTECTION_FAULT_VECTOR => {
+            panic!(
+                "#GP @ {:#x}, error_code={:#x}:\n{:#x?}\n{}",
+                tf.rip,
+                tf.error_code,
+                tf,
+                tf.backtrace()
+            );
+        }
+        CONTROL_PROTECTION_VECTOR => {
+            panic!(
+                "Unhandled kernel #CP @ {:#x}, error_code={:#x}:\n{:#x?}\n{}",
+                tf.rip,
+                tf.error_code,
+                tf,
+                tf.backtrace()
+            );
+        }
+        IRQ_VECTOR_START..=IRQ_VECTOR_END => {
+            handle_trap!(IRQ, tf.vector as _, tf);
+        }
+        _ => {
+            panic!(
+                "Unhandled exception {} ({}, error_code={:#x}) @ {:#x}:\n{:#x?}\n{}",
+                tf.vector,
+                vec_to_str(tf.vector),
+                tf.error_code,
+                tf.rip,
+                tf,
+                tf.backtrace()
+            );
+        }
+    }
+}
+
+fn vec_to_str(vec: u64) -> &'static str {
+    if vec < 32 {
+        EXCEPTIONS[vec as usize].mnemonic
+    } else {
+        "Unknown"
+    }
+}
+
+pub(super) fn err_code_to_flags(err_code: u64) -> Result<PageFaultFlags, u64> {
+    let code = PageFaultErrorCode::from_bits_truncate(err_code);
+    let reserved_bits = (PageFaultErrorCode::CAUSED_BY_WRITE
+        | PageFaultErrorCode::USER_MODE
+        | PageFaultErrorCode::INSTRUCTION_FETCH
+        | PageFaultErrorCode::SHADOW_STACK
+        | PageFaultErrorCode::PROTECTION_VIOLATION)
+        .complement();
+    if code.intersects(reserved_bits) {
+        Err(err_code)
+    } else {
+        let mut flags = PageFaultFlags::empty();
+        if code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
+            flags |= PageFaultFlags::WRITE;
+        } else {
+            flags |= PageFaultFlags::READ;
+        }
+        if code.contains(PageFaultErrorCode::USER_MODE) {
+            flags |= PageFaultFlags::USER;
+        }
+        if code.contains(PageFaultErrorCode::INSTRUCTION_FETCH) {
+            flags |= PageFaultFlags::EXECUTE;
+        }
+        if code.contains(PageFaultErrorCode::SHADOW_STACK) {
+            // PFEC.SS is authorized by a SHSTK VMA, never ordinary WRITE.
+            // The VM fault path separately treats it as write-like for COW.
+            flags |= PageFaultFlags::SHADOW_STACK;
+        }
+        Ok(flags)
+    }
+}

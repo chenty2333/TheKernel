@@ -273,6 +273,21 @@ static int test_io_uring(void) {
         "io-uring-child");
 }
 
+static int test_io_uring_trace(void) {
+    /* The kernel mounts tracefs during pseudofs initialization. */
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-io-uring-smoke",
+        "--trace",
+        "io-uring-trace-child");
+}
+
+static int test_log_diagnostics(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-kernel-bench",
+        "diagnostics",
+        "log-diagnostics-child");
+}
+
 static int test_io_uring_buffers(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-io-uring-buffers-smoke",
@@ -410,6 +425,7 @@ static int self_exec_init(const char *next_stage) {
 struct suite_case {
     const char *name;
     int (*run)(void);
+    unsigned int timeout_seconds;
 };
 
 static int test_futex_differential(void) {
@@ -434,6 +450,30 @@ static int test_eventfd_differential(void) {
     return run_guest_program(
         "/opt/thekernel-tests/portable/eventfd-differential", NULL,
         "eventfd-differential-child");
+}
+
+static int test_anon_fd_flags(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/anon-fd-flags", NULL,
+        "anon-fd-flags-child");
+}
+
+static int test_select(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/select-smoke", NULL,
+        "select-child");
+}
+
+static int test_exit_status(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/exit-status", NULL,
+        "exit-status-child");
+}
+
+static int test_timer_create_validation(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/timer-create-validation", NULL,
+        "timer-create-validation-child");
 }
 
 static int test_signal_order_differential(void) {
@@ -476,6 +516,18 @@ static int test_umask_differential(void) {
     return run_guest_program(
         "/opt/thekernel-tests/portable/umask-differential", NULL,
         "umask-differential-child");
+}
+
+static int test_fs_boundary_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/fs-boundary-differential", NULL,
+        "fs-boundary-differential-child");
+}
+
+static int test_signal_boundary_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/signal-boundary-differential", NULL,
+        "signal-boundary-differential-child");
 }
 
 /* The only suite status protocol is the direct child status: 0 is pass, 1
@@ -556,38 +608,46 @@ int main(int argc, char **argv) {
     }
 
     static const struct suite_case suite[] = {
-        { "mounts", verify_core_filesystems },
-        { "rootfs", test_rootfs },
-        { "tmpfs", test_tmpfs },
-        { "procfs", test_procfs },
-        { "memory-pressure", test_memory_pressure_reclaim },
-        { "process-exec", test_process_pipe_and_exec },
-        { "vfork", test_vfork },
-        { "signal-mask-alias", test_signal_mask_alias },
-        { "signal-wait", test_signal_wait_boundary },
-        { "pause", test_pause },
-        { "alarm", test_alarm },
-        { "wait-boundary", test_wait_boundary },
-        { "rseq", test_rseq },
-        { "futex", test_futex_differential },
-        { "futex2-waitv-signal", test_futex2_waitv_signal_differential },
-        { "epoll", test_epoll_differential },
-        { "eventfd", test_eventfd_differential },
-        { "signal-order", test_signal_order_differential },
-        { "io-uring-directio", test_io_uring_directio_differential },
-        { "proc-zombie", test_proc_zombie_differential },
-        { "native-ni", test_native_ni_differential },
-        { "creat", test_creat_differential },
-        { "time", test_time_differential },
-        { "umask", test_umask_differential },
-        { "signal-fp", test_signal_fp },
-        { "io-uring", test_io_uring },
-        { "io-uring-buffers", test_io_uring_buffers },
-        { "ioprio", test_ioprio },
-        { "membarrier", test_membarrier },
-        { "userfaultfd", test_userfaultfd },
-        { "packet", test_packet_socket },
-        { "seccomp", test_seccomp },
+        { "mounts", verify_core_filesystems, 60 },
+        { "rootfs", test_rootfs, 60 },
+        { "tmpfs", test_tmpfs, 60 },
+        { "procfs", test_procfs, 60 },
+        { "memory-pressure", test_memory_pressure_reclaim, 120 },
+        { "process-exec", test_process_pipe_and_exec, 60 },
+        { "vfork", test_vfork, 60 },
+        { "signal-mask-alias", test_signal_mask_alias, 60 },
+        { "signal-wait", test_signal_wait_boundary, 60 },
+        { "pause", test_pause, 60 },
+        { "alarm", test_alarm, 60 },
+        { "wait-boundary", test_wait_boundary, 60 },
+        { "rseq", test_rseq, 60 },
+        { "futex", test_futex_differential, 60 },
+        { "futex2-waitv-signal", test_futex2_waitv_signal_differential, 60 },
+        { "epoll", test_epoll_differential, 60 },
+        { "eventfd", test_eventfd_differential, 60 },
+        { "anon-fd-flags", test_anon_fd_flags, 20 },
+        { "select", test_select, 20 },
+        { "exit-status", test_exit_status, 20 },
+        { "timer-create-validation", test_timer_create_validation, 20 },
+        { "signal-order", test_signal_order_differential, 60 },
+        { "signal-boundary", test_signal_boundary_differential, 60 },
+        { "fs-boundary", test_fs_boundary_differential, 60 },
+        { "io-uring-directio", test_io_uring_directio_differential, 60 },
+        { "proc-zombie", test_proc_zombie_differential, 60 },
+        { "native-ni", test_native_ni_differential, 60 },
+        { "creat", test_creat_differential, 60 },
+        { "time", test_time_differential, 60 },
+        { "umask", test_umask_differential, 60 },
+        { "signal-fp", test_signal_fp, 60 },
+        { "io-uring", test_io_uring, 60 },
+        { "io-uring-trace", test_io_uring_trace, 60 },
+        { "log-diagnostics", test_log_diagnostics, 60 },
+        { "io-uring-buffers", test_io_uring_buffers, 60 },
+        { "ioprio", test_ioprio, 60 },
+        { "membarrier", test_membarrier, 60 },
+        { "userfaultfd", test_userfaultfd, 60 },
+        { "packet", test_packet_socket, 60 },
+        { "seccomp", test_seccomp, 60 },
     };
 
     puts("KTAP version 1");
@@ -595,7 +655,11 @@ int main(int argc, char **argv) {
     unsigned int failures = 0;
     unsigned int skips = 0;
     for (size_t index = 0; index < sizeof(suite) / sizeof(suite[0]); ++index) {
+        printf("# THEKERNEL_TEST_BEGIN %zu %s timeout_seconds=%u\n",
+               index + 1, suite[index].name, suite[index].timeout_seconds);
         int result = run_suite_case(&suite[index]);
+        printf("# THEKERNEL_TEST_END %zu %s result=%d\n",
+               index + 1, suite[index].name, result);
         if (result == 0) {
             printf("ok %zu - %s\n", index + 1, suite[index].name);
         } else if (result == 4) {

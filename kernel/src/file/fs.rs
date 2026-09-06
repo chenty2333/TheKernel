@@ -521,6 +521,7 @@ pub fn metadata_to_kstat(metadata: &Metadata) -> Kstat {
         attributes_mask: 0,
         atime: metadata.atime,
         btime: metadata.btime,
+        metadata_capabilities: Default::default(),
         mtime: metadata.mtime,
         ctime: metadata.ctime,
     }
@@ -544,7 +545,9 @@ pub(crate) fn location_to_kstat_with_idmap(
     loc: &Location,
     idmap: Option<&crate::mounts::MountIdmap>,
 ) -> AxResult<Kstat> {
-    let mut stat = metadata_to_kstat(&loc.metadata()?);
+    let metadata = loc.metadata()?;
+    let mut stat = metadata_to_kstat(&metadata);
+    stat.metadata_capabilities = loc.metadata_capabilities(&metadata);
     if let Some(idmap) = idmap {
         let project = |id: u32, rows: &[crate::mounts::MountIdmapRange]| {
             rows.iter()
@@ -1804,7 +1807,7 @@ mod tests {
     impl DirEntrySink for RecordingDirSink {
         fn accept(
             &mut self,
-            _name: &FsName,
+            _name: &axfs_ng_vfs::FsName,
             _ino: u64,
             _node_type: NodeType,
             _offset: u64,
@@ -1821,7 +1824,7 @@ mod tests {
         let loc = mount
             .root_location()
             .create(
-                "search-only-opath",
+                axfs_ng_vfs::FsName::new(b"search-only-opath"),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o111),
             )
@@ -1906,7 +1909,7 @@ mod tests {
         let loc = mount
             .root_location()
             .create(
-                "cached-killpriv",
+                axfs_ng_vfs::FsName::new(b"cached-killpriv"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o755),
             )

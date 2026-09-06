@@ -49,7 +49,13 @@ const SEMUSZ: usize = 20;
 /// parent's entries.  The proxy calls `apply_sem_undo` only when the final
 /// owner exits, which is the lifetime boundary required by Linux.
 pub(crate) struct SemUndo {
-    entries: BTreeMap<(i32, u16), i32>,
+    entries: BTreeMap<(i32, u16), SemAdjustment>,
+}
+
+#[derive(Clone, Copy)]
+struct SemAdjustment {
+    value: i32,
+    generation: u64,
 }
 
 impl SemUndo {
@@ -101,13 +107,23 @@ impl SemUndo {
 
     /// Records the inverse adjustment for one successfully completed SEM_UNDO
     /// operation. Linux clamps an adjustment instead of overflowing it.
-    pub(crate) fn record(&mut self, semid: i32, semnum: u16, sem_op: i16) -> AxResult<()> {
+    pub(crate) fn record(
+        &mut self,
+        semid: i32,
+        semnum: u16,
+        sem_op: i16,
+        generation: u64,
+    ) -> AxResult<()> {
         if sem_op == 0 {
             return Ok(());
         }
         let delta = -(sem_op as i32);
         let key = (semid, semnum);
-        let prior = self.entries.get(&key).copied().unwrap_or(0);
+        let prior = self
+            .entries
+            .get(&key)
+            .filter(|entry| entry.generation == generation)
+            .map_or(0, |entry| entry.value);
         let next = prior
             .saturating_add(delta)
             .clamp(-(SEMAEM as i32), SEMAEM as i32);
@@ -120,7 +136,13 @@ impl SemUndo {
             // after mutating the semaphore array: that would break semop's
             // all-or-nothing contract.
         }
-        self.entries.insert(key, next);
+        self.entries.insert(
+            key,
+            SemAdjustment {
+                value: next,
+                generation,
+            },
+        );
         Ok(())
     }
 }
@@ -313,6 +335,9 @@ pub struct Sembuf {
 #[derive(Clone, Copy)]
 struct Semaphore {
     value: u16,
+    // SETVAL/SETALL invalidate every owner's earlier adjustment under this
+    // same array lock. New SEM_UNDO operations start from zero in this epoch.
+    undo_generation: u64,
     pid: __kernel_pid_t,
     ncnt: usize,
     zcnt: usize,
@@ -322,10 +347,22 @@ impl Semaphore {
     const fn new() -> Self {
         Self {
             value: 0,
+            undo_generation: 0,
             pid: 0,
             ncnt: 0,
             zcnt: 0,
         }
+    }
+
+    fn reset_value(&mut self, value: u16, pid: __kernel_pid_t) -> AxResult<()> {
+        let generation = self
+            .undo_generation
+            .checked_add(1)
+            .ok_or(AxError::OutOfRange)?;
+        self.undo_generation = generation;
+        self.value = value;
+        self.pid = pid;
+        Ok(())
     }
 }
 
@@ -365,6 +402,21 @@ impl SemArray {
             removed: false,
             waiters: Arc::new(axtask::WaitQueue::new()),
         }
+    }
+
+    fn reset_values(&mut self, values: &[u16], pid: __kernel_pid_t) -> AxResult<()> {
+        if values.len() != self.sems.len() {
+            return Err(AxError::InvalidInput);
+        }
+        // Preflight the complete SETALL before either values or undo epochs
+        // change, preserving the operation's atomicity even on exhaustion.
+        if self.sems.iter().any(|sem| sem.undo_generation == u64::MAX) {
+            return Err(AxError::OutOfRange);
+        }
+        for (sem, value) in self.sems.iter_mut().zip(values) {
+            sem.reset_value(*value, pid)?;
+        }
+        Ok(())
     }
 
     fn nsems(&self) -> usize {
@@ -462,7 +514,10 @@ pub(crate) fn apply_sem_undo(manager: &Mutex<SemManager>, undo: &mut SemUndo) {
             let Some(sem) = array.sems.get_mut(semnum as usize) else {
                 continue;
             };
-            let value = (sem.value as i32 + adjustment).clamp(0, SEMVMX as i32) as u16;
+            if adjustment.generation != sem.undo_generation {
+                continue;
+            }
+            let value = (sem.value as i32 + adjustment.value).clamp(0, SEMVMX as i32) as u16;
             if value == sem.value {
                 false
             } else {
@@ -822,10 +877,7 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
         }
 
         let pid = current().as_thread().proc_data.proc.pid() as __kernel_pid_t;
-        for (sem, value) in array.sems.iter_mut().zip(values) {
-            sem.value = value;
-            sem.pid = pid;
-        }
+        array.reset_values(&values, pid)?;
         array.mark_changed();
         let waiters = array.waiters.clone();
         drop(array);
@@ -914,8 +966,7 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
             }
             let index = validate_semnum(&array, semnum)?;
             let pid = current().as_thread().proc_data.proc.pid() as __kernel_pid_t;
-            array.sems[index].value = value as u16;
-            array.sems[index].pid = pid;
+            array.sems[index].reset_value(value as u16, pid)?;
             array.mark_changed();
             let waiters = array.waiters.clone();
             drop(array);
@@ -1254,7 +1305,12 @@ pub fn sys_semtimedop<M: UserMemory + ?Sized>(
                     if let Some(undo) = undo_guard.as_deref_mut() {
                         let undo = undo.as_mut().ok_or(AxError::BadState)?;
                         for op in ops.iter().filter(|op| op.sem_flg & SEM_UNDO != 0) {
-                            undo.record(semid, op.sem_num, op.sem_op)?;
+                            undo.record(
+                                semid,
+                                op.sem_num,
+                                op.sem_op,
+                                array.sems[op.sem_num as usize].undo_generation,
+                            )?;
                         }
                     }
                     let waiters = array.waiters.clone();
@@ -1334,6 +1390,75 @@ mod setall_snapshot_tests {
         fn write(&mut self, _start: usize, _src: &[u8]) -> VmResult {
             Err(UserCopyError::BadAddress)
         }
+    }
+
+    #[test]
+    fn setval_clears_all_prior_owners_only_for_the_selected_semaphore() {
+        let _context = crate::test_support::scheduler_test_context();
+        let array = Arc::new(Mutex::new(SemArray::new(1, 1, 2, 0o600, 0, 0)));
+        let manager = Mutex::new(SemManager::new());
+        manager.lock().insert(1, 1, array.clone());
+        let mut first = SemUndo::new();
+        let mut second = SemUndo::new();
+        first.record(1, 0, -2, 0).unwrap();
+        first.record(1, 1, -3, 0).unwrap();
+        second.record(1, 0, -4, 0).unwrap();
+        second.record(1, 1, -5, 0).unwrap();
+        array.lock().sems[0].reset_value(20, 1).unwrap();
+        apply_sem_undo(&manager, &mut first);
+        assert_eq!(array.lock().sems[0].value, 20);
+        assert_eq!(array.lock().sems[1].value, 3);
+        // A new operation replaces, rather than combines with, the cleared
+        // adjustment in a surviving process's undo list.
+        let generation = array.lock().sems[0].undo_generation;
+        second.record(1, 0, -7, generation).unwrap();
+        apply_sem_undo(&manager, &mut second);
+        assert_eq!(array.lock().sems[0].value, 27);
+        assert_eq!(array.lock().sems[1].value, 8);
+    }
+
+    #[test]
+    fn setall_clears_every_prior_undo_adjustment() {
+        let _context = crate::test_support::scheduler_test_context();
+        let array = Arc::new(Mutex::new(SemArray::new(1, 1, 2, 0o600, 0, 0)));
+        let manager = Mutex::new(SemManager::new());
+        manager.lock().insert(1, 1, array.clone());
+        let mut undo = SemUndo::new();
+        undo.record(1, 0, -2, 0).unwrap();
+        undo.record(1, 1, -3, 0).unwrap();
+        array.lock().reset_values(&[10, 20], 1).unwrap();
+        apply_sem_undo(&manager, &mut undo);
+        assert_eq!(array.lock().sems[0].value, 10);
+        assert_eq!(array.lock().sems[1].value, 20);
+    }
+
+    #[test]
+    fn exhausted_setval_does_not_wrap_or_change_semaphore() {
+        let mut semaphore = Semaphore::new();
+        semaphore.value = 7;
+        semaphore.pid = 12;
+        semaphore.undo_generation = u64::MAX;
+        assert_eq!(semaphore.reset_value(20, 99), Err(AxError::OutOfRange));
+        assert_eq!(semaphore.value, 7);
+        assert_eq!(semaphore.pid, 12);
+        assert_eq!(semaphore.undo_generation, u64::MAX);
+    }
+
+    #[test]
+    fn failed_setall_preserves_every_value_and_undo_generation() {
+        let mut array = SemArray::new(1, 1, 2, 0o600, 0, 0);
+        array.sems[0].value = 7;
+        array.sems[0].undo_generation = 3;
+        array.sems[1].value = 8;
+        array.sems[1].undo_generation = u64::MAX;
+        assert_eq!(array.reset_values(&[20], 99), Err(AxError::InvalidInput));
+        assert_eq!(array.reset_values(&[20, 30], 99), Err(AxError::OutOfRange));
+        assert_eq!(array.sems[0].value, 7);
+        assert_eq!(array.sems[0].undo_generation, 3);
+        assert_eq!(array.sems[0].pid, 0);
+        assert_eq!(array.sems[1].value, 8);
+        assert_eq!(array.sems[1].undo_generation, u64::MAX);
+        assert_eq!(array.sems[1].pid, 0);
     }
 
     #[test]

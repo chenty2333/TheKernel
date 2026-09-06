@@ -515,7 +515,12 @@ fn sys_ptrace_for_target(
     addr: usize,
     data: usize,
 ) -> AxResult<isize> {
-    let target_task = get_visible_task(pid)?;
+    let target_pid = current()
+        .as_thread()
+        .pid_ns()
+        .resolve_visible_pid(pid)
+        .ok_or(AxError::NoSuchProcess)?;
+    let target_task = get_visible_task(target_pid)?;
     let target_thread = target_task.as_thread();
     let target = target_thread.proc_data.clone();
     match request {

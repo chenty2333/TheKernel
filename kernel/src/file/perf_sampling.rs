@@ -41,6 +41,42 @@ use crate::{
 };
 
 const PAGE: usize = PAGE_SIZE_4K;
+
+static PERF_WAITER_NOTIFICATION: [AtomicBool; axconfig::plat::MAX_CPU_NUM] =
+    [const { AtomicBool::new(false) }; axconfig::plat::MAX_CPU_NUM];
+
+/// Perf notification wakeups must not recursively acquire producer locks
+/// through sched_wakeup. The scheduler calls this with migration disabled.
+pub(crate) fn notifying_perf_waiters() -> bool {
+    PERF_WAITER_NOTIFICATION[axhal::percpu::this_cpu_id()].load(Ordering::Acquire)
+}
+
+struct PerfWaitNotificationGuard {
+    cpu: usize,
+    previous: bool,
+    _irq: NoPreemptIrqSave,
+}
+
+impl PerfWaitNotificationGuard {
+    fn new() -> Self {
+        let irq = NoPreemptIrqSave::new();
+        let cpu = axhal::percpu::this_cpu_id();
+        let previous = PERF_WAITER_NOTIFICATION[cpu].swap(true, Ordering::AcqRel);
+        Self { cpu, previous, _irq: irq }
+    }
+}
+
+impl Drop for PerfWaitNotificationGuard {
+    fn drop(&mut self) {
+        PERF_WAITER_NOTIFICATION[self.cpu].store(self.previous, Ordering::Release);
+    }
+}
+
+fn wake_perf_waiters(waiters: &PollSet<4>) {
+    let _notification = PerfWaitNotificationGuard::new();
+    waiters.wake();
+}
+
 const MIN_DATA: usize = PAGE;
 const MAX_DATA: usize = 1024 * 1024;
 const DATA_HEAD: usize = 1024;
@@ -98,11 +134,6 @@ pub(crate) struct SamplingConfig {
     pub count_kernel: bool,
     pub disabled: bool,
     pub read_format: u64,
-    /// Open-time frozen owner for perf_event_mlock_kb accounting.
-    pub mlock_owner: crate::perf_security::PerfMlockOwner,
-    /// `perf_event_paranoid=-1` mlock exemption, frozen with the descriptor
-    /// rather than re-evaluated when userspace first maps a ring.
-    pub mlock_limit_bypassed: bool,
     /// Exact AUX is never inferred from a generic sampling event.  The
     /// syscall performed the capability admission before constructing this
     /// immutable configuration.
@@ -301,7 +332,8 @@ struct SamplingState {
     ring: Option<Ring>,
     aux: Option<AuxRing>,
     pebs: Option<PebsRing>,
-    locked_bytes: usize,
+    data_charge: alloc::sync::Weak<crate::perf_security::PerfMlockReservation>,
+    aux_charge: alloc::sync::Weak<crate::perf_security::PerfMlockReservation>,
     /// Replaced only under this lock after SET_FILTER has completed bounded
     /// usercopy and source-specific parsing. The producer only reads it.
     filter: Option<Arc<SamplingFilter>>,
@@ -852,7 +884,8 @@ impl PerfSampleBackend {
                 output_paused: false,
                 ring: None,
                 aux: None,
-                locked_bytes: 0,
+                data_charge: alloc::sync::Weak::new(),
+                aux_charge: alloc::sync::Weak::new(),
                 pebs: None,
                 filter: None,
                 scratch: [0; 8192],
@@ -897,8 +930,6 @@ impl PerfSampleBackend {
             count_kernel: true,
             disabled,
             read_format: 0,
-            mlock_owner: crate::perf_security::PerfMlockOwner::current(),
-            mlock_limit_bypassed: false,
             aux: None,
             identity: PerfOpenIdentity {
                 attr: thekernel_linux_perf::PerfEventAttr::default(),
@@ -957,7 +988,7 @@ impl PerfSampleBackend {
     /// Emit a source record with its architectural instruction pointer.  The
     /// caller must pass zero when no trap/register IP exists; trace headers
     /// are payload, never a substitute for a program counter.
-    pub(crate) fn emit_raw_record_at(&self, ip: u64, user: bool, data: &[u8]) -> AxResult<()> {
+    pub(crate) fn emit_raw_record_at(&self, ip: u64, user: bool, data: &[u8], timestamp: u64) -> AxResult<()> {
         if (user && !self.config.count_user) || (!user && !self.config.count_kernel) {
             return Ok(());
         }
@@ -967,7 +998,7 @@ impl PerfSampleBackend {
             return Ok(());
         }
         let (sample_type, period) = (state.sample_type, state.period);
-        let now = axhal::time::monotonic_time_nanos();
+        let now = timestamp;
         let cpu = axhal::percpu::this_cpu_id() as u32;
         let pid = current().id().as_u64() as u32;
         let size = encode_sample_record_fields(
@@ -1015,16 +1046,13 @@ impl PerfSampleBackend {
         };
         drop(state);
         if wake {
-            target
-                .as_ref()
-                .map_or(&self.waiters, |target| &target.waiters)
-                .wake();
+            wake_perf_waiters(target.as_ref().map_or(&self.waiters, |target| &target.waiters));
         }
         Ok(())
     }
 
     pub(crate) fn emit_raw_record(&self, data: &[u8]) -> AxResult<()> {
-        self.emit_raw_record_at(0, true, data)
+        self.emit_raw_record_at(0, true, data, axhal::time::monotonic_time_nanos())
     }
 
     fn publish_encoded_data_record(&self, record: &[u8], source_id: u64) -> AxResult<()> {
@@ -1043,7 +1071,7 @@ impl PerfSampleBackend {
         let wake = publication_should_wake(wakeup, ring, result.published);
         drop(state);
         if wake {
-            self.waiters.wake();
+            wake_perf_waiters(&self.waiters);
         }
         Ok(())
     }
@@ -1117,11 +1145,12 @@ impl PerfSampleBackend {
         ip: u64,
         user: bool,
         data: &[u8],
+        timestamp: u64,
     ) -> AxResult<()> {
         if (user && !self.config.count_user) || (!user && !self.config.count_kernel) {
             return Ok(());
         }
-        let now = axhal::time::monotonic_time_nanos();
+        let now = timestamp;
         let due = {
             let mut state = self.state.lock();
             if !state
@@ -1134,14 +1163,14 @@ impl PerfSampleBackend {
             Self::source_sample_due_locked(&mut state, 1, now)
         };
         for _ in 0..due.records {
-            self.emit_raw_record_at(ip, user, data)?;
+            self.emit_raw_record_at(ip, user, data, timestamp)?;
         }
         self.charge_lost_records(due.lost);
         Ok(())
     }
 
     pub(crate) fn emit_source_raw_record(&self, pid: u32, data: &[u8]) -> AxResult<()> {
-        self.emit_source_raw_record_at(pid, 0, false, data)
+        self.emit_source_raw_record_at(pid, 0, false, data, axhal::time::monotonic_time_nanos())
     }
 
     /// Scheduler-time source accounting for CPU_CLOCK and TASK_CLOCK.  The
@@ -1162,7 +1191,7 @@ impl PerfSampleBackend {
             Self::source_sample_due_locked(&mut state, elapsed, now)
         };
         for _ in 0..due.records {
-            self.emit_raw_record_at(0, user, &[])?;
+            self.emit_raw_record_at(0, user, &[], now)?;
         }
         self.charge_lost_records(due.lost);
         Ok(())
@@ -1221,7 +1250,7 @@ impl PerfSampleBackend {
         let wake = publication_should_wake(wakeup, ring, published.published);
         drop(state);
         if wake {
-            self.waiters.wake();
+            wake_perf_waiters(&self.waiters);
         }
         Ok(())
     }
@@ -1911,7 +1940,7 @@ impl PerfSampleBackend {
                 .map(|head| head.store_release(metadata.offset + metadata.size as u64))
                 .ok();
             if wake {
-                self.waiters.wake();
+                wake_perf_waiters(&self.waiters);
             }
         }
     }
@@ -2223,9 +2252,9 @@ impl PerfSampleBackend {
         event.run_completion_bpf(completion.sample.period);
         if wake_needed {
             if let Some(output) = output {
-                output.waiters.wake();
+                wake_perf_waiters(&output.waiters);
             } else {
-                event.waiters.wake();
+                wake_perf_waiters(&event.waiters);
             }
         }
         if rearm {
@@ -2242,7 +2271,7 @@ impl PerfSampleBackend {
         true
     }
 
-    fn install_ring(&self, request: FileMmapRequest) -> AxResult {
+    fn install_ring(&self, request: FileMmapRequest, mlock: crate::perf_security::PerfMlockContext) -> AxResult<Arc<crate::perf_security::PerfMlockReservation>> {
         if !self.target_current() {
             return Err(AxError::OperationNotSupported);
         }
@@ -2267,18 +2296,17 @@ impl PerfSampleBackend {
         {
             return Err(AxError::InvalidInput);
         }
+        let charge = {
+            let mut state = self.state.lock();
+            Self::mapping_charge(&mut state.data_charge, mlock, total)?
+        };
         if let Some(ring) = self.state.lock().ring.as_ref() {
             return if ring.data_size == data_size {
-                Ok(())
+                Ok(charge)
             } else {
                 Err(AxError::ResourceBusy)
             };
         }
-        let locked = crate::perf_security::reserve_perf_locked_memory(
-            self.config.mlock_owner,
-            total,
-            self.config.mlock_limit_bypassed,
-        )?;
         let pages = Arc::try_new(SharedPages::new_fixed(
             total,
             axhal::paging::PageSize::Size4K,
@@ -2326,7 +2354,7 @@ impl PerfSampleBackend {
         let mut state = self.state.lock();
         if let Some(ring) = state.ring.as_ref() {
             return if ring.data_size == data_size {
-                Ok(())
+                Ok(charge)
             } else {
                 Err(AxError::ResourceBusy)
             };
@@ -2346,14 +2374,10 @@ impl PerfSampleBackend {
         if state.pebs.is_none() {
             state.pebs = pebs;
         }
-        state.locked_bytes = state
-            .locked_bytes
-            .checked_add(locked.commit())
-            .expect("perf mmap locked-memory charge overflow");
-        Ok(())
+        Ok(charge)
     }
 
-    fn install_aux_ring(&self, request: FileMmapRequest) -> AxResult {
+    fn install_aux_ring(&self, request: FileMmapRequest, mlock: crate::perf_security::PerfMlockContext) -> AxResult<Arc<crate::perf_security::PerfMlockReservation>> {
         if !self.config.aux.map_or(false, |request| request.aux) {
             return Err(AxError::OperationNotSupported);
         }
@@ -2382,18 +2406,14 @@ impl PerfSampleBackend {
         {
             return Err(AxError::InvalidInput);
         }
+        let charge = Self::mapping_charge(&mut state.aux_charge, mlock, request.length())?;
         if let Some(aux) = state.aux.as_ref() {
             return if aux.data_size == request.length() {
-                Ok(())
+                Ok(charge)
             } else {
                 Err(AxError::ResourceBusy)
             };
         }
-        let locked = crate::perf_security::reserve_perf_locked_memory(
-            self.config.mlock_owner,
-            request.length(),
-            self.config.mlock_limit_bypassed,
-        )?;
         let pages = Arc::try_new(SharedPages::new_fixed(
             request.length(),
             axhal::paging::PageSize::Size4K,
@@ -2434,6 +2454,7 @@ impl PerfSampleBackend {
         // allocation above has succeeded.  The hardware program is performed
         // by the task-context reconciler, never by mmap while holding this
         // state lock.
+        let data = state.ring.as_ref().expect("validated data ring remains installed");
         data.view.atomic_u64(AUX_HEAD)?.store_release(0);
         data.view.atomic_u64(AUX_TAIL)?.store_release(0);
         data.view.atomic_u64(AUX_OFFSET)?.store_release(offset);
@@ -2448,11 +2469,7 @@ impl PerfSampleBackend {
             backend,
             data_size: request.length(),
         });
-        state.locked_bytes = state
-            .locked_bytes
-            .checked_add(locked.commit())
-            .expect("perf AUX locked-memory charge overflow");
-        Ok(())
+        Ok(charge)
     }
 
     fn read_count(&self, dst: &mut IoDst) -> AxResult<usize> {
@@ -2544,7 +2561,7 @@ fn perf_sampling_nmi(frame: &axcpu::TrapFrame) -> bool {
 impl PerfSampleBackend {
     pub(crate) fn final_close(&self) {
         let now = axhal::time::monotonic_time_nanos();
-        let locked_bytes = {
+        {
             let mut state = self.state.lock();
             if state.enabled {
                 state.enabled_total = state
@@ -2556,16 +2573,17 @@ impl PerfSampleBackend {
             if let Some(ring) = state.ring.as_ref() {
                 let _ = sync_metadata(ring, &state, now);
             }
-            core::mem::take(&mut state.locked_bytes)
-        };
-        crate::perf_security::release_perf_locked_memory(self.config.mlock_owner, locked_bytes);
+            // Last-fd close stops production, but existing VMA leases still
+            // retain their mapping charge. Only the last VMA/plan lease
+            // refunds it; the backend retains a weak reference.
+        }
         #[cfg(target_os = "none")]
         // `final_close` still runs while the descriptor owns a strong Arc;
         // reconcile synchronously so close/CLOEXEC never rely on a tick.
         if let Some(event) = self.custody_reference() {
             crate::file::perf::reconcile_sampling_last(&event);
         }
-        self.waiters.wake();
+        wake_perf_waiters(&self.waiters);
     }
     fn stat(&self) -> AxResult<Kstat> {
         Ok(anon_inode_stat())
@@ -2576,25 +2594,30 @@ impl PerfSampleBackend {
     fn write(&self, _: &mut IoSrc) -> AxResult<usize> {
         Err(AxError::BadFileDescriptor)
     }
+    fn mapping_charge(
+        weak: &mut alloc::sync::Weak<crate::perf_security::PerfMlockReservation>,
+        mlock: crate::perf_security::PerfMlockContext, bytes: usize,
+    ) -> AxResult<Arc<crate::perf_security::PerfMlockReservation>> {
+        if let Some(charge) = weak.upgrade() { return Ok(charge); }
+        let charge = Arc::try_new(mlock.reserve(bytes)?).map_err(|_| AxError::NoMemory)?;
+        *weak = Arc::downgrade(&charge);
+        Ok(charge)
+    }
+
     pub(crate) fn prepare_mmap(
-        &self,
-        request: FileMmapRequest,
+        &self, request: FileMmapRequest,
     ) -> AxResult<Option<PreparedFileMmap>> {
-        if request.offset() == 0 {
-            self.install_ring(request)?;
-        } else {
-            self.install_aux_ring(request)?;
-        }
+        let mlock = crate::perf_security::perf_mlock_context()?;
+        let charge = if request.offset() == 0 { self.install_ring(request, mlock)? }
+            else { self.install_aux_ring(request, mlock)? };
         let state = self.state.lock();
         let region = if request.offset() == 0 {
             state.ring.as_ref().map(|ring| &ring.region)
-        } else {
-            state.aux.as_ref().map(|ring| &ring.region)
+        } else { state.aux.as_ref().map(|ring| &ring.region) };
+        let Some(plan) = region.map(|region| region.prepare(request)).transpose()?.flatten() else {
+            return Ok(None);
         };
-        Ok(region
-            .map(|region| region.prepare(request))
-            .transpose()?
-            .flatten())
+        Ok(Some(plan.with_mapping_lifetime(charge).with_excluded_fork_and_dump()))
     }
     pub(crate) fn ioctl(&self, context: &IoctlContext, cmd: u32, arg: usize) -> AxResult<usize> {
         if cmd == PERF_EVENT_IOC_SET_FILTER {
@@ -2991,8 +3014,6 @@ mod tests {
             count_kernel: false,
             disabled: true,
             read_format: 0,
-            mlock_owner: crate::perf_security::PerfMlockOwner::kernel_test_owner(),
-            mlock_limit_bypassed: false,
             aux: None,
             identity: PerfOpenIdentity {
                 attr: thekernel_linux_perf::PerfEventAttr::default(),
@@ -3006,6 +3027,63 @@ mod tests {
             },
         })
         .unwrap()
+    }
+
+    #[test]
+    fn stopping_a_descriptor_keeps_its_live_mapping_charge() {
+        let _context = crate::test_support::scheduler_test_context();
+        let event = test_sampling_event();
+        let mapping = Arc::new(crate::perf_security::PerfMlockReservation::for_test());
+        event.state.lock().data_charge = Arc::downgrade(&mapping);
+        event.final_close();
+        assert!(event.state.lock().data_charge.upgrade().is_some());
+        drop(mapping);
+        assert!(event.state.lock().data_charge.upgrade().is_none());
+    }
+
+    #[test]
+    fn source_record_keeps_the_captured_timestamp_until_encoding() {
+        let _context = crate::test_support::scheduler_test_context();
+        let event = test_sampling_event();
+        {
+            let mut state = event.state.lock();
+            state.enabled = true;
+            state.sample_type = PERF_SAMPLE_TIME | thekernel_linux_perf::PERF_SAMPLE_RAW;
+        }
+        let captured = 123_456_789;
+        // No ring was mapped: encoding runs, then the provider reports the
+        // missing destination. Inspect that real encoded source record,
+        // rather than testing only the generic record encoder in isolation.
+        assert_eq!(
+            event.emit_source_raw_record_at(0, 0, true, &[7, 8], captured),
+            Err(AxError::OperationNotSupported),
+        );
+        let state = event.state.lock();
+        assert_eq!(
+            u64::from_ne_bytes(state.scratch[8..16].try_into().unwrap()),
+            captured,
+        );
+        assert_eq!(
+            u32::from_ne_bytes(state.scratch[16..20].try_into().unwrap()),
+            2,
+        );
+        assert_eq!(&state.scratch[20..22], &[7, 8]);
+    }
+
+    #[test]
+    fn nested_perf_notifications_restore_the_outer_recursion_state() {
+        let _context = crate::test_support::scheduler_test_context();
+        assert!(!notifying_perf_waiters());
+        {
+            let _outer = PerfWaitNotificationGuard::new();
+            assert!(notifying_perf_waiters());
+            {
+                let _inner = PerfWaitNotificationGuard::new();
+                assert!(notifying_perf_waiters());
+            }
+            assert!(notifying_perf_waiters());
+        }
+        assert!(!notifying_perf_waiters());
     }
 
     #[test]

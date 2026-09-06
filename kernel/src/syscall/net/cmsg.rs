@@ -490,6 +490,7 @@ pub struct CMsgBuilder<'a> {
     hdr: UserPtr<cmsghdr>,
     len: &'a mut usize,
     capacity: usize,
+    pid_namespace: Arc<crate::task::PidNamespace>,
 }
 
 impl<'a> CMsgBuilder<'a> {
@@ -497,6 +498,7 @@ impl<'a> CMsgBuilder<'a> {
         capability: UserMemoryCapability,
         msg: UserPtr<cmsghdr>,
         len: &'a mut usize,
+        pid_namespace: Arc<crate::task::PidNamespace>,
     ) -> Self {
         let capacity = *len;
         *len = 0;
@@ -505,6 +507,7 @@ impl<'a> CMsgBuilder<'a> {
             hdr: msg,
             len,
             capacity,
+            pid_namespace,
         }
     }
 
@@ -641,6 +644,9 @@ impl<'a> CMsgBuilder<'a> {
         let Some(data_addr) = base.checked_add(header_len) else {
             return false;
         };
+        // Transport identities are kernel-wide; only the receiving ABI
+        // boundary projects them into the caller's PID namespace.
+        let pid = super::socket_credential_pid(&self.pid_namespace, pid);
         let Some((header, credentials)) = credentials_cmsg(pid, uid, gid) else {
             return false;
         };

@@ -15,4 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 axerrno = "0.2"
-axpoll-core = { package = "thekernel-axpoll", path = "../../../thekernel-ax/crates/thekernel-axpoll", version = "=0.1.0" }
+axpoll-core = { package = "thekernel-axpoll", path = "../ax/thekernel-axpoll", version = "=0.1.0" }
+
+[package.metadata.thekernel]
+layer = "integration"

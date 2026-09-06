@@ -202,14 +202,14 @@ mod tests {
         let first = first_mount
             .root_location()
             .create(
-                "setattr-token-mount",
+                axfs_ng_vfs::FsName::new(b"setattr-token-mount"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o755),
             )
             .unwrap();
         let second = second_mount
             .root_location()
-            .lookup_no_follow("setattr-token-mount")
+            .lookup_no_follow(axfs_ng_vfs::FsName::new(b"setattr-token-mount"))
             .unwrap();
         let metadata = first.metadata().unwrap();
         let second_metadata = second.metadata().unwrap();
@@ -231,7 +231,7 @@ mod tests {
         let file = mount
             .root_location()
             .create(
-                "setattr-token-apply",
+                axfs_ng_vfs::FsName::new(b"setattr-token-apply"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o755),
             )
@@ -279,7 +279,7 @@ mod tests {
         let file = mount
             .root_location()
             .create(
-                "shared-mapping-conservative-killpriv",
+                axfs_ng_vfs::FsName::new(b"shared-mapping-conservative-killpriv"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o6755),
             )
@@ -321,7 +321,7 @@ mod tests {
         let file = mount
             .root_location()
             .create(
-                "content-write-killpriv",
+                axfs_ng_vfs::FsName::new(b"content-write-killpriv"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o6755),
             )

@@ -410,7 +410,12 @@ fn sys_process_vm_rw(
         return Err(AxError::NoSuchProcess);
     }
 
-    let target_task = get_visible_task(pid as u32)?;
+    let target_pid = current()
+        .as_thread()
+        .pid_ns()
+        .resolve_visible_pid(pid as u32)
+        .ok_or(AxError::NoSuchProcess)?;
+    let target_task = get_visible_task(target_pid)?;
     let target_thread = target_task.as_thread();
     let target_image =
         check_current_thread_ptrace_image_access(target_thread, PtraceAccessMode::AttachReal)?;
@@ -482,15 +487,23 @@ pub fn sys_process_madvise(
     let pidfd = PidFd::from_fd(pidfd)?;
     let target = pidfd.process_data()?;
     let target_image = pidfd.image_access_snapshot()?;
-    validate_process_madvise_behavior(behavior)?;
     check_current_ptrace_image_snapshot(&target, &target_image, PtraceAccessMode::ReadFs)?;
+    if !super::mmap::madvise_behavior_valid(behavior) {
+        return Err(AxError::InvalidInput);
+    }
+    let remote_mm = process_madvise_is_remote(caller.address_space(), target_image.aspace());
+    if remote_mm {
+        validate_process_madvise_behavior(behavior)?;
+    }
     check_process_madvise_capability_if_remote(caller.address_space(), target_image.aspace())?;
     let target_aspace = target_image.into_aspace();
     let mut pageout_work = Vec::new();
     let mut completed = 0usize;
     let mut terminal_error = None;
     for iov in remote.into_iter().filter(|iov| iov.len != 0) {
-        let result = match behavior {
+        let result = if !remote_mm {
+            super::mmap::sys_madvise(iov.base, iov.len, behavior).map(|_| ())
+        } else { match behavior {
             // COLLAPSE may transact every shared alias.  It owns its lock
             // acquisition so it can order every participating mm by ID.
             MADV_COLLAPSE => crate::syscall::mm::mmap::process_madvise_collapse(
@@ -528,8 +541,8 @@ pub fn sys_process_madvise(
                 iov.base,
                 iov.len,
             ),
-            _ => unreachable!("behavior was validated before ptrace access"),
-        };
+            _ => unreachable!("remote behavior was validated"),
+        }};
         match result {
             Ok(()) => {
                 completed = completed

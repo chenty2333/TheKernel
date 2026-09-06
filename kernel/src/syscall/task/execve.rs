@@ -910,7 +910,7 @@ mod tests {
         ExecArgSizer, MappingFlags, PAGE_SIZE_4K, UserContext, VirtAddr, classify_exec_trace_state,
         effective_exec_personality, exact_exec_thread_snapshot, exec_arg_limit,
         exec_file_capabilities, exec_mm_owner_user_ns, files_preparation_covers_thread_snapshot,
-        install_exec_user_context, install_mmap_page_zero, load_exec_string_vec,
+        install_exec_user_context, install_mmap_page_zero, load_exec_byte_vec,
     };
     use crate::{
         mm::{ExecImageAccess, new_user_aspace_with_page_zero},
@@ -1184,7 +1184,7 @@ mod tests {
         let mut memory = UserMemoryContext::new(&mut provider);
         let mut sizer = ExecArgSizer::new().unwrap();
         let values =
-            load_exec_string_vec(&mut memory, base as *const *const c_char, &mut sizer).unwrap();
+            load_exec_byte_vec(&mut memory, base as *const *const c_char, &mut sizer).unwrap();
 
         assert_eq!(values.len(), count);
         assert!(sizer.bytes < exec_arg_limit());
@@ -1208,7 +1208,7 @@ mod tests {
         let mut memory = UserMemoryContext::new(&mut provider);
         let mut sizer = ExecArgSizer::new().unwrap();
         let values =
-            load_exec_string_vec(&mut memory, base as *const *const c_char, &mut sizer).unwrap();
+            load_exec_byte_vec(&mut memory, base as *const *const c_char, &mut sizer).unwrap();
 
         assert_eq!(values.len(), count);
     }
@@ -1223,7 +1223,7 @@ mod tests {
         let mut memory = UserMemoryContext::new(&mut provider);
         let mut sizer = ExecArgSizer::new().unwrap();
         let values =
-            load_exec_string_vec(&mut memory, base as *const *const c_char, &mut sizer).unwrap();
+            load_exec_byte_vec(&mut memory, base as *const *const c_char, &mut sizer).unwrap();
 
         assert!(values.is_empty());
         assert_eq!(values.capacity(), 0);
@@ -1242,7 +1242,7 @@ mod tests {
             bytes: exec_arg_limit() - size_of::<usize>(),
             limit: exec_arg_limit(),
         };
-        let result = load_exec_string_vec(&mut memory, base as *const *const c_char, &mut sizer);
+        let result = load_exec_byte_vec(&mut memory, base as *const *const c_char, &mut sizer);
 
         assert_eq!(result, Err(super::exec_arg_too_big()));
     }
@@ -1253,7 +1253,7 @@ mod tests {
         let mut memory = UserMemoryContext::new(&mut provider);
         let mut sizer = ExecArgSizer::new().unwrap();
         let result =
-            load_exec_string_vec(&mut memory, usize::MAX as *const *const c_char, &mut sizer);
+            load_exec_byte_vec(&mut memory, usize::MAX as *const *const c_char, &mut sizer);
 
         assert_eq!(result, Err(AxError::BadAddress));
     }
@@ -1274,7 +1274,7 @@ mod tests {
             bytes: limit - size_of::<usize>() - 1,
             limit,
         };
-        let result = load_exec_string_vec(&mut memory, base as *const *const c_char, &mut sizer);
+        let result = load_exec_byte_vec(&mut memory, base as *const *const c_char, &mut sizer);
 
         assert_eq!(result, Err(super::exec_arg_too_big()));
     }

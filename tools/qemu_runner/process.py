@@ -14,8 +14,9 @@ import threading
 import time
 import json
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
-from typing import BinaryIO, Mapping
+from typing import BinaryIO, Iterator, Mapping
 
 from .model import (
     INTENTIONAL_STOP_RETURN_CODE,
@@ -30,6 +31,10 @@ from .model import (
 
 class ProcessError(ValueError):
     """Raised when process interaction settings are inconsistent."""
+
+
+class _ScreenshotColorMismatch(ProcessError):
+    """A valid screendump may still show the previous scanout frame."""
 
 
 MAX_PENDING_INPUT_BYTES = 64 * 1024
@@ -108,7 +113,48 @@ def _validate_ppm(
         for y in range(block.y, block.y + block.height):
             start = (y * width + block.x) * 3
             if pixels[start : start + block.width * 3] != expected * block.width:
-                raise ProcessError("QMP screenshot color block did not match")
+                raise _ScreenshotColorMismatch("QMP screenshot color block did not match")
+
+
+def _pin_vcpu_threads(qemu_pid: int | None, response: object,
+                      host_cpus: tuple[int, ...]) -> tuple[tuple[int, int, int], ...]:
+    """Change only verified threads of this paused QEMU process."""
+    if qemu_pid is None or not isinstance(response, list) or len(response) != len(host_cpus):
+        raise ProcessError("QMP returned an incomplete vCPU thread map")
+    allowed = os.sched_getaffinity(qemu_pid)
+    if len(set(host_cpus)) != len(host_cpus) or any(
+        isinstance(cpu, bool) or not isinstance(cpu, int) or cpu not in allowed for cpu in host_cpus
+    ):
+        raise ProcessError("vCPU host CPUs must be distinct members of QEMU's inherited mask")
+    threads = {}
+    for cpu in response:
+        if not isinstance(cpu, dict):
+            raise ProcessError("QMP returned an invalid vCPU entry")
+        index, tid = cpu.get("cpu-index"), cpu.get("thread-id")
+        if (isinstance(index, bool) or not isinstance(index, int) or index not in range(len(host_cpus))
+            or isinstance(tid, bool) or not isinstance(tid, int) or tid <= 0
+            or index in threads or tid in threads.values() or tid == qemu_pid
+            or not Path(f"/proc/{qemu_pid}/task/{tid}").is_dir()):
+            raise ProcessError("QMP vCPU thread is duplicated, missing, or outside this QEMU")
+        threads[index] = tid
+    previous = {}
+    try:
+        for index, host_cpu in enumerate(host_cpus):
+            tid = threads[index]
+            previous[tid] = os.sched_getaffinity(tid)
+            os.sched_setaffinity(tid, {host_cpu})
+            if os.sched_getaffinity(tid) != {host_cpu}:
+                raise ProcessError("vCPU affinity readback differs from requested CPU")
+        if os.sched_getaffinity(qemu_pid) != allowed:
+            raise ProcessError("QEMU main thread mask changed while pinning vCPUs")
+    except (OSError, ProcessError):
+        for tid, mask in previous.items():
+            try:
+                os.sched_setaffinity(tid, mask)
+            except OSError:
+                pass  # The runner terminates QEMU; never resume a failed map.
+        raise
+    return tuple((index, threads[index], host_cpu) for index, host_cpu in enumerate(host_cpus))
 
 
 class _QmpController:
@@ -126,7 +172,12 @@ class _QmpController:
         screenshot_size: tuple[int, int] | None,
         screenshot_color_blocks: tuple[QmpColorBlock, ...],
         checkpoints: tuple[QmpCheckpoint, ...],
+        vcpu_host_cpus: tuple[int, ...] = (),
+        qemu_pid: int | None = None,
     ) -> None:
+        self.vcpu_host_cpus = vcpu_host_cpus
+        self.qemu_pid = qemu_pid
+        self.vcpu_affinity: tuple[tuple[int, int, int], ...] = ()
         self.socket_path = socket_path
         self.screenshot = screenshot
         self.input_events = input_events
@@ -258,11 +309,15 @@ class _QmpController:
         sequence: int,
         deadline: float,
         device_deleted_events: deque[dict[str, object]],
-    ) -> None:
+    ) -> object:
         request_id = f"thekernel-qmp-{sequence}"
         request: dict[str, object] = {"execute": command, "id": request_id}
         if arguments is not None:
             request["arguments"] = arguments
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProcessError("QMP timeout sending a request")
+        client.settimeout(remaining)
         client.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\r\n")
         while True:
             response = self._read_json(client, buffer, deadline)
@@ -278,7 +333,7 @@ class _QmpController:
             if "error" in response:
                 raise ProcessError(f"QMP rejected {command}: {response['error']}")
             if "return" in response:
-                return
+                return response["return"]
             raise ProcessError(f"QMP sent an invalid response for {command}")
 
     def _wait_device_deleted(
@@ -313,6 +368,7 @@ class _QmpController:
 
     def _run(self) -> None:
         deadline = time.monotonic() + self.timeout_secs
+        negotiated = False
         try:
             client = self._connect(deadline)
             buffer = bytearray()
@@ -325,6 +381,17 @@ class _QmpController:
                 raise ProcessError("QMP sent an invalid greeting")
             self._request(client, buffer, "qmp_capabilities", None, 0, deadline, device_deleted_events)
             sequence = 1
+            negotiated = True
+            if self.vcpu_host_cpus:
+                status = self._request(client, buffer, "query-status", None, sequence, deadline, device_deleted_events)
+                sequence += 1
+                if not isinstance(status, dict) or status.get("running") is not False:
+                    raise ProcessError("vCPU affinity requires QEMU to start paused")
+                cpus = self._request(client, buffer, "query-cpus-fast", None, sequence, deadline, device_deleted_events)
+                sequence += 1
+                self.vcpu_affinity = _pin_vcpu_threads(self.qemu_pid, cpus, self.vcpu_host_cpus)
+                self._request(client, buffer, "cont", None, sequence, deadline, device_deleted_events)
+                sequence += 1
             for checkpoint in self.checkpoints:
                 if checkpoint.input_events or checkpoint.pci_hotplug:
                     self._wait_marker(
@@ -385,26 +452,93 @@ class _QmpController:
                             f"screenshot marker: {checkpoint.screenshot_after_marker}",
                             deadline,
                         )
-                    checkpoint.screenshot.unlink(missing_ok=True)
-                    self._request(
-                        client,
-                        buffer,
-                        "screendump",
-                        {"filename": str(checkpoint.screenshot)},
-                        sequence,
-                        deadline,
-                        device_deleted_events,
-                    )
-                    sequence += 1
-                    _validate_ppm(
-                        checkpoint.screenshot,
-                        checkpoint.screenshot_size,
-                        checkpoint.screenshot_color_blocks,
-                    )
+                    # Wayland frame callbacks can precede scanout. Keep the
+                    # pixel oracle strict while waiting within this deadline.
+                    while True:
+                        checkpoint.screenshot.unlink(missing_ok=True)
+                        self._request(
+                            client,
+                            buffer,
+                            "screendump",
+                            {"filename": str(checkpoint.screenshot)},
+                            sequence,
+                            deadline,
+                            device_deleted_events,
+                        )
+                        sequence += 1
+                        try:
+                            _validate_ppm(
+                                checkpoint.screenshot,
+                                checkpoint.screenshot_size,
+                                checkpoint.screenshot_color_blocks,
+                            )
+                            break
+                        except _ScreenshotColorMismatch:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise
+                            if self._cancelled.wait(min(0.02, remaining)):
+                                raise ProcessError("QMP controls cancelled")
+                            if time.monotonic() >= deadline:
+                                raise
             self._complete.set()
         except (OSError, ValueError, json.JSONDecodeError) as error:
             if not self._cancelled.is_set():
-                self.error = error if isinstance(error, ProcessError) else ProcessError(f"QMP control failed: {error}")
+                failure = error if isinstance(error, ProcessError) else ProcessError(f"QMP control failed: {error}")
+                # The controller owns the sole monitor connection. Capture
+                # bounded, read-only CPU state before shutdown when the guest
+                # never reaches a checkpoint; a second monitor cannot attach
+                # to diagnose that stall while this connection is held.
+                if negotiated and str(error).startswith("QMP timeout waiting for") and "marker:" in str(error):
+                    try:
+                        diagnostic_deadline = time.monotonic() + 1.0
+                        registers = self._request(
+                            client, buffer, "human-monitor-command",
+                            {"command-line": "info registers -a"}, sequence,
+                            diagnostic_deadline, device_deleted_events,
+                        )
+                        if isinstance(registers, str) and registers.strip():
+                            failure = ProcessError(f"{failure}\nGuest CPU state at timeout:\n{registers[:32768]}")
+                            # The x86 monitor defaults to CPU 0. A bounded
+                            # kernel stack excerpt supplies return addresses
+                            # when RIP alone lands in a generic lock helper.
+                            first_cpu = registers.split("CPU#1", 1)[0]
+                            stack_pointer = re.search(r"\bRSP=([0-9a-fA-F]{16})\b", first_cpu)
+                            if stack_pointer is not None:
+                                address = int(stack_pointer.group(1), 16)
+                                if 0xffff800000000000 <= address <= 0xfffffffffffffc00:
+                                    stack = self._request(
+                                        client, buffer, "human-monitor-command",
+                                        {"command-line": f"x /128gx 0x{address:x}"}, sequence + 1,
+                                        diagnostic_deadline, device_deleted_events,
+                                    )
+                                    if isinstance(stack, str) and stack.strip():
+                                        failure = ProcessError(f"{failure}\nCPU 0 kernel stack:\n{stack[:8192]}")
+                        devices = self._request(
+                            client, buffer, "x-query-virtio", None, sequence + 2,
+                            diagnostic_deadline, device_deleted_events,
+                        )
+                        if isinstance(devices, list):
+                            gpu = next((device for device in devices[:16]
+                                        if isinstance(device, dict)
+                                        and "gpu" in str(device.get("name", "")).lower()
+                                        and isinstance(device.get("path"), str)), None)
+                            if gpu is not None:
+                                status = self._request(
+                                    client, buffer, "x-query-virtio-status",
+                                    {"path": gpu["path"]}, sequence + 3,
+                                    diagnostic_deadline, device_deleted_events,
+                                )
+                                queue = self._request(
+                                    client, buffer, "x-query-virtio-queue-status",
+                                    {"path": gpu["path"], "queue": 0}, sequence + 4,
+                                    diagnostic_deadline, device_deleted_events,
+                                )
+                                state = json.dumps({"device": status, "control_queue": queue})
+                                failure = ProcessError(f"{failure}\nVirtIO GPU state at timeout:\n{state[:8192]}")
+                    except (OSError, ValueError):
+                        pass  # Diagnostics must not replace the original failure.
+                self.error = failure
         finally:
             with self._lock:
                 if self._client is not None:
@@ -520,6 +654,41 @@ def _terminate_with_grace(process: subprocess.Popen[bytes], *, grace_secs: float
         process.wait()
 
 
+@contextmanager
+def _defer_termination_signals() -> Iterator[list[int]]:
+    """Defer termination until the child is reaped, then unwind caller cleanup.
+
+    Recording instead of raising also covers signals delivered inside Popen,
+    before the caller has received the child handle. Library callers running
+    outside the main thread retain their application's signal policy.
+    """
+    pending: list[int] = []
+    previous = {}
+
+    def defer(signum: int, frame: object) -> None:
+        if not pending:
+            pending.append(signum)
+
+    try:
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGTERM, signal.SIGHUP):
+                handler = signal.getsignal(signum)
+                if handler != signal.SIG_IGN:
+                    previous[signum] = handler
+                    signal.signal(signum, defer)
+        yield pending
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        if pending:
+            signum = pending[0]
+            if previous[signum] == signal.SIG_DFL:
+                # Terminating the interpreter with the OS signal would skip
+                # outer finally blocks that own disks and other run artifacts.
+                raise SystemExit(128 + signum)
+            signal.raise_signal(signum)
+
+
 def _write_stream(stream: BinaryIO | None, data: bytes) -> None:
     if stream is None:
         return
@@ -536,21 +705,25 @@ def _wait_for_process(
     input_stream: BinaryIO,
     console_stream: BinaryIO | None,
     forward_input: bool,
+    termination_signals: list[int],
     qmp_controller: _QmpController | None = None,
 ) -> tuple[int, str | None, bool, str | None]:
     started_at = time.monotonic()
     input_ready = interaction.input_after_marker is None
+    line_ready = interaction.input_line_after_marker is None
     input_open = forward_input
     stdout_open = True
     pending_output = bytearray()
     pending_input = bytearray()
     stop_pending = False
+    active_case: tuple[str, float] | None = None
+    last_case: str | None = None
     assert process.stdout is not None
 
     def consume_lines(
         data: bytes, *, final: bool = False
     ) -> tuple[int, str, bool, str] | None:
-        nonlocal input_ready, stop_pending
+        nonlocal input_ready, line_ready, stop_pending, active_case, last_case
         pending_output.extend(data)
         while True:
             newline = pending_output.find(b"\n")
@@ -560,6 +733,25 @@ def _wait_for_process(
             del pending_output[: newline + 1]
             exact_line = raw_line.rstrip(b"\r\n").decode("utf-8", errors="replace")
             marker_line = _ANSI_ESCAPE_RE.sub("", exact_line)
+            if any(marker_line == prefix or marker_line.startswith(prefix + " ")
+                   for prefix in interaction.failure_prefixes):
+                raise ProcessError(f"guest reported failure: {marker_line}")
+            begin = re.fullmatch(r"# THEKERNEL_TEST_BEGIN (\d+) (\S+) timeout_seconds=(\d+)", marker_line)
+            end = re.fullmatch(r"# THEKERNEL_TEST_END (\d+) (\S+) result=(-?\d+)", marker_line)
+            if begin:
+                if active_case is not None:
+                    raise ProcessError(f"new test began before {active_case[0]} completed")
+                last_case = f"{begin[1]} {begin[2]}"
+                # Each workload declares its own bound (pressure tests include
+                # deliberate pacing); the whole-run deadline remains in force.
+                active_case = (last_case, time.monotonic() + int(begin[3]))
+            elif end:
+                case = f"{end[1]} {end[2]}"
+                if active_case is None or active_case[0] != case:
+                    raise ProcessError(f"test completion without matching begin: {case}")
+                active_case = None
+            if marker_line == interaction.input_line_after_marker:
+                line_ready = True
             if marker_line == interaction.input_after_marker:
                 input_ready = True
             if qmp_controller is not None:
@@ -586,6 +778,9 @@ def _wait_for_process(
         return None
 
     while True:
+        if termination_signals:
+            signum = termination_signals[0]
+            return 128 + signum, f"interrupted by {signal.Signals(signum).name}", False, "interrupted"
         if qmp_controller is not None and qmp_controller.error is not None:
             raise qmp_controller.error
         if stop_pending:
@@ -610,7 +805,7 @@ def _wait_for_process(
             and len(pending_input) < MAX_PENDING_INPUT_BYTES
         ):
             readers.append(input_stream)
-        if pending_input:
+        if pending_input and line_ready:
             assert process.stdin is not None
             if not process.stdin.closed:
                 writers.append(process.stdin)
@@ -641,7 +836,10 @@ def _wait_for_process(
 
         if process.stdin is not None and process.stdin in writable:
             try:
-                written = os.write(process.stdin.fileno(), pending_input)
+                # Never queue the next command before its shell prompt.
+                newline = pending_input.find(b"\n")
+                limit = newline + 1 if interaction.input_line_after_marker is not None and newline >= 0 else len(pending_input)
+                written = os.write(process.stdin.fileno(), pending_input[:limit])
                 if written <= 0:
                     raise BrokenPipeError("QEMU stdin accepted zero bytes")
             except (BlockingIOError, InterruptedError):
@@ -651,6 +849,8 @@ def _wait_for_process(
                 pending_input.clear()
                 process.stdin.close()
             else:
+                if interaction.input_line_after_marker is not None and b"\n" in pending_input[:written]:
+                    line_ready = False
                 del pending_input[:written]
 
         if (
@@ -679,7 +879,9 @@ def _wait_for_process(
                 if qmp_controller.error is not None:
                     raise qmp_controller.error
                 if not qmp_controller.complete:
-                    raise ProcessError("QEMU exited before QMP graphics controls completed")
+                    raise ProcessError(
+                        f"QEMU exited before QMP graphics controls completed (returncode={returncode})"
+                    )
             if interaction.input_after_marker is not None and not input_ready:
                 return (
                     returncode if returncode != 0 else 4,
@@ -687,11 +889,17 @@ def _wait_for_process(
                     False,
                     None,
                 )
+            if active_case is not None:
+                return returncode or 4, f"QEMU exited before test completed: {active_case[0]}", False, "incomplete-case"
             return returncode, None, False, None
 
         now = time.monotonic()
+        if active_case is not None and now >= active_case[1]:
+            message = f"QEMU test timed out: {active_case[0]}; see console log for last serial output"
+            _terminate_with_grace(process)
+            return 124, message, False, "case-timeout"
         if limits.total_timeout_secs is not None and now - started_at >= limits.total_timeout_secs:
-            message = f"QEMU timed out after {limits.total_timeout_secs:g}s"
+            message = f"QEMU timed out after {limits.total_timeout_secs:g}s; last test={last_case or 'none'}"
             _terminate_with_grace(process)
             return 124, message, False, "total-timeout"
 
@@ -706,7 +914,9 @@ def run_process(
     input_stream: BinaryIO | None = None,
     console_stream: BinaryIO | None = None,
     pass_fds: tuple[int, ...] = (),
+    diagnostic_log_path: Path | None = None,
     qmp_socket: Path | None = None,
+    qmp_vcpu_host_cpus: tuple[int, ...] = (),
     screenshot: Path | None = None,
     qmp_input_events: tuple[tuple[Mapping[str, object], ...], ...] = (),
     qmp_input_after_marker: str | None = None,
@@ -735,8 +945,11 @@ def run_process(
         or qmp_input_after_marker is not None
             or qmp_screenshot_after_marker is not None
             or qmp_checkpoints
+            or qmp_vcpu_host_cpus
     ):
         raise ProcessError("QMP controls require a QMP socket")
+    if qmp_vcpu_host_cpus and "-S" not in command:
+        raise ProcessError("vCPU affinity requires paused QEMU (-S)")
     if any(fd < 0 for fd in pass_fds):
         raise ProcessError("passed file descriptors must be non-negative")
     workdir = workdir.expanduser().resolve()
@@ -758,104 +971,117 @@ def run_process(
     runner_terminated = False
     runner_termination_reason: str | None = None
     qmp_controller: _QmpController | None = None
-    try:
-        if proxy_input:
-            process_stdin: int | BinaryIO | None = subprocess.PIPE
-        elif interaction.interactive:
-            process_stdin = input_stream
-        else:
-            process_stdin = subprocess.DEVNULL
-        with log_path.open("wb") as log_file:
-            process = subprocess.Popen(
-                command,
-                cwd=workdir,
-                stdin=process_stdin,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=False,
-                bufsize=0,
-                start_new_session=True,
-                pass_fds=pass_fds,
-            )
-            launched = True
-            if qmp_socket is not None and (screenshot is not None or qmp_input_events or qmp_checkpoints):
-                qmp_controller = _QmpController(
-                    socket_path=qmp_socket,
-                    screenshot=screenshot,
-                    input_events=qmp_input_events,
-                    input_after_marker=qmp_input_after_marker,
-                    screenshot_after_marker=qmp_screenshot_after_marker,
-                    timeout_secs=qmp_timeout_secs,
-                    screenshot_size=qmp_screenshot_size,
-                    screenshot_color_blocks=qmp_screenshot_color_blocks,
-                    checkpoints=qmp_checkpoints,
-                )
-                qmp_controller.start()
+    with _defer_termination_signals() as termination_signals:
+        try:
             if proxy_input:
-                assert process.stdin is not None
-                os.set_blocking(process.stdin.fileno(), False)
-            (
-                returncode,
-                error_message,
-                marker_success,
-                runner_termination_reason,
-            ) = _wait_for_process(
-                process,
-                log_file=log_file,
-                limits=limits,
-                interaction=interaction,
-                input_stream=input_stream,
-                console_stream=console_stream,
-                forward_input=proxy_input,
-                qmp_controller=qmp_controller,
-            )
-            if qmp_controller is not None:
-                for index, latency_ns in qmp_controller.latency_metrics:
-                    event = json.dumps(
-                        {"kind": "input_to_visible", "index": index, "ns": latency_ns},
-                        separators=(",", ":"),
+                process_stdin: int | BinaryIO | None = subprocess.PIPE
+            elif interaction.interactive:
+                process_stdin = input_stream
+            else:
+                process_stdin = subprocess.DEVNULL
+            with log_path.open("wb") as log_file:
+                process = subprocess.Popen(
+                    command,
+                    cwd=workdir,
+                    stdin=process_stdin,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=False,
+                    bufsize=0,
+                    start_new_session=True,
+                    pass_fds=pass_fds,
+                )
+                launched = True
+                if qmp_socket is not None and (screenshot is not None or qmp_input_events or qmp_checkpoints or qmp_vcpu_host_cpus):
+                    qmp_controller = _QmpController(
+                        socket_path=qmp_socket,
+                        vcpu_host_cpus=qmp_vcpu_host_cpus,
+                        qemu_pid=process.pid,
+                        screenshot=screenshot,
+                        input_events=qmp_input_events,
+                        input_after_marker=qmp_input_after_marker,
+                        screenshot_after_marker=qmp_screenshot_after_marker,
+                        timeout_secs=qmp_timeout_secs,
+                        screenshot_size=qmp_screenshot_size,
+                        screenshot_color_blocks=qmp_screenshot_color_blocks,
+                        checkpoints=qmp_checkpoints,
                     )
-                    log_file.write(f"THEKERNEL_GRAPHICS_METRIC {event}\n".encode())
-                log_file.flush()
-    except KeyboardInterrupt:
-        if process is not None:
-            _terminate_with_grace(process)
-            runner_terminated = True
-            runner_termination_reason = "interrupted"
-        returncode = 130
-        error_message = "interrupted"
-    except (OSError, ProcessError) as error:
-        if process is not None and process.poll() is None:
-            _terminate_with_grace(process)
-            runner_terminated = True
-            runner_termination_reason = "process-io-error"
-        if launched:
-            returncode = 4
-            error_message = f"QEMU process I/O failed: {error}"
-        else:
-            returncode = 3
-            error_message = f"QEMU launch failed: {error}"
-    finally:
-        if qmp_controller is not None:
-            qmp_controller.close()
-        if qmp_socket is not None:
-            try:
-                qmp_socket.unlink(missing_ok=True)
-            except OSError:
-                pass
-        if process is not None:
-            if process.stdin is not None and not process.stdin.closed:
-                process.stdin.close()
-            if process.stdout is not None and not process.stdout.closed:
-                process.stdout.close()
+                    qmp_controller.start()
+                if proxy_input:
+                    assert process.stdin is not None
+                    os.set_blocking(process.stdin.fileno(), False)
+                (
+                    returncode,
+                    error_message,
+                    marker_success,
+                    runner_termination_reason,
+                ) = _wait_for_process(
+                    process,
+                    log_file=log_file,
+                    limits=limits,
+                    interaction=interaction,
+                    input_stream=input_stream,
+                    console_stream=console_stream,
+                    forward_input=proxy_input,
+                    termination_signals=termination_signals,
+                    qmp_controller=qmp_controller,
+                )
+                if qmp_controller is not None:
+                    for index, latency_ns in qmp_controller.latency_metrics:
+                        event = json.dumps(
+                            {"kind": "input_to_visible", "index": index, "ns": latency_ns},
+                            separators=(",", ":"),
+                        )
+                        log_file.write(f"THEKERNEL_GRAPHICS_METRIC {event}\n".encode())
+                    log_file.flush()
+        except KeyboardInterrupt:
+            if process is not None:
+                _terminate_with_grace(process)
+                runner_terminated = True
+                runner_termination_reason = "interrupted"
+            returncode = 130
+            error_message = "interrupted"
+        except (OSError, ProcessError) as error:
+            if process is not None and process.poll() is None:
+                _terminate_with_grace(process)
+                runner_terminated = True
+                runner_termination_reason = "process-io-error"
+            if launched:
+                returncode = 4
+                error_message = f"QEMU process I/O failed: {error}"
+            else:
+                returncode = 3
+                error_message = f"QEMU launch failed: {error}"
+        finally:
+            # A caller-supplied stream or a controller can raise an unexpected
+            # exception (for example TypeError). Preserve that exception, but
+            # never leave the child running after its owning invocation exits.
+            if process is not None and process.poll() is None:
+                _terminate_with_grace(process)
+            if qmp_controller is not None:
+                qmp_controller.close()
+            if qmp_socket is not None:
+                try:
+                    qmp_socket.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if process is not None:
+                if process.stdin is not None and not process.stdin.closed:
+                    process.stdin.close()
+                if process.stdout is not None and not process.stdout.closed:
+                    process.stdout.close()
 
-    return RunResult(
-        returncode=returncode,
-        log_path=log_path,
-        error_message=error_message,
-        marker_success=marker_success,
-        runner_terminated=(
-            runner_terminated or runner_termination_reason is not None
-        ),
-        runner_termination_reason=runner_termination_reason,
-    )
+        if error_message is not None and diagnostic_log_path is not None:
+            error_message += f"; console log: {log_path}; kernel log: {diagnostic_log_path}"
+        return RunResult(
+            returncode=returncode,
+            log_path=log_path,
+            diagnostic_log_path=diagnostic_log_path,
+            error_message=error_message,
+            marker_success=marker_success,
+            runner_terminated=(
+                runner_terminated or runner_termination_reason is not None
+            ),
+            runner_termination_reason=runner_termination_reason,
+            vcpu_affinity=qmp_controller.vcpu_affinity if qmp_controller is not None else (),
+        )

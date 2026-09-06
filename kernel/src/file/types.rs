@@ -3,7 +3,7 @@ use core::ffi::c_int;
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{
-    DeviceId, Filesystem, FsPath, FsPathBuf, Location, Timestamp, WritebackErrorState,
+    DeviceId, Filesystem, FsPath, FsPathBuf, Location, MetadataCapabilities, Timestamp, WritebackErrorState,
 };
 use axio::prelude::*;
 use axpoll::Pollable;
@@ -11,7 +11,7 @@ use axsync::Mutex;
 use axtask::{AxTaskRef, current};
 use downcast_rs::{DowncastSync, impl_downcast};
 use linux_raw_sys::general::{
-    RLIMIT_NOFILE, S_IFBLK, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, STATX_BASIC_STATS,
+    RLIMIT_NOFILE, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, STATX_BASIC_STATS,
     STATX_BTIME, STATX_DIOALIGN, STATX_MNT_ID, stat, statx, statx_timestamp,
 };
 use thekernel_linux_io_uring::{IssuedRequest, RequestId, TerminalCause};
@@ -25,10 +25,6 @@ use crate::{
     mm::{AddrSpace, UserMemoryCapability},
     task::{AX_FILE_LIMIT, AsThread, Cred, ProcessData, Session},
 };
-
-// Match Linux's regular-file O_DIRECT floor: logical sector alignment, not
-// the filesystem's preferred st_blksize.
-const REGULAR_FILE_DIO_ALIGNMENT: u32 = 512;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Kstat {
@@ -47,6 +43,7 @@ pub struct Kstat {
     pub attributes_mask: u64,
     pub atime: Timestamp,
     pub btime: Timestamp,
+    pub metadata_capabilities: MetadataCapabilities,
     pub mtime: Timestamp,
     pub ctime: Timestamp,
 }
@@ -191,6 +188,7 @@ impl Default for Kstat {
             attributes_mask: 0,
             atime: Timestamp::ZERO,
             btime: Timestamp::ZERO,
+            metadata_capabilities: MetadataCapabilities::default(),
             mtime: Timestamp::ZERO,
             ctime: Timestamp::ZERO,
         }
@@ -227,7 +225,7 @@ impl From<Kstat> for statx {
     fn from(value: Kstat) -> Self {
         // SAFETY: valid for statx
         let mut statx: statx = unsafe { core::mem::zeroed() };
-        statx.stx_mask = STATX_BASIC_STATS | STATX_BTIME;
+        statx.stx_mask = STATX_BASIC_STATS;
         statx.stx_blksize = value.blksize as _;
         statx.stx_attributes = value.attributes;
         statx.stx_attributes_mask = value.attributes_mask;
@@ -249,7 +247,10 @@ impl From<Kstat> for statx {
             }
         }
         statx.stx_atime = time_to_statx(&value.atime);
-        statx.stx_btime = time_to_statx(&value.btime);
+        if value.metadata_capabilities.birth_time {
+            statx.stx_mask |= STATX_BTIME;
+            statx.stx_btime = time_to_statx(&value.btime);
+        }
         statx.stx_ctime = time_to_statx(&value.ctime);
         statx.stx_mtime = time_to_statx(&value.mtime);
         if value.mnt_id != 0 {
@@ -260,15 +261,10 @@ impl From<Kstat> for statx {
         let dev = DeviceId(value.dev);
         statx.stx_dev_major = dev.major();
         statx.stx_dev_minor = dev.minor();
-        let file_type = value.mode & S_IFMT;
-        if file_type == S_IFBLK {
+        if let Some(alignment) = value.metadata_capabilities.direct_io_alignment {
             statx.stx_mask |= STATX_DIOALIGN;
-            statx.stx_dio_mem_align = 1;
-            statx.stx_dio_offset_align = value.blksize.max(512);
-        } else if file_type == S_IFREG {
-            statx.stx_mask |= STATX_DIOALIGN;
-            statx.stx_dio_mem_align = REGULAR_FILE_DIO_ALIGNMENT;
-            statx.stx_dio_offset_align = REGULAR_FILE_DIO_ALIGNMENT;
+            statx.stx_dio_mem_align = alignment.memory;
+            statx.stx_dio_offset_align = alignment.offset;
         }
 
         statx
@@ -521,6 +517,8 @@ impl FixedSharedMmapRegion {
             pages: self.pages.clone(),
             may_protect: self.may_protect,
             retain_description: self.retain_description,
+            mapping_lifetime: None,
+            excludes_fork_and_dump: false,
         }))
     }
 }
@@ -566,9 +564,26 @@ pub struct PreparedFileMmap {
     pages: Arc<SharedPages>,
     may_protect: FileMmapProtection,
     retain_description: bool,
+    mapping_lifetime: Option<Arc<dyn core::any::Any + Send + Sync>>,
+    excludes_fork_and_dump: bool,
 }
 
 impl PreparedFileMmap {
+    /// The plan and live VMA fragments alone retain this lease. Its Drop must
+    /// be safe under the address-space lock (spin-only or deferred cleanup).
+    pub(crate) fn with_mapping_lifetime(mut self, lease: Arc<dyn core::any::Any + Send + Sync>) -> Self {
+        self.mapping_lifetime = Some(lease);
+        self
+    }
+    pub(crate) fn with_excluded_fork_and_dump(mut self) -> Self {
+        self.excludes_fork_and_dump = true;
+        self
+    }
+    pub(crate) const fn excludes_fork_and_dump(&self) -> bool { self.excludes_fork_and_dump }
+    pub(crate) fn take_mapping_lifetime(&mut self) -> Option<Arc<dyn core::any::Any + Send + Sync>> {
+        self.mapping_lifetime.take()
+    }
+
     pub(crate) const fn request(&self) -> FileMmapRequest {
         self.request
     }
@@ -893,22 +908,22 @@ mod tests {
 
     #[test]
     fn pseudo_inode_paths_cover_decimal_boundaries_without_formatting() {
-        assert_eq!(try_pseudo_inode_path("socket", 0).unwrap(), "socket:[0]");
+        assert_eq!(try_pseudo_inode_path("socket", 0).unwrap().as_bytes(), b"socket:[0]");
         assert_eq!(
-            try_pseudo_inode_path("pipe", u64::MAX).unwrap(),
-            "pipe:[18446744073709551615]"
+            try_pseudo_inode_path("pipe", u64::MAX).unwrap().as_bytes(),
+            b"pipe:[18446744073709551615]"
         );
     }
 
     #[test]
     fn borrowed_and_owned_path_snapshots_keep_exact_bytes() {
         assert_eq!(
-            try_path_into_bytes(Cow::Borrowed("anon_inode:[eventfd]")).unwrap(),
+            try_path_into_bytes(Cow::Borrowed(axfs_ng_vfs::FsPath::new(b"anon_inode:[eventfd]"))).unwrap(),
             b"anon_inode:[eventfd]"
         );
         assert_eq!(
-            try_path_into_owned(Cow::Owned(try_owned_path("/tmp/file").unwrap())).unwrap(),
-            "/tmp/file"
+            try_path_into_owned(Cow::Owned(try_owned_path(axfs_ng_vfs::FsPath::new(b"/tmp/file")).unwrap())).unwrap().as_bytes(),
+            b"/tmp/file"
         );
     }
 

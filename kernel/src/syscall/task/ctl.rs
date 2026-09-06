@@ -36,8 +36,7 @@ use crate::{
     task::{
         AsThread, Cred, Dumpability, Mempolicy, ProcessData, ProcessMmLayout, PtraceAccessMode,
         check_current_process_ptrace_access, check_current_thread_ptrace_image_access, cred_error,
-        get_process_data, get_task, get_visible_task, ns_capable,
-        process_domain, process_error,
+        get_process_data, get_task, get_visible_task, ns_capable, process_domain, process_error,
     },
 };
 
@@ -300,7 +299,15 @@ fn numa_target_process(pid: i32) -> AxResult<Arc<ProcessData>> {
     if pid < 0 {
         return Err(AxError::NoSuchProcess);
     }
-    get_process_data(pid as u32)
+    if pid == 0 {
+        return Ok(current().as_thread().proc_data.clone());
+    }
+    let target_pid = current()
+        .as_thread()
+        .pid_ns()
+        .resolve_visible_pid(pid as u32)
+        .ok_or(AxError::NoSuchProcess)?;
+    Ok(get_visible_task(target_pid)?.as_thread().proc_data.clone())
 }
 
 fn check_numa_target_permission(target: &ProcessData) -> AxResult<()> {
@@ -473,8 +480,15 @@ pub fn sys_kcmp<M: UserMemory + ?Sized>(
     if pid1 <= 0 || pid2 <= 0 {
         return Err(AxError::NoSuchProcess);
     }
-    let task1 = get_visible_task(pid1 as u32)?;
-    let task2 = get_visible_task(pid2 as u32)?;
+    let caller_ns = current().as_thread().pid_ns();
+    let target1 = caller_ns
+        .resolve_visible_pid(pid1 as u32)
+        .ok_or(AxError::NoSuchProcess)?;
+    let task1 = get_visible_task(target1)?;
+    let target2 = caller_ns
+        .resolve_visible_pid(pid2 as u32)
+        .ok_or(AxError::NoSuchProcess)?;
+    let task2 = get_visible_task(target2)?;
     let thread1 = task1.as_thread();
     let thread2 = task2.as_thread();
     let proc1 = thread1.proc_data.clone();
@@ -1373,7 +1387,12 @@ fn resolve_cap_task(header: __user_cap_header_struct) -> AxResult<AxTaskRef> {
     if header.pid == 0 {
         Ok(current().clone())
     } else {
-        get_visible_task(header.pid as u32)
+        let target_pid = current()
+            .as_thread()
+            .pid_ns()
+            .resolve_visible_pid(header.pid as u32)
+            .ok_or(AxError::NoSuchProcess)?;
+        get_visible_task(target_pid)
     }
 }
 
@@ -1464,7 +1483,7 @@ pub fn sys_capset<M: UserMemory + ?Sized>(
     let curr = current();
     let current_tid = curr.as_thread().tid();
     let (header, task) = validate_cap_header(memory, header)?;
-    if header.pid != 0 && header.pid as u32 != current_tid {
+    if header.pid != 0 && task.as_thread().tid() != current_tid {
         return Err(AxError::OperationNotPermitted);
     }
 

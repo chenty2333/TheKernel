@@ -1269,6 +1269,7 @@ impl SimpleFileOps for DeviceAttributeFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::{format, vec};
 
     fn resolve_from(link: &str, target: &str) -> String {
         let mut components = Vec::new();
@@ -1308,6 +1309,7 @@ mod tests {
 
     #[test]
     fn reservation_is_invisible_until_atomic_publish_and_drop_rolls_back() {
+        let _context = crate::test_support::scheduler_test_context();
         let registry = DeviceRegistry::<1>::new();
         let identity = DeviceIdentity::new(
             "virtual".into(),
@@ -1337,6 +1339,7 @@ mod tests {
 
     #[test]
     fn identity_rejects_paths_and_duplicate_views() {
+        let _context = crate::test_support::scheduler_test_context();
         assert_eq!(
             DeviceIdentity::new(
                 "virtual/input".into(),
@@ -1374,6 +1377,7 @@ mod tests {
 
     #[test]
     fn removal_handle_cannot_remove_a_reused_slot() {
+        let _context = crate::test_support::scheduler_test_context();
         let registry = DeviceRegistry::<1>::new();
         let identity = DeviceIdentity::new(
             "virtual".into(),
@@ -1409,6 +1413,7 @@ mod tests {
 
     #[test]
     fn disconnecting_keeps_names_reserved_and_visible_until_remove_finishes() {
+        let _context = crate::test_support::scheduler_test_context();
         let registry = DeviceRegistry::<1>::new();
         let identity = DeviceIdentity::new(
             "virtual".into(),
@@ -1582,7 +1587,7 @@ mod tests {
             )
             .unwrap(),
             "pci_device".into(),
-            vec![DeviceAttribute::try_new("device".into(), || Ok("0x1052\n".into())).unwrap()],
+            vec![DeviceAttribute::try_new("device".into(), || Ok(String::from("0x1052\n"))).unwrap()],
             "pci".into(),
             false,
         )
@@ -1629,6 +1634,7 @@ mod tests {
 
     #[test]
     fn child_devices_are_not_resolvable_as_bus_root_devices() {
+        let _context = crate::test_support::scheduler_test_context();
         let registry = DeviceRegistry::<2>::new();
         let parent =
             DeviceIdentity::without_dev("virtio0".into(), "input".into(), "input0".into()).unwrap();
@@ -1708,6 +1714,7 @@ mod tests {
 
     #[test]
     fn bounded_many_publish_never_exposes_a_partial_set() {
+        let _context = crate::test_support::scheduler_test_context();
         let registry = DeviceRegistry::<2>::new();
         let card = DeviceIdentity::new(
             "virtio0".into(),
@@ -1739,6 +1746,7 @@ mod tests {
 
     #[test]
     fn bounded_many_publish_exposes_all_drm_nodes_together() {
+        let _context = crate::test_support::scheduler_test_context();
         let registry = DeviceRegistry::<3>::new();
         let identities = [
             DeviceIdentity::new(

@@ -300,6 +300,8 @@ struct NetlinkState {
     option_flags: u32,
     passcred: bool,
     bound: bool,
+    peer_port_id: u32,
+    peer_groups: u32,
 }
 
 pub struct NetlinkSocket {
@@ -1629,12 +1631,58 @@ impl NetlinkSocket {
         addr: UserPtr<sockaddr>,
         addrlen: &mut socklen_t,
     ) -> AxResult {
+        self.write_addr(capability, addr, addrlen, false)
+    }
+
+    pub fn write_peer_addr(
+        &self,
+        capability: &UserMemoryCapability,
+        addr: UserPtr<sockaddr>,
+        addrlen: &mut socklen_t,
+    ) -> AxResult {
+        self.write_addr(capability, addr, addrlen, true)
+    }
+
+    pub fn connect(&self, address: Option<SockaddrNl>, actor: &Cred, pid: u32) -> AxResult {
+        if let Some(address) = address {
+            if (address.nl_pid != 0 || address.nl_groups != 0)
+                && !ns_capable(actor, self.net_ns.owner_user_ns(), CAP_NET_ADMIN)
+            {
+                return Err(LinuxError::EPERM.into());
+            }
+            self.ensure_bound_for_send(pid, false)?;
+            let mut state = self.state.lock();
+            state.peer_port_id = address.nl_pid;
+            state.peer_groups = address.nl_groups & address.nl_groups.wrapping_neg();
+        } else {
+            let mut state = self.state.lock();
+            state.peer_port_id = 0;
+            state.peer_groups = 0;
+        }
+        Ok(())
+    }
+
+    fn write_addr(
+        &self,
+        capability: &UserMemoryCapability,
+        addr: UserPtr<sockaddr>,
+        addrlen: &mut socklen_t,
+        peer: bool,
+    ) -> AxResult {
         let state = self.state.lock();
         let nl = SockaddrNl {
             nl_family: AF_NETLINK as _,
             nl_pad: 0,
-            nl_pid: state.port_id,
-            nl_groups: state.groups,
+            nl_pid: if peer {
+                state.peer_port_id
+            } else {
+                state.port_id
+            },
+            nl_groups: if peer {
+                state.peer_groups
+            } else {
+                state.groups
+            },
         };
         drop(state);
 
@@ -1996,6 +2044,15 @@ impl NetlinkSocket {
         destination: Option<SockaddrNl>,
         nowait: bool,
     ) -> AxResult<usize> {
+        let destination = destination.or_else(|| {
+            let state = self.state.lock();
+            Some(SockaddrNl {
+                nl_family: AF_NETLINK as _,
+                nl_pad: 0,
+                nl_pid: state.peer_port_id,
+                nl_groups: state.peer_groups,
+            })
+        });
         if let Some(destination) = destination {
             if destination.nl_pid != 0 && destination.nl_groups != 0 {
                 return Err(AxError::InvalidInput);

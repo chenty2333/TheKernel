@@ -23,7 +23,6 @@ use alloc::sync::Arc;
 use axerrno::LinuxResult;
 use axfs::FsContext;
 use axfs_ng_vfs::{DirNodeOps, FileNodeOps, Filesystem, FsPath, NodePermission, WeakDirEntry};
-use axnet::unix::UnixNamespace;
 pub use tmp::MemoryFs;
 
 pub(crate) use self::proc::{
@@ -99,12 +98,9 @@ fn mount_at(fs: &FsContext, path: &FsPath, mount_fs: Filesystem) -> LinuxResult<
 /// Mount all filesystems
 pub fn mount_all(
     fs: &FsContext,
-    boot_security: &crate::file::permission::VfsSecurityContext,
-    unix_namespace: Arc<UnixNamespace>,
+    pid_ns: Arc<crate::task::PidNamespace>,
 ) -> LinuxResult<()> {
     info!("Initialize pseudofs...");
-    #[cfg(not(feature = "dev-log"))]
-    let _ = (boot_security, unix_namespace);
 
     mount_at(fs, FsPath::new(b"/dev"), dev::new_devfs())?;
     let tmp_permission = NodePermission::from_bits_truncate(0o1777);
@@ -127,7 +123,7 @@ pub fn mount_all(
             Some(VAR_TMP_CAPACITY_BYTES),
         )?,
     )?;
-    mount_at(fs, FsPath::new(b"/proc"), proc::new_procfs())?;
+    mount_at(fs, FsPath::new(b"/proc"), proc::new_procfs(pid_ns))?;
 
     mount_at(fs, FsPath::new(b"/sys"), sys::new_sysfs())?;
     // fusectl is a real dynamic control filesystem.  Its non-cacheable
@@ -154,9 +150,6 @@ pub fn mount_all(
         FsPath::new(b"/sys/kernel/debug/dri/0"),
         graphics_metrics::new_graphics_metricsfs(),
     )?;
-
-    #[cfg(feature = "dev-log")]
-    dev::bind_dev_log(fs, boot_security, unix_namespace).expect("Failed to bind /dev/log");
 
     Ok(())
 }

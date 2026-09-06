@@ -5,6 +5,8 @@ from __future__ import annotations
 import pathlib
 import subprocess
 import tempfile
+from tests.support import test_tmpdir
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -16,6 +18,42 @@ GRAPHICS = ROOT / "config" / "graphics"
 
 
 class GraphicsRootfsConfigTests(unittest.TestCase):
+    def test_failed_repeated_graphics_benchmark_removes_previous_metrics(self) -> None:
+        module = load_script_module("thekernel_product", "tools/thekernel.py")
+        with test_tmpdir() as directory:
+            root = pathlib.Path(directory)
+            rootfs, oracle = root / "rootfs.ext2", root / "linux.log"
+            rootfs.write_bytes(b"rootfs")
+            oracle.write_text("oracle")
+            result = root / "graphics-metrics.json"
+            result.write_text('{"previous":"success"}')
+            args = SimpleNamespace(accel="kvm", smp=4, memory="4G", asid_fast_switch=False,
+                rootfs=str(rootfs), workdir=str(root), linux_oracle_log=str(oracle),
+                no_build=True, timeout=10, graphics_profile="headless", fault=None)
+            with mock.patch.object(module, "run_product", return_value=4):
+                self.assertEqual(module.graphics_benchmark_cmd(args), 4)
+            self.assertFalse(result.exists())
+            self.assertEqual(oracle.read_text(), "oracle")
+
+    def test_graphics_metrics_alias_is_rejected_before_cleanup(self) -> None:
+        module = load_script_module("thekernel_product", "tools/thekernel.py")
+        with test_tmpdir() as directory:
+            root = pathlib.Path(directory)
+            rootfs, oracle = root / "rootfs.ext2", root / "linux.log"
+            rootfs.write_bytes(b"rootfs")
+            oracle.write_text("oracle")
+            result = root / "graphics-metrics.json"
+            result.hardlink_to(oracle)
+            args = SimpleNamespace(accel="kvm", smp=4, memory="4G", asid_fast_switch=False,
+                rootfs=str(rootfs), workdir=str(root), linux_oracle_log=str(oracle),
+                no_build=True, timeout=10, graphics_profile="headless", fault=None)
+            with mock.patch.object(module, "run_product") as run:
+                with self.assertRaisesRegex(module.ProductError, "aliases"):
+                    module.graphics_benchmark_cmd(args)
+                run.assert_not_called()
+            self.assertEqual(result.read_text(), "oracle")
+            self.assertEqual(oracle.read_text(), "oracle")
+
     def read(self, relative: str) -> str:
         return (GRAPHICS / relative).read_text()
 
@@ -71,10 +109,70 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         seatd = self.read("overlay/common/etc/init.d/S70seatd")
         self.assertIn("while [ ! -S /run/seatd.sock ]", seatd)
 
+    def test_weston_prepares_shared_x11_socket_directory_before_dropping_privileges(self) -> None:
+        weston = self.read("overlay/common/etc/init.d/S80weston")
+        prepare = (
+            "    mkdir -p /tmp/.X11-unix\n"
+            "    chown root:root /tmp/.X11-unix\n"
+            "    chmod 1777 /tmp/.X11-unix\n"
+        )
+        self.assertIn(prepare, weston)
+        self.assertLess(weston.index(prepare), weston.index('start-stop-daemon -S'))
+
+    def test_software_sessions_select_pixman_and_seatd_verifies_it(self) -> None:
+        session = self.read("overlay/common/usr/local/bin/graphics-session")
+        self.assertIn(
+            "if grep -Eqx 'q35-(graphics-seatd|software-desktop)' /etc/thekernel-graphics-flavor &&\n"
+            "    [ ! -c /dev/dri/renderD128 ]; then\n"
+            '    set -- "$@" --renderer=pixman\nfi', session,
+        )
+        self.assertIn(
+            'set -- --config=/etc/weston/weston.ini --socket=wayland-0 '
+            '--log="$XDG_RUNTIME_DIR/weston.log"', session,
+        )
+        self.assertIn('exec weston "$@"', session)
+        smoke = self.read("overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke")
+        renderer_check = smoke.index("grep -Fq 'Using Pixman renderer'")
+        self.assertLess(renderer_check, smoke.index("export THEKERNEL_GRAPHICS_SMOKE_EXIT=1"))
+        self.assertIn('state=FAIL reason=pixman_renderer', smoke)
+
+    def test_weston_smoke_verifies_initialized_drm_backend_and_device(self) -> None:
+        smoke = self.read("overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke")
+        self.assertNotIn('/environ', smoke)
+        self.assertNotIn("grep -q 'drm-backend.so'", smoke)
+        self.assertIn('report_weston_failure pixman_client_exit', smoke)
+        self.assertIn("Seat opened with backend 'seatd'", smoke)
+        session = self.read("overlay/common/usr/local/bin/graphics-session")
+        self.assertIn("export LIBSEAT_BACKEND=seatd", session)
+        backend = smoke.index("grep -Fq 'initializing drm backend'")
+        self.assertLess(smoke.index("weston_log=$XDG_RUNTIME_DIR/weston.log"), backend)
+        self.assertIn(
+            "grep -Fq 'initializing drm backend' \"$weston_log\" &&\n"
+            "    grep -Fq 'using /dev/dri/card0' \"$weston_log\" || report_weston_failure drm_backend",
+            smoke,
+        )
+
+    def test_shm_pointer_listener_handles_every_event_in_bound_version_five(self) -> None:
+        client = self.read("q35-wayland-shm-client.c")
+        self.assertIn("version < 5 ? version : 5", client)
+        listener = client.split("static const struct wl_pointer_listener pointer_listener =", 1)[1].split("};", 1)[0]
+        for event in ("enter", "leave", "motion", "button", "axis", "frame", "axis_source", "axis_stop", "axis_discrete"):
+            with self.subTest(event=event):
+                self.assertIn(f".{event} = pointer_{event}", listener)
+
+    def test_shm_client_creates_buffers_in_the_private_runtime_directory(self) -> None:
+        client = self.read("q35-wayland-shm-client.c")
+        self.assertIn('getenv("XDG_RUNTIME_DIR")', client)
+        self.assertIn('!runtime_dir || !*runtime_dir', client)
+        self.assertIn('"%s/thekernel-wl-shm-XXXXXX", runtime_dir', client)
+        self.assertIn('(size_t)length >= sizeof(name)', client)
+        self.assertNotIn('char name[] = "/thekernel-wl-shm-', client)
+        self.assertIn('unlink(name)', client)
+
     def test_guest_uapi_oracles_fail_loudly_and_run_before_the_ready_marker(self) -> None:
         smoke = self.read("overlay/common/usr/local/bin/graphics-abi-smoke")
-        self.assertLess(smoke.index("/usr/local/bin/drm-uapi-oracle"), smoke.index("THEKERNEL_GRAPHICS_ABI_SMOKE_READY"))
-        self.assertLess(smoke.index("/usr/local/bin/evdev-uapi-oracle"), smoke.index("THEKERNEL_GRAPHICS_ABI_SMOKE_READY"))
+        self.assertLess(smoke.index("/usr/local/bin/drm-uapi-oracle"), smoke.index("echo 'THEKERNEL_GRAPHICS_ABI_SMOKE_READY'"))
+        self.assertLess(smoke.index("/usr/local/bin/evdev-uapi-oracle"), smoke.index("echo 'THEKERNEL_GRAPHICS_ABI_SMOKE_READY'"))
         q35_smoke = self.read("overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke")
         self.assertLess(q35_smoke.index("/usr/local/bin/drm-uapi-oracle"), q35_smoke.index("q35-wayland-shm-client"))
         self.assertLess(q35_smoke.index("/usr/local/bin/evdev-uapi-oracle"), q35_smoke.index("q35-wayland-shm-client"))
@@ -88,12 +186,12 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
 
     def test_graphics_smoke_hands_an_existing_rootfs_to_the_drive_transport_without_building(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             rootfs = pathlib.Path(directory) / "graphics-rootfs.ext2"
             rootfs.write_bytes(b"rootfs")
             screenshot = pathlib.Path(directory) / "graphics.ppm"
             args = module.build_parser().parse_args([
-                "graphics-smoke", "--no-build", "--rootfs", str(rootfs),
+                "test", "--suite", "graphics", "--no-build", "--rootfs", str(rootfs),
                 "--screenshot", str(screenshot),
             ])
             calls: dict[str, object] = {}
@@ -157,7 +255,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
     def test_graphics_smoke_configures_one_marker_for_qmp_and_stop(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")
         args = module.build_parser().parse_args([
-            "graphics-smoke", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
+            "test", "--suite", "graphics", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
             "--screenshot", "/tmp/graphics.ppm",
         ])
         calls: dict[str, object] = {}
@@ -173,7 +271,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
     def test_q35_headless_graphics_smoke_keeps_the_software_marker_and_pixel_oracle(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")
         args = module.build_parser().parse_args([
-            "graphics-smoke", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
+            "test", "--suite", "graphics", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
             "--screenshot", "/tmp/graphics.ppm", "--flavor", "q35-graphics-seatd",
             "--graphics-profile", "headless",
         ])
@@ -182,15 +280,33 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         with mock.patch.object(pathlib.Path, "is_file", lambda _self: True):
             self.assertEqual(module.graphics_smoke_cmd(args), 0)
         spec = calls["spec"]
-        self.assertEqual(spec.stop_after_marker, "THEKERNEL_Q35_WESTON_READY")
+        self.assertIsNone(spec.stop_after_marker)
+        self.assertEqual(spec.completion_after_shutdown, "THEKERNEL_Q35_SOFTWARE_SMOKE_COMPLETE")
+        self.assertEqual(len(spec.qmp_checkpoints), 5)
+        self.assertIsNotNone(spec.qmp_checkpoints[-2].screenshot)
+        self.assertEqual(spec.qmp_checkpoints[-1].input_events[0][0]["data"]["key"]["data"], "f12")
         self.assertEqual(spec.qmp_screenshot_after_marker, "THEKERNEL_Q35_WESTON_READY")
         self.assertEqual(spec.qmp_screenshot_size, (800, 600))
         self.assertEqual(spec.qmp_screenshot_color_blocks[0].rgb, (255, 0, 0))
 
+    def test_graphics_smoke_forwards_gdb_without_losing_input_checkpoints(self) -> None:
+        module = load_script_module("thekernel_product", "tools/thekernel.py")
+        args = module.build_parser().parse_args([
+            "test", "--suite", "graphics", "--no-build", "--gdb",
+            "--rootfs", "/unused/rootfs.ext2", "--screenshot", "/unused/frame.ppm",
+            "--flavor", "q35-graphics-seatd", "--graphics-profile", "headless",
+        ])
+        with mock.patch.object(pathlib.Path, "is_file", return_value=True), \
+                mock.patch.object(module, "run_product", return_value=0) as run_product:
+            self.assertEqual(module.graphics_smoke_cmd(args), 0)
+        spec = run_product.call_args.args[1]
+        self.assertTrue(spec.gdb)
+        self.assertEqual(len(spec.qmp_checkpoints), 5)
+
     def test_virgl_headless_graphics_smoke_is_rejected_without_a_qmp_pixel_oracle(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")
         args = module.build_parser().parse_args([
-            "graphics-smoke", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
+            "test", "--suite", "graphics", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
             "--screenshot", "/tmp/graphics.ppm", "--flavor", "q35-graphics-seatd",
         ])
         args.graphics_profile = "virgl-headless"
@@ -201,7 +317,7 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
     def test_virgl_graphics_smoke_uses_the_virgl_marker_and_pixel_oracle(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")
         args = module.build_parser().parse_args([
-            "graphics-smoke", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
+            "test", "--suite", "graphics", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
             "--screenshot", "/tmp/graphics.ppm", "--flavor", "q35-graphics-seatd",
             "--graphics-profile", "virgl-interactive",
         ])
@@ -215,9 +331,41 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         self.assertEqual(spec.qmp_screenshot_size, (800, 600))
         self.assertEqual(spec.qmp_screenshot_color_blocks[0].rgb, (255, 0, 0))
 
+    def test_software_smoke_requires_completion_and_natural_shutdown(self) -> None:
+        module = load_script_module("thekernel_product", "tools/thekernel.py")
+        with test_tmpdir() as directory:
+            root = pathlib.Path(directory)
+            artifacts = module.Artifacts(root / "state", module.Variant(memory="128M"))
+            for path in (artifacts.kernel, artifacts.esp, artifacts.rootfs):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"artifact")
+            spec = module.RunSpec(
+                accel="tcg", timeout=30, workdir=root / "run", interactive=False,
+                input_after_marker=None, stop_after_marker=None,
+                completion_after_shutdown="THEKERNEL_Q35_SOFTWARE_SMOKE_COMPLETE",
+                commands=None, extra_block=None, run_cpus=1,
+            )
+            for clean, marker, code, expected in (
+                (True, True, 0, 0), (True, False, 0, 1),
+                (False, True, 0, 1), (False, True, -9, -9),
+            ):
+                with self.subTest(clean=clean, marker=marker, code=code):
+                    def fake_run(config):
+                        config.log_path.write_text(
+                            "THEKERNEL_Q35_SOFTWARE_SMOKE_COMPLETE\n" if marker else "",
+                            encoding="utf-8",
+                        )
+                        return type("Result", (), {
+                            "returncode": code, "error_message": None,
+                            "log_path": config.log_path, "guest_clean_shutdown": clean,
+                            "diagnostic_log_path": config.workdir / "kernel.log",
+                        })()
+                    module.run = fake_run
+                    self.assertEqual(module.run_product.__wrapped__(artifacts, spec), expected)
+
     def test_marker_gated_screenshot_is_forwarded_to_qemu_runner(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = pathlib.Path(directory)
             artifacts = module.Artifacts(root / "state", module.Variant(memory="128M"))
             for path in (artifacts.kernel, artifacts.esp):
@@ -234,10 +382,11 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
                     "returncode": 75, "error_message": None, "log_path": config.log_path,
                     "intentionally_stopped": True,
                     "guest_clean_shutdown": False,
+                    "diagnostic_log_path": config.workdir / "kernel.log",
                 })()
 
             module.run = fake_run
-            self.assertEqual(module.run_product(
+            self.assertEqual(module.run_product.__wrapped__(
                 artifacts,
                 module.RunSpec(
                     accel="tcg", timeout=30, workdir=root / "run", interactive=False,

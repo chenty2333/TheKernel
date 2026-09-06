@@ -17,12 +17,16 @@ pub struct Console {
 }
 impl TtyRead for Console {
     fn read(&mut self, buf: &mut [u8]) -> AxResult<usize> {
+        self.read_with_progress(buf).map(|(read, _)| read)
+    }
+
+    fn read_with_progress(&mut self, buf: &mut [u8]) -> AxResult<(usize, bool)> {
         if self.vt.is_some() {
             // A VT's manual line discipline is fed exclusively through
             // route_active_input; the hardware FIFO belongs to the root
             // console below.  Reading it here would steal bytes from that
             // route and discard them.
-            return Ok(0);
+            return Ok((0, false));
         }
         let read = axhal::console::read_bytes(buf);
         if read != 0 {
@@ -35,7 +39,10 @@ impl TtyRead for Console {
             // VT.
             let _ = super::VT_MANAGER.route_active_input(&buf[..read]);
         }
-        Ok(0)
+        // Routing consumed hardware bytes even though this root discipline
+        // receives none. Recheck the UART before sleeping: a full batch may
+        // leave its edge-triggered IRQ asserted with more input still pending.
+        Ok((0, read != 0))
     }
 }
 impl TtyWrite for Console {

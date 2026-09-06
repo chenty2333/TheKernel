@@ -1,0 +1,6 @@
+This package is a new extraction of Linux-visible seccomp policy and lifecycle
+contracts designed for TheKernel and distributed under Apache-2.0.
+
+Linux and TheKernel sources were consulted to understand observable UAPI,
+verifier-profile, filter-stack, action, inheritance, and thread-synchronization
+contracts. No Linux source text is copied into this package.

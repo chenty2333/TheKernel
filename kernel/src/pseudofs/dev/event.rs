@@ -437,9 +437,8 @@ impl EvdevDevice {
 
     fn state_bitmap(&self, event_type: EventType, out: &mut [u8]) -> AxResult<usize> {
         self.pump()?;
-        if !self.event_bits(event_type, &mut []).unwrap_or(false) {
-            return Err(LinuxError::EINVAL.into());
-        }
+        // Linux exposes the zero-initialized state bitmap even when this
+        // device does not advertise the event class (e.g. LEDs on a mouse).
         let state = self.state.lock();
         let bytes = match event_type {
             EventType::Led => state.led_state.as_bytes(),
@@ -607,6 +606,7 @@ impl EvdevClient {
     /// consequently returned as all zeroes, as Linux documents for
     /// EVIOCGMASK.
     fn mask_bits(&self, event_type: u16, out: &mut [u8]) {
+        out.fill(0);
         let state = self.state.lock();
         if let Some(mask) = state.masks.get(&event_type) {
             copy_bytes(mask, out);
@@ -1228,13 +1228,25 @@ impl EvdevFile {
                 .map_err(map_usercopy_error)?;
             return Ok(len);
         }
-        let event_type = EventType::from_repr(ty).ok_or(LinuxError::EINVAL)?;
+        // These are the EVIOCGBIT classes accepted by Linux's
+        // handle_eviocgbit(), independently of the device's evbit support.
+        let event_type = match EventType::from_repr(ty) {
+            Some(event_type @ (EventType::Key
+                | EventType::Relative
+                | EventType::Absolute
+                | EventType::Misc
+                | EventType::Switch
+                | EventType::Led
+                | EventType::Sound
+                | EventType::ForceFeedback)) => event_type,
+            _ => return Err(LinuxError::EINVAL.into()),
+        };
         let max_bit = event_type.bits_count().saturating_sub(1);
         let len = linux_bitmap_len(size, max_bit);
         let mut bits = vec![0; len];
-        if !self.device.event_bits(event_type, &mut bits)? {
-            return Err(LinuxError::EINVAL.into());
-        }
+        // Unsupported classes are valid empty capability bitmaps, not an
+        // invalid ioctl. libevdev queries every class during initialization.
+        self.device.event_bits(event_type, &mut bits)?;
         context
             .user_memory()
             .write_bytes(arg, &bits)
@@ -1953,7 +1965,7 @@ fn bitmap_hex(bytes: &[u8]) -> String {
         }
         let mut value = 0usize;
         for (index, byte) in bytes
-            .get(word * WORD_BYTES..(word + 1) * WORD_BYTES)
+            .get(word * WORD_BYTES..bytes.len().min((word + 1) * WORD_BYTES))
             .unwrap_or(&[])
             .iter()
             .enumerate()
@@ -2016,6 +2028,16 @@ mod tests {
         set_bit_if_fits(&mut low_only, 1);
         assert_eq!(bitmap_hex(&low_only), "2\n");
         assert_eq!(bitmap_hex(&[]), "0\n");
+    }
+
+    #[test]
+    fn sysfs_bitmaps_preserve_partial_native_words() {
+        // Event types and input properties occupy four bytes, while relative
+        // axes need only two. These still contain a nonempty native word.
+        assert_eq!(bitmap_hex(&[3, 0, 0, 0]), "3\n");
+        assert_eq!(bitmap_hex(&[3, 0]), "3\n");
+        assert_eq!(bitmap_hex(&[1]), "1\n");
+        assert_eq!(bitmap_hex(&[0, 0, 0, 0, 0, 0, 0, 0, 2]), "2 0\n");
     }
 
     #[test]
@@ -2111,11 +2133,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            attributes[5].directory_child_names().unwrap(),
+            attributes.iter().find(|attribute| attribute.name() == "id").unwrap().directory_child_names().unwrap(),
             vec!["bustype", "vendor", "product", "version"]
         );
         assert_eq!(
-            attributes[6].directory_child_names().unwrap(),
+            attributes.iter().find(|attribute| attribute.name() == "capabilities").unwrap().directory_child_names().unwrap(),
             vec!["ev", "key", "rel", "abs", "msc", "led", "snd", "ff", "sw"]
         );
     }
@@ -2156,6 +2178,7 @@ mod tests {
 
     #[test]
     fn client_mask_keeps_frame_boundaries_and_syn() {
+        let _context = crate::test_support::scheduler_test_context();
         let client = client();
         client.set_mask(EventType::Key as u16, vec![0]);
         client.enqueue_frame(&[
@@ -2168,6 +2191,7 @@ mod tests {
 
     #[test]
     fn clients_keep_independent_ofd_masks_and_queues() {
+        let _context = crate::test_support::scheduler_test_context();
         let masked = client();
         let unmasked = client();
         masked.set_mask(EventType::Key as u16, vec![0]);
@@ -2184,6 +2208,7 @@ mod tests {
 
     #[test]
     fn overflow_reports_syn_dropped_before_next_complete_frame() {
+        let _context = crate::test_support::scheduler_test_context();
         let client = client();
         let too_large = vec![record(EventType::Key as u16, 1); EVDEV_CLIENT_QUEUE_EVENTS + 1];
         client.enqueue_frame(&too_large);
@@ -2195,6 +2220,7 @@ mod tests {
 
     #[test]
     fn discarded_device_frame_marks_the_next_client_frame_dropped() {
+        let _context = crate::test_support::scheduler_test_context();
         let client = client();
         client.mark_overflow();
         client.enqueue_frame(&[record(EventType::Key as u16, 1), record(EV_SYN, SYN_REPORT)]);
@@ -2204,6 +2230,7 @@ mod tests {
 
     #[test]
     fn clock_ids_follow_linux_evdev_values() {
+        let _context = crate::test_support::scheduler_test_context();
         let client = client();
         client.set_clock_id(1).unwrap();
         assert_eq!(client.clock(), EvdevClock::Monotonic);
@@ -2214,6 +2241,7 @@ mod tests {
 
     #[test]
     fn event_masks_are_per_ofd_and_default_to_known_codes() {
+        let _context = crate::test_support::scheduler_test_context();
         let first = client();
         let second = client();
         let mut bits = [0; 2];

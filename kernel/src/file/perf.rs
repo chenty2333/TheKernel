@@ -233,6 +233,7 @@ const RECONCILE_CONTROL_READ: u8 = 0;
 const RECONCILE_CONTROL_ENABLE: u8 = 1;
 const RECONCILE_CONTROL_DISABLE: u8 = 2;
 const RECONCILE_CONTROL_RESET: u8 = 3;
+const RECONCILE_CONTROL_RETIRE: u8 = 4;
 #[cfg(all(feature = "perf-sampling", target_os = "none"))]
 const RECONCILE_CONTROL_GROUP: u8 = 0x80;
 #[cfg(all(feature = "perf-sampling", target_os = "none"))]
@@ -946,6 +947,11 @@ static PERF_FLEX_CURSOR: [AtomicUsize; axconfig::plat::MAX_CPU_NUM] =
 
 impl PerfGroup {
     pub(crate) fn attach_cpu_context(group: &Arc<Self>) -> AxResult<()> {
+        // Publication requires a live member; otherwise a concurrent
+        // scheduler registry scan can prune the group before open finishes.
+        if group.is_prunable() {
+            return Err(AxError::InvalidInput);
+        }
         let Some(cpu) = group.context.cpu() else {
             return Err(AxError::InvalidInput);
         };
@@ -1145,13 +1151,13 @@ impl PerfGroup {
     /// Publish one already-materialized trace entry to every active CPU or
     /// cgroup context on this CPU. No registry snapshot is allocated on this
     /// producer path.
-    pub(crate) fn cpu_context_tracepoint(cpu: usize, id: u64, raw: &[u8]) {
+    pub(crate) fn cpu_context_tracepoint(cpu: usize, id: u64, raw: &[u8], timestamp: u64) {
         let Some(groups) = CPU_CONTEXT_GROUPS.get(cpu) else {
             return;
         };
         let groups = groups.lock();
         for group in groups.iter() {
-            group.emit_tracepoint_raw(id, raw);
+            group.emit_tracepoint_raw(id, raw, timestamp);
         }
     }
 
@@ -1489,7 +1495,7 @@ impl PerfGroup {
                 if slot_mask & (1 << *slot_base) != 0 {
                     #[cfg(feature = "perf-sampling")]
                     if file.sampling.is_some() {
-                        file.emit_source_raw_at(ip, user, &[]);
+                        file.emit_source_raw_at(ip, user, &[], axhal::time::monotonic_time_nanos());
                     } else {
                         file.add_count(1);
                     }
@@ -1531,7 +1537,11 @@ impl PerfGroup {
     }
     pub(crate) fn is_prunable(&self) -> bool {
         let state = self.state.lock();
-        !state.active.task_active
+        // A task can stay on-CPU across arbitrarily many open/close cycles.
+        // Once no member or hardware lease remains, its registry slot is
+        // reclaimable without waiting for that task to leave the CPU.
+        !state.active.running
+            && !state.active.reconcile_frozen
             && state
                 .members
                 .iter()
@@ -1590,12 +1600,43 @@ impl PerfGroup {
         if state.active.running {
             return;
         }
+        // Custody belongs to a running lease, not merely to a successful
+        // Weak upgrade. An all-disabled group (or an unplaced sampler) can
+        // finish start_locked without a lease. Release these references
+        // before testing liveness, otherwise closed members never expire.
+        state.active.files.fill(None);
         state
             .members
             .retain(|member| member.file.upgrade().is_some());
-        // `stop_locked` has removed every strong custody entry, so shrinking
+        // Every strong custody entry is now gone, so shrinking
         // the parallel slot vector preserves the all-None correspondence.
         state.active.files.truncate(state.members.len());
+    }
+
+    fn retire_member_locked(state: &mut GroupState, member_id: u64) {
+        // The caller has settled the complete group. Remove membership now,
+        // while close still owns the file, so re-admission cannot reacquire
+        // the closing descriptor through its still-live Weak reference.
+        state.members.retain(|member| {
+            member.file.upgrade().is_some_and(|file| file.id != member_id)
+        });
+        state.active.files.truncate(state.members.len());
+    }
+
+    fn retire_member(&self, member_id: u64) {
+        if !self.state.lock().members.iter().any(|member| {
+            member.file.upgrade().is_some_and(|file| file.id == member_id)
+        }) {
+            return;
+        }
+        if self
+            .synchronize_hardware_control(member_id, false, RECONCILE_CONTROL_RETIRE)
+            .is_err()
+        {
+            // Preserve the existing bounded, fail-closed owner teardown if
+            // the control mailbox cannot complete the retirement.
+            self.reconcile_last_descriptor();
+        }
     }
 
     /// A perf group is the hardware scheduling unit.  A member requesting
@@ -1849,6 +1890,7 @@ impl PerfGroup {
             .iter()
             .filter_map(Option::as_ref)
             .any(|file| file.running());
+        Self::compact_locked(state);
     }
     fn stop_locked(state: &mut GroupState, now: u64, count_context_switch: bool) {
         if !state.active.running {
@@ -1961,11 +2003,11 @@ impl PerfGroup {
         if state.active.running {
             Self::stop_locked(&mut state, now, false);
         }
-        let mut found = control == RECONCILE_CONTROL_READ;
+        let mut found = matches!(control, RECONCILE_CONTROL_READ | RECONCILE_CONTROL_RETIRE);
         if control != RECONCILE_CONTROL_READ {
             let operation: fn(&PerfEventFile, u64) = match control {
                 RECONCILE_CONTROL_ENABLE => PerfEventFile::enable_at,
-                RECONCILE_CONTROL_DISABLE => PerfEventFile::disable_at,
+                RECONCILE_CONTROL_DISABLE | RECONCILE_CONTROL_RETIRE => PerfEventFile::disable_at,
                 RECONCILE_CONTROL_RESET => PerfEventFile::reset_at,
                 _ => return false,
             };
@@ -1986,6 +2028,9 @@ impl PerfGroup {
         if !found {
             state.active.reconcile_frozen = true;
             return false;
+        }
+        if control == RECONCILE_CONTROL_RETIRE {
+            Self::retire_member_locked(&mut state, member_id);
         }
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
             for file in state
@@ -2100,7 +2145,7 @@ impl PerfGroup {
                     .members
                     .iter()
                     .filter_map(|member| member.file.upgrade())
-                    .any(|file| file.event.uses_pmu());
+                    .any(|file| file.requires_owner_control());
             hardware_active.then_some((state.active.cpu, state.active.generation))
         };
         let Some((Some(cpu), generation)) = owner else {
@@ -2177,29 +2222,43 @@ impl PerfGroup {
         Err(AxError::Io)
     }
 
-    /// The no-owner half of control: software state is changed immediately,
-    /// while a later scheduler enter performs the first placement. This is
-    /// intentionally separate from `reconcile_control_local`, whose contract
-    /// requires an exact active generation to settle.
+    /// Controls without CPU-local custody settle under the group lock.
+    /// Inactive hardware waits for a later scheduler placement; ordinary
+    /// software groups can resume immediately. Owner-context controls use
+    /// `reconcile_control_local` to settle an exact active generation.
     fn control_local_inactive(
         &self,
         member_id: u64,
         group_control: bool,
         control: u8,
     ) -> AxResult<()> {
-        let now = monotonic_time_nanos();
         let mut state = self.state.lock();
-        if state.active.running {
+        let now = monotonic_time_nanos();
+        let caller_safe = !state
+            .members
+            .iter()
+            .filter_map(|member| member.file.upgrade())
+            .any(|file| file.requires_owner_control());
+        // Ordinary software events have no CPU-local custody, but their
+        // accounting can still be running. Clock samplers also need the owner
+        // CPU because settlement captures the current task's sample context.
+        // Serialize settlement and control with scheduler accounting under
+        // the group lock, including controls
+        // of a remote per-CPU tracepoint group.
+        if state.active.running && !caller_safe {
             return Err(AxError::Io);
         }
         let operation: fn(&PerfEventFile, u64) = match control {
             RECONCILE_CONTROL_ENABLE => PerfEventFile::enable_at,
-            RECONCILE_CONTROL_DISABLE => PerfEventFile::disable_at,
+            RECONCILE_CONTROL_DISABLE | RECONCILE_CONTROL_RETIRE => PerfEventFile::disable_at,
             RECONCILE_CONTROL_RESET => PerfEventFile::reset_at,
             RECONCILE_CONTROL_READ => return Ok(()),
             _ => return Err(AxError::InvalidInput),
         };
-        let mut found = false;
+        if caller_safe {
+            Self::stop_locked(&mut state, now, false);
+        }
+        let mut found = control == RECONCILE_CONTROL_RETIRE;
         if group_control {
             for (_, file) in Self::live(&mut state) {
                 operation(&file, now);
@@ -2212,6 +2271,12 @@ impl PerfGroup {
         {
             operation(&file, now);
             found = true;
+        }
+        if control == RECONCILE_CONTROL_RETIRE {
+            Self::retire_member_locked(&mut state, member_id);
+        }
+        if caller_safe {
+            Self::start_locked(&mut state, now);
         }
         found.then_some(()).ok_or(AxError::BadFileDescriptor)
     }
@@ -2230,7 +2295,7 @@ impl PerfGroup {
                     .members
                     .iter()
                     .filter_map(|member| member.file.upgrade())
-                    .any(|file| file.event.uses_pmu());
+                    .any(|file| file.requires_owner_control());
             hardware_active.then_some((state.active.cpu, state.active.generation))
         };
         match owner {
@@ -2894,9 +2959,9 @@ impl PerfGroup {
         self.on_software_event(SoftwareEvent::CpuMigrations);
     }
     pub(crate) fn emit_tracepoint(&self, id: u64) {
-        self.emit_tracepoint_raw(id, &[]);
+        self.emit_tracepoint_raw(id, &[], axhal::time::monotonic_time_nanos());
     }
-    pub(crate) fn emit_tracepoint_raw(&self, id: u64, raw: &[u8]) {
+    pub(crate) fn emit_tracepoint_raw(&self, id: u64, raw: &[u8], timestamp: u64) {
         let state = self.state.lock();
         if !state.active.running {
             return;
@@ -2904,7 +2969,7 @@ impl PerfGroup {
         for file in state.active.files.iter().filter_map(Option::as_ref) {
             if file.event == PerfEvent::Tracepoint(id) && file.running() && file.enabled() {
                 file.add_count(1);
-                file.emit_source_raw_at(0, false, raw);
+                file.emit_source_raw_at(0, false, raw, timestamp);
                 #[cfg(feature = "bpf")]
                 file.run_attached_bpf(2, id);
             }
@@ -2934,6 +2999,7 @@ impl PerfGroup {
                         PerfEvent::Uprobe { .. } | PerfEvent::Breakpoint { .. }
                     ),
                     raw,
+                    axhal::time::monotonic_time_nanos(),
                 );
                 #[cfg(feature = "bpf")]
                 file.run_attached_bpf(3, dynamic_event_key(event));
@@ -2948,7 +3014,7 @@ impl PerfGroup {
         for file in state.active.files.iter().filter_map(Option::as_ref) {
             if file.event == PerfEvent::Software(event) && file.running() && file.enabled() {
                 file.add_count(1);
-                file.emit_source_raw_at(0, false, &[]);
+                file.emit_source_raw_at(0, false, &[], axhal::time::monotonic_time_nanos());
                 #[cfg(feature = "bpf")]
                 file.run_attached_bpf(1, event as u64);
             }
@@ -3542,11 +3608,11 @@ impl PerfEventFile {
     /// Source hooks call this only after matching an enabled/running event.
     /// The backend owns a preallocated mmap ring; a missing mapping converts
     /// to its normal LOST/unsupported behavior and never changes the count.
-    fn emit_source_raw_at(&self, ip: u64, user: bool, raw: &[u8]) {
+    fn emit_source_raw_at(&self, ip: u64, user: bool, raw: &[u8], timestamp: u64) {
         #[cfg(feature = "perf-sampling")]
         if let Some(backend) = &self.sampling {
             let _ =
-                backend.emit_source_raw_record_at(current().id().as_u64() as u32, ip, user, raw);
+                backend.emit_source_raw_record_at(current().id().as_u64() as u32, ip, user, raw, timestamp);
         }
     }
     fn emit_comm_exec(&self, pid: u32, tid: u32, comm: &[u8]) {
@@ -3871,6 +3937,12 @@ impl PerfEventFile {
     }
 
     fn finish_map_held_close(&self) {
+        if let Some(group) = self.group() {
+            // Retire membership at the owner CPU before restoring terminal
+            // resources; surviving siblings are re-admitted there as part
+            // of the same control operation.
+            group.retire_member(self.id);
+        }
         self.release_dynamic_source();
         #[cfg(feature = "pmu")]
         self.restore_external_terminal();
@@ -3879,13 +3951,6 @@ impl PerfEventFile {
             if self.output_users.load(Ordering::Acquire) == 0 {
                 backend.final_close();
             }
-        }
-        if let Some(group) = self.group() {
-            // Dropping the final PERF_EVENT_ARRAY reference is the real
-            // object-lifetime close edge.  Stop the exact remote/local
-            // generation now; merely marking it invalid would leave its PMC
-            // live until an unrelated switch or tick.
-            group.reconcile_last_descriptor();
         }
     }
     fn release_dynamic_source(&self) {
@@ -4498,6 +4563,21 @@ impl PerfEventFile {
     fn running(&self) -> bool {
         self.state.lock().running
     }
+    fn requires_owner_control(&self) -> bool {
+        if self.event.uses_pmu() {
+            return true;
+        }
+        #[cfg(feature = "perf-sampling")]
+        if self.sampling.is_some()
+            && matches!(
+                self.event,
+                PerfEvent::Software(SoftwareEvent::CpuClock | SoftwareEvent::TaskClock)
+            )
+        {
+            return true;
+        }
+        false
+    }
     fn add_count(&self, value: u64) {
         let mut state = self.state.lock();
         state.count = state.count.saturating_add(value);
@@ -4707,10 +4787,9 @@ impl FileLike for PerfEventFile {
             if self.output_users.load(Ordering::Acquire) == 0 {
                 backend.final_close();
             }
-            return;
         }
         if let Some(group) = self.group() {
-            group.reconcile_last_descriptor();
+            group.retire_member(self.id);
         }
     }
 
@@ -5017,6 +5096,271 @@ mod tests {
     }
 
     #[test]
+    fn running_software_group_accepts_enable_reset_and_disable() {
+        let group = PerfGroup::new(1, 1).unwrap();
+        let file = PerfEventFile::new(
+            1,
+            PerfEvent::Software(SoftwareEvent::CpuMigrations),
+            true,
+            &group,
+            NO_READ,
+        )
+        .unwrap();
+        {
+            let mut state = group.state.lock();
+            state.active.task_active = true;
+            // Software control must also work for a remotely active group.
+            state.active.cpu = Some(usize::MAX);
+        }
+        for _ in 0..2 {
+            group
+                .synchronize_hardware_control(file.id, false, super::RECONCILE_CONTROL_ENABLE)
+                .unwrap();
+            assert!(file.running());
+            file.add_count(7);
+            group
+                .synchronize_hardware_control(file.id, false, super::RECONCILE_CONTROL_RESET)
+                .unwrap();
+            assert_eq!(file.state.lock().count, 0);
+            assert!(file.running());
+            group
+                .synchronize_hardware_control(file.id, false, super::RECONCILE_CONTROL_DISABLE)
+                .unwrap();
+            assert!(!file.running());
+            assert!(!file.enabled());
+            assert!(!group.state.lock().active.running);
+            assert!(group.state.lock().active.files.iter().all(Option::is_none));
+        }
+    }
+
+    #[test]
+    fn disabled_software_group_releases_closed_member_without_task_switch() {
+        let group = PerfGroup::new(1, 1).unwrap();
+        let file = PerfEventFile::new(
+            1,
+            PerfEvent::Software(SoftwareEvent::CpuMigrations),
+            true,
+            &group,
+            NO_READ,
+        )
+        .unwrap();
+        let weak_file = Arc::downgrade(&file);
+        {
+            let mut state = group.state.lock();
+            state.active.task_active = true;
+            state.active.cpu = Some(usize::MAX);
+        }
+        group
+            .synchronize_hardware_control(file.id, false, super::RECONCILE_CONTROL_ENABLE)
+            .unwrap();
+        group
+            .synchronize_hardware_control(file.id, false, super::RECONCILE_CONTROL_DISABLE)
+            .unwrap();
+        group.reconcile_last_descriptor();
+        drop(file);
+        // Closing must release the descriptor immediately; leaving the task
+        // then makes the group eligible for registry quota reclamation.
+        assert!(weak_file.upgrade().is_none());
+        group.on_leave();
+        assert!(group.is_prunable());
+        assert!(group.state.lock().members.is_empty());
+        assert!(group.state.lock().active.files.is_empty());
+    }
+
+    #[test]
+    fn disabled_software_groups_do_not_exhaust_registry_quota_without_task_switch() {
+        let _context = crate::test_support::scheduler_test_context();
+        for id in 1..=(super::MAX_CPU_CONTEXT_GROUPS as u64 * 2) {
+            let group = PerfGroup::new_for_context(PerfContext::Cpu { cpu: 0 }, id).unwrap();
+            let file = PerfEventFile::new(
+                id,
+                PerfEvent::Software(SoftwareEvent::CpuMigrations),
+                true,
+                &group,
+                NO_READ,
+            )
+            .unwrap();
+            PerfGroup::attach_cpu_context(&group).unwrap();
+            let description = crate::file::FileDescription::new(file.clone()).unwrap();
+            description.mark_open_committed();
+            description.begin_descriptor_publication().unwrap().commit();
+            group.on_enter();
+            group
+                .synchronize_hardware_control(id, false, super::RECONCILE_CONTROL_ENABLE)
+                .unwrap();
+            group
+                .synchronize_hardware_control(id, false, super::RECONCILE_CONTROL_DISABLE)
+                .unwrap();
+            description.descriptor_closed();
+            drop(description);
+            drop(file);
+            assert!(group.state.lock().active.task_active);
+            assert!(group.is_prunable());
+            // Leave reclamation to the real registry's next open, so a
+            // leaked descriptor exhausts its 64 entries on iteration 65.
+        }
+        super::CPU_CONTEXT_GROUPS[0].lock().retain(|group| !group.is_prunable());
+    }
+
+    #[test]
+    fn closing_group_member_keeps_survivor_counting_without_task_switch() {
+        let _context = crate::test_support::scheduler_test_context();
+        // Exercise both member and leader close through the real OFD
+        // lifecycle; membership removal must not depend on the final Arc
+        // disappearing, because close itself still holds the file alive.
+        for close_leader in [false, true] {
+            let group = PerfGroup::new(1, 1).unwrap();
+            let leader = PerfEventFile::new(
+                1,
+                PerfEvent::Software(SoftwareEvent::CpuMigrations),
+                true,
+                &group,
+                NO_READ,
+            )
+            .unwrap();
+            let child = PerfEventFile::new(
+                2,
+                PerfEvent::Software(SoftwareEvent::ContextSwitches),
+                true,
+                &group,
+                NO_READ,
+            )
+            .unwrap();
+            let (closing, survivor) = if close_leader {
+                (&leader, &child)
+            } else {
+                (&child, &leader)
+            };
+            let description = crate::file::FileDescription::new(closing.clone()).unwrap();
+            description.mark_open_committed();
+            description.begin_descriptor_publication().unwrap().commit();
+            group.on_enter();
+            group
+                .synchronize_hardware_control(1, true, super::RECONCILE_CONTROL_ENABLE)
+                .unwrap();
+            description.descriptor_closed();
+            drop(description);
+            assert!(!closing.enabled());
+            assert!(!closing.running());
+            assert!(survivor.running());
+            assert!(!group.state.lock().active.reconcile_frozen);
+            assert_eq!(group.state.lock().members.len(), 1);
+            let event = match survivor.event {
+                PerfEvent::Software(event) => event,
+                _ => unreachable!(),
+            };
+            let before = survivor.state.lock().count;
+            group.on_software_event(event);
+            assert_eq!(survivor.state.lock().count, before + 1);
+            group.on_leave();
+        }
+    }
+
+    #[cfg(feature = "perf-sampling")]
+    #[test]
+    fn running_software_tracepoint_wrapper_can_enable_disabled_backend() {
+        use crate::file::perf_sampling::{PerfOpenIdentity, SamplingConfig, SamplingEvent};
+        let _context = crate::test_support::scheduler_test_context();
+        let group = PerfGroup::new_for_context(PerfContext::Cpu { cpu: 0 }, 1).unwrap();
+        let backend = crate::file::PerfSampleBackend::try_new(SamplingConfig {
+            id: 1,
+            target_task_id: 0,
+            event: SamplingEvent::Source,
+            period: 1,
+            frequency: None,
+            sample_type: thekernel_linux_perf::PERF_SAMPLE_TIME,
+            count_user: true,
+            count_kernel: true,
+            disabled: true,
+            read_format: 0,
+            aux: None,
+            identity: PerfOpenIdentity {
+                attr: thekernel_linux_perf::PerfEventAttr::default(),
+                target: thekernel_linux_perf::PerfOpenTarget {
+                    target: thekernel_linux_perf::PerfTarget::Cpu { cpu: 0 },
+                    group_fd: -1,
+                    output_fd: -1,
+                    open_flags: 0,
+                },
+                authority: crate::perf_security::PerfAuthority::Restricted,
+            },
+        })
+        .unwrap();
+        let file = PerfEventFile::new_sampling(
+            1,
+            PerfEvent::Tracepoint(1),
+            &group,
+            NO_READ,
+            thekernel_linux_perf::PerfLifecycle::default(),
+            backend.clone(),
+        )
+        .unwrap();
+        {
+            let mut state = group.state.lock();
+            state.active.task_active = true;
+            state.active.cpu = Some(usize::MAX);
+            PerfGroup::start_locked(&mut state, super::monotonic_time_nanos());
+            assert!(state.active.running);
+        }
+        assert!(!backend.enabled());
+        assert!(!file.requires_owner_control());
+        // Sharing the same source backend with a clock event requires the
+        // owner's CPU/task context when settlement emits a pending sample.
+        let clock_group = PerfGroup::new(1, 2).unwrap();
+        let clock = PerfEventFile::new_sampling(
+            2,
+            PerfEvent::Software(SoftwareEvent::CpuClock),
+            &clock_group,
+            NO_READ,
+            thekernel_linux_perf::PerfLifecycle::default(),
+            backend.clone(),
+        )
+        .unwrap();
+        assert!(clock.requires_owner_control());
+        {
+            let mut state = clock_group.state.lock();
+            state.active.running = true;
+        }
+        assert_eq!(
+            clock_group.control_local_inactive(clock.id, false, super::RECONCILE_CONTROL_ENABLE),
+            Err(axerrno::AxError::Io)
+        );
+        group
+            .synchronize_hardware_control(file.id, false, super::RECONCILE_CONTROL_ENABLE)
+            .unwrap();
+        assert!(backend.enabled());
+        group
+            .synchronize_hardware_control(file.id, false, super::RECONCILE_CONTROL_DISABLE)
+            .unwrap();
+        assert!(!backend.enabled());
+    }
+
+    #[test]
+    fn cpu_group_publication_requires_live_member_before_registry_pruning() {
+        let _context = crate::test_support::scheduler_test_context();
+        let group = PerfGroup::new_for_context(PerfContext::Cpu { cpu: 0 }, 1).unwrap();
+        assert_eq!(PerfGroup::attach_cpu_context(&group), Err(super::AxError::InvalidInput));
+        let file = PerfEventFile::new(
+            1,
+            PerfEvent::Software(SoftwareEvent::CpuMigrations),
+            true,
+            &group,
+            NO_READ,
+        )
+        .unwrap();
+        PerfGroup::attach_cpu_context(&group).unwrap();
+        // This is the registry sweep that used to run between attaching the
+        // empty group and creating its first descriptor member.
+        super::CPU_CONTEXT_GROUPS[0].lock().retain(|entry| !entry.is_prunable());
+        drop(group);
+        let retained = file.group().expect("registry must retain an unopened live member");
+        retained
+            .synchronize_hardware_control(file.id, false, super::RECONCILE_CONTROL_ENABLE)
+            .unwrap();
+        PerfGroup::detach_empty_cpu_context(&retained);
+    }
+
+    #[test]
     fn file_holds_only_weak_group_reference() {
         let group = PerfGroup::new(1, 1).unwrap();
         let file = PerfEventFile::new(
@@ -5093,7 +5437,9 @@ mod tests {
             state.active.generation = u64::MAX;
             group.advance_generation_locked(&mut state)
         };
-        assert_eq!(generation, 1);
+        // Generations come from the global allocator, so preceding groups
+        // may already have consumed the first value.
+        assert_ne!(generation, 0);
         assert!(group.accepts_reconcile_generation(generation));
     }
 

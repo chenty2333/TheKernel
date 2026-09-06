@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef O_DIRECT
@@ -45,7 +46,7 @@
 #define IORING_OP_ASYNC_CANCEL 14U
 #define IORING_OP_READ 22U
 #define IORING_OP_WRITE 23U
-#define IORING_OP_LAST_LINUX_6_12 58U
+#define IORING_OP_LAST_LINUX_7_2_3 65U
 #define IOSQE_FIXED_FILE (1U << 0)
 #define IORING_OP_SUPPORTED (1U << 0)
 #define IORING_FEATURES_EXPECTED 0x47U
@@ -508,7 +509,10 @@ static int test_default_batch_stops_on_submission_failure(struct ring *ring) {
 
     const uint64_t failed_user_data = 0x4241544348464149ULL;
     const uint64_t next_user_data = 0x42415443484e4558ULL;
-    struct raw_sqe unsupported = make_sqe(IORING_OP_FSYNC, failed_user_data);
+    /* Linux io_init_req rejects an out-of-range opcode before issue, and
+     * io_submit_sqes stops there unless IORING_SETUP_SUBMIT_ALL is set.
+     * FSYNC is supported and its execution result does not test this gate. */
+    struct raw_sqe unsupported = make_sqe(UINT8_MAX, failed_user_data);
     struct raw_sqe next = make_sqe(IORING_OP_NOP, next_user_data);
     if (queue_one(ring, &unsupported) || queue_one(ring, &next)) {
         return 1;
@@ -526,7 +530,7 @@ static int test_default_batch_stops_on_submission_failure(struct ring *ring) {
     if (first_tail - cq_head != 1U) {
         return fail_value("batch-stop-cq-count", first_tail - cq_head, 1);
     }
-    if (expect_cqe(ring, cq_head, failed_user_data, -EOPNOTSUPP,
+    if (expect_cqe(ring, cq_head, failed_user_data, -EINVAL,
                    "batch-failed-cqe")) {
         return 1;
     }
@@ -560,16 +564,18 @@ static int test_probe(struct ring *ring) {
                 &probe, IORING_PROBE_OPS) != 0) {
         return fail("register-probe");
     }
-    if (probe.last_op != IORING_OP_LAST_LINUX_6_12 - 1 ||
+    if (probe.last_op != IORING_OP_LAST_LINUX_7_2_3 - 1 ||
         probe.ops_len != IORING_PROBE_OPS) {
         return fail_value("probe-header", probe.last_op,
-                          IORING_OP_LAST_LINUX_6_12 - 1);
+                          IORING_OP_LAST_LINUX_7_2_3 - 1);
     }
     for (uint32_t opcode = 0; opcode < IORING_PROBE_OPS; ++opcode) {
-        int supported = opcode == IORING_OP_NOP || opcode == IORING_OP_READ_FIXED ||
-                        opcode == IORING_OP_WRITE_FIXED || opcode == IORING_OP_POLL_ADD ||
-                        opcode == IORING_OP_ASYNC_CANCEL || opcode == IORING_OP_READ ||
-                        opcode == IORING_OP_WRITE;
+        /* Exact implemented profile, with numeric slots from Linux 7.2.3:
+         * NOP, READV, WRITEV, FSYNC, fixed I/O, polls, SYNC_FILE_RANGE,
+         * timeout operations, ACCEPT, ASYNC_CANCEL, FALLOCATE, CLOSE, I/O. */
+        int supported = opcode <= 8U || (opcode >= 11U && opcode <= 14U) ||
+                        opcode == 17U || opcode == 19U ||
+                        opcode == IORING_OP_READ || opcode == IORING_OP_WRITE;
         uint16_t expected = supported ? IORING_OP_SUPPORTED : 0;
         if (probe.ops[opcode].op != opcode || probe.ops[opcode].flags != expected) {
             return fail_value("probe-op", opcode, expected);
@@ -1191,9 +1197,182 @@ static int test_ring(int *dma_direct_diagnostics_available) {
     return 0;
 }
 
-int main(void) {
+/* Opt-in TheKernel diagnostic capture regression; ordinary ABI smoke continues
+ * to run on Linux without requiring this kernel-owned tracefs surface. */
+static const char *trace_root = "/sys/kernel/tracing";
+static int trace_write(const char *leaf, const char *value) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/io_uring/%s", trace_root, leaf);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return fail("trace-open-control");
+    size_t length = strlen(value);
+    ssize_t written = write(fd, value, length);
+    close(fd);
+    return written == (ssize_t)length ? 0 : fail("trace-write-control");
+}
+static char *trace_read(void) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/io_uring/trace", trace_root);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fail("trace-open"); return NULL; }
+    size_t capacity = 512U * 1024U, used = 0;
+    char *text = malloc(capacity);
+    if (!text) { close(fd); return NULL; }
+    for (;;) {
+        ssize_t got = read(fd, text + used, capacity - used - 1);
+        if (got < 0) { free(text); close(fd); fail("trace-read"); return NULL; }
+        if (!got) break;
+        used += (size_t)got;
+        if (used == capacity - 1) { free(text); close(fd); errno = EOVERFLOW; return NULL; }
+    }
+    close(fd);
+    text[used] = 0;
+    return text;
+}
+static int trace_empty(void) {
+    char *text = trace_read();
+    if (!text) return 1;
+    int failed = strstr(text, "seq=") != NULL || strstr(text, " dropped=0 ") == NULL;
+    free(text);
+    if (failed) { errno = EIO; return fail("trace-not-empty"); }
+    return 0;
+}
+static int trace_check_order(char *text, int cancellation) {
+    struct traced_request { unsigned long long ring, generation; unsigned slot, stage; int result, cancelled; } requests[3] = {0};
+    unsigned count = 0, reclaimed = 0, cancelled = 0;
+    unsigned long long previous = 0;
+    int seen = 0;
+    char *save;
+    for (char *line = strtok_r(text, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        if (line[0] == '#') continue;
+        unsigned long long sequence, nanos, ring, generation;
+        unsigned slot;
+        char event[48];
+        if (sscanf(line, "seq=%llu ns=%llu ring=%llu", &sequence, &nanos, &ring) != 3 || (seen && sequence <= previous)) return fail("trace-sequence");
+        previous = sequence;
+        seen = 1;
+        if (strstr(line, "event=head_reclaimed")) {
+            if (strstr(line, "slot=") || !count || ring != requests[0].ring) return fail("trace-aggregate-head");
+            reclaimed++;
+            continue;
+        }
+        if (sscanf(line, "seq=%llu ns=%llu ring=%llu slot=%u generation=%llu event=%47s", &sequence, &nanos, &ring, &slot, &generation, event) != 6) return fail("trace-record");
+        unsigned index;
+        for (index = 0; index < count; index++) if (requests[index].ring == ring && requests[index].slot == slot && requests[index].generation == generation) break;
+        if (index == count) {
+            if (count == (cancellation ? 3U : 2U) || strcmp(event, "reserved")) return fail("trace-request-identity");
+            unsigned long long user_data;
+            char *field = strstr(line, " user_data=");
+            if (!field || sscanf(field, " user_data=%llu", &user_data) != 1) return fail("trace-user-data");
+            int target = cancellation && user_data == 0x544152474554ULL;
+            int expected = target ? -ECANCELED : cancellation && user_data == 0x57414b45ULL ? (int)POLLIN : 0;
+            if (cancellation && !target && user_data != 0x57414b45ULL && user_data != 0x43414e43454cULL) return fail("trace-user-data");
+            requests[count++] = (struct traced_request){ring, generation, slot, 0, expected, target};
+            cancelled += target;
+        }
+        if (cancellation && requests[index].cancelled &&
+            (!strcmp(event, "provider_cancel_selected") || !strcmp(event, "provider_cancel_resolved"))) {
+            if (requests[index].stage < 3) return fail("trace-cancel-before-issue");
+            continue;
+        }
+        static const char *stages[] = {"reserved", "submitted", "issued", "completion_accepted", "publication_started", "published"};
+        unsigned stage = requests[index].stage;
+        if (stage >= 6 || strcmp(event, stages[stage])) return fail("trace-lifecycle-order");
+        char expected[96];
+        snprintf(expected, sizeof(expected), "cause=%s result=%d flags=0", requests[index].cancelled ? "Cancelled" : "Completed", requests[index].result);
+        if (stage == 3 && !strstr(line, expected)) return fail("trace-completion-result");
+        if (stage == 4 && !strstr(line, "terminal=true")) return fail("trace-publication-terminal");
+        snprintf(expected, sizeof(expected), "terminal=true result=%d flags=0", requests[index].result);
+        if (stage == 5 && !strstr(line, expected)) return fail("trace-publication-result");
+        requests[index].stage++;
+    }
+    if (count != (cancellation ? 3U : 2U) || !reclaimed || (cancellation && cancelled != 1)) return fail("trace-lifecycle-incomplete");
+    for (unsigned index = 0; index < count; index++) if (requests[index].stage != 6) return fail("trace-lifecycle-incomplete");
+    return 0;
+}
+static int trace_privilege_check(void) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/io_uring/trace", trace_root);
+    int inherited = open(path, O_RDWR);
+    if (inherited < 0) return fail("trace-privilege-open");
+    pid_t child = fork();
+    if (child == 0) {
+        if (setgid(65534) || setuid(65534)) _exit(1);
+        char byte;
+        errno = 0;
+        if (read(inherited, &byte, 1) >= 0 || (errno != EACCES && errno != EPERM)) _exit(2);
+        errno = 0;
+        if (write(inherited, "clear", 5) >= 0 || (errno != EACCES && errno != EPERM)) _exit(3);
+        for (unsigned i = 0; i < 3; i++) {
+            const char *names[] = {"enable", "trace", "dropped"};
+            snprintf(path, sizeof(path), "%s/io_uring/%s", trace_root, names[i]);
+            int fd = open(path, O_RDONLY);
+            if (fd >= 0) { close(fd); _exit(4); }
+            if (errno != EACCES && errno != EPERM) _exit(5);
+        }
+        _exit(0);
+    }
+    close(inherited);
+    int status;
+    if (child < 0 || waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) return fail("trace-privilege");
+    return 0;
+}
+static int test_trace(void) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/io_uring/enable", trace_root);
+    if (access(path, F_OK) != 0) trace_root = "/sys/kernel/debug/tracing";
+    if (trace_privilege_check()) return 1;
+    struct ring ring;
+    memset(&ring, 0, sizeof(ring));
+    ring.fd = (int)syscall(SYS_io_uring_setup, 8U, &ring.params);
+    if (ring.fd < 0) return fail("trace-ring-setup");
+    if (map_ring(&ring)) { close(ring.fd); return 1; }
+    int result = 1;
+    char *text = NULL;
+    struct raw_sqe nop = make_sqe(IORING_OP_NOP, 0x5452414345ULL);
+    if (trace_write("enable", "0") || trace_write("trace", "clear") ||
+        submit_one(&ring, &nop, 0x5452414345ULL, 0) || trace_empty()) goto out;
+    /* Account earlier CQ head changes before capture, so all retained events
+     * refer to this capture's two requests. */
+    if (syscall(SYS_io_uring_enter, ring.fd, 0U, 0U, 0U, NULL, 0U) < 0) goto out;
+    if (trace_write("enable", "1") ||
+        submit_one(&ring, &nop, 0x5452414345ULL, 0) || submit_one(&ring, &nop, 0x5452414345ULL, 0) ||
+        trace_write("enable", "0")) goto out;
+    text = trace_read();
+    if (!text || trace_check_order(text, 0)) goto out;
+    free(text); text = NULL;
+    if (syscall(SYS_io_uring_enter, ring.fd, 0U, 0U, 0U, NULL, 0U) < 0) goto out;
+    if (trace_write("trace", "clear") || trace_write("enable", "1") || test_deferred_poll_and_cancel(&ring) || trace_write("enable", "0")) goto out;
+    text = trace_read();
+    if (!text || trace_check_order(text, 1)) goto out;
+    free(text); text = NULL;
+    if (trace_write("trace", "clear") || trace_write("enable", "1")) goto out;
+    for (unsigned i = 0; i < 260; i++) if (submit_one(&ring, &nop, 0x5452414345ULL, 0)) goto out;
+    if (trace_write("enable", "0")) goto out;
+    text = trace_read();
+    if (!text || strstr(text, " dropped=0 ")) { fail("trace-full-drop-accounting"); goto out; }
+    unsigned records = 0;
+    for (char *cursor = text; (cursor = strstr(cursor, "seq=")); cursor += 4) records++;
+    if (records != 1024) { fail_value("trace-capacity", records, 1024); goto out; }
+    free(text); text = NULL;
+    if (trace_write("trace", "clear") || trace_empty() || submit_one(&ring, &nop, 0x5452414345ULL, 0) || trace_empty()) goto out;
+    puts("THEKERNEL_IO_URING_TRACE_OK");
+    result = 0;
+out:
+    free(text);
+    if (trace_write("enable", "0")) result = 1;
+    close(ring.fd);
+    munmap(ring.sqes, ring.sqe_bytes);
+    munmap(ring.cq_ring, ring.ring_bytes);
+    munmap(ring.sq_ring, ring.ring_bytes);
+    return result;
+}
+
+int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
+    if (argc == 2 && strcmp(argv[1], "--trace") == 0) return test_trace();
+    if (argc != 1) { fprintf(stderr, "usage: %s [--trace]\n", argv[0]); return 2; }
     int dma_direct_diagnostics_available = 0;
     if (test_ring(&dma_direct_diagnostics_available)) {
         return 1;

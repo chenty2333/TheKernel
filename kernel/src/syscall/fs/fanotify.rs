@@ -2,11 +2,11 @@ use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::FsPathBuf;
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
+use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, O_NONBLOCK, O_RDWR};
 
 use crate::{
     file::{
-        FileLike, ResolveAtResult, add_file_like, fanotify::*, get_file_like,
+        FileLike, ResolveAtResult, add_file_like_with_flags, fanotify::*, get_file_like,
         inotify::location_for_fd, resolve_at,
     },
     mm::{UserMemoryCapability, map_usercopy_error},
@@ -15,9 +15,15 @@ use crate::{
 pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> AxResult<isize> {
     validate_init_flags(flags, event_f_flags)?;
 
-    add_file_like(
+    add_file_like_with_flags(
         FanotifyFile::new(flags, event_f_flags)?,
         flags & FAN_CLOEXEC != 0,
+        O_RDWR
+            | if flags & FAN_NONBLOCK != 0 {
+                O_NONBLOCK
+            } else {
+                0
+            },
     )
     .map(|fd| fd as isize)
 }

@@ -12,6 +12,10 @@ use axfs_ng_vfs::{
 };
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use inherit_methods_macro::inherit_methods;
+#[cfg(not(test))]
+use axsync::Mutex;
+#[cfg(test)]
+use spin::Mutex;
 
 use crate::{
     pseudofs::{ChildNames, NodeOpsMux, SimpleDirOps, SimpleFs, SimpleFsNode, try_boxed_names},
@@ -32,7 +36,7 @@ pub(crate) fn new_mqueuefs(namespace: Arc<IpcNamespace>) -> Filesystem {
 /// Resolve the queue core behind an ordinary VFS open.  This is the bridge
 /// that makes mqueuefs opens and mq_open descriptors name the same queue
 /// object rather than two incompatible descriptor families.
-pub(crate) fn queue_for_location(location: &Location) -> Option<Arc<axsync::Mutex<PosixMqueue>>> {
+pub(crate) fn queue_for_location(location: &Location) -> Option<Arc<Mutex<PosixMqueue>>> {
     location
         .entry()
         .downcast::<MqueueFile>()
@@ -153,11 +157,11 @@ impl DirNodeOps for MqueueDir {
 
 struct MqueueFile {
     node: SimpleFsNode,
-    queue: Arc<axsync::Mutex<PosixMqueue>>,
+    queue: Arc<Mutex<PosixMqueue>>,
     readiness: Arc<MqReadiness>,
 }
 impl MqueueFile {
-    fn try_new(fs: Arc<SimpleFs>, queue: Arc<axsync::Mutex<PosixMqueue>>) -> VfsResult<Arc<Self>> {
+    fn try_new(fs: Arc<SimpleFs>, queue: Arc<Mutex<PosixMqueue>>) -> VfsResult<Arc<Self>> {
         let (mode, uid, gid, size) = mqueuefs_metadata(&queue);
         let node = SimpleFsNode::try_new(
             fs,

@@ -1,0 +1,6 @@
+This package is a new implementation of Linux-visible AF_PACKET policy values
+and first-stage state designed for TheKernel and distributed under Apache-2.0.
+
+Linux, gVisor, and libpcap sources were consulted for public ABI behavior,
+independent implementation comparison, and consumer expectations. No source
+text from those projects is copied into this package.

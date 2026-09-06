@@ -1,7 +1,7 @@
 //! Open-time perf authority and global perf sysctl policy.
 //!
-//! Perf descriptors retain the result of this policy at creation: capability
-//! changes and later sysctl writes never revoke an already-open descriptor.
+//! Event authority is retained at open. Ring locked-memory admission instead
+//! uses mmap-time credentials, limits, and online CPU count, as Linux does.
 
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
@@ -17,143 +17,122 @@ use thekernel_linux_perf::{
 use crate::task::AsThread;
 
 const PERF_LOCKED_MEMORY_OWNERS: usize = 16_384;
+// Intel EventSel bit 21 is AnyThread.  The PMU programming path deliberately
+// owns this bit and clears it; until the scheduler can reserve an SMT
+// exclusive placement, admitting the request would silently change its
+// delivery scope.
+const RAW_CONFIG_ANYTHREAD: u64 = 1 << 21;
 
-/// Frozen owner of perf mmap/AUX locked-memory accounting.  Keeping scalar
-/// namespace/uid identities avoids retaining credentials after open while
-/// ensuring later credential changes cannot move an existing charge.
+/// A mmap-time charge: the per-user allowance and the overflow charged to
+/// this address space are refunded independently, even after credentials or
+/// sysctls change. Stable mm IDs avoid retaining an address-space/file cycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PerfMlockOwner {
-    user_namespace: u64,
+struct PerfMlockOwner {
     kuid: u32,
-}
-
-impl PerfMlockOwner {
-    pub(crate) fn current() -> Self {
-        let credential = axtask::current().as_thread().current_cred();
-        Self {
-            user_namespace: credential.user_ns().identity().into_raw(),
-            kuid: credential.ids().euid.into_raw(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn kernel_test_owner() -> Self {
-        Self {
-            user_namespace: 0,
-            kuid: 0,
-        }
-    }
+    mm: u64,
 }
 
 #[derive(Clone, Copy)]
 struct PerfMlockEntry {
     owner: Option<PerfMlockOwner>,
-    bytes: usize,
+    user_bytes: usize,
+    pinned_bytes: usize,
 }
-
 impl PerfMlockEntry {
-    const EMPTY: Self = Self {
-        owner: None,
-        bytes: 0,
-    };
+    const EMPTY: Self = Self { owner: None, user_bytes: 0, pinned_bytes: 0 };
 }
-
 static PERF_LOCKED_MEMORY: SpinNoIrq<[PerfMlockEntry; PERF_LOCKED_MEMORY_OWNERS]> =
     SpinNoIrq::new([PerfMlockEntry::EMPTY; PERF_LOCKED_MEMORY_OWNERS]);
 
-/// RAII reservation used across fallible page/ring allocation.  Until
-/// committed, every early return refunds the exact open-time owner.
 pub(crate) struct PerfMlockReservation {
     owner: PerfMlockOwner,
-    bytes: usize,
-    committed: bool,
+    user_bytes: usize,
+    pinned_bytes: usize,
 }
-
+#[cfg(test)]
 impl PerfMlockReservation {
-    pub(crate) fn commit(mut self) -> usize {
-        self.committed = true;
-        self.bytes
+    pub(crate) fn for_test() -> Self {
+        reserve_perf_locked_memory_for(PerfMlockOwner { kuid: u32::MAX - 1, mm: u64::MAX - 2 }, 4096, 4096, 0, false).unwrap()
     }
 }
 
 impl Drop for PerfMlockReservation {
     fn drop(&mut self) {
-        if !self.committed {
-            release_perf_locked_memory(self.owner, self.bytes);
-        }
+        let mut ledger = PERF_LOCKED_MEMORY.lock();
+        let entry = ledger.iter_mut().find(|entry| entry.owner == Some(self.owner))
+            .expect("perf locked-memory refund without an owner slot");
+        entry.user_bytes = entry.user_bytes.checked_sub(self.user_bytes).expect("perf user charge underflow");
+        entry.pinned_bytes = entry.pinned_bytes.checked_sub(self.pinned_bytes).expect("perf pinned charge underflow");
+        if entry.user_bytes == 0 && entry.pinned_bytes == 0 { *entry = PerfMlockEntry::EMPTY; }
     }
 }
 
-pub(crate) fn reserve_perf_locked_memory(
-    owner: PerfMlockOwner,
-    bytes: usize,
-    bypass_limit: bool,
-) -> AxResult<PerfMlockReservation> {
-    // The descriptor records this decision at open.  A later sysctl change
-    // must not retroactively charge or uncharge an existing mmap/AUX ring.
-    // A zero-byte reservation deliberately uses the normal RAII path while
-    // leaving the per-owner ledger untouched.
-    if bypass_limit {
-        return Ok(PerfMlockReservation {
-            owner,
-            bytes: 0,
-            committed: false,
-        });
-    }
-    let limit = usize::try_from(perf_event_mlock_kb())
-        .ok()
-        .and_then(|kb| kb.checked_mul(1024))
-        .ok_or(AxError::InvalidInput)?;
-    let mut ledger = PERF_LOCKED_MEMORY.lock();
-    let mut empty = None;
-    for (index, entry) in ledger.iter_mut().enumerate() {
-        if entry.owner == Some(owner) {
-            let total = entry.bytes.checked_add(bytes).ok_or(AxError::NoMemory)?;
-            if total > limit {
-                return Err(AxError::OperationNotPermitted);
-            }
-            entry.bytes = total;
-            return Ok(PerfMlockReservation {
-                owner,
-                bytes,
-                committed: false,
-            });
-        }
-        if entry.owner.is_none() && empty.is_none() {
-            empty = Some(index);
-        }
-    }
-    if bytes > limit {
+fn split_perf_locked_memory(
+    bytes: usize, user_used: usize, user_limit: usize, pinned_used: usize,
+    memlock_limit: u64, bypass_limit: bool,
+) -> AxResult<(usize, usize)> {
+    let user_bytes = bytes.min(user_limit.saturating_sub(user_used));
+    let pinned_bytes = bytes - user_bytes;
+    let pinned_total = pinned_used.checked_add(pinned_bytes).ok_or(AxError::NoMemory)?;
+    if !bypass_limit && pinned_total as u128 > u128::from(memlock_limit) {
         return Err(AxError::OperationNotPermitted);
     }
-    let slot = empty.ok_or(AxError::NoMemory)?;
-    ledger[slot] = PerfMlockEntry {
-        owner: Some(owner),
-        bytes,
-    };
-    Ok(PerfMlockReservation {
-        owner,
-        bytes,
-        committed: false,
-    })
+    Ok((user_bytes, pinned_bytes))
 }
 
-pub(crate) fn release_perf_locked_memory(owner: PerfMlockOwner, bytes: usize) {
-    if bytes == 0 {
-        return;
+pub(crate) struct PerfMlockContext {
+    owner: PerfMlockOwner,
+    user_limit: usize,
+    memlock_limit: u64,
+    bypass_limit: bool,
+}
+impl PerfMlockContext {
+    pub(crate) fn reserve(self, bytes: usize) -> AxResult<PerfMlockReservation> {
+        reserve_perf_locked_memory_for(self.owner, bytes, self.user_limit, self.memlock_limit, self.bypass_limit)
     }
+}
+
+/// Capture sleepable task/mm policy before taking a perf backend spinlock.
+pub(crate) fn perf_mlock_context() -> AxResult<PerfMlockContext> {
+    let current = axtask::current();
+    let thread = current.as_thread();
+    let credential = thread.current_cred();
+    let owner = PerfMlockOwner {
+        kuid: credential.ids().ruid.into_raw(),
+        mm: thread.proc_data.aspace().lock().address_space_id().get(),
+    };
+    // Linux rounds the per-CPU allowance and RLIMIT down to complete pages.
+    let user_limit = (perf_event_mlock_kb() as usize / 4)
+        .checked_mul(4096).and_then(|bytes| bytes.checked_mul(axhal::cpu_num().max(1)))
+        .ok_or(AxError::InvalidInput)?;
+    let memlock_limit = thread.proc_data.rlim.read()[linux_raw_sys::general::RLIMIT_MEMLOCK].current & !4095;
+    let bypass_limit = perf_event_paranoid() < 0
+        || credential.has_effective_capability(linux_raw_sys::general::CAP_IPC_LOCK);
+    Ok(PerfMlockContext { owner, user_limit, memlock_limit, bypass_limit })
+}
+
+fn reserve_perf_locked_memory_for(
+    owner: PerfMlockOwner, bytes: usize, user_limit: usize,
+    memlock_limit: u64, bypass_limit: bool,
+) -> AxResult<PerfMlockReservation> {
     let mut ledger = PERF_LOCKED_MEMORY.lock();
-    let entry = ledger
-        .iter_mut()
-        .find(|entry| entry.owner == Some(owner))
-        .expect("perf locked-memory refund without an owner slot");
-    entry.bytes = entry
-        .bytes
-        .checked_sub(bytes)
-        .expect("perf locked-memory refund exceeded its charge");
-    if entry.bytes == 0 {
-        *entry = PerfMlockEntry::EMPTY;
+    let mut user_used = 0usize;
+    let mut pinned_used = 0usize;
+    for entry in ledger.iter() {
+        if let Some(other) = entry.owner {
+            if other.kuid == owner.kuid { user_used = user_used.checked_add(entry.user_bytes).ok_or(AxError::NoMemory)?; }
+            if other.mm == owner.mm { pinned_used = pinned_used.checked_add(entry.pinned_bytes).ok_or(AxError::NoMemory)?; }
+        }
     }
+    let (user_bytes, pinned_bytes) = split_perf_locked_memory(
+        bytes, user_used, user_limit, pinned_used, memlock_limit, bypass_limit)?;
+    let index = ledger.iter().position(|entry| entry.owner == Some(owner))
+        .or_else(|| ledger.iter().position(|entry| entry.owner.is_none())).ok_or(AxError::NoMemory)?;
+    let entry = &mut ledger[index];
+    let user_total = entry.user_bytes.checked_add(user_bytes).ok_or(AxError::NoMemory)?;
+    let pinned_total = entry.pinned_bytes.checked_add(pinned_bytes).ok_or(AxError::NoMemory)?;
+    *entry = PerfMlockEntry { owner: Some(owner), user_bytes: user_total, pinned_bytes: pinned_total };
+    Ok(PerfMlockReservation { owner, user_bytes, pinned_bytes })
 }
 
 /// Linux's safe default: unprivileged callers may profile task-attached work
@@ -199,13 +178,6 @@ impl PerfAuthority {
 
 pub(crate) fn perf_event_paranoid() -> i32 {
     PERF_EVENT_PARANOID.load(Ordering::Acquire)
-}
-
-/// Linux's `perf_event_paranoid=-1` also lifts perf mmap locked-memory
-/// accounting.  Sampling configurations store this boolean at open so mmap
-/// and AUX setup cannot consult changed credentials or a changed sysctl.
-pub(crate) fn perf_mlock_limit_bypassed_at_open() -> bool {
-    perf_event_paranoid() < 0
 }
 
 pub(crate) fn set_perf_event_paranoid(value: i32) -> AxResult<()> {
@@ -274,6 +246,17 @@ fn requires_perf_capability(attr: &PerfEventAttr) -> bool {
     raw_pmu || any_thread || precise_or_branch_or_aux || uncore_or_msr
 }
 
+fn requests_unavailable_anythread_raw(attr: &PerfEventAttr) -> bool {
+    use crate::pmu_registry::{DynamicPmu, dynamic_pmu};
+
+    let raw_pmu = attr.event_type == PERF_TYPE_RAW
+        || matches!(
+            dynamic_pmu(attr.event_type),
+            Some(DynamicPmu::CpuCore | DynamicPmu::CpuAtom)
+        );
+    raw_pmu && attr.config & RAW_CONFIG_ANYTHREAD != 0
+}
+
 /// Dynamic kernel tracing sources are intentionally separate from the PMU
 /// sensitivity class above.  Linux's `paranoid >= 0` restriction applies to
 /// raw tracepoint/ftrace access and kernel probes, while a uprobe remains a
@@ -296,6 +279,13 @@ pub(crate) fn authorize_open(
     _cpu: i32,
     flags: u64,
 ) -> AxResult<()> {
+    // AnyThread is currently stripped by PMU programming.  Keep this
+    // unsupported request out of every authority path until an SMT-exclusive
+    // placement can preserve the requested delivery scope.
+    if requests_unavailable_anythread_raw(attr) {
+        return Err(AxError::PermissionDenied);
+    }
+
     // Capability is evaluated once at descriptor creation.  CAP_PERFMON is
     // preferred and CAP_SYS_ADMIN is its compatibility fallback; either
     // bypasses every paranoid/product source restriction below.
@@ -346,6 +336,34 @@ mod tests {
             flags: ATTR_EXCLUDE_KERNEL,
             ..PerfEventAttr::default()
         }
+    }
+
+    #[test]
+    fn perf_mmap_splits_user_allowance_and_mm_limit_without_waiving_accounting() {
+        use super::*;
+        let page = 4096;
+        assert_eq!(split_perf_locked_memory(65 * page, 65 * page, 129 * page, 0, page as u64, false), Ok((64 * page, page)));
+        assert_eq!(split_perf_locked_memory(65 * page, 65 * page, 129 * page, 0, 0, false), Err(AxError::OperationNotPermitted));
+        assert_eq!(split_perf_locked_memory(65 * page, 65 * page, 129 * page, 0, 0, true), Ok((64 * page, page)));
+        assert_eq!(split_perf_locked_memory(65 * page, 65 * page, 4 * 129 * page, 0, 0, false), Ok((65 * page, 0)));
+        assert_eq!(split_perf_locked_memory(page, 2 * page, page, 0, page as u64, false), Ok((0, page)));
+    }
+
+    #[test]
+    fn perf_mmap_shares_uid_allowance_but_charges_overflow_to_each_mm_and_refunds() {
+        use super::*;
+        let first = PerfMlockOwner { kuid: u32::MAX, mm: u64::MAX };
+        let second = PerfMlockOwner { kuid: first.kuid, mm: first.mm - 1 };
+        let a = reserve_perf_locked_memory_for(first, 4096, 4096, 0, false).unwrap();
+        assert!(matches!(reserve_perf_locked_memory_for(second, 4096, 4096, 0, false), Err(AxError::OperationNotPermitted)));
+        let b = reserve_perf_locked_memory_for(second, 4096, 4096, 4096, false).unwrap();
+        assert_eq!((b.user_bytes, b.pinned_bytes), (0, 4096));
+        assert!(matches!(reserve_perf_locked_memory_for(second, 4096, 4096, 4096, false), Err(AxError::OperationNotPermitted)));
+        drop(a);
+        let c = reserve_perf_locked_memory_for(first, 4096, 4096, 0, false).unwrap();
+        assert_eq!((c.user_bytes, c.pinned_bytes), (4096, 0));
+        drop((b, c));
+        assert!(PERF_LOCKED_MEMORY.lock().iter().all(|entry| entry.owner != Some(first) && entry.owner != Some(second)));
     }
 
     #[test]

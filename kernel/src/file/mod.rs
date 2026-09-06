@@ -106,3 +106,5 @@ pub(crate) use self::{
     },
     userfaultfd::UserfaultFile,
 };
+
+pub(crate) use net::automatic_unix_credentials;

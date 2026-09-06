@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
 import tempfile
+from tests.support import test_tmpdir
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from tools.qemu_runner.model import Interaction, RunResult
+from tools.qemu_runner.model import Interaction, RunResult, QmpControls
 from tools.qemu_runner.runner import (
     RunConfig,
     RunnerError,
+    _copy_ovmf_vars,
     _resolve_ovmf_image,
     _parse_qemu_device_help,
     _parse_qemu_display_help,
@@ -23,6 +26,86 @@ from tools.qemu_runner.runner import (
 
 
 class RunnerTests(unittest.TestCase):
+    def test_firmware_copy_does_not_import_source_xattrs(self):
+        with test_tmpdir() as directory:
+            source = Path(directory) / "template"
+            destination = Path(directory) / "run" / "vars"
+            source.write_bytes(b"firmware")
+            try:
+                os.setxattr(source, "user.thekernel-fixture", b"source-only")
+            except OSError as error:
+                self.skipTest(f"filesystem does not support test xattrs: {error}")
+            _copy_ovmf_vars(source, destination)
+            self.assertEqual(destination.read_bytes(), b"firmware")
+            self.assertNotIn("user.thekernel-fixture", os.listxattr(destination))
+            destination.write_bytes(b"changed")
+            _copy_ovmf_vars(source, destination)
+            self.assertEqual(destination.read_bytes(), b"firmware")
+
+    def test_diagnostic_log_is_truncated_and_wired_independently(self):
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            kernel.write_bytes(b"kernel")
+            workdir = root / "run"
+            workdir.mkdir()
+            diagnostic = workdir / "kernel.log"
+            diagnostic.write_bytes(b"old run")
+            config = RunConfig(arch="x86_64", kernel=kernel, rootfs=None,
+                workdir=workdir, log_path=workdir / "console.log", direct_kernel=True)
+            def capture(**kwargs):
+                self.assertEqual(diagnostic.read_bytes(), b"")
+                self.assertEqual(kwargs["diagnostic_log_path"], diagnostic)
+                self.assertNotEqual(kwargs["log_path"], diagnostic)
+                self.assertIn("chardev:kernel-log", kwargs["command"])
+                return RunResult(3, kwargs["log_path"])
+            with patch("tools.qemu_runner.runner.run_process", side_effect=capture):
+                self.assertEqual(run(config).returncode, 3)
+
+    def test_diagnostic_log_cannot_alias_kernel(self):
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            kernel = root / "kernel.log"
+            kernel.write_bytes(b"kernel")
+            config = RunConfig(arch="x86_64", kernel=kernel, rootfs=None,
+                workdir=root, log_path=root / "console.log", direct_kernel=True)
+            with self.assertRaisesRegex(RunnerError, "kernel log aliases"):
+                run(config)
+            self.assertEqual(kernel.read_bytes(), b"kernel")
+
+    def test_failed_run_cannot_leave_a_previous_screenshot(self):
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            kernel, rootfs, screenshot = root / "kernel", root / "root.img", root / "screen.ppm"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            screenshot.write_bytes(b"previous successful screenshot")
+            config = RunConfig(arch="x86_64", kernel=kernel, rootfs=rootfs,
+                workdir=root / "run", log_path=root / "run" / "console.log",
+                qemu_binary=sys.executable, direct_kernel=True,
+                qmp=QmpControls(socket=root / "run" / "qmp.sock", screenshot=screenshot,
+                                screenshot_after_marker="NEVER_READY"))
+            with patch("tools.qemu_runner.runner.run_process", return_value=RunResult(4, config.log_path)):
+                self.assertEqual(run(config).returncode, 4)
+            self.assertFalse(screenshot.exists())
+
+    def test_vcpu_pinning_starts_paused_and_passes_the_explicit_map(self):
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            kernel, rootfs = root / "kernel", root / "root.img"
+            kernel.write_bytes(b"kernel")
+            rootfs.write_bytes(b"rootfs")
+            config = RunConfig(arch="x86_64", kernel=kernel, rootfs=rootfs,
+                workdir=root / "run", log_path=root / "run" / "console.log",
+                qemu_binary=sys.executable, direct_kernel=True, cpus=2,
+                qmp=QmpControls(socket=root / "run" / "qmp.sock", vcpu_host_cpus=(4, 2)))
+            expected = RunResult(0, config.log_path)
+            with patch("tools.qemu_runner.runner.os.sched_getaffinity", return_value={2, 4}), \
+                 patch("tools.qemu_runner.runner.run_process", return_value=expected) as process:
+                self.assertIs(run(config), expected)
+            self.assertIn("-S", process.call_args.kwargs["command"])
+            self.assertEqual(process.call_args.kwargs["qmp_vcpu_host_cpus"], (4, 2))
+
     def test_qemu_graphics_help_parsers_identify_host_capabilities(self) -> None:
         self.assertEqual(
             _parse_qemu_device_help(
@@ -114,7 +197,7 @@ class RunnerTests(unittest.TestCase):
                 _validate_venus_capabilities("venus-interactive", Path("/qemu"))
 
     def test_implicit_ovmf_selection_uses_available_host_firmware(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             image = root / "OVMF_CODE.fd"
             image.write_bytes(b"host-firmware")
@@ -129,7 +212,7 @@ class RunnerTests(unittest.TestCase):
             )
 
     def test_explicit_ovmf_image_must_exist(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             image = Path(directory) / "OVMF_CODE.fd"
             with self.assertRaisesRegex(RunnerError, "does not exist"):
                 _resolve_ovmf_image(
@@ -140,7 +223,7 @@ class RunnerTests(unittest.TestCase):
                 )
 
     def test_initrd_is_passed_to_qemu_after_validation(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel"
             rootfs = root / "root.img"
@@ -173,7 +256,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertIs(run(config), expected)
 
     def test_initrd_extra_argument_shape_is_strict(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel"
             rootfs = root / "root.img"
@@ -192,7 +275,7 @@ class RunnerTests(unittest.TestCase):
                 run(RunConfig(**base, extra_args=("-initrd",)))
 
     def test_x86_default_requires_esp_instead_of_falling_back_to_kernel(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel"
             rootfs = root / "root.img"
@@ -209,7 +292,7 @@ class RunnerTests(unittest.TestCase):
                 run(config)
 
     def test_x86_uefi_copies_vars_and_attaches_snapshot_esp(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel"
             rootfs = root / "root.img"
@@ -275,7 +358,7 @@ class RunnerTests(unittest.TestCase):
             self.assertNotEqual(vars_runtime.resolve(), ovmf_vars.resolve())
 
     def test_module_rootfs_does_not_open_or_attach_a_virtio_drive(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel"
             rootfs = root / "root.img"
@@ -300,7 +383,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_graphics_benchmark_drive_matches_linux_snapshot_pci_topology(self) -> None:
         """TheKernel and Linux boot the same snapshot-backed Q35/VirtIO topology."""
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel"
             rootfs = root / "benchmark-rootfs.ext2"
@@ -335,13 +418,16 @@ class RunnerTests(unittest.TestCase):
                     workdir=root / "thekernel-run", log_path=root / "thekernel-run" / "console.log",
                 ))
             self.assertEqual(len(commands), 2)
-            normalize = lambda command: re.sub(r"/proc/self/fd/\d+", "/proc/self/fd/FD", " ".join(command))
+            def normalize(command):
+                normalized = re.sub(r"/proc/self/fd/\d+", "/proc/self/fd/FD", " ".join(command))
+                return normalized.replace(str(root / "linux-run"), "WORKDIR").replace(
+                    str(root / "thekernel-run"), "WORKDIR")
             self.assertEqual(normalize(commands[0]), normalize(commands[1]))
             self.assertIn("id=rootfs,snapshot=on", normalize(commands[1]))
             self.assertIn("virtio-blk-pci,drive=rootfs", normalize(commands[1]))
 
     def test_explicit_artifacts_are_composed_without_discovery(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel"
             rootfs = root / "root.img"
@@ -377,7 +463,7 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("virtio-blk-pci,drive=extra", command)
 
     def test_qemu_uses_opened_input_fds_after_paths_are_replaced(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel"
             rootfs = root / "root.img"
@@ -427,7 +513,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(kernel.read_bytes(), b"replacement")
 
     def test_log_must_not_alias_a_run_input(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel"
             rootfs = root / "root.img"
@@ -449,7 +535,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(rootfs.read_bytes(), b"rootfs")
 
     def test_log_must_not_hardlink_a_run_input(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel"
             rootfs = root / "root.img"
@@ -473,7 +559,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(kernel.read_bytes(), b"kernel")
 
     def test_ovmf_vars_runtime_must_not_overwrite_kernel(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             workdir = root / "run"
             kernel = workdir / "firmware" / "OVMF_VARS.fd"
@@ -504,7 +590,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(kernel.read_bytes(), b"kernel")
 
     def test_log_must_not_alias_resolved_qemu(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             kernel = root / "kernel"
             rootfs = root / "root.img"
@@ -530,7 +616,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(qemu.read_bytes(), b"qemu executable")
 
     def test_missing_kernel_is_rejected_before_image_preparation(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with test_tmpdir() as directory:
             root = Path(directory)
             rootfs = root / "root.img"
             rootfs.write_bytes(b"rootfs")

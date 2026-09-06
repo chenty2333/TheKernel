@@ -16,10 +16,12 @@ use crate::{
     file::get_file_like,
     mm::{UserConstPtr, UserMemoryCapability, UserPtr, map_usercopy_error},
     syscall::signal::check_sigset_size,
+    task::AsThread,
     time::TimeValueLike,
 };
 
 struct FdSet(Bitmap<{ __FD_SETSIZE as usize }>);
+const STICKY_TIMEOUTS: u32 = 0x0400_0000;
 
 impl FdSet {
     fn new(nfds: usize, fds: Option<&__kernel_fd_set>) -> Self {
@@ -59,15 +61,32 @@ fn snapshot_fd_set(
     if nfds == 0 || fds.is_null() {
         return Ok(None);
     }
-    Ok(Some(read_user_value(caller, fds.address().as_usize())?))
+    let mut set = MaybeUninit::<__kernel_fd_set>::zeroed();
+    // select copies only the native-long words covered by nfds, even when
+    // libc's fd_set is larger or crosses an inaccessible page boundary.
+    let bytes = unsafe {
+        slice::from_raw_parts_mut(
+            set.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+            fd_set_bytes(nfds),
+        )
+    };
+    caller
+        .read_bytes(fds.address().as_usize(), bytes)
+        .map_err(map_usercopy_error)?;
+    Ok(Some(unsafe { set.assume_init() }))
+}
+
+fn fd_set_bytes(nfds: u32) -> usize {
+    (nfds as usize).div_ceil(usize::BITS as usize) * core::mem::size_of::<usize>()
 }
 
 fn copy_fd_set(
     caller: &UserMemoryCapability,
     destination: UserPtr<__kernel_fd_set>,
     bitmap: Bitmap<{ __FD_SETSIZE as usize }>,
+    nfds: u32,
 ) -> AxResult<()> {
-    if destination.is_null() {
+    if destination.is_null() || nfds == 0 {
         return Ok(());
     }
 
@@ -82,7 +101,7 @@ fn copy_fd_set(
     let bytes = unsafe {
         slice::from_raw_parts(
             (&set as *const __kernel_fd_set).cast::<u8>(),
-            core::mem::size_of::<__kernel_fd_set>(),
+            fd_set_bytes(nfds),
         )
     };
     caller
@@ -101,7 +120,14 @@ fn select_ready_events(
         // do not call through to the pathname handle's inner poll callback.
         interested
     } else {
-        poll() & interested
+        let mut ready = poll();
+        if ready.intersects(IoEvents::HANGUP | IoEvents::ERROR) {
+            ready |= IoEvents::READABLE;
+        }
+        if ready.contains(IoEvents::ERROR) {
+            ready |= IoEvents::WRITABLE;
+        }
+        ready & interested
     }
 }
 
@@ -113,25 +139,16 @@ fn do_select(
     writefds: UserPtr<__kernel_fd_set>,
     exceptfds: UserPtr<__kernel_fd_set>,
     timeout: Option<Duration>,
-    sigmask: UserConstPtr<SignalSetWithSize>,
+    sigmask: Option<SignalSet>,
 ) -> AxResult<isize> {
-    if nfds > __FD_SETSIZE {
+    if nfds > i32::MAX as u32 {
         return Err(AxError::InvalidInput);
     }
-    let sigmask = if sigmask.is_null() {
-        None
-    } else {
-        let sigmask: SignalSetWithSize = read_user_value(caller, sigmask.address().as_usize())?;
-        if sigmask.set.is_null() {
-            None
-        } else {
-            // As with ppoll, size validation must precede copying the actual
-            // mask so an invalid size takes precedence over EFAULT.
-            check_sigset_size(sigmask.sigsetsize)?;
-            Some(read_user_value(caller, sigmask.set.address().as_usize())?)
-        }
-    };
-
+    // Linux bounds a nonnegative nfds by the allocated file-table capacity.
+    // This profile's table owns AX_FILE_LIMIT slots; it cannot contain a
+    // descriptor above that bound, even if the caller supplies a larger n.
+    const _: () = assert!(crate::task::AX_FILE_LIMIT <= __FD_SETSIZE as usize);
+    let nfds = nfds.min(crate::task::AX_FILE_LIMIT as u32);
     let readfds_snapshot = snapshot_fd_set(caller, readfds, nfds)?;
     let writefds_snapshot = snapshot_fd_set(caller, writefds, nfds)?;
     let exceptfds_snapshot = snapshot_fd_set(caller, exceptfds, nfds)?;
@@ -157,7 +174,7 @@ fn do_select(
         let mut events = IoEvents::empty();
         events.set(IoEvents::READABLE, read_set.0.get(fd));
         events.set(IoEvents::WRITABLE, write_set.0.get(fd));
-        events.set(IoEvents::ERROR, except_set.0.get(fd));
+        events.set(IoEvents::PRIORITY, except_set.0.get(fd));
         if !events.is_empty() {
             fds.push(f, events);
             fd_indices.push(fd);
@@ -186,7 +203,7 @@ fn do_select(
                 res += 1;
                 ready_write.set(index, true);
             }
-            if events.contains(IoEvents::ERROR) && !exceptfds.is_null() {
+            if events.contains(IoEvents::PRIORITY) && !exceptfds.is_null() {
                 res += 1;
                 ready_except.set(index, true);
             }
@@ -218,13 +235,55 @@ fn do_select(
     };
     match result {
         Ok(result) => {
-            copy_fd_set(caller, readfds, ready_read)?;
-            copy_fd_set(caller, writefds, ready_write)?;
-            copy_fd_set(caller, exceptfds, ready_except)?;
+            copy_fd_set(caller, readfds, ready_read, nfds)?;
+            copy_fd_set(caller, writefds, ready_write, nfds)?;
+            copy_fd_set(caller, exceptfds, ready_except, nfds)?;
             Ok(result)
         }
         Err(error) => Err(error),
     }
+}
+
+fn select_timeval_duration(value: timeval) -> AxResult<Duration> {
+    if value.tv_sec < 0 || value.tv_usec < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    let seconds = value
+        .tv_sec
+        .checked_add(value.tv_usec / 1_000_000)
+        .ok_or(AxError::InvalidInput)?;
+    Ok(Duration::new(
+        seconds as u64,
+        (value.tv_usec % 1_000_000) as u32 * 1000,
+    ))
+}
+
+fn finish_timeout(
+    caller: &UserMemoryCapability,
+    address: usize,
+    timeout: Option<Duration>,
+    started: Duration,
+    microseconds: bool,
+) {
+    let Some(timeout) = timeout.filter(|duration| !duration.is_zero()) else {
+        return;
+    };
+    if axtask::current().as_thread().personality() & STICKY_TIMEOUTS != 0 {
+        return;
+    }
+    let elapsed = axhal::time::monotonic_time().saturating_sub(started);
+    let remaining = timeout.saturating_sub(elapsed);
+    // Both native x86_64 timeout structures contain exactly two signed longs.
+    // Linux deliberately ignores a read-only timeout's final copyout fault.
+    let value = [
+        remaining.as_secs() as i64,
+        if microseconds {
+            remaining.subsec_micros() as i64
+        } else {
+            remaining.subsec_nanos() as i64
+        },
+    ];
+    let _ = caller.write_value(address as *mut [i64; 2], value);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -236,23 +295,26 @@ pub fn sys_select(
     exceptfds: UserPtr<__kernel_fd_set>,
     timeout: UserConstPtr<timeval>,
 ) -> AxResult<isize> {
-    do_select(
+    let duration = if timeout.is_null() {
+        None
+    } else {
+        Some(select_timeval_duration(read_user_value(
+            &caller,
+            timeout.address().as_usize(),
+        )?)?)
+    };
+    let started = axhal::time::monotonic_time();
+    let result = do_select(
+        &caller, None, nfds, readfds, writefds, exceptfds, duration, None,
+    );
+    finish_timeout(
         &caller,
-        None,
-        nfds,
-        readfds,
-        writefds,
-        exceptfds,
-        if timeout.is_null() {
-            None
-        } else {
-            Some(
-                read_user_value::<timeval>(&caller, timeout.address().as_usize())?
-                    .try_into_time_value()?,
-            )
-        },
-        UserConstPtr::default(),
-    )
+        timeout.address().as_usize(),
+        duration,
+        started,
+        true,
+    );
+    result
 }
 
 #[repr(C)]
@@ -272,23 +334,50 @@ pub fn sys_pselect6(
     timeout: UserConstPtr<timespec>,
     sigmask: UserConstPtr<SignalSetWithSize>,
 ) -> AxResult<isize> {
-    do_select(
+    // The syscall wrapper copies the sigset argument header before the
+    // timeout; the actual mask is admitted after timeout validation.
+    let sigmask = if sigmask.is_null() {
+        None
+    } else {
+        Some(read_user_value::<SignalSetWithSize>(
+            &caller,
+            sigmask.address().as_usize(),
+        )?)
+    };
+    let duration = if timeout.is_null() {
+        None
+    } else {
+        Some(
+            read_user_value::<timespec>(&caller, timeout.address().as_usize())?
+                .try_into_time_value()?,
+        )
+    };
+    let started = axhal::time::monotonic_time();
+    let sigmask = match sigmask {
+        Some(mask) if !mask.set.is_null() => {
+            check_sigset_size(mask.sigsetsize)?;
+            Some(read_user_value(&caller, mask.set.address().as_usize())?)
+        }
+        _ => None,
+    };
+    let result = do_select(
         &caller,
         Some(uctx),
         nfds,
         readfds,
         writefds,
         exceptfds,
-        if timeout.is_null() {
-            None
-        } else {
-            Some(
-                read_user_value::<timespec>(&caller, timeout.address().as_usize())?
-                    .try_into_time_value()?,
-            )
-        },
+        duration,
         sigmask,
-    )
+    );
+    finish_timeout(
+        &caller,
+        timeout.address().as_usize(),
+        duration,
+        started,
+        false,
+    );
+    result
 }
 
 #[cfg(test)]
@@ -298,8 +387,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn select_error_and_hangup_are_not_priority_data() {
+        let interests = IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::PRIORITY;
+        assert_eq!(
+            select_ready_events(false, interests, || IoEvents::ERROR),
+            IoEvents::READABLE | IoEvents::WRITABLE
+        );
+        assert_eq!(
+            select_ready_events(false, interests, || IoEvents::HANGUP),
+            IoEvents::READABLE
+        );
+        assert_eq!(
+            select_ready_events(false, interests, || IoEvents::PRIORITY),
+            IoEvents::PRIORITY
+        );
+    }
+
+    #[test]
+    fn select_timeval_normalizes_positive_microseconds() {
+        assert_eq!(
+            select_timeval_duration(timeval {
+                tv_sec: 1,
+                tv_usec: 1_500_001
+            }),
+            Ok(Duration::new(2, 500_001_000))
+        );
+        assert_eq!(
+            select_timeval_duration(timeval {
+                tv_sec: -1,
+                tv_usec: 2_000_000
+            }),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            select_timeval_duration(timeval {
+                tv_sec: 0,
+                tv_usec: -1
+            }),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
     fn opath_select_keeps_all_requested_classes_ready() {
-        let interested = IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::ERROR;
+        let interested = IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::PRIORITY;
         let poll_calls = Cell::new(0);
         assert_eq!(
             select_ready_events(true, interested, || {
@@ -313,9 +444,9 @@ mod tests {
         assert_eq!(
             select_ready_events(false, interested, || {
                 poll_calls.set(poll_calls.get() + 1);
-                IoEvents::READABLE | IoEvents::ERROR
+                IoEvents::READABLE | IoEvents::PRIORITY
             }),
-            IoEvents::READABLE | IoEvents::ERROR
+            IoEvents::READABLE | IoEvents::PRIORITY
         );
         assert_eq!(poll_calls.get(), 1);
     }

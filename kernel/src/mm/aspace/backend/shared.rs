@@ -1599,9 +1599,9 @@ impl BackendOps for SharedBackend {
 
     fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult<BackendRetirement> {
         debug!("Shared::unmap: {range:?}");
-        // `drain_present_leaves` handles both original folio-sized leaves and
+        // `drain_mapped_leaves` handles both original folio-sized leaves and
         // the P1 children published by a prepared pkey demotion.
-        let _ = pt.drain_present_leaves(range.start, range.size())?;
+        let _ = pt.drain_mapped_leaves(range.start, range.size())?;
         Ok(BackendRetirement::empty())
     }
 
@@ -1755,6 +1755,8 @@ impl Backend {
 pub(crate) struct PreparedFixedSharedMapping {
     pages: Arc<SharedPages>,
     owner: Option<DeferredFileLease>,
+    mapping_lifetime: Option<Arc<dyn Any + Send + Sync>>,
+    excludes_fork_and_dump: bool,
     ofd_key: u64,
     object_offset: u64,
     page_offset: usize,
@@ -1766,7 +1768,7 @@ pub(crate) struct PreparedFixedSharedMapping {
 impl PreparedFixedSharedMapping {
     pub(crate) fn try_new(
         handle: FileHandle<dyn FileLike>,
-        plan: PreparedFileMmap,
+        mut plan: PreparedFileMmap,
     ) -> AxResult<Self> {
         let request = plan.request();
         let region_offset = plan.region_offset();
@@ -1800,6 +1802,8 @@ impl PreparedFixedSharedMapping {
         };
         let may_protect = mapping_flags(plan.may_protect());
         Ok(Self {
+            excludes_fork_and_dump: plan.excludes_fork_and_dump(),
+            mapping_lifetime: plan.take_mapping_lifetime(),
             pages: plan.into_pages(),
             owner,
             ofd_key,
@@ -1819,6 +1823,8 @@ impl PreparedFixedSharedMapping {
         let Self {
             pages,
             owner,
+            mapping_lifetime,
+            excludes_fork_and_dump,
             ofd_key,
             object_offset,
             page_offset,
@@ -1845,7 +1851,8 @@ impl PreparedFixedSharedMapping {
                 may_protect,
                 FileMappingSharing::Shared,
             ),
-        };
+        }.with_mapping_lifetime(mapping_lifetime)
+            .with_excluded_fork_and_dump(excludes_fork_and_dump);
         Backend::Shared(SharedBackend {
             start,
             page_offset,
@@ -1879,6 +1886,83 @@ fn access_flags() -> MappingFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_only_fixed_shared_mapping_faults_and_reprotects_without_losing_backing() {
+        use crate::mm::aspace::{PageFaultFailure, PageFaultResult};
+
+        let _context = crate::test_support::scheduler_test_context();
+        let start = VirtAddr::from(0x4000);
+        let pages = Arc::new(SharedPages::new_fixed(PAGE_SIZE_4K * 2, PageSize::Size4K).unwrap());
+        let backend = Backend::Shared(SharedBackend {
+            start,
+            page_offset: 0,
+            pages: pages.clone(),
+            may_protect: access_flags(),
+            map_id: SharedMapId::Fixed(FIXED_SHARED_MAPPING_ID.fetch_add(1, Ordering::Relaxed)),
+            status: MappingStatus::default(),
+        });
+        let write_only = MappingFlags::USER | MappingFlags::WRITE;
+        let mut mm = AddrSpace::new_empty(start, PAGE_SIZE_4K * 2).unwrap();
+        mm.map(start, PAGE_SIZE_4K * 2, write_only, false, backend)
+            .unwrap();
+        assert!(mm.page_table().query(start).is_err());
+
+        // A GEM/dumb-buffer mapping with PROT_WRITE must acquire an ordinary
+        // present writable PTE on the first pixel fault, never a PROT_NONE leaf.
+        assert_eq!(
+            mm.handle_page_fault_result(start, write_only, None),
+            PageFaultResult::Handled
+        );
+        let (physical, flags, _) = mm
+            .page_table()
+            .query(start)
+            .expect("first write installed a present leaf");
+        assert!(flags.contains(MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE));
+        assert_eq!(mm.find_area(start).unwrap().flags(), write_only);
+        mm.write(start, &[0x11, 0x22, 0x33, 0x44]).unwrap();
+        assert_eq!(
+            mm.handle_page_fault_result(start, write_only, None),
+            PageFaultResult::Handled
+        );
+        mm.write(start + 1, &[0x55]).unwrap();
+        let mut bytes = [0; 4];
+        pages.read_bytes(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x11, 0x55, 0x33, 0x44]);
+
+        mm.prepare_protect(start, PAGE_SIZE_4K, MappingFlags::USER)
+            .unwrap()
+            .commit()
+            .unwrap()
+            .finish();
+        assert!(mm.page_table().query(start).is_err());
+        assert_eq!(mm.page_table().query_mapped(start).unwrap().0, physical);
+        assert_eq!(
+            mm.handle_page_fault_result(start, write_only, None),
+            PageFaultResult::Failed(PageFaultFailure::AccessDenied)
+        );
+        mm.prepare_protect(start, PAGE_SIZE_4K, write_only)
+            .unwrap()
+            .commit()
+            .unwrap()
+            .finish();
+        assert_eq!(mm.page_table().query(start).unwrap().0, physical);
+        assert!(
+            mm.page_table()
+                .query(start)
+                .unwrap()
+                .1
+                .contains(MappingFlags::READ | MappingFlags::WRITE)
+        );
+        assert_eq!(mm.find_area(start).unwrap().flags(), write_only);
+        assert_eq!(
+            mm.handle_page_fault_result(start, write_only, None),
+            PageFaultResult::Handled
+        );
+        mm.write(start + 2, &[0x66]).unwrap();
+        pages.read_bytes(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x11, 0x55, 0x66, 0x44]);
+    }
 
     #[test]
     fn shmem_charge_is_in_base_page_equivalents_for_all_backing_sizes() {

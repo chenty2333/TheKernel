@@ -2057,6 +2057,10 @@ mod tests {
         }
     }
 
+    impl axio::IoBuf for FaultDst {
+        fn remaining(&self) -> usize { self.remaining }
+    }
+
     impl IoBufMut for FaultDst {
         fn remaining_mut(&self) -> usize {
             self.remaining
@@ -2121,6 +2125,7 @@ mod tests {
             link_header_len: 14,
             address_len: 6,
             ancillary: PacketAncillaryCapabilities::CANONICAL,
+            checksum: axnet::packet::PacketChecksumContext::UNKNOWN,
         }
     }
 

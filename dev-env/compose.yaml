@@ -3,6 +3,10 @@ name: thekernel-dev
 x-common-env: &common-env
   HOME: /home/thekernel
   PYTHONDONTWRITEBYTECODE: "1"
+  CARGO_BUILD_JOBS: "${CARGO_BUILD_JOBS:-2}"
+  CARGO_INCREMENTAL: "${CARGO_INCREMENTAL:-0}"
+  CARGO_TERM_COLOR: "${CARGO_TERM_COLOR:-auto}"
+  CI_DIFF_BASE: "${CI_DIFF_BASE:-}"
   LOCAL_UID: "${LOCAL_UID:-1000}"
   LOCAL_GID: "${LOCAL_GID:-1000}"
 
@@ -25,6 +29,9 @@ services:
       args:
         DEBIAN_MIRROR: "${THEKERNEL_DEBIAN_MIRROR:-http://deb.debian.org/debian}"
         DEBIAN_SECURITY_MIRROR: "${THEKERNEL_DEBIAN_SECURITY_MIRROR:-http://deb.debian.org/debian-security}"
+    userns_mode: "${THEKERNEL_USERNS_MODE:-}"
+    mem_limit: 8g
+    memswap_limit: 8g
     working_dir: /workspace
     stdin_open: true
     tty: true
@@ -40,6 +47,9 @@ services:
       args:
         DEBIAN_MIRROR: "${THEKERNEL_DEBIAN_MIRROR:-http://deb.debian.org/debian}"
         DEBIAN_SECURITY_MIRROR: "${THEKERNEL_DEBIAN_SECURITY_MIRROR:-http://deb.debian.org/debian-security}"
+    userns_mode: "${THEKERNEL_USERNS_MODE:-}"
+    mem_limit: 8g
+    memswap_limit: 8g
     working_dir: /workspace
     privileged: true
     stdin_open: true

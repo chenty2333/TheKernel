@@ -165,12 +165,11 @@ pub(crate) trait SeatHooks {
     fn abort(&mut self, target: SeatTarget);
 }
 
-/// A single-seat coordinator.  The mutex protects only the phase and ticket;
-/// no hook is ever invoked while it is held.
+/// A single-seat coordinator. The state mutex protects the phase and ticket;
+/// hooks run under the transaction mutex with the state mutex released.
 pub(crate) struct SeatLifecycle {
-    /// Serializes slow hook execution.  `abort_current` may still invalidate
-    /// its generation concurrently, but no two ordinary transitions can
-    /// overlap their device/ACL effects.
+    /// Serializes target snapshots with slow hook execution so a delayed
+    /// reconciliation cannot apply an obsolete VT owner after a newer one.
     transaction: Mutex<()>,
     state: Mutex<SeatState>,
 }
@@ -211,8 +210,15 @@ impl SeatLifecycle {
     /// Runs release followed by acquire.  Each phase is published before its
     /// callback, allowing owner exit, hot-unplug, and seatd restart to abort
     /// a stale generation without waiting on VT locks.
-    pub(crate) fn transition(&self, target: SeatTarget, hooks: &mut dyn SeatHooks) -> AxResult<()> {
+    pub(crate) fn transition(
+        &self,
+        snapshot_target: impl FnOnce() -> SeatTarget,
+        hooks: &mut dyn SeatHooks,
+    ) -> AxResult<()> {
         let _transaction = self.transaction.lock();
+        // Sample VT ownership only after joining the serialized transaction.
+        // The callback releases the VT spin lock before any device hook runs.
+        let target = snapshot_target();
         if self.active() == target {
             return Ok(());
         }
@@ -266,31 +272,6 @@ impl SeatLifecycle {
         Ok(())
     }
 
-    /// Makes every in-flight ticket stale and restores fbcon through the
-    /// supplied hook.  This is the owner-exit/compositor-crash/seatd-restart
-    /// path and is safe to call repeatedly.
-    pub(crate) fn abort_current(&self, hooks: &mut dyn SeatHooks) {
-        // Abort is a slow transaction too.  Serializing it with transition
-        // prevents a timeout/restart from interleaving fbcon restore with a
-        // still-running release/acquire phase.
-        let _transaction = self.transaction.lock();
-        let ticket = {
-            let mut state = self.state.lock();
-            state.generation = state.generation.wrapping_add(1);
-            state.phase = SeatPhase::PreparingAcquire;
-            SeatTicket {
-                generation: state.generation,
-                target: state.active,
-            }
-        };
-        hooks.abort(ticket.target);
-        let mut state = self.state.lock();
-        if state.generation == ticket.generation {
-            state.active = SeatTarget::Fbcon;
-            state.phase = SeatPhase::Fbcon;
-        }
-    }
-
     fn abort(&self, ticket: SeatTicket, hooks: &mut dyn SeatHooks) {
         if !self.current(ticket) {
             return;
@@ -301,5 +282,99 @@ impl SeatLifecycle {
             state.active = SeatTarget::Fbcon;
             state.phase = SeatPhase::Fbcon;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::sync::Arc;
+    use std::sync::mpsc;
+
+    use super::*;
+    use crate::drm::{
+        DisplayAdapter, DrmDevice, DrmError, DrmResult, DumbRequest, GemBacking, Scanout,
+    };
+
+    struct Adapter;
+    impl DisplayAdapter for Adapter {
+        fn create_dumb(&self, _: DumbRequest, _: u32, _: u64) -> DrmResult<Arc<dyn GemBacking>> {
+            Err(DrmError::Unsupported)
+        }
+        fn present(&self, _: Scanout) -> DrmResult<Arc<crate::drm::fence::Fence>> {
+            Err(DrmError::Unsupported)
+        }
+    }
+
+    struct Hooks(Arc<DrmDevice>);
+    impl SeatHooks for Hooks {
+        fn prepare_release(&mut self, _: SeatTarget) -> AxResult<()> {
+            self.0.suspend_kms_for_seat();
+            Ok(())
+        }
+        fn release(&mut self, _: SeatTarget) -> AxResult<()> {
+            Ok(())
+        }
+        fn prepare_acquire(&mut self, _: SeatTarget) -> AxResult<()> {
+            Ok(())
+        }
+        fn acquire(&mut self, _: SeatTarget) -> AxResult<()> {
+            self.0.resume_kms_for_seat();
+            Ok(())
+        }
+        fn abort(&mut self, _: SeatTarget) {
+            self.0.resume_kms_for_seat();
+        }
+    }
+
+    #[test]
+    fn delayed_reconciliation_preserves_new_graphics_device_lease() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let seat = Arc::new(SeatLifecycle::new());
+        let desired = Arc::new(spin::Mutex::new(SeatTarget::Fbcon));
+        let device = DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let delayed = {
+            let seat = seat.clone();
+            let desired = desired.clone();
+            let device = device.clone();
+            std::thread::spawn(move || {
+                // An unrelated exiting helper reaches reconciliation while
+                // the selected VT is still text, then loses its CPU turn.
+                assert_eq!(*desired.lock(), SeatTarget::Fbcon);
+                arrived_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                seat.transition(
+                    || {
+                        // This is the crucial ordering property: sampling
+                        // before transaction admission recreates the bug.
+                        assert!(seat.transaction.try_lock().is_none());
+                        *desired.lock()
+                    },
+                    &mut Hooks(device),
+                )
+                .unwrap();
+            })
+        };
+        arrived_rx.recv().unwrap();
+        let graphics = SeatTarget::Graphics(SeatOwner {
+            pid: Some(75),
+            uid: Some(100),
+            vt: 1,
+        });
+        *desired.lock() = graphics;
+        seat.transition(|| *desired.lock(), &mut Hooks(device.clone()))
+            .unwrap();
+        let compositor = device.open_primary();
+        compositor.become_master().unwrap();
+        // Resume only after the new session has acquired its actual DRM OFD.
+        // Host tests share one emulated task, so scheduler-facing operations
+        // stay ordered even though the delayed helper is a separate thread.
+        resume_tx.send(()).unwrap();
+        delayed.join().unwrap();
+        assert_eq!(seat.active(), graphics);
+        assert_eq!(compositor.become_master(), Ok(()));
     }
 }

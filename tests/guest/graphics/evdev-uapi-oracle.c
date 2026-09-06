@@ -44,6 +44,84 @@ static void bitset_hex(const unsigned char *bits, size_t count, char *out, size_
     out[used] = '\0';
 }
 
+static size_t bitmap_bytes(unsigned max_bit) {
+    const size_t word_bits = sizeof(unsigned long) * 8;
+    return ((max_bit + 1 + word_bits - 1) / word_bits) * sizeof(unsigned long);
+}
+
+static int all_zero(const unsigned char *bits, size_t size) {
+    for (size_t i = 0; i < size; ++i)
+        if (bits[i]) return 0;
+    return 1;
+}
+
+/* libevdev queries every capability class and key/LED/switch state even if
+ * EVIOCGBIT(0) does not advertise it. Probe every event device so a keyboard
+ * cannot hide a mouse/tablet initialization failure. */
+static void probe_initialization_bitmaps(void) {
+    static const struct { unsigned type, max; } classes[] = {
+        { EV_REL, REL_MAX }, { EV_ABS, ABS_MAX }, { EV_LED, LED_MAX },
+        { EV_KEY, KEY_MAX }, { EV_SW, SW_MAX }, { EV_MSC, MSC_MAX },
+        { EV_FF, FF_MAX }, { EV_SND, SND_MAX },
+    };
+    static const struct { unsigned type, max, nr; } states[] = {
+        { EV_KEY, KEY_MAX, 0x18 }, { EV_LED, LED_MAX, 0x19 },
+        { EV_SW, SW_MAX, 0x1b },
+    };
+    for (int index = 0; index < 32; ++index) {
+        char path[32];
+        snprintf(path, sizeof(path), "/dev/input/event%d", index);
+        int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (fd < 0) continue;
+        int before = failures;
+        unsigned char types[sizeof(unsigned long)] = {0};
+        if (ioctl(fd, EVIOCGBIT(0, sizeof(types)), types) != (int)sizeof(types)) {
+            result("evdev.init_types", "FAIL", errno);
+            close(fd);
+            continue;
+        }
+        unsigned char properties[sizeof(unsigned long)] = {0};
+        if (ioctl(fd, EVIOCGPROP(sizeof(properties)), properties) < 0)
+            result("evdev.init_properties", "FAIL", errno);
+        for (size_t i = 0; i < sizeof(classes) / sizeof(classes[0]); ++i) {
+            unsigned char bitmap[(KEY_MAX + 1 + 63) / 64 * 8];
+            memset(bitmap, 0xa5, sizeof(bitmap));
+            size_t size = bitmap_bytes(classes[i].max);
+            int count = ioctl(fd, EVIOCGBIT(classes[i].type, size), bitmap);
+            int supported = types[classes[i].type / 8] & (1u << (classes[i].type % 8));
+            if (count != (int)size || (!supported && !all_zero(bitmap, size))) {
+                printf("TK_GRAPHICS kind=evdev.init_bits state=FAIL device=%s type=%u bytes=%d supported=%d errno=%d\n",
+                       path, classes[i].type, count, !!supported, count < 0 ? errno : EPROTO);
+                failures++;
+                continue;
+            }
+            if (classes[i].type == EV_ABS) {
+                for (unsigned axis = 0; axis <= ABS_MAX; ++axis) {
+                    if (!(bitmap[axis / 8] & (1u << (axis % 8)))) continue;
+                    struct input_absinfo info;
+                    if (ioctl(fd, EVIOCGABS(axis), &info) < 0)
+                        result("evdev.init_abs", "FAIL", errno);
+                }
+            }
+        }
+        for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); ++i) {
+            unsigned char bitmap[(KEY_MAX + 1 + 63) / 64 * 8];
+            memset(bitmap, 0xa5, sizeof(bitmap));
+            size_t size = bitmap_bytes(states[i].max);
+            int rc = ioctl(fd, _IOC(_IOC_READ, 'E', states[i].nr, size), bitmap);
+            int supported = types[states[i].type / 8] & (1u << (states[i].type % 8));
+            if (rc < 0 || (!supported && !all_zero(bitmap, size))) {
+                printf("TK_GRAPHICS kind=evdev.init_state state=FAIL device=%s type=%u errno=%d\n",
+                       path, states[i].type, rc < 0 ? errno : EPROTO);
+                failures++;
+            }
+        }
+        printf("TK_GRAPHICS kind=evdev.init_bitmaps state=%s device=%s\n",
+               failures == before ? "OK" : "FAIL", path);
+        close(fd);
+    }
+}
+
 int main(void) {
     printf("TK_GRAPHICS kind=evdev.uapi state=OK input_event=%zu input_id=%zu input_absinfo=%zu version_ioctl=0x%lx id_ioctl=0x%lx bit_ioctl=0x%lx abs_ioctl=0x%lx clockid_ioctl=0x%lx grab_ioctl=0x%lx\n",
            sizeof(struct input_event), sizeof(struct input_id), sizeof(struct input_absinfo),
@@ -72,5 +150,6 @@ int main(void) {
     } else result("evdev.clockid", "FAIL", errno);
     if (ioctl(fd, EVIOCGRAB, &grab) == 0) { grab = 0; if (ioctl(fd, EVIOCGRAB, &grab) == 0) printf("TK_GRAPHICS kind=evdev.grab state=OK\n"); else result("evdev.grab_release", "FAIL", errno); } else result("evdev.grab", "FAIL", errno);
     close(fd);
+    probe_initialization_bitmaps();
     return failures == 0 ? 0 : 1;
 }

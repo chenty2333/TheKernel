@@ -1753,15 +1753,23 @@ pub fn statx_mount_id(mount_id: u64) -> Option<u32> {
 /// lock is released, so callers may inspect its filesystem without holding
 /// namespace state locked.
 pub fn mounted_root_location(device: DeviceId) -> AxResult<Location> {
-    let attached = snapshot()?
+    let mountpoint = snapshot()?
         .iter()
         .find_map(|record| {
             (record.dev == device.0)
                 .then(|| record.mountpoint.upgrade())
                 .flatten()
         })
+        .or_else(|| {
+            // Linux ustat resolves a live superblock by device number even
+            // when no attached mount in this namespace names it.
+            LIVE_SUPERBLOCK_MOUNTS.lock().values().find_map(|mount| {
+                let mount = mount.upgrade()?;
+                (linux_device_id(mount.device()) == device).then_some(mount)
+            })
+        })
         .ok_or(AxError::InvalidInput)?;
-    Ok(attached.root_location())
+    Ok(mountpoint.root_location())
 }
 
 fn register_live_superblock_mount(mountpoint: &Arc<Mountpoint>) -> VfsResult<()> {
@@ -3435,8 +3443,8 @@ fn move_tree_records(
             continue;
         }
 
-        if let Some(suffix) = path_suffix(old_target, &record.target) {
-            record.target = joined_path(new_target, suffix).unwrap();
+        if let Some(suffix) = path_suffix(FsPath::new(old_target.as_bytes()), &record.target) {
+            record.target = joined_path(FsPath::new(new_target.as_bytes()), suffix).unwrap();
             record.expire_epoch = None;
         }
         if record.mount_id == root_mount_id {
@@ -4061,6 +4069,7 @@ mod tests {
 
     #[test]
     fn remount_publication_adopts_flags_and_data_without_structural_reconciliation() {
+        let _context = crate::test_support::scheduler_test_context();
         let filesystem = MemoryFs::new().unwrap();
         let mountpoint = Mountpoint::new_root(&filesystem);
         let initial_metadata =
@@ -4086,7 +4095,7 @@ mod tests {
             mountpoint: Arc::downgrade(&mountpoint),
         };
         let topology =
-            MountTopology::try_new(1, vec![Mount::try_from_record(&record, None).unwrap()])
+            MountTopology::try_new(1, alloc::vec![Mount::try_from_record(&record, None).unwrap()])
                 .unwrap();
         let mut records = topology.try_records().unwrap();
         records[0].flags = MS_RDONLY | MS_NOEXEC;
@@ -4132,6 +4141,7 @@ mod tests {
 
     #[test]
     fn device_lookup_keeps_detached_live_superblocks_visible() {
+        let _context = crate::test_support::scheduler_test_context();
         let filesystem = MemoryFs::new().unwrap();
         let mountpoint = new_detached_with_flags(
             &filesystem,
@@ -4314,11 +4324,11 @@ mod tests {
         let lower = records.iter().find(|record| record.mount_id == 2).unwrap();
         let moved = records.iter().find(|record| record.mount_id == 3).unwrap();
         let nested = records.iter().find(|record| record.mount_id == 4).unwrap();
-        assert_eq!(lower.target, "/mnt");
+        assert_eq!(lower.target.as_bytes(), b"/mnt");
         assert_eq!(lower.parent_id, 1);
-        assert_eq!(moved.target, "/moved");
+        assert_eq!(moved.target.as_bytes(), b"/moved");
         assert_eq!(moved.parent_id, 1);
-        assert_eq!(nested.target, "/moved/nested");
+        assert_eq!(nested.target.as_bytes(), b"/moved/nested");
         assert_eq!(nested.parent_id, 3);
     }
 
@@ -4335,9 +4345,9 @@ mod tests {
         let namespace_root = records.iter().find(|record| record.mount_id == 1).unwrap();
         let moved = records.iter().find(|record| record.mount_id == 2).unwrap();
         let nested = records.iter().find(|record| record.mount_id == 3).unwrap();
-        assert_eq!(namespace_root.target, "/");
-        assert_eq!(moved.target, "/moved");
-        assert_eq!(nested.target, "/moved/nested");
+        assert_eq!(namespace_root.target.as_bytes(), b"/");
+        assert_eq!(moved.target.as_bytes(), b"/moved");
+        assert_eq!(nested.target.as_bytes(), b"/moved/nested");
     }
 
     #[test]
@@ -4352,7 +4362,7 @@ mod tests {
 
         let moved = records.iter().find(|record| record.mount_id == 2).unwrap();
         let nested = records.iter().find(|record| record.mount_id == 3).unwrap();
-        assert_eq!(moved.target, "/");
-        assert_eq!(nested.target, "/nested");
+        assert_eq!(moved.target.as_bytes(), b"/");
+        assert_eq!(nested.target.as_bytes(), b"/nested");
     }
 }

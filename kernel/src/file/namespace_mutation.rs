@@ -1287,7 +1287,7 @@ mod tests {
     fn create_file(parent: &Location, name: &str) -> Location {
         parent
             .create(
-                name,
+                axfs_ng_vfs::FsName::new(name.as_bytes()),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -1297,7 +1297,7 @@ mod tests {
     fn create_dir(parent: &Location, name: &str) -> Location {
         parent
             .create(
-                name,
+                axfs_ng_vfs::FsName::new(name.as_bytes()),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o777),
             )
@@ -1688,7 +1688,7 @@ mod tests {
                 create_named(
                     &operation,
                     &parent,
-                    "occupied",
+                    axfs_ng_vfs::FsName::new(b"occupied"),
                     NodeType::RegularFile,
                     NodePermission::from_bits_truncate(0o666),
                     0o022,
@@ -1703,7 +1703,7 @@ mod tests {
             assert_metadata_preserved(&existing_before, &existing);
             assert!(
                 parent
-                    .lookup_no_follow_in_mount("occupied")
+                    .lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"occupied"))
                     .unwrap()
                     .same_node(&existing)
             );
@@ -1719,7 +1719,7 @@ mod tests {
                 None,
             );
             assert!(matches!(
-                create_symlink(&operation, &parent, "occupied", "target", &symlink_security,),
+                create_symlink(&operation, &parent, axfs_ng_vfs::FsName::new(b"occupied"), axfs_ng_vfs::FsPath::new(b"target"), &symlink_security,),
                 Err(AxError::AlreadyExists)
             ));
             assert_eq!(
@@ -1740,13 +1740,13 @@ mod tests {
             assert!(covered.is_mountpoint());
             assert!(
                 parent
-                    .lookup_no_follow_in_mount("covered")
+                    .lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"covered"))
                     .unwrap()
                     .same_node(&covered)
             );
             assert!(
                 parent
-                    .lookup_no_follow("covered")
+                    .lookup_no_follow(axfs_ng_vfs::FsName::new(b"covered"))
                     .unwrap()
                     .same_node(&child_mount.root_location())
             );
@@ -1766,7 +1766,7 @@ mod tests {
                 create_named(
                     &operation,
                     &parent,
-                    "covered",
+                    axfs_ng_vfs::FsName::new(b"covered"),
                     NodeType::RegularFile,
                     NodePermission::from_bits_truncate(0o666),
                     0o022,
@@ -1781,7 +1781,7 @@ mod tests {
             assert_metadata_preserved(&covered_before, &covered);
             assert!(
                 parent
-                    .lookup_no_follow_in_mount("covered")
+                    .lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"covered"))
                     .unwrap()
                     .same_node(&covered)
             );
@@ -1797,7 +1797,7 @@ mod tests {
                 None,
             );
             assert!(matches!(
-                create_symlink(&operation, &parent, "covered", "target", &symlink_security,),
+                create_symlink(&operation, &parent, axfs_ng_vfs::FsName::new(b"covered"), axfs_ng_vfs::FsPath::new(b"target"), &symlink_security,),
                 Err(AxError::AlreadyExists)
             ));
             assert_eq!(
@@ -1890,7 +1890,7 @@ mod tests {
             let created = create_named(
                 &operation,
                 &parent,
-                name,
+                axfs_ng_vfs::FsName::new(name.as_bytes()),
                 node_type,
                 NodePermission::from_bits_truncate(requested_mode),
                 umask,
@@ -1903,7 +1903,7 @@ mod tests {
             assert_ne!(parent.namespace_generation().unwrap(), generation);
             assert!(
                 parent
-                    .lookup_no_follow_in_mount(name)
+                    .lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(name.as_bytes()))
                     .unwrap()
                     .same_node(&created)
             );
@@ -1925,13 +1925,14 @@ mod tests {
             None,
         );
         let operation = crate::mounts::namespace_operation();
-        let created = create_symlink(&operation, &parent, "symlink", target, &security).unwrap();
+        let created = create_symlink(&operation, &parent, axfs_ng_vfs::FsName::new(b"symlink"), FsPath::new(target.as_bytes()), &security).unwrap();
         assert_eq!((probe.permission_calls(), probe.leaf_calls()), (1, 1));
-        assert_eq!(created.read_link().unwrap(), target);
+        assert_eq!(created.read_link().unwrap().as_bytes(), target.as_bytes());
     }
 
     #[test]
     fn named_create_security_denials_leave_name_generation_and_metadata_unchanged() {
+        let _context = crate::test_support::scheduler_test_context();
         for (deny_permission, deny_leaf, expected_calls) in
             [(true, false, (1, 0)), (false, true, (1, 1))]
         {
@@ -1958,7 +1959,7 @@ mod tests {
                 create_named(
                     &operation,
                     &parent,
-                    name,
+                    axfs_ng_vfs::FsName::new(name.as_bytes()),
                     NodeType::RegularFile,
                     NodePermission::from_bits_truncate(0o2660),
                     0o027,
@@ -1974,7 +1975,7 @@ mod tests {
             assert_eq!(parent.namespace_generation().unwrap(), generation);
             assert_metadata_preserved(&parent_before, &parent);
             assert!(matches!(
-                parent.lookup_no_follow_in_mount(name),
+                parent.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(name.as_bytes())),
                 Err(AxError::NotFound)
             ));
         }
@@ -1982,6 +1983,7 @@ mod tests {
 
     #[test]
     fn no_cap_mknod_observes_exact_mount_and_dac_precedence_before_leaf_dispatch() {
+        let _context = crate::test_support::scheduler_test_context();
         let rdev = Some(DeviceId(0x1234));
         let requested_mode = NodePermission::from_bits_truncate(0o660);
 
@@ -2005,7 +2007,7 @@ mod tests {
                 create_named(
                     &operation,
                     &parent,
-                    "existing-device",
+                    axfs_ng_vfs::FsName::new(b"existing-device"),
                     NodeType::CharacterDevice,
                     requested_mode,
                     0o027,
@@ -2040,7 +2042,7 @@ mod tests {
                 create_named(
                     &operation,
                     &parent,
-                    "readonly-device",
+                    axfs_ng_vfs::FsName::new(b"readonly-device"),
                     NodeType::CharacterDevice,
                     requested_mode,
                     0o027,
@@ -2072,7 +2074,7 @@ mod tests {
                 create_named(
                     &operation,
                     &parent,
-                    "dac-denied-device",
+                    axfs_ng_vfs::FsName::new(b"dac-denied-device"),
                     NodeType::CharacterDevice,
                     requested_mode,
                     0o027,
@@ -2103,7 +2105,7 @@ mod tests {
                 create_named(
                     &operation,
                     &parent,
-                    "cap-denied-device",
+                    axfs_ng_vfs::FsName::new(b"cap-denied-device"),
                     NodeType::CharacterDevice,
                     requested_mode,
                     0o027,
@@ -2160,7 +2162,7 @@ mod tests {
                 create_named(
                     &operation,
                     &parent,
-                    name,
+                    axfs_ng_vfs::FsName::new(name.as_bytes()),
                     node_type,
                     NodePermission::from_bits_truncate(mode),
                     0,
@@ -2174,7 +2176,7 @@ mod tests {
             assert_eq!(parent.namespace_generation().unwrap(), generation);
             assert_metadata_preserved(&parent_before, &parent);
             assert!(matches!(
-                parent.lookup_no_follow_in_mount(name),
+                parent.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(name.as_bytes())),
                 Err(AxError::NotFound)
             ));
         }
@@ -2194,14 +2196,14 @@ mod tests {
         );
         let operation = crate::mounts::namespace_operation();
         assert!(matches!(
-            create_symlink(&operation, &parent, "symlink", "target", &security),
+            create_symlink(&operation, &parent, axfs_ng_vfs::FsName::new(b"symlink"), axfs_ng_vfs::FsPath::new(b"target"), &security),
             Err(AxError::OperationNotPermitted)
         ));
         assert_eq!((probe.permission_calls(), probe.leaf_calls()), (1, 0));
         assert_eq!(parent.namespace_generation().unwrap(), generation);
         assert_metadata_preserved(&parent_before, &parent);
         assert!(matches!(
-            parent.lookup_no_follow_in_mount("symlink"),
+            parent.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"symlink")),
             Err(AxError::NotFound)
         ));
     }
@@ -2225,7 +2227,7 @@ mod tests {
             let operation = crate::mounts::namespace_operation();
 
             assert!(matches!(
-                reject_unnameable_link_source(&operation, &parent, "existing-link", &security,),
+                reject_unnameable_link_source(&operation, &parent, axfs_ng_vfs::FsName::new(b"existing-link"), &security,),
                 Err(AxError::AlreadyExists)
             ));
             assert_eq!((probe.permission_calls(), probe.leaf_calls()), (0, 0));
@@ -2234,7 +2236,7 @@ mod tests {
             assert_metadata_preserved(&existing_before, &existing);
             assert!(
                 parent
-                    .lookup_no_follow_in_mount("existing-link")
+                    .lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"existing-link"))
                     .unwrap()
                     .same_node(&existing)
             );
@@ -2259,14 +2261,14 @@ mod tests {
             let operation = crate::mounts::namespace_operation();
 
             assert!(matches!(
-                reject_unnameable_link_source(&operation, &parent, "readonly-link", &security,),
+                reject_unnameable_link_source(&operation, &parent, axfs_ng_vfs::FsName::new(b"readonly-link"), &security,),
                 Err(AxError::ReadOnlyFilesystem)
             ));
             assert_eq!((probe.permission_calls(), probe.leaf_calls()), (0, 0));
             assert_eq!(parent.namespace_generation().unwrap(), generation);
             assert_metadata_preserved(&parent_before, &parent);
             assert!(matches!(
-                parent.lookup_no_follow_in_mount("readonly-link"),
+                parent.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"readonly-link")),
                 Err(AxError::NotFound)
             ));
         }
@@ -2286,14 +2288,14 @@ mod tests {
             let operation = crate::mounts::namespace_operation();
 
             let error =
-                reject_unnameable_link_source(&operation, &parent, "cross-device-link", &security)
+                reject_unnameable_link_source(&operation, &parent, axfs_ng_vfs::FsName::new(b"cross-device-link"), &security)
                     .unwrap_err();
             assert_eq!(error.canonicalize(), AxError::CrossesDevices);
             assert_eq!((probe.permission_calls(), probe.leaf_calls()), (0, 0));
             assert_eq!(parent.namespace_generation().unwrap(), generation);
             assert_metadata_preserved(&parent_before, &parent);
             assert!(matches!(
-                parent.lookup_no_follow_in_mount("cross-device-link"),
+                parent.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"cross-device-link")),
                 Err(AxError::NotFound)
             ));
         }
@@ -2443,7 +2445,7 @@ mod tests {
             let generation = parent.namespace_generation().unwrap();
             let operation = crate::mounts::namespace_operation();
 
-            let link = create_symlink(&operation, &parent, name, target, &security).unwrap();
+            let link = create_symlink(&operation, &parent, FsName::new(name.as_bytes()), FsPath::new(target.as_bytes()), &security).unwrap();
             let metadata = link.metadata().unwrap();
             assert_eq!(metadata.node_type, NodeType::Symlink);
             assert_eq!(metadata.mode.bits() & 0o7777, 0o777);
@@ -2451,9 +2453,9 @@ mod tests {
                 (metadata.uid, metadata.gid),
                 (fsuid.into_raw(), expected_gid)
             );
-            assert_eq!(link.read_link().unwrap(), target);
+            assert_eq!(link.read_link().unwrap().as_bytes(), target.as_bytes());
             assert_ne!(parent.namespace_generation().unwrap(), generation);
-            assert!(parent.lookup_no_follow(name).unwrap().same_node(&link));
+            assert!(parent.lookup_no_follow(FsName::new(name.as_bytes())).unwrap().same_node(&link));
         }
     }
 
@@ -2467,26 +2469,26 @@ mod tests {
         let _context = crate::test_support::scheduler_test_context();
         let root = memory_root();
         let victim = create_file(&root, "victim");
-        let alias = root.link("alias", &victim).unwrap();
+        let alias = root.link(axfs_ng_vfs::FsName::new(b"alias"), &victim).unwrap();
         assert_eq!(victim.metadata().unwrap().nlink, 2);
         let security = root_security();
         let operation = crate::mounts::namespace_operation();
 
-        let first = unlink(&operation, &root, "victim", &victim, false, &security).unwrap();
+        let first = unlink(&operation, &root, axfs_ng_vfs::FsName::new(b"victim"), &victim, false, &security).unwrap();
         assert!(!first.is_dir);
         assert!(!first.loses_last_link);
         assert!(matches!(
-            root.lookup_no_follow("victim"),
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"victim")),
             Err(AxError::NotFound)
         ));
-        assert!(root.lookup_no_follow("alias").unwrap().same_node(&alias));
+        assert!(root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"alias")).unwrap().same_node(&alias));
         assert_eq!(alias.metadata().unwrap().nlink, 1);
 
-        let last = unlink(&operation, &root, "alias", &alias, false, &security).unwrap();
+        let last = unlink(&operation, &root, axfs_ng_vfs::FsName::new(b"alias"), &alias, false, &security).unwrap();
         assert!(!last.is_dir);
         assert!(last.loses_last_link);
         assert!(matches!(
-            root.lookup_no_follow("alias"),
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"alias")),
             Err(AxError::NotFound)
         ));
         assert_eq!(alias.metadata().unwrap().nlink, 0);
@@ -2502,15 +2504,15 @@ mod tests {
         let operation = crate::mounts::namespace_operation();
 
         assert!(matches!(
-            unlink(&operation, &root, "directory", &directory, true, &security,),
+            unlink(&operation, &root, axfs_ng_vfs::FsName::new(b"directory"), &directory, true, &security,),
             Err(AxError::DirectoryNotEmpty)
         ));
         assert!(
-            root.lookup_no_follow("directory")
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"directory"))
                 .unwrap()
                 .same_node(&directory)
         );
-        assert!(directory.lookup_no_follow("child").is_ok());
+        assert!(directory.lookup_no_follow(axfs_ng_vfs::FsName::new(b"child")).is_ok());
     }
 
     #[test]
@@ -2525,19 +2527,19 @@ mod tests {
         let operation = crate::mounts::namespace_operation();
 
         assert!(matches!(
-            unlink(&operation, &root, "file", &file, true, &security),
+            unlink(&operation, &root, axfs_ng_vfs::FsName::new(b"file"), &file, true, &security),
             Err(AxError::NotADirectory)
         ));
         assert!(matches!(
-            unlink(&operation, &root, "directory", &directory, false, &security,),
+            unlink(&operation, &root, axfs_ng_vfs::FsName::new(b"directory"), &directory, false, &security,),
             Err(AxError::IsADirectory)
         ));
         assert_eq!(root.namespace_generation().unwrap(), generation);
         assert_eq!(file.metadata().unwrap().nlink, file_nlink);
         assert_eq!(directory.metadata().unwrap().nlink, directory_nlink);
-        assert!(root.lookup_no_follow("file").unwrap().same_node(&file));
+        assert!(root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"file")).unwrap().same_node(&file));
         assert!(
-            root.lookup_no_follow("directory")
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"directory"))
                 .unwrap()
                 .same_node(&directory)
         );
@@ -2547,20 +2549,20 @@ mod tests {
     fn unrelated_generation_drift_revalidates_the_exact_expected_identity() {
         let root = memory_root();
         let victim = create_file(&root, "victim");
-        let prepared = PreparedName::reserve(&root, "victim", Some(&victim)).unwrap();
+        let prepared = PreparedName::reserve(&root, axfs_ng_vfs::FsName::new(b"victim"), Some(&victim)).unwrap();
 
         create_file(&root, "unrelated");
 
         let result = prepared.revalidate();
         assert!(result.is_ok(), "revalidation failed: {result:?}");
-        assert!(root.lookup_no_follow("victim").unwrap().same_node(&victim));
+        assert!(root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"victim")).unwrap().same_node(&victim));
     }
 
     #[test]
     fn replacement_snapshot_is_rejected_without_touching_the_new_object() {
         let root = memory_root();
         let old = create_file(&root, "slot");
-        let prepared = PreparedName::reserve(&root, "slot", Some(&old)).unwrap();
+        let prepared = PreparedName::reserve(&root, axfs_ng_vfs::FsName::new(b"slot"), Some(&old)).unwrap();
         let replacement = create_file(&root, "replacement");
 
         assert!(matches!(
@@ -2568,11 +2570,11 @@ mod tests {
             Err(AxError::NotFound)
         ));
         assert!(
-            root.lookup_no_follow("replacement")
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"replacement"))
                 .unwrap()
                 .same_node(&replacement)
         );
-        assert!(root.lookup_no_follow("slot").unwrap().same_node(&old));
+        assert!(root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"slot")).unwrap().same_node(&old));
     }
 
     #[test]
@@ -2585,10 +2587,10 @@ mod tests {
         let destination = create_file(&new_parent, "destination");
         let mut prepared = RenameRequest {
             old_parent: &old_parent,
-            old_name: "source",
+            old_name: axfs_ng_vfs::FsName::new(b"source"),
             source: &source,
             new_parent: &new_parent,
-            new_name: "destination",
+            new_name: axfs_ng_vfs::FsName::new(b"destination"),
             replaced: Some(&destination),
             no_replace: false,
             mode: RenameMode::Ordinary,
@@ -2602,13 +2604,13 @@ mod tests {
         RenameRequest::revalidate(&prepared).unwrap();
         assert!(
             old_parent
-                .lookup_no_follow("source")
+                .lookup_no_follow(axfs_ng_vfs::FsName::new(b"source"))
                 .unwrap()
                 .same_node(&source)
         );
         assert!(
             new_parent
-                .lookup_no_follow("destination")
+                .lookup_no_follow(axfs_ng_vfs::FsName::new(b"destination"))
                 .unwrap()
                 .same_node(&destination)
         );
@@ -2622,7 +2624,7 @@ mod tests {
         ));
         assert!(
             new_parent
-                .lookup_no_follow("replacement")
+                .lookup_no_follow(axfs_ng_vfs::FsName::new(b"replacement"))
                 .unwrap()
                 .same_node(&replacement)
         );
@@ -2630,6 +2632,7 @@ mod tests {
 
     #[test]
     fn rename_denial_is_once_short_circuits_and_preserves_absent_destination_transaction() {
+        let _context = crate::test_support::scheduler_test_context();
         let root = memory_root();
         let old_parent = create_dir(&root, "old-parent");
         let new_parent = create_dir(&root, "new-parent");
@@ -2667,10 +2670,10 @@ mod tests {
             rename(
                 &operation,
                 &old_parent,
-                "old-name",
+                axfs_ng_vfs::FsName::new(b"old-name"),
                 &source,
                 &new_parent,
-                "new-name",
+                axfs_ng_vfs::FsName::new(b"new-name"),
                 None,
                 false,
                 &security,
@@ -2686,18 +2689,19 @@ mod tests {
         assert_metadata_preserved(&source_before, &source);
         assert!(
             old_parent
-                .lookup_no_follow_in_mount("old-name")
+                .lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"old-name"))
                 .unwrap()
                 .same_node(&source)
         );
         assert!(matches!(
-            new_parent.lookup_no_follow_in_mount("new-name"),
+            new_parent.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"new-name")),
             Err(AxError::NotFound)
         ));
     }
 
     #[test]
     fn rename_existing_destination_context_binds_victim_and_denial_preserves_every_snapshot() {
+        let _context = crate::test_support::scheduler_test_context();
         let root = memory_root();
         let old_parent = create_dir(&root, "existing-old-parent");
         let new_parent = create_dir(&root, "existing-new-parent");
@@ -2736,10 +2740,10 @@ mod tests {
             rename(
                 &operation,
                 &old_parent,
-                "source-entry",
+                axfs_ng_vfs::FsName::new(b"source-entry"),
                 &source,
                 &new_parent,
-                "victim-entry",
+                axfs_ng_vfs::FsName::new(b"victim-entry"),
                 Some(&victim),
                 false,
                 &security,
@@ -2755,13 +2759,13 @@ mod tests {
         assert_metadata_preserved(&victim_before, &victim);
         assert!(
             old_parent
-                .lookup_no_follow_in_mount("source-entry")
+                .lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"source-entry"))
                 .unwrap()
                 .same_node(&source)
         );
         assert!(
             new_parent
-                .lookup_no_follow_in_mount("victim-entry")
+                .lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"victim-entry"))
                 .unwrap()
                 .same_node(&victim)
         );
@@ -2769,6 +2773,7 @@ mod tests {
 
     #[test]
     fn rename_unsupported_backend_fails_before_inode_hook() {
+        let _context = crate::test_support::scheduler_test_context();
         let filesystem = crate::pseudofs::cgroup::new_cgroup_v2().unwrap();
         let mount = Mountpoint::new_root(&filesystem);
         crate::mounts::initialize_test_mount(&mount, 0).unwrap();
@@ -2795,10 +2800,10 @@ mod tests {
             rename(
                 &operation,
                 &parent,
-                "unsupported-source",
+                axfs_ng_vfs::FsName::new(b"unsupported-source"),
                 &source,
                 &parent,
-                "unsupported-target",
+                axfs_ng_vfs::FsName::new(b"unsupported-target"),
                 None,
                 false,
                 &security,
@@ -2811,18 +2816,19 @@ mod tests {
         assert_metadata_preserved(&source_before, &source);
         assert!(
             parent
-                .lookup_no_follow_in_mount("unsupported-source")
+                .lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"unsupported-source"))
                 .unwrap()
                 .same_node(&source)
         );
         assert!(matches!(
-            parent.lookup_no_follow_in_mount("unsupported-target"),
+            parent.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"unsupported-target")),
             Err(AxError::NotFound)
         ));
     }
 
     #[test]
     fn rename_type_mismatch_runs_destination_dac_and_sticky_admission_before_type_error() {
+        let _context = crate::test_support::scheduler_test_context();
         for (case, new_parent_mode, new_parent_owner, victim_owner, expected) in [
             (
                 "dac",
@@ -2881,10 +2887,10 @@ mod tests {
                 rename(
                     &operation,
                     &old_parent,
-                    "type-source",
+                    axfs_ng_vfs::FsName::new(b"type-source"),
                     &source,
                     &new_parent,
-                    "type-victim",
+                    axfs_ng_vfs::FsName::new(b"type-victim"),
                     Some(&victim),
                     false,
                     &security,
@@ -2901,6 +2907,7 @@ mod tests {
 
     #[test]
     fn cross_parent_directory_source_write_denial_precedes_inode_rename_hook() {
+        let _context = crate::test_support::scheduler_test_context();
         let root = memory_root();
         let old_parent = create_dir(&root, "move-old-parent");
         let new_parent = create_dir(&root, "move-new-parent");
@@ -2928,10 +2935,10 @@ mod tests {
             rename(
                 &operation,
                 &old_parent,
-                "moved-directory",
+                axfs_ng_vfs::FsName::new(b"moved-directory"),
                 &source,
                 &new_parent,
-                "moved-target",
+                axfs_ng_vfs::FsName::new(b"moved-target"),
                 None,
                 false,
                 &security,
@@ -2944,18 +2951,19 @@ mod tests {
         assert_metadata_preserved(&source_before, &source);
         assert!(
             old_parent
-                .lookup_no_follow_in_mount("moved-directory")
+                .lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"moved-directory"))
                 .unwrap()
                 .same_node(&source)
         );
         assert!(matches!(
-            new_parent.lookup_no_follow_in_mount("moved-target"),
+            new_parent.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"moved-target")),
             Err(AxError::NotFound)
         ));
     }
 
     #[test]
     fn rename_mountpoint_allow_reaches_hook_then_busy_and_denial_overrides_busy_on_covered_inode() {
+        let _context = crate::test_support::scheduler_test_context();
         let root = memory_root();
         let source = create_dir(&root, "mount-source");
         let covered = create_dir(&root, "mount-target");
@@ -2964,12 +2972,12 @@ mod tests {
         let child_mount = covered.mount(&child_filesystem).unwrap();
         assert!(covered.is_mountpoint());
         assert!(
-            root.lookup_no_follow("mount-target")
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"mount-target"))
                 .unwrap()
                 .is_root_of_mount()
         );
         assert!(
-            root.lookup_no_follow_in_mount("mount-target")
+            root.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"mount-target"))
                 .unwrap()
                 .same_node(&covered)
         );
@@ -2993,10 +3001,10 @@ mod tests {
             rename(
                 &operation,
                 &root,
-                "mount-source",
+                axfs_ng_vfs::FsName::new(b"mount-source"),
                 &source,
                 &root,
-                "mount-target",
+                axfs_ng_vfs::FsName::new(b"mount-target"),
                 Some(&covered),
                 false,
                 &allow_security,
@@ -3021,10 +3029,10 @@ mod tests {
             rename(
                 &operation,
                 &root,
-                "mount-source",
+                axfs_ng_vfs::FsName::new(b"mount-source"),
                 &source,
                 &root,
-                "mount-target",
+                axfs_ng_vfs::FsName::new(b"mount-target"),
                 Some(&covered),
                 false,
                 &deny_security,
@@ -3041,23 +3049,24 @@ mod tests {
         assert_metadata_preserved(&source_before, &source);
         assert_metadata_preserved(&covered_before, &covered);
         assert!(
-            root.lookup_no_follow_in_mount("mount-source")
+            root.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"mount-source"))
                 .unwrap()
                 .same_node(&source)
         );
         assert!(
-            root.lookup_no_follow_in_mount("mount-target")
+            root.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"mount-target"))
                 .unwrap()
                 .same_node(&covered)
         );
         assert!(Arc::ptr_eq(
-            root.lookup_no_follow("mount-target").unwrap().mountpoint(),
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"mount-target")).unwrap().mountpoint(),
             &child_mount
         ));
     }
 
     #[test]
     fn rename_nonempty_destination_allow_reaches_hook_then_notempty_and_denial_overrides_it() {
+        let _context = crate::test_support::scheduler_test_context();
         let root = memory_root();
         let source = create_dir(&root, "nonempty-source");
         let victim = create_dir(&root, "nonempty-target");
@@ -3083,10 +3092,10 @@ mod tests {
             rename(
                 &operation,
                 &root,
-                "nonempty-source",
+                axfs_ng_vfs::FsName::new(b"nonempty-source"),
                 &source,
                 &root,
-                "nonempty-target",
+                axfs_ng_vfs::FsName::new(b"nonempty-target"),
                 Some(&victim),
                 false,
                 &allow_security,
@@ -3111,10 +3120,10 @@ mod tests {
             rename(
                 &operation,
                 &root,
-                "nonempty-source",
+                axfs_ng_vfs::FsName::new(b"nonempty-source"),
                 &source,
                 &root,
-                "nonempty-target",
+                axfs_ng_vfs::FsName::new(b"nonempty-target"),
                 Some(&victim),
                 false,
                 &deny_security,
@@ -3132,7 +3141,7 @@ mod tests {
         assert_metadata_preserved(&child_before, &child);
         assert!(
             victim
-                .lookup_no_follow_in_mount("child")
+                .lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"child"))
                 .unwrap()
                 .same_node(&child)
         );
@@ -3142,7 +3151,7 @@ mod tests {
     fn rename_same_inode_is_a_zero_effect_noop_before_hooks_or_backend_publication() {
         let root = memory_root();
         let source = create_file(&root, "same-source");
-        let alias = root.link("same-alias", &source).unwrap();
+        let alias = root.link(axfs_ng_vfs::FsName::new(b"same-alias"), &source).unwrap();
         assert_eq!(source.metadata().unwrap().nlink, 2);
         let (security, probe, _) = rename_probe_security(
             &root,
@@ -3164,10 +3173,10 @@ mod tests {
         let outcome = rename(
             &operation,
             &root,
-            "same-source",
+            axfs_ng_vfs::FsName::new(b"same-source"),
             &source,
             &root,
-            "same-alias",
+            axfs_ng_vfs::FsName::new(b"same-alias"),
             Some(&alias),
             false,
             &security,
@@ -3181,12 +3190,12 @@ mod tests {
         assert_metadata_preserved(&source_before, &source);
         assert_metadata_preserved(&alias_before, &alias);
         assert!(
-            root.lookup_no_follow_in_mount("same-source")
+            root.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"same-source"))
                 .unwrap()
                 .same_node(&source)
         );
         assert!(
-            root.lookup_no_follow_in_mount("same-alias")
+            root.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"same-alias"))
                 .unwrap()
                 .same_node(&alias)
         );
@@ -3197,6 +3206,7 @@ mod tests {
 
     #[test]
     fn malformed_rename_module_state_fails_before_callback_and_preserves_transaction() {
+        let _context = crate::test_support::scheduler_test_context();
         let root = memory_root();
         let old_parent = create_dir(&root, "malformed-old-parent");
         let new_parent = create_dir(&root, "malformed-new-parent");
@@ -3225,10 +3235,10 @@ mod tests {
             rename(
                 &operation,
                 &old_parent,
-                "malformed-source",
+                axfs_ng_vfs::FsName::new(b"malformed-source"),
                 &source,
                 &new_parent,
-                "malformed-target",
+                axfs_ng_vfs::FsName::new(b"malformed-target"),
                 None,
                 false,
                 &security,
@@ -3243,12 +3253,12 @@ mod tests {
         assert_metadata_preserved(&source_before, &source);
         assert!(
             old_parent
-                .lookup_no_follow_in_mount("malformed-source")
+                .lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"malformed-source"))
                 .unwrap()
                 .same_node(&source)
         );
         assert!(matches!(
-            new_parent.lookup_no_follow_in_mount("malformed-target"),
+            new_parent.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"malformed-target")),
             Err(AxError::NotFound)
         ));
     }
@@ -3291,7 +3301,7 @@ mod tests {
         let _: fn(
             &NamespaceOperationGuard,
             &Location,
-            &str,
+            &FsName,
             NodeType,
             NodePermission,
             u32,
@@ -3301,21 +3311,21 @@ mod tests {
         let _: fn(
             &NamespaceOperationGuard,
             &Location,
-            &str,
-            &str,
+            &FsName,
+            &FsPath,
             &VfsSecurityContext,
         ) -> AxResult<Location> = create_symlink;
         let _: fn(
             &NamespaceOperationGuard,
             &Location,
-            &str,
+            &FsName,
             &Location,
             &VfsSecurityContext,
         ) -> AxResult<Location> = link;
         let _: fn(
             &NamespaceOperationGuard,
             &Location,
-            &str,
+            &FsName,
             &Location,
             bool,
             &VfsSecurityContext,
@@ -3323,10 +3333,10 @@ mod tests {
         let _: fn(
             &NamespaceOperationGuard,
             &Location,
-            &str,
+            &FsName,
             &Location,
             &Location,
-            &str,
+            &FsName,
             Option<&Location>,
             bool,
             &VfsSecurityContext,

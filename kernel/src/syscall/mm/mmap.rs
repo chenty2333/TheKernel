@@ -8,7 +8,7 @@ use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::*;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
-use thekernel_linux_arch_x86_64::{ArchPolicyError, PkeyPlan};
+use thekernel_linux_arch_x86_64::{ArchPolicyError, PKEY_RIGHTS_MASK, PkeyPlan};
 
 use crate::{
     file::{
@@ -1725,7 +1725,10 @@ fn sys_mprotect_inner(
         {
             let pkey = axhal::paging::Pkey::new(key).expect("validated pkey");
             let mut pt = aspace.page_table_mut().cursor();
-            for (vaddr, ..) in leaves {
+            for (vaddr, _, _, page_size) in leaves {
+                if vaddr < start_addr || vaddr + page_size as usize > end_addr {
+                    continue;
+                }
                 pt.set_pkey(vaddr, pkey)
                     .expect("preflighted pkey leaf must remain mapped");
             }
@@ -1861,14 +1864,18 @@ pub fn sys_pkey_mprotect(addr: usize, length: usize, prot: usize, pkey: i32) -> 
             aspace.consume_madvise_free_write_range(start, length);
         }
         let mut pt = aspace.page_table_mut().cursor();
-        for &(vaddr, ..) in &leaves {
+        for &(vaddr, _, _, page_size) in &leaves {
+            // Partial leaves were demoted and keyed only within the request.
+            if vaddr < start || vaddr + page_size as usize > start + length {
+                continue;
+            }
             pt.set_pkey(vaddr, key)
                 .expect("preflighted pkey leaf must remain mapped");
         }
         drop(pt);
         // `leaves` contains each original huge leaf once. The prepared demotion
-        // has already set all P1 children above; repeating its first child here
-        // is harmless and keeps fully covered huge leaves on the same path.
+        // has already keyed the requested P1 children above; only fully
+        // covered original leaves are updated by this final pass.
         aspace.synchronize_pte_mutation();
         if crate::uprobe::reconcile_mm_locked_gated(&aspace_handle, &mut aspace).is_err() {
             // Every newly executable segment already owns its complete probe
@@ -1885,8 +1892,10 @@ pub fn sys_pkey_mprotect(addr: usize, length: usize, prot: usize, pkey: i32) -> 
 
 /// Linux x86 `pkey_alloc(2)`.  Only the two PKRU access-disable bits are
 /// accepted, and allocation always chooses the lowest free nonzero key.
-pub fn sys_pkey_alloc(flags: u32, access_rights: u32) -> AxResult<isize> {
-    if flags != 0 {
+pub fn sys_pkey_alloc(flags: usize, access_rights: usize) -> AxResult<isize> {
+    // Linux takes unsigned long arguments and rejects invalid rights before
+    // checking hardware support or allocating from the finite key domain.
+    if flags != 0 || access_rights & !(PKEY_RIGHTS_MASK as usize) != 0 {
         return Err(AxError::InvalidInput);
     }
     if !axhal::asm::pkeys_enabled() {
@@ -1895,7 +1904,7 @@ pub fn sys_pkey_alloc(flags: u32, access_rights: u32) -> AxResult<isize> {
     let curr = current();
     let thread = curr.as_thread();
     let key = thread.proc_data.allocate_pkey()?;
-    let plan = PkeyPlan::new(key, access_rights).map_err(|error| match error {
+    let plan = PkeyPlan::new(key, access_rights as u32).map_err(|error| match error {
         ArchPolicyError::InvalidPkeyRights
         | ArchPolicyError::InvalidPkey
         | ArchPolicyError::DefaultPkey => AxError::InvalidInput,
@@ -2248,7 +2257,7 @@ pub(crate) fn ensure_4k_granularity_across_aliases(
                         && pages.has_4k_folio(start_index)
                         && aspace
                             .page_table()
-                            .query(cursor)
+                            .query_mapped(cursor)
                             .is_ok_and(|(_, _, size)| size == PageSize::Size2M))
                     .then_some((pages, start_index))
                 }
@@ -2458,7 +2467,7 @@ fn remove_anonymous_shared_across_aliases(
     }
 
     // Allocate and preflight every participant plan before the first PTE is
-    // changed. After this boundary drain_present_leaves is a validated,
+    // changed. After this boundary drain_mapped_leaves is a validated,
     // allocation-reserved operation.
     let mut plans = Vec::new();
     plans
@@ -2989,10 +2998,20 @@ fn process_madvise_collapse_locked(aspace: &mut AddrSpace, addr: usize, length: 
     first_error.map_or(Ok(()), Err)
 }
 
+pub(super) fn madvise_behavior_valid(advice: u32) -> bool {
+    matches!(advice, MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED |
+        MADV_DONTNEED | MADV_FREE | MADV_REMOVE | MADV_DONTFORK | MADV_DOFORK |
+        MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE | MADV_NOHUGEPAGE |
+        MADV_DONTDUMP | MADV_DODUMP | MADV_WIPEONFORK | MADV_KEEPONFORK |
+        MADV_COLD | MADV_PAGEOUT | MADV_POPULATE_READ | MADV_POPULATE_WRITE |
+        MADV_DONTNEED_LOCKED | MADV_COLLAPSE | MADV_GUARD_INSTALL | MADV_GUARD_REMOVE |
+        MADV_HWPOISON | MADV_SOFT_OFFLINE)
+}
+
 pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
     debug!("sys_madvise <= addr: {addr:#x}, length: {length:x}, advice: {advice:#x}");
 
-    if !addr.is_multiple_of(PageSize::Size4K as usize) {
+    if !madvise_behavior_valid(advice) || !addr.is_multiple_of(PageSize::Size4K as usize) {
         return Err(AxError::InvalidInput);
     }
     if length == 0 {
@@ -3217,7 +3236,6 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
 
 pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     debug!("sys_msync <= addr: {addr:#x}, length: {length:x}, flags: {flags:#x}");
-    const PAGE_SIZE: usize = PageSize::Size4K as usize;
 
     if !addr.is_multiple_of(PageSize::Size4K as usize) {
         return Err(AxError::InvalidInput);
@@ -3235,6 +3253,16 @@ pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     // outside the lock so page-cache eviction callbacks can unmap old PTEs.
     let curr = current();
     let aspace_handle = curr.as_thread().proc_data.aspace();
+    msync_address_space(&aspace_handle, addr, length, flags)
+}
+
+fn msync_address_space(
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
+    addr: usize,
+    length: usize,
+    flags: u32,
+) -> AxResult<isize> {
+    const PAGE_SIZE: usize = PageSize::Size4K as usize;
     let length = checked_align_up(length, PAGE_SIZE).ok_or(AxError::NoMemory)?;
     addr.checked_add(length).ok_or(AxError::NoMemory)?;
     let fail_on_first_unmapped = flags == MS_ASYNC;
@@ -3254,14 +3282,11 @@ pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
             let mut backends = Vec::new();
             if flags & MS_SYNC != 0 {
                 let end = start + length;
-                let mut cursor = start;
-                while cursor < end {
-                    let Some(area) = aspace.find_area(cursor) else {
-                        break;
-                    };
-                    if area.start() > cursor {
-                        break;
-                    }
+                // Holes affect the final errno, not the remaining sync
+                // work. Walk every intersecting VMA and clamp its own
+                // overlap so a leading/interior hole cannot stop writeback.
+                for area in aspace.areas_overlapping(VirtAddrRange::new(start, end)) {
+                    let overlap_start = area.start().max(start);
                     if area
                         .backend()
                         .file_mapping()
@@ -3272,15 +3297,14 @@ pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
                         let offset = area
                             .backend()
                             .file_mapping()
-                            .and_then(|lease| lease.file_offset_at(cursor))
+                            .and_then(|lease| lease.file_offset_at(overlap_start))
                             .ok_or(AxError::BadState)?;
                         backends.push((
                             area.backend().clone(),
                             offset,
-                            overlap_end.sub_addr(cursor) as u64,
+                            overlap_end.sub_addr(overlap_start) as u64,
                         ));
                     }
-                    cursor = area.end().min(end);
                 }
             }
             (backends, saw_unmapped)
@@ -3416,69 +3440,44 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     let (start, length) = validate_page_aligned_range(addr, length)?;
     loop {
         let mut aspace = aspace_handle.lock();
-        // mlock can fault-in and retain file aliases, so it is an alias-creation
-        // path.  Do not return EBUSY for a transient cache retirement.
         if let Some(retry) = aspace.file_eviction_retry_for_range(start, length) {
             drop(aspace);
             retry.wait()?;
             continue;
         }
-        if length > 0 && !aspace.can_access_range(start, length, MappingFlags::empty()) {
-            return Err(AxError::NoMemory);
-        }
-
         check_mlock_range_limit(proc_data, has_ipc_lock, &aspace, start, length)?;
+        apply_lock_prefix(&mut aspace, start, length, true)?;
+        drop(aspace);
         if flags & MLOCK_ONFAULT == 0 {
-            drop(aspace);
-            populate_explicit_with_reclaim(
-                &aspace_handle,
-                start,
-                length,
-                MappingFlags::empty(),
-                |aspace| {
-                    if length > 0 && !aspace.can_access_range(start, length, MappingFlags::empty())
-                    {
-                        return Err(AxError::NoMemory);
-                    }
-                    check_mlock_range_limit(proc_data, has_ipc_lock, aspace, start, length)
-                },
-            )?;
-            // The helper revalidated before its successful populate. Take the
-            // lock once more for the state publication; a concurrent VMA
-            // mutation is rechecked rather than locking stale pages.
-            let mut aspace = aspace_handle.lock();
-            if let Some(retry) = aspace.file_eviction_retry_for_range(start, length) {
-                drop(aspace);
-                retry.wait()?;
-                continue;
-            }
-            if length > 0 && !aspace.can_access_range(start, length, MappingFlags::empty()) {
-                continue;
-            }
-            check_mlock_range_limit(proc_data, has_ipc_lock, &aspace, start, length)?;
-            aspace.set_locked(start, length, true)?;
-            return Ok(0);
+            populate_explicit_with_reclaim(&aspace_handle, start, length,
+                MappingFlags::empty(), |_| Ok(()))?;
         }
-
-        aspace.set_locked(start, length, true)?;
         return Ok(0);
     }
 }
 
-pub fn sys_munlock(addr: usize, length: usize) -> AxResult<isize> {
-    debug!("sys_munlock <= addr: {addr:#x}, length: {length:x}");
-
-    let curr = current();
-    let thread = curr.as_thread();
-    let proc_data = &thread.proc_data;
-    let aspace_handle = proc_data.aspace();
-    let mut aspace = aspace_handle.lock();
-    let (start, length) = validate_page_aligned_range(addr, length)?;
-    if length > 0 && !aspace.can_access_range(start, length, MappingFlags::empty()) {
-        return Err(AxError::NoMemory);
+// Linux apply_vma_lock_flags commits each VMA before encountering a hole.
+// Keep the mm lock across this walk so its successful prefix is unambiguous.
+fn apply_lock_prefix(aspace: &mut AddrSpace, start: VirtAddr, length: usize, enabled: bool) -> AxResult {
+    let end = start.checked_add(length).ok_or(AxError::InvalidInput)?;
+    let mut cursor = start;
+    while cursor < end {
+        let area = aspace.find_area(cursor).ok_or(AxError::NoMemory)?;
+        if area.start() > cursor {
+            return Err(AxError::NoMemory);
+        }
+        let next = area.end().min(end);
+        aspace.set_locked(cursor, next.sub_addr(cursor), enabled)?;
+        cursor = next;
     }
+    Ok(())
+}
 
-    aspace.set_locked(start, length, false)?;
+pub fn sys_munlock(addr: usize, length: usize) -> AxResult<isize> {
+    let curr = current();
+    let aspace_handle = curr.as_thread().proc_data.aspace();
+    let (start, length) = validate_page_aligned_range(addr, length)?;
+    apply_lock_prefix(&mut aspace_handle.lock(), start, length, false)?;
     Ok(0)
 }
 
@@ -3498,7 +3497,7 @@ pub fn sys_mlockall(flags: u32) -> AxResult<isize> {
     let has_ipc_lock = thread.has_effective_capability(CAP_IPC_LOCK);
     let aspace_handle = proc_data.aspace();
     if flags & MCL_CURRENT != 0 {
-        let aspace = aspace_handle.lock();
+        let mut aspace = aspace_handle.lock();
         check_mlockall_current_limit(proc_data, has_ipc_lock, &aspace)?;
         let ranges: Vec<_> = if flags & MCL_ONFAULT == 0 {
             aspace
@@ -3508,10 +3507,12 @@ pub fn sys_mlockall(flags: u32) -> AxResult<isize> {
         } else {
             Vec::new()
         };
+        aspace.lock_current_mappings();
+        aspace.set_lock_future_mappings(flags & MCL_FUTURE != 0, flags & MCL_ONFAULT != 0);
         drop(aspace);
         if flags & MCL_ONFAULT == 0 {
             for (start, size) in ranges {
-                populate_explicit_with_reclaim(
+                let _ = populate_explicit_with_reclaim(
                     &aspace_handle,
                     start,
                     size,
@@ -3525,13 +3526,9 @@ pub fn sys_mlockall(flags: u32) -> AxResult<isize> {
                             .map(|_| ())
                             .ok_or(AxError::NoMemory)
                     },
-                )?;
+                );
             }
         }
-        let mut aspace = aspace_handle.lock();
-        check_mlockall_current_limit(proc_data, has_ipc_lock, &aspace)?;
-        aspace.lock_current_mappings();
-        aspace.set_lock_future_mappings(flags & MCL_FUTURE != 0, flags & MCL_ONFAULT != 0);
         return Ok(0);
     } else {
         check_mlockall_future_limit(proc_data, has_ipc_lock)?;
@@ -3570,6 +3567,21 @@ mod tests {
         pseudofs::tmp::MemoryFs,
         task::UserNamespace,
     };
+
+    #[test]
+    fn pkey_alloc_rejects_full_width_invalid_arguments_before_task_access() {
+        for (flags, rights) in [
+            (1usize << 32, 0),
+            (1, 0),
+            (0, 1usize << 32),
+            (0, 4),
+            (0, usize::MAX),
+        ] {
+            // No current process is needed to reject these arguments, even
+            // on a host without enabled PKU or an available protection key.
+            assert_eq!(sys_pkey_alloc(flags, rights), Err(AxError::InvalidInput));
+        }
+    }
 
     #[test]
     fn alias_granularity_skips_partial_first_address_space_window() {
@@ -3772,7 +3784,7 @@ mod tests {
         let location = mount
             .root_location()
             .create(
-                name,
+                axfs_ng_vfs::FsName::new(name.as_bytes()),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -3782,6 +3794,153 @@ mod tests {
             FileFlags::READ,
         ))))
         .unwrap()
+    }
+
+    // A disk-like cache provider backed by an isolated byte-storage inode.
+    // Unlike tmpfs, its cache must write through to the backing node on sync.
+    struct MsyncBackingFile {
+        this: alloc::sync::Weak<Self>,
+        backing: axfs_ng_vfs::Location,
+    }
+
+    impl MsyncBackingFile {
+        fn node(&self) -> &axfs_ng_vfs::FileNode {
+            self.backing.entry().as_file().expect("test backing is a regular file")
+        }
+    }
+
+    impl axfs_ng_vfs::FilesystemOps for MsyncBackingFile {
+        fn name(&self) -> &str { "msync-writeback-test" }
+        fn root_dir(&self) -> axfs_ng_vfs::DirEntry {
+            axfs_ng_vfs::DirEntry::new_file(
+                axfs_ng_vfs::FileNode::new(self.this.upgrade().unwrap()),
+                NodeType::RegularFile, axfs_ng_vfs::Reference::root())
+        }
+        fn stat(&self) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::StatFs> {
+            self.node().filesystem().stat()
+        }
+    }
+    impl axfs_ng_vfs::NodeOps for MsyncBackingFile {
+        fn inode(&self) -> u64 { self.node().inode() }
+        fn metadata(&self) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::Metadata> { self.node().metadata() }
+        fn update_metadata(&self, update: axfs_ng_vfs::MetadataUpdate) -> axfs_ng_vfs::VfsResult<()> {
+            self.node().update_metadata(update)
+        }
+        fn filesystem(&self) -> &dyn axfs_ng_vfs::FilesystemOps { self }
+        fn sync(&self, data_only: bool) -> axfs_ng_vfs::VfsResult<()> { self.node().sync(data_only) }
+        fn persistent_user_data(&self) -> Option<&axfs_ng_vfs::NodeUserData> {
+            self.node().persistent_user_data()
+        }
+        fn into_any(self: Arc<Self>) -> Arc<dyn core::any::Any + Send + Sync> { self }
+    }
+    impl axpoll::Pollable for MsyncBackingFile {
+        fn poll(&self) -> axpoll::IoEvents { axpoll::IoEvents::READABLE | axpoll::IoEvents::WRITABLE }
+        fn register<'a>(&'a self, _: &mut core::task::Context<'_>, _: axpoll::IoEvents)
+            -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+            axpoll::PollRegistration::empty()
+        }
+    }
+    impl axfs_ng_vfs::FileNodeOps for MsyncBackingFile {
+        fn read_at(&self, buf: &mut [u8], offset: u64) -> axfs_ng_vfs::VfsResult<usize> {
+            self.node().read_at(buf, offset)
+        }
+        fn write_at(&self, buf: &[u8], offset: u64) -> axfs_ng_vfs::VfsResult<usize> {
+            self.node().write_at(buf, offset)
+        }
+        fn set_len(&self, len: u64) -> axfs_ng_vfs::VfsResult<()> { self.node().set_len(len) }
+        fn append(&self, buf: &[u8]) -> axfs_ng_vfs::VfsResult<(usize, u64)> { self.node().append(buf) }
+        fn set_symlink(&self, target: &axfs_ng_vfs::FsPath) -> axfs_ng_vfs::VfsResult<()> {
+            self.node().set_symlink(target)
+        }
+    }
+
+    #[test]
+    fn msync_flushes_shared_file_ranges_after_holes_before_reporting_enomem() {
+        let _context = crate::test_support::scheduler_test_context();
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let location = mount.root_location().create(
+            axfs_ng_vfs::FsName::new(b"msync-holes"),
+            NodeType::RegularFile,
+            NodePermission::from_bits_truncate(0o600),
+        ).unwrap();
+        let backing = location;
+        let provider = Arc::new_cyclic(|this| MsyncBackingFile { this: this.clone(), backing });
+        let disk = axfs_ng_vfs::Filesystem::new(provider);
+        let location = Mountpoint::new_root(&disk).root_location();
+        let node = location.entry().as_file().unwrap();
+        node.set_len((PAGE_SIZE_4K * 6) as u64).unwrap();
+        let cache = CachedFile::get_or_create(location.clone());
+        for page in 0..6 {
+            cache.write_at_slice(&[page as u8 + 1], (page * PAGE_SIZE_4K) as u64).unwrap();
+        }
+        let description = FileDescription::new(Arc::new(File::new(axfs::File::new(
+            FileBackend::Cached(cache.clone()),
+            FileFlags::READ | FileFlags::WRITE,
+        )))).unwrap();
+        let file = FileHandle::<dyn FileLike>::from_description_for_test(description)
+            .downcast::<File>().unwrap();
+        let owner = UserNamespace::try_new_root().unwrap();
+        let base = VirtAddr::from(0x4000);
+        let aspace = Arc::new(Mutex::new(AddrSpace::new_empty(base, PAGE_SIZE_4K * 6).unwrap()));
+        for (page, pages, sharing) in [
+            (0, 1, FileMappingSharing::Shared),
+            (2, 2, FileMappingSharing::Shared),
+            (4, 1, FileMappingSharing::Private),
+        ] {
+            let start = base + page * PAGE_SIZE_4K;
+            let lease = FileMappingLease::new(
+                file.clone(), owner.clone(), start, (page * PAGE_SIZE_4K) as u64,
+                MappingFlags::USER | MappingFlags::READ,
+                MappingFlags::READ | MappingFlags::WRITE,
+                sharing,
+            );
+            let backend = if sharing == FileMappingSharing::Shared {
+                Backend::new_file(
+                    start, cache.clone(), FileFlags::READ | FileFlags::WRITE,
+                    page * PAGE_SIZE_4K, Some((PAGE_SIZE_4K * 6) as u64), &aspace,
+                ).unwrap()
+            } else {
+                Backend::new_alloc(start, PageSize::Size4K)
+            }.with_file_mapping(lease);
+            aspace.lock().map(
+                start, pages * PAGE_SIZE_4K, MappingFlags::USER | MappingFlags::READ,
+                false, backend,
+            ).unwrap();
+        }
+        // Read the backing node directly, bypassing the dirty page cache.
+        // A cached read could conceal missing writeback after a hole.
+        let mut byte = [0];
+        for page in 0..6 {
+            node.read_at(&mut byte, (page * PAGE_SIZE_4K) as u64).unwrap();
+            assert_eq!(byte, [0]);
+        }
+        assert_eq!(
+            msync_address_space(&aspace, base.as_usize(), PAGE_SIZE_4K * 6, MS_SYNC),
+            Err(AxError::NoMemory),
+        );
+        for page in 0..6 {
+            node.read_at(&mut byte, (page * PAGE_SIZE_4K) as u64).unwrap();
+            let expected = if matches!(page, 0 | 2 | 3) { page as u8 + 1 } else { 0 };
+            assert_eq!(byte, [expected], "backing page {page}");
+        }
+        cache.write_at_slice(&[42], (PAGE_SIZE_4K * 2) as u64).unwrap();
+        cache.write_at_slice(&[43], (PAGE_SIZE_4K * 3) as u64).unwrap();
+        let leading_hole = (base + PAGE_SIZE_4K).as_usize();
+        assert_eq!(
+            msync_address_space(&aspace, leading_hole, PAGE_SIZE_4K * 2, MS_ASYNC),
+            Err(AxError::NoMemory),
+        );
+        node.read_at(&mut byte, (PAGE_SIZE_4K * 2) as u64).unwrap();
+        assert_eq!(byte, [3]);
+        assert_eq!(
+            msync_address_space(&aspace, leading_hole, PAGE_SIZE_4K * 2, MS_SYNC),
+            Err(AxError::NoMemory),
+        );
+        node.read_at(&mut byte, (PAGE_SIZE_4K * 2) as u64).unwrap();
+        assert_eq!(byte, [42]);
+        node.read_at(&mut byte, (PAGE_SIZE_4K * 3) as u64).unwrap();
+        assert_eq!(byte, [4], "out-of-range suffix must stay dirty");
     }
 
     #[test]
@@ -3798,14 +3957,14 @@ mod tests {
         let first = first_mount
             .root_location()
             .create(
-                "shared-writable-dedup",
+                axfs_ng_vfs::FsName::new(b"shared-writable-dedup"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o6755),
             )
             .unwrap();
         let second = second_mount
             .root_location()
-            .lookup_no_follow("shared-writable-dedup")
+            .lookup_no_follow(axfs_ng_vfs::FsName::new(b"shared-writable-dedup"))
             .unwrap();
 
         assert!(!first.ptr_eq(&second));

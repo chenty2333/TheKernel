@@ -2507,7 +2507,7 @@ mod tests {
         let location = mount
             .root_location()
             .create(
-                "syncfs-anchor",
+                axfs_ng_vfs::FsName::new(b"syncfs-anchor"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2590,13 +2590,13 @@ mod tests {
         let root = mount.root_location();
         let source = root
             .create(
-                "writeback-source",
+                axfs_ng_vfs::FsName::new(b"writeback-source"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
-        let alias = root.link("writeback-alias", &source).unwrap();
-        let rebuilt_alias = root.lookup_no_follow_in_mount("writeback-alias").unwrap();
+        let alias = root.link(axfs_ng_vfs::FsName::new(b"writeback-alias"), &source).unwrap();
+        let rebuilt_alias = root.lookup_no_follow_in_mount(axfs_ng_vfs::FsName::new(b"writeback-alias")).unwrap();
         let source_file = Arc::new(File::new(axfs::File::new(
             FileBackend::Direct(source),
             FileFlags::READ,
@@ -2646,7 +2646,7 @@ mod tests {
         let loc = mount
             .root_location()
             .create(
-                "mutable-append",
+                axfs_ng_vfs::FsName::new(b"mutable-append"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2694,7 +2694,7 @@ mod tests {
         let read_loc = mount
             .root_location()
             .create(
-                "read-only-append",
+                axfs_ng_vfs::FsName::new(b"read-only-append"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2721,7 +2721,7 @@ mod tests {
         let loc = mount
             .root_location()
             .create(
-                "fionbio-regular",
+                axfs_ng_vfs::FsName::new(b"fionbio-regular"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2828,7 +2828,7 @@ mod tests {
         let path_loc = mount
             .root_location()
             .create(
-                "path-only-no-notify",
+                axfs_ng_vfs::FsName::new(b"path-only-no-notify"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2848,7 +2848,7 @@ mod tests {
         let loc = mount
             .root_location()
             .create(
-                "credential-bound-open",
+                axfs_ng_vfs::FsName::new(b"credential-bound-open"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -2881,20 +2881,10 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<IoOperationContext>();
 
-        let fs = MemoryFs::new().unwrap();
-        let mount = Mountpoint::new_root(&fs);
-        let loc = mount
-            .root_location()
-            .create(
-                "context-bound-open",
-                NodeType::RegularFile,
-                NodePermission::from_bits_truncate(0o600),
-            )
-            .unwrap();
-        let file: Arc<dyn FileLike> = Arc::new(File::new(axfs::File::new(
-            FileBackend::Direct(loc),
-            FileFlags::READ,
-        )));
+        // This test exercises context ownership, not a VFS namespace lookup.
+        // A regular-file fixture scans live mount namespaces during OFD
+        // construction and therefore requires a scheduler-backed mutex.
+        let file: Arc<dyn FileLike> = sync_probe();
         let namespace = crate::task::UserNamespace::try_new_root().unwrap();
         let credential = Cred::try_root(namespace).unwrap();
         let description = FileDescription::new_inner(
@@ -2925,6 +2915,15 @@ mod tests {
         assert!(context.open_security_credential().is_none());
         assert_eq!(context.open_credentials(), description.open_credentials());
         assert_eq!(context.fanotify_actor(), FanotifyEventActor::default());
+        // Deferred socket writes use the captured submitting process, not
+        // the task which later executes the operation.
+        let deferred = description.capture_io_operation_context(
+            VfsSecurityContext::new(credential.clone()), FanotifyEventActor::test_process(1234));
+        let sender = crate::file::automatic_unix_credentials(
+            deferred.security().actor(), deferred.fanotify_actor().process_id());
+        assert_eq!(sender.pid, 1234);
+        assert_eq!(sender.uid, credential.ids().ruid.into_raw());
+        assert_eq!(sender.gid, credential.ids().rgid.into_raw());
         // Changing the submitter's current credential must not alter the
         // admitted actor, and dropping the submitter's last local OFD handle
         // must not end the context's exact identity.
@@ -2943,7 +2942,7 @@ mod tests {
         let loc = mount
             .root_location()
             .create(
-                "context-generation-bound",
+                axfs_ng_vfs::FsName::new(b"context-generation-bound"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )

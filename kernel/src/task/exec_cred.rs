@@ -477,6 +477,10 @@ mod tests {
             match update.finish() {
                 Ok(prepared) => {
                     prepared.commit();
+                    // The host harness has no credential-retirement worker.
+                    // Leave capacity for the exec preparation under test even
+                    // when setup consumed the domain's final retire slot.
+                    crate::rcu::drain_credential_retire(crate::rcu::CREDENTIAL_RETIRE_CAPACITY);
                     break;
                 }
                 Err(AxError::ResourceBusy) => {

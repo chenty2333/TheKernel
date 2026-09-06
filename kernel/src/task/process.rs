@@ -1248,6 +1248,10 @@ impl PidNamespace {
             actor: &Cred,
             level: usize,
         ) -> AxResult<PidNamespaceReservation> {
+            // Explicit clone3 IDs must not bypass a dead ancestor's reaper.
+            if !namespace.child_reaper_allows_new_processes() {
+                return Err(AxError::NoMemory);
+            }
             let allocated_here = if let Some(&local_pid) = requested.get(level) {
                 {
                     let pids = namespace.pids.lock();
@@ -3386,6 +3390,8 @@ pub(crate) struct PtraceActionGuard<'a> {
 
 /// [`Process`]-shared data.
 pub struct ProcessData {
+    /// Immutable resource domain, inherited by fork and retained across exec.
+    pub(crate) world: crate::task::WorldId,
     /// The process.
     pub(crate) proc: Arc<Process>,
     /// Serializes child admission through publication against final exit and
@@ -3440,6 +3446,7 @@ pub struct ProcessData {
 
     /// The process signal manager
     pub signal: Arc<ProcessSignalManager>,
+    pub(crate) signal_pending_event: Arc<PollSet>,
 
     /// The futex table.
     pub(in crate::task) futex_table: Arc<FutexTable>,
@@ -3905,6 +3912,7 @@ impl InitialProcessThreadAdmission {
 impl ProcessData {
     /// Fallibly creates unpublished process runtime state.
     pub(crate) fn try_new(
+        world: crate::task::WorldId,
         proc: Arc<Process>,
         prepared_zombie_snapshot: PreparedZombieSnapshot,
         group_leader_credential: Arc<CredentialSlot>,
@@ -3919,6 +3927,8 @@ impl ProcessData {
         exit_signal: Option<Signo>,
         namespaces: NamespaceProxy,
     ) -> AxResult<Arc<Self>> {
+        // Resolve the static composition before process resources can publish.
+        let _profile = world.profile();
         struct ExecutableRollback(Option<ExecutableKey>);
 
         impl Drop for ExecutableRollback {
@@ -3933,11 +3943,13 @@ impl ProcessData {
         let child_exit_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let exit_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let exec_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
-        let signal = Arc::try_new(ProcessSignalManager::new(
+        let signal_pending_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
+        let mut signal = ProcessSignalManager::new(
             signal_actions,
             crate::config::SIGNAL_TRAMPOLINE,
-        ))
-        .map_err(|_| AxError::NoMemory)?;
+        );
+        signal.set_pending_waker(core::task::Waker::from(signal_pending_event.clone()));
+        let signal = Arc::try_new(signal).map_err(|_| AxError::NoMemory)?;
         let futex_table = Arc::try_new(FutexTable::new()).map_err(|_| AxError::NoMemory)?;
         let stop_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let vfork_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
@@ -3956,6 +3968,7 @@ impl ProcessData {
             image.tlb_state()
         };
         let data = Self {
+            world,
             proc,
             process_lifecycle: Mutex::new(()),
             prepared_zombie_snapshot: SpinNoIrq::new(Some(prepared_zombie_snapshot)),
@@ -3982,6 +3995,7 @@ impl ProcessData {
             exit_signal,
 
             signal,
+            signal_pending_event,
 
             futex_table,
 
@@ -4123,6 +4137,18 @@ impl ProcessData {
         &self,
     ) -> AxResult<(Arc<Cred>, Arc<ThreadSignalManager>)> {
         self.group_leader_identity.current_cred_and_signal()
+    }
+
+    /// Scheduler state retained for the exited group leader while siblings
+    /// still keep this process alive. Callers serialize identity with lifecycle.
+    pub(crate) fn group_leader_scheduler_state(&self) -> AxResult<ZombieSchedulerSnapshot> {
+        self.group_leader_identity
+            .signal
+            .lock()
+            .as_ref()
+            .and_then(|identity| identity.scheduler.as_ref())
+            .map(|scheduler| *scheduler.lock())
+            .ok_or(AxError::NoSuchProcess)
     }
 
     /// Captures the complete published leader identity for an operation that
@@ -7320,7 +7346,7 @@ mod tests {
                 uclamp_min_user_defined: false,
                 uclamp_max_user_defined: false,
                 uclamp_effective_min: 0,
-                uclamp_effective_max: 1024,
+                uclamp_effective_max: UtilizationBounds::unrestricted().maximum as u16,
                 affinity: AxCpuMask::full(),
                 identity_epoch: 1,
                 version: 3,
@@ -8044,17 +8070,18 @@ mod tests {
 
     #[test]
     fn namespace_owner_objects_retain_explicit_snapshot_and_forked_state() {
+        let _context = crate::test_support::scheduler_test_context();
         let root = UserNamespace::try_new_root().unwrap();
         let child = root.try_fork(kuid(1000), kgid(1000), false).unwrap();
         let child_weak = Arc::downgrade(&child);
 
         let cgroup_root = CgroupNamespace::try_new_root(root.clone()).unwrap();
-        let cgroup_child = cgroup_root
-            .try_fork(
-                child.clone(),
-                crate::pseudofs::cgroup::root_namespace_roots().unwrap(),
-            )
-            .unwrap();
+        let cgroup_child = CgroupNamespace::try_fork(
+            &cgroup_root,
+            child.clone(),
+            crate::pseudofs::cgroup::root_namespace_roots().unwrap(),
+        )
+        .unwrap();
         assert!(Arc::ptr_eq(cgroup_root.owner_user_ns(), &root));
         assert!(Arc::ptr_eq(cgroup_child.owner_user_ns(), &child));
 
@@ -8223,6 +8250,40 @@ mod tests {
             child.reserve_process_with_ids(104, &[2, 3, 4], &actor),
             Err(AxError::InvalidInput)
         ));
+    }
+
+    #[test]
+    fn clone3_set_tid_rejects_dead_ancestor_and_rolls_back_inner_slot() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root(owner.clone()).unwrap();
+        let domain = super::ProcessDomain::try_new().unwrap();
+        let root = PidNamespace::try_new_root_with_reaper_scope(
+            owner.clone(),
+            domain.root_reaper_scope(),
+        )
+        .unwrap();
+        root.reserve_process(100).unwrap().commit();
+        let init = domain.try_new_init(100, None).unwrap();
+        domain.prepare_thread(&init, 100).unwrap().commit().unwrap();
+        let child = root.try_fork(101, owner).unwrap();
+        child.reserve_process(101).unwrap().commit();
+        assert!(root.child_reaper_allows_new_processes());
+        assert_eq!(
+            init.exit_thread(100, 0),
+            thekernel_linux_process_adapter::ThreadExitOutcome::FinalThread
+        );
+        assert!(!root.child_reaper_allows_new_processes());
+
+        // Cover explicit and automatically allocated ancestor IDs. Both
+        // paths acquire an inner slot before visiting the dead ancestor.
+        for requested in [&[7, 42][..], &[7][..], &[][..]] {
+            assert!(matches!(
+                child.reserve_process_with_ids(102, requested, &actor),
+                Err(AxError::NoMemory)
+            ));
+            assert_eq!(child.visible_pid_checked(102), None);
+            assert_eq!(root.visible_pid_checked(102), None);
+        }
     }
 
     #[test]

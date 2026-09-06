@@ -1321,6 +1321,12 @@ mod tests {
         }
     }
 
+    impl axio::IoBuf for FaultAfterWrites {
+        fn remaining(&self) -> usize {
+            self.remaining
+        }
+    }
+
     impl IoBufMut for FaultAfterWrites {
         fn remaining_mut(&self) -> usize {
             self.remaining

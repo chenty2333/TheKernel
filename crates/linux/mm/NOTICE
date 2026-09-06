@@ -1,0 +1,6 @@
+This package is a new extraction of Linux-visible memory-management policy
+contracts designed for TheKernel and distributed under Apache-2.0.
+
+Linux, Zircon, and Asterinas sources were consulted to understand observable
+pin, invalidation, fault, and teardown contracts. No source text from those
+projects is copied into this package.

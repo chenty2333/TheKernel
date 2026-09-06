@@ -79,7 +79,8 @@ start_hotplug_observer() {
             sleep 1
         done
         [ ! -e "$old_event" ] || { echo "$hotplug_ready_marker state=FAIL reason=remove_timeout"; exit 1; }
-        echo "$hotplug_removed_marker event=$old_event"
+        echo "$hotplug_removed_marker state=INFO event=$old_event"
+        echo "$hotplug_removed_marker"
 
         tries=0
         while [ "$tries" -lt 30 ]; do
@@ -89,7 +90,8 @@ start_hotplug_observer() {
                 minor_hex=$(stat -c %T "$event")
                 udev_data=/run/udev/data/c$((0x$major_hex)):$((0x$minor_hex))
                 if [ -r "$udev_data" ]; then
-                    echo "$hotplug_ready_marker event=$event"
+                    echo "$hotplug_ready_marker state=INFO event=$event"
+                    echo "$hotplug_ready_marker"
                     exit 0
                 fi
             fi
@@ -101,6 +103,7 @@ start_hotplug_observer() {
     ) &
     hotplug_observer_pid=$!
 }
+sample_resources
 case "$fault" in
     modeset) modeset_fault || { echo "$marker state=FAIL reason=modeset"; exit 1; } ;;
     vt-switch) chvt 1; sleep 1; chvt 2 ;;
@@ -138,7 +141,6 @@ case "$renderer" in
         unset GALLIUM_DRIVER VK_DRIVER_FILES VK_ICD_FILENAMES || true
         ;;
 esac
-sample_resources
 if [ "$fault" = client-crash ]; then
     crash_log=/tmp/thekernel-client-crash.log
     ulimit -c 0
@@ -147,8 +149,10 @@ if [ "$fault" = client-crash ]; then
         start-stop-daemon -S -x "$client" -c weston -- >"$crash_log" 2>&1
     crash_status=$?
     set -e
-    cat "$crash_log"
-    [ "$crash_status" -ne 0 ] || { echo 'THEKERNEL_GRAPHICS_BENCHMARK state=FAIL reason=client_crash_status'; exit 1; }
+    # Keep the aborted run's READY/input/frame lines diagnostic-only. Replaying
+    # them as live protocol would trigger QMP on the wrong client and mix frames.
+    sed 's/^/THEKERNEL_GRAPHICS_CRASH_DIAGNOSTIC /' "$crash_log"
+    [ "$crash_status" -eq 134 ] || { echo 'THEKERNEL_GRAPHICS_BENCHMARK state=FAIL reason=client_crash_status'; exit 1; }
     grep -qx 'THEKERNEL_GRAPHICS_BENCHMARK_READY' "$crash_log" \
         || { echo 'THEKERNEL_GRAPHICS_BENCHMARK state=FAIL reason=client_crash_not_ready'; exit 1; }
 fi
@@ -164,4 +168,5 @@ if [ -n "$hotplug_observer_pid" ]; then
     hotplug_observer_pid=
 fi
 sample_resources
+printf 'THEKERNEL_GRAPHICS_FAULT %s\n' "${fault:-none}"
 echo 'THEKERNEL_GRAPHICS_BENCHMARK_COMPLETE'

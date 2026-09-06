@@ -218,32 +218,53 @@ fn map_address_space_error(error: AxError) -> UserCopyError {
     }
 }
 
-fn prepare_range(
-    address_space: &mut AddrSpace,
+/// Populate and use a user range under one mapping snapshot. Cache replacement
+/// must run outside the mm lock because eviction listeners acquire that lock.
+pub(super) fn with_populated_user_range<T>(
+    handle: &Arc<Mutex<AddrSpace>>,
     start: usize,
     len: usize,
     access_flags: MappingFlags,
-) -> Result<VirtAddr, UserCopyError> {
+    mut operation: impl FnMut(&mut AddrSpace, VirtAddr) -> AxResult<T>,
+) -> VmResult<T> {
     let start = VirtAddr::from(start);
-    if len == 0 {
-        return Ok(start);
+    for _ in 0..64 {
+        let caches = {
+            let mut address_space = handle.lock();
+            if len == 0 {
+                return operation(&mut address_space, start).map_err(map_address_space_error);
+            }
+            if !address_space.contains_range(start, len) {
+                return Err(UserCopyError::BadAddress);
+            }
+            if !address_space.can_access_range(start, len, access_flags) {
+                return Err(UserCopyError::AccessDenied);
+            }
+            let end = start.checked_add(len).ok_or(UserCopyError::BadAddress)?;
+            let page_start = start.align_down_4k();
+            let page_end = VirtAddr::from(
+                super::checked_align_up_4k(end.as_usize()).ok_or(UserCopyError::BadAddress)?,
+            );
+            let size = page_end.sub_addr(page_start);
+            match address_space.populate_area(page_start, size, access_flags) {
+                Ok(()) => {
+                    return operation(&mut address_space, start).map_err(map_address_space_error);
+                }
+                Err(error) if error.canonicalize() == AxError::ResourceBusy => address_space
+                    .file_caches_for_population_retry(page_start, size)
+                    .map_err(map_address_space_error)?,
+                Err(error) => return Err(map_address_space_error(error)),
+            }
+        };
+        let mut reclaimed = false;
+        for cache in caches {
+            reclaimed |= cache.reclaim_one().map_err(map_address_space_error)?;
+        }
+        if !reclaimed {
+            return Err(UserCopyError::NoMemory);
+        }
     }
-    if !address_space.contains_range(start, len) {
-        return Err(UserCopyError::BadAddress);
-    }
-    if !address_space.can_access_range(start, len, access_flags) {
-        return Err(UserCopyError::AccessDenied);
-    }
-
-    let end = start.checked_add(len).ok_or(UserCopyError::BadAddress)?;
-    let page_start = start.align_down_4k();
-    let page_end = VirtAddr::from(
-        super::checked_align_up_4k(end.as_usize()).ok_or(UserCopyError::BadAddress)?,
-    );
-    address_space
-        .populate_area(page_start, page_end.sub_addr(page_start), access_flags)
-        .map_err(map_address_space_error)?;
-    Ok(start)
+    Err(UserCopyError::NoMemory)
 }
 
 // SAFETY: all accesses are range-checked against the explicitly selected
@@ -251,33 +272,50 @@ fn prepare_range(
 unsafe impl UserMemory for AddressSpaceUserMemory {
     fn read(&mut self, start: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
         let current = self.targets_current_address_space();
-        let mut address_space = self.address_space.lock();
-        let start = prepare_range(&mut address_space, start, dst.len(), MappingFlags::READ)?;
-        // SAFETY: `MaybeUninit<u8>` has the same layout as `u8`; the address
-        // space read initializes the complete slice before returning `Ok`.
-        let dst = unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len()) };
-        if current {
-            address_space.current_uaccess_read(start, dst)
-        } else if address_space.has_secret_mapping(start, dst.len()) {
-            Err(AxError::BadAddress)
-        } else {
-            address_space.read(start, dst)
-        }
-        .map_err(map_address_space_error)
+        with_populated_user_range(
+            &self.address_space,
+            start,
+            dst.len(),
+            MappingFlags::READ,
+            |address_space, start| {
+                if !current && address_space.has_secret_mapping(start, dst.len()) {
+                    return Err(AxError::BadAddress);
+                }
+                // Preserve the caller's buffer when validation or population
+                // fails, but initialize it before constructing a byte slice.
+                for byte in dst.iter_mut() {
+                    byte.write(0);
+                }
+                // SAFETY: `MaybeUninit<u8>` has the same layout as `u8`;
+                // every byte was initialized above.
+                let dst =
+                    unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len()) };
+                if current {
+                    address_space.current_uaccess_read(start, dst)
+                } else {
+                    address_space.read(start, dst)
+                }
+            },
+        )
     }
 
     fn write(&mut self, start: usize, src: &[u8]) -> VmResult {
         let current = self.targets_current_address_space();
-        let mut address_space = self.address_space.lock();
-        let start = prepare_range(&mut address_space, start, src.len(), MappingFlags::WRITE)?;
-        if current {
-            address_space.current_uaccess_write(start, src)
-        } else if address_space.has_secret_mapping(start, src.len()) {
-            Err(AxError::BadAddress)
-        } else {
-            address_space.write(start, src)
-        }
-        .map_err(map_address_space_error)
+        with_populated_user_range(
+            &self.address_space,
+            start,
+            src.len(),
+            MappingFlags::WRITE,
+            |address_space, start| {
+                if current {
+                    address_space.current_uaccess_write(start, src)
+                } else if address_space.has_secret_mapping(start, src.len()) {
+                    Err(AxError::BadAddress)
+                } else {
+                    address_space.write(start, src)
+                }
+            },
+        )
     }
 
     fn validate_write(&mut self, start: usize, len: usize) -> VmResult {
@@ -328,15 +366,19 @@ mod tests {
             AddrSpace::new_empty(VirtAddr::from(0x4000), 0x1000).unwrap(),
         ));
 
-        let mut first_byte = [MaybeUninit::uninit(); 1];
+        let mut first_byte = [MaybeUninit::new(0xa5); 1];
         let first_result =
             with_user_memory(first, |memory| memory.read_bytes(0x1000, &mut first_byte));
         assert_eq!(first_result, Err(UserCopyError::AccessDenied));
+        // SAFETY: the destination was initialized before the rejected read.
+        assert_eq!(unsafe { first_byte[0].assume_init() }, 0xa5);
 
-        let mut second_byte = [MaybeUninit::uninit(); 1];
+        let mut second_byte = [MaybeUninit::new(0x5a); 1];
         let second_result =
             with_user_memory(second, |memory| memory.read_bytes(0x1000, &mut second_byte));
         assert_eq!(second_result, Err(UserCopyError::BadAddress));
+        // SAFETY: the destination was initialized before the rejected read.
+        assert_eq!(unsafe { second_byte[0].assume_init() }, 0x5a);
     }
 
     #[test]
@@ -390,6 +432,27 @@ mod tests {
         capability.read_bytes(0x1000, &mut ignored).unwrap();
         // SAFETY: the second read also initialized the byte.
         assert_eq!(unsafe { ignored[0].assume_init() }, 0x5a);
+    }
+
+    #[test]
+    fn provider_reads_readonly_source_and_rejects_write() {
+        let mut selected = AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K).unwrap();
+        selected
+            .map(
+                VirtAddr::from(0x1000),
+                PAGE_SIZE_4K,
+                MappingFlags::USER | MappingFlags::READ,
+                false,
+                super::super::Backend::new_alloc(VirtAddr::from(0x1000), PageSize::Size4K),
+            )
+            .unwrap();
+        let capability = UserMemoryCapability::new(Arc::new(Mutex::new(selected)));
+        let mut value = [MaybeUninit::<u8>::uninit()];
+        capability.read_bytes(0x1000, &mut value).unwrap();
+        assert_eq!(
+            capability.write_bytes(0x1000, &[1]),
+            Err(UserCopyError::AccessDenied)
+        );
     }
 
     #[test]

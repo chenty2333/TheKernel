@@ -1132,11 +1132,26 @@ mod tests {
     #[test]
     fn dynamic_linker_entry_uses_elf_entry_while_aux_base_stays_interp_base() {
         let layout = ExecLayout::fixed();
-        let linker = xmas_elf::ElfFile::new(include_bytes!(
-            "../../../../thekernel-ax/crates/thekernel-kernel-elf-parser/tests/ld-linux-x86-64.so.\
+        let linker_bytes = include_bytes!(
+            "../../../crates/ax/thekernel-kernel-elf-parser/tests/ld-linux-x86-64.so.\
              2"
-        ))
-        .unwrap();
+        );
+        // `include_bytes!` has byte alignment, while xmas-elf's legacy
+        // header reader requires its input address to be naturally aligned.
+        // The real loader accepts byte-aligned files through ELFHeadersBuilder;
+        // give this direct third-party parser use an explicitly aligned copy.
+        let mut aligned_storage =
+            vec![0u64; linker_bytes.len().div_ceil(core::mem::size_of::<u64>())];
+        // SAFETY: the initialized allocation contains at least linker_bytes.len()
+        // bytes. It stays alive and is not accessed while this byte slice is used.
+        let aligned_bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                aligned_storage.as_mut_ptr().cast::<u8>(),
+                linker_bytes.len(),
+            )
+        };
+        aligned_bytes.copy_from_slice(linker_bytes);
+        let linker = xmas_elf::ElfFile::new(aligned_bytes).unwrap();
         let elf_entry = usize::try_from(linker.header.pt2.entry_point()).unwrap();
         assert_ne!(elf_entry, 0);
         let linker_entry = layout.interp_base.checked_add(elf_entry).unwrap();
@@ -1195,7 +1210,7 @@ mod tests {
     fn create_test_file(root: &Location, name: &str, contents: &[u8]) -> Location {
         let location = root
             .create(
-                name,
+                axfs_ng_vfs::FsName::new(name.as_bytes()),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o755),
             )
@@ -1215,7 +1230,7 @@ mod tests {
     fn dynamic_elf_with_interp(path: &[u8]) -> Vec<u8> {
         assert_eq!(path.last(), Some(&0));
         let mut bytes = include_bytes!(
-            "../../../../thekernel-ax/crates/thekernel-kernel-elf-parser/tests/ld-linux-x86-64.so.\
+            "../../../crates/ax/thekernel-kernel-elf-parser/tests/ld-linux-x86-64.so.\
              2"
         )
         .to_vec();
@@ -1249,7 +1264,7 @@ mod tests {
             &root,
             "ld.so",
             include_bytes!(
-                "../../../../thekernel-ax/crates/thekernel-kernel-elf-parser/tests/\
+                "../../../crates/ax/thekernel-kernel-elf-parser/tests/\
                  ld-linux-x86-64.so.2"
             ),
         );

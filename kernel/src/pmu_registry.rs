@@ -491,6 +491,8 @@ pub(crate) const PACKAGE_CSTATE_EVENTS: [(&str, &str); 7] = [
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::String;
+
     use super::{
         PMU_EVENTS, PMU_FORMAT, PmuKind, power_event_has_metadata, power_metadata_owner,
         rapl_energy_scale_decimal,

@@ -626,15 +626,19 @@ mod tests {
     #[test]
     fn timeline_submission_never_replaces_an_existing_dependency() {
         let object = Syncobj::new(false);
-        object.submit_point(7, Fence::new(false)).unwrap();
+        let first = Fence::new(false);
+        object.submit_point(7, first.clone()).unwrap();
         assert_eq!(
             object.submit_point(7, Fence::new(false)),
             Err(AxError::InvalidInput)
         );
-        assert_eq!(
-            object.submit_point(6, Fence::new(false)),
-            Err(AxError::InvalidInput)
-        );
+        let earlier = Fence::new(false);
+        object.submit_point(6, earlier.clone()).unwrap();
+        assert!(Arc::ptr_eq(&object.fence_at(7).unwrap(), &first));
+        assert!(Arc::ptr_eq(&object.fence_at(6).unwrap(), &earlier));
+        assert_eq!(object.query_point(true), 7);
+        assert!(!first.is_signaled());
+        assert!(!earlier.is_signaled());
     }
 
     #[test]

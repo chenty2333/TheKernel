@@ -1,0 +1,22 @@
+[package]
+name = "thekernel-linux-futex"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["朝倉水希 <asakuramizu111@gmail.com>", "Mivik <mivikq@gmail.com>", "陈天意 <hi@tychen.cc>"]
+description = "Pure Linux futex and futex2 ABI validation plans"
+license = "Apache-2.0"
+repository = "https://github.com/chenty2333/thekernel-linux-abi"
+homepage = "https://github.com/chenty2333/thekernel-linux-abi"
+keywords = ["kernel", "linux", "no-std", "futex"]
+categories = ["no-std", "os"]
+[features]
+default = []
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[package.metadata.thekernel]
+layer = "linux_abi"

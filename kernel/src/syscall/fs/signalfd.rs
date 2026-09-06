@@ -2,12 +2,12 @@ use core::mem::size_of;
 
 use axerrno::{AxError, AxResult};
 use bitflags::bitflags;
-use linux_raw_sys::general::{O_CLOEXEC, O_NONBLOCK};
+use linux_raw_sys::general::{O_CLOEXEC, O_NONBLOCK, O_RDWR};
 use thekernel_linux_signal::SignalSet;
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
 
 use crate::{
-    file::{FileLike, add_file_like, signalfd::Signalfd},
+    file::{FileLike, add_file_like_with_flags, signalfd::Signalfd},
     mm::map_usercopy_error,
 };
 
@@ -55,12 +55,6 @@ pub fn sys_signalfd4<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     check_signalfd_sigset_size(sigsetsize)?;
 
-    let flags = SignalfdFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
-
-    if fd != -1 && flags.contains(SignalfdFlags::CLOEXEC) {
-        return Err(AxError::InvalidInput);
-    }
-
     // Read the signal mask from user space before handling the request mode.
     let mask = unsafe {
         VmPtr::vm_read_uninit(mask, memory)
@@ -68,11 +62,13 @@ pub fn sys_signalfd4<M: UserMemory + ?Sized>(
             .assume_init()
     };
 
+    let flags = SignalfdFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
+
     // If fd is not -1, we should modify the existing signalfd
     if fd != -1 {
         let signalfd = Signalfd::from_fd(fd)?;
         signalfd.update_mask(mask);
-        signalfd.set_nonblocking(flags.contains(SignalfdFlags::NONBLOCK))?;
+        // Linux applies creation flags only when allocating a new descriptor.
         return Ok(fd as _);
     }
 
@@ -81,7 +77,13 @@ pub fn sys_signalfd4<M: UserMemory + ?Sized>(
     signalfd.set_nonblocking(flags.contains(SignalfdFlags::NONBLOCK))?;
 
     // Add to file descriptor table
-    add_file_like(signalfd as _, flags.contains(SignalfdFlags::CLOEXEC)).map(|fd| fd as _)
+    let status_flags = O_RDWR | (flags.bits() & O_NONBLOCK);
+    add_file_like_with_flags(
+        signalfd as _,
+        flags.contains(SignalfdFlags::CLOEXEC),
+        status_flags,
+    )
+    .map(|fd| fd as _)
 }
 
 #[cfg(test)]

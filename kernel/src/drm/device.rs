@@ -819,12 +819,10 @@ impl DrmDevice {
             job.signal_scanout_error();
             return Ok(true);
         }
-        if job
-            .input_fences
-            .iter()
-            .chain(&job.reservation_predecessors)
-            .any(|fence| fence.is_failed())
-        {
+        // Implicit reservations order access until the predecessor is terminal,
+        // like dma_resv_wait_timeout; its error must not poison later writes.
+        // Explicit input dependencies still propagate failure to this commit.
+        if job.input_fences.iter().any(|fence| fence.is_failed()) {
             job.discard_event();
             job.cancellation.end_delivery();
             return Err(DrmError::Busy);
@@ -1618,6 +1616,50 @@ mod tests {
         fn shared_pages(&self) -> DrmResult<Arc<crate::mm::SharedPages>> {
             Err(DrmError::Unsupported)
         }
+    }
+
+    #[test]
+    fn implicit_failed_predecessor_retires_without_poisoning_next_commit() {
+        let device = DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
+        let file = device.open_fbdev_primary();
+        file.become_master().unwrap();
+        let predecessor = Fence::new(false);
+        let completion = Fence::new(false);
+        let mut job = AtomicCommit {
+            owner: file.id(),
+            next: super::super::atomic::initial(&device.state.lock().resources),
+            fb: None,
+            cancellation: super::super::file::EventQueue::new(),
+            event: None,
+            completion: None,
+            present: None,
+            present_target: 0,
+            damage: None,
+            cursor: None,
+            cursor_fb: None,
+            cursor_submitted: false,
+            cursor_fence: None,
+            cursor_target: 0,
+            input_fences: Vec::new(),
+            reservation_predecessors: alloc::vec![predecessor.clone()],
+            scanout_fence: Some(completion.clone()),
+        };
+        assert_eq!(device.complete_atomic(&mut job, 1), Ok(false));
+        assert!(!completion.is_signaled());
+        predecessor.signal_error();
+        assert_eq!(device.complete_atomic(&mut job, 2), Ok(true));
+        assert!(completion.is_signaled());
+        assert!(!completion.is_failed());
+
+        // The same terminal error remains fatal when explicitly supplied.
+        job.input_fences.push(predecessor);
+        assert_eq!(device.complete_atomic(&mut job, 3), Err(DrmError::Busy));
+        job.input_fences.clear();
+        // A failure from this job's own presentation also remains observable.
+        let present = Fence::new(false);
+        present.signal_error();
+        job.present = Some(present);
+        assert_eq!(device.complete_atomic(&mut job, 4), Err(DrmError::Busy));
     }
 
     #[test]

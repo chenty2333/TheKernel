@@ -1,0 +1,125 @@
+[package]
+name = "thekernel-axtask"
+version = "0.1.0"
+edition = "2024"
+authors = ["Yuekai Jia <equation618@gmail.com>"]
+description = "Maintained bounded task, run-queue, wait, and timer mechanisms for no_std kernels"
+license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+homepage = "https://github.com/chenty2333/thekernel-ax"
+repository = "https://github.com/chenty2333/thekernel-ax"
+documentation = "https://docs.rs/thekernel-axtask"
+readme = "README.md"
+
+[lib]
+name = "axtask"
+path = "src/lib.rs"
+
+[features]
+default = []
+multitask = [
+    "dep:axconfig",
+    "dep:axpoll",
+    "dep:axsched",
+    "dep:cpumask",
+    "dep:crate_interface",
+    "dep:event-listener",
+    "dep:futures-util",
+    "dep:kernel_guard",
+    "dep:kspin",
+    "dep:lazyinit",
+    "dep:memory_addr",
+    "dep:percpu",
+    "dep:spin",
+]
+task-ext = ["dep:extern-trait"]
+# A kernel-wide scheduler observer receives every real switch and local timer
+# tick, including idle tasks which intentionally carry no TaskExt payload.
+# Keeping the transport opt-in leaves generic scheduler consumers unchanged.
+scheduler-observer = ["multitask", "dep:crate_interface"]
+irq = ["axhal/irq"]
+# Remote wakeups publish the target run queue first, then use the maintained
+# axhal reason broker to kick the target CPU.  The broker itself is initialized
+# by the consumer after all scheduler run queues are online.
+remote-resched = ["axhal/ipi"]
+# Compatibility sentinel for downstream feature-forwarding manifests. Enabling
+# it is rejected explicitly in lib.rs until axhal exposes fallible TLS setup.
+tls = []
+preempt = ["irq", "percpu?/preempt", "kernel_guard/preempt"]
+smp = ["kspin/smp"]
+# Explicit IRQ-entry/exit integration. TheKernel enables this only with its
+# maintained axhal boundary contract; registry-only consumers keep it off.
+irq-exit = ["multitask", "preempt", "axhal/irq"]
+# Full x86_64 XSAVE/XCR0 task state is a SIMD concern; PKRU is merely one
+# optional component selected by the CPU's XCR0 layout.
+fp-simd = ["multitask", "preempt", "axhal/fp-simd"]
+pkeys = ["fp-simd", "axhal/pkeys"]
+# Consume scheduler-neutral utilization bounds through the x86_64 HWP
+# actuator after context-switch publication.  The task core itself remains
+# platform neutral; builds without this opt-in retain only the state and
+# placement mechanism.
+hwp-uclamp = ["sched-eevdf", "remote-resched", "axhal/hwp-uclamp"]
+# Allocation-free, lock-free trace snapshots for diagnosing IRQ-return
+# scheduling. This is intentionally opt-in because it adds atomics to context
+# switch and suspicious IRQ-off preemption paths.
+irq-continuation-diagnostics = ["multitask", "preempt", "smp"]
+sched-fifo = ["multitask"]
+sched-rr = ["multitask", "preempt"]
+sched-eevdf = ["multitask", "preempt"]
+# Pull-only idle stealing is an independent EEVDF/SMP policy.  Expressing its
+# prerequisites here makes an invalid feature combination unrepresentable to
+# Cargo and keeps ordinary EEVDF+SMP builds free of the stealing path.
+idle-steal = ["smp", "sched-eevdf"]
+# Experimental wake placement; disabled unless the M5 variant requests it.
+sched-wake-locality = ["idle-steal"]
+# EEVDF profiles are compile-time selections. `sched-eevdf` without one of
+# these features is the balanced profile for a reproducible default build.
+eevdf-balanced = ["sched-eevdf", "axsched/eevdf-balanced"]
+eevdf-latency = ["sched-eevdf", "axsched/eevdf-latency"]
+eevdf-throughput = ["sched-eevdf", "axsched/eevdf-throughput"]
+test = ["percpu?/sp-naive"]
+
+[dependencies]
+axconfig = { version = "=0.3.0-preview.2", optional = true }
+axerrno = "0.2"
+axhal = { package = "thekernel-axhal", path = "../thekernel-axhal", version = "=0.3.0-preview.2" }
+axpoll = { package = "thekernel-axpoll", path = "../thekernel-axpoll", version = "0.1.0", optional = true }
+axsched = { package = "thekernel-axsched", path = "../thekernel-axsched", version = "0.1.0", optional = true }
+cfg-if = "1.0"
+cpumask = { version = "0.1", optional = true }
+crate_interface = { version = "0.1", optional = true }
+event-listener = { version = "5.4.0", default-features = false, optional = true }
+extern-trait = { version = "0.4", optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true, features = [
+    "alloc",
+    "async-await-macro",
+] }
+kernel_guard = { version = "0.1", optional = true }
+kspin = { version = "0.1", features = ["smp"], optional = true }
+lazyinit = { version = "0.2", optional = true }
+log = "0.4"
+memory_addr = { version = "0.4", optional = true }
+percpu = { version = "0.2.3-preview.1", features = ["non-zero-vma"], optional = true }
+spin = { version = "0.10", optional = true }
+
+[dev-dependencies]
+axhal = { package = "thekernel-axhal", path = "../thekernel-axhal", version = "=0.3.0-preview.2", features = ["fp-simd"] }
+axsched = { package = "thekernel-axsched", path = "../thekernel-axsched", version = "0.1.0", features = ["test-utils"] }
+
+# Rust 1.99's nightly `Step` contract requires the implementation added in
+# x86_64 0.15.5.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = { version = "=0.15.5", default-features = false }
+
+[package.metadata.docs.rs]
+features = ["multitask", "sched-eevdf", "task-ext"]
+default-target = "x86_64-unknown-none"
+
+[package.metadata.thekernel]
+layer = "platform"
+toolchain = "nightly"
+nightly-features = ["allocator_api", "doc_cfg", "linkage"]
+
+[package.metadata.thekernel.host-test]
+selected = true
+all-targets = true
+features = ["test", "multitask", "irq", "preempt", "smp", "sched-eevdf", "task-ext", "irq-continuation-diagnostics", "irq-exit", "pkeys", "hwp-uclamp", "idle-steal", "scheduler-observer"]

@@ -3,6 +3,7 @@ use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axsync::Mutex;
+use self::shm::Mutex as ShmMutex;
 
 mod mqueue;
 mod msg;
@@ -30,8 +31,8 @@ pub(crate) struct IpcNamespace {
     owner_user_ns: Arc<UserNamespace>,
     msg: Mutex<MsgManager>,
     sem: Mutex<SemManager>,
-    shm: Mutex<ShmManager>,
-    shm_transaction: Mutex<()>,
+    shm: ShmMutex<ShmManager>,
+    shm_transaction: ShmMutex<()>,
     mqueue: Mutex<MqManager>,
     mqueue_notifications: Mutex<MqNotificationRegistry>,
     shm_locked_bytes: Mutex<BTreeMap<Kuid, usize>>,
@@ -52,8 +53,8 @@ impl IpcNamespace {
             owner_user_ns,
             msg: Mutex::new(MsgManager::new()),
             sem: Mutex::new(SemManager::new()),
-            shm: Mutex::new(ShmManager::new()),
-            shm_transaction: Mutex::new(()),
+            shm: ShmMutex::new(ShmManager::new()),
+            shm_transaction: ShmMutex::new(()),
             mqueue: Mutex::new(MqManager::new()),
             mqueue_notifications: Mutex::new(MqNotificationRegistry::new()),
             shm_locked_bytes: Mutex::new(BTreeMap::new()),
@@ -80,10 +81,10 @@ impl IpcNamespace {
     pub(crate) fn sem_manager(&self) -> &Mutex<SemManager> {
         &self.sem
     }
-    pub(crate) fn shm_manager(&self) -> &Mutex<ShmManager> {
+    pub(crate) fn shm_manager(&self) -> &ShmMutex<ShmManager> {
         &self.shm
     }
-    pub(crate) fn shm_transaction(&self) -> &Mutex<()> {
+    pub(crate) fn shm_transaction(&self) -> &ShmMutex<()> {
         &self.shm_transaction
     }
     pub(crate) fn mqueue_manager(&self) -> &Mutex<MqManager> {

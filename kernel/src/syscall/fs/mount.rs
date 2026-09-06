@@ -2443,7 +2443,7 @@ fn pseudo_fs_for_mount(source: &str, fs_type: &str, data: &str) -> AxResult<Opti
             Some(cgroup::new_cgroup_v2_for_namespace(&roots)?)
         }
         "tracefs" | "debugfs" => Some(trace::new_tracefs()),
-        "proc" => Some(crate::pseudofs::proc::new_procfs()),
+        "proc" => Some(crate::pseudofs::proc::new_procfs(current().as_thread().pid_ns())),
         "sysfs" => Some(crate::pseudofs::sys::new_sysfs()),
         "mqueue" => Some(crate::pseudofs::mqueue::new_mqueuefs(
             current().as_thread().ipc_ns(),
@@ -2453,15 +2453,30 @@ fn pseudo_fs_for_mount(source: &str, fs_type: &str, data: &str) -> AxResult<Opti
     })
 }
 
+impl FsMountFd {
+    pub(crate) fn location(&self) -> &Location {
+        &self.root
+    }
+}
+
 impl FileLike for FsMountFd {
     fn stat(&self) -> AxResult<Kstat> {
-        Ok(crate::file::anon_inode_stat())
+        // A mount descriptor retains a real path. Its idmap comes from the
+        // retained tree, including after setns, rather than the caller's
+        // current namespace. Freeze attachment/idmap replacement together.
+        let _operation = self.tree.operation.lock();
+        let mount_id = self.root.mountpoint().mount_id();
+        let topology = self.tree.topology.lock().clone();
+        let idmap = if let Some(topology) = topology {
+            topology.idmap_for_mount(mount_id)?
+        } else {
+            self.tree.idmaps.lock().get(&mount_id).cloned()
+        };
+        crate::file::fs::location_to_kstat_with_idmap(&self.root, idmap.as_deref())
     }
 
     fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
-        Ok(Cow::Borrowed(axfs_ng_vfs::FsPath::new(
-            b"anon_inode:[fsmount]",
-        )))
+        Ok(Cow::Owned(self.root.absolute_path()?))
     }
 
     fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
@@ -4880,21 +4895,21 @@ mod tests {
         let source_root = source_mount.root_location();
         let scoped = source_root
             .create(
-                "scoped",
+                axfs_ng_vfs::FsName::new(b"scoped"),
                 NodeType::Directory,
                 NodePermission::from_bits_truncate(0o700),
             )
             .unwrap();
         let child = scoped
             .create(
-                "child",
+                axfs_ng_vfs::FsName::new(b"child"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
         let outside = source_root
             .create(
-                "outside",
+                axfs_ng_vfs::FsName::new(b"outside"),
                 NodeType::RegularFile,
                 NodePermission::from_bits_truncate(0o600),
             )
@@ -4903,7 +4918,7 @@ mod tests {
         let bind_fs = bind_filesystem_for(&scoped, "tmpfs").unwrap();
         let bind_mount = Mountpoint::new_root(&bind_fs);
         let bind_root = bind_mount.root_location();
-        let bind_child = bind_root.lookup_no_follow("child").unwrap();
+        let bind_child = bind_root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"child")).unwrap();
         assert_ne!(bind_mount.mount_id(), source_mount.mount_id());
 
         let source_handle = source_mount

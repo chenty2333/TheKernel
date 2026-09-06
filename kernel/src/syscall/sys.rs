@@ -807,7 +807,7 @@ pub fn sys_restart_syscall(uctx: &UserContext) -> AxResult<isize> {
     let curr = current();
     let thr = curr.as_thread();
     let Some(block) = thr.begin_restart_syscall(uctx) else {
-        return Err(AxError::InvalidInput);
+        return Err(AxError::Interrupted);
     };
     match block {
         RestartBlock::FutexWait(block) => restart_futex_wait(thr.proc_data.aspace(), block),

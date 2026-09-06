@@ -1,0 +1,5 @@
+This package is derived from TheKernel FD, readiness, and epoll lifecycle work
+distributed under Apache-2.0.
+
+Linux and FreeBSD sources were consulted to understand observable behavior and
+architecture. No Linux or FreeBSD source text is copied into this package.

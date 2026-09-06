@@ -22,6 +22,7 @@
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
@@ -271,9 +272,9 @@ static int unregister_buffer(struct ring *ring) {
     return result == 0 ? 0 : -1;
 }
 
-static int queue_fixed(struct ring *ring, int fd, uint64_t offset,
-                       uintptr_t address, uint32_t length, uint16_t slot,
-                       uint64_t user_data, uint8_t opcode) {
+static int queue_fixed_flags(struct ring *ring, int fd, uint64_t offset,
+                             uintptr_t address, uint32_t length, uint16_t slot,
+                             uint64_t user_data, uint8_t opcode, uint32_t rw_flags) {
     uint32_t head = load_u32(ring->sq_ring, ring->params.sq_off.head);
     uint32_t tail = load_u32(ring->sq_ring, ring->params.sq_off.tail);
     if (tail - head >= ring->params.sq_entries) {
@@ -289,12 +290,20 @@ static int queue_fixed(struct ring *ring, int fd, uint64_t offset,
     write_u64(sqe->bytes, 8, offset);
     write_u64(sqe->bytes, 16, (uint64_t)address);
     write_u32(sqe->bytes, 24, length);
+    write_u32(sqe->bytes, 28, rw_flags);
     write_u64(sqe->bytes, 32, user_data);
     write_u16(sqe->bytes, 40, slot);
     store_u32(ring->sq_ring, ring->params.sq_off.array +
               index * sizeof(uint32_t), index);
     store_u32(ring->sq_ring, ring->params.sq_off.tail, tail + 1);
     return 0;
+}
+
+static int queue_fixed(struct ring *ring, int fd, uint64_t offset,
+                       uintptr_t address, uint32_t length, uint16_t slot,
+                       uint64_t user_data, uint8_t opcode) {
+    return queue_fixed_flags(ring, fd, offset, address, length, slot,
+                             user_data, opcode, 0);
 }
 
 static int enter_and_wait(struct ring *ring, uint32_t to_submit) {
@@ -803,6 +812,33 @@ static int test_invalid_slot(struct ring *ring, int file, unsigned char *buffer)
     return 0;
 }
 
+static int test_nowait_direct(struct ring *ring, int file, unsigned char *buffer) {
+    const uint64_t user_data = 0x4e4f57414954ULL;
+    const uint32_t rwf_nowait = 8U;
+    memset(buffer, 0xa5, DIRECT_BLOCK);
+    if (queue_fixed_flags(ring, file, 0, (uintptr_t)buffer, DIRECT_BLOCK, 0,
+                          user_data, IORING_OP_READ_FIXED, rwf_nowait) != 0 ||
+        enter_admitted(ring, 1U, "nowait-direct-enter") != 0) {
+        return fail_errno("nowait-direct-queue");
+    }
+    int32_t actual = 0;
+    if (wait_result(ring, user_data, &actual, "nowait-direct-cqe") != 0) {
+        return 1;
+    }
+    // Linux may complete direct NOWAIT when its provider can prove immediate
+    // readiness. TheKernel's physical provider has no such proof and must
+    // return EAGAIN without entering its blocking writeback settlement path.
+    if (actual != -EAGAIN && !(linux_host && actual == DIRECT_BLOCK)) {
+        return fail_result("nowait-direct-result", actual, -EAGAIN);
+    }
+    if (actual == -EAGAIN &&
+        check_fill(buffer, DIRECT_BLOCK, 0xa5, "nowait-direct-no-copy") != 0) {
+        return 1;
+    }
+    puts("THEKERNEL_IO_URING_DIRECTIO_NOWAIT_OK");
+    return 0;
+}
+
 static int test_unregister_admitted(struct ring *ring, int file,
                                     unsigned char *buffer) {
     /* Keep a fixed-buffer read blocked on an empty pipe.  A regular-file read
@@ -962,10 +998,12 @@ static int test_close_pending(struct ring *ring, int file,
 static int open_fixture(const char *path, uint64_t *file_size) {
     int seed = open(path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0600);
     if (seed < 0) {
+        fail_errno("fixture-create");
         return -1;
     }
     *file_size = (FRAGMENT_GAP_BLOCKS + 2U) * DIRECT_BLOCK;
     if (ftruncate(seed, (off_t)*file_size) != 0) {
+        fail_errno("fixture-truncate");
         int saved_errno = errno;
         close(seed);
         errno = saved_errno;
@@ -974,6 +1012,7 @@ static int open_fixture(const char *path, uint64_t *file_size) {
     unsigned char block[DIRECT_BLOCK];
     memset(block, 'A', sizeof(block));
     if (write_full_at(seed, block, sizeof(block), 0) != 0) {
+        fail_errno("fixture-write-first");
         int saved_errno = errno;
         close(seed);
         errno = saved_errno;
@@ -982,6 +1021,7 @@ static int open_fixture(const char *path, uint64_t *file_size) {
     memset(block, 'B', sizeof(block));
     if (write_full_at(seed, block, sizeof(block),
                       (off_t)(FRAGMENT_GAP_BLOCKS * DIRECT_BLOCK)) != 0) {
+        fail_errno("fixture-write-fragment");
         int saved_errno = errno;
         close(seed);
         errno = saved_errno;
@@ -989,8 +1029,15 @@ static int open_fixture(const char *path, uint64_t *file_size) {
     }
     memset(block, 'C', sizeof(block));
     if (write_full_at(seed, block, sizeof(block),
-                      (off_t)((FRAGMENT_GAP_BLOCKS + 1U) * DIRECT_BLOCK)) != 0 ||
-        fsync(seed) != 0) {
+                      (off_t)((FRAGMENT_GAP_BLOCKS + 1U) * DIRECT_BLOCK)) != 0) {
+        fail_errno("fixture-write-last");
+        int saved_errno = errno;
+        close(seed);
+        errno = saved_errno;
+        return -1;
+    }
+    if (fsync(seed) != 0) {
+        fail_errno("fixture-sync");
         int saved_errno = errno;
         close(seed);
         errno = saved_errno;
@@ -999,7 +1046,32 @@ static int open_fixture(const char *path, uint64_t *file_size) {
     if (close(seed) != 0) {
         return -1;
     }
-    return open(path, O_RDWR | O_DIRECT | O_CLOEXEC);
+    int direct = open(path, O_RDWR | O_DIRECT | O_CLOEXEC);
+    if (direct < 0) {
+        fail_errno("fixture-direct-open");
+    }
+    if (direct >= 0) {
+        struct statfs filesystem;
+        int status = fcntl(direct, F_GETFL);
+        if (status < 0 || fstatfs(direct, &filesystem) != 0) {
+            int saved_errno = errno;
+            close(direct);
+            errno = saved_errno;
+            return -1;
+        }
+        fprintf(stderr,
+                "io_uring_directio: provider_magic=0x%lx direct_flag=%d "
+                "path=%s physical_dma=not-observable-from-uapi\n",
+                (unsigned long)filesystem.f_type, !!(status & O_DIRECT), path);
+        if (!(status & O_DIRECT) ||
+            (filesystem.f_type != 0xef53)) {
+            close(direct);
+            errno = EPROTO;
+            fail_errno("fixture-provider");
+            return -1;
+        }
+    }
+    return direct;
 }
 
 int main(int argc, char **argv) {
@@ -1020,9 +1092,7 @@ int main(int argc, char **argv) {
         return fail_errno("page-size");
     }
     page_bytes = (size_t)system_page;
-    const char *path = linux_host
-        ? "/tmp/thekernel-io-uring-directio-differential"
-        : "/thekernel-io-uring-directio-differential";
+    const char *path = "/thekernel-io-uring-directio-differential";
     const char *path_override = getenv("THEKERNEL_DIRECTIO_PATH");
     if (linux_host && path_override != NULL && path_override[0] != '\0') {
         path = path_override;
@@ -1061,7 +1131,8 @@ int main(int argc, char **argv) {
         result = fail_errno("buffer-register");
         goto out;
     }
-    if (test_alignment(&ring, file, buffer) != 0 ||
+    if (test_nowait_direct(&ring, file, buffer) != 0 ||
+        test_alignment(&ring, file, buffer) != 0 ||
         test_eof_and_short(&ring, file, buffer, file_size) != 0 ||
         test_sparse_and_fragmented(&ring, file, buffer) != 0 ||
         test_write_fixed(&ring, file, buffer) != 0 ||

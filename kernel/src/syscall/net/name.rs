@@ -162,6 +162,13 @@ pub fn sys_getpeername(
         },
         || read_socklen(&capability, addrlen),
     )?;
+    if pinned.backend()? == SocketBackendKind::Netlink {
+        pinned
+            .netlink()?
+            .write_peer_addr(&capability, addr, &mut length)?;
+        write_socklen(&capability, addrlen, length)?;
+        return Ok(0);
+    }
     let socket = pinned.network()?;
     let peer_addr = socket.peer_addr()?;
     debug!("sys_getpeername <= fd: {fd}, addr: {peer_addr:?}");

@@ -1,0 +1,5 @@
+This package contains a modified migration of StarryOS `starry-process 0.2.0`,
+authored by 朝倉水希 and originally declared as MIT OR Apache-2.0.
+
+The included Apache-2.0 text was recovered from an immediate upstream
+follow-up commit.

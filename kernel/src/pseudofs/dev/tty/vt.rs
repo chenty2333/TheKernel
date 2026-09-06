@@ -185,6 +185,7 @@ impl SeatHooks for KernelSeatHooks {
     fn release(&mut self, _from: SeatTarget) -> AxResult<()> {
         // Input is paused before primary master is relinquished, so neither a
         // compositor nor a stale event FD can consume an event after release.
+        #[cfg(feature = "input")]
         crate::pseudofs::dev::event::pause_input_devices();
         if let SeatTarget::Graphics(owner) = _from
             && let Some(uid) = owner.uid
@@ -210,6 +211,7 @@ impl SeatHooks for KernelSeatHooks {
         // The graphics client gets master through its normal primary-node
         // SET_MASTER after this gate opens.  Render nodes remain independent.
         crate::drm::resume_primary_kms_for_seat();
+        #[cfg(feature = "input")]
         crate::pseudofs::dev::event::resume_input_devices();
         if matches!(target, SeatTarget::Fbcon) {
             super::super::fb::vt_graphics_changed(false);
@@ -222,6 +224,7 @@ impl SeatHooks for KernelSeatHooks {
         // Every abort lands on the known-good text console.  The operations
         // are idempotent for owner exit, hot unplug and seatd restart.
         crate::drm::resume_primary_kms_for_seat();
+        #[cfg(feature = "input")]
         crate::pseudofs::dev::event::resume_input_devices();
         super::super::fb::vt_graphics_changed(false);
         if let SeatTarget::Graphics(owner) = _target
@@ -333,23 +336,28 @@ impl VtManager {
     /// VT state under its spin lock and runs the transaction only afterwards;
     /// no ACL, DRM, input, or fbcon operation can nest under VT locks.
     fn reconcile_seat(&self) {
-        let target = {
-            let state = self.state.lock();
-            let vt = &state.vts[state.active as usize - 1];
-            if vt.graphics {
-                SeatTarget::Graphics(SeatOwner {
-                    pid: vt.graphics_owner,
-                    uid: vt.graphics_uid,
-                    vt: state.active,
-                })
-            } else {
-                SeatTarget::Fbcon
-            }
-        };
         let mut hooks = KernelSeatHooks;
-        if self.seat.transition(target, &mut hooks).is_err() {
-            self.seat.abort_current(&mut hooks);
-        }
+        // SeatLifecycle takes its transaction mutex before sampling VT state.
+        // A helper exit delayed by another transition must observe that
+        // transition's current owner rather than restore an old text seat.
+        let _ = self.seat.transition(
+            || {
+                let state = self.state.lock();
+                let vt = &state.vts[state.active as usize - 1];
+                if vt.graphics {
+                    SeatTarget::Graphics(SeatOwner {
+                        pid: vt.graphics_owner,
+                        uid: vt.graphics_uid,
+                        vt: state.active,
+                    })
+                } else {
+                    SeatTarget::Fbcon
+                }
+            },
+            &mut hooks,
+        );
+        // Failed transitions already restore fbcon while holding their own
+        // transaction mutex; a second unlocked rollback could undo a newer VT.
     }
 
     /// Serializes text rendering with active-console and KD mode changes.

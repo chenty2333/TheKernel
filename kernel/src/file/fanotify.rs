@@ -71,6 +71,11 @@ impl FanotifyEventActor {
             .unwrap_or_default()
     }
 
+    pub(crate) const fn process_id(self) -> u32 { self.tgid as u32 }
+
+    #[cfg(test)]
+    pub(crate) const fn test_process(tgid: c_int) -> Self { Self { tid: tgid, tgid } }
+
     fn pid_for(self, file: &FanotifyFile) -> c_int {
         if file.flags & FAN_REPORT_TID != 0 {
             self.tid
@@ -1491,6 +1496,12 @@ mod tests {
 
         fn flush(&mut self) -> AxResult<()> {
             Ok(())
+        }
+    }
+
+    impl axio::IoBuf for FaultAfterWrites {
+        fn remaining(&self) -> usize {
+            self.remaining
         }
     }
 

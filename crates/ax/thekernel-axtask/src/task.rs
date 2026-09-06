@@ -1,0 +1,3249 @@
+use alloc::{alloc::AllocError, boxed::Box, string::String, sync::Arc};
+#[cfg(feature = "preempt")]
+use core::sync::atomic::AtomicUsize;
+use core::{
+    alloc::Layout,
+    cell::{Cell, UnsafeCell},
+    fmt,
+    future::poll_fn,
+    ops::Deref,
+    ptr::NonNull,
+    sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
+    task::{Context, Poll},
+};
+
+use axhal::context::TaskContext;
+use futures_util::task::AtomicWaker;
+use kspin::SpinNoIrq;
+use memory_addr::VirtAddr;
+
+use crate::{AxCpuMask, AxTask, AxTaskRef, future::block_on};
+
+/// A unique identifier for a thread.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TaskId(u64);
+
+/// Minimum admitted kernel-task stack size.
+///
+/// Context switching, scheduler bookkeeping, and the allocation-free future
+/// executor all run on this stack. Smaller stacks corrupt adjacent allocator
+/// state before Rust can report an error, especially on the EEVDF path, so the
+/// mechanism rejects them before allocation instead of treating the size as a
+/// performance hint.
+pub const MIN_KERNEL_STACK_SIZE: usize = 16 * 1024;
+
+const TASK_MUTATION_IDLE: u8 = 0;
+const TASK_MUTATION_AFFINITY: u8 = 1;
+const TASK_MUTATION_BLOCK: u8 = 2;
+const TASK_MUTATION_WAKE: u8 = 4;
+const TASK_MUTATION_AFFINITY_WAKE_PENDING: u8 = 5;
+const TASK_MUTATION_BLOCK_WAKE_PENDING: u8 = 6;
+// Idle stealing is a ready-task handoff, not a blocked-task publication.
+// Keep its owner outside the existing exact mutation values; a stale wake
+// may set bit 4 and is absorbed when this transaction releases.
+#[cfg(feature = "idle-steal")]
+const TASK_MUTATION_IDLE_STEAL: u8 = 16;
+#[cfg(feature = "idle-steal")]
+const TASK_MUTATION_IDLE_STEAL_WAKE_PENDING: u8 = 20;
+// Include TASK_MUTATION_WAKE so a wait-free wake `fetch_or` leaves an
+// impossible new-task-publication race byte-for-byte unchanged.
+#[cfg(feature = "sched-eevdf")]
+const TASK_MUTATION_PUBLICATION: u8 = 12;
+
+/// Failure while constructing an unpublished task.
+///
+/// Identity exhaustion is deliberately distinct from allocation failure. A
+/// Linux personality may map this mechanism error to its own PID policy, but
+/// it cannot rewind or overwrite the mechanism's identity allocator.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TaskCreateError {
+    /// The requested kernel-stack size was too small or overflowed while aligning.
+    InvalidStackSize,
+    /// Kernel-stack, entry, or task-wrapper allocation failed.
+    OutOfMemory,
+    /// Every non-zero task identity has been allocated.
+    IdentifierExhausted,
+}
+
+/// Durable terminal fault recorded when a runnable task cannot be published.
+///
+/// Valid blocked-task wakeups are designed to be infallible after run-queue
+/// initialization. These values contain violated internal contracts without
+/// pretending the wake succeeded or leaving the failure visible only in a log.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TaskWakeFault {
+    /// The selected CPU had no published run queue.
+    RunQueueUnavailable = 1,
+    /// Scheduler capacity or monotonic ordering space was exhausted.
+    SchedulerCapacity   = 2,
+    /// Intrusive scheduler ownership disagreed with task lifecycle state.
+    SchedulerInvariant  = 3,
+    /// A context-switch wake handoff token was missing or duplicated.
+    HandoffCorrupt      = 4,
+    /// The task was published runnable, but the target CPU rejected the
+    /// best-effort remote reschedule kick. The periodic scheduler tick remains
+    /// the bounded fallback; the wake itself was not lost.
+    RemoteRescheduleFailed = 5,
+}
+
+/// Durable fault in allocation-free exited-task queue ownership.
+///
+/// The exited queue owns one strong task reference through an intrusive link
+/// embedded in each task. These faults describe internal lifecycle contract
+/// violations; normal task admission pressure is reported earlier by
+/// [`TaskCreateError`] and cannot grow a separate exit-queue allocation.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TaskExitQueueFault {
+    /// A task which still belonged to an exited queue was submitted again.
+    DuplicateEnqueue    = 1,
+    /// The monotonic ownership-transfer generation could not advance.
+    GenerationExhausted = 2,
+    /// The queue's exact task count could not be incremented.
+    LengthExhausted     = 3,
+    /// Embedded link state disagreed with queue membership or FIFO topology.
+    CorruptLink         = 4,
+}
+
+/// Failure to snapshot or replace a task name.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TaskNameError {
+    /// String storage could not be allocated outside the task-name lock.
+    OutOfMemory,
+    /// The name grew between sizing and the single bounded copy attempt.
+    ConcurrentMutation,
+}
+
+impl fmt::Display for TaskNameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::OutOfMemory => "task name allocation failed",
+            Self::ConcurrentMutation => "task name changed during snapshot",
+        })
+    }
+}
+
+impl fmt::Display for TaskCreateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidStackSize => "invalid task stack size",
+            Self::OutOfMemory => "task allocation failed",
+            Self::IdentifierExhausted => "task identity space exhausted",
+        })
+    }
+}
+
+/// Copyable ownership token for one synchronous block-wait session.
+///
+/// The token is intentionally not stored in a raw waker. A stale waker is
+/// allowed to cause a harmless spurious wake of the task's current session,
+/// while owner-only prepare/commit/end operations remain generation checked.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct BlockWaitToken(u64);
+
+/// Failure to start a block-wait session on a task.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum BeginBlockWaitError {
+    /// The task already owns an active synchronous wait session.
+    Busy,
+    /// The per-task wait generation cannot advance without wrapping.
+    GenerationExhausted,
+}
+
+/// Action a raw waker must take after publishing a wake.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum BlockWakeAction {
+    /// The task may already be blocked, so the waker must try to unblock it.
+    Unblock,
+    /// The block owner is committing the Running -> Blocked transition and
+    /// will consume this wake itself.
+    BlockOwnerWillConsume,
+    /// No synchronous wait session is active; the wake is stale.
+    Inactive,
+}
+
+/// Result of trying to claim the lost-wake transition before blocking.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum BlockWaitClaim {
+    /// The owner exclusively holds the Running -> Blocked transition.
+    Claimed,
+    /// A wake was already published, so the owner must not block.
+    Woken,
+    /// The token no longer names the active wait session.
+    Stale,
+}
+
+/// Result of publishing the Blocked state under a claimed wait transition.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum BlockWaitCommit {
+    /// The task is Blocked and future wakers are responsible for enqueueing it.
+    Blocked,
+    /// A concurrent waker delegated its wake to the block owner. The task state
+    /// has already been restored to Running.
+    Woken,
+    /// The token or transition ownership was invalid. The task state has been
+    /// restored to Running rather than leaving an orphaned blocked task.
+    Stale,
+}
+
+/// Failure to finish a block-wait session.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum EndBlockWaitError {
+    /// The token no longer names the active wait session.
+    Stale,
+    /// The caller tried to end while its block transition was still claimed.
+    TransitionInProgress,
+}
+
+const BLOCK_WAIT_ACTIVE: u64 = 1 << 0;
+const BLOCK_WAIT_WOKEN: u64 = 1 << 1;
+const BLOCK_WAIT_OWNER: u64 = 1 << 2;
+const BLOCK_WAIT_GENERATION_SHIFT: u32 = 3;
+const BLOCK_WAIT_GENERATION_MAX: u64 = u64::MAX >> BLOCK_WAIT_GENERATION_SHIFT;
+
+struct BlockWaitState(AtomicU64);
+
+impl BlockWaitState {
+    const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    const fn generation(state: u64) -> u64 {
+        state >> BLOCK_WAIT_GENERATION_SHIFT
+    }
+
+    const fn owner_state(token: BlockWaitToken) -> u64 {
+        (token.0 << BLOCK_WAIT_GENERATION_SHIFT) | BLOCK_WAIT_ACTIVE
+    }
+
+    fn begin(&self) -> Result<BlockWaitToken, BeginBlockWaitError> {
+        let mut observed = self.0.load(Ordering::Acquire);
+        loop {
+            if observed & BLOCK_WAIT_ACTIVE != 0 {
+                return Err(BeginBlockWaitError::Busy);
+            }
+            let generation = Self::generation(observed);
+            let Some(next_generation) = generation.checked_add(1) else {
+                return Err(BeginBlockWaitError::GenerationExhausted);
+            };
+            if next_generation > BLOCK_WAIT_GENERATION_MAX {
+                return Err(BeginBlockWaitError::GenerationExhausted);
+            }
+            let next = (next_generation << BLOCK_WAIT_GENERATION_SHIFT) | BLOCK_WAIT_ACTIVE;
+            match self
+                .0
+                .compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(BlockWaitToken(next_generation)),
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    /// Clears a prior spurious wake before polling a future again.
+    fn prepare_poll(&self, token: BlockWaitToken) -> Result<(), EndBlockWaitError> {
+        let expected_owner = Self::owner_state(token);
+        let mut observed = self.0.load(Ordering::Acquire);
+        loop {
+            if observed & !BLOCK_WAIT_WOKEN != expected_owner {
+                return Err(
+                    if observed & BLOCK_WAIT_OWNER != 0 && Self::generation(observed) == token.0 {
+                        EndBlockWaitError::TransitionInProgress
+                    } else {
+                        EndBlockWaitError::Stale
+                    },
+                );
+            }
+            let next = observed & !BLOCK_WAIT_WOKEN;
+            match self
+                .0
+                .compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(()),
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    fn mark_woken(&self) -> BlockWakeAction {
+        let mut observed = self.0.load(Ordering::Acquire);
+        loop {
+            if observed & BLOCK_WAIT_ACTIVE == 0 {
+                return BlockWakeAction::Inactive;
+            }
+            let next = observed | BLOCK_WAIT_WOKEN;
+            match self
+                .0
+                .compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) if observed & BLOCK_WAIT_OWNER != 0 => {
+                    return BlockWakeAction::BlockOwnerWillConsume;
+                }
+                Ok(_) => return BlockWakeAction::Unblock,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    fn is_woken(&self, token: BlockWaitToken) -> bool {
+        let state = self.0.load(Ordering::Acquire);
+        Self::generation(state) == token.0
+            && state & (BLOCK_WAIT_ACTIVE | BLOCK_WAIT_WOKEN)
+                == (BLOCK_WAIT_ACTIVE | BLOCK_WAIT_WOKEN)
+    }
+
+    fn claim_block(&self, token: BlockWaitToken) -> BlockWaitClaim {
+        let expected = Self::owner_state(token);
+        match self.0.compare_exchange(
+            expected,
+            expected | BLOCK_WAIT_OWNER,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => BlockWaitClaim::Claimed,
+            Err(actual)
+                if Self::generation(actual) == token.0
+                    && actual & (BLOCK_WAIT_ACTIVE | BLOCK_WAIT_WOKEN)
+                        == (BLOCK_WAIT_ACTIVE | BLOCK_WAIT_WOKEN) =>
+            {
+                BlockWaitClaim::Woken
+            }
+            Err(_) => BlockWaitClaim::Stale,
+        }
+    }
+
+    /// Releases block-transition ownership. The callback restores the task's
+    /// Running state before ownership becomes visible as released, so a
+    /// delegated waker never observes Blocked without an enqueue owner.
+    fn commit_block(
+        &self,
+        token: BlockWaitToken,
+        mut restore_running: impl FnMut(),
+    ) -> BlockWaitCommit {
+        let mut observed = self.0.load(Ordering::Acquire);
+        loop {
+            if Self::generation(observed) != token.0
+                || observed & (BLOCK_WAIT_ACTIVE | BLOCK_WAIT_OWNER)
+                    != (BLOCK_WAIT_ACTIVE | BLOCK_WAIT_OWNER)
+            {
+                restore_running();
+                return BlockWaitCommit::Stale;
+            }
+            if observed & BLOCK_WAIT_WOKEN != 0 {
+                // State restoration precedes releasing BLOCK_WAIT_OWNER. A raw
+                // waker seeing OWNER delegates to us and never enqueues.
+                restore_running();
+                let next = Self::owner_state(token) | BLOCK_WAIT_WOKEN;
+                match self.0.compare_exchange_weak(
+                    observed,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return BlockWaitCommit::Woken,
+                    Err(actual) => observed = actual,
+                }
+            } else {
+                let next = Self::owner_state(token);
+                match self.0.compare_exchange_weak(
+                    observed,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return BlockWaitCommit::Blocked,
+                    Err(actual) => observed = actual,
+                }
+            }
+        }
+    }
+
+    fn end(&self, token: BlockWaitToken) -> Result<(), EndBlockWaitError> {
+        let mut observed = self.0.load(Ordering::Acquire);
+        loop {
+            if Self::generation(observed) != token.0 || observed & BLOCK_WAIT_ACTIVE == 0 {
+                return Err(EndBlockWaitError::Stale);
+            }
+            if observed & BLOCK_WAIT_OWNER != 0 {
+                return Err(EndBlockWaitError::TransitionInProgress);
+            }
+            let next = token.0 << BLOCK_WAIT_GENERATION_SHIFT;
+            match self
+                .0
+                .compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(()),
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+}
+
+#[cfg(feature = "smp")]
+const CPU_OWNER_NONE: u64 = 0;
+#[cfg(feature = "smp")]
+const CPU_OWNER_WAKE_PENDING: u64 = 1 << 63;
+#[cfg(feature = "smp")]
+// The supported x86_64 platform has far fewer than 2^16 CPUs. Keep a fixed
+// tag width so the remaining owner-token bits provide a practical lifetime
+// budget for a task that is switched in and out repeatedly.
+const CPU_OWNER_CPU_BITS: u32 = 16;
+#[cfg(feature = "smp")]
+const CPU_OWNER_CPU_MASK: u64 = (1u64 << CPU_OWNER_CPU_BITS) - 1;
+#[cfg(feature = "smp")]
+const CPU_OWNER_GENERATION_MASK: u64 = (1u64 << (64 - 1 - CPU_OWNER_CPU_BITS)) - 1;
+
+/// Publication result when a blocked task is still owned by a remote CPU's
+/// context-switch epilogue.
+#[cfg(feature = "smp")]
+pub(crate) enum WakeHandoffPublication {
+    /// The old CPU now owns the strong task reference and will enqueue it.
+    Deferred,
+    /// The old CPU had already completed; the caller must enqueue this task.
+    Ready(AxTaskRef),
+    /// An impossible second handoff was already present. The caller retains
+    /// the task so the failure is explicit rather than leaked or overwritten.
+    Occupied(AxTaskRef),
+}
+
+/// Result returned to the old CPU when it completes a context-switch handoff.
+#[cfg(feature = "smp")]
+pub(crate) enum CpuHandoffCompletion {
+    /// No wake raced with the context switch.
+    Cleared,
+    /// A remote waker delegated this owned task for publication.
+    Wake(AxTaskRef),
+    /// The CPU-state flag was already clear.
+    AlreadyCleared,
+    /// The wake state was published without its required owned task pointer.
+    MissingWake,
+    /// The expected old owner was already replaced by a newer generation.
+    /// The newer owner is left untouched; callers must contain the stale
+    /// clear rather than retrying with the current token.
+    Stale,
+}
+
+struct TaskIdAllocator(AtomicU64);
+
+impl TaskIdAllocator {
+    const fn new(next: u64) -> Self {
+        Self(AtomicU64::new(next))
+    }
+
+    fn allocate(&self) -> Result<TaskId, TaskCreateError> {
+        self.allocate_up_to(TaskId::MAX)
+    }
+
+    /// Allocates one monotonic identity no greater than `maximum`.
+    ///
+    /// A personality with a narrower public identity type can use this before
+    /// allocating any task-owned resources. Rejection does not advance the
+    /// generic allocator, while an unrestricted kernel-task allocation may
+    /// still consume identities above that personality's ceiling.
+    fn allocate_up_to(&self, maximum: u64) -> Result<TaskId, TaskCreateError> {
+        self.0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                (next != 0 && next <= maximum.min(TaskId::MAX))
+                    .then(|| next.checked_add(1).unwrap_or(0))
+            })
+            .map(TaskId)
+            .map_err(|_| TaskCreateError::IdentifierExhausted)
+    }
+}
+
+/// The possible states of a task.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TaskState {
+    /// Task is running on some CPU.
+    Running = 1,
+    /// Task is ready to run on some scheduler's ready queue.
+    Ready   = 2,
+    /// Task is blocked (in the wait queue or timer list),
+    /// and it has finished its scheduling process, it can be wake up by `notify()` on any run queue safely.
+    Blocked = 3,
+    /// Task is exited and waiting for being dropped.
+    Exited  = 4,
+}
+
+/// Failure to decode a raw task-state representation.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TaskStateDecodeError {
+    value: u8,
+}
+
+impl TaskStateDecodeError {
+    /// Returns the unknown raw representation.
+    pub const fn value(self) -> u8 {
+        self.value
+    }
+}
+
+struct TaskAffinity {
+    mask: AxCpuMask,
+    #[cfg(feature = "smp")]
+    pending_migration: Option<AxTaskRef>,
+}
+
+impl TaskAffinity {
+    fn new(mask: AxCpuMask) -> Self {
+        Self {
+            mask,
+            #[cfg(feature = "smp")]
+            pending_migration: None,
+        }
+    }
+}
+
+#[cfg(feature = "smp")]
+pub(crate) enum MigrationClaim {
+    Allowed,
+    Prepared(AxTaskRef),
+    Missing,
+}
+
+/// Result of claiming the one runnable-publication obligation created by a
+/// raw blocked-task wake.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum WakeMutationClaim {
+    /// This waker owns the complete Blocked -> runnable publication.
+    Claimed,
+    /// An affinity transaction will inherit the publication when it releases.
+    DeferredToAffinity,
+    /// The block publisher will inherit the publication after committing the
+    /// Blocked state and releasing its source runqueue lock.
+    DeferredToBlock,
+    /// Another waker or the affinity owner already owns the publication.
+    AlreadyOwned,
+    /// Wake publication raced an incompatible or corrupt mutation owner.
+    Corrupt,
+}
+
+/// Result of releasing one affinity transaction.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum AffinityMutationCompletion {
+    /// No wake arrived while affinity ownership was held.
+    Released,
+    /// A waker delegated its runnable-publication obligation to this owner.
+    WakeClaimed,
+    /// The task mutation word did not contain a valid affinity-owned state.
+    Corrupt,
+}
+
+/// RAII owner for one bounded idle-steal task mutation.
+///
+/// The guard is intentionally separate from [`AffinityMutationCompletion`]:
+/// an idle steal only transfers a task which is already Ready, so a racing
+/// wake is not allowed to create a second enqueue obligation.
+#[cfg(feature = "idle-steal")]
+pub(crate) struct IdleStealMutation<'a>(&'a AxTaskRef);
+
+#[cfg(feature = "idle-steal")]
+impl<'a> IdleStealMutation<'a> {
+    #[cfg(test)]
+    pub(crate) fn try_begin(task: &'a AxTaskRef) -> Option<Self> {
+        if task.try_begin_idle_steal_mutation() {
+            Some(Self(task))
+        } else {
+            None
+        }
+    }
+
+    /// Reify a guard after the bounded scheduler predicate has claimed the
+    /// task. The caller must pass the exact task reference whose claim it
+    /// owns; no additional mutation transition is performed here.
+    pub(crate) fn claimed(task: &'a AxTaskRef) -> Self {
+        Self(task)
+    }
+}
+
+#[cfg(feature = "idle-steal")]
+impl Drop for IdleStealMutation<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.finish_idle_steal_mutation();
+    }
+}
+
+/// Result of releasing one Running -> Blocked publication transaction.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum BlockMutationCompletion {
+    /// No post-commit wake arrived while block publication was owned.
+    Released,
+    /// A post-commit waker delegated its runnable-publication obligation.
+    WakeClaimed,
+    /// The task mutation word did not contain a valid block-owned state.
+    Corrupt,
+}
+
+/// Result of trying to own one current-task Blocked publication.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum BlockMutationClaim {
+    /// This caller owns the complete mask/CPU/state block transaction.
+    Claimed,
+    /// A valid affinity or wake publication is active; abort and repoll.
+    Busy,
+    /// A current task was already owned by an impossible mutation domain.
+    Corrupt,
+}
+
+/// User-defined task extended data.
+///
+/// The reason is supplied at the actual scheduler handoff, rather than
+/// inferred from the task state after it has become Ready.  This preserves
+/// Linux's voluntary/involuntary switch distinction for rusage accounting.
+#[cfg(feature = "task-ext")]
+#[extern_trait::extern_trait(
+    /// The impl proxy type for [`TaskExt`].
+    pub AxTaskExt
+)]
+pub trait TaskExt {
+    /// Called when the task is switched in.
+    fn on_enter(&self, _task: &TaskInner) {}
+    /// Called at the exact scheduler handoff for both participants. `peer` is
+    /// the task being switched to when `switch_out` is true and the task being
+    /// switched from otherwise. Implementations must remain allocation-free.
+    fn on_switch(
+        &self,
+        _task: &TaskInner,
+        _peer: &TaskInner,
+        _switch_out: bool,
+        _reason: SwitchReason,
+    ) {
+    }
+    /// Called when the task is switched out.
+    fn on_leave(&self, _task: &TaskInner, _reason: SwitchReason) {}
+    /// Called by the owning raw-waker immediately before publishing a blocked
+    /// task runnable. Implementations must be allocation-free and may only
+    /// perform lock-free state transitions.
+    fn on_ready_wake(&self, _task: &TaskInner) {}
+    /// Called for the current task from the periodic timer interrupt.
+    ///
+    /// Implementations must be allocation-free, non-blocking, and bounded.
+    /// They may publish a pre-admitted IRQ-safe mechanism wake, but must not
+    /// run subsystem policy, signal delivery, or scheduler recursion here.
+    /// Returning `true` requests a normal reschedule boundary after IRQ exit.
+    fn on_timer_tick(&self, _task: &TaskInner) -> bool {
+        false
+    }
+}
+
+/// Why a task stopped running at a scheduler switch edge.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SwitchReason {
+    /// The task explicitly yielded the processor.
+    Yield,
+    /// The task blocked waiting for an event or timer.
+    Block,
+    /// The scheduler preempted the task while it remained runnable.
+    Preempt,
+    /// The task was moved to another run queue.
+    Migrate,
+    /// The task exited and can no longer be scheduled.
+    Exit,
+}
+
+impl SwitchReason {
+    /// Returns whether this switch is a scheduler-forced transition from a
+    /// runnable task. An explicit yield is still involuntary for Linux's
+    /// `ru_nivcsw` accounting; blocking and exit transitions are voluntary.
+    pub const fn is_involuntary(self) -> bool {
+        matches!(self, Self::Yield | Self::Preempt | Self::Migrate)
+    }
+
+    /// Task exit is a voluntary context switch: Linux accounts the final
+    /// TASK_DEAD handoff in `ru_nvcsw`.
+    pub const fn counts_as_context_switch(self) -> bool {
+        true
+    }
+}
+
+/// The inner task structure.
+pub struct TaskInner {
+    id: TaskId,
+    name: SpinNoIrq<String>,
+    is_idle: bool,
+    is_init: bool,
+    /// A short-lived CPU migration helper runs outside the source scheduler's
+    /// `running` slot while it commits/rolls back the parked task handoff.
+    is_migration_helper: bool,
+
+    entry: Cell<Option<Box<dyn FnOnce()>>>,
+    state: AtomicU8,
+    /// Terminal transaction marker published before the scheduler tears down
+    /// the current task. `state` remains `Running` until `notify_exit` can
+    /// publish the exit code and wake joiners, so scheduler-parameter updates
+    /// must consult this marker under the run-queue lock as well.
+    terminalizing: AtomicBool,
+
+    /// Serializes new-task, affinity, block-owner, and wake publication. A raw
+    /// waker performs only a bounded sequence of exact state transitions: it
+    /// either owns `WAKE`, delegates to an active affinity/block transaction,
+    /// or observes an existing wake owner. Thus affinity and the committed
+    /// blocked CPU cannot change across Ready-before-enqueue or deferred CPU
+    /// handoff windows.
+    /// Other task state remains protected by its existing scheduler/field
+    /// ownership domains rather than by this narrow transaction word.
+    mutation: AtomicU8,
+
+    /// CPU affinity and its at-most-one pre-admitted migration helper are one
+    /// publication domain. Observing a newly disallowed CPU therefore always
+    /// implies that the no-allocation scheduling safe point can claim a helper.
+    affinity: SpinNoIrq<TaskAffinity>,
+
+    /// Used to indicate the CPU ID where the task is running or will run.
+    cpu_id: AtomicU32,
+    /// Per-task scheduler transaction generation; durable task snapshots only
+    /// compare commits from this same stream.
+    sched_commit_version: AtomicU64,
+    /// ABI-visible scheduler policy bit, serialized by the owning run queue.
+    sched_reset_on_spawn: AtomicBool,
+    /// Requested utilization bounds. The low half is the minimum and the high
+    /// half the maximum; the representation preserves the complete `u32`
+    /// mechanism domain without imposing an ABI scale.
+    ///
+    /// This is owned by the same run-queue transaction which publishes
+    /// `sched_reset_on_spawn` and `sched_params`; atomic storage is only used
+    /// for pre-publication inheritance and never substitutes for that lock.
+    sched_utilization_bounds: AtomicU64,
+    /// Raw Linux uclamp request.  This is deliberately distinct from the
+    /// effective bounds above: class defaults and the two ownership bits must
+    /// survive a later class transition and fork reset.
+    #[cfg(feature = "sched-eevdf")]
+    sched_uclamp_request: AtomicU64,
+    /// True exactly while this runnable task contributes one entry to its
+    /// owning run queue's utilization-clamp multiset.
+    #[cfg(feature = "sched-eevdf")]
+    sched_uclamp_accounted: AtomicBool,
+    /// CPU on which this task most recently received a context-switch-in.
+    /// This is separate from `cpu_id`, which is the current routing owner and
+    /// may be published ahead of a migration commit.
+    #[cfg(feature = "idle-steal")]
+    last_run_cpu: AtomicU32,
+    /// Monotonic timestamp of the most recent context-switch-in. A zero value
+    /// means the task has not yet been observed running by the scheduler.
+    #[cfg(feature = "idle-steal")]
+    last_run_ns: AtomicU64,
+    /// CPU time accumulated across preemptions in the current blocking burst.
+    #[cfg(feature = "sched-wake-locality")]
+    wake_burst_ns: AtomicU64,
+    #[cfg(feature = "sched-wake-locality")]
+    wake_run_started_ns: AtomicU64,
+    #[cfg(feature = "sched-wake-locality")]
+    wake_burst_ewma_ns: AtomicU64,
+    #[cfg(feature = "sched-wake-locality")]
+    wake_short_bursts: AtomicU32,
+    /// One task-local CPU+generation owner. Zero means that no context-switch
+    /// lifecycle currently owns the task; the high bit marks a wake pointer
+    /// delegated to the exact owner generation. The owner is intentionally a
+    /// single atomic so ready migration can reject a task with one cache-hot
+    /// Acquire load and the old CPU can clear only its saved token.
+    #[cfg(feature = "smp")]
+    cpu_handoff: AtomicU64,
+    /// Monotonic per-task owner generation. It is never reused or wrapped,
+    /// preventing a delayed old-CPU clear from matching a future owner.
+    #[cfg(feature = "smp")]
+    cpu_handoff_generation: AtomicU64,
+    /// At most one strong self reference delegated by a remote blocked-task
+    /// wake while the old CPU completes its context-switch epilogue.
+    #[cfg(feature = "smp")]
+    wake_handoff: AtomicPtr<AxTask>,
+
+    #[cfg(feature = "preempt")]
+    need_resched: AtomicBool,
+    #[cfg(feature = "preempt")]
+    preempt_disable_count: AtomicUsize,
+
+    /// Prevents recursive deferred-work dispatch on this task.
+    deferred_work_dispatching: AtomicBool,
+
+    interrupted: AtomicBool,
+    interrupt_waker: AtomicWaker,
+
+    /// Allocation-free, generation-checked lost-wake handshake used by
+    /// synchronous future executors. Linux interruption policy stays above
+    /// this generic task mechanism.
+    block_wait: BlockWaitState,
+
+    /// First terminal wake-publication fault. Zero means no fault; the first
+    /// failure wins so later symptoms cannot overwrite the root cause.
+    wake_fault: AtomicU8,
+
+    /// Intrusive exited-task FIFO link. The queue turns one `Arc<AxTask>` into
+    /// a raw pointer while this task is queued and reconstructs that exact
+    /// ownership unit when it pops the task.
+    exit_next: AtomicPtr<AxTask>,
+    /// True exactly while one per-CPU exited queue owns the task's raw Arc.
+    exit_queued: AtomicBool,
+    /// Monotonic ownership-transfer generation; it never wraps.
+    exit_queue_generation: AtomicU64,
+    /// First exited-queue ownership fault. Zero means no fault.
+    exit_queue_fault: AtomicU8,
+
+    exit_code: AtomicI32,
+    wait_for_exit: AtomicWaker,
+
+    kstack: Option<TaskStack>,
+    // Keep the large XSAVE image out of by-value task ownership transfers.
+    ctx: Box<UnsafeCell<TaskContext>>,
+    /// ABI-visible CET feature/lock state published independently of the
+    /// scheduler context. A proc reader must never dereference a running
+    /// foreign task's `TaskContext`, nor read that CPU's CET MSRs.
+    #[cfg(target_arch = "x86_64")]
+    published_user_cet_status: AtomicU64,
+
+    #[cfg(feature = "task-ext")]
+    task_ext: Option<AxTaskExt>,
+}
+
+impl TaskId {
+    /// Largest task identity. Zero and `u64::MAX` are reserved for synchronization states.
+    pub const MAX: u64 = u64::MAX - 1;
+
+    fn try_new() -> Result<Self, TaskCreateError> {
+        TASK_IDS.allocate()
+    }
+
+    fn try_new_up_to(maximum: u64) -> Result<Self, TaskCreateError> {
+        TASK_IDS.allocate_up_to(maximum)
+    }
+
+    /// Convert the task ID to a `u64`.
+    pub const fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+static TASK_IDS: TaskIdAllocator = TaskIdAllocator::new(1);
+
+impl TryFrom<u8> for TaskState {
+    type Error = TaskStateDecodeError;
+
+    #[inline]
+    fn try_from(state: u8) -> Result<Self, Self::Error> {
+        match state {
+            1 => Ok(Self::Running),
+            2 => Ok(Self::Ready),
+            3 => Ok(Self::Blocked),
+            4 => Ok(Self::Exited),
+            value => Err(TaskStateDecodeError { value }),
+        }
+    }
+}
+
+unsafe impl Send for TaskInner {}
+unsafe impl Sync for TaskInner {}
+
+#[cfg(feature = "preempt")]
+struct PreemptDispatchGuard<'a>(&'a TaskInner);
+
+#[cfg(feature = "preempt")]
+const MAX_PREEMPT_DISPATCH_PASSES: usize = 8;
+
+#[cfg(feature = "preempt")]
+impl<'a> PreemptDispatchGuard<'a> {
+    fn new(task: &'a TaskInner) -> Self {
+        task.disable_preempt();
+        PreemptDispatchGuard(task)
+    }
+}
+
+#[cfg(feature = "preempt")]
+impl Drop for PreemptDispatchGuard<'_> {
+    fn drop(&mut self) {
+        // The owner drains `need_resched` iteratively. Its final decrement must
+        // never re-enter the dispatcher synchronously.
+        self.0.enable_preempt(false);
+    }
+}
+
+impl TaskInner {
+    pub fn next_sched_commit_version(&self) -> u64 {
+        self.sched_commit_version.fetch_add(1, Ordering::AcqRel)
+    }
+    pub fn sched_commit_version(&self) -> u64 {
+        self.sched_commit_version
+            .load(Ordering::Acquire)
+            .wrapping_sub(1)
+    }
+    pub(crate) fn sched_reset_on_spawn(&self) -> bool {
+        self.sched_reset_on_spawn.load(Ordering::Relaxed)
+    }
+    pub(crate) fn set_sched_reset_on_spawn(&self, enabled: bool) {
+        self.sched_reset_on_spawn.store(enabled, Ordering::Relaxed);
+    }
+    pub(crate) fn sched_utilization_bounds(&self) -> (u32, u32) {
+        let bounds = self.sched_utilization_bounds.load(Ordering::Relaxed);
+        (bounds as u32, (bounds >> 32) as u32)
+    }
+    pub(crate) fn set_sched_utilization_bounds(&self, min: u32, max: u32) {
+        debug_assert!(min <= max);
+        self.sched_utilization_bounds
+            .store(u64::from(min) | (u64::from(max) << 32), Ordering::Relaxed);
+    }
+    #[cfg(feature = "sched-eevdf")]
+    pub(crate) fn sched_uclamp_request(&self) -> crate::api::UclampRequest {
+        let packed = self.sched_uclamp_request.load(Ordering::Relaxed);
+        crate::api::UclampRequest {
+            minimum: (packed & 0x7ff) as u16,
+            maximum: ((packed >> 11) & 0x7ff) as u16,
+            minimum_user_defined: packed & (1 << 22) != 0,
+            maximum_user_defined: packed & (1 << 23) != 0,
+        }
+    }
+    #[cfg(feature = "sched-eevdf")]
+    pub(crate) fn set_sched_uclamp_request(&self, request: crate::api::UclampRequest) {
+        debug_assert!(request.minimum <= 1024);
+        debug_assert!(request.maximum <= 1024);
+        let packed = u64::from(request.minimum)
+            | (u64::from(request.maximum) << 11)
+            | (u64::from(request.minimum_user_defined) << 22)
+            | (u64::from(request.maximum_user_defined) << 23);
+        self.sched_uclamp_request.store(packed, Ordering::Relaxed);
+    }
+    #[cfg(feature = "sched-eevdf")]
+    pub(crate) fn claim_sched_uclamp_accounting(&self) -> bool {
+        self.sched_uclamp_accounted
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+    #[cfg(feature = "sched-eevdf")]
+    pub(crate) fn release_sched_uclamp_accounting(&self) -> bool {
+        self.sched_uclamp_accounted
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+    #[cfg(feature = "sched-eevdf")]
+    pub(crate) fn sched_uclamp_is_accounted(&self) -> bool {
+        self.sched_uclamp_accounted.load(Ordering::Acquire)
+    }
+    /// Fallibly creates a new unpublished task.
+    ///
+    /// This constructor is intentionally fallible in the 0.1 contract: both
+    /// allocation and monotonic identity exhaustion must reach the lifecycle
+    /// owner before any task is published.
+    pub fn new<F>(entry: F, name: String, stack_size: usize) -> Result<Self, TaskCreateError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        Self::try_new(entry, name, stack_size)
+    }
+
+    /// Fallibly creates an unpublished task, including its entry ownership and
+    /// kernel stack.
+    pub fn try_new<F>(entry: F, name: String, stack_size: usize) -> Result<Self, TaskCreateError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        Self::try_new_with_identity(entry, name, stack_size, TaskId::try_new)
+    }
+
+    /// Fallibly creates an unpublished task whose generic identity must fit a
+    /// caller-owned finite identity domain.
+    ///
+    /// The ceiling is checked atomically against the shared monotonic allocator
+    /// before allocating a stack or boxing the entry closure. This lets an OS
+    /// personality reject identity exhaustion without truncation, rollback, or
+    /// a second task-ID allocator.
+    pub fn try_new_with_id_limit<F>(
+        entry: F,
+        name: String,
+        stack_size: usize,
+        maximum_id: u64,
+    ) -> Result<Self, TaskCreateError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        Self::try_new_with_identity(entry, name, stack_size, || {
+            TaskId::try_new_up_to(maximum_id)
+        })
+    }
+
+    fn try_new_with_identity<F>(
+        entry: F,
+        name: String,
+        stack_size: usize,
+        allocate_id: impl FnOnce() -> Result<TaskId, TaskCreateError>,
+    ) -> Result<Self, TaskCreateError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let stack_size = stack_size
+            .checked_add(4095)
+            .map(|size| size & !4095)
+            .filter(|size| *size >= MIN_KERNEL_STACK_SIZE)
+            .ok_or(TaskCreateError::InvalidStackSize)?;
+        let mut t = Self::new_common(allocate_id()?, name)?;
+        debug!("new task id: {}", t.id.as_u64());
+        let kstack = TaskStack::try_alloc(stack_size).map_err(|_| TaskCreateError::OutOfMemory)?;
+        let entry = Box::try_new(entry).map_err(|_| TaskCreateError::OutOfMemory)?;
+
+        let tls = VirtAddr::from(0);
+
+        t.entry = Cell::new(Some(entry));
+        t.ctx_mut()
+            .init(task_entry as *const () as usize, kstack.top(), tls);
+        t.kstack = Some(kstack);
+        if t.name.lock().as_str() == "idle" {
+            t.is_idle = true;
+        }
+        Ok(t)
+    }
+
+    /// Gets the ID of the task.
+    pub const fn id(&self) -> TaskId {
+        self.id
+    }
+
+    /// Gets the name of the task.
+    pub fn name(&self) -> Result<String, TaskNameError> {
+        self.try_name()
+    }
+
+    /// Fallibly snapshots the task name without allocating under its spin lock.
+    pub fn try_name(&self) -> Result<String, TaskNameError> {
+        let mut name = String::new();
+        let required = self.name.lock().len();
+        if name.capacity() < required {
+            name.try_reserve_exact(required)
+                .map_err(|_| TaskNameError::OutOfMemory)?;
+        }
+        let current = self.name.lock();
+        if name.capacity() < current.len() {
+            return Err(TaskNameError::ConcurrentMutation);
+        }
+        name.push_str(&current);
+        Ok(name)
+    }
+
+    /// Copies a bounded task-name prefix without allocating. Scheduler trace
+    /// producers use this while IRQs are disabled; the returned length never
+    /// exceeds `out.len()`.
+    pub fn copy_name_into(&self, out: &mut [u8]) -> usize {
+        let name = self.name.lock();
+        let len = core::cmp::min(name.len(), out.len());
+        out[..len].copy_from_slice(&name.as_bytes()[..len]);
+        len
+    }
+
+    /// Set the name of the task.
+    pub fn set_name(&self, name: &str) -> Result<(), TaskNameError> {
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(name.len())
+            .map_err(|_| TaskNameError::OutOfMemory)?;
+        owned.push_str(name);
+        let name = owned;
+        drop(self.replace_name(name));
+        Ok(())
+    }
+
+    /// Replace the task name with an already-owned string.
+    ///
+    /// Constructing the replacement before taking the task-name lock keeps
+    /// allocator work out of the spin-locked section. Returning the previous
+    /// string likewise lets callers defer its destructor until after the lock
+    /// has been released.
+    pub fn replace_name(&self, name: String) -> String {
+        core::mem::replace(&mut *self.name.lock(), name)
+    }
+
+    /// Get a combined string of the task ID and name.
+    pub fn id_name(&self) -> Result<alloc::string::String, TaskNameError> {
+        use core::fmt::Write;
+
+        let name = self.try_name()?;
+        let mut description = String::new();
+        description
+            .try_reserve(name.len().saturating_add(32))
+            .map_err(|_| TaskNameError::OutOfMemory)?;
+        write!(&mut description, "Task({}, {})", self.id.as_u64(), name)
+            .map_err(|_| TaskNameError::OutOfMemory)?;
+        Ok(description)
+    }
+
+    /// Wait for the task to exit, and return the exit code.
+    ///
+    /// It will return immediately if the task has already exited (but not dropped).
+    pub fn join(&self) -> Result<i32, crate::future::BlockOnError> {
+        block_on(poll_fn(|cx| self.poll_join(cx)))
+    }
+
+    fn exited_code(&self) -> Option<i32> {
+        (self.state() == TaskState::Exited).then(|| self.exit_code.load(Ordering::Acquire))
+    }
+
+    fn poll_join(&self, cx: &mut Context<'_>) -> Poll<i32> {
+        if let Some(exit_code) = self.exited_code() {
+            return Poll::Ready(exit_code);
+        }
+
+        self.register_join_waiter_and_recheck(cx)
+    }
+
+    fn register_join_waiter_and_recheck(&self, cx: &mut Context<'_>) -> Poll<i32> {
+        self.wait_for_exit.register(cx.waker());
+
+        // Exit can race between the first state check and waker publication.
+        // Rechecking after registration makes both interleavings safe: either
+        // the registered waker observes a later exit, or this poll observes an
+        // exit whose earlier wake had no waiter to consume it.
+        self.exited_code().map_or(Poll::Pending, Poll::Ready)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_join_waiter_and_recheck_for_test(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<i32> {
+        self.register_join_waiter_and_recheck(cx)
+    }
+
+    /// Returns a reference to the task extended data.
+    #[cfg(feature = "task-ext")]
+    pub fn task_ext(&self) -> Option<&AxTaskExt> {
+        self.task_ext.as_ref()
+    }
+
+    /// Returns a mutable reference to the task extended data.
+    #[cfg(feature = "task-ext")]
+    pub fn task_ext_mut(&mut self) -> &mut Option<AxTaskExt> {
+        &mut self.task_ext
+    }
+
+    /// Returns a mutable reference to the task context.
+    #[inline]
+    pub fn ctx_mut(&mut self) -> &mut TaskContext {
+        self.ctx.get_mut()
+    }
+
+    /// Publishes CET feature and lock bits for status-style observers.
+    ///
+    /// PL3_SSP remains CPU-local while a task runs, so it is deliberately not
+    /// included. Both ABI-visible status fields share one atomic publication.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub fn publish_user_cet_status(&self, state: axhal::asm::UserCetState) {
+        let packed = (state.u_cet as u32 as u64) | ((state.locked as u32 as u64) << 32);
+        self.published_user_cet_status
+            .store(packed, Ordering::Release);
+    }
+
+    /// Returns the last task-published CET feature and lock bits.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    pub fn published_user_cet_status(&self) -> (u64, u64) {
+        let packed = self.published_user_cet_status.load(Ordering::Acquire);
+        (packed as u32 as u64, (packed >> 32) as u32 as u64)
+    }
+
+    /// Copies the current task's complete XSAVE image into this unpublished
+    /// task. Taking `&mut self` makes publication while mutating the child
+    /// impossible; the parent is pinned while its live state is saved.
+    #[cfg(feature = "fp-simd")]
+    pub fn inherit_current_xsave(&mut self) {
+        let _guard = kernel_guard::NoPreemptIrqSave::new();
+        let parent = crate::api::current();
+        unsafe {
+            let parent = &mut *parent.ctx_mut_ptr();
+            parent.ext_state.save();
+            self.ctx_mut().inherit_extended_state_from(parent);
+        }
+    }
+
+    /// Returns the top address of the kernel stack.
+    #[inline]
+    pub const fn kernel_stack_top(&self) -> Option<VirtAddr> {
+        match &self.kstack {
+            Some(s) => Some(s.top()),
+            None => None,
+        }
+    }
+
+    /// Returns the CPU ID where the task is running or will run.
+    ///
+    /// Note: the task may not be running on the CPU, it just exists in the run queue.
+    #[inline]
+    pub fn cpu_id(&self) -> u32 {
+        self.cpu_id.load(Ordering::Acquire)
+    }
+
+    /// Return the CPU which most recently switched this task in.
+    #[inline]
+    #[cfg(feature = "idle-steal")]
+    pub(crate) fn last_run_cpu(&self) -> u32 {
+        self.last_run_cpu.load(Ordering::Acquire)
+    }
+
+    /// Return the monotonic timestamp of the most recent switch-in.
+    #[inline]
+    #[cfg(feature = "idle-steal")]
+    pub(crate) fn last_run_ns(&self) -> u64 {
+        self.last_run_ns.load(Ordering::Acquire)
+    }
+
+    /// Gets the cpu affinity mask of the task.
+    ///
+    /// Returns the cpu affinity mask of the task in type [`AxCpuMask`].
+    #[inline]
+    pub fn cpumask(&self) -> AxCpuMask {
+        self.affinity.lock().mask
+    }
+
+    /// Snapshots the task's affinity while excluding CPUs without an
+    /// initialized run queue.
+    ///
+    /// The affinity lock is the publication domain for both the mask and its
+    /// paired migration helper, so this cannot observe an affinity update half
+    /// way through publication.  A terminal task has no usable scheduler
+    /// affinity and is reported separately from an empty active topology.
+    pub(crate) fn allowed_active_cpus(&self, active_cpus: AxCpuMask) -> Option<AxCpuMask> {
+        if self.is_terminalizing() || matches!(self.state(), TaskState::Exited) {
+            return None;
+        }
+
+        let affinity = self.affinity.lock();
+        if self.is_terminalizing() || matches!(self.state(), TaskState::Exited) {
+            return None;
+        }
+        Some(affinity.mask & active_cpus)
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    pub(crate) fn try_reserve_publication_mutation(&self) -> bool {
+        self.mutation
+            .compare_exchange(
+                TASK_MUTATION_IDLE,
+                TASK_MUTATION_PUBLICATION,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    pub(crate) fn release_publication_mutation(&self) -> bool {
+        if self
+            .mutation
+            .compare_exchange(
+                TASK_MUTATION_PUBLICATION,
+                TASK_MUTATION_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            true
+        } else {
+            self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+            false
+        }
+    }
+
+    pub(crate) fn try_begin_affinity_mutation(&self) -> bool {
+        self.mutation
+            .compare_exchange(
+                TASK_MUTATION_IDLE,
+                TASK_MUTATION_AFFINITY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// A publication reservation owns an unpublished task.  It is not a
+    /// scheduler handoff that a public affinity operation may wait on: PID
+    /// lookup cannot legitimately expose this task until the reservation has
+    /// released its mutation word.
+    #[cfg(feature = "sched-eevdf")]
+    pub(crate) fn affinity_mutation_is_publication_reservation(&self) -> bool {
+        self.mutation.load(Ordering::Acquire) == TASK_MUTATION_PUBLICATION
+    }
+
+    /// Claim the independent ready-task idle-steal transaction.
+    #[cfg(feature = "idle-steal")]
+    pub(crate) fn try_begin_idle_steal_mutation(&self) -> bool {
+        self.mutation
+            .compare_exchange(
+                TASK_MUTATION_IDLE,
+                TASK_MUTATION_IDLE_STEAL,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Release idle-steal ownership, absorbing a stale wake bit from a task
+    /// which remained ready throughout the handoff.
+    #[cfg(feature = "idle-steal")]
+    pub(crate) fn finish_idle_steal_mutation(&self) -> bool {
+        if self
+            .mutation
+            .compare_exchange(
+                TASK_MUTATION_IDLE_STEAL,
+                TASK_MUTATION_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+        if self
+            .mutation
+            .compare_exchange(
+                TASK_MUTATION_IDLE_STEAL_WAKE_PENDING,
+                TASK_MUTATION_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+        self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+        false
+    }
+
+    pub(crate) fn finish_affinity_mutation(&self) -> AffinityMutationCompletion {
+        match self.mutation.compare_exchange(
+            TASK_MUTATION_AFFINITY,
+            TASK_MUTATION_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => AffinityMutationCompletion::Released,
+            Err(TASK_MUTATION_AFFINITY_WAKE_PENDING) => {
+                if self
+                    .mutation
+                    .compare_exchange(
+                        TASK_MUTATION_AFFINITY_WAKE_PENDING,
+                        TASK_MUTATION_WAKE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    AffinityMutationCompletion::WakeClaimed
+                } else {
+                    self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                    AffinityMutationCompletion::Corrupt
+                }
+            }
+            Err(_) => {
+                self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                AffinityMutationCompletion::Corrupt
+            }
+        }
+    }
+
+    /// Claims the mask/owner/state transaction which publishes this current
+    /// task as Blocked. Failure is non-blocking: the block owner must turn this
+    /// iteration into a spurious wake and retry from ordinary task context.
+    pub(crate) fn try_begin_block_mutation(&self) -> BlockMutationClaim {
+        match self.mutation.compare_exchange(
+            TASK_MUTATION_IDLE,
+            TASK_MUTATION_BLOCK,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => BlockMutationClaim::Claimed,
+            Err(
+                TASK_MUTATION_AFFINITY | TASK_MUTATION_WAKE | TASK_MUTATION_AFFINITY_WAKE_PENDING,
+            ) => BlockMutationClaim::Busy,
+            #[cfg(feature = "idle-steal")]
+            Err(TASK_MUTATION_IDLE_STEAL | TASK_MUTATION_IDLE_STEAL_WAKE_PENDING) => {
+                BlockMutationClaim::Busy
+            }
+            Err(_) => {
+                self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                BlockMutationClaim::Corrupt
+            }
+        }
+    }
+
+    pub(crate) fn finish_block_mutation(&self) -> BlockMutationCompletion {
+        match self.mutation.compare_exchange(
+            TASK_MUTATION_BLOCK,
+            TASK_MUTATION_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => BlockMutationCompletion::Released,
+            Err(TASK_MUTATION_BLOCK_WAKE_PENDING) => {
+                if self
+                    .mutation
+                    .compare_exchange(
+                        TASK_MUTATION_BLOCK_WAKE_PENDING,
+                        TASK_MUTATION_WAKE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    BlockMutationCompletion::WakeClaimed
+                } else {
+                    self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                    BlockMutationCompletion::Corrupt
+                }
+            }
+            Err(_) => {
+                self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                BlockMutationCompletion::Corrupt
+            }
+        }
+    }
+
+    /// Claims or delegates one raw-waker runnable-publication obligation.
+    ///
+    /// One wait-free `fetch_or` is the complete arbitration step. If affinity
+    /// or block publication owns the task, the corresponding pending state
+    /// transfers the obligation without spinning on that owner. The reserved
+    /// new-task publication value already contains the wake bit, so even the
+    /// impossible case remains unmodified before fail-stop containment.
+    pub(crate) fn claim_wake_mutation(&self) -> WakeMutationClaim {
+        match self.mutation.fetch_or(TASK_MUTATION_WAKE, Ordering::AcqRel) {
+            TASK_MUTATION_IDLE => WakeMutationClaim::Claimed,
+            TASK_MUTATION_AFFINITY => WakeMutationClaim::DeferredToAffinity,
+            TASK_MUTATION_BLOCK => WakeMutationClaim::DeferredToBlock,
+            TASK_MUTATION_WAKE
+            | TASK_MUTATION_AFFINITY_WAKE_PENDING
+            | TASK_MUTATION_BLOCK_WAKE_PENDING => WakeMutationClaim::AlreadyOwned,
+            #[cfg(feature = "idle-steal")]
+            TASK_MUTATION_IDLE_STEAL | TASK_MUTATION_IDLE_STEAL_WAKE_PENDING => {
+                WakeMutationClaim::AlreadyOwned
+            }
+            _ => {
+                self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                WakeMutationClaim::Corrupt
+            }
+        }
+    }
+
+    /// Releases a completed immediate or old-CPU-deferred wake publication.
+    pub(crate) fn finish_wake_mutation(&self) -> bool {
+        if self
+            .mutation
+            .compare_exchange(
+                TASK_MUTATION_WAKE,
+                TASK_MUTATION_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            true
+        } else {
+            self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+            false
+        }
+    }
+
+    /// Sets the cpu affinity mask of the task.
+    ///
+    /// # Arguments
+    /// `cpumask` - The cpu affinity mask to be set in type [`AxCpuMask`].
+    #[inline]
+    pub(crate) fn set_cpumask(&self, cpumask: AxCpuMask) {
+        #[cfg(feature = "smp")]
+        let displaced = self.publish_affinity(cpumask, None);
+        #[cfg(not(feature = "smp"))]
+        {
+            self.affinity.lock().mask = cpumask;
+        }
+        #[cfg(feature = "smp")]
+        drop(displaced);
+    }
+
+    /// Atomically publishes a new mask and its already allocated migration
+    /// helper. The replaced helper is returned so its stack/entry are destroyed
+    /// after the no-IRQ affinity lock has been released.
+    #[cfg(feature = "smp")]
+    pub(crate) fn publish_affinity(
+        &self,
+        cpumask: AxCpuMask,
+        pending_migration: Option<AxTaskRef>,
+    ) -> Option<AxTaskRef> {
+        let mut affinity = self.affinity.lock();
+        affinity.mask = cpumask;
+        core::mem::replace(&mut affinity.pending_migration, pending_migration)
+    }
+
+    /// Claims the pre-admitted migration helper iff this CPU is no longer in
+    /// the published mask. No allocation or destructor runs under the lock.
+    #[cfg(feature = "smp")]
+    pub(crate) fn claim_migration(&self, cpu_id: usize) -> MigrationClaim {
+        let mut affinity = self.affinity.lock();
+        if affinity.mask.get(cpu_id) {
+            MigrationClaim::Allowed
+        } else if let Some(task) = affinity.pending_migration.take() {
+            MigrationClaim::Prepared(task)
+        } else {
+            MigrationClaim::Missing
+        }
+    }
+
+    /// Clears only the caller's own still-pending helper. A concurrent later
+    /// setaffinity publication cannot be mistaken for this token.
+    #[cfg(feature = "smp")]
+    pub(crate) fn clear_migration_if(&self, expected: &AxTaskRef) -> Option<AxTaskRef> {
+        let mut affinity = self.affinity.lock();
+        if affinity
+            .pending_migration
+            .as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(pending, expected))
+        {
+            affinity.pending_migration.take()
+        } else {
+            None
+        }
+    }
+
+    /// Retires a helper which became unnecessary before it was claimed. The
+    /// returned task must be dropped by a normal task-context caller after this
+    /// lock has been released.
+    #[cfg(feature = "smp")]
+    pub(crate) fn take_allowed_migration(&self, cpu_id: usize) -> Option<AxTaskRef> {
+        let mut affinity = self.affinity.lock();
+        affinity
+            .mask
+            .get(cpu_id)
+            .then(|| affinity.pending_migration.take())
+            .flatten()
+    }
+
+    /// Polls whether the task has been interrupted.
+    #[inline]
+    pub fn poll_interrupt(&self, cx: &Context) -> Poll<()> {
+        if self.interrupted.swap(false, Ordering::AcqRel) {
+            Poll::Ready(())
+        } else {
+            self.interrupt_waker.register(cx.waker());
+            if self.interrupted.swap(false, Ordering::AcqRel) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    /// Clears the interrupt state of the task.
+    #[inline]
+    pub fn clear_interrupt(&self) {
+        self.interrupted.store(false, Ordering::Release);
+    }
+
+    /// Returns whether the task has a pending interrupt wakeup.
+    #[inline]
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Acquire)
+    }
+
+    /// Interrupts the task.
+    #[inline]
+    pub fn interrupt(&self) {
+        self.interrupted.store(true, Ordering::Release);
+        self.interrupt_waker.wake();
+    }
+
+    /// Drops an obsolete interrupt waiter before a Linux-uninterruptible wait.
+    /// The pending signal bit is deliberately retained.
+    #[inline]
+    pub fn clear_interrupt_waker(&self) {
+        let _ = self.interrupt_waker.take();
+    }
+}
+
+// private methods
+impl TaskInner {
+    fn new_common(id: TaskId, name: String) -> Result<Self, TaskCreateError> {
+        let mut ctx = Box::<UnsafeCell<TaskContext>>::try_new_uninit()
+            .map_err(|_| TaskCreateError::OutOfMemory)?;
+        // SAFETY: Box provides exclusive storage aligned for UnsafeCell<TaskContext>.
+        // raw_get exposes its transparent inner storage without constructing a
+        // reference to an uninitialized value. initialize_at writes every field
+        // in place, including the large XSAVE image, before assume_init.
+        let ctx = unsafe {
+            TaskContext::initialize_at(UnsafeCell::raw_get(ctx.as_mut_ptr()));
+            ctx.assume_init()
+        };
+        Ok(Self {
+            id,
+            name: SpinNoIrq::new(name),
+            is_idle: false,
+            is_init: false,
+            is_migration_helper: false,
+            entry: Cell::new(None),
+            state: AtomicU8::new(TaskState::Ready as u8),
+            terminalizing: AtomicBool::new(false),
+            mutation: AtomicU8::new(TASK_MUTATION_IDLE),
+            // By default, the task is allowed to run on all CPUs.
+            affinity: SpinNoIrq::new(TaskAffinity::new(crate::api::cpu_mask_full())),
+            cpu_id: AtomicU32::new(0),
+            sched_commit_version: AtomicU64::new(1),
+            sched_reset_on_spawn: AtomicBool::new(false),
+            sched_utilization_bounds: AtomicU64::new(u64::from(u32::MAX) << 32),
+            #[cfg(feature = "sched-eevdf")]
+            sched_uclamp_request: AtomicU64::new(u64::from(1024_u16) << 11),
+            #[cfg(feature = "sched-eevdf")]
+            sched_uclamp_accounted: AtomicBool::new(false),
+            #[cfg(feature = "idle-steal")]
+            last_run_cpu: AtomicU32::new(0),
+            #[cfg(feature = "idle-steal")]
+            last_run_ns: AtomicU64::new(0),
+            #[cfg(feature = "sched-wake-locality")]
+            wake_burst_ns: AtomicU64::new(0),
+            #[cfg(feature = "sched-wake-locality")]
+            wake_run_started_ns: AtomicU64::new(0),
+            #[cfg(feature = "sched-wake-locality")]
+            wake_burst_ewma_ns: AtomicU64::new(0),
+            #[cfg(feature = "sched-wake-locality")]
+            wake_short_bursts: AtomicU32::new(0),
+            #[cfg(feature = "smp")]
+            cpu_handoff: AtomicU64::new(CPU_OWNER_NONE),
+            #[cfg(feature = "smp")]
+            cpu_handoff_generation: AtomicU64::new(0),
+            #[cfg(feature = "smp")]
+            wake_handoff: AtomicPtr::new(core::ptr::null_mut()),
+            #[cfg(feature = "preempt")]
+            need_resched: AtomicBool::new(false),
+            #[cfg(feature = "preempt")]
+            preempt_disable_count: AtomicUsize::new(0),
+            deferred_work_dispatching: AtomicBool::new(false),
+            interrupted: AtomicBool::new(false),
+            interrupt_waker: AtomicWaker::new(),
+            block_wait: BlockWaitState::new(),
+            wake_fault: AtomicU8::new(0),
+            exit_next: AtomicPtr::new(core::ptr::null_mut()),
+            exit_queued: AtomicBool::new(false),
+            exit_queue_generation: AtomicU64::new(0),
+            exit_queue_fault: AtomicU8::new(0),
+            exit_code: AtomicI32::new(0),
+            wait_for_exit: AtomicWaker::new(),
+            kstack: None,
+            ctx,
+            #[cfg(target_arch = "x86_64")]
+            published_user_cet_status: AtomicU64::new(0),
+            #[cfg(feature = "task-ext")]
+            task_ext: None,
+        })
+    }
+
+    /// Creates an "init task" using the current CPU states, to use as the
+    /// current task.
+    ///
+    /// As it is the current task, no other task can switch to it until it
+    /// switches out.
+    ///
+    /// And there is no need to set the `entry`, `kstack` or `tls` fields, as
+    /// they will be filled automatically when the task is switches out.
+    pub(crate) fn new_init(name: String) -> Result<Self, TaskCreateError> {
+        let mut t = Self::new_common(TaskId::try_new()?, name)?;
+        t.is_init = true;
+        #[cfg(feature = "sched-wake-locality")]
+        t.resume_wake_burst(axhal::time::monotonic_time_nanos());
+        #[cfg(feature = "smp")]
+        t.set_cpu_id(axhal::percpu::this_cpu_id() as u32);
+        #[cfg(feature = "smp")]
+        t.mark_running_on_cpu();
+        if t.name.lock().as_str() == "idle" {
+            t.is_idle = true;
+        }
+        Ok(t)
+    }
+
+    pub(crate) fn into_arc(self) -> Result<AxTaskRef, TaskCreateError> {
+        Arc::try_new(AxTask::new(self)).map_err(|_| TaskCreateError::OutOfMemory)
+    }
+
+    /// Fallibly constructs the scheduler-owned task object without making it
+    /// runnable. Lifecycle code can therefore complete every other admission
+    /// step before publishing a user-visible handle to the task.
+    pub(crate) fn try_into_arc(self) -> Result<AxTaskRef, TaskCreateError> {
+        self.into_arc()
+    }
+
+    /// Returns the current state of the task.
+    #[inline]
+    pub fn state(&self) -> TaskState {
+        let raw = self.state.load(Ordering::Acquire);
+        match TaskState::try_from(raw) {
+            Ok(state) => state,
+            Err(_) => {
+                // The atomic is private and every writer stores a valid enum
+                // discriminant. Treat memory corruption as terminal and leave
+                // a durable diagnostic instead of exposing a public panic.
+                self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                TaskState::Exited
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set_state(&self, state: TaskState) {
+        self.state.store(state as u8, Ordering::Release)
+    }
+
+    /// Begin the one-way terminal transaction before scheduler ownership is
+    /// released. The marker closes the interval in which the task is still
+    /// externally `Running` but no longer has a scheduler entity.
+    pub(crate) fn begin_terminal_transaction(&self) {
+        assert!(
+            self.terminalizing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "task terminal transaction began twice"
+        );
+    }
+
+    /// Whether terminal teardown has started. Callers pair this Acquire load
+    /// with the scheduler lock when deciding whether a parameter publication
+    /// may proceed.
+    #[inline]
+    pub(crate) fn is_terminalizing(&self) -> bool {
+        self.terminalizing.load(Ordering::Acquire)
+    }
+
+    /// Transition the task state from `current_state` to `new_state`,
+    /// Returns `true` if the current state is `current_state` and the state is successfully set to `new_state`,
+    /// otherwise returns `false`.
+    #[inline]
+    pub(crate) fn transition_state(&self, current_state: TaskState, new_state: TaskState) -> bool {
+        self.state
+            .compare_exchange(
+                current_state as u8,
+                new_state as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[inline]
+    pub(crate) fn is_running(&self) -> bool {
+        matches!(self.state(), TaskState::Running)
+    }
+
+    #[inline]
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self.state(), TaskState::Ready)
+    }
+
+    pub(crate) fn try_enter_deferred_work(&self) -> bool {
+        self.deferred_work_dispatching
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn leave_deferred_work(&self) {
+        self.deferred_work_dispatching
+            .store(false, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) const fn is_init(&self) -> bool {
+        self.is_init
+    }
+
+    #[inline]
+    pub(crate) const fn is_idle(&self) -> bool {
+        self.is_idle
+    }
+
+    #[inline]
+    pub(crate) const fn is_migration_helper(&self) -> bool {
+        self.is_migration_helper
+    }
+
+    #[inline]
+    pub(crate) fn mark_migration_helper(&mut self) {
+        self.is_migration_helper = true;
+    }
+
+    #[inline]
+    #[cfg(feature = "preempt")]
+    pub(crate) fn set_preempt_pending(&self, pending: bool) {
+        self.need_resched.store(pending, Ordering::Release)
+    }
+
+    #[inline]
+    #[cfg(feature = "preempt")]
+    pub(crate) fn take_preempt_pending(&self) -> bool {
+        self.need_resched.swap(false, Ordering::AcqRel)
+    }
+
+    #[inline]
+    #[cfg(all(feature = "preempt", feature = "smp"))]
+    pub(crate) fn preserve_preempt_if_cpu_disallowed(&self, cpu_id: usize) {
+        if !self.cpumask().get(cpu_id) {
+            self.set_preempt_pending(true);
+        }
+    }
+
+    #[inline]
+    #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+    pub(crate) fn preempt_pending(&self) -> bool {
+        self.need_resched.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    #[cfg(feature = "preempt")]
+    pub(crate) fn can_preempt(&self, current_disable_count: usize) -> bool {
+        self.preempt_disable_count.load(Ordering::Acquire) == current_disable_count
+    }
+
+    #[inline]
+    #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+    pub(crate) fn preempt_disable_count(&self) -> usize {
+        self.preempt_disable_count.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    #[cfg(feature = "preempt")]
+    pub(crate) fn disable_preempt(&self) {
+        if self
+            .preempt_disable_count
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .is_err()
+        {
+            self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+        }
+    }
+
+    #[inline]
+    #[cfg(feature = "preempt")]
+    pub(crate) fn enable_preempt(&self, resched: bool) {
+        match self
+            .preempt_disable_count
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            }) {
+            Ok(1) if resched && self.need_resched.load(Ordering::Acquire) => {
+                // If current task is pending to be preempted, do rescheduling.
+                Self::current_check_preempt_pending();
+            }
+            Ok(_) => {}
+            Err(_) => {
+                self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+            }
+        }
+    }
+
+    #[cfg(feature = "preempt")]
+    pub(crate) fn current_check_preempt_pending() {
+        Self::current_check_preempt_pending_from(false);
+    }
+
+    #[cfg(all(feature = "preempt", feature = "irq-exit"))]
+    pub(crate) fn current_check_preempt_pending_at_irq_exit() {
+        Self::current_check_preempt_pending_from(true);
+    }
+
+    #[cfg(feature = "preempt")]
+    fn current_check_preempt_pending_from(_at_irq_exit: bool) {
+        use kernel_guard::IrqSave;
+        #[cfg(feature = "irq-exit")]
+        {
+            #[cfg(target_os = "none")]
+            let irqs_enabled = axhal::asm::irqs_enabled();
+            #[cfg(not(target_os = "none"))]
+            let irqs_enabled = true;
+            if !crate::irq_exit::may_check_preempt(
+                crate::irq_exit::in_irq_context(),
+                irqs_enabled,
+                _at_irq_exit,
+            ) {
+                return;
+            }
+        }
+        let curr = crate::current();
+        #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+        let irq_off = !axhal::asm::irqs_enabled();
+        #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+        if irq_off {
+            let mut flags = 0;
+            if curr.is_idle() {
+                flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
+            }
+            if curr.preempt_pending() {
+                flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
+            }
+            // Ordinary IRQ-off task safe points returned above. Reaching this
+            // event with IRQs masked therefore proves the explicit outermost
+            // IRQ-exit transport authorized this check.
+            flags |= crate::irq_continuation_diagnostics::FLAG_RESCHED_ALLOWED;
+            crate::irq_continuation_diagnostics::record_event(
+                crate::irq_continuation_diagnostics::EVENT_PREEMPT_CHECK_IRQ_OFF,
+                curr.id().as_u64(),
+                0,
+                flags,
+                curr.preempt_disable_count(),
+            );
+        }
+        let mut dispatched = false;
+        if curr.need_resched.load(Ordering::Acquire) && curr.can_preempt(0) {
+            // Keep one task-owned preemption-disable unit across every switch.
+            // A task selected while this stack is suspended has its own count,
+            // unlike a per-CPU IRQ-exit marker. The no-resched release also
+            // prevents a guard drop from recursively growing this stack.
+            {
+                let _dispatch = PreemptDispatchGuard::new(&curr);
+                let mut passes = 0;
+                while passes < MAX_PREEMPT_DISPATCH_PASSES
+                    && curr.need_resched.load(Ordering::Acquire)
+                    && curr.can_preempt(1)
+                {
+                    let mut rq = crate::current_run_queue::<IrqSave>();
+                    if !curr.need_resched.load(Ordering::Acquire) {
+                        break;
+                    }
+                    passes += 1;
+                    rq.preempt_resched();
+                    dispatched = true;
+                }
+            }
+        }
+        if dispatched {
+            // The task-owned dispatch guard has been released. The deferred
+            // worker performs its own IRQ/preemption checks, so an IRQ-exit
+            // caller leaves the work pending for a later task-context point.
+            crate::run_deferred_work();
+        }
+        #[cfg(all(feature = "irq-continuation-diagnostics", target_os = "none"))]
+        if irq_off && !axhal::asm::irqs_enabled() {
+            let mut flags = 0;
+            if curr.is_idle() {
+                flags |= crate::irq_continuation_diagnostics::FLAG_IDLE;
+            }
+            if curr.preempt_pending() {
+                flags |= crate::irq_continuation_diagnostics::FLAG_NEED_RESCHED;
+            }
+            crate::irq_continuation_diagnostics::record_event(
+                crate::irq_continuation_diagnostics::EVENT_PREEMPT_CHECK_RETURN_IRQ_OFF,
+                curr.id().as_u64(),
+                0,
+                flags,
+                curr.preempt_disable_count(),
+            );
+        }
+    }
+
+    /// Notify all tasks that join on this task.
+    pub(crate) fn notify_exit(&self, exit_code: i32) {
+        self.exit_code.store(exit_code, Ordering::Release);
+        // Publish the exit code before Exited. An Acquire state observation in
+        // join() must never pair the terminal state with the old exit code.
+        self.set_state(TaskState::Exited);
+        self.wait_for_exit.wake();
+    }
+
+    #[inline]
+    pub(crate) unsafe fn ctx_mut_ptr(&self) -> *mut TaskContext {
+        self.ctx.get()
+    }
+
+    /// Return whether the task has crossed the final stack-reclamation gate.
+    ///
+    /// An exited task can remain represented by a suspended context-switch
+    /// frame for a short interval.  GC must not unwrap it or recycle its stack
+    /// until both the CPU owner token and any delegated wake pointer are gone.
+    #[cfg(feature = "smp")]
+    #[inline]
+    pub(crate) fn can_reclaim_stack(&self) -> bool {
+        !self.has_cpu_owner_or_handoff()
+    }
+
+    /// Return whether the task has crossed the final stack-reclamation gate.
+    #[cfg(not(feature = "smp"))]
+    #[inline]
+    pub(crate) fn can_reclaim_stack(&self) -> bool {
+        true
+    }
+
+    /// Remove and return the kernel stack owned by this task, if any.
+    pub(crate) fn take_kernel_stack(&mut self) -> Option<TaskStack> {
+        assert!(
+            self.can_reclaim_stack(),
+            "task stack reclaimed while its CPU owner or wake handoff remained"
+        );
+        self.kstack.take()
+    }
+
+    /// Set the CPU ID where the task is running or will run.
+    #[cfg(feature = "smp")]
+    #[inline]
+    pub(crate) fn set_cpu_id(&self, cpu_id: u32) {
+        self.cpu_id.store(cpu_id, Ordering::Release);
+    }
+
+    /// Publish the last-run hint at the context-switch boundary. This hint is
+    /// advisory only; scheduler ownership, affinity and task state remain
+    /// authoritative for migration correctness.
+    #[cfg(feature = "idle-steal")]
+    #[inline]
+    pub(crate) fn record_last_run(&self, cpu_id: u32, now: u64) {
+        self.last_run_cpu.store(cpu_id, Ordering::Release);
+        self.last_run_ns.store(now, Ordering::Release);
+        #[cfg(feature = "sched-wake-locality")]
+        self.wake_run_started_ns.store(now, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "sched-wake-locality")]
+    pub(crate) fn resume_wake_burst(&self, now: u64) {
+        self.wake_run_started_ns.store(now, Ordering::Relaxed);
+    }
+
+    /// Include every running slice, but exclude time waiting on a ready queue.
+    /// Called only by the task's current CPU at a real switch-out boundary.
+    #[cfg(feature = "sched-wake-locality")]
+    pub(crate) fn accumulate_wake_burst(&self, now: u64) {
+        let slice = now.saturating_sub(self.wake_run_started_ns.load(Ordering::Relaxed));
+        let total = self
+            .wake_burst_ns
+            .load(Ordering::Relaxed)
+            .saturating_add(slice);
+        self.wake_burst_ns.store(total, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "sched-wake-locality")]
+    fn next_wake_burst(&self, now: u64) -> (u64, u32) {
+        let burst = self
+            .wake_burst_ns
+            .load(Ordering::Relaxed)
+            .saturating_add(now.saturating_sub(self.wake_run_started_ns.load(Ordering::Relaxed)));
+        let previous = self.wake_burst_ewma_ns.load(Ordering::Relaxed);
+        let average = if previous == 0 {
+            burst
+        } else {
+            previous
+                .saturating_sub(previous / 4)
+                .saturating_add(burst / 4)
+        };
+        let short = if burst <= 500_000 && average <= 500_000 {
+            self.wake_short_bursts
+                .load(Ordering::Relaxed)
+                .saturating_add(1)
+        } else {
+            0
+        };
+        (average, short)
+    }
+
+    /// Preview includes the current burst, but aborted sleeps cannot train the
+    /// policy. Two consecutive sub-500us bursts avoid classifying a fresh task
+    /// from a single short setup syscall.
+    #[cfg(feature = "sched-wake-locality")]
+    pub(crate) fn short_blocking_burst(&self, now: u64) -> bool {
+        self.next_wake_burst(now).1 >= 2
+    }
+
+    #[cfg(feature = "sched-wake-locality")]
+    pub(crate) fn finish_wake_burst(&self, now: u64) {
+        let (average, short) = self.next_wake_burst(now);
+        self.wake_burst_ewma_ns.store(average, Ordering::Relaxed);
+        self.wake_short_bursts.store(short, Ordering::Relaxed);
+        self.wake_burst_ns.store(0, Ordering::Relaxed);
+        self.wake_run_started_ns.store(now, Ordering::Relaxed);
+    }
+
+    /// Return the currently published CPU owner token, excluding the wake
+    /// pending marker. The value is only a snapshot; clearing requires the
+    /// exact token captured by the old CPU before it switched away.
+    #[cfg(feature = "smp")]
+    #[inline]
+    pub(crate) fn cpu_owner_token(&self) -> Option<u64> {
+        let state = self.cpu_handoff.load(Ordering::Acquire);
+        let token = state & !CPU_OWNER_WAKE_PENDING;
+        (token != CPU_OWNER_NONE).then_some(token)
+    }
+
+    /// Return whether a context-switch owner or delegated wake handoff still
+    /// retains this task. The pointer check closes the interval after an owner
+    /// CAS and before the publisher has reclaimed its exact Arc.
+    #[cfg(feature = "smp")]
+    #[inline]
+    pub(crate) fn has_cpu_owner_or_handoff(&self) -> bool {
+        self.cpu_handoff.load(Ordering::Acquire) != CPU_OWNER_NONE
+            || !self.wake_handoff.load(Ordering::Acquire).is_null()
+    }
+
+    /// Try to claim one new CPU+generation owner. A duplicate mark is a
+    /// rejected operation, allowing deterministic tests to inspect the
+    /// invariant without invoking the fail-stop wrapper.
+    #[cfg(feature = "smp")]
+    pub(crate) fn try_mark_running_on_cpu(&self, cpu_id: u32) -> Option<u64> {
+        if (cpu_id as u64) > CPU_OWNER_CPU_MASK {
+            return None;
+        }
+        if self.cpu_handoff.load(Ordering::Acquire) != CPU_OWNER_NONE {
+            return None;
+        }
+        // `AtomicU64::try_update` returns the value observed before the
+        // successful update.  Encode the value published by the update, not
+        // that old value: the first owner must be generation one rather than
+        // the all-zero NONE token.
+        let previous_generation = self
+            .cpu_handoff_generation
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                let next = current.checked_add(1)?;
+                (next <= CPU_OWNER_GENERATION_MASK).then_some(next)
+            })
+            .ok()?;
+        let generation = previous_generation.checked_add(1)?;
+        let token = (generation << CPU_OWNER_CPU_BITS) | cpu_id as u64;
+        self.cpu_handoff
+            .compare_exchange(CPU_OWNER_NONE, token, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| token)
+    }
+
+    /// Marks the task as owned by this CPU's context-switch lifecycle. A
+    /// duplicate owner is a scheduler invariant violation and fail-stops;
+    /// ordinary migration paths must use [`Self::try_mark_running_on_cpu`]
+    /// when they need a recoverable predicate.
+    #[cfg(feature = "smp")]
+    #[inline]
+    pub(crate) fn mark_running_on_cpu(&self) -> u64 {
+        match self.try_mark_running_on_cpu(axhal::percpu::this_cpu_id() as u32) {
+            Some(token) => token,
+            None => {
+                self.record_wake_fault(TaskWakeFault::SchedulerInvariant);
+                error!(
+                    "task {} received a duplicate or exhausted CPU owner",
+                    self.id().as_u64()
+                );
+                axhal::power::system_off()
+            }
+        }
+    }
+
+    /// Delegates one owned task reference to the old CPU instead of spinning
+    /// while its context-switch epilogue still owns the task.
+    ///
+    /// The pointer is published before the state CAS. If the old CPU clears
+    /// first it observes `RUNNING`, while our CAS observes `OFF` and returns the
+    /// same reference to the caller. If our CAS wins, the old CPU observes
+    /// `WAKE_PENDING` and takes the reference. Thus exactly one side owns the
+    /// enqueue without a polling loop.
+    #[cfg(feature = "smp")]
+    pub(crate) fn publish_wake_handoff(&self, task: AxTaskRef) -> WakeHandoffPublication {
+        let owner = self.cpu_handoff.load(Ordering::Acquire);
+        if owner == CPU_OWNER_NONE {
+            return WakeHandoffPublication::Ready(task);
+        }
+        if owner & CPU_OWNER_WAKE_PENDING != 0 {
+            return WakeHandoffPublication::Occupied(task);
+        }
+        let raw = Arc::into_raw(task).cast_mut();
+        if self
+            .wake_handoff
+            .compare_exchange(
+                core::ptr::null_mut(),
+                raw,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // Safety: this CAS failed, so the new raw pointer was never
+            // published and remains the caller's one Arc ownership unit.
+            return WakeHandoffPublication::Occupied(unsafe { Arc::from_raw(raw) });
+        }
+
+        match self.cpu_handoff.compare_exchange(
+            owner,
+            owner | CPU_OWNER_WAKE_PENDING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => WakeHandoffPublication::Deferred,
+            Err(CPU_OWNER_NONE) => {
+                let task = self.take_wake_handoff();
+                match task {
+                    Some(task) => WakeHandoffPublication::Ready(task),
+                    None => {
+                        // The old CPU saw WAKE_PENDING and consumed ownership
+                        // between our failed CAS and this take.
+                        WakeHandoffPublication::Deferred
+                    }
+                }
+            }
+            Err(observed) => {
+                let task = self.take_wake_handoff();
+                match task {
+                    // The old owner may have completed and a newer owner may
+                    // already have been marked before this publisher's CAS.
+                    // In that case this exact pointer is still a valid ready
+                    // publication; only a still-pending owner means another
+                    // handoff already owns the slot.
+                    Some(task) if observed & CPU_OWNER_WAKE_PENDING == 0 => {
+                        WakeHandoffPublication::Ready(task)
+                    }
+                    Some(task) => WakeHandoffPublication::Occupied(task),
+                    None => WakeHandoffPublication::Deferred,
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "smp")]
+    fn take_wake_handoff(&self) -> Option<AxTaskRef> {
+        let raw = self
+            .wake_handoff
+            .swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if raw.is_null() {
+            None
+        } else {
+            // Safety: every non-null value came from exactly one Arc::into_raw
+            // above, and swap gives this caller exclusive reconstruction.
+            Some(unsafe { Arc::from_raw(raw) })
+        }
+    }
+
+    /// Completes old-CPU ownership and claims a delegated remote wake, if any,
+    /// using the exact token captured before the context switch. A no-argument
+    /// form remains useful for local mechanism tests; production switch
+    /// epilogues must call [`Self::finish_cpu_handoff_exact`].
+    #[cfg(feature = "smp")]
+    #[cfg(test)]
+    pub(crate) fn finish_cpu_handoff(&self) -> CpuHandoffCompletion {
+        let state = self.cpu_handoff.load(Ordering::Acquire);
+        self.finish_cpu_handoff_exact(state & !CPU_OWNER_WAKE_PENDING)
+    }
+
+    /// Clear an old CPU owner only if `expected` is still the published
+    /// generation. This CAS is the stale-clear firewall: a delayed old stack
+    /// cannot clear a newer owner, even if the task has already been switched
+    /// in again elsewhere.
+    #[cfg(feature = "smp")]
+    pub(crate) fn finish_cpu_handoff_exact(&self, expected: u64) -> CpuHandoffCompletion {
+        if expected == CPU_OWNER_NONE {
+            return CpuHandoffCompletion::AlreadyCleared;
+        }
+        let pending = expected | CPU_OWNER_WAKE_PENDING;
+        loop {
+            match self.cpu_handoff.load(Ordering::Acquire) {
+                observed if observed == expected => {
+                    if self
+                        .cpu_handoff
+                        .compare_exchange(
+                            expected,
+                            CPU_OWNER_NONE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return CpuHandoffCompletion::Cleared;
+                    }
+                }
+                observed if observed == pending => {
+                    if self
+                        .cpu_handoff
+                        .compare_exchange(
+                            pending,
+                            CPU_OWNER_NONE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return self.take_wake_handoff().map_or(
+                            CpuHandoffCompletion::MissingWake,
+                            CpuHandoffCompletion::Wake,
+                        );
+                    }
+                }
+                CPU_OWNER_NONE => return CpuHandoffCompletion::AlreadyCleared,
+                _ => return CpuHandoffCompletion::Stale,
+            }
+        }
+    }
+
+    /// Starts one allocation-free synchronous block-wait session.
+    pub(crate) fn begin_block_wait(&self) -> Result<BlockWaitToken, BeginBlockWaitError> {
+        self.block_wait.begin()
+    }
+
+    /// Clears a prior spurious wake before the owner polls its future.
+    pub(crate) fn prepare_block_poll(
+        &self,
+        token: BlockWaitToken,
+    ) -> Result<(), EndBlockWaitError> {
+        self.block_wait.prepare_poll(token)
+    }
+
+    /// Publishes a wake without requiring a token in raw-waker storage.
+    pub(crate) fn mark_block_woken(&self) -> BlockWakeAction {
+        self.block_wait.mark_woken()
+    }
+
+    /// Returns whether this generation has a published wake.
+    pub(crate) fn is_block_woken(&self, token: BlockWaitToken) -> bool {
+        self.block_wait.is_woken(token)
+    }
+
+    /// Claims exclusive ownership of the Running -> Blocked transition.
+    pub(crate) fn claim_block_wait(&self, token: BlockWaitToken) -> BlockWaitClaim {
+        self.block_wait.claim_block(token)
+    }
+
+    /// Commits a previously claimed Blocked state or consumes a racing wake.
+    pub(crate) fn commit_block_wait(&self, token: BlockWaitToken) -> BlockWaitCommit {
+        self.block_wait
+            .commit_block(token, || self.set_state(TaskState::Running))
+    }
+
+    /// Ends a generation-checked synchronous block-wait session.
+    pub(crate) fn end_block_wait(&self, token: BlockWaitToken) -> Result<(), EndBlockWaitError> {
+        self.block_wait.end(token)
+    }
+
+    /// Records the first terminal wake-publication fault for diagnostics and
+    /// lifecycle containment. Returns `true` when this call installed it.
+    pub(crate) fn record_wake_fault(&self, fault: TaskWakeFault) -> bool {
+        self.wake_fault
+            .compare_exchange(0, fault as u8, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Returns a durable terminal wake-publication fault, if any.
+    pub fn wake_fault(&self) -> Option<TaskWakeFault> {
+        match self.wake_fault.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(TaskWakeFault::RunQueueUnavailable),
+            2 => Some(TaskWakeFault::SchedulerCapacity),
+            3 => Some(TaskWakeFault::SchedulerInvariant),
+            4 => Some(TaskWakeFault::HandoffCorrupt),
+            5 => Some(TaskWakeFault::RemoteRescheduleFailed),
+            _ => Some(TaskWakeFault::SchedulerInvariant),
+        }
+    }
+
+    /// Claims this task's embedded link for one exited-queue ownership unit.
+    ///
+    /// Admission is performed before `Arc::into_raw`, so every error leaves
+    /// the caller with ordinary owned `Arc` storage and the queue unchanged.
+    pub(crate) fn admit_exit_queue(&self) -> Result<(), TaskExitQueueFault> {
+        if self
+            .exit_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            let fault = TaskExitQueueFault::DuplicateEnqueue;
+            self.record_exit_queue_fault(fault);
+            return Err(fault);
+        }
+
+        if !self.exit_next.load(Ordering::Acquire).is_null() {
+            self.exit_queued.store(false, Ordering::Release);
+            let fault = TaskExitQueueFault::CorruptLink;
+            self.record_exit_queue_fault(fault);
+            return Err(fault);
+        }
+
+        if self
+            .exit_queue_generation
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .is_err()
+        {
+            self.exit_queued.store(false, Ordering::Release);
+            let fault = TaskExitQueueFault::GenerationExhausted;
+            self.record_exit_queue_fault(fault);
+            return Err(fault);
+        }
+
+        Ok(())
+    }
+
+    /// Releases a queue admission which has not yet been linked or published.
+    pub(crate) fn rollback_exit_queue_admission(&self) {
+        debug_assert!(self.exit_next.load(Ordering::Acquire).is_null());
+        self.exit_queued.store(false, Ordering::Release);
+    }
+
+    /// Links the next queue-owned raw Arc after this task.
+    pub(crate) fn link_exit_queue_successor(
+        &self,
+        successor: *mut AxTask,
+    ) -> Result<(), TaskExitQueueFault> {
+        if successor.is_null() || !self.exit_queued.load(Ordering::Acquire) {
+            let fault = TaskExitQueueFault::CorruptLink;
+            self.record_exit_queue_fault(fault);
+            return Err(fault);
+        }
+        self.exit_next
+            .compare_exchange(
+                core::ptr::null_mut(),
+                successor,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| {
+                let fault = TaskExitQueueFault::CorruptLink;
+                self.record_exit_queue_fault(fault);
+                fault
+            })
+    }
+
+    /// Detaches and returns the next queue-owned raw Arc.
+    pub(crate) fn take_exit_queue_successor(&self) -> *mut AxTask {
+        self.exit_next.swap(core::ptr::null_mut(), Ordering::AcqRel)
+    }
+
+    /// Ends this task's exited-queue membership after its raw Arc was popped.
+    pub(crate) fn finish_exit_dequeue(&self) -> Result<(), TaskExitQueueFault> {
+        self.exit_queued
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| {
+                let fault = TaskExitQueueFault::CorruptLink;
+                self.record_exit_queue_fault(fault);
+                fault
+            })
+    }
+
+    /// Records the first exited-queue ownership fault.
+    pub(crate) fn record_exit_queue_fault(&self, fault: TaskExitQueueFault) -> bool {
+        self.exit_queue_fault
+            .compare_exchange(0, fault as u8, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Returns the first durable exited-queue ownership fault, if any.
+    pub fn exit_queue_fault(&self) -> Option<TaskExitQueueFault> {
+        match self.exit_queue_fault.load(Ordering::Acquire) {
+            0 => None,
+            1 => Some(TaskExitQueueFault::DuplicateEnqueue),
+            2 => Some(TaskExitQueueFault::GenerationExhausted),
+            3 => Some(TaskExitQueueFault::LengthExhausted),
+            4 => Some(TaskExitQueueFault::CorruptLink),
+            _ => Some(TaskExitQueueFault::CorruptLink),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn exit_queue_generation_for_test(&self) -> u64 {
+        self.exit_queue_generation.load(Ordering::Acquire)
+    }
+}
+
+impl fmt::Debug for TaskInner {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("TaskInner")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("state", &self.state())
+            .finish()
+    }
+}
+
+impl Drop for TaskInner {
+    fn drop(&mut self) {
+        debug!("task drop: id={}", self.id.as_u64());
+    }
+}
+
+pub(crate) struct TaskStack {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+impl TaskStack {
+    pub fn try_alloc(size: usize) -> Result<Self, AllocError> {
+        if size == 0 {
+            return Err(AllocError);
+        }
+        let layout = Layout::from_size_align(size, 16).map_err(|_| AllocError)?;
+        if let Some(stack) = crate::run_queue::take_cached_task_stack(layout.size(), layout.align())
+        {
+            return Ok(stack);
+        }
+        Ok(Self {
+            ptr: NonNull::new(unsafe { alloc::alloc::alloc(layout) }).ok_or(AllocError)?,
+            layout,
+        })
+    }
+
+    pub const fn top(&self) -> VirtAddr {
+        unsafe { core::mem::transmute(self.ptr.as_ptr().add(self.layout.size())) }
+    }
+
+    pub(crate) const fn layout_size(&self) -> usize {
+        self.layout.size()
+    }
+
+    pub(crate) const fn layout_align(&self) -> usize {
+        self.layout.align()
+    }
+
+    pub(crate) fn scrub_for_cache(&mut self) {
+        // Kernel stacks are not user-readable and are overwritten as the next
+        // task runs. Avoid a full-stack zero fill on every thread exit; code
+        // that exposes kernel memory must initialize the data it copies out.
+        let _ = self;
+    }
+}
+
+impl Drop for TaskStack {
+    fn drop(&mut self) {
+        unsafe { alloc::alloc::dealloc(self.ptr.as_ptr(), self.layout) }
+    }
+}
+
+/// An owned handle to the task which was current when the handle was created.
+///
+/// The per-CPU current-task slot owns a separate strong reference. Cloning that
+/// reference here is required because a safe caller may retain this handle
+/// across a context switch or even across reclamation of the task's scheduler
+/// state. A non-owning, lifetime-free wrapper around the per-CPU raw pointer
+/// would otherwise become dangling while it was still usable from safe Rust.
+pub struct CurrentTask(AxTaskRef);
+
+impl CurrentTask {
+    pub(crate) fn try_get() -> Option<Self> {
+        let ptr: *const super::AxTask = axhal::percpu::current_task_ptr();
+        if !ptr.is_null() {
+            // SAFETY: the non-null per-CPU pointer owns one strong reference.
+            // Increment it before reconstructing an independently owned Arc for
+            // the returned handle; the per-CPU ownership remains untouched.
+            unsafe { Arc::increment_strong_count(ptr) };
+            Some(Self(unsafe { AxTaskRef::from_raw(ptr) }))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn get() -> Self {
+        Self::try_get().expect("current task is uninitialized")
+    }
+
+    /// Clone the inner `AxTaskRef`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn clone(&self) -> AxTaskRef {
+        self.0.clone()
+    }
+
+    /// Returns `true` if the current task is the same as `other`.
+    pub fn ptr_eq(&self, other: &AxTaskRef) -> bool {
+        Arc::ptr_eq(&self.0, other)
+    }
+
+    pub(crate) unsafe fn init_current(init_task: AxTaskRef) {
+        assert!(init_task.is_init());
+        let ptr = Arc::into_raw(init_task);
+        unsafe {
+            axhal::percpu::set_current_task_ptr(ptr);
+        }
+    }
+
+    pub(crate) unsafe fn set_current(prev: Self, next: AxTaskRef) {
+        let previous_raw: *const super::AxTask = axhal::percpu::current_task_ptr();
+        debug_assert_eq!(previous_raw, Arc::as_ptr(&prev.0));
+        let ptr = Arc::into_raw(next);
+        unsafe {
+            axhal::percpu::set_current_task_ptr(ptr);
+        };
+
+        // SAFETY: `previous_raw` is the distinct strong reference owned by the
+        // per-CPU current-task slot. Replacing the slot above transfers that
+        // ownership out exactly once. `prev` is an additional owned handle and
+        // is dropped independently at the end of this function.
+        drop(unsafe { AxTaskRef::from_raw(previous_raw) });
+        drop(prev);
+    }
+}
+
+impl Deref for CurrentTask {
+    type Target = AxTaskRef;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+extern "C" fn task_entry() -> ! {
+    #[cfg(feature = "smp")]
+    unsafe {
+        // Clear the prev task on CPU before running the task entry function.
+        crate::run_queue::clear_prev_task_on_cpu();
+    }
+    // Enable irq (if feature "irq" is enabled) before running the task entry function.
+    #[cfg(feature = "irq")]
+    axhal::asm::enable_irqs();
+    #[cfg(feature = "smp")]
+    {
+        let task = crate::current();
+        let retired = task.take_allowed_migration(axhal::percpu::this_cpu_id());
+        drop(retired);
+    }
+    crate::run_deferred_work();
+    let entry = {
+        let task = crate::current();
+        task.entry.take()
+    };
+    if let Some(entry) = entry {
+        entry()
+    }
+    crate::exit(0);
+}
+
+#[cfg(test)]
+mod mechanism_tests {
+    use super::*;
+
+    #[test]
+    fn task_ownership_transfer_keeps_large_context_off_the_gc_stack() {
+        // GC unwraps the Arc and scheduler wrapper on its bounded kernel stack.
+        // Keep those by-value frames small even when XSAVE grows with CPU state.
+        assert!(core::mem::size_of::<crate::AxTask>() <= 4096);
+        let mut task = TaskInner::new(
+            || {},
+            "context-transfer".into(),
+            crate::MIN_KERNEL_STACK_SIZE,
+        )
+        .unwrap();
+        let address = task.ctx_mut() as *mut TaskContext as usize;
+        assert_eq!(address % core::mem::align_of::<TaskContext>(), 0);
+        let task = task.into_arc().unwrap();
+        let mut task = Arc::try_unwrap(task)
+            .unwrap_or_else(|_| panic!("unpublished task must have one owner"))
+            .into_inner();
+        assert_eq!(task.ctx_mut() as *mut TaskContext as usize, address);
+    }
+
+    #[test]
+    fn switch_reason_accounting_preserves_linux_classes() {
+        assert!(SwitchReason::Block.counts_as_context_switch());
+        assert!(!SwitchReason::Block.is_involuntary());
+        for reason in [
+            SwitchReason::Yield,
+            SwitchReason::Preempt,
+            SwitchReason::Migrate,
+        ] {
+            assert!(reason.counts_as_context_switch());
+            assert!(reason.is_involuntary());
+        }
+        assert!(SwitchReason::Exit.counts_as_context_switch());
+        assert!(!SwitchReason::Exit.is_involuntary());
+    }
+
+    #[cfg(feature = "sched-wake-locality")]
+    #[test]
+    fn wake_burst_classifier_counts_running_slices_and_only_committed_blocks() {
+        let task = TaskInner::new_init("wake-burst".into()).unwrap();
+        task.record_last_run(0, 1_000_000);
+        assert!(!task.short_blocking_burst(1_100_000));
+        // Preview of an aborted sleep must not train the consecutive counter.
+        assert!(!task.short_blocking_burst(1_100_000));
+        task.finish_wake_burst(1_100_000);
+        task.record_last_run(1, 5_000_000);
+        task.accumulate_wake_burst(5_200_000);
+        task.record_last_run(0, 9_000_000);
+        assert!(task.short_blocking_burst(9_200_000));
+        task.finish_wake_burst(9_200_000);
+        // A block immediately woken on the same CPU starts a new burst even
+        // when resched keeps prev == next and emits no switch-in.
+        task.resume_wake_burst(20_000_000);
+        assert!(task.short_blocking_burst(20_100_000));
+        assert!(!task.short_blocking_burst(21_000_000));
+    }
+
+    #[test]
+    fn task_identity_allocates_max_once_and_never_wraps() {
+        let allocator = TaskIdAllocator::new(TaskId::MAX);
+        assert_eq!(allocator.allocate().unwrap().as_u64(), TaskId::MAX);
+        assert_eq!(
+            allocator.allocate(),
+            Err(TaskCreateError::IdentifierExhausted)
+        );
+        assert_eq!(
+            allocator.allocate(),
+            Err(TaskCreateError::IdentifierExhausted)
+        );
+    }
+
+    #[test]
+    fn task_identity_never_allocates_synchronization_sentinels() {
+        for reserved in [0, u64::MAX] {
+            let allocator = TaskIdAllocator::new(reserved);
+            assert_eq!(
+                allocator.allocate_up_to(u64::MAX),
+                Err(TaskCreateError::IdentifierExhausted)
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_task_identity_rejects_without_advancing_generic_space() {
+        let maximum = i32::MAX as u64;
+        let allocator = TaskIdAllocator::new(maximum);
+
+        assert_eq!(allocator.allocate_up_to(maximum).unwrap().as_u64(), maximum);
+        assert_eq!(
+            allocator.allocate_up_to(maximum),
+            Err(TaskCreateError::IdentifierExhausted)
+        );
+        assert_eq!(allocator.allocate().unwrap().as_u64(), maximum + 1);
+
+        let zero = TaskIdAllocator::new(0);
+        assert_eq!(
+            zero.allocate_up_to(maximum),
+            Err(TaskCreateError::IdentifierExhausted)
+        );
+    }
+
+    #[test]
+    fn bounded_task_rejection_drops_unpublished_entry_ownership() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let captured = DropProbe(dropped.clone());
+        let allocator = TaskIdAllocator::new(i32::MAX as u64 + 1);
+        let result = TaskInner::try_new_with_identity(
+            move || drop(captured),
+            "linux-id-exhausted".into(),
+            MIN_KERNEL_STACK_SIZE,
+            || allocator.allocate_up_to(i32::MAX as u64),
+        );
+
+        assert!(matches!(result, Err(TaskCreateError::IdentifierExhausted)));
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn raw_task_state_decode_is_typed_and_private_corruption_is_contained() {
+        assert_eq!(TaskState::try_from(0).unwrap_err().value(), 0);
+        assert_eq!(TaskState::try_from(5).unwrap_err().value(), 5);
+
+        let task = TaskInner::new_init("state-corrupt".into()).unwrap();
+        task.state.store(0, Ordering::Release);
+        assert_eq!(task.state(), TaskState::Exited);
+        assert_eq!(task.wake_fault(), Some(TaskWakeFault::SchedulerInvariant));
+    }
+
+    #[test]
+    fn block_wait_owner_closes_wake_before_block_race() {
+        let state = BlockWaitState::new();
+        let token = state.begin().unwrap();
+        assert_eq!(state.begin(), Err(BeginBlockWaitError::Busy));
+
+        state.prepare_poll(token).unwrap();
+        assert_eq!(state.claim_block(token), BlockWaitClaim::Claimed);
+        assert_eq!(state.mark_woken(), BlockWakeAction::BlockOwnerWillConsume);
+
+        let mut restored = false;
+        assert_eq!(
+            state.commit_block(token, || restored = true),
+            BlockWaitCommit::Woken
+        );
+        assert!(restored);
+        assert!(state.is_woken(token));
+        state.end(token).unwrap();
+    }
+
+    #[test]
+    fn block_wait_consumes_wake_published_before_claim() {
+        let state = BlockWaitState::new();
+        let token = state.begin().unwrap();
+
+        state.prepare_poll(token).unwrap();
+        assert_eq!(state.mark_woken(), BlockWakeAction::Unblock);
+        assert_eq!(state.claim_block(token), BlockWaitClaim::Woken);
+        state.end(token).unwrap();
+    }
+
+    #[test]
+    fn block_wait_publishes_wake_after_block_commit() {
+        let state = BlockWaitState::new();
+        let token = state.begin().unwrap();
+
+        state.prepare_poll(token).unwrap();
+        assert_eq!(state.claim_block(token), BlockWaitClaim::Claimed);
+        assert_eq!(state.commit_block(token, || {}), BlockWaitCommit::Blocked);
+        assert_eq!(state.mark_woken(), BlockWakeAction::Unblock);
+        assert!(state.is_woken(token));
+        state.end(token).unwrap();
+    }
+
+    #[test]
+    fn block_wait_rejects_stale_owner_but_allows_spurious_raw_wake() {
+        let state = BlockWaitState::new();
+        let old = state.begin().unwrap();
+        state.end(old).unwrap();
+        assert_eq!(state.mark_woken(), BlockWakeAction::Inactive);
+
+        let current = state.begin().unwrap();
+        assert_ne!(old, current);
+        assert_eq!(state.prepare_poll(old), Err(EndBlockWaitError::Stale));
+        assert_eq!(state.mark_woken(), BlockWakeAction::Unblock);
+        assert!(state.is_woken(current));
+        state.end(current).unwrap();
+    }
+
+    #[test]
+    fn block_wait_generation_exhaustion_is_explicit() {
+        let state = BlockWaitState(AtomicU64::new(
+            BLOCK_WAIT_GENERATION_MAX << BLOCK_WAIT_GENERATION_SHIFT,
+        ));
+        assert_eq!(state.begin(), Err(BeginBlockWaitError::GenerationExhausted));
+    }
+
+    #[test]
+    fn affinity_owner_inherits_a_racing_wake_without_an_old_owner_window() {
+        let task = TaskInner::new_init("affinity-wake-handoff".into()).unwrap();
+        task.set_state(TaskState::Blocked);
+        #[cfg(feature = "smp")]
+        task.set_cpu_id(0);
+
+        assert!(task.try_begin_affinity_mutation());
+        assert_eq!(
+            task.claim_wake_mutation(),
+            WakeMutationClaim::DeferredToAffinity
+        );
+
+        // Model the affinity owner's final Blocked-task redirect after a waker
+        // sampled the old owner. The waker cannot act on that stale sample: its
+        // exact obligation is transferred only after the new owner is visible.
+        #[cfg(feature = "smp")]
+        task.set_cpu_id(1);
+        assert_eq!(
+            task.finish_affinity_mutation(),
+            AffinityMutationCompletion::WakeClaimed
+        );
+        #[cfg(feature = "smp")]
+        assert_eq!(task.cpu_id(), 1);
+        assert_eq!(task.claim_wake_mutation(), WakeMutationClaim::AlreadyOwned);
+        assert!(task.finish_wake_mutation());
+    }
+
+    #[cfg(feature = "idle-steal")]
+    #[test]
+    fn idle_steal_mutation_is_exclusive_and_absorbs_a_stale_wake() {
+        let first = TaskInner::new_init("idle-steal-first".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        let second = TaskInner::new_init("idle-steal-second".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+
+        // A candidate whose mutation is already owned must not prevent the
+        // bounded successor scan from claiming the next candidate.
+        let first_owner = IdleStealMutation::try_begin(&first).expect("first claim");
+        assert_eq!(
+            first.inner().mutation.load(Ordering::Acquire),
+            TASK_MUTATION_IDLE_STEAL
+        );
+        assert!(IdleStealMutation::try_begin(&first).is_none());
+        let second_owner = IdleStealMutation::try_begin(&second).expect("successor claim");
+
+        // A wake on a task which remains Ready is only a stale publication
+        // hint.  The idle-steal owner absorbs that bit and releases exactly
+        // once, without creating another enqueue obligation.
+        assert_eq!(
+            first.inner().mutation.load(Ordering::Acquire),
+            TASK_MUTATION_IDLE_STEAL
+        );
+        assert_eq!(
+            first.inner().claim_wake_mutation(),
+            WakeMutationClaim::AlreadyOwned
+        );
+        drop(second_owner);
+        drop(first_owner);
+        assert!(first.inner().try_begin_affinity_mutation());
+        assert_eq!(
+            first.inner().finish_affinity_mutation(),
+            AffinityMutationCompletion::Released
+        );
+        assert!(second.inner().try_begin_affinity_mutation());
+        assert_eq!(
+            second.inner().finish_affinity_mutation(),
+            AffinityMutationCompletion::Released
+        );
+    }
+
+    #[test]
+    fn wake_owner_excludes_affinity_until_exact_completion() {
+        let task = TaskInner::new_init("wake-before-affinity".into()).unwrap();
+        assert_eq!(task.claim_wake_mutation(), WakeMutationClaim::Claimed);
+        assert!(!task.try_begin_affinity_mutation());
+        assert_eq!(task.claim_wake_mutation(), WakeMutationClaim::AlreadyOwned);
+
+        assert!(task.finish_wake_mutation());
+        assert!(task.try_begin_affinity_mutation());
+        assert_eq!(
+            task.finish_affinity_mutation(),
+            AffinityMutationCompletion::Released
+        );
+    }
+
+    #[test]
+    fn block_owner_inherits_only_a_post_commit_wake() {
+        let task = TaskInner::new_init("block-wake-handoff".into()).unwrap();
+        assert_eq!(task.try_begin_block_mutation(), BlockMutationClaim::Claimed);
+        assert_eq!(
+            task.claim_wake_mutation(),
+            WakeMutationClaim::DeferredToBlock
+        );
+        assert_eq!(
+            task.finish_block_mutation(),
+            BlockMutationCompletion::WakeClaimed
+        );
+        assert_eq!(task.try_begin_block_mutation(), BlockMutationClaim::Busy);
+        assert!(task.finish_wake_mutation());
+        assert_eq!(task.try_begin_block_mutation(), BlockMutationClaim::Claimed);
+        assert_eq!(
+            task.finish_block_mutation(),
+            BlockMutationCompletion::Released
+        );
+    }
+
+    #[cfg(feature = "sched-eevdf")]
+    #[test]
+    fn wake_claim_does_not_modify_an_unpublished_task_reservation() {
+        let task = TaskInner::new_init("publication-wake-isolation".into()).unwrap();
+        assert!(task.try_reserve_publication_mutation());
+        assert_eq!(
+            task.claim_wake_mutation(),
+            WakeMutationClaim::Corrupt,
+            "an unpublished task cannot own a valid block wake"
+        );
+        assert_eq!(
+            task.mutation.load(Ordering::Acquire),
+            TASK_MUTATION_PUBLICATION,
+            "the rejected wake must not poison the publication owner"
+        );
+        task.release_publication_mutation();
+        assert_eq!(task.mutation.load(Ordering::Acquire), TASK_MUTATION_IDLE);
+    }
+
+    #[test]
+    fn first_wake_fault_is_durable() {
+        let task = TaskInner::new_init("wake-fault".into()).unwrap();
+        assert!(task.record_wake_fault(TaskWakeFault::SchedulerCapacity));
+        assert!(!task.record_wake_fault(TaskWakeFault::HandoffCorrupt));
+        assert_eq!(task.wake_fault(), Some(TaskWakeFault::SchedulerCapacity));
+    }
+
+    #[test]
+    fn remote_reschedule_failure_is_diagnostic_and_first_wins() {
+        let task = TaskInner::new_init("remote-resched-fault".into()).unwrap();
+        assert!(task.record_wake_fault(TaskWakeFault::RemoteRescheduleFailed));
+        assert!(!task.record_wake_fault(TaskWakeFault::HandoffCorrupt));
+        assert_eq!(
+            task.wake_fault(),
+            Some(TaskWakeFault::RemoteRescheduleFailed)
+        );
+    }
+
+    #[cfg(feature = "preempt")]
+    #[test]
+    fn preempt_guard_counter_never_wraps_on_internal_mismatch() {
+        let underflow = TaskInner::new_init("preempt-underflow".into()).unwrap();
+        underflow.enable_preempt(false);
+        assert_eq!(underflow.preempt_disable_count.load(Ordering::Acquire), 0);
+        assert_eq!(
+            underflow.wake_fault(),
+            Some(TaskWakeFault::SchedulerInvariant)
+        );
+
+        let overflow = TaskInner::new_init("preempt-overflow".into()).unwrap();
+        overflow
+            .preempt_disable_count
+            .store(usize::MAX, Ordering::Release);
+        overflow.disable_preempt();
+        assert_eq!(
+            overflow.preempt_disable_count.load(Ordering::Acquire),
+            usize::MAX
+        );
+        assert_eq!(
+            overflow.wake_fault(),
+            Some(TaskWakeFault::SchedulerInvariant)
+        );
+    }
+
+    #[cfg(feature = "preempt")]
+    #[test]
+    fn preempt_dispatch_guard_is_task_owned_and_releases_without_resched() {
+        let owner = TaskInner::new_init("preempt-dispatch-owner".into()).unwrap();
+        let peer = TaskInner::new_init("preempt-dispatch-peer".into()).unwrap();
+        owner.set_preempt_pending(true);
+
+        {
+            let _dispatch = PreemptDispatchGuard::new(&owner);
+            assert!(owner.can_preempt(1));
+            assert!(peer.can_preempt(0));
+
+            // Model a nested guard release while the dispatcher owns the task.
+            owner.disable_preempt();
+            assert!(owner.can_preempt(2));
+            owner.enable_preempt(true);
+            assert!(owner.can_preempt(1));
+        }
+
+        assert!(owner.can_preempt(0));
+        assert!(owner.need_resched.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "preempt")]
+    #[test]
+    fn selected_task_clear_does_not_consume_a_later_publication() {
+        let selected = TaskInner::new_init("selected-preempt-publication".into()).unwrap();
+        selected.set_preempt_pending(true);
+
+        assert!(selected.take_preempt_pending());
+        assert!(!selected.need_resched.load(Ordering::Acquire));
+
+        // Model a remote affinity/wake publisher after the scheduler has
+        // removed this task from its ready queue and released the scheduler
+        // lock. The later publication must remain pending for the task.
+        selected.set_preempt_pending(true);
+        assert!(selected.need_resched.load(Ordering::Acquire));
+    }
+
+    #[cfg(all(feature = "preempt", feature = "smp"))]
+    #[test]
+    fn selected_task_preserves_an_already_published_affinity_exclusion() {
+        let selected = TaskInner::new_init("selected-affinity-publication".into()).unwrap();
+        // The host test axconfig has one CPU, so an empty mask is used only to
+        // model the local "CPU 0 excluded" predicate. Public SMP admission
+        // still rejects empty masks and requires another online target.
+        selected.set_cpumask(AxCpuMask::new());
+        selected.set_preempt_pending(true);
+
+        assert!(selected.take_preempt_pending());
+        selected.preserve_preempt_if_cpu_disallowed(0);
+
+        assert!(selected.need_resched.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn exited_queue_generation_exhaustion_is_explicit_and_rolls_back() {
+        let task = TaskInner::new_init("exit-generation".into()).unwrap();
+        task.exit_queue_generation
+            .store(u64::MAX, Ordering::Release);
+
+        assert_eq!(
+            task.admit_exit_queue(),
+            Err(TaskExitQueueFault::GenerationExhausted)
+        );
+        assert_eq!(
+            task.exit_queue_fault(),
+            Some(TaskExitQueueFault::GenerationExhausted)
+        );
+        assert!(!task.exit_queued.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn exited_queue_stale_link_is_typed_and_durable() {
+        let task = TaskInner::new_init("exit-link".into()).unwrap();
+        let stale = NonNull::<AxTask>::dangling().as_ptr();
+        task.exit_next.store(stale, Ordering::Release);
+
+        assert_eq!(
+            task.admit_exit_queue(),
+            Err(TaskExitQueueFault::CorruptLink)
+        );
+        assert_eq!(
+            task.exit_queue_fault(),
+            Some(TaskExitQueueFault::CorruptLink)
+        );
+        assert!(!task.exit_queued.load(Ordering::Acquire));
+
+        // The deliberately injected pointer was never an Arc ownership unit.
+        // Clear it before the test object is dropped.
+        task.exit_next
+            .store(core::ptr::null_mut(), Ordering::Release);
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn remote_wake_handoff_transfers_exactly_one_arc() {
+        let task = TaskInner::new_init("handoff".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        match task.publish_wake_handoff(task.clone()) {
+            WakeHandoffPublication::Deferred => {}
+            WakeHandoffPublication::Ready(_) | WakeHandoffPublication::Occupied(_) => {
+                panic!("running task must delegate its wake to the old CPU")
+            }
+        }
+        match task.finish_cpu_handoff() {
+            CpuHandoffCompletion::Wake(owned) => assert!(Arc::ptr_eq(&owned, &task)),
+            CpuHandoffCompletion::Cleared
+            | CpuHandoffCompletion::AlreadyCleared
+            | CpuHandoffCompletion::MissingWake
+            | CpuHandoffCompletion::Stale => panic!("delegated wake ownership was lost"),
+        }
+        assert!(matches!(
+            task.finish_cpu_handoff(),
+            CpuHandoffCompletion::AlreadyCleared
+        ));
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn deferred_cpu_handoff_retains_the_wake_claim_until_target_publication() {
+        let task = TaskInner::new_init("claimed-handoff".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        assert_eq!(task.claim_wake_mutation(), WakeMutationClaim::Claimed);
+        assert!(matches!(
+            task.publish_wake_handoff(task.clone()),
+            WakeHandoffPublication::Deferred
+        ));
+        let owned = match task.finish_cpu_handoff() {
+            CpuHandoffCompletion::Wake(owned) => owned,
+            CpuHandoffCompletion::Cleared
+            | CpuHandoffCompletion::AlreadyCleared
+            | CpuHandoffCompletion::MissingWake
+            | CpuHandoffCompletion::Stale => {
+                panic!("deferred handoff lost its exact task owner")
+            }
+        };
+        assert!(Arc::ptr_eq(&owned, &task));
+        assert!(!task.try_begin_affinity_mutation());
+        assert!(task.finish_wake_mutation());
+        drop(owned);
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn completed_cpu_handoff_returns_wake_to_publisher() {
+        let task = TaskInner::new_init("handoff-complete".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        assert!(matches!(
+            task.finish_cpu_handoff(),
+            CpuHandoffCompletion::Cleared
+        ));
+        match task.publish_wake_handoff(task.clone()) {
+            WakeHandoffPublication::Ready(owned) => assert!(Arc::ptr_eq(&owned, &task)),
+            WakeHandoffPublication::Deferred | WakeHandoffPublication::Occupied(_) => {
+                panic!("completed handoff must return enqueue ownership")
+            }
+        }
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn duplicate_cpu_owner_mark_is_rejected_and_generation_is_unique() {
+        let task = TaskInner::new_init("owner-generation".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        let first = task.cpu_owner_token().expect("init owner token");
+        assert!(task.try_mark_running_on_cpu(0).is_none());
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(first),
+            CpuHandoffCompletion::Cleared
+        ));
+
+        let second = task
+            .try_mark_running_on_cpu(1)
+            .expect("released task can receive a new owner");
+        assert_ne!(first, second, "owner generations must never be reused");
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(second),
+            CpuHandoffCompletion::Cleared
+        ));
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn cpu_owner_generation_budget_is_wide_and_checked_at_the_boundary() {
+        let task = TaskInner::new_init("owner-generation-budget".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        let initial = task.cpu_owner_token().expect("init owner token");
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(initial),
+            CpuHandoffCompletion::Cleared
+        ));
+
+        // One wake marker bit and a 16-bit x86_64 CPU tag leave 47 bits for a
+        // monotonic owner generation. Seed the private counter immediately
+        // before its limit to exercise both the final valid claim and the
+        // explicit non-wrapping rejection without billions of context switches.
+        assert_eq!(CPU_OWNER_CPU_BITS, 16);
+        assert_eq!(CPU_OWNER_GENERATION_MASK, (1_u64 << 47) - 1);
+        task.cpu_handoff_generation
+            .store(CPU_OWNER_GENERATION_MASK - 1, Ordering::Release);
+        let cpu = CPU_OWNER_CPU_MASK as u32;
+        let final_owner = task
+            .try_mark_running_on_cpu(cpu)
+            .expect("the maximum representable owner generation is valid");
+        assert_eq!(final_owner >> CPU_OWNER_CPU_BITS, CPU_OWNER_GENERATION_MASK);
+        assert_eq!(final_owner & CPU_OWNER_CPU_MASK, cpu as u64);
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(final_owner),
+            CpuHandoffCompletion::Cleared
+        ));
+
+        assert!(
+            task.try_mark_running_on_cpu(0).is_none(),
+            "owner generation exhaustion must fail without wrapping"
+        );
+        assert!(
+            task.try_mark_running_on_cpu((CPU_OWNER_CPU_MASK + 1) as u32)
+                .is_none(),
+            "CPU tags outside the fixed token field must be rejected"
+        );
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn stale_owner_clear_cannot_clear_a_newer_cpu_owner() {
+        let task = TaskInner::new_init("stale-owner-clear".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        let old = task.cpu_owner_token().expect("old owner token");
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(old),
+            CpuHandoffCompletion::Cleared
+        ));
+        let new = task.try_mark_running_on_cpu(1).expect("new owner token");
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(old),
+            CpuHandoffCompletion::Stale
+        ));
+        assert_eq!(task.cpu_owner_token(), Some(new));
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(new),
+            CpuHandoffCompletion::Cleared
+        ));
+    }
+
+    #[cfg(feature = "smp")]
+    #[test]
+    fn stack_reclamation_waits_for_cpu_owner_release() {
+        let mut task =
+            TaskInner::new(|| {}, "stack-owner-gate".into(), MIN_KERNEL_STACK_SIZE).unwrap();
+        let owner = task.try_mark_running_on_cpu(0).expect("test owner token");
+        assert!(!task.can_reclaim_stack());
+        assert!(matches!(
+            task.finish_cpu_handoff_exact(owner),
+            CpuHandoffCompletion::Cleared
+        ));
+        assert!(task.can_reclaim_stack());
+        assert!(task.take_kernel_stack().is_some());
+    }
+}

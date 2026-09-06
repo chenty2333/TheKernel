@@ -1,0 +1,22 @@
+[package]
+name = "thekernel-linux-ipc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["朝倉水希 <asakuramizu111@gmail.com>", "Mivik <mivikq@gmail.com>", "陈天意 <hi@tychen.cc>"]
+description = "Pure System V IPC and POSIX mqueue policy plans"
+license = "Apache-2.0"
+repository = "https://github.com/chenty2333/thekernel-linux-abi"
+homepage = "https://github.com/chenty2333/thekernel-linux-abi"
+keywords = ["kernel", "linux", "no-std", "ipc"]
+categories = ["no-std", "os"]
+[features]
+default = []
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[package.metadata.thekernel]
+layer = "linux_abi"

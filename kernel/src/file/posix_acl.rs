@@ -76,9 +76,7 @@ impl Acl {
                 return Err(invalid());
             }
             match tag {
-                ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_MASK | ACL_OTHER if id != u32::MAX => {
-                    return Err(invalid());
-                }
+                ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_MASK | ACL_OTHER if id == u32::MAX => {}
                 ACL_USER | ACL_GROUP if id != u32::MAX => {}
                 _ => return Err(invalid()),
             }
@@ -266,19 +264,25 @@ impl Acl {
     fn grant_user(&mut self, uid: u32, permissions: u16) -> AxResult<()> {
         if !self.extended {
             let group = self.entry(ACL_GROUP_OBJ).perm;
-            let other = self.entries.pop().ok_or(AxError::BadState)?;
             self.entries.try_reserve(2).map_err(|_| AxError::NoMemory)?;
-            self.entries.push(Entry {
-                tag: ACL_USER,
-                perm: permissions,
-                id: uid,
-            });
-            self.entries.push(Entry {
-                tag: ACL_MASK,
-                perm: group,
-                id: u32::MAX,
-            });
-            self.entries.push(other);
+            // Linux canonical order places named users before GROUP_OBJ,
+            // with MASK immediately before the final OTHER entry.
+            self.entries.insert(
+                1,
+                Entry {
+                    tag: ACL_USER,
+                    perm: permissions,
+                    id: uid,
+                },
+            );
+            self.entries.insert(
+                self.entries.len() - 1,
+                Entry {
+                    tag: ACL_MASK,
+                    perm: group,
+                    id: u32::MAX,
+                },
+            );
             self.extended = true;
             return Ok(());
         }
@@ -632,4 +636,73 @@ pub(crate) fn revoke_user(location: &Location, uid: u32) -> AxResult<()> {
         return Err(error);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use axfs_ng_vfs::{FsName, Mountpoint};
+
+    use super::*;
+    use crate::pseudofs::tmp::MemoryFs;
+
+    #[test]
+    fn seat_acl_mode_grant_revoke_roundtrip() {
+        let mode = NodePermission::from_bits_truncate(0o660);
+        for uid in [0, 100] {
+            let original = Acl::from_mode(mode).unwrap().encode().unwrap();
+            let mut acl = Acl::parse(&original).unwrap();
+            acl.grant_user(uid, 0o6).unwrap();
+            let mut acl = Acl::parse(&acl.encode().unwrap()).unwrap();
+            assert!(acl.extended);
+            assert_eq!(acl.entries[1].tag, ACL_USER);
+            assert_eq!(acl.entries[1].id, uid);
+            assert_eq!(acl.entries[1].perm & acl.entry(ACL_MASK).perm, 0o6);
+            assert_eq!(acl.mode(mode).bits(), mode.bits());
+            // A subsequent acquisition uses the persisted extended ACL.
+            acl.grant_user(uid, 0o6).unwrap();
+            let mut acl = Acl::parse(&acl.encode().unwrap()).unwrap();
+            assert!(acl.revoke_user(uid));
+            let restored = Acl::parse(&acl.encode().unwrap()).unwrap();
+            assert!(!restored.extended);
+            assert_eq!(restored.encode().unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn seat_acl_rejects_wrong_entry_id_classes() {
+        let mode = NodePermission::from_bits_truncate(0o660);
+        let mut acl = Acl::from_mode(mode).unwrap();
+        acl.entries[0].id = 0;
+        assert!(Acl::parse(&acl.encode().unwrap()).is_err());
+        acl.entries[0].id = u32::MAX;
+        acl.grant_user(100, 0o6).unwrap();
+        acl.entries[1].id = u32::MAX;
+        assert!(Acl::parse(&acl.encode().unwrap()).is_err());
+    }
+
+    #[test]
+    fn seat_acl_location_grant_revoke_preserves_mode_and_storage() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let filesystem = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&filesystem);
+        let mode = NodePermission::from_bits_truncate(0o660);
+        let location = mount
+            .root_location()
+            .create(FsName::new(b"seat-device-acl"), NodeType::RegularFile, mode)
+            .unwrap();
+        for uid in [0, 100] {
+            grant_user(&location, uid, 0o6).unwrap();
+            let acl = Acl::parse(&location.get_xattr(ACCESS_XATTR).unwrap()).unwrap();
+            assert_eq!(acl.entries[1].tag, ACL_USER);
+            assert_eq!(acl.entries[1].id, uid);
+            assert_eq!(location.metadata().unwrap().mode.bits(), mode.bits());
+            grant_user(&location, uid, 0o6).unwrap();
+            revoke_user(&location, uid).unwrap();
+            assert_eq!(location.metadata().unwrap().mode.bits(), mode.bits());
+            assert_eq!(
+                LinuxError::from(location.get_xattr(ACCESS_XATTR).unwrap_err()),
+                LinuxError::ENODATA
+            );
+        }
+    }
 }

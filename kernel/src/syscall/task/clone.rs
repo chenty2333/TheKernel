@@ -1066,6 +1066,7 @@ impl CloneArgs {
             let exit_fd_table = Arc::try_new(FdTable::new()?).map_err(|_| AxError::NoMemory)?;
 
             let proc_data = ProcessData::try_new(
+                old_proc_data.world,
                 proc,
                 prepared_zombie_snapshot,
                 child_credential.clone(),

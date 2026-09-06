@@ -1,0 +1,29 @@
+[package]
+name = "thekernel-linux-seccomp"
+version = "0.1.0"
+edition = "2024"
+authors = ["朝倉水希 <asakuramizu111@gmail.com>", "Mivik <mivikq@gmail.com>", "陈天意 <hi@tychen.cc>"]
+description = "Bounded classic-BPF and seccomp policy state for no_std Linux ABI kernels"
+license = "Apache-2.0"
+repository = "https://github.com/chenty2333/thekernel-linux-abi"
+homepage = "https://github.com/chenty2333/thekernel-linux-abi"
+readme = "README.md"
+keywords = ["kernel", "linux", "no-std", "seccomp", "bpf"]
+categories = ["no-std", "os"]
+
+[features]
+default = []
+
+[package.metadata.docs.rs]
+all-features = true
+
+[package.metadata.thekernel]
+layer = "linux_abi"
+toolchain = "nightly"
+nightly-features = ["allocator_api"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
