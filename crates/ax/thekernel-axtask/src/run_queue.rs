@@ -4469,11 +4469,19 @@ pub(crate) fn migrate_entry(migrated_task: AxTaskRef) {
             migrated_task.record_wake_fault(TaskWakeFault::RunQueueUnavailable);
             axhal::power::system_off();
         };
-        {
-            let _scheduler = source.scheduler.lock();
-            migrated_task.set_cpu_id(source.cpu_id as _);
-        }
-        if let Err(error) = source.enqueue_task(migrated_task, EnqueueReason::Migrate) {
+        // The target-selection guard was released above. Re-establish the
+        // scheduler lock's IRQ/preemption exclusion while rolling back on the
+        // source queue; otherwise an IRQ-side wake can re-enter this raw lock
+        // on the migration helper's CPU and spin forever.
+        let enqueue = {
+            let _guard = kernel_guard::NoPreemptIrqSave::new();
+            {
+                let _scheduler = source.scheduler.lock();
+                migrated_task.set_cpu_id(source.cpu_id as _);
+            }
+            source.enqueue_task(migrated_task, EnqueueReason::Migrate)
+        };
+        if let Err(error) = enqueue {
             contain_enqueue_failure(&error, TaskState::Ready);
             axhal::power::system_off();
         }

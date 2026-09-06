@@ -334,6 +334,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn completed_block_session_releases_its_interrupt_waker() {
+        let task = crate::TaskInner::new_init("interrupt-waker-retirement".into())
+            .unwrap()
+            .into_arc()
+            .unwrap();
+        let baseline = Arc::strong_count(&task);
+        let token = task.begin_block_wait().unwrap();
+        let waker = task_waker(&task);
+        let cx = Context::from_waker(&waker);
+        assert!(task.poll_interrupt(&cx).is_pending());
+        assert_eq!(Arc::strong_count(&task), baseline + 2);
+        task.end_block_wait(token).unwrap();
+        assert_eq!(Arc::strong_count(&task), baseline + 1);
+        drop(waker);
+        assert_eq!(Arc::strong_count(&task), baseline);
+
+        // Stale cleanup cannot remove the next session's owned waker.
+        let next_token = task.begin_block_wait().unwrap();
+        let waker = task_waker(&task);
+        let cx = Context::from_waker(&waker);
+        assert!(task.poll_interrupt(&cx).is_pending());
+        assert!(task.end_block_wait(token).is_err());
+        assert_eq!(Arc::strong_count(&task), baseline + 2);
+        task.end_block_wait(next_token).unwrap();
+        drop(waker);
+        assert_eq!(Arc::strong_count(&task), baseline);
+
+        // Retiring the waker must not consume a pending interrupt.
+        let token = task.begin_block_wait().unwrap();
+        task.interrupt();
+        task.end_block_wait(token).unwrap();
+        assert!(task.is_interrupted());
+    }
+
+    #[test]
     fn raw_task_waker_owns_exactly_one_arc_per_instance() {
         let task = crate::TaskInner::new_init("raw-waker".into())
             .unwrap()

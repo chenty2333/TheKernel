@@ -2298,7 +2298,12 @@ impl TaskInner {
 
     /// Ends a generation-checked synchronous block-wait session.
     pub(crate) fn end_block_wait(&self, token: BlockWaitToken) -> Result<(), EndBlockWaitError> {
-        self.block_wait.end(token)
+        self.block_wait.end(token)?;
+        // poll_interrupt may retain this session's task waker. Once the
+        // session ends it can no longer wake useful work, and retaining it
+        // would form Task -> interrupt_waker -> Arc<Task>, preventing GC.
+        self.clear_interrupt_waker();
+        Ok(())
     }
 
     /// Records the first terminal wake-publication fault for diagnostics and

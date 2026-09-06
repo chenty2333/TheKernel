@@ -248,8 +248,9 @@ where
 
 /// Cancels a live timer callback registration.
 ///
-/// If the callback is currently running, destruction is deferred until that
-/// invocation exits. Returning `true` guarantees no later invocation begins.
+/// Returning `true` prevents admission by subsequent dispatches. Callbacks
+/// already leased by the current dispatch may still run, even if their call
+/// has not started. Destruction waits for the last admitted invocation to exit.
 pub fn cancel_timer_callback(token: TimerCallbackToken) -> bool {
     callbacks_for(token.owner_cpu).cancel(token)
 }
