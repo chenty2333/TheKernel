@@ -26,7 +26,7 @@ use core::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 pub const IPPROTO_DCCP: u8 = 33;
@@ -694,7 +694,7 @@ pub struct DccpSocket {
     state: Mutex<State>,
     rd: AtomicBool,
     wr: AtomicBool,
-    poll: PollSet,
+    poll: Arc<PollSet>,
     timer: Mutex<Option<DccpTimer>>,
     accept: u64,
 }
@@ -730,7 +730,7 @@ impl DccpSocket {
             state: Mutex::new(State::new()),
             rd: AtomicBool::new(false),
             wr: AtomicBool::new(false),
-            poll: PollSet::new(),
+            poll: Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?,
             timer: Mutex::new(None),
             accept: NEXT.fetch_add(1, Ordering::Relaxed),
         })
@@ -1160,13 +1160,19 @@ impl DccpSocket {
         }
         earliest
     }
-    fn arm_timer(&self, c: &mut Context<'_>) -> Result<(), PollRegistrationError> {
+    fn arm_timer(&self) -> Result<(), PollRegistrationError> {
         let deadline = self.next_deadline();
         if deadline == 0 {
-            *self.timer.lock() = None;
+            let retired = self.timer.lock().take();
+            drop(retired);
             return Ok(());
         }
         let deadline = TimeValue::from_micros((deadline / 1_000) as _);
+        // The shared timer wakes the socket source, never one particular
+        // registration. Only this known source Arc is cloned/dropped under
+        // the timer gate; callers' raw wakers run after that gate is released.
+        let waker = Waker::from(Arc::clone(&self.poll));
+        let mut context = Context::from_waker(&waker);
         let mut timer = self.timer.lock();
         if timer.as_ref().is_none_or(|x| x.deadline != deadline) {
             let future =
@@ -1174,20 +1180,16 @@ impl DccpSocket {
             *timer = Some(DccpTimer {
                 deadline,
                 future: Box::into_pin(future),
-            })
+            });
         }
-        if let Some(active_timer) = timer.as_mut() {
-            match active_timer.future.as_mut().poll(c) {
-                Poll::Ready(Ok(())) => {
-                    *timer = None;
-                    c.waker().wake_by_ref()
-                }
-                Poll::Ready(Err(_)) => {
-                    *timer = None;
-                    return Err(PollRegistrationError::InvalidState);
-                }
-                Poll::Pending => {}
-            }
+        let result = timer.as_mut().map(|timer| timer.future.as_mut().poll(&mut context));
+        let retired = if matches!(result, Some(Poll::Ready(_))) { timer.take() } else { None };
+        drop(timer);
+        drop(retired);
+        match result {
+            Some(Poll::Ready(Ok(()))) => { self.poll.wake(); }
+            Some(Poll::Ready(Err(error))) => return Err(crate::service::map_timer_registration_error(error)),
+            Some(Poll::Pending) | None => {}
         }
         Ok(())
     }
@@ -1849,12 +1851,112 @@ impl Pollable for DccpSocket {
         c: &mut Context<'_>,
         _: IoEvents,
     ) -> Result<PollRegistration<'a>, PollRegistrationError> {
-        self.arm_timer(c)?;
         let mut p = PreparedPollRegistration::try_new(6)?;
         p.arm(&self.poll, c.waker())?;
         p.arm(&self.ingress.wake, c.waker())?;
         self.dispatcher.v4.arm_dispatcher_readiness(&mut p, c)?;
         self.dispatcher.v6.arm_dispatcher_readiness(&mut p, c)?;
+        self.arm_timer()?;
         p.commit()
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::*;
+    use core::sync::atomic::AtomicUsize;
+
+    struct TimerProbe {
+        ready: AtomicBool,
+        waker: std::sync::Mutex<Option<Waker>>,
+    }
+
+    struct ControlledTimer(Arc<TimerProbe>);
+
+    impl Future for ControlledTimer {
+        type Output = Result<(), TimerRegistrationError>;
+
+        fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.0.ready.load(Ordering::Acquire) {
+                Poll::Ready(Ok(()))
+            } else {
+                *self.0.waker.lock().unwrap() = Some(context.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    struct WakeProbe {
+        socket: Weak<DccpSocket>,
+        wakes: AtomicUsize,
+    }
+
+    impl alloc::task::Wake for WakeProbe {
+        fn wake(self: Arc<Self>) { self.wake_by_ref(); }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let socket = self.socket.upgrade().unwrap();
+            assert!(socket.timer.try_lock().is_some());
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn socket_with_deadline() -> (Arc<DccpSocket>, TimeValue) {
+        let socket = Arc::new(DccpSocket::new(NetStack::new_loopback_only(), RawSocketFamily::Ipv4).unwrap());
+        socket.state.lock().deadline = 1_000_000;
+        let deadline = TimeValue::from_micros(1_000);
+        (socket, deadline)
+    }
+
+    #[test]
+    fn shared_timer_broadcasts_and_wakes_after_unlock() {
+        let (socket, deadline) = socket_with_deadline();
+        let timer = Arc::new(TimerProbe {
+            ready: AtomicBool::new(false),
+            waker: std::sync::Mutex::new(None),
+        });
+        *socket.timer.lock() = Some(DccpTimer {
+            deadline,
+            future: Box::pin(ControlledTimer(Arc::clone(&timer))),
+        });
+        let first = Arc::new(WakeProbe { socket: Arc::downgrade(&socket), wakes: AtomicUsize::new(0) });
+        let second = Arc::new(WakeProbe { socket: Arc::downgrade(&socket), wakes: AtomicUsize::new(0) });
+        let first_waker = Waker::from(Arc::clone(&first));
+        let second_waker = Waker::from(Arc::clone(&second));
+        let mut first_context = Context::from_waker(&first_waker);
+        let mut second_context = Context::from_waker(&second_waker);
+        let first_registration = socket.register(&mut first_context, IoEvents::READABLE).unwrap();
+        let second_registration = socket.register(&mut second_context, IoEvents::READABLE).unwrap();
+        let installed = timer.waker.lock().unwrap().take().unwrap();
+        installed.wake();
+        assert_eq!(first.wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(second.wakes.load(Ordering::Relaxed), 1);
+        drop(first_registration);
+        drop(second_registration);
+        let _first_registration = socket.register(&mut first_context, IoEvents::READABLE).unwrap();
+        let _second_registration = socket.register(&mut second_context, IoEvents::READABLE).unwrap();
+        timer.ready.store(true, Ordering::Release);
+        socket.arm_timer().unwrap();
+        assert_eq!(first.wakes.load(Ordering::Relaxed), 2);
+        assert_eq!(second.wakes.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn timer_admission_error_preserves_reason_and_rolls_back_sources() {
+        let (socket, deadline) = socket_with_deadline();
+        for (error, expected) in [
+            (TimerRegistrationError::CapacityExhausted, PollRegistrationError::Quota),
+            (TimerRegistrationError::TokenSpaceExhausted, PollRegistrationError::InvalidState),
+            (TimerRegistrationError::DeadlineOverflow, PollRegistrationError::InvalidState),
+        ] {
+            *socket.timer.lock() = Some(DccpTimer {
+                deadline,
+                future: Box::pin(core::future::ready(Err(error))),
+            });
+            let result = socket.register(&mut Context::from_waker(Waker::noop()), IoEvents::READABLE);
+            assert!(matches!(result, Err(actual) if actual == expected));
+            assert!(socket.timer.lock().is_none());
+            assert!(socket.poll.is_empty());
+        }
     }
 }

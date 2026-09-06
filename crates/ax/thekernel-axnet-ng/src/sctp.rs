@@ -27,7 +27,7 @@ use core::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -231,7 +231,7 @@ struct Inner {
     family: RawSocketFamily,
     state: Mutex<State>,
     general: GeneralOptions,
-    poll: PollSet,
+    poll: Arc<PollSet>,
     timer: Mutex<Option<SctpTimer>>,
     rd: AtomicBool,
     wr: AtomicBool,
@@ -912,6 +912,9 @@ impl SctpDispatcher {
         if s.phase != Phase::Listen || s.pending.len() >= s.backlog {
             return;
         }
+        let Ok(poll) = Arc::try_new(PollSet::new()) else {
+            return;
+        };
         let a = match Arc::try_new(Inner {
             stack: x.stack.clone(),
             family: x.family,
@@ -928,7 +931,7 @@ impl SctpDispatcher {
                 ..State::new()
             }),
             general: GeneralOptions::new(),
-            poll: PollSet::new(),
+            poll,
             timer: Mutex::new(None),
             rd: AtomicBool::new(false),
             wr: AtomicBool::new(false),
@@ -1495,18 +1498,21 @@ impl SctpSocket {
         state.t1.saturating_add(interval)
     }
 
-    fn arm_t1_timer(&self, context: &mut Context<'_>) -> Result<(), PollRegistrationError> {
+    fn arm_t1_timer(&self) -> Result<(), PollRegistrationError> {
         let deadline_nanos = self.next_t1_deadline();
-        let mut timer = self.inner.timer.lock();
         if deadline_nanos == 0 {
-            *timer = None;
+            let retired = self.inner.timer.lock().take();
+            drop(retired);
             return Ok(());
         }
         let deadline = TimeValue::from_micros((deadline_nanos / 1_000) as _);
-        if timer
-            .as_ref()
-            .is_none_or(|timer| timer.deadline != deadline)
-        {
+        // One shared source preserves every association waiter. Cloning or
+        // dropping its known Arc cannot invoke a caller's raw waker while
+        // the timer gate is held.
+        let waker = Waker::from(Arc::clone(&self.inner.poll));
+        let mut context = Context::from_waker(&waker);
+        let mut timer = self.inner.timer.lock();
+        if timer.as_ref().is_none_or(|timer| timer.deadline != deadline) {
             let future =
                 Box::try_new(sleep_until(deadline)).map_err(|_| PollRegistrationError::NoMemory)?;
             *timer = Some(SctpTimer {
@@ -1514,18 +1520,14 @@ impl SctpSocket {
                 future: Box::into_pin(future),
             });
         }
-        if let Some(active_timer) = timer.as_mut() {
-            match active_timer.future.as_mut().poll(context) {
-                Poll::Ready(Ok(())) => {
-                    *timer = None;
-                    context.waker().wake_by_ref();
-                }
-                Poll::Ready(Err(_)) => {
-                    *timer = None;
-                    return Err(PollRegistrationError::InvalidState);
-                }
-                Poll::Pending => {}
-            }
+        let result = timer.as_mut().map(|timer| timer.future.as_mut().poll(&mut context));
+        let retired = if matches!(result, Some(Poll::Ready(_))) { timer.take() } else { None };
+        drop(timer);
+        drop(retired);
+        match result {
+            Some(Poll::Ready(Ok(()))) => { self.inner.poll.wake(); }
+            Some(Poll::Ready(Err(error))) => return Err(crate::service::map_timer_registration_error(error)),
+            Some(Poll::Pending) | None => {}
         }
         Ok(())
     }
@@ -1626,7 +1628,7 @@ impl SctpSocket {
             family,
             state: Mutex::new(State::new()),
             general: GeneralOptions::new(),
-            poll: PollSet::new(),
+            poll: Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?,
             timer: Mutex::new(None),
             rd: AtomicBool::new(false),
             wr: AtomicBool::new(false),
@@ -2081,16 +2083,117 @@ impl Pollable for SctpSocket {
         c: &mut Context<'_>,
         _: IoEvents,
     ) -> Result<PollRegistration<'a>, PollRegistrationError> {
-        // Arm before publishing all sources, then the poller immediately
-        // rechecks timers after registration; this closes the deadline wake
-        // window used by blocking GeneralOptions transfers.
-        self.arm_t1_timer(c)?;
         // inner state + each raw socket's local wake source and NetStack
         // device readiness registration.
         let mut p = PreparedPollRegistration::try_new(5)?;
         p.arm(&self.inner.poll, c.waker())?;
         self.dispatcher.v4.arm_dispatcher_readiness(&mut p, c)?;
         self.dispatcher.v6.arm_dispatcher_readiness(&mut p, c)?;
+        self.arm_t1_timer()?;
         p.commit()
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::*;
+    use core::sync::atomic::AtomicUsize;
+
+    struct TimerProbe {
+        ready: AtomicBool,
+        waker: std::sync::Mutex<Option<Waker>>,
+    }
+
+    struct ControlledTimer(Arc<TimerProbe>);
+
+    impl Future for ControlledTimer {
+        type Output = Result<(), TimerRegistrationError>;
+
+        fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.0.ready.load(Ordering::Acquire) {
+                Poll::Ready(Ok(()))
+            } else {
+                *self.0.waker.lock().unwrap() = Some(context.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    struct WakeProbe {
+        socket: Weak<Inner>,
+        wakes: AtomicUsize,
+    }
+
+    impl alloc::task::Wake for WakeProbe {
+        fn wake(self: Arc<Self>) { self.wake_by_ref(); }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let socket = self.socket.upgrade().unwrap();
+            assert!(socket.timer.try_lock().is_some());
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn socket_with_deadline() -> (SctpSocket, TimeValue) {
+        let socket = SctpSocket::new(NetStack::new_loopback_only(), RawSocketFamily::Ipv4).unwrap();
+        {
+            let mut state = socket.inner.state.lock();
+            state.phase = Phase::CookieWait;
+            state.t1 = 1;
+        }
+        let deadline = TimeValue::from_micros(socket.next_t1_deadline() / 1_000);
+        (socket, deadline)
+    }
+
+    #[test]
+    fn shared_timer_broadcasts_and_wakes_after_unlock() {
+        let (socket, deadline) = socket_with_deadline();
+        let timer = Arc::new(TimerProbe {
+            ready: AtomicBool::new(false),
+            waker: std::sync::Mutex::new(None),
+        });
+        *socket.inner.timer.lock() = Some(SctpTimer {
+            deadline,
+            future: Box::pin(ControlledTimer(Arc::clone(&timer))),
+        });
+        let first = Arc::new(WakeProbe { socket: Arc::downgrade(&socket.inner), wakes: AtomicUsize::new(0) });
+        let second = Arc::new(WakeProbe { socket: Arc::downgrade(&socket.inner), wakes: AtomicUsize::new(0) });
+        let first_waker = Waker::from(Arc::clone(&first));
+        let second_waker = Waker::from(Arc::clone(&second));
+        let mut first_context = Context::from_waker(&first_waker);
+        let mut second_context = Context::from_waker(&second_waker);
+        let first_registration = socket.register(&mut first_context, IoEvents::READABLE).unwrap();
+        let second_registration = socket.register(&mut second_context, IoEvents::READABLE).unwrap();
+        let installed = timer.waker.lock().unwrap().take().unwrap();
+        installed.wake();
+        assert_eq!(first.wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(second.wakes.load(Ordering::Relaxed), 1);
+        drop(first_registration);
+        drop(second_registration);
+        let _first_registration = socket.register(&mut first_context, IoEvents::READABLE).unwrap();
+        let _second_registration = socket.register(&mut second_context, IoEvents::READABLE).unwrap();
+        timer.ready.store(true, Ordering::Release);
+        socket.arm_t1_timer().unwrap();
+        assert_eq!(first.wakes.load(Ordering::Relaxed), 2);
+        assert_eq!(second.wakes.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn timer_admission_error_preserves_reason_and_rolls_back_sources() {
+        let (socket, deadline) = socket_with_deadline();
+        for (error, expected) in [
+            (TimerRegistrationError::CapacityExhausted, PollRegistrationError::Quota),
+            (TimerRegistrationError::TokenSpaceExhausted, PollRegistrationError::InvalidState),
+            (TimerRegistrationError::DeadlineOverflow, PollRegistrationError::InvalidState),
+        ] {
+            *socket.inner.timer.lock() = Some(SctpTimer {
+                deadline,
+                future: Box::pin(core::future::ready(Err(error))),
+            });
+            let result = socket.register(&mut Context::from_waker(Waker::noop()), IoEvents::READABLE);
+            assert!(matches!(result, Err(actual) if actual == expected));
+            assert!(socket.inner.timer.lock().is_none());
+            assert!(socket.inner.poll.is_empty());
+        }
     }
 }

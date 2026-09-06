@@ -314,7 +314,7 @@ impl Service {
     }
 }
 
-fn map_timer_registration_error(error: TimerRegistrationError) -> PollRegistrationError {
+pub(crate) fn map_timer_registration_error(error: TimerRegistrationError) -> PollRegistrationError {
     match error {
         TimerRegistrationError::CapacityExhausted => PollRegistrationError::Quota,
         TimerRegistrationError::TokenSpaceExhausted | TimerRegistrationError::DeadlineOverflow => {
