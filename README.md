@@ -61,6 +61,7 @@ small, resource-bounded wrapper around that same entry point:
 
 ```bash
 make run
+make run-gui       # open the Weston desktop with a terminal
 make run-existing  # reuse already-built kernel, ESP, and rootfs artifacts
 make build         # build without booting
 make lint          # run Clippy for the product kernel configuration
@@ -68,6 +69,17 @@ make test          # run the host verification suite
 make clean         # remove generated run, output, and cache directories
 make docker-clean  # remove the dev container volume and local image
 ```
+
+`make run-gui` builds the graphics userspace on its first run (Buildroot and
+package downloads can take a while), then uses incremental builds. It opens
+a Weston desktop with its native terminal; the panel's terminal launcher opens
+another after you close it. This session stays running and does not launch
+the graphics smoke tests. Close the QEMU window or press Ctrl+C in the host
+terminal to exit. Use `make run-gui RUN_ARGS=--no-build` to reuse the current
+images without rebuilding. See [graphics rootfs](docs/graphics-rootfs.md) for
+build dependencies and cache options.
+Like the other QEMU runs, the desktop uses a temporary disk snapshot: guest
+file changes are discarded when QEMU exits.
 
 Kernel output is captured separately from the user terminal in `kernel.log`.
 See [kernel diagnostics and request tracing](docs/debugging.md) for runtime log

@@ -3,6 +3,9 @@
 # software virtio-gpu has no render node and deliberately skips this phase.
 set -eu
 
+# The interactive desktop keeps Weston and its applications running.
+grep -qx q35-software-desktop /etc/thekernel-graphics-flavor && exit 0
+
 marker=THEKERNEL_Q35_VIRGL_KMSCUBE_READY
 [ -c /dev/dri/renderD128 ] || exit 0
 [ -c /dev/dri/card0 ] || { echo "$marker state=FAIL reason=card0"; exit 1; }

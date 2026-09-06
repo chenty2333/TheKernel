@@ -23,6 +23,14 @@ scripts/build-graphics-rootfs.sh --flavor q35-graphics-seatd --fetch-buildroot \
 
 ## User-local host dependencies
 
+`make run-gui` uses `~/.cache/thekernel-targets/graphics-desktop` for the
+incremental desktop build, `buildroot/source` for Buildroot, and
+`graphics-downloads` for package downloads, all below `THEKERNEL_STATE_DIR`
+(or Make's `STATE_DIR`). `THEKERNEL_BUILDROOT_DIR` and
+`THEKERNEL_GRAPHICS_DL_DIR` can select existing source and download caches.
+An existing `graphics-host-deps/bin/perl` below the state directory is used
+automatically; `THEKERNEL_GRAPHICS_HOST_DEPS_DIR` can select another prefix.
+
 Buildroot keeps its own dependency check enabled. By default the wrapper leaves
 the system Perl, `PATH`, and `PERL5LIB` untouched, so Buildroot's own complete
 dependency check is authoritative. On a machine whose Perl was installed
@@ -42,8 +50,8 @@ a tmpfs from the Buildroot SysV skeleton; `S80weston` creates
 The init script does not read `/etc/profile.d`. Each flavor overlay links
 `/etc/weston/weston.ini` to the checked-in headless or DRM Weston
 configuration, and `S80weston` starts `graphics-session`, which runs Weston
-with that file. `/etc/thekernel-graphics-flavor` remains a root-readable
-image-identity record only; nothing reads it at boot.
+with that file. `/etc/thekernel-graphics-flavor` identifies the image so the
+session can select its renderer and init can skip test workloads on the desktop.
 
 This is explicitly a **seatd + libseat** arrangement, not logind: Buildroot
 does not select systemd/logind, seatd owns `/run/seatd.sock` as `root:seat`,
@@ -86,6 +94,16 @@ binds both its QMP screendump and intentional stop to
 the screendump. The general `run --rootfs IMAGE` argument likewise requires an
 existing image and otherwise leaves the standard rootfs-builder behavior
 unchanged.
+
+For an interactive desktop, run `make run-gui`. The `q35-software-desktop`
+image opens Weston's desktop shell and native terminal as the unprivileged
+`weston` user, with the session's Wayland runtime environment. The terminal
+starts in `/var/lib/weston`; click the terminal icon in the top panel to open
+another terminal after closing one. Closing a terminal leaves the desktop
+running. Exit QEMU with Ctrl+C in the host terminal or by closing its window.
+This flavor skips the startup graphics test workloads and automatic shutdown.
+It uses software rendering by default; it is a minimal desktop and terminal,
+not a bundled general-purpose desktop distribution.
 
 `q35-graphics-seatd` is the canonical BusyBox/eudev + seatd + Weston
 desktop-shell + foot + rootless Xwayland image.  It contains Mesa softpipe,

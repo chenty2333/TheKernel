@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tools.qemu_runner.model import Interaction, QmpCheckpoint, QmpColorBlock, QmpPciHotplug, RunLimits
-from tools.qemu_runner.process import ProcessError, run_process, _pin_vcpu_threads, _QmpController
+from tools.qemu_runner.process import ProcessError, run_process, _pin_vcpu_threads, _QmpController, _ShellConsoleFilter
 
 
 class ProcessTests(unittest.TestCase):
@@ -509,6 +509,48 @@ print('DONE', flush=True)
         )
         self.assertEqual(result.returncode, 0, result.error_message or log.decode())
         self.assertIn(b"DONE", log)
+
+    def test_shell_console_filter_handles_every_chunk_boundary(self) -> None:
+        raw = b"boot\r\nTHEKERNEL_SHELL_READY\r\n# echo hi\r\nhi\r\n\rTHEKERNEL_SHELL_READY\n# "
+        expected = b"boot\r\n# echo hi\r\nhi\r\n# "
+        for split in range(len(raw) + 1):
+            with self.subTest(split=split):
+                console_filter = _ShellConsoleFilter()
+                self.assertEqual(console_filter.feed(raw[:split])
+                                 + console_filter.feed(raw[split:], final=True), expected)
+        console_filter = _ShellConsoleFilter()
+        self.assertEqual(console_filter.feed(b"# "), b"# ")
+        self.assertEqual(console_filter.feed(b"echo hi"), b"echo hi")
+
+    def test_shell_console_filter_preserves_similar_and_incomplete_lines(self) -> None:
+        for raw in (b" THEKERNEL_SHELL_READY\n", b"THEKERNEL_SHELL_READY extra\n",
+                    b"prefix THEKERNEL_SHELL_READY\n", b"THEKERNEL_SHELL_READ",
+                    b"THEKERNEL_SHELL_READY"):
+            with self.subTest(raw=raw):
+                console_filter = _ShellConsoleFilter()
+                actual = b"".join(console_filter.feed(bytes([byte])) for byte in raw)
+                self.assertEqual(actual + console_filter.feed(b"", final=True), raw)
+
+    def test_hidden_shell_prompt_still_gates_each_command_and_is_logged(self) -> None:
+        script = """
+import os, select
+for index in range(2):
+    assert not select.select([0], [], [], 0.05)[0], 'input before prompt'
+    print('THEKERNEL_SHELL_READY', flush=True)
+    received = os.read(0, 4096)
+    assert received == (str(index) + '\\n').encode(), received
+    print('# command ' + str(index), flush=True)
+"""
+        result, log, console = self.run_child(
+            script,
+            interaction=Interaction(interactive=True,
+                                    input_after_marker="THEKERNEL_SHELL_READY",
+                                    input_line_after_marker="THEKERNEL_SHELL_READY"),
+            input_text=b"0\n1\n",
+        )
+        self.assertEqual(result.returncode, 0, result.error_message or log.decode())
+        self.assertEqual(log.count(b"THEKERNEL_SHELL_READY"), 2)
+        self.assertEqual(console, b"# command 0\n# command 1\n")
 
     def test_plain_interactive_mode_preserves_tty_stdin(self) -> None:
         master_fd, slave_fd = pty.openpty()

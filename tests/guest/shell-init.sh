@@ -14,6 +14,7 @@ mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
 # Emit readiness from the interactive prompt, after the shell has configured
 # its terminal. Start a fresh line even when firmware or a command left a
 # partial line; the runner intentionally accepts only standalone markers.
+# The runner retains this handshake in its log but hides it from the live console.
 export PS1='
 THEKERNEL_SHELL_READY
 # '

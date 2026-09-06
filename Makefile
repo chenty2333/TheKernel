@@ -23,7 +23,7 @@ RUN_ARGS ?=
 RESOURCE_SCOPE = systemd-run --user --scope --quiet --collect \
 	-p MemoryMax=8G -p MemorySwapMax=0 -p OOMPolicy=stop
 
-.PHONY: run run-existing build lint test bench clean docker-clean
+.PHONY: run run-gui run-existing build lint test bench clean docker-clean
 
 run:
 	$(RESOURCE_SCOPE) \
@@ -35,6 +35,14 @@ run:
 
 run-existing:
 	$(MAKE) run RUN_ARGS="--no-build $(RUN_ARGS)"
+
+run-gui:
+	$(RESOURCE_SCOPE) \
+		env CARGO_BUILD_JOBS=$(CARGO_JOBS) \
+		THEKERNEL_STATE_DIR="$(STATE_DIR)" \
+		./tools/thekernel.py run-gui \
+		--smp $(SMP) --run-cpus $(RUN_CPUS) --memory $(MEMORY) \
+		--accel $(ACCEL) --timeout $(TIMEOUT) $(RUN_ARGS)
 
 build:
 	$(RESOURCE_SCOPE) env CARGO_BUILD_JOBS=$(CARGO_JOBS) \

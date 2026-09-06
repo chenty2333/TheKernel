@@ -115,6 +115,10 @@ flavor_br2_contract() {
     case "$1" in
         q35-software-desktop)
             printf '%s\n' \
+                'BR2_PACKAGE_WESTON_SHELL_DESKTOP=y' \
+                'BR2_PACKAGE_DEJAVU=y' \
+                'BR2_PACKAGE_DEJAVU_MONO=y' \
+                'BR2_GENERATE_LOCALE="C.UTF-8"' \
                 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y' \
                 'BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y' \
                 'BR2_PACKAGE_MESA3D_OPENGL_GLX=y' \
@@ -269,7 +273,13 @@ validate_checked_in() {
     }
     case "$flavor_backend" in
         headless-backend.so) weston_ini_link "$flavor_overlay" weston-headless.ini ;;
-        drm-backend.so) weston_ini_link "$flavor_overlay" weston-drm.ini ;;
+        drm-backend.so)
+            if [ "$flavor" = q35-software-desktop ]; then
+                weston_ini_link "$flavor_overlay" weston-desktop.ini
+            else
+                weston_ini_link "$flavor_overlay" weston-drm.ini
+            fi
+            ;;
     esac
     case "$flavor" in
         headless-abi-smoke)
@@ -284,7 +294,11 @@ validate_checked_in() {
             grep -qx 'BR2_PACKAGE_WESTON_DEFAULT_DRM=y' "$fragment"
             grep -qx 'BR2_PACKAGE_PYTHON3=y' "$fragment"
             flavor_br2_contract "$flavor" | require_br2_contract "$fragment"
-            grep -qx 'xwayland=true' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/weston/weston-drm.ini"
+            grep -qx 'xwayland=true' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/weston/weston-desktop.ini"
+            [ -x "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/usr/local/bin/thekernel-desktop-terminal" ]
+            sh -n "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/usr/local/bin/thekernel-desktop-terminal"
+            grep -qx 'shell=desktop-shell.so' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/weston/weston-desktop.ini"
+            grep -qx 'watch=false' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/weston/weston-desktop.ini"
             grep -qx 'q35-software-desktop' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/thekernel-graphics-flavor"
             grep -q '^/usr/local/bin/drm-uapi-oracle || { echo .*state=FAIL reason=drm_uapi_oracle' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke"
             grep -q '^/usr/local/bin/evdev-uapi-oracle || { echo .*state=FAIL reason=evdev_uapi_oracle' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke"
@@ -422,6 +436,11 @@ validate_build_output() {
     case "$flavor" in
         headless-abi-smoke) ;;
         q35-software-desktop)
+            [ -r "$target/usr/share/fonts/dejavu/DejaVuSansMono.ttf" ]
+            [ -s "$target/usr/lib/locale/locale-archive" ]
+            [ -x "$target/usr/bin/weston-terminal" ]
+            [ -x "$target/usr/local/bin/thekernel-desktop-terminal" ]
+            [ -r "$target/etc/weston/weston-desktop.ini" ]
             grep -qx 'BR2_PACKAGE_WESTON_DRM=y' "$resolved"
             flavor_br2_contract "$flavor" | require_br2_contract "$resolved"
             [ -x "$target/etc/init.d/S90q35-weston-smoke" ]
@@ -551,7 +570,7 @@ fi
 [ -d "$buildroot_dir" ] || { printf 'Buildroot source unavailable: %s (pass --buildroot-dir or --fetch-buildroot)\n' "$buildroot_dir" >&2; exit 1; }
 # Accept existing release tarballs and checkouts without switching branches or
 # discarding local changes. The source Makefile declares the release version.
-buildroot_version=$(sed -nE 's/^BR2_VERSION[[:space:]]*[:?]?=[[:space:]]*([^[:space:]]+).*$/\1/p' "$buildroot_dir/Makefile")
+buildroot_version=$(sed -nE 's/^[[:space:]]*(export[[:space:]]+)?BR2_VERSION[[:space:]]*[:?]?=[[:space:]]*([^[:space:]]+).*$/\2/p' "$buildroot_dir/Makefile")
 [ "$buildroot_version" = "$BUILDROOT_VERSION" ] || {
     printf 'Buildroot version mismatch: expected %s, found %s in %s; use a matching source directory\n' "$BUILDROOT_VERSION" "${buildroot_version:-missing}" "$buildroot_dir" >&2
     exit 1

@@ -576,6 +576,41 @@ def clean_cmd(_args: argparse.Namespace) -> int:
     return 0
 
 
+@serialized_build
+def build_desktop_rootfs(artifacts: Artifacts) -> Path:
+    """Use the graphics builder's incremental Buildroot output for the desktop."""
+    output = artifacts.root / "graphics-desktop"
+    source = Path(os.environ.get("THEKERNEL_BUILDROOT_DIR") or
+                  str(artifacts.root / "buildroot" / "source")).expanduser().resolve()
+    downloads = Path(os.environ.get("THEKERNEL_GRAPHICS_DL_DIR") or
+                     str(artifacts.root / "graphics-downloads")).expanduser().resolve()
+    for path in (output, source, downloads):
+        validate_storage(path)
+    command = [
+        str(REPO_ROOT / "scripts" / "build-graphics-rootfs.sh"),
+        "--flavor", "q35-software-desktop", "--output", str(output),
+        "--buildroot-dir", str(source), "--fetch-buildroot",
+        "--download-dir", str(downloads),
+    ]
+    host_deps = Path(os.environ.get("THEKERNEL_GRAPHICS_HOST_DEPS_DIR") or
+                     str(artifacts.root / "graphics-host-deps")).expanduser().resolve()
+    if (host_deps / "bin" / "perl").is_file():
+        command.extend(["--host-deps-dir", str(host_deps)])
+    run_checked(command)
+    return output / "images" / "rootfs.ext2"
+
+
+def run_gui_cmd(args: argparse.Namespace) -> int:
+    artifacts = Artifacts(state_root(), parse_variant(args), "system")
+    resolve_run_cpus(args.smp, args.run_cpus)
+    if not args.rootfs:
+        rootfs = artifacts.root / "graphics-desktop" / "images" / "rootfs.ext2"
+        if not args.no_build:
+            rootfs = build_desktop_rootfs(artifacts)
+        args.rootfs = str(rootfs)
+    return run_cmd(args)
+
+
 def run_cmd(args: argparse.Namespace) -> int:
     artifacts = Artifacts(state_root(), parse_variant(args), args.profile)
     run_cpus = resolve_run_cpus(args.smp, args.run_cpus)
@@ -1460,6 +1495,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = sub.add_parser("run", help="build and boot the product image")
     add_run_arguments(run_parser)
     run_parser.set_defaults(func=run_cmd)
+
+    gui_parser = sub.add_parser("run-gui", help="build and boot the interactive Weston desktop")
+    add_run_arguments(gui_parser)
+    gui_parser.set_defaults(func=run_gui_cmd, profile="system", interactive=True,
+                            graphics_profile="interactive", rootfs_transport="drive")
 
     test = sub.add_parser("test", help="run a checked host or guest suite")
     add_graphics_smoke_arguments(test)

@@ -1,10 +1,14 @@
-# q35 desktop carries both the software KMS fallback and the virtio-gpu virgl
-# driver. The guest smoke selects and proves the latter explicitly.
+# Interactive Weston desktop with a terminal; smoke workloads stay disabled.
+# Carry both software KMS and the virtio-gpu virgl driver.
 BR2_ROOTFS_OVERLAY="@REPO_ROOT@/config/graphics/overlay/common @REPO_ROOT@/config/graphics/overlay/q35-software-desktop"
 BR2_ROOTFS_POST_BUILD_SCRIPT="@REPO_ROOT@/config/graphics/build-guest-tools.sh @REPO_ROOT@/config/graphics/build-q35-wayland-client.sh"
 BR2_PACKAGE_WESTON_DEFAULT_DRM=y
 BR2_PACKAGE_WESTON_HEADLESS=y
 BR2_PACKAGE_WESTON_DRM=y
+BR2_PACKAGE_WESTON_SHELL_DESKTOP=y
+BR2_PACKAGE_DEJAVU=y
+BR2_PACKAGE_DEJAVU_MONO=y
+BR2_GENERATE_LOCALE="C.UTF-8"
 BR2_PACKAGE_MESA3D=y
 BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y
 BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_VIRGL=y
@@ -17,7 +21,6 @@ BR2_PACKAGE_PIGLIT=y
 BR2_PACKAGE_XORG7=y
 BR2_PACKAGE_LIBEPOXY=y
 BR2_TARGET_ROOTFS_EXT2_SIZE="3G"
-# The shared S90 render path also exercises rootless Xwayland/glamor when a
-# Virgl render node is present, so retain the corresponding Weston component.
+# Allow X11 applications through rootless Xwayland.
 BR2_PACKAGE_WESTON_XWAYLAND=y
 # BR2_PACKAGE_WLROOTS is not set

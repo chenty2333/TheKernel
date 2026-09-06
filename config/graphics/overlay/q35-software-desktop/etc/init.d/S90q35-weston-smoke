@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+# The interactive desktop keeps Weston and its applications running.
+grep -qx q35-software-desktop /etc/thekernel-graphics-flavor && exit 0
+
 marker=THEKERNEL_Q35_WESTON_READY
 virgl_marker=THEKERNEL_Q35_VIRGL_READY
 

@@ -696,6 +696,41 @@ def _write_stream(stream: BinaryIO | None, data: bytes) -> None:
     stream.flush()
 
 
+class _ShellConsoleFilter:
+    """Hide the reserved prompt handshake without buffering ordinary output."""
+
+    marker = b"THEKERNEL_SHELL_READY"
+
+    def __init__(self) -> None:
+        self.pending = bytearray()
+        self.passthrough = False
+
+    def feed(self, data: bytes, *, final: bool = False) -> bytes:
+        output = bytearray()
+        for byte in data:
+            if self.passthrough:
+                output.append(byte)
+                if byte == 10:
+                    self.passthrough = False
+                continue
+            self.pending.append(byte)
+            if byte == 10:
+                if self.pending.strip(b"\r\n") != self.marker:
+                    output.extend(self.pending)
+                self.pending.clear()
+                continue
+            candidate = bytes(self.pending).lstrip(b"\r")
+            if not (self.marker.startswith(candidate)
+                    or candidate.rstrip(b"\r") == self.marker):
+                output.extend(self.pending)
+                self.pending.clear()
+                self.passthrough = True
+        if final:
+            output.extend(self.pending)
+            self.pending.clear()
+        return bytes(output)
+
+
 def _wait_for_process(
     process: subprocess.Popen[bytes],
     *,
@@ -713,6 +748,7 @@ def _wait_for_process(
     line_ready = interaction.input_line_after_marker is None
     input_open = forward_input
     stdout_open = True
+    console_filter = _ShellConsoleFilter()
     pending_output = bytearray()
     pending_input = bytearray()
     stop_pending = False
@@ -817,12 +853,14 @@ def _wait_for_process(
                 log_file.write(data)
                 log_file.flush()
                 if interaction.interactive:
-                    _write_stream(console_stream, data)
+                    _write_stream(console_stream, console_filter.feed(data))
                 stopped = consume_lines(data)
                 if stopped is not None:
                     return stopped
             else:
                 stdout_open = False
+                if interaction.interactive:
+                    _write_stream(console_stream, console_filter.feed(b"", final=True))
 
         if input_ready and input_open and input_stream in ready:
             data = os.read(
@@ -870,9 +908,11 @@ def _wait_for_process(
                         break
                     log_file.write(remainder)
                     if interaction.interactive:
-                        _write_stream(console_stream, remainder)
+                        _write_stream(console_stream, console_filter.feed(remainder))
                     consume_lines(remainder)
                 log_file.flush()
+            if interaction.interactive:
+                _write_stream(console_stream, console_filter.feed(b"", final=True))
             consume_lines(b"", final=True)
             if qmp_controller is not None:
                 qmp_controller.settle()

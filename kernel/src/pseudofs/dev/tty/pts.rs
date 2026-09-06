@@ -182,6 +182,12 @@ pub fn add_slave(fs: Arc<SimpleFs>, pty: Arc<PtyDriver>, lease: &PtsLease) -> Ax
 pub struct PtsDir;
 
 impl SimpleDirOps for PtsDir {
+    fn is_cacheable(&self) -> bool {
+        // Numeric slots are reused after the master closes. A cached dentry
+        // would keep resolving the previous, permanently hung-up slave.
+        false
+    }
+
     fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
         let snapshot = PTS_TABLE.assigned_ids();
         let count = snapshot.iter().flatten().count();
@@ -222,6 +228,47 @@ mod tests {
 
     #[derive(Debug)]
     struct Marker(u32);
+
+    #[test]
+    fn vfs_lookup_revalidates_a_reused_slave_number() {
+        let _context = crate::test_support::scheduler_test_context();
+        let mut simple_fs = None;
+        let fs = SimpleFs::new_with("pts-reuse-test".into(), 0, |fs| {
+            simple_fs = Some(fs.clone());
+            crate::pseudofs::SimpleDir::new_maker(fs, Arc::new(PtsDir))
+        });
+        let root = fs.root_dir();
+        let dir = root.as_dir().unwrap();
+        let fs = simple_fs.unwrap();
+        let lease = reserve_slave().unwrap();
+        let slot = lease.id();
+        let name = alloc::format!("{slot}");
+        let (_master, slave) = super::super::pty::create_pty_pair_for_test().unwrap();
+        let old = Device::try_new(
+            fs.clone(),
+            NodeType::CharacterDevice,
+            DeviceId::new(136, slot as u32),
+            slave,
+        )
+        .unwrap();
+        assert!(lease.publish(old).is_ok());
+        let old_entry = dir.lookup(FsName::new(name.as_bytes())).unwrap();
+        drop(lease);
+
+        let lease = reserve_slave().unwrap();
+        assert_eq!(lease.id(), slot);
+        let (_master, slave) = super::super::pty::create_pty_pair_for_test().unwrap();
+        let new = Device::try_new(
+            fs,
+            NodeType::CharacterDevice,
+            DeviceId::new(136, slot as u32),
+            slave,
+        )
+        .unwrap();
+        assert!(lease.publish(new).is_ok());
+        let new_entry = dir.lookup(FsName::new(name.as_bytes())).unwrap();
+        assert_ne!(old_entry.inode(), new_entry.inode());
+    }
 
     #[test]
     fn lease_reuses_index_beyond_capacity_and_open_clone_survives_unlink() {

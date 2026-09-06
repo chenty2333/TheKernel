@@ -99,6 +99,8 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
                 link = GRAPHICS / "overlay" / overlay / "etc" / "weston" / "weston.ini"
                 self.assertTrue(link.is_symlink(), flavor)
                 expected = "weston-headless.ini" if backend == "headless-backend.so" else "weston-drm.ini"
+                if flavor == "q35-software-desktop":
+                    expected = "weston-desktop.ini"
                 self.assertEqual(link.readlink(), pathlib.Path(expected), flavor)
         for flavor in manifest["SMOKE_FLAVORS"].split():
             self.assertIn(flavor, flavors)
@@ -244,6 +246,35 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
             cwd=ROOT,
             check=True,
         )
+
+    def test_buildroot_version_accepts_exported_assignment_and_rejects_mismatch(self) -> None:
+        with test_tmpdir() as directory:
+            work = pathlib.Path(directory)
+            source = work / "buildroot"
+            source.mkdir()
+            for declaration, accepted in (
+                ("BR2_VERSION = 2026.05.2", True),
+                ("  export BR2_VERSION := 2026.05.2", True),
+                ("export BR2_VERSION := 2026.05.1", False),
+                ("# BR2_VERSION is absent", False),
+            ):
+                with self.subTest(declaration=declaration):
+                    (source / "Makefile").write_text(declaration + "\n")
+                    # Stop at the next preflight check so no package build runs.
+                    result = subprocess.run([
+                        ROOT / "scripts/build-graphics-rootfs.sh",
+                        "--flavor", "q35-software-desktop",
+                        "--buildroot-dir", str(source),
+                        "--output", str(work / "output"),
+                        "--download-dir", str(work / "downloads"),
+                        "--host-deps-dir", str(work / "missing-host-deps"),
+                    ], cwd=ROOT, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    if accepted:
+                        self.assertIn("local Buildroot Perl modules unavailable", result.stderr)
+                        self.assertNotIn("Buildroot version mismatch", result.stderr)
+                    else:
+                        self.assertIn("Buildroot version mismatch", result.stderr)
 
     def test_product_cli_accepts_an_existing_graphics_rootfs(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")
