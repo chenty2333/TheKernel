@@ -473,6 +473,11 @@ static IO_URING_REGISTERED_BUFFER_SLOTS: AtomicUsize = AtomicUsize::new(0);
 static IO_URING_REGISTERED_BUFFER_PAGES: AtomicUsize = AtomicUsize::new(0);
 static IO_URING_REGISTERED_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(0);
 static DEFERRED_IO_URING_WORK: AtomicPtr<IoUring> = AtomicPtr::new(ptr::null_mut());
+static DEFERRED_POLL_CALLBACKS: AtomicPtr<PollCallbackState> = AtomicPtr::new(ptr::null_mut());
+// Only the policy worker consumes this detached continuation. New IRQ
+// publications remain on DEFERRED_POLL_CALLBACKS until the next bounded batch.
+static DEFERRED_POLL_CONTINUATION: AtomicPtr<PollCallbackState> = AtomicPtr::new(ptr::null_mut());
+const POLL_CALLBACK_BUDGET: usize = 64;
 /// The lower handle/cookie namespace is device-local. Keep the exact shared
 /// queue identity alongside every upper route instead of trying to infer it
 /// from a raw completion handle. This fixed table is deliberately small: the
@@ -6307,16 +6312,33 @@ struct PollCallbackState {
     request: RequestId,
     enabled: AtomicBool,
     source_woke: AtomicBool,
+    deferred_next: AtomicPtr<PollCallbackState>,
+    deferred_queued: AtomicBool,
 }
 
 impl PollCallbackState {
-    fn publish_source_wake(&self) {
+    fn publish_source_wake(self: &Arc<Self>) {
         if !self.enabled.load(Ordering::Acquire) {
             return;
         }
         self.source_woke.store(true, Ordering::Release);
-        if let Some(ring) = self.ring.upgrade() {
-            ring.publish_poll_hint(self.request);
+        // A source can call us on the timer IRQ stack. Upgrading the ring
+        // here would allow its final strong reference (and SharedPages) to
+        // drop in IRQ context after a concurrent policy-worker close. Queue
+        // only this callback token; its ring ownership remains weak.
+        if self.deferred_queued.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let node = Arc::into_raw(Arc::clone(self)).cast_mut();
+        let mut head = DEFERRED_POLL_CALLBACKS.load(Ordering::Acquire);
+        loop {
+            self.deferred_next.store(head, Ordering::Relaxed);
+            match DEFERRED_POLL_CALLBACKS.compare_exchange_weak(
+                head, node, Ordering::Release, Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => head = observed,
+            }
         }
     }
 }
@@ -6357,6 +6379,8 @@ impl PollControl {
             request,
             enabled: AtomicBool::new(true),
             source_woke: AtomicBool::new(false),
+            deferred_next: AtomicPtr::new(ptr::null_mut()),
+            deferred_queued: AtomicBool::new(false),
         }) {
             Ok(callback) => callback,
             Err(_) => return Err((AxError::NoMemory, lease)),
@@ -12071,9 +12095,44 @@ impl Pollable for IoUring {
 
 pub(crate) fn has_deferred_io_uring_work() -> bool {
     !DEFERRED_IO_URING_WORK.load(Ordering::Acquire).is_null()
+        || !DEFERRED_POLL_CALLBACKS.load(Ordering::Acquire).is_null()
+        || !DEFERRED_POLL_CONTINUATION.load(Ordering::Acquire).is_null()
+}
+
+fn drain_deferred_poll_callbacks() {
+    let mut node = DEFERRED_POLL_CONTINUATION.swap(ptr::null_mut(), Ordering::AcqRel);
+    if node.is_null() {
+        node = DEFERRED_POLL_CALLBACKS.swap(ptr::null_mut(), Ordering::AcqRel);
+    }
+    for _ in 0..POLL_CALLBACK_BUDGET {
+        if node.is_null() {
+            break;
+        }
+        // SAFETY: publication transfers one Arc reference; the queued bit
+        // prevents reuse until we have detached this node's next pointer.
+        let callback = unsafe { Arc::from_raw(node) };
+        let next = callback.deferred_next.swap(ptr::null_mut(), Ordering::AcqRel);
+        callback.deferred_queued.store(false, Ordering::Release);
+        if callback.enabled.load(Ordering::Acquire)
+            && let Some(ring) = callback.ring.upgrade()
+        {
+            let state = ring.state.lock();
+            if state.requests.request(callback.request).is_ok()
+                && callback.enabled.load(Ordering::Acquire)
+            {
+                ring.publish_poll_hint(callback.request);
+            }
+        }
+        node = next;
+    }
+    // Keep the unvisited nodes' queue-owned references and queued bits intact.
+    // has_deferred_io_uring_work schedules another pass; ring/close work gets
+    // its turn now even if sources keep publishing more callbacks.
+    DEFERRED_POLL_CONTINUATION.store(node, Ordering::Release);
 }
 
 pub(crate) fn drain_deferred_io_uring_work() {
+    drain_deferred_poll_callbacks();
     let mut node = DEFERRED_IO_URING_WORK.swap(ptr::null_mut(), Ordering::AcqRel);
     while !node.is_null() {
         // SAFETY: enqueue_deferred transferred exactly one strong reference
@@ -12232,6 +12291,48 @@ mod adapter_state_tests {
     // that install synthetic routes so parallel unit tests cannot make one
     // test observe another test's bounded QD custody.
     static PHYSICAL_COMPLETION_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+    #[test]
+    fn poll_irq_callbacks_queue_weak_tokens_and_preserve_budget_continuation() {
+        let _context = crate::test_support::scheduler_test_context();
+        let _serial = PHYSICAL_COMPLETION_TEST_LOCK.lock();
+        let layout = SetupRequest::new(2, 0, SetupFlags::NO_SQARRAY)
+            .resolve(FeatureFlags::EMPTY)
+            .unwrap();
+        let ring = IoUring::try_new(layout).unwrap();
+        let request = issue_test_request(&ring).id();
+        let weak = Arc::downgrade(&ring);
+        let mut callbacks = Vec::new();
+        for _ in 0..POLL_CALLBACK_BUDGET + 1 {
+            callbacks.push(Arc::new(PollCallbackState {
+                ring: weak.clone(),
+                request,
+                enabled: AtomicBool::new(true),
+                source_woke: AtomicBool::new(false),
+                deferred_next: AtomicPtr::new(ptr::null_mut()),
+                deferred_queued: AtomicBool::new(false),
+            }));
+        }
+        {
+            let irq_gate = SpinNoIrq::new(());
+            let _irq = irq_gate.lock();
+            for callback in &callbacks {
+                callback.publish_source_wake();
+                callback.publish_source_wake(); // one node per token
+            }
+            assert_eq!(Arc::strong_count(&ring), 1);
+            assert!(!ring.poll_hint_pending.load(Ordering::Acquire));
+        }
+        // The callback queue must not postpone task-context destruction or
+        // upgrade a dead ring when its delayed notifications are dispatched.
+        drop(ring);
+        assert!(weak.upgrade().is_none());
+        drain_deferred_poll_callbacks();
+        assert_eq!(callbacks.iter().filter(|callback| callback.deferred_queued.load(Ordering::Acquire)).count(), 1);
+        assert!(has_deferred_io_uring_work());
+        drain_deferred_poll_callbacks();
+        assert!(callbacks.iter().all(|callback| !callback.deferred_queued.load(Ordering::Acquire)));
+    }
 
     #[test]
     fn successful_physical_write_reports_logical_bytes_to_cqe() {

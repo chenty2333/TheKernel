@@ -13,7 +13,7 @@ use core::{
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -28,7 +28,7 @@ use axnet::{
         PacketSelector, PacketSendRequest, PacketView as EndpointPacketView,
     },
 };
-use axpoll::{IoEvents, Pollable};
+use axpoll::{IoEvents, PollSet, Pollable, PreparedPollRegistration};
 use axsync::{Mutex, MutexGuard};
 use axtask::future::{TimerRegistrationError, sleep_until};
 use thekernel_linux_packet::{
@@ -163,6 +163,7 @@ pub(crate) struct PacketSocket {
     mmap: Mutex<Option<Arc<PacketRingMmap>>>,
     mmap_published: AtomicBool,
     v3_timer: Mutex<Option<PacketV3Timer>>,
+    v3_timeout: Arc<PollSet>,
     inode: PseudoInode,
 }
 
@@ -790,6 +791,7 @@ impl PacketSocket {
             mmap: Mutex::new(None),
             mmap_published: AtomicBool::new(false),
             v3_timer: Mutex::new(None),
+            v3_timeout: Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?,
             inode: PseudoInode::socket(),
         })
         .map_err(|_| AxError::NoMemory)
@@ -1009,17 +1011,26 @@ impl PacketSocket {
             .map_or(0, |ring| ring.take_freeze_q_cnt())
     }
 
-    fn arm_v3_timer(&self, context: &mut Context<'_>) -> Result<(), axpoll::PollRegistrationError> {
+    fn arm_v3_timer(&self) -> Result<(), axpoll::PollRegistrationError> {
         let deadline = self
             .ring
             .lock()
             .as_ref()
             .and_then(|ring| ring.v3_deadline());
+        self.arm_v3_deadline(deadline.map(TimeValue::from_nanos))
+    }
+
+    fn arm_v3_deadline(&self, deadline: Option<TimeValue>) -> Result<(), axpoll::PollRegistrationError> {
         let Some(deadline) = deadline else {
-            *self.v3_timer.lock() = None;
+            let retired = self.v3_timer.lock().take();
+            drop(retired);
             return Ok(());
         };
-        let deadline = TimeValue::from_nanos(deadline);
+        // Never poll this shared timer with a caller's waker: replacing it
+        // would strand earlier waiters, and clone/drop could reenter this
+        // mutex. This known waker only owns a source kept alive by the socket.
+        let waker = Waker::from(Arc::clone(&self.v3_timeout));
+        let mut context = Context::from_waker(&waker);
         let mut timer = self.v3_timer.lock();
         if timer
             .as_ref()
@@ -1032,12 +1043,19 @@ impl PacketSocket {
                 future: Box::into_pin(future),
             });
         }
-        let expired = timer
-            .as_mut()
-            .is_some_and(|timer| matches!(timer.future.as_mut().poll(context), Poll::Ready(_)));
-        if expired {
-            *timer = None;
-            context.waker().wake_by_ref();
+        let result = timer.as_mut().map(|timer| timer.future.as_mut().poll(&mut context));
+        let retired = if matches!(result, Some(Poll::Ready(_))) { timer.take() } else { None };
+        drop(timer);
+        drop(retired);
+        match result {
+            Some(Poll::Ready(Ok(()))) => { self.v3_timeout.wake(); }
+            Some(Poll::Ready(Err(TimerRegistrationError::CapacityExhausted))) => {
+                return Err(axpoll::PollRegistrationError::Quota);
+            }
+            Some(Poll::Ready(Err(TimerRegistrationError::TokenSpaceExhausted | TimerRegistrationError::DeadlineOverflow))) => {
+                return Err(axpoll::PollRegistrationError::InvalidState);
+            }
+            Some(Poll::Pending) | None => {}
         }
         Ok(())
     }
@@ -1790,10 +1808,15 @@ impl Pollable for PacketSocket {
         context: &mut Context<'_>,
         events: IoEvents,
     ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
-        self.arm_v3_timer(context)?;
-        self.net_ns
-            .stack()
-            .register_packet_endpoint(self.endpoint.as_ref(), context, events)
+        let mut prepared = PreparedPollRegistration::try_new(2)?;
+        prepared.arm(&self.v3_timeout, context.waker())?;
+        prepared.arm_nested(|| {
+            self.net_ns
+                .stack()
+                .register_packet_endpoint(self.endpoint.as_ref(), context, events)
+        })?;
+        self.arm_v3_timer()?;
+        prepared.commit()
     }
 }
 
@@ -2023,6 +2046,135 @@ pub(crate) fn packet_test_context() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
     use crate::task::UserNamespace;
+
+    struct V3TimerProbe {
+        ready: AtomicBool,
+        waker: axsync::spin::SpinNoIrq<Option<Waker>>,
+    }
+
+    struct ControlledV3Timer(Arc<V3TimerProbe>);
+
+    impl Future for ControlledV3Timer {
+        type Output = Result<(), TimerRegistrationError>;
+
+        fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.0.ready.load(Ordering::Acquire) {
+                Poll::Ready(Ok(()))
+            } else {
+                *self.0.waker.lock() = Some(context.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    struct V3WakeProbe {
+        socket: alloc::sync::Weak<PacketSocket>,
+        wakes: core::sync::atomic::AtomicUsize,
+    }
+
+    impl alloc::task::Wake for V3WakeProbe {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let socket = self.socket.upgrade().unwrap();
+            // A real waiter can reenter registration from its raw waker.
+            // Fail deterministically rather than hanging on recursive lock.
+            assert!(socket.v3_timer.try_lock().is_some());
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn v3_timer_socket() -> (Arc<PacketSocket>, TimeValue) {
+        let socket = PacketSocket::try_new(
+            PacketSocketType::Raw,
+            ProtocolSelector::All,
+            namespace(),
+        ).unwrap();
+        let ring = PacketRxRing::try_new_v3(PacketV3Request {
+            block_size: 4096,
+            block_nr: 1,
+            frame_size: 4096,
+            frame_nr: 1,
+            retire_blk_tov_ms: 1,
+            private_size: 0,
+            fill_rxhash: false,
+            socket_type: PacketSocketType::Raw,
+        }).unwrap();
+        if let PacketRxRingKind::V3 { state, .. } = &ring.kind {
+            let mut state = state.lock();
+            state.packets = 1;
+            state.opened_at_nanos = 1;
+        }
+        let deadline = TimeValue::from_nanos(ring.v3_deadline().unwrap());
+        *socket.ring.lock() = Some(ring);
+        (socket, deadline)
+    }
+
+    #[test]
+    fn v3_timer_admission_errors_roll_back_waiters_without_waking() {
+        let _context = packet_test_context();
+        let (socket, deadline) = v3_timer_socket();
+        for (error, expected) in [
+            (TimerRegistrationError::CapacityExhausted, axpoll::PollRegistrationError::Quota),
+            (TimerRegistrationError::TokenSpaceExhausted, axpoll::PollRegistrationError::InvalidState),
+            (TimerRegistrationError::DeadlineOverflow, axpoll::PollRegistrationError::InvalidState),
+        ] {
+            *socket.v3_timer.lock() = Some(PacketV3Timer {
+                deadline,
+                future: Box::pin(core::future::ready(Err(error))),
+            });
+            let result = socket.register(&mut Context::from_waker(Waker::noop()), IoEvents::READABLE);
+            assert!(matches!(result, Err(actual) if actual == expected));
+            assert!(socket.v3_timer.lock().is_none());
+            assert!(socket.v3_timeout.is_empty());
+        }
+    }
+
+    #[test]
+    fn v3_timer_broadcasts_to_all_registered_waiters_outside_timer_lock() {
+        let _context = packet_test_context();
+        let (socket, deadline) = v3_timer_socket();
+        let timer = Arc::new(V3TimerProbe {
+            ready: AtomicBool::new(false),
+            waker: axsync::spin::SpinNoIrq::new(None),
+        });
+        *socket.v3_timer.lock() = Some(PacketV3Timer {
+            deadline,
+            future: Box::pin(ControlledV3Timer(Arc::clone(&timer))),
+        });
+        let first = Arc::new(V3WakeProbe {
+            socket: Arc::downgrade(&socket),
+            wakes: core::sync::atomic::AtomicUsize::new(0),
+        });
+        let second = Arc::new(V3WakeProbe {
+            socket: Arc::downgrade(&socket),
+            wakes: core::sync::atomic::AtomicUsize::new(0),
+        });
+        let first_waker = Waker::from(Arc::clone(&first));
+        let second_waker = Waker::from(Arc::clone(&second));
+        let mut first_context = Context::from_waker(&first_waker);
+        let mut second_context = Context::from_waker(&second_waker);
+        let first_registration = socket.register(&mut first_context, IoEvents::READABLE).unwrap();
+        let second_registration = socket.register(&mut second_context, IoEvents::READABLE).unwrap();
+        // Exercise the waker actually installed by both timer polls, rather
+        // than directly waking the broadcast source. The old shared future
+        // retained only second_waker and stranded the first registration.
+        let timer_waker = timer.waker.lock().take().unwrap();
+        timer_waker.wake();
+        assert_eq!(first.wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(second.wakes.load(Ordering::Relaxed), 1);
+        drop(first_registration);
+        drop(second_registration);
+        let _first_registration = socket.register(&mut first_context, IoEvents::READABLE).unwrap();
+        let _second_registration = socket.register(&mut second_context, IoEvents::READABLE).unwrap();
+        // Also cover synchronous completion while arm_v3_timer owns its gate.
+        timer.ready.store(true, Ordering::Release);
+        socket.arm_v3_timer().unwrap();
+        assert_eq!(first.wakes.load(Ordering::Relaxed), 2);
+        assert_eq!(second.wakes.load(Ordering::Relaxed), 2);
+    }
 
     struct FaultDst {
         remaining: usize,
