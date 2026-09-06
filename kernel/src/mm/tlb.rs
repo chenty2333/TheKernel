@@ -32,7 +32,7 @@ mod imp {
         CPU_MAINTENANCE_REASON, CpuMaintenance, CpuSet, ShootdownGrace, ShootdownRequest,
         TlbShootdown,
     };
-    use kernel_guard::NoPreempt;
+    use kernel_guard::{NoPreempt, NoPreemptIrqSave};
 
     use crate::task::AsThread;
 
@@ -474,13 +474,6 @@ mod imp {
         CPU_RUNTIME[cpu]
             .ipi_handler_entries
             .fetch_add(1, Ordering::Relaxed);
-        // An LDT update shares this maintenance grace with TLB invalidation.
-        // If the interrupted task still uses the modified address space, load
-        // its newly published descriptor before acknowledging the grace that
-        // permits the old LDT backing allocation to be dropped.
-        if let Some(thread) = axtask::current().try_as_thread() {
-            thread.proc_data.aspace_tlb_state().reload_current_ldt();
-        }
         service_cpu(cpu);
     }
 
@@ -500,6 +493,15 @@ mod imp {
         if reasons & CPU_MAINTENANCE_REASON.bit() != 0 {
             SHOOTDOWN
                 .service_maintenance(cpu, |maintenance| {
+                    // The epoch snapshot must precede the descriptor reload:
+                    // a publication after an earlier reload could otherwise
+                    // be acknowledged while LDTR still names retired memory.
+                    // Self-service must perform the same reload as the IPI
+                    // path, with CPU-local GDT updates protected from IRQs.
+                    let _guard = NoPreemptIrqSave::new();
+                    if let Some(thread) = axtask::current().try_as_thread() {
+                        thread.proc_data.aspace_tlb_state().reload_current_ldt();
+                    }
                     maintain_local(maintenance);
                 })
                 .unwrap_or_else(|_| axhal::power::system_off());

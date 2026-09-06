@@ -4428,6 +4428,9 @@ impl ProcessData {
                 self.mempolicy.lock().ranges.clear();
             },
         );
+        // Both image writer locks are released. Registry cleanup takes the
+        // old mm mutex, whose owner may need this CPU's shootdown IPI to run.
+        drop(_switch_guard);
         unregister_address_space(&old_aspace);
         ExecImageCommit {
             group_leader,
