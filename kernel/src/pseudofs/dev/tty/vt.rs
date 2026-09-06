@@ -663,11 +663,37 @@ impl VtManager {
             .expect("VT open count underflow");
     }
 
+    /// A negative snapshot is the no-op exit linearization point. Process
+    /// exit has already excluded new ioctls from this owner; unrelated VT
+    /// writers and signal deliveries need not wait for its cleanup.
+    fn has_owner(&self, pid: Pid) -> bool {
+        let state = self.state.lock();
+        let owns_switch = |pending: PendingSwitch| match pending.phase {
+            SwitchPhase::Release { owner } | SwitchPhase::Acquire { owner } => owner == pid,
+        };
+        state.vts.iter().any(|vt| {
+            vt.process.is_some_and(|mode| mode.owner == pid) || vt.graphics_owner == Some(pid)
+        }) || state.pending.is_some_and(owns_switch)
+            || state.delivery_in_flight.is_some_and(owns_switch)
+    }
+
+    fn notify_owner_exit(&self, pid: Pid) {
+        if !self.has_owner(pid) {
+            return;
+        }
+        self.deliver_switch_signal(self.owner_exited(pid));
+        self.reconcile_seat();
+        self.present_active();
+    }
+
     /// Retires a VT_PROCESS owner during process exit.  The process-exit path
     /// calls this without holding task/session locks; any acquire signal is
     /// delivered only after this method has dropped the VT lock.
     fn owner_exited(&self, pid: Pid) -> Option<SwitchSignal> {
         loop {
+            if !self.has_owner(pid) {
+                return None;
+            }
             let _delivery = self.delivery.lock();
             if self.state.lock().delivery_in_flight.is_some() {
                 drop(_delivery);
@@ -826,9 +852,7 @@ impl VtManager {
 /// Process-exit integration point.  It intentionally does not require a TTY
 /// or session reference, avoiding exit-path lock nesting.
 pub fn notify_vt_owner_exit(pid: Pid) {
-    VT_MANAGER.deliver_switch_signal(VT_MANAGER.owner_exited(pid));
-    VT_MANAGER.reconcile_seat();
-    VT_MANAGER.present_active();
+    VT_MANAGER.notify_owner_exit(pid);
 }
 
 /// Pseudo-device endpoint.  Number zero is tty0, the active-console alias.
@@ -1167,6 +1191,7 @@ mod tests {
 
     #[test]
     fn process_release_is_a_two_phase_switch() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 2, 0, 0, 0]).unwrap();
         assert_switch_signal(m.activate(2).unwrap(), (7, 1));
@@ -1176,6 +1201,7 @@ mod tests {
     }
     #[test]
     fn process_mode_without_a_release_signal_switches_immediately() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.mode(1, 7, [VT_PROCESS, 0, 0, 0, 2, 0, 0, 0]).unwrap();
         assert_eq!(m.activate(2).unwrap(), None);
@@ -1184,6 +1210,7 @@ mod tests {
 
     #[test]
     fn immediate_switch_starts_target_acquire_handshake() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.mode(2, 9, [VT_PROCESS, 0, 0, 0, 2, 0, 0, 0]).unwrap();
         assert_switch_signal(m.activate(2).unwrap(), (9, 2));
@@ -1192,12 +1219,70 @@ mod tests {
     }
     #[test]
     fn disallocate_never_removes_active_console() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         assert_eq!(m.disallocate(1), Err(AxError::ResourceBusy));
     }
 
     #[test]
+    fn unrelated_exit_skips_busy_vt_gates_and_in_flight_delivery() {
+        let _context = crate::test_support::scheduler_test_context();
+        let m = VtManager::new();
+        m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 0, 0, 0, 0]).unwrap();
+        let ticket = m.activate(2).unwrap().unwrap();
+        assert!(m.claim_ticket_for_test(ticket));
+        let _delivery = m.delivery.lock();
+        let _route = m.route.lock();
+        let _presentation = m.presentation.lock();
+        // Taking any slow gate again would recursively acquire a sleeping
+        // mutex. This also rules out seat reconciliation/full presentation.
+        m.notify_owner_exit(99);
+        assert_eq!(m.owner_exited(99), None);
+        let state = m.state.lock();
+        assert_eq!(state.active, 1);
+        assert_eq!(state.pending, Some(ticket.pending));
+        assert_eq!(state.delivery_in_flight, Some(ticket.pending));
+        assert_eq!(state.vts[0].process.unwrap().owner, 7);
+    }
+
+    #[test]
+    fn owner_exit_notification_resets_graphics_without_process_mode() {
+        let _context = crate::test_support::scheduler_test_context();
+        let m = VtManager::new();
+        {
+            let mut state = m.state.lock();
+            state.vts[0].graphics = true;
+            state.vts[0].graphics_owner = Some(7);
+            state.vts[0].kb_mode = K_OFF;
+        }
+        m.notify_owner_exit(7);
+        let state = m.state.lock();
+        assert!(!state.vts[0].graphics);
+        assert_eq!(state.vts[0].graphics_owner, None);
+        assert_eq!(state.vts[0].kb_mode, K_XLATE);
+    }
+
+    #[test]
+    fn pending_owner_exit_is_relevant_after_mode_is_cleared() {
+        let _context = crate::test_support::scheduler_test_context();
+        let m = VtManager::new();
+        m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 0, 0, 0, 0]).unwrap();
+        let ticket = m.activate(2).unwrap().unwrap();
+        m.state.lock().vts[0].process = None;
+        assert!(m.has_owner(7));
+        assert_eq!(m.owner_exited(7), None);
+        assert_eq!(m.active(), 2);
+        assert!(m.state.lock().pending.is_none());
+
+        // A claimed delivery also retains interest independently of mode.
+        m.state.lock().delivery_in_flight = Some(ticket.pending);
+        assert!(m.has_owner(7));
+        assert!(!m.has_owner(99));
+    }
+
+    #[test]
     fn owner_exit_completes_a_pending_vt_process_switch() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 0, 0, 0, 0]).unwrap();
         m.mode(2, 9, [VT_PROCESS, 0, 0, 0, 2, 0, 0, 0]).unwrap();
@@ -1210,6 +1295,7 @@ mod tests {
 
     #[test]
     fn owner_exit_keeps_acquire_pending_until_xorg_acknowledges() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 0, 0, 0, 0]).unwrap();
         m.mode(2, 9, [VT_PROCESS, 0, 0, 0, 2, 0, 0, 0]).unwrap();
@@ -1220,6 +1306,7 @@ mod tests {
 
     #[test]
     fn owner_exit_clears_pending_acquire_for_dead_owner() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.mode(2, 9, [VT_PROCESS, 0, 0, 0, 2, 0, 0, 0]).unwrap();
         assert_switch_signal(m.activate(2).unwrap(), (9, 2));
@@ -1230,6 +1317,7 @@ mod tests {
 
     #[test]
     fn replacing_process_mode_cancels_its_pending_release_handshake() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 0, 0, 0, 0]).unwrap();
         assert_switch_signal(m.activate(2).unwrap(), (7, 1));
@@ -1244,6 +1332,7 @@ mod tests {
 
     #[test]
     fn same_pid_mode_replacement_rejects_the_already_returned_signal_ticket() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 0, 0, 0, 0]).unwrap();
         let ticket = m.activate(2).unwrap().unwrap();
@@ -1257,6 +1346,7 @@ mod tests {
 
     #[test]
     fn signal_claim_linearizes_before_same_pid_mode_replacement() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 0, 0, 0, 0]).unwrap();
         let ticket = m.activate(2).unwrap().unwrap();
@@ -1272,6 +1362,7 @@ mod tests {
 
     #[test]
     fn clearing_process_mode_cancels_its_pending_acquire_handshake() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.mode(2, 9, [VT_PROCESS, 0, 0, 0, 2, 0, 0, 0]).unwrap();
         assert_switch_signal(m.activate(2).unwrap(), (9, 2));
@@ -1283,6 +1374,7 @@ mod tests {
 
     #[test]
     fn owner_exit_resets_graphics_and_chains_release_to_acquire() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 0, 0, 0, 0]).unwrap();
         m.mode(2, 9, [VT_PROCESS, 0, 0, 0, 2, 0, 0, 0]).unwrap();
@@ -1298,6 +1390,7 @@ mod tests {
 
     #[test]
     fn input_batch_and_switch_share_the_route_linearization_gate() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         let route = m.route.lock();
         let active = m.state.lock().active;
@@ -1309,6 +1402,7 @@ mod tests {
 
     #[test]
     fn active_tty_alias_tracks_the_current_active_vt() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         let tty1 = m.active_tty().0;
         assert_eq!(m.activate(2), Ok(None));
@@ -1317,6 +1411,7 @@ mod tests {
 
     #[test]
     fn alias_open_resolves_once_and_keeps_that_vt_busy() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         // This is the state captured by VtDevice(0)::open_description.
         let resolved = m.active();
@@ -1333,6 +1428,7 @@ mod tests {
 
     #[test]
     fn erased_tty_identity_recovers_only_its_vt_number() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         let tty: Arc<dyn Any + Send + Sync> = m.tty_for(2);
         assert_eq!(m.number_for_tty(tty.as_ref()), Some(2));
@@ -1348,6 +1444,7 @@ mod tests {
 
     #[test]
     fn xorg_release_acquire_handshake_requires_ackacq() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.mode(1, 7, [VT_PROCESS, 0, 1, 0, 2, 0, 0, 0]).unwrap();
         m.mode(2, 9, [VT_PROCESS, 0, 1, 0, 2, 0, 0, 0]).unwrap();
@@ -1362,6 +1459,7 @@ mod tests {
 
     #[test]
     fn open_lifetime_blocks_disallocate_but_not_final_close() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.opened(2).unwrap();
         m.opened(2).unwrap(); // dup/fork references belong to the same OFD; this models two OFDs.
@@ -1375,6 +1473,7 @@ mod tests {
 
     #[test]
     fn getstate_mask_reserves_tty0_and_maps_vt1_to_bit_one() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.opened(16).unwrap();
         m.opened(17).unwrap();
@@ -1386,6 +1485,7 @@ mod tests {
 
     #[test]
     fn inactive_final_close_makes_vt_reusable_without_deallocating_storage() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.opened(2).unwrap();
         m.closed(2);
@@ -1394,6 +1494,7 @@ mod tests {
 
     #[test]
     fn single_disallocate_restores_keyboard_translation_mode() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         m.state.lock().vts[1].kb_mode = K_OFF;
         assert_eq!(m.disallocate(2), Ok(()));
@@ -1402,6 +1503,7 @@ mod tests {
 
     #[test]
     fn text_presentation_excludes_inactive_and_graphics_vts() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         assert_eq!(m.with_text_active(2, || 1), None);
         assert_eq!(m.with_text_active(1, || 1), Some(1));
@@ -1418,6 +1520,7 @@ mod tests {
 
     #[test]
     fn each_virtual_console_has_a_distinct_tty_session_identity() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         assert!(!Arc::ptr_eq(&m.tty_for(1), &m.tty_for(2)));
     }
@@ -1430,6 +1533,7 @@ mod tests {
 
     #[test]
     fn process_mode_signal_numbers_do_not_truncate() {
+        let _context = crate::test_support::scheduler_test_context();
         let m = VtManager::new();
         let signal_257 = 257i16.to_ne_bytes();
         assert_eq!(
