@@ -396,7 +396,7 @@ impl DescriptionCleanupDrainGuard {
         DESCRIPTION_CLEANUP_DRAINING
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
-            .then_some(Self)
+            .then(|| Self)
     }
 }
 
@@ -2297,6 +2297,16 @@ pub struct FileDescriptor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rejected_drain_guard_preserves_existing_owner() {
+        let _context = crate::test_support::scheduler_test_context();
+        let first = super::DescriptionCleanupDrainGuard::try_enter().expect("first drain owner");
+        assert!(super::DescriptionCleanupDrainGuard::try_enter().is_none());
+        assert!(super::DescriptionCleanupDrainGuard::try_enter().is_none());
+        drop(first);
+        assert!(super::DescriptionCleanupDrainGuard::try_enter().is_some());
+    }
+
     extern crate std;
 
     use alloc::borrow::Cow;

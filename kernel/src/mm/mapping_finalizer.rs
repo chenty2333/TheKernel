@@ -223,7 +223,7 @@ impl MappingFinalizerDrainGuard {
         DEFERRED_MAPPING_FINALIZER_DRAINING
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
-            .then_some(Self)
+            .then(|| Self)
     }
 }
 
@@ -252,5 +252,18 @@ pub(crate) fn drain_deferred_mapping_finalizers(budget: usize) {
         };
         let DeferredMappingFinalizerInner { finalizer, .. } = *inner;
         finalizer.finalize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rejected_drain_guard_preserves_existing_owner() {
+        let _context = crate::test_support::scheduler_test_context();
+        let first = super::MappingFinalizerDrainGuard::try_enter().expect("first drain owner");
+        assert!(super::MappingFinalizerDrainGuard::try_enter().is_none());
+        assert!(super::MappingFinalizerDrainGuard::try_enter().is_none());
+        drop(first);
+        assert!(super::MappingFinalizerDrainGuard::try_enter().is_some());
     }
 }

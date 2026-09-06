@@ -136,7 +136,7 @@ struct ExecAdmission<'a> {
 
 impl<'a> ExecAdmission<'a> {
     fn try_begin(proc_data: &'a ProcessData, owner: Pid) -> Option<Self> {
-        proc_data.begin_exec(owner).then_some(Self {
+        proc_data.begin_exec(owner).then(|| Self {
             proc_data,
             owner,
             armed: true,
