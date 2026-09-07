@@ -587,6 +587,22 @@ class SystemTestGateTests(unittest.TestCase):
 
 
 class DesktopHomeTests(unittest.TestCase):
+    def test_run_wires_usb_input_and_storage(self):
+        product = load_product()
+        args = product.build_parser().parse_args([
+            "run", "--no-build", "--input-backend", "usb", "--usb-disk", "/home/example/usb.img",
+        ])
+        with patch.object(product, "run_product", return_value=0) as run:
+            self.assertEqual(product.run_cmd(args), 0)
+            spec = run.call_args.args[1]
+            self.assertEqual(spec.input_backend, "usb")
+            self.assertEqual(spec.usb_disk, Path("/home/example/usb.img"))
+
+    def test_desktop_defaults_to_accelerated_virgl(self):
+        product = load_product()
+        args = product.build_parser().parse_args(["run-gui"])
+        self.assertEqual(args.graphics_profile, "virgl-interactive")
+
     def test_new_home_disk_is_ext4_and_reused_without_reformatting(self):
         product = load_product()
         if product.shutil.which("mkfs.ext4") is None:

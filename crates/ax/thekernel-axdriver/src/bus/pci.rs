@@ -397,13 +397,36 @@ impl AllDevices {
         #[cfg(all(not(feature = "dyn"), input_dev = "virtio-input"))]
         PCI_DEVICE_REGISTRY.init_once(Mutex::new(BusDeviceRegistry::new()));
 
+        #[cfg(feature = "usb-xhci")]
+        let mut usb_devices = alloc::vec::Vec::new();
         walk_reachable_pci_functions(&mut root, |root, bdf, dev_info| {
             debug!("PCI {bdf}: {dev_info}");
             if dev_info.header_type != HeaderType::Standard {
                 return;
             }
             match config_pci_device(root, bdf, &mut allocator) {
-                Ok(_) => for_each_drivers!(type Driver, {
+                Ok(_) => {
+                    #[cfg(feature = "usb-xhci")]
+                    if dev_info.class == 0x0c
+                        && dev_info.subclass == 0x03
+                        && dev_info.prog_if == 0x30
+                    {
+                        if let Ok(BarInfo::Memory { address, .. }) = root.bar_info(bdf, 0) {
+                            let mmio = phys_to_virt((address as usize).into()).as_mut_ptr();
+                            if let Some(mmio) = core::ptr::NonNull::new(mmio) {
+                                match crate::usb::probe(mmio) {
+                                    Ok(devices) => {
+                                        for device in devices {
+                                            usb_devices.push(device);
+                                        }
+                                    }
+                                    Err(error) => warn!("USB xHCI at {bdf} failed: {error:?}"),
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    for_each_drivers!(type Driver, {
                     match Driver::probe_pci(root, bdf, dev_info) {
                         BusProbeResult::NotMatched => {}
                         BusProbeResult::Claimed => return,
@@ -448,10 +471,15 @@ impl AllDevices {
                             }
                         }
                     }
-                }),
+                    });
+                }
                 Err(e) => warn!("failed to enable PCI device at {bdf}({dev_info}): {e:?}"),
             }
         });
+        // USB is auxiliary storage; preserve the existing root disk ordering
+        // even when the xHCI function precedes VirtIO block on the PCI bus.
+        #[cfg(feature = "usb-xhci")]
+        for device in usb_devices { self.add_device(device); }
     }
 }
 

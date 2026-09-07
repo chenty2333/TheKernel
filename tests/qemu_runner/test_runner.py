@@ -26,6 +26,39 @@ from tools.qemu_runner.runner import (
 
 
 class RunnerTests(unittest.TestCase):
+    def test_usb_disk_is_opened_and_wired_to_xhci(self):
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            kernel, disk = root / "kernel", root / "usb.img"
+            kernel.write_bytes(b"kernel")
+            disk.write_bytes(b"original USB data")
+            config = RunConfig(arch="x86_64", kernel=kernel, rootfs=None,
+                workdir=root / "run", log_path=root / "run/console.log",
+                direct_kernel=True, usb_disk=disk, input_backend="usb")
+            def capture(**kwargs):
+                command = kwargs["command"]
+                option = next(value for value in command if "id=usb-disk," in value)
+                fd_path = option.split(",", 1)[0].removeprefix("file=")
+                fd = int(fd_path.rsplit("/", 1)[1])
+                self.assertEqual(os.pread(fd, 17, 0), b"original USB data")
+                os.pwrite(fd, b"updated", 0)
+                self.assertIn("usb-storage,id=usb-storage,bus=xhci.0,drive=usb-disk", command)
+                return RunResult(0, kwargs["log_path"])
+            with patch("tools.qemu_runner.runner.run_process", side_effect=capture):
+                self.assertEqual(run(config).returncode, 0)
+            self.assertTrue(disk.read_bytes().startswith(b"updated"))
+
+    def test_output_cannot_overwrite_usb_disk(self):
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            kernel, disk = root / "kernel", root / "usb.img"
+            kernel.write_bytes(b"kernel")
+            disk.write_bytes(b"USB data")
+            with self.assertRaises(RunnerError):
+                run(RunConfig(arch="x86_64", kernel=kernel, rootfs=None,
+                    workdir=root / "run", log_path=disk, direct_kernel=True, usb_disk=disk))
+            self.assertEqual(disk.read_bytes(), b"USB data")
+
     def test_firmware_copy_does_not_import_source_xattrs(self):
         with test_tmpdir() as directory:
             source = Path(directory) / "template"

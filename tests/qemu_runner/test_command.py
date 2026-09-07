@@ -48,6 +48,34 @@ class GraphicsProfileTableTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_usb_input_topology_has_no_virtio_input_fallback(self):
+        command = build_qemu_command(arch="x86_64", kernel=Path("kernel"),
+            rootfs=None, direct_kernel=True, input_backend="usb",
+            usb_disk=Drive(Path("/home/usb,a.img"), "rw"))
+        joined = " ".join(command)
+        self.assertEqual(command.count("qemu-xhci,id=xhci"), 1)
+        self.assertIn("usb-kbd,id=input-kbd,bus=xhci.0", command)
+        self.assertIn("usb-mouse,id=input-mouse,bus=xhci.0", command)
+        self.assertNotIn("virtio-keyboard", joined)
+        self.assertNotIn("virtio-mouse", joined)
+        self.assertNotIn("virtio-tablet", joined)
+        self.assertIn("usb-storage,id=usb-storage,bus=xhci.0,drive=usb-disk", command)
+        self.assertIn("file=/home/usb,,a.img,if=none,format=raw,id=usb-disk,aio=threads", command)
+
+    def test_usb_disk_can_coexist_with_virtio_input(self):
+        command = build_qemu_command(arch="x86_64", kernel=Path("kernel"),
+            rootfs=None, direct_kernel=True, usb_disk=Drive(Path("usb.img"), "readonly"))
+        joined = " ".join(command)
+        self.assertIn("virtio-keyboard", joined)
+        self.assertIn("qemu-xhci,id=xhci", command)
+        self.assertNotIn("usb-kbd", joined)
+        self.assertIn("id=usb-disk,readonly=on,aio=threads", joined)
+
+    def test_invalid_input_backend_is_rejected(self):
+        with self.assertRaisesRegex(CommandError, "input backend"):
+            build_qemu_command(arch="x86_64", kernel=Path("kernel"),
+                rootfs=None, direct_kernel=True, input_backend="unknown")
+
     def test_diagnostics_use_second_serial_with_keyval_escaped_path(self):
         command = build_qemu_command(arch="x86_64", kernel=Path("kernel"),
             rootfs=None, direct_kernel=True,

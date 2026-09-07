@@ -13,10 +13,12 @@ export LIBSEAT_BACKEND=seatd
 
 # Each flavor overlay selects the backend through its weston.ini symlink.
 set -- --config=/etc/weston/weston.ini --socket=wayland-0 --log="$XDG_RUNTIME_DIR/weston.log"
-# This shared image includes EGL, so AUTO selects GL even on the software
-# device. Select Pixman explicitly for both software desktop flavors.
+# Select the renderer explicitly: plain display devices need Pixman, while
+# render-node sessions require the GL renderer.
 if grep -Eqx 'q35-(graphics-seatd|software-desktop)' /etc/thekernel-graphics-flavor &&
     [ ! -c /dev/dri/renderD128 ]; then
     set -- "$@" --renderer=pixman
+elif [ -c /dev/dri/renderD128 ]; then
+    set -- "$@" --renderer=gl
 fi
 exec weston "$@"

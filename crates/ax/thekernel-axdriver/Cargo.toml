@@ -80,6 +80,19 @@ shared-block = [
     "dep:axsync",
     "dep:axtask",
 ]
+usb-xhci = [
+    "bus-pci",
+    "input",
+    "block",
+    "dep:crab-usb",
+    "dep:dma-api-usb",
+    "dep:axalloc",
+    "dep:spin",
+    "dep:kspin",
+    "dep:ax-sync",
+    "dep:ax-crate-interface",
+    "dep:kernel_guard",
+]
 virtio = [
     "dep:axdriver_virtio",
     "dep:axalloc",
@@ -249,3 +262,28 @@ optional = true
 
 [package.metadata.thekernel]
 layer = "platform"
+
+[dependencies.crab-usb]
+version = "0.11.0"
+optional = true
+
+[dependencies.dma-api-usb]
+package = "dma-api"
+version = "0.10"
+optional = true
+
+[dependencies.kspin]
+version = "0.1"
+optional = true
+
+[dependencies.ax-sync]
+version = "0.5"
+optional = true
+
+[dependencies.ax-crate-interface]
+version = "0.5"
+optional = true
+
+[dependencies.kernel_guard]
+version = "0.1"
+optional = true

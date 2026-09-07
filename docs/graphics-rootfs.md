@@ -97,8 +97,9 @@ the screendump. The general `run --rootfs IMAGE` argument likewise requires an
 existing image and otherwise leaves the standard rootfs-builder behavior
 unchanged.
 
-For an interactive desktop, run `make run-gui`. The `q35-software-desktop`
-image opens Weston's desktop shell and native terminal as the unprivileged
+For an interactive desktop, run `make run-gui`. It uses the
+`virgl-interactive` profile to render through the host GPU. The
+`q35-software-desktop` image opens Weston's desktop shell and native terminal as the unprivileged
 `weston` user, with the session's Wayland runtime environment. The top panel
 launches Terminal, Files (PCManFM), Text Editor (xedit), Images (feh), and Python.
 Applications start in `/var/lib/weston`.
@@ -106,11 +107,12 @@ Double-click text files or PNG/JPEG images in Files to open them in the editor
 or image viewer. The Images launcher initially displays the supplied Wayland
 image; use Files to open your own pictures. Python runs its basic interactive
 interpreter in a native Weston terminal; PCManFM, xedit, and feh use rootless
-Xwayland. This software desktop disables X11 MIT-SHM because its SysV attach
-path fails for GTK clients; Xwayland still presents through Wayland shared
-memory. Closing an
-application leaves the desktop running. This flavor skips startup graphics
-test workloads and automatic shutdown and uses software rendering by default.
+Xwayland with glamor on the Virgl render node. X11 MIT-SHM remains disabled
+because its SysV attach path fails for GTK clients. Closing an application
+leaves the desktop running. This flavor skips startup graphics test workloads
+and automatic shutdown. To explicitly use the software display, pass
+`make run-gui RUN_ARGS="--graphics-profile interactive"`; Weston then uses
+Pixman and Xwayland presents through Wayland shared memory.
 
 The first `run-gui` invocation creates a 1 GiB sparse ext4 user disk at
 `${XDG_DATA_HOME:-~/.local/share}/thekernel/desktop/home.ext4`; subsequent runs

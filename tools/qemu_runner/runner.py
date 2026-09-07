@@ -195,6 +195,9 @@ class RunConfig:
     rootfs_transport: RootfsTransport = "drive"
     extra_block: Path | None = None
     extra_block_mode: DriveMode = "rw"
+    usb_disk: Path | None = None
+    usb_disk_mode: DriveMode = "rw"
+    input_backend: str = "virtio"
     limits: RunLimits = RunLimits()
     interaction: Interaction = Interaction()
     memory: str = "1G"
@@ -387,6 +390,7 @@ def run(
     workdir = config.workdir.expanduser().resolve()
     rootfs_mode = _validate_mode("rootfs", config.rootfs_mode)
     extra_mode = _validate_mode("extra-block", config.extra_block_mode)
+    usb_mode = _validate_mode("usb-disk", config.usb_disk_mode)
     initrd = _initrd_from_extra_args(config.extra_args)
     input_path = None
     if config.input_path is not None:
@@ -449,6 +453,11 @@ def run(
         else None
     )
 
+    usb_disk = (
+        _plan_drive(config.usb_disk, mode=usb_mode, label="USB disk")
+        if config.usb_disk is not None else None
+    )
+
     esp = None
     ovmf_code = None
     ovmf_vars_source = None
@@ -496,6 +505,8 @@ def run(
         run_input_paths.append(ovmf_vars_source)
     if extra_block is not None:
         run_input_paths.append(extra_block.path)
+    if usb_disk is not None:
+        run_input_paths.append(usb_disk.path)
     if qemu_executable is not None:
         run_input_paths.append(qemu_executable)
 
@@ -560,6 +571,13 @@ def run(
             )
             opened_fds.append(extra_fd)
             qemu_extra_block = Drive(path=qemu_extra_path, mode=extra_block.mode)
+        qemu_usb_disk = None
+        if usb_disk is not None:
+            usb_fd, qemu_usb_path = _open_qemu_input(
+                usb_disk.path, label="USB disk", writable=usb_disk.mode == "rw",
+            )
+            opened_fds.append(usb_fd)
+            qemu_usb_disk = Drive(path=qemu_usb_path, mode=usb_disk.mode)
         qemu_esp = None
         if esp is not None:
             esp_fd, qemu_esp_path = _open_qemu_input(esp.path, label="esp")
@@ -589,6 +607,8 @@ def run(
             kernel=qemu_kernel,
             rootfs=qemu_rootfs,
             extra_block=qemu_extra_block,
+            usb_disk=qemu_usb_disk,
+            input_backend=config.input_backend,
             esp=qemu_esp,
             ovmf_code=qemu_ovmf_code,
             ovmf_vars=qemu_ovmf_vars,

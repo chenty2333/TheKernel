@@ -394,6 +394,8 @@ class RunSpec:
     commands: Path | None
     extra_block: Path | None
     run_cpus: int
+    usb_disk: Path | None = None
+    input_backend: str = "virtio"
     qemu_debug: str | None = None
     gdb: bool = False
     failure_prefixes: tuple[str, ...] = ()
@@ -474,6 +476,8 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             rootfs_transport=spec.rootfs_transport,
             esp=selected_esp,
             extra_block=spec.extra_block.expanduser().resolve() if spec.extra_block else None,
+            usb_disk=spec.usb_disk.expanduser().resolve() if spec.usb_disk else None,
+            input_backend=spec.input_backend,
             input_path=command_path,
             workdir=run_dir,
             log_path=run_dir / "console.log",
@@ -676,6 +680,8 @@ def run_cmd(args: argparse.Namespace) -> int:
             stop_after_marker=args.stop_after_marker,
             commands=Path(args.commands) if args.commands else None,
             extra_block=Path(args.extra_block) if args.extra_block else None,
+            usb_disk=Path(args.usb_disk) if args.usb_disk else None,
+            input_backend=args.input_backend,
             rootfs=rootfs,
             rootfs_transport=args.rootfs_transport,
             run_cpus=run_cpus,
@@ -1064,6 +1070,9 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input-after-marker")
     parser.add_argument("--stop-after-marker")
     parser.add_argument("--extra-block")
+    parser.add_argument("--usb-disk", help="attach an existing writable image as USB mass storage")
+    parser.add_argument("--input-backend", choices=("virtio", "usb"), default="virtio",
+                        help="select VirtIO input or xHCI USB keyboard and mouse")
     parser.add_argument(
         "--rootfs",
         help="boot this existing rootfs image instead of the standard generated rootfs",
@@ -1534,7 +1543,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_arguments(gui_parser)
     gui_parser.add_argument("--home-disk", help="persistent desktop home image (created once if missing)")
     gui_parser.set_defaults(func=run_gui_cmd, profile="system", interactive=True,
-                            graphics_profile="interactive", rootfs_transport="drive")
+                            graphics_profile="virgl-interactive", rootfs_transport="drive")
 
     test = sub.add_parser("test", help="run a checked host or guest suite")
     add_graphics_smoke_arguments(test)

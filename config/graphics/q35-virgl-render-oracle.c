@@ -29,11 +29,13 @@ static int fail(const char *reason)
 
 static int getparam(int fd, uint64_t param, uint64_t *value)
 {
-    struct drm_virtgpu_getparam request = { .param = param };
+    struct drm_virtgpu_getparam request = {
+        .param = param,
+        .value = (uintptr_t)value,
+    };
 
     if (ioctl(fd, DRM_IOCTL_VIRTGPU_GETPARAM, &request) < 0)
         return -1;
-    *value = request.value;
     return 0;
 }
 
@@ -98,11 +100,29 @@ destroy:
 
 int main(void)
 {
+    /* Weston initializes GBM on its KMS fd, before opening render resources. */
+    int primary = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    uint64_t primary_value = 0;
+    if (primary < 0)
+        return fail("primary_node");
+    if (getparam(primary, VIRTGPU_PARAM_3D_FEATURES, &primary_value) < 0 ||
+        primary_value == 0) {
+        close(primary);
+        return fail("primary_getparam_3d");
+    }
+    close(primary);
+
     int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
     uint64_t value = 0;
 
     if (fd < 0)
         return fail("render_node");
+    struct drm_mode_card_res kms = { 0 };
+    errno = 0;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &kms) == 0 || errno != ENOTTY) {
+        close(fd);
+        return fail("render_node_kms_isolation");
+    }
     if (getparam(fd, VIRTGPU_PARAM_3D_FEATURES, &value) < 0 || value == 0) {
         close(fd);
         return fail("getparam_3d");

@@ -296,7 +296,9 @@ pub(super) fn dispatch(
         uapi::DRM_IOCTL_MODE_DESTROYPROPBLOB => destroy_blob(file, copy, arg)?,
         uapi::DRM_IOCTL_MODE_ATOMIC => atomic(file, context, arg)?,
         uapi::DRM_IOCTL_MODE_GETFB2 => getfb2(file, copy, arg)?,
-        _ => return Err(AxError::NotATty),
+        // Compositors create GBM on the KMS primary fd, so driver rendering
+        // commands must work here as well as on the dedicated render node.
+        _ => return super::render::dispatch(file, context, cmd, arg),
     }
     Ok(0)
 }
@@ -1191,8 +1193,10 @@ fn resources(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
     request.count_encoders = 1;
     request.min_width = 1;
     request.min_height = 1;
-    request.max_width = u32::MAX;
-    request.max_height = u32::MAX;
+    // libdrm exposes these unsigned UAPI fields as signed ints.  UINT_MAX
+    // becomes -1 there, causing compositors to reject every framebuffer.
+    request.max_width = i32::MAX as u32;
+    request.max_height = i32::MAX as u32;
     write_pod(copy, arg, &request)
 }
 
@@ -1830,6 +1834,22 @@ mod tests {
         ) -> crate::drm::DrmResult<alloc::sync::Arc<crate::drm::fence::Fence>> {
             Ok(crate::drm::fence::Fence::new(true))
         }
+    }
+
+    #[test]
+    fn resources_dimensions_remain_positive_in_libdrm() {
+        let device = crate::drm::DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
+        let file = device.open_primary();
+        let size = core::mem::size_of::<uapi::DrmModeCardRes>();
+        let copy = Image(RefCell::new(vec![0; size]));
+
+        resources(&file, &copy, 0).unwrap();
+        let reply: uapi::DrmModeCardRes = read_pod(&copy, 0).unwrap();
+        // Weston compares GBM geometry against libdrm's signed bounds.
+        assert!((reply.max_width as i32) >= 800);
+        assert!((reply.max_height as i32) >= 600);
+        assert!(reply.min_width <= reply.max_width);
+        assert!(reply.min_height <= reply.max_height);
     }
 
     #[test]

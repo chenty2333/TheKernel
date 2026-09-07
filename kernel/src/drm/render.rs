@@ -486,9 +486,9 @@ pub(super) fn dispatch(
     let copy = context;
     match cmd as u64 {
         uapi::DRM_IOCTL_VIRTGPU_GETPARAM => {
-            let mut r: GetParam = read(copy, arg)?;
+            let r: GetParam = read(copy, arg)?;
             let modern = file.render_adapter().map_err(drm)?.modern_features();
-            r.value = match r.param {
+            let value: u64 = match r.param {
                 PARAM_3D_FEATURES | PARAM_CAPSET_QUERY_FIX => 1,
                 PARAM_SUPPORTED_CAPSET_IDS => supported_capsets(file, modern)?,
                 PARAM_RESOURCE_BLOB => u64::from(modern.resource_blob),
@@ -496,7 +496,8 @@ pub(super) fn dispatch(
                 PARAM_CONTEXT_INIT => u64::from(modern.context_init),
                 _ => return Err(AxError::InvalidInput),
             };
-            write(copy, arg, &r)?;
+            // Unlike DRM_GET_CAP, VirtGPU GETPARAM carries an output pointer.
+            write(copy, r.value as usize, &value)?;
         }
         uapi::DRM_IOCTL_VIRTGPU_GET_CAPS => {
             let r: Caps = read(copy, arg)?;

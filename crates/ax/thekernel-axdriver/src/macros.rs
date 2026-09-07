@@ -30,7 +30,7 @@ macro_rules! register_input_driver {
     ($driver_type:ty, $device_type:ty) => {
         /// The unified type of the NIC devices.
         #[cfg(not(feature = "dyn"))]
-        pub type AxInputDevice = $device_type;
+        pub type RegisteredStaticInputDevice = $device_type;
     };
 }
 

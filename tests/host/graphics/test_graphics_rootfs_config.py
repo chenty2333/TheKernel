@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+import os
 import subprocess
 import tempfile
 from tests.support import test_tmpdir
@@ -126,7 +127,9 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         self.assertIn(
             "if grep -Eqx 'q35-(graphics-seatd|software-desktop)' /etc/thekernel-graphics-flavor &&\n"
             "    [ ! -c /dev/dri/renderD128 ]; then\n"
-            '    set -- "$@" --renderer=pixman\nfi', session,
+            '    set -- "$@" --renderer=pixman\n'
+            'elif [ -c /dev/dri/renderD128 ]; then\n'
+            '    set -- "$@" --renderer=gl\nfi', session,
         )
         self.assertIn(
             'set -- --config=/etc/weston/weston.ini --socket=wayland-0 '
@@ -137,6 +140,23 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         renderer_check = smoke.index("grep -Fq 'Using Pixman renderer'")
         self.assertLess(renderer_check, smoke.index("export THEKERNEL_GRAPHICS_SMOKE_EXIT=1"))
         self.assertIn('state=FAIL reason=pixman_renderer', smoke)
+
+    def test_accelerated_xwayland_removes_inherited_glamor_disable(self) -> None:
+        # Xwayland checks presence, so assigning "0" still disables glamor.
+        # Execute the wrappers' environment setup with a known character node.
+        for wrapper in (
+            "overlay/common/usr/local/bin/thekernel-xwayland-glamor",
+            "overlay/q35-software-desktop/usr/local/bin/thekernel-desktop-xwayland",
+        ):
+            with self.subTest(wrapper=wrapper):
+                setup = self.read(wrapper).split("exec /usr/bin/Xwayland", 1)[0]
+                setup = setup.replace("/dev/dri/renderD128", "/dev/null")
+                result = subprocess.run(
+                    ["sh"], input=setup + 'printf "%s" "${XWAYLAND_NO_GLAMOR-unset}"\n',
+                    env={**os.environ, "XWAYLAND_NO_GLAMOR": "1"},
+                    text=True, capture_output=True, check=True,
+                )
+                self.assertEqual(result.stdout, "unset")
 
     def test_weston_smoke_verifies_initialized_drm_backend_and_device(self) -> None:
         smoke = self.read("overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke")

@@ -73,7 +73,9 @@ make docker-clean  # remove the dev container volume and local image
 `make run-gui` builds the graphics userspace on its first run (Buildroot and
 package downloads can take a while), then uses incremental builds. It opens
 a Weston desktop with launchers for a terminal, file manager, text editor,
-image viewer, and Python. Save your work and use the panel's
+image viewer, and Python. The default desktop uses Virgl OpenGL acceleration
+through the host GPU; select `RUN_ARGS="--graphics-profile interactive"` for
+software rendering. Save your work and use the panel's
 Shut Down button to flush files and exit. Closing QEMU directly or pressing
 Ctrl+C forcibly stops the guest and can lose pending writes.
 Use `make run-gui RUN_ARGS=--no-build` to reuse the current images without
@@ -84,6 +86,14 @@ Downloads, lives on a persistent disk at
 `${XDG_DATA_HOME:-~/.local/share}/thekernel/desktop/home.ext4`. Rebuilding the
 system or running `make clean` preserves this default user disk. The rest of
 the root filesystem uses a temporary snapshot; changes there are discarded.
+
+The xHCI USB driver supports boot-protocol keyboards and mice and BOT/SCSI
+mass-storage devices attached at boot. Use
+`make run-gui RUN_ARGS="--input-backend usb --usb-disk /home/ava/usb.img"`
+to replace VirtIO input with USB input and attach an existing writable disk
+image. The USB disk follows the VirtIO system and home disks in `/dev/vd*`.
+This attaches an image, not a physical host USB device. Runtime hotplug, UAS,
+and non-boot HID report protocols are not supported yet.
 
 Kernel output is captured separately from the user terminal in `kernel.log`.
 See [kernel diagnostics and request tracing](docs/debugging.md) for runtime log

@@ -61,6 +61,7 @@ input = [
     "alloc",
     "paging",
     "axdriver/virtio-input",
+    "axdriver/usb-xhci",
     "dep:axinput",
     "axruntime/input",
 ]

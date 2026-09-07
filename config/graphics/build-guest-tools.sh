@@ -9,7 +9,10 @@ source_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 compiler=$HOST_DIR/bin/x86_64-buildroot-linux-gnu-gcc
 
 [ -x "$compiler" ]
-install -d -m 0755 "$target/usr/local/bin"
+install -d -m 0755 "$target/usr/local/bin" "$target/etc/thekernel"
+# Graphics device oracles also run under the canonical boot-shell profile.
+install -m 0755 "$source_dir/tests/guest/shell-init.sh" \
+    "$target/etc/thekernel/shell-init.sh"
 
 installed=
 for source in "$source_dir/tests/guest/graphics/"*.c; do

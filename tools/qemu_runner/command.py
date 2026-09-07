@@ -74,6 +74,8 @@ def build_qemu_command(
     kernel: Path,
     rootfs: Drive | None,
     extra_block: Drive | None = None,
+    usb_disk: Drive | None = None,
+    input_backend: str = "virtio",
     esp: Drive | None = None,
     ovmf_code: Path | None = None,
     ovmf_vars: Path | None = None,
@@ -103,6 +105,8 @@ def build_qemu_command(
         not str(qmp_socket) or any(char in str(qmp_socket) for char in ",\n\r")
     ):
         raise CommandError("QMP socket path must be QEMU-safe")
+    if input_backend not in {"virtio", "usb"}:
+        raise CommandError(f"unsupported input backend: {input_backend}")
     _validate_extra_args(extra_args)
     qemu_argv = [qemu_binary or "qemu-system-x86_64"]
     if arch == "x86_64":
@@ -155,6 +159,14 @@ def build_qemu_command(
                 GRAPHICS_PROFILES[graphics_profile].display,
                 "-device",
                 graphics_device(graphics_profile, graphics_width, graphics_height),
+                "-object",
+                "rng-random,filename=/dev/urandom,id=rng0",
+                "-device",
+                "virtio-rng-pci,rng=rng0",
+            ]
+        )
+        if input_backend == "virtio":
+            command.extend([
                 "-device",
                 "pcie-root-port,id=rp-input-kbd,slot=2,chassis=2",
                 "-device",
@@ -167,12 +179,19 @@ def build_qemu_command(
                 "pcie-root-port,id=rp-input-tablet,slot=4,chassis=4",
                 "-device",
                 "virtio-tablet-pci,id=input-tablet,bus=rp-input-tablet",
-                "-object",
-                "rng-random,filename=/dev/urandom,id=rng0",
-                "-device",
-                "virtio-rng-pci,rng=rng0",
-            ]
-        )
+            ])
+        if input_backend == "usb" or usb_disk is not None:
+            command.extend(["-device", "qemu-xhci,id=xhci"])
+        if input_backend == "usb":
+            command.extend([
+                "-device", "usb-kbd,id=input-kbd,bus=xhci.0",
+                "-device", "usb-mouse,id=input-mouse,bus=xhci.0",
+            ])
+        if usb_disk is not None:
+            command.extend([
+                "-drive", drive_options(usb_disk.path, "usb-disk", mode=usb_disk.mode),
+                "-device", "usb-storage,id=usb-storage,bus=xhci.0,drive=usb-disk",
+            ])
         if diagnostic_log_path is not None:
             command.extend([
                 "-chardev",

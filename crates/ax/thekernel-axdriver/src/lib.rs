@@ -82,6 +82,9 @@ mod shared_block;
 #[cfg(feature = "virtio")]
 mod virtio;
 
+#[cfg(feature = "usb-xhci")]
+mod usb;
+
 #[cfg(feature = "ixgbe")]
 mod ixgbe;
 

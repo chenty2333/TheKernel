@@ -3,5 +3,5 @@
 # choice explicit so a DRM desktop cannot silently request the SHM fallback;
 # the wrapper still delegates all X server argument parsing upstream.
 set -eu
-export XWAYLAND_NO_GLAMOR=0
+unset XWAYLAND_NO_GLAMOR
 exec /usr/bin/Xwayland "$@"
