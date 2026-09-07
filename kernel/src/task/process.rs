@@ -5827,20 +5827,10 @@ impl ProcessData {
         job_ctl.continued = true;
     }
 
-    /// Begins a multi-thread exec de-threading phase.
-    pub fn begin_exec(&self, owner: Pid) -> bool {
-        let mut exec_ctl = self.exec_ctl.lock();
-        if exec_ctl.group_exit {
-            return false;
-        }
-        match exec_ctl.owner {
-            Some(curr) => curr == owner,
-            None if exec_ctl.pending_thread_additions == 0 => {
-                exec_ctl.owner = Some(owner);
-                true
-            }
-            None => false,
-        }
+    /// Begins a multi-thread exec de-threading phase. An in-flight thread
+    /// publication is transient: wait on `exec_event` and retry WouldBlock.
+    pub fn begin_exec(&self, owner: Pid) -> AxResult<()> {
+        begin_exec_control(&mut self.exec_ctl.lock(), owner)
     }
 
     /// Excludes thread creation while a process-scope pointer is replaced.
@@ -6005,6 +5995,21 @@ impl ProcessData {
     }
 }
 
+fn begin_exec_control(exec_ctl: &mut ExecControlState, owner: Pid) -> AxResult<()> {
+    if exec_ctl.group_exit {
+        return Err(AxError::Interrupted);
+    }
+    match exec_ctl.owner {
+        Some(curr) if curr == owner => Ok(()),
+        None if exec_ctl.pending_thread_additions == 0 => {
+            exec_ctl.owner = Some(owner);
+            Ok(())
+        }
+        None => Err(AxError::WouldBlock),
+        Some(_) => Err(AxError::Interrupted),
+    }
+}
+
 fn release_exec_control_owner(exec_ctl: &SpinNoIrq<ExecControlState>, owner: Pid) -> bool {
     let mut exec_ctl = exec_ctl.lock();
     if exec_ctl.owner != Some(owner) {
@@ -6052,14 +6057,62 @@ mod tests {
         PreparedPtraceReverseLink, ProcessAccessState, ProcessImageBinding, PtraceReverseLinkDrain,
         PtraceReverseLinkNode, PtraceReverseLinks, SIGNAL_QUEUE_GLOBAL_HARD_LIMIT,
         SIGNAL_QUEUE_PER_USER_HARD_LIMIT, TimeNamespace, UserNamespace, UtsNamespace,
-        ZombieSchedulerSnapshot, coredump_image_snapshot, group_exit_handoff_requires_kill,
-        init_uts_state, ptrace_image_snapshot_if_owned, ptrace_image_snapshot_if_session,
-        ptrace_inactive_image_snapshot_if_session, ptrace_lifecycle_first_key,
-        release_exec_control_owner, release_vfork_control_parent,
+        ZombieSchedulerSnapshot, begin_exec_control, coredump_image_snapshot,
+        group_exit_handoff_requires_kill, init_uts_state, ptrace_image_snapshot_if_owned,
+        ptrace_image_snapshot_if_session, ptrace_inactive_image_snapshot_if_session,
+        ptrace_lifecycle_first_key, release_exec_control_owner, release_vfork_control_parent,
         replace_process_image_with_group_handoff, retire_group_leader_signal_owner,
         scheduler_publication_matches, scheduler_tlb_state_snapshot, snapshot_credential_image,
         snapshot_group_credential_image, try_allocate_namespace_id, try_increment_bounded,
     };
+
+    #[test]
+    fn exec_admission_waits_for_runnable_child_publication_to_finish() {
+        // Force the SMP window after runqueue publication but before the
+        // parent's PendingThreadPublication::finish releases exec exclusion.
+        let mut state = ExecControlState {
+            pending_thread_additions: 1,
+            ..ExecControlState::default()
+        };
+        assert_eq!(begin_exec_control(&mut state, 42), Err(AxError::WouldBlock));
+        assert_eq!(state.owner, None);
+        // Completing publication wakes exec_event; the retry owns the gate.
+        state.pending_thread_additions -= 1;
+        assert_eq!(begin_exec_control(&mut state, 42), Ok(()));
+        assert_eq!(state.owner, Some(42));
+        assert_eq!(
+            begin_exec_control(&mut state, 43),
+            Err(AxError::Interrupted)
+        );
+        state.group_exit = true;
+        assert_eq!(
+            begin_exec_control(&mut state, 42),
+            Err(AxError::Interrupted)
+        );
+    }
+
+    #[test]
+    fn exec_admission_rechecks_publication_completion_after_arming_waiter() {
+        let event: axpoll::PollSet = axpoll::PollSet::new();
+        let mut state = ExecControlState {
+            pending_thread_additions: 1,
+            ..ExecControlState::default()
+        };
+        let mut attempts = 0;
+        let result = crate::readiness::block_on_poll_set(&event, || {
+            attempts += 1;
+            if attempts == 2 {
+                // Publication completes after the first blocked attempt;
+                // its wake may race the readiness waiter's installation.
+                state.pending_thread_additions -= 1;
+                event.wake();
+            }
+            begin_exec_control(&mut state, 42)
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts, 2);
+        assert_eq!(state.owner, Some(42));
+    }
 
     fn scheduler_snapshot(state: SchedState, version: u64) -> TaskSchedulingSnapshot {
         TaskSchedulingSnapshot {

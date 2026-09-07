@@ -697,12 +697,13 @@ def _write_stream(stream: BinaryIO | None, data: bytes) -> None:
 
 
 class _ShellConsoleFilter:
-    """Hide the reserved prompt handshake without buffering ordinary output."""
+    """Hide the prompt handshake and its extra blank separator."""
 
     marker = b"THEKERNEL_SHELL_READY"
 
     def __init__(self) -> None:
         self.pending = bytearray()
+        self.blank_line = b""
         self.passthrough = False
 
     def feed(self, data: bytes, *, final: bool = False) -> bytes:
@@ -715,17 +716,31 @@ class _ShellConsoleFilter:
                 continue
             self.pending.append(byte)
             if byte == 10:
-                if self.pending.strip(b"\r\n") != self.marker:
+                line = self.pending.strip(b"\r\n")
+                if line == self.marker:
+                    self.blank_line = b""
+                elif not line:
+                    # PS1 inserts a newline before the marker. Hold only the
+                    # last empty line, preserving any command-generated ones.
+                    output.extend(self.blank_line)
+                    self.blank_line = bytes(self.pending)
+                else:
+                    output.extend(self.blank_line)
+                    self.blank_line = b""
                     output.extend(self.pending)
                 self.pending.clear()
                 continue
             candidate = bytes(self.pending).lstrip(b"\r")
             if not (self.marker.startswith(candidate)
                     or candidate.rstrip(b"\r") == self.marker):
+                output.extend(self.blank_line)
+                self.blank_line = b""
                 output.extend(self.pending)
                 self.pending.clear()
                 self.passthrough = True
         if final:
+            output.extend(self.blank_line)
+            self.blank_line = b""
             output.extend(self.pending)
             self.pending.clear()
         return bytes(output)

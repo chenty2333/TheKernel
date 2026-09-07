@@ -531,6 +531,29 @@ print('DONE', flush=True)
                 actual = b"".join(console_filter.feed(bytes([byte])) for byte in raw)
                 self.assertEqual(actual + console_filter.feed(b"", final=True), raw)
 
+    def test_shell_console_filter_removes_only_the_prompt_blank_line(self) -> None:
+        marker = b"THEKERNEL_SHELL_READY\r\n"
+        raw = (b"\r\n" + marker + b"# ls\r\n\r\n" + marker
+               + b"# sl\r\n/bin/sh: sl: not found\r\n\r\n" + marker
+               + b"# printf hi\r\nhi\r\n" + marker + b"# ")
+        expected = (b"# ls\r\n# sl\r\n/bin/sh: sl: not found\r\n"
+                    b"# printf hi\r\nhi\r\n# ")
+        for split in range(len(raw) + 1):
+            with self.subTest(split=split):
+                console_filter = _ShellConsoleFilter()
+                self.assertEqual(console_filter.feed(raw[:split])
+                                 + console_filter.feed(raw[split:], final=True), expected)
+        for raw, expected in (
+            (b"output\r\n\r\n\r\n" + marker + b"# ", b"output\r\n\r\n# "),
+            (b"output\n\n", b"output\n\n"),
+            (b"\nTHEKERNEL_SHELL_READ", b"\nTHEKERNEL_SHELL_READ"),
+            (b"\nTHEKERNEL_SHELL_READY extra\n", b"\nTHEKERNEL_SHELL_READY extra\n"),
+        ):
+            with self.subTest(raw=raw):
+                console_filter = _ShellConsoleFilter()
+                actual = b"".join(console_filter.feed(bytes([byte])) for byte in raw)
+                self.assertEqual(actual + console_filter.feed(b"", final=True), expected)
+
     def test_hidden_shell_prompt_still_gates_each_command_and_is_logged(self) -> None:
         script = """
 import os, select

@@ -92,6 +92,7 @@ impl Ext4Disk {
     /// caller's effect/pin owner must remain retained until a supervisor or a
     /// complete transport reinitialization takes custody.
     fn reset_for_physical_error(&self, fallback_context: &'static str) -> Ext4Error {
+        error!("physical queue reset requested: {fallback_context}");
         let (context, quarantined) = match self.reset_device() {
             Ok(BlockResetOutcome::Quiesced) => (fallback_context, false),
             Ok(BlockResetOutcome::Retired) => (

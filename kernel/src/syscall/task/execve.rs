@@ -135,8 +135,12 @@ struct ExecAdmission<'a> {
 }
 
 impl<'a> ExecAdmission<'a> {
-    fn try_begin(proc_data: &'a ProcessData, owner: Pid) -> Option<Self> {
-        proc_data.begin_exec(owner).then(|| Self {
+    fn begin(proc_data: &'a ProcessData, owner: Pid) -> AxResult<Self> {
+        // A newly runnable child can exec before its parent completes the
+        // publication handoff. Keep thread admission excluded until that
+        // handoff finishes, then retry using the normal check/arm/check wait.
+        block_on_poll_set(&proc_data.exec_event, || proc_data.begin_exec(owner))?;
+        Ok(Self {
             proc_data,
             owner,
             armed: true,
@@ -513,8 +517,7 @@ fn do_execve(
     // metadata. If attach published first, this exec observes that exact
     // relationship. If this gate published first, a later attach is rejected
     // until the new image is completely visible.
-    let exec_admission =
-        ExecAdmission::try_begin(proc_data, curr_tid).ok_or(AxError::Interrupted)?;
+    let exec_admission = ExecAdmission::begin(proc_data, curr_tid)?;
     let exec_ptrace_relationship = proc_data.ptrace_relationship_snapshot();
 
     // Only the terminal ELF (the shebang interpreter when the initial object
