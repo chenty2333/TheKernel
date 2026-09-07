@@ -42,8 +42,8 @@ pub const DRM_CAP_SYNCOBJ_TIMELINE: u64 = 0x14;
 pub const DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP: u64 = 0x15;
 pub const DRM_PRIME_CAP_IMPORT: u64 = 1;
 pub const DRM_PRIME_CAP_EXPORT: u64 = 2;
-/// Flags shared by PRIME and syncobj fd conversion ioctls.
-pub const DRM_CLOEXEC: u32 = 0x1;
+/// PRIME fd export flags use the x86_64 Linux open flag values.
+pub const DRM_CLOEXEC: u32 = 0x80000;
 pub const DRM_RDWR: u32 = 0x2;
 pub const DRM_CLIENT_CAP_STEREO_3D: u64 = 1;
 pub const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
@@ -522,6 +522,7 @@ pub struct DrmSyncobjHandle {
     pub flags: u32,
     pub fd: i32,
     pub pad: u32,
+    pub point: u64,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -862,7 +863,7 @@ layout!(DrmWaitVblankReply, 24, 8);
 layout!(DrmWaitVblank, 24, 8);
 layout!(DrmSyncobjCreate, 8, 4);
 layout!(DrmSyncobjDestroy, 8, 4);
-layout!(DrmSyncobjHandle, 16, 4);
+layout!(DrmSyncobjHandle, 24, 8);
 layout!(DrmSyncobjTransfer, 32, 8);
 layout!(DrmSyncobjWait, 40, 8);
 layout!(DrmSyncobjTimelineWait, 48, 8);
@@ -950,6 +951,7 @@ field_offset!(DrmModeAtomic, user_data, 48);
 field_offset!(DrmWaitVblankRequest, signal, 8);
 field_offset!(DrmWaitVblankReply, tval_sec, 8);
 field_offset!(DrmSyncobjHandle, fd, 8);
+field_offset!(DrmSyncobjHandle, point, 16);
 field_offset!(DrmSyncobjTransfer, src_point, 8);
 field_offset!(DrmSyncobjTransfer, flags, 24);
 field_offset!(DrmSyncobjWait, timeout_nsec, 8);
@@ -975,6 +977,12 @@ mod uapi_tests {
             assert_eq!($ioctl, $value, stringify!($ioctl));
         };
     }
+    #[test]
+    fn prime_fd_flags_match_x86_64_linux_open_flags() {
+        assert_eq!(DRM_CLOEXEC, 0x80000);
+        assert_eq!(DRM_RDWR, 2);
+    }
+
     #[test]
     fn linux_ioctl_encodings() {
         linux_ioctl!(DRM_IOCTL_VERSION, 0xc040_6400);
@@ -1021,8 +1029,8 @@ mod uapi_tests {
         linux_ioctl!(DRM_IOCTL_MODE_GETFB2, 0xc068_64ce);
         linux_ioctl!(DRM_IOCTL_SYNCOBJ_CREATE, 0xc008_64bf);
         linux_ioctl!(DRM_IOCTL_SYNCOBJ_DESTROY, 0xc008_64c0);
-        linux_ioctl!(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, 0xc010_64c1);
-        linux_ioctl!(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, 0xc010_64c2);
+        linux_ioctl!(DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, 0xc018_64c1);
+        linux_ioctl!(DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, 0xc018_64c2);
         linux_ioctl!(DRM_IOCTL_SYNCOBJ_WAIT, 0xc028_64c3);
         linux_ioctl!(DRM_IOCTL_SYNCOBJ_RESET, 0xc010_64c4);
         linux_ioctl!(DRM_IOCTL_SYNCOBJ_SIGNAL, 0xc010_64c5);

@@ -147,7 +147,7 @@ def _validate_virgl_capabilities(profile: GraphicsProfile, qemu: Path | None) ->
     displays = _parse_qemu_display_help(_qemu_help_output(qemu, "-display", "help"))
     if "virtio-gpu-gl-pci" not in devices:
         raise RunnerError("SKIP: QEMU does not provide required virgl device virtio-gpu-gl-pci")
-    backend = "egl-headless" if profile == "virgl-headless" else "gtk"
+    backend = "egl-headless" if profile == "virgl-headless" else "sdl"
     if backend not in displays:
         raise RunnerError(f"SKIP: QEMU does not provide required virgl display backend {backend}")
     if profile == "virgl-headless":

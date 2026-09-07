@@ -517,6 +517,9 @@ impl DeviceRegistration {
             self.subsystem,
             self.devtype,
         );
+        if self.subsystem_kind == SysfsSubsystemKind::Bus && self.subsystem == "pci" {
+            payload.push_str(&alloc::format!("PCI_SLOT_NAME={}\n", self.identity.name));
+        }
         if let Some(device_id) = self.identity.device_id {
             payload = alloc::format!(
                 "MAJOR={}\nMINOR={}\nDEVNAME={}\n{}",
@@ -1191,16 +1194,16 @@ fn subsystem_link_target(device: &DeviceRegistration) -> String {
 
 /// A canonical device object's physical parent is the `device` link target.
 fn device_link_target(device: &DeviceRegistration) -> String {
-    // `/devices/.../virtioN/input/inputN` has a synthetic `input` directory
-    // between the physical VirtIO kobject and inputN.  Its `device` link must
+    // Input and DRM nodes have a synthetic subsystem directory between
+    // the physical VirtIO kobject and the class node. Their `device` link must
     // therefore skip two levels. An eventN kobject has inputN as its direct
     // parent, and ordinary top-level devices have their bus object as theirs.
-    if device.identity.class == "input"
+    if matches!(device.identity.class.as_str(), "input" | "drm")
         && device
             .identity
             .parent
             .as_ref()
-            .is_some_and(|(_, parent_name)| parent_name == "input")
+            .is_some_and(|(_, parent_name)| parent_name == &device.identity.class)
     {
         "../..".into()
     } else {
@@ -1595,6 +1598,7 @@ mod tests {
         assert!(pci
             .uevent_payload()
             .contains("DEVPATH=/devices/pci0000:00/0000:00:03.0\nSUBSYSTEM=pci\n"));
+        assert!(pci.uevent_payload().contains("PCI_SLOT_NAME=0000:00:03.0\n"));
         assert!(!pci.class_member);
         assert_eq!(
             resolve_from(
@@ -1603,6 +1607,21 @@ mod tests {
             ),
             "/sys/bus/pci"
         );
+    }
+
+    #[test]
+    fn drm_minor_skips_subsystem_directory_to_find_its_physical_parent() {
+        let minor = DeviceRegistration::try_new(
+            DeviceIdentity::new("virtio0".into(), "drm".into(), "renderD128".into(), DeviceId::new(226, 128))
+                .unwrap().child_of_path("pci0000:00/0000:00:01.0/virtio8".into(), "drm".into()).unwrap(),
+            "drm_minor".into(), Vec::new(), None,
+        ).unwrap();
+        let canonical = alloc::format!("/sys{}", minor.canonical_path());
+        assert_eq!(canonical, "/sys/devices/pci0000:00/0000:00:01.0/virtio8/drm/renderD128");
+        assert_eq!(resolve_from(&alloc::format!("{canonical}/device"), &device_link_target(&minor)),
+            "/sys/devices/pci0000:00/0000:00:01.0/virtio8");
+        assert_eq!(resolve_from(&alloc::format!("{canonical}/subsystem"), &subsystem_link_target(&minor)),
+            "/sys/class/drm");
     }
 
     #[test]

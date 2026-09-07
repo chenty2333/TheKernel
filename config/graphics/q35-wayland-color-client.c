@@ -33,6 +33,13 @@ static int setup_egl(struct app *a) {
     a->es = eglCreateWindowSurface(a->ed, config, (EGLNativeWindowType)a->win, NULL);
     a->ec = eglCreateContext(a->ed, config, EGL_NO_CONTEXT, ctxattrs);
     if (a->es == EGL_NO_SURFACE || a->ec == EGL_NO_CONTEXT || !eglMakeCurrent(a->ed, a->es, a->es, a->ec)) goto bad;
+    const char *renderer = (const char *)glGetString(GL_RENDERER);
+    fprintf(stderr, "%s GL_RENDERER=%s\n", a->marker, renderer ? renderer : "(null)");
+    if (!strcmp(a->marker, "THEKERNEL_Q35_VIRGL_GLES_READY") &&
+        (!renderer || !strstr(renderer, "virgl"))) {
+        fail(a, "expected_virgl_renderer");
+        return -1;
+    }
     return 0;
 bad: fail(a, "egl_initialize"); return -1;
 }

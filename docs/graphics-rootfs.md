@@ -165,7 +165,8 @@ For real virgl coverage, run the same flavor with
 `THEKERNEL_Q35_VIRGL_READY`; after the software marker the guest requires
 `/dev/dri/renderD128`, checks that `weston` has the required `render`
 supplementary device group, and launches the EGL/GLES workload with
-`MESA_LOADER_DRIVER_OVERRIDE=virgl`. EGL setup, rendering, or its frame
+`MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu`. The GLES client requires `GL_RENDERER`
+to contain `virgl`, so a software fallback fails acceptance. EGL setup, rendering, or its frame
 callback failures are non-zero and never emit that marker. The same 800x600
 red-block pixel oracle is captured after the virgl marker. This is Weston-only
 acceptance: the image does not run an independent Xorg session.

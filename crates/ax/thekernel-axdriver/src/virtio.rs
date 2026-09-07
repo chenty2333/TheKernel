@@ -2,6 +2,8 @@ use core::{marker::PhantomData, ptr, ptr::NonNull};
 
 use axalloc::{UsageKind, global_allocator};
 use axdriver_base::{BaseDriverOps, DevResult, DeviceType};
+#[cfg(feature = "display")]
+use axdriver_display::DisplayDriverOps;
 use axdriver_virtio::{
     BufferDirection, DmaMapping, PhysAddr, VirtIoError, VirtIoHal, VirtIoResult,
 };
@@ -234,7 +236,23 @@ impl<D: VirtIoDevMeta> DriverProbe for VirtIoDriver<D> {
             && ty == D::DEVICE_TYPE
         {
             match D::try_new(transport, irq) {
-                Ok(dev) => return BusProbeResult::Device(dev),
+                Ok(mut dev) => {
+                    #[cfg(feature = "display")]
+                    if let AxDeviceEnum::Display(display) = &mut dev {
+                        let (subsystem_vendor, subsystem_device) = root.endpoint_subsystem_ids(bdf);
+                        display.set_pci_identity(axdriver_display::DisplayPciIdentity {
+                            bus: bdf.bus,
+                            device: bdf.device,
+                            function: bdf.function,
+                            vendor_id: dev_info.vendor_id,
+                            device_id: dev_info.device_id,
+                            subsystem_vendor,
+                            subsystem_device,
+                            revision: dev_info.revision,
+                        });
+                    }
+                    return BusProbeResult::Device(dev);
+                }
                 Err(e) => {
                     warn!("failed to initialize PCI device at {bdf}({dev_info}): {e:?}");
                     return BusProbeResult::Claimed;

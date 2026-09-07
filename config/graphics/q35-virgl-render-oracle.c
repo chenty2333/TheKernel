@@ -2,14 +2,15 @@
 
 /*
  * Exercise the render-node part of the legacy VirtGPU contract directly.
- * This deliberately does not create a 3D resource: Mesa owns command-stream
- * construction in the EGL workload.  Keeping the ABI probe to discovery,
+ * Mesa owns command-stream construction in the EGL workload. A small 3D
+ * resource exercises PRIME export/import. Keeping the ABI probe to discovery,
  * capability, PRIME and sync_file primitives makes an unsupported render
  * node fail before Mesa can silently select llvmpipe.
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,56 +63,104 @@ static int probe_prime(int fd)
         errno = EOPNOTSUPP;
         return -1;
     }
-    return 0;
+    struct drm_virtgpu_resource_create resource = {
+        .target = 2, /* PIPE_TEXTURE_2D */
+        .format = 1, /* PIPE_FORMAT_B8G8R8A8_UNORM */
+        .bind = 2, /* VIRGL_BIND_RENDER_TARGET */
+        .width = 16, .height = 16, .depth = 1, .array_size = 1,
+        .size = 4096, .stride = 64,
+    };
+    struct drm_prime_handle exported = { .fd = -1 };
+    struct drm_prime_handle imported = { 0 };
+    int result = -1;
+    if (ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE, &resource) < 0)
+        return -1;
+    exported.handle = resource.bo_handle;
+    /* Literal x86_64 Linux O_CLOEXEC | O_RDWR guards the flag ABI. */
+    exported.flags = 0x80002;
+    if (ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &exported) < 0)
+        goto prime_destroy;
+    int descriptor_flags = fcntl(exported.fd, F_GETFD);
+    if (descriptor_flags < 0)
+        goto prime_destroy;
+    if (!(descriptor_flags & FD_CLOEXEC)) {
+        errno = EIO;
+        goto prime_destroy;
+    }
+    imported.fd = exported.fd;
+    if (ioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &imported) < 0)
+        goto prime_destroy;
+    if (!imported.handle) {
+        errno = EIO;
+        goto prime_destroy;
+    }
+    result = 0;
+prime_destroy:;
+    int saved_errno = errno;
+    if (imported.handle && imported.handle != resource.bo_handle)
+        (void)ioctl(fd, DRM_IOCTL_GEM_CLOSE, &(struct drm_gem_close) {
+            .handle = imported.handle });
+    if (exported.fd >= 0)
+        close(exported.fd);
+    (void)ioctl(fd, DRM_IOCTL_GEM_CLOSE, &(struct drm_gem_close) {
+        .handle = resource.bo_handle });
+    errno = saved_errno;
+    return result;
 }
 
 static int probe_sync_file(int fd)
 {
     struct drm_syncobj_create create = { .flags = DRM_SYNCOBJ_CREATE_SIGNALED };
-    struct drm_syncobj_handle export_fd;
-    struct drm_syncobj_handle import_fd;
+    struct drm_syncobj_create destination = { 0 };
+    struct drm_syncobj_handle export_fd = { .fd = -1 };
+    struct drm_syncobj_handle imported_fd = { .fd = -1 };
+    int result = -1;
 
     if (ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &create) < 0)
         return -1;
-    memset(&export_fd, 0, sizeof(export_fd));
+    if (ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &destination) < 0)
+        goto destroy;
     export_fd.handle = create.handle;
     export_fd.flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE;
     if (ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &export_fd) < 0)
         goto destroy;
-    memset(&import_fd, 0, sizeof(import_fd));
-    import_fd.fd = export_fd.fd;
-    import_fd.flags = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE;
-    if (ioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &import_fd) < 0) {
-        close(export_fd.fd);
+    /* IMPORT_SYNC_FILE replaces the fence in an existing destination. */
+    struct drm_syncobj_handle import_fd = {
+        .handle = destination.handle,
+        .fd = export_fd.fd,
+        .flags = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
+    };
+    if (ioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &import_fd) < 0)
+        goto destroy;
+    imported_fd.handle = destination.handle;
+    imported_fd.flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE;
+    if (ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &imported_fd) < 0)
+        goto destroy;
+    struct pollfd ready = { .fd = imported_fd.fd, .events = POLLIN };
+    if (poll(&ready, 1, 0) != 1 || !(ready.revents & POLLIN) ||
+        (ready.revents & (POLLERR | POLLNVAL))) {
+        errno = EIO;
         goto destroy;
     }
-    close(export_fd.fd);
-    (void)ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &(struct drm_syncobj_destroy) {
-        .handle = import_fd.handle });
-    (void)ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &(struct drm_syncobj_destroy) {
-        .handle = create.handle });
-    return 0;
+    result = 0;
 
-destroy:
+destroy:;
+    int saved_errno = errno;
+    if (imported_fd.fd >= 0)
+        close(imported_fd.fd);
+    if (export_fd.fd >= 0)
+        close(export_fd.fd);
+    if (destination.handle)
+        (void)ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &(struct drm_syncobj_destroy) {
+            .handle = destination.handle });
     (void)ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &(struct drm_syncobj_destroy) {
         .handle = create.handle });
-    return -1;
+    errno = saved_errno;
+    return result;
 }
 
 int main(void)
 {
-    /* Weston initializes GBM on its KMS fd, before opening render resources. */
-    int primary = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-    uint64_t primary_value = 0;
-    if (primary < 0)
-        return fail("primary_node");
-    if (getparam(primary, VIRTGPU_PARAM_3D_FEATURES, &primary_value) < 0 ||
-        primary_value == 0) {
-        close(primary);
-        return fail("primary_getparam_3d");
-    }
-    close(primary);
-
     int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
     uint64_t value = 0;
 

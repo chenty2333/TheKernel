@@ -1134,12 +1134,9 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         flags: u32,
     ) -> Result<(ResourceId, GpuSubmission)> {
         self.require_virgl()?;
-        if width == 0
-            || height == 0
-            || depth == 0
-            || array_size == 0
-            || self.resources.len() == MAX_RESOURCES
-        {
+        // Gallium resource descriptors are interpreted by the renderer. In
+        // particular PIPE_BUFFER resources legitimately use array_size == 0.
+        if self.resources.len() == MAX_RESOURCES {
             return Err(Error::InvalidParam);
         }
         self.resources.try_reserve(1).map_err(|_| Error::DmaError)?;

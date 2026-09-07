@@ -16,7 +16,7 @@ if command -v vulkaninfo >/dev/null 2>&1 && vulkaninfo --summary >/dev/null 2>&1
     exit 0
 fi
 
-MESA_LOADER_DRIVER_OVERRIDE=virgl kmscube --count=120 || {
+MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu kmscube --count=120 || {
     echo "$marker state=FAIL reason=kmscube"
     exit 1
 }

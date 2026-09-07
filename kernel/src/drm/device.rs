@@ -111,6 +111,10 @@ impl fmt::Display for DrmError {
 /// lock held. Presentation returns a fence which becomes terminal only after
 /// the host has consumed the scanout command.
 pub trait DisplayAdapter: Send + Sync {
+    fn pci_identity(&self) -> Option<axdriver_display::DisplayPciIdentity> {
+        None
+    }
+
     fn create_dumb(
         &self,
         request: DumbRequest,

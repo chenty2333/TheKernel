@@ -4,7 +4,7 @@
 set -eu
 
 marker=THEKERNEL_Q35_VIRGL_READY
-export MESA_LOADER_DRIVER_OVERRIDE=virgl
+export MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu
 
 /usr/local/bin/q35-virgl-render-oracle || { echo "$marker state=FAIL reason=render_uapi"; exit 1; }
 echo THEKERNEL_Q35_VIRGL_RENDER_READY

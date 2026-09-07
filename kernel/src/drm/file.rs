@@ -1210,28 +1210,18 @@ impl Drop for DrmFile {
         for (bytes, blob) in released_handles {
             self.device.gem_handle_closed(bytes, blob);
         }
-        if self.render_node
-            && let Some(adapter) = self.device.render.clone()
-        {
-            let (context, resources) = {
+        if let Some(adapter) = self.device.render.clone() {
+            let context = {
                 let mut state = self.state.lock();
                 state.render_cancelled.store(true, Ordering::Release);
-                let context = state.render_context.take();
-                let resources = state
-                    .handles
-                    .values()
-                    .filter_map(|o| o.render_resource)
-                    .collect::<alloc::vec::Vec<_>>();
-                (context, resources)
+                state.render_context.take()
             };
             if let Some(context) = context {
                 self.device.render_context_closed();
+                // Primary and render nodes both own rendering contexts. The
+                // adapter cancels queued work and destroys the context after
+                // submitted jobs finish, retaining their backing until then.
                 adapter.cancel_context(context);
-                // cancel_context resets the render transport and ends every
-                // in-flight job before returning.  A reset invalidates host
-                // context state, so issuing detach/destroy afterwards would
-                // race a stale host context rather than improve cleanup.
-                let _ = resources;
             }
         }
     }

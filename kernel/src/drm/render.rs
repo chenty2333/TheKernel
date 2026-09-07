@@ -32,9 +32,6 @@ const CAPSET_VENUS: u32 = 4;
 /// not an arbitrary userspace-visible 4 KiB restriction.
 const MAX_COMMAND: usize = 1024 * 1024;
 const MAX_HANDLES: usize = 128;
-// The only formats for which this legacy path can prove a linear four-byte
-// layout. These are the first four virgl/Gallium BGRA/ARGB 8:8:8:8 formats.
-const LINEAR_4BPP_FORMATS: core::ops::RangeInclusive<u32> = 1..=4;
 const PIPE_TEXTURE_2D: u32 = 2;
 
 #[derive(Clone, Copy)]
@@ -502,27 +499,17 @@ pub(super) fn dispatch(
         uapi::DRM_IOCTL_VIRTGPU_GET_CAPS => {
             let r: Caps = read(copy, arg)?;
             let modern = file.render_adapter().map_err(drm)?.modern_features();
-            if r.pad != 0 || r.cap_set_id >= 64 {
+            if r.pad != 0 || r.cap_set_id >= 64 || r.size == 0 {
                 return Err(AxError::InvalidInput);
             }
             let a = file.render_adapter().map_err(drm)?;
-            let Some((_, max)) = capset_index(&a, r.cap_set_id, modern).map_err(drm)? else {
+            let Some((max_version, max)) = capset_index(&a, r.cap_set_id, modern).map_err(drm)?
+            else {
                 return Err(AxError::InvalidInput);
             };
-            if r.size > max {
-                return Err(AxError::InvalidInput);
-            }
-            let mut data = bytes(copy, r.addr, r.size as usize, MAX_COMMAND)?;
-            let actual = a
-                .capset(r.cap_set_id, r.cap_set_ver, &mut data)
-                .map_err(drm)?;
-            if actual != data.len() {
-                return Err(AxError::InvalidInput);
-            }
-            copy.write(
-                usize::try_from(r.addr).map_err(|_| AxError::BadAddress)?,
-                &data,
-            )?;
+            get_caps(copy, &r, max_version, max, |data| {
+                a.capset(r.cap_set_id, r.cap_set_ver, data).map_err(drm)
+            })?;
         }
         uapi::DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => create(file, copy, arg)?,
         uapi::DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB => create_blob(file, copy, arg)?,
@@ -547,13 +534,39 @@ pub(super) fn dispatch(
     };
     Ok(0)
 }
+fn get_caps(
+    copy: &impl UserCopy,
+    request: &Caps,
+    max_version: u32,
+    host_size: u32,
+    fetch: impl FnOnce(&mut [u8]) -> AxResult<usize>,
+) -> AxResult<()> {
+    if request.size == 0 || request.cap_set_ver > max_version || host_size as usize > MAX_COMMAND {
+        return Err(AxError::InvalidInput);
+    }
+    // The host returns its complete capset regardless of the userspace buffer
+    // length. Receive it in full, then expose the prefix requested by the caller.
+    let mut data = Vec::new();
+    data.try_reserve_exact(host_size as usize)
+        .map_err(|_| AxError::NoMemory)?;
+    data.resize(host_size as usize, 0);
+    if fetch(&mut data)? != data.len() {
+        return Err(AxError::InvalidInput);
+    }
+    let count = core::cmp::min(request.size, host_size) as usize;
+    copy.write(
+        usize::try_from(request.addr).map_err(|_| AxError::BadAddress)?,
+        &data[..count],
+    )
+}
+
 fn capset_index(
     adapter: &Arc<dyn RenderAdapter>,
     id: u32,
     modern: ModernFeatures,
 ) -> DrmResult<Option<(u32, u32)>> {
     for index in 0..8 {
-        let (candidate, _, max_size) = match adapter.capset_info(index) {
+        let (candidate, max_version, max_size) = match adapter.capset_info(index) {
             Ok(info) => info,
             Err(_) => continue,
         };
@@ -561,7 +574,7 @@ fn capset_index(
             if candidate == CAPSET_VENUS && !(modern.resource_blob && modern.context_init) {
                 return Ok(None);
             }
-            return Ok(Some((index, max_size)));
+            return Ok(Some((max_version, max_size)));
         }
     }
     Ok(None)
@@ -582,16 +595,8 @@ fn supported_capsets(file: &DrmFile, modern: ModernFeatures) -> AxResult<u64> {
 }
 fn create(file: &DrmFile, copy: &impl super::ioctl::UserCopy, arg: usize) -> AxResult<()> {
     let mut r: Create = read(copy, arg)?;
-    if r.bo_handle != 0 || r.res_handle != 0 || r.size == 0 {
-        return Err(AxError::InvalidInput);
-    };
-    validate_linear_resource(&r)?;
-    let size = r.size as u64;
-    let alloc = checked_align_up(
-        usize::try_from(size).map_err(|_| AxError::InvalidInput)?,
-        PageSize::Size4K as usize,
-    )
-    .ok_or(AxError::InvalidInput)?;
+    let alloc = resource_backing_size(&r)?;
+    let size = alloc as u64;
     let pages = Arc::try_new(
         SharedPages::new_fixed(alloc, PageSize::Size4K).map_err(|_| AxError::NoMemory)?,
     )
@@ -645,28 +650,20 @@ fn create(file: &DrmFile, copy: &impl super::ioctl::UserCopy, arg: usize) -> AxR
     write(copy, arg, &r)
 }
 
-fn validate_linear_resource(r: &Create) -> AxResult<()> {
-    // Transfers below use a four-byte-per-pixel bound. Refuse every format or
-    // layout for which that calculation would not prove the host DMA range.
-    if !LINEAR_4BPP_FORMATS.contains(&r.format)
-        || r.target != PIPE_TEXTURE_2D
-        || r.nr_samples != 0
-        || r.last_level != 0
-        || r.width == 0
-        || r.height == 0
-        || r.depth != 1
-        || r.array_size != 1
-    {
+fn resource_backing_size(r: &Create) -> AxResult<usize> {
+    if r.bo_handle != 0 || r.res_handle != 0 {
         return Err(AxError::InvalidInput);
     }
-    let bytes = u64::from(r.width)
-        .checked_mul(u64::from(r.height))
-        .and_then(|value| value.checked_mul(4))
-        .ok_or(AxError::InvalidInput)?;
-    if bytes > u64::from(r.size) {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(())
+    // As in Linux virtgpu, guest backing and host texture storage are separate.
+    // Mesa can request a one-byte BO for a large texture using staging transfers.
+    // The renderer validates Gallium targets, formats and mip layouts against
+    // the attached SG list; guessing a pixel footprint here rejects valid BOs.
+    // Only kernel-allocated, pinned pages enter that SG list.
+    checked_align_up(
+        core::cmp::max(r.size as usize, 1),
+        PageSize::Size4K as usize,
+    )
+    .ok_or(AxError::InvalidInput)
 }
 fn create_blob(file: &DrmFile, copy: &impl super::ioctl::UserCopy, arg: usize) -> AxResult<()> {
     let mut r: CreateBlob = read(copy, arg)?;
@@ -861,45 +858,14 @@ fn transfer(
         return Err(AxError::InvalidInput);
     };
     let (res, obj) = file.render_resource(r.bo_handle).map_err(drm)?;
-    let meta = obj.render_meta.ok_or(AxError::InvalidInput)?;
-    if r.level != 0
-        || r.box_
-            .x
-            .checked_add(r.box_.w)
-            .is_none_or(|v| v > meta.width)
-        || r.box_
-            .y
-            .checked_add(r.box_.h)
-            .is_none_or(|v| v > meta.height)
-        || r.box_
-            .z
-            .checked_add(r.box_.d)
-            .is_none_or(|v| v > meta.depth)
+    // Legacy virgl transfers use the renderer's format/mip layout. The host
+    // bounds accesses against the attached SG list; this ioctl never turns
+    // the box or offset into guest pointers. Keep ownership and reservation
+    // fences here, rather than applying a fictitious four-byte pixel layout.
+    // Linux permits explicit strides only for resources with host3d blob memory.
+    if obj.render_blob_mem == Some(1)
+        || (obj.render_blob_mem.is_none() && (r.stride != 0 || r.layer_stride != 0))
     {
-        return Err(AxError::InvalidInput);
-    }
-    let row = if r.stride == 0 {
-        u64::from(r.box_.w).checked_mul(4)
-    } else {
-        Some(u64::from(r.stride))
-    }
-    .ok_or(AxError::InvalidInput)?;
-    let layer = if r.layer_stride == 0 {
-        row.checked_mul(u64::from(r.box_.h))
-    } else {
-        Some(u64::from(r.layer_stride))
-    }
-    .ok_or(AxError::InvalidInput)?;
-    let end = u64::from(r.offset)
-        .checked_add(
-            layer
-                .checked_mul(u64::from(r.box_.d - 1))
-                .ok_or(AxError::InvalidInput)?,
-        )
-        .and_then(|v| v.checked_add(row.checked_mul(u64::from(r.box_.h - 1))?))
-        .and_then(|v| v.checked_add(u64::from(r.box_.w).checked_mul(4)?))
-        .ok_or(AxError::InvalidInput)?;
-    if end > obj.size {
         return Err(AxError::InvalidInput);
     }
     let a = file.render_adapter().map_err(drm)?;
@@ -1121,38 +1087,98 @@ const _: [(); 16] = [(); size_of::<ContextInitIoctl>()];
 mod tests {
     use super::*;
 
-    fn linear_create() -> Create {
-        Create {
-            target: PIPE_TEXTURE_2D,
-            format: 1,
-            width: 16,
-            height: 8,
-            depth: 1,
-            array_size: 1,
-            size: 16 * 8 * 4,
-            ..Default::default()
+    struct CapsOutput(core::cell::RefCell<Vec<u8>>);
+
+    impl UserCopy for CapsOutput {
+        fn read(&self, _: usize, _: &mut [MaybeUninit<u8>]) -> AxResult<()> {
+            panic!("GET_CAPS must not read the output buffer");
+        }
+        fn write(&self, address: usize, src: &[u8]) -> AxResult<()> {
+            assert_eq!(address, 128);
+            let mut output = self.0.borrow_mut();
+            output[..src.len()].copy_from_slice(src);
+            Ok(())
         }
     }
 
     #[test]
-    fn resource_create_rejects_layouts_the_transfer_bounds_cannot_prove() {
-        let valid = linear_create();
-        assert!(validate_linear_resource(&valid).is_ok());
+    fn get_caps_fetches_full_host_payload_and_copies_only_requested_prefix() {
+        for size in [2, 4, 4096] {
+            let output = CapsOutput(core::cell::RefCell::new(alloc::vec![0xaa; 8]));
+            let request = Caps {
+                cap_set_id: 1,
+                cap_set_ver: 1,
+                addr: 128,
+                size,
+                pad: 0,
+            };
+            get_caps(&output, &request, 1, 4, |data| {
+                assert_eq!(data.len(), 4);
+                data.copy_from_slice(&[1, 2, 3, 4]);
+                Ok(4)
+            })
+            .unwrap();
+            let count = core::cmp::min(size, 4) as usize;
+            assert_eq!(&output.0.borrow()[..count], &[1, 2, 3, 4][..count]);
+            assert!(output.0.borrow()[count..].iter().all(|byte| *byte == 0xaa));
+        }
+    }
 
-        let mut invalid = valid;
-        invalid.format = 5;
-        assert!(validate_linear_resource(&invalid).is_err());
-        invalid = valid;
-        invalid.nr_samples = 1;
-        assert!(validate_linear_resource(&invalid).is_err());
-        invalid = valid;
-        invalid.size -= 1;
-        assert!(validate_linear_resource(&invalid).is_err());
-        invalid = valid;
-        invalid.depth = 2;
-        assert!(validate_linear_resource(&invalid).is_err());
-        invalid = valid;
-        invalid.array_size = 2;
-        assert!(validate_linear_resource(&invalid).is_err());
+    #[test]
+    fn get_caps_rejects_empty_buffers_and_unsupported_versions_before_fetch() {
+        let output = CapsOutput(core::cell::RefCell::new(Vec::new()));
+        for (size, version) in [(0, 1), (4, 2)] {
+            let request = Caps {
+                cap_set_id: 1,
+                cap_set_ver: version,
+                addr: 128,
+                size,
+                pad: 0,
+            };
+            assert_eq!(
+                get_caps(&output, &request, 1, 4, |_| panic!(
+                    "invalid request reached host"
+                )),
+                Err(AxError::InvalidInput)
+            );
+        }
+    }
+
+    #[test]
+    fn resource_backing_accepts_mesa_buffer_and_staging_texture() {
+        // virgl_fence_create uses an eight-byte PIPE_BUFFER with no array layers.
+        let buffer = Create {
+            target: 0,
+            format: 64, // VIRGL_FORMAT_R8_UNORM
+            width: 8,
+            height: 1,
+            depth: 1,
+            array_size: 0,
+            size: 8,
+            ..Default::default()
+        };
+        assert_eq!(resource_backing_size(&buffer), Ok(4096));
+        // virgl_resource_create allocates only one byte when using staging.
+        let texture = Create {
+            target: 2,
+            format: 1,
+            width: 1920,
+            height: 1080,
+            depth: 1,
+            array_size: 1,
+            last_level: 4,
+            size: 1,
+            ..Default::default()
+        };
+        assert_eq!(resource_backing_size(&texture), Ok(4096));
+        assert_eq!(resource_backing_size(&Create::default()), Ok(4096));
+        assert_eq!(
+            resource_backing_size(&Create { bo_handle: 1, ..buffer }),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            resource_backing_size(&Create { res_handle: 1, ..buffer }),
+            Err(AxError::InvalidInput)
+        );
     }
 }

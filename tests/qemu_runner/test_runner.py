@@ -189,9 +189,9 @@ class RunnerTests(unittest.TestCase):
             _validate_virgl_capabilities("virgl-headless", Path("/qemu"))
         probe.assert_called_once_with(Path("/qemu"))
 
-    def test_virgl_interactive_requires_gl_device_and_gtk_gl_syntax(self) -> None:
+    def test_virgl_interactive_requires_gl_device_and_sdl_backend(self) -> None:
         device_help = 'name "virtio-gpu-gl-pci", bus PCI\n'
-        display_help = "Available display backend types:\ngtk\n\n"
+        display_help = "Available display backend types:\nsdl\n\n"
         with patch(
             "tools.qemu_runner.runner._qemu_help_output",
             side_effect=(device_help, display_help),
@@ -201,6 +201,16 @@ class RunnerTests(unittest.TestCase):
             [call.args[1:] for call in capability_help.call_args_list],
             [("-device", "help"), ("-display", "help")],
         )
+
+    def test_virgl_interactive_rejects_qemu_without_sdl(self) -> None:
+        device_help = 'name "virtio-gpu-gl-pci", bus PCI\n'
+        display_help = "Available display backend types:\ngtk\negl-headless\n\n"
+        with patch(
+            "tools.qemu_runner.runner._qemu_help_output",
+            side_effect=(device_help, display_help),
+        ):
+            with self.assertRaisesRegex(RunnerError, "required virgl display backend sdl"):
+                _validate_virgl_capabilities("virgl-interactive", Path("/qemu"))
 
     def test_venus_requires_hostmem_limit_and_geometry_properties(self) -> None:
         device_help = 'name "virtio-gpu-gl-pci", bus PCI\n'

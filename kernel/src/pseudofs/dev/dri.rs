@@ -67,22 +67,94 @@ fn mode_attribute(mode: crate::drm::Mode) -> DeviceAttribute {
     .expect("static DRM sysfs mode attribute")
 }
 
+// libdrm resolves the DRM node's device link, skips a virtio parent, then
+// reads PCI_SLOT_NAME from uevent and these five separate PCI attributes.
+fn pci_registrations(
+    identity: axdriver_display::DisplayPciIdentity,
+) -> VfsResult<[Arc<DeviceRegistration>; 2]> {
+    let root = alloc::format!("pci0000:{:02x}", identity.bus);
+    let bdf = alloc::format!(
+        "0000:{:02x}:{:02x}.{}",
+        identity.bus,
+        identity.device,
+        identity.function
+    );
+    let virtio = alloc::format!(
+        "virtio{}",
+        ((identity.bus as u32) << 8) | ((identity.device as u32) << 3) | identity.function as u32
+    );
+    let hex = |name: &str, value: u16| {
+        DeviceAttribute::try_new(name.into(), move || Ok(alloc::format!("0x{value:04x}\n")))
+            .expect("PCI attribute")
+    };
+    let pci = DeviceRegistration::try_bus_device(
+        DeviceIdentity::without_dev(root.clone(), "pci".into(), bdf.clone())?,
+        "pci_device".into(),
+        vec![
+            hex("vendor", identity.vendor_id),
+            hex("device", identity.device_id),
+            hex("subsystem_vendor", identity.subsystem_vendor),
+            hex("subsystem_device", identity.subsystem_device),
+            hex("revision", identity.revision as u16),
+        ],
+        "pci".into(),
+        false,
+    )?;
+    let transport = DeviceRegistration::try_bus_device(
+        DeviceIdentity::without_dev(root.clone(), "virtio".into(), virtio)?
+            .child_of_path(root, bdf)?,
+        "virtio_device".into(),
+        vec![attribute("modalias", "virtio:d00000010v00001AF4\n")],
+        "virtio".into(),
+        true,
+    )?;
+    Ok([pci, transport])
+}
+
 fn publish_sysfs(device: &DrmDevice) -> VfsResult<Vec<DeviceHandle<'static, MAX_DEVICES>>> {
+    let mut parents = Vec::new();
+    let transport = if let Some(identity) = device.adapter.pci_identity() {
+        let [pci, virtio] = pci_registrations(identity)?;
+        let path = alloc::format!("{}/{}", pci.identity().bus, pci.identity().name);
+        let name = virtio.identity().name.clone();
+        let pci_reservation = global_device_registry().reserve(pci.identity().clone())?;
+        let virtio_reservation = global_device_registry().reserve(virtio.identity().clone())?;
+        let (pci, virtio) =
+            DeviceReservation::publish_pair(pci_reservation, pci, virtio_reservation, virtio)?;
+        parents.extend([pci, virtio]);
+        Some((path, name))
+    } else {
+        None
+    };
+    let attach = |identity: DeviceIdentity| -> VfsResult<DeviceIdentity> {
+        match &transport {
+            Some((path, name)) => {
+                identity.child_of_path(alloc::format!("{path}/{name}"), "drm".into())
+            }
+            None => Ok(identity),
+        }
+    };
     let card = DeviceRegistration::try_new(
-        DeviceIdentity::new(
-            "virtio0".into(),
-            "drm".into(),
-            "card0".into(),
-            DRM_PRIMARY_DEVICE_ID,
-        )?
-        .with_devname("dri/card0".into())?,
+        attach(
+            DeviceIdentity::new(
+                "virtio0".into(),
+                "drm".into(),
+                "card0".into(),
+                DRM_PRIMARY_DEVICE_ID,
+            )?
+            .with_devname("dri/card0".into())?,
+        )?,
         "drm_minor".into(),
         Vec::new(),
         None,
     )?;
+    let connector_parent = transport.as_ref().map_or_else(
+        || "virtio0".into(),
+        |(path, name)| alloc::format!("{path}/{name}/drm"),
+    );
     let connector = DeviceRegistration::try_new(
         DeviceIdentity::without_dev("virtio0".into(), "drm".into(), "card0-Virtual-1".into())?
-            .child_of("virtio0".into(), "card0".into())?,
+            .child_of_path(connector_parent, "card0".into())?,
         "drm_connector".into(),
         vec![
             attribute("status", "connected\n"),
@@ -92,13 +164,15 @@ fn publish_sysfs(device: &DrmDevice) -> VfsResult<Vec<DeviceHandle<'static, MAX_
     )?;
     let render = if device.has_render() {
         Some(DeviceRegistration::try_new(
-            DeviceIdentity::new(
-                "virtio0".into(),
-                "drm".into(),
-                "renderD128".into(),
-                DRM_RENDER_DEVICE_ID,
-            )?
-            .with_devname("dri/renderD128".into())?,
+            attach(
+                DeviceIdentity::new(
+                    "virtio0".into(),
+                    "drm".into(),
+                    "renderD128".into(),
+                    DRM_RENDER_DEVICE_ID,
+                )?
+                .with_devname("dri/renderD128".into())?,
+            )?,
             "drm_minor".into(),
             Vec::new(),
             None,
@@ -115,16 +189,19 @@ fn publish_sysfs(device: &DrmDevice) -> VfsResult<Vec<DeviceHandle<'static, MAX_
             connector_reservation,
             connector,
         )?;
-        return Ok(vec![card_handle, connector_handle]);
+        parents.extend([card_handle, connector_handle]);
+        return Ok(parents);
     };
     let render_reservation = global_device_registry().reserve(render.identity().clone())?;
-    Ok(DeviceReservation::publish_many([
-        (card_reservation, card),
-        (connector_reservation, connector),
-        (render_reservation, render),
-    ])?
-    .into_iter()
-    .collect())
+    parents.extend(
+        DeviceReservation::publish_many([
+            (card_reservation, card),
+            (connector_reservation, connector),
+            (render_reservation, render),
+        ])?
+        .into_iter(),
+    );
+    Ok(parents)
 }
 
 pub(crate) fn primary_node(
@@ -376,7 +453,40 @@ mod tests {
     }
 
     #[test]
+    fn pci_discovery_preserves_nondefault_function_and_libdrm_slot_identity() {
+        let identity = axdriver_display::DisplayPciIdentity {
+            bus: 2,
+            device: 7,
+            function: 3,
+            vendor_id: 0x1af4,
+            device_id: 0x1050,
+            subsystem_vendor: 0x1af4,
+            subsystem_device: 0x1100,
+            revision: 1,
+        };
+        let [pci, virtio] = pci_registrations(identity).unwrap();
+        assert_eq!(pci.identity().bus, "pci0000:02");
+        assert_eq!(pci.identity().name, "0000:02:07.3");
+        assert!(
+            pci.uevent_payload()
+                .contains("PCI_SLOT_NAME=0000:02:07.3\n")
+        );
+        assert!(pci.uevent_payload().contains("SUBSYSTEM=pci\n"));
+        assert_eq!(
+            virtio.identity().parent,
+            Some(("pci0000:02".into(), "0000:02:07.3".into()))
+        );
+        assert_eq!(virtio.identity().name, "virtio571");
+        assert!(
+            virtio
+                .uevent_payload()
+                .contains("DEVPATH=/devices/pci0000:02/0000:02:07.3/virtio571\nSUBSYSTEM=virtio\n")
+        );
+    }
+
+    #[test]
     fn primary_node_registers_linux_identity_and_opens_per_ofd() {
+        let _context = crate::test_support::scheduler_test_context();
         let holder = Arc::new(axsync::Mutex::new(None));
         let holder_for_root = holder.clone();
         let filesystem = SimpleFs::new_with("dri-test".into(), 0, move |fs| {

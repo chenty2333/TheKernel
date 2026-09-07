@@ -253,6 +253,14 @@ impl PciRoot {
         (status, command)
     }
 
+    /// Reads the subsystem vendor and device IDs of a type-0 PCI endpoint.
+    /// The caller must first establish that this is an endpoint function,
+    /// because bridge headers assign a different meaning to offset 0x2c.
+    pub fn endpoint_subsystem_ids(&self, device_function: DeviceFunction) -> (u16, u16) {
+        let ids = self.config_read_word(device_function, 0x2c);
+        (ids as u16, (ids >> 16) as u16)
+    }
+
     /// Returns the firmware-provided legacy INTx line and pin for a device.
     ///
     /// The line is the PCI configuration-space routing value (normally the

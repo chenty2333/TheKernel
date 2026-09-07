@@ -10,6 +10,19 @@ use core::any::Any;
 #[doc(no_inline)]
 pub use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 
+/// PCI identity retained from the owning function's configuration space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayPciIdentity {
+    pub bus: u8,
+    pub device: u8,
+    pub function: u8,
+    pub vendor_id: u16,
+    pub device_id: u16,
+    pub subsystem_vendor: u16,
+    pub subsystem_device: u16,
+    pub revision: u8,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DisplayInfo {
     pub width: u32,
@@ -362,6 +375,11 @@ impl<'a> FrameBuffer<'a> {
 /// user to a driver that supports caller-owned pinned backing. Drivers that do
 /// not implement this transport remain usable through the framebuffer API.
 pub trait DisplayDriverOps: BaseDriverOps {
+    fn pci_identity(&self) -> Option<DisplayPciIdentity> {
+        None
+    }
+    fn set_pci_identity(&mut self, _identity: DisplayPciIdentity) {}
+
     fn info(&self) -> DisplayInfo;
     fn fb(&self) -> FrameBuffer<'_>;
     fn need_flush(&self) -> bool;

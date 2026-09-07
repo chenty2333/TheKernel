@@ -33,6 +33,10 @@ use super::{
 use crate::mm::{ExternalPageLease, SharedPages, checked_align_up};
 
 trait GpuTransport: Send {
+    fn pci_identity(&self) -> Option<axdriver_display::DisplayPciIdentity> {
+        None
+    }
+
     fn modern_features(&mut self) -> DriverGpuFeatures {
         DriverGpuFeatures::empty()
     }
@@ -65,6 +69,10 @@ trait GpuTransport: Send {
 struct DisplayTransport(Box<dyn DisplayDriverOps>);
 
 impl GpuTransport for DisplayTransport {
+    fn pci_identity(&self) -> Option<axdriver_display::DisplayPciIdentity> {
+        self.0.pci_identity()
+    }
+
     fn modern_features(&mut self) -> DriverGpuFeatures {
         self.0
             .render_transport()
@@ -1459,17 +1467,12 @@ impl<T: GpuTransport> AdapterState<T> {
         shadows.try_reserve(1).map_err(|_| DrmError::NoMemory)?;
         let pages = scanout.backing.shared_pages()?;
         let width = scanout.pitch / 4;
-        let shadow_height = u32::try_from(
-            scanout
-                .backing_size
-                .checked_add(u64::from(scanout.pitch) - 1)
-                .ok_or(DrmError::Overflow)?
-                / u64::from(scanout.pitch),
-        )
-        .map_err(|_| DrmError::Overflow)?;
-        if shadow_height < scanout.framebuffer_height {
-            return Err(DrmError::Invalid);
-        }
+        let shadow_height = render_shadow_height(
+            scanout.pitch,
+            scanout.backing_size,
+            scanout.framebuffer_offset,
+            scanout.framebuffer_height,
+        )?;
         let mut entries: Vec<(u64, u32)> = Vec::new();
         entries
             .try_reserve_exact(pages.len())
@@ -2660,6 +2663,10 @@ impl<T: GpuTransport> Drop for VirtioGemBacking<T> {
 }
 
 impl<T: GpuTransport + 'static> DisplayAdapter for VirtioGpuAdapter<T> {
+    fn pci_identity(&self) -> Option<axdriver_display::DisplayPciIdentity> {
+        self.state.transport.lock().pci_identity()
+    }
+
     fn metrics(&self) -> AdapterMetrics {
         self.state.metrics()
     }
@@ -2794,6 +2801,29 @@ impl<T: GpuTransport + 'static> DisplayAdapter for VirtioGpuAdapter<T> {
     }
 }
 
+/// Only complete rows fit in the shared backing. Page-alignment padding is
+/// not another scanline: rounding up would describe more DMA bytes than the
+/// SG list contains, and the transport correctly rejects ATTACH_BACKING.
+fn render_shadow_height(
+    pitch: u32,
+    backing_size: u64,
+    framebuffer_offset: u64,
+    framebuffer_height: u32,
+) -> DrmResult<u32> {
+    if pitch == 0 {
+        return Err(DrmError::Invalid);
+    }
+    let height = u32::try_from(backing_size / u64::from(pitch))
+        .map_err(|_| DrmError::Overflow)?;
+    let required_rows = (framebuffer_offset / u64::from(pitch))
+        .checked_add(u64::from(framebuffer_height))
+        .ok_or(DrmError::Overflow)?;
+    if height == 0 || u64::from(height) < required_rows {
+        return Err(DrmError::Invalid);
+    }
+    Ok(height)
+}
+
 fn map_dev_error(error: DevError) -> DrmError {
     match error {
         DevError::InvalidParam => DrmError::Invalid,
@@ -2847,6 +2877,8 @@ mod tests {
         destroy_calls: Arc<AtomicUsize>,
         transport_drops: Arc<AtomicUsize>,
         render_next: u32,
+        contexts_created: u32,
+        contexts_destroyed: Vec<u32>,
         render_attach_fails: u32,
         render_detach_fails: u32,
         render_unref_fails: u32,
@@ -2874,7 +2906,15 @@ mod tests {
             _: u64,
         ) -> Result<DriverGpuSubmission, DevError> {
             let mut resource_id = None;
+            let mut context_id = None;
             match batch {
+                DriverGpuBatch::CreateContext { .. } => {
+                    self.contexts_created += 1;
+                    context_id = Some(self.contexts_created);
+                }
+                DriverGpuBatch::DestroyContext { context } => {
+                    self.contexts_destroyed.push(context);
+                }
                 DriverGpuBatch::Create2d { width, height, .. } => {
                     self.created.push((width, height, 0, 0));
                     resource_id = Some(7);
@@ -2942,7 +2982,7 @@ mod tests {
             Ok(DriverGpuSubmission {
                 fence_id: self.next_fence,
                 resource_id,
-                context_id: None,
+                context_id,
             })
         }
         fn drain_completions(
@@ -2977,6 +3017,69 @@ mod tests {
         fn drop(&mut self) {
             self.transport_drops.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn render_shadow_does_not_turn_page_padding_into_an_unbacked_row() {
+        let pitch = 1366 * 4;
+        let framebuffer_height = 768;
+        let bytes = u64::from(pitch) * u64::from(framebuffer_height);
+        let backing = (bytes + 4095) & !4095;
+        assert!(backing > bytes);
+        let height = render_shadow_height(pitch, backing, 0, framebuffer_height).unwrap();
+        assert_eq!(height, framebuffer_height);
+        assert!(u64::from(pitch) * u64::from(height) <= backing);
+        assert!(u64::from(pitch) * u64::from(height + 1) > backing);
+        assert_eq!(
+            render_shadow_height(pitch, bytes - 1, 0, framebuffer_height),
+            Err(DrmError::Invalid)
+        );
+        assert_eq!(
+            render_shadow_height(0, backing, 0, framebuffer_height),
+            Err(DrmError::Invalid)
+        );
+        assert_eq!(render_shadow_height(3200, 1921024, 0, 600), Ok(600));
+        // A framebuffer starting two rows into the BO needs those rows too.
+        assert_eq!(render_shadow_height(3200, 1929216, 6400, 600), Ok(602));
+        assert_eq!(
+            render_shadow_height(3200, 1921024, 6400, 600),
+            Err(DrmError::Invalid)
+        );
+    }
+
+    #[test]
+    fn closing_primary_and_render_files_destroys_their_render_contexts() {
+        let _context = crate::test_support::scheduler_test_context();
+        let adapter = Arc::new(VirtioGpuAdapter::new(FakeTransport::default()));
+        let render: Arc<dyn RenderAdapter> = Arc::new(VirtioRenderAdapter {
+            state: adapter.state.clone(),
+        });
+        let device = super::super::DrmDevice::with_render(
+            adapter.clone(),
+            Some(render),
+            1,
+            2,
+            3,
+            4,
+        );
+        let primary = device.open_primary();
+        let render_file = device.open_render().unwrap();
+        let primary_context = primary.render_context().unwrap();
+        let render_context = render_file.render_context().unwrap();
+        assert_ne!(primary_context, render_context);
+        assert_eq!(device.metrics().render_contexts, 2);
+        drop(primary);
+        assert_eq!(device.metrics().render_contexts, 1);
+        assert_eq!(
+            adapter.state.transport.lock().contexts_destroyed,
+            [primary_context]
+        );
+        drop(render_file);
+        assert_eq!(device.metrics().render_contexts, 0);
+        assert_eq!(
+            adapter.state.transport.lock().contexts_destroyed,
+            [primary_context, render_context]
+        );
     }
 
     #[test]

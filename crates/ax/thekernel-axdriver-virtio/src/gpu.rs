@@ -20,6 +20,7 @@ use crate::as_dev_err;
 pub struct VirtIoGpuDev<H: Hal, T: Transport> {
     inner: InnerDev<H, T>,
     info: DisplayInfo,
+    pci_identity: Option<axdriver_display::DisplayPciIdentity>,
     drm_resources: Vec<DrmResource>,
     pending_destroy_resources: Vec<(u64, u32)>,
 }
@@ -51,6 +52,7 @@ impl<H: Hal, T: Transport> VirtIoGpuDev<H, T> {
         Ok(Self {
             inner: virtio,
             info,
+            pci_identity: None,
             drm_resources: Vec::new(),
             pending_destroy_resources: Vec::new(),
         })
@@ -68,6 +70,12 @@ impl<H: Hal, T: Transport> BaseDriverOps for VirtIoGpuDev<H, T> {
 }
 
 impl<H: Hal, T: Transport> DisplayDriverOps for VirtIoGpuDev<H, T> {
+    fn pci_identity(&self) -> Option<axdriver_display::DisplayPciIdentity> {
+        self.pci_identity
+    }
+    fn set_pci_identity(&mut self, identity: axdriver_display::DisplayPciIdentity) {
+        self.pci_identity = Some(identity);
+    }
     fn info(&self) -> DisplayInfo {
         self.info
     }

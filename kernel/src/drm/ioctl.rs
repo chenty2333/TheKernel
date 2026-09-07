@@ -558,22 +558,39 @@ fn syncobj_wait(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()
     write_pod(copy, arg, &request)
 }
 
+// Both fd conversions share the same flag bits. Without SYNC_FILE the fd
+// carries the syncobj itself, so a nonzero point is invalid. Binary sync_file
+// conversions ignore point unless TIMELINE is explicitly selected, as Linux does.
+fn syncobj_fd_point(request: &uapi::DrmSyncobjHandle) -> AxResult<Option<u64>> {
+    let sync_file = uapi::DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE;
+    let timeline = uapi::DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_TIMELINE;
+    if request.pad != 0 || request.flags & !(sync_file | timeline) != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if request.flags & sync_file != 0 {
+        Ok(Some(if request.flags & timeline != 0 {
+            request.point
+        } else {
+            0
+        }))
+    } else if request.point != 0 {
+        Err(AxError::InvalidInput)
+    } else {
+        Ok(None)
+    }
+}
+
 fn syncobj_handle_to_fd(
     file: &DrmFile,
     context: &crate::file::IoctlContext,
     arg: usize,
 ) -> AxResult<()> {
     let mut request: uapi::DrmSyncobjHandle = read_pod(context, arg)?;
-    if request.pad != 0 {
-        return Err(AxError::InvalidInput);
-    }
+    let point = syncobj_fd_point(&request)?;
     let object = file.syncobj(request.handle).map_err(AxError::from)?;
-    request.fd = match request.flags {
-        0 => syncobj::export_syncobj(object, context, false)?,
-        uapi::DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE => {
-            syncobj::export(object.fence()?, context, false)?
-        }
-        _ => return Err(AxError::InvalidInput),
+    request.fd = match point {
+        None => syncobj::export_syncobj(object, context, false)?,
+        Some(point) => syncobj::export(object.fence_at(point)?, context, false)?,
     };
     write_pod(context, arg, &request)
 }
@@ -584,21 +601,17 @@ fn syncobj_fd_to_handle(
     arg: usize,
 ) -> AxResult<()> {
     let mut request: uapi::DrmSyncobjHandle = read_pod(context, arg)?;
-    if request.pad != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    match request.flags {
-        0 => {
+    match syncobj_fd_point(&request)? {
+        None => {
             request.handle = file
                 .import_syncobj(syncobj::import_syncobj(context, request.fd)?)
                 .map_err(AxError::from)?;
         }
-        uapi::DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE => {
+        Some(point) => {
             file.syncobj(request.handle)
                 .map_err(AxError::from)?
-                .import_fence(syncobj::import(context, request.fd)?);
+                .submit_point(point, syncobj::import(context, request.fd)?)?;
         }
-        _ => return Err(AxError::InvalidInput),
     }
     write_pod(context, arg, &request)
 }
@@ -1681,6 +1694,38 @@ mod tests {
     use core::{cell::RefCell, mem::MaybeUninit};
 
     use super::*;
+
+    #[test]
+    fn prime_fd_flags_accept_linux_cloexec_and_reject_the_old_bit() {
+        assert_eq!(fd_flags(0), Ok(false));
+        assert_eq!(fd_flags(2), Ok(false));
+        assert_eq!(fd_flags(0x80000), Ok(true));
+        assert_eq!(fd_flags(0x80002), Ok(true));
+        assert_eq!(fd_flags(1), Err(AxError::InvalidInput));
+        assert_eq!(fd_flags(0x80003), Err(AxError::InvalidInput));
+    }
+
+    #[test]
+    fn syncobj_fd_conversion_validates_flags_and_selects_binary_or_timeline_point() {
+        for (flags, point, expected) in [
+            (0, 0, Ok(None)),
+            (2, 0, Ok(None)),
+            (0, 7, Err(AxError::InvalidInput)),
+            (2, 7, Err(AxError::InvalidInput)),
+            (1, 7, Ok(Some(0))),
+            (3, 7, Ok(Some(7))),
+            (4, 0, Err(AxError::InvalidInput)),
+        ] {
+            let mut request = uapi::DrmSyncobjHandle {
+                flags,
+                point,
+                ..Default::default()
+            };
+            assert_eq!(syncobj_fd_point(&request), expected);
+            request.pad = 1;
+            assert_eq!(syncobj_fd_point(&request), Err(AxError::InvalidInput));
+        }
+    }
 
     struct Image(RefCell<alloc::vec::Vec<u8>>);
     impl UserCopy for Image {

@@ -10,7 +10,7 @@ command -v wflinfo >/dev/null || { echo 'THEKERNEL_Q35_VIRGL_PIGLIT_READY state=
 results=/tmp/thekernel-piglit-quick
 rm -rf "$results"
 mkdir -p "$results"
-MESA_LOADER_DRIVER_OVERRIDE=virgl "$runner" run \
+MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu "$runner" run \
     -p wayland -1 --timeout 60 quick "$results" || {
     echo 'THEKERNEL_Q35_VIRGL_PIGLIT_READY state=FAIL reason=piglit_quick'
     exit 1

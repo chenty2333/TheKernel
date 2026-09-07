@@ -1,4 +1,6 @@
+#include <errno.h>
 #include <poll.h>
+#include <time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +16,51 @@ static int checked(xcb_connection_t *connection, xcb_void_cookie_t cookie,
     fprintf(stderr, "THEKERNEL_Q35_XWAYLAND_GLAMOR_READY state=FAIL reason=%s code=%u\n",
             operation, error->error_code);
     free(error);
+    return -1;
+}
+
+static int wait_viewable(xcb_connection_t *connection, xcb_window_t window)
+{
+    struct timespec start, now;
+    struct pollfd descriptor = { .fd = xcb_get_file_descriptor(connection), .events = POLLIN };
+    int mapped = 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) < 0)
+        goto fail;
+    xcb_flush(connection);
+    for (;;) {
+        xcb_generic_event_t *event;
+        while ((event = xcb_poll_for_event(connection)) != NULL) {
+            if ((event->response_type & 0x7f) == XCB_MAP_NOTIFY &&
+                ((xcb_map_notify_event_t *)event)->window == window)
+                mapped = 1;
+            free(event);
+        }
+        if (mapped) {
+            xcb_get_window_attributes_reply_t *attributes = xcb_get_window_attributes_reply(
+                connection, xcb_get_window_attributes(connection, window), NULL);
+            int viewable = attributes && attributes->map_state == XCB_MAP_STATE_VIEWABLE;
+            free(attributes);
+            if (viewable)
+                return 0;
+        }
+        if (xcb_connection_has_error(connection) || clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+            goto fail;
+        long elapsed = (now.tv_sec - start.tv_sec) * 1000 +
+            (now.tv_nsec - start.tv_nsec) / 1000000;
+        if (elapsed >= 5000)
+            goto fail;
+        /* A WM may map the client before its parent; recheck viewability too. */
+        int timeout = (int)(5000 - elapsed);
+        if (timeout > 50)
+            timeout = 50;
+        int ready = poll(&descriptor, 1, timeout);
+        if (ready < 0 && errno != EINTR)
+            goto fail;
+        if (ready > 0 && (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)))
+            goto fail;
+    }
+fail:
+    fputs("THEKERNEL_Q35_XWAYLAND_GLAMOR_READY state=FAIL reason=map_viewable\n", stderr);
     return -1;
 }
 
@@ -57,7 +104,8 @@ int main(void)
     gc = xcb_generate_id(connection);
     window_values[0] = screen->black_pixel;
     window_values[1] = XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_KEY_PRESS |
-        XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_FOCUS_CHANGE;
+        XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_FOCUS_CHANGE |
+        XCB_EVENT_MASK_STRUCTURE_NOTIFY;
     if (checked(connection, xcb_create_window_checked(connection, XCB_COPY_FROM_PARENT,
                 background, screen->root, 64, 64, 320, 220, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
                 screen->root_visual, XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK, window_values), "map_background") < 0 ||
@@ -73,6 +121,7 @@ int main(void)
                 XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT, resize_values), "resize") < 0 ||
         checked(connection, xcb_configure_window_checked(connection, foreground,
                 XCB_CONFIG_WINDOW_STACK_MODE, &stack_mode), "raise_layer") < 0 ||
+        wait_viewable(connection, foreground) < 0 ||
         checked(connection, xcb_set_input_focus_checked(connection, XCB_INPUT_FOCUS_POINTER_ROOT,
                 foreground, XCB_CURRENT_TIME), "focus") < 0)
         goto fail;

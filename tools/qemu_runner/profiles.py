@@ -26,7 +26,7 @@ GRAPHICS_PROFILES = {
     "headless": GraphicsProfileTopology("none", "virtio-gpu-pci", "software"),
     "interactive": GraphicsProfileTopology("gtk", "virtio-gpu-pci", None),
     "virgl-headless": GraphicsProfileTopology("egl-headless,gl=on", "virtio-gpu-gl-pci", "virgl"),
-    "virgl-interactive": GraphicsProfileTopology("gtk,gl=on", "virtio-gpu-gl-pci", "virgl"),
+    "virgl-interactive": GraphicsProfileTopology("sdl,gl=on", "virtio-gpu-gl-pci", "virgl"),
     # Keep this ABI string exact.  The Venus rootfs verifies Vulkan
     # capability itself and must never fall back to the legacy Virgl device
     # configuration.

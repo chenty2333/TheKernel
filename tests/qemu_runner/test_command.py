@@ -157,7 +157,7 @@ class CommandTests(unittest.TestCase):
         headless_text = " ".join(headless)
         interactive_text = " ".join(interactive)
         self.assertIn("-display egl-headless,gl=on", headless_text)
-        self.assertIn("-display gtk,gl=on", interactive_text)
+        self.assertIn("-display sdl,gl=on", interactive_text)
         self.assertIn("virtio-gpu-gl-pci,max_outputs=1,xres=800,yres=600", headless_text)
         self.assertIn("virtio-gpu-gl-pci,max_outputs=1,xres=800,yres=600", interactive_text)
         self.assertNotIn("blob=on", headless_text)

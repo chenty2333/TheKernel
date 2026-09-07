@@ -16,8 +16,21 @@ start() {
 	start-stop-daemon --start --background --make-pidfile \
 		--pidfile "$PIDFILE" --exec "/sbin/$DAEMON" -- $UDEVD_ARGS
 	status=$?
-	[ "$status" -eq 0 ] && echo OK || echo FAIL
-	[ "$status" -eq 0 ] || return "$status"
+	[ "$status" -eq 0 ] || { echo FAIL; return "$status"; }
+
+	# start-stop-daemon returns before udevd binds its netlink monitor.
+	# eudev has no control --ping, and settle succeeds even with no daemon.
+	# This acknowledged control command runs only after the monitor is bound.
+	attempts=50
+	until udevadm control --timeout=1 --start-exec-queue >/dev/null 2>&1; do
+		attempts=$((attempts - 1))
+		if [ "$attempts" -eq 0 ]; then
+			echo 'FAIL (udevd control readiness timeout)'
+			return 1
+		fi
+		sleep 0.1
+	done
+	echo OK
 
 	# DRM and input policy must be committed before seatd/Weston start.  S90
 	# replays input once more to exercise the required lost-netlink rescan path.
