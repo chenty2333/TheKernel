@@ -291,12 +291,22 @@ validate_checked_in() {
             ;;
         q35-software-desktop)
             grep -qx 'BR2_ROOTFS_POST_BUILD_SCRIPT="@REPO_ROOT@/config/graphics/build-guest-tools.sh @REPO_ROOT@/config/graphics/build-q35-wayland-client.sh"' "$fragment"
+            grep -Fqx 'BR2_ROOTFS_DEVICE_TABLE="system/device_table.txt @REPO_ROOT@/config/graphics/desktop-permissions.table"' "$fragment"
+            [ -r "$REPO_ROOT/config/graphics/desktop-poweroff.c" ]
+            [ -r "$REPO_ROOT/config/graphics/desktop-permissions.table" ]
             grep -qx 'BR2_PACKAGE_WESTON_DEFAULT_DRM=y' "$fragment"
             grep -qx 'BR2_PACKAGE_PYTHON3=y' "$fragment"
+            for package in PCMANFM XAPP_XEDIT FEH SHARED_MIME_INFO XFONT_FONT_MISC_MISC XFONT_FONT_ALIAS; do
+                grep -qx "BR2_PACKAGE_${package}=y" "$fragment"
+            done
             flavor_br2_contract "$flavor" | require_br2_contract "$fragment"
             grep -qx 'xwayland=true' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/weston/weston-desktop.ini"
             [ -x "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/usr/local/bin/thekernel-desktop-terminal" ]
             sh -n "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/usr/local/bin/thekernel-desktop-terminal"
+            for wrapper in app xwayland; do
+                [ -x "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/usr/local/bin/thekernel-desktop-$wrapper" ]
+                sh -n "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/usr/local/bin/thekernel-desktop-$wrapper"
+            done
             grep -qx 'shell=desktop-shell.so' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/weston/weston-desktop.ini"
             grep -qx 'watch=false' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/weston/weston-desktop.ini"
             grep -qx 'q35-software-desktop' "$REPO_ROOT/config/graphics/overlay/q35-software-desktop/etc/thekernel-graphics-flavor"
@@ -440,7 +450,19 @@ validate_build_output() {
             [ -s "$target/usr/lib/locale/locale-archive" ]
             [ -x "$target/usr/bin/weston-terminal" ]
             [ -x "$target/usr/local/bin/thekernel-desktop-terminal" ]
+            [ -x "$target/usr/local/bin/thekernel-desktop-app" ]
+            [ -x "$target/usr/local/bin/thekernel-desktop-poweroff" ]
+            [ -x "$target/usr/local/bin/thekernel-desktop-xwayland" ]
+            for app in pcmanfm xedit feh python3; do
+                [ -x "$target/usr/bin/$app" ]
+            done
+            [ -r "$target/etc/xdg/mimeapps.list" ]
+            [ -r "$target/usr/share/applications/thekernel-editor.desktop" ]
+            [ -r "$target/usr/share/applications/thekernel-images.desktop" ]
             [ -r "$target/etc/weston/weston-desktop.ini" ]
+            while IFS= read -r icon; do
+                [ -r "$target$icon" ]
+            done < <(sed -n 's/^icon=//p' "$target/etc/weston/weston-desktop.ini")
             grep -qx 'BR2_PACKAGE_WESTON_DRM=y' "$resolved"
             flavor_br2_contract "$flavor" | require_br2_contract "$resolved"
             [ -x "$target/etc/init.d/S90q35-weston-smoke" ]

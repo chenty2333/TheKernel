@@ -34,10 +34,12 @@ automatically; `THEKERNEL_GRAPHICS_HOST_DEPS_DIR` can select another prefix.
 Buildroot keeps its own dependency check enabled. By default the wrapper leaves
 the system Perl, `PATH`, and `PERL5LIB` untouched, so Buildroot's own complete
 dependency check is authoritative. On a machine whose Perl was installed
-without the needed core modules, prepare a task-local prefix that supplies a
-`bin/perl` wrapper and a `lib/perl5` tree with those modules, then pass it as
-`--host-deps-dir`; the wrapper puts its `bin` first on `PATH` and its
-`lib/perl5` on `PERL5LIB`. No `sudo`, system package installation, or `BR2_*`
+without the needed development files, prepare a complete user-local Perl
+installation, including the CORE headers and ExtUtils typemap, and pass its
+prefix as `--host-deps-dir`. GTK dependencies compile native Perl modules,
+so a wrapper supplying only missing `.pm` files is insufficient. The build
+wrapper puts the prefix's `bin` first on `PATH` and its `lib/perl5` on
+`PERL5LIB`. No `sudo`, system package installation, or `BR2_*`
 dependency-check override is used.
 
 The first flavor includes libdrm, libevdev, libinput, libseat/seatd (daemon), Wayland,
@@ -97,13 +99,33 @@ unchanged.
 
 For an interactive desktop, run `make run-gui`. The `q35-software-desktop`
 image opens Weston's desktop shell and native terminal as the unprivileged
-`weston` user, with the session's Wayland runtime environment. The terminal
-starts in `/var/lib/weston`; click the terminal icon in the top panel to open
-another terminal after closing one. Closing a terminal leaves the desktop
-running. Exit QEMU with Ctrl+C in the host terminal or by closing its window.
-This flavor skips the startup graphics test workloads and automatic shutdown.
-It uses software rendering by default; it is a minimal desktop and terminal,
-not a bundled general-purpose desktop distribution.
+`weston` user, with the session's Wayland runtime environment. The top panel
+launches Terminal, Files (PCManFM), Text Editor (xedit), Images (feh), and Python.
+Applications start in `/var/lib/weston`.
+Double-click text files or PNG/JPEG images in Files to open them in the editor
+or image viewer. The Images launcher initially displays the supplied Wayland
+image; use Files to open your own pictures. Python runs its basic interactive
+interpreter in a native Weston terminal; PCManFM, xedit, and feh use rootless
+Xwayland. This software desktop disables X11 MIT-SHM because its SysV attach
+path fails for GTK clients; Xwayland still presents through Wayland shared
+memory. Closing an
+application leaves the desktop running. This flavor skips startup graphics
+test workloads and automatic shutdown and uses software rendering by default.
+
+The first `run-gui` invocation creates a 1 GiB sparse ext4 user disk at
+`${XDG_DATA_HOME:-~/.local/share}/thekernel/desktop/home.ext4`; subsequent runs
+reuse it without formatting. It is mounted at `/var/lib/weston` before Weston
+starts, and the desktop refuses to start if the mount fails. Documents,
+Pictures, and Downloads are created there on first use. The system rootfs
+remains a disposable snapshot, so new application builds do not replace user
+files. The default user disk is outside the build cache and `make clean`.
+Pass `make run-gui RUN_ARGS="--home-disk /path/to/home.ext4"` to choose another
+disk; `run-gui` reserves the extra block device for this purpose.
+
+Save edited files and click **Shut Down** in the top panel for normal exit.
+Its fixed-purpose privileged helper asks BusyBox init to stop the session,
+sync and unmount the user disk, and power off. Directly closing QEMU or killing
+its process behaves like removing power and can lose pending guest writes.
 
 `q35-graphics-seatd` is the canonical BusyBox/eudev + seatd + Weston
 desktop-shell + foot + rootless Xwayland image.  It contains Mesa softpipe,

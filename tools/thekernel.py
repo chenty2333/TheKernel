@@ -600,7 +600,40 @@ def build_desktop_rootfs(artifacts: Artifacts) -> Path:
     return output / "images" / "rootfs.ext2"
 
 
+def prepare_desktop_home(path: Path | None = None) -> Path:
+    if path is None:
+        data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+        path = data_home / "thekernel" / "desktop" / "home.ext4"
+    path = path.expanduser().resolve()
+    validate_storage(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with state_lock(path.name, root=path.parent):
+        if path.exists():
+            if not path.is_file():
+                raise ProductError(f"desktop home disk is not a file: {path}")
+            return path
+        mkfs = shutil.which("mkfs.ext4")
+        if mkfs is None:
+            raise ProductError("mkfs.ext4 is required to create the desktop home disk")
+        with tempfile.NamedTemporaryFile(prefix=".home-", suffix=".ext4", dir=path.parent) as image:
+            image.truncate(1024 * 1024 * 1024)
+            image.flush()
+            run_checked([mkfs, "-q", "-F", "-L", "thekernel-home", "-O",
+                         "^64bit,^metadata_csum_seed,^orphan_file", image.name])
+            os.fsync(image.fileno())
+            # Publish only the fully formatted image, without replacing data
+            # even if an external creator ignored our per-image lock.
+            try:
+                os.link(image.name, path)
+            except FileExistsError:
+                if not path.is_file():
+                    raise ProductError(f"desktop home disk is not a file: {path}")
+    return path
+
+
 def run_gui_cmd(args: argparse.Namespace) -> int:
+    if args.extra_block:
+        raise ProductError("run-gui reserves the extra disk for persistent home; use --home-disk")
     artifacts = Artifacts(state_root(), parse_variant(args), "system")
     resolve_run_cpus(args.smp, args.run_cpus)
     if not args.rootfs:
@@ -608,6 +641,7 @@ def run_gui_cmd(args: argparse.Namespace) -> int:
         if not args.no_build:
             rootfs = build_desktop_rootfs(artifacts)
         args.rootfs = str(rootfs)
+    args.extra_block = str(prepare_desktop_home(Path(args.home_disk) if args.home_disk else None))
     return run_cmd(args)
 
 
@@ -1498,6 +1532,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     gui_parser = sub.add_parser("run-gui", help="build and boot the interactive Weston desktop")
     add_run_arguments(gui_parser)
+    gui_parser.add_argument("--home-disk", help="persistent desktop home image (created once if missing)")
     gui_parser.set_defaults(func=run_gui_cmd, profile="system", interactive=True,
                             graphics_profile="interactive", rootfs_transport="drive")
 

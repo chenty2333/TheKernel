@@ -35,3 +35,12 @@ done
 # Intentional word splitting: each installed path is space-joined above.
 # shellcheck disable=SC2086
 chmod 0755 $installed
+
+# The interactive desktop lets its unprivileged user request a normal init
+# shutdown. The desktop permission table grants only this fixed helper setuid.
+if grep -qx q35-software-desktop "$target/etc/thekernel-graphics-flavor"; then
+    "$compiler" -O2 -std=c11 -Wall -Wextra -Werror \
+        "$source_dir/config/graphics/desktop-poweroff.c" \
+        -o "$target/usr/local/bin/thekernel-desktop-poweroff"
+    chmod 0755 "$target/usr/local/bin/thekernel-desktop-poweroff"
+fi

@@ -37,11 +37,12 @@ use crate::{
 const BUF_SIZE: usize = TCP_TX_BUF_LEN;
 const STREAM_ANCILLARY_SEGMENTS: usize = 256;
 
-/// A control-bearing stream byte interval. It is queued under the same
-/// channel lock as the producer ring, so its start offset is never visible to
-/// the receiver before the corresponding bytes have been committed.
+/// A control-bearing stream byte interval. Publish this before committing its
+/// ring bytes; the receiver snapshots occupied bytes before inspecting metadata.
+/// The endpoint locks are distinct and do not synchronize the two peers.
 struct AncillarySegment {
     start: usize,
+    end: usize,
     cmsg: Vec<crate::CMsgData>,
 }
 
@@ -912,9 +913,6 @@ impl TransportOps for StreamTransport {
                         }
                         count += second;
                     }
-                    // SAFETY: Validated counts cover only initialized vacant
-                    // slots; no other producer can advance this channel's index.
-                    unsafe { tx.advance_write_index(count) };
                     count
                 };
                 if count != 0 {
@@ -923,11 +921,17 @@ impl TransportOps for StreamTransport {
                         segment
                             .send(AncillarySegment {
                                 start,
+                                end: chan.tx_offset,
                                 cmsg: core::mem::take(&mut options.cmsg),
                             })
                             .map_err(|_| AxError::BrokenPipe)?;
                     }
                 }
+                // The release publication of bytes must follow ancillary
+                // publication: the receiver uses a different endpoint mutex.
+                // SAFETY: Validated counts cover only initialized vacant slots;
+                // this endpoint owns the sole producer.
+                unsafe { tx.advance_write_index(count) };
                 total += count;
                 let poll_update = (count > 0).then(|| chan.poll_update.clone());
                 let result = finish_stream_send(total, size, effective_nonblocking);
@@ -965,7 +969,22 @@ impl TransportOps for StreamTransport {
                 };
 
                 let count = {
+                    // Snapshot the ring first: its acquire load pairs with the
+                    // sender's publication after enqueueing ancillary metadata.
                     let (left, right) = rx.as_slices();
+                    let available = left.len() + right.len();
+                    let limit = chan
+                        .segments_rx
+                        .as_ref()
+                        .and_then(|segments| {
+                            segments.with_front(|segment| segment.end.wrapping_sub(chan.rx_offset))
+                        })
+                        .unwrap_or(available)
+                        .min(available);
+                    // Linux includes preceding plain bytes, but stops after the
+                    // first control-bearing interval, even with room remaining.
+                    let left = &left[..left.len().min(limit)];
+                    let right = &right[..right.len().min(limit - left.len())];
                     let mut count = dst.write(left)?;
                     if count > left.len() {
                         return Err(AxError::InvalidInput);
@@ -991,7 +1010,7 @@ impl TransportOps for StreamTransport {
                 if count != 0 {
                     if let Some(segments) = chan.segments_rx.as_ref()
                         && segments
-                            .with_front(|segment| segment.start == cmsg_start)
+                            .with_front(|segment| segment.start.wrapping_sub(cmsg_start) < count)
                             .unwrap_or(false)
                     {
                         let reservation = segments
@@ -1174,6 +1193,197 @@ mod tests {
 
     use super::*;
     use crate::SendFlags;
+
+    #[test]
+    fn stream_ancillary_barrier_includes_preceding_plain_bytes() {
+        let (left, right) = StreamTransport::new_pair(SocketCredentials::UNKNOWN).unwrap();
+        left.send(&b"plain"[..], SendOptions::default()).unwrap();
+        left.send(
+            &b"fd"[..],
+            SendOptions {
+                cmsg: alloc::vec![crate::CMsgData::new(Box::new(42u32), 1)],
+                ..SendOptions::default()
+            },
+        )
+        .unwrap();
+        left.send(&b"tail"[..], SendOptions::default()).unwrap();
+        let mut bytes = [0; 32];
+        let mut control = Vec::new();
+        let count = right
+            .recv(
+                &mut bytes[..],
+                RecvOptions {
+                    flags: RecvFlags::DONT_WAIT,
+                    cmsg: Some(&mut control),
+                    ..RecvOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(&bytes[..count], b"plainfd");
+        assert_eq!(control.len(), 1);
+        assert_eq!(*control.pop().unwrap().downcast::<u32>().ok().unwrap(), 42);
+        let count = right
+            .recv(
+                &mut bytes[..],
+                RecvOptions {
+                    flags: RecvFlags::DONT_WAIT,
+                    ..RecvOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(&bytes[..count], b"tail");
+    }
+
+    #[test]
+    fn stream_ancillary_short_reads_peek_and_multiple_segments() {
+        let (left, right) = StreamTransport::new_pair(SocketCredentials::UNKNOWN).unwrap();
+        // Exercise wrapping stream offsets as well as the two physical ring slices.
+        {
+            let mut left_guard = left.channel.lock();
+            let mut right_guard = right.channel.lock();
+            let left_channel = left_guard.as_mut().unwrap();
+            let right_channel = right_guard.as_mut().unwrap();
+            left_channel.tx_offset = usize::MAX - 2;
+            right_channel.rx_offset = usize::MAX - 2;
+            let padding = alloc::vec![0u8; BUF_SIZE - 2];
+            assert_eq!(
+                left_channel.tx.as_mut().unwrap().push_slice(&padding),
+                padding.len()
+            );
+            let mut discarded = alloc::vec![0u8; padding.len()];
+            assert_eq!(
+                right_channel.rx.as_mut().unwrap().pop_slice(&mut discarded),
+                padding.len()
+            );
+        }
+        left.send(&b"ab"[..], SendOptions::default()).unwrap();
+        for (data, value) in [(&b"cd"[..], 1u32), (&b"ef"[..], 2u32)] {
+            left.send(
+                data,
+                SendOptions {
+                    cmsg: alloc::vec![
+                        crate::CMsgData::new_peekable(Box::new(value), 1, |v| Ok(*v)).unwrap()
+                    ],
+                    ..SendOptions::default()
+                },
+            )
+            .unwrap();
+        }
+        let mut bytes = [0; 16];
+        let mut control = Vec::new();
+        // Ending exactly before the first FD byte must leave its custody queued.
+        assert_eq!(
+            right
+                .recv(
+                    &mut bytes[..2],
+                    RecvOptions {
+                        flags: RecvFlags::DONT_WAIT,
+                        cmsg: Some(&mut control),
+                        ..RecvOptions::default()
+                    }
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(&bytes[..2], b"ab");
+        assert!(control.is_empty());
+        for _ in 0..2 {
+            assert_eq!(
+                right
+                    .recv(
+                        &mut bytes[..],
+                        RecvOptions {
+                            flags: RecvFlags::DONT_WAIT | RecvFlags::PEEK,
+                            cmsg: Some(&mut control),
+                            ..RecvOptions::default()
+                        }
+                    )
+                    .unwrap(),
+                2
+            );
+            assert_eq!(&bytes[..2], b"cd");
+            assert_eq!(control.len(), 1);
+            assert_eq!(*control.pop().unwrap().downcast::<u32>().ok().unwrap(), 1);
+        }
+        // A partial control interval returns its FD once, on the first byte.
+        assert_eq!(
+            right
+                .recv(
+                    &mut bytes[..1],
+                    RecvOptions {
+                        flags: RecvFlags::DONT_WAIT,
+                        cmsg: Some(&mut control),
+                        ..RecvOptions::default()
+                    }
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(&bytes[..1], b"c");
+        assert_eq!(control.len(), 1);
+        assert_eq!(*control.pop().unwrap().downcast::<u32>().ok().unwrap(), 1);
+        assert_eq!(
+            right
+                .recv(
+                    &mut bytes[..],
+                    RecvOptions {
+                        flags: RecvFlags::DONT_WAIT,
+                        cmsg: Some(&mut control),
+                        ..RecvOptions::default()
+                    }
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(&bytes[..3], b"def");
+        assert_eq!(control.len(), 1);
+        assert_eq!(*control.pop().unwrap().downcast::<u32>().ok().unwrap(), 2);
+    }
+
+    #[test]
+    fn stream_ancillary_plain_read_discards_only_reached_control() {
+        let (left, right) = StreamTransport::new_pair(SocketCredentials::UNKNOWN).unwrap();
+        left.send(&b"a"[..], SendOptions::default()).unwrap();
+        for value in [1u32, 2u32] {
+            left.send(
+                &b"b"[..],
+                SendOptions {
+                    cmsg: alloc::vec![crate::CMsgData::new(Box::new(value), 1)],
+                    ..SendOptions::default()
+                },
+            )
+            .unwrap();
+        }
+        let mut bytes = [0; 16];
+        assert_eq!(
+            right
+                .recv(
+                    &mut bytes[..],
+                    RecvOptions {
+                        flags: RecvFlags::DONT_WAIT,
+                        ..RecvOptions::default()
+                    }
+                )
+                .unwrap(),
+            2
+        );
+        let mut control = Vec::new();
+        assert_eq!(
+            right
+                .recv(
+                    &mut bytes[..],
+                    RecvOptions {
+                        flags: RecvFlags::DONT_WAIT,
+                        cmsg: Some(&mut control),
+                        ..RecvOptions::default()
+                    }
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(control.len(), 1);
+        assert_eq!(*control.pop().unwrap().downcast::<u32>().ok().unwrap(), 2);
+    }
 
     #[test]
     fn safe_io_implementations_cannot_corrupt_stream_ring() {

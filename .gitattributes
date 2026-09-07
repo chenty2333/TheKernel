@@ -16,6 +16,9 @@
 *.cpp text eol=lf
 *.hpp text eol=lf
 
+# Unified-diff context prefixes can precede source tabs or empty lines.
+config/graphics/patches/** whitespace=-blank-at-eol,-space-before-tab
+
 # Binary files
 *.bin binary
 *.elf binary
@@ -26,4 +29,3 @@
 
 # Script files (keep executable)
 *.sh text eol=lf
-

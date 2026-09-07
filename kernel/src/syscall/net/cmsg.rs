@@ -110,6 +110,33 @@ pub(crate) fn collect_scm_rights_cycles() {
             }
         }
     }
+    // A live queue owner is a root even when that socket was never itself
+    // transferred as an SCM target. Otherwise closing a sent shm file can
+    // make its sole queued reference appear unreachable before recvmsg.
+    for weak in graph.iter() {
+        let Some(node) = weak.upgrade() else {
+            continue;
+        };
+        if let Some(owner) = node.owner.lock().upgrade() {
+            let id = owner.id().get();
+            let edges = incoming
+                .iter()
+                .find(|(known, _)| *known == id)
+                .map(|(_, count)| *count)
+                .unwrap_or(0);
+            // Unlike the borrowed target above, upgrading the weak owner adds
+            // one temporary strong reference. It must not root a dead cycle.
+            if (owner.has_live_descriptor_references()
+                || Arc::strong_count(&owner).saturating_sub(1) > edges)
+                && !marked.contains(&id)
+            {
+                if marked.try_reserve(1).is_err() {
+                    return;
+                }
+                marked.push(id);
+            }
+        }
+    }
     let mut changed = true;
     while changed {
         changed = false;
@@ -729,6 +756,89 @@ mod tests {
     use super::*;
 
     static SCM_ACCOUNT_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+    struct GraphTestFile;
+
+    impl axpoll::Pollable for GraphTestFile {
+        fn poll(&self) -> axpoll::IoEvents {
+            axpoll::IoEvents::empty()
+        }
+
+        fn register<'a>(
+            &'a self,
+            _context: &mut core::task::Context<'_>,
+            _events: axpoll::IoEvents,
+        ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+            axpoll::PollRegistration::empty()
+        }
+    }
+
+    impl crate::file::FileLike for GraphTestFile {
+        fn stat(&self) -> AxResult<crate::file::Kstat> {
+            Err(AxError::InvalidInput)
+        }
+
+        fn path(&self) -> AxResult<alloc::borrow::Cow<'_, axfs_ng_vfs::FsPath>> {
+            Ok(alloc::borrow::Cow::Borrowed(axfs_ng_vfs::FsPath::new(
+                b"scm-graph-test",
+            )))
+        }
+
+        fn set_nonblocking(&self, _nonblocking: bool) -> AxResult {
+            Ok(())
+        }
+    }
+
+    fn graph_test_description() -> Arc<FileDescription> {
+        let description = FileDescription::new(Arc::new(GraphTestFile)).unwrap();
+        description.begin_descriptor_publication().unwrap().commit();
+        description
+    }
+
+    #[test]
+    fn live_scm_owner_preserves_rights_after_original_file_closes() {
+        let _guard = SCM_ACCOUNT_TEST_LOCK.lock();
+        let owner = graph_test_description();
+        let transferred = graph_test_description();
+        let id = transferred.id();
+        let graph = register_rights_graph(alloc::vec![transferred.acquire_scm_custody()]).unwrap();
+        *graph.owner.lock() = Arc::downgrade(&owner);
+        // A Wayland client sends a newly created shm file and closes its
+        // original descriptor before the compositor imports the queued FD.
+        // The live socket owner need never itself appear as a queued target.
+        transferred.descriptor_closed();
+        drop(transferred);
+        collect_scm_rights_cycles();
+        assert_eq!(graph.fds.lock().len(), 1);
+        assert_eq!(graph.fds.lock()[0].description().id(), id);
+
+        owner.descriptor_closed();
+        // A retained non-fd owner (for example an in-flight operation) also
+        // remains a root until that independent reference is released.
+        collect_scm_rights_cycles();
+        assert_eq!(graph.fds.lock().len(), 1);
+        drop(owner);
+        collect_scm_rights_cycles();
+        assert!(graph.fds.lock().is_empty());
+    }
+
+    #[test]
+    fn scm_owner_root_does_not_keep_an_unreachable_cycle_alive() {
+        let _guard = SCM_ACCOUNT_TEST_LOCK.lock();
+        let left = graph_test_description();
+        let right = graph_test_description();
+        let to_right = register_rights_graph(alloc::vec![right.acquire_scm_custody()]).unwrap();
+        let to_left = register_rights_graph(alloc::vec![left.acquire_scm_custody()]).unwrap();
+        *to_right.owner.lock() = Arc::downgrade(&left);
+        *to_left.owner.lock() = Arc::downgrade(&right);
+        left.descriptor_closed();
+        right.descriptor_closed();
+        drop(left);
+        drop(right);
+        collect_scm_rights_cycles();
+        assert!(to_right.fds.lock().is_empty());
+        assert!(to_left.fds.lock().is_empty());
+    }
 
     #[test]
     fn cmsg_lengths_match_linux_native_alignment() {

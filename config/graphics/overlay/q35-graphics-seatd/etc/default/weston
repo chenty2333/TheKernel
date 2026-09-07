@@ -1,0 +1,2 @@
+# The smoke image uses its rootfs home and requires no persistent disk.
+WESTON_HOME_MOUNT=

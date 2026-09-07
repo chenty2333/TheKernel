@@ -9,6 +9,8 @@ UID=$(id -u "$USER")
 RUNTIME_DIR=/run/user/$UID
 PIDFILE=/run/weston.pid
 SESSION=/usr/local/bin/graphics-session
+WESTON_HOME_MOUNT=
+[ ! -r /etc/default/weston ] || . /etc/default/weston
 
 running() {
     pid_from_file >/dev/null 2>&1 && kill -0 "$(pid_from_file)" 2>/dev/null
@@ -35,6 +37,10 @@ wait_for_exit() {
 
 start() {
     running && return 0
+    if [ -n "$WESTON_HOME_MOUNT" ] && ! mountpoint -q "$WESTON_HOME_MOUNT"; then
+        echo "Cannot start desktop: persistent home disk is not mounted" >&2
+        return 1
+    fi
     mkdir -p "$RUNTIME_DIR"
     chown "$USER:$USER" "$RUNTIME_DIR"
     chmod 0700 "$RUNTIME_DIR"

@@ -72,14 +72,18 @@ make docker-clean  # remove the dev container volume and local image
 
 `make run-gui` builds the graphics userspace on its first run (Buildroot and
 package downloads can take a while), then uses incremental builds. It opens
-a Weston desktop with its native terminal; the panel's terminal launcher opens
-another after you close it. This session stays running and does not launch
-the graphics smoke tests. Close the QEMU window or press Ctrl+C in the host
-terminal to exit. Use `make run-gui RUN_ARGS=--no-build` to reuse the current
-images without rebuilding. See [graphics rootfs](docs/graphics-rootfs.md) for
-build dependencies and cache options.
-Like the other QEMU runs, the desktop uses a temporary disk snapshot: guest
-file changes are discarded when QEMU exits.
+a Weston desktop with launchers for a terminal, file manager, text editor,
+image viewer, and Python. Save your work and use the panel's
+Shut Down button to flush files and exit. Closing QEMU directly or pressing
+Ctrl+C forcibly stops the guest and can lose pending writes.
+Use `make run-gui RUN_ARGS=--no-build` to reuse the current images without
+rebuilding. See [graphics rootfs](docs/graphics-rootfs.md) for build dependencies
+and cache options.
+The desktop home at `/var/lib/weston`, including Documents, Pictures, and
+Downloads, lives on a persistent disk at
+`${XDG_DATA_HOME:-~/.local/share}/thekernel/desktop/home.ext4`. Rebuilding the
+system or running `make clean` preserves this default user disk. The rest of
+the root filesystem uses a temporary snapshot; changes there are discarded.
 
 Kernel output is captured separately from the user terminal in `kernel.log`.
 See [kernel diagnostics and request tracing](docs/debugging.md) for runtime log

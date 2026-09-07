@@ -1,0 +1,30 @@
+#!/bin/sh
+# Panel launchers and file associations share the compositor's user session.
+set -eu
+export LANG=C.UTF-8
+export HOME=/var/lib/weston
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+export WAYLAND_DISPLAY=wayland-0
+cd "$HOME"
+app=${1:-terminal}
+[ "$#" -eq 0 ] || shift
+case "$app" in
+    terminal) exec /usr/bin/weston-terminal --maximized --shell=/bin/sh ;;
+    files)
+        [ "$#" -gt 0 ] || set -- "$HOME"
+        # PCManFM 1.3.2 uses X11 screen APIs even for ordinary file windows.
+        export GDK_BACKEND=x11
+        exec /usr/bin/pcmanfm "$@"
+        ;;
+    editor) exec /usr/bin/xedit "$@" ;;
+    images)
+        [ "$#" -gt 0 ] || set -- /usr/share/weston/wayland.png
+        exec /usr/bin/feh --scale-down --auto-zoom "$@"
+        ;;
+    python)
+        export PYTHON_BASIC_REPL=1
+        exec /usr/bin/weston-terminal --shell=/usr/bin/python3
+        ;;
+    shutdown) exec /usr/local/bin/thekernel-desktop-poweroff ;;
+    *) printf 'Unknown desktop application: %s\n' "$app" >&2; exit 2 ;;
+esac

@@ -839,6 +839,103 @@ fn build_dirent(
     Ok(record)
 }
 
+fn copy_dirents<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    buf: *mut u8,
+    count: usize,
+    format: DirentFormat,
+    dir_offset: &mut u64,
+    mut read_dir: impl FnMut(u64, &mut dyn axfs_ng_vfs::DirEntrySink) -> AxResult<usize>,
+    mut has_signal: impl FnMut() -> bool,
+) -> AxResult<isize> {
+    // Filesystems may hold their own locks while invoking the sink. Usercopy
+    // acquires AddrSpace and may fault a file-backed mapping, so it must run
+    // after read_dir returns. Bound staging independently of the user's count.
+    const BATCH_ENTRIES: usize = 32;
+    let mut batch = Vec::new();
+    batch
+        .try_reserve_exact(BATCH_ENTRIES)
+        .map_err(|_| AxError::NoMemory)?;
+    let mut copied = 0;
+    let mut stop_error = None;
+    let mut stopped_for_space = false;
+    let mut last_reclen = 0;
+
+    let iteration = 'batches: loop {
+        batch.clear();
+        let mut staged = 0;
+        let mut full_batch = false;
+        let iteration = read_dir(*dir_offset, &mut |name: &FsName, ino, node_type, offset| {
+            let record_len = match dirent_record_len(format, name.as_bytes()) {
+                Ok(record_len) => record_len,
+                Err(error) => {
+                    stop_error = Some(error);
+                    return false;
+                }
+            };
+            if !getdents_has_room(count, copied + staged, record_len) {
+                stopped_for_space = true;
+                return false;
+            }
+            let mut record = Vec::new();
+            if let Err(error) =
+                fill_dirent(&mut record, format, ino, offset, node_type, name.as_bytes())
+            {
+                stop_error = Some(error);
+                return false;
+            }
+            staged += record.len();
+            batch.push((offset, record));
+            full_batch = batch.len() == BATCH_ENTRIES;
+            !full_batch
+        });
+
+        for (offset, record) in &batch {
+            // Linux only checks signals between already completed records.
+            if copied != 0 && has_signal() {
+                break 'batches iteration;
+            }
+            // Any failure from the user-memory provider is EFAULT for this
+            // copyout, including provider-side allocation failures. Commit
+            // only copied records, not the iterator's speculative batch end.
+            if vm_write_slice(memory, buf.wrapping_add(copied), record).is_err() {
+                stop_error = Some(AxError::BadAddress);
+                break 'batches iteration;
+            }
+            *dir_offset = *offset;
+            copied += record.len();
+            last_reclen = record.len();
+        }
+        if iteration.is_err() || stop_error.is_some() || stopped_for_space || !full_batch {
+            break iteration;
+        }
+    };
+
+    if copied != 0 {
+        // Linux performs a final checked d_off store after iteration. A
+        // concurrent mprotect/unmap may therefore turn an otherwise
+        // successful prefix into EFAULT, while the OFD cookie remains
+        // committed to the last copied record.
+        let final_offset = match format {
+            DirentFormat::Legacy => dir_offset.to_ne_bytes(),
+            DirentFormat::Dirent64 => (*dir_offset as i64).to_ne_bytes(),
+        };
+        let last_d_off = buf.wrapping_add(copied - last_reclen + 8);
+        vm_write_slice(memory, last_d_off, &final_offset)
+            .map(|_| copied as isize)
+            .map_err(|_| AxError::BadAddress)
+    } else {
+        match iteration {
+            Err(error) => Err(error),
+            Ok(_) => match stop_error {
+                Some(error) => Err(error),
+                None if stopped_for_space => Err(AxError::InvalidInput),
+                None => Ok(0),
+            },
+        }
+    }
+}
+
 fn sys_getdents_common<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     fd: i32,
@@ -852,75 +949,15 @@ fn sys_getdents_common<M: UserMemory + ?Sized>(
         return Err(AxError::NotFound);
     }
 
-    let count = getdents_count(count);
-    let result = {
-        let mut dir_offset = dir.offset.lock();
-        let mut copied = 0;
-        let mut stop_error = None;
-        let mut stopped_for_space = false;
-        let mut record = Vec::new();
-        let mut last_reclen = 0;
-
-        let iteration = dir.read_dir(*dir_offset, &mut |name: &FsName, ino, node_type, offset| {
-            // Linux only checks signals between already completed records.
-            if copied != 0 && has_pending_syscall_signal(current().as_thread()) {
-                return false;
-            }
-
-            let record_len = match dirent_record_len(format, name.as_bytes()) {
-                Ok(record_len) => record_len,
-                Err(error) => {
-                    stop_error = Some(error);
-                    return false;
-                }
-            };
-            if !getdents_has_room(count, copied, record_len) {
-                stopped_for_space = true;
-                return false;
-            }
-            if let Err(error) =
-                fill_dirent(&mut record, format, ino, offset, node_type, name.as_bytes())
-            {
-                stop_error = Some(error);
-                return false;
-            }
-
-            // Any failure from the user-memory provider is EFAULT for this
-            // copyout, including provider-side allocation failures.
-            if vm_write_slice(memory, buf.wrapping_add(copied), &record).is_err() {
-                stop_error = Some(AxError::BadAddress);
-                return false;
-            }
-            *dir_offset = offset;
-            copied += record.len();
-            last_reclen = record.len();
-            true
-        });
-
-        if copied != 0 {
-            // Linux performs a final checked d_off store after iteration. A
-            // concurrent mprotect/unmap may therefore turn an otherwise
-            // successful prefix into EFAULT, while the OFD cookie remains
-            // committed to the last copied record.
-            let final_offset = match format {
-                DirentFormat::Legacy => dir_offset.to_ne_bytes(),
-                DirentFormat::Dirent64 => (*dir_offset as i64).to_ne_bytes(),
-            };
-            let last_d_off = buf.wrapping_add(copied - last_reclen + 8);
-            vm_write_slice(memory, last_d_off, &final_offset)
-                .map(|_| copied as isize)
-                .map_err(|_| AxError::BadAddress)
-        } else {
-            match iteration {
-                Err(error) => Err(error),
-                Ok(_) => match stop_error {
-                    Some(error) => Err(error),
-                    None if stopped_for_space => Err(AxError::InvalidInput),
-                    None => Ok(0),
-                },
-            }
-        }
-    };
+    let result = copy_dirents(
+        memory,
+        buf,
+        getdents_count(count),
+        format,
+        &mut dir.offset.lock(),
+        |offset, sink| dir.read_dir(offset, sink),
+        || has_pending_syscall_signal(current().as_thread()),
+    );
 
     // Linux marks every live-directory iteration as an access, including an
     // empty result, EINVAL/EFAULT from the actor, or an iterator error.
@@ -2296,6 +2333,139 @@ mod tests {
             valid[1],
         ];
         assert!(legacy_futimesat_pair(negative_seconds).is_ok());
+    }
+
+    struct GetdentsMemory<'a> {
+        iterating: &'a Cell<bool>,
+        bytes: Vec<u8>,
+        calls: usize,
+        fail_call: Option<usize>,
+    }
+
+    // SAFETY: The fixture accesses only its owned byte vector after checking
+    // the requested range, and never dereferences a userspace address.
+    unsafe impl UserMemory for GetdentsMemory<'_> {
+        fn read(
+            &mut self,
+            _start: usize,
+            _dst: &mut [MaybeUninit<u8>],
+        ) -> Result<(), UserCopyError> {
+            Err(UserCopyError::BadAddress)
+        }
+
+        fn write(&mut self, start: usize, src: &[u8]) -> Result<(), UserCopyError> {
+            self.calls += 1;
+            // Usercopy may fault a file-backed mapping, requiring the same
+            // filesystem lock held by the directory iterator.
+            if self.iterating.get() || self.fail_call == Some(self.calls) {
+                return Err(UserCopyError::BadAddress);
+            }
+            let end = start
+                .checked_add(src.len())
+                .ok_or(UserCopyError::BadAddress)?;
+            self.bytes
+                .get_mut(start..end)
+                .ok_or(UserCopyError::BadAddress)?
+                .copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    fn getdents_test_directory(
+        iterating: &Cell<bool>,
+        offset: u64,
+        entries: u64,
+        sink: &mut dyn axfs_ng_vfs::DirEntrySink,
+    ) -> AxResult<usize> {
+        iterating.set(true);
+        let mut accepted = 0;
+        for entry in offset..entries {
+            if !sink.accept(
+                FsName::new(b"entry"),
+                entry + 1,
+                NodeType::RegularFile,
+                entry + 1,
+            ) {
+                break;
+            }
+            accepted += 1;
+        }
+        iterating.set(false);
+        Ok(accepted)
+    }
+
+    #[test]
+    fn getdents_copyout_runs_after_filesystem_iteration_unlocks() {
+        for format in [DirentFormat::Legacy, DirentFormat::Dirent64] {
+            let iterating = Cell::new(false);
+            let mut provider = GetdentsMemory {
+                iterating: &iterating,
+                bytes: vec![0; 4096],
+                calls: 0,
+                fail_call: None,
+            };
+            let mut memory = UserMemoryContext::new(&mut provider);
+            let mut offset = 0;
+            let result = copy_dirents(
+                &mut memory,
+                core::ptr::null_mut(),
+                4096,
+                format,
+                &mut offset,
+                |offset, sink| getdents_test_directory(&iterating, offset, 40, sink),
+                || false,
+            );
+            let reclen = dirent_record_len(format, b"entry").unwrap();
+            assert_eq!(result, Ok((40 * reclen) as isize));
+            assert_eq!(offset, 40);
+            assert_eq!(
+                u64::from_ne_bytes(provider.bytes[8..16].try_into().unwrap()),
+                1
+            );
+            assert_eq!(
+                u64::from_ne_bytes(
+                    provider.bytes[39 * reclen + 8..39 * reclen + 16]
+                        .try_into()
+                        .unwrap()
+                ),
+                40
+            );
+        }
+    }
+
+    #[test]
+    fn getdents_staged_copy_preserves_partial_fault_and_cookie_semantics() {
+        for format in [DirentFormat::Legacy, DirentFormat::Dirent64] {
+            for (fail_call, count, signal, expected, expected_offset) in [
+                (Some(1), 4096, false, Err(AxError::BadAddress), 0),
+                (Some(2), 4096, false, Ok(32), 1),
+                (Some(4), 4096, false, Err(AxError::BadAddress), 3),
+                (None, 31, false, Err(AxError::InvalidInput), 0),
+                (None, 64, false, Ok(64), 2),
+                (None, 4096, true, Ok(32), 1),
+            ] {
+                let iterating = Cell::new(false);
+                let mut provider = GetdentsMemory {
+                    iterating: &iterating,
+                    bytes: vec![0; 4096],
+                    calls: 0,
+                    fail_call,
+                };
+                let mut memory = UserMemoryContext::new(&mut provider);
+                let mut offset = 0;
+                let result = copy_dirents(
+                    &mut memory,
+                    core::ptr::null_mut(),
+                    count,
+                    format,
+                    &mut offset,
+                    |offset, sink| getdents_test_directory(&iterating, offset, 3, sink),
+                    || signal,
+                );
+                assert_eq!(result, expected);
+                assert_eq!(offset, expected_offset);
+            }
+        }
     }
 
     #[test]

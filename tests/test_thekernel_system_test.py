@@ -586,5 +586,74 @@ class SystemTestGateTests(unittest.TestCase):
             self.assertEqual(observed["config"].workdir, workdir.resolve())
 
 
+class DesktopHomeTests(unittest.TestCase):
+    def test_new_home_disk_is_ext4_and_reused_without_reformatting(self):
+        product = load_product()
+        if product.shutil.which("mkfs.ext4") is None:
+            self.skipTest("mkfs.ext4 unavailable")
+        with test_tmpdir() as directory:
+            disk = Path(directory) / "home.ext4"
+            self.assertEqual(product.prepare_desktop_home(disk), disk)
+            self.assertEqual(disk.stat().st_size, 1024 * 1024 * 1024)
+            with disk.open("rb") as image:
+                image.seek(1024 + 56)
+                self.assertEqual(image.read(2), b"\x53\xef")
+            initial_inode = disk.stat().st_ino
+            with patch.object(product, "run_checked") as format_disk:
+                self.assertEqual(product.prepare_desktop_home(disk), disk)
+                format_disk.assert_not_called()
+            self.assertEqual(disk.stat().st_ino, initial_inode)
+
+    def test_home_creation_failure_leaves_no_partial_disk(self):
+        product = load_product()
+        with test_tmpdir() as directory:
+            disk = Path(directory) / "home.ext4"
+            with patch.object(product.shutil, "which", return_value="mkfs.ext4"), \
+                    patch.object(product, "run_checked", side_effect=product.ProductError("format failed")):
+                with self.assertRaisesRegex(product.ProductError, "format failed"):
+                    product.prepare_desktop_home(disk)
+            self.assertFalse(disk.exists())
+            self.assertEqual(list(disk.parent.glob(".home-*")), [])
+
+    def test_home_creation_never_overwrites_external_creator(self):
+        product = load_product()
+        with test_tmpdir() as directory:
+            disk = Path(directory) / "home.ext4"
+            with patch.object(product.shutil, "which", return_value="mkfs.ext4"), \
+                    patch.object(product, "run_checked", side_effect=lambda _: disk.write_bytes(b"existing data")):
+                product.prepare_desktop_home(disk)
+            self.assertEqual(disk.read_bytes(), b"existing data")
+
+    def test_run_gui_wires_persistent_home_as_extra_disk(self):
+        product = load_product()
+        args = product.build_parser().parse_args([
+            "run-gui", "--no-build", "--rootfs", "/home/example/rootfs.ext2",
+            "--home-disk", "/home/example/home.ext4",
+        ])
+        with patch.object(product, "prepare_desktop_home", return_value=Path(args.home_disk)) as prepare, \
+                patch.object(product, "run_cmd", return_value=0) as run:
+            self.assertEqual(product.run_gui_cmd(args), 0)
+            prepare.assert_called_once_with(Path("/home/example/home.ext4"))
+            self.assertEqual(run.call_args.args[0].extra_block, "/home/example/home.ext4")
+            self.assertEqual(run.call_args.args[0].rootfs_transport, "drive")
+
+    def test_run_gui_rejects_conflicting_extra_disk(self):
+        product = load_product()
+        args = product.build_parser().parse_args(["run-gui", "--extra-block", "/home/example/other.ext4"])
+        with patch.object(product, "prepare_desktop_home") as prepare:
+            with self.assertRaisesRegex(product.ProductError, "use --home-disk"):
+                product.run_gui_cmd(args)
+            prepare.assert_not_called()
+
+    def test_default_home_disk_uses_durable_xdg_data_directory(self):
+        product = load_product()
+        with test_tmpdir() as directory:
+            disk = Path(directory) / "thekernel/desktop/home.ext4"
+            disk.parent.mkdir(parents=True)
+            disk.write_bytes(b"existing data")
+            with patch.dict(os.environ, {"XDG_DATA_HOME": directory}):
+                self.assertEqual(product.prepare_desktop_home(), disk)
+
+
 if __name__ == "__main__":
     unittest.main()

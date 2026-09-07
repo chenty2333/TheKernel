@@ -1,7 +1,9 @@
-# Interactive Weston desktop with a terminal; smoke workloads stay disabled.
+# Interactive Weston desktop; smoke workloads stay disabled.
 # Carry both software KMS and the virtio-gpu virgl driver.
 BR2_ROOTFS_OVERLAY="@REPO_ROOT@/config/graphics/overlay/common @REPO_ROOT@/config/graphics/overlay/q35-software-desktop"
 BR2_ROOTFS_POST_BUILD_SCRIPT="@REPO_ROOT@/config/graphics/build-guest-tools.sh @REPO_ROOT@/config/graphics/build-q35-wayland-client.sh"
+BR2_ROOTFS_DEVICE_TABLE="system/device_table.txt @REPO_ROOT@/config/graphics/desktop-permissions.table"
+BR2_GLOBAL_PATCH_DIR="@REPO_ROOT@/config/graphics/patches"
 BR2_PACKAGE_WESTON_DEFAULT_DRM=y
 BR2_PACKAGE_WESTON_HEADLESS=y
 BR2_PACKAGE_WESTON_DRM=y
@@ -17,6 +19,15 @@ BR2_PACKAGE_MESA3D_OPENGL_EGL=y
 BR2_PACKAGE_MESA3D_OPENGL_ES=y
 BR2_PACKAGE_KMSCUBE=y
 BR2_PACKAGE_PYTHON3=y
+BR2_PACKAGE_PCMANFM=y
+BR2_PACKAGE_LIBGTK3_WAYLAND=y
+# BR2_PACKAGE_LIBGTK3_BROADWAY is not set
+BR2_PACKAGE_ADWAITA_ICON_THEME=y
+BR2_PACKAGE_SHARED_MIME_INFO=y
+BR2_PACKAGE_XAPP_XEDIT=y
+BR2_PACKAGE_XFONT_FONT_MISC_MISC=y
+BR2_PACKAGE_XFONT_FONT_ALIAS=y
+BR2_PACKAGE_FEH=y
 BR2_PACKAGE_PIGLIT=y
 BR2_PACKAGE_XORG7=y
 BR2_PACKAGE_LIBEPOXY=y

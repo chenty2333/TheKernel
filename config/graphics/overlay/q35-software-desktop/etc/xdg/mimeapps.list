@@ -1,0 +1,6 @@
+[Default Applications]
+text/plain=thekernel-editor.desktop;
+text/x-python=thekernel-editor.desktop;
+application/x-shellscript=thekernel-editor.desktop;
+image/png=thekernel-images.desktop;
+image/jpeg=thekernel-images.desktop;

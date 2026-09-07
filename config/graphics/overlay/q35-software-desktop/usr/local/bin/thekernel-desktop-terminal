@@ -1,9 +1,2 @@
 #!/bin/sh
-# Both the initial terminal and the panel launcher inherit Weston's user session.
-set -eu
-export LANG=C.UTF-8
-export HOME=/var/lib/weston
-export XDG_RUNTIME_DIR=/run/user/$(id -u)
-export WAYLAND_DISPLAY=wayland-0
-cd "$HOME"
-exec /usr/bin/weston-terminal --maximized --shell=/bin/sh
+exec /usr/local/bin/thekernel-desktop-app terminal

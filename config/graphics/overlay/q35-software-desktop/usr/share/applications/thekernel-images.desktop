@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Images
+Exec=/usr/local/bin/thekernel-desktop-app images %F
+Icon=image-x-generic
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/png;image/jpeg;

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Xwayland presents through Wayland wl_shm. Disable the separate X11 MIT-SHM
+# extension: its SysV ShmAttach path fails with BadAccess for GTK clients.
+set -eu
+export XWAYLAND_NO_GLAMOR=1
+exec /usr/bin/Xwayland -extension MIT-SHM "$@" 2>"$XDG_RUNTIME_DIR/xwayland.log"

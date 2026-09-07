@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+
+# Other graphics flavors inherit this overlay but keep their smoke rootfs.
+grep -qx q35-software-desktop /etc/thekernel-graphics-flavor || exit 0
+
+home_dir=/var/lib/weston
+case "${1:-}" in
+    start)
+        [ -b /dev/vdb ] || { echo "Desktop home disk missing: /dev/vdb" >&2; exit 1; }
+        mkdir -p "$home_dir"
+        mountpoint -q "$home_dir" || mount -t ext4 /dev/vdb "$home_dir"
+        chown weston:weston "$home_dir"
+        chmod 0700 "$home_dir"
+        for name in Documents Pictures Downloads; do
+            directory=$home_dir/$name
+            if [ ! -e "$directory" ] && [ ! -L "$directory" ]; then
+                mkdir -m 0700 "$directory"
+                chown weston:weston "$directory"
+            fi
+        done
+        ;;
+    stop)
+        sync
+        if mountpoint -q "$home_dir"; then
+            umount "$home_dir"
+        fi
+        ;;
+    *) echo "Usage: $0 {start|stop}" >&2; exit 1 ;;
+esac
