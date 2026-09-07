@@ -1142,8 +1142,8 @@ impl DrmDevice {
     }
 
     /// Consume a post-IRQ VirtIO display sample as one KMS-state transition.
-    /// Mode/EDID replacement and invalidation of queued stale commits share
-    /// the device lock, so no old mode can become visible after hotplug.
+    /// A connected display's new preferred mode is an advertisement, not a
+    /// revocation of the current mode or already accepted page flips.
     fn refresh_display_config(&self) -> DrmResult<()> {
         let Some(config) = self.adapter.display_config_changed()? else {
             return Ok(());
@@ -1166,8 +1166,15 @@ impl DrmDevice {
             state.resources.modes = modes;
             replace_connector_edid(&mut state)?;
             state.advance_atomic_generation()?;
-            state.atomic_tail = state.atomic;
-            core::mem::take(&mut state.pending_commits)
+            if config.connected {
+                // Accepted flips still own a completion event and may already
+                // be presenting. Keep their order and proposal tail until the
+                // compositor chooses to modeset after the hotplug notice.
+                VecDeque::new()
+            } else {
+                state.atomic_tail = state.atomic;
+                core::mem::take(&mut state.pending_commits)
+            }
         };
         for job in stale {
             job.discard_event();
@@ -1616,6 +1623,143 @@ mod tests {
         fn shared_pages(&self) -> DrmResult<Arc<crate::mm::SharedPages>> {
             Err(DrmError::Unsupported)
         }
+    }
+
+    #[test]
+    fn connected_mode_hint_preserves_accepted_flip_completion() {
+        let _context = crate::test_support::scheduler_test_context();
+        struct ChangingAdapter {
+            change: Mutex<Option<DisplayConfig>>,
+            present: Arc<Fence>,
+        }
+        impl DisplayAdapter for ChangingAdapter {
+            fn create_dumb(
+                &self,
+                _: DumbRequest,
+                _: u32,
+                _: u64,
+            ) -> DrmResult<Arc<dyn GemBacking>> {
+                Ok(Arc::new(Backing))
+            }
+            fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
+                Ok(self.present.clone())
+            }
+            fn display_config_changed(&self) -> DrmResult<Option<DisplayConfig>> {
+                Ok(self.change.lock().take())
+            }
+        }
+
+        let adapter = Arc::new(ChangingAdapter {
+            change: Mutex::new(None),
+            present: Fence::new(false),
+        });
+        let device = DrmDevice::new(adapter.clone(), 1, 2, 3, 4);
+        let file = device.open_fbdev_primary();
+        file.become_master().unwrap();
+        let old_mode = device.state.lock().resources.preferred_mode;
+        let dumb = file
+            .create_dumb(DumbRequest {
+                width: old_mode.width,
+                height: old_mode.height,
+                bpp: 32,
+            })
+            .unwrap();
+        let fb_id = file
+            .add_framebuffer(dumb.handle, old_mode.width, old_mode.height, dumb.pitch, 32)
+            .unwrap();
+        let fb = file.framebuffer(fb_id).unwrap();
+        let mut next = super::super::atomic::initial(&device.state.lock().resources);
+        next.active = true;
+        next.mode = Some(old_mode);
+        next.fb = fb_id;
+        next.crtc_w = old_mode.width;
+        next.crtc_h = old_mode.height;
+        next.src_w = old_mode.width << 16;
+        next.src_h = old_mode.height << 16;
+        let generation = device.state.lock().atomic_generation;
+        let completion = Fence::new(false);
+        file.submit_atomic(
+            generation,
+            next,
+            Some(fb),
+            Some(123),
+            true,
+            super::super::file::AtomicSync {
+                inputs: Vec::new(),
+                predecessors: Vec::new(),
+                completion: Some(completion.clone()),
+            },
+        )
+        .unwrap();
+        device.advance_vblank().unwrap();
+        assert!(file.dequeue_event().is_none());
+
+        // A host-window resize changes the preferred mode while the old-mode
+        // flip is already accepted and its host presentation is in flight.
+        let new_mode = Mode {
+            width: 1536,
+            height: 800,
+            refresh_millihz: 60_000,
+        };
+        *adapter.change.lock() = Some(DisplayConfig {
+            connected: true,
+            mode: Some(new_mode),
+        });
+        device.advance_vblank().unwrap();
+        let tail_after_hint = device.state.lock().atomic_tail;
+        adapter.present.signal();
+        device.advance_vblank().unwrap();
+
+        assert!(matches!(
+            file.dequeue_event(),
+            Some(super::super::file::DrmEvent::FlipComplete {
+                sequence: 3,
+                user_data: 123,
+                ..
+            })
+        ));
+        assert!(completion.is_signaled());
+        assert!(!completion.is_failed());
+        assert_eq!(tail_after_hint.fb, next.fb);
+        assert_eq!(tail_after_hint.mode, next.mode);
+        assert!(tail_after_hint.active);
+        let state = device.state.lock();
+        assert_eq!(state.resources.preferred_mode, new_mode);
+        assert_eq!(state.resources.crtc.mode, Some(old_mode));
+        assert_eq!(state.resources.crtc.framebuffer, Some(next.fb));
+        assert!(state.pending_commits.is_empty());
+        assert!(state.pending_fb_pins.is_empty());
+        let generation = state.atomic_generation;
+        let fb = state.framebuffers.get(&next.fb).unwrap().clone();
+        drop(state);
+
+        // A real disconnect still cancels the accepted request and releases
+        // its framebuffer custody through the existing terminal path.
+        let cancelled = Fence::new(false);
+        file.submit_atomic(
+            generation,
+            next,
+            Some(fb),
+            Some(456),
+            true,
+            super::super::file::AtomicSync {
+                inputs: Vec::new(),
+                predecessors: Vec::new(),
+                completion: Some(cancelled.clone()),
+            },
+        )
+        .unwrap();
+        *adapter.change.lock() = Some(DisplayConfig {
+            connected: false,
+            mode: None,
+        });
+        device.advance_vblank().unwrap();
+        assert!(file.dequeue_event().is_none());
+        assert!(cancelled.is_failed());
+        let state = device.state.lock();
+        assert!(!state.resources.connector.connected);
+        assert!(state.pending_commits.is_empty());
+        assert!(state.pending_fb_pins.is_empty());
     }
 
     #[test]

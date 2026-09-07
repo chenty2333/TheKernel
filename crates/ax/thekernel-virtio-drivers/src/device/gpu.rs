@@ -2084,7 +2084,10 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
     fn request_bytes<Rsp: FromBytes>(&mut self, request: &[u8]) -> Result<Rsp> {
         // This is reserved for immutable display/config reads and must never
         // consume a completion owned by an asynchronous submission.
-        if self.control_faulted || !self.pending_control.is_empty() {
+        if self.control_faulted {
+            return Err(Error::IoError);
+        }
+        if !self.pending_control.is_empty() {
             return Err(Error::NotReady);
         }
         if request.len() > MAX_CONTROL_PAYLOAD
@@ -2614,6 +2617,39 @@ mod tests {
         let header = CtrlHeader::fenced(Command::SUBMIT_3D, 7, 9);
         assert!(header.check_fence(Command::SUBMIT_3D, 7, 9).is_ok());
     }
+    #[test]
+    fn display_read_distinguishes_pending_control_from_faulted_queue() {
+        use alloc::{boxed::Box, sync::Arc, vec};
+        use core::ptr::NonNull;
+        use std::sync::Mutex;
+
+        use crate::{
+            hal::fake::FakeHal,
+            transport::{
+                fake::{FakeTransport, QueueStatus, State},
+                DeviceType,
+            },
+        };
+        let mut config = Box::new(unsafe { core::mem::zeroed::<Config>() });
+        let transport = FakeTransport {
+            device_type: DeviceType::GPU,
+            max_queue_size: QUEUE_SIZE as u32,
+            device_features: 0,
+            config_space: NonNull::from(config.as_mut()),
+            state: Arc::new(Mutex::new(State {
+                queues: vec![QueueStatus::default(), QueueStatus::default()],
+                ..State::default()
+            })),
+        };
+        let mut gpu = VirtIOGpu::<FakeHal, _>::new(transport).unwrap();
+        gpu.submit_create_2d(64, 64).unwrap();
+        assert_eq!(gpu.display_info().err(), Some(Error::NotReady));
+        assert_eq!(gpu.pending_control.len(), 1);
+        gpu.fault_control_queue();
+        assert!(gpu.pending_control.is_empty());
+        assert_eq!(gpu.display_info().err(), Some(Error::IoError));
+    }
+
     #[test]
     fn fake_transport_negotiates_virgl_only_when_offered() {
         use alloc::{boxed::Box, sync::Arc, vec};

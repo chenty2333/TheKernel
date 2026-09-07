@@ -168,11 +168,9 @@ struct AdapterState<T: GpuTransport> {
     /// UPDATE_CURSOR, the exact GEM backing consumed by the host command.
     cursor_jobs: Mutex<HashMap<u64, CursorJob>>,
     /// Serializes cursorq capacity reservation through fence-token
-    /// publication. The completion worker observes `cursor_admitting` and
-    /// never drains a token in that interval.
+    /// publication with completion draining and reset.
     cursor_admission: Mutex<()>,
     cursor_worker_started: AtomicBool,
-    cursor_admitting: AtomicBool,
     final_2d_leaks: AtomicUsize,
     final_render_leaks: AtomicUsize,
 }
@@ -319,7 +317,6 @@ impl<T: GpuTransport> VirtioGpuAdapter<T> {
                 cursor_jobs: Mutex::new(HashMap::new()),
                 cursor_admission: Mutex::new(()),
                 cursor_worker_started: AtomicBool::new(false),
-                cursor_admitting: AtomicBool::new(false),
                 final_2d_leaks: AtomicUsize::new(0),
                 final_render_leaks: AtomicUsize::new(0),
             }),
@@ -1832,7 +1829,6 @@ impl<T: GpuTransport> AdapterState<T> {
             fence.signal_error();
             return Err(error);
         }
-        self.cursor_admitting.store(true, Ordering::Release);
         let submission = match self.transport.lock().submit(
             DriverGpuQueue::Cursor,
             DriverGpuBatch::UpdateCursor(cursor),
@@ -1840,7 +1836,6 @@ impl<T: GpuTransport> AdapterState<T> {
         ) {
             Ok(submission) => submission,
             Err(error) => {
-                self.cursor_admitting.store(false, Ordering::Release);
                 fence.signal_error();
                 return Err(map_dev_error(error));
             }
@@ -1856,11 +1851,9 @@ impl<T: GpuTransport> AdapterState<T> {
             )
             .is_some()
         {
-            self.cursor_admitting.store(false, Ordering::Release);
             fence.signal_error();
             return Err(DrmError::Invalid);
         }
-        self.cursor_admitting.store(false, Ordering::Release);
         drop(jobs);
         Ok(fence)
     }
@@ -1884,7 +1877,6 @@ impl<T: GpuTransport> AdapterState<T> {
             fence.signal_error();
             return Err(error);
         }
-        self.cursor_admitting.store(true, Ordering::Release);
         let submission = match self.transport.lock().submit(
             DriverGpuQueue::Cursor,
             DriverGpuBatch::MoveCursor { x, y },
@@ -1892,7 +1884,6 @@ impl<T: GpuTransport> AdapterState<T> {
         ) {
             Ok(submission) => submission,
             Err(error) => {
-                self.cursor_admitting.store(false, Ordering::Release);
                 fence.signal_error();
                 return Err(map_dev_error(error));
             }
@@ -1908,11 +1899,9 @@ impl<T: GpuTransport> AdapterState<T> {
             )
             .is_some()
         {
-            self.cursor_admitting.store(false, Ordering::Release);
             fence.signal_error();
             return Err(DrmError::Invalid);
         }
-        self.cursor_admitting.store(false, Ordering::Release);
         Ok(fence)
     }
     fn ensure_cursor_worker(self: &Arc<Self>) -> DrmResult<()>
@@ -1943,24 +1932,22 @@ impl<T: GpuTransport> AdapterState<T> {
         }
     }
     fn service_cursor_jobs(&self) {
-        if self.cursor_admitting.load(Ordering::Acquire) {
+        // A sampled flag cannot exclude a producer that starts after the
+        // sample. Keep its admission gate through completion consumption.
+        let Some(_admission) = self.cursor_admission.try_lock() else {
             return;
-        }
+        };
         let mut records: [DriverGpuCompletion; 8] = core::array::from_fn(|_| DriverGpuCompletion {
             fence_id: 0,
             result: Ok(()),
             data: DriverGpuCompletionData::None,
         });
-        let count = match self
-            .transport
-            .lock()
-            .drain_completions(DriverGpuQueue::Cursor, &mut records)
-        {
-            Ok(count) => count,
-            Err(_) => self
-                .transport
-                .lock()
-                .reset(DriverGpuQueue::Cursor, &mut records),
+        let count = {
+            let mut transport = self.transport.lock();
+            match transport.drain_completions(DriverGpuQueue::Cursor, &mut records) {
+                Ok(count) => count,
+                Err(_) => transport.reset(DriverGpuQueue::Cursor, &mut records),
+            }
         };
         let mut jobs = self.cursor_jobs.lock();
         for record in records.into_iter().take(count) {
@@ -2797,11 +2784,13 @@ impl<T: GpuTransport + 'static> DisplayAdapter for VirtioGpuAdapter<T> {
         self.state.enqueue_cursor_move(x, y)
     }
     fn display_config_changed(&self) -> DrmResult<Option<DisplayConfig>> {
-        self.state
-            .transport
-            .lock()
-            .display_config_changed()
-            .map_err(map_dev_error)
+        match self.state.transport.lock().display_config_changed() {
+            // The immutable query cannot share controlq with an in-flight
+            // submission. Its display event stays unacknowledged until a
+            // successful sample, so retry on the next vblank.
+            Err(DevError::Again) => Ok(None),
+            result => result.map_err(map_dev_error),
+        }
     }
 }
 
@@ -2865,9 +2854,19 @@ mod tests {
         render_detaches: u32,
         render_unrefs: u32,
         next_fence: u64,
+        cursor_drain_fails: bool,
+        display_error: Option<DevError>,
+        display_change: Option<DisplayConfig>,
         completions: Vec<(DriverGpuQueue, DriverGpuCompletion)>,
     }
     impl GpuTransport for FakeTransport {
+        fn display_config_changed(&mut self) -> Result<Option<DisplayConfig>, DevError> {
+            if let Some(error) = self.display_error.take() {
+                return Err(error);
+            }
+            Ok(self.display_change.take())
+        }
+
         fn submit(
             &mut self,
             queue: DriverGpuQueue,
@@ -2928,6 +2927,7 @@ mod tests {
                 } => {
                     self.presented.push((resource, width, height));
                 }
+                DriverGpuBatch::MoveCursor { .. } | DriverGpuBatch::UpdateCursor(_) => {}
                 _ => return Err(DevError::Unsupported),
             }
             self.next_fence += 1;
@@ -2950,6 +2950,10 @@ mod tests {
             queue: DriverGpuQueue,
             out: &mut [DriverGpuCompletion],
         ) -> Result<usize, DevError> {
+            if queue == DriverGpuQueue::Cursor && self.cursor_drain_fails {
+                self.cursor_drain_fails = false;
+                return Err(DevError::Io);
+            }
             let mut count = 0;
             while count < out.len() {
                 let Some(index) = self.completions.iter().position(|(q, _)| *q == queue) else {
@@ -2973,6 +2977,79 @@ mod tests {
         fn drop(&mut self) {
             self.transport_drops.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn display_config_busy_retries_without_losing_pending_change() {
+        let _context = crate::test_support::scheduler_test_context();
+        let change = DisplayConfig {
+            connected: false,
+            mode: None,
+        };
+        let mut transport = FakeTransport::default();
+        transport.display_error = Some(DevError::Again);
+        transport.display_change = Some(change);
+        let adapter = VirtioGpuAdapter::new(transport);
+        assert_eq!(adapter.display_config_changed(), Ok(None));
+        assert_eq!(adapter.state.transport.lock().display_change, Some(change));
+        assert_eq!(adapter.display_config_changed(), Ok(Some(change)));
+        assert_eq!(adapter.display_config_changed(), Ok(None));
+    }
+
+    #[test]
+    fn display_config_transport_failure_remains_device_lost() {
+        let _context = crate::test_support::scheduler_test_context();
+        let adapter = VirtioGpuAdapter::new(FakeTransport::default());
+        for error in [DevError::Io, DevError::BadState] {
+            adapter.state.transport.lock().display_error = Some(error);
+            assert_eq!(adapter.display_config_changed(), Err(DrmError::DeviceLost));
+        }
+    }
+
+    #[test]
+    fn cursor_completion_waits_for_token_publication() {
+        let _context = crate::test_support::scheduler_test_context();
+        let adapter = VirtioGpuAdapter::new(FakeTransport::default());
+        let state = &adapter.state;
+        let admission = state.cursor_admission.lock();
+        let fence = Fence::new(false);
+        let submission = state
+            .transport
+            .lock()
+            .submit(
+                DriverGpuQueue::Cursor,
+                DriverGpuBatch::MoveCursor { x: 3, y: 5 },
+                0,
+            )
+            .unwrap();
+        // The host has already completed, but the producer has not published
+        // the token's fence. Completion service must share its admission gate.
+        state.service_cursor_jobs();
+        assert_eq!(state.transport.lock().completions.len(), 1);
+        assert!(!fence.is_signaled());
+        state.cursor_jobs.lock().insert(
+            submission.fence_id,
+            CursorJob {
+                completion: fence.clone(),
+                _backing: None,
+            },
+        );
+        drop(admission);
+        state.service_cursor_jobs();
+        assert!(fence.is_signaled());
+        assert!(state.cursor_jobs.lock().is_empty());
+        assert!(state.transport.lock().completions.is_empty());
+    }
+
+    #[test]
+    fn cursor_completion_reset_signals_failed_fence() {
+        let _context = crate::test_support::scheduler_test_context();
+        let adapter = VirtioGpuAdapter::new(FakeTransport::default());
+        let fence = adapter.state.enqueue_cursor_move(3, 5).unwrap();
+        adapter.state.transport.lock().cursor_drain_fails = true;
+        adapter.state.service_cursor_jobs();
+        assert!(fence.is_failed());
+        assert!(adapter.state.cursor_jobs.lock().is_empty());
     }
 
     #[test]
