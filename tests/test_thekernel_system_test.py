@@ -21,6 +21,31 @@ def load_product():
 
 
 class SystemTestGateTests(unittest.TestCase):
+    def test_io_submit_batch_is_independent_and_uses_separate_artifacts(self) -> None:
+        product = load_product()
+        artifacts = []
+        for flags in ([], ["--io-submit-batch"], ["--m5-candidate"],
+                      ["--m5-candidate", "--io-submit-batch"]):
+            args = product.build_parser().parse_args(["build", "--profile", "shell", *flags])
+            artifacts.append(product.Artifacts(Path("/unused"), product.parse_variant(args), args.profile))
+        self.assertEqual(len({item.output_dir for item in artifacts}), 4)
+        self.assertEqual(len({item.cargo_target_dir for item in artifacts}), 4)
+        self.assertEqual(product.kernel_features(artifacts[0]), "x86-product boot-shell")
+        self.assertEqual(product.kernel_features(artifacts[1]), "x86-product boot-shell io-submit-batch")
+        self.assertEqual(product.kernel_features(artifacts[2]), product.kernel_features(artifacts[3]))
+        self.assertEqual(product.kernel_features(artifacts[3]).split().count("io-submit-batch"), 1)
+
+    def test_candidate_flags_cannot_replace_io_or_graphics_benchmark_baseline(self) -> None:
+        product = load_product()
+        for suite in ("io", "graphics"):
+            for flag in ("--io-submit-batch", "--m5-candidate"):
+                with self.subTest(suite=suite, flag=flag):
+                    args = product.build_parser().parse_args(["bench", "--suite", suite, flag])
+                    with patch.object(product, "graphics_benchmark_cmd") as graphics:
+                        with self.assertRaisesRegex(product.ProductError, "baseline must use default"):
+                            product.bench_cmd(args)
+                    graphics.assert_not_called()
+
     def test_experimental_candidate_cannot_replace_benchmark_baseline(self) -> None:
         product = load_product()
         default = product.Artifacts(Path("/unused"), product.Variant("1G"), "shell")

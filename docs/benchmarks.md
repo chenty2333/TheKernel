@@ -158,6 +158,11 @@ The product CLI's Linux comparison uses
 must use its shell profile with a drive-rootfs ESP; Linux uses the existing ESP
 builder with `config/x86_64/grub-linux-shell.cfg`, which boots the same shell-init
 script from the same rootfs. Linux must identify itself as 7.2.3 in its console.
+After Linux reaches the shell-ready marker, the benchmark commands run
+`/bin/busybox dmesg -n 4` to keep routine kernel diagnostics from interleaving
+with serial workload JSON. This preserves the boot banner for version validation
+and leaves kernel errors visible. Failure to configure the console prevents the
+workload from running; the parser still requires intact records.
 A host Linux run only validates the workload and is not this comparison.
 
 Start with a single functionality trial before collecting measurements:
@@ -260,3 +265,83 @@ or execution, linked dispatch, errors or return, pending notification is flushed
 Asynchronous completions never inherit the token. Fixed buffered I/O can block,
 so the candidate does not defer notifications across those operations; no
 batch-notification improvement is claimed for the primary fixed-read scenario.
+
+### Isolating the I/O candidate
+
+`build --io-submit-batch` enables only the existing I/O candidate. It uses a
+separate `mem1g-io-submit-batch` artifact directory at the default memory size.
+`--m5-candidate` also enables the scheduler candidate and therefore cannot
+isolate the I/O change. Benchmark baseline commands reject either candidate
+flag; pass a separately built candidate kernel and drive-rootfs ESP instead.
+
+```sh
+./tools/thekernel.py build --profile shell --rootfs-transport drive --io-submit-batch
+./tools/thekernel.py bench --suite io --accel kvm --iterations 1000 --trials 10 \
+  --candidate-kernel "$HOME/.cache/thekernel-targets/out/x86_64/q35-uefi/shell/mem1g-io-submit-batch/kernel-x86_64" \
+  --candidate-esp "$HOME/.cache/thekernel-targets/out/x86_64/q35-uefi/shell/mem1g-io-submit-batch/kernel-x86_64-drive.esp"
+```
+
+Keep the same rootfs, memory, CPU count and registration mode for both builds.
+`THEKERNEL_STATE_DIR` can isolate the experiment from an interactive guest's
+build lock; all targets and run files must remain on disk. When using an
+existing image, pass the same explicit `--rootfs` to build and benchmark.
+
+For fixed I/O, the candidate avoids repeated current-slot checks inside one
+exclusive resource-table transaction and obtains a retained buffer's capability
+and exact range together. Each request still owns a separate generation-bound
+lease. This is validation work saved on real read/write paths, not a combined
+physical I/O request or a shared completion owner. Ordinary-resource rows are
+controls; comparing ordinary and fixed absolute times does not isolate this
+change. The fixed-read target above remains primary, and the full matrix still
+checks read contents, write readback and unique completion identities.
+
+The VFS `successful_byte_count_trusts_provider_for_source_and_content_effects`
+test records a separate API boundary: an intentionally incorrect provider can
+report an in-range success without sourcing input or changing its target, on
+both published and immediate completion paths. Passing resource-lifecycle tests
+or this benchmark does not establish truthful provider effects. The test does
+not accuse a production provider of returning a false result.
+
+### I/O-only candidate result (2026-09-07)
+
+The isolated candidate completed ten rotating, paired trials plus one discarded
+warmup round against the default-policy baseline and Linux 7.2.3. Each guest ran
+all 72 I/O scenarios with 1,000 operations per scenario: KVM, four vCPUs pinned
+to host CPUs 0–3, 1 GiB RAM, and private writable rootdisks from the same input
+image. All 33 guests passed content, completion-identity, complete-matrix and
+clean-shutdown checks. Both TheKernel builds also passed the io_uring and
+registered-buffer guest smoke tests.
+
+For the predeclared 4 KiB random fixed-buffer buffered-read QD32 target:
+
+| Metric | Baseline | I/O candidate |
+| --- | ---: | ---: |
+| Geometric mean elapsed time per operation | 297.62 µs | 316.07 µs |
+| Paired change in elapsed time | — | +6.20% |
+| 95% bootstrap interval for that change | — | −11.05% to +24.30% |
+
+Positive time change means slower. The interval crosses zero, so this run does
+not establish a stable regression or improvement. It fails the predeclared
+10% improvement criterion, and its point estimate triggers the 5% regression
+flag. Across all 72 latency rows, 19 trigger that point-regression flag (13
+fixed-resource and six ordinary-resource controls); none meets the 10%
+improvement criterion. These are per-scenario guardrail flags, not 19 claims of
+statistically established regression. The Linux target's geometric mean was
+7.13 µs per operation; this comparison does not identify the cause of the
+TheKernel cost.
+
+Decision: retain the default policy and make no performance-win claim for this
+candidate. The functional evidence supports preserving the tested resource and
+completion boundaries for this limited validation optimization. It does not
+prove arbitrary provider effects, physical-request batching, or the stronger
+operation-constrained executor design. This was a shared development host, not
+an otherwise idle controlled machine; foreground-only counters and absolute
+maxRSS also leave whole-system resource costs unmeasured.
+
+The focused host checks passed: 72 kernel io_uring tests with the candidate off,
+75 with it on, 57 lower io_uring crate tests, and the VFS false-success boundary
+test. The combined CLI, process-runner and benchmark Python suite passed 90
+tests. The experiment also exposed and fixed two runner issues: firmware LF-CR
+line endings blocking exact readiness markers, and Linux diagnostic output
+interrupting workload JSON. Their regressions preserve strict marker, Linux
+boot-version and JSON/matrix validation.

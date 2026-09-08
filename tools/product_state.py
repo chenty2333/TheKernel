@@ -95,6 +95,7 @@ class Variant:
     memory: str
     asid_fast_switch: bool = False
     m5_candidate: bool = False
+    io_submit_batch: bool = False
 
     @property
     def memory_bytes(self) -> int:
@@ -109,6 +110,8 @@ class Variant:
         suffix = "-asid-fast-switch" if self.asid_fast_switch else ""
         if self.m5_candidate:
             suffix += "-m5-candidate"
+        if self.io_submit_batch:
+            suffix += "-io-submit-batch"
         return f"mem{self.memory.lower()}{suffix}"
 
 

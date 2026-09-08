@@ -69,7 +69,8 @@ def parse_variant(args: argparse.Namespace) -> Variant:
     if not MEMORY_RE.fullmatch(memory):
         raise ProductError(f"--memory must be a positive K/M/G size: {args.memory}")
     variant = Variant(memory=memory, asid_fast_switch=args.asid_fast_switch,
-                      m5_candidate=getattr(args, "m5_candidate", False))
+                      m5_candidate=getattr(args, "m5_candidate", False),
+                      io_submit_batch=getattr(args, "io_submit_batch", False))
     if variant.memory_bytes <= KERNEL_LOAD_PADDR:
         raise ProductError("--memory must extend beyond the 2 MiB kernel load address")
     if variant.memory_bytes > X86_64_MAX_MEMORY_BYTES:
@@ -229,7 +230,9 @@ def kernel_features(artifacts: Artifacts) -> str:
     if variant.asid_fast_switch:
         features.append("asid-fast-switch")
     if variant.m5_candidate:
-        features.extend(("sched-wake-locality", "io-submit-batch"))
+        features.append("sched-wake-locality")
+    if variant.m5_candidate or variant.io_submit_batch:
+        features.append("io-submit-batch")
     return " ".join(features)
 
 
@@ -1032,6 +1035,8 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
     parser.add_argument("--asid-fast-switch", action="store_true")
     parser.add_argument("--m5-candidate", action="store_true",
                         help="build or validate the experimental scheduler/I/O candidate in separate artifact paths")
+    parser.add_argument("--io-submit-batch", action="store_true",
+                        help="enable the experimental I/O submission batch independently in separate artifact paths")
     if profiles:
         parser.add_argument(
             "--profile",
@@ -1441,12 +1446,12 @@ def abi_test_cmd(args: argparse.Namespace) -> int:
 
 
 def bench_cmd(args: argparse.Namespace) -> int:
+    if getattr(args, "m5_candidate", False) or getattr(args, "io_submit_batch", False):
+        raise ProductError("benchmark baseline must use default policies; supply prepared candidate kernel and ESP paths")
     if args.suite == "graphics":
         if not args.rootfs or not args.workdir or not args.linux_oracle_log:
             raise ProductError("graphics benchmark requires --rootfs, --workdir and --linux-oracle-log")
         return graphics_benchmark_cmd(args)
-    if getattr(args, "m5_candidate", False):
-        raise ProductError("benchmark baseline must use default policies; supply prepared candidate kernel and ESP paths")
     if args.accel != "kvm":
         raise ProductError("benchmark comparisons require --accel kvm")
     if not 32 <= args.iterations <= 1_000_000 or args.trials < 1:
