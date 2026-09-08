@@ -186,11 +186,16 @@ class KernelBenchmarkTests(unittest.TestCase):
         with test_tmpdir() as temporary:
             for suite in ("scheduler", "io", "all"):
                 config = replace(self.config(temporary), suite=suite, iterations=1000000, cpus=4)
-                commands = _benchmark_commands(config)
-                self.assertTrue(all(len(line.encode()) + 1 < 128 for line in commands.splitlines()))
-                self.assertNotIn("if ", commands)
-                self.assertIn(f'[ "$failed" = 0 ] && echo {COMPLETE_MARKER}', commands)
-                self.assertIn('|| failed=1', commands)
+                for linux in (False, True):
+                    commands = _benchmark_commands(config, linux=linux)
+                    self.assertTrue(all(len(line.encode()) + 1 < 128 for line in commands.splitlines()))
+                    self.assertNotIn("if ", commands)
+                    self.assertIn(f'[ "$failed" = 0 ] && echo {COMPLETE_MARKER}', commands)
+                    self.assertIn('[ "$failed" != 0 ] || "$b"', commands)
+                    self.assertEqual("dmesg -n 4" in commands, linux)
+                    if linux:
+                        self.assertEqual(commands.splitlines()[:2],
+                                         ["failed=0", "/bin/busybox dmesg -n 4 || failed=1"])
 
     @patch("tools.qemu_runner.kernel_benchmark.os.sched_getaffinity", return_value={0, 1, 2, 3})
     @patch("tools.qemu_runner.kernel_benchmark.os.sched_setaffinity")
@@ -215,6 +220,7 @@ class KernelBenchmarkTests(unittest.TestCase):
                 self.assertEqual(run_config.qmp.vcpu_host_cpus, (0,))
                 self.assertEqual(run_config.qmp.socket, run_config.workdir / "qmp.sock")
                 commands = run_config.input_path.read_text()
+                self.assertEqual("dmesg -n 4" in commands, run_config.workdir.name.endswith("-linux"))
                 self.assertIn("KERNEL_BENCH_WORKERS=1", commands)
                 self.assertIn("/root/thekernel-bench.data", commands)
                 self.assertNotIn("/var/tmp/", commands)

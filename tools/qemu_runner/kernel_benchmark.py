@@ -271,11 +271,16 @@ def _execution_environment(cpus: tuple[int, ...], temporary: Path):
         os.sched_setaffinity(0, previous_affinity)
 
 
-def _benchmark_commands(config: BenchmarkConfig) -> str:
+def _benchmark_commands(config: BenchmarkConfig, *, linux: bool = False) -> str:
     # Each independent command waits for the shell-ready marker. Keep every
     # UART line below the guest's 128-byte input buffer, including its newline.
-    lines = ["failed=0", "b=/opt/thekernel-tests/bin/thekernel-kernel-bench",
-             f"export KERNEL_BENCH_WORKERS={config.cpus}"]
+    lines = ["failed=0"]
+    if linux:
+        # Preserve the authentic boot banner, then quiet kernel diagnostics
+        # before workload JSON shares the serial console.
+        lines.append("/bin/busybox dmesg -n 4 || failed=1")
+    lines += ["b=/opt/thekernel-tests/bin/thekernel-kernel-bench",
+              f"export KERNEL_BENCH_WORKERS={config.cpus}"]
     if config.suite in {"scheduler", "all"}:
         lines += ["tp=/sys/kernel/tracing",
                   '[ -r "$tp/events/sched/sched_wakeup/id" ] || /bin/busybox mount -t tracefs tracefs "$tp" || failed=1']
@@ -327,7 +332,7 @@ def run_benchmark_experiment(config: BenchmarkConfig) -> dict:
                     current.mkdir()
                     rootfs = current / "rootfs.img"
                     command = current / "commands"
-                    command.write_text(_benchmark_commands(config), encoding="utf-8")
+                    command.write_text(_benchmark_commands(config, linux=target.name == "linux"), encoding="utf-8")
                     print(f"benchmark {phase} {target.name}: {current / 'console.log'}", file=sys.stderr)
                     try:
                         shutil.copyfile(base, rootfs)

@@ -484,6 +484,36 @@ class ProcessTests(unittest.TestCase):
         self.assertIn(b"GOT:payload", log)
         self.assertEqual(console, log)
 
+    def test_firmware_lf_cr_releases_input_at_shell_ready_marker(self) -> None:
+        script = (
+            "import sys; "
+            "sys.stdout.buffer.write(b'WARNING: no console will be available to OS\\n\\r'); "
+            "sys.stdout.buffer.flush(); "
+            "sys.stdout.buffer.write(b'THEKERNEL_SHELL_READY\\r\\n# '); "
+            "sys.stdout.buffer.flush(); "
+            "line=sys.stdin.readline().strip(); "
+            "print('GOT:'+line, flush=True)"
+        )
+        result, log, console = self.run_child(
+            script,
+            interaction=Interaction(interactive=True, input_after_marker="THEKERNEL_SHELL_READY"),
+            input_text=b"payload\n",
+        )
+        self.assertEqual(result.returncode, 0, result.error_message)
+        self.assertIn(b"\n\rTHEKERNEL_SHELL_READY\r\n# GOT:payload", log)
+        self.assertEqual(console, b"WARNING: no console will be available to OS\n# GOT:payload\n")
+
+    def test_boundary_cr_normalization_preserves_exact_marker_matching(self) -> None:
+        for line in (b"\r READY\r\n", b"\rREADY \r\n", b"prefix\rREADY\r\n"):
+            with self.subTest(line=line):
+                result, _, _ = self.run_child(
+                    f"import sys; sys.stdout.buffer.write({line!r}); sys.stdout.buffer.flush()",
+                    interaction=Interaction(interactive=True, input_after_marker="READY"),
+                    input_text=b"payload\n",
+                )
+                self.assertEqual(result.returncode, 4)
+                self.assertIn("before input-ready marker", result.error_message or "")
+
     def test_command_file_releases_one_complete_line_per_prompt(self) -> None:
         script = """
 import os, select

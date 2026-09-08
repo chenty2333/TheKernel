@@ -782,7 +782,10 @@ def _wait_for_process(
                 break
             raw_line = bytes(pending_output[: newline + 1])
             del pending_output[: newline + 1]
-            exact_line = raw_line.rstrip(b"\r\n").decode("utf-8", errors="replace")
+            # Firmware can end a line with LF-CR, leaving its carriage return
+            # before the next marker. Normalize boundary CRs only; spaces and
+            # other text must still prevent an exact marker match.
+            exact_line = raw_line.rstrip(b"\r\n").lstrip(b"\r").decode("utf-8", errors="replace")
             marker_line = _ANSI_ESCAPE_RE.sub("", exact_line)
             if any(marker_line == prefix or marker_line.startswith(prefix + " ")
                    for prefix in interaction.failure_prefixes):
