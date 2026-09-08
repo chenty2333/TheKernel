@@ -1275,3 +1275,109 @@ impl FileNode {
             .map_err(|_| VfsError::InvalidInput)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    struct CountedSource(Arc<AtomicUsize>);
+
+    impl OwnedFileIoBuffer for CountedSource {
+        fn len(&self) -> usize {
+            4
+        }
+        fn supports(&self, access: FileIoBufferAccess) -> bool {
+            access == FileIoBufferAccess::Source
+        }
+        fn source_copy_at(&self, offset: usize, destination: &mut [u8]) -> VfsResult<usize> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            destination.copy_from_slice(&b"new!"[offset..offset + destination.len()]);
+            Ok(destination.len())
+        }
+        fn destination_copy_at(&mut self, _: usize, _: &[u8]) -> VfsResult<usize> {
+            Err(VfsError::InvalidInput)
+        }
+    }
+
+    struct Completion(Arc<Mutex<Vec<FileIoCompletion>>>);
+
+    impl OwnedFileIoCompletion for Completion {
+        fn complete(self: Box<Self>, completion: FileIoCompletion) {
+            self.0.lock().unwrap().push(completion);
+        }
+        fn into_retry_completion(self: Box<Self>) -> Box<dyn OwnedFileIoCompletion> {
+            self
+        }
+    }
+
+    struct ReportingProvider(Arc<Mutex<Vec<u8>>>);
+
+    impl PreparedFileIoSubmission for ReportingProvider {
+        fn publish(
+            self: Box<Self>,
+            payload: FileIoPublishPayload,
+        ) -> Result<SubmittedFileIo, FileIoPublishError> {
+            let bytes = payload.geometry().len();
+            assert_eq!(self.0.lock().unwrap().len(), bytes);
+            // Deliberately skip both sourcing bytes and changing the target.
+            payload.commit().complete(ImmediateFileIoResult::Completed(bytes));
+            Ok(SubmittedFileIo::new(Box::new(TerminalControl)))
+        }
+        fn try_complete_immediate(
+            self: Box<Self>,
+            request: &mut dyn FileIoRequestAccess,
+        ) -> VfsResult<ImmediateFileIoResult> {
+            assert_eq!(self.0.lock().unwrap().len(), request.len());
+            Ok(ImmediateFileIoResult::Completed(request.len()))
+        }
+    }
+
+    struct TerminalControl;
+
+    impl SubmittedFileIoControl for TerminalControl {
+        fn cancel(self: Box<Self>) -> FileIoCancelOutcome {
+            FileIoCancelOutcome::Terminal
+        }
+    }
+
+    #[test]
+    fn successful_byte_count_trusts_provider_for_source_and_content_effects() {
+        // This records the current trust boundary, not a provider correctness
+        // guarantee: completion bounds/ownership do not certify content effects.
+        for immediate in [false, true] {
+            let source_reads = Arc::new(AtomicUsize::new(0));
+            let target = Arc::new(Mutex::new(vec![b'o', b'l', b'd', b'!']));
+            let completions = Arc::new(Mutex::new(Vec::new()));
+            let request = FileIoRequest::try_new(
+                FileIoOpcode::Write,
+                0,
+                Box::new(CountedSource(source_reads.clone())),
+            )
+            .unwrap();
+            let prepared = PreparedFileIo::new(
+                request,
+                Box::new(Completion(completions.clone())),
+                Box::new(ReportingProvider(target.clone())),
+            );
+            if immediate {
+                assert_eq!(
+                    prepared.try_complete_immediate().ok(),
+                    Some(ImmediateFileIoResult::Completed(4))
+                );
+            } else {
+                assert!(prepared.submit().is_ok());
+            }
+            assert_eq!(source_reads.load(Ordering::SeqCst), 0);
+            assert_eq!(target.lock().unwrap().as_slice(), b"old!");
+            let received = completions.lock().unwrap();
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].result, ImmediateFileIoResult::Completed(4));
+            assert_eq!(received[0].actual_offset, 0);
+            assert_eq!(received[0].request.len(), 4);
+        }
+    }
+}

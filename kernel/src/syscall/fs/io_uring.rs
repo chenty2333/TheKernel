@@ -3579,4 +3579,91 @@ mod tests {
             caller.address_space()
         ));
     }
+
+    #[cfg(feature = "io-submit-batch")]
+    #[test]
+    fn batched_fixed_geometry_keeps_admitted_owner_and_range_through_unregister() {
+        use axhal::paging::{MappingFlags, PageSize};
+        use memory_addr::VirtAddr;
+        use thekernel_linux_io_uring::SetupFlags;
+
+        let _context = crate::test_support::scheduler_test_context();
+        let mapped_capability = || {
+            let base = VirtAddr::from(0x1000);
+            let mut space = crate::mm::AddrSpace::new_empty(base, PAGE_SIZE_4K).unwrap();
+            space
+                .map(
+                    base,
+                    PAGE_SIZE_4K,
+                    MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                    false,
+                    crate::mm::Backend::new_alloc(base, PageSize::Size4K),
+                )
+                .unwrap();
+            UserMemoryCapability::new(Arc::new(axsync::Mutex::new(space)))
+        };
+        let registered = mapped_capability();
+        let caller = mapped_capability();
+        let world = crate::task::WorldId::BOOT;
+        let layout = SetupRequest::new(2, 0, SetupFlags::NO_SQARRAY)
+            .resolve(FeatureFlags::EMPTY)
+            .unwrap();
+        let ring = IoUring::try_new_in_world(layout, world).unwrap();
+        ring.register_buffers(world, &registered, alloc::vec![(0x1100, 0x100)])
+            .unwrap();
+        // These addresses are mapped, but lie outside the registered iovec.
+        // Rejection must not consume the capacity needed by the valid lease.
+        for (address, length) in [(0x10ff, 1), (0x11ff, 2), (u64::MAX, 2)] {
+            assert!(matches!(
+                ring.acquire_registered_buffer(world, BufferSlot::new(0), address, length),
+                Err(AxError::BadAddress)
+            ));
+        }
+        let lease = ring
+            .acquire_registered_buffer(world, BufferSlot::new(0), 0x1120, 0x20)
+            .unwrap();
+        // Supply different raw SQE geometry: after admission the retained
+        // lease, rather than those untrusted fields, determines the I/O range.
+        let mut bytes = [0; thekernel_linux_io_uring::SQE_BYTES as usize];
+        bytes[0] = 4; // IORING_OP_READ_FIXED
+        bytes[16..24].copy_from_slice(&0x1180_u64.to_le_bytes());
+        bytes[24..28].copy_from_slice(&0x40_u32.to_le_bytes());
+        let SubmissionOperation::Read(request) = ParsedSubmission::parse(bytes).unwrap().operation()
+        else {
+            panic!("expected fixed read");
+        };
+        assert!(matches!(
+            submission_io_geometry(&caller, request, None, true),
+            Err(AxError::BadAddress)
+        ));
+        for retiring in [false, true] {
+            if retiring {
+                ring.unregister_buffers().unwrap();
+                assert!(ring
+                    .acquire_registered_buffer(world, BufferSlot::new(0), 0x1120, 0x20)
+                    .is_err());
+                assert_eq!(
+                    ring.register_buffers(world, &caller, alloc::vec![(0x1100, 0x100)]),
+                    Err(AxError::ResourceBusy)
+                );
+            }
+            let (selected, range) =
+                submission_io_geometry(&caller, request, Some(&lease), true).unwrap();
+            assert_eq!(range, (0x1120, 0x20));
+            assert!(Arc::ptr_eq(selected.address_space(), registered.address_space()));
+            assert!(!Arc::ptr_eq(selected.address_space(), caller.address_space()));
+        }
+        drop(lease);
+        ring.register_buffers(world, &caller, alloc::vec![(0x1100, 0x100)])
+            .unwrap();
+        let replacement = ring
+            .acquire_registered_buffer(world, BufferSlot::new(0), 0x1180, 0x10)
+            .unwrap();
+        let (selected, range) =
+            submission_io_geometry(&registered, request, Some(&replacement), true).unwrap();
+        assert_eq!(range, (0x1180, 0x10));
+        assert!(Arc::ptr_eq(selected.address_space(), caller.address_space()));
+        drop(replacement);
+        ring.unregister_buffers().unwrap();
+    }
 }

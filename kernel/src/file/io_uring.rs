@@ -13035,6 +13035,8 @@ mod adapter_state_tests {
         assert_eq!(lease.validate_world(ring.world), Err(AxError::BadState));
         assert_eq!(lease.range(), Err(AxError::BadState));
         assert!(matches!(lease.capability(), Err(AxError::BadState)));
+        #[cfg(feature = "io-submit-batch")]
+        assert!(matches!(lease.capability_and_range(), Err(AxError::BadState)));
         ring.request_final_close();
         assert_eq!(ring.world, crate::task::WorldId::BOOT);
         assert_eq!(lease.validate_world(ring.world), Err(AxError::BadState));
