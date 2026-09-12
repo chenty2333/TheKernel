@@ -53,6 +53,8 @@ pub struct VirtIOSound<H: Hal, T: Transport> {
 
     queue_buf_send: Box<[u8]>,
     queue_buf_recv: Box<[u8]>,
+    control_timeout: Option<(fn() -> u64, u64)>,
+    control_failed: bool,
 
     set_up: bool,
 
@@ -142,6 +144,8 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
             chmap_infos: None,
             queue_buf_send,
             queue_buf_recv,
+            control_timeout: None,
+            control_failed: false,
             pcm_parameters,
             set_up: false,
             token_rsp: BTreeMap::new(),
@@ -170,12 +174,39 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
         self.transport.ack_interrupt()
     }
 
+    /// Bound control commands using the platform's monotonic nanosecond clock.
+    /// A timeout freezes this queue; its owner must retain the device and DMA
+    /// pages until transport reset. TheKernel keeps that owner in a static slot.
+    pub fn set_control_timeout(&mut self, clock: fn() -> u64, timeout_ns: u64) {
+        self.control_timeout = Some((clock, timeout_ns));
+    }
+
     fn request<Req: AsBytes>(&mut self, req: Req) -> Result<VirtIOSndHdr> {
-        self.control_queue.add_notify_wait_pop(
-            &[req.as_bytes()],
-            &mut [self.queue_buf_recv.as_bytes_mut()],
-            &mut self.transport,
-        )?;
+        if self.control_failed { return Err(Error::Quarantined); }
+        let length = req.as_bytes().len();
+        if length > self.queue_buf_send.len() { return Err(Error::InvalidParam); }
+        self.queue_buf_send[..length].copy_from_slice(req.as_bytes());
+        let input = &self.queue_buf_send[..length];
+        // Both DMA buffers remain device-owned on timeout; no borrowed stack
+        // request may escape its lifetime when a broken device fails to reply.
+        let token = unsafe { self.control_queue.add(&[input], &mut [self.queue_buf_recv.as_mut()])? };
+        if self.control_queue.should_notify() { self.transport.notify(CONTROL_QUEUE_IDX); }
+        let deadline = self.control_timeout.map(|(clock, duration)| (clock, clock().saturating_add(duration)));
+        while !self.control_queue.can_pop() {
+            if deadline.is_some_and(|(clock, limit)| clock() >= limit) {
+                self.control_failed = true;
+                return Err(Error::Quarantined);
+            }
+            spin_loop();
+        }
+        let response_len = match unsafe { self.control_queue.pop_used(token, &[input], &mut [self.queue_buf_recv.as_mut()]) } {
+            Ok(length) => length,
+            Err(error) => { self.control_failed = true; return Err(error); }
+        };
+        if response_len < size_of::<VirtIOSndHdr>() as u32 {
+            self.control_failed = true;
+            return Err(Error::IoError);
+        }
         Ok(VirtIOSndHdr::read_from_prefix(&self.queue_buf_recv).unwrap())
     }
 
@@ -578,41 +609,65 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
             self.set_up()?;
             self.set_up = true;
         }
+        if stream_id as usize >= self.pcm_parameters.len() {
+            return Err(Error::InvalidParam);
+        }
         if !self.pcm_parameters[stream_id as usize].setup {
             warn!("Please set parameters for a stream before using it!");
             return Err(Error::IoError);
         }
         const U32_SIZE: usize = size_of::<u32>();
         let period_size: usize = self.pcm_parameters[stream_id as usize].period_bytes as usize;
-        assert_eq!(period_size, frames.len());
+        if period_size != frames.len() {
+            return Err(Error::InvalidParam);
+        }
         let mut buf = vec![0; U32_SIZE + period_size];
         buf[..U32_SIZE].copy_from_slice(&stream_id.to_le_bytes());
         buf[U32_SIZE..U32_SIZE + period_size].copy_from_slice(frames);
         let mut rsp = VirtIOSndPcmStatus::new_box_zeroed();
-        let token = unsafe { self.tx_queue.add(&[&buf], &mut [rsp.as_bytes_mut()])? };
+        // Install every owning allocation before publishing DMA descriptors.
+        // In particular, BTreeMap insertion may allocate a new tree node.
+        let token = unsafe {
+            self.tx_queue
+                .add_unpublished(&[&buf], &mut [rsp.as_bytes_mut()])?
+        };
+        self.token_buf.insert(token, buf);
+        self.token_rsp.insert(token, rsp);
+        self.tx_queue.publish_unpublished(token);
         if self.tx_queue.should_notify() {
             self.transport.notify(TX_QUEUE_IDX);
         }
-        self.token_buf.insert(token, buf);
-        self.token_rsp.insert(token, rsp);
         Ok(token)
     }
 
     /// The PCM frame transmission corresponding to the given token has been completed.
     pub fn pcm_xfer_ok(&mut self, token: u16) -> Result {
-        assert!(self.token_buf.contains_key(&token));
-        assert!(self.token_rsp.contains_key(&token));
-        unsafe {
+        if !self.token_buf.contains_key(&token) || !self.token_rsp.contains_key(&token) {
+            return Err(Error::WrongToken);
+        }
+        let response_len = unsafe {
             self.tx_queue.pop_used(
                 token,
                 &[&self.token_buf[&token]],
                 &mut [self.token_rsp.get_mut(&token).unwrap().as_bytes_mut()],
-            )?;
-        }
+            )?
+        };
 
         self.token_buf.remove(&token);
-        self.token_rsp.remove(&token);
-        Ok(())
+        let status = self.token_rsp.remove(&token).unwrap();
+        if response_len >= size_of::<VirtIOSndPcmStatus>() as u32
+            && status.status == CommandCode::SOk.into()
+        {
+            Ok(())
+        } else {
+            Err(Error::IoError)
+        }
+    }
+
+    /// Returns the next completed playback token without waiting for a period.
+    /// The caller must retire it with `pcm_xfer_ok` before polling again.
+    pub fn pcm_completed(&self) -> Option<u16> {
+        self.tx_queue.peek_used()
     }
 
     /// Get all output streams.
@@ -1692,6 +1747,20 @@ mod tests {
     }
 
     #[test]
+    fn control_timeout_retains_request_pages_and_freezes_the_queue() {
+        let (_fake, transport) = FakeSoundDevice::new(vec![], vec![], vec![]);
+        let mut sound = VirtIOSound::<FakeHal, FakeTransport<VirtIOSoundConfig>>::new(transport).unwrap();
+        sound.set_control_timeout(|| 0, 0);
+        let request = || VirtIOSndPcmHdr { hdr: CommandCode::RPcmPrepare.into(), stream_id: 0 };
+        assert!(matches!(sound.request(request()), Err(Error::Quarantined)));
+        let descriptors = sound.control_queue.outstanding_descriptor_count();
+        assert!(descriptors > 0);
+        assert_eq!(&sound.queue_buf_send[..size_of::<VirtIOSndPcmHdr>()], request().as_bytes());
+        assert!(matches!(sound.request(request()), Err(Error::Quarantined)));
+        assert_eq!(sound.control_queue.outstanding_descriptor_count(), descriptors);
+    }
+
+    #[test]
     fn play() {
         let (fake, transport) = FakeSoundDevice::new(
             vec![],
@@ -1753,6 +1822,52 @@ mod tests {
         println!("Playing empty");
         sound.pcm_xfer(0, &[]).unwrap();
         assert_eq!(fake.played_bytes.lock().unwrap()[0], expected_sound);
+
+        // Nonblocking playback must expose real readiness and retire DMA even
+        // when the device rejects a period. Invalid callers cannot panic.
+        assert!(matches!(sound.pcm_xfer_nb(99, &[0; 100]), Err(Error::InvalidParam)));
+        assert!(matches!(sound.pcm_xfer_nb(0, &[0; 99]), Err(Error::InvalidParam)));
+        assert!(matches!(sound.pcm_xfer_ok(999), Err(Error::WrongToken)));
+        assert_eq!(sound.pcm_completed(), None);
+        let token = sound.pcm_xfer_nb(0, &[77; 100]).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while sound.pcm_completed().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(sound.pcm_completed(), Some(token));
+        sound.pcm_xfer_ok(token).unwrap();
+        expected_sound.extend([77; 100]);
+        assert_eq!(fake.played_bytes.lock().unwrap()[0], expected_sound);
+        fake.tx_status.store(CommandCode::SIoErr.into(), core::sync::atomic::Ordering::Release);
+        let token = sound.pcm_xfer_nb(0, &[88; 100]).unwrap();
+        while sound.pcm_completed().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(matches!(sound.pcm_xfer_ok(token), Err(Error::IoError)));
+        assert!(!sound.token_buf.contains_key(&token));
+        assert!(!sound.token_rsp.contains_key(&token));
+        fake.tx_status.store(CommandCode::SOk.into(), core::sync::atomic::Ordering::Release);
+        expected_sound.extend([88; 100]);
+
+        // A success header without the complete PCM status is malformed, but
+        // the consumed descriptor and its DMA allocations must still retire.
+        fake.tx_response_len
+            .store(4, core::sync::atomic::Ordering::Release);
+        let token = sound.pcm_xfer_nb(0, &[99; 100]).unwrap();
+        while sound.pcm_completed().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(matches!(sound.pcm_xfer_ok(token), Err(Error::IoError)));
+        assert!(!sound.token_buf.contains_key(&token));
+        assert!(!sound.token_rsp.contains_key(&token));
+        fake.tx_response_len.store(
+            size_of::<VirtIOSndPcmStatus>() as u32,
+            core::sync::atomic::Ordering::Release,
+        );
+        expected_sound.extend([99; 100]);
 
         // Send one buffer worth.
         println!("Playing 100");

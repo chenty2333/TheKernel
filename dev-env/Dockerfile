@@ -24,12 +24,17 @@ RUN sed -i \
       ca-certificates \
       curl \
       git \
+      libepoxy-dev \
       libfdt-dev \
+      libgbm-dev \
       libglib2.0-dev \
       libpixman-1-dev \
+      libpulse-dev \
       libslirp-dev \
+      libvirglrenderer-dev \
       meson \
       ninja-build \
+      patch \
       pkg-config \
       python3 \
       python3-venv \
@@ -39,16 +44,23 @@ RUN sed -i \
 
 WORKDIR /home/qemu-build
 
+COPY qemu-egl-headless-screendump.patch /home/qemu-build/
+
 RUN aria2c --allow-overwrite=true --auto-file-renaming=false --continue=true \
       --console-log-level=warn --download-result=hide --max-connection-per-server=8 \
       --min-split-size=1M --out="qemu-${QEMU_VERSION}.tar.xz" --split=8 \
       "https://download.qemu.org/qemu-${QEMU_VERSION}.tar.xz" \
  && tar -xf "qemu-${QEMU_VERSION}.tar.xz" \
  && cd "qemu-${QEMU_VERSION}" \
+ && patch -p1 < ../qemu-egl-headless-screendump.patch \
  && ./configure \
       --prefix="/opt/qemu-${QEMU_VERSION}" \
       --target-list="x86_64-softmmu" \
       --enable-slirp \
+      --enable-opengl \
+      --enable-virglrenderer \
+      --enable-pa \
+      --audio-drv-list=pa \
       --disable-docs \
       --disable-bsd-user \
       --disable-linux-user \
@@ -97,11 +109,18 @@ RUN sed -i \
       less \
       libclang-dev \
       libelf-dev \
+      libegl1 \
+      libegl-mesa0 \
+      libepoxy0 \
       libfdt1 \
+      libgbm1 \
       libglib2.0-0 \
+      libgl1-mesa-dri \
       libpixman-1-0 \
+      libpulse0 \
       libslirp0 \
       libssl-dev \
+      libvirglrenderer1 \
       mtools \
       make \
       ovmf \

@@ -10,6 +10,8 @@ use axpoll::{
     IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable, PreparedPollRegistration,
 };
 use axsync::Mutex;
+/// Largest ICMP quoted payload retained by the transport.
+pub use smol::MAX_UDP_ERROR_PAYLOAD;
 use smoltcp::{
     iface::SocketHandle,
     phy::PacketMeta,
@@ -31,6 +33,43 @@ use crate::{
     options::{Configurable, GetSocketOption, SetSocketOption, SocketFault},
     wrapper::Transport,
 };
+
+/// Metadata for an asynchronous network error, independent of Linux wire ABI.
+#[derive(Clone, Copy, Debug)]
+pub struct UdpError {
+    pub fault: SocketFault,
+    pub destination: core::net::SocketAddr,
+    pub offender: core::net::IpAddr,
+    pub icmp_type: u8,
+    pub icmp_code: u8,
+    pub info: u32,
+}
+
+fn icmp_fault(ipv6: bool, kind: u8, code: u8) -> SocketFault {
+    use SocketFault::*;
+    if ipv6 {
+        match (kind, code) {
+            (1, 0) => NetworkUnreachable,
+            (1, 1 | 5 | 6) => PermissionDenied,
+            (1, 2 | 3) | (3, _) => HostUnreachable,
+            (1, 4) => ConnectionRefused,
+            (2, _) => MessageTooLong,
+            _ => ProtocolError,
+        }
+    } else {
+        match (kind, code) {
+            (3, 0 | 6 | 9 | 11) => NetworkUnreachable,
+            (3, 1 | 10 | 12..=15) | (11, _) => HostUnreachable,
+            (3, 2) => ProtocolOptionUnsupported,
+            (3, 3) => ConnectionRefused,
+            (3, 4) => MessageTooLong,
+            (3, 5) => OperationNotSupported,
+            (3, 7) => HostDown,
+            (3, 8) => NoNetwork,
+            _ => ProtocolError,
+        }
+    }
+}
 
 /// Largest UDP payload representable by the transport's datagram framing.
 pub const MAX_UDP_SEND_LEN: usize = u16::MAX as usize;
@@ -154,6 +193,33 @@ impl UdpSocket {
         self.general.set_pending_error(error);
     }
 
+    /// Dequeue one ICMP error without blocking, independently of ordinary data.
+    pub fn recv_error(&self, dst: &mut [u8]) -> AxResult<(usize, usize, UdpError)> {
+        self.stack.poll_interfaces();
+        self.with_smol_socket(|socket| {
+            let error = socket.recv_error().ok_or(AxError::WouldBlock)?;
+            self.general.clear_pending_error();
+            let copied = dst.len().min(error.payload.len());
+            dst[..copied].copy_from_slice(&error.payload[..copied]);
+            Ok((
+                copied,
+                error.payload.len(),
+                UdpError {
+                    fault: icmp_fault(
+                        matches!(error.offender, IpAddress::Ipv6(_)),
+                        error.icmp_type,
+                        error.icmp_code,
+                    ),
+                    destination: error.destination.into(),
+                    offender: error.offender.into(),
+                    icmp_type: error.icmp_type,
+                    icmp_code: error.icmp_code,
+                    info: error.info,
+                },
+            ))
+        })
+    }
+
     /// Returns the next queued UDP payload length without consuming it.
     pub(crate) fn recv_pending_len(&self) -> AxResult<usize> {
         if self.rx_shutdown.load(Ordering::Acquire) {
@@ -210,7 +276,13 @@ impl UdpSocket {
     fn with_smol_socket<R>(&self, f: impl FnOnce(&mut smol::Socket) -> R) -> R {
         self.stack
             .socket_set
-            .with_socket_mut::<smol::Socket, _, _>(self.handle, f)
+            .with_socket_mut::<smol::Socket, _, _>(self.handle, |socket| {
+                let result = f(socket);
+                if let Some((ipv6, kind, code)) = socket.take_pending_error() {
+                    self.general.set_pending_error(icmp_fault(ipv6, kind, code));
+                }
+                result
+            })
     }
 
     fn remote_endpoint(&self) -> AxResult<(IpEndpoint, IpAddress)> {
@@ -427,10 +499,20 @@ impl Configurable for UdpSocket {
     fn get_option_inner(&self, option: &mut GetSocketOption) -> AxResult<bool> {
         use GetSocketOption as O;
 
+        if matches!(option, O::Error(_)) {
+            self.stack.poll_interfaces();
+            self.with_smol_socket(|_| ());
+        }
         if self.general.get_option_inner(option)? {
             return Ok(true);
         }
         match option {
+            O::ReceiveErrors4(enabled) if self.family == UdpSocketFamily::Ipv4 => {
+                **enabled = self.with_smol_socket(|socket| socket.receive_errors());
+            }
+            O::ReceiveErrors6(enabled) if self.family == UdpSocketFamily::Ipv6 => {
+                **enabled = self.with_smol_socket(|socket| socket.receive_errors());
+            }
             O::Ttl(ttl) => {
                 self.with_smol_socket(|socket| {
                     **ttl = socket.hop_limit().unwrap_or(64);
@@ -454,6 +536,18 @@ impl Configurable for UdpSocket {
             return Ok(true);
         }
         match option {
+            O::ReceiveErrors4(enabled) if self.family == UdpSocketFamily::Ipv4 => {
+                self.with_smol_socket(|socket| {
+                    socket.set_receive_errors(*enabled, self.family == UdpSocketFamily::Ipv6)
+                })
+                .map_err(|_| AxError::NoMemory)?;
+            }
+            O::ReceiveErrors6(enabled) if self.family == UdpSocketFamily::Ipv6 => {
+                self.with_smol_socket(|socket| {
+                    socket.set_receive_errors(*enabled, self.family == UdpSocketFamily::Ipv6)
+                })
+                .map_err(|_| AxError::NoMemory)?;
+            }
             O::Ttl(ttl) => {
                 self.with_smol_socket(|socket| {
                     socket.set_hop_limit(Some(*ttl));
@@ -729,6 +823,7 @@ impl Pollable for UdpSocket {
                 !self.tx_shutdown.load(Ordering::Acquire) && socket.can_send(),
             );
             events.set(IoEvents::READ_HANGUP, rx_shutdown);
+            events.set(IoEvents::ERROR, socket.has_error());
         });
         let events = self.general.add_pending_error_event(events);
         self.stack.add_terminal_events(events)
@@ -825,6 +920,42 @@ mod tests {
                 .unwrap(),
             payload.len()
         );
+    }
+
+    #[test]
+    fn real_loopback_icmp_errors_keep_pollerr_until_queue_drained() {
+        for family in [UdpSocketFamily::Ipv4, UdpSocketFamily::Ipv6] {
+            let stack = NetStack::new_loopback_only();
+            let socket = UdpSocket::new_with_family(stack.clone(), family).unwrap();
+            let address = match family {
+                UdpSocketFamily::Ipv4 => core::net::IpAddr::V4(core::net::Ipv4Addr::LOCALHOST),
+                UdpSocketFamily::Ipv6 => core::net::IpAddr::V6(core::net::Ipv6Addr::LOCALHOST),
+            };
+            let destination = core::net::SocketAddr::new(address, 31991);
+            let option = match family {
+                UdpSocketFamily::Ipv4 => SetSocketOption::ReceiveErrors4(&true),
+                UdpSocketFamily::Ipv6 => SetSocketOption::ReceiveErrors6(&true),
+            };
+            socket.set_option(option).unwrap();
+            assert_eq!(socket.send(&b"quoted-data"[..], SendOptions {
+                to: Some(SocketAddrEx::Ip(destination)), ..SendOptions::default()
+            }).unwrap(), 11);
+            for _ in 0..8 { stack.poll_interfaces(); }
+            assert!(socket.poll().contains(IoEvents::ERROR), "{family:?}");
+            let mut fault = None;
+            socket.get_option(GetSocketOption::Error(&mut fault)).unwrap();
+            assert_eq!(fault, Some(SocketFault::ConnectionRefused));
+            assert!(socket.poll().contains(IoEvents::ERROR));
+            let mut payload = [0; 6];
+            let (copied, total, metadata) = socket.recv_error(&mut payload).unwrap();
+            assert_eq!((copied, total), (6, 11));
+            assert_eq!(&payload, b"quoted");
+            assert_eq!(metadata.destination, destination);
+            assert_eq!(metadata.offender, address);
+            assert_eq!(metadata.fault, SocketFault::ConnectionRefused);
+            assert!(!socket.poll().contains(IoEvents::ERROR));
+            assert!(matches!(socket.recv_error(&mut payload), Err(AxError::WouldBlock)));
+        }
     }
 
     #[test]

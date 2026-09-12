@@ -108,7 +108,7 @@ pub struct ModernFeatures {
 /// while the command is in flight.
 pub struct RenderJob {
     pub context: u32,
-    pub ring_idx: u32,
+    pub ring_idx: Option<u32>,
     pub commands: Vec<u8>,
     pub resources: Vec<u32>,
     // Deliberately not exposed to adapters: it is solely an ownership pin.
@@ -123,15 +123,35 @@ pub struct RenderJob {
     pub cancelled: Arc<core::sync::atomic::AtomicBool>,
 }
 
-struct FenceFailureGuard(Arc<Fence>);
+#[cfg(test)]
+impl RenderJob {
+    pub(super) fn empty_for_test(completion: Arc<Fence>) -> Self {
+        Self {
+            context: 1,
+            ring_idx: None,
+            commands: Vec::new(),
+            resources: Vec::new(),
+            objects: Vec::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            predecessors: Vec::new(),
+            completion,
+            cancelled: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+struct FenceFailureGuard(Option<Arc<Fence>>);
 impl FenceFailureGuard {
-    fn disarm(self) {
-        core::mem::forget(self);
+    fn disarm(mut self) {
+        self.0.take();
     }
 }
 impl Drop for FenceFailureGuard {
     fn drop(&mut self) {
-        self.0.signal_error();
+        if let Some(fence) = &self.0 {
+            fence.signal_error();
+        }
     }
 }
 
@@ -193,10 +213,10 @@ pub trait RenderAdapter: Send + Sync {
         transfer: RenderTransfer,
         to_host: bool,
     ) -> DrmResult<()>;
-    /// Queue an EXECBUFFER without waiting.  The adapter must retain `job`
-    /// through the exact terminal host completion, then detach its resources
-    /// and signal or error-signal `job.completion`.
-    fn submit(&self, job: RenderJob) -> DrmResult<()>;
+    /// Reserve queue capacity before calling `prepare` exactly once. The
+    /// callback publishes reservations and outputs; a full queue must return
+    /// without invoking it. Retain the resulting job until host completion.
+    fn submit(&self, prepare: &mut dyn FnMut() -> AxResult<RenderJob>) -> AxResult<()>;
 }
 
 struct RenderBacking {
@@ -871,7 +891,7 @@ fn transfer(
     let a = file.render_adapter().map_err(drm)?;
     let c = file.render_context().map_err(drm)?;
     let completion = Fence::new(false);
-    let guard = FenceFailureGuard(completion.clone());
+    let guard = FenceFailureGuard(Some(completion.clone()));
     let mut reservations = [&obj.reservation];
     let predecessors =
         match super::fence::Reservation::replace_many(&mut reservations, completion.clone()) {
@@ -1003,70 +1023,54 @@ fn exec(file: &DrmFile, context: &crate::file::IoctlContext, arg: usize) -> AxRe
         return Err(AxError::InvalidInput);
     }
     let completion = Fence::new(false);
-    let guard = FenceFailureGuard(completion.clone());
+    let guard = FenceFailureGuard(Some(completion.clone()));
     let exported_fd = if r.flags & FENCE_FD_OUT != 0 {
         let fd = syncobj::export(completion.clone(), context, false)?;
         r.fence_fd = fd;
-        if let Err(error) = write(copy, arg, &r) {
-            let _ = crate::file::close_file_like(fd);
-            return Err(error);
-        }
         Some(fd)
     } else {
         None
     };
-    let predecessors =
-        match super::fence::Reservation::replace_many(&mut reservations, completion.clone()) {
-            Ok(predecessors) => predecessors,
-            Err(error) => {
-                if let Some(fd) = exported_fd {
-                    let _ = crate::file::close_file_like(fd);
-                }
-                return Err(error);
-            }
-        };
-
-    // Publish each output before queue admission.  The completion stays
-    // unsignaled until the VirtIO completion worker observes the host's
-    // terminal record, so a fast worker can never complete a job before its
-    // output syncobj names the same fence.  From this point on the failure
-    // guard makes admission failure visible through that same error fence.
-    for (object, point, reset) in &outputs {
-        object
-            .apply_exec_output(*reset, *point, completion.clone())
-            .map_err(|error| {
-                if let Some(fd) = exported_fd {
-                    let _ = crate::file::close_file_like(fd);
-                }
-                error
-            })?;
-    }
-
-    let job = RenderJob {
+    let mut job = Some(RenderJob {
         context: render_context,
-        ring_idx: r.ring_idx,
+        ring_idx: (r.flags & RING_IDX != 0).then_some(r.ring_idx),
         commands,
         resources,
-        objects: objects.into_iter().map(|(_, object)| object).collect(),
+        objects: objects.iter().map(|(_, object)| object.clone()).collect(),
         inputs,
         outputs,
-        predecessors,
+        predecessors: Vec::new(),
         completion: completion.clone(),
         cancelled: file.render_cancelled(),
-    };
+    });
 
     // This only admits a state-owned job.  In particular it never waits for
     // an input or reservation fence in ioctl context, and FENCE_FD_OUT is
     // exported while still unsignaled.
-    if let Err(error) = adapter.submit(job).map_err(drm) {
+    if let Err(error) = adapter.submit(&mut || {
+        let mut job = job.take().ok_or(AxError::BadState)?;
+        job.predecessors =
+            super::fence::Reservation::replace_many(&mut reservations, completion.clone())?;
+        for (object, point, reset) in &job.outputs {
+            object.apply_exec_output(*reset, *point, completion.clone())?;
+        }
+        Ok(job)
+    }) {
         if let Some(fd) = exported_fd {
             let _ = crate::file::close_file_like(fd);
         }
         return Err(error);
     }
-    // Admission owns the already-published completion fence now.
-    let _ = exported_fd;
+    // Admission owns the completion now, even if the final user copy fails.
     guard.disarm();
+    if let Some(fd) = exported_fd {
+        // An EAGAIN retry must see the original request, not a descriptor
+        // which the failed admission has already closed.
+        if let Err(error) = write(copy, arg, &r) {
+            let _ = crate::file::close_file_like(fd);
+            return Err(error);
+        }
+    }
     Ok(())
 }
 
@@ -1099,6 +1103,19 @@ mod tests {
             output[..src.len()].copy_from_slice(src);
             Ok(())
         }
+    }
+
+    #[test]
+    fn disarmed_failure_guard_releases_its_fence_reference() {
+        let fence = Fence::new(false);
+        let guard = FenceFailureGuard(Some(fence.clone()));
+        assert_eq!(Arc::strong_count(&fence), 2);
+        guard.disarm();
+        assert_eq!(Arc::strong_count(&fence), 1);
+        assert!(!fence.is_signaled());
+        drop(FenceFailureGuard(Some(fence.clone())));
+        assert!(fence.is_failed());
+        assert_eq!(Arc::strong_count(&fence), 1);
     }
 
     #[test]

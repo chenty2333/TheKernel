@@ -87,6 +87,8 @@ def build_qemu_command(
     graphics_profile: GraphicsProfile = "headless",
     graphics_width: int = 800,
     graphics_height: int = 600,
+    audio_backend: str | None = None,
+    audio_path: Path | None = None,
     qmp_socket: Path | None = None,
     diagnostic_log_path: Path | None = None,
     extra_args: tuple[str, ...] = (),
@@ -101,6 +103,10 @@ def build_qemu_command(
         raise CommandError(f"unsupported graphics profile: {graphics_profile}")
     if graphics_width <= 0 or graphics_height <= 0:
         raise CommandError("graphics dimensions must be positive")
+    if audio_backend not in {None, "pa", "wav"}:
+        raise CommandError("unsupported audio backend")
+    if (audio_backend == "wav") != (audio_path is not None):
+        raise CommandError("WAV audio requires its output path; other backends must not supply one")
     if qmp_socket is not None and (
         not str(qmp_socket) or any(char in str(qmp_socket) for char in ",\n\r")
     ):
@@ -165,6 +171,11 @@ def build_qemu_command(
                 "virtio-rng-pci,rng=rng0",
             ]
         )
+        if audio_backend is not None:
+            backend = f"{audio_backend},id=desktop-audio"
+            if audio_path is not None:
+                backend += f",path={_escaped_path(audio_path)}"
+            command.extend(["-audiodev", backend, "-device", "virtio-sound-pci,audiodev=desktop-audio,streams=1"])
         if input_backend == "virtio":
             command.extend([
                 "-device",

@@ -104,6 +104,27 @@ class RunnerTests(unittest.TestCase):
                 workdir=root, log_path=root / "console.log", direct_kernel=True)
             with self.assertRaisesRegex(RunnerError, "kernel log aliases"):
                 run(config)
+
+    def test_wav_audio_is_fresh_and_cannot_overwrite_a_run_input(self):
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            kernel = root / "kernel"
+            kernel.write_bytes(b"kernel")
+            audio = root / "audio.wav"
+            config = RunConfig(arch="x86_64", kernel=kernel, rootfs=None,
+                workdir=root, log_path=root / "console.log", direct_kernel=True, audio_backend="wav")
+            audio.hardlink_to(kernel)
+            with self.assertRaisesRegex(RunnerError, "WAV audio aliases"):
+                run(config)
+            self.assertEqual(kernel.read_bytes(), b"kernel")
+            audio.unlink()
+            audio.write_bytes(b"stale recording")
+            def capture(**kwargs):
+                self.assertFalse(audio.exists())
+                self.assertIn(f"wav,id=desktop-audio,path={audio}", kwargs["command"])
+                return RunResult(3, kwargs["log_path"])
+            with patch("tools.qemu_runner.runner.run_process", side_effect=capture):
+                self.assertEqual(run(config).returncode, 3)
             self.assertEqual(kernel.read_bytes(), b"kernel")
 
     def test_failed_run_cannot_leave_a_previous_screenshot(self):

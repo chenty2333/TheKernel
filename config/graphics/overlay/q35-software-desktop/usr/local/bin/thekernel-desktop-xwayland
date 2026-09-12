@@ -1,10 +1,9 @@
 #!/bin/sh
 # Use glamor on the Virgl render node; the plain VirtIO display uses wl_shm.
-# Disable X11 MIT-SHM: its SysV ShmAttach path fails for GTK clients.
 set -eu
 if [ -c /dev/dri/renderD128 ]; then
     unset XWAYLAND_NO_GLAMOR
 else
     export XWAYLAND_NO_GLAMOR=1
 fi
-exec /usr/bin/Xwayland -extension MIT-SHM "$@" 2>"$XDG_RUNTIME_DIR/xwayland.log"
+exec /usr/bin/Xwayland "$@" 2>"$XDG_RUNTIME_DIR/xwayland.log"

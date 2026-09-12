@@ -942,6 +942,8 @@ struct PidNamespacePids {
     /// Exclusive local-PID ceiling for this particular namespace.
     pid_max: Pid,
     next: Pid,
+    allocation_disabled: bool,
+    pending_publications: usize,
 }
 
 impl PidNamespacePids {
@@ -958,6 +960,8 @@ impl PidNamespacePids {
             by_local: HashMap::new(),
             pid_max,
             next: 1,
+            allocation_disabled: false,
+            pending_publications: 0,
         };
         if let Some(init_pid) = init_pid {
             pids.try_insert(init_pid, 1)?;
@@ -1033,6 +1037,18 @@ impl PidNamespacePids {
         Ok(true)
     }
 
+    fn reserve_publication(&mut self, global_pid: Pid, local_pid: Option<Pid>) -> AxResult<bool> {
+        if self.allocation_disabled {
+            return Err(AxError::NoMemory);
+        }
+        let allocated = match local_pid {
+            Some(pid) => self.try_reserve_exact(global_pid, pid)?,
+            None => self.try_reserve(global_pid)?,
+        };
+        self.pending_publications += 1;
+        Ok(allocated)
+    }
+
     fn pid_max(&self) -> Pid {
         self.pid_max
     }
@@ -1079,9 +1095,11 @@ impl PidNamespaceReservation {
 
 impl Drop for PidNamespaceReservation {
     fn drop(&mut self) {
+        let mut pids = self.namespace.pids.lock();
         if !self.committed && self.allocated_here {
-            self.namespace.pids.lock().release(self.global_pid);
+            pids.release(self.global_pid);
         }
+        pids.pending_publications -= 1;
     }
 }
 
@@ -1167,10 +1185,19 @@ impl PidNamespace {
         self.pids.lock().by_global.is_empty()
     }
 
+    /// Close allocation under the same lock as reservation, then let every
+    /// already admitted clone publish or roll back before the exit walk.
+    pub(crate) fn disable_allocation(&self) {
+        self.pids.lock().allocation_disabled = true;
+    }
+
+    pub(crate) fn has_pending_publications(&self) -> bool {
+        self.pids.lock().pending_publications != 0
+    }
+
     /// Linux disables PID allocation when a namespace's child reaper exits.
-    /// The process core retains the scope-init identity through zombie/reap,
-    /// so its liveness is the authoritative distinction between a newly
-    /// created (not-yet-bound) namespace and a dead namespace.  The latter
+    /// The process core retains whether its scope init was ever bound, so a
+    /// reaped init cannot make a dead namespace look newly created. The latter
     /// deliberately reports ENOMEM, matching alloc_pid()'s long-standing
     /// externally visible result rather than leaking a core NotLive detail.
     fn child_reaper_allows_new_processes(&self) -> bool {
@@ -1179,7 +1206,7 @@ impl PidNamespace {
             Some(scope) => match scope.init_process() {
                 // A CLONE_NEWPID/unshare first child has reserved a namespace
                 // but has not yet atomically published its scope init.
-                None => true,
+                None => !scope.was_initialized(),
                 Some(init) => init.is_live(),
             },
         }
@@ -1212,7 +1239,7 @@ impl PidNamespace {
             .map(|parent| parent.reserve_process(global_pid))
             .transpose()?
             .map(Box::new);
-        let allocated_here = self.pids.lock().try_reserve(global_pid)?;
+        let allocated_here = self.pids.lock().reserve_publication(global_pid, None)?;
         Ok(PidNamespaceReservation {
             namespace: self.clone(),
             global_pid,
@@ -1279,9 +1306,9 @@ impl PidNamespace {
                 namespace
                     .pids
                     .lock()
-                    .try_reserve_exact(global_pid, local_pid)?
+                    .reserve_publication(global_pid, Some(local_pid))?
             } else {
-                namespace.pids.lock().try_reserve(global_pid)?
+                namespace.pids.lock().reserve_publication(global_pid, None)?
             };
             let mut reservation = PidNamespaceReservation {
                 namespace: namespace.clone(),
@@ -2033,6 +2060,10 @@ impl NetworkNamespace {
 
     pub(crate) fn try_new_loopback_only(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
         Self::try_new(NetStack::try_new_loopback_only()?, owner_user_ns)
+    }
+
+    pub(crate) fn try_new_network_namespace(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+        Self::try_new(NetStack::try_new_network_namespace()?, owner_user_ns)
     }
 
     pub(crate) fn stack(&self) -> &Arc<NetStack> {
@@ -8263,6 +8294,43 @@ mod tests {
     }
 
     #[test]
+    fn pid_namespace_shutdown_drains_admitted_clones_and_closes_descendants() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root(owner.clone()).unwrap();
+        let root = PidNamespace::try_new_root(owner.clone()).unwrap();
+        root.reserve_process(10).unwrap().commit();
+        let child = root.try_fork(20, owner.clone()).unwrap();
+        child.reserve_process(20).unwrap().commit();
+        let nested = child.try_fork(30, owner).unwrap();
+        nested.reserve_process(30).unwrap().commit();
+        let admitted = nested.reserve_process(31).unwrap();
+        let cancelled = child.reserve_process(21).unwrap();
+
+        child.disable_allocation();
+        assert!(child.has_pending_publications());
+        admitted.commit();
+        assert!(child.has_pending_publications());
+        drop(cancelled);
+        assert!(!child.has_pending_publications());
+        assert!(!root.has_pending_publications());
+        assert!(!nested.has_pending_publications());
+        assert_eq!(nested.visible_pid_checked(31), Some(2));
+        assert_eq!(child.visible_pid_checked(21), None);
+
+        for ids in [&[][..], &[7, 8, 9][..]] {
+            assert!(matches!(
+                nested.reserve_process_with_ids(40, ids, &actor),
+                Err(AxError::NoMemory)
+            ));
+            assert_eq!(nested.visible_pid_checked(40), None);
+        }
+        assert!(matches!(nested.reserve_process(41), Err(AxError::NoMemory)));
+        assert!(!nested.has_pending_publications());
+        // Closing a child never disables unrelated outer-namespace forks.
+        root.reserve_process(50).unwrap().commit();
+    }
+
+    #[test]
     fn exact_pid_slots_reject_invalid_and_colliding_values() {
         let mut pids = PidNamespacePids::try_new(None).unwrap();
         assert_eq!(pids.try_reserve_exact(10, 42), Ok(true));
@@ -8305,6 +8373,28 @@ mod tests {
         assert!(matches!(
             child.reserve_process_with_ids(104, &[2, 3, 4], &actor),
             Err(AxError::InvalidInput)
+        ));
+    }
+
+    #[test]
+    fn pid_namespace_with_released_reaper_remains_closed() {
+        let owner = UserNamespace::try_new_root().unwrap();
+        let actor = Cred::try_root(owner.clone()).unwrap();
+        let domain = super::ProcessDomain::try_new().unwrap();
+        let namespace = PidNamespace::try_new_root_with_reaper_scope(
+            owner, domain.root_reaper_scope(),
+        ).unwrap();
+        namespace.reserve_process(100).unwrap().commit();
+        let init = domain.try_new_init(100, None).unwrap();
+        let weak_init = Arc::downgrade(&init);
+        drop(init);
+        drop(domain);
+        assert!(weak_init.upgrade().is_none());
+        assert!(!namespace.child_reaper_allows_new_processes());
+        assert!(matches!(namespace.reserve_process(101), Err(AxError::NoMemory)));
+        assert!(matches!(
+            namespace.reserve_process_with_ids(101, &[2], &actor),
+            Err(AxError::NoMemory)
         ));
     }
 

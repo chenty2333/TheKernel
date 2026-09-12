@@ -614,6 +614,9 @@ pub(crate) fn init() {
 }
 
 fn dispatch() {
+    if axruntime::klog::take_reader_notification() {
+        crate::syscall::notify_syslog_readers();
+    }
     if axruntime::klog::diagnostic_work_pending() {
         LOG_WORKER_WAKE.wake();
     }

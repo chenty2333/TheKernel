@@ -11,7 +11,7 @@ use std::{
     iter::repeat_with,
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread::{self, JoinHandle},
 };
@@ -43,6 +43,8 @@ pub struct FakeSoundDevice {
     pub params: Arc<Mutex<Vec<Option<VirtIOSndPcmSetParams>>>>,
     /// The bytes send on the TX queue for each channel.
     pub played_bytes: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub tx_status: Arc<AtomicU32>,
+    pub tx_response_len: Arc<AtomicU32>,
     pub jack_infos: Vec<VirtIOSndJackInfo>,
     pub pcm_infos: Vec<VirtIOSndPcmInfo>,
     pub chmap_infos: Vec<VirtIOSndChmapInfo>,
@@ -85,6 +87,8 @@ impl FakeSoundDevice {
                 terminate: Arc::new(AtomicBool::new(false)),
                 params: Arc::new(Mutex::new(params)),
                 played_bytes: Arc::new(Mutex::new(played_bytes)),
+                tx_status: Arc::new(AtomicU32::new(CommandCode::SOk.into())),
+                tx_response_len: Arc::new(AtomicU32::new(size_of::<VirtIOSndPcmStatus>() as u32)),
                 jack_infos,
                 pcm_infos,
                 chmap_infos,
@@ -138,12 +142,14 @@ impl FakeSoundDevice {
         self.played_bytes.lock().unwrap()[usize::try_from(header.stream_id).unwrap()]
             .extend(&request[size_of::<VirtIOSndPcmXfer>()..]);
 
-        VirtIOSndPcmStatus {
-            status: CommandCode::SOk.into(),
+        let mut response = VirtIOSndPcmStatus {
+            status: self.tx_status.load(Ordering::Acquire),
             latency_bytes: 0,
         }
         .as_bytes()
-        .to_owned()
+        .to_owned();
+        response.truncate(self.tx_response_len.load(Ordering::Acquire) as usize);
+        response
     }
 
     fn handle_control_request(&self, request: &[u8]) -> Vec<u8> {

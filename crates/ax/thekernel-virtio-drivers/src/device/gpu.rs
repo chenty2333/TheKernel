@@ -16,11 +16,11 @@ use bitflags::bitflags;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use crate::{
+    Error, PAGE_SIZE, Result,
     hal::Hal,
     queue::VirtQueue,
     transport::{SharedMemoryRegion, Transport},
-    volatile::{volread, volwrite, ReadOnly, Volatile, WriteOnly},
-    Error, Result, PAGE_SIZE,
+    volatile::{ReadOnly, Volatile, WriteOnly, volread, volwrite},
 };
 
 /// Control work is deliberately bounded.  Each accepted asynchronous command
@@ -118,7 +118,8 @@ struct Resource {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResourceKind {
-    Legacy,
+    Legacy2d,
+    Render3d,
     GuestBlob,
     Host3dBlob,
     Host3dGuestBlob,
@@ -298,8 +299,8 @@ struct PendingCursor {
     request: Box<[u8]>,
 }
 
-/// One externally visible presentation is three strictly ordered controlq
-/// commands.  Only `fence_id` is visible above this layer; `in_flight` is an
+/// One externally visible presentation consists of ordered controlq
+/// commands (with an upload only for CPU-written 2D resources).  Only `fence_id` is visible above this layer; `in_flight` is an
 /// internal command fence and is never completed to the caller.
 struct PresentBatch {
     fence_id: u64,
@@ -307,6 +308,7 @@ struct PresentBatch {
     visible: Rect,
     damage: Rect,
     blob_layout: Option<BlobScanoutLayout>,
+    upload: bool,
     stage: PresentStage,
     in_flight: Option<u64>,
 }
@@ -451,7 +453,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             ResourceKind::GuestBlob | ResourceKind::Host3dBlob | ResourceKind::Host3dGuestBlob => {
                 resource.backing_bytes.ok_or(Error::InvalidParam)
             }
-            ResourceKind::Legacy => Err(Error::InvalidParam),
+            ResourceKind::Legacy2d | ResourceKind::Render3d => Err(Error::InvalidParam),
         }
     }
 
@@ -763,6 +765,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                 stride,
                 offset,
             }),
+            upload: false,
             stage: PresentStage::SetScanoutBlob,
             in_flight: None,
         });
@@ -777,7 +780,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
     pub fn submit_3d(
         &mut self,
         context: u32,
-        ring_idx: u32,
+        ring_idx: Option<u32>,
         commands: &[u8],
         resources: &[u32],
     ) -> Result<GpuSubmission> {
@@ -797,7 +800,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             || !self
                 .contexts
                 .iter()
-                .any(|c| c.id.0 == context && ring_idx < c.rings)
+                .any(|c| c.id.0 == context && ring_idx.is_none_or(|ring| ring < c.rings))
         {
             return Err(Error::InvalidParam);
         }
@@ -817,7 +820,12 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         }
         let fence = self.next_fence()?;
         let header = CmdSubmit {
-            header: CtrlHeader::fenced_ring(Command::SUBMIT_3D, context, fence, ring_idx),
+            // The default global timeline and explicitly selected context
+            // ring zero are different virtio-gpu fence domains.
+            header: match ring_idx {
+                Some(ring) => CtrlHeader::fenced_ring(Command::SUBMIT_3D, context, fence, ring),
+                None => CtrlHeader::fenced(Command::SUBMIT_3D, context, fence),
+            },
             size: u32::try_from(commands.len()).map_err(|_| Error::InvalidParam)?,
             _padding: 0,
         };
@@ -911,7 +919,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             backing: BackingState::Detached,
             lifecycle: ResourceLifecycle::CreateUncertain,
             backing_bytes: Some(u64::from(width) * u64::from(height) * 4),
-            kind: ResourceKind::Legacy,
+            kind: ResourceKind::Legacy2d,
             uuid: None,
             mapped: false,
             map_offset: None,
@@ -942,7 +950,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
     }
 
     /// Reserve a context ID and publish CTX_CREATE. A failed completion
-    /// schedules a fenced destroy for the never-reused ID (or resets the
+    /// schedules a destroy for the never-reused ID (or resets the
     /// queue if that cleanup cannot be owned), so an uncertain host context
     /// can never be confused with a later client context.
     pub fn submit_create_context(
@@ -1012,7 +1020,9 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
     }
 
     /// Asynchronous CTX_DESTROY.  The context remains locally live until the
-    /// exact used-ring completion commits its removal.
+    /// exact used-ring completion commits its removal. Do not request a GPU
+    /// fence after destroying the rendering context: the used descriptor is
+    /// the acknowledgment of this synchronous control operation.
     pub fn submit_destroy_context(&mut self, context: u32) -> Result<GpuSubmission> {
         let id = self
             .contexts
@@ -1033,7 +1043,10 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             context,
             PendingControlOperation::DestroyContext(id),
             CtxDestroy {
-                header: CtrlHeader::fenced(Command::CTX_DESTROY, context, fence),
+                header: CtrlHeader {
+                    ctx_id: context,
+                    ..CtrlHeader::with_type(Command::CTX_DESTROY)
+                },
             }
             .as_bytes()
             .to_vec(),
@@ -1153,7 +1166,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             backing: BackingState::Detached,
             lifecycle: ResourceLifecycle::CreateUncertain,
             backing_bytes: None,
-            kind: ResourceKind::Legacy,
+            kind: ResourceKind::Render3d,
             uuid: None,
             mapped: false,
             map_offset: None,
@@ -1522,11 +1535,10 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         )
     }
 
-    /// Submit one complete 2D presentation.  Its single externally visible
-    /// fence becomes terminal only after SET_SCANOUT, TRANSFER_TO_HOST_2D,
-    /// and RESOURCE_FLUSH have each completed successfully.  The individual
-    /// command fences remain private so a caller cannot mistake a configured
-    /// scanout for pixels that have reached the host.
+    /// Present a legacy resource using its native host representation. CPU
+    /// 2D resources require an upload; virgl 3D textures are already rendered
+    /// on the host and must never be overwritten from guest backing pages.
+    /// The public fence completes only after the final RESOURCE_FLUSH.
     pub fn submit_present(
         &mut self,
         resource: ResourceId,
@@ -1544,6 +1556,11 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         {
             return Err(Error::InvalidParam);
         }
+        let upload = match entry.kind {
+            ResourceKind::Legacy2d => true,
+            ResourceKind::Render3d => false,
+            _ => return Err(Error::InvalidParam),
+        };
         // Reserve all terminal-record capacity before the batch gains a
         // resource lifetime pin. Reset may need one result for every queued
         // batch in addition to ordinary control submissions.
@@ -1560,6 +1577,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             visible,
             damage,
             blob_layout: None,
+            upload,
             stage: PresentStage::SetScanout,
             in_flight: None,
         });
@@ -1662,7 +1680,13 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
         let batch = &mut self.pending_presents[index];
         batch.in_flight = None;
         match batch.stage {
-            PresentStage::SetScanout => batch.stage = PresentStage::TransferToHost,
+            PresentStage::SetScanout => {
+                batch.stage = if batch.upload {
+                    PresentStage::TransferToHost
+                } else {
+                    PresentStage::Flush
+                };
+            }
             PresentStage::SetScanoutBlob => batch.stage = PresentStage::Flush,
             PresentStage::TransferToHost => batch.stage = PresentStage::Flush,
             PresentStage::Flush => {
@@ -1828,6 +1852,15 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
                     pending.response[start..end].to_vec(),
                 ))
             }
+            PendingControlOperation::DestroyContext(_)
+            | PendingControlOperation::DestroyUncertainContext(_) => {
+                // Unfenced replies need not echo ctx_id or a fence ID. The
+                // exact retained descriptor token identifies this operation.
+                let header =
+                    CtrlHeader::read_from_prefix(&pending.response).ok_or(Error::IoError)?;
+                header.check_type(Command::OK_NODATA)?;
+                Ok(GpuCompletionData::None)
+            }
             _ => {
                 let header =
                     CtrlHeader::read_from_prefix(&pending.response).ok_or(Error::IoError)?;
@@ -1934,7 +1967,7 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
 
     /// Preserve cleanup ownership after a failed context-create completion.
     /// The host may have created the context despite a lost/error response,
-    /// so submit a fenced destroy using a distinct never-reused identity. If
+    /// so submit a destroy using a distinct never-reused identity. If
     /// the cleanup request cannot be published, the control queue is reset
     /// rather than allowing later work to overlap an ambiguous context.
     fn abort_control_operation(&mut self, operation: PendingControlOperation) {
@@ -1976,7 +2009,10 @@ impl<H: Hal, T: Transport> VirtIOGpu<H, T> {
             }
         };
         let request = CtxDestroy {
-            header: CtrlHeader::fenced(Command::CTX_DESTROY, context.get(), fence),
+            header: CtrlHeader {
+                ctx_id: context.get(),
+                ..CtrlHeader::with_type(Command::CTX_DESTROY)
+            },
         }
         .as_bytes()
         .to_vec();
@@ -2615,6 +2651,160 @@ mod tests {
         assert!(header.check_fence(Command::SUBMIT_3D, 7, 9).is_ok());
     }
     #[test]
+    fn submit_preserves_global_and_explicit_context_ring_fence_domains() {
+        use alloc::{boxed::Box, sync::Arc, vec};
+        use core::ptr::NonNull;
+        use std::sync::Mutex;
+
+        use crate::{
+            hal::fake::FakeHal,
+            transport::{
+                DeviceType,
+                fake::{FakeTransport, QueueStatus, State},
+            },
+        };
+        for ring in [None, Some(0)] {
+            let mut config = Box::new(unsafe { core::mem::zeroed::<Config>() });
+            let state = Arc::new(Mutex::new(State {
+                queues: vec![QueueStatus::default(), QueueStatus::default()],
+                ..State::default()
+            }));
+            let transport = FakeTransport {
+                device_type: DeviceType::GPU,
+                max_queue_size: QUEUE_SIZE as u32,
+                device_features: Features::VIRGL.bits(),
+                config_space: NonNull::from(config.as_mut()),
+                state: state.clone(),
+            };
+            let mut gpu = VirtIOGpu::<FakeHal, _>::new(transport).unwrap();
+            let id = ContextId(1);
+            gpu.contexts.push(Context {
+                id,
+                resources: Vec::new(),
+                rings: 1,
+            });
+            assert_eq!(
+                gpu.submit_3d(id.get(), Some(1), &[0, 0, 0, 0], &[]).err(),
+                Some(Error::InvalidParam)
+            );
+            let submission = gpu.submit_3d(id.get(), ring, &[0, 0, 0, 0], &[]).unwrap();
+            assert!(
+                state
+                    .lock()
+                    .unwrap()
+                    .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE_TRANSMIT, |input| {
+                        let header = CtrlHeader::read_from_prefix(&input).unwrap();
+                        assert_eq!(header.hdr_type, Command::SUBMIT_3D);
+                        assert_eq!(header.flags, if ring.is_some() { 3 } else { 1 });
+                        assert_eq!(header.ctx_id, id.get());
+                        assert_eq!(header.fence_id, submission.fence_id);
+                        assert_eq!(header.ring_idx, 0);
+                        let mut response = input[..24].to_vec();
+                        response[..4].copy_from_slice(&Command::OK_NODATA.0.to_le_bytes());
+                        response
+                    })
+            );
+            let mut out = [GpuCompletion {
+                fence_id: 0,
+                result: Ok(()),
+                data: GpuCompletionData::None,
+            }];
+            assert_eq!(gpu.drain_control_completions(&mut out).unwrap(), 1);
+            assert_eq!(out[0].fence_id, submission.fence_id);
+            assert_eq!(out[0].result, Ok(()));
+        }
+    }
+
+    #[test]
+    fn context_destroy_uses_descriptor_ack_without_post_destroy_fence() {
+        use alloc::{boxed::Box, sync::Arc, vec};
+        use core::ptr::NonNull;
+        use std::sync::Mutex;
+
+        use crate::{
+            hal::fake::FakeHal,
+            transport::{
+                DeviceType,
+                fake::{FakeTransport, QueueStatus, State},
+            },
+        };
+        for failed_create in [false, true] {
+            let mut config = Box::new(unsafe { core::mem::zeroed::<Config>() });
+            let state = Arc::new(Mutex::new(State {
+                queues: vec![QueueStatus::default(), QueueStatus::default()],
+                ..State::default()
+            }));
+            let transport = FakeTransport {
+                device_type: DeviceType::GPU,
+                max_queue_size: QUEUE_SIZE as u32,
+                device_features: Features::VIRGL.bits(),
+                config_space: NonNull::from(config.as_mut()),
+                state: state.clone(),
+            };
+            let mut gpu = VirtIOGpu::<FakeHal, _>::new(transport).unwrap();
+            let (id, _) = gpu
+                .submit_create_context(b"destroy-test", ContextInit::default())
+                .unwrap();
+            assert!(
+                state
+                    .lock()
+                    .unwrap()
+                    .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE_TRANSMIT, |input| {
+                        let mut response = input[..24].to_vec();
+                        let status = if failed_create {
+                            0x1200u32
+                        } else {
+                            Command::OK_NODATA.0
+                        };
+                        response[..4].copy_from_slice(&status.to_le_bytes());
+                        response
+                    })
+            );
+            let mut out = [GpuCompletion {
+                fence_id: 0,
+                result: Ok(()),
+                data: GpuCompletionData::None,
+            }];
+            assert_eq!(gpu.drain_control_completions(&mut out).unwrap(), 1);
+            let submission = if failed_create {
+                assert_eq!(out[0].result, Err(Error::IoError));
+                assert_eq!(gpu.failed_contexts, [id]);
+                gpu.pending_control[0].fence_id
+            } else {
+                assert_eq!(out[0].result, Ok(()));
+                gpu.submit_destroy_context(id.get()).unwrap().fence_id
+            };
+            assert_eq!(gpu.drain_control_completions(&mut out).unwrap(), 0);
+            assert!(if failed_create {
+                gpu.failed_contexts.contains(&id)
+            } else {
+                gpu.contexts.iter().any(|entry| entry.id == id)
+            });
+            assert!(
+                state
+                    .lock()
+                    .unwrap()
+                    .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE_TRANSMIT, |input| {
+                        let header = CtrlHeader::read_from_prefix(&input).unwrap();
+                        assert_eq!(header.hdr_type, Command::CTX_DESTROY);
+                        assert_eq!(header.ctx_id, id.get());
+                        assert_eq!(header.flags, 0);
+                        assert_eq!(header.fence_id, 0);
+                        // QEMU does not echo the context in an unfenced reply.
+                        CtrlHeader::with_type(Command::OK_NODATA)
+                            .as_bytes()
+                            .to_vec()
+                    })
+            );
+            assert_eq!(gpu.drain_control_completions(&mut out).unwrap(), 1);
+            assert_eq!(out[0].fence_id, submission);
+            assert_eq!(out[0].result, Ok(()));
+            assert!(gpu.failed_contexts.is_empty());
+            assert!(gpu.contexts.is_empty());
+        }
+    }
+
+    #[test]
     fn display_read_distinguishes_pending_control_from_faulted_queue() {
         use alloc::{boxed::Box, sync::Arc, vec};
         use core::ptr::NonNull;
@@ -2623,8 +2813,8 @@ mod tests {
         use crate::{
             hal::fake::FakeHal,
             transport::{
-                fake::{FakeTransport, QueueStatus, State},
                 DeviceType,
+                fake::{FakeTransport, QueueStatus, State},
             },
         };
         let mut config = Box::new(unsafe { core::mem::zeroed::<Config>() });
@@ -2648,14 +2838,135 @@ mod tests {
     }
 
     #[test]
+    fn native_present_preserves_texture_and_owns_resource_through_flush_and_reset() {
+        use alloc::{boxed::Box, sync::Arc, vec};
+        use core::ptr::NonNull;
+        use std::sync::Mutex;
+
+        use crate::{
+            hal::fake::FakeHal,
+            transport::{
+                DeviceType,
+                fake::{FakeTransport, QueueStatus, State},
+            },
+        };
+
+        for render in [false, true] {
+            let mut config = Box::new(unsafe { core::mem::zeroed::<Config>() });
+            let state = Arc::new(Mutex::new(State {
+                queues: vec![QueueStatus::default(), QueueStatus::default()],
+                ..State::default()
+            }));
+            let transport = FakeTransport {
+                device_type: DeviceType::GPU,
+                max_queue_size: QUEUE_SIZE as u32,
+                device_features: Features::VIRGL.bits(),
+                config_space: NonNull::from(config.as_mut()),
+                state: state.clone(),
+            };
+            let mut gpu = VirtIOGpu::<FakeHal, _>::new(transport).unwrap();
+            let respond = |expected: Command| {
+                assert!(
+                    state
+                        .lock()
+                        .unwrap()
+                        .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE_TRANSMIT, |input| {
+                            assert_eq!(
+                                u32::from_le_bytes(input[..4].try_into().unwrap()),
+                                expected.0
+                            );
+                            let mut response = input[..24].to_vec();
+                            response[..4].copy_from_slice(&(Command::OK_NODATA.0).to_le_bytes());
+                            response
+                        })
+                );
+            };
+            let mut out = core::array::from_fn::<_, 8, _>(|_| GpuCompletion {
+                fence_id: 0,
+                result: Ok(()),
+                data: GpuCompletionData::None,
+            });
+            let (id, _) = if render {
+                gpu.submit_create_3d(2, 2, 2, 64, 64, 1, 1, 0, 0, 1)
+                    .unwrap()
+            } else {
+                gpu.submit_create_2d(64, 64).unwrap()
+            };
+            respond(if render {
+                Command::RESOURCE_CREATE_3D
+            } else {
+                Command::RESOURCE_CREATE_2D
+            });
+            assert_eq!(gpu.drain_control_completions(&mut out).unwrap(), 1);
+            gpu.submit_attach_backing_entries(id, &[(0x1000, 64 * 64 * 4)])
+                .unwrap();
+            respond(Command::RESOURCE_ATTACH_BACKING);
+            assert_eq!(gpu.drain_control_completions(&mut out).unwrap(), 1);
+            let visible = Rect::new(3, 4, 20, 21);
+            let present = gpu.submit_present(id, visible, visible).unwrap();
+            assert!(gpu.present_pending(id));
+            assert!(gpu.submit_unref(id).is_err());
+            assert!(
+                state
+                    .lock()
+                    .unwrap()
+                    .read_write_queue::<{ QUEUE_SIZE as usize }>(QUEUE_TRANSMIT, |input| {
+                        assert_eq!(
+                            u32::from_le_bytes(input[..4].try_into().unwrap()),
+                            Command::SET_SCANOUT.0
+                        );
+                        assert_eq!(&input[24..40], visible.as_bytes());
+                        assert_eq!(
+                            u32::from_le_bytes(input[44..48].try_into().unwrap()),
+                            id.get()
+                        );
+                        let mut response = input[..24].to_vec();
+                        response[..4].copy_from_slice(&(Command::OK_NODATA.0).to_le_bytes());
+                        response
+                    })
+            );
+            assert_eq!(gpu.drain_control_completions(&mut out).unwrap(), 0);
+            if !render {
+                respond(Command::TRANSFER_TO_HOST_2D);
+                assert_eq!(gpu.drain_control_completions(&mut out).unwrap(), 0);
+            }
+            // A virgl texture goes straight to FLUSH: uploading its stale
+            // guest backing here would overwrite the rendered frame.
+            assert!(gpu.present_pending(id));
+            respond(Command::RESOURCE_FLUSH);
+            assert_eq!(gpu.drain_control_completions(&mut out).unwrap(), 1);
+            assert_eq!(out[0].fence_id, present.fence_id);
+            assert_eq!(out[0].result, Ok(()));
+            assert!(!gpu.present_pending(id));
+
+            // Descriptor pressure must retain the presentation's lifetime
+            // pin even before SET_SCANOUT can enter controlq.
+            while gpu.submit_resource_flush(id, visible).is_ok() {}
+            let blocked = gpu.submit_present(id, visible, visible).unwrap();
+            assert!(gpu.present_pending(id));
+            assert!(gpu.pending_presents[0].in_flight.is_none());
+            assert!(gpu.submit_detach_backing(id).is_err());
+            gpu.fault_control_queue();
+            assert!(!gpu.present_pending(id));
+            assert_eq!(
+                gpu.terminal_control
+                    .iter()
+                    .filter(|c| c.fence_id == blocked.fence_id && c.result.is_err())
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn fake_transport_negotiates_virgl_only_when_offered() {
         use alloc::{boxed::Box, sync::Arc, vec};
         use core::ptr::NonNull;
         use std::sync::Mutex;
 
         use crate::transport::{
-            fake::{FakeTransport, QueueStatus, State},
             DeviceType, Transport,
+            fake::{FakeTransport, QueueStatus, State},
         };
         let config = unsafe {
             NonNull::new_unchecked(Box::into_raw(Box::new(core::mem::zeroed::<Config>())))

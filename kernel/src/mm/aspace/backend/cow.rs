@@ -1359,11 +1359,7 @@ impl CowBackend {
             return false;
         }
 
-        let mut resident = false;
-        file.with_page(file_page as u32, |page| {
-            resident = page.is_some();
-        });
-        resident
+        file.is_page_cached(file_page as u32)
     }
 
     /// Converts a virtual subrange of this private file mapping into 4 KiB

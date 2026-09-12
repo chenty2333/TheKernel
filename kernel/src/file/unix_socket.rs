@@ -47,32 +47,32 @@ fn check_bind_name_available(parent: &axfs_ng_vfs::Location, name: &FsName) -> A
 /// Creates and binds a Linux pathname Unix socket with one frozen credential
 /// view. Transport admission is private and reversible until the filesystem
 /// backend has initialized the exact slot and atomically published the name.
-pub(crate) fn bind_path(
+pub(crate) fn bind_path<G>(
     socket: &UnixSocket,
     path: Arc<Vec<u8>>,
     security: &VfsSecurityContext,
     requested_mode: NodePermission,
     umask: u32,
-    publish: impl FnOnce(axnet::unix::UnixEndpointIdentity),
-) -> AxResult<()> {
+    prepare: impl FnOnce(axnet::unix::UnixEndpointIdentity) -> AxResult<G>,
+) -> AxResult<G> {
     let lookup_path = path.clone();
     let result = with_path_fs(
         AT_FDCWD,
         FsPath::new(lookup_path.as_slice()),
-        |fs| bind_path_in_fs(fs, path, socket, security, requested_mode, umask, publish),
+        |fs| bind_path_in_fs(fs, path, socket, security, requested_mode, umask, prepare),
     );
     result.map_err(map_bind_create_error)
 }
 
-fn bind_path_in_fs(
+fn bind_path_in_fs<G>(
     fs: &FsContext,
     path: Arc<Vec<u8>>,
     socket: &UnixSocket,
     security: &VfsSecurityContext,
     requested_mode: NodePermission,
     umask: u32,
-    publish: impl FnOnce(axnet::unix::UnixEndpointIdentity),
-) -> AxResult<()> {
+    prepare: impl FnOnce(axnet::unix::UnixEndpointIdentity) -> AxResult<G>,
+) -> AxResult<G> {
     let path_ref = FsPath::new(path.as_slice());
     validate_pathname(path_ref)?;
     // This specialized socket/filesystem composite transaction is independent
@@ -125,6 +125,7 @@ fn bind_path_in_fs(
     let target = UnixSocketTarget::new(UnixSocketAddr::Path(path), slot.clone())?;
     let reservation: UnixBindReservation<'_> = socket.reserve_bind(target)?;
     let endpoint = reservation.target_endpoint_identity()?;
+    let prepared = prepare(endpoint)?;
     let initial_data = InitialNodeData::from_shared(slot);
     let (project_id, project_inherit) =
         super::inode_flags::prepare_inherited_project_id(&parent, false)?;
@@ -151,7 +152,6 @@ fn bind_path_in_fs(
     // No fallible work is permitted after the backend makes the initialized
     // name visible. Committing only moves/clones already admitted ownership.
     reservation.commit_with_keepalive(location.entry.entry().lifetime_token());
-    publish(endpoint);
     if let Err(error) = crate::file::inotify::notify_parent_with_name(
         &parent,
         Some(&location.entry),
@@ -162,7 +162,7 @@ fn bind_path_in_fs(
     ) {
         warn!("Unix socket create notification failed: {error}");
     }
-    Ok(())
+    Ok(prepared)
 }
 
 /// Resolves a Linux pathname Unix peer and enforces path-search plus socket
@@ -294,9 +294,12 @@ mod tests {
         let client = make_socket();
         let path = Arc::new(b"/log".to_vec());
         let mode = NodePermission::from_bits_truncate(0o666);
+        assert!(matches!(bind_path_in_fs(&fs, path.clone(), &old_server, &security, mode, 0,
+            |_| Err::<(), _>(AxError::NoMemory)), Err(AxError::NoMemory)));
+        assert!(matches!(root.lookup_no_follow(FsName::new(b"log")), Err(AxError::NotFound)));
         let mut published = None;
         bind_path_in_fs(&fs, path.clone(), &old_server, &security, mode, 0,
-            |identity| published = Some(identity)).unwrap();
+            |identity| { published = Some(identity); Ok(()) }).unwrap();
         let old_target = resolve_peer_in_fs(&fs, path.clone(), &security).unwrap();
         assert_eq!(published, Some(old_target.endpoint_identity().unwrap()));
         let old_node = root.lookup_no_follow(FsName::new(b"log")).unwrap();
@@ -321,7 +324,7 @@ mod tests {
             Err(AxError::NotFound)));
         exchange(old_target.clone(), &old_server, 2);
 
-        bind_path_in_fs(&fs, path.clone(), &new_server, &security, mode, 0, |_| {}).unwrap();
+        bind_path_in_fs(&fs, path.clone(), &new_server, &security, mode, 0, |_| Ok(())).unwrap();
         let new_target = resolve_peer_in_fs(&fs, path.clone(), &security).unwrap();
         let new_node = root.lookup_no_follow(FsName::new(b"log")).unwrap();
         assert!(!old_node.same_node(&new_node));

@@ -31,11 +31,11 @@ use kspin::SpinNoIrq;
 use spin::Once;
 use thekernel_linux_signal::{SignalInfo, Signo};
 
+pub(crate) use self::pts::{DevPtsOptions, new_devpts};
 pub(crate) use self::seat::{remember_input_node, remember_primary_node};
 pub use self::{
     ntty::{N_TTY, NTtyDriver},
     ptm::Ptmx,
-    pts::PtsDir,
     pty::PtyDriver,
     vt::{VT_MANAGER, VtDevice, notify_vt_owner_exit},
 };
@@ -111,6 +111,7 @@ pub struct Tty<R, W> {
     hung_up: core::sync::atomic::AtomicBool,
     endpoint: Option<PtyEndpoint>,
     pts_lease: SpinNoIrq<Option<PtsLease>>,
+    pts_node: SpinNoIrq<Option<(Weak<axfs_ng_vfs::Mountpoint>, Weak<crate::pseudofs::Device>)>>,
     is_ptm: bool,
 }
 
@@ -134,6 +135,7 @@ impl<R: TtyRead, W: TtyWrite + Clone> Tty<R, W> {
             hung_up: core::sync::atomic::AtomicBool::new(false),
             endpoint,
             pts_lease: SpinNoIrq::new(None),
+            pts_node: SpinNoIrq::new(None),
             is_ptm,
         })
         .map_err(|_| AxError::NoMemory)?;
@@ -155,6 +157,33 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
             .get()
             .and_then(Weak::upgrade)
             .ok_or(AxError::NotATty)
+    }
+
+    pub(crate) fn remember_pts_location(&self, location: &Location, device: &Arc<crate::pseudofs::Device>) {
+        if !self.is_ptm {
+            *self.pts_node.lock() = Some((Arc::downgrade(location.mountpoint()), Arc::downgrade(device)));
+        }
+    }
+
+    /// Resolve the controlling slave's exact inode, never a reused number in
+    /// the opener's unrelated devpts instance. Weak links avoid a tty/table cycle.
+    pub(crate) fn pts_location(&self) -> AxResult<Location> {
+        use axfs_ng_vfs::{DirEntry, FileNode, FsNameBuf, NodeType, Reference};
+        let (mount, device) = self.pts_node.lock().clone().ok_or(AxError::NotFound)?;
+        let mount = mount.upgrade().ok_or(AxError::NotFound)?;
+        let device = device.upgrade().ok_or(AxError::NotFound)?;
+        let root = mount.root_location();
+        if root.entry().downcast::<crate::pseudofs::Device>()
+            .is_ok_and(|root_device| Arc::ptr_eq(&root_device, &device)) {
+            return Ok(root);
+        }
+        let mut name = String::new();
+        name.try_reserve_exact(10).map_err(|_| AxError::NoMemory)?;
+        core::fmt::write(&mut name, format_args!("{}", self.pty_number()))
+            .map_err(|_| AxError::NoMemory)?;
+        let entry = DirEntry::try_new_file(FileNode::new(device), NodeType::CharacterDevice,
+            Reference::new(Some(root.entry().clone()), FsNameBuf::from_vec(name.into_bytes())?))?;
+        Ok(Location::new(mount, entry))
     }
 
     fn install_pts_lease(&self, lease: PtsLease) -> AxResult<()> {
@@ -1244,9 +1273,9 @@ mod tests {
         let _context = crate::test_support::scheduler_test_context();
         drain_all_description_cleanup();
         let (master, slave) = pty::create_pty_pair_for_test().unwrap();
-        let (lease, slot) = pts::reserve_test_lease().unwrap();
+        let (lease, table, slot) = pts::reserve_test_lease().unwrap();
         master.install_pts_lease(lease).unwrap();
-        assert!(pts::test_slot_reserved(slot));
+        assert!(pts::test_slot_reserved(&table, slot));
 
         let master_open = master.open_transport_description().unwrap().unwrap();
         let slave_open = slave.open_transport_description().unwrap().unwrap();
@@ -1269,17 +1298,17 @@ mod tests {
 
         let duplicated = description.clone();
         drop(description);
-        assert!(pts::test_slot_reserved(slot));
+        assert!(pts::test_slot_reserved(&table, slot));
         assert!(slave.endpoint.as_ref().unwrap().hangup_events().is_empty());
 
         drop(duplicated);
         // Final Arc drop only publishes preallocated work. The PTY guard, PTS
         // lease, hangup, and any worker join remain deferred.
-        assert!(pts::test_slot_reserved(slot));
+        assert!(pts::test_slot_reserved(&table, slot));
         assert!(slave.endpoint.as_ref().unwrap().hangup_events().is_empty());
 
         drain_all_description_cleanup();
-        assert!(!pts::test_slot_reserved(slot));
+        assert!(!pts::test_slot_reserved(&table, slot));
         let events = slave.endpoint.as_ref().unwrap().hangup_events();
         assert!(events.contains(
             IoEvents::READABLE | IoEvents::WRITABLE | IoEvents::ERROR | IoEvents::HANGUP

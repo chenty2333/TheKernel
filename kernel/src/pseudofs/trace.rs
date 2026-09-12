@@ -11,7 +11,11 @@ use alloc::{
 
 use axfs_ng_vfs::{Filesystem, FsName, FsNameBuf, NodePermission, VfsError, VfsResult};
 use axsync::spin::SpinNoIrq;
-pub(crate) use io_uring::record as record_io_uring;
+pub(crate) use io_uring::{
+    ReadStage as IoUringReadStage, read_stage as record_io_uring_read_stage,
+    executor_returned as record_io_uring_executor_returned,
+    executor_started as record_io_uring_executor_started, record as record_io_uring,
+};
 
 use crate::{
     perf_sources::{

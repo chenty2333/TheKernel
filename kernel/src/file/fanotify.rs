@@ -775,6 +775,9 @@ fn current_permission_fd(
 
 impl Drop for FanotifyFile {
     fn drop(&mut self) {
+        // release() drains marks at the final OFD boundary. A directly owned
+        // group may never reach that boundary and must return its own quota.
+        FANOTIFY_MARKS.fetch_sub(self.state.get_mut().marks.len(), Ordering::AcqRel);
         // A group which never reached FileDescription::drop still owns its
         // preallocated cleanup node directly. Published work owns the credit
         // until the policy worker drains it instead.
@@ -1234,6 +1237,13 @@ pub(crate) fn permission_check_with_actor(
     parent_event: bool,
     actor: FanotifyEventActor,
 ) -> AxResult<()> {
+    // Additions reserve the count before publishing a mark; removals decrement
+    // after unpublishing it. Zero therefore permits skipping metadata/registry
+    // work. A concurrent new mark may begin observing subsequent operations.
+    #[cfg(feature = "io-notify-fastpath")]
+    if FANOTIFY_MARKS.load(Ordering::Acquire) == 0 {
+        return Ok(());
+    }
     let event_key = WatchKey::from_location(event_loc)?;
     let event_mount_id = event_loc.mountpoint().mount_id();
     let watch_key = WatchKey::from_location(watch_loc)?;
@@ -1488,6 +1498,166 @@ mod tests {
         wait_for_permission_response,
     };
     use crate::file::{FdTable, FileDescription};
+
+    #[test]
+    fn mark_count_is_released_by_both_group_ownership_paths() {
+        use core::sync::atomic::Ordering;
+
+        let _context = crate::test_support::scheduler_test_context();
+        let fs = crate::pseudofs::tmp::MemoryFs::new().unwrap();
+        let target = axfs_ng_vfs::Mountpoint::new_root(&fs).root_location();
+        let count = || super::FANOTIFY_MARKS.load(Ordering::Acquire);
+        let before = count();
+        for wrapped in [false, true] {
+            let file = FanotifyFile::new(FAN_NONBLOCK, 0).unwrap();
+            let description = wrapped.then(|| FileDescription::new(file.clone()).unwrap());
+            for mask in [FAN_ACCESS, super::FAN_MODIFY] {
+                file.mark(thekernel_linux_fsnotify::FAN_MARK_ADD, mask, Some(&target))
+                    .unwrap();
+                assert_eq!(count(), before + 1);
+            }
+            drop(description);
+            if wrapped {
+                assert_eq!(count(), before);
+            }
+            drop(file);
+            assert_eq!(count(), before);
+        }
+    }
+
+    struct FailingMetadataDirectory {
+        inner: axfs_ng_vfs::DirEntry,
+        calls: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+    }
+
+    impl axfs_ng_vfs::NodeOps for FailingMetadataDirectory {
+        fn inode(&self) -> u64 {
+            self.inner.inode()
+        }
+        fn metadata(&self) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::Metadata> {
+            self.calls
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Err(axfs_ng_vfs::VfsError::Io)
+        }
+        fn update_metadata(&self, _: axfs_ng_vfs::MetadataUpdate) -> axfs_ng_vfs::VfsResult<()> {
+            Err(axfs_ng_vfs::VfsError::Unsupported)
+        }
+        fn filesystem(&self) -> &dyn axfs_ng_vfs::FilesystemOps {
+            self.inner.filesystem()
+        }
+        fn sync(&self, _: bool) -> axfs_ng_vfs::VfsResult<()> {
+            Ok(())
+        }
+        fn into_any(
+            self: alloc::sync::Arc<Self>,
+        ) -> alloc::sync::Arc<dyn core::any::Any + Send + Sync> {
+            self
+        }
+    }
+
+    impl axfs_ng_vfs::DirNodeOps for FailingMetadataDirectory {
+        fn read_dir(
+            &self,
+            _: u64,
+            _: &mut dyn axfs_ng_vfs::DirEntrySink,
+        ) -> axfs_ng_vfs::VfsResult<usize> {
+            Ok(0)
+        }
+        fn lookup(&self, _: &axfs_ng_vfs::FsName) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::DirEntry> {
+            Err(axfs_ng_vfs::VfsError::NotFound)
+        }
+        fn create_named(
+            &self,
+            _: &axfs_ng_vfs::FsName,
+            _: &axfs_ng_vfs::NamedCreateOptions,
+            _: axfs_ng_vfs::CreateDisposition,
+        ) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::CreateOutcome<axfs_ng_vfs::DirEntry>> {
+            Err(axfs_ng_vfs::VfsError::Unsupported)
+        }
+        fn link(
+            &self,
+            _: &axfs_ng_vfs::FsName,
+            _: &axfs_ng_vfs::DirEntry,
+        ) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::DirEntry> {
+            Err(axfs_ng_vfs::VfsError::Unsupported)
+        }
+        fn unlink(&self, _: axfs_ng_vfs::UnlinkRequest<'_>) -> axfs_ng_vfs::VfsResult<()> {
+            Err(axfs_ng_vfs::VfsError::Unsupported)
+        }
+        fn rename(&self, _: axfs_ng_vfs::RenameRequest<'_>) -> axfs_ng_vfs::VfsResult<()> {
+            Err(axfs_ng_vfs::VfsError::Unsupported)
+        }
+    }
+
+    #[test]
+    fn permission_metadata_follows_real_mark_lifecycle() {
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        use axfs_ng_vfs::{DirEntry, DirNode, Location, Mountpoint, Reference};
+
+        let _context = crate::test_support::scheduler_test_context();
+        assert_eq!(super::FANOTIFY_MARKS.load(Ordering::Acquire), 0);
+        let fs = crate::pseudofs::tmp::MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let target = mount.root_location();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let failing = Location::new(
+            mount.clone(),
+            DirEntry::new_dir(
+                |_| {
+                    DirNode::new(Arc::new(FailingMetadataDirectory {
+                        inner: target.entry().clone(),
+                        calls: calls.clone(),
+                    }))
+                },
+                Reference::root(),
+            ),
+        );
+        let check = || {
+            super::permission_check_with_actor(
+                &failing,
+                &target,
+                FAN_OPEN_PERM,
+                true,
+                false,
+                super::FanotifyEventActor::default(),
+            )
+        };
+        let no_marks_result = if cfg!(feature = "io-notify-fastpath") {
+            Ok(())
+        } else {
+            Err(AxError::Io)
+        };
+        calls.store(0, Ordering::Relaxed);
+        assert_eq!(check(), no_marks_result);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            usize::from(!cfg!(feature = "io-notify-fastpath"))
+        );
+
+        let file = FanotifyFile::new(FAN_NONBLOCK | FAN_CLASS_PRE_CONTENT, 0).unwrap();
+        file.mark(
+            thekernel_linux_fsnotify::FAN_MARK_ADD,
+            FAN_OPEN_PERM,
+            Some(&target),
+        )
+        .unwrap();
+        assert_eq!(super::FANOTIFY_MARKS.load(Ordering::Acquire), 1);
+        calls.store(0, Ordering::Relaxed);
+        assert_eq!(check(), Err(AxError::Io));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        file.mark(super::FAN_MARK_REMOVE, FAN_OPEN_PERM, Some(&target))
+            .unwrap();
+        assert_eq!(super::FANOTIFY_MARKS.load(Ordering::Acquire), 0);
+        calls.store(0, Ordering::Relaxed);
+        assert_eq!(check(), no_marks_result);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            usize::from(!cfg!(feature = "io-notify-fastpath"))
+        );
+    }
 
     struct FaultAfterWrites {
         remaining: usize,

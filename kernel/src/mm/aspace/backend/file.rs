@@ -48,7 +48,7 @@ pub(crate) struct FileFutexIdentity {
 }
 
 /// One address-space's reversible write-protection of a 4 KiB file alias.
-/// Pageout never calls `commit` until every owner has prepared and backing
+/// The cache never calls `commit` until every owner has prepared and backing
 /// writeback has completed; `Drop` of the axfs reservation set calls `abort`.
 struct FileEvictionAlias {
     vaddr: VirtAddr,
@@ -67,6 +67,7 @@ struct FileEvictionReservation {
     cache: CachedFile,
     fence: Option<FileEvictionFenceKey>,
     aliases: Vec<FileEvictionAlias>,
+    writeback_only: bool,
 }
 
 impl CachedPageEvictionReservation for FileEvictionReservation {
@@ -78,6 +79,12 @@ impl CachedPageEvictionReservation for FileEvictionReservation {
         };
         let mut aspace = aspace_ref.lock();
         for alias in self.aliases {
+            if self.writeback_only {
+                // Preparation already removed WRITE and synchronized the
+                // TLB. Keep the resident PTE, including for mlocked pages;
+                // the next mapped write faults to dirty the cache again.
+                continue;
+            }
             match aspace.page_table_mut().cursor().unmap(alias.vaddr) {
                 Ok((paddr, _, PageSize::Size4K)) if paddr == alias.paddr => {}
                 // Concurrent munmap is permitted while fenced: it already
@@ -517,6 +524,7 @@ impl FileBackendInner {
                         cache: listener_cache.clone(),
                         fence: None,
                         aliases: Vec::new(),
+                        writeback_only: eviction.writeback_only,
                     }));
                 };
                 let Some(aspace) = aspace.upgrade() else {
@@ -525,6 +533,7 @@ impl FileBackendInner {
                         cache: this.cache.clone(),
                         fence: None,
                         aliases: Vec::new(),
+                        writeback_only: eviction.writeback_only,
                     }));
                 };
                 this.prepare_evict(eviction, aspace)
@@ -595,7 +604,7 @@ impl FileBackendInner {
         // write-protection pass is then fail-stop: under the same aspace lock
         // a changed PTE is structural corruption, not a retryable race.
         for &vaddr in &candidates {
-            if guard.range_is_locked(vaddr, PAGE_SIZE_4K) {
+            if !eviction.writeback_only && guard.range_is_locked(vaddr, PAGE_SIZE_4K) {
                 guard.complete_file_eviction_fence(fence);
                 return Err(VfsError::ResourceBusy);
             }
@@ -661,6 +670,7 @@ impl FileBackendInner {
             cache: self.cache.clone(),
             fence: Some(fence),
             aliases,
+            writeback_only: eviction.writeback_only,
         }))
     }
 
@@ -1284,11 +1294,7 @@ impl FileBackend {
             return false;
         };
 
-        let mut resident = false;
-        self.0.cache.with_page(pn, |page| {
-            resident = page.is_some();
-        });
-        resident
+        self.0.cache.is_page_cached(pn)
     }
 
     /// Retains the cache object needed for a lock-external reclaim retry.
@@ -1614,7 +1620,7 @@ impl BackendOps for FileBackend {
                             if access_flags.contains(MappingFlags::WRITE)
                                 && !page_flags.contains(MappingFlags::WRITE)
                             {
-                                self.0.cache.with_page(pn, |page| {
+                                self.0.cache.try_with_page(pn, |page| {
                                     let page = page.ok_or(AxError::BadAddress)?;
                                     if page.paddr() != paddr {
                                         return Err(AxError::BadAddress);
@@ -1624,7 +1630,7 @@ impl BackendOps for FileBackend {
                                     needs_tlb_sync = true;
                                     pages += 1;
                                     AxResult::Ok(())
-                                })?;
+                                })??;
                             } else if page_flags.contains(access_flags) {
                                 pages += 1;
                             }
@@ -1646,12 +1652,7 @@ impl BackendOps for FileBackend {
                                     pn,
                                     readahead_pages,
                                     |page| {
-                                        pt.map(
-                                            addr,
-                                            page.paddr(),
-                                            PageSize::Size4K,
-                                            map_flags,
-                                        )?;
+                                        pt.map(addr, page.paddr(), PageSize::Size4K, map_flags)?;
                                         pages += 1;
                                         Ok(())
                                     },

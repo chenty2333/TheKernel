@@ -141,13 +141,13 @@ impl<A: SimpleDirOps, B: SimpleDirOps> SimpleDirOps for ChainedDirOps<A, B> {
 
 /// Simple directory.
 pub struct SimpleDir<O> {
-    node: SimpleFsNode,
+    node: Arc<SimpleFsNode>,
     this: WeakDirEntry,
     ops: Arc<O>,
 }
 
 impl<O: SimpleDirOps> SimpleDir<O> {
-    fn new(node: SimpleFsNode, ops: Arc<O>, this: WeakDirEntry) -> Arc<Self> {
+    fn new(node: Arc<SimpleFsNode>, ops: Arc<O>, this: WeakDirEntry) -> Arc<Self> {
         Arc::new(Self { node, this, ops })
     }
 
@@ -157,17 +157,15 @@ impl<O: SimpleDirOps> SimpleDir<O> {
 
     /// Create a [`DirMaker`] from given directory operations.
     pub fn new_maker(fs: Arc<SimpleFs>, ops: Arc<O>) -> DirMaker {
-        Arc::new(move |this| {
-            SimpleDir::new(
-                SimpleFsNode::new(
-                    fs.clone(),
-                    NodeType::Directory,
-                    NodePermission::from_bits_truncate(0o755),
-                ),
-                ops.clone(),
-                this,
-            )
-        })
+        // A factory can be called again after its parent's namespace changes.
+        // Keep inode identity and metadata stable so existing mounts and open
+        // references still identify this directory after dentry revalidation.
+        let node = Arc::new(SimpleFsNode::new(
+            fs,
+            NodeType::Directory,
+            NodePermission::from_bits_truncate(0o755),
+        ));
+        Arc::new(move |this| SimpleDir::new(node.clone(), ops.clone(), this))
     }
 }
 

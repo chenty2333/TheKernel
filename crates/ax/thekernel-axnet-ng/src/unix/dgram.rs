@@ -447,6 +447,7 @@ pub(super) struct DgramSendReservation<'a> {
     effective_nonblocking: bool,
     cmsg: Vec<CMsgData>,
     credentials: Option<SocketCredentials>,
+    credentials_explicit: bool,
     channel: Channel,
 }
 
@@ -465,6 +466,7 @@ impl DgramSendReservation<'_> {
             self.effective_nonblocking,
             self.cmsg,
             self.credentials,
+            self.credentials_explicit,
             self.channel,
         )
     }
@@ -729,8 +731,15 @@ impl DgramTransport {
         Ok((transport1, transport2))
     }
 
-    pub(super) fn identity(&self) -> usize {
-        self as *const Self as usize
+    pub(super) fn identity(&self) -> Option<usize> {
+        self.data_rx
+            .lock()
+            .queue()
+            .map(|(_, _, closed)| Arc::as_ptr(closed) as usize)
+    }
+
+    pub(super) fn peer_identity(&self) -> Option<usize> {
+        self.connected.read().as_ref().map(Channel::identity)
     }
 
     pub(super) fn new_record_pair(
@@ -778,6 +787,7 @@ impl DgramTransport {
             effective_nonblocking,
             cmsg: options.cmsg,
             credentials: options.credentials,
+            credentials_explicit: options.credentials_explicit,
             channel,
         }
     }
@@ -824,6 +834,7 @@ impl DgramTransport {
         effective_nonblocking: bool,
         mut cmsg: Vec<CMsgData>,
         credentials: Option<SocketCredentials>,
+        credentials_explicit: bool,
         channel: Channel,
     ) -> AxResult<usize> {
         if self.tx_shutdown.load(Ordering::Acquire) {
@@ -831,7 +842,10 @@ impl DgramTransport {
         }
 
         let len = src.remaining();
-        if channel.peer_passcred.load(Ordering::Acquire) {
+        if credentials_explicit
+            || channel.peer_passcred.load(Ordering::Acquire)
+            || self.passcred.load(Ordering::Acquire)
+        {
             cmsg.try_reserve(1).map_err(|_| AxError::NoMemory)?;
             let credentials = credentials.unwrap_or_else(|| *self.local_credentials.read());
             cmsg.push(CMsgData::new_peekable(Box::new(credentials), 0, |value| {
@@ -1117,6 +1131,9 @@ impl TransportOps for DgramTransport {
                     for item in &packet.cmsg {
                         cmsg.push(item.clone_for_peek()?);
                     }
+                    if !self.passcred.load(Ordering::Acquire) {
+                        cmsg.retain_mut(|item| item.downcast_mut::<SocketCredentials>().is_none());
+                    }
                     let data = packet.data.clone();
                     let sender = packet.sender.clone();
                     let count = dst.write(&data)?;
@@ -1166,10 +1183,13 @@ impl TransportOps for DgramTransport {
                 };
                 let Packet {
                     data,
-                    cmsg,
+                    mut cmsg,
                     sender,
                     charge,
                 } = packet;
+                if !self.passcred.load(Ordering::Acquire) {
+                    cmsg.retain_mut(|item| item.downcast_mut::<SocketCredentials>().is_none());
+                }
                 queued_bytes.fetch_sub(charge, Ordering::AcqRel);
                 // The queue slot and byte charge jointly define writability.
                 // Publish both removals before waking a sender; otherwise it
@@ -1416,6 +1436,15 @@ mod tests {
     fn datagram_socketpair_snapshots_creator_credentials() {
         let credentials = SocketCredentials::new(11, 12, 13);
         let (left, right) = DgramTransport::new_pair(credentials).unwrap();
+        let left_identity = left.identity();
+        let right_identity = right.identity();
+        assert!(left_identity.is_some());
+        assert_ne!(left_identity, right_identity);
+        assert_eq!(left.peer_identity(), right_identity);
+        assert_eq!(right.peer_identity(), left_identity);
+        let (left, right) = (alloc::boxed::Box::new(left), alloc::boxed::Box::new(right));
+        assert_eq!(left.identity(), left_identity);
+        assert_eq!(right.identity(), right_identity);
         assert_eq!(peer_credentials(&left), credentials);
         assert_eq!(peer_credentials(&right), credentials);
 

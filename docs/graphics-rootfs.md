@@ -98,27 +98,46 @@ existing image and otherwise leaves the standard rootfs-builder behavior
 unchanged.
 
 For an interactive desktop, run `make run-gui`. It uses the
-`virgl-interactive` profile to render through the host GPU. The
+`virgl-interactive` profile to render through the host GPU, with KVM, a
+1920×1080 display, four CPUs, and 2 GiB of guest memory by default. Override
+these with `RUN_ARGS="--width 1280 --height 720 --memory 4G"` as needed. The
 `q35-software-desktop` image opens Weston's desktop shell and native terminal as the unprivileged
 `weston` user, with the session's Wayland runtime environment. The top panel
-launches Terminal, Files (PCManFM), Text Editor (xedit), Images (feh), and Python.
-Applications start in `/var/lib/weston`.
+launches Terminal, Files (PCManFM), Text Editor (xedit), Images (feh), Python,
+and Web Browser (WebKitGTK MiniBrowser). Terminal and Python start in
+`/var/lib/weston`; file launchers preserve relative paths.
 Double-click text files or PNG/JPEG images in Files to open them in the editor
 or image viewer. The Images launcher initially displays the supplied Wayland
 image; use Files to open your own pictures. Python runs its basic interactive
 interpreter in a native Weston terminal; PCManFM, xedit, and feh use rootless
-Xwayland with glamor on the Virgl render node. X11 MIT-SHM remains disabled
-because its SysV attach path fails for GTK clients. Closing an application
+Xwayland with glamor on the Virgl render node and X11 MIT-SHM enabled.
+Closing an application
 leaves the desktop running. This flavor skips startup graphics test workloads
 and automatic shutdown. To explicitly use the software display, pass
 `make run-gui RUN_ARGS="--graphics-profile interactive"`; Weston then uses
 Pixman and Xwayland presents through Wayland shared memory.
+
+MiniBrowser uses WebKitGTK 2.52.6 with JavaScript, HTTPS certificate validation,
+downloads, and GStreamer media support. The launcher explicitly enables its
+Bubblewrap process sandbox. It is WebKit's sample browser shell,
+with a smaller interface than Firefox or Chromium; this build disables WebRTC.
+The image also provides `curl`, and OpenSSH's `ssh`, `scp`, and `sftp` clients.
+Networking uses the kernel's QEMU user-network address and DNS at `10.0.2.3`.
+The default audio device is VirtIO sound: the guest's playback-only OSS
+`/dev/dsp` feeds PulseAudio's OSS module, and browser media uses its Pulse sink.
+QEMU connects output to the host PulseAudio/PipeWire-Pulse server. To record
+guest output instead, use `RUN_ARGS="--audio-backend wav"`; the runner writes
+`audio.wav` in its run directory. The session requires a usable sound device
+and does not substitute a silent sink if audio initialization fails.
 
 The first `run-gui` invocation creates a 1 GiB sparse ext4 user disk at
 `${XDG_DATA_HOME:-~/.local/share}/thekernel/desktop/home.ext4`; subsequent runs
 reuse it without formatting. It is mounted at `/var/lib/weston` before Weston
 starts, and the desktop refuses to start if the mount fails. Documents,
 Pictures, and Downloads are created there on first use. The system rootfs
+uses standard XDG user directories, so browser downloads go to `Downloads`.
+MiniBrowser's website data and persistent cookie database live under
+`~/.local/share/webkitgtk-4.1/MiniBrowser` on the same user disk. The rootfs
 remains a disposable snapshot, so new application builds do not replace user
 files. The default user disk is outside the build cache and `make clean`.
 Pass `make run-gui RUN_ARGS="--home-disk /path/to/home.ext4"` to choose another
@@ -161,15 +180,34 @@ flavors; `test --suite graphics --flavor` accepts only `headless-abi-smoke`,
 `q35-graphics-seatd`, and `q35-graphics-logind`.
 
 For real virgl coverage, run the same flavor with
-`--graphics-profile virgl-interactive`. The tool waits only for
-`THEKERNEL_Q35_VIRGL_READY`; after the software marker the guest requires
+`--graphics-profile virgl-interactive`. The final
+`THEKERNEL_Q35_VIRGL_READY` marker follows the render-node oracle, EGL/GLES,
+complete Piglit quick profile, and Xwayland workload. The guest requires
 `/dev/dri/renderD128`, checks that `weston` has the required `render`
 supplementary device group, and launches the EGL/GLES workload with
 `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu`. The GLES client requires `GL_RENDERER`
 to contain `virgl`, so a software fallback fails acceptance. EGL setup, rendering, or its frame
-callback failures are non-zero and never emit that marker. The same 800x600
-red-block pixel oracle is captured after the virgl marker. This is Weston-only
-acceptance: the image does not run an independent Xorg session.
+callback failures are non-zero and never emit that marker. The conformance
+chain runs in the foreground so its diagnostics and failure markers reach the
+serial console. Set `--timeout` to cover the complete profile; the Virgl QMP
+controller uses that same run budget.
+
+Unmodified QEMU 10.2.2 cannot complete the Virgl QMP pixel oracle: its
+[`screendump`](https://github.com/qemu/qemu/blob/v10.2.2/ui/ui-qmp-cmds.c)
+requires a console surface, while
+[`Virgl scanout`](https://github.com/qemu/qemu/blob/v10.2.2/hw/display/virtio-gpu-virgl.c)
+sets the console to a GL texture. The
+[`console implementation`](https://github.com/qemu/qemu/blob/v10.2.2/ui/console.c)
+then returns no surface. The development image applies
+[`qemu-egl-headless-screendump.patch`](../dev-env/qemu-egl-headless-screendump.patch),
+which exposes EGL-headless's existing CPU readback through an optional display
+listener callback. Use `--graphics-profile virgl-headless` with that QEMU for
+automated GL screenshots; SDL/GTK GL windows still lack this callback. The patch
+preserves the device-facing console surface API. A ready marker alone remains
+insufficient: acceptance still requires the rendered pixels and input checks.
+The image runs rootless Xwayland inside Weston, without an independent Xorg
+session. Interactive desktop resolution defaults to 1920×1080; the fixed
+800×600 conformance clients retain their original pixel coordinates.
 
 Both Q35 fragments select Buildroot's Xorg7 libraries to supply desktop
 OpenGL/GLX for Piglit and enable rootless Weston's Xwayland with `libepoxy`.
@@ -184,6 +222,13 @@ driver override, then checks the generated `results.json.bz2`. Only `pass`,
 `skip`, `warn`, and `notrun` records are accepted; failures, crashes, timeouts,
 incomplete results, malformed results, and unknown statuses fail the guest
 oracle before it emits its ready marker.
+
+The September 8, 2026 validation entered this full 45,124-case profile after
+fixing `/dev/shm` mount identity across devfs socket creation. It completed
+361 cases with `pass` and 135 with `skip` before corruption of the shared block
+device owner retired the root-disk completion queue. Subsequent executable
+loads failed with `EIO`; those are storage failures, not GL conformance
+results. The profile and QMP acceptance remain incomplete.
 
 No Buildroot or package downloads, cross-toolchain build, or guest boot are
 performed by `--check`; the full wrapper build validates the produced ext4

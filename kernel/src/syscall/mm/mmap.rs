@@ -142,8 +142,17 @@ fn populate_explicit_with_reclaim(
             }
         };
         let mut reclaimed = false;
+        let mut contended = false;
         for cache in caches {
-            reclaimed |= cache.reclaim_one()?;
+            match cache.reclaim_one() {
+                Ok(progress) => reclaimed |= progress,
+                Err(error) if error.canonicalize() == AxError::ResourceBusy => contended = true,
+                Err(error) => return Err(error),
+            }
+        }
+        if contended {
+            axtask::yield_now();
+            continue;
         }
         if !reclaimed {
             return Err(AxError::NoMemory);

@@ -144,6 +144,7 @@ impl Store {
 }
 static STORE: SpinNoIrq<Store> = SpinNoIrq::new(Store::new());
 static PENDING: AtomicBool = AtomicBool::new(false);
+static READERS_PENDING: AtomicBool = AtomicBool::new(false);
 static LOST_RECORDS: AtomicU64 = AtomicU64::new(0);
 static LOST_DIAGNOSTICS: AtomicU64 = AtomicU64::new(0);
 static TRUNCATED: AtomicU64 = AtomicU64::new(0);
@@ -324,6 +325,10 @@ fn append(text: Text, level: Level) {
     if !store.append(text, priority(level)) {
         LOST_DIAGNOSTICS.fetch_add(1, Ordering::Relaxed);
     }
+    // Readers observe retained bytes even when console output is disabled or
+    // its bounded queue is full. Wake only from a deferred safe point: log
+    // producers may hold scheduler locks or run in interrupt context.
+    READERS_PENDING.store(true, Ordering::Release);
     // Publish under the same lock as consumer's empty check; no missed wake.
     if store.count != 0 {
         PENDING.store(true, Ordering::Release);
@@ -410,6 +415,10 @@ pub fn retire_diagnostic_sink() {
 }
 pub fn set_console_threshold(threshold: u8) {
     STORE.lock().threshold = threshold;
+}
+/// Consume the coalesced log-arrival edge from a scheduler-safe dispatcher.
+pub fn take_reader_notification() -> bool {
+    READERS_PENDING.swap(false, Ordering::AcqRel)
 }
 pub fn diagnostic_work_pending() -> bool {
     PENDING.load(Ordering::Acquire)
@@ -588,6 +597,7 @@ mod tests {
     #[test]
     fn producer_contention_reentrancy_and_partial_drain() {
         // All other tests use local stores, so this owns the global test state.
+        assert!(!take_reader_notification());
         let before = LOST_RECORDS.load(Ordering::Relaxed);
         {
             let store = STORE.lock();
@@ -600,8 +610,11 @@ mod tests {
             diagnostic(format_args!("recursive"));
         }
         assert_eq!(LOST_RECORDS.load(Ordering::Relaxed), before + 2);
+        assert!(!take_reader_notification());
         diagnostic(format_args!("retained"));
         assert_eq!(STORE.lock().count, 1);
+        assert!(take_reader_notification());
+        assert!(!take_reader_notification());
         let mut drain = DiagnosticDrain::new();
         let mut retained = std::vec::Vec::new();
         drain.drain_with(|bytes| {
@@ -636,5 +649,10 @@ mod tests {
         });
         assert_eq!(output, b"abcdef\n");
         assert!(drain.pending.is_none());
+        set_console_enabled(false);
+        diagnostic(format_args!("retained with console disabled"));
+        assert!(take_reader_notification());
+        assert!(!diagnostic_work_pending());
+        set_console_enabled(true);
     }
 }

@@ -22,6 +22,7 @@ use super::{
 
 /// Per-request explicit synchronization.  These fences are intentionally
 /// outside `atomic::State`: KMS properties reset after every commit.
+#[derive(Default)]
 pub(crate) struct AtomicSync {
     pub(crate) inputs: alloc::vec::Vec<Arc<super::fence::Fence>>,
     pub(crate) predecessors: alloc::vec::Vec<Arc<super::fence::Fence>>,
@@ -62,7 +63,6 @@ struct FileState {
     cursor_framebuffers: BTreeMap<GemHandle, FramebufferId>,
     next_syncobj: super::syncobj::SyncobjHandle,
     syncobjs: BTreeMap<super::syncobj::SyncobjHandle, Arc<super::syncobj::Syncobj>>,
-    is_master: bool,
     atomic_enabled: bool,
     render_context: Option<u32>,
     render_init: super::render::ContextInit,
@@ -223,7 +223,6 @@ impl DrmFile {
                 cursor_framebuffers: BTreeMap::new(),
                 next_syncobj: 1,
                 syncobjs: BTreeMap::new(),
-                is_master: false,
                 atomic_enabled: false,
                 render_context: None,
                 render_init: super::render::ContextInit::default(),
@@ -534,30 +533,22 @@ impl DrmFile {
         if self.render_node {
             return Err(DrmError::PermissionDenied);
         }
-        let mut device = self.device.state.lock();
-        if device.kms_suspended {
-            return Err(DrmError::Busy);
-        }
-        match device.master {
-            Some(id) if id != self.id => Err(DrmError::Busy),
-            _ => {
-                device.master = Some(self.id);
-                self.state.lock().is_master = true;
-                Ok(())
-            }
-        }
+        self.device.acquire_master(self.id, self.seat_owned_primary)
     }
 
     pub fn drop_master(&self) {
         let mut device = self.device.state.lock();
+        let restore_console = self.seat_owned_primary && device.master == Some(self.id);
         if device.master == Some(self.id) {
-            device.master = None;
+            device.set_master(None);
         }
-        self.state.lock().is_master = false;
         drop(device);
         // Do not leave an already-host-complete flip eligible for publication
         // after this file loses DRM mastership.
         self.device.cancel_file_commits(&self.events);
+        if restore_console {
+            crate::pseudofs::dev::restore_console_after_master_close();
+        }
     }
 
     pub fn resources(&self) -> KmsResources {
@@ -1153,7 +1144,7 @@ impl DrmFile {
             return Err(DrmError::PermissionDenied);
         }
         let device_is_master = self.device.state.lock().master == Some(self.id);
-        if device_is_master && self.state.lock().is_master {
+        if device_is_master {
             Ok(())
         } else {
             Err(DrmError::PermissionDenied)
@@ -1194,11 +1185,15 @@ impl Drop for DrmFile {
         let mut device = self.device.state.lock();
         device.open_ids.remove(&self.id);
         device.primary_session_leases.remove(&self.id);
+        let restore_console = self.seat_owned_primary && device.master == Some(self.id);
         if device.master == Some(self.id) {
-            device.master = None;
+            device.set_master(None);
         }
         remove_owned_framebuffers(&mut device, self.id);
         drop(device);
+        if restore_console {
+            crate::pseudofs::dev::restore_console_after_master_close();
+        }
         let released_handles = {
             let state = self.state.lock();
             state
@@ -1439,6 +1434,7 @@ mod tests {
     #[test]
     fn gamma_lut_is_per_crtc_and_requires_master_to_change() {
         let file = device().open_primary();
+        file.drop_master();
         let original = file.gamma_lut(3).unwrap();
         let mut replacement = original.clone();
         replacement[0] = 0x1234;
@@ -1450,6 +1446,26 @@ mod tests {
         file.set_gamma_lut(3, &replacement).unwrap();
         assert_eq!(file.gamma_lut(3).unwrap()[0], 0x1234);
         assert!(matches!(file.gamma_lut(99), Err(DrmError::NotFound)));
+    }
+
+    #[test]
+    fn first_primary_opener_takes_console_master_without_stealing_a_user_seat() {
+        let device = device();
+        let console = device.open_fbdev_primary();
+        console.become_master().unwrap();
+        let first = device.open_primary();
+        first.require_master().unwrap();
+        assert_eq!(console.require_master(), Err(DrmError::PermissionDenied));
+        assert_eq!(console.become_master(), Err(DrmError::Busy));
+        let second = device.open_primary();
+        assert_eq!(second.require_master(), Err(DrmError::PermissionDenied));
+        assert_eq!(second.become_master(), Err(DrmError::Busy));
+        first.drop_master();
+        console.become_master().unwrap();
+        second.become_master().unwrap();
+        assert_eq!(console.require_master(), Err(DrmError::PermissionDenied));
+        drop(second);
+        console.become_master().unwrap();
     }
 
     #[test]

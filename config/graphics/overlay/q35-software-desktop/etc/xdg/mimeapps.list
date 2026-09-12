@@ -1,4 +1,7 @@
 [Default Applications]
+text/html=thekernel-browser.desktop;
+x-scheme-handler/http=thekernel-browser.desktop;
+x-scheme-handler/https=thekernel-browser.desktop;
 text/plain=thekernel-editor.desktop;
 text/x-python=thekernel-editor.desktop;
 application/x-shellscript=thekernel-editor.desktop;

@@ -27,6 +27,7 @@ from .runner import RunConfig, RunnerError, run
 COMPLETE_MARKER = "THEKERNEL_BENCH_EXIT_ZERO"
 SHELL_MARKER = "THEKERNEL_SHELL_READY"
 PRESSURES = ("none", "cpu", "io", "mixed")
+IO_TARGET = ("io", "random", 4096, 32, "fixed", "buffered", "read", "none")
 IO_FIELDS = ("workload", "block_bytes", "queue_depth", "resources", "cache", "operation", "durability")
 
 
@@ -50,6 +51,8 @@ class BenchmarkConfig:
     host_cpus: tuple[int, ...] = ()
     timeout: float = 1800.0
     qemu_binary: str | None = None
+    io_target: bool = False
+    io_trace: bool = False
 
 
 def _scenario(row: dict) -> tuple:
@@ -58,7 +61,11 @@ def _scenario(row: dict) -> tuple:
     return ("io", *(row.get(field) for field in IO_FIELDS))
 
 
-def _expected_scenarios(suite: str) -> set[tuple]:
+def _expected_scenarios(suite: str, io_target: bool = False) -> set[tuple]:
+    if io_target:
+        if suite != "io":
+            raise RunnerError("I/O target requires suite io")
+        return {IO_TARGET}
     keys = set()
     if suite in {"scheduler", "all"}:
         keys.update(("scheduler", pressure) for pressure in PRESSURES)
@@ -82,7 +89,7 @@ def _number(row: dict, name: str, *, positive: bool = True) -> float:
 
 
 def parse_benchmark_log(path: Path, suite: str, iterations: int, *, linux: bool = False,
-                        workers: int | None = None) -> dict[tuple, dict]:
+                        workers: int | None = None, io_target: bool = False) -> dict[tuple, dict]:
     """Reject partial/duplicate matrices, silent failures and mismatched work."""
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
@@ -165,9 +172,99 @@ def parse_benchmark_log(path: Path, suite: str, iterations: int, *, linux: bool 
         if key in rows:
             raise RunnerError(f"duplicate benchmark scenario {key}")
         rows[key] = row
-    if rows.keys() != _expected_scenarios(suite):
+    if rows.keys() != _expected_scenarios(suite, io_target):
         raise RunnerError(f"benchmark matrix incomplete or unexpected: {path}")
     return rows
+
+
+def parse_io_trace(path: Path, iterations: int) -> dict:
+    """Validate the bounded canonical synchronous-read lifecycle, preserving identities.
+
+    Adjacent transition intervals include instrumentation overhead. In particular,
+    issue-to-completion combines provider, filesystem, copying and any blocking.
+    """
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    begin, end = "THEKERNEL_IO_TRACE_BEGIN", "THEKERNEL_IO_TRACE_END"
+    if iterations != 64 or lines.count(COMPLETE_MARKER) != 1:
+        raise RunnerError("I/O trace requires 64 operations and workload completion")
+    if lines.count(begin) != 1 or lines.count(end) != 1:
+        raise RunnerError("I/O trace markers missing or duplicated")
+    first, last = lines.index(begin), lines.index(end)
+    if first >= last or last >= lines.index(COMPLETE_MARKER):
+        raise RunnerError("I/O trace marker order differs")
+    capture = lines[first + 1:last]
+    if not capture or not re.fullmatch(
+        r"# io_uring lifecycle snapshot; capacity=1024 policy=stop-on-full dropped=0 dropped_total=\d+",
+        capture[0],
+    ):
+        raise RunnerError("I/O trace header invalid or capture dropped events")
+    stages = ("reserved", "submitted", "issued", "executor_started",
+              "permission_started", "permission_returned", "read_started", "read_returned",
+              "notification_returned", "executor_returned", "completion_accepted",
+              "publication_started", "published")
+    requests = {}
+    previous = -1
+    reclaimed = 0
+    reclaimed_rings = set()
+    for line in capture[1:]:
+        pairs = re.findall(r"(\w+)=([^ =]+)", line)
+        fields = dict(pairs)
+        if len(fields) != len(pairs) or " ".join(f"{key}={value}" for key, value in pairs) != line:
+            raise RunnerError(f"invalid I/O trace fields: {line}")
+        try:
+            sequence, nanos, ring = (int(fields[name]) for name in ("seq", "ns", "ring"))
+            event = fields["event"]
+            if sequence < 0 or (previous >= 0 and sequence != previous + 1) or nanos < 0 or ring <= 0:
+                raise ValueError("sequence")
+            previous = sequence
+            if event == "head_reclaimed":
+                if "slot" in fields or "generation" in fields or int(fields["count"]) <= 0:
+                    raise ValueError("head reclamation")
+                # The first measured enter can reclaim the final warmup batch.
+                # Its ring identity is validated after measured reservations arrive.
+                reclaimed_rings.add(ring)
+                reclaimed += int(fields["count"])
+                continue
+            key = (ring, int(fields["slot"]), int(fields["generation"]))
+            if key[1] < 0 or key[2] <= 0:
+                raise ValueError("request identity")
+            if key not in requests:
+                if event != "reserved" or fields.get("operation") != "Read":
+                    raise ValueError("reservation")
+                user_data = int(fields["user_data"])
+                if not 0 <= user_data < 32:
+                    raise ValueError("submission identity")
+                requests[key] = {"ring": key[0], "slot": key[1], "generation": key[2],
+                                 "user_data": user_data, "timestamps_ns": {}}
+            times = requests[key]["timestamps_ns"]
+            if len(times) >= len(stages) or event != stages[len(times)]:
+                raise ValueError("lifecycle order")
+            if times and nanos < next(reversed(times.values())):
+                raise ValueError("timestamp order")
+            if event in {"completion_accepted", "published"}:
+                if fields.get("result") != "4096" or fields.get("flags") != "0":
+                    raise ValueError("completion result")
+            if event == "completion_accepted" and fields.get("cause") != "Completed":
+                raise ValueError("completion cause")
+            if event in {"publication_started", "published"} and fields.get("terminal") != "true":
+                raise ValueError("terminal publication")
+            times[event] = nanos
+        except (KeyError, ValueError) as error:
+            raise RunnerError(f"invalid I/O trace event: {line}") from error
+    if len(requests) != iterations or any(len(row["timestamps_ns"]) != len(stages) for row in requests.values()):
+        raise RunnerError("I/O trace request lifecycles incomplete")
+    request_rings = {key[0] for key in requests}
+    if len(request_rings) != 1 or not reclaimed_rings <= request_rings:
+        raise RunnerError("I/O trace contains unrelated rings")
+    if any(sum(row["user_data"] == identity for row in requests.values()) != 2 for identity in range(32)):
+        raise RunnerError("I/O trace submission identities differ from two QD32 batches")
+    intervals = {}
+    for start, stop in zip(stages, stages[1:]):
+        values = [row["timestamps_ns"][stop] - row["timestamps_ns"][start] for row in requests.values()]
+        intervals[f"{start}_to_{stop}"] = {"sum_ns": sum(values), "mean_ns": sum(values) / len(values)}
+    return {"scope": "measured_canonical_target", "clock": "monotonic", "dropped": 0,
+            "requests": list(requests.values()), "intervals": intervals, "head_reclaimed_count": reclaimed,
+            "limitations": "Diagnostic instrumentation overhead is included; permission stages include file-status validation and fanotify; read stages include provider, filesystem, bounce allocation, copying and blocking; read-return-to-notification-return includes post-read fsnotify; all intervals include instrumentation overhead; head reclamation is aggregate."}
 
 
 def _metrics(row: dict) -> dict[str, tuple[float, bool]]:
@@ -226,6 +323,10 @@ def _validate_config(config: BenchmarkConfig) -> tuple[int, ...]:
         raise RunnerError("invalid benchmark suite or iteration count")
     if config.trials < 1 or config.cpus not in (1, 4) or not math.isfinite(config.timeout) or config.timeout <= 0:
         raise RunnerError("benchmark needs >=1 trial, 1/4 vCPUs and a positive timeout")
+    if config.io_target and config.suite != "io":
+        raise RunnerError("I/O target requires suite io")
+    if config.io_trace and (not config.io_target or config.iterations != 64 or config.trials != 1):
+        raise RunnerError("I/O trace requires target-only, 64 iterations and one diagnostic trial")
     available = os.sched_getaffinity(0)
     selected = config.host_cpus or tuple(sorted(available)[:config.cpus])
     if (any(type(cpu) is not int or cpu < 0 for cpu in selected)
@@ -281,6 +382,10 @@ def _benchmark_commands(config: BenchmarkConfig, *, linux: bool = False) -> str:
         lines.append("/bin/busybox dmesg -n 4 || failed=1")
     lines += ["b=/opt/thekernel-tests/bin/thekernel-kernel-bench",
               f"export KERNEL_BENCH_WORKERS={config.cpus}"]
+    if config.io_target:
+        lines.append("export KERNEL_BENCH_IO_TARGET=1")
+    if config.io_trace and not linux:
+        lines.append("export KERNEL_BENCH_IO_TRACE=1")
     if config.suite in {"scheduler", "all"}:
         lines += ["tp=/sys/kernel/tracing",
                   '[ -r "$tp/events/sched/sched_wakeup/id" ] || /bin/busybox mount -t tracefs tracefs "$tp" || failed=1']
@@ -301,6 +406,7 @@ def run_benchmark_experiment(config: BenchmarkConfig) -> dict:
     observations = {target.name: [] for target in config.targets}
     order = []
     pinning_runs = []
+    io_traces = {}
     boot_files = []
     discarded = 1 if config.trials >= 10 else 0
     try:
@@ -358,7 +464,10 @@ def run_benchmark_experiment(config: BenchmarkConfig) -> dict:
                             raise RunnerError("benchmark did not confirm the requested per-vCPU affinity")
                         pinning_runs.append({"phase": phase, "target": target.name, "mapping": mapping})
                         rows = parse_benchmark_log(result.log_path, config.suite, config.iterations,
-                                                   linux=target.name == "linux", workers=config.cpus)
+                                                   linux=target.name == "linux", workers=config.cpus,
+                                                   io_target=config.io_target)
+                        if config.io_trace and target.name != "linux":
+                            io_traces[target.name] = parse_io_trace(result.log_path, config.iterations)
                         if trial >= 0:
                             observations[target.name].append(rows)
                     finally:
@@ -390,6 +499,7 @@ def run_benchmark_experiment(config: BenchmarkConfig) -> dict:
                     **({"inference": "incomparable_counter_semantics",
                         "reason": "Linux counts pending migration at sched-in; TheKernel counts changed execution CPU"}
                        if target.name == "linux" and metric == "foreground_cpu_migrations"
+                       else {"inference": "diagnostic_only"} if config.io_trace
                        else paired_improvement(reference_values, target_values, smaller_better=smaller)
                        if config.trials >= 10 and all(value > 0 for value in reference_values + target_values)
                        else {"inference": "zero_values_no_ratio" if config.trials >= 10 else "insufficient_trials",
@@ -397,7 +507,8 @@ def run_benchmark_experiment(config: BenchmarkConfig) -> dict:
                 })
     return {
         "suite": config.suite, "trials": config.trials, "discarded_warmup_rounds": discarded,
-        "acceptance": "measured" if config.trials >= 10 else "smoke_only",
+        "acceptance": "diagnostic_only" if config.io_trace else "measured" if config.trials >= 10 else "smoke_only",
+        "io_target": config.io_target, "io_traces": io_traces,
         "iterations": config.iterations, "order": order, "workdir": str(directory),
         "configuration": {"accel": "kvm", "cpus": config.cpus, "memory": config.memory,
                           "host_cpu_mask": list(host_cpus), "per_vcpu_thread_pinning": True,

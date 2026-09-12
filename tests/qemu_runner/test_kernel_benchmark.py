@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 from tests.support import test_tmpdir
 from tools.qemu_runner.kernel_benchmark import (
-    BenchmarkConfig, BenchmarkTarget, COMPLETE_MARKER, PRESSURES,
+    BenchmarkConfig, BenchmarkTarget, COMPLETE_MARKER, PRESSURES, IO_TARGET, IO_FIELDS,
+    parse_io_trace, _validate_config,
     paired_improvement, parse_benchmark_log, run_benchmark_experiment, _metrics, _benchmark_commands, SHELL_MARKER,
 )
 from tools.qemu_runner.model import RunResult
@@ -126,6 +127,79 @@ class KernelBenchmarkTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["cpu_jain_fairness"][0], 0.9)
         self.assertEqual(metrics["cpu_max_progress_gap_ns"], (9000000, True))
         self.assertEqual(metrics["foreground_cpu_migrations"], (0, True))
+
+    def test_io_target_requires_explicit_exact_singleton(self):
+        with test_tmpdir() as temporary:
+            log = Path(temporary) / "console.log"
+            row = {"suite": "io", **dict(zip(IO_FIELDS, IO_TARGET[1:]))}
+            row.update(suite="io", iterations=32, bytes=32 * 4096, elapsed_ns=32000,
+                       includes_buffer_work=True, measurement=scheduler_rows()[0]["measurement"])
+            write_log(log, [row])
+            self.assertEqual(set(parse_benchmark_log(log, "io", 32, io_target=True)), {IO_TARGET})
+            with self.assertRaisesRegex(RunnerError, "matrix"):
+                parse_benchmark_log(log, "io", 32)
+            row["queue_depth"] = 8
+            write_log(log, [row])
+            with self.assertRaisesRegex(RunnerError, "matrix"):
+                parse_benchmark_log(log, "io", 32, io_target=True)
+
+    def test_io_trace_validates_identities_order_loss_and_completeness(self):
+        with test_tmpdir() as temporary:
+            log = Path(temporary) / "console.log"
+            lines = ["THEKERNEL_IO_TRACE_BEGIN",
+                     "# io_uring lifecycle snapshot; capacity=1024 policy=stop-on-full dropped=0 dropped_total=7",
+                     "seq=0 ns=0 ring=1 event=head_reclaimed head=128 count=32"]
+            for request in range(64):
+                for stage, (event, extra) in enumerate((
+                    ("reserved", f"user_data={request % 32} operation=Read"),
+                    ("submitted", ""), ("issued", ""),
+                    ("executor_started", ""), ("permission_started", ""),
+                    ("permission_returned", ""), ("read_started", ""), ("read_returned", ""),
+                    ("notification_returned", ""), ("executor_returned", ""),
+                    ("completion_accepted", "cause=Completed result=4096 flags=0"),
+                    ("publication_started", "terminal=true"),
+                    ("published", "tail=1 terminal=true result=4096 flags=0"),
+                )):
+                    sequence = request * 13 + stage + 1
+                    lines.append(f"seq={sequence} ns={sequence * 10} ring=1 slot={request % 32} "
+                                 f"generation={request // 32 + 1} event={event} {extra}".rstrip())
+            lines += ["THEKERNEL_IO_TRACE_END", COMPLETE_MARKER]
+            valid = "\n".join(lines) + "\n"
+            log.write_text(valid)
+            result = parse_io_trace(log, 64)
+            self.assertEqual(len(result["requests"]), 64)
+            self.assertEqual(result["head_reclaimed_count"], 32)
+            for interval in ("permission_started_to_permission_returned",
+                             "read_started_to_read_returned", "read_returned_to_notification_returned"):
+                self.assertEqual(result["intervals"][interval]["mean_ns"], 10)
+            for invalid in (valid.replace("dropped=0", "dropped=1"),
+                            valid.replace("result=4096", "result=-5 result=4096", 1),
+                            valid.replace("seq=1 ns=10", "garbage seq=1 ns=10", 1),
+                            valid.replace("seq=1 ns=10", "seq=1 ns=10 malformed", 1),
+                            valid.replace("ring=1 event=head_reclaimed", "ring=2 event=head_reclaimed"),
+                            valid.replace("event=issued", "event=submitted", 1),
+                            valid.replace("event=read_returned", "event=read_started", 1),
+                            valid.replace("event=permission_returned", "event=notification_returned", 1),
+                            valid.replace("result=4096", "result=0", 1),
+                            valid.replace("generation=2", "generation=1"),
+                            valid.replace(lines[-3] + "\n", "")):
+                log.write_text(invalid)
+                with self.assertRaises(RunnerError):
+                    parse_io_trace(log, 64)
+
+    def test_io_trace_configuration_and_commands_are_bounded(self):
+        with test_tmpdir() as temporary:
+            config = replace(self.config(temporary, trials=1), suite="io", iterations=64,
+                             io_target=True, io_trace=True)
+            for linux in (False, True):
+                commands = _benchmark_commands(config, linux=linux)
+                self.assertIn("KERNEL_BENCH_IO_TARGET=1", commands)
+                self.assertEqual("KERNEL_BENCH_IO_TRACE=1" in commands, not linux)
+                self.assertTrue(all(len(line.encode()) + 1 < 128 for line in commands.splitlines()))
+            for invalid in (replace(config, suite="all"), replace(config, io_target=False),
+                            replace(config, iterations=128), replace(config, trials=10)):
+                with self.assertRaisesRegex(RunnerError, "I/O"):
+                    _validate_config(invalid)
 
     def test_io_primary_metric_uses_nanoseconds_per_operation(self):
         row = {"suite": "io", "elapsed_ns": 64000, "iterations": 32,

@@ -1454,6 +1454,70 @@ fn remove_current_thread(
         .map_err(process_lifecycle_error)
 }
 
+/// Close clone admission before releasing init's lifecycle gate. Descendants
+/// blocked in CLONE_PARENT need that gate to unwind and deliver their SIGKILL;
+/// retaining it across the drain would make init and its child wait forever.
+fn drain_pid_namespace_without_lifecycle<P, R>(
+    namespace: &super::PidNamespace,
+    lifecycle: P,
+    drain: impl FnOnce() -> R,
+) -> R {
+    namespace.disable_allocation();
+    drop(lifecycle);
+    drain()
+}
+
+/// Like Linux zap_pid_ns_processes(), finish the namespace's children while
+/// its last init thread still provides the exact reaper endpoint. Allocation
+/// is already disabled and no lifecycle, global publication or spin lock is held.
+fn zap_pid_namespace(proc_data: &ProcessData) -> AxResult<()> {
+    let namespace = proc_data.pid_ns();
+    while namespace.has_pending_publications() {
+        axtask::yield_now();
+    }
+    let registry = process_domain()?.registry();
+    for process in registry.processes_through_current_max() {
+        if process.pid() != proc_data.proc.pid()
+            && process
+                .identity::<Arc<super::PidNamespace>>()
+                .is_some_and(|target| namespace.contains(target))
+            && let Ok(target) = get_process_data(process.pid())
+        {
+            let _ = send_signal_to_process_data(
+                &target,
+                Some(SignalInfo::new_kernel(Signo::SIGKILL)),
+            );
+        }
+    }
+    loop {
+        let mut remaining = false;
+        for process in registry.processes_through_current_max() {
+            if process.pid() == proc_data.proc.pid()
+                || !process
+                    .identity::<Arc<super::PidNamespace>>()
+                    .is_some_and(|target| namespace.contains(target))
+            {
+                continue;
+            }
+            if process.is_zombie()
+                && process
+                    .parent()
+                    .is_some_and(|parent| Arc::ptr_eq(&parent, &proc_data.proc))
+            {
+                if reap_process(&process)? {
+                    cgroup::detach_process(&process);
+                }
+            } else {
+                remaining = true;
+            }
+        }
+        if !remaining {
+            return Ok(());
+        }
+        axtask::yield_now();
+    }
+}
+
 fn exact_parent_thread_in_process(
     process: &Arc<Process>,
     departing_kernel_tid: Option<Pid>,
@@ -1573,7 +1637,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // Declare custody before the guard so a failed prepare/unwind cannot
     // destroy a filter chain under lifecycle serialization.
     let seccomp_retirement_plan;
-    let lifecycle = thr.proc_data.lock_process_lifecycle();
+    let mut lifecycle = thr.proc_data.lock_process_lifecycle();
     // Reserve the bounded terminal-retirement entry before group exit can
     // become irreversible.  A full queue must still be reported while the
     // caller can return without leaving the group-exit gate or peer SIGKILLs
@@ -1596,6 +1660,15 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
                 let _ = send_signal_to_thread(Some(process.pid()), peer_tid, Some(sig.clone()));
             }
         }
+    }
+    if process.is_init() && thr.pid_ns().parent().is_some() && process.thread_count() == 1 {
+        drain_pid_namespace_without_lifecycle(&thr.pid_ns(), lifecycle, || {
+            zap_pid_namespace(&thr.proc_data)
+        })
+        .unwrap_or_else(|error| fail_closed_exit(error));
+        // Allocation closure prevents new same-group threads while unlocked.
+        // Restore serialization for the irreversible final-exit transaction.
+        lifecycle = thr.proc_data.lock_process_lifecycle();
     }
     let mut task_parent_publication = Some(lock_task_parent_publication());
     thr.proc_data.begin_usage_transition();
@@ -1941,6 +2014,41 @@ pub(crate) fn fail_closed_exit(error: AxError) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_exit_releases_lifecycle_for_blocked_clone_parent() {
+        use std::{sync::mpsc, time::Duration};
+
+        let owner = super::super::UserNamespace::try_new_root().unwrap();
+        let root = super::super::PidNamespace::try_new_root(owner.clone()).unwrap();
+        root.reserve_process(10).unwrap().commit();
+        let namespace = root.try_fork(20, owner).unwrap();
+        namespace.reserve_process(20).unwrap().commit();
+        let admitted = namespace.reserve_process(21).unwrap();
+        let gate = std::sync::Mutex::new(());
+        let lifecycle = gate.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).unwrap();
+                // CLONE_PARENT takes the parent's gate before PID allocation.
+                let _parent = gate.lock().unwrap();
+                let result = namespace.reserve_process(22).map(|reservation| reservation.commit());
+                admitted.commit();
+                done_tx.send(result).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            drain_pid_namespace_without_lifecycle(&namespace, lifecycle, || {
+                assert_eq!(
+                    done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    Err(AxError::NoMemory)
+                );
+                assert!(!namespace.has_pending_publications());
+                assert_eq!(namespace.visible_pid_checked(22), None);
+            });
+        });
+    }
 
     #[test]
     fn robust_owner_died_marks_matching_tid() {

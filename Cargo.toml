@@ -147,6 +147,7 @@ default = ["x86-product"]
 boot-shell = []
 sched-wake-locality = ["thekernel-kernel/sched-wake-locality"]
 io-submit-batch = ["thekernel-kernel/io-submit-batch"]
+io-notify-fastpath = ["thekernel-kernel/io-notify-fastpath"]
 # The shipped x86_64 product keeps its hardware-backed Linux ABI paths in one
 # explicit opt-in.  CET and cachestat have no feature gate: both are always
 # compiled, while their hardware use is capability-gated at runtime.

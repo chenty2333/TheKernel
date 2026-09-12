@@ -277,11 +277,10 @@ impl UnixNamespace {
         }
     }
 
-    fn insert_abstract_slot_with(
+    fn insert_abstract_slot(
         &self,
         name: Arc<Vec<u8>>,
         slot: Arc<BindSlot>,
-        publish: impl FnOnce(),
     ) -> AxResult {
         let mut binds = self.abstract_binds.lock();
         let retired = match binds.get(&name) {
@@ -295,9 +294,6 @@ impl UnixNamespace {
             return Err(AxError::NoMemory);
         }
         binds.insert(name, slot);
-        // The caller's companion metadata becomes visible while the endpoint
-        // remains protected by this namespace publication lock.
-        publish();
         drop(binds);
         drop(retired);
         Ok(())
@@ -563,6 +559,12 @@ pub struct UnixSeqPacketConnectReservation<'a> {
 }
 
 impl UnixStreamConnectReservation<'_> {
+    pub fn connecting_identity(&self) -> UnixEndpointIdentity {
+        UnixEndpointIdentity::from_raw(
+            self.inner.as_ref().expect("active Unix stream-connect reservation").connecting_identity(),
+        )
+    }
+
     pub fn listening_identity(&self) -> UnixEndpointIdentity {
         UnixEndpointIdentity::from_raw(
             self.inner
@@ -606,6 +608,12 @@ impl Drop for UnixStreamConnectReservation<'_> {
 }
 
 impl UnixSeqPacketConnectReservation<'_> {
+    pub fn connecting_identity(&self) -> UnixEndpointIdentity {
+        UnixEndpointIdentity::from_raw(
+            self.inner.as_ref().expect("active Unix seqpacket reservation").connecting_identity(),
+        )
+    }
+
     pub fn listening_identity(&self) -> UnixEndpointIdentity {
         UnixEndpointIdentity::from_raw(
             self.inner
@@ -784,12 +792,21 @@ pub struct UnixSocket {
 impl UnixSocket {
     pub fn connected_endpoint_identity(&self) -> Option<UnixEndpointIdentity> {
         match &self.transport {
-            Transport::Dgram(data) => Some(UnixEndpointIdentity::from_raw(data.identity())),
+            Transport::Dgram(data) => data.identity().map(UnixEndpointIdentity::from_raw),
             Transport::SeqPacket(data) => {
                 data.endpoint_identity().map(UnixEndpointIdentity::from_raw)
             }
-            Transport::Stream(_) => None,
+            Transport::Stream(data) => data.endpoint_identity().map(UnixEndpointIdentity::from_raw),
         }
+    }
+
+    pub fn peer_endpoint_identity(&self) -> Option<UnixEndpointIdentity> {
+        match &self.transport {
+            Transport::Stream(data) => data.peer_endpoint_identity(),
+            Transport::Dgram(data) => data.peer_identity(),
+            Transport::SeqPacket(data) => data.peer_endpoint_identity(),
+        }
+        .map(UnixEndpointIdentity::from_raw)
     }
     /// Create a new Unix socket with the given transport.
     pub fn new(transport: impl Into<Transport>, namespace: Arc<UnixNamespace>) -> Self {
@@ -868,13 +885,13 @@ impl UnixSocket {
         })
     }
 
-    /// Binds an abstract endpoint and publishes caller-owned metadata in the
-    /// same namespace critical section as the endpoint name.
-    pub fn bind_abstract_with_publish(
+    /// Prepare fallible caller metadata before publishing the abstract name.
+    /// On failure the prepared guard and private endpoint are both rolled back.
+    pub fn bind_abstract_with_publish<G>(
         &self,
         address: UnixSocketAddr,
-        publish: impl FnOnce(UnixEndpointIdentity),
-    ) -> AxResult {
+        prepare: impl FnOnce(UnixEndpointIdentity) -> AxResult<G>,
+    ) -> AxResult<G> {
         let UnixSocketAddr::Abstract(name) = &address else {
             return Err(AxError::InvalidInput);
         };
@@ -883,10 +900,10 @@ impl UnixSocket {
         let target = UnixSocketTarget::new(address, slot.clone())?;
         let reservation = self.reserve_bind(target)?;
         let endpoint = reservation.target.endpoint_identity()?;
-        self.namespace
-            .insert_abstract_slot_with(name, slot, || publish(endpoint))?;
+        let prepared = prepare(endpoint)?;
+        self.namespace.insert_abstract_slot(name, slot)?;
         reservation.commit_inner(true);
-        Ok(())
+        Ok(prepared)
     }
 
     fn prepare_stream_connect_target(
@@ -1253,7 +1270,7 @@ impl SocketOps for UnixSocket {
         match &local_addr {
             UnixSocketAddr::Unnamed => Err(AxError::InvalidInput),
             UnixSocketAddr::Path(_) => Err(AxError::OperationNotSupported),
-            UnixSocketAddr::Abstract(_) => self.bind_abstract_with_publish(local_addr, |_| {}),
+            UnixSocketAddr::Abstract(_) => self.bind_abstract_with_publish(local_addr, |_| Ok(())),
         }
     }
 
@@ -1352,6 +1369,32 @@ mod tests {
             drain_deferred_receive_cleanup_work();
         }
         assert!(!has_deferred_receive_cleanup_work());
+    }
+
+    #[test]
+    fn abstract_bind_metadata_failure_rolls_back_name_and_transport() {
+        let _guard = UNIX_CLEANUP_TEST_LOCK.lock();
+        drain_all_unix_cleanup();
+        let name = test_abstract_name(b"axnet-metadata-rollback");
+        let namespace = UnixNamespace::try_new().unwrap();
+        let socket = test_socket_in(&namespace, DgramTransport::new().unwrap());
+        let address = UnixSocketAddr::Abstract(name.clone());
+        assert!(matches!(socket.bind_abstract_with_publish(address.clone(),
+            |_| Err::<(), _>(AxError::NoMemory)), Err(AxError::NoMemory)));
+        assert!(!namespace.abstract_binds.lock().contains_key(&name));
+        socket.bind_abstract_with_publish(address.clone(), |_| Ok(())).unwrap();
+
+        struct Prepared(Arc<core::sync::atomic::AtomicUsize>);
+        impl Drop for Prepared {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+        }
+        let dropped = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let other = test_socket_in(&namespace, DgramTransport::new().unwrap());
+        assert!(matches!(other.bind_abstract_with_publish(address,
+            |_| Ok(Prepared(dropped.clone()))), Err(AxError::AddrInUse)));
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        other.bind_abstract_with_publish(UnixSocketAddr::Abstract(test_abstract_name(b"axnet-metadata-retry")),
+            |_| Ok(())).unwrap();
     }
 
     #[test]
@@ -1517,6 +1560,7 @@ mod tests {
                         CMsgData::new(Box::new(RollbackDropProbe(drops.clone())), 1,)
                     ],
                     credentials: None,
+                    credentials_explicit: false,
                     nonblocking_override: None,
                 },
                 target.clone(),

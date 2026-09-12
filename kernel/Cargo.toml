@@ -37,6 +37,7 @@ eevdf-throughput = ["axtask/eevdf-throughput"]
 idle-steal = ["axtask/idle-steal"]
 sched-wake-locality = ["axtask/sched-wake-locality"]
 io-submit-batch = []
+io-notify-fastpath = []
 
 [dependencies]
 axfeat = { workspace = true, features = [
@@ -62,7 +63,7 @@ axfeat = { workspace = true, features = [
 axalloc.workspace = true
 axconfig.workspace = true
 axdisplay.workspace = true
-axdriver.workspace = true
+axdriver = { workspace = true, features = ["virtio-sound"] }
 axdriver_display.workspace = true
 axfs = { workspace = true, features = ["task-io-accounting", "nfs41"] }
 axhal = { workspace = true, features = ["fp-simd", "pkeys"] }

@@ -4593,11 +4593,16 @@ pub(crate) fn init() -> Result<(), TaskRuntimeInitError> {
 
     // Create the `idle` task (not current task).
     // The idle task will run when there is no other runnable task.
-    // Stack size of idle task should be large because traps/interrupts may happen in idle task,
-    // which need more stack space.
-    const IDLE_TASK_STACK_SIZE: usize = 16384;
-    let idle_task =
-        TaskInner::new(|| crate::run_idle(), "idle".into(), IDLE_TASK_STACK_SIZE)?.into_arc()?;
+    // Idle runs the scheduler and deferred work on its own stack. The former
+    // 16 KiB allocation overflowed into adjacent heap objects on the EEVDF
+    // path under graphics pressure. Use the same budget as ordinary tasks
+    // and secondary-CPU idle stacks.
+    let idle_task = TaskInner::new(
+        || crate::run_idle(),
+        "idle".into(),
+        axconfig::TASK_STACK_SIZE,
+    )?
+    .into_arc()?;
     let main_task = TaskInner::new_init("main".into())?.into_arc()?;
     let run_queue = AxRunQueue::new(cpu_id, true)?;
     #[cfg(feature = "sched-eevdf")]

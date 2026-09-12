@@ -115,7 +115,10 @@ impl ListenTable {
 
     pub fn unlisten(&self, port: u16) {
         debug!("TCP socket unlisten on {port}");
-        *self.tcp[port as usize].lock() = None;
+        // Release the entry lock before its queued sockets are removed.
+        // Ingress holds the socket set before acquiring this entry.
+        let entry = self.tcp[port as usize].lock().take();
+        drop(entry);
     }
 
     fn listen_entry(&self, port: u16) -> &Mutex<Option<Box<ListenTableEntryInner>>> {
@@ -123,11 +126,12 @@ impl ListenTable {
     }
 
     pub(crate) fn can_accept(&self, port: u16, socket_set: &SocketSetWrapper) -> AxResult<bool> {
+        let sockets = socket_set.inner.lock();
         if let Some(entry) = self.listen_entry(port).lock().as_ref() {
             Ok(entry
                 .syn_queue
                 .iter()
-                .any(|&handle| is_connected(handle, socket_set)))
+                .any(|&handle| is_connected(handle, &sockets)))
         } else {
             warn!("accept before listen");
             Err(AxError::InvalidInput)
@@ -139,6 +143,8 @@ impl ListenTable {
         port: u16,
         socket_set: &SocketSetWrapper,
     ) -> AxResult<(SocketHandle, u64)> {
+        // Match ingress ordering: socket set, then listener entry.
+        let mut sockets = socket_set.inner.lock();
         let entry = self.listen_entry(port);
         let mut table = entry.lock();
         let Some(entry) = table.deref_mut() else {
@@ -150,7 +156,7 @@ impl ListenTable {
         let idx = syn_queue
             .iter()
             .enumerate()
-            .find_map(|(idx, &handle)| is_connected(handle, socket_set).then_some(idx))
+            .find_map(|(idx, &handle)| is_connected(handle, &sockets).then_some(idx))
             .ok_or(AxError::WouldBlock)?; // wait for connection
         if idx > 0 {
             warn!(
@@ -163,10 +169,10 @@ impl ListenTable {
         entry.accept_reservations += 1;
         // If the connection is reset, return ConnectionReset error
         // Otherwise, return the handle and the address tuple
-        if is_closed(handle, socket_set) {
+        if is_closed(handle, &sockets) {
             warn!("accept failed: connection reset");
             entry.accept_reservations -= 1;
-            socket_set.remove(handle);
+            sockets.remove(handle);
             Err(AxError::ConnectionReset)
         } else {
             Ok((handle, entry.generation))
@@ -240,15 +246,15 @@ impl ListenTable {
     }
 }
 
-fn is_connected(handle: SocketHandle, socket_set: &SocketSetWrapper) -> bool {
-    socket_set.with_socket::<tcp::Socket, _, _>(handle, |socket| {
-        !matches!(socket.state(), State::Listen | State::SynReceived)
-    })
+fn is_connected(handle: SocketHandle, sockets: &SocketSet<'_>) -> bool {
+    !matches!(
+        sockets.get::<tcp::Socket>(handle).state(),
+        State::Listen | State::SynReceived
+    )
 }
 
-fn is_closed(handle: SocketHandle, socket_set: &SocketSetWrapper) -> bool {
-    socket_set
-        .with_socket::<tcp::Socket, _, _>(handle, |socket| matches!(socket.state(), State::Closed))
+fn is_closed(handle: SocketHandle, sockets: &SocketSet<'_>) -> bool {
+    matches!(sockets.get::<tcp::Socket>(handle).state(), State::Closed)
 }
 
 #[cfg(test)]
@@ -275,6 +281,43 @@ mod tests {
             ListenTableEntryInner::new(2, endpoint, usize::MAX, empty).queue_limit,
             LISTEN_QUEUE_SIZE
         );
+    }
+
+    #[test]
+    fn reset_accept_and_unlisten_reclaim_queued_sockets() {
+        let table = ListenTable::try_new().unwrap();
+        let sockets = Arc::new(SocketSetWrapper::new());
+        let endpoint = IpListenEndpoint {
+            addr: Some(Ipv4Address::LOCALHOST.into()),
+            port: 2346,
+        };
+        table.listen(endpoint, 2, &sockets).unwrap();
+        let reset = sockets.add(new_tcp_socket().unwrap()).unwrap();
+        table
+            .listen_entry(endpoint.port)
+            .lock()
+            .as_mut()
+            .unwrap()
+            .syn_queue
+            .push_back(reset);
+        assert!(table.can_accept(endpoint.port, &sockets).unwrap());
+        assert_eq!(
+            table.reserve_accept(endpoint.port, &sockets),
+            Err(AxError::ConnectionReset)
+        );
+        assert_eq!(sockets.inner.lock().iter().count(), 0);
+        let pending = sockets.add(new_tcp_socket().unwrap()).unwrap();
+        table
+            .listen_entry(endpoint.port)
+            .lock()
+            .as_mut()
+            .unwrap()
+            .syn_queue
+            .push_back(pending);
+        table.unlisten(endpoint.port);
+        assert_eq!(sockets.inner.lock().iter().count(), 0);
+        table.listen(endpoint, 2, &sockets).unwrap();
+        assert!(!table.can_accept(endpoint.port, &sockets).unwrap());
     }
 
     #[test]

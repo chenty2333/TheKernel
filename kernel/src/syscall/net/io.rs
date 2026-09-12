@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::{
     mem::{MaybeUninit, size_of},
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr},
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -9,16 +9,16 @@ use axio::prelude::*;
 use axnet::{
     CMsgData, RecvFlags, RecvOptions, SendFlags, SendOptions, Socket as AxSocket, SocketAddrEx,
     SocketOps,
-    options::{Configurable, GetSocketOption, SocketFault},
+    options::{Configurable, GetSocketOption, SocketCredentials, SocketFault},
     sctp::{SctpRecvMetadata, SctpSendMetadata},
     unix::UnixSocketAddr,
 };
 use linux_raw_sys::{
-    general::timespec,
+    general::{CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN, timespec},
     net::{
         AF_NETLINK, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_EOR, MSG_ERRQUEUE,
-        MSG_NOSIGNAL, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, cmsghdr, mmsghdr, msghdr,
-        sockaddr, socklen_t,
+        MSG_NOSIGNAL, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, SCM_CREDENTIALS, SOL_SOCKET,
+        cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t, ucred,
     },
 };
 use memory_addr::PAGE_SIZE_4K;
@@ -52,7 +52,7 @@ const MAX_RECVMSG_IOVCNT: usize = 1024;
 const MAX_MMSG_VLEN: usize = 1024;
 const MSG_WAITFORONE: u32 = 0x1_0000;
 // Linux bounds ancillary allocation with net.core.optmem_max. TheKernel only
-// supports SCM_RIGHTS here, so 64 KiB leaves ample room for fragmented headers
+// uses 64 KiB to leave ample room for fragmented ancillary headers
 // while imposing a hard parsing/work bound.
 const MAX_SENDMSG_CONTROL_LEN: usize = 64 * 1024;
 const SOL_SCTP: u32 = 132;
@@ -86,13 +86,7 @@ fn take_pending_socket_error(socket: &PinnedSocketDescription) -> AxResult {
     let Some(error) = error else {
         return Ok(());
     };
-    let failure = match error {
-        SocketFault::ConnectionRefused => thekernel_linux_net::SocketFailure::ConnectionRefused,
-        SocketFault::ConnectionReset => thekernel_linux_net::SocketFailure::ConnectionReset,
-        SocketFault::TimedOut => thekernel_linux_net::SocketFailure::TimedOut,
-        SocketFault::Other => thekernel_linux_net::SocketFailure::Io,
-    };
-    Err(socket_failure(failure))
+    Err(super::opt::socket_fault_error(error).into())
 }
 
 fn admitted_sendmmsg_vlen(vlen: u32) -> Option<usize> {
@@ -569,13 +563,10 @@ fn validate_recvmsg_flags(
     if !defer_packet_mechanism && flags & !SUPPORTED_RECVMSG_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
-    if !defer_packet_mechanism && flags & MSG_OOB != 0 {
+    if !defer_packet_mechanism && flags & MSG_OOB != 0 && flags & MSG_ERRQUEUE == 0 {
         return Err(AxError::InvalidInput);
     }
-    if !defer_packet_mechanism && flags & MSG_ERRQUEUE != 0 {
-        return Err(AxError::from(LinuxError::EAGAIN));
-    }
-    if !defer_packet_mechanism && flags & MSG_WAITALL != 0 {
+    if !defer_packet_mechanism && flags & MSG_WAITALL != 0 && flags & MSG_ERRQUEUE == 0 {
         return Err(AxError::OperationNotSupported);
     }
 
@@ -739,14 +730,52 @@ fn parse_sctp_send_cmsg(
     }
 }
 
+fn validate_send_credentials(
+    snapshot: &SocketSyscallSnapshot,
+    supplied: ucred,
+) -> AxResult<SocketCredentials> {
+    let actor = snapshot.actor();
+    let namespace = actor.user_ns();
+    let uid = namespace
+        .make_kuid(supplied.uid)
+        .ok_or(AxError::InvalidInput)?;
+    let gid = namespace
+        .make_kgid(supplied.gid)
+        .ok_or(AxError::InvalidInput)?;
+    let ids = actor.ids();
+    let pid_namespace = snapshot.pid_namespace();
+    // Linux checks IDs against real, effective and saved IDs, and checks
+    // capabilities in the owning namespaces before resolving an alternate PID.
+    if (pid_namespace.visible_pid_checked(snapshot.pid()) != Some(supplied.pid as u32)
+        && !crate::task::ns_capable(actor, pid_namespace.owner_user_ns(), CAP_SYS_ADMIN))
+        || (uid != ids.ruid
+            && uid != ids.euid
+            && uid != ids.suid
+            && !crate::task::ns_capable(actor, namespace, CAP_SETUID))
+        || (gid != ids.rgid
+            && gid != ids.egid
+            && gid != ids.sgid
+            && !crate::task::ns_capable(actor, namespace, CAP_SETGID))
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
+    let pid = (supplied.pid > 0 && supplied.pid <= i32::MAX as u32)
+        .then(|| pid_namespace.resolve_visible_pid(supplied.pid as u32))
+        .flatten()
+        .ok_or(AxError::from(LinuxError::ESRCH))?;
+    Ok(SocketCredentials::new(pid, uid.into_raw(), gid.into_raw()))
+}
+
 fn parse_send_control(
     capability: &UserMemoryCapability,
     msg: &msghdr,
     sctp: bool,
     dccp: bool,
-) -> AxResult<Vec<CMsgData>> {
+    unix: bool,
+    snapshot: &SocketSyscallSnapshot,
+) -> AxResult<(Vec<CMsgData>, Option<SocketCredentials>)> {
     if msg.msg_controllen == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     if msg.msg_control.is_null() {
         return Err(AxError::BadAddress);
@@ -760,6 +789,7 @@ fn parse_send_control(
         .ok_or(AxError::BadAddress)?;
 
     let mut rights = Vec::new();
+    let mut credentials = None;
     let mut sctp_metadata = None;
     let mut dccp_priority = None;
     let mut sctp_send_info_seen = false;
@@ -776,7 +806,19 @@ fn parse_send_control(
         if hdr.cmsg_len < size_of::<cmsghdr>() || hdr.cmsg_len > remaining {
             return Err(AxError::InvalidInput);
         }
-        if (hdr.cmsg_level as u32) == SOL_SCTP {
+        if hdr.cmsg_level as u32 == SOL_SOCKET && hdr.cmsg_type as u32 == SCM_CREDENTIALS {
+            if !unix {
+                return Err(AxError::InvalidInput);
+            }
+            let body = read_cmsg_body(capability, hdr_addr, &hdr, size_of::<ucred>())?;
+            let supplied = ucred {
+                pid: u32::from_ne_bytes(body[0..4].try_into().unwrap()),
+                uid: u32::from_ne_bytes(body[4..8].try_into().unwrap()),
+                gid: u32::from_ne_bytes(body[8..12].try_into().unwrap()),
+            };
+            // Linux validates every occurrence; the final credentials win.
+            credentials = Some(validate_send_credentials(snapshot, supplied)?);
+        } else if (hdr.cmsg_level as u32) == SOL_SCTP {
             if !sctp {
                 return Err(AxError::InvalidInput);
             }
@@ -840,7 +882,7 @@ fn parse_send_control(
         cmsg.try_reserve_exact(1).map_err(|_| AxError::NoMemory)?;
         cmsg.push(CMsg::dccp_priority(priority)?);
     }
-    Ok(cmsg)
+    Ok((cmsg, credentials))
 }
 
 fn mmsg_address(base: usize, index: usize) -> AxResult<usize> {
@@ -993,11 +1035,11 @@ fn send_impl(
     addr: UserConstPtr<sockaddr>,
     addrlen: socklen_t,
     cmsg: Vec<CMsgData>,
+    credentials: Option<SocketCredentials>,
     packet_control_length: usize,
     iov_count: usize,
     control_length: usize,
 ) -> AxResult<isize> {
-    let owner_description = socket.description().clone();
     let backend = socket.backend()?;
     let send_flags = if backend == SocketBackendKind::Packet {
         None
@@ -1110,11 +1152,15 @@ fn send_impl(
         to: network_addr,
         flags: send_flags.ok_or(AxError::BadState)?,
         cmsg,
-        credentials: Some(snapshot.automatic_unix_credentials()),
+        credentials_explicit: credentials.is_some(),
+        credentials: Some(credentials.unwrap_or_else(|| snapshot.automatic_unix_credentials())),
         nonblocking_override: Some(nonblocking),
     };
-    if matches!(&socket.inner, AxSocket::Unix(_)) {
-        super::cmsg::set_scm_rights_owner(&mut options.cmsg, &owner_description);
+    if let AxSocket::Unix(unix) = &socket.inner
+        && !unix.is_datagram()
+        && let Some(endpoint) = unix.peer_endpoint_identity()
+    {
+        super::cmsg::set_scm_rights_endpoint_owner(&mut options.cmsg, endpoint.raw())?;
     }
     let sent = match &socket.inner {
         AxSocket::Unix(unix) if unix.is_datagram() => {
@@ -1140,7 +1186,7 @@ fn send_impl(
                 &receiving,
             ))?;
             let receiving_endpoint = reservation.receiving_identity().raw();
-            super::cmsg::set_scm_rights_endpoint_owner(reservation.cmsg_mut(), receiving_endpoint);
+            super::cmsg::set_scm_rights_endpoint_owner(reservation.cmsg_mut(), receiving_endpoint)?;
             reservation.commit(&mut src)
         }
         AxSocket::Sctp(sctp) => {
@@ -1219,6 +1265,7 @@ pub fn sys_sendto(
         addr,
         addrlen,
         Vec::new(),
+        None,
         0,
         1,
         0,
@@ -1319,24 +1366,28 @@ fn sendmsg_with_socket(
         msg.msg_iov.cast::<IoVec>(),
         msg.msg_iovlen,
     )?;
-    let (cmsg, packet_control_length) = if socket.backend()? == SocketBackendKind::Packet {
-        // Copy the bounded generic control buffer once, but defer semantic
-        // cmsg parsing/support to the AF_PACKET mechanism phase after policy.
-        let control = snapshot_user_bytes(
-            capability,
-            msg.msg_control.cast::<u8>(),
-            msg.msg_controllen,
-            MAX_SENDMSG_CONTROL_LEN,
-        )?;
-        (Vec::new(), control.len())
-    } else {
-        let is_sctp = socket.backend()? == SocketBackendKind::Network
-            && matches!(&socket.network()?.inner, AxSocket::Sctp(_));
-        let is_dccp = socket.backend()? == SocketBackendKind::Network
-            && matches!(&socket.network()?.inner, AxSocket::Dccp(_));
-        let cmsg = parse_send_control(capability, &msg, is_sctp, is_dccp)?;
-        (cmsg, 0)
-    };
+    let (cmsg, credentials, packet_control_length) =
+        if socket.backend()? == SocketBackendKind::Packet {
+            // Copy the bounded generic control buffer once, but defer semantic
+            // cmsg parsing/support to the AF_PACKET mechanism phase after policy.
+            let control = snapshot_user_bytes(
+                capability,
+                msg.msg_control.cast::<u8>(),
+                msg.msg_controllen,
+                MAX_SENDMSG_CONTROL_LEN,
+            )?;
+            (Vec::new(), None, control.len())
+        } else {
+            let is_sctp = socket.backend()? == SocketBackendKind::Network
+                && matches!(&socket.network()?.inner, AxSocket::Sctp(_));
+            let is_dccp = socket.backend()? == SocketBackendKind::Network
+                && matches!(&socket.network()?.inner, AxSocket::Dccp(_));
+            let is_unix = socket.backend()? == SocketBackendKind::Network
+                && matches!(&socket.network()?.inner, AxSocket::Unix(_));
+            let (cmsg, credentials) =
+                parse_send_control(capability, &msg, is_sctp, is_dccp, is_unix, snapshot)?;
+            (cmsg, credentials, 0)
+        };
 
     send_impl(
         capability,
@@ -1348,6 +1399,7 @@ fn sendmsg_with_socket(
         UserConstPtr::from(msg.msg_name as usize),
         msg.msg_namelen as socklen_t,
         cmsg,
+        credentials,
         packet_control_length,
         msg.msg_iovlen,
         msg.msg_controllen,
@@ -1414,6 +1466,39 @@ struct ReceiveOutcome {
     message_eor: bool,
     control_truncated: bool,
     address: Option<ReceivedSocketAddress>,
+}
+
+fn udp_error_control(error: &axnet::udp::UdpError) -> (u32, u32, [u8; 44], usize) {
+    // Linux sock_extended_err followed by the sockaddr of the ICMP sender.
+    // Encode initialized bytes explicitly; Rust struct padding is not UAPI.
+    let mut bytes = [0; 44];
+    bytes[..4].copy_from_slice(&(super::opt::socket_fault_error(error.fault) as u32).to_ne_bytes());
+    bytes[5] = error.icmp_type;
+    bytes[6] = error.icmp_code;
+    bytes[8..12].copy_from_slice(&error.info.to_ne_bytes());
+    let (level, kind, length) = match error.offender {
+        IpAddr::V4(address) => {
+            bytes[4] = 2; // SO_EE_ORIGIN_ICMP
+            bytes[16..18].copy_from_slice(&(linux_raw_sys::net::AF_INET as u16).to_ne_bytes());
+            bytes[20..24].copy_from_slice(&address.octets());
+            (
+                linux_raw_sys::net::IPPROTO_IP as u32,
+                linux_raw_sys::net::IP_RECVERR,
+                32,
+            )
+        }
+        IpAddr::V6(address) => {
+            bytes[4] = 3; // SO_EE_ORIGIN_ICMP6
+            bytes[16..18].copy_from_slice(&(linux_raw_sys::net::AF_INET6 as u16).to_ne_bytes());
+            bytes[24..40].copy_from_slice(&address.octets());
+            (
+                linux_raw_sys::net::SOL_IPV6,
+                linux_raw_sys::net::IPV6_RECVERR,
+                44,
+            )
+        }
+    };
+    (level, kind, bytes, length)
 }
 
 /// Retained io_uring socket-receive result.  It deliberately carries record
@@ -1503,6 +1588,35 @@ fn recv_impl(
     cloexec_rights: bool,
 ) -> AxResult<ReceiveOutcome> {
     debug!("sys_recv <= fd: {fd}, flags: {recv_flags:?}");
+
+    if recv_flags.raw & MSG_ERRQUEUE != 0 {
+        if socket.backend()? != SocketBackendKind::Network {
+            return Err(AxError::WouldBlock);
+        }
+        let socket = socket.network()?;
+        let AxSocket::Udp(udp) = &socket.inner else {
+            return Err(AxError::WouldBlock);
+        };
+        // Error queues never block and always consume a record, including
+        // MSG_PEEK. Linux returns the copied prefix even with input MSG_TRUNC.
+        let mut payload = [0; axnet::udp::MAX_UDP_ERROR_PAYLOAD];
+        let capacity = payload.len().min(dst.remaining_mut());
+        let (copied, original, error) = udp.recv_error(&mut payload[..capacity])?;
+        dst.write_all(&payload[..copied])?;
+        let (level, kind, control, length) = udp_error_control(&error);
+        let control_truncated = cmsg_builder
+            .map(|mut builder| !builder.push_fixed(level, kind, &control[..length]))
+            .unwrap_or(true);
+        return Ok(ReceiveOutcome {
+            returned_len: copied as isize,
+            message_truncated: original > copied,
+            message_eor: false,
+            control_truncated,
+            address: want_address.then_some(ReceivedSocketAddress::Network(SocketAddrEx::Ip(
+                error.destination,
+            ))),
+        });
+    }
 
     if socket.backend()? == SocketBackendKind::Netlink {
         let nonblocking = socket.nonblocking();
@@ -1828,7 +1942,7 @@ fn recvmsg_imported(
     } = imported;
 
     let mut name_len = msg_hdr.msg_namelen as socklen_t;
-    msg_hdr.msg_flags = 0;
+    msg_hdr.msg_flags = flags & MSG_ERRQUEUE;
     let control = if msg_hdr.msg_control.is_null() {
         msg_hdr.msg_controllen = 0;
         None
@@ -1838,6 +1952,7 @@ fn recvmsg_imported(
             UserPtr::from(msg_hdr.msg_control.cast::<cmsghdr>()),
             &mut msg_hdr.msg_controllen,
             snapshot.pid_namespace().clone(),
+            snapshot.actor().user_ns().clone(),
         ))
     };
     let recv_iov = PageProgressIo::new(recv_iov)?;
@@ -2158,6 +2273,72 @@ pub fn sys_recvmmsg(
 mod tests {
     use super::*;
 
+    #[test]
+    fn explicit_scm_credentials_validate_and_last_valid_header_wins() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let user_ns = crate::task::UserNamespace::try_new_root().unwrap();
+        let actor = crate::task::Cred::try_root(user_ns.clone()).unwrap();
+        let pid_namespace = crate::task::PidNamespace::try_new_root(user_ns.clone()).unwrap();
+        let _sender = pid_namespace.reserve_process(42).unwrap();
+        let visible_pid = pid_namespace.visible_pid_checked(42).unwrap();
+        let snapshot = SocketSyscallSnapshot {
+            actor,
+            landlock_domain: Default::default(),
+            net_namespace: crate::task::NetworkNamespace::try_new_loopback_only(user_ns).unwrap(),
+            pid: 42,
+            pid_namespace,
+            umask: 0,
+            unix_credentials: SocketCredentials::new(42, 0, 0),
+        };
+        let own = ucred {
+            pid: visible_pid,
+            uid: 0,
+            gid: 0,
+        };
+        assert_eq!(
+            validate_send_credentials(&snapshot, own).unwrap(),
+            SocketCredentials::new(42, 0, 0)
+        );
+        assert_eq!(
+            validate_send_credentials(
+                &snapshot,
+                ucred {
+                    uid: u32::MAX,
+                    ..own
+                }
+            ),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            validate_send_credentials(&snapshot, ucred { pid: 100, ..own }),
+            Err(AxError::from(LinuxError::ESRCH))
+        );
+        let capability = mapped_io_capability();
+        let mut control = [0u8; 64];
+        for (index, uid) in [0u32, 123].into_iter().enumerate() {
+            let base = index * 32;
+            control[base..base + 8].copy_from_slice(&28usize.to_ne_bytes());
+            control[base + 8..base + 12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+            control[base + 12..base + 16].copy_from_slice(&SCM_CREDENTIALS.to_ne_bytes());
+            control[base + 16..base + 20].copy_from_slice(&visible_pid.to_ne_bytes());
+            control[base + 20..base + 24].copy_from_slice(&uid.to_ne_bytes());
+        }
+        capability.write_bytes(0x1000, &control).unwrap();
+        let mut msg: msghdr = unsafe { core::mem::zeroed() };
+        msg.msg_control = 0x1000usize as _;
+        msg.msg_controllen = control.len();
+        let (cmsg, credentials) =
+            parse_send_control(&capability, &msg, false, false, true, &snapshot).unwrap();
+        assert!(cmsg.is_empty());
+        assert_eq!(credentials, Some(SocketCredentials::new(42, 123, 0)));
+        control[32..40].copy_from_slice(&27usize.to_ne_bytes());
+        capability.write_bytes(0x1000, &control).unwrap();
+        assert!(matches!(
+            parse_send_control(&capability, &msg, false, false, true, &snapshot),
+            Err(AxError::InvalidInput)
+        ));
+    }
+
     fn mapped_io_capability() -> UserMemoryCapability {
         use alloc::sync::Arc;
 
@@ -2352,13 +2533,18 @@ mod tests {
 
     #[test]
     fn packet_receive_mechanism_flags_are_rejected_only_after_policy_stage() {
+        assert!(validate_recvmsg_flags(MSG_ERRQUEUE | MSG_OOB, false).is_ok());
         for (flag, expected) in [
             (MSG_OOB, LinuxError::EINVAL),
             (MSG_ERRQUEUE, LinuxError::EAGAIN),
             (MSG_WAITALL, LinuxError::EINVAL),
             (1_u32 << 31, LinuxError::EINVAL),
         ] {
-            assert!(validate_recvmsg_flags(flag, false).is_err());
+            if flag != MSG_ERRQUEUE {
+                assert!(validate_recvmsg_flags(flag, false).is_err());
+            } else {
+                assert!(validate_recvmsg_flags(flag, false).is_ok());
+            }
             let deferred = validate_recvmsg_flags(flag, true).unwrap();
             assert_eq!(
                 deferred.packet_flags().map_err(LinuxError::from),

@@ -23,7 +23,7 @@ COMPLETE_MARKER = "THEKERNEL_ABI_EXIT_ZERO"
 # Explicit expectations prevent an accidentally deleted guest assertion from
 # reducing acceptance coverage. Keep these aligned with tests/guest/portable.
 CONTRACTS = {
-    "unix-write-credentials": ("raw-differential", "pass", "WRITE_SENDER_PID_REAL_IDS WRITEV_SENDER_PID_REAL_IDS SENDMSG_SENDER_PID_REAL_IDS CHILD_EXIT_CLEAN REAL_EFFECTIVE_IDS"),
+    "unix-write-credentials": ("raw-differential", "pass", "UNIX_SOCKET_IDENTITY PEER_PID_EFFECTIVE_IDS WRITE_SENDER_PID_REAL_IDS WRITEV_SENDER_PID_REAL_IDS SENDMSG_SENDER_PID_REAL_IDS CHILD_EXIT_CLEAN REAL_EFFECTIVE_IDS RIGHTS_RECEIVER_LIFETIME"),
     "eventfd": ("portable-differential", "pass", "LEGACY_FLAGS IO_ERRNO_STATE COUNTER_POLL SEMAPHORE CLOEXEC_TEARDOWN"),
     "creat": ("raw-differential", "pass", "PROVIDER_EXT4 CREATE_UMASK_STATUS TRUNCATE_EXISTING BAD_PATH_EFAULT TEARDOWN"),
     "time": ("raw-differential", "pass", "NULL_EPOCH_ERRNO UNALIGNED_EIGHT_BYTES CROSS_WRITABLE_PAGE EFAULT_COPYOUT REALTIME_BRACKET"),
@@ -43,16 +43,16 @@ CONTRACTS.update({
 CONTRACTS.update({
     "mprotect": ("raw-differential", "pass", "HOLE_COMMITS_PREFIX_ONLY VALIDATION_RESTORE PROT_NONE_FORK_UNMAP_REUSE"),
     "munmap": ("raw-differential", "pass", "HOLE_NEIGHBORS_IDEMPOTENT VALIDATION_PRESERVES_NEIGHBORS"),
-    "mincore": ("raw-differential", "pass", "TOUCHED_RESIDENCY_EXACT_OUTPUT VALIDATION_ORDER FILE_PAGE_RESIDENCY"),
+    "mincore": ("raw-differential", "pass", "TOUCHED_RESIDENCY_EXACT_OUTPUT VALIDATION_ORDER FILE_PAGE_RESIDENCY SHARED_MSYNC_FSYNC_REDIRTY LOCKED_SHARED_FSYNC"),
     "process-vm-readv": ("raw-differential", "pass", "EXACT_COPY REMOTE_FAULT_PREFIX VALIDATION_EMPTY_LOCAL REMOTE_CONTENT_CONFIRMED PERMISSION_EPERM"),
     "process-vm-writev": ("raw-differential", "pass", "EXACT_COPY REMOTE_FAULT_PREFIX VALIDATION_EMPTY_LOCAL REMOTE_CONTENT_CONFIRMED PERMISSION_EPERM"),
     "mseal": ("raw-differential", "pass", "VALIDATION_AND_MAPPING_SEAL DISCARD_RESPECTS_WRITE_PERMISSION"),
 })
 CONTRACTS.update({
     "network_bind": ("raw-differential", "pass", "IPV4_OVERLONG_EINVAL IPV4_STORAGE_BOUNDARY IPV6_OVERLONG_EINVAL"),
-    "network_connect": ("raw-differential", "pass", "IPV6_OVERLONG_EINVAL IPV4_OVERLONG_EINVAL NETLINK_SOCKET NETLINK_KERNEL_CONNECT NETLINK_AUTOBIND NETLINK_DISCONNECT NETLINK_DISCONNECTED_PEER NETLINK_BAD_FAMILY"),
+    "network_connect": ("raw-differential", "pass", "IPV6_OVERLONG_EINVAL IPV4_OVERLONG_EINVAL NETLINK_SOCKET NETLINK_KERNEL_CONNECT NETLINK_AUTOBIND NETLINK_DISCONNECT NETLINK_DISCONNECTED_PEER NETLINK_BAD_FAMILY TCP_CLOSE_QUEUED"),
     "network_getpeername": ("raw-differential", "pass", "NETLINK_UNCONNECTED_ZERO NETLINK_CONNECTED_ZERO NETLINK_PEER_POLICY NETLINK_PEER_STATE NETLINK_PEER_RESET NETLINK_TRUNCATED_LENGTH"),
-    "network_sendto": ("raw-differential", "pass", "IPV4_OVERLONG_EINVAL IPV6_OVERLONG_EINVAL"),
+    "network_sendto": ("raw-differential", "pass", "IPV4_OVERLONG_EINVAL IPV6_OVERLONG_EINVAL UDP4_ERROR_QUEUE UDP6_ERROR_QUEUE"),
 })
 CONTRACTS.update({
     "rt_tgsigqueueinfo": ("raw-differential", "pass", "COPY_BEFORE_INVALID_IDS INVALID_IDS_BEFORE_CODE COPY_BEFORE_INVALID_SIGNO"),
@@ -276,7 +276,10 @@ def run_abi_differential(config: AbiConfig) -> Path:
                 # Linux DEBUG_STACK_USAGE informational printk output can split
                 # userspace assertion lines on the serial console. Keep errors
                 # visible and retain the already emitted boot version banner.
-                ("echo 3 > /proc/sys/kernel/printk || failed=1\n" if target.name == "linux" else "") +
+                ("echo 3 > /proc/sys/kernel/printk || failed=1\n"
+                 # The shell init has no network service. UDP error-queue
+                 # contracts require the same usable loopback as TheKernel.
+                 "ip link set lo up || failed=1\n" if target.name == "linux" else "") +
                 "\n".join(workloads) + "\n" +
                 f'[ "$failed" = 0 ] && echo {COMPLETE_MARKER}\n'
                 "/bin/busybox poweroff -f\nexit\n", encoding="utf-8")

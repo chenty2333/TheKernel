@@ -1205,7 +1205,6 @@ pub(crate) fn admit_affinity_then_publish<T, E, R>(
 
 #[cfg(feature = "smp")]
 fn try_prepare_migration_task(migrated: &AxTaskRef) -> AxResult<AxTaskRef> {
-    const MIGRATION_TASK_STACK_SIZE: usize = MIN_KERNEL_STACK_SIZE;
     const MIGRATION_TASK_NAME: &str = "migration-task";
 
     let mut name = String::new();
@@ -1220,11 +1219,29 @@ fn try_prepare_migration_task(migrated: &AxTaskRef) -> AxResult<AxTaskRef> {
             }
         },
         name,
-        MIGRATION_TASK_STACK_SIZE,
+        // Even this short-lived helper executes the full scheduler switch
+        // path, so the allocation admission floor is not its stack budget.
+        axconfig::TASK_STACK_SIZE,
     )
     .map_err(map_task_create_error)?;
     task.mark_migration_helper();
     task.try_into_arc().map_err(map_task_create_error)
+}
+
+#[cfg(all(test, feature = "smp"))]
+#[test]
+fn migration_helper_owns_a_configured_kernel_stack() {
+    let migrated = TaskInner::new_init("migration-stack-target".into())
+        .unwrap()
+        .into_arc()
+        .unwrap();
+    let helper = try_prepare_migration_task(&migrated).unwrap();
+    assert!(helper.is_migration_helper());
+    let mut helper = Arc::try_unwrap(helper)
+        .unwrap_or_else(|_| panic!("unpublished migration helper must have one owner"))
+        .into_inner();
+    let stack = helper.take_kernel_stack().unwrap();
+    assert_eq!(stack.layout_size(), axconfig::TASK_STACK_SIZE);
 }
 
 #[cfg(feature = "smp")]

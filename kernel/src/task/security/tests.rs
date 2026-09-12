@@ -6996,6 +6996,46 @@ fn ordinary_mutation_reports_every_changed_credential_family() {
 }
 
 #[test]
+fn user_namespace_post_commit_preserves_transaction_and_notifies_once() {
+    let _probe_guard = reset_credential_state_probes();
+    let registry = probe_registry();
+    let namespace = UserNamespace::try_new_root().unwrap();
+    let old = Cred::try_root_with_registry(registry, namespace.clone()).unwrap();
+    let child = namespace
+        .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, true)
+        .unwrap();
+    let slot = CredentialSlot::new(old.clone());
+
+    CRED_STATE_FAIL_PREPARE_KEY.store(3, Ordering::SeqCst);
+    assert_eq!(
+        slot.prepare().finish_user_namespace(child.clone()).err(),
+        Some(AxError::NoMemory)
+    );
+    assert!(Arc::ptr_eq(&old, &slot.current()));
+    CRED_STATE_FAIL_PREPARE_KEY.store(0, Ordering::SeqCst);
+    drop(slot.prepare().finish_user_namespace(child.clone()).unwrap());
+    assert!(Arc::ptr_eq(&old, &slot.current()));
+    assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 0);
+
+    let publication = slot
+        .prepare()
+        .finish_user_namespace(child.clone())
+        .unwrap()
+        .publish();
+    assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 0);
+    let (new, retirement) = publication.complete_post_commit();
+    assert!(Arc::ptr_eq(new.user_ns(), &child));
+    assert!(Arc::ptr_eq(&slot.current(), &new));
+    assert_eq!(CRED_STATE_COMMIT_TRACE.load(Ordering::SeqCst), 23);
+    assert_eq!(
+        CRED_STATE_COMMIT_TRANSITION_MASK.load(Ordering::SeqCst),
+        1 << 2
+    );
+    assert_eq!(CRED_STATE_COMMIT_GENERATION_TRACE.load(Ordering::SeqCst), 1);
+    drop(retirement);
+}
+
+#[test]
 fn exec_post_commit_notifies_once_with_exec_transition() {
     let _probe_guard = reset_credential_state_probes();
     let registry = probe_registry();

@@ -367,7 +367,7 @@ impl<Z> ProcessRegistry<Z> {
     /// cursor was created. Concurrent insertion above the captured maximum is
     /// ignored, while insertion below/after the cursor cannot consume a fixed
     /// item budget and make an original higher-PID entry disappear.
-    fn processes_through_current_max(&self) -> ProcessesThroughCurrentMax<'_, Z> {
+    pub fn processes_through_current_max(&self) -> ProcessesThroughCurrentMax<'_, Z> {
         let upper_bound = self
             .state
             .lock()
@@ -702,14 +702,22 @@ pub struct ProcessDomain<Z> {
 /// ancestor exists in the scope.
 pub struct ReaperScope<Z> {
     registry: Weak<ProcessRegistry<Z>>,
-    init: SpinNoIrq<Option<Arc<Process<Z>>>>,
-    outer_scope: SpinNoIrq<Option<Weak<ReaperScope<Z>>>>,
+    // Some retains the initialized identity even after reap drops the process.
+    // A strong init would cycle through Process::reaper_scope and retain its
+    // zombie payload and caller-owned namespace forever.
+    init: SpinNoIrq<Option<Weak<Process<Z>>>>,
+    outer_scope: SpinNoIrq<Option<Arc<ReaperScope<Z>>>>,
 }
 
 impl<Z> ReaperScope<Z> {
     /// Returns this scope's namespace-init process after it has been published.
     pub fn init_process(&self) -> Option<Arc<Process<Z>>> {
-        self.init.lock().clone()
+        self.init.lock().as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Whether an init was bound, including one which has already been reaped.
+    pub fn was_initialized(&self) -> bool {
+        self.init.lock().is_some()
     }
 }
 
@@ -738,21 +746,20 @@ fn select_reaper_for_exit_locked<Z>(
     child: &Arc<Process<Z>>,
     scope: &Arc<ReaperScope<Z>>,
 ) -> ReaperSelection<Z> {
-    let init = scope
-        .init_process()
-        .expect("every published process has a bound reaper-scope init");
-    // A scope's init is parented in its outer scope. It cannot reparent to
-    // itself when that outer parent exits; use the outer scope fallback.
-    let fallback = if Arc::ptr_eq(&init, child) {
-        scope
-            .outer_scope
-            .lock()
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .and_then(|outer| outer.init_process())
-            .expect("a non-root scope init has an outer-scope init")
-    } else {
-        init
+    let mut fallback_scope = scope.clone();
+    let fallback = loop {
+        if let Some(init) = fallback_scope.init_process()
+            && !Arc::ptr_eq(&init, child)
+            && !Arc::ptr_eq(&init, exiting)
+            && !init.is_zombie()
+        {
+            break init;
+        }
+        // Namespace init can already be reaped. Keep the acyclic outer-scope
+        // chain alive independently of that process and skip retired scopes.
+        let outer = fallback_scope.outer_scope.lock().clone()
+            .expect("a non-root scope init has an outer scope");
+        fallback_scope = outer;
     };
     let Some(first_ancestor) = exiting.parent() else {
         return ReaperSelection {
@@ -857,6 +864,10 @@ impl<Z> ProcessDomain<Z> {
         self.root_reaper_scope.clone()
     }
 
+    fn is_root_init(&self, process: &Process<Z>) -> bool {
+        process.is_init() && Arc::ptr_eq(process.reaper_scope(), &self.root_reaper_scope)
+    }
+
     /// Creates an empty reparenting scope owned by this domain.
     pub fn try_new_reaper_scope(&self) -> Result<Arc<ReaperScope<Z>>, ProcessError> {
         Arc::try_new(ReaperScope {
@@ -937,7 +948,7 @@ impl<Z> ProcessDomain<Z> {
         }
         job_control.commit();
         admission.commit();
-        *init = Some(process.clone());
+        *init = Some(Arc::downgrade(&process));
         Ok(process)
     }
 
@@ -1026,7 +1037,7 @@ impl<Z> ProcessDomain<Z> {
     {
         self.registry.ensure_published(parent)?;
         self.ensure_scope_owned(scope)?;
-        if parent.is_zombie() || scope.init_process().is_some() {
+        if parent.is_zombie() || scope.was_initialized() {
             return Err(ProcessError::NotLive);
         }
         let identity: Arc<dyn Any + Send + Sync> =
@@ -1123,7 +1134,7 @@ impl<Z> ProcessDomain<Z> {
             return Ok(ThreadExitTransition::LiveThreadsRemain);
         }
 
-        if process.is_init() || process.is_zombie.load(Ordering::Acquire) {
+        if self.is_root_init(process) || process.is_zombie.load(Ordering::Acquire) {
             return Err(ProcessError::NotLive);
         }
         if tg.exit_prepared {
@@ -1154,7 +1165,7 @@ impl<Z> ProcessDomain<Z> {
     /// Validates and exclusively reserves the final zombie transition.
     ///
     /// The returned token proves that `process` belongs to this domain, is
-    /// published, has no live or reserved thread memberships, is not init or
+    /// published, has no live or reserved thread memberships, is not root init or
     /// already a zombie, and has a valid reaper. While the token exists, new
     /// thread admission and competing exit publication are rejected.
     pub fn prepare_exit(
@@ -1162,7 +1173,7 @@ impl<Z> ProcessDomain<Z> {
         process: &Arc<Process<Z>>,
     ) -> Result<ProcessExitAdmission<Z>, ProcessError> {
         self.registry.ensure_published(process)?;
-        if process.is_init() || process.is_zombie() {
+        if self.is_root_init(process) || process.is_zombie() {
             return Err(ProcessError::NotLive);
         }
         self.init_process().ok_or(ProcessError::NotInitialized)?;
@@ -1332,7 +1343,7 @@ impl<Z> ProcessDomain<Z> {
         mut inherited_zombie: impl FnMut(Arc<Process<Z>>),
     ) -> Result<ExitOutcome, ProcessError> {
         self.registry.ensure_published(process)?;
-        if process.is_init() {
+        if self.is_root_init(process) {
             return Ok(ExitOutcome::InitProcess);
         }
         if process.is_zombie() {
@@ -1737,7 +1748,7 @@ impl<Z> Iterator for Processes<'_, Z> {
 
 /// PID-monotonic process cursor bounded by the registry maximum captured at
 /// construction. Used by multi-section exit reparenting.
-struct ProcessesThroughCurrentMax<'a, Z> {
+pub struct ProcessesThroughCurrentMax<'a, Z> {
     registry: &'a ProcessRegistry<Z>,
     after: Option<Pid>,
     upper_bound: Option<Pid>,
@@ -1865,7 +1876,7 @@ impl<Z> Process<Z> {
         &self.reaper_scope
     }
 
-    /// Returns whether this is the unique init process of its domain.
+    /// Returns whether this is the init process of its reparenting scope.
     pub fn is_init(&self) -> bool {
         self.init
     }
@@ -2249,9 +2260,9 @@ impl<Z> ScopedInitProcessAdmission<Z> {
     fn bind(&mut self) {
         let mut init = self.scope.init.lock();
         assert!(init.is_none(), "a reaper scope has exactly one init");
-        *init = Some(self.admission.process().clone());
+        *init = Some(Arc::downgrade(self.admission.process()));
         drop(init);
-        *self.scope.outer_scope.lock() = Some(Arc::downgrade(&self.outer_scope));
+        *self.scope.outer_scope.lock() = Some(self.outer_scope.clone());
     }
 }
 
@@ -2274,9 +2285,9 @@ impl<Z> ScopedInitialProcessAdmission<Z> {
         if init.is_some() {
             return Err(ProcessError::AlreadyExists);
         }
-        *init = Some(self.admission.process().clone());
+        *init = Some(Arc::downgrade(self.admission.process()));
         drop(init);
-        *self.scope.outer_scope.lock() = Some(Arc::downgrade(&self.outer_scope));
+        *self.scope.outer_scope.lock() = Some(self.outer_scope.clone());
         Ok(self.admission.commit())
     }
 }
@@ -2633,6 +2644,109 @@ mod tests {
             &child_process.parent().unwrap(),
             &second_process
         ));
+    }
+
+    #[test]
+    fn nested_init_can_exit_and_reap_without_retiring_root_init() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let root = domain.try_new_init(1, None).unwrap();
+        domain.prepare_thread(&root, 1).unwrap().commit().unwrap();
+        let scope = domain.try_new_reaper_scope().unwrap();
+        let init = domain
+            .prepare_fork_as_reaper_scope_init_with_identity(&root, &scope, 2, None, ())
+            .unwrap()
+            .prepare_initial_thread(2)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let child = domain
+            .prepare_fork_in_reaper_scope_with_identity(&init, &scope, 3, None, ())
+            .unwrap()
+            .prepare_initial_thread(3)
+            .unwrap()
+            .commit();
+
+        // Rollback must restore even a namespace init's final membership.
+        drop(domain.exit_thread(&init, 2, 7).unwrap());
+        assert!(init.is_live());
+        let exit = match domain.exit_thread(&init, 2, 7).unwrap() {
+            ThreadExitTransition::FinalThread(exit) => exit,
+            _ => panic!("nested init must receive final-exit admission"),
+        };
+        let committed = exit.commit(Arc::new(()), |_| {});
+        assert_eq!(committed.outcome(), ExitOutcome::BecameZombie);
+        assert!(Arc::ptr_eq(committed.notification_parent().unwrap(), &root));
+        assert!(Arc::ptr_eq(&child.parent().unwrap(), &root));
+        assert!(domain.reap(&init).unwrap());
+        assert!(!domain.reap(&init).unwrap());
+        assert!(root.is_live());
+        assert!(matches!(
+            domain.exit_thread(&root, 1, 0),
+            Err(ProcessError::NotLive)
+        ));
+        assert_eq!(
+            domain.exit(&root, Arc::new(()), |_| {}).unwrap(),
+            ExitOutcome::InitProcess
+        );
+    }
+
+    #[test]
+    fn reaped_nested_init_releases_payload_and_cannot_reinitialize_scope() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let root = domain.try_new_init(1, None).unwrap();
+        let scope = domain.try_new_reaper_scope().unwrap();
+        let admission = domain
+            .prepare_fork_as_reaper_scope_init_with_identity(&root, &scope, 2, None, ())
+            .unwrap();
+        let init = admission.process().clone();
+        admission.commit();
+        let inner_scope = domain.try_new_reaper_scope().unwrap();
+        let inner_admission = domain
+            .prepare_fork_as_reaper_scope_init_with_identity(&init, &inner_scope, 3, None, ())
+            .unwrap();
+        let inner = inner_admission.process().clone();
+        inner_admission.commit();
+        let child_admission = domain.prepare_fork(&inner, 4, None).unwrap();
+        let child = child_admission.process().clone();
+        child_admission.commit();
+        let identity = Arc::downgrade(&init);
+        let payload = Arc::new(());
+        let payload_ref = Arc::downgrade(&payload);
+        domain.exit(&init, payload, |_| {}).unwrap();
+        assert!(domain.reap(&init).unwrap());
+        drop(init);
+        assert!(identity.upgrade().is_none());
+        assert!(payload_ref.upgrade().is_none());
+        assert!(scope.was_initialized());
+        assert!(scope.init_process().is_none());
+        assert!(matches!(
+            domain.prepare_fork_as_reaper_scope_init_with_identity(&root, &scope, 5, None, ()),
+            Err(ProcessError::NotLive)
+        ));
+        // The intermediate init is gone and callers release its scope, but
+        // deeper descendants still need the outer reaper chain.
+        drop(scope);
+        domain.exit(&inner, Arc::new(()), |_| {}).unwrap();
+        assert!(Arc::ptr_eq(&child.parent().unwrap(), &root));
+        assert!(domain.reap(&inner).unwrap());
+    }
+
+    #[test]
+    fn nested_init_legacy_exit_uses_ordinary_zombie_admission() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let root = domain.try_new_init(1, None).unwrap();
+        let scope = domain.try_new_reaper_scope().unwrap();
+        let admission = domain
+            .prepare_fork_as_reaper_scope_init_with_identity(&root, &scope, 2, None, ())
+            .unwrap();
+        let init = admission.process().clone();
+        admission.commit();
+        drop(domain.prepare_exit(&init).unwrap());
+        assert_eq!(
+            domain.exit(&init, Arc::new(()), |_| {}).unwrap(),
+            ExitOutcome::BecameZombie
+        );
+        assert!(domain.reap(&init).unwrap());
     }
 
     #[test]

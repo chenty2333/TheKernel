@@ -257,8 +257,17 @@ pub(super) fn with_populated_user_range<T>(
             }
         };
         let mut reclaimed = false;
+        let mut contended = false;
         for cache in caches {
-            reclaimed |= cache.reclaim_one().map_err(map_address_space_error)?;
+            match cache.reclaim_one() {
+                Ok(progress) => reclaimed |= progress,
+                Err(error) if error.canonicalize() == AxError::ResourceBusy => contended = true,
+                Err(error) => return Err(map_address_space_error(error)),
+            }
+        }
+        if contended {
+            axtask::yield_now();
+            continue;
         }
         if !reclaimed {
             return Err(UserCopyError::NoMemory);

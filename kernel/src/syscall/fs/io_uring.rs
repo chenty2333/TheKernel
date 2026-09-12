@@ -2183,6 +2183,11 @@ fn execute_submission(
             } else {
                 None
             };
+            // Kernel-private diagnostic stages retain the issued request identity.
+            // The complete submission wrapper includes security/fanotify and I/O.
+            if request.fixed_buffer().is_some() {
+                crate::pseudofs::trace::record_io_uring_executor_started(issued.id());
+            }
             let attempt = file.description().and_then(|description| {
                 let context = context.as_ref().ok_or(AxError::BadState)?;
                 let submit = if pending_stream {
@@ -2198,8 +2203,12 @@ fn execute_submission(
                     io_length,
                     request.offset(),
                     fixed_segments,
+                    request.fixed_buffer().map(|_| issued.id()),
                 )
             });
+            if request.fixed_buffer().is_some() {
+                crate::pseudofs::trace::record_io_uring_executor_returned(issued.id());
+            }
             if pending_stream && attempt == Err(AxError::WouldBlock) {
                 let buffer = buffer.ok_or(AxError::BadAddress)?;
                 let context = context.take().ok_or(AxError::BadState)?;

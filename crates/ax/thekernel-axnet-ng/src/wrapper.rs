@@ -7,6 +7,7 @@ use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, Socket},
     wire::IpAddress,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,9 +30,19 @@ fn addrs_conflict(requested: Option<IpAddress>, existing: Option<IpAddress>) -> 
     }
 }
 
+struct ClosingTcp {
+    handle: SocketHandle,
+    queued: usize,
+    timeout: Duration,
+    deadline: Instant,
+}
+
 pub(crate) struct SocketSetWrapper<'a> {
     pub inner: Mutex<SocketSet<'a>>,
     pub new_socket: Event,
+    // Lock order: inner, then closing_tcp. Entries remain in the existing
+    // bounded socket set until protocol close (including TIME-WAIT) finishes.
+    closing_tcp: Mutex<Vec<ClosingTcp>>,
 }
 
 impl<'a> SocketSetWrapper<'a> {
@@ -39,6 +50,7 @@ impl<'a> SocketSetWrapper<'a> {
         Self {
             inner: Mutex::new(SocketSet::new(Vec::with_capacity(MAX_SOCKETS))),
             new_socket: Event::new(),
+            closing_tcp: Mutex::new(Vec::with_capacity(MAX_SOCKETS)),
         }
     }
 
@@ -53,6 +65,7 @@ impl<'a> SocketSetWrapper<'a> {
         Ok(handle)
     }
 
+    #[cfg(test)]
     pub fn with_socket<T: AnySocket<'a>, R, F>(&self, handle: SocketHandle, f: F) -> R
     where
         F: FnOnce(&T) -> R,
@@ -127,6 +140,61 @@ impl<'a> SocketSetWrapper<'a> {
             Self::local_endpoint(socket, transport)
                 .is_some_and(|(_, existing_port)| existing_port == port)
         })
+    }
+
+    /// Release the file-description owner without discarding accepted TX bytes.
+    /// The service's existing TCP timer/packet polling owns the remaining close.
+    pub fn close_tcp(&self, handle: SocketHandle, now: Instant) {
+        let mut sockets = self.inner.lock();
+        let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+        socket.close();
+        if socket.state() == smoltcp::socket::tcp::State::Closed && socket.remote_endpoint().is_none() {
+            sockets.remove(handle);
+        } else {
+            // Preserve an explicitly configured transport timeout. The orphan
+            // deadline tracks ACKed bytes rather than arbitrary incoming ACKs:
+            // zero-window probes must not retain a dead fd's buffer forever.
+            let timeout = socket.timeout().unwrap_or(Duration::from_secs(60));
+            let entry = ClosingTcp {
+                handle,
+                queued: socket.send_queue(),
+                timeout,
+                deadline: now + timeout,
+            };
+            let mut closing = self.closing_tcp.lock();
+            debug_assert!(closing.len() < MAX_SOCKETS);
+            closing.push(entry);
+        }
+    }
+
+    pub fn closing_tcp_deadline(&self) -> Option<Instant> {
+        self.closing_tcp.lock().iter().map(|entry| entry.deadline).min()
+    }
+
+    /// Called while the service owns `inner`, after processing TCP timers and
+    /// packets. Returns whether an abort needs another egress pass for its RST.
+    pub fn reap_closed_tcp(&self, sockets: &mut SocketSet<'_>, now: Instant) -> bool {
+        let mut aborted = false;
+        self.closing_tcp.lock().retain_mut(|entry| {
+            let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(entry.handle);
+            if socket.state() == smoltcp::socket::tcp::State::Closed {
+                // This runs after the next egress opportunity following abort.
+                // RST is best effort: a down link/full route must not retain
+                // an expired owner forever or rearm an already expired timer.
+                sockets.remove(entry.handle);
+                return false;
+            }
+            let queued = socket.send_queue();
+            if queued < entry.queued {
+                entry.queued = queued;
+                entry.deadline = now + entry.timeout;
+            } else if now >= entry.deadline {
+                socket.abort();
+                aborted = true;
+            }
+            true
+        });
+        aborted
     }
 
     pub fn remove(&self, handle: SocketHandle) {

@@ -1358,9 +1358,6 @@ impl Location {
 
     /// See [`Mountpoint::effective_mountpoint`].
     fn resolve_mountpoint(self) -> VfsResult<Self> {
-        if self.entry.as_dir().is_err() {
-            return Ok(self);
-        }
         let _tree = MOUNT_TREE_LOCK.read();
         if self.mountpoint().has_unmounting_ancestor_locked() {
             return Err(VfsError::ResourceBusy);
@@ -1751,11 +1748,13 @@ impl Location {
         fs: &Filesystem,
         extensions: Option<TypeMap>,
     ) -> VfsResult<Arc<Mountpoint>> {
-        self.check_is_dir()?;
         // `root_dir` is an open filesystem callback. Invoke it before taking
         // the global topology writer so a backend cannot stall pathname
         // readers or re-enter the mount tree while that writer is held.
         let root = fs.root_dir();
+        if self.is_dir() != root.is_dir() {
+            return Err(VfsError::NotADirectory);
+        }
         // Admit the mount object and its policy extensions before taking the
         // topology writer. Failure only drops an unpublished detached object.
         let result = Mountpoint::new_mounted(fs, root, self, extensions)?;
@@ -1786,8 +1785,7 @@ impl Location {
         if self.mountpoint().namespace_root.load(Ordering::Acquire) {
             return Err(VfsError::ResourceBusy);
         }
-        target.check_is_dir()?;
-        if !self.is_dir() {
+        if self.is_dir() != target.is_dir() {
             return Err(VfsError::NotADirectory);
         }
 

@@ -12,7 +12,7 @@ use axfs::{
     FileBackend, FileFlags, FsContext, OpenOptions, OpenResult, PathwalkComponent, PathwalkPolicy,
 };
 use axfs_ng_vfs::{
-    DirEntry, ExportHandleDecodeMode, FileNode, FsName, FsNameBuf, FsPath, FsPathBuf, Location,
+    DirEntry, ExportHandleDecodeMode, FileNode, FsNameBuf, FsPath, FsPathBuf, Location,
     MetadataUpdate, NodePermission, NodeType, PreparedInitialAttributes, Reference,
 };
 use axio::{Seek, SeekFrom};
@@ -786,12 +786,11 @@ fn prepare_open_description(
                         let inner = device.inner().as_any();
                         if let Some(ptmx) = inner.downcast_ref::<tty::Ptmx>() {
                             // Opening /dev/ptmx creates a new pseudo-terminal
-                            let (master, master_tty, pty_number) = ptmx.create_pty()?;
+                            let (master, master_tty, pty_number) = ptmx.create_pty(file.location())?;
                             let pts = file
                                 .location()
                                 .parent()
-                                .ok_or(AxError::NotFound)?
-                                .lookup_no_follow(FsName::new(b"pts"))?;
+                                .ok_or(AxError::NotFound)?;
                             let pty_name =
                                 FsNameBuf::from_vec(try_pty_name(pty_number)?.into_bytes())
                                     .map_err(AxError::from)?;
@@ -821,14 +820,7 @@ fn prepare_open_description(
                                 )?
                             } else if let Some(pts) = term.downcast_ref::<tty::PtyDriver>() {
                                 pty_guard = pts.open_transport_description()?;
-                                let pty_name = try_pty_name(pts.pty_number())?;
-                                dev_dir
-                                    .lookup_no_follow(FsName::new(b"pts"))?
-                                    .lookup_no_follow(
-                                        FsNameBuf::from_vec(pty_name.into_bytes())
-                                            .map_err(AxError::from)?
-                                            .as_name(),
-                                    )?
+                                pts.pts_location()?
                             } else {
                                 return Err(LinuxError::ENODEV.into());
                             };

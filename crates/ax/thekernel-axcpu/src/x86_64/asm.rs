@@ -396,7 +396,8 @@ pub const PKRU_DEFAULT: u32 = 0;
 
 /// Mandatory user xfeatures selected for this kernel. This is an XCR0 mask, never
 /// a host-toolchain target-feature mask.  Keep the base kernel contract to
-/// architectural x87 and SSE; wider SIMD state is deliberately not enabled.
+/// architectural x87 and SSE; supported AVX/YMM and requested PKRU are added
+/// separately. AVX-512 and AMX remain outside the selected user-state contract.
 #[cfg(feature = "fp-simd")]
 pub const XSAVE_REQUIRED_XFEATURES: u64 = (1 << 0) | (1 << 1);
 
@@ -404,7 +405,7 @@ pub const XSAVE_REQUIRED_XFEATURES: u64 = (1 << 0) | (1 << 1);
 const XSAVE_PKRU_XFEATURE: u64 = 1 << 9;
 
 #[cfg(feature = "fp-simd")]
-const fn selected_xsave_features(supported: u64, pkeys: bool) -> Option<u64> {
+const fn selected_xsave_features(supported: u64, avx: bool, pkeys: bool) -> Option<u64> {
     if !xsave_has_required_components(supported) {
         return None;
     }
@@ -413,7 +414,11 @@ const fn selected_xsave_features(supported: u64, pkeys: bool) -> Option<u64> {
     } else {
         0
     };
-    Some(XSAVE_REQUIRED_XFEATURES | optional)
+    // Libatomic's x86 IFUNC may select VEX-encoded atomic accesses directly
+    // from CPUID.AVX. Preserve YMM state whenever both instruction support
+    // and the architectural XSAVE component are available.
+    let ymm = if avx { supported & (1 << 2) } else { 0 };
+    Some(XSAVE_REQUIRED_XFEATURES | ymm | optional)
 }
 
 #[cfg(feature = "pkeys")]
@@ -498,7 +503,7 @@ pub struct XsaveLayout {
     pub xstate_size: usize,
 }
 
-/// Why x87/SSE/PKRU standard XSAVE state cannot be used on this CPU.
+/// Why x87/SSE/YMM/PKRU standard XSAVE state cannot be used on this CPU.
 #[cfg(feature = "fp-simd")]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum XsaveUnavailable {
@@ -521,9 +526,14 @@ impl XsaveLayout {
         let leaf = core::arch::x86_64::__cpuid_count(0xD, 0);
         let supported = u64::from(leaf.eax) | (u64::from(leaf.edx) << 32);
         Some(Self {
-            // Do not grow the kernel's XCR0 contract merely because the host
-            // happens to implement AVX, AVX-512, or AMX.
-            xfeatures: selected_xsave_features(supported, cfg!(feature = "pkeys"))?,
+            // Instruction and state-component discovery must agree before
+            // enabling YMM. Standard XSAVE sizing and fleet validation below
+            // cover the complete selected image on every boot CPU.
+            xfeatures: selected_xsave_features(
+                supported,
+                core::arch::x86_64::__cpuid(1).ecx & (1 << 28) != 0,
+                cfg!(feature = "pkeys"),
+            )?,
             xstate_size: 0,
         })
     }
@@ -1653,25 +1663,23 @@ mod hosted_xsave_tests {
     struct Image([u8; MAX_XSAVE_SIZE]);
 
     #[test]
-    fn kernel_xsave_selection_adds_only_supported_requested_pkru() {
+    fn kernel_xsave_selection_requires_avx_instruction_and_component_support() {
         let base = XSAVE_REQUIRED_XFEATURES;
+        let ymm = 1 << 2;
         let pkru = super::XSAVE_PKRU_XFEATURE;
-        let wider_simd = (1 << 2) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 17) | (1 << 18);
-        assert_eq!(
-            super::selected_xsave_features(base | wider_simd, true),
-            Some(base)
-        );
-        assert_eq!(
-            super::selected_xsave_features(base | pkru | wider_simd, true),
-            Some(base | pkru)
-        );
-        assert_eq!(
-            super::selected_xsave_features(base | pkru | wider_simd, false),
-            Some(base)
-        );
-        assert_eq!(super::selected_xsave_features(pkru, true), None);
-        assert_eq!(super::selected_xsave_features((1 << 0) | pkru, true), None);
-        assert_eq!(super::selected_xsave_features((1 << 1) | pkru, true), None);
+        let wider_simd = (1 << 5) | (1 << 6) | (1 << 7) | (1 << 17) | (1 << 18);
+        for avx in [false, true] {
+            for pkeys in [false, true] {
+                assert_eq!(super::selected_xsave_features(base, avx, pkeys), Some(base));
+                assert_eq!(
+                    super::selected_xsave_features(base | ymm | pkru | wider_simd, avx, pkeys),
+                    Some(base | if avx { ymm } else { 0 } | if pkeys { pkru } else { 0 }),
+                );
+                for invalid in [pkru, (1 << 0) | pkru, (1 << 1) | pkru] {
+                    assert_eq!(super::selected_xsave_features(invalid, avx, pkeys), None);
+                }
+            }
+        }
     }
 
     #[test]

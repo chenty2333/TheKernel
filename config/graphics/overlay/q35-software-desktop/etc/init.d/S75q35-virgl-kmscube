@@ -2,6 +2,7 @@
 # Exercise the direct GBM/EGL/KMS path before Weston obtains DRM master.  A
 # software virtio-gpu has no render node and deliberately skips this phase.
 set -eu
+[ "${1:-start}" = start ] || exit 0
 
 # The interactive desktop keeps Weston and its applications running.
 grep -qx q35-software-desktop /etc/thekernel-graphics-flavor && exit 0

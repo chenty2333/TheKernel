@@ -164,6 +164,15 @@ impl MemoryFs {
         permission: NodePermission,
         capacity_bytes: Option<u64>,
     ) -> VfsResult<Filesystem> {
+        Self::new_tmpfs(permission, capacity_bytes, 0, 0)
+    }
+
+    pub(crate) fn new_tmpfs(
+        permission: NodePermission,
+        capacity_bytes: Option<u64>,
+        root_uid: u32,
+        root_gid: u32,
+    ) -> VfsResult<Filesystem> {
         Self::new_with_identity(
             permission,
             capacity_bytes,
@@ -172,8 +181,8 @@ impl MemoryFs {
             TMPFS_BLOCK_SIZE,
             None,
             MAX_TMPFS_INODES,
-            0,
-            0,
+            root_uid,
+            root_gid,
             0,
         )
     }

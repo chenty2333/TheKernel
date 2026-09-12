@@ -7,20 +7,36 @@ use axfs_ng_vfs::{DeviceId, NodeType};
 use crate::{
     file::IoctlContext,
     pseudofs::{Device, DeviceOps, SimpleFs},
+    task::AsThread,
 };
 
-pub struct Ptmx(pub Arc<SimpleFs>);
+pub struct Ptmx {
+    pub(super) fs: Arc<SimpleFs>,
+    pub(super) table: Arc<super::pts::PtsTable>,
+    pub(super) options: super::pts::DevPtsOptions,
+}
 impl Ptmx {
-    pub fn create_pty(&self) -> AxResult<(Arc<Device>, Arc<super::PtyDriver>, u32)> {
+    pub fn create_pty(
+        &self,
+        location: &axfs_ng_vfs::Location,
+    ) -> AxResult<(Arc<Device>, Arc<super::PtyDriver>, u32)> {
         // Admission precedes worker construction. A full devpts table therefore
         // cannot create and immediately tear down an external reader task.
-        let lease = super::pts::reserve_slave()?;
+        let lease = super::pts::reserve_slave(&self.table)?;
         let (master, slave) = super::pty::create_pty_pair()?;
-        super::pts::add_slave(self.0.clone(), slave, &lease)?;
+        let ids = axtask::current().as_thread().current_cred().ids();
+        super::pts::add_slave(
+            self.fs.clone(),
+            slave,
+            &lease,
+            self.options,
+            (ids.fsuid.into_raw(), ids.fsgid.into_raw()),
+            location,
+        )?;
         let pty_number = master.pty_number();
         master.install_pts_lease(lease)?;
         let device = Device::try_new(
-            self.0.clone(),
+            self.fs.clone(),
             NodeType::CharacterDevice,
             DeviceId::new(128, pty_number),
             master.clone(),

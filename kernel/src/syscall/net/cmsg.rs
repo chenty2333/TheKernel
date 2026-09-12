@@ -44,13 +44,16 @@ static UNIX_ENDPOINT_OWNERS: Lazy<Mutex<Vec<(usize, Weak<FileDescription>)>>> =
 /// partially copied user control message.
 pub(crate) struct RightsGraphNode {
     pub(crate) fds: Mutex<Vec<ScmDescriptorCustody>>,
-    owner: Mutex<Weak<FileDescription>>,
+    // None denotes syscall-owned custody not yet published to a receive queue.
+    owner: Mutex<Option<Weak<FileDescription>>>,
+    receiving_endpoint: AtomicUsize,
 }
 
 fn register_rights_graph(fds: Vec<ScmDescriptorCustody>) -> AxResult<Arc<RightsGraphNode>> {
     let node = Arc::try_new(RightsGraphNode {
         fds: Mutex::new(fds),
-        owner: Mutex::new(Weak::new()),
+        owner: Mutex::new(None),
+        receiving_endpoint: AtomicUsize::new(0),
     })
     .map_err(|_| AxError::NoMemory)?;
     let mut graph = SCM_RIGHTS_GRAPH.lock();
@@ -100,7 +103,8 @@ pub(crate) fn collect_scm_rights_cycles() {
             // The borrowed value below does not clone the Arc. Therefore an
             // incoming SCM edge accounts for exactly one strong reference and
             // any surplus is a real fd-table/VMA/in-flight-operation root.
-            if description.has_live_descriptor_references()
+            if node.owner.lock().is_none()
+                || description.has_live_descriptor_references()
                 || Arc::strong_count(description) > edges
             {
                 if marked.try_reserve(1).is_err() {
@@ -117,7 +121,7 @@ pub(crate) fn collect_scm_rights_cycles() {
         let Some(node) = weak.upgrade() else {
             continue;
         };
-        if let Some(owner) = node.owner.lock().upgrade() {
+        if let Some(owner) = node.owner.lock().as_ref().and_then(Weak::upgrade) {
             let id = owner.id().get();
             let edges = incoming
                 .iter()
@@ -144,7 +148,7 @@ pub(crate) fn collect_scm_rights_cycles() {
             let Some(node) = weak.upgrade() else {
                 continue;
             };
-            if let Some(owner) = node.owner.lock().upgrade()
+            if let Some(owner) = node.owner.lock().as_ref().and_then(Weak::upgrade)
                 && marked.contains(&owner.id().get())
             {
                 for fd in node.fds.lock().iter() {
@@ -170,27 +174,17 @@ pub(crate) fn collect_scm_rights_cycles() {
         };
         let should_sweep = {
             let fds = node.fds.lock();
-            let owner_reachable = node
-                .owner
-                .lock()
-                .upgrade()
-                .is_some_and(|owner| marked.contains(&owner.id().get()));
-            !owner_reachable
-                && !fds.is_empty()
-                && !fds
-                    .iter()
-                    .any(|fd| marked.contains(&fd.description().id().get()))
+            let owner_reachable = match node.owner.lock().as_ref() {
+                // Unpublished send/PEEK custody belongs to its syscall.
+                None => true,
+                Some(owner) => owner
+                    .upgrade()
+                    .is_some_and(|owner| marked.contains(&owner.id().get())),
+            };
+            !owner_reachable && !fds.is_empty()
         };
         if should_sweep {
             node.fds.lock().clear();
-        }
-    }
-}
-
-pub(crate) fn set_scm_rights_owner(cmsgs: &mut [CMsgData], owner: &Arc<FileDescription>) {
-    for cmsg in cmsgs {
-        if let Some(CMsg::Rights { graph, .. }) = cmsg.downcast_mut::<CMsg>() {
-            *graph.owner.lock() = Arc::downgrade(owner);
         }
     }
 }
@@ -199,26 +193,101 @@ pub(crate) fn register_unix_endpoint_owner(
     endpoint: usize,
     owner: &Arc<FileDescription>,
 ) -> AxResult<()> {
+    // Accept changes a pending receive queue's owner from the listener to its
+    // new OFD. Move every already queued edge under the same lock as GC.
+    let graph = SCM_RIGHTS_GRAPH.lock();
     let mut owners = UNIX_ENDPOINT_OWNERS.lock();
     owners.retain(|(_, weak)| weak.strong_count() != 0);
     if let Some((_, known)) = owners.iter_mut().find(|(known, _)| *known == endpoint) {
         *known = Arc::downgrade(owner);
-        return Ok(());
+    } else {
+        owners.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        owners.push((endpoint, Arc::downgrade(owner)));
     }
-    owners.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-    owners.push((endpoint, Arc::downgrade(owner)));
+    for node in graph.iter().filter_map(Weak::upgrade) {
+        if node.receiving_endpoint.load(Ordering::Relaxed) == endpoint {
+            *node.owner.lock() = Some(Arc::downgrade(owner));
+        }
+    }
     Ok(())
 }
 
-pub(crate) fn set_scm_rights_endpoint_owner(cmsgs: &mut [CMsgData], endpoint: usize) {
+pub(crate) struct UnixEndpointOwnerRegistration {
+    endpoint: usize,
+    owner: Weak<FileDescription>,
+    committed: bool,
+}
+
+impl UnixEndpointOwnerRegistration {
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for UnixEndpointOwnerRegistration {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _graph = SCM_RIGHTS_GRAPH.lock();
+            UNIX_ENDPOINT_OWNERS.lock().retain(|(endpoint, owner)| {
+                *endpoint != self.endpoint || !owner.ptr_eq(&self.owner)
+            });
+        }
+    }
+}
+
+pub(crate) fn prepare_unix_endpoint_owner(
+    endpoint: usize,
+    owner: &Arc<FileDescription>,
+) -> AxResult<UnixEndpointOwnerRegistration> {
+    register_unix_endpoint_owner(endpoint, owner)?;
+    Ok(UnixEndpointOwnerRegistration {
+        endpoint,
+        owner: Arc::downgrade(owner),
+        committed: false,
+    })
+}
+
+pub(crate) fn register_unix_connection_owners(
+    listening: usize,
+    connecting: usize,
+    accepted: usize,
+    client: &Arc<FileDescription>,
+) -> AxResult<(UnixEndpointOwnerRegistration, UnixEndpointOwnerRegistration)> {
+    let listener = UNIX_ENDPOINT_OWNERS
+        .lock()
+        .iter()
+        .find(|(known, _)| *known == listening)
+        .and_then(|(_, owner)| owner.upgrade())
+        .ok_or(AxError::ConnectionRefused)?;
+    let connecting = prepare_unix_endpoint_owner(connecting, client)?;
+    let accepted = prepare_unix_endpoint_owner(accepted, &listener)?;
+    Ok((connecting, accepted))
+}
+
+pub(crate) fn set_scm_rights_endpoint_owner(
+    cmsgs: &mut [CMsgData],
+    endpoint: usize,
+) -> AxResult<()> {
+    if !cmsgs
+        .iter_mut()
+        .any(|cmsg| matches!(cmsg.downcast_mut::<CMsg>(), Some(CMsg::Rights { .. })))
+    {
+        return Ok(());
+    }
+    let _graph = SCM_RIGHTS_GRAPH.lock();
     let owner = UNIX_ENDPOINT_OWNERS
         .lock()
         .iter()
         .find(|(known, _)| *known == endpoint)
-        .and_then(|(_, owner)| owner.upgrade());
-    if let Some(owner) = owner {
-        set_scm_rights_owner(cmsgs, &owner);
+        .map(|(_, owner)| owner.clone())
+        .ok_or(AxError::NotConnected)?;
+    for cmsg in cmsgs {
+        if let Some(CMsg::Rights { graph, .. }) = cmsg.downcast_mut::<CMsg>() {
+            graph.receiving_endpoint.store(endpoint, Ordering::Relaxed);
+            *graph.owner.lock() = Some(owner.clone());
+        }
     }
+    Ok(())
 }
 
 fn try_acquire_scm_rights(count: usize) -> AxResult<()> {
@@ -466,6 +535,9 @@ impl CMsg {
                 for fd in source.iter() {
                     fds.push(fd.description().acquire_scm_custody());
                 }
+                // GC takes graph -> fds; release the source lock before
+                // publishing this independent in-flight PEEK snapshot.
+                drop(source);
                 let inflight = ScmRightsReservation::acquire(fds.len())?;
                 Ok(Self::Rights {
                     graph: register_rights_graph(fds)?,
@@ -518,6 +590,7 @@ pub struct CMsgBuilder<'a> {
     len: &'a mut usize,
     capacity: usize,
     pid_namespace: Arc<crate::task::PidNamespace>,
+    user_namespace: Arc<crate::task::UserNamespace>,
 }
 
 impl<'a> CMsgBuilder<'a> {
@@ -526,6 +599,7 @@ impl<'a> CMsgBuilder<'a> {
         msg: UserPtr<cmsghdr>,
         len: &'a mut usize,
         pid_namespace: Arc<crate::task::PidNamespace>,
+        user_namespace: Arc<crate::task::UserNamespace>,
     ) -> Self {
         let capacity = *len;
         *len = 0;
@@ -535,6 +609,7 @@ impl<'a> CMsgBuilder<'a> {
             len,
             capacity,
             pid_namespace,
+            user_namespace,
         }
     }
 
@@ -674,6 +749,12 @@ impl<'a> CMsgBuilder<'a> {
         // Transport identities are kernel-wide; only the receiving ABI
         // boundary projects them into the caller's PID namespace.
         let pid = super::socket_credential_pid(&self.pid_namespace, pid);
+        let uid = thekernel_linux_cred::Kuid::from_raw(uid)
+            .map(|uid| self.user_namespace.from_kuid_munged(uid))
+            .unwrap_or(thekernel_linux_cred::USER_NAMESPACE_OVERFLOW_ID);
+        let gid = thekernel_linux_cred::Kgid::from_raw(gid)
+            .map(|gid| self.user_namespace.from_kgid_munged(gid))
+            .unwrap_or(thekernel_linux_cred::USER_NAMESPACE_OVERFLOW_ID);
         let Some((header, credentials)) = credentials_cmsg(pid, uid, gid) else {
             return false;
         };
@@ -703,9 +784,8 @@ impl<'a> CMsgBuilder<'a> {
         true
     }
 
-    /// Publish an already initialized fixed-size ancillary payload.  SCTP
-    /// receive metadata has no resource-transfer side effect, so it follows
-    /// the same post-payload truncation contract as SCM_CREDENTIALS.
+    /// Publish fixed ancillary data, including a fitting prefix on truncation.
+    /// A false result tells the caller to set MSG_CTRUNC.
     pub fn push_fixed(&mut self, level: u32, kind: u32, payload: &[u8]) -> bool {
         let Some(remaining) = self.capacity.checked_sub(*self.len) else {
             return false;
@@ -716,13 +796,16 @@ impl<'a> CMsgBuilder<'a> {
         let Some(message_space) = cmsg_space(payload.len()) else {
             return false;
         };
-        if remaining < message_len {
-            return false;
-        }
         let base = self.hdr.address().as_usize();
         let Some(header_len) = cmsg_align(cmsg_header_len()) else {
             return false;
         };
+        if remaining < header_len {
+            return false;
+        }
+        let complete = remaining >= message_len;
+        let message_len = message_len.min(remaining);
+        let payload = &payload[..message_len - header_len];
         let Some(data_addr) = base.checked_add(header_len) else {
             return false;
         };
@@ -747,7 +830,7 @@ impl<'a> CMsgBuilder<'a> {
         };
         self.hdr = UserPtr::from(next);
         *self.len += used;
-        true
+        complete
     }
 }
 
@@ -796,13 +879,101 @@ mod tests {
     }
 
     #[test]
+    fn unpublished_send_custody_survives_concurrent_descriptor_close() {
+        let _guard = SCM_ACCOUNT_TEST_LOCK.lock();
+        let transferred = graph_test_description();
+        let graph = register_rights_graph(alloc::vec![transferred.acquire_scm_custody()]).unwrap();
+        transferred.descriptor_closed();
+        drop(transferred);
+        collect_scm_rights_cycles();
+        assert_eq!(graph.fds.lock().len(), 1);
+        // Once published to a dead receiver, the same edge is collectible.
+        *graph.owner.lock() = Some(Weak::new());
+        collect_scm_rights_cycles();
+        assert!(graph.fds.lock().is_empty());
+    }
+
+    #[test]
+    fn failed_endpoint_publication_releases_its_owner_registration() {
+        let _guard = SCM_ACCOUNT_TEST_LOCK.lock();
+        let owner = graph_test_description();
+        let endpoint = Arc::as_ptr(&owner) as usize;
+        let registration = prepare_unix_endpoint_owner(endpoint, &owner).unwrap();
+        assert!(
+            UNIX_ENDPOINT_OWNERS
+                .lock()
+                .iter()
+                .any(|(id, _)| *id == endpoint)
+        );
+        drop(registration);
+        assert!(
+            !UNIX_ENDPOINT_OWNERS
+                .lock()
+                .iter()
+                .any(|(id, _)| *id == endpoint)
+        );
+        owner.descriptor_closed();
+    }
+
+    #[test]
+    fn accept_transfers_only_its_pending_rights_from_listener_to_receiver() {
+        let _guard = SCM_ACCOUNT_TEST_LOCK.lock();
+        let listener = graph_test_description();
+        let receiver = graph_test_description();
+        let first = graph_test_description();
+        let second = graph_test_description();
+        let first_endpoint = Arc::as_ptr(&first) as usize;
+        let second_endpoint = Arc::as_ptr(&second) as usize;
+        register_unix_endpoint_owner(first_endpoint, &listener).unwrap();
+        register_unix_endpoint_owner(second_endpoint, &listener).unwrap();
+        let mut first_control = alloc::vec![
+            CMsg::from_rights(alloc::vec![first.acquire_scm_custody()])
+                .unwrap()
+                .unwrap()
+        ];
+        let mut second_control = alloc::vec![
+            CMsg::from_rights(alloc::vec![second.acquire_scm_custody()])
+                .unwrap()
+                .unwrap()
+        ];
+        set_scm_rights_endpoint_owner(&mut first_control, first_endpoint).unwrap();
+        set_scm_rights_endpoint_owner(&mut second_control, second_endpoint).unwrap();
+        let first_graph = match first_control[0].downcast_mut::<CMsg>().unwrap() {
+            CMsg::Rights { graph, .. } => graph.clone(),
+            _ => unreachable!(),
+        };
+        let second_graph = match second_control[0].downcast_mut::<CMsg>().unwrap() {
+            CMsg::Rights { graph, .. } => graph.clone(),
+            _ => unreachable!(),
+        };
+        first.descriptor_closed();
+        second.descriptor_closed();
+        drop(first);
+        drop(second);
+        collect_scm_rights_cycles();
+        assert_eq!(first_graph.fds.lock().len(), 1);
+        assert_eq!(second_graph.fds.lock().len(), 1);
+
+        register_unix_endpoint_owner(first_endpoint, &receiver).unwrap();
+        listener.descriptor_closed();
+        drop(listener);
+        collect_scm_rights_cycles();
+        assert_eq!(first_graph.fds.lock().len(), 1);
+        assert!(second_graph.fds.lock().is_empty());
+        receiver.descriptor_closed();
+        drop(receiver);
+        collect_scm_rights_cycles();
+        assert!(first_graph.fds.lock().is_empty());
+    }
+
+    #[test]
     fn live_scm_owner_preserves_rights_after_original_file_closes() {
         let _guard = SCM_ACCOUNT_TEST_LOCK.lock();
         let owner = graph_test_description();
         let transferred = graph_test_description();
         let id = transferred.id();
         let graph = register_rights_graph(alloc::vec![transferred.acquire_scm_custody()]).unwrap();
-        *graph.owner.lock() = Arc::downgrade(&owner);
+        *graph.owner.lock() = Some(Arc::downgrade(&owner));
         // A Wayland client sends a newly created shm file and closes its
         // original descriptor before the compositor imports the queued FD.
         // The live socket owner need never itself appear as a queued target.
@@ -829,8 +1000,8 @@ mod tests {
         let right = graph_test_description();
         let to_right = register_rights_graph(alloc::vec![right.acquire_scm_custody()]).unwrap();
         let to_left = register_rights_graph(alloc::vec![left.acquire_scm_custody()]).unwrap();
-        *to_right.owner.lock() = Arc::downgrade(&left);
-        *to_left.owner.lock() = Arc::downgrade(&right);
+        *to_right.owner.lock() = Some(Arc::downgrade(&left));
+        *to_left.owner.lock() = Some(Arc::downgrade(&right));
         left.descriptor_closed();
         right.descriptor_closed();
         drop(left);
@@ -838,6 +1009,27 @@ mod tests {
         collect_scm_rights_cycles();
         assert!(to_right.fds.lock().is_empty());
         assert!(to_left.fds.lock().is_empty());
+    }
+
+    #[test]
+    fn externally_open_sibling_does_not_preserve_a_dead_receive_queue() {
+        let _guard = SCM_ACCOUNT_TEST_LOCK.lock();
+        let receiver = graph_test_description();
+        let external = graph_test_description();
+        let receiver_weak = Arc::downgrade(&receiver);
+        let graph = register_rights_graph(alloc::vec![
+            receiver.acquire_scm_custody(),
+            external.acquire_scm_custody(),
+        ])
+        .unwrap();
+        *graph.owner.lock() = Some(receiver_weak.clone());
+        receiver.descriptor_closed();
+        drop(receiver);
+        collect_scm_rights_cycles();
+        assert!(graph.fds.lock().is_empty());
+        assert!(receiver_weak.upgrade().is_none());
+        assert!(external.has_live_descriptor_references());
+        external.descriptor_closed();
     }
 
     #[test]

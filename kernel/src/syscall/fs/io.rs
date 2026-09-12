@@ -69,7 +69,7 @@ use crate::{
         try_pin_user_slice_to_user_with,
     },
     mounts,
-    pseudofs::{dev::tun::TunFile, tmp},
+    pseudofs::{dev::tun::TunFile, tmp, trace::{IoUringReadStage, record_io_uring_read_stage}},
     readiness::block_on_poll_io,
     task::{
         AsThread, current_fs_context,
@@ -3822,6 +3822,7 @@ fn execute_classic_aio_operation_with_cancellation(
             offset,
             None,
             cancellation,
+            None,
         ),
         ClassicAioOperation::Write {
             capability,
@@ -4773,6 +4774,7 @@ pub fn sys_pread64(
             offset as u64,
             None,
             None,
+            None,
         )
     })
 }
@@ -4915,6 +4917,7 @@ fn pread64_file_with_context(
     offset: u64,
     fixed_segments: Option<IoUringFixedSegments<'_>>,
     cancellation: Option<&AsyncOperation>,
+    trace_id: Option<thekernel_linux_io_uring::RequestId>,
 ) -> AxResult<isize> {
     if cancellation.is_some_and(AsyncOperation::cancellation_requested) {
         return Err(LinuxError::ECANCELED.into());
@@ -4943,6 +4946,7 @@ fn pread64_file_with_context(
         };
         if read > 0 {
             notify_read_file_with_actor(f.as_ref(), context.fanotify_actor());
+            record_io_uring_read_stage(trace_id, IoUringReadStage::NotificationReturned);
             rwf_dontcache_range(context, f, offset, read)?;
         }
         return Ok(read as isize);
@@ -4966,14 +4970,17 @@ fn pread64_file_with_context(
             disjoint,
             provenance,
         ));
-        Some(read_at_fixed_user_segments(
+        record_io_uring_read_stage(trace_id, IoUringReadStage::ReadStarted);
+        let read = read_at_fixed_user_segments(
             f.as_ref(),
             segments,
             offset_in_segments,
             fixed_len,
             offset,
             disjoint,
-        )?)
+        )?;
+        record_io_uring_read_stage(trace_id, IoUringReadStage::ReadReturned);
+        Some(read)
     } else {
         match try_regular_file_pread_user_slice(capability, f.as_ref(), buf, len, offset)? {
             Some(read) => Some(read),
@@ -4983,6 +4990,7 @@ fn pread64_file_with_context(
     if let Some(read) = fast_read {
         if read > 0 {
             notify_read_file_with_actor(f.as_ref(), context.fanotify_actor());
+            record_io_uring_read_stage(trace_id, IoUringReadStage::NotificationReturned);
             rwf_dontcache_range(context, f, offset, read)?;
         }
         return Ok(read as _);
@@ -5015,6 +5023,7 @@ pub(crate) fn io_uring_pread64_submission(
     len: usize,
     offset: u64,
     fixed_segments: Option<IoUringFixedSegments<'_>>,
+    trace_id: Option<thekernel_linux_io_uring::RequestId>,
 ) -> AxResult<isize> {
     io_uring_pread64_submission_with_mode(
         capability,
@@ -5025,6 +5034,7 @@ pub(crate) fn io_uring_pread64_submission(
         offset,
         fixed_segments,
         false,
+        trace_id,
     )
 }
 
@@ -5039,6 +5049,7 @@ pub(crate) fn io_uring_pread64_submission_nonblocking_stream(
     len: usize,
     offset: u64,
     fixed_segments: Option<IoUringFixedSegments<'_>>,
+    trace_id: Option<thekernel_linux_io_uring::RequestId>,
 ) -> AxResult<isize> {
     io_uring_pread64_submission_with_mode(
         capability,
@@ -5049,6 +5060,7 @@ pub(crate) fn io_uring_pread64_submission_nonblocking_stream(
         offset,
         fixed_segments,
         true,
+        trace_id,
     )
 }
 
@@ -5061,6 +5073,7 @@ fn io_uring_pread64_submission_with_mode(
     offset: u64,
     fixed_segments: Option<IoUringFixedSegments<'_>>,
     force_nonblocking_stream: bool,
+    trace_id: Option<thekernel_linux_io_uring::RequestId>,
 ) -> AxResult<isize> {
     context.validate_for(description)?;
     let file_handle = description.file_handle();
@@ -5071,6 +5084,7 @@ fn io_uring_pread64_submission_with_mode(
         file_handle.check_io_status(context.status())?;
         let _ = PinnedSocketDescription::from_file_handle(&file_handle, context.status())?;
     }
+    record_io_uring_read_stage(trace_id, IoUringReadStage::PermissionStarted);
     if len != 0 {
         permission_check_file_like_with_actor_and_status(
             &file_handle,
@@ -5079,6 +5093,7 @@ fn io_uring_pread64_submission_with_mode(
             context.status(),
         )?;
     }
+    record_io_uring_read_stage(trace_id, IoUringReadStage::PermissionReturned);
     file_handle.with_read_credentials(|| {
         execute_io_uring_pread(
             capability,
@@ -5089,6 +5104,7 @@ fn io_uring_pread64_submission_with_mode(
             offset,
             fixed_segments,
             force_nonblocking_stream,
+            trace_id,
         )
     })
 }
@@ -5109,6 +5125,7 @@ fn execute_io_uring_pread(
     offset: u64,
     fixed_segments: Option<IoUringFixedSegments<'_>>,
     force_nonblocking_stream: bool,
+    trace_id: Option<thekernel_linux_io_uring::RequestId>,
 ) -> AxResult<isize> {
     let file_handle = description.file_handle();
     // Linux's io_uring rw path treats a zero offset on a non-seekable file
@@ -5136,6 +5153,7 @@ fn execute_io_uring_pread(
         offset,
         fixed_segments,
         None,
+        trace_id,
     )
 }
 

@@ -233,7 +233,19 @@ fn prepare_new_socket_arc(
         socket.set_nonblocking(true)?;
     }
     let description = FileDescription::new_with_flags(socket, socket_status_flags(nonblocking))?;
-    PinnedSocketDescription::from_description(description)
+    let socket = PinnedSocketDescription::from_description(description)?;
+    register_socket_endpoint_owner(&socket)?;
+    Ok(socket)
+}
+
+fn register_socket_endpoint_owner(socket: &PinnedSocketDescription) -> AxResult<()> {
+    if let Ok(network) = socket.network()
+        && let SocketInner::Unix(unix) = &network.inner
+        && let Some(endpoint) = unix.connected_endpoint_identity()
+    {
+        super::cmsg::register_unix_endpoint_owner(endpoint.raw(), socket.description())?;
+    }
+    Ok(())
 }
 
 fn publish_new_socket_like(socket: PinnedSocketDescription, cloexec: bool) -> AxResult<i32> {
@@ -324,10 +336,6 @@ pub(crate) fn accept_pinned(
     let listener = pinned.network()?;
     let net_ns = listener.net_namespace().clone();
     let reservation = listener.prepare_accept()?;
-    let unix_endpoint = match reservation.identity() {
-        axnet::SocketAcceptIdentity::Unix(endpoint) => Some(endpoint),
-        _ => None,
-    };
     let pending_ref = PendingSocketSecurityRef::new(&reservation, &net_ns);
     dispatch_socket(&SocketSecurityContext::accept(
         actor,
@@ -338,9 +346,6 @@ pub(crate) fn accept_pinned(
     accepted.inherit_creator_security_from(listener);
     accepted.inherit_inet_identity_from(listener)?;
     let accepted = prepare_new_socket_like(accepted, nonblocking)?;
-    if let Some(endpoint) = unix_endpoint {
-        super::cmsg::register_unix_endpoint_owner(endpoint.raw(), accepted.description())?;
-    }
     publish_new_socket_like(accepted, cloexec).map(|fd| fd as isize)
 }
 
@@ -749,12 +754,13 @@ pub fn sys_bind(
                     NodePermission::from_bits_truncate(0o777),
                     snapshot.umask(),
                     |endpoint| {
-                        let _ = super::cmsg::register_unix_endpoint_owner(
+                        super::cmsg::prepare_unix_endpoint_owner(
                             endpoint.raw(),
                             pinned.description(),
-                        );
+                        )
                     },
-                )?;
+                )?
+                .commit();
             } else if let (
                 SocketInner::Unix(unix),
                 SocketAddrEx::Unix(UnixSocketAddr::Abstract(_)),
@@ -765,10 +771,9 @@ pub fn sys_bind(
                     addr.clone()
                         .into_unix()
                         .map_err(|_| AxError::InvalidInput)?,
-                    |endpoint| {
-                        let _ = super::cmsg::register_unix_endpoint_owner(endpoint.raw(), &owner);
-                    },
-                )?;
+                    |endpoint| super::cmsg::prepare_unix_endpoint_owner(endpoint.raw(), &owner),
+                )?
+                .commit();
             } else {
                 require_bind_permissions(&addr, socket.net_namespace(), actor)?;
                 validate_network_address(&socket.inner, &addr)?;
@@ -910,7 +915,16 @@ pub fn sys_connect(
                     &listening,
                     &accepted,
                 ))?;
-                reservation.commit()
+                let owners = super::cmsg::register_unix_connection_owners(
+                    reservation.listening_identity().raw(),
+                    reservation.connecting_identity().raw(),
+                    reservation.accepted_identity().raw(),
+                    pinned.description(),
+                )?;
+                reservation.commit()?;
+                owners.0.commit();
+                owners.1.commit();
+                Ok(())
             } else {
                 let reservation =
                     unix.prepare_stream_connect_resolved_as(target, snapshot.unix_credentials())?;
@@ -930,7 +944,16 @@ pub fn sys_connect(
                     &listening,
                     &accepted,
                 ))?;
-                reservation.commit()
+                let owners = super::cmsg::register_unix_connection_owners(
+                    reservation.listening_identity().raw(),
+                    reservation.connecting_identity().raw(),
+                    reservation.accepted_identity().raw(),
+                    pinned.description(),
+                )?;
+                reservation.commit()?;
+                owners.0.commit();
+                owners.1.commit();
+                Ok(())
             }
         }
         (SocketInner::Unix(unix), SocketAddrEx::Unix(_)) => {
@@ -955,7 +978,16 @@ pub fn sys_connect(
                     &listening,
                     &accepted,
                 ))?;
-                reservation.commit()
+                let owners = super::cmsg::register_unix_connection_owners(
+                    reservation.listening_identity().raw(),
+                    reservation.connecting_identity().raw(),
+                    reservation.accepted_identity().raw(),
+                    pinned.description(),
+                )?;
+                reservation.commit()?;
+                owners.0.commit();
+                owners.1.commit();
+                Ok(())
             } else {
                 let reservation =
                     unix.prepare_stream_connect_as(addr.clone(), snapshot.unix_credentials())?;
@@ -975,7 +1007,16 @@ pub fn sys_connect(
                     &listening,
                     &accepted,
                 ))?;
-                reservation.commit()
+                let owners = super::cmsg::register_unix_connection_owners(
+                    reservation.listening_identity().raw(),
+                    reservation.connecting_identity().raw(),
+                    reservation.accepted_identity().raw(),
+                    pinned.description(),
+                )?;
+                reservation.commit()?;
+                owners.0.commit();
+                owners.1.commit();
+                Ok(())
             }
         }
         _ => socket.connect(addr.clone()),
@@ -1083,10 +1124,6 @@ pub fn sys_accept4(
     let listener = pinned.network()?;
     let net_ns = listener.net_namespace().clone();
     let reservation = listener.prepare_accept()?;
-    let unix_endpoint = match reservation.identity() {
-        axnet::SocketAcceptIdentity::Unix(endpoint) => Some(endpoint),
-        _ => None,
-    };
     let pending_ref = PendingSocketSecurityRef::new(&reservation, &net_ns);
     let accepted_ref = AcceptedSocketSecurityRef::Pending(pending_ref);
     dispatch_socket(&SocketSecurityContext::accept(
@@ -1110,9 +1147,6 @@ pub fn sys_accept4(
     }
 
     let socket = prepare_new_socket_like(socket, nonblocking)?;
-    if let Some(endpoint) = unix_endpoint {
-        super::cmsg::register_unix_endpoint_owner(endpoint.raw(), socket.description())?;
-    }
     let fd = publish_new_socket_like(socket, cloexec).map(|fd| fd as isize)?;
     debug!("sys_accept => fd: {fd}, addr: {remote_addr:?}");
 
@@ -1246,6 +1280,8 @@ pub fn sys_socketpair(
     )?;
     let socket1 = PinnedSocketDescription::from_description(description1)?;
     let socket2 = PinnedSocketDescription::from_description(description2)?;
+    register_socket_endpoint_owner(&socket1)?;
+    register_socket_endpoint_owner(&socket2)?;
     dispatch_socket_post_create(actor, &socket1, spec)?;
     dispatch_socket_post_create(actor, &socket2, spec)?;
     {

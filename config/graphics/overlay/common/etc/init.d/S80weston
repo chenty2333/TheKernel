@@ -41,6 +41,11 @@ start() {
         echo "Cannot start desktop: persistent home disk is not mounted" >&2
         return 1
     fi
+    if [ -n "$WESTON_HOME_MOUNT" ]; then
+        [ -c /dev/dsp ] || { echo "Desktop playback device missing: /dev/dsp" >&2; return 1; }
+        chgrp audio /dev/dsp
+        chmod 0660 /dev/dsp
+    fi
     mkdir -p "$RUNTIME_DIR"
     chown "$USER:$USER" "$RUNTIME_DIR"
     chmod 0700 "$RUNTIME_DIR"
@@ -55,6 +60,17 @@ start() {
 }
 
 stop() {
+    if [ -n "$WESTON_HOME_MOUNT" ]; then
+        # Pulse holds the playback device and writes user state. Stop it before
+        # the later home unmount, even if the compositor has already exited.
+        start-stop-daemon -K -q -x /usr/bin/pulseaudio -u "$USER" || true
+        tries=0
+        while start-stop-daemon -K -q -t -x /usr/bin/pulseaudio -u "$USER"; do
+            [ "$tries" -lt 10 ] || { echo "PulseAudio did not stop" >&2; return 1; }
+            tries=$((tries + 1))
+            sleep 1
+        done
+    fi
     pid=$(pid_from_file) || { rm -f "$PIDFILE"; return 0; }
     kill -0 "$pid" 2>/dev/null || { rm -f "$PIDFILE"; return 0; }
     printf 'Stopping Weston: '

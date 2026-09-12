@@ -127,7 +127,9 @@ impl PendingCredentialPostCommit {
     ) -> AxResult<Self> {
         if !matches!(
             transition,
-            CredentialStateTransition::Mutation(_) | CredentialStateTransition::Exec
+            CredentialStateTransition::Mutation(_)
+                | CredentialStateTransition::Exec
+                | CredentialStateTransition::UserNamespace
         ) {
             return Err(AxError::BadState);
         }

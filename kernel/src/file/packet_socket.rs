@@ -111,7 +111,7 @@ struct PacketSendPermit<'a> {
 }
 
 impl PacketSendPermit<'_> {
-    fn interfaces(&self) -> Vec<axnet::InterfaceInfo> {
+    fn interfaces(&self) -> AxResult<Vec<axnet::InterfaceInfo>> {
         self.service.interfaces()
     }
 
@@ -1608,7 +1608,7 @@ impl PacketSocket {
         let interface_index =
             exact_interface(selected_interface).map_err(|_| AxError::from(LinuxError::ENXIO))?;
         let info = permit
-            .interfaces()
+            .interfaces()?
             .into_iter()
             .find(|candidate| candidate.index == interface_index)
             .ok_or_else(|| AxError::from(LinuxError::ENXIO))?;

@@ -73,6 +73,101 @@ static xcb_atom_t atom(xcb_connection_t *connection, const char *name)
     return result;
 }
 
+static int clipboard_roundtrip(xcb_connection_t *owner, xcb_window_t source,
+                              xcb_atom_t clipboard, xcb_atom_t utf8)
+{
+    xcb_connection_t *reader = xcb_connect(NULL, NULL);
+    xcb_atom_t property = atom(owner, "THEKERNEL_CLIPBOARD_RESULT");
+    xcb_atom_t targets = atom(owner, "TARGETS");
+    struct timespec start, now;
+    int result = -1;
+    if (!reader || xcb_connection_has_error(reader) || !property || !targets)
+        goto done;
+    xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(reader)).data;
+    xcb_window_t window = xcb_generate_id(reader);
+    if (checked(reader, xcb_create_window_checked(reader, XCB_COPY_FROM_PARENT,
+                window, screen->root, 0, 0, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
+                screen->root_visual, 0, NULL), "clipboard_reader") < 0 ||
+        checked(reader, xcb_convert_selection_checked(reader, window, clipboard,
+                utf8, property, XCB_CURRENT_TIME), "clipboard_request") < 0 ||
+        clock_gettime(CLOCK_MONOTONIC, &start) < 0)
+        goto done;
+    xcb_flush(reader);
+    struct pollfd descriptors[2] = {
+        { .fd = xcb_get_file_descriptor(owner), .events = POLLIN },
+        { .fd = xcb_get_file_descriptor(reader), .events = POLLIN },
+    };
+    for (;;) {
+        xcb_generic_event_t *event;
+        while ((event = xcb_poll_for_event(owner)) != NULL) {
+            if ((event->response_type & 0x7f) == XCB_SELECTION_REQUEST) {
+                xcb_selection_request_event_t *request = (void *)event;
+                xcb_selection_notify_event_t response = {
+                    .response_type = XCB_SELECTION_NOTIFY,
+                    .time = request->time, .requestor = request->requestor,
+                    .selection = request->selection, .target = request->target,
+                    .property = XCB_ATOM_NONE,
+                };
+                if (request->owner == source && request->selection == clipboard) {
+                    xcb_atom_t destination = request->property ? request->property : request->target;
+                    if (request->target == utf8) {
+                        xcb_change_property(owner, XCB_PROP_MODE_REPLACE, request->requestor,
+                                destination, utf8, 8, 9, "TheKernel");
+                        response.property = destination;
+                    } else if (request->target == targets) {
+                        xcb_atom_t supported[] = { targets, utf8 };
+                        xcb_change_property(owner, XCB_PROP_MODE_REPLACE, request->requestor,
+                                destination, XCB_ATOM_ATOM, 32, 2, supported);
+                        response.property = destination;
+                    }
+                }
+                char wire_event[32] = { 0 };
+                memcpy(wire_event, &response, sizeof(response));
+                xcb_send_event(owner, 0, request->requestor, XCB_EVENT_MASK_NO_EVENT, wire_event);
+                xcb_flush(owner);
+            }
+            free(event);
+        }
+        while ((event = xcb_poll_for_event(reader)) != NULL) {
+            if ((event->response_type & 0x7f) == XCB_SELECTION_NOTIFY) {
+                xcb_selection_notify_event_t *notify = (void *)event;
+                int matches = notify->requestor == window && notify->selection == clipboard &&
+                    notify->target == utf8 && notify->property == property;
+                free(event);
+                if (!matches)
+                    goto done;
+                xcb_get_property_reply_t *value = xcb_get_property_reply(reader,
+                        xcb_get_property(reader, 1, window, property, utf8, 0, 16), NULL);
+                if (value && value->type == utf8 && value->format == 8 &&
+                    value->bytes_after == 0 && xcb_get_property_value_length(value) == 9 &&
+                    memcmp(xcb_get_property_value(value), "TheKernel", 9) == 0)
+                    result = 0;
+                free(value);
+                goto done;
+            }
+            free(event);
+        }
+        if (xcb_connection_has_error(owner) || xcb_connection_has_error(reader) ||
+            clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+            goto done;
+        long elapsed = (now.tv_sec - start.tv_sec) * 1000 +
+            (now.tv_nsec - start.tv_nsec) / 1000000;
+        if (elapsed >= 5000)
+            goto done;
+        int ready = poll(descriptors, 2, (int)(5000 - elapsed));
+        if (ready < 0 && errno != EINTR)
+            goto done;
+        if ((descriptors[0].revents | descriptors[1].revents) & (POLLERR | POLLHUP | POLLNVAL))
+            goto done;
+    }
+done:
+    if (reader)
+        xcb_disconnect(reader);
+    if (result < 0)
+        fputs("THEKERNEL_Q35_XWAYLAND_GLAMOR_READY state=FAIL reason=clipboard_transfer\n", stderr);
+    return result;
+}
+
 int main(void)
 {
     xcb_connection_t *connection = xcb_connect(NULL, NULL);
@@ -142,6 +237,8 @@ int main(void)
         goto fail;
     }
     free(owner);
+    if (clipboard_roundtrip(connection, foreground, clipboard, utf8_string) < 0)
+        goto fail;
     puts("THEKERNEL_Q35_XWAYLAND_EVENT_READY");
     fflush(stdout);
     pollfd.fd = xcb_get_file_descriptor(connection);

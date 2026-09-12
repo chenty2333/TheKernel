@@ -237,6 +237,7 @@ pub(crate) struct DeviceState {
     pub(crate) open_ids: BTreeSet<u64>,
     pub(crate) next_mmap_offset: MmapOffset,
     pub(crate) master: Option<u64>,
+    pub(crate) master_epoch: u64,
     pub(crate) resources: KmsResources,
     pub(crate) framebuffers: BTreeMap<FramebufferId, Framebuffer>,
     pub(crate) next_framebuffer: FramebufferId,
@@ -274,11 +275,35 @@ pub(crate) struct PropertyBlob {
     pub(crate) destroyed: bool,
 }
 impl DeviceState {
+    pub(crate) fn set_master(&mut self, owner: Option<u64>) {
+        if self.master == owner {
+            return;
+        }
+        if let Some(epoch) = self.master_epoch.checked_add(1) {
+            self.master_epoch = epoch;
+            self.master = owner;
+        } else {
+            // Never reuse an ownership epoch: fail closed on exhaustion.
+            self.kms_suspended = true;
+            self.master = None;
+        }
+    }
+
     fn rebuild_atomic_tail(&mut self) {
         self.atomic_tail = self
             .pending_commits
             .back()
             .map_or(self.atomic, |job| job.next);
+    }
+
+    fn take_pending_commits(&mut self) -> VecDeque<AtomicCommit> {
+        let commits = core::mem::take(&mut self.pending_commits);
+        for job in &commits {
+            release_state_blobs(self, job.next);
+        }
+        self.rebuild_atomic_tail();
+        self.poison_on_generation_overflow();
+        commits
     }
 }
 
@@ -318,6 +343,7 @@ impl DrmDevice {
                 open_ids: BTreeSet::new(),
                 next_mmap_offset: 4096,
                 master: None,
+                master_epoch: 0,
                 resources: KmsResources {
                     connector: super::kms::ConnectorInfo {
                         id: connector_id,
@@ -429,8 +455,39 @@ impl DrmDevice {
                 .lock()
                 .primary_session_leases
                 .insert(id, file.seat_lease());
+            // Linux's first primary opener is master without SET_MASTER.
+            // An existing userspace master still owns the seat exclusively.
+            let _ = file.become_master();
         }
         file
+    }
+
+    pub(crate) fn acquire_master(&self, owner: u64, session_owned: bool) -> DrmResult<()> {
+        let retired = {
+            let mut state = self.state.lock();
+            if state.kms_suspended {
+                return Err(DrmError::Busy);
+            }
+            if state.master != Some(owner) && state.master_epoch == u64::MAX {
+                return Err(DrmError::Overflow);
+            }
+            let retired = match state.master {
+                Some(previous) if previous != owner => {
+                    if !session_owned || state.primary_session_leases.contains_key(&previous) {
+                        return Err(DrmError::Busy);
+                    }
+                    // fbdev is a kernel console client, not a userspace
+                    // master. Revoke its queued modesets atomically with the
+                    // handoff so they cannot supersede the new master's work.
+                    state.take_pending_commits()
+                }
+                _ => VecDeque::new(),
+            };
+            state.set_master(Some(owner));
+            retired
+        };
+        self.retire_pending_commits(retired);
+        Ok(())
     }
 
     /// Factory for an unprivileged render-node OFD.  It exists only when the
@@ -817,7 +874,12 @@ impl DrmDevice {
     /// Returns whether this vblank made the job terminal.  A successful host
     /// present is intentionally observed on the first following vblank, not
     /// in the transport completion context.
-    fn complete_atomic(&self, job: &mut AtomicCommit, sequence: u64) -> DrmResult<bool> {
+    fn complete_atomic(
+        &self,
+        job: &mut AtomicCommit,
+        sequence: u64,
+        epoch: u64,
+    ) -> DrmResult<bool> {
         if !job.cancellation.try_begin_delivery() {
             job.discard_event();
             job.signal_scanout_error();
@@ -930,7 +992,7 @@ impl DrmDevice {
                 return Ok(false);
             }
         }
-        if !self.publish_atomic(&job) {
+        if !self.publish_atomic(&job, epoch) {
             // A file can close while the adapter presents an already-validated
             // scanout.  Do not revive its framebuffer after Drop removes it.
             job.discard_event();
@@ -952,9 +1014,11 @@ impl DrmDevice {
     /// Publishes a completed atomic job only while its file and framebuffer
     /// still exist.  This is deliberately checked under the device lock: file
     /// teardown removes framebuffers under the same lock.
-    fn publish_atomic(&self, job: &AtomicCommit) -> bool {
+    fn publish_atomic(&self, job: &AtomicCommit, epoch: u64) -> bool {
         let mut state = self.state.lock();
         if job.cancellation.is_closed()
+            || state.kms_suspended
+            || state.master_epoch != epoch
             || state.master != Some(job.owner)
             || !state.open_ids.contains(&job.owner)
             || (job.next.active && !state.framebuffers.contains_key(&job.next.fb))
@@ -1023,7 +1087,7 @@ impl DrmDevice {
                 .master
                 .is_some_and(|master| state.primary_session_leases.contains_key(&master))
             {
-                state.master = None;
+                state.set_master(None);
             }
             state
                 .primary_session_leases
@@ -1092,7 +1156,7 @@ impl DrmDevice {
     /// completion path without pretending the dummy platform has a clock.
     pub(crate) fn advance_vblank(&self) -> DrmResult<()> {
         self.refresh_display_config()?;
-        let (sequence, job, events) = {
+        let (sequence, job, epoch, events) = {
             let mut state = self.state.lock();
             state.vblank = state.vblank.wrapping_add(1);
             self.telemetry.vblanks.fetch_add(1, Ordering::Relaxed);
@@ -1105,7 +1169,12 @@ impl DrmDevice {
             {
                 events.push(state.pending_vblanks.pop_front().unwrap());
             }
-            (sequence, state.pending_commits.pop_front(), events)
+            (
+                sequence,
+                state.pending_commits.pop_front(),
+                state.master_epoch,
+                events,
+            )
         };
         self.vblank_waiters.notify_all(true);
         let timestamp_us = axhal::time::monotonic_time_nanos() / 1_000;
@@ -1114,35 +1183,65 @@ impl DrmDevice {
                 .queue
                 .complete_vblank(event.token, sequence, timestamp_us);
         }
-        if let Some(mut job) = job {
-            let result = if job.cancellation.is_closed() {
-                job.discard_event();
-                job.signal_scanout_error();
-                Ok(true)
-            } else {
-                self.complete_atomic(&mut job, sequence)
-            };
-            match result {
-                Ok(false) => self.state.lock().pending_commits.push_front(job),
-                Ok(true) => {
-                    if let Some(completion) = job.completion {
-                        completion.complete(Ok(()));
-                    }
-                    self.unpin_framebuffer(job.next.active.then_some(job.next.fb));
-                    self.release_commit_blobs(job.next);
-                }
-                Err(error) => {
-                    job.signal_scanout_error();
-                    if let Some(completion) = job.completion {
-                        completion.complete(Err(error));
-                    }
-                    self.unpin_framebuffer(job.next.active.then_some(job.next.fb));
-                    self.release_commit_blobs(job.next);
-                    return Err(error);
-                }
-            }
+        if let Some(job) = job {
+            self.advance_atomic_commit(job, sequence, epoch);
         }
         Ok(())
+    }
+
+    /// A worker-owned commit is outside pending_commits while it checks
+    /// fences or admits a host present. Master handoff must therefore also
+    /// be checked when this exact owner rejoins (or leaves) the queue.
+    fn advance_atomic_commit(&self, mut job: AtomicCommit, sequence: u64, epoch: u64) {
+        let may_deliver = {
+            let state = self.state.lock();
+            !state.kms_suspended
+                && state.master_epoch == epoch
+                && state.master == Some(job.owner)
+                && state.open_ids.contains(&job.owner)
+        };
+        let result = if job.cancellation.is_closed() || !may_deliver {
+            job.discard_event();
+            job.signal_scanout_error();
+            Ok(true)
+        } else {
+            self.complete_atomic(&mut job, sequence, epoch)
+        };
+        let mut state = self.state.lock();
+        if state.kms_suspended
+            || state.master_epoch != epoch
+            || state.master != Some(job.owner)
+            || !state.open_ids.contains(&job.owner)
+        {
+            release_state_blobs(&mut state, job.next);
+            drop(state);
+            // The transport retains any already-admitted present and its
+            // backing through its host fence; it must not re-enter the KMS
+            // queue or keep a new master behind an old input/host fence.
+            self.retire_atomic_commit(job, DrmError::Busy);
+            return;
+        }
+        match result {
+            Ok(false) => state.pending_commits.push_front(job),
+            Ok(true) => {
+                drop(state);
+                if let Some(completion) = job.completion {
+                    completion.complete(Ok(()));
+                }
+                self.unpin_framebuffer(job.next.active.then_some(job.next.fb));
+                self.release_commit_blobs(job.next);
+            }
+            Err(error) => {
+                // Cancel the dependent tail under the same master check.
+                // Returning this old error to the worker for a later global
+                // drain could instead cancel a newly acquired master's jobs.
+                let retired = state.take_pending_commits();
+                release_state_blobs(&mut state, job.next);
+                drop(state);
+                self.retire_atomic_commit(job, error);
+                self.retire_pending_commits(retired);
+            }
+        }
     }
 
     /// Consume a post-IRQ VirtIO display sample as one KMS-state transition.
@@ -1201,23 +1300,22 @@ impl DrmDevice {
 
 impl DrmDevice {
     fn cancel_pending_commits(&self) {
-        let commits = {
-            let mut state = self.state.lock();
-            let commits = core::mem::take(&mut state.pending_commits);
-            for job in &commits {
-                release_state_blobs(&mut state, job.next);
-            }
-            state.rebuild_atomic_tail();
-            state.poison_on_generation_overflow();
-            commits
-        };
+        let commits = self.state.lock().take_pending_commits();
+        self.retire_pending_commits(commits);
+    }
+
+    fn retire_atomic_commit(&self, job: AtomicCommit, error: DrmError) {
+        job.discard_event();
+        job.signal_scanout_error();
+        self.unpin_framebuffer(job.next.active.then_some(job.next.fb));
+        if let Some(done) = job.completion {
+            done.complete(Err(error));
+        }
+    }
+
+    fn retire_pending_commits(&self, commits: VecDeque<AtomicCommit>) {
         for job in commits {
-            job.discard_event();
-            job.signal_scanout_error();
-            self.unpin_framebuffer(job.next.active.then_some(job.next.fb));
-            if let Some(done) = job.completion {
-                done.complete(Err(DrmError::Busy));
-            }
+            self.retire_atomic_commit(job, DrmError::Busy);
         }
     }
     fn worker_failed(&self) {
@@ -1630,6 +1728,210 @@ mod tests {
     }
 
     #[test]
+    fn primary_open_cancels_queued_console_modeset_before_handoff() {
+        let device = DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
+        let console = device.open_fbdev_primary();
+        console.become_master().unwrap();
+        let state = device.state.lock();
+        let next = super::super::atomic::initial(&state.resources);
+        let generation = state.atomic_generation;
+        drop(state);
+        let completion = Fence::new(false);
+        console
+            .submit_atomic(
+                generation,
+                next,
+                None,
+                Some(123),
+                true,
+                super::super::file::AtomicSync {
+                    inputs: alloc::vec![Fence::new(false)],
+                    predecessors: Vec::new(),
+                    completion: Some(completion.clone()),
+                },
+            )
+            .unwrap();
+        assert!(!completion.is_signaled());
+        let client = device.open_primary();
+        client.require_master().unwrap();
+        assert!(completion.is_failed());
+        assert!(console.dequeue_event().is_none());
+        let state = device.state.lock();
+        assert!(state.pending_commits.is_empty());
+        assert!(state.pending_fb_pins.is_empty());
+        assert_ne!(generation, state.atomic_generation);
+    }
+
+    #[test]
+    fn popped_console_commit_cannot_rejoin_after_master_aba() {
+        let device = DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
+        let console = device.open_fbdev_primary();
+        console.become_master().unwrap();
+        let next = device.state.lock().atomic;
+        let generation = device.state.lock().atomic_generation;
+        let old_done = Fence::new(false);
+        console
+            .submit_atomic(
+                generation,
+                next,
+                None,
+                Some(1),
+                true,
+                super::super::file::AtomicSync {
+                    inputs: alloc::vec![Fence::new(false)],
+                    predecessors: Vec::new(),
+                    completion: Some(old_done.clone()),
+                },
+            )
+            .unwrap();
+        // Pause precisely after the worker takes ownership, so takeover
+        // cannot find this commit in pending_commits.
+        let (job, epoch) = {
+            let mut state = device.state.lock();
+            (
+                state.pending_commits.pop_front().unwrap(),
+                state.master_epoch,
+            )
+        };
+        let user = device.open_primary();
+        user.require_master().unwrap();
+        drop(user);
+        console.become_master().unwrap();
+        let new_done = Fence::new(false);
+        let generation = device.state.lock().atomic_generation;
+        console
+            .submit_atomic(
+                generation,
+                next,
+                None,
+                Some(2),
+                true,
+                super::super::file::AtomicSync {
+                    inputs: Vec::new(),
+                    predecessors: Vec::new(),
+                    completion: Some(new_done.clone()),
+                },
+            )
+            .unwrap();
+        device.advance_atomic_commit(job, 1, epoch);
+        assert!(old_done.is_failed());
+        assert!(!new_done.is_signaled());
+        assert_eq!(device.state.lock().pending_commits.len(), 1);
+        device.advance_vblank().unwrap();
+        assert!(new_done.is_signaled());
+        assert!(!new_done.is_failed());
+        assert!(device.state.lock().pending_commits.is_empty());
+    }
+
+    #[test]
+    fn pending_host_present_cannot_rejoin_after_worker_handoff() {
+        let _context = crate::test_support::scheduler_test_context();
+        struct HandoffAdapter {
+            device: Mutex<alloc::sync::Weak<DrmDevice>>,
+            user: Mutex<Option<super::super::DrmFile>>,
+            retained: Mutex<Option<Scanout>>,
+            fence: Arc<Fence>,
+        }
+        impl DisplayAdapter for HandoffAdapter {
+            fn create_dumb(
+                &self,
+                _: DumbRequest,
+                _: u32,
+                _: u64,
+            ) -> DrmResult<Arc<dyn GemBacking>> {
+                Ok(Arc::new(Backing))
+            }
+            fn present(&self, scanout: Scanout) -> DrmResult<Arc<Fence>> {
+                // The transport has admitted a real present but has not
+                // completed it when master changes outside the queue lock.
+                *self.retained.lock() = Some(scanout);
+                *self.user.lock() = Some(self.device.lock().upgrade().unwrap().open_primary());
+                Ok(self.fence.clone())
+            }
+        }
+        let adapter = Arc::new(HandoffAdapter {
+            device: Mutex::new(alloc::sync::Weak::new()),
+            user: Mutex::new(None),
+            retained: Mutex::new(None),
+            fence: Fence::new(false),
+        });
+        let device = DrmDevice::new(adapter.clone(), 1, 2, 3, 4);
+        *adapter.device.lock() = Arc::downgrade(&device);
+        let console = device.open_fbdev_primary();
+        console.become_master().unwrap();
+        let mode = device.preferred_mode();
+        let dumb = console
+            .create_dumb(DumbRequest {
+                width: mode.width,
+                height: mode.height,
+                bpp: 32,
+            })
+            .unwrap();
+        let fb = console
+            .add_framebuffer(dumb.handle, mode.width, mode.height, dumb.pitch, 32)
+            .unwrap();
+        let mut next = device.state.lock().atomic;
+        next.active = true;
+        next.mode = Some(mode);
+        next.fb = fb;
+        next.crtc_w = mode.width;
+        next.crtc_h = mode.height;
+        next.src_w = mode.width << 16;
+        next.src_h = mode.height << 16;
+        let done = Fence::new(false);
+        let generation = device.state.lock().atomic_generation;
+        console
+            .submit_atomic(
+                generation,
+                next,
+                Some(console.framebuffer(fb).unwrap()),
+                Some(1),
+                true,
+                super::super::file::AtomicSync {
+                    inputs: Vec::new(),
+                    predecessors: Vec::new(),
+                    completion: Some(done.clone()),
+                },
+            )
+            .unwrap();
+        device.advance_vblank().unwrap();
+        assert!(done.is_failed());
+        assert!(!adapter.fence.is_signaled());
+        assert!(adapter.retained.lock().is_some());
+        assert!(device.state.lock().pending_commits.is_empty());
+        assert!(device.state.lock().pending_fb_pins.is_empty());
+        let next = super::super::atomic::initial(&device.state.lock().resources);
+        let generation = device.state.lock().atomic_generation;
+        let new_done = Fence::new(false);
+        adapter
+            .user
+            .lock()
+            .as_ref()
+            .unwrap()
+            .submit_atomic(
+                generation,
+                next,
+                None,
+                None,
+                true,
+                super::super::file::AtomicSync {
+                    inputs: Vec::new(),
+                    predecessors: Vec::new(),
+                    completion: Some(new_done.clone()),
+                },
+            )
+            .unwrap();
+        device.advance_vblank().unwrap();
+        assert!(new_done.is_signaled());
+        assert!(!new_done.is_failed());
+        // Transport ownership ends only at host completion, independently
+        // of the cancelled KMS job and its now-released framebuffer pin.
+        adapter.fence.signal();
+        adapter.retained.lock().take();
+        adapter.user.lock().take();
+    }
+
+    #[test]
     fn connected_mode_hint_preserves_accepted_flip_completion() {
         let _context = crate::test_support::scheduler_test_context();
         struct ChangingAdapter {
@@ -1792,22 +2094,29 @@ mod tests {
             reservation_predecessors: alloc::vec![predecessor.clone()],
             scanout_fence: Some(completion.clone()),
         };
-        assert_eq!(device.complete_atomic(&mut job, 1), Ok(false));
+        let epoch = device.state.lock().master_epoch;
+        assert_eq!(device.complete_atomic(&mut job, 1, epoch), Ok(false));
         assert!(!completion.is_signaled());
         predecessor.signal_error();
-        assert_eq!(device.complete_atomic(&mut job, 2), Ok(true));
+        assert_eq!(device.complete_atomic(&mut job, 2, epoch), Ok(true));
         assert!(completion.is_signaled());
         assert!(!completion.is_failed());
 
         // The same terminal error remains fatal when explicitly supplied.
         job.input_fences.push(predecessor);
-        assert_eq!(device.complete_atomic(&mut job, 3), Err(DrmError::Busy));
+        assert_eq!(
+            device.complete_atomic(&mut job, 3, epoch),
+            Err(DrmError::Busy)
+        );
         job.input_fences.clear();
         // A failure from this job's own presentation also remains observable.
         let present = Fence::new(false);
         present.signal_error();
         job.present = Some(present);
-        assert_eq!(device.complete_atomic(&mut job, 4), Err(DrmError::Busy));
+        assert_eq!(
+            device.complete_atomic(&mut job, 4, epoch),
+            Err(DrmError::Busy)
+        );
     }
 
     #[test]
@@ -1917,7 +2226,7 @@ mod tests {
         assert!(queue.try_begin_delivery());
         queue.begin_close();
         remove_owned_framebuffers(&mut device.state.lock(), 1);
-        assert!(!device.publish_atomic(&job));
+        assert!(!device.publish_atomic(&job, 0));
         queue.end_delivery();
 
         let state = device.state.lock();

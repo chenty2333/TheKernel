@@ -94,6 +94,10 @@ struct FilesystemType {
 
 const FILESYSTEM_TYPES: &[FilesystemType] = &[
     FilesystemType {
+        name: "devpts",
+        ops: FsContextOps::Pseudo,
+    },
+    FilesystemType {
         name: "tmpfs",
         ops: FsContextOps::Pseudo,
     },
@@ -2244,7 +2248,7 @@ fn parse_tmpfs_size_component(value: &str) -> Option<u64> {
 }
 
 fn parse_tmpfs_size(data: &str) -> Option<u64> {
-    data.split(',').find_map(|option| {
+    data.rsplit(',').find_map(|option| {
         option
             .trim()
             .strip_prefix("size=")
@@ -2329,8 +2333,36 @@ fn parse_fat_mount_options_with_defaults(
     })
 }
 
-fn tmpfs_for_mount(data: &str) -> AxResult<Filesystem> {
-    MemoryFs::new_with_capacity(parse_tmpfs_size(data))
+fn tmpfs_for_mount(
+    data: &str,
+    owner: (u32, u32),
+    user_ns: &crate::task::UserNamespace,
+    mut mode: u16,
+) -> AxResult<Filesystem> {
+    let (mut uid, mut gid) = owner;
+    for option in data.split(',') {
+        let option = option.trim();
+        if let Some(value) = option.strip_prefix("mode=") {
+            mode = u16::from_str_radix(value, 8).map_err(|_| AxError::InvalidInput)?;
+            mode &= 0o7777;
+        } else if let Some(value) = option.strip_prefix("uid=") {
+            uid = user_ns
+                .make_kuid(value.parse().map_err(|_| AxError::InvalidInput)?)
+                .ok_or(AxError::InvalidInput)?
+                .into_raw();
+        } else if let Some(value) = option.strip_prefix("gid=") {
+            gid = user_ns
+                .make_kgid(value.parse().map_err(|_| AxError::InvalidInput)?)
+                .ok_or(AxError::InvalidInput)?
+                .into_raw();
+        }
+    }
+    MemoryFs::new_tmpfs(
+        NodePermission::from_bits_truncate(mode),
+        parse_tmpfs_size(data),
+        uid,
+        gid,
+    )
 }
 
 fn bind_mount_flags(
@@ -2365,10 +2397,8 @@ fn do_bind_mount(
         .lock()
         .resolve_security(source, security)?;
     if source_loc.is_dir() != target.is_dir() {
-        return Err(AxError::InvalidInput);
+        return Err(AxError::NotADirectory);
     }
-    source_loc.check_is_dir()?;
-    target.check_is_dir()?;
 
     let metadata = mounts::clone_metadata_for_bind(&source_loc)?;
     let fs = bind_filesystem_for(&source_loc, &metadata.fs_type)?;
@@ -2383,7 +2413,7 @@ fn do_bind_mount(
                 .resolve(&child.relative_path)
                 .map_err(|_| AxError::Io)?;
             let child_source = child.source;
-            if child_source.is_dir() != child_target.is_dir() || !child_source.is_dir() {
+            if child_source.is_dir() != child_target.is_dir() {
                 return Err(AxError::Io);
             }
             let child_fs = bind_filesystem_for(&child_source, &child.metadata.fs_type)?;
@@ -2424,10 +2454,25 @@ fn do_move_mount_old(
 
 fn pseudo_fs_for_mount(source: &str, fs_type: &str, data: &str) -> AxResult<Option<Filesystem>> {
     Ok(match fs_type {
+        "devpts" => Some(crate::pseudofs::dev::tty::new_devpts(
+            crate::pseudofs::dev::tty::DevPtsOptions::parse(
+                data,
+                &current().as_thread().current_user_namespace(),
+            )?,
+        )?),
         // bpffs has the normal named-dentry mechanics of an in-memory
         // filesystem; the mount metadata is its type authority and the BPF
         // object layer supplies the non-file payload/lifetime.
-        "tmpfs" | "bpf" => Some(tmpfs_for_mount(data)?),
+        "tmpfs" | "bpf" => {
+            let cred = current().as_thread().current_cred();
+            let ids = cred.ids();
+            Some(tmpfs_for_mount(
+                data,
+                (ids.fsuid.into_raw(), ids.fsgid.into_raw()),
+                &current().as_thread().current_user_namespace(),
+                if fs_type == "bpf" { 0o755 } else { 0o1777 },
+            )?)
+        }
         "hugetlbfs" => Some(crate::pseudofs::hugetlb::new_hugetlbfs(data)?),
         // A cgroup superblock is global hierarchy state, while the root
         // exposed by this mount belongs to the caller's cgroup namespace.
@@ -2443,7 +2488,9 @@ fn pseudo_fs_for_mount(source: &str, fs_type: &str, data: &str) -> AxResult<Opti
             Some(cgroup::new_cgroup_v2_for_namespace(&roots)?)
         }
         "tracefs" | "debugfs" => Some(trace::new_tracefs()),
-        "proc" => Some(crate::pseudofs::proc::new_procfs(current().as_thread().pid_ns())),
+        "proc" => Some(crate::pseudofs::proc::new_procfs(
+            current().as_thread().pid_ns(),
+        )),
         "sysfs" => Some(crate::pseudofs::sys::new_sysfs()),
         "mqueue" => Some(crate::pseudofs::mqueue::new_mqueuefs(
             current().as_thread().ipc_ns(),
@@ -2704,13 +2751,18 @@ pub fn sys_fsconfig<M: UserMemory + ?Sized>(
                 ("btrfs", "device") => {
                     append_btrfs_mount_option(&mut state.data, &key, value.as_ref())?;
                 }
-                ("tmpfs", "size") => {
+                ("tmpfs", "size" | "mode") => {
                     let value = core::str::from_utf8(value.as_bytes())
                         .map_err(|_| AxError::InvalidInput)?;
-                    if parse_tmpfs_size_component(&value).is_none() {
+                    if (key == "size" && parse_tmpfs_size_component(&value).is_none())
+                        || (key == "mode" && u16::from_str_radix(value, 8).is_err())
+                    {
                         return Err(AxError::InvalidInput);
                     }
-                    state.data = alloc::format!("size={value}");
+                    if !state.data.is_empty() {
+                        state.data.push(',');
+                    }
+                    state.data.push_str(&alloc::format!("{key}={value}"));
                 }
                 (
                     "hugetlbfs",
@@ -4566,12 +4618,16 @@ pub fn sys_mount<M: UserMemory + ?Sized>(
             }
             let bind_flags =
                 normalize_mount_atime(flags_u32, Some(current_flags)) & MS_BIND_REMOUNT_FLAGS;
+            // MS_BIND|MS_REMOUNT changes only this mount's flags. Linux
+            // ignores source/type/data, including callers' conventional
+            // source="none", and retains the mounted filesystem's options.
+            let metadata = mounts::metadata_for_location(&target)?;
             mounts::remount_with_data(
                 &target,
-                source,
-                try_string(normalized_fs)?,
+                FsPathBuf::new(),
+                String::new(),
                 bind_flags,
-                data,
+                metadata.data,
             )?;
             return Ok(0);
         }
@@ -4889,6 +4945,227 @@ mod tests {
     use crate::pseudofs::MemoryFs;
 
     #[test]
+    fn tmpfs_mount_honors_root_mode_for_unprivileged_shared_memory() {
+        let _context = crate::test_support::scheduler_test_context();
+        let ns = crate::task::UserNamespace::try_new_root().unwrap();
+        let fs = tmpfs_for_mount("size=1M,mode=1777", (100, 105), &ns, 0o1777).unwrap();
+        let root = fs.root_dir().metadata().unwrap();
+        assert_eq!((root.uid, root.gid), (100, 105));
+        assert_eq!(
+            tmpfs_for_mount("", (100, 105), &ns, 0o1777)
+                .unwrap()
+                .root_dir()
+                .metadata()
+                .unwrap()
+                .mode
+                .bits(),
+            0o1777
+        );
+        assert_eq!(fs.root_dir().metadata().unwrap().mode.bits(), 0o1777);
+        assert_eq!(
+            tmpfs_for_mount("", (100, 105), &ns, 0o755)
+                .unwrap()
+                .root_dir()
+                .metadata()
+                .unwrap()
+                .mode
+                .bits(),
+            0o755
+        );
+        let stat = fs.stat().unwrap();
+        assert_eq!(stat.blocks * u64::from(stat.block_size), 1024 * 1024);
+        let private = tmpfs_for_mount("mode=1777,mode=0700", (100, 105), &ns, 0o1777).unwrap();
+        assert_eq!(private.root_dir().metadata().unwrap().mode.bits(), 0o700);
+        assert!(matches!(
+            tmpfs_for_mount("mode=1788", (100, 105), &ns, 0o1777),
+            Err(AxError::InvalidInput)
+        ));
+        use thekernel_linux_cred::{IdMapInputExtent, Kgid, Kuid};
+        let child = ns
+            .try_fork(
+                Kuid::from_raw(100).unwrap(),
+                Kgid::from_raw(105).unwrap(),
+                false,
+            )
+            .unwrap();
+        child
+            .publish_uid_map(
+                child
+                    .try_build_uid_map(alloc::vec![IdMapInputExtent::new(0, 100, 1)])
+                    .unwrap(),
+            )
+            .unwrap();
+        child
+            .publish_gid_map(
+                child
+                    .try_build_gid_map(alloc::vec![IdMapInputExtent::new(0, 105, 1)])
+                    .unwrap(),
+                false,
+            )
+            .unwrap();
+        let mapped = tmpfs_for_mount("uid=0,gid=0,mode=0700", (0, 0), &child, 0o1777).unwrap();
+        let metadata = mapped.root_dir().metadata().unwrap();
+        assert_eq!(
+            (metadata.uid, metadata.gid, metadata.mode.bits()),
+            (100, 105, 0o700)
+        );
+        assert!(matches!(
+            tmpfs_for_mount("uid=1", (100, 105), &child, 0o1777),
+            Err(AxError::InvalidInput)
+        ));
+        assert!(matches!(
+            tmpfs_for_mount("gid=1", (100, 105), &child, 0o1777),
+            Err(AxError::InvalidInput)
+        ));
+    }
+
+    #[test]
+    fn file_bind_can_attach_move_and_unmount_without_changing_the_covered_file() {
+        let fs = MemoryFs::new().unwrap();
+        let root_mount = Mountpoint::new_root(&fs);
+        let root = root_mount.root_location();
+        let source = root
+            .create(
+                axfs_ng_vfs::FsName::new(b"source"),
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let target = root
+            .create(
+                axfs_ng_vfs::FsName::new(b"target"),
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let other = root
+            .create(
+                axfs_ng_vfs::FsName::new(b"other"),
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let bind = bind_filesystem_for(&source, "tmpfs").unwrap();
+        assert!(matches!(root.mount(&bind), Err(AxError::NotADirectory)));
+        assert!(matches!(target.mount(&fs), Err(AxError::NotADirectory)));
+        let mounted = target.mount(&bind).unwrap();
+        let visible = root
+            .lookup_no_follow(axfs_ng_vfs::FsName::new(b"target"))
+            .unwrap();
+        assert_eq!(visible.inode(), source.inode());
+        assert!(!visible.is_dir());
+        assert!(visible.is_root_of_mount());
+        assert!(matches!(
+            visible.move_mount_to(&root),
+            Err(AxError::NotADirectory)
+        ));
+        visible.move_mount_to(&other).unwrap();
+        assert_eq!(
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"target"))
+                .unwrap()
+                .inode(),
+            target.inode()
+        );
+        assert_eq!(
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"other"))
+                .unwrap()
+                .inode(),
+            source.inode()
+        );
+        mounted.root_location().lazy_unmount().unwrap();
+        assert_eq!(
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"other"))
+                .unwrap()
+                .inode(),
+            other.inode()
+        );
+        let detached = Mountpoint::new_detached(&bind).unwrap();
+        detached.attach_to(&target).unwrap();
+        assert_eq!(
+            root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"target"))
+                .unwrap()
+                .inode(),
+            source.inode()
+        );
+        detached.root_location().lazy_unmount().unwrap();
+    }
+
+    #[test]
+    fn file_bind_retains_unlinked_data_until_last_mount_drops() {
+        let _context = crate::test_support::scheduler_test_context();
+        let fs = MemoryFs::new().unwrap();
+        let root_mount = Mountpoint::new_root(&fs);
+        let root = root_mount.root_location();
+        let source = root
+            .create(
+                axfs_ng_vfs::FsName::new(b"source"),
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let alias = root
+            .link(axfs_ng_vfs::FsName::new(b"alias"), &source)
+            .unwrap();
+        let cached = axfs::CachedFile::get_or_create(source.clone());
+        cached.write_at_slice(b"hello", 0).unwrap();
+        let bind = bind_filesystem_for(&source, "tmpfs").unwrap();
+        let new_mount = || {
+            mounts::new_detached_with_flags(
+                &bind,
+                0,
+                mounts::MountMetadata::try_from_parts(
+                    FsPath::new(b"none"),
+                    "tmpfs",
+                    FsPath::new(b"/source"),
+                    "",
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let first = new_mount();
+        let second = new_mount();
+        let create_target = |name| {
+            root.create(
+                axfs_ng_vfs::FsName::new(name),
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap()
+        };
+        let a = create_target(b"a");
+        let b = create_target(b"b");
+        let c = create_target(b"c");
+        mounts::update_detached_mount_flags(&second, false, |flags| Ok(flags | MS_RDONLY)).unwrap();
+        first.attach_to(&a).unwrap();
+        second.attach_to(&b).unwrap();
+        first.root_location().move_mount_to(&c).unwrap();
+        root.unlink(axfs_ng_vfs::FsName::new(b"source"), false)
+            .unwrap();
+        assert_eq!(alias.metadata().unwrap().nlink, 1);
+        root.unlink(axfs_ng_vfs::FsName::new(b"alias"), false)
+            .unwrap();
+        axfs::mark_cached_file_unlinked(&source);
+        drop(cached);
+        first.root_location().lazy_unmount().unwrap();
+        drop(first);
+        let reopened = axfs::CachedFile::get_or_create(second.root_location());
+        let mut bytes = [0u8; 5];
+        assert_eq!(reopened.read_at_slice(&mut bytes, 0).unwrap(), 5);
+        assert_eq!(&bytes, b"hello");
+        assert_eq!(reopened.cachestat(0, 0).nr_cache, 1);
+        drop(reopened);
+        second.root_location().lazy_unmount().unwrap();
+        drop(second);
+        let after = axfs::CachedFile::get_or_create(source.clone());
+        assert_eq!(after.cachestat(0, 0).nr_cache, 0);
+        assert!(matches!(
+            axfs::CachedFileMountLease::new(&source),
+            Err(AxError::NotFound)
+        ));
+    }
+
+    #[test]
     fn bind_filesystem_forwards_export_handles_with_its_own_mount_identity() {
         let source_fs = MemoryFs::new().unwrap();
         let source_mount = Mountpoint::new_root(&source_fs);
@@ -4918,7 +5195,9 @@ mod tests {
         let bind_fs = bind_filesystem_for(&scoped, "tmpfs").unwrap();
         let bind_mount = Mountpoint::new_root(&bind_fs);
         let bind_root = bind_mount.root_location();
-        let bind_child = bind_root.lookup_no_follow(axfs_ng_vfs::FsName::new(b"child")).unwrap();
+        let bind_child = bind_root
+            .lookup_no_follow(axfs_ng_vfs::FsName::new(b"child"))
+            .unwrap();
         assert_ne!(bind_mount.mount_id(), source_mount.mount_id());
 
         let source_handle = source_mount

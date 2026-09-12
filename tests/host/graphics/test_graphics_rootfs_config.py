@@ -5,6 +5,7 @@ from __future__ import annotations
 import pathlib
 import os
 import subprocess
+import shlex
 import tempfile
 from tests.support import test_tmpdir
 from types import SimpleNamespace
@@ -158,6 +159,81 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
                 )
                 self.assertEqual(result.stdout, "unset")
 
+    def test_desktop_file_launches_preserve_relative_paths_and_browser_arguments(self) -> None:
+        with test_tmpdir() as directory:
+            root = pathlib.Path(directory)
+            home, documents = root / "home", root / "documents"
+            home.mkdir()
+            documents.mkdir()
+            recorder = root / "record"
+            recorder.write_text('#!/bin/sh\nprintf "%s\\n" "$PWD" "$@"\n')
+            recorder.chmod(0o755)
+            wrapper = self.read("overlay/q35-software-desktop/usr/local/bin/thekernel-desktop-app")
+            wrapper = wrapper.replace("export HOME=/var/lib/weston", f"export HOME={shlex.quote(str(home))}")
+            wrapper = wrapper.replace("/usr/bin/xedit", shlex.quote(str(recorder)))
+            wrapper = wrapper.replace("/usr/bin/dbus-run-session", shlex.quote(str(recorder)))
+            cookie_file = home / ".local/share/webkitgtk-4.1/MiniBrowser/cookies.sqlite"
+            browser_prefix = ["--", "/usr/bin/MiniBrowser", "--enable-sandbox", f"--cookies-file={cookie_file}"]
+            for app, arguments, expected in (
+                ("editor", ["relative file.py"], ["relative file.py"]),
+                ("browser", ["https://example.test/?a=1&b=2"],
+                    [*browser_prefix, "https://example.test/?a=1&b=2"]),
+                ("browser", [], [*browser_prefix, "about:blank"]),
+            ):
+                with self.subTest(app=app, arguments=arguments):
+                    result = subprocess.run(["sh", "-s", "--", app, *arguments], input=wrapper,
+                        cwd=documents, env={key: value for key, value in os.environ.items() if key != "XDG_DATA_HOME"},
+                        text=True, capture_output=True, check=True)
+                    self.assertEqual(result.stdout.splitlines(), [str(documents), *expected])
+                    if app == "browser":
+                        self.assertTrue(cookie_file.parent.is_dir())
+
+    def test_desktop_stop_waits_for_audio_even_when_weston_has_exited(self) -> None:
+        script = self.read("overlay/common/etc/init.d/S80weston")
+        functions = script[script.index("running() {"):script.index('case "${1:-}" in')]
+        for stuck in (False, True):
+            with self.subTest(stuck=stuck):
+                harness = '''
+set -eu
+WESTON_HOME_MOUNT=/persistent-home
+USER=weston
+PIDFILE=/unused
+remaining=2
+start-stop-daemon() {
+    case " $* " in
+        *" -t "*)
+            [ "$remaining" -gt 0 ] || return 1
+            [ "$stuck" = yes ] || remaining=$((remaining - 1))
+            return 0 ;;
+        *) echo audio-stop ;;
+    esac
+}
+sleep() { echo wait; }
+'''
+                harness += f"stuck={'yes' if stuck else 'no'}\n" + functions
+                harness += "\npid_from_file() { return 1; }\nrm() { :; }\nstop\n"
+                result = subprocess.run(["sh"], input=harness, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 1 if stuck else 0)
+                self.assertEqual(result.stdout.splitlines().count("wait"), 10 if stuck else 2)
+                self.assertIn("audio-stop", result.stdout)
+                if stuck:
+                    self.assertIn("PulseAudio did not stop", result.stderr)
+
+    def test_desktop_seeds_standard_user_directories_without_replacing_user_choices(self) -> None:
+        session = self.read("overlay/common/usr/local/bin/graphics-session")
+        setup = session[session.index("    config_dir="):session.index("    pulseaudio --start")]
+        template = GRAPHICS / "overlay/q35-software-desktop/etc/xdg/user-dirs.dirs"
+        setup = setup.replace("/etc/xdg/user-dirs.dirs", shlex.quote(str(template)))
+        with test_tmpdir() as directory:
+            config = pathlib.Path(directory) / "config"
+            env = {**os.environ, "XDG_CONFIG_HOME": str(config)}
+            subprocess.run(["sh", "-eu"], input=setup, env=env, text=True, check=True)
+            user_dirs = config / "user-dirs.dirs"
+            self.assertEqual(user_dirs.read_text(), template.read_text())
+            user_dirs.write_text('XDG_DOWNLOAD_DIR="$HOME/My Downloads"\n')
+            subprocess.run(["sh", "-eu"], input=setup, env=env, text=True, check=True)
+            self.assertEqual(user_dirs.read_text(), 'XDG_DOWNLOAD_DIR="$HOME/My Downloads"\n')
+
     def test_weston_smoke_verifies_initialized_drm_backend_and_device(self) -> None:
         smoke = self.read("overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke")
         self.assertNotIn('/environ', smoke)
@@ -225,6 +301,11 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         self.assertEqual(spec.rootfs_transport, "drive")
 
     def test_piglit_desktop_gl_contract_keeps_complete_tests_and_uses_buildroots_cli(self) -> None:
+        smoke = self.read("overlay/q35-software-desktop/etc/init.d/S90q35-weston-smoke")
+        self.assertIn(
+            "start-stop-daemon -S -x /usr/local/bin/q35-virgl-workloads -c weston",
+            smoke.splitlines(),
+        )
         piglit = self.read("overlay/q35-software-desktop/usr/local/bin/q35-piglit-quick")
         self.assertIn("runner=/usr/bin/piglit", piglit)
         self.assertIn('-p wayland -1 --timeout 60 quick "$results"', piglit)
@@ -354,33 +435,26 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         self.assertTrue(spec.gdb)
         self.assertEqual(len(spec.qmp_checkpoints), 5)
 
-    def test_virgl_headless_graphics_smoke_is_rejected_without_a_qmp_pixel_oracle(self) -> None:
+    def test_virgl_profiles_keep_the_same_full_marker_and_pixel_oracle(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")
-        args = module.build_parser().parse_args([
-            "test", "--suite", "graphics", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
-            "--screenshot", "/tmp/graphics.ppm", "--flavor", "q35-graphics-seatd",
-        ])
-        args.graphics_profile = "virgl-headless"
-        with mock.patch.object(pathlib.Path, "is_file", lambda _self: True):
-            with self.assertRaisesRegex(module.ProductError, "no QMP pixel-oracle surface"):
-                module.graphics_smoke_cmd(args)
-
-    def test_virgl_graphics_smoke_uses_the_virgl_marker_and_pixel_oracle(self) -> None:
-        module = load_script_module("thekernel_product", "tools/thekernel.py")
-        args = module.build_parser().parse_args([
-            "test", "--suite", "graphics", "--no-build", "--rootfs", "/tmp/graphics-rootfs.ext2",
-            "--screenshot", "/tmp/graphics.ppm", "--flavor", "q35-graphics-seatd",
-            "--graphics-profile", "virgl-interactive",
-        ])
-        calls: dict[str, object] = {}
-        module.run_product = lambda _artifacts, spec: calls.update(spec=spec) or 0
-        with mock.patch.object(pathlib.Path, "is_file", lambda _self: True):
-            self.assertEqual(module.graphics_smoke_cmd(args), 0)
-        spec = calls["spec"]
-        self.assertEqual(spec.stop_after_marker, "THEKERNEL_Q35_VIRGL_READY")
-        self.assertEqual(spec.qmp_screenshot_after_marker, "THEKERNEL_Q35_VIRGL_READY")
-        self.assertEqual(spec.qmp_screenshot_size, (800, 600))
-        self.assertEqual(spec.qmp_screenshot_color_blocks[0].rgb, (255, 0, 0))
+        for profile in ("virgl-interactive", "virgl-headless"):
+            with self.subTest(profile=profile):
+                args = module.build_parser().parse_args([
+                    "test", "--suite", "graphics", "--no-build", "--rootfs", "/unused/rootfs.ext2",
+                    "--screenshot", "/unused/graphics.ppm", "--flavor", "q35-graphics-seatd",
+                    "--graphics-profile", profile, "--timeout", "7200",
+                ])
+                with mock.patch.object(pathlib.Path, "is_file", return_value=True), \
+                        mock.patch.object(module, "run_product", return_value=0) as run_product:
+                    self.assertEqual(module.graphics_smoke_cmd(args), 0)
+                spec = run_product.call_args.args[1]
+                self.assertEqual(spec.stop_after_marker, "THEKERNEL_Q35_VIRGL_READY")
+                self.assertEqual(spec.qmp_screenshot_after_marker, "THEKERNEL_Q35_VIRGL_READY")
+                self.assertEqual(spec.qmp_screenshot_size, (800, 600))
+                self.assertEqual((spec.graphics_width, spec.graphics_height), (800, 600))
+                self.assertEqual(spec.qmp_screenshot_color_blocks[0].rgb, (255, 0, 0))
+                self.assertEqual(spec.qmp_timeout_secs, 7200)
+                self.assertEqual(spec.qmp_checkpoints, module._xwayland_smoke_checkpoints(pathlib.Path(args.screenshot)))
 
     def test_software_smoke_requires_completion_and_natural_shutdown(self) -> None:
         module = load_script_module("thekernel_product", "tools/thekernel.py")

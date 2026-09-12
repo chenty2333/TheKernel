@@ -7649,6 +7649,7 @@ impl AddrSpace {
             let area_end = area.end();
             let range = VirtAddrRange::new(start, area_end.min(end));
             let area_flags = area.flags();
+            let resident_before = self.pt.mapped_bytes(range.start, range.size());
             let outcome =
                 area.backend()
                     .populate(range, area_flags, access_flags, &mut self.pt.cursor());
@@ -7656,9 +7657,15 @@ impl AddrSpace {
             // A backend may have published a valid executable prefix before a
             // later page fails, so synchronize before propagating the error.
             synchronize_executable_publication(area_flags);
-            // Publish even on a partial-population error: the valid prefix is
-            // still a real resident peak and may be rolled back immediately.
-            self.publish_resident_highwater();
+            // Usercopy also visits already-resident pages. Avoid walking every
+            // VMA and PTE in the mm when this range did not gain resident pages.
+            // Check before propagating errors: a populated prefix still counts
+            // toward the peak even if a later page failed.
+            let resident_after = self.pt.mapped_bytes(range.start, range.size());
+            if !matches!((resident_before, resident_after), (Ok(before), Ok(after)) if after <= before)
+            {
+                self.publish_resident_highwater();
+            }
             result?;
             start = area_end;
             if !start.is_aligned_4k() {
@@ -10571,6 +10578,30 @@ mod tests {
         assert_eq!(aspace.merge_resident_highwater(12), 12);
         assert_eq!(aspace.merge_resident_highwater(7), 12);
         assert_eq!(aspace.merge_resident_highwater(19), 19);
+    }
+
+    #[test]
+    fn populate_preserves_resident_peak_across_retries_and_partial_failure() {
+        let start = VirtAddr::from(0x1000);
+        let mut aspace = AddrSpace::new_empty(start, TEST_SPACE_SIZE).unwrap();
+        let user = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+        aspace.map(start, PAGE_SIZE_4K * 2, user, false,
+            Backend::new_alloc(start, PageSize::Size4K)).unwrap();
+        assert_eq!(aspace.maxrss_kb.load(Ordering::Acquire), 0);
+
+        aspace.populate_area(start, PAGE_SIZE_4K, user).unwrap();
+        assert_eq!(aspace.maxrss_kb.load(Ordering::Acquire), 4);
+        aspace.populate_area(start, PAGE_SIZE_4K, user).unwrap();
+        assert_eq!(aspace.maxrss_kb.load(Ordering::Acquire), 4);
+
+        // The second page is populated before the unmapped third page fails.
+        assert_eq!(aspace.populate_area(start, PAGE_SIZE_4K * 3, user),
+            Err(AxError::NoMemory));
+        assert_eq!(aspace.resident_user_bytes(), PAGE_SIZE_4K * 2);
+        assert_eq!(aspace.maxrss_kb.load(Ordering::Acquire), 8);
+        assert!(aspace.oom_reap_private_pages());
+        assert_eq!(aspace.resident_user_bytes(), 0);
+        assert_eq!(aspace.maxrss_kb.load(Ordering::Acquire), 8);
     }
 
     #[test]

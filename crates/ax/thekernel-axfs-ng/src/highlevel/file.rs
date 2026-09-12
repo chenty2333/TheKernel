@@ -652,6 +652,7 @@ impl CachedFileIdentity {
 /// bounded scan cursor.
 struct CachedFileIdentityLease {
     object: u64,
+    discarded_unlinked: AtomicBool,
 }
 
 impl CachedFileIdentityLease {
@@ -1999,7 +2000,7 @@ fn reclaim_clean_pages_from_shared_with_scan_budget(
             stats.busy_files = stats.busy_files.saturating_add(1);
             return 0;
         };
-        let Ok(_mutation) = CachedFile::try_begin_shared_cache_invalidating_mutation(shared) else {
+        let Ok(_mutation) = CachedFile::try_begin_shared_cache_reclaim(shared) else {
             stats.busy_files = stats.busy_files.saturating_add(1);
             return 0;
         };
@@ -2830,7 +2831,9 @@ fn discard_cached_pages(shared: &Arc<CachedFileShared>) -> VfsResult<()> {
 /// live, so the request remains pending until that lease's Drop calls this
 /// helper again. Other errors remain terminal and are not silently swallowed.
 fn attempt_unlinked_cached_file_cleanup(shared: &Arc<CachedFileShared>) -> bool {
-    if !shared.unlinked.load(Ordering::Acquire) || shared.open_handles.load(Ordering::Acquire) != 0
+    if !shared.unlinked.load(Ordering::Acquire)
+        || shared.open_handles.load(Ordering::Acquire) != 0
+        || shared.mount_roots.load(Ordering::Acquire) != 0
     {
         return false;
     }
@@ -2839,6 +2842,11 @@ fn attempt_unlinked_cached_file_cleanup(shared: &Arc<CachedFileShared>) -> bool 
     // old conflict; keeping the request bit pending behind this guard lets
     // that lease-drop attempt run immediately after the earlier Busy result.
     let _cleanup_guard = shared.unlinked_cleanup_lock.lock();
+    if shared.open_handles.load(Ordering::Acquire) != 0
+        || shared.mount_roots.load(Ordering::Acquire) != 0
+    {
+        return false;
+    }
     if shared
         .unlinked_cleanup_pending
         .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
@@ -2849,6 +2857,10 @@ fn attempt_unlinked_cached_file_cleanup(shared: &Arc<CachedFileShared>) -> bool 
 
     match discard_cached_pages(shared) {
         Ok(()) => {
+            shared
+                .identity_lease
+                .discarded_unlinked
+                .store(true, Ordering::Release);
             release_cached_file_writeback_anchor_if_clean(shared);
             release_unlinked_cached_file_registry_ownership_for_shared(shared);
             true
@@ -2873,7 +2885,9 @@ fn attempt_unlinked_cached_file_cleanup(shared: &Arc<CachedFileShared>) -> bool 
 }
 
 fn request_unlinked_cached_file_cleanup(shared: &Arc<CachedFileShared>) -> bool {
-    if !shared.unlinked.load(Ordering::Acquire) || shared.open_handles.load(Ordering::Acquire) != 0
+    if !shared.unlinked.load(Ordering::Acquire)
+        || shared.open_handles.load(Ordering::Acquire) != 0
+        || shared.mount_roots.load(Ordering::Acquire) != 0
     {
         return false;
     }
@@ -3029,6 +3043,41 @@ fn try_collect_noreuse_keys<T>(
         }
     }
     Some(keys)
+}
+
+/// A file mount keeps its inode cache alive independently of open descriptors.
+/// The lease owns no Location or Filesystem, so writeback anchors cannot keep
+/// the mount alive through a cache-to-mount cycle.
+pub struct CachedFileMountLease {
+    shared: Arc<CachedFileShared>,
+}
+
+impl CachedFileMountLease {
+    pub fn new(location: &Location) -> VfsResult<Self> {
+        let shared = cached_file_shared_for_location_or_create(location);
+        {
+            let _cleanup = shared.unlinked_cleanup_lock.lock();
+            // The generation marker survives registry retirement. A bind
+            // racing the final unlink/close must not resurrect discarded data.
+            if shared
+                .identity_lease
+                .discarded_unlinked
+                .load(Ordering::Acquire)
+            {
+                return Err(VfsError::NotFound);
+            }
+            shared.mount_roots.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(Self { shared })
+    }
+}
+
+impl Drop for CachedFileMountLease {
+    fn drop(&mut self) {
+        if self.shared.mount_roots.fetch_sub(1, Ordering::AcqRel) == 1 {
+            request_unlinked_cached_file_cleanup(&self.shared);
+        }
+    }
 }
 
 /// Marks cached pages for an inode whose final directory entry is being removed.
@@ -3663,7 +3712,7 @@ impl CachedFileEvictionOwner {
     }
 }
 
-/// Immutable identity of a page whose cache residency is being retired.
+/// Immutable identity of a page whose aliases are being fenced.
 ///
 /// Listeners deliberately do not receive `PageCache`: the retained cache page
 /// remains owned by the coordinator until every alias reservation commits.
@@ -3675,15 +3724,18 @@ pub struct CachedPageEviction {
     pub page_number: u32,
     /// Physical frame still owned by the cache transaction.
     pub paddr: PhysAddr,
+    /// Keep the frame resident and its aliases read-only after writeback.
+    /// A later mapped write must fault to record the next dirty generation.
+    pub writeback_only: bool,
 }
 
 /// One prepared address-space participant in a cache eviction.
 ///
 /// Both operations are required to be allocation-free and infallible.  A
-/// reservation must leave aliases writable again when aborted, and must leave
-/// no alias of `CachedPageEviction::paddr` when committed.
+/// reservation must restore the original permissions when aborted. Commit
+/// removes aliases for eviction, or leaves them read-only for writeback.
 pub trait CachedPageEvictionReservation: Send {
-    /// Publishes the irreversible alias removal.
+    /// Publishes alias removal or the completed read-only writeback state.
     fn commit(self: Box<Self>);
 
     /// Reverses the temporary eviction fence/write protection.
@@ -4099,6 +4151,43 @@ fn begin_dirty_writeback_run(shared: &CachedFileShared, run: &DirtyWritebackRun)
     Ok(())
 }
 
+/// Fence mapped writers while their snapshot is written back. The run's
+/// writeback pins keep these exact frames resident while listener callbacks
+/// acquire address spaces without holding the page-cache lock.
+fn prepare_dirty_writeback_aliases(
+    shared: &CachedFileShared,
+    run: &DirtyWritebackRun,
+) -> VfsResult<CachedPageEvictionReservations> {
+    let listeners = evict_listeners_snapshot(shared)?;
+    let count = run
+        .pages
+        .len()
+        .checked_mul(listeners.len())
+        .ok_or(VfsError::NoMemory)?;
+    let mut reservations = CachedPageEvictionReservations::reserve(count)?;
+    if listeners.is_empty() {
+        return Ok(reservations);
+    }
+    for written in &run.pages {
+        let paddr = shared
+            .page_cache
+            .lock()
+            .peek(&written.pn)
+            .ok_or(VfsError::ResourceBusy)?
+            .paddr();
+        reservations.prepare(
+            &listeners,
+            CachedPageEviction {
+                identity: shared.registry_key,
+                page_number: written.pn,
+                paddr,
+                writeback_only: true,
+            },
+        )?;
+    }
+    Ok(reservations)
+}
+
 fn finish_dirty_writeback_run(shared: &CachedFileShared, run: &DirtyWritebackRun, success: bool) {
     let mut guard = shared.page_cache.lock();
     for written in &run.pages {
@@ -4412,6 +4501,13 @@ fn flush_dirty_page_list_locked_with_held_native_gate(
             return Err(error.into());
         }
 
+        let aliases = match prepare_dirty_writeback_aliases(shared, &run) {
+            Ok(aliases) => aliases,
+            Err(error) => {
+                finish_dirty_writeback_run(shared, &run, false);
+                return Err(error.into());
+            }
+        };
         let segments = build_dirty_writeback_segments(&run);
         let slices = segments.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let write_result = file.write_at_vectored(&slices, run.page_start);
@@ -4422,6 +4518,9 @@ fn flush_dirty_page_list_locked_with_held_native_gate(
             Ok(written) if written == run.bytes => {
                 record_dirty_writeback(range_flush, run.pages.len(), run.bytes, async_enabled);
                 finish_dirty_writeback_run(shared, &run, true);
+                // The next mapped write must fault and dirty the page again,
+                // including when it occurs after this fsync has returned.
+                aliases.commit();
             }
             Ok(_) => {
                 finish_dirty_writeback_run(shared, &run, false);
@@ -4595,6 +4694,20 @@ impl RangeCacheLeaseTable {
     }
 
     fn conflicts(candidate: RangeCacheLeaseRecord, active: RangeCacheLeaseRecord) -> bool {
+        // Extent-changing operations exclude every in-flight direct request,
+        // even when their cached-byte effects cover only a tail or one page.
+        if matches!(
+            (candidate.kind, active.kind),
+            (
+                RangeCacheLeaseKind::WholeFileMutation,
+                RangeCacheLeaseKind::DirectRead | RangeCacheLeaseKind::DirectWrite,
+            ) | (
+                RangeCacheLeaseKind::DirectRead | RangeCacheLeaseKind::DirectWrite,
+                RangeCacheLeaseKind::WholeFileMutation,
+            )
+        ) {
+            return true;
+        }
         if candidate.end <= active.start || active.end <= candidate.start {
             return false;
         }
@@ -4686,6 +4799,7 @@ struct CachedFileShared {
     /// observation cannot lose the deferred request.
     unlinked_cleanup_lock: Mutex<()>,
     open_handles: AtomicUsize,
+    mount_roots: AtomicUsize,
     user_io_pin_admission: Mutex<CachedFilePinAdmission>,
     /// Sleeping inode transaction gate.  Unlike the old spin `RwLock`, this
     /// may remain held while backing I/O waits; range leases and mutation
@@ -4887,6 +5001,7 @@ impl CachedFileShared {
             registry_key,
             Arc::new(CachedFileIdentityLease {
                 object: registry_key.object(),
+                discarded_unlinked: AtomicBool::new(false),
             }),
             in_memory,
         )
@@ -4921,6 +5036,7 @@ impl CachedFileShared {
             unlinked_cleanup_pending: AtomicBool::new(false),
             unlinked_cleanup_lock: Mutex::new(()),
             open_handles: AtomicUsize::new(0),
+            mount_roots: AtomicUsize::new(0),
             user_io_pin_admission: Mutex::new(CachedFilePinAdmission::default()),
             direct_io_lock: SleepingMutex::new(()),
             writeback_lock: RwLock::new(()),
@@ -5117,7 +5233,7 @@ impl CachedPageInvalidationTransaction {
         }
         if keys
             .iter()
-            .any(|pn| cache.get(pn).is_some_and(PageCache::is_pinned))
+            .any(|pn| cache.peek(pn).is_some_and(PageCache::is_pinned))
         {
             return Err(VfsError::ResourceBusy);
         }
@@ -5149,8 +5265,8 @@ impl CachedPageInvalidationTransaction {
     fn stage_page_for_pageout(&mut self, pn: u32) -> VfsResult<bool> {
         debug_assert_eq!(self.kind, CachedPageTransactionKind::Pageout);
         self.listeners = evict_listeners_snapshot(&self.shared)?;
-        let mut cache = self.shared.page_cache.lock();
-        let Some(page) = cache.get(&pn) else {
+        let cache = self.shared.page_cache.lock();
+        let Some(page) = cache.peek(&pn) else {
             return Ok(false);
         };
         if page.is_pinned() || page.is_writeback() {
@@ -5176,7 +5292,7 @@ impl CachedPageInvalidationTransaction {
         // The transaction's mutation guard excludes conflicting cache
         // invalidation; still revalidate this page after releasing the lock
         // for the shadow reservation so a benign miss leaves no stale token.
-        let Some(page) = cache.get(&pn) else {
+        let Some(page) = cache.peek(&pn) else {
             return Ok(false);
         };
         if page.is_pinned() || page.is_writeback() {
@@ -5207,7 +5323,7 @@ impl CachedPageInvalidationTransaction {
         }
         if keys
             .iter()
-            .any(|pn| cache.get(pn).is_some_and(PageCache::is_pinned))
+            .any(|pn| cache.peek(pn).is_some_and(PageCache::is_pinned))
         {
             return Err(VfsError::ResourceBusy);
         }
@@ -5247,6 +5363,7 @@ impl CachedPageInvalidationTransaction {
                     identity: self.shared.registry_key,
                     page_number: *pn,
                     paddr: page.paddr(),
+                    writeback_only: false,
                 },
             )?;
         }
@@ -5793,7 +5910,10 @@ impl FileUserData {
                 next.checked_add(1)
             })
             .expect("cached file identity generation exhausted");
-        let identity_lease = Arc::new(CachedFileIdentityLease { object });
+        let identity_lease = Arc::new(CachedFileIdentityLease {
+            object,
+            discarded_unlinked: AtomicBool::new(false),
+        });
         let object_key = location.object_key();
         let registry_key = CachedFileIdentity {
             device: object_key.filesystem,
@@ -6310,9 +6430,16 @@ impl CachedFile {
     fn begin_shared_cache_invalidating_mutation(
         shared: &Arc<CachedFileShared>,
     ) -> VfsResult<CachedFileMutationGuard> {
+        Self::begin_shared_cache_invalidating_range(shared, 0..u64::MAX)
+    }
+
+    fn begin_shared_cache_invalidating_range(
+        shared: &Arc<CachedFileShared>,
+        range: Range<u64>,
+    ) -> VfsResult<CachedFileMutationGuard> {
         let range_lease = Some(CachedFileShared::try_range_cache_lease(
             shared,
-            0..u64::MAX,
+            range,
             RangeCacheLeaseKind::WholeFileMutation,
         )?);
         let mut admission = shared.user_io_pin_admission.lock();
@@ -6327,14 +6454,13 @@ impl CachedFile {
         })
     }
 
-    fn try_begin_shared_cache_invalidating_mutation(
+    /// Admit the pressure scan while its caller holds `direct_io_lock`.
+    /// Precise pins protect their individual pages, which the scan skips.
+    /// A whole-file range lease would unnecessarily prevent reclaiming every
+    /// other page for the entire lifetime of one registered user buffer.
+    fn try_begin_shared_cache_reclaim(
         shared: &Arc<CachedFileShared>,
     ) -> VfsResult<CachedFileMutationGuard> {
-        let range_lease = Some(CachedFileShared::try_range_cache_lease(
-            shared,
-            0..u64::MAX,
-            RangeCacheLeaseKind::WholeFileMutation,
-        )?);
         let Some(mut admission) = shared.user_io_pin_admission.try_lock() else {
             return Err(VfsError::ResourceBusy);
         };
@@ -6345,7 +6471,7 @@ impl CachedFile {
         drop(admission);
         Ok(CachedFileMutationGuard {
             shared: shared.clone(),
-            _range_lease: range_lease,
+            _range_lease: None,
         })
     }
 
@@ -6432,6 +6558,7 @@ impl CachedFile {
                 identity: self.identity(),
                 page_number: pn,
                 paddr: page.paddr(),
+                writeback_only: false,
             },
         )?;
         let _ = writeback_cached_page_data(file, pn, page)?;
@@ -6820,21 +6947,32 @@ impl CachedFile {
             return Ok(false);
         }
         let native_mutation = begin_source_location_writeback_mutation(&self.inner)?;
-        let mutation = match self.begin_cache_invalidating_mutation() {
-            Ok(mutation) => mutation,
-            Err(VfsError::ResourceBusy) => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        let candidate = {
+        let _direct_guard = self.shared.direct_io_lock.lock();
+        let (candidate, writeback_pending) = {
             let cache = self.shared.page_cache.lock();
-            cache
-                .iter()
-                .rev()
-                .find_map(|(pn, page)| (!page.is_pinned() && !page.is_writeback()).then_some(*pn))
+            (
+                cache.iter().rev().find_map(|(pn, page)| {
+                    (!page.is_pinned() && !page.is_writeback()).then_some(*pn)
+                }),
+                cache.iter().any(|(_, page)| page.is_writeback()),
+            )
         };
         let Some(pn) = candidate else {
-            return Ok(false);
+            // A writeback pin is temporary. Faults must retry outside their
+            // address-space lock instead of treating it as exhausted memory.
+            return if writeback_pending {
+                Err(VfsError::ResourceBusy)
+            } else {
+                Ok(false)
+            };
         };
+        // A retained pin on another page must not turn this fault into an
+        // endless Busy retry. Fence only the chosen cached page, while still
+        // excluding direct requests and short cache users during admission.
+        let mutation = Self::begin_shared_cache_invalidating_range(
+            &self.shared,
+            page_range(u64::from(pn), 1),
+        )?;
         let file = self.inner.entry().as_file()?;
         let mut invalidation = CachedPageInvalidationTransaction::new_pageout(&mutation);
         if !invalidation.stage_page_for_pageout(pn)? {
@@ -7600,6 +7738,40 @@ impl CachedFile {
         Ok(evicted)
     }
 
+    /// Observes residency without accessing page data or waiting for writeback.
+    pub fn is_page_cached(&self, pn: u32) -> bool {
+        self.shared.page_cache.lock().contains(&pn)
+    }
+
+    /// Accesses a cached page without waiting for writeback. Callers holding an
+    /// address-space lock must release it before retrying `ResourceBusy`.
+    /// A missing page is passed to the callback as `None`; a busy page never is.
+    pub fn try_with_page<R>(
+        &self,
+        pn: u32,
+        f: impl FnOnce(Option<&mut PageCache>) -> R,
+    ) -> VfsResult<R> {
+        let _range_lease = CachedFileShared::try_range_cache_lease(
+            &self.shared,
+            page_range(u64::from(pn), 1),
+            RangeCacheLeaseKind::CachedWrite,
+        )?;
+        let mut guard = self.shared.page_cache.lock();
+        if guard.get(&pn).is_some_and(PageCache::is_writeback) {
+            return Err(VfsError::ResourceBusy);
+        }
+        if let Some(page) = guard.get_mut(&pn) {
+            file_cache_record_page_reference(page);
+        }
+        let result = f(guard.get_mut(&pn));
+        let dirty = guard.get(&pn).is_some_and(PageCache::is_dirty);
+        drop(guard);
+        if dirty {
+            retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
+        }
+        Ok(result)
+    }
+
     /// Invokes `f` with the cached page at `pn`, or `None` if it is not cached.
     pub fn with_page<R>(&self, pn: u32, f: impl FnOnce(Option<&mut PageCache>) -> R) -> R {
         let mut f = Some(f);
@@ -7744,37 +7916,32 @@ impl CachedFile {
             page_range(u64::from(pn), 1),
             RangeCacheLeaseKind::CachedWrite,
         )?;
-        let mut f = Some(f);
-        loop {
-            let mut guard = self.shared.page_cache.lock();
-            if !guard.contains(&pn) && guard.len() == guard.cap().get() {
-                return Err(VfsError::ResourceBusy);
-            }
-            let _evicted = self.ensure_page_cached_with_window(
-                self.inner.entry().as_file()?,
-                &mut guard,
-                pn,
-                true,
-                false,
-                readahead_pages.max(1),
-            )?;
-            debug_assert!(
-                _evicted.is_none(),
-                "no-reclaim cache insertion must not evict while an address space is locked"
-            );
-            if guard.get(&pn).is_some_and(PageCache::is_writeback) {
-                drop(guard);
-                wait_for_page_writeback_clear(&self.shared, pn);
-                continue;
-            }
-            let result = f.take().unwrap()(guard.get_mut(&pn).unwrap());
-            let dirty = guard.get(&pn).is_some_and(PageCache::is_dirty);
-            drop(guard);
-            if dirty {
-                retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
-            }
-            return result;
+        let mut guard = self.shared.page_cache.lock();
+        if !guard.contains(&pn) && guard.len() == guard.cap().get() {
+            return Err(VfsError::ResourceBusy);
         }
+        let _evicted = self.ensure_page_cached_with_window(
+            self.inner.entry().as_file()?,
+            &mut guard,
+            pn,
+            true,
+            false,
+            readahead_pages.max(1),
+        )?;
+        debug_assert!(
+            _evicted.is_none(),
+            "no-reclaim cache insertion must not evict while an address space is locked"
+        );
+        if guard.get(&pn).is_some_and(PageCache::is_writeback) {
+            return Err(VfsError::ResourceBusy);
+        }
+        let result = f(guard.get_mut(&pn).unwrap());
+        let dirty = guard.get(&pn).is_some_and(PageCache::is_dirty);
+        drop(guard);
+        if dirty {
+            retain_cached_file_writeback_anchor_if_dirty(&self.inner, &self.shared);
+        }
+        result
     }
 
     /// Runs `f` while direct I/O is excluded from this inode's page cache.
@@ -8511,10 +8678,13 @@ impl CachedFile {
         wait_for_all_writeback_clear(&self.shared);
         let file = self.inner.entry().as_file()?;
         let old_len = file.len()?;
-        // Length changes can relocate, allocate, or release extents even when
-        // no cached page is currently discarded. Keep the whole-file mutation
-        // token through the lower operation in both directions.
-        let mutation = self.begin_cache_invalidating_mutation()?;
+        // Keep direct extent requests excluded through the lower operation.
+        // Precise cache pins wholly before the changed tail remain valid.
+        let changed_page = old_len.min(len) / PAGE_SIZE as u64;
+        let mutation = Self::begin_shared_cache_invalidating_range(
+            &self.shared,
+            changed_page * PAGE_SIZE as u64..u64::MAX,
+        )?;
         self.admit_truncate(old_len, len)?;
         let partial_page = (old_len > len && len % PAGE_SIZE as u64 != 0)
             .then_some((len / PAGE_SIZE as u64) as u32);
@@ -9644,10 +9814,10 @@ fn prepare_direct_owned_io_coherency(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum FadviseReadahead {
-    Normal = 0,
-    Random = 1,
+    Normal     = 0,
+    Random     = 1,
     Sequential = 2,
-    NoReuse = 3,
+    NoReuse    = 3,
 }
 
 const FADVISE_RANDOM: u8 = 1 << 0;
@@ -12581,7 +12751,6 @@ mod tests {
         validate_pinned_physical_segments, with_cache_invalidating_file_operation_after_preflight,
         with_sync_and_invalidate_cached_file_pages,
     };
-
     #[cfg(feature = "ext4")]
     use super::{PhysicalIoEffect, PhysicalIoResetProof};
 
@@ -12939,6 +13108,7 @@ mod tests {
     fn physical_preflight_rejects_before_cache_mutation_or_operation() {
         let (cached, location, state) = cached_append_test_file(PAGE_SIZE as u64);
         seed_cached_page(&cached, 0, 0x5a, true);
+        let reads_before = state.read_calls.load(Ordering::Acquire);
         let preflight_calls = AtomicUsize::new(0);
         let operation_calls = AtomicUsize::new(0);
         let result = with_cache_invalidating_file_operation_after_preflight(
@@ -12955,7 +13125,7 @@ mod tests {
         assert!(matches!(result, Ok(None)));
         assert_eq!(preflight_calls.load(Ordering::Acquire), 1);
         assert_eq!(operation_calls.load(Ordering::Acquire), 0);
-        assert_eq!(state.read_calls.load(Ordering::Acquire), 0);
+        assert_eq!(state.read_calls.load(Ordering::Acquire), reads_before);
         assert_eq!(state.write_calls.load(Ordering::Acquire), 0);
         cached.with_page(0, |page| {
             let page = page.expect("preflight rejection discarded a cached page");
@@ -13318,6 +13488,26 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_contention_preserves_pages_and_retries_after_reader_releases() {
+        let (cached, location, _) = cached_append_test_file((2 * PAGE_SIZE) as u64);
+        cached
+            .with_page_or_insert_without_reclaim(0, |page| {
+                page.data()[0] = 0x5a;
+                Ok(())
+            })
+            .unwrap();
+        let reader = cached.begin_cache_user().unwrap();
+        assert_eq!(cached.reclaim_one(), Err(VfsError::ResourceBusy));
+        cached.with_page(0, |page| assert_eq!(page.unwrap().data()[0], 0x5a));
+        drop(reader);
+        assert_eq!(cached.reclaim_one(), Ok(true));
+        cached.with_page(0, |page| assert!(page.is_none()));
+        assert_eq!(cached.reclaim_one(), Ok(false));
+        mark_cached_file_unlinked(&location);
+        drop(cached);
+    }
+
+    #[test]
     fn ordinary_cache_still_requires_reclaim_at_its_bounded_capacity() {
         let (cached, location, _) = cached_append_test_file(64 * 1024 * 1024);
         assert!(!cached.in_memory());
@@ -13387,6 +13577,7 @@ mod tests {
     #[test]
     fn pageout_writes_back_then_evicts_each_resident_page() {
         let (cached, _location, state) = cached_append_test_file(2 * PAGE_SIZE as u64);
+        state.full_page_io.store(true, Ordering::Release);
         seed_cached_page(&cached, 0, 0x31, true);
         seed_cached_page(&cached, 1, 0x32, false);
         let notifications = Arc::new(AtomicUsize::new(0));
@@ -13425,7 +13616,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(cached.pageout_pages(0..1), Err(VfsError::ResourceBusy));
-        assert_eq!(state.write_calls.load(Ordering::Acquire), 1);
+        // Alias preparation must succeed before any backing write starts.
+        assert_eq!(state.write_calls.load(Ordering::Acquire), 0);
         assert_eq!(cached.cachestat(0, 0).nr_cache, 1);
         assert_eq!(cached.cachestat(0, 0).nr_dirty, 1);
         assert_eq!(cached.cachestat(0, 0).nr_evicted, 0);
@@ -13467,6 +13659,7 @@ mod tests {
             assert_eq!(cached.shared.page_cache.lock().peek_lru().unwrap().0, &1);
         }
 
+        drop(mutation);
         cached.with_page(0, |page| {
             let page = page.unwrap();
             assert_eq!(page.paddr(), original_paddr);
@@ -13552,15 +13745,17 @@ mod tests {
 
     #[test]
     fn range_sg_completion_error_arrives_with_its_errseq_already_published() {
-        let (cached, location, state) = cached_append_test_file(PAGE_SIZE as u64);
+        // The SG path admits at least two adjacent complete pages.
+        let (cached, location, state) = cached_append_test_file(2 * PAGE_SIZE as u64);
         seed_cached_page(&cached, 0, 0x5a, true);
+        seed_cached_page(&cached, 1, 0x5b, true);
         let writeback_errors = location.writeback_error_state().unwrap();
         let mut cursor = writeback_errors.sample();
 
         state.async_write_mode.store(2, Ordering::Release);
         axdriver::set_virtio_async_block_enabled(true);
         super::set_async_dirty_flush_sg_enabled(true);
-        let result = cached.sync_range_marked(0, PAGE_SIZE as u64, true);
+        let result = cached.sync_range_marked(0, 2 * PAGE_SIZE as u64, true);
         super::set_async_dirty_flush_sg_enabled(false);
         axdriver::set_virtio_async_block_enabled(false);
 
@@ -13641,6 +13836,43 @@ mod tests {
     }
 
     #[test]
+    fn fault_reclaim_can_progress_past_a_retained_precise_pin() {
+        let (cached, _location, _state) = cached_append_test_file(2 * PAGE_SIZE as u64);
+        let pinned = seed_cached_page(&cached, 0, 0x11, false);
+        seed_cached_page(&cached, 1, 0x22, false);
+        let pin = cached.pin_cached_page_by_paddr(0, pinned, false).unwrap();
+        assert_eq!(cached.reclaim_one(), Ok(true));
+        assert!(cached.shared.page_cache.lock().contains(&0));
+        assert!(!cached.shared.page_cache.lock().contains(&1));
+        assert_eq!(cached.reclaim_one(), Ok(false));
+        drop(pin);
+        assert_eq!(cached.reclaim_one(), Ok(true));
+    }
+
+    #[test]
+    fn fault_reclaim_retries_when_writeback_is_the_only_resident_page() {
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x33, false);
+        cached
+            .shared
+            .page_cache
+            .lock()
+            .get_mut(&0)
+            .unwrap()
+            .begin_writeback()
+            .unwrap();
+        assert_eq!(cached.reclaim_one(), Err(VfsError::ResourceBusy));
+        cached
+            .shared
+            .page_cache
+            .lock()
+            .get_mut(&0)
+            .unwrap()
+            .end_writeback();
+        assert_eq!(cached.reclaim_one(), Ok(true));
+    }
+
+    #[test]
     fn pressure_reclaim_records_a_shadow_and_refault_consumes_it() {
         let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
         seed_cached_page(&cached, 0, 0x33, false);
@@ -13651,7 +13883,9 @@ mod tests {
             1
         );
         assert_eq!(cached.cachestat(0, 0).nr_evicted, 1);
-        assert_eq!(cached.cachestat(0, 0).nr_recently_evicted, 0);
+        // No later eviction has advanced the nonresident age, so this
+        // shadow is recent even when the resident working set is empty.
+        assert_eq!(cached.cachestat(0, 0).nr_recently_evicted, 1);
 
         seed_cached_page(&cached, 0, 0x34, false);
         assert_eq!(cached.cachestat(0, 0).nr_evicted, 0);
@@ -13809,6 +14043,45 @@ mod tests {
             managed
         );
         assert_eq!(super::file_cache_shadow_budget(), budget);
+    }
+
+    #[test]
+    fn mmap_cache_access_retries_writeback_without_calling_callbacks() {
+        let (cached, _location, _state) = cached_append_test_file(PAGE_SIZE as u64);
+        seed_cached_page(&cached, 0, 0x37, true);
+        let run = super::DirtyWritebackRun {
+            page_start: 0,
+            bytes: PAGE_SIZE,
+            pages: vec![super::DirtyWritebackPage {
+                pn: 0,
+                data: vec![0x37; PAGE_SIZE],
+            }],
+        };
+        begin_dirty_writeback_run(&cached.shared, &run).unwrap();
+        assert!(cached.is_page_cached(0));
+        assert!(!cached.is_page_cached(1));
+        assert_eq!(
+            cached.try_with_page(0, |_| panic!("busy callback")),
+            Err::<(), _>(VfsError::ResourceBusy)
+        );
+        assert_eq!(
+            cached.with_page_or_insert_without_reclaim_with_readahead(0, 1, |_| panic!(
+                "busy fault callback"
+            )),
+            Err::<(), _>(VfsError::ResourceBusy)
+        );
+        assert_eq!(cached.try_with_page(1, |page| page.is_none()), Ok(true));
+        finish_dirty_writeback_run(&cached.shared, &run, false);
+        assert_eq!(
+            cached.try_with_page(0, |page| page.unwrap().is_dirty()),
+            Ok(true)
+        );
+        assert_eq!(
+            cached.with_page_or_insert_without_reclaim_with_readahead(0, 1, |page| Ok(
+                page.is_dirty()
+            )),
+            Ok(true)
+        );
     }
 
     #[test]
@@ -14561,6 +14834,7 @@ mod tests {
                 .and_then(|()| invalidation.prepare_evictions())
         };
         assert_eq!(result, Err(VfsError::ResourceBusy));
+        drop(mutation);
         cached.with_page(0, |page| {
             let page = page.expect("listener contention must restore the staged page");
             assert_eq!(page.paddr(), original_paddr);
@@ -14569,7 +14843,6 @@ mod tests {
         });
         assert!(state.write_offsets.lock().is_empty());
         assert_eq!(state.set_len_calls.load(Ordering::Acquire), 0);
-        drop(mutation);
 
         unsafe { cached.remove_evict_listener(handle) };
     }
@@ -14586,6 +14859,7 @@ mod tests {
             invalidation.writeback(location.entry().as_file().unwrap(), false)
         };
         assert_eq!(result, Err(VfsError::Io));
+        drop(mutation);
         cached.with_page(0, |page| {
             let page = page.expect("short writeback must restore the staged page");
             assert_eq!(page.paddr(), original_paddr);
@@ -14633,6 +14907,28 @@ mod tests {
         cached.with_page(0, |page| assert!(page.is_some()));
         cached.with_page(2, |page| assert!(page.is_none()));
         drop(pin);
+    }
+
+    #[test]
+    fn cached_shrink_still_excludes_direct_io_on_preserved_bytes() {
+        let (cached, _location, state) = cached_append_test_file(3 * PAGE_SIZE as u64);
+        for kind in [
+            RangeCacheLeaseKind::DirectRead,
+            RangeCacheLeaseKind::DirectWrite,
+        ] {
+            let lease =
+                CachedFileShared::try_range_cache_lease(&cached.shared, 0..PAGE_SIZE as u64, kind)
+                    .unwrap();
+            assert_eq!(
+                cached.set_len(2 * PAGE_SIZE as u64),
+                Err(VfsError::ResourceBusy)
+            );
+            assert_eq!(state.set_len_calls.load(Ordering::Acquire), 0);
+            assert!(lease.revalidate());
+            drop(lease);
+        }
+        cached.set_len(2 * PAGE_SIZE as u64).unwrap();
+        assert_eq!(state.set_len_calls.load(Ordering::Acquire), 1);
     }
 
     #[test]

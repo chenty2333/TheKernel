@@ -6,12 +6,20 @@ set -eu
 runner=/usr/bin/piglit
 [ -x "$runner" ] || { echo 'THEKERNEL_Q35_VIRGL_PIGLIT_READY state=FAIL reason=piglit'; exit 1; }
 command -v wflinfo >/dev/null || { echo 'THEKERNEL_Q35_VIRGL_PIGLIT_READY state=FAIL reason=waffle'; exit 1; }
+if [ ! -w /dev/shm ]; then
+    ls -ld /dev/shm
+    id
+    echo 'THEKERNEL_Q35_VIRGL_PIGLIT_READY state=FAIL reason=shared_memory_permissions'
+    exit 1
+fi
 
 results=/tmp/thekernel-piglit-quick
 rm -rf "$results"
 mkdir -p "$results"
 MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu "$runner" run \
     -p wayland -1 --timeout 60 quick "$results" || {
+    ls -ld /dev/shm
+    id
     echo 'THEKERNEL_Q35_VIRGL_PIGLIT_READY state=FAIL reason=piglit_quick'
     exit 1
 }

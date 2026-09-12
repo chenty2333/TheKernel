@@ -207,6 +207,7 @@ class RunConfig:
     graphics_profile: GraphicsProfile = "headless"
     graphics_width: int = 800
     graphics_height: int = 600
+    audio_backend: str | None = None
     qmp: QmpControls = QmpControls()
     extra_args: tuple[str, ...] = ()
     ovmf_code: Path | None = None
@@ -523,6 +524,8 @@ def run(
         )
     planned_outputs.append(("log", config.log_path))
     planned_outputs.append(("kernel log", workdir / "kernel.log"))
+    if config.audio_backend == "wav":
+        planned_outputs.append(("WAV audio", workdir / "audio.wav"))
     if qmp_socket is not None:
         planned_outputs.append(("QMP socket", qmp_socket))
     if screenshot is not None:
@@ -535,6 +538,7 @@ def run(
     )
     log_path = resolved_outputs["log"]
     diagnostic_log_path = resolved_outputs["kernel log"]
+    audio_path = resolved_outputs.get("WAV audio")
 
     workdir.mkdir(parents=True, exist_ok=True)
     if qmp_socket is not None:
@@ -620,6 +624,8 @@ def run(
             graphics_profile=config.graphics_profile,
             graphics_width=config.graphics_width,
             graphics_height=config.graphics_height,
+            audio_backend=config.audio_backend,
+            audio_path=audio_path,
             qmp_socket=qmp_socket,
             diagnostic_log_path=diagnostic_log_path,
             extra_args=_initrd_args_with_path(config.extra_args, qemu_initrd) + (("-S",) if pinning else ()),
@@ -630,6 +636,8 @@ def run(
         # Start each run with an empty diagnostic sink, even if launch fails.
         try:
             diagnostic_log_path.write_bytes(b"")
+            if audio_path is not None:
+                audio_path.unlink(missing_ok=True)
         except OSError as error:
             raise RunnerError(f"could not prepare kernel log {diagnostic_log_path}: {error}") from error
 

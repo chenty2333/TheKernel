@@ -19,9 +19,10 @@ STATE_DIR ?= $(HOME)/.cache/thekernel-targets
 CARGO_JOBS ?= 2
 SUITE ?= host
 RUN_ARGS ?=
-# Every build-capable entry point shares the same host memory budget.
+# The desktop also builds WebKit, whose compiler needs a larger host budget.
+SCOPE_MEMORY ?= 8G
 RESOURCE_SCOPE = systemd-run --user --scope --quiet --collect \
-	-p MemoryMax=8G -p MemorySwapMax=0 -p OOMPolicy=stop
+	-p MemoryMax=$(SCOPE_MEMORY) -p MemorySwapMax=0 -p OOMPolicy=stop
 
 .PHONY: run run-gui run-existing build lint test bench clean docker-clean
 
@@ -36,6 +37,8 @@ run:
 run-existing:
 	$(MAKE) run RUN_ARGS="--no-build $(RUN_ARGS)"
 
+run-gui: MEMORY = 2G
+run-gui: SCOPE_MEMORY = 16G
 run-gui:
 	$(RESOURCE_SCOPE) \
 		env CARGO_BUILD_JOBS=$(CARGO_JOBS) \

@@ -2948,6 +2948,16 @@ impl NetlinkSocket {
     ) -> AxResult {
         self.require_net_admin(actor)?;
         let (ifindex, address) = self.parse_address(payload)?;
+        let message = read_unaligned::<IfAddrMsg>(payload)?;
+        let service = permit.route_service().ok_or(AxError::BadState)?;
+        let interface = service
+            .interfaces()?
+            .into_iter()
+            .find(|entry| entry.index == ifindex)
+            .ok_or(AxError::NoSuchDevice)?;
+        if message.ifa_scope == RT_SCOPE_HOST && interface.kind != InterfaceKind::Loopback {
+            return Err(AxError::OperationNotSupported);
+        }
         permit
             .route_service()
             .ok_or(AxError::BadState)?
@@ -2980,7 +2990,7 @@ impl NetlinkSocket {
     ) -> AxResult {
         self.require_net_admin(actor)?;
         if flags & NLM_F_CREATE == 0 {
-            return Err(AxError::AlreadyExists);
+            return self.set_link(permit, payload, actor);
         }
         let (name, peer_name) = self.parse_veth_create(payload)?;
         permit
@@ -3004,7 +3014,7 @@ impl NetlinkSocket {
         let interface = permit
             .route_service()
             .ok_or(AxError::BadState)?
-            .interfaces()
+            .interfaces()?
             .into_iter()
             .find(|entry| entry.index == message.ifi_index as u32)
             .ok_or(AxError::NoSuchDevice)?;
@@ -3115,8 +3125,8 @@ impl NetlinkSocket {
         let message = read_unaligned::<IfAddrMsg>(payload)?;
         if !matches!(message.ifa_family as u32, family if family == AF_INET || family == AF_INET6)
             || message.ifa_index == 0
-            || message.ifa_flags != 0
-            || message.ifa_scope != RT_SCOPE_UNIVERSE
+            || message.ifa_flags & !IFA_F_PERMANENT != 0
+            || !matches!(message.ifa_scope, RT_SCOPE_UNIVERSE | RT_SCOPE_HOST)
         {
             return Err(AxError::OperationNotSupported);
         }
@@ -3255,7 +3265,7 @@ impl NetlinkSocket {
         let interface = permit
             .route_service()
             .ok_or(AxError::BadState)?
-            .interfaces()
+            .interfaces()?
             .into_iter()
             .find(|interface| interface.index == ifindex)
             .ok_or(AxError::NoSuchDevice)?;
@@ -3288,7 +3298,7 @@ impl NetlinkSocket {
         let interfaces = permit
             .route_service()
             .ok_or(AxError::BadState)?
-            .interfaces();
+            .interfaces()?;
         for interface in interfaces {
             for entry in address_entries(&interface) {
                 if let Some(filter) = filter
@@ -3349,7 +3359,7 @@ impl NetlinkSocket {
         let interfaces = permit
             .route_service()
             .ok_or(AxError::BadState)?
-            .interfaces();
+            .interfaces()?;
         for interface in interfaces {
             let link = link_entry(interface);
             if let Some(filter) = filter
@@ -4571,12 +4581,7 @@ mod tests {
     use axsync::Mutex;
     use memory_addr::{PAGE_SIZE_4K, VirtAddr};
 
-    use super::{
-        NETLINK_KOBJECT_UEVENT, NETLINK_MAX_MESSAGE_BYTES, NETLINK_NO_ENOBUFS, NETLINK_ROUTE,
-        NetlinkSocket, NlMsgHdr, RTM_GETLINK, SockaddrNl, emit_init_net_kobject_uevent,
-        emit_kobject_uevent, kobject_uevent_socket_is_registered, register_init_network_namespace,
-        write_struct,
-    };
+    use super::*;
     use crate::{
         mm::{AddrSpace, Backend, UserMemoryCapability, UserPtr},
         task::{Cred, Kgid, Kuid, NetworkNamespace, UserNamespace},
@@ -4755,6 +4760,121 @@ mod tests {
         assert_eq!(LinuxError::from(error), LinuxError::EINVAL);
         assert_eq!(source.remaining, 0);
         assert_eq!(source.reads, 1);
+    }
+
+    #[test]
+    fn bubblewrap_configures_only_its_new_network_namespace() {
+        use axnet::{RecvOptions, SendOptions, SocketAddrEx, SocketOps, udp::UdpSocket};
+        let _context = crate::test_support::scheduler_test_context();
+        let owner = UserNamespace::try_new_root().unwrap();
+        let namespace = NetworkNamespace::try_new_network_namespace(owner.clone()).unwrap();
+        let other = NetworkNamespace::try_new_network_namespace(owner).unwrap();
+        let socket = NetlinkSocket::try_new(0, namespace.clone()).unwrap();
+        socket.bind(123, 0).unwrap();
+        let actor = socket_owner_credential(&socket);
+        let initial = namespace.stack().interfaces();
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].addresses.is_empty());
+        assert!(!initial[0].administrative_up);
+        assert!(namespace.stack().routes().is_empty());
+        let index = initial[0].index;
+        let send = |kind, flags, payload: Vec<u8>| {
+            let header = NlMsgHdr {
+                nlmsg_len: (size_of::<NlMsgHdr>() + payload.len()) as u32,
+                nlmsg_type: kind,
+                nlmsg_flags: flags | 1 /* NLM_F_REQUEST */ | NLM_F_ACK,
+                nlmsg_seq: 7,
+                nlmsg_pid: 123,
+            };
+            let mut message = payload_with(&header);
+            message.extend_from_slice(&payload);
+            socket
+                .write_with_actor(&mut &message[..], &actor, 123)
+                .unwrap();
+            let mut reply = [0; 128];
+            socket
+                .recv_with_nonblocking(&mut &mut reply[..], RecvFlags::empty(), true)
+                .unwrap();
+            let hdr = read_unaligned::<NlMsgHdr>(&reply).unwrap();
+            assert_eq!(hdr.nlmsg_type, NLMSG_ERROR);
+            assert_eq!(hdr.nlmsg_pid, 123);
+            assert_eq!(hdr.nlmsg_seq, 7);
+            read_unaligned::<NlMsgErr>(&reply[size_of::<NlMsgHdr>()..])
+                .unwrap()
+                .error
+        };
+        let mut address = payload_with(&IfAddrMsg {
+            ifa_family: AF_INET as u8,
+            ifa_prefixlen: 8,
+            ifa_flags: IFA_F_PERMANENT,
+            ifa_scope: RT_SCOPE_HOST,
+            ifa_index: index,
+        });
+        push_attr(&mut address, IFA_LOCAL, &[127, 0, 0, 1]);
+        push_attr(&mut address, IFA_ADDRESS, &[127, 0, 0, 1]);
+        assert_eq!(
+            send(
+                RTM_NEWADDR,
+                NLM_F_CREATE | 0x200, // NLM_F_EXCL
+                address.clone()
+            ),
+            0
+        );
+        assert_eq!(
+            send(
+                RTM_NEWADDR,
+                NLM_F_CREATE | 0x200, // NLM_F_EXCL
+                address
+            ),
+            -(LinuxError::EEXIST as i32)
+        );
+        let link = payload_with(&IfInfoMsg {
+            ifi_family: AF_UNSPEC as u8,
+            ifi_pad: 0,
+            ifi_type: 0,
+            ifi_index: index as i32,
+            ifi_flags: IFF_UP,
+            ifi_change: IFF_UP,
+        });
+        assert_eq!(send(RTM_NEWLINK, 0, link), 0);
+        let configured = namespace.stack().interfaces();
+        assert!(configured[0].administrative_up);
+        assert_eq!(configured[0].addresses.len(), 1);
+        assert_eq!(
+            configured[0].addresses[0],
+            IpCidr::new(Ipv4Address::new(127, 0, 0, 1).into(), 8)
+        );
+        assert_eq!(namespace.stack().routes().len(), 1);
+        let permit = namespace.stack().acquire_packet_service();
+        assert_eq!(permit.interfaces().unwrap(), configured);
+        drop(permit);
+        assert!(other.stack().interfaces()[0].addresses.is_empty());
+        assert!(!other.stack().interfaces()[0].administrative_up);
+        assert!(other.stack().routes().is_empty());
+        let receiver = UdpSocket::new(namespace.stack().clone()).unwrap();
+        let sender = UdpSocket::new(namespace.stack().clone()).unwrap();
+        let endpoint = SocketAddrEx::Ip(core::net::SocketAddr::from(([127, 0, 0, 1], 31100)));
+        receiver.bind(endpoint.clone()).unwrap();
+        sender
+            .send(
+                &b"sandbox"[..],
+                SendOptions {
+                    to: Some(endpoint),
+                    ..SendOptions::default()
+                },
+            )
+            .unwrap();
+        let mut bytes = [0; 16];
+        let count = receiver
+            .recv(
+                &mut bytes[..],
+                RecvOptions {
+                    flags: RecvFlags::DONT_WAIT,
+                    ..RecvOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(&bytes[..count], b"sandbox");
     }
 
     #[test]

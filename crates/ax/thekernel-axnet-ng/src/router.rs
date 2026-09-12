@@ -776,6 +776,15 @@ impl Router {
         index < 64 && self.rx_wake_unavailable & (1u64 << index) != 0
     }
 
+    /// An administratively down link can regain its wake owner on link-up.
+    /// This is distinct from a source whose registration has failed terminally.
+    pub(crate) fn has_dormant_rx_source(&self) -> bool {
+        self.devices.iter().enumerate().any(|(index, device)| {
+            !self.links[index].up && !device.is_quarantined()
+                && !self.rx_wake_quarantined(index) && !self.rx_wake_unavailable(index)
+        })
+    }
+
     pub(crate) fn register_rx_waker(&mut self, waker: &core::task::Waker) -> RxWakeRegistration {
         // The dedicated worker owns every source in a physical stack,
         // including software bridges (loopback/veth). Quarantined devices
@@ -1922,20 +1931,20 @@ mod tests {
     use crate::packet::PacketDeviceContext;
 
     struct FakeDevice {
-        name: &'static str,
+        name: String,
         steps: VecDeque<RxStep>,
         seen: Arc<Mutex<Vec<u32>>>,
     }
 
     impl FakeDevice {
         fn new(
-            name: &'static str,
+            name: &str,
             steps: impl IntoIterator<Item = RxStep>,
         ) -> (Self, Arc<Mutex<Vec<u32>>>) {
             let seen = Arc::new(Mutex::new(Vec::new()));
             (
                 Self {
-                    name,
+                    name: name.into(),
                     steps: steps.into_iter().collect(),
                     seen: seen.clone(),
                 },
@@ -1946,7 +1955,7 @@ mod tests {
 
     impl Device for FakeDevice {
         fn name(&self) -> &str {
-            self.name
+            &self.name
         }
 
         fn stats(&self) -> DeviceStats {
@@ -2068,7 +2077,7 @@ mod tests {
         // not mistaken for a physical RX ring merely because they are
         // Ethernet-shaped interfaces.
         let (software, _) = FakeDevice::new("software", core::iter::empty());
-        assert_eq!(router.try_add_device(Box::new(software)), Ok(0));
+        assert_eq!(router.try_add_device(Box::new(software)), Ok(1));
     }
 
     #[test]
@@ -2142,8 +2151,8 @@ mod tests {
 
     #[test]
     fn device_scan_budget_does_not_spin_on_an_idle_full_device_set() {
-        let mut router = router_with_devices((0..MAX_DEVICES).map(|_| {
-            let (device, _) = FakeDevice::new("full", core::iter::empty());
+        let mut router = router_with_devices((0..MAX_DEVICES).map(|index| {
+            let (device, _) = FakeDevice::new(&alloc::format!("full{index}"), core::iter::empty());
             Box::new(device) as Box<dyn Device>
         }));
 
@@ -2167,8 +2176,9 @@ mod tests {
     #[test]
     fn broadcast_fanout_is_bounded_and_resumed_by_cursor() {
         let mut seen = Vec::new();
-        let mut router = router_with_devices((0..MAX_DEVICES).map(|_| {
-            let (device, device_seen) = FakeDevice::new("fanout", core::iter::empty());
+        let mut router = router_with_devices((0..MAX_DEVICES).map(|index| {
+            let (device, device_seen) =
+                FakeDevice::new(&alloc::format!("fanout{index}"), core::iter::empty());
             seen.push(device_seen);
             Box::new(device) as Box<dyn Device>
         }));

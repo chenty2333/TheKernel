@@ -151,7 +151,45 @@ static void mincore_case(void) {
     check(p != MAP_FAILED && *(volatile unsigned char *)p == 51, "file-map-touch");
     check(syscall(NR_MINCORE, p, PAGE, vec) == 0 && (vec[0] & 1), "file-resident");
     check(munmap(p, PAGE) == 0 && close(fd) == 0, "file-cleanup");
-    mark("FILE_PAGE_RESIDENCY"); done();
+    mark("FILE_PAGE_RESIDENCY");
+    char shared_path[] = "/root/thekernel-redirty-XXXXXX";
+    fd = mkstemp(shared_path); check(fd >= 0, "redirty-create");
+    check(ftruncate(fd, PAGE) == 0, "redirty-size");
+    int direct = open(shared_path, O_RDONLY | O_DIRECT);
+    check(direct >= 0 && unlink(shared_path) == 0, "redirty-direct-reader");
+    void *readback = NULL;
+    check(posix_memalign(&readback, PAGE, PAGE) == 0, "redirty-aligned-buffer");
+    p = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    check(p != MAP_FAILED, "redirty-shared-map");
+    /* Keep the same writable mapping alive across both writeback rounds.
+       Direct I/O prevents a clean-but-stale cache page hiding lost writeback. */
+    for (unsigned method = 0; method < 2; ++method) {
+        for (unsigned round = 0; round < 2; ++round) {
+            unsigned char value = 'A' + method * 2 + round;
+            memset(p, value, PAGE);
+            check((method ? fsync(fd) : msync(p, PAGE, MS_SYNC)) == 0,
+                  "redirty-writeback");
+        }
+        /* Only read directly after B: an intervening direct read could revoke
+           aliases itself and accidentally repair the dirty-tracking defect. */
+        check(pread(direct, readback, PAGE, 0) == PAGE, "redirty-direct-read");
+        for (size_t i = 0; i < PAGE; ++i)
+            check(((unsigned char *)readback)[i] == 'B' + method * 2,
+                  "redirty-persisted-content");
+    }
+    mark("SHARED_MSYNC_FSYNC_REDIRTY");
+    check(mlock(p, PAGE) == 0, "redirty-mlock");
+    memset(p, 'E', PAGE);
+    check(fsync(fd) == 0, "locked-shared-fsync");
+    check(mincore(p, PAGE, vec) == 0 && (vec[0] & 1), "locked-writeback-resident");
+    check(munlock(p, PAGE) == 0, "redirty-munlock");
+    check(pread(direct, readback, PAGE, 0) == PAGE, "locked-shared-direct-read");
+    for (size_t i = 0; i < PAGE; ++i)
+        check(((unsigned char *)readback)[i] == 'E', "locked-shared-persisted-content");
+    check(munmap(p, PAGE) == 0 && close(direct) == 0 && close(fd) == 0,
+          "redirty-cleanup");
+    free(readback);
+    mark("LOCKED_SHARED_FSYNC"); done();
 }
 static void vm_case(int nr, const char *name) {
     begin(name);

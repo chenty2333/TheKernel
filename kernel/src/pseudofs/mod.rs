@@ -103,6 +103,8 @@ pub fn mount_all(
     info!("Initialize pseudofs...");
 
     mount_at(fs, FsPath::new(b"/dev"), dev::new_devfs())?;
+    mount_at(fs, FsPath::new(b"/dev/pts"),
+        dev::tty::new_devpts(dev::tty::DevPtsOptions::boot())?)?;
     let tmp_permission = NodePermission::from_bits_truncate(0o1777);
     mount_at(
         fs,

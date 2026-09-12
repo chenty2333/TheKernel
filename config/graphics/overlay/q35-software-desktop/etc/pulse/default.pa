@@ -1,0 +1,3 @@
+.fail
+load-module module-native-protocol-unix
+load-module module-oss device=/dev/dsp record=no playback=yes mmap=no format=s16le rate=48000 channels=2 fragments=4 fragment_size=4096

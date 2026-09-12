@@ -798,6 +798,22 @@ pub(crate) fn fbcon_draw(draw: impl FnOnce(&FbconFrame)) {
     display.mark_full();
 }
 
+/// A primary client can take master without ever changing KD_TEXT (for
+/// example a bare KMS demo). Its final close must restore the real console
+/// mode and framebuffer, serialized with VT mode changes.
+pub(crate) fn restore_console_after_master_close() {
+    if FBCON_DISPLAY
+        .lock()
+        .as_ref()
+        .and_then(alloc::sync::Weak::upgrade)
+        .is_none()
+    {
+        return;
+    }
+    let manager = &super::tty::VT_MANAGER;
+    manager.with_text_active(manager.active(), || vt_graphics_changed(false));
+}
+
 /// Called by the VT gate after it has changed `KD_TEXT`/`KD_GRAPHICS`. This
 /// keeps the sole DRM master synchronized with the scanout owner: fbcon owns
 /// it in text mode, while a graphics client can acquire it in graphics mode.
@@ -1182,6 +1198,116 @@ impl DeviceOps for FrameBuffer {
 #[cfg(test)]
 mod tests {
     use super::{DAMAGE_CLEAN, DAMAGE_FULL, DamageTracker, FB_DEVICE_ID, fb_sysfs_registration};
+
+    #[test]
+    fn last_userspace_master_close_restores_text_framebuffer_without_vt_ioctl() {
+        check_userspace_master_text_restore(false);
+    }
+
+    #[test]
+    fn userspace_drop_master_restores_text_framebuffer_before_close() {
+        check_userspace_master_text_restore(true);
+    }
+
+    fn check_userspace_master_text_restore(explicit_drop: bool) {
+        use alloc::sync::Arc;
+
+        use crate::drm::{
+            DisplayAdapter, DrmDevice, DrmResult, DumbRequest, GemBacking, Scanout, fence::Fence,
+        };
+        struct Pages(Arc<crate::mm::SharedPages>);
+        impl GemBacking for Pages {
+            fn shared_pages(&self) -> DrmResult<Arc<crate::mm::SharedPages>> {
+                Ok(self.0.clone())
+            }
+        }
+        struct Adapter;
+        impl DisplayAdapter for Adapter {
+            fn create_dumb(
+                &self,
+                _: DumbRequest,
+                _: u32,
+                size: u64,
+            ) -> DrmResult<Arc<dyn GemBacking>> {
+                Ok(Arc::new(Pages(Arc::new(
+                    crate::mm::SharedPages::new_fixed(
+                        size as usize,
+                        axhal::paging::PageSize::Size4K,
+                    )
+                    .unwrap(),
+                ))))
+            }
+            fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
+                Ok(Fence::new(true))
+            }
+        }
+        let _context = crate::test_support::scheduler_test_context();
+        let device = DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
+        let scanout = Arc::new(super::DrmFbdev::new(device.clone()).unwrap());
+        let console_fb = device.state.lock().atomic.fb;
+        let display = Arc::new(super::DisplayCore::new(scanout));
+        let previous = super::FBCON_DISPLAY
+            .lock()
+            .replace(Arc::downgrade(&display));
+        let user = device.open_primary();
+        user.require_master().unwrap();
+        let mode = device.preferred_mode();
+        let dumb = user
+            .create_dumb(DumbRequest {
+                width: mode.width,
+                height: mode.height,
+                bpp: 32,
+            })
+            .unwrap();
+        let fb = user
+            .add_framebuffer(dumb.handle, mode.width, mode.height, dumb.pitch, 32)
+            .unwrap();
+        let mut next = device.state.lock().atomic;
+        next.fb = fb;
+        let generation = device.state.lock().atomic_generation;
+        user.submit_atomic(
+            generation,
+            next,
+            Some(user.framebuffer(fb).unwrap()),
+            None,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(device.state.lock().resources.crtc.framebuffer, Some(fb));
+        let user = if explicit_drop {
+            user.drop_master();
+            Some(user)
+        } else {
+            drop(user);
+            None
+        };
+        // Release itself reacquires and enqueues the full fbdev modeset. No
+        // test-side become_master or synthetic KD_TEXT transition is used.
+        device.advance_vblank().unwrap();
+        device.advance_vblank().unwrap();
+        let state = device.state.lock();
+        assert!(state.atomic.active);
+        assert_eq!(state.atomic.fb, console_fb);
+        assert_eq!(state.atomic.mode, Some(mode));
+        assert_eq!(state.resources.crtc.framebuffer, Some(console_fb));
+        assert_eq!(state.resources.crtc.mode, Some(mode));
+        assert_eq!(state.atomic.src_y, 0);
+        drop(state);
+        assert!(
+            display
+                .refresh_enabled
+                .load(core::sync::atomic::Ordering::Acquire)
+        );
+        // Closing an already-released user OFD must leave the restored
+        // console installed, too.
+        drop(user);
+        assert_eq!(
+            device.state.lock().resources.crtc.framebuffer,
+            Some(console_fb)
+        );
+        *super::FBCON_DISPLAY.lock() = previous;
+    }
 
     #[test]
     fn damage_tracker_coalesces_and_clears() {

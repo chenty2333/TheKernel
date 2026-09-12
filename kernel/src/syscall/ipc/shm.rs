@@ -1511,6 +1511,25 @@ impl Drop for ShmatAdmission<'_> {
     }
 }
 
+// IPC_RMID unlinks the key, but Linux permits new attachments by shmid while
+// an existing attachment still owns the segment. Revalidate the registry after
+// lock-external MM preparation so a final detach cannot resurrect a stale Arc.
+fn validate_shmat_segment(
+    manager: &Mutex<ShmManager>,
+    inner: &Arc<Mutex<ShmInner>>,
+    shmid: i32,
+) -> AxResult<()> {
+    if manager
+        .lock()
+        .get_inner_by_shmid(shmid)
+        .is_some_and(|registered| Arc::ptr_eq(&registered, inner))
+    {
+        Ok(())
+    } else {
+        Err(AxError::from(LinuxError::EIDRM))
+    }
+}
+
 fn prepare_shmat_admission_with_finalizer_in<'a>(
     manager: &'a Mutex<ShmManager>,
     inner: Arc<Mutex<ShmInner>>,
@@ -1521,6 +1540,7 @@ fn prepare_shmat_admission_with_finalizer_in<'a>(
     finalizer: Option<DeferredMappingFinalizer>,
     allow_same_detach_base: bool,
 ) -> AxResult<ShmatAdmission<'a>> {
+    validate_shmat_segment(manager, &inner, shmid)?;
     let publication =
         Arc::try_new(ShmForkPublication::new(false)).map_err(|_| AxError::NoMemory)?;
     let vaddr = va_range.start;
@@ -2613,9 +2633,6 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     let context = IpcAccessContext::for_ipc_namespace(thread.current_cred(), &ipc_ns);
     let (mut mapping_flags, page_num, existing_pages) = {
         let state = shm_inner.lock();
-        if state.rmid {
-            return Err(AxError::from(LinuxError::EIDRM));
-        }
         if !can_attach_shm(&context, &state.shmid_ds.shm_perm, read_only, executable) {
             return Err(AxError::from(LinuxError::EACCES));
         }
@@ -2688,11 +2705,9 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     drop(aspace);
     // Rebuild the IPC edge and select/reserve canonical first-attach pages.
     let _transaction = ipc_ns.shm_transaction().lock();
+    validate_shmat_segment(ipc_ns.shm_manager(), &shm_inner, shmid)?;
     {
         let state = shm_inner.lock();
-        if state.rmid {
-            return Err(AxError::from(LinuxError::EIDRM));
-        }
         if !can_attach_shm(&context, &state.shmid_ds.shm_perm, read_only, executable) {
             return Err(AxError::from(LinuxError::EACCES));
         }
@@ -3318,6 +3333,45 @@ mod tests {
         );
         assert_eq!(inner.lock().attach_count(), 1);
         assert_eq!(inner.lock().visible_snapshot().shm_nattch, 1);
+    }
+
+    #[test]
+    fn rmid_allows_new_attachment_until_final_detach_without_resurrection() {
+        let (transaction, manager, inner) = inheritance_fixture();
+        inner.lock().set_removed(true);
+        validate_shmat_segment(&manager, &inner, SHMID).unwrap();
+        prepare_shmat_admission_in(
+            &manager,
+            inner.clone(),
+            CHILD_PID,
+            SHMID,
+            attachment_range(),
+        )
+        .unwrap()
+        .commit();
+        assert_eq!(inner.lock().visible_snapshot().shm_nattch, 2);
+        clear_proc_shm_in(&transaction, &manager, PARENT_PID);
+        assert!(manager.lock().contains_shmid(SHMID));
+        assert_eq!(inner.lock().visible_snapshot().shm_nattch, 1);
+        clear_proc_shm_in(&transaction, &manager, CHILD_PID);
+        assert!(!manager.lock().contains_shmid(SHMID));
+        assert_eq!(manager.lock().total_page_count(), 0);
+        assert_eq!(
+            validate_shmat_segment(&manager, &inner, SHMID),
+            Err(AxError::from(LinuxError::EIDRM))
+        );
+        let replacement = test_segment(IPC_PRIVATE, SHMID, 1);
+        manager.lock().try_reserve_segment(false).unwrap();
+        manager
+            .lock()
+            .insert_shmid_inner(SHMID, 1, replacement)
+            .unwrap();
+        assert_eq!(
+            prepare_shmat_admission_in(&manager, inner, PARENT_PID, SHMID, attachment_range(),)
+                .err(),
+            Some(AxError::from(LinuxError::EIDRM))
+        );
+        assert_eq!(manager.lock().attachment_count, 0);
     }
 
     #[test]

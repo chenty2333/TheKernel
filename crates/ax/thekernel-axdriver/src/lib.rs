@@ -73,6 +73,8 @@ mod bus;
 mod drivers;
 mod dummy;
 mod structs;
+#[cfg(feature = "virtio-sound")]
+pub mod sound;
 
 #[cfg(feature = "shared-block")]
 mod block_volume;

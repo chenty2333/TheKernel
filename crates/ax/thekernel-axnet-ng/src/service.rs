@@ -46,7 +46,7 @@ pub(crate) struct OutboundRoute {
     pub(crate) next_hop: IpAddress,
 }
 
-fn now() -> Instant {
+pub(crate) fn now() -> Instant {
     Instant::from_micros_const((wall_time_nanos() / NANOS_PER_MICROS) as i64)
 }
 
@@ -138,8 +138,9 @@ impl Service {
         // service transaction rather than waiting for route mutation.
         self.router.prune_dead_raw_routes();
         let tx = self.router.dispatch(timestamp);
+        let closed_tcp_abort = self.socket_set.reap_closed_tcp(sockets, timestamp);
 
-        let continuation = rx.is_continuation()
+        let continuation = closed_tcp_abort || rx.is_continuation()
             || tx.is_continuation()
             || matches!(egress, PollResult::SocketStateChanged)
             || egress_blocked
@@ -262,12 +263,15 @@ impl Service {
         }
     }
 
-    pub fn register_waker(
+    pub(crate) fn register_protocol_timer(
         &mut self,
-        mask: u64,
         waker: &Waker,
     ) -> Result<(), PollRegistrationError> {
         let next = self.iface.poll_at(now(), &self.socket_set.inner.lock());
+        let next = match (next, self.socket_set.closing_tcp_deadline()) {
+            (Some(protocol), Some(close)) => Some(protocol.min(close)),
+            (protocol, close) => protocol.or(close),
+        };
 
         if let Some(t) = next {
             let next = TimeValue::from_micros(t.total_micros() as _);
@@ -305,6 +309,15 @@ impl Service {
             self.timeout = None;
         }
 
+        Ok(())
+    }
+
+    pub fn register_waker(
+        &mut self,
+        mask: u64,
+        waker: &Waker,
+    ) -> Result<(), PollRegistrationError> {
+        self.register_protocol_timer(waker)?;
         for (i, device) in self.router.devices.iter().enumerate() {
             if i >= 64 || mask & (1u64 << i) != 0 {
                 device.register_waker(waker)?;

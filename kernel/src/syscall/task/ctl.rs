@@ -744,7 +744,7 @@ pub fn sys_unshare(flags: u32) -> AxResult<isize> {
                 None
             };
             let private_net_ns = if flags & CLONE_NEWNET != 0 {
-                Some(crate::task::NetworkNamespace::try_new_loopback_only(
+                Some(crate::task::NetworkNamespace::try_new_network_namespace(
                     namespace_owner.clone(),
                 )?)
             } else {

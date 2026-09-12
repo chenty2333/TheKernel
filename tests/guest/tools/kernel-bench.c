@@ -886,6 +886,34 @@ static void io_batch(struct ring *r, int file, char **buffers, unsigned size,
     atomic_store_explicit(&io_step, IO_IDLE, memory_order_relaxed);
 }
 
+/* Private TheKernel lifecycle capture; controls and serial output are outside timing. */
+static int io_target_only, io_capture;
+static void io_trace_control(const char *leaf, const char *value)
+{
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/kernel/tracing/io_uring/%s", leaf);
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) fail("I/O trace control open");
+    size_t length = strlen(value);
+    if (write(fd, value, length) != (ssize_t)length) fail("I/O trace control write");
+    if (close(fd)) fail("I/O trace control close");
+}
+
+static void io_trace_print(void)
+{
+    FILE *file = fopen("/sys/kernel/tracing/io_uring/trace", "r");
+    if (!file) fail("I/O trace snapshot open");
+    puts("THEKERNEL_IO_TRACE_BEGIN");
+    char line[1024];
+    while (fgets(line, sizeof(line), file)) {
+        if (!strchr(line, '\n')) { errno = EOVERFLOW; fail("I/O trace line"); }
+        fputs(line, stdout);
+    }
+    if (ferror(file) || fclose(file)) fail("I/O trace snapshot read");
+    puts("THEKERNEL_IO_TRACE_END");
+    fflush(stdout);
+}
+
 static void io_case(int file, unsigned iterations, unsigned size, unsigned depth,
                     int fixed, int direct, int mode)
 {
@@ -921,7 +949,14 @@ static void io_case(int file, unsigned iterations, unsigned size, unsigned depth
     for (unsigned phase = 0; phase < 2; phase++) {
         unsigned total = phase ? iterations : WARMUP;
         atomic_store_explicit(&io_phase, phase ? IO_MEASURED : IO_WARMUP, memory_order_relaxed);
-        if (phase) { measurement_start(&measured); start = now_ns(); }
+        if (phase) {
+            if (io_capture) {
+                io_trace_control("enable", "0");
+                io_trace_control("trace", "clear");
+                io_trace_control("enable", "1");
+            }
+            measurement_start(&measured); start = now_ns();
+        }
         for (unsigned n = 0; n < total;) {
             unsigned count = total - n < depth ? total - n : depth;
             io_batch(&r, file, buffers, size, count, n, size == 4096, fixed, mode != 0);
@@ -934,7 +969,13 @@ static void io_case(int file, unsigned iterations, unsigned size, unsigned depth
             }
             n += count;
         }
-        if (phase) { elapsed = now_ns() - start; measurement_stop(&measured); }
+        if (phase) {
+            elapsed = now_ns() - start; measurement_stop(&measured);
+            if (io_capture) {
+                io_trace_control("enable", "0");
+                io_trace_print();
+            }
+        }
     }
     if (mode != 0) {
         /* Separate readback is outside write timing. */
@@ -999,6 +1040,8 @@ static void io_suite(unsigned iterations, const char *path)
             for (int fixed = 0; fixed < 2; fixed++)
                 for (int d = 0; d < 2; d++)
                     for (int mode = 0; mode < 3; mode++) {
+                        if (io_target_only && (s != 0 || depths[q] != 32 || !fixed || d || mode))
+                            continue;
                         if (fsync(file)) fail("scenario boundary fsync");
                         io_case(d ? direct : file, iterations, sizes[s], depths[q], fixed, d, mode);
                     }
@@ -1211,6 +1254,14 @@ int main(int argc, char **argv)
     if (!sched && !io && !all) {
         fprintf(stderr, "suite must be scheduler, io, or all\n"); return 2;
     }
+    const char *target = getenv("KERNEL_BENCH_IO_TARGET");
+    const char *capture = getenv("KERNEL_BENCH_IO_TRACE");
+    if ((target && strcmp(target, "1")) || (capture && strcmp(capture, "1")) ||
+        (target && !io) || (capture && (!target || count != 64))) {
+        fprintf(stderr, "invalid I/O target/trace configuration\n"); return 2;
+    }
+    io_target_only = target != NULL;
+    io_capture = capture != NULL;
     /* Bound a missing CQE or pipe handoff on both oracle and guest. */
     alarm(600);
     if (sched || all) scheduler((unsigned)count, argv[3]);

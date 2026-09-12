@@ -1,7 +1,7 @@
 # The compositor receives card and input devices through libseat -> seatd.
-# `render` is the one direct-device exception, for the separately gated virgl
-# render-node workload; do not add video or input supplementary groups.
-weston -1 weston -1 !* /var/lib/weston /bin/sh seat,render Weston compositor
+# Render nodes and the playback device are direct-access exceptions;
+# do not add video or input supplementary groups.
+weston -1 weston -1 !* /var/lib/weston /bin/sh seat,render,audio Weston compositor
 
 # Stable named policy groups for the graphics device rules below. seatd
 # provides the seat group itself; these entries make group ownership visible
@@ -9,3 +9,4 @@ weston -1 weston -1 !* /var/lib/weston /bin/sh seat,render Weston compositor
 - - video -1 - - - -
 - - input -1 - - - -
 - - render -1 - - - -
+- - audio -1 - - - -

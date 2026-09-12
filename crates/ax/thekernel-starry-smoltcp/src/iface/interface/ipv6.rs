@@ -378,6 +378,45 @@ impl InterfaceInner {
             &self.caps.checksum,
         ));
 
+        #[cfg(all(feature = "socket-udp", feature = "alloc"))]
+        if let Some((header, data, kind, code, info)) = match icmp_repr {
+            Icmpv6Repr::DstUnreachable {
+                reason,
+                header,
+                data,
+            } => Some((header, data, 1, u8::from(reason), 0)),
+            Icmpv6Repr::PktTooBig { mtu, header, data } => Some((header, data, 2, 0, mtu)),
+            Icmpv6Repr::TimeExceeded {
+                reason,
+                header,
+                data,
+            } => Some((header, data, 3, u8::from(reason), 0)),
+            Icmpv6Repr::ParamProblem {
+                reason,
+                pointer,
+                header,
+                data,
+            } => Some((header, data, 4, u8::from(reason), pointer)),
+            _ => None,
+        } {
+            if header.next_header == IpProtocol::Udp && header.src_addr == ip_repr.dst_addr {
+                for socket in _sockets
+                    .items_mut()
+                    .filter_map(|i| crate::socket::udp::Socket::downcast_mut(&mut i.socket))
+                {
+                    socket.process_error(
+                        header.src_addr.into(),
+                        header.dst_addr.into(),
+                        ip_repr.src_addr.into(),
+                        data,
+                        kind,
+                        code,
+                        info,
+                    );
+                }
+            }
+        }
+
         #[cfg(feature = "socket-icmp")]
         let mut handled_by_icmp_socket = false;
 

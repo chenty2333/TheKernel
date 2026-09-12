@@ -222,4 +222,6 @@ while [ ! -S /tmp/.X11-unix/X0 ] && [ "$attempt" -lt 20 ]; do
     sleep 1
 done
 [ -S /tmp/.X11-unix/X0 ] || { echo "$virgl_marker state=FAIL reason=xwayland_socket"; exit 1; }
-start-stop-daemon -S -x /usr/local/bin/q35-virgl-workloads -c weston -b
+# Keep the conformance chain attached to the console: background mode closes
+# stdout/stderr and hides both its ready markers and actionable test failures.
+start-stop-daemon -S -x /usr/local/bin/q35-virgl-workloads -c weston

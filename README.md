@@ -73,9 +73,12 @@ make docker-clean  # remove the dev container volume and local image
 `make run-gui` builds the graphics userspace on its first run (Buildroot and
 package downloads can take a while), then uses incremental builds. It opens
 a Weston desktop with launchers for a terminal, file manager, text editor,
-image viewer, and Python. The default desktop uses Virgl OpenGL acceleration
-through the host GPU; select `RUN_ARGS="--graphics-profile interactive"` for
-software rendering. Save your work and use the panel's
+image viewer, Python, and the sandboxed WebKitGTK MiniBrowser. The default
+desktop uses KVM, a 1920×1080 display, 2 GiB of guest memory, and Virgl OpenGL
+acceleration through the host GPU. Browser audio plays through PulseAudio and
+VirtIO sound; `curl`, `ssh`, `scp`, and `sftp` are included. Select
+`RUN_ARGS="--graphics-profile interactive"` for software rendering. Save your
+work and use the panel's
 Shut Down button to flush files and exit. Closing QEMU directly or pressing
 Ctrl+C forcibly stops the guest and can lose pending writes.
 Use `make run-gui RUN_ARGS=--no-build` to reuse the current images without

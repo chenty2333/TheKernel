@@ -36,6 +36,13 @@ command -v grub-mkstandalone >/dev/null 2>&1 \
     || { printf 'missing grub-mkstandalone/grub2-mkstandalone\n' >&2; exit 1; }
 
 qemu-system-x86_64 --version | grep -q "version ${QEMU_EXPECTED_VERSION}"
+qemu-system-x86_64 -display help | grep -Fx 'egl-headless' >/dev/null
+qemu-system-x86_64 -device help | grep -F 'name "virtio-gpu-gl-pci"' >/dev/null
+qemu-system-x86_64 -device help | grep -F 'name "virtio-sound-pci"' >/dev/null
+qemu_audio_drivers=$(qemu-system-x86_64 -audiodev help)
+for driver in pa none wav; do
+    grep -Fx "$driver" <<< "$qemu_audio_drivers" >/dev/null
+done
 
 ovmf_code=
 for candidate in \

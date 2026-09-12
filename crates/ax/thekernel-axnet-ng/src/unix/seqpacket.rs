@@ -81,7 +81,9 @@ struct ConnRequest {
 }
 impl ConnRequest {
     fn identity(&self) -> usize {
-        self.transport.identity()
+        self.transport
+            .identity()
+            .expect("queued seqpacket endpoint")
     }
 }
 
@@ -94,6 +96,14 @@ pub(super) struct SeqPacketConnectReservation<'a> {
     committed: bool,
 }
 impl SeqPacketConnectReservation<'_> {
+    pub(super) fn connecting_identity(&self) -> usize {
+        self.client
+            .as_ref()
+            .expect("active seqpacket connect reservation")
+            .identity()
+            .expect("prepared seqpacket endpoint")
+    }
+
     pub(super) fn listener_identity(&self) -> usize {
         self.listener.identity()
     }
@@ -189,7 +199,14 @@ pub struct SeqPacketTransport {
 }
 impl SeqPacketTransport {
     pub fn endpoint_identity(&self) -> Option<usize> {
-        self.data.lock().as_ref().map(DgramTransport::identity)
+        self.data.lock().as_ref().and_then(DgramTransport::identity)
+    }
+
+    pub(super) fn peer_endpoint_identity(&self) -> Option<usize> {
+        self.data
+            .lock()
+            .as_ref()
+            .and_then(DgramTransport::peer_identity)
     }
     pub fn new() -> AxResult<Self> {
         Ok(Self {

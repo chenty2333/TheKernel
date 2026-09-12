@@ -81,7 +81,11 @@ cat dropped
 
 The snapshot includes reservation, submission, issue, accepted completion,
 CQ publication start/rollback/commit, provider cancellation selection/results,
-and request rollback/discard. A completion accepted by the
+and request rollback/discard. Fixed reads additionally record kernel-private
+`executor_started` and `executor_returned` events around the full submission
+wrapper, including security/fanotify checks and provider I/O. These use the same
+ring/slot/generation identity and bounded capture; they do not add lower-layer
+request state transitions. A completion accepted by the
 kernel is distinct from a CQE successfully published to the ring. CQ head
 reclamation is reported as an aggregate ring/head/count observation; it does
 not prove that userspace consumed a particular request's result.

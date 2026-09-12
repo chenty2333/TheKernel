@@ -722,10 +722,9 @@ impl MountTopology {
             next.try_reserve_exact(before)
                 .map_err(|_| AxError::NoMemory)?;
             for record in pending {
-                let Some(parent) = cloned
-                    .iter()
-                    .find(|candidate| candidate.mount_id == record.parent_id)
-                else {
+                let Some(parent) = cloned.iter().find(|candidate| {
+                    source_identity.get(&candidate.mount_id) == Some(&record.parent_id)
+                }) else {
                     next.push(record);
                     continue;
                 };
@@ -749,8 +748,8 @@ impl MountTopology {
                         old,
                     )?,
                 )?;
-                clone.attach_to(&target)?;
                 register_live_superblock_mount(&clone)?;
+                clone.attach_to(&target)?;
                 cloned.push(MountRecord {
                     mount_id: clone.mount_id(),
                     mount_id_old: old,
@@ -1294,6 +1293,11 @@ fn apply_propagation_change(
                 mount.unbindable = false;
             }
             MS_SLAVE => {
+                // A private (or unbindable) mount has no propagation peer
+                // or master to detach from. Linux leaves it unchanged.
+                if state.mounts[*index].peer_group.is_none() {
+                    continue;
+                }
                 let master = parent_peer.ok_or(AxError::InvalidInput)?;
                 // Do not repurpose a shared group as a slave group: its
                 // other peers must remain shared.  Every conversion gets a
@@ -1321,6 +1325,7 @@ struct LinuxMountState {
     activity_epoch: AtomicU64,
     readonly_floor: bool,
     metadata: Mutex<MountMetadata>,
+    file_cache: Mutex<Option<axfs::CachedFileMountLease>>,
 }
 
 struct RemountVisibilityGuard<'a> {
@@ -1772,7 +1777,21 @@ pub fn mounted_root_location(device: DeviceId) -> AxResult<Location> {
     Ok(mountpoint.root_location())
 }
 
+fn retain_file_mount_cache(mountpoint: &Arc<Mountpoint>) -> VfsResult<()> {
+    if mountpoint.root_location().node_type() == axfs_ng_vfs::NodeType::RegularFile {
+        let state = mount_state(mountpoint)?;
+        let mut lease = state.file_cache.lock();
+        if lease.is_none() {
+            *lease = Some(axfs::CachedFileMountLease::new(
+                &mountpoint.root_location(),
+            )?);
+        }
+    }
+    Ok(())
+}
+
 fn register_live_superblock_mount(mountpoint: &Arc<Mountpoint>) -> VfsResult<()> {
+    retain_file_mount_cache(mountpoint)?;
     let mut mounts = LIVE_SUPERBLOCK_MOUNTS.lock();
     mounts.retain(|_, entry| entry.strong_count() != 0);
     let mount_id = mountpoint.mount_id();
@@ -1826,6 +1845,7 @@ fn mount_extensions(flags: u32, metadata: MountMetadata, mount_id_old: u32) -> V
         activity_epoch: AtomicU64::new(0),
         readonly_floor: flags & MS_RDONLY != 0,
         metadata: Mutex::new(metadata),
+        file_cache: Mutex::new(None),
     })?;
     drop(retired);
     Ok(extensions)
@@ -1893,10 +1913,9 @@ pub fn mount_with_flags(
     flags: u32,
     metadata: MountMetadata,
 ) -> VfsResult<Arc<Mountpoint>> {
-    target.mount_with_extensions(
-        filesystem,
-        mount_extensions(flags, metadata, next_mountinfo_id()?)?,
-    )
+    let mountpoint = new_detached_with_flags(filesystem, flags, metadata)?;
+    mountpoint.attach_to(target)?;
+    Ok(mountpoint)
 }
 
 pub fn new_detached_with_flags(
@@ -2626,6 +2645,7 @@ fn clone_tree_for_propagation(
             source.root_location().entry().clone(),
             mount_extensions(record.flags, metadata, old)?,
         )?;
+        retain_file_mount_cache(&clone)?;
         let (parent_id, target) = if source_id == root.mount_id() {
             (destination_parent, try_path(destination_path.as_ref())?)
         } else {
@@ -3352,10 +3372,14 @@ pub fn pivot_root_and_records(
     }
     let new_root_path = new_root.absolute_path().map_err(|_| AxError::Io)?;
     let put_old_path = put_old.absolute_path().map_err(|_| AxError::Io)?;
-    let put_old_new_path = path_suffix(new_root_path.as_ref(), put_old_path.as_ref())
-        .filter(|path| !path.as_bytes().is_empty())
-        .ok_or(AxError::InvalidInput)
-        .and_then(try_path)?;
+    let put_old_new_path =
+        path_suffix(new_root_path.as_ref(), put_old_path.as_ref()).ok_or(AxError::InvalidInput)?;
+    // Linux permits pivot_root(".", "."): the old root is stacked at /.
+    let put_old_new_path = if put_old_new_path.as_bytes().is_empty() {
+        FsPath::new(b"/")
+    } else {
+        put_old_new_path
+    };
 
     let mut records = snapshot()?;
     let index = MountRecordIndex::new(&records)?;
@@ -3410,7 +3434,6 @@ pub fn pivot_root_and_records(
         },
     )?;
 
-    new_root.pivot_root_to(put_old)?;
     for (record_index, target, parent_id) in updates {
         let record = &mut records[record_index];
         record.target = target;
@@ -3419,12 +3442,16 @@ pub fn pivot_root_and_records(
         }
         record.expire_epoch = None;
     }
-    if let Err(error) = commit_mount_mutation(plan).and_then(|_| publish_current_records(&records))
-    {
-        // pivot_root_to has a paired inverse while both prepared locations
-        // are pinned: restore the old root under the new root's put_old slot.
-        let _ = put_old.pivot_root_to(new_root);
-        return Err(error);
+    commit_mount_mutation(plan)?;
+    let publication = prepare_current_record_publication(&records)?;
+    if let Some(publication) = &publication {
+        publication.validate_epoch()?;
+    }
+    new_root.pivot_root_to(put_old)?;
+    if let Some(publication) = publication {
+        publication.commit_validated();
+    } else {
+        publish_bootstrap_records(records);
     }
     Ok(())
 }
@@ -4067,6 +4094,161 @@ mod tests {
         }
     }
 
+    fn mounted_root_with_child() -> (Arc<Mountpoint>, Arc<Mountpoint>, Vec<MountRecord>) {
+        let filesystem = MemoryFs::new().unwrap();
+        let old_mount = Mountpoint::new_root(&filesystem);
+        let old_root = old_mount.root_location();
+        let target = old_root
+            .create(
+                axfs_ng_vfs::FsName::new(b"newroot"),
+                axfs_ng_vfs::NodeType::Directory,
+                axfs_ng_vfs::NodePermission::from_bits_truncate(0o755),
+            )
+            .unwrap();
+        let new_filesystem = MemoryFs::new().unwrap();
+        let new_mount = mount_with_flags(
+            &target,
+            &new_filesystem,
+            0,
+            MountMetadata::try_from_parts(FsPath::new(b"none"), "tmpfs", FsPath::new(b"/"), "")
+                .unwrap(),
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        for (mount, parent, path) in [
+            (&old_mount, 0, "/"),
+            (&new_mount, old_mount.mount_id(), "/newroot"),
+        ] {
+            let mut record = record(mount.mount_id(), parent, path);
+            record.dev = mount.device();
+            record.mountpoint = Arc::downgrade(mount);
+            if mount.is_root() {
+                mount
+                    .initialize_extensions(
+                        mount_extensions(
+                            0,
+                            MountMetadata::try_from_parts(
+                                FsPath::new(b"none"),
+                                "tmpfs",
+                                FsPath::new(b"/"),
+                                "",
+                            )
+                            .unwrap(),
+                            record.mount_id_old,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            records.push(record);
+        }
+        (old_mount, new_mount, records)
+    }
+
+    #[test]
+    fn namespace_clone_matches_source_parent_ids_to_cloned_mounts() {
+        let _context = crate::test_support::scheduler_test_context();
+        let _operation = namespace_operation();
+        let (old_root, old_child, records) = mounted_root_with_child();
+        let mounts = records
+            .iter()
+            .map(|record| Mount::try_from_record(record, None).unwrap())
+            .collect();
+        let source = MountTopology::try_new(41, mounts).unwrap();
+        let clone = source.try_prepare_clone_namespace(42, false).unwrap();
+        let copied = clone.topology().try_records().unwrap();
+        let root = copied.iter().find(|record| record.parent_id == 0).unwrap();
+        let child = copied.iter().find(|record| record.parent_id != 0).unwrap();
+        assert_ne!(root.mount_id, old_root.mount_id());
+        assert_ne!(child.mount_id, old_child.mount_id());
+        assert_eq!(child.parent_id, root.mount_id);
+        let resolved = clone
+            .topology()
+            .root_location()
+            .unwrap()
+            .lookup_no_follow(axfs_ng_vfs::FsName::new(b"newroot"))
+            .unwrap();
+        assert_eq!(resolved.mountpoint().mount_id(), child.mount_id);
+        assert!(old_root.is_root());
+        assert_eq!(
+            old_child.location().unwrap().mountpoint().mount_id(),
+            old_root.mount_id()
+        );
+    }
+
+    #[test]
+    fn making_private_mounts_slave_without_a_master_is_a_noop() {
+        let _context = crate::test_support::scheduler_test_context();
+        let _operation = namespace_operation();
+        let (root, _child, records) = mounted_root_with_child();
+        let mut mounts: Vec<_> = records
+            .iter()
+            .map(|record| Mount::try_from_record(record, None).unwrap())
+            .collect();
+        mounts[1].unbindable = true;
+        let topology = MountTopology::try_new(43, mounts).unwrap();
+        topology
+            .prepare_setattr(
+                root.mount_id(),
+                true,
+                MountSetattrRequest {
+                    attr_set: 0,
+                    attr_clr: 0,
+                    propagation: MS_SLAVE as u64,
+                    idmap: None,
+                    idmap_replace: false,
+                },
+            )
+            .unwrap()
+            .commit()
+            .unwrap();
+        let state = topology.try_snapshot().unwrap();
+        assert!(state.mounts.iter().all(|mount| mount.peer_group.is_none()));
+        assert!(!state.mounts[0].unbindable);
+        assert!(state.mounts[1].unbindable);
+    }
+
+    #[test]
+    fn pivot_root_same_location_stacks_old_root_and_updates_records() {
+        let _context = crate::test_support::scheduler_test_context();
+        let _operation = namespace_operation();
+        struct RestoreRecords(Vec<MountRecord>);
+        impl Drop for RestoreRecords {
+            fn drop(&mut self) {
+                publish_bootstrap_records(core::mem::take(&mut self.0));
+            }
+        }
+        let _restore = RestoreRecords(core::mem::take(&mut *BOOTSTRAP_MOUNT_RECORDS.lock()));
+        let (old_mount, new_mount, records) = mounted_root_with_child();
+        let old_root = old_mount.root_location();
+        let new_root = new_mount.root_location();
+        publish_bootstrap_records(records);
+
+        pivot_root_and_records(&old_root, &new_root, &new_root).unwrap();
+
+        assert!(new_mount.is_root());
+        assert!(!old_mount.is_root());
+        assert!(old_mount.location().unwrap().ptr_eq(&new_root));
+        let records = snapshot().unwrap();
+        assert_eq!(records.len(), 2);
+        for record in &records {
+            assert_eq!(record.target.as_bytes(), b"/");
+            assert_eq!(
+                record.parent_id,
+                if record.mount_id == new_mount.mount_id() {
+                    0
+                } else {
+                    new_mount.mount_id()
+                }
+            );
+        }
+        // Like bubblewrap's saved old-root fd, this location still identifies
+        // the covered root and permits detaching it without detaching /.
+        old_root.lazy_unmount().unwrap();
+        assert!(new_root.mounted_child().is_none());
+        assert!(new_mount.is_root());
+    }
+
     #[test]
     fn remount_publication_adopts_flags_and_data_without_structural_reconciliation() {
         let _context = crate::test_support::scheduler_test_context();
@@ -4094,9 +4276,11 @@ mod tests {
             expire_epoch: None,
             mountpoint: Arc::downgrade(&mountpoint),
         };
-        let topology =
-            MountTopology::try_new(1, alloc::vec![Mount::try_from_record(&record, None).unwrap()])
-                .unwrap();
+        let topology = MountTopology::try_new(
+            1,
+            alloc::vec![Mount::try_from_record(&record, None).unwrap()],
+        )
+        .unwrap();
         let mut records = topology.try_records().unwrap();
         records[0].flags = MS_RDONLY | MS_NOEXEC;
         records[0].data = "size=64M".to_string();

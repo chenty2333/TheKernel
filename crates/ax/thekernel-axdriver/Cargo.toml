@@ -121,6 +121,7 @@ virtio-net = [
     "axdriver_virtio/net",
 ]
 virtio-rng = ["virtio"]
+virtio-sound = ["virtio", "axdriver_virtio/alloc"]
 virtio-socket = [
     "vsock",
     "virtio",

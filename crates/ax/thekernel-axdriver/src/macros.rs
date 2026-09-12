@@ -55,6 +55,11 @@ macro_rules! for_each_drivers {
             type $drv_type = virtio::VirtIoEntropyDriver;
             $code
         }
+        #[cfg(feature = "virtio-sound")]
+        {
+            type $drv_type = crate::sound::VirtIoSoundDriver;
+            $code
+        }
         #[cfg(net_dev = "virtio-net")]
         {
             type $drv_type = <virtio::VirtIoNet as VirtIoDevMeta>::Driver;

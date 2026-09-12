@@ -3,10 +3,15 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -33,6 +38,92 @@ static void poll_delay(void)
 
     while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
     }
+}
+
+static int test_pid_namespace_exit(void)
+{
+    pid_t controller = fork();
+    if (controller < 0)
+        return fail("pidns-controller-fork");
+    if (controller == 0) {
+        alarm(10);
+        int alive[2];
+        _Atomic int *ready = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (ready == MAP_FAILED || pipe(alive) != 0 ||
+            unshare(CLONE_NEWPID) != 0)
+            _exit(fail("pidns-setup"));
+        atomic_init(ready, 0);
+        pid_t init = fork();
+        if (init < 0)
+            _exit(fail("pidns-init-fork"));
+        if (init == 0) {
+            if (getpid() != 1)
+                _exit(2);
+            /* The inherited process group has no ID in this namespace.
+             * Any-child, exact-child, and current-group waits still work. */
+            for (int selector = 0; selector < 4; ++selector) {
+                pid_t waited = fork();
+                if (waited < 0)
+                    _exit(6);
+                if (waited == 0)
+                    _exit(11);
+                int status;
+                if (selector == 3) {
+                    siginfo_t info = { 0 };
+                    if (waitid(P_PGID, 0, &info, WEXITED) != 0 ||
+                        info.si_pid != waited || info.si_code != CLD_EXITED ||
+                        info.si_status != 11)
+                        _exit(7);
+                } else if (waitpid(selector == 0 ? -1 : selector == 1 ? waited : 0,
+                                   &status, 0) != waited ||
+                           !WIFEXITED(status) || WEXITSTATUS(status) != 11) {
+                    _exit(8);
+                }
+            }
+            for (int i = 0; i < 2; ++i) {
+                pid_t child = fork();
+                if (child < 0)
+                    _exit(3);
+                if (child == 0) {
+                    /* Include an orphaned grandchild in the exit walk. */
+                    if (i == 1 && fork() < 0)
+                        _exit(4);
+                    atomic_fetch_add(ready, 1);
+                    for (;;)
+                        pause();
+                }
+            }
+            for (int i = 0; i < POLL_ATTEMPTS; ++i) {
+                if (atomic_load(ready) == 3)
+                    _exit(23);
+                poll_delay();
+            }
+            _exit(5);
+        }
+        close(alive[1]);
+        int status;
+        if (waitpid(init, &status, 0) != init || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 23)
+            _exit(fail("pidns-init-wait"));
+        /* Every descendant retained the write end: EOF proves teardown. */
+        struct pollfd pfd = { .fd = alive[0], .events = POLLIN };
+        char byte;
+        if (poll(&pfd, 1, 1000) != 1 || read(alive[0], &byte, 1) != 0)
+            _exit(fail("pidns-descendants-survived"));
+        errno = 0;
+        if (fork() != -1 || errno != ENOMEM)
+            _exit(fail("pidns-dead-namespace-fork"));
+        close(alive[0]);
+        munmap(ready, 4096);
+        _exit(0);
+    }
+    int status;
+    if (waitpid(controller, &status, 0) != controller || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0)
+        return fail("pidns-controller-wait");
+    puts("THEKERNEL_PROC_ZOMBIE_PID_NAMESPACE_EXIT_OK");
+    return 0;
 }
 
 static int proc_root_contains(pid_t pid)
@@ -531,6 +622,8 @@ int main(void)
     }
     puts("THEKERNEL_PROC_ZOMBIE_ROOT_HIDDEN_OK");
     puts("THEKERNEL_PROC_ZOMBIE_STAT_HIDDEN_OK");
+    if (test_pid_namespace_exit() != 0)
+        return 1;
     puts("THEKERNEL_PROC_ZOMBIE_OK");
     return 0;
 }

@@ -356,6 +356,10 @@ impl<T> RecvReservation<T> {
         self.item.as_ref().expect("active receive reservation")
     }
 
+    pub(super) fn item_mut(&mut self) -> &mut T {
+        self.item.as_mut().expect("active receive reservation")
+    }
+
     /// Consumes the exact reserved item. A listener-side close rejects the
     /// commit and returns ownership so the transport can publish peer reset in
     /// task context.

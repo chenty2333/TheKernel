@@ -3929,6 +3929,24 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
         sys.add("kernel", {
             let mut kernel = DirMapping::new();
 
+            // These are the IDs actually returned for unmapped namespace IDs.
+            for name in ["overflowuid", "overflowgid"] {
+                kernel.add(
+                    name,
+                    SimpleFile::new_regular_with_permission(
+                        fs.clone(),
+                        NodePermission::from_bits_truncate(0o444),
+                        || {
+                            Ok(format!(
+                                "{}\n",
+                                thekernel_linux_cred::USER_NAMESPACE_OVERFLOW_ID
+                            )
+                            .into_bytes())
+                        },
+                    ),
+                );
+            }
+
             kernel.add(
                 "log_filter",
                 SimpleFile::new_regular_with_permission(
@@ -4523,6 +4541,30 @@ mod tests {
     }
 
     #[test]
+    fn proc_exports_real_namespace_overflow_ids() {
+        let _context = crate::test_support::scheduler_test_context();
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let fs = new_procfs(PidNamespace::try_new_root(user_ns).unwrap());
+        let root = axfs_ng_vfs::Mountpoint::new_root(&fs).root_location();
+        let kernel = root
+            .lookup_no_follow(FsName::new(b"sys"))
+            .unwrap()
+            .lookup_no_follow(FsName::new(b"kernel"))
+            .unwrap();
+        for name in [b"overflowuid", b"overflowgid"] {
+            let location = kernel.lookup_no_follow(FsName::new(name)).unwrap();
+            let file = location.entry().as_file().unwrap();
+            let mut bytes = [0; 32];
+            let count = file.read_at(&mut bytes, 0).unwrap();
+            assert_eq!(
+                &bytes[..count],
+                format!("{}\n", thekernel_linux_cred::USER_NAMESPACE_OVERFLOW_ID).as_bytes()
+            );
+            assert_eq!(file.read_at(&mut bytes, count as u64).unwrap(), 0);
+        }
+    }
+
+    #[test]
     fn oom_score_adj_accepts_in_range_raise_and_lower_values() {
         assert_eq!(validate_oom_score_adj_value(500), Ok(()));
         assert_eq!(validate_oom_score_adj_value(0), Ok(()));
@@ -4709,6 +4751,7 @@ mod tests {
 
     #[test]
     fn bpf_stats_open_snapshot_survives_chunked_read_and_concurrent_publication() {
+        let _context = crate::test_support::scheduler_test_context();
         fn new_file() -> Arc<ProcBpfStatsFile> {
             let holder = Arc::new(Mutex::new(None));
             let holder_for_root = holder.clone();

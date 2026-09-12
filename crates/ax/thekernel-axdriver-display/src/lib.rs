@@ -92,6 +92,12 @@ pub enum GpuQueue {
 /// can retain request and response DMA buffers until terminal completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GpuBatch {
+    /// Upload CPU-written pixels without changing the scanout.
+    Transfer2d {
+        resource: u32,
+        width: u32,
+        height: u32,
+    },
     Create2d {
         width: u32,
         height: u32,
@@ -185,7 +191,7 @@ pub enum GpuBatch {
     },
     Submit3d {
         context: u32,
-        ring_idx: u32,
+        ring_idx: Option<u32>,
         commands: Vec<u8>,
         resources: Vec<u32>,
     },

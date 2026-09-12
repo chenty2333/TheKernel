@@ -159,6 +159,13 @@ version = "0.1"
 [dependencies.spin]
 version = "0.10"
 
+# Exercise the real async block policy in the writeback tests.
+[dev-dependencies.axdriver]
+package = "thekernel-axdriver"
+path = "../thekernel-axdriver"
+version = "=0.3.0-preview.2"
+features = ["virtio-blk"]
+
 [dev-dependencies.axdriver_block]
 package = "thekernel-axdriver-block"
 path = "../thekernel-axdriver-block"

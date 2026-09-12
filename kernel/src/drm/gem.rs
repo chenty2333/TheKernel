@@ -15,8 +15,8 @@ pub trait GemBacking: Send + Sync {
     }
 }
 
-/// VirtIO resource IDs have disjoint 2D, 3D and blob semantics.  Numeric
-/// equality is never authority to submit a 3D resource to SET_SCANOUT.
+/// Typed resource identity determines whether scanout needs a CPU upload,
+/// a native virgl texture, or an explicit blob layout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostResourceKind {
     Scanout2d,

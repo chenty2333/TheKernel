@@ -321,6 +321,48 @@ impl InterfaceInner {
         let icmp_packet = check!(Icmpv4Packet::new_checked(ip_payload));
         let icmp_repr = check!(Icmpv4Repr::parse(&icmp_packet, &self.caps.checksum));
 
+        #[cfg(all(feature = "socket-udp", feature = "alloc"))]
+        if let Some((header, data, kind, code, info)) = match icmp_repr {
+            Icmpv4Repr::DstUnreachable {
+                reason,
+                header,
+                data,
+            } => Some((
+                header,
+                data,
+                3,
+                u8::from(reason),
+                if u8::from(reason) == 4 {
+                    u16::from_be_bytes([ip_payload[6], ip_payload[7]]) as u32
+                } else {
+                    0
+                },
+            )),
+            Icmpv4Repr::TimeExceeded {
+                reason,
+                header,
+                data,
+            } => Some((header, data, 11, u8::from(reason), 0)),
+            _ => None,
+        } {
+            if header.next_header == IpProtocol::Udp && header.src_addr == ip_repr.dst_addr {
+                for socket in _sockets
+                    .items_mut()
+                    .filter_map(|i| crate::socket::udp::Socket::downcast_mut(&mut i.socket))
+                {
+                    socket.process_error(
+                        header.src_addr.into(),
+                        header.dst_addr.into(),
+                        ip_repr.src_addr.into(),
+                        data,
+                        kind,
+                        code,
+                        info,
+                    );
+                }
+            }
+        }
+
         #[cfg(feature = "socket-icmp")]
         let mut handled_by_icmp_socket = false;
 

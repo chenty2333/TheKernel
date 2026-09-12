@@ -266,6 +266,19 @@ Asynchronous completions never inherit the token. Fixed buffered I/O can block,
 so the candidate does not defer notifications across those operations; no
 batch-notification improvement is claimed for the primary fixed-read scenario.
 
+### No-mark permission experiment
+
+`build --io-notify-fastpath` independently enables a default-off fanotify
+permission fast path, with separate `mem1g-io-notify-fastpath` artifacts.
+It skips permission metadata and registry traversal only when the acquired
+mark count is zero; file I/O status validation still runs first. Mark additions
+increment before publication and removals decrement after removal. With marks
+present, the existing permission dispatch remains unchanged. This follows the
+no-watch guard approach in [Linux fsnotify](https://github.com/torvalds/linux/blob/master/include/linux/fsnotify.h).
+Do not combine it with `--io-submit-batch` when measuring its isolated effect.
+Benchmark baseline commands reject this flag; supply the prepared candidate
+kernel and ESP paths. No performance improvement is claimed until measured.
+
 ### Isolating the I/O candidate
 
 `build --io-submit-batch` enables only the existing I/O candidate. It uses a
@@ -345,3 +358,142 @@ tests. The experiment also exposed and fixed two runner issues: firmware LF-CR
 line endings blocking exact readiness markers, and Linux diagnostic output
 interrupting workload JSON. Their regressions preserve strict marker, Linux
 boot-version and JSON/matrix validation.
+
+### Focused I/O target and lifecycle diagnosis
+
+`bench --suite io --io-target` explicitly selects only the predeclared 4 KiB
+random registered-resource buffered-read QD32 scenario. Without this flag the
+runner still requires all 72 rows; target mode requires exactly the one matching
+row, with the same content and completion checks and 128-operation warmup.
+Use target mode for a focused paired experiment; the full matrix remains needed
+for the other I/O guardrails.
+
+```sh
+./tools/thekernel.py bench --suite io --accel kvm --io-target --io-trace \
+  --iterations 64 --trials 1
+```
+
+`--io-trace` requires that exact bounded diagnostic configuration. TheKernel
+baseline and optional candidate clear and enable the existing lifecycle capture
+after workload warmup, then disable it after measured I/O and print the snapshot
+outside timing. Linux runs the identical target without this private trace.
+The guest controls are `KERNEL_BENCH_IO_TARGET=1` and `KERNEL_BENCH_IO_TRACE=1`;
+the latter requires the former and 64 iterations. The default workload enables
+neither option.
+
+The runner rejects dropped events, missing or duplicate capture markers,
+incomplete request lifecycles, unexpected transitions, and incorrect completion
+results. `results.json` retains the ring/slot/generation identities and event
+timestamps under `io_traces`, plus sums and means for adjacent lifecycle
+intervals. Capture includes measured requests only, with aggregate CQ-head
+reclamation observations possibly accounting for the last warmup batch.
+It labels the experiment `diagnostic_only` and provides no performance-win
+inference. Rerun without `--io-trace` for comparable elapsed measurements.
+
+Fixed reads add kernel-private `executor_started` and `executor_returned`
+stages around the complete `file.description().and_then(...)` submission call.
+Issue-to-executor-start covers the remaining resource validation and geometry
+work. Executor-start-to-return includes the full submission wrapper, including
+security/fanotify hooks, provider execution, filesystem work, copying and any
+blocking. Return-to-completion-accepted includes lease retirement and terminal
+completion handling. Publication intervals include completion bookkeeping and
+tracing overhead. These boundaries are observations, not exclusive cost centers;
+in particular the full wrapper must not be labeled filesystem time alone.
+The synchronous fixed-read target also records `permission_started`,
+`permission_returned`, `read_started`, `read_returned`, and
+`notification_returned`. The permission interval includes file-status validation
+and fanotify dispatch. The read interval brackets the complete retained physical
+buffer read, including filesystem/provider work, bounce allocation, copying and
+blocking. Read-return to notification-return covers post-read fsnotify dispatch;
+credential installation and remaining validation precede read-start. All these
+intervals include tracing overhead. The 64-request target uses 832 request events
+plus aggregate reclamation events, within the existing 1,024-event capacity.
+Aggregate reclamation cannot identify the exact moment
+userspace consumed each CQE. See [lifecycle capture](debugging.md#io_uring-lifecycle-capture)
+for the existing trace capacity, loss semantics and control interface.
+
+A follow-up guest run completed all 13 stages for 64 measured requests with
+zero dropped events. The permission interval averaged 7.16 µs, the retained
+buffer read 198.80 µs (median 121.42 µs), and post-read notification 9.60 µs.
+The read interval accounted for 79% of the captured reservation-to-publication
+time. This narrows further investigation to the read path, which still includes
+provider execution, allocation, copying and blocking. Other validation guests
+were running on the host, so these diagnostic timings do not establish a
+performance improvement or isolate physical storage latency. This capture
+predates the removal of redundant resident-set scans and empty syslog polling
+found during desktop validation.
+
+### Target diagnosis and no-mark permission experiment (2026-09-08)
+
+A 64-operation diagnostic run of the same primary target completed all eight
+trace stages without loss. Mean issue-to-executor-start was 2.20 µs, the full
+synchronous submission wrapper was 169.73 µs, and executor-return-to-completion
+was 2.37 µs. The other adjacent stages averaged 2.42–5.73 µs. Foreground system
+CPU was 12.392 ms, user CPU 0.215 ms, with zero voluntary or involuntary context
+switches. This locates the large interval inside the synchronous wrapper; it
+does not attribute that entire interval to fanotify or the filesystem.
+
+The separate, default-off `io-notify-fastpath` experiment avoids fanotify
+permission metadata lookup, allocation and registry scanning when the existing
+atomic mark count is zero. File-status validation remains in place, and a
+nonzero count retains the original permission path. It does not enable the
+earlier `io-submit-batch` candidate.
+
+Ten rotating paired trials plus a discarded warmup round ran without tracing,
+with 1,000 operations per guest, KVM, four vCPUs pinned to host CPUs 0–3, 1 GiB
+RAM and private writable rootdisks from the same image. All 33 target runs
+passed content, completion-identity and clean-shutdown checks.
+
+| Primary target elapsed time per operation | Baseline | No-mark candidate |
+| --- | ---: | ---: |
+| Geometric mean | 198.22 µs | 177.51 µs |
+| Paired improvement | — | 10.45% |
+| 95% bootstrap interval for improvement | — | −17.70% to +32.57% |
+
+Positive improvement means faster. The interval crosses zero, so the point
+estimate does not establish a stable benefit or meet the acceptance criterion.
+Keep this candidate default off. Linux's target geometric mean was 2.63 µs;
+the focused run omits the preceding scenarios of the earlier full matrix,
+so these absolute values are not a longitudinal performance comparison.
+Measurements came from a shared development host.
+
+Focused host validation passed seven fanotify tests in each feature setting,
+including a real mark installation/removal fixture that verifies metadata is
+skipped only in the empty case, and existing permission-response/denial tests.
+The trace capture passed three Rust tests and fifteen benchmark Python tests.
+A separate one-trial, 64-operation full-matrix smoke run passed all 72 scenarios
+on baseline, candidate and Linux, including read contents, write readback,
+completion identities and clean shutdown. This checks functional guardrails;
+it is not a statistical full-matrix performance result.
+
+
+## ASID fast-switch scheduler gate (2026-09-13)
+
+`asid-fast-switch` remains default off. The final baseline and candidate were
+built from the same runtime sources, including the RSS and syslog fixes, and
+compared with Linux 7.2.3 using the same rebuilt rootfs. The scheduler experiment
+used 1 GiB, four vCPUs pinned individually to host CPUs 0–3, 1,000 iterations,
+and ten rotating paired trials after one discarded warmup round. All 33 guests
+completed all four pressure scenarios and passed the affinity and result checks;
+no other task VM or build ran during measurement.
+
+The predeclared mixed-pressure `wake_to_run_p99_ns` target had a **+5.12%**
+paired improvement estimate, with a **95% interval of −225.49% to +71.05%**.
+It does not meet the required 10% lower confidence bound. The wide interval
+also prevents a reliable claim about this target's direction.
+
+All 64 candidate-versus-baseline metric comparisons were reviewed: 56 have
+positive-valued ratios and eight retain absolute changes because of zero
+switch/migration counts. Twelve metrics trigger the >5% point-regression flag:
+two under CPU pressure, two under I/O pressure, four under mixed pressure, and
+four without pressure. These are flags, not twelve established regressions.
+In particular, unpressured handoff p99 worsened by 18.33% (95% improvement
+interval −31.81% to −6.38%). Mixed-pressure aggregate I/O-worker throughput
+had a 12.76% point regression with an interval crossing zero. The sole metric
+meeting the improvement threshold was unpressured involuntary-switch count;
+it cannot substitute for the predeclared wake-latency target.
+
+The necessary scheduler gate failed, so the planned conditional 72-scenario
+I/O performance experiment was not run. Earlier functional ASID checks remain
+functional evidence; they do not justify enabling the policy without the
+required performance benefit. No default or runtime policy was changed.

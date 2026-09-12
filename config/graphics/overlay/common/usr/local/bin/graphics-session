@@ -21,4 +21,12 @@ if grep -Eqx 'q35-(graphics-seatd|software-desktop)' /etc/thekernel-graphics-fla
 elif [ -c /dev/dri/renderD128 ]; then
     set -- "$@" --renderer=gl
 fi
+if grep -qx q35-software-desktop /etc/thekernel-graphics-flavor; then
+    config_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}
+    mkdir -p "$config_dir"
+    if [ ! -e "$config_dir/user-dirs.dirs" ] && [ ! -L "$config_dir/user-dirs.dirs" ]; then
+        cp /etc/xdg/user-dirs.dirs "$config_dir/user-dirs.dirs"
+    fi
+    pulseaudio --start --exit-idle-time=-1 --log-target="file:$XDG_RUNTIME_DIR/pulse.log"
+fi
 exec weston "$@"

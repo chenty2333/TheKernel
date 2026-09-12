@@ -2,8 +2,8 @@
 //!
 //! fbdev is represented by a real dumb GEM object and a normal DRM
 //! framebuffer.  It intentionally owns DRM master while the text console is
-//! active; VT/session code will hand that master to the compositor rather
-//! than maintaining a second, raw-display scanout path.
+//! active, yielding to the first userspace primary opener or a VT/session
+//! handoff. There is no second, raw-display scanout path.
 
 use alloc::sync::Arc;
 
@@ -157,28 +157,14 @@ impl DrmFbdev {
     /// the vblank worker complete it after the VT transaction has released
     /// all slow locks.
     pub fn restore_text_nonblocking(&self) -> DrmResult<()> {
-        if self.yoffset() == 0 {
-            self.file.submit_legacy_atomic(&[], None, None, true)
-        } else {
-            let resources = self.file.resources();
-            self.file.submit_legacy_atomic(
-                &[Change {
-                    object: resources.primary_plane_id,
-                    property: property::PLANE_SRC_Y,
-                    value: 0,
-                }],
-                None,
-                None,
-                true,
-            )?;
-            *self.yoffset.lock() = 0;
-            Ok(())
-        }
+        self.commit_mode_with_policy(true)?;
+        *self.yoffset.lock() = 0;
+        Ok(())
     }
 
     /// Relinquish the primary-node master while a graphics VT owns the seat.
     /// The fbdev GEM remains allocated, but it cannot submit or modeset until
-    /// the VT transaction has restored text mode.
+    /// mastership is reacquired for text mode.
     pub fn release_master(&self) {
         self.file.drop_master();
     }
@@ -188,6 +174,10 @@ impl DrmFbdev {
     }
 
     fn commit_mode(&self) -> DrmResult<()> {
+        self.commit_mode_with_policy(false)
+    }
+
+    fn commit_mode_with_policy(&self, nonblocking: bool) -> DrmResult<()> {
         let resources = self.file.resources();
         let source_width = self.mode.width.checked_shl(16).ok_or(DrmError::Overflow)?;
         let source_height = self.mode.height.checked_shl(16).ok_or(DrmError::Overflow)?;
@@ -266,7 +256,7 @@ impl DrmFbdev {
             ],
             Some(self.mode),
             None,
-            false,
+            nonblocking,
         )
     }
 }

@@ -18,8 +18,9 @@ use super::sync::restart_futex_wait;
 use crate::{
     mm::{map_usercopy_error, shmem_resident_pages, system_memory_stats},
     task::{
-        AsThread, Kgid, RestartBlock, UTS_FIELD_LEN, has_pending_syscall_signal, live_thread_count,
-        load_average_sample_now, load_average_sysinfo, ns_capable,
+        AsThread, Kgid, ProcStateHint, RestartBlock, UTS_FIELD_LEN, has_pending_syscall_signal,
+        live_thread_count, load_average_sample_now, load_average_sysinfo, ns_capable,
+        with_proc_state_hint,
     },
 };
 
@@ -660,6 +661,30 @@ use thekernel_linux_syslog::{
 static SYSLOG_READ_LOCK: Mutex<()> = Mutex::new(());
 static SYSLOG_CURSORS: Mutex<SyslogCursors> = Mutex::new(SyslogCursors { read: 0, clear: 0 });
 
+static SYSLOG_READERS: event_listener::Event = event_listener::Event::new();
+
+pub(crate) fn notify_syslog_readers() {
+    let _guard = kernel_guard::NoPreemptIrqSave::new();
+    SYSLOG_READERS.notify(usize::MAX);
+}
+
+async fn wait_for_syslog_data(cursor: u64) {
+    loop {
+        if axruntime::klog::available_from(cursor) != 0 {
+            return;
+        }
+        let mut slot = core::pin::pin!(axtask::event_listener::IrqSafeListenerSlot::new(
+            &SYSLOG_READERS
+        ));
+        let listener = slot.as_mut().listen();
+        // Publication between the empty check and registration cannot be lost.
+        if axruntime::klog::available_from(cursor) != 0 {
+            return;
+        }
+        listener.await;
+    }
+}
+
 fn current_can_read_klog() -> bool {
     let current = current();
     let thread = current.as_thread();
@@ -691,7 +716,11 @@ fn syslog_copy<M: UserMemory + ?Sized>(
         if has_pending_syscall_signal(current().as_thread()) {
             return Err(AxError::Interrupted);
         }
-        axtask::yield_now();
+        with_proc_state_hint(ProcStateHint::Interruptible, || {
+            axtask::future::block_on(axtask::future::interruptible(wait_for_syslog_data(cursor)))
+        })
+        .map_err(AxError::from)?
+        .map_err(|_| AxError::Interrupted)?;
     }
 }
 
@@ -871,6 +900,73 @@ mod tests {
             destination.copy_from_slice(src);
             Ok(())
         }
+    }
+
+    #[test]
+    fn syslog_empty_wait_parks_until_arrival_and_cancels_on_interrupt() {
+        use alloc::sync::Arc;
+        use core::{
+            future::Future,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Context, Poll, Waker},
+        };
+        use alloc::task::Wake;
+
+        struct CountWake(AtomicUsize);
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let _context = crate::test_support::scheduler_test_context();
+        let count = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        let (_, cursor) = axruntime::klog::snapshot_into(0, &mut [], true);
+        let _ = axruntime::klog::take_reader_notification();
+        {
+            let mut wait = core::pin::pin!(wait_for_syslog_data(cursor));
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(
+                count.0.load(Ordering::Relaxed),
+                0,
+                "empty reads must not self-wake"
+            );
+            notify_syslog_readers();
+            assert!(
+                wait.as_mut().poll(&mut cx).is_pending(),
+                "a spurious wake is not data"
+            );
+            let before = count.0.load(Ordering::Relaxed);
+            axruntime::klog::diagnostic(format_args!("syslog arrival test"));
+            assert_eq!(
+                count.0.load(Ordering::Relaxed),
+                before,
+                "producers defer wakeups"
+            );
+            assert!(axruntime::klog::take_reader_notification());
+            notify_syslog_readers();
+            assert!(count.0.load(Ordering::Relaxed) > before);
+            assert!(wait.as_mut().poll(&mut cx).is_ready());
+        }
+        let (_, cursor) = axruntime::klog::snapshot_into(0, &mut [], true);
+        {
+            let mut wait =
+                core::pin::pin!(axtask::future::interruptible(wait_for_syslog_data(cursor)));
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            axtask::current().interrupt();
+            assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Err(_))));
+        }
+        let before = count.0.load(Ordering::Relaxed);
+        notify_syslog_readers();
+        assert_eq!(
+            count.0.load(Ordering::Relaxed),
+            before,
+            "cancelled readers must unlink"
+        );
     }
 
     #[test]

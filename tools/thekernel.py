@@ -70,7 +70,8 @@ def parse_variant(args: argparse.Namespace) -> Variant:
         raise ProductError(f"--memory must be a positive K/M/G size: {args.memory}")
     variant = Variant(memory=memory, asid_fast_switch=args.asid_fast_switch,
                       m5_candidate=getattr(args, "m5_candidate", False),
-                      io_submit_batch=getattr(args, "io_submit_batch", False))
+                      io_submit_batch=getattr(args, "io_submit_batch", False),
+                      io_notify_fastpath=getattr(args, "io_notify_fastpath", False))
     if variant.memory_bytes <= KERNEL_LOAD_PADDR:
         raise ProductError("--memory must extend beyond the 2 MiB kernel load address")
     if variant.memory_bytes > X86_64_MAX_MEMORY_BYTES:
@@ -233,6 +234,8 @@ def kernel_features(artifacts: Artifacts) -> str:
         features.append("sched-wake-locality")
     if variant.m5_candidate or variant.io_submit_batch:
         features.append("io-submit-batch")
+    if variant.io_notify_fastpath:
+        features.append("io-notify-fastpath")
     return " ".join(features)
 
 
@@ -416,6 +419,7 @@ class RunSpec:
     qmp_timeout_secs: float = 5.0
     graphics_width: int = 800
     graphics_height: int = 600
+    audio_backend: str | None = None
 
 
 @isolated_run
@@ -499,6 +503,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             graphics_profile=spec.graphics_profile,
             graphics_width=spec.graphics_width,
             graphics_height=spec.graphics_height,
+            audio_backend=spec.audio_backend,
             extra_args=(("-d", spec.qemu_debug, "-D", str(run_dir / "qemu-debug.log"))
                         if spec.qemu_debug else ()) + (
                 ("-gdb", f"unix:{run_dir / 'gdb.sock'},server=on,wait=off",
@@ -639,6 +644,8 @@ def prepare_desktop_home(path: Path | None = None) -> Path:
 
 
 def run_gui_cmd(args: argparse.Namespace) -> int:
+    if getattr(args, "width", 1920) <= 0 or getattr(args, "height", 1080) <= 0:
+        raise ProductError("--width and --height must be positive")
     if args.extra_block:
         raise ProductError("run-gui reserves the extra disk for persistent home; use --home-disk")
     artifacts = Artifacts(state_root(), parse_variant(args), "system")
@@ -653,6 +660,9 @@ def run_gui_cmd(args: argparse.Namespace) -> int:
 
 
 def run_cmd(args: argparse.Namespace) -> int:
+    width, height = getattr(args, "width", 800), getattr(args, "height", 600)
+    if width <= 0 or height <= 0:
+        raise ProductError("--width and --height must be positive")
     artifacts = Artifacts(state_root(), parse_variant(args), args.profile)
     run_cpus = resolve_run_cpus(args.smp, args.run_cpus)
     rootfs = Path(args.rootfs).expanduser().resolve() if args.rootfs else None
@@ -679,6 +689,9 @@ def run_cmd(args: argparse.Namespace) -> int:
             workdir=Path(args.workdir) if args.workdir else None,
             interactive=args.interactive,
             graphics_profile=args.graphics_profile,
+            graphics_width=width,
+            graphics_height=height,
+            audio_backend=getattr(args, "audio_backend", None),
             input_after_marker=input_after_marker,
             stop_after_marker=args.stop_after_marker,
             commands=Path(args.commands) if args.commands else None,
@@ -738,6 +751,7 @@ SMOKE_FLAVORS = {
         marker="THEKERNEL_Q35_WESTON_READY",
         profile_markers={
             "virgl-interactive": "THEKERNEL_Q35_VIRGL_READY",
+            "virgl-headless": "THEKERNEL_Q35_VIRGL_READY",
             "venus-interactive": "THEKERNEL_Q35_VENUS_READY",
         },
         screenshot_size=(800, 600),
@@ -884,13 +898,8 @@ def graphics_smoke_cmd(args: argparse.Namespace) -> int:
     screenshot = Path(args.screenshot).expanduser().resolve()
     if not rootfs.is_file():
         raise ProductError(f"rootfs does not exist: {rootfs}")
-    if args.graphics_profile == "virgl-headless":
-        raise ProductError(
-            "virgl-headless graphics smoke is unsupported: its EGL-headless "
-            "display has no QMP pixel-oracle surface; use virgl-interactive"
-        )
     if (
-        args.graphics_profile in {"virgl-interactive", "venus-interactive"}
+        args.graphics_profile in {"virgl-interactive", "virgl-headless", "venus-interactive"}
         and args.flavor not in {"q35-graphics-seatd", "q35-graphics-logind"}
     ):
         raise ProductError(
@@ -903,7 +912,7 @@ def graphics_smoke_cmd(args: argparse.Namespace) -> int:
     marker = descriptor.profile_markers.get(args.graphics_profile, descriptor.marker)
     if args.flavor == "q35-graphics-logind":
         checkpoints = _logind_smoke_checkpoints(marker, screenshot)
-    elif args.flavor == "q35-graphics-seatd" and args.graphics_profile == "virgl-interactive":
+    elif args.flavor == "q35-graphics-seatd" and args.graphics_profile in {"virgl-interactive", "virgl-headless"}:
         checkpoints = _xwayland_smoke_checkpoints(screenshot)
     elif args.flavor == "q35-graphics-seatd":
         size = descriptor.screenshot_size
@@ -948,7 +957,11 @@ def graphics_smoke_cmd(args: argparse.Namespace) -> int:
             qmp_screenshot_size=descriptor.screenshot_size,
             qmp_screenshot_color_blocks=descriptor.screenshot_color_blocks,
             qmp_checkpoints=checkpoints,
-            qmp_timeout_secs=descriptor.qmp_timeout_secs,
+            # Virgl's completion marker follows the full Piglit quick profile.
+            # Give its QMP checkpoint the same budget as the requested run.
+            qmp_timeout_secs=(max(descriptor.qmp_timeout_secs, args.timeout)
+                              if args.graphics_profile in {"virgl-interactive", "virgl-headless"}
+                              else descriptor.qmp_timeout_secs),
             run_cpus=args.smp,
         ),
     )
@@ -1037,6 +1050,8 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
                         help="build or validate the experimental scheduler/I/O candidate in separate artifact paths")
     parser.add_argument("--io-submit-batch", action="store_true",
                         help="enable the experimental I/O submission batch independently in separate artifact paths")
+    parser.add_argument("--io-notify-fastpath", action="store_true",
+                        help="enable the experimental no-mark fanotify permission fast path in separate artifact paths")
     if profiles:
         parser.add_argument(
             "--profile",
@@ -1065,6 +1080,10 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
                         help="serve workdir/gdb.sock; pause on guest shutdown/reboot/panic for inspection")
     parser.add_argument("--rootfs-transport", choices=("module", "drive"), default="module")
     parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--width", type=int, default=800, help="guest display width in pixels")
+    parser.add_argument("--height", type=int, default=600, help="guest display height in pixels")
+    parser.add_argument("--audio-backend", choices=("pa", "wav"),
+                        help="attach VirtIO playback through host PulseAudio or workdir/audio.wav")
     parser.add_argument(
         "--graphics-profile",
         choices=tuple(GRAPHICS_PROFILES),
@@ -1143,9 +1162,7 @@ def add_graphics_smoke_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--graphics-profile",
-        # virgl-headless stays rejected at runtime: its EGL-headless display
-        # has no QMP pixel-oracle surface for a smoke run.
-        choices=tuple(profile for profile in GRAPHICS_PROFILES if profile != "virgl-headless"),
+        choices=tuple(GRAPHICS_PROFILES),
         default="headless",
         help="QEMU display topology; headless uses QMP screendump without a host window",
     )
@@ -1446,8 +1463,13 @@ def abi_test_cmd(args: argparse.Namespace) -> int:
 
 
 def bench_cmd(args: argparse.Namespace) -> int:
-    if getattr(args, "m5_candidate", False) or getattr(args, "io_submit_batch", False):
+    if (getattr(args, "m5_candidate", False) or getattr(args, "io_submit_batch", False)
+            or getattr(args, "io_notify_fastpath", False)):
         raise ProductError("benchmark baseline must use default policies; supply prepared candidate kernel and ESP paths")
+    if getattr(args, "io_target", False) and args.suite != "io":
+        raise ProductError("--io-target requires --suite io")
+    if getattr(args, "io_trace", False) and (not getattr(args, "io_target", False) or args.iterations != 64 or args.trials != 1):
+        raise ProductError("--io-trace requires --io-target --iterations 64 --trials 1")
     if args.suite == "graphics":
         if not args.rootfs or not args.workdir or not args.linux_oracle_log:
             raise ProductError("graphics benchmark requires --rootfs, --workdir and --linux-oracle-log")
@@ -1507,6 +1529,7 @@ def bench_cmd(args: argparse.Namespace) -> int:
         result = run_benchmark_experiment(BenchmarkConfig(
             targets=tuple(targets), rootfs=rootfs, workdir=output, suite=args.suite,
             iterations=args.iterations, trials=args.trials,
+            io_target=getattr(args, "io_target", False), io_trace=getattr(args, "io_trace", False),
             cpus=resolve_run_cpus(args.smp, args.run_cpus), memory=args.memory,
             host_cpus=host_cpus, timeout=args.timeout,
         ))
@@ -1548,7 +1571,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_arguments(gui_parser)
     gui_parser.add_argument("--home-disk", help="persistent desktop home image (created once if missing)")
     gui_parser.set_defaults(func=run_gui_cmd, profile="system", interactive=True,
-                            graphics_profile="virgl-interactive", rootfs_transport="drive")
+                            graphics_profile="virgl-interactive", rootfs_transport="drive",
+                            width=1920, height=1080, memory="2G", accel="kvm", audio_backend="pa")
 
     test = sub.add_parser("test", help="run a checked host or guest suite")
     add_graphics_smoke_arguments(test)
@@ -1566,6 +1590,8 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--run-cpus", type=int)
     bench.add_argument("--iterations", type=int, default=1000)
     bench.add_argument("--trials", type=int, default=10)
+    bench.add_argument("--io-target", action="store_true", help="run only the predeclared 4 KiB random fixed buffered read QD32 target")
+    bench.add_argument("--io-trace", action="store_true", help="capture TheKernel measured-phase lifecycle events (target, 64 iterations, one trial)")
     bench.add_argument("--linux-kernel", help="already built Linux 7.2.3 oracle bzImage")
     bench.add_argument("--candidate-kernel")
     bench.add_argument("--candidate-esp")

@@ -228,11 +228,7 @@ impl<H: Hal, T: Transport> GpuTransport for VirtIoGpuDev<H, T> {
                     damage,
                 },
             ) => {
-                let resource = self
-                    .drm_resources
-                    .iter()
-                    .find_map(|entry| (entry.raw == resource).then_some(entry.resource))
-                    .ok_or(axdriver_base::DevError::InvalidParam)?;
+                let resource = ResourceId::from_raw(resource);
                 let visible = Rect::new(source_x, source_y, width, height);
                 let damage = damage.map_or(visible, |damage| {
                     Rect::new(damage.x, damage.y, damage.width, damage.height)
@@ -510,6 +506,36 @@ impl<H: Hal, T: Transport> GpuTransport for VirtIoGpuDev<H, T> {
                     context_id: None,
                 })
                 .map_err(as_dev_err),
+            (
+                GpuQueue::Control,
+                GpuBatch::Transfer2d {
+                    resource,
+                    width,
+                    height,
+                },
+            ) => {
+                let resource = self
+                    .drm_resources
+                    .iter()
+                    .find_map(|entry| (entry.raw == resource).then_some(entry.resource))
+                    .ok_or(axdriver_base::DevError::InvalidParam)?;
+                self.inner
+                    .submit_transfer_to_host(
+                        resource,
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            width,
+                            height,
+                        },
+                    )
+                    .map(|submission| GpuSubmission {
+                        fence_id: submission.fence_id,
+                        resource_id: None,
+                        context_id: None,
+                    })
+                    .map_err(as_dev_err)
+            }
             (GpuQueue::Cursor, GpuBatch::UpdateCursor(cursor)) => {
                 let resource = self
                     .drm_resources

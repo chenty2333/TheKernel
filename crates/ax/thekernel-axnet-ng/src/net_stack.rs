@@ -24,7 +24,7 @@ use spin::Once;
 
 use crate::{
     device::{
-        Device, DeviceStats, InterfaceInfo, LoopbackDevice, PacketSendProgress, RxWakeSource,
+        Device, DeviceStats, InterfaceInfo, InterfaceKind, LoopbackDevice, PacketSendProgress, RxWakeSource,
         TapDevice, TapHandle, TunDevice, TunHandle, VethEnd,
     },
     listen_table::ListenTable,
@@ -110,8 +110,23 @@ impl NetStackServicePermit<'_> {
             .packet_device_capabilities(interface_index)
     }
 
-    pub fn interfaces(&self) -> Vec<InterfaceInfo> {
-        self.service.router.interfaces()
+    pub fn interfaces(&self) -> AxResult<Vec<InterfaceInfo>> {
+        let mut interfaces = self.service.router.interfaces();
+        let addresses = if self.nowait {
+            self.stack.addresses.try_lock().ok_or(AxError::WouldBlock)?
+        } else {
+            self.stack.addresses.lock()
+        };
+        for interface in &mut interfaces {
+            interface.addresses.clear();
+            interface.addresses.extend(
+                addresses
+                    .iter()
+                    .filter(|entry| entry.ifindex == interface.index)
+                    .map(|entry| entry.cidr),
+            );
+        }
+        Ok(interfaces)
     }
 
     fn publish_route_generation(&self) {
@@ -151,16 +166,46 @@ impl NetStackServicePermit<'_> {
         }
         let mut next = registry.clone();
         next.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-        if self.service.router.device_slot(ifindex).is_none() {
-            return Err(AxError::NoSuchDevice);
-        }
+        let interface = self
+            .service
+            .router
+            .interfaces()
+            .into_iter()
+            .find(|entry| entry.index == ifindex)
+            .ok_or(AxError::NoSuchDevice)?;
         let mut result = Ok(());
+        let mut inserted = false;
         self.service.iface.update_ip_addrs(|addrs| {
-            if !addrs.contains(&addr) && addrs.push(addr).is_err() {
-                result = Err(AxError::ResourceBusy);
+            if !addrs.contains(&addr) {
+                if addrs.push(addr).is_err() {
+                    result = Err(AxError::ResourceBusy);
+                } else {
+                    inserted = true;
+                }
             }
         });
         result?;
+        // Loopback address assignment installs the local route used by the
+        // actual packet path, including when lo began unconfigured.
+        if interface.kind == InterfaceKind::Loopback
+            && !self
+                .service
+                .router
+                .routes()
+                .iter()
+                .any(|route| route.destination == addr)
+            && let Err(error) =
+                self.service
+                    .router
+                    .try_add_rule(Rule::new(addr, None, ifindex, addr.address()))
+        {
+            if inserted {
+                self.service.iface.update_ip_addrs(|addrs| {
+                    addrs.retain(|entry| *entry != addr);
+                });
+            }
+            return Err(error);
+        }
         next.push(AssignedAddress {
             ifindex,
             cidr: addr,
@@ -180,8 +225,22 @@ impl NetStackServicePermit<'_> {
             .iter()
             .position(|entry| entry.ifindex == ifindex && entry.cidr == addr)
             .ok_or(AxError::NotFound)?;
-        if self.service.router.device_slot(ifindex).is_none() {
-            return Err(AxError::NoSuchDevice);
+        let interface = self
+            .service
+            .router
+            .interfaces()
+            .into_iter()
+            .find(|entry| entry.index == ifindex)
+            .ok_or(AxError::NoSuchDevice)?;
+        if interface.kind == InterfaceKind::Loopback {
+            match self
+                .service
+                .router
+                .remove_rule(&Rule::new(addr, None, ifindex, addr.address()))
+            {
+                Ok(()) | Err(AxError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
         }
         self.service.iface.update_ip_addrs(|addrs| {
             if let Some(index) = addrs.iter().position(|candidate| *candidate == addr) {
@@ -291,6 +350,7 @@ impl NetStackServicePermit<'_> {
         self.service.router.configure_link(ifindex, name, mtu, up)?;
         self.publish_route_generation();
         if up == Some(true) {
+            self.stack.wake_protocol_worker();
             self.stack.poll_source.as_ref().wake();
         }
         Ok(())
@@ -774,7 +834,10 @@ impl NetStack {
         let poll_wake =
             Arc::try_new(NetPollWake(poll_source.clone())).map_err(|_| AxError::NoMemory)?;
         let poll_waker = Waker::from(poll_wake);
-        let rx_worker = if service.has_rx_wake_capable_device() {
+        // Kernel namespaces need protocol-timer ownership even with only lo:
+        // TCP can retain queued data and FIN state after the last fd closes.
+        // Host tests have no scheduler worker and explicitly drive polling.
+        let rx_worker = if cfg!(target_os = "none") || service.has_rx_wake_capable_device() {
             Some(NetRxWorker::try_new()?)
         } else {
             None
@@ -850,9 +913,9 @@ impl NetStack {
 
     /// Create a minimal network stack with only a loopback device.
     ///
-    /// This is used for new network namespaces created via `CLONE_NEWNET`.
-    /// The resulting stack has a single `lo` interface (127.0.0.1/8) and no
-    /// external connectivity.
+    /// The resulting standalone stack has a configured `lo` interface and
+    /// no external connectivity. Linux namespace creation uses
+    /// `try_new_network_namespace` for an initially down, unconfigured lo.
     pub fn new_loopback_only() -> Arc<Self> {
         Self::try_new_loopback_only().expect("failed to allocate loopback network namespace")
     }
@@ -898,6 +961,21 @@ impl NetStack {
         });
 
         Self::try_new(listen_table, socket_set, service)
+    }
+
+    /// Linux CLONE_NEWNET starts with an unconfigured, administratively down lo.
+    pub fn try_new_network_namespace() -> AxResult<Arc<Self>> {
+        let stack = Self::try_new_loopback_only()?;
+        {
+            let mut permit = stack.acquire_packet_service();
+            for interface in permit.interfaces()? {
+                for address in interface.addresses {
+                    permit.route_remove_interface_addr(interface.index, address)?;
+                }
+                permit.configure_link(interface.index, None, None, Some(false))?;
+            }
+        }
+        Ok(stack)
     }
 
     /// Add a network device to this stack's router.
@@ -1483,60 +1561,24 @@ impl NetStack {
     }
 
     pub fn add_interface_addr(&self, ifindex: u32, addr: IpCidr) -> AxResult {
-        // All readers take service before addresses (`interfaces`).  Taking
-        // these in the reverse order here used to permit an address mutation
-        // racing a dump to deadlock.  Reserve registry capacity only after
-        // the topology lock is held, then publish both sides together.
-        let mut service = self.service.lock();
-        let mut registry = self.addresses.lock();
-        if registry
-            .iter()
-            .any(|entry| entry.ifindex == ifindex && entry.cidr == addr)
-        {
-            return Err(AxError::AlreadyExists);
-        }
-        let mut next = registry.clone();
-        next.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-        if service.router.device_slot(ifindex).is_none() {
-            return Err(AxError::NoSuchDevice);
-        }
-        let mut result = Ok(());
-        service.iface.update_ip_addrs(|addrs| {
-            if !addrs.contains(&addr) && addrs.push(addr).is_err() {
-                result = Err(AxError::ResourceBusy);
-            }
-        });
-        result?;
-        next.push(AssignedAddress {
-            ifindex,
-            cidr: addr,
-        });
-        *registry = next;
-        self.publish_route_generation();
-        Ok(())
+        self.acquire_packet_service()
+            .route_add_interface_addr(ifindex, addr)
     }
 
     pub fn remove_interface_addr(&self, ifindex: u32, addr: IpCidr) -> AxResult {
-        let mut service = self.service.lock();
-        let mut registry = self.addresses.lock();
-        let position = registry
-            .iter()
-            .position(|entry| entry.ifindex == ifindex && entry.cidr == addr)
-            .ok_or(AxError::NotFound)?;
-        if service.router.device_slot(ifindex).is_none() {
-            return Err(AxError::NoSuchDevice);
-        }
-        service.iface.update_ip_addrs(|addrs| {
-            if let Some(index) = addrs.iter().position(|candidate| *candidate == addr) {
-                addrs.remove(index);
-            }
-        });
-        registry.remove(position);
-        self.publish_route_generation();
-        Ok(())
+        self.acquire_packet_service()
+            .route_remove_interface_addr(ifindex, addr)
     }
 
     /// Poll all network interfaces owned by this stack.
+    /// Schedule existing task-context service ownership after TCP close has
+    /// changed its next retransmit/FIN deadline, without retaining an fd.
+    pub(crate) fn wake_protocol_worker(&self) {
+        if let Some(worker) = &self.rx_worker {
+            worker.state.publish_wake();
+        }
+    }
+
     pub fn poll_interfaces(&self) -> NetPollStatus {
         if let Some(reason) = self.rx_terminal_reason() {
             return NetPollStatus::Terminal { reason };
@@ -1581,18 +1623,9 @@ impl NetStack {
 
     /// Snapshot the interfaces currently owned by this network stack.
     pub fn interfaces(&self) -> Vec<InterfaceInfo> {
-        let mut interfaces = self.service.lock().router.interfaces();
-        let addresses = self.addresses.lock();
-        for interface in &mut interfaces {
-            interface.addresses.clear();
-            interface.addresses.extend(
-                addresses
-                    .iter()
-                    .filter(|entry| entry.ifindex == interface.index)
-                    .map(|entry| entry.cidr),
-            );
-        }
-        interfaces
+        self.acquire_packet_service()
+            .interfaces()
+            .expect("blocking interface snapshot")
     }
 
     /// Snapshot the routes currently used by this network stack.
@@ -1689,9 +1722,13 @@ impl NetStack {
         if worker.state.terminal_reason().is_some() {
             return Err(PollRegistrationError::InvalidState);
         }
+        service.register_protocol_timer(waker)?;
         let registration = service.register_rx_waker(waker);
         let quarantine_edge = service.router.take_quarantine_edge();
-        if registration.has_owner() || service.has_rx_backlog() {
+        if registration.has_owner() || service.has_rx_backlog()
+            || service.router.has_dormant_rx_source()
+            || self.socket_set.closing_tcp_deadline().is_some()
+        {
             // A source error is already represented in the router's
             // per-device quarantine bitmap. Keep the worker alive whenever a
             // healthy source or retained software backlog can make progress;
@@ -1968,7 +2005,10 @@ mod tests {
 
     struct CountingWake(AtomicUsize);
 
+    static NEXT_PROBE_NAME: AtomicUsize = AtomicUsize::new(0);
+
     struct ProbeDevice {
+        name: String,
         quarantined: Arc<AtomicBool>,
         backlog: Arc<AtomicBool>,
         rx_wake_capable: bool,
@@ -1982,7 +2022,7 @@ mod tests {
 
     impl Device for ProbeDevice {
         fn name(&self) -> &str {
-            "probe0"
+            &self.name
         }
 
         fn stats(&self) -> DeviceStats {
@@ -2167,6 +2207,7 @@ mod tests {
         let receive_attempts = Arc::new(AtomicUsize::new(0));
         router
             .try_add_device(Box::new(ProbeDevice {
+                name: alloc::format!("probe{}", NEXT_PROBE_NAME.fetch_add(1, Ordering::Relaxed)),
                 quarantined: quarantined.clone(),
                 backlog: Arc::new(AtomicBool::new(false)),
                 rx_wake_capable: true,
@@ -2235,6 +2276,7 @@ mod tests {
 
         let index = stack
             .try_add_device(Box::new(ProbeDevice {
+                name: alloc::format!("probe{}", NEXT_PROBE_NAME.fetch_add(1, Ordering::Relaxed)),
                 quarantined: Arc::new(AtomicBool::new(false)),
                 backlog: backlog.clone(),
                 rx_wake_capable: true,
@@ -2247,7 +2289,7 @@ mod tests {
             }))
             .unwrap();
 
-        assert_eq!(index, 2);
+        assert_eq!(index, 3);
         assert_eq!(rx_registrations.load(Ordering::Acquire), 1);
         assert_eq!(
             worker.state.generation.load(Ordering::Acquire),
@@ -2296,6 +2338,7 @@ mod tests {
         let receives = Arc::new(AtomicUsize::new(0));
         let index = stack
             .try_add_device(Box::new(ProbeDevice {
+                name: alloc::format!("probe{}", NEXT_PROBE_NAME.fetch_add(1, Ordering::Relaxed)),
                 quarantined: Arc::new(AtomicBool::new(false)),
                 backlog: backlog.clone(),
                 rx_wake_capable: false,
@@ -2308,7 +2351,7 @@ mod tests {
             }))
             .unwrap();
 
-        assert_eq!(index, 1);
+        assert_eq!(index, 2);
         assert_eq!(ordinary_registrations.load(Ordering::Acquire), 1);
         assert!(backlog.load(Ordering::Acquire));
         assert!(wake_count.0.load(Ordering::Acquire) > 0);
@@ -2335,6 +2378,7 @@ mod tests {
         let failed_registrations = Arc::new(AtomicUsize::new(0));
 
         let result = stack.try_add_device(Box::new(ProbeDevice {
+            name: alloc::format!("probe{}", NEXT_PROBE_NAME.fetch_add(1, Ordering::Relaxed)),
             quarantined: Arc::new(AtomicBool::new(false)),
             backlog: Arc::new(AtomicBool::new(false)),
             rx_wake_capable: false,
@@ -2356,6 +2400,7 @@ mod tests {
         let retry_registrations = Arc::new(AtomicUsize::new(0));
         let index = stack
             .try_add_device(Box::new(ProbeDevice {
+                name: alloc::format!("probe{}", NEXT_PROBE_NAME.fetch_add(1, Ordering::Relaxed)),
                 quarantined: Arc::new(AtomicBool::new(false)),
                 backlog: Arc::new(AtomicBool::new(false)),
                 rx_wake_capable: false,
@@ -2367,7 +2412,7 @@ mod tests {
                 receive_attempts: Arc::new(AtomicUsize::new(0)),
             }))
             .unwrap();
-        assert_eq!(index, 1);
+        assert_eq!(index, 2);
         assert_eq!(retry_registrations.load(Ordering::Acquire), 1);
         assert_eq!(stack.interfaces().len(), 2);
         assert!(stack.packet_device_capabilities(2).is_some());
@@ -2380,6 +2425,10 @@ mod tests {
         while stack.interfaces().len() < MAX_DEVICES {
             stack
                 .try_add_device(Box::new(ProbeDevice {
+                    name: alloc::format!(
+                        "probe{}",
+                        NEXT_PROBE_NAME.fetch_add(1, Ordering::Relaxed)
+                    ),
                     quarantined: Arc::new(AtomicBool::new(false)),
                     backlog: Arc::new(AtomicBool::new(false)),
                     rx_wake_capable: true,
@@ -2396,6 +2445,7 @@ mod tests {
         for _ in 0..4 {
             let rx_registrations = Arc::new(AtomicUsize::new(0));
             let result = stack.try_add_device(Box::new(ProbeDevice {
+                name: alloc::format!("probe{}", NEXT_PROBE_NAME.fetch_add(1, Ordering::Relaxed)),
                 quarantined: Arc::new(AtomicBool::new(false)),
                 backlog: Arc::new(AtomicBool::new(false)),
                 rx_wake_capable: true,
@@ -2417,6 +2467,7 @@ mod tests {
         let rx_registrations = Arc::new(AtomicUsize::new(0));
         let index = retry_stack
             .try_add_device(Box::new(ProbeDevice {
+                name: alloc::format!("probe{}", NEXT_PROBE_NAME.fetch_add(1, Ordering::Relaxed)),
                 quarantined: Arc::new(AtomicBool::new(false)),
                 backlog: Arc::new(AtomicBool::new(false)),
                 rx_wake_capable: true,
@@ -2428,7 +2479,7 @@ mod tests {
                 receive_attempts: Arc::new(AtomicUsize::new(0)),
             }))
             .unwrap();
-        assert_eq!(index, 2);
+        assert_eq!(index, 3);
         assert_eq!(rx_registrations.load(Ordering::Acquire), 1);
     }
 
@@ -2546,6 +2597,25 @@ mod tests {
                 edge: false,
             }
         );
+        // These synthetic non-IP frames stop smoltcp ingress after one
+        // forwarding discard. Link admission and protocol draining therefore
+        // have distinct budgets; require bounded completion, not three passes.
+        let mut drained = false;
+        for _ in 0..=RX_PASS_BUDGET {
+            let status = stack.poll_interfaces();
+            assert!(matches!(
+                status,
+                NetPollStatus::Quarantined { edge: false, .. }
+            ));
+            if !status.is_continuation() {
+                drained = true;
+                break;
+            }
+        }
+        assert!(
+            drained,
+            "healthy backlog must drain despite the quarantined NIC"
+        );
         assert_eq!(
             stack.poll_interfaces(),
             NetPollStatus::Quarantined {
@@ -2640,6 +2710,7 @@ mod tests {
         let healthy_rx = Arc::new(AtomicUsize::new(0));
         let index = stack
             .try_add_device(Box::new(ProbeDevice {
+                name: alloc::format!("probe{}", NEXT_PROBE_NAME.fetch_add(1, Ordering::Relaxed)),
                 quarantined: Arc::new(AtomicBool::new(false)),
                 backlog: Arc::new(AtomicBool::new(false)),
                 rx_wake_capable: true,
@@ -2651,7 +2722,7 @@ mod tests {
                 receive_attempts: Arc::new(AtomicUsize::new(0)),
             }))
             .unwrap();
-        assert_eq!(index, 2);
+        assert_eq!(index, 3);
         assert_eq!(healthy_rx.load(Ordering::Acquire), 1);
 
         let worker = stack.rx_worker.as_ref().unwrap();
@@ -2757,6 +2828,7 @@ mod tests {
 
         let rx_registrations = Arc::new(AtomicUsize::new(0));
         let result = stack.try_add_device(Box::new(ProbeDevice {
+            name: alloc::format!("probe{}", NEXT_PROBE_NAME.fetch_add(1, Ordering::Relaxed)),
             quarantined: Arc::new(AtomicBool::new(false)),
             backlog: Arc::new(AtomicBool::new(false)),
             rx_wake_capable: true,

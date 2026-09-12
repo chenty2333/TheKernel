@@ -91,6 +91,20 @@ fn socket_ifconf_ioctl(context: &IoctlContext, stack: &NetStack, arg: usize) -> 
     Ok(0)
 }
 
+fn interface_flags(kind: InterfaceKind, administrative_up: bool) -> i16 {
+    let mut flags = if administrative_up {
+        net_device_flags::IFF_UP as i16 | net_device_flags::IFF_RUNNING as i16
+    } else {
+        0
+    };
+    flags |= if kind == InterfaceKind::Loopback {
+        net_device_flags::IFF_LOOPBACK as i16
+    } else {
+        net_device_flags::IFF_BROADCAST as i16 | net_device_flags::IFF_MULTICAST as i16
+    };
+    flags
+}
+
 /// Enacts interface state queries whose Linux wire decoding lives in linux-abi.
 pub fn socket_ifreq_ioctl(
     context: &IoctlContext,
@@ -128,14 +142,10 @@ pub fn socket_ifreq_ioctl(
         }
         IfreqRequest::GetFlags => {
             let interface = interface_by_name(&interfaces, ifr.name()).ok_or(LinuxError::ENODEV)?;
-            let mut flags = net_device_flags::IFF_UP as u32 | net_device_flags::IFF_RUNNING as u32;
-            if interface.kind == InterfaceKind::Loopback {
-                flags |= net_device_flags::IFF_LOOPBACK as u32;
-            } else {
-                flags |=
-                    net_device_flags::IFF_BROADCAST as u32 | net_device_flags::IFF_MULTICAST as u32;
-            }
-            (ifr, IfreqOutput::Flags(flags as i16))
+            (
+                ifr,
+                IfreqOutput::Flags(interface_flags(interface.kind, interface.administrative_up)),
+            )
         }
         IfreqRequest::GetMtu => (
             ifr,
@@ -157,6 +167,21 @@ pub fn socket_ifreq_ioctl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interface_flags_follow_administrative_state() {
+        let lo = net_device_flags::IFF_LOOPBACK as i16;
+        let active = net_device_flags::IFF_UP as i16 | net_device_flags::IFF_RUNNING as i16;
+        assert_eq!(interface_flags(InterfaceKind::Loopback, false), lo);
+        assert_eq!(interface_flags(InterfaceKind::Loopback, true), lo | active);
+        let ethernet =
+            net_device_flags::IFF_BROADCAST as i16 | net_device_flags::IFF_MULTICAST as i16;
+        assert_eq!(interface_flags(InterfaceKind::Ethernet, false), ethernet);
+        assert_eq!(
+            interface_flags(InterfaceKind::Ethernet, true),
+            ethernet | active
+        );
+    }
+
     #[test]
     fn linux_abi_owns_ifreq_and_ifconf_geometry() {
         assert_eq!(IFREQ_SIZE, 40);

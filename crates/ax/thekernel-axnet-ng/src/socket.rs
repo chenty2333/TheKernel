@@ -224,6 +224,9 @@ pub struct SendOptions {
     /// Sender credentials captured at the syscall boundary for automatic
     /// Unix `SO_PASSCRED` delivery.  Internal protocol traffic has none.
     pub credentials: Option<crate::options::SocketCredentials>,
+    /// Validated SCM_CREDENTIALS must remain attached even if SO_PASSCRED
+    /// is enabled by the receiver only after this send.
+    pub credentials_explicit: bool,
     /// Exact per-operation nonblocking state captured by a caller.
     ///
     /// `None` samples the socket's ordinary mutable state at operation entry.

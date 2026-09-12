@@ -929,7 +929,7 @@ impl CloneArgs {
             };
 
             let net_ns = if flags.contains(CloneFlags::NEWNET) {
-                NetworkNamespace::try_new_loopback_only(namespace_owner.clone())?
+                NetworkNamespace::try_new_network_namespace(namespace_owner.clone())?
             } else {
                 calling_thread.net_ns()
             };

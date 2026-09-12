@@ -35,10 +35,23 @@ class SystemTestGateTests(unittest.TestCase):
         self.assertEqual(product.kernel_features(artifacts[2]), product.kernel_features(artifacts[3]))
         self.assertEqual(product.kernel_features(artifacts[3]).split().count("io-submit-batch"), 1)
 
+    def test_io_notify_fastpath_is_independent_and_uses_separate_artifacts(self) -> None:
+        product = load_product()
+        artifacts = []
+        for flags in ([], ["--io-notify-fastpath"], ["--io-submit-batch"],
+                      ["--io-submit-batch", "--io-notify-fastpath"]):
+            args = product.build_parser().parse_args(["build", "--profile", "shell", *flags])
+            artifacts.append(product.Artifacts(Path("/unused"), product.parse_variant(args), args.profile))
+        self.assertEqual(len({item.output_dir for item in artifacts}), 4)
+        self.assertEqual(len({item.cargo_target_dir for item in artifacts}), 4)
+        self.assertEqual(product.kernel_features(artifacts[1]), "x86-product boot-shell io-notify-fastpath")
+        self.assertEqual(product.kernel_features(artifacts[3]),
+                         "x86-product boot-shell io-submit-batch io-notify-fastpath")
+
     def test_candidate_flags_cannot_replace_io_or_graphics_benchmark_baseline(self) -> None:
         product = load_product()
         for suite in ("io", "graphics"):
-            for flag in ("--io-submit-batch", "--m5-candidate"):
+            for flag in ("--io-submit-batch", "--m5-candidate", "--io-notify-fastpath"):
                 with self.subTest(suite=suite, flag=flag):
                     args = product.build_parser().parse_args(["bench", "--suite", suite, flag])
                     with patch.object(product, "graphics_benchmark_cmd") as graphics:
@@ -627,6 +640,33 @@ class DesktopHomeTests(unittest.TestCase):
         product = load_product()
         args = product.build_parser().parse_args(["run-gui"])
         self.assertEqual(args.graphics_profile, "virgl-interactive")
+        self.assertEqual((args.width, args.height, args.accel, args.audio_backend), (1920, 1080, "kvm", "pa"))
+        self.assertEqual(args.memory, "2G")
+        self.assertEqual(product.build_parser().parse_args(["run-gui", "--memory", "4G"]).memory, "4G")
+        self.assertEqual(product.build_parser().parse_args(["run"]).memory, "1G")
+
+    def test_display_and_audio_arguments_reach_no_build_run(self):
+        product = load_product()
+        for command, extra, expected in (
+            ("run", [], (800, 600, "tcg", None)),
+            ("run-gui", [], (1920, 1080, "kvm", "pa")),
+            ("run-gui", ["--width", "1280", "--height", "720", "--audio-backend", "wav"],
+                (1280, 720, "kvm", "wav")),
+        ):
+            with self.subTest(command=command, extra=extra):
+                args = product.build_parser().parse_args([command, "--no-build", *extra])
+                with patch.object(product, "run_product", return_value=0) as run:
+                    self.assertEqual(product.run_cmd(args), 0)
+                spec = run.call_args.args[1]
+                self.assertEqual((spec.graphics_width, spec.graphics_height, spec.accel, spec.audio_backend), expected)
+
+    def test_invalid_display_dimensions_fail_before_build(self):
+        product = load_product()
+        args = product.build_parser().parse_args(["run-gui", "--width", "0"])
+        with patch.object(product, "build_kernel") as build:
+            with self.assertRaisesRegex(product.ProductError, "must be positive"):
+                product.run_cmd(args)
+            build.assert_not_called()
 
     def test_new_home_disk_is_ext4_and_reused_without_reformatting(self):
         product = load_product()

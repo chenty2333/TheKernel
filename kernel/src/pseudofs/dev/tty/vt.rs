@@ -119,6 +119,7 @@ struct Vt {
 
 struct State {
     active: u16,
+    input_generation: u64,
     pending: Option<PendingSwitch>,
     delivery_in_flight: Option<PendingSwitch>,
     next_switch_generation: u64,
@@ -144,6 +145,14 @@ struct SwitchSignal {
     pid: Pid,
     signal: i16,
     pending: PendingSwitch,
+}
+
+/// Identity of one hardware batch before it enters a VT line discipline.
+#[derive(Clone, Copy, Default)]
+pub(super) struct ConsoleInputStamp {
+    vt: u16,
+    route_generation: u64,
+    flush_generation: u64,
 }
 
 /// The global VT switch arbiter. Signal delivery happens after dropping
@@ -263,6 +272,7 @@ impl VtManager {
             route: Mutex::new(()),
             state: SpinNoIrq::new(State {
                 active: 1,
+                input_generation: 0,
                 pending: None,
                 delivery_in_flight: None,
                 next_switch_generation: 0,
@@ -311,12 +321,49 @@ impl VtManager {
         (vt.tty.clone(), vt.poll.clone())
     }
 
-    /// The physical console has one reader.  Route each input batch only to
-    /// the active VT's independently-owned line discipline.
-    pub(crate) fn route_active_input(&self, bytes: &[u8]) -> AxResult<()> {
+    /// Capture the recipient before reading hardware, under the same route
+    /// gate used by VT switches. The retained batch never migrates to a new VT.
+    pub(super) fn read_console_input(
+        &self,
+        bytes: &mut [u8],
+        read: impl FnOnce(&mut [u8]) -> usize,
+    ) -> (usize, ConsoleInputStamp) {
         let _route = self.route.lock();
-        let (tty, poll) = self.active_tty();
-        tty.inject_input(bytes)?;
+        let state = self.state.lock();
+        let vt = state.active;
+        let route_generation = state.input_generation;
+        let tty = state.vts[vt as usize - 1].tty.clone();
+        drop(state);
+        let flush_generation = tty.ldisc.lock().input_generation();
+        let count = read(bytes);
+        (
+            count,
+            ConsoleInputStamp {
+                vt,
+                route_generation,
+                flush_generation,
+            },
+        )
+    }
+
+    pub(super) fn route_console_input(
+        &self,
+        stamp: ConsoleInputStamp,
+        bytes: &[u8],
+    ) -> AxResult<()> {
+        let _route = self.route.lock();
+        let state = self.state.lock();
+        if state.active != stamp.vt || state.input_generation != stamp.route_generation {
+            return Err(AxError::Interrupted);
+        }
+        let (tty, poll) = {
+            let vt = &state.vts[stamp.vt as usize - 1];
+            (vt.tty.clone(), vt.poll.clone())
+        };
+        drop(state);
+        tty.ldisc
+            .lock()
+            .inject_input_at(bytes, stamp.flush_generation)?;
         poll.wake();
         self.poll.wake();
         Ok(())
@@ -420,8 +467,13 @@ impl VtManager {
 
     fn complete_switch_locked(&self, state: &mut State, target: u16) -> Option<SwitchSignal> {
         state.active = target;
+        state.input_generation = state
+            .input_generation
+            .checked_add(1)
+            .expect("VT input generation exhausted");
         self.changed.notify_all(false);
         self.poll.wake();
+        super::ntty::wake_console_input();
         if let Some(mode) = state.vts[target as usize - 1]
             .process
             .filter(|mode| mode.acqsig != 0)
@@ -566,6 +618,7 @@ impl VtManager {
                 state.pending = None;
                 self.changed.notify_all(false);
                 self.poll.wake();
+                super::ntty::wake_console_input();
             }
             return Ok(());
         }
@@ -727,6 +780,7 @@ impl VtManager {
         if removed_owner {
             self.changed.notify_all(false);
             self.poll.wake();
+            super::ntty::wake_console_input();
         }
         match state.pending {
             Some(PendingSwitch {
@@ -1386,6 +1440,49 @@ mod tests {
         assert_eq!(m.state.lock().vts[0].kb_mode, K_XLATE);
         assert_eq!(m.owner_exited(9), None);
         assert!(m.state.lock().pending.is_none());
+    }
+
+    #[test]
+    fn retained_console_batch_is_revoked_by_flush_and_vt_switch_aba() {
+        let _context = crate::test_support::scheduler_test_context();
+        let m = VtManager::new();
+        let tty = m.active_tty().0;
+        let mut raw = tty.terminal.termios.lock().to_user_bytes();
+        raw[12..16].copy_from_slice(&0u32.to_ne_bytes());
+        *tty.terminal.termios.lock() =
+            super::super::terminal::termios::Termios2::from_user_bytes(raw);
+        let mut bytes = [0; 8];
+        let capture = |buf: &mut [u8]| {
+            buf[..3].copy_from_slice(b"old");
+            3
+        };
+        let (len, before_flush) = m.read_console_input(&mut bytes, capture);
+        tty.ldisc.lock().flush_input().unwrap();
+        assert_eq!(
+            m.route_console_input(before_flush, &bytes[..len]),
+            Err(AxError::Interrupted)
+        );
+        assert_eq!(tty.ldisc.lock().readable_len(), 0);
+
+        let (len, before_switch) = m.read_console_input(&mut bytes, capture);
+        assert_eq!(m.activate(2), Ok(None));
+        assert_eq!(
+            m.route_console_input(before_switch, &bytes[..len]),
+            Err(AxError::Interrupted)
+        );
+        assert_eq!(m.active_tty().0.ldisc.lock().readable_len(), 0);
+        assert_eq!(m.activate(1), Ok(None));
+        assert_eq!(
+            m.route_console_input(before_switch, &bytes[..len]),
+            Err(AxError::Interrupted)
+        );
+        assert_eq!(tty.ldisc.lock().readable_len(), 0);
+
+        let (len, fresh) = m.read_console_input(&mut bytes, capture);
+        m.route_console_input(fresh, &bytes[..len]).unwrap();
+        let mut output = [0; 8];
+        let read = tty.ldisc.lock().read(&mut output).unwrap();
+        assert_eq!(&output[..read], b"old");
     }
 
     #[test]

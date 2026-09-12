@@ -25,11 +25,10 @@ pub struct TaskId(u64);
 
 /// Minimum admitted kernel-task stack size.
 ///
-/// Context switching, scheduler bookkeeping, and the allocation-free future
-/// executor all run on this stack. Smaller stacks corrupt adjacent allocator
-/// state before Rust can report an error, especially on the EEVDF path, so the
-/// mechanism rejects them before allocation instead of treating the size as a
-/// performance hint.
+/// This is an allocation admission floor, not a sufficient budget for every
+/// scheduler and task entry path. Runtime-owned tasks use the configured
+/// `axconfig::TASK_STACK_SIZE`; callers requesting a custom size must account
+/// for scheduler, interrupt, and deferred-work stack use as well as their entry.
 pub const MIN_KERNEL_STACK_SIZE: usize = 16 * 1024;
 
 const TASK_MUTATION_IDLE: u8 = 0;

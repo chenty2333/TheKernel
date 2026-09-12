@@ -1,0 +1,90 @@
+QEMU 10.2.2: expose egl-headless CPU readback to QMP screendump.
+
+GL scanouts intentionally have no qemu_console_surface(). egl-headless
+nevertheless maintains a CPU surface on every GL flush for 2D consumers.
+Let screendump obtain that surface through an optional listener callback,
+without changing the surface accessor used by devices and other displays.
+Other GL displays still report no surface unless they supply CPU readback.
+
+--- a/include/ui/console.h
++++ b/include/ui/console.h
+@@ -214,6 +214,8 @@
+     /* optional */
+     void (*dpy_gfx_switch)(DisplayChangeListener *dcl,
+                            struct DisplaySurface *new_surface);
++    /* Optional CPU readback of an active GL scanout, owned by the listener. */
++    DisplaySurface *(*dpy_gl_readback)(DisplayChangeListener *dcl);
+     /* optional */
+     bool (*dpy_gfx_check_format)(DisplayChangeListener *dcl,
+                                  pixman_format_code_t format);
+@@ -413,6 +415,7 @@
+ 
+ void qemu_console_resize(QemuConsole *con, int width, int height);
+ DisplaySurface *qemu_console_surface(QemuConsole *con);
++DisplaySurface *qemu_console_readback(QemuConsole *con);
+ void coroutine_fn qemu_console_co_wait_update(QemuConsole *con);
+ int qemu_invalidate_text_consoles(void);
+ 
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -1495,6 +1495,26 @@
+     }
+ }
+ 
++/* Called after the hardware update, with the BQL held. */
++DisplaySurface *qemu_console_readback(QemuConsole *con)
++{
++    DisplaySurface *surface = qemu_console_surface(con);
++    DisplayChangeListener *dcl;
++
++    if (surface || con->scanout.kind == SCANOUT_NONE) {
++        return surface;
++    }
++    QLIST_FOREACH(dcl, &con->ds->listeners, next) {
++        if (dcl->con == con && dcl->ops->dpy_gl_readback) {
++            surface = dcl->ops->dpy_gl_readback(dcl);
++            if (surface) {
++                return surface;
++            }
++        }
++    }
++    return NULL;
++}
++
+ PixelFormat qemu_default_pixelformat(int bpp)
+ {
+     pixman_format_code_t fmt = qemu_default_pixman_format(bpp, true);
+--- a/ui/ui-qmp-cmds.c
++++ b/ui/ui-qmp-cmds.c
+@@ -362,7 +362,7 @@
+      * further graphic update are possible until it is released.  Take
+      * an image ref before that.
+      */
+-    surface = qemu_console_surface(con);
++    surface = qemu_console_readback(con);
+     if (!surface) {
+         error_setg(errp, "no surface");
+         return;
+--- a/ui/egl-headless.c
++++ b/ui/egl-headless.c
+@@ -166,11 +166,20 @@
+     dpy_gfx_update(edpy->dcl.con, x, y, w, h);
+ }
+ 
++static DisplaySurface *egl_readback(DisplayChangeListener *dcl)
++{
++    egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
++
++    /* egl_scanout_flush already copies every GL update into this surface. */
++    return edpy->guest_fb.texture ? edpy->ds : NULL;
++}
++
+ static const DisplayChangeListenerOps egl_ops = {
+     .dpy_name                = "egl-headless",
+     .dpy_refresh             = egl_refresh,
+     .dpy_gfx_update          = egl_gfx_update,
+     .dpy_gfx_switch          = egl_gfx_switch,
++    .dpy_gl_readback         = egl_readback,
+ 
+     .dpy_gl_scanout_disable  = egl_scanout_disable,
+     .dpy_gl_scanout_texture  = egl_scanout_texture,

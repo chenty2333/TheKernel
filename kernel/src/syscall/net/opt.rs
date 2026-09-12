@@ -329,6 +329,25 @@ fn option_copy_len(requested: socklen_t, available: usize) -> usize {
     (requested as usize).min(available)
 }
 
+pub(super) const fn socket_fault_error(fault: axnet::options::SocketFault) -> LinuxError {
+    use axnet::options::SocketFault;
+    match fault {
+        SocketFault::ConnectionRefused => LinuxError::ECONNREFUSED,
+        SocketFault::ConnectionReset => LinuxError::ECONNRESET,
+        SocketFault::TimedOut => LinuxError::ETIMEDOUT,
+        SocketFault::Other => LinuxError::EIO,
+        SocketFault::NetworkUnreachable => LinuxError::ENETUNREACH,
+        SocketFault::HostUnreachable => LinuxError::EHOSTUNREACH,
+        SocketFault::MessageTooLong => LinuxError::EMSGSIZE,
+        SocketFault::PermissionDenied => LinuxError::EACCES,
+        SocketFault::OperationNotSupported => LinuxError::EOPNOTSUPP,
+        SocketFault::ProtocolError => LinuxError::EPROTO,
+        SocketFault::ProtocolOptionUnsupported => LinuxError::ENOPROTOOPT,
+        SocketFault::HostDown => LinuxError::EHOSTDOWN,
+        SocketFault::NoNetwork => LinuxError::ENONET,
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct IptReplaceHeader {
@@ -451,18 +470,7 @@ mod conv {
         }
 
         pub fn rust_to_sys(value: Option<SocketFault>) -> AxResult<i32> {
-            let failure = match value {
-                None => return Ok(0),
-                Some(SocketFault::ConnectionRefused) => {
-                    thekernel_linux_net::SocketFailure::ConnectionRefused
-                }
-                Some(SocketFault::ConnectionReset) => {
-                    thekernel_linux_net::SocketFailure::ConnectionReset
-                }
-                Some(SocketFault::TimedOut) => thekernel_linux_net::SocketFailure::TimedOut,
-                Some(SocketFault::Other) => thekernel_linux_net::SocketFailure::Io,
-            };
-            Ok(thekernel_linux_net::socket_failure_errno(failure))
+            Ok(value.map_or(0, |fault| super::socket_fault_error(fault) as i32))
         }
     }
 }
@@ -507,6 +515,8 @@ macro_rules! call_dispatch {
             LinuxSocketOption::MaxSegment => MaxSegment as Int<usize>,
             LinuxSocketOption::TimeToLive => Ttl as Int<u8>,
             LinuxSocketOption::Ipv6Only => Ipv6Only as IntBool,
+            LinuxSocketOption::ReceiveErrors4 => ReceiveErrors4 as IntBool,
+            LinuxSocketOption::ReceiveErrors6 => ReceiveErrors6 as IntBool,
         }
     }};
     ($dispatch:ident, $in:expr, $($pat:pat => $which:ident $(as $conv:ty)?),* $(,)?) => {
@@ -1240,26 +1250,37 @@ pub fn sys_getsockopt(
     // request, not the raw endpoint's current bind/connect state.  DCCP in
     // particular remains unbound while these values must already be visible.
     if level == SOL_SOCKET && matches!(optname, SO_DOMAIN | SO_TYPE | SO_PROTOCOL) {
-        let identity = socket
-            .inet_identity()
-            .ok_or_else(|| AxError::from(LinuxError::ENOPROTOOPT))?;
-        let value = match optname {
-            SO_DOMAIN => identity.family as i32,
-            SO_TYPE => {
-                if matches!(&socket.inner, AxSocket::Dccp(_)) {
-                    SOCK_DCCP
-                } else {
-                    identity.socket_type as i32
-                }
+        let value = if let AxSocket::Unix(unix) = &socket.inner {
+            match optname {
+                SO_DOMAIN => linux_raw_sys::net::AF_UNIX as i32,
+                SO_TYPE if unix.is_datagram() => SOCK_DGRAM as i32,
+                SO_TYPE if unix.is_seqpacket() => linux_raw_sys::net::SOCK_SEQPACKET as i32,
+                SO_TYPE => linux_raw_sys::net::SOCK_STREAM as i32,
+                SO_PROTOCOL => 0,
+                _ => unreachable!(),
             }
-            SO_PROTOCOL => {
-                if matches!(&socket.inner, AxSocket::Dccp(_)) {
-                    IPPROTO_DCCP
-                } else {
-                    identity.protocol as i32
+        } else {
+            let identity = socket
+                .inet_identity()
+                .ok_or_else(|| AxError::from(LinuxError::ENOPROTOOPT))?;
+            match optname {
+                SO_DOMAIN => identity.family as i32,
+                SO_TYPE => {
+                    if matches!(&socket.inner, AxSocket::Dccp(_)) {
+                        SOCK_DCCP
+                    } else {
+                        identity.socket_type as i32
+                    }
                 }
+                SO_PROTOCOL => {
+                    if matches!(&socket.inner, AxSocket::Dccp(_)) {
+                        IPPROTO_DCCP
+                    } else {
+                        identity.protocol as i32
+                    }
+                }
+                _ => unreachable!(),
             }
-            _ => unreachable!(),
         };
         write_option(&capability, optval, &mut optlen, value)?;
         capability
@@ -1695,9 +1716,11 @@ pub fn sys_setsockopt(
             return Err(LinuxError::ENOPROTOOPT.into());
         }
         if optname == PACKET_VERSION {
-            let _ = pinned
-                .packet()?
-                .set_packet_version(read_option::<i32>(&capability, optval, optlen)?);
+            let _ = pinned.packet()?.set_packet_version(read_option::<i32>(
+                &capability,
+                optval,
+                optlen,
+            )?);
             return Ok(0);
         }
         if matches!(optname, PACKET_RX_RING | PACKET_TX_RING) {
@@ -1920,6 +1943,25 @@ pub fn sys_setsockopt(
         (PeerCredentials as $conv:ty) => {
             let val = read_ucred(&capability, optval, optlen)?;
             socket.set_option(SetSocketOption::PeerCredentials(&val))?;
+        };
+        (ReceiveErrors4 as $conv:ty) => {
+            // IPv4 accepts an int prefix or a one-byte boolean. IPv6 uses
+            // the ordinary int-prefix convention below.
+            let enabled = if optlen >= size_of::<i32>() as socklen_t {
+                read_option_prefix_i32(&capability, optval, optlen)? != 0
+            } else if optlen != 0 {
+                capability
+                    .read_value::<u8>(optval.address().as_usize() as *const u8)
+                    .map_err(map_usercopy_error)?
+                    != 0
+            } else {
+                return Err(AxError::InvalidInput);
+            };
+            socket.set_option(SetSocketOption::ReceiveErrors4(&enabled))?;
+        };
+        (ReceiveErrors6 as $conv:ty) => {
+            let enabled = read_option_prefix_i32(&capability, optval, optlen)? != 0;
+            socket.set_option(SetSocketOption::ReceiveErrors6(&enabled))?;
         };
         ($which:ident) => {
             let val = read_option(&capability, optval, optlen)?;

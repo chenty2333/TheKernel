@@ -66,6 +66,8 @@ pub use virtio_drivers::{
         pci::{PciTransport, bus as pci},
     },
 };
+#[cfg(feature = "alloc")]
+pub use virtio_drivers::device::sound::{VirtIOSound, PcmFeatures, PcmFormat, PcmFormats, PcmRate, PcmRates};
 
 use self::pci::{DeviceFunction, DeviceFunctionInfo, PciRoot};
 #[cfg(feature = "socket")]
@@ -160,6 +162,18 @@ pub fn probe_pci_entropy_device<H: VirtIoHal>(
     use virtio_drivers::transport::pci::virtio_device_type;
 
     if virtio_device_type(dev_info)? != VirtIoDevType::EntropySource {
+        return None;
+    }
+    PciTransport::new::<H>(root, bdf).ok()
+}
+
+/// Construct a polling transport for the single playback device.
+pub fn probe_pci_sound_device<H: VirtIoHal>(
+    root: &mut PciRoot,
+    bdf: DeviceFunction,
+    dev_info: &DeviceFunctionInfo,
+) -> Option<PciTransport> {
+    if virtio_drivers::transport::pci::virtio_device_type(dev_info)? != VirtIoDevType::Sound {
         return None;
     }
     PciTransport::new::<H>(root, bdf).ok()

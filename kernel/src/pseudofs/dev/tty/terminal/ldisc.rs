@@ -132,6 +132,9 @@ pub trait TtyRead: Send + Sync + 'static {
         self.read(buf).map(|read| (read, read != 0))
     }
 
+    /// Notify an owning transport that userspace has freed input capacity.
+    fn input_capacity_changed(&self) {}
+
     /// Returns true only after the producer has permanently closed and every
     /// byte accepted by the underlying transport has been consumed.
     fn input_eof(&self) -> bool {
@@ -818,6 +821,7 @@ enum Processor<R, W> {
 }
 
 pub struct LineDiscipline<R, W> {
+    input_generation: u64,
     terminal: Arc<Terminal>,
     buf_rx: CachingCons<ReadBuf>,
     poll_tx: Arc<PollSet>,
@@ -913,6 +917,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             ),
         };
         Ok(Self {
+            input_generation: 0,
             terminal,
             buf_rx,
             poll_tx,
@@ -963,6 +968,19 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         }
     }
 
+    pub(crate) fn input_generation(&self) -> u64 {
+        self.input_generation
+    }
+
+    /// The caller holds this discipline's lock across generation validation
+    /// and injection, so TCIFLUSH cannot be followed by an old retained batch.
+    pub(crate) fn inject_input_at(&mut self, bytes: &[u8], generation: u64) -> AxResult<()> {
+        if generation != self.input_generation {
+            return Err(AxError::Interrupted);
+        }
+        self.inject_input(bytes)
+    }
+
     /// Delivers bytes from a single owning transport into a manually-driven
     /// line discipline.  The bounded staging buffer deliberately reports
     /// backpressure rather than stealing bytes into another terminal.
@@ -973,6 +991,9 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         let Processor::Manual(reader) = &mut self.processor else {
             return Err(AxError::BadState);
         };
+        // A userspace read may have freed public-ring space since the last
+        // injection. Drain the retained staging prefix before admission.
+        reader.poll()?;
         if !reader.read_range.is_empty() || bytes.len() > reader.read_buf.len() {
             return Err(AxError::WouldBlock);
         }
@@ -986,6 +1007,10 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
     /// Flush every input stage owned by this discipline.  The transport is
     /// asked first so a concurrent refill cannot republish pre-flush bytes.
     pub fn flush_input(&mut self) -> AxResult<()> {
+        self.input_generation = self
+            .input_generation
+            .checked_add(1)
+            .ok_or(AxError::OutOfRange)?;
         let external_flush = match &mut self.processor {
             Processor::External(processor) => Some((
                 processor.poll_rx.clone(),
@@ -997,6 +1022,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         match &mut self.processor {
             Processor::Manual(reader) => {
                 reader.flush_input();
+                reader.reader.input_capacity_changed();
             }
             Processor::None(reader, _) => {
                 reader.reader.flush_input();
@@ -1059,6 +1085,9 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             && self.buf_rx.is_empty()
             && self.empty_eof_pending.swap(false, Ordering::AcqRel)
         {
+            if let Processor::Manual(reader) = &self.processor {
+                reader.reader.input_capacity_changed();
+            }
             self.poll_tx.wake();
             return Ok(0);
         }
@@ -1067,6 +1096,11 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         }
 
         let total_read = self.buf_rx.pop_slice(buf);
+        if total_read != 0
+            && let Processor::Manual(reader) = &self.processor
+        {
+            reader.reader.input_capacity_changed();
+        }
         self.poll_tx.wake();
         Ok(total_read)
     }
@@ -1570,7 +1604,10 @@ mod tests {
     fn noncanonical_vmin_is_capped_by_read_count() {
         let terminal = Arc::try_new(Terminal::default()).unwrap();
         terminal.termios.lock().set_canonical_for_test(false);
-        terminal.termios.lock().set_special_char_for_test(linux_raw_sys::general::VMIN, 5);
+        terminal
+            .termios
+            .lock()
+            .set_special_char_for_test(linux_raw_sys::general::VMIN, 5);
         let mut ldisc = LineDiscipline::try_new(
             terminal,
             TtyConfig {

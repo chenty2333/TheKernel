@@ -103,6 +103,14 @@ impl FaultSession {
                             };
                             match cache.reclaim_one() {
                                 Ok(true) => continue 'retry,
+                                Err(error) if error.canonicalize() == AxError::ResourceBusy => {
+                                    // No mm/cache lock is held. Let the current
+                                    // cache owner progress, then return through
+                                    // normal signal/exit handling before the
+                                    // instruction faults and revalidates again.
+                                    axtask::yield_now();
+                                    return PageFaultResult::Handled;
+                                }
                                 // The cache remained full but has no evictable
                                 // page. This is memory pressure, not a fabricated
                                 // backing-I/O failure.

@@ -26,7 +26,7 @@ use memory_addr::PhysAddr;
 use super::{
     AdapterMetrics, DisplayAdapter, DrmDevice, DrmError, DrmResult, DumbRequest, GemBacking,
     RenderAdapter, Scanout,
-    device::{CursorUpdate, DamageRect, DisplayConfig},
+    device::{CursorUpdate, DisplayConfig},
     fence::Fence,
     render::{BlobMem, BlobResource, ContextInit, RenderJob, RenderResource, RenderTransfer},
 };
@@ -167,10 +167,6 @@ struct AdapterState<T: GpuTransport> {
     present_completions: Mutex<HashMap<u64, Result<(), DevError>>>,
     present_pending: Mutex<HashMap<u64, ()>>,
     present_worker_started: AtomicBool,
-    /// Per-shared-backing 2D scanout shadows for legacy virgl resources.
-    /// The key is the backing Arc allocation, hence PRIME aliases reuse the
-    /// same resource rather than creating divergent scanout copies.
-    render_shadows: Mutex<HashMap<usize, RenderShadow>>,
     /// Fence token -> KMS/GEM lifetime pin. The lower queue owns DMA until
     /// completion; this map owns both the matching DRM fence and, for an
     /// UPDATE_CURSOR, the exact GEM backing consumed by the host command.
@@ -227,33 +223,6 @@ struct CursorJob {
     /// MOVE_CURSOR has no backing. UPDATE_CURSOR must retain this reference
     /// until the matching cursorq completion has become terminal.
     _backing: Option<Arc<dyn GemBacking>>,
-}
-
-struct RenderShadow {
-    source: Weak<dyn GemBacking>,
-    resource: u32,
-    pages: Arc<SharedPages>,
-    width: u32,
-    height: u32,
-    pitch: u32,
-    context: u32,
-    attached_source: Option<u32>,
-    retire_stage: ShadowRetireStage,
-    cleanup_pending: bool,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ShadowRetireStage {
-    Active,
-    DetachSource,
-    DetachBacking,
-    DestroyResource,
-    DestroyContext,
-}
-
-struct ShadowTransferError {
-    error: DrmError,
-    attached_source: Option<u32>,
 }
 
 struct Retired2dResource {
@@ -321,7 +290,6 @@ impl<T: GpuTransport> VirtioGpuAdapter<T> {
                 present_completions: Mutex::new(HashMap::new()),
                 present_pending: Mutex::new(HashMap::new()),
                 present_worker_started: AtomicBool::new(false),
-                render_shadows: Mutex::new(HashMap::new()),
                 cursor_jobs: Mutex::new(HashMap::new()),
                 cursor_admission: Mutex::new(()),
                 cursor_worker_started: AtomicBool::new(false),
@@ -678,11 +646,11 @@ impl<T: GpuTransport + 'static> RenderAdapter for VirtioRenderAdapter<T> {
             })?;
         Ok(())
     }
-    fn submit(&self, job: RenderJob) -> DrmResult<()> {
-        if self.state.render_dead.load(Ordering::Acquire) {
-            return Err(DrmError::DeviceLost);
-        }
-        self.state.enqueue_render_job(job)
+    fn submit(
+        &self,
+        prepare: &mut dyn FnMut() -> axerrno::AxResult<RenderJob>,
+    ) -> axerrno::AxResult<()> {
+        self.state.enqueue_render_job(prepare)
     }
 }
 
@@ -808,19 +776,28 @@ impl<T: GpuTransport> AdapterState<T> {
         }
     }
 
-    fn enqueue_render_job(self: &Arc<Self>, job: RenderJob) -> DrmResult<()>
+    fn enqueue_render_job(
+        self: &Arc<Self>,
+        prepare: &mut dyn FnMut() -> axerrno::AxResult<RenderJob>,
+    ) -> axerrno::AxResult<()>
     where
         T: 'static,
     {
-        {
-            let mut jobs = self.render_jobs.lock();
-            if jobs.len() == 8 {
-                return Err(DrmError::QueueFull);
-            }
-            jobs.try_reserve(1).map_err(|_| DrmError::NoMemory)?;
-            jobs.push(QueuedRenderJob::Waiting(job));
+        self.ensure_render_worker().map_err(axerrno::AxError::from)?;
+        let mut jobs = self.render_jobs.lock();
+        if self.render_dead.load(Ordering::Acquire) {
+            return Err(axerrno::AxError::from(DrmError::DeviceLost));
         }
-        self.ensure_render_worker()
+        if jobs.len() == 8 {
+            return Err(axerrno::AxError::WouldBlock);
+        }
+        jobs.try_reserve(1).map_err(|_| axerrno::AxError::NoMemory)?;
+        // Capacity and publication are one transaction. In particular,
+        // drmIoctl's EAGAIN retry must not inherit a failed BO reservation
+        // from an earlier attempt which never entered this queue.
+        let job = prepare()?;
+        jobs.push(QueuedRenderJob::Waiting(job));
+        Ok(())
     }
 
     fn enqueue_resource_creation(
@@ -990,10 +967,7 @@ impl<T: GpuTransport> AdapterState<T> {
             }
             (
                 LifecycleJob::Attaching {
-                    pages,
-                    ready,
-                    blob,
-                    ..
+                    pages, ready, blob, ..
                 },
                 Ok(()),
             ) => {
@@ -1281,8 +1255,7 @@ impl<T: GpuTransport> AdapterState<T> {
         {
             return Err(DrmError::Unsupported);
         }
-        // Resolve typed backing ownership before publication.  In particular,
-        // a Render3d ID must never reach the ordinary 2D SET_SCANOUT path.
+        // Validate the resource layout before publishing a presentation.
         if let Some(resource) = scanout.backing.host_resource() {
             match resource {
                 super::gem::HostResource::Scanout2d { .. } => {}
@@ -1300,9 +1273,7 @@ impl<T: GpuTransport> AdapterState<T> {
                     }
                 }
                 super::gem::HostResource::Render3d { meta, .. } => {
-                    if meta.target != 2 || !(1..=4).contains(&meta.format) {
-                        return Err(DrmError::Unsupported);
-                    }
+                    Self::validate_render_scanout(&scanout, meta)?;
                 }
             }
         } else {
@@ -1394,390 +1365,33 @@ impl<T: GpuTransport> AdapterState<T> {
         Ok((x, y))
     }
 
-    /// Stage a linear legacy-virgl resource through a 2D resource sharing the
-    /// exact GEM SG pages.  This is deliberately host-side only: no CPU copy
-    /// and no accidental use of a 3D ID as a SET_SCANOUT resource.
-    fn render_shadow_for(
-        &self,
-        scanout: &Scanout,
-        resource: u32,
-        meta: super::render::RenderResource,
-    ) -> DrmResult<u32> {
-        self.evict_render_shadows();
+    /// Legacy virgl scanout selects the host texture itself. SET_SCANOUT has
+    /// no byte offset, pitch or format fields; unlike a blob, it cannot
+    /// reinterpret a suballocation or a different pixel format.
+    fn validate_render_scanout(scanout: &Scanout, meta: RenderResource) -> DrmResult<()> {
+        let format = match scanout.format {
+            0x3432_5241 => 1, // DRM ARGB8888 / virgl B8G8R8A8_UNORM
+            0x3432_5258 => 2, // DRM XRGB8888 / virgl B8G8R8X8_UNORM
+            _ => return Err(DrmError::Unsupported),
+        };
         if meta.target != 2
-            || !(1..=4).contains(&meta.format)
+            || meta.format != format
             || meta.depth != 1
             || meta.array_size != 1
-            || meta.last_level != 0
-            || meta.nr_samples != 0
-            || scanout.pitch
-                < scanout
-                    .framebuffer_width
-                    .checked_mul(4)
-                    .ok_or(DrmError::Overflow)?
+            || meta.nr_samples > 1
+            || scanout.framebuffer_offset != 0
             || scanout.framebuffer_width > meta.width
             || scanout.framebuffer_height > meta.height
         {
             return Err(DrmError::Unsupported);
         }
-        let key = Arc::as_ptr(&scanout.backing) as *const () as usize;
-        let mut shadows = self.render_shadows.lock();
-        if let Some(shadow) = shadows.get(&key) {
-            if shadow.width == scanout.framebuffer_width
-                && shadow.height == scanout.framebuffer_height
-                && shadow.pitch == scanout.pitch
-            {
-                let context = shadow.context;
-                let shadow_resource = shadow.resource;
-                let pages = shadow.pages.clone();
-                drop(shadows);
-                return match self.transfer_render_to_shadow(context, resource, scanout) {
-                    Ok(()) => Ok(shadow_resource),
-                    Err(failure) => {
-                        if failure.attached_source.is_some() {
-                            let mut shadows = self.render_shadows.lock();
-                            if let Some(shadow) = shadows.get_mut(&key) {
-                                shadow.attached_source = failure.attached_source;
-                                shadow.retire_stage = ShadowRetireStage::DetachSource;
-                                shadow.cleanup_pending = true;
-                            } else {
-                                drop(shadows);
-                                self.retain_shadow_cleanup(
-                                    key,
-                                    Arc::downgrade(&scanout.backing),
-                                    shadow_resource,
-                                    pages,
-                                    context,
-                                    failure.attached_source,
-                                );
-                            }
-                        }
-                        Err(failure.error)
-                    }
-                };
-            }
-            return Err(DrmError::Busy);
-        }
-        if shadows.len() >= 8 {
-            return Err(DrmError::QueueFull);
-        }
-        // Reserve the table slot before publishing any shadow DMA resource;
-        // every later rollback can then retain its resource/pages/context for
-        // retry without a fallible allocation.
-        shadows.try_reserve(1).map_err(|_| DrmError::NoMemory)?;
-        let pages = scanout.backing.shared_pages()?;
-        let width = scanout.pitch / 4;
-        let shadow_height = render_shadow_height(
-            scanout.pitch,
-            scanout.backing_size,
-            scanout.framebuffer_offset,
-            scanout.framebuffer_height,
-        )?;
-        let mut entries: Vec<(u64, u32)> = Vec::new();
-        entries
-            .try_reserve_exact(pages.len())
-            .map_err(|_| DrmError::NoMemory)?;
-        for index in 0..pages.len() {
-            let paddr = pages
-                .paddr_at(index)
-                .map_err(|_| DrmError::Invalid)?
-                .as_usize() as u64;
-            let mut merged = false;
-            if let Some((base, length)) = entries.last_mut() {
-                if base.checked_add(u64::from(*length)) == Some(paddr)
-                    && *length <= u32::MAX - PageSize::Size4K as u32
-                {
-                    *length += PageSize::Size4K as u32;
-                    merged = true;
-                }
-            }
-            if !merged {
-                entries.push((paddr, PageSize::Size4K as u32));
-            }
-        }
-        let sg_len = entries
-            .iter()
-            .try_fold(0u64, |total, (_, length)| {
-                total.checked_add(u64::from(*length))
-            })
-            .ok_or(DrmError::Overflow)?;
-        if sg_len < scanout.backing_size {
+        if scanout.width == 0 || scanout.height == 0 || scanout.pitch == 0 {
             return Err(DrmError::Invalid);
         }
-        // All fallible SG work completes before CREATE publishes a host
-        // resource, so pre-publication failure simply releases `pages`.
-        drop(shadows);
-        let created = self
-            .submit_control_and_wait(DriverGpuBatch::Create2d {
-                width,
-                height: shadow_height,
-                entries: Vec::new(),
-            })?
-            .0;
-        let Some(shadow_resource) = created.resource_id else {
-            self.reset_render_transport();
+        if Self::visible_source(scanout)? != (scanout.source_x, scanout.source_y) {
             return Err(DrmError::Invalid);
-        };
-        if let Err(error) = self.submit_control_and_wait(DriverGpuBatch::AttachBacking {
-            resource: shadow_resource,
-            entries,
-        }) {
-            self.reset_render_transport();
-            self.retire_render_resource(shadow_resource, pages, false);
-            return Err(error);
         }
-        let context = match self.submit_control_and_wait(DriverGpuBatch::CreateContext {
-            name: b"thekernel-kms-blit".to_vec(),
-            init: DriverContextInit::default(),
-        }) {
-            Ok((submission, _)) => match submission.context_id {
-                Some(context) => context,
-                None => {
-                    self.retire_render_resource(shadow_resource, pages, true);
-                    return Err(DrmError::Invalid);
-                }
-            },
-            Err(error) => {
-                self.retire_render_resource(shadow_resource, pages, true);
-                return Err(error);
-            }
-        };
-        if let Err(failure) = self.transfer_render_to_shadow(context, resource, scanout) {
-            self.retain_shadow_cleanup(
-                key,
-                Arc::downgrade(&scanout.backing),
-                shadow_resource,
-                pages,
-                context,
-                failure.attached_source,
-            );
-            return Err(failure.error);
-        }
-        let mut shadows = self.render_shadows.lock();
-        if shadows.len() >= 8 {
-            drop(shadows);
-            self.retain_shadow_cleanup(
-                key,
-                Arc::downgrade(&scanout.backing),
-                shadow_resource,
-                pages,
-                context,
-                None,
-            );
-            return Err(DrmError::QueueFull);
-        }
-        shadows.insert(
-            key,
-            RenderShadow {
-                source: Arc::downgrade(&scanout.backing),
-                resource: shadow_resource,
-                pages,
-                width: scanout.framebuffer_width,
-                height: scanout.framebuffer_height,
-                pitch: scanout.pitch,
-                context,
-                attached_source: None,
-                retire_stage: ShadowRetireStage::Active,
-                cleanup_pending: false,
-            },
-        );
-        Ok(shadow_resource)
-    }
-
-    fn retain_shadow_cleanup(
-        &self,
-        key: usize,
-        source: Weak<dyn GemBacking>,
-        resource: u32,
-        pages: Arc<SharedPages>,
-        context: u32,
-        attached_source: Option<u32>,
-    ) {
-        // Acquiring the table lock after reset has set `render_dead` proves
-        // reset quiesced the lower control queue and cleared shadow DMA
-        // ownership. Do not resurrect cleanup state after that boundary.
-        let mut shadows = self.render_shadows.lock();
-        if self.render_dead.load(Ordering::Acquire) {
-            return;
-        }
-        shadows.insert(
-            key,
-            RenderShadow {
-                source,
-                resource,
-                pages,
-                width: 0,
-                height: 0,
-                pitch: 0,
-                context,
-                attached_source,
-                retire_stage: if attached_source.is_some() {
-                    ShadowRetireStage::DetachSource
-                } else {
-                    ShadowRetireStage::DetachBacking
-                },
-                cleanup_pending: true,
-            },
-        );
-    }
-
-    fn evict_render_shadows(&self) {
-        let mut stale = None;
-        {
-            let mut shadows = self.render_shadows.lock();
-            if let Some((&key, _)) = shadows
-                .iter()
-                .find(|(_, shadow)| shadow.cleanup_pending || shadow.source.strong_count() == 0)
-            {
-                stale = shadows.remove(&key).map(|shadow| (key, shadow));
-            }
-        }
-        let Some((key, mut shadow)) = stale else {
-            return;
-        };
-        // Keep page/context ownership in the table until every terminal
-        // cleanup command succeeds.  Failed retirement is retried by the
-        // periodic worker instead of dropping DMA backing.
-        let complete = match shadow.retire_stage {
-            ShadowRetireStage::DetachSource => match shadow.attached_source {
-                Some(resource) => {
-                    match self.submit_control_and_wait(DriverGpuBatch::DetachResource {
-                        context: shadow.context,
-                        resource,
-                    }) {
-                        Ok(_) => {
-                            shadow.attached_source = None;
-                            shadow.retire_stage = ShadowRetireStage::DetachBacking;
-                            false
-                        }
-                        Err(_) => false,
-                    }
-                }
-                None => {
-                    shadow.retire_stage = ShadowRetireStage::DetachBacking;
-                    false
-                }
-            },
-            ShadowRetireStage::Active | ShadowRetireStage::DetachBacking => match self
-                .submit_control_and_wait(DriverGpuBatch::DetachBacking {
-                    resource: shadow.resource,
-                }) {
-                Ok(_) => {
-                    shadow.retire_stage = ShadowRetireStage::DestroyResource;
-                    false
-                }
-                Err(_) => false,
-            },
-            ShadowRetireStage::DestroyResource => {
-                match self.submit_control_and_wait(DriverGpuBatch::DestroyResource {
-                    resource: shadow.resource,
-                }) {
-                    Ok(_) => {
-                        shadow.retire_stage = ShadowRetireStage::DestroyContext;
-                        false
-                    }
-                    Err(_) => false,
-                }
-            }
-            ShadowRetireStage::DestroyContext => self
-                .submit_control_and_wait(DriverGpuBatch::DestroyContext {
-                    context: shadow.context,
-                })
-                .is_ok(),
-        };
-        if !complete && !self.render_dead.load(Ordering::Acquire) {
-            let mut shadows = self.render_shadows.lock();
-            // Reset sets `render_dead` before it clears the table. Recheck
-            // under the table lock so a cleanup worker cannot resurrect a
-            // shadow whose host DMA rights were already revoked.
-            if !self.render_dead.load(Ordering::Acquire) {
-                shadows.insert(key, shadow);
-            }
-        }
-    }
-
-    fn transfer_render_to_shadow(
-        &self,
-        context: u32,
-        resource: u32,
-        scanout: &Scanout,
-    ) -> Result<(), ShadowTransferError> {
-        let (source_x, source_y) =
-            Self::visible_source(scanout).map_err(|error| ShadowTransferError {
-                error,
-                attached_source: None,
-            })?;
-        let damage = scanout.damage.unwrap_or(DamageRect {
-            x: source_x,
-            y: source_y,
-            width: scanout.width,
-            height: scanout.height,
-        });
-        if damage.width == 0
-            || damage.height == 0
-            || damage
-                .x
-                .checked_add(damage.width)
-                .is_none_or(|end| end > scanout.framebuffer_width)
-            || damage
-                .y
-                .checked_add(damage.height)
-                .is_none_or(|end| end > scanout.framebuffer_height)
-        {
-            return Err(ShadowTransferError {
-                error: DrmError::Invalid,
-                attached_source: None,
-            });
-        }
-        let transfer_offset = scanout
-            .framebuffer_offset
-            .checked_add(
-                u64::from(damage.y)
-                    .checked_mul(u64::from(scanout.pitch))
-                    .ok_or(ShadowTransferError {
-                        error: DrmError::Overflow,
-                        attached_source: None,
-                    })?,
-            )
-            .and_then(|value| value.checked_add(u64::from(damage.x).checked_mul(4)?))
-            .ok_or(ShadowTransferError {
-                error: DrmError::Overflow,
-                attached_source: None,
-            })?;
-        self.submit_control_and_wait(DriverGpuBatch::AttachResource { context, resource })
-            .map_err(|error| ShadowTransferError {
-                error,
-                attached_source: None,
-            })?;
-        let transfer = self.submit_control_and_wait(DriverGpuBatch::Transfer3d {
-            context,
-            resource,
-            transfer: RenderTransfer3D {
-                x: damage.x,
-                y: damage.y,
-                z: 0,
-                width: damage.width,
-                height: damage.height,
-                depth: 1,
-                offset: transfer_offset,
-                level: 0,
-                stride: scanout.pitch,
-                layer_stride: 0,
-            },
-            to_host: false,
-        });
-        let detach =
-            self.submit_control_and_wait(DriverGpuBatch::DetachResource { context, resource });
-        match detach {
-            Err(error) => Err(ShadowTransferError {
-                error,
-                attached_source: Some(resource),
-            }),
-            Ok(_) => transfer.map(|_| ()).map_err(|error| ShadowTransferError {
-                error,
-                attached_source: None,
-            }),
-        }
+        Ok(())
     }
 
     fn ensure_present_worker(self: &Arc<Self>) -> DrmResult<()>
@@ -2007,9 +1621,8 @@ impl<T: GpuTransport> AdapterState<T> {
         }
         let next = {
             let mut jobs = self.present_jobs.lock();
-            // A shadow transfer writes the same shared pages used by every
-            // scanout resource.  Do not start another transfer/present until
-            // the preceding scanout completion made that ownership terminal.
+            // Keep scanout changes ordered until the preceding complete
+            // SET_SCANOUT/FLUSH batch reaches its terminal fence.
             (!jobs
                 .iter()
                 .any(|job| matches!(job, PresentJob::Submitted { .. })))
@@ -2052,9 +1665,8 @@ impl<T: GpuTransport> AdapterState<T> {
                     })
                 })
             }
-            Some(super::gem::HostResource::Render3d { resource, meta }) => self
-                .render_shadow_for(&scanout, resource, meta)
-                .and_then(|resource| {
+            Some(super::gem::HostResource::Render3d { resource, meta }) => {
+                Self::validate_render_scanout(&scanout, meta).and_then(|()| {
                     Ok(DriverGpuBatch::Present {
                         resource,
                         width: scanout.width,
@@ -2068,7 +1680,8 @@ impl<T: GpuTransport> AdapterState<T> {
                             height: damage.height,
                         }),
                     })
-                }),
+                })
+            }
             _ => self.resource_for(&scanout.backing).and_then(|resource| {
                 Ok(DriverGpuBatch::Present {
                     resource,
@@ -2153,11 +1766,6 @@ impl<T: GpuTransport> AdapterState<T> {
         // external mapping before reset removes host execution rights; VMA
         // owners stay pinned, but no new fault/mmap/submit may publish the
         // stale PCI aperture after this point.
-        // Serialize every possible shadow-retain transition with reset. The
-        // lock stays held through lower reset and fence termination, so a
-        // concurrent rollback can only drop its pages after host DMA is
-        // known quiescent.
-        let mut shadows = self.render_shadows.lock();
         self.render_dead.store(true, Ordering::Release);
         {
             let mut aperture = self.blob_aperture.lock();
@@ -2251,9 +1859,6 @@ impl<T: GpuTransport> AdapterState<T> {
                 },
             );
         }
-        // All externally visible fences are terminal above; only now may the
-        // shadow page owners be released after the host reset revoked DMA.
-        shadows.clear();
     }
 
     /// Retain every terminal completion before returning control to a
@@ -2590,7 +2195,6 @@ fn retirement_worker<T: GpuTransport + 'static>(state: Arc<AdapterState<T>>) {
     loop {
         state.retry_retired_2d_resources();
         state.retry_retired_render_resources();
-        state.evict_render_shadows();
         let _ = axtask::future::block_on(axtask::future::sleep(Duration::from_millis(1)));
     }
 }
@@ -2773,6 +2377,15 @@ impl<T: GpuTransport + 'static> DisplayAdapter for VirtioGpuAdapter<T> {
         }
         let backing = Arc::clone(&cursor.backing);
         let resource = self.state.resource_for(&backing)?;
+        // UPDATE_CURSOR reads the host resource, not its attached guest pages.
+        // Wait for the fenced upload before publishing work on cursorq, which
+        // is independent of controlq and may otherwise overtake the upload.
+        self.state
+            .submit_control_and_wait(DriverGpuBatch::Transfer2d {
+                resource,
+                width: cursor.width,
+                height: cursor.height,
+            })?;
         self.state.enqueue_cursor(
             DriverCursorUpdate {
                 resource,
@@ -2799,29 +2412,6 @@ impl<T: GpuTransport + 'static> DisplayAdapter for VirtioGpuAdapter<T> {
             result => result.map_err(map_dev_error),
         }
     }
-}
-
-/// Only complete rows fit in the shared backing. Page-alignment padding is
-/// not another scanline: rounding up would describe more DMA bytes than the
-/// SG list contains, and the transport correctly rejects ATTACH_BACKING.
-fn render_shadow_height(
-    pitch: u32,
-    backing_size: u64,
-    framebuffer_offset: u64,
-    framebuffer_height: u32,
-) -> DrmResult<u32> {
-    if pitch == 0 {
-        return Err(DrmError::Invalid);
-    }
-    let height = u32::try_from(backing_size / u64::from(pitch))
-        .map_err(|_| DrmError::Overflow)?;
-    let required_rows = (framebuffer_offset / u64::from(pitch))
-        .checked_add(u64::from(framebuffer_height))
-        .ok_or(DrmError::Overflow)?;
-    if height == 0 || u64::from(height) < required_rows {
-        return Err(DrmError::Invalid);
-    }
-    Ok(height)
 }
 
 fn map_dev_error(error: DevError) -> DrmError {
@@ -2887,6 +2477,9 @@ mod tests {
         render_unrefs: u32,
         next_fence: u64,
         cursor_drain_fails: bool,
+        cursor_upload_fails: bool,
+        cursor_uploads: u32,
+        cursor_updates: u32,
         display_error: Option<DevError>,
         display_change: Option<DisplayConfig>,
         completions: Vec<(DriverGpuQueue, DriverGpuCompletion)>,
@@ -2967,7 +2560,23 @@ mod tests {
                 } => {
                     self.presented.push((resource, width, height));
                 }
-                DriverGpuBatch::MoveCursor { .. } | DriverGpuBatch::UpdateCursor(_) => {}
+                DriverGpuBatch::Transfer2d { .. } => {
+                    assert_eq!(queue, DriverGpuQueue::Control);
+                    self.cursor_uploads += 1;
+                    if self.cursor_upload_fails {
+                        return Err(DevError::Io);
+                    }
+                }
+                DriverGpuBatch::UpdateCursor(_) => {
+                    assert_eq!(self.cursor_uploads, self.cursor_updates + 1);
+                    assert!(
+                        self.completions
+                            .iter()
+                            .all(|(queue, _)| *queue != DriverGpuQueue::Control)
+                    );
+                    self.cursor_updates += 1;
+                }
+                DriverGpuBatch::MoveCursor { .. } => {}
                 _ => return Err(DevError::Unsupported),
             }
             self.next_fence += 1;
@@ -3020,31 +2629,88 @@ mod tests {
     }
 
     #[test]
-    fn render_shadow_does_not_turn_page_padding_into_an_unbacked_row() {
-        let pitch = 1366 * 4;
-        let framebuffer_height = 768;
-        let bytes = u64::from(pitch) * u64::from(framebuffer_height);
-        let backing = (bytes + 4095) & !4095;
-        assert!(backing > bytes);
-        let height = render_shadow_height(pitch, backing, 0, framebuffer_height).unwrap();
-        assert_eq!(height, framebuffer_height);
-        assert!(u64::from(pitch) * u64::from(height) <= backing);
-        assert!(u64::from(pitch) * u64::from(height + 1) > backing);
+    fn native_render_scanout_keeps_resource_crop_and_rejects_reinterpretation() {
+        let _context = crate::test_support::scheduler_test_context();
+        struct Texture(RenderResource);
+        impl GemBacking for Texture {
+            fn shared_pages(&self) -> DrmResult<Arc<SharedPages>> {
+                panic!("native virgl scanout must not read GEM backing pages")
+            }
+            fn host_resource(&self) -> Option<super::super::gem::HostResource> {
+                Some(super::super::gem::HostResource::Render3d {
+                    resource: 101,
+                    meta: self.0,
+                })
+            }
+        }
+        let meta = RenderResource {
+            target: 2,
+            format: 2,
+            bind: 2,
+            width: 1920,
+            height: 1080,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: 1,
+        };
+        let adapter = VirtioGpuAdapter::new(FakeTransport::default());
+        let backing: Arc<dyn GemBacking> = Arc::new(Texture(meta));
+        let weak = Arc::downgrade(&backing);
+        let mut scanout = Scanout {
+            backing,
+            width: 1280,
+            height: 720,
+            pitch: 1920 * 4,
+            bpp: 32,
+            format: 0x3432_5258,
+            framebuffer_width: 1920,
+            framebuffer_height: 1080,
+            backing_size: 1920 * 1080 * 4,
+            framebuffer_offset: 0,
+            offset: (20 * 1920 + 10) * 4,
+            source_x: 10,
+            source_y: 20,
+            mode: super::super::Mode {
+                width: 1280,
+                height: 720,
+                refresh_millihz: 60_000,
+            },
+            damage: None,
+        };
         assert_eq!(
-            render_shadow_height(pitch, bytes - 1, 0, framebuffer_height),
+            AdapterState::<FakeTransport>::validate_render_scanout(&scanout, meta),
+            Ok(())
+        );
+        scanout.framebuffer_offset = 4096;
+        assert_eq!(
+            AdapterState::<FakeTransport>::validate_render_scanout(&scanout, meta),
+            Err(DrmError::Unsupported)
+        );
+        scanout.framebuffer_offset = 0;
+        scanout.format = 0x3432_5241;
+        assert_eq!(
+            AdapterState::<FakeTransport>::validate_render_scanout(&scanout, meta),
+            Err(DrmError::Unsupported)
+        );
+        scanout.format = 0x3432_5258;
+        scanout.source_x = 11;
+        assert_eq!(
+            AdapterState::<FakeTransport>::validate_render_scanout(&scanout, meta),
             Err(DrmError::Invalid)
         );
-        assert_eq!(
-            render_shadow_height(0, backing, 0, framebuffer_height),
-            Err(DrmError::Invalid)
-        );
-        assert_eq!(render_shadow_height(3200, 1921024, 0, 600), Ok(600));
-        // A framebuffer starting two rows into the BO needs those rows too.
-        assert_eq!(render_shadow_height(3200, 1929216, 6400, 600), Ok(602));
-        assert_eq!(
-            render_shadow_height(3200, 1921024, 6400, 600),
-            Err(DrmError::Invalid)
-        );
+        scanout.source_x = 10;
+        let fence = adapter.present(scanout).unwrap();
+        adapter.state.service_present_job();
+        assert!(!fence.is_signaled());
+        assert!(weak.upgrade().is_some());
+        adapter.state.service_present_job();
+        assert!(fence.is_signaled());
+        let transport = adapter.state.transport.lock();
+        assert_eq!(transport.presented, [(101, 1280, 720)]);
+        assert!(transport.created.is_empty());
+        assert_eq!(transport.contexts_created, 0);
     }
 
     #[test]
@@ -3054,14 +2720,8 @@ mod tests {
         let render: Arc<dyn RenderAdapter> = Arc::new(VirtioRenderAdapter {
             state: adapter.state.clone(),
         });
-        let device = super::super::DrmDevice::with_render(
-            adapter.clone(),
-            Some(render),
-            1,
-            2,
-            3,
-            4,
-        );
+        let device =
+            super::super::DrmDevice::with_render(adapter.clone(), Some(render), 1, 2, 3, 4);
         let primary = device.open_primary();
         let render_file = device.open_render().unwrap();
         let primary_context = primary.render_context().unwrap();
@@ -3107,6 +2767,40 @@ mod tests {
             adapter.state.transport.lock().display_error = Some(error);
             assert_eq!(adapter.display_config_changed(), Err(DrmError::DeviceLost));
         }
+    }
+
+    #[test]
+    fn cursor_upload_completes_before_update_and_failure_skips_cursorq() {
+        let _context = crate::test_support::scheduler_test_context();
+        let adapter = VirtioGpuAdapter::new(FakeTransport::default());
+        let backing = adapter
+            .create_dumb(
+                DumbRequest {
+                    width: 64,
+                    height: 64,
+                    bpp: 32,
+                },
+                256,
+                16384,
+            )
+            .unwrap();
+        let cursor = CursorUpdate {
+            backing,
+            width: 64,
+            height: 64,
+            hot_x: 0,
+            hot_y: 0,
+            x: 3,
+            y: 5,
+        };
+        let fence = adapter.update_cursor(cursor.clone()).unwrap();
+        adapter.state.service_cursor_jobs();
+        assert!(fence.is_signaled());
+        adapter.state.transport.lock().cursor_upload_fails = true;
+        assert!(adapter.update_cursor(cursor).is_err());
+        let transport = adapter.state.transport.lock();
+        assert_eq!(transport.cursor_uploads, 2);
+        assert_eq!(transport.cursor_updates, 1);
     }
 
     #[test]
@@ -3280,6 +2974,50 @@ mod tests {
         let transport = adapter.state.transport.lock();
         assert_eq!(transport.render_detaches, 2);
         assert_eq!(transport.render_unrefs, 1);
+    }
+
+    #[test]
+    fn full_render_queue_does_not_publish_a_failed_reservation_on_retry() {
+        let _context = crate::test_support::scheduler_test_context();
+        let adapter = VirtioGpuAdapter::new(FakeTransport::default());
+        for _ in 0..8 {
+            adapter
+                .state
+                .enqueue_render_job(&mut || Ok(RenderJob::empty_for_test(Fence::new(true))))
+                .unwrap();
+        }
+        let reservation = super::super::fence::Reservation::new();
+        let predecessor = Fence::new(false);
+        reservation.publish(predecessor.clone());
+        let completion = Fence::new(false);
+        let mut calls = 0;
+        let mut prepare = || {
+            calls += 1;
+            let mut job = RenderJob::empty_for_test(completion.clone());
+            job.predecessors = super::super::fence::Reservation::replace_many(
+                &mut [&reservation],
+                completion.clone(),
+            )?;
+            Ok(job)
+        };
+        assert_eq!(
+            adapter.state.enqueue_render_job(&mut prepare),
+            Err(axerrno::AxError::WouldBlock)
+        );
+        assert!(Arc::ptr_eq(
+            &reservation.predecessor().unwrap(),
+            &predecessor
+        ));
+        assert!(!predecessor.is_failed());
+        adapter.state.render_jobs.lock().pop();
+        adapter.state.enqueue_render_job(&mut prepare).unwrap();
+        assert_eq!(calls, 1);
+        assert!(Arc::ptr_eq(
+            &reservation.predecessor().unwrap(),
+            &completion
+        ));
+        assert!(!completion.is_failed());
+        assert_eq!(adapter.state.render_jobs.lock().len(), 8);
     }
 
     #[test]

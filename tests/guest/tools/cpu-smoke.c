@@ -104,6 +104,63 @@ static int memory_protection(void) {
     return failed;
 }
 
+static volatile sig_atomic_t avx_signal_seen;
+static void avx_signal_handler(int signo) {
+    (void)signo;
+    /* Signal return must restore the interrupted YMM upper half too. */
+    __asm__ volatile("vpxor %%ymm15, %%ymm15, %%ymm15" ::: "ymm15");
+    avx_signal_seen = 1;
+}
+
+static int avx_context_state(unsigned int xcr0) {
+    if (!(leaf1c & (1u << 28))) return 0;
+    if ((xcr0 & 7) != 7) {
+        puts("# CPUID AVX advertised without enabled YMM state");
+        return 1;
+    }
+    const uint64_t expected[4] = {0x1122334455667788ULL, 0x99aabbccddeeff00ULL,
+                                  0x13579bdf2468ace0ULL, 0xfedcba9876543210ULL};
+    uint64_t observed[4];
+    cpu_set_t original, single;
+    struct sigaction action = {.sa_handler = avx_signal_handler}, previous;
+    sigemptyset(&action.sa_mask);
+    if (sched_getaffinity(0, sizeof(original), &original) ||
+        sigaction(SIGUSR1, &action, &previous)) return 1;
+    long pid = getpid(), tid = syscall(SYS_gettid);
+    int failed = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        if (!CPU_ISSET(cpu, &original)) continue;
+        CPU_ZERO(&single); CPU_SET(cpu, &single);
+        avx_signal_seen = 0;
+        long affinity_result, signal_result;
+        /* Keep all libc/compiler SIMD activity outside the live register
+         * window. Set affinity after loading YMM15 to exercise migration,
+         * yield, then deliver a handler that overwrites that register. */
+        __asm__ volatile(
+            "vmovdqu (%2), %%ymm15\n\t"
+            "mov %4, %%rdx; mov %5, %%rsi; xor %%edi, %%edi\n\t"
+            "mov $203, %%eax; syscall; mov %%rax, %0\n\t"
+            "mov $24, %%eax; syscall\n\t"
+            "mov %6, %%rdi; mov %7, %%rsi; mov $10, %%edx\n\t"
+            "mov $234, %%eax; syscall; mov %%rax, %1\n\t"
+            "vmovdqu %%ymm15, (%3); vzeroupper"
+            : "=m"(affinity_result), "=m"(signal_result)
+            : "r"(expected), "r"(observed), "r"(&single), "i"(sizeof(single)),
+              "r"(pid), "r"(tid)
+            : "rax", "rdi", "rsi", "rdx", "rcx", "r11", "ymm15", "memory", "cc");
+        if (affinity_result || signal_result || !avx_signal_seen ||
+            memcmp(expected, observed, sizeof(expected)) || sched_getcpu() != cpu) {
+            fprintf(stderr, "# AVX state migration/signal failure on CPU %d\n", cpu);
+            failed = 1;
+            break;
+        }
+    }
+    if (sched_setaffinity(0, sizeof(original), &original) ||
+        sigaction(SIGUSR1, &previous, NULL)) failed = 1;
+    if (!failed) puts("# AVX YMM state survived CPU migration, yield and signal return");
+    return failed;
+}
+
 static int xsave_state(void) {
     if (!(leaf1c & (1u << 26)) || !(leaf1c & (1u << 27))) {
         unsigned char legacy[512] __attribute__((aligned(16)));
@@ -122,6 +179,7 @@ static int xsave_state(void) {
         /* No calls or compiler FP work between saving and restoring. */
         __asm__ volatile("xsave64 (%0)\n\txrstor64 (%0)" :: "r"(state), "a"(lo), "d"(hi) : "memory");
         free(state);
+        if (avx_context_state(lo)) return 1;
     }
     pid_t child = fork();
     if (child < 0) return 1;

@@ -48,6 +48,19 @@ class GraphicsProfileTableTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_audio_is_optional_and_wav_uses_the_requested_file(self):
+        base = dict(arch="x86_64", kernel=Path("kernel"), rootfs=None, direct_kernel=True)
+        self.assertNotIn("-audiodev", build_qemu_command(**base))
+        pa = build_qemu_command(**base, audio_backend="pa")
+        self.assertIn("pa,id=desktop-audio", pa)
+        self.assertIn("virtio-sound-pci,audiodev=desktop-audio,streams=1", pa)
+        wav = build_qemu_command(**base, audio_backend="wav", audio_path=Path("/home/run,a/audio.wav"))
+        self.assertIn("wav,id=desktop-audio,path=/home/run,,a/audio.wav", wav)
+        with self.assertRaises(CommandError):
+            build_qemu_command(**base, audio_backend="wav")
+        with self.assertRaises(CommandError):
+            build_qemu_command(**base, audio_backend="unknown")
+
     def test_usb_input_topology_has_no_virtio_input_fallback(self):
         command = build_qemu_command(arch="x86_64", kernel=Path("kernel"),
             rootfs=None, direct_kernel=True, input_backend="usb",

@@ -1,13 +1,41 @@
-use crate::iface::Context;
-use crate::phy::PacketMeta;
-use crate::socket::PollAt;
-#[cfg(feature = "async")]
-use crate::socket::WakerRegistration;
-use crate::storage::Empty;
-use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, UdpRepr};
 use core::cmp::min;
 #[cfg(feature = "async")]
 use core::task::Waker;
+
+#[cfg(feature = "async")]
+use crate::socket::WakerRegistration;
+use crate::{
+    iface::Context,
+    phy::PacketMeta,
+    socket::PollAt,
+    storage::Empty,
+    wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, UdpRepr},
+};
+
+#[cfg(feature = "alloc")]
+fn is_ipv6(address: IpAddress) -> bool {
+    match address {
+        #[cfg(feature = "proto-ipv4")]
+        IpAddress::Ipv4(_) => false,
+        #[cfg(feature = "proto-ipv6")]
+        IpAddress::Ipv6(_) => true,
+    }
+}
+
+/// Maximum quoted UDP payload retained for asynchronous ICMP errors.
+pub const MAX_UDP_ERROR_PAYLOAD: usize = 1280;
+
+/// Validated ICMP error associated with an outgoing UDP datagram.
+#[cfg(feature = "alloc")]
+#[derive(Debug, Clone)]
+pub struct UdpError {
+    pub destination: IpEndpoint,
+    pub offender: IpAddress,
+    pub icmp_type: u8,
+    pub icmp_code: u8,
+    pub info: u32,
+    pub payload: alloc::vec::Vec<u8>,
+}
 
 /// Metadata for a sent or received UDP packet.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -117,6 +145,12 @@ impl std::error::Error for RecvError {}
 /// packet buffers.
 #[derive(Debug)]
 pub struct Socket<'a> {
+    #[cfg(feature = "alloc")]
+    errors: Option<alloc::collections::VecDeque<UdpError>>,
+    #[cfg(feature = "alloc")]
+    errors_ipv6: bool,
+    #[cfg(feature = "alloc")]
+    pending_error: Option<(bool, u8, u8)>,
     endpoint: IpListenEndpoint,
     remote_endpoint: Option<IpEndpoint>,
     rx_buffer: PacketBuffer<'a>,
@@ -133,6 +167,12 @@ impl<'a> Socket<'a> {
     /// Create an UDP socket with the given buffers.
     pub fn new(rx_buffer: PacketBuffer<'a>, tx_buffer: PacketBuffer<'a>) -> Socket<'a> {
         Socket {
+            #[cfg(feature = "alloc")]
+            errors: None,
+            #[cfg(feature = "alloc")]
+            errors_ipv6: false,
+            #[cfg(feature = "alloc")]
+            pending_error: None,
             endpoint: IpListenEndpoint::default(),
             remote_endpoint: None,
             rx_buffer,
@@ -142,6 +182,116 @@ impl<'a> Socket<'a> {
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
             tx_waker: WakerRegistration::new(),
+        }
+    }
+
+    /// Enable ICMP error queuing, allocating only for opted-in sockets.
+    #[cfg(feature = "alloc")]
+    pub fn set_receive_errors(&mut self, enabled: bool, ipv6: bool) -> Result<(), ()> {
+        if enabled && self.errors.is_none() {
+            let mut queue = alloc::collections::VecDeque::new();
+            queue.try_reserve_exact(8).map_err(|_| ())?;
+            self.errors = Some(queue);
+            self.errors_ipv6 = ipv6;
+        } else if !enabled {
+            self.errors = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "alloc")]
+    pub fn receive_errors(&self) -> bool {
+        self.errors.is_some()
+    }
+
+    #[cfg(feature = "alloc")]
+    pub fn has_error(&self) -> bool {
+        self.pending_error.is_some() || self.errors.as_ref().is_some_and(|q| !q.is_empty())
+    }
+
+    #[cfg(feature = "alloc")]
+    pub fn take_pending_error(&mut self) -> Option<(bool, u8, u8)> {
+        self.pending_error.take()
+    }
+
+    #[cfg(feature = "alloc")]
+    pub fn recv_error(&mut self) -> Option<UdpError> {
+        let error = self.errors.as_mut()?.pop_front()?;
+        self.pending_error = self
+            .errors
+            .as_ref()
+            .and_then(|q| q.front())
+            .map(|e| (is_ipv6(e.offender), e.icmp_type, e.icmp_code));
+        Some(error)
+    }
+
+    /// Route a validated ICMP quote to its bound UDP socket. ICMP quotes may
+    /// contain only a UDP header; do not require the original datagram length.
+    #[cfg(feature = "alloc")]
+    pub(crate) fn process_error(
+        &mut self,
+        source: IpAddress,
+        destination: IpAddress,
+        offender: IpAddress,
+        data: &[u8],
+        icmp_type: u8,
+        icmp_code: u8,
+        info: u32,
+    ) {
+        if data.len() < 8 || self.endpoint.port == 0 {
+            return;
+        }
+        if self.errors.is_some() && self.errors_ipv6 != is_ipv6(source) {
+            return;
+        }
+        let port = u16::from_be_bytes([data[0], data[1]]);
+        let remote = IpEndpoint::new(destination, u16::from_be_bytes([data[2], data[3]]));
+        if port != self.endpoint.port
+            || self.endpoint.addr.is_some_and(|addr| addr != source)
+            || self.remote_endpoint.is_some_and(|peer| peer != remote)
+        {
+            return;
+        }
+        // Without RECVERR Linux reports only hard errors on connected UDP.
+        // Packet-too-big is hard under the default PMTU discovery policy.
+        let hard_error = if is_ipv6(source) {
+            match icmp_type {
+                1 => !matches!(icmp_code, 0 | 2 | 3),
+                2 | 4 => true,
+                _ => false,
+            }
+        } else {
+            match icmp_type {
+                3 => matches!(icmp_code, 2..=4 | 6..=10 | 13..=15),
+                12 => true,
+                _ => false,
+            }
+        };
+        if self.errors.is_none() && (self.remote_endpoint.is_none() || !hard_error) {
+            return;
+        }
+        self.pending_error = Some((is_ipv6(offender), icmp_type, icmp_code));
+        if let Some(queue) = self.errors.as_mut() {
+            let payload = &data[8..];
+            if queue.len() < 8 && payload.len() <= MAX_UDP_ERROR_PAYLOAD {
+                let mut copy = alloc::vec::Vec::new();
+                if copy.try_reserve_exact(payload.len()).is_ok() {
+                    copy.extend_from_slice(payload);
+                    queue.push_back(UdpError {
+                        destination: remote,
+                        offender,
+                        icmp_type,
+                        icmp_code,
+                        info,
+                        payload: copy,
+                    });
+                }
+            }
+        }
+        #[cfg(feature = "async")]
+        {
+            self.rx_waker.wake();
+            self.tx_waker.wake();
         }
     }
 
@@ -279,6 +429,13 @@ impl<'a> Socket<'a> {
         // Clear the bound endpoint of the socket.
         self.endpoint = IpListenEndpoint::default();
         self.remote_endpoint = None;
+        #[cfg(feature = "alloc")]
+        {
+            self.pending_error = None;
+            if let Some(queue) = self.errors.as_mut() {
+                queue.clear();
+            }
+        }
 
         // Reset the RX and TX buffers of the socket.
         self.tx_buffer.reset();
@@ -672,12 +829,14 @@ impl<'a> Socket<'a> {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::wire::{IpRepr, UdpRepr};
-
-    use crate::phy::Medium;
-    use crate::tests::setup;
     use rstest::*;
+
+    use super::*;
+    use crate::{
+        phy::Medium,
+        tests::setup,
+        wire::{IpRepr, UdpRepr},
+    };
 
     fn buffer(packets: usize) -> PacketBuffer<'static> {
         PacketBuffer::new(
@@ -693,6 +852,121 @@ mod test {
         tx_buffer: PacketBuffer<'static>,
     ) -> Socket<'static> {
         Socket::new(rx_buffer, tx_buffer)
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn error_queue_is_opt_in_bounded_and_separate_from_pending_fault() {
+        let mut socket = socket(buffer(1), buffer(1));
+        socket.bind(LOCAL_END).unwrap();
+        let mut quote = [0u8; 12];
+        quote[..2].copy_from_slice(&LOCAL_PORT.to_be_bytes());
+        quote[2..4].copy_from_slice(&REMOTE_PORT.to_be_bytes());
+        quote[4..6].copy_from_slice(&100u16.to_be_bytes()); // truncated ICMP quote is valid
+        quote[8..].copy_from_slice(b"test");
+        let inject = |s: &mut Socket| {
+            s.process_error(
+                LOCAL_ADDR.into(),
+                REMOTE_ADDR.into(),
+                REMOTE_ADDR.into(),
+                &quote,
+                3,
+                3,
+                0,
+            )
+        };
+        inject(&mut socket);
+        assert!(!socket.has_error());
+        socket
+            .set_receive_errors(true, is_ipv6(LOCAL_ADDR.into()))
+            .unwrap();
+        for _ in 0..10 {
+            inject(&mut socket);
+        }
+        assert!(socket.take_pending_error().is_some());
+        assert!(socket.has_error()); // clearing SO_ERROR does not drain the queue
+        for _ in 0..8 {
+            let error = socket.recv_error().unwrap();
+            assert_eq!(error.payload, b"test");
+            assert_eq!(error.destination, REMOTE_END);
+        }
+        assert!(socket.recv_error().is_none());
+        assert!(!socket.has_error());
+        inject(&mut socket);
+        socket
+            .set_receive_errors(false, is_ipv6(LOCAL_ADDR.into()))
+            .unwrap();
+        assert!(socket.recv_error().is_none());
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn connected_soft_errors_require_recverr() {
+        let mut socket = socket(buffer(1), buffer(1));
+        socket.bind(LOCAL_END).unwrap();
+        socket.set_remote_endpoint(Some(REMOTE_END));
+        let mut quote = [0u8; 8];
+        quote[..2].copy_from_slice(&LOCAL_PORT.to_be_bytes());
+        quote[2..4].copy_from_slice(&REMOTE_PORT.to_be_bytes());
+        let ipv6 = is_ipv6(LOCAL_ADDR.into());
+        let (unreachable, port) = if ipv6 { (1, 4) } else { (3, 3) };
+        let inject = |s: &mut Socket, kind, code| {
+            s.process_error(
+                LOCAL_ADDR.into(),
+                REMOTE_ADDR.into(),
+                REMOTE_ADDR.into(),
+                &quote,
+                kind,
+                code,
+                0,
+            );
+        };
+        inject(&mut socket, unreachable, 0); // network unreachable is soft
+        inject(&mut socket, if ipv6 { 3 } else { 11 }, 0); // time exceeded
+        assert!(!socket.has_error());
+        inject(&mut socket, unreachable, port);
+        assert!(socket.take_pending_error().is_some());
+        assert!(!socket.has_error());
+        socket.set_receive_errors(true, ipv6).unwrap();
+        inject(&mut socket, unreachable, 0);
+        assert!(socket.take_pending_error().is_some());
+        assert_eq!(socket.recv_error().unwrap().icmp_code, 0);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn error_quote_rejects_other_binding_and_oversize_payload() {
+        let mut socket = socket(buffer(1), buffer(1));
+        socket.bind(LOCAL_END).unwrap();
+        socket
+            .set_receive_errors(true, is_ipv6(LOCAL_ADDR.into()))
+            .unwrap();
+        let mut quote = vec![0; MAX_UDP_ERROR_PAYLOAD + 9];
+        quote[..2].copy_from_slice(&LOCAL_PORT.to_be_bytes());
+        quote[2..4].copy_from_slice(&REMOTE_PORT.to_be_bytes());
+        socket.process_error(
+            OTHER_ADDR.into(),
+            REMOTE_ADDR.into(),
+            REMOTE_ADDR.into(),
+            &quote[..8],
+            3,
+            3,
+            0,
+        );
+        assert!(!socket.has_error());
+        socket.process_error(
+            LOCAL_ADDR.into(),
+            REMOTE_ADDR.into(),
+            REMOTE_ADDR.into(),
+            &quote,
+            3,
+            3,
+            0,
+        );
+        assert!(socket.take_pending_error().is_some());
+        assert!(socket.recv_error().is_none()); // never present a silently truncated record
+        socket.close();
+        assert!(!socket.has_error());
     }
 
     const LOCAL_PORT: u16 = 53;
@@ -872,7 +1146,7 @@ mod test {
     #[case::ieee802154(Medium::Ieee802154)]
     #[cfg(feature = "medium-ieee802154")]
     fn test_send_dispatch(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
+        let (mut iface, ..) = setup(medium);
         let cx = iface.context();
         let mut socket = socket(buffer(0), buffer(1));
 
@@ -922,7 +1196,7 @@ mod test {
     #[case::ieee802154(Medium::Ieee802154)]
     #[cfg(feature = "medium-ieee802154")]
     fn test_recv_process(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
+        let (mut iface, ..) = setup(medium);
         let cx = iface.context();
 
         let mut socket = socket(buffer(1), buffer(0));
@@ -966,7 +1240,7 @@ mod test {
     #[case::ieee802154(Medium::Ieee802154)]
     #[cfg(feature = "medium-ieee802154")]
     fn test_connected_peer_admission_precedes_rx_queue(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
+        let (mut iface, ..) = setup(medium);
         let cx = iface.context();
         let mut socket = socket(buffer(1), buffer(0));
 
@@ -1005,7 +1279,7 @@ mod test {
     #[case::ieee802154(Medium::Ieee802154)]
     #[cfg(feature = "medium-ieee802154")]
     fn test_remote_changes_preserve_admission_time_queue_order(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
+        let (mut iface, ..) = setup(medium);
         let cx = iface.context();
         let mut socket = socket(buffer(3), buffer(0));
 
@@ -1055,7 +1329,7 @@ mod test {
     #[case::ieee802154(Medium::Ieee802154)]
     #[cfg(feature = "medium-ieee802154")]
     fn test_peek_process(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
+        let (mut iface, ..) = setup(medium);
         let cx = iface.context();
 
         let mut socket = socket(buffer(1), buffer(0));
@@ -1090,7 +1364,7 @@ mod test {
     #[case::ieee802154(Medium::Ieee802154)]
     #[cfg(feature = "medium-ieee802154")]
     fn test_recv_truncated_slice(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
+        let (mut iface, ..) = setup(medium);
         let cx = iface.context();
 
         let mut socket = socket(buffer(1), buffer(0));
@@ -1118,7 +1392,7 @@ mod test {
     #[case::ieee802154(Medium::Ieee802154)]
     #[cfg(feature = "medium-ieee802154")]
     fn test_peek_truncated_slice(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
+        let (mut iface, ..) = setup(medium);
         let cx = iface.context();
 
         let mut socket = socket(buffer(1), buffer(0));
@@ -1147,7 +1421,7 @@ mod test {
     #[case::ieee802154(Medium::Ieee802154)]
     #[cfg(feature = "medium-ieee802154")]
     fn test_set_hop_limit(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
+        let (mut iface, ..) = setup(medium);
         let cx = iface.context();
 
         let mut s = socket(buffer(0), buffer(1));
@@ -1157,7 +1431,7 @@ mod test {
         s.set_hop_limit(Some(0x2a));
         assert_eq!(s.send_slice(b"abcdef", REMOTE_END), Ok(()));
         assert_eq!(
-            s.dispatch(cx, |_, _, (ip_repr, _, _)| {
+            s.dispatch(cx, |_, _, (ip_repr, ..)| {
                 assert_eq!(
                     ip_repr,
                     IpReprIpvX(IpvXRepr {
@@ -1182,7 +1456,7 @@ mod test {
     #[case::ieee802154(Medium::Ieee802154)]
     #[cfg(feature = "medium-ieee802154")]
     fn test_doesnt_accept_wrong_port(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
+        let (mut iface, ..) = setup(medium);
         let cx = iface.context();
 
         let mut socket = socket(buffer(1), buffer(0));
@@ -1203,7 +1477,7 @@ mod test {
     #[case::ieee802154(Medium::Ieee802154)]
     #[cfg(feature = "medium-ieee802154")]
     fn test_doesnt_accept_wrong_ip(#[case] medium: Medium) {
-        let (mut iface, _, _) = setup(medium);
+        let (mut iface, ..) = setup(medium);
         let cx = iface.context();
 
         let mut port_bound_socket = socket(buffer(1), buffer(0));
@@ -1241,7 +1515,7 @@ mod test {
         let recv_buffer = PacketBuffer::new(&mut meta[..], vec![]);
         let mut socket = socket(recv_buffer, buffer(0));
 
-        let (mut iface, _, _) = setup(medium);
+        let (mut iface, ..) = setup(medium);
         let cx = iface.context();
 
         assert_eq!(socket.bind(LOCAL_PORT), Ok(()));

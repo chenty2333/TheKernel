@@ -606,6 +606,8 @@ pub enum SocketOption {
     MaxSegment,
     TimeToLive,
     Ipv6Only,
+    ReceiveErrors4,
+    ReceiveErrors6,
     PassCred,
     ReceiveCredentials,
 }
@@ -680,6 +682,8 @@ pub const fn decode_socket_option(
         (6, 2) => Ok(SocketOption::MaxSegment),
         (0, 2) => Ok(SocketOption::TimeToLive),
         (41, 26) => Ok(SocketOption::Ipv6Only),
+        (0, 11) => Ok(SocketOption::ReceiveErrors4),
+        (41, 25) => Ok(SocketOption::ReceiveErrors6),
         (1 | 6 | 0 | 41, _) => Err(SocketOptionDecodeError::UnknownOption),
         _ => Err(SocketOptionDecodeError::UnknownLevel),
     }

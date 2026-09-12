@@ -7,10 +7,19 @@ use enum_dispatch::enum_dispatch;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum SocketFault {
-    ConnectionRefused = 1,
-    ConnectionReset = 2,
-    Other = 3,
-    TimedOut = 4,
+    ConnectionRefused  = 1,
+    ConnectionReset    = 2,
+    Other              = 3,
+    TimedOut           = 4,
+    NetworkUnreachable = 5,
+    HostUnreachable    = 6,
+    MessageTooLong     = 7,
+    PermissionDenied   = 8,
+    OperationNotSupported = 9,
+    ProtocolError      = 10,
+    ProtocolOptionUnsupported = 11,
+    HostDown           = 12,
+    NoNetwork          = 13,
 }
 
 impl SocketFault {
@@ -20,6 +29,16 @@ impl SocketFault {
             Self::ConnectionReset => AxError::ConnectionReset,
             Self::Other => AxError::Io,
             Self::TimedOut => AxError::TimedOut,
+            Self::PermissionDenied => AxError::PermissionDenied,
+            Self::OperationNotSupported | Self::ProtocolOptionUnsupported => {
+                AxError::OperationNotSupported
+            }
+            Self::MessageTooLong => AxError::InvalidInput,
+            Self::NetworkUnreachable
+            | Self::HostUnreachable
+            | Self::ProtocolError
+            | Self::HostDown
+            | Self::NoNetwork => AxError::Io,
         }
     }
 
@@ -41,6 +60,16 @@ impl SocketFault {
             2 => Some(Self::ConnectionReset),
             3 => Some(Self::Other),
             4 => Some(Self::TimedOut),
+            5 => Some(Self::NetworkUnreachable),
+            6 => Some(Self::HostUnreachable),
+            7 => Some(Self::MessageTooLong),
+            8 => Some(Self::PermissionDenied),
+            9 => Some(Self::OperationNotSupported),
+            10 => Some(Self::ProtocolError),
+            11 => Some(Self::ProtocolOptionUnsupported),
+            12 => Some(Self::HostDown),
+            13 => Some(Self::NoNetwork),
+
             _ => None,
         }
     }
@@ -113,6 +142,8 @@ define_options! {
     // ---- IP level options (IP_*) ----
     Ttl(u8),
     Ipv6Only(bool),
+    ReceiveErrors4(bool),
+    ReceiveErrors6(bool),
 
     // ---- Extra options ----
     NonBlocking(bool),

@@ -5,11 +5,10 @@ export LANG=C.UTF-8
 export HOME=/var/lib/weston
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 export WAYLAND_DISPLAY=wayland-0
-cd "$HOME"
 app=${1:-terminal}
 [ "$#" -eq 0 ] || shift
 case "$app" in
-    terminal) exec /usr/bin/weston-terminal --maximized --shell=/bin/sh ;;
+    terminal) cd "$HOME"; exec /usr/bin/weston-terminal --maximized --shell=/bin/sh ;;
     files)
         [ "$#" -gt 0 ] || set -- "$HOME"
         # PCManFM 1.3.2 uses X11 screen APIs even for ordinary file windows.
@@ -22,8 +21,16 @@ case "$app" in
         exec /usr/bin/feh --scale-down --auto-zoom "$@"
         ;;
     python)
+        cd "$HOME"
         export PYTHON_BASIC_REPL=1
         exec /usr/bin/weston-terminal --shell=/usr/bin/python3
+        ;;
+    browser)
+        export GDK_BACKEND=wayland
+        browser_data=${XDG_DATA_HOME:-"$HOME/.local/share"}/webkitgtk-4.1/MiniBrowser
+        mkdir -p "$browser_data"
+        [ "$#" -gt 0 ] || set -- about:blank
+        exec /usr/bin/dbus-run-session -- /usr/bin/MiniBrowser --enable-sandbox --cookies-file="$browser_data/cookies.sqlite" "$@"
         ;;
     shutdown) exec /usr/local/bin/thekernel-desktop-poweroff ;;
     *) printf 'Unknown desktop application: %s\n' "$app" >&2; exit 2 ;;

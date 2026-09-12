@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -115,6 +116,61 @@ static int test_tmpfs(void) {
         return fail("tmpfs-rmdir");
     }
     return 0;
+}
+
+static int test_sysv_shm(void) {
+    int id = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+    if (id < 0)
+        return fail("shmget");
+    unsigned char *first = shmat(id, NULL, 0);
+    unsigned char *second = (void *)-1;
+    const char *error = "shmat-first";
+    if (first == (void *)-1)
+        goto out;
+    first[0] = 17;
+    error = "shm-rmid";
+    if (shmctl(id, IPC_RMID, NULL) != 0)
+        goto out;
+    error = "shmat-after-rmid";
+    second = shmat(id, NULL, SHM_RDONLY);
+    if (second == (void *)-1 || second[0] != 17)
+        goto out;
+    error = "shmat-child";
+    pid_t child = fork();
+    if (child < 0)
+        goto out;
+    if (child == 0) {
+        unsigned char *shared = shmat(id, NULL, 0);
+        if (shared == (void *)-1 || shared[0] != 17)
+            _exit(1);
+        shared[0] = 23;
+        _exit(shmdt(shared) != 0);
+    }
+    int status;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0 || first[0] != 23 || second[0] != 23)
+        goto out;
+    error = "shmdt-final";
+    if (shmdt(second) != 0)
+        goto out;
+    second = (void *)-1;
+    if (shmdt(first) != 0)
+        goto out;
+    first = (void *)-1;
+    error = "shmat-removed-id";
+    second = shmat(id, NULL, 0);
+    if (second != (void *)-1 || errno != EINVAL)
+        goto out;
+    return 0;
+out:
+    {
+        int saved = errno;
+        (void)shmctl(id, IPC_RMID, NULL);
+        if (second != (void *)-1) (void)shmdt(second);
+        if (first != (void *)-1) (void)shmdt(first);
+        errno = saved;
+        return fail(error);
+    }
 }
 
 static int test_procfs(void) {
@@ -611,6 +667,7 @@ int main(int argc, char **argv) {
         { "mounts", verify_core_filesystems, 60 },
         { "rootfs", test_rootfs, 60 },
         { "tmpfs", test_tmpfs, 60 },
+        { "sysv-shm", test_sysv_shm, 60 },
         { "procfs", test_procfs, 60 },
         { "memory-pressure", test_memory_pressure_reclaim, 120 },
         { "process-exec", test_process_pipe_and_exec, 60 },

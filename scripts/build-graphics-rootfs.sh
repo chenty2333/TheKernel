@@ -126,6 +126,18 @@ flavor_br2_contract() {
                 'BR2_PACKAGE_PIGLIT=y' \
                 'BR2_PACKAGE_XORG7=y' \
                 'BR2_PACKAGE_LIBEPOXY=y' \
+                'BR2_PACKAGE_WEBKITGTK=y' \
+                'BR2_PACKAGE_WEBKITGTK_MINIBROWSER=y' \
+                'BR2_PACKAGE_WEBKITGTK_SANDBOX=y' \
+                'BR2_PACKAGE_WEBKITGTK_HTTPS=y' \
+                'BR2_PACKAGE_WEBKITGTK_MULTIMEDIA=y' \
+                'BR2_PACKAGE_PULSEAUDIO=y' \
+                'BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_PULSE=y' \
+                'BR2_PACKAGE_CA_CERTIFICATES=y' \
+                'BR2_PACKAGE_LIBCURL_CURL=y' \
+                'BR2_PACKAGE_LIBCURL_OPENSSL=y' \
+                'BR2_PACKAGE_OPENSSH_CLIENT=y' \
+                '# BR2_PACKAGE_OPENSSH_SERVER is not set' \
                 'BR2_TARGET_ROOTFS_EXT2_SIZE="3G"' \
                 'BR2_PACKAGE_WESTON_XWAYLAND=y'
             ;;
@@ -245,7 +257,7 @@ validate_checked_in() {
     grep -qx 'BR2_PACKAGE_PIXMAN=y' "$COMMON"
     grep -qx 'BR2_PACKAGE_WESTON=y' "$COMMON"
     seatd_common_br2_contract | require_br2_contract "$COMMON"
-    grep -qx 'weston -1 weston -1 !\* /var/lib/weston /bin/sh seat,render Weston compositor' "$REPO_ROOT/config/graphics/users.table"
+    grep -qx 'weston -1 weston -1 !\* /var/lib/weston /bin/sh seat,render,audio Weston compositor' "$REPO_ROOT/config/graphics/users.table"
     grep -qx 'SUBSYSTEM=="drm", KERNEL=="card\[0-9\]\*", GROUP="video", MODE="0660"' "$REPO_ROOT/config/graphics/overlay/common/etc/udev/rules.d/71-thekernel-graphics.rules"
     grep -qx 'SUBSYSTEM=="drm", KERNEL=="renderD\[0-9\]\*", GROUP="render", MODE="0660"' "$REPO_ROOT/config/graphics/overlay/common/etc/udev/rules.d/71-thekernel-graphics.rules"
     grep -qx 'SUBSYSTEM=="graphics", KERNEL=="fb\[0-9\]\*", GROUP="video", MODE="0660"' "$REPO_ROOT/config/graphics/overlay/common/etc/udev/rules.d/71-thekernel-graphics.rules"
@@ -294,6 +306,7 @@ validate_checked_in() {
             grep -Fqx 'BR2_ROOTFS_DEVICE_TABLE="system/device_table.txt @REPO_ROOT@/config/graphics/desktop-permissions.table"' "$fragment"
             [ -r "$REPO_ROOT/config/graphics/desktop-poweroff.c" ]
             [ -r "$REPO_ROOT/config/graphics/desktop-permissions.table" ]
+            [ -r "$REPO_ROOT/config/graphics/patches/webkitgtk/$WEBKITGTK_VERSION/webkitgtk.hash" ]
             grep -qx 'BR2_PACKAGE_WESTON_DEFAULT_DRM=y' "$fragment"
             grep -qx 'BR2_PACKAGE_PYTHON3=y' "$fragment"
             for package in PCMANFM XAPP_XEDIT FEH SHARED_MIME_INFO XFONT_FONT_MISC_MISC XFONT_FONT_ALIAS; do
@@ -453,12 +466,20 @@ validate_build_output() {
             [ -x "$target/usr/local/bin/thekernel-desktop-app" ]
             [ -x "$target/usr/local/bin/thekernel-desktop-poweroff" ]
             [ -x "$target/usr/local/bin/thekernel-desktop-xwayland" ]
-            for app in pcmanfm xedit feh python3; do
+            for app in pcmanfm xedit feh python3 MiniBrowser dbus-run-session curl ssh scp sftp pulseaudio paplay pactl; do
                 [ -x "$target/usr/bin/$app" ]
             done
+            [ -s "$target/etc/ssl/certs/ca-certificates.crt" ]
+            [ -r "$target/etc/resolv.conf" ]
+            [ -r "$target/etc/pulse/default.pa" ]
+            find "$target/usr/lib" -type f -name 'module-oss.so' -print -quit | grep -q .
+            find "$target/usr/lib" -type f -name 'libgstpulseaudio.so' -print -quit | grep -q .
+            "$debugfs" -R 'cat /etc/group' "$accounts_image" 2>/dev/null \
+                | grep -Eq '^audio:[^:]*:[^:]*:([^,]+,)*weston(,[^,]+)*$'
             [ -r "$target/etc/xdg/mimeapps.list" ]
             [ -r "$target/usr/share/applications/thekernel-editor.desktop" ]
             [ -r "$target/usr/share/applications/thekernel-images.desktop" ]
+            [ -r "$target/usr/share/applications/thekernel-browser.desktop" ]
             [ -r "$target/etc/weston/weston-desktop.ini" ]
             while IFS= read -r icon; do
                 [ -r "$target$icon" ]
@@ -624,17 +645,21 @@ generated_config=$output/.thekernel-graphics.config
 sed -e "s|@REPO_ROOT@/config/graphics/overlay|$staged_overlay|g" -e "s|@REPO_ROOT@|$REPO_ROOT|g" "$COMMON" >"$generated_config"
 sed -e "s|@REPO_ROOT@/config/graphics/overlay|$staged_overlay|g" -e "s|@REPO_ROOT@|$REPO_ROOT|g" "$fragment" >>"$generated_config"
 
-make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}" defconfig BR2_DEFCONFIG="$generated_config"
-make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}" olddefconfig
+# 2.52.6 includes the pinned Buildroot release's system-malloc patch. Keep
+# Buildroot's package recipe, but use this version's patch/hash directory.
+webkit_package_args=("WEBKITGTK_VERSION=$WEBKITGTK_VERSION"
+                     "WEBKITGTK_PKGDIR=$REPO_ROOT/config/graphics/patches/webkitgtk")
+make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}" "${webkit_package_args[@]}" defconfig BR2_DEFCONFIG="$generated_config"
+make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}" "${webkit_package_args[@]}" olddefconfig
 if [ "$source_only" -eq 1 ]; then
-    make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}" source
+    make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}" "${webkit_package_args[@]}" source
     printf 'verified package sources cached in: %s\n' "$download_dir"
 else
-    make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}"
+    make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}" "${webkit_package_args[@]}"
     if [ -n "$fault" ]; then
         [ "$flavor" = q35-graphics-benchmark ] || { printf '%s\n' '--fault requires q35-graphics-benchmark' >&2; exit 2; }
         printf '%s\n' "$fault" >"$output/target/etc/thekernel-graphics-fault"
-        make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}" rootfs-ext2-rebuild
+        make -C "$buildroot_dir" O="$output" BR2_DL_DIR="$download_dir" BR2_JLEVEL="${BR2_JLEVEL:-2}" "${webkit_package_args[@]}" rootfs-ext2-rebuild
     fi
     validate_build_output
     printf 'graphics rootfs output: %s/images/rootfs.ext2\n' "$output"

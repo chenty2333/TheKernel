@@ -4,11 +4,13 @@ mod dri;
 #[cfg(feature = "input")]
 pub(crate) mod event;
 mod fb;
+pub(crate) use fb::restore_console_after_master_close;
 pub(crate) mod fuse;
 pub(crate) mod r#loop;
 #[cfg(feature = "memtrack")]
 mod memtrack;
 mod rtc;
+mod sound;
 pub mod tty;
 pub(crate) mod tun;
 
@@ -620,6 +622,18 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             Arc::new(rtc::Rtc),
         ),
     );
+    if axdriver::sound::available() {
+        root.add(
+            "dsp",
+            Device::new_with_permissions(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(14, 3),
+                NodePermission::from_bits_truncate(0o660),
+                Arc::new(sound::Dsp),
+            ),
+        );
+    }
     // DRM owns VirtIO-GPU scanout before devfs publication. `/dev/fb0` is an
     // emulation client of that primary device, never a competing raw display.
     if crate::drm::primary_device().is_some() {
@@ -681,19 +695,9 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         );
     }
 
-    root.add(
-        "ptmx",
-        Device::new(
-            fs.clone(),
-            NodeType::CharacterDevice,
-            DeviceId::new(5, 2),
-            Arc::new(tty::Ptmx(fs.clone())),
-        ),
-    );
-    root.add(
-        "pts",
-        SimpleDir::new_maker(fs.clone(), Arc::new(tty::PtsDir)),
-    );
+    root.add("ptmx", SimpleFile::new(fs.clone(), NodeType::Symlink,
+        || Ok("pts/ptmx")));
+    root.add("pts", SimpleDir::new_maker(fs.clone(), Arc::new(DirMapping::new())));
     #[cfg(feature = "memtrack")]
     root.add(
         "memtrack",
@@ -793,6 +797,35 @@ mod tests {
     use super::*;
     use crate::task::{Cred, Kgid, Kuid, UserNamespace};
     use axfs_ng_vfs::FsName;
+
+    #[test]
+    fn devfs_socket_creation_preserves_shared_memory_mount() {
+        let _scheduler = crate::test_support::scheduler_test_context();
+        let devfs = new_devfs();
+        let root = axfs_ng_vfs::Mountpoint::new_root(&devfs).root_location();
+        let shm = root.lookup_no_follow(FsName::new(b"shm")).unwrap();
+        let tmpfs = crate::pseudofs::MemoryFs::new_with_permission(
+            NodePermission::from_bits_truncate(0o1777),
+        )
+        .unwrap();
+        shm.mount(&tmpfs).unwrap();
+        assert_eq!(
+            root.lookup_no_follow(FsName::new(b"shm"))
+                .unwrap()
+                .filesystem()
+                .name(),
+            "tmpfs",
+        );
+        root.create(
+            FsName::new(b"log"),
+            NodeType::Socket,
+            NodePermission::from_bits_truncate(0o666),
+        )
+        .unwrap();
+        let mounted = root.lookup_no_follow(FsName::new(b"shm")).unwrap();
+        assert_eq!(mounted.filesystem().name(), "tmpfs");
+        assert_eq!(mounted.metadata().unwrap().mode.bits(), 0o1777);
+    }
 
     #[test]
     fn devfs_publishes_linux_virtual_console_nodes() {

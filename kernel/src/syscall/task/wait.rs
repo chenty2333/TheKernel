@@ -58,12 +58,13 @@ enum WaitPid {
     Any,
     /// Wait for the child whose process ID is equal to the value.
     Pid(Pid),
-    /// Wait for any child process whose process group ID is equal to the value.
+    /// Wait for a child in this kernel-wide process group. A current group
+    /// can be inherited from an outer PID namespace and have no visible ID.
     Pgid(Pid),
 }
 
 impl WaitPid {
-    const fn apply_visible(&self, child_pid: Pid, child_pgid: Pid) -> bool {
+    const fn matches(&self, child_pid: Pid, child_pgid: Pid) -> bool {
         match self {
             WaitPid::Any => true,
             WaitPid::Pid(pid) => child_pid == *pid,
@@ -80,15 +81,9 @@ fn visible_process_pid(viewer_pid_ns: &PidNamespace, process: &Process) -> Optio
     viewer_pid_ns.visible_pid_for(target_pid_ns, process.pid())
 }
 
-fn visible_process_pgid(viewer_pid_ns: &PidNamespace, process: &Process) -> Option<Pid> {
-    let target_pid_ns = process.identity::<Arc<PidNamespace>>()?;
-    viewer_pid_ns.visible_pid_for(target_pid_ns, process.group().pgid())
-}
-
 fn wait_pid_applies(viewer_pid_ns: &PidNamespace, pid: WaitPid, child: &Process) -> Option<Pid> {
     let child_pid = visible_process_pid(viewer_pid_ns, child)?;
-    let child_pgid = visible_process_pgid(viewer_pid_ns, child)?;
-    pid.apply_visible(child_pid, child_pgid)
+    pid.matches(child_pid, child.group().pgid())
         .then_some(child_pid)
 }
 
@@ -473,11 +468,11 @@ pub fn sys_waitpid(
     let pid = if pid == -1 {
         WaitPid::Any
     } else if pid == 0 {
-        WaitPid::Pgid(visible_process_pgid(&viewer_pid_ns, proc).ok_or(AxError::NoSuchProcess)?)
+        WaitPid::Pgid(proc.group().pgid())
     } else if pid > 0 {
         WaitPid::Pid(pid as _)
     } else {
-        WaitPid::Pgid(-pid as _)
+        WaitPid::Pgid(viewer_pid_ns.resolve_visible_pid(-pid as _).unwrap_or(0))
     };
     let check_children = || {
         let _wait_guard = proc_data.wait_lock.lock();
@@ -623,11 +618,9 @@ pub fn sys_waitid(
                 return Err(AxError::InvalidInput);
             }
             Some(if pgid == 0 {
-                WaitPid::Pgid(
-                    visible_process_pgid(&viewer_pid_ns, proc).ok_or(AxError::NoSuchProcess)?,
-                )
+                WaitPid::Pgid(proc.group().pgid())
             } else {
-                WaitPid::Pgid(pgid as _)
+                WaitPid::Pgid(viewer_pid_ns.resolve_visible_pid(pgid as _).unwrap_or(0))
             })
         }
         P_PIDFD => {
@@ -793,12 +786,66 @@ mod tests {
 
     #[test]
     fn wait_pid_matches_the_caller_visible_pid_and_pgid() {
-        // The caller sees a child as PID 46 and as member of process group
-        // 12, even though both core IDs differ in the parent namespace.
-        assert!(WaitPid::Pid(46).apply_visible(46, 12));
-        assert!(!WaitPid::Pid(79).apply_visible(46, 12));
-        assert!(WaitPid::Pgid(12).apply_visible(46, 12));
-        assert!(!WaitPid::Pgid(78).apply_visible(46, 12));
-        assert!(WaitPid::Any.apply_visible(46, 12));
+        // Process IDs are caller-visible; group selectors have already been
+        // resolved to the stable kernel identity (12 here).
+        assert!(WaitPid::Pid(46).matches(46, 12));
+        assert!(!WaitPid::Pid(79).matches(46, 12));
+        assert!(WaitPid::Pgid(12).matches(46, 12));
+        assert!(!WaitPid::Pgid(78).matches(46, 12));
+        assert!(WaitPid::Any.matches(46, 12));
+    }
+
+    #[test]
+    fn namespace_wait_keeps_children_whose_group_is_outside_the_namespace() {
+        use alloc::sync::Arc;
+
+        use crate::task::{PidNamespace, UserNamespace};
+
+        let user = UserNamespace::try_new_root().unwrap();
+        let outer = PidNamespace::try_new_root(user.clone()).unwrap();
+        outer.reserve_process(100).unwrap().commit();
+        let domain = thekernel_linux_process_adapter::ProcessDomain::try_new().unwrap();
+        let root = domain
+            .try_new_init_with_identity(100, None, outer.clone())
+            .unwrap();
+        domain.prepare_thread(&root, 100).unwrap().commit().unwrap();
+        let scope = domain.try_new_reaper_scope().unwrap();
+        let inner = outer
+            .try_fork_with_reaper_scope(200, user, scope.clone())
+            .unwrap();
+        inner.reserve_process(200).unwrap().commit();
+        let admission = domain
+            .prepare_fork_as_reaper_scope_init_with_identity(
+                &root,
+                &scope,
+                200,
+                None,
+                inner.clone(),
+            )
+            .unwrap();
+        let init = admission
+            .prepare_initial_thread(200)
+            .unwrap()
+            .commit()
+            .unwrap();
+        inner.reserve_process(201).unwrap().commit();
+        let admission = domain
+            .prepare_fork_in_reaper_scope_with_identity(&init, &scope, 201, Some(17), inner.clone())
+            .unwrap();
+        let child = admission.process().clone();
+        admission.commit();
+        assert!(Arc::ptr_eq(&init.group(), &root.group()));
+        assert_eq!(inner.visible_pid_checked(child.group().pgid()), None);
+        for selector in [
+            WaitPid::Any,
+            WaitPid::Pid(2),
+            WaitPid::Pgid(init.group().pgid()),
+        ] {
+            assert_eq!(super::wait_pid_applies(&inner, selector, &child), Some(2));
+        }
+        assert_eq!(
+            super::wait_pid_applies(&inner, WaitPid::Pgid(200), &child),
+            None
+        );
     }
 }

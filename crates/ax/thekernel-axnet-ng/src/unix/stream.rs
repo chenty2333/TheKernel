@@ -44,6 +44,7 @@ struct AncillarySegment {
     start: usize,
     end: usize,
     cmsg: Vec<crate::CMsgData>,
+    credentials: Option<SocketCredentials>,
 }
 
 fn new_uni_channel() -> AxResult<(HeapProd<u8>, HeapCons<u8>)> {
@@ -74,6 +75,8 @@ fn new_channels(
     let poll_update = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
     let left_close = Arc::try_new(AtomicU8::new(0)).map_err(|_| AxError::NoMemory)?;
     let right_close = Arc::try_new(AtomicU8::new(0)).map_err(|_| AxError::NoMemory)?;
+    let left_passcred = Arc::try_new(AtomicBool::new(false)).map_err(|_| AxError::NoMemory)?;
+    let right_passcred = Arc::try_new(AtomicBool::new(false)).map_err(|_| AxError::NoMemory)?;
     Ok((
         Channel {
             tx: Some(client_tx),
@@ -84,6 +87,9 @@ fn new_channels(
             rx_offset: 0,
             poll_update: poll_update.clone(),
             peer_credentials: right_credentials,
+            local_credentials: left_credentials,
+            local_passcred: left_passcred.clone(),
+            peer_passcred: right_passcred.clone(),
             local_close: left_close.clone(),
             peer_close: right_close.clone(),
         },
@@ -96,6 +102,9 @@ fn new_channels(
             rx_offset: 0,
             poll_update,
             peer_credentials: left_credentials,
+            local_credentials: right_credentials,
+            local_passcred: right_passcred,
+            peer_passcred: left_passcred,
             local_close: right_close,
             peer_close: left_close,
         },
@@ -118,11 +127,22 @@ struct Channel {
     // TODO: granularity
     poll_update: Arc<PollSet>,
     peer_credentials: SocketCredentials,
+    local_credentials: SocketCredentials,
+    local_passcred: Arc<AtomicBool>,
+    peer_passcred: Arc<AtomicBool>,
     local_close: Arc<AtomicU8>,
     peer_close: Arc<AtomicU8>,
 }
 
 impl Channel {
+    fn identity(&self) -> usize {
+        Arc::as_ptr(&self.local_close) as usize
+    }
+
+    fn peer_identity(&self) -> usize {
+        Arc::as_ptr(&self.peer_close) as usize
+    }
+
     fn publish_read_close(&self) {
         self.local_close
             .fetch_or(STREAM_READ_CLOSED, Ordering::AcqRel);
@@ -202,6 +222,7 @@ impl Channel {
 struct Listener {
     conn_tx: Sender<ConnRequest>,
     credentials: Mutex<SocketCredentials>,
+    passcred: Arc<AtomicBool>,
     backlog: AtomicUsize,
 }
 
@@ -209,10 +230,11 @@ struct Listener {
 pub struct Bind(Arc<Listener>);
 
 impl Bind {
-    fn try_new(conn_tx: Sender<ConnRequest>) -> AxResult<Self> {
+    fn try_new(conn_tx: Sender<ConnRequest>, passcred: Arc<AtomicBool>) -> AxResult<Self> {
         Arc::try_new(Listener {
             conn_tx,
             credentials: Mutex::new(SocketCredentials::UNKNOWN),
+            passcred,
             backlog: AtomicUsize::new(0),
         })
         .map(Self)
@@ -253,7 +275,7 @@ struct ConnRequest {
 
 impl ConnRequest {
     fn identity(&self) -> usize {
-        Arc::as_ptr(&self.channel.poll_update).cast::<()>() as usize
+        self.channel.identity()
     }
 }
 
@@ -267,6 +289,13 @@ pub(super) struct StreamConnectReservation<'a> {
 }
 
 impl StreamConnectReservation<'_> {
+    pub(super) fn connecting_identity(&self) -> usize {
+        self.client_channel
+            .as_ref()
+            .expect("active stream-connect reservation")
+            .identity()
+    }
+
     pub(super) fn listener_identity(&self) -> usize {
         self.listener.identity()
     }
@@ -367,10 +396,12 @@ impl StreamAcceptReservation {
             .drop_cleanup
             .take()
             .expect("prepared stream-accept cleanup");
+        let passcred = channel.local_passcred.clone();
         Ok((
             Transport::Stream(StreamTransport::new_channel_with_cleanup(
                 Some(channel),
                 cleanup,
+                passcred,
             )),
             peer_addr,
         ))
@@ -579,12 +610,21 @@ pub struct StreamTransport {
     rx_closed: AtomicBool,
     tx_closed: AtomicBool,
     connect_state: AtomicU8,
+    passcred: Arc<AtomicBool>,
 }
 
 const CONNECT_UNCONNECTED: u8 = 0;
 const CONNECT_RESERVED: u8 = 1;
 const CONNECT_CONNECTED: u8 = 2;
 impl StreamTransport {
+    pub(super) fn endpoint_identity(&self) -> Option<usize> {
+        self.channel.lock().as_ref().map(Channel::identity)
+    }
+
+    pub(super) fn peer_endpoint_identity(&self) -> Option<usize> {
+        self.channel.lock().as_ref().map(Channel::peer_identity)
+    }
+
     /// Create a new unconnected stream transport.
     pub fn new() -> AxResult<Self> {
         StreamTransport::new_channel(None)
@@ -602,12 +642,21 @@ impl StreamTransport {
 
     fn new_channel(channel: Option<Channel>) -> AxResult<Self> {
         let drop_cleanup = DeferredStreamCleanup::try_new()?;
-        Ok(Self::new_channel_with_cleanup(channel, drop_cleanup))
+        let passcred = match channel.as_ref() {
+            Some(channel) => channel.local_passcred.clone(),
+            None => Arc::try_new(AtomicBool::new(false)).map_err(|_| AxError::NoMemory)?,
+        };
+        Ok(Self::new_channel_with_cleanup(
+            channel,
+            drop_cleanup,
+            passcred,
+        ))
     }
 
     fn new_channel_with_cleanup(
         channel: Option<Channel>,
         drop_cleanup: Box<DeferredStreamCleanup>,
+        passcred: Arc<AtomicBool>,
     ) -> Self {
         let connect_state = if channel.is_some() {
             CONNECT_CONNECTED
@@ -623,6 +672,7 @@ impl StreamTransport {
             rx_closed: AtomicBool::new(false),
             tx_closed: AtomicBool::new(false),
             connect_state: AtomicU8::new(connect_state),
+            passcred,
         }
     }
 
@@ -712,7 +762,15 @@ impl StreamTransport {
             };
             let permit = bind.reserve()?;
             let listener_credentials = *bind.0.credentials.lock();
-            let (client_channel, server_channel) = new_channels(credentials, listener_credentials)?;
+            let (mut client_channel, mut server_channel) =
+                new_channels(credentials, listener_credentials)?;
+            client_channel.local_passcred = self.passcred.clone();
+            server_channel.peer_passcred = self.passcred.clone();
+            // Accepted sockets inherit the listener option at connect time,
+            // then own their setting independently of future listener changes.
+            server_channel
+                .local_passcred
+                .store(bind.0.passcred.load(Ordering::Acquire), Ordering::Release);
             Ok(StreamConnectReservation {
                 transport: self,
                 listener: bind,
@@ -771,6 +829,9 @@ impl Configurable for StreamTransport {
             O::SendBuffer(size) | O::ReceiveBuffer(size) => {
                 **size = BUF_SIZE;
             }
+            O::PassCredentials(enabled) => {
+                **enabled = self.passcred.load(Ordering::Acquire);
+            }
             O::PeerCredentials(cred) => {
                 **cred = self
                     .channel
@@ -788,7 +849,18 @@ impl Configurable for StreamTransport {
             return Ok(true);
         }
 
-        let _ = opt;
+        if let SetSocketOption::PassCredentials(enabled) = opt {
+            self.passcred.store(*enabled, Ordering::Release);
+            let poll = self
+                .channel
+                .lock()
+                .as_ref()
+                .map(|chan| chan.poll_update.clone());
+            if let Some(poll) = poll {
+                poll.wake();
+            }
+            return Ok(true);
+        }
         Ok(false)
     }
 }
@@ -801,7 +873,7 @@ impl TransportOps for StreamTransport {
         // Admission and queue storage are completely prepared before either
         // endpoint lock is acquired. Installation below only moves ownership.
         let (tx, rx) = try_bounded(LISTEN_QUEUE_SIZE)?;
-        let prepared_bind = Bind::try_new(tx)?;
+        let prepared_bind = Bind::try_new(tx, self.passcred.clone())?;
         let mut slot = slot.stream.lock();
         if slot.is_some() {
             return Err(AxError::AddrInUse);
@@ -866,7 +938,11 @@ impl TransportOps for StreamTransport {
                 if chan.peer_read_closed() {
                     return Err(AxError::BrokenPipe);
                 }
-                let segment = if options.cmsg.is_empty() {
+                let credentials = (options.credentials_explicit
+                    || chan.peer_passcred.load(Ordering::Acquire)
+                    || self.passcred.load(Ordering::Acquire))
+                .then_some(options.credentials.unwrap_or(chan.local_credentials));
+                let segment = if options.cmsg.is_empty() && credentials.is_none() {
                     None
                 } else {
                     Some(
@@ -923,6 +999,7 @@ impl TransportOps for StreamTransport {
                                 start,
                                 end: chan.tx_offset,
                                 cmsg: core::mem::take(&mut options.cmsg),
+                                credentials,
                             })
                             .map_err(|_| AxError::BrokenPipe)?;
                     }
@@ -977,7 +1054,17 @@ impl TransportOps for StreamTransport {
                         .segments_rx
                         .as_ref()
                         .and_then(|segments| {
-                            segments.with_front(|segment| segment.end.wrapping_sub(chan.rx_offset))
+                            segments.with_front(|segment| {
+                                let start = segment.start.wrapping_sub(chan.rx_offset);
+                                if self.passcred.load(Ordering::Acquire)
+                                    && segment.credentials.is_some()
+                                    && start != 0
+                                {
+                                    start
+                                } else {
+                                    segment.end.wrapping_sub(chan.rx_offset)
+                                }
+                            })
                         })
                         .unwrap_or(available)
                         .min(available);
@@ -996,38 +1083,86 @@ impl TransportOps for StreamTransport {
                         }
                         count += second;
                     }
-                    if !options.flags.contains(RecvFlags::PEEK) {
-                        // SAFETY: Both returned counts were bounded by occupied
-                        // slices, and this locked channel owns the only consumer.
-                        unsafe { rx.advance_read_index(count) };
-                    }
                     count
                 };
                 let cmsg_start = chan.rx_offset;
+                let mut segment = if count != 0 {
+                    chan.segments_rx
+                        .as_ref()
+                        .filter(|segments| {
+                            segments
+                                .with_front(|segment| {
+                                    segment.start.wrapping_sub(cmsg_start) < count
+                                })
+                                .unwrap_or(false)
+                        })
+                        .map(|segments| segments.try_reserve_inner().map_err(|_| AxError::BadState))
+                        .transpose()?
+                } else {
+                    None
+                };
+                // Prepare every fallible ancillary operation before consuming
+                // ring bytes or changing segment offsets. A failed PEEK clone
+                // must also leave the caller's control list untouched.
+                let mut prepared_credentials = None;
+                let mut prepared = Vec::new();
+                if let Some(segment) = segment.as_ref()
+                    && let Some(output) = options.cmsg.as_mut()
+                {
+                    let credentials = self
+                        .passcred
+                        .load(Ordering::Acquire)
+                        .then_some(segment.item().credentials)
+                        .flatten();
+                    let capacity = segment.item().cmsg.len() + usize::from(credentials.is_some());
+                    output
+                        .try_reserve(capacity)
+                        .map_err(|_| AxError::NoMemory)?;
+                    if let Some(credentials) = credentials {
+                        prepared_credentials = Some(crate::CMsgData::new_peekable(
+                            Box::try_new(credentials).map_err(|_| AxError::NoMemory)?,
+                            0,
+                            |credentials| Ok(*credentials),
+                        )?);
+                    }
+                    if options.flags.contains(RecvFlags::PEEK) {
+                        prepared
+                            .try_reserve(segment.item().cmsg.len())
+                            .map_err(|_| AxError::NoMemory)?;
+                        for cmsg in &segment.item().cmsg {
+                            prepared.push(cmsg.clone_for_peek()?);
+                        }
+                    }
+                }
                 if count != 0 && !options.flags.contains(RecvFlags::PEEK) {
+                    // SAFETY: Both returned counts were bounded by occupied
+                    // slices, and this locked channel owns the only consumer.
+                    unsafe { rx.advance_read_index(count) };
                     chan.rx_offset = chan.rx_offset.wrapping_add(count);
                 }
-                if count != 0 {
-                    if let Some(segments) = chan.segments_rx.as_ref()
-                        && segments
-                            .with_front(|segment| segment.start.wrapping_sub(cmsg_start) < count)
-                            .unwrap_or(false)
-                    {
-                        let reservation = segments
-                            .try_reserve_inner()
-                            .map_err(|_| AxError::BadState)?;
-                        if options.flags.contains(RecvFlags::PEEK) {
-                            if let Some(output) = options.cmsg.as_mut() {
-                                for cmsg in &reservation.item().cmsg {
-                                    output.push(cmsg.clone_for_peek()?);
-                                }
-                            }
+                if let Some(mut reservation) = segment.take() {
+                    if let Some(output) = options.cmsg.as_mut() {
+                        if let Some(credentials) = prepared_credentials {
+                            output.push(credentials);
+                        }
+                        output.append(&mut prepared);
+                    }
+                    if options.flags.contains(RecvFlags::PEEK) {
+                        let _ = reservation.cancel();
+                    } else {
+                        let segment = reservation.item_mut();
+                        if let Some(output) = options.cmsg.as_mut() {
+                            output.append(&mut segment.cmsg);
+                        } else {
+                            segment.cmsg.clear();
+                        }
+                        if segment.credentials.is_some() && chan.rx_offset != segment.end {
+                            // Credentials describe every byte of this interval;
+                            // SCM_RIGHTS is delivered only once.
+                            segment.start = chan.rx_offset;
                             let _ = reservation.cancel();
                         } else {
-                            let segment = reservation.commit().map_err(|_| AxError::BrokenPipe)?;
-                            if let Some(output) = options.cmsg.as_mut() {
-                                output.extend(segment.cmsg);
-                            }
+                            let _ = reservation.commit().map_err(|_| AxError::BrokenPipe)?;
                         }
                     }
                 }
@@ -1106,10 +1241,16 @@ impl Pollable for StreamTransport {
             events.set(
                 IoEvents::WRITABLE,
                 !self.tx_closed.load(Ordering::Acquire)
-                    && chan
-                        .tx
-                        .as_ref()
-                        .is_some_and(|tx| peer_read_closed || tx.vacant_len() > 0),
+                    && chan.tx.as_ref().is_some_and(|tx| {
+                        peer_read_closed
+                            || (tx.vacant_len() > 0
+                                && (!(chan.peer_passcred.load(Ordering::Acquire)
+                                    || self.passcred.load(Ordering::Acquire))
+                                    || chan
+                                        .segments_tx
+                                        .as_ref()
+                                        .is_some_and(|segments| !segments.is_full())))
+                    }),
             );
             events.set(IoEvents::ERROR, peer_reset_pending);
             events.set(IoEvents::READ_HANGUP, peer_write_closed);
@@ -1193,6 +1334,201 @@ mod tests {
 
     use super::*;
     use crate::SendFlags;
+
+    #[test]
+    fn failed_ancillary_peek_preserves_control_output_and_receive_segment() {
+        let credentials = SocketCredentials::new(10, 20, 30);
+        let (left, right) = StreamTransport::new_pair(credentials).unwrap();
+        right
+            .set_option(SetSocketOption::PassCredentials(&true))
+            .unwrap();
+        left.send(
+            &b"data"[..],
+            SendOptions {
+                cmsg: alloc::vec![
+                    crate::CMsgData::new_peekable(Box::new(42u32), 1, |_| Err(AxError::NoMemory),)
+                        .unwrap()
+                ],
+                ..SendOptions::default()
+            },
+        )
+        .unwrap();
+        let mut output = [0u8; 4];
+        let mut cmsg = Vec::new();
+        assert_eq!(
+            right.recv(
+                &mut output[..],
+                RecvOptions {
+                    flags: RecvFlags::PEEK,
+                    cmsg: Some(&mut cmsg),
+                    ..RecvOptions::default()
+                }
+            ),
+            Err(AxError::NoMemory)
+        );
+        assert!(cmsg.is_empty());
+        assert_eq!(
+            right
+                .recv(
+                    &mut output[..],
+                    RecvOptions {
+                        cmsg: Some(&mut cmsg),
+                        ..RecvOptions::default()
+                    }
+                )
+                .unwrap(),
+            4
+        );
+        assert_eq!(&output, b"data");
+        assert_eq!(cmsg.len(), 2);
+        assert_eq!(
+            *cmsg.remove(0).downcast::<SocketCredentials>().unwrap(),
+            credentials
+        );
+        assert_eq!(*cmsg.remove(0).downcast::<u32>().unwrap(), 42);
+    }
+
+    #[test]
+    fn passcred_preserves_sender_boundaries_across_partial_reads_and_peek() {
+        let _guard = super::super::UNIX_CLEANUP_TEST_LOCK.lock();
+        let creator = SocketCredentials::new(1, 2, 3);
+        let sender = SocketCredentials::new(10, 20, 30);
+        let next_sender = SocketCredentials::new(11, 21, 31);
+        let (left, right) = StreamTransport::new_pair(creator).unwrap();
+        right
+            .set_option(SetSocketOption::PassCredentials(&true))
+            .unwrap();
+        assert_eq!(
+            left.send(
+                &b"abcd"[..],
+                SendOptions {
+                    credentials: Some(sender),
+                    cmsg: alloc::vec![
+                        crate::CMsgData::new_peekable(Box::new(42u32), 1, |value| Ok(*value))
+                            .unwrap()
+                    ],
+                    ..SendOptions::default()
+                }
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            left.send(
+                &b"ef"[..],
+                SendOptions {
+                    credentials: Some(next_sender),
+                    ..SendOptions::default()
+                }
+            )
+            .unwrap(),
+            2
+        );
+        for (flags, bytes, rights) in [
+            (RecvFlags::PEEK, b"ab", true),
+            (RecvFlags::empty(), b"ab", true),
+            (RecvFlags::PEEK, b"cd", false),
+            (RecvFlags::empty(), b"cd", false),
+            (RecvFlags::empty(), b"ef", false),
+        ] {
+            let mut output = [0u8; 2];
+            let mut cmsg = Vec::new();
+            assert_eq!(
+                right
+                    .recv(
+                        &mut output[..],
+                        RecvOptions {
+                            flags,
+                            cmsg: Some(&mut cmsg),
+                            ..RecvOptions::default()
+                        }
+                    )
+                    .unwrap(),
+                2
+            );
+            assert_eq!(&output, bytes);
+            assert_eq!(cmsg.len(), 1 + usize::from(rights));
+            let expected = if bytes == b"ef" { next_sender } else { sender };
+            assert_eq!(
+                *cmsg.remove(0).downcast::<SocketCredentials>().unwrap(),
+                expected
+            );
+            if rights {
+                assert_eq!(*cmsg.remove(0).downcast::<u32>().unwrap(), 42);
+            }
+        }
+        right
+            .set_option(SetSocketOption::PassCredentials(&false))
+            .unwrap();
+        left.send(
+            &b"g"[..],
+            SendOptions {
+                credentials: Some(sender),
+                ..SendOptions::default()
+            },
+        )
+        .unwrap();
+        let mut output = [0u8; 1];
+        let mut cmsg = Vec::new();
+        assert_eq!(
+            right
+                .recv(
+                    &mut output[..],
+                    RecvOptions {
+                        cmsg: Some(&mut cmsg),
+                        ..RecvOptions::default()
+                    }
+                )
+                .unwrap(),
+            1
+        );
+        assert!(cmsg.is_empty());
+        left.send(
+            &b"z"[..],
+            SendOptions {
+                credentials: Some(sender),
+                credentials_explicit: true,
+                ..SendOptions::default()
+            },
+        )
+        .unwrap();
+        right
+            .set_option(SetSocketOption::PassCredentials(&true))
+            .unwrap();
+        right
+            .recv(
+                &mut output[..],
+                RecvOptions {
+                    cmsg: Some(&mut cmsg),
+                    ..RecvOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            *cmsg.remove(0).downcast::<SocketCredentials>().unwrap(),
+            sender
+        );
+        for _ in 0..STREAM_ANCILLARY_SEGMENTS {
+            left.send(&b"x"[..], SendOptions::default()).unwrap();
+        }
+        assert!(!left.poll().contains(IoEvents::WRITABLE));
+        assert_eq!(
+            left.send(
+                &b"x"[..],
+                SendOptions {
+                    flags: crate::SendFlags::DONT_WAIT,
+                    ..SendOptions::default()
+                }
+            ),
+            Err(AxError::WouldBlock)
+        );
+        right.recv(&mut output[..], RecvOptions::default()).unwrap();
+        assert!(left.poll().contains(IoEvents::WRITABLE));
+        drop((left, right));
+        while super::super::has_deferred_receive_cleanup_work() {
+            super::super::drain_deferred_receive_cleanup_work();
+        }
+    }
 
     #[test]
     fn stream_ancillary_barrier_includes_preceding_plain_bytes() {
@@ -1838,6 +2174,9 @@ mod tests {
         listener.bind(&slot, &address).unwrap();
         listener.listen(&slot, 1, listen_credentials).unwrap();
 
+        listener
+            .set_option(SetSocketOption::PassCredentials(&true))
+            .unwrap();
         let client = StreamTransport::new().unwrap();
         client
             .connect(&slot, &UnixSocketAddr::Unnamed, connect_credentials)
@@ -1851,8 +2190,27 @@ mod tests {
             .unwrap()
             .try_recv()
             .unwrap();
+        let accepted_identity = request.identity();
         let accepted = StreamTransport::new_channel(Some(request.channel)).unwrap();
+        assert_eq!(accepted.endpoint_identity(), Some(accepted_identity));
+        assert_eq!(
+            client.peer_endpoint_identity(),
+            accepted.endpoint_identity()
+        );
+        assert_eq!(
+            accepted.peer_endpoint_identity(),
+            client.endpoint_identity()
+        );
+        assert_ne!(client.endpoint_identity(), accepted.endpoint_identity());
         assert_eq!(peer_credentials(&accepted), connect_credentials);
+        listener
+            .set_option(SetSocketOption::PassCredentials(&false))
+            .unwrap();
+        let mut enabled = false;
+        accepted
+            .get_option(GetSocketOption::PassCredentials(&mut enabled))
+            .unwrap();
+        assert!(enabled);
     }
 
     #[test]
@@ -2067,7 +2425,7 @@ mod tests {
     fn listener_rejects_connect_before_listen_and_enforces_backlog() {
         let credentials = SocketCredentials::new(1, 2, 3);
         let (tx, rx) = try_bounded(LISTEN_QUEUE_SIZE).unwrap();
-        let bind = Bind::try_new(tx).unwrap();
+        let bind = Bind::try_new(tx, Arc::new(AtomicBool::new(false))).unwrap();
 
         assert_eq!(bind.reserve().err().unwrap(), AxError::ConnectionRefused);
 

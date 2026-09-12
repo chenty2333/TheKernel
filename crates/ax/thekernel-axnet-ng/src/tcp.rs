@@ -305,19 +305,6 @@ impl TcpSocket {
         events
     }
 
-    fn wait_for_close_handshake(&self) {
-        for _ in 0..16 {
-            self.stack.poll_interfaces();
-            let closed = self.with_smol_socket(|socket| {
-                !socket.is_active() && !socket.may_recv() && !socket.may_send()
-            });
-            if closed {
-                break;
-            }
-            axtask::yield_now();
-        }
-    }
-
     pub fn set_filter(
         &self,
         _filter: Option<alloc::sync::Arc<dyn crate::SocketFilter>>,
@@ -803,13 +790,11 @@ impl Drop for TcpSocket {
             if let Ok(endpoint) = self.bound_endpoint() {
                 self.stack.listen_table.unlisten(endpoint.port);
             }
-        } else {
-            self.with_smol_socket(|socket| socket.close());
         }
-        // Give loopback peers a short chance to observe a graceful close
-        // before we tear the socket out of the set.
-        self.wait_for_close_handshake();
-        self.stack.socket_set.remove(self.handle);
+        // close(2) releases the descriptor, not the transport's queued bytes.
+        // Keep TCP alive in the bounded socket set until FIN/timers complete.
+        self.stack.socket_set.close_tcp(self.handle, crate::service::now());
+        self.stack.wake_protocol_worker();
         self.stack.poll_interfaces();
     }
 }
@@ -853,6 +838,47 @@ mod tests {
 
         replace_tcp_recv_buffer(&mut socket, usize::MAX).unwrap();
         assert_eq!(socket.recv_capacity(), SOCKET_BUFFER_MAX);
+    }
+
+    #[test]
+    fn close_retains_protocol_owner_and_explicit_timeout() {
+        let stack = NetStack::new_loopback_only();
+        let listener = TcpSocket::new(stack.clone()).unwrap();
+        let address = SocketAddrEx::Ip(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 32481));
+        listener.bind(address.clone()).unwrap();
+        listener.listen(1).unwrap();
+        listener.set_option(SetSocketOption::NonBlocking(&true)).unwrap();
+        let client = TcpSocket::new(stack.clone()).unwrap();
+        client.set_option(SetSocketOption::NonBlocking(&true)).unwrap();
+        client.with_service_and_smol_socket(|service, socket| {
+            socket.connect(service.iface.context(),
+                (smoltcp::wire::Ipv4Address::LOCALHOST, 32481),
+                (smoltcp::wire::Ipv4Address::LOCALHOST, 32482)).unwrap();
+        });
+        for _ in 0..16 {
+            stack.poll_interfaces();
+        }
+        let Socket::Tcp(sender) = listener.accept().unwrap() else { panic!("expected TCP") };
+        let handle = sender.handle;
+        sender.with_smol_socket(|socket| socket.set_timeout(Some(Duration::from_secs(3))));
+        drop(sender);
+        assert!(stack.socket_set.closing_tcp_deadline().is_some());
+        stack.socket_set.with_socket::<smol::Socket, _, _>(handle, |socket| {
+            assert_eq!(socket.timeout(), Some(Duration::from_secs(3)));
+            assert_ne!(socket.state(), smol::State::Closed);
+        });
+        let after_timeout = crate::service::now() + Duration::from_secs(4);
+        let mut sockets = stack.socket_set.inner.lock();
+        assert!(stack.socket_set.reap_closed_tcp(&mut sockets, after_timeout));
+        let orphan = sockets.get::<smol::Socket>(handle);
+        assert_eq!(orphan.state(), smol::State::Closed);
+        assert!(orphan.remote_endpoint().is_some());
+        // Simulate the following service pass having no TX capacity for RST.
+        // An expired owner still has a finite lifetime and no stale deadline.
+        assert!(!stack.socket_set.reap_closed_tcp(&mut sockets, after_timeout));
+        assert!(sockets.iter().all(|(id, _)| id != handle));
+        drop(sockets);
+        assert!(stack.socket_set.closing_tcp_deadline().is_none());
     }
 
     #[test]

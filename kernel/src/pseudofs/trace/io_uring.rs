@@ -20,10 +20,46 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 static CAPTURE: SpinNoIrq<Capture> = SpinNoIrq::new(Capture::new());
 
 #[derive(Clone, Copy)]
+enum CaptureEvent {
+    Lifecycle(RequestTraceEvent),
+    ExecutorStarted(RequestId),
+    ExecutorReturned(RequestId),
+    ReadStage(RequestId, ReadStage),
+}
+
+/// Diagnostic boundaries for the synchronous registered-buffer read target.
+#[derive(Clone, Copy)]
+pub(crate) enum ReadStage {
+    PermissionStarted,
+    PermissionReturned,
+    ReadStarted,
+    ReadReturned,
+    NotificationReturned,
+}
+
+impl ReadStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::PermissionStarted => "permission_started",
+            Self::PermissionReturned => "permission_returned",
+            Self::ReadStarted => "read_started",
+            Self::ReadReturned => "read_returned",
+            Self::NotificationReturned => "notification_returned",
+        }
+    }
+}
+
+pub(crate) fn read_stage(id: Option<RequestId>, stage: ReadStage) {
+    if let Some(id) = id {
+        record_event(CaptureEvent::ReadStage(id, stage));
+    }
+}
+
+#[derive(Clone, Copy)]
 struct Record {
     sequence: u64,
     nanos: u64,
-    event: RequestTraceEvent,
+    event: CaptureEvent,
 }
 struct Capture {
     records: [Option<Record>; CAPACITY],
@@ -60,6 +96,18 @@ pub(super) fn dropped() -> u64 {
 }
 
 pub(crate) fn record(event: RequestTraceEvent) {
+    record_event(CaptureEvent::Lifecycle(event));
+}
+
+pub(crate) fn executor_started(id: RequestId) {
+    record_event(CaptureEvent::ExecutorStarted(id));
+}
+
+pub(crate) fn executor_returned(id: RequestId) {
+    record_event(CaptureEvent::ExecutorReturned(id));
+}
+
+fn record_event(event: CaptureEvent) {
     if !enabled() {
         return;
     }
@@ -136,6 +184,21 @@ fn format_snapshot(
     } in records
     {
         write!(output, "seq={sequence} ns={nanos} ")?;
+        let event = match event {
+            CaptureEvent::Lifecycle(event) => event,
+            CaptureEvent::ExecutorStarted(id) => {
+                simple(&mut output, *id, "executor_started")?;
+                continue;
+            }
+            CaptureEvent::ExecutorReturned(id) => {
+                simple(&mut output, *id, "executor_returned")?;
+                continue;
+            }
+            CaptureEvent::ReadStage(id, stage) => {
+                simple(&mut output, *id, stage.name())?;
+                continue;
+            }
+        };
         match event {
             RequestTraceEvent::Reserved { id, descriptor } => {
                 identity(&mut output, *id)?;
@@ -223,6 +286,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn executor_stages_preserve_the_reserved_request_identity() {
+        use thekernel_linux_io_uring::{RequestDescriptor, RequestOperation, RequestRegistry};
+
+        let mut registry = RequestRegistry::new(RingId::new(7).unwrap(), 1, 1).unwrap();
+        let reservation = registry
+            .reserve(RequestDescriptor::new(9, RequestOperation::Read))
+            .unwrap();
+        let id = reservation.id();
+        let records = [
+            Record {
+                sequence: 1,
+                nanos: 10,
+                event: CaptureEvent::ExecutorStarted(id),
+            },
+            Record {
+                sequence: 2,
+                nanos: 20,
+                event: CaptureEvent::ExecutorReturned(id),
+            },
+        ];
+        let text = format_snapshot(&records, 0, 0).unwrap();
+        for (sequence, nanos, stage) in [(1, 10, "executor_started"), (2, 20, "executor_returned")]
+        {
+            assert!(text.contains(&alloc::format!(
+                "seq={sequence} ns={nanos} ring=7 slot={} generation={} event={stage}\n",
+                id.slot(),
+                id.generation()
+            )));
+        }
+    }
+
+    #[test]
+    fn read_stages_preserve_request_identity_and_fit_target_capture() {
+        use thekernel_linux_io_uring::{RequestDescriptor, RequestOperation, RequestRegistry};
+
+        let mut registry = RequestRegistry::new(RingId::new(7).unwrap(), 1, 1).unwrap();
+        let request = registry.reserve(RequestDescriptor::new(9, RequestOperation::Read)).unwrap();
+        let id = request.id();
+        let stages = [ReadStage::PermissionStarted, ReadStage::PermissionReturned,
+            ReadStage::ReadStarted, ReadStage::ReadReturned, ReadStage::NotificationReturned];
+        for stage in stages {
+            let record = Record { sequence: 1, nanos: 10, event: CaptureEvent::ReadStage(id, stage) };
+            let text = format_snapshot(&[record], 0, 0).unwrap();
+            assert!(text.contains(&alloc::format!(
+                "seq=1 ns=10 ring=7 slot={} generation={} event={}\n",
+                id.slot(), id.generation(), stage.name(),
+            )));
+        }
+        assert!(64 * (8 + stages.len()) + 2 <= CAPACITY);
+    }
+
+    #[test]
     fn capture_is_bounded_and_does_not_overwrite_the_first_failure_context() {
         let mut capture = Capture::new();
         let event = RequestTraceEvent::HeadReclaimed {
@@ -234,13 +349,13 @@ mod tests {
             assert!(capture.push(Record {
                 sequence,
                 nanos: 0,
-                event
+                event: CaptureEvent::Lifecycle(event)
             }));
         }
         assert!(!capture.push(Record {
             sequence: CAPACITY as u64,
             nanos: 0,
-            event
+            event: CaptureEvent::Lifecycle(event)
         }));
         assert_eq!(capture.len, CAPACITY);
         assert_eq!(capture.records[0].unwrap().sequence, 0);
