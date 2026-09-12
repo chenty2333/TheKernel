@@ -37,6 +37,7 @@ run:
 run-existing:
 	$(MAKE) run RUN_ARGS="--no-build $(RUN_ARGS)"
 
+# Reuse desktop images; RUN_ARGS=--build updates them before starting.
 run-gui: MEMORY = 2G
 run-gui: SCOPE_MEMORY = 16G
 run-gui:

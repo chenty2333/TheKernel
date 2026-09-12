@@ -1060,18 +1060,27 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
         )
 
 
-def add_run_arguments(parser: argparse.ArgumentParser) -> None:
+def add_run_arguments(parser: argparse.ArgumentParser, *, build_by_default: bool = True) -> None:
     add_variant_arguments(parser)
     parser.add_argument(
         "--run-cpus",
         type=int,
         help="boot the --smp artifact with this many QEMU CPUs (1 through --smp)",
     )
-    parser.add_argument(
+    build_options = parser.add_mutually_exclusive_group()
+    build_options.add_argument(
         "--no-build",
         action="store_true",
         help="boot existing kernel, ESP, and rootfs artifacts without rebuilding",
     )
+    if not build_by_default:
+        build_options.add_argument(
+            "--build",
+            dest="no_build",
+            action="store_false",
+            help="build or update the kernel and desktop images before booting",
+        )
+    parser.set_defaults(no_build=not build_by_default)
     parser.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     parser.add_argument("--timeout", type=positive_timeout, default=300.0)
     parser.add_argument("--workdir")
@@ -1567,8 +1576,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_arguments(run_parser)
     run_parser.set_defaults(func=run_cmd)
 
-    gui_parser = sub.add_parser("run-gui", help="build and boot the interactive Weston desktop")
-    add_run_arguments(gui_parser)
+    gui_parser = sub.add_parser("run-gui", help="boot the existing Weston desktop; use --build to update images")
+    add_run_arguments(gui_parser, build_by_default=False)
     gui_parser.add_argument("--home-disk", help="persistent desktop home image (created once if missing)")
     gui_parser.set_defaults(func=run_gui_cmd, profile="system", interactive=True,
                             graphics_profile="virgl-interactive", rootfs_transport="drive",

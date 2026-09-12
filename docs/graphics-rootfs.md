@@ -23,7 +23,7 @@ scripts/build-graphics-rootfs.sh --flavor q35-graphics-seatd --fetch-buildroot \
 
 ## User-local host dependencies
 
-`make run-gui` uses `~/.cache/thekernel-targets/graphics-desktop` for the
+`make run-gui RUN_ARGS=--build` uses `~/.cache/thekernel-targets/graphics-desktop` for the
 incremental desktop build, `buildroot/source` for Buildroot, and
 `graphics-downloads` for package downloads, all below `THEKERNEL_STATE_DIR`
 (or Make's `STATE_DIR`). `THEKERNEL_BUILDROOT_DIR` and
@@ -97,10 +97,13 @@ the screendump. The general `run --rootfs IMAGE` argument likewise requires an
 existing image and otherwise leaves the standard rootfs-builder behavior
 unchanged.
 
-For an interactive desktop, run `make run-gui`. It uses the
+For an interactive desktop, run `make run-gui` to start the existing images.
+On the first run or after changing code, use `make run-gui RUN_ARGS=--build`
+to build or update the images before starting. It uses the
 `virgl-interactive` profile to render through the host GPU, with KVM, a
 1920×1080 display, four CPUs, and 2 GiB of guest memory by default. Override
-these with `RUN_ARGS="--width 1280 --height 720 --memory 4G"` as needed. The
+these with `RUN_ARGS="--width 1280 --height 720 --memory 4G --build"` as needed;
+include `--build` when selecting a kernel configuration that needs new images. The
 `q35-software-desktop` image opens Weston's desktop shell and native terminal as the unprivileged
 `weston` user, with the session's Wayland runtime environment. The top panel
 launches Terminal, Files (PCManFM), Text Editor (xedit), Images (feh), Python,

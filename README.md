@@ -61,7 +61,8 @@ small, resource-bounded wrapper around that same entry point:
 
 ```bash
 make run
-make run-gui       # open the Weston desktop with a terminal
+make run-gui       # open the already-built Weston desktop
+make run-gui RUN_ARGS=--build  # update images, then open the desktop
 make run-existing  # reuse already-built kernel, ESP, and rootfs artifacts
 make build         # build without booting
 make lint          # run Clippy for the product kernel configuration
@@ -70,8 +71,10 @@ make clean         # remove generated run, output, and cache directories
 make docker-clean  # remove the dev container volume and local image
 ```
 
-`make run-gui` builds the graphics userspace on its first run (Buildroot and
-package downloads can take a while), then uses incremental builds. It opens
+`make run-gui` starts the existing kernel and desktop images without building.
+Use `make run-gui RUN_ARGS=--build` on the first run or after changing code;
+it updates the images before starting. The first Buildroot build and package
+downloads can take a while; subsequent updates use incremental builds. It opens
 a Weston desktop with launchers for a terminal, file manager, text editor,
 image viewer, Python, and the sandboxed WebKitGTK MiniBrowser. The default
 desktop uses KVM, a 1920×1080 display, 2 GiB of guest memory, and Virgl OpenGL
@@ -81,8 +84,7 @@ VirtIO sound; `curl`, `ssh`, `scp`, and `sftp` are included. Select
 work and use the panel's
 Shut Down button to flush files and exit. Closing QEMU directly or pressing
 Ctrl+C forcibly stops the guest and can lose pending writes.
-Use `make run-gui RUN_ARGS=--no-build` to reuse the current images without
-rebuilding. See [graphics rootfs](docs/graphics-rootfs.md) for build dependencies
+See [graphics rootfs](docs/graphics-rootfs.md) for build dependencies
 and cache options.
 The desktop home at `/var/lib/weston`, including Documents, Pictures, and
 Downloads, lives on a persistent disk at
