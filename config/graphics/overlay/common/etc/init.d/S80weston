@@ -35,8 +35,39 @@ wait_for_exit() {
     done
 }
 
+wait_for_ready() {
+    tries=0
+    while [ "$tries" -lt 20 ]; do
+        if running && [ -S "$RUNTIME_DIR/wayland-0" ]; then
+            return 0
+        fi
+        # The daemon writes its PID before exec. Once it has exited there is
+        # no reason to wait out the remaining startup deadline.
+        if pid_from_file >/dev/null 2>&1 && ! running; then
+            return 1
+        fi
+        tries=$((tries + 1))
+        sleep 1
+    done
+    return 1
+}
+
+report_start_failure() {
+    echo "FAIL: Weston did not create a live Wayland socket" >&2
+    for name in graphics-session.log pulse.log weston.log; do
+        if [ -r "$RUNTIME_DIR/$name" ]; then
+            echo "--- $RUNTIME_DIR/$name ---" >&2
+            tail -n 40 "$RUNTIME_DIR/$name" >&2
+        fi
+    done
+}
+
 start() {
-    running && return 0
+    if running; then
+        wait_for_ready && return 0
+        report_start_failure
+        return 1
+    fi
     if [ -n "$WESTON_HOME_MOUNT" ] && ! mountpoint -q "$WESTON_HOME_MOUNT"; then
         echo "Cannot start desktop: persistent home disk is not mounted" >&2
         return 1
@@ -54,9 +85,22 @@ start() {
     mkdir -p /tmp/.X11-unix
     chown root:root /tmp/.X11-unix
     chmod 1777 /tmp/.X11-unix
+    # No live managed process owns these paths. A stale socket must not make
+    # the newly forked launcher appear ready before it executes Weston.
+    rm -f "$PIDFILE" "$RUNTIME_DIR/wayland-0" "$RUNTIME_DIR/wayland-0.lock"
+    for name in graphics-session.log pulse.log weston.log; do
+        : > "$RUNTIME_DIR/$name"
+        chown "$USER:$USER" "$RUNTIME_DIR/$name"
+        chmod 0600 "$RUNTIME_DIR/$name"
+    done
     printf 'Starting Weston: '
-    start-stop-daemon -S -x "$SESSION" -p "$PIDFILE" -m -b -c "$USER"
-    echo OK
+    if start-stop-daemon -S -x "$SESSION" -p "$PIDFILE" -m -b -O "$RUNTIME_DIR/graphics-session.log" -c "$USER" && wait_for_ready; then
+        echo OK
+        return 0
+    fi
+    report_start_failure
+    stop || true
+    return 1
 }
 
 stop() {

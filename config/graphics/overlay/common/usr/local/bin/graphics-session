@@ -6,6 +6,11 @@ runtime_dir=/run/user/$(id -u)
 export HOME=/var/lib/weston
 export XDG_RUNTIME_DIR="$runtime_dir"
 export LIBSEAT_BACKEND=seatd
+# start-stop-daemon closes the background child's standard streams. Capture
+# failures before Weston opens its own log, including config and Pulse setup.
+exec >> "$XDG_RUNTIME_DIR/graphics-session.log" 2>&1
+stage="runtime directory validation"
+trap 'status=$?; if [ "$status" -ne 0 ]; then echo "graphics-session failed during $stage (exit $status)" >&2; fi' 0
 [ "$(id -u)" -ne 0 ]
 [ -d "$XDG_RUNTIME_DIR" ]
 [ "$(stat -c %u "$XDG_RUNTIME_DIR")" = "$(id -u)" ]
@@ -22,11 +27,14 @@ elif [ -c /dev/dri/renderD128 ]; then
     set -- "$@" --renderer=gl
 fi
 if grep -qx q35-software-desktop /etc/thekernel-graphics-flavor; then
+    stage="desktop user configuration"
     config_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}
     mkdir -p "$config_dir"
     if [ ! -e "$config_dir/user-dirs.dirs" ] && [ ! -L "$config_dir/user-dirs.dirs" ]; then
         cp /etc/xdg/user-dirs.dirs "$config_dir/user-dirs.dirs"
     fi
+    stage="PulseAudio startup"
     pulseaudio --start --exit-idle-time=-1 --log-target="file:$XDG_RUNTIME_DIR/pulse.log"
 fi
+stage="Weston exec"
 exec weston "$@"

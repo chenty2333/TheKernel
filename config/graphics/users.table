@@ -1,7 +1,8 @@
 # The compositor receives card and input devices through libseat -> seatd.
 # Render nodes and the playback device are direct-access exceptions;
 # do not add video or input supplementary groups.
-weston -1 weston -1 !* /var/lib/weston /bin/sh seat,render,audio Weston compositor
+# Keep persistent home ownership independent of the selected Buildroot packages.
+weston 102 weston 107 !* /var/lib/weston /bin/sh seat,render,audio Weston compositor
 
 # Stable named policy groups for the graphics device rules below. seatd
 # provides the seat group itself; these entries make group ownership visible

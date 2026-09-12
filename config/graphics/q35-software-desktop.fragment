@@ -1,4 +1,7 @@
 # Interactive Weston desktop; smoke workloads stay disabled.
+# Weston owns the graphical seat; /dev/console is its active VT, not a serial
+# login TTY. Desktop terminal applications provide interactive shells.
+# BR2_TARGET_GENERIC_GETTY is not set
 # Carry both software KMS and the virtio-gpu virgl driver.
 BR2_ROOTFS_OVERLAY="@REPO_ROOT@/config/graphics/overlay/common @REPO_ROOT@/config/graphics/overlay/q35-software-desktop"
 BR2_ROOTFS_POST_BUILD_SCRIPT="@REPO_ROOT@/config/graphics/build-guest-tools.sh @REPO_ROOT@/config/graphics/build-q35-wayland-client.sh"

@@ -6,6 +6,7 @@ import pathlib
 import os
 import subprocess
 import shlex
+import socket
 import tempfile
 from tests.support import test_tmpdir
 from types import SimpleNamespace
@@ -122,6 +123,59 @@ class GraphicsRootfsConfigTests(unittest.TestCase):
         )
         self.assertIn(prepare, weston)
         self.assertLess(weston.index(prepare), weston.index('start-stop-daemon -S'))
+
+    def test_weston_readiness_requires_live_process_and_socket_with_bounded_wait(self) -> None:
+        weston = self.read("overlay/common/etc/init.d/S80weston")
+        functions = weston[weston.index("running() {"):weston.index('case "${1:-}" in')]
+        with test_tmpdir() as directory, socket.socket(socket.AF_UNIX) as listener:
+            root = pathlib.Path(directory)
+            listener.bind(str(root / "ready"))
+            for kind, alive, expected, waits in (
+                ("socket", True, 0, 0),
+                ("socket", False, 1, 0),
+                ("file", True, 1, 20),
+                ("absent", True, 1, 20),
+                ("delayed", True, 0, 2),
+            ):
+                with self.subTest(kind=kind, alive=alive):
+                    path = root / "wayland-0"
+                    path.unlink(missing_ok=True)
+                    if kind == "socket":
+                        path.symlink_to(root / "ready")
+                    elif kind == "file":
+                        path.touch()
+                    setup = f"RUNTIME_DIR={shlex.quote(str(root))}\n" + functions
+                    setup += "pid_from_file() { echo 123; }\n"
+                    setup += f"running() {{ {'true' if alive else 'false'}; }}\n"
+                    setup += "sleep() { echo wait; "
+                    if kind == "delayed":
+                        setup += '[ "$tries" -ne 2 ] || ln -s "$RUNTIME_DIR/ready" "$RUNTIME_DIR/wayland-0"; '
+                    setup += "}\nwait_for_ready\n"
+                    result = subprocess.run(["sh"], input=setup, text=True, capture_output=True)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertEqual(result.stdout.splitlines().count("wait"), waits)
+
+    def test_graphics_session_reports_failure_before_weston_exec(self) -> None:
+        source = self.read("overlay/common/usr/local/bin/graphics-session")
+        with test_tmpdir() as directory:
+            root = pathlib.Path(directory)
+            runtime, home = root / "runtime", root / "home"
+            runtime.mkdir(mode=0o700)
+            home.mkdir()
+            (home / ".config").write_text("not a directory")
+            flavor = root / "flavor"
+            flavor.write_text("q35-software-desktop\n")
+            source = source.replace("runtime_dir=/run/user/$(id -u)", f"runtime_dir={shlex.quote(str(runtime))}")
+            source = source.replace("export HOME=/var/lib/weston", f"export HOME={shlex.quote(str(home))}")
+            source = source.replace("/etc/thekernel-graphics-flavor", shlex.quote(str(flavor)))
+            # Host CI can run as root; retain the runtime owner/mode validation.
+            source = source.replace('[ "$(id -u)" -ne 0 ]', "true")
+            result = subprocess.run(["sh"], input=source, text=True, capture_output=True,
+                env={key: value for key, value in os.environ.items() if key != "XDG_CONFIG_HOME"})
+            self.assertNotEqual(result.returncode, 0)
+            log = (runtime / "graphics-session.log").read_text()
+            self.assertIn("mkdir:", log)
+            self.assertIn("graphics-session failed during desktop user configuration", log)
 
     def test_software_sessions_select_pixman_and_seatd_verifies_it(self) -> None:
         session = self.read("overlay/common/usr/local/bin/graphics-session")

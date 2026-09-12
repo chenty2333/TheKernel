@@ -10,7 +10,14 @@ case "${1:-}" in
         [ -b /dev/vdb ] || { echo "Desktop home disk missing: /dev/vdb" >&2; exit 1; }
         mkdir -p "$home_dir"
         mountpoint -q "$home_dir" || mount -t ext4 /dev/vdb "$home_dir"
-        chown weston:weston "$home_dir"
+        # This disk belongs to the desktop user. Older images allocated its
+        # IDs dynamically, leaving existing 0700 configuration directories
+        # inaccessible after packages added another account. Repair only
+        # mismatched ownership, without following symlinks outside the home.
+        desktop_uid=$(id -u weston)
+        desktop_gid=$(id -g weston)
+        find "$home_dir" -xdev \( ! -user "$desktop_uid" -o ! -group "$desktop_gid" \) \
+            -exec chown -h "$desktop_uid:$desktop_gid" {} +
         chmod 0700 "$home_dir"
         for name in Documents Pictures Downloads; do
             directory=$home_dir/$name

@@ -115,6 +115,7 @@ flavor_br2_contract() {
     case "$1" in
         q35-software-desktop)
             printf '%s\n' \
+                '# BR2_TARGET_GENERIC_GETTY is not set' \
                 'BR2_PACKAGE_WESTON_SHELL_DESKTOP=y' \
                 'BR2_PACKAGE_DEJAVU=y' \
                 'BR2_PACKAGE_DEJAVU_MONO=y' \
@@ -257,7 +258,7 @@ validate_checked_in() {
     grep -qx 'BR2_PACKAGE_PIXMAN=y' "$COMMON"
     grep -qx 'BR2_PACKAGE_WESTON=y' "$COMMON"
     seatd_common_br2_contract | require_br2_contract "$COMMON"
-    grep -qx 'weston -1 weston -1 !\* /var/lib/weston /bin/sh seat,render,audio Weston compositor' "$REPO_ROOT/config/graphics/users.table"
+    grep -qx 'weston 102 weston 107 !\* /var/lib/weston /bin/sh seat,render,audio Weston compositor' "$REPO_ROOT/config/graphics/users.table"
     grep -qx 'SUBSYSTEM=="drm", KERNEL=="card\[0-9\]\*", GROUP="video", MODE="0660"' "$REPO_ROOT/config/graphics/overlay/common/etc/udev/rules.d/71-thekernel-graphics.rules"
     grep -qx 'SUBSYSTEM=="drm", KERNEL=="renderD\[0-9\]\*", GROUP="render", MODE="0660"' "$REPO_ROOT/config/graphics/overlay/common/etc/udev/rules.d/71-thekernel-graphics.rules"
     grep -qx 'SUBSYSTEM=="graphics", KERNEL=="fb\[0-9\]\*", GROUP="video", MODE="0660"' "$REPO_ROOT/config/graphics/overlay/common/etc/udev/rules.d/71-thekernel-graphics.rules"
