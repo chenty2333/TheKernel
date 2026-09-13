@@ -333,7 +333,7 @@ pub(crate) fn describe(surface: &Surface) -> String {
         surface.height(),
         surface.plan().format().name(),
         surface.stride(),
-        surface.stride_units(),
+        surface.stride_units_for_log(),
         surface.physical_address(),
         surface.ggtt_address(),
         surface.len()
@@ -433,8 +433,8 @@ mod tests {
         // 100 pixels at 32 bits is 400 bytes, padded up to a whole 256-byte
         // multiple: 512, which is eight 64-byte units.
         assert_eq!(pitch, 512);
-        assert_eq!(surface.stride_units(), pitch / 64);
-        assert_eq!(surface.stride_units() * 64, pitch);
+        assert_eq!(surface.stride_units_for_log(), pitch / 64);
+        assert_eq!(surface.stride_units_for_log() * 64, pitch);
     }
 
     #[test]
