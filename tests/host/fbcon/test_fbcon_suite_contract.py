@@ -88,10 +88,18 @@ class FbconSuiteContractTests(unittest.TestCase):
         self.assertNotIn("virtio", topology.device)
         self.assertEqual((topology.display, topology.device), ("none", "bochs-display"))
         with test_tmpdir() as directory, \
+             mock.patch.object(module, "state_root", return_value=Path(directory)), \
              mock.patch.object(module, "build_kernel") as kernel, \
              mock.patch.object(module, "build_rootfs") as rootfs, \
              mock.patch.object(module, "run_product",
-                               side_effect=lambda artifacts, spec: calls.append(spec) or 1):
+                               side_effect=lambda artifacts, spec: calls.append((artifacts, spec)) or 1):
+            # The no-build preflight stats the real artifact paths, so give it a
+            # state root that holds them: a test that only passes because the
+            # developer's own state directory happens to be built is not a test.
+            artifacts = module.Artifacts(Path(directory), module.Variant(memory="512M"), "system")
+            artifacts.kernel.parent.mkdir(parents=True, exist_ok=True)
+            artifacts.kernel.write_bytes(b"kernel")
+            artifacts.esp.write_bytes(b"esp")
             args = SimpleNamespace(
                 accel="tcg", smp=4, memory="512M", profile="system", no_build=True,
                 timeout=240.0, asid_fast_switch=False, m5_candidate=False,
@@ -102,7 +110,14 @@ class FbconSuiteContractTests(unittest.TestCase):
             self.assertEqual(module.fbcon_suite_cmd(args), 1)
             kernel.assert_not_called()
             rootfs.assert_not_called()
-        spec = calls[0]
+            # The rootfs travels as the Multiboot module, which is what the
+            # system profile's ESP pair carries; the drive pair is not built.
+            self.assertEqual(calls[0][1].rootfs_transport, "module")
+        artifacts, spec = calls[0]
+        # The booted artifacts are the variant the run asked for: a suite that
+        # silently booted another memory size would assert on a kernel QEMU was
+        # never given.
+        self.assertEqual(artifacts.variant.name, "mem512m")
         self.assertEqual(spec.graphics_profile, "firmware-fb")
         self.assertEqual(spec.stop_after_marker, module.FBCON_MARKER)
         self.assertEqual(spec.qmp_screenshot_after_marker, module.FBCON_MARKER)
