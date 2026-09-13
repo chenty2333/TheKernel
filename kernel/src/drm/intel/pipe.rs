@@ -82,7 +82,7 @@
 //! writes 4095, which is also the largest value `[I915]` itself considers
 //! valid: its watermark computation turns "value >= plane ddb allocation" into
 //! a rejected level with the comment "Bspec says: value >= plane ddb allocation
-//! -> invalid, hence the +1 here" (`display/skl_watermark.c:1995-1997`).  So
+//! -> invalid, hence the +1 here" (`display/skl_watermark.c:1992-1993`).  So
 //! 4095 is one block short of the instruction and the largest legal value at
 //! the same time.  See `docs/design/intel-pipe.md`.
 //!
@@ -219,7 +219,7 @@ pub(crate) const PLANE_WM_LINES_SHIFT: u32 = 14;
 ///
 /// `[I915]`'s `skl_wm_max_lines` returns 31 only below display version 13 and
 /// 255 from 13 on (`display/skl_watermark.c:1858-1864`), and ADL-N reports
-/// display version 13 (`display/intel_display_device.c:1057`).  The generous
+/// display version 13 (`display/intel_display_device.c:1051`).  The generous
 /// level is written with 31, which is legal under either reading; the
 /// disagreement is recorded in `docs/design/intel-pipe.md`.
 pub(crate) const PLANE_WM_LINES_MAX: u32 = 31;
@@ -238,7 +238,7 @@ pub(crate) const PLANE_WM_LEVELS: usize = 8;
 /// The DBUF's size in 512-byte blocks.
 ///
 /// Section 7.2 gives the DDB as 4096 blocks, and `[I915]`'s `XE_LPD_FEATURES`
-/// has `.dbuf.size = 4096` (`display/intel_display_device.c:1024`).
+/// has `.dbuf.size = 4096` (`display/intel_display_device.c:1023`).
 pub(crate) const DDB_BLOCKS: u32 = 4096;
 
 /// `PLANE_BUF_START[11:0]`.  Reference section 7.2.
@@ -910,7 +910,7 @@ impl PipeProgram {
     /// Keeping it here means one call programs everything the pipe owns.
     /// `[I915]` gives the same ordering: `bdw_set_pipe_misc` runs before
     /// `hsw_configure_cpu_transcoder` in `intel_crtc_enable_pipe`
-    /// (`display/intel_display.c:1719` against `:1725`), so the depth is
+    /// (`display/intel_display.c:1719` against `:1723`), so the depth is
     /// programmed before the pipe is enabled there too.
     pub(crate) fn writes(&self, pipe_misc_before: u32) -> Vec<PlannedWrite> {
         let mut writes = Vec::with_capacity(1 + 7 + 1 + PLANE_WM_LEVELS + 6);

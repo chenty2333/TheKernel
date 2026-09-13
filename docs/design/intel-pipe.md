@@ -92,7 +92,7 @@ Three ordering details worth stating:
   everything the pipe owns, and one log line shows the whole program.
   `[I915]` orders it the same way: `bdw_set_pipe_misc` runs before
   `hsw_configure_cpu_transcoder` in `intel_crtc_enable_pipe`
-  (`display/intel_display.c:1719` against `:1725`), so the output depth is
+  (`display/intel_display.c:1719` against `:1723`), so the output depth is
   programmed before the pipe is enabled there too.
 * **§5.6's `noarm` list is a grouping, not a sequence.**  It puts `PLANE_WM` and
   `PLANE_BUF_CFG` after stride/position/size, while §11 makes the DDB and the
@@ -225,7 +225,7 @@ is `[11:0]` (§7.3; `skl_universal_plane_regs.h:325`), whose largest value is
 This module writes **4095**, and the reason is stronger than "the field is
 narrow": `[I915]`'s watermark computation rejects a level whose block count
 reaches the DDB allocation — "Bspec says: value >= plane ddb allocation ->
-invalid, hence the +1 here" (`display/skl_watermark.c:1995-1997`) — so 4095 is
+invalid, hence the +1 here" (`display/skl_watermark.c:1992-1993`) — so 4095 is
 both the largest legal field value and the largest value the vendor driver
 would consider valid for a 4096-block allocation.  It is one block short of the
 instruction and exactly at the vendor driver's ceiling.
@@ -239,7 +239,7 @@ under-allocate") is met, the literal number is not.
 warns that the field is 13 bits wide so the hardware will accept larger values.
 `[I915]`'s `skl_wm_max_lines` returns 31 only below display version 13 and
 **255 from 13 on** (`display/skl_watermark.c:1858-1864`), and ADL-N reports
-display version 13 (`display/intel_display_device.c:1057`, `XE_LPD_FEATURES`'s
+display version 13 (`display/intel_display_device.c:1051`, `XE_LPD_FEATURES`'s
 `ip.ver = 13`).
 
 The generous level writes 31, which is legal under either reading, so nothing
@@ -252,7 +252,7 @@ Xe-LP" throughout.  In i915's terms ADL-N is `XE_LPD` with display IP version
 13, not 12, and version-gated behaviour is a real trap on this platform — §15's
 "meta-lesson" says exactly that.  `PIPE_MISC`'s BPC field changing meaning at
 version 13 ("For Display < 13, Bits 5-7 represent DITHER BPC ... ADLP+, the
-bits 5-7 represent PORT OUTPUT BPC", `i915_reg.h:1717-1722`) is one example
+bits 5-7 represent PORT OUTPUT BPC", `i915_reg.h:1720-1725`) is one example
 this module depends on, and the 12-bit DDB fields of §7.2 are another.
 
 ## 5. The output depth, and why WS-2 is not writing it
@@ -326,8 +326,9 @@ Everything, on hardware.  Specifically:
 WS-1 reported, and this workstream confirms by reading the same registers, that
 the GGTT page-table write cannot be followed by a TLB invalidate in this
 kernel: `[I915]` writes `GEN12_GUC_TLB_INV_CR` (`0xcee8`, bit 0) after a PTE
-update for graphics version 12 and later (`gt/intel_ggtt.c`,
-`guc_ggtt_invalidate`), that offset lies inside `FORCEWAKE_GT` per §2.1, and
+update for graphics version 12 and later (`gt/intel_ggtt.c:237-252`,
+`guc_ggtt_invalidate`, with the register write at `:249-250`), that offset lies
+inside `FORCEWAKE_GT` per §2.1, and
 `regs::RegisterWindow` refuses forcewake-gated offsets by construction.  This
 kernel has no forcewake handshake and this module does not add one.
 
