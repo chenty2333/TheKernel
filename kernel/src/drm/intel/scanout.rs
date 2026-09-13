@@ -1,10 +1,10 @@
-//! The console's Intel scanout surface: [`fb::Surface`] offered to
+//! The console's Intel scanout surface: [`super::fb::Surface`] offered to
 //! [`crate::drm::screen`].
 //!
 //! This module is the seam between the memory half of the modeset (this
 //! workstream: a framebuffer in memory the display engine can read) and the
 //! console, which needs only a surface it can draw into.  It implements
-//! [`ScanoutSurface`] over [`fb::Surface`] and registers a
+//! [`ScanoutSurface`] over [`super::fb::Surface`] and registers a
 //! [`screen::Candidate`] for it at [`screen::rank::DRIVER`].
 //!
 //! ## When it is safe to register
@@ -66,7 +66,7 @@ use axgpu::PixelLayout;
 use axhal::mem::{PhysAddr, PhysAddrRange};
 use spin::Mutex;
 
-use super::fb::{self, Surface};
+use super::fb::Surface;
 use crate::{
     drm::screen::{self, Candidate, Unavailable, rank},
     pseudofs::{DeviceMmap, dev::scanout::ScanoutSurface},

@@ -500,15 +500,13 @@ impl Surface {
     }
 }
 
-// The numbers a reader is most likely to check by hand: 1920x1080 at 32 bits
-// per pixel is 8 294 400 bytes of pixels, and that is already a whole number of
-// 256-byte strides (7680 bytes) and of 4 KiB pages (2025), so the surface this
-// module lays out for it is exactly as large as its pixels are.  The brief that
+// The numbers a reader is most likely to check by hand are asserted in
+// `a_1080p_surface_lays_out_at_the_documented_size`: 1920x1080 at 32 bits per
+// pixel is 8 294 400 bytes of pixels, which is already a whole number of
+// 256-byte strides (7680 bytes) and of 4 KiB pages (2025), so the surface laid
+// out for it is exactly as large as its pixels are.  The brief that
 // commissioned this module gives 8 291 520 for the same surface; that is 2880
 // bytes short of `1920 * 1080 * 4` and is not the size of anything.
-const _: () = assert!(1920 * 1080 * 4 == 8_294_400);
-const _: () = assert!(7680 * 1080 == 8_294_400);
-const _: () = assert!(8_294_400 / 4096 == 2025);
 
 #[cfg(test)]
 mod tests {
@@ -527,6 +525,8 @@ mod tests {
         assert_eq!(plan.stride_units(), 120);
         // 2025 whole pages, and the last of them is not shared with anything.
         assert_eq!(plan.size(), 8_294_400);
+        assert_eq!(plan.size(), 1920 * 1080 * 4);
+        assert_eq!(plan.size() / PAGE_SIZE as usize, 2025);
         assert_eq!(plan.size() % PAGE_SIZE as usize, 0);
         // The stride is a multiple of 256, which is what makes it a multiple of
         // the 64-byte unit the register counts in.

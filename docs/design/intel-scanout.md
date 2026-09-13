@@ -606,7 +606,7 @@ The five readings that would settle the most, in the order they become possible:
 
 ## 9. Test inventory
 
-`drm::intel` host tests: **206 pass** (168 before this workstream; 38 added by
+`drm::intel` host tests: **208 pass** (168 before this workstream; 40 added by
 it), run with the invocation in the workstream brief (`--tests`, the percpu
 linker script, the linker wrapper, `env -u` for the product build flags), in
 0.04 s of test time after the build.
@@ -614,7 +614,7 @@ linker script, the linker wrapper, `env -u` for the product build flags), in
 | module | tests | what they pin down |
 |---|---:|---|
 | `fb` | 11 | the 1920×1080 layout (stride 7680 = 120 units, 8 294 400 bytes, 2025 pages), stride padding to 256, the stride and size refusals, an empty extent, every error describing itself, allocation alignment/presence/blackness, `len >= pitch * virtual_height` for both an exact and a padded geometry, byte-range refusals including a wrapping offset, an allocation the allocator cannot satisfy, and a page table that refuses the run |
-| `gtt` | 16 | the PTE round trip, the bits the vendor encoder leaves clear (including local memory being reported rather than masked), address refusals (zero, unaligned, too wide), a run written present and in order, page rounding of a partial length, non-overlapping successive mappings, **a present entry never being overwritten**, a run restarting below an occupied page rather than straddling it, exhaustion as an error rather than a wrap, a dropped write caught by the read-back, validation before any write, every error describing itself, a short window refused, an address outside the table refused, the aperture following the table, and the reserved first page |
+| `gtt` | 18 | the PTE round trip, the bits the vendor encoder leaves clear (including local memory being reported rather than masked), address refusals (zero, unaligned, too wide), a run written present and in order, page rounding of a partial length, non-overlapping successive mappings, **a present entry never being overwritten**, a run restarting below an occupied page rather than straddling it, exhaustion as an error rather than a wrap, a dropped write caught by the read-back, validation before any write, every error describing itself, a short window refused, an address outside the table refused, the aperture following the table, and the reserved first page, a BAR too short to hold the array (2 MiB, the length i915 under-maps to), and a zero-length run |
 | `scanout` | 11 | the console geometry check selecting the candidate, a pixel written and read back in the layout the engine reads, `pitch / 64` as the register value, `present` accepted and `pan` refused, the no-op methods, out-of-range console writes refused, the physical mmap range, `register` publishing what the candidate hands over, **a `NotScanning` verdict leaving the firmware console alone with the reason in the log**, and a `SURFLIVE` mismatch refused with both addresses named |
 
 What these tests are worth is bounded and stated: they drive the module's own
