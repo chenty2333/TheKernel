@@ -174,8 +174,8 @@ the only non-zero counters anywhere in the 32 stored console logs are `rounds`,
 gives a one-sided 95% upper bound of 2.75e-6 per round (rule of three:
 3/1090000), and 6.1e-6 per round for `shared` alone. For comparison, the
 weakest pre-fix variant (`multi`) failed 19.8% of rounds and the acceptance
-topology's own variant (`wait`) failed 27% — five orders of magnitude above
-this bound. A per-round bound is the honest headline because each round is an
+topology's own variant (`wait`) failed 27% — four to five orders of magnitude
+above this bound (72000x and 98000x respectively). A per-round bound is the honest headline because each round is an
 independent re-run of the window.
 
 Boot level: 0 of 32 boots failed a window assertion, whose 95% upper bound is
