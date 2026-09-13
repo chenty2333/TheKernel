@@ -62,7 +62,7 @@ use core::fmt;
 
 use super::{
     gmbus::Pin,
-    regs::{Register, RegisterWindow, SDEISR, SHOTPLUG_CTL_DDI, SHPD_FILTER_CNT, SOUTH_CHICKEN1},
+    regs::{Register, Registers, SDEISR, SHOTPLUG_CTL_DDI, SHPD_FILTER_CNT, SOUTH_CHICKEN1},
 };
 
 /// One DDI: the digital display interface a connector hangs off.
@@ -286,7 +286,7 @@ impl HpdStatus {
             self.interrupt_status,
             self.south_chicken1,
             match self.filter {
-                Some(filter) => format!(", SHPD_FILTER_CNT {filter:#08x}"),
+                Some(filter) => format!(", SHPD_FILTER_CNT {filter:#010x}"),
                 None => String::new(),
             }
         )
@@ -323,7 +323,7 @@ impl HpdStatus {
 ///
 /// Interrupts are deliberately not enabled: `SDEIER` is not written, so this
 /// only configures the detect logic and reads its result.
-pub(crate) fn enable_and_read(regs: &RegisterWindow, ddi: Ddi) -> Result<HpdStatus, HpdError> {
+pub(crate) fn enable_and_read<R: Registers>(regs: &R, ddi: Ddi) -> Result<HpdStatus, HpdError> {
     let control_before = read(regs, SHOTPLUG_CTL_DDI)?;
     let enable = ddi.enable_bit();
     // `HPD_ENABLE` is the top bit of this DDI's four, so setting it leaves the
@@ -357,7 +357,7 @@ pub(crate) fn enable_and_read(regs: &RegisterWindow, ddi: Ddi) -> Result<HpdStat
 /// The same read [`enable_and_read`] finishes with, for a caller that has
 /// already enabled detection and wants to look again -- after a hotplug
 /// interrupt was noticed, or later in a boot.
-pub(crate) fn live_state(regs: &RegisterWindow, ddi: Ddi) -> Result<bool, HpdError> {
+pub(crate) fn live_state<R: Registers>(regs: &R, ddi: Ddi) -> Result<bool, HpdError> {
     let status = read(regs, SDEISR)?;
     Ok(status & ddi.live_bit() != 0)
 }
@@ -370,7 +370,7 @@ pub(crate) fn live_state(regs: &RegisterWindow, ddi: Ddi) -> Result<bool, HpdErr
 /// `SOUTH_CHICKEN1` and those bits are one per DDI ([I915] `i915_reg.h:
 /// 3358-3370`).  It is the first thing to check when a status bit never
 /// changes, which is why it is reported rather than acted on.
-pub(crate) fn polarity_inverted(regs: &RegisterWindow, ddi: Ddi) -> Result<bool, HpdError> {
+pub(crate) fn polarity_inverted<R: Registers>(regs: &R, ddi: Ddi) -> Result<bool, HpdError> {
     let chicken = read(regs, SOUTH_CHICKEN1)?;
     Ok(chicken & ddi.invert_bit() != 0)
 }
@@ -386,8 +386,8 @@ pub(crate) fn polarity_inverted(regs: &RegisterWindow, ddi: Ddi) -> Result<bool,
 /// not so that some later boot path makes it silently.
 ///
 /// Returns `SOUTH_CHICKEN1` as it read back.
-pub(crate) fn set_board_inversion(
-    regs: &RegisterWindow,
+pub(crate) fn set_board_inversion<R: Registers>(
+    regs: &R,
     ddi: Ddi,
     inverted: bool,
 ) -> Result<u32, HpdError> {
@@ -402,13 +402,13 @@ pub(crate) fn set_board_inversion(
     read(regs, SOUTH_CHICKEN1)
 }
 
-fn read(regs: &RegisterWindow, register: Register) -> Result<u32, HpdError> {
+fn read<R: Registers>(regs: &R, register: Register) -> Result<u32, HpdError> {
     regs.read(register).ok_or(HpdError::WindowTooSmall {
         register: register.name(),
     })
 }
 
-fn write(regs: &RegisterWindow, register: Register, value: u32) -> Result<(), HpdError> {
+fn write<R: Registers>(regs: &R, register: Register, value: u32) -> Result<(), HpdError> {
     if regs.write(register, value) {
         Ok(())
     } else {

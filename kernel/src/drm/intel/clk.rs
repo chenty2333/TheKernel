@@ -742,11 +742,11 @@ impl RawClockState {
         if let RawClockProgrammed::Known(khz) = self.was
             && khz != self.plan.khz
         {
-            text.push_str(&format!(
+            text.push_str(
                 "; the firmware and the strap DISAGREE about the crystal and the strap won -- if \
                  GMBUS or hotplug de-glitching misbehaves later, this is the first thing to \
-                 revisit"
-            ));
+                 revisit",
+            );
         }
         text
     }
@@ -819,6 +819,103 @@ pub(crate) const SFUSE_STRAP_RAW_FREQUENCY_BIT: u32 = 8;
 /// a timeout that is too tight would refuse a CDCLK that works.
 pub(crate) const PLL_LOCK_TIMEOUT_US: u32 = 1_000;
 
+/// What the CDCLK step did, and what the hardware said afterwards.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CdclkState {
+    /// What the registers said before anything was written.
+    pub(crate) observed: CdclkObservation,
+    /// Whether the firmware's CDCLK was kept.  This is the expected answer on a
+    /// machine whose firmware drove the screen.
+    pub(crate) kept_firmware: bool,
+    /// What was programmed, when the firmware's CDCLK could not be kept.
+    pub(crate) programmed: Option<CdclkProgrammed>,
+    /// The registers re-read after programming: the evidence that the device is
+    /// running what was asked for, rather than the write having been posted and
+    /// forgotten.
+    pub(crate) after: Option<CdclkObservation>,
+}
+
+impl CdclkState {
+    pub(crate) fn describe(&self) -> String {
+        let mut text = self.observed.describe();
+        if self.kept_firmware {
+            text.push_str(
+                "; kept: `bxt_cdclk_init_hw` sanitises rather than reprograms and returns early \
+                 on a legal CDCLK, and this one is legal",
+            );
+        } else if let Some(programmed) = self.programmed {
+            text.push_str(&format!(
+                "; no usable CDCLK was programmed, so {} kHz was (ratio {}, {}, decimal {:#05x})",
+                programmed.entry.cdclk_khz,
+                programmed.entry.ratio,
+                programmed.divider.name(),
+                cdclk_decimal(programmed.entry.cdclk_khz),
+            ));
+            if let Some(after) = self.after {
+                text.push_str(&format!(
+                    "; re-read: {} kHz at ratio {}, which {} a table row",
+                    after.cdclk_khz,
+                    after.ratio,
+                    if after.entry.is_some() {
+                        "is"
+                    } else {
+                        "is NOT"
+                    },
+                ));
+            }
+        }
+        text
+    }
+}
+
+/// Keep a usable CDCLK, or program one if there is none.
+///
+/// The order matters and is §11 phase 1.4's: read first, and only program when
+/// what is there cannot be used.  `[I915]` `bxt_cdclk_init_hw` calls
+/// `bxt_sanitize_cdclk` and then *returns early* when the PLL is enabled and
+/// locked with a VCO the table knows, so a firmware CDCLK is the normal case,
+/// not an unusual one.  Reprogramming it would be a frequency change on a
+/// display that is already running, which the PRM says requires disabling every
+/// display engine function first.
+///
+/// When there is nothing usable, the value programmed is the lowest the
+/// platform's table allows for the reference the hardware reports — which is
+/// `bxt_calc_cdclk(dev_priv, 0)`, i.e. the same choice i915 makes when it has
+/// to initialise from scratch.
+pub(crate) fn bring_up(regs: &impl Registers) -> Result<CdclkState, ClockError> {
+    let observed = observe(regs)?;
+    if observed.usable() {
+        return Ok(CdclkState {
+            observed,
+            kept_firmware: true,
+            programmed: None,
+            after: None,
+        });
+    }
+
+    let entry = lowest_cdclk(observed.reference).ok_or(ClockError::NoTableRow {
+        reference_khz: observed.reference.khz(),
+    })?;
+    let programmed = program(regs, entry)?;
+
+    // The write is posted, so the answer to "did it take" is a fresh read of
+    // the same three registers the decision was made from.
+    let after = observe(regs)?;
+    if !after.usable() {
+        return Err(ClockError::StillNotUsable {
+            cdclk_khz: after.cdclk_khz,
+            ratio: after.ratio,
+            pll_register: after.pll_register,
+        });
+    }
+    Ok(CdclkState {
+        observed,
+        kept_firmware: false,
+        programmed: Some(programmed),
+        after: Some(after),
+    })
+}
+
 /// What can go wrong with the clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ClockError {
@@ -842,6 +939,21 @@ pub(crate) enum ClockError {
         reference_khz: u32,
         cdclk_khz: u32,
         ratio: u32,
+    },
+    /// The table has no row for this reference frequency at all.  It cannot
+    /// happen with the table as written -- every reference the decode can
+    /// produce has rows -- so this is a guard against a table edit, and it is
+    /// an error rather than a panic because a driver that panics on hardware
+    /// nobody has characterised is worse than one that refuses to guess.
+    NoTableRow { reference_khz: u32 },
+    /// The CDCLK was programmed and still does not read back as a combination
+    /// the table states.  The read-back is the point: a display running at a
+    /// frequency nobody chose is the failure this whole module exists to
+    /// prevent, and it must not be reported as success.
+    StillNotUsable {
+        cdclk_khz: u32,
+        ratio: u32,
+        pll_register: u32,
     },
 }
 
@@ -875,6 +987,19 @@ impl ClockError {
             } => format!(
                 "the CDCLK table row {reference_khz} kHz reference / {cdclk_khz} kHz / ratio \
                  {ratio} has no legal CD2X divider, which is a bug in this driver's table"
+            ),
+            Self::NoTableRow { reference_khz } => format!(
+                "the CDCLK table has no row for a {reference_khz} kHz reference frequency, which \
+                 is a bug in this driver's table"
+            ),
+            Self::StillNotUsable {
+                cdclk_khz,
+                ratio,
+                pll_register,
+            } => format!(
+                "the CDCLK was programmed and reads back as {cdclk_khz} kHz at ratio {ratio} \
+                 (CDCLK_PLL_ENABLE {pll_register:#010x}), which is not a combination the ADL-N \
+                 table states"
             ),
         }
     }
@@ -1428,6 +1553,81 @@ mod tests {
             ClockError::WriteRefused {
                 register: "PCH_RAWCLK_FREQ"
             }
+        );
+    }
+
+    #[test]
+    fn a_usable_cdclk_is_kept_and_an_unusable_one_is_replaced() {
+        // The two halves of the decision, through the entry point.  A machine
+        // whose firmware drove the screen must come out of this with its CDCLK
+        // untouched; one whose firmware left nothing usable must come out with
+        // a frequency the table states.
+        let regs = MockRegisters::new();
+        regs.set(regs::SKL_DSSM, 2 << 29); // 38.4 MHz
+        regs.set(regs::CDCLK_PLL_ENABLE, locked_pll(29)); // 1113.6 MHz
+        regs.set(regs::CDCLK_CTL, ctl(Cd2xDivider::Div1, 1112)); // 556.8 MHz
+        let state = bring_up(&regs).unwrap();
+        assert!(state.kept_firmware);
+        assert!(state.programmed.is_none());
+        assert!(state.after.is_none());
+        assert!(
+            regs.writes().is_empty(),
+            "a usable CDCLK must not be touched"
+        );
+        assert!(state.describe().contains("kept"));
+
+        // A PLL that is off: the lowest value for the reference is programmed,
+        // and the re-read confirms it.
+        let regs = MockRegisters::new();
+        regs.set(regs::SKL_DSSM, 1 << 29); // 19.2 MHz
+        regs.derive(regs::CDCLK_PLL_ENABLE, |written| {
+            if written & PLL_ENABLE != 0 {
+                written | PLL_LOCK
+            } else {
+                written & !PLL_LOCK
+            }
+        });
+        let state = bring_up(&regs).unwrap();
+        assert!(!state.kept_firmware);
+        assert_eq!(state.programmed.unwrap().entry.cdclk_khz, 172_800);
+        let after = state.after.unwrap();
+        assert!(after.usable());
+        assert_eq!(after.cdclk_khz, 172_800);
+        assert_eq!(after.divider, Cd2xDivider::Div1_5);
+        assert!(state.describe().contains("172800 kHz"));
+        assert!(state.describe().contains("re-read"));
+
+        // A device that locks the PLL but drops the ratio: the control register
+        // takes what it is given, so `program` is satisfied, and only the
+        // re-read catches that the display is not running the frequency that
+        // was asked for.
+        let regs = MockRegisters::new();
+        regs.set(regs::SKL_DSSM, 1 << 29);
+        regs.derive(regs::CDCLK_PLL_ENABLE, |written| {
+            (written & !0xFF) | PLL_ENABLE | PLL_LOCK
+        });
+        let error = bring_up(&regs).unwrap_err();
+        assert!(
+            matches!(error, ClockError::StillNotUsable { .. }),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .describe()
+                .contains("not a combination the ADL-N table states")
+        );
+
+        // A device that accepts the PLL writes but not the divider write is
+        // caught earlier, by the read-back inside `program`: two different
+        // faults, reported differently.
+        let regs = MockRegisters::new();
+        regs.set(regs::SKL_DSSM, 1 << 29);
+        regs.derive(regs::CDCLK_PLL_ENABLE, |written| written | PLL_LOCK);
+        regs.derive(regs::CDCLK_CTL, |_| ctl(Cd2xDivider::Div1, 612));
+        let error = bring_up(&regs).unwrap_err();
+        assert!(
+            matches!(error, ClockError::ReadbackMismatch { .. }),
+            "{error:?}"
         );
     }
 

@@ -34,6 +34,25 @@ use axerrno::{AxError, AxResult};
 
 use super::id::Quirk;
 
+// The register table is split by what the register belongs to, not by which
+// module reads it, so that "who owns this address" has one answer.  Each
+// submodule carries registers for one block of the display engine and cites
+// the reference section each offset came from; `mod.rs` keeps the access
+// machinery, the tables the probe reads, and the mock aperture the tests use.
+//
+// The split also settles the one naming collision the blocks produce: the
+// register at `0x70008` is `TRANSCONF(T)` to the transcoder chapter and
+// `PIPECONF(pipe)` to the pipe chapter, and it is one register.  It is
+// declared once, in [`pipe`], under the name its own chapter's table uses;
+// [`ddi`]'s timing registers live beside it at the same stride.
+
+pub(crate) mod ddi;
+pub(crate) mod dpll;
+pub(crate) mod interrupt;
+pub(crate) mod pipe;
+pub(crate) mod port;
+pub(crate) mod table;
+
 /// The part of the register aperture this kernel maps.
 ///
 /// On Gen12 Xe-LP this is exactly the whole MMIO register window: `GTTMMADR`
@@ -1354,7 +1373,8 @@ mod tests {
         let registers = POWER_AND_CLOCK_REGISTERS
             .iter()
             .copied()
-            .chain(every_combo_phy_register());
+            .chain(every_combo_phy_register())
+            .chain(table::ALL.iter().copied().flatten().copied());
         for register in registers {
             assert_eq!(
                 register.offset() % 4,
@@ -1648,6 +1668,7 @@ mod tests {
             .chain(POWER_AND_CLOCK_REGISTERS.iter().copied())
             .chain(every_combo_phy_register())
             .chain(BUS.iter().copied())
+            .chain(table::ALL.iter().copied().flatten().copied())
         {
             for (name, offset) in &seen {
                 assert_ne!(

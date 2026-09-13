@@ -58,8 +58,10 @@ mod id;
 mod pci;
 mod phy;
 mod pll;
+mod power;
 mod probe;
 mod regs;
+mod sink;
 mod timing;
 
 #[cfg(test)]
@@ -82,6 +84,30 @@ use self::{
 /// open of a debug file would make a diagnostic tool a source of hardware
 /// traffic.
 static REPORT: Mutex<Option<ProbeReport>> = Mutex::new(None);
+
+/// What the power step of the bring-up order found, kept for the debug file.
+///
+/// `None` means either that the step did not run -- there was no identified
+/// device, or its register window could not be mapped -- or that it ran and
+/// failed, in which case [`POWER_FAILURE`] holds the reason.  The two are kept
+/// apart on purpose: "the display was never powered" and "the display could not
+/// be powered" are different facts and the log says which one happened.
+static POWER: Mutex<Option<power::PowerState>> = Mutex::new(None);
+
+/// Why the power step did not produce a state, when it was attempted and
+/// failed.  Reference §11 phase 1: everything after this point is behind the
+/// power wells, so a failure here is reported once, in full, rather than
+/// re-derived by every later step that then fails for an unrelated-looking
+/// reason.
+static POWER_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+/// What the sink step of the bring-up order found, kept for the debug file.
+///
+/// Separate from [`REPORT`] because it is produced by a different step, and
+/// kept for the same reason: the EDID is the first fact in this kernel that the
+/// firmware did not supply, and on a machine whose only console is the screen
+/// it is worth being able to read twice.
+static SINK: Mutex<Option<sink::SinkReport>> = Mutex::new(None);
 
 /// A value as grouped hexadecimal, the way a register dump is written down.
 ///
@@ -109,21 +135,109 @@ pub(crate) fn hex(value: u64, digits: usize) -> String {
 /// The console is the only output device on the target machine, so the report
 /// goes to the log as it is produced: a person who was not watching the boot
 /// can read the same text back from [`debugfs`] afterwards.
+///
+/// The probe runs first and alone; the bring-up order's later steps are run
+/// from [`bring_up_at_boot`], which needs the window this produces.
 pub(crate) fn probe_at_boot() {
     let report = platform_probe();
     report.log();
     *REPORT.lock() = Some(report);
 }
 
+/// Run the rest of the bring-up order against the device the probe found.
+///
+/// This is reference §11 phases 1 and 2, in the order the reference gives them,
+/// and each step is attempted only on a device whose register window the probe
+/// mapped -- a device this kernel has a model for.  On a machine with no Intel
+/// display, or one whose window could not be mapped, nothing here runs and it
+/// says so rather than reporting a half-run sequence as a result.
+///
+/// The order is the point.  Power comes before the sink because GMBUS needs the
+/// AUX/DDC power well and a well cannot be requested before `PW_1` is up; the
+/// sink comes before any mode because a timing computed from a guessed EDID is
+/// worse than no timing at all.  Each step logs as it goes, for the same reason
+/// the probe does.
+pub(crate) fn bring_up_at_boot() {
+    let windows = mapped_windows();
+    if windows.is_empty() {
+        axlog::info!(
+            "intel-gpu: no device with a mapped register window, so the power and sink steps of \
+             the bring-up order did not run"
+        );
+        return;
+    }
+
+    for (bdf, window) in &windows {
+        axlog::info!("intel-gpu: powering up {bdf} (reference section 11 phase 1)");
+        match power::bring_up(window) {
+            Ok(state) => {
+                state.log();
+                *POWER.lock() = Some(state);
+            }
+            Err(error) => {
+                // One line, once, and the sequence stops here: §11 phase 1 is
+                // the gate everything else is behind, and a later step that
+                // fails because the display is unpowered would be reported as
+                // its own fault rather than this one's.
+                let text = alloc::format!("intel-gpu: power: {} ({error:?})", error.describe());
+                axlog::warn!("{text}");
+                *POWER_FAILURE.lock() = Some(text);
+                continue;
+            }
+        }
+    }
+
+    // Phase 2 runs for every mapped device whose power came up, because the
+    // sink is per-device and one device's monitor must not be lost to another
+    // device's failure.
+    let report = { REPORT.lock().clone() };
+    if let Some(report) = report {
+        let sink = sink::probe_at_boot(&report);
+        *SINK.lock() = Some(sink);
+    }
+}
+
+/// The devices whose register window the probe mapped, with those windows.
+///
+/// A device the probe found but could not map is skipped here rather than
+/// guessed at, which is the policy the probe itself applies to a part it has no
+/// model for.
+fn mapped_windows() -> alloc::vec::Vec<(pci::Bdf, RegisterWindow)> {
+    let report = REPORT.lock();
+    let Some(report) = report.as_ref() else {
+        return alloc::vec::Vec::new();
+    };
+    report
+        .displays
+        .iter()
+        .filter_map(|found| match found.status {
+            WindowStatus::Mapped { window, .. } => Some((found.info.bdf, window)),
+            WindowStatus::Refused(_) => None,
+        })
+        .collect()
+}
+
 /// The report of the boot probe as text.
 pub(crate) fn report_text() -> String {
-    match &*REPORT.lock() {
+    let mut text = match &*REPORT.lock() {
         Some(report) => report.render(),
         None => String::from(
             "intel-gpu: the Intel display probe has not run in this boot; it runs from the DRM \
              initialization path, so this file is empty only if that path never executed\n",
         ),
+    };
+    // The locks are taken one at a time: nothing holds two at once.
+    if let Some(failure) = &*POWER_FAILURE.lock() {
+        text.push_str(failure);
+        text.push('\n');
     }
+    if let Some(state) = &*POWER.lock() {
+        text.push_str(&state.render());
+    }
+    if let Some(sink) = &*SINK.lock() {
+        text.push_str(&sink.render());
+    }
+    text
 }
 
 /// Whether the boot probe found a display device it could identify.

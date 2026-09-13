@@ -43,7 +43,14 @@ pub fn init_virtio_gpu() -> DrmResult<bool> {
     // before devfs is mounted, and therefore before any debug file could be
     // read, so that its report reaches the console on a machine that has no
     // other way to show one.
+    //
+    // The bring-up order's later steps run immediately after, in the same place
+    // and for the same reason.  They are separate calls because they are
+    // separate claims: the probe can succeed on a device whose power never
+    // comes up, and saying which of the two happened is the difference between
+    // a log a person can act on and one that only says "no display".
     intel::probe_at_boot();
+    intel::bring_up_at_boot();
     virtio::init()
 }
 
