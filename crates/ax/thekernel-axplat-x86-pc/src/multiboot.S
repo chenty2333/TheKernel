@@ -38,10 +38,46 @@ multiboot2_header:
     .int    multiboot2_header - {offset}        # header_addr
     .int    _skernel - {offset}                 # load_addr
     .int    _edata - {offset}                   # load_end_addr
-    .int    _ebss - {offset}                   # bss_end_addr
+    .int    _ebss - {offset}                    # bss_end_addr
 
-    # Entry-address tag.  Its size is 12 bytes, so include the required
-    # four-byte pad before the next eight-byte-aligned tag.
+    # Framebuffer request tag (type 5), which the bootloader uses and does not
+    # pass on.  Both halves of that sentence were measured under OVMF with GRUB
+    # 2.12, and they are why the tag is here in this shape:
+    #
+    # * GRUB does not forward it.  With the tag in the header and with it
+    #   removed, the kernel logged the same thirteen tags -- 21, 1, 2, 3, 6, 9,
+    #   4, 8, 12, 14, 15, 17, 0 -- and no type 5 among them either way.  The
+    #   framebuffer the kernel draws on is the type-8 EFI tag, and it arrives
+    #   whether or not this tag is present.
+    # * GRUB does act on it.  Without the tag GRUB prints `WARNING: no console
+    #   will be available to OS` while booting; with it, the warning is gone.
+    #   So the tag is the bootloader's own signal that a graphical console was
+    #   requested, and it is worth carrying even though the kernel never sees
+    #   it -- the type-8 tag arriving unconditionally is a property of the EFI
+    #   video path, not a promise the specification makes.
+    #
+    # Width, height and depth are zero with the optional flag clear, which asks
+    # GRUB for a mode of its choosing rather than a specific one.  Naming a
+    # mode here would be a guess about a monitor nobody has seen, and the
+    # kernel only ever reads back what it was given; it accepts 32, 24 and 16
+    # bits per pixel and refuses the rest with a log line.
+    #
+    # The 20-byte size is what makes the padding below necessary.  GRUB walks
+    # the header with `ALIGN_UP(tag->size, MULTIBOOT_TAG_ALIGN)` and
+    # MULTIBOOT_TAG_ALIGN is 8, so this tag ends at 24 bytes, not at the 20 its
+    # size states -- while the specification only asks for the 4-byte
+    # alignment that 20 already satisfies.  A reader that trusts `size` finds
+    # the entry tag four bytes early.  GRUB does not: it refuses the whole
+    # image with `unsupported tag: 0xc`, which is how this padding was found.
+    .short  5                                   # type
+    .short  0                                   # flags (0 = required, 1 = optional)
+    .int    20                                  # size
+    .int    0                                   # width: no preference
+    .int    0                                   # height: no preference
+    .int    0                                   # depth: no preference
+    .int    0                                   # alignment padding to 24 bytes
+
+    # Entry-address tag, on the 8-byte boundary GRUB rounds the tag above to.
     .short  3                                   # type
     .short  0                                   # flags
     .int    12                                  # size

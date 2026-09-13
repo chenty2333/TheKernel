@@ -36,10 +36,23 @@ const MULTIBOOT2_HEADER_ARCH: u32 = 0;
 /// The Multiboot2 header magic passed in EAX by GRUB.
 pub(crate) const MULTIBOOT2_BOOTLOADER_MAGIC: usize = 0x36D7_6289;
 
-// Header (16 bytes), address tag (24 bytes), entry tag (16 bytes including
-// alignment padding), and end tag (8 bytes).
+// Header (16 bytes), address tag (24 bytes), framebuffer request tag (24 bytes
+// including the alignment padding GRUB's `ALIGN_UP(size, 8)` requires), entry
+// tag (16 bytes including alignment padding), and end tag (8 bytes).
+//
+// This must equal the size `multiboot.S` actually assembles.
+// `tests/test_multiboot_header.py` reads both and fails if they disagree, and
+// `tools/qemu_runner/multiboot2.py` re-reads the assembled image before every
+// boot, because a header that lies about its own length is an image that
+// produces no output at all rather than a build error.
+//
+// The framebuffer tag is a *request*, not a description, and GRUB acts on it
+// without forwarding it: with the tag the bootloader prints no console
+// warning, without it, it prints `WARNING: no console will be available to
+// OS` -- while the type-8 tag the kernel actually reads arrives either way on
+// EFI.  Both halves were measured; see the comment in `multiboot.S`.
 #[cfg(all(not(test), target_os = "none"))]
-const MULTIBOOT2_HEADER_LENGTH: u32 = 16 + 24 + 16 + 8;
+const MULTIBOOT2_HEADER_LENGTH: u32 = 16 + 24 + 24 + 16 + 8;
 #[cfg(all(not(test), target_os = "none"))]
 const MULTIBOOT2_HEADER_CHECKSUM: u32 = 0u32.wrapping_sub(
     MULTIBOOT2_HEADER_MAGIC
