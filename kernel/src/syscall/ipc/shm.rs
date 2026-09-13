@@ -2403,6 +2403,21 @@ fn clear_proc_shm_in(transaction: &Mutex<()>, manager: &Mutex<ShmManager>, pid: 
 }
 
 /// Clears every SHM attachment owned by `pid` in exactly `namespace`.
+///
+/// This is the process-exit authority for SysV SHM attachments, the equivalent
+/// of Linux's `exit_shm()`: it runs from the exiting task's context before the
+/// zombie is published, so a process that has been reaped owns no attachment
+/// and an `IPC_RMID` segment whose last attachment went away with it is
+/// unreachable immediately rather than after some later VMA teardown.
+///
+/// The deferred VMA mapping finalizer is deliberately *not* the authority for
+/// attachment identity. It exists so the last fragment's IPC retirement can run
+/// in a task context after that mapping's TLB grace, but page ownership never
+/// depends on it: a segment's frames are owned by the `Arc<SharedPages>` each
+/// mapping holds through its `SharedBackend`. Removing the record of an exit
+/// here therefore cannot free backing that a live or retiring VMA still maps;
+/// it only turns the outstanding VMA lease's eventual finalizer into an
+/// exact-match no-op.
 pub(crate) fn clear_proc_shm_in_namespace(namespace: &IpcNamespace, pid: Pid) {
     clear_proc_shm_in(namespace.shm_transaction(), namespace.shm_manager(), pid)
 }
@@ -3119,6 +3134,7 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use crate::task::UserNamespace;
 
     const PARENT_PID: Pid = 11;
     const CHILD_PID: Pid = 12;
@@ -3204,6 +3220,259 @@ mod tests {
             VirtAddr::from(ATTACH_ADDR),
             VirtAddr::from(ATTACH_ADDR + PAGE_SIZE_4K),
         )
+    }
+
+    const SECOND_ATTACH_ADDR: usize = 0x8000;
+    const CHILD_OWN_ATTACH_ADDR: usize = 0xC000;
+
+    fn range_at(addr: usize) -> VirtAddrRange {
+        VirtAddrRange::new(VirtAddr::from(addr), VirtAddr::from(addr + PAGE_SIZE_4K))
+    }
+
+    fn namespace_fixture(inner: &Arc<Mutex<ShmInner>>) -> Arc<IpcNamespace> {
+        let namespace = IpcNamespace::try_new(UserNamespace::try_new_root().unwrap()).unwrap();
+        let mut manager = namespace.shm_manager().lock();
+        manager.try_reserve_segment(false).unwrap();
+        manager.insert_shmid_inner(SHMID, 1, inner.clone()).unwrap();
+        drop(manager);
+        namespace
+    }
+
+    fn attachment_records(namespace: &IpcNamespace, pid: Pid) -> Vec<ShmAttachmentRecord> {
+        namespace
+            .shm_manager()
+            .lock()
+            .pid_vaddr_shmid
+            .get(&pid)
+            .map(|attachments| {
+                attachments
+                    .entries
+                    .values()
+                    .map(|attachment| attachment.value)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Builds the guest `sysv-shm` topology inside one live IPC namespace: the
+    /// parent owns two attachments, the child inherits both across a committed
+    /// fork admission, the child adds one attachment of its own and detaches it
+    /// explicitly, and the segment is then marked for removal with its key
+    /// unlinked.
+    ///
+    /// The returned records are the child's still-outstanding inherited
+    /// attachments. They model the VMA leases whose deferred finalizers run
+    /// only after `AddrSpace` teardown has removed the child's last fragment.
+    fn exited_child_rmid_fixture(
+        namespace: &IpcNamespace,
+        inner: &Arc<Mutex<ShmInner>>,
+    ) -> Vec<ShmAttachmentRecord> {
+        for addr in [ATTACH_ADDR, SECOND_ATTACH_ADDR] {
+            prepare_shmat_admission_in(
+                namespace.shm_manager(),
+                inner.clone(),
+                PARENT_PID,
+                SHMID,
+                range_at(addr),
+            )
+            .unwrap()
+            .commit();
+        }
+        prepare_proc_shm_inheritance_in(
+            namespace.shm_transaction(),
+            namespace.shm_manager(),
+            PARENT_PID,
+            CHILD_PID,
+        )
+        .unwrap()
+        .commit();
+        let own = prepare_shmat_admission_in(
+            namespace.shm_manager(),
+            inner.clone(),
+            CHILD_PID,
+            SHMID,
+            range_at(CHILD_OWN_ATTACH_ADDR),
+        )
+        .unwrap();
+        let own_id = own.record.id;
+        own.commit();
+        // The only synchronous retirement in the guest sequence is the child's
+        // explicit `shmdt` of its own attachment.
+        finalize_sysv_attachment(namespace, CHILD_PID, SHMID, own_id);
+        inner.lock().set_removed(true);
+        namespace.shm_manager().lock().remove_key_by_shmid(SHMID);
+        attachment_records(namespace, CHILD_PID)
+    }
+
+    /// The invariant a parent may rely on once `wait()` has returned: an exited
+    /// process owns no SysV attachment, so an `IPC_RMID` segment whose last
+    /// owner was that process is already unreachable through `shmat`. The
+    /// retiring VMA lease is deliberately still outstanding here, which is
+    /// exactly the state the guest `sysv-shm` case observes.
+    #[test]
+    fn exit_retirement_destroys_rmid_identity_without_vma_finalizers() {
+        let _context = crate::test_support::scheduler_test_context();
+        let inner = test_segment(IPC_PRIVATE, SHMID, 1);
+        let namespace = namespace_fixture(&inner);
+        prepare_shmat_admission_in(
+            namespace.shm_manager(),
+            inner.clone(),
+            PARENT_PID,
+            SHMID,
+            attachment_range(),
+        )
+        .unwrap()
+        .commit();
+        inner.lock().set_removed(true);
+        namespace.shm_manager().lock().remove_key_by_shmid(SHMID);
+        assert!(namespace.shm_manager().lock().contains_shmid(SHMID));
+
+        clear_proc_shm_in_namespace(&namespace, PARENT_PID);
+
+        let manager = namespace.shm_manager().lock();
+        assert!(manager.get_inner_by_shmid(SHMID).is_none());
+        assert!(!manager.contains_shmid(SHMID));
+        assert!(!manager.pid_vaddr_shmid.contains_key(&PARENT_PID));
+        assert_eq!(manager.total_page_count(), 0);
+        assert_eq!(manager.attachment_count, 0);
+        drop(manager);
+        let state = inner.lock();
+        assert!(!state.has_attachment_owners());
+        assert_eq!(state.attach_count(), 0);
+        assert_eq!(state.visible_snapshot().shm_nattch, 0);
+    }
+
+    /// The full guest `sysv-shm` ordering at metadata level. `shmat-removed-id`
+    /// expects `EINVAL` immediately after the parent's last `shmdt`, so the
+    /// segment identity must die with its last attachment rather than with the
+    /// deferred VMA finalizer that still owes the exiting child's mappings.
+    #[test]
+    fn exit_retirement_releases_rmid_identity_before_late_vma_finalizers() {
+        let _context = crate::test_support::scheduler_test_context();
+        let inner = test_segment(IPC_PRIVATE, SHMID, 1);
+        let namespace = namespace_fixture(&inner);
+        let child_leases = exited_child_rmid_fixture(&namespace, &inner);
+        assert_eq!(child_leases.len(), 2);
+        assert_eq!(inner.lock().attach_count(), 4);
+
+        // `waitpid` returned: the child has completed its exit path.
+        clear_proc_shm_in_namespace(&namespace, CHILD_PID);
+        assert_eq!(inner.lock().attach_count(), 2);
+        assert!(
+            !namespace
+                .shm_manager()
+                .lock()
+                .pid_vaddr_shmid
+                .contains_key(&CHILD_PID)
+        );
+        assert!(namespace.shm_manager().lock().contains_shmid(SHMID));
+
+        // The parent's two `shmdt` calls.
+        for record in attachment_records(&namespace, PARENT_PID) {
+            finalize_sysv_attachment(&namespace, PARENT_PID, SHMID, record.id);
+        }
+        assert!(
+            namespace
+                .shm_manager()
+                .lock()
+                .get_inner_by_shmid(SHMID)
+                .is_none(),
+            "shmat must report EINVAL once the last attachment is gone"
+        );
+        assert_eq!(namespace.shm_manager().lock().total_page_count(), 0);
+        assert_eq!(namespace.shm_manager().lock().attachment_count, 0);
+
+        // The exiting child's leases finalize afterwards. They must not be able
+        // to reach back into the identity that has already been retired.
+        for record in &child_leases {
+            finalize_sysv_attachment(&namespace, CHILD_PID, SHMID, record.id);
+        }
+        assert!(
+            namespace
+                .shm_manager()
+                .lock()
+                .get_inner_by_shmid(SHMID)
+                .is_none()
+        );
+        assert_eq!(namespace.shm_manager().lock().attachment_count, 0);
+    }
+
+    /// Destroying the identity at exit while VMA leases are still outstanding
+    /// must not let a late finalizer detach a successor that reused the shmid.
+    /// The exact-ID lookup is what makes the early retirement safe.
+    #[test]
+    fn late_vma_finalizer_after_exit_retirement_cannot_detach_a_successor() {
+        let _context = crate::test_support::scheduler_test_context();
+        let inner = test_segment(IPC_PRIVATE, SHMID, 1);
+        let namespace = namespace_fixture(&inner);
+        let child_leases = exited_child_rmid_fixture(&namespace, &inner);
+        clear_proc_shm_in_namespace(&namespace, CHILD_PID);
+        for record in attachment_records(&namespace, PARENT_PID) {
+            finalize_sysv_attachment(&namespace, PARENT_PID, SHMID, record.id);
+        }
+        assert!(!namespace.shm_manager().lock().contains_shmid(SHMID));
+
+        // Linux reuses shmids, so a successor may legitimately own SHMID before
+        // the exited child's leases are drained.
+        let successor = test_segment(IPC_PRIVATE, SHMID, 1);
+        {
+            let mut manager = namespace.shm_manager().lock();
+            manager.try_reserve_segment(false).unwrap();
+            manager
+                .insert_shmid_inner(SHMID, 1, successor.clone())
+                .unwrap();
+        }
+        prepare_shmat_admission_in(
+            namespace.shm_manager(),
+            successor.clone(),
+            PARENT_PID,
+            SHMID,
+            attachment_range(),
+        )
+        .unwrap()
+        .commit();
+
+        for record in &child_leases {
+            finalize_sysv_attachment(&namespace, CHILD_PID, SHMID, record.id);
+        }
+
+        let manager = namespace.shm_manager().lock();
+        assert!(manager.contains_shmid(SHMID));
+        assert_eq!(manager.total_page_count(), 1);
+        assert_eq!(manager.attachment_count, 1);
+        drop(manager);
+        assert_eq!(successor.lock().attach_count(), 1);
+    }
+
+    /// Negative control for the guest `shmat-removed-id` assertion. It models
+    /// the pre-fix ordering, where an exiting process's records were left to the
+    /// deferred VMA finalizer alone: after the last live owner detaches, the
+    /// removed segment is still reachable by shmid, so `shmat` succeeds instead
+    /// of failing with `EINVAL`. The exit-time retirement above is what removes
+    /// this state.
+    #[test]
+    fn deferred_only_retirement_leaves_an_exited_owners_rmid_identity_reachable() {
+        let _context = crate::test_support::scheduler_test_context();
+        let inner = test_segment(IPC_PRIVATE, SHMID, 1);
+        let namespace = namespace_fixture(&inner);
+        let child_leases = exited_child_rmid_fixture(&namespace, &inner);
+        assert_eq!(child_leases.len(), 2);
+
+        for record in attachment_records(&namespace, PARENT_PID) {
+            finalize_sysv_attachment(&namespace, PARENT_PID, SHMID, record.id);
+        }
+
+        let reachable = namespace
+            .shm_manager()
+            .lock()
+            .get_inner_by_shmid(SHMID)
+            .is_some();
+        assert!(
+            reachable,
+            "the deferred finalizer alone cannot retire an exited process's attachments, which is \
+             why the exit path must"
+        );
+        assert_eq!(inner.lock().attach_count(), 2);
     }
 
     fn inheritance_fixture() -> (Mutex<()>, Mutex<ShmManager>, Arc<Mutex<ShmInner>>) {
