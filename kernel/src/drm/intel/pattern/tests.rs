@@ -150,8 +150,8 @@ fn the_darkest_bar_is_not_black_so_no_visible_pixel_is_zero() {
             .chunks_exact(scratch.stride)
             .enumerate()
         {
-            for (column, pixel) in line[..width * 4].chunks_exact(4).enumerate() {
-                let word = u32::from_le_bytes(pixel.try_into().expect("four bytes"));
+            for (column, pixel) in line[..width * 4].as_chunks::<4>().0.iter().enumerate() {
+                let word = u32::from_le_bytes(*pixel);
                 assert_ne!(
                     word, 0,
                     "{width}x{height}: pixel ({column}, {row}) is black"
@@ -191,8 +191,10 @@ fn two_frames_differ_exactly_by_the_two_marker_positions() {
     // that assumed it was failed on the first run.
     let differing = first
         .bytes
-        .chunks_exact(4)
-        .zip(second.bytes.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(second.bytes.as_chunks::<4>().0.iter())
         .filter(|(a, b)| a != b)
         .count();
     assert_eq!(differing, 2 * one.marker.side * one.marker.side);
@@ -206,8 +208,7 @@ fn the_marker_never_leaves_the_surface_however_large_the_frame_counter() {
             assert!(marker.side >= 1, "{width}x{height}: a zero-sided marker");
             assert!(
                 marker.x + marker.side <= width && marker.y + marker.side <= height,
-                "{width}x{height} frame {frame}: {}",
-                format!("{marker:?}")
+                "{width}x{height} frame {frame}: {marker:?}"
             );
         }
     }

@@ -354,8 +354,8 @@ fn write_pixel(pixel: &mut [u8], color: u32) {
 /// byte order.
 fn write_color(pixels: &mut [u8], color: u32) {
     let bytes = color.to_le_bytes();
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel.copy_from_slice(&bytes);
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        *pixel = bytes;
     }
 }
 
