@@ -400,7 +400,10 @@ design record carries its own status line, and they all say the same thing: `int
 of this has run on the target machine", `intel-gpu-probe.md` "No register value in any report is
 verified against real hardware", `intel-gmbus.md` "Nothing in this workstream has run on that
 machine", `intel-pipe.md` and `intel-scanout.md` likewise, `intel-output.md` "nothing in this module
-has run against silicon". This is where a reader finds out which claim is which.
+has run against silicon". This is where a reader finds out which claim is which. Two of those
+records go further than the summary below and should be read with it: `intel-scanout.md` §8 lists
+the memory half's unverified facts one by one with the reading that would settle each, and
+`docs/design/intel-modeset.md` §8 does the same for phases 3 to 6.
 
 | Claim | How it is verified today | What that is worth |
 |---|---|---|
@@ -411,7 +414,7 @@ has run against silicon". This is where a reader finds out which claim is which.
 | Hotplug enable and the live connect read | 10 host tests over bit positions and over what is *not* written (`kernel/src/drm/intel/hpd/tests.rs`) | the register encoding. Which DDI the monitor is on is hardware's answer |
 | The mode layer (EDID → mode) | host tests plus fixtures (`kernel/src/drm/modes/`) | that a given EDID selects a given timing. Real monitors send real EDIDs, which is a different test |
 | Timings, DDB, watermarks, plane, PLL dividers, the DDI sequence, phase 6 | host tests over the mock, including the write order (`kernel/src/drm/intel/pipe/tests.rs`, `kernel/src/drm/intel/output/tests.rs`, `kernel/src/drm/intel/pll.rs`) | arithmetic, ordering and the verdict logic. QEMU writes none of these registers: it has no Gen12 display engine to write them to |
-| Framebuffer allocation, GGTT entries, the console candidate gate | host tests (`fb.rs`, `gtt.rs`, `scanout.rs`) | the address arithmetic and the refusal path |
+| Framebuffer allocation, GGTT entries, the console candidate gate | host tests (`fb.rs`, `gtt.rs`, `scanout.rs`), inventoried in `docs/design/intel-scanout.md` §9 | the address arithmetic and the refusal path. §8 of that document lists what they cannot show, starting with "the host tests themselves prove nothing about device memory" |
 | The end-to-end modeset | **not written** — `modeset::set_mode` is specified and not implemented | nothing |
 | The console handover keeping the firmware's surface on a failed verdict | **reasoned, not observed** (`docs/design/intel-modeset.md` §8) | a prediction |
 | Anything on the target machine | **0 boots.** Nothing in this repository records TheKernel running on this hardware | nothing at all |
