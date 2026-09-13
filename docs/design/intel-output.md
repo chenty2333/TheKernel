@@ -251,9 +251,10 @@ ports A and B, and i915's `intel_port_to_phy` is `PHY_A + port - PORT_A` for eve
 `PORT_TC1` (`display/intel_display.c:1950-1965`), so port index and PHY index are the *same number*
 for both and the old port-keyed expression produced the byte-identical word this one does. The
 difference appears where the two diverge — a Type-C DDI, which this sequence refuses at
-`UnsupportedDdi` before it computes anything, and any future extension to `DDI_TC_1..4`, where
-`intel_port_to_phy` returns `PHY_F + port - PORT_TC1` and a port-keyed field would point the
-transcoder at a clock the port is not on.
+`UnsupportedDdi` before it computes anything, and any future extension to the Type-C ports i915 names
+`PORT_TC1..TC4`, where `intel_port_to_phy` returns `PHY_F + port - PORT_TC1`: port index 3 is
+`PORT_TC1`, whose PHY is `PHY_F = 5`, so a port-keyed field would write `(3 + 1) << 28` where the
+field wants `(5 + 1) << 28` — a different port's clock.
 
 **What the fix is.** `phy_index(ComboPhy)` in `output.rs` is the one place the PHY's index is
 computed, and it takes a `ComboPhy` rather than a `Ddi`, so the two cannot be confused at the call
@@ -272,8 +273,8 @@ and the correction is listed for the coordinator in the workstream report.
 
 ### 3.9 Read-modify-write or whole value: `TRANSCONF` no, `DDI_BUF_CTL` yes
 
-The last difference the research pass found between i915 and this sequence is that i915 composes both
-of these registers from a value it read, where the module composed whole words from constants.
+The last difference between i915's composition and this module's was that i915 builds both of these
+registers out of a value it read, where the module built whole words out of constants.
 `intel_enable_transcoder` reads `TRANSCONF` and writes it back with `TRANSCONF_ENABLE` OR'd in
 (`display/intel_display.c:459`, `:474-475`), and the HDMI buffer enable writes
 `saved_port_bits | DDI_BUF_CTL_ENABLE` (`display/intel_ddi.c:3353`, `:3375`), where `saved_port_bits`
@@ -295,11 +296,10 @@ Enumerating `[I915]`'s own field list (`i915_reg.h:1589-1645`) against the mode 
 | `GAMMA_MODE`, `FRAME_START_DELAY`, `MSA_TIMING_DELAY`, `OUTPUT_COLORSPACE` | ilk–ivb and pre-HSW fields by their own definitions |
 | `PIPE_LOCKED`/`FORCE_BORDER` bit 25, `DSI_PLL_LOCKED` bit 29 | no writer in v6.12 (only the analog-CRT path sets `FORCE_BORDER`, `intel_crt.c:732`), and `DSI_PLL_LOCKED` is VLV pipe A |
 
-There is therefore no field to preserve: a read-modify-write would carry back zeros and the status
-bit, and the task's own rule — do not add a read-modify-write with nothing to preserve — applies. The
-whole-value write stays, and this is the cited reason. It is a decision with a condition attached: if
-this kernel ever programs limited-range output or DSC, `TRANSCONF` grows a field that another part of
-the driver owns and this paragraph stops being true.
+There is therefore no field to preserve, and a read-modify-write with nothing to preserve would only
+carry the status bit back: the whole-value write stays, and this is the cited reason. It is a decision
+with a condition attached — if this kernel ever programs limited-range output or DSC, `TRANSCONF`
+grows a field another part of the driver owns and this paragraph stops being true.
 
 **`DDI_BUF_CTL`: `PORT_REVERSAL` is the board's, so the write is a read-modify-write.** The reference
 names the field in its `DDI_BUF_CTL` row (`[REF]` §8.4, `PORT_REVERSAL[16]`) and §11 phase 5.7's write
