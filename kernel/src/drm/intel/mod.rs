@@ -55,8 +55,10 @@ pub(crate) mod debugfs;
 mod id;
 mod pci;
 mod phy;
+mod pll;
 mod probe;
 mod regs;
+mod timing;
 
 #[cfg(test)]
 mod testbus;
