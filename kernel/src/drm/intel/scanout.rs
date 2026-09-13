@@ -344,21 +344,25 @@ pub(crate) fn describe(surface: &Surface) -> String {
 mod tests {
     use super::{
         super::{
-            fb::{Format, Plan},
-            gtt::{Gtt, PAGE_SIZE, mock::MockPageTable},
+            fb::Format,
+            gtt::{Gtt, mock::MockPageTable},
         },
         *,
     };
     use crate::drm::screen::decide;
 
-    /// A surface over a page table in ordinary memory, sized so the mock's
-    /// allocation is a few pages rather than a few thousand.
+    /// A page table with room for the alignment and the padding a run needs.
+    ///
+    /// A run is placed on a 256 KiB boundary with 64 entries of padding after
+    /// it, so a mock table sized to the surface alone would refuse it.
+    const TEST_TABLE_ENTRIES: usize = 4096;
+
+    /// A surface over a page table in ordinary memory.
     fn surface(width: u32, height: u32) -> (Arc<Surface>, Gtt) {
-        let plan = Plan::of(width, height, Format::Xrgb8888).unwrap();
-        let pages = plan.size() / PAGE_SIZE as usize;
-        // One page more than the surface needs: the first page of the aperture
-        // is never handed out (see `gtt::RESERVED_LOW_APERTURE`).
-        let gtt = Gtt::over(alloc::boxed::Box::new(MockPageTable::new(pages + 1))).unwrap();
+        let gtt = Gtt::over(alloc::boxed::Box::new(MockPageTable::new(
+            TEST_TABLE_ENTRIES,
+        )))
+        .unwrap();
         let surface = Arc::new(Surface::allocate(&gtt, width, height, Format::Xrgb8888).unwrap());
         (surface, gtt)
     }

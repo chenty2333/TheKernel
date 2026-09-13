@@ -512,9 +512,15 @@ impl Surface {
 mod tests {
     use super::{super::gtt::mock::MockPageTable, *};
 
+    /// A page table with room for the surfaces these tests allocate *and* for
+    /// the padding and 256 KiB alignment every run now needs: a 1920x1080
+    /// surface is 2025 pages, its block is 2089 entries, and the search needs a
+    /// 256 KiB boundary below the reserved top page for it.
+    const ROOM_FOR_A_1080P_SURFACE: usize = 4096;
+
     /// A page table big enough for any surface a test allocates here.
-    fn test_gtt(pages: usize) -> Gtt {
-        Gtt::over(alloc::boxed::Box::new(MockPageTable::new(pages))).unwrap()
+    fn test_gtt(entries: usize) -> Gtt {
+        Gtt::over(alloc::boxed::Box::new(MockPageTable::new(entries))).unwrap()
     }
 
     #[test]
@@ -637,7 +643,7 @@ mod tests {
     #[test]
     fn an_allocated_surface_is_aligned_present_and_black() {
         let _guard = crate::test_support::scheduler_test_context();
-        let gtt = test_gtt(64);
+        let gtt = test_gtt(ROOM_FOR_A_1080P_SURFACE);
         let surface = Surface::allocate(&gtt, 64, 64, Format::Xrgb8888).unwrap();
         // 64 pixels at 32 bits is already a multiple of 256.
         assert_eq!(surface.stride(), 256);
@@ -673,7 +679,7 @@ mod tests {
         // addresses pitch * virtual_height bytes.  That has to hold whatever
         // the geometry, because the allocation is rounded up to whole pages and
         // the padding is what makes it hold.
-        let gtt = Gtt::over(alloc::boxed::Box::new(MockPageTable::new(64))).unwrap();
+        let gtt = test_gtt(ROOM_FOR_A_1080P_SURFACE);
         // 100 pixels at 32 bits is 400 bytes, padded to a 512-byte stride, and
         // 100 scan lines of that is 51 200 bytes: not a whole number of pages.
         let padded = Surface::allocate(&gtt, 100, 100, Format::Xrgb8888).unwrap();
@@ -694,7 +700,7 @@ mod tests {
     #[test]
     fn a_byte_range_outside_the_surface_is_refused() {
         let _guard = crate::test_support::scheduler_test_context();
-        let gtt = test_gtt(64);
+        let gtt = test_gtt(ROOM_FOR_A_1080P_SURFACE);
         let surface = Surface::allocate(&gtt, 64, 64, Format::Xrgb8888).unwrap();
         let len = surface.len();
         let mut dst = [0u8; 8];
