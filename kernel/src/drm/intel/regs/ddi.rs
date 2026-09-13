@@ -416,10 +416,13 @@ pub(crate) const DDI_BUF_TRANS_HI_B9: Register =
  *   `PORT_TX_DW2/DW4/DW5/DW7`.  Both register sets exist in the merged table
  *   (the indexed one here, the PHY's in `regs-phy.rs`); which one a port
  *   actually uses is a PHY-family question this group does not decide.
- * - Section 8.5 names `PORT_TX_DW2/DW5/DW7` without naming a TX instance.  The
- *   group instance is the one used, because section 8.2's worked examples give
- *   the group offsets for exactly those dwords and the per-lane carve-out is
- *   stated for `DW4` only.
+ * - Section 8.5 names `PORT_TX_DW2/DW5/DW7` without naming a TX instance, and
+ *   its per-lane carve-out is stated for `DW4` only.  The instances i915's DDI
+ *   voltage-swing sequence uses answer it: `DW2` and `DW7` per lane
+ *   ([I915] display/intel_ddi.c:1148-1157, :1171-1178), `DW5` read from lane 0
+ *   and written to the group (:1141-1146, :1218-1229).  No group `DW2`/`DW7`
+ *   write appears anywhere on that path, so the PHY table declares both
+ *   instances of each and says which one the sequence uses.
  *
  * Registers deliberately left out
  * - `DP_AUX_CH_CTL` (`0x64010`/`0x64110`) and `DP_AUX_CH_DATA(i)` (`0x64014 +
@@ -436,9 +439,11 @@ pub(crate) const DDI_BUF_TRANS_HI_B9: Register =
  *   `PORT_COMP_DW0/1/3/8/9/10`, `PORT_TX_DW8` and `ICL_PHY_MISC`), while
  *   `PORT_CL_DW10` (`0x162028`/`0x06c028`), the `TX` group's `DW2`/`DW5`/`DW7`
  *   (`0x162688`/`0x162694`/`0x16269c`, and `0x06c688`/`0x06c694`/`0x06c69c` for
- *   PHY B) and the four per-lane `TX DW4` registers (`0x162890 + 0x100*ln`, and
- *   `0x06c890 + 0x100*ln` for PHY B) are declared by `regs-phy.rs`; those
- *   offsets were derived here from section 8.2 and agree with that file.
+ *   PHY B), the four per-lane `TX DW2`/`DW4`/`DW7` registers
+ *   (`0x162888 + 0x100*ln`, `0x162890 + 0x100*ln`, `0x16289c + 0x100*ln`, and
+ *   the same minus 0xf6000 for PHY B) and `PORT_TX_DW5` lane 0
+ *   (`0x162894`/`0x06c894`) are declared by `regs-phy.rs`; those offsets were
+ *   derived here from section 8.2 and agree with that file.
  * - `PORT_TX_DW4`'s group instance (`0x162690`/`0x06C690`): section 8.5 says
  *   group access must not be used for `DW4`, so no group `DW4` is declared
  *   anywhere, here or in `regs-phy.rs`, only the four per-lane registers.
