@@ -50,12 +50,33 @@
 //! reports the latched field instead of programming it -- see the design note
 //! `docs/design/intel-gmbus.md`.
 //!
+//! # Looking again, after the boot
+//!
+//! [`enable_and_read`] answers "is a monitor attached?" exactly once, during
+//! bring-up.  A monitor plugged in an hour later changes nothing that has
+//! already been read, so the same two registers have to be read again -- and
+//! the whole of that second read is [`poll_connect`], which writes nothing,
+//! takes no interrupt, and returns the raw words next to the decision they
+//! produced.  `SDEISR` is write-one-to-clear, so a poll that wrote would
+//! destroy the evidence it came for; that is why the read-and-classify is here
+//! as a pure function over the words, and why the tests assert through a mock
+//! that a poll leaves the write log empty.
+//!
+//! Deciding what a *change* is belongs to [`ConnectTracker`], which is also
+//! pure: it remembers the last state each DDI's poll produced and reports an
+//! edge, and it treats "the register did not answer" as neither a change nor a
+//! new baseline.  The thread that drives it, and what it does with an edge,
+//! live in the parent module -- this module never sleeps, never logs on a poll
+//! and never touches GMBUS.
+//!
 //! # Not verified
 //!
 //! Nothing here has run against real hardware.  The bit positions come from
 //! `[I915]` and from reference §9.5, and the tests below check the arithmetic
 //! against those tables; whether an Alder Lake-N part latches a connect the way
-//! this module assumes is exactly what the target machine is for.
+//! this module assumes is exactly what the target machine is for.  Neither the
+//! poll interval nor the latency it produces has been measured on the machine:
+//! see `docs/design/intel-hotplug.md`.
 
 use alloc::{format, string::String};
 use core::fmt;
@@ -169,6 +190,36 @@ impl fmt::Display for Ddi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "DDI {}", self.name())
     }
+}
+
+/// Whether a raw `SDEISR` word has this DDI's live connect bit set.
+///
+/// `SDE_DDI_HOTPLUG_ICP(hpd_pin) = 1 << (16 + _HPD_PIN_DDI(hpd_pin))` ([I915]
+/// `i915_reg.h:3001`), which is [`Ddi::live_bit`].  One definition, because
+/// [`enable_and_read`] and [`poll_connect`] have to agree about what the bit
+/// means: two copies of this mask would be two chances to disagree with the
+/// register.
+pub(crate) const fn connect_bit(interrupt_status: u32, ddi: Ddi) -> bool {
+    interrupt_status & ddi.live_bit() != 0
+}
+
+/// Whether a raw `SOUTH_CHICKEN1` word inverts this DDI's hotplug.
+///
+/// `INVERT_DDIA_HPD` through `INVERT_DDID_HPD`, bit `15 + idx` ([I915]
+/// `i915_reg.h:3367-3370`), which is [`Ddi::invert_bit`].
+pub(crate) const fn inverted_bit(south_chicken1: u32, ddi: Ddi) -> bool {
+    south_chicken1 & ddi.invert_bit() != 0
+}
+
+/// The decision a live connect bit and a board-inversion bit add up to.
+///
+/// The two are `XOR`ed rather than one of them winning, because a board whose
+/// level shifter inverts hotplug reports a connect as a *clear* bit (reference
+/// §9.5, quoting the PRM's board-inversion note).  This is the only place the
+/// two bits are combined, so a caller that reads a state cannot apply the
+/// polarity twice or forget to apply it once.
+pub(crate) const fn decides_connect(connect_bit: bool, inverted: bool) -> bool {
+    connect_bit != inverted
 }
 
 /// Why hotplug detection could not be configured or read.
@@ -296,6 +347,234 @@ impl HpdStatus {
     pub(crate) fn log(&self) {
         axlog::info!("intel-hpd: {}", self.describe());
     }
+
+    /// The decision these raw bits add up to, once board polarity is applied.
+    ///
+    /// [`HpdStatus::connected`] is the raw bit and [`describe`] states both
+    /// readings rather than picking one, because this kernel has no way to tell
+    /// which board it is on.  A caller that has to *act* on the state -- the
+    /// after-boot watch, which compares one poll against the next -- needs the
+    /// one answer, and this is it: the same [`decides_connect`] the poll uses,
+    /// so a baseline taken at boot and a poll taken later cannot disagree about
+    /// what the bits meant.
+    ///
+    /// [`describe`]: HpdStatus::describe
+    pub(crate) const fn effective_connect(&self) -> bool {
+        decides_connect(self.connected, self.polarity_inverted)
+    }
+}
+
+/// One DDI's live connect state, and the words it was decided from.
+///
+/// The raw words travel with the decision because on the target machine they
+/// are the diagnostic: a reader who is told "DDI B: disconnected" and nothing
+/// else cannot tell a monitor that was unplugged from a polarity bit the
+/// firmware set, an enable bit that never took, or a register that answered
+/// zero because its power well is down.  `SDEISR` and `SOUTH_CHICKEN1` next to
+/// the conclusion are the difference between a log line and a fact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DdiConnect {
+    pub(crate) ddi: Ddi,
+    /// `SDEISR` (`0xC4000`) as read, the whole word rather than the one bit.
+    pub(crate) interrupt_status: u32,
+    /// `SOUTH_CHICKEN1` (`0xC2000`) as read.
+    pub(crate) south_chicken1: u32,
+    /// Whether this DDI's board-inversion bit is set.
+    pub(crate) polarity_inverted: bool,
+    /// Whether a sink is connected, with the polarity bit applied.
+    pub(crate) connected: bool,
+}
+
+impl DdiConnect {
+    /// The words this decision came from, as one clause of a log line.
+    pub(crate) fn words(&self) -> String {
+        format!(
+            "SDEISR {:#010x} (live connect bit {}), SOUTH_CHICKEN1 {:#010x} (board inversion {})",
+            self.interrupt_status,
+            if connect_bit(self.interrupt_status, self.ddi) {
+                "set"
+            } else {
+                "clear"
+            },
+            self.south_chicken1,
+            if self.polarity_inverted {
+                "set, so the bit reads backwards"
+            } else {
+                "clear"
+            },
+        )
+    }
+}
+
+/// One poll's worth of connect state, for every DDI, in two register reads.
+///
+/// Both registers are whole-register reads, so a failure is not per-DDI: if
+/// `SDEISR` did not answer then *no* DDI's state is known, and [`state`] says
+/// `None` for all four rather than guessing zero for the ones that look quiet.
+/// [`failure`] carries the register by name, which is the one-line fix a reader
+/// needs when the reason is that the mapped window does not reach it.
+///
+/// [`state`]: ConnectPoll::state
+/// [`failure`]: ConnectPoll::failure
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConnectPoll {
+    /// `SDEISR` as read, or `None` when the mapped window does not reach it.
+    interrupt_status: Option<u32>,
+    /// `SOUTH_CHICKEN1` as read, or `None` when the window does not reach it.
+    south_chicken1: Option<u32>,
+}
+
+impl ConnectPoll {
+    /// One DDI's state, or `None` when a register this needs did not answer.
+    pub(crate) fn state(&self, ddi: Ddi) -> Option<DdiConnect> {
+        let interrupt_status = self.interrupt_status?;
+        let south_chicken1 = self.south_chicken1?;
+        let polarity_inverted = inverted_bit(south_chicken1, ddi);
+        Some(DdiConnect {
+            ddi,
+            interrupt_status,
+            south_chicken1,
+            polarity_inverted,
+            connected: decides_connect(connect_bit(interrupt_status, ddi), polarity_inverted),
+        })
+    }
+
+    /// Every DDI, in register order, so a caller can walk one poll.
+    pub(crate) fn states(&self) -> [Option<DdiConnect>; 4] {
+        [
+            self.state(Ddi::A),
+            self.state(Ddi::B),
+            self.state(Ddi::C),
+            self.state(Ddi::D),
+        ]
+    }
+
+    /// The register that refused, when one did.
+    ///
+    /// A window can miss both registers, and then only one of them is named:
+    /// `SDEISR`, because it is the register the decision is about.  The order
+    /// is fixed rather than incidental, so that the same machine produces the
+    /// same line every time.
+    pub(crate) fn failure(&self) -> Option<HpdError> {
+        if self.interrupt_status.is_none() {
+            return Some(HpdError::WindowTooSmall {
+                register: SDEISR.name(),
+            });
+        }
+        if self.south_chicken1.is_none() {
+            return Some(HpdError::WindowTooSmall {
+                register: SOUTH_CHICKEN1.name(),
+            });
+        }
+        None
+    }
+}
+
+/// Read the live connect state of every DDI, and write nothing.
+///
+/// This is the whole of the polling path: one read of `SDEISR` and one of
+/// `SOUTH_CHICKEN1`, which between them answer all four ports, and no write of
+/// any register.  Nothing has to be enabled first -- [`enable_and_read`] did
+/// that during bring-up, and detection stays enabled -- so a poll is two
+/// uncached reads and nothing else, which is what makes it safe to run at a
+/// fixed interval forever.
+///
+/// `SDEISR` is write-one-to-clear, so a poll that wrote it would discard the
+/// state it came to read; `SOUTH_CHICKEN1` is left alone because board polarity
+/// is a decision with evidence behind it ([`set_board_inversion`]) and not
+/// something a status read may quietly flip.
+pub(crate) fn poll_connect<R: Registers>(regs: &R) -> ConnectPoll {
+    ConnectPoll {
+        interrupt_status: regs.read(SDEISR),
+        south_chicken1: regs.read(SOUTH_CHICKEN1),
+    }
+}
+
+/// A change in one DDI's connect state: what a hotplug event is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DdiTransition {
+    pub(crate) ddi: Ddi,
+    /// The state the last poll that answered reported.
+    pub(crate) from: bool,
+    /// The state this poll reports, raw words included.
+    pub(crate) state: DdiConnect,
+}
+
+impl DdiTransition {
+    /// One line for a log: the change, and the words that produced it.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "{}: {} -> {} ({})",
+            self.ddi,
+            if self.from {
+                "connected"
+            } else {
+                "disconnected"
+            },
+            if self.state.connected {
+                "connected"
+            } else {
+                "disconnected"
+            },
+            self.state.words(),
+        )
+    }
+}
+
+/// The connect state each DDI read the last time a poll answered.
+///
+/// An edge detector has to remember something, and what it remembers decides
+/// what counts as an event.  Two rules, and both are deliberate:
+///
+/// * **A register that did not answer changes nothing.**  A failed read is not
+///   an event and does not reset the baseline, because "I could not look" is
+///   not "nothing is there" -- a poll that failed and then succeeded must not
+///   report a monitor as having just been plugged in.
+/// * **A first answer with no baseline is adopted in silence.**  The boot step
+///   already reported the state it could read; re-reporting it as a transition
+///   would say a monitor arrived when the truth is that this kernel had not
+///   looked yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConnectTracker {
+    seen: [Option<bool>; 4],
+}
+
+impl ConnectTracker {
+    /// A tracker that has seen nothing yet: every DDI has no baseline.
+    pub(crate) const fn new() -> Self {
+        Self { seen: [None; 4] }
+    }
+
+    /// Adopt `connected` as the state future polls are compared against,
+    /// without calling the adoption an event.
+    ///
+    /// This is how the boot step's own reading becomes the baseline: the sink
+    /// step read every DDI once and said so, and a watch that started by
+    /// reporting that same state as a hotplug would be reporting its own first
+    /// look.
+    pub(crate) fn seed(&mut self, ddi: Ddi, connected: bool) {
+        self.seen[ddi.index() as usize] = Some(connected);
+    }
+
+    /// Fold one DDI's state in and say what changed.
+    ///
+    /// `None` means "not an event", which covers both "the same state again"
+    /// and "no baseline to compare against"; see the type's documentation for
+    /// why the second is silent.
+    pub(crate) fn observe(&mut self, state: DdiConnect) -> Option<DdiTransition> {
+        let slot = &mut self.seen[state.ddi.index() as usize];
+        let previous = *slot;
+        *slot = Some(state.connected);
+        let from = previous?;
+        if from == state.connected {
+            return None;
+        }
+        Some(DdiTransition {
+            ddi: state.ddi,
+            from,
+            state,
+        })
+    }
 }
 
 /// Enable hotplug detection for one DDI and read the live state once.
@@ -347,8 +626,8 @@ pub(crate) fn enable_and_read<R: Registers>(regs: &R, ddi: Ddi) -> Result<HpdSta
         south_chicken1,
         filter,
         enabled: observed & enable != 0,
-        connected: interrupt_status & ddi.live_bit() != 0,
-        polarity_inverted: south_chicken1 & ddi.invert_bit() != 0,
+        connected: connect_bit(interrupt_status, ddi),
+        polarity_inverted: inverted_bit(south_chicken1, ddi),
     })
 }
 
@@ -356,10 +635,12 @@ pub(crate) fn enable_and_read<R: Registers>(regs: &R, ddi: Ddi) -> Result<HpdSta
 ///
 /// The same read [`enable_and_read`] finishes with, for a caller that has
 /// already enabled detection and wants to look again -- after a hotplug
-/// interrupt was noticed, or later in a boot.
+/// interrupt was noticed, or later in a boot.  A caller that is looking at all
+/// four DDIs wants [`poll_connect`] instead, which reads each register once
+/// rather than once per DDI.
 pub(crate) fn live_state<R: Registers>(regs: &R, ddi: Ddi) -> Result<bool, HpdError> {
     let status = read(regs, SDEISR)?;
-    Ok(status & ddi.live_bit() != 0)
+    Ok(connect_bit(status, ddi))
 }
 
 /// Whether this DDI's board level shifter inverts hotplug.
@@ -372,7 +653,7 @@ pub(crate) fn live_state<R: Registers>(regs: &R, ddi: Ddi) -> Result<bool, HpdEr
 /// changes, which is why it is reported rather than acted on.
 pub(crate) fn polarity_inverted<R: Registers>(regs: &R, ddi: Ddi) -> Result<bool, HpdError> {
     let chicken = read(regs, SOUTH_CHICKEN1)?;
-    Ok(chicken & ddi.invert_bit() != 0)
+    Ok(inverted_bit(chicken, ddi))
 }
 
 /// Set or clear one DDI's board-inversion bit.
