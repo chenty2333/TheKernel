@@ -46,6 +46,14 @@
 //! demand of the dividers.  [`OutputProgram::render`] is that log, and the
 //! numbers in it come from `pll.rs` rather than from arithmetic redone here.
 //!
+//! One write is the exception, and it is the one register that carries
+//! somebody else's bit: `DDI_BUF_CTL` is enabled with a read-modify-write over
+//! the fields the plan composes ([`DDI_BUF_CTL_OWNED`]), because
+//! `PORT_REVERSAL[16]` belongs to the board.  So the plan holds the fields this
+//! sequence owns in that register, not the whole word -- and
+//! `docs/design/intel-output.md` §3.9 states which other fields were considered
+//! and why `TRANSCONF` is *not* written that way.
+//!
 //! # The PLL is `pll.rs`'s, and so is its encoding question
 //!
 //! [`pll::ddi_pll_dividers`] computes the divider set and refuses what it
@@ -273,6 +281,37 @@ const DDI_BUF_CTL_A_4_LANES: u32 = 1 << 4;
 
 /// `DDI_BUF_CTL`'s `PORT_WIDTH[3:1]` shift: `(lanes - 1) << 1`.
 const DDI_BUF_CTL_PORT_WIDTH_SHIFT: u32 = 1;
+
+/// The bits of `DDI_BUF_CTL` the plan composes, and therefore the only bits the
+/// enable write may clear.
+///
+/// `[I915]` `i915_reg.h:3858-3873`: `ENABLE[31]`, `BUF_TRANS_SELECT[27:24]`,
+/// `PHY_LINK_RATE[23:20]`, `PORT_WIDTH[3:1]` and `A_4_LANES[4]`.  Everything
+/// else in the register belongs to somebody else, and one of those bits is
+/// load-bearing: `PORT_REVERSAL[16]` (`i915_reg.h:3868`) is the **board's**.
+/// i915 reads it out of this same register while initialising the encoder and
+/// keeps that bit alone for `DISPLAY_VER >= 11`
+/// (`display/intel_ddi.c:5115-5120`), ORs in the VBT's own lane-reversal flag
+/// (`:5124`), and composes the HDMI enable as
+/// `saved_port_bits | DDI_BUF_CTL_ENABLE` (`:3353`, written at `:3375`).  A
+/// whole-value write composed from constants would clear a lane order the
+/// firmware declared, and the TMDS pairs would come out on the wrong lanes.
+/// Reference §8.4 names `PORT_REVERSAL` in its `DDI_BUF_CTL` row and §11 phase
+/// 5.7's write does not carry it; `docs/design/intel-output.md` §3.9 records the
+/// difference and why this module keeps the bit.
+///
+/// The mask is the sequence's whole claim on the register, so the
+/// read-modify-write in [`program`] also hands back the read-only bits it read
+/// (`IS_IDLE[7]`, `DDI_INIT_DISPLAY_DETECTED[0]`), which hardware ignores on
+/// write.  i915 read-modify-writes this register the same way where it does not
+/// have a saved word -- `intel_de_rmw(..., DDI_BUF_CTL(port), 0,
+/// DDI_BUF_CTL_ENABLE)` (`display/icl_dsi.c:514`) and the enable clear at
+/// `display/intel_ddi.c:3615-3618`.
+const DDI_BUF_CTL_OWNED: u32 = DDI_BUF_CTL_ENABLE
+    | (0b1111 << DDI_BUF_CTL_BUF_TRANS_SELECT_SHIFT)
+    | (0b1111 << DDI_BUF_CTL_PHY_LINK_RATE_SHIFT)
+    | (0b111 << DDI_BUF_CTL_PORT_WIDTH_SHIFT)
+    | DDI_BUF_CTL_A_4_LANES;
 
 /// How long to wait for `IS_IDLE` to clear, in microseconds.
 ///
@@ -836,7 +875,10 @@ pub(crate) struct OutputProgram {
     pub(crate) trans_ddi_func_ctl: u32,
     /// `TRANSCONF(A)`, the register `regs/pipe.rs` names `PIPECONF_A`.
     pub(crate) transconf: u32,
-    /// `DDI_BUF_CTL` for this port.
+    /// The fields this sequence owns in `DDI_BUF_CTL` for this port.  Written
+    /// as a read-modify-write, so the register keeps the bits the plan does not
+    /// name -- the board's `PORT_REVERSAL` among them; see
+    /// [`DDI_BUF_CTL_OWNED`].
     pub(crate) ddi_buf_ctl: u32,
 }
 
@@ -1060,6 +1102,13 @@ impl OutputProgram {
             self.ddi.name(),
             self.ddi_buf_ctl,
         ));
+        out.push_str(&format!(
+            "intel-output: that DDI_BUF_CTL({}) word is the plan's fields only -- ENABLE, \
+             BUF_TRANS_SELECT, PHY_LINK_RATE, PORT_WIDTH and A_4_LANES.  The write is a \
+             read-modify-write, so the board's PORT_REVERSAL[16] and every other bit keep the \
+             value the firmware left\n",
+            self.ddi.name(),
+        ));
         out
     }
 
@@ -1110,7 +1159,8 @@ pub(crate) struct OutputState {
     pub(crate) trans_ddi_func_ctl: u32,
     /// `TRANSCONF(A)` as written.
     pub(crate) transconf: u32,
-    /// `DDI_BUF_CTL` as written.
+    /// The fields this sequence owns in `DDI_BUF_CTL`, as written; the rest of
+    /// the register held what it held ([`DDI_BUF_CTL_OWNED`]).
     pub(crate) ddi_buf_ctl: u32,
     /// The `DDI_BUF_CTL` readback that showed `IS_IDLE` clear.
     pub(crate) ddi_buf_ctl_readback: u32,
@@ -1314,10 +1364,19 @@ pub(crate) fn program(
     // `TRANSCONF` and that they are one register, not two.
     write(regs, pipe::PIPECONF_A, plan.transconf)?;
 
-    // 5.7 -- the DDI buffer last, then the idle poll.  Reading the register
-    // that was just written is §2.2's read-back discipline, and the poll is
-    // what establishes the device saw the enable.
-    write(regs, registers.ddi_buf_ctl, plan.ddi_buf_ctl)?;
+    // 5.7 -- the DDI buffer last, then the idle poll.  The write is a
+    // read-modify-write over the fields the plan composes
+    // ([`DDI_BUF_CTL_OWNED`]): the register also carries the board's
+    // `PORT_REVERSAL` and i915 keeps it for this exact mode, so a whole-value
+    // write would clear a lane order the firmware declared.  Reading the
+    // register that was just written is §2.2's read-back discipline, and the
+    // poll is what establishes the device saw the enable.
+    rmw(
+        regs,
+        registers.ddi_buf_ctl,
+        DDI_BUF_CTL_OWNED,
+        plan.ddi_buf_ctl,
+    )?;
     match poll(
         regs,
         registers.ddi_buf_ctl,

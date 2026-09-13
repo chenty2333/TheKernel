@@ -769,6 +769,60 @@ fn the_idle_poll_waits_for_a_ddi_that_takes_several_polls() {
     assert_eq!(state.ddi_buf_ctl_readback & DDI_BUF_CTL_IS_IDLE, 0);
 }
 
+/// `DDI_BUF_CTL`'s enable is a read-modify-write over the plan's fields, so the
+/// board's `PORT_REVERSAL` bit survives it.
+///
+/// `PORT_REVERSAL[16]` (`[I915]` `i915_reg.h:3868`) is not this sequence's to
+/// set or clear.  i915 reads it out of this same register while initialising
+/// the encoder and keeps that bit alone for `DISPLAY_VER >= 11`
+/// (`display/intel_ddi.c:5115-5120`), ORs in the VBT's lane-reversal flag
+/// (`:5124`), and composes the HDMI enable as
+/// `saved_port_bits | DDI_BUF_CTL_ENABLE` (`:3353`, written at `:3375`).  A
+/// whole-value write composed from constants would clear a lane order the
+/// firmware declared, which on a board that declares one puts the TMDS pairs
+/// on the wrong lanes.  Reference §8.4 names the field in its `DDI_BUF_CTL` row
+/// and §11 phase 5.7's write does not carry it, so this write is the one place
+/// the sequence departs from §11's step -- and only by leaving a bit alone.
+#[test]
+fn the_ddi_buffer_enable_keeps_the_port_reversal_bit() {
+    /// `DDI_BUF_PORT_REVERSAL`, `[I915]` `i915_reg.h:3868`.
+    const PORT_REVERSAL: u32 = 1 << 16;
+    /// `DDI_INIT_DISPLAY_DETECTED`, bit 0 -- the legacy presence detect §8.4
+    /// describes and this sequence deliberately does not write.
+    const PRESENCE_DETECT: u32 = 1;
+
+    let regs = ready_mock();
+    // The firmware's word: the board's lane reversal is set, and the presence
+    // detect reads set.
+    regs.set(ddi::DDI_BUF_CTL_A, PORT_REVERSAL | PRESENCE_DETECT);
+    let plan = target_plan();
+    program(&regs, &plan).expect("the mock's status bits all behave");
+
+    let (_, written) = regs
+        .writes()
+        .into_iter()
+        .find(|(name, _)| *name == "DDI_BUF_CTL(A)")
+        .expect("the sequence enables the buffer");
+    assert_eq!(
+        written,
+        plan.ddi_buf_ctl | PORT_REVERSAL | PRESENCE_DETECT,
+        "the enable write is the plan's fields over the word that was already there"
+    );
+    assert_eq!(
+        regs.read(ddi::DDI_BUF_CTL_A),
+        Some(0x8200_0016 | PORT_REVERSAL | PRESENCE_DETECT),
+        "the register keeps the board's bit and holds the plan's fields, to the literal"
+    );
+    // And the plan's own word does not carry bit 16, which is exactly why the
+    // write cannot be a whole-value one.
+    assert_eq!(plan.ddi_buf_ctl & PORT_REVERSAL, 0);
+    let log = target_plan().render();
+    assert!(
+        log.contains("PORT_REVERSAL[16]"),
+        "the plan log does not say which bit the read-modify-write keeps:\n{log}"
+    );
+}
+
 // -- the second combo PHY ---------------------------------------------------
 //
 // Which combo PHY the monitor is on is not known when this module is written:

@@ -177,7 +177,7 @@ widths with an unrelated bit set in the register to prove the read-modify-write 
 | `TRANS_CLK_SEL(A)` | `0x10000000` = `(PHY_A + 1) << 28` | §6.3 routing step 2, §11 5.4, and §3.8 for the PHY |
 | `TRANS_DDI_FUNC_CTL(A)` | `0x88030006` = `ENABLE \| SELECT_PORT(A) \| MODE_SELECT_HDMI \| BPC_8 \| PHSYNC \| PVSYNC \| PORT_WIDTH(4)` | §8.4's corrected table, §11 5.5 |
 | `TRANSCONF(A)` (`PIPECONF_A`) | `0x80000000` = `ENABLE` alone | §11 5.6 minus its status bit — §3.7 |
-| `DDI_BUF_CTL(A)` | `0x80000000 \| level << 24 \| width \| A_4_LANES` | §8.4, §11 5.7 |
+| `DDI_BUF_CTL(A)` | `0x80000000 \| level << 24 \| width \| A_4_LANES`, written **over** the register's other bits | §8.4, §11 5.7, §3.9 |
 
 `0x88030006` and `0x80000000` are `[MEASURED]` from the host test.
 
@@ -269,6 +269,59 @@ what makes that stick.
 **The reference still states one rule where there are two.** `[REF]` §6.3 routing step 2 and §11
 phase 5.4 both name the argument `port`; `intel-display-registers.md` is not this workstream's file
 and the correction is listed for the coordinator in the workstream report.
+
+### 3.9 Read-modify-write or whole value: `TRANSCONF` no, `DDI_BUF_CTL` yes
+
+The last difference the research pass found between i915 and this sequence is that i915 composes both
+of these registers from a value it read, where the module composed whole words from constants.
+`intel_enable_transcoder` reads `TRANSCONF` and writes it back with `TRANSCONF_ENABLE` OR'd in
+(`display/intel_display.c:459`, `:474-475`), and the HDMI buffer enable writes
+`saved_port_bits | DDI_BUF_CTL_ENABLE` (`display/intel_ddi.c:3353`, `:3375`), where `saved_port_bits`
+was captured while the encoder was initialised — from this same register, keeping only
+`PORT_REVERSAL` for `DISPLAY_VER >= 11` (`:5115-5120`), plus the VBT's own lane-reversal flag
+(`:5124`). The question is whether composing whole values can lose a field that matters for a
+progressive 8-bpc HDMI mode on a combo-PHY port. The two registers answer differently, and the
+difference is worth stating because "make both read-modify-write" is the wrong generalisation.
+
+**`TRANSCONF`: every field i915's read preserves is zero on this path, so the write stays whole.**
+Enumerating `[I915]`'s own field list (`i915_reg.h:1589-1645`) against the mode and the driver:
+
+| Field | Why it is zero here |
+|---|---|
+| `INTERLACE_MASK` `[23:21]` (`[22:21]` HSW+) | the mode is progressive, which is the field reading zero (§11 phase 5.6's "progressive") |
+| `BPC` `[7:5]`, `DITHER_EN` bit 4 | a pre-Haswell leftover; on Gen12 the depth and dithering are `PIPE_MISC`'s (§8.4's correction), and this kernel does not enable dithering |
+| `COLOR_RANGE_SELECT` bit 13 | i915 sets it for limited-range output (`intel_display.c:2975`, `:3205`); this kernel programs RGB full range only |
+| `PIXEL_COUNT_SCALING` `[1:0]` | `Wa_1409098942`, and i915 sets it only when DSC compression is enabled (`intel_display.c:466-473`); no DSC here |
+| `GAMMA_MODE`, `FRAME_START_DELAY`, `MSA_TIMING_DELAY`, `OUTPUT_COLORSPACE` | ilk–ivb and pre-HSW fields by their own definitions |
+| `PIPE_LOCKED`/`FORCE_BORDER` bit 25, `DSI_PLL_LOCKED` bit 29 | no writer in v6.12 (only the analog-CRT path sets `FORCE_BORDER`, `intel_crt.c:732`), and `DSI_PLL_LOCKED` is VLV pipe A |
+
+There is therefore no field to preserve: a read-modify-write would carry back zeros and the status
+bit, and the task's own rule — do not add a read-modify-write with nothing to preserve — applies. The
+whole-value write stays, and this is the cited reason. It is a decision with a condition attached: if
+this kernel ever programs limited-range output or DSC, `TRANSCONF` grows a field that another part of
+the driver owns and this paragraph stops being true.
+
+**`DDI_BUF_CTL`: `PORT_REVERSAL` is the board's, so the write is a read-modify-write.** The reference
+names the field in its `DDI_BUF_CTL` row (`[REF]` §8.4, `PORT_REVERSAL[16]`) and §11 phase 5.7's write
+does not carry it, so a whole-value write clears it. It is not a spare bit: i915 treats it as a
+property of the board's wiring, reads it out of the register itself at init, and puts it back in the
+HDMI enable for exactly this mode. On a board that declares reversed lanes, clearing it puts the TMDS
+pairs on the wrong lanes — the mode's timings would be right and the picture would not be. So
+`program` writes
+`(was & !DDI_BUF_CTL_OWNED) | plan.ddi_buf_ctl`, where `DDI_BUF_CTL_OWNED` is `ENABLE`,
+`BUF_TRANS_SELECT`, `PHY_LINK_RATE`, `PORT_WIDTH` and `A_4_LANES` — the fields §11 phase 5.7 composes.
+Everything else survives, including the read-only bits the read returned, which hardware ignores on
+write; i915 read-modify-writes this register the same way wherever it has no saved word
+(`display/icl_dsi.c:514`, `display/intel_ddi.c:3615-3618`).
+
+What this module does *not* do is decide the bit: the VBT half of i915's `saved_port_bits` needs a VBT
+read this kernel does not perform, so what is preserved is whatever the firmware left in the register
+(§7). The plan's `ddi_buf_ctl` is therefore the fields the sequence owns rather than the whole word,
+and `render` says so on its own log line.
+
+`the_ddi_buffer_enable_keeps_the_port_reversal_bit` sets bit 16 and the legacy presence detect in the
+register before the sequence runs, then asserts both the written word and the register afterwards, to
+the literal `0x8200_0016 | bit 16 | bit 0`.
 
 ## 4. The failures, and what they say
 
@@ -382,6 +435,10 @@ The module's tests assert, among other things:
 * the two transcoder-side selects carry the literals `0x10000000`/`0x20000000` for `TRANS_CLK_SEL` and
   `1 << 27`/`2 << 27` for `SELECT_PORT`, with the test stating that the PHY keying and the DDI keying
   coincide for both ports this sequence accepts, so a revert would pass it (§3.8);
+* `DDI_BUF_CTL`'s enable is a read-modify-write over the plan's fields: a `PORT_REVERSAL[16]` and a
+  presence-detect bit set in the register before the sequence runs are both still in the written word
+  and in the register afterwards, to the literal, and the plan's own word does not contain bit 16
+  (§3.9);
 * the polarity bits follow the mode in both directions and change nothing else;
 * a DDI that is not a combo-PHY port is refused before any write — including a tampered plan, which
   is how the re-check inside `program` is shown to be real;
@@ -461,6 +518,11 @@ reproducible and a revert to the Skylake path would fail rather than be believed
   by PHY on this display version, and the fix derives it from a `ComboPhy` rather than from the DDI;
   but port A→PHY A and port B→PHY B, so the word written is the same either way and no host test can
   tell the two derivations apart (§3.8). The claim rests on i915's source, not on a measurement.
+* **`PORT_REVERSAL` is preserved, never decided.** The `DDI_BUF_CTL` read-modify-write keeps whatever
+  bit 16 the firmware left in the register; i915 additionally ORs in a VBT lane-reversal flag
+  (`display/intel_ddi.c:5124`) and this kernel parses no VBT, so a board whose reversal is declared
+  only there gets the register's value rather than the VBT's. A dump taken before the first write is
+  what says whether this board sets the bit at all (§8).
 * **The two caller-supplied value sets** — the swing program and any `PHY_LINK_RATE` code — are
   untested by construction; the tests use invented numbers to exercise the write order and say so in
   the logged `source`.
