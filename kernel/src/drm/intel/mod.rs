@@ -62,6 +62,7 @@
 //! nothing else.
 
 mod clk;
+mod connect;
 pub(crate) mod debugfs;
 pub(crate) mod fb;
 mod gmbus;
