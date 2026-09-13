@@ -15,31 +15,59 @@
 //! modeset that can be tested on a machine that has no display, so it is kept
 //! where a test can reach it.
 //!
+//! # Which generation's search this is
+//!
+//! **This module implements the ADL-N search, `icl_calc_wrpll`, not the
+//! Skylake one.**  That is a change: until `fix/intel-pll-adln` it implemented
+//! `skl_ddi_calculate_wrpll`, because that was the loop the reference document
+//! had extracted first, and ADL-N does not use it at all (`[REF]` §6.3
+//! corrections 1 and 2).  The two are different functions with different
+//! answers, and the difference was measured before it was fixed: over 985
+//! symbol rates from 16 to 1000 MHz in 1 MHz steps, 114 of the 574 rates both
+//! searches could reach got a different total divider, and 12 of those put the
+//! DCO *outside* the PRM's `[7998, 10000] MHz` window -- a PLL that never
+//! locks, which the monitor shows as no signal.  The measurement is re-derived
+//! and pinned in
+//! `output::tests::pll_rs_search_is_measured_against_the_documented_adl_n_search`
+//! and recorded in `docs/design/intel-pll.md` §3.3.
+//!
+//! What the Skylake path did, and the ADL-N path does not:
+//!
+//! * three discrete central frequencies `{8400, 9000, 9600} MHz` with an
+//!   asymmetric `+1%`/`-6%` tolerance, instead of one window
+//!   `[7998, 10000] MHz` and one midpoint, 8999 MHz;
+//! * a `min_deviation == 0` early exit, instead of testing every candidate;
+//! * an even-divider list that wins outright if anything in it is accepted, so
+//!   an even divider 5.95% off its centre beat an exact odd one.  The ADL-N
+//!   list is flat, the comparison is strict `<`, and the first entry in list
+//!   order achieving the minimum distance from the midpoint wins;
+//! * a total divider of 35 in the odd list, which no PRM-legal `(P, Q, K)`
+//!   decomposes.  The ADL-N list stops at 21 and contains no 35.
+//!
 //! # Where the facts come from
 //!
-//! `docs/design/intel-display-registers.md` §6.3 is the reference.  It sources
-//! the architecture, the register fields and the DCO bounds from Intel's Tiger
-//! Lake PRM volumes, and it flags two things it could not settle:
+//! `docs/design/intel-display-registers.md` §6.3 is the reference, and its
+//! "The search -- now resolved from the implementation" is the transcription
+//! this module follows: `icl_calc_wrpll` (the window, the flat divider list and
+//! the midpoint), `icl_wrpll_get_multipliers` (the `(P, Q, K)` decomposition),
+//! the Gen12 `PDIV`/`KDIV` field positions and `icl_wrpll_ref_clock`.
 //!
-//! * the `PDIV`/`KDIV` field encoding -- `[GAP]`, §6.3 "An unresolved
-//!   discrepancy in the PDIV encoding"; and
-//! * the exact search loop, tolerance and tie-breaking -- `[GAP]`, §13.1
-//!   item 11 ("I did not extract the exact loop, tolerance and tie-breaking
-//!   rules from `skl_ddi_calculate_wrpll`").
-//!
-//! Both are settled here from the only source in the reference's set that
-//! targets **display version 13**, which is what an Alder Lake-N part is:
+//! The source behind that transcription is the only one in the reference's set
+//! that targets **display version 13**, which is what an Alder Lake-N part is:
 //! Linux v6.12 `drm/i915` (tag `v6.12`, commit
 //! `adc218676eef25575469234709c2d87185ca223a`), file
 //! `drivers/gpu/drm/i915/display/intel_dpll_mgr.c`, with register definitions
 //! in `drivers/gpu/drm/i915/i915_reg.h`.  Facts are taken from those files --
 //! symbols and line numbers are cited throughout -- and no code is copied.
 //!
-//! Settling a `[GAP]` is not the same as closing it, and this module is built
-//! so that it cannot pretend otherwise.  Where i915's *executed* path and its
-//! own *named constants* disagree, both are offered as named encodings
-//! ([`PllFieldEncoding`]), there is no default, and the disputed cases return
-//! a named error rather than a guess.  See "the encoding gap" below.
+//! §13.1 item 11 used to list the search loop as a `[GAP]` ("I did not extract
+//! the exact loop, tolerance and tie-breaking rules from
+//! `skl_ddi_calculate_wrpll`").  It is closed: the loop ADL-N uses is
+//! `icl_calc_wrpll`, and §6.3 carries it in full.
+//!
+//! One question the reference raises and this module still refuses to settle is
+//! [`PllFieldEncoding`] -- two encoders that disagree about what `CFGCR1`'s
+//! `PDIV` and `KDIV` codes mean.  See "the encoding gap" below.
 //!
 //! # The shape of the arithmetic
 //!
@@ -52,115 +80,125 @@
 //!     DCO       = afe_clock * P * Q * K
 //! ```
 //!
-//! and the search is over the integer `P * Q * K`, aiming the DCO at one of
-//! three central frequencies.  The doc's own worked example is 1080p60 over
-//! HDMI: the TMDS character rate is 148.5 MHz, so `afe_clock` is 742.5 MHz and
-//! a total divider of 12 puts the DCO at 8910 MHz, between the 8400 and 9000
-//! MHz centres.
+//! and the search is over the integer `P * Q * K`, keeping the DCO inside
+//! `[7998, 10000] MHz` and as close to that window's 8999 MHz midpoint as the
+//! candidate list allows.  The doc's own worked example is 1080p60 over HDMI:
+//! the TMDS character rate is 148.5 MHz, so `afe_clock` is 742.5 MHz and a
+//! total divider of 12 puts the DCO at 8910 MHz, 89 MHz below the midpoint.
+//! It is also the only in-window candidate at that rate, so the midpoint rule
+//! is not what picks it there -- see the worked-example test.
 //!
 //! # The encoding gap
 //!
-//! `CFGCR1` holds `P` and `K` as small codes, and there are two mutually
-//! inconsistent accounts of what those codes are:
+//! `CFGCR1` holds `P` and `K` as small codes, and this module offers **two**
+//! accounts of what those codes are, as [`PllFieldEncoding`], with no default.
+//! They are not two readings of one generation; they are two generations'
+//! encoders that share a struct in i915:
 //!
-//! * [`PllFieldEncoding::Executed`] -- what i915 actually writes.  Its values
-//!   come from `skl_wrpll_params_populate` (`intel_dpll_mgr.c:1592-1658`),
-//!   which encodes `P` over the candidate set `{1,2,3,7}` and `K` over
-//!   `{5,2,3,1}`.
-//! * [`PllFieldEncoding::Named`] -- what i915's constants say.  `i915_reg.h`
-//!   defines `DPLL_CFGCR1_PDIV_{2,3,5,7}` as `{1,2,4,8} << 2`
-//!   (`i915_reg.h:4293-4296`) and `DPLL_CFGCR1_KDIV_{1,2,3}` as
-//!   `{1,2,4} << 6` (`i915_reg.h:4287-4289`), matching the PRM's `P ∈
-//!   {2,3,5,7}`, `K ∈ {1,2,3}`.
+//! * [`PllFieldEncoding::Named`] -- what i915's Gen12 constants say, and what
+//!   ADL-N's own encoder writes.  `i915_reg.h` defines `DPLL_CFGCR1_PDIV_{2,3,5,7}`
+//!   as `{1,2,4,8} << 2` (`i915_reg.h:4293-4296`) and `DPLL_CFGCR1_KDIV_{1,2,3}`
+//!   as `{1,2,4} << 6` (`i915_reg.h:4287-4289`), matching the PRM's
+//!   `P ∈ {2,3,5,7}`, `K ∈ {1,2,3}`.  `icl_wrpll_params_populate`
+//!   (`intel_dpll_mgr.c:2546-2570`) emits exactly those values, and the read
+//!   path `icl_ddi_combo_pll_get_freq` decodes with the same constants, so on
+//!   this platform write and read round-trip.
+//! * [`PllFieldEncoding::Executed`] -- the codes `skl_wrpll_params_populate`
+//!   writes (`intel_dpll_mgr.c:1592-1658`), which are the *Skylake*
+//!   `DPLL_CFGCR2` convention: `P` over `{1,2,3,7}` and `K` over `{5,2,3,1}`.
+//!   ADL-N does not call that function.  The variant is kept because it is the
+//!   other convention the reference records and because §6.3's "trap" section
+//!   is about telling the two apart: they write the same `struct
+//!   skl_wrpll_params`, so nothing in i915's source stops one generation's
+//!   encoder being handed to the other's decoder.
 //!
-//! The two disagree on **every** `K` and on `P = 7`.  The reason is now clear
-//! and is worth writing down, because the reference document could only
-//! observe the symptom: `skl_wrpll_params_populate`'s candidate sets and codes
-//! are exactly the *Skylake* `DPLL_CFGCR2` convention -- compare
-//! `DPLL_CFGCR2_KDIV_{5,2,3,1} = {0,1,2,3} << 5` and
-//! `DPLL_CFGCR2_PDIV_{1,2,3,7} = {0,1,2,4} << 2` at `i915_reg.h:4141-4150` --
-//! and `icl_calc_dpll_state` (`intel_dpll_mgr.c:2884-2909`) shifts those
-//! Skylake-convention values straight into the Gen12 `CFGCR1` positions.
-//! i915 then reads them back with the Gen12 named-constant convention in
-//! `icl_ddi_combo_pll_get_freq` (`intel_dpll_mgr.c:1740-1802`), so its own
-//! write and read disagree.  Both conventions are still present in mainline.
+//! The two disagree on **every** `K` and on `P = 7`.  This module therefore
+//! refuses to choose: there is no `Default`, and a divider set with no code
+//! under the requested encoding returns [`PllError::DividerNotEncodable`] rather
+//! than a value nobody can justify.  That refusal is live rather than
+//! theoretical: the ADL-N decomposition reaches `P = 5` (a 360 MHz symbol rate
+//! puts the odd divider 5 exactly on 9000 MHz), which `Named` codes as `4 << 2`
+//! and `Executed` has no case for at all -- i915's Skylake encoder hits
+//! `default: WARN(1, "Incorrect PDiv")` and silently leaves a zero-initialised
+//! `pdiv`, which is `P = 1`.
 //!
-//! This module therefore refuses to choose.  `P = 7` and `P = 5` are the cases
-//! where the two encodings differ in *which* `P` they can express at all, and
-//! they return [`PllError::DividerNotEncodable`] under the encoding that has no
-//! code for them, rather than emitting a value nobody can justify.
+//! Which one a caller should write is a hardware question.  `[REF]` §6.3's
+//! route 2 says to mirror `icl_wrpll_get_multipliers` + `icl_wrpll_params_populate`
+//! -- the `Named` pair -- and **verify by read-back** before enabling, and
+//! `PllRegisters::symbol_rate_hz` is that read-back.
 //!
 //! # What has not been checked
 //!
 //! No value from this module has been written to, or read from, real silicon.
-//! The arithmetic is checked against i915 v6.12's own, and the published
-//! modelines below are checked against the numbers the timing tables carry, but
-//! that is a host test against a published reference, not a measurement.  The
-//! reference document's §13.4 recommendation stands: read `DPLL0_CFGCR0` and
-//! `DPLL0_CFGCR1` from a firmware-programmed working mode and diff them against
-//! what this module computes for the same mode before trusting either.
+//! The arithmetic is checked against i915 v6.12's own and against the published
+//! modelines, but that is a host test against a published reference, not a
+//! measurement of a PLL.  The reference document's §13.4 recommendation stands:
+//! read `DPLL0_CFGCR0` and `DPLL0_CFGCR1` from a firmware-programmed working
+//! mode and diff them against what this module computes for the same mode
+//! before trusting either.
+//!
+//! The search change on `fix/intel-pll-adln` is a change of *algorithm*, taken
+//! from the reference's transcription and checked against i915 v6.12's
+//! `icl_calc_wrpll` and `icl_wrpll_get_multipliers` in that file.  It is not
+//! evidence that the ADL-N PLL locks where this module now aims it; that is
+//! what §13.4's read-back is for.
 
 use core::fmt;
 
-/// The DCO central frequencies the divider search aims at, in kHz.
-///
-/// `[I915]` `skl_ddi_calculate_wrpll` (`intel_dpll_mgr.c:1665-1667`) holds
-/// `{8400, 9000, 9600} MHz` as `dco_central_freq`.  The reference document
-/// (§6.3, "The search bounds") separately quotes the PRM's *window*
-/// `[7998 MHz, 10000 MHz]` with a 8999 MHz midpoint; the two framings are
-/// compatible in spirit but not identical, and this module implements i915's
-/// because i915 is the only source in the set that targets display 13.  Both
-/// are available, so the difference can be seen rather than assumed: see
-/// [`PRM_DCO_MIN_KHZ`], [`PRM_DCO_MAX_KHZ`] and the
-/// `the_two_dco_framings_really_do_differ` test.
-/// The search is done in Hz throughout.  Mixing it with the kHz the rest of
-/// the module reports in is how a deviation comes out a thousand times too
-/// large and every candidate is rejected, so the unit is in the name.
-const DCO_CENTRAL_FREQ_HZ: [u64; 3] = [8_400_000_000, 9_000_000_000, 9_600_000_000];
-
-/// The PRM's DCO window, in kHz, for cross-checking a candidate divider.
+/// The PRM's DCO window, in kHz.
 ///
 /// `docs/design/intel-display-registers.md` §6.3: "DCO ∈ [7998 MHz, 10000 MHz],
-/// midpoint 8999 MHz", quoted from `[TGL12]` Clocks → combo PHY PLL.  This is
-/// *not* what the search uses -- [`DCO_CENTRAL_FREQ_KHZ`] and the deviation
-/// limits are -- but a candidate outside this window is worth reporting,
-/// because the PRM is the only source that states a hard bound.
+/// midpoint 8999 MHz", quoted from `[TGL12]` Clocks → combo PHY PLL.  i915's
+/// `icl_calc_wrpll` carries the same two numbers as `dco_min = 7998000` and
+/// `dco_max = 10000000` (`display/intel_dpll_mgr.c:2785-2786`), so the PRM and
+/// the implementation agree and there is nothing to choose between them.
+///
+/// **The search enforces this window.**  A candidate whose DCO falls outside it
+/// is rejected outright, so no divider set this module returns can put the DCO
+/// where the PLL does not lock.  Before `fix/intel-pll-adln` these two
+/// constants were only reported, and the Skylake search returned 12 divisible
+/// rates out of 985 whose DCO they do not cover.
 pub(crate) const PRM_DCO_MIN_KHZ: u64 = 7_998_000;
 
 /// The upper end of the PRM's DCO window.  See [`PRM_DCO_MIN_KHZ`].
 pub(crate) const PRM_DCO_MAX_KHZ: u64 = 10_000_000;
 
-/// Total dividers i915 tries on the even path, in the order it tries them.
+/// The lower end of the search's window, in Hz.
+const DCO_MIN_HZ: u64 = PRM_DCO_MIN_KHZ * 1000;
+
+/// The upper end of the search's window, in Hz.
+const DCO_MAX_HZ: u64 = PRM_DCO_MAX_KHZ * 1000;
+
+/// The DCO the search aims at, in Hz.
 ///
-/// `[I915]` `skl_ddi_calculate_wrpll` (`intel_dpll_mgr.c:1668-1672`)
-/// `even_dividers[]`.  The list is not every even number: it is exactly the
-/// even numbers whose half decomposes under
-/// `skl_wrpll_get_multipliers`, so every entry has a `(P, Q, K)`.  That is
-/// checked by the `every_candidate_divider_decomposes` test rather than assumed.
-const EVEN_TOTAL_DIVIDERS: &[u32] = &[
-    4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 30, 32, 36, 40, 42, 44, 48, 52, 54, 56, 60, 64, 66,
-    68, 70, 72, 76, 78, 80, 84, 88, 90, 92, 96, 98,
+/// `[I915]` `icl_calc_wrpll` (`display/intel_dpll_mgr.c:2787`):
+/// `dco_mid = (dco_min + dco_max) / 2`, so `(7998 + 10000) / 2 = 8999` MHz --
+/// the PRM's "midpoint 8999".  The Skylake path this module used to implement
+/// had three discrete central frequencies instead; §6.3: "**ADL-N takes the
+/// midpoint form, not the three-frequency form.**"
+const DCO_MIDPOINT_HZ: u64 = (PRM_DCO_MIN_KHZ + PRM_DCO_MAX_KHZ) / 2 * 1000;
+
+/// The total dividers `icl_calc_wrpll` tries, in the order it tries them.
+///
+/// `[I915]` `icl_calc_wrpll` (`display/intel_dpll_mgr.c:2788-2793`), which §6.3
+/// transcribes.  It is a **single flat list** -- the forty even entries first,
+/// then the six odd ones -- and not the Skylake `even_dividers` +
+/// `odd_dividers` pair: it starts at 2 where the Skylake list starts at 4, and
+/// it stops at 21, so the Skylake-only total divider 35 -- the one with no
+/// PRM-legal `(P, Q, K)` -- is not in it.
+///
+/// The order is behaviour and not presentation: the comparison in
+/// [`search_total_divider`] is strict, so the first entry in this order
+/// achieving the minimum distance from the midpoint wins.
+///
+/// Every entry decomposes under [`icl_wrpll_get_multipliers`], and every
+/// decomposition satisfies the PRM's `P`/`Q`/`K` bounds.  The
+/// `every_candidate_divider_decomposes` test proves both rather than assuming
+/// them.
+const ADL_N_TOTAL_DIVIDERS: &[u32] = &[
+    2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 30, 32, 36, 40, 42, 44, 48, 50, 52, 54, 56, 60, 64,
+    66, 68, 70, 72, 76, 78, 80, 84, 88, 90, 92, 96, 98, 100, 102, 3, 5, 7, 9, 15, 21,
 ];
-
-/// Total dividers i915 tries on the odd path.
-///
-/// `[I915]` `skl_ddi_calculate_wrpll` (`intel_dpll_mgr.c:1673`)
-/// `odd_dividers[]`.
-const ODD_TOTAL_DIVIDERS: &[u32] = &[3, 5, 7, 9, 15, 21, 35];
-
-/// The most a candidate DCO may sit **above** the central frequency it aims at,
-/// in units of 0.01%.
-///
-/// `[I915]` `SKL_DCO_MAX_PDEVIATION` (`intel_dpll_mgr.c:1501`), with the
-/// comment "DCO freq must be within +1%/-6% of the DCO central freq"
-/// (`intel_dpll_mgr.c:1500`).  The deviation is computed in hundredths of a
-/// percent, so 100 is 1.00%.
-const DCO_MAX_POSITIVE_DEVIATION: u64 = 100;
-
-/// The most a candidate DCO may sit **below** the central frequency it aims at,
-/// in units of 0.01%.  See [`DCO_MAX_POSITIVE_DEVIATION`].  `[I915]`
-/// `SKL_DCO_MAX_NDEVIATION` (`intel_dpll_mgr.c:1502`).
-const DCO_MAX_NEGATIVE_DEVIATION: u64 = 600;
 
 /// How far the achieved symbol rate may sit from the requested one, in parts
 /// per billion, before the search refuses its own answer.
@@ -170,10 +208,10 @@ const DCO_MAX_NEGATIVE_DEVIATION: u64 = 600;
 /// * K` returns the requested symbol rate exactly.  The only error is the
 /// quantisation of `DCO_FRACTION`, which has 15 bits and therefore steps by
 /// `ref / 0x8000`: 24 MHz / 32768 = 732 Hz at the largest reference this part
-/// uses, against a DCO of at least 7896 MHz, which is 93 parts per billion.
-/// 1000 ppb (1 ppm) is ten times that bound, so a solution that trips it is a
-/// bug in this module rather than a hardware limit -- which is the point of
-/// checking.
+/// uses, against a DCO of at least 7998 MHz, which is under 92 parts per
+/// billion.  1000 ppb (1 ppm) is ten times that bound, so a solution that trips
+/// it is a bug in this module rather than a hardware limit -- which is the
+/// point of checking.
 const MAX_SYMBOL_RATE_ERROR_PPB: u64 = 1000;
 
 /// The `SKL_DSSM` register's reference-clock field, as a mask.
@@ -254,22 +292,31 @@ impl ComboPhy {
     }
 }
 
-/// Which of the two mutually inconsistent `CFGCR1` field encodings to use.
+/// Which of the two `CFGCR1` field encodings to write.
 ///
 /// There is deliberately no `Default`.  Choosing one silently is the failure
 /// this type exists to prevent; see the module documentation's "the encoding
 /// gap", and `docs/design/intel-pll.md` for the full argument.
+///
+/// These are not two readings of one generation's encoder: they are the
+/// **Skylake** encoder's codes and the **Gen12** encoder's codes, which i915
+/// keeps in two functions that write the same struct.  ADL-N runs the Gen12
+/// one, so [`Self::Named`] is what this platform's i915 writes; [`Self::Executed`]
+/// is retained because it is the other sourced convention and telling them
+/// apart is the exercise `[REF]` §6.3's "trap" section sets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PllFieldEncoding {
-    /// The codes i915's `skl_wrpll_params_populate` actually writes
+    /// The codes `skl_wrpll_params_populate` writes
     /// (`intel_dpll_mgr.c:1611-1643`): `P` over `{1,2,3,7}` and `K` over
-    /// `{5,2,3,1}`.  These are the Skylake `DPLL_CFGCR2` codes, reused for
-    /// Gen12 without translation.
+    /// `{5,2,3,1}`.  These are the Skylake `DPLL_CFGCR2` codes, and ADL-N does
+    /// not go through this function at all.
     Executed,
-    /// The codes i915's named constants define (`i915_reg.h:4287-4296`): `P`
-    /// over `{2,3,5,7}` and `K` over `{1,2,3}`, which are the value sets the
-    /// PRM states.  This is also the convention i915's own read-back path,
-    /// `icl_ddi_combo_pll_get_freq`, decodes with.
+    /// The codes i915's Gen12 named constants define (`i915_reg.h:4287-4296`):
+    /// `P` over `{2,3,5,7}` and `K` over `{1,2,3}`, which are the value sets
+    /// the PRM states.  `icl_wrpll_params_populate` (`intel_dpll_mgr.c:2546-2570`)
+    /// emits exactly these, and i915's own read-back path,
+    /// `icl_ddi_combo_pll_get_freq`, decodes with them, so this is the
+    /// convention the ADL-N path writes and reads.
     Named,
 }
 
@@ -340,29 +387,28 @@ pub(crate) enum PllError {
     /// something this module can do arithmetic for, so it says so instead of
     /// trying.
     UnsupportedReference { ref_khz: u32 },
-    /// No divider in the sourced candidate lists put the DCO within the
-    /// documented tolerance of any central frequency.
+    /// No divider in the sourced candidate list put the DCO inside the PRM's
+    /// documented window.
     ///
     /// This is the honest answer for a pixel clock the PLL cannot make, and it
     /// is deliberately an error rather than the nearest divider: a silently
     /// wrong pixel clock is a monitor that shows nothing.
-    NoLegalDividerSet {
-        symbol_rate_khz: u32,
-        ref_khz: u32,
-    },
-    /// A divider i915's lists contain could not be decomposed into `(P, Q, K)`.
+    NoLegalDividerSet { symbol_rate_khz: u32, ref_khz: u32 },
+    /// A divider i915's list contains could not be decomposed into `(P, Q, K)`.
     ///
-    /// `skl_wrpll_get_multipliers` leaves its outputs untouched for a divider
-    /// it does not recognise, which the caller zero-initialised; i915 then
-    /// warns and programs a zero.  Every entry of the two lists does decompose
-    /// (the `every_candidate_divider_decomposes` test checks exactly that), so
-    /// this is a guard against a list being edited, not a reachable state.
+    /// `icl_wrpll_get_multipliers` leaves its outputs untouched for a divider
+    /// no branch matches, which the caller zero-initialised; i915 then programs
+    /// a zero.  Every entry of the list does decompose (the
+    /// `every_candidate_divider_decomposes` test checks exactly that), so this
+    /// is a guard against a list being edited, not a reachable state.
     DividerNotDecomposable { total_divider: u32 },
     /// The chosen divider set has no code in the requested field encoding.
     ///
-    /// This is the encoding `[GAP]` of §6.3 surfaced as a value rather than
-    /// hidden: `P = 5` has no `Executed` code (i915 warns "Incorrect PDiv" and
-    /// programs whatever `pdiv` was left as), and `K = 5` has no `Named` code
+    /// This is the encoding question of §6.3 surfaced as a value rather than
+    /// hidden: `P = 5` is reachable from the ADL-N search and has no code in
+    /// the Skylake `Executed` encoder (i915 warns "Incorrect PDiv" and programs
+    /// whatever `pdiv` was left as), and `K = 5` -- which the Skylake
+    /// decomposition produced and the ADL-N one cannot -- has no `Named` code
     /// (and is not a legal `K` in the PRM's `K ∈ {1,2,3}` at all).
     DividerNotEncodable {
         /// The post divider `P` that could not be coded.
@@ -408,16 +454,16 @@ impl fmt::Display for PllError {
             Self::ZeroReference => f.write_str("the reference frequency is zero"),
             Self::UnsupportedReference { ref_khz } => write!(
                 f,
-                "a reference of {ref_khz} kHz is not one a Gen12 combo PHY PLL is strapped to \
-                 (24 MHz, 19.2 MHz and 38.4 MHz are the ones i915 decodes from SKL_DSSM)"
+                "a reference of {ref_khz} kHz is not one a Gen12 combo PHY PLL is strapped to (24 \
+                 MHz, 19.2 MHz and 38.4 MHz are the ones i915 decodes from SKL_DSSM)"
             ),
             Self::NoLegalDividerSet {
                 symbol_rate_khz,
                 ref_khz,
             } => write!(
                 f,
-                "no divider in the sourced candidate lists puts the DCO within tolerance of a \
-                 central frequency for a {symbol_rate_khz} kHz symbol rate at a {ref_khz} kHz \
+                "no divider in the sourced candidate list puts the DCO inside the PRM's [7998, \
+                 10000] MHz window for a {symbol_rate_khz} kHz symbol rate at a {ref_khz} kHz \
                  reference; the pixel clock is outside what this PLL can make"
             ),
             Self::DividerNotDecomposable { total_divider } => write!(
@@ -432,14 +478,17 @@ impl fmt::Display for PllError {
             } => write!(
                 f,
                 "the divider set (P={p}, K={k}) has no code for {field:?} under the {encoding} \
-                 encoding; this is the PDIV/KDIV gap the register reference flags in §6.3 and it \
-                 must be settled by hardware read-back, not guessed"
+                 encoding; these are the two encoders §6.3 warns share one struct, and which one \
+                 the hardware implements must be settled by read-back, not guessed"
             ),
             Self::FieldOverflow { field, value, bits } => write!(
                 f,
                 "{field:?} value {value} does not fit its {bits}-bit register field"
             ),
-            Self::AchievedRateOutOfTolerance { error_ppb, limit_ppb } => write!(
+            Self::AchievedRateOutOfTolerance {
+                error_ppb,
+                limit_ppb,
+            } => write!(
                 f,
                 "the registers would produce a symbol rate {error_ppb} ppb from the request, \
                  beyond this module's {limit_ppb} ppb tolerance"
@@ -528,7 +577,15 @@ impl DdiPllDividers {
         self.k
     }
 
-    /// The central frequency the chosen DCO was aimed at, in kHz.
+    /// The DCO the search aimed at, in kHz.
+    ///
+    /// **On the ADL-N path this is always 8999 MHz**, the midpoint of the PRM's
+    /// `[7998, 10000] MHz` window (`[I915]` `icl_calc_wrpll`,
+    /// `intel_dpll_mgr.c:2787`).  The name is the Skylake path's, which had
+    /// three central frequencies `{8400, 9000, 9600} MHz` instead of one
+    /// midpoint; §6.3 records that ADL-N takes the midpoint form.  A caller
+    /// that wants the *chosen* frequency wants [`Self::target_dco_khz`]; this
+    /// is the fixed point the choice was measured against.
     pub(crate) const fn central_freq_khz(&self) -> u64 {
         self.central_freq_khz
     }
@@ -538,7 +595,13 @@ impl DdiPllDividers {
         self.target_dco_khz
     }
 
-    /// How far the chosen DCO sits from its central frequency, in 0.01%.
+    /// How far the chosen DCO sits from the midpoint above, in 0.01%.
+    ///
+    /// This is the quantity the ADL-N search minimises: i915 computes
+    /// `dco_centrality = abs(dco - dco_mid)` (`intel_dpll_mgr.c:2802`) and
+    /// keeps the smallest.  A larger figure is a DCO further from the middle of
+    /// the band, not an out-of-tolerance one -- the window is enforced
+    /// separately and cannot be violated.
     pub(crate) const fn deviation_centipercent(&self) -> u64 {
         self.deviation_centipercent
     }
@@ -577,10 +640,17 @@ impl DdiPllDividers {
 
     /// Whether the chosen DCO is inside the PRM's `[7998, 10000] MHz` window.
     ///
-    /// i915's deviation rule and the PRM's window are not the same test, and a
-    /// candidate can satisfy one and not the other; see
-    /// [`PRM_DCO_MIN_KHZ`].  This is reported rather than enforced, because the
-    /// search follows i915.
+    /// **This is now an invariant rather than a report.**  The ADL-N search
+    /// rejects a candidate outside the window before it looks at the distance
+    /// from the midpoint (`icl_calc_wrpll`'s `dco <= dco_max && dco >= dco_min`,
+    /// `intel_dpll_mgr.c:2801`), so every divider set that exists at all is
+    /// inside it, and a rate with no in-window candidate is
+    /// [`PllError::NoLegalDividerSet`] instead.  The accessor is kept because
+    /// the property is the whole point of the ADL-N search and the sweep test
+    /// asserts it on every answer.
+    ///
+    /// The Skylake search this module used to implement did *not* have this
+    /// property; see [`PRM_DCO_MIN_KHZ`].
     pub(crate) const fn inside_prm_dco_window(&self) -> bool {
         self.target_dco_khz >= PRM_DCO_MIN_KHZ && self.target_dco_khz <= PRM_DCO_MAX_KHZ
     }
@@ -589,18 +659,21 @@ impl DdiPllDividers {
     /// if any.
     ///
     /// The PRM states `P ∈ {2,3,5,7}`, `K ∈ {1,2,3}`, `Q ∈ 1..255` and
-    /// "`K != 2 ⇒ Q = 1`" (reference document §6.3, "The search bounds").  The
-    /// divider i915 picks does **not** always satisfy them: its decomposition
-    /// can produce `K = 5`, which is not a legal `K` at all, and `total = 35`
-    /// has no legal decomposition whatsoever.
+    /// "`K != 2 ⇒ Q = 1`" (reference document §6.3, "The search bounds").
+    /// `icl_wrpll_get_multipliers` satisfies all of them by construction, and
+    /// the `every_candidate_divider_decomposes` test checks that this function
+    /// agrees with it for every candidate divider -- so on the ADL-N path this
+    /// is a *check* on the decomposition rather than a substitute for it.
     ///
-    /// This is a *report*, not a substitution.  Returning a different triple
-    /// here and programming it would replace the only display-13 implementation
-    /// that exists with this module's reading of a PRM for a different
-    /// generation, which is exactly the kind of swap that cannot be debugged on
-    /// a machine with no serial port.  A caller that wants to know whether the
-    /// divider it is about to program is PRM-legal asks this; a caller that
-    /// wants what i915 would write asks [`Self::p`] and friends.
+    /// It did not always agree: the Skylake decomposition this module used to
+    /// carry produced `K = 5` (which the PRM does not define) for the total
+    /// divider 10, and the Skylake list contained 35, which has no PRM-legal
+    /// decomposition at all.  `[REF]` §6.3's "Two more facts" and §13.1 item 11
+    /// record why: neither the list nor the decomposition is ADL-N's.
+    ///
+    /// This is still a *report*, not a substitution: a caller that wants to
+    /// know whether the divider it is about to program is PRM-legal asks this;
+    /// a caller that wants what i915 would write asks [`Self::p`] and friends.
     pub(crate) fn prm_legal_divider_set(&self) -> Option<(u32, u32, u32)> {
         prm_legal_divider_set(self.total_divider)
     }
@@ -757,9 +830,9 @@ pub(crate) fn wrpll_reference_khz(platform_ref_khz: u32) -> Result<u32, PllError
 /// The DDI PLL dividers for a pixel clock on an HDMI/DVI port.
 ///
 /// For HDMI the TMDS character rate equals the pixel clock, so the symbol rate
-/// this needs is the pixel clock itself: `[I915]` `skl_ddi_calculate_wrpll`
-/// takes `crtc_state->port_clock` and sets `afe_clock = clock * 1000 * 5`
-/// (`intel_dpll_mgr.c:1686`), which is the same statement.  That is the case
+/// this needs is the pixel clock itself: `[I915]` `icl_calc_wrpll` takes
+/// `crtc_state->port_clock` and sets `afe_clock = crtc_state->port_clock * 5`
+/// (`intel_dpll_mgr.c:2784`), which is the same statement.  That is the case
 /// the reference document §6.3 works through, and it is the case a first
 /// light-up on this machine uses.
 ///
@@ -779,15 +852,16 @@ pub(crate) fn ddi_pll_dividers(
 /// The DDI PLL dividers for an arbitrary symbol rate.
 ///
 /// This is the real entry point; [`ddi_pll_dividers`] is the HDMI convenience
-/// wrapper over it.  The search reproduces i915's `skl_ddi_calculate_wrpll`
-/// (`intel_dpll_mgr.c:1660-1730`) exactly, including its preference for an even
-/// total divider, because that `[GAP]` -- §13.1 item 11 -- is the one thing the
-/// reference document could not extract and this is the only display-13 source
-/// that has it.
+/// wrapper over it.  The search is i915's `icl_calc_wrpll`
+/// (`intel_dpll_mgr.c:2779-2820`) and the decomposition is
+/// `icl_wrpll_get_multipliers` (`:2507-2543`), which is what ADL-N runs;
+/// `docs/design/intel-display-registers.md` §6.3 transcribes both, and §13.1
+/// item 11 -- the `[GAP]` that said the search loop had not been extracted -- is
+/// closed by that transcription.
 ///
-/// The returned error is the honest one: when no candidate is legal this says
-/// so, instead of returning the nearest divider and a pixel clock nobody asked
-/// for.
+/// The returned error is the honest one: when no candidate puts the DCO inside
+/// the PRM's window this says so, instead of returning the nearest divider and
+/// a pixel clock nobody asked for.
 pub(crate) fn ddi_pll_dividers_for_symbol_rate(
     symbol_rate_khz: u32,
     ref_khz: u32,
@@ -799,29 +873,37 @@ pub(crate) fn ddi_pll_dividers_for_symbol_rate(
     let wrpll_ref_khz = wrpll_reference_khz(ref_khz)?;
 
     // `afe_clock` is 5x the symbol rate, in Hz.  u64 throughout: the largest
-    // DCO this can produce is 98 * 5 * 646 MHz, about 3.2e11, which is well
-    // inside a u64 and far outside the u32 a register field would hold -- which
-    // is why `dco_integer` is range-checked before it is handed back.
+    // DCO the search can return is the window's 10 GHz, which is well inside a
+    // u64 and far outside the u32 a register field would hold -- which is why
+    // `dco_integer` is range-checked before it is handed back.
     let afe_clock_hz = 5 * u64::from(symbol_rate_khz) * 1000;
 
-    let chosen = search_total_divider(afe_clock_hz)
-        .ok_or(PllError::NoLegalDividerSet {
-            symbol_rate_khz,
-            ref_khz,
-        })?;
+    let chosen = search_total_divider(afe_clock_hz).ok_or(PllError::NoLegalDividerSet {
+        symbol_rate_khz,
+        ref_khz,
+    })?;
 
-    let (p, q, k) = decompose(chosen.total_divider)
-        .ok_or(PllError::DividerNotDecomposable {
+    let (p, q, k) = icl_wrpll_get_multipliers(chosen.total_divider).ok_or(
+        PllError::DividerNotDecomposable {
             total_divider: chosen.total_divider,
-        })?;
+        },
+    )?;
 
-    let target_dco_hz = u64::from(chosen.total_divider) * afe_clock_hz;
+    let target_dco_hz = chosen.dco_hz;
     let ref_hz = u64::from(wrpll_ref_khz) * 1000;
     let dco_integer = target_dco_hz / ref_hz;
     let dco_fraction = ((target_dco_hz % ref_hz) * 0x8000) / ref_hz;
 
-    let dco_integer = field_value(u32::try_from(dco_integer).unwrap_or(u32::MAX), 10, PllDividerField::DcoInteger)?;
-    let dco_fraction = field_value(u32::try_from(dco_fraction).unwrap_or(u32::MAX), 15, PllDividerField::DcoFraction)?;
+    let dco_integer = field_value(
+        u32::try_from(dco_integer).unwrap_or(u32::MAX),
+        10,
+        PllDividerField::DcoInteger,
+    )?;
+    let dco_fraction = field_value(
+        u32::try_from(dco_fraction).unwrap_or(u32::MAX),
+        15,
+        PllDividerField::DcoFraction,
+    )?;
 
     // What the registers will really produce, which is the target DCO rounded
     // down to the fraction's resolution.
@@ -849,9 +931,9 @@ pub(crate) fn ddi_pll_dividers_for_symbol_rate(
         p,
         q,
         k,
-        central_freq_khz: chosen.central_freq_hz / 1000,
+        central_freq_khz: DCO_MIDPOINT_HZ / 1000,
         target_dco_khz: target_dco_hz / 1000,
-        deviation_centipercent: chosen.deviation,
+        deviation_centipercent: chosen.centrality_centipercent,
         dco_integer,
         dco_fraction,
         achieved_dco_hz,
@@ -860,136 +942,110 @@ pub(crate) fn ddi_pll_dividers_for_symbol_rate(
     })
 }
 
-/// A divider the search accepted, and why.
+/// A divider the search accepted, and the arithmetic behind it.
 #[derive(Clone, Copy, Debug)]
 struct Chosen {
+    /// The total divider `P * Q * K`.
     total_divider: u32,
-    central_freq_hz: u64,
-    deviation: u64,
+    /// The DCO that divider produces, in Hz: `total_divider * afe_clock`.
+    dco_hz: u64,
+    /// `|DCO - midpoint|`, in Hz.  This is the quantity the search minimises.
+    centrality_hz: u64,
+    /// The same distance as a fraction of the midpoint, in 0.01%.
+    centrality_centipercent: u64,
 }
 
-/// The search state, mirroring i915's `struct skl_wrpll_context`
-/// (`intel_dpll_mgr.c:1493-1498`).
+/// i915's `icl_calc_wrpll` search (`intel_dpll_mgr.c:2779-2820`), which §6.3
+/// transcribes and which is the loop ADL-N actually runs.
 ///
-/// `total_divider == 0` means "nothing accepted yet", which is how i915 uses
-/// `ctx.p`; the field is not a divider value in that case.
-#[derive(Clone, Copy, Debug)]
-struct Search {
-    min_deviation: u64,
-    central_freq_hz: u64,
-    total_divider: u32,
-    deviation: u64,
-}
-
-/// i915's `skl_wrpll_try_divider` (`intel_dpll_mgr.c:1504-1531`).
+/// The loop structure is behaviour, and none of it is the Skylake loop:
 ///
-/// Both frequencies are in Hz.  The deviation is a ratio, so its unit cancels;
-/// what does not cancel is the *comparison*, and a kHz DCO against a Hz centre
-/// would be a thousand times off.
-fn try_divider(search: &mut Search, central_freq_hz: u64, dco_hz: u64, total_divider: u32) {
-    let deviation = 10_000 * central_freq_hz.abs_diff(dco_hz) / central_freq_hz;
-    let within_tolerance = if dco_hz >= central_freq_hz {
-        deviation < DCO_MAX_POSITIVE_DEVIATION
-    } else {
-        deviation < DCO_MAX_NEGATIVE_DEVIATION
-    };
-    if within_tolerance && deviation < search.min_deviation {
-        search.min_deviation = deviation;
-        search.central_freq_hz = central_freq_hz;
-        search.total_divider = total_divider;
-        search.deviation = deviation;
-    }
-}
-
-/// i915's `skl_ddi_calculate_wrpll` search (`intel_dpll_mgr.c:1681-1718`),
-/// including both of its tie-breaks.
+/// * **every** candidate in the flat list is tested; there is no
+///   `min_deviation == 0` early exit on this path, so the answer does not
+///   depend on the order candidates are enumerated in beyond the tie-break
+///   below;
+/// * a candidate whose DCO is outside `[7998000, 10000000]` kHz is skipped
+///   *before* its distance is considered
+///   (`dco <= dco_max && dco >= dco_min`, `intel_dpll_mgr.c:2801`), so the
+///   search cannot return an out-of-window DCO even when that DCO would be
+///   closer to the midpoint -- which is why the returned error for a rate with
+///   no in-window candidate is [`PllError::NoLegalDividerSet`] and not a
+///   nearest-divider guess;
+/// * the comparison is strict `<` against the best so far, which i915
+///   initialises to `U32_MAX` with the comment "Spec meaning of 999999 MHz"
+///   (`intel_dpll_mgr.c:2795`).  The **first** entry in list order achieving
+///   the minimum distance therefore wins.  That is the smallest even divider on
+///   a tie between evens, and the even one on a tie between an even and an odd
+///   divider, because the evens come first in the list -- a genuine tie-break,
+///   not the Skylake path's "any even divider beats every odd one".
 ///
-/// The loop structure is copied as *behaviour* and matters:
-///
-/// * a candidate whose deviation is exactly zero ends the search immediately,
-///   across all three central frequencies; and
-/// * if **any** even total divider was accepted, the odd list is never tried --
-///   "If a solution is found with an even divider, prefer this one"
-///   (`intel_dpll_mgr.c:1709-1714`).
-///
-/// The second rule is strong enough to be surprising: it prefers an even
-/// divider with a deviation of 5.95% over an odd one that is exact.  The
-/// `an_even_divider_wins_even_when_an_odd_one_is_exact` test pins that, because
-/// a well-meaning "fix" here would silently change which pixel clock the
-/// machine produces.
+/// The search is done in Hz throughout.  Mixing it with the kHz the rest of the
+/// module reports in is how a distance comes out a thousand times too large and
+/// every candidate is rejected, so the unit is in the name.
 fn search_total_divider(afe_clock_hz: u64) -> Option<Chosen> {
-    let mut search = Search {
-        min_deviation: u64::MAX,
-        central_freq_hz: 0,
-        total_divider: 0,
-        deviation: 0,
-    };
-
-    for (index, dividers) in [EVEN_TOTAL_DIVIDERS, ODD_TOTAL_DIVIDERS]
-        .into_iter()
-        .enumerate()
-    {
-        let mut exact = false;
-        for central_freq_hz in DCO_CENTRAL_FREQ_HZ {
-            for &total_divider in dividers {
-                let dco_hz = u64::from(total_divider) * afe_clock_hz;
-                try_divider(&mut search, central_freq_hz, dco_hz, total_divider);
-                if search.min_deviation == 0 {
-                    exact = true;
-                    break;
-                }
-            }
-            if exact {
-                break;
-            }
+    let mut best: Option<Chosen> = None;
+    for &total_divider in ADL_N_TOTAL_DIVIDERS {
+        let dco_hz = u64::from(total_divider) * afe_clock_hz;
+        if dco_hz < DCO_MIN_HZ || dco_hz > DCO_MAX_HZ {
+            continue;
         }
-        // The even list is index 0; an accepted even divider ends the search.
-        if index == 0 && search.total_divider != 0 {
-            break;
+        let centrality_hz = dco_hz.abs_diff(DCO_MIDPOINT_HZ);
+        if best.is_none_or(|best| centrality_hz < best.centrality_hz) {
+            best = Some(Chosen {
+                total_divider,
+                dco_hz,
+                centrality_hz,
+                centrality_centipercent: 10_000 * centrality_hz / DCO_MIDPOINT_HZ,
+            });
         }
     }
-
-    if search.total_divider == 0 {
-        return None;
-    }
-    Some(Chosen {
-        total_divider: search.total_divider,
-        central_freq_hz: search.central_freq_hz,
-        deviation: search.deviation,
-    })
+    best
 }
 
-/// i915's `skl_wrpll_get_multipliers` (`intel_dpll_mgr.c:1533-1580`).
+/// i915's `icl_wrpll_get_multipliers` (`intel_dpll_mgr.c:2507-2543`), the
+/// decomposition the ADL-N path uses.
 ///
-/// `None` where i915 leaves its outputs untouched and warns, which cannot
-/// happen for the two candidate lists -- the
-/// `every_candidate_divider_decomposes` test proves that -- but is returned
-/// rather than assumed so that editing a list cannot silently produce a
-/// zero divider.
-fn decompose(total_divider: u32) -> Option<(u32, u32, u32)> {
+/// The branch order is behaviour and not presentation: `%4` is tested before
+/// `%6` before `%5` before `%14`, so the total divider 20 takes the `%4` branch
+/// (`P = 2, Q = 5, K = 2`) and not `%5`.  Every branch yields `P ∈ {2,3,5,7}`
+/// and `K ∈ {1,2,3}` and sets `Q = 1` whenever `K != 2`, which is the PRM's own
+/// rule and i915's own assertion (`WARN_ON(kdiv != 2 && qdiv != 1)`,
+/// `intel_dpll_mgr.c:2583`).  **No candidate the ADL-N search can choose
+/// produces `K = 5`, and every one of them has a PRM-legal decomposition** --
+/// both checked by the `every_candidate_divider_decomposes` test, and both
+/// false of the Skylake decomposition this module used to carry.
+///
+/// # Divergences from i915, both unreachable from the candidate list
+///
+/// * If an even divider matches none of the five branches, i915 assigns
+///   nothing, leaving the caller's zero-initialised outputs as `(0, 0, 0)`.
+///   This returns `None`, and the caller turns that into
+///   [`PllError::DividerNotDecomposable`] rather than a zero divider.
+/// * i915's final `else` is commented `/* 9, 15, 21 */` but catches *any* other
+///   odd divider, so it would answer `icl_wrpll_get_multipliers(11)` with
+///   `P = 3, Q = 1, K = 3` -- a triple whose product is 9, not 11.  This
+///   returns `None` for an odd divider that is not 3, 5, 7, 9, 15 or 21, so
+///   [`ADL_N_TOTAL_DIVIDERS`] cannot silently acquire an entry that decomposes
+///   to something else.  11 is not in that list and never was.
+fn icl_wrpll_get_multipliers(total_divider: u32) -> Option<(u32, u32, u32)> {
     if total_divider % 2 == 0 {
-        let half = total_divider / 2;
-        if half == 1 || half == 2 || half == 3 || half == 5 {
-            Some((2, 1, half))
-        } else if half % 2 == 0 {
-            Some((2, half / 2, 2))
-        } else if half % 3 == 0 {
-            Some((3, half / 3, 2))
-        } else if half % 7 == 0 {
-            Some((7, half / 7, 2))
+        if total_divider == 2 {
+            Some((2, 1, 1))
+        } else if total_divider % 4 == 0 {
+            Some((2, total_divider / 4, 2))
+        } else if total_divider % 6 == 0 {
+            Some((3, total_divider / 6, 2))
+        } else if total_divider % 5 == 0 {
+            Some((5, total_divider / 10, 2))
+        } else if total_divider % 14 == 0 {
+            Some((7, total_divider / 14, 2))
         } else {
             None
         }
-    } else if total_divider == 3 || total_divider == 9 {
-        Some((3, 1, total_divider / 3))
-    } else if total_divider == 5 || total_divider == 7 {
+    } else if total_divider == 3 || total_divider == 5 || total_divider == 7 {
         Some((total_divider, 1, 1))
-    } else if total_divider == 15 {
-        Some((3, 1, 5))
-    } else if total_divider == 21 {
-        Some((7, 1, 3))
-    } else if total_divider == 35 {
-        Some((7, 1, 5))
+    } else if total_divider == 9 || total_divider == 15 || total_divider == 21 {
+        Some((total_divider / 3, 1, 3))
     } else {
         None
     }
@@ -1000,8 +1056,15 @@ fn decompose(total_divider: u32) -> Option<(u32, u32, u32)> {
 /// Reference document §6.3, "The search bounds": `P ∈ {2,3,5,7}`,
 /// `K ∈ {1,2,3}`, `Q ∈ 1..255`, and `K != 2 ⇒ Q = 1`.  The search is over `K`
 /// then `P` in ascending order, so the answer is deterministic but is *a* legal
-/// triple rather than necessarily i915's -- for `total = 6` it finds
-/// `(3, 1, 2)` where i915 writes `(2, 1, 3)`, and both are legal.
+/// triple rather than necessarily i915's: for a total divider the two
+/// decompositions can differ, and both are legal.
+///
+/// On the ADL-N path this agrees with [`icl_wrpll_get_multipliers`] for every
+/// candidate divider, which is §6.3's point that the ADL-N decomposition
+/// satisfies the PRM by construction.  The Skylake decomposition this module
+/// used to carry did not: `total = 10` came out as `(2, 1, 5)` with an illegal
+/// `K`, and `total = 35` -- which the Skylake list contained and the ADL-N list
+/// does not -- had no legal decomposition at all.
 fn prm_legal_divider_set(total_divider: u32) -> Option<(u32, u32, u32)> {
     for k in [1u32, 2, 3] {
         for p in [2u32, 3, 5, 7] {
@@ -1134,7 +1197,12 @@ fn decode_kdiv(code: u32, encoding: PllFieldEncoding) -> Result<u32, PllError> {
 }
 
 /// The error [`pdiv_code`] and [`kdiv_code`] return when they have no code.
-const fn not_encodable(p: u32, k: u32, field: PllDividerField, encoding: PllFieldEncoding) -> PllError {
+const fn not_encodable(
+    p: u32,
+    k: u32,
+    field: PllDividerField,
+    encoding: PllFieldEncoding,
+) -> PllError {
     PllError::DividerNotEncodable {
         p,
         k,
@@ -1148,11 +1216,7 @@ fn field_value(value: u32, bits: u32, field: PllDividerField) -> Result<u32, Pll
     if bits >= 32 || value < (1u32 << bits) {
         Ok(value)
     } else {
-        Err(PllError::FieldOverflow {
-            field,
-            value,
-            bits,
-        })
+        Err(PllError::FieldOverflow { field, value, bits })
     }
 }
 
@@ -1192,10 +1256,14 @@ mod tests {
         let dividers = hdmi(148_500);
         assert_eq!(dividers.total_divider(), 12, "the doc's worked example");
         assert_eq!(dividers.target_dco_khz(), 8_910_000);
-        assert_eq!(dividers.central_freq_khz(), 9_000_000);
-        // The doc offers "P=2, Q=2, K=3 or P=3, Q=2, K=2" and then rules the
-        // second out because K=2 requires Q=1.  i915's own decomposition of 12
-        // is the first shape's sibling, (2, 3, 2).
+        // The aim point is the window's midpoint, 8999 MHz, not one of the
+        // Skylake path's three central frequencies.
+        assert_eq!(dividers.central_freq_khz(), 8_999_000);
+        // 8910 MHz is 89 MHz below the midpoint: 10_000 * 89 / 8999 = 98.9, so
+        // 98 in whole hundredths of a percent.
+        assert_eq!(dividers.deviation_centipercent(), 98);
+        // §6.3: `12 % 4 == 0 -> P = 2, Q = 12/4 = 3, K = 2`.  The `%4` branch
+        // is tested before `%6`, which is why 12 is not `(3, 2, 2)`.
         assert_eq!((dividers.p(), dividers.q(), dividers.k()), (2, 3, 2));
         assert!(dividers.inside_prm_dco_window());
         // 8910 MHz is 24 MHz * 371.25, so the fraction is exactly a quarter and
@@ -1206,6 +1274,50 @@ mod tests {
         assert_eq!(dividers.achieved_symbol_rate_hz(), 148_500_000);
     }
 
+    /// The reference's worked example, worked all the way to register values.
+    ///
+    /// §6.3, "Worked example -- 1080p60, 148.5 MHz pixel clock, HDMI, 38.4 MHz
+    /// strap" prints the chain and ends at `DPLL0_CFGCR0 = 0x001001D0` and
+    /// `DPLL0_CFGCR1 = 0x00000E84`.  The register values are under the
+    /// **named** encoding -- `icl_wrpll_params_populate`'s -- and the halved
+    /// fraction (`0x800` before the workaround, `0x400` after it) is the ADL-P/N
+    /// workaround at a 38.4 MHz strap, which is why this needs `HalveFraction`.
+    ///
+    /// Note what this test does *not* discriminate: 148.5 MHz is the one rate
+    /// where the divergent case is easy -- the only in-window candidate is 12,
+    /// so the Skylake search finds the same divider and the same
+    /// `(P, Q, K)`.  The discriminating cases are
+    /// `the_search_uses_the_prm_window_it_reports` and
+    /// `the_adl_n_search_and_the_skylake_search_disagree_where_measured`.
+    #[test]
+    fn the_reference_worked_example_reproduces_the_published_registers() {
+        let dividers = ddi_pll_dividers(148_500, 38_400, ComboPhy::A).expect("1080p60");
+        assert_eq!(dividers.wrpll_ref_khz(), 19_200, "38.4 MHz is divided by 2");
+        assert_eq!(dividers.total_divider(), 12);
+        assert_eq!((dividers.p(), dividers.q(), dividers.k()), (2, 3, 2));
+        assert_eq!(dividers.target_dco_khz(), 8_910_000);
+        // `dco = (8_910_000 << 15) / 19_200 = 15_206_400`, so the integer is
+        // `15_206_400 >> 15 = 464` (0x1D0) and the fraction is
+        // `15_206_400 & 0x7FFF = 2048` (0x800).
+        assert_eq!(dividers.dco_integer(), 464);
+        assert_eq!(dividers.dco_fraction(), 0x800);
+        assert_eq!(
+            dividers
+                .registers(
+                    PllFieldEncoding::Named,
+                    DcoFractionWorkaround::HalveFraction
+                )
+                .unwrap(),
+            PllRegisters {
+                // DCO_FRACTION[24:10] = 1024, DCO_INTEGER[9:0] = 464.
+                cfgcr0: 0x0010_01D0,
+                // QDIV_RATIO[17:10] = 3, QDIV_MODE[9] = 1, KDIV[8:6] = 2,
+                // PDIV[5:2] = 1, CFSELOVRD[1:0] = 0.
+                cfgcr1: 0x0000_0E84,
+            }
+        );
+    }
+
     /// CTA-861 VIC 4: 1280x720@60, 74.25 MHz.  Half of VIC 16's clock, so the
     /// same DCO with twice the division.
     #[test]
@@ -1213,69 +1325,86 @@ mod tests {
         let dividers = hdmi(74_250);
         assert_eq!(dividers.total_divider(), 24);
         assert_eq!(dividers.target_dco_khz(), 8_910_000);
-        assert_eq!(dividers.central_freq_khz(), 9_000_000);
+        assert_eq!(dividers.central_freq_khz(), 8_999_000);
         assert_eq!((dividers.p(), dividers.q(), dividers.k()), (2, 6, 2));
         assert_eq!(dividers.achieved_symbol_rate_hz(), 74_250_000);
         assert_eq!(dividers.rate_error_ppb(), 0);
     }
 
-    /// DMT 0x04: 640x480@60, 25.175 MHz.  The interesting one, because the DCO
-    /// does not land on a central frequency: the search has to accept a
-    /// candidate that is off by a fraction of a percent, which is what the
-    /// asymmetric +1%/-6% tolerance is for.
+    /// DMT 0x04: 640x480@60, 25.175 MHz.  The interesting one, because no
+    /// candidate lands on the 8999 MHz midpoint: the search has to take the
+    /// divider whose DCO is closest, and every other candidate is hundreds of
+    /// megahertz further away.
     #[test]
     fn dmt_0x04_640x480_60_finds_an_off_centre_dco() {
         let dividers = hdmi(25_175);
-        assert_eq!(dividers.total_divider(), 76);
-        assert_eq!(dividers.target_dco_khz(), 9_566_500);
-        assert_eq!(dividers.central_freq_khz(), 9_600_000);
-        // 0.34% below the 9600 MHz centre, well inside the 6% negative limit.
-        assert_eq!(dividers.deviation_centipercent(), 34);
-        assert_eq!((dividers.p(), dividers.q(), dividers.k()), (2, 19, 2));
+        assert_eq!(dividers.total_divider(), 72);
+        assert_eq!(dividers.target_dco_khz(), 9_063_000);
+        assert_eq!(dividers.central_freq_khz(), 8_999_000);
+        // 9063 MHz is 64 MHz above the 8999 MHz midpoint:
+        // 10_000 * 64 / 8999 = 71.1, so 71 in whole hundredths of a percent.
+        assert_eq!(dividers.deviation_centipercent(), 71);
+        // 72 % 4 == 0 -> P = 2, Q = 18, K = 2.
+        assert_eq!((dividers.p(), dividers.q(), dividers.k()), (2, 18, 2));
         assert!(dividers.inside_prm_dco_window());
-        // The rate is reproduced to within the fraction's resolution.
-        assert_eq!(dividers.achieved_symbol_rate_hz(), 25_174_999);
-        assert!(dividers.rate_error_ppb().abs() < 100, "{dividers:?}");
+        // 9063 MHz is 24 MHz * 377.625, and 0.625 * 0x8000 = 0x5000 exactly, so
+        // the registers reproduce this rate exactly.  (Under the Skylake search
+        // this mode took divider 76 at 9566.5 MHz and came out 1 Hz low; the
+        // ADL-N midpoint rule takes 72, which is closer to 8999 MHz.)
+        assert_eq!(dividers.dco_integer(), 377);
+        assert_eq!(dividers.dco_fraction(), 0x5000);
+        assert_eq!(dividers.achieved_symbol_rate_hz(), 25_175_000);
+        assert_eq!(dividers.rate_error_ppb(), 0);
     }
 
     /// Every published modeline this module is asked about must produce a
     /// symbol rate that is right to well inside a part per million, and the
     /// register round trip must agree with the request.
+    ///
+    /// The total divider is pinned alongside the clock, because it is what moved
+    /// when the search did: under the Skylake search these ten modes took
+    /// `{24, 12, 12, 6, 3, 76, 42, 28, 14, 14}` and under the ADL-N search they
+    /// take `{24, 12, 12, 6, 3, 72, 44, 28, 12, 16}`.  Four of the ten change.
     #[test]
     fn published_modelines_round_trip_through_their_registers() {
-        // (name, pixel clock in kHz) -- CTA-861 VICs 4, 16, 31, 93, 97 and VESA
-        // DMT codes 0x04, 0x09, 0x10, 0x52, 0x53.
-        let modelines: &[(&str, u32)] = &[
-            ("CTA VIC 4 1280x720@60", 74_250),
-            ("CTA VIC 16 1920x1080@60", 148_500),
-            ("CTA VIC 31 1920x1080@50", 148_500),
-            ("CTA VIC 93 3840x2160@24", 297_000),
-            ("CTA VIC 97 3840x2160@60", 594_000),
-            ("DMT 0x04 640x480@60", 25_175),
-            ("DMT 0x09 800x600@60", 40_000),
-            ("DMT 0x10 1024x768@60", 65_000),
-            ("DMT 0x52 1920x1080@60 CVT-RB", 138_500),
-            ("DMT 0x53 1920x1080@50 CVT-RB", 115_500),
+        // (name, pixel clock in kHz, total divider) -- CTA-861 VICs 4, 16, 31,
+        // 93, 97 and VESA DMT codes 0x04, 0x09, 0x10, 0x52, 0x53.
+        let modelines: &[(&str, u32, u32)] = &[
+            ("CTA VIC 4 1280x720@60", 74_250, 24),
+            ("CTA VIC 16 1920x1080@60", 148_500, 12),
+            ("CTA VIC 31 1920x1080@50", 148_500, 12),
+            ("CTA VIC 93 3840x2160@24", 297_000, 6),
+            ("CTA VIC 97 3840x2160@60", 594_000, 3),
+            ("DMT 0x04 640x480@60", 25_175, 72),
+            ("DMT 0x09 800x600@60", 40_000, 44),
+            ("DMT 0x10 1024x768@60", 65_000, 28),
+            ("DMT 0x52 1920x1080@60 CVT-RB", 138_500, 12),
+            ("DMT 0x53 1920x1080@50 CVT-RB", 115_500, 16),
         ];
-        for &(name, clock_khz) in modelines {
+        for &(name, clock_khz, expected_divider) in modelines {
             for encoding in [PllFieldEncoding::Executed, PllFieldEncoding::Named] {
                 let dividers = hdmi(clock_khz);
+                assert_eq!(
+                    dividers.total_divider(),
+                    expected_divider,
+                    "{name}: total divider"
+                );
                 let Ok(registers) = dividers.registers(encoding, DcoFractionWorkaround::NotNeeded)
                 else {
                     // A divider set with no code under this encoding is the
-                    // §6.3 gap, and is asserted separately.
+                    // §6.3 encoder split, and is asserted separately.
                     continue;
                 };
                 let decoded = registers
                     .symbol_rate_hz(REF_24, encoding, DcoFractionWorkaround::NotNeeded)
                     .unwrap_or_else(|error| panic!("{name}: {error}"));
                 let requested_hz = u64::from(clock_khz) * 1000;
-                let error_ppb =
-                    (decoded as i128 - requested_hz as i128) * 1_000_000_000i128 / requested_hz as i128;
+                let error_ppb = (decoded as i128 - requested_hz as i128) * 1_000_000_000i128
+                    / requested_hz as i128;
                 assert!(
                     error_ppb.abs() < 1_000,
-                    "{name}: round trip produced {decoded} Hz for {requested_hz} Hz \
-                     ({error_ppb} ppb) under {encoding}"
+                    "{name}: round trip produced {decoded} Hz for {requested_hz} Hz ({error_ppb} \
+                     ppb) under {encoding}"
                 );
             }
         }
@@ -1283,93 +1412,199 @@ mod tests {
 
     // -- the search's documented rules --------------------------------------
 
-    /// Every divider in both candidate lists must decompose.  i915's lists are
-    /// chosen so this holds; if a future edit breaks it, the search would
-    /// otherwise silently return a zero divider.
+    /// Every divider in the candidate list must decompose, to the divider it
+    /// came from, into a `(P, Q, K)` the PRM allows.
+    ///
+    /// This is §6.3's "the PRM's rules are satisfied by construction": every
+    /// branch of `icl_wrpll_get_multipliers` yields `P ∈ {2,3,5,7}` and
+    /// `K ∈ {1,2,3}` and sets `Q = 1` whenever `K != 2`.  The test checks the
+    /// product, the bounds, *and* that [`prm_legal_divider_set`] agrees -- the
+    /// last is what makes the report function a check rather than a second
+    /// opinion.
     #[test]
     fn every_candidate_divider_decomposes() {
-        for &total_divider in EVEN_TOTAL_DIVIDERS.iter().chain(ODD_TOTAL_DIVIDERS) {
-            let (p, q, k) = decompose(total_divider)
+        for &total_divider in ADL_N_TOTAL_DIVIDERS {
+            let (p, q, k) = icl_wrpll_get_multipliers(total_divider)
                 .unwrap_or_else(|| panic!("divider {total_divider} does not decompose"));
             assert_eq!(
                 p * q * k,
                 total_divider,
                 "divider {total_divider} decomposed to ({p}, {q}, {k})"
             );
+            assert!(
+                [2, 3, 5, 7].contains(&p),
+                "divider {total_divider}: P = {p}"
+            );
+            assert!([1, 2, 3].contains(&k), "divider {total_divider}: K = {k}");
             assert!(q >= 1 && q <= 255, "divider {total_divider}: Q = {q}");
-            // i915's decomposition always satisfies the PRM's Q/K rule; that
-            // the two agree here is worth pinning, because it is the one place
-            // they do.
             if k != 2 {
                 assert_eq!(q, 1, "divider {total_divider}: K = {k} requires Q = 1");
             }
+            assert_eq!(
+                prm_legal_divider_set(total_divider),
+                Some((p, q, k)),
+                "divider {total_divider}: the PRM's own search disagrees with the decomposition"
+            );
         }
-        // And a divider that is not in either list does not silently decompose.
-        assert!(decompose(11).is_none());
-        assert!(decompose(1).is_none());
-        assert!(decompose(49).is_none());
+        // The total divider 35 is the Skylake list's one extension past 21, and
+        // it is the one with no PRM-legal decomposition at all: 35 = 5 * 7
+        // needs Q = 7 with K = 1, and K != 2 forces Q = 1.  The ADL-N list
+        // stops at 21 and does not contain it.
+        assert!(!ADL_N_TOTAL_DIVIDERS.contains(&35));
+        assert_eq!(prm_legal_divider_set(35), None);
+        // A divider that is in neither list does not silently decompose.
+        assert!(icl_wrpll_get_multipliers(11).is_none());
+        assert!(icl_wrpll_get_multipliers(1).is_none());
+        assert!(icl_wrpll_get_multipliers(49).is_none());
     }
 
-    /// i915 prefers an even total divider strongly enough to take a worse DCO.
+    /// The midpoint rule takes the odd divider the Skylake path threw away.
     ///
-    /// At a 200 MHz symbol rate `afe_clock` is 1000 MHz: the even divider 8
-    /// gives an 8000 MHz DCO, which is 4.76% below the 8400 MHz centre and is
-    /// therefore *accepted*, so the odd divider 9 -- which would land exactly
-    /// on 9000 MHz -- is never tried.  This is i915's documented intent
-    /// (`intel_dpll_mgr.c:1709-1714`) and this module reproduces it.
+    /// At a 200 MHz symbol rate `afe_clock` is 1000 MHz.  The ADL-N search
+    /// tests both 8 (8000 MHz, 999 MHz from the midpoint) and 9 (9000 MHz,
+    /// 1 MHz from it) and takes **9**, because it is the closest to 8999 MHz.
+    /// The Skylake search took 8: it accepted an even divider 4.76% below its
+    /// 8400 MHz centre and never tried the odd list at all.  This test is the
+    /// exact inverse of the one it replaced
+    /// (`an_even_divider_wins_even_when_an_odd_one_is_exact`), which pinned
+    /// that Skylake rule while `pll.rs` implemented the Skylake search; §6.3
+    /// says "no even-list-wins rule" on this path and that is what changed.
     #[test]
-    fn an_even_divider_wins_even_when_an_odd_one_is_exact() {
+    fn the_midpoint_rule_takes_the_odd_divider_the_skylake_path_skipped() {
         let dividers = hdmi(200_000);
-        assert_eq!(dividers.total_divider(), 8, "the even divider, not 9");
-        assert_eq!(dividers.target_dco_khz(), 8_000_000);
-        assert_eq!(dividers.central_freq_khz(), 8_400_000);
-        assert_eq!(dividers.deviation_centipercent(), 476);
-        // 9 would have been exact: 9 * 1000 MHz = 9000 MHz.
-        assert_eq!(9 * 5 * 200_000, 9_000_000);
+        assert_eq!(dividers.total_divider(), 9, "the odd divider, not 8");
+        assert_eq!(dividers.target_dco_khz(), 9_000_000);
+        assert_eq!(dividers.central_freq_khz(), 8_999_000);
+        // 9000 MHz is 1 MHz above the midpoint: 10_000 * 1 / 8999 = 1.1, so 1.
+        assert_eq!(dividers.deviation_centipercent(), 1);
+        // 9 is odd and not 3, 5 or 7, so P = 9/3 = 3, Q = 1, K = 3.
+        assert_eq!((dividers.p(), dividers.q(), dividers.k()), (3, 1, 3));
+        assert!(dividers.inside_prm_dco_window());
+        // The losing candidate is *also* in the PRM's window -- 8 * 1000 MHz is
+        // 8000 MHz, above the 7998 MHz floor -- so the difference here is the
+        // midpoint rule and nothing else.
+        assert!(8 * 1_000_000 >= PRM_DCO_MIN_KHZ && 8 * 1_000_000 <= PRM_DCO_MAX_KHZ);
+        assert!((9_000_000u64).abs_diff(8_999_000) < (8_000_000u64).abs_diff(8_999_000));
     }
 
-    /// The DCO window and the central-frequency rule are different tests and
-    /// pick different dividers.  This is the `[INF]` the reference document
-    /// §6.3 flags when it says the two framings are "compatible in spirit but
-    /// not bit-identical"; the divergence is pinned here so nobody has to take
-    /// it on trust.
+    /// The two searches this module has implemented disagree, and this pins
+    /// where -- with the arithmetic, so the difference is checkable by hand.
+    ///
+    /// 198 MHz and 138.5 MHz are two of the rates a sibling workstream measured
+    /// (`output::tests::pll_rs_search_is_measured_against_the_documented_adl_n_search`,
+    /// over 1 MHz steps from 16 to 1000 MHz).  Both are cases where the two
+    /// searches return a different total divider.
+    ///
+    /// **198 MHz -- the Skylake search put the DCO outside the PRM's window.**
+    ///
+    /// ```text
+    /// afe_clock = 5 * 198 000 = 990 000 kHz
+    /// d = 8 : 7 920 000 kHz  < 7 998 000  -> rejected, and this is what the
+    ///                                         Skylake search returned
+    /// d = 9 : 8 910 000 kHz  |8 910 000 - 8 999 000| =    89 000  -> chosen
+    /// d = 10: 9 900 000 kHz  |9 900 000 - 8 999 000| =   901 000
+    /// ```
+    ///
+    /// 7920 MHz is not "slightly wrong": the PRM's window starts at 7998 MHz, so
+    /// the Skylake answer asks the DCO to run below its documented minimum.  That
+    /// is the failure this workstream exists to remove, and 12 of the 985
+    /// measured rates were in it.
+    ///
+    /// **138.5 MHz -- both answers are in the window, and they still differ.**
+    ///
+    /// ```text
+    /// afe_clock = 5 * 138 500 = 692 500 kHz
+    /// d = 12: 8 310 000 kHz  |8 310 000 - 8 999 000| = 689 000  -> chosen
+    /// d = 14: 9 695 000 kHz  |9 695 000 - 8 999 000| = 696 000  -> what the
+    ///                                                              Skylake search
+    ///                                                              returned
+    /// ```
+    ///
+    /// This is DMT 0x52, a mode the kernel publishes, so the difference reaches
+    /// the mode layer and not just a synthetic rate.
     #[test]
-    fn the_two_dco_framings_really_do_differ() {
+    fn the_adl_n_search_and_the_skylake_search_disagree_where_measured() {
+        // 198 MHz: the Skylake search's answer is out of the DCO window.
+        let outside = hdmi(198_000);
+        assert_eq!(outside.total_divider(), 9);
+        assert_eq!(outside.target_dco_khz(), 8_910_000);
+        assert_eq!((outside.p(), outside.q(), outside.k()), (3, 1, 3));
+        assert!(outside.inside_prm_dco_window());
+        // The Skylake search's answer for this rate, by its own arithmetic
+        // above: divider 8 at 7920 MHz, below the window's 7998 MHz floor.
+        assert_eq!(8 * 5 * 198_000, 7_920_000);
+        assert!(7_920_000 < PRM_DCO_MIN_KHZ);
+
+        // 138.5 MHz: DMT 0x52.  Both in the window; the midpoint picks 12.
+        let inside = hdmi(138_500);
+        assert_eq!(inside.total_divider(), 12);
+        assert_eq!(inside.target_dco_khz(), 8_310_000);
+        assert!(inside.inside_prm_dco_window());
+        // 14 (9695 MHz) is the Skylake answer and is also in the window.
+        assert_eq!(14 * 5 * 138_500, 9_695_000);
+        assert!(9_695_000 <= PRM_DCO_MAX_KHZ);
+        assert!(
+            (8_310_000u64).abs_diff(8_999_000) < (9_695_000u64).abs_diff(8_999_000),
+            "the midpoint rule prefers 12"
+        );
+    }
+
+    /// The search uses the PRM's window as a hard bound, which is what makes
+    /// `inside_prm_dco_window` an invariant instead of a report.
+    ///
+    /// 395 MHz is the case the test this replaces
+    /// (`the_two_dco_framings_really_do_differ`) used to show the two framings
+    /// disagreeing: the Skylake search took the even divider 4 at 7900 MHz,
+    /// 5.95% below its 8400 MHz centre and *outside* the PRM's window, where
+    /// the ADL-N search takes 5 at 9875 MHz.  §6.3 records that disagreement;
+    /// the branch now implements the ADL-N side of it, so the test asserts the
+    /// ADL-N answer and states the Skylake one as the counterfactual.
+    #[test]
+    fn the_search_uses_the_prm_window_it_reports() {
         // 395 MHz: afe_clock is 1975 MHz.
         let dividers = hdmi(395_000);
-        // i915 accepts the even divider 4 at 7900 MHz, 5.95% below 8400 MHz.
-        assert_eq!(dividers.total_divider(), 4);
-        assert_eq!(dividers.target_dco_khz(), 7_900_000);
-        assert_eq!(dividers.deviation_centipercent(), 595);
-        // That DCO is *outside* the PRM's documented window.
-        assert!(!dividers.inside_prm_dco_window());
-        // The PRM framing would instead take the divider 5, at 9875 MHz, which
-        // is the candidate closest to the 8999 MHz midpoint.
+        // 4 * 1975 = 7900 MHz is below the window's floor, so it is not even a
+        // candidate; 5 * 1975 = 9875 MHz is in the window and is the closest to
+        // the 8999 MHz midpoint.
+        assert_eq!(4 * 1_975_000, 7_900_000);
+        assert!(
+            7_900_000 < PRM_DCO_MIN_KHZ,
+            "the Skylake answer is out of the window"
+        );
         assert_eq!(5 * 1_975_000, 9_875_000);
         assert!(9_875_000 >= PRM_DCO_MIN_KHZ && 9_875_000 <= PRM_DCO_MAX_KHZ);
-        assert!(
-            (9_875_000u64).abs_diff(8_999_000) < (7_900_000u64).abs_diff(8_999_000),
-            "the midpoint rule really does prefer the other divider"
-        );
+
+        assert_eq!(dividers.total_divider(), 5);
+        assert_eq!(dividers.target_dco_khz(), 9_875_000);
+        assert!(dividers.inside_prm_dco_window());
+        // 9875 MHz is 876 MHz above the midpoint: 10_000 * 876 / 8999 = 973.4.
+        assert_eq!(dividers.deviation_centipercent(), 973);
+        // 5 is odd and is one of 3, 5, 7, so P = 5, Q = 1, K = 1.
+        assert_eq!((dividers.p(), dividers.q(), dividers.k()), (5, 1, 1));
     }
 
     // -- the PDIV/KDIV gap ---------------------------------------------------
 
-    /// `P = 5` has no `Executed` code at all.
+    /// `P = 5` has no `Executed` code at all, and the ADL-N decomposition
+    /// reaches it.
     ///
     /// A 360 MHz symbol rate has `afe_clock` 1800 MHz, and the odd divider 5
-    /// lands exactly on the 9000 MHz centre while no even divider is within
-    /// tolerance.  The search therefore returns `P = 5`, which
-    /// `skl_wrpll_params_populate` has no case for: i915 warns "Incorrect
-    /// PDiv" and programs whatever `pdiv` its zero-initialised struct held.
-    /// This module refuses instead.
+    /// lands on 9000 MHz, 1 MHz from the midpoint, while no other candidate is
+    /// even in the window (4 * 1800 = 7200 MHz is below it, 6 * 1800 = 10 800
+    /// above).  The search therefore returns `P = 5`, which the *Skylake*
+    /// `skl_wrpll_params_populate` has no case for: i915 warns "Incorrect PDiv"
+    /// and programs whatever `pdiv` its zero-initialised struct held.  ADL-N's
+    /// `icl_wrpll_params_populate` codes it as `4 << 2` like any other `P`, so
+    /// the `Named` encoding accepts it and only `Executed` refuses.  That is
+    /// §6.3's "the representability asymmetry is the sharp edge", as a test.
     #[test]
     fn a_post_divider_of_five_has_no_executed_code() {
         let dividers = hdmi(360_000);
         assert_eq!(dividers.total_divider(), 5);
         assert_eq!((dividers.p(), dividers.q(), dividers.k()), (5, 1, 1));
         assert_eq!(dividers.target_dco_khz(), 9_000_000);
-        assert_eq!(dividers.deviation_centipercent(), 0);
+        // 9000 MHz is 1 MHz above the midpoint: 10_000 * 1 / 8999 = 1.1.
+        assert_eq!(dividers.deviation_centipercent(), 1);
         assert_eq!(
             dividers.cfgcr1(PllFieldEncoding::Executed),
             Err(PllError::DividerNotEncodable {
@@ -1379,32 +1614,69 @@ mod tests {
                 encoding: PllFieldEncoding::Executed,
             })
         );
-        // The named-constant convention does have one, and the PRM agrees that
-        // P = 5 is a legal post divider.
+        // The named-constant convention -- the one ADL-N's own encoder emits --
+        // has a code, and the PRM agrees that P = 5 is a legal post divider.
         assert!(dividers.cfgcr1(PllFieldEncoding::Named).is_ok());
         assert_eq!(dividers.prm_legal_divider_set(), Some((5, 1, 1)));
-        // The DCO arithmetic is unaffected: this is an encoding problem only.
+        // The DCO arithmetic is unaffected: this is an encoder question only.
         assert_eq!(dividers.achieved_symbol_rate_hz(), 360_000_000);
     }
 
-    /// `K = 5` is a divider i915 writes but the PRM does not define.
+    /// `K = 5` is not reachable from the ADL-N search, which is what removes
+    /// the Skylake path's PRM-illegal case.
     ///
-    /// A 180 MHz symbol rate puts the DCO exactly on 9000 MHz with the even
-    /// divider 10, which `skl_wrpll_get_multipliers` decomposes as
-    /// `(2, 1, 5)`.  `K = 5` is not in the PRM's `K ∈ {1,2,3}`, and there is no
-    /// `DPLL_CFGCR1_KDIV_5` constant -- but `skl_wrpll_params_populate` has a
-    /// `case 5: kdiv = 0`, so i915 writes a code for it anyway.
+    /// The test this replaces
+    /// (`a_k_of_five_is_written_but_is_not_a_legal_prm_k`) pinned that a 180 MHz
+    /// symbol rate took the total divider 10 and the *Skylake* decomposition
+    /// turned it into `(2, 1, 5)`, with a `K = 5` the PRM does not define.  The
+    /// ADL-N decomposition takes the `%5` branch for 10 and answers
+    /// `(5, 1, 2)` -- `K = 2`, `Q = 1` -- so the illegal case no longer arises,
+    /// and the same total divider now reaches the same answer through both the
+    /// decomposition and the PRM's own bounds.
+    ///
+    /// The encoder guard is still tested rather than assumed: `K = 5` has no
+    /// `Named` code, and no candidate divider decomposes to it.
     #[test]
-    fn a_k_of_five_is_written_but_is_not_a_legal_prm_k() {
+    fn the_adl_n_decomposition_never_produces_a_k_of_five() {
+        // 180 MHz: afe_clock 900 MHz, and 10 * 900 = 9000 MHz is the candidate
+        // closest to the 8999 MHz midpoint (9 * 900 = 8100 is 899 away).
         let dividers = hdmi(180_000);
         assert_eq!(dividers.total_divider(), 10);
-        assert_eq!((dividers.p(), dividers.q(), dividers.k()), (2, 1, 5));
         assert_eq!(dividers.target_dco_khz(), 9_000_000);
-        // i915 has a code for it ...
-        assert!(dividers.cfgcr1(PllFieldEncoding::Executed).is_ok());
-        // ... and its named constants do not.
+        // §6.3's branch list: 10 % 4 != 0, 10 % 6 != 0, 10 % 5 == 0 ->
+        // P = 5, Q = 10/10 = 1, K = 2.
+        assert_eq!((dividers.p(), dividers.q(), dividers.k()), (5, 1, 2));
+        assert_eq!(dividers.prm_legal_divider_set(), Some((5, 1, 2)));
+        // The same total divider the Skylake decomposition answered with an
+        // illegal `K = 5` is now answered with `P = 5`, so the encoder refusal
+        // moves from `Named` to `Executed`: the Skylake encoder has no case for
+        // `P = 5` either, while the Gen12 one codes it `4 << 2` and accepts it.
+        assert!(dividers.cfgcr1(PllFieldEncoding::Named).is_ok());
         assert_eq!(
-            dividers.cfgcr1(PllFieldEncoding::Named),
+            dividers.cfgcr1(PllFieldEncoding::Executed),
+            Err(PllError::DividerNotEncodable {
+                p: 5,
+                k: 0,
+                field: PllDividerField::Post,
+                encoding: PllFieldEncoding::Executed,
+            })
+        );
+
+        // The three cases the Skylake decomposition got wrong are gone from the
+        // ADL-N list's answers.
+        assert_eq!(icl_wrpll_get_multipliers(10), Some((5, 1, 2)));
+        assert_eq!(icl_wrpll_get_multipliers(6), Some((3, 1, 2)));
+        assert_eq!(icl_wrpll_get_multipliers(50), Some((5, 5, 2)));
+        assert_eq!(icl_wrpll_get_multipliers(70), Some((5, 7, 2)));
+        assert_eq!(icl_wrpll_get_multipliers(15), Some((5, 1, 3)));
+        for &total_divider in ADL_N_TOTAL_DIVIDERS {
+            let (_, _, k) = icl_wrpll_get_multipliers(total_divider).unwrap();
+            assert_ne!(k, 5, "divider {total_divider} decomposed to K = 5");
+        }
+        // `K = 5` is still not a value the Gen12 encoder can write, so the
+        // guard is real and not merely unreachable.
+        assert_eq!(
+            kdiv_code(5, PllFieldEncoding::Named),
             Err(PllError::DividerNotEncodable {
                 p: 0,
                 k: 5,
@@ -1412,10 +1684,7 @@ mod tests {
                 encoding: PllFieldEncoding::Named,
             })
         );
-        // The PRM's own bounds reach the same total a different way, which is
-        // what makes this worth reporting rather than crashing on.
-        assert_eq!(dividers.prm_legal_divider_set(), Some((5, 1, 2)));
-        assert_ne!(dividers.prm_legal_divider_set(), Some((2, 1, 5)));
+        assert_eq!(kdiv_code(5, PllFieldEncoding::Executed), Ok(0));
     }
 
     /// The two encodings disagree for every `K` and for `P = 7`, and agree for
@@ -1483,7 +1752,11 @@ mod tests {
 
         // Read back the way it was written: exact.
         let honest = registers
-            .symbol_rate_hz(REF_24, PllFieldEncoding::Executed, DcoFractionWorkaround::NotNeeded)
+            .symbol_rate_hz(
+                REF_24,
+                PllFieldEncoding::Executed,
+                DcoFractionWorkaround::NotNeeded,
+            )
             .unwrap();
         assert_eq!(honest, 148_500_000);
 
@@ -1491,9 +1764,16 @@ mod tests {
         // the named constants.  The chosen set has K = 2, written as the
         // executed code 1, which the named convention reads as K = 1.
         let i915_way = registers
-            .symbol_rate_hz(REF_24, PllFieldEncoding::Named, DcoFractionWorkaround::NotNeeded)
+            .symbol_rate_hz(
+                REF_24,
+                PllFieldEncoding::Named,
+                DcoFractionWorkaround::NotNeeded,
+            )
             .unwrap();
-        assert_eq!(i915_way, 297_000_000, "i915's own read-back doubles the rate");
+        assert_eq!(
+            i915_way, 297_000_000,
+            "i915's own read-back doubles the rate"
+        );
         assert_ne!(i915_way, honest);
     }
 
@@ -1505,10 +1785,7 @@ mod tests {
         assert_eq!(wrpll_reference_khz(38_400), Ok(19_200));
         assert_eq!(wrpll_reference_khz(24_000), Ok(24_000));
         assert_eq!(wrpll_reference_khz(19_200), Ok(19_200));
-        assert_eq!(
-            wrpll_reference_khz(0),
-            Err(PllError::ZeroReference)
-        );
+        assert_eq!(wrpll_reference_khz(0), Err(PllError::ZeroReference));
         assert_eq!(
             wrpll_reference_khz(100_000),
             Err(PllError::UnsupportedReference { ref_khz: 100_000 })
@@ -1520,6 +1797,7 @@ mod tests {
         let at_19_2 = ddi_pll_dividers(148_500, 19_200, ComboPhy::A).unwrap();
         assert_eq!(at_38_4.total_divider(), at_19_2.total_divider());
         assert_eq!(at_38_4.central_freq_khz(), at_19_2.central_freq_khz());
+        assert_eq!(at_38_4.central_freq_khz(), 8_999_000);
         assert_eq!(at_38_4.wrpll_ref_khz(), 19_200);
         assert_eq!(at_38_4.platform_ref_khz(), 38_400);
         // But the register value is genuinely different: DCO_INTEGER is
@@ -1567,11 +1845,18 @@ mod tests {
         // Halving and doubling round-trips through the decoder, which is how
         // i915 keeps its own read-back self-consistent.
         let registers = dividers
-            .registers(PllFieldEncoding::Named, DcoFractionWorkaround::HalveFraction)
+            .registers(
+                PllFieldEncoding::Named,
+                DcoFractionWorkaround::HalveFraction,
+            )
             .unwrap();
         assert_eq!(
             registers
-                .symbol_rate_hz(38_400, PllFieldEncoding::Named, DcoFractionWorkaround::HalveFraction)
+                .symbol_rate_hz(
+                    38_400,
+                    PllFieldEncoding::Named,
+                    DcoFractionWorkaround::HalveFraction
+                )
                 .unwrap(),
             148_500_000
         );
@@ -1601,28 +1886,54 @@ mod tests {
 
     /// Below the smallest DCO the PLL can make, and above the largest, the
     /// answer is an error and not the nearest divider.
+    ///
+    /// The bounds are now exact rather than approximate, because the window is a
+    /// hard constraint on the candidates.  The smallest total divider is 2 and
+    /// the largest is 102, so the symbol rate has to be in
+    /// `[7998/(102*5), 10000/(2*5)]` = `[15.6824, 1000]` MHz.
     #[test]
     fn a_pixel_clock_outside_the_plls_range_is_refused() {
-        // The total divider is at least 3 and at most 98, and the DCO must land
-        // inside [7896, 9696] MHz, so the symbol rate has to be in
-        // [7896/(98*5), 9696/(3*5)] = [16.11, 646.4] MHz.
-        let below = ddi_pll_dividers(10_000, REF_24, ComboPhy::A);
+        let below = ddi_pll_dividers(15_682, REF_24, ComboPhy::A);
         assert_eq!(
             below,
             Err(PllError::NoLegalDividerSet {
-                symbol_rate_khz: 10_000,
+                symbol_rate_khz: 15_682,
                 ref_khz: REF_24,
             })
         );
-        let above = ddi_pll_dividers(700_000, REF_24, ComboPhy::A);
+        // The lower end is the largest divider: 102 * 78410 = 7 997 820 kHz,
+        // which is 180 kHz below the window's floor.  78315 kHz -- one step of
+        // 1 kHz up -- is 7 998 330 kHz and is accepted.
+        assert_eq!(102 * 5 * 15_682, 7_997_820);
+        assert!(7_997_820 < PRM_DCO_MIN_KHZ);
+        let just_above = hdmi(15_683);
+        assert_eq!(just_above.total_divider(), 102);
+        assert_eq!(just_above.target_dco_khz(), 7_998_330);
+        assert!(just_above.inside_prm_dco_window());
+
+        // The upper end is the smallest divider, 2, and it lands exactly on the
+        // window's ceiling: 2 * 5 * 1 000 000 = 10 000 000 kHz.
+        let at_ceiling = hdmi(1_000_000);
+        assert_eq!(at_ceiling.total_divider(), 2);
+        assert_eq!(at_ceiling.target_dco_khz(), PRM_DCO_MAX_KHZ);
+        assert_eq!((at_ceiling.p(), at_ceiling.q(), at_ceiling.k()), (2, 1, 1));
+        let above = ddi_pll_dividers(1_001_000, REF_24, ComboPhy::A);
         assert_eq!(
             above,
+            Err(PllError::NoLegalDividerSet {
+                symbol_rate_khz: 1_001_000,
+                ref_khz: REF_24,
+            })
+        );
+        // A rate that is inside neither end: 700 MHz needs a total divider
+        // between 2.29 and 2.86, and the list has no such entry.
+        assert_eq!(
+            ddi_pll_dividers(700_000, REF_24, ComboPhy::A),
             Err(PllError::NoLegalDividerSet {
                 symbol_rate_khz: 700_000,
                 ref_khz: REF_24,
             })
         );
-        // Immediately inside both ends there is an answer.
         assert!(ddi_pll_dividers(20_000, REF_24, ComboPhy::A).is_ok());
         assert!(ddi_pll_dividers(600_000, REF_24, ComboPhy::A).is_ok());
         assert_eq!(
@@ -1631,45 +1942,78 @@ mod tests {
         );
     }
 
-    /// The smallest and largest total dividers the lists contain are both
+    /// The smallest and largest total dividers the list contains are both
     /// reachable, and they are the ones the arithmetic says they are.
+    ///
+    /// Under the Skylake search this test used 3 and 98, because the Skylake
+    /// even list starts at 4 and the ADL-N list starts at 2 and runs to 102.
     #[test]
     fn the_smallest_and_largest_legal_dividers_are_reachable() {
-        // 640 MHz: afe_clock 3200 MHz, and 3 * 3200 = 9600 MHz exactly.  No
-        // even divider is within tolerance, so the odd list is reached.
-        let smallest = hdmi(640_000);
-        assert_eq!(smallest.total_divider(), 3);
-        assert_eq!(smallest.target_dco_khz(), 9_600_000);
-        assert_eq!(smallest.deviation_centipercent(), 0);
-        assert_eq!((smallest.p(), smallest.q(), smallest.k()), (3, 1, 1));
+        // 900 MHz: afe_clock 4500 MHz, and 2 * 4500 = 9000 MHz is in the window
+        // while 3 * 4500 = 13 500 MHz is far above it.  The list's smallest
+        // entry, 2, is the `P = 2, Q = 1, K = 1` branch.
+        let smallest = hdmi(900_000);
+        assert_eq!(smallest.total_divider(), 2);
+        assert_eq!(smallest.target_dco_khz(), 9_000_000);
+        assert_eq!(smallest.deviation_centipercent(), 1);
+        assert_eq!((smallest.p(), smallest.q(), smallest.k()), (2, 1, 1));
 
+        // 15.683 MHz: afe_clock 78.415 MHz, and 102 * 78.415 = 7998.33 MHz, just
+        // inside the window's floor.  100 * 78.415 = 7841.5 MHz is below it.
+        // This is the largest entry, 102 = 3 * 17 * 2, at the very bottom of
+        // the band -- 1111 centipercent from the midpoint and still the right
+        // answer, because the window is the constraint and the midpoint only
+        // breaks ties within it.
+        let largest = hdmi(15_683);
+        assert_eq!(largest.total_divider(), 102);
+        assert_eq!(largest.target_dco_khz(), 7_998_330);
+        assert_eq!(largest.deviation_centipercent(), 1111);
+        assert_eq!((largest.p(), largest.q(), largest.k()), (3, 17, 2));
+        assert!(largest.inside_prm_dco_window());
+
+        // P = 7 is reachable too, and it is the half of the encoder split the
+        // Skylake P = 5 case does not cover.
+        //
         // 18.45 MHz: afe_clock 92.25 MHz, and 98 * 92.25 = 9040.5 MHz, which is
-        // 0.45% above the 9000 MHz centre.  An even divider wins.
-        let largest = hdmi(18_450);
-        assert_eq!(largest.total_divider(), 98);
-        assert_eq!(largest.target_dco_khz(), 9_040_500);
-        assert_eq!(largest.central_freq_khz(), 9_000_000);
-        assert_eq!(largest.deviation_centipercent(), 45);
-        assert_eq!((largest.p(), largest.q(), largest.k()), (7, 7, 2));
-        // P = 7 is the other half of the encoding gap, so the two encodings
-        // give different register values for the same divider set.
-        let executed = largest.cfgcr1(PllFieldEncoding::Executed).unwrap();
-        let named = largest.cfgcr1(PllFieldEncoding::Named).unwrap();
+        // 46 centipercent above the 8999 MHz midpoint.
+        let p_is_seven = hdmi(18_450);
+        assert_eq!(p_is_seven.total_divider(), 98);
+        assert_eq!(p_is_seven.target_dco_khz(), 9_040_500);
+        assert_eq!(p_is_seven.deviation_centipercent(), 46);
+        assert_eq!((p_is_seven.p(), p_is_seven.q(), p_is_seven.k()), (7, 7, 2));
+        // The two encoders code P = 7 differently, so the same divider set has
+        // two different CFGCR1 values.
+        let executed = p_is_seven.cfgcr1(PllFieldEncoding::Executed).unwrap();
+        let named = p_is_seven.cfgcr1(PllFieldEncoding::Named).unwrap();
         assert_eq!((executed >> 2) & 0xf, 4);
         assert_eq!((named >> 2) & 0xf, 8);
     }
 
     // -- properties ----------------------------------------------------------
 
-    /// Sweep the whole legal range and check the module's own invariants on
-    /// every answer: the dividers multiply out, the encodings agree with the
+    /// Sweep the whole range and check the module's own invariants on every
+    /// answer: the dividers multiply out, the DCO is inside the PRM's window,
+    /// the decomposition is the PRM-legal one, the encodings agree with the
     /// divider values they claim, and the rate is right.
+    ///
+    /// The sweep also pins where the search has *no* answer, which is not the
+    /// whole range: the divider list has gaps between consecutive entries, and
+    /// a symbol rate whose window `[7998000/(5r), 10000000/(5r)]` falls entirely
+    /// inside one of them cannot be served.  On this grid there are two such
+    /// bands, and they are a property of the documented algorithm rather than of
+    /// this implementation.
     #[test]
     fn every_answer_satisfies_the_invariants() {
         let mut found = 0u32;
-        for symbol_rate_khz in (17_000..=640_000).step_by(250) {
-            let Ok(dividers) = ddi_pll_dividers(symbol_rate_khz, REF_24, ComboPhy::B) else {
-                continue;
+        let mut refused = 0u32;
+        for symbol_rate_khz in (17_000..=1_000_000).step_by(250) {
+            let dividers = match ddi_pll_dividers(symbol_rate_khz, REF_24, ComboPhy::B) {
+                Ok(dividers) => dividers,
+                Err(PllError::NoLegalDividerSet { .. }) => {
+                    refused += 1;
+                    continue;
+                }
+                Err(other) => panic!("{symbol_rate_khz} kHz: unexpected error {other}"),
             };
             found += 1;
 
@@ -1679,12 +2023,32 @@ mod tests {
                 dividers.total_divider(),
                 "{symbol_rate_khz} kHz"
             );
-            // The total divider is one the lists actually contain.
+            // The total divider is one the list actually contains.
             assert!(
-                EVEN_TOTAL_DIVIDERS.contains(&dividers.total_divider())
-                    || ODD_TOTAL_DIVIDERS.contains(&dividers.total_divider()),
+                ADL_N_TOTAL_DIVIDERS.contains(&dividers.total_divider()),
                 "{symbol_rate_khz} kHz: {} is not a candidate",
                 dividers.total_divider()
+            );
+            // The DCO is inside the PRM's window, which is what the ADL-N
+            // search enforces and the Skylake one did not.
+            assert!(
+                dividers.inside_prm_dco_window(),
+                "{symbol_rate_khz} kHz: DCO {} kHz is outside [7998, 10000] MHz",
+                dividers.target_dco_khz()
+            );
+            // The midpoint is the only aim point this path has.
+            assert_eq!(
+                dividers.central_freq_khz(),
+                8_999_000,
+                "{symbol_rate_khz} kHz"
+            );
+            // The decomposition is the one the PRM's own bounds would pick as
+            // well, because icl_wrpll_get_multipliers satisfies them by
+            // construction.
+            assert_eq!(
+                dividers.prm_legal_divider_set(),
+                Some((dividers.p(), dividers.q(), dividers.k())),
+                "{symbol_rate_khz} kHz"
             );
             // The target DCO is exactly the definition.
             assert_eq!(
@@ -1703,12 +2067,28 @@ mod tests {
                 dividers.achieved_dco_hz() / (5 * u64::from(dividers.total_divider())),
                 "{symbol_rate_khz} kHz"
             );
-            // The deviation is inside one of the two documented limits.
-            let deviation = dividers.deviation_centipercent();
-            if dividers.target_dco_khz() >= dividers.central_freq_khz() {
-                assert!(deviation < DCO_MAX_POSITIVE_DEVIATION, "{symbol_rate_khz} kHz");
-            } else {
-                assert!(deviation < DCO_MAX_NEGATIVE_DEVIATION, "{symbol_rate_khz} kHz");
+            // The declared distance from the midpoint is the definition.
+            assert_eq!(
+                dividers.deviation_centipercent(),
+                10_000 * dividers.target_dco_khz().abs_diff(8_999_000) / 8_999_000,
+                "{symbol_rate_khz} kHz"
+            );
+            // No other candidate in the list is closer to the midpoint while
+            // still inside the window -- that is the search's whole contract,
+            // re-derived here rather than taken from it.
+            let afe_clock_khz = 5 * u64::from(symbol_rate_khz);
+            for &candidate in ADL_N_TOTAL_DIVIDERS {
+                let dco_khz = u64::from(candidate) * afe_clock_khz;
+                if dco_khz < PRM_DCO_MIN_KHZ || dco_khz > PRM_DCO_MAX_KHZ {
+                    continue;
+                }
+                assert!(
+                    dco_khz.abs_diff(8_999_000) >= dividers.target_dco_khz().abs_diff(8_999_000),
+                    "{symbol_rate_khz} kHz: divider {candidate} at {dco_khz} kHz is closer to the \
+                     midpoint than the chosen {} at {} kHz",
+                    dividers.total_divider(),
+                    dividers.target_dco_khz()
+                );
             }
             // Every encoding that accepts the set round-trips through its own
             // decode.
@@ -1721,21 +2101,127 @@ mod tests {
                     .symbol_rate_hz(REF_24, encoding, DcoFractionWorkaround::NotNeeded)
                     .unwrap_or_else(|error| panic!("{symbol_rate_khz} kHz: {error}"));
                 // The round trip is exact to the fraction's resolution, which
-                // is a relative error, not an absolute one: 93 ppb at the
-                // smallest legal DCO is 60 Hz at a 640 MHz symbol rate.
+                // is a relative error, not an absolute one: 92 ppb at the
+                // smallest legal DCO is 2 Hz at a 17 MHz symbol rate.
                 let requested_hz = u64::from(symbol_rate_khz) * 1000;
                 let error_ppb = (decoded as i128 - requested_hz as i128) * 1_000_000_000i128
                     / requested_hz as i128;
                 assert!(
                     error_ppb.abs() <= MAX_SYMBOL_RATE_ERROR_PPB as i128,
-                    "{symbol_rate_khz} kHz decoded to {decoded} Hz under {encoding} \
-                     ({error_ppb} ppb)"
+                    "{symbol_rate_khz} kHz decoded to {decoded} Hz under {encoding} ({error_ppb} \
+                     ppb)"
                 );
             }
         }
-        // The sweep must actually have covered most of the range, or the test
-        // proves nothing.
-        assert!(found > 2_000, "only {found} rates in the range were solvable");
+        // The sweep must actually have covered the range, or the test proves
+        // nothing: 3933 sampled rates, of which 665 are in the two gap bands.
+        assert_eq!(found + refused, 3_933, "the sweep did not cover the range");
+        assert_eq!(found, 3_268, "solvable rates in the sweep");
+        assert_eq!(refused, 665, "refused rates in the sweep");
+    }
+
+    /// Where the candidate list cannot reach, and why.
+    ///
+    /// The gaps are between consecutive entries of
+    /// [`ADL_N_TOTAL_DIVIDERS`], and the widest is between 2 and 3: a window
+    /// `[7998/(5r), 10000/(5r)]` of width ratio 1.25 that falls between 2 and 3
+    /// contains no candidate, so rates in `[666.75, 799.75] MHz` are refused.
+    /// The other band, `[500.25, 533] MHz`, is between 3 and 4 -- a ratio of
+    /// 1.5/1.25, where the top of the range just misses 4 and the bottom just
+    /// misses 3.
+    ///
+    /// This is bounded and worth knowing rather than discovering on the machine:
+    /// a caller that asks for one of these and gets
+    /// [`PllError::NoLegalDividerSet`] has a rate this PLL cannot make, not a
+    /// bug.  The Skylake search this module used to use could serve 7 of the
+    /// 985 measured rates inside these bands -- and in every one of the 7 it
+    /// programmed a DCO *below* 7998 MHz, i.e. outside the window.  That is
+    /// asserted in
+    /// `output::tests::pll_rs_search_is_measured_against_the_documented_adl_n_search`.
+    #[test]
+    fn the_candidate_list_has_two_gaps_and_they_are_refused() {
+        // Just below the first band, and inside it.
+        assert_eq!(hdmi(666_500).total_divider(), 3);
+        assert_eq!(hdmi(666_500).target_dco_khz(), 9_997_500);
+        assert_eq!(
+            ddi_pll_dividers(666_750, REF_24, ComboPhy::A),
+            Err(PllError::NoLegalDividerSet {
+                symbol_rate_khz: 666_750,
+                ref_khz: REF_24,
+            })
+        );
+        assert_eq!(
+            ddi_pll_dividers(799_750, REF_24, ComboPhy::A),
+            Err(PllError::NoLegalDividerSet {
+                symbol_rate_khz: 799_750,
+                ref_khz: REF_24,
+            })
+        );
+        // And just above it: 2 * 4000 MHz is 8000 MHz, inside the window.
+        assert_eq!(hdmi(800_000).total_divider(), 2);
+        assert_eq!(hdmi(800_000).target_dco_khz(), 8_000_000);
+
+        // The second band: 500 MHz lands exactly on the window ceiling with
+        // divider 4, 500.25 MHz is already above it, and 533.25 MHz is where
+        // divider 3 comes back into the window.
+        assert_eq!(hdmi(500_000).total_divider(), 4);
+        assert_eq!(hdmi(500_000).target_dco_khz(), PRM_DCO_MAX_KHZ);
+        assert_eq!(
+            ddi_pll_dividers(500_250, REF_24, ComboPhy::A),
+            Err(PllError::NoLegalDividerSet {
+                symbol_rate_khz: 500_250,
+                ref_khz: REF_24,
+            })
+        );
+        assert_eq!(
+            ddi_pll_dividers(533_000, REF_24, ComboPhy::A),
+            Err(PllError::NoLegalDividerSet {
+                symbol_rate_khz: 533_000,
+                ref_khz: REF_24,
+            })
+        );
+        assert_eq!(hdmi(533_250).total_divider(), 3);
+        assert_eq!(hdmi(533_250).target_dco_khz(), 7_998_750);
+    }
+
+    /// The `DCO_INTEGER`/`DCO_FRACTION` split is the one
+    /// `icl_wrpll_params_populate` computes, and not the Skylake encoder's.
+    ///
+    /// `[I915]` `icl_wrpll_params_populate` (`intel_dpll_mgr.c:2588-2591`):
+    ///
+    /// ```text
+    /// dco          = div_u64((u64)dco_freq << 15, ref_freq);
+    /// dco_integer  = dco >> 15;
+    /// dco_fraction = dco & 0x7fff;
+    /// ```
+    ///
+    /// with `dco_freq` and `ref_freq` in kHz.  This module computes the integer
+    /// and the fraction separately from the remainder, which is the same
+    /// arithmetic; the test is here because the *Skylake* encoder
+    /// (`skl_wrpll_params_populate`, `:1654-1657`) divides by a reference
+    /// truncated to whole megahertz instead, and reaching for that one is the
+    /// mistake the whole workstream is about.
+    #[test]
+    fn the_dco_fraction_split_is_the_icl_encoders() {
+        for ref_khz in [19_200u32, 24_000, 38_400] {
+            let wrpll_ref_khz = u64::from(wrpll_reference_khz(ref_khz).unwrap());
+            for rate_khz in [
+                15_683u32, 25_175, 74_250, 148_500, 297_000, 594_000, 900_000,
+            ] {
+                let dividers = ddi_pll_dividers(rate_khz, ref_khz, ComboPhy::A).unwrap();
+                let packed = (dividers.target_dco_khz() << 15) / wrpll_ref_khz;
+                assert_eq!(
+                    u64::from(dividers.dco_integer()),
+                    packed >> 15,
+                    "reference {ref_khz} kHz, rate {rate_khz} kHz: DCO_INTEGER"
+                );
+                assert_eq!(
+                    u64::from(dividers.dco_fraction()),
+                    packed & 0x7fff,
+                    "reference {ref_khz} kHz, rate {rate_khz} kHz: DCO_FRACTION"
+                );
+            }
+        }
     }
 
     /// The reference frequency does not change which divider set is chosen --
@@ -1746,7 +2232,10 @@ mod tests {
         for ref_khz in [19_200u32, 24_000, 38_400] {
             let dividers = ddi_pll_dividers(148_500, ref_khz, ComboPhy::A).unwrap();
             assert_eq!(dividers.total_divider(), 12, "reference {ref_khz} kHz");
-            assert_eq!(dividers.wrpll_ref_khz(), wrpll_reference_khz(ref_khz).unwrap());
+            assert_eq!(
+                dividers.wrpll_ref_khz(),
+                wrpll_reference_khz(ref_khz).unwrap()
+            );
             let registers = dividers
                 .registers(PllFieldEncoding::Named, DcoFractionWorkaround::NotNeeded)
                 .unwrap();
@@ -1770,7 +2259,11 @@ mod tests {
             // rate that was asked for.
             assert_eq!(
                 registers
-                    .symbol_rate_hz(ref_khz, PllFieldEncoding::Named, DcoFractionWorkaround::NotNeeded)
+                    .symbol_rate_hz(
+                        ref_khz,
+                        PllFieldEncoding::Named,
+                        DcoFractionWorkaround::NotNeeded
+                    )
                     .unwrap(),
                 148_500_000,
                 "reference {ref_khz} kHz"
@@ -1817,28 +2310,40 @@ mod tests {
 
     // -- the PRM's own bounds ------------------------------------------------
 
-    /// The PRM's `(P, Q, K)` bounds, checked against the totals i915's lists
-    /// contain.  Some totals have no legal decomposition at all, which is a
-    /// real disagreement between the two sources rather than a bug here.
+    /// The PRM's `(P, Q, K)` bounds, checked across every total divider there
+    /// is -- not only the candidates.
+    ///
+    /// The test this replaces
+    /// (`the_prm_bounds_do_not_cover_every_divider_i915_uses`) asserted the
+    /// opposite conclusion: that `prm_legal_divider_set(35)` is `None` while the
+    /// Skylake candidate list contains 35, and that `total = 10` decomposed to
+    /// `K = 5`, which the PRM does not define.  Both were true of the Skylake
+    /// path and are false of the ADL-N one, which is §6.3's point that "the
+    /// PRM's rules are satisfied by construction" here.  What remains worth
+    /// checking is that the report function's bounds are the ones it claims, on
+    /// every input rather than only the reachable ones.
     #[test]
-    fn the_prm_bounds_do_not_cover_every_divider_i915_uses() {
-        // Totals both sources can express.
+    fn the_prm_bounds_hold_wherever_the_report_function_answers() {
+        // Totals both sources can express, and the answers agree.
         assert_eq!(prm_legal_divider_set(3), Some((3, 1, 1)));
         assert_eq!(prm_legal_divider_set(5), Some((5, 1, 1)));
         assert_eq!(prm_legal_divider_set(12), Some((2, 3, 2)));
         assert_eq!(prm_legal_divider_set(24), Some((2, 6, 2)));
         assert_eq!(prm_legal_divider_set(76), Some((2, 19, 2)));
-        // A total i915 decomposes to K = 5, which the PRM does not define, but
-        // which the PRM can reach another way.
+        // 10 and 15 are the totals the Skylake decomposition answered with an
+        // illegal K = 5; the ADL-N decomposition answers the PRM's way.
         assert_eq!(prm_legal_divider_set(10), Some((5, 1, 2)));
         assert_eq!(prm_legal_divider_set(15), Some((5, 1, 3)));
+        assert_eq!(icl_wrpll_get_multipliers(10), Some((5, 1, 2)));
+        assert_eq!(icl_wrpll_get_multipliers(15), Some((5, 1, 3)));
         // The PRM cannot express 35 at all: 35 = 5 * 7 needs Q = 7 with K = 1,
-        // and K != 2 forces Q = 1.
+        // and K != 2 forces Q = 1.  It is the one total the Skylake list
+        // carried past 21, and the ADL-N list does not carry it.
         assert_eq!(prm_legal_divider_set(35), None);
-        assert!(ODD_TOTAL_DIVIDERS.contains(&35));
-        assert_eq!(decompose(35), Some((7, 1, 5)));
+        assert!(!ADL_N_TOTAL_DIVIDERS.contains(&35));
+        assert!(icl_wrpll_get_multipliers(35).is_none());
         // Whatever it returns must satisfy the bounds it claims.
-        for total in 3u32..=98 {
+        for total in 1u32..=200 {
             let Some((p, q, k)) = prm_legal_divider_set(total) else {
                 continue;
             };
@@ -1905,8 +2410,9 @@ mod tests {
             "p: 2",
             "q: 3",
             "k: 2",
-            "central_freq_khz: 9000000",
+            "central_freq_khz: 8999000",
             "target_dco_khz: 8910000",
+            "deviation_centipercent: 98",
             "dco_integer: 371",
             "dco_fraction: 8192",
             "rate_error_ppb: 0",

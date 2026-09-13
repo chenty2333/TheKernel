@@ -821,9 +821,9 @@ fn an_unreadable_register_is_a_named_error() {
 
 // -- the arithmetic's provenance --------------------------------------------
 
-/// The ADL-N search §6.3 transcribes, used here only to *compare* against
-/// `pll.rs`'s Skylake-path search.  It is test code: the production arithmetic
-/// is `pll.rs`'s and is not re-derived in this module.
+/// The ADL-N search §6.3 transcribes, re-derived here from the reference rather
+/// than called: the production arithmetic is `pll.rs`'s, and this is the second
+/// implementation the comparison below measures it against.
 ///
 /// §6.3: a flat divider list, the window `[7998, 10000] MHz`, a 8999 MHz
 /// midpoint, and the first candidate achieving the minimum distance from that
@@ -853,44 +853,105 @@ fn documented_total_divider(symbol_rate_khz: u32) -> Option<u32> {
     best.map(|(_, divider)| divider)
 }
 
-/// How far `pll.rs`'s search is from the one §6.3 transcribes for ADL-N.
+/// The Skylake search `pll.rs` implemented before `fix/intel-pll-adln`, kept
+/// here as the other half of the measurement below.
 ///
-/// `pll.rs` implements the **Skylake** search: three central frequencies
-/// (8400/9000/9600 MHz), an asymmetric `+1%/-6%` tolerance, and a divider list
-/// that is the Skylake one -- including the total divider 35, which §6.3 says
-/// the ADL-N list does not contain.  §6.3's corrections 1 and 2 record that
-/// ADL-N uses the `icl_calc_wrpll` search transcribed above instead.  Both find
-/// a divider for the target mode and both land on 12 for it, which is why the
-/// reference's worked example comes out exactly right; they are not the same
-/// function, and this test measures the difference instead of asserting that
-/// there is none.
+/// `[I915]` `skl_ddi_calculate_wrpll` (`display/intel_dpll_mgr.c:1660-1730`):
+/// three central frequencies, the asymmetric `+1%`/`-6%` tolerance, an exact
+/// hit ending the search, and the even list winning outright if anything in it
+/// was accepted.  This is test code and it is *deliberately* dead arithmetic:
+/// the numbers it produces are the historical measurement, and without it
+/// there would be no way to re-measure the divergence the fix removed, or to
+/// notice a revert to it.
 ///
-/// The numbers are pinned deliberately: if `pll.rs` is later brought onto the
-/// ADL-N path, this test fails and the failure is the finding.  They are the
-/// one place a reader can see the size of the gap, and
-/// `docs/design/intel-output.md` carries the same figures.
+/// It returns the divider and the DCO that divider produces, in kHz.
+fn skylake_total_divider(symbol_rate_khz: u32) -> Option<(u32, u64)> {
+    const CENTRES_KHZ: [u64; 3] = [8_400_000, 9_000_000, 9_600_000];
+    const EVEN: &[u32] = &[
+        4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 30, 32, 36, 40, 42, 44, 48, 52, 54, 56, 60, 64,
+        66, 68, 70, 72, 76, 78, 80, 84, 88, 90, 92, 96, 98,
+    ];
+    const ODD: &[u32] = &[3, 5, 7, 9, 15, 21, 35];
+    let afe_clock = 5 * u64::from(symbol_rate_khz);
+    let mut best: Option<(u64, u32)> = None;
+    for (index, list) in [EVEN, ODD].into_iter().enumerate() {
+        let mut exact = false;
+        for centre in CENTRES_KHZ {
+            for &divider in list {
+                let dco = u64::from(divider) * afe_clock;
+                let deviation = 10_000 * centre.abs_diff(dco) / centre;
+                // Positive deviation above the centre has the tighter bound.
+                let within_tolerance = if dco >= centre {
+                    deviation < 100
+                } else {
+                    deviation < 600
+                };
+                if within_tolerance && best.is_none_or(|(smallest, _)| deviation < smallest) {
+                    best = Some((deviation, divider));
+                }
+                if best.is_some_and(|(smallest, _)| smallest == 0) {
+                    exact = true;
+                    break;
+                }
+            }
+            if exact {
+                break;
+            }
+        }
+        // The even list is index 0, and an accepted even divider ends the
+        // search -- the rule that let a 5.95%-off even divider beat an exact odd
+        // one.
+        if index == 0 && best.is_some() {
+            break;
+        }
+    }
+    best.map(|(_, divider)| (divider, u64::from(divider) * afe_clock))
+}
+
+/// The PRM's DCO window, as the comparison below uses it.
+fn inside_window(dco_khz: u64) -> bool {
+    (7_998_000..=10_000_000).contains(&dco_khz)
+}
+
+/// How far `pll.rs` is from the search §6.3 transcribes for ADL-N, and how far
+/// the Skylake search it used to implement is from it.
+///
+/// **The first measurement is now zero**, and that is the point: `pll.rs`
+/// implements the ADL-N search, so it agrees with the reference transcription on
+/// every rate and every published mode, and every divider it returns is inside
+/// the PRM's DCO window.  Before `fix/intel-pll-adln` it implemented the
+/// Skylake search, and the second measurement here re-derives what that cost:
+/// 114 of the 574 rates both searches could reach got a different divider, 12 of
+/// those put the DCO outside the window -- and so did all 7 of the rates only
+/// the Skylake search could reach at all.
+///
+/// Both halves are pinned deliberately.  The first fails if `pll.rs` is ever
+/// moved off the ADL-N path; the second fails if this test stops being able to
+/// see the difference, which is what would happen if the measurement were
+/// reduced to a claim about a search nobody re-derives.  They are the one place
+/// a reader can see the size of the gap, and `docs/design/intel-output.md` and
+/// `docs/design/intel-pll.md` §3.3 carry the same figures.
 #[test]
 fn pll_rs_search_is_measured_against_the_documented_adl_n_search() {
     // The whole symbol-rate range the DCO window and the divider list can
     // reach, in 1 MHz steps: 16 to 1000 MHz is 985 rates.
     let rates = (16_000..=1_000_000u32).step_by(1_000);
-    let mut compared = 0u32;
+
+    // -- the production search against the reference transcription ----------
+    let mut covered = 0u32;
     let mut different_divider = 0u32;
-    let mut different_and_outside_window = 0u32;
     let mut outside_window = 0u32;
     let mut only_pll = 0u32;
     let mut only_documented = 0u32;
-    for rate in rates {
+    let mut neither = 0u32;
+    for rate in rates.clone() {
         let ours = pll::ddi_pll_dividers(rate, STRAP_38_4, ComboPhy::A);
         let documented = documented_total_divider(rate);
         match (ours, documented) {
             (Ok(ours), Some(documented)) => {
-                compared += 1;
+                covered += 1;
                 if ours.total_divider() != documented {
                     different_divider += 1;
-                    if !ours.inside_prm_dco_window() {
-                        different_and_outside_window += 1;
-                    }
                 }
                 if !ours.inside_prm_dco_window() {
                     outside_window += 1;
@@ -898,11 +959,11 @@ fn pll_rs_search_is_measured_against_the_documented_adl_n_search() {
             }
             (Ok(_), None) => only_pll += 1,
             (Err(_), Some(_)) => only_documented += 1,
-            (Err(_), None) => {}
+            (Err(_), None) => neither += 1,
         }
     }
-    // The target mode is one of the rates where the two agree, which is why
-    // this bring-up can proceed on `pll.rs` at all.
+    // The target mode is one of the rates where the two always agreed, which is
+    // why this bring-up could proceed before the fix as well as after it.
     assert_eq!(documented_total_divider(148_500), Some(12));
     assert_eq!(
         pll::ddi_pll_dividers(148_500, STRAP_38_4, ComboPhy::A)
@@ -911,31 +972,90 @@ fn pll_rs_search_is_measured_against_the_documented_adl_n_search() {
         12
     );
 
-    // Measured on this host with the tree as committed, over 985 symbol rates.
+    // Measured on this host with the tree as committed: `pll.rs` and the
+    // transcription agree everywhere, no answer is outside the window, and the
+    // 166 rates neither can make are the two gap bands between the candidate
+    // list's entries (500.25-533 MHz and 666.75-799.75 MHz).
+    assert_eq!(
+        (
+            covered,
+            different_divider,
+            outside_window,
+            only_pll,
+            only_documented,
+            neither
+        ),
+        (819, 0, 0, 0, 0, 166)
+    );
+
+    // -- the same 985 rates against the search `pll.rs` used to implement ----
+    let mut compared = 0u32;
+    let mut skylake_different = 0u32;
+    let mut skylake_different_and_outside = 0u32;
+    let mut skylake_outside = 0u32;
+    let mut only_skylake = 0u32;
+    let mut only_skylake_outside = 0u32;
+    let mut only_adl_n = 0u32;
+    for rate in rates {
+        let skylake = skylake_total_divider(rate);
+        let documented = documented_total_divider(rate);
+        match (skylake, documented) {
+            (Some((divider, dco)), Some(documented)) => {
+                compared += 1;
+                if divider != documented {
+                    skylake_different += 1;
+                    if !inside_window(dco) {
+                        skylake_different_and_outside += 1;
+                    }
+                }
+                if !inside_window(dco) {
+                    skylake_outside += 1;
+                }
+            }
+            (Some((_, dco)), None) => {
+                only_skylake += 1;
+                if !inside_window(dco) {
+                    only_skylake_outside += 1;
+                }
+            }
+            (None, Some(_)) => only_adl_n += 1,
+            (None, None) => {}
+        }
+    }
     // Reading the tuple: 574 rates both searches can make, 114 of those where
-    // they pick a different total divider, 12 of those 114 where `pll.rs`'s
+    // they pick a different total divider, 12 of those 114 where the Skylake
     // choice is also outside the PRM's `[7998, 10000] MHz` window (and 12 is
-    // the whole out-of-window count), 7 rates only `pll.rs`'s list reaches, and
-    // 245 rates only the documented ADL-N list reaches.  The remaining 159
-    // rates neither can make.
+    // the whole out-of-window count), 7 rates only the Skylake list reaches,
+    // and 245 rates only the documented ADL-N list reaches.
     assert_eq!(
         (
             compared,
-            different_divider,
-            different_and_outside_window,
-            outside_window,
-            only_pll,
-            only_documented
+            skylake_different,
+            skylake_different_and_outside,
+            skylake_outside,
+            only_skylake,
+            only_adl_n
         ),
         (574, 114, 12, 12, 7, 245)
     );
+    // The 7 rates the fix gives up are 527-533 MHz, where the Skylake search
+    // took divider 3 at 7905-7995 MHz -- every one of them below the window's
+    // 7998 MHz floor.  Nothing that used to lock stops locking.
+    assert_eq!(
+        only_skylake_outside, only_skylake,
+        "every rate only the Skylake search could reach had an out-of-window DCO anyway"
+    );
 
-    // The same comparison over the modes this kernel actually publishes.  The
-    // interlaced rows are skipped because `timing.rs` refuses them anyway.
-    let mut modes_compared = 0u32;
+    // -- the same comparison over the modes this kernel publishes ----------
+    // The interlaced rows are skipped because `timing.rs` refuses them anyway.
+    let mut modes_covered = 0u32;
     let mut modes_different = 0u32;
     let mut modes_only_pll = 0u32;
     let mut modes_only_documented = 0u32;
+    let mut modes_skylake_compared = 0u32;
+    let mut modes_skylake_different = 0u32;
+    let mut modes_only_skylake = 0u32;
+    let mut modes_only_adl_n = 0u32;
     let dmt = DMT_TIMINGS.iter().map(|entry| entry.mode);
     let cta = CTA_VIC_TIMINGS.iter().map(|entry| entry.mode);
     for mode in dmt.chain(cta) {
@@ -946,7 +1066,7 @@ fn pll_rs_search_is_measured_against_the_documented_adl_n_search() {
         let documented = documented_total_divider(mode.clock_khz);
         match (ours, documented) {
             (Ok(ours), Some(documented)) => {
-                modes_compared += 1;
+                modes_covered += 1;
                 if ours.total_divider() != documented {
                     modes_different += 1;
                 }
@@ -955,22 +1075,55 @@ fn pll_rs_search_is_measured_against_the_documented_adl_n_search() {
             (Err(_), Some(_)) => modes_only_documented += 1,
             (Err(_), None) => {}
         }
+        match (skylake_total_divider(mode.clock_khz), documented) {
+            (Some((divider, _)), Some(documented)) => {
+                modes_skylake_compared += 1;
+                if divider != documented {
+                    modes_skylake_different += 1;
+                }
+            }
+            (Some(_), None) => modes_only_skylake += 1,
+            (None, Some(_)) => modes_only_adl_n += 1,
+            (None, None) => {}
+        }
     }
+    // `pll.rs` now makes every published progressive mode the transcription
+    // can, with no disagreement at all.
     assert_eq!(
         (
-            modes_compared,
+            modes_covered,
             modes_different,
             modes_only_pll,
             modes_only_documented
+        ),
+        (182, 0, 0, 0)
+    );
+    // The historical measurement, re-derived: one published mode (CTA VIC 92)
+    // was reachable only by the documented search, and 56 of the 181 both could
+    // make got a different divider.  56 of 181 is nearly a third.
+    assert_eq!(
+        (
+            modes_skylake_compared,
+            modes_skylake_different,
+            modes_only_skylake,
+            modes_only_adl_n
         ),
         (181, 56, 0, 1)
     );
 
     // The single published mode in that last bucket is CTA VIC 92 --
-    // 2560x1440p @ 120 Hz, 495 MHz -- and this sequence refuses it before the
-    // arithmetic is reached anyway, because it is above the scrambling gate.
+    // 2560x1440p @ 120 Hz, 495 MHz.  Before the fix the PLL search refused it
+    // and now it does not; the sequence still refuses it, but at the scrambling
+    // gate, which is earlier than the arithmetic.
     assert!(documented_total_divider(495_000).is_some());
-    assert!(pll::ddi_pll_dividers(495_000, STRAP_38_4, ComboPhy::A).is_err());
+    assert!(pll::ddi_pll_dividers(495_000, STRAP_38_4, ComboPhy::A).is_ok());
+    assert!(matches!(
+        OutputProgram::plan(
+            &OutputRequest::hdmi(Ddi::A, vic(92), PllFieldEncoding::Named).with_swing(test_swing()),
+            STRAP_38_4
+        ),
+        Err(OutputError::HdmiScramblingNotImplemented { .. })
+    ));
 }
 
 /// DVI is the same sequence with a different mode select, and the reference
