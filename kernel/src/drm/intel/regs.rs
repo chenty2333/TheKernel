@@ -111,8 +111,22 @@ pub(crate) enum Meaning {
     StolenMemoryBase,
     /// The physical base of the global page table.
     GttBase,
-    /// A register the display bring-up owns: a power well, a clock, a fuse that
-    /// selects a clock's reference, a display buffer slice or a combo PHY.
+    /// One register of the GMBUS controller, the I2C master that carries DDC
+    /// and therefore EDID.  The probe's report does not read these; the
+    /// protocol that gives them meaning lives in [`super::gmbus`].
+    BusController,
+    /// A register of the south display's hotplug-detect block: the per-DDI
+    /// enable, the latched detect field, the live connect state and the board
+    /// polarity bit.  Interpreted by [`super::hpd`], not by the probe.
+    Hotplug,
+    /// A display power well's request or state register.  Interpreted by
+    /// [`super::power`], which is the module that requests and releases wells;
+    /// [`super::gmbus`] reads one state bit to explain a NAKed DDC transaction
+    /// and writes none of them.
+    PowerWell,
+    /// A display bring-up register that no variant above describes: a clock, a
+    /// fuse that selects a clock's reference, a display buffer slice, a combo
+    /// PHY register, a workaround or an error mask.
     ///
     /// It carries no decoding here on purpose.  These registers are read and
     /// written by `power`, `clk` and `phy`, which interpret them and log what
@@ -615,24 +629,24 @@ pub(crate) const SKL_FUSE_STATUS: Register =
 /// this one has its request bit set was requested by the firmware all along.
 /// Reference §4.2; `[I915]` `i915_reg.h:3626`.
 pub(crate) const HSW_PWR_WELL_CTL1: Register =
-    Register::read_only("HSW_PWR_WELL_CTL1", 0x4_5400, Meaning::BringUp, None);
+    Register::read_only("HSW_PWR_WELL_CTL1", 0x4_5400, Meaning::PowerWell, None);
 
 /// `HSW_PWR_WELL_CTL2`, the driver's power well request register.
 ///
 /// The only power well register this kernel writes.  Reference §4.2 and §4.4;
 /// `[I915]` `i915_reg.h:3627`.
 pub(crate) const HSW_PWR_WELL_CTL2: Register =
-    Register::read_write("HSW_PWR_WELL_CTL2", 0x4_5404, Meaning::BringUp, None);
+    Register::read_write("HSW_PWR_WELL_CTL2", 0x4_5404, Meaning::PowerWell, None);
 
 /// `HSW_PWR_WELL_CTL3`, the KVMR requester's register.  Read for diagnosis.
 /// Reference §4.2; `[I915]` `i915_reg.h:3628`.
 pub(crate) const HSW_PWR_WELL_CTL3: Register =
-    Register::read_only("HSW_PWR_WELL_CTL3", 0x4_5408, Meaning::BringUp, None);
+    Register::read_only("HSW_PWR_WELL_CTL3", 0x4_5408, Meaning::PowerWell, None);
 
 /// `HSW_PWR_WELL_CTL4`, the debug requester's register.  Read for diagnosis.
 /// Reference §4.2; `[I915]` `i915_reg.h:3629`.
 pub(crate) const HSW_PWR_WELL_CTL4: Register =
-    Register::read_only("HSW_PWR_WELL_CTL4", 0x4_540C, Meaning::BringUp, None);
+    Register::read_only("HSW_PWR_WELL_CTL4", 0x4_540C, Meaning::PowerWell, None);
 
 /// `ICL_PWR_WELL_CTL_AUX2`, the driver's AUX power well request register.
 ///
@@ -642,12 +656,12 @@ pub(crate) const HSW_PWR_WELL_CTL4: Register =
 /// register so that step needs a name, not a new mechanism.
 /// Reference §4.2; `[I915]` `i915_reg.h:3663`.
 pub(crate) const ICL_PWR_WELL_CTL_AUX2: Register =
-    Register::read_write("ICL_PWR_WELL_CTL_AUX2", 0x4_5444, Meaning::BringUp, None);
+    Register::read_write("ICL_PWR_WELL_CTL_AUX2", 0x4_5444, Meaning::PowerWell, None);
 
 /// `ICL_PWR_WELL_CTL_DDI2`, the driver's DDI IO power well request register.
 /// Reference §4.2 and §11 phase 5; `[I915]` `i915_reg.h:3691`.
 pub(crate) const ICL_PWR_WELL_CTL_DDI2: Register =
-    Register::read_write("ICL_PWR_WELL_CTL_DDI2", 0x4_5454, Meaning::BringUp, None);
+    Register::read_write("ICL_PWR_WELL_CTL_DDI2", 0x4_5454, Meaning::PowerWell, None);
 
 /// `DC_STATE_EN`, the display C-state request.
 ///
@@ -861,6 +875,134 @@ pub(crate) const POWER_AND_CLOCK_REGISTERS: &[Register] = &[
     GEN11_CHICKEN_DCPR_2,
     XELPD_DISPLAY_ERR_FATAL_MASK,
 ];
+
+// ---------------------------------------------------------------------------
+// The registers the DDC/EDID transport and hotplug detect own.
+//
+// These are separate from `NAMED` for the same reason the bring-up registers
+// are: `NAMED` is what the boot probe reads, and its claim is that the probe
+// writes nothing, while the transport below has to program the controller.
+// They are separate from `POWER_AND_CLOCK_REGISTERS` because the module that
+// interprets them is `gmbus` or `hpd`, not `power`.
+//
+// One register that `gmbus` *reads* is deliberately not here.
+// `ICL_PWR_WELL_CTL_AUX2` (0x45444) is declared once, in the power bring-up
+// table above, because the module that programs wells owns the register: the
+// two workstreams reached for it independently and one declaration is the
+// answer.  `gmbus` reads its state bit to explain a NAK and writes nothing,
+// which its own tests assert, so the power module's writable declaration is
+// not a loosening of anything this module does.
+// ---------------------------------------------------------------------------
+
+/// The GMBUS controller: Intel's I2C master for DDC, and therefore the way an
+/// EDID is read.
+///
+/// The block sits in the south display window at `0xC0000`, the base a Gen12
+/// part without a GMCH puts its PCH display registers at (`[I915]`
+/// `display/intel_gmbus.c:871-879`; reference §9.1).  Offsets are `[I915]`
+/// `display/intel_gmbus_regs.h:29-79`.
+///
+/// **Provenance, and it is weaker here than anywhere else in this file.**  Of
+/// these registers only `GMBUS0` appears in any public Intel Gen12 register
+/// volume; the reference says so explicitly (§9.2, and §13.1 item 2, which
+/// records that the TGL, DG1 and RKL volumes were all searched).  The whole
+/// transaction protocol therefore rests on `[I915]` alone, which is why every
+/// field mask in [`super::gmbus`] carries its own citation and why this driver
+/// prefers to poll a status register it can read back over anything it cannot.
+///
+/// Access is stated per register rather than inherited from the block:
+///
+/// * `GMBUS2` (status) and `GMBUS3` (data) are read-only *here* because this
+///   driver never writes them -- the index cycle this driver uses carries the
+///   index byte in `GMBUS1`, so `GMBUS3` is only ever read.  A later driver
+///   that speaks DPCD over I2C needs `GMBUS3` writable, and that is an
+///   addition to this table rather than a relaxation of it.
+/// * `GMBUS4` (interrupt mask) is written only with zero: this kernel takes no
+///   GMBUS interrupt, so the mask is cleared and completion is polled.
+/// * `GMBUS5` (two-byte index) is cleared before a transaction.  See
+///   [`super::gmbus`] for why clearing it is worth a write to a register no
+///   public volume defines.
+/// * `SDEISR` is read-only and not merely by convention: it is
+///   write-one-to-clear, so a stray write would discard the state a caller
+///   came to read.
+pub(crate) const BUS: &[Register] = &[
+    GMBUS0,
+    GMBUS1,
+    GMBUS2,
+    GMBUS3,
+    GMBUS4,
+    GMBUS5,
+    SHOTPLUG_CTL_DDI,
+    SDEISR,
+    SOUTH_CHICKEN1,
+    SHPD_FILTER_CNT,
+];
+
+/// Clock/port select: the pin index and the bus rate.
+pub(crate) const GMBUS0: Register =
+    Register::read_write("GMBUS0", 0xc5100, Meaning::BusController, None);
+
+/// Command and status: cycle type, byte count, slave address, direction.
+pub(crate) const GMBUS1: Register =
+    Register::read_write("GMBUS1", 0xc5104, Meaning::BusController, None);
+
+/// Status: the bits a transaction is driven by.
+pub(crate) const GMBUS2: Register =
+    Register::read_only("GMBUS2", 0xc5108, Meaning::BusController, None);
+
+/// The four-byte data buffer.
+pub(crate) const GMBUS3: Register =
+    Register::read_only("GMBUS3", 0xc510c, Meaning::BusController, None);
+
+/// The interrupt mask.  Written with zero: completion is polled, not taken.
+pub(crate) const GMBUS4: Register =
+    Register::read_write("GMBUS4", 0xc5110, Meaning::BusController, None);
+
+/// The two-byte index enable and value.
+pub(crate) const GMBUS5: Register =
+    Register::read_write("GMBUS5", 0xc5120, Meaning::BusController, None);
+
+/// DDI hotplug control, one four-bit field per DDI (`[I915]`
+/// `i915_reg.h:3078-3085`; reference §9.5).
+///
+/// The address is a reuse: on older platforms `0xc4030` is `PCH_PORT_HOTPLUG`
+/// with a different field layout, including three `BXT_DDI*_HPD_INVERT` bits
+/// at 27/11/3 (`[I915]` `i915_reg.h:3023-3064`).  On ADL-N the split
+/// `SHOTPLUG_CTL_DDI`/`SHOTPLUG_CTL_TC` layout applies, which is what
+/// [`super::hpd`] programs.
+///
+/// The per-DDI two-bit detect field is a status latch, not a control field:
+/// `[I915]` reads it to classify a hotplug event (`intel_hotplug_irq.c`
+/// `icp_ddi_port_hotplug_long_detect`, and `:564-572`), so [`super::hpd`]
+/// enables detection without ever writing it.
+pub(crate) const SHOTPLUG_CTL_DDI: Register =
+    Register::read_write("SHOTPLUG_CTL_DDI", 0xc4030, Meaning::Hotplug, None);
+
+/// South display interrupt status: where the *live* connect state of a DDI is
+/// read, per the PRM's advice quoted in reference §9.4.
+pub(crate) const SDEISR: Register = Register::read_only("SDEISR", 0xc4000, Meaning::Hotplug, None);
+
+/// The south display's first "chicken" register.
+///
+/// The reference records it as `[GAP]` (item 10 of §13.1): the DG1 PRM requires
+/// `0xC2000[18:15] = 1111b` for board hotplug inversion but did not say what
+/// the register is called.  It is `SOUTH_CHICKEN1` (`[I915]`
+/// `i915_reg.h:3358`), and the field is not one four-bit value but one bit per
+/// DDI -- `INVERT_DDIA_HPD` through `INVERT_DDID_HPD` at bits 15..18
+/// (`i915_reg.h:3367-3370`) -- which is what lets a board invert one port
+/// instead of all four.  `[I915]` applies it only for DG1
+/// (`intel_hotplug_irq.c:883-904`), so [`super::hpd`] reports it and changes it
+/// only when a caller asks.
+pub(crate) const SOUTH_CHICKEN1: Register =
+    Register::read_write("SOUTH_CHICKEN1", 0xc2000, Meaning::Hotplug, None);
+
+/// Hotplug pulse filter (`[I915]` `i915_reg.h:3092`; reference §9.5).
+///
+/// Read-only: the filter shapes interrupt *pulses*, and this workstream
+/// deliberately enables detection without taking an interrupt, so it has no
+/// business changing it.
+pub(crate) const SHPD_FILTER_CNT: Register =
+    Register::read_only("SHPD_FILTER_CNT", 0xc4038, Meaning::Hotplug, None);
 
 #[cfg(test)]
 pub(crate) mod mock {
@@ -1425,5 +1567,122 @@ mod tests {
         // through the window.
         assert!(!register.write(SKL_DFSM, 0));
         assert_eq!(register.read64(SKL_DFSM), None);
+    }
+
+    #[test]
+    fn every_bus_register_is_addressable_and_classified() {
+        // The same properties the other tables have to satisfy, for the same
+        // reason: a register outside a forcewake-free band answers zero for the
+        // wrong reason, and one outside the mapped window has no address at
+        // all.
+        for register in BUS {
+            assert_eq!(register.offset() % 4, 0, "{}", register.name());
+            assert!(
+                is_forcewake_free(register.offset()),
+                "{} is outside the forcewake-free bands",
+                register.name()
+            );
+            assert!(
+                is_forcewake_free(register.offset() + register.width().bytes() as u32 - 4),
+                "{} has a second dword outside the forcewake-free bands",
+                register.name()
+            );
+            assert!(
+                register.fits_in(PROBE_WINDOW),
+                "{} is outside the mapped window",
+                register.name()
+            );
+        }
+        // The window the probe maps must cover the south display block these
+        // registers live in, or nothing here could be reached on the target.
+        assert!(PROBE_WINDOW as u32 > 0xc5120 + 4, "the GMBUS block");
+    }
+
+    #[test]
+    fn writing_the_bus_is_an_explicit_list() {
+        // Writable is a statement about this kernel.  This test is the list: if
+        // a register becomes writable, that is a deliberate change to what the
+        // kernel may do to real hardware, and it should fail here first.
+        let writable: vec::Vec<&str> = BUS
+            .iter()
+            .filter(|register| register.is_writable())
+            .map(|register| register.name())
+            .collect();
+        assert_eq!(
+            writable,
+            vec![
+                "GMBUS0",           // pin select and rate
+                "GMBUS1",           // the transaction itself
+                "GMBUS4",           // interrupt mask, cleared to zero
+                "GMBUS5",           // two-byte index, cleared to zero
+                "SHOTPLUG_CTL_DDI", // hotplug enable
+                "SOUTH_CHICKEN1",   // board HPD inversion, when a caller asks
+            ]
+        );
+        // Status, data and the write-one-to-clear interrupt status stay
+        // read-only: a write to SDEISR would clear the very state a caller
+        // reads it for.
+        for name in ["GMBUS2", "GMBUS3", "SDEISR", "SHPD_FILTER_CNT"] {
+            let register = BUS
+                .iter()
+                .find(|register| register.name() == name)
+                .unwrap_or_else(|| panic!("{name} is not in the bus table"));
+            assert!(!register.is_writable(), "{name} must stay read-only");
+        }
+    }
+
+    #[test]
+    fn no_two_tables_declare_the_same_register() {
+        // This merge had two declarations of 0x45444 (`ICL_PWR_WELL_CTL_AUX2`):
+        // the power workstream declared it because it writes wells, and this
+        // workstream declared it because a NAKed DDC transaction is diagnosed
+        // against its state bit.  One register, one declaration, one owner --
+        // so this test walks every table and refuses a second one, by name or
+        // by offset.  A name duplicated across tables is the failure mode that
+        // rots quietly: two decodings, two access classifications, and no
+        // single answer to "who owns this address".
+        let mut seen: vec::Vec<(&str, u32)> = vec::Vec::new();
+        for register in NAMED
+            .iter()
+            .copied()
+            .chain(POWER_AND_CLOCK_REGISTERS.iter().copied())
+            .chain(every_combo_phy_register())
+            .chain(BUS.iter().copied())
+        {
+            for (name, offset) in &seen {
+                assert_ne!(
+                    *name,
+                    register.name(),
+                    "{} is declared in two tables",
+                    register.name()
+                );
+                assert_ne!(
+                    *offset,
+                    register.offset(),
+                    "{:#x} is declared twice: {} and {}",
+                    register.offset(),
+                    name,
+                    register.name()
+                );
+            }
+            seen.push((register.name(), register.offset()));
+        }
+
+        // The one register this module reads outside its own table is the AUX
+        // power well, and it is the power module's declaration: writable,
+        // because that module programs wells, and read here to name a failure.
+        // Nothing in `gmbus` writes it -- its tests assert that -- so the
+        // classification is the owner's and no access rule was loosened.
+        let well = POWER_AND_CLOCK_REGISTERS
+            .iter()
+            .find(|register| register.offset() == 0x4_5444)
+            .expect("the AUX power well register must be declared");
+        assert_eq!(well.name(), "ICL_PWR_WELL_CTL_AUX2");
+        assert_eq!(well.meaning(), Meaning::PowerWell);
+        assert!(well.is_writable(), "the power module programs this register");
+        assert!(
+            !BUS.iter().any(|register| register.offset() == 0x4_5444),
+            "the bus table must not declare the power module's register"
+        );
     }
 }
