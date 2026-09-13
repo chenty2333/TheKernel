@@ -15,7 +15,7 @@
 //!
 //! Nothing here says anything about an Alder Lake-N part.
 
-use alloc::{vec, vec::Vec};
+use alloc::{format, vec, vec::Vec};
 use core::cell::{Cell, RefCell};
 
 use super::*;
@@ -529,12 +529,16 @@ fn the_sink_step_still_finds_what_it_found_before_this_module_composed_it() {
     assert!(plan.strict, "{:?}", plan.edid_error);
     assert_eq!(plan.selection.mode.clock_khz, 148_500);
 
-    let text = sink::SinkReport {
-        devices: vec![device],
-    }
-    .render();
+    // The rendering this module replaced lived on a `SinkReport` that nothing
+    // constructs any more; what the step found is now asserted directly, which
+    // is the same claim without a type kept alive only to be printed once.
+    let text = device.pins.render();
     assert!(text.contains("monitor on pin 2"), "{text}");
-    assert!(text.contains("1920x1080"), "{text}");
+    assert!(
+        format!("{}", plan.selection.mode).contains("1920x1080"),
+        "{}",
+        plan.selection.mode
+    );
 }
 
 #[test]

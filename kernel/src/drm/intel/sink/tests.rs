@@ -77,10 +77,7 @@ fn a_monitor_is_found_and_the_mode_layer_reads_the_bytes_this_kernel_asked_for()
 
     // And the whole thing is legible in the report a person reads off the
     // screen or out of the debug file.
-    let report = SinkReport {
-        devices: vec![device],
-    };
-    let text = report.render();
+    let text = device.render();
     assert!(text.contains("display 0000:00:02.0"), "{text}");
     assert!(text.contains("monitor on pin 2"), "{text}");
     assert!(text.contains("1920x1080"), "{text}");
@@ -103,10 +100,7 @@ fn nothing_plugged_in_says_so_on_every_pin_and_names_the_power_well() {
         3,
         "DDI A, B and C are all asked"
     );
-    let report = SinkReport {
-        devices: vec![device],
-    };
-    let text = report.render();
+    let text = device.render();
     assert!(text.contains("no monitor"), "{text}");
     // The diagnosis the power workstream needs, in the words of the reference.
     assert!(text.contains("AUX_A"), "{text}");
@@ -187,10 +181,7 @@ fn a_window_that_does_not_reach_the_registers_is_reported_and_not_guessed_at() {
     for (ddi, error) in &device.hotplug_errors {
         assert!(matches!(error, HpdError::WindowTooSmall { .. }), "{ddi}");
     }
-    let report = SinkReport {
-        devices: vec![device],
-    };
-    let text = report.render();
+    let text = device.render();
     assert!(text.contains("does not reach"), "{text}");
     assert!(
         text.contains(&format!("register {}", "SHOTPLUG_CTL_DDI")) || text.contains("GMBUS0"),

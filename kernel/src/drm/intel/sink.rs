@@ -31,13 +31,12 @@
 
 use alloc::{format, string::String, vec::Vec};
 
-use axlog::{info, warn};
+use axlog::warn;
 
 use super::{
-    gmbus::{self, EdidBytes, MonotonicTimer, Pin, PollTimer, SinkProbe},
+    gmbus::{self, EdidBytes, Pin, PollTimer, SinkProbe},
     hpd::{self, Ddi, HpdError, HpdStatus},
     pci::Bdf,
-    probe::{ProbeReport, WindowStatus},
     regs::Registers,
 };
 use crate::drm::modes::{self, Constraints, ModePlan};
@@ -61,66 +60,37 @@ pub(crate) struct DeviceSink {
     pub(crate) hotplug_errors: Vec<(Ddi, HpdError)>,
 }
 
-/// What phase 2 found, for the log and for the debug file.
-#[derive(Default)]
-pub(crate) struct SinkReport {
-    pub(crate) devices: Vec<DeviceSink>,
-}
-
-impl SinkReport {
-    /// The same text the log carries, for `/sys/kernel/debug/dri/0/intel_gpu`.
+impl DeviceSink {
+    /// What phase 2 found on this device, as the lines a person reads off the
+    /// screen or out of `/sys/kernel/debug/dri/0/intel_gpu`.
     ///
-    /// Every line is prefixed, so a reader who pipes the file into a log can
-    /// grep one word to find all of it, exactly as the probe's own report does.
+    /// The rendering lives on the value rather than on a report type that
+    /// aggregates devices: the aggregation is the connector step's
+    /// (`connect::ConnectReport`), and what is left here is one display's own
+    /// facts.  Every line is prefixed, so a reader who pipes the file into a log
+    /// can grep one word to find all of it, exactly as the probe's report does.
     pub(crate) fn render(&self) -> String {
-        if self.devices.is_empty() {
-            return String::new();
+        let mut out = format!("display {}:\n", self.bdf);
+        out.push_str(&self.pins.render());
+        if let Some(extension) = &self.extension {
+            out.push_str(&format!("  extension block: {}\n", extension.describe()));
         }
-        let mut out = String::from("\n--- the sink (reference section 11 phase 2) ---\n");
-        for device in &self.devices {
-            out.push_str(&format!("display {}:\n", device.bdf));
-            out.push_str(&device.pins.render());
-            if let Some(extension) = &device.extension {
-                out.push_str(&format!("  extension block: {}\n", extension.describe()));
-            }
-            if let Some(plan) = &device.plan {
-                out.push_str(&format!(
-                    "  mode layer chose {} ({:?}{})\n",
-                    plan.selection.mode,
-                    plan.selection.reason,
-                    if plan.strict { "" } else { ", lenient parse" }
-                ));
-            }
-            for status in &device.hotplug {
-                out.push_str(&format!("  {}\n", status.describe()));
-            }
-            for (ddi, error) in &device.hotplug_errors {
-                out.push_str(&format!("  {ddi}: {}\n", error.describe()));
-            }
+        if let Some(plan) = &self.plan {
+            out.push_str(&format!(
+                "  mode layer chose {} ({:?}{})\n",
+                plan.selection.mode,
+                plan.selection.reason,
+                if plan.strict { "" } else { ", lenient parse" }
+            ));
+        }
+        for status in &self.hotplug {
+            out.push_str(&format!("  {}\n", status.describe()));
+        }
+        for (ddi, error) in &self.hotplug_errors {
+            out.push_str(&format!("  {ddi}: {}\n", error.describe()));
         }
         out
     }
-}
-
-/// Ask every display device the probe mapped what is attached to it.
-///
-/// The devices are the ones whose register window the probe mapped and
-/// identified; a device with no window is skipped rather than guessed at, which
-/// is the same policy the probe applies to a part it has no model for.  One
-/// device's failure never stops the next.
-pub(crate) fn probe_at_boot(report: &ProbeReport) -> SinkReport {
-    let mut devices = Vec::new();
-    for found in &report.displays {
-        let WindowStatus::Mapped { window, .. } = found.status else {
-            continue;
-        };
-        info!(
-            "intel-sink: looking for a monitor on {} (reference section 11 phase 2)",
-            found.info.bdf
-        );
-        devices.push(probe_one(found.info.bdf, &window, &MonotonicTimer));
-    }
-    SinkReport { devices }
 }
 
 /// Phase 2 against one register file.
