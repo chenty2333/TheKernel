@@ -19,11 +19,16 @@ Two procedures are described and it matters which is which:
 
 ## 1. Capture the machine's hardware facts
 
-The kernel's assumptions about this machine are guesses. This replaces them
-with bytes read from the machine: above all the **PCI ECAM base** (TheKernel
-takes it from `axconfig::devices::PCI_ECAM_BASE`, a QEMU value, consumed at
-`crates/ax/thekernel-axdriver/src/bus/pci.rs:225`; another workstream is adding
-ACPI MCFG discovery) and everything about the **integrated graphics**.
+The kernel now reads the one fact firmware can tell it: the **PCI ECAM base**
+comes from the ACPI MCFG table at boot, and it falls back to the configured
+`pci-ecam-base` only when firmware publishes nothing usable (`n305.toml` ships
+the documented Alder Lake default as that fallback). The capture is therefore
+the *check* on that discovery rather than its replacement: it carries the raw
+MCFG bytes, an independent decode of them, and the kernel's own ECAM line, so
+discovery can be confirmed against the machine instead of trusted. Everything
+firmware does **not** tell the kernel is in the bundle too — above all the
+**integrated graphics**: BARs, the OpRegion with its VBT, the driver's debug
+state, the framebuffer's format and the EDID of the attached sink.
 
 ### 1.1 Build the capture image (development host, no root needed)
 
@@ -73,6 +78,20 @@ the live environment did not find its payload partition; power-cycle and try
 once more, and if it repeats, rebuild the stick. The payload cannot print a
 diagnostic in that case, because the code that would print it is what was not
 found.
+
+That failure is a race, and it is worth knowing why it can happen at all.
+Alpine's initramfs scans block devices as their kernel events arrive, stops as
+soon as it holds both a package repository and the apkovl, and shortens its
+patience from five seconds to 250 ms the moment it finds the ISO's repository.
+On a machine that enumerates its disk quickly, the payload partition's event
+can arrive after it has given up. The image narrows the race from this side —
+the payload partition sits in the first partition slot, so its event is
+generated first, and it carries the live system's own package repository, so
+one scan of it satisfies the whole search — but the race cannot be removed from
+outside. Removing it means naming the apkovl on the kernel command line
+(`apkovl=LABEL=HWDUMP:alpine.apkovl.tar.gz`), which needs a boot configuration
+this image does not own: the ISO's is embedded in its bootloader, and the
+replacement GRUB image is larger than the ISO's 1.4 MiB EFI partition.
 
 Attach the display or the capture dongle *before* powering on: the EDID in the
 bundle is the EDID of whatever sink is connected, which is the same thing the
@@ -171,9 +190,8 @@ there is no rush.
 In order:
 
 1. the firmware's own logo;
-2. `GRUB` text (only once `config/x86_64/grub.cfg` sends its terminal to the
-   console as well as the serial port — the framebuffer-console workstream owns
-   that line; until it lands, GRUB is silent on a serial-less machine);
+2. `GRUB` text, because `config/x86_64/grub.cfg` sends GRUB's terminal to the
+   console as well as the serial port;
 3. kernel log lines;
 4. a prompt preceded by `THEKERNEL_SHELL_READY`, and then **no further
    change**: that stillness is the success signal, not a hang.
@@ -184,7 +202,8 @@ Telling a good boot from a bad one, from the screen alone:
 | --- | --- | --- |
 | nothing at all, not even the firmware logo | no boot from USB: wrong boot entry, CSM mode, or Secure Boot refusing the stick | firmware setup: UEFI mode, Secure Boot off, boot the USB entry |
 | firmware logo, then nothing | the firmware did not execute `BOOTX64.EFI`; Secure Boot is the first suspect | disable Secure Boot, or clear the platform keys |
-| GRUB text, then a dark screen | GRUB ran, the kernel produced no screen output | keep the frames and report; the kernel's early screen is another workstream |
+| GRUB text, then no kernel log at all — and a kernel log read elsewhere says `MB2 framebuffer: absent` | the bootloader passed no Multiboot2 framebuffer tag, so the kernel has no console to draw on. This is *not* the same failure as a kernel that produced no output: here the kernel has nowhere to write, and the fix belongs in the bootloader's video configuration | fix the bootloader's video setup (a mode must be set before handoff); keep the frames as evidence |
+| GRUB text, then a dark screen | GRUB ran and passed a framebuffer, but the kernel drew nothing | keep the frames and report; the kernel's early screen is another workstream |
 | log appears, then stops before `THEKERNEL_SHELL_READY` | the kernel stopped — a hang or a panic | keep the frames: they are the evidence. A panic display is landing in another workstream and will separate the two; do not wait for it |
 | log, then `THEKERNEL_SHELL_READY` and no further change | acceptance (a) passed | turn the frames into gate evidence, below |
 
