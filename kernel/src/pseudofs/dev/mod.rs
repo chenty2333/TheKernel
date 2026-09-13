@@ -1,5 +1,6 @@
 //! Special devices
 
+mod bootfb;
 mod dri;
 #[cfg(feature = "input")]
 pub(crate) mod event;
@@ -542,6 +543,45 @@ impl DeviceOps for BlockDevice {
     }
 }
 
+/// The scanout `/dev/fb0` should be published over, if this machine has one.
+///
+/// A DRM device wins when one exists: it is a real driver with a real
+/// connector behind it.  The firmware aperture is the fallback which keeps a
+/// machine with no display device at all able to show a console, and on a
+/// machine with no serial port that console is the only way anything can be
+/// reported at all.
+fn primary_scanout() -> Option<Arc<dyn scanout::ScanoutSurface>> {
+    if let Some(device) = crate::drm::primary_device() {
+        match crate::drm::drm_scanout(device) {
+            Ok(scanout) => return Some(scanout),
+            // Fall through rather than give up.  A DRM setup which cannot
+            // produce a scanout must not also cost the machine the aperture it
+            // could still draw into.
+            Err(error) => warn!("Failed to prepare the DRM scanout for fbdev: {error}"),
+        }
+    }
+    let framebuffer = axhal::boot::framebuffer()?;
+    let surface = match bootfb::BootFb::new(&framebuffer) {
+        Ok(surface) => surface,
+        Err(error) => {
+            error!("Failed to map the firmware framebuffer: {error}");
+            return None;
+        }
+    };
+    let surface: Arc<dyn scanout::ScanoutSurface> = match Arc::try_new(surface) {
+        Ok(surface) => surface,
+        Err(_) => {
+            error!("Failed to allocate the firmware framebuffer surface");
+            return None;
+        }
+    };
+    info!(
+        "Firmware framebuffer scanout: {}x{} pitch {} at {:#x}",
+        framebuffer.width, framebuffer.height, framebuffer.pitch, framebuffer.address
+    );
+    Some(surface)
+}
+
 fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     let mut root = DevRoot::new(fs.clone());
     root.add(
@@ -638,11 +678,11 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     // `/dev/fb0` is published whenever the kernel has a scanout to draw into.
     // DRM owns the virtio-gpu scanout before devfs publication, so fbdev is an
     // emulation client of that primary device rather than a competing raw
-    // display.  A machine with no display device at all simply has no fb0.
-    match crate::drm::primary_device().map(crate::drm::drm_scanout) {
-        None => {}
-        Some(Err(error)) => error!("Failed to prepare the primary scanout for fbdev: {error}"),
-        Some(Ok(scanout)) => match fb::FrameBuffer::try_new(scanout) {
+    // display.  A machine with no display device at all still has the linear
+    // aperture its own firmware programmed, and there a console is the only
+    // output the kernel has.
+    match primary_scanout() {
+        Some(scanout) => match fb::FrameBuffer::try_new(scanout) {
             Ok(framebuffer) => root.add(
                 "fb0",
                 Device::new_with_permissions(
@@ -655,6 +695,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             ),
             Err(error) => error!("Failed to initialize framebuffer device: {error}"),
         },
+        None => info!("No scanout surface available; /dev/fb0 is not published"),
     }
 
     if let Some(device) = crate::drm::primary_device() {

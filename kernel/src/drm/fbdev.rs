@@ -18,7 +18,10 @@ use super::{
 };
 use crate::{
     mm::SharedPages,
-    pseudofs::{DeviceMmap, dev::scanout::ScanoutSurface},
+    pseudofs::{
+        DeviceMmap,
+        dev::scanout::{PixelLayout, ScanoutSurface},
+    },
 };
 
 /// The kernel's single fbdev scanout.  The GEM object remains owned by this
@@ -276,6 +279,18 @@ impl ScanoutSurface for DrmFbdev {
 
     fn pitch(&self) -> u32 {
         self.pitch
+    }
+
+    fn pixel_layout(&self) -> PixelLayout {
+        // The dumb buffer is created at `bpp: 32` and the adapter's scanout is
+        // B8G8R8A8, whose little-endian word is the canonical colour value.
+        PixelLayout::B8G8R8A8
+    }
+
+    fn write_pixel(&self, offset: usize, color: u32) {
+        let mut pixel = [0u8; size_of::<u32>()];
+        let width = self.pixel_layout().encode_into(color, &mut pixel);
+        let _ = self.write_bytes(offset, &pixel[..width]);
     }
 
     fn virtual_height(&self) -> u32 {

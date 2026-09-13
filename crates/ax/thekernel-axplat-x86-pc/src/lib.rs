@@ -31,7 +31,7 @@ mod mem;
 mod power;
 mod time;
 
-pub use boot_info::ModuleInfo;
+pub use boot_info::{ColorField, FramebufferInfo, ModuleInfo};
 
 /// Configure a PCI INTx line without changing the default ISA routing.
 #[cfg(feature = "irq")]
@@ -52,6 +52,17 @@ pub fn register_shared_dispatcher(dispatcher: fn(usize) -> bool) -> bool {
 /// read-only for the lifetime of the booted kernel.
 pub fn boot_modules() -> impl Iterator<Item = ModuleInfo> + 'static {
     boot_info::get().modules().iter().flatten().copied()
+}
+
+/// Returns the linear framebuffer the bootloader handed over, if it supplied
+/// one this kernel can actually draw into.
+///
+/// The surface is *described* rather than mapped.  It lies outside the memory
+/// the kernel may allocate, so whoever first writes to it owns mapping the
+/// aperture; merely asking this question cannot fault, and a kernel with no
+/// business drawing anything never pays for the mapping.
+pub fn boot_framebuffer() -> Option<FramebufferInfo> {
+    boot_info::get().framebuffer().copied()
 }
 
 #[cfg(feature = "pmu")]

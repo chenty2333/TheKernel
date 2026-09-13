@@ -57,6 +57,62 @@ cfg_if::cfg_if! {
 pub mod dtb;
 /// Immutable boot-module metadata supplied by the selected platform.
 pub mod boot {
+    /// Bit position and width of one colour channel inside a pixel.
+    ///
+    /// The position is the index of the channel's least significant bit.
+    /// Keeping both values lets a writer scale an 8-bit channel into a field
+    /// that is not necessarily eight bits wide.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct ColorChannel {
+        /// Index of the channel's least significant bit within a pixel.
+        pub position: u8,
+        /// Channel width in bits.
+        pub size: u8,
+    }
+
+    /// A linear framebuffer the firmware programmed before the kernel started.
+    ///
+    /// This is the kernel-facing form of the bootloader's description, and it
+    /// is deliberately its own type rather than the platform's parse result:
+    /// `axhal` must also build for host tests, where no platform crate is
+    /// linked at all.  That is the same reason [`rootfs_module`] returns a
+    /// plain range instead of a platform type.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct BootFramebuffer {
+        /// Physical address of the first pixel of the first scan line.
+        pub address: u64,
+        /// Visible width in pixels.
+        pub width: u32,
+        /// Visible height in pixels.
+        pub height: u32,
+        /// Bytes between the starts of two consecutive scan lines.
+        ///
+        /// This is not necessarily the visible width times the pixel size:
+        /// firmware pads scan lines.
+        pub pitch: u32,
+        /// Bits per pixel.
+        pub bpp: u8,
+        /// Red channel layout.
+        pub red: ColorChannel,
+        /// Green channel layout.
+        pub green: ColorChannel,
+        /// Blue channel layout.
+        pub blue: ColorChannel,
+    }
+
+    impl BootFramebuffer {
+        /// Bytes occupied by the visible surface.
+        ///
+        /// Returns `None` rather than wrapping when the extent cannot be
+        /// represented, so a caller cannot derive a short length and map a
+        /// window smaller than the pixels it is about to write.
+        pub fn byte_len(&self) -> Option<usize> {
+            usize::try_from(self.pitch)
+                .ok()?
+                .checked_mul(usize::try_from(self.height).ok()?)
+        }
+    }
+
     /// Returns the physical range of the Multiboot module explicitly marked
     /// `rootfs`, if one was supplied by the bootloader.
     #[cfg(all(target_os = "none", feature = "defplat"))]
@@ -69,6 +125,34 @@ pub mod boot {
     /// Host tests have no bootloader-owned physical module.
     #[cfg(not(all(target_os = "none", feature = "defplat")))]
     pub fn rootfs_module() -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Returns the linear framebuffer the bootloader handed over, if it
+    /// supplied one the kernel can draw into.
+    #[cfg(all(target_os = "none", feature = "defplat"))]
+    pub fn framebuffer() -> Option<BootFramebuffer> {
+        fn channel(field: axplat_x86_pc::ColorField) -> ColorChannel {
+            ColorChannel {
+                position: field.position(),
+                size: field.size(),
+            }
+        }
+        axplat_x86_pc::boot_framebuffer().map(|framebuffer| BootFramebuffer {
+            address: framebuffer.address(),
+            width: framebuffer.width(),
+            height: framebuffer.height(),
+            pitch: framebuffer.pitch(),
+            bpp: framebuffer.bpp(),
+            red: channel(framebuffer.red()),
+            green: channel(framebuffer.green()),
+            blue: channel(framebuffer.blue()),
+        })
+    }
+
+    /// Host tests have no firmware-programmed display.
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
+    pub fn framebuffer() -> Option<BootFramebuffer> {
         None
     }
 }

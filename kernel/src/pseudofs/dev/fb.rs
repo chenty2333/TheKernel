@@ -16,7 +16,7 @@ use crate::{
     file::IoctlContext,
     pseudofs::{
         DeviceMmap, DeviceOps,
-        dev::scanout::ScanoutSurface,
+        dev::scanout::{ColorChannel, ScanoutSurface},
         device_registry::{
             DeviceHandle, DeviceIdentity, DeviceRegistration, MAX_DEVICES, global_device_registry,
         },
@@ -456,7 +456,17 @@ fn var_screen_info_from_user_bytes(
     }
 }
 
+/// Translate one surface channel into the fbdev bitfield form.
+fn color_bitfield(channel: ColorChannel) -> FrameBufferBitfield {
+    FrameBufferBitfield {
+        offset: u32::from(channel.position),
+        length: u32::from(channel.size),
+        msb_right: 0,
+    }
+}
+
 fn current_var_screen_info(core: &DisplayCore) -> VarScreenInfo {
+    let layout = core.scanout.pixel_layout();
     VarScreenInfo {
         xres: core.scanout.width(),
         yres: core.scanout.height(),
@@ -464,29 +474,26 @@ fn current_var_screen_info(core: &DisplayCore) -> VarScreenInfo {
         yres_virtual: core.scanout.virtual_height(),
         xoffset: 0,
         yoffset: core.scanout.yoffset(),
-        bits_per_pixel: 32,
+        bits_per_pixel: u32::from(layout.bits),
         grayscale: 0,
-        // virtio-gpu allocates B8G8R8A8_UNORM scanout; on x86_64 its bytes
-        // are B, G, R, A, which is this native-endian 32-bit layout.
-        red: FrameBufferBitfield {
-            offset: 16,
-            length: 8,
-            msb_right: 0,
-        },
-        green: FrameBufferBitfield {
-            offset: 8,
-            length: 8,
-            msb_right: 0,
-        },
-        blue: FrameBufferBitfield {
-            offset: 0,
-            length: 8,
-            msb_right: 0,
-        },
-        transp: FrameBufferBitfield {
-            offset: 24,
-            length: 8,
-            msb_right: 0,
+        // Report the surface's own layout rather than a fixed one.  The
+        // virtio-gpu scanout is B8G8R8A8_UNORM and its little-endian word is
+        // the canonical colour value, but a firmware framebuffer is whatever
+        // its GOP mode was; describing a 16-bit mode as 32-bit BGRA would make
+        // every userspace client render noise.
+        red: color_bitfield(layout.red),
+        green: color_bitfield(layout.green),
+        blue: color_bitfield(layout.blue),
+        // fbdev calls the unoccupied field transparency.  A surface whose
+        // colour channels fill the pixel has none, and reporting one anyway
+        // would describe bits that do not exist.
+        transp: match layout.spare_field() {
+            Some(channel) => color_bitfield(channel),
+            None => FrameBufferBitfield {
+                offset: 0,
+                length: 0,
+                msb_right: 0,
+            },
         },
         nonstd: 0,
         activate: 0,
@@ -647,6 +654,8 @@ pub(crate) struct FbconFrame {
     width: usize,
     height: usize,
     pitch: usize,
+    /// Bytes one pixel occupies on this surface, which is not always four.
+    bytes_per_pixel: usize,
 }
 
 impl FbconFrame {
@@ -686,18 +695,18 @@ impl FbconFrame {
     fn write_pixel(&self, x: usize, y: usize, color: u32) {
         let Some(offset) = y
             .checked_mul(self.pitch)
-            .and_then(|row| row.checked_add(x.checked_mul(4)?))
+            .and_then(|row| row.checked_add(x.checked_mul(self.bytes_per_pixel)?))
         else {
             return;
         };
-        if offset + 4 > self.size {
+        if offset + self.bytes_per_pixel > self.size {
             return;
         }
-        // A failed write is dropped rather than propagated. The console clips
-        // its own output and must never be able to fault the kernel, and a
-        // backend which rejected an in-range, in-bounds offset would leave the
-        // caller with nothing to do about it anyway.
-        let _ = self.scanout.write_bytes(offset, &color.to_ne_bytes());
+        // The surface encodes the colour in its own layout, so this path never
+        // needs to know the pixel format.  A failed write is dropped rather
+        // than propagated: the console clips its own output and must never be
+        // able to fault the kernel.
+        self.scanout.write_pixel(offset, color);
     }
 }
 
@@ -784,6 +793,7 @@ pub(crate) fn fbcon_draw(draw: impl FnOnce(&FbconFrame)) {
         width: scanout.width() as usize,
         height: scanout.height() as usize,
         pitch: scanout.pitch() as usize,
+        bytes_per_pixel: scanout.bytes_per_pixel() as usize,
         scanout,
         size: display.size,
     });
@@ -1158,12 +1168,15 @@ mod tests {
     use axsync::Mutex;
 
     use super::{
-        DAMAGE_CLEAN, DAMAGE_FULL, DamageTracker, DisplayCore, FB_DEVICE_ID,
+        DAMAGE_CLEAN, DAMAGE_FULL, DamageTracker, DisplayCore, FB_DEVICE_ID, FbconFrame,
         current_var_screen_info, fb_sysfs_registration,
     };
     use crate::{
         drm::DrmFbdev,
-        pseudofs::{DeviceMmap, dev::scanout::ScanoutSurface},
+        pseudofs::{
+            DeviceMmap,
+            dev::scanout::{ColorChannel, PixelLayout, ScanoutSurface},
+        },
     };
 
     #[test]
@@ -1325,13 +1338,22 @@ mod tests {
         width: u32,
         height: u32,
         pitch: u32,
+        layout: PixelLayout,
         presents: AtomicU64,
         master: AtomicBool,
     }
 
     impl MemorySurface {
+        /// A surface in the virtio-gpu layout, which is what the reference
+        /// display device produces.
         fn new(width: u32, height: u32) -> Arc<Self> {
-            let pitch = width * 4;
+            Self::with_layout(width, height, PixelLayout::B8G8R8A8)
+        }
+
+        /// A surface in an arbitrary layout, standing in for a firmware
+        /// framebuffer whose GOP mode is not 32 bits deep.
+        fn with_layout(width: u32, height: u32, layout: PixelLayout) -> Arc<Self> {
+            let pitch = width * layout.bytes_per_pixel();
             let mut bytes = Vec::new();
             bytes.resize((pitch * height) as usize, 0);
             Arc::new(Self {
@@ -1339,6 +1361,7 @@ mod tests {
                 width,
                 height,
                 pitch,
+                layout,
                 presents: AtomicU64::new(0),
                 master: AtomicBool::new(true),
             })
@@ -1356,6 +1379,16 @@ mod tests {
 
         fn pitch(&self) -> u32 {
             self.pitch
+        }
+
+        fn pixel_layout(&self) -> PixelLayout {
+            self.layout
+        }
+
+        fn write_pixel(&self, offset: usize, color: u32) {
+            let mut pixel = [0u8; size_of::<u32>()];
+            let width = self.layout.encode_into(color, &mut pixel);
+            let _ = self.write_bytes(offset, &pixel[..width]);
         }
 
         fn virtual_height(&self) -> u32 {
@@ -1455,5 +1488,70 @@ mod tests {
         assert!(surface.master.load(Ordering::Acquire));
         core.scanout.set_master(false).unwrap();
         assert!(!surface.master.load(Ordering::Acquire));
+    }
+
+    /// The 16-bit RGB565 layout a firmware may report for a 16-bit GOP mode.
+    const RGB565: PixelLayout = PixelLayout {
+        bits: 16,
+        red: ColorChannel {
+            position: 11,
+            size: 5,
+        },
+        green: ColorChannel {
+            position: 5,
+            size: 6,
+        },
+        blue: ColorChannel {
+            position: 0,
+            size: 5,
+        },
+    };
+
+    #[test]
+    fn console_writes_pixels_at_the_surfaces_own_depth() {
+        // The console used to write four bytes per pixel unconditionally.  On
+        // a 16-bit framebuffer that walks the surface at twice the correct
+        // stride and paints a garbled screen -- and on a machine whose only
+        // output device is that screen, a garbled console is indistinguishable
+        // from a kernel that never booted.
+        //
+        // The surface's buffer is behind a sleeping lock, and taking one needs
+        // a current task.  Installing the context here is what makes this test
+        // pass on its own as well as after whichever test ran before it.
+        let _context = crate::test_support::scheduler_test_context();
+        let surface = MemorySurface::with_layout(4, 2, RGB565);
+        let frame = FbconFrame {
+            scanout: surface.clone(),
+            size: 16,
+            width: 4,
+            height: 2,
+            pitch: 8,
+            bytes_per_pixel: 2,
+        };
+
+        // White at column 3 of row 1 belongs in the last two bytes, and every
+        // byte before it must stay untouched.
+        frame.write_pixel(3, 1, 0x00ff_ffff);
+        let bytes = surface.bytes.lock();
+        assert_eq!(&bytes[14..16], &[0xff, 0xff]);
+        assert!(bytes[..14].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn console_pixel_write_stops_at_the_surface_end() {
+        // A frame whose geometry claims a column beyond the surface must clip
+        // rather than run past the mapping it was given.
+        let _context = crate::test_support::scheduler_test_context();
+        let surface = MemorySurface::with_layout(2, 1, RGB565);
+        let frame = FbconFrame {
+            scanout: surface.clone(),
+            size: 4,
+            width: 2,
+            height: 1,
+            pitch: 4,
+            bytes_per_pixel: 2,
+        };
+        frame.write_pixel(2, 0, 0x00ff_ffff);
+        assert!(surface.bytes.lock().iter().all(|byte| *byte == 0));
     }
 }
