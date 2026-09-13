@@ -416,4 +416,41 @@ mod tests {
             Err(AllocError::MemoryOverlap)
         ));
     }
+
+    /// A free region above the bitmap's window is refused, and the refusal is
+    /// an error rather than a panic.
+    ///
+    /// This is the shape of a real boot failure.  The bitmap spans a fixed
+    /// window anchored at the base of the first free region, so on a machine
+    /// with more RAM than the window covers the high regions do not fit.  The
+    /// caller in `axruntime` used to `.expect()` this call, which turned
+    /// "this machine has more RAM than we can address" into a panic during
+    /// heap setup -- before anything existed that could print why.  A 16 GiB
+    /// machine with RAM above 4 GiB hit it every time.
+    ///
+    /// The pair of assertions matters: `just_inside` proves the window is not
+    /// merely rejecting everything, so a future change that made `add_memory`
+    /// refuse unconditionally would fail here instead of looking conservative.
+    #[test]
+    fn a_region_above_the_bitmap_window_is_refused_not_a_panic() {
+        let cap_bytes = BitAllocUsed::CAP as usize * PAGE_SIZE;
+        let mut allocator = BitmapPageAllocator::<PAGE_SIZE>::new();
+        allocator.init(0, 2 * PAGE_SIZE);
+
+        // The last page the window can describe.
+        assert!(
+            allocator
+                .add_memory(cap_bytes - PAGE_SIZE, PAGE_SIZE)
+                .is_ok(),
+            "the final page of the window must fit"
+        );
+        assert!(matches!(
+            allocator.add_memory(cap_bytes, PAGE_SIZE),
+            Err(AllocError::NoMemory)
+        ));
+        assert!(matches!(
+            allocator.add_memory(cap_bytes + PAGE_SIZE, PAGE_SIZE),
+            Err(AllocError::NoMemory)
+        ));
+    }
 }
