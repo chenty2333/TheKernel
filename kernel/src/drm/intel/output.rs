@@ -16,7 +16,7 @@
 //!      PORT_CL_DW10's PWR_DOWN_LN_MASK to power the lanes
 //! 5.4  TRANS_CLK_SEL(A)
 //! 5.5  TRANS_DDI_FUNC_CTL(A): port, HDMI/DVI, 8 bpc, polarity
-//! 5.6  TRANSCONF(A) = ENABLE | STATE_ENABLE | progressive
+//! 5.6  TRANSCONF(A) = ENABLE only -- bit 30 is a status, not an enable
 //! 5.7  DDI_BUF_CTL: enable, buffer-translation level, width,
 //!      then poll IS_IDLE == 0
 //! ```
@@ -195,17 +195,40 @@ const TRANS_DDI_PORT_WIDTH_SHIFT: u32 = 1;
 
 /// `TRANSCONF`'s `ENABLE` bit.
 ///
-/// Reference §11 phase 5.6: "`TRANSCONF(A) = ENABLE | STATE_ENABLE |
-/// progressive` = `(1<<31) | (1<<30)`".  The output bit depth and dithering are
-/// **not** written here: §8.4's correction and §11 phase 5.6 both put them in
-/// `PIPE_MISC` on Gen12, and §8.6 step 12's "| 8bpc" is the pre-correction
-/// text.  Progressive is the interlace field reading zero, so no interlace bits
-/// are set; §5.2's `[23:21]` and docs/design/intel-pll.md's HSW+ `[22:21]`
-/// disagree about the mask, and a zero value makes the disagreement moot.
+/// This is the only bit §11 phase 5.6's write may set.  The output bit depth
+/// and dithering are **not** written here: §8.4's correction and §11 phase 5.6
+/// both put them in `PIPE_MISC` on Gen12, and §8.6 step 12's "| 8bpc" is the
+/// pre-correction text.  Progressive is the interlace field reading zero, so no
+/// interlace bits are set; §5.2's `[23:21]` and docs/design/intel-pll.md's HSW+
+/// `[22:21]` disagree about the mask, and a zero value makes the disagreement
+/// moot.
+///
+/// §11 phase 5.6 also sets `STATE_ENABLE` -- "`(1<<31) | (1<<30)`" -- and that
+/// is a **defect in the reference**: bit 30 is the hardware's pipe-running
+/// status, not a second enable, and writing it is writing a status bit as if it
+/// were a request.  [`TRANSCONF_STATE_ENABLE_STATUS`] carries the citations and
+/// `docs/design/intel-output.md` records the defect.
 const TRANSCONF_ENABLE: u32 = 1 << 31;
 
-/// `TRANSCONF`'s `STATE_ENABLE` bit.
-const TRANSCONF_STATE_ENABLE: u32 = 1 << 30;
+/// `TRANSCONF`'s `STATE_ENABLE` bit, which is a **hardware status** and never a
+/// value this sequence writes.
+///
+/// `[I915]` defines the bit as `TRANSCONF_STATE_ENABLE`, `REG_BIT(30)`,
+/// "i965+" (`i915_reg.h:1591`; the same bit is `TRANSCONF_DOUBLE_WIDE` on the
+/// pre-i965 parts, which is why the generation matters), and uses it for one
+/// thing only: to watch the transcoder stop.  `intel_wait_for_pipe_off` waits
+/// for it to read *clear* after a disable
+/// (`display/intel_display.c:302-318`, the wait at `:312-313`), and the enable
+/// path never sets it: `intel_enable_transcoder` reads `TRANSCONF` (`:459`) and
+/// writes the value back with `TRANSCONF_ENABLE` OR'd in (`:474-475`), so bit
+/// 30 keeps whatever the hardware had put there.
+///
+/// Reference §11 phase 5.6 states the write as `ENABLE | STATE_ENABLE`, and an
+/// earlier revision of this module followed it -- see the "reference defect"
+/// note in `docs/design/intel-output.md`.  §11's *disable* sequence ("Disable
+/// `TRANSCONF`; poll for off state") is the reading that agrees with i915, and
+/// is where the document gives the bit its status meaning.
+const TRANSCONF_STATE_ENABLE_STATUS: u32 = 1 << 30;
 
 /// `DDI_BUF_CTL`'s `ENABLE` bit.  Reference §8.4.
 const DDI_BUF_CTL_ENABLE: u32 = 1 << 31;
@@ -863,10 +886,16 @@ impl OutputProgram {
             }
             | request.width.width_field();
 
-        // §11 phase 5.6.  No bit depth: §8.4's correction and §11 phase 5.6
-        // both put it in `PIPE_MISC` on Gen12, and §8.6 step 12's "| 8bpc" is
-        // the pre-correction text.
-        let transconf = TRANSCONF_ENABLE | TRANSCONF_STATE_ENABLE;
+        // §11 phase 5.6's write, restricted to what is actually a control bit.
+        // No bit depth: §8.4's correction and §11 phase 5.6 both put it in
+        // `PIPE_MISC` on Gen12, and §8.6 step 12's "| 8bpc" is the
+        // pre-correction text.  No `STATE_ENABLE` either: §11 phase 5.6 prints
+        // `(1<<31) | (1<<30)` and bit 30 is the hardware's pipe-running status
+        // (`[I915]` `i915_reg.h:1591`, polled clear by `intel_wait_for_pipe_off`
+        // at `display/intel_display.c:312-313`), which
+        // `intel_enable_transcoder` never sets (`:459`, `:474-475`).  That is
+        // the reference defect this composition used to repeat.
+        let transconf = TRANSCONF_ENABLE;
 
         let ddi_buf_ctl = DDI_BUF_CTL_ENABLE
             | (u32::from(swing.level) << DDI_BUF_CTL_BUF_TRANS_SELECT_SHIFT)
@@ -970,10 +999,12 @@ impl OutputProgram {
         out.push_str(&format!("intel-output: {}\n", self.link_rate.describe()));
         out.push_str(&format!(
             "intel-output: TRANS_CLK_SEL(A) = {:#010x}, TRANS_DDI_FUNC_CTL(A) = {:#010x}, \
-             TRANSCONF(A) = {:#010x}, DDI_BUF_CTL({}) = {:#010x}\n",
+             TRANSCONF(A) = {:#010x} (ENABLE only: {:#010x} is STATE_ENABLE, the hardware's \
+             pipe-running status, and is not written), DDI_BUF_CTL({}) = {:#010x}\n",
             self.trans_clk_sel,
             self.trans_ddi_func_ctl,
             self.transconf,
+            TRANSCONF_STATE_ENABLE_STATUS,
             self.ddi.name(),
             self.ddi_buf_ctl,
         ));

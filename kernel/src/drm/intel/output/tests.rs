@@ -197,21 +197,82 @@ fn the_transcoder_and_ddi_values_are_the_reference_encodings() {
         plan.trans_ddi_func_ctl, 0x8803_0006,
         "ENABLE | SELECT_PORT(A) | HDMI | 8bpc | both syncs | four lanes"
     );
-    assert_eq!(plan.transconf, 0xC000_0000, "ENABLE | STATE_ENABLE");
+    assert_eq!(
+        plan.transconf, 0x8000_0000,
+        "TRANSCONF(A): ENABLE only, because bit 30 is a status"
+    );
     assert_eq!(
         plan.ddi_buf_ctl, 0x8200_0016,
         "ENABLE | BUF_TRANS_SELECT(2) | PORT_WIDTH(4 lanes) | A_4_LANES"
     );
 }
 
-/// No output bit depth in `TRANSCONF`: §8.4's correction and §11 phase 5.6 put
-/// it in `PIPE_MISC`, and §8.6 step 12 still lists it here.
+/// No output bit depth in `TRANSCONF`, and no `STATE_ENABLE` either.
+///
+/// §8.4's correction and §11 phase 5.6 put the bit depth in `PIPE_MISC`;
+/// §8.6 step 12 still lists it here.  Bit 30 is the other half: §11 phase 5.6
+/// prints `ENABLE | STATE_ENABLE` and bit 30 is a **hardware status**, so the
+/// value is the enable bit exactly.  The literal is asserted rather than the
+/// module's own constants, because
+/// `TRANSCONF_ENABLE | TRANSCONF_STATE_ENABLE_STATUS` is what the defect was.
 #[test]
 fn transconf_carries_no_bit_depth() {
     let plan = target_plan();
     // `TRANSCONF`'s BPC field is a pre-Haswell leftover; the value is exactly
-    // enable plus state-enable, nothing else.
-    assert_eq!(plan.transconf, (1 << 31) | (1 << 30));
+    // the enable bit, nothing else.
+    assert_eq!(plan.transconf, 0x8000_0000);
+}
+
+/// The register the sequence leaves behind holds `0x8000_0000`, whatever the
+/// module's constants say.
+///
+/// §11 phase 5.6's `TRANSCONF(A) = (1<<31) | (1<<30)` is the reference's defect
+/// and this module followed it.  `[I915]`'s `TRANSCONF_STATE_ENABLE`
+/// (`i915_reg.h:1591`) is bit 30, and i915 only ever *polls* it: clear after a
+/// disable (`display/intel_display.c:302-318`), never set by
+/// `intel_enable_transcoder`, which ORs `TRANSCONF_ENABLE` into the value it
+/// read (`:459`, `:474-475`).  Asserting the literal at the aperture is the
+/// point: a test that compared against the module's own composition would have
+/// passed with the status bit in it.
+#[test]
+fn the_transcoder_is_enabled_with_bit_31_alone() {
+    let regs = ready_mock();
+    program(&regs, &target_plan()).expect("the mock's status bits all behave");
+
+    let (_, written) = regs
+        .writes()
+        .into_iter()
+        .find(|(name, _)| *name == "PIPECONF_A")
+        .expect("the sequence writes the transcoder's own register");
+    assert_eq!(
+        written, 0x8000_0000,
+        "TRANSCONF(A) is ENABLE and nothing else"
+    );
+    assert_eq!(
+        written & 0x4000_0000,
+        0,
+        "bit 30 is STATE_ENABLE, the hardware's pipe-running status"
+    );
+    assert_eq!(
+        regs.read(pipe::PIPECONF_A),
+        Some(0x8000_0000),
+        "the register holds the enable bit alone"
+    );
+    assert_eq!(
+        TRANSCONF_STATE_ENABLE_STATUS, 0x4000_0000,
+        "the renamed constant is the status bit, and the write does not carry it"
+    );
+    // The log is the only evidence a machine with no serial port leaves, so it
+    // prints the value the register gets and names the bit it does not.
+    let log = target_plan().render();
+    assert!(
+        log.contains("TRANSCONF(A) = 0x80000000"),
+        "the plan log does not print the transcoder value:\n{log}"
+    );
+    assert!(
+        log.contains("0x40000000 is STATE_ENABLE"),
+        "the plan log does not name the status bit:\n{log}"
+    );
 }
 
 /// §11 phase 5.5's polarities: the two bits follow the mode, in both

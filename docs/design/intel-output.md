@@ -175,10 +175,10 @@ widths with an unrelated bit set in the register to prove the read-modify-write 
 |---|---|---|
 | `TRANS_CLK_SEL(A)` | `0x10000000` = `(PORT_A + 1) << 28` | §6.3 routing step 2, §11 5.4 |
 | `TRANS_DDI_FUNC_CTL(A)` | `0x88030006` = `ENABLE \| SELECT_PORT(A) \| MODE_SELECT_HDMI \| BPC_8 \| PHSYNC \| PVSYNC \| PORT_WIDTH(4)` | §8.4's corrected table, §11 5.5 |
-| `TRANSCONF(A)` (`PIPECONF_A`) | `0xC0000000` = `ENABLE \| STATE_ENABLE` | §11 5.6, §8.4's correction |
+| `TRANSCONF(A)` (`PIPECONF_A`) | `0x80000000` = `ENABLE` alone | §11 5.6 minus its status bit — §3.7 |
 | `DDI_BUF_CTL(A)` | `0x80000000 \| level << 24 \| width \| A_4_LANES` | §8.4, §11 5.7 |
 
-`0x88030006` and `0xC0000000` are `[MEASURED]` from the host test.
+`0x88030006` and `0x80000000` are `[MEASURED]` from the host test.
 
 The polarity bits follow the mode: the module reads `mode.hsync_positive` and `mode.vsync_positive`,
 which §6.1 says is where they belong (`timing.rs` deliberately does not carry them). A test plans
@@ -197,6 +197,38 @@ the two bits move and nothing else does.
 the register that was just written is §2.2's read-back discipline, and the poll is what establishes
 the device saw the enable. A test drives a mock that takes three reads to come out of idle, so the
 retry path is exercised rather than assumed.
+
+### 3.7 A reference defect: `TRANSCONF` bit 30 is a status, and §11 writes it
+
+`[REF]` §11 phase 5.6 gives the transcoder enable as
+`TRANSCONF(A) = ENABLE | STATE_ENABLE | progressive` = `(1<<31) | (1<<30)`, and until
+`fix/intel-transcoder-values` this module wrote exactly that. Bit 30 is not a second enable. `[I915]`
+names it `TRANSCONF_STATE_ENABLE` (`i915_reg.h:1591`) and uses it in one direction only: as something
+to wait *clear* after the transcoder is disabled — `intel_wait_for_pipe_off` polls it clear with a
+100 ms budget and warns if the pipe does not stop
+(`display/intel_display.c:302-318`, the wait at `:312-313`). The enable path never sets it:
+`intel_enable_transcoder` reads `TRANSCONF` (`:459`) and writes the word back with
+`TRANSCONF_ENABLE` OR'd in (`:474-475`), so bit 30 keeps whatever the hardware had put there. The bit
+is not even spare: on the pre-i965 parts the same position is `TRANSCONF_DOUBLE_WIDE`
+(`i915_reg.h:1590`).
+
+What makes this a section rather than a one-line fix is that **the reference contradicts itself and
+the enable step is the wrong half.** §11's disable sequence, further down the same phase, says
+"Disable `TRANSCONF`; poll for off state, timeout two frame times" — bit 30 read as a status, exactly
+as i915 reads it. §5.2's register row lists `STATE_ENABLE[30]` without saying which direction the bit
+runs. The document therefore holds the right reading in one place and the wrong one in another, and
+the sequence followed the wrong one.
+
+**What the fix is.** The write composes `TRANSCONF_ENABLE` alone; the constant that names bit 30 is
+renamed `TRANSCONF_STATE_ENABLE_STATUS` and documented as the status it is; the plan log prints that
+bit's value beside the register's, so a reader diffing a dump can see why it is absent; and the tests
+assert the literal `0x80000000` — at the aperture as well as in the plan — rather than the module's
+own composition, which is what let the defect through (`[MEASURED]`,
+`the_transcoder_is_enabled_with_bit_31_alone` and `transconf_carries_no_bit_depth`).
+
+**The reference still carries the defect.** `docs/design/intel-display-registers.md` §11 phase 5.6
+and its §8.6 step 12 both print the old value, and this workstream does not own that document; it is
+listed for the coordinator in the workstream report rather than edited here.
 
 ## 4. The failures, and what they say
 
@@ -305,6 +337,8 @@ The module's tests assert, among other things:
   mock whose two `DW5` instances differ;
 * the lane-power field is shifted into `[7:4]` and an unrelated bit in `PORT_CL_DW10` survives;
 * `SUS_CLOCK_CONFIG` does not clobber `CL_POWER_DOWN_ENABLE`;
+* the transcoder is enabled with bit 31 alone: the write log and the register both hold the literal
+  `0x80000000`, and bit 30 — `STATE_ENABLE`, the hardware's pipe-running status — is not in it (§3.7);
 * the polarity bits follow the mode in both directions and change nothing else;
 * a DDI that is not a combo-PHY port is refused before any write — including a tampered plan, which
   is how the re-check inside `program` is shown to be real;
