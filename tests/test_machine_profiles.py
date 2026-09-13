@@ -39,6 +39,18 @@ def load_profile(name: str) -> dict:
     return tomllib.loads(path.read_text(encoding="utf-8"))
 
 
+def parse_range(entry: list) -> tuple[int, int]:
+    """Normalise one profile range to `(base, size)`.
+
+    A 64-bit base is written as a quoted hexadecimal string in the profile, so
+    a naive `tuple(entry)` mixes `str` and `int` and any comparison over it
+    raises instead of checking the property.
+    """
+
+    base, size = entry
+    return int(base, 0) if isinstance(base, str) else base, size
+
+
 def contains(outer: tuple[int, int], inner: tuple[int, int]) -> bool:
     start, size = outer
     inner_start, inner_size = inner
@@ -110,16 +122,17 @@ class MachineProfileTests(unittest.TestCase):
             base = devices["pci-ecam-base"]
             # Buses 0..=pci-bus-end, one MiB per bus.
             window = (base, (devices["pci-bus-end"] + 1) * (1 << 20))
+            mapped = [parse_range(range_) for range_ in devices["mmio-ranges"]]
             with self.subTest(profile=name):
                 self.assertTrue(
-                    any(contains(tuple(range_), window) for range_ in devices["mmio-ranges"]),
+                    any(contains(range_, window) for range_ in mapped),
                     "the configured ECAM fallback must lie inside a mapped MMIO range",
                 )
 
     def test_pci_allocation_ranges_exclude_bus_zero_and_do_not_overlap(self) -> None:
         for name in MACHINE_PROFILES:
             devices = load_profile(name)["devices"]
-            ranges = [tuple(range_) for range_ in devices["pci-ranges"]]
+            ranges = [parse_range(range_) for range_ in devices["pci-ranges"]]
             with self.subTest(profile=name):
                 self.assertEqual(
                     ranges[0],
@@ -129,8 +142,8 @@ class MachineProfileTests(unittest.TestCase):
                 windows = sorted(ranges[1:])
                 for (start, size), (next_start, _) in zip(windows, windows[1:]):
                     self.assertLessEqual(start + size, next_start)
-                for range_ in devices["mmio-ranges"]:
-                    self.assertGreater(range_[1], 0)
+                for _, size in (parse_range(range_) for range_ in devices["mmio-ranges"]):
+                    self.assertGreater(size, 0)
 
     def test_phys_memory_size_is_not_a_ram_description(self) -> None:
         # No Rust code reads `plat.phys-memory-size`; installed RAM comes from
