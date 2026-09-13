@@ -741,8 +741,31 @@ fn init_allocator() {
 
     for r in memory_regions() {
         if r.flags.contains(MemRegionFlags::FREE) && r.paddr != max_region_paddr {
-            axalloc::global_add_memory(phys_to_virt(r.paddr).as_usize(), r.size)
-                .expect("add heap memory region failed");
+            // A free region the heap cannot cover is RAM the kernel does not
+            // get to use -- not a reason to refuse to boot.  The page
+            // allocator's bitmap spans a fixed window anchored at the first
+            // free region, so on a machine whose RAM reaches above that window
+            // this returns `NoMemory` for the high regions.  That is the
+            // expected shape on a box with more RAM than the window covers, and
+            // the earlier `.expect()` turned it into a panic during heap setup,
+            // before anything existed that could report why: the screen simply
+            // stayed dark.
+            //
+            // Losing the tail of RAM is survivable and greppable; refusing to
+            // boot is neither.  The window's size is selected by the
+            // `page-alloc-*` feature on the kernel (see `kernel/Cargo.toml`).
+            if let Err(error) =
+                axalloc::global_add_memory(phys_to_virt(r.paddr).as_usize(), r.size)
+            {
+                warn!(
+                    "heap: free region [PA:{:#x}, PA:{:#x}) of {} MiB is outside the page \
+                     allocator's window: {:?}",
+                    r.paddr,
+                    r.paddr + r.size,
+                    r.size / (1024 * 1024),
+                    error
+                );
+            }
         }
     }
 }

@@ -45,7 +45,11 @@ axfeat = { workspace = true, features = [
     "irq",
     "uspace",
 
-    "page-alloc-4g",
+    # 64 GiB rather than 4 GiB: the page allocator's bitmap spans a fixed
+    # window anchored at the first free region, and the target machine (a
+    # 16 GiB N305, like any machine with RAM above 4 GiB) has free regions
+    # the 4 GiB window cannot cover.  The extra static bitmap costs 2 MiB.
+    "page-alloc-64g",
     "alloc-slab",
 
     "multitask",
