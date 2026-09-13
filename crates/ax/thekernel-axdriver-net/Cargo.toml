@@ -11,6 +11,7 @@ repository = "https://github.com/arceos-org/axdriver_crates"
 [features]
 default = []
 fxmac = ["dep:fxmac_rs"]
+igc = []
 ixgbe = ["dep:ixgbe-driver"]
 
 [lib]
@@ -26,3 +27,11 @@ spin = "0.9"
 
 [package.metadata.thekernel]
 layer = "platform"
+
+# The igc driver's arithmetic, register encoding, descriptor construction and
+# ring bookkeeping are host-testable with no hardware, and there is no QEMU
+# device model for this part, so the host suite is the only automated evidence
+# this workstream can produce.
+[package.metadata.thekernel.host-test]
+selected = true
+features = ["igc"]

@@ -97,6 +97,12 @@ class Variant:
     m5_candidate: bool = False
     io_submit_batch: bool = False
     io_notify_fastpath: bool = False
+    # Builds the Intel i225/i226 (igc) driver into the product kernel.  It is a
+    # separate variant because the product's static NIC type is `virtio-net`
+    # and one non-`dyn` build cannot be both; the flag exists so the driver can
+    # be built, booted on a machine that has no such part, and seen to reject
+    # it -- the only automated run this workstream has.
+    net_igc: bool = False
 
     @property
     def memory_bytes(self) -> int:
@@ -115,6 +121,8 @@ class Variant:
             suffix += "-io-submit-batch"
         if self.io_notify_fastpath:
             suffix += "-io-notify-fastpath"
+        if self.net_igc:
+            suffix += "-net-igc"
         return f"mem{self.memory.lower()}{suffix}"
 
 
