@@ -210,16 +210,28 @@ int main(int argc, char **argv)
         pids[index] = worker;
     }
 
+    /* Reap every worker before reading any pipe: `waitpid(worker)` must never
+     * be in flight while a worker is still creating children, or the parent
+     * would collect the worker's children and steal its waits. */
     for (unsigned index = 0; index < workers; ++index) {
         int status = -1;
         pid_t reaped;
+
+        do {
+            reaped = waitpid(pids[index], &status, 0);
+        } while (reaped < 0 && errno == EINTR);
+        if (reaped != pids[index] || status != 0) {
+            printf("EXIT_STATUS_STRESS_FAIL worker_exit index=%u reaped=%d want=%d status=%#x\n",
+                   index, (int)reaped, (int)pids[index], (unsigned)status);
+            failed = 1;
+        }
+    }
+
+    for (unsigned index = 0; index < workers; ++index) {
         size_t got = 0;
         char *into = (char *)&reports[index];
 
         reports[index].first_failure_round = -1;
-        do {
-            reaped = waitpid(pids[index], &status, 0);
-        } while (reaped < 0 && errno == EINTR);
         while (got < sizeof(reports[index])) {
             ssize_t count = read(pipes[index][0], into + got, sizeof(reports[index]) - got);
             if (count <= 0)
@@ -227,9 +239,8 @@ int main(int argc, char **argv)
             got += (size_t)count;
         }
         close(pipes[index][0]);
-        if (reaped != pids[index] || status != 0 || got != sizeof(reports[index])) {
-            printf("EXIT_STATUS_STRESS_FAIL worker_exit index=%u reaped=%d want=%d status=%#x report=%zu\n",
-                   index, (int)reaped, (int)pids[index], (unsigned)status, got);
+        if (got != sizeof(reports[index])) {
+            printf("EXIT_STATUS_STRESS_FAIL worker_report index=%u got=%zu\n", index, got);
             failed = 1;
         }
     }
