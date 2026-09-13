@@ -3,6 +3,7 @@ from pathlib import Path
 import re
 import subprocess
 
+from .multiboot2 import validate_thekernel_multiboot2_header
 from .runner import RunnerError
 
 
@@ -30,6 +31,12 @@ def validate_linux_esp_kernel(kernel: Path, esp: Path) -> None:
 
 
 def validate_thekernel_esp_kernel(kernel: Path, esp: Path) -> None:
+    # The boot protocol is checked before the payload, and on the kernel rather
+    # than on the copy inside the ESP, so a header the bootloader cannot walk is
+    # named as such instead of showing up as a boot that produces no output at
+    # all.  This runs before every TheKernel boot and reads a few hundred bytes
+    # of a file that has already been read.
+    validate_thekernel_multiboot2_header(kernel)
     validate_esp_kernel(kernel, esp, "::/TheKernel.elf")
 
 

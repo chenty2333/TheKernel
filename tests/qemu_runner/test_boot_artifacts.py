@@ -4,7 +4,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from tests.support import test_tmpdir
+from tests.support import multiboot2_elf, multiboot2_header, test_tmpdir
 from tools.qemu_runner.boot_artifacts import validate_linux_esp_kernel, validate_thekernel_esp_kernel
 from tools.qemu_runner.runner import RunnerError
 
@@ -14,7 +14,10 @@ class BootArtifactTests(unittest.TestCase):
         with test_tmpdir() as temporary:
             kernel = Path(temporary) / "vmlinuz"
             esp = Path(temporary) / "linux.esp"
-            kernel.write_bytes(b"kernel\x00\xff\r\n")
+            # The TheKernel payload is validated as a Multiboot2 image before
+            # the ESP is read, so this has to be one.  The Linux payload is
+            # only compared byte for byte, and stays arbitrary bytes.
+            kernel.write_bytes(multiboot2_elf(multiboot2_header()))
             with patch("tools.qemu_runner.boot_artifacts.subprocess.run") as read:
                 read.return_value = SimpleNamespace(returncode=0, stdout=kernel.read_bytes(), stderr=b"")
                 validate_linux_esp_kernel(kernel, esp)

@@ -25,7 +25,6 @@ authors = [
     "Mivik <mivikq@gmail.com>",
     "朝倉水希 <asakuramizu111@gmail.com>",
 ]
-build = false
 autolib = false
 autobins = false
 autoexamples = false
