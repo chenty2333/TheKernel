@@ -210,3 +210,251 @@ ABI and the damage tracker, and installs the fbcon's weak handle (`FBCON_DISPLAY
 Sections 2 and 3 record what was done about each.
 
 ---
+## 2. Decision
+
+### 2.1 The `dyn` display path is dead weight and stays dead
+
+Correction to the brief's framing, on the evidence in §1: the `dyn` path is not a layer
+"nobody uses today" that could be switched on later. It has no enabling manifest, no probe
+for display devices, no dependency edge that could link one, and its only effect on a
+product build would be to replace the single static display type with a trait object that
+nothing constructs. Enabling `dyn` would **remove** the one display driver the product has.
+
+It is therefore not resurrected, and the `dyn_drivers` module is not extended. The three
+things the brief asked of a registry are provided where display drivers actually live.
+
+### 2.2 What takes its place: a ranked scanout provider registry
+
+`kernel/src/drm/screen.rs` is now the kernel's single selection point, and it is a registry
+rather than a chain of `if`s:
+
+* **A candidate is data, not code.** `Candidate::new(name, rank, reason, acquire)` describes
+  a provider: a name for the log, a rank from the table in §3.1, the provider's own
+  statement of why it is entitled to the screen, and a `fn` that tries to take it. A driver
+  in any directory can build one and call `crate::drm::screen::register`.
+* **The decision is a pure function over candidates.** `decide(&[Candidate]) -> Selection`
+  touches no hardware of its own, so all four cases the brief names — no candidate, a
+  candidate that errors, two candidates that both work, a candidate that succeeds with
+  unusable geometry — are host unit tests (§3.3).
+* **Every candidate is accounted for.** `Selection` records one `Verdict` per candidate in
+  consultation order, and `report` prints all of them at `info!` (§3.2). A candidate that
+  was never asked because an earlier one won is recorded as `Outranked`, not omitted: "lost
+  to a better provider" and "never ran" are different facts and only one of them is a
+  configuration problem.
+* **Failure falls through.** A candidate that is absent, that fails, or that hands back a
+  surface which cannot be drawn into does not end the search; the next candidate is
+  consulted. The kernel's own two providers are the built-in candidates at ranks 100 and
+  200, so today's behaviour is preserved exactly while a third provider can now outrank
+  either of them.
+
+The registry is in `kernel/src/drm/` because that is the directory display drivers are
+written in, not because the decision is a DRM one — one of the two built-in candidates has
+no DRM device behind it at all, and the module doc says so.
+
+## 3. The new structure
+
+### 3.1 Priority, and why
+
+| Rank | Tier | Reason |
+|---:|---|---|
+| 0 | `rank::DRIVER` | It owns the display controller and programmed the mode it reports. It can present at the panel's own mode, and it is the surface a graphics client on the same device presents through. |
+| 100 | `rank::DRM` | The fbdev emulation of the registered DRM primary device (virtio-gpu today). A real driver with a real connector, but its console pixels live in a dumb GEM buffer and reach the screen only through an atomic commit — strictly more that can fail than a surface the controller scans directly. |
+| 200 | `rank::FIRMWARE` | The linear aperture the firmware programmed before the kernel started. Last because it is the only candidate that cannot present at a mode of the kernel's choosing, and it exists only because nothing above it did. |
+
+Within one rank a registered candidate is consulted before a built-in one, and registration
+order breaks any remaining tie (`sort_by_key` is stable), so the order is deterministic
+rather than incidental. On the profiles that exist today the candidate set is exactly
+`drm-primary`, `firmware-aperture`, and the order is the one the previous `if` hard-coded.
+
+### 3.2 What a boot log says
+
+One `info!` line per candidate, in consultation order, on the `scanout:` prefix:
+
+```
+scanout: candidate 'drm-primary' (rank 100) has nothing to offer: no DRM primary device is registered
+scanout: candidate 'firmware-aperture' (rank 200) selected: 1280x800 pitch 5120, because the firmware programmed this display and nothing in the kernel did
+Firmware framebuffer scanout: 1280x800 pitch 5120 at 0x80000000
+```
+
+and when nothing can drive the screen:
+
+```
+scanout: candidate 'drm-primary' (rank 100) offered an unusable surface: it addresses 1024 bytes but claims 960 scan lines of 4096
+scanout: candidate 'firmware-aperture' (rank 200) has nothing to offer: the bootloader handed over no framebuffer
+scanout: no candidate produced a usable surface
+No scanout surface available; /dev/fb0 is not published
+```
+
+The existing `Firmware framebuffer scanout: …` line is unchanged and is still emitted by the
+provider that maps the aperture, so nothing that greps for it breaks.
+
+**Every verdict is emitted as it is decided, not collected and printed at the end.** A
+verdict that is only printed once the search has finished is a verdict that is lost exactly
+when it matters: on a machine whose only output is the screen, the screen exists only after
+some candidate has won, and if the fallback that a losing verdict enabled is what faults on
+the way up, nothing is ever read. `decide` therefore takes a verdict observer and calls it
+before the next candidate is asked; `a_verdict_is_reported_before_the_next_candidate_is_asked`
+pins that ordering with a synthetic provider that refuses to be acquired until it has
+happened.
+
+**Gap: the bootloader's own rejection reason does not reach this log.** The platform parses
+Multiboot2 tag 8 into seven distinct rejections (`FramebufferRejection::Truncated`,
+`Indexed`, `Text`, `UnknownKind`, `Inconsistent`, `UnusableAddress`,
+`OverlapsUsableMemory` — `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs:172-191`) and
+reports them at `report_framebuffer` (`:385-405`), but only through `diagnostic_println!`,
+which is COM2 (`crates/ax/thekernel-axplat-x86-pc/src/lib.rs:12-16` →
+`console::emergency_diagnostic_print`). The N305 has no serial port, so on that machine the
+distinction is invisible, and all the kernel can say from `axhal::boot::framebuffer() ==
+None` is that there is no framebuffer. The enum and the accessor exist but are `pub(crate)`
+(`boot_info.rs:172`, `:325-327`), and `axplat_x86_pc::boot_framebuffer()` returns only
+`Option<FramebufferInfo>` (`crates/ax/thekernel-axplat-x86-pc/src/lib.rs:64-66`). Closing
+this needs the platform crate, which this change does not own; §5.5 gives the two-line
+shape.
+
+### 3.3 Tests
+
+`kernel/src/drm/screen.rs` carries host tests over synthetic candidates: a `SyntheticSurface`
+that reports geometry a test chooses and a set of `fn` factories for the provider
+behaviours. They cover, by name:
+
+| Test | Case |
+|---|---|
+| `no_candidate_at_all_selects_nothing_and_says_so` | no candidate |
+| `a_candidate_that_has_nothing_to_offer_falls_through_to_the_next` | absent provider |
+| `a_candidate_that_fails_falls_through_to_the_next` | provider errors |
+| `every_candidate_is_accounted_for_in_the_order_it_was_consulted` | verdict ordering |
+| `two_working_candidates_leave_the_later_one_unconsulted` | two working candidates |
+| `a_surface_that_cannot_be_drawn_into_falls_through` | unusable geometry, fall-through |
+| `every_geometry_a_console_cannot_draw_into_is_rejected` | empty extent, undrawable layout, short pitch, short allocation, rows below the visible ones |
+| `the_last_candidate_still_wins_when_everyone_above_it_failed` | fall-through to the last |
+| `a_verdict_is_reported_before_the_next_candidate_is_asked` | logging order (§3.2) |
+
+## 4. What a future Intel display driver must implement
+
+Two routes, and a driver may take either. Both end with the same guarantee: the surface is
+used only if it is consulted first *and* passes the console's own geometry check.
+
+**Route A — offer your own scanout (`rank::DRIVER`).** Implement
+`ScanoutSurface` (`kernel/src/pseudofs/dev/scanout.rs`) over the aperture you programmed:
+
+| Method | What it must be |
+|---|---|
+| `width`, `height`, `pitch`, `pixel_layout` | the mode you programmed, the real stride, and how you pack a pixel (build it from `axgpu::PixelLayout`) |
+| `write_pixel`, `read_bytes`, `write_bytes` | write/read through your mapping, clipped to the surface |
+| `virtual_height`, `yoffset`, `pan` | `height`, `0`, `Err(Unsupported)` unless you can really pan |
+| `len` | bytes addressable from the surface's first byte |
+| `mmap` | `DeviceMmap::Physical(range)` for a linear aperture, `SharedPages` if the memory is owned elsewhere |
+| `present` | `Ok(())` if a write is already visible, otherwise publish and return `Err` on failure |
+| `restore_text`, `set_master`, `set_blank` | accept if you have nothing to do; the console holds master while text is active |
+
+then register it, once, before `/dev/fb0` is published:
+
+```rust
+crate::drm::screen::register(Candidate::new(
+    "intel-display",
+    crate::drm::screen::rank::DRIVER,
+    "it owns the display engine and programmed this mode",
+    acquire, // fn() -> Result<Arc<dyn ScanoutSurface>, Unavailable>
+));
+```
+
+`Unavailable::Absent` is for "this machine has no such hardware"; `Unavailable::Failed` is
+for "it is there and I could not prepare a surface". The log distinguishes them because the
+first is a machine or configuration question and the second is a driver bug.
+
+**Route B — be the DRM device.** Implement `DisplayAdapter`
+(`kernel/src/drm/device.rs`) and publish it with `register_primary_device`. The built-in
+`drm-primary` candidate then offers your fbdev emulation at rank 100 with no registration
+call of your own.
+
+**What the console checks before it will use your surface** (`screen::usable`): non-zero
+extent; a drawable `PixelLayout` (every channel present and inside the pixel, depth a whole
+number of bytes); `pitch >= width * bytes_per_pixel`; and
+`len() >= pitch * virtual_height()`. A surface that fails any of these is rejected with the
+reason in the log and the next candidate is consulted.
+
+**Modes.** A driver programs the mode it wants and reports it; the console never changes a
+mode. The mode *description* type belongs to the modes workstream
+(`kernel/src/drm/modes/**`) and reaches a driver through the DRM layer, not through the
+scanout registry. See §5.1.
+
+## 5. What I did not do
+
+### 5.1 No mode-setting verb was added to the display driver traits
+
+The brief allowed this to be declined with an argument. Three facts decide it:
+
+1. **The mode description type is not mine.** A timing description (pixel clock, blank and
+   sync geometry, polarities, interlace) is being built in `kernel/src/drm/modes/**`, and
+   `thekernel-axdriver-display` is a mechanism-layer crate that cannot name a kernel type.
+   A verb on `DisplayDriverOps` would therefore have to invent a second mode description, or
+   reach for `axgpu::Mode`/`drm::kms::Mode` — a third and fourth way to say "mode" in one
+   kernel. The repository has spent the last weeks removing exactly that duplication.
+2. **The trait is not on the path.** `DisplayDriverOps` is not consulted by the console,
+   `/dev/fb0` or the scanout registry; those use `ScanoutSurface`. A defaulted
+   `Err(Unsupported)` verb there would have no caller and no defined effect on an
+   already-published `/dev/fb0` node, whose geometry is cached by `DisplayCore`.
+3. **Modes already have a direction.** `DisplayAdapter::preferred_mode()` states the mode a
+   driver programmed, and every commit carries it to the adapter in `Scanout.mode`. A driver
+   that can change modes can already express what it is in; what it cannot do is be
+   *commanded* from the console, which is deliberate — the console never changes a mode.
+
+Where the verb goes when there is a caller for it — recorded here exactly, so that the next
+person adds a line instead of re-deriving the layering. On `DisplayAdapter` in
+`kernel/src/drm/device.rs`:
+
+```rust
+/// Program `mode` on the display controller.
+///
+/// Defaulted: an adapter that cannot change modes — every adapter in the tree
+/// today — keeps compiling and states so by returning `Unsupported`.
+fn set_mode(&mut self, mode: crate::drm::modes::Mode) -> Result<(), DrmError> {
+    let _ = mode;
+    Err(DrmError::Unsupported)
+}
+```
+
+It is a one-line addition once two things exist: `kernel/src/drm/modes/**` (which owns the
+timing description this references by path), and a KMS path that changes mode on a live
+CRTC. Adding it before either would be a verb with no implementation site and no caller.
+Note also that `DisplayAdapter`'s methods take `&self`; the first implementation will have
+to decide whether a mode change needs interior mutability or a `&mut self` sibling, which is
+another reason not to guess at the signature ahead of its implementation.
+
+### 5.2 The choice is made once, and a loser cannot take over later
+
+`console_scanout()` runs when devfs is built, and its surface is handed to
+`fb::FrameBuffer::try_new`. There is no re-selection, no hotplug path into it, and a driver
+that registers after that point is simply never consulted. A real handover protocol (a
+display that appears later, or a driver that only becomes ready after init) is a separate
+piece of work and is not in this change.
+
+### 5.3 `FrameBuffer`'s bytes still have no accessor
+
+`DisplayDriverOps::fb()` returns a `FrameBuffer` whose `_raw` is private with no accessor,
+so the value remains unusable by any caller. It is *not* on the console path (that is
+`ScanoutSurface`), the new `DisplayInfo` fields describe a surface rather than expose it,
+and inventing an accessor with no caller would be API for its own sake. Recorded here as the
+next thing that interface needs.
+
+### 5.4 The bootloader's rejection reason is not visible on a serial-less machine
+
+See the gap analysed in §3.2. Within this change's ownership the kernel's line is as precise
+as the information it is given allows, and the fix belongs to the platform crate:
+
+```rust
+// crates/ax/thekernel-axplat-x86-pc/src/lib.rs
+/// Why the bootloader's framebuffer was declined, if it offered one.
+pub fn boot_framebuffer_rejection() -> Option<&'static str> { /* map the enum */ }
+```
+
+plus a two-line relay in `axhal::boot` (`framebuffer_rejection()` next to `framebuffer()`)
+and one word in `screen::firmware_aperture`'s `Unavailable::Absent` message. That is a
+change to a crate another workstream owns, so it is recorded rather than made.
+
+### 5.5 Nothing here has met Intel hardware
+
+No display driver other than virtio-gpu and the firmware aperture has ever registered
+itself. Every claim about the registry is from host tests and a QEMU boot; the registry's
+first real client will be the Intel driver, and its `Unavailable::Failed` path is the one
+most likely to be exercised there for the first time.
