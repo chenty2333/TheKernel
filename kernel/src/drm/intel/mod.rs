@@ -20,6 +20,16 @@
 //! | [`probe`] | the walk, the identity decision, the register reads, and the report |
 //! | [`debugfs`] | the report, exposed as a file in the DRM debug filesystem |
 //!
+//! The modeset's memory half is a second group, implemented and tested but not
+//! yet called from the boot path -- the pipe and the plane that scan these
+//! surfaces out are another workstream's:
+//!
+//! | module | what it owns |
+//! |---|---|
+//! | [`gtt`] | the GGTT page table: the entry layout, a run of entries for a physical range, and the read-back that proves the run landed |
+//! | [`fb`] | a framebuffer the display engine can read: geometry, the allocation, and the failure path |
+//! | [`scanout`] | that framebuffer as the console's [`crate::pseudofs::dev::scanout::ScanoutSurface`], offered to [`crate::drm::screen`] |
+//!
 //! ## What it proves, and what it does not
 //!
 //! A successful probe proves that the platform's configuration space was read,
@@ -53,7 +63,9 @@
 
 mod clk;
 pub(crate) mod debugfs;
+pub(crate) mod fb;
 mod gmbus;
+pub(crate) mod gtt;
 mod hpd;
 mod id;
 mod output;
@@ -64,6 +76,7 @@ mod pll;
 mod power;
 mod probe;
 mod regs;
+pub(crate) mod scanout;
 mod sink;
 mod timing;
 
