@@ -989,18 +989,21 @@ impl PipeProgram {
     /// Built as a string rather than logged as it goes because the sequence
     /// cannot be run on the target yet, so the text has to be something a host
     /// test can assert on.  [`Self::log`] puts the same text in the kernel log.
+    ///
+    /// `pipe_misc_before` is what `PIPE_MISC` holds now, which is what its
+    /// read-modify-write is applied to; a caller that wants the exact value
+    /// reads the register first, and one that only wants the rest of the
+    /// program can pass zero.
     pub(crate) fn render(&self, pipe_misc_before: u32) -> String {
         let mut out = String::new();
         out.push_str(&format!(
-            "intel-pipe: pipe {} {mode}, reference section 11 phases 3.4 and 4\n",
+            "intel-pipe: pipe {} mode {mode}, reference section 11 phases 3.4 and 4\n",
             self.pipe,
             mode = self.mode,
         ));
         out.push_str(&format!(
-            "intel-pipe: pipe {} mode {} at {} kHz, surface {} stride {} bytes\n",
+            "intel-pipe: pipe {} surface {} stride {} bytes\n",
             self.pipe,
-            self.mode,
-            self.mode.clock_khz,
             hex(u64::from(self.plane.surf), 8),
             self.plane.stride_bytes,
         ));
