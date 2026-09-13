@@ -24,11 +24,14 @@ from tools.qemu_runner.process import ProcessError, run_process, _pin_vcpu_threa
 # claims: what the tests assert is that a signalled runner reaps its child and
 # runs its `finally` cleanup, and that a broken one never returns at all.  The
 # repository's verification runs on a machine that may be executing a dozen
-# other test suites at the same time, where interpreter startup has been
-# measured past eight seconds; a bound tight enough to fail there would report
-# the machine's load as a regression in this code.
+# other test suites at the same time.  The tests below pass in under a second
+# on an idle machine and have been observed to exceed sixty seconds on a loaded
+# one -- two interpreters, a fork, a signal and a cleanup, all starved of CPU.
+# A bound tight enough to fail there reports the machine's load as a regression
+# in this code, which is the one thing a hang detector must not do; these are
+# set where only a genuine hang reaches them.
 STARTUP_BOUND_SECONDS = 30
-TEARDOWN_BOUND_SECONDS = 60
+TEARDOWN_BOUND_SECONDS = 120
 
 
 class ProcessTests(unittest.TestCase):
