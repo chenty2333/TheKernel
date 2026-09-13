@@ -27,6 +27,36 @@ pub(crate) const DPLL0_CFGCR0: Register =
 pub(crate) const DPLL0_CFGCR1: Register =
     Register::read_write("DPLL0_CFGCR1", 0x16_4288, Meaning::BringUp, None);
 
+/// `DPLL1_CFGCR0` (combo DPLL 1), reference section 6.3.
+///
+/// The same DCO fields as `DPLL0_CFGCR0` -- i915's `DPLL_CFGCR0_*` field
+/// macros are defined once (`i915_reg.h:4258-4273`) and used for both -- for
+/// the PLL that clocks combo PHY B, which section 6.3's PLL table gives as
+/// DPLL 1's use.  The section states no offset for it, so this one comes from
+/// the citation the section gives for the whole block, `[I915]`
+/// `i915_reg.h:4301-4322`: `_TGL_DPLL1_CFGCR0 = 0x16428C` (`i915_reg.h:4302`)
+/// is the second entry of `TGL_DPLL_CFGCR0(pll)` (`i915_reg.h:4304-4306`),
+/// which is the register `icl_dpll_write` picks for PLL id 1 on
+/// `DISPLAY_VER >= 12` (`intel_dpll_mgr.c:3767-3769`) -- and ADL-N is display
+/// 13, so that is this table's path.  It is the `_TGL_*` block and not
+/// `_ICL_DPLL1_CFGCR0` (`0x164080`, `i915_reg.h:4255`): same field layout,
+/// different address.
+pub(crate) const DPLL1_CFGCR0: Register =
+    Register::read_write("DPLL1_CFGCR0", 0x16_428C, Meaning::BringUp, None);
+
+/// `DPLL1_CFGCR1` (combo DPLL 1), reference section 6.3.
+///
+/// `DPLL0_CFGCR1`'s divider fields at DPLL1's address: `_TGL_DPLL1_CFGCR1` is
+/// `0x164290` and is the second entry of `TGL_DPLL_CFGCR1(pll)`
+/// (`[I915]` `i915_reg.h:4317`, `4319-4321`).  The field positions are shared
+/// with DPLL0 -- the `DPLL_CFGCR1_*` field macros are defined once
+/// (`i915_reg.h:4279-4299`) and used for both -- so the value `pll.rs` computes
+/// for a mode is the same whichever combo PHY the port is on, and only the
+/// address changes.  The posting read of this register closes the divider
+/// write, as it does for DPLL0.
+pub(crate) const DPLL1_CFGCR1: Register =
+    Register::read_write("DPLL1_CFGCR1", 0x16_4290, Meaning::BringUp, None);
+
 /// `DPLL0_ENABLE` (alias `LCPLL1_CTL`), reference section 6.3.
 ///
 /// The combo PLL's power and enable control: `PLL_ENABLE[31]`, `LOCK[30]`,
@@ -61,11 +91,6 @@ pub(crate) const ICL_DPCLKA_CFGCR0: Register =
  *
  * Offsets the document does not state, and which were therefore not
  * transcribed:
- * - `DPLL1_CFGCR0` / `DPLL1_CFGCR1`: section 6.3 names a `DPLL1_*` family and
- *   gives `DPLL1_ENABLE` as `0x46014`, but it states config offsets only for
- *   DPLL0 ("`DPLLn_CFGCR0` (`0x164284` for DPLL0)", "`DPLLn_CFGCR1`
- *   (`0x164288` for DPLL0)").  No DPLL1 config offset appears anywhere in the
- *   document, so combo PHY B's PLL cannot be configured from this table.
  * - Per-PHY siblings of the port clock select: the document names exactly one
  *   such register, `ICL_DPCLKA_CFGCR0` (`0x164280`, sections 6.3 and 11 phase
  *   5.2), and handles the PHYs with fields inside it (`DDI_CLK_SEL_SHIFT(phy)
@@ -75,7 +100,23 @@ pub(crate) const ICL_DPCLKA_CFGCR0: Register =
  * - `DPLL_CFGCR2`, which the group list names: it occurs only as the
  *   Skylake-era `DPLL_CFGCR2_*` field layout that section 6.3 says "do not
  *   apply" on Gen12, and no `DPLL_CFGCR2` register offset is stated anywhere.
- *   Not transcribed; the Gen12 config register is `DPLL0_CFGCR1`.
+ *   Not transcribed; the Gen12 config registers are `DPLL0_CFGCR1` and
+ *   `DPLL1_CFGCR1`.
+ *
+ * Where the document is incomplete, and the gap was closed from the source it
+ * cites:
+ * - `DPLL1_CFGCR0` / `DPLL1_CFGCR1`: section 6.3's PLL table gives the
+ *   `DPLL1_*` family as what clocks combo PHY B, and its two field rows name
+ *   only the DPLL0 instances -- "`DPLLn_CFGCR0` (`0x164284` for DPLL0)" and
+ *   "`DPLLn_CFGCR1` (`0x164288` for DPLL0)" -- so the table alone leaves
+ *   PHY B's PLL without an address, and an earlier revision of this file
+ *   stopped there.  The same subsection does cite the region that carries both
+ *   pairs, `[I915]` `i915_reg.h:4301-4322`, and that is where the two offsets
+ *   above come from: `_TGL_DPLL1_CFGCR0 = 0x16428C` (`i915_reg.h:4302`) and
+ *   `_TGL_DPLL1_CFGCR1 = 0x164290` (`i915_reg.h:4317`), selected by PLL id in
+ *   `icl_dpll_write`'s `DISPLAY_VER >= 12` path (`intel_dpll_mgr.c:3767-3769`).
+ *   The document omits the values, not the source: the citation it prints
+ *   under the DPLL0 rows covers DPLL1 as well.
  *
  * Places where the document's mentions of a register disagree:
  * - `CDCLK_PLL_ENABLE` (`0x46070`) bits `[27]`/`[26]`: `[TGL12]` calls them
@@ -118,7 +159,11 @@ pub(crate) const ICL_DPCLKA_CFGCR0: Register =
  *   used on `XE_LPD`.
  * - `DPLL0_DIV0` (`0x164B00`): section 6.3 lists it but marks the AFC-startup
  *   write "only if VBT overrides it"; section 11 never writes it and this
- *   kernel reads no VBT.
+ *   kernel reads no VBT.  Its DPLL1 sibling `_TGL_DPLL1_DIV0` (`0x164C00`,
+ *   `[I915]` `i915_reg.h:4311`) is left out for the same reason, so PHY B's
+ *   PLL is configured without either -- which matches `icl_dpll_write`, where
+ *   the `DIV0` write is behind `vbt.override_afc_startup`
+ *   (`intel_dpll_mgr.c:3784-3789`).
  * - TBT PLL (`0x46020`) and TC PLL 1-4 (`PORTTC1/2_PLL_ENABLE`,
  *   `0x46038`/`0x46040`): section 6.3 says to ignore the DKL/Type-C PLLs and
  *   section 8.8 defers the whole Type-C path.
