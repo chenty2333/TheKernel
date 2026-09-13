@@ -660,6 +660,7 @@ def run(
                 qmp_timeout_secs=config.qmp.timeout_secs,
                 qmp_screenshot_size=config.qmp.screenshot_size,
                 qmp_screenshot_color_blocks=config.qmp.screenshot_color_blocks,
+                qmp_screenshot_text_cells=config.qmp.screenshot_text_cells,
                 qmp_checkpoints=checkpoints,
             )
         with input_path.open("rb") as input_stream:
@@ -682,6 +683,7 @@ def run(
                 qmp_timeout_secs=config.qmp.timeout_secs,
                 qmp_screenshot_size=config.qmp.screenshot_size,
                 qmp_screenshot_color_blocks=config.qmp.screenshot_color_blocks,
+                qmp_screenshot_text_cells=config.qmp.screenshot_text_cells,
                 qmp_checkpoints=checkpoints,
             )
     finally:

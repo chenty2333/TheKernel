@@ -66,6 +66,7 @@ class QmpControls:
     timeout_secs: float = 5.0
     screenshot_size: tuple[int, int] | None = None
     screenshot_color_blocks: tuple["QmpColorBlock", ...] = ()
+    screenshot_text_cells: "QmpTextCells | None" = None
     checkpoints: tuple["QmpCheckpoint", ...] = ()
 
 
@@ -78,6 +79,76 @@ class QmpColorBlock:
     width: int
     height: int
     rgb: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class QmpConsoleLine:
+    """One line of console text expected to be readable in a screendump.
+
+    ``cells`` holds one cell bitmap per character, rendered from the console's
+    own font (``tools/qemu_runner/console_font.py``).  Matching bitmaps instead
+    of a string keeps the assertion about pixels -- these characters, on this
+    cell grid -- and lets a font change move both sides together instead of
+    silently invalidating the expectation.
+    """
+
+    label: str
+    cells: tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True)
+class QmpTextCells:
+    """A structural ink expectation for one QMP ``screendump`` PPM image.
+
+    The framebuffer console paints glyphs into a fixed character grid, so a
+    frame it produced has exactly two colours and no ink outside the cells it
+    wrote.  Asserting that structure proves "text was rendered, and only where
+    text was expected" without re-encoding the guest's font table, which would
+    have to be updated in lockstep with every font change and would still be
+    satisfied by a frame nobody can read.
+
+    It is deliberately not a "the image is not blank" check.  A console which
+    walks the surface at the wrong stride for its pixel depth paints a busy,
+    colourful frame that such a check accepts; that frame carries no pixel of
+    exactly ``ink``, so the floors and the two-colour rule below reject it.
+    """
+
+    # Character grid origin and cell size, in pixels.
+    x: int = 0
+    y: int = 0
+    cell_width: int = 8
+    cell_height: int = 16
+    # Grid extent in cells.  ``None`` derives it from the screendump, which
+    # must then be an exact whole number of cells; an explicit value bounds
+    # the region ink is allowed to appear in at all.
+    columns: int | None = None
+    rows: int | None = None
+    # The only two colours the console paints, as canonical RGB triples.
+    ink: tuple[int, int, int] = (0xD0, 0xD0, 0xD0)
+    background: tuple[int, int, int] = (0, 0, 0)
+    # Floors that separate a rendered screen from a blank or unreadable one.
+    min_ink_pixels: int = 512
+    min_inked_cells: int = 16
+    # Pixels inside the grid allowed to be neither ink nor background.  A
+    # correctly rendered console produces zero of them, so this is a budget
+    # for a known exception, never a tolerance for a rendering bug.
+    max_foreign_pixels: int = 0
+    # Assert the console's cell-border invariant: no ink in a cell's last pixel
+    # column, nor in its first or last pixel row.  The kernel's font guarantees
+    # this for every glyph it can draw (``no_glyph_touches_the_cell_border`` in
+    # kernel/src/pseudofs/dev/console_font/tests.rs), so a frame that violates
+    # it did not come from the console's glyph renderer.  That is worth its own
+    # rule because a misaligned or wrongly strided render can keep the colours
+    # exact and still paint text a pixel off -- which no colour rule can see.
+    # Off by default: it is a property of this console, not of text in general.
+    require_clear_cell_borders: bool = False
+    # Whole console lines that must be readable somewhere on the grid.  This is
+    # what turns "there is ink" into "the kernel's log and the guest's own
+    # output are on the screen": a caller gating a screendump on a serial
+    # marker knows the guest has *written* the line, and this asserts the
+    # console actually presented it.  A console that records cells and defers
+    # the repaint is one frame behind, so a miss is retried, not fatal.
+    expected_lines: tuple["QmpConsoleLine", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -98,6 +169,7 @@ class QmpCheckpoint:
     screenshot_after_marker: str | None = None
     screenshot_size: tuple[int, int] | None = None
     screenshot_color_blocks: tuple[QmpColorBlock, ...] = ()
+    screenshot_text_cells: "QmpTextCells | None" = None
     pci_hotplug: tuple["QmpPciHotplug", ...] = ()
     # When set, measure from immediately before QMP input submission until
     # the guest reports that the input-driven frame became visible.  The

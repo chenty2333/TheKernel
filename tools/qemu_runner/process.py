@@ -14,6 +14,7 @@ import threading
 import time
 import json
 from collections import deque
+from dataclasses import dataclass
 from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, Iterator, Mapping
@@ -23,7 +24,9 @@ from .model import (
     Interaction,
     QmpColorBlock,
     QmpCheckpoint,
+    QmpConsoleLine,
     QmpPciHotplug,
+    QmpTextCells,
     RunLimits,
     RunResult,
 )
@@ -56,12 +59,36 @@ def _validate_color_block(block: QmpColorBlock) -> None:
         raise ProcessError("QMP screenshot color block RGB channels must be in 0..255")
 
 
-def _validate_ppm(
-    screenshot: Path,
-    expected_size: tuple[int, int] | None,
-    color_blocks: tuple[QmpColorBlock, ...],
-) -> None:
-    """Validate QEMU's P6 screendump before reporting graphics success."""
+def _validate_text_cells(cells: QmpTextCells) -> None:
+    if cells.x < 0 or cells.y < 0:
+        raise ProcessError("QMP screenshot text grid must have a non-negative origin")
+    if cells.cell_width <= 0 or cells.cell_height <= 0:
+        raise ProcessError("QMP screenshot text grid cell size must be positive")
+    for name, extent in (("columns", cells.columns), ("rows", cells.rows)):
+        if extent is not None and extent <= 0:
+            raise ProcessError(f"QMP screenshot text grid {name} must be positive")
+    for name, colour in (("ink", cells.ink), ("background", cells.background)):
+        if len(colour) != 3 or any(channel < 0 or channel > 255 for channel in colour):
+            raise ProcessError(f"QMP screenshot text grid {name} colour channels must be in 0..255")
+    if cells.ink == cells.background:
+        raise ProcessError("QMP screenshot text grid ink and background must differ")
+    if cells.min_ink_pixels <= 0 or cells.min_inked_cells <= 0:
+        raise ProcessError("QMP screenshot text grid ink floors must be positive")
+    if cells.max_foreign_pixels < 0:
+        raise ProcessError("QMP screenshot text grid foreign-pixel budget must be non-negative")
+    for line in cells.expected_lines:
+        if not line.label or not line.cells:
+            raise ProcessError("QMP screenshot expected console line needs a label and cells")
+        for cell in line.cells:
+            if len(cell) != cells.cell_height:
+                raise ProcessError(
+                    f"QMP screenshot expected console line {line.label!r} has a cell of "
+                    f"{len(cell)} rows, not the grid's {cells.cell_height}"
+                )
+
+
+def _read_ppm(screenshot: Path) -> tuple[int, int, bytes]:
+    """Read one QEMU P6 screendump into (width, height, RGB pixels)."""
 
     try:
         image = screenshot.read_bytes()
@@ -102,6 +129,279 @@ def _validate_ppm(
     pixels = image[offset:]
     if len(pixels) != width * height * 3:
         raise ProcessError("QMP screendump PPM pixel data is incomplete")
+    return width, height, pixels
+
+
+def _grid_extent(cells: QmpTextCells, width: int, height: int) -> tuple[int, int]:
+    """Resolve the character grid, rejecting an image it cannot describe."""
+
+    columns, rows = cells.columns, cells.rows
+    if columns is None:
+        # Deriving the extent makes the image itself the claim: a surface whose
+        # width is not a whole number of character cells cannot be the console
+        # grid this oracle describes, and no amount of waiting fixes it.
+        if width % cells.cell_width:
+            raise ProcessError(
+                f"QMP screendump width {width} is not a whole number of "
+                f"{cells.cell_width}-pixel character cells"
+            )
+        columns = width // cells.cell_width
+    if rows is None:
+        if height % cells.cell_height:
+            raise ProcessError(
+                f"QMP screendump height {height} is not a whole number of "
+                f"{cells.cell_height}-pixel character cells"
+            )
+        rows = height // cells.cell_height
+    if cells.x + columns * cells.cell_width > width or cells.y + rows * cells.cell_height > height:
+        raise ProcessError(
+            f"QMP screendump text grid {columns}x{rows} cells at ({cells.x},{cells.y}) "
+            f"does not fit the {width}x{height} image"
+        )
+    return columns, rows
+
+
+@dataclass(frozen=True)
+class TextGridInk:
+    """What one screendump actually contained, measured on its character grid."""
+
+    columns: int
+    rows: int
+    ink_pixels: int
+    inked_cells: int
+    foreign_pixels: int
+    outside_ink_pixels: int
+    border_ink_pixels: int = 0
+    missing_lines: tuple[str, ...] = ()
+    # First offending pixel of each class, for a failure message a reader can
+    # act on without opening the image.
+    first_foreign: tuple[int, int] | None = None
+    first_outside: tuple[int, int] | None = None
+    first_border: tuple[int, int] | None = None
+
+    def summary(self) -> str:
+        return (
+            f"{self.columns}x{self.rows} cells, {self.inked_cells} inked cells, "
+            f"{self.ink_pixels} ink pixels, {self.foreign_pixels} foreign pixels, "
+            f"{self.outside_ink_pixels} ink pixels outside the grid, "
+            f"{self.border_ink_pixels} on a cell border"
+        )
+
+
+def _measure_text_grid(
+    pixels: bytes,
+    width: int,
+    height: int,
+    cells: QmpTextCells,
+) -> TextGridInk:
+    """Count ink, inked cells, and non-console pixels on the character grid."""
+
+    columns, rows = _grid_extent(cells, width, height)
+    grid_width = columns * cells.cell_width
+    grid_height = rows * cells.cell_height
+    ink = bytes(cells.ink)
+    background = bytes(cells.background)
+    # A blank cell row is 24 zero bytes on every real console, so one slice
+    # comparison skips eight pixel comparisons.  The scan stays exact: the
+    # fast path only ever skips pixels already known to be background.
+    blank_row = background * cells.cell_width
+    ink_pixels = 0
+    inked_cells = 0
+    foreign_pixels = 0
+    border_ink_pixels = 0
+    first_foreign: tuple[int, int] | None = None
+    first_border: tuple[int, int] | None = None
+    for row in range(rows):
+        grid_row = cells.y + row * cells.cell_height
+        for column in range(columns):
+            grid_column = cells.x + column * cells.cell_width
+            cell_ink = 0
+            for y in range(grid_row, grid_row + cells.cell_height):
+                offset = (y * width + grid_column) * 3
+                segment = pixels[offset : offset + cells.cell_width * 3]
+                if segment == blank_row:
+                    continue
+                border_row = (y == grid_row or y == grid_row + cells.cell_height - 1)
+                for x in range(cells.cell_width):
+                    pixel = segment[x * 3 : x * 3 + 3]
+                    if pixel == ink:
+                        cell_ink += 1
+                        if cells.require_clear_cell_borders and (
+                            border_row or x == cells.cell_width - 1
+                        ):
+                            border_ink_pixels += 1
+                            if first_border is None:
+                                first_border = (grid_column + x, y)
+                    elif pixel != background:
+                        foreign_pixels += 1
+                        if first_foreign is None:
+                            first_foreign = (grid_column + x, y)
+            ink_pixels += cell_ink
+            if cell_ink:
+                inked_cells += 1
+
+    # Ink outside the declared grid means the console wrote where this test
+    # says nothing is drawn: a stale frame, a second writer, or a scanout the
+    # console does not actually own.  When the grid covers the image there is
+    # no outside, which is the common case and costs nothing here.
+    outside_ink = 0
+    first_outside: tuple[int, int] | None = None
+
+    def scan(x_start: int, x_end: int, y_start: int, y_end: int) -> None:
+        nonlocal outside_ink, first_outside
+        for y in range(y_start, y_end):
+            offset = (y * width + x_start) * 3
+            for x in range(x_start, x_end):
+                if pixels[offset : offset + 3] == ink:
+                    outside_ink += 1
+                    if first_outside is None:
+                        first_outside = (x, y)
+                offset += 3
+
+    scan(0, width, 0, cells.y)
+    scan(0, cells.x, cells.y, min(cells.y + grid_height, height))
+    scan(cells.x + grid_width, width, cells.y, min(cells.y + grid_height, height))
+    scan(0, width, min(cells.y + grid_height, height), height)
+
+    # A line is a run of consecutive cells.  The console draws one byte per
+    # cell from a font this test shares with it, so a line that was presented
+    # matches cell for cell -- and searching from the last rows up finds the
+    # newest text first, which is where a line the guest just wrote lands.
+    missing: list[str] = []
+    for line in cells.expected_lines:
+        width_cells = len(line.cells)
+        found = False
+        for row in range(rows - 1, -1, -1):
+            if found:
+                break
+            for column in range(0, columns - width_cells + 1):
+                if all(
+                    _cell_rows(pixels, width, cells, row, column + offset) == line.cells[offset]
+                    for offset in range(width_cells)
+                ):
+                    found = True
+                    break
+        if not found:
+            missing.append(line.label)
+
+    return TextGridInk(
+        columns,
+        rows,
+        ink_pixels,
+        inked_cells,
+        foreign_pixels,
+        outside_ink,
+        border_ink_pixels,
+        tuple(missing),
+        first_foreign,
+        first_outside,
+        first_border,
+    )
+
+
+def _cell_rows(
+    pixels: bytes,
+    width: int,
+    cells: QmpTextCells,
+    row: int,
+    column: int,
+) -> tuple[int, ...]:
+    """One cell's 16 row bytes, in the font's bit order (MSB is leftmost)."""
+
+    rows = []
+    for dy in range(cells.cell_height):
+        y = cells.y + row * cells.cell_height + dy
+        bits = 0
+        for dx in range(cells.cell_width):
+            offset = (y * width + cells.x + column * cells.cell_width + dx) * 3
+            if pixels[offset : offset + 3] == bytes(cells.ink):
+                bits |= 0x80 >> dx
+        rows.append(bits)
+    return tuple(rows)
+
+
+def _validate_text_grid(
+    pixels: bytes,
+    width: int,
+    height: int,
+    cells: QmpTextCells,
+) -> None:
+    """Assert that a screendump contains console glyph ink on its cell grid.
+
+    Every threshold failure is raised as a retryable frame mismatch: a
+    screendump may legitimately catch a repaint that has not reached the
+    expected cells yet, and the caller polls until the deadline before
+    reporting the last one.  A structural failure, where the image cannot be
+    the grid at all, is fatal instead.
+    """
+
+    measured = _measure_text_grid(pixels, width, height, cells)
+    if measured.missing_lines:
+        raise _ScreenshotColorMismatch(
+            f"QMP screendump does not show the expected console text: "
+            f"{', '.join(repr(label) for label in measured.missing_lines)} "
+            f"({measured.summary()})"
+        )
+    if measured.outside_ink_pixels:
+        assert measured.first_outside is not None
+        raise _ScreenshotColorMismatch(
+            f"QMP screendump has {measured.outside_ink_pixels} ink pixels outside the "
+            f"{measured.columns}x{measured.rows}-cell text grid "
+            f"(first at {measured.first_outside[0]},{measured.first_outside[1]})"
+        )
+    if measured.foreign_pixels > cells.max_foreign_pixels:
+        assert measured.first_foreign is not None
+        raise _ScreenshotColorMismatch(
+            f"QMP screendump has {measured.foreign_pixels} pixels inside the text grid which are "
+            f"neither ink {cells.ink} nor background {cells.background} "
+            f"(first at {measured.first_foreign[0]},{measured.first_foreign[1]}); a console "
+            f"writing at the wrong stride for the surface's pixel depth looks exactly like this"
+        )
+    if measured.border_ink_pixels:
+        assert measured.first_border is not None
+        raise _ScreenshotColorMismatch(
+            f"QMP screendump has {measured.border_ink_pixels} ink pixels on a character cell's "
+            f"border (first at {measured.first_border[0]},{measured.first_border[1]}); the "
+            f"console's glyphs never touch a cell edge, so text painted there was not drawn by "
+            f"its renderer -- a shifted or wrongly strided render looks like this even when it "
+            f"keeps the exact console colours"
+        )
+    if measured.ink_pixels < cells.min_ink_pixels:
+        raise _ScreenshotColorMismatch(
+            f"QMP screendump holds {measured.ink_pixels} ink pixels, below the "
+            f"{cells.min_ink_pixels} that rendered text requires "
+            f"(grid {measured.columns}x{measured.rows} cells)"
+        )
+    if measured.inked_cells < cells.min_inked_cells:
+        raise _ScreenshotColorMismatch(
+            f"QMP screendump holds ink in {measured.inked_cells} character cells, below the "
+            f"{cells.min_inked_cells} that rendered text requires "
+            f"({measured.ink_pixels} ink pixels)"
+        )
+
+
+def measure_text_cells(screenshot: Path, cells: QmpTextCells) -> TextGridInk:
+    """Measure one screendump against a text-cell expectation, without a gate.
+
+    This is the oracle's read-only half.  The acceptance suite calls it after
+    a passing run so the report quotes what the screen actually held instead
+    of restating the thresholds.
+    """
+
+    _validate_text_cells(cells)
+    width, height, pixels = _read_ppm(screenshot)
+    return _measure_text_grid(pixels, width, height, cells)
+
+
+def _validate_ppm(
+    screenshot: Path,
+    expected_size: tuple[int, int] | None,
+    color_blocks: tuple[QmpColorBlock, ...],
+    text_cells: QmpTextCells | None = None,
+) -> None:
+    """Validate QEMU's P6 screendump before reporting graphics success."""
+
+    width, height, pixels = _read_ppm(screenshot)
     if expected_size is not None and (width, height) != expected_size:
         raise ProcessError(
             f"QMP screendump dimensions are {width}x{height}, expected {expected_size[0]}x{expected_size[1]}"
@@ -114,6 +414,8 @@ def _validate_ppm(
             start = (y * width + block.x) * 3
             if pixels[start : start + block.width * 3] != expected * block.width:
                 raise _ScreenshotColorMismatch("QMP screenshot color block did not match")
+    if text_cells is not None:
+        _validate_text_grid(pixels, width, height, text_cells)
 
 
 def _pin_vcpu_threads(qemu_pid: int | None, response: object,
@@ -172,6 +474,7 @@ class _QmpController:
         screenshot_size: tuple[int, int] | None,
         screenshot_color_blocks: tuple[QmpColorBlock, ...],
         checkpoints: tuple[QmpCheckpoint, ...],
+        screenshot_text_cells: QmpTextCells | None = None,
         vcpu_host_cpus: tuple[int, ...] = (),
         qemu_pid: int | None = None,
     ) -> None:
@@ -186,6 +489,7 @@ class _QmpController:
         self.timeout_secs = timeout_secs
         self.screenshot_size = screenshot_size
         self.screenshot_color_blocks = screenshot_color_blocks
+        self.screenshot_text_cells = screenshot_text_cells
         self.checkpoints = checkpoints or (
             QmpCheckpoint(
                 input_after_marker=input_after_marker or "",
@@ -194,6 +498,7 @@ class _QmpController:
                 screenshot_after_marker=screenshot_after_marker,
                 screenshot_size=screenshot_size,
                 screenshot_color_blocks=screenshot_color_blocks,
+                screenshot_text_cells=screenshot_text_cells,
             ),
         )
         self._markers: set[str] = set()
@@ -234,6 +539,15 @@ class _QmpController:
         """Allow an in-flight final QMP response to win a guest-exit race."""
 
         self._finished.wait(timeout=0.2)
+
+    def _unsettled(self, mismatch: _ScreenshotColorMismatch) -> ProcessError:
+        """A frame that never became what the oracle required, within budget."""
+
+        if self._cancelled.is_set():
+            return ProcessError("QMP controls cancelled")
+        return ProcessError(
+            f"QMP screenshot oracle did not settle within {self.timeout_secs:g}s: {mismatch}"
+        )
 
     def _wait_marker(self, marker: str, description: str, deadline: float) -> None:
         with self._marker_condition:
@@ -471,16 +785,20 @@ class _QmpController:
                                 checkpoint.screenshot,
                                 checkpoint.screenshot_size,
                                 checkpoint.screenshot_color_blocks,
+                                checkpoint.screenshot_text_cells,
                             )
                             break
-                        except _ScreenshotColorMismatch:
+                        except _ScreenshotColorMismatch as mismatch:
+                            # The screen may simply not show it yet: the guest
+                            # records console cells and repaints behind the
+                            # writes.  Retry until the deadline, then report
+                            # what was still missing and how long was allowed,
+                            # never a bare "did not match".
                             remaining = deadline - time.monotonic()
-                            if remaining <= 0:
-                                raise
-                            if self._cancelled.wait(min(0.02, remaining)):
-                                raise ProcessError("QMP controls cancelled")
+                            if remaining <= 0 or self._cancelled.wait(min(0.02, remaining)):
+                                raise self._unsettled(mismatch) from mismatch
                             if time.monotonic() >= deadline:
-                                raise
+                                raise self._unsettled(mismatch) from mismatch
             self._complete.set()
         except (OSError, ValueError, json.JSONDecodeError) as error:
             if not self._cancelled.is_set():
@@ -590,6 +908,7 @@ def validate_qmp_controls(
     screenshot_size: tuple[int, int] | None,
     screenshot_color_blocks: tuple[QmpColorBlock, ...],
     checkpoints: tuple[QmpCheckpoint, ...],
+    screenshot_text_cells: QmpTextCells | None = None,
 ) -> None:
     _validate_qmp_marker("QMP input-after marker", input_after_marker)
     _validate_qmp_marker("QMP screenshot-after marker", screenshot_after_marker)
@@ -603,10 +922,14 @@ def validate_qmp_controls(
         len(screenshot_size) != 2 or any(value <= 0 for value in screenshot_size)
     ):
         raise ProcessError("QMP screenshot dimensions must be positive")
-    if screenshot is None and (screenshot_size is not None or screenshot_color_blocks):
+    if screenshot is None and (
+        screenshot_size is not None or screenshot_color_blocks or screenshot_text_cells is not None
+    ):
         raise ProcessError("QMP screenshot oracle requires a screenshot")
     for block in screenshot_color_blocks:
         _validate_color_block(block)
+    if screenshot_text_cells is not None:
+        _validate_text_cells(screenshot_text_cells)
     for checkpoint in checkpoints:
         _validate_qmp_marker("QMP checkpoint input-after marker", checkpoint.input_after_marker)
         _validate_qmp_marker("QMP checkpoint screenshot-after marker", checkpoint.screenshot_after_marker)
@@ -623,10 +946,13 @@ def validate_qmp_controls(
         if checkpoint.screenshot is None and (
             checkpoint.screenshot_size is not None
             or checkpoint.screenshot_color_blocks
+            or checkpoint.screenshot_text_cells is not None
         ):
             raise ProcessError("QMP checkpoint screenshot oracle requires a screenshot")
         for block in checkpoint.screenshot_color_blocks:
             _validate_color_block(block)
+        if checkpoint.screenshot_text_cells is not None:
+            _validate_text_cells(checkpoint.screenshot_text_cells)
         for action in checkpoint.pci_hotplug:
             _validate_pci_hotplug(action)
 
@@ -982,6 +1308,7 @@ def run_process(
     qmp_timeout_secs: float = 5.0,
     qmp_screenshot_size: tuple[int, int] | None = None,
     qmp_screenshot_color_blocks: tuple[QmpColorBlock, ...] = (),
+    qmp_screenshot_text_cells: QmpTextCells | None = None,
     qmp_checkpoints: tuple[QmpCheckpoint, ...] = (),
 ) -> RunResult:
     """Run one explicit QEMU command and capture its complete serial stream."""
@@ -995,6 +1322,7 @@ def run_process(
         timeout_secs=qmp_timeout_secs,
         screenshot_size=qmp_screenshot_size,
         screenshot_color_blocks=qmp_screenshot_color_blocks,
+        screenshot_text_cells=qmp_screenshot_text_cells,
         checkpoints=qmp_checkpoints,
     )
     if qmp_socket is None and (
@@ -1062,6 +1390,7 @@ def run_process(
                         timeout_secs=qmp_timeout_secs,
                         screenshot_size=qmp_screenshot_size,
                         screenshot_color_blocks=qmp_screenshot_color_blocks,
+                        screenshot_text_cells=qmp_screenshot_text_cells,
                         checkpoints=qmp_checkpoints,
                     )
                     qmp_controller.start()
