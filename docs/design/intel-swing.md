@@ -73,26 +73,33 @@ For a `Ddi` on a combo PHY — DDI A on PHY A (`0x162000`), DDI B on PHY B (`0x0
 | `PORT_COMP_DW0` | `0x162100` / `0x06C100` | bit 31 `COMP_INIT` | §8.3 steps 2, 6; §12.2; `[I915]` `display/intel_combo_phy_regs.h:55` |
 | `DDI_BUF_CTL` | `0x64000` / `0x64100` | bit 31 `ENABLE`, bit 7 `IS_IDLE`, `[27:24]` `BUF_TRANS_SELECT` | §8.4; §8.6 steps 13-14; §11 phases 5.7, 6.3; `[I915]` `i915_reg.h:3859`, `:3861-3862`, `:3869` |
 | `PORT_CL_DW10` | `0x162028` / `0x06C028` | `[7:4]` `PWR_DOWN_LN_MASK` | §8.2; §8.6 step 7; `[I915]` `display/intel_combo_phy_regs.h:34-37` |
-| `PORT_TX_DW2` (group) | `0x162688` / `0x06C688` | the whole dword | §8.2 worked example; §8.5 step 5 |
-| `PORT_TX_DW4_LN0..3` | `0x162890 + 0x100·ln` / `0x06C890 + 0x100·ln` | the whole dword, **per lane** | §8.2 rule `0x880 + ln·0x100`; §8.5 steps 2 and 5 |
-| `PORT_TX_DW5` (group) | `0x162694` / `0x06C694` | bit 31 `TX_TRAINING_EN`, and the word itself | §8.5 steps 4-6; `[I915]` `display/intel_combo_phy_regs.h:133` |
-| `PORT_TX_DW7` (group) | `0x16269C` / `0x06C69C` | the whole dword | §8.5 step 5 |
+| `PORT_TX_DW2_LN0..3` | `0x162888 + 0x100·ln` / `0x06C888 + 0x100·ln` | the whole dword, **per lane** | §8.2 rule `0x880 + ln·0x100` (`DW2` adds `0x8`); §8.5 step 5; `[I915]` `display/intel_ddi.c:1148-1157` |
+| `PORT_TX_DW4_LN0..3` | `0x162890 + 0x100·ln` / `0x06C890 + 0x100·ln` | the whole dword, **per lane** | §8.2 rule `0x880 + ln·0x100`; §8.5 steps 2 and 5; `[I915]` `display/intel_ddi.c:1159-1169` |
+| `PORT_TX_DW5_LN0` | `0x162894` / `0x06C894` | bit 31 `TX_TRAINING_EN`, and the word itself | §8.5 steps 4-6; `[I915]` `display/intel_combo_phy_regs.h:133`, `display/intel_ddi.c:1141`, `:1218`, `:1226` |
+| `PORT_TX_DW7_LN0..3` | `0x16289C + 0x100·ln` / `0x06C89C + 0x100·ln` | the whole dword, **per lane** | §8.2 rule (`DW7` adds `0x1c`); §8.5 step 5; `[I915]` `display/intel_ddi.c:1171-1178` |
 
 Two choices about *how* they are read matter:
 
-* **`PORT_TX_DW4` is read one lane at a time, never as a group.** §8.5 step 2 says the loadgen select
-  differs per lane and the paragraph after the sequence says group access must not be used for it;
-  i915's comment on the same write is *"We cannot write to GRP. It would overwrite individual
-  loadgen"* (`[I915]` `display/intel_ddi.c:1159-1160`). A group read would collapse four values into
-  one, and the replay would drive every lane from one lane's coefficients.
-* **`DW2`, `DW5` and `DW7` are read from the *group* instance.** That is the instance §8.5's sequence
-  writes and the only one this repository's register table declares for those dwords; `regs/port.rs`
-  records that §8.5 states the per-lane carve-out for `DW4` only. `[INF]` See §6 item 3 — i915 writes
-  `DW2` and `DW7` per lane, and whether a group read reflects a per-lane program is unverified.
-* **Every dword is read whole and replayed whole.** §8.5 enumerates the table's fields but not the
-  registers' other bits, and i915 writes fields the document never names — `RCOMP_SCALAR(0x98)` in
-  `DW2`, `RTERM_SELECT(0x6)` and `TAP3_DISABLE` in `DW5`, the loadgen bit in `DW4`
-  (`[I915]` `display/intel_ddi.c:1139-1168`, `:1205-1212`). A masked read would drop them; a whole
+* **`PORT_TX_DW2`, `PORT_TX_DW4` and `PORT_TX_DW7` are read one lane at a time, never as a
+  group.** For `DW4` §8.5 step 2 says the loadgen select differs per lane and the paragraph
+  after the sequence says group access must not be used for it; i915's comment on the same
+  write is *"We cannot write to GRP. It would overwrite individual loadgen"*
+  (`[I915]` `display/intel_ddi.c:1159-1160`). For `DW2` and `DW7` the document's per-lane
+  sentence names `DW4` only, so the evidence is i915's sequence, which writes both of them
+  per lane over `ln = 0..3` (`[I915]` `display/intel_ddi.c:1148-1157`, `:1171-1178`).
+  §8.2 defines three instances of each TX dword — AUX `+0x380`, group `+0x680`, lane
+  `0x880 + ln·0x100` (`[I915]` `display/intel_combo_phy_regs.h:96-105`) — and they are three
+  addresses, so a group read is not a read of what a per-lane write left.
+* **`PORT_TX_DW5` is read from lane 0.** That is the copy i915 reads before each of the two
+  writes it makes to the group instance: `ICL_PORT_TX_DW5_LN(0, phy)` for the read,
+  `ICL_PORT_TX_DW5_GRP(phy)` for the write (`[I915]` `display/intel_ddi.c:1218-1229`, and the
+  same pair inside the batch at `:1141-1146`). `output::program` writes the group instance for
+  the same two writes. The group instances of `DW2`/`DW7` stay declared in `regs/port.rs`
+  because §8.2's worked examples tabulate them; a DDI's swing does not land in them.
+* **Every dword is read whole and replayed whole.** §8.5 enumerates the table's fields but not
+  the registers' other bits, and i915 writes fields the document never names — `RCOMP_SCALAR(0x98)`
+  in `DW2`, `RTERM_SELECT(0x6)` and `TAP3_DISABLE` in `DW5`, the loadgen bit in `DW4`
+  (`[I915]` `display/intel_ddi.c:1141-1178`). A masked read would drop them; a whole
   read is the exact inverse of the whole write `output::program` performs.
 
 ## 4. The evidence required before the values are believed
@@ -107,8 +114,8 @@ still answers reads — with zero, with a reset value, or with values from an ea
 | `DDI_BUF_CTL.ENABLE` set | `PortNotEnabled` | §8.6 step 13 and §11 phase 5.7: the port's buffer is on. |
 | `DDI_BUF_CTL.IS_IDLE` clear | `PortStillIdle` | §11 phase 5.7 calls `IS_IDLE` the single best "is my DDI alive" bit on the chip; phase 6.3 makes it the read-back that proves the port is scanning. An idle port has no working configuration to copy. |
 | at least one lane powered (`PWR_DOWN_LN_MASK` ≠ `0xf`) | `LanesAllPoweredDown` | §8.6 step 7 powers the lanes *before* step 13 enables the buffer. A buffer that says "enabled, not idle" while every lane is down is not a state that sequence produces. |
-| not all three swing words all-zero or all-ones | `PhyNotResponding` | §12.2: an absent block answers all-zero or all-ones. |
-| `PORT_TX_DW5.TX_TRAINING_EN` set | `TrainingNotEnabled` | §8.5 step 6 and `[I915]` `display/intel_ddi.c:1226-1229`: setting that bit is the write that triggers the update. With it clear the batch was never committed — and it is the bit the derived state is built from. |
+| not every swing word all-zero or all-ones (both per-lane dwords, and lane 0 of `DW5`) | `PhyNotResponding` | §12.2: an absent block answers all-zero or all-ones. |
+| `PORT_TX_DW5_LN0.TX_TRAINING_EN` set | `TrainingNotEnabled` | §8.5 step 6 and `[I915]` `display/intel_ddi.c:1226-1229`: setting that bit is the write that triggers the update. With it clear the batch was never committed — and it is the bit the derived state is built from. |
 | the DDI is A or B | `UnsupportedDdi` | §8.1: C and D are Type-C/DKL ports; the register table declares no TX registers for them. Refused before the first read. |
 | every register readable | `Unreadable` | §2.2: a register that could not be read is not a register that read zero. |
 
@@ -156,11 +163,20 @@ still supply them literally.
    distinguish "level 0" from "nobody wrote it", and it should not pretend to. On Gen12 the field is
    an index the hardware may not consult, so a wrong value here costs a log line rather than a
    picture; a dump settles it.
-3. **Group vs per-lane `DW2`/`DW7`.** §8.5's sequence writes them to the group instance, i915 writes
-   them per lane (`[I915]` `display/intel_ddi.c:1148-1157`, `:1171-1179`). If the firmware is
-   i915-shaped, the group register may or may not mirror the per-lane values. The register table
-   declares only the group instance, so this module reads what it can address. A dump comparing the
-   group and lane instances decides whether per-lane registers have to be added to the table.
+3. **Group vs per-lane `DW2`/`DW7` — closed.** §8.5's step 5 names the two dwords without
+   naming one of the three instances §8.2 defines, and its per-lane carve-out is stated for
+   `DW4` only, which is why this module originally read the group instances. i915's DDI
+   voltage-swing sequence answers it: `DW2` and `DW7` are written per lane over `ln = 0..3`
+   (`[I915]` `display/intel_ddi.c:1148-1157`, `:1171-1178`) and `DW5` is read from lane 0
+   before the group instance is written (`:1141-1146`, `:1218-1229`). `regs/port.rs` now
+   declares `PORT_TX_DW2_LN0..3`, `PORT_TX_DW7_LN0..3` and `PORT_TX_DW5_LN0` beside the group
+   instances, `read_firmware_swing` reads the lane instances, and `output::program` writes
+   them. What remains open is not the shape but what *this machine's* firmware left: the dump
+   in §6 item 1 is still the first measurement, and it now compares four lane addresses per
+   dword instead of one group address. An `[INF]` corollary worth stating: i915's own step 6
+   reads lane 0 after its step-4 group write, so it relies on a group write being visible at
+   lane 0; the reverse — a per-lane write showing up in the group instance — is what the old
+   read assumed and is the assumption this change removes.
 4. **Whether the firmware's final `DW5` has `TX_TRAINING_EN` set.** §8.5 step 6 and i915 both leave
    it set; a firmware that clears it after the update would be refused (`TrainingNotEnabled`) even
    though its swing values are good. The refusal text says exactly what was read, so the log
@@ -199,19 +215,25 @@ numbers would be doing exactly what §8.5's `[GAP]` exists to prevent.
 
 ## 8. What the tests measure
 
-`[MEASURED]` 279 `drm::intel` host tests pass, 13 of them this module's, none failing. The 13
+`[MEASURED]` 283 `drm::intel` host tests pass, 15 of them this module's, none failing. The 15
 assert:
 
-* a register state shaped like a program reads back whole: `level`, `dw2`, the four lane values in
-  lane order, both `DW5` states, `dw7`, and a `source` string naming the DDI and the level;
+* a register state shaped like a program reads back whole: `level`, the per-lane `dw2`, the
+  per-lane `dw4`, both `DW5` states, the per-lane `dw7`, and a `source` string naming the DDI
+  and the level;
 * the level comes from `DDI_BUF_CTL.BUF_TRANS_SELECT` — changing that field moves `level` and
-  `source` and leaves the four swing words untouched;
+  `source` and leaves the swing words untouched;
 * `dw5_training_disabled` is the read value with bit 31 cleared and every other field preserved;
-* four different lane values come back from four different registers;
-* DDI A and DDI B read ten *different* addresses, and two different programs in one aperture come
-  back as two different `SwingProgram`s (the aliasing test: a shared mapping would set port B's swing
-  from port A's calibration);
-* an untouched aperture is refused as `PhyNotInitialised`, an initialised PHY with no enabled buffer
+* four different lane values come back from four different registers for each of `DW2`, `DW4` and
+  `DW7`, at the `0x100·ln` lane stride and nowhere near the group instance;
+* `DW5` comes from lane 0 and not from the group instance, in both directions: a mock whose two
+  instances differ returns lane 0's word, and a port whose group holds the training bit while lane
+  0 does not is refused;
+* DDI A and DDI B read sixteen *different* addresses, and two different programs in one aperture
+  come back as two different `SwingProgram`s (the aliasing test: a shared mapping would set port
+  B's swing from port A's calibration);
+* one degenerate lane is not an absent block — §12.2's answer is every instance — while an
+  untouched aperture is refused as `PhyNotInitialised`, an initialised PHY with no enabled buffer
   as `PortNotEnabled`, a still-idle port as `PortStillIdle`, all-lanes-down as
   `LanesAllPoweredDown`, a `DW5` without the training bit as `TrainingNotEnabled`, a dead block as
   `PhyNotResponding` (both all-zero and all-ones), a hidden register as `Unreadable`, and Type-C DDIs

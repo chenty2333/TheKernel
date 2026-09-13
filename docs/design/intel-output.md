@@ -120,11 +120,18 @@ than another module's registers, and calling it keeps the ordering in one place.
 `PORT_CL_DW5`'s `SUS_CLOCK_CONFIG` is set to `0b11` (§8.5 step 3) with a read-modify-write, because
 `CL_POWER_DOWN_ENABLE` is bit 4 of the same register and §8.3 step 7 set it during phase 1.
 
-The swing writes follow §8.5's steps 4 to 6: `PORT_TX_DW5` with TX training disabled, then
-`PORT_TX_DW2`, the four per-lane `PORT_TX_DW4` writes, `PORT_TX_DW7`, then `PORT_TX_DW5` with
-training enabled — that last write is what commits the settings. `PORT_TX_DW4` is written per lane
-and never as a group, which §8.5 step 2 demands in capitals and explains (each lane's loadgen select
-differs).
+The swing writes follow §8.5's steps 4 to 6 in the shape i915's
+`icl_ddi_combo_vswing_program` gives them: `PORT_TX_DW5`'s **group** instance with TX training
+disabled, then `PORT_TX_DW2`, `PORT_TX_DW4` and `PORT_TX_DW7` written once per lane in lane
+order, then the group `PORT_TX_DW5` with training enabled — that last write is what commits the
+settings. §8.5 step 2 demands the per-lane form for `PORT_TX_DW4` in capitals and explains it
+(each lane's loadgen select differs), and i915 writes all three dwords that way, one
+read-modify-write per lane over `ln = 0..3` (`[I915]` `display/intel_ddi.c:1148-1178`). The
+group instances of `DW2` and `DW7` are different addresses from the lane instances
+(`[I915]` `display/intel_combo_phy_regs.h:96-105`) and are not written. `DW5` is the exception
+in both directions: it is read from lane 0 and written to the group
+(`[I915]` `display/intel_ddi.c:1141-1146`, `:1218-1229`), which is the shape `swing.rs`'s read
+and this write share.
 
 Then `PORT_CL_DW10`'s `PWR_DOWN_LN_MASK` powers the lanes: `0x0` for four lanes, `0xC` for two,
 `0xE` for one (§8.6 step 7).
@@ -240,20 +247,26 @@ what was done instead, and what would close it.
 
 ## 6. What the tests measure
 
-`[MEASURED]` 197 `drm::intel` host tests pass, 29 of them this module's, none failing. `cargo
+`[MEASURED]` 283 `drm::intel` host tests pass, 31 of them this module's, none failing. `cargo
 clippy` for the host test target and for the product kernel configuration (`tools/thekernel.py
 lint`, `x86_64-unknown-none`, release) reports nothing in `output.rs` or `output/tests.rs`. The
 product kernel builds.
 
-The 29 tests assert, among other things:
+The 31 tests assert, among other things:
 
-* the write order, on `writes()` rather than on the return value: twenty-one writes in the order §8.6
-  gives, with the DDI-IO well between the clock mapping and the swing values;
+* the write order, on `writes()` rather than on the return value: twenty-nine writes in the order
+  §8.6 gives, with the DDI-IO well between the clock mapping and the swing values;
 * the PLL is powered before it is enabled and the dividers land in between;
 * `ICL_DPCLKA_CFGCR0` is written exactly twice, with the gate bit set in the first write and cleared
   in the second;
-* the four per-lane `PORT_TX_DW4` writes carry the four supplied values in lane order, and the two
-  `PORT_TX_DW5` writes straddle them;
+* the per-lane `PORT_TX_DW2`, `PORT_TX_DW4` and `PORT_TX_DW7` writes carry the four supplied values
+  each, in lane order, and the two group `PORT_TX_DW5` writes straddle them;
+* one lane's write is not another lane's: after the sequence each lane address holds its own value,
+  the lane addresses are at the `0x100·ln` stride, and the group instances of `DW2` and `DW7` are
+  never written;
+* the two group `PORT_TX_DW5` writes carry the word the read route took from lane 0, not the group
+  instance's own word, with `swing::read_firmware_swing` → `plan` → `program` run end to end on one
+  mock whose two `DW5` instances differ;
 * the lane-power field is shifted into `[7:4]` and an unrelated bit in `PORT_CL_DW10` survives;
 * `SUS_CLOCK_CONFIG` does not clobber `CL_POWER_DOWN_ENABLE`;
 * the polarity bits follow the mode in both directions and change nothing else;
@@ -327,8 +340,17 @@ the failure is the finding.
 * **The `[INF]` choices** (writing `PHY_LINK_RATE` as 0; the scrambling threshold at 340 MHz rather
   than §8.4's `[INF]` "approximately 300 MHz") are labelled inferences with the dump that would
   settle them named in §8.
-* **The order of the swing writes within §8.5 step 5** is this module's reading of the step's list;
-  §8.5 gives the batch and its commit write, not a required interleaving of `DW2`, `DW4` and `DW7`.
+* **The order of the swing writes within §8.5 step 5** follows i915's
+  `icl_ddi_combo_vswing_program` — group `DW5`, then `DW2`, `DW4` and `DW7` per lane
+  (`[I915]` `display/intel_ddi.c:1141-1178`) — rather than §8.5's own list, which gives the
+  batch and its commit write and no required interleaving of the three dwords.
+* **`DW5`'s named fields are replayed, not set.** i915 clears and sets `SCALING_MODE_SEL`,
+  `RTERM_SELECT`, `TAP2_DISABLE` and `TAP3_DISABLE` on the group instance after reading lane 0
+  (`[I915]` `display/intel_ddi.c:1141-1146`). This module writes the two `DW5` states it is
+  given and derives nothing from an unstated bit position, so on the read route those fields
+  hold what the firmware's lane-0 word held, with only `TX_TRAINING_EN` toggled. A firmware
+  whose values differ from i915's is replayed rather than corrected — that is the read route's
+  premise, argued in `docs/design/intel-swing.md` §4.
 * **The end-to-end product build was not completed.** `tools/thekernel.py lint` compiles and lints
   the kernel for `x86_64-unknown-none` in release with the product features, and that succeeds with
   nothing reported in these files; `tools/thekernel.py build` stops earlier than the kernel, in
@@ -362,12 +384,13 @@ the failure is the finding.
 
 The firmware on the target machine drives the same HDMI output before this kernel does, so the
 translation values that matter for *this* board are already in the PHY when the kernel starts. They
-can be read at boot — the two candidate sets are the PHY's `PORT_TX_DW2`/`DW4`/`DW5`/`DW7`
-(`0x162688`, `0x162890 + 0x100*ln`, `0x162694`, `0x16269c`, and `0x06c...` for PHY B) and the
-indexed `DDI_BUF_TRANS_LO`/`HI` pair (`0x64E00 + i*8` and `+4`, `0x64E60` for port B; the table
-declares entries 0 to 9) — and fed into `SwingProgram` with a `source` string that says where they
-came from. Reading both sets and logging the raw words answers §5 item 4 at the same time: whichever
-set holds plausible per-lane variation is the one the port uses.
+can be read at boot — the two candidate sets are the PHY's per-lane `PORT_TX_DW2`/`DW4`/`DW7`
+(`0x162888 + 0x100*ln`, `0x162890 + 0x100*ln`, `0x16289c + 0x100*ln`) together with `PORT_TX_DW5`
+lane 0 (`0x162894`), all of them minus `0xf6000` for PHY B, and the indexed `DDI_BUF_TRANS_LO`/`HI`
+pair (`0x64E00 + i*8` and `+4`, `0x64E60` for port B; the table declares entries 0 to 9) — and fed
+into `SwingProgram` with a `source` string that says where they came from. Reading both sets and
+logging the raw words answers §5 item 4 at the same time: whichever set holds plausible per-lane
+variation is the one the port uses.
 
 That is a route for whoever wires this into the boot sequence, not something this module does. It
 reads no register the sequence does not own and writes nothing it did not compute; what it must not
