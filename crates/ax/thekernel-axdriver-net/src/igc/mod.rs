@@ -24,14 +24,18 @@
 //!
 //! 1. **Identify, do not program.**  Match the device ids, read configuration
 //!    space, map BAR0, read the registers that identify the part, and print one
-//!    verdict.  This phase exists in the tree today.  It writes nothing: the
-//!    register table declares no writable register at all, and there is a test
-//!    that fails if one appears before the phase that needs it does.
+//!    verdict.  It writes nothing, and the report says so.
+//! 2. **The register map.**  The named-register table in [`regs`]: every
+//!    register the reset, link-up and descriptor-ring phases need, each with
+//!    the vendor symbol and line its offset and access came from, a typed
+//!    accessor where the field encoding is non-trivial, and an access rule the
+//!    window enforces -- including the two registers whose *read* has a side
+//!    effect, which the identify-only phase's register list therefore excludes.
 //!
-//! The phases that follow -- the register map, reset and link-up, descriptor
-//! rings -- each arrive as their own change, and the table grows with them.
-//! Nothing below claims to be finished, and the module documentation of each
-//! later phase states what it does *not* establish.
+//! The phases that follow -- reset and link-up, then descriptor rings -- each
+//! arrive as their own change, and the driver grows into the table the second
+//! phase declares.  Nothing below claims to be finished, and the module
+//! documentation of each later phase states what it does *not* establish.
 //!
 //! # What cannot be verified here
 //!
@@ -179,10 +183,13 @@ mod tests {
         scratch.words[0x00008 / 4] = 0x0000_0083;
         assert_eq!(bus.read(named("IGC_STATUS").unwrap()), Some(0x0000_0083));
         // Read-only in the table, so the write is refused and nothing changes.
-        assert!(!bus.write(named("IGC_CTRL").unwrap(), 0xffff_ffff));
-        assert_eq!(bus.read(named("IGC_CTRL").unwrap()), Some(0));
+        assert!(!bus.write(named("IGC_STATUS").unwrap(), 0xffff_ffff));
+        assert_eq!(bus.read(named("IGC_STATUS").unwrap()), Some(0x0000_0083));
+        // Writable in the table, so the write lands.
+        assert!(bus.write(named("IGC_CTRL").unwrap(), 0x0400_0040));
+        assert_eq!(bus.read(named("IGC_CTRL").unwrap()), Some(0x0400_0040));
         // A register the table does not name cannot be reached at all.
-        assert!(named("IGC_IMC").is_none());
+        assert!(named("IGC_RETA(0)").is_none());
     }
 
     #[test]

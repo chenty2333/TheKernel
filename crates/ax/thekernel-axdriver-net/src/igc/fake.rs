@@ -188,15 +188,27 @@ mod tests {
 
         let undecoded = FakeBus::undecoded();
         assert_eq!(undecoded.peek("IGC_STATUS"), 0xffff_ffff);
+
+        // `poke` changes the register file behind the driver's back, which is
+        // how a test models the device changing state on its own -- a reset
+        // completing, or a link coming up between two polls.
+        let mut bus = FakeBus::new();
+        bus.poke("IGC_STATUS", 0x0000_0002);
+        assert_eq!(bus.peek("IGC_STATUS"), 0x0000_0002);
+        assert!(bus.writes().is_empty(), "a poke is not a driver write");
     }
 
     #[test]
     fn a_write_to_a_read_only_register_is_recorded_as_refused() {
         let mut bus = FakeBus::new();
-        assert!(!bus.write(regs::named("IGC_CTRL").unwrap(), 7));
-        assert_eq!(bus.writes(), &[(0x00000, 7, false)]);
+        assert!(!bus.write(regs::named("IGC_STATUS").unwrap(), 7));
+        assert_eq!(bus.writes(), &[(0x00008, 7, false)]);
         assert!(bus.accepted_writes().is_empty());
-        assert_eq!(bus.peek("IGC_CTRL"), 0);
+        assert_eq!(bus.peek("IGC_STATUS"), 0);
+        // A writable register is accepted and recorded as accepted, so a test
+        // can tell the two apart.
+        assert!(bus.write(regs::named("IGC_CTRL").unwrap(), 7));
+        assert_eq!(bus.accepted_writes(), alloc::vec![(0x00000, 7)]);
     }
 
     #[test]

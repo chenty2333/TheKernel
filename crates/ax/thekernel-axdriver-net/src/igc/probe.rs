@@ -37,8 +37,8 @@ use super::{
     IgcBus,
     ids::{self, DeviceId},
     regs::{
-        self, Meaning, NAMED, NAMED_SPAN, NvmControl, ReceiveAddressHigh, Register, WINDOW_BYTES,
-        assemble_receive_address,
+        self, IDENTIFY, Meaning, NAMED, NAMED_SPAN, NvmControl, ReceiveAddressHigh, Register,
+        WINDOW_BYTES, assemble_receive_address,
     },
 };
 
@@ -497,8 +497,8 @@ pub fn is_valid_unicast(address: [u8; 6]) -> bool {
 /// This is the whole of the identify-only phase.  It reads; it never writes,
 /// and a test asserts that the bus saw no write at all.
 pub fn run<B: IgcBus>(facts: ConfigFacts, device: &'static DeviceId, bus: &mut B) -> ProbeReport {
-    let mut readings = Vec::with_capacity(NAMED.len());
-    for register in NAMED {
+    let mut readings = Vec::with_capacity(IDENTIFY.len());
+    for register in IDENTIFY {
         readings.push(Reading {
             register: *register,
             value: bus.read(*register),
@@ -769,7 +769,7 @@ mod tests {
         let mut bus = healthy_bus();
         let report = run(facts(), device(), &mut bus);
         assert_eq!(report.verdict, Verdict::Identified, "{:#?}", report.checks);
-        assert_eq!(report.readings.len(), NAMED.len());
+        assert_eq!(report.readings.len(), IDENTIFY.len());
         assert!(
             report.readings.iter().all(|reading| reading.value.is_some()),
             "every named register was read"
