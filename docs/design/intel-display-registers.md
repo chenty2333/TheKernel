@@ -86,6 +86,13 @@ document is written so that those reads are the *next* action, not an afterthoug
 | Item | Value | Source |
 |---|---|---|
 | PCI device | `8086:46d0`, iGPU (one function — see §3) | `[I915]` `include/drm/intel/pciids.h`, `INTEL_ADLN_IDS` |
+
+> **`46d0` is not 1:1 with the i3-N305.** `INTEL_ADLN_IDS` is `0x46D0`–`0x46D4`; `[I915]` bug
+> #10932 has a real **N200** reporting `46d0`. Use the device ID to identify the *platform*, and read
+> `SKL_DFSM`/`DSSM` to identify the *configuration*. Do not hard-code i3-N305 behaviour on `46d0`.
+>
+> Also: there is **no GT2-class Alder Lake-N**. `[I915]` `gt/intel_sseu.c` states that TGL, RKL, DG1
+> and ADL all have a single slice.
 | MMIO BAR | **BAR 0** (`GTTMMADR`) | `[I915]` `intel_pci_config.h:19,25-32` |
 | MMIO BAR size | **16 MiB** on Gen8+ | `[I915]` `gt/intel_ggtt.c:1134-1142` |
 | Register window inside BAR 0 | **first 8 MiB** (offset `0x000000`–`0x7FFFFF`) | `[I915]` `gt/intel_ggtt.c:1144-1147` (`gttadr_offset = gttmmadr_size/2`) |
@@ -135,9 +142,13 @@ NEEDS_FORCE_WAKE(reg) = (reg < 0x40000 || reg >= 0x116000)
 ```
 
 Any MMIO access outside that predicate is issued directly, with no forcewake request/ack. The
-display blocks listed in §1.2 — pipes, transcoders, planes, power wells, CDCLK, DDI, combo PHY,
-south display at `0xC0000`+ — **all** lie in `0x40000`–`0x115FFF`, so a first bring-up can ignore
-forcewake entirely.
+display blocks listed in §1.2 — pipes, transcoders, planes, power wells, CDCLK, DDI and the
+south display at `0xC0000`+ — all lie in `0x40000`–`0x115FFF`, so a first bring-up can ignore
+forcewake for them.
+
+**Two display-adjacent blocks do NOT:** the **combo PHY** registers (combo PHY A is `0x162000`)
+and the **DPLL configuration** registers (`0x164xxx`). Both are above `0x116000`. Only the DPLL
+*enable* registers at `0x46010`/`0x46014` are inside the fast path.
 
 Caveats, so this does not become a trap:
 
@@ -222,11 +233,16 @@ and use the low 2 MiB for registers. Do not map BAR 2 unless you intend CPU acce
 The display engine occupies the **low** part of the register window. There is no single boundary
 register; the practical boundaries on Gen12 are:
 
-- `0x00000`–`0x3FFFF` — legacy/VGA and some GT registers (forcewake-gated).
-- `0x40000`–`0x7FFFF` — display: pipes, transcoders, planes, power wells, CDCLK, DDI, interrupts.
+- `0x00000`–`0x3FFFF` — legacy/VGA, fuses, and GT (forcewake-gated).
+- **`0x40000`–`0x1BFFFF` — the display / "non-GT" region.** This is the range the Gen12 forcewake
+  table marks with domain `0`, i.e. no forcewake required. `[I915]` `intel_uncore.c`,
+  `__gen12_fw_ranges[]` (`GEN_FW_RANGE(0x40000, 0x1bffff, 0)`).
+- `0x80000`–`0x8FFFF` — the **DMC's own MMIO window**. `[I915]` `display/intel_dmc_regs.h`
+  (`DMC_MMIO_START_RANGE`/`END_RANGE`). This is *inside* the display region; it is **not** a
+  display/GT boundary, which is a common misreading.
 - `0xC0000`–`0xCFFFF` — "south display": GMBUS, hotplug, panel power, backlight.
-- `0x16xxxx` — combo PHY and DPLL registers.
-- `0x1xxxxx`+ — GT / media.
+- `0x162xxx`–`0x16Fxxx` — combo PHY, DPLL configuration, `DPCLKA`.
+- `0x1C0000`+ — high media engines (VDBOX/VEBOX).
 
 `[I915]` `i915_reg.h:2905` defines `PCH_DISPLAY_BASE = 0xc0000u`, and
 `display/intel_gmbus.c:871-879` sets the GMBUS base to it for every platform that is not Valleyview
@@ -236,6 +252,11 @@ and not GMCH — which includes ADL-N. So the "south display" window on a PCH-le
 `[I915]` `i915_reg.h:2470-2476` shows the top-level display interrupt tree, which is the cleanest
 "is this display?" test: `DEISR` at `0x44000` carries `GEN8_DE_MISC_IRQ`, `GEN8_DE_PORT_IRQ` and
 `GEN8_DE_PIPE_{A,B,C}_IRQ`.
+
+**A note on the two apertures.** Do not confuse the *register region* boundary above with the *BAR*
+boundary in §3.2. BAR 0 is 16 MiB and is split at **8 MiB** into registers (low) and the GGTT array
+(high); that 8 MiB split is a BAR-layout fact. The `0x40000` figure is a register-address fact about
+which block a given offset belongs to. They are unrelated numbers that happen to look similar.
 
 ### 3.4 How to tell the display is present at all
 
@@ -290,6 +311,32 @@ simplification and it is the single biggest scope reduction available.
 You **cannot** skip it if the target is the internal eDP panel, because panel power sequencing
 delays and backlight PWM frequency live there. `[I915]` `display/intel_pps.c` and
 `display/intel_panel.c`. Plan the first bring-up on HDMI.
+
+**Important structural fact if you do need it.** `[I915]` derives port presence from the VBT, not
+from a fuse: `port_strap_detected()` begins `/* straps not used on skl+ */ if (DISPLAY_VER >= 9)
+return true;`, and `intel_setup_outputs()` enumerates encoders by iterating the VBT's child devices
+(`intel_bios_for_each_encoder` → `intel_bios_is_port_present`). So on ADL-N **the VBT is the only
+authority on which ports and panel exist**, and reading a fuse instead will not work. If i915 finds
+no VBT it does not fail cleanly — it hits a `WARN_ON` in `intel_bios_is_port_present()` and returns
+a degenerate answer.
+
+Where the VBT lives, for reference:
+- OpRegion is located via PCI config **`ASLS = 0xFC`**, is **8 KiB**, and begins with the 16-byte
+  signature `"IntelGraphicsMem"`. Layout: header `0x000`, mailbox #1 `0x100`, #2 `0x200`,
+  #3 (ASLE) `0x300`, **#4 (VBT) `0x400`**, #5 `0x1C00`. `[I915]` `intel_pci_config.h`,
+  `display/intel_opregion.c`.
+- Mailbox #4 is a fixed **6 KiB** VBT buffer. The ASLE mailbox also carries `RVDA`/`RVDS` (raw VBT
+  address and size) as an alternative source.
+- OpRegion header has a `pcon` field whose **`PCON_HEADLESS_SKU` bit (bit 13)** lets firmware declare
+  the SKU headless; i915 honours it (requires OpRegion version ≥ 2.3) and disables display entirely.
+  `[I915]` `intel_opregion_headless_sku()`, `intel_display_device_enabled()`. **Check this bit
+  before concluding the hardware is broken.**
+- coreboot builds **OpRegion version 2.1** for Alder Lake
+  (`src/soc/intel/alderlake/Kconfig` selects `INTEL_GMA_OPREGION_2_1`).
+
+`[GAP]` There is **no public VBT format specification** and no Gen12-era OpRegion specification
+(the public OpRegion spec is Skylake Rev 0.5, 2016). For the VBT, the practical references are
+`[I915]`'s `display/intel_vbt_defs.h` and the `intel_vbt_decode` tool.
 
 `[GAP]` Whether the i3-N305 machine in front of you has an eDP panel at all is unknown to me and
 unknowable from documents. §13 gives the probe.
@@ -433,10 +480,14 @@ enable(well):
 Notes that matter:
 
 - `ICL_PW_CTL_IDX_TO_PG(idx) = idx - ICL_PW_CTL_IDX_PW_1 + SKL_PG1`, i.e. `PW_1 → PG1`,
-  `PW_2 → PG2`, `PW_A..PW_D` have **no** fuses (`has_fuses` is only set on `PW_1` and `PW_2` in
-  `xelpd_power_wells_main`; `PW_A`…`PW_D` do set `has_fuses = true` in the source — read
-  `intel_display_power_map.c:1326-1360` carefully, `PW_A`…`PW_D` **do** carry `.has_fuses = true`).
-  `[I915]` `intel_display_power_map.c:1322-1360`.
+  `PW_2 → PG2`. **All of `PW_A`…`PW_D` carry `.has_fuses = true` as well**
+  (`[I915]` `intel_display_power_map.c:1329,1337,1345,1353`), so each one has a fuse poll after its
+  state bit. Because `ICL_PW_CTL_IDX_TO_PG(idx) = idx - 0 + SKL_PG1`, that poll is for
+  `SKL_FUSE_PG_DIST_STATUS(pg)` with `pg = idx + 1` — i.e. **PG6…PG9 for indices 5…8**, which are
+  bits `27 - 6 = 21` down to `27 - 9 = 18` of `SKL_FUSE_STATUS`. Note those `PG6+` bit positions are
+  **outside** the PG0…PG5 range that `[TGL12]` documents, which is further evidence that the
+  `XE_LPD` well map is not the TGL map. `[INF]` on the PG6…PG9 naming; the arithmetic follows from
+  `[I915]` `i915_reg.h:3735-3738` and `display/intel_display_power_well.c:371-378`.
 - The fuse register is `SKL_FUSE_STATUS = 0x42000`. `SKL_FUSE_PG_DIST_STATUS(pg) = 1 << (27 - pg)`
   with `SKL_PG0=0, SKL_PG1=1, SKL_PG2=2`. `[I915]` `i915_reg.h:3724-3745`.
 - `[PRM]` "Initialize Sequence" step 3 gives the timeouts: **20 µs** for the PG0 fuse, **30 µs**
@@ -714,7 +765,7 @@ return divider + fraction                 /* kHz: 24000 or 19200 */
 
 So concretely:
 - 24 MHz → `PCH_RAWCLK_FREQ = 24 << 16 = 0x00180000`
-- 19.2 MHz → `(19 << 16) | (4 << 26) | (1 << 11) = 0x10040000 | 0x800 = 0x10040800`
+- 19.2 MHz → `(19 << 16) | (4 << 26) | (1 << 11) = 0x00130000 | 0x10000000 | 0x800 = 0x10130800`
 
 **This is again a source disagreement.** `[PRM]` (DG1) says *"Raw clock frequency is expected to be
 38.4 MHz. The RAWCLK_FREQ register … defaults to 38.4 MHz"* and DG1's `dg1_rawclk` programs
@@ -811,7 +862,7 @@ Key topology rules, all from `[PRM]` "DG1 Display Overview":
 
 | Register | Pipe A | Field summary |
 |---|---|---|
-| `TRANSCONF` (a.k.a. `PIPECONF`; **i915 renamed it**) | `0x70008` | `ENABLE[31]`, `STATE_ENABLE[30]`, `INTERLACE[23:21]`, `BPC`, `DITHER` |
+| `TRANSCONF` (a.k.a. `PIPECONF`; **i915 renamed it**) | `0x70008` | `ENABLE[31]`, `STATE_ENABLE[30]`, `INTERLACE[23:21]` |
 | `PIPESRC` | `0x6001c` | `WIDTH[31:16]`, `HEIGHT[15:0]` — pipe source size, **minus 1** |
 | `PIPEDSL` | `0x70000` | `LINE[19:0]` — current scanline; read this to prove the pipe is running |
 | `PIPESTAT` | `0x70024` | `PIPE_FIFO_UNDERRUN_STATUS[31]`, vblank status/enable |
@@ -1025,8 +1076,16 @@ lies within tolerance of the chosen central frequency. Then:
 
 ```
 dco_integer  = DCO_div_Hz / (ref_kHz * 1000)
-dco_fraction = ((DCO_div_Hz / (ref_kHz)) - dco_integer * 1e6) * 0x8000 / 1e6
+dco_fraction = ((DCO_div_Hz / ref_MHz) - dco_integer * 1e6) * 0x8000 / 1e6
 ```
+
+**Correction to an earlier draft.** The search description above was garbled there. `[I915]`'s
+`skl_ddi_calculate_wrpll` first enumerates candidate **total** dividers
+`p = DCO / afe_clock` from a hard-coded even list `{4,6,8,…,98}` and odd list `{3,5,7,9,15,21,35}`,
+and only then decomposes each `p` into `(p0, p1, p2)` via `skl_wrpll_get_multipliers()`, which
+yields `p0 ∈ {2,3,7}` with `p2 ∈ {5,2,3,1}` on this path — **`p0 = 1` never occurs.**
+`[I915]` `display/intel_dpll_mgr.c:1537-1575,1662-1668,1727-1731`. The formula above is correct; the
+"`p0 ∈ {1,2,3,7}`" candidate set was not.
 
 Field encodings. **These are the TGL/Gen12 positions, which are NOT the Skylake positions.**
 `[TGL2C]` (DPLL0–3 `CFGCR0`/`CFGCR1`) and `[I915]` `i915_reg.h:4265-4298` (`_ICL_DPLL0_CFGCR1`
@@ -1036,7 +1095,7 @@ block, used for `DISPLAY_VER >= 12`) **agree exactly**:
 |---|---|---|---|
 | `DPLLn_CFGCR0` (`0x164284` for DPLL0) | `DCO_FRACTION` | `[24:10]` | reset default `0x4000` |
 | | `DCO_INTEGER` | `[9:0]` | reset default `0x151` |
-| | `LINK_RATE` override | `[27:25]` | HDMI link-rate override; leave 0 |
+| | `LINK_RATE` override | mask `[28:25]`, defined values in `[27:25]` | HDMI link-rate override; leave 0 |
 | `DPLLn_CFGCR1` (`0x164288` for DPLL0) | `QDIV_RATIO` | `[17:10]` | |
 | | `QDIV_MODE` | `[9]` | 0 if `qdiv_ratio == 1`, else 1 |
 | | `KDIV` | `[8:6]` | `K=1→1`, `K=2→2`, `K=3→4` |
@@ -1433,14 +1492,35 @@ wrong. **Initialise all combo PHYs present, PHY A first.**
 |---|---|---|
 | `TRANS_DDI_FUNC_ENABLE` | 31 | |
 | `TGL_TRANS_DDI_PORT_MASK` | `[30:27]` | `TGL_TRANS_DDI_SELECT_PORT(p) = (p+1) << 27` |
-| `TRANS_DDI_MODE_SELECT_MASK` | `[26:24]` | HDMI=0, DVI=1, DP_SST=4, DP_MST=5 |
-| `TRANS_DDI_BPC` | `[22:20]` | 6/8/10/12 bpc |
-| `TRANS_DDI_PVSYNC` / `PHSYNC` | 19 / 18 | from the mode's polarity flags |
-| `DDI_PORT_WIDTH` | `[3:1]` | `(lanes - 1) << 1` |
-| `TRANS_DDI_HDMI_SCRAMBLING` | 12 | needed for HDMI ≥ 340 MHz |
-| `TRANS_DDI_HIGH_TMDS_CHAR_RATE` | 11 | needed for TMDS ≥ 340 MHz |
+| `TRANS_DDI_MODE_SELECT_MASK` | `[26:24]` | **HDMI = 0, DVI = 1, DP_SST = 2, DP_MST = 3**, FDI/128b132b = 4 |
+| `TRANS_DDI_BPC_MASK` | `[22:20]` | 8 bpc = 0, 10 bpc = 1, 6 bpc = 2, 12 bpc = 3 |
+| `TRANS_DDI_PVSYNC` / `PHSYNC` | **17 / 16** | from the mode's polarity flags |
+| `TRANS_DDI_PORT_SYNC_MASTER_SELECT` | `[19:18]` | port-sync only |
+| `TRANS_DDI_PORT_WIDTH_MASK` | `[3:1]` | `(lanes - 1) << 1` |
+| `TRANS_DDI_HIGH_TMDS_CHAR_RATE` | **4** | needed for TMDS ≥ 340 MHz |
+| `TRANS_DDI_HDMI_SCRAMBLING` | **0** | needed for HDMI ≥ 340 MHz |
 
-`[I915]` `i915_reg.h:3740-3800`, `intel_ddi.c:471-580`.
+`[I915]` `i915_reg.h:3748-3800`, `intel_ddi.c:471-580`.
+
+> **Correction to an earlier draft.** Four rows of this table were wrong there: the mode-select
+> values (`DP_SST`/`DP_MST` are 2/3, not 4/5), the polarity bits (17/16, not 19/18 — bits 19:18 are
+> the port-sync master select), and both HDMI high-rate bits (4 and 0, not 11 and 12). Confirmed at
+> `[I915]` `i915_reg.h:3758-3800`.
+
+**Where the output bit depth actually goes.** `TRANS_DDI_FUNC_CTL` does carry a BPC field, but on
+Gen12 the *pipe-side* output depth and dithering live in **`PIPE_MISC`** (`0x70030`), not in
+`TRANSCONF`:
+
+| Field | Bits | Notes |
+|---|---|---|
+| `PIPE_MISC_BPC_MASK` | `[7:5]` | 8 bpc = 0, 10 bpc = 1, 6 bpc = 2, 12 bpc = 4 (**ADL-P+ only**) |
+| `PIPE_MISC_DITHER_ENABLE` | 4 | |
+| `PIPE_MISC_DITHER_TYPE` | `[3:2]` | spatial / ST1 / ST2 / temporal |
+
+`[I915]` `i915_reg.h:1708-1740`, including the source comment confirming that for `ADLP+` bits
+`[7:5]` are *port output BPC* rather than the pre-Gen13 *dither* BPC. **An earlier draft attributed
+these to `TRANSCONF`; that was wrong** — `TRANSCONF`'s BPC/DITHER fields there are a pre-Haswell
+leftover and are not what Gen12 uses.
 
 `[INF]` **HDMI ≥ 300 MHz TMDS (approximately 4K30 or 1080p with high pixel clock) requires
 scrambling and the high TMDS character rate.** For a first 1080p60 (148.5 MHz) mode, neither is
@@ -1801,18 +1881,41 @@ Semantics (standard Intel): **ISR** = live status, read-only. **IMR** = mask; **
 (disabled)**. **IIR** = write-1-to-clear; reading gives the currently pending *unmasked* interrupts.
 **IER** = enable; **set = enabled**.
 
-### 10.3 Top-level routing in `DEISR`/`DEIER`
+### 10.3 The global display interrupt enable is a *separate* register
 
-| Bit | Name |
-|---|---|
-| 31 | `DE_MASTER_IRQ_CONTROL` — **the global display interrupt enable** |
-| 22 | `GEN8_DE_MISC_IRQ` |
-| 20 | `GEN8_DE_PORT_IRQ` |
-| 19 | `GEN8_DE_PIPE_D_IRQ` — from the source macro `GEN8_DE_PIPE_IRQ(pipe) = 1 << (16 + pipe)` with `PIPE_D = 3` |
-| 18/17/16 | `GEN8_DE_PIPE_{C,B,A}_IRQ` |
+**This is the single highest-impact trap in this section.** On Gen11/Gen12 the ultimate display
+interrupt gate is **`DISPLAY_INT_CTL` at `0x44200`, bit 31 (`DISPLAY_IRQ_ENABLE`)** — *not* bit 31
+of `DEISR`/`DEIER`.
 
-`[I915]` `i915_reg.h:2461-2476`. `DE_MASTER_IRQ_CONTROL` must be set or nothing below it is
-delivered (`[INF]` from the bit name and its position in the top-level `DEIER`).
+`[I915]` `i915_reg.h:2612-2613`:
+
+```
+GEN11_DISPLAY_INT_CTL   = 0x44200
+GEN11_DISPLAY_IRQ_ENABLE = 1 << 31
+```
+
+and `display/intel_display_irq.c:1253-1263` writes exactly that register (and nothing else) in
+`gen11_de_irq_postinstall`. Cached RKL Volume 2 states it in prose: *"DISPLAY_INT_CTL, Address
+44200h … bit 31 Display Interrupt Enable … This is the ultimate control for display interrupts. This
+must be enabled for any of these interrupts to propagate."* **i915 never writes `DEIER` on Gen12.**
+
+`[INF]` The name `DE_MASTER_IRQ_CONTROL` still exists in `[I915]` `i915_reg.h:2403` at bit 31 of the
+legacy `DEISR` block, which is why it is easy to reach for — but it is not the Gen12 gate. An
+earlier draft of this document made exactly that mistake.
+
+Routing, corrected:
+
+```
+DISPLAY_INT_CTL (0x44200) bit 31 = DISPLAY_IRQ_ENABLE   <-- enable this first
+        |
+DEISR / DEIER (0x44000 / 0x4400C)  -- top-level, per-block routing
+        |
+        +-- GEN8_DE_MISC_IRQ  = 1<<22 --> GEN8_DE_MISC_IIR  (0x44468)
+        +-- GEN8_DE_PORT_IRQ  = 1<<20 --> GEN8_DE_PORT_IIR  (0x44448)
+        +-- GEN8_DE_PIPE_x_IRQ = 1<<(16+pipe) --> GEN8_DE_PIPE_IIR(pipe) (0x44408+pipe*0x10)
+        |
+SDEISR / SDEIER (0xC4000 / 0xC400C) -- south display (hotplug, GMBUS)
+```
 
 ### 10.4 Per-pipe interrupts
 
@@ -2049,12 +2152,28 @@ then, **in a separate write**, clear `DDI_CLK_OFF(phy)`.
 **5.5 `TRANS_DDI_FUNC_CTL(A) = ENABLE | SELECT_PORT(A) | MODE_SELECT_HDMI | BPC_8 | PHSYNC? | PVSYNC?`**
 — note `SELECT_PORT(A)` in Gen12 encoding is `(0+1) << 27 = 0x08000000`.
 
-**5.6 `TRANSCONF(A) = ENABLE | STATE_ENABLE | progressive | 8bpc`** = `(1<<31) | (1<<30)`.
+**5.6 `TRANSCONF(A) = ENABLE | STATE_ENABLE | progressive`** = `(1<<31) | (1<<30)`.
+Output bit depth is **not** set here on Gen12 — put `PIPE_MISC_BPC_8` (`PIPE_MISC[7:5] = 0`) and
+`PIPE_MISC_DITHER_ENABLE` (`PIPE_MISC[4]`) in `PIPE_MISC(A)` (`0x70030`) if you want dithering.
 
 **5.7 `DDI_BUF_CTL(A) = ENABLE | BUF_TRANS_SELECT(level) | PHY_LINK_RATE(rate) | PORT_WIDTH(lanes-1)`**
 then poll `IS_IDLE == 0`.
-*Looks like it did nothing:* `IS_IDLE` stays 1. That means the DDI has no clock — check 52 and 5.1,
+*Looks like it did nothing:* `IS_IDLE` stays 1. That means the DDI has no clock — check 5.2 and 5.1,
 in that order. `IS_IDLE` is the single best "is my DDI alive" bit on the chip.
+
+> **A known real-hardware failure at exactly this step.** `[I915]` bug #10932 reports an
+> **N200 / `46d0`** machine failing with *"Timeout waiting for DDI BUF **D** to get active"* under
+> coreboot + EDK2. It is the closest thing to a field report for this exact bring-up. If you hit a
+> DDI-buffer idle poll that never clears, check the port/`aux_ch` mapping and which DDI is actually
+> wired before suspecting your PLL — a wrong DDI is a far more common cause than a wrong divider.
+> Related reports on neighbouring parts: #15690 (N100, Type-C PHY warning plus display loss on HDMI
+> hotplug), #15924 (N150, DP link training after USB-C hotplug).
+>
+> Note also that **no ADL-N-specific display workaround exists in mainline i915.** `IS_ALDERLAKE_N`
+> was proposed and rejected in review; the macro is `IS_ALDERLAKE_P_N()`, and every mainline commit
+> mentioning ADL-N is enablement, PCI-ID, PCH, stepping or GuC plumbing. The one mechanism that
+> genuinely changes ADL-N display behaviour is that its **display** stepping is `STEP_D0` while its
+> GT stepping is A0 — so A0/B0-bounded ADL-P display workarounds are silently skipped.
 
 ### Phase 6 — prove it
 
@@ -2226,18 +2345,24 @@ trust this document.
 
 ### 13.2 Things that are inference — `[INF]`
 
-- That the display and render blocks share one PCI function on ADL-N. Strongly implied by i915's
-  single-device model and by libgfxinit treating it as one device, but I did not find a document
-  that says it in one sentence.
-- That `GEN8_DE_PIPE_D_IRQ` is `1 << 19` (following the `1 << (16 + pipe)` pattern).
-- That `DE_MASTER_IRQ_CONTROL` must be set for any display interrupt to be delivered.
+- That the display and render blocks share one PCI function on ADL-N. Now **independently
+  corroborated**: i915 binds only PCI function 0, coreboot's `SA_DEVFN_IGD` is `PCI_DEVFN(2,0)`, and
+  Intel's 12th-gen datasheet documents all graphics BARs under device 0:2:0 — but I still found no
+  single sentence that states it, so it stays listed here.
+- That `GEN8_DE_PIPE_D_IRQ` is `1 << 19`. (The source macro `1 << (16 + pipe)` with `PIPE_D = 3`
+  makes this near-certain, but the constant is not written out anywhere.)
 - That the "generous level 0 watermark" approach in §7.3 produces a working display. It is a
   reasonable engineering position, not a sourced one.
 - That the PRM's `0xC2000[18:15]` hotplug-inversion note is DG1-specific and does not apply to
   ADL-N boards.
-- That the `SFUSE_STRAP` DDI-detect bits are advisory on Gen12.
-- That the ADL-N GPIO pin table is exactly `gmbus_pins_icp` — i915 selects it via
-  `INTEL_PCH_TYPE >= PCH_ICP`, and I did not independently confirm ADL-N's PCH type.
+- That the `SFUSE_STRAP` DDI-detect bits are advisory on Gen12. (`[I915]`'s `port_strap_detected()`
+  returns true unconditionally for `DISPLAY_VER >= 9` and port presence comes from the VBT, which
+  supports this — but the bits are documented, so they are not simply dead.)
+- That the ADL-N GPIO pin table is exactly `gmbus_pins_icp`. `[I915]` selects it via
+  `INTEL_PCH_TYPE >= PCH_ICP`; ADL-N's PCH type is reported as `PCH_ADP` (LPC/eSPI ID `0x5480`),
+  which satisfies the condition — so this is now well-supported, but I did not read it out of a
+  document that says "ADL-N uses the ICP pin table".
+- That the ADL-N CDCLK voltage-level table is `tgl_calc_voltage_level`.
 
 ### 13.3 Where sources disagree, and which I trust
 
@@ -2271,6 +2396,28 @@ Also read, before overwriting anything, the registers i915 would refuse to repro
 `CDCLK_PLL_ENABLE` + `CDCLK_CTL` (i915's `bxt_sanitize_cdclk` keeps a working CDCLK rather than
 replacing it), `DPLL0_CFGCR0`/`DPLL0_CFGCR1` (reuse the divider set verbatim — see the `PDIV`
 encoding problem in §6.3), and `PCH_RAWCLK_FREQ`.
+
+### 13.5 Tools worth having on the machine
+
+- **`intel_reg` from igt-gpu-tools works, but only with an explicit spec file.** Its lookup order is
+  `registers/<devid>` → `registers/<codename>` → `registers/gen<N>`; there is no `alderlake_n`,
+  no `46d0` and no `gen12` entry, so it **silently falls back to a builtin Gen2–Gen7.5 spec** and
+  will mis-name or refuse your registers. Pass the ADL-P file explicitly:
+  ```
+  intel_reg --spec=<igt>/tools/registers/alderlake_p ...
+  ```
+  (or set `INTEL_REG_SPEC`). That spec pulls `adlp_base.txt` (~2,100 named registers) plus a delta
+  file, and is correct for ADL-N because the kernel models ADL-N as a subplatform of ADL-P.
+- **The highest-value oracle workflow:** `intel_reg snapshot > mmio.bin` on a known-good i915 boot,
+  then decode offline with `--mmio=mmio.bin --devid=0x46d0 --spec=…`, and **diff snapshots taken in
+  different states**. The register delta *is* the modeset sequence, sourced from your own hardware.
+- Other useful igt tools: `intel_watermark` and `intel_display_bandwidth` (both handle display
+  version 13 explicitly), `intel_display_poller` (tells you *when* a write took effect),
+  `intel_display_crc` (pipe CRC on pipes A–C), `intel_vbt_decode`, `intel_opregion_decode`,
+  `intel_firmware_decode`, `lsgpu -c`.
+- Two corrections to common assumptions: `modetest` does **not** dump EDID and belongs to libdrm,
+  not igt; `intel_gpu_top` is a PMU engine-counter tool, not a display oracle. `edid-decode` now
+  ships in `v4l-utils`.
 
 ---
 
@@ -2397,6 +2544,27 @@ Behaviour:
   `src/mainboard/starlabs/starbook/adl_n` (several VBT revisions: "Update VBT to fix HDMI output",
   "fix panel timings", "raise panel PWM frequency") and `src/mainboard/lattepanda/mu`
   ("Make VBT compatible with ADL-N FSP IPU25.3").
+  - libgfxinit names this part explicitly: `common/hw-gfx-gma-config.ads.template` contains
+    `function Is_Alder_Lake_N (Device_Id : Word16) return Boolean is
+    (Device_Id = 16#46d0# or 16#46d1# or 16#46d2#);`. That is direct, independent corroboration of
+    the device-ID grouping in §1.1.
+- **Haiku `intel_extreme`** — an **independent** (not ported) Intel driver, MIT-licensed by
+  recollection. Its `Generation()` returns 12 for Tiger Lake / Alder Lake and it added ADL support
+  in commit `0db74e1a` (2025-01-16, described as tested and confirmed working). Its
+  `TigerLakePLL.cpp` cites `IHD-OS-TGL-Vol 12-12.21` by page. **Gap:** it carries `0x46D1`, not
+  `0x46D0` — likely a one-line addition, but untested.
+- **Redox OS `ihdgd`** — an independent Gen12 modeset driver in Rust (merged 2025-12-18), split into
+  `gmbus` / `aux` / `ddi` / `dpll` / `pipe` / `transcoder` / `power` / `gpio`. Structurally the
+  closest small-scale decomposition of Gen12 modeset available, and therefore a useful template for
+  how to *organise* a from-scratch driver.
+- **Fuchsia `intel-display`** — independent, targets Gen12. Its README mandates that code comments
+  cite the PRM document reference, section title, part and page. That is a good process model even
+  if you never read its code. (Its PRM hyperlinks point at the dead 01.org, so follow the
+  `cdrdv2-public.intel.com` IDs in §14.1 instead.)
+- **The BSDs are ports, not independent implementations**, and their Linux baseline varies enough to
+  matter: OpenBSD is on Linux 6.18.x, FreeBSD tracks a recent LTS, and **NetBSD is on Linux
+  5.6-rc3 and stops at Tiger Lake with no Alder Lake support at all** — a clean demonstration that
+  "it's a port of i915" does not imply "it supports your part".
 
 ### 14.4 Checked and found not to help
 
@@ -2422,10 +2590,25 @@ Behaviour:
   Where a claim is reasoning rather than reading, it is tagged `[INF]`; where a source was missing,
   it is tagged `[GAP]`.
 - **No hardware was run.** No part of this has been validated on real silicon.
-- **Three corrections were made to earlier drafts** during review, and are left visible in the text
-  because each is a trap worth knowing about: the CDCLK PLL sequence wrongly carried the combo
-  DPLL's bit-27 power-up step; the `DPLL_CFGCR1` field positions were the Skylake `CFGCR2` layout
-  rather than the Gen12 one; and the GMBUS pin index was treated as 0-based when it is 1-based.
+- **An adversarial fact-check pass was run against the cached sources before this document was
+  committed**, and it found real errors, all of which are fixed and left visible in the text because
+  each is a trap worth knowing about:
+  1. The CDCLK PLL sequence wrongly carried the combo DPLL's bit-27 power-up step.
+  2. The `DPLL_CFGCR1` field positions were the Skylake `CFGCR2` layout, not the Gen12 one.
+  3. The GMBUS pin index was treated as 0-based when it is 1-based.
+  4. The global display interrupt enable was given as `DEISR[31]` instead of `DISPLAY_INT_CTL`
+     (`0x44200[31]`) — **the highest-impact of the four**, since a driver following it would enable
+     nothing.
+  5. Four rows of the `TRANS_DDI_FUNC_CTL` bitfield table were wrong (mode-select values, polarity
+     bits, and both HDMI high-rate bits).
+  6. The 19.2 MHz `PCH_RAWCLK_FREQ` value was mis-added (`0x10040800` → `0x10130800`).
+  7. Two internal contradictions (the forcewake range vs. the combo PHY's `0x162000`; the
+     `has_fuses` sentence for `PW_A`…`PW_D`).
+  8. Bit depth and dithering were attributed to `TRANSCONF` when on Gen12 they live in `PIPE_MISC`.
+  9. The `dco_fraction` formula had a dimension error (`ref_kHz` where `ref_MHz` belongs).
+- **Three sources of the same generation disagreed with each other on the power-well map** (TGL vs.
+  RKL vs. `XE_LPD`). That is recorded in §4.2.1 and is the single strongest argument for verifying
+  the map on real hardware rather than trusting any document — including this one.
 - **Licence.** This document records *facts* — register offsets, bitfield positions, sequences,
   constants, tables — which are not copyrightable. The GPL-2.0 `drm/i915` sources and the Intel
   PRMs were read for those facts; no code, comment or prose from either was reproduced.
