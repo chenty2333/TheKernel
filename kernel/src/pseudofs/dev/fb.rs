@@ -668,9 +668,14 @@ impl FbconFrame {
     }
 
     pub(crate) fn glyph(&self, x: usize, y: usize, byte: u8) {
-        for dy in 0..16 {
-            let bits = glyph_row(byte, dy / 2);
-            for dx in 0..8 {
+        // A byte with no glyph is drawn blank rather than as a substitute
+        // character: the console shows control bytes, UTF-8 continuation bytes
+        // and bytes outside the font's range, and a full screen of replacement
+        // boxes would hide the text around them.
+        let rows = super::console_font::glyph(byte);
+        for dy in 0..super::console_font::GLYPH_HEIGHT {
+            let bits = rows.map_or(0, |rows| rows[dy]);
+            for dx in 0..super::console_font::GLYPH_WIDTH {
                 let px = x + dx;
                 let py = y + dy;
                 if px >= self.width || py >= self.height {
@@ -683,8 +688,8 @@ impl FbconFrame {
                 };
                 if py
                     .checked_mul(self.pitch)
-                    .and_then(|row| row.checked_add(px.saturating_mul(4)))
-                    .is_some_and(|offset| offset + 4 <= self.size)
+                    .and_then(|row| row.checked_add(px.saturating_mul(self.bytes_per_pixel)))
+                    .is_some_and(|offset| offset + self.bytes_per_pixel <= self.size)
                 {
                     self.write_pixel(px, py, color);
                 }
@@ -708,63 +713,6 @@ impl FbconFrame {
         // able to fault the kernel.
         self.scanout.write_pixel(offset, color);
     }
-}
-
-// A compact built-in 5x7 ASCII subset, doubled vertically by `glyph`.  It
-// covers normal kernel/login text without a font cache or any allocation.
-fn glyph_row(byte: u8, row: usize) -> u8 {
-    const GLYPHS: [[u8; 7]; 36] = [
-        [14, 17, 17, 31, 17, 17, 17],
-        [30, 17, 17, 30, 17, 17, 30],
-        [15, 16, 16, 16, 16, 16, 15],
-        [30, 17, 17, 17, 17, 17, 30],
-        [31, 16, 16, 30, 16, 16, 31],
-        [31, 16, 16, 30, 16, 16, 16],
-        [15, 16, 16, 23, 17, 17, 15],
-        [17, 17, 17, 31, 17, 17, 17],
-        [31, 4, 4, 4, 4, 4, 31],
-        [1, 1, 1, 1, 17, 17, 14],
-        [17, 18, 20, 24, 20, 18, 17],
-        [16, 16, 16, 16, 16, 16, 31],
-        [17, 27, 21, 21, 17, 17, 17],
-        [17, 25, 21, 19, 17, 17, 17],
-        [14, 17, 17, 17, 17, 17, 14],
-        [30, 17, 17, 30, 16, 16, 16],
-        [14, 17, 17, 17, 21, 18, 13],
-        [30, 17, 17, 30, 20, 18, 17],
-        [15, 16, 16, 14, 1, 1, 30],
-        [31, 4, 4, 4, 4, 4, 4],
-        [17, 17, 17, 17, 17, 17, 14],
-        [17, 17, 17, 17, 17, 10, 4],
-        [17, 17, 17, 21, 21, 21, 10],
-        [17, 17, 10, 4, 10, 17, 17],
-        [17, 17, 10, 4, 4, 4, 4],
-        [31, 1, 2, 4, 8, 16, 31],
-        [14, 17, 19, 21, 25, 17, 14],
-        [4, 12, 4, 4, 4, 4, 14],
-        [14, 17, 1, 2, 4, 8, 31],
-        [30, 1, 1, 14, 1, 1, 30],
-        [2, 6, 10, 18, 31, 2, 2],
-        [31, 16, 30, 1, 1, 17, 14],
-        [6, 8, 16, 30, 17, 17, 14],
-        [31, 1, 2, 4, 8, 8, 8],
-        [14, 17, 17, 14, 17, 17, 14],
-        [14, 17, 17, 15, 1, 2, 12],
-    ];
-    if row >= 7 {
-        return 0;
-    }
-    let upper = byte.to_ascii_uppercase();
-    let index = match upper {
-        b'A'..=b'Z' => (upper - b'A') as usize,
-        b'0'..=b'9' => 26 + (upper - b'0') as usize,
-        _ => {
-            return matches!(byte, b'-' | b'_' | b'.' | b':' | b'/' | b'[' | b']')
-                .then_some(if row == 6 { 0x3e } else { 0 })
-                .unwrap_or(0);
-        }
-    };
-    GLYPHS[index][row] << 1
 }
 
 pub(crate) fn fbcon_dimensions() -> Option<(usize, usize)> {

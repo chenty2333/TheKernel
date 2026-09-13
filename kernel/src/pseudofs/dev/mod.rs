@@ -1,6 +1,7 @@
 //! Special devices
 
 mod bootfb;
+mod console_font;
 mod dri;
 #[cfg(feature = "input")]
 pub(crate) mod event;
