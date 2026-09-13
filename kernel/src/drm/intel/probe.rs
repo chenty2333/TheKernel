@@ -454,6 +454,16 @@ fn interpret(register: Register, value: u64) -> String {
                 )
             }
         }
+        // A bring-up register -- a power well, a clock, a fuse that selects a
+        // clock's reference, a display buffer slice or a combo PHY -- is
+        // decoded where it is used, by `power`, `clk` and `phy`, because the
+        // decode depends on state those modules hold (which reference frequency
+        // is in force, which well is being enabled).  A second decoding here
+        // would be a second place to be wrong.  The probe never reads one of
+        // these anyway: none is in `NAMED`, and the ones that are readable are
+        // read by the bring-up path at the point in the sequence where their
+        // value means something.
+        Meaning::BringUp => String::new(),
     }
 }
 
