@@ -1201,6 +1201,9 @@ impl<R: BusRegisters, T: PollTimer> Bus<'_, R, T> {
                 status: waited.status,
                 waited_micros: waited.micros,
             },
+            // `Met` is filtered out before this is called; it is listed so that
+            // adding an outcome is a compile error rather than a silent
+            // misclassification.
             WaitOutcome::TimedOut | WaitOutcome::Met => GmbusError::ReadyTimeout {
                 pin,
                 rate,
@@ -1239,6 +1242,11 @@ impl<R: BusRegisters, T: PollTimer> Bus<'_, R, T> {
             | GMBUS1_SLAVE_READ
             | GMBUS1_SW_RDY;
         self.write(GMBUS1, command)?;
+        // A posted write is not evidence that the device saw it (reference
+        // §2.2), and the very next thing this function does is poll a status
+        // bit the command is supposed to change.  Reading the register back is
+        // the ordering primitive this architecture offers.
+        let _ = self.posting_read(GMBUS1)?;
 
         let transaction_deadline = self
             .timer
@@ -1276,6 +1284,7 @@ impl<R: BusRegisters, T: PollTimer> Bus<'_, R, T> {
         // separate stop cycle is issued unconditionally ([I915] `intel_gmbus.c`
         // :660-664, whose comment says exactly that).
         self.write(GMBUS1, GMBUS1_CYCLE_STOP | GMBUS1_SW_RDY)?;
+        let _ = self.posting_read(GMBUS1)?;
         let idle = self.wait_idle()?;
         self.write(GMBUS0, 0)?;
         if idle.status & GMBUS2_TERMINAL != 0 {
