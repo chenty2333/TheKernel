@@ -2599,7 +2599,14 @@ trust this document.
    reading `SFUSE_STRAP[8]` and `PCH_RAWCLK_FREQ`.
 6. **The ADL-N CDCLK voltage-level table.** `tgl_calc_voltage_level` is Gen12-specific and I did
    not verify it against a PRM.
-7. **The `PDIV`/`KDIV` field encoding.** `[TGL12]` and i915's executed path disagree; see §6.3.
+7. **The `PDIV`/`KDIV` field encoding.** **CLOSED — it was a false alarm of this document's own
+   making.** §6.3's "The `PDIV`/`KDIV` encoding — resolved" records what the apparent conflict
+   actually was: the *Skylake* encoder `skl_wrpll_params_populate` compared against the *Gen12*
+   decoder, which are not on the same path. ADL-N runs `icl_wrpll_params_populate`, which emits
+   exactly the Gen12 named-constant values, so write and read round-trip and there is no
+   discrepancy to settle. What remains live is the trap §6.3 describes — both encoders write one
+   `struct skl_wrpll_params` — and what remains *unverified* is only whether the silicon implements
+   the named-constant encoding, which §13.4's read-back settles rather than any document.
 8. **Where ADL-P/N programs `DBUF_TRACKER_STATE_SERVICE`.** `gen12_dbuf_slices_config` explicitly
    returns early for ADL-P. Either the reset value is correct or the programming is elsewhere.
 9. **Whether ADL-N needs the 16 Gb-DIMM level-0 latency adjustment** for its soldered LPDDR5.
