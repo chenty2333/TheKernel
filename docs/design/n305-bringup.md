@@ -86,12 +86,25 @@ patience from five seconds to 250 ms the moment it finds the ISO's repository.
 On a machine that enumerates its disk quickly, the payload partition's event
 can arrive after it has given up. The image narrows the race from this side —
 the payload partition sits in the first partition slot, so its event is
-generated first, and it carries the live system's own package repository, so
-one scan of it satisfies the whole search — but the race cannot be removed from
-outside. Removing it means naming the apkovl on the kernel command line
+generated first — but the race cannot be removed from outside. Removing it
+means naming the apkovl on the kernel command line
 (`apkovl=LABEL=HWDUMP:alpine.apkovl.tar.gz`), which needs a boot configuration
-this image does not own: the ISO's is embedded in its bootloader, and the
-replacement GRUB image is larger than the ISO's 1.4 MiB EFI partition.
+this image does not own: the ISO's is embedded in its bootloader, and a
+replacement GRUB image built on the development host is several megabytes,
+against 590 KiB free in the ISO's 1.4 MiB EFI partition.
+
+Measured on this host, before and after that partition-slot change: booting the
+image with QEMU's own kernel loader (`-kernel`/`-initrd`, which hands the
+kernel straight to the machine) always finds the payload — the initramfs log
+shows `Loading user settings from /media/sda1/alpine.apkovl.tar.gz` and the
+guest powers itself off — while the UEFI path (OVMF, then the ISO's GRUB) has
+repeatedly missed it, leaving the guest at a login prompt. The difference is
+boot speed: the kernel's console output slows early boot enough for the scan to
+see every partition, and `quiet` on the ISO's command line removes exactly that
+delay. So on the real machine, expect the fast case. A capture that ends at
+`localhost login:` is this failure, not broken hardware: power-cycle and retry,
+and if it fails repeatedly the boot configuration change above is the fix worth
+making rather than more retries.
 
 Attach the display or the capture dongle *before* powering on: the EDID in the
 bundle is the EDID of whatever sink is connected, which is the same thing the
@@ -184,6 +197,25 @@ Then power the machine on. Nothing is typed on the machine, ever. Leave the
 capture running until the log has stopped and the prompt has been on screen for
 a while — a minute is plenty, because the point of the shell profile is that
 there is no rush.
+
+Measured on this host, with the shell profile built by
+`python3 tools/thekernel.py build --profile shell`, booted under OVMF with
+`-device bochs-display` and a GRUB configuration that sets `gfxterm` and
+`gfxpayload=keep`: screen captures at t = 10, 30, 60, 120, 180, 240 and 280
+seconds are **byte-identical** (sha256 `eefb2ed3348c9ee6…`) and show
+`THEKERNEL_SHELL_READY`. The guest never powered itself off; QEMU exited only
+when the test's own timeout killed it. That is the property this profile is
+chosen for: the evidence is still on the glass minutes later.
+
+Two things the same run makes plain:
+
+* the glass showed the readiness marker and **no kernel log**. "The log is
+  visible on screen" is therefore not yet something this procedure can claim —
+  the log mirror is a separate workstream's artefact, and until it lands the
+  screen carries the marker, not the transcript;
+* the bootloader has to pass a Multiboot2 framebuffer tag. With GRUB's terminal
+  left on the serial port, GRUB prints `WARNING: no console will be available
+  to OS` and the glass stays black — the failure in the table below.
 
 ### 2.4 What the good outcome looks like on the glass
 
