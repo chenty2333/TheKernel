@@ -4647,11 +4647,27 @@ impl ProcessData {
         };
         for namespace in namespaces {
             crate::syscall::ipc::cleanup_process_mqueue_notifications_in(&namespace, pid);
-            // Visible SysV attachments are VMA-owned. Their finalizer runs
-            // only after AddrSpace teardown has removed the last fragment and
-            // completed its TLB grace period; deleting the IPC record here
-            // could free an IPC_RMID segment while stale translations or VMA
-            // retirements still retain its backing.
+            // SysV attachments are retired here, in the exiting task's own
+            // context and before `publish_final_process_exit` makes the zombie
+            // waitable, exactly as Linux's `exit_shm()` runs from `do_exit()`
+            // ahead of `exit_notify()`. This is what makes an IPC_RMID segment
+            // unreachable at the moment its last attachment disappears: a
+            // parent's `wait()` returning is itself the proof that the exited
+            // process owns nothing. Leaving it to the deferred VMA mapping
+            // finalizer is not equivalent, because AddrSpace teardown (and its
+            // TLB grace) completes after the zombie is published, so `shmat`
+            // could still find the removed shmid.
+            //
+            // Page lifetime is not decided here. Every mapping of the segment
+            // holds its own `Arc<SharedPages>` through its `SharedBackend`, and
+            // an unmap releases that ownership only after its TLB grace
+            // (`AddrSpace::unmap_areas_with_tlb_grace`), so the segment's own
+            // reference is never the last one while a mapping or a translation
+            // still needs the frames. A record removed here only turns the
+            // still-outstanding VMA lease's deferred finalizer into an
+            // exact-match no-op, which is the same state an explicit `shmdt`
+            // already produces while its lease is outstanding.
+            crate::syscall::ipc::clear_proc_shm_in_namespace(&namespace, pid);
         }
     }
     pub(crate) fn net_ns(&self) -> Arc<NetworkNamespace> {
