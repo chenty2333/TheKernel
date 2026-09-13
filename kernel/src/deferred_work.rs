@@ -616,6 +616,10 @@ pub(crate) fn init() {
 fn dispatch() {
     if axruntime::klog::take_reader_notification() {
         crate::syscall::notify_syslog_readers();
+        // The framebuffer console reads the same ring through its own cursor,
+        // so the same edge that tells `/dev/kmsg` readers there is more log
+        // tells the screen too.
+        crate::pseudofs::dev::tty::fbcon::notify_log_mirror();
     }
     if axruntime::klog::diagnostic_work_pending() {
         LOG_WORKER_WAKE.wake();

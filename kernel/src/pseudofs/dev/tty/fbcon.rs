@@ -6,13 +6,26 @@
 //! render with KD_GRAPHICS transitions; fbcon then holds the cell lock across
 //! the bounded draw so a concurrent writer cannot make the presented cells
 //! inconsistent with that decision.
+//!
+//! It is also where the kernel's own log reaches the screen.  Terminal output
+//! arrives here because a process wrote to a console device; kernel `println!`
+//! arrives through the klog ring instead, and on a machine with no serial port
+//! the screen is the only console that log has.  See [`install_log_mirror`].
 
 use alloc::{boxed::Box, vec::Vec};
-use core::time::Duration;
+use core::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
+use axerrno::AxError;
+use axpoll::PollSet;
 use axsync::Mutex;
 
-use crate::pseudofs::dev::fb;
+use crate::{
+    pseudofs::dev::{fb, tty::VT_MANAGER},
+    readiness::block_on_poll_set_uninterruptible,
+};
 
 const VT_COUNT: usize = 63;
 const MAX_COLS: usize = 160;
@@ -138,7 +151,141 @@ static PRESENT: Mutex<PresentState> = Mutex::new(PresentState {
 /// Allocation is bounded and happens only at setup; an allocation failure
 /// leaves the serial console fully usable.
 pub(crate) fn install() {
-    *FBCON.lock() = Console::try_new();
+    let console = Console::try_new();
+    let installed = console.is_some();
+    *FBCON.lock() = console;
+    if installed {
+        install_log_mirror();
+    }
+}
+
+/// Bytes of kernel log copied into the cell grid per pass.
+///
+/// The ring retains up to 64 KiB, so the first pass after installation is a
+/// replay of the whole retained boot log.  Reading it in bounded chunks keeps
+/// one pass from holding the console lock while it walks the entire ring.
+const LOG_MIRROR_CHUNK: usize = 512;
+
+/// Chunks one pass copies before returning to the worker loop.
+///
+/// Eight KiB is more than a screen can show but far less than the ring, so a
+/// caught-up mirror still finishes the pass promptly and an overrun cannot
+/// monopolise the worker.
+const LOG_MIRROR_CHUNKS_PER_PASS: usize = 16;
+
+/// How long a pass which exhausted its budget waits before reading again.
+const LOG_MIRROR_SATURATED_INTERVAL: Duration = Duration::from_millis(33);
+
+/// Wakes the kernel-log mirror when the klog ring has grown.
+static LOG_MIRROR_WAKE: PollSet = PollSet::new();
+
+/// Whether a pass is in progress, so two of them cannot share one cursor.
+static LOG_MIRROR_WRITING: AtomicBool = AtomicBool::new(false);
+
+/// Whether the mirror task exists, so a second [`install`] cannot start a
+/// second copy of it.
+static LOG_MIRROR_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Wakes the kernel-log mirror from a scheduler safe point.
+///
+/// A log producer may hold the console lock or run in interrupt context and
+/// must never wake a task itself, so it publishes an edge that the deferred
+/// work dispatcher turns into this call.
+pub(crate) fn notify_log_mirror() {
+    LOG_MIRROR_WAKE.wake();
+}
+
+/// Mirrors the kernel log into the active virtual console.
+///
+/// The ring is read through a cursor rather than through the diagnostic
+/// record queue, which makes the screen independent of the serial sink in
+/// both directions: a machine with no serial port still shows the log, and a
+/// serial port which has stopped accepting bytes cannot hold the screen back.
+/// Starting the cursor at zero replays every retained byte, so the messages
+/// printed before this console existed -- everything a serial-less machine
+/// sent to a UART that is not there -- appear on the screen rather than being
+/// lost.  Only bytes the ring has already overwritten are missed.
+///
+/// The cost of that independence is that the screen shows every retained
+/// byte, not only the records the console threshold would have admitted.  The
+/// ring stores no per-record level, so a filtered mirror is not possible from
+/// here; and on a machine whose only console is the screen, filtering it is
+/// what makes a failed boot undiagnosable.  Console level control therefore
+/// keeps its existing meaning for the serial sink alone.
+pub(crate) fn install_log_mirror() {
+    if LOG_MIRROR_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if axtask::try_spawn_with_name(log_mirror_worker, "fbcon-log".into()).is_err() {
+        // The screen still works for whatever userspace writes to it; only the
+        // kernel's own log would be missing, so report and carry on.
+        LOG_MIRROR_STARTED.store(false, Ordering::Release);
+        warn!("Failed to start the kernel-log console mirror");
+    }
+}
+
+/// Copies the kernel log into the active virtual console until it is drained,
+/// then sleeps until a producer publishes more.
+///
+/// Writing into the cells of a VT which is showing graphics is deliberate: the
+/// text belongs to that console, and a client which later yields the seat
+/// repaints from these cells.  Dropping the bytes instead would leave a hole
+/// in the log that returning to text could not fill.
+fn log_mirror_worker() {
+    let mut cursor = 0u64;
+    loop {
+        if mirror_new_log_bytes(&mut cursor) {
+            // The ring grew at least as fast as this pass could read it, so
+            // the wake below -- which is level-triggered on a non-empty ring
+            // -- would return at once and the worker would spin.  Nothing
+            // legitimate produces log faster than a console can show it, so
+            // pace the pass instead of waiting on an edge that is already
+            // set; a console which is somehow logging climbs at a reading
+            // pace rather than pinning a CPU.
+            let _ = axtask::sleep(LOG_MIRROR_SATURATED_INTERVAL);
+            continue;
+        }
+        // Re-check after registering, so a record appended between the drain
+        // above and this wait cannot leave the mirror asleep with work to do.
+        if let Err(error) = block_on_poll_set_uninterruptible(&LOG_MIRROR_WAKE, || {
+            if axruntime::klog::available_from(cursor) != 0 {
+                Ok(())
+            } else {
+                Err(AxError::WouldBlock)
+            }
+        }) {
+            warn!("Kernel-log console mirror stopped: {error}");
+            return;
+        }
+    }
+}
+
+/// Copies everything the ring has retained since `cursor` into the console.
+///
+/// **Nothing on this path may log.**  The mirror is a reader of the ring it
+/// writes the console from, so a record produced here would be read back and
+/// written again: one log line would become an endless stream of them, and a
+/// machine with no serial port would look hung behind a screen scrolling
+/// faster than it can be read.  `the_console_write_path_does_not_log` in this
+/// module's tests is what holds that down; the guard below only keeps a second
+/// caller from racing this one over the same cursor.
+fn mirror_new_log_bytes(cursor: &mut u64) -> bool {
+    if LOG_MIRROR_WRITING.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let mut bytes = [0u8; LOG_MIRROR_CHUNK];
+    let mut chunks = 0;
+    while chunks < LOG_MIRROR_CHUNKS_PER_PASS {
+        let (count, next) = axruntime::klog::snapshot_into(*cursor, &mut bytes, false);
+        if count == 0 {
+            break;
+        }
+        *cursor = next;
+        write_active(&bytes[..count]);
+        chunks += 1;
+    }
+    LOG_MIRROR_WRITING.store(false, Ordering::Release);
+    chunks == LOG_MIRROR_CHUNKS_PER_PASS
 }
 
 fn dimensions() -> Option<(usize, usize)> {
@@ -227,10 +374,13 @@ fn trailing_present() {
     }
 }
 
-/// Mirrors `/dev/console` output to whichever VT is active, while its normal
-/// writer continues to send the same bytes to the serial console.
-pub(crate) fn write_active(bytes: &[u8], active: u16, graphics: bool) {
-    write(active, bytes, active, graphics);
+/// Mirrors output from a source which has no virtual console of its own --
+/// the kernel log -- to whichever VT is active.  A source with a console of
+/// its own writes to that console through [`write`] instead, so that output
+/// meant for an inactive `ttyN` is not shown on the active one.
+pub(crate) fn write_active(bytes: &[u8]) {
+    let active = VT_MANAGER.active();
+    write(active, bytes, active, VT_MANAGER.graphics(active));
 }
 
 /// Repaints `vt` only after the VT arbiter has verified that it is active and
@@ -274,6 +424,102 @@ pub(crate) fn present(vt: u16, _graphics: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A logger which forwards to the klog ring.
+    ///
+    /// Host tests install no kernel logger, so `info!` and `warn!` are
+    /// silently dropped and a test that watched the ring would pass by being
+    /// deaf.  This connects the same `log` facade the kernel uses to the ring
+    /// the mirror reads, so the test below can see what the console logged.
+    struct KlogTestLogger;
+
+    impl log::Log for KlogTestLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            use core::fmt::Write as _;
+            let mut text = alloc::string::String::new();
+            let _ = write!(&mut text, "{}", record.args());
+            axruntime::klog::record(text.as_bytes());
+        }
+
+        fn flush(&self) {}
+    }
+
+    static KLOG_TEST_LOGGER: KlogTestLogger = KlogTestLogger;
+
+    /// Bytes the klog ring has ever held, which only ever grows.
+    fn ring_end() -> u64 {
+        axruntime::klog::snapshot_into(0, &mut [], true).1
+    }
+
+    #[test]
+    fn a_pass_is_bounded_and_reports_that_it_was() {
+        // The mirror reads a ring it also writes the console from.  If
+        // anything on that path ever logs, the ring grows at least as fast as
+        // the mirror reads it and a pass that only stopped when the ring was
+        // empty would never return.  Bounding the pass is what turns that into
+        // a paced worker instead of a spin, and the saturated flag is what
+        // tells the worker to pace itself.
+        let mut cursor = ring_end();
+        // More than one pass can carry, so the pass must stop at its budget.
+        for line in 0..(LOG_MIRROR_CHUNK * (LOG_MIRROR_CHUNKS_PER_PASS + 4) / 24) {
+            axruntime::klog::record(alloc::format!("saturate the ring {line:08}\n").as_bytes());
+        }
+        assert!(
+            axruntime::klog::available_from(cursor) > LOG_MIRROR_CHUNK * LOG_MIRROR_CHUNKS_PER_PASS,
+            "the ring did not hold more than one pass"
+        );
+
+        assert!(
+            mirror_new_log_bytes(&mut cursor),
+            "a full pass must report that it was saturated"
+        );
+
+        // Once drained the flag clears, so the worker goes back to sleeping on
+        // the wake edge rather than polling.
+        let mut drained = ring_end();
+        assert!(!mirror_new_log_bytes(&mut drained));
+    }
+
+    #[test]
+    fn the_console_write_path_does_not_log() {
+        // The kernel-log mirror reads the ring this module writes into, so a
+        // record produced here would be read back and written again: one log
+        // line would become an endless stream of them, and on a machine with
+        // no serial port that looks exactly like a hung kernel behind a screen
+        // scrolling faster than it can be read.  This test is what keeps the
+        // mirror's cursor safe to advance.
+        let _context = crate::test_support::scheduler_test_context();
+        // A previously installed logger wins; both forward to the ring, and
+        // the canary below proves the forwarding works either way.
+        let _ = log::set_logger(&KLOG_TEST_LOGGER);
+        log::set_max_level(log::LevelFilter::Trace);
+        // Installation may itself report a failure to spawn on the host; only
+        // the console path below is under test.
+        install();
+
+        let before = ring_end();
+        log::info!("canary");
+        assert!(
+            ring_end() > before,
+            "the test logger is not connected to klog, so this test is deaf"
+        );
+
+        let before = ring_end();
+        write(1, b"terminal output\n", 1, false);
+        write_active(b"mirrored kernel log\n");
+        present(1, false);
+        present_while_text_active(1);
+
+        assert_eq!(
+            ring_end(),
+            before,
+            "the console write path appended to klog"
+        );
+    }
 
     #[test]
     fn cells_wrap_and_scroll_without_allocating() {

@@ -3583,6 +3583,7 @@ dependencies = [
  "linkme",
  "linux-raw-sys",
  "lock_api",
+ "log",
  "memory_addr",
  "miniz_oxide",
  "num_enum",

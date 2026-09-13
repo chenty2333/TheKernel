@@ -184,6 +184,9 @@ page_table_multiarch = { workspace = true, features = ["copy-from"] }
 
 [target.'cfg(not(target_os = "none"))'.dev-dependencies]
 axcpu = { workspace = true, features = ["host-test-context"] }
+# The console tests observe whether a path logged, which means reaching the
+# same `log` facade the kernel's own macros use.
+log = { workspace = true }
 
 [package.metadata.thekernel]
 layer = "integration"
