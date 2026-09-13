@@ -160,7 +160,7 @@ Named precisely, because "a panic is now visible" would be an overstatement:
 
 ## 6. Verification
 
-Sixteen host tests in `kernel/src/pseudofs/dev/early_screen/tests.rs` run under
+Seventeen host tests in `kernel/src/pseudofs/dev/early_screen/tests.rs` run under
 `test --suite host`, over a plain `Vec<u8>`: stride from pitch, 32/24/16-bit pixel depth,
 wrapping at the column limit, status-row clipping, newest-log-line selection, clearing of
 rows a shorter frame no longer uses, the first frame's full repaint of the aperture,
@@ -195,3 +195,9 @@ no virtio-gpu), with the PPM decoded back to text through the console font:
   console exist) leaves `THEKERNEL  driver init` on the status bar with the log tail ending
   at `use EEVDF scheduler.` — the early screen is on the display with `fbcon` provably not
   yet installed, and a hang is as legible as a panic.
+
+  The same run also demonstrates why the ring, and not the UART, is the right thing to
+  mirror.  Its diagnostic stream stops at `THEKERNEL_CPU_ENABLED cpu=0`, because the
+  diagnostic UART is drained by a deferred worker which this stall never lets run — while
+  the screen shows two further records that are still in the ring.  On a machine with no
+  UART at all there is no drain competing with the screen in the first place.
