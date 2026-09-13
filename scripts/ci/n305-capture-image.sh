@@ -363,93 +363,6 @@ fi
 [ -s "$WORK/apks/MANIFEST.sha256" ] || die "no packages staged; run without --assemble-only first"
 
 # ---------------------------------------------------------------------------
-# The live system's own packages, so that the stick does not depend on the
-# initramfs finding the ISO's repository before its event window closes.
-# Alpine's initramfs looks for a directory holding .boot_repository; a
-# partition that carries both that repository and the apkovl satisfies its
-# search in a single step.
-# ---------------------------------------------------------------------------
-
-if [ "$ASSEMBLE_ONLY" = no ]; then
-	note "staging the live system's package repository"
-	mkdir -p "$WORK/bootrepo"
-	if [ "$ISO_EXTRACTOR" = bsdtar ]; then
-		( cd "$WORK/bootrepo" && bsdtar -xf "$ISO" apks/.boot_repository apks/x86_64/APKINDEX.tar.gz ) ||
-			die "cannot read the ISO's package repository"
-	else
-		# x, not e: the repository layout is what makes it a repository.
-		"$ISO_EXTRACTOR" x -y -o"$WORK/bootrepo" "$ISO" apks/.boot_repository apks/x86_64/APKINDEX.tar.gz >/dev/null 2>&1 ||
-			die "cannot read the ISO's package repository (needs 7z or bsdtar)"
-	fi
-	python3 - "$ISO" "$WORK/bootrepo" "$ISO_EXTRACTOR" <<'BASEEOF'
-"""Copy the ISO's own alpine-base closure out of the ISO."""
-import subprocess, sys, tarfile, os
-
-iso, out, extractor = sys.argv[1], sys.argv[2], sys.argv[3]
-packages = os.path.join(out, "apks", "x86_64")
-os.makedirs(packages, exist_ok=True)
-index = os.path.join(packages, "APKINDEX.tar.gz")
-with tarfile.open(index) as archive:
-    member = [n for n in archive.getnames() if n.endswith("APKINDEX")][0]
-    text = archive.extractfile(member).read().decode()
-entries = {}
-for block in text.strip().split("\n\n"):
-    entry = {}
-    for line in block.splitlines():
-        if len(line) > 2 and line[1] == ":":
-            entry[line[0]] = line[2:]
-    if "P" in entry:
-        entries[entry["P"]] = entry
-provides = {}
-for name, entry in entries.items():
-    for token in entry.get("p", "").split():
-        provides.setdefault(token.split("=")[0], []).append(name)
-
-
-def dep_name(token):
-    if token.startswith("!"):
-        return None
-    for separator in (">=", "<=", "=", "~", ">", "<"):
-        if separator in token:
-            return token.split(separator, 1)[0]
-    return token
-
-
-chosen, seen, queue = [], set(), ["alpine-base"]
-while queue:
-    name = queue.pop(0)
-    if name in seen:
-        continue
-    seen.add(name)
-    if name in entries:
-        package = name
-    else:
-        candidates = provides.get(name, [])
-        if not candidates:
-            continue
-        package = sorted(candidates, key=lambda n: (len(n), n))[0]
-    if package in chosen:
-        continue
-    chosen.append(package)
-    for token in entries[package].get("D", "").split():
-        dependency = dep_name(token)
-        if dependency:
-            queue.append(dependency)
-
-members = ["apks/x86_64/%s-%s.apk" % (name, entries[name]["V"]) for name in chosen]
-print("live system packages to stage: %d" % len(members))
-if extractor == "bsdtar":
-    subprocess.run(["bsdtar", "-xf", iso, "-C", out] + members, check=True,
-                   stdout=subprocess.DEVNULL)
-else:
-    subprocess.run([extractor, "e", "-y", "-o" + packages, iso] + members, check=True,
-                   stdout=subprocess.DEVNULL)
-BASEEOF
-	[ -f "$WORK/bootrepo/apks/.boot_repository" ] || die "the staged repository is missing .boot_repository"
-	note "live system repository: $(du -sh "$WORK/bootrepo" | cut -f1)"
-fi
-
-# ---------------------------------------------------------------------------
 # The apkovl: Alpine's documented unattended hook.
 # ---------------------------------------------------------------------------
 
@@ -498,15 +411,6 @@ truncate -s "$((part_sectors * sector))" "$WORK/payload.fat"
 mkfs.vfat -F 32 -n HWDUMP "$WORK/payload.fat" > /dev/null
 mmd -i "$WORK/payload.fat" ::/apks ::/payload ::/dump
 mcopy -i "$WORK/payload.fat" "$WORK/alpine.apkovl.tar.gz" ::/alpine.apkovl.tar.gz
-if [ -d "$WORK/bootrepo/apks" ]; then
-	# The live system's repository lives at apks/, beside the offline tool set
-	# at the top level, so that the initramfs finds .boot_repository where it
-	# expects it without mixing the two sets of packages.
-	mmd -i "$WORK/payload.fat" ::/apks/x86_64 2>/dev/null || true
-	mcopy -i "$WORK/payload.fat" "$WORK/bootrepo/apks/.boot_repository" ::/apks/
-	mcopy -i "$WORK/payload.fat" "$WORK/bootrepo/apks/x86_64/APKINDEX.tar.gz" ::/apks/x86_64/
-	mcopy -i "$WORK/payload.fat" "$WORK/bootrepo/apks/x86_64/"*.apk ::/apks/x86_64/
-fi
 mcopy -i "$WORK/payload.fat" "$WORK/apks/MANIFEST.sha256" ::/apks/MANIFEST.sha256
 mcopy -i "$WORK/payload.fat" "$WORK/apks/"*.apk ::/apks/
 mcopy -i "$WORK/payload.fat" "$PAYLOAD" ::/payload/n305-capture-payload.sh
@@ -773,28 +677,14 @@ mdir -i "$OUT@@$((iso_sectors * sector))" ::/ > "$WORK/verify-listing.txt" 2>&1 
 # directory listing: FAT shows an 8.3 name like README.txt as "README   txt",
 # so a listing-based check would be checking the wrong thing.
 offset="$((iso_sectors * sector))"
-# Each file is copied out to a temporary file before it is grepped: a pipeline
-# into grep -q closes early, and with pipefail that turns a match into a
-# spurious "write error".
-mcopy -i "$OUT@@$offset" "::/$MARKER_NAME" "$WORK/check-marker.txt" ||
-	die "payload marker file is missing from the assembled image"
-grep -qx "$MARKER_TEXT" "$WORK/check-marker.txt" || die "payload marker file has the wrong contents"
-mcopy -i "$OUT@@$offset" ::/README.txt "$WORK/check-readme.txt" ||
+mcopy -i "$OUT@@$offset" "::/$MARKER_NAME" - | grep -qx "$MARKER_TEXT" ||
+	die "payload marker file is missing or wrong in the assembled image"
+mcopy -i "$OUT@@$offset" ::/README.txt - | grep -q 'TheKernel N305 hardware-facts capture stick' ||
 	die "payload README is missing from the assembled image"
-grep -q 'TheKernel N305 hardware-facts capture stick' "$WORK/check-readme.txt" ||
-	die "payload README has the wrong contents"
-mcopy -i "$OUT@@$offset" ::/alpine.apkovl.tar.gz "$WORK/check-apkovl.tar.gz" ||
-	die "the apkovl is missing from the assembled image"
-tar -tzf "$WORK/check-apkovl.tar.gz" > "$WORK/check-apkovl.txt" ||
-	die "the apkovl in the image is not a readable tarball"
-grep -q 'etc/local.d/n305-capture.start' "$WORK/check-apkovl.txt" ||
-	die "apkovl in the image is not the one that was built"
-mcopy -i "$OUT@@$offset" "::/apks/MANIFEST.sha256" "$WORK/check-tools.txt" ||
-	die "the offline package manifest is missing from the assembled image"
-grep -q 'pciutils' "$WORK/check-tools.txt" ||
+mcopy -i "$OUT@@$offset" ::/alpine.apkovl.tar.gz - | tar -tzf - |
+	grep -q 'etc/local.d/n305-capture.start' || die "apkovl in the image is not the one that was built"
+mcopy -i "$OUT@@$offset" "::/apks/MANIFEST.sha256" - | grep -q 'pciutils' ||
 	die "offline package set is missing from the assembled image"
-mcopy -i "$OUT@@$offset" "::/apks/.boot_repository" "$WORK/check-bootrepo.txt" ||
-	die "the live system repository is missing from the assembled image"
 
 rm -rf "$WORK/fat"
 if [ "$KEEP_INTERMEDIATE" = no ]; then
