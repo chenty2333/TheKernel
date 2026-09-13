@@ -1,31 +1,45 @@
-//! The platform half of the `igc` driver: mapping, waiting, and the probe.
+//! The platform half of the `igc` driver: mapping, waiting, and the three
+//! phases that turn a PCI function into a NIC.
 //!
 //! The driver's logic lives in `axdriver_net::igc`, which has no architecture
 //! underneath it and is therefore testable on the host.  This module is the
 //! other half: the part that needs this platform's PCI layer, its physical
-//! memory map and its clock.  Keeping the split sharp is what lets the
-//! arithmetic, the register encodings and the state machines be verified on a
-//! machine that has no such NIC.
+//! memory map, its DMA allocator and its clock.  Keeping the split sharp is
+//! what lets the arithmetic, the register encodings, the descriptor layout and
+//! the ring state machines be verified on a machine that has no such NIC.
 //!
-//! # What this half does, and does not, do
+//! # The three phases, in order
 //!
-//! It reads configuration space through the bus walk's `PciRoot` (whose
-//! accessors are read-only except for the command register and BAR sizing that
-//! the walk itself performs before any driver is consulted), maps BAR0 at its
-//! direct-map address, and hands the driver a [`WindowBus`] over it.  It does
-//! not write a register: the driver's register table declares no writable
-//! register in this phase, so there is nothing for it to write through.
+//! 1. **Identify.**  Read configuration space, map BAR0, read the registers
+//!    that identify the part, and print one verdict.  Writes nothing.
+//! 2. **Bring up.**  Reset the MAC, wait for the NVM auto-read, read the
+//!    station address, ask the PHY to autonegotiate and wait for link.  Sets up
+//!    no ring, so nothing can be sent or received yet.
+//! 3. **Take over.**  Build the descriptor rings and hand the NIC to the bus.
+//!
+//! Each phase logs its own outcome before the next begins, so a machine that
+//! fails in the middle says where it failed instead of going quiet -- which
+//! matters on the target, where the screen is the only output there is.
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::{
+    ptr,
+    ptr::NonNull,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
+use axalloc::{UsageKind, global_allocator};
 use axdriver_net::igc::{
-    self, IgcHal, ProbeReport, WindowBus,
+    self, DMA_PAGE_BYTES, IgcHal, IgcNic, PhysAddr, WindowBus,
     ids::{self, INTEL_VENDOR},
     probe::{BarFacts, Candidate, ConfigFacts, MsixFacts},
     regs::{RegisterWindow, WINDOW_BYTES},
 };
-use axhal::mem::phys_to_virt;
+use axhal::mem::{phys_to_virt, virt_to_phys};
 use log::*;
+
+/// The queue size both rings are built with: the vendor driver's default of
+/// 256 descriptors (`IGC_DEFAULT_TXD`/`IGC_DEFAULT_RXD`, `igc.h:442-447`).
+pub(crate) const QUEUE_SIZE: usize = 256;
 
 /// The PCI class and subclass a network controller reports.
 const CLASS_NETWORK: u8 = 0x02;
@@ -43,6 +57,32 @@ pub struct IgcHalImpl;
 impl IgcHal for IgcHalImpl {
     fn busy_wait_us(micros: u32) {
         axhal::time::busy_wait(core::time::Duration::from_micros(u64::from(micros)));
+    }
+
+    fn dma_alloc(pages: usize) -> Option<(PhysAddr, NonNull<u8>)> {
+        // The same primitive the virtio HAL uses for its buffers: pages from
+        // the global allocator, tagged as DMA, whose physical address is the
+        // direct map's answer.  Coherent because x86_64 with no IOMMU in the
+        // way is coherent, which is what this kernel's DMA users already
+        // assume.
+        let virtual_address =
+            global_allocator().alloc_pages(pages, DMA_PAGE_BYTES, UsageKind::Dma).ok()?;
+        if virtual_address == 0 {
+            return None;
+        }
+        let physical = virt_to_phys(virtual_address.into()).as_usize();
+        // The allocator returns memory that may hold another user's data; a
+        // descriptor ring whose first read is a stale length field is a ring
+        // that reports packets nobody sent.
+        // SAFETY: the region is `pages` pages long and owned by this
+        // allocation.
+        unsafe { ptr::write_bytes(virtual_address as *mut u8, 0, pages * DMA_PAGE_BYTES) };
+        let pointer = NonNull::new(virtual_address as *mut u8)?;
+        Some((physical as PhysAddr, pointer))
+    }
+
+    unsafe fn dma_dealloc(_address: PhysAddr, cpu: NonNull<u8>, pages: usize) {
+        global_allocator().dealloc_pages(cpu.as_ptr() as usize, pages, UsageKind::Dma);
     }
 }
 
@@ -67,6 +107,143 @@ static TALLY: ProbeTally = ProbeTally {
     matched: AtomicBool::new(false),
     reported: AtomicBool::new(false),
 };
+
+/// The driver's entry point: identify the function, bring it up, and -- when
+/// both worked -- build the NIC.
+///
+/// A function this driver recognises is always `Claimed`, even when it could
+/// not be driven: the driver has read and possibly programmed it, so no other
+/// driver may be offered it afterwards.
+pub(crate) fn probe_and_init(
+    root: &mut axdriver_pci::PciRoot,
+    bdf: axdriver_pci::DeviceFunction,
+    dev_info: &axdriver_pci::DeviceFunctionInfo,
+) -> crate::drivers::BusProbeResult {
+    match probe(root, bdf, dev_info) {
+        Some(Some(nic)) => {
+            crate::drivers::BusProbeResult::Device(crate::AxDeviceEnum::from_net(nic))
+        }
+        Some(None) => crate::drivers::BusProbeResult::Claimed,
+        None => crate::drivers::BusProbeResult::NotMatched,
+    }
+}
+
+/// Run the three phases for one function, if it is one of ours.
+///
+/// The return value is `None` for a function that is not this driver's,
+/// `Some(None)` for one that is but could not be driven, and `Some(Some(nic))`
+/// for one that is now a usable interface.
+fn probe(
+    root: &mut axdriver_pci::PciRoot,
+    bdf: axdriver_pci::DeviceFunction,
+    dev_info: &axdriver_pci::DeviceFunctionInfo,
+) -> Option<Option<IgcNic<IgcHalImpl, QUEUE_SIZE>>> {
+    TALLY.functions.fetch_add(1, Ordering::Relaxed);
+    let intel = dev_info.vendor_id == INTEL_VENDOR;
+    if intel {
+        TALLY.intel.fetch_add(1, Ordering::Relaxed);
+    }
+    let Some(device) = ids::identify(dev_info.vendor_id, dev_info.device_id) else {
+        // An Intel network function with a device id this driver does not bind
+        // is the most valuable line a machine without the assumed part can
+        // produce: it says what is actually there.
+        if intel && is_ethernet_class(dev_info.class, dev_info.subclass) {
+            TALLY.candidates.fetch_add(1, Ordering::Relaxed);
+            info!(
+                "{}",
+                igc::probe::candidate_line(&Candidate {
+                    bdf: alloc::format!("{bdf}"),
+                    vendor_id: dev_info.vendor_id,
+                    device_id: dev_info.device_id,
+                    class: dev_info.class,
+                    subclass: dev_info.subclass,
+                    revision: dev_info.revision,
+                })
+            );
+        }
+        return None;
+    };
+
+    let facts = config_facts(root, bdf, dev_info);
+    let bdf = facts.bdf.clone();
+    info!("igc: {}: {}", facts.bdf, facts.describe());
+
+    // Phase 1: identify.  A BAR that cannot hold the registers this driver
+    // names is not mapped at all: a probe does not find out what happens next
+    // by touching an aperture it has already decided it does not understand.
+    if !facts.bar0.holds_the_named_registers() {
+        warn!(
+            "igc: {bdf}: refusing to map BAR0 ({}); the driver needs at least {} bytes",
+            facts.bar0.describe(),
+            igc::regs::NAMED_SPAN,
+        );
+        let report = igc::probe::refusal(facts, device);
+        info!("{}", report.render());
+        note_match();
+        return Some(None);
+    }
+    // The direct map is addressed by `usize`; on x86_64 a BAR address always
+    // fits, and if it somehow does not, the aperture is not one this platform
+    // can reach.
+    let Ok(address) = usize::try_from(facts.bar0.address) else {
+        warn!(
+            "igc: {bdf}: BAR0 address {:#x} does not fit this platform's address size",
+            facts.bar0.address,
+        );
+        let report = igc::probe::refusal(facts, device);
+        info!("{}", report.render());
+        note_match();
+        return Some(None);
+    };
+    // SAFETY: the BAR is memory, assigned, and at least as large as the window
+    // this driver maps.  The platform's direct map covers the PCIe MMIO ranges
+    // the platform profile declares as device memory, which is the same
+    // mechanism the ixgbe driver uses for its own aperture.
+    let mut bus = unsafe {
+        WindowBus::<IgcHalImpl>::new(RegisterWindow::from_mapped(
+            phys_to_virt(address.into()).into(),
+            WINDOW_BYTES,
+        ))
+    };
+    let report = igc::probe::run(facts, device, &mut bus);
+    let identified = matches!(report.verdict, igc::probe::Verdict::Identified);
+    info!("{}", report.render());
+    note_match();
+    if !identified {
+        warn!(
+            "igc: {bdf}: not brought up: the identification did not confirm the device, so \
+             nothing was programmed"
+        );
+        return Some(None);
+    }
+
+    // Phase 2: bring the link up.  No packets yet, and the report says so.
+    let up = match igc::bringup::bring_up(&mut bus) {
+        Ok(up) => up,
+        Err(error) => {
+            warn!("igc: bring-up {bdf} failed: {}", error.describe());
+            return Some(None);
+        }
+    };
+    info!("{}", up.render(&bdf));
+
+    // Phase 3: take the device over.
+    let nic = match IgcNic::<IgcHalImpl, QUEUE_SIZE>::init(bus, &up.station) {
+        Ok(nic) => nic,
+        Err(error) => {
+            warn!(
+                "igc: {bdf}: the link is up but the descriptor rings could not be built: {error:?}"
+            );
+            return Some(None);
+        }
+    };
+    info!(
+        "igc: {bdf}: {QUEUE_SIZE} descriptors in each ring, station address {}; the interface is \
+         ready, it polls, and it takes no interrupts",
+        up.station.describe(),
+    );
+    Some(Some(nic))
+}
 
 /// Decode the configuration space of one function into the driver's facts.
 ///
@@ -149,107 +326,6 @@ fn config_facts(
     }
 }
 
-/// Run the identify-only probe for one function, if it is one of ours.
-///
-/// Returns the report when the function matched the device table, so the
-/// caller can decide what to do with the device; `None` means this function is
-/// not this driver's.
-pub(crate) fn probe(
-    root: &mut axdriver_pci::PciRoot,
-    bdf: axdriver_pci::DeviceFunction,
-    dev_info: &axdriver_pci::DeviceFunctionInfo,
-) -> Option<ProbeReport> {
-    TALLY.functions.fetch_add(1, Ordering::Relaxed);
-    let intel = dev_info.vendor_id == INTEL_VENDOR;
-    if intel {
-        TALLY.intel.fetch_add(1, Ordering::Relaxed);
-    }
-    let Some(device) = ids::identify(dev_info.vendor_id, dev_info.device_id) else {
-        // An Intel network function with a device id this driver does not
-        // bind is the most valuable line a machine without the assumed part
-        // can produce: it says what is actually there.
-        if intel && is_ethernet_class(dev_info.class, dev_info.subclass) {
-            TALLY.candidates.fetch_add(1, Ordering::Relaxed);
-            info!(
-                "{}",
-                igc::probe::candidate_line(&Candidate {
-                    bdf: alloc::format!("{bdf}"),
-                    vendor_id: dev_info.vendor_id,
-                    device_id: dev_info.device_id,
-                    class: dev_info.class,
-                    subclass: dev_info.subclass,
-                    revision: dev_info.revision,
-                })
-            );
-        }
-        return None;
-    };
-
-    let facts = config_facts(root, bdf, dev_info);
-    info!("igc: {}: {}", facts.bdf, facts.describe());
-    if !facts.bar0.holds_the_named_registers() {
-        // Report the refusal without touching the aperture at all: mapping a
-        // BAR that is unassigned or too small is not something a probe should
-        // do to find out what happens.
-        warn!(
-            "igc: {}: refusing to map BAR0 ({}); the driver needs at least {} bytes",
-            facts.bdf,
-            facts.bar0.describe(),
-            igc::regs::NAMED_SPAN,
-        );
-        let report = igc::probe::refusal(facts, device);
-        info!("{}", report.render());
-        note_match();
-        return Some(report);
-    }
-
-    // The direct map is addressed by `usize`; on x86_64 a BAR address always
-    // fits, and if it somehow does not, the aperture is not one this platform
-    // can reach and saying so is better than truncating it.
-    let Ok(address) = usize::try_from(facts.bar0.address) else {
-        warn!(
-            "igc: {}: BAR0 address {:#x} does not fit this platform's address size",
-            facts.bdf, facts.bar0.address,
-        );
-        let report = igc::probe::refusal(facts, device);
-        info!("{}", report.render());
-        note_match();
-        return Some(report);
-    };
-
-    // SAFETY: the BAR is memory, assigned, and at least as large as the window
-    // this driver maps.  The platform's direct map covers the PCIe MMIO ranges
-    // the platform profile declares as device memory, which is the same
-    // mechanism the ixgbe driver uses for its own aperture.
-    let mut bus = unsafe {
-        WindowBus::<IgcHalImpl>::new(RegisterWindow::from_mapped(
-            phys_to_virt(address.into()).into(),
-            WINDOW_BYTES,
-        ))
-    };
-    let bdf = facts.bdf.clone();
-    let report = igc::probe::run(facts, device, &mut bus);
-    let identified = matches!(report.verdict, igc::probe::Verdict::Identified);
-    info!("{}", report.render());
-
-    // Only a device the identification actually confirmed is programmed: a
-    // function whose registers contradict its device id is a function this
-    // driver does not understand well enough to reset.
-    if identified {
-        match igc::bringup::bring_up(&mut bus) {
-            Ok(up) => info!("{}", up.render(&bdf)),
-            Err(error) => warn!("igc: bring-up {bdf} failed: {}", error.describe()),
-        }
-    } else {
-        warn!(
-            "igc: {bdf}: not brought up: the identification did not confirm the device, so \
-             nothing was programmed"
-        );
-    }
-    note_match();
-    Some(report)
-}
-
 /// Print the verdict for a machine where nothing matched, once, at the end of
 /// the bus walk.
 ///
@@ -266,8 +342,8 @@ pub(crate) fn finish_probe(bus_end: u8) {
     if TALLY.matched.load(Ordering::Relaxed) {
         info!(
             "igc: bus walk: {functions} PCI functions answered on buses 0..={bus_end}, {intel} \
-             from Intel, at least one matching a device id this driver binds; the report above \
-             is what that device said about itself"
+             from Intel, at least one matching a device id this driver binds; the reports above \
+             are what those devices said about themselves"
         );
         return;
     }

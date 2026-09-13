@@ -411,17 +411,6 @@ impl AllDevices {
             }
             match config_pci_device(root, bdf, &mut allocator) {
                 Ok(_) => {
-                    // The igc identify-only probe runs here, in the walk,
-                    // rather than through the driver table, because it does
-                    // not own the device yet: it reads configuration space and
-                    // a few identification registers and reports what it
-                    // found, including the case where the machine does not
-                    // have the part at all.  The phase that programs the
-                    // device registers it as a real driver through
-                    // `for_each_drivers!` and removes this call.
-                    #[cfg(feature = "igc")]
-                    crate::igc::probe(root, bdf, dev_info);
-
                     #[cfg(feature = "usb-xhci")]
                     if dev_info.class == 0x0c
                         && dev_info.subclass == 0x03
@@ -497,9 +486,9 @@ impl AllDevices {
         #[cfg(feature = "usb-xhci")]
         for device in usb_devices { self.add_device(device); }
 
-        // The igc probe's negative case, printed once so that a machine
+        // The igc driver's negative case, printed once so that a machine
         // without the assumed part says so in one greppable line.
-        #[cfg(feature = "igc")]
+        #[cfg(net_dev = "igc")]
         crate::igc::finish_probe(axconfig::devices::PCI_BUS_END as u8);
     }
 }

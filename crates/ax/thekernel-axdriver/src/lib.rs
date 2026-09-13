@@ -87,7 +87,7 @@ mod virtio;
 #[cfg(feature = "usb-xhci")]
 mod usb;
 
-#[cfg(feature = "igc")]
+#[cfg(net_dev = "igc")]
 mod igc;
 
 #[cfg(feature = "ixgbe")]

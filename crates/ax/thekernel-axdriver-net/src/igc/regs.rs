@@ -501,6 +501,16 @@ pub const NAMED: &[Register] = &[
         "igc_regs.h:21 (IGC_TXPBS, \"Tx Packet Buffer Size - RW\"); written by igc_main.c:7098 \
          with I225_TXPBSIZE_DEFAULT (igc_defines.h:400)",
     ),
+    Register::read_write(
+        "IGC_RLPML",
+        0x05004,
+        Group::Receive,
+        Meaning::None,
+        "the longest frame the receive path will accept; the vendor driver sets it to the jumbo \
+         bound, and this driver sets it to the size of the buffers it gives the hardware",
+        "igc_regs.h:109 (IGC_RLPML, \"Rx Long Packet Max Length\"); written by igc_main.c:4013 \
+         igc_set_rx_mode, and cleared by igc_base.c igc_rx_fifo_flush_base",
+    ),
     Register::read_only(
         "IGC_RAL(0)",
         0x05400,
@@ -826,12 +836,42 @@ pub mod bits {
     /// `IGC_RCTL_SECRC` — strip the Ethernet CRC (`igc_defines.h:397`).
     pub const RCTL_SECRC: u32 = 0x0400_0000;
 
+    /// `MAX_JUMBO_FRAME_SIZE`, the value `igc_set_rx_mode` puts in `IGC_RLPML`
+    /// (`igc_defines.h:147`, `igc_main.c:3978`).
+    ///
+    /// This driver does not use it: its receive buffers are
+    /// [`super::desc::RX_BUFFER_BYTES`] bytes, and a receive bound larger than
+    /// the buffer a frame is written into is a bound the driver cannot honour.
+    pub const MAX_JUMBO_FRAME_SIZE: u32 = 0x2600;
+
     /// `IGC_RXD_STAT_DD` — descriptor done, in the receive descriptor's
     /// `status_error` word (`igc_defines.h:304`).
     pub const RXD_STAT_DD: u32 = 0x0000_0001;
     /// `IGC_RXD_STAT_EOP` — end of packet, in the same word
     /// (`igc_defines.h:366`).
     pub const RXD_STAT_EOP: u32 = 0x0000_0002;
+
+    /// `IGC_ADVTXD_DTYP_DATA` — an advanced data descriptor (`igc_base.h:45`).
+    pub const ADVTXD_DTYP_DATA: u32 = 0x0030_0000;
+    /// `IGC_ADVTXD_DCMD_EOP` — end of packet (`igc_base.h:46`).
+    pub const ADVTXD_DCMD_EOP: u32 = 0x0100_0000;
+    /// `IGC_ADVTXD_DCMD_IFCS` — insert the frame check sequence
+    /// (`igc_base.h:47`).
+    pub const ADVTXD_DCMD_IFCS: u32 = 0x0200_0000;
+    /// `IGC_ADVTXD_DCMD_RS` — report status (`igc_base.h:48`).
+    pub const ADVTXD_DCMD_RS: u32 = 0x0800_0000;
+    /// `IGC_ADVTXD_DCMD_DEXT` — the descriptor is an advanced one
+    /// (`igc_base.h:49`).
+    pub const ADVTXD_DCMD_DEXT: u32 = 0x2000_0000;
+    /// `IGC_ADVTXD_DCMD_VLE` — insert a VLAN tag (`igc_base.h:50`).
+    pub const ADVTXD_DCMD_VLE: u32 = 0x4000_0000;
+    /// `IGC_ADVTXD_DCMD_TSE` — TCP segmentation offload (`igc_base.h:51`).
+    pub const ADVTXD_DCMD_TSE: u32 = 0x8000_0000;
+    /// `IGC_ADVTXD_PAYLEN_SHIFT` (`igc_base.h:52`).
+    pub const ADVTXD_PAYLEN_SHIFT: u32 = 14;
+    /// `IGC_ADVTXD_MAC_TSTAMP` — take a timestamp for this packet
+    /// (`igc_base.h:36`).
+    pub const ADVTXD_MAC_TSTAMP: u32 = 0x0008_0000;
 
     /// `IGC_TXD_STAT_DD` — descriptor done, in the transmit descriptor's
     /// write-back `status` word (`igc_defines.h:315`).
@@ -1845,6 +1885,7 @@ mod tests {
             ("IGC_IMC", 0x0150c, Access::WriteOnly),
             ("IGC_RXPBS", 0x02404, Access::ReadWrite),
             ("IGC_TXPBS", 0x03404, Access::ReadWrite),
+            ("IGC_RLPML", 0x05004, Access::ReadWrite),
             ("IGC_RAL(0)", 0x05400, Access::ReadOnly),
             ("IGC_RAH(0)", 0x05404, Access::ReadOnly),
             ("IGC_RDBAL(0)", 0x0c000, Access::ReadWrite),
@@ -1897,6 +1938,7 @@ mod tests {
         assert_eq!(bits::RAH_ADDR_MASK, 0x0000_ffff); // :108
         assert_eq!(bits::RXPBSIZE_DEFAULT, 0x0000_00a2); // :399
         assert_eq!(bits::TXPBSIZE_DEFAULT, 0x0400_0014); // :400
+        assert_eq!(bits::MAX_JUMBO_FRAME_SIZE, 0x2600); // :147
         assert_eq!(bits::TCTL_EN, 0x0000_0002); // :330
         assert_eq!(bits::TCTL_PSP, 0x0000_0008); // :331
         assert_eq!(bits::TCTL_CT, 0x0000_0ff0); // :332
@@ -1916,6 +1958,15 @@ mod tests {
         assert_eq!(bits::RXD_STAT_DD, 0x0000_0001); // :304
         assert_eq!(bits::RXD_STAT_EOP, 0x0000_0002); // :366
         assert_eq!(bits::TXD_STAT_DD, 0x0000_0001); // :315
+        assert_eq!(bits::ADVTXD_MAC_TSTAMP, 0x0008_0000); // igc_base.h:36
+        assert_eq!(bits::ADVTXD_DTYP_DATA, 0x0030_0000); // igc_base.h:45
+        assert_eq!(bits::ADVTXD_DCMD_EOP, 0x0100_0000); // igc_base.h:46
+        assert_eq!(bits::ADVTXD_DCMD_IFCS, 0x0200_0000); // igc_base.h:47
+        assert_eq!(bits::ADVTXD_DCMD_RS, 0x0800_0000); // igc_base.h:48
+        assert_eq!(bits::ADVTXD_DCMD_DEXT, 0x2000_0000); // igc_base.h:49
+        assert_eq!(bits::ADVTXD_DCMD_VLE, 0x4000_0000); // igc_base.h:50
+        assert_eq!(bits::ADVTXD_DCMD_TSE, 0x8000_0000); // igc_base.h:51
+        assert_eq!(bits::ADVTXD_PAYLEN_SHIFT, 14); // igc_base.h:52
         assert_eq!(bits::TXD_POPTS_IXSM, 0x0000_0001); // :309
         assert_eq!(bits::TXD_POPTS_TXSM, 0x0000_0002); // :310
         assert_eq!(bits::MDIC_DATA_MASK, 0x0000_ffff); // :644

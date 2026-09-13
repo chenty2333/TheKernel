@@ -56,17 +56,24 @@
 //! i225 has, so far, been read zero times.
 
 pub mod bringup;
+pub mod desc;
 pub mod ids;
+pub mod nic;
 pub mod probe;
 pub mod regs;
 
 #[cfg(test)]
 pub(crate) mod fake;
 
-use core::{marker::PhantomData, time::Duration};
+use core::{marker::PhantomData, ptr::NonNull, time::Duration};
 
 pub use self::{
     bringup::{BringUp, BringUpError, LinkOutcome, StationAddress},
+    nic::IgcNic,
+    desc::{
+        BufferPool, DESCRIPTOR_BYTES, DescriptorMemory, MAX_FRAME_BYTES, RX_BUFFER_BYTES,
+        ReceivedFrame, RingError, RxRing, TxRing,
+    },
     ids::{DeviceId, Family, INTEL_VENDOR, identify},
     probe::{ConfigFacts, ProbeReport, Verdict},
     regs::{
@@ -74,6 +81,17 @@ pub use self::{
         RegisterWindow, Speed, WINDOW_BYTES, assemble_receive_address, named,
     },
 };
+
+/// A physical address as the device sees it.
+pub type PhysAddr = u64;
+
+/// The granularity of a DMA allocation.
+///
+/// The platform allocates DMA memory a page at a time -- `axalloc`'s
+/// `alloc_pages` is the primitive the virtio HAL uses for its own buffers --
+/// so the driver asks for whole pages and checks the alignment it gets rather
+/// than assuming one.
+pub const DMA_PAGE_BYTES: usize = 4096;
 
 /// What the driver needs from the platform it is running on.
 ///
@@ -88,6 +106,26 @@ pub trait IgcHal {
     /// vendor source it came from; a wait that expires is a reported failure,
     /// never a hang.
     fn busy_wait_us(micros: u32);
+
+    /// Allocate `pages` pages of DMA-coherent memory, zeroed.
+    ///
+    /// Returns the bus address the device uses and the CPU address the driver
+    /// uses, or `None`.  "Coherent" is the whole requirement: the device reads
+    /// what the driver wrote without an explicit flush, which is what the
+    /// x86_64 platform this kernel runs on gives for the memory the platform's
+    /// DMA allocator returns.  The memory must be at least page aligned, and a
+    /// caller that needs stronger alignment checks what it got.
+    fn dma_alloc(pages: usize) -> Option<(PhysAddr, NonNull<u8>)>;
+
+    /// Give a DMA allocation back.
+    ///
+    /// # Safety
+    ///
+    /// `address`, `cpu` and `pages` must be exactly what one call to
+    /// [`IgcHal::dma_alloc`] returned, and nothing may still be using the
+    /// memory -- in particular no descriptor ring may still be programmed to
+    /// point into it.
+    unsafe fn dma_dealloc(address: PhysAddr, cpu: NonNull<u8>, pages: usize);
 }
 
 /// Register access, as the driver's logic sees it.

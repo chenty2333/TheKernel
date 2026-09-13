@@ -90,6 +90,11 @@ macro_rules! for_each_drivers {
             type $drv_type = crate::drivers::RamDiskDriver;
             $code
         }
+        #[cfg(net_dev = "igc")]
+        {
+            type $drv_type = crate::drivers::IgcDriver;
+            $code
+        }
         #[cfg(net_dev = "ixgbe")]
         {
             type $drv_type = crate::drivers::IxgbeDriver;

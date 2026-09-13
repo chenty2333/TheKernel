@@ -1,4 +1,8 @@
-const NET_DEV_FEATURES: &[&str] = &["ixgbe", "virtio-net"];
+// Order matters for a non-`dyn` build: the first enabled entry wins, because
+// exactly one net device type can exist in the static configuration.  `igc`
+// is first so that a build which asks for it by name gets it, while a build
+// that only asks for `virtio-net` (the product default) never sees it.
+const NET_DEV_FEATURES: &[&str] = &["igc", "ixgbe", "virtio-net"];
 const BLOCK_DEV_FEATURES: &[&str] = &["ramdisk", "virtio-blk"];
 const DISPLAY_DEV_FEATURES: &[&str] = &["virtio-gpu"];
 const INPUT_DEV_FEATURES: &[&str] = &["virtio-input"];

@@ -30,9 +30,10 @@
 //! The types are `#[cfg(test)]` only: none of this exists in a kernel build.
 
 use alloc::{collections::BTreeMap, vec::Vec};
+use core::ptr::NonNull;
 
 use super::{
-    IgcBus, IgcHal,
+    IgcBus, IgcHal, PhysAddr,
     regs::{self, Register, Speed, bits, mii},
 };
 
@@ -71,6 +72,81 @@ impl FakeHal {
 impl IgcHal for FakeHal {
     fn busy_wait_us(micros: u32) {
         DELAYS.with(|delays| delays.borrow_mut().push(micros));
+    }
+
+    fn dma_alloc(pages: usize) -> Option<(PhysAddr, NonNull<u8>)> {
+        // The platform's page allocator returns page-aligned, zeroed memory;
+        // this fake asks the host allocator for the same thing.
+        let layout =
+            std::alloc::Layout::from_size_align((pages.max(1)) * super::DMA_PAGE_BYTES, super::DMA_PAGE_BYTES)
+                .ok()?;
+        // SAFETY: the layout has a non-zero size, and the allocation is
+        // recorded so that `dma_dealloc` can give it back with the same
+        // layout.
+        let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+        let pointer = NonNull::new(pointer)?;
+        ALLOCATIONS.with(|allocations| {
+            allocations
+                .borrow_mut()
+                .push((pointer.as_ptr() as usize, layout));
+        });
+        // The bus address is the CPU address: this fake has no IOMMU, which is
+        // exactly what the driver assumes of the platform either way.
+        Some((pointer.as_ptr() as PhysAddr, pointer))
+    }
+
+    unsafe fn dma_dealloc(_address: PhysAddr, cpu: NonNull<u8>, _pages: usize) {
+        let layout = ALLOCATIONS.with(|allocations| {
+            let mut allocations = allocations.borrow_mut();
+            let position = allocations
+                .iter()
+                .position(|(pointer, _)| *pointer == cpu.as_ptr() as usize);
+            position.map(|position| allocations.remove(position).1)
+        });
+        if let Some(layout) = layout {
+            // SAFETY: the pointer came from `alloc_zeroed` with exactly this
+            // layout, and it has been removed from the record so it cannot be
+            // freed twice.
+            unsafe { std::alloc::dealloc(cpu.as_ptr(), layout) };
+        }
+    }
+}
+
+std::thread_local! {
+    /// Every live DMA allocation on this thread, as `(address, layout)`, so a
+    /// test can both free them properly and play the device's side by writing
+    /// into them.
+    static ALLOCATIONS: std::cell::RefCell<Vec<(usize, std::alloc::Layout)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The test's view of the DMA memory the driver allocated.
+impl FakeHal {
+    /// How many allocations are live on this thread.
+    pub fn live_allocations() -> usize {
+        ALLOCATIONS.with(|allocations| allocations.borrow().len())
+    }
+
+    /// Forget the record of every live allocation, returning how many there
+    /// were.  A test that has dropped the driver uses this to check that the
+    /// driver gave everything back.
+    pub fn take_allocation_count() -> usize {
+        ALLOCATIONS.with(|allocations| {
+            let mut allocations = allocations.borrow_mut();
+            let count = allocations.len();
+            allocations.clear();
+            count
+        })
+    }
+
+    /// A pointer of `align`-aligned memory of an allocation exactly `size`
+    /// bytes long, for a test that wants to hand the driver memory it does not
+    /// own.
+    pub fn foreign_allocation(size: usize, align: usize) -> NonNull<u8> {
+        let layout = std::alloc::Layout::from_size_align(size.max(1), align.max(1)).unwrap();
+        // SAFETY: the layout is non-zero.
+        let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+        NonNull::new(pointer).expect("an allocation")
     }
 }
 
