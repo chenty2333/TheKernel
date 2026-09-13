@@ -14,7 +14,7 @@ mod ptrace;
 mod schedule;
 mod thread;
 mod uprobe;
-mod wait;
+pub(crate) mod wait;
 
 pub(crate) use self::perf::*;
 pub(crate) use self::uprobe::*;

@@ -1645,6 +1645,14 @@ impl CloneArgs {
         let published_task = publish_prepared_task(task_publication);
         debug_assert!(Arc::ptr_eq(&published_task, &task));
         drop(published_task);
+        // Diagnostic: pair this child's birth with the parent that will wait
+        // for it, so a `wait4` that later reports ECHILD can be checked against
+        // the child that was actually published.
+        crate::task::exit_status_trace_clone(
+            old_proc_data.proc.pid(),
+            caller_visible_tid,
+            child_exit_signal.map_or(0, |signo| signo as u32),
+        );
         thread_completion.finish();
         // Thread/vfork-style clones often rely on immediate child progress for
         // futex or parent/child tid handshakes. Plain fork children are seeded

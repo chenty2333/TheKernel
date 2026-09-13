@@ -1690,8 +1690,19 @@ impl<Z> Drop for ProcessExitAdmission<Z> {
 
 /// Allocation-free PID-ordered iterator over a [`ProcessRegistry`].
 ///
-/// Each lock acquisition clones at most one intrusive node. The initial
-/// membership count bounds the walk under concurrent fork and reap activity.
+/// Each lock acquisition clones at most one intrusive node. The visit budget
+/// starts at the membership count observed when the iterator was built, and is
+/// re-armed from the live count whenever it expires before the walk reaches the
+/// end of the tree.
+///
+/// Re-arming matters: consuming the budget is not by itself proof that the walk
+/// has seen every entry. A PID-ordered walk that loses its cursor (its last
+/// node was unlinked and the tree moved on) restarts from `after`, which is the
+/// highest PID it has already returned; every entry at or below that PID is
+/// behind it, but the budget spent on the way there is gone. If the budget then
+/// expires while entries remain above the cursor, a budget-limited walk returns
+/// `None` early and every consumer sees a silently truncated registry. That is
+/// exactly how `wait4` came to answer `ECHILD` for a child that existed.
 pub struct Processes<'a, Z> {
     registry: &'a ProcessRegistry<Z>,
     last: Option<Arc<Process<Z>>>,
@@ -1704,7 +1715,20 @@ impl<Z> Iterator for Processes<'_, Z> {
     type Item = Arc<Process<Z>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while !self.finished && self.remaining != 0 {
+        loop {
+            if self.remaining == 0 {
+                // The budget expired without the tree ending. Re-arm it from
+                // the live count: insertion raises `memberships` monotonically
+                // and removal lowers it, so a count above zero means the tree
+                // can still hold an entry above the cursor. The walk itself is
+                // strictly PID-increasing, so it terminates even if entries
+                // keep arriving while it runs.
+                let live = self.registry.membership_count();
+                if live == 0 {
+                    break;
+                }
+                self.remaining = live;
+            }
             let state = self.registry.state.lock();
             let next = if let Some(last) = self
                 .last
@@ -1730,7 +1754,7 @@ impl<Z> Iterator for Processes<'_, Z> {
                 self.finished = true;
                 break;
             };
-            self.remaining -= 1;
+            self.remaining = self.remaining.saturating_sub(1);
             self.after = Some(next.pid);
             let last = self.last.replace(next.clone());
             drop(last);
@@ -2595,6 +2619,51 @@ impl<Z> Iterator for ThreadIds<Z> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: an exhausted visit budget is not proof that the walk has
+    /// finished.
+    ///
+    /// `wait4` snapshots a process's children by walking the registry with this
+    /// iterator. When the budget expired while entries remained above the
+    /// cursor, the walk returned `None` early: the snapshot came back short,
+    /// `matching_wait_candidates` found no candidate for a child that existed,
+    /// and `wait4` answered `ECHILD` for it. The acceptance test then reported
+    /// `THEKERNEL_EXIT_STATUS_FAIL concurrent-clone-exit` (about 8.5% of
+    /// `--smp 4` invocations, 0/100 at `--smp 1`).
+    #[test]
+    fn registry_walk_completes_after_its_visit_budget_is_exhausted() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let init = domain.try_new_init(1, None).unwrap();
+        for pid in 2..=6 {
+            domain.prepare_fork(&init, pid, Some(17)).unwrap().commit();
+        }
+        let registry = domain.registry();
+        // The init plus the five children.
+        assert_eq!(registry.membership_count(), 6);
+
+        // A budget of zero is the pathological form of the race: the counter
+        // expired before the walk started. Every committed process must still
+        // be visited.
+        let exhausted = Processes {
+            registry,
+            last: None,
+            after: None,
+            remaining: 0,
+            finished: false,
+        };
+        assert_eq!(exhausted.count(), 6);
+
+        // The same for a budget that expires after the first entry: the walk
+        // must re-arm rather than truncate.
+        let partial = Processes {
+            registry,
+            last: None,
+            after: None,
+            remaining: 1,
+            finished: false,
+        };
+        assert_eq!(partial.count(), 6);
+    }
 
     #[test]
     fn bounded_counters_never_wrap_at_either_edge() {
