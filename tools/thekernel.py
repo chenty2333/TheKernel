@@ -36,7 +36,8 @@ from tools.qemu_runner import (
     RunnerError,
     run,
 )
-from tools.qemu_runner.model import QmpCheckpoint, QmpColorBlock, QmpControls
+from tools.qemu_runner.model import QmpCheckpoint, QmpColorBlock, QmpControls, QmpTextCells
+from tools.qemu_runner.process import measure_text_cells
 from tools.qemu_runner.runner import _validate_output_destinations
 from tools.qemu_runner.graphics_benchmark import (
     BENCHMARK_COMPLETE_MARKER,
@@ -415,6 +416,7 @@ class RunSpec:
     qmp_screenshot_after_marker: str | None = None
     qmp_screenshot_size: tuple[int, int] | None = None
     qmp_screenshot_color_blocks: tuple[QmpColorBlock, ...] = ()
+    qmp_screenshot_text_cells: QmpTextCells | None = None
     qmp_checkpoints: tuple[QmpCheckpoint, ...] = ()
     qmp_timeout_secs: float = 5.0
     graphics_width: int = 800
@@ -472,6 +474,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
             screenshot_after_marker=(None if spec.qmp_checkpoints else spec.qmp_screenshot_after_marker),
             screenshot_size=(None if spec.qmp_checkpoints else spec.qmp_screenshot_size),
             screenshot_color_blocks=( () if spec.qmp_checkpoints else spec.qmp_screenshot_color_blocks),
+            screenshot_text_cells=(None if spec.qmp_checkpoints else spec.qmp_screenshot_text_cells),
             checkpoints=spec.qmp_checkpoints,
             timeout_secs=spec.qmp_timeout_secs,
         )
@@ -730,6 +733,177 @@ def system_test_cmd(args: argparse.Namespace) -> int:
             run_cpus=run_cpus,
         ),
     )
+
+
+# The firmware framebuffer acceptance suite.
+#
+# The guest is the ordinary system-test image.  What makes this suite different
+# is the display: `firmware-fb` has no virtio-gpu at all, so the only surface
+# the kernel can draw on is the one the firmware's GOP left behind -- the same
+# configuration as the serial-less N305.  The kernel mirrors its own log ring
+# into that console, so the screen shows the boot log with no cooperation from
+# userspace, and a screendump of it is the whole acceptance condition.
+FBCON_PROFILE = "firmware-fb"
+# Exact, ANSI-stripped console lines: the QMP marker gate matches a whole line,
+# so the timeout suffix belongs to the marker.  `test_fbcon_marker_is_what_the_
+# guest_prints` proves this literal against the guest source on the host, before
+# a boot can burn a run discovering the same thing.
+FBCON_MARKER = "# THEKERNEL_TEST_BEGIN 1 mounts timeout_seconds=60"
+# `report_framebuffer` in crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs
+# prints the mode the kernel accepted from the Multiboot2 tag, on the raw early
+# diagnostic channel.  That channel is written before the log ring exists, so
+# unlike the later `info!` lines it is always complete in kernel.log even when
+# the run is stopped with SIGKILL; the ring-fed diagnostic drain lags the guest
+# and its tail is lost.  Reading the geometry from here is what ties the
+# screendump to the surface the kernel was handed: a screenshot of any other
+# device cannot match, and a declined or absent tag is a distinguishable,
+# quotable failure instead of a blank screen.
+FBCON_BOOT_FRAMEBUFFER_RE = re.compile(
+    r"MB2 framebuffer: addr=(?P<address>0x[0-9a-fA-F]+) "
+    r"(?P<width>\d+)x(?P<height>\d+) bpp=(?P<bpp>\d+) pitch=(?P<pitch>\d+)"
+)
+FBCON_BOOT_FRAMEBUFFER_ANY_RE = re.compile(r"MB2 framebuffer: .*")
+# The console is 8x16 cells of exact `0xd0d0d0` ink on exact black, cleared
+# before every repaint.  The floors sit well below what a screen of boot log
+# holds (measured on a real screendump: 14009 ink pixels across 926 cells, from
+# the 9 lines the console had painted at the first test marker) and well above
+# what a blank frame or a wrong-stride frame contains, which is the band this
+# oracle has to separate.
+FBCON_TEXT_CELLS = QmpTextCells(
+    cell_width=8,
+    cell_height=16,
+    ink=(0xD0, 0xD0, 0xD0),
+    background=(0, 0, 0),
+    min_ink_pixels=4096,
+    min_inked_cells=256,
+    # The font's own invariant, and the only rule here that sees a render which
+    # kept the console's exact colours but painted one pixel off.
+    require_clear_cell_borders=True,
+)
+
+
+def fbcon_artifacts(args: argparse.Namespace) -> Artifacts:
+    """Resolve the system artifacts for exactly the requested variant."""
+
+    artifacts = Artifacts(state_root(), parse_variant(args), "system")
+    if args.no_build and (not artifacts.kernel.is_file() or not artifacts.esp.is_file()):
+        # Artifact paths are keyed by memory size, so a kernel built at a
+        # different --memory is not "stale" here -- it is simply absent, and
+        # saying which size was wanted is the difference between a one-line fix
+        # and an afternoon.
+        raise ProductError(
+            f"fbcon suite has no {artifacts.variant.name} kernel and ESP to boot "
+            f"(missing: {artifacts.kernel if not artifacts.kernel.is_file() else artifacts.esp}); "
+            f"build them with the same memory size first: "
+            f"thekernel.py build --smp {args.smp} --memory {artifacts.variant.memory.lower()}"
+        )
+    return artifacts
+
+
+def fbcon_suite_cmd(args: argparse.Namespace) -> int:
+    """Boot the firmware framebuffer profile and assert its log reached the screen."""
+
+    if args.graphics_profile != FBCON_PROFILE:
+        raise ProductError(
+            f"the fbcon suite requires --graphics-profile {FBCON_PROFILE}: "
+            f"it asserts on a firmware framebuffer, and {args.graphics_profile} has none"
+        )
+    if not args.screenshot:
+        raise ProductError("the fbcon suite requires --screenshot OUT.ppm")
+    if args.profile != "system":
+        # The marker is the system guest's own KTAP output, so a shell guest
+        # would never print it and the failure would look like a dead screen.
+        raise ProductError(
+            f"the fbcon suite boots the system profile, whose KTAP output is the line it "
+            f"gates its screendump on; --profile {args.profile} does not print it"
+        )
+    artifacts = fbcon_artifacts(args)
+    run_cpus = resolve_run_cpus(args.smp, args.run_cpus)
+    if not args.no_build:
+        build_rootfs(artifacts)
+        build_kernel(artifacts)
+    screenshot = Path(args.screenshot).expanduser().resolve()
+    if screenshot.exists():
+        # A stale image would satisfy nothing here (the oracle would reject it)
+        # but it would hide which run produced the evidence.
+        screenshot.unlink()
+    runs = Path(args.workdir).expanduser().resolve() if args.workdir else state_root() / "runs"
+    validate_storage(runs)
+    runs.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix="fbcon-", dir=runs))
+    result = run_product(
+        artifacts,
+        RunSpec(
+            accel=args.accel,
+            timeout=args.timeout,
+            qemu_debug=getattr(args, "qemu_debug", None),
+            workdir=directory,
+            interactive=False,
+            graphics_profile=FBCON_PROFILE,
+            input_after_marker=None,
+            # The first KTAP case is the cheapest line that proves the guest
+            # reached userspace with the log mirror running; stopping there
+            # also keeps this suite clear of the unrelated `sysv-shm` flake.
+            stop_after_marker=FBCON_MARKER,
+            commands=None,
+            extra_block=None,
+            rootfs_transport="module",
+            run_cpus=run_cpus,
+            qmp_screenshot=screenshot,
+            qmp_screenshot_after_marker=FBCON_MARKER,
+            qmp_screenshot_text_cells=FBCON_TEXT_CELLS,
+            qmp_timeout_secs=args.timeout,
+        ),
+    )
+    if result:
+        return result
+    return _check_fbcon_run(directory, screenshot, artifacts)
+
+
+def _check_fbcon_run(directory: Path, screenshot: Path, artifacts: Artifacts) -> int:
+    """Assert the run's own logs and pixels agree with the acceptance condition."""
+
+    console = (directory / "console.log").read_text(encoding="utf-8", errors="replace").splitlines()
+    if FBCON_MARKER not in console:
+        # The QMP gate normally fails first, with the same literal line; this
+        # keeps the failure honest if the marker arrived after the screenshot.
+        raise ProductError(
+            f"fbcon suite never saw its marker line on the console: {FBCON_MARKER!r}; "
+            f"console={directory / 'console.log'}"
+        )
+    kernel_log = (directory / "kernel.log").read_text(encoding="utf-8", errors="replace")
+    accepted = FBCON_BOOT_FRAMEBUFFER_RE.search(kernel_log)
+    if accepted is None:
+        # A declined or absent tag is the likeliest reason a real machine shows
+        # nothing, so quote whichever verdict the kernel printed.
+        verdict = FBCON_BOOT_FRAMEBUFFER_ANY_RE.search(kernel_log)
+        detail = (f"the kernel printed {verdict.group(0).strip()!r}" if verdict is not None else
+                  f"the kernel printed no framebuffer report; expected a line matching "
+                  f"{FBCON_BOOT_FRAMEBUFFER_RE.pattern!r}")
+        raise ProductError(
+            f"fbcon suite booted {artifacts.variant.name} without a usable firmware "
+            f"framebuffer: {detail}; kernel log={directory / 'kernel.log'}"
+        )
+    width, height, bpp, pitch = (int(accepted[name]) for name in ("width", "height", "bpp", "pitch"))
+    measured = measure_text_cells(screenshot, FBCON_TEXT_CELLS)
+    geometry = (measured.columns * FBCON_TEXT_CELLS.cell_width,
+                measured.rows * FBCON_TEXT_CELLS.cell_height)
+    if geometry != (width, height):
+        raise ProductError(
+            f"fbcon screendump is not the surface the kernel reported: the kernel accepted "
+            f"{width}x{height} but {screenshot} is {geometry[0]}x{geometry[1]}"
+        )
+    if pitch < width * bpp // 8:
+        raise ProductError(
+            f"kernel reported an unusable firmware framebuffer: {width}x{height} at {bpp} bpp "
+            f"needs at least {width * bpp // 8} bytes per line, not {pitch}"
+        )
+    print(
+        f"fbcon: {accepted.group(0).strip()}\n"
+        f"fbcon: screendump {screenshot} holds {measured.summary()}",
+        file=sys.stderr,
+    )
+    return 0
 
 
 @dataclass(frozen=True)
@@ -1254,6 +1428,10 @@ def host_test_cmd() -> int:
 
 
 def test_cmd(args: argparse.Namespace) -> int:
+    # `fbcon` is deliberately not part of `all`: it asserts on a firmware
+    # framebuffer and therefore fixes the graphics profile and the screenshot
+    # path, which the other suites select independently.  Run it as
+    # `test --suite fbcon --graphics-profile firmware-fb --screenshot OUT.ppm`.
     suites = ("host", "guest", "abi", "graphics", "cpu") if args.suite == "all" else (args.suite,)
     for suite in suites:
         if suite == "host":
@@ -1271,6 +1449,10 @@ def test_cmd(args: argparse.Namespace) -> int:
             if not args.rootfs or not args.screenshot:
                 raise ProductError("graphics suite requires --rootfs and --screenshot")
             result = graphics_smoke_cmd(args)
+            if result:
+                return result
+        elif suite == "fbcon":
+            result = fbcon_suite_cmd(args)
             if result:
                 return result
         elif suite == "cpu":
@@ -1585,7 +1767,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     test = sub.add_parser("test", help="run a checked host or guest suite")
     add_graphics_smoke_arguments(test)
-    test.add_argument("--suite", choices=("host", "guest", "abi", "graphics", "cpu", "all"), required=True)
+    test.add_argument(
+        "--suite",
+        choices=("host", "guest", "abi", "graphics", "cpu", "fbcon", "all"),
+        required=True,
+    )
     test.add_argument("--run-cpus", type=int)
     test.add_argument("--allow-skip", action="store_true")
     test.add_argument("--qemu-debug", help="QEMU -d categories; write workdir/qemu-debug.log")
