@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
@@ -36,7 +37,14 @@ from tools.qemu_runner import (
     RunnerError,
     run,
 )
-from tools.qemu_runner.model import QmpCheckpoint, QmpColorBlock, QmpControls, QmpTextCells
+from tools.qemu_runner.console_font import ConsoleFont
+from tools.qemu_runner.model import (
+    QmpCheckpoint,
+    QmpColorBlock,
+    QmpConsoleLine,
+    QmpControls,
+    QmpTextCells,
+)
 from tools.qemu_runner.process import measure_text_cells
 from tools.qemu_runner.runner import _validate_output_destinations
 from tools.qemu_runner.graphics_benchmark import (
@@ -782,6 +790,33 @@ FBCON_TEXT_CELLS = QmpTextCells(
 )
 
 
+def fbcon_readable_lines() -> tuple[QmpConsoleLine, ...]:
+    """The lines that must be readable on the firmware framebuffer.
+
+    Two of them are the guest's own userspace output and one is the kernel log
+    mirror, which is the split that matters: the mirror proves the kernel's log
+    reached a serial-less screen, and the KTAP lines prove the ordinary console
+    write path did too.  The gate line is asserted as well as gated on, so the
+    suite proves the console presented the very bytes whose arrival on the
+    serial stream triggered the screendump.
+
+    The font comes from the kernel's generated table, so these expectations are
+    rendered exactly as the console renders them and follow it if it changes.
+    """
+
+    font = ConsoleFont.load()
+    return (
+        QmpConsoleLine("guest userspace: KTAP banner", font.cells("KTAP version 1")),
+        QmpConsoleLine("guest userspace: the gated marker line",
+                       font.cells("# THEKERNEL_TEST_BEGIN 1 mounts")),
+        QmpConsoleLine("kernel log mirror: task entry", font.cells("Enter user space: ip=0x")),
+    )
+
+
+def fbcon_text_cells() -> QmpTextCells:
+    return dataclasses.replace(FBCON_TEXT_CELLS, expected_lines=fbcon_readable_lines())
+
+
 def fbcon_artifacts(args: argparse.Namespace) -> Artifacts:
     """Resolve the system artifacts for exactly the requested variant."""
 
@@ -851,7 +886,7 @@ def fbcon_suite_cmd(args: argparse.Namespace) -> int:
             run_cpus=run_cpus,
             qmp_screenshot=screenshot,
             qmp_screenshot_after_marker=FBCON_MARKER,
-            qmp_screenshot_text_cells=FBCON_TEXT_CELLS,
+            qmp_screenshot_text_cells=fbcon_text_cells(),
             qmp_timeout_secs=args.timeout,
         ),
     )
@@ -885,9 +920,9 @@ def _check_fbcon_run(directory: Path, screenshot: Path, artifacts: Artifacts) ->
             f"framebuffer: {detail}; kernel log={directory / 'kernel.log'}"
         )
     width, height, bpp, pitch = (int(accepted[name]) for name in ("width", "height", "bpp", "pitch"))
-    measured = measure_text_cells(screenshot, FBCON_TEXT_CELLS)
-    geometry = (measured.columns * FBCON_TEXT_CELLS.cell_width,
-                measured.rows * FBCON_TEXT_CELLS.cell_height)
+    cells = fbcon_text_cells()
+    measured = measure_text_cells(screenshot, cells)
+    geometry = (measured.columns * cells.cell_width, measured.rows * cells.cell_height)
     if geometry != (width, height):
         raise ProductError(
             f"fbcon screendump is not the surface the kernel reported: the kernel accepted "
@@ -898,9 +933,11 @@ def _check_fbcon_run(directory: Path, screenshot: Path, artifacts: Artifacts) ->
             f"kernel reported an unusable firmware framebuffer: {width}x{height} at {bpp} bpp "
             f"needs at least {width * bpp // 8} bytes per line, not {pitch}"
         )
+    readable = ", ".join(repr(line.label) for line in cells.expected_lines)
     print(
         f"fbcon: {accepted.group(0).strip()}\n"
-        f"fbcon: screendump {screenshot} holds {measured.summary()}",
+        f"fbcon: screendump {screenshot} holds {measured.summary()}\n"
+        f"fbcon: readable on screen: {readable}",
         file=sys.stderr,
     )
     return 0

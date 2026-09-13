@@ -82,6 +82,21 @@ class QmpColorBlock:
 
 
 @dataclass(frozen=True)
+class QmpConsoleLine:
+    """One line of console text expected to be readable in a screendump.
+
+    ``cells`` holds one cell bitmap per character, rendered from the console's
+    own font (``tools/qemu_runner/console_font.py``).  Matching bitmaps instead
+    of a string keeps the assertion about pixels -- these characters, on this
+    cell grid -- and lets a font change move both sides together instead of
+    silently invalidating the expectation.
+    """
+
+    label: str
+    cells: tuple[tuple[int, ...], ...]
+
+
+@dataclass(frozen=True)
 class QmpTextCells:
     """A structural ink expectation for one QMP ``screendump`` PPM image.
 
@@ -127,6 +142,13 @@ class QmpTextCells:
     # exact and still paint text a pixel off -- which no colour rule can see.
     # Off by default: it is a property of this console, not of text in general.
     require_clear_cell_borders: bool = False
+    # Whole console lines that must be readable somewhere on the grid.  This is
+    # what turns "there is ink" into "the kernel's log and the guest's own
+    # output are on the screen": a caller gating a screendump on a serial
+    # marker knows the guest has *written* the line, and this asserts the
+    # console actually presented it.  A console that records cells and defers
+    # the repaint is one frame behind, so a miss is retried, not fatal.
+    expected_lines: tuple["QmpConsoleLine", ...] = ()
 
 
 @dataclass(frozen=True)

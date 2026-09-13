@@ -17,7 +17,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from tests.support import load_script_module, repo_root, test_tmpdir
-from tools.qemu_runner.model import QmpCheckpoint, QmpTextCells
+from tools.qemu_runner.console_font import ConsoleFont, ConsoleFontError
+from tools.qemu_runner.model import QmpCheckpoint, QmpConsoleLine, QmpTextCells
 from tools.qemu_runner.process import (
     ProcessError,
     TextGridInk,
@@ -59,6 +60,23 @@ def ppm(width: int, height: int, pixels: bytes) -> bytes:
 
 def blank(width: int, height: int, colour: tuple[int, int, int] = BACKGROUND) -> bytearray:
     return bytearray(bytes(colour) * (width * height))
+
+
+FONT = ConsoleFont.load()
+
+
+def put_text(image: bytearray, width: int, column: int, row: int, text: str,
+             cell_width: int = 8, cell_height: int = 16) -> None:
+    """Draw a line with the console's own font, one character per cell."""
+
+    for index, character in enumerate(text):
+        rows = FONT.cell(character)
+        for dy, bits in enumerate(rows):
+            for dx in range(8):
+                if bits & (0x80 >> dx):
+                    x = (column + index) * cell_width + dx
+                    offset = ((row * cell_height + dy) * width + x) * 3
+                    image[offset : offset + 3] = bytes(INK)
 
 
 def put_glyph(image: bytearray, width: int, column: int, row: int,
@@ -327,6 +345,99 @@ class TextCellOracleTests(unittest.TestCase):
                 checkpoints=(QmpCheckpoint(input_after_marker="READY",
                                            screenshot_text_cells=QmpTextCells()),),
             )
+
+
+class ConsoleFontTests(unittest.TestCase):
+    """The font the oracle renders expectations with is the kernel's own."""
+
+    def test_loads_the_generated_table_the_console_draws_with(self) -> None:
+        self.assertEqual((FONT.width, FONT.height), (8, 16))
+        self.assertEqual(FONT.first_byte, 0x20)
+        self.assertEqual(len(FONT.glyphs), 95)
+        # A glyph is a bitmap, not a blank: 'A' has ink, and it keeps the cell
+        # border clear exactly as the kernel's font tests require.
+        rows = FONT.cell("A")
+        self.assertTrue(any(rows))
+        self.assertEqual(rows[0], 0)
+        self.assertEqual(rows[15], 0)
+        self.assertTrue(all(row & 1 == 0 for row in rows))
+
+    def test_rejects_a_file_that_is_not_the_font_table(self) -> None:
+        with test_tmpdir() as directory:
+            path = Path(directory) / "not-a-font.rs"
+            path.write_text("fn main() {}\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConsoleFontError, "not the generated console font table"):
+                ConsoleFont.load(path)
+
+    def test_rejects_a_character_outside_the_table(self) -> None:
+        with self.assertRaisesRegex(ConsoleFontError, "outside the console font's range"):
+            FONT.cell("\u00e9")
+
+
+class ExpectedTextTests(unittest.TestCase):
+    """Expected console lines: found where they were drawn, missing otherwise."""
+
+    def cells(self, *labels: str) -> QmpTextCells:
+        return QmpTextCells(
+            min_ink_pixels=1,
+            min_inked_cells=1,
+            expected_lines=tuple(QmpConsoleLine(label, FONT.cells(label)) for label in labels),
+        )
+
+    def test_finds_a_line_the_console_drew(self) -> None:
+        width, height, image = console(40, 3, inked_cells=0)
+        put_text(image, width, 0, 2, "ok 1 - mounts")
+        put_text(image, width, 0, 0, "KTAP version 1")
+        with test_tmpdir() as directory:
+            path = write_ppm(Path(directory), "lines.ppm", ppm(width, height, bytes(image)))
+            measured = measure_text_cells(path, self.cells("ok 1 - mounts", "KTAP version 1"))
+            self.assertEqual(measured.missing_lines, ())
+            _validate_ppm(path, None, (), self.cells("ok 1 - mounts"))
+
+    def test_reports_a_line_the_console_never_drew(self) -> None:
+        """A frame one repaint behind is a retry, and says what was missing."""
+
+        width, height, image = console(40, 3, inked_cells=0)
+        put_text(image, width, 0, 2, "KTAP version 1")
+        with test_tmpdir() as directory:
+            path = write_ppm(Path(directory), "early.ppm", ppm(width, height, bytes(image)))
+            cells = self.cells("KTAP version 1", "ok 1 - mounts")
+            measured = measure_text_cells(path, cells)
+            self.assertEqual(measured.missing_lines, ("ok 1 - mounts",))
+            with self.assertRaisesRegex(_ScreenshotColorMismatch,
+                                        "does not show the expected console text"):
+                _validate_ppm(path, None, (), cells)
+            # The same frame passes once the line the console was still
+            # painting arrives, which is what the controller's poll does.
+            put_text(image, width, 0, 1, "ok 1 - mounts")
+            write_ppm(Path(directory), "late.ppm", ppm(width, height, bytes(image)))
+            _validate_ppm(Path(directory) / "late.ppm", None, (), cells)
+
+    def test_a_line_must_match_cell_for_cell(self) -> None:
+        """Ink in the right place is not enough: the characters must match."""
+
+        width, height, image = console(40, 3, inked_cells=0)
+        put_text(image, width, 0, 2, "ok 1 - mountz")
+        with test_tmpdir() as directory:
+            path = write_ppm(Path(directory), "wrong.ppm", ppm(width, height, bytes(image)))
+            measured = measure_text_cells(path, self.cells("ok 1 - mounts"))
+            self.assertEqual(measured.missing_lines, ("ok 1 - mounts",))
+
+    def test_a_line_split_across_rows_does_not_match(self) -> None:
+        width, height, image = console(40, 3, inked_cells=0)
+        put_text(image, width, 0, 2, "ok 1 - mou")
+        put_text(image, width, 0, 1, "nts")
+        with test_tmpdir() as directory:
+            path = write_ppm(Path(directory), "wrapped.ppm", ppm(width, height, bytes(image)))
+            measured = measure_text_cells(path, self.cells("ok 1 - mounts"))
+            self.assertEqual(measured.missing_lines, ("ok 1 - mounts",))
+
+    def test_expectation_shape_is_validated(self) -> None:
+        with self.assertRaisesRegex(ProcessError, "needs a label and cells"):
+            _validate_text_cells(QmpTextCells(expected_lines=(QmpConsoleLine("x", ()),)))
+        with self.assertRaisesRegex(ProcessError, "rows, not the grid's 16"):
+            _validate_text_cells(QmpTextCells(
+                expected_lines=(QmpConsoleLine("x", ((0,) * 15,)),)))
 
 
 if __name__ == "__main__":

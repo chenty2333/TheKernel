@@ -58,6 +58,24 @@ class FbconSuiteContractTests(unittest.TestCase):
             self.module.FBCON_MARKER,
         ))
 
+    def test_suite_asserts_rendered_text_not_just_ink(self) -> None:
+        """The acceptance evidence is readable lines, userspace and kernel."""
+
+        module = self.module
+        from tools.qemu_runner.console_font import ConsoleFont
+
+        font = ConsoleFont.load()
+        lines = {line.label: line.cells for line in module.fbcon_readable_lines()}
+        userspace = [label for label in lines if label.startswith("guest userspace")]
+        self.assertEqual(len(userspace), 2, lines.keys())
+        # The marker it gates on must be one of the lines it proves is drawn.
+        gated = font.cells(module.FBCON_MARKER.split(" timeout_seconds=")[0])
+        self.assertIn(gated, lines.values())
+        self.assertIn("kernel log mirror", " ".join(lines))
+        cells = module.fbcon_text_cells()
+        self.assertEqual(len(cells.expected_lines), len(lines))
+        self.assertTrue(cells.require_clear_cell_borders)
+
     def test_fbcon_suite_boots_the_firmware_profile_without_a_build(self) -> None:
         """The suite's run must be the serial-less configuration, not a rebuild."""
 
@@ -88,7 +106,8 @@ class FbconSuiteContractTests(unittest.TestCase):
         self.assertEqual(spec.graphics_profile, "firmware-fb")
         self.assertEqual(spec.stop_after_marker, module.FBCON_MARKER)
         self.assertEqual(spec.qmp_screenshot_after_marker, module.FBCON_MARKER)
-        self.assertEqual(spec.qmp_screenshot_text_cells, module.FBCON_TEXT_CELLS)
+        self.assertEqual(spec.qmp_screenshot_text_cells, module.fbcon_text_cells())
+        self.assertTrue(spec.qmp_screenshot_text_cells.expected_lines)
         self.assertIsNone(spec.qmp_screenshot_size)
 
     def test_fbcon_suite_refuses_a_display_it_cannot_assert_on(self) -> None:
@@ -192,6 +211,32 @@ class FbconAcceptanceCheckTests(unittest.TestCase):
             with self.assertRaisesRegex(self.module.ProductError, "unusable firmware framebuffer"):
                 self.run_check(Path(temporary), console_lines=[self.module.FBCON_MARKER],
                                kernel_lines=["MB2 framebuffer: addr=0x80000000 128x32 bpp=32 pitch=8"])
+
+
+class FbconVerificationStageTests(unittest.TestCase):
+    """The daily tier boots the profile this suite asserts on."""
+
+    def test_daily_tier_boots_the_firmware_framebuffer_from_the_build_stage(self) -> None:
+        from tools import verification
+
+        stages = verification.plan("daily", Path("/home/build"))
+        names = [stage.name for stage in stages]
+        self.assertIn("firmware-fbcon", names)
+        stage = stages[names.index("firmware-fbcon")]
+        command = stage.command
+        self.assertIn("fbcon", command)
+        self.assertIn("firmware-fb", command)
+        self.assertIn("--screenshot", command)
+        self.assertIn("--no-build", command)
+        # The stage boots what `build` produced, and artifact paths are keyed
+        # by memory size: a different size here would boot nothing at all.
+        build = stages[names.index("build")]
+        self.assertEqual(command[command.index("--memory") + 1],
+                         build.command[build.command.index("--memory") + 1])
+        self.assertLess(names.index("build"), names.index("firmware-fbcon"))
+        # The suite's own timeout is a wall clock the stage must outlive.
+        self.assertLessEqual(int(command[command.index("--timeout") + 1]), stage.timeout)
+        self.assertLessEqual(stage.timeout, 300)
 
 
 if __name__ == "__main__":

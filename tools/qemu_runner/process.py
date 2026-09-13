@@ -24,6 +24,7 @@ from .model import (
     Interaction,
     QmpColorBlock,
     QmpCheckpoint,
+    QmpConsoleLine,
     QmpPciHotplug,
     QmpTextCells,
     RunLimits,
@@ -75,6 +76,15 @@ def _validate_text_cells(cells: QmpTextCells) -> None:
         raise ProcessError("QMP screenshot text grid ink floors must be positive")
     if cells.max_foreign_pixels < 0:
         raise ProcessError("QMP screenshot text grid foreign-pixel budget must be non-negative")
+    for line in cells.expected_lines:
+        if not line.label or not line.cells:
+            raise ProcessError("QMP screenshot expected console line needs a label and cells")
+        for cell in line.cells:
+            if len(cell) != cells.cell_height:
+                raise ProcessError(
+                    f"QMP screenshot expected console line {line.label!r} has a cell of "
+                    f"{len(cell)} rows, not the grid's {cells.cell_height}"
+                )
 
 
 def _read_ppm(screenshot: Path) -> tuple[int, int, bytes]:
@@ -162,6 +172,7 @@ class TextGridInk:
     foreign_pixels: int
     outside_ink_pixels: int
     border_ink_pixels: int = 0
+    missing_lines: tuple[str, ...] = ()
     # First offending pixel of each class, for a failure message a reader can
     # act on without opening the image.
     first_foreign: tuple[int, int] | None = None
@@ -252,6 +263,27 @@ def _measure_text_grid(
     scan(cells.x + grid_width, width, cells.y, min(cells.y + grid_height, height))
     scan(0, width, min(cells.y + grid_height, height), height)
 
+    # A line is a run of consecutive cells.  The console draws one byte per
+    # cell from a font this test shares with it, so a line that was presented
+    # matches cell for cell -- and searching from the last rows up finds the
+    # newest text first, which is where a line the guest just wrote lands.
+    missing: list[str] = []
+    for line in cells.expected_lines:
+        width_cells = len(line.cells)
+        found = False
+        for row in range(rows - 1, -1, -1):
+            if found:
+                break
+            for column in range(0, columns - width_cells + 1):
+                if all(
+                    _cell_rows(pixels, width, cells, row, column + offset) == line.cells[offset]
+                    for offset in range(width_cells)
+                ):
+                    found = True
+                    break
+        if not found:
+            missing.append(line.label)
+
     return TextGridInk(
         columns,
         rows,
@@ -260,10 +292,32 @@ def _measure_text_grid(
         foreign_pixels,
         outside_ink,
         border_ink_pixels,
+        tuple(missing),
         first_foreign,
         first_outside,
         first_border,
     )
+
+
+def _cell_rows(
+    pixels: bytes,
+    width: int,
+    cells: QmpTextCells,
+    row: int,
+    column: int,
+) -> tuple[int, ...]:
+    """One cell's 16 row bytes, in the font's bit order (MSB is leftmost)."""
+
+    rows = []
+    for dy in range(cells.cell_height):
+        y = cells.y + row * cells.cell_height + dy
+        bits = 0
+        for dx in range(cells.cell_width):
+            offset = (y * width + cells.x + column * cells.cell_width + dx) * 3
+            if pixels[offset : offset + 3] == bytes(cells.ink):
+                bits |= 0x80 >> dx
+        rows.append(bits)
+    return tuple(rows)
 
 
 def _validate_text_grid(
@@ -282,6 +336,12 @@ def _validate_text_grid(
     """
 
     measured = _measure_text_grid(pixels, width, height, cells)
+    if measured.missing_lines:
+        raise _ScreenshotColorMismatch(
+            f"QMP screendump does not show the expected console text: "
+            f"{', '.join(repr(label) for label in measured.missing_lines)} "
+            f"({measured.summary()})"
+        )
     if measured.outside_ink_pixels:
         assert measured.first_outside is not None
         raise _ScreenshotColorMismatch(
