@@ -396,16 +396,22 @@ pub(crate) const PIPEDSL_LINE_MASK: u32 = 0xf_ffff;
 /// How many times `PIPEDSL` is read before the scanline check gives up on it.
 ///
 /// Section 11 step 6.1 asks for two reads "a few milliseconds apart".  Four
-/// samples at [`SCANLINE_INTERVAL_MICROS`] each cost three milliseconds and make
-/// the check immune to the one way two reads can agree by accident: a sample
-/// taken exactly one frame apart, which a fixed two-read check would call a
-/// stopped pipe.
+/// samples at [`SCANLINE_INTERVAL_MICROS`] cost three intervals and make the
+/// check immune to the one way two reads can agree by accident: a second read
+/// that lands on the same line as the first -- at 1080p60 a line is 14.9
+/// microseconds and the counter has 1125 values, so a fixed two-read check
+/// would call a perfectly good pipe stopped once in a few hundred boots.  The
+/// samples' timestamps are kept as well, so the same four reads also produce
+/// the line rate section 12.3 asks for.
 pub(crate) const SCANLINE_SAMPLES: usize = 4;
 
 /// The gap between two `PIPEDSL` samples.
 ///
 /// At 1080p60 a whole line is 14.9 microseconds, so a millisecond is 67 lines
-/// and several frames pass across the four samples.  The reference's "a few
+/// and every interval moves the counter by tens of lines.  The four samples
+/// span three intervals -- about 3 ms, which is **less than one 1080p60 frame**
+/// (16.7 ms) -- so this is not a frame count and could not be one; it is a line
+/// rate, which is what section 12.3 asks for.  The reference's "a few
 /// milliseconds" is the outer bound this sits inside.
 pub(crate) const SCANLINE_INTERVAL_MICROS: u64 = 1_000;
 
@@ -1629,11 +1635,54 @@ pub(crate) fn program(regs: &impl Registers, plan: &PipeProgram) -> Result<PipeS
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScanlineCheck {
     /// At least two of the samples differed, so the pipe is counting lines.
-    Scanning { samples: [u32; SCANLINE_SAMPLES] },
+    ///
+    /// The samples carry their timestamps as well as their line counts, so the
+    /// verdict can report the line rate it observed and not only the fact that
+    /// the counter moved.  Section 12.3 calls `PIPEDSL` sampled over time "the
+    /// only way to verify your PLL arithmetic against reality without a
+    /// scope"; a verdict that discarded the timestamps threw that measurement
+    /// away.
+    Scanning {
+        samples: [ScanlineSample; SCANLINE_SAMPLES],
+    },
     /// Every sample was identical: the pipe is not scanning.
-    NotScanning { samples: [u32; SCANLINE_SAMPLES] },
+    NotScanning {
+        samples: [ScanlineSample; SCANLINE_SAMPLES],
+    },
     /// `PIPEDSL` could not be read at all.
     Unreadable { register: &'static str },
+}
+
+/// One `PIPEDSL` reading: the line the pipe was on, and when that was read.
+///
+/// Both fields are raw: `line` is `PIPEDSL`'s `LINE[19:0]` and `micros` is the
+/// timer's reading, so the difference between two samples is the only thing
+/// with a meaning and [`ScanlineCheck`] is where the arithmetic over them
+/// lives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScanlineSample {
+    /// `PIPEDSL`'s `LINE[19:0]`.
+    pub(crate) line: u32,
+    /// The timer's reading when the register was read, in microseconds.
+    pub(crate) micros: u64,
+}
+
+impl ScanlineSample {
+    /// The lines between this sample and `next`, signed: negative means the
+    /// counter went backwards, which is what a frame wrap looks like from
+    /// inside one sampling window.
+    pub(crate) const fn line_delta(self, next: Self) -> i64 {
+        (next.line as i64) - (self.line as i64)
+    }
+
+    /// How long after this sample `next` was taken, in microseconds.
+    ///
+    /// Saturating rather than wrapping: a timer that went backwards is a
+    /// broken timer, and the interval it produces is one no rate should be
+    /// computed from.
+    pub(crate) const fn micros_delta(self, next: Self) -> u64 {
+        next.micros.saturating_sub(self.micros)
+    }
 }
 
 impl ScanlineCheck {
@@ -1641,22 +1690,78 @@ impl ScanlineCheck {
         matches!(self, Self::Scanning { .. })
     }
 
+    /// Every interval between consecutive samples, as `(line delta, micros)`.
+    ///
+    /// Three entries for four samples, in order.  This is what the log renders,
+    /// and it is here rather than in the log because it is also the raw
+    /// material of [`Self::observed_lines_per_second`].
+    pub(crate) fn intervals(self) -> [(i64, u64); SCANLINE_SAMPLES - 1] {
+        let mut out = [(0i64, 0u64); SCANLINE_SAMPLES - 1];
+        match self {
+            Self::Scanning { samples } | Self::NotScanning { samples } => {
+                for (index, pair) in samples.windows(2).enumerate() {
+                    out[index] = (pair[0].line_delta(pair[1]), pair[0].micros_delta(pair[1]));
+                }
+            }
+            Self::Unreadable { .. } => {}
+        }
+        out
+    }
+
+    /// The line rate the samples measured, in lines per second, or `None` when
+    /// they cannot give one.
+    ///
+    /// A rate over the intervals that moved forward and took time: an interval
+    /// whose counter did not move is not a measurement of zero lines per
+    /// second, it is not a measurement, and one that went backwards is a frame
+    /// wrap or a counter that is not counting.  `None` therefore means "no
+    /// measurement", never "zero", and it is what a timer that does not advance
+    /// produces.
+    ///
+    /// This is section 12.3's observation: the delta over a known interval
+    /// gives the line rate, and the line rate is the pixel clock divided by the
+    /// line total -- 67.5 klines/s at 148.5 MHz over 2200 pixels.  The number
+    /// reported here is measured, not derived; comparing it with the mode is
+    /// the reader's step, and the boot log prints both.
+    pub(crate) fn observed_lines_per_second(self) -> Option<u32> {
+        let mut lines = 0u64;
+        let mut micros = 0u64;
+        for (delta, span) in self.intervals() {
+            if delta > 0 && span > 0 {
+                lines += delta as u64;
+                micros += span;
+            }
+        }
+        if micros == 0 || lines == 0 {
+            return None;
+        }
+        u32::try_from(lines * 1_000_000 / micros).ok()
+    }
+
     /// What to do about it, in the reference's own terms.
     pub(crate) fn describe(self) -> String {
         match self {
             Self::Scanning { samples } => format!(
-                "PIPEDSL sampled {} times over {} ms and changed: {samples:06x?}.  The pipe is \
-                 scanning (reference section 11 phase 6.1)",
+                "PIPEDSL sampled {} times over {} ms and changed: {}.  Intervals: {}.  Observed \
+                 line rate: {}.  The pipe is scanning (reference section 11 phase 6.1, and \
+                 section 12.3 for the rate).",
                 SCANLINE_SAMPLES,
                 (SCANLINE_SAMPLES as u64 - 1) * SCANLINE_INTERVAL_MICROS / 1_000,
+                render_samples(&samples),
+                render_intervals(self.intervals()),
+                render_rate(self.observed_lines_per_second()),
             ),
             Self::NotScanning { samples } => format!(
-                "PIPEDSL read {samples:06x?} on every one of {SCANLINE_SAMPLES} samples over {} \
-                 ms: the value never changed, so the pipe is not scanning and nothing downstream \
-                 of it matters (reference section 11 phase 6.1).  Check, in this order: TRANSCONF \
-                 is written with ENABLE | STATE_ENABLE (section 11 step 5.6); TRANS_CLK_SEL names \
-                 the port PLL the DDI is using (step 5.4); the PLL locked (step 5.1)",
+                "PIPEDSL read {} on every one of {SCANLINE_SAMPLES} samples over {} ms: the value \
+                 never changed, so the pipe is not scanning and nothing downstream of it matters \
+                 (reference section 11 phase 6.1).  Intervals: {}.  Observed line rate: {}.  \
+                 Check, in this order: TRANSCONF is written with ENABLE | STATE_ENABLE (section \
+                 11 step 5.6); TRANS_CLK_SEL names the port PLL the DDI is using (step 5.4); the \
+                 PLL locked (step 5.1)",
+                render_samples(&samples),
                 (SCANLINE_SAMPLES as u64 - 1) * SCANLINE_INTERVAL_MICROS / 1_000,
+                render_intervals(self.intervals()),
+                render_rate(self.observed_lines_per_second()),
             ),
             Self::Unreadable { register } => format!(
                 "{register} could not be read, so whether the pipe is scanning is unknown.  It is \
@@ -1664,6 +1769,41 @@ impl ScanlineCheck {
                  rather than in the mode"
             ),
         }
+    }
+}
+
+/// The samples as `line@micros`, in order.
+fn render_samples(samples: &[ScanlineSample; SCANLINE_SAMPLES]) -> String {
+    let mut out = String::new();
+    for (index, sample) in samples.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("{}@{}us", sample.line, sample.micros));
+    }
+    out
+}
+
+/// The intervals as `+lines/micros`, in order.
+fn render_intervals(intervals: [(i64, u64); SCANLINE_SAMPLES - 1]) -> String {
+    let mut out = String::new();
+    for (index, (lines, micros)) in intervals.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("{lines:+}/{micros}us"));
+    }
+    out
+}
+
+/// The measured rate as a log phrase, or why there is none.
+fn render_rate(rate: Option<u32>) -> String {
+    match rate {
+        Some(rate) => format!("{rate} lines/s"),
+        None => String::from(
+            "none: no interval both moved the counter forward and took time, so nothing was \
+             measured",
+        ),
     }
 }
 
@@ -1825,7 +1965,10 @@ pub(crate) fn prove(
 
     let scanline = match sample_scanline(regs, pipe.pipedsl(), timer) {
         Ok(samples) => {
-            if samples.windows(2).any(|pair| pair[0] != pair[1]) {
+            // The verdict is on the *lines*.  Two samples with the same line
+            // and different timestamps are a stopped counter, not a slow one:
+            // the timestamps are the measurement, never the thing measured.
+            if samples.windows(2).any(|pair| pair[0].line != pair[1].line) {
                 ScanlineCheck::Scanning { samples }
             } else {
                 ScanlineCheck::NotScanning { samples }
@@ -1883,21 +2026,31 @@ pub(crate) fn prove_at_boot(regs: &impl Registers, plan: &PipeProgram) -> PipeCh
 /// apart.
 ///
 /// Only `LINE[19:0]` is kept: the register's other bits are reserved, and a
-/// changing reserved bit is not a scanning pipe.
+/// changing reserved bit is not a scanning pipe.  Each sample keeps the timer's
+/// reading as well, taken immediately before the register read, because the
+/// line rate section 12.3 asks for is the delta between two of these and a
+/// timestamp thrown away is an observation thrown away.
 fn sample_scanline(
     regs: &impl Registers,
     register: Register,
     timer: &impl PollTimer,
-) -> Result<[u32; SCANLINE_SAMPLES], &'static str> {
-    let mut samples = [0u32; SCANLINE_SAMPLES];
+) -> Result<[ScanlineSample; SCANLINE_SAMPLES], &'static str> {
+    let mut samples = [ScanlineSample { line: 0, micros: 0 }; SCANLINE_SAMPLES];
     for (index, sample) in samples.iter_mut().enumerate() {
         if index > 0 {
             wait_micros(timer, SCANLINE_INTERVAL_MICROS);
         }
+        // Stamped before the read, so the stamp is never later than the value
+        // it belongs to; the read itself is microseconds of MMIO and the
+        // interval is a millisecond.
+        let micros = timer.now_micros();
         let Some(value) = regs.read(register) else {
             return Err(register.name());
         };
-        *sample = value & PIPEDSL_LINE_MASK;
+        *sample = ScanlineSample {
+            line: value & PIPEDSL_LINE_MASK,
+            micros,
+        };
     }
     Ok(samples)
 }

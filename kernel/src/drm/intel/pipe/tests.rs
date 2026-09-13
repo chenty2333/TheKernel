@@ -1020,8 +1020,43 @@ fn a_scanning_pipe_an_armed_plane_and_no_underrun_all_pass() {
     assert_eq!(
         checks.scanline,
         ScanlineCheck::Scanning {
-            samples: [100, 200, 300, 400]
+            samples: [
+                // The mock advances 100 lines per read, and the fake clock
+                // advances one interval per wait, so this is a measurable
+                // 100 lines/ms = 100000 lines/s.
+                ScanlineSample {
+                    line: 100,
+                    micros: 0
+                },
+                ScanlineSample {
+                    line: 200,
+                    micros: 1_000
+                },
+                ScanlineSample {
+                    line: 300,
+                    micros: 2_000
+                },
+                ScanlineSample {
+                    line: 400,
+                    micros: 3_000
+                },
+            ]
         }
+    );
+    assert_eq!(
+        checks.scanline.intervals(),
+        [(100, 1_000), (100, 1_000), (100, 1_000)],
+        "each interval's line delta and duration, which is what the log renders"
+    );
+    assert_eq!(
+        checks.scanline.observed_lines_per_second(),
+        Some(100_000),
+        "300 lines over 3000 us"
+    );
+    assert!(
+        checks.scanline.describe().contains("100000 lines/s"),
+        "the log has to carry the number, not only that the counter moved: {}",
+        checks.scanline.describe()
     );
     assert_eq!(
         checks.surface,
@@ -1059,13 +1094,38 @@ fn a_pipe_that_is_not_scanning_is_a_named_failure() {
     assert_eq!(
         checks.scanline,
         ScanlineCheck::NotScanning {
-            samples: [0, 0, 0, 0]
+            samples: [
+                ScanlineSample { line: 0, micros: 0 },
+                ScanlineSample {
+                    line: 0,
+                    micros: 1_000
+                },
+                ScanlineSample {
+                    line: 0,
+                    micros: 2_000
+                },
+                ScanlineSample {
+                    line: 0,
+                    micros: 3_000
+                },
+            ]
         }
+    );
+    assert_eq!(
+        checks.scanline.observed_lines_per_second(),
+        None,
+        "a counter that did not move is not a measurement of zero lines per second"
     );
     assert!(checks.surface.is_ok(), "the surface check still ran");
     assert!(checks.underrun.is_ok(), "the underrun check still ran");
     let text = checks.scanline.describe();
-    for expected in ["PIPEDSL", "not scanning", "TRANSCONF", "TRANS_CLK_SEL"] {
+    for expected in [
+        "PIPEDSL",
+        "not scanning",
+        "TRANSCONF",
+        "TRANS_CLK_SEL",
+        "none: no interval",
+    ] {
         assert!(text.contains(expected), "{expected} missing from {text}");
     }
 }
@@ -1078,7 +1138,8 @@ fn a_repeated_scanline_sample_is_not_a_stopped_pipe() {
     let regs = MockRegisters::new();
     let reads = Cell::new(0u32);
     // First and last samples equal, the middle two different: a two-read check
-    // would call this stopped.
+    // would call this stopped.  The verdict is on the *lines*: the timestamps
+    // differ in every interval, and must not be what "changed" means.
     regs.on_read(Pipe::A.pipedsl(), move |_| {
         reads.set(reads.get() + 1);
         match reads.get() {
@@ -1091,9 +1152,33 @@ fn a_repeated_scanline_sample_is_not_a_stopped_pipe() {
     assert_eq!(
         checks.scanline,
         ScanlineCheck::Scanning {
-            samples: [500, 900, 900, 500]
+            samples: [
+                ScanlineSample {
+                    line: 500,
+                    micros: 0
+                },
+                ScanlineSample {
+                    line: 900,
+                    micros: 1_000
+                },
+                ScanlineSample {
+                    line: 900,
+                    micros: 2_000
+                },
+                ScanlineSample {
+                    line: 500,
+                    micros: 3_000
+                },
+            ]
         }
     );
+    // Two intervals moved forward and one went backwards, which is what a
+    // frame wrap looks like: the rate comes from the two that are measurements.
+    assert_eq!(
+        checks.scanline.intervals(),
+        [(400, 1_000), (0, 1_000), (-400, 1_000)]
+    );
+    assert_eq!(checks.scanline.observed_lines_per_second(), Some(400_000));
 }
 
 /// An underrun is a named result that points at the watermarks and the DDB,
@@ -1252,8 +1337,79 @@ fn a_clock_that_never_advances_does_not_hang_the_check() {
     assert_eq!(
         checks.scanline,
         ScanlineCheck::NotScanning {
-            samples: [0, 0, 0, 0]
+            samples: [
+                ScanlineSample { line: 0, micros: 0 },
+                ScanlineSample { line: 0, micros: 0 },
+                ScanlineSample { line: 0, micros: 0 },
+                ScanlineSample { line: 0, micros: 0 },
+            ]
         }
+    );
+    assert_eq!(
+        checks.scanline.observed_lines_per_second(),
+        None,
+        "a clock that does not advance measures no rate; it must not report zero"
+    );
+    assert!(
+        checks.scanline.describe().contains("none: no interval"),
+        "{}",
+        checks.scanline.describe()
+    );
+}
+
+/// The rate the phase-6 log reports is the one the samples measured, and a
+/// window that wrapped a frame does not turn into a wrong number.
+///
+/// Section 12.3: sampling `PIPEDSL` at a known interval gives the line rate,
+/// "the only way to verify your PLL arithmetic against reality without a
+/// scope".  What the log can do is print the number; what it must not do is
+/// print one it did not measure.
+#[test]
+fn the_verdict_reports_the_rate_the_samples_measured() {
+    let plan = compute(Pipe::A, &vic16(), SURFACE).unwrap();
+    let regs = MockRegisters::new();
+    // 67.5 lines/ms is 1080p60's rate (148.5 MHz / 2200 pixels).  Each read
+    // advances the counter by 67 lines and costs one FakeClock interval, so the
+    // measured rate is 67 lines/ms = 67000 lines/s -- the counter's resolution,
+    // not the mode's exact rate, which is the point of reporting a measurement.
+    let scanline = Cell::new(0u32);
+    regs.on_read(Pipe::A.pipedsl(), move |_| {
+        let line = scanline.get();
+        scanline.set(line + 67);
+        line
+    });
+
+    let checks = prove(&regs, &plan, &FakeClock::new());
+    assert!(checks.scanline.is_ok());
+    assert_eq!(checks.scanline.observed_lines_per_second(), Some(67_000));
+    let text = checks.scanline.describe();
+    for expected in ["67000 lines/s", "67@", "12.3"] {
+        assert!(text.contains(expected), "{expected} missing from {text}");
+    }
+
+    // A wrapped interval is not a rate: only the intervals that moved forward
+    // count, and the log shows the one that did not as a negative delta.
+    let regs = MockRegisters::new();
+    let reads = Cell::new(0u32);
+    regs.on_read(Pipe::A.pipedsl(), move |_| {
+        reads.set(reads.get() + 1);
+        match reads.get() {
+            1 => 1_100,
+            2 => 40,
+            3 => 107,
+            _ => 174,
+        }
+    });
+    let checks = prove(&regs, &plan, &FakeClock::new());
+    assert_eq!(
+        checks.scanline.intervals(),
+        [(-1_060, 1_000), (67, 1_000), (67, 1_000)],
+        "the wrap is visible in the log as a negative delta"
+    );
+    assert_eq!(
+        checks.scanline.observed_lines_per_second(),
+        Some(67_000),
+        "the wrap is excluded from the rate rather than averaged into it"
     );
 }
 
