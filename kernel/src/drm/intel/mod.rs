@@ -118,13 +118,17 @@ static POWER: Mutex<Option<power::PowerState>> = Mutex::new(None);
 /// reason.
 static POWER_FAILURE: Mutex<Option<String>> = Mutex::new(None);
 
-/// What the sink step of the bring-up order found, kept for the debug file.
+/// What the connector step of the bring-up order found, kept for the debug
+/// file.
 ///
-/// Separate from [`REPORT`] because it is produced by a different step, and
-/// kept for the same reason: the EDID is the first fact in this kernel that the
-/// firmware did not supply, and on a machine whose only console is the screen
-/// it is worth being able to read twice.
-static SINK: Mutex<Option<sink::SinkReport>> = Mutex::new(None);
+/// This is the connector the modeset will take: the pin a monitor answered on,
+/// the DDI it carries, the validated EDID, the mode layer's plan and the live
+/// hotplug state, plus what phase 2.1 found for the AUX/DDC power wells.  It is
+/// the composition of reference §11 phases 2.1, 2.2 and 2.3, and it is kept for
+/// the same reason the probe's report is: on a machine whose only console is
+/// the screen, an EDID -- and the well that explains a bus which would not
+/// produce one -- is worth being able to read twice.
+static CONNECT: Mutex<Option<connect::ConnectReport>> = Mutex::new(None);
 
 /// A value as grouped hexadecimal, the way a register dump is written down.
 ///
@@ -169,17 +173,19 @@ pub(crate) fn probe_at_boot() {
 /// display, or one whose window could not be mapped, nothing here runs and it
 /// says so rather than reporting a half-run sequence as a result.
 ///
-/// The order is the point.  Power comes before the sink because GMBUS needs the
-/// AUX/DDC power well and a well cannot be requested before `PW_1` is up; the
-/// sink comes before any mode because a timing computed from a guessed EDID is
-/// worse than no timing at all.  Each step logs as it goes, for the same reason
-/// the probe does.
+/// The order is the point.  Power comes before the DDC pin pair because GMBUS
+/// is a channel behind the AUX/DDC power well and a well cannot be requested
+/// before `PW_1` is up; the well comes before the EDID read because a channel
+/// behind a shut gate NAKs every address, which is indistinguishable from an
+/// empty port; the sink comes before any mode because a timing computed from a
+/// guessed EDID is worse than no timing at all.  Each step logs as it goes, for
+/// the same reason the probe does.
 pub(crate) fn bring_up_at_boot() {
     let windows = mapped_windows();
     if windows.is_empty() {
         axlog::info!(
-            "intel-gpu: no device with a mapped register window, so the power and sink steps of \
-             the bring-up order did not run"
+            "intel-gpu: no device with a mapped register window, so the power and connector steps \
+             of the bring-up order did not run"
         );
         return;
     }
@@ -205,12 +211,14 @@ pub(crate) fn bring_up_at_boot() {
     }
 
     // Phase 2 runs for every mapped device whose power came up, because the
-    // sink is per-device and one device's monitor must not be lost to another
-    // device's failure.
+    // connector is per-device and one device's monitor must not be lost to
+    // another device's failure.  `resolve_at_boot` is phases 2.1, 2.2 and 2.3
+    // composed: the AUX/DDC power wells first, then one pass over the bus, then
+    // the connector the modeset takes.
     let report = { REPORT.lock().clone() };
     if let Some(report) = report {
-        let sink = sink::probe_at_boot(&report);
-        *SINK.lock() = Some(sink);
+        let connect = connect::resolve_at_boot(&report);
+        *CONNECT.lock() = Some(connect);
     }
 }
 
@@ -251,8 +259,8 @@ pub(crate) fn report_text() -> String {
     if let Some(state) = &*POWER.lock() {
         text.push_str(&state.render());
     }
-    if let Some(sink) = &*SINK.lock() {
-        text.push_str(&sink.render());
+    if let Some(connect) = &*CONNECT.lock() {
+        text.push_str(&connect.render());
     }
     text
 }

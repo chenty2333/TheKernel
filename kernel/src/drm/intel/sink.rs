@@ -16,7 +16,10 @@
 //! *name* it — [`GmbusError::AuxWellDown`] carries the well and its state bit —
 //! rather than to enable it behind that workstream's back.  On a machine where
 //! the well is off, the boot log says so in those words, which is the finding
-//! the power workstream needs.
+//! the power workstream needs.  [`super::connect`] is the composition that puts
+//! step 1 in front of this module: it requests the well for each candidate pin
+//! and then calls [`probe_one`] here, so the boot path runs the reference's
+//! order with the power register written by the module that owns it.
 //!
 //! The result is a fact the firmware did not give this kernel: what monitor is
 //! attached, on which pin, and what timing the mode layer would program for it.
