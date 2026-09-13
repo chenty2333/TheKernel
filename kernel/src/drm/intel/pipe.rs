@@ -658,6 +658,10 @@ impl DdbAllocation {
 /// scanlines and `blocks` a count of 512-byte DBUF blocks, both of which are
 /// written as themselves -- not as a count minus one, unlike the timing
 /// registers and `PLANE_BUF_CFG`'s end index.
+///
+/// `ignore_lines` is part of the field layout and is always false here:
+/// section 7.3's generous level does not use it, and nothing else in this
+/// bring-up programs a watermark level.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WatermarkLevel {
     enabled: bool,
@@ -904,6 +908,10 @@ impl PipeProgram {
     /// that nothing in the plane's double-buffered state is committed before the
     /// watermarks are -- which `PLANE_SURF` being last is what guarantees.
     /// Keeping it here means one call programs everything the pipe owns.
+    /// `[I915]` gives the same ordering: `bdw_set_pipe_misc` runs before
+    /// `hsw_configure_cpu_transcoder` in `intel_crtc_enable_pipe`
+    /// (`display/intel_display.c:1719` against `:1725`), so the depth is
+    /// programmed before the pipe is enabled there too.
     pub(crate) fn writes(&self, pipe_misc_before: u32) -> Vec<PlannedWrite> {
         let mut writes = Vec::with_capacity(1 + 7 + 1 + PLANE_WM_LEVELS + 6);
 
