@@ -928,6 +928,9 @@ fn an_underrun_names_the_watermarks_and_the_ddb() {
         scanline.set(scanline.get() + 1);
         scanline.get()
     });
+    // Program first, then let the pipe underrun: §11 phase 6.4's bit is the
+    // verdict on what phase 4 wrote, so this is the order the sequence runs in.
+    let state = program(&regs, &plan).unwrap();
     regs.set(Pipe::A.plane_surflive(), plan.plane.surf);
     // Bit 31 plus an unrelated vblank status bit, so the verdict cannot be
     // "the whole register was non-zero".
@@ -941,6 +944,24 @@ fn an_underrun_names_the_watermarks_and_the_ddb() {
             stat: PIPE_FIFO_UNDERRUN_STATUS | 0x2,
             watermark: 0x8007_cfff,
             ddb: 0x0fff_0000,
+        }
+    );
+    // And the values the verdict names are the ones the program wrote, not a
+    // second computation of them.
+    let written = |register: Register| {
+        state
+            .writes
+            .iter()
+            .find(|write| write.register == register)
+            .unwrap_or_else(|| panic!("the program did not write {}", register.name()))
+            .value
+    };
+    assert_eq!(
+        checks.underrun,
+        UnderrunCheck::Underrun {
+            stat: PIPE_FIFO_UNDERRUN_STATUS | 0x2,
+            watermark: written(Pipe::A.plane_wm(0)),
+            ddb: written(Pipe::A.plane_buf_cfg()),
         }
     );
     let text = checks.underrun.describe();
