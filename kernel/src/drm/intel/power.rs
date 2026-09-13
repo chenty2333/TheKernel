@@ -807,6 +807,13 @@ pub(crate) enum PowerError {
     DbufNeverPowered {
         readback: [u32; 4],
     },
+    /// A write did not read back as written.  The bits in `wrote` are the ones
+    /// the sequence set; `read` is what the device kept.
+    ReadbackMismatch {
+        register: &'static str,
+        wrote: u32,
+        read: u32,
+    },
 }
 
 impl From<phy::PhyError> for PowerError {
@@ -899,6 +906,11 @@ impl PowerError {
                  causes is not a failure to start but every frame underrunning \
                  (PIPE_FIFO_UNDERRUN_STATUS), which is far harder to attribute later"
             ),
+            Self::ReadbackMismatch {
+                register,
+                wrote,
+                read,
+            } => format!("{register} did not keep the bits {wrote:#010x}: it reads {read:#010x}"),
         }
     }
 }
@@ -1193,8 +1205,10 @@ pub(crate) fn apply_workarounds(regs: &impl Registers) -> Result<WorkaroundState
     rmw(regs, regs::GEN11_CHICKEN_DCPR_2, 0, WA_14011508470_BITS)?;
     let chicken_dcpr_2_after = read(regs, regs::GEN11_CHICKEN_DCPR_2)?;
     if chicken_dcpr_2_after & WA_14011508470_BITS != WA_14011508470_BITS {
-        return Err(PowerError::WriteRefused {
+        return Err(PowerError::ReadbackMismatch {
             register: regs::GEN11_CHICKEN_DCPR_2.name(),
+            wrote: WA_14011508470_BITS,
+            read: chicken_dcpr_2_after,
         });
     }
     let display_err_fatal_mask = read(regs, regs::XELPD_DISPLAY_ERR_FATAL_MASK)?;
@@ -1705,6 +1719,18 @@ mod tests {
             regs.read(regs::GEN11_CHICKEN_DCPR_2).unwrap() & WA_14011508470_BITS,
             WA_14011508470_BITS
         );
+    }
+
+    #[test]
+    fn a_workaround_register_that_drops_the_bits_is_an_error() {
+        let regs = powered_machine();
+        regs.derive(regs::GEN11_CHICKEN_DCPR_2, |_| 0);
+        let error = apply_workarounds(&regs).unwrap_err();
+        assert!(
+            matches!(error, PowerError::ReadbackMismatch { .. }),
+            "{error:?}"
+        );
+        assert!(error.describe().contains("did not keep the bits"));
     }
 
     #[test]

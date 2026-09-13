@@ -326,8 +326,8 @@ failed check is named.
 
 Nothing in this workstream has run on the target.  The evidence is:
 
-* **79 host tests** across `drm::intel`, of which 44 are new in this workstream
-  (15 in `clk.rs`, 15 in `power.rs`, 10 in `phy.rs` and 4 in `regs.rs`), run
+* **80 host tests** across `drm::intel`, of which 45 are new in this workstream
+  (16 in `power.rs`, 15 in `clk.rs`, 10 in `phy.rs` and 4 in `regs.rs`), run
   with `cargo test --locked -p thekernel-kernel --target
   x86_64-unknown-linux-gnu -- drm::intel`.  They drive the sequences through
   `regs::mock::MockRegisters`, which models a status bit that follows a request
@@ -405,7 +405,8 @@ device the target has.
 | `power::a_well_whose_state_never_sets_withdraws_the_request_it_added` | rollback at the handshake, and that a bit this call did not set survives |
 | `power::a_failure_after_the_well_came_up_withdraws_it` | rollback for a later failure, with the original message carried through |
 | `power::the_dbuf_reads_before_it_requests_and_reports_a_partial_part` | read-first, partial, and zero-slice outcomes |
-| `power::the_error_mask_is_read_and_left_alone` | §3.6's decision |
+| `power::the_error_mask_is_read_and_left_alone` | §3.7's decision |
+| `power::a_workaround_register_that_drops_the_bits_is_an_error` | the `Wa_14011508470` read-back |
 | `power::enabling_a_well_that_is_already_on_does_not_claim_credit` | the `already_on` distinction |
 | `power::a_register_outside_the_window_is_an_error_rather_than_a_zero` | the error paths |
 | `power::the_well_table_is_the_xe_lpd_one_and_not_tigers` | the indices, bits and fuse positions |
