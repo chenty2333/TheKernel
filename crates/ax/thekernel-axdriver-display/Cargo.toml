@@ -6,6 +6,7 @@ license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
 
 [dependencies]
 axdriver_base = { package = "thekernel-axdriver-base", path = "../thekernel-axdriver-base", version = "0.1.4-preview.3" }
+axgpu = { package = "thekernel-axgpu", path = "../thekernel-axgpu", version = "=0.1.0", default-features = false }
 
 [package.metadata.thekernel]
 layer = "mechanism"
