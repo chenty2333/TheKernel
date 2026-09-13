@@ -232,15 +232,17 @@ rather than a chain of `if`s:
   a provider: a name for the log, a rank from the table in §3.1, the provider's own
   statement of why it is entitled to the screen, and a `fn` that tries to take it. A driver
   in any directory can build one and call `crate::drm::screen::register`.
-* **The decision is a pure function over candidates.** `decide(&[Candidate]) -> Selection`
-  touches no hardware of its own, so all four cases the brief names — no candidate, a
-  candidate that errors, two candidates that both work, a candidate that succeeds with
-  unusable geometry — are host unit tests (§3.3).
+* **The decision is a function over candidates and nothing else.** `decide(&[Candidate],
+  &mut dyn FnMut(&Considered)) -> Selection` touches no hardware of its own — the candidates
+  do — so all four cases the brief names (no candidate, a candidate that errors, two
+  candidates that both work, a candidate that succeeds with unusable geometry) are host unit
+  tests (§3.3). The observer is how each verdict reaches the log the moment it is decided,
+  which §3.2 explains.
 * **Every candidate is accounted for.** `Selection` records one `Verdict` per candidate in
-  consultation order, and `report` prints all of them at `info!` (§3.2). A candidate that
-  was never asked because an earlier one won is recorded as `Outranked`, not omitted: "lost
-  to a better provider" and "never ran" are different facts and only one of them is a
-  configuration problem.
+  consultation order, and `report` prints each one at `info!` as it is decided (§3.2). A
+  candidate that was never asked because an earlier one won is recorded as `Outranked`, not
+  omitted: "lost to a better provider" and "never ran" are different facts and only one of
+  them is a configuration problem.
 * **Failure falls through.** A candidate that is absent, that fails, or that hands back a
   surface which cannot be drawn into does not end the search; the next candidate is
   consulted. The kernel's own two providers are the built-in candidates at ranks 100 and
@@ -268,25 +270,34 @@ rather than incidental. On the profiles that exist today the candidate set is ex
 
 ### 3.2 What a boot log says
 
-One `info!` line per candidate, in consultation order, on the `scanout:` prefix:
+One `info!` line per candidate, in consultation order, on the `scanout:` prefix. Captured
+verbatim from QEMU, with the profile that produces each shape.
+
+**A machine with a DRM device** (`test --suite guest`, `headless` graphics profile, kernel
+log at `0.45 s`): the DRM device takes the screen and the firmware aperture is recorded as
+never asked.
 
 ```
-scanout: candidate 'drm-primary' (rank 100) has nothing to offer: no DRM primary device is registered
-scanout: candidate 'firmware-aperture' (rank 200) selected: 1280x800 pitch 5120, because the firmware programmed this display and nothing in the kernel did
-Firmware framebuffer scanout: 1280x800 pitch 5120 at 0x80000000
+<6>[0.382711 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::entry module=thekernel_kernel::entry] registered VirtIO GPU as DRM primary device
+<6>[0.455935 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::drm::screen module=thekernel_kernel::drm::screen] scanout: candidate 'drm-primary' (rank 100) selected: 800x600 pitch 3200, because a driver published this device and presents through it
+<6>[0.456091 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::drm::screen module=thekernel_kernel::drm::screen] scanout: candidate 'firmware-aperture' (rank 200) not consulted: 'drm-primary' already won
 ```
 
-and when nothing can drive the screen:
+**A machine with no display device at all** (`--graphics-profile firmware-fb`, a
+`bochs-display` and no virtio-gpu — the N305's topology): the DRM candidate loses on the
+stated ground that no device registered, the aperture wins, and the losing verdict is on the
+log *before* the winning one, which is the only order in which a serial-less machine can
+read it.
 
 ```
-scanout: candidate 'drm-primary' (rank 100) offered an unusable surface: it addresses 1024 bytes but claims 960 scan lines of 4096
-scanout: candidate 'firmware-aperture' (rank 200) has nothing to offer: the bootloader handed over no framebuffer
-scanout: no candidate produced a usable surface
-No scanout surface available; /dev/fb0 is not published
+<6>[0.578926 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::entry module=thekernel_kernel::entry] no DRM-capable VirtIO GPU found
+<6>[0.582261 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::drm::screen module=thekernel_kernel::drm::screen] scanout: candidate 'drm-primary' (rank 100) has nothing to offer: no DRM primary device is registered
+<6>[0.583333 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::drm::screen module=thekernel_kernel::drm::screen] Firmware framebuffer scanout: 1280x800 pitch 5120 at 0x80000000
+<6>[0.583728 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::drm::screen module=thekernel_kernel::drm::screen] scanout: candidate 'firmware-aperture' (rank 200) selected: 1280x800 pitch 5120, because the firmware programmed this display and nothing in the kernel did
 ```
 
-The existing `Firmware framebuffer scanout: …` line is unchanged and is still emitted by the
-provider that maps the aperture, so nothing that greps for it breaks.
+The `Firmware framebuffer scanout: …` line is the one the previous code emitted, unchanged
+and in the same place, so nothing that greps for it breaks.
 
 **Every verdict is emitted as it is decided, not collected and printed at the end.** A
 verdict that is only printed once the search has finished is a verdict that is lost exactly
@@ -308,7 +319,7 @@ distinction is invisible, and all the kernel can say from `axhal::boot::framebuf
 None` is that there is no framebuffer. The enum and the accessor exist but are `pub(crate)`
 (`boot_info.rs:172`, `:325-327`), and `axplat_x86_pc::boot_framebuffer()` returns only
 `Option<FramebufferInfo>` (`crates/ax/thekernel-axplat-x86-pc/src/lib.rs:64-66`). Closing
-this needs the platform crate, which this change does not own; §5.5 gives the two-line
+this needs the platform crate, which this change does not own; §5.4 gives the two-line
 shape.
 
 ### 3.3 Tests

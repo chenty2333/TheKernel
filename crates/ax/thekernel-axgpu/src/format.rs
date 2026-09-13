@@ -59,9 +59,7 @@ impl PixelLayout {
 
     /// Bytes one pixel occupies.
     pub const fn bytes_per_pixel(&self) -> u32 {
-        // `div_ceil` is not const; the depth is at most 32 in every layout this
-        // kernel can be handed, and the arithmetic is exact for the rest too.
-        ((self.bits as u32) + 7) / 8
+        (self.bits as u32).div_ceil(8)
     }
 
     /// Whether this layout describes a pixel a writer can produce.

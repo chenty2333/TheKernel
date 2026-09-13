@@ -201,7 +201,7 @@ pub(crate) fn console_scanout() -> Option<Arc<dyn ScanoutSurface>> {
 /// The order is the caller's: [`console_scanout`] sorts by rank before calling
 /// this, and a test can hand it any order at all. One surface is taken, so the
 /// candidates after the winner are recorded as outranked rather than consulted
-/// - asking a driver to prepare a surface it will not be allowed to use is not
+/// -- asking a driver to prepare a surface it will not be allowed to use is not
 /// a harmless question.
 ///
 /// `note` is called with each candidate's verdict *as it is decided*, before
@@ -210,10 +210,7 @@ pub(crate) fn console_scanout() -> Option<Arc<dyn ScanoutSurface>> {
 /// whole search has finished is a verdict that is lost if the fallback it
 /// enabled faults on the way up. The one diagnostic a black screen can still
 /// carry is the one that was written before the screen was touched.
-pub(crate) fn decide(
-    candidates: &[Candidate],
-    note: &mut dyn FnMut(&Considered),
-) -> Selection {
+pub(crate) fn decide(candidates: &[Candidate], note: &mut dyn FnMut(&Considered)) -> Selection {
     let mut considered = Vec::with_capacity(candidates.len());
     let mut surface: Option<Arc<dyn ScanoutSurface>> = None;
     let mut winner: Option<&'static str> = None;
@@ -276,7 +273,8 @@ fn usable(surface: &dyn ScanoutSurface) -> Result<(), String> {
     let pitch = u64::from(surface.pitch());
     if pitch < minimum_pitch {
         return Err(format!(
-            "its pitch {pitch} is shorter than one scan line of {width} pixels at {bytes_per_pixel} bytes"
+            "its pitch {pitch} is shorter than one scan line of {width} pixels at \
+             {bytes_per_pixel} bytes"
         ));
     }
     // `virtual_height` rather than `height`: fbdev can pan to the rows below
@@ -330,11 +328,12 @@ fn drm_primary() -> Candidate {
         rank::DRM,
         "a driver published this device and presents through it",
         || {
-            let device = super::primary_device().ok_or(Unavailable::Absent(
-                "no DRM primary device is registered",
-            ))?;
+            let device = super::primary_device()
+                .ok_or(Unavailable::Absent("no DRM primary device is registered"))?;
             super::drm_scanout(device).map_err(|error: AxError| {
-                Unavailable::Failed(format!("the DRM fbdev surface could not be prepared: {error}"))
+                Unavailable::Failed(format!(
+                    "the DRM fbdev surface could not be prepared: {error}"
+                ))
             })
         },
     )
@@ -348,25 +347,28 @@ fn firmware_aperture() -> Candidate {
         "the firmware programmed this display and nothing in the kernel did",
         || {
             let framebuffer = axhal::boot::framebuffer().ok_or(Unavailable::Absent(
-                "the bootloader handed over no framebuffer",
+                // The platform parses seven distinct rejections out of the
+                // bootloader's tag and reports which one it was on the
+                // diagnostic channel only, which a machine with no serial port
+                // cannot read. This is everything the kernel can say until that
+                // accessor exists; see docs/design/display-dispatch.md 5.4.
+                "the bootloader handed over no framebuffer this kernel can draw into",
             ))?;
             let surface = bootfb::BootFb::new(&framebuffer).map_err(|error| {
-                Unavailable::Failed(format!("the firmware framebuffer could not be mapped: {error}"))
+                Unavailable::Failed(format!(
+                    "the firmware framebuffer could not be mapped: {error}"
+                ))
             })?;
             let surface: Arc<dyn ScanoutSurface> = Arc::try_new(surface)
                 .map_err(|_| Unavailable::Failed(String::from("out of memory")))?;
             info!(
                 "Firmware framebuffer scanout: {}x{} pitch {} at {:#x}",
-                framebuffer.width,
-                framebuffer.height,
-                framebuffer.pitch,
-                framebuffer.address
+                framebuffer.width, framebuffer.height, framebuffer.pitch, framebuffer.address
             );
             Ok(surface)
         },
     )
 }
-
 
 #[cfg(test)]
 mod tests {
