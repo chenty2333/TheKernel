@@ -62,6 +62,9 @@ carries the same status. The first run is also the first test of this document.
 
 * The pinned toolchain: `scripts/setup-toolchain.sh` provisions `rustup`, `cargo`, `rustc` and
   `axconfig-gen`, which `tools/verification.py` checks before any tier runs.
+* The BusyBox rootfs the ESP carries is built locally on the first build: `scripts/build-rootfs.sh`
+  needs `curl`, `debugfs`, `make`, `mke2fs`, `realpath`, `tar`, `touch` and `truncate` on `PATH`, and
+  downloads BusyBox 1.36.1 into the state directory's `source-cache` unless it is already there.
 * The ESP builder needs `grub2-mkstandalone` (or `grub-mkstandalone`), `parted`, `mkfs.fat`,
   `mcopy` and `mmd` on `PATH`; it names each one it cannot find
   (`scripts/build-x86-uefi-esp.sh`).
@@ -342,10 +345,10 @@ A report about a display failure on this machine is only actionable with all fou
 
 ### 4.2 The paths on the running system
 
-These are the files that carry the display evidence, all read-only, all reachable from the shell
-profile once a channel exists:
+These are the files and commands that carry the display evidence, all read-only, all reachable from
+the shell profile once a channel to the machine exists:
 
-| Path | What it holds |
+| Path or command | What it holds |
 |---|---|
 | `/sys/kernel/debug/dri/0/intel_gpu` | the boot probe's report, the power step's log, and the sink step's report — one rendering, the same text the kernel logged (`kernel/src/drm/intel/debugfs.rs`, `kernel/src/drm/intel/mod.rs::report_text`) |
 | `/sys/kernel/debug/dri/0/thekernel_metrics` | the DRM resource snapshot: whether a primary device is registered, framebuffers, resources (`kernel/src/pseudofs/graphics_metrics.rs`) |
@@ -356,7 +359,8 @@ profile once a channel exists:
 | `lspci -nn` | the PCI functions, including the display function's device id and BARs (the capture image carries `lspci`; the product rootfs is BusyBox) |
 
 **On today's machine none of these can be read by typing**, because console input has one source —
-the UART — and there is none (§1.1). What is on the panel is what exists. Two ways to change that:
+the UART — and there is none (§1.1). What is on the panel is what exists. Three ways to change that,
+the last of which does not exist yet:
 
 * **The screen-capture dongle** (not owned yet; §6.1) turns the panel into files on the development
   host. That is the intended channel for a display acceptance run.
@@ -404,9 +408,9 @@ has run against silicon". This is where a reader finds out which claim is which.
 | The probe's register reads and their interpretation | host tests over a mock register file and a synthetic aperture | the offsets and decodings are the reference's; no value has ever been read from a real Gen12 part |
 | Power wells, combo PHY, CDCLK, raw clock, DBUF, the workarounds | host tests over `regs::mock::MockRegisters`, which can be made to fail in named ways | the sequence and the arithmetic. Whether `PW_1` comes up on this board, and whether the fuse bits are where the reference says, is unknown until §3.3 runs |
 | GMBUS transactions, EDID validation, the §11.1 failure modes | 27 host tests with a controller that can be made to fail, plus a fake clock (`kernel/src/drm/intel/gmbus/tests.rs`) | the protocol and the error attribution. No transaction has ever run on a real DDC bus |
-| Hotplug enable and the live connect read | 10 host tests over bit positions and over what is *not* written (`hpd/tests.rs`) | the register encoding. Which DDI the monitor is on is hardware's answer |
+| Hotplug enable and the live connect read | 10 host tests over bit positions and over what is *not* written (`kernel/src/drm/intel/hpd/tests.rs`) | the register encoding. Which DDI the monitor is on is hardware's answer |
 | The mode layer (EDID → mode) | host tests plus fixtures (`kernel/src/drm/modes/`) | that a given EDID selects a given timing. Real monitors send real EDIDs, which is a different test |
-| Timings, DDB, watermarks, plane, PLL dividers, the DDI sequence, phase 6 | host tests over the mock, including the write order (`pipe/tests.rs`, `output/tests.rs`, `pll.rs`) | arithmetic, ordering and the verdict logic. QEMU writes none of these registers: it has no Gen12 display engine to write them to |
+| Timings, DDB, watermarks, plane, PLL dividers, the DDI sequence, phase 6 | host tests over the mock, including the write order (`kernel/src/drm/intel/pipe/tests.rs`, `kernel/src/drm/intel/output/tests.rs`, `kernel/src/drm/intel/pll.rs`) | arithmetic, ordering and the verdict logic. QEMU writes none of these registers: it has no Gen12 display engine to write them to |
 | Framebuffer allocation, GGTT entries, the console candidate gate | host tests (`fb.rs`, `gtt.rs`, `scanout.rs`) | the address arithmetic and the refusal path |
 | The end-to-end modeset | **not written** — `modeset::set_mode` is specified and not implemented | nothing |
 | The console handover keeping the firmware's surface on a failed verdict | **reasoned, not observed** (`docs/design/intel-modeset.md` §8) | a prediction |
