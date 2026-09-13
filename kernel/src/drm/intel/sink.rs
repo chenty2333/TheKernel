@@ -61,16 +61,21 @@ pub(crate) struct DeviceSink {
 }
 
 impl DeviceSink {
-    /// What phase 2 found on this device, as the lines a person reads off the
-    /// screen or out of `/sys/kernel/debug/dri/0/intel_gpu`.
+    /// This device's lines, as the report writes them.
     ///
     /// The rendering lives on the value rather than on a report type that
-    /// aggregates devices: the aggregation is the connector step's
-    /// (`connect::ConnectReport`), and what is left here is one display's own
-    /// facts.  Every line is prefixed, so a reader who pipes the file into a log
-    /// can grep one word to find all of it, exactly as the probe's report does.
-    pub(crate) fn render(&self) -> String {
-        let mut out = format!("display {}:\n", self.bdf);
+    /// aggregates devices: the aggregation belongs to the step that composes
+    /// them (the connector's `ConnectReport`), and what is left here is one
+    /// display's own facts.  It is split out because a phase-2 probe is no
+    /// longer only a boot step -- the after-boot hotplug watch re-runs
+    /// [`probe_one`] for the device whose connect state changed, and the result
+    /// has to read the same way in the debug file as the boot result did.
+    /// Rendering it in one place is what keeps the two comparable.
+    ///
+    /// Every line is prefixed, so a reader who pipes the file into a log can
+    /// grep one word to find all of it, exactly as the probe's own report does.
+    pub(crate) fn render_into(&self, out: &mut String) {
+        out.push_str(&format!("display {}:\n", self.bdf));
         out.push_str(&self.pins.render());
         if let Some(extension) = &self.extension {
             out.push_str(&format!("  extension block: {}\n", extension.describe()));
@@ -89,6 +94,12 @@ impl DeviceSink {
         for (ddi, error) in &self.hotplug_errors {
             out.push_str(&format!("  {ddi}: {}\n", error.describe()));
         }
+    }
+
+    /// The same lines, for a caller that wants them as one string.
+    pub(crate) fn render(&self) -> String {
+        let mut out = String::new();
+        self.render_into(&mut out);
         out
     }
 }

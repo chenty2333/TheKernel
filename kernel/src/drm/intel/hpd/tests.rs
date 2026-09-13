@@ -11,7 +11,7 @@ use alloc::vec;
 
 use super::*;
 use crate::{
-    drm::intel::regs::{PROBE_WINDOW, Register, RegisterWindow},
+    drm::intel::regs::{PROBE_WINDOW, Register, RegisterWindow, mock::MockRegisters},
     test_support::scheduler_test_context,
 };
 
@@ -267,4 +267,237 @@ fn a_window_that_does_not_reach_the_hotplug_block_is_named() {
     // mistake "no monitor" for "the register read zero".
     assert!(live_state(&window, Ddi::A).is_err());
     assert!(polarity_inverted(&window, Ddi::A).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// The after-boot poll.
+//
+// These drive `poll_connect` and `ConnectTracker` through `MockRegisters`,
+// which logs every write -- so "the poll path writes nothing" is asserted as an
+// empty write log rather than argued from the code.
+// ---------------------------------------------------------------------------
+
+/// A monitor arrives on DDI B: the words, and what they decide.
+fn connected_on(regs: &MockRegisters) {
+    regs.set(SDEISR, Ddi::B.live_bit());
+}
+
+#[test]
+fn a_poll_reads_both_status_registers_and_writes_none_of_them() {
+    let _guard = scheduler_test_context();
+    let regs = MockRegisters::new();
+    connected_on(&regs);
+    // The board inverts DDI D, which is a different DDI with a different bit:
+    // one poll has to decide four ports from two words.
+    regs.set(SOUTH_CHICKEN1, Ddi::D.invert_bit());
+
+    let poll = poll_connect(&regs);
+    assert_eq!(poll.failure(), None);
+    let states = poll.states();
+
+    let b = states[Ddi::B.index() as usize].expect("DDI B answered");
+    assert!(b.connected);
+    assert!(!b.polarity_inverted);
+    assert_eq!(b.interrupt_status, Ddi::B.live_bit());
+
+    let d = states[Ddi::D.index() as usize].expect("DDI D answered");
+    assert!(
+        d.connected,
+        "a clear live bit through an inverting shifter is a connect"
+    );
+    assert!(d.polarity_inverted);
+
+    assert!(!states[Ddi::A.index() as usize].unwrap().connected);
+    assert!(!states[Ddi::C.index() as usize].unwrap().connected);
+
+    // `SDEISR` is write-one-to-clear, so a poll that wrote anything would be
+    // discarding the state it came to read.  The mock logs every write that
+    // happened, and the log is empty.
+    let writes = regs.writes();
+    assert!(writes.is_empty(), "the poll path wrote {writes:?}");
+}
+
+#[test]
+fn a_read_that_fails_is_no_state_at_all_and_names_the_register() {
+    let _guard = scheduler_test_context();
+    // The status word is there but unreachable, as a window that does not reach
+    // it would be.  A register that cannot be read must not be guessed at: the
+    // bit being absent from a word nobody read is not "nothing is connected".
+    let regs = MockRegisters::new();
+    regs.set(SDEISR, 0xffff_ffff);
+    regs.set(SOUTH_CHICKEN1, 0xffff_ffff);
+    regs.hide(SDEISR);
+
+    let poll = poll_connect(&regs);
+    for ddi in Ddi::ALL {
+        assert_eq!(poll.state(ddi), None, "{ddi}");
+    }
+    assert_eq!(
+        poll.failure(),
+        Some(HpdError::WindowTooSmall { register: "SDEISR" })
+    );
+    assert!(poll.failure().unwrap().describe().contains("SDEISR"));
+    assert!(regs.writes().is_empty());
+
+    // The polarity word alone is enough to make every decision unknown, and it
+    // is named too: applying a polarity nobody read would be a wrong answer
+    // rather than no answer.
+    let regs = MockRegisters::new();
+    regs.set(SDEISR, Ddi::A.live_bit());
+    regs.hide(SOUTH_CHICKEN1);
+    let poll = poll_connect(&regs);
+    for ddi in Ddi::ALL {
+        assert_eq!(poll.state(ddi), None, "{ddi}");
+    }
+    assert_eq!(
+        poll.failure(),
+        Some(HpdError::WindowTooSmall {
+            register: "SOUTH_CHICKEN1"
+        })
+    );
+    assert!(regs.writes().is_empty());
+}
+
+#[test]
+fn a_connect_and_a_disconnect_are_each_one_transition_and_repeats_are_not() {
+    let _guard = scheduler_test_context();
+    let regs = MockRegisters::new();
+    let mut tracker = ConnectTracker::new();
+    // The baseline is what the boot step reported: nothing connected.
+    for ddi in Ddi::ALL {
+        tracker.seed(ddi, false);
+    }
+
+    // The same read twice is not an event.  This is the first read, so it is
+    // also the check that a steady state produces nothing at all.
+    let first = poll_connect(&regs);
+    assert_eq!(first.failure(), None);
+    for state in first.states().into_iter().flatten() {
+        assert_eq!(tracker.observe(state), None);
+    }
+
+    // A monitor arrives.
+    connected_on(&regs);
+    let arriving = poll_connect(&regs);
+    let transition = tracker
+        .observe(arriving.state(Ddi::B).expect("DDI B answered"))
+        .expect("a connect is a transition");
+    assert_eq!(transition.ddi, Ddi::B);
+    assert!(!transition.from);
+    assert!(transition.state.connected);
+
+    // The same read again is not.
+    let again = poll_connect(&regs);
+    assert_eq!(
+        again.state(Ddi::B).unwrap(),
+        arriving.state(Ddi::B).unwrap()
+    );
+    assert_eq!(tracker.observe(again.state(Ddi::B).unwrap()), None);
+
+    // And it goes away again, which is the other edge.
+    regs.set(SDEISR, 0);
+    let leaving = poll_connect(&regs);
+    let transition = tracker
+        .observe(leaving.state(Ddi::B).expect("DDI B answered"))
+        .expect("a disconnect is a transition");
+    assert!(transition.from);
+    assert!(!transition.state.connected);
+
+    // The line a person reads carries the raw words, because on the target
+    // machine they are the diagnostic.
+    let text = transition.describe();
+    assert!(text.contains("DDI B: connected -> disconnected"), "{text}");
+    assert!(text.contains("SDEISR 0x00000000"), "{text}");
+    assert!(text.contains("SOUTH_CHICKEN1 0x00000000"), "{text}");
+}
+
+#[test]
+fn the_polarity_bit_flips_the_decision_and_the_transition_with_it() {
+    let _guard = scheduler_test_context();
+    let regs = MockRegisters::new();
+    // One board, one set of words, two DDIs that read differently because one
+    // of them has its inversion bit set: a clear live bit is a connected sink
+    // only where the level shifter is in the way (reference §9.5).
+    connected_on(&regs);
+    let plain = poll_connect(&regs).state(Ddi::B).expect("DDI B");
+    assert!(plain.connected);
+    assert!(!plain.polarity_inverted);
+
+    let regs = MockRegisters::new();
+    regs.set(SOUTH_CHICKEN1, Ddi::B.invert_bit());
+    let inverted = poll_connect(&regs).state(Ddi::B).expect("DDI B");
+    assert!(inverted.polarity_inverted);
+    assert!(
+        inverted.connected,
+        "with the shifter inverting hotplug, a clear bit is a connect"
+    );
+
+    // The bit being *set* is the other state, so the same tracker sees the
+    // opposite edge on the same word.
+    regs.set(SDEISR, Ddi::B.live_bit());
+    let mut tracker = ConnectTracker::new();
+    tracker.seed(Ddi::B, true);
+    let transition = tracker
+        .observe(poll_connect(&regs).state(Ddi::B).expect("DDI B"))
+        .expect("the bit now means disconnected");
+    assert!(transition.from);
+    assert!(!transition.state.connected);
+    assert!(
+        transition.describe().contains("board inversion set"),
+        "{}",
+        transition.describe()
+    );
+}
+
+#[test]
+fn a_read_that_failed_is_not_an_event_and_does_not_reset_the_baseline() {
+    let _guard = scheduler_test_context();
+    let working = MockRegisters::new();
+    connected_on(&working);
+    let broken = MockRegisters::new();
+    connected_on(&broken);
+    broken.hide(SDEISR);
+
+    let mut tracker = ConnectTracker::new();
+    for ddi in Ddi::ALL {
+        tracker.seed(ddi, false);
+    }
+    let arriving = poll_connect(&working);
+    assert!(tracker.observe(arriving.state(Ddi::B).unwrap()).is_some());
+
+    // The next poll cannot read the register.  There is no state to fold in, so
+    // there is no event -- and, when the register answers again with the same
+    // state, still no event: "I could not look" reset nothing.
+    let failed = poll_connect(&broken);
+    let reason = failed
+        .failure()
+        .expect("a poll that could not read must name the register")
+        .describe();
+    assert!(reason.contains("SDEISR"), "{reason}");
+    for state in failed.states().into_iter().flatten() {
+        panic!("a hidden register produced a state: {state:?}");
+    }
+    let again = poll_connect(&working);
+    assert_eq!(tracker.observe(again.state(Ddi::B).unwrap()), None);
+}
+
+#[test]
+fn a_first_answer_with_no_baseline_is_adopted_without_an_event() {
+    let _guard = scheduler_test_context();
+    let regs = MockRegisters::new();
+    connected_on(&regs);
+    // No seed: the boot step could not read this DDI, so there is nothing to
+    // have changed from.  Reporting the first look as a hotplug would say a
+    // monitor arrived when the truth is that this kernel had not looked yet.
+    let mut tracker = ConnectTracker::new();
+    let poll = poll_connect(&regs);
+    assert_eq!(tracker.observe(poll.state(Ddi::B).unwrap()), None);
+    // And the adoption is a baseline, not a one-off: the next change from it is
+    // an event.
+    regs.set(SDEISR, 0);
+    let transition = tracker
+        .observe(poll_connect(&regs).state(Ddi::B).unwrap())
+        .expect("the state changed from the adopted one");
+    assert!(transition.from);
+    assert!(!transition.state.connected);
 }
