@@ -69,7 +69,31 @@ pub(crate) mod offset {
     /// asserts none, which on a PCI Express function means it can only be
     /// reached by MSI.
     pub(crate) const INTERRUPT_PIN: u16 = 0x3d;
+    /// `SNB_GMCH_CTRL`, which is not a standard header field: Intel reuses this
+    /// dword of the function's own header for the graphics memory size, and on
+    /// Gen8 and later bits `[7:6]` are the `GGMS` field that says how much page
+    /// table the GGTT has.
+    ///
+    /// `[I915]` `include/drm/intel/i915_drm.h:49` (`#define SNB_GMCH_CTRL 0x50`),
+    /// read by `gt/intel_ggtt.c:1228-1232` on every Gen8 and later part, so the
+    /// target's Gen12 display function is one of them.
+    pub(crate) const GMCH_CTL: u16 = 0x50;
 }
+
+/// `BDW_GMCH_GGMS_SHIFT`: where the `GGMS` field starts on Gen8 and later.
+///
+/// `[I915]` `include/drm/intel/i915_drm.h:54`.  The older `SNB` encoding puts
+/// the same field at bit 8 (`:50-51`), which is why the shift is a constant
+/// here rather than a literal at the read: `gen8_get_total_gtt_size()` is the
+/// function this generation's probe calls (`gt/intel_ggtt.c:1230-1232` for
+/// `GRAPHICS_VER >= 8`).
+pub(crate) const GMCH_GGMS_SHIFT: u16 = 6;
+
+/// `BDW_GMCH_GGMS_MASK`: the width of the `GGMS` field.
+///
+/// `[I915]` `include/drm/intel/i915_drm.h:55`.  Two bits is why the field names
+/// four values and no more.
+pub(crate) const GMCH_GGMS_MASK: u16 = 0x3;
 
 /// The configuration-space dword offset of BAR `slot`.
 pub(crate) const fn bar_offset(slot: u8) -> u16 {

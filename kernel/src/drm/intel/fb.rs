@@ -55,12 +55,13 @@
 //!   is a property of the machine this driver is for.
 //! * **It does not depend on cache coherency this kernel cannot test.**  A
 //!   cacheable CPU view would rely on the display engine snooping the CPU's
-//!   cache.  `[I915]`'s device information does say ADL-N has an LLC
-//!   (`has_llc = 1` through `GEN12_FEATURES` -> `GEN9_FEATURES`,
-//!   `i915_pci.c:477-482,634-640`), and the vendor driver sets a scanout
-//!   object's cache coherency to `I915_CACHE_WT` where the platform has
+//!   cache.  `[I915]`'s device information does say this generation has an LLC
+//!   (`.has_llc = 1` in `GEN7_FEATURES`, `i915_pci.c:316`, inherited through
+//!   `GEN8_FEATURES` `:413-420`, `GEN9_FEATURES` `:477-481`, `GEN11_FEATURES`
+//!   `:606-611` and `GEN12_FEATURES` `:634-640`), and the vendor driver sets a
+//!   scanout object's cache coherency to `I915_CACHE_WT` where the platform has
 //!   write-through and `I915_CACHE_NONE` otherwise
-//!   (`display/intel_plane_initial.c:186-193`; `HAS_WT` is `HAS_EDRAM`,
+//!   (`display/intel_plane_initial.c:184-190`; `HAS_WT` is `HAS_EDRAM`,
 //!   `i915_drv.h:659`, which ADL-N does not have).  Uncached writes do not
 //!   need any of that to be true.
 //!
@@ -68,12 +69,33 @@
 //! line, on a console that is written a glyph at a time.  That is the same
 //! trade `bootfb` already makes.
 //!
-//! One consequence is written down rather than hidden: `/dev/fb0` maps the
-//! surface as a physical range, and the mapping a userspace writer gets is
-//! cacheable while the kernel's is not.  That arrangement is exactly the one
-//! the firmware aperture already has, and the fbdev ABI's explicit publication
-//! points (`fsync`, `FBIOPAN_DISPLAY`) are where the two views are reconciled;
-//! see `docs/design/intel-scanout.md`.
+//! ## The userspace mapping is cacheable, and nothing reconciles the two views
+//!
+//! `/dev/fb0` maps the surface as a physical range ([`super::scanout`]'s
+//! `DeviceMmap::Physical`), so a userspace writer's view of these pages is
+//! cacheable (write-back) while the kernel's view is device-uncached.  **The
+//! fbdev ABI's publication points do not reconcile them.**  In this backend
+//! `fsync` reaches [`super::scanout`]'s `present`, which accepts and does
+//! nothing (there is no submission for a linear aperture), and
+//! `FBIOPAN_DISPLAY` reaches `pan`, which refuses, so no flush, fence or
+//! register write happens between a userspace store and the display engine's
+//! read of the same bytes.
+//!
+//! The position is therefore the one this module's own argument was trying to
+//! avoid, and it is stated rather than implied: **a userspace writer's pixels
+//! reach the display engine only if the engine's GGTT reads snoop the CPU's
+//! cache.**  `[I915]`'s device information does say this part has an LLC
+//! (`.has_llc = 1` in `GEN7_FEATURES`, `i915_pci.c:316`, inherited by
+//! `GEN12_FEATURES` at `:634-640`), which is the mechanism that would make it
+//! work, but the *kernel's* view is uncached precisely so that it does not
+//! depend on that, and the vendor driver's own scanout objects are set to
+//! `I915_CACHE_NONE`/`WT` rather than left cacheable
+//! (`display/intel_plane_initial.c:184-190`).  Nothing here has measured
+//! whether a cacheable userspace store is visible to this display engine; an
+//! early eviction may or may not have happened by the time the engine reads.
+//! It is on the hardware checklist in `docs/design/intel-scanout.md` §8, and a
+//! flush is *not* added for it: a flush this kernel cannot test is a claim,
+//! not a fix.
 //!
 //! ## Stride
 //!
@@ -85,9 +107,17 @@
 //! (`display/skl_universal_plane.c:671-697`; the read-back multiplies,
 //! `:2782-2785`).  Reference §5.4's table says the register is "stride in
 //! bytes", which contradicts its own §11 phase 3.2 requirement that the stride
-//! be a multiple of 64; the register value this surface produces is
-//! [`Surface::stride_units`], and `docs/design/intel-scanout.md` records the
-//! correction.
+//! be a multiple of 64.
+//!
+//! **The conversion to register units happens where the register is written**
+//! -- `pipe::PlaneProgram`'s `stride_field`, which refuses a stride that is not
+//! a multiple of 64 and one that does not fit the twelve-bit field
+//! (`super::pipe`).  [`Plan::stride_units_for_log`] is a *log* number and
+//! nothing else: it is named so that it cannot be mistaken for the register
+//! value, and the test
+//! `the_plane_register_gets_the_surfaces_stride_in_sixty_four_byte_units`
+//! builds one of these surfaces into a `pipe::PlaneSurface` and checks that the
+//! two agree.  `docs/design/intel-scanout.md` records the correction.
 
 use alloc::string::String;
 
@@ -212,8 +242,15 @@ impl Plan {
         self.stride
     }
 
-    /// The value `PLANE_STRIDE[11:0]` wants: the stride in 64-byte units.
-    pub(crate) const fn stride_units(self) -> u32 {
+    /// The stride in 64-byte units, for a log line only.
+    ///
+    /// This is **not** the value written to `PLANE_STRIDE`: the register's own
+    /// conversion lives where the register is written (`super::pipe`, which is
+    /// the module that refuses a stride that is not a multiple of 64 and one
+    /// that does not fit the field).  This one can refuse nothing and nothing
+    /// acts on it, which is why it is named for the log rather than for the
+    /// register.
+    pub(crate) const fn stride_units_for_log(self) -> u32 {
         self.stride / STRIDE_UNIT
     }
 
@@ -309,9 +346,16 @@ impl FbError {
 /// A surface of memory the display engine can read.
 ///
 /// The value owns its memory: dropping it returns the pages to the allocator.
-/// It also owns the page table entries that name them, but not the aperture
-/// range's bookkeeping -- nothing in this kernel frees a console surface, and
-/// [`Gtt`] deliberately has no unmap path (see its module comment).
+/// **Nothing in this kernel drops a surface once its page table entries exist**,
+/// and that is deliberate rather than incidental.  Two things forbid freeing
+/// one: the GGTT entries naming its pages stay present for the rest of the
+/// boot, because [`Gtt`] has no unmap path (see its module comment), and the
+/// display engine may still be reading the address those entries name.  Pages
+/// handed back to the allocator under a present entry would be scanned out as
+/// whatever the next owner puts there, and pages handed back under a live
+/// *mapping* would be worse still -- see [`Surface::allocate`]'s failure path.
+/// [`super::scanout`] keeps every surface it has offered, including the ones a
+/// later offer replaced.
 pub(crate) struct Surface {
     /// The allocation that owns the memory.  Held whether or not anything
     /// reads it, because dropping it is what returns the pages.
@@ -391,7 +435,9 @@ impl Surface {
                 // pages are deliberately not returned to the allocator here: a
                 // live mapping of memory that has been handed to someone else
                 // is worse than a few leaked pages on a path that runs at most
-                // once per boot.
+                // once per boot.  The leak is the reason and not a side effect
+                // -- the pages cannot be freed while that mapping names them,
+                // and it cannot be unmapped from here.
                 core::mem::forget(memory);
                 return Err(FbError::Gtt(error));
             }
@@ -421,9 +467,10 @@ impl Surface {
         self.plan.stride()
     }
 
-    /// The value `PLANE_STRIDE[11:0]` wants: the stride in 64-byte units.
-    pub(crate) fn stride_units(&self) -> u32 {
-        self.plan.stride_units()
+    /// The stride in 64-byte units, for a log line only; see
+    /// [`Plan::stride_units_for_log`].
+    pub(crate) fn stride_units_for_log(&self) -> u32 {
+        self.plan.stride_units_for_log()
     }
 
     /// Visible width in pixels.
@@ -510,11 +557,34 @@ impl Surface {
 
 #[cfg(test)]
 mod tests {
-    use super::{super::gtt::mock::MockPageTable, *};
+    use super::{
+        super::{
+            gtt::{SCANOUT_ALIGNMENT, SCANOUT_PADDING_ENTRIES, mock::MockPageTable},
+            pipe::{self, Pipe},
+        },
+        *,
+    };
+    use crate::drm::modes::CTA_VIC_TIMINGS;
+
+    /// A page table with room for the surfaces these tests allocate *and* for
+    /// the padding and 256 KiB alignment every run now needs: a 1920x1080
+    /// surface is 2025 pages, its block is 2089 entries, and the search needs a
+    /// 256 KiB boundary below the reserved top page for it.
+    const ROOM_FOR_A_1080P_SURFACE: usize = 4096;
 
     /// A page table big enough for any surface a test allocates here.
-    fn test_gtt(pages: usize) -> Gtt {
-        Gtt::over(alloc::boxed::Box::new(MockPageTable::new(pages))).unwrap()
+    fn test_gtt(entries: usize) -> Gtt {
+        Gtt::over(alloc::boxed::Box::new(MockPageTable::new(entries))).unwrap()
+    }
+
+    /// The mode §11 phase 3.1 names for a first light-up: CTA-861 VIC 16,
+    /// 1920x1080@60.
+    fn vic16() -> crate::drm::modes::Mode {
+        CTA_VIC_TIMINGS
+            .iter()
+            .find(|entry| entry.vic == 16)
+            .expect("VIC 16 is in the kernel's CTA table")
+            .mode
     }
 
     #[test]
@@ -522,7 +592,7 @@ mod tests {
         let _guard = crate::test_support::scheduler_test_context();
         let plan = Plan::of(1920, 1080, Format::Xrgb8888).unwrap();
         assert_eq!(plan.stride(), 7680);
-        assert_eq!(plan.stride_units(), 120);
+        assert_eq!(plan.stride_units_for_log(), 120);
         // 2025 whole pages, and the last of them is not shared with anything.
         assert_eq!(plan.size(), 8_294_400);
         assert_eq!(plan.size(), 1920 * 1080 * 4);
@@ -540,7 +610,7 @@ mod tests {
         // 1000 pixels at 32 bits is 4000 bytes, which is not a multiple of 256.
         let plan = Plan::of(1000, 100, Format::Xrgb8888).unwrap();
         assert_eq!(plan.stride(), 4096);
-        assert_eq!(plan.stride_units(), 64);
+        assert_eq!(plan.stride_units_for_log(), 64);
         assert_eq!(plan.size(), 409_600);
     }
 
@@ -637,16 +707,19 @@ mod tests {
     #[test]
     fn an_allocated_surface_is_aligned_present_and_black() {
         let _guard = crate::test_support::scheduler_test_context();
-        let gtt = test_gtt(64);
+        let gtt = test_gtt(ROOM_FOR_A_1080P_SURFACE);
         let surface = Surface::allocate(&gtt, 64, 64, Format::Xrgb8888).unwrap();
         // 64 pixels at 32 bits is already a multiple of 256.
         assert_eq!(surface.stride(), 256);
-        assert_eq!(surface.stride_units(), 4);
+        assert_eq!(surface.stride_units_for_log(), 4);
         assert_eq!(surface.len(), 256 * 64);
         // The base is page aligned, which is what PLANE_SURF[31:12] requires
-        // and what the page table entry can name at all.
+        // and what the page table entry can name at all, and it is on the
+        // 256 KiB boundary and followed by the padding entries the VT-d
+        // workaround wants (see `gtt::SCANOUT_ALIGNMENT`).
         assert_eq!(surface.physical_address() % PAGE_SIZE, 0);
         assert_eq!(surface.ggtt_address() % PAGE_SIZE, 0);
+        assert_eq!(surface.ggtt_address() % SCANOUT_ALIGNMENT, 0);
         // Every page of the run has a present entry naming the right page.
         let pages = surface.len() as u64 / PAGE_SIZE;
         for page in 0..pages {
@@ -673,7 +746,7 @@ mod tests {
         // addresses pitch * virtual_height bytes.  That has to hold whatever
         // the geometry, because the allocation is rounded up to whole pages and
         // the padding is what makes it hold.
-        let gtt = Gtt::over(alloc::boxed::Box::new(MockPageTable::new(64))).unwrap();
+        let gtt = test_gtt(ROOM_FOR_A_1080P_SURFACE);
         // 100 pixels at 32 bits is 400 bytes, padded to a 512-byte stride, and
         // 100 scan lines of that is 51 200 bytes: not a whole number of pages.
         let padded = Surface::allocate(&gtt, 100, 100, Format::Xrgb8888).unwrap();
@@ -694,7 +767,7 @@ mod tests {
     #[test]
     fn a_byte_range_outside_the_surface_is_refused() {
         let _guard = crate::test_support::scheduler_test_context();
-        let gtt = test_gtt(64);
+        let gtt = test_gtt(ROOM_FOR_A_1080P_SURFACE);
         let surface = Surface::allocate(&gtt, 64, 64, Format::Xrgb8888).unwrap();
         let len = surface.len();
         let mut dst = [0u8; 8];
@@ -723,6 +796,63 @@ mod tests {
                 assert_eq!(pages, bytes / PAGE_SIZE as usize);
             }
             other => panic!("expected an allocation failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_plane_register_gets_the_surfaces_stride_in_sixty_four_byte_units() {
+        // The handoff the two modules never had a test for: a real surface from
+        // this module, built into the `PlaneSurface` the pipe module programs,
+        // and the value it writes to `PLANE_STRIDE` -- taken from the program's
+        // own write list, so it is the number a register receives and not a
+        // second computation of it.
+        let _guard = crate::test_support::scheduler_test_context();
+        let gtt = test_gtt(ROOM_FOR_A_1080P_SURFACE);
+        let surface = Surface::allocate(&gtt, 1920, 1080, Format::Xrgb8888).unwrap();
+        assert_eq!(surface.stride(), 7680);
+        let program = pipe::compute(
+            Pipe::A,
+            &vic16(),
+            pipe::PlaneSurface {
+                ggtt_address: surface.ggtt_address(),
+                stride_bytes: surface.stride(),
+            },
+        )
+        .unwrap();
+        // `PLANE_STRIDE` counts 64-byte units for a linear surface
+        // (display/skl_universal_plane.c:671-697), so the register value is the
+        // byte stride divided by 64 and nothing else.
+        assert_eq!(program.plane.stride, surface.stride() / STRIDE_UNIT);
+        assert_eq!(program.plane.stride, 120);
+        assert_eq!(program.plane.stride_bytes, surface.stride());
+        let write = program
+            .writes(0, 0)
+            .into_iter()
+            .find(|write| write.register == Pipe::A.plane_stride())
+            .expect("the pipe programs PLANE_STRIDE");
+        assert_eq!(write.value, surface.stride() / STRIDE_UNIT);
+        // The log-only number is the same number here, and it is a log-only
+        // number: see `Plan::stride_units_for_log`.
+        assert_eq!(write.value, surface.stride_units_for_log());
+    }
+
+    #[test]
+    fn the_padding_after_a_surface_is_bound_to_the_zero_page() {
+        // The entries after the surface are present and name a page of zeros,
+        // not the surface: that is what the VT-d workaround asks for, and it
+        // must not be the surface's own memory, which the engine would read
+        // past the end of the picture.
+        let _guard = crate::test_support::scheduler_test_context();
+        let gtt = test_gtt(ROOM_FOR_A_1080P_SURFACE);
+        let surface = Surface::allocate(&gtt, 1920, 1080, Format::Xrgb8888).unwrap();
+        let scratch = gtt.scratch_entry();
+        let pages = surface.len() as u64 / PAGE_SIZE;
+        for entry in pages..pages + SCANOUT_PADDING_ENTRIES {
+            let pte = gtt
+                .entry(surface.ggtt_address() + entry * PAGE_SIZE)
+                .unwrap();
+            assert_eq!(pte, scratch, "padding entry {entry}");
+            assert!(!pte.describes(surface.physical_address()));
         }
     }
 

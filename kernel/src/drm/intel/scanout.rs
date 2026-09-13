@@ -53,7 +53,7 @@
 //!
 //! | Method | What it does here |
 //! |---|---|
-//! | [`present`](ScanoutSurface::present) | Nothing, and accepts: a write is visible as soon as it lands, so there is nothing to submit.  The damage tracker and the fbdev ABI's publication points keep one meaning across backends. |
+//! | [`present`](ScanoutSurface::present) | Nothing, and accepts: a write through this kernel's uncached mapping is visible as soon as it lands, so there is nothing to submit.  It is **not** a publication point for a cacheable userspace mapping of `/dev/fb0` -- no register is written and no cache is flushed -- and §4.3 of the design record says what that leaves a raw writer depending on. |
 //! | [`pan`](ScanoutSurface::pan) | Refuses: the visible window is the plane's, not this surface's, and the surface is one screen tall.  A caller that believed a pan happened would display the wrong page. |
 //! | [`set_blank`](ScanoutSurface::set_blank) | Accepts and does nothing: blanking is a pipe/plane write this surface does not own.  Same choice, and the same reason, as [`crate::pseudofs::dev::bootfb`]. |
 //! | [`restore_text`](ScanoutSurface::restore_text) | Nothing to do: the console's pixels *are* the surface's contents. |
@@ -123,6 +123,36 @@ struct Offered {
 /// accumulating.
 static OFFERED: Mutex<Option<Offered>> = Mutex::new(None);
 
+/// The offers a later one replaced, kept alive rather than dropped.
+///
+/// **A replaced offer must not be freed.**  [`Surface`] owns its pages, so
+/// dropping the last `Arc` returns them to the page allocator -- while the
+/// page table entries naming them stay present for the rest of the boot
+/// (nothing in this kernel unmaps; see `gtt`'s module comment) and while the
+/// display engine may still be scanning the address they name.  The console
+/// holds no `Arc` of its own beyond what it is drawing into, and a userspace
+/// `/dev/fb0` mapping of the same range can outlive any of this, so "nothing
+/// has a clone" is not the same as "nothing is reading it".
+///
+/// Keeping the `Arc` is the whole of the fix and the list is what makes the
+/// retirement a value rather than a `mem::forget`.  It is a leak by design, on
+/// the same reasoning as [`Surface::allocate`]'s failure path, and it grows by
+/// at most one entry per boot: registering twice is already a warning, not a
+/// normal event.
+static RETIRED: Mutex<alloc::vec::Vec<Arc<Surface>>> = Mutex::new(alloc::vec::Vec::new());
+
+/// Put `offered` in the slot, retiring whatever was there, and say whether
+/// anything was.
+fn offer(offered: Offered) -> bool {
+    match OFFERED.lock().replace(offered) {
+        Some(previous) => {
+            RETIRED.lock().push(previous.surface);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Offer an Intel framebuffer to the console, with the evidence for it.
 ///
 /// The call sequence this expects is:
@@ -147,14 +177,12 @@ pub(crate) fn register(surface: Arc<Surface>, verdict: Verdict) {
              (reference section 11 phase 6)"
         );
     }
-    let replaced = OFFERED
-        .lock()
-        .replace(Offered { surface, refused })
-        .is_some();
-    if replaced {
+    if offer(Offered { surface, refused }) {
         warn!(
             "scanout: a second Intel framebuffer surface replaced the first; the registered \
-             candidate will hand over the newer one"
+             candidate will hand over the newer one, and the older one is kept because its page \
+             table entries stay present and the display engine may still be scanning the address \
+             they name"
         );
     }
     screen::register(candidate());
@@ -215,7 +243,7 @@ fn publish(surface: Arc<Surface>) {
             surflive: surface.ggtt_address(),
         },
     );
-    OFFERED.lock().replace(Offered { surface, refused });
+    let _ = offer(Offered { surface, refused });
 }
 
 impl ScanoutSurface for Surface {
@@ -273,10 +301,16 @@ impl ScanoutSurface for Surface {
         // The surface is one contiguous physical range, so userspace maps it
         // directly rather than through page objects, and the framebuffer's
         // address can be reported truthfully instead of as a fictitious zero.
+        //
         // The mapping a user gets is cacheable while the kernel's view of the
-        // same pages is device-uncached; that is the same arrangement the
-        // firmware aperture already has, and it is recorded in
-        // docs/design/intel-scanout.md.
+        // same pages is device-uncached, and **nothing in this backend
+        // reconciles the two**: `present` writes no register and `pan` refuses,
+        // so neither publication point pushes a userspace store out to the
+        // display engine.  A raw writer therefore depends on the engine's GGTT
+        // reads snooping the CPU's cache, which is the coherency dependency the
+        // kernel's own uncached view exists to avoid; `fb`'s module comment
+        // states the position and docs/design/intel-scanout.md §4.3 records
+        // it.
         match PhysAddrRange::try_from_start_size(
             PhysAddr::from_usize(self.physical_address() as usize),
             self.len(),
@@ -287,11 +321,17 @@ impl ScanoutSurface for Surface {
     }
 
     fn present(&self) -> AxResult<()> {
-        // A linear aperture is the display controller's own memory: a write is
-        // visible as soon as it lands and there is nothing to submit.  The call
-        // is still accepted so that the damage tracker and the explicit
-        // publication points in the fbdev ABI keep one meaning on every
-        // backend.
+        // A linear aperture is the display controller's own memory: a write
+        // *through this kernel's device-uncached mapping* is visible as soon as
+        // it lands and there is nothing to submit.  The call is still accepted
+        // so that the damage tracker and the explicit publication points in the
+        // fbdev ABI keep one meaning on every backend.
+        //
+        // What it does not do is publish a userspace writer's cacheable mapping
+        // of the same pages: no register is written and no cache is flushed, so
+        // `fsync` on /dev/fb0 is not a publication point for this backend.  The
+        // position is stated in `fb`'s module comment rather than fixed with a
+        // flush this kernel has no way to test.
         Ok(())
     }
 
@@ -328,12 +368,13 @@ impl ScanoutSurface for Surface {
 /// A one-line description of the surface, for a boot log.
 pub(crate) fn describe(surface: &Surface) -> String {
     format!(
-        "{}x{} {} pitch {} (PLANE_STRIDE {}), physical {:#x}, ggtt {:#x}, {} bytes",
+        "{}x{} {} pitch {} bytes ({} in the 64-byte units PLANE_STRIDE counts), physical {:#x}, \
+         ggtt {:#x}, {} bytes",
         surface.width(),
         surface.height(),
         surface.plan().format().name(),
         surface.stride(),
-        surface.stride_units(),
+        surface.stride_units_for_log(),
         surface.physical_address(),
         surface.ggtt_address(),
         surface.len()
@@ -344,21 +385,25 @@ pub(crate) fn describe(surface: &Surface) -> String {
 mod tests {
     use super::{
         super::{
-            fb::{Format, Plan},
-            gtt::{Gtt, PAGE_SIZE, mock::MockPageTable},
+            fb::Format,
+            gtt::{Gtt, mock::MockPageTable},
         },
         *,
     };
     use crate::drm::screen::decide;
 
-    /// A surface over a page table in ordinary memory, sized so the mock's
-    /// allocation is a few pages rather than a few thousand.
+    /// A page table with room for the alignment and the padding a run needs.
+    ///
+    /// A run is placed on a 256 KiB boundary with 64 entries of padding after
+    /// it, so a mock table sized to the surface alone would refuse it.
+    const TEST_TABLE_ENTRIES: usize = 4096;
+
+    /// A surface over a page table in ordinary memory.
     fn surface(width: u32, height: u32) -> (Arc<Surface>, Gtt) {
-        let plan = Plan::of(width, height, Format::Xrgb8888).unwrap();
-        let pages = plan.size() / PAGE_SIZE as usize;
-        // One page more than the surface needs: the first page of the aperture
-        // is never handed out (see `gtt::RESERVED_LOW_APERTURE`).
-        let gtt = Gtt::over(alloc::boxed::Box::new(MockPageTable::new(pages + 1))).unwrap();
+        let gtt = Gtt::over(alloc::boxed::Box::new(MockPageTable::new(
+            TEST_TABLE_ENTRIES,
+        )))
+        .unwrap();
         let surface = Arc::new(Surface::allocate(&gtt, width, height, Format::Xrgb8888).unwrap());
         (surface, gtt)
     }
@@ -429,8 +474,8 @@ mod tests {
         // 100 pixels at 32 bits is 400 bytes, padded up to a whole 256-byte
         // multiple: 512, which is eight 64-byte units.
         assert_eq!(pitch, 512);
-        assert_eq!(surface.stride_units(), pitch / 64);
-        assert_eq!(surface.stride_units() * 64, pitch);
+        assert_eq!(surface.stride_units_for_log(), pitch / 64);
+        assert_eq!(surface.stride_units_for_log() * 64, pitch);
     }
 
     #[test]
@@ -511,11 +556,15 @@ mod tests {
     }
 
     #[test]
-    fn a_modeset_that_did_not_prove_it_is_scanning_leaves_the_firmware_console_alone() {
+    fn a_modeset_that_did_not_prove_it_is_scanning_is_refused_and_the_search_continues() {
         let _guard = crate::test_support::scheduler_test_context();
         // The failure this pins down is the expensive one on a machine with no
         // serial port: a candidate that took the screen for a display that is
-        // dark would take the log with it.
+        // dark would take the log with it.  This test cannot show that the
+        // firmware console *wins* -- its provider below is a stub that answers
+        // `Unavailable::Absent`, because a host test has no firmware
+        // framebuffer -- so what it pins is that the refused candidate does not
+        // win and that the search moves past it.
         let (surface, _gtt) = surface(640, 480);
         register(
             surface,
@@ -537,7 +586,8 @@ mod tests {
         );
         let selection = decide(&[candidate(), firmware], &mut |_| {});
         // Ours is refused, and the search moves on rather than ending on a
-        // surface nothing scans out.
+        // surface nothing scans out.  Nothing wins here only because the
+        // stand-in below has no framebuffer either.
         assert_eq!(selection.winner(), None);
         match &selection.considered[0].verdict {
             screen::Verdict::Unavailable(Unavailable::Failed(reason)) => {
@@ -583,6 +633,39 @@ mod tests {
             }
             other => panic!("expected the candidate to refuse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_replaced_offer_is_retired_rather_than_freed() {
+        let _guard = crate::test_support::scheduler_test_context();
+        let gtt = Gtt::over(alloc::boxed::Box::new(MockPageTable::new(
+            TEST_TABLE_ENTRIES,
+        )))
+        .unwrap();
+        let first = surface_over(&gtt, 64, 64);
+        // A weak reference is the witness: it says whether the surface's pages
+        // are still owned, without keeping them alive itself.
+        let witness = Arc::downgrade(&first);
+        let ours = first.ggtt_address();
+        register(first, Verdict::Scanning { surflive: ours });
+        assert!(witness.upgrade().is_some(), "the offer owns the surface");
+
+        let second = surface_over(&gtt, 128, 64);
+        let ours = second.ggtt_address();
+        register(second, Verdict::Scanning { surflive: ours });
+        // The replaced surface's pages are still the kernel's: its page table
+        // entries stay present, and the display engine may still be scanning
+        // the address they name.
+        assert!(
+            witness.upgrade().is_some(),
+            "a replaced offer's pages must not go back to the allocator"
+        );
+        // And the candidate hands over the newer surface, not the retired one.
+        let selection = decide(&[candidate()], &mut |_| {});
+        assert_eq!(
+            selection.surface.as_ref().map(|surface| surface.width()),
+            Some(128)
+        );
     }
 
     #[test]
