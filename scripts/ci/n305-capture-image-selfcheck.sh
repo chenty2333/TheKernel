@@ -18,7 +18,7 @@ CACHE="${HOME}/.cache/thekernel-n305-capture"
 IMAGE=""
 KEEP=no
 BOOT_TIMEOUT=1800
-FRAME_INTERVAL=3
+FRAME_INTERVAL=2
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
@@ -175,8 +175,14 @@ if kill -0 "$QPID" 2>/dev/null; then
 	kill -9 "$QPID" 2>/dev/null || true
 	status=1
 else
-	wait "$QPID" || true
-	note "the guest powered itself off (this is the capture's success signal)"
+	# QEMU exits 0 only for a guest-initiated power-off.  Anything else (a
+	# signal, a crash) must not be mistaken for the capture's success signal.
+	if wait "$QPID"; then
+		note "the guest powered itself off (this is the capture's success signal)"
+	else
+		note "FAIL: QEMU exited without the guest powering itself off"
+		status=1
+	fi
 fi
 kill "$MONITOR" 2>/dev/null || true
 

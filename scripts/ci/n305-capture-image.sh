@@ -163,7 +163,7 @@ mkdir -p "$WORK/apks" "$WORK/apkovl" "$WORK/fat"
 # ---------------------------------------------------------------------------
 
 missing=()
-for tool in curl sha256sum sfdisk mkfs.vfat mcopy mmd truncate tar gzip python3 dd cmp od install; do
+for tool in curl sha256sum fdisk mkfs.vfat mcopy mmd truncate tar gzip python3 dd cmp od install; do
 	command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -454,13 +454,26 @@ truncate -s $((iso_bytes + PART_MIB * 1024 * 1024)) "$OUT"
 # Start after the ISO's own extent, never where sfdisk would put it: a dd'ed
 # hybrid ISO declares only the ISO and its embedded ESP, so an automatic
 # append would land inside the ISO9660 filesystem.
-printf '%s,%s,0c\n' "$iso_sectors" "$part_sectors" | sfdisk --append --no-reread "$OUT" > /dev/null
 python3 - "$OUT" "$iso_sectors" "$part_sectors" <<'GPTEOF'
-"""Add the payload partition to the ISO's GPT, leaving the ESP entry alone."""
+"""Record the payload partition in both of the ISO's partition tables.
+
+The slot it lands in is not cosmetic.  The kernel creates partition devices in
+MBR slot order, and Alpine's initramfs (nlplug-findfs) scans each device as
+its uevent arrives: MAX_EVENT_TIMEOUT (5000 ms) until it finds something, then
+DEFAULT_EVENT_TIMEOUT (250 ms) once it has the ISO's boot repository.  Putting
+the payload in slot 0 makes it the first partition uevent, so its apkovl is
+found inside the wide window however slow the machine is.  The vendor's own
+entries keep their contents, and the ISO entry keeps the boot flag the
+isohybrid MBR code looks for, so the vendor boot path is unchanged.
+"""
 import os, struct, sys, zlib
 
 image, start, sectors = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 SECTOR = 512
+PAYLOAD_TYPE = 0x0C  # W95 FAT32 (LBA)
+MBR_TABLE = 446
+MBR_ENTRIES = 4
+MBR_ENTRY_BYTES = 16
 DATA_GUID = bytes.fromhex("a2a0d0ebe5b9334487c068b6b72699c7")  # Microsoft basic data
 # Fixed rather than random so two builds of the same inputs are identical.
 UNIQUE_GUID = bytes.fromhex("4e9f1c7a2d3b584c9a614f0d2e5b8c31")
@@ -474,6 +487,44 @@ with open(image, "r+b") as disk:
     # The disk is the vendor ISO plus the payload partition plus the 63 sectors
     # a GPT reserves for its backup header and entry array at the very end.
     total = os.path.getsize(image) // SECTOR
+
+    # --- the hybrid MBR -------------------------------------------------
+    disk.seek(0)
+    mbr = bytearray(disk.read(SECTOR))
+    if struct.unpack_from("<H", mbr, 510)[0] != 0xAA55:
+        raise SystemExit("assembled image has no MBR signature")
+    entries = [bytes(mbr[MBR_TABLE + i * MBR_ENTRY_BYTES:MBR_TABLE + (i + 1) * MBR_ENTRY_BYTES])
+               for i in range(MBR_ENTRIES)]
+    # The vendor's bootable entry is an "Empty" (0x00) type covering the whole
+    # ISO: xorriso marks the isohybrid entry active without giving it a type,
+    # so the boot flag alone identifies it.
+    bootable = [e for e in entries if e[0] == 0x80]
+    if len(bootable) != 1:
+        raise SystemExit("expected exactly one bootable vendor MBR entry")
+    # The isohybrid boot entry is the one covering the ISO from sector zero.
+    iso_entry = bootable[0]
+    if struct.unpack_from("<I", iso_entry, 8)[0] != 0:
+        raise SystemExit("the bootable MBR entry is not the ISO entry at sector 0")
+    esp_entry = [e for e in entries if e[4] == 0xEF]
+    if len(esp_entry) != 1:
+        raise SystemExit("expected exactly one EFI system partition entry")
+    esp_entry = esp_entry[0]
+
+    payload_entry = bytearray(MBR_ENTRY_BYTES)
+    payload_entry[0] = 0x00
+    payload_entry[1:4] = b"\xfe\xff\xff"  # start CHS unused; LBA is authoritative
+    payload_entry[4] = PAYLOAD_TYPE
+    payload_entry[5:8] = b"\xfe\xff\xff"
+    struct.pack_into("<II", payload_entry, 8, start, sectors)
+
+    table = bytes(payload_entry) + iso_entry + esp_entry + bytes(MBR_ENTRY_BYTES)
+    if len(table) != MBR_ENTRIES * MBR_ENTRY_BYTES:
+        raise SystemExit("internal error: MBR table is the wrong size")
+    mbr[MBR_TABLE:MBR_TABLE + len(table)] = table
+    disk.seek(0)
+    disk.write(mbr)
+
+    # --- the GPT --------------------------------------------------------
     disk.seek(SECTOR)
     header = bytearray(disk.read(92))
     if header[:8] != b"EFI PART":
@@ -531,7 +582,7 @@ with open(image, "r+b") as disk:
     disk.seek(last_lba * SECTOR)
     disk.write(build_header(last_lba, 1))
     disk.flush()
-print("gpt: partition %d..%d recorded in entry %d" % (start, end, slot))
+print("partition tables: payload %d..%d in MBR slot 0 and GPT entry %d" % (start, end, slot))
 GPTEOF
 dd if="$WORK/payload.fat" of="$OUT" bs=512 seek="$iso_sectors" conv=notrunc status=none
 
@@ -599,7 +650,25 @@ GPTEOF
 # 2. The partition table says what it should.
 fdisk -l "$OUT" > "$WORK/image-partitions.txt" 2>&1 || die "cannot read the assembled partition table"
 sfdisk --dump "$OUT" > "$WORK/image-sfdisk.txt" 2>&1 || die "cannot dump the assembled partition table"
-grep -q 'W95 FAT32' "$WORK/image-partitions.txt" || die "payload partition is missing from the image"
+python3 - "$OUT" "$iso_sectors" "$part_sectors" <<'MBREOF'
+"""Fail unless the MBR is the layout the guest depends on."""
+import struct, sys
+
+image, start, sectors = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(image, "rb") as disk:
+    disk.seek(446)
+    table = disk.read(64)
+entries = [table[index * 16:(index + 1) * 16] for index in range(4)]
+payload, iso, esp, spare = entries
+assert payload[4] == 0x0C, "MBR slot 0 is not the FAT32 payload partition"
+assert struct.unpack_from("<II", payload, 8) == (start, sectors), "MBR slot 0 has the wrong extent"
+assert iso[0] == 0x80 and iso[4] == 0x00, "the ISO entry lost the boot flag the isohybrid code needs"
+assert struct.unpack_from("<I", iso, 8)[0] == 0, "the ISO entry no longer starts at sector 0"
+assert esp[4] == 0xEF, "the EFI system partition entry is missing"
+assert spare[4] == 0x00 and spare[8:12] == b"\0" * 4, "MBR slot 3 should be empty"
+print("mbr: payload in slot 0 at %d..%d, ISO boot entry and ESP preserved"
+      % (start, start + sectors - 1))
+MBREOF
 
 # 3. The payload partition really is readable and complete.
 mdir -i "$OUT@@$((iso_sectors * sector))" ::/ > "$WORK/verify-listing.txt" 2>&1 ||
