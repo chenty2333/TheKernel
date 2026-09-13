@@ -166,8 +166,8 @@ const DCO_MAX_NEGATIVE_DEVIATION: u64 = 600;
 /// per billion, before the search refuses its own answer.
 ///
 /// The divider set does not introduce any error at all: the DCO is
-/// `afe_clock * P * Q * K` by construction, so dividing it back by `5 * P * Q
-/// * K` returns the requested symbol rate exactly.  The only error is the
+/// `afe_clock * P * Q * K` by construction, so dividing it back by that same
+/// product returns the requested symbol rate exactly.  The only error is the
 /// quantisation of `DCO_FRACTION`, which has 15 bits and therefore steps by
 /// `ref / 0x8000`: 24 MHz / 32768 = 732 Hz at the largest reference this part
 /// uses, against a DCO of at least 7896 MHz, which is 93 parts per billion.
@@ -631,7 +631,7 @@ impl DdiPllDividers {
             // i915 uses DIV_ROUND_CLOSEST here (`intel_dpll_mgr.c:2892`);
             // rounding to nearest rather than truncating halves the error the
             // halving itself introduces.
-            DcoFractionWorkaround::HalveFraction => (self.dco_fraction + 1) / 2,
+            DcoFractionWorkaround::HalveFraction => self.dco_fraction.div_ceil(2),
         };
         (fraction << 10) | self.dco_integer
     }
@@ -973,15 +973,15 @@ fn search_total_divider(afe_clock_hz: u64) -> Option<Chosen> {
 /// rather than assumed so that editing a list cannot silently produce a
 /// zero divider.
 fn decompose(total_divider: u32) -> Option<(u32, u32, u32)> {
-    if total_divider % 2 == 0 {
+    if total_divider.is_multiple_of(2) {
         let half = total_divider / 2;
         if half == 1 || half == 2 || half == 3 || half == 5 {
             Some((2, 1, half))
-        } else if half % 2 == 0 {
+        } else if half.is_multiple_of(2) {
             Some((2, half / 2, 2))
-        } else if half % 3 == 0 {
+        } else if half.is_multiple_of(3) {
             Some((3, half / 3, 2))
-        } else if half % 7 == 0 {
+        } else if half.is_multiple_of(7) {
             Some((7, half / 7, 2))
         } else {
             None
@@ -1012,7 +1012,7 @@ fn prm_legal_divider_set(total_divider: u32) -> Option<(u32, u32, u32)> {
     for k in [1u32, 2, 3] {
         for p in [2u32, 3, 5, 7] {
             let product = p * k;
-            if total_divider % product != 0 {
+            if !total_divider.is_multiple_of(product) {
                 continue;
             }
             let q = total_divider / product;
@@ -1303,7 +1303,7 @@ mod tests {
                 total_divider,
                 "divider {total_divider} decomposed to ({p}, {q}, {k})"
             );
-            assert!(q >= 1 && q <= 255, "divider {total_divider}: Q = {q}");
+            assert!((1..=255).contains(&q), "divider {total_divider}: Q = {q}");
             // i915's decomposition always satisfies the PRM's Q/K rule; that
             // the two agree here is worth pinning, because it is the one place
             // they do.
@@ -1352,10 +1352,13 @@ mod tests {
         assert!(!dividers.inside_prm_dco_window());
         // The PRM framing would instead take the divider 5, at 9875 MHz, which
         // is the candidate closest to the 8999 MHz midpoint.
-        assert_eq!(5 * 1_975_000, 9_875_000);
-        assert!(9_875_000 >= PRM_DCO_MIN_KHZ && 9_875_000 <= PRM_DCO_MAX_KHZ);
+        let afe_clock_khz = 5 * 395_000u64;
+        let midpoint_candidate_khz = 5 * afe_clock_khz;
+        assert_eq!(midpoint_candidate_khz, 9_875_000);
+        assert!((PRM_DCO_MIN_KHZ..=PRM_DCO_MAX_KHZ).contains(&midpoint_candidate_khz));
         assert!(
-            (9_875_000u64).abs_diff(8_999_000) < (7_900_000u64).abs_diff(8_999_000),
+            midpoint_candidate_khz.abs_diff(8_999_000)
+                < dividers.target_dco_khz().abs_diff(8_999_000),
             "the midpoint rule really does prefer the other divider"
         );
     }
@@ -1883,7 +1886,7 @@ mod tests {
             assert_eq!(p * q * k, total);
             assert!([2, 3, 5, 7].contains(&p), "total {total}: P = {p}");
             assert!([1, 2, 3].contains(&k), "total {total}: K = {k}");
-            assert!(q >= 1 && q <= 255, "total {total}: Q = {q}");
+            assert!((1..=255).contains(&q), "total {total}: Q = {q}");
             assert!(k == 2 || q == 1, "total {total}: K = {k} requires Q = 1");
         }
     }
