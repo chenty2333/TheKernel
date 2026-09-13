@@ -60,6 +60,7 @@ mod phy;
 mod pll;
 mod probe;
 mod regs;
+mod sink;
 mod timing;
 
 #[cfg(test)]
@@ -82,6 +83,14 @@ use self::{
 /// open of a debug file would make a diagnostic tool a source of hardware
 /// traffic.
 static REPORT: Mutex<Option<ProbeReport>> = Mutex::new(None);
+
+/// What the sink step of the bring-up order found, kept for the debug file.
+///
+/// Separate from [`REPORT`] because it is produced by a different step, and
+/// kept for the same reason: the EDID is the first fact in this kernel that the
+/// firmware did not supply, and on a machine whose only console is the screen
+/// it is worth being able to read twice.
+static SINK: Mutex<Option<sink::SinkReport>> = Mutex::new(None);
 
 /// A value as grouped hexadecimal, the way a register dump is written down.
 ///
@@ -112,18 +121,32 @@ pub(crate) fn hex(value: u64, digits: usize) -> String {
 pub(crate) fn probe_at_boot() {
     let report = platform_probe();
     report.log();
+    // Phase 2 of the bring-up order: find the monitor, read its EDID, and read
+    // the hotplug state once.  It runs here, immediately after the probe, for
+    // the reason reference §9.4 gives: a monitor that was plugged in before the
+    // kernel started produces no hotplug edge, so the state has to be read
+    // rather than waited for.  It writes only the registers the transaction and
+    // the hotplug enable need, and only on a device whose window the probe
+    // mapped -- a device this kernel has a model for.
+    let sink = sink::probe_at_boot(&report);
     *REPORT.lock() = Some(report);
+    *SINK.lock() = Some(sink);
 }
 
 /// The report of the boot probe as text.
 pub(crate) fn report_text() -> String {
-    match &*REPORT.lock() {
+    let mut text = match &*REPORT.lock() {
         Some(report) => report.render(),
         None => String::from(
             "intel-gpu: the Intel display probe has not run in this boot; it runs from the DRM \
              initialization path, so this file is empty only if that path never executed\n",
         ),
+    };
+    // The two locks are taken one at a time: nothing holds both.
+    if let Some(sink) = &*SINK.lock() {
+        text.push_str(&sink.render());
     }
+    text
 }
 
 /// Whether the boot probe found a display device it could identify.
