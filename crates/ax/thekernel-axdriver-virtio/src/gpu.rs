@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use axdriver_base::{BaseDriverOps, DevResult, DeviceType};
 use axdriver_display::{
     BlobMem, DisplayDriverOps, DisplayInfo, DrmDisplayConfig, FrameBuffer, GpuBatch, GpuCompletion,
-    GpuCompletionData, GpuFeatures, GpuQueue, GpuSubmission, GpuTransport,
+    GpuCompletionData, GpuFeatures, GpuQueue, GpuSubmission, GpuTransport, PixelLayout,
 };
 use virtio_drivers::{
     Hal,
@@ -40,14 +40,12 @@ impl<H: Hal, T: Transport> VirtIoGpuDev<H, T> {
         let mut virtio = InnerDev::new(transport).map_err(as_dev_err)?;
 
         let (width, height) = virtio.resolution().map_err(as_dev_err)?;
-        let info = DisplayInfo {
-            width,
-            height,
-            // DRM takes this device before devfs creates fb0. Do not create a
-            // compatibility resource here: it would be a second scanout owner.
-            fb_base_vaddr: 0,
-            fb_size: 0,
-        };
+        // DRM takes this device before devfs creates fb0. Do not create a
+        // compatibility resource here: it would be a second scanout owner, so
+        // no linear framebuffer is published.  The scanout format is still
+        // stated: it is what a compatible buffer must be allocated as, and it
+        // is true whether or not this driver publishes an address.
+        let info = DisplayInfo::without_framebuffer(width, height, PixelLayout::B8G8R8A8);
 
         Ok(Self {
             inner: virtio,

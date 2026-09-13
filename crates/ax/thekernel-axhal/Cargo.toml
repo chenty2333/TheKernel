@@ -92,6 +92,12 @@ optional = true
 [dependencies.axconfig]
 version = "=0.3.0-preview.2"
 
+[dependencies.axgpu]
+package = "thekernel-axgpu"
+path = "../thekernel-axgpu"
+version = "=0.1.0"
+default-features = false
+
 [dependencies.axcpu]
 package = "thekernel-axcpu"
 path = "../thekernel-axcpu"

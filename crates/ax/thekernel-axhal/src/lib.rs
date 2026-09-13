@@ -59,16 +59,10 @@ pub mod dtb;
 pub mod boot {
     /// Bit position and width of one colour channel inside a pixel.
     ///
-    /// The position is the index of the channel's least significant bit.
-    /// Keeping both values lets a writer scale an 8-bit channel into a field
-    /// that is not necessarily eight bits wide.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub struct ColorChannel {
-        /// Index of the channel's least significant bit within a pixel.
-        pub position: u8,
-        /// Channel width in bits.
-        pub size: u8,
-    }
+    /// This is the display stack's own type, not a boot-protocol type: the
+    /// platform's parse result is converted into it at the boundary, so a
+    /// framebuffer description means the same thing wherever it is read.
+    pub use axgpu::ColorChannel;
 
     /// A linear framebuffer the firmware programmed before the kernel started.
     ///
@@ -110,6 +104,21 @@ pub mod boot {
             usize::try_from(self.pitch)
                 .ok()?
                 .checked_mul(usize::try_from(self.height).ok()?)
+        }
+
+        /// How this framebuffer stores one pixel.
+        ///
+        /// The bootloader describes a pixel as a depth plus three channel
+        /// fields; every writer in the kernel speaks [`axgpu::PixelLayout`].
+        /// Converting here keeps that one step in the description's own crate,
+        /// so no consumer restates the field-by-field mapping.
+        pub fn pixel_layout(&self) -> axgpu::PixelLayout {
+            axgpu::PixelLayout {
+                bits: self.bpp,
+                red: self.red,
+                green: self.green,
+                blue: self.blue,
+            }
         }
     }
 

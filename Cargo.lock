@@ -3211,6 +3211,7 @@ name = "thekernel-axdriver-display"
 version = "0.1.4-preview.3"
 dependencies = [
  "thekernel-axdriver-base",
+ "thekernel-axgpu",
 ]
 
 [[package]]
@@ -3358,6 +3359,7 @@ dependencies = [
  "spin 0.10.1",
  "thekernel-axalloc",
  "thekernel-axcpu",
+ "thekernel-axgpu",
  "thekernel-axplat-x86-pc",
  "thekernel-page-table-multiarch",
 ]

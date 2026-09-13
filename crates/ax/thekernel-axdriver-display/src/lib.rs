@@ -9,6 +9,7 @@ use core::any::Any;
 
 #[doc(no_inline)]
 pub use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
+pub use axgpu::PixelLayout;
 
 /// PCI identity retained from the owning function's configuration space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,12 +24,62 @@ pub struct DisplayPciIdentity {
     pub revision: u8,
 }
 
+/// What a display driver's scanout is, as every consumer of it has to see it.
+///
+/// Geometry alone is not a surface.  Two consumers of this type previously
+/// fabricated the missing half — the console assumed four bytes per pixel and
+/// the fbdev ABI reported a fixed 32-bit format — and both were wrong for a
+/// surface whose firmware mode was 16 or 24 bits deep, which paints a garbled
+/// screen rather than failing.  Pitch and [`PixelLayout`] are stated here for
+/// the same reason a driver states its width: so that nothing downstream has to
+/// guess.
 #[derive(Debug, Clone, Copy)]
 pub struct DisplayInfo {
+    /// Visible width in pixels.
     pub width: u32,
+    /// Visible height in pixels.
     pub height: u32,
+    /// Virtual address of the first byte of the driver's linear framebuffer, or
+    /// zero when it publishes none.
     pub fb_base_vaddr: usize,
+    /// Bytes of linear framebuffer published at [`Self::fb_base_vaddr`].
+    ///
+    /// Zero when the driver has no linear framebuffer to publish: a DRM-owned
+    /// scanout hands its pixels to userspace as GEM objects instead, and
+    /// reporting an address for it would be a fabrication a consumer could
+    /// write into.
     pub fb_size: usize,
+    /// Bytes between the starts of two consecutive scan lines of that
+    /// framebuffer; zero when there is none.
+    ///
+    /// This is not necessarily the visible width times the pixel size:
+    /// backends pad scan lines, and a consumer which recomputed the stride
+    /// instead of reading it would shear the image.
+    pub pitch: u32,
+    /// How the driver's scanout stores one pixel.
+    ///
+    /// Valid whether or not a linear framebuffer is published: a driver whose
+    /// pixels leave through GEM still has one scanout format, and a caller
+    /// asking for a compatible buffer needs it.
+    pub layout: PixelLayout,
+}
+
+impl DisplayInfo {
+    /// A display whose pixels are not published through a linear framebuffer.
+    ///
+    /// The base, size and pitch of a framebuffer that does not exist are all
+    /// zero, so no consumer can mistake this for a surface it may write into.
+    /// `layout` is still the format of the driver's own scanout.
+    pub const fn without_framebuffer(width: u32, height: u32, layout: PixelLayout) -> Self {
+        Self {
+            width,
+            height,
+            fb_base_vaddr: 0,
+            fb_size: 0,
+            pitch: 0,
+            layout,
+        }
+    }
 }
 
 /// A fully validated hardware-cursor update for the sole virtual scanout.
