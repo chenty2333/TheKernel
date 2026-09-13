@@ -47,12 +47,17 @@ enable debug records at runtime without rebuilding. Syslog console controls
 affect the diagnostic sink only; they do not alter the user terminal or erase
 retained records.
 
-Storage is deliberately bounded: a 64 KiB retained text ring and a separate
-64-record diagnostic queue, with at most 1024 bytes per formatted record.
-Contention or reentrancy can drop a record; a full diagnostic queue can drop its
-serial copy while retaining the text. `log_stats` reports these losses,
-truncation, retention overwrite, and sink availability. Missing output is not
-evidence that an event did not happen when the relevant loss counter increased.
+Storage is deliberately bounded: one 64 KiB retained text ring, with at most
+1024 bytes per formatted record, and every reader -- `syslog(2)`, `/dev/kmsg`,
+the framebuffer console mirror and the diagnostic console -- carries a cursor
+into it rather than a copy of it. A slow console therefore costs nothing until
+the ring itself overwrites text the console had not reached. `log_stats`
+reports: `records_dropped` (records refused, which should be 0),
+`diagnostic_records_dropped` (records the ring overwrote before the console
+printed them), `records_truncated`, `retention_bytes_overwritten`, and sink
+availability. Missing output is not evidence that an event did not happen when
+the relevant loss counter increased. See `docs/design/kernel-log-retention.md`
+for the paths that can still lose a record and how each was measured.
 
 Run `/opt/thekernel-tests/bin/thekernel-kernel-bench diagnostics` as guest root
 to check filter replacement, permissions (including inherited descriptors),
