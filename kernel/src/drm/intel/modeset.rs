@@ -68,10 +68,11 @@ use super::{
     gmbus::PollTimer,
     hpd::Ddi,
     output::{
-        self, LinkRate, OutputError, OutputProgram, OutputRequest, OutputState, SwingProgram,
+        self, DDI_BUF_CTL_IS_IDLE, LinkRate, OutputError, OutputProgram, OutputRequest,
+        OutputState, SwingProgram,
     },
     pattern::{self, PatternError, PatternGeometry},
-    pipe::{self, Pipe, PipeError, PipeProgram, PipeState},
+    pipe::{self, ArmState, Pipe, PipeError, PipeProgram, PipeState},
     pll::PllFieldEncoding,
     regs::{
         Register, Registers,
@@ -444,30 +445,6 @@ pub(crate) fn mode_line_rate_hz(mode: &Mode) -> Option<u32> {
 // Prove it: reference §11 phase 6
 // ---------------------------------------------------------------------------
 
-/// `DDI_BUF_CTL.IS_IDLE`, reference §8.4.
-///
-/// `output.rs` has a private copy of this bit for phase 5.7's poll; this is
-/// phase 6.3's read of the same bit, a few milliseconds later, which is what
-/// catches a DDI that came up and then went idle again.
-pub(crate) const DDI_BUF_CTL_IS_IDLE: u32 = 1 << 7;
-
-/// How long the plane is given to arm before phase 6.2's read is taken.
-///
-/// The plane arms at a frame boundary after `PLANE_SURF` is written (§5.6:
-/// "`PLANE_SURF` is the commit"), so an immediate read may legitimately show
-/// zero.  100 ms is at least two frames at any refresh a sink is likely to
-/// report down to 20 Hz, and it is a bound chosen for that reason -- not a
-/// measured arming latency, because nothing here has run on real hardware.
-pub(crate) const SURFACE_ARM_TIMEOUT_MICROS: u64 = 100_000;
-
-/// A hard bound on the polls the arming wait may make.
-///
-/// [`SURFACE_ARM_TIMEOUT_MICROS`] is the policy; this is the guarantee that a
-/// clock which does not advance cannot hang the boot path.  It is set well
-/// above the polls the timeout needs at the real poll interval, so it can only
-/// be reached when time is not moving.
-pub(crate) const SURFACE_ARM_POLL_LIMIT: u32 = 100_000;
-
 /// How far the observed line rate may differ from the mode's before
 /// [`ScanEvidence::rate_agrees`] says so.
 ///
@@ -548,15 +525,18 @@ impl CheckId {
     }
 }
 
-/// 6.1's evidence: what the sampler read, and the line rate it implies.
+/// 6.1's evidence: what the sampler read, and the line rate it measured.
 ///
-/// The values are `PIPEDSL`'s line field, in the order they were read.  The
-/// interval is `pipe`'s sampler's, and the elapsed time is `(n - 1)` of them,
-/// which is exact by the sampler's construction rather than an estimate.
+/// The samples are `pipe`'s, timestamps and all: the interval policy and the
+/// wrap handling are its registers' business, and this module does not
+/// re-derive a rate from numbers it was handed.  The values are carried beside
+/// them because a report and a test both want the line fields alone.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct ScanEvidence {
+    /// The raw readings, in the order they were taken.
+    pub(crate) samples: Vec<pipe::ScanlineSample>,
+    /// `PIPEDSL`'s line field from those samples, in the same order.
     pub(crate) values: Vec<u32>,
-    pub(crate) interval_micros: u64,
     /// The line rate derived from the first pair of values that differed.
     /// Compare it with [`mode_line_rate_hz`] of the mode that was programmed:
     /// this is §12.3's scope-less check of the PLL arithmetic.
@@ -568,7 +548,10 @@ pub(crate) struct ScanEvidence {
 impl ScanEvidence {
     /// Microseconds between the first and the last sample.
     pub(crate) fn elapsed_micros(&self) -> u64 {
-        self.values.len().saturating_sub(1) as u64 * self.interval_micros
+        match (self.samples.first(), self.samples.last()) {
+            (Some(first), Some(last)) => last.micros.saturating_sub(first.micros),
+            _ => 0,
+        }
     }
 
     /// Whether the observed line rate agrees with the mode's, within
@@ -595,15 +578,16 @@ impl ScanEvidence {
 }
 
 /// 6.2's evidence.
+///
+/// The wait for the latch is `pipe::prove`'s, which polls for about two frame
+/// times and separates "not latched yet" from "scanning another address"; this
+/// carries what it found.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct SurfaceEvidence {
     /// The `PLANE_SURF` field that was written.
     pub(crate) expected: u32,
     /// What `PLANE_SURFLIVE` read.
     pub(crate) live: u32,
-    /// How many reads the arming wait made before the proof's read.
-    pub(crate) polls: u32,
-    pub(crate) waited_micros: u64,
     /// Whether the register *already* named this surface before the modeset
     /// wrote anything.
     ///
@@ -694,19 +678,27 @@ impl PreSample {
 /// reading the log has instead of an oscilloscope.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum ProveFailure {
-    /// 6.1: every sample read the same value.
-    NotScanning {
-        values: Vec<u32>,
-        interval_micros: u64,
+    /// 6.1: every sample read the same line.
+    NotScanning { samples: Vec<pipe::ScanlineSample> },
+    /// 6.2: `PLANE_SURFLIVE` still read zero at the deadline, so the arm has
+    /// not latched.
+    ///
+    /// This is **not** "the address was rejected": the arm latches at a vblank
+    /// and the wait is about two frame times, so a pipe that is not scanning
+    /// has no vblank to latch at.  The 6.1 verdict is what says which of those
+    /// it is, and the advice for this check says to read it first.
+    SurfaceNotLatched {
+        expected: u32,
+        waited_micros: u64,
+        /// See [`SurfaceEvidence::pre_matching`].
+        pre_matching: bool,
     },
-    /// 6.2: `PLANE_SURFLIVE` never read back the surface address.
-    SurfaceNotLive {
+    /// 6.2: `PLANE_SURFLIVE` holds a different, non-zero address, so the plane
+    /// is scanning another surface -- a wrong buffer, not a late latch.
+    SurfaceWrongAddress {
         expected: u32,
         live: u32,
-        polls: u32,
-        waited_micros: u64,
-        /// See [`SurfaceEvidence::pre_matching`].  True here means the plane was
-        /// armed on this surface before the modeset ran and is not any more.
+        /// See [`SurfaceEvidence::pre_matching`].
         pre_matching: bool,
     },
     /// 6.3: the DDI buffer says it is still idle.
@@ -827,7 +819,10 @@ impl ProveReport {
     pub(crate) fn surflive(&self) -> Option<u64> {
         let live = match &self.surface {
             Ok(evidence) => evidence.live,
-            Err(ProveFailure::SurfaceNotLive { live, .. }) => *live,
+            // A wrong address is still a reading, and the caller may want it in
+            // the log.  "Not latched" is not: the register read zero, and zero
+            // is the absence of an address rather than one.
+            Err(ProveFailure::SurfaceWrongAddress { live, .. }) => *live,
             Err(_) => return None,
         };
         Some(u64::from(live & pipe::PLANE_SURF_ADDRESS_MASK))
@@ -869,11 +864,9 @@ impl ProveReport {
             },
             CheckId::SurfaceLive => match &self.surface {
                 Ok(evidence) => format!(
-                    "{} == {} after {} poll(s), {} us{}",
+                    "{} == {}{}",
                     super::hex(u64::from(evidence.live), 8),
                     super::hex(u64::from(evidence.expected), 8),
-                    evidence.polls,
-                    evidence.waited_micros,
                     if evidence.pre_matching {
                         "; the register already named this surface before the modeset wrote, so \
                          the read-back does not attribute the arm to this write"
@@ -1051,35 +1044,48 @@ impl ScanoutVerdict {
 /// The reading a failure was decided from, as one clause.
 fn describe_failure(failure: &ProveFailure) -> String {
     match failure {
-        ProveFailure::NotScanning {
-            values,
-            interval_micros,
-        } => {
-            let hexes: Vec<String> = values
+        ProveFailure::NotScanning { samples } => {
+            let readings: Vec<String> = samples
                 .iter()
-                .map(|value| format!("{value:#010x}"))
+                .map(|sample| format!("{:#010x}@{}us", sample.line, sample.micros))
                 .collect();
-            let span = values.len().saturating_sub(1) as u64 * interval_micros;
+            let span = match (samples.first(), samples.last()) {
+                (Some(first), Some(last)) => last.micros.saturating_sub(first.micros),
+                _ => 0,
+            };
             format!(
-                "PIPEDSL read the same value on all {} samples over {span} us: {}",
-                values.len(),
-                hexes.join(", ")
+                "PIPEDSL read the same line on all {} samples over {span} us: {}",
+                samples.len(),
+                readings.join(", ")
             )
         }
-        ProveFailure::SurfaceNotLive {
+        ProveFailure::SurfaceNotLatched {
             expected,
-            live,
-            polls,
             waited_micros,
             pre_matching,
         } => format!(
-            "PLANE_SURFLIVE read {} but {} was written, after {polls} poll(s) over \
-             {waited_micros} us{}",
+            "PLANE_SURFLIVE still read zero {waited_micros} us after the arm, so {} has not \
+             latched{}",
+            super::hex(u64::from(*expected), 8),
+            if *pre_matching {
+                "; it named this surface before the modeset wrote anything, so the arm is not what \
+                 put it there"
+            } else {
+                ".  Read the 6.1 verdict first: an arm latches at a vblank, and a pipe that is not \
+                 scanning has none"
+            }
+        ),
+        ProveFailure::SurfaceWrongAddress {
+            expected,
+            live,
+            pre_matching,
+        } => format!(
+            "PLANE_SURFLIVE read {} where {} was written: the plane is scanning a different \
+             surface{}",
             super::hex(u64::from(*live), 8),
             super::hex(u64::from(*expected), 8),
             if *pre_matching {
-                "; it already read that before this modeset wrote anything, so the plane was armed \
-                 on this surface and has since moved off it"
+                ", and it was already on this one before the modeset wrote anything"
             } else {
                 ""
             }
@@ -1136,29 +1142,26 @@ pub(crate) fn prove_it<R: Registers, T: PollTimer>(
     target: &ProveTarget,
     pre: &PreSample,
 ) -> ProveReport {
-    // 6.2 first: the plane arms at a frame boundary after `PLANE_SURF` is
-    // written, so phase 6.2's read is taken after a bounded wait rather than
-    // immediately.  The wait is this module's policy; the read that *decides*
-    // is `pipe::prove`'s.
-    let arming = wait_for_plane_arm(regs, timer, program);
     let checks = pipe::prove(regs, program, timer);
 
     let scan = match checks.scanline {
         pipe::ScanlineCheck::Scanning { samples }
         | pipe::ScanlineCheck::NotScanning { samples } => {
-            let values = samples.to_vec();
+            let values = samples.iter().map(|sample| sample.line).collect();
             let scan = ScanEvidence {
-                observed_line_rate_hz: line_rate(&values, pipe::SCANLINE_INTERVAL_MICROS),
+                // The sampler's own measurement, not a second arithmetic over
+                // the same numbers: `pipe` owns the interval policy and the
+                // wrap handling now.
+                observed_line_rate_hz: checks.scanline.observed_lines_per_second(),
                 expected_line_rate_hz: target.line_rate_hz,
-                interval_micros: pipe::SCANLINE_INTERVAL_MICROS,
+                samples: samples.to_vec(),
                 values,
             };
             if checks.scanline.is_ok() {
                 Ok(scan)
             } else {
                 Err(ProveFailure::NotScanning {
-                    values: scan.values,
-                    interval_micros: scan.interval_micros,
+                    samples: scan.samples,
                 })
             }
         }
@@ -1168,21 +1171,32 @@ pub(crate) fn prove_it<R: Registers, T: PollTimer>(
         }),
     };
 
+    // 6.2's read, and the wait for the latch, are `pipe::prove`'s: it polls
+    // `PLANE_SURFLIVE` for about two frame times and distinguishes a plane that
+    // has not latched yet from one that is scanning a different address.  This
+    // module used to run its own 100 ms poll first; it was a duplicate of a
+    // better one, and its "no change" verdict could not tell those two apart.
     let surface = match checks.surface {
         pipe::SurfaceCheck::Armed { live, wrote } => Ok(SurfaceEvidence {
             expected: wrote,
             live,
-            polls: arming.polls,
-            waited_micros: arming.waited_micros,
             pre_matching: pre.surface_already_live(wrote),
         }),
-        pipe::SurfaceCheck::NotArmed { live, wrote } => Err(ProveFailure::SurfaceNotLive {
+        pipe::SurfaceCheck::NotLatched {
+            wrote,
+            waited_micros,
+        } => Err(ProveFailure::SurfaceNotLatched {
             expected: wrote,
-            live,
-            polls: arming.polls,
-            waited_micros: arming.waited_micros,
+            waited_micros,
             pre_matching: pre.surface_already_live(wrote),
         }),
+        pipe::SurfaceCheck::WrongAddress { live, wrote } => {
+            Err(ProveFailure::SurfaceWrongAddress {
+                expected: wrote,
+                live,
+                pre_matching: pre.surface_already_live(wrote),
+            })
+        }
         pipe::SurfaceCheck::Unreadable { register } => Err(ProveFailure::Unreadable {
             check: CheckId::SurfaceLive,
             register,
@@ -1227,67 +1241,6 @@ pub(crate) fn prove_it<R: Registers, T: PollTimer>(
         ddi,
         underrun,
     }
-}
-
-/// Wait for `PLANE_SURFLIVE` to read back the surface, or for the budget to run
-/// out.
-fn wait_for_plane_arm<R: Registers, T: PollTimer>(
-    regs: &R,
-    timer: &T,
-    program: &PipeProgram,
-) -> ArmWait {
-    let register = program.pipe.plane_surflive();
-    let expected = program.plane.surf & pipe::PLANE_SURF_ADDRESS_MASK;
-    let start = timer.now_micros();
-    let mut polls = 0u32;
-    loop {
-        if let Some(live) = regs.read(register) {
-            polls += 1;
-            if live & pipe::PLANE_SURF_ADDRESS_MASK == expected {
-                return ArmWait {
-                    polls,
-                    waited_micros: timer.now_micros().saturating_sub(start),
-                };
-            }
-        } else {
-            // The register is not readable; `pipe::prove` will report that as
-            // `Unreadable`, and waiting cannot change it.
-            return ArmWait {
-                polls,
-                waited_micros: timer.now_micros().saturating_sub(start),
-            };
-        }
-        let waited_micros = timer.now_micros().saturating_sub(start);
-        if waited_micros >= SURFACE_ARM_TIMEOUT_MICROS || polls >= SURFACE_ARM_POLL_LIMIT {
-            return ArmWait {
-                polls,
-                waited_micros,
-            };
-        }
-        timer.pause();
-    }
-}
-
-/// What the arming wait saw.  The value it last read travels no further: the
-/// reading phase 6.2 is decided from is `pipe::prove`'s, taken after this wait.
-struct ArmWait {
-    polls: u32,
-    waited_micros: u64,
-}
-
-/// The line rate implied by the first pair of samples that differed.
-fn line_rate(values: &[u32], interval_micros: u64) -> Option<u32> {
-    let pair = values.windows(2).find(|pair| pair[0] != pair[1])?;
-    if interval_micros == 0 {
-        return None;
-    }
-    let lines = u64::from(
-        (pair[1] & pipe::PIPEDSL_LINE_MASK).wrapping_sub(pair[0] & pipe::PIPEDSL_LINE_MASK),
-    );
-    if lines == 0 {
-        return None;
-    }
-    Some((lines.saturating_mul(1_000_000) / interval_micros).min(u64::from(u32::MAX)) as u32)
 }
 
 /// The `DDI_BUF_CTL` register of a DDI, for the ports the register table has
@@ -1400,9 +1353,12 @@ pub(crate) struct ModeOutcome {
     pub(crate) pattern: PatternGeometry,
     /// What phase 6's registers said before the first write.
     pub(crate) pre_sample: PreSample,
-    /// What phase 3.4 and 4 wrote, and the exact list of writes.
+    /// What phase 3.4 and 4's shadow half wrote, and the exact list of writes.
     pub(crate) pipe: PipeProgram,
     pub(crate) pipe_state: PipeState,
+    /// Phase 4.3, which is a separate step: `PLANE_CTL` then `PLANE_SURF`,
+    /// adjacent, after the output is up.  See [`set_mode`]'s order note.
+    pub(crate) arm: ArmState,
     /// What phase 5 planned and what it left behind.
     pub(crate) output: OutputProgram,
     pub(crate) output_state: OutputState,
@@ -1441,6 +1397,7 @@ impl ModeOutcome {
         out.push_str(&self.pipe_state.render());
         out.push_str(&self.output.render());
         out.push_str(&self.output_state.render());
+        out.push_str(&self.arm.render());
         out.push_str(&self.prove.render());
         out
     }
@@ -1452,6 +1409,7 @@ impl ModeOutcome {
         self.pipe_state.log();
         self.output.log();
         self.output_state.log();
+        self.arm.log();
         self.prove.log();
     }
 }
@@ -1478,10 +1436,12 @@ pub(crate) enum ModesetError {
     Pattern(PatternError),
     /// The framebuffer refused a write.
     Surface(FbError),
-    /// §11 phases 3.4 and 4: the pipe and the plane.
+    /// §11 phases 3.4 and 4: the pipe and the plane's shadow registers.
     Pipe(PipeError),
     /// §11 phase 5: the PLL, the DDI and the transcoder.
     Output(OutputError),
+    /// §11 phase 4.3, after phase 5: `PLANE_CTL` and `PLANE_SURF`.
+    Arm(PipeError),
 }
 
 impl ModesetError {
@@ -1518,6 +1478,9 @@ impl ModesetError {
             }
             ModesetError::Pipe(error) => error.describe(),
             ModesetError::Output(error) => error.describe(),
+            ModesetError::Arm(error) => {
+                format!("arming the plane failed: {}", error.describe())
+            }
         }
     }
 }
@@ -1535,9 +1498,9 @@ impl ModesetError {
 /// 5.x  compute the PLL, DDI and transcoder  /
 /// --   pre-sample PIPESTAT, PLANE_SURFLIVE and DDI_BUF_CTL, before the first write
 /// 3.4  write the timings               \
-/// 4.1  write the DDB                    |  `pipe::program`, ending with PLANE_SURF, the commit
+/// 4.1  write the DDB                    |  `pipe::program`: the shadow half, no PLANE_SURF
 /// 4.2  write the watermarks             |
-/// 4.3  write the plane                  /
+/// 4.3  write the plane's shadow values  /
 /// 5.1  PLL power, dividers, enable, lock \
 /// 5.2  DDI clock select, clock-off clear  |
 /// 5.3  swing values, lane power           |  `output::program`, never ahead of the pipe
@@ -1545,8 +1508,26 @@ impl ModesetError {
 /// 5.5  TRANS_DDI_FUNC_CTL                 |
 /// 5.6  TRANSCONF                          |
 /// 5.7  DDI_BUF_CTL, poll IS_IDLE clear   /
+/// 4.3  PLANE_CTL then PLANE_SURF          `pipe::arm` -- the commit, and it comes *after*
+///                                          the output, which is where this deviates from
+///                                          section 11's numbering (see below)
 /// 6    prove it
 /// ```
+///
+/// **Why the arm is after phase 5 and not inside phase 4.**  `PLANE_SURF` is
+/// only the arm: the shadow registers `pipe::program` writes are latched at the
+/// plane's update event, which is the pipe's vblank, and while the transcoder
+/// is disabled there is no vblank to latch them at -- "Until the pipe starts
+/// PIPEDSL reads will return a stale value" (`[I915]`
+/// `display/intel_display.c:478-486`).  A `PLANE_SURF` written before
+/// `TRANSCONF` therefore cannot take effect until after it, and this driver
+/// does not depend on a pre-enable write latching later: `[I915]` enables the
+/// crtc first (`intel_enable_crtc`, `:7200`) and arms the plane afterwards
+/// (`intel_update_crtc`, `:7249`).  Reference section 11 phase 4.3 arms the
+/// plane inside phase 4, which is the order coreboot's libgfxinit ships; the
+/// reference is followed everywhere else, and its own step 4.3 text ("if
+/// ENABLE is set but SURFLIVE is 0, the surface address was rejected") is
+/// exactly the misreading this order avoids.
 ///
 /// A failure at any write stops the sequence and is reported in full: a mode
 /// that was half programmed is not a mode.  Nothing is unwound, and the design
@@ -1617,14 +1598,20 @@ pub(crate) fn set_mode<R: Registers, T: PollTimer>(
     // is what makes a latched underrun bit attributable (§11 6.4).
     let pre_sample = PreSample::take(regs, &pipe_program, ddi_buf_ctl);
 
-    // §11 phases 3.4 and 4: the timings, the DDB, the watermarks and the plane,
-    // ending in `PLANE_SURF`, which is the commit.
+    // §11 phases 3.4 and 4: the timings, the DDB, the watermarks and the
+    // plane's shadow values.  None of them has taken effect yet -- every one is
+    // double buffered and the arm is what latches them.
     let pipe_state = pipe::program(regs, &pipe_program).map_err(ModesetError::Pipe)?;
 
-    // §11 phase 5: the output.  Never reordered ahead of the pipe: the plane is
-    // armed into a pipe whose output is not up yet, which is harmless, whereas
-    // an output brought up into a pipe that is not configured is not.
+    // §11 phase 5: the output, and it enables the transcoder, which is what
+    // makes a vblank exist for the arm below to latch at.
     let output_state = output::program(regs, &output_program).map_err(ModesetError::Output)?;
+
+    // §11 phase 4.3, *after* phase 5: `PLANE_CTL` then `PLANE_SURF`, adjacent.
+    // This is the one place the sequence reorders the reference's numbering,
+    // and `set_mode`'s own documentation argues it: the arm latches at a
+    // vblank, and until the transcoder is running there is none.
+    let arm = pipe::arm(regs, &pipe_program).map_err(ModesetError::Arm)?;
 
     // §11 phase 6.
     let target = ProveTarget {
@@ -1640,6 +1627,7 @@ pub(crate) fn set_mode<R: Registers, T: PollTimer>(
         pre_sample,
         pipe: pipe_program,
         pipe_state,
+        arm,
         output: output_program,
         output_state,
         prove,

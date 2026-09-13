@@ -28,7 +28,7 @@ use crate::{
                 self,
                 ddi::{DDI_BUF_CTL_A, DDI_BUF_CTL_B},
                 mock::MockRegisters,
-                pipe::{PIPEDSL_A, PIPESTAT_A, PLANE_SURF_A, PLANE_SURFLIVE_A},
+                pipe::{PIPEDSL_A, PIPESTAT_A, PLANE_CTL_A, PLANE_SURF_A, PLANE_SURFLIVE_A},
             },
             timing::TimingRegister,
         },
@@ -547,7 +547,9 @@ fn a_clean_device_passes_every_check_with_the_readings_it_passed_on() {
         pipe::SCANLINE_SAMPLES,
         "the sampler takes its whole window when it has to"
     );
-    assert_eq!(scan.interval_micros, pipe::SCANLINE_INTERVAL_MICROS);
+    // The timestamps are `pipe`'s now, and they are what the elapsed time and
+    // the rate come from.
+    assert_eq!(scan.samples.len(), pipe::SCANLINE_SAMPLES);
     assert_eq!(
         scan.elapsed_micros(),
         (pipe::SCANLINE_SAMPLES as u64 - 1) * pipe::SCANLINE_INTERVAL_MICROS
@@ -565,8 +567,6 @@ fn a_clean_device_passes_every_check_with_the_readings_it_passed_on() {
     let surface = report.surface.as_ref().expect("6.2 passed");
     assert_eq!(surface.expected, program.plane.surf);
     assert_eq!(surface.live, program.plane.surf);
-    assert_eq!(surface.polls, 1, "the address was already live");
-    assert_eq!(surface.waited_micros, 0);
     assert!(!surface.pre_matching, "nothing named it before the write");
 
     assert_eq!(
@@ -620,13 +620,16 @@ fn a_pipe_that_does_not_scan_is_a_named_failure() {
     let (check, failure) = report.failure().expect("a failure");
     assert_eq!(check, CheckId::Scanning);
     match failure {
-        ProveFailure::NotScanning {
-            values,
-            interval_micros,
-        } => {
-            assert_eq!(values.len(), pipe::SCANLINE_SAMPLES);
-            assert!(values.iter().all(|value| *value == 0x0000_1234));
-            assert_eq!(*interval_micros, pipe::SCANLINE_INTERVAL_MICROS);
+        ProveFailure::NotScanning { samples } => {
+            assert_eq!(samples.len(), pipe::SCANLINE_SAMPLES);
+            assert!(samples.iter().all(|sample| sample.line == 0x0000_1234));
+            // The sampler still spaced them out, which is what makes "the same
+            // line over three milliseconds" a measurement rather than one read
+            // repeated.
+            assert_eq!(
+                samples.last().expect("a sample").micros,
+                (pipe::SCANLINE_SAMPLES as u64 - 1) * pipe::SCANLINE_INTERVAL_MICROS
+            );
         }
         other => panic!("expected NotScanning, got {other:?}"),
     }
@@ -640,7 +643,7 @@ fn a_pipe_that_does_not_scan_is_a_named_failure() {
 }
 
 #[test]
-fn a_plane_that_never_arms_is_a_named_failure() {
+fn a_plane_that_has_not_latched_is_a_named_failure_and_is_not_a_wrong_address() {
     let _guard = scheduler_test_context();
     let regs = prove_mock(&prove_program(), 67);
     regs.set(PLANE_SURFLIVE_A, 0);
@@ -648,25 +651,36 @@ fn a_plane_that_never_arms_is_a_named_failure() {
     let (check, failure) = report.failure().expect("a failure");
     assert_eq!(check, CheckId::SurfaceLive, "6.1 passed, so 6.2 is first");
     match failure {
-        ProveFailure::SurfaceNotLive {
+        ProveFailure::SurfaceNotLatched {
             expected,
-            live,
-            polls,
             waited_micros,
             pre_matching,
         } => {
             assert_eq!(*expected, prove_program().plane.surf);
-            assert_eq!(*live, 0);
-            assert_eq!(*waited_micros, SURFACE_ARM_TIMEOUT_MICROS);
-            // One poll per step of the fake clock's 25 us, plus the first at
-            // zero: the bound that bites is the timeout, not the poll count.
-            assert_eq!(*polls, (SURFACE_ARM_TIMEOUT_MICROS / 25) as u32 + 1);
+            // The wait is `pipe`'s: about two frame times, computed from the
+            // mode -- 2200 x 1125 over 148.5 MHz is 16 666 us a frame.
+            let frame = 2200u64 * 1125 * 1000 / 148_500;
+            assert!(
+                *waited_micros >= 2 * frame,
+                "waited {waited_micros} us, less than two frame times"
+            );
+            assert!(
+                *waited_micros < 2 * frame + 100,
+                "waited {waited_micros} us, more than the deadline allows"
+            );
             assert!(!*pre_matching);
         }
-        other => panic!("expected SurfaceNotLive, got {other:?}"),
+        other => panic!("expected SurfaceNotLatched, got {other:?}"),
     }
+    // "Not latched yet" is not evidence that the address was rejected, and
+    // neither the name nor the advice may say it was.
+    let text = describe_failure(failure);
+    assert!(text.contains("has not latched"), "{text}");
+    assert!(text.contains("Read the 6.1 verdict first"), "{text}");
+    assert!(!text.contains("rejected"), "{text}");
     assert!(check.advice().contains("4.3"), "{}", check.advice());
-    assert_eq!(report.surflive(), Some(0), "the reading is still reported");
+    // A zero read-back is not an address, so there is nothing to hand WS-1.
+    assert_eq!(report.surflive(), None);
 }
 
 #[test]
@@ -674,18 +688,23 @@ fn a_plane_that_arms_on_a_later_poll_is_not_a_failure() {
     let _guard = scheduler_test_context();
     let program = prove_program();
     let regs = prove_mock(&program, 67);
-    let polls = Cell::new(0u32);
+    let polls = Rc::new(Cell::new(0u32));
+    let counted = Rc::clone(&polls);
     let field = program.plane.surf;
     regs.on_read(PLANE_SURFLIVE_A, move |_| {
-        polls.set(polls.get() + 1);
-        if polls.get() < 3 { 0 } else { field }
+        counted.set(counted.get() + 1);
+        if counted.get() < 3 { 0 } else { field }
     });
     let report = read_prove(&regs);
     assert!(report.verdict().is_scanning_out(), "{}", report.render());
-    let surface = report.surface.as_ref().expect("6.2 passed");
-    // Three polls: two that did not match, then the proof's read.
-    assert_eq!(surface.polls, 3);
-    assert_eq!(surface.waited_micros, 50, "two 25 us waits");
+    // The latch arrived on the third read, well inside `pipe`'s two-frame
+    // window: a late latch is not a failure, which is the whole reason the
+    // poll exists.
+    assert_eq!(polls.get(), 3);
+    assert_eq!(
+        report.surface.as_ref().expect("6.2 passed").live,
+        program.plane.surf
+    );
 }
 
 #[test]
@@ -700,12 +719,23 @@ fn the_surface_comparison_ignores_the_bits_that_are_not_address() {
     assert!(report.verdict().is_scanning_out(), "{}", report.render());
     assert_eq!(report.surflive(), Some(u64::from(program.plane.surf)));
 
-    // A difference in the address itself is not.
+    // A difference in the address itself is not, and it is a *wrong address*
+    // rather than a late latch: `pipe` distinguishes the two, because only one
+    // of them is worth waiting for.
     let regs = prove_mock(&prove_program(), 67);
     regs.set(PLANE_SURFLIVE_A, program.plane.surf + 0x1000);
     let report = read_prove(&regs);
-    let (check, _) = report.failure().expect("a failure");
+    let (check, failure) = report.failure().expect("a failure");
     assert_eq!(check, CheckId::SurfaceLive);
+    assert!(
+        matches!(failure, ProveFailure::SurfaceWrongAddress { .. }),
+        "expected a wrong address, got {failure:?}"
+    );
+    assert_eq!(
+        report.surflive(),
+        Some(u64::from(program.plane.surf + 0x1000)),
+        "a wrong but real address is still evidence"
+    );
 }
 
 #[test]
@@ -1103,9 +1133,8 @@ fn the_whole_sequence_writes_in_the_reference_s_order_and_stops_before_the_reads
     // What the write log held when phase 6's first `PIPEDSL` read happened, so
     // that "nothing is written after the proof starts" is a measurement rather
     // than a reading of the code.  `PIPEDSL` is read by nothing but phase 6 --
-    // the pre-sample reads the other three registers -- and the arming wait's
-    // `PLANE_SURFLIVE` reads come before it, so a write after this point would
-    // be a write during the proof.
+    // the pre-sample reads the other three registers -- so a write after this
+    // point would be a write during the proof.
     let writes_at_first_proof_read = Rc::new(Cell::new(usize::MAX));
     {
         let count = Rc::clone(&writes_at_first_proof_read);
@@ -1128,8 +1157,9 @@ fn the_whole_sequence_writes_in_the_reference_s_order_and_stops_before_the_reads
     let writes = regs.writes();
     let names: Vec<&'static str> = writes.iter().map(|(name, _)| *name).collect();
 
-    // 1. The pipe's writes come first, and they are exactly the plan's own
-    //    list -- not a copy of it kept in this test.
+    // 1. The shadow group comes first and is exactly the plan's own list --
+    //    not a copy of it kept in this test -- and it contains no `PLANE_SURF`:
+    //    the arm is a separate step now.
     let planned: Vec<&'static str> = outcome
         .pipe_state
         .writes
@@ -1142,23 +1172,16 @@ fn the_whole_sequence_writes_in_the_reference_s_order_and_stops_before_the_reads
         &planned[..],
         "the first writes are the plan's, in the plan's order"
     );
-
-    // 2. `PLANE_SURF` is the last of the plane registers: §5.6's commit.
-    let surface_write = names
-        .iter()
-        .position(|name| *name == PLANE_SURF_A.name())
-        .expect("the plane is armed");
-    assert_eq!(
-        surface_write + 1,
-        planned.len(),
-        "PLANE_SURF is the plan's last write"
-    );
     assert!(
-        !names[surface_write + 1..]
-            .iter()
-            .any(|name| name.starts_with("PLANE_")),
-        "no plane register is written after the commit: {names:?}"
+        !planned.contains(&PLANE_SURF_A.name()),
+        "the shadow half does not arm the plane: {planned:?}"
     );
+    let arm_names: Vec<&'static str> = outcome
+        .arm
+        .writes
+        .iter()
+        .map(|write| write.register.name())
+        .collect();
 
     // 3. The timing registers precede the DDB, the watermarks and the plane.
     let timing_names: Vec<&'static str> = [
@@ -1188,10 +1211,11 @@ fn the_whole_sequence_writes_in_the_reference_s_order_and_stops_before_the_reads
         "every timing register precedes the DDB, the watermarks and the plane: {names:?}"
     );
 
-    // 4. Nothing the pipe owns is written once the output starts, and the whole
-    //    output sequence is after the whole pipe sequence.
+    // 4. The whole output sequence follows the whole shadow group, and rewrites
+    //    none of it.  "The output" is what lies between the shadow group and
+    //    the arm pair, which is the order the arm split created.
     let pipe_owned: Vec<&'static str> = planned.clone();
-    let output_names = &names[planned.len()..];
+    let output_names = &names[planned.len()..names.len() - arm_names.len()];
     assert!(!output_names.is_empty(), "the output sequence writes");
     assert!(
         !output_names.iter().any(|name| pipe_owned.contains(name)),
@@ -1199,7 +1223,8 @@ fn the_whole_sequence_writes_in_the_reference_s_order_and_stops_before_the_reads
     );
 
     // 5. The DDI-to-PLL mapping is two separate writes, and the DDI buffer is
-    //    the last of the output's.
+    //    the last the output stage writes -- the arm pair comes after it now,
+    //    and assertion 6 is where that belongs.
     let dpclka = output_names
         .iter()
         .filter(|name| **name == "ICL_DPCLKA_CFGCR0")
@@ -1208,7 +1233,7 @@ fn the_whole_sequence_writes_in_the_reference_s_order_and_stops_before_the_reads
     assert_eq!(
         *output_names.last().expect("the output writes"),
         DDI_BUF_CTL_A.name(),
-        "DDI_BUF_CTL is written last, after the IS_IDLE poll"
+        "DDI_BUF_CTL is the output's last write, after the IS_IDLE poll"
     );
     // And the transcoder is enabled before the DDI buffer that consumes it.
     let transconf = output_names
@@ -1221,7 +1246,27 @@ fn the_whole_sequence_writes_in_the_reference_s_order_and_stops_before_the_reads
         .expect("DDI_BUF_CTL is written");
     assert!(transconf < ddi_buf);
 
-    // 6. Nothing is written after phase 6's first read.
+    // 6. The arm pair is last: `PLANE_CTL` then `PLANE_SURF`, adjacent, and
+    //    nothing follows them but the proof's reads.  This is the order the
+    //    arm split exists for -- the arm latches at a vblank, and the vblank
+    //    only exists once the output above is enabled.
+    assert_eq!(
+        arm_names,
+        [PLANE_CTL_A.name(), PLANE_SURF_A.name()],
+        "the arm is PLANE_CTL then PLANE_SURF"
+    );
+    assert_eq!(
+        &names[names.len() - arm_names.len()..],
+        &arm_names[..],
+        "the arm pair is the last two writes of the modeset: {names:?}"
+    );
+    assert_eq!(
+        names.len() - arm_names.len(),
+        planned.len() + output_names.len(),
+        "the sequence is exactly the shadow group, the output and the arm"
+    );
+
+    // 7. Nothing is written after phase 6's first read.
     assert_ne!(
         writes_at_first_proof_read.get(),
         usize::MAX,
@@ -1234,7 +1279,7 @@ fn the_whole_sequence_writes_in_the_reference_s_order_and_stops_before_the_reads
         &names[writes_at_first_proof_read.get()..]
     );
 
-    // 7. And the framebuffer holds the pattern, because §11 6.5 was painted
+    // 8. And the framebuffer holds the pattern, because §11 6.5 was painted
     //    before the plane could scan it.
     assert_eq!(outcome.pattern.height, 1080);
     assert_eq!(
@@ -1245,11 +1290,11 @@ fn the_whole_sequence_writes_in_the_reference_s_order_and_stops_before_the_reads
 }
 
 #[test]
-fn a_failure_while_arming_the_plane_still_leaves_the_pattern_in_the_framebuffer() {
+fn a_refused_arm_leaves_everything_else_programmed_and_the_pattern_in_the_framebuffer() {
     let _guard = scheduler_test_context();
     // §3.1's ordering claim, as a measurement: the fill happens before the
-    // first register write, so a failure while arming the plane leaves a
-    // framebuffer that is already the pattern rather than a black one.
+    // first register write, so a failure at the arm leaves a framebuffer that
+    // is already the pattern rather than a black one.
     let (edid, plan) = plan_1080p60();
     let surface = test_surface();
     let (regs, _armed) = working_device(67);
@@ -1258,6 +1303,10 @@ fn a_failure_while_arming_the_plane_still_leaves_the_pattern_in_the_framebuffer(
     let Err(error) = result else {
         panic!("PLANE_SURF refuses the write, so the sequence must fail")
     };
+    assert!(
+        matches!(error, ModesetError::Arm(_)),
+        "the arm is its own step now: {error:?}"
+    );
     assert!(
         error.describe().contains("PLANE_SURF"),
         "{}",
@@ -1268,16 +1317,16 @@ fn a_failure_while_arming_the_plane_still_leaves_the_pattern_in_the_framebuffer(
         top_right_expected(),
         "the fill happened before the register write that failed"
     );
-    // The pattern was written, and the register writes that came before the
-    // refusal did happen: this is a half-programmed pipe, which is why the
-    // sequence stops and says so.
-    assert!(regs.writes().iter().any(|(name, _)| *name == "PLANE_CTL_A"));
-    assert!(
-        !regs
-            .writes()
-            .iter()
-            .any(|(name, _)| *name == "DPLL0_ENABLE")
-    );
+    // The arm runs *after* the output now, so everything before it happened:
+    // `PLANE_CTL` landed, the PLL came up, the DDI is enabled -- and
+    // `PLANE_SURF`, the commit, did not.  That is a worse state than a
+    // half-programmed pipe, and it is exactly what the sequence reports
+    // instead of papering over: the mode is up and nothing is scanned out.
+    let names: Vec<&str> = regs.writes().iter().map(|(name, _)| *name).collect();
+    assert_eq!(names.last(), Some(&PLANE_CTL_A.name()));
+    assert!(names.contains(&"DPLL0_ENABLE"));
+    assert!(names.contains(&DDI_BUF_CTL_A.name()));
+    assert!(!names.contains(&PLANE_SURF_A.name()));
 }
 
 #[test]
@@ -1303,11 +1352,21 @@ fn a_failure_partway_through_phase_five_stops_before_the_proof() {
     let text = error.describe();
     assert!(text.contains("IS_IDLE"), "{text}");
     assert!(text.contains("DDI"), "{text}");
-    // The pipe was programmed and its last write was the commit...
+    // The shadow half was programmed...
     let names: Vec<&str> = regs.writes().iter().map(|(name, _)| *name).collect();
-    assert!(names.contains(&"PLANE_SURF_A"));
+    assert!(names.contains(&"PLANE_STRIDE_A"));
     assert_eq!(names.last(), Some(&"DDI_BUF_CTL(A)"));
-    // ...and phase 6 never ran, because there is no mode to prove.
+    // ...and because the arm now runs *after* the output, a phase 5 failure
+    // means the plane was never armed at all: no `PLANE_CTL`, no `PLANE_SURF`
+    // and no phase 6.  Under the old order the plane was committed before the
+    // output came up, so the same failure left a pipe scanning into an output
+    // that was not there; now it leaves a configured but unarmed plane, which
+    // is the state the arm split exists to make reachable.
+    assert!(
+        !names.contains(&PLANE_CTL_A.name()),
+        "the arm must not have run: {names:?}"
+    );
+    assert!(!names.contains(&PLANE_SURF_A.name()));
     assert_eq!(reads.get(), 0, "the sequence stopped before the proof");
 }
 

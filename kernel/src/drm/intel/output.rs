@@ -217,7 +217,12 @@ const DDI_BUF_CTL_BUF_TRANS_SELECT_SHIFT: u32 = 24;
 const DDI_BUF_CTL_PHY_LINK_RATE_SHIFT: u32 = 20;
 
 /// `DDI_BUF_CTL`'s `IS_IDLE` bit: 1 means the DDI has no clock.
-const DDI_BUF_CTL_IS_IDLE: u32 = 1 << 7;
+/// `DDI_BUF_CTL.IS_IDLE`, reference section 8.4.
+///
+/// Phase 5.7 polls it here, and phase 6.3 reads it again a few milliseconds
+/// later; the modeset workstream takes this constant from here rather than
+/// keeping a second copy of the bit.
+pub(crate) const DDI_BUF_CTL_IS_IDLE: u32 = 1 << 7;
 
 /// `DDI_BUF_CTL`'s `A_4_LANES` bit, set when the port drives four lanes.
 const DDI_BUF_CTL_A_4_LANES: u32 = 1 << 4;

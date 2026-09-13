@@ -100,12 +100,15 @@ Two things the gate does **not** do, both deliberate:
   still the firmware's. The alternative — moving the console to a surface nothing is scanning —
   would leave the kernel believing it has a display it does not have, which is worse: `/dev/fb0`
   consumers, the console and every later check would be reading a surface no one can see.
-* **It does not stop the panel changing before the verdict.** The plane armed in phase 4.3 points
-  pipe A at the pattern, so from that moment the panel shows the *pattern*, not the log. What the
-  panel carries in each case is §4.2's table; the mitigation here is that every decision line — the
-  mode, the PLL dividers, the timing registers, the surface address, the pattern geometry — is
-  logged **before** `PLANE_SURF` is written, so the last thing the console shows before the panel
-  changes is the driver's own summary of what it is about to program.
+* **It does not stop the panel changing before the verdict.** The arm — `PLANE_CTL` then
+  `PLANE_SURF`, §4.1 — points pipe A at the pattern, so from that moment the panel shows the
+  *pattern*, not the log. The arm is now the last step before phase 6 rather than part of phase 4,
+  so the window in which the panel shows the pattern and the console is still on the firmware's
+  aperture is as short as the sequence can make it. What the panel carries in each case is §4.2's
+  table; the mitigation here is that every decision line — the mode, the PLL dividers, the timing
+  registers, the surface address, the pattern geometry — is logged **before** the arm, so the last
+  thing the console shows before the panel changes is the driver's own summary of what it is about
+  to program.
 
 `[INF]` The reasoning above follows from where the console writes and when the surface is chosen;
 nothing here has watched a real panel. §8 records that.
@@ -223,9 +226,10 @@ phase 3.2, immediately after the framebuffer is allocated and before the plane i
 reason is that phase 6.5's own argument applies with more force to the *ordering* than to the
 timing: if the framebuffer is filled before `PLANE_SURF` is written, then there is no window in
 which a correctly programmed pipe scans out an unfilled surface, and a black screen means "nothing
-is scanning" and can never mean "the driver forgot to draw". The reference's §11 phase 4.3 note
-matters here too — `PLANE_SURF` is the commit — so the fill has to happen before that write, not
-after it.
+is scanning" and can never mean "the driver forgot to draw". `PLANE_SURF` is the commit — the
+reference's §11 phase 4.3 note and §5.6 both say so — so the fill has to happen before that write,
+not after it. With the arm split (§4.1) the fill is before *every* register write, which is
+stronger and simpler: the pattern is in place before the sequence can change anything at all.
 
 The alternative ordering would leave exactly one frame-worth of ambiguity that §6.5 was written to
 remove, and it costs nothing to avoid.
@@ -293,7 +297,7 @@ marked otherwise.
 | 3.4 | the timing registers (every field is `value − 1`) | `timing::timing_registers` through WS-3's `pipe::compute` |
 | 4.1 | `PLANE_BUF_CFG` = `0x0FFF0000` | WS-3's `pipe::program` |
 | 4.2 | watermarks: level 0 enabled and generous | WS-3's `pipe::program` |
-| 4.3 | plane noarm registers, then `PLANE_CTL`, then `PLANE_SURF` **last** | WS-3's `pipe::program` |
+| 4.3a | the plane's shadow registers, no `PLANE_SURF` | WS-3's `pipe::program` |
 | 5.1 | PLL: dividers, power, enable, poll `LOCK` | WS-2's `output::program` |
 | 5.2 | DDI→PLL mapping, then `DDI_CLK_OFF` cleared in a **separate** write | WS-2's `output::program` |
 | 5.3 | buffer translation for the port type and swing, then power the lanes | WS-2's `output::program` |
@@ -301,15 +305,34 @@ marked otherwise.
 | 5.5 | `TRANS_DDI_FUNC_CTL` | WS-2's `output::program` |
 | 5.6 | `TRANSCONF` | WS-2's `output::program` |
 | 5.7 | `DDI_BUF_CTL`, then poll `IS_IDLE == 0` | WS-2's `output::program` |
+| 4.3b | `PLANE_CTL` then `PLANE_SURF`, adjacent — **after** phase 5 | WS-3's `pipe::arm`, called by `set_mode` |
 | 6.1/6.2/6.4 | the pipe-side read-backs | WS-3's `pipe::prove`, called by `modeset::prove_it` |
 | 6.3 | `DDI_BUF_CTL.IS_IDLE` | `modeset::prove_it` |
 | 6 | the verdict and the gate | `modeset::ProveReport::verdict` |
 
 The order is not a preference. Planes before the transcoder, transcoder before the DDI, clock before
 buffer, buffer before well — §8.6's disable sequence is the exact reverse of this and its own note
-says getting it backwards is how an unkillable underrun is produced. Phase 4 arms the plane into a
-pipe whose output is not up yet, which is harmless (the plane reads memory into a pipe that discards
-it) and is why the pattern can be in place before anything is visible.
+says getting it backwards is how an unkillable underrun is produced.
+
+**The one place this deviates from the reference's numbering, and why.** Reference §11 phase 4.3
+writes `PLANE_CTL` and `PLANE_SURF` inside phase 4, before the output exists. This driver arms the
+plane *after* phase 5, as a step of its own (`pipe::arm`), because `PLANE_SURF` is only the arm: the
+shadow registers `pipe::program` writes are latched at the plane's update event, which is the pipe's
+vblank, and while the transcoder is disabled there is no vblank to latch them at — "Until the pipe
+starts `PIPEDSL` reads will return a stale value" (`[I915]` `display/intel_display.c:478-486`). A
+`PLANE_SURF` written before `TRANSCONF` therefore cannot take effect until after it, and this
+sequence will not *depend* on a pre-enable write latching later. `[I915]` does not either: it
+enables the crtc first (`intel_enable_crtc`, `:7200`) and arms the plane afterwards
+(`intel_update_crtc`, `:7249`), with the two writes adjacent
+(`display/skl_universal_plane.c:1525-1532`). Coreboot's libgfxinit arms before the enable and ships
+that order, so the reference's is probably not fatal — but whether a pending arm survives the enable
+is not documented anywhere this repository could find, which is exactly why the sequence no longer
+relies on it.
+
+The deviation also makes the failure states sharper. The arm pair is the last thing written before
+phase 6, so a failure anywhere in phases 3.4 to 5 leaves a configured but **unarmed** plane rather
+than a committed one scanning into an output that is not there — which is what §4.2's table now
+records.
 
 ### 4.2 Bad cases: what is left programmed, what is unwound, and what the operator sees
 
@@ -331,7 +354,7 @@ the panel happens to be showing.
 | 5.1–5.6 PLL / DDI / transcoder, partway | the output stage in whatever half-state it reached | no | firmware aperture | usually dark; possibly the bars if the timing the stage was left at happens to match the monitor, which is the "rolling image = a total off by one" signature §11 describes | the PLL's `ref`, `(P,Q,K)` and symbol rate, then the failing step |
 | 5.7 `IS_IDLE` never clears | everything, and the DDI is idle | no | firmware aperture | dark. This is the closest thing to a field report for this exact bring-up (`[I915]` #10932, an N200 `46d0`), and §11's advice is to suspect the port and the wiring before the PLL | `DDI_BUF_CTL`'s raw value and §11 5.2-then-5.1 |
 | 6.1 no change in `PIPEDSL` | everything | no | firmware aperture | the bars, unproven: nothing says they are being refreshed rather than being one frame that arrived and stopped | each sample with its timestamp, and §11 6.1's advice (PLL, then DDI clock, then `TRANSCONF`) |
-| 6.2 `PLANE_SURFLIVE` disagrees | everything; the plane did not arm | no | firmware aperture | whatever the pipe was already scanning — the firmware's picture if the plane never took the new address, garbage if it took a wrong one | the live value, the expected value, the poll count and the time waited, and §11 4.3's advice |
+| 6.2 `PLANE_SURFLIVE` disagrees | everything, including the arm | no | firmware aperture | as 6.1 for `NotLatched`; for `WrongAddress`, whatever the plane *is* scanning — most likely the firmware's surface | for `NotLatched`: the address written and the time waited, with the log saying plainly that this is a timing result and telling the reader to check 6.1 first. For `WrongAddress`: both addresses. §11 4.3's advice is attached to the wrong-address case, not to the latch one. |
 | 6.3 the DDI never leaves idle | everything | no | firmware aperture | dark | the raw `DDI_BUF_CTL`, and §11 5.2-then-5.1 |
 | 6.4 a latched underrun | everything; the pipe **is** scanning (6.1 passed) | no | firmware aperture | **the bars, with the marker moving** — the panel itself shows the framebuffer path works and the fault is in the fetch side | the raw `PIPESTAT` and §11 6.4's advice: go back to the watermarks (4.2) before changing anything else |
 | 6 all four pass | everything | n/a | **moves to our surface** at devfs publication | the bars, then the console's own repaint as fbcon draws into the new surface | the four readings and "the display engine is scanning out" |
@@ -359,16 +382,16 @@ the panel happens to be showing.
 
 ## 5. Phase 6: prove it
 
-`modeset::prove_it(regs, timer, target) -> ProveReport` performs all four checks and returns each
-one's verdict. `ProveTarget` names the four registers (`PIPEDSL`, `PLANE_SURFLIVE`, `DDI_BUF_CTL`,
-`PIPESTAT`) and the two numbers they are checked against, so the pipe/DDI workstreams' types only
-have to produce registers, not conform to a type this workstream invented.
+`modeset::prove_it(regs, timer, program, target, pre) -> ProveReport` performs all four checks and
+returns each one's verdict. `ProveTarget` carries only what `pipe::prove` cannot know — the port's
+`DDI_BUF_CTL` and the line rate the mode implies — so the pipe and DDI workstreams' types only have
+to produce registers, not conform to a type this workstream invented.
 
 ### 5.1 The checks, and the policy behind each
 
 | Step | Check | Policy |
 |---|---|---|
-| 6.1 | `PIPEDSL` must change | Up to 4 samples, 5 ms apart, stopping at the first change. 5 ms is a third of a frame at 60 Hz and about 337 lines at 1080p60's 67.5 kHz line rate, so a scanning pipe cannot repeat itself. The extra samples exist because phase 5 has just enabled the transcoder and a pipe that started microseconds ago may not have advanced a line yet; the healthy path costs two reads. Equal samples throughout → `NotScanning`, with every sample in the verdict. |
+| 6.1 | `PIPEDSL` must change | Four samples 1 ms apart (`pipe`'s sampler, with each sample carrying its own timestamp), and the verdict is on the *lines*: two samples with the same line and different timestamps are a stopped counter, not a slow one. The check reports the line rate it measured — §12.3's observation — and this module compares it with the mode's. Equal lines throughout → `NotScanning`, with every sample and timestamp in the verdict. |
 | 6.2 | `PLANE_SURFLIVE` must read back the address written | Polled for up to 100 ms, because the plane arms at a frame boundary after `PLANE_SURF` is written (§5.6) and an immediate read may legitimately read zero. 100 ms is at least two frames down to 20 Hz — chosen from frame arithmetic, **not measured**. Compared on the address bits `[31:12]` only: bit 2 is the decrypt flag and the low bits are not address. |
 | 6.3 | `DDI_BUF_CTL.IS_IDLE` must be 0 | Read **once**. It is a live status bit; a retry that passed after a first failure would hide the fault the check exists to report. §11 calls it the single best "is my DDI alive" bit on the chip. |
 | 6.4 | `PIPESTAT` bit 31 must be clear | Read **once**. It is a latched bit, and the verdict points at §11 phase 4.2 (the watermarks) before anything else, in the reference's own words. |
@@ -388,8 +411,9 @@ dead pipe alone says something else. `ProveReport::failure()` therefore reports 
 
 ### 5.3 The line rate, from §12.3
 
-`PIPEDSL`'s low 20 bits are the scanline. The first pair of samples that differ gives a line count
-over a known interval, and `ScanEvidence::observed_line_rate_hz` is that rate.
+`PIPEDSL`'s low 20 bits are the scanline, and each sample now carries the time it was read.
+`pipe::prove` sums the intervals that moved forward and took time and reports the rate —
+`ScanEvidence::observed_line_rate_hz` is that number, not a second arithmetic over the same samples.
 `modeset::mode_line_rate_hz(mode)` is the rate the mode implies (pixel clock over horizontal total),
 and the report prints both. This is §12.3's own point: *"the only way to verify your PLL arithmetic
 against reality without a scope."*
@@ -403,9 +427,11 @@ wrong by a factor rather than a percent, always trips it.
 ### 5.4 The verdict is one value, and it is the gate
 
 The four reads have two owners and one verdict. **WS-3's `pipe::prove`** performs 6.1, 6.2 and 6.4,
-because those are its registers and its sampling policy; `modeset::prove_it` gives the plane its
-arming window first, takes 6.3's single read of `DDI_BUF_CTL`, and assembles what comes back. There
-is one implementation of each read in the tree, and exactly one value at the end of them:
+because those are its registers, its latch poll and its sampling policy; `modeset::prove_it` takes
+6.3's single read of `DDI_BUF_CTL` and assembles what comes back. There is one implementation of
+each read in the tree — this module's own 100 ms `PLANE_SURFLIVE` poll was deleted when `pipe`'s
+arrived, because two waits in a row is one wait too many and the earlier one could not tell "not
+latched yet" from "wrong address" — and exactly one value at the end of them:
 
 `ProveReport::verdict()` returns a `ScanoutVerdict`:
 
@@ -444,9 +470,9 @@ said. The report then distinguishes:
   reading, with the attribution the sequence can actually support.
 
 The same pre-sample answers the same question for the other two: a `PLANE_SURFLIVE` that already
-named our surface means the 6.2 read-back proves nothing about our write (recorded, not suppressed),
-and a DDI that was already out of idle separates "it never came up" from "it came up and went back
-to idle" when 6.3 fails.
+named our surface means the 6.2 read-back proves nothing about our arm (recorded, not suppressed —
+`SurfaceEvidence::pre_matching`), and a DDI that was already out of idle separates "it never came
+up" from "it came up and went back to idle" when 6.3 fails.
 
 A pre-sample that could not be read is a third state, and the report says so rather than guessing:
 the field is `None` and the verdict's attribution is correspondingly absent.
@@ -529,7 +555,9 @@ pub(crate) fn set_mode<R: Registers, T: PollTimer>(
 
 pub(crate) struct ModeOutcome {
     choice: ModeChoice, mode: Mode, pattern: PatternGeometry, pre_sample: PreSample,
-    pipe: PipeProgram, pipe_state: PipeState, output: OutputProgram, output_state: OutputState,
+    pipe: PipeProgram, pipe_state: PipeState,          // the shadow half, unarmed
+    arm: ArmState,                                     // PLANE_CTL then PLANE_SURF, the commit
+    output: OutputProgram, output_state: OutputState,
     prove: ProveReport,
 }
 // ::verdict() -> ScanoutVerdict   <- the console gate, and the only way to ask
@@ -537,10 +565,17 @@ pub(crate) struct ModeOutcome {
 // ::render() -> String, ::log()
 
 pub(crate) enum ModesetError { Refused(..), Clock(..), NoCdclk {..}, UnsupportedPort {..},
-                               Pattern(..), Surface(..), Pipe(..), Output(..) }  // ::describe()
+                               Pattern(..), Surface(..), Pipe(..), Output(..), Arm(..) }
+// ::describe().  `Pipe` is the shadow half and `Arm` the commit: a refused
+// `PLANE_SURF` is a different failure from a refused timing write, and the log
+// says which one happened.
 
 pub(crate) struct PreSample { pipestat, plane_surflive, ddi_buf_ctl: Option<u32> }
 pub(crate) struct ProveTarget { ddi_buf_ctl: Register, line_rate_hz: Option<u32> }  // ::port(ddi, rate)
+// `ProveFailure::SurfaceNotLatched` and `SurfaceWrongAddress` are separate
+// variants on purpose: `pipe::prove` distinguishes them, and collapsing them
+// into one would invite exactly the reading -- "the address was rejected" --
+// that the arm ordering exists to avoid.
 pub(crate) fn prove_it<R: Registers, T: PollTimer>(
     regs: &R, timer: &T, program: &PipeProgram, target: &ProveTarget, pre: &PreSample,
 ) -> ProveReport;
@@ -620,7 +655,7 @@ supplies the exact types:
 | From | Needed | Used for |
 |---|---|---|
 | WS-1 GGTT/framebuffer | allocate a linear, contiguous, 4 KiB-aligned surface whose stride is a multiple of 64 bytes; write the GGTT PTE; hand back the **GGTT address as a `u32`**, a `&mut [u8]` over the memory, and later an `Arc<dyn ScanoutSurface>` over the same memory | phase 3.2, then `pattern::fill_xrgb8888`; the address is what `ProveTarget::surface` compares; the surface is what the console candidate hands over |
-| WS-3 pipe/plane | program the timing registers, the DDB, the watermarks, and the plane registers in §5.6's noarm/arm order, with `PLANE_SURF` last | phases 3.4, 4.1–4.3 |
+| WS-3 pipe/plane | program the timing registers, the DDB, the watermarks and the plane's shadow registers (`pipe::program`), and arm the plane (`pipe::arm`) after the output is up | phases 3.4, 4.1–4.3 |
 | WS-2 DDI/output | program the PLL and poll `LOCK`; map DDI→PLL and clear `DDI_CLK_OFF`; buffer translation and lane power; `TRANS_CLK_SEL`, `TRANS_DDI_FUNC_CTL`, `TRANSCONF`; `DDI_BUF_CTL` and the `IS_IDLE` poll | phase 5.1–5.7 |
 | the register table | a `read_write` declaration of `PIPESTAT` **and** a write-1-to-clear before the plane is armed | §5.5's caveat |
 
@@ -631,14 +666,18 @@ The assembly, in words, of what `set_mode` does with them:
    with a `ScanningOut` verdict.
 2. Allocate and fill the framebuffer (the pattern, at `frame = 0`).
 3. `timing_registers(mode)`; log every value; hand them to WS-3.
-4. WS-3's plane sequence, ending at `PLANE_SURF`.
-5. WS-2's PLL/DDI/transcoder sequence, ending at the `IS_IDLE` poll.
-6. `prove_it` against `ProveTarget::pipe_a(ggtt_address, mode_line_rate_hz(mode))`.
-7. `ModesetReport` with every step's outcome, the verdict, and the framebuffer handle; logged and
-   stored in the static the console candidate reads.
+4. WS-3's shadow sequence: the plane's double-buffered registers, no `PLANE_SURF`.
+5. WS-2's PLL/DDI/transcoder sequence, ending at the `IS_IDLE` poll. It enables the transcoder,
+   which is what makes a vblank exist for step 6 to latch at.
+6. WS-3's arm: `PLANE_CTL` then `PLANE_SURF`, adjacent — the commit, and the last write before the
+   proof.
+7. `prove_it(regs, timer, &pipe_program, &ProveTarget::port(ddi, mode_line_rate_hz(&mode)), &pre)`,
+   where `pre` is the pre-sample taken before step 4's first write.
+8. `ModeOutcome` with every step's outcome, the arm, the verdict and the pattern geometry; logged
+   and stored in the static the console candidate reads.
 
 Three rules the driver must keep, all of which come from decisions above: the pattern is written
-before `PLANE_SURF` (§3.1); the decision lines are logged before the plane is armed (§1.3); and the
+before the first register write (§3.1); the decision lines are logged before the arm (§1.3); and the
 verdict — not the last successful register write — is what the console handover reads (§5.4).
 
 ### 7.4 Who advances the pattern's frame counter
@@ -695,10 +734,15 @@ between a result and a guess.
   sink, so nothing in this document runs on a boot today. The call site, the surface allocation over
   a real GTT, and `scanout::register` are the coordinator's wiring (§7.2), and it needs one thing
   this workstream cannot supply: §8.5's swing values, without which `set_mode` refuses by design.
-* **The end-to-end test is over mocks.** It asserts the whole write order, that nothing is written
-  after the proof starts, and that each named failure leaves the state §4.2 claims — against a
-  `BTreeMap` register file and a host page arena. It cannot establish that a real `PIPEDSL` advances,
-  that a real plane arms in under 100 ms, or that a real DDI reports `IS_IDLE` when it should.
+* **The end-to-end test is over mocks.** It asserts the whole write order — the shadow group, then
+  the output, then the arm pair and nothing after the proof's first read — and that each named
+  failure leaves the state §4.2 claims, against a `BTreeMap` register file and a host page arena. It
+  cannot establish that a real `PIPEDSL` advances, that a real arm latches inside the two-frame
+  window, or that a real DDI reports `IS_IDLE` when it should.
+* **The arm ordering is sourced but unobserved.** `[I915]`'s order (enable the crtc, then arm) and
+  its comment about a stale `PIPEDSL` before the pipe starts are the reason for the deviation §4.1
+  records; whether *this* driver's pending shadow writes would have survived an earlier arm is not
+  something the sequence can find out without hardware, and it does not rely on them doing so.
 * **The repaint loop is not written** (§7.4), so a boot-path `set_mode` writes a static pattern:
   the bars prove the framebuffer path, but only the report's frame number and the phase 6 readings
   distinguish "scanning" from "one frame that arrived and stopped".
