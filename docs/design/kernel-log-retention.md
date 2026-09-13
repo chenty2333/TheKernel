@@ -85,8 +85,9 @@ is about to print it, so a console that is behind costs nothing: the text is
 still in the ring.  The record's priority — needed by the console level filter,
 and not present in arbitrary `diagnostic()` text — is kept in a
 `marks: [u8; CAPACITY]` array written in lockstep with `bytes`, with the top bit
-marking a record's first byte.  The copy queue and `LOST_DIAGNOSTICS` are gone;
-the trade is 64 KiB of marks for 66 KiB of copies.
+marking a record's first byte.  The copy queue and `LOST_DIAGNOSTICS` are gone:
+64 KiB of marks replaces the 64 x 1048-byte queue of copies, and the hand-over
+slots add 4 x 1048 bytes, so the log's static footprint grows by 2656 bytes.
 
 Two consequences worth stating:
 

@@ -1190,9 +1190,10 @@ static void diagnostics(void)
     if (syscall(SYS_syslog, 6, NULL, 0) < 0) fail("diagnostics console off");
     diagnostics_console_disabled = 1;
     char *record = NULL;
-    /* Capture deliberately drops records on producer/store contention instead
-     * of blocking an IRQ. Exercise retention with a bounded number of fresh
-     * records; a single dropped record is not a retention failure. */
+    /* Capture waits for the ring and the filter rather than refusing a record
+     * when another CPU holds either, so no record should be lost here; the
+     * retry loop stays because a console control can land between the filter
+     * write and the record it is meant to capture. */
     for (unsigned int attempt = 0; attempt < 32; ++attempt) {
         if (diagnostics_write_filter(narrow)) fail("diagnostics enable syscall log");
         long pid = syscall(SYS_getpid);
