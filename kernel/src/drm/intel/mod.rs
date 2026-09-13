@@ -69,6 +69,7 @@ pub(crate) mod gtt;
 mod hpd;
 mod id;
 mod output;
+mod pattern;
 mod pci;
 mod phy;
 mod pipe;
