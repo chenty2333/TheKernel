@@ -257,7 +257,18 @@ that leaves no room, naming the byte count and the offending directory.
 `missing required command: bison` (and `flex`); CI runs the tier inside
 `scripts/dev-shell.sh`. The tier was therefore reproduced stage by stage with the real
 `tools.verification.plan` and `verify.execute`, substituting only that image assertion; the
-substitution is printed in the transcript.
+substitution is printed in the transcript. Stage results are in the change-set State block
+below.
+
+**Result 13 — a suite that only passed on the developer's machine is not a suite.** The
+contract test that proves the fbcon suite does not rebuild reached the real filesystem: its
+`--no-build` preflight stats the artifact paths, so the test passed exactly where those
+artifacts already existed and failed on a clean state directory — which is where CI runs it.
+It now points the state root at its own temporary directory and creates the two files the
+preflight stats, so the real path is exercised instead of bypassed, and it asserts that the
+artifacts booted belong to the variant the run asked for. Both properties were verified by
+injecting the fault and reverting it: a `fbcon_artifacts` that ignores `--memory` fails, and
+a suite that rebuilds despite `--no-build` fails.
 
 ---
 
@@ -2282,6 +2293,29 @@ committed on `feat/fbcon-verify`, which is based on that branch. Every implement
 host tests, and items 5–9 were additionally confirmed by booting the `firmware-fb` profile
 and reading a QMP screendump (§0.2). Items 13–16 are confirmed the same way, with the
 results recorded in §0.3. Nothing is verified on the N305.
+
+*Evidence for items 13–16, on `feat/fbcon-verify`.* `python3 -m unittest discover -s tests
+-t .` passes (314 tests) and `tools/thekernel.py test --suite host` passes against a state
+directory that has never been built (314 Python and 1869 Rust tests, exit 0).
+`tools/thekernel.py test --suite fbcon --smp 4 --memory 512M --accel tcg --no-build
+--timeout 240 --graphics-profile firmware-fb --screenshot OUT.ppm` passes against a real
+boot (exit 0), reporting
+
+```
+fbcon: MB2 framebuffer: addr=0x80000000 1280x800 bpp=32 pitch=5120
+fbcon: screendump OUT.ppm holds 160x50 cells, 1211 inked cells, 18729 ink pixels,
+       0 foreign pixels, 0 ink pixels outside the grid, 0 on a cell border
+fbcon: readable on screen: 'guest userspace: KTAP banner',
+       'guest userspace: the gated marker line', 'kernel log mirror: task entry'
+```
+
+and the frame decodes with zero unmatched cells to `KTAP version 1`, `# THEKERNEL_TEST_BEGIN
+1 mounts timeout_seconds=60`, `ok 1 - mounts`, `ok 2 - rootfs` interleaved with `<6>[0.746134
+… task::ops] Task(36, init) exit with code: 0`. The daily tier runs every stage green with
+the stage in place — `whitespace`, `dependency-layers`, `graphics-config-{seatd,desktop}`,
+`host`, `build`, `lint`, `guest-tcg`, `firmware-fbcon`, then `verify: daily: PASS` — with
+`verify`'s environment preflight substituted as described in §0.3 result 12, because this
+host is not the development image.
 
 Four items were **deliberately not done as specified**, for reasons the build settled:
 
