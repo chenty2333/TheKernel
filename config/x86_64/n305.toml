@@ -73,8 +73,16 @@ mmio-ranges = [
     [0xfec0_0000, 0x0000_1000],       # I/O APIC
     [0xfed0_0000, 0x0000_1000],       # HPET
     [0xfee0_0000, 0x0000_1000],       # Local APIC
-    ["0x0000_0001_0000_0000", 0x4000_0000], # 64-bit PCIe BAR window, 4-5 GiB
 ] # [(uint, uint)]
+# A 64-bit PCIe BAR window above 4 GiB was declared here and has been removed.
+# It was a guess, and it is the one kind of entry that can be actively wrong on
+# a machine with plenty of RAM: a 16 GiB N305 has usable RAM at 4-5 GiB, so the
+# declared window overlapped real memory and the boot panicked building the
+# memory map.  Nothing here needs an above-4-GiB window at boot -- the rootfs
+# arrives as a Multiboot2 module or from disk, and no driver in this tree maps a
+# BAR there -- so the entry bought nothing and risked the whole boot.  Add one
+# only from a measurement, taken from the capture bundle's `/proc/iomem` as
+# `docs/design/n305-bringup.md` describes.
 virtio-mmio-ranges = [] # [(uint, uint)]
 # FALLBACK ONLY.  The ECAM base is a machine fact and the kernel reads it from
 # the ACPI MCFG table during early boot; this value is used only when firmware
@@ -86,11 +94,13 @@ pci-ecam-base = 0xe000_0000
 # conservative bound: a value below the true top bus silently hides devices.
 pci-bus-end = 0xff
 # BAR allocation windows.  The leading [0, 0] excludes bus 0, whose devices are
-# already assigned by firmware and must not be reallocated.
+# already assigned by firmware and must not be reallocated.  The above-4-GiB
+# window was removed along with the matching `mmio-ranges` entry: assigning a
+# BAR into address space the kernel does not map would produce a device that
+# cannot be reached, and this machine has no device that needs one.
 pci-ranges = [
     [0, 0],
     [0x8000_0000, 0x6000_0000],
-    ["0x0000_0001_0000_0000", 0x4000_0000],
 ] # [(uint, uint)]
 # Local-APIC vector numbers, not machine IRQs.  They are identical to the q35
 # profile because they are a kernel convention: device IRQs arrive through the
