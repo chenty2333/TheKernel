@@ -99,7 +99,7 @@ document is written so that those reads are the *next* action, not an afterthoug
 | GGTT array inside BAR 0 | **second 8 MiB** (offset `0x800000`) | same |
 | GTT aperture BAR | **BAR 2** (`GMADR`) | `[I915]` `intel_pci_config.h:20` |
 | Display register base | **offset 0** (no `DISPLAY_MMIO_BASE` bias on Gen12) | `[I915]` `display/intel_display_reg_defs.h:11` + `xe_lpd_display` leaves `mmio_offset` zero |
-| Forcewake needed? | **No** for `0x40000`–`0x115FFF` | `[I915]` `intel_uncore.c:909-913` |
+| Forcewake needed? | **No** anywhere in `0x40000`–`0x1BFFFF` (the display region), incl. combo PHY and DPLL config | `[I915]` `intel_uncore.c` `__gen12_fw_ranges[]`; see §2.1 |
 | Stolen-memory / GTT base | `GEN6_GSMBASE` = `0x108100`, bits `[63:20]` | `[I915]` `i915_reg.h:4448,4451` |
 
 ### 1.2 Display register blocks (ADL-N, `XE_LPD`)
@@ -130,42 +130,78 @@ Resist the temptation to program them "correctly" before the first pixel appears
 
 ## 2. Register access model
 
-### 2.1 You almost certainly do not need forcewake
+### 2.1 You do not need forcewake at all for display registers
 
 This is worth stating early because most Intel display bring-up folklore is about forcewake
-handshakes, and on Gen12 they are avoidable.
+handshakes, and on Gen12 they are avoidable for everything in the display region.
 
-`[I915]` `intel_uncore.c:909-913`:
+**Two different mechanisms, and conflating them is the trap.** `[I915]` has both a *fast-path
+filter* and an *authoritative range table*, and only the second one determines whether forcewake is
+actually taken:
 
 ```
+/* intel_uncore.c:909-913 -- a FILTER, not a requirement */
 NEEDS_FORCE_WAKE(reg) = (reg < 0x40000 || reg >= 0x116000)
+
+/* intel_uncore.c, __gen12_fw_ranges[] -- the AUTHORITY */
+GEN_FW_RANGE(0x40000, 0x1bffff, 0)     /* domain 0 == no forcewake */
 ```
 
-Any MMIO access outside that predicate is issued directly, with no forcewake request/ack. The
-display blocks listed in §1.2 — pipes, transcoders, planes, power wells, CDCLK, DDI and the
-south display at `0xC0000`+ — all lie in `0x40000`–`0x115FFF`, so a first bring-up can ignore
-forcewake for them.
+The filter only decides whether it is worth doing a table lookup. The domain it returns is what
+matters:
 
-**Two display-adjacent blocks do NOT:** the **combo PHY** registers (combo PHY A is `0x162000`)
-and the **DPLL configuration** registers (`0x164xxx`). Both are above `0x116000`. Only the DPLL
-*enable* registers at `0x46010`/`0x46014` are inside the fast path.
+```c
+/* intel_uncore.c, fwtable_read32 / fwtable_write32 */
+fw_engine = __fwtable_reg_read_fw_domains(uncore, offset);
+if (fw_engine)                      /* <-- guarded on NON-ZERO */
+        __force_wake_auto(uncore, fw_engine);
+val = __raw_uncore_read32(uncore, reg);
+```
 
-Caveats, so this does not become a trap:
+and `__force_wake_auto` has `GEM_BUG_ON(!fw_domains)`, so the guard is load-bearing: a domain of
+`0` means **nothing is acquired and a plain MMIO access is issued.**
 
-- Registers **below `0x40000`** do need forcewake. This includes VGA legacy registers and the
-  `GEN6_GSMBASE`/`GGC` stolen-memory registers *if* you read them through the raw path — note
-  `0x108100` is `>= 0x40000`, so in fact `GSMBASE` is also in the safe window. The genuinely
-  forcewake-gated low range is `0x0`–`0x3FFFF`.
-- Registers **at or above `0x116000`** need forcewake. That range holds some display-adjacent
-  blocks (DSB, and the `0x164xxx` DPLL/DPCLKA registers are *below* it and therefore safe).
-  **Check `0x164280` (`ICL_DPCLKA_CFGCR0`) and `0x164284` (`DPLL0_CFGCR0`): `0x164xxx > 0x116000`,
-  so these DO fall outside the fast path.** This is a real hazard: the DPLL configuration registers
-  are above the cutoff while the DPLL *enable* registers at `0x46010`/`0x46014` are below it.
-  `[INF]` from `[I915]` `intel_uncore.c:909-913` plus the register offsets in `i915_reg.h:4301,4158`.
-  If you implement no forcewake at all, prefer writing DPLL config through a path that does, or
-  accept the risk and verify by read-back.
+**Therefore the whole range `0x40000`–`0x1BFFFF` requires no forcewake** — including the combo PHY
+at `0x162000` and the DPLL configuration at `0x164xxx`. For those two:
+`NEEDS_FORCE_WAKE(0x162000)` is *true* (they are `>= 0x116000`), so the code takes the slow path —
+and `find_fw_domain()` then finds them inside `GEN_FW_RANGE(0x40000, 0x1bffff, 0)` and returns
+**0**. No forcewake is taken. `[I915]` `intel_uncore.c:909-913` (filter), `:943-970`
+(`find_fw_domain`), `:1900-1914` and `:1997-2002` (the guarded accessors), `:2433-2436`
+(Gen12 selects `__gen12_fw_ranges` via `GRAPHICS_VER >= 12`, and ADL-P/N is `GEN12_FEATURES` →
+`GEN(12)` per `i915_pci.c:634-640,685-692`).
+
+The distinction that matters to an implementer:
+
+| Range | Fast-path filter | Table domain | Forcewake needed? |
+|---|---|---|---|
+| `0x00000`–`0x3FFFF` | needs lookup | GT / render / media domains | **yes** |
+| `0x40000`–`0x115FFF` | skipped (definitely safe) | — | **no** |
+| `0x116000`–`0x1BFFFF` | needs lookup | **0 (none)** | **no** |
+| `0x1C0000`+ | needs lookup | media VDBOX/VEBOX domains | **yes** |
+
+So the practical rule for a display bring-up is simpler than the filter suggests: **everything in
+the display region, from `0x40000` to `0x1BFFFF`, is safe without any forcewake implementation**,
+and a from-scratch driver can skip forcewake entirely as long as it stays out of the GT range below
+`0x40000` and the media range above `0x1C0000`.
+
+> **This section previously contradicted §3.3 and the contradiction was resolved in favour of
+> §3.3.** An earlier draft read the `0x116000` figure as "registers at or above this need
+> forcewake", which would have swept in the combo PHY and DPLL configuration. That reading is
+> wrong: `0x116000` is where the *filter* stops short-cutting, not where forcewake starts. Nothing
+> in `0x40000`–`0x1BFFFF` needs forcewake. If you had already added a forcewake handshake
+> specifically to reach `0x162000` or `0x164xxx` because of the older text, it was unnecessary —
+> though harmless, and a useful thing to have written anyway if you later touch GT registers.
+
+Remaining caveats, so this does not become a trap:
+
+- Registers **below `0x40000`** genuinely need forcewake (VGA legacy, GT). Note `GEN6_GSMBASE`
+  (`0x108100`) and `GGC` (`0x108040`) are **above** `0x40000`, so they are in the safe window too,
+  despite sitting in the stolen-memory block.
 - The safe-window claim is i915's model of the hardware, not a PRM statement. It is a strong
   signal, not a guarantee. §13 gives the read-back checks that catch a violation.
+- Absent forcewake is not the only way a display register reads as zeros — **a powered-down well
+  also reads as zero, and drops writes** (§4.2). If a register reads `0`, check the power well
+  before suspecting forcewake.
 
 ### 2.2 Read-back discipline
 
@@ -235,14 +271,18 @@ register; the practical boundaries on Gen12 are:
 
 - `0x00000`–`0x3FFFF` — legacy/VGA, fuses, and GT (forcewake-gated).
 - **`0x40000`–`0x1BFFFF` — the display / "non-GT" region.** This is the range the Gen12 forcewake
-  table marks with domain `0`, i.e. no forcewake required. `[I915]` `intel_uncore.c`,
-  `__gen12_fw_ranges[]` (`GEN_FW_RANGE(0x40000, 0x1bffff, 0)`).
+  table marks with domain `0`, i.e. **no forcewake required anywhere in it**. `[I915]`
+  `intel_uncore.c`, `__gen12_fw_ranges[]` (`GEN_FW_RANGE(0x40000, 0x1bffff, 0)`). This includes the
+  combo PHY at `0x162000` and the DPLL configuration at `0x164xxx`, which are above the
+  `NEEDS_FORCE_WAKE` filter's `0x116000` threshold but still inside this domain-0 range — see §2.1
+  for why the filter and the requirement are different things.
 - `0x80000`–`0x8FFFF` — the **DMC's own MMIO window**. `[I915]` `display/intel_dmc_regs.h`
   (`DMC_MMIO_START_RANGE`/`END_RANGE`). This is *inside* the display region; it is **not** a
   display/GT boundary, which is a common misreading.
 - `0xC0000`–`0xCFFFF` — "south display": GMBUS, hotplug, panel power, backlight.
-- `0x162xxx`–`0x16Fxxx` — combo PHY, DPLL configuration, `DPCLKA`.
-- `0x1C0000`+ — high media engines (VDBOX/VEBOX).
+- `0x162xxx`–`0x16Fxxx` — combo PHY, DPLL configuration, `DPCLKA`. Inside the domain-0 range above,
+  so **no forcewake despite the high address**.
+- `0x1C0000`+ — high media engines (VDBOX/VEBOX). **This is where forcewake genuinely resumes.**
 
 `[I915]` `i915_reg.h:2905` defines `PCH_DISPLAY_BASE = 0xc0000u`, and
 `display/intel_gmbus.c:871-879` sets the GMBUS base to it for every platform that is not Valleyview
@@ -1062,30 +1102,35 @@ is all you need.** Ignore the DKL/Type-C PLLs entirely.
 
 #### The divider arithmetic (combo PHY / WRPLL)
 
-This is the part that must be right. `[I915]` `skl_wrpll_params_populate` and
-`skl_ddi_calculate_wrpll` (`display/intel_dpll_mgr.c:1589-1680`):
-
-Search over `p0 ∈ {1,2,3,7}` (odd path) or even dividers `{4,6,…,98}`, `p1`, `p2 ∈ {5,2,3,1}` and
-three central frequencies `{8.4, 9.0, 9.6} GHz`, to find a divider set such that
+This is the part that must be right. The governing identity is the same on every generation:
 
 ```
- DCO  =  p0 * p1 * p2 * afe_clock           where afe_clock = 5 * symbol_rate = 5 * (bit_rate/2)
+DCO = P · Q · K · afe_clock          where afe_clock = 5 · symbol_rate = 5 · (bit_rate / 2)
 ```
 
-lies within tolerance of the chosen central frequency. Then:
+so `symbol_rate = DCO / (P · Q · K · 5)`. Only the *search* and the *field encoding* differ between
+generations, and **ADL-N uses the ICL/TGL forms, not the Skylake ones.** The full ADL-N search is
+transcribed in "The search — now resolved from the implementation" below; the essential arithmetic
+for converting a chosen DCO into register bits is:
 
 ```
-dco_integer  = DCO_div_Hz / (ref_kHz * 1000)
-dco_fraction = ((DCO_div_Hz / ref_MHz) - dco_integer * 1e6) * 0x8000 / 1e6
+dco_integer  = DCO_Hz / (ref_kHz * 1000)
+dco_fraction = ((DCO_Hz / ref_MHz) - dco_integer * 1e6) * 0x8000 / 1e6
 ```
 
-**Correction to an earlier draft.** The search description above was garbled there. `[I915]`'s
-`skl_ddi_calculate_wrpll` first enumerates candidate **total** dividers
-`p = DCO / afe_clock` from a hard-coded even list `{4,6,8,…,98}` and odd list `{3,5,7,9,15,21,35}`,
-and only then decomposes each `p` into `(p0, p1, p2)` via `skl_wrpll_get_multipliers()`, which
-yields `p0 ∈ {2,3,7}` with `p2 ∈ {5,2,3,1}` on this path — **`p0 = 1` never occurs.**
-`[I915]` `display/intel_dpll_mgr.c:1537-1575,1662-1668,1727-1731`. The formula above is correct; the
-"`p0 ∈ {1,2,3,7}`" candidate set was not.
+equivalently, and closer to how `icl_wrpll_params_populate` computes it,
+`dco = (dco_freq << 15) / ref_freq; dco_integer = dco >> 15; dco_fraction = dco & 0x7fff`.
+
+**Two corrections to earlier drafts of this subsection**, both instances of the same mistake —
+reaching for the Skylake helper when the target is Gen12:
+
+1. The search description named `skl_wrpll_params_populate` / `skl_ddi_calculate_wrpll` as the
+   ADL-N arithmetic. They are the **Skylake** arithmetic. ADL-N uses `icl_calc_wrpll` +
+   `icl_wrpll_get_multipliers` + `icl_wrpll_params_populate`.
+2. The candidate set was given as `p0 ∈ {1,2,3,7}`, `p2 ∈ {5,2,3,1}` with central frequencies
+   `{8.4, 9.0, 9.6} GHz`. The ADL-N path uses a flat **total-divider** list
+   `{2,4,…,102, 3,5,7,9,15,21}`, a single **midpoint** of 8999 MHz, and decomposes to
+   `P ∈ {2,3,5,7}`, `K ∈ {1,2,3}`. See below.
 
 Field encodings. **These are the TGL/Gen12 positions, which are NOT the Skylake positions.**
 `[TGL2C]` (DPLL0–3 `CFGCR0`/`CFGCR1`) and `[I915]` `i915_reg.h:4265-4298` (`_ICL_DPLL0_CFGCR1`
@@ -1099,7 +1144,7 @@ block, used for `DISPLAY_VER >= 12`) **agree exactly**:
 | `DPLLn_CFGCR1` (`0x164288` for DPLL0) | `QDIV_RATIO` | `[17:10]` | |
 | | `QDIV_MODE` | `[9]` | 0 if `qdiv_ratio == 1`, else 1 |
 | | `KDIV` | `[8:6]` | `K=1→1`, `K=2→2`, `K=3→4` |
-| | `PDIV` | `[5:2]` | see the discrepancy below |
+| | `PDIV` | `[5:2]` | `P=2→1`, `P=3→2`, `P=5→4`, `P=7→8` |
 | | `CFSELOVRD` | `[1:0]` | **On Gen12 this is `TGL_DPLL_CFGCR1_CFSELOVRD_NORMAL_XTAL = 0`**, not a central-frequency selector |
 
 The last row is a Gen12 delta that is easy to miss: `icl_calc_dpll_state` writes
@@ -1111,74 +1156,258 @@ The earlier SKL-era `DPLL_CFGCR2_*` definitions at `[I915]` `i915_reg.h:4136-415
 (`QDIV_RATIO[15:8]`, `QDIV_MODE[7]`, `KDIV[6:5]`, `PDIV[4:2]`) are **two bits lower** and do **not**
 apply. An earlier draft of this document used them; that was wrong.
 
-#### An unresolved discrepancy in the PDIV encoding
+#### The PDIV/KDIV encoding — resolved, and a real trap alongside it
 
-`[TGL12]` documents the post-divider as `P ∈ {2, 3, 5, 7}`. i915's **executed** ADL-N path
-disagrees with its own named constants:
+**On the ADL-N path there is no discrepancy: write and read agree.** This corrects an earlier draft
+of this document which claimed an unresolved conflict. The draft — and, independently, a later
+implementation review — both made the same mistake, which is the trap described below.
 
-- `[I915]`'s `DPLL_CFGCR1_PDIV_{2,3,5,7}` constants are `{1, 2, 4, 8} << 2` — matching
-  `P ∈ {2,3,5,7}` and the PRM.
-- But `icl_calc_dpll_state` builds the field as `DPLL_CFGCR1_PDIV(pll_params->pdiv)`, and
-  `pll_params->pdiv` is produced by `skl_wrpll_params_populate`, whose mapping is
-  `p0 ∈ {1,2,3,7} → pdiv ∈ {0,1,2,4}`. `[I915]` `display/intel_dpll_mgr.c:1626-1637`, `2884-2905`.
+The chain on ADL-N (HDMI or DSI on a combo PHY) is:
 
-For `p0 = 7` the two give `4 << 2` and `8 << 2` respectively — **different values in the same
-field.** I could not determine which the hardware wants, and the named constants appear unused on
-this path. The same tension exists for `KDIV`: i915's `pll_params->kdiv` mapping is
-`p2 ∈ {5,2,3,1} → {0,1,2,3}` while `[TGL12]` gives `K ∈ {1,2,3}`.
+```
+icl_calc_wrpll()            -> picks a total divider from its own list, then
+icl_wrpll_get_multipliers() -> logical (pdiv, qdiv, kdiv)
+icl_wrpll_params_populate() -> encodes into Gen12 CFGCR1 code values
+icl_calc_dpll_state()       -> DPLL_CFGCR1_PDIV(pdiv) | DPLL_CFGCR1_KDIV(kdiv)
+icl_dpll_write()            -> DPLLn_CFGCR1
+```
+
+and `icl_wrpll_params_populate` (`[I915]` `display/intel_dpll_mgr.c:2546-2570`, identical in
+mainline at `:2576`) emits **exactly the values the Gen12 named constants define**:
+
+| Logical | `params->kdiv` | Gen12 constant | Field value |
+|---|---|---|---|
+| `K = 1` | `1` | `DPLL_CFGCR1_KDIV_1` | `1 << 6` |
+| `K = 2` | `2` | `DPLL_CFGCR1_KDIV_2` | `2 << 6` |
+| `K = 3` | `4` | `DPLL_CFGCR1_KDIV_3` | `4 << 6` |
+
+| Logical | `params->pdiv` | Gen12 constant | Field value |
+|---|---|---|---|
+| `P = 2` | `1` | `DPLL_CFGCR1_PDIV_2` | `1 << 2` |
+| `P = 3` | `2` | `DPLL_CFGCR1_PDIV_3` | `2 << 2` |
+| `P = 5` | `4` | `DPLL_CFGCR1_PDIV_5` | `4 << 2` |
+| `P = 7` | `8` | `DPLL_CFGCR1_PDIV_7` | `8 << 2` |
+
+The read path `icl_ddi_combo_pll_get_freq` (`[I915]` `display/intel_dpll_mgr.c:2827-2890`) masks
+`CFGCR1` with `DPLL_CFGCR1_PDIV_MASK` / `KDIV_MASK` and switches on **those same named constants**.
+Write and read therefore round-trip. The hard-coded DP tables
+(`icl_dp_combo_pll_{24,19_2}MHz_values`) are pre-shifted the same way — the source comment says
+*"These values already adjusted: they're the bits we write to the registers, not the logical
+values"*, and `.pdiv = 0x4 /* 5 */` decodes as `P = 5`. Verified numerically: the 19.2 MHz table's
+540 MHz entry is `dco_integer = 0x1A5` (421) with `dco_fraction = 0x7000`, giving
+`DCO = 421 × 19.2 + (28672 × 19.2)/32768 = 8100 MHz`, and `8100 / (P·Q·K·5) = 8100/(3·1·1·5) = 540`
+— correct for `P = 3, Q = 1, K = 1`.
+
+##### The trap: two populate functions, one struct, two encodings
+
+`[I915]` contains **two** functions whose names differ by four characters and which both write the
+**same** `struct skl_wrpll_params` — but whose `pdiv` and `kdiv` fields hold **different encodings**:
+
+| | `skl_wrpll_params_populate` | `icl_wrpll_params_populate` |
+|---|---|---|
+| Source | `intel_dpll_mgr.c:1592` | `intel_dpll_mgr.c:2546` |
+| Written to | `DPLL_CFGCR2_*` (Skylake) | `DPLL_CFGCR1_*` (Gen12) |
+| Called by | `skl_ddi_calculate_wrpll` → `skl_ddi_hdmi_pll_dividers` | `icl_calc_wrpll` / `icl_calc_dp_combo_pll` / `icl_calc_tbt_pll` |
+| Used on | SKL/KBL/CFL/CML HDMI | **ICL/TGL/RKL/ADL** |
+| `pdiv` accepts | `P ∈ {1,2,3,7}` → `{0,1,2,4}` | `P ∈ {2,3,5,7}` → `{1,2,4,8}` |
+| `kdiv` accepts | `K ∈ {5,2,3,1}` → `{0,1,2,3}` | `K ∈ {1,2,3}` → `{1,2,4}` |
+
+The representability asymmetry is the sharp edge:
+
+- **`P = 5` is representable in the Gen12 convention but NOT in the Skylake one.**
+  `skl_wrpll_get_multipliers` *does* produce `p0 = 5` (for total divider 5:
+  `else if (p == 5 || p == 7) { *p0 = p; ... }`), and `skl_wrpll_params_populate`'s `pdiv` switch has
+  no case for 5 — it hits `default: WARN(1, "Incorrect PDiv")` and leaves `pdiv` at its
+  zero-initialised value, which is `PDIV_1`, i.e. `P = 1`. **Silently wrong, not merely warned.**
+- **`K = 5` is representable in the Skylake convention but NOT in the Gen12 one.**
+  `icl_wrpll_params_populate`'s `kdiv` switch has cases 1, 2, 3 only.
+
+`icl_calc_dpll_state` consumes `pll_params->pdiv`/`kdiv` **assuming the ICL convention**. Nothing in
+the code prevents a Skylake-encoded `struct skl_wrpll_params` from being handed to it; the compiler
+cannot tell the two apart because they are the same type. So this is a latent, silent
+mis-programming hazard rather than an active bug — but it is exactly the shape of mistake a
+from-scratch implementer makes when copying one populate function and one state-builder from
+different generations. **Take the encoder and the decoder from the same generation.**
+
+##### The PRM bounds are matched by the ADL-N path, but not by every list
+
+An implementation review reported that "the PRM's own stated bounds do not cover i915's dividers —
+`total = 35` has no PRM-legal `(P,Q,K)`, and `K = 5` is not a legal `K`". That is **half right, and
+the half that is right does not apply to ADL-N**:
+
+- `total = 35` → `skl_wrpll_get_multipliers(35)` → `(P,Q,K) = (7,1,5)`. `K = 5` **is** outside the
+  PRM's `K ∈ {1,2,3}`, so `total = 35` has no PRM-legal decomposition. **But 35 appears only in
+  `skl_wrpll_get_multipliers`'s odd list `{3,5,7,9,15,21,35}`. The ADL-N list in `icl_calc_wrpll` is
+  `{2,4,…,102, 3,5,7,9,15,21}` — it stops at 21 and contains no 35.** So this cannot arise on ADL-N.
+- Conversely, the ADL-N path **does** respect the PRM bounds. `icl_wrpll_get_multipliers`
+  (`intel_dpll_mgr.c:2507-2543`) only ever emits `P ∈ {2,3,5,7}`, `K ∈ {1,2,3}`, and sets `Q = 1`
+  whenever `K ≠ 2` — which is precisely the PRM's rule, enforced by its own
+  `WARN_ON(kdiv != 2 && qdiv != 1)`.
+
+So the document's earlier presentation of the PRM bounds as the ADL-N rule was **correct**; what was
+missing is that those bounds are *not* universal to i915, and a reader who wandered into the
+Skylake list would find dividers the Gen12 rules forbid.
+
+##### Two more facts the arithmetic depends on
+
+**1. A 38.4 MHz reference is divided down to 19.2 MHz before use.** `[I915]`
+`display/intel_dpll_mgr.c:2764-2776`:
+
+```c
+static int icl_wrpll_ref_clock(struct drm_i915_private *i915)
+{
+        int ref_clock = i915->display.dpll.ref_clks.nssc;
+        /* For ICL+, the spec states: if reference frequency is 38.4,
+         * use 19.2 because the DPLL automatically divides that by 2. */
+        if (ref_clock == 38400)
+                ref_clock = 19200;
+        return ref_clock;
+}
+```
+
+This is used on **both** sides — `icl_calc_wrpll` (`:2783`) and `icl_ddi_combo_pll_get_freq`
+(`:2827`) — so the arithmetic is symmetric. Consequence for a from-scratch driver on a 38.4 MHz
+strap: **compute `dco_integer`/`dco_fraction` against 19.2 MHz, not 38.4 MHz**, or every divider
+will be wrong by 2×. The DP tables handle this by construction — the 19.2 MHz table carries the
+comment *"Also used for 38.4 MHz values"* (`intel_dpll_mgr.c:2637`).
+
+**2. On ADL-P/N at a 38.4 MHz reference, the programmed DCO fraction is halved.** `[I915]`
+`display/intel_dpll_mgr.c:2593-2602`:
+
+```c
+/* Display WA #22010492432: ehl, tgl, adl-s, adl-p
+ * Program half of the nominal DCO divider fraction value. */
+static bool ehl_combo_pll_div_frac_wa_needed(...)
+{
+        return ((IS_ELKHARTLAKE(...) || IS_TIGERLAKE(i915) || IS_ALDERLAKE_S(i915) ||
+                 IS_ALDERLAKE_P(i915)) && i915->display.dpll.ref_clks.nssc == 38400);
+}
+```
+
+`IS_ALDERLAKE_P` is true for ADL-N (it is a subplatform), so **this workaround applies to the
+target**. The halving is applied on write in `icl_calc_dpll_state`
+(`dco_fraction = DIV_ROUND_CLOSEST(dco_fraction, 2)`, `:2873`) and undone on read in
+`icl_ddi_combo_pll_get_freq` (`dco_fraction *= 2`, `:2891`), so it round-trips. Note the predicate
+tests `ref_clks.nssc == 38400` — the **raw** strap value, *not* the divided-down value that
+`icl_wrpll_ref_clock` returns. Those two facts interact: at a 38.4 MHz strap you divide the
+reference by 2 *and* halve the fraction, which is self-consistent because the DPLL itself divides
+the reference by 2.
 
 **Do not synthesise these fields by hand from this document.** Two safe routes:
 
 1. **Best:** if the firmware or a vendor driver has already programmed a combo DPLL for a mode you
    can use, **read `DPLL0_CFGCR0`/`DPLL0_CFGCR1` and reuse the divider set verbatim**, changing
-   only the ratio if you must. Then diff your own computation against it.
-2. Otherwise implement i915's executed encoding, and **verify by read-back** before enabling.
+   only the ratio if you must. Then diff your own computation against it. This also sidesteps the
+   `ehl_combo_pll_div_frac_wa_needed` question, since the stored fraction already has whatever
+   adjustment the platform needed.
+2. Otherwise mirror `icl_wrpll_get_multipliers` + `icl_wrpll_params_populate` (**not** the `skl_`
+   pair), apply `icl_wrpll_ref_clock` and the EHL workaround, and **verify by read-back** before
+   enabling.
 
-This is recorded again in §13.1 and §13.3.
+#### The search — now resolved from the implementation
 
-#### The search bounds — these *are* documented
-
-`[TGL12]` Clocks → combo PHY PLL gives the search explicitly, which fills what would otherwise be a
-gap:
+The PRM states the bounds; i915's implementation of them is `icl_calc_wrpll`
+(`[I915]` `display/intel_dpll_mgr.c:2779-2820`, identical in mainline at `:2811`). The earlier draft
+of this document recorded the search loop as a `[GAP]`; it is not one. Here it is in full, with the
+PRM's stated bounds alongside so the correspondence is visible:
 
 ```
-symbol_rate = DCO / (P · Q · K) / 5
-P ∈ {2, 3, 5, 7}
-K ∈ {1, 2, 3}
-K != 2  ⇒  Q = 1        (otherwise Q ∈ 1..255, and Q must be integer)
-DCO ∈ [7998 MHz, 10000 MHz]      midpoint 8999 MHz
+afe_clock = port_clock * 5                       /* AFE = 5x symbol rate; port_clock IS the symbol rate */
+dco_min = 7998000        /* 7998 MHz  -- PRM: "DCO min 7998"          */
+dco_max = 10000000       /* 10000 MHz -- PRM: "DCO max 10000"         */
+dco_mid = (dco_min + dco_max) / 2   /* 8999 MHz -- PRM: "midpoint 8999" */
+
+dividers[] = { 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 30, 32, 36, 40,
+               42, 44, 48, 50, 52, 54, 56, 60, 64, 66, 68, 70, 72, 76, 78, 80,
+               84, 88, 90, 92, 96, 98, 100, 102,
+               3, 5, 7, 9, 15, 21 }
+
+best = argmin over d of |afe_clock * dividers[d] - dco_mid|
+       subject to  dco_min <= afe_clock * dividers[d] <= dco_max
+if no such d: fail with -EINVAL
+(P, Q, K) = icl_wrpll_get_multipliers(best)
+icl_wrpll_params_populate(params, best_dco, ref_clock, P, Q, K)
 ```
 
-So the search is: enumerate `(P,Q,K)`, compute `DCO = symbol_rate · 5 · P · Q · K`, keep the
-candidates whose DCO lands in `[7998, 10000]` MHz, and pick the one closest to the midpoint.
-`Q` comes from `QDIV_RATIO`/`QDIV_MODE`; `K` from `KDIV`; `P` from `PDIV` — **subject to the
-encoding discrepancy above.**
+The three PRM constants and i915's three constants are **the same numbers**, which is a strong
+mutual confirmation. The search strategy differs in form only: the PRM describes "closest to the
+midpoint" and i915 implements exactly that (`dco_centrality = abs(dco - dco_mid)`, minimised), while
+the *Skylake* path (`skl_ddi_calculate_wrpll`) instead walks three discrete central frequencies
+`{8400, 9000, 9600}` MHz and minimises percentage deviation with
+`SKL_DCO_MAX_PDEVIATION`/`SKL_DCO_MAX_NDEVIATION` bounds. **ADL-N takes the midpoint form, not the
+three-frequency form.**
 
-`[I915]`'s own search uses central frequencies `{8400, 9000, 9600}` MHz
-(`skl_ddi_calculate_wrpll`, `intel_dpll_mgr.c:1662-1666`) rather than a midpoint, and its `P`/`K`
-candidate sets are `p0 ∈ {1,2,3,7}` / `p2 ∈ {5,2,3,1}`. The two framings are compatible in spirit
-(9.0 GHz is the PRM's midpoint) but **not bit-identical**. `[INF]`
+Two behaviours worth knowing because they are easy to get wrong when reimplementing:
 
-**Worked example — 1080p60, 148.5 MHz pixel clock, HDMI.** The TMDS symbol rate is 148.5 MHz, so
-the PLL output must be `5 × 148.5 = 742.5 MHz`. Search over `P·Q·K`:
+- **Even dividers are preferred, but only after the whole search.** In the Skylake loop the even
+  list is tried first and the code breaks out if an even divider produced any solution; in the ICL
+  loop there is a single flat list with the evens first and strict `<` comparison, so the first
+  (smallest) divider achieving the minimum centrality wins.
+- **Exhaustive, not early-exit, on the ICL path.** Unlike the Skylake loop there is no
+  `min_deviation == 0` early break — every candidate in the list is tested. That is cheap
+  (~46 entries) and makes the result order-independent, which is convenient if you want to diff
+  your implementation against i915's.
 
-| `P·Q·K` | DCO (MHz) | In `[7998,10000]`? |
+`icl_wrpll_get_multipliers` (`:2507-2543`) then decomposes the chosen total divider:
+
+```
+even, == 2          -> P=2, Q=1,      K=1
+even, %4 == 0       -> P=2, Q=d/4,    K=2
+even, %6 == 0       -> P=3, Q=d/6,    K=2
+even, %5 == 0       -> P=5, Q=d/10,   K=2
+even, %14 == 0      -> P=7, Q=d/14,   K=2
+odd, 3 | 5 | 7      -> P=d, Q=1,      K=1
+odd, otherwise (9,15,21) -> P=d/3, Q=1, K=3
+```
+
+Note the ordering: `%4` is tested before `%6` before `%5` before `%14`, so e.g. 20 takes the `%4`
+branch (`P=2, Q=5, K=2`), not `%5`. **Every branch yields `P ∈ {2,3,5,7}` and `K ∈ {1,2,3}`, and
+`Q = 1` whenever `K ≠ 2`** — i.e. the PRM's rules are satisfied by construction, and the
+function's own `WARN_ON(kdiv != 2 && qdiv != 1)` is the assertion of that.
+
+**Worked example — 1080p60, 148.5 MHz pixel clock, HDMI, 38.4 MHz strap.** This is worked all the
+way through to register values, and every number below was recomputed from the source arithmetic.
+
+```
+port_clock = 148500 kHz        (the mode's pixel clock == the TMDS symbol rate)
+afe_clock  = 148500 * 5 = 742500 kHz
+ref        = 38400 -> icl_wrpll_ref_clock() -> 19200 kHz
+```
+
+Candidates `DCO = 742500 * d` (kHz) inside `[7998000, 10000000]`:
+
+| `d` | DCO (MHz) | Verdict |
 |---|---|---|
-| 10 | 7425 | no — below |
-| 11 | 8167.5 | yes (if reachable) |
-| 12 | 8910 | yes |
-| 13 | 9652.5 | yes (if reachable) |
-| 14 | 10395 | no — above |
+| 10 | 7425.0 | **rejected** — below `dco_min` |
+| **12** | **8910.0** | **accepted**, `\|DCO − 8999\| = 89` |
+| 14 | 10395.0 | **rejected** — above `dco_max` |
 
-`[INF]` `P·Q·K = 11` needs `P = 11` (not in the set) or `Q = 11, P = 1`; `P·Q·K = 12` is reachable as
-`P=2, Q=2, K=3` or `P=3, Q=2, K=2` (note `K=2 ⇒ Q=1`, so `Q=2, K=2` is illegal — `P=2,Q=6,K=1` or
-`P=3,Q=4,K=1` or `P=2,Q=2,K=3`). `P·Q·K = 13` needs `Q = 13`. I have **not** validated a specific
-divider set end to end; implement the search, print the chosen `(P,Q,K)` and the resulting DCO, and
-cross-check against the firmware's `CFGCR0`/`CFGCR1` if the firmware ever programmed this mode.
+`d = 12` is in fact the *only* in-range candidate here, so the midpoint rule is not exercised by
+this mode — it matters at higher pixel clocks where several divisors land in the window.
 
-`[GAP]` I did not extract the exact loop, tolerance and tie-breaking rules from
-`skl_ddi_calculate_wrpll` (~90 lines). The arithmetic and field encodings above are sourced; the
-*choice among valid candidates* is not.
+```
+icl_wrpll_get_multipliers(12):  12 % 4 == 0  ->  P = 2, Q = 12/4 = 3, K = 2
+icl_wrpll_params_populate(dco_freq = 8910000 kHz, ref_freq = 19200 kHz, P=2, Q=3, K=2):
+    dco          = (8910000 << 15) / 19200 = 15206400
+    dco_integer  = 15206400 >> 15          = 464   (0x1D0)
+    dco_fraction = 15206400 & 0x7FFF       = 2048  (0x800)
+```
+
+Because the strap is 38.4 MHz, `ehl_combo_pll_div_frac_wa_needed()` is true and
+`icl_calc_dpll_state` halves the fraction before writing:
+**`dco_fraction` is written as `1024` (`0x400`), not `2048`.**
+
+Final register values for DPLL0:
+
+| Register | Fields | Value |
+|---|---|---|
+| `DPLL0_CFGCR0` (`0x164284`) | `DCO_FRACTION[24:10] = 1024`, `DCO_INTEGER[9:0] = 464` | `(1024 << 10) \| 464` = `0x001001D0` |
+| `DPLL0_CFGCR1` (`0x164288`) | `QDIV_RATIO[17:10] = 3`, `QDIV_MODE[9] = 1`, `KDIV[8:6] = 2`, `PDIV[5:2] = 1`, `CFSELOVRD[1:0] = 0` | `(3 << 10) \| (1 << 9) \| (2 << 6) \| (1 << 2)` = `0x00000E84` |
+
+Round-trip check (this is what `icl_ddi_combo_pll_get_freq` does, in reverse): the read path doubles
+the fraction back to 2048, giving
+`DCO = 464 × 19.2 + (2048 × 19.2)/32768 = 8908.8 + 1.2 = 8910.0 MHz`, and then
+`symbol_rate = 8910.0 / (P·Q·K·5) = 8910.0 / 60 = 148.5 MHz` ✓ — the pixel clock we started from.
 
 #### PLL enable sequence
 
@@ -1408,17 +1637,53 @@ Combo PHY A base `0x162000`, combo PHY B base `0x06C000`. `[I915]`
 `display/intel_combo_phy_regs.h:11-18`. (PHY C/EHL `0x160000`, PHY D/RKL `0x161000`, PHY E/ADL-S
 `0x16B000` — none of these are known to exist on ADL-N.)
 
-Sub-blocks within a PHY:
+Sub-blocks within a PHY. Every combo PHY register is `PHY_BASE + SUB_BLOCK(instance) + 4 * dw`.
+There are four blocks (`CL`, `COMP`, `PCS`, `TX`) and **eight instances** in total, named
+`_ICL_PORT_<block>_<instance>`:
 
-| Block | Offset | Notable registers |
+| Sub-block | `AUX` | `GRP` (group) | `LN(ln)` (per lane) | What it holds |
+|---|---|---|---|---|
+| `CL` | *(implicit `+0x000`)* | — | — | `DW5` `CL_POWER_DOWN_ENABLE[4]`, `SUS_CLOCK_CONFIG[1:0]`; `DW10` `PWR_DOWN_LN_MASK[7:4]`; `DW12` `LANE_ENABLE_AUX[0]` |
+| `COMP` | — | `+0x100` | — | `DW0` `COMP_INIT[31]`; `DW1`/`DW9`/`DW10` = procmon; `DW3` process/voltage; `DW8` `IREFGEN[24]` |
+| `PCS` | `+0x300` | `+0x600` | `+0x800 + ln*0x100` | `DW1` `DCC_MODE_SELECT` |
+| `TX` | `+0x380` | **`+0x680`** | `+0x880 + ln*0x100` | `DW2` swing, `DW4` cursor coeff, `DW5` training enable / scaling mode, `DW7` N scalar, `DW8` ODCC |
+
+Offsets are defined in `[I915]` `display/intel_combo_phy_regs.h:24` (`CL`), `:50` (`COMP`),
+`:77-79` (`PCS`) and `:96-98` (`TX`).
+
+**Two mnemonics make this recomputable rather than memorisable:**
+
+1. **`TX` is always exactly `+0x80` after the corresponding `PCS` instance.** AUX: `0x300`/`0x380`.
+   Group: `0x600`/`0x680`. Lane: `0x800`/`0x880`. Find one and you can derive the other.
+2. **`CL` and `COMP` are group-wide only** — no AUX or per-lane instances — which is why
+   `_ICL_PORT_CL_DW(dw, phy) = PHY_BASE + 4*dw` has no sub-block term at all.
+
+Worked examples for **combo PHY A** (`PHY_BASE = 0x162000`):
+
+| Register | Derivation | Absolute |
 |---|---|---|
-| `PORT_CL_DW*` | `+0x000 + 4*dw` | `DW5` `CL_POWER_DOWN_ENABLE[4]`, `SUS_CLOCK_CONFIG[1:0]`; `DW10` `PWR_DOWN_LN_MASK[7:4]`; `DW12` `LANE_ENABLE_AUX[0]` |
-| `PORT_COMP_DW*` | `+0x100 + 4*dw` | `DW0` `COMP_INIT[31]`; `DW1`, `DW9`, `DW10` = procmon; `DW3` process/voltage; `DW8` `IREFGEN[24]` |
-| `PORT_PCS_DW*` | `+0x300` (AUX), `+0x600` (group), `+0x800 + ln*0x100` (per lane) | `DW1` `DCC_MODE_SELECT` |
-| `PORT_TX_DW*` | `+0x400` (group), `+0x600+…` | `DW2` swing, `DW4` cursor coeff, `DW5` training enable/scaling mode, `DW7` N scalar, `DW8` ODCC |
-| `ICL_PHY_MISC` | `0x64C00` (A), `0x64C04` (B) | `DE_IO_COMP_PWR_DOWN`, `MUX_DDID` |
+| `ICL_PORT_COMP_DW0(A)` | `0x162000 + 0x100 + 4*0` | `0x162100` |
+| `ICL_PORT_CL_DW5(A)` | `0x162000 + 0x000 + 4*5` | `0x162014` |
+| `ICL_PORT_PCS_DW1_GRP(A)` | `0x162000 + 0x600 + 4*1` | `0x162604` |
+| `ICL_PORT_TX_DW2_GRP(A)` | `0x162000 + 0x680 + 4*2` | `0x162688` |
+| `ICL_PORT_TX_DW4_GRP(A)` | `0x162000 + 0x680 + 4*4` | `0x162690` |
+| `ICL_PORT_TX_DW5_GRP(A)` | `0x162000 + 0x680 + 4*5` | `0x162694` |
+| `ICL_PORT_TX_DW8_GRP(A)` | `0x162000 + 0x680 + 4*8` | `0x1626A0` |
 
-`[I915]` `intel_combo_phy_regs.h:20-80`, `i915_reg.h:4453-4456`.
+> **Correction to an earlier draft.** This table previously gave the `PORT_TX_DW*` group base as
+> `+0x400`. **That is wrong.** `+0x400` is not any defined sub-block and lands in unassigned space
+> between `PCS_AUX` (`0x300`) and `PCS_GRP` (`0x600`); a buffer-translation value written there
+> would reach no register, and the swing/pre-emphasis programming would silently do nothing — which
+> presents as a link that trains at the wrong level or not at all, *after* the PLL has already
+> locked, so it looks like a PHY or cable problem rather than an offset bug. The group base is
+> **`+0x680`**.
+
+> **`ICL_PHY_MISC` is NOT in the combo PHY aperture.** It lives at `0x64C00` (PHY A) and `0x64C04`
+> (PHY B) — `[I915]` `i915_reg.h:4458-4459` — in the DDI register block, nowhere near `0x162000` or
+> `0x06C000`. It is the one combo-PHY-related register you **cannot** derive from `PHY_BASE`.
+> Fields: `DE_IO_COMP_PWR_DOWN`, `MUX_DDID`.
+
+`[I915]` `intel_combo_phy_regs.h:20-105`, `i915_reg.h:4453-4459`.
 
 ### 8.3 Combo PHY initialisation
 
@@ -2139,7 +2404,21 @@ a GGTT entry that is not valid).
 
 ### Phase 5 — the output
 
-**5.1 Program the PLL** for the pixel clock (dividers, then power, then enable, then poll `LOCK`).
+**5.1 Program the PLL** — dividers, then power, then enable, then poll `LOCK`. Four things to get
+right, all in §6.3:
+```
+ref = SKL_DSSM[31:29] decoded          /* 24 / 19.2 / 38.4 MHz */
+if ref == 38400: ref = 19200           /* icl_wrpll_ref_clock: DPLL auto-divides by 2 */
+(P,Q,K) = search(port_clock*5, ref)    /* icl_calc_wrpll: midpoint 8999 MHz, DCO in [7998,10000] */
+if ref_strap == 38400: dco_fraction /= 2   /* WA #22010492432, applies to ADL-P/N */
+```
+*Looks like it did nothing:* `LOCK` never sets, or the mode comes out at the wrong pixel clock
+(monitor reports "out of range" or shows a doubled/halved image). The two clamps above are the
+usual cause: using 38.4 MHz instead of 19.2 MHz in the arithmetic makes every divider wrong by 2×,
+and skipping the fraction halving makes it wrong by a fraction of a percent — small enough to look
+like a marginal-signal problem rather than an arithmetic bug. **Print `ref`, `(P,Q,K)` and the
+resulting `symbol_rate` before writing**, and compare the symbol rate against the mode's pixel
+clock.
 
 **5.2 Map DDI → PLL**: `rmw(ICL_DPCLKA_CFGCR0 0x164280, DDI_CLK_SEL_MASK(phy), DDI_CLK_SEL(pll_id, phy))`
 then, **in a separate write**, clear `DDI_CLK_OFF(phy)`.
@@ -2326,9 +2605,11 @@ trust this document.
 9. **Whether ADL-N needs the 16 Gb-DIMM level-0 latency adjustment** for its soldered LPDDR5.
 10. **What register `0xC2000` is**, which the DG1 PRM says must have bits `[18:15] = 1111b` for
     hotplug board inversion.
-11. **The exact `skl_ddi_calculate_wrpll` search loop** — tolerances and tie-breaking. The
-    arithmetic, the field encodings and the DCO bounds are sourced; the *choice among valid
-    candidates* is not.
+11. ~~**The exact `skl_ddi_calculate_wrpll` search loop.**~~ **CLOSED.** The ADL-N search loop is
+    `icl_calc_wrpll`, not `skl_ddi_calculate_wrpll`, and it is fully transcribed in §6.3 — bounds,
+    divider list, selection rule, and the `icl_wrpll_get_multipliers` decomposition. The PRM's three
+    DCO constants match i915's three constants exactly. What remains unverified is only whether the
+    arithmetic produces the *right* frequency on real silicon; the algorithm itself is sourced.
 12. **The values of `icl_combo_phy_trans_hdmi`** — the HDMI buffer-translation table for combo PHY.
     I identified which table is selected but did not extract its entries.
 13. **The ADL-N VBT / OpRegion structure.** Out of scope by choice; needed only for eDP.
@@ -2375,7 +2656,7 @@ trust this document.
 | `CDCLK_FREQ_DECIMAL` | U10.1 of `round_to_0.5MHz(f) − 1` | `DIV_ROUND_CLOSEST(f_kHz − 1000, 500)` | **both agree** | Verified numerically on two frequencies (§4.6). |
 | `CD2X_PIPE` | `000/010/100/110/111` = A/B/C/D/none | `pipe << 20`, none = `7 << 19` | **both agree** | Bit-for-bit. |
 | `DPLL_CFGCR0/1` layout | `CFGCR0`: frac `[24:10]`, int `[9:0]`; `CFGCR1`: qdiv `[17:10]`, mode `[9]` | identical | **both agree** | Bit-for-bit. This *replaced* an earlier draft that used the Skylake `CFGCR2` layout — that was wrong. |
-| `PDIV`/`KDIV` encoding | `P ∈ {2,3,5,7}`, `K ∈ {1,2,3}` | executed path uses `p0 ∈ {1,2,3,7}`, `p2 ∈ {5,2,3,1}`; named constants match the PRM but are unused | **unresolved** | Genuine internal inconsistency in i915. Reuse a firmware-programmed value if you can (§6.3). |
+| `PDIV`/`KDIV` encoding | `P ∈ {2,3,5,7}`, `K ∈ {1,2,3}`, `K≠2 ⇒ Q=1` | **agrees on the ADL-N path**: `icl_wrpll_get_multipliers` + `icl_wrpll_params_populate` satisfy the PRM rules by construction, and write/read round-trip | **resolved** | An earlier draft claimed an unresolved conflict; it had compared the *Skylake* populate function against the Gen12 decoder. The real finding is a two-conventions-one-struct trap, not a live inconsistency. See §6.3. |
 | Power-well numbering | TGL/DG1: `PG0..PG5` chain, bits 1/0…9/8. RKL: different again | `XE_LPD`: tree, `PW_1`=0, `PW_2`=1, `PW_A..D`=5..8 | **i915 for ADL-N** | i915's `XE_LPD` map is the only source that targets display 13. TGL and RKL disagreeing with *each other* is the warning. |
 | Hotplug board inversion | DG1 says apply `0xC2000[18:15]=0xF` | does not program it | **unresolved** | Board-specific. Try both polarities. |
 | Combo PHY DCC mode | TGL says "DCC continuous mode"; DG1 says "divide by 2" | programs `RUN_DCC_ONCE` in `PCS_DW1` for Gen12 | **i915** | Two PRM volumes contradict each other on the same step; i915 is unambiguous and targets Gen12. |
@@ -2591,8 +2872,8 @@ Behaviour:
   it is tagged `[GAP]`.
 - **No hardware was run.** No part of this has been validated on real silicon.
 - **An adversarial fact-check pass was run against the cached sources before this document was
-  committed**, and it found real errors, all of which are fixed and left visible in the text because
-  each is a trap worth knowing about:
+  first committed**, and it found real errors, all of which are fixed and left visible in the text
+  because each is a trap worth knowing about:
   1. The CDCLK PLL sequence wrongly carried the combo DPLL's bit-27 power-up step.
   2. The `DPLL_CFGCR1` field positions were the Skylake `CFGCR2` layout, not the Gen12 one.
   3. The GMBUS pin index was treated as 0-based when it is 1-based.
@@ -2606,9 +2887,49 @@ Behaviour:
      `has_fuses` sentence for `PW_A`…`PW_D`).
   8. Bit depth and dithering were attributed to `TRANSCONF` when on Gen12 they live in `PIPE_MISC`.
   9. The `dco_fraction` formula had a dimension error (`ref_kHz` where `ref_MHz` belongs).
+
+- **A second review round, prompted by two independent implementation workstreams, found four more
+  defects.** All are fixed:
+  10. **§8.2 gave the `PORT_TX_DW*` group base as `+0x400`; it is `+0x680`.** `+0x400` is not a
+      defined sub-block and would have written buffer-translation values into unassigned space —
+      silent, and it presents *after* the PLL locks, so it looks like a signal-integrity problem.
+      §8.2 now states the full base-plus-sub-block rule plus the `TX = PCS + 0x80` mnemonic so every
+      PHY offset is recomputable.
+  11. **§2.1 contradicted §3.3 on forcewake.** §2.1 had read `NEEDS_FORCE_WAKE`'s `0x116000`
+      threshold as "registers at or above this need forcewake", which swept in the combo PHY and
+      DPLL configuration. §3.3 was right: `0x116000` is where a *fast-path filter* stops
+      short-cutting, not where forcewake begins, and the authoritative `__gen12_fw_ranges` table
+      assigns **domain 0** to the whole `0x40000`–`0x1BFFFF` range. Resolved in favour of §3.3, with
+      the filter-versus-requirement distinction now spelled out and cross-referenced from both
+      sections.
+  12. **§6.3's "unresolved `PDIV`/`KDIV` discrepancy" was a false alarm of my own making** — I had
+      compared `skl_wrpll_params_populate` (the *Skylake* encoder) against the *Gen12* decoder. They
+      are not on the same path. ADL-N uses `icl_wrpll_params_populate`, which emits exactly the
+      Gen12 named-constant values, so write and read round-trip. The section now documents the real
+      finding instead: two populate functions, one shared struct, two incompatible encodings, with
+      `P = 5` representable only in the Gen12 convention and `K = 5` only in the Skylake one.
+  13. **§6.3 and §13.1 item 11 treated the wrpll search as an open gap.** It is not — ADL-N's search
+      is `icl_calc_wrpll`, fully transcribed in §6.3, including the midpoint rule and the
+      `icl_wrpll_get_multipliers` decomposition. The PRM's three DCO constants (7998 / 10000 / 8999
+      MHz) match i915's three constants exactly.
+
+- **A claim from the second review that I could not confirm, and did not adopt.** The review stated
+  that "the PRM's stated bounds do not cover i915's dividers — `total = 35` has no PRM-legal
+  `(P,Q,K)`, and `K = 5` is not a legal `K`". Both halves are true *of the Skylake divider list*,
+  and both are false of the ADL-N path: `icl_calc_wrpll`'s list stops at 21 and contains no 35, and
+  `icl_wrpll_get_multipliers` only ever emits `K ∈ {1,2,3}`. §6.3 records this explicitly rather
+  than silently dropping it, because the Skylake list is a plausible place for a reader to end up.
+
 - **Three sources of the same generation disagreed with each other on the power-well map** (TGL vs.
   RKL vs. `XE_LPD`). That is recorded in §4.2.1 and is the single strongest argument for verifying
   the map on real hardware rather than trusting any document — including this one.
+
+- **A meta-lesson from defects 10–13, worth more than any of them individually.** Three of the four
+  were the *same* mistake in different clothes: reaching for a Skylake-era or TGL-era symbol when
+  the target is `XE_LPD`. The `skl_`/`icl_` prefix in i915's function names is not decorative —
+  `skl_wrpll_*` and `icl_wrpll_*` take the same struct and mean different things by it, and
+  `[TGL12]` documents a power-well map that ADL-N does not use. **When reading i915 for this
+  platform, check the generation prefix on every helper before trusting its encoding.**
 - **Licence.** This document records *facts* — register offsets, bitfield positions, sequences,
   constants, tables — which are not copyrightable. The GPL-2.0 `drm/i915` sources and the Intel
   PRMs were read for those facts; no code, comment or prose from either was reproduced.
