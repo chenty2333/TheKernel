@@ -247,10 +247,9 @@ pub fn collect_modes(edid: &Edid<'_>, list: &mut ModeList) -> CollectReport {
         }
     }
     if let Some(extra) = edid.standard_timing_ids() {
-        for chunk in extra.chunks_exact(2) {
-            let code = [chunk[0], chunk[1]];
-            if code != [0x01, 0x01] && code[0] != 0 {
-                codes.push(code);
+        for code in extra.as_chunks::<2>().0 {
+            if *code != [0x01, 0x01] && code[0] != 0 {
+                codes.push(*code);
             }
         }
     }

@@ -814,10 +814,9 @@ impl fmt::Debug for Edid<'_> {
             self.base.revision,
             self.present_blocks,
             self.warnings,
-            match self.monitor_name().and_then(EdidText::as_str) {
-                Some(name) => name,
-                None => "<unnamed>",
-            }
+            self.monitor_name()
+                .and_then(EdidText::as_str)
+                .unwrap_or("<unnamed>")
         )
     }
 }
@@ -848,7 +847,7 @@ impl<'a> Edid<'a> {
         if bytes.is_empty() {
             return Err(EdidError::Empty);
         }
-        if bytes.len() % BLOCK_LEN != 0 {
+        if !bytes.len().is_multiple_of(BLOCK_LEN) {
             return Err(EdidError::NotBlockAligned { len: bytes.len() });
         }
         let present_blocks = bytes.len() / BLOCK_LEN;
@@ -1375,7 +1374,7 @@ impl<'a> Cta861<'a> {
     /// Iterates the detailed timing descriptors of the extension.
     pub fn detailed_timings(&self) -> CtaDetailedTimings<'a> {
         let offset = usize::from(self.dtd_offset());
-        let rest = if offset >= 4 && offset < CHECKSUM_OFFSET {
+        let rest = if (4..CHECKSUM_OFFSET).contains(&offset) {
             self.raw.get(offset..CHECKSUM_OFFSET).unwrap_or(&[])
         } else {
             &[]
@@ -1516,10 +1515,10 @@ fn parse_base(
         ScreenSize {
             width_mm: None,
             height_mm: None,
-            landscape_aspect_ratio_percent: (width_cm > 0)
-                .then(|| (u16::from(width_cm) + 99) / 100 * 100),
-            portrait_aspect_ratio_percent: (height_cm > 0)
-                .then(|| (u16::from(height_cm) + 99) / 100 * 100),
+            // The byte holds `(aspect ratio * 100) - 99`, so the ratio in
+            // percent is the byte plus 99: 79 means 1.78.
+            landscape_aspect_ratio_percent: (width_cm > 0).then(|| u16::from(width_cm) + 99),
+            portrait_aspect_ratio_percent: (height_cm > 0).then(|| u16::from(height_cm) + 99),
         }
     } else {
         ScreenSize {
@@ -1837,7 +1836,7 @@ fn parse_detailed_timing(
             vdisplay * 2,
             (vdisplay + vfront) * 2,
             (vdisplay + vfront + vsync) * 2,
-            (vdisplay + vblank) * 2 | 1,
+            ((vdisplay + vblank) * 2) | 1,
         )
     } else {
         (
@@ -2078,6 +2077,34 @@ mod tests {
         assert_eq!(timing.image_size_mm, Some((344, 194)));
         assert_eq!(timing.sync, SyncType::DigitalSeparate);
         assert_eq!(timing.stereo, StereoMode::None);
+    }
+
+    #[test]
+    fn an_edid_that_encodes_only_an_aspect_ratio_is_decoded_that_way() {
+        // EDID 1.4 lets a sink state an aspect ratio instead of a size: the
+        // width byte holds (ratio * 100) - 99 and the height byte is zero.
+        let bytes = BaseBlockBuilder::new()
+            .manufacturer(b"ACR")
+            .screen_size_cm(79, 0)
+            .detailed_timing(0, &DetailedTimingSpec::new(148_500, 1920, 1080))
+            .build();
+        let edid = parse(&bytes);
+        let size = edid.screen_size();
+        assert_eq!(size.width_mm, None);
+        assert_eq!(size.height_mm, None);
+        assert_eq!(size.landscape_aspect_ratio_percent, Some(178));
+        assert_eq!(size.portrait_aspect_ratio_percent, None);
+
+        // The portrait form is the mirror image.
+        let bytes = BaseBlockBuilder::new()
+            .manufacturer(b"ACR")
+            .screen_size_cm(0, 79)
+            .detailed_timing(0, &DetailedTimingSpec::new(148_500, 1920, 1080))
+            .build();
+        let edid = parse(&bytes);
+        let size = edid.screen_size();
+        assert_eq!(size.portrait_aspect_ratio_percent, Some(178));
+        assert_eq!(size.landscape_aspect_ratio_percent, None);
     }
 
     #[test]
