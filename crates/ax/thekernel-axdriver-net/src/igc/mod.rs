@@ -31,11 +31,19 @@
 //!    accessor where the field encoding is non-trivial, and an access rule the
 //!    window enforces -- including the two registers whose *read* has a side
 //!    effect, which the identify-only phase's register list therefore excludes.
+//! 3. **Reset, station address and link.**  [`bringup`]: stop the MAC's DMA
+//!    engine, reset the part, wait for the NVM auto-read, read the station
+//!    address out of the receive-address registers, ask the PHY to
+//!    autonegotiate and wait for link, then report speed and duplex.  It sets
+//!    up no descriptor ring, so nothing can be sent or received yet, and it
+//!    writes no PHY register -- the advertisement the firmware left is the one
+//!    used, which is stated as a limitation rather than hidden.
 //!
-//! The phases that follow -- reset and link-up, then descriptor rings -- each
-//! arrive as their own change, and the driver grows into the table the second
-//! phase declares.  Nothing below claims to be finished, and the module
-//! documentation of each later phase states what it does *not* establish.
+//! The phase that follows -- descriptor rings and the `NetDriverOps`
+//! implementation -- arrives as its own change, and the driver grows into the
+//! table the second phase declares.  Nothing below claims to be finished, and
+//! the module documentation of each later phase states what it does *not*
+//! establish.
 //!
 //! # What cannot be verified here
 //!
@@ -47,6 +55,7 @@
 //! does and does not establish.  Every value this driver ever read from a real
 //! i225 has, so far, been read zero times.
 
+pub mod bringup;
 pub mod ids;
 pub mod probe;
 pub mod regs;
@@ -57,6 +66,7 @@ pub(crate) mod fake;
 use core::{marker::PhantomData, time::Duration};
 
 pub use self::{
+    bringup::{BringUp, BringUpError, LinkOutcome, StationAddress},
     ids::{DeviceId, Family, INTEL_VENDOR, identify},
     probe::{ConfigFacts, ProbeReport, Verdict},
     regs::{

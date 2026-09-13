@@ -227,8 +227,25 @@ pub(crate) fn probe(
             WINDOW_BYTES,
         ))
     };
+    let bdf = facts.bdf.clone();
     let report = igc::probe::run(facts, device, &mut bus);
+    let identified = matches!(report.verdict, igc::probe::Verdict::Identified);
     info!("{}", report.render());
+
+    // Only a device the identification actually confirmed is programmed: a
+    // function whose registers contradict its device id is a function this
+    // driver does not understand well enough to reset.
+    if identified {
+        match igc::bringup::bring_up(&mut bus) {
+            Ok(up) => info!("{}", up.render(&bdf)),
+            Err(error) => warn!("igc: bring-up {bdf} failed: {}", error.describe()),
+        }
+    } else {
+        warn!(
+            "igc: {bdf}: not brought up: the identification did not confirm the device, so \
+             nothing was programmed"
+        );
+    }
     note_match();
     Some(report)
 }

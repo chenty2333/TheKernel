@@ -11,9 +11,12 @@
 //! 4. Are the values they answer with consistent with the part the device id
 //!    claims to be?
 //!
-//! It writes nothing.  The register table this phase uses declares no writable
-//! register, so "identify, do not program" is not a promise the code makes
-//! about itself -- there is no writable register for it to reach.
+//! It writes nothing.  That is a property of this function rather than of the
+//! register table: the table now declares the writable registers the bring-up
+//! phase needs, and `run` reads its own list ([`super::regs::IDENTIFY`]) and
+//! never calls `write`.  A test drives it against a bus that records every
+//! write and asserts the record is empty, so "identify, do not program" is
+//! checkable rather than promised.
 //!
 //! # What the verdict means, and what it does not
 //!
