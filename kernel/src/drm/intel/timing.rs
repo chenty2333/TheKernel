@@ -2,9 +2,12 @@
 //!
 //! Six registers on a Gen12 transcoder describe one timing -- `HTOTAL`,
 //! `HBLANK`, `HSYNC`, `VTOTAL`, `VBLANK`, `VSYNC` -- and a seventh, `PIPESRC`,
-//! describes how much of the pipe's source is active.  This module turns a
-//! [`Mode`] into those seven values.  It touches no hardware: the register
-//! writes belong to the modeset workstream, which consumes this result.
+//! describes how much of the pipe's source is active.  On this platform an
+//! eighth value goes with them: display version 13 stopped reading
+//! `TRANS_VBLANK`'s `VBLANK_START` field, and `TRANS_SET_CONTEXT_LATENCY`
+//! replaces it.  This module turns a [`Mode`] into all eight values.  It
+//! touches no hardware: the register writes belong to the modeset workstream,
+//! which consumes this result.
 //!
 //! # The one thing this module exists to get right
 //!
@@ -28,19 +31,46 @@
 //! a test failure rather than a rolling picture on a machine with no serial
 //! port.
 //!
+//! `TRANS_SET_CONTEXT_LATENCY` is the exception on both sides of that rule: it
+//! is not one of the six, it holds a plain line count that is **not**
+//! decremented, and it is `0` for every mode in those tables -- see
+//! [`set_context_latency`].
+//!
 //! # Where each value goes, and what is not here
 //!
-//! The formulas are §6.1 of `docs/design/intel-display-registers.md`:
+//! The formulas are §6.1 of `docs/design/intel-display-registers.md`, with the
+//! ADL+ substitution `[I915]` makes:
 //!
 //! ```text
+//!     TRANS_SET_CONTEXT_LATENCY(T) = vblank_start - vdisplay   /* ADL+ only */
 //!     HTOTAL(T)  = ((htotal  - 1) << 16) | (hdisplay - 1)
 //!     HBLANK(T)  = ((htotal  - 1) << 16) | (hdisplay - 1)
 //!     HSYNC(T)   = ((hsync_end - 1) << 16) | (hsync_start - 1)
 //!     VTOTAL(T)  = ((vtotal  - 1) << 16) | (vdisplay - 1)
-//!     VBLANK(T)  = ((vtotal  - 1) << 16) | (vdisplay - 1)
+//!     VBLANK(T)  = ((vtotal  - 1) << 16) | 0                   /* ADL+ only */
 //!     VSYNC(T)   = ((vsync_end - 1) << 16) | (vsync_start - 1)
 //!     PIPESRC(T) = ((hdisplay - 1) << 16) | (vdisplay - 1)
 //! ```
+//!
+//! The `VBLANK` line is the other half of the same substitution and is the
+//! reason the two are in one table: `VBLANK_START` no longer works on ADL+, so
+//! writing `vdisplay − 1` into it programs a field the hardware ignores, and
+//! the value that used to go there goes into `TRANS_SET_CONTEXT_LATENCY`
+//! instead, *undecorated*.  `[I915]` (`display/intel_display.c:2717-2735`):
+//!
+//! ```text
+//!     if (DISPLAY_VER(dev_priv) >= 13) {
+//!             intel_de_write(dev_priv, TRANS_SET_CONTEXT_LATENCY(...),
+//!                            crtc_vblank_start - crtc_vdisplay);
+//!             /* VBLANK_START not used by hw, just clear it ... */
+//!             crtc_vblank_start = 1;
+//!     }
+//! ```
+//!
+//! after which `TRANS_VBLANK` is written as
+//! `VBLANK_START(crtc_vblank_start - 1) | VBLANK_END(crtc_vblank_end - 1)`,
+//! whose low half is therefore `0`.  The reference document has neither the
+//! register nor the branch -- see `docs/design/intel-pipe.md` §4.
 //!
 //! Three things are deliberately absent.
 //!
@@ -80,6 +110,8 @@ use crate::drm::modes::Mode;
 /// half is zero" is not.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TimingRegister {
+    /// The ADL+ context latency, which replaces `VBLANK`'s start field.
+    SetContextLatency,
     /// Total and active pixels.
     Htotal,
     /// Blanking end and start, horizontally.
@@ -99,6 +131,7 @@ pub(crate) enum TimingRegister {
 impl TimingRegister {
     const fn name(self) -> &'static str {
         match self {
+            Self::SetContextLatency => "SET_CONTEXT_LATENCY",
             Self::Htotal => "HTOTAL",
             Self::Hblank => "HBLANK",
             Self::Hsync => "HSYNC",
@@ -109,6 +142,13 @@ impl TimingRegister {
         }
     }
 }
+
+/// How many register values [`TimingRegisters::in_write_order`] returns.
+///
+/// The six timing registers, `PIPESRC`, and `TRANS_SET_CONTEXT_LATENCY`.  It is
+/// named here rather than counted in `pipe.rs` so that the capacity of that
+/// module's write list and this table cannot drift apart.
+pub(crate) const TIMING_REGISTERS: usize = 8;
 
 /// Which half of a register a value goes in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,6 +250,7 @@ impl fmt::Display for TimingError {
 /// [`Self::unpack`] is how a caller gets the counts back.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TimingRegisters {
+    set_context_latency: u32,
     htotal: u32,
     hblank: u32,
     hsync: u32,
@@ -220,6 +261,11 @@ pub(crate) struct TimingRegisters {
 }
 
 impl TimingRegisters {
+    /// `TRANS_SET_CONTEXT_LATENCY`: `vblank_start − vdisplay`, undecorated.
+    pub(crate) const fn set_context_latency(self) -> u32 {
+        self.set_context_latency
+    }
+
     /// `HTOTAL`: `[31:16]` total pixels, `[15:0]` active pixels.
     pub(crate) const fn htotal(self) -> u32 {
         self.htotal
@@ -255,14 +301,20 @@ impl TimingRegisters {
         self.pipesrc
     }
 
-    /// The six timing registers and `PIPESRC`, in the order §5.3 lists them,
+    /// Every value this table produces, in the order §5.3 lists the registers,
     /// each with its name.
     ///
     /// The order is the one a register dump is written in, so this is what a
     /// bring-up logs before writing anything -- §11 phase 3.3's "log them
     /// before writing" applies to the PLL and to these alike.
-    pub(crate) const fn in_write_order(self) -> [(TimingRegister, u32); 7] {
+    /// `TRANS_SET_CONTEXT_LATENCY` comes first because that is where `[I915]`
+    /// writes it in `intel_set_transcoder_timings`, before the register whose
+    /// field it replaces (`display/intel_display.c:2717-2735`); the order
+    /// matters to a reader rather than to the hardware, because none of these
+    /// registers is double buffered behind a commit.
+    pub(crate) const fn in_write_order(self) -> [(TimingRegister, u32); TIMING_REGISTERS] {
         [
+            (TimingRegister::SetContextLatency, self.set_context_latency),
             (TimingRegister::Htotal, self.htotal),
             (TimingRegister::Hblank, self.hblank),
             (TimingRegister::Hsync, self.hsync),
@@ -284,6 +336,13 @@ impl TimingRegisters {
 pub(crate) const fn unpack(register: u32) -> (u32, u32) {
     (((register >> 16) & 0xffff) + 1, (register & 0xffff) + 1)
 }
+
+/// `TRANS_VBLANK`'s low half, `VBLANK_START[15:0]`.
+///
+/// The field display version 13 stopped reading; `[I915]` clears it and moves
+/// the blanking start into `TRANS_SET_CONTEXT_LATENCY`
+/// (`display/intel_display.c:2729-2734`).  See [`set_context_latency`].
+pub(crate) const VBLANK_START_MASK: u32 = 0xffff;
 
 /// Pack two counts into one register, each stored as `count − 1`.
 ///
@@ -314,17 +373,19 @@ const fn pack_minus_one(
 
 /// A mode as the transcoder timing registers it needs.
 ///
-/// The formulas are §6.1; see the module documentation for what is deliberately
-/// not here.
+/// The formulas are §6.1, plus the ADL+ substitution `[I915]` makes for
+/// `VBLANK_START`; see the module documentation for what is deliberately not
+/// here.
 ///
-/// Note that `HTOTAL` and `HBLANK` hold the same value, and `VTOTAL` and
-/// `VBLANK` hold the same value, and that this is not a shortcut.  §5.3 names
-/// `HBLANK`'s halves "end" and "start" of the *blanking* interval, and §6.1
-/// writes the packing as the line total and the active width -- which are the
-/// blank interval's end and start precisely because blanking runs from the end
-/// of the active region to the end of the line.  A mode whose blanking started
-/// somewhere other than the end of active would need a different value, and the
-/// tables carry no such mode.
+/// Note that `HTOTAL` and `HBLANK` hold the same value, and that this is not a
+/// shortcut.  §5.3 names `HBLANK`'s halves "end" and "start" of the *blanking*
+/// interval, and §6.1 writes the packing as the line total and the active width
+/// -- which are the blank interval's end and start precisely because blanking
+/// runs from the end of the active region to the end of the line.  A mode whose
+/// blanking started somewhere other than the end of active would need a
+/// different value, and the tables carry no such mode.  `VTOTAL` and `VBLANK`
+/// agreed the same way before display version 13; `VBLANK`'s **low** half no
+/// longer does, for the reason [`set_context_latency`] gives.
 pub(crate) fn timing_registers(mode: &Mode) -> Result<TimingRegisters, TimingError> {
     if mode.is_interlaced() {
         return Err(TimingError::InterlaceNotSourced);
@@ -334,19 +395,61 @@ pub(crate) fn timing_registers(mode: &Mode) -> Result<TimingRegisters, TimingErr
     }
 
     Ok(TimingRegisters {
+        set_context_latency: set_context_latency(mode),
         htotal: pack_minus_one(mode.htotal, mode.hdisplay, TimingRegister::Htotal)?,
         // Blanking runs to the end of the line, so the blank interval is
         // [hdisplay, htotal) and HBLANK packs the same two counts HTOTAL does.
         hblank: pack_minus_one(mode.htotal, mode.hdisplay, TimingRegister::Hblank)?,
         hsync: pack_minus_one(mode.hsync_end, mode.hsync_start, TimingRegister::Hsync)?,
         vtotal: pack_minus_one(mode.vtotal, mode.vdisplay, TimingRegister::Vtotal)?,
-        vblank: pack_minus_one(mode.vtotal, mode.vdisplay, TimingRegister::Vblank)?,
+        // `VBLANK_START` is not read on display version 13, so the low half is
+        // cleared -- `[I915]`'s `crtc_vblank_start = 1` after the branch above
+        // -- and the blanking start lives in `TRANS_SET_CONTEXT_LATENCY`
+        // instead.  The high half, the blanking *end*, is still `vtotal` and is
+        // still stored minus one.  Zero is written here as a field value and
+        // not as a count, which is why it is not `pack_minus_one`'s business.
+        vblank: pack_minus_one(mode.vtotal, mode.vdisplay, TimingRegister::Vblank)?
+            & !VBLANK_START_MASK,
         vsync: pack_minus_one(mode.vsync_end, mode.vsync_start, TimingRegister::Vsync)?,
         // PIPESRC is width in the high half and height in the low half, which
         // is the opposite pairing from the other registers but the same
         // `value - 1` rule (§6.1, and §5.2's `WIDTH[31:16]`, `HEIGHT[15:0]`).
         pipesrc: pack_minus_one(mode.hdisplay, mode.vdisplay, TimingRegister::Pipesrc)?,
     })
+}
+
+/// `TRANS_SET_CONTEXT_LATENCY`'s value: `vblank_start − vdisplay`, undecorated.
+///
+/// `[I915]` computes exactly this difference for display version 13 and later
+/// and writes it in place of `TRANS_VBLANK`'s `VBLANK_START` field, which the
+/// hardware stopped reading (`display/intel_display.c:2717-2735`, the write at
+/// `:2725-2727`).  The quantity has a second, independent use in the same tree
+/// -- ALPM's guard band is `crtc_vtotal - crtc_vdisplay - context_latency`
+/// (`display/intel_alpm.c:296-298`) -- which is a second witness that it is
+/// the blanking start less the active height rather than a count minus one.
+///
+/// **It is zero for every mode in this kernel's tables**, and that is a
+/// statement about [`Mode`], not about the register: vertical blanking in this
+/// kernel runs from the end of the active region to the end of the frame --
+/// [`Mode::vblank`] is `vtotal - vdisplay`, and the type carries no separate
+/// blanking-start field (`drm/modes/mode.rs:103-115`, `:226-228`) -- so the
+/// blanking start is the active height and the difference is zero.  A mode
+/// whose blanking started earlier would need this function changed *and*
+/// `VBLANK`'s high half is unaffected, because only the start moved.
+///
+/// It is still a value this module **writes** rather than leaves alone: the
+/// register's reset value is not a value this bring-up has any source for.
+///
+/// Not verified against the source that fills `crtc_vblank_start` in: that is
+/// DRM's `drm_mode_set_crtcinfo`, which is not in the cached tree, so "the
+/// difference is zero" is argued from this kernel's own mode type.  Recorded
+/// as such in `docs/design/intel-pipe.md`.
+const fn set_context_latency(mode: &Mode) -> u32 {
+    // The blanking start, in i915's terms, is the active height: see above.
+    // The subtraction is written out rather than folded to `0` so that the two
+    // counts it is made of stay visible.
+    let vblank_start = mode.vdisplay;
+    (vblank_start - mode.vdisplay) as u32
 }
 
 #[cfg(test)]
@@ -403,7 +506,16 @@ mod tests {
         assert_eq!(timings.hblank(), timings.htotal());
         assert_eq!(timings.hsync(), 0x0803_07d7, "(2052-1) << 16 | (2008-1)");
         assert_eq!(timings.vtotal(), 0x0464_0437, "(1125-1) << 16 | (1080-1)");
-        assert_eq!(timings.vblank(), timings.vtotal());
+        assert_eq!(
+            timings.vblank(),
+            0x0464_0000,
+            "(1125-1) << 16 | 0: VBLANK_START is not read on display version 13"
+        );
+        assert_eq!(
+            timings.set_context_latency(),
+            0,
+            "vblank_start - vdisplay, the substitution ADL+ makes for VBLANK_START"
+        );
         assert_eq!(timings.vsync(), 0x0440_043b, "(1089-1) << 16 | (1084-1)");
         assert_eq!(timings.pipesrc(), 0x077f_0437, "(1920-1) << 16 | (1080-1)");
     }
@@ -529,11 +641,19 @@ mod tests {
                 (u32::from(mode.vtotal), u32::from(mode.vdisplay)),
                 "{mode}"
             );
+            // `VBLANK` is no longer `VTOTAL`'s twin: the blanking *end* still
+            // round-trips, and the *start* field is cleared because display
+            // version 13 does not read it.
             assert_eq!(
                 unpack(timings.vblank()),
-                (u32::from(mode.vtotal), u32::from(mode.vdisplay)),
-                "{mode}"
+                (u32::from(mode.vtotal), 1),
+                "{mode}: VBLANK's low half is the cleared VBLANK_START field"
             );
+            assert_eq!(timings.vblank() & VBLANK_START_MASK, 0, "{mode}");
+            assert_eq!(timings.vblank() >> 16, timings.vtotal() >> 16, "{mode}");
+            // The blanking start lives in the context latency now, and it is
+            // `vblank_start - vdisplay`, zero for every mode in the tables.
+            assert_eq!(timings.set_context_latency(), 0, "{mode}");
             assert_eq!(
                 unpack(timings.vsync()),
                 (u32::from(mode.vsync_end), u32::from(mode.vsync_start)),
@@ -569,13 +689,18 @@ mod tests {
             (timings.hblank(), mode.htotal, mode.hdisplay),
             (timings.hsync(), mode.hsync_end, mode.hsync_start),
             (timings.vtotal(), mode.vtotal, mode.vdisplay),
-            (timings.vblank(), mode.vtotal, mode.vdisplay),
             (timings.vsync(), mode.vsync_end, mode.vsync_start),
             (timings.pipesrc(), mode.hdisplay, mode.vdisplay),
         ] {
             assert_eq!(register >> 16, u32::from(high) - 1);
             assert_eq!(register & 0xffff, u32::from(low) - 1);
         }
+        // `VBLANK`'s two halves are the blanking end (minus one, like every
+        // other high half) and a *cleared* start field, and the start it used
+        // to hold is `TRANS_SET_CONTEXT_LATENCY`'s now.
+        assert_eq!(timings.vblank() >> 16, u32::from(mode.vtotal) - 1);
+        assert_eq!(timings.vblank() & VBLANK_START_MASK, 0);
+        assert_eq!(timings.set_context_latency(), 0);
     }
 
     // -- the `value - 1` check itself ----------------------------------------
@@ -595,15 +720,57 @@ mod tests {
             ("HBLANK", timings.hblank(), 800, 640),
             ("HSYNC", timings.hsync(), 752, 656),
             ("VTOTAL", timings.vtotal(), 525, 480),
-            ("VBLANK", timings.vblank(), 525, 480),
+            ("VBLANK", timings.vblank(), 525, 0),
             ("VSYNC", timings.vsync(), 492, 490),
             ("PIPESRC", timings.pipesrc(), 640, 480),
         ] {
             assert_eq!(register >> 16, high - 1, "{name} high half");
+            if name == "VBLANK" {
+                // The one low half that is a cleared field rather than a count
+                // minus one: display version 13 does not read VBLANK_START.
+                assert_eq!(register & VBLANK_START_MASK, 0, "{name} low half");
+                assert_eq!(unpack(register), (high, 1), "{name} decode");
+                continue;
+            }
             assert_eq!(register & 0xffff, low - 1, "{name} low half");
             // And the decode returns the count, not the field value.
             assert_eq!(unpack(register), (high, low), "{name} round trip");
         }
+    }
+
+    /// Display version 13 stops reading `TRANS_VBLANK`'s `VBLANK_START` field,
+    /// and the count that used to go there moves to
+    /// `TRANS_SET_CONTEXT_LATENCY` undecorated.
+    ///
+    /// `[I915]`'s ADL+ branch (`display/intel_display.c:2717-2735`) writes
+    /// `crtc_vblank_start - crtc_vdisplay` to the new register and then sets
+    /// `crtc_vblank_start = 1`, so the `TRANS_VBLANK` it writes is
+    /// `((vtotal - 1) << 16) | 0`.  The reference document carries neither the
+    /// register nor the branch -- its §6.1 formula still says the low half is
+    /// `vdisplay - 1` -- so a bring-up built from the document alone programs a
+    /// field the hardware ignores and leaves a register it does read at reset.
+    #[test]
+    fn the_vblank_start_field_is_cleared_and_the_context_latency_replaces_it() {
+        // VIC 4: 1280x720@60, vtotal 750.
+        let timings = timing_registers(&vic(4)).unwrap();
+        assert_eq!(timings.vtotal(), 0x02ed_02cf, "(750-1) << 16 | (720-1)");
+        assert_eq!(
+            timings.vblank(),
+            0x02ed_0000,
+            "(750-1) << 16 | 0: the blanking end survives, the start field does not"
+        );
+        assert_eq!(timings.set_context_latency(), 0);
+
+        // The zero is not a count that was decremented: the register holds the
+        // substitution itself.  In this kernel the vertical blanking interval
+        // starts at the active height -- `Mode::vblank()` is `vtotal - vdisplay`
+        // and there is no other blanking-start field to read -- so
+        // `vblank_start - vdisplay` is zero for every mode in the tables.
+        let mode = dmt(0x04);
+        assert_eq!(mode.vblank(), mode.vtotal - mode.vdisplay);
+        let timings = timing_registers(&mode).unwrap();
+        assert_eq!(timings.set_context_latency(), 0);
+        assert_eq!(timings.vblank(), 0x020c_0000, "(525-1) << 16 | 0");
     }
 
     /// `pack_minus_one` refuses a zero rather than wrapping to `0xffff`.
@@ -688,16 +855,25 @@ mod tests {
     fn the_write_order_names_every_register() {
         let timings = timing_registers(&vic16()).unwrap();
         let order = timings.in_write_order();
-        assert_eq!(order.len(), 7);
+        assert_eq!(order.len(), TIMING_REGISTERS);
+        assert_eq!(order.len(), 8);
         assert_eq!(
             order.map(|(register, _)| register.name()),
             [
-                "HTOTAL", "HBLANK", "HSYNC", "VTOTAL", "VBLANK", "VSYNC", "PIPESRC"
+                "SET_CONTEXT_LATENCY",
+                "HTOTAL",
+                "HBLANK",
+                "HSYNC",
+                "VTOTAL",
+                "VBLANK",
+                "VSYNC",
+                "PIPESRC"
             ]
         );
         // Every value in the list is the value the accessor returns.
-        assert_eq!(order[0].1, timings.htotal());
-        assert_eq!(order[6].1, timings.pipesrc());
+        assert_eq!(order[0].1, timings.set_context_latency());
+        assert_eq!(order[1].1, timings.htotal());
+        assert_eq!(order[7].1, timings.pipesrc());
     }
 
     /// Polarity is not in these registers, and the mode's polarity does not

@@ -3,6 +3,13 @@
 //! Owner: [`super`].  Every offset here cites the reference section it came
 //! from, and the access classification is the sequence's: a register the
 //! bring-up writes is `read_write`, one it only reads back is `read_only`.
+//!
+//! Three registers section 5.4's tables do not place are declared from
+//! `[I915]` instead -- `PLANE_WM_TRANS`, `PLANE_WM_SAGV` and
+//! `PLANE_WM_SAGV_TRANS` -- because the reference either names them without an
+//! offset or reaches their offsets with a formula that is wrong about what
+//! lives there.  The transcription notes at the end of this file record each
+//! one with the file and line it came from.
 
 use super::{Meaning, Register};
 
@@ -170,6 +177,41 @@ pub(crate) const PIPE_MISC_C: Register =
 /// pipe A, at the section 5.2 per-pipe stride of `+0x3000`.
 pub(crate) const PIPE_MISC_D: Register =
     Register::read_write("PIPE_MISC_D", 0x7_3030, Meaning::BringUp, None);
+
+/// `PIPE_ARB_CTL` (pipe A), reference section 5.2.
+///
+/// `USE_PROG_SLOTS[13]` makes the pipe take the plane's arbiter slot count
+/// from `PLANE_CTL`'s `ARB_SLOTS[30:28]` rather than from its own default, and
+/// the two halves are one workaround: `Wa_22012358565:adl-p`.  `[I915]` writes
+/// the pipe half in `intel_enable_transcoder` (`display/intel_display.c:441-445`,
+/// next to `:442`'s `DISPLAY_VER(dev_priv) == 13`) and the plane half in
+/// `skl_plane_ctl` (`display/skl_universal_plane.c:1090-1092`).  Section 5.2
+/// states the offset and the field, which matching `[I915]`'s `0x70028` and
+/// `REG_BIT(13)` (`i915_reg.h:1704-1706`) is what makes it transcribable; §5.6
+/// and §11 never name it, which is why this table's first draft left it out.
+pub(crate) const PIPE_ARB_CTL_A: Register =
+    Register::read_write("PIPE_ARB_CTL_A", 0x7_0028, Meaning::BringUp, None);
+
+/// `PIPE_ARB_CTL` (pipe B), reference section 5.2.
+///
+/// Pipe B's arbiter control, `USE_PROG_SLOTS[13]`; section 5.2 per-pipe stride
+/// `+0x1000`.
+pub(crate) const PIPE_ARB_CTL_B: Register =
+    Register::read_write("PIPE_ARB_CTL_B", 0x7_1028, Meaning::BringUp, None);
+
+/// `PIPE_ARB_CTL` (pipe C), reference section 5.2.
+///
+/// Pipe C's arbiter control, `USE_PROG_SLOTS[13]`; section 5.2 per-pipe stride
+/// `+0x2000`.
+pub(crate) const PIPE_ARB_CTL_C: Register =
+    Register::read_write("PIPE_ARB_CTL_C", 0x7_2028, Meaning::BringUp, None);
+
+/// `PIPE_ARB_CTL` (pipe D), reference section 5.2.
+///
+/// Pipe D's arbiter control, `USE_PROG_SLOTS[13]`; section 5.2 per-pipe stride
+/// `+0x3000`.
+pub(crate) const PIPE_ARB_CTL_D: Register =
+    Register::read_write("PIPE_ARB_CTL_D", 0x7_3028, Meaning::BringUp, None);
 
 /// `PLANE_CTL` (plane 1, pipe A), reference section 5.4.
 ///
@@ -499,22 +541,40 @@ pub(crate) const PLANE_WM_4_A: Register =
 pub(crate) const PLANE_WM_5_A: Register =
     Register::read_write("PLANE_WM_5_A", 0x7_0254, Meaning::BringUp, None);
 
-/// `PLANE_WM` (plane 1, pipe A, latency level 6), reference sections 5.4 and 7.3.
+/// `PLANE_WM_SAGV` (plane 1, pipe A), `[I915]` `skl_universal_plane_regs.h:327-333`.
 ///
-/// Watermark level 6 of the levels the algorithm programs.  Section 7.3's
-/// generous bring-up leaves it with `EN` cleared; it becomes live only when
-/// the real latency calculation of section 7.4 enables it.
-pub(crate) const PLANE_WM_6_A: Register =
-    Register::read_write("PLANE_WM_6_A", 0x7_0258, Meaning::BringUp, None);
+/// The watermark a plane uses while SAGV has the memory at a reduced
+/// frequency.  It is **not** watermark level 6: the six levels section 7.3
+/// describes end at `PLANE_WM_5_A` (`0x70254`), and `0x70258` is
+/// `_PLANE_WM_SAGV_1_A`, a register with the same field layout and a different
+/// meaning.  `[I915]` programs it only when `HAS_HW_SAGV_WM`
+/// (`display/skl_watermark.c:743-748`), which is this platform exactly --
+/// display version 13 and not a discrete GPU
+/// (`display/intel_display_device.h:141`) -- so leaving it at reset is leaving
+/// a watermark the pipe may be reading at reset, which section 7.1 says does
+/// not work.
+pub(crate) const PLANE_WM_SAGV_A: Register =
+    Register::read_write("PLANE_WM_SAGV_A", 0x7_0258, Meaning::BringUp, None);
 
-/// `PLANE_WM` (plane 1, pipe A, latency level 7), reference sections 5.4 and 7.3.
+/// `PLANE_WM_SAGV_TRANS` (plane 1, pipe A), `[I915]` `skl_universal_plane_regs.h:335-341`.
 ///
-/// Watermark level 7 of the levels the algorithm programs, the highest
-/// latency level the document accounts for (section 7.4 step 1 reads levels
-/// 0-3 and 4-7 from PCode).  Section 7.3's generous bring-up leaves it with
-/// `EN` cleared.
-pub(crate) const PLANE_WM_7_A: Register =
-    Register::read_write("PLANE_WM_7_A", 0x7_025c, Meaning::BringUp, None);
+/// The transition half of [`PLANE_WM_SAGV_A`], at the level-7 offset the
+/// reference's `0x70240 + level*4` formula would name; `[I915]` writes it with
+/// the SAGV pair (`display/skl_universal_plane.c:743-748`).
+pub(crate) const PLANE_WM_SAGV_TRANS_A: Register =
+    Register::read_write("PLANE_WM_SAGV_TRANS_A", 0x7_025c, Meaning::BringUp, None);
+
+/// `PLANE_WM_TRANS` (plane 1, pipe A), `[I915]` `skl_universal_plane_regs.h:343-349`.
+///
+/// The transition watermark: the level at which the pipe starts the transition
+/// between watermark levels, which `[I915]` computes from level 0 and writes
+/// immediately after the levels (`display/skl_universal_plane.c:735-749`).
+/// Section 5.6 names it in its `noarm` order next to `PLANE_WM(0..n)` and gives
+/// no offset anywhere; the offset is `[I915]`'s, and the `_B`/`_C`/`_D`
+/// instances below are that offset plus the section 5.4 per-pipe stride, like
+/// every other register in this file.
+pub(crate) const PLANE_WM_TRANS_A: Register =
+    Register::read_write("PLANE_WM_TRANS_A", 0x7_0268, Meaning::BringUp, None);
 
 /// `PLANE_WM` (plane 1, pipe B, latency level 0), reference sections 5.4 and 7.3.
 ///
@@ -558,19 +618,26 @@ pub(crate) const PLANE_WM_4_B: Register =
 pub(crate) const PLANE_WM_5_B: Register =
     Register::read_write("PLANE_WM_5_B", 0x7_1254, Meaning::BringUp, None);
 
-/// `PLANE_WM` (plane 1, pipe B, latency level 6), reference sections 5.4 and 7.3.
+/// `PLANE_WM_SAGV` (plane 1, pipe B), `[I915]` `skl_universal_plane_regs.h:327-333`.
 ///
-/// Pipe B's watermark level 6, left with `EN` cleared by the generous
-/// bring-up of section 7.3 until the real latency calculation uses it.
-pub(crate) const PLANE_WM_6_B: Register =
-    Register::read_write("PLANE_WM_6_B", 0x7_1258, Meaning::BringUp, None);
+/// Pipe B's SAGV watermark, the register at level 6's offset that is not a
+/// watermark level; section 5.4 per-pipe stride `+0x1000`.
+pub(crate) const PLANE_WM_SAGV_B: Register =
+    Register::read_write("PLANE_WM_SAGV_B", 0x7_1258, Meaning::BringUp, None);
 
-/// `PLANE_WM` (plane 1, pipe B, latency level 7), reference sections 5.4 and 7.3.
+/// `PLANE_WM_SAGV_TRANS` (plane 1, pipe B), `[I915]` `skl_universal_plane_regs.h:335-341`.
 ///
-/// Pipe B's last accounted watermark level, left with `EN` cleared by the
-/// generous bring-up of section 7.3.
-pub(crate) const PLANE_WM_7_B: Register =
-    Register::read_write("PLANE_WM_7_B", 0x7_125c, Meaning::BringUp, None);
+/// Pipe B's SAGV transition watermark, at level 7's offset rather than at a
+/// level 7; section 5.4 per-pipe stride `+0x1000`.
+pub(crate) const PLANE_WM_SAGV_TRANS_B: Register =
+    Register::read_write("PLANE_WM_SAGV_TRANS_B", 0x7_125c, Meaning::BringUp, None);
+
+/// `PLANE_WM_TRANS` (plane 1, pipe B), `[I915]` `skl_universal_plane_regs.h:343-349`.
+///
+/// Pipe B's transition watermark, the level `[I915]` writes straight after
+/// pipe B's six watermark levels; section 5.4 per-pipe stride `+0x1000`.
+pub(crate) const PLANE_WM_TRANS_B: Register =
+    Register::read_write("PLANE_WM_TRANS_B", 0x7_1268, Meaning::BringUp, None);
 
 /// `PLANE_WM` (plane 1, pipe C, latency level 0), reference sections 5.4 and 7.3.
 ///
@@ -614,19 +681,26 @@ pub(crate) const PLANE_WM_4_C: Register =
 pub(crate) const PLANE_WM_5_C: Register =
     Register::read_write("PLANE_WM_5_C", 0x7_2254, Meaning::BringUp, None);
 
-/// `PLANE_WM` (plane 1, pipe C, latency level 6), reference sections 5.4 and 7.3.
+/// `PLANE_WM_SAGV` (plane 1, pipe C), `[I915]` `skl_universal_plane_regs.h:327-333`.
 ///
-/// Pipe C's watermark level 6, left with `EN` cleared by the generous
-/// bring-up of section 7.3 until the real latency calculation uses it.
-pub(crate) const PLANE_WM_6_C: Register =
-    Register::read_write("PLANE_WM_6_C", 0x7_2258, Meaning::BringUp, None);
+/// Pipe C's SAGV watermark, the register at level 6's offset that is not a
+/// watermark level; section 5.4 per-pipe stride `+0x2000`.
+pub(crate) const PLANE_WM_SAGV_C: Register =
+    Register::read_write("PLANE_WM_SAGV_C", 0x7_2258, Meaning::BringUp, None);
 
-/// `PLANE_WM` (plane 1, pipe C, latency level 7), reference sections 5.4 and 7.3.
+/// `PLANE_WM_SAGV_TRANS` (plane 1, pipe C), `[I915]` `skl_universal_plane_regs.h:335-341`.
 ///
-/// Pipe C's last accounted watermark level, left with `EN` cleared by the
-/// generous bring-up of section 7.3.
-pub(crate) const PLANE_WM_7_C: Register =
-    Register::read_write("PLANE_WM_7_C", 0x7_225c, Meaning::BringUp, None);
+/// Pipe C's SAGV transition watermark, at level 7's offset rather than at a
+/// level 7; section 5.4 per-pipe stride `+0x2000`.
+pub(crate) const PLANE_WM_SAGV_TRANS_C: Register =
+    Register::read_write("PLANE_WM_SAGV_TRANS_C", 0x7_225c, Meaning::BringUp, None);
+
+/// `PLANE_WM_TRANS` (plane 1, pipe C), `[I915]` `skl_universal_plane_regs.h:343-349`.
+///
+/// Pipe C's transition watermark, the level `[I915]` writes straight after
+/// pipe C's six watermark levels; section 5.4 per-pipe stride `+0x2000`.
+pub(crate) const PLANE_WM_TRANS_C: Register =
+    Register::read_write("PLANE_WM_TRANS_C", 0x7_2268, Meaning::BringUp, None);
 
 /// `PLANE_WM` (plane 1, pipe D, latency level 0), reference sections 5.4 and 7.3.
 ///
@@ -670,19 +744,26 @@ pub(crate) const PLANE_WM_4_D: Register =
 pub(crate) const PLANE_WM_5_D: Register =
     Register::read_write("PLANE_WM_5_D", 0x7_3254, Meaning::BringUp, None);
 
-/// `PLANE_WM` (plane 1, pipe D, latency level 6), reference sections 5.4 and 7.3.
+/// `PLANE_WM_SAGV` (plane 1, pipe D), `[I915]` `skl_universal_plane_regs.h:327-333`.
 ///
-/// Pipe D's watermark level 6, left with `EN` cleared by the generous
-/// bring-up of section 7.3 until the real latency calculation uses it.
-pub(crate) const PLANE_WM_6_D: Register =
-    Register::read_write("PLANE_WM_6_D", 0x7_3258, Meaning::BringUp, None);
+/// Pipe D's SAGV watermark, the register at level 6's offset that is not a
+/// watermark level; section 5.4 per-pipe stride `+0x3000`.
+pub(crate) const PLANE_WM_SAGV_D: Register =
+    Register::read_write("PLANE_WM_SAGV_D", 0x7_3258, Meaning::BringUp, None);
 
-/// `PLANE_WM` (plane 1, pipe D, latency level 7), reference sections 5.4 and 7.3.
+/// `PLANE_WM_SAGV_TRANS` (plane 1, pipe D), `[I915]` `skl_universal_plane_regs.h:335-341`.
 ///
-/// Pipe D's last accounted watermark level, left with `EN` cleared by the
-/// generous bring-up of section 7.3.
-pub(crate) const PLANE_WM_7_D: Register =
-    Register::read_write("PLANE_WM_7_D", 0x7_325c, Meaning::BringUp, None);
+/// Pipe D's SAGV transition watermark, at level 7's offset rather than at a
+/// level 7; section 5.4 per-pipe stride `+0x3000`.
+pub(crate) const PLANE_WM_SAGV_TRANS_D: Register =
+    Register::read_write("PLANE_WM_SAGV_TRANS_D", 0x7_325c, Meaning::BringUp, None);
+
+/// `PLANE_WM_TRANS` (plane 1, pipe D), `[I915]` `skl_universal_plane_regs.h:343-349`.
+///
+/// Pipe D's transition watermark, the level `[I915]` writes straight after
+/// pipe D's six watermark levels; section 5.4 per-pipe stride `+0x3000`.
+pub(crate) const PLANE_WM_TRANS_D: Register =
+    Register::read_write("PLANE_WM_TRANS_D", 0x7_3268, Meaning::BringUp, None);
 
 /*
  * Transcription notes
@@ -694,8 +775,6 @@ pub(crate) const PLANE_WM_7_D: Register =
  *   with an explicit colour key cannot be programmed from this transcription.
  * - `PLANE_AUX_DIST` and `PLANE_AUX_OFFSET`: named in section 5.6's `arm` order ("0 for
  *   single-plane formats") with no offset anywhere in the document.  Not declared.
- * - `PLANE_WM_TRANS`: named once, in section 5.6's `noarm` order next to `PLANE_WM(0..n)`.  It has
- *   no row of its own in section 5.4's table and no offset in any section.  Not declared.
  * - `PLANE_NV12_BUF_CFG`: the document never mentions this register -- the string `NV12` does not
  *   occur in it -- so there is neither a placement nor an offset to copy.  Not declared.
  * - `PIPE_FIFO_UNDERRUN_STATUS`: not a register of its own.  Sections 5.2, 10.4 and 10.8 all place
@@ -716,7 +795,26 @@ pub(crate) const PLANE_WM_7_D: Register =
  *   section 11's preamble assumes "one plane" and phase 4.3 programs that plane.
  * - The offset of the `PLANE_WM` *level* is the one offset this file computes rather than copies
  *   character by character: the document gives it as a formula (`0x70240 + level*4`, sections 5.4
- *   and 7.3), and the constants are the eight literal results of evaluating it for levels 0-7.
+ *   and 7.3), and the constants are the six literal results of evaluating it for levels 0-5.  The
+ *   formula's results for 6 and 7 are *not* levels: they are `PLANE_WM_SAGV` and
+ *   `PLANE_WM_SAGV_TRANS` (`skl_universal_plane_regs.h:327`, `:335`), which is why the level count
+ *   is six and those two offsets have constants of their own.
+ *
+ * Offsets the document does not state and which were therefore taken from `[I915]`:
+ * - `PLANE_WM_TRANS` (`0x70268`): named in section 5.6's `noarm` order next to `PLANE_WM(0..n)`
+ *   with no offset anywhere in the document.  `[I915]` defines
+ *   `_PLANE_WM_TRANS_1_A 0x70268` and writes it immediately after the levels
+ *   (`skl_universal_plane_regs.h:343-349`, `skl_universal_plane.c:735-749`), so the offset is
+ *   sourced, not guessed.
+ * - `PLANE_WM_SAGV` (`0x70258`) and `PLANE_WM_SAGV_TRANS` (`0x7025c`): the document's formula
+ *   reaches them and calls them levels 6 and 7.  `[I915]` names them, programs them only under
+ *   `HAS_HW_SAGV_WM`, and gives the six-level count that says the formula's last two results are
+ *   not levels (`skl_universal_plane_regs.h:327-341`, `skl_watermark.c:3379-3383`,
+ *   `intel_display_device.h:141`).  Declared, and recorded as a reference defect in
+ *   `docs/design/intel-pipe.md`.
+ * - `PIPE_ARB_CTL` (`0x70028`, `USE_PROG_SLOTS[13]`): section 5.2 states the offset and the field,
+ *   so this one is the document's; `[I915]`'s `_PIPE_ARB_CTL_A 0x70028` and
+ *   `PIPE_ARB_USE_PROG_SLOTS REG_BIT(13)` (`i915_reg.h:1704-1706`) agree with it.
  *
  * Places where the document's two mentions of a register disagree:
  * - `TRANSCONF`'s output bit depth: section 8.6's sequence writes
@@ -747,8 +845,12 @@ pub(crate) const PLANE_WM_7_D: Register =
  *   four constants, not add a second set.
  * - `PLANE_WM`'s level count: the document never states how many watermark levels exist.  Section
  *   7.4 step 1 has PCode return latency levels 0-3 and 4-7, and section 7.3 says each watermark
- *   level corresponds to a memory latency level, so levels 0-7 are declared per pipe.  No section
- *   states an offset, a field, or an existence for a level 8 or beyond, and none is invented.
+ *   level corresponds to a memory latency level, but `[I915]` programs six levels on this platform
+ *   -- `skl_setup_wm_latency` sets `num_levels = 6` under `HAS_HW_SAGV_WM`
+ *   (`skl_watermark.c:3379-3383`), which is `DISPLAY_VER >= 13 && !IS_DGFX`
+ *   (`intel_display_device.h:141`), and ADL-N is both.  Six are declared per pipe; the document's
+ *   levels 6 and 7 are the SAGV pair above, and no section states an offset, a field, or an
+ *   existence for a level 8 or beyond.
  * - Checked and *not* disagreements, each mention compared: `PLANE_BUF_CFG` is `0x7027c` for plane
  *   1 of pipe A in both section 5.4's table and section 7.2 (it sits in the tail of plane 1's
  *   `0x100`-byte slot, not at the plane's base -- consistent, not contradictory); `PLANE_WM` is
@@ -758,8 +860,6 @@ pub(crate) const PLANE_WM_7_D: Register =
  *   sections 5.2, 10.4 and 12.3.
  *
  * Registers deliberately left out:
- * - `PIPE_ARB_CTL` (`0x70028`, `USE_PROG_SLOTS[13]`): offset stated in section 5.2, but neither
- *   section 5.6's `noarm`/`arm` orders nor section 11 names it, so the bring-up does not need it.
  * - `PLANE_CUS_CTL` (`0x701c8`): offset stated in section 5.4, but it is the HDR-plane chroma
  *   upsampler and section 5.6 says the disable path that clears it "does not apply to a first
  *   light-up"; section 11 never writes it.

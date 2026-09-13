@@ -142,10 +142,15 @@ fn the_write_order_is_phase_3_4_then_4_1_then_4_2_then_4_3() {
     assert_eq!(
         names,
         [
-            // The pipe's output depth, first so that `PLANE_SURF` is the last
-            // write of the whole sequence; see `PipeProgram::writes`.
+            // The pipe's output depth and its arbiter slots, first so that
+            // `PLANE_SURF` is the last write of the whole sequence; see
+            // `PipeProgram::writes`.
             "PIPE_MISC_A",
-            // Phase 3.4, in `timing.rs`'s own order (section 5.3's table).
+            "PIPE_ARB_CTL_A",
+            // Phase 3.4, in `timing.rs`'s own order: the ADL+ context latency
+            // that replaces `VBLANK`'s start field first, then section 5.3's
+            // six, then `PIPESRC`.
+            "TRANS_SET_CONTEXT_LATENCY(A)",
             "TRANS_HTOTAL(A)",
             "TRANS_HBLANK(A)",
             "TRANS_HSYNC(A)",
@@ -155,15 +160,17 @@ fn the_write_order_is_phase_3_4_then_4_1_then_4_2_then_4_3() {
             "PIPESRC_A",
             // Phase 4.1.
             "PLANE_BUF_CFG_A",
-            // Phase 4.2: every level, including the disabled ones.
+            // Phase 4.2: every level, including the disabled ones, then the
+            // three watermark registers that are not levels.
             "PLANE_WM_0_A",
             "PLANE_WM_1_A",
             "PLANE_WM_2_A",
             "PLANE_WM_3_A",
             "PLANE_WM_4_A",
             "PLANE_WM_5_A",
-            "PLANE_WM_6_A",
-            "PLANE_WM_7_A",
+            "PLANE_WM_TRANS_A",
+            "PLANE_WM_SAGV_A",
+            "PLANE_WM_SAGV_TRANS_A",
             // Phase 4.3, the `noarm` half.
             "PLANE_STRIDE_A",
             "PLANE_POS_A",
@@ -179,6 +186,58 @@ fn the_write_order_is_phase_3_4_then_4_1_then_4_2_then_4_3() {
     assert_eq!(programmed.state.writes.len(), names.len());
 }
 
+/// The watermark offsets the reference's `0x70240 + level*4` formula reaches
+/// past level 5 are written as the registers they are, and never as levels.
+///
+/// This is the regression test for the defect finding 1 names: the first
+/// version of this module looped to eight and wrote a *disabled* level over
+/// `0x70258` and `0x7025c`, which are `PLANE_WM_SAGV` and
+/// `PLANE_WM_SAGV_TRANS`.  A disabled watermark on a pipe that is reading it is
+/// section 7.1's plane that reads nothing -- and it would have looked correct
+/// in the log, because "levels 1..n disabled" is what the loop intended.
+#[test]
+fn the_watermark_offsets_above_level_five_are_not_written_as_levels() {
+    let programmed = Programmed::new();
+    let writes = programmed.writes();
+    let value_of = |register: Register| writes[programmed.index_of(register)].1;
+
+    // Level 5 is the last level, and `[I915]`'s six-level count is why.
+    assert_eq!(PLANE_WM_LEVELS, 6);
+    assert_eq!(Pipe::A.plane_wm(PLANE_WM_LEVELS - 1).offset(), 0x7_0254);
+
+    // The two offsets the formula would have called levels 6 and 7 are the
+    // SAGV pair, and both are written *enabled*, with level 0's value.
+    assert_eq!(Pipe::A.plane_wm_sagv().offset(), 0x7_0258);
+    assert_eq!(Pipe::A.plane_wm_sagv_trans().offset(), 0x7_025c);
+    assert_eq!(value_of(Pipe::A.plane_wm_sagv()), 0x8007_cfff);
+    assert_eq!(value_of(Pipe::A.plane_wm_sagv_trans()), 0x8007_cfff);
+    for register in [Pipe::A.plane_wm_sagv(), Pipe::A.plane_wm_sagv_trans()] {
+        assert_ne!(
+            value_of(register) & PLANE_WM_EN,
+            0,
+            "{} must carry PLANE_WM_EN: this kernel never writes SAGV's control, so the pipe may \
+             be reading this register, and a watermark with EN clear reads nothing (section 7.1)",
+            register.name()
+        );
+        assert_eq!(
+            value_of(register),
+            value_of(Pipe::A.plane_wm(0)),
+            "{} is programmed with level 0's generous value",
+            register.name()
+        );
+    }
+
+    // And the third non-level register, the transition watermark, is written
+    // disabled -- which is the value `[I915]`'s own computation produces for a
+    // level 0 that fills a 4096-block allocation.
+    assert_eq!(Pipe::A.plane_wm_trans().offset(), 0x7_0268);
+    assert_eq!(
+        value_of(Pipe::A.plane_wm_trans()),
+        0,
+        "no transition watermark fits above a 4095-block level 0, so i915 disables it"
+    );
+}
+
 /// The write list is complete before the first write happens, which is the
 /// property that lets a caller log the whole program first.
 #[test]
@@ -186,11 +245,16 @@ fn computing_the_write_list_writes_nothing() {
     let plan = compute(Pipe::A, &vic16(), SURFACE).unwrap();
     let regs = MockRegisters::new();
 
-    let planned = plan.writes(0);
+    let planned = plan.writes(0, 0);
     assert_eq!(
         planned.len(),
-        24,
+        27,
         "one write per register the sequence owns"
+    );
+    assert_eq!(
+        planned.len(),
+        PIPE_PROGRAM_WRITES,
+        "the list and the capacity reserved for it are the same number, not two hand-kept ones"
     );
     assert_eq!(
         planned.last().map(|write| write.register),
@@ -321,6 +385,28 @@ fn an_unreadable_pipe_misc_is_a_named_error() {
     );
 }
 
+/// The second read-modify-write's read gets the same treatment: a named error
+/// and no writes at all, including no `PIPE_MISC` write that was already
+/// planned.
+#[test]
+fn an_unreadable_pipe_arb_ctl_is_a_named_error() {
+    let plan = compute(Pipe::A, &vic16(), SURFACE).unwrap();
+    let regs = MockRegisters::new();
+    regs.hide(Pipe::A.arb_ctl());
+
+    let error = program(&regs, &plan).expect_err("the read fails");
+    assert_eq!(
+        error,
+        PipeError::Unreadable {
+            register: "PIPE_ARB_CTL_A"
+        }
+    );
+    assert!(
+        regs.writes().is_empty(),
+        "the list is built before the first write, so a failed read writes nothing"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The values
 // ---------------------------------------------------------------------------
@@ -328,30 +414,35 @@ fn an_unreadable_pipe_misc_is_a_named_error() {
 /// The timing registers are written with exactly what `timing.rs` produced,
 /// for a published mode.
 ///
-/// The first assertion is the reference's own arithmetic for VIC 16 (§6.1), so
-/// a reader can check it by eye; the second is the property that matters, that
-/// this module adds nothing to those seven values and takes nothing away.
+/// The first assertion is the arithmetic the reference and `[I915]` describe
+/// (§6.1, plus the ADL+ substitution for `VBLANK_START`), so a reader can check
+/// it by eye; the second is the property that matters, that this module adds
+/// nothing to those values and takes nothing away.
 #[test]
 fn the_timing_registers_are_exactly_what_timing_produced() {
     let programmed = Programmed::new();
     let writes = programmed.writes();
 
+    // `PIPE_MISC` and `PIPE_ARB_CTL` are the first two writes; the timing
+    // table's eight values follow.
     assert_eq!(
         [
-            writes[1].1,
             writes[2].1,
             writes[3].1,
             writes[4].1,
             writes[5].1,
             writes[6].1,
             writes[7].1,
+            writes[8].1,
+            writes[9].1,
         ],
         [
+            0,           // TRANS_SET_CONTEXT_LATENCY: vblank_start - vdisplay = 0
             0x0897_077f, // HTOTAL:  (2200-1) << 16 | (1920-1)
             0x0897_077f, // HBLANK:  blanking runs to the end of the line
             0x0803_07d7, // HSYNC:   (2052-1) << 16 | (2008-1)
             0x0464_0437, // VTOTAL:  (1125-1) << 16 | (1080-1)
-            0x0464_0437, // VBLANK
+            0x0464_0000, // VBLANK:  (1125-1) << 16 | 0: VBLANK_START is not read on ADL+
             0x0440_043b, // VSYNC:   (1089-1) << 16 | (1084-1)
             0x077f_0437, // PIPESRC: (1920-1) << 16 | (1080-1)
         ]
@@ -359,7 +450,7 @@ fn the_timing_registers_are_exactly_what_timing_produced() {
 
     for (index, (register, value)) in programmed.plan.timings.in_write_order().iter().enumerate() {
         let expected = Pipe::A.timing(*register);
-        let (name, written) = writes[index + 1];
+        let (name, written) = writes[index + 2];
         assert_eq!(name, expected.name(), "{register:?}");
         assert_eq!(written, *value, "{register:?} was not written verbatim");
     }
@@ -424,6 +515,12 @@ fn the_published_mode_program_matches_the_reference_numbers() {
             "level {level} must be written disabled, not left at reset (section 7.3)"
         );
     }
+    // The SAGV pair carries level 0's value -- a literal here, like the two
+    // above, so that the assertion cannot be satisfied by a constant that
+    // drifted with the code.
+    assert_eq!(value_of(Pipe::A.plane_wm_sagv()), 0x8007_cfff);
+    assert_eq!(value_of(Pipe::A.plane_wm_sagv_trans()), 0x8007_cfff);
+    assert_eq!(value_of(Pipe::A.plane_wm_trans()), 0);
 
     // Phase 4.3.
     assert_eq!(value_of(Pipe::A.plane_stride()), 120, "7680 bytes / 64");
@@ -431,12 +528,26 @@ fn the_published_mode_program_matches_the_reference_numbers() {
     assert_eq!(value_of(Pipe::A.plane_offset()), 0);
     assert_eq!(
         value_of(Pipe::A.plane_color_ctl()),
-        PLANE_COLOR_CTL_ALPHA_DISABLE
+        1 << 13,
+        "PLANE_COLOR_PLANE_GAMMA_DISABLE; zero would enable the plane's gamma with no table"
     );
     assert_eq!(
         value_of(Pipe::A.plane_ctl()),
-        0x8400_0000,
-        "ENABLE[31] | FORMAT_XRGB_8888 (4 << 24) | TILED_LINEAR (0)"
+        0x9400_0000,
+        "ENABLE[31] | FORMAT_XRGB_8888 (4 << 24) | TILED_LINEAR (0) | ARB_SLOTS(1) (1 << 28)"
+    );
+
+    // The pipe's own two registers, both read-modify-writes over a mock that
+    // started at zero.
+    assert_eq!(
+        value_of(Pipe::A.misc()),
+        1 << 8,
+        "8 bpc (0), dithering off (0), pixel rounding truncated (bit 8)"
+    );
+    assert_eq!(
+        value_of(Pipe::A.arb_ctl()),
+        1 << 13,
+        "USE_PROG_SLOTS, the pipe half of Wa_22012358565:adl-p"
     );
     assert_eq!(value_of(Pipe::A.plane_surf()), 0x0100_0000);
 
@@ -451,16 +562,28 @@ fn the_published_mode_program_matches_the_reference_numbers() {
     );
 }
 
-/// Every watermark level is written exactly once, so nothing is left at a reset
-/// value that section 7.3 says cannot work.
+/// Every watermark register is written exactly once, so nothing is left at a
+/// reset value that section 7.3 says cannot work.
 #[test]
-fn every_watermark_level_is_written_once() {
+fn every_watermark_register_is_written_once() {
     let programmed = Programmed::new();
     for level in 0..PLANE_WM_LEVELS {
         assert_eq!(
             programmed.regs.write_count(Pipe::A.plane_wm(level)),
             1,
             "level {level}"
+        );
+    }
+    for register in [
+        Pipe::A.plane_wm_trans(),
+        Pipe::A.plane_wm_sagv(),
+        Pipe::A.plane_wm_sagv_trans(),
+    ] {
+        assert_eq!(
+            programmed.regs.write_count(register),
+            1,
+            "{}",
+            register.name()
         );
     }
     // And `PLANE_SURF` is written exactly once: the commit is not repeated.
@@ -500,10 +623,12 @@ fn the_stride_is_written_in_sixty_four_byte_units() {
 /// `PIPE_MISC` is a read-modify-write of the bits this bring-up owns, so a
 /// firmware value the reference does not mention survives.
 ///
-/// Two of those bits are real: `HDR_MODE_PRECISION[23]` (§5.2) and
-/// `PIXEL_ROUNDING_TRUNC[8]`, which `[I915]`'s `bdw_set_pipe_misc` sets for
-/// display version 12 and later (`display/intel_display.c:3289-3290`) and the
-/// reference never mentions.  Writing the whole register would clear both.
+/// `HDR_MODE_PRECISION[23]` is the real example: the reference lists it (§5.2)
+/// and never says whether this bring-up should set it, so it is left as found.
+/// `PIXEL_ROUNDING_TRUNC[8]` used to be in that category and no longer is --
+/// `[I915]` sets it for display version 12 and later
+/// (`display/intel_display.c:3289-3290`), so it is one of the owned bits, and
+/// this test asserts that it is *set* rather than preserved.
 #[test]
 fn pipe_misc_keeps_the_bits_this_bring_up_does_not_own() {
     let plan = compute(Pipe::A, &vic16(), SURFACE).unwrap();
@@ -518,12 +643,17 @@ fn pipe_misc_keeps_the_bits_this_bring_up_does_not_own() {
 
     assert_eq!(
         after & !PIPE_MISC_OWNED_MASK,
-        (1 << 27) | (1 << 23) | (1 << 8),
+        (1 << 27) | (1 << 23),
         "the bits this bring-up does not own must survive"
     );
     assert_eq!(after & PIPE_MISC_BPC_MASK, PIPE_MISC_BPC_8, "8 bpc");
     assert_eq!(after & PIPE_MISC_DITHER_ENABLE, 0, "dithering off");
     assert_eq!(after & PIPE_MISC_DITHER_TYPE_MASK, 0);
+    assert_eq!(
+        after & PIPE_MISC_PIXEL_ROUNDING_TRUNC,
+        PIPE_MISC_PIXEL_ROUNDING_TRUNC,
+        "bit 8 is owned and set, not preserved: a firmware zero must not clear it"
+    );
     assert_eq!(state.pipe_misc_before, firmware);
     assert_eq!(state.pipe_misc_after, after);
     assert_eq!(
@@ -533,16 +663,49 @@ fn pipe_misc_keeps_the_bits_this_bring_up_does_not_own() {
     );
 }
 
-/// `PIPE_MISC`'s depth is set for the mode's 8-bit components and for nothing
-/// else -- there is no depth conversion to dither.
+/// `PIPE_ARB_CTL` is a read-modify-write of one bit: `[I915]` writes it with a
+/// zero clear mask, and the reference has no source for the register's other
+/// bits.
 #[test]
-fn pipe_misc_is_eight_bpc_with_dithering_off() {
+fn pipe_arb_ctl_sets_the_programmed_slots_bit_and_nothing_else() {
+    let plan = compute(Pipe::A, &vic16(), SURFACE).unwrap();
+    let regs = MockRegisters::new();
+    // Firmware's value, with bits this bring-up has no source for set.
+    let firmware = (1 << 31) | 0x7;
+    regs.set(Pipe::A.arb_ctl(), firmware);
+
+    let state = program(&regs, &plan).unwrap();
+    let after = regs.read(Pipe::A.arb_ctl()).unwrap();
+
+    assert_eq!(
+        after & !PIPE_ARB_USE_PROG_SLOTS,
+        firmware,
+        "every bit but the one this workaround sets must survive"
+    );
+    assert_eq!(after & PIPE_ARB_USE_PROG_SLOTS, 1 << 13);
+    assert_eq!(state.arb_ctl_before, firmware);
+    assert_eq!(state.arb_ctl_after, after);
+    assert_eq!(
+        regs.writes()[1].0,
+        "PIPE_ARB_CTL_A",
+        "it is written immediately after PIPE_MISC, and before the plane that reads ARB_SLOTS"
+    );
+}
+
+/// `PIPE_MISC`'s depth is set for the mode's 8-bit components and for nothing
+/// else -- there is no depth conversion to dither -- and its rounding is
+/// truncated, which is what `[I915]` programs on this display version.
+#[test]
+fn pipe_misc_is_eight_bpc_with_dithering_off_and_rounding_truncated() {
     let programmed = Programmed::new();
-    assert_eq!(programmed.plan.pipe_misc, PIPE_MISC_BPC_8);
+    assert_eq!(
+        programmed.plan.pipe_misc,
+        PIPE_MISC_BPC_8 | PIPE_MISC_PIXEL_ROUNDING_TRUNC
+    );
     assert_eq!(
         programmed.regs.read(Pipe::A.misc()),
-        Some(PIPE_MISC_BPC_8),
-        "a mock that started at zero keeps only the program's value"
+        Some(1 << 8),
+        "a mock that started at zero keeps only the program's value: bit 8, and no others"
     );
 }
 
@@ -561,6 +724,11 @@ fn each_pipe_has_its_own_registers() {
     for pipe in Pipe::ALL {
         let offset = pipe.index() * 0x1000;
         assert_eq!(pipe.misc().offset(), 0x7_0030 + offset, "PIPE_MISC({pipe})");
+        assert_eq!(
+            pipe.arb_ctl().offset(),
+            0x7_0028 + offset,
+            "PIPE_ARB_CTL({pipe}), section 5.2"
+        );
         assert_eq!(
             pipe.pipedsl().offset(),
             0x7_0000 + offset,
@@ -595,8 +763,19 @@ fn each_pipe_has_its_own_registers() {
                 "PLANE_WM({pipe},1,{level})"
             );
         }
+        // The three watermark registers that are not levels, at the offsets
+        // the reference's level formula would have named 6 and 7 and at
+        // `[I915]`'s `PLANE_WM_TRANS` offset.
+        assert_eq!(pipe.plane_wm_sagv().offset(), 0x7_0258 + offset);
+        assert_eq!(pipe.plane_wm_sagv_trans().offset(), 0x7_025c + offset);
+        assert_eq!(pipe.plane_wm_trans().offset(), 0x7_0268 + offset);
         // The transcoder timing registers live in the other block, at
         // section 5.3's base.
+        assert_eq!(
+            pipe.timing(TimingRegister::SetContextLatency).offset(),
+            0x6_007c + offset,
+            "TRANS_SET_CONTEXT_LATENCY({pipe}), [I915] i915_reg.h:4027"
+        );
         assert_eq!(
             pipe.timing(TimingRegister::Htotal).offset(),
             0x6_0000 + offset
@@ -1102,15 +1281,19 @@ fn the_phase_six_report_renders_every_check() {
 fn the_whole_program_can_be_logged_before_the_first_write() {
     let plan = compute(Pipe::A, &vic16(), SURFACE).unwrap();
     let regs = MockRegisters::new();
-    let text = plan.render(0);
+    let text = plan.render(0, 0);
 
     for expected in [
         "pipe A",
         "reference section 11 phases 3.4 and 4",
         "PLANE_BUF_CFG = 0x0fff0000",
         "watermark level 0: 0x8007cfff",
-        "levels 1..7 disabled",
+        "levels 1..5 disabled",
+        "SAGV 0x8007cfff",
+        "TRANS 0x00000000",
+        "PIPE_ARB_CTL 0x00000000 -> 0x00002000",
         "PLANE_SURF_A <- 0x01000000",
+        "TRANS_SET_CONTEXT_LATENCY(A) <- 0x00000000",
         "TRANS_HTOTAL(A) <- 0x0897077f",
         "PLANE_MISC", // deliberately absent; asserted below
     ] {
@@ -1125,11 +1308,12 @@ fn the_whole_program_can_be_logged_before_the_first_write() {
         "rendering a program must not write it"
     );
 
-    // The state's own rendering has one line per write plus the two headers.
+    // The state's own rendering has one line per write plus the header and the
+    // two read-modify-write lines.
     let state = program(&regs, &plan).unwrap();
     let rendered = state.render();
-    assert_eq!(rendered.lines().count(), state.writes.len() + 2);
-    assert!(rendered.contains("24 writes"));
+    assert_eq!(rendered.lines().count(), state.writes.len() + 3);
+    assert!(rendered.contains("27 writes"));
 }
 
 /// The mock register file is only useful if it is the thing being driven, so
