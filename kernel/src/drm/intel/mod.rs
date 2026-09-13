@@ -56,6 +56,7 @@ mod pci;
 mod pll;
 mod probe;
 mod regs;
+mod timing;
 
 #[cfg(test)]
 mod testbus;
