@@ -95,16 +95,27 @@ against 590 KiB free in the ISO's 1.4 MiB EFI partition.
 
 Measured on this host, before and after that partition-slot change: booting the
 image with QEMU's own kernel loader (`-kernel`/`-initrd`, which hands the
-kernel straight to the machine) always finds the payload — the initramfs log
-shows `Loading user settings from /media/sda1/alpine.apkovl.tar.gz` and the
-guest powers itself off — while the UEFI path (OVMF, then the ISO's GRUB) has
-repeatedly missed it, leaving the guest at a login prompt. The difference is
-boot speed: the kernel's console output slows early boot enough for the scan to
-see every partition, and `quiet` on the ISO's command line removes exactly that
-delay. So on the real machine, expect the fast case. A capture that ends at
-`localhost login:` is this failure, not broken hardware: power-cycle and retry,
-and if it fails repeatedly the boot configuration change above is the fix worth
-making rather than more retries.
+kernel straight to the machine) finds the payload every time — the initramfs
+log shows `Loading user settings from /media/sda1/alpine.apkovl.tar.gz`, the
+payload runs and the guest powers itself off. The UEFI path (OVMF, then the
+ISO's GRUB, the same kernel and initramfs) missed it **three times out of
+three**, run one at a time with nothing else on the host, leaving the guest at
+a login prompt. The difference is boot speed: the kernel's console output slows
+early boot enough for the initramfs scan to see every partition, and `quiet` on
+the ISO's command line removes exactly that delay.
+
+**So this image is not yet reliable on the target.** The N305 will boot the way
+the UEFI path does, `quiet` included, which is the fast case that loses. The
+fix is not more retries: it is a boot configuration that names the apkovl on
+the kernel command line (`apkovl=LABEL=HWDUMP:alpine.apkovl.tar.gz`), which
+takes the initramfs scan out of the picture entirely. That needs a GRUB image
+of our own, because the ISO's is embedded in its `BOOTX64.EFI` and the ISO's
+1.4 MiB EFI partition has 590 KiB free against several megabytes for a
+host-built GRUB. The shape of it: append a 16 MiB ESP of our own carrying
+`EFI/BOOT/BOOTX64.EFI` built by `grub2-mkstandalone` with that command line,
+and point the MBR's `0xEF` entry and the GPT's ESP entry at it. Until that
+exists, the capture is a retry-until-it-takes operation, and the retry is
+cheap: power-cycle, and read the screen.
 
 Attach the display or the capture dongle *before* powering on: the EDID in the
 bundle is the EDID of whatever sink is connected, which is the same thing the
