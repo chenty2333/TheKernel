@@ -1089,12 +1089,28 @@ is all you need.** Ignore the DKL/Type-C PLLs entirely.
 |---|---|---|
 | `DPLL0_CFGCR0` | `0x164284` | DCO integer + fraction |
 | `DPLL0_CFGCR1` | `0x164288` | pdiv/kdiv/qdiv/central freq |
+| `DPLL1_CFGCR0` | `0x16428C` | the same fields as `DPLL0_CFGCR0`; this is combo PHY B's pair |
+| `DPLL1_CFGCR1` | `0x164290` | the same fields as `DPLL0_CFGCR1` |
 | `DPLL0_DIV0` | `0x164B00` | AFC startup (only if VBT overrides it) |
+| `DPLL1_DIV0` | `0x164C00` | the same, for DPLL1 |
 | `DPLL0_ENABLE` (**= `LCPLL1_CTL`**) | `0x46010` | `PLL_ENABLE[31]`, `LOCK[30]`, `POWER_ENABLE[27]`, `POWER_STATE[26]` |
 | `DPLL1_ENABLE` (**= `LCPLL2_CTL`**) | `0x46014` | same bits |
 | `ICL_DPCLKA_CFGCR0` | `0x164280` | DDI → PLL select + per-DDI clock-off |
 
 `[I915]` `i915_reg.h:4301-4322`, `4213-4221`, `4158`.
+
+> **The `DPLL1_CFGCR*` rows, and how this table came to be missing them.** Earlier revisions stated
+> the config offsets for DPLL0 only, as "`DPLLn_CFGCR0` (`0x164284` for DPLL0)" and "`DPLLn_CFGCR1`
+> (`0x164288` for DPLL0)", which read on its own leaves combo PHY B's PLL with no address: a driver
+> built from this table refuses DDI B rather than lighting the screen. The citation printed for the
+> whole block, `i915_reg.h:4301-4322`, is precisely the region that defines both pairs --
+> `_TGL_DPLL0_CFGCR0/1 = 0x164284/0x164288` at `:4301`/`:4316` and
+> `_TGL_DPLL1_CFGCR0/1 = 0x16428C/0x164290` at `:4302`/`:4317`, selected by PLL id through
+> `TGL_DPLL_CFGCR0/1(pll)` (`:4304-4306`, `:4319-4321`), which is what `icl_dpll_write` uses for
+> `DISPLAY_VER >= 12` (`[I915]` `display/intel_dpll_mgr.c:3767-3769`). The two pairs interleave, so
+> DPLL1 is **not** DPLL0 + 4. `DPLL1_DIV0` is listed for symmetry and is written only when the VBT
+> overrides the AFC startup value, the same rule as DPLL0's
+> (`[I915]` `intel_dpll_mgr.c:3784-3789`); nothing in this kernel writes either.
 
 > **Two names, one register.** `_DPLL0_ENABLE = 0x46010` and `LCPLL1_CTL = 0x46010` are the same
 > address; likewise `0x46014`. `[I915]` `i915_reg.h:4093-4095` and `4213-4214`. The `LCPLL_PLL_ENABLE`
@@ -1138,10 +1154,10 @@ block, used for `DISPLAY_VER >= 12`) **agree exactly**:
 
 | Register | Field | Bits | Notes |
 |---|---|---|---|
-| `DPLLn_CFGCR0` (`0x164284` for DPLL0) | `DCO_FRACTION` | `[24:10]` | reset default `0x4000` |
+| `DPLLn_CFGCR0` (`0x164284` for DPLL0, `0x16428C` for DPLL1) | `DCO_FRACTION` | `[24:10]` | reset default `0x4000` |
 | | `DCO_INTEGER` | `[9:0]` | reset default `0x151` |
 | | `LINK_RATE` override | mask `[28:25]`, defined values in `[27:25]` | HDMI link-rate override; leave 0 |
-| `DPLLn_CFGCR1` (`0x164288` for DPLL0) | `QDIV_RATIO` | `[17:10]` | |
+| `DPLLn_CFGCR1` (`0x164288` for DPLL0, `0x164290` for DPLL1) | `QDIV_RATIO` | `[17:10]` | |
 | | `QDIV_MODE` | `[9]` | 0 if `qdiv_ratio == 1`, else 1 |
 | | `KDIV` | `[8:6]` | `K=1→1`, `K=2→2`, `K=3→4` |
 | | `PDIV` | `[5:2]` | `P=2→1`, `P=3→2`, `P=5→4`, `P=7→8` |
