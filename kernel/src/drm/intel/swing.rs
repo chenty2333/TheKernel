@@ -31,21 +31,29 @@
 //! | `PORT_COMP_DW0` | `COMP_INIT[31]` | §8.3 steps 2 and 6: the PHY initialisation has run |
 //! | `DDI_BUF_CTL` | `ENABLE[31]`, `IS_IDLE[7]`, `BUF_TRANS_SELECT[27:24]` | §8.6 steps 13-14: the port is enabled and driving, and the level it selected |
 //! | `PORT_CL_DW10` | `PWR_DOWN_LN_MASK[7:4]` | §8.6 step 7: the lanes were powered before the buffer was enabled |
-//! | `PORT_TX_DW2` (group) | whole dword | §8.5 step 5's swing select |
+//! | `PORT_TX_DW2_LN0..3` | whole dword, **per lane** | §8.5 step 5's swing select |
 //! | `PORT_TX_DW4_LN0..3` | whole dword, **per lane** | §8.5 step 5's cursor coefficient and step 2's per-lane loadgen select |
-//! | `PORT_TX_DW5` (group) | `TX_TRAINING_EN[31]` | §8.5 step 6: the write that commits the batch has happened |
-//! | `PORT_TX_DW7` (group) | whole dword | §8.5 step 5's N scalar |
+//! | `PORT_TX_DW5_LN0` | `TX_TRAINING_EN[31]`, and the word itself | §8.5 step 6: the write that commits the batch has happened |
+//! | `PORT_TX_DW7_LN0..3` | whole dword, **per lane** | §8.5 step 5's N scalar |
 //!
-//! `PORT_TX_DW4` is read one lane at a time and the group instance is never
-//! touched, because §8.5 step 2 says so in as many words ("NOT group access --
-//! each lane differs") and i915's own comment on the same write is *"We cannot
-//! write to GRP. It would overwrite individual loadgen"* (`[I915]`
-//! `display/intel_ddi.c:1160`).  A read of the group instance would collapse
-//! four values into one and the replay would drive every lane from one lane's
-//! coefficients.  `DW2`, `DW5` and `DW7` are read from the **group** instance,
-//! which is the instance §8.5's sequence writes and the only one this
-//! repository's register table declares (`regs/port.rs`'s transcription notes
-//! record that the per-lane carve-out is stated for `DW4` only).
+//! `PORT_TX_DW2`, `DW4` and `DW7` are read one lane at a time and the group
+//! instance is never touched.  For `DW4` §8.5 step 2 says so in as many words
+//! ("NOT group access -- each lane differs") and i915's own comment on the same
+//! write is *"We cannot write to GRP. It would overwrite individual loadgen"*
+//! (`[I915]` `display/intel_ddi.c:1160`); for `DW2` and `DW7` the sentence that
+//! states the carve-out names `DW4` only, and the evidence is i915's sequence,
+//! which writes both of them per lane in a loop over `ln = 0..3`
+//! (`[I915]` `display/intel_ddi.c:1148-1157`, `:1171-1178`).  A read of a group
+//! instance would collapse four values into one and the replay would drive every
+//! lane from one lane's coefficients.  `DW5` is the one dword read from **lane
+//! 0**: that is the copy i915 reads before writing the group instance
+//! (`ICL_PORT_TX_DW5_LN(0, phy)`, `[I915]` `display/intel_ddi.c:1141`, `:1218`,
+//! `:1226`), and `output::program` writes the group instance as it does
+//! (`:1146`, `:1221`, `:1229`).  The group instances of `DW2` and `DW7` exist
+//! and are declared in `regs/port.rs` -- §8.2's worked examples tabulate them --
+//! but a DDI's swing does not land in them
+//! (`[I915]` `display/intel_combo_phy_regs.h:96-105` gives the three address
+//! forms: AUX `+0x380`, group `+0x680`, lane `0x880 + ln*0x100`).
 //!
 //! Every dword is read and later written whole.  That is deliberate: §8.5
 //! enumerates the table's fields but not the registers' other bits, and i915
@@ -78,8 +86,9 @@
 //!   the lanes *before* step 13 enables the buffer, so a buffer that reports
 //!   itself enabled and not idle with every lane down is not a state that
 //!   sequence produces.
-//! * The three swing words are not all-zeros or all-ones
-//!   (`PhyNotResponding`): §12.2's absent-block test.
+//! * The swing words are not all-zeros or all-ones
+//!   (`PhyNotResponding`): §12.2's absent-block test, asked of both per-lane
+//!   dwords and of the lane-0 `DW5`.
 //! * `PORT_TX_DW5.TX_TRAINING_EN` is set (`TrainingNotEnabled`): §8.5 step 6
 //!   and `[I915]` `display/intel_ddi.c:1226-1229` make that bit the write that
 //!   triggers the update, so with it clear the batch was never committed.
@@ -97,14 +106,17 @@
 //! [`SwingProgram`] carries two `DW5` dwords because §8.5's sequence writes two
 //! states -- training disabled while the table values land (step 4), then
 //! training enabled as the write that commits them (step 6) -- and the
-//! firmware's register holds only the second.  The first is **derived** here
-//! rather than left for a caller to invent: `TX_TRAINING_EN` is a documented
-//! bit, bit 31 (`[I915]` `display/intel_combo_phy_regs.h:133`), and the only
-//! difference between the state i915 leaves during the batch and the state it
-//! leaves afterwards is that bit (`[I915]` `display/intel_ddi.c:1218-1229`:
-//! read, clear, write; program `DW2`/`DW4`/`DW7`; read, set, write).  So
-//! `dw5_training_disabled` is the read value with bit 31 cleared, and nothing
-//! else about it is guessed.  §8.5 gives the same two states as steps 4 and 6.
+//! firmware's register holds only the second.  Both go to the group instance;
+//! this module reads **lane 0**, which is the copy i915 reads for the same two
+//! writes (`[I915]` `display/intel_ddi.c:1218-1229`).  The first state is
+//! **derived** here rather than left for a caller to invent: `TX_TRAINING_EN` is
+//! a documented bit, bit 31 (`[I915]` `display/intel_combo_phy_regs.h:133`), and
+//! the only difference between the state i915 leaves during the batch and the
+//! state it leaves afterwards is that bit (`[I915]` `display/intel_ddi.c:1218-1229`:
+//! read lane 0, clear, write group; program `DW2`/`DW4`/`DW7`; read lane 0, set,
+//! write group).  So `dw5_training_disabled` is the lane-0 read with bit 31
+//! cleared, and nothing else about it is guessed.  §8.5 gives the same two
+//! states as steps 4 and 6.
 //!
 //! # What the caller does with it
 //!
@@ -193,8 +205,10 @@ const TX_TRAINING_EN: u32 = 1 << 31;
 ///
 /// Every offset is the register table's, keyed by the DDI's combo PHY: §8.1's
 /// port numbering puts DDI A on combo PHY A and DDI B on combo PHY B, and §6.3
-/// pairs them with DPLL0 and DPLL1.  The `PORT_TX_DW4` array is per lane; there
-/// is deliberately no group instance of it (§8.5 step 2).
+/// pairs them with DPLL0 and DPLL1.  Three of the four dwords live in per-lane
+/// instances (`PORT_TX_DW2`, `DW4` and `DW7`), so each is an array in lane
+/// order; `PORT_TX_DW5` is read from lane 0, which is the copy i915 reads
+/// before writing the group instance (`[I915]` `display/intel_ddi.c:1141`).
 #[derive(Clone, Copy, Debug)]
 struct SourceRegisters {
     /// `PORT_COMP_DW0`: `COMP_INIT` says §8.3's initialisation has run.
@@ -203,14 +217,14 @@ struct SourceRegisters {
     ddi_buf_ctl: Register,
     /// `PORT_CL_DW10`: `PWR_DOWN_LN_MASK`.
     cl_dw10: Register,
-    /// `PORT_TX_DW2` (group).
-    tx_dw2: Register,
+    /// `PORT_TX_DW2`, one register per lane, in lane order.
+    tx_dw2: [Register; 4],
     /// `PORT_TX_DW4`, one register per lane, in lane order.
     tx_dw4: [Register; 4],
-    /// `PORT_TX_DW5` (group).
-    tx_dw5: Register,
-    /// `PORT_TX_DW7` (group).
-    tx_dw7: Register,
+    /// `PORT_TX_DW5`, lane 0.
+    tx_dw5_lane0: Register,
+    /// `PORT_TX_DW7`, one register per lane, in lane order.
+    tx_dw7: [Register; 4],
 }
 
 /// The registers for a DDI's combo PHY, or `None` for a port this kernel does
@@ -227,29 +241,49 @@ const fn source_registers(ddi: Ddi) -> Option<SourceRegisters> {
             comp_dw0: regs::COMBO_PHY_A.comp_dw0,
             ddi_buf_ctl: ddi::DDI_BUF_CTL_A,
             cl_dw10: port::PORT_CL_DW10_A,
-            tx_dw2: port::PORT_TX_DW2_GRP_A,
+            tx_dw2: [
+                port::PORT_TX_DW2_LN0_A,
+                port::PORT_TX_DW2_LN1_A,
+                port::PORT_TX_DW2_LN2_A,
+                port::PORT_TX_DW2_LN3_A,
+            ],
             tx_dw4: [
                 port::PORT_TX_DW4_LN0_A,
                 port::PORT_TX_DW4_LN1_A,
                 port::PORT_TX_DW4_LN2_A,
                 port::PORT_TX_DW4_LN3_A,
             ],
-            tx_dw5: port::PORT_TX_DW5_GRP_A,
-            tx_dw7: port::PORT_TX_DW7_GRP_A,
+            tx_dw5_lane0: port::PORT_TX_DW5_LN0_A,
+            tx_dw7: [
+                port::PORT_TX_DW7_LN0_A,
+                port::PORT_TX_DW7_LN1_A,
+                port::PORT_TX_DW7_LN2_A,
+                port::PORT_TX_DW7_LN3_A,
+            ],
         }),
         Ddi::B => Some(SourceRegisters {
             comp_dw0: regs::COMBO_PHY_B.comp_dw0,
             ddi_buf_ctl: ddi::DDI_BUF_CTL_B,
             cl_dw10: port::PORT_CL_DW10_B,
-            tx_dw2: port::PORT_TX_DW2_GRP_B,
+            tx_dw2: [
+                port::PORT_TX_DW2_LN0_B,
+                port::PORT_TX_DW2_LN1_B,
+                port::PORT_TX_DW2_LN2_B,
+                port::PORT_TX_DW2_LN3_B,
+            ],
             tx_dw4: [
                 port::PORT_TX_DW4_LN0_B,
                 port::PORT_TX_DW4_LN1_B,
                 port::PORT_TX_DW4_LN2_B,
                 port::PORT_TX_DW4_LN3_B,
             ],
-            tx_dw5: port::PORT_TX_DW5_GRP_B,
-            tx_dw7: port::PORT_TX_DW7_GRP_B,
+            tx_dw5_lane0: port::PORT_TX_DW5_LN0_B,
+            tx_dw7: [
+                port::PORT_TX_DW7_LN0_B,
+                port::PORT_TX_DW7_LN1_B,
+                port::PORT_TX_DW7_LN2_B,
+                port::PORT_TX_DW7_LN3_B,
+            ],
         }),
         Ddi::C | Ddi::D => None,
     }
@@ -319,16 +353,16 @@ pub(crate) enum SwingSource {
         /// What it read.
         readback: u32,
     },
-    /// The three swing words all read as an absent block.
+    /// The swing words all read as an absent block.
     PhyNotResponding {
         /// The DDI.
         ddi: Ddi,
-        /// `PORT_TX_DW2`'s read.
-        dw2: u32,
-        /// `PORT_TX_DW5`'s read.
+        /// `PORT_TX_DW2`'s read, one value per lane.
+        dw2: [u32; 4],
+        /// `PORT_TX_DW5`'s read, lane 0.
         dw5: u32,
-        /// `PORT_TX_DW7`'s read.
-        dw7: u32,
+        /// `PORT_TX_DW7`'s read, one value per lane.
+        dw7: [u32; 4],
     },
     /// `PORT_TX_DW5.TX_TRAINING_EN` is clear: §8.5 step 6 never ran.
     TrainingNotEnabled {
@@ -416,10 +450,11 @@ impl SwingSource {
                 ddi.name()
             ),
             Self::PhyNotResponding { ddi, dw2, dw5, dw7 } => format!(
-                "all three swing registers of DDI {} read as an absent block: PORT_TX_DW2 \
-                 {dw2:#010x}, PORT_TX_DW5 {dw5:#010x}, PORT_TX_DW7 {dw7:#010x}.  Reference \
-                 section 12.2: a block that is not there answers all-zero or all-ones, and the TX \
-                 registers are the one thing this read cannot do without.  Nothing was believed",
+                "the swing registers of DDI {} all read as an absent block: PORT_TX_DW2 per lane \
+                 {dw2:#010x?}, PORT_TX_DW5 (lane 0) {dw5:#010x}, PORT_TX_DW7 per lane \
+                 {dw7:#010x?}.  Reference section 12.2: a block that is not there answers \
+                 all-zero or all-ones, and the TX registers are the one thing this read cannot do \
+                 without.  Nothing was believed",
                 ddi.name()
             ),
             Self::TrainingNotEnabled {
@@ -516,22 +551,35 @@ pub(crate) fn read_firmware_swing<R: Registers>(
         });
     }
 
-    // §8.5 step 5's swing values.  `PORT_TX_DW4` is read one lane at a time
-    // and the group instance is never used: §8.5 step 2 says group access must
-    // not be used for it because each lane's loadgen select differs, and i915's
-    // comment on the same write is that a group write "would overwrite
-    // individual loadgen" ([I915] display/intel_ddi.c:1160).
-    let dw2 = read(regs, ddi, port.tx_dw2)?;
+    // §8.5 step 5's swing values, read the way i915 writes them: `PORT_TX_DW2`,
+    // `DW4` and `DW7` one lane at a time, `ln = 0..3`, and never through a group
+    // instance (`[I915]` `display/intel_ddi.c:1148-1157`, `:1161-1169`,
+    // `:1171-1178`).  For `DW4` §8.5 step 2 says group access must not be used
+    // because each lane's loadgen select differs, and i915's comment on the same
+    // write is that it "would overwrite individual loadgen"
+    // (`[I915]` `display/intel_ddi.c:1160`).  A group read would collapse four
+    // values into one, whichever lane the hardware answered with.
+    let mut dw2 = [0u32; 4];
+    for (lane, register) in port.tx_dw2.iter().enumerate() {
+        dw2[lane] = read(regs, ddi, *register)?;
+    }
     let mut dw4 = [0u32; 4];
     for (lane, register) in port.tx_dw4.iter().enumerate() {
         dw4[lane] = read(regs, ddi, *register)?;
     }
-    let dw5 = read(regs, ddi, port.tx_dw5)?;
-    let dw7 = read(regs, ddi, port.tx_dw7)?;
+    // §8.5 steps 4 and 6 as i915 performs them: the value that is modified is
+    // lane 0's, the write goes to the group instance
+    // (`[I915]` `display/intel_ddi.c:1218-1229`).
+    let dw5 = read(regs, ddi, port.tx_dw5_lane0)?;
+    let mut dw7 = [0u32; 4];
+    for (lane, register) in port.tx_dw7.iter().enumerate() {
+        dw7[lane] = read(regs, ddi, *register)?;
+    }
 
-    // §12.2: a block that is not there answers all-zero or all-ones.  Three
-    // degenerate words at once is that, and there is nothing to copy.
-    if degenerate(dw2) && degenerate(dw5) && degenerate(dw7) {
+    // §12.2: a block that is not there answers all-zero or all-ones.  Every lane
+    // of both per-lane dwords and lane 0's `DW5` degenerate at once is that, and
+    // there is nothing to copy.
+    if degenerate_all(&dw2) && degenerate(dw5) && degenerate_all(&dw7) {
         return Err(SwingSource::PhyNotResponding { ddi, dw2, dw5, dw7 });
     }
 
@@ -542,7 +590,7 @@ pub(crate) fn read_firmware_swing<R: Registers>(
     if dw5 & TX_TRAINING_EN == 0 {
         return Err(SwingSource::TrainingNotEnabled {
             ddi,
-            register: port.tx_dw5.name(),
+            register: port.tx_dw5_lane0.name(),
             readback: dw5,
         });
     }
@@ -576,11 +624,19 @@ fn read(regs: &impl Registers, ddi: Ddi, register: Register) -> Result<u32, Swin
 ///
 /// Reference §12.2: "A read of `0xFFFFFFFF` or `0x00000000` on **both** the read
 /// and a re-read means **the PHY instance is absent**."  This read asks the
-/// question of all three group words at once; a single zero or all-ones word
-/// among sane neighbours is left alone, because these registers legitimately
-/// hold zero in some fields.
+/// question of every swing word at once; a single zero or all-ones word among
+/// sane neighbours is left alone, because these registers legitimately hold zero
+/// in some fields.
 fn degenerate(value: u32) -> bool {
     value == 0 || value == u32::MAX
+}
+
+/// The same question for a dword that has one instance per lane.
+///
+/// Four lanes of one dword are four instances; §12.2's absent-block answer is
+/// all of them, not one of them.
+fn degenerate_all(values: &[u32; 4]) -> bool {
+    values.iter().all(|value| degenerate(*value))
 }
 
 /// The `source` strings a read-back program carries, one per DDI and level.
