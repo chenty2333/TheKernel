@@ -128,7 +128,33 @@ bound that is too tight would refuse hardware that works.
 Nothing is silently ignored: a recorded failure is carried in `PowerState` and
 printed, naming the bit and the value that was read.
 
-### 3.3 Read-modify-write convention
+### 3.3 Rollback: a failure puts the well back
+
+A bring-up that fails after `PW_1` came up withdraws the request bit it added
+(`power::unwind`), so the display is left as it was found rather than powered
+and unprogrammed.  The same rollback happens inside the handshake: a well whose
+`STATE` bit never sets has its request withdrawn before the error is returned,
+because leaving the bit set would make the next attempt — and anyone reading
+the register afterwards — unable to tell whether it was there before, which is
+the difference between a retry and a diagnosis.
+
+Two details make it safe rather than destructive:
+
+* The request is withdrawn only when *this call* added it.  A bit that was
+  already set belongs to whoever set it — the firmware, or an earlier attempt —
+  and is left alone; the error says which of the two happened.
+* Nothing else is unwound.  The DBUF slice requests are left, because with
+  `PW_1` down their state reads zero and `enable_dbuf` reads the state before it
+  requests anything, so a retry re-requests exactly what it needs.  A
+  half-programmed PHY is left for the same reason, and because clearing
+  `COMP_INIT` on a PHY whose reference values are half-written would make a
+  retry's verification pass fail for a reason this driver created.
+
+The diagnostic is read *before* the rollback in both cases: a report that said
+"nobody requested this well" because the rollback had already run would be
+actively misleading about the one thing §11 phase 1.3 asks a reader to compare.
+
+### 3.4 Read-modify-write convention
 
 `rmw(regs, register, clear, set)` computes `(read & !clear) | set`, which is
 `[I915]`'s `intel_de_rmw(reg, clear, set)` rather than a "field mask and value"
@@ -137,7 +163,7 @@ helper.  The distinction is load-bearing: `icl_combo_phys_init` writes
 mask-and-value helper silently turns into a no-op.  The convention is documented
 at both call sites.
 
-### 3.4 The firmware's CDCLK is kept
+### 3.5 The firmware's CDCLK is kept
 
 `bxt_cdclk_init_hw` sanitises and then returns early if the PLL is enabled and
 locked with a VCO the table knows (§4.6, §11 phase 1.4).  `clk::bring_up` does
@@ -147,7 +173,7 @@ the frequency is what the display runs on, and rewriting the field on a running
 display is a CDCLK change, which the PRM says requires disabling every display
 engine function first.
 
-### 3.5 The raw clock: strap over firmware, and the disagreement is logged
+### 3.6 The raw clock: strap over firmware, and the disagreement is logged
 
 §4.8 and §13.3 record a source disagreement: the DG1 PRM expects a 38.4 MHz raw
 clock, while `[I915]`'s `cnp_rawclk` derives 24 or 19.2 MHz from
@@ -163,7 +189,7 @@ A consequence worth knowing: `intel_pch_rawclk`'s DG1 path programs
 register value that is not one of the two this driver can produce is carried
 raw and reported as undecodable rather than guessed at.
 
-### 3.6 `XELPD_DISPLAY_ERR_FATAL_MASK` is deliberately left unmasked
+### 3.7 `XELPD_DISPLAY_ERR_FATAL_MASK` is deliberately left unmasked
 
 `[I915]` writes all-ones there (`Wa_14011503030`), masking every fatal display
 error.  §4.9 step 11 suggests the opposite for a first bring-up and §13.2 marks
@@ -171,7 +197,7 @@ that suggestion as `[INF]`.  This driver takes the `[INF]`: an error that is
 masked is an error nobody sees.  The register is *read*, so the log says what
 state it was left in rather than implying the question was never asked.
 
-### 3.7 The PCode handshake is not implemented
+### 3.8 The PCode handshake is not implemented
 
 `[I915]` `bxt_set_cdclk` opens with
 `skl_pcode_request(SKL_PCODE_CDCLK_CONTROL, SKL_CDCLK_PREPARE_FOR_CHANGE, ...)`
@@ -184,7 +210,7 @@ screen should not happen.  Related: CDCLK *crawl* (`has_cdclk_crawl` is set for
 VCO of zero unless the PLL is enabled *and* locked, so every state that reaches
 the programming path is one i915 also treats as a disable/enable.
 
-### 3.8 Two steps of `icl_display_core_init` are not ported
+### 3.9 Two steps of `icl_display_core_init` are not ported
 
 `icl_mbus_init` (step 6) and `tgl_bw_buddy_init` (step 7, `BW_BUDDY_CTL`
 `0x45130`/`0x45140`) are in `icl_display_core_init` but not in §11's phase 1,
@@ -212,7 +238,7 @@ Each is marked in the code where it is used.
    reading `SKL_DSSM[31:29]` and never assuming.  The three undefined encodings
    fall back to 24 MHz as `icl_readout_refclk` does, but the fallback is flagged
    and printed, and the flag is asserted in a test.
-4. **The ADL-N raw clock frequency** (§4.8, §13.1 item 5).  Bridged as §3.5
+4. **The ADL-N raw clock frequency** (§4.8, §13.1 item 5).  Bridged as §3.6
    above.
 5. **The ADL-N CDCLK voltage-level table** (§4.6, §13.1 item 6).  Bridged by
    not computing one: no PCode write happens, so no voltage level is needed.
@@ -300,8 +326,8 @@ failed check is named.
 
 Nothing in this workstream has run on the target.  The evidence is:
 
-* **77 host tests** across `drm::intel`, of which 42 are new in this workstream
-  (15 in `clk.rs`, 13 in `power.rs`, 10 in `phy.rs` and 4 in `regs.rs`), run
+* **79 host tests** across `drm::intel`, of which 44 are new in this workstream
+  (15 in `clk.rs`, 15 in `power.rs`, 10 in `phy.rs` and 4 in `regs.rs`), run
   with `cargo test --locked -p thekernel-kernel --target
   x86_64-unknown-linux-gnu -- drm::intel`.  They drive the sequences through
   `regs::mock::MockRegisters`, which models a status bit that follows a request
@@ -376,6 +402,8 @@ device the target has.
 | `power::a_dc_state_that_will_not_take_the_write_is_an_error` | the 100-write retry bound |
 | `power::a_well_whose_state_never_sets_names_every_cause_it_can` | §11 phase 1.3's diagnostic, with the requester comparison |
 | `power::a_pg0_that_is_not_distributed_stops_the_well_before_the_request` | the fatal fuse poll, and the recorded one |
+| `power::a_well_whose_state_never_sets_withdraws_the_request_it_added` | rollback at the handshake, and that a bit this call did not set survives |
+| `power::a_failure_after_the_well_came_up_withdraws_it` | rollback for a later failure, with the original message carried through |
 | `power::the_dbuf_reads_before_it_requests_and_reports_a_partial_part` | read-first, partial, and zero-slice outcomes |
 | `power::the_error_mask_is_read_and_left_alone` | §3.6's decision |
 | `power::enabling_a_well_that_is_already_on_does_not_claim_credit` | the `already_on` distinction |

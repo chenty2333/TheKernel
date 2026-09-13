@@ -786,6 +786,21 @@ pub(crate) enum PowerError {
         index: u32,
         control: u32,
         requesters: Requesters,
+        /// Whether the request bit this call added has been withdrawn.  It is
+        /// false when the bit was already set before the call, because then it
+        /// is not this call's to withdraw.
+        rolled_back: bool,
+    },
+    /// A phase after `PW_1` came up failed.
+    ///
+    /// The well request this call added is withdrawn before returning, so a
+    /// failed bring-up leaves the device as it was found rather than
+    /// half-powered -- which matters because the next attempt, and any
+    /// diagnosis, has to start from a state someone can describe.
+    AfterPowerUp {
+        step: &'static str,
+        cause: String,
+        unwound: bool,
     },
     Clock(clk::ClockError),
     /// No DBUF slice came up at all.
@@ -846,16 +861,36 @@ impl PowerError {
                 index,
                 control,
                 requesters,
+                rolled_back,
             } => format!(
                 "power well {well} never reported its state bit: {control:#010x} after requesting \
                  bit {request:#x} (well index {index}, state bit {state:#x}).  Reference section \
                  11 phase 1.3 lists the causes in order of likelihood: the well index is wrong; \
                  the fuse bit is wrong; or another requester is holding the well with a different \
                  bit pattern -- {}.  The BIOS, KVMR and debug request registers are in the log \
-                 for exactly that comparison",
+                 for exactly that comparison.  The request bit this call added was {}",
                 requesters.describe(),
+                if *rolled_back {
+                    "withdrawn, so the well is left as it was found"
+                } else {
+                    "already set before this call, so it was left alone"
+                },
                 request = well_request(*index),
                 state = well_state(*index),
+            ),
+            Self::AfterPowerUp {
+                step,
+                cause,
+                unwound,
+            } => format!(
+                "{step} failed after PW_1 came up: {cause}.  {}",
+                if *unwound {
+                    "The well request this call added was withdrawn, so the display is left as it \
+                     was found rather than half-powered"
+                } else {
+                    "The well request was already set before this call, so it was left alone; the \
+                     display is powered but not brought up"
+                },
             ),
             Self::Clock(error) => error.describe(),
             Self::DbufNeverPowered { readback } => format!(
@@ -1017,6 +1052,10 @@ pub(crate) fn enable_well(
 
     let control_before = read(regs, well.register)?;
     let already_on = control_before & well.state_mask() != 0;
+    // Whether *this call* is the one adding the request bit.  It is the
+    // difference between a bit this call may withdraw and one that belongs to
+    // whoever set it earlier.
+    let we_request = control_before & well.request_mask() == 0;
 
     rmw(regs, well.register, 0, well.request_mask())?;
 
@@ -1034,11 +1073,24 @@ pub(crate) fn enable_well(
         register: well.register.name(),
     })?;
     if !state_set {
+        // The diagnostic describes the state at the moment of failure, so it is
+        // read before the rollback: a report that said "nobody requested this
+        // well" because the rollback had already run would be actively
+        // misleading about the one thing section 11 phase 1.3 asks a reader to
+        // compare.
+        let control = read(regs, well.register)?;
+        let requesters = requesters(regs, well)?;
+        // Then withdraw the request this call added.  Leaving it set would make
+        // the next attempt -- and anyone reading the register afterwards --
+        // unable to tell whether the bit was there before, which is the
+        // difference between a retry and a diagnosis.
+        let rolled_back = we_request && rmw(regs, well.register, well.request_mask(), 0).is_ok();
         return Err(PowerError::WellStateNeverSet {
             well: well.name,
             index: well.index,
-            control: read(regs, well.register)?,
-            requesters: requesters(regs, well)?,
+            control,
+            requesters,
+            rolled_back,
         });
     }
 
@@ -1154,6 +1206,48 @@ pub(crate) fn apply_workarounds(regs: &impl Registers) -> Result<WorkaroundState
     })
 }
 
+/// Re-read each combo PHY's `COMP_INIT`.
+///
+/// §11 phase 1.2's check, at the point where its answer means something: before
+/// `PW_1` a `COMP_INIT` that did not stick is expected, and after it the same
+/// reading means the PHY is not powered.
+fn recheck_phys(regs: &impl Registers) -> Result<Vec<(&'static str, bool)>, PowerError> {
+    let mut out = Vec::with_capacity(regs::COMBO_PHYS.len());
+    for phy in regs::COMBO_PHYS {
+        let value = read(regs, phy.comp_dw0)?;
+        out.push((phy.port, value & phy::COMP_INIT != 0));
+    }
+    Ok(out)
+}
+
+/// Withdraw the `PW_1` request this call added, and describe why.
+///
+/// This is the rollback: a bring-up that fails after the well came up must not
+/// leave the display powered but unprogrammed, because the next attempt and any
+/// diagnosis have to start from a state someone can describe.  The request is
+/// only withdrawn when *this call* added it -- `we_requested` is false when the
+/// bit was already set, and then it belongs to whoever set it.
+///
+/// Nothing else is unwound.  The DBUF slice requests are deliberately left:
+/// with `PW_1` down their state reads zero, `enable_dbuf` reads the state before
+/// it requests anything, and so a retry re-requests exactly what it needs.  A
+/// half-programmed PHY is likewise left alone, for the same reason and because
+/// clearing `COMP_INIT` on a PHY whose reference values are half-written would
+/// make a retry's verification pass fail for a reason this driver created.
+fn unwind(
+    regs: &impl Registers,
+    we_requested: bool,
+    step: &'static str,
+    cause: PowerError,
+) -> PowerError {
+    let unwound = we_requested && rmw(regs, PW_1.register, PW_1.request_mask(), 0).is_ok();
+    PowerError::AfterPowerUp {
+        step,
+        cause: cause.describe(),
+        unwound,
+    }
+}
+
 /// Bring the display's power, clocks and PHYs up, in order.
 ///
 /// This is the workstream's single entry point.  It is the whole of reference
@@ -1193,27 +1287,44 @@ pub(crate) fn bring_up(regs: &impl Registers) -> Result<PowerState, PowerError> 
 
     // Phase 1.3.
     let pw1 = enable_well(regs, PW_1)?;
+    // Every step below runs with the well up, so every failure below has to
+    // put the well back.  `we_requested` is what makes that safe: a request bit
+    // that was already set is not this call's to withdraw.
+    let we_requested = pw1.control_before & well_request(PW_1.index) == 0;
 
     // The re-read §11 phase 1.2 asks for: COMP_INIT is written before PW_1
     // exists, so its not sticking there means nothing; after PW_1 it means the
     // PHY is not powered.
-    let mut phy_comp_init_after_pw1 = Vec::with_capacity(phys.len());
-    for phy in regs::COMBO_PHYS {
-        let value = read(regs, phy.comp_dw0)?;
-        phy_comp_init_after_pw1.push((phy.port, value & phy::COMP_INIT != 0));
-    }
+    let phy_comp_init_after_pw1 =
+        recheck_phys(regs).map_err(|error| unwind(regs, we_requested, "the PHY re-read", error))?;
 
     // Phases 1.4 and 1.4b.  The raw clock is a clock and belongs with CDCLK;
     // it must also be right before any south display function is enabled, which
     // is not this phase, so doing it here satisfies that with margin.
-    let cdclk = clk::bring_up(regs)?;
-    let raw_clock = clk::bring_up_raw_clock(regs, fuses.sfuse_strap)?;
+    let cdclk = clk::bring_up(regs).map_err(|error| {
+        unwind(
+            regs,
+            we_requested,
+            "the CDCLK step",
+            PowerError::Clock(error),
+        )
+    })?;
+    let raw_clock = clk::bring_up_raw_clock(regs, fuses.sfuse_strap).map_err(|error| {
+        unwind(
+            regs,
+            we_requested,
+            "the raw clock step",
+            PowerError::Clock(error),
+        )
+    })?;
 
     // Phase 1.5.
-    let dbuf = enable_dbuf(regs)?;
+    let dbuf =
+        enable_dbuf(regs).map_err(|error| unwind(regs, we_requested, "the DBUF step", error))?;
 
     // Phase 1.6.
-    let workarounds = apply_workarounds(regs)?;
+    let workarounds = apply_workarounds(regs)
+        .map_err(|error| unwind(regs, we_requested, "the workaround step", error))?;
 
     Ok(PowerState {
         fuses,
@@ -1668,6 +1779,98 @@ mod tests {
         assert_eq!(AUX_A.register.name(), "ICL_PWR_WELL_CTL_AUX2");
         assert_eq!(DDI_IO_A.request_mask(), 0x2);
         assert_eq!(AUX_B.state_mask(), 0x4);
+    }
+
+    #[test]
+    fn a_well_whose_state_never_sets_withdraws_the_request_it_added() {
+        // Rollback, at the handshake: the request bit this call added must not
+        // be left behind, or the next attempt cannot tell whether it was there
+        // before.
+        let regs = powered_machine();
+        regs.derive(regs::HSW_PWR_WELL_CTL2, |written| {
+            written & !PW_1.state_mask()
+        });
+        let error = enable_well(&regs, PW_1).unwrap_err();
+        match error {
+            PowerError::WellStateNeverSet { rolled_back, .. } => assert!(rolled_back),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            regs.read(regs::HSW_PWR_WELL_CTL2).unwrap() & PW_1.request_mask(),
+            0,
+            "the request bit must be gone"
+        );
+        assert!(
+            error.describe().contains("withdrawn"),
+            "{}",
+            error.describe()
+        );
+
+        // A request bit that was already set is not this call's to withdraw.
+        let regs = powered_machine();
+        regs.set(regs::HSW_PWR_WELL_CTL2, PW_1.request_mask());
+        regs.derive(regs::HSW_PWR_WELL_CTL2, |written| {
+            written & !PW_1.state_mask()
+        });
+        let error = enable_well(&regs, PW_1).unwrap_err();
+        match error {
+            PowerError::WellStateNeverSet { rolled_back, .. } => assert!(!rolled_back),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            regs.read(regs::HSW_PWR_WELL_CTL2).unwrap() & PW_1.request_mask(),
+            PW_1.request_mask(),
+            "a bit this call did not set must survive"
+        );
+    }
+
+    #[test]
+    fn a_failure_after_the_well_came_up_withdraws_it() {
+        // The whole-sequence rollback: a step after PW_1 that fails must leave
+        // the display as it was found.  The failing step here is the DBUF, and
+        // the well request must be gone afterwards.
+        let regs = powered_machine();
+        for slice in DBUF_SLICES {
+            regs.derive(slice, |written| written & !DBUF_POWER_STATE);
+        }
+        let error = bring_up(&regs).unwrap_err();
+        match &error {
+            PowerError::AfterPowerUp { step, unwound, .. } => {
+                assert_eq!(*step, "the DBUF step");
+                assert!(unwound);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            regs.read(regs::HSW_PWR_WELL_CTL2).unwrap() & PW_1.request_mask(),
+            0,
+            "PW_1 must have been released"
+        );
+        let text = error.describe();
+        assert!(text.contains("the DBUF step failed"), "{text}");
+        assert!(text.contains("left as it was found"), "{text}");
+
+        // A later failure, the CDCLK: same contract, and the original error's
+        // own message is carried through rather than replaced.
+        let regs = powered_machine();
+        regs.set(regs::SKL_DSSM, 2 << 29); // 38.4 MHz
+        regs.set(regs::CDCLK_PLL_ENABLE, 0); // nothing usable
+        // A PLL that will not enable at all: the mock's earlier hook sets LOCK
+        // when ENABLE is written, so this one has to take both away, or the
+        // device would look like one that locks at a ratio it dropped.
+        regs.derive(regs::CDCLK_PLL_ENABLE, |written| {
+            written & !(clk::PLL_ENABLE | clk::PLL_LOCK)
+        });
+        let error = bring_up(&regs).unwrap_err();
+        match &error {
+            PowerError::AfterPowerUp { step, unwound, .. } => {
+                assert_eq!(*step, "the CDCLK step");
+                assert!(unwound);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let text = error.describe();
+        assert!(text.contains("never reported lock"), "{text}");
     }
 
     #[test]

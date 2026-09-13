@@ -742,11 +742,11 @@ impl RawClockState {
         if let RawClockProgrammed::Known(khz) = self.was
             && khz != self.plan.khz
         {
-            text.push_str(&format!(
+            text.push_str(
                 "; the firmware and the strap DISAGREE about the crystal and the strap won -- if \
                  GMBUS or hotplug de-glitching misbehaves later, this is the first thing to \
-                 revisit"
-            ));
+                 revisit",
+            );
         }
         text
     }
