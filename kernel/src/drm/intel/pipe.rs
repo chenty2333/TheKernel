@@ -1067,7 +1067,7 @@ pub(crate) struct PlaneProgram {
 
 impl PlaneProgram {
     /// The `PLANE_SURF` field for a GGTT address, or why it cannot be one.
-    fn surface_field(address: u64) -> Result<u32, PipeError> {
+    pub(crate) fn surface_field(address: u64) -> Result<u32, PipeError> {
         if address == 0 {
             return Err(PipeError::SurfaceAddressZero);
         }
