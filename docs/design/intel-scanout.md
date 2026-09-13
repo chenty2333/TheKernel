@@ -26,21 +26,27 @@ facts, and `[GAP]` is something no source in reach states.  Facts are cited by
 
 | file | what it owns |
 |---|---|
-| `kernel/src/drm/intel/gtt.rs` | the GGTT page table: the entry layout, the aperture, `map_linear` (a run of entries for a contiguous physical range), the read-back check, and the allocator |
+| `kernel/src/drm/intel/gtt.rs` | the GGTT page table: the entry layout, **the aperture the device reports** (`ApertureSize`, read through `pci::ConfigSpace`), the reserved page at each end, `map_linear` (a run of entries for a contiguous physical range, aligned and padded), the read-back check, and the allocator |
 | `kernel/src/drm/intel/fb.rs` | `Plan` (geometry, stride, size and every refusal), `Surface::allocate`, and the kernel's writable view of the memory |
 | `kernel/src/drm/intel/scanout.rs` | `ScanoutSurface` over `fb::Surface`, and the `screen::Candidate` that offers it to the console |
+| `kernel/src/drm/intel/pci.rs` | the configuration-space side: `offset::GMCH_CTL` and the `GGMS` field's shift and mask, next to every other header field the probe reads |
 
 The call sequence a coordinator wires is:
 
 ```rust
-// once, after the probe found a device and knows its BAR 0:
-let gtt = intel::gtt::Gtt::map(bar0_physical, bar0_len)?;
+// once, after the probe found a device and knows its BAR 0 and its function:
+let aperture = intel::gtt::ApertureSize::read(&config, bdf);
+let gtt = intel::gtt::Gtt::map(bar0_physical, bar0_len, aperture)?;
 // per mode, after the mode layer chose one:
 let surface = Arc::new(intel::fb::Surface::allocate(&gtt, width, height, fb::Format::Xrgb8888)?);
 // after the modeset has programmed PLANE_SURF = surface.ggtt_address() and read
 // the phase 6 evidence back:
 intel::scanout::register(surface, scanout::Verdict::Scanning { surflive });
 ```
+
+`Gtt::map` logs `Gtt::describe()` -- the observed field, the aperture it names and
+the window that was mapped -- at the moment it decides, and the same string is
+what a debug file should carry (it is `pub(crate)` and one line long).
 
 **None of it is called from the boot path.**  Nothing in this kernel allocates a
 framebuffer, writes a page table entry, or registers a console candidate at
@@ -132,50 +138,143 @@ diagnostic:
   address inside `GEN12_GGTT_PTE_ADDR_MASK`; `Pte::encode` checks it and refuses
   a wider address rather than truncating it to a different page.
 
-### 2.3 The aperture, and the size that is inferred
+### 2.3 The aperture, and the size the device reports
 
-The array is 8 MiB of 8-byte entries: 1 048 576 entries, each naming a 4 KiB
-page, which is exactly **4 GiB of aperture**.  That number is `[INF]`, not a
-statement in the reference, and it rests on three independent supports:
+**The BAR does not say how big the aperture is, and neither does the array this
+module maps.**  `[I915]` asserts that BAR 0 is exactly 16 MiB on this generation
+-- `GEM_WARN_ON(pci_resource_len(pdev, GEN4_GTTMMADR_BAR) !=
+gen6_gttmmadr_size(i915))`, `gt/intel_ggtt.c:1158` -- and takes the aperture from
+the `GGMS` field of the device's own configuration header:
 
-1. the reference's own BAR split (the array is the last 8 MiB of a 16 MiB BAR);
-2. `PLANE_SURF` carrying the graphics address in bits `[31:12]`
-   (reference §5.4; `[I915]` `display/skl_universal_plane_regs.h:160`), which
-   can name exactly 4 GiB and no more;
-3. `[I915]`'s own comment "if the size of the GGTT is 4G"
-   (`gt/intel_ggtt.c:769-778`) and its clamp of any larger table to
-   `1ULL << 32` (`:1471-1478`).
+| what | where | source |
+|---|---|---|
+| the field | PCI configuration space offset `0x50`, bits `[7:6]` | `SNB_GMCH_CTRL 0x50`, `include/drm/intel/i915_drm.h:49`; `BDW_GMCH_GGMS_SHIFT 6` / `BDW_GMCH_GGMS_MASK 0x3`, `:54-55` |
+| the read | `pci_read_config_word(pdev, SNB_GMCH_CTRL, &snb_gmch_ctl)` | `gt/intel_ggtt.c:1228` (in `gen8_gmch_probe`, which `ggtt_probe_hw` selects for `GRAPHICS_VER(i915) >= 8`, `:1459`) |
+| the encoding | shift, mask, `1 << field` MiB of page table, zero for zero | `gen8_get_total_gtt_size()`, `gt/intel_ggtt.c:1107-1121` |
+| the arithmetic | `ggtt->vm.total = (size / sizeof(gen8_pte_t)) * I915_GTT_PAGE_SIZE` | `gt/intel_ggtt.c:1238` |
 
-The module does not hard-code it: `Gtt::over` derives the aperture from the
-number of entries it was given and caps it at `MAX_APERTURE` (4 GiB), so the
-arithmetic follows the mapping rather than a belief about the mapping.
+One 8-byte entry per 4 KiB page, so the three values the two-bit field can name
+are **2, 4 and 8 MiB of page table, and a 1, 2 or 4 GiB aperture**.
 
-### 2.4 Where an allocation may go: present entries are never overwritten
+The difference matters because the array window is not the page table.  This
+module maps the whole second half of the BAR (8 MiB), but the table the hardware
+walks is only the `GGMS`-sized prefix of it: with a 2 MiB field, everything from
+offset 2 MiB to 8 MiB of the window is BAR space that is not a page table, and an
+entry written there is a write into something else.  So `Gtt::aperture()` is
+`ApertureSize`'s answer, `Gtt::entries()` is that aperture in pages rather than
+the window's length, and `index_of` -- the bound behind both `Gtt::entry` and the
+allocator's writes -- refuses anything at or above it with
+`GttError::AddressOutsideAperture { address, aperture }`, which now names the
+bound it actually used.
+
+`[I915]`'s own comment "if the size of the GGTT is 4G" (`gt/intel_ggtt.c:769-778`)
+and its clamp of a larger table to `1ULL << 32` (`:1471-1478`) are still the
+reason `MAX_APERTURE` is 4 GiB, which is also all `PLANE_SURF[31:12]` can name
+(reference §5.4; `[I915]` `display/skl_universal_plane_regs.h:160`).
+
+Three answers are possible and each is named rather than guessed at:
+
+| what the read gave | what happens | where it says so |
+|---|---|---|
+| 1, 2 or 3 in the field | the aperture is 1, 2 or 4 GiB | `ApertureSize::Observed`, printed by `Gtt::describe` |
+| 0 in the field | **no address is handed out**: the vendor function maps zero to a zero-byte page table, which is not a size to allocate out of, and guessing one is a write outside the real table | `ApertureSize::Unmodelled`, refused by `map_linear` as `GttError::ApertureSizeUnmodelled { raw }` |
+| no answer (configuration space unreachable) | the aperture is the one the mapped window covers -- the behaviour this kernel had before it read the field -- and the report says the value is **absent** rather than printing a number nobody measured | `ApertureSize::Unreadable` |
+
+`Gtt::over` is the fourth case and the honest one for a host test: no read was
+attempted (`ApertureSize::NotObserved`).
+
+### 2.4 Where an allocation may go: the reserved pages, the padding, and the entries that are never overwritten
 
 The firmware programmed this machine's current scanout into the same table, and
 the machine's only console is what that scanout shows.  Overwriting those
 entries would take the console away, which is why `map_linear` reads every
-candidate entry before it writes one and steps over any that is present:
+candidate entry before it writes any of them and restarts below any that is
+present:
 
-* the search runs **downwards from the top of the aperture**, so the low region
-  a firmware framebuffer usually occupies is touched last (`[PRM]` DG1 Vol 12's
-  own worked example maps a surface at `0x200000`);
-* a candidate run that meets a present entry **restarts below it**, so the pages
-  of one surface stay consecutive in the aperture — the display engine walks
-  them linearly from `PLANE_SURF`;
-* a run that cannot fit above the current floor is `ApertureExhausted`, a named
-  error, never a wrap.
+* the search runs **downwards from below the reserved top page**, so the low
+  region a firmware framebuffer usually occupies is touched last (`[PRM]` DG1
+  Vol 12's own worked example maps a surface at `0x200000`);
+* a candidate block that meets a present entry **restarts below it**, so the
+  pages of one surface stay consecutive in the aperture — the display engine
+  walks them linearly from `PLANE_SURF`;
+* a block that cannot fit above the current floor is `ApertureExhausted`, a
+  named error, never a wrap.
+
+Two pages are reserved by name, and this is the difference between this kernel
+and the vendor driver: `[I915]` runs before it has bound anything and *writes*
+its scratch entry into the top page (`init_ggtt`'s "And finally clear the
+reserved guard page", `gt/intel_ggtt.c:906-907`), while this kernel runs after
+firmware that may have left a live entry there, so it reserves the page without
+writing it.
+
+**The top page.**  `[I915]` leaves one page at the end of the GGTT out of the
+allocator because the hardware prefetches past the end of an object: "However,
+leave one page at the end still bound to the scratch page.  There are a number
+of places where the hardware apparently prefetches past the end of the object,
+and we've seen multiple hangs with the GPU head pointer stuck in a batchbuffer
+bound at the last page of the aperture.  One page should be enough to keep any
+prefetching inside of the aperture" (`gt/intel_ggtt.c:815-826`, and the page is
+the one `:906-907` clears).  The page-colouring half of the same guard
+(`i915_ggtt_color_adjust`, "insert a guard page to prevent prefetches crossing
+over the GTT boundary", `:36-53`) is installed only where the platform has no
+LLC and no PPGTT (`:66-67`), so on this part the guard is the reserve itself.
+The same bytes are where `[I915]` puts the GuC's firmware reserve, the top
+`SZ_4G - GUC_GGTT_TOP` (`:768-799`; `GUC_GGTT_TOP` is `0xFEE00000`,
+`gt/uc/intel_guc.h:401`, so 18 MiB on a 4 GiB GGTT), and where at least one GOP
+puts its framebuffer (`display/intel_plane_initial.c:207-209`).  This kernel
+reserves one page -- the record of the finding -- and does **not** reserve the
+18 MiB: nothing here loads the GuC, so the GuC's reserve is not this kernel's to
+keep, and the present-entry rule is what protects a GOP framebuffer that landed
+inside it.
+
+**The padding after a run.**  Under VT-d `[I915]` requires a scanout buffer to
+be 256 KiB-aligned with 64 PTEs of valid entries after it:
+
+```c
+/* [I915] display/intel_fb_pin.c:127-133 */
+/* Note that the w/a also requires 64 PTE of padding following the
+ * bo. We currently fill all unused PTE with the shadow page and so
+ * we should always have valid PTE following the scanout preventing
+ * the VT-d warning.
+ */
+if (intel_scanout_needs_vtd_wa(dev_priv) && alignment < 256 * 1024)
+        alignment = 256 * 1024;
+```
+
+and the workaround is `DISPLAY_VER(i915) >= 6 && i915_vtd_active(i915)`
+(`display/intel_display.c:8385-8388`).  The vendor driver gets the padding for
+free because it fills *every* unused entry with its scratch page; this kernel's
+table is the firmware's and only the entries a run owns may be written, so the
+padding is bound explicitly: `map_linear` searches for a block of the run's
+pages plus `SCANOUT_PADDING_ENTRIES` (64) entries on a `SCANOUT_ALIGNMENT`
+(256 KiB) boundary, writes the run into the first pages of it and the **zero
+page** into the rest, and reads the whole block back.
+
+Applying it unconditionally, rather than under `intel_scanout_needs_vtd_wa`, is
+a deliberate `[INF]`: nothing in this kernel parses `DMAR`, so it cannot tell
+whether VT-d is active, and a valid entry naming a page of zeros is harmless
+when it is not.  Zero is the safe content because every byte the engine could
+read there is black and no bit pattern in it names anything.  The padding
+entries must be *free* before they are written: they are part of the block the
+search proves absent, so "a present entry is never overwritten" is the same rule
+and not a second one.
+
+`[I915]` also binds scratch entries *before* an object (`:482-496`, its VMA
+`guard` pages).  This kernel does not: the cited VT-d requirement is about the
+PTEs *following* the scanout, and every run is 256 KiB-aligned, so the space
+below a run is free aperture rather than an entry this code fills.
 
 The top-down direction is defence in depth, not the protection.  `[I915]`
 records that the usual assumption is false somewhere: "MTL GOP likes to place
-the framebuffer high up in ggtt" (`display/intel_plane_initial.c:206-210`).  The
+the framebuffer high up in ggtt" (`display/intel_plane_initial.c:207-209`).  The
 protection is the read-before-write, and the vendor driver guards the same
 hazard explicitly: it refuses to relocate the firmware's framebuffer onto its
 own entries, "that would corrupt the original PTEs which are still being used
-for scanout" (`display/intel_plane_initial.c:218-221`).
+for scanout" (`display/intel_plane_initial.c:217-224`).
 
 A zeroed table has no present entries, so on a machine whose firmware never
-used a given address this costs one read per page and changes nothing.  It also
+used a given address this costs one read per entry of a candidate block and
+changes nothing.  It also
 means a window that is *not* the page table — the class of bug that "returns
 zeroes rather than faulting" — fails loudly instead of quietly: a table full of
 non-zero garbage exhausts the aperture and reports it, and a table that reads
@@ -269,7 +368,10 @@ in this kernel unmaps**.  Every address `Gtt::map_linear` hands out is an
 address the display engine has never translated on this boot, so the only way a
 stale translation could exist is if the firmware or another agent had used that
 same aperture address earlier in the same boot — and the read-before-write rule
-in §2.4 makes that page skip rather than reuse.  A stale *positive* entry is
+in §2.4 makes that page skip rather than reuse.  The two reserved pages are the
+same argument in the other direction: the top page is never written, so a
+translation the firmware left there is untouched, and the zero page's entries
+are written only into entries that read as absent.  A stale *positive* entry is
 therefore the case that cannot arise; a stale *negative* entry (the engine
 having cached "nothing there" for an address it never saw) is the one that
 would, and no source says whether the display engine even has such a cache.
@@ -409,13 +511,36 @@ The cost is one memory transaction per access instead of one per cache line, on
 a console written a glyph at a time; that is the same trade `bootfb` already
 makes, so the Intel surface is not slower than the console it replaces.
 
-One consequence is written down rather than hidden.  `/dev/fb0` maps the
-surface as a physical range (`DeviceMmap::Physical`), and the mapping a
-userspace writer gets through the fbdev path is cacheable while the kernel's
-view is not.  That is exactly the arrangement the firmware aperture already has
-today, and the fbdev ABI's explicit publication points (`fsync`,
-`FBIOPAN_DISPLAY`) are where the two views are reconciled.  It is a caveat, not
-a measured problem, and it is on §8's list of things to watch on hardware.
+One consequence is written down rather than hidden, and **the earlier version of
+this section was wrong about it**.  `/dev/fb0` maps the surface as a physical
+range (`DeviceMmap::Physical`), so a userspace writer's mapping of those pages is
+cacheable while the kernel's is not -- and the fbdev ABI's publication points do
+**not** reconcile the two views on this backend:
+
+| publication point | what it reaches here |
+|---|---|
+| `fsync` | `ScanoutSurface::present`, which accepts and writes nothing: a linear aperture has no submission |
+| `FBIOPAN_DISPLAY` | `ScanoutSurface::pan`, which returns `Unsupported` |
+
+So no cache is flushed, no fence is waited on and no register is written between
+a userspace store and the display engine's read of the same bytes.  The true
+position is therefore the one §4.3's own argument about the kernel's view was
+trying to avoid: **a userspace writer's pixels reach the display engine only if
+the engine's GGTT reads snoop the CPU's cache.**  `[I915]`'s device information
+says this part has an LLC (`.has_llc = 1` in `GEN7_FEATURES`, `i915_pci.c:316`,
+inherited through `GEN8_FEATURES` `:413-420`, `GEN9_FEATURES` `:477-481`,
+`GEN11_FEATURES` `:606-611` and `GEN12_FEATURES` `:634-640`), which is the
+mechanism that would make it work, but the vendor driver does not rely on it for
+its own scanout objects -- it sets them to `I915_CACHE_NONE`, or `WT` where the
+platform has write-through (`display/intel_plane_initial.c:184-190`; `HAS_WT` is
+`HAS_EDRAM`, `i915_drv.h:659`, which ADL-N does not have).
+
+A flush is **not** added for this.  Nothing in this kernel can test one: a
+`clflush`/`wbinvd` on the user's pages would have to be driven from the fbdev
+`fsync` path and its effect on the display engine is exactly what is unverified
+in the first place, so writing it would be a claim rather than a fix.  It is
+§8's sixth item, and it is a thing to *measure* on the machine: a raw writer
+followed by a read of the same pixels through the console is the experiment.
 
 ### 4.4 When the allocation fails
 
@@ -432,6 +557,13 @@ them panics:
 | `FbError::Unaddressable` / `Unmappable` | the allocation cannot be mapped for the CPU |
 | `FbError::OffsetOutsideSurface` | a byte range outside the surface |
 | `FbError::Gtt(..)` | the page table refused the run (§2.4, §2.5) |
+
+The page table's own refusals are named in `gtt::GttError::describe`, and three
+of them are new with §2.3 and §2.4: `ApertureSizeUnmodelled` (the device reported
+a GGTT size this kernel has no model for, so nothing is allocated),
+`AddressOutsideAperture` (an address at or above the **observed** aperture, even
+when the mapped window covers it) and `ApertureExhausted` (no block of the run
+plus its padding fits on a 256 KiB boundary between the two reserved pages).
 
 The failure path a coordinator sees is the one `screen::decide` already
 implements: the candidate returns `Unavailable::Failed(reason)`, the search
@@ -475,8 +607,11 @@ puts the reason in the boot log while the firmware is still driving the screen.
 
 The call sequence, in order:
 
-1. `gtt = Gtt::map(bar0_physical, bar0_len)` — once the probe knows BAR 0 and its
-   observed length.
+1. `gtt = Gtt::map(bar0_physical, bar0_len, ApertureSize::read(&config, bdf))` —
+   once the probe knows BAR 0, its observed length, and the function it read the
+   `GGMS` field from.  This is the one signature that changed for §2.3, and it
+   is the only change: `Surface::allocate` and `scanout::register` are as they
+   were.
 2. `surface = Surface::allocate(&gtt, width, height, Format::Xrgb8888)` — after
    the mode is chosen; `Arc::new` it for the candidate.
 3. Program the pipe and the plane with `PLANE_SURF = surface.ggtt_address()`
@@ -504,13 +639,13 @@ works, which is the only way a machine without a serial port can report it.
 
 | method | behaviour, and why |
 |---|---|
-| `width` / `height` / `pitch` / `pixel_layout` | the plan's numbers; `pitch` is in **bytes** because that is what the trait says, and `Surface::stride_units()` is the separate value a plane register wants (§6.1) |
+| `width` / `height` / `pitch` / `pixel_layout` | the plan's numbers; `pitch` is in **bytes** because that is what the trait says.  `Surface::stride_units_for_log()` is a log-only number and is named for that: the register's own conversion happens where the register is written (§6.1) |
 | `write_pixel` | encodes the canonical `0x00RRGGBB` in the surface's own layout and writes only its bytes; an out-of-range offset is ignored, because the console clips its own output and a console write must not fault the kernel |
 | `virtual_height` / `yoffset` | one screen tall and zero: this is a single scanout buffer, and pretending to a second page would be a lie a pan would then act on |
 | `len` | the allocation's size, which is what `screen::usable` checks against `pitch * virtual_height` |
 | `read_bytes` / `write_bytes` | range-checked copies into the device-uncached mapping; out of range is `InvalidInput` |
-| `mmap` | `DeviceMmap::Physical` over the same physical range (see §4.3 for the cacheability caveat) |
-| `present` | accepts, does nothing: a linear aperture has no publication step, and the damage tracker and fbdev ABI need one meaning on every backend |
+| `mmap` | `DeviceMmap::Physical` over the same physical range; see §4.3, which now states the real position -- the user's mapping is cacheable, the kernel's is not, and nothing in this backend reconciles them |
+| `present` | accepts, does nothing: a linear aperture has no publication step for a write through the kernel's own uncached mapping, and the damage tracker and fbdev ABI need one meaning on every backend.  It is **not** a publication point for a cacheable userspace mapping (§4.3) |
 | `pan` | **refuses** (`Unsupported`): the visible window is the plane's, not this surface's, and there is no second page.  A caller that believed a pan happened would display the wrong page |
 | `set_blank` | accepts, does nothing: blanking is a pipe/plane write this surface does not own.  The same choice, for the same reason, that `bootfb` documents |
 | `restore_text` | nothing to do: the console's pixels *are* the surface's contents |
@@ -536,13 +671,23 @@ produces a sheared or unstartable image rather than a diagnostic.  `[I915]`:
 
 Reference §11 phase 3.2's own requirement — "make the surface stride a multiple
 of 64 bytes (256 is safest)" — is a consequence of that encoding, and the two
-sections of the reference therefore contradict each other.  This document and
-`fb.rs` follow the code: `Plan::stride()` is bytes for the console,
-`Surface::stride_units()` is the register value, `Plan::of` refuses a stride above
-262 080, and the padding to 256 bytes guarantees divisibility by 64.
+sections of the reference therefore contradict each other.  This document and the
+code follow `[I915]`: `Plan::stride()` is bytes for the console, `Plan::of`
+refuses a stride above 262 080, and the padding to 256 bytes guarantees
+divisibility by 64.
 
-WS-3 owns the `PLANE_STRIDE` write, and the coordinator has been told; this
-section is the record.
+**There is one conversion, and it is where the register is written.**
+`pipe::PlaneProgram`'s `stride_field` is what turns a byte stride into
+`PLANE_STRIDE`'s units, and it is the one that refuses a stride that is not a
+multiple of 64 and one that does not fit the twelve-bit field.  The number
+`fb.rs` exposes is `Plan::stride_units_for_log()` / `Surface::stride_units_for_log()`
+— named for the log because that is all it is, and it can refuse nothing because
+nothing acts on it.  The handoff is pinned by a test rather than by this
+paragraph: `the_plane_register_gets_the_surfaces_stride_in_sixty_four_byte_units`
+in `fb.rs` allocates a real 1920×1080 surface, builds it into the
+`pipe::PlaneSurface` the pipe module takes, and asserts that the value in the
+program's own `PLANE_STRIDE` write is `stride_bytes / 64` (120) — which no test
+or production code did before.
 
 ### 6.2 Nothing else
 
@@ -560,20 +705,21 @@ deliverable rather than an apology.  Each row says what was done about it.
 | # | the gap | where the fact came from instead | what this code does |
 |---|---|---|---|
 | 1 | the GGTT page table entry bit layout | `[I915]` `gt/intel_gtt.h:97,100,152-153`; `gt/intel_ggtt.c:277-286` | implemented and cited in `gtt.rs`; `Pte::is_local_memory` keeps the one dangerous bit visible |
-| 2 | the aperture size (4 GiB) | `[INF]` from the BAR split, `PLANE_SURF[31:12]` and `[I915]`'s own "GGTT size = 4G" comment and clamp | derived from the mapped array's length, capped at 4 GiB |
+| 2 | the aperture size | the device's own configuration header: `GGMS` at `0x50` bits `[7:6]`, `gt/intel_ggtt.c:1107-1121`, `:1228`, `:1238`; `PLANE_SURF[31:12]` and `[I915]`'s "GGTT size = 4G" comment and clamp for the 4 GiB cap | **read**, not inferred: 1, 2 or 4 GiB, bounded on every entry access and every allocation; a zero field refuses allocation by name; an unreadable field keeps the window-derived aperture and says the value is absent (§2.3) |
 | 3 | whether a scanout buffer may live in ordinary system memory | `[I915]` `display/intel_fb_pin.c:105-174` (pins object pages; local-memory migration is discrete-only) | allocated from the kernel's page allocator (§4.1) |
 | 4 | whether a scanout buffer must be inside the mappable aperture (BAR 2) | `[I915]` `display/intel_fb_pin.c:147-156` (`PIN_MAPPABLE` only when `HAS_GMCH`) | no mappable-window restriction; the allocator uses the whole aperture |
-| 5 | whether the display engine snoops the CPU cache for scanout reads | `[I915]` `.has_llc = 1` for this generation and `I915_CACHE_NONE`/`WT` for a scanout object; stage 1 on this machine | device-uncached CPU view, so the answer does not matter (§4.3) |
+| 5 | whether the display engine snoops the CPU cache for scanout reads | `[I915]` `.has_llc = 1` for this generation (`i915_pci.c:316`, `:634-640`) and `I915_CACHE_NONE`/`WT` for a scanout object; stage 1 on this machine for the *kernel's* writes | the kernel's view is device-uncached, so the answer does not matter for it -- but a **userspace** `/dev/fb0` writer gets a cacheable mapping and its pixels do depend on the answer, because no publication point on this backend flushes them (§4.3) |
 | 6 | whether the GTT translate cache must be invalidated before a fresh entry is used | **not stated either way**; `[I915]` invalidates after every update including the first binding; the register is in the GuTG forcewake domain | not invalidated; §3 records what it would take, the fresh-address argument, and the symptom |
 | 7 | the unit of `PLANE_STRIDE` | `[I915]` `display/skl_universal_plane.c:671-697,2782-2785` | 64-byte units; both numbers exposed (§6.1) |
 | 8 | the widest stride the hardware accepts | `[I915]` `display/skl_universal_plane_regs.h:109` (12-bit field) | `Plan::of` refuses above 262 080 bytes |
-| 9 | whether a non-present entry inside a scanout range is legal | `[I915]` fills unused entries with the scratch page (`gt/intel_ggtt.c:485-496`); nothing states what a hole does | the run is fully populated; no holes are created |
+| 9 | whether a non-present entry inside a scanout range is legal | `[I915]` fills unused entries with the scratch page (`gt/intel_ggtt.c:482-496`, `:548-566`); nothing states what a hole does | the run is fully populated and so are the 64 entries after it, so no hole is created anywhere a scanout addresses (§2.4) |
 | 10 | whether aperture address zero is usable for scanout | reference §5.6 and §11 phase 4.3 use zero as "disabled"/"rejected" | never handed out (§2.5) |
-| 11 | whether VT-d on the target requires the 64-PTE padding `[I915]` applies (`intel_scanout_needs_vtd_wa`, `display/intel_display.c:8385-8388`) | `[I915]` applies it when `DISPLAY_VER >= 6 && i915_vtd_activei915` | not implemented; §8 lists it as a candidate cause of a black screen, and the target's VT-d state is unknown |
-| 12 | the observed BAR 0 length and BAR 2 size on this machine | §11 phase 0.4 says to log them | `Gtt::map` refuses a short BAR; the sizes are the coordinator's to log |
+| 11 | whether VT-d on the target requires the 64-PTE padding and 256 KiB alignment `[I915]` applies (`intel_scanout_needs_vtd_wa`, `display/intel_display.c:8385-8388`; `display/intel_fb_pin.c:127-133`) | `[I915]` applies it when `DISPLAY_VER >= 6 && i915_vtd_active(i915)` | **implemented unconditionally**, because this kernel cannot tell whether VT-d is active and a zero page is harmless when it is not (§2.4); whether it is *needed* here is unverified (§8) |
+| 12 | the observed BAR 0 length and BAR 2 size on this machine | §11 phase 0.4 says to log them | `Gtt::map` refuses a short BAR; the sizes are the coordinator's to log.  The `GGMS` field itself is logged by `Gtt::map` and printed by `Gtt::describe` (§2.3) |
 | 13 | whether a scatter-gather surface would scan out | the GGTT is a page table, so it should; no source states it for this part | not implemented; the linear case was the brief's |
 | 14 | the physical size of a 1920×1080 surface | arithmetic; the brief's figure is wrong (§4.2) | asserted in a test: 8 294 400 bytes, 2025 pages |
-| 15 | where the firmware's own scanout sits in the aperture | `[I915]` records that it may be low or high (`display/intel_plane_initial.c:206-221`) | the allocator never overwrites a present entry; a coordinator can log `PLANE_SURFLIVE` at boot for the record |
+| 15 | where the firmware's own scanout sits in the aperture | `[I915]` records that it may be low or high (`display/intel_plane_initial.c:207-209`, `:217-224`) | the allocator never overwrites a present entry; a coordinator can log `PLANE_SURFLIVE` at boot for the record |
+| 16 | whether the top page of the GGTT may be used by anything of this kernel's | `[I915]` reserves it for prefetch (`gt/intel_ggtt.c:815-826`, `:906-907`), puts the GuC's reserve in the same bytes (`:768-799`) and records a GOP framebuffer there (`display/intel_plane_initial.c:207-209`) | reserved by name and never handed out; **not** written, because a firmware entry may still be live there, and the 18 MiB GuC reserve is not claimed by a kernel that does not use the GuC (§2.4) |
 
 ## 8. What is not verified, and how to verify it on the machine
 
@@ -588,16 +734,34 @@ Nothing in this workstream has run on hardware.  Specifically, **unverified**:
    engine (they are visible through the *firmware's* entries today, which is
    suggestive and not the same test);
 5. that a fresh entry needs no translate-cache invalidate (§3.3);
-6. that `/dev/fb0`'s cacheable userspace mapping and the kernel's uncached view
-   do not visibly disagree under a raw-writing client (§4.3);
-7. the host tests themselves prove nothing about device memory: they exercise
+6. that a **userspace** `/dev/fb0` writer's cacheable mapping is visible to the
+   display engine at all: no publication point on this backend flushes it, so
+   the pixels depend on the engine snooping the LLC (§4.3).  This is the one
+   item on this list whose failure mode is a *stale* picture rather than a dark
+   one, and it is read with a raw writer (write a known pattern through the
+   mapping, then read the same pixels back through the console);
+7. that the `GGMS` field on this machine names the aperture this kernel models.
+   If the field reads zero, `map_linear` refuses every allocation by name and
+   the firmware console keeps the screen -- a boot that logs
+   `ApertureSizeUnmodelled` and no Intel surface is this check failing, not a
+   regression;
+8. that the 256 KiB alignment and the 64 entries of zero page after the run are
+   *needed* here (VT-d may be off, in which case they cost aperture and change
+   nothing) or *sufficient* (if VT-d is on and the padding is the wrong length,
+   the symptom is the `DMAR` fault `[I915]` cites, which this kernel cannot
+   read without an IOMMU driver);
+9. that the firmware has left the top page of the aperture absent or live.  The
+   kernel does not write it either way, so this reading changes nothing about
+   the code; it is recorded by reading the entry before any allocation;
+10. the host tests themselves prove nothing about device memory: they exercise
    the volatile access path over ordinary memory and the allocator over a mock
    page table, in a 32 MiB host page arena.  What they do prove is listed in §9.
 
-The five readings that would settle the most, in the order they become possible:
+The readings that would settle the most, in the order they become possible:
 
 | reading | what it settles |
 |---|---|
+| the `GGMS` word at PCI config `0x50` (the kernel logs it at `Gtt::map`) | gap 2: whether the aperture is 1, 2 or 4 GiB, and whether this kernel will hand out a single address on this machine |
 | PCI config space BAR 0 and BAR 2 lengths (§11 phase 0.4) | gap 12, and whether `Gtt::map` will refuse on this machine |
 | `GSMBASE` (`0x108100`, bits `[63:20]`) | where the firmware's page table really is, and a cross-check on the BAR window |
 | `PLANE_SURF` / `PLANE_SURFLIVE` for the live plane, **before** this driver writes anything | where the firmware put its surface: if that address is above the mappable end, gaps 3 and 4 are answered on this machine for good |
@@ -606,28 +770,37 @@ The five readings that would settle the most, in the order they become possible:
 
 ## 9. Test inventory
 
-`drm::intel` host tests: **208 pass** (168 before this workstream; 40 added by
-it), run with the invocation in the workstream brief (`--tests`, the percpu
-linker script, the linker wrapper, `env -u` for the product build flags), in
-0.04 s of test time after the build.  The repository's whole host suite --
-`python3 tools/thekernel.py test --suite host`, the `host` stage of the daily
-verification tier -- also passes at this branch's tip: 2163 kernel tests with 0
-failures, 1955 filtered out of the `drm::intel`-filtered run plus these 208,
-and every component host suite and python unit test ahead of it.  Every commit
-on the branch was checked with `cargo check --tests` against its own contents.
+`drm::intel` host tests at this branch's tip: **385 run, 381 pass**, with the
+invocation in the workstream brief (`--tests`, the percpu linker script, the
+linker wrapper, `env -u` for the product build flags, `--test-threads=1`), in
+0.5 s of test time after the build.  The whole kernel test binary, unfiltered,
+is **2340 run, 2336 pass**.
+
+The four failures are the same four `modeset` tests in both runs, and they are
+not this workstream's: at the base commit `18b4bd18`, `modeset.rs` still refers
+to the `pipe.rs` API that `14e49ffe` replaced (`SurfaceCheck::NotArmed`,
+`Vec<ScanlineSample>` where `line_rate` wants `&[u32]`), so the **library does
+not compile** and the test binary cannot be built at all until the modeset fix
+lands.  The numbers above come from a run with a local, uncommitted three-line
+patch that only makes that base tree compile
+(`/home/ava/.cache/thekernel-targets/intel-scanout-fix/local-modeset-compile-hack.diff`);
+nothing in this workstream's commits touches `modeset.rs`, and with that patch
+the four tests fail on the verdict they were already failing on before these
+changes.  **This is the one number in this document that is not reproducible
+from the branch alone**, and it is recorded rather than smoothed over.
 
 The product configuration compiles and lints as well:
 `python3 tools/thekernel.py lint --platform n305` (the n305 profile, clippy with
 `clippy::correctness` and `clippy::suspicious` denied) exits 0, and that is what
 compiles the `#[cfg(target_os = "none")]` half of these modules -- the BAR
-mapping and the device-uncached CPU view, neither of which a host test can
-reach.
+mapping, the GGMS read, the zero page's physical address and the device-uncached
+CPU view, none of which a host test can reach.
 
 | module | tests | what they pin down |
 |---|---:|---|
-| `fb` | 11 | the 1920×1080 layout (stride 7680 = 120 units, 8 294 400 bytes, 2025 pages), stride padding to 256, the stride and size refusals, an empty extent, every error describing itself, allocation alignment/presence/blackness, `len >= pitch * virtual_height` for both an exact and a padded geometry, byte-range refusals including a wrapping offset, an allocation the allocator cannot satisfy, and a page table that refuses the run |
-| `gtt` | 18 | the PTE round trip, the bits the vendor encoder leaves clear (including local memory being reported rather than masked), address refusals (zero, unaligned, too wide), a run written present and in order, page rounding of a partial length, non-overlapping successive mappings, **a present entry never being overwritten**, a run restarting below an occupied page rather than straddling it, exhaustion as an error rather than a wrap, a dropped write caught by the read-back, validation before any write, every error describing itself, a short window refused, an address outside the table refused, the aperture following the table, and the reserved first page, a BAR too short to hold the array (2 MiB, the length i915 under-maps to), and a zero-length run |
-| `scanout` | 11 | the console geometry check selecting the candidate, a pixel written and read back in the layout the engine reads, `pitch / 64` as the register value, `present` accepted and `pan` refused, the no-op methods, out-of-range console writes refused, the physical mmap range, `register` publishing what the candidate hands over, **a `NotScanning` verdict leaving the firmware console alone with the reason in the log**, and a `SURFLIVE` mismatch refused with both addresses named |
+| `fb` | 13 | the 1920×1080 layout (stride 7680 = 120 units, 8 294 400 bytes, 2025 pages), stride padding to 256, the stride and size refusals, an empty extent, every error describing itself, allocation alignment (page **and** 256 KiB)/presence/blackness, **the handoff into the pipe module: a real surface's `stride_bytes / 64` is the value in the program's own `PLANE_STRIDE` write**, **the 64 padding entries after a surface naming the zero page and not the surface**, `len >= pitch * virtual_height` for both an exact and a padded geometry, byte-range refusals including a wrapping offset, an allocation the allocator cannot satisfy, and a page table that refuses the run |
+| `gtt` | 28 | the PTE round trip, the bits the vendor encoder leaves clear (including local memory being reported rather than masked), address refusals (zero, unaligned, too wide), a run written present and in order, page rounding of a partial length, non-overlapping successive mappings, **a present entry never being overwritten**, a run restarting below an occupied page rather than straddling it, exhaustion as an error rather than a wrap, a dropped write caught by the read-back, validation before any write, every error describing itself, a short window refused, an address outside the table refused, a BAR too short to hold the array (2 MiB, the length i915 under-maps to), a zero-length run, and — new with §2.3 and §2.4 — **all four values of the `GGMS` field decoded**, **the field read through `ConfigSpace` (including a bus that does not answer)**, **the observed aperture bounding `entry`, `plan` and the allocator below an 8 MiB window**, **an unmodelled field refusing allocation by name with nothing written**, **an unobserved field keeping the window aperture**, **the padding bound into the entries after a run and refusing to overwrite a live one**, **the top page reserved and not written**, and **the report carrying both numbers and the observation** |
+| `scanout` | 12 | the console geometry check selecting the candidate, a pixel written and read back in the layout the engine reads, `pitch / 64` as the register value, `present` accepted and `pan` refused, the no-op methods, out-of-range console writes refused, the physical mmap range, `register` publishing what the candidate hands over, **a replaced offer being retired rather than freed** (a `Weak` reference proves the pages are still owned), **a `NotScanning` verdict being refused with the reason in the log while the search continues**, and a `SURFLIVE` mismatch refused with both addresses named |
 
 What these tests are worth is bounded and stated: they drive the module's own
 logic over ordinary memory and a mock page table.  They cannot show that a real
