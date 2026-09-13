@@ -609,7 +609,19 @@ The five readings that would settle the most, in the order they become possible:
 `drm::intel` host tests: **208 pass** (168 before this workstream; 40 added by
 it), run with the invocation in the workstream brief (`--tests`, the percpu
 linker script, the linker wrapper, `env -u` for the product build flags), in
-0.04 s of test time after the build.
+0.04 s of test time after the build.  The repository's whole host suite --
+`python3 tools/thekernel.py test --suite host`, the `host` stage of the daily
+verification tier -- also passes at this branch's tip: 2163 kernel tests with 0
+failures, 1955 filtered out of the `drm::intel`-filtered run plus these 208,
+and every component host suite and python unit test ahead of it.  Every commit
+on the branch was checked with `cargo check --tests` against its own contents.
+
+The product configuration compiles and lints as well:
+`python3 tools/thekernel.py lint --platform n305` (the n305 profile, clippy with
+`clippy::correctness` and `clippy::suspicious` denied) exits 0, and that is what
+compiles the `#[cfg(target_os = "none")]` half of these modules -- the BAR
+mapping and the device-uncached CPU view, neither of which a host test can
+reach.
 
 | module | tests | what they pin down |
 |---|---:|---|
