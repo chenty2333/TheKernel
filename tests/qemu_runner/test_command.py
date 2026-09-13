@@ -19,12 +19,26 @@ class GraphicsProfileTableTests(unittest.TestCase):
             "interactive",
             "virgl-headless",
             "virgl-interactive",
+            "firmware-fb",
             "venus-interactive",
         ))
+        # Every profile must name a display adapter this runner knows how to
+        # build.  The set is listed explicitly rather than checked with a
+        # `virtio-gpu` prefix, because firmware-fb deliberately drives a
+        # VGA-compatible adapter: it exists to exercise the kernel's boot
+        # framebuffer path, and only a firmware-programmed surface can do
+        # that.  An explicit set still catches a misspelled device, which is
+        # what the prefix check was there for.
+        known_devices = frozenset({
+            "virtio-gpu-pci",
+            "virtio-gpu-gl-pci",
+            "virtio-gpu-gl-pci,blob=on,venus=on,hostmem=1G,max_hostmem=1G",
+            "bochs-display",
+        })
         for name, topology in GRAPHICS_PROFILES.items():
             with self.subTest(profile=name):
                 self.assertTrue(topology.display)
-                self.assertTrue(topology.device.startswith("virtio-gpu"))
+                self.assertIn(topology.device, known_devices)
                 self.assertIn(topology.renderer, (None, "software", "virgl", "venus"))
 
     def test_benchmark_profiles_are_exactly_the_renderer_backed_profiles(self) -> None:
@@ -45,6 +59,13 @@ class GraphicsProfileTableTests(unittest.TestCase):
             "virtio-gpu-gl-pci,blob=on,venus=on,hostmem=1G,"
             "max_hostmem=1G,max_outputs=1,xres=3840,yres=2160",
         )
+
+    def test_graphics_device_omits_scanout_properties_for_a_vga_adapter(self) -> None:
+        # A VGA-compatible adapter synthesises its mode from its own video
+        # memory and rejects max_outputs/xres/yres, so appending them would
+        # make QEMU refuse to start rather than simply ignore them.
+        self.assertEqual(graphics_device("firmware-fb", 800, 600), "bochs-display")
+        self.assertFalse(GRAPHICS_PROFILES["firmware-fb"].scanout_properties)
 
 
 class CommandTests(unittest.TestCase):
