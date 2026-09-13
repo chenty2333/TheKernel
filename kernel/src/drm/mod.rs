@@ -14,6 +14,7 @@ mod gem;
 pub(crate) mod intel;
 mod ioctl;
 mod kms;
+pub mod modes;
 mod property;
 mod render;
 mod syncobj;
