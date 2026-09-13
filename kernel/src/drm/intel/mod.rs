@@ -20,15 +20,18 @@
 //! | [`probe`] | the walk, the identity decision, the register reads, and the report |
 //! | [`debugfs`] | the report, exposed as a file in the DRM debug filesystem |
 //!
-//! The modeset's memory half is a second group, implemented and tested but not
-//! yet called from the boot path -- the pipe and the plane that scan these
-//! surfaces out are another workstream's:
+//! The modeset is a second group: the memory it scans out of, the output it
+//! scans through, and the sequence that ties them together.  The design is
+//! `docs/design/intel-modeset.md`.
 //!
 //! | module | what it owns |
 //! |---|---|
 //! | [`gtt`] | the GGTT page table: the entry layout, a run of entries for a physical range, and the read-back that proves the run landed |
 //! | [`fb`] | a framebuffer the display engine can read: geometry, the allocation, and the failure path |
 //! | [`scanout`] | that framebuffer as the console's [`crate::pseudofs::dev::scanout::ScanoutSurface`], offered to [`crate::drm::screen`] |
+//! | [`output`] | reference section 11 phase 5: the port PLL, the DDI, the transcoder, and the read-backs that say the DDI is alive |
+//! | [`pattern`] | section 11 phase 6.5: the colour-bar test pattern written into a linear XRGB8888 framebuffer |
+//! | [`modeset`] | section 11 phases 3 to 6 in one sequence: the mode choice, the pipe, the output, and the proof that the result is scanning out |
 //!
 //! ## What it proves, and what it does not
 //!
@@ -68,6 +71,7 @@ mod gmbus;
 pub(crate) mod gtt;
 mod hpd;
 mod id;
+mod modeset;
 mod output;
 mod pattern;
 mod pci;
