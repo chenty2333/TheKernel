@@ -454,6 +454,14 @@ fn interpret(register: Register, value: u64) -> String {
                 )
             }
         }
+        // The registers of the DDC/EDID transport, the hotplug block and the
+        // power wells are named here so that a register table can declare
+        // them, but the probe does not read any of them: what they mean
+        // depends on a transaction or on a request this report knows nothing
+        // about.  `gmbus` and `hpd` interpret them where they are used, and
+        // this arm deliberately says nothing rather than saying something
+        // shallow about a value the probe never asked for.
+        Meaning::BusController | Meaning::Hotplug | Meaning::PowerWell => String::new(),
     }
 }
 
