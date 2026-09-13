@@ -420,12 +420,18 @@ impl LinkRate {
 /// two PRMs disagree about them for the same nominal level: they are
 /// board-tuned.
 ///
-/// The *shape* is the reference's.  §8.5's write sequence programs
-/// `PORT_TX_DW2`, `PORT_TX_DW4`, `PORT_TX_DW5` and `PORT_TX_DW7` from one table
-/// entry, with `PORT_TX_DW4` written **per lane** (step 2: "NOT group access --
-/// each lane differs") and `PORT_TX_DW5`'s TX-training-enable bit toggled off
-/// and back on around the batch (steps 4 and 6) -- that last write is what
-/// commits the settings.
+/// The *shape* is the reference's, as i915 implements it.  §8.5's write
+/// sequence programs `PORT_TX_DW2`, `PORT_TX_DW4`, `PORT_TX_DW5` and
+/// `PORT_TX_DW7` from one table entry, with `PORT_TX_DW2`, `PORT_TX_DW4` and
+/// `PORT_TX_DW7` written **per lane** and `PORT_TX_DW5` written to the group
+/// register.  For `DW4` §8.5 step 2 says so in capitals ("NOT group access --
+/// each lane differs"); for the other two the evidence is i915, whose
+/// `icl_ddi_combo_vswing_program` runs one read-modify-write per lane for each
+/// of `DW2`, `DW4` and `DW7` (`ln = 0..3`, `[I915]` `display/intel_ddi.c:1148-1178`)
+/// and reads `PORT_TX_DW5` from lane 0 to write the group
+/// (`[I915]` `display/intel_ddi.c:1141-1146`, `:1218-1229`).  `DW5`'s
+/// TX-training-enable bit is toggled off and back on around the batch (steps 4
+/// and 6) -- that last write is what commits the settings.
 ///
 /// The two `DW5` states are separate fields rather than a value plus a bit
 /// because §8.5 names the register's `TX Training Enable` and `Scaling Mode
@@ -437,8 +443,12 @@ pub(crate) struct SwingProgram {
     /// The level index, written to `DDI_BUF_CTL.BUF_TRANS_SELECT[27:24]` and
     /// (in i915's table) the index of the entry these values came from.
     pub(crate) level: u8,
-    /// `PORT_TX_DW2` (group): the swing select.
-    pub(crate) dw2: u32,
+    /// `PORT_TX_DW2`, one value per lane, written in lane order 0 to 3.  i915
+    /// takes the level per lane (`intel_ddi_level(encoder, crtc_state, ln)`) and
+    /// writes the lane instance for each
+    /// (`[I915]` `display/intel_ddi.c:1148-1157`); the group instance is a
+    /// different address and this sequence does not write it.
+    pub(crate) dw2: [u32; 4],
     /// `PORT_TX_DW4`, one value per lane, written in lane order 0 to 3.  §8.5
     /// step 2: the loadgen select differs per lane, so the group register must
     /// not be used.
@@ -448,8 +458,10 @@ pub(crate) struct SwingProgram {
     /// `PORT_TX_DW5` with the scaling mode set and TX training enabled, which
     /// is step 6's state and the write that triggers the update.
     pub(crate) dw5_training_enabled: u32,
-    /// `PORT_TX_DW7` (group): the N scalar.
-    pub(crate) dw7: u32,
+    /// `PORT_TX_DW7`, one value per lane, written in lane order 0 to 3.  i915
+    /// writes the lane instances here too
+    /// (`[I915]` `display/intel_ddi.c:1171-1178`).
+    pub(crate) dw7: [u32; 4],
     /// Where these numbers came from.  Free text, printed in the log; §8.5's
     /// values are a `[GAP]`, so a reader has to be able to see what was used
     /// instead.
@@ -533,14 +545,22 @@ struct PortRegisters {
     cl_dw5: Register,
     /// `PORT_CL_DW10`: `PWR_DOWN_LN_MASK`.
     cl_dw10: Register,
-    /// `PORT_TX_DW2` (group): the swing select.
+    /// `PORT_TX_DW2` (**group** instance): the swing select as §8.2's worked
+    /// example tabulates it.  The sequence writes the per-lane instances
+    /// instead -- see [`TxLaneRegisters`] -- so this entry is the port's
+    /// inventory of the register rather than a write target.
     tx_dw2: Register,
     /// `PORT_TX_DW4`, one per lane.  No group instance: §8.5 says group access
-    /// must not be used for this register.
+    /// must not be used for this register.  The sequence reads these through
+    /// [`TxLaneRegisters`], beside the other two per-lane dwords.
     tx_dw4: [Register; 4],
-    /// `PORT_TX_DW5` (group): the training-enable and scaling-mode register.
+    /// `PORT_TX_DW5` (group): the training-enable and scaling-mode register,
+    /// and the instance both batch writes go to
+    /// (`[I915]` `display/intel_ddi.c:1146`, `:1221`, `:1229`).
     tx_dw5: Register,
-    /// `PORT_TX_DW7` (group): the N scalar.
+    /// `PORT_TX_DW7` (**group** instance): the N scalar as §8.2's worked example
+    /// tabulates it.  See [`Self::tx_dw2`] -- the sequence writes the per-lane
+    /// instances.
     tx_dw7: Register,
     /// `DDI_BUF_CTL` for this port.
     ddi_buf_ctl: Register,
@@ -590,6 +610,81 @@ const fn port_registers(phy: ComboPhy) -> PortRegisters {
             tx_dw5: port::PORT_TX_DW5_GRP_B,
             tx_dw7: port::PORT_TX_DW7_GRP_B,
             ddi_buf_ctl: ddi::DDI_BUF_CTL_B,
+        },
+    }
+}
+
+/// The three `PORT_TX_*` dwords §8.5's batch writes once per lane.
+///
+/// A TX dword has three instances -- AUX (`+0x380`), group (`+0x680`) and one
+/// per lane (`0x880 + ln*0x100`) -- and they are three addresses, not three
+/// names for one (`[I915]` `display/intel_combo_phy_regs.h:96-105`).  i915's
+/// DDI voltage-swing sequence writes exactly these three dwords to the lane
+/// instances, one read-modify-write per lane in lane order, and leaves the
+/// group instances of `DW2` and `DW7` alone
+/// (`[I915]` `display/intel_ddi.c:1148-1178`); `DW5` is the exception, read
+/// from lane 0 and written to the group on both sides of the batch
+/// (`[I915]` `display/intel_ddi.c:1218-1229`), so it has no entry here.
+///
+/// The registers come from `regs/port.rs` one named constant at a time rather
+/// than by arithmetic on a base, so a dump of this machine can be compared with
+/// the log by name.
+#[derive(Clone, Copy, Debug)]
+struct TxLaneRegisters {
+    /// `PORT_TX_DW2`, one register per lane, in lane order.
+    dw2: [Register; 4],
+    /// `PORT_TX_DW4`, one register per lane, in lane order.
+    dw4: [Register; 4],
+    /// `PORT_TX_DW7`, one register per lane, in lane order.
+    dw7: [Register; 4],
+}
+
+/// The per-lane TX registers of one combo PHY.
+///
+/// §8.2's lane rule is `0x880 + ln*0x100` with the dword at `+4*dw`; every
+/// offset below is the register table's declaration of that instance, whose own
+/// doc comment carries the arithmetic and the citation.
+const fn tx_lane_registers(phy: ComboPhy) -> TxLaneRegisters {
+    match phy {
+        ComboPhy::A => TxLaneRegisters {
+            dw2: [
+                port::PORT_TX_DW2_LN0_A,
+                port::PORT_TX_DW2_LN1_A,
+                port::PORT_TX_DW2_LN2_A,
+                port::PORT_TX_DW2_LN3_A,
+            ],
+            dw4: [
+                port::PORT_TX_DW4_LN0_A,
+                port::PORT_TX_DW4_LN1_A,
+                port::PORT_TX_DW4_LN2_A,
+                port::PORT_TX_DW4_LN3_A,
+            ],
+            dw7: [
+                port::PORT_TX_DW7_LN0_A,
+                port::PORT_TX_DW7_LN1_A,
+                port::PORT_TX_DW7_LN2_A,
+                port::PORT_TX_DW7_LN3_A,
+            ],
+        },
+        ComboPhy::B => TxLaneRegisters {
+            dw2: [
+                port::PORT_TX_DW2_LN0_B,
+                port::PORT_TX_DW2_LN1_B,
+                port::PORT_TX_DW2_LN2_B,
+                port::PORT_TX_DW2_LN3_B,
+            ],
+            dw4: [
+                port::PORT_TX_DW4_LN0_B,
+                port::PORT_TX_DW4_LN1_B,
+                port::PORT_TX_DW4_LN2_B,
+                port::PORT_TX_DW4_LN3_B,
+            ],
+            dw7: [
+                port::PORT_TX_DW7_LN0_B,
+                port::PORT_TX_DW7_LN1_B,
+                port::PORT_TX_DW7_LN2_B,
+                port::PORT_TX_DW7_LN3_B,
+            ],
         },
     }
 }
@@ -853,8 +948,8 @@ impl OutputProgram {
             self.dpclka_select, self.dpclka_clock_off,
         ));
         out.push_str(&format!(
-            "intel-output: voltage-swing level {} from {} ({}) , DW2 {:#010x}, DW4 per lane \
-             {:#010x?}, DW7 {:#010x}; {} lane(s) -> PWR_DOWN_LN_MASK field {:#x}\n",
+            "intel-output: voltage-swing level {} from {} ({}) , DW2 per lane {:#010x?}, DW4 per \
+             lane {:#010x?}, DW7 per lane {:#010x?}; {} lane(s) -> PWR_DOWN_LN_MASK field {:#x}\n",
             self.swing.level,
             self.swing.source,
             match self.port_type.buffer_translation_table() {
@@ -1087,16 +1182,29 @@ pub(crate) fn program(
     let ddi_io_well = power::enable_well(regs, ddi_io_well(phy))?;
 
     // 5.3 -- §8.5's voltage-swing sequence: step 3's SUS clock config, steps 4
-    // to 6's register batch.  `PORT_TX_DW4` is written per lane and never as a
-    // group (§8.5 step 2), and the second `PORT_TX_DW5` write is step 6's
-    // training-enable, which is what commits the settings.
+    // to 6's register batch.  `PORT_TX_DW2`, `PORT_TX_DW4` and `PORT_TX_DW7` are
+    // written to the **per-lane** instances, once each in lane order, and never
+    // to the group instance: §8.5 step 2 demands that for `DW4` ("NOT group
+    // access -- each lane differs"), and i915's `icl_ddi_combo_vswing_program`
+    // does the same for all three dwords, one read-modify-write per lane over
+    // `ln = 0..3` (`[I915]` `display/intel_ddi.c:1148-1178`; the `DW4` loop's
+    // own comment is that a group write "would overwrite individual loadgen",
+    // `:1160`).  `PORT_TX_DW5` is the group register on both sides of that
+    // batch -- i915 reads lane 0 and writes the group each time
+    // (`[I915]` `display/intel_ddi.c:1141-1146`, `:1218-1229`) -- and the second
+    // write is step 6's training-enable, which is what commits the settings.
+    let lanes = tx_lane_registers(phy);
     rmw(regs, registers.cl_dw5, 0, CL_DW5_SUS_CLOCK_CONFIG_MASK)?;
     write(regs, registers.tx_dw5, plan.swing.dw5_training_disabled)?;
-    write(regs, registers.tx_dw2, plan.swing.dw2)?;
-    for (register, value) in registers.tx_dw4.iter().zip(plan.swing.dw4) {
+    for (register, value) in lanes.dw2.iter().zip(plan.swing.dw2) {
         write(regs, *register, value)?;
     }
-    write(regs, registers.tx_dw7, plan.swing.dw7)?;
+    for (register, value) in lanes.dw4.iter().zip(plan.swing.dw4) {
+        write(regs, *register, value)?;
+    }
+    for (register, value) in lanes.dw7.iter().zip(plan.swing.dw7) {
+        write(regs, *register, value)?;
+    }
     write(regs, registers.tx_dw5, plan.swing.dw5_training_enabled)?;
 
     // §8.6 step 7 -- power the lanes.  A read-modify-write so that whatever

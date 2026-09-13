@@ -29,15 +29,82 @@ pub(crate) const PORT_CL_DW10_B: Register =
 /// The TX block's swing-select register, written with the buffer translation
 /// table's `dw2_swing_sel` value during the voltage-swing sequence of section
 /// 8.5 that section 11 phase 5.3 runs before the lanes come up.
+///
+/// **Both instances are declared, because they are two addresses.**
+/// `PORT_TX_DW2` exists in an AUX (`+0x380`), a group (`+0x680`) and a per-lane
+/// (`0x880 + ln*0x100`) instance (`[I915]` `display/intel_combo_phy_regs.h:96-105`,
+/// `:107-109`), and i915's DDI voltage-swing sequence writes the *per-lane*
+/// ones -- one masked read-modify-write per lane
+/// (`[I915]` `display/intel_ddi.c:1148-1157`).  The group instance is the one
+/// section 8.2's worked example tabulates and the one this table's offsets were
+/// derived from; it is not where a DDI's swing lands.
 pub(crate) const PORT_TX_DW2_GRP_A: Register =
     Register::read_write("PORT_TX_DW2_GRP(A)", 0x16_2688, Meaning::BringUp, None);
 
 /// `PORT_TX_DW2` (combo PHY B, group instance), reference section 8.2.
 ///
 /// PHY B's swing-select register: the same buffer-translation `dw2_swing_sel`
-/// value as PHY A's, at PHY B's own `+0x680` TX group.
+/// value as PHY A's, at PHY B's own `+0x680` TX group.  See
+/// [`PORT_TX_DW2_GRP_A`] for why both the group and the per-lane instances are
+/// declared.
 pub(crate) const PORT_TX_DW2_GRP_B: Register =
     Register::read_write("PORT_TX_DW2_GRP(B)", 0x6_c688, Meaning::BringUp, None);
+
+/// `PORT_TX_DW2`, lane 0 of combo PHY A, reference section 8.2.
+///
+/// Lane 0's swing select, and the register i915's DDI voltage-swing sequence
+/// actually writes: one read-modify-write per lane, masked to
+/// `SWING_SEL_UPPER`/`SWING_SEL_LOWER`/`RCOMP_SCALAR`
+/// (`[I915]` `display/intel_ddi.c:1148-1157`).  Section 8.2 states the lane base
+/// `0x880 + ln*0x100` and works no example past lane 0; `DW2` adds `0x8`.
+pub(crate) const PORT_TX_DW2_LN0_A: Register =
+    Register::read_write("PORT_TX_DW2_LN0(A)", 0x16_2888, Meaning::BringUp, None);
+
+/// `PORT_TX_DW2`, lane 1 of combo PHY A, reference section 8.2.
+///
+/// Lane 1's swing select, at the same `+0x100` lane stride as lane 0.  i915
+/// takes the level per lane (`intel_ddi_level(encoder, crtc_state, ln)`) even
+/// though one table entry usually serves all four, which is why the write is a
+/// loop over the lane instances rather than one group write.
+pub(crate) const PORT_TX_DW2_LN1_A: Register =
+    Register::read_write("PORT_TX_DW2_LN1(A)", 0x16_2988, Meaning::BringUp, None);
+
+/// `PORT_TX_DW2`, lane 2 of combo PHY A, reference section 8.2.
+///
+/// Lane 2's swing select, written per lane for the same reason as lanes 0 and 1.
+pub(crate) const PORT_TX_DW2_LN2_A: Register =
+    Register::read_write("PORT_TX_DW2_LN2(A)", 0x16_2a88, Meaning::BringUp, None);
+
+/// `PORT_TX_DW2`, lane 3 of combo PHY A, reference section 8.2.
+///
+/// Lane 3's swing select; the last of the four instances the sequence writes.
+pub(crate) const PORT_TX_DW2_LN3_A: Register =
+    Register::read_write("PORT_TX_DW2_LN3(A)", 0x16_2b88, Meaning::BringUp, None);
+
+/// `PORT_TX_DW2`, lane 0 of combo PHY B, reference section 8.2.
+///
+/// Lane 0's swing select on the second combo PHY, at PHY B's own lane base
+/// `0x06c880 + ln*0x100`; written per lane exactly as PHY A's are.
+pub(crate) const PORT_TX_DW2_LN0_B: Register =
+    Register::read_write("PORT_TX_DW2_LN0(B)", 0x6_c888, Meaning::BringUp, None);
+
+/// `PORT_TX_DW2`, lane 1 of combo PHY B, reference section 8.2.
+///
+/// Lane 1's swing select on combo PHY B.
+pub(crate) const PORT_TX_DW2_LN1_B: Register =
+    Register::read_write("PORT_TX_DW2_LN1(B)", 0x6_c988, Meaning::BringUp, None);
+
+/// `PORT_TX_DW2`, lane 2 of combo PHY B, reference section 8.2.
+///
+/// Lane 2's swing select on combo PHY B.
+pub(crate) const PORT_TX_DW2_LN2_B: Register =
+    Register::read_write("PORT_TX_DW2_LN2(B)", 0x6_ca88, Meaning::BringUp, None);
+
+/// `PORT_TX_DW2`, lane 3 of combo PHY B, reference section 8.2.
+///
+/// Lane 3's swing select on combo PHY B, the last of PHY B's four.
+pub(crate) const PORT_TX_DW2_LN3_B: Register =
+    Register::read_write("PORT_TX_DW2_LN3(B)", 0x6_cb88, Meaning::BringUp, None);
 
 /// `PORT_TX_DW4`, lane 0 of combo PHY A, reference section 8.5.
 ///
@@ -103,21 +170,49 @@ pub(crate) const PORT_TX_DW4_LN3_B: Register =
 /// steps 4 to 6 clear TX training enable, set the scaling mode, write the table
 /// values, then set training enable again -- that last write is what commits
 /// the swing and pre-emphasis settings.
+///
+/// The group instance is the one written and lane 0 the one read: i915 reads
+/// `ICL_PORT_TX_DW5_LN(0, phy)` before each of the two writes and writes
+/// `ICL_PORT_TX_DW5_GRP(phy)` both times
+/// (`[I915]` `display/intel_ddi.c:1218-1229`, and the same pair inside the
+/// batch at `:1141-1146`).  Both instances are declared for that reason.
 pub(crate) const PORT_TX_DW5_GRP_A: Register =
     Register::read_write("PORT_TX_DW5_GRP(A)", 0x16_2694, Meaning::BringUp, None);
 
 /// `PORT_TX_DW5` (combo PHY B, group instance), reference section 8.2.
 ///
 /// PHY B's training-enable and scaling-mode register, written by the same
-/// sequence as PHY A's when PHY B's port is programmed.
+/// sequence as PHY A's when PHY B's port is programmed.  See
+/// [`PORT_TX_DW5_GRP_A`] for the read-lane-0/write-group pair.
 pub(crate) const PORT_TX_DW5_GRP_B: Register =
     Register::read_write("PORT_TX_DW5_GRP(B)", 0x6_c694, Meaning::BringUp, None);
+
+/// `PORT_TX_DW5`, lane 0 of combo PHY A, reference section 8.2.
+///
+/// The copy i915 reads: a group write is how the register is programmed, but
+/// the value that gets modified is read from lane 0
+/// (`[I915]` `display/intel_ddi.c:1141`, `:1218`, `:1226`).  Only lane 0 is
+/// declared -- no sequence in the named sections touches `DW5` on lanes 1-3.
+pub(crate) const PORT_TX_DW5_LN0_A: Register =
+    Register::read_write("PORT_TX_DW5_LN0(A)", 0x16_2894, Meaning::BringUp, None);
+
+/// `PORT_TX_DW5`, lane 0 of combo PHY B, reference section 8.2.
+///
+/// PHY B's lane-0 copy, read for the same reason as PHY A's.
+pub(crate) const PORT_TX_DW5_LN0_B: Register =
+    Register::read_write("PORT_TX_DW5_LN0(B)", 0x6_c894, Meaning::BringUp, None);
 
 /// `PORT_TX_DW7` (combo PHY A, group instance), reference section 8.2.
 ///
 /// The TX block's N-scalar register, written with the buffer translation
 /// table's `dw7_n_scalar` value as part of the section 8.5 voltage-swing
 /// sequence.
+///
+/// **Both instances are declared, because they are two addresses.** i915's DDI
+/// voltage-swing sequence writes `DW7` per lane, masked to `N_SCALAR`
+/// (`[I915]` `display/intel_ddi.c:1171-1178`), as it does `DW2`; the group
+/// instance is the offset section 8.2's worked example tabulates.  See
+/// [`PORT_TX_DW2_GRP_A`].
 pub(crate) const PORT_TX_DW7_GRP_A: Register =
     Register::read_write("PORT_TX_DW7_GRP(A)", 0x16_269c, Meaning::BringUp, None);
 
@@ -127,6 +222,57 @@ pub(crate) const PORT_TX_DW7_GRP_A: Register =
 /// for a given swing level.
 pub(crate) const PORT_TX_DW7_GRP_B: Register =
     Register::read_write("PORT_TX_DW7_GRP(B)", 0x6_c69c, Meaning::BringUp, None);
+
+/// `PORT_TX_DW7`, lane 0 of combo PHY A, reference section 8.2.
+///
+/// Lane 0's N scalar; `DW7` adds `0x1c` to the lane base section 8.2 states
+/// (`0x880 + ln*0x100`).  i915 writes all four lane instances in a loop
+/// (`[I915]` `display/intel_ddi.c:1171-1178`); this is the one a read of the
+/// firmware's program starts from.
+pub(crate) const PORT_TX_DW7_LN0_A: Register =
+    Register::read_write("PORT_TX_DW7_LN0(A)", 0x16_289c, Meaning::BringUp, None);
+
+/// `PORT_TX_DW7`, lane 1 of combo PHY A, reference section 8.2.
+///
+/// Lane 1's N scalar, at the same `+0x100` lane stride.
+pub(crate) const PORT_TX_DW7_LN1_A: Register =
+    Register::read_write("PORT_TX_DW7_LN1(A)", 0x16_299c, Meaning::BringUp, None);
+
+/// `PORT_TX_DW7`, lane 2 of combo PHY A, reference section 8.2.
+///
+/// Lane 2's N scalar, written per lane for the same reason as lanes 0 and 1.
+pub(crate) const PORT_TX_DW7_LN2_A: Register =
+    Register::read_write("PORT_TX_DW7_LN2(A)", 0x16_2a9c, Meaning::BringUp, None);
+
+/// `PORT_TX_DW7`, lane 3 of combo PHY A, reference section 8.2.
+///
+/// Lane 3's N scalar; the last of the four instances the sequence writes.
+pub(crate) const PORT_TX_DW7_LN3_A: Register =
+    Register::read_write("PORT_TX_DW7_LN3(A)", 0x16_2b9c, Meaning::BringUp, None);
+
+/// `PORT_TX_DW7`, lane 0 of combo PHY B, reference section 8.2.
+///
+/// Lane 0's N scalar on the second combo PHY, at PHY B's own lane base.
+pub(crate) const PORT_TX_DW7_LN0_B: Register =
+    Register::read_write("PORT_TX_DW7_LN0(B)", 0x6_c89c, Meaning::BringUp, None);
+
+/// `PORT_TX_DW7`, lane 1 of combo PHY B, reference section 8.2.
+///
+/// Lane 1's N scalar on combo PHY B.
+pub(crate) const PORT_TX_DW7_LN1_B: Register =
+    Register::read_write("PORT_TX_DW7_LN1(B)", 0x6_c99c, Meaning::BringUp, None);
+
+/// `PORT_TX_DW7`, lane 2 of combo PHY B, reference section 8.2.
+///
+/// Lane 2's N scalar on combo PHY B.
+pub(crate) const PORT_TX_DW7_LN2_B: Register =
+    Register::read_write("PORT_TX_DW7_LN2(B)", 0x6_ca9c, Meaning::BringUp, None);
+
+/// `PORT_TX_DW7`, lane 3 of combo PHY B, reference section 8.2.
+///
+/// Lane 3's N scalar on combo PHY B, the last of PHY B's four.
+pub(crate) const PORT_TX_DW7_LN3_B: Register =
+    Register::read_write("PORT_TX_DW7_LN3(B)", 0x6_cb9c, Meaning::BringUp, None);
 /*
  * Transcription notes
  * ===================
@@ -167,6 +313,19 @@ pub(crate) const PORT_TX_DW7_GRP_B: Register =
  *     0x06ca90/0x06cb90 (B).  The same arithmetic reproduces the `PORT_TX_DW8`
  *     group and lane-0 offsets regs.rs already declares, which is the check
  *     that it is the document's rule and not a guess.
+ *   - `PORT_TX_DW2` and `PORT_TX_DW7` lanes 0-3: the same lane base, with `DW2`
+ *     adding `0x8` and `DW7` adding `0x1c`, giving 0x162888/0x162988/0x162a88/
+ *     0x162b88 and 0x16289c/0x16299c/0x162a9c/0x162b9c (A), minus 0xf6000 for
+ *     B (0x06c888/0x06c988/0x06ca88/0x06cb88 and 0x06c89c/0x06c99c/0x06ca9c/
+ *     0x06cb9c).  These are the instances i915's DDI voltage-swing sequence
+ *     writes ([I915] display/intel_ddi.c:1148-1157, :1171-1178), and i915's own
+ *     macros use the identical arithmetic
+ *     (display/intel_combo_phy_regs.h:96-105).
+ *   - `PORT_TX_DW5` lane 0: the lane base plus `0x14`, giving 0x162894 (A) and
+ *     0x06c894 (B).  Section 8.2 works no `DW5` lane example; the instance is
+ *     declared because i915 reads lane 0 before each of the group writes
+ *     ([I915] display/intel_ddi.c:1141, :1218, :1226, all of them
+ *     `ICL_PORT_TX_DW5_LN(0, phy)`).
  *   - Every PHY B offset: section 8.2 gives the PHY B base 0x06c000 and no
  *     worked PHY B example; section 12.2's PHY B `PORT_COMP_DW0 = 0x06C100`
  *     confirms the base.  PHY B is PHY A minus 0xf6000 throughout.
@@ -181,6 +340,17 @@ pub(crate) const PORT_TX_DW7_GRP_B: Register =
  *     programmed per lane and the paragraph after the sequence says group
  *     access must never be used for it.  Declared the four per-lane instances
  *     and no group instance.
+ *   - `PORT_TX_DW2`/`DW7` instances: section 8.5 step 5 names the dwords
+ *     without naming one of the three instances section 8.2 defines (AUX
+ *     `+0x380`, group `+0x680`, lane `0x880 + ln*0x100`), and the sentence that
+ *     states the per-lane carve-out names `DW4` only.  i915 answers it for the
+ *     DDI path: `DW2` and `DW7` are written per lane in a loop over the four
+ *     lane instances ([I915] display/intel_ddi.c:1148-1157, :1171-1178), while
+ *     `DW5` is read from lane 0 and written to the group (:1141-1146,
+ *     :1218-1229).  Both instances of `DW2` and `DW7` are declared, and each
+ *     entry says which one the sequence uses.  The AUX instances
+ *     ([I915] display/intel_combo_phy_regs.h:107, :119, :130, :148) are not
+ *     declared: no section names them and no sequence here touches them.
  *   - `PORT_TX_DW4`'s contents: section 8.2 calls it the cursor coefficient,
  *     section 8.5 step 2 calls the same register the per-lane loadgen select.
  *     Both are written through it, so the per-lane declaration covers both.
@@ -209,8 +379,10 @@ pub(crate) const PORT_TX_DW7_GRP_B: Register =
  *     not registers, and the document names no register at `PHY_BASE + 0`, so
  *     no constant was invented for them (regs.rs's `ComboPhyRegisters` carries
  *     no base field either).
- *   - `PORT_TX_AUX` (`+0x380`), `PORT_PCS_AUX` (`+0x300`), and PCS/TX lanes 1-3
- *     apart from `PORT_TX_DW4`: no sequence in the named sections names them.
+ *   - `PORT_TX_AUX` (`+0x380`), `PORT_PCS_AUX` (`+0x300`), and PCS lanes 1-3
+ *     together with TX lanes 1-3 of every dword except the
+ *     `PORT_TX_DW2`/`DW4`/`DW7` lanes: no sequence in the named sections names
+ *     them.
  *   - `DDI_BUF_TRANS_LO`/`DDI_BUF_TRANS_HI` (section 8.4: `0x64e00 + i*8` and
  *     `0x64e60 + i*8`, high half at `+4`): section 8.5's write sequence programs
  *     the combo PHY's `PORT_TX_DW2`/`DW4`/`DW5`/`DW7` directly, and no step of

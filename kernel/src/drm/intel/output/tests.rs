@@ -13,7 +13,7 @@ use core::cell::Cell;
 
 use super::*;
 use crate::drm::{
-    intel::regs::mock::MockRegisters,
+    intel::{phy::COMP_INIT, regs::mock::MockRegisters, swing},
     modes::{CTA_VIC_TIMINGS, DMT_TIMINGS},
 };
 
@@ -52,14 +52,18 @@ const STRAP_38_4: u32 = 38_400;
 /// which is why `swing` is a caller field at all.  These numbers exist to give
 /// the sequence something to write so that its order can be asserted; the
 /// `source` string says so, and the log carries it.
+///
+/// `dw2` and `dw7` differ lane by lane on purpose.  The sequence writes them to
+/// four different addresses, and a test whose four values were equal could not
+/// tell that from a group write or from one lane written four times.
 fn test_swing() -> SwingProgram {
     SwingProgram {
         level: 2,
-        dw2: 0x0C,
+        dw2: [0x0C, 0x1C, 0x2C, 0x3C],
         dw4: [0x30, 0x31, 0x31, 0x31],
         dw5_training_disabled: 0x0000_0000,
         dw5_training_enabled: 0x0002_0000,
-        dw7: 0x0071,
+        dw7: [0x71, 0x72, 0x73, 0x74],
         source: "test fixture, not sourced from the reference",
     }
 }
@@ -278,6 +282,11 @@ fn the_plan_log_carries_the_reference_the_dividers_and_the_symbol_rate() {
 
 /// The order §8.6 states, asserted on the write log rather than on the return
 /// value.
+///
+/// The swing batch's shape is i915's: one group `PORT_TX_DW5` write, then
+/// `DW2`, `DW4` and `DW7` once per lane in lane order, then the group `DW5`
+/// write that commits them (`[I915]` `display/intel_ddi.c:1140-1179` and
+/// `:1218-1229`).
 #[test]
 fn the_write_order_is_the_sequence_the_reference_states() {
     let regs = ready_mock();
@@ -298,15 +307,23 @@ fn the_write_order_is_the_sequence_the_reference_states() {
             "ICL_DPCLKA_CFGCR0",
             // §8.6 step 5: the port's DDI-IO power.
             "ICL_PWR_WELL_CTL_DDI2",
-            // 5.3: §8.5's swing sequence, then the lane power.
+            // 5.3: §8.5's swing sequence, then the lane power.  Step 4's group
+            // write first, the three per-lane dwords next, step 6's group write
+            // last.
             "PORT_CL_DW5(A)",
             "PORT_TX_DW5_GRP(A)",
-            "PORT_TX_DW2_GRP(A)",
+            "PORT_TX_DW2_LN0(A)",
+            "PORT_TX_DW2_LN1(A)",
+            "PORT_TX_DW2_LN2(A)",
+            "PORT_TX_DW2_LN3(A)",
             "PORT_TX_DW4_LN0(A)",
             "PORT_TX_DW4_LN1(A)",
             "PORT_TX_DW4_LN2(A)",
             "PORT_TX_DW4_LN3(A)",
-            "PORT_TX_DW7_GRP(A)",
+            "PORT_TX_DW7_LN0(A)",
+            "PORT_TX_DW7_LN1(A)",
+            "PORT_TX_DW7_LN2(A)",
+            "PORT_TX_DW7_LN3(A)",
             "PORT_TX_DW5_GRP(A)",
             "PORT_CL_DW10(A)",
             // 5.4, 5.5, 5.6, 5.7.
@@ -412,8 +429,14 @@ fn the_ddi_io_well_is_enabled_before_the_swing_values_are_written() {
     );
 }
 
-/// §8.5 step 2: `PORT_TX_DW4` is written once per lane, in lane order, with the
-/// four values the caller supplied.
+/// §8.5's batch, as i915 writes it: `PORT_TX_DW2`, `PORT_TX_DW4` and
+/// `PORT_TX_DW7` once per lane, in lane order, with the four values the caller
+/// supplied.
+///
+/// `[I915]` `display/intel_ddi.c:1148-1178` runs one read-modify-write per lane
+/// over `ln = 0..3` for each of the three dwords, and `:1160` says why the
+/// group instance must not be used for `DW4`.  Both `PORT_TX_DW5` writes go to
+/// the group instance and straddle the three loops.
 #[test]
 fn the_swing_writes_reach_the_per_lane_registers_in_lane_order() {
     let regs = ready_mock();
@@ -422,15 +445,27 @@ fn the_swing_writes_reach_the_per_lane_registers_in_lane_order() {
     let lane_writes: Vec<(&str, u32)> = regs
         .writes()
         .into_iter()
-        .filter(|(name, _)| name.starts_with("PORT_TX_DW4_LN"))
+        .filter(|(name, _)| {
+            name.starts_with("PORT_TX_DW2_LN")
+                || name.starts_with("PORT_TX_DW4_LN")
+                || name.starts_with("PORT_TX_DW7_LN")
+        })
         .collect();
     assert_eq!(
         lane_writes,
         [
+            ("PORT_TX_DW2_LN0(A)", swing.dw2[0]),
+            ("PORT_TX_DW2_LN1(A)", swing.dw2[1]),
+            ("PORT_TX_DW2_LN2(A)", swing.dw2[2]),
+            ("PORT_TX_DW2_LN3(A)", swing.dw2[3]),
             ("PORT_TX_DW4_LN0(A)", swing.dw4[0]),
             ("PORT_TX_DW4_LN1(A)", swing.dw4[1]),
             ("PORT_TX_DW4_LN2(A)", swing.dw4[2]),
             ("PORT_TX_DW4_LN3(A)", swing.dw4[3]),
+            ("PORT_TX_DW7_LN0(A)", swing.dw7[0]),
+            ("PORT_TX_DW7_LN1(A)", swing.dw7[1]),
+            ("PORT_TX_DW7_LN2(A)", swing.dw7[2]),
+            ("PORT_TX_DW7_LN3(A)", swing.dw7[3]),
         ]
     );
     // Step 4 disables TX training, step 6 re-enables it; both writes are to the
@@ -445,6 +480,139 @@ fn the_swing_writes_reach_the_per_lane_registers_in_lane_order() {
         dw5,
         [swing.dw5_training_disabled, swing.dw5_training_enabled]
     );
+}
+
+/// One lane's write is not another lane's, and the group instances of `DW2` and
+/// `DW7` are not written at all.
+///
+/// This is the defect this workstream exists for, asserted where it is visible:
+/// the four lane instances of each dword are four addresses, so what the
+/// aperture holds afterwards is four values and not the last one four times,
+/// while the group registers keep whatever was there.  The values differ lane
+/// by lane (`test_swing`), so a group write or a wrong stride would show up as
+/// a value at the wrong address.
+#[test]
+fn a_lane_write_is_not_visible_at_another_lanes_address() {
+    let regs = ready_mock();
+    let swing = test_swing();
+    program(&regs, &target_plan()).unwrap();
+
+    let lanes = tx_lane_registers(ComboPhy::A);
+    for (register, value) in lanes.dw2.iter().zip(swing.dw2) {
+        assert_eq!(regs.read(*register), Some(value), "{}", register.name());
+    }
+    for (register, value) in lanes.dw4.iter().zip(swing.dw4) {
+        assert_eq!(regs.read(*register), Some(value), "{}", register.name());
+    }
+    for (register, value) in lanes.dw7.iter().zip(swing.dw7) {
+        assert_eq!(regs.read(*register), Some(value), "{}", register.name());
+    }
+    // The sentence the defect was, said directly: lane 1's write is not visible
+    // at lane 0's address, and lane 0 kept its own word.
+    assert_eq!(
+        regs.read(lanes.dw2[0]),
+        Some(swing.dw2[0]),
+        "lane 0's PORT_TX_DW2 does not hold lane 0's value"
+    );
+    assert_ne!(
+        regs.read(lanes.dw2[0]),
+        regs.read(lanes.dw2[1]),
+        "lane 1's write is visible at lane 0's address"
+    );
+    assert_ne!(
+        regs.read(lanes.dw7[0]),
+        regs.read(lanes.dw7[3]),
+        "lane 3's write is visible at lane 0's address"
+    );
+    for (lane, register) in lanes.dw2.iter().enumerate() {
+        assert_eq!(
+            register.offset(),
+            0x16_2888 + 0x100 * lane as u32,
+            "PORT_TX_DW2 lane {lane} is not at the lane stride"
+        );
+    }
+    for (lane, register) in lanes.dw7.iter().enumerate() {
+        assert_eq!(
+            register.offset(),
+            0x16_289c + 0x100 * lane as u32,
+            "PORT_TX_DW7 lane {lane} is not at the lane stride"
+        );
+    }
+    for name in ["PORT_TX_DW2_GRP(A)", "PORT_TX_DW7_GRP(A)"] {
+        assert!(
+            !regs.writes().iter().any(|(written, _)| *written == name),
+            "{name} must not be written: group access is what collapsed the lanes"
+        );
+    }
+    assert_eq!(regs.read(port::PORT_TX_DW2_GRP_A), Some(0));
+    assert_eq!(regs.read(port::PORT_TX_DW7_GRP_A), Some(0));
+}
+
+/// The two group `DW5` writes carry the word that was read from lane 0.
+///
+/// This is where the read route and the write sequence meet: `swing.rs` reads
+/// `PORT_TX_DW5_LN0` (`[I915]` `display/intel_ddi.c:1226`) and this module
+/// writes `PORT_TX_DW5_GRP` twice (`:1221`, `:1229`).  The mock's two instances
+/// hold different words, so a group write that came from anywhere but lane 0's
+/// read would be visible in the log the test reads.
+#[test]
+fn the_group_dw5_writes_carry_the_word_read_from_lane_zero() {
+    /// Lane 0's `PORT_TX_DW5`: `TX_TRAINING_EN`, bit 31
+    /// (`[I915]` `display/intel_combo_phy_regs.h:133`), plus fields this module
+    /// deliberately has no names for.
+    const LANE0_DW5: u32 = (1 << 31) | 0x0002_0030;
+    /// The group instance's own word, deliberately a different one.
+    const GROUP_DW5: u32 = 0x0002_0008;
+
+    let regs = ready_mock();
+    // A firmware program, in the shape `swing.rs`'s read requires: PHY
+    // initialised, buffer enabled and not idle, lanes up, the swing words
+    // programmed one lane at a time.
+    regs.set(regs::COMBO_PHY_A.comp_dw0, COMP_INIT);
+    regs.set(
+        ddi::DDI_BUF_CTL_A,
+        DDI_BUF_CTL_ENABLE | (2 << DDI_BUF_CTL_BUF_TRANS_SELECT_SHIFT),
+    );
+    regs.set(port::PORT_CL_DW10_A, 0);
+    let lanes = tx_lane_registers(ComboPhy::A);
+    for (lane, register) in lanes.dw2.iter().enumerate() {
+        regs.set(*register, 0x0000_0100 | lane as u32);
+    }
+    for (lane, register) in lanes.dw4.iter().enumerate() {
+        regs.set(*register, 0x0000_0200 | lane as u32);
+    }
+    for (lane, register) in lanes.dw7.iter().enumerate() {
+        regs.set(*register, 0x0000_0300 | lane as u32);
+    }
+    regs.set(port::PORT_TX_DW5_LN0_A, LANE0_DW5);
+    regs.set(port::PORT_TX_DW5_GRP_A, GROUP_DW5);
+
+    let read_back =
+        swing::read_firmware_swing(&regs, Ddi::A).expect("the mock is a firmware program");
+    assert_eq!(read_back.dw5_training_enabled, LANE0_DW5);
+    let plan = OutputProgram::plan(
+        &OutputRequest::hdmi(Ddi::A, target_mode(), PllFieldEncoding::Named).with_swing(read_back),
+        STRAP_38_4,
+    )
+    .expect("the target mode plans");
+    program(&regs, &plan).expect("the mock's status bits behave");
+
+    let dw5: Vec<u32> = regs
+        .writes()
+        .into_iter()
+        .filter(|(name, _)| *name == "PORT_TX_DW5_GRP(A)")
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(
+        dw5,
+        [LANE0_DW5 & !(1 << 31), LANE0_DW5],
+        "step 4's write is lane 0's word with the training bit cleared, step 6's is lane 0's word"
+    );
+    assert!(
+        !dw5.contains(&GROUP_DW5),
+        "the group instance's own word reached the write log"
+    );
+    assert_eq!(regs.read(port::PORT_TX_DW5_GRP_A), Some(LANE0_DW5));
 }
 
 /// §8.2's `PWR_DOWN_LN_MASK[7:4]` with §8.6 step 7's values, as a
