@@ -52,6 +52,7 @@
 
 mod clk;
 pub(crate) mod debugfs;
+pub(crate) mod fb;
 mod gmbus;
 pub(crate) mod gtt;
 mod hpd;
