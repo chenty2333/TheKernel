@@ -212,7 +212,9 @@ impl BaseBlockBuilder {
         block[0x15] = 34; // 34 cm
         block[0x16] = 19; // 19 cm
         block[0x17] = 120; // gamma 2.20
-        block[0x18] = 0x0e; // preferred timing is native, continuous frequency
+        // YCbCr 4:4:4 accepted, preferred timing is native, continuous
+        // frequency; sRGB is deliberately left clear so tests can see the bit.
+        block[0x18] = 0x0b;
         for slot in 0..4 {
             // An unused descriptor is a dummy: zero clock, tag 0x10.
             block[descriptor_offset(slot) + 3] = 0x10;
@@ -399,9 +401,12 @@ impl BaseBlockBuilder {
     }
 
     /// Returns the block with a deliberately wrong checksum.
+    ///
+    /// The correct byte is flipped rather than replaced, so the result is a
+    /// bad block whatever the block's contents happen to sum to.
     pub fn build_with_bad_checksum(self) -> [u8; BLOCK_LEN] {
         let mut block = self.build();
-        block[BLOCK_LEN - 1] = block[BLOCK_LEN - 1].wrapping_add(0x5a);
+        block[BLOCK_LEN - 1] ^= 0x01;
         block
     }
 }
@@ -519,7 +524,7 @@ impl CtaBlockBuilder {
         if valid {
             block[BLOCK_LEN - 1] = checksum_byte(&block);
         } else {
-            block[BLOCK_LEN - 1] = 0x5a;
+            block[BLOCK_LEN - 1] = checksum_byte(&block) ^ 0x01;
         }
         block
     }

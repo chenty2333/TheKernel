@@ -684,13 +684,13 @@ pub fn select(edid: &Edid<'_>, candidates: &ModeList, constraints: &Constraints)
     {
         return selection;
     }
-    let link_admits_anything = candidates
-        .iter()
-        .any(|candidate| constraints.admits(&candidate.mode));
-    let because = if !candidates.is_empty() && link_admits_anything {
-        FallbackReason::ConstraintsExcluded
-    } else {
+    // The sink named timings and none of them survived the constraints - the
+    // interlace policy, the link ceiling or the range limits - which is a
+    // different situation from a sink that named nothing usable at all.
+    let because = if candidates.is_empty() {
         FallbackReason::NoUsableMode
+    } else {
+        FallbackReason::ConstraintsExcluded
     };
     Selection {
         mode: FALLBACK_MODE,
@@ -781,7 +781,9 @@ mod tests {
         assert_eq!(selection.reason, SelectionReason::SinkPreferred);
         assert_eq!(selection.mode.hdisplay, 1920);
         assert_eq!(selection.mode.clock_khz, 148_500);
-        assert!(selection.considered >= 4);
+        // The preferred timing, the 720p descriptor and the established
+        // 640x480 bit; VIC 4 and VIC 16 duplicate the two descriptors.
+        assert_eq!(selection.considered, 3);
         assert_eq!(selection.excluded, 0);
     }
 
@@ -941,13 +943,19 @@ mod tests {
         let cta = CtaBlockBuilder::new(3).vics(&[5]).build();
         let bytes = assemble(base, &[cta]);
         let refused = choose(&bytes, &Constraints::unlimited());
-        assert!(matches!(
-            refused.reason,
-            SelectionReason::BuiltinFallback {
-                because: FallbackReason::NoUsableMode
-            }
-        ));
+        assert!(
+            matches!(
+                refused.reason,
+                SelectionReason::BuiltinFallback {
+                    because: FallbackReason::ConstraintsExcluded
+                }
+            ),
+            "{:?}",
+            refused.reason
+        );
         assert_eq!(refused.mode, FALLBACK_MODE);
+        assert_eq!(refused.considered, 1);
+        assert_eq!(refused.excluded, 1);
         let allowed = choose(
             &bytes,
             &Constraints {

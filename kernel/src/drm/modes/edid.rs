@@ -2001,7 +2001,6 @@ mod tests {
             .manufacture(20, 2024)
             .screen_size_cm(34, 19)
             .gamma_byte(120)
-            .features(0x0e)
             .chromaticity([640, 330, 300, 600, 150, 60, 313, 329])
             .detailed_timing(0, &DetailedTimingSpec::new(148_500, 1920, 1080))
     }
@@ -2040,6 +2039,8 @@ mod tests {
         let features = edid.features();
         assert!(features.preferred_timing_is_native);
         assert!(features.continuous_frequency);
+        assert!(features.ycbcr444, "bit 3 is YCbCr 4:4:4 for a digital sink");
+        assert!(!features.ycbcr422);
         assert!(!features.srgb_is_default);
         assert!(!features.standby && !features.suspend && !features.active_off);
 
