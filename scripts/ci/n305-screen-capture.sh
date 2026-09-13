@@ -24,6 +24,9 @@
 
 set -euo pipefail
 
+# What the checker looked for on the screen.  The transcript marker is what
+# the system profile prints last; the shell profile's readiness prompt is what
+# a screen-only acceptance run uses instead.
 MARKER="# THEKERNEL_SYSTEM_TEST_COMPLETE"
 
 die() {
@@ -84,6 +87,7 @@ verdict)
 	dut=n305
 	run=1
 	resolution=""
+	marker="$MARKER"
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--dir)
@@ -108,6 +112,10 @@ verdict)
 			;;
 		--resolution)
 			resolution="$2"
+			shift 2
+			;;
+		--marker)
+			marker="$2"
 			shift 2
 			;;
 		*) die "unknown argument: $1" ;;
@@ -139,7 +147,7 @@ verdict)
 
 	cat > "$dir/verdict.txt" <<EOF
 # Written by scripts/ci/n305-screen-capture.sh.  The checker named below is
-# what asserted that $completion_name shows $MARKER.
+# what asserted that $completion_name shows $marker.
 version=1
 dut=$dut
 run=$run
@@ -147,6 +155,7 @@ resolution=$resolution
 frames=${#frames[@]}
 completion_frame=$completion_name
 last_frame=$last_name
+marker=$marker
 checker=$checker
 EOF
 	printf 'n305-screen-capture: wrote %s/verdict.txt (completion %s, last %s, %s frames)\n' \

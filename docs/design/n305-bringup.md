@@ -2,169 +2,208 @@
 
 The DUT is an Acer 蜂鸟 mini (SQM2270): Intel i3-N305 (Alder Lake-N), 16 GB
 RAM, 512 GB NVMe, no operating system installed, **no serial port**. The screen
-is the only output channel the machine has, and for now the only way to read
-that screen from the development host is a driver-free USB HDMI capture
-dongle.
+is the only output channel the machine has, and the only way to read that
+screen from the development host is a driver-free USB HDMI capture dongle.
 
-Everything below is written so that the person at the machine does as little as
-possible, and so that every step ends in a file that someone else can check.
+Everything below is ordered: do the steps in the order they appear. Each one
+ends in a file that someone else can check.
 
-## 1. Capture ground truth from the machine
+Two procedures are described and it matters which is which:
 
-The kernel's assumptions about this machine are guesses; this replaces them
-with bytes read from the machine. Two things in particular:
+* **§1 captures ground truth about the hardware** with a throwaway Linux
+  environment. It ends by powering the machine off, and that power-off is its
+  success signal;
+* **§2 and §3 accept TheKernel on the machine.** §2's boot deliberately does
+  *not* end, so that the evidence stays on the screen; §3 replaces screen
+  reading with a network transcript.
 
-* the **PCI ECAM base**, which TheKernel currently takes from
-  `axconfig::devices::PCI_ECAM_BASE` (a QEMU value, consumed at
-  `crates/ax/thekernel-axdriver/src/bus/pci.rs:225`) while another workstream
-  adds ACPI MCFG discovery. The capture carries the raw MCFG table, a decode of
-  its bytes done on the machine with `od` and `awk` only, the kernel's own
-  `PCI: ECAM ...` line from dmesg, and the PCI windows from `/proc/iomem`, so
-  the value can be corroborated three independent ways;
-* everything about the **integrated graphics**: BARs, the driver's debugfs
-  state, the OpRegion (which carries the VBT), the framebuffer format and
-  contents, and the EDID of whatever sink is attached.
+## 1. Capture the machine's hardware facts
 
-### 1.1 Build the stick (development host, no root needed)
+The kernel's assumptions about this machine are guesses. This replaces them
+with bytes read from the machine: above all the **PCI ECAM base** (TheKernel
+takes it from `axconfig::devices::PCI_ECAM_BASE`, a QEMU value, consumed at
+`crates/ax/thekernel-axdriver/src/bus/pci.rs:225`; another workstream is adding
+ACPI MCFG discovery) and everything about the **integrated graphics**.
+
+### 1.1 Build the capture image (development host, no root needed)
 
 ```sh
 scripts/ci/n305-capture-image.sh --out ~/n305-capture.img
 ```
 
-This downloads Alpine's standard live ISO (352 MiB, checksum verified against
-the copy the CDN publishes beside it) and appends one 256 MiB FAT partition
+Downloads Alpine's standard live ISO (352 MiB, checksum verified against the
+copy the CDN publishes beside it) and appends one 256 MiB FAT partition
 carrying the capture payload, an offline tool set, and a dump directory. The
 vendor ISO is not modified: the build proves with `cmp` that every byte from
-the start of the ISO's filesystem to the end of the vendor image is unchanged,
-and that the new partition is recorded in both the hybrid MBR and the GPT the
-ISO already carries. Alpine is the live environment because it is the smallest
-mainstream one (~350 MiB), boots to a root shell with no installer and no
-prompts, and has a documented unattended hook: its initramfs scans every
-partition for `alpine.apkovl.tar.gz`, which is what starts the capture with no
-kernel command line edit and no console interaction.
+the ISO9660 filesystem to the end of the vendor image is unchanged, and that
+the new partition is recorded in both the hybrid MBR and the GPT — in the first
+MBR slot, so that the initramfs finds the payload however slowly the machine
+enumerates devices. Build dependencies are listed at the top of the script
+(`p7zip` and `mtools` are the unusual ones).
 
-Write it to a stick of at least 1 GiB, then check that you are pointing at the
-stick and not at the machine's internal NVMe:
+Write it to a stick of at least 1 GiB. **Check which device is the stick**: the
+target machine has a 512 GB NVMe, and writing to that by mistake destroys it.
 
 ```sh
-lsblk -o NAME,SIZE,TRAN,MODEL          # confirm the device: TRAN=usb, the size you expect
+lsblk -o NAME,SIZE,TRAN,MODEL      # the stick is the one with TRAN=usb
 sudo dd if=~/n305-capture.img of=/dev/sdX bs=4M conv=fsync status=progress
 sync
 ```
 
-`bs=4M` is only throughput. `conv=fsync` matters: it makes `dd` wait until the
-data is on the device, which USB sticks otherwise cache and lose when the
-machine is switched off. `oflag=direct` is not needed and fails on some
-sticks.
+`bs=4M` is only throughput. `conv=fsync` matters: without it `dd` returns
+while the stick still holds the data in its own cache. `oflag=direct` is not
+needed and fails on some sticks.
 
-### 1.2 Run it (at the machine)
+### 1.2 Run it at the machine
 
-Plug the stick in, power the machine on, and do nothing else. The screen shows
-`n305-capture:` progress lines, then `CAPTURE COMPLETE`, and the machine
-**powers itself off**. That power-off is the success signal: a machine that
-stays on has hit an error and is displaying it.
+Plug the stick in, power the machine on, and do nothing else. Two firmware
+preconditions, because this boot chain is unsigned:
 
-Two firmware preconditions, because the boot chain is unsigned GRUB →
-Multiboot2:
-
-* **Secure Boot must be off.** `EFI/BOOT/BOOTX64.EFI` in Alpine's live image is
-  unsigned, and on a screen-only machine a Secure Boot refusal looks exactly
-  like nothing happening. If the firmware hides the option, clearing the
-  platform keys is the usual route;
+* **Secure Boot must be off.** If the firmware hides the option, clearing the
+  platform keys is the usual route. A Secure Boot refusal looks exactly like
+  nothing happening, which is the worst failure mode on a screen-only machine;
 * the firmware must be in **UEFI** mode, not legacy/CSM.
 
-Attach the display or the capture dongle before powering on: the EDID in the
+On the glass, in order: the firmware's own logo, then `n305-capture:` progress
+lines, then `n305-capture: CAPTURE COMPLETE`, then the machine **powers itself
+off**. The power-off is the success signal.
+
+If instead the screen ends at `localhost login:` with no `n305-capture:` lines,
+the live environment did not find its payload partition; power-cycle and try
+once more, and if it repeats, rebuild the stick. The payload cannot print a
+diagnostic in that case, because the code that would print it is what was not
+found.
+
+Attach the display or the capture dongle *before* powering on: the EDID in the
 bundle is the EDID of whatever sink is connected, which is the same thing the
 kernel will see.
 
-### 1.3 Read it back
+### 1.3 Read the bundle back
 
-The bundle is a directory on the FAT partition, so any host can read it:
+The bundle is a plain directory on a FAT partition:
 
 ```sh
-mkdir -p /mnt/stick && sudo mount /dev/sdX3 /mnt/stick
+mkdir -p /mnt/stick && sudo mount /dev/sdX1 /mnt/stick   # the partition with the marker file
 cp -r /mnt/stick/dump/n305-<timestamp> /somewhere/
 scripts/ci/hw_facts_bundle.py /somewhere/n305-<timestamp>
 ```
 
-`hw_facts_bundle.py` prints the machine's identity, the CPU, the ECAM base with
-its corroboration from dmesg and `/proc/iomem`, the graphics device and driver,
-each display's decoded EDID (including the preferred timing, which
-`edid-decode` cannot do here because it is not packaged for this Alpine
-release), and the list of probes that failed or were unavailable. With
-`--expect-ecam <addr>` it fails loudly if MCFG disagrees: pass the
-`pci-ecam-base` the profile being built actually uses (the value lives in the
-build's axconfig, e.g. `config/x86_64/q35-uefi.toml` for the QEMU profiles),
-which is the check that turns "the kernel assumes an address" into "the kernel
-assumes a *wrong* address, and here is the table that says so".
+`hw_facts_bundle.py` prints the machine's identity, CPU, the ECAM base with its
+corroboration from dmesg and `/proc/iomem`, the graphics device and driver,
+each display's decoded EDID (which the DUT cannot do: `edid-decode` is not
+packaged for this Alpine release), and every probe that failed. With
+`--expect-ecam <addr>`, passing the `pci-ecam-base` the built profile actually
+uses, it fails loudly when MCFG disagrees — which is the check that turns "the
+kernel assumes an address" into "the kernel assumes a *wrong* address, and here
+is the table that says so".
 
-### 1.4 What the bundle does not contain, and why
+### 1.4 What the capture cannot contain
 
 * **No serial output** — the machine has no serial port; the capture runs
-  headless and the screen messages are not recorded.
-* **No decoded EDID on the machine** — `edid-decode` is not packaged for Alpine
-  3.24. The raw EDID bytes are captured and are the authority; decoding happens
-  in `hw_facts_bundle.py` on the development host.
+  headless and its screen messages are not recorded.
+* **No decoded EDID on the machine** — decoded on the development host instead.
 * **No `intel_reg` MMIO dump** — `intel-gpu-tools` is not packaged for Alpine
-  3.24. `graphics/debugfs-*/` carries what i915 reports about itself instead,
-  which includes its display and engine state.
-* **No i915 initialisation trace** — tracing has to be armed before the driver
-  loads, and the vendor boot configuration cannot do that. `logs/messages.txt`
-  usually retains more of the early boot than `dmesg` does.
-* Anything else that could not be read is listed in the bundle's own
+  3.24; `graphics/debugfs-*/` carries what i915 reports about itself.
+* **No i915 initialisation trace** — tracing must be armed before the driver
+  loads, which the vendor boot configuration cannot do.
+* Everything else that could not be read is in the bundle's own
   `capture-status.txt` as `FAIL` or `UNAVAILABLE` with the reason.
 
 `scripts/ci/n305-capture-image-selfcheck.sh` boots the built image in QEMU and
-asserts that the whole pipeline works — vendor boot path, apkovl discovery,
-offline tool install, every probe, the bundle landing on FAT, the guest
-powering itself off. It says nothing about the N305: QEMU is not that machine.
+asserts the whole pipeline works. It proves nothing about the N305: QEMU is not
+that machine.
 
 ## 2. Acceptance (a): the kernel boots and its log is visible on screen
 
-### 2.1 What the person at the machine does
+### 2.1 Build the shell profile, and why not the system profile
 
-1. FLASH the ESP image the build produced to a USB stick — same `lsblk` check,
-   same `dd ... bs=4M conv=fsync` as above. Nothing else needs to be written to
-   the stick: `tools/thekernel.py build` (with the `n305` platform profile once
-   it lands) emits `kernel-x86_64.esp`, and that artifact is already a complete
-   GPT disk image containing `EFI/BOOT/BOOTX64.EFI`, `TheKernel.elf` and
-   `rootfs-x86.img`.
-2. Start `scripts/ci/n305-screen-capture.sh capture --out ~/n305-run-1` on the
-   development host with the HDMI dongle connected to the machine's output.
-3. Power the machine on and wait. Nothing is typed on the machine.
-4. When the kernel log and `# THEKERNEL_SYSTEM_TEST_COMPLETE` are on the
-   screen, power the machine off, then stop the capture.
-5. Look at the frames, find the first frame in which the completion banner is
-   legible, and turn that judgement into evidence:
+```sh
+python3 tools/thekernel.py build --profile shell
+```
+
+The build emits `kernel-x86_64.esp`: a complete GPT disk image containing
+`EFI/BOOT/BOOTX64.EFI`, `TheKernel.elf` and `rootfs-x86.img`. Nothing else has
+to be put on the stick.
+
+**Use the shell profile.** The acceptance question is "is the log on the glass,
+and can a person still be looking at it a minute later", and only the shell
+profile answers yes:
+
+* `--profile shell` boots `/etc/thekernel/shell-init.sh`, which ends in
+  `/bin/sh -i`. On this machine there is no keyboard driver, so the shell's
+  read from the console never returns (`kernel/src/pseudofs/dev/tty/mod.rs`
+  blocks on the READABLE event in `read_with_nonblocking`), and the
+  `poweroff -f` at the end of the script is never reached. The log and the
+  `THEKERNEL_SHELL_READY` prompt stay on the glass indefinitely;
+* `--profile system` runs the KTAP suite and prints its transcript, but it
+  cannot be relied on to leave it there: the transcript ends with the
+  completion marker and `system-init.c` then returns, and the clean power-off
+  the lab observes is the *runner* sending `SYSTEM_TEST_SHUTDOWN_COMMANDS`
+  (`/bin/busybox poweroff -f`) after it sees the marker. On a machine with no
+  input channel, nothing sends that.
+
+So §2 establishes boot, log and reachability — not test results. The tests are
+§3's job, and that is the honest split.
+
+### 2.2 Write the ESP to the stick
+
+Same check and same command as §1.1 — the ESP *is* the disk image:
+
+```sh
+lsblk -o NAME,SIZE,TRAN,MODEL
+sudo dd if=<build output>/kernel-x86_64.esp of=/dev/sdX bs=4M conv=fsync status=progress
+sync
+```
+
+### 2.3 Record the screen, then boot
+
+```sh
+scripts/ci/n305-screen-capture.sh capture --out ~/n305-run-1     # start this first
+```
+
+Then power the machine on. Nothing is typed on the machine, ever. Leave the
+capture running until the log has stopped and the prompt has been on screen for
+a while — a minute is plenty, because the point of the shell profile is that
+there is no rush.
+
+### 2.4 What the good outcome looks like on the glass
+
+In order:
+
+1. the firmware's own logo;
+2. `GRUB` text (only once `config/x86_64/grub.cfg` sends its terminal to the
+   console as well as the serial port — the framebuffer-console workstream owns
+   that line; until it lands, GRUB is silent on a serial-less machine);
+3. kernel log lines;
+4. a prompt preceded by `THEKERNEL_SHELL_READY`, and then **no further
+   change**: that stillness is the success signal, not a hang.
+
+Telling a good boot from a bad one, from the screen alone:
+
+| what the screen shows | what it means | what to do |
+| --- | --- | --- |
+| nothing at all, not even the firmware logo | no boot from USB: wrong boot entry, CSM mode, or Secure Boot refusing the stick | firmware setup: UEFI mode, Secure Boot off, boot the USB entry |
+| firmware logo, then nothing | the firmware did not execute `BOOTX64.EFI`; Secure Boot is the first suspect | disable Secure Boot, or clear the platform keys |
+| GRUB text, then a dark screen | GRUB ran, the kernel produced no screen output | keep the frames and report; the kernel's early screen is another workstream |
+| log appears, then stops before `THEKERNEL_SHELL_READY` | the kernel stopped — a hang or a panic | keep the frames: they are the evidence. A panic display is landing in another workstream and will separate the two; do not wait for it |
+| log, then `THEKERNEL_SHELL_READY` and no further change | acceptance (a) passed | turn the frames into gate evidence, below |
+
+That last line is why the shell profile matters: the frame that proves the boot
+is still on the glass when the person gets round to looking at it.
+
+### 2.5 Turn the frames into gate evidence
+
+Find the first frame in which `THEKERNEL_SHELL_READY` is legible and record who
+read it:
 
 ```sh
 scripts/ci/n305-screen-capture.sh verdict --dir ~/n305-run-1 \
-    --completion-frame 42 --checker "your name, who read the screen"
+    --completion-frame 42 --marker THEKERNEL_SHELL_READY \
+    --checker "your name, who read the screen"
 ```
 
-### 2.2 Tell "firmware problem" from "kernel problem" first
-
-Before accepting anything, establish that **GRUB was reached**, because that is
-what separates a USB or firmware fault from a kernel fault, and with
-`set timeout=0` the menu does not linger. The screen alone distinguishes them:
-
-| what the screen shows | what it means |
-| --- | --- |
-| nothing at all, not even the firmware's own logo | no boot from USB: wrong boot entry, wrong mode (CSM), or Secure Boot refusing the stick |
-| firmware logo, then nothing | the firmware did not execute `BOOTX64.EFI` — Secure Boot is the first suspect |
-| GRUB's own text or menu, then a dark screen | GRUB ran; the kernel did not produce screen output — a kernel-side problem |
-| GRUB text, then a kernel log | the chain works; this is what acceptance (a) is about |
-
-GRUB currently writes to the serial port only (`terminal_output serial` in
-`config/x86_64/grub.cfg`), so with no serial port present a GRUB failure and a
-kernel failure are indistinguishable on the screen. Making GRUB's console
-terminal active as well is a prerequisite for this procedure and belongs to the
-framebuffer-console workstream, not here.
-
-### 2.3 The gate
-
-Three cold boots, driven by the same gate the Panther Lake DUT uses, with the
-screen as the observation channel:
+Then run the gate, which checks the frames itself rather than trusting the
+verdict:
 
 ```sh
 THEKERNEL_DUT_POWER_CYCLE_CMD='...' \
@@ -174,24 +213,24 @@ scripts/ci/dut_gate.py --artifact-dir <build output> --state-dir <state> \
     --dut n305 --observation screen --runs 3
 ```
 
-The capture hook must record frames as `frame-0000.ppm`, `frame-0001.ppm`, ...
-into `$THEKERNEL_DUT_SCREEN_DIR` and write the verdict file at
-`$THEKERNEL_DUT_SCREEN_VERDICT`; `n305-screen-capture.sh` does both. With no
-lab controller, the power-cycle and one-shot-boot hooks are the person: a hook
-that prompts, waits for the machine to be switched on, and returns is a
-legitimate implementation of both.
+Each hook receives `THEKERNEL_DUT_*` paths; the screen hook must record
+`frame-0000.ppm`, `frame-0001.ppm`, ... into `$THEKERNEL_DUT_SCREEN_DIR` and
+write the verdict to `$THEKERNEL_DUT_SCREEN_VERDICT`, which
+`n305-screen-capture.sh` does. With no lab controller, the power-cycle and
+one-shot-boot hooks are the person: a hook that prints "power on the machine
+now", waits for a keypress, and returns is a legitimate implementation.
 
-Evidence that comes back, per run, in the state directory: the frame set, the
-verdict, and the gate's own verdict line. The gate checks the frames itself —
-real binary P6 PPM, the declared resolution, contiguous indices, a completion
-frame that is not blank, and a later frame proving the capture kept looking
-after the banner appeared.
+The gate rejects a frame set whose completion frame is blank (a black screen
+cannot show a prompt), whose frames are not real binary P6 PPM files of the
+declared resolution, whose indices are not contiguous, or which stops looking
+before the banner. It accepts a *dark* last frame, because a machine that
+powers itself off after the banner is a success.
 
-**What this proves:** the machine booted, put its log on the screen, reached the
-completion banner, and stayed up afterwards.
-**What it does not prove:** the KTAP contract — that every test ran and passed.
-No amount of screenshotting establishes that, and the gate says so on stdout
-rather than implying otherwise. Acceptance (b) is how that gap closes.
+**What acceptance (a) proves:** the machine booted from the stick, produced
+output on its only display, reached the shell prompt, and stayed there.
+**What it does not prove:** that the system-test suite ran or passed. No
+screenshot can establish that, and the gate says so on stdout rather than
+implying otherwise.
 
 ## 3. Acceptance (b): the automated network channel
 
@@ -206,28 +245,26 @@ scripts/ci/dut_gate.py --artifact-dir <build output> --state-dir <state> \
     --dut n305 --observation network --runs 3
 ```
 
-The hook fetches the guest's complete KTAP transcript over the network into
-`$THEKERNEL_DUT_TRANSCRIPT` and writes `clean` to
-`$THEKERNEL_DUT_SHUTDOWN_STATUS` only after it has independently observed a
-normal shutdown. The gate then enforces exactly what the Panther Lake serial
-gate enforces: `KTAP version 1`, one plan, every record present, no `not ok`,
-no `SKIP`, and the completion marker. The network transport itself is the
-guest-side workstream; the gate only requires that the transcript it is handed
-is the guest's, not a summary of it.
+This runs the `system` profile: the hook fetches the guest's complete KTAP
+transcript over the network into `$THEKERNEL_DUT_TRANSCRIPT` and writes `clean`
+to `$THEKERNEL_DUT_SHUTDOWN_STATUS` only after independently observing a normal
+shutdown. The gate then enforces exactly what the Panther Lake serial gate
+enforces: `KTAP version 1`, one plan, every record present, no `not ok`, no
+`SKIP`, and the completion marker. The transport is the guest-side
+workstream's business; all the gate requires is that the transcript is the
+guest's, not a summary of it.
 
-The gate takes one observation channel per invocation, so requiring both costs
-two invocations — six cold boots. Use the screen channel while the network
-channel does not exist yet, and switch to the network channel as soon as it
-does.
+The gate takes one channel per invocation, so requiring both costs two
+invocations (six cold boots). Use the screen channel while the network channel
+does not exist, and switch as soon as it does.
 
-## 4. What is still an assumption afterwards
+## 4. What is still an assumption
 
-* The MCFG value is confirmed *for this machine as configured*: a firmware
-  update, or the machine being a different unit of the same model, invalidates
-  it, which is why MCFG discovery belongs in the kernel rather than in a
-  constant that this capture blesses.
-* The screen channel's verdict is attested by whoever read the screen. It is a
-  named, recorded judgement, not a measurement; the frames that back it are in
-  the bundle, so it can be re-checked by someone else.
+* The MCFG value is confirmed *for this machine as configured*. A firmware
+  update, or a different unit of the same model, invalidates it — which is why
+  MCFG discovery belongs in the kernel rather than in a constant that this
+  capture blesses.
+* The screen verdict is a named, recorded human judgement, not a measurement.
+  The frames that back it travel with it, so someone else can re-check it.
 * Nothing here validates the kernel's behaviour on the NVMe beyond what the
   capture image reports about the device itself.
