@@ -87,12 +87,53 @@ enum {
     GRANDCHILD_TOKEN = 5,
     GRANDCHILD_FORK = 6,
     CHILD_READ_INCOMPLETE = 7,
+    KILLED_BY_SIGNAL = 8,
 };
 
 struct failure_report {
     int code;
     int error;
 };
+
+/* Where a dying child or grandchild writes its report.  A fatal-signal
+ * handler may only use async-signal-safe calls, so the descriptor lives here
+ * rather than being passed through the handler's context. */
+static int signal_report_fd = -1;
+
+static void report_failure(int fd, int code, int error)
+{
+    struct failure_report report;
+    report.code = code;
+    report.error = error;
+    ssize_t ignored = write(fd, &report, sizeof(report));
+    (void)ignored;
+}
+
+static void on_fatal_signal(int signo)
+{
+    report_failure(signal_report_fd, KILLED_BY_SIGNAL, signo);
+    _exit(128 + signo);
+}
+
+/*
+ * Report rather than die silently on the signals a two-generation round can
+ * plausibly take: a fault in the shared mapping, a broken pipe, or an abort.
+ * Without this a grandchild that is killed leaves the parent with nothing but
+ * "the child's read did not complete", which is the unattributed failure this
+ * instrumentation exists to remove.
+ */
+static void watch_fatal_signals(int fd)
+{
+    static const int signals[] = {SIGSEGV, SIGBUS, SIGPIPE, SIGABRT, SIGILL,
+                                  SIGFPE};
+    signal_report_fd = fd;
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = on_fatal_signal;
+    sigemptyset(&action.sa_mask);
+    for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); ++i)
+        (void)sigaction(signals[i], &action, NULL);
+}
 
 struct counters {
     unsigned long rounds;
@@ -129,19 +170,7 @@ static void record_failure(struct first_fail *first, unsigned long round,
     first->data = data;
 }
 
-/*
- * Best-effort failure report from a dying grandchild or child.  A short write
- * is ignored: the report is a diagnostic, and the round is already failing.
- */
-static void report_failure(int fd, int code, int error)
-{
-    struct failure_report report;
-    report.code = code;
-    report.error = error;
-    ssize_t ignored = write(fd, &report, sizeof(report));
-    (void)ignored;
-}
-
+/* Reads one report from the `finished` pipe; 0 means EOF (clean round). */
 static int read_failure_report(int fd, struct failure_report *report)
 {
     ssize_t got;
@@ -483,6 +512,8 @@ static void round_shared(unsigned long round, struct counters *counters,
     if (child == 0) {
         close(release[1]);
         close(finished[0]);
+        /* The grandchild inherits this handler and the same report fd. */
+        watch_fatal_signals(finished[1]);
         errno = 0;
         pid_t grandchild = fork();
         if (grandchild < 0) {
@@ -530,7 +561,9 @@ static void round_shared(unsigned long round, struct counters *counters,
         }
         close(attached[1]);
         close(release[0]);
-        close(finished[1]);
+        /* `finished[1]` deliberately stays open across the read below: it is
+         * the descriptor this process reports its own incomplete read on, and
+         * the parent only looks for EOF after reaping this process anyway. */
         char token;
         ssize_t got;
         do {
