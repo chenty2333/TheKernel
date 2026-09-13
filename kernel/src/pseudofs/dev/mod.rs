@@ -3,6 +3,7 @@
 mod bootfb;
 mod console_font;
 mod dri;
+pub(crate) mod early_screen;
 #[cfg(feature = "input")]
 pub(crate) mod event;
 mod fb;

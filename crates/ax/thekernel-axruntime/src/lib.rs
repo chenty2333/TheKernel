@@ -64,6 +64,94 @@ pub(crate) fn invoke_panic_crash_hook() {
     }
 }
 
+/// The screen the kernel paints when no console exists yet.
+///
+/// This is the runtime's second panic hook, and it is deliberately *not* the
+/// crash-kexec slot above: that one must run before any logging, while this one
+/// is itself a consumer of the log tail and runs after it.  It is also not a
+/// runtime-registered function pointer, because the steps it exists to report
+/// and the panics it exists to make legible all happen before kernel code gets
+/// control: a registration slot could only be filled from `main()`, which is
+/// the last of the milestones.  The monolithic kernel supplies the painter as a
+/// linked interface implementation instead, the same way `axfs` obtains its
+/// task I/O accounting.
+///
+/// The runtime makes no promise that any method can paint; each returns without
+/// effect when it cannot, and the panic path continues to the diagnostic UART
+/// and to power-off unchanged.
+#[crate_interface::def_interface]
+pub trait EarlyScreen {
+    /// Claim the firmware framebuffer through the boot page table's linear map.
+    ///
+    /// Called once, before anything which can fail.  A machine with no serial
+    /// port has no other channel, so this is the earliest point at which a
+    /// bring-up failure can be reported at all.
+    fn claim_boot_linear_map();
+
+    /// Stop painting: the mapping the claim used is about to be replaced.
+    fn boot_freeze();
+
+    /// Map the aperture in the kernel page table and start painting again.
+    fn rebind_after_paging();
+
+    /// Repaint, naming the initialization step which is about to run.
+    ///
+    /// The name is the step *in progress*, not the one which finished, so a
+    /// screen left showing a name is a screen which says where the machine is
+    /// stuck.
+    fn milestone(name: &str);
+
+    /// Repaint from the panic handler.
+    ///
+    /// The backtrace arrives as format arguments rather than as rendered text,
+    /// so that rendering into a fixed stack buffer stays the implementor's
+    /// business and the panic path keeps its single, pre-existing capture.
+    fn panic(info: &core::panic::PanicInfo<'_>, backtrace: &core::fmt::Arguments<'_>);
+}
+
+/// Paint the panic on the early screen when the kernel supplied one.
+pub(crate) fn invoke_panic_screen_hook(
+    info: &core::panic::PanicInfo<'_>,
+    backtrace: &core::fmt::Arguments<'_>,
+) {
+    #[cfg(all(target_os = "none", not(test)))]
+    crate_interface::call_interface!(EarlyScreen::panic, info, backtrace);
+    #[cfg(not(all(target_os = "none", not(test))))]
+    let _ = (info, backtrace);
+}
+
+/// Report that `name` is the initialization step now starting.
+///
+/// Called once per step of [`rust_main`], never per log record and never from
+/// an interrupt.  On a host build the kernel crate is not linked and there is
+/// no screen to paint, so the call compiles away rather than failing to link.
+fn early_screen_milestone(name: &str) {
+    #[cfg(all(target_os = "none", not(test)))]
+    crate_interface::call_interface!(EarlyScreen::milestone, name);
+    #[cfg(not(all(target_os = "none", not(test))))]
+    let _ = name;
+}
+
+/// Claim the firmware aperture for the early screen.
+fn early_screen_claim() {
+    #[cfg(all(target_os = "none", not(test)))]
+    crate_interface::call_interface!(EarlyScreen::claim_boot_linear_map);
+}
+
+/// Stop painting before the boot page table is replaced.
+#[cfg(feature = "paging")]
+fn early_screen_freeze() {
+    #[cfg(all(target_os = "none", not(test)))]
+    crate_interface::call_interface!(EarlyScreen::boot_freeze);
+}
+
+/// Re-map the aperture in the kernel page table and paint again.
+#[cfg(feature = "paging")]
+fn early_screen_rebind() {
+    #[cfg(all(target_os = "none", not(test)))]
+    crate_interface::call_interface!(EarlyScreen::rebind_after_paging);
+}
+
 pub mod klog;
 
 #[cfg(all(target_os = "none", not(test)))]
@@ -344,6 +432,14 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
 
     klog::init(log_level);
 
+    // The screen goes up before anything which can fail.  The boot page table
+    // `multiboot.S` installed is still live here, and it is the only mapping
+    // available until `axmm::init_memory_management` builds the kernel page
+    // table, so this is the earliest point at which a machine whose only output
+    // is the display can report a bring-up failure at all.
+    early_screen_claim();
+    early_screen_milestone("runtime entry");
+
     if show_banner {
         klog::diagnostic(format_args!("{}", LOGO));
         klog::diagnostic(format_args!(
@@ -389,6 +485,8 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     }
 
     #[cfg(feature = "alloc")]
+    early_screen_milestone("heap allocator");
+    #[cfg(feature = "alloc")]
     init_allocator();
 
     if enable_backtrace {
@@ -421,11 +519,23 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     );
 
     #[cfg(feature = "paging")]
-    axmm::init_memory_management();
+    {
+        early_screen_milestone("memory management");
+        // The boot page table's linear map is about to be replaced by the
+        // kernel page table, which does not cover the aperture until `iomap`
+        // adds it.  Freezing first is what keeps a panic in between from
+        // writing through a mapping the CPU no longer has.
+        early_screen_freeze();
+        axmm::init_memory_management();
+        early_screen_rebind();
+    }
 
+    early_screen_milestone("platform devices");
     info!("Initialize platform devices...");
     axhal::init_later(cpu_id, arg);
 
+    #[cfg(feature = "multitask")]
+    early_screen_milestone("scheduler");
     #[cfg(feature = "multitask")]
     if let Err(error) = axtask::init_scheduler() {
         error!("Primary task scheduler initialization failed: {error:?}");
@@ -434,9 +544,12 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
 
     #[cfg(feature = "axdriver")]
     {
+        early_screen_milestone("driver init");
         #[allow(unused_variables)]
         let all_devices = axdriver::init_drivers();
 
+        #[cfg(feature = "fs-ng")]
+        early_screen_milestone("filesystems");
         #[cfg(feature = "fs-ng")]
         axfs_ng::init_filesystems(all_devices.block);
 
@@ -459,8 +572,12 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     }
 
     #[cfg(feature = "smp")]
+    early_screen_milestone("secondary CPU bring-up");
+    #[cfg(feature = "smp")]
     self::mp::start_secondary_cpus(cpu_id);
 
+    #[cfg(feature = "irq")]
+    early_screen_milestone("interrupt init");
     #[cfg(feature = "irq")]
     {
         info!("Initialize interrupt handlers...");
@@ -488,6 +605,11 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     #[cfg(all(feature = "input", feature = "multitask", feature = "irq"))]
     start_pci_input_reconcile_worker();
 
+    // Everything before `main` is now done, including every step which could
+    // have stopped the machine without a console to say so.  From here the
+    // kernel's own device filesystem, and with it the framebuffer console,
+    // takes the screen over.
+    early_screen_milestone("kernel main");
     unsafe { main() };
 
     #[cfg(feature = "multitask")]

@@ -47,7 +47,7 @@ fn range_within(offset: usize, len: usize, size: usize) -> Option<core::ops::Ran
 /// the console cannot write: a wrong stride or a wrong field would paint a
 /// garbled screen, and on a machine whose only output device that screen is,
 /// a garbled console is indistinguishable from a kernel that never booted.
-fn pixel_layout(framebuffer: &BootFramebuffer) -> AxResult<PixelLayout> {
+pub(crate) fn pixel_layout(framebuffer: &BootFramebuffer) -> AxResult<PixelLayout> {
     if !matches!(framebuffer.bpp, 15 | 16 | 24 | 32) {
         return Err(AxError::InvalidInput);
     }

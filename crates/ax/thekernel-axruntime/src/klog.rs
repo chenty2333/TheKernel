@@ -399,6 +399,15 @@ pub fn record(bytes: &[u8]) {
 pub fn snapshot_into(cursor: u64, dst: &mut [u8], newest: bool) -> (usize, u64) {
     STORE.lock().snapshot(cursor, dst, newest)
 }
+/// The same snapshot, refused rather than waited for when the ring is busy.
+///
+/// The panic handler runs on any CPU, at any point, possibly having interrupted
+/// the very producer which holds the ring.  Spinning there would turn a legible
+/// panic into a silent hang, so it takes the tail it can get and draws the rest
+/// of the screen without it.
+pub fn try_snapshot_into(cursor: u64, dst: &mut [u8], newest: bool) -> Option<(usize, u64)> {
+    Some(STORE.try_lock()?.snapshot(cursor, dst, newest))
+}
 pub fn available_from(cursor: u64) -> usize {
     let store = STORE.lock();
     (store.end - cursor.max(store.oldest).min(store.end)) as usize
