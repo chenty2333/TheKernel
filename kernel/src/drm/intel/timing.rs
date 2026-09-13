@@ -188,8 +188,8 @@ impl fmt::Display for TimingError {
             ),
             Self::ZeroCount { register, half } => write!(
                 f,
-                "{}'s {half:?} half is a count of zero, which the register's `value - 1` \
-                 encoding cannot represent",
+                "{}'s {half:?} half is a count of zero, which the register's `value - 1` encoding \
+                 cannot represent",
                 register.name()
             ),
             Self::InterlaceNotSourced => f.write_str(
@@ -292,11 +292,7 @@ pub(crate) const fn unpack(register: u32) -> (u32, u32) {
 /// checked, so a zero count is an error rather than a wrap to `0xffff`, which
 /// would be a timing 65535 pixels wide and is exactly the kind of value that
 /// looks plausible in a register dump.
-const fn pack_minus_one(
-    high: u16,
-    low: u16,
-    register: TimingRegister,
-) -> Result<u32, TimingError> {
+const fn pack_minus_one(high: u16, low: u16, register: TimingRegister) -> Result<u32, TimingError> {
     let Some(high) = high.checked_sub(1) else {
         return Err(TimingError::ZeroCount {
             register,
@@ -548,9 +544,15 @@ mod tests {
 
         // Both tables must have been walked, and both cases exercised, or this
         // proves less than it looks like it does.
-        assert!(checked > 150, "only {checked} progressive modes round-tripped");
+        assert!(
+            checked > 150,
+            "only {checked} progressive modes round-tripped"
+        );
         assert!(interlaced > 0, "no interlaced mode was found to refuse");
-        assert_eq!(checked + interlaced, DMT_TIMINGS.len() + CTA_VIC_TIMINGS.len());
+        assert_eq!(
+            checked + interlaced,
+            DMT_TIMINGS.len() + CTA_VIC_TIMINGS.len()
+        );
     }
 
     /// The two halves of every register are the two counts the formulas name,
@@ -665,7 +667,10 @@ mod tests {
         assert_eq!(mode.hdisplay, 1920);
         assert_eq!(mode.vdisplay, 1080);
         assert_eq!(mode.vtotal, 1125, "frame lines, not field lines");
-        assert!(mode.is_well_formed(), "it is well formed, just unsourceable");
+        assert!(
+            mode.is_well_formed(),
+            "it is well formed, just unsourceable"
+        );
 
         assert_eq!(
             timing_registers(&mode),

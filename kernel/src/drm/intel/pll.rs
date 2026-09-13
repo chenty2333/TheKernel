@@ -346,10 +346,7 @@ pub(crate) enum PllError {
     /// This is the honest answer for a pixel clock the PLL cannot make, and it
     /// is deliberately an error rather than the nearest divider: a silently
     /// wrong pixel clock is a monitor that shows nothing.
-    NoLegalDividerSet {
-        symbol_rate_khz: u32,
-        ref_khz: u32,
-    },
+    NoLegalDividerSet { symbol_rate_khz: u32, ref_khz: u32 },
     /// A divider i915's lists contain could not be decomposed into `(P, Q, K)`.
     ///
     /// `skl_wrpll_get_multipliers` leaves its outputs untouched for a divider
@@ -408,8 +405,8 @@ impl fmt::Display for PllError {
             Self::ZeroReference => f.write_str("the reference frequency is zero"),
             Self::UnsupportedReference { ref_khz } => write!(
                 f,
-                "a reference of {ref_khz} kHz is not one a Gen12 combo PHY PLL is strapped to \
-                 (24 MHz, 19.2 MHz and 38.4 MHz are the ones i915 decodes from SKL_DSSM)"
+                "a reference of {ref_khz} kHz is not one a Gen12 combo PHY PLL is strapped to (24 \
+                 MHz, 19.2 MHz and 38.4 MHz are the ones i915 decodes from SKL_DSSM)"
             ),
             Self::NoLegalDividerSet {
                 symbol_rate_khz,
@@ -439,7 +436,10 @@ impl fmt::Display for PllError {
                 f,
                 "{field:?} value {value} does not fit its {bits}-bit register field"
             ),
-            Self::AchievedRateOutOfTolerance { error_ppb, limit_ppb } => write!(
+            Self::AchievedRateOutOfTolerance {
+                error_ppb,
+                limit_ppb,
+            } => write!(
                 f,
                 "the registers would produce a symbol rate {error_ppb} ppb from the request, \
                  beyond this module's {limit_ppb} ppb tolerance"
@@ -804,24 +804,30 @@ pub(crate) fn ddi_pll_dividers_for_symbol_rate(
     // is why `dco_integer` is range-checked before it is handed back.
     let afe_clock_hz = 5 * u64::from(symbol_rate_khz) * 1000;
 
-    let chosen = search_total_divider(afe_clock_hz)
-        .ok_or(PllError::NoLegalDividerSet {
-            symbol_rate_khz,
-            ref_khz,
-        })?;
+    let chosen = search_total_divider(afe_clock_hz).ok_or(PllError::NoLegalDividerSet {
+        symbol_rate_khz,
+        ref_khz,
+    })?;
 
-    let (p, q, k) = decompose(chosen.total_divider)
-        .ok_or(PllError::DividerNotDecomposable {
-            total_divider: chosen.total_divider,
-        })?;
+    let (p, q, k) = decompose(chosen.total_divider).ok_or(PllError::DividerNotDecomposable {
+        total_divider: chosen.total_divider,
+    })?;
 
     let target_dco_hz = u64::from(chosen.total_divider) * afe_clock_hz;
     let ref_hz = u64::from(wrpll_ref_khz) * 1000;
     let dco_integer = target_dco_hz / ref_hz;
     let dco_fraction = ((target_dco_hz % ref_hz) * 0x8000) / ref_hz;
 
-    let dco_integer = field_value(u32::try_from(dco_integer).unwrap_or(u32::MAX), 10, PllDividerField::DcoInteger)?;
-    let dco_fraction = field_value(u32::try_from(dco_fraction).unwrap_or(u32::MAX), 15, PllDividerField::DcoFraction)?;
+    let dco_integer = field_value(
+        u32::try_from(dco_integer).unwrap_or(u32::MAX),
+        10,
+        PllDividerField::DcoInteger,
+    )?;
+    let dco_fraction = field_value(
+        u32::try_from(dco_fraction).unwrap_or(u32::MAX),
+        15,
+        PllDividerField::DcoFraction,
+    )?;
 
     // What the registers will really produce, which is the target DCO rounded
     // down to the fraction's resolution.
@@ -1134,7 +1140,12 @@ fn decode_kdiv(code: u32, encoding: PllFieldEncoding) -> Result<u32, PllError> {
 }
 
 /// The error [`pdiv_code`] and [`kdiv_code`] return when they have no code.
-const fn not_encodable(p: u32, k: u32, field: PllDividerField, encoding: PllFieldEncoding) -> PllError {
+const fn not_encodable(
+    p: u32,
+    k: u32,
+    field: PllDividerField,
+    encoding: PllFieldEncoding,
+) -> PllError {
     PllError::DividerNotEncodable {
         p,
         k,
@@ -1148,11 +1159,7 @@ fn field_value(value: u32, bits: u32, field: PllDividerField) -> Result<u32, Pll
     if bits >= 32 || value < (1u32 << bits) {
         Ok(value)
     } else {
-        Err(PllError::FieldOverflow {
-            field,
-            value,
-            bits,
-        })
+        Err(PllError::FieldOverflow { field, value, bits })
     }
 }
 
@@ -1270,12 +1277,12 @@ mod tests {
                     .symbol_rate_hz(REF_24, encoding, DcoFractionWorkaround::NotNeeded)
                     .unwrap_or_else(|error| panic!("{name}: {error}"));
                 let requested_hz = u64::from(clock_khz) * 1000;
-                let error_ppb =
-                    (decoded as i128 - requested_hz as i128) * 1_000_000_000i128 / requested_hz as i128;
+                let error_ppb = (decoded as i128 - requested_hz as i128) * 1_000_000_000i128
+                    / requested_hz as i128;
                 assert!(
                     error_ppb.abs() < 1_000,
-                    "{name}: round trip produced {decoded} Hz for {requested_hz} Hz \
-                     ({error_ppb} ppb) under {encoding}"
+                    "{name}: round trip produced {decoded} Hz for {requested_hz} Hz ({error_ppb} \
+                     ppb) under {encoding}"
                 );
             }
         }
@@ -1483,7 +1490,11 @@ mod tests {
 
         // Read back the way it was written: exact.
         let honest = registers
-            .symbol_rate_hz(REF_24, PllFieldEncoding::Executed, DcoFractionWorkaround::NotNeeded)
+            .symbol_rate_hz(
+                REF_24,
+                PllFieldEncoding::Executed,
+                DcoFractionWorkaround::NotNeeded,
+            )
             .unwrap();
         assert_eq!(honest, 148_500_000);
 
@@ -1491,9 +1502,16 @@ mod tests {
         // the named constants.  The chosen set has K = 2, written as the
         // executed code 1, which the named convention reads as K = 1.
         let i915_way = registers
-            .symbol_rate_hz(REF_24, PllFieldEncoding::Named, DcoFractionWorkaround::NotNeeded)
+            .symbol_rate_hz(
+                REF_24,
+                PllFieldEncoding::Named,
+                DcoFractionWorkaround::NotNeeded,
+            )
             .unwrap();
-        assert_eq!(i915_way, 297_000_000, "i915's own read-back doubles the rate");
+        assert_eq!(
+            i915_way, 297_000_000,
+            "i915's own read-back doubles the rate"
+        );
         assert_ne!(i915_way, honest);
     }
 
@@ -1505,10 +1523,7 @@ mod tests {
         assert_eq!(wrpll_reference_khz(38_400), Ok(19_200));
         assert_eq!(wrpll_reference_khz(24_000), Ok(24_000));
         assert_eq!(wrpll_reference_khz(19_200), Ok(19_200));
-        assert_eq!(
-            wrpll_reference_khz(0),
-            Err(PllError::ZeroReference)
-        );
+        assert_eq!(wrpll_reference_khz(0), Err(PllError::ZeroReference));
         assert_eq!(
             wrpll_reference_khz(100_000),
             Err(PllError::UnsupportedReference { ref_khz: 100_000 })
@@ -1567,11 +1582,18 @@ mod tests {
         // Halving and doubling round-trips through the decoder, which is how
         // i915 keeps its own read-back self-consistent.
         let registers = dividers
-            .registers(PllFieldEncoding::Named, DcoFractionWorkaround::HalveFraction)
+            .registers(
+                PllFieldEncoding::Named,
+                DcoFractionWorkaround::HalveFraction,
+            )
             .unwrap();
         assert_eq!(
             registers
-                .symbol_rate_hz(38_400, PllFieldEncoding::Named, DcoFractionWorkaround::HalveFraction)
+                .symbol_rate_hz(
+                    38_400,
+                    PllFieldEncoding::Named,
+                    DcoFractionWorkaround::HalveFraction
+                )
                 .unwrap(),
             148_500_000
         );
@@ -1706,9 +1728,15 @@ mod tests {
             // The deviation is inside one of the two documented limits.
             let deviation = dividers.deviation_centipercent();
             if dividers.target_dco_khz() >= dividers.central_freq_khz() {
-                assert!(deviation < DCO_MAX_POSITIVE_DEVIATION, "{symbol_rate_khz} kHz");
+                assert!(
+                    deviation < DCO_MAX_POSITIVE_DEVIATION,
+                    "{symbol_rate_khz} kHz"
+                );
             } else {
-                assert!(deviation < DCO_MAX_NEGATIVE_DEVIATION, "{symbol_rate_khz} kHz");
+                assert!(
+                    deviation < DCO_MAX_NEGATIVE_DEVIATION,
+                    "{symbol_rate_khz} kHz"
+                );
             }
             // Every encoding that accepts the set round-trips through its own
             // decode.
@@ -1728,14 +1756,17 @@ mod tests {
                     / requested_hz as i128;
                 assert!(
                     error_ppb.abs() <= MAX_SYMBOL_RATE_ERROR_PPB as i128,
-                    "{symbol_rate_khz} kHz decoded to {decoded} Hz under {encoding} \
-                     ({error_ppb} ppb)"
+                    "{symbol_rate_khz} kHz decoded to {decoded} Hz under {encoding} ({error_ppb} \
+                     ppb)"
                 );
             }
         }
         // The sweep must actually have covered most of the range, or the test
         // proves nothing.
-        assert!(found > 2_000, "only {found} rates in the range were solvable");
+        assert!(
+            found > 2_000,
+            "only {found} rates in the range were solvable"
+        );
     }
 
     /// The reference frequency does not change which divider set is chosen --
@@ -1746,7 +1777,10 @@ mod tests {
         for ref_khz in [19_200u32, 24_000, 38_400] {
             let dividers = ddi_pll_dividers(148_500, ref_khz, ComboPhy::A).unwrap();
             assert_eq!(dividers.total_divider(), 12, "reference {ref_khz} kHz");
-            assert_eq!(dividers.wrpll_ref_khz(), wrpll_reference_khz(ref_khz).unwrap());
+            assert_eq!(
+                dividers.wrpll_ref_khz(),
+                wrpll_reference_khz(ref_khz).unwrap()
+            );
             let registers = dividers
                 .registers(PllFieldEncoding::Named, DcoFractionWorkaround::NotNeeded)
                 .unwrap();
@@ -1770,7 +1804,11 @@ mod tests {
             // rate that was asked for.
             assert_eq!(
                 registers
-                    .symbol_rate_hz(ref_khz, PllFieldEncoding::Named, DcoFractionWorkaround::NotNeeded)
+                    .symbol_rate_hz(
+                        ref_khz,
+                        PllFieldEncoding::Named,
+                        DcoFractionWorkaround::NotNeeded
+                    )
                     .unwrap(),
                 148_500_000,
                 "reference {ref_khz} kHz"
