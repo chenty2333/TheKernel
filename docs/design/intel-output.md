@@ -299,7 +299,8 @@ documented search. A DCO outside that window is a PLL that does not lock, which 
 the decomposition is the one the PRM's bounds describe. Re-measured on the same 985 rates, `pll.rs`
 and the reference transcription agree on all 819 rates either can reach and no answer is outside the
 window. The 166 rates neither can make are two bands between the candidate list's entries
-(`[500.25, 533] MHz` and `[666.75, 799.75] MHz`), which the documented algorithm cannot serve at all.
+(`(500.000, 533.200) MHz` and `(666.666, 799.800) MHz`), which the documented algorithm cannot serve
+at all.
 
 Two consequences for this module, both measured rather than assumed:
 

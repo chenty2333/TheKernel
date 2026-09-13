@@ -2120,68 +2120,63 @@ mod tests {
         assert_eq!(refused, 665, "refused rates in the sweep");
     }
 
-    /// Where the candidate list cannot reach, and why.
+    /// Where the candidate list cannot reach, and why -- to the kilohertz.
     ///
-    /// The gaps are between consecutive entries of
-    /// [`ADL_N_TOTAL_DIVIDERS`], and the widest is between 2 and 3: a window
-    /// `[7998/(5r), 10000/(5r)]` of width ratio 1.25 that falls between 2 and 3
-    /// contains no candidate, so rates in `[666.75, 799.75] MHz` are refused.
-    /// The other band, `[500.25, 533] MHz`, is between 3 and 4 -- a ratio of
-    /// 1.5/1.25, where the top of the range just misses 4 and the bottom just
-    /// misses 3.
+    /// The gaps are between consecutive entries of [`ADL_N_TOTAL_DIVIDERS`], and
+    /// a symbol rate is servable exactly when some entry's DCO lands in
+    /// `[7998, 10000] MHz`.  Two ranges of rates fall between entries:
     ///
-    /// This is bounded and worth knowing rather than discovering on the machine:
-    /// a caller that asks for one of these and gets
+    /// * `(500 000, 533 200)` kHz -- between 4 and 3.  500 MHz puts 4 * 2500 MHz
+    ///   exactly on the 10 000 MHz ceiling, and 533.2 MHz puts 3 * 2666 MHz
+    ///   exactly on the 7998 MHz floor.
+    /// * `(666 666, 799 800)` kHz -- between 3 and 2.  666.666 MHz puts
+    ///   3 * 3333.33 MHz just under the ceiling, and 799.8 MHz puts
+    ///   2 * 3999 MHz exactly on the floor.
+    ///
+    /// Every value in between is refused, and every value outside them has an
+    /// answer.  This is bounded and worth knowing rather than discovering on the
+    /// machine: a caller that asks for one of these and gets
     /// [`PllError::NoLegalDividerSet`] has a rate this PLL cannot make, not a
-    /// bug.  The Skylake search this module used to use could serve 7 of the
-    /// 985 measured rates inside these bands -- and in every one of the 7 it
-    /// programmed a DCO *below* 7998 MHz, i.e. outside the window.  That is
-    /// asserted in
-    /// `output::tests::pll_rs_search_is_measured_against_the_documented_adl_n_search`.
+    /// bug.  On the 1 MHz grid the two bands are 501-533 MHz and 667-799 MHz --
+    /// 166 of the 985 rates
+    /// `output::tests::pll_rs_search_is_measured_against_the_documented_adl_n_search`
+    /// measures.
+    ///
+    /// The Skylake search this module used to use could serve 7 of those rates
+    /// (527-533 MHz) -- and in every one of the 7 it programmed a DCO *below*
+    /// 7998 MHz, i.e. outside the window, which is why they are not a real
+    /// loss.  That is asserted in the `output` test above.
     #[test]
     fn the_candidate_list_has_two_gaps_and_they_are_refused() {
-        // Just below the first band, and inside it.
-        assert_eq!(hdmi(666_500).total_divider(), 3);
-        assert_eq!(hdmi(666_500).target_dco_khz(), 9_997_500);
-        assert_eq!(
-            ddi_pll_dividers(666_750, REF_24, ComboPhy::A),
-            Err(PllError::NoLegalDividerSet {
-                symbol_rate_khz: 666_750,
-                ref_khz: REF_24,
-            })
-        );
-        assert_eq!(
-            ddi_pll_dividers(799_750, REF_24, ComboPhy::A),
-            Err(PllError::NoLegalDividerSet {
-                symbol_rate_khz: 799_750,
-                ref_khz: REF_24,
-            })
-        );
-        // And just above it: 2 * 4000 MHz is 8000 MHz, inside the window.
-        assert_eq!(hdmi(800_000).total_divider(), 2);
-        assert_eq!(hdmi(800_000).target_dco_khz(), 8_000_000);
-
-        // The second band: 500 MHz lands exactly on the window ceiling with
-        // divider 4, 500.25 MHz is already above it, and 533.25 MHz is where
-        // divider 3 comes back into the window.
+        // The first band, from both sides: 500 MHz is the ceiling with divider
+        // 4, and 533.2 MHz is the floor with divider 3.
         assert_eq!(hdmi(500_000).total_divider(), 4);
         assert_eq!(hdmi(500_000).target_dco_khz(), PRM_DCO_MAX_KHZ);
+        assert!(ddi_pll_dividers(500_001, REF_24, ComboPhy::A).is_err());
+        assert!(ddi_pll_dividers(533_199, REF_24, ComboPhy::A).is_err());
+        assert_eq!(hdmi(533_200).total_divider(), 3);
+        assert_eq!(hdmi(533_200).target_dco_khz(), PRM_DCO_MIN_KHZ);
+
+        // The second band.  666.666 MHz is 3 * 3333.33 MHz, just inside the
+        // ceiling; 666.667 MHz is 10 000 005 kHz with divider 3 and 6 666 670
+        // kHz with divider 2, so it has nothing.  At the other end 799.8 MHz is
+        // 2 * 3999 MHz, exactly the floor.
+        assert_eq!(hdmi(666_666).total_divider(), 3);
+        assert_eq!(hdmi(666_666).target_dco_khz(), 9_999_990);
+        assert!(ddi_pll_dividers(666_667, REF_24, ComboPhy::A).is_err());
+        assert!(ddi_pll_dividers(799_799, REF_24, ComboPhy::A).is_err());
+        assert_eq!(hdmi(799_800).total_divider(), 2);
+        assert_eq!(hdmi(799_800).target_dco_khz(), PRM_DCO_MIN_KHZ);
+
+        // A refusal carries the rate and the reference, so a log reader can tell
+        // which one happened.
         assert_eq!(
-            ddi_pll_dividers(500_250, REF_24, ComboPhy::A),
+            ddi_pll_dividers(700_000, REF_24, ComboPhy::A),
             Err(PllError::NoLegalDividerSet {
-                symbol_rate_khz: 500_250,
+                symbol_rate_khz: 700_000,
                 ref_khz: REF_24,
             })
         );
-        assert_eq!(
-            ddi_pll_dividers(533_000, REF_24, ComboPhy::A),
-            Err(PllError::NoLegalDividerSet {
-                symbol_rate_khz: 533_000,
-                ref_khz: REF_24,
-            })
-        );
-        assert_eq!(hdmi(533_250).total_divider(), 3);
-        assert_eq!(hdmi(533_250).target_dco_khz(), 7_998_750);
     }
 
     /// The `DCO_INTEGER`/`DCO_FRACTION` split is the one

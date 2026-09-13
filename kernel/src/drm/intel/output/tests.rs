@@ -975,7 +975,7 @@ fn pll_rs_search_is_measured_against_the_documented_adl_n_search() {
     // Measured on this host with the tree as committed: `pll.rs` and the
     // transcription agree everywhere, no answer is outside the window, and the
     // 166 rates neither can make are the two gap bands between the candidate
-    // list's entries (500.25-533 MHz and 666.75-799.75 MHz).
+    // list's entries (500.001-533.199 MHz and 666.667-799.799 MHz).
     assert_eq!(
         (
             covered,

@@ -390,8 +390,9 @@ appeared later.
 
 **After the fix**, re-measured on the same grid: `pll.rs` and the reference transcription agree on
 every one of the 819 rates either can reach, no returned divider is outside the window, and 166
-rates are refused — the two gap bands between the candidate list's entries, `[500.25, 533] MHz`
-(between 3 and 4) and `[666.75, 799.75] MHz` (between 2 and 3). Those refusals are the documented
+rates are refused — the two gap bands between the candidate list's entries, `(500.000, 533.200) MHz`
+(between 4 and 3) and `(666.666, 799.800) MHz` (between 3 and 2), the ends being exact: each is a
+rate where the neighbouring divider lands exactly on a window bound. Those refusals are the documented
 algorithm's, not this implementation's: a rate whose window falls entirely inside a gap in the
 divider list has no legal divider set at all. **The fix does give up 7 rates the old search
 served**, and every one of them was a rate where the old search programmed a DCO below 7998 MHz —
