@@ -62,6 +62,13 @@ pub(crate) mod offset {
     pub(crate) const SUBSYSTEM_ID: u16 = 0x2e;
     /// First BAR slot; each slot is one dword.
     pub(crate) const BAR0: u16 = 0x10;
+    /// `Interrupt Line`: the legacy IRQ the firmware routed this function to,
+    /// or a value that says it routed none.
+    pub(crate) const INTERRUPT_LINE: u16 = 0x3c;
+    /// `Interrupt Pin`: which `INTx#` this function can assert.  Zero means it
+    /// asserts none, which on a PCI Express function means it can only be
+    /// reached by MSI.
+    pub(crate) const INTERRUPT_PIN: u16 = 0x3d;
 }
 
 /// The configuration-space dword offset of BAR `slot`.
@@ -409,6 +416,11 @@ pub(crate) struct DeviceInfo {
     pub(crate) subsystem_vendor_id: u16,
     pub(crate) subsystem_id: u16,
     pub(crate) command: u16,
+    /// `Interrupt Line`, `0x3c`.  Read-only here, like every other byte of the
+    /// header: assigning this line is a write, and this probe does not write.
+    pub(crate) interrupt_line: u8,
+    /// `Interrupt Pin`, `0x3d`.
+    pub(crate) interrupt_pin: u8,
     pub(crate) bars: [Bar; BAR_SLOTS],
 }
 
@@ -433,6 +445,15 @@ impl DeviceInfo {
         let header_type = config.read_u8(bdf, offset::HEADER_TYPE)?;
         let subsystem_vendor_id = config.read_u16(bdf, offset::SUBSYSTEM_VENDOR_ID)?;
         let subsystem_id = config.read_u16(bdf, offset::SUBSYSTEM_ID)?;
+        // The last two bytes of the type 0 header's first half.  They are read
+        // because they are the answer to the first question a reader asks about
+        // this device's interrupt: whether any legacy INTx route exists at all.
+        // On this part the display function's interrupt is an MSI and this
+        // kernel has no MSI support, so "is there an INTx to fall back on" is
+        // not an academic question -- and it is these two bytes, not an
+        // inference from the device id.
+        let interrupt_line = config.read_u8(bdf, offset::INTERRUPT_LINE)?;
+        let interrupt_pin = config.read_u8(bdf, offset::INTERRUPT_PIN)?;
 
         let mut bars = [Bar::absent(0); BAR_SLOTS];
         for (slot, bar) in bars.iter_mut().enumerate() {
@@ -470,6 +491,8 @@ impl DeviceInfo {
             subsystem_vendor_id,
             subsystem_id,
             command,
+            interrupt_line,
+            interrupt_pin,
             bars,
         })
     }
@@ -501,7 +524,8 @@ impl DeviceInfo {
     pub(crate) fn describe_identity(&self) -> String {
         format!(
             "{} vendor {:#06x} device {:#06x} revision {:#04x} class {:#04x}:{:#04x}:{:#04x} \
-             subsystem {:#06x}:{:#06x} header {:#04x} command {:#06x}",
+             subsystem {:#06x}:{:#06x} header {:#04x} command {:#06x} interrupt pin {:#04x} line \
+             {:#04x}",
             self.bdf,
             self.vendor_id,
             self.device_id,
@@ -513,6 +537,37 @@ impl DeviceInfo {
             self.subsystem_id,
             self.header_type,
             self.command,
+            self.interrupt_pin,
+            self.interrupt_line,
+        )
+    }
+
+    /// What the two interrupt bytes say, in words, for a report line.
+    ///
+    /// Both are read-only observations of what the firmware left in the header.
+    /// `Interrupt Pin` is which `INTx#` the function can assert -- zero means
+    /// it asserts none, so only MSI can reach it -- and `Interrupt Line` is the
+    /// legacy IRQ the firmware routed that pin to, where zero and `0xff` are
+    /// the two values that conventionally mean "none".  A reader who is asking
+    /// whether the MSI gap can be worked around needs exactly these bytes, and
+    /// a raw pair of hex numbers does not answer the question by itself.
+    pub(crate) fn describe_interrupt(&self) -> String {
+        let pin = match self.interrupt_pin {
+            0 => String::from("no INTx pin, so only MSI can reach this function"),
+            1 => String::from("INTA#"),
+            2 => String::from("INTB#"),
+            3 => String::from("INTC#"),
+            4 => String::from("INTD#"),
+            other => format!("{other:#04x}, which is not one of the four INTx pins"),
+        };
+        let line = match self.interrupt_line {
+            0x00 => String::from("no legacy IRQ is programmed in the header"),
+            0xff => String::from("0xff, which is what firmware leaves when it assigned none"),
+            value => format!("IRQ {value}"),
+        };
+        format!(
+            "interrupt pin {:#04x} ({pin}), interrupt line {:#04x} ({line})",
+            self.interrupt_pin, self.interrupt_line,
         )
     }
 }
@@ -858,6 +913,49 @@ mod tests {
     fn an_absent_function_reads_as_nothing_at_all() {
         let bus = FakeBus::new(vec![]);
         assert!(DeviceInfo::read(&bus, Bdf::new(0, 2, 0)).is_none());
+    }
+
+    #[test]
+    fn the_interrupt_line_and_pin_are_read_and_said_in_words() {
+        // The two bytes at 0x3c and 0x3d, which are the answer to "is there a
+        // legacy INTx route on this function at all".  They are read from the
+        // same dword, one byte apart, and neither one changes any decision the
+        // probe makes: the identity and the window are the same either way.
+        let bus = FakeBus::new(vec![
+            Header::new(Bdf::new(0, 2, 0), VENDOR_INTEL, 0x46d0)
+                .class(CLASS_DISPLAY, SUBCLASS_VGA)
+                .interrupt(0x0b, 1),
+            Header::new(Bdf::new(0, 2, 1), VENDOR_INTEL, 0x46d1)
+                .class(CLASS_DISPLAY, SUBCLASS_VGA)
+                .interrupt(0xff, 0),
+        ]);
+        let routing = DeviceInfo::read(&bus, Bdf::new(0, 2, 0)).unwrap();
+        assert_eq!(routing.interrupt_line, 0x0b);
+        assert_eq!(routing.interrupt_pin, 1);
+        assert!(
+            routing
+                .describe_identity()
+                .contains("interrupt pin 0x01 line 0x0b")
+        );
+        let described = routing.describe_interrupt();
+        assert!(described.contains("INTA#"), "{described}");
+        assert!(described.contains("IRQ 11"), "{described}");
+
+        // A function that asserts no pin can only be reached by MSI, and a
+        // header firmware left unassigned reads as unassigned rather than as
+        // IRQ 255.
+        let msi_only = DeviceInfo::read(&bus, Bdf::new(0, 2, 1)).unwrap();
+        assert!(msi_only.is_intel_display());
+        let described = msi_only.describe_interrupt();
+        assert!(described.contains("only MSI can reach"), "{described}");
+        assert!(!described.contains("IRQ 255"), "{described}");
+        // The probe's decision is untouched by either value.
+        assert_eq!(
+            DeviceInfo::read(&bus, Bdf::new(0, 2, 0))
+                .unwrap()
+                .has_standard_header(),
+            msi_only.has_standard_header()
+        );
     }
 
     #[test]

@@ -274,6 +274,14 @@ impl ProbeReport {
                 describe_quirks(device, info.revision),
             ));
         }
+        // The two interrupt bytes, in words.  They are in the identity line
+        // above as raw values; this is what they mean, and it is the first
+        // thing a reader asks when the MSI question comes back: is there a
+        // legacy INTx route on this function at all, and if so, which line.
+        out.push_str(&format!(
+            "intel-gpu:   {} (this kernel takes no interrupt from this device either way)\n",
+            info.describe_interrupt(),
+        ));
         for bar in info.declared_bars() {
             let aperture = found
                 .identity
@@ -650,6 +658,7 @@ mod tests {
                 .class(CLASS_DISPLAY, SUBCLASS_VGA)
                 .revision(0x04)
                 .subsystem(0x1025, 0x161c)
+                .interrupt(0x0b, 1)
                 .bars([
                     0x0000_0004,
                     0x0000_6000,
@@ -780,6 +789,15 @@ mod tests {
         assert!(text.contains("revision 0x04"), "{text}");
         assert!(text.contains("subsystem 0x1025:0x161c"), "{text}");
         assert!(text.contains("class 0x03:0x00:0x00"), "{text}");
+        // The two interrupt bytes, raw in the identity line and in words on
+        // their own: they are what settles whether a legacy INTx route exists
+        // on the real machine, which is the first question anyone asks when the
+        // missing MSI support is revisited.
+        assert!(text.contains("interrupt pin 0x01 line 0x0b"), "{text}");
+        assert!(
+            text.contains("interrupt pin 0x01 (INTA#), interrupt line 0x0b (IRQ 11)"),
+            "{text}"
+        );
         assert!(
             text.contains("BAR0 memory 64-bit at 0x0000_6000_0000_0000"),
             "{text}"
