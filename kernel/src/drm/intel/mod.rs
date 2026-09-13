@@ -53,10 +53,10 @@
 pub(crate) mod debugfs;
 mod id;
 mod pci;
-mod pll;
+pub(crate) mod pll;
 mod probe;
 mod regs;
-mod timing;
+pub(crate) mod timing;
 
 #[cfg(test)]
 mod testbus;
