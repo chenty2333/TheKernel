@@ -91,6 +91,80 @@ place it elsewhere, so the aperture mapping in change-set item 4 remains require
 
 ---
 
+## 0.2 Empirical results — the change set built, booted and photographed
+
+This section supersedes the *predictions* in the change set below for items 1–9. It records
+what was built and what a boot actually showed. The instrument is the new `firmware-fb`
+profile (`-display none -device bochs-display`, no virtio-gpu at all), a 1280x800 bochs
+surface, and a QMP `screendump` taken while the guest runs.
+
+**Result 1 — the kernel's own log reaches a real screen, on a machine with no display
+driver and no serial port.** Booting `firmware-fb`, the screendump contains the boot log
+rendered as glyphs in the console's grey on black, beginning:
+
+```
+<6>[0.198049 cpu=None tid=None INFO target=axnet_ng ...] mac: 52-54-00-12-34-56
+...
+<6>[0.301987 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::pseudofs::dev ...]
+    Firmware framebuffer scanout: 1280x800 pitch 5120 at 0x80000000
+<6>[0.321577 ...] Mounted devfs at FsPath([47, 100, 101, 118])
+```
+
+This is the stage-1 acceptance condition. It is the *only* output the kernel has on that
+machine: `boot_info` reports no virtio-gpu (`no DRM-capable VirtIO GPU found`), so before
+this work the same boot produced no observable output of any kind.
+
+**Result 2 — a firmware splash is left on screen unless the console clears it.** The first
+screendump showed OVMF's TianoCore logo and its `BdsDxe:` line still in the aperture. The
+console only repaints once something writes to a VT, and nothing did before userspace
+started. `present_while_text_active` already clears the frame, so this resolved itself as
+soon as the log mirror existed; the observable point is that "console exists" and "screen
+is ours" are different states, and only the second is what a person sees.
+
+**Result 3 — the console wrote four bytes per pixel regardless of the surface's depth.**
+`FbconFrame::write_pixel` computed `x * 4` and wrote a whole `u32`; `current_var_screen_info`
+reported a fixed 32-bit BGRA. Both were correct for the only backend that existed (a
+virtio-gpu `B8G8R8A8_UNORM` dumb buffer) and both are wrong for a firmware aperture whose
+GOP mode is 16 or 24 bits deep: a 16-bit surface is walked at twice its stride, which
+paints a garbled screen rather than an error. Fixed by making `PixelLayout` the single
+place that knows how to turn a canonical `0x00RRGGBB` colour into a surface's pixel, with
+`encode_into` returning the byte count so no caller can write the wrong width. The first
+draft of the fix had this bug in **three** places (the two production backends and the
+test double); the test double failing is what exposed it.
+
+**Result 4 — the log mirror works, and its failure mode is a log feedback loop.** An early
+attempt to instrument the mirror with an `info!` line inside its read loop produced
+~160 KB of log every 10 ms, because the mirror reads the ring it was writing into: the
+record it emitted was read back on the next pass. The bound and the pacing in
+`mirror_new_log_bytes` are the fix, and
+`the_console_write_path_does_not_log` is the regression guard — it installs a logger that
+forwards to klog, asserts a canary record is visible, and then asserts the whole console
+write path adds nothing. **A test without the canary would have passed by being deaf**;
+this was checked by injecting a logging call and confirming the test fails.
+
+**Result 5 — the built-in font was the other half of "can this be read".** The 5x7 table
+folded every byte through `to_ascii_uppercase`, so a boot log rendered as
+`THEKERNEL_TEST_BEGIN 2 ROOTFS TIMEOUT_SECONDS 60` and lost `f`/`|`/punctuation to a
+placeholder. It is replaced by a full 95-glyph 8x16 table generated from Liberation Mono
+(OFL-1.1) by `tools/gen-console-font.py`; the generator is deterministic and its output is
+committed, so no build depends on the script or on that font being installed. The
+generated table is data only — the interface and the invariant tests live in hand-written
+files beside it, so regenerating cannot delete them.
+
+**Result 6 — QMP screenshot markers match a whole console line, not a prefix.**
+`screenshot_after_marker` is compared against the exact ANSI-stripped line. A marker of
+`# THEKERNEL_TEST_BEGIN 1 mounts` never fires, because the guest prints
+`# THEKERNEL_TEST_BEGIN 1 mounts timeout_seconds=60`. This cost two failed runs; the
+acceptance test in items 13–15 must use full lines.
+
+**What this does not establish.** Every result above is from QEMU with a `bochs-display`.
+Nothing here has run on the N305: the firmware aperture address, the GOP mode and the
+absence of a serial port are all still assumptions about that machine, and the N305 boots
+from a USB image that has not been written yet. No claim in this section is a hardware
+result.
+
+---
+
 ## 0. Executive summary — the five findings that change the design
 
 1. **An fbcon already exists, but it is hard-wired to DRM.** `kernel/src/pseudofs/dev/tty/fbcon.rs`
@@ -2084,12 +2158,12 @@ Dependency order. Sizes are rough line counts of new/changed code including test
 | 1 | `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs` | Modify | Add `MB2_TAG_FRAMEBUFFER = 8`, a `BootFramebuffer` POD struct, a `framebuffer: Option<BootFramebuffer>` field on `BootInfo`, a validating parse arm before the `_ => {}` catch-all at `:462`, and ~8 host tests. | ~180 |
 | 2 | `crates/ax/thekernel-axplat-x86-pc/src/lib.rs` | Modify | Export `framebuffer()` from the boot module beside the existing `boot_modules` accessor at `:48`. | ~10 |
 | 3 | `crates/ax/thekernel-axhal/src/lib.rs` | Modify | Re-export the boot framebuffer descriptor as `axhal::boot::framebuffer()`, mirroring `rootfs_module()` at `:60`. | ~8 |
-| 4 | `crates/ax/thekernel-axmm/src/lib.rs` | Modify | Add `iomap_uncached_checked` (or an overlap guard) that refuses a range intersecting `phys_ram_ranges()` before calling the existing `iomap`. | ~30 |
+| 4 | `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs` | Modify | Refuse a framebuffer surface which overlaps a usable-RAM region. **As built:** the guard sits in the boot parser as `FramebufferRejection::OverlapsUsableMemory` rather than in `axmm`, because the memory map is already there and the check must run after the whole tag block is read. No new `axmm` entry point was needed: `iomap` already tolerates an address its caller has validated. | ~30 |
 | 5 | `kernel/src/pseudofs/dev/bootfb.rs` | **Add** | The firmware-framebuffer scanout provider: map the aperture, own the mode/pitch/base, and implement the `ScanoutSurface` operations that `DisplayCore`/`FbconFrame` use (`mode`, `pitch`, `virtual_height`, pixel write, `present`). | ~350 |
 | 6 | `kernel/src/pseudofs/dev/fb.rs` | Modify | Introduce `trait ScanoutSurface` and change `DisplayCore::scanout` and `FbconFrame::scanout` from `Arc<DrmFbdev>` to `Arc<dyn ScanoutSurface>`; keep `DrmFbdev` as one impl. | ~200 |
 | 7 | `kernel/src/pseudofs/dev/mod.rs` | Modify | Change the `/dev/fb0` gate at `:639` from "DRM primary device exists" to "DRM primary device **or** boot framebuffer exists", and construct the matching `ScanoutSurface`. | ~40 |
-| 8 | `crates/ax/thekernel-axruntime/src/klog.rs` + `kernel/src/deferred_work.rs` | Modify | Add a second `DiagnosticDrain` target that mirrors kernel log records to the framebuffer console, driven from `diagnostic_worker` at `deferred_work.rs:239`. | ~150 |
-| 9 | `kernel/src/pseudofs/dev/fb.rs` (`glyph_row`) | Modify | Replace the 36-glyph 5×7 table with a full 256-glyph 8×16 VGA font so lowercase and punctuation render correctly. | ~300 |
+| 8 | `crates/ax/thekernel-axruntime/src/klog.rs` + `kernel/src/deferred_work.rs` + `kernel/src/pseudofs/dev/tty/fbcon.rs` | Modify | Mirror the kernel log to the active VT. **As built:** not a second `DiagnosticDrain` sink. The drain's record queue is 64 deep and is not even fed when `Store::supported` is false — which is exactly the serial-less machine — so a drain-side sink would have shown at most the first 64 records and then stalled. The mirror is instead a **cursor reader of the klog ring**, started by `fbcon::install`, which replays everything the ring retains and is independent of serial backpressure in both directions. The cost, stated in the module: the screen shows every retained byte rather than only the records the console threshold admits. | ~180 |
+| 9 | `kernel/src/pseudofs/dev/console_font/` (new module) + `tools/gen-console-font.py` | **Add** | Replace the 36-glyph 5×7 uppercase-only table with a 95-glyph 8×16 table covering 0x20–0x7e. **As built:** generated from Liberation Mono (OFL-1.1) rather than copied from a VGA ROM font, because the obvious sources (Linux `font_8x16.c`, `kbd` consolefonts) are GPL-2.0 and this tree is Apache-2.0. Data lives in a generated `glyphs.rs`; the interface and invariant tests are hand-written beside it (§0.2 result 5). | ~90 + 12 KB data |
 | 10 | `config/x86_64/grub.cfg`, `config/x86_64/grub-drive.cfg` | Modify | Add `set gfxmode=…` / `set gfxpayload=keep` so GRUB initialises video and emits the Multiboot2 type-8 tag. | ~6 each |
 | 11 | `crates/ax/thekernel-axplat-x86-pc/src/console.rs` | Modify | Emit an explicit boot diagnostic when no framebuffer tag was found, so a serial-less machine is not silently dead. | ~20 |
 | 12 | `tools/qemu_runner/profiles.py` | Modify | Add the `"firmware-fb"` profile (`-display none`, `-device bochs-display`). | ~4 |
@@ -2105,6 +2179,24 @@ precede 7 because the `ScanoutSurface` abstraction is what lets `/dev/fb0` accep
 non-DRM provider. 8 is independent of 5–7 and can land in parallel, but the acceptance test
 (12–16) requires both 5–7 and 8 to observe rendered text. 9 is independent and cosmetic.
 10 must land before any hardware trial. 11 is a safety net for 10 failing.
+
+**State at the time of writing** — items 1, 2, 3, 4, 5, 6, 7, 8, 9, 12 and 17 are
+implemented and committed on `feat/baremetal-boot`; items 10, 11 and 13–16 are not. Every
+implemented item has host tests, and items 5–9 were additionally confirmed by booting the
+`firmware-fb` profile and reading a QMP screendump (§0.2). Nothing is verified on the
+N305.
+
+Two items were **deliberately not done** as specified, for reasons the build settled:
+
+- **Item 10 (`gfxmode`/`gfxpayload=keep`) is dropped.** §0.1 correction 1 shows GRUB emits
+  the type-8 tag without either directive, so the stated rationale is void. Pinning a mode
+  would also make the guest's aperture a product decision rather than the firmware's, and
+  there is no evidence yet that the firmware's choice is unusable. It stays a fallback for
+  a real machine that reports an address the kernel cannot map.
+- **Item 11 is subsumed.** The thing that makes a serial-less machine diagnosable is not a
+  diagnostic *about* the missing tag; it is the log reaching the screen at all. The `info!`
+  in `primary_scanout` for each of the two paths, plus the explicit
+  `No scanout surface available; /dev/fb0 is not published`, covers the same ground.
 
 **Explicitly out of scope (documented as follow-ups):** write-combining via `IA32_PAT`
 (§2.4 Option 2), a DRM `DisplayAdapter` for the firmware framebuffer so
