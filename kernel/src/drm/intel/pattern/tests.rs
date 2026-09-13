@@ -201,6 +201,34 @@ fn two_frames_differ_exactly_by_the_two_marker_positions() {
 }
 
 #[test]
+fn painting_line_by_line_is_the_same_bytes_as_filling_the_whole_surface() {
+    // The modeset owns a `fb::Surface` rather than a byte slice, so it paints
+    // through `Surface::write_bytes` one line at a time.  This is the property
+    // that says the two paths cannot produce different pictures: the bars and
+    // the marker are decided in `paint_row`, and `fill_xrgb8888` is a loop over
+    // it.
+    let (width, height, padding) = (1002, 40, 64);
+    let mut whole = Scratch::new(width, height, padding, 0);
+    let geometry = whole.fill(5).expect("a fillable surface");
+
+    let stride = whole.stride;
+    let mut rows = vec![0u8; stride * height];
+    let mut line = vec![0u8; stride];
+    for y in 0..height {
+        paint_row(&mut line, width, geometry.marker, y);
+        // Only the visible pixels travel, which is what `write_bytes` gets.
+        rows[y * stride..y * stride + width * 4].copy_from_slice(&line[..width * 4]);
+    }
+    for y in 0..height {
+        assert_eq!(
+            &whole.bytes[y * stride..y * stride + width * 4],
+            &rows[y * stride..y * stride + width * 4],
+            "row {y}"
+        );
+    }
+}
+
+#[test]
 fn the_marker_never_leaves_the_surface_however_large_the_frame_counter() {
     for (width, height) in [(8, 8), (9, 17), (1, 1), (2, 64), (320, 200), (1920, 1080)] {
         for frame in [0u64, 1, 7, 111, 4096, u64::MAX - 1] {

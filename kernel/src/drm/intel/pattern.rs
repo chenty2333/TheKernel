@@ -272,6 +272,68 @@ pub(crate) fn marker_rect(width: usize, height: usize, frame: u64) -> MarkerRect
     }
 }
 
+/// Whether a surface's geometry can carry the pattern at all.
+///
+/// [`fill_xrgb8888`] checks this and then the size of the buffer it was handed;
+/// a caller that owns a surface rather than a byte slice -- the modeset, which
+/// paints through `Surface::write_bytes` -- checks this and then writes the
+/// lines itself.  Both go through here so that "a surface this module will
+/// paint" means the same thing on both paths, and so that neither can index a
+/// bar that does not exist.
+pub(crate) fn check_geometry(
+    stride: usize,
+    width: usize,
+    height: usize,
+) -> Result<(), PatternError> {
+    if width == 0 || height == 0 {
+        return Err(PatternError::Empty { width, height });
+    }
+    if width < BAR_COUNT {
+        return Err(PatternError::TooNarrow { width });
+    }
+    let row_bytes = width * 4;
+    if stride < row_bytes {
+        return Err(PatternError::StrideTooSmall {
+            stride,
+            needed: row_bytes,
+        });
+    }
+    Ok(())
+}
+
+/// Paint one scan line of the pattern: its bars, and the marker wherever that
+/// line crosses it.
+///
+/// `row` holds the visible pixels of the line and must be at least `width * 4`
+/// bytes; anything past that is left alone, which is what keeps a strided
+/// surface's row padding unwritten.  `marker` comes from [`marker_rect`] and
+/// `y` is the line's own index, because whether this line crosses the marker is
+/// a property of the line.
+///
+/// This is the pattern's only pixel-level implementation: [`fill_xrgb8888`] is
+/// a loop over it.  The reason it exists separately is that a caller who owns a
+/// [`super::fb::Surface`] rather than a byte slice -- the modeset does -- has to
+/// write through `Surface::write_bytes`, one line at a time, and painting those
+/// lines with a second implementation of the bar boundaries and the marker
+/// would be two places for the geometry to drift apart.
+pub(crate) fn paint_row(row: &mut [u8], width: usize, marker: MarkerRect, y: usize) {
+    let edges = bar_boundaries(width);
+    let visible = &mut row[..width * 4];
+    for (bar, color) in BAR_COLORS.iter().enumerate() {
+        write_color(&mut visible[edges[bar] * 4..edges[bar + 1] * 4], *color);
+    }
+    if y < marker.y || y >= marker.y + marker.side {
+        return;
+    }
+    for column in marker.x..marker.x + marker.side {
+        let under = BAR_COLORS[bar_index(width, column)];
+        write_pixel(
+            &mut visible[column * 4..column * 4 + 4],
+            marker_colour(under),
+        );
+    }
+}
+
 /// Fill a linear XRGB8888 surface with the bring-up test pattern.
 ///
 /// `stride` is the distance in bytes between the starts of two rows and is
@@ -289,19 +351,8 @@ pub(crate) fn fill_xrgb8888(
     height: usize,
     frame: u64,
 ) -> Result<PatternGeometry, PatternError> {
-    if width == 0 || height == 0 {
-        return Err(PatternError::Empty { width, height });
-    }
-    if width < BAR_COUNT {
-        return Err(PatternError::TooNarrow { width });
-    }
+    check_geometry(stride, width, height)?;
     let row_bytes = width * 4;
-    if stride < row_bytes {
-        return Err(PatternError::StrideTooSmall {
-            stride,
-            needed: row_bytes,
-        });
-    }
     // The last row's *padding* is not part of the surface this function
     // promises to write, so it is not required to exist either.
     let needed = (height - 1) * stride + row_bytes;
@@ -312,25 +363,10 @@ pub(crate) fn fill_xrgb8888(
         });
     }
 
-    let edges = bar_boundaries(width);
-    for row in 0..height {
-        let start = row * stride;
-        let line = &mut surface[start..start + row_bytes];
-        for (bar, color) in BAR_COLORS.iter().enumerate() {
-            write_color(&mut line[edges[bar] * 4..edges[bar + 1] * 4], *color);
-        }
-    }
-
     let marker = marker_rect(width, height, frame);
-    for row in marker.y..marker.y + marker.side {
-        let start = row * stride;
-        for column in marker.x..marker.x + marker.side {
-            let under = BAR_COLORS[bar_index(width, column)];
-            write_pixel(
-                &mut surface[start + column * 4..start + column * 4 + 4],
-                marker_colour(under),
-            );
-        }
+    for y in 0..height {
+        let start = y * stride;
+        paint_row(&mut surface[start..start + row_bytes], width, marker, y);
     }
 
     Ok(PatternGeometry {

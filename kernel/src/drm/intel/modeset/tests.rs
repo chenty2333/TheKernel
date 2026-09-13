@@ -1,25 +1,36 @@
-//! The mode-choice policy and phase 6's verdicts, against a modelled register
-//! file.
+//! The mode-choice policy, the whole §11 phase 3.2-to-6 sequence, and phase
+//! 6's verdicts, against a modelled register file.
 //!
 //! What these tests establish: that the reference's preference and the mode
 //! layer's decision reconcile the way the design document says they do, that a
-//! refusal is a refusal and not a guessed timing, and that each of §11 phase
-//! 6's four checks fails by name with the reading it failed from.  What they
-//! cannot establish is anything about a display engine: every register here is
-//! a `BTreeMap` entry, and no part of this driver has run on the target.
+//! refusal is a refusal and not a guessed timing; that the sequence writes the
+//! registers in the reference's order, computes before it writes, paints the
+//! pattern before it arms the plane, and writes nothing after the proof starts;
+//! that each named failure leaves the state the design document's failure table
+//! claims; and that each of §11 phase 6's four checks fails by name with the
+//! reading it failed from.
+//!
+//! What they cannot establish is anything about a display engine: every
+//! register here is a `BTreeMap` entry, the framebuffer is host memory, and no
+//! part of this driver has run on the target.
 
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
 use core::cell::Cell;
 
 use super::*;
 use crate::{
     drm::{
         intel::{
+            fb,
             gmbus::tests::FakeClock,
+            gtt, power,
             regs::{
+                self,
+                ddi::{DDI_BUF_CTL_A, DDI_BUF_CTL_B},
                 mock::MockRegisters,
-                pipe::{PIPEDSL_A, PIPESTAT_A, PLANE_SURFLIVE_A},
+                pipe::{PIPEDSL_A, PIPESTAT_A, PLANE_SURF_A, PLANE_SURFLIVE_A},
             },
+            timing::TimingRegister,
         },
         modes::{
             Constraints, FALLBACK_MODE, ModeFlags, ModeList, SelectionReason, TimingSource,
@@ -140,7 +151,7 @@ fn cta_block(vics: &[u8]) -> Vec<u8> {
 }
 
 /// A base block and its extensions, concatenated.
-fn edid(base: Vec<u8>, extensions: &[Vec<u8>]) -> Vec<u8> {
+fn assemble_edid(base: Vec<u8>, extensions: &[Vec<u8>]) -> Vec<u8> {
     let mut bytes = base;
     for extension in extensions {
         bytes.extend_from_slice(extension);
@@ -198,7 +209,7 @@ fn a_choice_that_needs_scrambling_gives_way_to_the_references_1080p60() {
         ModeFlags::NONE,
         TimingSource::EdidDtd { index: 0 },
     );
-    let bytes = edid(base_block(Some(&four_k), 1), &[cta_block(&[16, 97])]);
+    let bytes = assemble_edid(base_block(Some(&four_k), 1), &[cta_block(&[16, 97])]);
     let plan = plan_modeset(&bytes, &Constraints::unlimited());
     assert_eq!(
         plan.selection.mode.clock_khz, 594_000,
@@ -262,7 +273,7 @@ fn a_safe_preferred_timing_is_not_second_guessed() {
         ModeFlags::NONE,
         TimingSource::EdidDtd { index: 0 },
     );
-    let bytes = edid(base_block(Some(&native), 1), &[cta_block(&[16])]);
+    let bytes = assemble_edid(base_block(Some(&native), 1), &[cta_block(&[16])]);
     let plan = plan_modeset(&bytes, &Constraints::unlimited());
     assert_eq!(plan.selection.mode.hdisplay, 2560);
 
@@ -439,7 +450,7 @@ fn the_line_rate_the_mode_implies_is_the_clock_over_the_total() {
 #[test]
 fn the_sink_advertised_1080p60_is_found_in_a_cta_extension() {
     let _guard = scheduler_test_context();
-    let bytes = edid(base_block(None, 1), &[cta_block(&[16])]);
+    let bytes = assemble_edid(base_block(None, 1), &[cta_block(&[16])]);
     let mut list = ModeList::new();
     let report = advertised_modes(&bytes, &mut list).expect("a valid EDID");
     assert!(
@@ -455,51 +466,72 @@ fn the_sink_advertised_1080p60_is_found_in_a_cta_extension() {
 // Prove it
 // ---------------------------------------------------------------------------
 
-/// A register file whose pipe is scanning: `PIPEDSL` advances by `lines` on
-/// every read, exactly as a running counter does.
+/// The surface address a test programs, 4 KiB aligned as §11 phase 3.2 wants.
+const SURFACE: u32 = 0x1234_5000;
+
+/// The pipe program the prove-it tests read back, for the target's mode.
+fn prove_program() -> PipeProgram {
+    pipe::compute(
+        Pipe::A,
+        &mode_1080p60(),
+        pipe::PlaneSurface {
+            ggtt_address: u64::from(SURFACE),
+            stride_bytes: 1920 * 4,
+        },
+    )
+    .expect("the target mode is what the reference works through")
+}
+
+/// The target phase 6 reads: pipe A, port A, and the line rate 1080p60 implies.
+fn prove_target() -> ProveTarget {
+    ProveTarget::port(Ddi::A, Some(67_500)).expect("DDI A has a DDI_BUF_CTL in the table")
+}
+
+/// What phase 6's three registers said before a healthy modeset: the underrun
+/// bit clear, the plane not yet armed on our surface, and the DDI still idle.
+fn pre_sample() -> PreSample {
+    PreSample {
+        pipestat: Some(0),
+        plane_surflive: Some(0),
+        ddi_buf_ctl: Some(0x0000_0080),
+    }
+}
+
+/// A register file whose pipe counts lines, whose plane is armed on `program`'s
+/// surface, whose DDI is out of idle, and whose `PIPESTAT` is clear.
 ///
-/// The mock keeps **one read hook per register**, so a test that installs a
-/// second hook on `PIPEDSL_A` replaces this one rather than adding to it.  The
-/// tests below build their register file in one place for that reason.
-fn scanning_pipe(lines: u32) -> MockRegisters {
+/// `lines_per_read` is how far `PIPEDSL` advances between reads: at the
+/// sampler's 1 ms interval, 67 lines per read is the 67.5 kHz a 1080p60 mode
+/// runs at, near enough to agree with it inside the tolerance.
+fn prove_mock(program: &PipeProgram, lines_per_read: u32) -> MockRegisters {
     let regs = MockRegisters::new();
+    regs.set(PLANE_SURFLIVE_A, program.plane.surf);
+    regs.set(PIPESTAT_A, 0);
+    regs.set(DDI_BUF_CTL_A, 0x8200_0016);
     let reads = Cell::new(0u32);
     regs.on_read(PIPEDSL_A, move |value| {
         reads.set(reads.get() + 1);
-        value + reads.get() * lines
+        value + reads.get() * lines_per_read
     });
     regs
 }
 
-/// The surface address a test programs, 4 KiB aligned as §11 phase 3.2 wants.
-const SURFACE: u32 = 0x1234_5000;
-
-/// Every register a healthy device answers: the pipe scans, the plane is live,
-/// the DDI is not idle, and no underrun is latched.
-fn clean_device(lines: u32) -> MockRegisters {
-    let regs = scanning_pipe(lines);
-    healthy_peripherals(&regs);
-    regs
-}
-
-/// The registers 6.2, 6.3 and 6.4 read, set as a working device would hold
-/// them.  Separate from [`clean_device`] so that a test can install its own
-/// `PIPEDSL` hook without replacing the one that makes the pipe scan.
-fn healthy_peripherals(regs: &MockRegisters) {
-    regs.set(PLANE_SURFLIVE_A, SURFACE);
-    regs.set(DDI_BUF_CTL_A, 0x8000_0000); // ENABLE, and IS_IDLE clear
-    regs.set(PIPESTAT_A, 0);
+fn read_prove(regs: &MockRegisters) -> ProveReport {
+    prove_it(
+        regs,
+        &FakeClock::new(),
+        &prove_program(),
+        &prove_target(),
+        &pre_sample(),
+    )
 }
 
 #[test]
 fn a_clean_device_passes_every_check_with_the_readings_it_passed_on() {
     let _guard = scheduler_test_context();
-    let regs = clean_device(337);
-    let report = prove_it(
-        &regs,
-        &FakeClock::new(),
-        &ProveTarget::pipe_a(SURFACE, Some(67_500)),
-    );
+    let program = prove_program();
+    let regs = prove_mock(&program, 67);
+    let report = read_prove(&regs);
     assert!(report.verdict().is_scanning_out(), "{}", report.render());
     // The one value the console handover tests.  It is only `ScanningOut` when
     // all four checks agreed, and it carries no failures when it is.
@@ -510,33 +542,44 @@ fn a_clean_device_passes_every_check_with_the_readings_it_passed_on() {
     assert!(verdict.describe().contains("scanning out"), "{verdict:?}");
 
     let scan = report.scan.as_ref().expect("6.1 passed");
-    assert_eq!(scan.samples.len(), 2, "the check stops at the first change");
-    assert_eq!(scan.samples[0].micros, 0);
     assert_eq!(
-        scan.samples[1].micros, SCAN_SAMPLE_INTERVAL_MICROS,
-        "the samples are the interval apart"
+        scan.values.len(),
+        pipe::SCANLINE_SAMPLES,
+        "the sampler takes its whole window when it has to"
     );
-    assert_eq!(scan.samples[0].value, 337);
-    assert_eq!(scan.samples[1].value, 674);
-    // 337 lines in 5000 us.  The mock advances a whole number of lines per
-    // sample because that is what an integer counter can do; the point is that
-    // the arithmetic that turns it into a rate is exercised.
-    assert_eq!(scan.observed_line_rate_hz, Some(67_400));
+    assert_eq!(scan.interval_micros, pipe::SCANLINE_INTERVAL_MICROS);
+    assert_eq!(
+        scan.elapsed_micros(),
+        (pipe::SCANLINE_SAMPLES as u64 - 1) * pipe::SCANLINE_INTERVAL_MICROS
+    );
+    assert_eq!(
+        scan.values,
+        [67, 134, 201, 268],
+        "PIPEDSL advanced per read"
+    );
+    // 67 lines in 1 ms is 67 kHz against the mode's 67.5 kHz.
+    assert_eq!(scan.observed_line_rate_hz, Some(67_000));
     assert_eq!(scan.expected_line_rate_hz, Some(67_500));
     assert_eq!(scan.rate_agrees(), Some(true));
-    assert!(report.render().contains("agrees"), "{}", report.render());
 
     let surface = report.surface.as_ref().expect("6.2 passed");
-    assert_eq!(surface.expected, SURFACE);
-    assert_eq!(surface.live, SURFACE);
+    assert_eq!(surface.expected, program.plane.surf);
+    assert_eq!(surface.live, program.plane.surf);
     assert_eq!(surface.polls, 1, "the address was already live");
     assert_eq!(surface.waited_micros, 0);
+    assert!(!surface.pre_matching, "nothing named it before the write");
 
     assert_eq!(
         report.ddi.as_ref().expect("6.3 passed").ddi_buf_ctl,
-        0x8000_0000
+        0x8200_0016
     );
     assert_eq!(report.underrun.as_ref().expect("6.4 passed").pipestat, 0);
+    // The reading `scanout::Verdict::Scanning` wants, straight from the report.
+    assert_eq!(
+        report.surflive(),
+        Some(u64::from(program.plane.surf)),
+        "the address field is the graphics address"
+    );
 
     let text = report.render();
     for step in ["6.1", "6.2", "6.3", "6.4"] {
@@ -548,21 +591,17 @@ fn a_clean_device_passes_every_check_with_the_readings_it_passed_on() {
 #[test]
 fn a_line_rate_far_from_the_mode_s_is_reported_without_failing_the_check() {
     let _guard = scheduler_test_context();
-    // The pipe scans, but 100 lines per 5 ms is 20 kHz where the mode implies
-    // 67.5 kHz: a PLL that locked to the wrong frequency looks like this.
-    let regs = clean_device(100);
-    let report = prove_it(
-        &regs,
-        &FakeClock::new(),
-        &ProveTarget::pipe_a(SURFACE, Some(67_500)),
-    );
+    // The pipe scans, but 100 lines per millisecond is 100 kHz where the mode
+    // implies 67.5 kHz: a PLL that locked to the wrong frequency looks like
+    // this, and phase 6.1 is not the check that fails for it.
+    let regs = prove_mock(&prove_program(), 100);
+    let report = read_prove(&regs);
     assert!(
         report.verdict().is_scanning_out(),
-        "6.1 asks whether the pipe scans, and it does; a wrong rate is evidence, not this check's \
-         failure"
+        "a wrong rate is evidence, not 6.1's failure"
     );
     let scan = report.scan.as_ref().expect("6.1 passed");
-    assert_eq!(scan.observed_line_rate_hz, Some(20_000));
+    assert_eq!(scan.observed_line_rate_hz, Some(100_000));
     assert_eq!(scan.rate_agrees(), Some(false));
     assert!(
         report.render().contains("DOES NOT AGREE"),
@@ -574,25 +613,20 @@ fn a_line_rate_far_from_the_mode_s_is_reported_without_failing_the_check() {
 #[test]
 fn a_pipe_that_does_not_scan_is_a_named_failure() {
     let _guard = scheduler_test_context();
-    let regs = clean_device(0);
+    let regs = prove_mock(&prove_program(), 0);
     regs.set(PIPEDSL_A, 0x0000_1234);
-    let report = prove_it(
-        &regs,
-        &FakeClock::new(),
-        &ProveTarget::pipe_a(SURFACE, None),
-    );
+    let report = read_prove(&regs);
     assert!(!report.verdict().is_scanning_out());
     let (check, failure) = report.failure().expect("a failure");
     assert_eq!(check, CheckId::Scanning);
     match failure {
-        ProveFailure::NotScanning { samples } => {
-            assert_eq!(samples.len(), SCAN_SAMPLES, "the window is fully sampled");
-            assert!(samples.iter().all(|sample| sample.value == 0x0000_1234));
-            assert_eq!(
-                samples.last().expect("a sample").micros,
-                (SCAN_SAMPLES as u64 - 1) * SCAN_SAMPLE_INTERVAL_MICROS,
-                "four samples span three intervals"
-            );
+        ProveFailure::NotScanning {
+            values,
+            interval_micros,
+        } => {
+            assert_eq!(values.len(), pipe::SCANLINE_SAMPLES);
+            assert!(values.iter().all(|value| *value == 0x0000_1234));
+            assert_eq!(*interval_micros, pipe::SCANLINE_INTERVAL_MICROS);
         }
         other => panic!("expected NotScanning, got {other:?}"),
     }
@@ -606,37 +640,11 @@ fn a_pipe_that_does_not_scan_is_a_named_failure() {
 }
 
 #[test]
-fn a_pipe_that_starts_late_still_passes() {
-    let _guard = scheduler_test_context();
-    // The counter is still on its first line for three reads and then moves,
-    // which is what a transcoder enabled microseconds ago looks like.  This
-    // hook is the only one on PIPEDSL_A: the mock replaces rather than adds.
-    let regs = MockRegisters::new();
-    let reads = Cell::new(0u32);
-    regs.on_read(PIPEDSL_A, move |_| {
-        reads.set(reads.get() + 1);
-        if reads.get() < 4 { 0x10 } else { 0x11 }
-    });
-    healthy_peripherals(&regs);
-    let report = prove_it(
-        &regs,
-        &FakeClock::new(),
-        &ProveTarget::pipe_a(SURFACE, None),
-    );
-    assert!(report.verdict().is_scanning_out(), "{}", report.render());
-    assert_eq!(report.scan.as_ref().expect("6.1 passed").samples.len(), 4);
-}
-
-#[test]
 fn a_plane_that_never_arms_is_a_named_failure() {
     let _guard = scheduler_test_context();
-    let regs = clean_device(337);
+    let regs = prove_mock(&prove_program(), 67);
     regs.set(PLANE_SURFLIVE_A, 0);
-    let report = prove_it(
-        &regs,
-        &FakeClock::new(),
-        &ProveTarget::pipe_a(SURFACE, None),
-    );
+    let report = read_prove(&regs);
     let (check, failure) = report.failure().expect("a failure");
     assert_eq!(check, CheckId::SurfaceLive, "6.1 passed, so 6.2 is first");
     match failure {
@@ -645,35 +653,37 @@ fn a_plane_that_never_arms_is_a_named_failure() {
             live,
             polls,
             waited_micros,
+            pre_matching,
         } => {
-            assert_eq!(*expected, SURFACE);
+            assert_eq!(*expected, prove_program().plane.surf);
             assert_eq!(*live, 0);
             assert_eq!(*waited_micros, SURFACE_ARM_TIMEOUT_MICROS);
-            // One poll at every step of the fake clock's 25 us, plus the first
-            // one at zero: the bound is the timeout, not the poll count.
+            // One poll per step of the fake clock's 25 us, plus the first at
+            // zero: the bound that bites is the timeout, not the poll count.
             assert_eq!(*polls, (SURFACE_ARM_TIMEOUT_MICROS / 25) as u32 + 1);
+            assert!(!*pre_matching);
         }
         other => panic!("expected SurfaceNotLive, got {other:?}"),
     }
     assert!(check.advice().contains("4.3"), "{}", check.advice());
+    assert_eq!(report.surflive(), Some(0), "the reading is still reported");
 }
 
 #[test]
-fn a_plane_that_arms_on_a_later_frame_is_not_a_failure() {
+fn a_plane_that_arms_on_a_later_poll_is_not_a_failure() {
     let _guard = scheduler_test_context();
-    let regs = clean_device(337);
+    let program = prove_program();
+    let regs = prove_mock(&program, 67);
     let polls = Cell::new(0u32);
+    let field = program.plane.surf;
     regs.on_read(PLANE_SURFLIVE_A, move |_| {
         polls.set(polls.get() + 1);
-        if polls.get() < 3 { 0 } else { SURFACE }
+        if polls.get() < 3 { 0 } else { field }
     });
-    let report = prove_it(
-        &regs,
-        &FakeClock::new(),
-        &ProveTarget::pipe_a(SURFACE, None),
-    );
+    let report = read_prove(&regs);
     assert!(report.verdict().is_scanning_out(), "{}", report.render());
     let surface = report.surface.as_ref().expect("6.2 passed");
+    // Three polls: two that did not match, then the proof's read.
     assert_eq!(surface.polls, 3);
     assert_eq!(surface.waited_micros, 50, "two 25 us waits");
 }
@@ -681,67 +691,98 @@ fn a_plane_that_arms_on_a_later_frame_is_not_a_failure() {
 #[test]
 fn the_surface_comparison_ignores_the_bits_that_are_not_address() {
     let _guard = scheduler_test_context();
-    let regs = clean_device(337);
+    let program = prove_program();
+    let regs = prove_mock(&program, 67);
     // Bits below 12 are not address, and bit 2 is the decrypt flag, so a live
     // value that differs only there is the same surface.
-    regs.set(PLANE_SURFLIVE_A, SURFACE | 0xfff);
-    let report = prove_it(
-        &regs,
-        &FakeClock::new(),
-        &ProveTarget::pipe_a(SURFACE, None),
-    );
+    regs.set(PLANE_SURFLIVE_A, program.plane.surf | 0xfff);
+    let report = read_prove(&regs);
     assert!(report.verdict().is_scanning_out(), "{}", report.render());
+    assert_eq!(report.surflive(), Some(u64::from(program.plane.surf)));
 
     // A difference in the address itself is not.
-    let regs = clean_device(337);
-    regs.set(PLANE_SURFLIVE_A, SURFACE + 0x1000);
-    let report = prove_it(
-        &regs,
-        &FakeClock::new(),
-        &ProveTarget::pipe_a(SURFACE, None),
-    );
+    let regs = prove_mock(&prove_program(), 67);
+    regs.set(PLANE_SURFLIVE_A, program.plane.surf + 0x1000);
+    let report = read_prove(&regs);
     let (check, _) = report.failure().expect("a failure");
     assert_eq!(check, CheckId::SurfaceLive);
 }
 
 #[test]
+fn a_surface_that_was_already_live_says_the_read_back_proves_nothing() {
+    let _guard = scheduler_test_context();
+    let program = prove_program();
+    let regs = prove_mock(&program, 67);
+    let pre = PreSample {
+        plane_surflive: Some(program.plane.surf),
+        ..pre_sample()
+    };
+    let report = prove_it(&regs, &FakeClock::new(), &program, &prove_target(), &pre);
+    assert!(report.verdict().is_scanning_out());
+    assert!(
+        report.surface.as_ref().expect("6.2 passed").pre_matching,
+        "the pre-sample named this surface, so the pass is not attributable"
+    );
+    assert!(
+        report.render().contains("does not attribute"),
+        "{}",
+        report.render()
+    );
+}
+
+#[test]
 fn a_ddi_that_is_still_idle_is_a_named_failure() {
     let _guard = scheduler_test_context();
-    let regs = clean_device(337);
+    let regs = prove_mock(&prove_program(), 67);
     regs.set(DDI_BUF_CTL_A, 0x8000_0080); // ENABLE | IS_IDLE
-    let report = prove_it(
-        &regs,
-        &FakeClock::new(),
-        &ProveTarget::pipe_a(SURFACE, None),
-    );
+    let report = read_prove(&regs);
     let (check, failure) = report.failure().expect("a failure");
     assert_eq!(check, CheckId::DdiActive);
     assert_eq!(
         failure,
         &ProveFailure::DdiIdle {
-            ddi_buf_ctl: 0x8000_0080
+            ddi_buf_ctl: 0x8000_0080,
+            pre_active: false
         }
     );
     assert!(check.advice().contains("5.2"), "{}", check.advice());
+    assert!(
+        describe_failure(failure).contains("never came up"),
+        "{}",
+        describe_failure(failure)
+    );
+
+    // A DDI that was already out of idle and is idle now is a different story,
+    // and the verdict says which one it is.
+    let pre = PreSample {
+        ddi_buf_ctl: Some(0x8000_0016),
+        ..pre_sample()
+    };
+    let report = prove_it(
+        &regs,
+        &FakeClock::new(),
+        &prove_program(),
+        &prove_target(),
+        &pre,
+    );
+    let failure = report.ddi.as_ref().expect_err("still idle");
+    assert!(describe_failure(failure).contains("went back to idle"));
 }
 
 #[test]
 fn an_underrun_points_at_the_watermarks() {
     let _guard = scheduler_test_context();
-    let regs = clean_device(337);
-    regs.set(PIPESTAT_A, PIPESTAT_FIFO_UNDERRUN | 0x0000_0002);
-    let report = prove_it(
-        &regs,
-        &FakeClock::new(),
-        &ProveTarget::pipe_a(SURFACE, None),
-    );
+    let regs = prove_mock(&prove_program(), 67);
+    regs.set(PIPESTAT_A, pipe::PIPE_FIFO_UNDERRUN_STATUS | 0x0000_0002);
+    let report = read_prove(&regs);
     assert!(!report.verdict().is_scanning_out());
     let (check, failure) = report.failure().expect("a failure");
     assert_eq!(check, CheckId::FifoUnderrun, "6.1 to 6.3 passed");
     assert_eq!(
         failure,
         &ProveFailure::FifoUnderrun {
-            pipestat: PIPESTAT_FIFO_UNDERRUN | 0x0000_0002
+            pipestat: pipe::PIPE_FIFO_UNDERRUN_STATUS | 0x0000_0002,
+            pre_existing: false,
         }
     );
     // §11 phase 6.4's own advice: go back to the watermarks before changing
@@ -754,16 +795,50 @@ fn an_underrun_points_at_the_watermarks() {
 }
 
 #[test]
-fn a_register_outside_the_window_names_itself() {
+fn an_underrun_bit_that_was_already_set_says_so() {
     let _guard = scheduler_test_context();
-    let regs = clean_device(337);
-    regs.hide(PIPEDSL_A);
-    regs.hide(PLANE_SURFLIVE_A);
+    // The pre-sample saw the sticky bit set, so the verdict must not blame this
+    // modeset for it: the register table declares PIPESTAT read-only and
+    // nothing can clear it before the plane is armed.
+    let regs = prove_mock(&prove_program(), 67);
+    regs.set(PIPESTAT_A, pipe::PIPE_FIFO_UNDERRUN_STATUS);
+    let pre = PreSample {
+        pipestat: Some(pipe::PIPE_FIFO_UNDERRUN_STATUS),
+        ..pre_sample()
+    };
     let report = prove_it(
         &regs,
         &FakeClock::new(),
-        &ProveTarget::pipe_a(SURFACE, None),
+        &prove_program(),
+        &prove_target(),
+        &pre,
     );
+    let failure = report.underrun.as_ref().expect_err("the bit is set");
+    assert_eq!(
+        failure,
+        &ProveFailure::FifoUnderrun {
+            pipestat: pipe::PIPE_FIFO_UNDERRUN_STATUS,
+            pre_existing: true,
+        }
+    );
+    let text = describe_failure(failure);
+    assert!(text.contains("already set before this modeset"), "{text}");
+    assert!(text.contains("sticky"), "{text}");
+    // The reason the console stays put carries the attribution too.
+    let reason = report.verdict().unavailable_reason().expect("a reason");
+    assert!(
+        reason.contains("already set before this modeset"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_register_outside_the_window_names_itself() {
+    let _guard = scheduler_test_context();
+    let regs = prove_mock(&prove_program(), 67);
+    regs.hide(PIPEDSL_A);
+    regs.hide(PLANE_SURFLIVE_A);
+    let report = read_prove(&regs);
     let (check, failure) = report.failure().expect("a failure");
     assert_eq!(check, CheckId::Scanning);
     assert_eq!(
@@ -781,34 +856,7 @@ fn a_register_outside_the_window_names_itself() {
         })
     );
     assert!(describe_failure(failure).contains("PIPEDSL_A"));
-}
-
-#[test]
-fn the_second_pipe_reads_the_second_pipe_s_registers() {
-    let _guard = scheduler_test_context();
-    // ProveTarget carries registers rather than a pipe index precisely so that
-    // a mode set on pipe B is provable with the same code.
-    let target = ProveTarget {
-        surface: SURFACE,
-        line_rate_hz: None,
-        pipedsl: crate::drm::intel::regs::pipe::PIPEDSL_B,
-        plane_surflive: crate::drm::intel::regs::pipe::PLANE_SURFLIVE_B,
-        ddi_buf_ctl: crate::drm::intel::regs::ddi::DDI_BUF_CTL_B,
-        pipestat: crate::drm::intel::regs::pipe::PIPESTAT_B,
-    };
-    let regs = MockRegisters::new();
-    let reads = Cell::new(0u32);
-    regs.on_read(target.pipedsl, move |value| {
-        reads.set(reads.get() + 1);
-        value + reads.get()
-    });
-    regs.set(target.plane_surflive, SURFACE);
-    regs.set(target.ddi_buf_ctl, 0x8000_0000);
-    let report = prove_it(&regs, &FakeClock::new(), &target);
-    assert!(report.verdict().is_scanning_out(), "{}", report.render());
-    // Pipe A's registers were never touched, so a target that had been wired
-    // to the wrong pipe would have failed rather than passed.
-    assert!(regs.writes().is_empty());
+    assert_eq!(report.surflive(), None, "nothing readable to report");
 }
 
 #[test]
@@ -818,16 +866,13 @@ fn a_verdict_that_is_not_scanning_out_carries_every_failure_as_a_reason() {
     // plane never arms, the DDI stays idle and an underrun is latched.  This is
     // the case a single boolean would erase: the reason has to name all four,
     // because they point at different phases.
-    let regs = MockRegisters::new();
+    let program = prove_program();
+    let regs = prove_mock(&program, 0);
     regs.set(PIPEDSL_A, 0x0000_0001);
     regs.set(PLANE_SURFLIVE_A, 0);
-    regs.set(DDI_BUF_CTL_A, 0x0000_0080); // ENABLE absent, IS_IDLE set
-    regs.set(PIPESTAT_A, PIPESTAT_FIFO_UNDERRUN);
-    let report = prove_it(
-        &regs,
-        &FakeClock::new(),
-        &ProveTarget::pipe_a(SURFACE, Some(67_500)),
-    );
+    regs.set(DDI_BUF_CTL_A, 0x0000_0080);
+    regs.set(PIPESTAT_A, pipe::PIPE_FIFO_UNDERRUN_STATUS);
+    let report = read_prove(&regs);
     let verdict = report.verdict();
     assert!(!verdict.is_scanning_out());
     let checks: Vec<CheckId> = verdict.failures().iter().map(|(check, _)| *check).collect();
@@ -840,20 +885,17 @@ fn a_verdict_that_is_not_scanning_out_carries_every_failure_as_a_reason() {
     // The advice attached is the first failure's, which is §11's order: a pipe
     // that is not scanning is the thing to fix before reading anything else.
     assert!(reason.contains("5.1"), "{reason}");
-    // And it is a `String`, ready to hand to `screen::Unavailable::Failed`.
+    // And it is a `String`, ready to hand to `scanout::Verdict::NotScanning`.
     assert!(report.render().contains("verdict:"), "{}", report.render());
 }
 
 #[test]
 fn one_failure_gives_one_reason_and_not_a_general_warning() {
     let _guard = scheduler_test_context();
-    let regs = clean_device(337);
-    regs.set(PIPESTAT_A, PIPESTAT_FIFO_UNDERRUN);
-    let report = prove_it(
-        &regs,
-        &FakeClock::new(),
-        &ProveTarget::pipe_a(SURFACE, Some(67_500)),
-    );
+    let program = prove_program();
+    let regs = prove_mock(&program, 67);
+    regs.set(PIPESTAT_A, pipe::PIPE_FIFO_UNDERRUN_STATUS);
+    let report = read_prove(&regs);
     let verdict = report.verdict();
     assert_eq!(verdict.failures().len(), 1);
     assert_eq!(verdict.failures()[0].0, CheckId::FifoUnderrun);
@@ -866,4 +908,643 @@ fn one_failure_gives_one_reason_and_not_a_general_warning() {
     for step in ["6.1", "6.2", "6.3"] {
         assert!(!reason.contains(step), "{step} in: {reason}");
     }
+}
+
+#[test]
+fn a_pipe_that_starts_late_still_passes() {
+    let _guard = scheduler_test_context();
+    // The counter is still on its first line for three reads and then moves,
+    // which is what a transcoder enabled microseconds ago looks like.
+    let regs = prove_mock(&prove_program(), 0);
+    let reads = Cell::new(0u32);
+    regs.on_read(PIPEDSL_A, move |_| {
+        reads.set(reads.get() + 1);
+        if reads.get() < 4 { 0x10 } else { 0x11 }
+    });
+    let report = read_prove(&regs);
+    assert!(report.verdict().is_scanning_out(), "{}", report.render());
+    assert_eq!(
+        report.scan.as_ref().expect("6.1 passed").values.len(),
+        pipe::SCANLINE_SAMPLES
+    );
+}
+
+#[test]
+fn the_second_pipe_reads_the_second_pipe_s_registers() {
+    let _guard = scheduler_test_context();
+    // The program carries its pipe, so a mode set on pipe B is proved against
+    // pipe B's registers with the same code.
+    let program = pipe::compute(
+        Pipe::B,
+        &mode_1080p60(),
+        pipe::PlaneSurface {
+            ggtt_address: u64::from(SURFACE),
+            stride_bytes: 1920 * 4,
+        },
+    )
+    .expect("pipe B can carry the same mode");
+    let regs = MockRegisters::new();
+    let reads = Cell::new(0u32);
+    regs.on_read(pipe::Pipe::B.pipedsl(), move |value| {
+        reads.set(reads.get() + 1);
+        value + reads.get()
+    });
+    regs.set(program.pipe.plane_surflive(), program.plane.surf);
+    regs.set(program.pipe.pipestat(), 0);
+    regs.set(DDI_BUF_CTL_B, 0x8200_0016);
+    let target = ProveTarget::port(Ddi::B, Some(67_500)).expect("DDI B has a DDI_BUF_CTL");
+    let report = prove_it(&regs, &FakeClock::new(), &program, &target, &pre_sample());
+    assert!(report.verdict().is_scanning_out(), "{}", report.render());
+    // Pipe A's registers were never read, so a target wired to the wrong pipe
+    // would have failed rather than passed.
+    assert!(regs.writes().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The sequence: reference §11 phases 3.2 to 6
+// ---------------------------------------------------------------------------
+
+/// The 19.2 MHz reference strap, which the platform's CDCLK table has rows for.
+const STRAP_19_2: u32 = 1 << 29;
+
+/// A page table with enough entries for a 1080p surface's run.
+fn test_gtt() -> gtt::Gtt {
+    gtt::Gtt::over(Box::new(gtt::mock::MockPageTable::new(4096)))
+        .expect("a page table with room for the surface")
+}
+
+/// The framebuffer the sequence scans out: 1920x1080 XRGB8888, which is the
+/// mode every test here uses.
+fn test_surface() -> fb::Surface {
+    fb::Surface::allocate(&test_gtt(), 1920, 1080, fb::Format::Xrgb8888)
+        .expect("the host page arena can hold an 8 MiB surface")
+}
+
+/// §8.5's HDMI translation values are a `[GAP]`; these are a test fixture with
+/// a `source` string that says so, exactly as `output`'s own tests use.
+fn test_swing() -> SwingProgram {
+    SwingProgram {
+        level: 2,
+        dw2: 0x0C,
+        dw4: [0x30, 0x31, 0x31, 0x31],
+        dw5_training_disabled: 0x0000_0000,
+        dw5_training_enabled: 0x0002_0000,
+        dw7: 0x0071,
+        source: "test fixture, not sourced from the reference",
+    }
+}
+
+/// A mock of a machine whose display engine works end to end: CDCLK is up and
+/// legal, the port PLL locks, the DDI leaves idle, the plane arms when
+/// `PLANE_SURF` is written, and the pipe counts lines.
+///
+/// The returned cell is the value `PLANE_SURF` was written with, which is what
+/// `PLANE_SURFLIVE` reads back; a test that wants to watch the proof's reads
+/// replaces that hook and must return the same cell, because the mock keeps one
+/// hook per register.
+///
+/// One hook per register, which is the mock's rule: a second `derive` on the
+/// same register replaces the first.
+fn working_device(program_lines_per_read: u32) -> (MockRegisters, Rc<Cell<u32>>) {
+    let regs = MockRegisters::new();
+    // §11 phase 1.4's outcome: 19.2 MHz reference, ratio 27, divide by 1.5, so
+    // 172.8 MHz -- the first row of the platform's CDCLK table.
+    regs.set(regs::SKL_DSSM, STRAP_19_2);
+    regs.set(regs::CDCLK_PLL_ENABLE, (1 << 31) | (1 << 30) | 27);
+    regs.set(regs::CDCLK_CTL, 1 << 22);
+    regs.derive(regs::dpll::DPLL0_ENABLE, |value| {
+        let mut stored = value;
+        if value & (1 << 27) != 0 {
+            stored |= 1 << 26; // POWER_STATE
+        }
+        if value & (1 << 31) != 0 {
+            stored |= 1 << 30; // LOCK
+        }
+        stored
+    });
+    regs.derive(DDI_BUF_CTL_A, |value| {
+        if value & (1 << 31) != 0 {
+            value & !DDI_BUF_CTL_IS_IDLE
+        } else {
+            value | DDI_BUF_CTL_IS_IDLE
+        }
+    });
+    // The DDI-IO power well reports its state once it is requested.
+    regs.derive(regs::ICL_PWR_WELL_CTL_DDI2, |value| {
+        value | power::well_state(power::DDI_IO_A.index)
+    });
+    // The plane arms when `PLANE_SURF` is written: `PLANE_SURFLIVE` reads back
+    // whatever was written, which is what §5.6's "PLANE_SURF is the commit"
+    // means for a mock.
+    let armed = Rc::new(Cell::new(0u32));
+    let stored = Rc::clone(&armed);
+    regs.derive(PLANE_SURF_A, move |value| {
+        stored.set(value);
+        value
+    });
+    let live = Rc::clone(&armed);
+    regs.on_read(PLANE_SURFLIVE_A, move |_| live.get());
+    let reads = Cell::new(0u32);
+    regs.on_read(PIPEDSL_A, move |value| {
+        reads.set(reads.get() + 1);
+        value + reads.get() * program_lines_per_read
+    });
+    regs.set(PIPESTAT_A, 0);
+    (regs, armed)
+}
+
+/// The pixel at the top-right corner of a surface: outside frame 0's marker
+/// (which sits at the origin) and the last bar's near-black grey, which is not
+/// the zero the allocator leaves.  Reading it is how a test says "the pattern
+/// was painted" without depending on where the marker is.
+fn top_right_pixel(surface: &fb::Surface) -> u32 {
+    let mut bytes = [0u8; 4];
+    surface
+        .read_bytes((surface.width() as usize - 1) * 4, &mut bytes)
+        .expect("the last pixel of the first row");
+    u32::from_le_bytes(bytes)
+}
+
+/// The colour the top-right pixel must have if the pattern is there.
+fn top_right_expected() -> u32 {
+    pattern::BAR_COLORS[pattern::BAR_COUNT - 1]
+}
+
+/// The EDID whose preferred timing is 1080p60, and the plan the mode layer
+/// makes from it.
+fn plan_1080p60() -> (Vec<u8>, ModePlan) {
+    let bytes = base_block(Some(&mode_1080p60()), 0);
+    let plan = plan_modeset(&bytes, &Constraints::unlimited());
+    (bytes, plan)
+}
+
+/// The request every end-to-end test makes: pipe A, port A, the reference's
+/// 1080p60 plan, the framebuffer, and the swing values without which
+/// `output::plan` refuses.
+fn request<'a>(plan: &'a ModePlan, edid: &'a [u8], surface: &'a fb::Surface) -> ModeRequest<'a> {
+    ModeRequest::new(
+        Ddi::A,
+        Pipe::A,
+        plan,
+        edid,
+        surface,
+        PllFieldEncoding::Named,
+    )
+    .with_swing(test_swing())
+}
+
+#[test]
+fn the_whole_sequence_writes_in_the_reference_s_order_and_stops_before_the_reads() {
+    let _guard = scheduler_test_context();
+    let (edid, plan) = plan_1080p60();
+    let surface = test_surface();
+    let (regs, _armed) = working_device(67);
+    let regs = Rc::new(regs);
+    // What the write log held when phase 6's first `PIPEDSL` read happened, so
+    // that "nothing is written after the proof starts" is a measurement rather
+    // than a reading of the code.  `PIPEDSL` is read by nothing but phase 6 --
+    // the pre-sample reads the other three registers -- and the arming wait's
+    // `PLANE_SURFLIVE` reads come before it, so a write after this point would
+    // be a write during the proof.
+    let writes_at_first_proof_read = Rc::new(Cell::new(usize::MAX));
+    {
+        let count = Rc::clone(&writes_at_first_proof_read);
+        let mock = Rc::clone(&regs);
+        let reads = Cell::new(0u32);
+        regs.on_read(PIPEDSL_A, move |value| {
+            if count.get() == usize::MAX {
+                count.set(mock.writes().len());
+            }
+            reads.set(reads.get() + 1);
+            value + reads.get() * 67
+        });
+    }
+
+    let outcome = set_mode(&*regs, &FakeClock::new(), &request(&plan, &edid, &surface))
+        .expect("the mock models a working device");
+    assert!(outcome.verdict().is_scanning_out(), "{}", outcome.render());
+    assert_eq!(outcome.mode.clock_khz, 148_500);
+
+    let writes = regs.writes();
+    let names: Vec<&'static str> = writes.iter().map(|(name, _)| *name).collect();
+
+    // 1. The pipe's writes come first, and they are exactly the plan's own
+    //    list -- not a copy of it kept in this test.
+    let planned: Vec<&'static str> = outcome
+        .pipe_state
+        .writes
+        .iter()
+        .map(|write| write.register.name())
+        .collect();
+    assert!(!planned.is_empty(), "the pipe program writes something");
+    assert_eq!(
+        &names[..planned.len()],
+        &planned[..],
+        "the first writes are the plan's, in the plan's order"
+    );
+
+    // 2. `PLANE_SURF` is the last of the plane registers: §5.6's commit.
+    let surface_write = names
+        .iter()
+        .position(|name| *name == PLANE_SURF_A.name())
+        .expect("the plane is armed");
+    assert_eq!(
+        surface_write + 1,
+        planned.len(),
+        "PLANE_SURF is the plan's last write"
+    );
+    assert!(
+        !names[surface_write + 1..]
+            .iter()
+            .any(|name| name.starts_with("PLANE_")),
+        "no plane register is written after the commit: {names:?}"
+    );
+
+    // 3. The timing registers precede the DDB, the watermarks and the plane.
+    let timing_names: Vec<&'static str> = [
+        TimingRegister::Htotal,
+        TimingRegister::Hblank,
+        TimingRegister::Hsync,
+        TimingRegister::Vtotal,
+        TimingRegister::Vblank,
+        TimingRegister::Vsync,
+    ]
+    .iter()
+    .map(|register| outcome.pipe.pipe.timing(*register).name())
+    .collect();
+    let last_timing = timing_names
+        .iter()
+        .filter_map(|name| names.iter().position(|candidate| candidate == name))
+        .max()
+        .expect("the timings were written");
+    let first_plane_group = names
+        .iter()
+        .position(|name| {
+            *name == outcome.pipe.pipe.plane_buf_cfg().name() || name.starts_with("PLANE_")
+        })
+        .expect("the plane group was written");
+    assert!(
+        last_timing < first_plane_group,
+        "every timing register precedes the DDB, the watermarks and the plane: {names:?}"
+    );
+
+    // 4. Nothing the pipe owns is written once the output starts, and the whole
+    //    output sequence is after the whole pipe sequence.
+    let pipe_owned: Vec<&'static str> = planned.clone();
+    let output_names = &names[planned.len()..];
+    assert!(!output_names.is_empty(), "the output sequence writes");
+    assert!(
+        !output_names.iter().any(|name| pipe_owned.contains(name)),
+        "the output does not rewrite the pipe's registers: {output_names:?}"
+    );
+
+    // 5. The DDI-to-PLL mapping is two separate writes, and the DDI buffer is
+    //    the last of the output's.
+    let dpclka = output_names
+        .iter()
+        .filter(|name| **name == "ICL_DPCLKA_CFGCR0")
+        .count();
+    assert_eq!(dpclka, 2, "the mapping, then the clock-off clear");
+    assert_eq!(
+        *output_names.last().expect("the output writes"),
+        DDI_BUF_CTL_A.name(),
+        "DDI_BUF_CTL is written last, after the IS_IDLE poll"
+    );
+    // And the transcoder is enabled before the DDI buffer that consumes it.
+    let transconf = output_names
+        .iter()
+        .position(|name| *name == "PIPECONF_A")
+        .expect("TRANSCONF is written");
+    let ddi_buf = output_names
+        .iter()
+        .position(|name| *name == DDI_BUF_CTL_A.name())
+        .expect("DDI_BUF_CTL is written");
+    assert!(transconf < ddi_buf);
+
+    // 6. Nothing is written after phase 6's first read.
+    assert_ne!(
+        writes_at_first_proof_read.get(),
+        usize::MAX,
+        "phase 6 read something"
+    );
+    assert_eq!(
+        writes.len(),
+        writes_at_first_proof_read.get(),
+        "the proof wrote nothing: {:?}",
+        &names[writes_at_first_proof_read.get()..]
+    );
+
+    // 7. And the framebuffer holds the pattern, because §11 6.5 was painted
+    //    before the plane could scan it.
+    assert_eq!(outcome.pattern.height, 1080);
+    assert_eq!(
+        top_right_pixel(&surface),
+        top_right_expected(),
+        "the pattern is painted, not the black the allocator left"
+    );
+}
+
+#[test]
+fn a_failure_while_arming_the_plane_still_leaves_the_pattern_in_the_framebuffer() {
+    let _guard = scheduler_test_context();
+    // §3.1's ordering claim, as a measurement: the fill happens before the
+    // first register write, so a failure while arming the plane leaves a
+    // framebuffer that is already the pattern rather than a black one.
+    let (edid, plan) = plan_1080p60();
+    let surface = test_surface();
+    let (regs, _armed) = working_device(67);
+    regs.refuse(PLANE_SURF_A);
+    let result = set_mode(&regs, &FakeClock::new(), &request(&plan, &edid, &surface));
+    let Err(error) = result else {
+        panic!("PLANE_SURF refuses the write, so the sequence must fail")
+    };
+    assert!(
+        error.describe().contains("PLANE_SURF"),
+        "{}",
+        error.describe()
+    );
+    assert_eq!(
+        top_right_pixel(&surface),
+        top_right_expected(),
+        "the fill happened before the register write that failed"
+    );
+    // The pattern was written, and the register writes that came before the
+    // refusal did happen: this is a half-programmed pipe, which is why the
+    // sequence stops and says so.
+    assert!(regs.writes().iter().any(|(name, _)| *name == "PLANE_CTL_A"));
+    assert!(
+        !regs
+            .writes()
+            .iter()
+            .any(|(name, _)| *name == "DPLL0_ENABLE")
+    );
+}
+
+#[test]
+fn a_failure_partway_through_phase_five_stops_before_the_proof() {
+    let _guard = scheduler_test_context();
+    // §11 phase 5.7's real-hardware failure: the DDI never leaves idle.  The
+    // pipe is already programmed, so this is exactly the row of the design's
+    // failure table that leaves a pipe running into an output that is not up.
+    let (edid, plan) = plan_1080p60();
+    let surface = test_surface();
+    let (regs, _armed) = working_device(67);
+    regs.derive(DDI_BUF_CTL_A, |_| DDI_BUF_CTL_IS_IDLE);
+    let reads = Rc::new(Cell::new(0u32));
+    let counted = Rc::clone(&reads);
+    regs.on_read(PIPEDSL_A, move |value| {
+        counted.set(counted.get() + 1);
+        value
+    });
+    let result = set_mode(&regs, &FakeClock::new(), &request(&plan, &edid, &surface));
+    let Err(error) = result else {
+        panic!("the DDI never leaves idle, so the sequence must fail")
+    };
+    let text = error.describe();
+    assert!(text.contains("IS_IDLE"), "{text}");
+    assert!(text.contains("DDI"), "{text}");
+    // The pipe was programmed and its last write was the commit...
+    let names: Vec<&str> = regs.writes().iter().map(|(name, _)| *name).collect();
+    assert!(names.contains(&"PLANE_SURF_A"));
+    assert_eq!(names.last(), Some(&"DDI_BUF_CTL(A)"));
+    // ...and phase 6 never ran, because there is no mode to prove.
+    assert_eq!(reads.get(), 0, "the sequence stopped before the proof");
+}
+
+#[test]
+fn no_usable_edid_refuses_before_anything_is_written() {
+    let _guard = scheduler_test_context();
+    let plan = plan_modeset(&[], &Constraints::unlimited());
+    let surface = test_surface();
+    let (regs, _armed) = working_device(67);
+    let result = set_mode(&regs, &FakeClock::new(), &request(&plan, &[], &surface));
+    let Err(error) = result else {
+        panic!("there is no timing to program, so the sequence must refuse")
+    };
+    assert!(
+        matches!(
+            error,
+            ModesetError::Refused(ModeRefusal::NoAdvertisedMode { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .describe()
+            .contains("firmware framebuffer is left alone")
+    );
+    assert!(regs.writes().is_empty(), "nothing was programmed");
+    // And the firmware's framebuffer is untouched: not one pixel was painted.
+    let mut first = [0xffu8; 4];
+    surface.read_bytes(0, &mut first).expect("the first pixel");
+    assert_eq!(first, [0, 0, 0, 0], "the surface is still as allocated");
+}
+
+#[test]
+fn a_display_without_a_usable_cdclk_is_refused_by_name() {
+    let _guard = scheduler_test_context();
+    let (edid, plan) = plan_1080p60();
+    let surface = test_surface();
+    let (regs, _armed) = working_device(67);
+    // The PLL is off, so `observe` reports the bypass clock and no table row.
+    regs.set(regs::CDCLK_PLL_ENABLE, 0);
+    let result = set_mode(&regs, &FakeClock::new(), &request(&plan, &edid, &surface));
+    let Err(error) = result else {
+        panic!("there is no pixel clock, so the sequence must refuse")
+    };
+    assert!(matches!(error, ModesetError::NoCdclk { .. }), "{error:?}");
+    assert!(error.describe().contains("CDCLK"), "{}", error.describe());
+    assert!(regs.writes().is_empty());
+}
+
+#[test]
+fn a_mode_above_the_cdclk_ceiling_gives_way_to_the_reference_timing() {
+    let _guard = scheduler_test_context();
+    // The sink prefers 2560x1440@60 (241.5 MHz) and also offers 1080p60.  On a
+    // 172.8 MHz CDCLK the preferred timing cannot be clocked at all, so the
+    // sequence programs the reference's 1080p60 and says what it set aside.
+    let native = Mode::from_blanking(
+        241_500,
+        2560,
+        160,
+        48,
+        32,
+        1440,
+        41,
+        3,
+        5,
+        ModeFlags::NONE,
+        TimingSource::EdidDtd { index: 0 },
+    );
+    let bytes = assemble_edid(base_block(Some(&native), 1), &[cta_block(&[16])]);
+    let plan = plan_modeset(&bytes, &Constraints::unlimited());
+    assert_eq!(plan.selection.mode.clock_khz, 241_500);
+    // The surface has to match the mode that is actually programmed.
+    let surface = test_surface();
+    let (regs, _armed) = working_device(67);
+    let outcome = set_mode(&regs, &FakeClock::new(), &request(&plan, &bytes, &surface))
+        .expect("1080p60 is what the sequence falls back to");
+    assert_eq!(outcome.mode.clock_khz, 148_500);
+    assert_eq!(outcome.pattern.width, 1920, "the pattern matches the mode");
+    assert!(outcome.choice.overrode_the_mode_layer());
+    assert!(
+        outcome.render().contains("2560x1440"),
+        "the log names what was set aside"
+    );
+}
+
+#[test]
+fn without_swing_values_the_sequence_refuses_before_any_write() {
+    let _guard = scheduler_test_context();
+    // §8.5's HDMI translation values are a `[GAP]`; `output::plan` refuses
+    // rather than inventing them, and the refusal happens before the first
+    // write because the whole program is computed first.
+    let (edid, plan) = plan_1080p60();
+    let surface = test_surface();
+    let (regs, _armed) = working_device(67);
+    let bare = ModeRequest::new(
+        Ddi::A,
+        Pipe::A,
+        &plan,
+        &edid,
+        &surface,
+        PllFieldEncoding::Named,
+    );
+    let result = set_mode(&regs, &FakeClock::new(), &bare);
+    let Err(error) = result else {
+        panic!("without swing values the output cannot be planned")
+    };
+    assert!(matches!(error, ModesetError::Output(_)), "{error:?}");
+    assert!(regs.writes().is_empty(), "computing first means no writes");
+    // The framebuffer is already the pattern, though: the fill precedes the
+    // computation, and a caller that fixes the gap and runs again gets the
+    // same frame rather than a stale one.
+    assert_eq!(top_right_pixel(&surface), top_right_expected());
+}
+
+#[test]
+fn a_port_the_table_has_no_ddi_buf_ctl_for_is_refused_by_name() {
+    let _guard = scheduler_test_context();
+    let (edid, plan) = plan_1080p60();
+    let surface = test_surface();
+    let (regs, _armed) = working_device(67);
+    let request = ModeRequest::new(
+        Ddi::C,
+        Pipe::A,
+        &plan,
+        &edid,
+        &surface,
+        PllFieldEncoding::Named,
+    )
+    .with_swing(test_swing());
+    let result = set_mode(&regs, &FakeClock::new(), &request);
+    let Err(error) = result else {
+        panic!("DDI C is not a combo-PHY port")
+    };
+    assert!(
+        matches!(error, ModesetError::UnsupportedPort { ddi: Ddi::C }),
+        "{error:?}"
+    );
+    assert!(error.describe().contains("Type-C"), "{}", error.describe());
+    assert!(regs.writes().is_empty());
+}
+
+#[test]
+fn a_surface_too_narrow_for_the_pattern_is_refused_by_name() {
+    let _guard = scheduler_test_context();
+    let (edid, plan) = plan_1080p60();
+    // Four columns cannot carry eight bars, and the sequence says so rather
+    // than indexing a bar that does not exist.
+    let gtt = test_gtt();
+    let surface = fb::Surface::allocate(&gtt, 4, 4, fb::Format::Xrgb8888)
+        .expect("a four-pixel surface allocates");
+    let (regs, _armed) = working_device(67);
+    let result = set_mode(&regs, &FakeClock::new(), &request(&plan, &edid, &surface));
+    let Err(error) = result else {
+        panic!("four columns cannot carry eight bars")
+    };
+    assert_eq!(
+        error,
+        ModesetError::Pattern(PatternError::TooNarrow { width: 4 })
+    );
+    assert!(regs.writes().is_empty());
+}
+
+#[test]
+fn a_verdict_that_fails_still_returns_the_outcome_for_the_console_gate() {
+    let _guard = scheduler_test_context();
+    // Phase 6 failing is not an error of the sequence: the mode *was*
+    // programmed, and the caller needs the outcome -- the verdict, the
+    // `PLANE_SURFLIVE` reading and the geometry -- to hand to `scanout`.
+    let (edid, plan) = plan_1080p60();
+    let surface = test_surface();
+    let (regs, _armed) = working_device(0);
+    regs.set(PIPEDSL_A, 0x0000_0010);
+    let outcome = set_mode(&regs, &FakeClock::new(), &request(&plan, &edid, &surface))
+        .expect("the mode was programmed");
+    let verdict = outcome.verdict();
+    assert!(!verdict.is_scanning_out());
+    assert_eq!(verdict.failures().len(), 1);
+    assert_eq!(verdict.failures()[0].0, CheckId::Scanning);
+    // The `surflive` the console verdict wants is still there, because the
+    // plane armed even though the pipe is not counting.
+    assert_eq!(
+        outcome.surflive(),
+        Some(u64::from(outcome.pipe.plane.surf)),
+        "the reading phase 6.2 made travels with the outcome"
+    );
+    assert!(
+        outcome.render().contains("not scanning out"),
+        "{}",
+        outcome.render()
+    );
+}
+
+#[test]
+fn a_repaint_writes_a_different_frame_into_the_same_surface() {
+    let _guard = scheduler_test_context();
+    let (edid, plan) = plan_1080p60();
+    let surface = test_surface();
+    let (regs, _armed) = working_device(67);
+    let first = set_mode(&regs, &FakeClock::new(), &request(&plan, &edid, &surface))
+        .expect("the first frame");
+    assert_eq!(first.pattern.frame, 0);
+    let mut before = [0u8; 4];
+    surface
+        .read_bytes(
+            first.pattern.marker.y * first.pattern.stride + first.pattern.marker.x * 4,
+            &mut before,
+        )
+        .expect("the marker's first pixel");
+
+    let second = set_mode(
+        &regs,
+        &FakeClock::new(),
+        &request(&plan, &edid, &surface).with_frame(1),
+    )
+    .expect("the second frame");
+    assert_eq!(second.pattern.frame, 1);
+    assert_ne!(first.pattern.marker, second.pattern.marker);
+    // The same pixel, after the second fill: frame 0's marker has moved away,
+    // so the bar underneath is what is there now.  Reading where the *marker*
+    // is in each frame would compare two marker pixels and find them equal,
+    // which is what the first version of this test did.
+    let mut after = [0u8; 4];
+    surface
+        .read_bytes(
+            first.pattern.marker.y * first.pattern.stride + first.pattern.marker.x * 4,
+            &mut after,
+        )
+        .expect("the marker's first pixel");
+    assert_ne!(before, after, "the marker moved, so the bytes changed");
+    assert_eq!(
+        u32::from_le_bytes(before),
+        pattern::marker_colour(pattern::BAR_COLORS[0]),
+        "frame 0's marker sits on the white bar"
+    );
+    assert_eq!(
+        u32::from_le_bytes(after),
+        pattern::BAR_COLORS[0],
+        "and the bar is back once it has moved on"
+    );
 }

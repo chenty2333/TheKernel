@@ -26,36 +26,56 @@
 //! the console stays where it was.  The verdict is one value, not four results,
 //! because four results are four chances to check three of them.
 //!
-//! The rest of the driver -- `set_mode`, which runs §11 phases 3 to 5 by
-//! calling the framebuffer, pipe and output sequences, and the
-//! `ModesetReport` that carries every step's outcome to the log and the debug
-//! file -- is **not here yet on purpose**.  It is the layer that calls the
-//! three sibling modules (GGTT/framebuffer, DDI/output, pipe/plane), and
-//! writing it before their signatures exist would mean inventing them.  The
-//! design it will implement is `docs/design/intel-modeset.md`, which is
-//! finished; [`ProveTarget`] and [`ModeChoice`] are the two interfaces it
-//! consumes from this file.
+//! [`set_mode`] is **§11 phases 3 to 6 in one sequence**: it chooses the mode,
+//! paints the pattern into the framebuffer the caller allocated, computes the
+//! whole pipe and output program *before* it writes anything, writes them in
+//! the reference's order, and finishes with [`prove_it`].  It calls the three
+//! sibling modules rather than duplicating them: `fb` for the surface, `pipe`
+//! for §11 phases 3.4 and 4, `output` for phase 5, and WS-3's `pipe::prove` for
+//! the phase 6 reads that are its registers.
 //!
 //! # Where the pattern fits
 //!
 //! §11 phase 6.5's colour bars are not a phase 6 action at all in this driver's
 //! order: the framebuffer is filled *before* the plane is armed, in phase 3.2,
 //! so that no window exists in which a correctly-programmed pipe scans out an
-//! unfilled surface.  [`super::pattern`] generates it; `set_mode` will call it.
+//! unfilled surface.  The fill goes through [`super::pattern::paint_row`], one
+//! line at a time, so that a surface the caller owns can be written through
+//! `fb::Surface::write_bytes` and the bar and marker geometry keeps exactly one
+//! implementation.
+//!
+//! # Attribution: what the registers said before anything was written
+//!
+//! §11 phase 6.4 reads a *latched* bit, and this kernel's register table
+//! declares `PIPESTAT` read-only, so nobody can clear it before arming the
+//! plane.  [`set_mode`] therefore pre-samples the three registers phase 6 reads
+//! before its first write ([`PreSample`]), and the verdict says when a reading
+//! that looks like a failure was already there before this modeset: an underrun
+//! bit that was already set, a DDI that was already idle, a `PLANE_SURFLIVE`
+//! that already named our surface.  Without that, a stale bit is
+//! indistinguishable from one this sequence caused.
 //!
 //! Nothing in this file has run against a display engine.  What the tests
-//! establish is the arithmetic of the mode decision and the verdicts of the
-//! proof against a register file in a `BTreeMap`.
+//! establish is the arithmetic of the mode decision, the *order* of the whole
+//! sequence against a mock register file, and the verdicts of the proof.
 
-use alloc::{format, string::String, vec::Vec};
+use alloc::{format, string::String, vec, vec::Vec};
 use core::cmp::Ordering;
 
 use super::{
+    clk::{self, ClockError},
+    fb::{self, FbError},
     gmbus::PollTimer,
+    hpd::Ddi,
+    output::{
+        self, LinkRate, OutputError, OutputProgram, OutputRequest, OutputState, SwingProgram,
+    },
+    pattern::{self, PatternError, PatternGeometry},
+    pipe::{self, Pipe, PipeError, PipeProgram, PipeState},
+    pll::PllFieldEncoding,
     regs::{
         Register, Registers,
-        ddi::DDI_BUF_CTL_A,
-        pipe::{PIPEDSL_A, PIPESTAT_A, PLANE_SURFLIVE_A},
+        ddi::{DDI_BUF_CTL_A, DDI_BUF_CTL_B},
     },
 };
 use crate::drm::modes::{
@@ -424,40 +444,14 @@ pub(crate) fn mode_line_rate_hz(mode: &Mode) -> Option<u32> {
 // Prove it: reference §11 phase 6
 // ---------------------------------------------------------------------------
 
-/// `PIPEDSL.LINE`, reference §5.2: the low 20 bits are the current scanline.
-pub(crate) const PIPEDSL_LINE_MASK: u32 = (1 << 20) - 1;
-
 /// `DDI_BUF_CTL.IS_IDLE`, reference §8.4.
+///
+/// `output.rs` has a private copy of this bit for phase 5.7's poll; this is
+/// phase 6.3's read of the same bit, a few milliseconds later, which is what
+/// catches a DDI that came up and then went idle again.
 pub(crate) const DDI_BUF_CTL_IS_IDLE: u32 = 1 << 7;
 
-/// `PIPESTAT.PIPE_FIFO_UNDERRUN_STATUS`, reference §5.2 and §11 step 6.4.
-pub(crate) const PIPESTAT_FIFO_UNDERRUN: u32 = 1 << 31;
-
-/// The address bits of `PLANE_SURF` / `PLANE_SURFLIVE`, reference §5.4:
-/// `[31:12]`.  Bits below 12 are not address, and bit 2 is the decrypt flag,
-/// which is not part of the surface's identity for this comparison.
-pub(crate) const PLANE_SURFACE_ADDRESS_MASK: u32 = 0xffff_f000;
-
-/// How long the scan check holds between samples of `PIPEDSL`.
-///
-/// §11 phase 6.1 says "a few milliseconds apart"; 5 ms is a third of a frame at
-/// 60 Hz and about 337 lines at 1920x1080@60 (67.5 kHz line rate), so a pipe
-/// that is scanning at all cannot show the same value twice.  It is short
-/// enough that a pipe which is *not* scanning costs 15 ms of boot rather than a
-/// second.
-pub(crate) const SCAN_SAMPLE_INTERVAL_MICROS: u64 = 5_000;
-
-/// How many samples the scan check takes before it concludes the pipe is not
-/// scanning: the first, then three more across 15 ms.
-///
-/// The check stops at the first change, so the healthy path costs two reads.
-/// The extra two exist because phase 5 has just enabled the transcoder: a pipe
-/// that was enabled microseconds ago may not have advanced a line yet, and
-/// declaring failure before a full frame has passed would report a slow start
-/// as a dead pipe.
-pub(crate) const SCAN_SAMPLES: usize = 4;
-
-/// How long `PLANE_SURFLIVE` is given to read back the surface address.
+/// How long the plane is given to arm before phase 6.2's read is taken.
 ///
 /// The plane arms at a frame boundary after `PLANE_SURF` is written (§5.6:
 /// "`PLANE_SURF` is the commit"), so an immediate read may legitimately show
@@ -466,20 +460,13 @@ pub(crate) const SCAN_SAMPLES: usize = 4;
 /// measured arming latency, because nothing here has run on real hardware.
 pub(crate) const SURFACE_ARM_TIMEOUT_MICROS: u64 = 100_000;
 
-/// A hard bound on the polls the surface check may make.
+/// A hard bound on the polls the arming wait may make.
 ///
-/// `SURFACE_ARM_TIMEOUT_MICROS` is the policy; this is the guarantee that a
-/// broken clock cannot hang the boot path.  It is set well above the number of
-/// polls the timeout needs at the real poll interval, so it can only ever be
-/// reached when time is not moving.
+/// [`SURFACE_ARM_TIMEOUT_MICROS`] is the policy; this is the guarantee that a
+/// clock which does not advance cannot hang the boot path.  It is set well
+/// above the polls the timeout needs at the real poll interval, so it can only
+/// be reached when time is not moving.
 pub(crate) const SURFACE_ARM_POLL_LIMIT: u32 = 100_000;
-
-/// A hard bound on the pauses one sampling interval may take.
-///
-/// [`PollTimer`]'s contract is that `pause` advances `now_micros`, and every
-/// implementation in this kernel honours it; this is the boot path refusing to
-/// depend on another module's contract for its ability to finish.
-const MAX_PAUSES_PER_INTERVAL: u32 = 50_000;
 
 /// How far the observed line rate may differ from the mode's before
 /// [`ScanEvidence::rate_agrees`] says so.
@@ -561,20 +548,16 @@ impl CheckId {
     }
 }
 
-/// One reading of `PIPEDSL`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct ScanSample {
-    /// Microseconds after the first sample of this check.
-    pub(crate) micros: u64,
-    /// The raw `PIPEDSL` value.
-    pub(crate) value: u32,
-}
-
-/// 6.1's evidence: the samples, and the line rate they imply.
+/// 6.1's evidence: what the sampler read, and the line rate it implies.
+///
+/// The values are `PIPEDSL`'s line field, in the order they were read.  The
+/// interval is `pipe`'s sampler's, and the elapsed time is `(n - 1)` of them,
+/// which is exact by the sampler's construction rather than an estimate.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct ScanEvidence {
-    pub(crate) samples: Vec<ScanSample>,
-    /// The line rate derived from the first pair of samples that differed.
+    pub(crate) values: Vec<u32>,
+    pub(crate) interval_micros: u64,
+    /// The line rate derived from the first pair of values that differed.
     /// Compare it with [`mode_line_rate_hz`] of the mode that was programmed:
     /// this is §12.3's scope-less check of the PLL arithmetic.
     pub(crate) observed_line_rate_hz: Option<u32>,
@@ -583,6 +566,11 @@ pub(crate) struct ScanEvidence {
 }
 
 impl ScanEvidence {
+    /// Microseconds between the first and the last sample.
+    pub(crate) fn elapsed_micros(&self) -> u64 {
+        self.values.len().saturating_sub(1) as u64 * self.interval_micros
+    }
+
     /// Whether the observed line rate agrees with the mode's, within
     /// [`LINE_RATE_TOLERANCE_PERCENT`].  `None` when either rate is unknown.
     ///
@@ -592,9 +580,7 @@ impl ScanEvidence {
     /// the derived rate carries several percent of slop; and a pipe scanning at
     /// the wrong rate is still scanning, which is what 6.1 asks.  What the
     /// number is for is §12.3's use: it is the only way to check the PLL
-    /// arithmetic on the real machine without a scope, and a mismatch of tens
-    /// of percent is worth a person's attention even though it is not a
-    /// failure.
+    /// arithmetic on the real machine without a scope.
     pub(crate) fn rate_agrees(&self) -> Option<bool> {
         let (observed, expected) = (self.observed_line_rate_hz?, self.expected_line_rate_hz?);
         if expected == 0 {
@@ -611,24 +597,96 @@ impl ScanEvidence {
 /// 6.2's evidence.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct SurfaceEvidence {
+    /// The `PLANE_SURF` field that was written.
     pub(crate) expected: u32,
+    /// What `PLANE_SURFLIVE` read.
     pub(crate) live: u32,
-    /// How many reads it took to see the address, which is how long the plane
-    /// took to arm in polls.
+    /// How many reads the arming wait made before the proof's read.
     pub(crate) polls: u32,
     pub(crate) waited_micros: u64,
+    /// Whether the register *already* named this surface before the modeset
+    /// wrote anything.
+    ///
+    /// True means the read-back cannot be attributed to this sequence: the
+    /// plane was armed on this address when the modeset started, so a match
+    /// afterwards proves nothing about the write.  Recorded rather than
+    /// suppressed, because a report that said only "SURFLIVE == the address"
+    /// would be claiming evidence it does not have.
+    pub(crate) pre_matching: bool,
 }
 
 /// 6.3's evidence.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct DdiEvidence {
     pub(crate) ddi_buf_ctl: u32,
+    /// Whether the DDI was already out of idle *before* the modeset wrote
+    /// anything.  On a pass that means the read-back does not attribute the
+    /// running DDI to this sequence; on a failure it is the difference between
+    /// a DDI that never came up and one that came up and went back to idle.
+    pub(crate) pre_active: bool,
 }
 
 /// 6.4's evidence.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct UnderrunEvidence {
     pub(crate) pipestat: u32,
+    /// Whether the sticky underrun bit was already set before the modeset wrote
+    /// anything.
+    pub(crate) pre_existing: bool,
+}
+
+/// What phase 6's three registers said **before the modeset's first write**.
+///
+/// §11 phase 6.4 reads a latched bit and this kernel's register table declares
+/// `PIPESTAT` read-only, so nothing here can clear it before the plane is
+/// armed.  The pre-sample is what makes the difference between "an underrun is
+/// latched" and "an underrun happened during this modeset"; the same reasoning
+/// applies to a DDI that was already idle and to a `PLANE_SURFLIVE` that
+/// already named our surface.
+///
+/// A field is `None` when the register could not be read before the writes,
+/// which is itself a finding: the verdict then says the reading cannot be
+/// attributed rather than guessing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct PreSample {
+    pub(crate) pipestat: Option<u32>,
+    pub(crate) plane_surflive: Option<u32>,
+    pub(crate) ddi_buf_ctl: Option<u32>,
+}
+
+impl PreSample {
+    /// Read the three registers phase 6 will read again, before anything is
+    /// written.
+    pub(crate) fn take<R: Registers>(
+        regs: &R,
+        program: &PipeProgram,
+        ddi_buf_ctl: Register,
+    ) -> PreSample {
+        PreSample {
+            pipestat: regs.read(program.pipe.pipestat()),
+            plane_surflive: regs.read(program.pipe.plane_surflive()),
+            ddi_buf_ctl: regs.read(ddi_buf_ctl),
+        }
+    }
+
+    /// Whether the sticky FIFO-underrun bit was already set.
+    pub(crate) fn underrun_already_set(&self) -> bool {
+        self.pipestat
+            .is_some_and(|value| value & pipe::PIPE_FIFO_UNDERRUN_STATUS != 0)
+    }
+
+    /// Whether the DDI was already out of idle (which is the *good* state:
+    /// `IS_IDLE` clear means the DDI is running).
+    pub(crate) fn ddi_already_active(&self) -> bool {
+        self.ddi_buf_ctl
+            .is_some_and(|value| value & DDI_BUF_CTL_IS_IDLE == 0)
+    }
+
+    /// Whether `PLANE_SURFLIVE` already named this surface.
+    pub(crate) fn surface_already_live(&self, expected: u32) -> bool {
+        self.plane_surflive
+            .is_some_and(|value| value & pipe::PLANE_SURF_ADDRESS_MASK == expected)
+    }
 }
 
 /// Why a check failed.  Every variant carries the reading it was decided from,
@@ -637,28 +695,67 @@ pub(crate) struct UnderrunEvidence {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum ProveFailure {
     /// 6.1: every sample read the same value.
-    NotScanning { samples: Vec<ScanSample> },
+    NotScanning {
+        values: Vec<u32>,
+        interval_micros: u64,
+    },
     /// 6.2: `PLANE_SURFLIVE` never read back the surface address.
     SurfaceNotLive {
         expected: u32,
         live: u32,
         polls: u32,
         waited_micros: u64,
+        /// See [`SurfaceEvidence::pre_matching`].  True here means the plane was
+        /// armed on this surface before the modeset ran and is not any more.
+        pre_matching: bool,
     },
     /// 6.3: the DDI buffer says it is still idle.
-    DdiIdle { ddi_buf_ctl: u32 },
+    DdiIdle {
+        ddi_buf_ctl: u32,
+        /// Whether it was already out of idle before this modeset wrote
+        /// anything, which is what separates "it never came up" from "it came
+        /// up and went back to idle".
+        pre_active: bool,
+    },
     /// 6.4: the sticky FIFO-underrun bit is set.
     ///
     /// The bit is sticky and this kernel declares `PIPESTAT` read-only, so it
-    /// cannot be cleared before the plane is armed: a set bit may predate this
-    /// modeset.  It is still the first thing to check, which is why the verdict
-    /// points at the watermarks rather than staying silent.
-    FifoUnderrun { pipestat: u32 },
+    /// cannot be cleared before the plane is armed.  `pre_existing` is what
+    /// says whether the bit was already set before this modeset: when it was,
+    /// the verdict reports the reading and says it cannot be attributed here.
+    FifoUnderrun { pipestat: u32, pre_existing: bool },
     /// The register could not be read at all -- outside the mapped window.
     Unreadable {
         check: CheckId,
         register: &'static str,
     },
+}
+
+/// The three registers phase 6 reads that are not the pipe's, plus the numbers
+/// it compares against.
+///
+/// The pipe's own three reads come from WS-3's `pipe::prove`, which owns those
+/// registers; this carries what that call cannot know: which DDI the mode was
+/// set on, and the line rate the mode implies.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ProveTarget {
+    /// The `DDI_BUF_CTL` of the port the mode was set on.
+    pub(crate) ddi_buf_ctl: Register,
+    /// The line rate the mode implies, from [`mode_line_rate_hz`].
+    pub(crate) line_rate_hz: Option<u32>,
+}
+
+impl ProveTarget {
+    /// The target for a port the register table has a `DDI_BUF_CTL` for.
+    pub(crate) const fn port(ddi: Ddi, line_rate_hz: Option<u32>) -> Option<ProveTarget> {
+        match ddi_buf_ctl_register(ddi) {
+            Some(ddi_buf_ctl) => Some(ProveTarget {
+                ddi_buf_ctl,
+                line_rate_hz,
+            }),
+            None => None,
+        }
+    }
 }
 
 /// What phase 6 found, check by check.
@@ -720,94 +817,98 @@ impl ProveReport {
         }
     }
 
+    /// The `PLANE_SURFLIVE` address field §11 phase 6.2 read, as the
+    /// **graphics address** `scanout::Verdict::Scanning` wants.
+    ///
+    /// The register holds `PLANE_SURF`'s `[31:12]`, which *is* the GGTT address
+    /// with its low twelve bits zero -- the alignment `PipeProgram` refuses an
+    /// address for not having.  So this is the value to hand to WS-1 rather
+    /// than re-reading the register.  `None` when it could not be read at all.
+    pub(crate) fn surflive(&self) -> Option<u64> {
+        let live = match &self.surface {
+            Ok(evidence) => evidence.live,
+            Err(ProveFailure::SurfaceNotLive { live, .. }) => *live,
+            Err(_) => return None,
+        };
+        Some(u64::from(live & pipe::PLANE_SURF_ADDRESS_MASK))
+    }
+
     /// The verdict for one check, as the line a report carries.
     pub(crate) fn line(&self, check: CheckId) -> String {
-        match check {
+        let text = match check {
             CheckId::Scanning => match &self.scan {
                 Ok(evidence) => {
-                    let first = evidence.samples.first();
-                    let last = evidence.samples.last();
+                    let rate = match (
+                        evidence.observed_line_rate_hz,
+                        evidence.expected_line_rate_hz,
+                    ) {
+                        (Some(observed), Some(expected)) => format!(
+                            ", line rate {observed} Hz against the mode's {expected} Hz ({})",
+                            match evidence.rate_agrees() {
+                                Some(true) => "agrees",
+                                Some(false) => "DOES NOT AGREE",
+                                None => "not comparable",
+                            }
+                        ),
+                        (Some(observed), None) => format!(", line rate {observed} Hz"),
+                        _ => String::new(),
+                    };
                     format!(
-                        "{} {}: {} samples over {} us{}; {}",
-                        check.reference(),
-                        check.title(),
-                        evidence.samples.len(),
-                        last.map(|sample| sample.micros).unwrap_or(0),
-                        match (
-                            evidence.observed_line_rate_hz,
-                            evidence.expected_line_rate_hz
-                        ) {
-                            (Some(observed), Some(expected)) => format!(
-                                ", line rate {observed} Hz against the mode's {expected} Hz ({})",
-                                match evidence.rate_agrees() {
-                                    Some(true) => "agrees",
-                                    Some(false) => "DOES NOT AGREE",
-                                    None => "not comparable",
-                                }
-                            ),
-                            (Some(observed), None) => format!(", line rate {observed} Hz"),
-                            _ => String::new(),
-                        },
-                        match (first, last) {
+                        "{} samples over {} us{}; {}",
+                        evidence.values.len(),
+                        evidence.elapsed_micros(),
+                        rate,
+                        match (evidence.values.first(), evidence.values.last()) {
                             (Some(first), Some(last)) =>
-                                format!("changed: {:#010x} -> {:#010x}", first.value, last.value),
+                                format!("changed: {first:#010x} -> {last:#010x}"),
                             _ => String::from("changed"),
-                        },
+                        }
                     )
                 }
-                Err(failure) => format!(
-                    "{} {}: FAILED -- {}",
-                    check.reference(),
-                    check.title(),
-                    describe_failure(failure)
-                ),
+                Err(failure) => format!("FAILED -- {}", describe_failure(failure)),
             },
             CheckId::SurfaceLive => match &self.surface {
                 Ok(evidence) => format!(
-                    "{} {}: {} == {} after {} poll(s), {} us",
-                    check.reference(),
-                    check.title(),
+                    "{} == {} after {} poll(s), {} us{}",
                     super::hex(u64::from(evidence.live), 8),
                     super::hex(u64::from(evidence.expected), 8),
                     evidence.polls,
                     evidence.waited_micros,
+                    if evidence.pre_matching {
+                        "; the register already named this surface before the modeset wrote, so \
+                         the read-back does not attribute the arm to this write"
+                    } else {
+                        ""
+                    }
                 ),
-                Err(failure) => format!(
-                    "{} {}: FAILED -- {}",
-                    check.reference(),
-                    check.title(),
-                    describe_failure(failure)
-                ),
+                Err(failure) => format!("FAILED -- {}", describe_failure(failure)),
             },
             CheckId::DdiActive => match &self.ddi {
                 Ok(evidence) => format!(
-                    "{} {}: DDI_BUF_CTL = {}",
-                    check.reference(),
-                    check.title(),
+                    "DDI_BUF_CTL = {}{}",
                     super::hex(u64::from(evidence.ddi_buf_ctl), 8),
+                    if evidence.pre_active {
+                        " (the DDI was already out of idle before this modeset wrote)"
+                    } else {
+                        ""
+                    }
                 ),
-                Err(failure) => format!(
-                    "{} {}: FAILED -- {}",
-                    check.reference(),
-                    check.title(),
-                    describe_failure(failure)
-                ),
+                Err(failure) => format!("FAILED -- {}", describe_failure(failure)),
             },
             CheckId::FifoUnderrun => match &self.underrun {
                 Ok(evidence) => format!(
-                    "{} {}: PIPESTAT = {}",
-                    check.reference(),
-                    check.title(),
+                    "PIPESTAT = {}{}",
                     super::hex(u64::from(evidence.pipestat), 8),
+                    if evidence.pre_existing {
+                        " (the bit was set before this modeset and is clear now)"
+                    } else {
+                        ""
+                    }
                 ),
-                Err(failure) => format!(
-                    "{} {}: FAILED -- {}",
-                    check.reference(),
-                    check.title(),
-                    describe_failure(failure)
-                ),
+                Err(failure) => format!("FAILED -- {}", describe_failure(failure)),
             },
-        }
+        };
+        format!("{} {}: {text}", check.reference(), check.title())
     }
 
     /// The phase's report, for `/sys/kernel/debug/dri/0/intel_gpu`.
@@ -835,7 +936,7 @@ impl ProveReport {
         out
     }
 
-    /// Write the same lines to the kernel log as they are produced.
+    /// Write the same lines to the kernel log.
     ///
     /// The last line is the verdict, which is also what the console handover
     /// reads: one line in the log and one value in memory say the same thing.
@@ -869,10 +970,11 @@ impl ProveReport {
 
 /// §11 phase 6's answer, as one value a caller can test.
 ///
-/// **This is the console handover's gate** (`drm::screen`).  The Intel surface
-/// may become the console's only when this is [`ScanoutVerdict::ScanningOut`];
-/// anything else must leave the console where it is, which is what makes the
-/// handover a decision rather than a side effect of programming registers.
+/// **This is the console handover's gate** (`drm::screen` through
+/// `scanout::register`).  The Intel surface may become the console's only when
+/// this is [`ScanoutVerdict::ScanningOut`]; anything else must leave the console
+/// where it is, which is what makes the handover a decision rather than a side
+/// effect of programming registers.
 ///
 /// It is one value on purpose.  Four separate results are four chances for a
 /// caller to check three of them, and a console handed to a pipe that is not
@@ -901,8 +1003,8 @@ impl ScanoutVerdict {
         }
     }
 
-    /// The reason to hand to `screen::Unavailable::Failed`, or `None` when the
-    /// console may move.
+    /// The reason to hand to `scanout::Verdict::NotScanning`, or `None` when
+    /// the console may move.
     ///
     /// Written here rather than at the call site so that the sentence a person
     /// reads in the boot log is the sentence a test asserts on, and so the
@@ -949,21 +1051,19 @@ impl ScanoutVerdict {
 /// The reading a failure was decided from, as one clause.
 fn describe_failure(failure: &ProveFailure) -> String {
     match failure {
-        ProveFailure::NotScanning { samples } => {
-            let values: Vec<String> = samples
+        ProveFailure::NotScanning {
+            values,
+            interval_micros,
+        } => {
+            let hexes: Vec<String> = values
                 .iter()
-                .map(|sample| {
-                    format!(
-                        "{}@{}us",
-                        super::hex(u64::from(sample.value), 8),
-                        sample.micros
-                    )
-                })
+                .map(|value| format!("{value:#010x}"))
                 .collect();
+            let span = values.len().saturating_sub(1) as u64 * interval_micros;
             format!(
-                "PIPEDSL read the same value {} times across the whole window: {}",
-                samples.len(),
-                values.join(", ")
+                "PIPEDSL read the same value on all {} samples over {span} us: {}",
+                values.len(),
+                hexes.join(", ")
             )
         }
         ProveFailure::SurfaceNotLive {
@@ -971,19 +1071,44 @@ fn describe_failure(failure: &ProveFailure) -> String {
             live,
             polls,
             waited_micros,
+            pre_matching,
         } => format!(
             "PLANE_SURFLIVE read {} but {} was written, after {polls} poll(s) over \
-             {waited_micros} us",
+             {waited_micros} us{}",
             super::hex(u64::from(*live), 8),
             super::hex(u64::from(*expected), 8),
+            if *pre_matching {
+                "; it already read that before this modeset wrote anything, so the plane was armed \
+                 on this surface and has since moved off it"
+            } else {
+                ""
+            }
         ),
-        ProveFailure::DdiIdle { ddi_buf_ctl } => format!(
-            "DDI_BUF_CTL = {} still has IS_IDLE set",
-            super::hex(u64::from(*ddi_buf_ctl), 8)
+        ProveFailure::DdiIdle {
+            ddi_buf_ctl,
+            pre_active,
+        } => format!(
+            "DDI_BUF_CTL = {} still has IS_IDLE set{}",
+            super::hex(u64::from(*ddi_buf_ctl), 8),
+            if *pre_active {
+                ", and it was already out of idle before this modeset wrote anything, so it came \
+                 up and went back to idle"
+            } else {
+                ", and it was idle before this modeset wrote anything too: it never came up"
+            }
         ),
-        ProveFailure::FifoUnderrun { pipestat } => format!(
-            "PIPESTAT = {} has PIPE_FIFO_UNDERRUN_STATUS set",
-            super::hex(u64::from(*pipestat), 8)
+        ProveFailure::FifoUnderrun {
+            pipestat,
+            pre_existing,
+        } => format!(
+            "PIPESTAT = {} has PIPE_FIFO_UNDERRUN_STATUS set{}",
+            super::hex(u64::from(*pipestat), 8),
+            if *pre_existing {
+                ", and it was already set before this modeset wrote anything, so it may predate it \
+                 -- the bit is sticky and this kernel's register table declares PIPESTAT read-only"
+            } else {
+                ""
+            }
         ),
         ProveFailure::Unreadable { check, register } => format!(
             "{register} could not be read, so check {} could not run: the register is outside the \
@@ -993,210 +1118,563 @@ fn describe_failure(failure: &ProveFailure) -> String {
     }
 }
 
-/// The pipe and port phase 6 proves things about, and the numbers it checks
-/// them against.
-///
-/// The registers are values rather than a pipe index because the pipe and DDI
-/// sequences belong to the sibling workstreams: this is the seam, so that
-/// whatever type those modules end up using for "the pipe we programmed" only
-/// has to produce four named registers and two numbers.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct ProveTarget {
-    /// The address written to `PLANE_SURF`, compared against `PLANE_SURFLIVE`.
-    /// A 32-bit value because that is the whole of the register (§5.4).
-    pub(crate) surface: u32,
-    /// The line rate the mode implies, from [`mode_line_rate_hz`], when the
-    /// caller knows the mode.  Reported next to the observed rate.
-    pub(crate) line_rate_hz: Option<u32>,
-    pub(crate) pipedsl: Register,
-    pub(crate) plane_surflive: Register,
-    pub(crate) ddi_buf_ctl: Register,
-    pub(crate) pipestat: Register,
-}
-
-impl ProveTarget {
-    /// Pipe A, plane 1 and port A -- the pipeline §11's checklist assumes
-    /// ("pipe A, transcoder A, combo PHY A, HDMI/DVI, one plane").
-    pub(crate) const fn pipe_a(surface: u32, line_rate_hz: Option<u32>) -> ProveTarget {
-        ProveTarget {
-            surface,
-            line_rate_hz,
-            pipedsl: PIPEDSL_A,
-            plane_surflive: PLANE_SURFLIVE_A,
-            ddi_buf_ctl: DDI_BUF_CTL_A,
-            pipestat: PIPESTAT_A,
-        }
-    }
-}
-
 /// Reference §11 phase 6, "prove it", against one pipe and port.
 ///
-/// This is deliberately pure: it reads registers, waits on the caller's timer
-/// and returns a verdict.  It writes nothing, enables nothing and logs nothing,
-/// so a host test can drive it against a mock register file and a clock it
-/// owns, and the boot path can hand it the mapped aperture and the machine's
-/// clock.
+/// **The reads are WS-3's and the verdict is this module's.**  `pipe::prove`
+/// owns 6.1, 6.2 and 6.4 because it owns those registers and their sampling
+/// policy; this function gives the plane its arming window first, takes 6.3's
+/// one read of `DDI_BUF_CTL` (which is the output workstream's register, read
+/// here because phase 6 asks the question), and assembles the single
+/// [`ScanoutVerdict`] the console gate tests.
 ///
-/// The four checks and the policy behind each:
-///
-/// * **6.1** `PIPEDSL` is sampled up to [`SCAN_SAMPLES`] times,
-///   [`SCAN_SAMPLE_INTERVAL_MICROS`] apart, and the first change ends the
-///   check.  Equal values throughout are [`ProveFailure::NotScanning`].  The
-///   samples travel with the verdict, and so does the line rate they imply.
-/// * **6.2** `PLANE_SURFLIVE` is polled until it matches the address written,
-///   for up to [`SURFACE_ARM_TIMEOUT_MICROS`], because the plane arms at a
-///   frame boundary rather than at the write.
-/// * **6.3** and **6.4** are read once each.  They are live and latched status
-///   bits: a retry would not make them more true, and a retry that *passed*
-///   after a first read failed would hide exactly the fault the check exists to
-///   report.
+/// It writes nothing and logs nothing, so a host test can drive it against a
+/// mock register file and a clock it owns.
 pub(crate) fn prove_it<R: Registers, T: PollTimer>(
     regs: &R,
     timer: &T,
+    program: &PipeProgram,
     target: &ProveTarget,
+    pre: &PreSample,
 ) -> ProveReport {
+    // 6.2 first: the plane arms at a frame boundary after `PLANE_SURF` is
+    // written, so phase 6.2's read is taken after a bounded wait rather than
+    // immediately.  The wait is this module's policy; the read that *decides*
+    // is `pipe::prove`'s.
+    let arming = wait_for_plane_arm(regs, timer, program);
+    let checks = pipe::prove(regs, program, timer);
+
+    let scan = match checks.scanline {
+        pipe::ScanlineCheck::Scanning { samples }
+        | pipe::ScanlineCheck::NotScanning { samples } => {
+            let values = samples.to_vec();
+            let scan = ScanEvidence {
+                observed_line_rate_hz: line_rate(&values, pipe::SCANLINE_INTERVAL_MICROS),
+                expected_line_rate_hz: target.line_rate_hz,
+                interval_micros: pipe::SCANLINE_INTERVAL_MICROS,
+                values,
+            };
+            if checks.scanline.is_ok() {
+                Ok(scan)
+            } else {
+                Err(ProveFailure::NotScanning {
+                    values: scan.values,
+                    interval_micros: scan.interval_micros,
+                })
+            }
+        }
+        pipe::ScanlineCheck::Unreadable { register } => Err(ProveFailure::Unreadable {
+            check: CheckId::Scanning,
+            register,
+        }),
+    };
+
+    let surface = match checks.surface {
+        pipe::SurfaceCheck::Armed { live, wrote } => Ok(SurfaceEvidence {
+            expected: wrote,
+            live,
+            polls: arming.polls,
+            waited_micros: arming.waited_micros,
+            pre_matching: pre.surface_already_live(wrote),
+        }),
+        pipe::SurfaceCheck::NotArmed { live, wrote } => Err(ProveFailure::SurfaceNotLive {
+            expected: wrote,
+            live,
+            polls: arming.polls,
+            waited_micros: arming.waited_micros,
+            pre_matching: pre.surface_already_live(wrote),
+        }),
+        pipe::SurfaceCheck::Unreadable { register } => Err(ProveFailure::Unreadable {
+            check: CheckId::SurfaceLive,
+            register,
+        }),
+    };
+
+    let underrun = match checks.underrun {
+        pipe::UnderrunCheck::Clear { stat } => Ok(UnderrunEvidence {
+            pipestat: stat,
+            pre_existing: pre.underrun_already_set(),
+        }),
+        pipe::UnderrunCheck::Underrun { stat, .. } => Err(ProveFailure::FifoUnderrun {
+            pipestat: stat,
+            pre_existing: pre.underrun_already_set(),
+        }),
+        pipe::UnderrunCheck::Unreadable { register } => Err(ProveFailure::Unreadable {
+            check: CheckId::FifoUnderrun,
+            register,
+        }),
+    };
+
+    // 6.3: the DDI.  One read, taken now rather than during phase 5, because
+    // the question phase 6 asks is whether it is *still* out of idle.
+    let ddi = match regs.read(target.ddi_buf_ctl) {
+        Some(value) if value & DDI_BUF_CTL_IS_IDLE == 0 => Ok(DdiEvidence {
+            ddi_buf_ctl: value,
+            pre_active: pre.ddi_already_active(),
+        }),
+        Some(value) => Err(ProveFailure::DdiIdle {
+            ddi_buf_ctl: value,
+            pre_active: pre.ddi_already_active(),
+        }),
+        None => Err(ProveFailure::Unreadable {
+            check: CheckId::DdiActive,
+            register: target.ddi_buf_ctl.name(),
+        }),
+    };
+
     ProveReport {
-        scan: scan_check(regs, timer, target),
-        surface: surface_check(regs, timer, target),
-        ddi: ddi_check(regs, target),
-        underrun: underrun_check(regs, target),
+        scan,
+        surface,
+        ddi,
+        underrun,
     }
 }
 
-/// 6.1: `PIPEDSL` must change.
-fn scan_check<R: Registers, T: PollTimer>(
+/// Wait for `PLANE_SURFLIVE` to read back the surface, or for the budget to run
+/// out.
+fn wait_for_plane_arm<R: Registers, T: PollTimer>(
     regs: &R,
     timer: &T,
-    target: &ProveTarget,
-) -> Result<ScanEvidence, ProveFailure> {
-    let first = read(regs, target.pipedsl, CheckId::Scanning)?;
-    let mut samples = Vec::with_capacity(SCAN_SAMPLES);
-    samples.push(ScanSample {
-        micros: 0,
-        value: first,
-    });
+    program: &PipeProgram,
+) -> ArmWait {
+    let register = program.pipe.plane_surflive();
+    let expected = program.plane.surf & pipe::PLANE_SURF_ADDRESS_MASK;
     let start = timer.now_micros();
-    let mut changed = false;
-    for _ in 1..SCAN_SAMPLES {
-        wait(timer, SCAN_SAMPLE_INTERVAL_MICROS);
-        let value = read(regs, target.pipedsl, CheckId::Scanning)?;
-        samples.push(ScanSample {
-            micros: timer.now_micros().saturating_sub(start),
-            value,
-        });
-        if value != first {
-            changed = true;
-            break;
+    let mut polls = 0u32;
+    loop {
+        if let Some(live) = regs.read(register) {
+            polls += 1;
+            if live & pipe::PLANE_SURF_ADDRESS_MASK == expected {
+                return ArmWait {
+                    polls,
+                    waited_micros: timer.now_micros().saturating_sub(start),
+                };
+            }
+        } else {
+            // The register is not readable; `pipe::prove` will report that as
+            // `Unreadable`, and waiting cannot change it.
+            return ArmWait {
+                polls,
+                waited_micros: timer.now_micros().saturating_sub(start),
+            };
         }
+        let waited_micros = timer.now_micros().saturating_sub(start);
+        if waited_micros >= SURFACE_ARM_TIMEOUT_MICROS || polls >= SURFACE_ARM_POLL_LIMIT {
+            return ArmWait {
+                polls,
+                waited_micros,
+            };
+        }
+        timer.pause();
     }
-    if !changed {
-        return Err(ProveFailure::NotScanning { samples });
-    }
-    let observed_line_rate_hz = line_rate(&samples);
-    Ok(ScanEvidence {
-        samples,
-        observed_line_rate_hz,
-        expected_line_rate_hz: target.line_rate_hz,
-    })
+}
+
+/// What the arming wait saw.  The value it last read travels no further: the
+/// reading phase 6.2 is decided from is `pipe::prove`'s, taken after this wait.
+struct ArmWait {
+    polls: u32,
+    waited_micros: u64,
 }
 
 /// The line rate implied by the first pair of samples that differed.
-fn line_rate(samples: &[ScanSample]) -> Option<u32> {
-    let pair = samples
-        .windows(2)
-        .find(|pair| pair[0].value != pair[1].value)?;
-    let elapsed = pair[1].micros.saturating_sub(pair[0].micros);
-    if elapsed == 0 {
+fn line_rate(values: &[u32], interval_micros: u64) -> Option<u32> {
+    let pair = values.windows(2).find(|pair| pair[0] != pair[1])?;
+    if interval_micros == 0 {
         return None;
     }
     let lines = u64::from(
-        (pair[1].value & PIPEDSL_LINE_MASK).wrapping_sub(pair[0].value & PIPEDSL_LINE_MASK),
+        (pair[1] & pipe::PIPEDSL_LINE_MASK).wrapping_sub(pair[0] & pipe::PIPEDSL_LINE_MASK),
     );
     if lines == 0 {
         return None;
     }
-    Some((lines.saturating_mul(1_000_000) / elapsed).min(u64::from(u32::MAX)) as u32)
+    Some((lines.saturating_mul(1_000_000) / interval_micros).min(u64::from(u32::MAX)) as u32)
 }
 
-/// 6.2: `PLANE_SURFLIVE` must read back the address that was written.
-fn surface_check<R: Registers, T: PollTimer>(
+/// The `DDI_BUF_CTL` register of a DDI, for the ports the register table has
+/// one for.
+///
+/// §8.1: the combo-PHY ports are A and B; C and D are the Type-C/DKL ports,
+/// whose table entries `output.rs` refuses before it computes a value and which
+/// the reference's §8.8 defers entirely.
+pub(crate) const fn ddi_buf_ctl_register(ddi: Ddi) -> Option<Register> {
+    match ddi {
+        Ddi::A => Some(DDI_BUF_CTL_A),
+        Ddi::B => Some(DDI_BUF_CTL_B),
+        Ddi::C | Ddi::D => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The sequence: reference §11 phases 3.2 to 6
+// ---------------------------------------------------------------------------
+
+/// Everything [`set_mode`] is told.
+///
+/// The surface is a parameter and is never allocated here: §11 phase 3.2's
+/// allocation is the framebuffer workstream's, and a sequence that allocated
+/// its own memory could not be run twice against the same buffer, which is what
+/// a repaint needs.
+pub(crate) struct ModeRequest<'a> {
+    /// The DDI the monitor answered on -- `sink.rs`'s `Pin::ddi()` is the
+    /// authority for which physical port that is (§11 phase 2.3).
+    pub(crate) ddi: Ddi,
+    /// §11's preamble assumes pipe A; the type allows any pipe the register
+    /// table has, and the pipe program carries which one it is.
+    pub(crate) pipe: Pipe,
+    /// What the mode layer decided, from the EDID below.
+    pub(crate) plan: &'a ModePlan,
+    /// The validated EDID bytes, for [`choose_mode`]'s search.
+    pub(crate) edid: &'a [u8],
+    /// The framebuffer to scan out and to paint the pattern into.
+    pub(crate) surface: &'a fb::Surface,
+    /// §11 phase 6.5's frame counter.  Zero for the first fill; a caller that
+    /// repaints advances it, which is what makes the marker move.
+    pub(crate) frame: u64,
+    /// §6.3's `CFGCR1` field encoding.  No default: `output.rs` refuses to
+    /// guess between the two conventions the sources disagree about.
+    pub(crate) encoding: PllFieldEncoding,
+    /// §8.5's voltage-swing values, or `None` when nobody has them, which
+    /// makes the sequence refuse with `output`'s `MissingBufferTranslation`
+    /// naming the table and §13.1 item 12.
+    pub(crate) swing: Option<SwingProgram>,
+    /// `DDI_BUF_CTL.PHY_LINK_RATE`.  §8.6 gives no sourced HDMI encoding for
+    /// it, so the honest value is [`LinkRate::NoSourcedEncoding`] until a
+    /// working dump settles it (§13.4).
+    pub(crate) link_rate: LinkRate,
+}
+
+impl<'a> ModeRequest<'a> {
+    /// The first-light-up request: HDMI, frame zero, the swing values the
+    /// caller has (possibly none), and no sourced link-rate encoding.
+    pub(crate) const fn new(
+        ddi: Ddi,
+        pipe: Pipe,
+        plan: &'a ModePlan,
+        edid: &'a [u8],
+        surface: &'a fb::Surface,
+        encoding: PllFieldEncoding,
+    ) -> Self {
+        Self {
+            ddi,
+            pipe,
+            plan,
+            edid,
+            surface,
+            frame: 0,
+            encoding,
+            swing: None,
+            link_rate: LinkRate::NoSourcedEncoding,
+        }
+    }
+
+    /// The pattern's frame counter, for a caller that repaints.
+    pub(crate) const fn with_frame(mut self, frame: u64) -> Self {
+        self.frame = frame;
+        self
+    }
+
+    /// §8.5's voltage-swing values.
+    pub(crate) const fn with_swing(mut self, swing: SwingProgram) -> Self {
+        self.swing = Some(swing);
+        self
+    }
+
+    /// `DDI_BUF_CTL.PHY_LINK_RATE`.
+    pub(crate) const fn with_link_rate(mut self, link_rate: LinkRate) -> Self {
+        self.link_rate = link_rate;
+        self
+    }
+}
+
+/// What one mode set did, step by step.
+///
+/// Everything is here for the same reason the power and sink reports keep
+/// their observations: on the target the console is the only output device, so
+/// the boot log's copy of this is what a person reads, and the debug file's
+/// copy is what they read again an hour later.
+pub(crate) struct ModeOutcome {
+    /// Whose decision the mode was, and why.
+    pub(crate) choice: ModeChoice,
+    pub(crate) mode: Mode,
+    /// §11 phase 6.5's pattern: what was drawn, and where its marker is.
+    pub(crate) pattern: PatternGeometry,
+    /// What phase 6's registers said before the first write.
+    pub(crate) pre_sample: PreSample,
+    /// What phase 3.4 and 4 wrote, and the exact list of writes.
+    pub(crate) pipe: PipeProgram,
+    pub(crate) pipe_state: PipeState,
+    /// What phase 5 planned and what it left behind.
+    pub(crate) output: OutputProgram,
+    pub(crate) output_state: OutputState,
+    /// §11 phase 6.
+    pub(crate) prove: ProveReport,
+}
+
+impl ModeOutcome {
+    /// §11 phase 6's answer, which is what the console handover is gated on.
+    pub(crate) fn verdict(&self) -> ScanoutVerdict {
+        self.prove.verdict()
+    }
+
+    /// The `PLANE_SURFLIVE` reading, for `scanout::Verdict::Scanning`.
+    pub(crate) fn surflive(&self) -> Option<u64> {
+        self.prove.surflive()
+    }
+
+    /// Everything the run observed, as text.
+    ///
+    /// The mode choice, the pattern and its marker, every pipe write in order,
+    /// the PLL's dividers and the rate they achieve, and phase 6's four
+    /// readings with the verdict: enough for a person looking at the panel to
+    /// check what they see against what the driver says it did.
+    pub(crate) fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("intel-modeset: {}\n", self.choice.describe()));
+        out.push_str(&format!("intel-modeset: {}\n", self.pattern.describe()));
+        out.push_str(&format!(
+            "intel-modeset: mode {} ({} lines, {} Hz refresh, {} kHz pixel clock)\n",
+            self.mode,
+            self.mode.vtotal,
+            self.mode.refresh_hz_rounded(),
+            self.mode.clock_khz
+        ));
+        out.push_str(&self.pipe_state.render());
+        out.push_str(&self.output.render());
+        out.push_str(&self.output_state.render());
+        out.push_str(&self.prove.render());
+        out
+    }
+
+    /// The same lines, to the kernel log.
+    pub(crate) fn log(&self) {
+        axlog::info!("intel-modeset: {}", self.choice.describe());
+        axlog::info!("intel-modeset: {}", self.pattern.describe());
+        self.pipe_state.log();
+        self.output.log();
+        self.output_state.log();
+        self.prove.log();
+    }
+}
+
+/// Why [`set_mode`] did not finish.
+///
+/// Every variant names the step and carries the reading or the inner error
+/// that explains it, because the caller is a boot path whose only output is the
+/// screen and the log line is the whole diagnostic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ModesetError {
+    /// §11 phase 3.1: nothing will be programmed.  Not a failure of the
+    /// sequence -- it is the sequence declining to guess -- but the caller must
+    /// not treat it as a mode set either, which is why it is an error here
+    /// rather than a field of an outcome.
+    Refused(ModeRefusal),
+    /// The CDCLK registers could not be read.
+    Clock(ClockError),
+    /// The display has no usable CDCLK, so there is no pixel clock to program.
+    NoCdclk { cdclk_khz: u32, detail: String },
+    /// The DDI has no `DDI_BUF_CTL` in the register table.
+    UnsupportedPort { ddi: Ddi },
+    /// The pattern does not fit the surface.
+    Pattern(PatternError),
+    /// The framebuffer refused a write.
+    Surface(FbError),
+    /// §11 phases 3.4 and 4: the pipe and the plane.
+    Pipe(PipeError),
+    /// §11 phase 5: the PLL, the DDI and the transcoder.
+    Output(OutputError),
+}
+
+impl ModesetError {
+    /// One line for the boot log.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            ModesetError::Refused(refusal) => refusal.describe(),
+            ModesetError::Clock(error) => {
+                format!(
+                    "the CDCLK registers could not be read: {}",
+                    error.describe()
+                )
+            }
+            ModesetError::NoCdclk { cdclk_khz, detail } => format!(
+                "no usable CDCLK, so there is no pixel clock to program: {detail}.  The \
+                 observation was {cdclk_khz} kHz, which is the bypass clock or a PLL the \
+                 platform's table does not know; reference section 11 phase 1.4 is the step that \
+                 leaves a usable one"
+            ),
+            ModesetError::UnsupportedPort { ddi } => format!(
+                "DDI {} is not a combo-PHY port this kernel can program: the register table has \
+                 DDI_BUF_CTL for A and B, and reference section 8.8 defers the Type-C/DKL path \
+                 entirely",
+                ddi.name()
+            ),
+            ModesetError::Pattern(error) => {
+                format!(
+                    "the test pattern does not fit the surface: {}",
+                    error.describe()
+                )
+            }
+            ModesetError::Surface(error) => {
+                format!("the framebuffer refused a write: {}", error.describe())
+            }
+            ModesetError::Pipe(error) => error.describe(),
+            ModesetError::Output(error) => error.describe(),
+        }
+    }
+}
+
+/// Reference §11 phases 3.2 to 6 against one device, in one sequence.
+///
+/// The order is the reference's and is not negotiable:
+///
+/// ```text
+/// 3.1  choose the mode (and read CDCLK, which bounds the pixel clock)
+/// 3.2  paint the pattern into the caller's framebuffer   <- before anything is armed
+/// 3.4  compute the pipe's timings      \
+/// 4.1  compute the DDB                  |  everything computed before the first write
+/// 4.2  compute the watermarks           |
+/// 5.x  compute the PLL, DDI and transcoder  /
+/// --   pre-sample PIPESTAT, PLANE_SURFLIVE and DDI_BUF_CTL, before the first write
+/// 3.4  write the timings               \
+/// 4.1  write the DDB                    |  `pipe::program`, ending with PLANE_SURF, the commit
+/// 4.2  write the watermarks             |
+/// 4.3  write the plane                  /
+/// 5.1  PLL power, dividers, enable, lock \
+/// 5.2  DDI clock select, clock-off clear  |
+/// 5.3  swing values, lane power           |  `output::program`, never ahead of the pipe
+/// 5.4  TRANS_CLK_SEL                      |
+/// 5.5  TRANS_DDI_FUNC_CTL                 |
+/// 5.6  TRANSCONF                          |
+/// 5.7  DDI_BUF_CTL, poll IS_IDLE clear   /
+/// 6    prove it
+/// ```
+///
+/// A failure at any write stops the sequence and is reported in full: a mode
+/// that was half programmed is not a mode.  Nothing is unwound, and the design
+/// document argues why (§4.2 of `docs/design/intel-modeset.md`): the failure's
+/// own signature on the panel is the primary diagnostic on a machine with no
+/// serial port, and there is no saved firmware state to restore.
+///
+/// It allocates nothing, enables no interrupt, and writes no register outside
+/// the two programs it computed.
+pub(crate) fn set_mode<R: Registers, T: PollTimer>(
     regs: &R,
     timer: &T,
-    target: &ProveTarget,
-) -> Result<SurfaceEvidence, ProveFailure> {
-    let start = timer.now_micros();
-    let mut polls = 0u32;
-    loop {
-        let live = read(regs, target.plane_surflive, CheckId::SurfaceLive)?;
-        polls += 1;
-        if address_bits(live) == address_bits(target.surface) {
-            return Ok(SurfaceEvidence {
-                expected: target.surface,
-                live,
-                polls,
-                waited_micros: timer.now_micros().saturating_sub(start),
-            });
-        }
-        let waited_micros = timer.now_micros().saturating_sub(start);
-        if waited_micros >= SURFACE_ARM_TIMEOUT_MICROS || polls >= SURFACE_ARM_POLL_LIMIT {
-            return Err(ProveFailure::SurfaceNotLive {
-                expected: target.surface,
-                live,
-                polls,
-                waited_micros,
-            });
-        }
-        timer.pause();
+    request: &ModeRequest<'_>,
+) -> Result<ModeOutcome, ModesetError> {
+    // §11 phase 3.1's sanity check, and the ceiling the mode choice needs: one
+    // pixel per clock, so the pixel clock cannot exceed CDCLK.  Reading it here
+    // rather than taking it as a parameter means the choice reflects the
+    // registers as they are now, which is what the pipe will actually run on.
+    let cdclk = clk::observe(regs).map_err(ModesetError::Clock)?;
+    if !cdclk.usable() {
+        return Err(ModesetError::NoCdclk {
+            cdclk_khz: cdclk.cdclk_khz,
+            detail: cdclk.describe(),
+        });
     }
-}
 
-/// 6.3: the DDI buffer must not be idle.
-fn ddi_check<R: Registers>(regs: &R, target: &ProveTarget) -> Result<DdiEvidence, ProveFailure> {
-    let value = read(regs, target.ddi_buf_ctl, CheckId::DdiActive)?;
-    if value & DDI_BUF_CTL_IS_IDLE != 0 {
-        return Err(ProveFailure::DdiIdle { ddi_buf_ctl: value });
+    let choice = choose_mode(
+        request.plan,
+        request.edid,
+        EngineLimits::at_cdclk(cdclk.cdclk_khz),
+    );
+    if let ModeChoice::Refused(refusal) = choice {
+        return Err(ModesetError::Refused(refusal));
     }
-    Ok(DdiEvidence { ddi_buf_ctl: value })
-}
+    let mode = choice.mode().expect("a non-refusal names a mode");
 
-/// 6.4: no FIFO underrun may be latched.
-fn underrun_check<R: Registers>(
-    regs: &R,
-    target: &ProveTarget,
-) -> Result<UnderrunEvidence, ProveFailure> {
-    let value = read(regs, target.pipestat, CheckId::FifoUnderrun)?;
-    if value & PIPESTAT_FIFO_UNDERRUN != 0 {
-        return Err(ProveFailure::FifoUnderrun { pipestat: value });
+    // The port's register, which phase 6.3 needs as well as phase 5.
+    let Some(ddi_buf_ctl) = ddi_buf_ctl_register(request.ddi) else {
+        return Err(ModesetError::UnsupportedPort { ddi: request.ddi });
+    };
+
+    // §11 phase 3.2 and 6.5: the pattern, before anything can scan it out.
+    let pattern = paint_pattern(request.surface, request.frame)?;
+
+    // Compute the whole program before the first write, so that a computation
+    // that cannot succeed costs no register writes at all.
+    let pipe_program = pipe::compute(
+        request.pipe,
+        &mode,
+        pipe::PlaneSurface {
+            ggtt_address: request.surface.ggtt_address(),
+            stride_bytes: request.surface.stride(),
+        },
+    )
+    .map_err(ModesetError::Pipe)?;
+
+    let platform_ref_khz =
+        output::read_platform_reference_khz(regs).map_err(ModesetError::Output)?;
+    let mut output_request = OutputRequest::hdmi(request.ddi, mode, request.encoding);
+    output_request.link_rate = request.link_rate;
+    if let Some(swing) = request.swing {
+        output_request = output_request.with_swing(swing);
     }
-    Ok(UnderrunEvidence { pipestat: value })
-}
+    let output_program =
+        OutputProgram::plan(&output_request, platform_ref_khz).map_err(ModesetError::Output)?;
 
-/// The address part of a surface register.  See
-/// [`PLANE_SURFACE_ADDRESS_MASK`].
-fn address_bits(value: u32) -> u32 {
-    value & PLANE_SURFACE_ADDRESS_MASK
-}
+    // What phase 6's registers said *before* the modeset writes anything.  This
+    // is what makes a latched underrun bit attributable (§11 6.4).
+    let pre_sample = PreSample::take(regs, &pipe_program, ddi_buf_ctl);
 
-/// Read a register, naming it if it is not there.
-fn read<R: Registers>(regs: &R, register: Register, check: CheckId) -> Result<u32, ProveFailure> {
-    regs.read(register).ok_or(ProveFailure::Unreadable {
-        check,
-        register: register.name(),
+    // §11 phases 3.4 and 4: the timings, the DDB, the watermarks and the plane,
+    // ending in `PLANE_SURF`, which is the commit.
+    let pipe_state = pipe::program(regs, &pipe_program).map_err(ModesetError::Pipe)?;
+
+    // §11 phase 5: the output.  Never reordered ahead of the pipe: the plane is
+    // armed into a pipe whose output is not up yet, which is harmless, whereas
+    // an output brought up into a pipe that is not configured is not.
+    let output_state = output::program(regs, &output_program).map_err(ModesetError::Output)?;
+
+    // §11 phase 6.
+    let target = ProveTarget {
+        ddi_buf_ctl,
+        line_rate_hz: mode_line_rate_hz(&mode),
+    };
+    let prove = prove_it(regs, timer, &pipe_program, &target, &pre_sample);
+
+    Ok(ModeOutcome {
+        choice,
+        mode,
+        pattern,
+        pre_sample,
+        pipe: pipe_program,
+        pipe_state,
+        output: output_program,
+        output_state,
+        prove,
     })
 }
 
-/// Let an interval pass, with a bound that does not depend on the clock
-/// advancing.  Returns the time that actually passed.
-fn wait<T: PollTimer>(timer: &T, interval_micros: u64) -> u64 {
-    let start = timer.now_micros();
-    let mut pauses = 0u32;
-    while timer.now_micros().saturating_sub(start) < interval_micros
-        && pauses < MAX_PAUSES_PER_INTERVAL
-    {
-        timer.pause();
-        pauses += 1;
+/// Paint §11 phase 6.5's pattern into a surface the caller allocated.
+///
+/// One reusable row buffer, painted by [`pattern::paint_row`] and written
+/// through `Surface::write_bytes`: the framebuffer is device-uncached memory,
+/// so the pattern is composed where the CPU can write it quickly and moved a
+/// scan line at a time.  Only the visible pixels of each line are written, so
+/// the surface's row padding is never touched -- the same guarantee
+/// [`pattern::fill_xrgb8888`] makes for a byte slice.
+fn paint_pattern(surface: &fb::Surface, frame: u64) -> Result<PatternGeometry, ModesetError> {
+    let width = surface.width() as usize;
+    let height = surface.height() as usize;
+    let stride = surface.stride() as usize;
+    pattern::check_geometry(stride, width, height).map_err(ModesetError::Pattern)?;
+
+    let marker = pattern::marker_rect(width, height, frame);
+    let mut row = vec![0u8; stride];
+    for y in 0..height {
+        pattern::paint_row(&mut row, width, marker, y);
+        surface
+            .write_bytes(y * stride, &row[..width * 4])
+            .map_err(ModesetError::Surface)?;
     }
-    timer.now_micros().saturating_sub(start)
+    Ok(PatternGeometry {
+        stride,
+        width,
+        height,
+        frame,
+        marker,
+    })
 }
 
 #[cfg(test)]

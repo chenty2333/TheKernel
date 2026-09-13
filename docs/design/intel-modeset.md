@@ -5,12 +5,14 @@ HDMI, no serial port — the screen is the only output device.
 **Scope:** reference `docs/design/intel-display-registers.md` §11 phases 3 to 6: choose a mode,
 program a pipe and a plane and a DDI, and prove that it took. Phase 6.6 (hardening) and §10
 (hotplug interrupts) are out of scope for stage 2, as the reference itself says.
-**Status:** the decisions and the two hardware-independent halves are implemented on
-`feat/intel-verify` — `kernel/src/drm/intel/pattern.rs` (phase 6.5's test pattern) and the mode
-choice plus phase 6 prove-it verdicts in `kernel/src/drm/intel/modeset.rs`. The driver that calls
-the sibling modules — `modeset::set_mode` — is specified in §7.3 and **not written yet**, because it
-is the layer that calls the framebuffer, pipe and output sequences and their signatures do not exist
-at the time of writing. **No part of this workstream has run against a display engine.**
+**Status:** implemented on `feat/intel-verify`, over the merged sibling modules —
+`kernel/src/drm/intel/pattern.rs` (phase 6.5's test pattern), and `kernel/src/drm/intel/modeset.rs`
+with the mode choice, `set_mode` (phases 3.2 to 6 as one sequence), and phase 6's verdicts. The
+whole sequence is exercised end to end against a mock register file and a host framebuffer,
+including the write order and the failure table below. What is **not** done is the boot-path
+wiring: `intel::bring_up_at_boot` does not call `set_mode` yet, because the call site is the
+coordinator's (§7.2), and GTT/BAR mapping and `scanout::register` belong to the framebuffer
+workstream. **No part of this workstream has run against a display engine.**
 
 Provenance: register offsets, bit positions and sequences are the reference document's; where this
 document goes beyond it, the claim is marked `[INF]` and the reasoning is given.
@@ -50,7 +52,9 @@ produce **one honest line**, not a half-run sequence reported as a result. The e
 | The display is fused off | `power::FuseState::display_disabled()` — `SFUSE_STRAP` bit 7 | One line naming the strap. Nothing is programmed. |
 | Pipe A is fused off | `FuseState::pipe_mask() & 1 == 0` — `SKL_DFSM` bit 30 | One line naming the pipe fuse. §11's checklist assumes pipe A, and this driver has no second pipeline to fall back to. |
 | No monitor answered, or its EDID was unusable | `ModePlan::used_edid()` is false | `ModeRefusal::NoAdvertisedMode`: **the firmware framebuffer is left exactly as firmware left it.** §11 phase 2.3 forbids proceeding past an invalid EDID, and a timing the kernel guessed turns a parse bug into a display bug. |
-| The power step left no usable CDCLK | `power::PowerState::cdclk` not enabled and locked, per §11 phase 1.4 | Refuse before choosing a mode, with a line that names CDCLK. Without CDCLK no pixel clock exists, and "every mode is above the ceiling" is a true but useless way to say so. |
+| The display has no usable CDCLK | `clk::observe` inside `set_mode`: the PLL not enabled and locked, or a triple the platform's table does not know | `ModesetError::NoCdclk`, refused **before the mode is even chosen** and before any write. Without CDCLK no pixel clock exists, and "every mode is above the ceiling" is a true but useless way to say so. |
+| The DDI is not a combo-PHY port | `regs::ddi` has `DDI_BUF_CTL` for A and B only | `ModesetError::UnsupportedPort`, refused before any write. §8.1 makes C and D the Type-C/DKL ports and §8.8 defers them. |
+| §8.5's swing values are missing | `request.swing` is `None` | `ModesetError::Output(MissingBufferTranslation)`, refused **before the first write**, because the whole program is computed before anything is programmed. This is the state the tree is in today: a boot path with no dump has no values to pass (§13.4). |
 
 Each skip is one line in the log and one line in the debug file. None of them is an error: they are
 the answers to *why is there nothing on the screen*, which on this machine is the only question
@@ -108,7 +112,9 @@ nothing here has watched a real panel. §8 records that.
 
 The modeset is one call from one place (`bring_up_at_boot`). If the first run on hardware shows the
 panel change is not worth the pattern, commenting out that one call restores stage 1 behaviour
-exactly, and this document is where the trade is recorded.
+exactly, and this document is where the trade is recorded. `set_mode` returns the verdict rather
+than acting on it: the caller decides whether to offer the surface to the console, and the sequence
+itself never registers a candidate.
 
 ### 1.4 The failure-repaint option, if the first hardware run needs it
 
@@ -119,11 +125,16 @@ carries the reason instead of only the pattern. The mechanism already exists in 
 `pseudofs::dev::early_screen::paint` is a pure function of a geometry description and a byte slice,
 and `ScanoutSurface::write_pixel` writes into any surface.
 
-This is **not implemented** and is not part of `set_mode` as specified below. It is recorded because
-it is the highest-value follow-up if the first hardware run fails at phase 5: it is the difference
-between a panel that shows colour bars and a panel that shows which check failed. It needs WS-1's
-surface type and a decision about who owns the paint, which is why it is a question for the
-coordinator rather than a decision taken here.
+This is **not implemented, and it is now deliberately deferred** rather than merely undone. The
+console gate in §1.3 changes the trade: a failed modeset leaves the console on the firmware's
+aperture, so the log that explains the failure goes on being drawn where the kernel believes its
+console is — and the alternative, painting the reason into the Intel surface, would only help in
+the window where that surface is what the panel shows *and* the console is not on it. What the panel
+carries in each case is §4.2's table, and the case the repaint would improve (the plane armed, the
+verdict failed) already leaves the bars, which is the diagnostic §6.5 asked for. If the first
+hardware run shows a panel of bars is not enough, this is the follow-up: `early_screen::paint` is
+already a pure function of a geometry description and a byte slice, and `ScanoutSurface::write_pixel`
+writes into any surface. It needs WS-1's surface type and a decision about who owns the paint.
 
 ---
 
@@ -242,6 +253,14 @@ The generator writes bytes into a caller-owned slice and does nothing else: no a
 mapping, no GGTT. On the target that slice is the memory the display engine reads through the GGTT,
 which is the framebuffer allocation's business (WS-1), not the pattern's.
 
+`set_mode` has a `fb::Surface` rather than a slice, so it paints through
+`pattern::paint_row` — the *same* pixel-level code `fill_xrgb8888` loops over, not a second
+implementation of the bar boundaries and the marker — and writes each finished line with
+`Surface::write_bytes`, visible pixels only. One reused stride-sized row buffer, so the 8 MiB
+allocation is never duplicated in cached memory. A test asserts that painting line by line produces
+byte-identical visible pixels to filling one buffer, which is what keeps the two paths from
+drifting.
+
 **Measured cost** (this host, the same `pattern.rs` included verbatim by a standalone harness,
 writing to a `Vec<u8>` of the target's geometry — 1920×1080, stride 7936, 20 fills each):
 
@@ -265,21 +284,26 @@ marked otherwise.
 
 | Step | Action | Owner |
 |---|---|---|
-| 3.1 | choose the mode (`modeset::choose_mode`) | this workstream, **done** |
-| 3.2 | allocate the framebuffer, write the GGTT PTE, fill the pattern | WS-1, then `pattern::fill_xrgb8888` |
-| 3.3 | compute the PLL dividers and **log them before writing** | `pll::ddi_pll_dividers` |
-| 3.4 | program the timing registers (every field is `value − 1`) | `timing::timing_registers` + WS-3 |
-| 4.1 | `PLANE_BUF_CFG` = `0x0FFF0000` | WS-3 |
-| 4.2 | watermarks: level 0 `EN \| BLOCKS(allocation) \| LINES(31)`, others disabled | WS-3 |
-| 4.3 | plane noarm registers, then `PLANE_CTL`, then `PLANE_SURF` **last** | WS-3 |
-| 5.1 | PLL: dividers, power, enable, poll `LOCK` | WS-2 |
-| 5.2 | DDI→PLL mapping, then `DDI_CLK_OFF` cleared in a **separate** write | WS-2 |
-| 5.3 | buffer translation for the port type and swing, then power the lanes | WS-2 |
-| 5.4 | `TRANS_CLK_SEL(A)` | WS-2 |
-| 5.5 | `TRANS_DDI_FUNC_CTL(A)` | WS-2 |
-| 5.6 | `TRANSCONF(A)` | WS-2 |
-| 5.7 | `DDI_BUF_CTL(A)`, then poll `IS_IDLE == 0` | WS-2 |
-| 6 | prove it (`modeset::prove_it`) | this workstream, **done** |
+| Step | Action | Implemented by |
+|---|---|---|
+| 3.1 | choose the mode | `modeset::choose_mode`, called by `set_mode` |
+| 3.2 | allocate the framebuffer, write the GGTT PTE | WS-1's `fb::Surface::allocate`, called by the boot path — the surface is a **parameter** of `set_mode` |
+| 3.2/6.5 | paint the pattern into that surface | `modeset::paint_pattern` → `pattern::paint_row` → `Surface::write_bytes` |
+| 3.3 | compute the PLL dividers, and log them before writing | WS-2's `OutputProgram::plan`, computed before the first write |
+| 3.4 | the timing registers (every field is `value − 1`) | `timing::timing_registers` through WS-3's `pipe::compute` |
+| 4.1 | `PLANE_BUF_CFG` = `0x0FFF0000` | WS-3's `pipe::program` |
+| 4.2 | watermarks: level 0 enabled and generous | WS-3's `pipe::program` |
+| 4.3 | plane noarm registers, then `PLANE_CTL`, then `PLANE_SURF` **last** | WS-3's `pipe::program` |
+| 5.1 | PLL: dividers, power, enable, poll `LOCK` | WS-2's `output::program` |
+| 5.2 | DDI→PLL mapping, then `DDI_CLK_OFF` cleared in a **separate** write | WS-2's `output::program` |
+| 5.3 | buffer translation for the port type and swing, then power the lanes | WS-2's `output::program` |
+| 5.4 | `TRANS_CLK_SEL` | WS-2's `output::program` |
+| 5.5 | `TRANS_DDI_FUNC_CTL` | WS-2's `output::program` |
+| 5.6 | `TRANSCONF` | WS-2's `output::program` |
+| 5.7 | `DDI_BUF_CTL`, then poll `IS_IDLE == 0` | WS-2's `output::program` |
+| 6.1/6.2/6.4 | the pipe-side read-backs | WS-3's `pipe::prove`, called by `modeset::prove_it` |
+| 6.3 | `DDI_BUF_CTL.IS_IDLE` | `modeset::prove_it` |
+| 6 | the verdict and the gate | `modeset::ProveReport::verdict` |
 
 The order is not a preference. Planes before the transcoder, transcoder before the DDI, clock before
 buffer, buffer before well — §8.6's disable sequence is the exact reverse of this and its own note
@@ -378,6 +402,11 @@ wrong by a factor rather than a percent, always trips it.
 
 ### 5.4 The verdict is one value, and it is the gate
 
+The four reads have two owners and one verdict. **WS-3's `pipe::prove`** performs 6.1, 6.2 and 6.4,
+because those are its registers and its sampling policy; `modeset::prove_it` gives the plane its
+arming window first, takes 6.3's single read of `DDI_BUF_CTL`, and assembles what comes back. There
+is one implementation of each read in the tree, and exactly one value at the end of them:
+
 `ProveReport::verdict()` returns a `ScanoutVerdict`:
 
 ```rust
@@ -400,15 +429,31 @@ Why one value rather than four results: four results are four chances for a call
 them, and the failure mode of that mistake is a console drawing into a surface nobody scans while the
 kernel reports a working display. The type makes the mistake unrepresentable rather than unlikely.
 
-### 5.5 A caveat that belongs in the log: `PIPESTAT` is sticky and this kernel cannot clear it
+### 5.5 Attribution: what the registers said before the first write
 
 `PIPE_FIFO_UNDERRUN_STATUS` latches, and the register table declares `PIPESTAT` **read-only**, so
 this driver cannot write 1 to clear it before the plane is armed. A set bit at phase 6 may therefore
-predate the modeset — firmware may have left it set while driving its own pipe. The verdict reports
-the raw value and points at the watermarks, which is §11's instruction, but the honest reading is
-*"an underrun is latched; it may or may not be from this modeset."* Clearing it needs a `read_write`
-declaration of `PIPESTAT` plus a write-1-to-clear in phase 4, which is WS-3's register; **this is a
-question for the coordinator**, recorded here so it is not discovered on hardware.
+predate the modeset — firmware may have left it set while driving its own pipe.
+
+`set_mode` cannot clear the bit, so it does the next best thing: **`PreSample::take` reads the three
+registers phase 6 will read before the modeset's first write**, and the verdict carries what they
+said. The report then distinguishes:
+
+* *"PIPESTAT has PIPE_FIFO_UNDERRUN_STATUS set"* — the bit is the modeset's to answer for; and
+* *"…and it was already set before this modeset wrote anything, so it may predate it"* — the same
+  reading, with the attribution the sequence can actually support.
+
+The same pre-sample answers the same question for the other two: a `PLANE_SURFLIVE` that already
+named our surface means the 6.2 read-back proves nothing about our write (recorded, not suppressed),
+and a DDI that was already out of idle separates "it never came up" from "it came up and went back
+to idle" when 6.3 fails.
+
+A pre-sample that could not be read is a third state, and the report says so rather than guessing:
+the field is `None` and the verdict's attribution is correspondingly absent.
+
+If phase 4 ever clears the bit — a `read_write` declaration of `PIPESTAT` plus a write-1-to-clear,
+which is WS-3's register — the pre-sample becomes redundant for 6.4 rather than wrong, and the
+verdict's wording is where that would be revisited.
 
 ---
 
@@ -452,68 +497,96 @@ pub(crate) fn fill_xrgb8888(
 
 pub(crate) const BAR_COUNT: usize;              // 8
 pub(crate) const BAR_COLORS: [u32; BAR_COUNT];
+pub(crate) fn check_geometry(stride: usize, width: usize, height: usize) -> Result<(), PatternError>;
 pub(crate) fn bar_boundaries(width: usize) -> [usize; BAR_COUNT + 1];
 pub(crate) fn bar_index(width: usize, x: usize) -> usize;
 pub(crate) fn marker_rect(width: usize, height: usize, frame: u64) -> MarkerRect;
 pub(crate) const fn marker_colour(under: u32) -> u32;
+/// The pixel-level core: one scan line, its bars and the marker over it.
+pub(crate) fn paint_row(row: &mut [u8], width: usize, marker: MarkerRect, y: usize);
 pub(crate) struct PatternGeometry { stride, width, height, frame, marker }  // ::describe()
 
-// kernel/src/drm/intel/modeset.rs — §11 phase 3.1 and phase 6
+// kernel/src/drm/intel/modeset.rs — §11 phases 3.1 to 6
 pub(crate) fn choose_mode(plan: &ModePlan, edid_bytes: &[u8], limits: EngineLimits) -> ModeChoice;
-pub(crate) enum ModeChoice {
-    ModeLayer { mode: Mode, reason: SelectionReason },
-    ReferencePreference { mode: Mode, replaced: Mode, because: NotProgrammable },
-    Refused(ModeRefusal),
-}
+pub(crate) enum ModeChoice { ModeLayer {..}, ReferencePreference {..}, Refused(ModeRefusal) }
 pub(crate) struct EngineLimits { pub max_clock_khz: u32 }  // ::at_cdclk(khz), ::ceiling_khz()
 pub(crate) fn programmable(mode: &Mode, limits: EngineLimits) -> Result<(), NotProgrammable>;
 pub(crate) fn is_reference_timing(mode: &Mode) -> bool;
 pub(crate) fn mode_line_rate_hz(mode: &Mode) -> Option<u32>;
 
-pub(crate) struct ProveTarget { surface: u32, line_rate_hz: Option<u32>, pipedsl, plane_surflive,
-                                ddi_buf_ctl, pipestat: regs::Register }   // ::pipe_a(surface, rate)
+/// Everything the sequence is told.  The surface is a parameter: `set_mode`
+/// allocates nothing.
+pub(crate) struct ModeRequest<'a> {
+    ddi: Ddi, pipe: Pipe, plan: &'a ModePlan, edid: &'a [u8], surface: &'a fb::Surface,
+    frame: u64, encoding: PllFieldEncoding, swing: Option<SwingProgram>, link_rate: LinkRate,
+}
+// ::new(ddi, pipe, plan, edid, surface, encoding)  -> frame 0, no swing, no sourced link rate
+// ::with_frame(frame), ::with_swing(swing), ::with_link_rate(rate)
+
+pub(crate) fn set_mode<R: Registers, T: PollTimer>(
+    regs: &R, timer: &T, request: &ModeRequest<'_>,
+) -> Result<ModeOutcome, ModesetError>;
+
+pub(crate) struct ModeOutcome {
+    choice: ModeChoice, mode: Mode, pattern: PatternGeometry, pre_sample: PreSample,
+    pipe: PipeProgram, pipe_state: PipeState, output: OutputProgram, output_state: OutputState,
+    prove: ProveReport,
+}
+// ::verdict() -> ScanoutVerdict   <- the console gate, and the only way to ask
+// ::surflive() -> Option<u64>     <- for `scanout::Verdict::Scanning { surflive }`
+// ::render() -> String, ::log()
+
+pub(crate) enum ModesetError { Refused(..), Clock(..), NoCdclk {..}, UnsupportedPort {..},
+                               Pattern(..), Surface(..), Pipe(..), Output(..) }  // ::describe()
+
+pub(crate) struct PreSample { pipestat, plane_surflive, ddi_buf_ctl: Option<u32> }
+pub(crate) struct ProveTarget { ddi_buf_ctl: Register, line_rate_hz: Option<u32> }  // ::port(ddi, rate)
 pub(crate) fn prove_it<R: Registers, T: PollTimer>(
-    regs: &R, timer: &T, target: &ProveTarget,
+    regs: &R, timer: &T, program: &PipeProgram, target: &ProveTarget, pre: &PreSample,
 ) -> ProveReport;
 pub(crate) struct ProveReport { scan, surface, ddi, underrun }
-// ::verdict() -> ScanoutVerdict   <- the console gate, and the only way to ask
-// ::failure(), ::failure_of(check), ::check_passed(check), ::render(), ::log()
+// ::verdict(), ::failure(), ::failure_of(check), ::check_passed(check), ::surflive(),
+// ::render(), ::log()
 
 pub(crate) enum ScanoutVerdict { ScanningOut, NotScanningOut(Vec<(CheckId, ProveFailure)>) }
 // ::is_scanning_out(), ::failures(), ::unavailable_reason() -> Option<String>, ::describe()
 ```
 
 `choose_mode` is pure and reads no register; `prove_it` reads registers, waits on the caller's
-`PollTimer` and writes nothing. Both are driven in host tests through `regs::mock::MockRegisters`
-and `gmbus::tests::FakeClock`.
+`PollTimer` and writes nothing; `set_mode` writes and allocates nothing but the one row buffer the
+pattern is painted through. All three are driven in host tests through
+`regs::mock::MockRegisters`, `gmbus::tests::FakeClock` and a real `fb::Surface` over a mock page
+table.
 
 ### 7.2 The console candidate the coordinator wires
 
 `screen::Candidate::new(name, rank::DRIVER, reason, acquire)` takes a *function pointer*, so the
-verdict has to live in a `static` — which is where `ModesetReport` goes anyway (§6.2). The acquire
-function is then the whole of the gate:
+verdict has to live in a `static`. The acquire function is then the whole of the gate, and the two
+lines that matter are the verdict and the reading it carries:
 
 ```rust
-/// What the console handover asks.  `None` when no modeset ran.
-fn intel_console_surface() -> Result<Arc<dyn ScanoutSurface>, Unavailable> {
-    let report = MODESET.lock();                     // beside POWER and SINK
-    let Some(report) = report.as_ref() else {
-        return Err(Unavailable::Absent("no Intel display device was identified"));
-    };
-    match report.verdict() {
-        // Only WS-1 can build this: the framebuffer's address, geometry and layout.
-        ScanoutVerdict::ScanningOut => Ok(report.console_surface()),
-        verdict => Err(Unavailable::Failed(verdict.unavailable_reason().unwrap_or_default())),
+/// What the console handover asks, from the stored `ModeOutcome`.
+fn intel_console_verdict() -> scanout::Verdict {
+    match outcome.verdict() {
+        // `surflive()` is the reading phase 6.2 already made: WS-1 checks it
+        // against the surface it holds rather than trusting it.
+        ScanoutVerdict::ScanningOut => scanout::Verdict::Scanning {
+            surflive: outcome.surflive().unwrap_or_default(),
+        },
+        verdict => scanout::Verdict::NotScanning {
+            reason: verdict.unavailable_reason().unwrap_or_default(),
+        },
     }
 }
 ```
 
-Two seams this needs, and both are the coordinator's to place:
+The seams, all of them the coordinator's or WS-1's to place:
 
 | Seam | Who | What it is |
 |---|---|---|
-| `ModesetReport::verdict()` | this workstream | already exists as `ProveReport::verdict()`; the aggregate report will forward to it |
-| `ModesetReport::console_surface() -> Arc<dyn ScanoutSurface>` | WS-1 | the allocated framebuffer as a `ScanoutSurface` at the programmed mode's geometry — width, height, pitch and XRGB8888 layout — which is also what `/dev/fb0` and fbcon will draw through |
+| `set_mode`'s call site | coordinator | `bring_up_at_boot`, after power and the sink, with a surface from WS-1's `fb::Surface::allocate` and the §8.5 swing values (§13.4) |
+| `scanout::register(surface, verdict)` | WS-1 | already implemented; it re-checks `surflive` against the surface it holds and logs the refusal |
+| the swing values | coordinator | `set_mode` refuses without them (`MissingBufferTranslation`), so the boot path needs a source — a dump, per §13.4, or WS-2 reading the firmware's own `PORT_TX_DW*` values |
 
 **Is this the interface I would have designed?** Mostly, and the one thing I would change is worth
 saying rather than working around:
@@ -570,15 +643,18 @@ verdict — not the last successful register write — is what the console hando
 
 ### 7.4 Who advances the pattern's frame counter
 
-`set_mode` writes one frame, so the marker sits still until something writes the next one. A marker
-that never moves cannot answer §6.1's question by eye, so part 2 should add a bounded repaint: a
-deferred-work item that rewrites the surface with `frame + 1` every few hundred milliseconds, and
-stops when the console takes the surface over (or after a fixed number of frames).
+`set_mode` writes the frame `ModeRequest::frame` names, so the caller owns the counter:
+`with_frame(1)` is a repaint, and a test shows the marker moving between two frames of the same
+surface. One `set_mode` call writes one frame, so the marker sits still until something calls again.
 
-The measured cost says this is affordable: 306 µs per 1920×1080 fill optimised (§3.2), so a repaint
-at 2 Hz is 0.06% of one core. It is not implemented here because it needs the framebuffer handle and
-the point at which the console takes over, both of which are part 2's. Until then the frame number
-in the report is still what makes a single frame identifiable.
+A marker that never moves cannot answer §6.1's question by eye, so a bounded repaint is still worth
+adding at the boot path: a deferred-work item that rewrites the surface with `frame + 1` every few
+hundred milliseconds, stopping when the console takes the surface over or after a fixed number of
+frames. The measured cost says it is affordable — 306 µs per 1920×1080 fill optimised (§3.2), so
+2 Hz is 0.06% of one core — and it is a few lines now that `set_mode` takes the frame as a
+parameter. It is not written here because the point at which the console takes over is the
+coordinator's wiring, not this module's. Until then the frame number in the report is what makes a
+single frame identifiable.
 
 ---
 
@@ -615,9 +691,17 @@ between a result and a guess.
   specified and not written.
 * **The plane's maximum dimensions are not checked** (§2.3). The mode layer's `Constraints` are the
   place for that, and `sink.rs` currently passes `Constraints::unlimited()`.
-* **`set_mode` does not exist yet**, so no part of phases 3.2 to 5.7 is implemented, and the
-  end-to-end test the brief asks for — a whole sequence against a mock that models a working device,
-  asserting on the order of writes across all phases — is not written. It cannot be written honestly
-  before the sibling modules exist.
-* **The register table's `PIPESTAT` access, and whether phase 4 clears the underrun bit**, is a
-  question for the coordinator rather than a decision this workstream can make.
+* **The boot path does not call `set_mode` yet.** `intel::bring_up_at_boot` still stops after the
+  sink, so nothing in this document runs on a boot today. The call site, the surface allocation over
+  a real GTT, and `scanout::register` are the coordinator's wiring (§7.2), and it needs one thing
+  this workstream cannot supply: §8.5's swing values, without which `set_mode` refuses by design.
+* **The end-to-end test is over mocks.** It asserts the whole write order, that nothing is written
+  after the proof starts, and that each named failure leaves the state §4.2 claims — against a
+  `BTreeMap` register file and a host page arena. It cannot establish that a real `PIPEDSL` advances,
+  that a real plane arms in under 100 ms, or that a real DDI reports `IS_IDLE` when it should.
+* **The repaint loop is not written** (§7.4), so a boot-path `set_mode` writes a static pattern:
+  the bars prove the framebuffer path, but only the report's frame number and the phase 6 readings
+  distinguish "scanning" from "one frame that arrived and stopped".
+* **The register table's `PIPESTAT` access, and whether phase 4 clears the underrun bit**, is still
+  a question for the coordinator rather than a decision this workstream can make. Until it is
+  answered, §5.5's pre-sample is what the verdict has instead of a clean bit.
