@@ -240,7 +240,7 @@ what was done instead, and what would close it.
 
 ## 6. What the tests measure
 
-`[MEASURED]` 197 `drm::intel` host tests pass, 29 of them this module's, none failing. `cargo
+`[MEASURED]` 230 `drm::intel` host tests pass, 29 of them this module's, none failing. `cargo
 clippy` for the host test target and for the product kernel configuration (`tools/thekernel.py
 lint`, `x86_64-unknown-none`, release) reports nothing in `output.rs` or `output/tests.rs`. The
 product kernel builds.
@@ -266,50 +266,55 @@ The 29 tests assert, among other things:
 * the DDI-IO well that never comes up leaves its request bit withdrawn;
 * the plan log carries `ref`, `(P, Q, K)`, the symbol rate and both `CFGCR` values.
 
-### 6.1 One measurement that is a finding: `pll.rs` is not the ADL-N search
+### 6.1 One measurement that was a finding: `pll.rs` was not the ADL-N search
 
 `[REF]` §6.3's corrections 1 and 2 record that ADL-N uses `icl_calc_wrpll`: a flat divider list
 ending at 21, the DCO window `[7998, 10000] MHz`, and selection by distance from the 8999 MHz
-midpoint. `pll.rs` implements the **Skylake** search instead — three central frequencies
-(8400/9000/9600 MHz), an asymmetric `+1%/−6%` tolerance, and a divider list that includes 35, which
-§6.3 says the ADL-N list does not contain. `pll.rs`'s own documentation says so; what was missing was
-a number.
+midpoint. When this module was written, `pll.rs` implemented the **Skylake** search instead — three
+central frequencies (8400/9000/9600 MHz), an asymmetric `+1%/−6%` tolerance, and a divider list that
+includes 35, which §6.3 says the ADL-N list does not contain.
 
-`output::tests::pll_rs_search_is_measured_against_the_documented_adl_n_search` supplies it, by
-running both searches over the same inputs and counting. `[MEASURED]`, over 985 symbol rates from 16
-to 1000 MHz in 1 MHz steps:
+`output::tests::pll_rs_search_is_measured_against_the_documented_adl_n_search` was written to supply
+the number rather than the claim, by running both searches over the same inputs and counting.
+`[MEASURED]`, over 985 symbol rates from 16 to 1000 MHz in 1 MHz steps:
 
 | Count | Value |
 |---|---|
-| rates both searches can make | 574 |
+| rates both searches could make | 574 |
 | of those, a different total divider | 114 |
-| of those, `pll.rs`'s choice also outside the PRM's `[7998, 10000] MHz` window | 12 |
-| rates where `pll.rs`'s choice is outside that window (all 12 are disagreements) | 12 |
-| rates only `pll.rs`'s list reaches | 7 |
-| rates only the documented ADL-N list reaches | 245 |
-| rates neither can make | 159 |
+| of those, the Skylake choice also outside the PRM's `[7998, 10000] MHz` window | 12 |
+| rates where the Skylake choice was outside that window (all 12 are disagreements) | 12 |
+| rates only the Skylake list could reach | 7 — 527–533 MHz, all 7 also outside the window |
+| rates only the documented ADL-N list could reach | 245 |
+| rates neither could make | 159 |
 
 And over the modes this kernel actually publishes (the DMT and CTA-861 tables, interlaced rows
-skipped because `timing.rs` refuses them anyway):
+skipped because `timing.rs` refuses them anyway): 181 progressive modes both could make, **56 with a
+different total divider**, and one — CTA VIC 92, 2560×1440@120, 495 MHz — reachable only by the
+documented search. A DCO outside that window is a PLL that does not lock, which a monitor shows as
+"no signal".
 
-| Count | Value |
-|---|---|
-| progressive modes both searches can make | 181 |
-| of those, a different total divider | 56 |
-| modes only `pll.rs` can make | 0 |
-| modes only the documented search can make | 1 — CTA VIC 92, 2560×1440@120, 495 MHz, which this sequence refuses at the scrambling gate anyway |
+**The fix landed on `fix/intel-pll-adln`** (WS-5): `pll.rs` now implements `icl_calc_wrpll` and
+`icl_wrpll_get_multipliers`, the window is a hard bound on the candidates rather than a report, and
+the decomposition is the one the PRM's bounds describe. Re-measured on the same 985 rates, `pll.rs`
+and the reference transcription agree on all 819 rates either can reach and no answer is outside the
+window. The 166 rates neither can make are two bands between the candidate list's entries
+(`(500.000, 533.200) MHz` and `(666.666, 799.800) MHz`), which the documented algorithm cannot serve
+at all.
 
-**What this means for this bring-up:** the target mode is one where the two agree — both land on
-total divider 12, and the register values match §6.3's worked example exactly — so phase 5 does not
-depend on the divergence. What it means for the mode layer is that `pll.rs` cannot make some modes
-the documented ADL-N arithmetic can, and picks a different divider (occasionally outside the PRM's
-own DCO window) for a fifth of the rates both can make — and for 56 of the 181 published
-progressive modes, nearly a third. That is WS-1's module and a decision for the coordinator;
-it is measured here because this module is the first caller, and a silent difference in the clock
-would surface as a monitor reporting "out of range" with no other symptom.
+Two consequences for this module, both measured rather than assumed:
 
-The test pins all of these numbers, so if `pll.rs` is brought onto the ADL-N path the test fails and
-the failure is the finding.
+* The target mode was and remains a rate where everything agrees — total divider 12, `(P, Q, K) =
+  (2, 3, 2)`, and `CFGCR0 = 0x001001D0` / `CFGCR1 = 0x00000E84` under the named encoding, exactly
+  §6.3's worked example. Phase 5 never depended on this.
+* CTA VIC 92 is still refused by this sequence, but now at the **scrambling gate** (line 699) rather
+  than by the PLL search (line 726): the arithmetic can make 495 MHz, and the reason not to program
+  it is the one §8.4 already gives.
+
+The test now pins both halves: `pll.rs` against the transcription (zero divergence), and the
+transcription against a test-local copy of the Skylake search, so the pre-fix numbers above stay
+reproducible and a revert to the Skylake path would fail rather than be believed. `docs/design/intel-pll.md`
+§3.3 and §3.7 carry the full record.
 
 ## 7. What is not verified
 
