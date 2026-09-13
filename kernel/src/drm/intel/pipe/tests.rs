@@ -9,7 +9,7 @@
 //! the watermarks and not before, a failure leaves no surface address written,
 //! an underrun names the watermarks -- rather than "the function returned `Ok`".
 
-use alloc::vec::Vec;
+use alloc::{rc::Rc, vec::Vec};
 use core::cell::Cell;
 
 use super::*;
@@ -95,6 +95,7 @@ struct Programmed {
     plan: PipeProgram,
     regs: MockRegisters,
     state: PipeState,
+    arm_state: ArmState,
 }
 
 impl Programmed {
@@ -106,7 +107,18 @@ impl Programmed {
         let plan = compute(pipe, mode, surface).expect("a well-formed progressive mode");
         let regs = MockRegisters::new();
         let state = program(&regs, &plan).expect("the mock refuses nothing");
-        Self { plan, regs, state }
+        // The order the boot path uses: the shadow program, then the output
+        // workstream's `TRANSCONF`, then the arm.  The mock cannot run
+        // `TRANSCONF` -- that register belongs to another module -- so the two
+        // pipe steps are adjacent here, and what the tests assert is the order
+        // *within* the pipe's own writes, which is what this module owns.
+        let arm_state = arm(&regs, &plan).expect("the mock refuses nothing");
+        Self {
+            plan,
+            regs,
+            state,
+            arm_state,
+        }
     }
 
     /// The write log as `(name, value)`, which is what the order tests assert
@@ -128,22 +140,27 @@ impl Programmed {
 // The write order
 // ---------------------------------------------------------------------------
 
-/// The exact write order of section 11 phases 3.4 and 4.
+/// The exact write order of section 11 phases 3.4 and 4: the shadow program,
+/// then the arm pair.
 ///
 /// Asserted as a whole sequence rather than as a handful of relative positions,
 /// because the property section 5.6 establishes is about the sequence: the
 /// `noarm` values, the DDB and the watermarks are all double buffered, and the
-/// only write that makes any of them take effect is the last one.
+/// only writes that make any of them take effect are the last two.
 #[test]
 fn the_write_order_is_phase_3_4_then_4_1_then_4_2_then_4_3() {
     let programmed = Programmed::new();
-    let names: Vec<&'static str> = programmed.writes().iter().map(|(name, _)| *name).collect();
+    let names: Vec<&'static str> = programmed
+        .state
+        .writes
+        .iter()
+        .map(|write| write.register.name())
+        .collect();
 
     assert_eq!(
         names,
         [
-            // The pipe's output depth and its arbiter slots, first so that
-            // `PLANE_SURF` is the last write of the whole sequence; see
+            // The pipe's output depth and its arbiter slots; see
             // `PipeProgram::writes`.
             "PIPE_MISC_A",
             "PIPE_ARB_CTL_A",
@@ -175,15 +192,97 @@ fn the_write_order_is_phase_3_4_then_4_1_then_4_2_then_4_3() {
             "PLANE_STRIDE_A",
             "PLANE_POS_A",
             "PLANE_SIZE_A",
-            // Phase 4.3, the `arm` half, `PLANE_CTL` immediately before the
-            // commit.
+            // Phase 4.3's remaining shadow registers.  The arm pair,
+            // `PLANE_CTL` then `PLANE_SURF`, is *not* here: it is a separate
+            // step, written after the pipe is enabled, and
+            // `the_arm_pair_is_adjacent_and_last` is where it is asserted.
             "PLANE_OFFSET_A",
             "PLANE_COLOR_CTL_A",
-            "PLANE_CTL_A",
-            "PLANE_SURF_A",
         ]
     );
     assert_eq!(programmed.state.writes.len(), names.len());
+    assert_eq!(names.len(), 25, "the shadow program's write count");
+}
+
+/// The arm is a pair, adjacent, in that order, and it is the last thing the
+/// pipe writes.
+///
+/// Section 5.6's one absolute ordering rule: "the control register self-arms if
+/// the plane was previously disabled.  Try to make the plane enable atomic by
+/// writing the control register just before the surface register"
+/// (`display/skl_universal_plane.c:1525-1532`).  The pair is also a separate
+/// *step* from `program` -- the arm latches at a vblank, so it runs after the
+/// pipe is enabled -- which is why it is a separate write list rather than the
+/// tail of the shadow one.
+#[test]
+fn the_arm_pair_is_adjacent_and_last() {
+    let programmed = Programmed::new();
+    let shadow: Vec<&'static str> = programmed
+        .state
+        .writes
+        .iter()
+        .map(|write| write.register.name())
+        .collect();
+    let arm: Vec<&'static str> = programmed
+        .arm_state
+        .writes
+        .iter()
+        .map(|write| write.register.name())
+        .collect();
+
+    assert_eq!(arm, ["PLANE_CTL_A", "PLANE_SURF_A"], "the pair, in order");
+    assert_eq!(PLANE_ARM_WRITES, 2);
+    for register in [Pipe::A.plane_ctl(), Pipe::A.plane_surf()] {
+        assert!(
+            !shadow.contains(&register.name()),
+            "{} belongs to the arm step, not to the shadow program",
+            register.name()
+        );
+    }
+    // The whole pipe sequence, in the order the register file saw it: the
+    // shadow program first, the arm pair last.
+    let all: Vec<&'static str> = programmed.writes().iter().map(|(name, _)| *name).collect();
+    assert_eq!(&all[..shadow.len()], shadow.as_slice());
+    assert_eq!(&all[shadow.len()..], arm.as_slice());
+    assert_eq!(all.len(), PIPE_PROGRAM_WRITES + PLANE_ARM_WRITES);
+    assert_eq!(
+        all.last(),
+        Some(&"PLANE_SURF_A"),
+        "PLANE_SURF is the last write of the whole sequence"
+    );
+}
+
+/// The arm writes the values the program computed, and a refused `PLANE_CTL`
+/// leaves `PLANE_SURF` unwritten.
+///
+/// The failure ordering matters more here than anywhere else in the module: an
+/// arm whose control word did not land but whose surface address did is the
+/// half-armed plane the pair exists to prevent.
+#[test]
+fn a_refused_plane_control_write_in_the_arm_leaves_the_plane_unarmed() {
+    let plan = compute(Pipe::A, &vic16(), SURFACE).unwrap();
+    let regs = MockRegisters::new();
+    // The shadow program completes: nothing in it touches `PLANE_CTL`.
+    program(&regs, &plan).expect("the shadow program is not refused");
+    assert!(
+        !regs.writes().iter().any(|(name, _)| *name == "PLANE_CTL_A"),
+        "PLANE_CTL is not a shadow write"
+    );
+
+    regs.refuse(Pipe::A.plane_ctl());
+    let error = arm(&regs, &plan).expect_err("the arm's first write is refused");
+    assert_eq!(
+        error,
+        PipeError::WriteRefused {
+            register: "PLANE_CTL_A"
+        }
+    );
+    assert_eq!(
+        regs.writes().last().map(|(name, _)| *name),
+        Some("PLANE_COLOR_CTL_A"),
+        "the shadow program's last write, and no PLANE_SURF after it"
+    );
+    assert!(error.describe().contains("not armed"));
 }
 
 /// The watermark offsets the reference's `0x70240 + level*4` formula reaches
@@ -246,20 +345,27 @@ fn computing_the_write_list_writes_nothing() {
     let regs = MockRegisters::new();
 
     let planned = plan.writes(0, 0);
+    let arm_planned = plan.writes_arm();
     assert_eq!(
-        planned.len(),
+        planned.len() + arm_planned.len(),
         27,
-        "one write per register the sequence owns"
+        "one write per register the sequence owns: 25 shadow writes and the arm pair"
     );
     assert_eq!(
         planned.len(),
         PIPE_PROGRAM_WRITES,
         "the list and the capacity reserved for it are the same number, not two hand-kept ones"
     );
+    assert_eq!(arm_planned.len(), PLANE_ARM_WRITES);
     assert_eq!(
         planned.last().map(|write| write.register),
+        Some(Pipe::A.plane_color_ctl()),
+        "the last planned shadow write is the last one the arm latches"
+    );
+    assert_eq!(
+        arm_planned.last().map(|write| write.register),
         Some(Pipe::A.plane_surf()),
-        "the last planned write is the commit"
+        "the last write of the whole sequence is the commit"
     );
     assert!(
         regs.writes().is_empty(),
@@ -351,9 +457,10 @@ fn a_refused_watermark_write_leaves_the_plane_unarmed() {
 fn a_refused_plane_control_write_leaves_the_plane_unarmed() {
     let plan = compute(Pipe::A, &vic16(), SURFACE).unwrap();
     let regs = MockRegisters::new();
+    program(&regs, &plan).expect("the shadow program is not refused");
     regs.refuse(Pipe::A.plane_ctl());
 
-    let error = program(&regs, &plan).expect_err("the write is refused");
+    let error = arm(&regs, &plan).expect_err("the arm's first write is refused");
     assert_eq!(
         error,
         PipeError::WriteRefused {
@@ -1240,36 +1347,109 @@ fn an_underrun_names_the_watermarks_and_the_ddb() {
 /// A plane that did not arm is a named failure, and the two shapes of it -- a
 /// zero and somebody else's address -- say different things.
 #[test]
-fn a_plane_that_did_not_arm_is_a_named_failure() {
+fn a_plane_that_did_not_latch_is_a_named_failure() {
     let plan = compute(Pipe::A, &vic16(), SURFACE).unwrap();
 
-    // Never armed: SURFLIVE reads zero.
+    // Not latched: SURFLIVE reads zero for the whole two-frame wait.
     let regs = MockRegisters::new();
-    let checks = prove(&regs, &plan, &FakeClock::new());
-    assert_eq!(
-        checks.surface,
-        SurfaceCheck::NotArmed {
-            live: 0,
-            wrote: plan.plane.surf
+    let clock = FakeClock::new();
+    let checks = prove(&regs, &plan, &clock);
+    let waited = match checks.surface {
+        SurfaceCheck::NotLatched {
+            wrote,
+            waited_micros,
+        } => {
+            assert_eq!(wrote, plan.plane.surf);
+            waited_micros
         }
+        other => panic!("expected NotLatched, got {other:?}"),
+    };
+    assert!(
+        (33_332..40_000).contains(&waited),
+        "the poll waited about two 1080p60 frame times (33 332 us), not one read: {waited} us"
     );
+    // The message must not call a late latch a rejected address: with the arm
+    // after the enable, zero is the expected reading until the pipe runs.
     let text = checks.surface.describe();
-    for expected in ["never armed", "PLANE_CTL", "alignment", "GGTT"] {
+    for expected in [
+        "not been latched",
+        "not \"the surface address was rejected\"",
+        "stale value",
+        "PLANE_CTL",
+        "alignment",
+        "GGTT",
+    ] {
         assert!(text.contains(expected), "{expected} missing from {text}");
     }
 
-    // Armed at something else: the firmware's surface, most likely.
+    // Armed at something else: the firmware's surface, most likely -- and that
+    // one is a wrong buffer rather than a late latch, so it is its own verdict.
     let regs = MockRegisters::new();
     regs.set(Pipe::A.plane_surflive(), 0x0200_0000);
-    let checks = prove(&regs, &plan, &FakeClock::new());
+    let clock = FakeClock::new();
+    let checks = prove(&regs, &plan, &clock);
     assert_eq!(
         checks.surface,
-        SurfaceCheck::NotArmed {
+        SurfaceCheck::WrongAddress {
             live: 0x0200_0000,
             wrote: plan.plane.surf
         }
     );
-    assert!(checks.surface.describe().contains("firmware"));
+    assert!(
+        clock.now_micros() >= 33_332,
+        "the poll waits its whole deadline before calling an address wrong: the next vblank may \
+         still replace it with the one that was written ({} us)",
+        clock.now_micros()
+    );
+    let text = checks.surface.describe();
+    for expected in ["different surface", "firmware", "wrong buffer"] {
+        assert!(text.contains(expected), "{expected} missing from {text}");
+    }
+}
+
+/// The surface check polls: an arm that latches after the first read is
+/// reported as armed, not as a plane that never latched.
+///
+/// This is the race the poll exists for.  The arm is written after the pipe is
+/// enabled, so the transfer to `PLANE_SURFLIVE` happens at the pipe's next
+/// vblank -- up to one frame time after the write, and microseconds is all it
+/// takes for a single eager read to land inside that window.
+#[test]
+fn a_late_latch_is_armed_rather_than_reported_missing() {
+    let plan = compute(Pipe::A, &vic16(), SURFACE).unwrap();
+    let regs = MockRegisters::new();
+    // The first three reads are stale, the fourth has the address: something a
+    // one-read check would have called NotLatched.
+    let reads = Rc::new(Cell::new(0u32));
+    let reads_in_hook = Rc::clone(&reads);
+    let surf = plan.plane.surf;
+    regs.on_read(Pipe::A.plane_surflive(), move |_| {
+        reads_in_hook.set(reads_in_hook.get() + 1);
+        if reads_in_hook.get() < 4 { 0 } else { surf }
+    });
+
+    let clock = FakeClock::new();
+    let checks = prove(&regs, &plan, &clock);
+    assert_eq!(
+        checks.surface,
+        SurfaceCheck::Armed {
+            live: plan.plane.surf,
+            wrote: plan.plane.surf
+        }
+    );
+    assert_eq!(
+        reads.get(),
+        4,
+        "the poll re-read until the address appeared rather than reading once"
+    );
+    // The wait was microseconds, not a frame time.  `prove` runs the scanline
+    // check first, which costs three scanline intervals of the fake clock, so
+    // the bound below is that plus a margin.
+    assert!(
+        clock.now_micros() < 3 * SCANLINE_INTERVAL_MICROS + 1_000,
+        "the latch came within microseconds of the first read: {} us",
+        clock.now_micros()
+    );
 }
 
 /// The comparison ignores bits outside the address field, so a decrypt flag in
@@ -1448,7 +1628,11 @@ fn the_whole_program_can_be_logged_before_the_first_write() {
         "SAGV 0x8007cfff",
         "TRANS 0x00000000",
         "PIPE_ARB_CTL 0x00000000 -> 0x00002000",
-        "PLANE_SURF_A <- 0x01000000",
+        // The arm pair is rendered too, marked with its step: the log shows
+        // the whole sequence even though two calls perform it.
+        "arm (after the pipe is enabled):",
+        "PLANE_CTL_A <- 0x94000000  (arm)",
+        "PLANE_SURF_A <- 0x01000000  (arm)",
         "TRANS_SET_CONTEXT_LATENCY(A) <- 0x00000000",
         "TRANS_HTOTAL(A) <- 0x0897077f",
         "PLANE_MISC", // deliberately absent; asserted below
@@ -1464,12 +1648,18 @@ fn the_whole_program_can_be_logged_before_the_first_write() {
         "rendering a program must not write it"
     );
 
-    // The state's own rendering has one line per write plus the header and the
-    // two read-modify-write lines.
+    // The state's own rendering has one line per shadow write plus the header
+    // and the two read-modify-write lines; the arm state's has one per arm
+    // write plus its header.
     let state = program(&regs, &plan).unwrap();
+    let arm_state = arm(&regs, &plan).unwrap();
     let rendered = state.render();
     assert_eq!(rendered.lines().count(), state.writes.len() + 3);
-    assert!(rendered.contains("27 writes"));
+    assert!(rendered.contains("25 shadow writes"), "{rendered}");
+    assert!(rendered.contains("not yet armed"), "{rendered}");
+    let rendered = arm_state.render();
+    assert_eq!(rendered.lines().count(), arm_state.writes.len() + 1);
+    assert!(rendered.contains("PLANE_CTL then PLANE_SURF"), "{rendered}");
 }
 
 /// The mock register file is only useful if it is the thing being driven, so
