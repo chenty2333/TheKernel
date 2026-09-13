@@ -14,7 +14,17 @@ use lazyinit::LazyInit;
 
 use crate::boot::{EarlyBootRecord, MULTIBOOT_BOOTLOADER_MAGIC, MULTIBOOT2_BOOTLOADER_MAGIC};
 
-pub(crate) const MAX_REGIONS: usize = 16;
+/// Upper bound on the number of *disjoint* usable memory ranges retained.
+///
+/// The bootloader's map is coalesced while it is parsed (see
+/// [`parse_memory_map`]), so this bounds ranges that genuinely do not touch —
+/// a handful on any real machine.  It was 16 when the parser stored every
+/// entry verbatim, which made a fragmented UEFI memory map a boot failure:
+/// firmware is free to hand over one descriptor per usable page and GRUB is
+/// not obliged to merge them.  Exceeding the bound now truncates and records
+/// the truncation rather than panicking, so the kernel loses some high RAM
+/// instead of the whole machine.
+pub(crate) const MAX_REGIONS: usize = 64;
 pub(crate) const MAX_MODULES: usize = 8;
 const MAX_MB2_INFO_SIZE: usize = 16 * 1024 * 1024;
 const MAX_RSDP_LENGTH: usize = 4096;
@@ -169,7 +179,7 @@ impl FramebufferInfo {
 /// no serial port the display *is* the diagnostic channel, and "the tag was
 /// absent" and "the tag was rejected" call for completely different fixes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FramebufferRejection {
+pub enum FramebufferRejection {
     /// The tag is shorter than its fixed portion.
     Truncated,
     /// The declared kind is the palette-indexed one.
@@ -188,6 +198,36 @@ pub(crate) enum FramebufferRejection {
     UnusableAddress,
     /// The declared surface would lie inside memory the kernel may allocate.
     OverlapsUsableMemory,
+}
+
+impl FramebufferRejection {
+    /// Stable spelling for a boot log.
+    ///
+    /// The strings are a contract: they are the only description of this
+    /// failure that reaches a machine whose sole output is the screen, so they
+    /// name the fault rather than the enum variant.  `UnknownKind` keeps its
+    /// discriminant because "kind 7" is the datum a fix needs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            FramebufferRejection::Truncated => "framebuffer tag truncated",
+            FramebufferRejection::Indexed => "framebuffer kind is palette-indexed",
+            FramebufferRejection::Text => "framebuffer kind is EGA text",
+            FramebufferRejection::UnknownKind(_) => "framebuffer kind is unknown",
+            FramebufferRejection::Inconsistent => "framebuffer geometry is inconsistent",
+            FramebufferRejection::UnusableAddress => "framebuffer address is unusable",
+            FramebufferRejection::OverlapsUsableMemory => {
+                "framebuffer overlaps usable memory"
+            }
+        }
+    }
+
+    /// The unknown kind number, when that is what was declined.
+    pub const fn unknown_kind(self) -> Option<u8> {
+        match self {
+            FramebufferRejection::UnknownKind(kind) => Some(kind),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,6 +296,12 @@ pub(crate) struct BootInfo {
     rsdp: Option<AcpiRsdp>,
     memory_regions: [RawRange; MAX_REGIONS],
     memory_region_count: usize,
+    /// Usable entries the bootloader declared, before coalescing.
+    memory_map_entries: usize,
+    /// Whether the bootloader's memory map held more disjoint usable ranges
+    /// than [`MAX_REGIONS`].  Retained so the boot log can say so: losing
+    /// high memory is survivable, but silently losing it is not diagnosable.
+    memory_map_truncated: bool,
     modules: [Option<ModuleInfo>; MAX_MODULES],
     module_count: usize,
     tags: [TagRecord; MAX_TAG_INVENTORY],
@@ -273,6 +319,8 @@ impl BootInfo {
             rsdp: None,
             memory_regions: [(0, 0); MAX_REGIONS],
             memory_region_count: 0,
+            memory_map_entries: 0,
+            memory_map_truncated: false,
             modules: [None; MAX_MODULES],
             module_count: 0,
             tags: [TagRecord {
@@ -302,6 +350,16 @@ impl BootInfo {
         &self.memory_regions[..self.memory_region_count]
     }
 
+    /// Whether more disjoint usable ranges existed than the map retains.
+    pub(crate) fn memory_map_truncated(&self) -> bool {
+        self.memory_map_truncated
+    }
+
+    /// Usable entries the bootloader declared, before coalescing.
+    pub(crate) fn memory_map_entries(&self) -> usize {
+        self.memory_map_entries
+    }
+
     pub(crate) fn modules(&self) -> &[Option<ModuleInfo>] {
         &self.modules[..self.module_count]
     }
@@ -322,7 +380,7 @@ impl BootInfo {
     }
 
     /// Why no usable framebuffer was retained, if the bootloader tried.
-    pub(crate) fn framebuffer_rejection(&self) -> Option<FramebufferRejection> {
+    pub fn framebuffer_rejection(&self) -> Option<FramebufferRejection> {
         self.framebuffer_rejection
     }
 }
@@ -371,6 +429,18 @@ fn report_tag_inventory(info: &BootInfo) {
         info.protocol(),
         info.tags().len(),
         info.tags_truncated() as u8
+    );
+    // The usable-region counts settle how fragmented this machine's firmware
+    // memory map is.  They are printed here, alongside the tag inventory,
+    // because this is the earliest point at which the answer exists and the
+    // latest at which a truncated map could still be explained.
+    diagnostic_println!(
+        "MB2 memory map: entries={} usable_regions={} capacity={} coalesced={} truncated={}",
+        info.memory_map_entries(),
+        info.memory_regions().len(),
+        MAX_REGIONS,
+        (info.memory_map_entries() - info.memory_regions().len()) as u32,
+        info.memory_map_truncated() as u8
     );
     for record in info.tags() {
         diagnostic_println!("MB2 tag type={} size={}", record.tag_type, record.size);
@@ -441,7 +511,6 @@ enum ParseError {
     DuplicateMemoryMap,
     MemoryMapMissing,
     MemoryMapMalformed,
-    MemoryMapCapacity,
     MemoryRangeOverflow,
     MemoryRangeConversion,
     ModuleTagMalformed,
@@ -515,10 +584,22 @@ fn parse_acpi_tag(payload: &[u8], tag_type: u32) -> Result<AcpiRsdp, ParseError>
     Ok(AcpiRsdp { bytes, length })
 }
 
+/// Parse the Multiboot2 memory map into sorted, disjoint usable ranges.
+///
+/// Returns the number of ranges stored, how many usable entries the
+/// bootloader declared, and whether any range was dropped because the map did
+/// not fit.
+///
+/// Fragmentation is not a property of the machine, it is a property of how the
+/// firmware happened to describe it: a UEFI memory map can list hundreds of
+/// separate `EfiConventionalMemory` descriptors for memory that is physically
+/// contiguous.  Storing them verbatim would make the retained-region count a
+/// function of firmware verbosity, so adjacent and overlapping ranges are
+/// merged here, and only the genuinely disjoint pieces are kept.
 fn parse_memory_map(
     tag: &[u8],
     regions: &mut [RawRange; MAX_REGIONS],
-) -> Result<usize, ParseError> {
+) -> Result<(usize, usize, bool), ParseError> {
     if tag.len() < 16 {
         return Err(ParseError::MemoryMapMalformed);
     }
@@ -535,6 +616,8 @@ fn parse_memory_map(
     }
 
     let mut count = 0;
+    let mut entries = 0;
+    let mut truncated = false;
     let mut offset = 16;
     while offset < tag.len() {
         let entry = tag
@@ -553,15 +636,74 @@ fn parse_memory_map(
             let length = usize::try_from(length).map_err(|_| ParseError::MemoryRangeConversion)?;
             base.checked_add(length)
                 .ok_or(ParseError::MemoryRangeOverflow)?;
-            if count == regions.len() {
-                return Err(ParseError::MemoryMapCapacity);
+            entries += 1;
+            if !insert_coalesced(regions, &mut count, (base, length)) {
+                truncated = true;
             }
-            regions[count] = (base, length);
-            count += 1;
         }
         offset += entry_size;
     }
-    Ok(count)
+    Ok((count, entries, truncated))
+}
+
+/// Insert one usable range into a sorted array of disjoint ranges, merging
+/// every range it touches or overlaps.
+///
+/// Returns `false` when the array is full and the range had to be dropped.
+/// Dropping a range can only lose access to memory the kernel would otherwise
+/// have used; it must never be a fatal error, because this parser runs before
+/// any console exists to report a fault.
+///
+/// The array `regions[..count]` must be sorted by start address with no two
+/// ranges touching or overlapping.  Bootloaders do not promise to emit the
+/// map in address order, so "sorted" is an invariant this function creates,
+/// not one it may assume of its input.
+fn insert_coalesced(regions: &mut [RawRange], count: &mut usize, range: RawRange) -> bool {
+    let (mut start, length) = range;
+    let Some(mut end) = start.checked_add(length) else {
+        return false;
+    };
+
+    // Walk forward over every stored range that ends strictly below this one.
+    // Those are untouched: they are disjoint and stay where they are.
+    let mut index = 0;
+    while index < *count {
+        let (existing_start, existing_length) = regions[index];
+        if existing_start.saturating_add(existing_length) >= start {
+            break;
+        }
+        index += 1;
+    }
+
+    // Absorb stored ranges from `index` onward while they reach into this one.
+    // The first stored range may start *before* this one (it was inserted
+    // later, out of order), in which case it also moves the merged start down.
+    let mut merge_end = index;
+    while merge_end < *count {
+        let (existing_start, existing_length) = regions[merge_end];
+        let existing_end = existing_start.saturating_add(existing_length);
+        // Touching counts as one run: `[a, b)` and `[b, c)` describe
+        // contiguous memory and no consumer benefits from seeing them apart.
+        if existing_start > end {
+            break;
+        }
+        start = start.min(existing_start);
+        end = end.max(existing_end);
+        merge_end += 1;
+    }
+
+    // Ranges after `merge_end` stay; the merged range replaces the absorbed
+    // run.  Writing it back needs one slot, and `merge_end - index` slots are
+    // freed, so this can only fail when nothing was absorbed and the array is
+    // already full.
+    let absorbed = merge_end - index;
+    if absorbed == 0 && *count >= regions.len() {
+        return false;
+    }
+    regions.copy_within(merge_end..*count, index + 1);
+    regions[index] = (start, end - start);
+    *count = *count - absorbed + 1;
+    true
 }
 
 fn parse_module(tag: &[u8]) -> Result<ModuleInfo, ParseError> {
@@ -802,7 +944,11 @@ fn parse_multiboot2_info(bytes: &[u8], info_paddr: usize) -> Result<BootInfo, Pa
                     return Err(ParseError::DuplicateMemoryMap);
                 }
                 saw_mmap = true;
-                owner.memory_region_count = parse_memory_map(tag, &mut owner.memory_regions)?;
+                let (count, entries, truncated) =
+                    parse_memory_map(tag, &mut owner.memory_regions)?;
+                owner.memory_region_count = count;
+                owner.memory_map_entries = entries;
+                owner.memory_map_truncated = truncated;
             }
             MB2_TAG_MODULE => {
                 if owner.module_count == MAX_MODULES {
@@ -859,6 +1005,19 @@ fn parse_multiboot2_info(bytes: &[u8], info_paddr: usize) -> Result<BootInfo, Pa
     }
     for module in owner.modules() {
         let module = module.expect("module slots below module_count are initialized");
+        // Usable ranges are inserted in ascending address order and merging
+        // only ever removes a range by growing its neighbour, so a truncated
+        // map keeps the lowest addresses and drops the highest.  A module that
+        // is not covered can then only be a module the bootloader placed in
+        // dropped high memory, which is survivable: the kernel loses that
+        // module rather than the boot.  Without truncation the check stays
+        // strict, because it is a real guard against a bootloader describing a
+        // module outside memory the kernel may read.
+        if owner.memory_map_truncated
+            && !module_is_available(module, owner.memory_regions())
+        {
+            continue;
+        }
         if !module_is_available(module, owner.memory_regions()) {
             return Err(ParseError::ModuleRangeOutsideMemory);
         }
@@ -883,13 +1042,14 @@ fn parse_multiboot2_info(bytes: &[u8], info_paddr: usize) -> Result<BootInfo, Pa
 
 #[cfg(test)]
 mod tests {
+    use std::vec::Vec;
+
     use super::{
         AcpiRsdp, BootProtocol, FramebufferRejection, MAX_MODULES, MAX_REGIONS, MAX_TAG_INVENTORY,
         ParseError, TagRecord, parse_multiboot2_info,
     };
 
-    fn push_u32(bytes: &mut std::vec::Vec<u8>, value: u32) {
-        bytes.extend_from_slice(&value.to_le_bytes());
+    fn push_u32(bytes: &mut std::vec::Vec<u8>, value: u32) {        bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     fn push_tag(bytes: &mut std::vec::Vec<u8>, tag_type: u32, payload: &[u8]) {
@@ -1166,24 +1326,150 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mmap_capacity_is_fatal_instead_of_truncating() {
-        let mut payload = vec![0; 8 + 24 * (MAX_REGIONS + 1)];
+    /// Build an MB2 information block carrying exactly `entries` as its memory
+    /// map, where each entry is `(base, length, kind)`.
+    fn info_with_memory_map(entries: &[(u64, u64, u32)]) -> Vec<u8> {
+        let mut payload = vec![0; 8 + 24 * entries.len()];
         payload[..4].copy_from_slice(&24u32.to_le_bytes());
-        for index in 0..=MAX_REGIONS {
+        for (index, &(base, length, kind)) in entries.iter().enumerate() {
             let offset = 8 + index * 24;
-            payload[offset..offset + 8].copy_from_slice(&((index * 0x1000) as u64).to_le_bytes());
-            payload[offset + 8..offset + 16].copy_from_slice(&0x1000u64.to_le_bytes());
-            payload[offset + 16..offset + 20].copy_from_slice(&1u32.to_le_bytes());
+            payload[offset..offset + 8].copy_from_slice(&base.to_le_bytes());
+            payload[offset + 8..offset + 16].copy_from_slice(&length.to_le_bytes());
+            payload[offset + 16..offset + 20].copy_from_slice(&kind.to_le_bytes());
         }
         let mut bytes = vec![0; 8];
         push_tag(&mut bytes, 6, &payload);
         push_tag(&mut bytes, 0, &[]);
         set_total_size(&mut bytes);
+        bytes
+    }
+
+    fn memory_map_of(bytes: &[u8]) -> (Vec<(usize, usize)>, bool) {
+        let info = parse_multiboot2_info(bytes, 0x1000).expect("valid information");
+        (
+            info.memory_regions().to_vec(),
+            info.memory_map_truncated(),
+        )
+    }
+
+    #[test]
+    fn adjacent_usable_ranges_coalesce_into_one() {
+        let bytes = info_with_memory_map(&[
+            (0x1000, 0x1000, 1),
+            (0x2000, 0x1000, 1),
+            (0x3000, 0x1000, 1),
+        ]);
+        let (regions, truncated) = memory_map_of(&bytes);
+        assert_eq!(regions, vec![(0x1000, 0x3000)]);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn overlapping_usable_ranges_coalesce_into_their_union() {
+        let bytes = info_with_memory_map(&[
+            (0x1000, 0x4000, 1),
+            (0x3000, 0x4000, 1),
+            (0x2000, 0x1000, 1),
+        ]);
+        let (regions, _) = memory_map_of(&bytes);
+        assert_eq!(regions, vec![(0x1000, 0x6000)]);
+    }
+
+    #[test]
+    fn an_unsorted_map_is_ordered_before_it_is_coalesced() {
+        // GRUB is not required to emit the map in address order, and one
+        // coalescing pass only sees neighbours if it sorts first.
+        let bytes = info_with_memory_map(&[
+            (0x9000, 0x1000, 1),
+            (0x1000, 0x3000, 1),
+            (0x8000, 0x1000, 1),
+            (0x2000, 0x1000, 1),
+            (0x4000, 0x1000, 3), // reserved: not usable, breaks the run
+            (0x5000, 0x1000, 1),
+        ]);
+        let (regions, _) = memory_map_of(&bytes);
         assert_eq!(
-            parse_multiboot2_info(&bytes, 0x1000),
-            Err(ParseError::MemoryMapCapacity)
+            regions,
+            vec![(0x1000, 0x3000), (0x5000, 0x1000), (0x8000, 0x2000)]
         );
+    }
+
+    #[test]
+    fn a_gap_is_never_bridged_by_an_out_of_order_entry() {
+        // Regression: sorting by start does not imply the previous range ends
+        // before this one starts.  A merge rule that only asked "does the
+        // previous range reach me?" extended a low range across the gap to
+        // swallow every higher one, collapsing distinct windows into a single
+        // fictional run of usable memory.
+        let bytes = info_with_memory_map(&[
+            (0x9000, 0x1000, 1),
+            (0x1000, 0x1000, 1),
+            (0x8000, 0x1000, 1),
+        ]);
+        let (regions, _) = memory_map_of(&bytes);
+        assert_eq!(
+            regions,
+            vec![(0x1000, 0x1000), (0x8000, 0x2000)],
+            "the 0x2000..0x8000 gap is not memory"
+        );
+    }
+
+    #[test]
+    fn non_usable_entries_do_not_join_a_usable_run() {
+        let bytes = info_with_memory_map(&[
+            (0x1000, 0x1000, 1),
+            (0x2000, 0x1000, 3),
+            (0x3000, 0x1000, 1),
+        ]);
+        let (regions, _) = memory_map_of(&bytes);
+        assert_eq!(regions, vec![(0x1000, 0x1000), (0x3000, 0x1000)]);
+    }
+
+    #[test]
+    fn capacity_in_disjoint_ranges_still_parses() {
+        let entries: Vec<_> = (0..MAX_REGIONS as u64)
+            .map(|index| (0x10_0000 + index * 0x2000, 0x1000, 1))
+            .collect();
+        let bytes = info_with_memory_map(&entries);
+        let (regions, truncated) = memory_map_of(&bytes);
+        assert_eq!(regions.len(), MAX_REGIONS);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn more_disjoint_ranges_than_capacity_truncates_instead_of_failing() {
+        // Regression: this map used to return `MemoryMapCapacity`, which the
+        // caller turns into a panic before any console exists.  A fragmented
+        // firmware memory map must not be a boot failure.
+        let entries: Vec<_> = (0..MAX_REGIONS as u64 + 8)
+            .map(|index| (0x10_0000 + index * 0x2000, 0x1000, 1))
+            .collect();
+        let bytes = info_with_memory_map(&entries);
+        let (regions, truncated) = memory_map_of(&bytes);
+        assert!(truncated, "dropping ranges must be recorded");
+        assert_eq!(regions.len(), MAX_REGIONS);
+        // The retained ranges are the lowest addresses: merging only ever
+        // removes a range by growing a neighbour, so a dropped range is always
+        // the highest one so far.
+        assert_eq!(regions[0], (0x10_0000, 0x1000));
+        assert_eq!(
+            regions[MAX_REGIONS - 1],
+            (0x10_0000 + (MAX_REGIONS as usize - 1) * 0x2000, 0x1000)
+        );
+    }
+
+    #[test]
+    fn a_fragmented_map_of_one_contiguous_run_is_not_truncated() {
+        // 4096 one-page descriptors for one contiguous 16 MiB run: the shape a
+        // real UEFI memory map can take.  Coalescing must reduce it to one
+        // range, not overflow.
+        let entries: Vec<_> = (0..4096u64)
+            .map(|index| (0x100_0000 + index * 0x1000, 0x1000, 1))
+            .collect();
+        let bytes = info_with_memory_map(&entries);
+        let (regions, truncated) = memory_map_of(&bytes);
+        assert_eq!(regions, vec![(0x100_0000, 4096 * 0x1000)]);
+        assert!(!truncated);
     }
 
     #[test]
@@ -1329,6 +1615,52 @@ mod tests {
             // The rest of the handoff must be unaffected by the decline.
             assert_eq!(info.memory_regions(), &[(0, 0x0800_0000)]);
         }
+    }
+
+    #[test]
+    fn every_framebuffer_rejection_reaches_the_log_as_a_distinct_phrase() {
+        // The phrase is the only description of this failure that reaches a
+        // machine whose sole output is the screen, so each reason must survive
+        // to distinct text: a generic "declined" would leave the operator with
+        // nothing to act on.
+        let rejections = [
+            FramebufferRejection::Truncated,
+            FramebufferRejection::Indexed,
+            FramebufferRejection::Text,
+            FramebufferRejection::UnknownKind(7),
+            FramebufferRejection::Inconsistent,
+            FramebufferRejection::UnusableAddress,
+            FramebufferRejection::OverlapsUsableMemory,
+        ];
+        let mut phrases = std::vec::Vec::new();
+        for rejection in rejections {
+            let phrase = rejection.as_str();
+            assert!(
+                phrase.starts_with("framebuffer "),
+                "{rejection:?} reports an unhelpful phrase: {phrase}"
+            );
+            assert!(!phrase.is_empty());
+            assert!(
+                !phrases.contains(&phrase),
+                "two rejections share the phrase {phrase}"
+            );
+            phrases.push(phrase);
+        }
+        assert_eq!(phrases.len(), rejections.len());
+        // The unknown kind keeps its discriminant: "kind 7" is the datum a fix
+        // needs, and the phrase alone cannot carry it.
+        assert_eq!(FramebufferRejection::UnknownKind(7).unknown_kind(), Some(7));
+        assert_eq!(FramebufferRejection::Text.unknown_kind(), None);
+    }
+
+    #[test]
+    fn a_declined_framebuffer_is_still_reported_as_offered() {
+        // "No tag" and "tag declined" call for different fixes, so the owner
+        // must be able to tell them apart without the diagnostic UART.
+        let tag = framebuffer_payload(0x8000_0000, 4096, 800, 600, 32, 0, RGB_888);
+        let info = parse_multiboot2_info(&info_with_framebuffer(&tag), 0x1000).unwrap();
+        assert!(info.framebuffer().is_none());
+        assert!(info.framebuffer_rejection().is_some());
     }
 
     #[test]
