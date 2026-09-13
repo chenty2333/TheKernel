@@ -878,23 +878,11 @@ fn all_ones(block: &[u8; EDID_BLOCK_LEN]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Where the protocol touches the machine
+// Where the protocol gets its sense of time
+//
+// The other half of the protocol's contact with the machine is `regs::Registers`
+// in `regs.rs`: the register file, which the bring-up sequences share.
 // ---------------------------------------------------------------------------
-
-/// The six registers a GMBUS transaction is a state machine over.
-///
-/// The protocol is written against [`Registers`], the same abstraction the
-/// power, clock, PHY and PLL sequences are written against, rather than
-/// against MMIO.  Two implementations exist: [`RegisterWindow`], which is
-/// volatile access to the mapped aperture, and the test controller in
-/// `gmbus::tests`, which is a device model layered on a real window over an
-/// ordinary buffer.  The protocol therefore runs -- including its timeout, NAK,
-/// stuck-bus and recovery paths, which no machine without a fault injector can
-/// be made to produce -- on a host that has no graphics device at all.
-///
-/// The trait is `&self` rather than `&mut self` because a register file is
-/// shared: the bring-up sequences hold one and so does this transport, and
-/// interior mutability belongs in the test double, not in the interface.
 
 /// What a poll loop needs from the outside world: a monotonic reading, and a
 /// way to let a moment pass.
