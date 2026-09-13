@@ -23,6 +23,15 @@ The first invocation after a tree change builds the shell-profile kernel and
 rootfs; pass `--no-build` to reuse them.  `--host-control` runs the same
 program on host Linux instead of in the guest: that is a check on the harness,
 not on TheKernel.
+
+A boot that ran has one of three states.  `ok` means every requested variant
+completed its rounds and no counter moved.  `DEFECT` means it completed and a
+round failed: that is the result worth having, it stays in the pooled
+denominator, and its first-failure line and console log are printed.  `UNUSABLE`
+means it did not measure what was asked (no console, no summary for a variant,
+a short round count, an alarm timeout) and is therefore excluded from the pool
+and retried; a `--rounds` mismatch is how a cut-short loop surfaces, so a boot
+can never pass by running fewer rounds than requested.
 """
 
 from __future__ import annotations
@@ -58,18 +67,20 @@ DEFECT_FIELDS = (
     "attach_fail",
     "errno_fail",
     "retire_early_fail",
+    "grandchild_fail",
 )
-# Exactly the fields and order the C program prints in its summary line.
+# The fields the program prints today, in print order.  Parsing does not
+# depend on this list: a summary line is read as generic key=value pairs, so
+# logs written by an older or newer revision of the program still parse and
+# unknown counters are preserved for the JSON report.
 COUNTER_FIELDS = ("rounds", "completed", *DEFECT_FIELDS, "alive_probe")
 BOOT_MARKER = "SYSV-SHM-STRESS-BOOT-COMPLETE"
 CONFIDENCE = 0.95
 
 SUMMARY_RE = re.compile(
-    r"^SYSV-SHM-STRESS variant=(\w+) "
-    + " ".join(rf"{field}=(\d+)" for field in COUNTER_FIELDS)
-    + r"\s*$",
-    re.MULTILINE,
+    r"^SYSV-SHM-STRESS variant=(\w+) ((?:[a-z_]+=\d+\s*)+)$", re.MULTILINE
 )
+COUNTER_RE = re.compile(r"([a-z_]+)=(\d+)")
 VERDICT_RE = re.compile(r"^SYSV-SHM-STRESS-(OK|FAIL) (\w+)\s*$", re.MULTILINE)
 FIRST_FAIL_RE = re.compile(
     r"^SYSV-SHM-STRESS-FIRST-FAIL variant=(\w+) round=(\d+) kind=(\S+) "
@@ -168,6 +179,10 @@ class Invocation:
     ok: bool
     first_fail: str | None
     timed_out: bool
+    # True when the round counters moved or the program printed FAIL.  A
+    # missing verdict line is not a defect: it is truncated output, which the
+    # marker rule below treats as unusable evidence instead.
+    failed: bool = False
 
     @property
     def rounds(self) -> int:
@@ -227,9 +242,7 @@ class BootParse:
     @property
     def failed_invocations(self) -> tuple[Invocation, ...]:
         return tuple(
-            invocation
-            for invocation in self.invocations
-            if invocation.defects or not invocation.ok
+            invocation for invocation in self.invocations if invocation.failed
         )
 
 
@@ -256,11 +269,11 @@ def parse_boot_text(
     seen: dict[str, int] = {}
     for match in SUMMARY_RE.finditer(text):
         variant = match.group(1)
-        counters = {
-            field: int(match.group(index))
-            for index, field in enumerate(COUNTER_FIELDS, start=2)
-        }
+        counters = dict.fromkeys(COUNTER_FIELDS, 0)
+        for field, value in COUNTER_RE.findall(match.group(2)):
+            counters[field] = int(value)
         seen[variant] = seen.get(variant, 0) + 1
+        defects = sum(counters[field] for field in DEFECT_FIELDS)
         invocations.append(
             Invocation(
                 variant=variant,
@@ -268,6 +281,7 @@ def parse_boot_text(
                 ok=verdicts.get(variant) == "OK",
                 first_fail=first_fails.get(variant),
                 timed_out=timed_out,
+                failed=defects > 0 or verdicts.get(variant) == "FAIL",
             )
         )
 
@@ -284,7 +298,7 @@ def parse_boot_text(
                 f"{invocation.variant} ran {invocation.rounds} rounds, "
                 f"expected {expected_rounds}"
             )
-        if not invocation.ok:
+        if invocation.failed:
             detail = f" ({invocation.first_fail})" if invocation.first_fail else ""
             defect_notes.append(
                 f"{invocation.variant} FAIL: {invocation.defects} defective round(s)"
@@ -292,7 +306,10 @@ def parse_boot_text(
             )
     if timed_out:
         problems.append("SYSV-SHM-STRESS-TIMEOUT marker present")
-    if not marker:
+    # The marker is printed by the guest shell only when every invocation
+    # exited zero.  A missing marker is therefore expected when a variant
+    # failed; it is evidence against the boot only when nothing explains it.
+    if not marker and not defect_notes:
         problems.append(f"missing completion marker {BOOT_MARKER}")
     return BootParse(
         invocations=tuple(invocations),
@@ -327,9 +344,19 @@ class BootRun:
 
 
 def guest_command(variants: Sequence[str], rounds: int, alarm: int) -> str:
-    """The single guest shell line whose success gates the completion marker."""
+    """The single guest shell line whose success gates the completion marker.
 
-    return " && ".join(f"{GUEST_TOOL} {variant} {rounds} {alarm}" for variant in variants)
+    Every requested variant runs even when an earlier one reports a defect:
+    the first failing variant must not hide the others from the same boot, and
+    a defect is a result to keep, not a reason to discard the boot.  The line
+    ends with `test $ok -eq 0`, which is what the caller's `&& echo MARKER`
+    gates on, so the marker still means "every invocation exited zero".
+    """
+
+    runs = " ; ".join(
+        f"{GUEST_TOOL} {variant} {rounds} {alarm} || ok=1" for variant in variants
+    )
+    return f"ok=0 ; {runs} ; test $ok -eq 0"
 
 
 def heavy_command(inner: Sequence[str], heavy_run: Path) -> list[str]:
@@ -597,16 +624,24 @@ def render_report(
         for run in valid
         for note in run.parse.defect_notes
     ]
+    excluded = sum(run.parse.defects for run in runs if not run.valid)
     if pool_notes:
         lines.append(
             f"*** DEFECTS OBSERVED: {pooled_defects} defective round(s) in "
-            f"{pooled_rounds}; the fix does not hold at this rate ***"
+            f"{pooled_rounds}; the program did not complete every round cleanly. "
+            f"Which assertion failed decides what that means for the fix. ***"
         )
         for note in pool_notes:
             lines.append(f"    {note}")
         for run in valid:
             if run.parse.defects and run.console is not None:
                 lines.append(f"    console: {run.console}")
+        lines.append("")
+    if excluded:
+        lines.append(
+            f"defects in boots excluded as unusable evidence (not in the "
+            f"denominator above): {excluded}"
+        )
         lines.append("")
     lines.append(f"per round:  {_rate_text(pooled_defects, pooled_rounds)}")
     bad_boots = sum(1 for run in valid if run.parse.defects)

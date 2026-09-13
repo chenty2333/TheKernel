@@ -134,6 +134,37 @@ class ParserTests(unittest.TestCase):
         )
         self.assertIn("DEFECTS OBSERVED", reported)
 
+    def test_a_failing_variant_does_not_hide_the_others(self):
+        """The real shape of the observed anomaly: one variant fails, so the
+        guest shell never prints the marker, but every variant did report."""
+
+        lines = [summary("wait", 100), summary("pipe", 100)]
+        lines.append(summary("shared", 100, child_fail=1))
+        lines.append("SYSV-SHM-STRESS-OK wait")
+        lines.append("SYSV-SHM-STRESS-OK pipe")
+        lines.append("SYSV-SHM-STRESS-FAIL shared")
+        parsed = stress.parse_boot_text("\n".join(lines), ["wait", "pipe", "shared"], 100)
+        self.assertTrue(parsed.valid, parsed.problems)
+        self.assertFalse(parsed.marker)
+        self.assertEqual(parsed.defects, 1)
+        self.assertEqual([item.variant for item in parsed.failed_invocations], ["shared"])
+        totals = stress.totals_for([stress.BootRun("a", 1, 1, None, None, parsed)])
+        self.assertEqual(totals["wait"].rounds, 100)
+        self.assertEqual(totals["shared"].defects, 1)
+
+    def test_older_summary_format_still_parses(self):
+        """A log written before `grandchild_fail` existed is still evidence."""
+
+        line = (
+            "SYSV-SHM-STRESS variant=shared rounds=100 completed=100 setup_fail=0 "
+            "child_fail=0 value_fail=0 attach_fail=0 errno_fail=0 "
+            "retire_early_fail=0 alive_probe=0"
+        )
+        text = "\n".join([line, "SYSV-SHM-STRESS-OK shared", stress.BOOT_MARKER])
+        parsed = stress.parse_boot_text(text, ["shared"], 100)
+        self.assertTrue(parsed.valid, parsed.problems)
+        self.assertEqual(parsed.invocations[0].counters["grandchild_fail"], 0)
+
     def test_alive_probe_is_descriptive_not_a_defect(self):
         """`nowait` legitimately probes while the child still owns the segment."""
 
@@ -194,13 +225,18 @@ class AggregationTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
-    def test_guest_command_chains_every_variant_in_one_line(self):
+    def test_guest_command_runs_every_variant_and_gates_on_all_of_them(self):
         command = stress.guest_command(["wait", "pipe"], 4000, 300)
         self.assertEqual(
             command,
-            "/opt/thekernel-tests/portable/sysv-shm-exit-stress wait 4000 300 && "
-            "/opt/thekernel-tests/portable/sysv-shm-exit-stress pipe 4000 300",
+            "ok=0 ; "
+            "/opt/thekernel-tests/portable/sysv-shm-exit-stress wait 4000 300 || ok=1 ; "
+            "/opt/thekernel-tests/portable/sysv-shm-exit-stress pipe 4000 300 || ok=1 ; "
+            "test $ok -eq 0",
         )
+        # A failing variant must not stop the later ones: the last variant's
+        # result is not allowed to depend on the first variant passing.
+        self.assertNotIn("&&", command)
 
     def test_heavy_command_keeps_the_inner_command_as_one_argument(self):
         wrapped = stress.heavy_command(["python3", "-c", "a b"], Path("/h.sh"))
