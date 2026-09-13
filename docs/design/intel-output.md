@@ -35,8 +35,15 @@ ICL_DPCLKA_CFGCR0: DDI_CLK_SEL, then DDI_CLK_OFF cleared in a separate write
 DDI-IO power well -> poll STATE
 PORT_CL_DW5 SUS_CLOCK_CONFIG, the swing writes, PORT_CL_DW10 lane power
 TRANS_CLK_SEL(A), TRANS_DDI_FUNC_CTL(A), TRANSCONF(A)
-DDI_BUF_CTL(A), then poll IS_IDLE == 0
+DDI_BUF_CTL, then poll IS_IDLE == 0
 ```
+
+Which PLL and which port registers those steps use is the DDI's, and `port_registers(phy)` is the
+single place that mapping lives: combo PHY A is DPLL0's port and combo PHY B is DPLL1's (`[REF]` §6.3),
+so the `CFGCR` pair, the enable register, the `PORT_*` registers and `DDI_BUF_CTL` are the B
+instances for DDI B. The transcoder registers are *not* per-port: `[REF]` §5.1 gives the PRM's rule
+that *"Transcoders A-D can connect to any DDI"*, so they stay A's and the DDI rides inside the value
+(`(port + 1) << 28` in `TRANS_CLK_SEL`, `(port + 1) << 27` in `TRANS_DDI_FUNC_CTL`).
 
 ## 2. Provenance
 
@@ -80,6 +87,19 @@ exactly what §6.3's worked example prints:
 That test would fail if `pll.rs`'s arithmetic, the reference division, the workaround or the field
 encoding were wrong, so it is the strongest sourced check this module has. It is still a host test.
 
+**A reference defect, closed from the source the reference itself cites.** §6.3's PLL table gives
+`DPLL1_*` as what clocks combo PHY B, and then its register table and both of its field rows state the
+DPLL0 instances only — "`DPLLn_CFGCR0` (`0x164284` for DPLL0)", "`DPLLn_CFGCR1` (`0x164288` for
+DPLL0)" — so read on its own the table leaves PHY B's PLL with no address at all. An earlier revision
+of this module therefore refused DDI B outright with `PllConfigRegisterMissing`, which on a machine
+whose HDMI socket is wired to PHY B is a refusal instead of a picture. The subsection's own citation
+for that register block, `[I915]` `i915_reg.h:4301-4322`, is the region that defines both pairs:
+`_TGL_DPLL1_CFGCR0 = 0x16428C` (`i915_reg.h:4302`) and `_TGL_DPLL1_CFGCR1 = 0x164290`
+(`i915_reg.h:4317`), the registers `icl_dpll_write` picks for PLL id 1 on `DISPLAY_VER >= 12`
+(`intel_dpll_mgr.c:3767-3769`), which is ADL-N. Both are now declared in `regs/dpll.rs` with that
+citation and registered in the table; the divider *values* do not change with the PHY, because the
+`CFGCR` field macros are defined once and used for both (`i915_reg.h:4279-4299`).
+
 ### 3.2 The encoding question is the caller's
 
 `PllFieldEncoding` has no default in `pll.rs` and none here: `OutputRequest.encoding` must be
@@ -106,6 +126,12 @@ with separate register writes"*. A test asserts `write_count(ICL_DPCLKA_CFGCR0) 
 first write keeps the gate bit and sets the select, and that the second clears the gate and keeps
 the select — a merged read-modify-write would pass a test that only checked the final value, so the
 test checks the log.
+
+The field is two bits at `phy * 2` and its **value is the PLL id**, so the two combo PHYs do not
+write the same word: PHY A selects 0 (DPLL0) and PHY B selects 1 (DPLL1), and each clears its own
+`DDI_CLK_OFF` bit — 10 for A, 11 for B (`[I915]` `i915_reg.h:4159,4164,4166`, which `pll.rs`'s
+`ComboPhy` encodes). `the_clock_select_field_carries_the_pll_id_for_each_phy` pins both fields and
+both gate bits, on the write log for B with A's field deliberately non-zero in the register.
 
 ### 3.4 The DDI-IO power well (§8.6 step 5)
 
@@ -174,7 +200,7 @@ screen the mode was supposed to light up.
 | Error | What it means, and what the text says to do |
 |---|---|
 | `UnsupportedDdi` | C or D: not a combo-PHY port (§8.1), Type-C/DKL deferred (§8.8). Refused before any write. |
-| `PllConfigRegisterMissing` | Combo PHY B: the table has no `DPLL1_CFGCR0`/`CFGCR1` offset. §13.4's dump is the fix. |
+| `PllConfigRegisterMissing` | A PHY whose PLL `CFGCR0`/`CFGCR1` offsets are not in the table. Nothing raises it today: both combo PHYs have theirs. |
 | `MissingBufferTranslation` | §8.5's HDMI values are a `[GAP]`. Supply them, do not guess. |
 | `HdmiScramblingNotImplemented` | The pixel clock is at or above the scrambling threshold; the sink-side SCDC enable does not exist here. |
 | `Pll(PllError)` | `pll.rs` refused the mode, the reference or the encoding. |
@@ -225,11 +251,18 @@ what was done instead, and what would close it.
    document does not give, and the log labels it as an inference rather than hiding it. It is not a refusal because the field tunes
    the DDI buffer's own equalisation, and refusing a whole bring-up over an equalisation margin
    would be the wrong trade.
-6. **`DPLL1_CFGCR0`/`DPLL1_CFGCR1`.** §6.3 states the config offsets for DPLL0 only. `pll.rs`
-   computes PHY B's dividers happily; there is no inventoried address to write them to.
-   `regs/dpll.rs` already records the omission, and this module refuses PHY B with
-   `PllConfigRegisterMissing` rather than guessing a neighbouring offset. **This is the one gap that
-   blocks a whole port**, and it matters if the monitor turns out to be on DDI B.
+6. **`DPLL1_CFGCR0`/`DPLL1_CFGCR1` — closed, and it was a defect in the reference rather than a
+   missing fact.** §6.3's register table and both of its field rows state the DPLL0 instances only
+   ("`DPLLn_CFGCR0` (`0x164284` for DPLL0)"), so the document read on its own leaves PHY B's PLL
+   without an address, and an earlier revision of this module refused DDI B with
+   `PllConfigRegisterMissing`. **What closed it:** the citation §6.3 prints for that same block,
+   `[I915]` `i915_reg.h:4301-4322` — `_TGL_DPLL1_CFGCR0 = 0x16428C` (`:4302`),
+   `_TGL_DPLL1_CFGCR1 = 0x164290` (`:4317`), which `icl_dpll_write` selects for PLL id 1 on
+   `DISPLAY_VER >= 12` (`intel_dpll_mgr.c:3767-3769`). Both are declared in `regs/dpll.rs` and in
+   the table, and `port_registers(ComboPhy::B)` supplies them. `DPLL1_ENABLE` (`0x46014`) and the
+   `DPLL1_DIV0` sibling (`0x164C00`, deliberately unwritten — §6.3's AFC write is VBT-only) are the
+   rest of that family. **What a dump still settles:** which of the two DDIs the machine's HDMI
+   socket is actually wired to, which is what §8 item 5 now asks for.
 7. **The `DDI_CLK_SEL` field's per-PHY siblings.** §6.3 gives one `ICL_DPCLKA_CFGCR0` at `0x164280`
    with both PHYs' fields inside it. No `DPCLKB`/`C`/`D` register appears anywhere in the document,
    so none is declared or written.
@@ -240,12 +273,16 @@ what was done instead, and what would close it.
 
 ## 6. What the tests measure
 
-`[MEASURED]` 230 `drm::intel` host tests pass, 29 of them this module's, none failing. `cargo
-clippy` for the host test target and for the product kernel configuration (`tools/thekernel.py
-lint`, `x86_64-unknown-none`, release) reports nothing in `output.rs` or `output/tests.rs`. The
-product kernel builds.
+`[MEASURED]` 36 of the `drm::intel` host suite's tests are this module's, and none of them fails;
+the whole-suite count is recorded in the integration report rather than here, because two
+workstreams added to it independently -- the DDI B sequence and the corrected ADL-N PLL divider
+search -- and a number copied from either one would be wrong for the merge (earlier revisions of
+this document recorded 197 and 29). `tools/thekernel.py lint` -- Clippy for the product kernel
+configuration, `x86_64-unknown-none`, release -- reports nothing in `output.rs`,
+`output/tests.rs`, `regs/dpll.rs` or `regs/table/mod.rs`. The host test target's own Clippy run
+recorded by the earlier revision was not repeated here.
 
-The 29 tests assert, among other things:
+The 36 tests assert, among other things:
 
 * the write order, on `writes()` rather than on the return value: twenty-one writes in the order §8.6
   gives, with the DDI-IO well between the clock mapping and the swing values;
@@ -264,7 +301,14 @@ The 29 tests assert, among other things:
 * `PLL_LOCK` never setting is `PllNeverLocked` carrying `(P, Q, K)` and the reference; and
   `PLL_POWER_STATE` never setting is a *different* error, because the dividers were never reached;
 * the DDI-IO well that never comes up leaves its request bit withdrawn;
-* the plan log carries `ref`, `(P, Q, K)`, the symbol rate and both `CFGCR` values.
+* the plan log carries `ref`, `(P, Q, K)`, the symbol rate and both `CFGCR` values;
+* **the DDI B / PHY B path as a sequence of its own**: the plan is PHY B's with the same divider
+  program, the write log is the B instances (`DPLL1_ENABLE`, `DPLL1_CFGCR0`, `DPLL1_CFGCR1`,
+  `PORT_CL_DW5(B)`, `PORT_TX_DW*_GRP(B)`, `PORT_CL_DW10(B)`, `DDI_BUF_CTL(B)`) with the transcoder
+  registers still A's, the `DPLL1` config words are read back at `0x16428C`/`0x164290` and
+  `DPLL0`'s addresses are untouched, `DPLL1_ENABLE` takes the same power-then-enable dance with the
+  dividers in between and a `LOCK` poll that retries, and `ICL_DPCLKA_CFGCR0`'s two-bit field
+  carries PLL id 1 for PHY B and 0 for PHY A with each PHY's own `DDI_CLK_OFF` bit.
 
 ### 6.1 One measurement that was a finding: `pll.rs` was not the ADL-N search
 
@@ -356,10 +400,12 @@ reproducible and a revert to the Skylake path would fail rather than be believed
 3. **`DDI_BUF_CTL(A)` and `DDI_BUF_CTL(B)`** from that dump, for `IS_IDLE` and `PHY_LINK_RATE`.
 4. **`ICL_DPCLKA_CFGCR0`** from that dump, to confirm the `DDI_CLK_SEL` shift and the `DDI_CLK_OFF`
    bit positions per PHY, and to see which DDI the firmware used.
-5. **If the monitor is on DDI B:** read `0x164290`–`0x1642A0` in the dump and find the pair whose
-   fields look like `DPLL0_CFGCR0`/`CFGCR1` do. That is the one gap that blocks a port outright, and
-   a single dump closes it. The offsets must then go into `regs/dpll.rs` and the table, not into
-   this module as a literal.
+5. **If the monitor is on DDI B:** the registers are no longer the question — `DPLL1_CFGCR0`/
+   `DPLL1_CFGCR1` are in `regs/dpll.rs` from the `[I915]` region `[REF]` §6.3 cites for that block,
+   and the sequence programs DDI B end to end. What a dump still settles is **which DDI the socket is
+   wired to**: read `DDI_BUF_CTL(A)` and `DDI_BUF_CTL(B)` and `ICL_DPCLKA_CFGCR0` while the
+   firmware's own output is up, and see which DDI's `DDI_CLK_SEL` field is non-zero. `sink.rs`'s
+   EDID probe answers the same question at run time from the GMBUS pin.
 6. **`DPLL0_ENABLE` after the firmware's modeset**, to confirm the lock bit and to compare the poll
    timing the reference reports against what this machine does.
 

@@ -94,6 +94,8 @@ pub(crate) const DDI: &[Register] = &[
 pub(crate) const DPLL: &[Register] = &[
     dpll::DPLL0_CFGCR0,
     dpll::DPLL0_CFGCR1,
+    dpll::DPLL1_CFGCR0,
+    dpll::DPLL1_CFGCR1,
     dpll::DPLL0_ENABLE,
     dpll::DPLL1_ENABLE,
     dpll::ICL_DPCLKA_CFGCR0,

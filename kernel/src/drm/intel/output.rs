@@ -8,7 +8,7 @@
 //! §11 phase 5, with the output half of §8.6 and the routing rules of §6.3:
 //!
 //! ```text
-//! 5.1  DPLL0: power on -> poll POWER_STATE -> dividers -> enable -> poll LOCK
+//! 5.1  DPLL0/DPLL1: power on -> poll POWER_STATE -> dividers -> enable -> poll LOCK
 //! 5.2  ICL_DPCLKA_CFGCR0: DDI_CLK_SEL, then DDI_CLK_OFF cleared
 //!      in a *separate write*
 //! 8.6.5 enable the port's DDI-IO power well, poll its state
@@ -17,9 +17,17 @@
 //! 5.4  TRANS_CLK_SEL(A)
 //! 5.5  TRANS_DDI_FUNC_CTL(A): port, HDMI/DVI, 8 bpc, polarity
 //! 5.6  TRANSCONF(A) = ENABLE | STATE_ENABLE | progressive
-//! 5.7  DDI_BUF_CTL(A): enable, buffer-translation level, width,
+//! 5.7  DDI_BUF_CTL: enable, buffer-translation level, width,
 //!      then poll IS_IDLE == 0
 //! ```
+//!
+//! Which PLL, which port registers and which `DDI_BUF_CTL` those steps use is
+//! the DDI's: combo PHY A is DPLL0's port and combo PHY B is DPLL1's (§6.3),
+//! and [`port_registers`] is the one place that mapping lives.  The transcoder
+//! side is not per-port: §5.1 gives the PRM's rule that *"Transcoders A-D can
+//! connect to any DDI"*, so the transcoder registers are A's and the **values**
+//! written into them carry the DDI (§5.4's `(port + 1) << 28`, §5.5's
+//! `(port + 1) << 27`).
 //!
 //! # Compute, then write
 //!
@@ -87,18 +95,13 @@
 //! `docs/design/intel-output.md`, and §13.4's dump-diff is how to settle it.
 //! It is deliberately *not* a refusal: the field tunes the DDI buffer's own
 //! equalisation, and an error here would block a bring-up over a
-//! signal-integrity margin, while the three refusals below are cases where the
+//! signal-integrity margin, while the two refusals below are cases where the
 //! sequence cannot proceed at all.
 //!
-//! Three things are refused rather than approximated:
+//! Two things are refused rather than approximated:
 //!
 //! * **A DDI that is not a combo-PHY port.** §8.1: the rear HDMI is on combo
 //!   PHY A or B; C and D are Type-C/DKL ports and §8.8 defers that whole path.
-//! * **Combo PHY B.** §6.3 gives `DPLL0_CFGCR0`/`CFGCR1` offsets and no
-//!   `DPLL1_CFGCR*` offsets at all -- `regs/dpll.rs` records that gap in its
-//!   transcription notes -- so PHY B's PLL cannot be programmed from this
-//!   repository's register table.  The arithmetic is fine (`pll.rs` computes a
-//!   divider set for PHY B) but the write would need an inventoried offset.
 //! * **A pixel clock at or above the HDMI scrambling threshold.** §8.4's `[INF]`
 //!   note says TMDS at 340 MHz and above needs scrambling and the high TMDS
 //!   character rate, and §11 phase 3.1 steers a first light-up to 1080p60
@@ -106,6 +109,13 @@
 //!   enabling source-side scrambling without telling the sink (SCDC over the
 //!   DDC bus, which this kernel does not write) gives a picture the monitor
 //!   cannot lock.
+//!
+//! **Either combo PHY can be driven.**  The connector probe decides which one
+//! at run time from the EDID read on the GMBUS pin, so a build that could only
+//! program PHY A would refuse a machine whose HDMI socket is wired to B.  Both
+//! now have every register phase 5 writes: DPLL1's config pair is declared in
+//! `regs/dpll.rs` from the `[I915]` header region §6.3 cites for it, and
+//! [`port_registers`] supplies the per-PHY set.
 //!
 //! # What has not been checked
 //!
@@ -503,11 +513,13 @@ impl OutputRequest {
 
 /// The registers one combo PHY's port sequence writes.
 ///
-/// `Option` for the DPLL config pair because the register table has no
-/// `DPLL1_CFGCR0`/`DPLL1_CFGCR1`: §6.3 states those offsets for DPLL0 only and
-/// `regs/dpll.rs`'s transcription notes record the omission.  `None` is what
-/// makes [`OutputError::PllConfigRegisterMissing`] reachable rather than a
-/// silent wrong address.
+/// `Option` for the DPLL config pair although both combo PHYs on `XE_LPD` have
+/// one: whether a PHY's config offsets have been sourced is a property of the
+/// register table rather than of this sequence, and a port whose PLL config
+/// registers are not in it must fail closed via
+/// [`OutputError::PllConfigRegisterMissing`] rather than be pointed at a
+/// neighbouring address.  Both arms below supply them, so nothing refuses
+/// today; the check is what a platform with a third combo PHY would hit.
 #[derive(Clone, Copy, Debug)]
 struct PortRegisters {
     /// `DPLLn_ENABLE`: power, enable and lock.
@@ -538,7 +550,11 @@ struct PortRegisters {
 ///
 /// Offsets are §8.2's (`CL` at `base + 4*dw`, the `TX` group at
 /// `base + 0x680 + 4*dw`, the `TX` lane at `base + 0x880 + ln*0x100`), and the
-/// declarations are `regs/port.rs`'s and `regs/mod.rs`'s.
+/// declarations are `regs/port.rs`'s and `regs/mod.rs`'s.  The PLL pair is
+/// §6.3's table: combo PHY A is on DPLL 0 and combo PHY B on DPLL 1, so B's
+/// arm names the `DPLL1_*` registers -- including `DPLL1_CFGCR0`/`DPLL1_CFGCR1`
+/// (`0x16428C`/`0x164290`, `[I915]` `i915_reg.h:4302,4317`), which §6.3's own
+/// register table omits and its citation to that header supplies.
 const fn port_registers(phy: ComboPhy) -> PortRegisters {
     match phy {
         ComboPhy::A => PortRegisters {
@@ -560,10 +576,8 @@ const fn port_registers(phy: ComboPhy) -> PortRegisters {
         },
         ComboPhy::B => PortRegisters {
             pll_enable: dpll::DPLL1_ENABLE,
-            // No `DPLL1_CFGCR0`/`DPLL1_CFGCR1` offsets exist anywhere in the
-            // reference document.  See this struct's documentation.
-            pll_cfgcr0: None,
-            pll_cfgcr1: None,
+            pll_cfgcr0: Some(dpll::DPLL1_CFGCR0),
+            pll_cfgcr1: Some(dpll::DPLL1_CFGCR1),
             cl_dw5: regs::COMBO_PHY_B.cl_dw5,
             cl_dw10: port::PORT_CL_DW10_B,
             tx_dw2: port::PORT_TX_DW2_GRP_B,
@@ -685,9 +699,12 @@ impl OutputProgram {
         let phy = combo_phy_of(request.ddi)?;
         let registers = port_registers(phy);
 
-        // §6.3 states `DPLL0_CFGCR0`/`CFGCR1` and no `DPLL1_*` config offsets.
-        // Refusing is the only honest answer: `pll.rs` can compute PHY B's
-        // dividers, but there is no inventoried address to write them to.
+        // Both combo PHYs have a config pair in the table, so this is a check
+        // on the table's completeness rather than on the request: a PHY whose
+        // offsets were never sourced is refused instead of being written to a
+        // neighbouring address.  The dividers themselves are PHY-independent --
+        // `pll.rs` computes the same set for A and B, and only the address the
+        // two values go to differs.
         if registers.pll_cfgcr0.is_none() || registers.pll_cfgcr1.is_none() {
             return Err(OutputError::PllConfigRegisterMissing { phy });
         }
@@ -981,6 +998,8 @@ pub(crate) fn program(
     // A plan is data.  The DDI is checked again here, before the first write,
     // because "refused before anything is written" has to hold for the plan
     // that is actually programmed and not only for the one the builder accepts.
+    // The register set is looked up from that same DDI, so a plan whose `phy`
+    // field disagreed with its `ddi` field could not redirect a write.
     let phy = combo_phy_of(plan.ddi)?;
     let registers = port_registers(phy);
     let pll_cfgcr0 = registers
@@ -1091,7 +1110,11 @@ pub(crate) fn program(
 
     // 5.4 and 5.5 -- connect the transcoder to the port's clock, then to the
     // DDI.  Both are plain writes: these registers have no other field in play
-    // on this path.
+    // on this path.  The transcoder is A's whatever DDI the plan names -- §5.1
+    // gives the PRM's "Transcoders A-D can connect to any DDI" -- and the DDI
+    // is inside the value (`plan.trans_clk_sel`'s port field and
+    // `plan.trans_ddi_func_ctl`'s), so a plan for DDI B writes A's transcoder
+    // registers with B's port number in them.
     write(regs, ddi::TRANS_CLK_SEL_A, plan.trans_clk_sel)?;
     write(regs, ddi::TRANS_DDI_FUNC_CTL_A, plan.trans_ddi_func_ctl)?;
 
@@ -1162,9 +1185,11 @@ pub(crate) enum OutputError {
     },
     /// The port's PLL config registers are not in the register table.
     ///
-    /// `DPLL0_CFGCR0`/`CFGCR1` are the only ones §6.3 states an offset for;
-    /// nothing in the document gives `DPLL1_CFGCR*`, so combo PHY B's PLL
-    /// cannot be programmed from this repository's table.
+    /// Both combo PHYs on `XE_LPD` have theirs -- DPLL0's from §6.3 and
+    /// DPLL1's from the `[I915]` header region §6.3 cites for that block -- so
+    /// nothing raises this today.  It stays for the case it names: a PHY whose
+    /// config offsets are genuinely unsourced must be refused rather than
+    /// written to a guessed address.
     PllConfigRegisterMissing {
         /// Which combo PHY's PLL.
         phy: ComboPhy,
@@ -1287,17 +1312,19 @@ impl OutputError {
                 ddi.name()
             ),
             Self::PllConfigRegisterMissing { phy } => format!(
-                "combo PHY {} is on DPLL1, and the register table has no DPLL1_CFGCR0 or \
-                 DPLL1_CFGCR1 offset: reference section 6.3 states config offsets for DPLL0 only \
-                 (0x164284 and 0x164288), and regs/dpll.rs records the omission rather than \
-                 inventing one.  The divider arithmetic would work -- pll.rs computes a set for \
-                 PHY B -- but there is no inventoried address to write it to.  Reference section \
-                 13.4's register dump of a working configuration is what settles this; nothing \
-                 was written",
+                "combo PHY {}'s PLL (DPLL{}) has no CFGCR0/CFGCR1 offset in the register table.  \
+                 Reference section 6.3 states the DPLL config offsets it carries, and \
+                 regs/dpll.rs transcribes those and no others rather than pointing the divider \
+                 write at a neighbouring address: the dividers would land on another PLL and this \
+                 port would simply have no clock.  The arithmetic is not the problem -- pll.rs \
+                 computes a divider set for either combo PHY -- so what is missing is an address; \
+                 the `[I915]` register header that section 6.3 cites for the block, or a section \
+                 13.4 dump of a working configuration, is what supplies one.  Nothing was written",
                 match phy {
                     ComboPhy::A => "A",
                     ComboPhy::B => "B",
-                }
+                },
+                phy.dpll_index(),
             ),
             Self::MissingBufferTranslation { port_type, table } => format!(
                 "the {} buffer-translation values are not in the reference document, so this \
