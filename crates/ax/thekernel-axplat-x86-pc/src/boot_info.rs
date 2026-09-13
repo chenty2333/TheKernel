@@ -369,8 +369,8 @@ fn report_tag_inventory(info: &BootInfo) {
     diagnostic_println!(
         "MB2 tag inventory: protocol={:?} count={} truncated={}",
         info.protocol(),
-        info.tag_count,
-        info.tags_truncated as u8
+        info.tags().len(),
+        info.tags_truncated() as u8
     );
     for record in info.tags() {
         diagnostic_println!("MB2 tag type={} size={}", record.tag_type, record.size);
@@ -385,7 +385,7 @@ fn report_tag_inventory(info: &BootInfo) {
 fn report_framebuffer(info: &BootInfo) {
     match (info.framebuffer(), info.framebuffer_rejection()) {
         (Some(fb), _) => diagnostic_println!(
-            "MB2 framebuffer: addr={:#x} {}x{} bpp={} pitch={} len={:#x} rgb_bits={}/{}/{}",
+            "MB2 framebuffer: addr={:#x} {}x{} bpp={} pitch={} len={:#x} rgb=({}@{}/{}@{}/{}@{})",
             fb.address(),
             fb.width(),
             fb.height(),
@@ -393,8 +393,11 @@ fn report_framebuffer(info: &BootInfo) {
             fb.pitch(),
             fb.byte_len().unwrap_or(0),
             fb.red().size(),
+            fb.red().position(),
             fb.green().size(),
+            fb.green().position(),
             fb.blue().size(),
+            fb.blue().position(),
         ),
         (None, Some(reason)) => {
             diagnostic_println!("MB2 framebuffer: declined reason={:?}", reason)
