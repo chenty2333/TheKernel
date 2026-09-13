@@ -381,11 +381,11 @@ impl<'a> Content<'a> {
 
 /// What one call to [`paint`] touched.
 struct Painted {
-    /// Rows the frame's content occupies, which is what the next frame has to
-    /// treat as its predecessor's extent.
+    /// Text rows the frame's content occupies, which is what the next frame
+    /// has to treat as its predecessor's extent.
     used: usize,
-    /// Text rows cleared to the background, which is what a cacheable mapping
-    /// has to flush and never covers fewer rows than `used`.
+    /// Scan lines cleared to the background, which is what a cacheable mapping
+    /// has to flush and never covers fewer lines than `used` needs.
     dirty: usize,
 }
 
@@ -429,8 +429,13 @@ fn paint(
     let tail = wrap_rows(content.tail, cols, body - pinned, true);
 
     let used = 1 + pinned + tail.count;
-    let dirty = previous.map_or(rows, |previous| previous.max(used));
-    view.fill_rows(dst, 0, dirty * GLYPH_HEIGHT, BACKGROUND);
+    // The first frame clears the whole surface, not just the lines its own
+    // cells occupy: whatever the firmware drew also covers the strips of a
+    // scan line and a screen edge that no glyph cell lands on.
+    let dirty = previous.map_or(view.height as usize, |previous| {
+        (previous * GLYPH_HEIGHT).max(used * GLYPH_HEIGHT)
+    });
+    view.fill_rows(dst, 0, dirty, BACKGROUND);
 
     let bar = if content.alert { PANIC_BAR } else { STATUS_BAR };
     view.fill_rows(dst, 0, GLYPH_HEIGHT, bar);
@@ -647,13 +652,16 @@ fn present(content: &Content<'_>) {
     // live for as long as `MAPPED` says so.  The guard above makes this the
     // only writer.
     let dst = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, view.len) };
-    let previous = PAINTED_ONCE
-        .swap(true, Ordering::AcqRel)
-        .then(|| PAINTED_ROWS.load(Ordering::Relaxed));
+    let first = !PAINTED_ONCE.swap(true, Ordering::AcqRel);
+    let previous = if first {
+        None
+    } else {
+        Some(PAINTED_ROWS.load(Ordering::Relaxed))
+    };
     let painted = paint(&view, dst, content, previous);
     PAINTED_ROWS.store(painted.used, Ordering::Relaxed);
     if CACHEABLE.load(Ordering::Relaxed) {
-        flush_range(dst.as_ptr(), painted.dirty * GLYPH_HEIGHT * view.pitch as usize);
+        flush_range(dst.as_ptr(), painted.dirty * view.pitch as usize);
     }
     PAINTING.store(false, Ordering::Release);
 }

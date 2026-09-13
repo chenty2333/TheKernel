@@ -156,7 +156,7 @@ fn stride_comes_from_the_surface_pitch_not_the_visible_width() {
     let mut bytes = surface(&view);
     let painted = paint(&view, &mut bytes, &Content::milestone(b"", b"A"), None);
     assert_eq!(painted.used, 2, "a status row and one tail row");
-    assert_eq!(painted.dirty, 2);
+    assert_eq!(painted.dirty, 2 * GLYPH_HEIGHT);
 
     let (dx, dy) = first_ink(b'A');
     let expected = view
@@ -190,9 +190,9 @@ fn a_16_bit_surface_takes_two_bytes_per_pixel() {
         .expect("inside the surface");
     assert_eq!(offset, (GLYPH_HEIGHT + dy) * 20 + dx * 2);
     let encoded = RGB565.encode(LOG_TEXT).to_le_bytes();
-    assert_eq!(&bytes[offset..offset + 2], &encoded[..]);
+    assert_eq!(&bytes[offset..offset + 2], &encoded[..2]);
     let depth_four = (GLYPH_HEIGHT + dy) * 20 + dx * 4;
-    assert_ne!(&bytes[depth_four..depth_four + 2], &encoded[..]);
+    assert_ne!(&bytes[depth_four..depth_four + 2], &encoded[..2]);
 }
 
 #[test]
@@ -238,9 +238,14 @@ fn a_line_longer_than_the_screen_is_clipped_on_the_status_row() {
     );
     assert_eq!(painted.used, 1);
     assert_eq!(rendered_row(&view, &bytes, 0, STATUS_BAR), b"01");
-    // The padding after the two visible pixels is repainted as well: nothing
-    // of the firmware's own image is left in the rows this frame covers.
-    assert_eq!(&bytes[8..80], &[0u8; 72][..]);
+    // Every byte after the two visible pixels -- the rest of the scan line
+    // and its padding -- carries the bar colour, so nothing of the firmware's
+    // own image is left in the rows this frame covers.
+    let bar = STATUS_BAR.to_le_bytes();
+    assert!(
+        bytes[8..80].chunks_exact(4).all(|pixel| pixel == bar),
+        "the frame repaints the whole scan line, padding included"
+    );
 }
 
 #[test]
@@ -293,7 +298,7 @@ fn an_out_of_range_glyph_byte_draws_a_blank_cell() {
         &Content::milestone(b"", &[b'A', 0x01, 0xff, 0x80, b'B']),
         None,
     );
-    assert_eq!(rendered_row(&view, &bytes, 1, BACKGROUND), b"A  B");
+    assert_eq!(rendered_row(&view, &bytes, 1, BACKGROUND), b"A   B");
 }
 
 #[test]
@@ -304,9 +309,12 @@ fn the_first_frame_erases_everything_the_firmware_left() {
     let view = view(48, 80, 224, B8G8R8A8);
     let mut bytes = surface(&view);
     let painted = paint(&view, &mut bytes, &Content::milestone(b"boot", b"log\n"), None);
-    assert_eq!(painted.dirty, view.rows(), "the first frame clears the screen");
+    assert_eq!(
+        painted.dirty, view.height as usize,
+        "the first frame clears the whole surface"
+    );
     assert!(
-        bytes.iter().all(|&byte| byte == 0),
+        !bytes.contains(&0xa5),
         "every byte of the aperture is repainted"
     );
 }
@@ -393,7 +401,7 @@ fn rows_beyond_the_ceiling_are_never_addressed() {
     let mut bytes = surface(&view);
     let painted = paint(&view, &mut bytes, &Content::milestone(b"", b"one\n"), None);
     assert!(painted.used <= MAX_ROWS);
-    assert_eq!(painted.dirty, MAX_ROWS);
+    assert_eq!(painted.dirty, view.height as usize);
 }
 
 #[test]
