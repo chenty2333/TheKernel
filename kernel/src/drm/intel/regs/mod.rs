@@ -1494,6 +1494,15 @@ mod tests {
         // reference document's `PORT_TX_DW*` group base: it gives `+0x400`,
         // while the header it cites gives `+0x680`, and the two cannot both
         // address `PORT_TX_DW8`.
+        // The rule itself, written once: a sub-block register is its group's
+        // base plus four bytes per index within the group.  Spelled as a
+        // function rather than as `+ 4 * n` at every assertion so that the
+        // index is a parameter -- the point of the test is that the table obeys
+        // the rule, and a literal `4 * 0` folded into the expected value would
+        // state neither.
+        const fn at(phy_base: u32, group: u32, index: u32) -> u32 {
+            phy_base + group + 4 * index
+        }
         const COMP: u32 = 0x100;
         const TX_GRP: u32 = 0x680;
         const TX_LN0: u32 = 0x880;
@@ -1501,42 +1510,18 @@ mod tests {
         const PCS_LN0: u32 = 0x800;
         for (phy, base) in [(COMBO_PHY_A, 0x16_2000), (COMBO_PHY_B, 0x6_C000)] {
             let name = phy.port;
-            assert_eq!(
-                phy.comp_dw0.offset(),
-                base + COMP + 4 * 0,
-                "COMP_DW0({name})"
-            );
-            assert_eq!(
-                phy.comp_dw1.offset(),
-                base + COMP + 4 * 1,
-                "COMP_DW1({name})"
-            );
-            assert_eq!(
-                phy.comp_dw3.offset(),
-                base + COMP + 4 * 3,
-                "COMP_DW3({name})"
-            );
-            assert_eq!(
-                phy.comp_dw8.offset(),
-                base + COMP + 4 * 8,
-                "COMP_DW8({name})"
-            );
-            assert_eq!(
-                phy.comp_dw9.offset(),
-                base + COMP + 4 * 9,
-                "COMP_DW9({name})"
-            );
+            assert_eq!(phy.comp_dw0.offset(), at(base, COMP, 0), "COMP_DW0({name})");
+            assert_eq!(phy.comp_dw1.offset(), at(base, COMP, 1), "COMP_DW1({name})");
+            assert_eq!(phy.comp_dw3.offset(), at(base, COMP, 3), "COMP_DW3({name})");
+            assert_eq!(phy.comp_dw8.offset(), at(base, COMP, 8), "COMP_DW8({name})");
+            assert_eq!(phy.comp_dw9.offset(), at(base, COMP, 9), "COMP_DW9({name})");
             assert_eq!(
                 phy.comp_dw10.offset(),
-                base + COMP + 4 * 10,
+                at(base, COMP, 10),
                 "COMP_DW10({name})"
             );
-            assert_eq!(phy.tx_dw8.offset(), base + TX_GRP + 4 * 8, "TX_DW8({name})");
-            assert_eq!(
-                phy.pcs_dw1.offset(),
-                base + PCS_GRP + 4 * 1,
-                "PCS_DW1({name})"
-            );
+            assert_eq!(phy.tx_dw8.offset(), at(base, TX_GRP, 8), "TX_DW8({name})");
+            assert_eq!(phy.pcs_dw1.offset(), at(base, PCS_GRP, 1), "PCS_DW1({name})");
             // The lane 0 registers are read and never written: the
             // initialisation takes its starting value from lane 0 and writes
             // the result to the group register, which is what `[I915]`
@@ -1545,17 +1530,17 @@ mod tests {
             // distinction is kept rather than collapsed into one register.
             assert_eq!(
                 phy.tx_dw8_ln0.offset(),
-                base + TX_LN0 + 4 * 8,
+                at(base, TX_LN0, 8),
                 "TX_DW8_LN0({name})"
             );
             assert_eq!(
                 phy.pcs_dw1_ln0.offset(),
-                base + PCS_LN0 + 4 * 1,
+                at(base, PCS_LN0, 1),
                 "PCS_DW1_LN0({name})"
             );
             assert!(!phy.tx_dw8_ln0.is_writable(), "TX_DW8_LN0({name})");
             assert!(!phy.pcs_dw1_ln0.is_writable(), "PCS_DW1_LN0({name})");
-            assert_eq!(phy.cl_dw5.offset(), base + 4 * 5, "CL_DW5({name})");
+            assert_eq!(phy.cl_dw5.offset(), at(base, 0, 5), "CL_DW5({name})");
         }
         // `ICL_PHY_MISC` is the exception: it lives in the DDI block, not in
         // the PHY block.  Reference §8.2; `[I915]` `i915_reg.h:4458-4465`.
