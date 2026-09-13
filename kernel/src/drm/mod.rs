@@ -23,6 +23,7 @@ pub use device::{
     AdapterMetrics, DisplayAdapter, DrmDevice, DrmError, DrmMetrics, DrmResult, Scanout,
     primary_device, register_primary_device,
 };
+pub(crate) use fbdev::drm_scanout;
 pub use fbdev::DrmFbdev;
 pub(crate) use fence::metrics as fence_metrics;
 pub use file::{DrmEvent, DrmFile, OpenId};

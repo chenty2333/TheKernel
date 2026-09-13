@@ -10,6 +10,7 @@ pub(crate) mod r#loop;
 #[cfg(feature = "memtrack")]
 mod memtrack;
 mod rtc;
+pub(crate) mod scanout;
 mod sound;
 pub mod tty;
 pub(crate) mod tun;
@@ -634,10 +635,14 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             ),
         );
     }
-    // DRM owns VirtIO-GPU scanout before devfs publication. `/dev/fb0` is an
-    // emulation client of that primary device, never a competing raw display.
-    if crate::drm::primary_device().is_some() {
-        match fb::FrameBuffer::try_new() {
+    // `/dev/fb0` is published whenever the kernel has a scanout to draw into.
+    // DRM owns the virtio-gpu scanout before devfs publication, so fbdev is an
+    // emulation client of that primary device rather than a competing raw
+    // display.  A machine with no display device at all simply has no fb0.
+    match crate::drm::primary_device().map(crate::drm::drm_scanout) {
+        None => {}
+        Some(Err(error)) => error!("Failed to prepare the primary scanout for fbdev: {error}"),
+        Some(Ok(scanout)) => match fb::FrameBuffer::try_new(scanout) {
             Ok(framebuffer) => root.add(
                 "fb0",
                 Device::new_with_permissions(
@@ -649,7 +654,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 ),
             ),
             Err(error) => error!("Failed to initialize framebuffer device: {error}"),
-        }
+        },
     }
 
     if let Some(device) = crate::drm::primary_device() {

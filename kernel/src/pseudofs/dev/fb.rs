@@ -7,18 +7,16 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{DeviceId, NodeFlags, VfsError, VfsResult};
-use axhal::mem::phys_to_virt;
 use axsync::Mutex;
 use axtask::WaitQueue;
 use kspin::SpinNoIrq;
 use lazy_static::lazy_static;
-use memory_addr::{PAGE_SIZE_4K, PhysAddr};
 
 use crate::{
-    drm::DrmFbdev,
     file::IoctlContext,
     pseudofs::{
         DeviceMmap, DeviceOps,
+        dev::scanout::ScanoutSurface,
         device_registry::{
             DeviceHandle, DeviceIdentity, DeviceRegistration, MAX_DEVICES, global_device_registry,
         },
@@ -459,11 +457,10 @@ fn var_screen_info_from_user_bytes(
 }
 
 fn current_var_screen_info(core: &DisplayCore) -> VarScreenInfo {
-    let mode = core.scanout.mode();
     VarScreenInfo {
-        xres: mode.width,
-        yres: mode.height,
-        xres_virtual: mode.width,
+        xres: core.scanout.width(),
+        yres: core.scanout.height(),
+        xres_virtual: core.scanout.width(),
         yres_virtual: core.scanout.virtual_height(),
         xoffset: 0,
         yoffset: core.scanout.yoffset(),
@@ -611,10 +608,11 @@ impl DamageTracker {
     }
 }
 
-/// The sole fbdev-side scanout authority. Its backing is a DRM dumb GEM
-/// object; fbdev and fbcon do not retain a raw-display ownership path.
+/// The sole fbdev-side scanout authority. Its backing is whatever
+/// [`ScanoutSurface`] the platform installed; fbdev and fbcon do not retain a
+/// raw-display ownership path of their own.
 struct DisplayCore {
-    scanout: alloc::sync::Arc<DrmFbdev>,
+    scanout: alloc::sync::Arc<dyn ScanoutSurface>,
     size: usize,
     /// Linux truecolor pseudo-palette, used by fbcon-style 0..15 pixel
     /// values. It is software state and never a hardware CLUT claim.
@@ -644,7 +642,7 @@ lazy_static! {
 /// framebuffer console. fbdev users still own the ABI surface; fbcon merely
 /// repaints before KD_TEXT scanout commits.
 pub(crate) struct FbconFrame {
-    scanout: alloc::sync::Arc<DrmFbdev>,
+    scanout: alloc::sync::Arc<dyn ScanoutSurface>,
     size: usize,
     width: usize,
     height: usize,
@@ -695,19 +693,11 @@ impl FbconFrame {
         if offset + 4 > self.size {
             return;
         }
-        let pages = self.scanout.pages();
-        let Ok(page) = pages.paddr_at(offset / PAGE_SIZE_4K) else {
-            return;
-        };
-        let address = PhysAddr::from(page.as_usize() + offset % PAGE_SIZE_4K);
-        // Pixels are four-byte aligned, so they cannot straddle a 4 KiB
-        // page boundary. The direct map is only used by in-kernel fbcon.
-        unsafe {
-            phys_to_virt(address)
-                .as_mut_ptr()
-                .cast::<u32>()
-                .write_volatile(color)
-        };
+        // A failed write is dropped rather than propagated. The console clips
+        // its own output and must never be able to fault the kernel, and a
+        // backend which rejected an in-range, in-bounds offset would leave the
+        // caller with nothing to do about it anyway.
+        let _ = self.scanout.write_bytes(offset, &color.to_ne_bytes());
     }
 }
 
@@ -770,8 +760,10 @@ fn glyph_row(byte: u8, row: usize) -> u8 {
 
 pub(crate) fn fbcon_dimensions() -> Option<(usize, usize)> {
     let display = FBCON_DISPLAY.lock().as_ref()?.upgrade()?;
-    let mode = display.scanout.mode();
-    let dimensions = (mode.width as usize, mode.height as usize);
+    let dimensions = (
+        display.scanout.width() as usize,
+        display.scanout.height() as usize,
+    );
     drop(display);
     Some(dimensions)
 }
@@ -787,13 +779,13 @@ pub(crate) fn fbcon_draw(draw: impl FnOnce(&FbconFrame)) {
     else {
         return;
     };
-    let mode = display.scanout.mode();
+    let scanout = display.scanout.clone();
     draw(&FbconFrame {
-        scanout: display.scanout.clone(),
+        width: scanout.width() as usize,
+        height: scanout.height() as usize,
+        pitch: scanout.pitch() as usize,
+        scanout,
         size: display.size,
-        width: mode.width as usize,
-        height: mode.height as usize,
-        pitch: display.scanout.pitch() as usize,
     });
     display.mark_full();
 }
@@ -827,13 +819,15 @@ pub(crate) fn vt_graphics_changed(graphics: bool) {
     };
     if graphics {
         display.suspend_refresh();
-        display.scanout.release_master();
+        if let Err(error) = display.scanout.set_master(false) {
+            warn!("failed to yield scanout ownership to the graphics VT: {error}");
+        }
     } else if let Err(error) = display
         .scanout
-        .acquire_master()
-        .and_then(|_| display.scanout.restore_text_nonblocking())
+        .set_master(true)
+        .and_then(|_| display.scanout.restore_text(true))
     {
-        warn!("failed to restore DRM fbdev master for KD_TEXT: {error}");
+        warn!("failed to restore scanout ownership for KD_TEXT: {error}");
     } else {
         // Coalesce all writes made while the graphics VT owned the seat into
         // exactly one full text repaint after master is reacquired.
@@ -842,7 +836,7 @@ pub(crate) fn vt_graphics_changed(graphics: bool) {
 }
 
 impl DisplayCore {
-    fn new(scanout: alloc::sync::Arc<DrmFbdev>) -> Self {
+    fn new(scanout: alloc::sync::Arc<dyn ScanoutSurface>) -> Self {
         Self {
             size: scanout.len(),
             scanout,
@@ -901,46 +895,12 @@ impl DisplayCore {
         self.refresh.clone()
     }
 
-    fn read_bytes(&self, mut offset: usize, mut dst: &mut [u8]) -> VfsResult<()> {
-        let pages = self.scanout.pages();
-        while !dst.is_empty() {
-            let in_page = offset % PAGE_SIZE_4K;
-            let count = dst.len().min(PAGE_SIZE_4K - in_page);
-            let page = pages.paddr_at(offset / PAGE_SIZE_4K)?;
-            // SAFETY: page index and chunk are bounded by `size`; direct-map
-            // access is used only to expose this fixed GEM backing.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    phys_to_virt(PhysAddr::from(page.as_usize() + in_page)).as_ptr(),
-                    dst.as_mut_ptr(),
-                    count,
-                )
-            };
-            offset += count;
-            dst = &mut dst[count..];
-        }
-        Ok(())
+    fn read_bytes(&self, offset: usize, dst: &mut [u8]) -> VfsResult<()> {
+        self.scanout.read_bytes(offset, dst).map_err(VfsError::from)
     }
 
-    fn write_bytes(&self, mut offset: usize, mut src: &[u8]) -> VfsResult<()> {
-        let pages = self.scanout.pages();
-        while !src.is_empty() {
-            let in_page = offset % PAGE_SIZE_4K;
-            let count = src.len().min(PAGE_SIZE_4K - in_page);
-            let page = pages.paddr_at(offset / PAGE_SIZE_4K)?;
-            // SAFETY: page index and chunk are bounded by `size`; direct-map
-            // access is used only to expose this fixed GEM backing.
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src.as_ptr(),
-                    phys_to_virt(PhysAddr::from(page.as_usize() + in_page)).as_mut_ptr(),
-                    count,
-                )
-            };
-            offset += count;
-            src = &src[count..];
-        }
-        Ok(())
+    fn write_bytes(&self, offset: usize, src: &[u8]) -> VfsResult<()> {
+        self.scanout.write_bytes(offset, src).map_err(VfsError::from)
     }
 
     fn commit_if_needed(&self) {
@@ -1021,10 +981,12 @@ fn fb_sysfs_registration() -> VfsResult<alloc::sync::Arc<DeviceRegistration>> {
 }
 
 impl FrameBuffer {
-    pub fn try_new() -> Result<Self, AxError> {
-        let device = crate::drm::primary_device().ok_or(AxError::NoSuchDevice)?;
-        let scanout = alloc::sync::Arc::try_new(DrmFbdev::new(device).map_err(AxError::from)?)
-            .map_err(|_| AxError::NoMemory)?;
+    /// Publish `/dev/fb0` over the platform's scanout surface.
+    ///
+    /// The caller chooses the surface rather than this module discovering a
+    /// DRM device itself, so that a machine with no virtio-gpu can still have
+    /// a framebuffer console.
+    pub fn try_new(scanout: alloc::sync::Arc<dyn ScanoutSurface>) -> Result<Self, AxError> {
         let core =
             alloc::sync::Arc::try_new(DisplayCore::new(scanout)).map_err(|_| AxError::NoMemory)?;
         let registration = fb_sysfs_registration()?;
@@ -1150,20 +1112,11 @@ impl DeviceOps for FrameBuffer {
                 if !pan_mode_matches(&request, current) || request.xoffset != 0 {
                     return Err(AxError::InvalidInput);
                 }
-                self.core
-                    .scanout
-                    .pan(request.yoffset)
-                    .map_err(AxError::from)
-                    .map(|_| 0)
+                self.core.scanout.pan(request.yoffset).map(|_| 0)
             }
             // FBIOBLANK maps to connector DPMS in the same atomic state
             // machine as ordinary KMS clients.
-            0x4611 if arg <= 4 => self
-                .core
-                .scanout
-                .set_blank(arg != 0)
-                .map_err(AxError::from)
-                .map(|_| 0),
+            0x4611 if arg <= 4 => self.core.scanout.set_blank(arg != 0).map(|_| 0),
             0x4611 => Err(LinuxError::EOPNOTSUPP.into()),
             _ => Err(AxError::NotATty),
         }
@@ -1175,8 +1128,9 @@ impl DeviceOps for FrameBuffer {
 
     fn mmap(&self) -> DeviceMmap {
         // mmap is deliberately passive: raw writers publish through fsync or
-        // FBIOPAN_DISPLAY. The mapping retains the actual SG GEM pages.
-        DeviceMmap::SharedPages(self.core.scanout.pages())
+        // FBIOPAN_DISPLAY. The mapping is whatever the surface's own backing
+        // requires.
+        self.core.scanout.mmap()
     }
 
     fn sync(&self, _data_only: bool) -> VfsResult<()> {
@@ -1197,7 +1151,20 @@ impl DeviceOps for FrameBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{DAMAGE_CLEAN, DAMAGE_FULL, DamageTracker, FB_DEVICE_ID, fb_sysfs_registration};
+    use alloc::{sync::Arc, vec::Vec};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    use axerrno::{AxError, AxResult};
+    use axsync::Mutex;
+
+    use super::{
+        DAMAGE_CLEAN, DAMAGE_FULL, DamageTracker, DisplayCore, FB_DEVICE_ID,
+        current_var_screen_info, fb_sysfs_registration,
+    };
+    use crate::{
+        drm::DrmFbdev,
+        pseudofs::{DeviceMmap, dev::scanout::ScanoutSurface},
+    };
 
     #[test]
     fn last_userspace_master_close_restores_text_framebuffer_without_vt_ioctl() {
@@ -1243,9 +1210,9 @@ mod tests {
         }
         let _context = crate::test_support::scheduler_test_context();
         let device = DrmDevice::new(Arc::new(Adapter), 1, 2, 3, 4);
-        let scanout = Arc::new(super::DrmFbdev::new(device.clone()).unwrap());
+        let scanout = Arc::new(DrmFbdev::new(device.clone()).unwrap());
         let console_fb = device.state.lock().atomic.fb;
-        let display = Arc::new(super::DisplayCore::new(scanout));
+        let display = Arc::new(DisplayCore::new(scanout));
         let previous = super::FBCON_DISPLAY
             .lock()
             .replace(Arc::downgrade(&display));
@@ -1347,5 +1314,146 @@ mod tests {
                 "DEVTYPE=graphics\n",
             )
         );
+    }
+
+    /// A scanout surface with no DRM device and no display hardware behind it.
+    ///
+    /// It stands in for the linear aperture a firmware programs, which is the
+    /// only display a machine without a virtio-gpu device can have.
+    struct MemorySurface {
+        bytes: Mutex<Vec<u8>>,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        presents: AtomicU64,
+        master: AtomicBool,
+    }
+
+    impl MemorySurface {
+        fn new(width: u32, height: u32) -> Arc<Self> {
+            let pitch = width * 4;
+            let mut bytes = Vec::new();
+            bytes.resize((pitch * height) as usize, 0);
+            Arc::new(Self {
+                bytes: Mutex::new(bytes),
+                width,
+                height,
+                pitch,
+                presents: AtomicU64::new(0),
+                master: AtomicBool::new(true),
+            })
+        }
+    }
+
+    impl ScanoutSurface for MemorySurface {
+        fn width(&self) -> u32 {
+            self.width
+        }
+
+        fn height(&self) -> u32 {
+            self.height
+        }
+
+        fn pitch(&self) -> u32 {
+            self.pitch
+        }
+
+        fn virtual_height(&self) -> u32 {
+            self.height
+        }
+
+        fn yoffset(&self) -> u32 {
+            0
+        }
+
+        fn len(&self) -> usize {
+            self.bytes.lock().len()
+        }
+
+        fn read_bytes(&self, offset: usize, dst: &mut [u8]) -> AxResult<()> {
+            let bytes = self.bytes.lock();
+            let end = offset.checked_add(dst.len()).ok_or(AxError::InvalidInput)?;
+            dst.copy_from_slice(bytes.get(offset..end).ok_or(AxError::InvalidInput)?);
+            Ok(())
+        }
+
+        fn write_bytes(&self, offset: usize, src: &[u8]) -> AxResult<()> {
+            let mut bytes = self.bytes.lock();
+            let end = offset.checked_add(src.len()).ok_or(AxError::InvalidInput)?;
+            bytes
+                .get_mut(offset..end)
+                .ok_or(AxError::InvalidInput)?
+                .copy_from_slice(src);
+            Ok(())
+        }
+
+        fn mmap(&self) -> DeviceMmap {
+            DeviceMmap::None
+        }
+
+        fn present(&self) -> AxResult<()> {
+            self.presents.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn pan(&self, _yoffset: u32) -> AxResult<()> {
+            Err(AxError::Unsupported)
+        }
+
+        fn set_blank(&self, _blank: bool) -> AxResult<()> {
+            Ok(())
+        }
+
+        fn restore_text(&self, _nonblocking: bool) -> AxResult<()> {
+            Ok(())
+        }
+
+        fn set_master(&self, master: bool) -> AxResult<()> {
+            self.master.store(master, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fbdev_console_drives_a_surface_with_no_drm_device() {
+        // `/dev/fb0` has to exist on a machine whose only display is a
+        // firmware-programmed aperture, so the fbdev path is exercised here
+        // over a surface with no DRM device anywhere behind it.  If this ever
+        // needs a `DrmDevice` to pass, the seam has been closed again.
+        //
+        // `mark_full` wakes the refresh worker and waking a wait queue needs a
+        // scheduler context.  Installing it here rather than inheriting
+        // whatever a previously run test happened to leave behind is what
+        // makes this test pass on its own as well as inside the full suite.
+        let _context = crate::test_support::scheduler_test_context();
+        let surface = MemorySurface::new(64, 48);
+        let core = DisplayCore::new(surface.clone());
+
+        // Geometry comes from the surface, not from a DRM mode: a firmware
+        // framebuffer has no refresh rate to report and must not be given one.
+        let var = current_var_screen_info(&core);
+        assert_eq!((var.xres, var.yres), (64, 48));
+        assert_eq!(var.xres_virtual, 64);
+        assert_eq!(var.xres_virtual * 4, core.scanout.pitch());
+        assert_eq!(core.size, 64 * 4 * 48);
+
+        // A write through the surface contract lands in the surface.
+        core.write_bytes(0, &[0x11, 0x22, 0x33, 0x44]).unwrap();
+        assert_eq!(&surface.bytes.lock()[..4], &[0x11, 0x22, 0x33, 0x44]);
+        let mut readback = [0u8; 4];
+        core.read_bytes(0, &mut readback).unwrap();
+        assert_eq!(readback, [0x11, 0x22, 0x33, 0x44]);
+
+        // Publication keeps one meaning across backends: damage accumulates and
+        // the commit point is what asks the surface to present.
+        assert_eq!(surface.presents.load(Ordering::Acquire), 0);
+        core.mark_full();
+        core.commit_if_needed();
+        assert_eq!(surface.presents.load(Ordering::Acquire), 1);
+
+        // The console's ownership of the seat follows the same contract.
+        assert!(surface.master.load(Ordering::Acquire));
+        core.scanout.set_master(false).unwrap();
+        assert!(!surface.master.load(Ordering::Acquire));
     }
 }

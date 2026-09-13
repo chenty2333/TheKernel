@@ -7,13 +7,19 @@
 
 use alloc::sync::Arc;
 
+use axerrno::{AxError, AxResult};
+use axhal::mem::phys_to_virt;
 use axsync::Mutex;
+use memory_addr::{PAGE_SIZE_4K, PhysAddr};
 
 use super::{
     DrmDevice, DrmError, DrmFile, DrmResult, DumbRequest, FramebufferId, Mode, atomic::Change,
     property,
 };
-use crate::mm::SharedPages;
+use crate::{
+    mm::SharedPages,
+    pseudofs::{DeviceMmap, dev::scanout::ScanoutSurface},
+};
 
 /// The kernel's single fbdev scanout.  The GEM object remains owned by this
 /// private DRM file for its entire lifetime, so fbcon and `/dev/fb0` always
@@ -176,7 +182,6 @@ impl DrmFbdev {
     fn commit_mode(&self) -> DrmResult<()> {
         self.commit_mode_with_policy(false)
     }
-
     fn commit_mode_with_policy(&self, nonblocking: bool) -> DrmResult<()> {
         let resources = self.file.resources();
         let source_width = self.mode.width.checked_shl(16).ok_or(DrmError::Overflow)?;
@@ -259,4 +264,122 @@ impl DrmFbdev {
             nonblocking,
         )
     }
+}
+
+impl ScanoutSurface for DrmFbdev {
+    fn width(&self) -> u32 {
+        self.mode.width
+    }
+    fn height(&self) -> u32 {
+        self.mode.height
+    }
+
+    fn pitch(&self) -> u32 {
+        self.pitch
+    }
+
+    fn virtual_height(&self) -> u32 {
+        self.virtual_height
+    }
+
+    fn yoffset(&self) -> u32 {
+        *self.yoffset.lock()
+    }
+
+    fn len(&self) -> usize {
+        self.size
+    }
+
+    fn read_bytes(&self, mut offset: usize, mut dst: &mut [u8]) -> AxResult<()> {
+        while !dst.is_empty() {
+            let in_page = offset % PAGE_SIZE_4K;
+            let count = dst.len().min(PAGE_SIZE_4K - in_page);
+            let page = self.pages.paddr_at(offset / PAGE_SIZE_4K)?;
+            // SAFETY: the page index and the chunk length are both bounded by
+            // the GEM backing's own size, and the direct map covers that
+            // backing for as long as this surface exists.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_to_virt(PhysAddr::from(page.as_usize() + in_page)).as_ptr(),
+                    dst.as_mut_ptr(),
+                    count,
+                )
+            };
+            offset += count;
+            dst = &mut dst[count..];
+        }
+        Ok(())
+    }
+
+    fn write_bytes(&self, mut offset: usize, mut src: &[u8]) -> AxResult<()> {
+        while !src.is_empty() {
+            let in_page = offset % PAGE_SIZE_4K;
+            let count = src.len().min(PAGE_SIZE_4K - in_page);
+            let page = self.pages.paddr_at(offset / PAGE_SIZE_4K)?;
+            // SAFETY: as for `read_bytes`; the destination is the same bounded
+            // GEM backing.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    phys_to_virt(PhysAddr::from(page.as_usize() + in_page)).as_mut_ptr(),
+                    count,
+                )
+            };
+            offset += count;
+            src = &src[count..];
+        }
+        Ok(())
+    }
+
+    fn mmap(&self) -> DeviceMmap {
+        // The scanout is a scatter-gather GEM allocation, so mapping its real
+        // pages is what lets a userspace writer see the same buffer KMS
+        // presents.  There is no fictitious linear physical base to report.
+        DeviceMmap::SharedPages(self.pages())
+    }
+
+    fn present(&self) -> AxResult<()> {
+        self.file
+            .submit_legacy_atomic(&[], None, None, false)
+            .map_err(Into::into)
+    }
+
+    fn pan(&self, yoffset: u32) -> AxResult<()> {
+        DrmFbdev::pan(self, yoffset).map_err(Into::into)
+    }
+
+    fn set_blank(&self, blank: bool) -> AxResult<()> {
+        DrmFbdev::set_blank(self, blank).map_err(Into::into)
+    }
+
+    fn restore_text(&self, nonblocking: bool) -> AxResult<()> {
+        if nonblocking {
+            self.restore_text_nonblocking()
+        } else {
+            self.restore_text()
+        }
+        .map_err(Into::into)
+    }
+
+    fn set_master(&self, master: bool) -> AxResult<()> {
+        if master {
+            self.acquire_master().map_err(Into::into)
+        } else {
+            self.release_master();
+            Ok(())
+        }
+    }
+}
+
+/// Build the DRM-backed scanout surface for a primary display device.
+///
+/// The fbdev layer takes a [`ScanoutSurface`] instead of discovering a DRM
+/// device itself, so that a machine with no virtio-gpu can still publish
+/// `/dev/fb0` over a surface the firmware programmed.  This is the DRM side of
+/// that choice; the caller decides which surface the machine actually has.
+pub(crate) fn drm_scanout(device: Arc<DrmDevice>) -> AxResult<Arc<dyn ScanoutSurface>> {
+    let scanout = DrmFbdev::new(device)?;
+    Arc::try_new(scanout)
+        .map(|scanout| scanout as Arc<dyn ScanoutSurface>)
+        .map_err(|_| AxError::NoMemory)
 }
