@@ -891,8 +891,8 @@ pub(crate) mod mock {
     /// A mock aperture.
     pub(crate) struct MockRegisters {
         words: RefCell<BTreeMap<u32, u32>>,
-        write_hooks: RefCell<BTreeMap<u32, WriteHook>>,
-        read_hooks: RefCell<BTreeMap<u32, ReadHook>>,
+        write_hooks: RefCell<Vec<(u32, WriteHook)>>,
+        read_hooks: RefCell<Vec<(u32, ReadHook)>>,
         refused: RefCell<Vec<&'static str>>,
         hidden: RefCell<Vec<&'static str>>,
         log: RefCell<Vec<(&'static str, u32)>>,
@@ -902,8 +902,8 @@ pub(crate) mod mock {
         pub(crate) fn new() -> Self {
             Self {
                 words: RefCell::new(BTreeMap::new()),
-                write_hooks: RefCell::new(BTreeMap::new()),
-                read_hooks: RefCell::new(BTreeMap::new()),
+                write_hooks: RefCell::new(Vec::new()),
+                read_hooks: RefCell::new(Vec::new()),
                 refused: RefCell::new(Vec::new()),
                 hidden: RefCell::new(Vec::new()),
                 log: RefCell::new(Vec::new()),
@@ -921,7 +921,7 @@ pub(crate) mod mock {
         pub(crate) fn derive(&self, register: Register, hook: impl Fn(u32) -> u32 + 'static) {
             self.write_hooks
                 .borrow_mut()
-                .insert(register.offset(), Box::new(hook));
+                .push((register.offset(), Box::new(hook)));
         }
 
         /// Make reads of `register` derive their answer, which is how a
@@ -929,7 +929,7 @@ pub(crate) mod mock {
         pub(crate) fn on_read(&self, register: Register, hook: impl Fn(u32) -> u32 + 'static) {
             self.read_hooks
                 .borrow_mut()
-                .insert(register.offset(), Box::new(hook));
+                .push((register.offset(), Box::new(hook)));
         }
 
         /// Make writes to `register` fail, as a read-only register or a
@@ -970,10 +970,17 @@ pub(crate) mod mock {
                 .get(&register.offset())
                 .copied()
                 .unwrap_or(0);
-            match self.read_hooks.borrow().get(&register.offset()) {
-                Some(hook) => Some(hook(stored)),
-                None => Some(stored),
+            // Every hook registered for this register applies, in the order it
+            // was registered: a test that wants to model two agents on one
+            // register has to be able to, and replacing the first hook with the
+            // second would make such a test silently wrong.
+            let mut value = stored;
+            for (offset, hook) in self.read_hooks.borrow().iter() {
+                if *offset == register.offset() {
+                    value = hook(value);
+                }
             }
+            Some(value)
         }
 
         fn read64(&self, register: Register) -> Option<u64> {
@@ -992,10 +999,12 @@ pub(crate) mod mock {
                 return false;
             }
             self.log.borrow_mut().push((register.name(), value));
-            let stored = match self.write_hooks.borrow().get(&register.offset()) {
-                Some(hook) => hook(value),
-                None => value,
-            };
+            let mut stored = value;
+            for (offset, hook) in self.write_hooks.borrow().iter() {
+                if *offset == register.offset() {
+                    stored = hook(stored);
+                }
+            }
             self.words.borrow_mut().insert(register.offset(), stored);
             true
         }

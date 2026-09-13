@@ -55,6 +55,7 @@ pub(crate) mod debugfs;
 mod id;
 mod pci;
 mod phy;
+mod power;
 mod probe;
 mod regs;
 
