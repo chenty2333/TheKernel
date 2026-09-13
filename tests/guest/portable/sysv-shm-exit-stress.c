@@ -39,6 +39,13 @@
  *            grandchild still holds the segment, so the removed segment must
  *            stay reachable until the grandchild is gone. It catches a fix
  *            that retires more than the exiting process's own attachments.
+ *            A two-generation round has more ways to be cut short than a
+ *            one-generation round, so both the grandchild's failure path and
+ *            the child's incomplete read report a code and an errno through
+ *            the `finished` pipe the parent already reads. That turns "the
+ *            child exited 5" into "the grandchild's shmat failed with EINVAL"
+ *            or "the grandchild never reported", which is the difference
+ *            between a kernel finding and an unattributed flake.
  *
  * Every round creates its own private segment, so rounds are independent.
  * Output is one machine-readable summary line per invocation; the process exit
@@ -67,6 +74,67 @@ enum {
     MULTI_STRIDE = 64,
 };
 
+/*
+ * Why a `shared` round stopped early.  The process that notices writes one
+ * report to the `finished` pipe before exiting, so the parent can name the
+ * failing syscall instead of only observing that the child exited 5.
+ */
+enum {
+    GRANDCHILD_SHMAT = 1,
+    GRANDCHILD_BAD_VALUE = 2,
+    GRANDCHILD_WRITE = 3,
+    GRANDCHILD_DETACH = 4,
+    GRANDCHILD_TOKEN = 5,
+    GRANDCHILD_FORK = 6,
+    CHILD_READ_INCOMPLETE = 7,
+    KILLED_BY_SIGNAL = 8,
+};
+
+struct failure_report {
+    int code;
+    int error;
+};
+
+/* Where a dying child or grandchild writes its report.  A fatal-signal
+ * handler may only use async-signal-safe calls, so the descriptor lives here
+ * rather than being passed through the handler's context. */
+static int signal_report_fd = -1;
+
+static void report_failure(int fd, int code, int error)
+{
+    struct failure_report report;
+    report.code = code;
+    report.error = error;
+    ssize_t ignored = write(fd, &report, sizeof(report));
+    (void)ignored;
+}
+
+static void on_fatal_signal(int signo)
+{
+    report_failure(signal_report_fd, KILLED_BY_SIGNAL, signo);
+    _exit(128 + signo);
+}
+
+/*
+ * Report rather than die silently on the signals a two-generation round can
+ * plausibly take: a fault in the shared mapping, a broken pipe, or an abort.
+ * Without this a grandchild that is killed leaves the parent with nothing but
+ * "the child's read did not complete", which is the unattributed failure this
+ * instrumentation exists to remove.
+ */
+static void watch_fatal_signals(int fd)
+{
+    static const int signals[] = {SIGSEGV, SIGBUS, SIGPIPE, SIGABRT, SIGILL,
+                                  SIGFPE};
+    signal_report_fd = fd;
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = on_fatal_signal;
+    sigemptyset(&action.sa_mask);
+    for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); ++i)
+        (void)sigaction(signals[i], &action, NULL);
+}
+
 struct counters {
     unsigned long rounds;
     unsigned long completed;
@@ -76,6 +144,7 @@ struct counters {
     unsigned long attach_fail;
     unsigned long errno_fail;
     unsigned long retire_early_fail;
+    unsigned long grandchild_fail;
     unsigned long alive_probe;
     unsigned long polls_max;
     unsigned long polls_sum;
@@ -99,6 +168,16 @@ static void record_failure(struct first_fail *first, unsigned long round,
     first->kind = kind;
     first->error = error;
     first->data = data;
+}
+
+/* Reads one report from the `finished` pipe; 0 means EOF (clean round). */
+static int read_failure_report(int fd, struct failure_report *report)
+{
+    ssize_t got;
+    do {
+        got = read(fd, report, sizeof(*report));
+    } while (got < 0 && errno == EINTR);
+    return got == (ssize_t)sizeof(*report) ? 1 : 0;
 }
 
 static int reap(pid_t pid, int *status)
@@ -433,19 +512,34 @@ static void round_shared(unsigned long round, struct counters *counters,
     if (child == 0) {
         close(release[1]);
         close(finished[0]);
+        /* The grandchild inherits this handler and the same report fd. */
+        watch_fatal_signals(finished[1]);
         errno = 0;
         pid_t grandchild = fork();
-        if (grandchild < 0)
+        if (grandchild < 0) {
+            report_failure(finished[1], GRANDCHILD_FORK, errno);
             _exit(4);
+        }
         if (grandchild == 0) {
             close(finished[0]);
             errno = 0;
             unsigned char *shared = shmat(id, NULL, 0);
-            if (shared == (void *)-1 || shared[0] != PARENT_VALUE)
+            if (shared == (void *)-1) {
+                int error = errno;
+                report_failure(finished[1], GRANDCHILD_SHMAT, error);
                 _exit(1);
+            }
+            if (shared[0] != PARENT_VALUE) {
+                report_failure(finished[1], GRANDCHILD_BAD_VALUE, shared[0]);
+                _exit(1);
+            }
             shared[GRANDCHILD_OFFSET] = GRANDCHILD_VALUE;
-            if (write(attached[1], "a", 1) != 1)
+            errno = 0;
+            if (write(attached[1], "a", 1) != 1) {
+                int error = errno;
+                report_failure(finished[1], GRANDCHILD_WRITE, error);
                 _exit(2);
+            }
             close(attached[1]);
             char token;
             ssize_t got;
@@ -453,18 +547,36 @@ static void round_shared(unsigned long round, struct counters *counters,
                 got = read(release[0], &token, 1);
             } while (got < 0 && errno == EINTR);
             /* EOF on the release pipe is the parent's permission to go. */
-            _exit(shmdt(shared) != 0 || got > 0);
+            errno = 0;
+            if (shmdt(shared) != 0) {
+                int error = errno;
+                report_failure(finished[1], GRANDCHILD_DETACH, error);
+                _exit(3);
+            }
+            if (got > 0) {
+                report_failure(finished[1], GRANDCHILD_TOKEN, (int)got);
+                _exit(3);
+            }
+            _exit(0);
         }
         close(attached[1]);
         close(release[0]);
-        close(finished[1]);
+        /* `finished[1]` deliberately stays open across the read below: it is
+         * the descriptor this process reports its own incomplete read on, and
+         * the parent only looks for EOF after reaping this process anyway. */
         char token;
         ssize_t got;
         do {
             got = read(attached[0], &token, 1);
         } while (got < 0 && errno == EINTR);
         /* Exit while the grandchild still owns the segment. */
-        _exit(got == 1 ? 0 : 5);
+        if (got != 1) {
+            int error = errno;
+            report_failure(finished[1], CHILD_READ_INCOMPLETE,
+                           got == 0 ? 0 : error);
+            _exit(5);
+        }
+        _exit(0);
     }
     close(attached[0]);
     close(attached[1]);
@@ -476,11 +588,8 @@ static void round_shared(unsigned long round, struct counters *counters,
     (void)shmdt(ro);
     (void)shmdt(rw);
     int status = -1;
-    if (reap(child, &status) != 0 || !WIFEXITED(status) ||
-        WEXITSTATUS(status) != 0) {
-        counters->child_fail++;
-        record_failure(first, round, "child-status", status, 0);
-    }
+    int child_failed =
+        reap(child, &status) != 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0;
     /* The child is gone but the grandchild still holds the segment: the
      * removed id must still be attachable, and the grandchild's write must be
      * visible through the new mapping. */
@@ -498,15 +607,23 @@ static void round_shared(unsigned long round, struct counters *counters,
         (void)shmdt(probe);
     }
     close(release[1]);
-    char token;
-    ssize_t got;
-    do {
-        got = read(finished[0], &token, 1);
-    } while (got < 0 && errno == EINTR);
+    /* The grandchild writes here only when it could not do its part; the
+     * child writes here only when its read did not complete. A clean round
+     * reads nothing at all (EOF), which is what the old code asserted. */
+    struct failure_report report;
+    memset(&report, 0, sizeof(report));
+    int reported = read_failure_report(finished[0], &report);
     close(finished[0]);
-    if (got != 0) {
-        counters->setup_fail++;
-        record_failure(first, round, "grandchild-exit", (int)got, 0);
+    if (!reported && child_failed) {
+        counters->child_fail++;
+        record_failure(first, round, "child-status", status, 0);
+    } else if (reported && report.code == CHILD_READ_INCOMPLETE) {
+        counters->child_fail++;
+        record_failure(first, round, "child-read-incomplete", report.error, 0);
+    } else if (reported) {
+        counters->grandchild_fail++;
+        record_failure(first, round, "grandchild-report", report.code,
+                       (unsigned long)report.error);
     }
     check_probe(id, round, counters, first);
 }
@@ -567,14 +684,15 @@ int main(int argc, char **argv)
     }
     unsigned long defects = counters.setup_fail + counters.child_fail +
                             counters.value_fail + counters.attach_fail +
-                            counters.errno_fail + counters.retire_early_fail;
+                            counters.errno_fail + counters.retire_early_fail +
+                            counters.grandchild_fail;
     printf("SYSV-SHM-STRESS variant=%s rounds=%lu completed=%lu setup_fail=%lu "
            "child_fail=%lu value_fail=%lu attach_fail=%lu errno_fail=%lu "
-           "retire_early_fail=%lu alive_probe=%lu\n",
+           "retire_early_fail=%lu grandchild_fail=%lu alive_probe=%lu\n",
            variant, counters.rounds, counters.completed, counters.setup_fail,
            counters.child_fail, counters.value_fail, counters.attach_fail,
            counters.errno_fail, counters.retire_early_fail,
-           counters.alive_probe);
+           counters.grandchild_fail, counters.alive_probe);
     printf("SYSV-SHM-STRESS-%s %s\n", defects == 0 ? "OK" : "FAIL", variant);
     fflush(stdout);
     return defects == 0 ? 0 : 1;
