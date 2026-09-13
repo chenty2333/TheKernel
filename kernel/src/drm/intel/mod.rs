@@ -53,6 +53,7 @@
 mod clk;
 pub(crate) mod debugfs;
 mod gmbus;
+pub(crate) mod gtt;
 mod hpd;
 mod id;
 mod pci;
