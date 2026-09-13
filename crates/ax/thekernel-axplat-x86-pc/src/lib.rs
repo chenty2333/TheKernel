@@ -15,6 +15,7 @@ macro_rules! diagnostic_println {
     };
 }
 
+mod acpi;
 mod apic;
 mod boot;
 mod boot_info;
@@ -28,10 +29,11 @@ pub mod hwp;
 mod init;
 pub mod kexec;
 mod mem;
+pub mod pci;
 mod power;
 mod time;
 
-pub use boot_info::{ColorField, FramebufferInfo, ModuleInfo};
+pub use boot_info::{ColorField, FramebufferInfo, FramebufferRejection, ModuleInfo};
 
 /// Configure a PCI INTx line without changing the default ISA routing.
 #[cfg(feature = "irq")]
@@ -63,6 +65,30 @@ pub fn boot_modules() -> impl Iterator<Item = ModuleInfo> + 'static {
 /// business drawing anything never pays for the mapping.
 pub fn boot_framebuffer() -> Option<FramebufferInfo> {
     boot_info::get().framebuffer().copied()
+}
+
+/// Whether the bootloader offered a framebuffer tag at all.
+///
+/// Together with [`boot_framebuffer`] and [`boot_framebuffer_rejection`] this
+/// separates the three states a caller must distinguish: no tag (the kernel
+/// was never given a display), a tag this kernel accepted, and a tag it
+/// declined for a specific reason.
+pub fn boot_framebuffer_offered() -> bool {
+    let info = boot_info::get();
+    info.framebuffer().is_some() || info.framebuffer_rejection().is_some()
+}
+
+/// Why the bootloader's framebuffer tag produced no usable surface.
+///
+/// Returned as a stable string rather than as the platform's own enum so the
+/// kernel can report the reason without depending on this crate's internals.
+/// The caller is expected to log it: on a machine with no serial port the
+/// display is the diagnostic channel, and "no tag" and "tag rejected" call for
+/// completely different fixes.
+pub fn boot_framebuffer_rejection() -> Option<&'static str> {
+    boot_info::get()
+        .framebuffer_rejection()
+        .map(FramebufferRejection::as_str)
 }
 
 #[cfg(feature = "pmu")]

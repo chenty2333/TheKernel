@@ -388,6 +388,31 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         );
     }
 
+    // The firmware framebuffer verdict belongs in the kernel log, not only in
+    // the platform's diagnostic UART output.  On a machine with no serial port
+    // the screen is the only channel left, and the screen is exactly what is
+    // missing when this verdict is a rejection; a log record is what a
+    // framebuffer console mirrors to it.  Emitted here, on the boot path,
+    // because nothing on the console write path may itself log.
+    match (
+        axhal::boot::framebuffer(),
+        axhal::boot::framebuffer_rejection(),
+    ) {
+        (Some(framebuffer), _) => info!(
+            "boot framebuffer: accepted addr={:#x} {}x{} bpp={} pitch={}",
+            framebuffer.address,
+            framebuffer.width,
+            framebuffer.height,
+            framebuffer.bpp,
+            framebuffer.pitch,
+        ),
+        (None, Some(reason)) => warn!("boot framebuffer: declined: {reason}"),
+        (None, None) if axhal::boot::framebuffer_offered() => {
+            warn!("boot framebuffer: declined for an unrecorded reason")
+        }
+        (None, None) => info!("boot framebuffer: none offered by the bootloader"),
+    }
+
     #[cfg(feature = "alloc")]
     init_allocator();
 
