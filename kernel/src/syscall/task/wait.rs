@@ -29,7 +29,7 @@ const POST_WAIT_RECLAIM_YIELDS: usize = 4;
 
 bitflags! {
     #[derive(Debug)]
-    struct WaitOptions: u32 {
+    pub(crate) struct WaitOptions: u32 {
         /// Do not block when there are no processes wishing to report status.
         const WNOHANG = WNOHANG;
         /// Report the status of selected processes which are stopped due to a
@@ -76,7 +76,7 @@ impl WaitPid {
 /// Renders a core process ID in the caller's PID namespace.  The process
 /// registry deliberately uses kernel-wide IDs, but wait(2) arguments and
 /// results are namespace-relative.
-fn visible_process_pid(viewer_pid_ns: &PidNamespace, process: &Process) -> Option<Pid> {
+pub(crate) fn visible_process_pid(viewer_pid_ns: &PidNamespace, process: &Process) -> Option<Pid> {
     let target_pid_ns = process.identity::<Arc<PidNamespace>>()?;
     viewer_pid_ns.visible_pid_for(target_pid_ns, process.pid())
 }
@@ -186,7 +186,7 @@ fn validate_waitid_options(options: u32) -> AxResult<WaitOptions> {
 }
 
 /// Determines whether a child should be included in wait based on WALL/WCLONE flags.
-fn should_wait_for_child(child: &Process, options: &WaitOptions) -> bool {
+pub(crate) fn should_wait_for_child(child: &Process, options: &WaitOptions) -> bool {
     if options.contains(WaitOptions::WALL) {
         return true;
     }
@@ -228,10 +228,21 @@ fn matching_wait_candidates(
     candidates
         .try_reserve_exact(capacity)
         .map_err(|_| AxError::NoMemory)?;
+    // Diagnostic counters: how many children the registry returned, how many
+    // the pid filter accepted, and how many survived the clone-type filter.
+    // Published for the trace record that this syscall is about to write.
+    let seen = children.len() as u32;
+    let mut pid_ok = 0u32;
+    let mut ok = 0u32;
+    let mut invisible = 0u32;
     for process in children {
-        if let Some(visible_pid) = wait_pid_applies(viewer_pid_ns, pid, &process)
-            && should_wait_for_child(&process, options)
-        {
+        let Some(visible_pid) = wait_pid_applies(viewer_pid_ns, pid, &process) else {
+            invisible += 1;
+            continue;
+        };
+        pid_ok += 1;
+        if should_wait_for_child(&process, options) {
+            ok += 1;
             candidates.push(WaitCandidate {
                 process,
                 visible_pid,
@@ -240,6 +251,13 @@ fn matching_wait_candidates(
             });
         }
     }
+    crate::task::exit_status_note_candidates(
+        seen,
+        pid_ok,
+        ok,
+        tracees.len() as u32,
+        invisible,
+    );
 
     for reverse_link in tracees {
         let tracee_pid = reverse_link.tracee();
@@ -478,10 +496,33 @@ pub fn sys_waitpid(
         let _wait_guard = proc_data.wait_lock.lock();
         let candidates = match matching_wait_candidates(proc_data, &viewer_pid_ns, pid, &options) {
             Ok(candidates) => candidates,
-            Err(err) => return Err(err),
+            Err(err) => {
+                // Error codes are recorded symbolically: `errno()` is not
+                // reachable from here, and the only distinction the report
+                // needs is which `wait4` failure the caller saw.
+                let code = if err == AxError::from(LinuxError::ECHILD) {
+                    1
+                } else if err == AxError::from(LinuxError::ESRCH) {
+                    2
+                } else {
+                    3
+                };
+                trace_wait(pid, -1, 0, &options, 5, code, 0);
+                return Err(err);
+            }
         };
 
         if let Some(event) = select_wait_event(&candidates, &options, true) {
+            // Diagnostic: record what this pid-targeted wait is about to
+            // return, before the event is consumed. `event.pid()` is the
+            // candidate's namespace-visible pid, which may differ from the
+            // requested pid when the wait matched something else.
+            let (event_kind, status) = match &event {
+                WaitEvent::Exited { snapshot, .. } => (1u32, snapshot.wait_status),
+                WaitEvent::Stopped { stop, .. } => (2, i32::from(stop.signal)),
+                WaitEvent::Continued { .. } => (3, 0),
+            };
+            trace_wait(pid, i64::from(event.pid()), status, &options, event_kind, 0, 0);
             let claimed_event = match &event {
                 WaitEvent::Stopped {
                     stop, proc_data, ..
@@ -527,6 +568,7 @@ pub fn sys_waitpid(
             return Ok(Some(event.pid() as isize));
         }
 
+        trace_wait(pid, -1, 0, &options, 4, 0, 0);
         if options.contains(WaitOptions::WNOHANG) {
             Ok(Some(0))
         } else {
@@ -547,9 +589,47 @@ pub fn sys_waitpid(
         },
         || has_pending_syscall_signal(curr.as_thread()),
     );
+    // `result` is the blocking phase's outcome: an interrupt that did not
+    // become a completed event, or a completed event.
+    let (result, result_symbol) = match &result {
+        Ok(_) => (result, 0u8),
+        Err(error) if *error == AxError::Interrupted => (result, 1),
+        Err(error) if *error == AxError::WouldBlock => (result, 2),
+        Err(_) => (result, 3),
+    };
+    if result_symbol != 0 {
+        trace_wait(pid, -1, 0, &options, 6, 0, result_symbol);
+    }
     let result = result?;
     axtask::reclaim_exited_tasks_until_clear(POST_WAIT_RECLAIM_YIELDS);
     Ok(result)
+}
+
+/// Diagnostic: records one pid-targeted `wait4` observation.
+///
+/// Only positive, namespace-visible pid requests are recorded, because that is
+/// the shape `tests/guest/portable/exit-status.c` and the acceptance loop use.
+fn trace_wait(
+    pid: WaitPid,
+    got: i64,
+    status: i32,
+    options: &WaitOptions,
+    event: u32,
+    error: u8,
+    result: u8,
+) {
+    let WaitPid::Pid(requested) = pid else {
+        return;
+    };
+    crate::task::exit_status_trace_record(
+        requested,
+        got.max(-1) as Pid,
+        status,
+        options.bits(),
+        event,
+        error,
+        result,
+    );
 }
 
 /// Decodes a Linux-style wait status into (CLD_* code, si_status) for waitid.

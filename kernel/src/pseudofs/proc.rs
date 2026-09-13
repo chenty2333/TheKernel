@@ -3991,6 +3991,18 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
                 ),
             );
             kernel.add(
+                "exit-status",
+                SimpleFile::new_regular_with_permission(
+                    fs.clone(),
+                    NodePermission::from_bits_truncate(0o444),
+                    // Reading re-renders the ring, so the guest always sees the
+                    // most recent events: the diagnostic exists to be read
+                    // immediately after a failing wait, from a boot that is
+                    // still running.
+                    || Ok(crate::task::exit_status_trace_dump()),
+                ),
+            );
+            kernel.add(
                 "arch",
                 SimpleFile::new_regular_with_permission(
                     fs.clone(),

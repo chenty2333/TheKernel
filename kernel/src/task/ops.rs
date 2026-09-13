@@ -39,7 +39,10 @@ use crate::{
         try_read_user_u32_nofault_locked,
     },
     pseudofs::cgroup,
-    syscall::acct_process_exit,
+    syscall::{
+        acct_process_exit,
+        task::wait::{WaitOptions, should_wait_for_child, visible_process_pid},
+    },
 };
 
 #[cfg(not(test))]
@@ -1395,6 +1398,504 @@ pub fn exit_robust_list(memory: &UserMemoryCapability, head: *const RobustListHe
     }
 }
 
+/// Diagnostic black box for the exit-status/concurrent-clone-exit race.
+///
+/// Two rings and no control-flow change, exposed to the guest through
+/// `/proc/sys/kernel/exit-status`.  It is the second generation of the probe in
+/// this worktree; the first recorded only pid-targeted wait results, and pushed
+/// them through the kernel log sink, which drops records under exactly the
+/// contention the race needs (`klog::allowed` is a `try_lock`).  It never
+/// captured a failing run.
+///
+/// Recorded events:
+///
+///   * `WAIT` — one entry per pid-targeted `wait4` observation, including every
+///     failure: no candidate yet (`event=4`), error (`event=5`), interrupted
+///     (`event=6`), or a selected event (`event=1..3`).
+///   * `CLONE` — child-to-parent publication for every clone/fork.
+///   * `EXIT` — one entry per published final process exit, carrying the exact
+///     wait status the zombie payload was initialized with.
+///
+/// On `ECHILD` the record additionally carries what the process registry and
+/// the waiter's own `try_children` result held for the requested pid, which is
+/// what distinguishes "the child was never linked to me" from "the child is
+/// there but my pid filter rejected it".
+///
+/// Reads are cheap and allocation-light, but the module is written to be safe
+/// under the registry locks its callers hold: no log output, no sleeps, and
+/// only short SpinNoIrq critical sections.
+const EXIT_STATUS_TRACE_LEN: usize = 512;
+/// Number of the waiter's children captured in an `ECHILD` record.
+const EXIT_STATUS_CHILD_SLOTS: usize = 16;
+/// `(37 << 8)`: the wait status `tests/guest/portable/exit-status.c` requires
+/// from every clone child.  Retained as documentation for the report reader.
+#[allow(dead_code)]
+const EXIT_STATUS_CHILD_STATUS: i32 = 37 << 8;
+
+/// One wait observation, clone publication, or exit publication.
+#[derive(Clone, Copy)]
+struct ExitStatusRecord {
+    /// Monotonic observation number; zero means "never written".
+    sequence: u32,
+    /// Observing process (wait) or exiting process (publication).
+    process_pid: Pid,
+    /// `wait4` request, or the published process's own pid.
+    requested_pid: Pid,
+    /// Child the kernel actually selected, or the publication's process pid.
+    reaped_pid: Pid,
+    /// `snapshot.wait_status` for a wait, or `process.exit_code()` for a
+    /// publication — the exact value that becomes the zombie's wait status.
+    status: i32,
+    /// Caller options (`wait4`) or the child-to-parent clone signal.
+    aux: u32,
+    /// `1` exited, `2` stopped, `3` continued, `4` no candidate, `5` error,
+    /// `6` interrupted, `7` clone publication, `9` exit publication.
+    event: u32,
+    /// Requested-pid lookup result for a failed wait: `0` missing, `1` ok.
+    target_found: u32,
+    /// `1` when the requested pid resolved to an unpublished registry entry.
+    target_unpublished: u32,
+    /// Waiter's live `try_children` count, or clone/exit observation `0`.
+    viewer_children: u32,
+    /// Requested process's visible pid in the waiter's namespace (`-1` when it
+    /// could not be rendered).
+    target_visible: i32,
+    /// `is_zombie` of the requested process (`-1` when absent).
+    target_zombie: i32,
+    /// `is_group_exited` of the requested process (`-1` when absent).
+    target_group_exited: i32,
+    /// Requested process's parent pid (`-1` when absent).
+    target_parent: i32,
+    /// `is_zombie` of the observing process at observation.
+    zombie: u8,
+    /// `is_group_exited` of the observing process.
+    group_exited: u8,
+    /// Observed process's live thread-group exit code.
+    exit_code: i32,
+    /// Live thread count of the observing process.
+    threads: u8,
+    /// Error symbol: `0` none, `1` ECHILD, `2` ESRCH, `3` other.
+    error: u8,
+    /// `0` ok, `1` `AxError::Interrupted`, `2` `WouldBlock`, `3` other.
+    wait_result: u8,
+    /// Number of valid entries in `child_*`.
+    child_count: u8,
+    /// Child's parent pid, or `-1`.
+    parent_pid: i32,
+    /// Waiter's children at the failing observation: global pid.
+    child_pid: [i32; EXIT_STATUS_CHILD_SLOTS],
+    /// Waiter's children at the failing observation: global pid as the waiter's
+    /// namespace renders it (`-1` when it cannot be rendered).
+    child_visible: [i32; EXIT_STATUS_CHILD_SLOTS],
+    /// Waiter's children at the failing observation: whether the waiter's pid
+    /// filter accepted it.
+    child_matched: [u8; EXIT_STATUS_CHILD_SLOTS],
+    /// `1` when the clone entry's child had this waiter as its process parent.
+    child_is_child: u8,
+    /// Registry-wide process membership count at the observation.
+    registry_total: u32,
+    /// Children dropped from the head of `child_pid` when the list is longer
+    /// than the record can hold.
+    child_skipped: u32,
+    /// Global pid the waiter's namespace resolves the requested pid to, `-1`
+    /// when the binding is absent.
+    resolved_global: i32,
+    /// `1` when that global process exists and is the waiter's child.
+    resolved_is_my_child: u8,
+    /// Raw `wait4` options, so the report can re-run the filter decision.
+    raw_options: u32,
+    /// Children's clone exit signals at the failing observation.
+    child_exit_signal: [i32; EXIT_STATUS_CHILD_SLOTS],
+    /// Whether `should_wait_for_child` accepted each child.
+    child_accepts: [u8; EXIT_STATUS_CHILD_SLOTS],
+    /// Whether each child was live.
+    child_live: [u8; EXIT_STATUS_CHILD_SLOTS],
+    /// Whether each child was a zombie.
+    child_zombie: [u8; EXIT_STATUS_CHILD_SLOTS],
+    /// Children `matching_wait_candidates` saw, before either filter.
+    candidates_seen: u32,
+    /// Children that passed `wait_pid_applies`.
+    candidates_pid_ok: u32,
+    /// Children that passed `should_wait_for_child`.
+    candidates_ok: u32,
+    /// Children the ptrace reverse-link loop added.
+    candidates_tracee: u32,
+    /// `try_children` entries whose pid could not be rendered in the caller
+    /// namespace.
+    candidates_invisible: u32,
+}
+
+impl ExitStatusRecord {
+    const EMPTY: Self = Self {
+        sequence: 0,
+        process_pid: 0,
+        requested_pid: 0,
+        reaped_pid: 0,
+        status: 0,
+        aux: 0,
+        event: 0,
+        target_found: 0,
+        target_unpublished: 0,
+        viewer_children: 0,
+        target_visible: -1,
+        target_zombie: -1,
+        target_group_exited: -1,
+        target_parent: -1,
+        zombie: 0,
+        group_exited: 0,
+        exit_code: 0,
+        threads: 0,
+        error: 0,
+        wait_result: 0,
+        child_count: 0,
+        parent_pid: -1,
+        child_pid: [-1; EXIT_STATUS_CHILD_SLOTS],
+        child_visible: [-1; EXIT_STATUS_CHILD_SLOTS],
+        child_matched: [0; EXIT_STATUS_CHILD_SLOTS],
+        child_is_child: 0,
+        registry_total: 0,
+        child_skipped: 0,
+        resolved_global: -1,
+        resolved_is_my_child: 0,
+        raw_options: 0,
+        child_exit_signal: [0; EXIT_STATUS_CHILD_SLOTS],
+        child_accepts: [0; EXIT_STATUS_CHILD_SLOTS],
+        child_live: [0; EXIT_STATUS_CHILD_SLOTS],
+        child_zombie: [0; EXIT_STATUS_CHILD_SLOTS],
+        candidates_seen: 0,
+        candidates_pid_ok: 0,
+        candidates_ok: 0,
+        candidates_tracee: 0,
+        candidates_invisible: 0,
+    };
+}
+
+struct ExitStatusTrace {
+    sequence: u32,
+    records: [ExitStatusRecord; EXIT_STATUS_TRACE_LEN],
+}
+
+impl ExitStatusTrace {
+    const fn new() -> Self {
+        Self {
+            sequence: 0,
+            records: [ExitStatusRecord::EMPTY; EXIT_STATUS_TRACE_LEN],
+        }
+    }
+}
+
+static EXIT_STATUS_TRACE: axsync::spin::SpinNoIrq<ExitStatusTrace> =
+    axsync::spin::SpinNoIrq::new(ExitStatusTrace::new());
+
+fn exit_status_trace_push(record: ExitStatusRecord) {
+    let mut trace = EXIT_STATUS_TRACE.lock();
+    trace.sequence = trace.sequence.wrapping_add(1);
+    let sequence = trace.sequence;
+    let index = (sequence.wrapping_sub(1) as usize) % EXIT_STATUS_TRACE_LEN;
+    trace.records[index] = ExitStatusRecord { sequence, ..record };
+}
+
+/// Per-observation counters the candidate builder publishes for the trace.
+///
+/// Written by `matching_wait_candidates` immediately before it returns, and
+/// consumed by `exit_status_trace_record` for the same observation, on the same
+/// task: a plain per-CPU-free pair of atomics is enough because the recorder
+/// runs in the syscall that produced them.
+static CANDIDATE_SEEN: AtomicU32 = AtomicU32::new(0);
+static CANDIDATE_PID_OK: AtomicU32 = AtomicU32::new(0);
+static CANDIDATE_OK: AtomicU32 = AtomicU32::new(0);
+static CANDIDATE_TRACEE: AtomicU32 = AtomicU32::new(0);
+static CANDIDATE_INVISIBLE: AtomicU32 = AtomicU32::new(0);
+
+/// Diagnostic: publishes what the last candidate build saw.
+pub(crate) fn exit_status_note_candidates(
+    seen: u32,
+    pid_ok: u32,
+    ok: u32,
+    tracee: u32,
+    invisible: u32,
+) {
+    CANDIDATE_SEEN.store(seen, Ordering::Relaxed);
+    CANDIDATE_PID_OK.store(pid_ok, Ordering::Relaxed);
+    CANDIDATE_OK.store(ok, Ordering::Relaxed);
+    CANDIDATE_TRACEE.store(tracee, Ordering::Relaxed);
+    CANDIDATE_INVISIBLE.store(invisible, Ordering::Relaxed);
+}
+
+/// Registry lookup for the diagnostic probe, without a `?` in a closure.
+fn registry_get_for_probe(global_pid: Pid) -> Option<Arc<Process>> {
+    process_domain().ok()?.registry().get(global_pid)
+}
+
+/// Snapshot of the state a wait or publication observed.
+///
+/// Allocation-free: this runs while the caller may hold process-registry and
+/// thread-group locks, and it must not perturb the race it observes.
+fn exit_status_snapshot(process: &Arc<Process>) -> (i32, u8, u8, u8, Pid) {
+    (
+        process.exit_code(),
+        u8::from(process.is_zombie()),
+        u8::from(process.is_group_exited()),
+        process.thread_count() as u8,
+        process.parent().map_or(0, |parent| parent.pid()),
+    )
+}
+
+/// Records one completed pid-targeted wait observation.
+///
+/// `event`: `1` exited, `2` stopped, `3` continued, `4` no candidate, `5`
+/// error, `6` interrupted.  `result`: `0` ok, `1` interrupted, `2` would-block,
+/// `3` other.
+pub(crate) fn exit_status_trace_record(
+    requested_pid: Pid,
+    reaped_pid: Pid,
+    status: i32,
+    options: u32,
+    event: u32,
+    error: u8,
+    result: u8,
+) {
+    let process_pid = current().as_thread().proc_data.proc.pid();
+    let mut record = ExitStatusRecord {
+        raw_options: options,
+        candidates_seen: CANDIDATE_SEEN.load(Ordering::Relaxed),
+        candidates_pid_ok: CANDIDATE_PID_OK.load(Ordering::Relaxed),
+        candidates_ok: CANDIDATE_OK.load(Ordering::Relaxed),
+        candidates_tracee: CANDIDATE_TRACEE.load(Ordering::Relaxed),
+        candidates_invisible: CANDIDATE_INVISIBLE.load(Ordering::Relaxed),
+        sequence: 0,
+        process_pid,
+        requested_pid,
+        reaped_pid,
+        status,
+        aux: options,
+        event,
+        error,
+        wait_result: result,
+        ..ExitStatusRecord::EMPTY
+    };
+    if let Ok(data) = get_process_data(process_pid) {
+        let (exit_code, zombie, group_exited, threads, parent_pid) =
+            exit_status_snapshot(&data.proc);
+        record.exit_code = exit_code;
+        record.zombie = zombie;
+        record.group_exited = group_exited;
+        record.threads = threads;
+        record.parent_pid = parent_pid as i32;
+
+        // The ECHILD case is the one that matters: the requested process is
+        // alive by contract (its pid binding survives until reap), so capture
+        // both the registry's view of it and the waiter's own child list.
+        if error == 1 {
+            if let Ok(domain) = process_domain()
+                && let Some(target) = domain.registry().get(requested_pid)
+            {
+                record.target_found = 1;
+                let (_, zombie, group_exited, _, parent_pid) = exit_status_snapshot(&target);
+                record.target_zombie = i32::from(zombie);
+                record.target_group_exited = i32::from(group_exited);
+                record.target_parent = parent_pid as i32;
+                let viewer_pid_ns = current().as_thread().pid_ns();
+                record.target_visible = visible_process_pid(&viewer_pid_ns, &target)
+                    .and_then(|pid| i32::try_from(pid).ok())
+                    .unwrap_or(-1);
+            }
+            if let Ok(domain) = process_domain() {
+                let viewer_pid_ns = current().as_thread().pid_ns();
+                record.registry_total = domain.registry().membership_count() as u32;
+
+                // Which global process does this namespace think the requested
+                // pid names, and is it the process the waiter should have seen?
+                record.resolved_global = viewer_pid_ns
+                    .resolve_visible_pid(requested_pid)
+                    .and_then(|global| i32::try_from(global).ok())
+                    .unwrap_or(-1);
+                let resolved_child = viewer_pid_ns
+                    .resolve_visible_pid(requested_pid)
+                    .and_then(registry_get_for_probe)
+                    .map(|process| u8::from(
+                        process
+                            .parent()
+                            .is_some_and(|parent| parent.pid() == process_pid),
+                    ))
+                    .unwrap_or(0);
+                record.resolved_is_my_child = resolved_child;
+                if let Ok(children) = data.proc.try_children(domain.registry()) {
+                    record.viewer_children = children.len() as u32;
+                    // Keep the *tail* of a long list: children are pid-ordered
+                    // and the requested child is the most recently cloned.
+                    let skip = children.len().saturating_sub(EXIT_STATUS_CHILD_SLOTS);
+                    for (slot, child) in children.iter().skip(skip).enumerate() {
+                        if slot >= EXIT_STATUS_CHILD_SLOTS {
+                            break;
+                        }
+                        record.child_pid[slot] = child.pid() as i32;
+                        record.child_visible[slot] = visible_process_pid(&viewer_pid_ns, child)
+                            .and_then(|pid| i32::try_from(pid).ok())
+                            .unwrap_or(-1);
+                        record.child_matched[slot] = u8::from(
+                            i32::try_from(requested_pid).ok() == Some(record.child_visible[slot]),
+                        );
+                        record.child_exit_signal[slot] =
+                            child.exit_signal().map_or(-1, i32::from);
+                        record.child_accepts[slot] = u8::from(should_wait_for_child(
+                            child,
+                            &WaitOptions::from_bits_truncate(options),
+                        ));
+                        record.child_live[slot] = u8::from(child.is_live());
+                        record.child_zombie[slot] = u8::from(child.is_zombie());
+                    }
+                    record.child_count = children.len().min(EXIT_STATUS_CHILD_SLOTS) as u8;
+                    record.child_skipped = skip.min(u32::MAX as usize) as u32;
+                }
+            }
+        } else if event == 1 && reaped_pid == requested_pid {
+            record.child_is_child = 1;
+        }
+    }
+    exit_status_trace_push(record);
+}
+
+/// Records one cloned child's publication, with the signal it will raise in its
+/// parent.  Called on the clone success path only.
+pub(crate) fn exit_status_trace_clone(parent_pid: Pid, child_pid: Pid, exit_signal: u32) {
+    exit_status_trace_push(ExitStatusRecord {
+        sequence: 0,
+        process_pid: parent_pid,
+        requested_pid: exit_signal as Pid,
+        reaped_pid: child_pid,
+        aux: exit_signal,
+        event: 7,
+        ..ExitStatusRecord::EMPTY
+    });
+}
+
+/// Records the wait status a final process exit is about to publish.
+///
+/// This is the value the reaper's `wait4` will later observe, captured at the
+/// instant the zombie payload is initialized.
+pub(crate) fn exit_status_trace_publish(process: &Arc<Process>, wait_status: i32) {
+    let (exit_code, zombie, group_exited, threads, parent_pid) = exit_status_snapshot(process);
+    exit_status_trace_push(ExitStatusRecord {
+        sequence: 0,
+        process_pid: process.pid(),
+        requested_pid: process.pid(),
+        reaped_pid: process.pid(),
+        // The published payload value is the subject of this record; the live
+        // thread-group code is carried alongside it.
+        status: wait_status,
+        event: 9,
+        target_parent: exit_code,
+        target_group_exited: i32::from(group_exited),
+        zombie,
+        group_exited,
+        exit_code,
+        threads,
+        parent_pid: parent_pid as i32,
+        ..ExitStatusRecord::EMPTY
+    });
+}
+
+/// Renders the whole ring as text, oldest entry first.
+///
+/// Called from the `/proc` read handler, i.e. from the guest's own context
+/// while the kernel is still running, so the whole ring is preserved rather
+/// than only the tail that survived a boot-long kernel log.
+pub(crate) fn exit_status_trace_dump() -> Vec<u8> {
+    let (records, sequence) = {
+        let trace = EXIT_STATUS_TRACE.lock();
+        (trace.records, trace.sequence)
+    };
+    let width = EXIT_STATUS_TRACE_LEN as u32;
+    // Entries `sequence - width + 1 ..= sequence` are the ones the ring still
+    // holds once it has wrapped; before that, the whole prefix is live.
+    let first = sequence.saturating_sub(width - 1).max(1);
+    let mut out = Vec::new();
+    let header = alloc::format!(
+        "EXITSTATUS_TRACE_BEGIN seq={} first={} entries={}\n",
+        sequence,
+        first,
+        sequence + 1 - first
+    );
+    out.extend_from_slice(header.as_bytes());
+    for wanted in first..=sequence {
+        let index = (wanted.wrapping_sub(1) as usize) % EXIT_STATUS_TRACE_LEN;
+        let record = &records[index];
+        if record.sequence != wanted {
+            continue;
+        }
+        let line = match record.event {
+            7 => alloc::format!(
+                "CLONE seq={} parent={} child={} signal={}\n",
+                record.sequence,
+                record.process_pid,
+                record.reaped_pid,
+                record.aux
+            ),
+            9 => alloc::format!(
+                "EXIT seq={} pid={} wait_status={:#x} tg_exit_code={} group_exited={} parent={}\n",
+                record.sequence,
+                record.process_pid,
+                record.status as u32,
+                record.target_parent,
+                record.target_group_exited,
+                record.parent_pid
+            ),
+            _ => alloc::format!(
+                "WAIT seq={} pid={} req={} got={} status={:#x} event={} err={} result={} \
+                 my_zombie={} my_threads={} my_parent={} kids={} target_found={} \
+                 target_unpublished={} target_visible={} target_zombie={} target_parent={} \
+                 registry_total={} kids_skipped={} resolved={} resolved_is_child={} options={:#x} \
+                 kids=[{}] candidates(seen={} pid_ok={} ok={} tracee={} invisible={})\n",
+                record.sequence,
+                record.process_pid,
+                record.requested_pid,
+                record.reaped_pid,
+                record.status as u32,
+                record.event,
+                record.error,
+                record.wait_result,
+                record.zombie,
+                record.threads,
+                record.parent_pid,
+                record.viewer_children,
+                record.target_found,
+                record.target_unpublished,
+                record.target_visible,
+                record.target_zombie,
+                record.target_parent,
+                record.registry_total,
+                record.child_skipped,
+                record.resolved_global,
+                record.resolved_is_my_child,
+                record.raw_options,
+                (0..record.child_count as usize)
+                    .map(|slot| alloc::format!(
+                        "{}:vis={}:match={}:sig={}:acc={}:live={}:zom={}",
+                        record.child_pid[slot],
+                        record.child_visible[slot],
+                        record.child_matched[slot],
+                        record.child_exit_signal[slot],
+                        record.child_accepts[slot],
+                        record.child_live[slot],
+                        record.child_zombie[slot]
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                record.candidates_seen,
+                record.candidates_pid_ok,
+                record.candidates_ok,
+                record.candidates_tracee,
+                record.candidates_invisible
+            ),
+        };
+        out.extend_from_slice(line.as_bytes());
+    }
+    out.extend_from_slice(b"EXITSTATUS_TRACE_END\n");
+    out
+}
+
+
 fn process_lifecycle_error(error: ProcessError) -> AxError {
     match error {
         ProcessError::NoMemory | ProcessError::Capacity => AxError::NoMemory,
@@ -1422,8 +1923,10 @@ fn publish_final_process_exit(
     // through final exit.  Re-sampling ambient `current()` here would create a
     // second authority after live process membership has already been removed
     // and after teardown has crossed blocking/context-switch boundaries.
+    let wait_status = process.exit_code();
+    exit_status_trace_publish(process, wait_status);
     exit.commit_with_reparent_handoff(
-        process.exit_code(),
+        wait_status,
         self_usage.into(),
         child_usage.into(),
         proc_data.group_leader_cred(),
