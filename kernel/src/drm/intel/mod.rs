@@ -60,6 +60,17 @@
 //! driver would implement it once it can program a pipe.  This module supplies
 //! the device identity and register access that implementation will need, and
 //! nothing else.
+//!
+//! ## After the boot: the hotplug watch
+//!
+//! [`probe_at_boot`] and [`bring_up_at_boot`] each run once and report what
+//! they found.  A monitor plugged in afterwards is invisible to both, so this
+//! module also owns the one thing that looks again: a task that sleeps, reads
+//! the south display's live connect state, and re-runs the sink step for the
+//! device when that state changes.  It is described in
+//! `docs/design/intel-hotplug.md`; the short version is that the poll is two
+//! register reads that write nothing, and every expensive step happens in task
+//! context after the read.
 
 mod clk;
 pub(crate) mod debugfs;
@@ -83,14 +94,20 @@ mod timing;
 #[cfg(test)]
 mod testbus;
 
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
 
 use spin::Mutex;
 
+/// The machine's own clock, which only the watch needs: the poll decides what
+/// to do, and the machine's clock is what the log line is stamped with.
+#[cfg(target_os = "none")]
+use self::gmbus::MonotonicTimer;
 use self::{
+    gmbus::PollTimer,
     id::Aperture,
+    pci::Bdf,
     probe::{BusFacts, ProbeReport, WindowStatus},
-    regs::{PROBE_WINDOW, RegisterWindow},
+    regs::{PROBE_WINDOW, RegisterWindow, Registers},
 };
 
 /// The report of the one probe this kernel runs, kept for the debug file.
@@ -124,6 +141,46 @@ static POWER_FAILURE: Mutex<Option<String>> = Mutex::new(None);
 /// firmware did not supply, and on a machine whose only console is the screen
 /// it is worth being able to read twice.
 static SINK: Mutex<Option<sink::SinkReport>> = Mutex::new(None);
+
+/// How often the after-boot hotplug watch reads the live connect state.
+///
+/// This number *is* the detection latency: a sleeping task notices a monitor
+/// at the first poll after the electrical event, so the delay is between zero
+/// and one interval (plus whatever scheduling delay the task sees -- nothing
+/// here is a real-time guarantee).  Two hundred and fifty milliseconds is four
+/// uncached reads a second of two always-on registers, against a delay nobody
+/// watching a screen would notice.
+///
+/// The alternative considered and not built is a 100 Hz timer callback that
+/// reads `SDEISR` in interrupt context and publishes an edge for a task to act
+/// on.  It buys ten-millisecond resolution at a hundred times the register
+/// traffic, and it adds state two contexts have to agree about, for a
+/// difference no person can see.  The reasoning is written down in
+/// `docs/design/intel-hotplug.md` rather than left in this comment alone,
+/// because "why is it a task and not an interrupt" is the first question a
+/// reader asks.
+const HOTPLUG_POLL_INTERVAL: core::time::Duration = core::time::Duration::from_millis(250);
+
+/// The most transitions the after-boot watch keeps for the debug file.
+///
+/// A connector whose cable makes intermittent contact can produce a transition
+/// on every poll, so an unbounded list would be a way for a loose plug to
+/// exhaust kernel memory.  The most recent [`HOTPLUG_EVENT_LIMIT`] transitions
+/// are kept and the rest are counted, so the file shows both the tail of the
+/// flap and the fact that there was more of it.  This is a bound on what is
+/// *remembered*, not storm mitigation: the work each transition calls for
+/// still happens, because the first thing a flapping connector needs is a log
+/// of the flap (see the design note).
+const HOTPLUG_EVENT_LIMIT: usize = 32;
+
+/// What the after-boot hotplug watch has seen since bring-up, kept for the
+/// debug file.
+///
+/// `None` means the watch never started, which is a different fact from "the
+/// watch is running and has seen nothing"; the two are reported in different
+/// words, because on a machine with no mapped register window the second would
+/// be a claim this kernel cannot make.
+static HOTPLUG: Mutex<Option<HotplugWatch>> = Mutex::new(None);
 
 /// A value as grouped hexadecimal, the way a register dump is written down.
 ///
@@ -183,12 +240,16 @@ pub(crate) fn bring_up_at_boot() {
         return;
     }
 
+    // The devices whose phase-1 power came up, which are the only ones later
+    // steps may touch.
+    let mut powered = Vec::new();
     for (bdf, window) in &windows {
         axlog::info!("intel-gpu: powering up {bdf} (reference section 11 phase 1)");
         match power::bring_up(window) {
             Ok(state) => {
                 state.log();
                 *POWER.lock() = Some(state);
+                powered.push((*bdf, *window));
             }
             Err(error) => {
                 // One line, once, and the sequence stops here: §11 phase 1 is
@@ -211,6 +272,14 @@ pub(crate) fn bring_up_at_boot() {
         let sink = sink::probe_at_boot(&report);
         *SINK.lock() = Some(sink);
     }
+
+    // The after-boot watch starts here and nowhere else.  Every step it depends
+    // on has now run: the window is mapped, the display is powered, hotplug
+    // detection is enabled, and the states the boot step read are in [`SINK`]
+    // to be the baseline.  A machine that reached none of that never gets here
+    // and never polls.
+    #[cfg(target_os = "none")]
+    start_hotplug_watch(&powered);
 }
 
 /// The devices whose register window the probe mapped, with those windows.
@@ -233,6 +302,336 @@ fn mapped_windows() -> alloc::vec::Vec<(pci::Bdf, RegisterWindow)> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// The after-boot hotplug watch.
+//
+// Everything below this line runs *after* the bring-up order, and the whole of
+// its read-and-decide half is a plain function so that a host test can drive
+// the poll, the edge compare and the re-probe through a model of the
+// controller.  Only the thread is a thread, and only the thread is
+// `target_os = "none"`.
+//
+// Nothing here touches a register on the poll path.  The writes this path does
+// make are the re-probe's, and they are phase 2's own: `HPD_ENABLE`, already
+// set, and the GMBUS controller's control registers.  The poll itself writes
+// nothing at all -- `SDEISR` is write-one-to-clear, so a poll that wrote it
+// would destroy the state it came to read.
+// ---------------------------------------------------------------------------
+
+/// One transition the watch saw, and the millisecond it was seen at.
+struct HotplugEvent {
+    /// Milliseconds since the platform's monotonic clock started.  A number
+    /// rather than a formatted duration, because the log line is written where
+    /// the clock is read and the file is rendered much later.
+    millis: u64,
+    transition: hpd::DdiTransition,
+}
+
+/// What the after-boot watch has seen, for the debug file.
+struct HotplugWatch {
+    /// The device whose register window is polled.
+    ///
+    /// One watch follows one device.  A machine with two display devices this
+    /// kernel had mapped would get a watch for the first, and the log says so
+    /// when that happens: two watches would need a report with a heading per
+    /// device, and the target machine has one display function.
+    bdf: Bdf,
+    /// The transitions, oldest first, at most [`HOTPLUG_EVENT_LIMIT`] of them.
+    events: Vec<HotplugEvent>,
+    /// How many transitions were dropped off the front of that list.
+    dropped: u64,
+    /// What the phase-2 probe re-run after the most recent transition found.
+    /// `None` until a transition has happened.
+    last_probe: Option<sink::DeviceSink>,
+}
+
+impl HotplugWatch {
+    fn new(bdf: Bdf) -> Self {
+        Self {
+            bdf,
+            events: Vec::new(),
+            dropped: 0,
+            last_probe: None,
+        }
+    }
+
+    /// Take one pass: keep what changed, and keep the re-probe it called for.
+    ///
+    /// The logging is the caller's and happens before this, outside the lock:
+    /// a console write has no business happening while a lock a debug-file read
+    /// also wants is held.
+    fn record(&mut self, millis: u64, pass: ReconcilePass) {
+        for transition in pass.transitions.iter().flatten() {
+            if self.events.len() == HOTPLUG_EVENT_LIMIT {
+                self.events.remove(0);
+                self.dropped += 1;
+            }
+            self.events.push(HotplugEvent {
+                millis,
+                transition: *transition,
+            });
+        }
+        // A pass produces a re-probe exactly when it produces a transition, so
+        // this is the same condition -- but it is written as its own so that a
+        // pass with no probe cannot silently clear the last one.
+        if let Some(device) = pass.probe {
+            self.last_probe = Some(device);
+        }
+    }
+
+    /// The lines the debug file carries.
+    fn render(&self) -> String {
+        let mut out = alloc::format!(
+            "\n--- hotplug after boot (reference section 11 phase 2.2) ---\nwatching {}: one \
+             SDEISR read every {} ms.  The poll writes no register; a transition re-runs the \
+             phase-2 sink probe.\n",
+            self.bdf,
+            HOTPLUG_POLL_INTERVAL.as_millis(),
+        );
+        if self.events.is_empty() {
+            out.push_str("  no transition since the state the sink step read at boot\n");
+        }
+        for event in &self.events {
+            out.push_str(&alloc::format!(
+                "  {} ms: {}\n",
+                event.millis,
+                event.transition.describe()
+            ));
+        }
+        if self.dropped != 0 {
+            out.push_str(&alloc::format!(
+                "  {} older transitions are not listed: this file keeps the most recent {}\n",
+                self.dropped,
+                HOTPLUG_EVENT_LIMIT,
+            ));
+        }
+        if let Some(device) = &self.last_probe {
+            out.push_str("  the phase-2 sink probe re-run after the last transition:\n");
+            device.render_into(&mut out);
+        }
+        out
+    }
+}
+
+/// What one pass of the watch found.
+struct ReconcilePass {
+    /// The register that refused, when one did.  Never set together with a
+    /// transition: a state that could not be read is not a state that changed.
+    failure: Option<hpd::HpdError>,
+    /// The transitions this pass produced, at most one per DDI.
+    transitions: [Option<hpd::DdiTransition>; 4],
+    /// The phase-2 sink probe, when a transition called for one.
+    probe: Option<sink::DeviceSink>,
+}
+
+impl ReconcilePass {
+    /// How many transitions this pass produced.
+    fn changed(&self) -> usize {
+        self.transitions.iter().flatten().count()
+    }
+}
+
+/// Read the live connect state once, and do what a change calls for.
+///
+/// This is the whole of the watch that is not a thread, and the order is the
+/// point:
+///
+/// 1. One pair of register reads, writing nothing ([`hpd::poll_connect`]).
+/// 2. An edge compare against the state the last answered poll left
+///    ([`hpd::ConnectTracker`]).  A register that did not answer produces
+///    neither an event nor a re-probe: "I could not look" is not "nothing is
+///    there".
+/// 3. Only when something changed, the phase-2 sink probe for this device, in
+///    the context of whatever task called this.  That is why the watch is a
+///    sleeping task and not a timer callback: the step that follows a change
+///    waits on GMBUS and allocates, and neither belongs in an interrupt.
+///
+/// Step 3 is the *same* composition bring-up runs, deliberately.  A monitor
+/// found after boot is probed by the code that probed the one found at boot, so
+/// the two results are comparable and there is one implementation of "find out
+/// what is on this port" instead of two that drift apart.  It reads the EDID
+/// and it writes what phase 2 writes -- `HPD_ENABLE`, already set, and the
+/// GMBUS controller's control registers -- which is not the poll path: the
+/// poll path is step 1, and step 1 wrote nothing.
+///
+/// The re-probe is the *last* thing a pass does, so the transitions a pass
+/// found are logged before the bus work starts and a slow GMBUS transaction
+/// delays the next poll rather than the report of what was seen.
+fn reconcile_once<R: Registers, T: PollTimer>(
+    bdf: Bdf,
+    regs: &R,
+    timer: &T,
+    tracker: &mut hpd::ConnectTracker,
+) -> ReconcilePass {
+    let poll = hpd::poll_connect(regs);
+    let mut transitions = [None; 4];
+    let mut changed = 0;
+    for state in poll.states().into_iter().flatten() {
+        let Some(transition) = tracker.observe(state) else {
+            continue;
+        };
+        // One poll produces at most one state per DDI and each state at most
+        // one transition, so `changed` cannot reach the end of this array.  The
+        // guard is here anyway: a hotplug is no place for an index panic, and
+        // what it would drop is one more line in a report, not a decision.
+        let Some(slot) = transitions.get_mut(changed) else {
+            break;
+        };
+        *slot = Some(transition);
+        changed += 1;
+    }
+    let probe = if changed == 0 {
+        None
+    } else {
+        Some(sink::probe_one(bdf, regs, timer))
+    };
+    ReconcilePass {
+        failure: poll.failure(),
+        transitions,
+        probe,
+    }
+}
+
+/// The baseline the watch starts from: what the sink step already reported.
+///
+/// A watch that reported the state it found on its first poll would be
+/// reporting its own first look as a hotplug.  The sink step read every DDI
+/// once and logged each one, so that reading is the baseline and only a change
+/// from it is an event.  A DDI the boot read could not answer for gets no
+/// baseline, and its first answered poll is adopted in silence -- see
+/// [`hpd::ConnectTracker`], which is where that rule and its reason live.
+fn boot_baseline(report: &sink::SinkReport, bdf: Bdf) -> hpd::ConnectTracker {
+    let mut tracker = hpd::ConnectTracker::new();
+    for device in &report.devices {
+        if device.bdf != bdf {
+            continue;
+        }
+        for status in &device.hotplug {
+            tracker.seed(status.ddi, status.effective_connect());
+        }
+    }
+    tracker
+}
+
+/// Start the after-boot hotplug watch, once, for the first device phase 1
+/// brought up.
+///
+/// The call site is the end of [`bring_up_at_boot`], and the ordering is the
+/// whole of the safety argument for polling: by the time this runs the register
+/// window is mapped, the display is powered, hotplug detection is enabled, and
+/// the states the sink step read are there to be the baseline.  On a machine
+/// with no mapped window [`bring_up_at_boot`] has already returned and nothing
+/// polls at all.
+#[cfg(target_os = "none")]
+fn start_hotplug_watch(powered: &[(Bdf, RegisterWindow)]) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    /// Set once, so that a second call cannot start a second watch: two watches
+    /// would each see the same edge and log it twice.
+    static STARTED: AtomicBool = AtomicBool::new(false);
+
+    if STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some((bdf, window)) = powered.first().copied() else {
+        axlog::info!(
+            "intel-hpd: no display device reached phase 1, so nothing polls the hotplug status \
+             registers after boot"
+        );
+        return;
+    };
+    if powered.len() > 1 {
+        axlog::info!(
+            "intel-hpd: {} display devices came up; the after-boot hotplug watch follows {bdf} \
+             only",
+            powered.len()
+        );
+    }
+    // The baseline is taken before the task starts, and the lock is released
+    // before anything that allocates.
+    let tracker = match &*SINK.lock() {
+        Some(report) => boot_baseline(report, bdf),
+        None => hpd::ConnectTracker::new(),
+    };
+    // Published before the task starts, so the debug file says "watching and
+    // nothing yet" rather than "the watch never started" in the window between
+    // the spawn and the first poll.
+    *HOTPLUG.lock() = Some(HotplugWatch::new(bdf));
+    let name = String::from("intel-hotplug");
+    match axtask::spawn_with_name(move || watch_hotplug(bdf, window, tracker), name) {
+        Ok(_) => axlog::info!(
+            "intel-hpd: watching {bdf} for hotplug: one SDEISR read every {} ms, and the poll \
+             itself writes no register",
+            HOTPLUG_POLL_INTERVAL.as_millis()
+        ),
+        Err(error) => {
+            // Put the state back the way it was: a watch that did not start
+            // must not leave a file claiming one is running.
+            STARTED.store(false, Ordering::Release);
+            *HOTPLUG.lock() = None;
+            axlog::warn!(
+                "intel-hpd: the after-boot hotplug watch could not start, so a monitor plugged in \
+                 after boot will not be noticed: {error:?}"
+            );
+        }
+    }
+}
+
+/// Follow one display device's hotplug state for the rest of the boot.
+///
+/// A task that sleeps, polls and then does the work a change calls for in its
+/// own context.  Everything expensive or blocking -- the sleep, the GMBUS
+/// transactions of the re-probe, the allocation a report line needs -- is on
+/// this side of the boundary, which is the reason the watch is a task rather
+/// than a timer callback.
+#[cfg(target_os = "none")]
+fn watch_hotplug(bdf: Bdf, window: RegisterWindow, mut tracker: hpd::ConnectTracker) {
+    // The failure reported last time, so that a window which does not reach
+    // `SDEISR` is reported once rather than four times a second.
+    let mut reported: Option<hpd::HpdError> = None;
+    loop {
+        if axtask::sleep(HOTPLUG_POLL_INTERVAL).is_err() {
+            // A timer admission that is temporarily exhausted must not stop the
+            // watch; yielding keeps the task live and keeps the loop from
+            // becoming a tight poll, exactly as the PCI input reconcile worker
+            // does.
+            axtask::yield_now();
+        }
+        let pass = reconcile_once(bdf, &window, &MonotonicTimer, &mut tracker);
+        match pass.failure {
+            Some(failure) if reported != Some(failure) => {
+                axlog::warn!(
+                    "intel-hpd: the after-boot watch cannot read the live connect state, so it \
+                     cannot see a monitor arrive: {}",
+                    failure.describe()
+                );
+                reported = Some(failure);
+            }
+            // The same refusal again: already said, and saying it every poll
+            // would fill the log with one line.
+            Some(_) => {}
+            None => reported = None,
+        }
+        if pass.changed() == 0 {
+            continue;
+        }
+        // The clock is read, and the lock is taken, only once there is
+        // something to record.  The lines go to the log before the lock: the
+        // raw words are what a person sees as it happens, and a console write
+        // holds nothing.
+        let millis = axhal::time::monotonic_time_nanos() / 1_000_000;
+        for transition in pass.transitions.iter().flatten() {
+            axlog::info!(
+                "intel-hpd: hotplug at {millis} ms: {}",
+                transition.describe()
+            );
+        }
+        let mut slot = HOTPLUG.lock();
+        let watch = slot.get_or_insert_with(|| HotplugWatch::new(bdf));
+        watch.record(millis, pass);
+    }
+}
+
 /// The report of the boot probe as text.
 pub(crate) fn report_text() -> String {
     let mut text = match &*REPORT.lock() {
@@ -252,6 +651,9 @@ pub(crate) fn report_text() -> String {
     }
     if let Some(sink) = &*SINK.lock() {
         text.push_str(&sink.render());
+    }
+    if let Some(watch) = &*HOTPLUG.lock() {
+        text.push_str(&watch.render());
     }
     text
 }
@@ -335,7 +737,30 @@ fn open_register_window(info: &pci::DeviceInfo, aperture: &'static Aperture) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::hex;
+    use alloc::{format, vec};
+
+    use super::*;
+    use crate::{
+        drm::intel::{
+            gmbus::{
+                Pin,
+                tests::{FakeClock, FakeController, valid_edid},
+            },
+            hpd::Ddi,
+            regs::SDEISR,
+        },
+        test_support::scheduler_test_context,
+    };
+
+    /// A `Bdf` for a display function, for the report lines.
+    fn bdf() -> Bdf {
+        Bdf::new(0, 2, 0)
+    }
+
+    /// A controller with a monitor wired to `pin`, and nothing else attached.
+    fn controller_with_monitor_on(pin: Pin) -> FakeController {
+        FakeController::with_monitor(pin, &valid_edid(0))
+    }
 
     #[test]
     fn hexadecimal_is_grouped_the_way_register_dumps_are() {
@@ -352,5 +777,199 @@ mod tests {
         // And a request for fewer digits than the value needs does not
         // truncate it.
         assert_eq!(hex(0xdead_beef, 4), "0xdead_beef");
+    }
+
+    /// The baseline a watch starts from, for a controller the test owns: the
+    /// states the sink step reported at boot.
+    fn boot_report(controller: &FakeController) -> sink::SinkReport {
+        sink::SinkReport {
+            devices: vec![sink::probe_one(bdf(), controller, &FakeClock::new())],
+        }
+    }
+
+    #[test]
+    fn the_baseline_is_the_state_the_boot_step_already_reported() {
+        let _guard = scheduler_test_context();
+        let controller = controller_with_monitor_on(Pin::DdiC);
+        controller.set_word(SDEISR, Ddi::C.live_bit());
+        let mut tracker = boot_baseline(&boot_report(&controller), bdf());
+
+        // The boot step read DDI C's live bit and logged it, so the first poll
+        // finds the same state and has nothing to report: a watch that reported
+        // its own first look would say a monitor arrived that was there all
+        // along.
+        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
+        assert_eq!(pass.changed(), 0);
+        assert!(pass.probe.is_none(), "no change, no re-probe");
+        assert!(pass.failure.is_none());
+
+        // And the baseline is DDI C's state, not "everything connected":
+        // unplugging the word alone is a transition on DDI C.
+        controller.set_word(SDEISR, 0);
+        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
+        let transition = pass
+            .transitions
+            .iter()
+            .flatten()
+            .next()
+            .expect("a transition");
+        assert_eq!(transition.ddi, Ddi::C);
+        assert!(transition.from);
+        assert!(!transition.state.connected);
+    }
+
+    #[test]
+    fn a_monitor_plugged_in_after_boot_is_seen_and_the_sink_is_probed_again() {
+        let _guard = scheduler_test_context();
+        // Nothing is attached, and the status word agrees.  The monitor's EEPROM
+        // image is loaded from the start, so "plugged in" is only the pin being
+        // wired up and the connect bit being set.
+        let controller = controller_with_monitor_on(Pin::DdiB);
+        controller.detach();
+        let mut tracker = boot_baseline(&boot_report(&controller), bdf());
+        let mut watch = HotplugWatch::new(bdf());
+
+        // A steady state is not an event, and, more than that, it costs the bus
+        // nothing: no GMBUS transaction is started by a poll that found no
+        // change.
+        let transactions = controller.transactions();
+        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
+        assert_eq!(pass.changed(), 0);
+        assert!(pass.probe.is_none());
+        assert_eq!(controller.transactions(), transactions);
+
+        // A monitor arrives: the sink answers on DDI B's DDC pin, and the live
+        // connect bit for DDI B is set.
+        controller.attach(Pin::DdiB);
+        controller.set_word(SDEISR, Ddi::B.live_bit());
+        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
+        assert_eq!(pass.changed(), 1);
+        let transition = pass.transitions.iter().flatten().next().unwrap();
+        assert_eq!(transition.ddi, Ddi::B);
+        assert!(!transition.from);
+        let probe = pass.probe.as_ref().expect("a change re-probes the sink");
+        assert_eq!(probe.monitor, Some(Pin::DdiB));
+
+        watch.record(1234, pass);
+        let text = watch.render();
+        // The report a reader gets has the transition, the raw words it came
+        // from, and the phase-2 result behind it.
+        assert!(text.contains("hotplug after boot"), "{text}");
+        assert!(text.contains(&format!("{} ms:", 1234)), "{text}");
+        assert!(text.contains("DDI B: disconnected -> connected"), "{text}");
+        assert!(
+            text.contains(&format!("SDEISR {:#010x}", Ddi::B.live_bit())),
+            "{text}"
+        );
+        assert!(text.contains("SOUTH_CHICKEN1 0x00000000"), "{text}");
+        assert!(
+            text.contains("the phase-2 sink probe re-run after the last transition"),
+            "{text}"
+        );
+        assert!(text.contains("monitor on pin 2"), "{text}");
+
+        // And the same poll again is not an event, which is the whole of "the
+        // same read twice is not a hotplug".
+        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
+        assert_eq!(pass.changed(), 0);
+
+        // Unplugged: the other edge, probed again, and the report says the sink
+        // is gone.
+        controller.detach();
+        controller.set_word(SDEISR, 0);
+        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
+        assert_eq!(pass.changed(), 1);
+        let transition = pass.transitions.iter().flatten().next().unwrap();
+        assert!(transition.from);
+        assert!(!transition.state.connected);
+        assert!(pass.probe.as_ref().unwrap().monitor.is_none());
+        watch.record(2000, pass);
+        let text = watch.render();
+        assert!(text.contains("DDI B: connected -> disconnected"), "{text}");
+        assert!(text.contains("no monitor"), "{text}");
+        // The log line for the first transition is still there: the file keeps
+        // the history, not only the last state.
+        assert!(text.contains("DDI B: disconnected -> connected"), "{text}");
+    }
+
+    #[test]
+    fn a_poll_that_cannot_read_the_registers_does_nothing_and_says_why_once() {
+        let _guard = scheduler_test_context();
+        let controller = FakeController::bare();
+        controller.detach();
+        controller.set_window_len(0x1000);
+        let mut tracker = boot_baseline(&boot_report(&controller), bdf());
+        let mut watch = HotplugWatch::new(bdf());
+
+        // The window does not reach the hotplug block: no state, no event, no
+        // re-probe, and a reason named by register.
+        let transactions = controller.transactions();
+        let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
+        assert_eq!(pass.changed(), 0);
+        assert!(pass.probe.is_none());
+        assert_eq!(controller.transactions(), transactions);
+        let failure = pass.failure.expect("a read that failed must be named");
+        assert!(
+            failure.describe().contains("SDEISR"),
+            "{}",
+            failure.describe()
+        );
+
+        // Nothing is recorded, so the file says the watch is running and has
+        // seen nothing -- not that a monitor came or went.
+        assert!(pass.probe.is_none());
+        watch.record(0, pass);
+        let text = watch.render();
+        assert!(text.contains("no transition"), "{text}");
+        assert!(!text.contains(" -> "), "{text}");
+    }
+
+    #[test]
+    fn the_event_list_is_bounded_and_counts_what_it_dropped() {
+        let _guard = scheduler_test_context();
+        let controller = FakeController::bare();
+        controller.detach();
+        let mut tracker = boot_baseline(&boot_report(&controller), bdf());
+        let mut watch = HotplugWatch::new(bdf());
+
+        // A connector that makes and breaks contact on every poll.  What is
+        // kept is bounded; what is counted is not, so the file says both what
+        // happened last and that there was more of it.
+        for step in 0..(HOTPLUG_EVENT_LIMIT + 3) {
+            let connected = step % 2 == 0;
+            controller.set_word(SDEISR, if connected { Ddi::B.live_bit() } else { 0 });
+            let pass = reconcile_once(bdf(), &controller, &FakeClock::new(), &mut tracker);
+            assert_eq!(pass.changed(), 1, "step {step}");
+            watch.record(step as u64, pass);
+        }
+        assert_eq!(watch.events.len(), HOTPLUG_EVENT_LIMIT);
+        assert_eq!(watch.dropped, 3);
+        let text = watch.render();
+        assert!(
+            text.contains("3 older transitions are not listed"),
+            "{text}"
+        );
+        // The most recent one is kept, so the file ends on the current state.
+        assert!(
+            text.contains(&format!("{} ms: DDI B: ", HOTPLUG_EVENT_LIMIT + 2)),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_watch_that_has_seen_nothing_says_that_rather_than_nothing_at_all() {
+        // Nothing in this test touches the statics: the file's hotplug section
+        // is produced by `HotplugWatch`, and a watch that does not exist
+        // produces no section at all.  What the test pins down is that "no
+        // section" and "a section saying nothing happened" are different texts,
+        // which is why the watch publishes itself before its first poll.
+        let watch = HotplugWatch::new(bdf());
+        let text = watch.render();
+        assert!(
+            text.contains("no transition since the state the sink step read at boot"),
+            "{text}"
+        );
+        assert!(text.contains("every 250 ms"), "{text}");
+        assert!(text.contains("The poll writes no register"), "{text}");
     }
 }

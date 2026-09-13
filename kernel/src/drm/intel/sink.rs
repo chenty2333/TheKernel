@@ -64,6 +64,37 @@ pub(crate) struct SinkReport {
     pub(crate) devices: Vec<DeviceSink>,
 }
 
+impl DeviceSink {
+    /// This device's lines, as the boot report writes them.
+    ///
+    /// Split out of [`SinkReport::render`] because a phase-2 probe is no longer
+    /// only a boot step: the after-boot hotplug watch re-runs
+    /// [`probe_one`] for the device whose connect state changed, and the result
+    /// has to read the same way in the debug file as the boot result did.
+    /// Rendering it in one place is what keeps the two comparable.
+    pub(crate) fn render_into(&self, out: &mut String) {
+        out.push_str(&format!("display {}:\n", self.bdf));
+        out.push_str(&self.pins.render());
+        if let Some(extension) = &self.extension {
+            out.push_str(&format!("  extension block: {}\n", extension.describe()));
+        }
+        if let Some(plan) = &self.plan {
+            out.push_str(&format!(
+                "  mode layer chose {} ({:?}{})\n",
+                plan.selection.mode,
+                plan.selection.reason,
+                if plan.strict { "" } else { ", lenient parse" }
+            ));
+        }
+        for status in &self.hotplug {
+            out.push_str(&format!("  {}\n", status.describe()));
+        }
+        for (ddi, error) in &self.hotplug_errors {
+            out.push_str(&format!("  {ddi}: {}\n", error.describe()));
+        }
+    }
+}
+
 impl SinkReport {
     /// The same text the log carries, for `/sys/kernel/debug/dri/0/intel_gpu`.
     ///
@@ -75,25 +106,7 @@ impl SinkReport {
         }
         let mut out = String::from("\n--- the sink (reference section 11 phase 2) ---\n");
         for device in &self.devices {
-            out.push_str(&format!("display {}:\n", device.bdf));
-            out.push_str(&device.pins.render());
-            if let Some(extension) = &device.extension {
-                out.push_str(&format!("  extension block: {}\n", extension.describe()));
-            }
-            if let Some(plan) = &device.plan {
-                out.push_str(&format!(
-                    "  mode layer chose {} ({:?}{})\n",
-                    plan.selection.mode,
-                    plan.selection.reason,
-                    if plan.strict { "" } else { ", lenient parse" }
-                ));
-            }
-            for status in &device.hotplug {
-                out.push_str(&format!("  {}\n", status.describe()));
-            }
-            for (ddi, error) in &device.hotplug_errors {
-                out.push_str(&format!("  {ddi}: {}\n", error.describe()));
-            }
+            device.render_into(&mut out);
         }
         out
     }
