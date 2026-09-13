@@ -165,6 +165,102 @@ result.
 
 ---
 
+## 0.3 Empirical results — the acceptance oracle and suite (items 13–16)
+
+Same instrument as §0.2: the `firmware-fb` profile, no virtio-gpu, a 1280×800 bochs
+surface, and a QMP `screendump` gated on a console line. `feat/fbcon-verify`, based on
+`feat/baremetal-boot` at `5e09089e`.
+
+**Result 7 — the screen can be read back, and it says what the kernel logged.** Decoding a
+screendump cell by cell with the kernel's own generated font
+(`kernel/src/pseudofs/dev/console_font/glyphs.rs`) recovered the boot log:
+
+```
+31|<6>[0.379222 cpu=Some(2) tid=Some(2) INFO target=thekernel_kernel::pseudofs module=thekernel_kernel::pseudofs] Mounted tmpfs at FsPath([47, 100, 101, 118, 47, 1
+36|<6>[0.387974 cpu=Some(2) tid=Some(2) INFO target=thekernel_kernel::pseudofs module=thekernel_kernel::pseudofs] Mounted proc at FsPath([47, 112, 114, 111, 99])
+37|<6>[0.396903 cpu=Some(2) tid=Some(2) INFO target=thekernel_kernel::pseudofs module=thekernel_kernel::pseudofs] Mounted sysfs at FsPath([47, 115, 121, 115])
+47|<6>[0.442961 cpu=Some(0) tid=Some(32) INFO target=thekernel_kernel::task::user module=thekernel_kernel::task::user] Enter user space: ip=0x401dc0, sp=0x7ffeffff
+```
+
+This is the acceptance condition of §6.4 in literal form: the kernel's own log, on the
+firmware framebuffer, of a machine with no display driver. The decode is evidence tooling,
+not the oracle — see result 10 for why the committed oracle does not do it.
+
+**Result 8 — a screendump gated on a serial marker is a frame behind, so "present" must be
+asserted, not assumed.** At the first KTAP marker the screen held kernel-log-mirror records
+only; not one character of the guest's own output was on it, even though `Console::write`
+(`kernel/src/pseudofs/dev/tty/ntty.rs:91-100`) mirrors userspace output into the same cells.
+The cause is not a routing gap but the deferred repaint: `fbcon::write` only records cells
+and `trailing_present` repaints on its own schedule, while the serial marker is written a
+few instructions earlier. A gate that screenshots on the marker and accepts whatever is
+there photographs the *previous* repaint, and never tests the path the marker came from.
+
+The lag is not marginal. With the marker on `# THEKERNEL_TEST_BEGIN 1 mounts`, the first
+frame that actually showed the KTAP lines arrived while the guest was already running its
+sixth case (`memory-pressure`), on a 1280×800 surface under TCG. The fix is to assert the
+lines rather than hope: `QmpConsoleLine` expectations are matched cell for cell, a missing
+line is a retryable frame mismatch, and the runner's existing screendump loop therefore
+waits for the console to present the text before the run is allowed to stop. That frame,
+decoded with the kernel's own font, reads with **0 unmatched cells**:
+
+```
+02|KTAP version 1
+04|# THEKERNEL_TEST_BEGIN 1 mounts timeout_seconds=60
+05|<6>[0.834545 cpu=Some(2) tid=Some(36) INFO target=thekernel_kernel::task::user ...] Enter user space: ip=0x4633b6, sp=0x7ffef3c9
+07|<6>[0.872622 cpu=Some(2) tid=Some(36) INFO target=thekernel_kernel::task::ops ...] Task(36, init) exit with code: 0
+09|# THEKERNEL_TEST_END 1 mounts result=0
+10|ok 1 - mounts
+42|ok 5 - procfs
+48|# memory-pressure: THEKERNEL_MM_PRESSURE_BEGIN
+```
+
+Userspace output and the kernel's own log, interleaved in the order they happened, on a
+screen belonging to a machine with no display driver. That is the acceptance condition with
+nothing assumed.
+
+**Result 9 — the oracle fails on a real bad image.** Verdicts from the committed oracle
+(`tools/qemu_runner/process.py`) on the real screendump of result 8 and on copies of it.
+Each copy keeps the PPM header, so every one of them is a well-formed image of the right
+size:
+
+| Image | Verdict |
+|---|---|
+| the real screendump | accepted: 160×50 cells, 3613 inked cells, 55864 ink pixels, 0 foreign, 0 outside the grid, 0 on a cell border |
+| blanked to background | rejected: `does not show the expected console text: 'guest userspace: KTAP banner', 'guest userspace: the gated marker line', 'kernel log mirror: task entry' (… 0 inked cells, 0 ink pixels …)` |
+| shifted one pixel right | rejected: same missing text, `(… 1058 on a cell border)` |
+| repainted by a `u32`-per-pixel writer on a 16-bit surface | rejected: same missing text, `(… 77199 foreign pixels)` |
+
+The last row is §0.2 result 3's bug reproduced on a real frame, and it is the class a
+blank/not-blank check accepts: that frame is busy and colourful. The third row is the one
+the colours cannot see, and it is why the oracle carries the font's border invariant. That
+the blank frame is rejected for missing *text* rather than for missing ink is the point of
+result 8: the assertion is what must be on the screen, not merely that something is.
+
+**Result 10 — what the oracle deliberately cannot see.** It asserts structure and declared
+lines, not a rendering. A frame in which every glyph were replaced by a different glyph of
+the same size and colour would pass, and so would a font whose bitmaps changed under a
+still-passing cell-border invariant. Catching that means comparing the whole screen against
+a rendered expectation, which is a different test with a different failure mode (any font
+change becomes a test failure). The declared-line expectations close the practical part of
+that gap: the lines the suite requires are the ones whose absence would mean the acceptance
+condition is not met.
+
+**Result 11 — the run directory has a hard length budget.** The QMP monitor is a unix
+socket inside the run directory and `sun_path` is 108 bytes, so a deep `--workdir` fails as
+`QEMU process I/O failed: QMP control failed: AF_UNIX path too long` part-way through a
+boot — which the runner reports as a missing completion marker, several layers from the
+cause. `fbcon_suite_cmd` now measures the prospective socket path and refuses a workdir
+that leaves no room, naming the byte count and the offending directory.
+
+**Result 12 — the daily tier's stage cannot be run by `verify --tier daily` on this host.**
+`verify` asserts the development image first (`dev-env/check-image.sh`) and fails with
+`missing required command: bison` (and `flex`); CI runs the tier inside
+`scripts/dev-shell.sh`. The tier was therefore reproduced stage by stage with the real
+`tools.verification.plan` and `verify.execute`, substituting only that image assertion; the
+substitution is printed in the transcript.
+
+---
+
 ## 0. Executive summary — the five findings that change the design
 
 1. **An fbcon already exists, but it is hard-wired to DRM.** `kernel/src/pseudofs/dev/tty/fbcon.rs`
@@ -2181,12 +2277,13 @@ non-DRM provider. 8 is independent of 5–7 and can land in parallel, but the ac
 10 must land before any hardware trial. 11 is a safety net for 10 failing.
 
 **State at the time of writing** — items 1, 2, 3, 4, 5, 6, 7, 8, 9, 12 and 17 are
-implemented and committed on `feat/baremetal-boot`; items 10, 11 and 13–16 are not. Every
-implemented item has host tests, and items 5–9 were additionally confirmed by booting the
-`firmware-fb` profile and reading a QMP screendump (§0.2). Nothing is verified on the
-N305.
+implemented and committed on `feat/baremetal-boot`; items 13–16 are implemented and
+committed on `feat/fbcon-verify`, which is based on that branch. Every implemented item has
+host tests, and items 5–9 were additionally confirmed by booting the `firmware-fb` profile
+and reading a QMP screendump (§0.2). Items 13–16 are confirmed the same way, with the
+results recorded in §0.3. Nothing is verified on the N305.
 
-Two items were **deliberately not done** as specified, for reasons the build settled:
+Four items were **deliberately not done as specified**, for reasons the build settled:
 
 - **Item 10 (`gfxmode`/`gfxpayload=keep`) is dropped.** §0.1 correction 1 shows GRUB emits
   the type-8 tag without either directive, so the stated rationale is void. Pinning a mode
@@ -2197,6 +2294,21 @@ Two items were **deliberately not done** as specified, for reasons the build set
   diagnostic *about* the missing tag; it is the log reaching the screen at all. The `info!`
   in `primary_scanout` for each of the two paths, plus the explicit
   `No scanout surface available; /dev/fb0 is not published`, covers the same ground.
+- **Item 13's glyph-bitmap comparison is not what was built.** The oracle compares the
+  framebuffer against the console's *cell grid*: ink and background are the only colours
+  present, no ink falls outside the declared cells, no ink lands on a cell border, the ink
+  floors are met, and each declared console line is matched cell for cell. Glyph bitmaps
+  are used for the line expectations, but they are read from the kernel's generated table
+  (`tools/qemu_runner/console_font.py`) rather than re-encoded in the test, so a font change
+  moves both sides together. §6.4's "minimal first version" — assert only that the image is
+  800×600 and non-black — was not used; it cannot see the bug this oracle exists for.
+- **Item 14's guest-written marker is not what was built.** §6.4 step 3 planned a tiny
+  rootfs whose `init` writes a fixed string. The kernel-log mirror makes that unnecessary:
+  the screen shows the kernel's own log with no guest cooperation, so the suite boots the
+  ordinary system image and gates on the KTAP lines the guest already prints. Item 16's
+  "static assertion that the guest writes the expected marker" survives as a host test that
+  matches `FBCON_MARKER` against the printf in `tests/guest/system-init.c`, which is what
+  catches a marker drift before a boot can burn a run on it.
 
 **Explicitly out of scope (documented as follow-ups):** write-combining via `IA32_PAT`
 (§2.4 Option 2), a DRM `DisplayAdapter` for the firmware framebuffer so

@@ -866,6 +866,18 @@ def fbcon_suite_cmd(args: argparse.Namespace) -> int:
     validate_storage(runs)
     runs.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="fbcon-", dir=runs))
+    # The runner's QMP monitor is a unix socket inside the run directory, and a
+    # unix socket path is bounded by sun_path (108 bytes here).  A deep
+    # --workdir otherwise surfaces as an opaque "QEMU process I/O failed"
+    # halfway through a boot, so say what is wrong while it is still a
+    # one-word fix.
+    monitor = directory / "graphics-smoke.qmp"
+    if len(str(monitor)) >= 108:
+        raise ProductError(
+            f"fbcon run directory leaves no room for the QMP monitor socket: "
+            f"{monitor} is {len(str(monitor))} characters and the kernel limit is 107; "
+            f"use a shorter --workdir than {runs}"
+        )
     result = run_product(
         artifacts,
         RunSpec(

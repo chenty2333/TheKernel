@@ -124,6 +124,25 @@ class FbconSuiteContractTests(unittest.TestCase):
         with self.assertRaisesRegex(module.ProductError, "boots the system profile"):
             module.fbcon_suite_cmd(args)
 
+    def test_a_workdir_that_leaves_no_room_for_the_qmp_socket_is_refused(self) -> None:
+        """A unix socket path is bounded, and the failure is opaque otherwise."""
+
+        module = self.module
+        with test_tmpdir() as directory:
+            deep = Path(directory)
+            while len(str(deep)) < 130:
+                deep = deep / "nested-workdir"
+            args = SimpleNamespace(
+                accel="tcg", smp=4, memory="512M", profile="system", no_build=True,
+                timeout=240.0, asid_fast_switch=False, m5_candidate=False,
+                io_submit_batch=False, io_notify_fastpath=False, run_cpus=None,
+                workdir=str(deep), graphics_profile="firmware-fb",
+                screenshot=str(Path(directory) / "console.ppm"), qemu_debug=None,
+            )
+            with mock.patch.object(module, "fbcon_artifacts", return_value=None), \
+                 self.assertRaisesRegex(module.ProductError, "QMP monitor socket"):
+                module.fbcon_suite_cmd(args)
+
     def test_missing_artifacts_name_the_memory_size_that_was_built(self) -> None:
         """A `make build` at its own default must not produce a confusing boot.
 
