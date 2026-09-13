@@ -255,9 +255,19 @@ skips the check entirely.
   field by field from named fields (`fixtures.rs`), table integrity and exact
   value tests, CVT reference timings and the 28 DMT CVT rows, selection policy
   cases, and a 4000-case structured-random corpus that must never panic and
-  must leave every accepted mode well formed.
+  must leave every accepted mode well formed.  Result on the committed tree:
+  `ok. 1932 passed; 0 failed`, of which 63 are under `drm::modes::*` (the
+  suite had 1869 tests before this component).
+* `tools/thekernel.py test --suite guest` boots the product kernel and runs the
+  system test: green (exit 0, `THEKERNEL_SYSTEM_TEST_COMPLETE`).
 * `tools/thekernel.py lint --smp 4 --memory 512M` runs clippy for the product
-  configuration.
+  configuration: exit 0, no warnings from `drm/modes/**`.
+* The tests were shown to fail on a wrong parser and a wrong table, not merely
+  asserted to be capable of it: raising DMT 0x04's pixel clock by 100 kHz (0.4%,
+  the "blank screen" class of error) failed four tests - and *not* the table
+  integrity test, whose tolerance is the standard's rounded refresh label,
+  which is exactly why the exact-value tests exist - and reading the CTA-861
+  revision from byte 0 instead of byte 1 failed the CTA extension test.
 * The tables' fidelity rests on the entry-by-entry cross-check described in
   section 4; no real monitor's EDID was available to this work, and the guest
   suite boots QEMU rather than the target machine, so the end-to-end path

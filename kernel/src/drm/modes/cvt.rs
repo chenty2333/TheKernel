@@ -121,7 +121,7 @@ pub fn generate(request: CvtRequest) -> Option<Mode> {
 
     let period_ps = PS_PER_MILLIHERTZ / u64::from(refresh_millihz);
 
-    let (h_blank, h_sync, h_front, v_blank, v_sync_bp, v_front, total_pixels, clock_khz) =
+    let (h_blank, h_sync, h_front, v_blank, v_front, total_pixels, clock_khz) =
         if !reduced {
             // Standard blanking: estimate the line period from the frame
             // period minus the minimum vertical sync plus back porch, then
@@ -162,7 +162,6 @@ pub fn generate(request: CvtRequest) -> Option<Mode> {
                 h_sync,
                 h_front,
                 v_blank,
-                v_sync_bp,
                 v_blank - v_sync_bp,
                 total_pixels,
                 clock_khz,
@@ -201,7 +200,6 @@ pub fn generate(request: CvtRequest) -> Option<Mode> {
                 RB_H_SYNC,
                 h_front,
                 v_blank,
-                v_sync_bp,
                 v_blank - v_sync_bp,
                 total_pixels,
                 clock_khz,
@@ -249,9 +247,9 @@ fn vertical_sync_width(hactive: u64, vactive: u64) -> u64 {
         5
     } else if vactive * 16 / 10 == hactive {
         6
-    } else if vactive % 4 == 0 && vactive * 5 / 4 == hactive {
-        7
-    } else if vactive * 15 / 9 == hactive {
+    } else if (vactive.is_multiple_of(4) && vactive * 5 / 4 == hactive) || vactive * 15 / 9 == hactive
+    {
+        // 5:4 and 15:9 share a sync width, as the standard's table shows.
         7
     } else {
         10
