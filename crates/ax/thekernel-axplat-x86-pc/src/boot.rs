@@ -37,9 +37,20 @@ const MULTIBOOT2_HEADER_ARCH: u32 = 0;
 pub(crate) const MULTIBOOT2_BOOTLOADER_MAGIC: usize = 0x36D7_6289;
 
 // Header (16 bytes), address tag (24 bytes), entry tag (16 bytes including
-// alignment padding), and end tag (8 bytes).
+// alignment padding), framebuffer request tag (20 bytes), and end tag
+// (8 bytes).
+//
+// The framebuffer tag is a *request*, not a description: it tells the
+// bootloader that this kernel wants a linear framebuffer and can use one.
+// It has to be present because the tag the kernel *reads* (type 8, the
+// framebuffer information the bootloader reports) is only supplied to a kernel
+// that asked for a graphical console.  Without this, GRUB 2.12 defaults to EGA
+// text, concludes no usable console exists, prints `WARNING: no console will
+// be available to OS`, and the framebuffer tag arrives only because its EFI
+// path fills the video parameters unconditionally.  Where that path is
+// compiled out, the same header would boot a machine with no console at all.
 #[cfg(all(not(test), target_os = "none"))]
-const MULTIBOOT2_HEADER_LENGTH: u32 = 16 + 24 + 16 + 8;
+const MULTIBOOT2_HEADER_LENGTH: u32 = 16 + 24 + 16 + 20 + 8;
 #[cfg(all(not(test), target_os = "none"))]
 const MULTIBOOT2_HEADER_CHECKSUM: u32 = 0u32.wrapping_sub(
     MULTIBOOT2_HEADER_MAGIC

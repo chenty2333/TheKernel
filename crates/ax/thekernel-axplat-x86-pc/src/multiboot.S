@@ -48,6 +48,28 @@ multiboot2_header:
     .int    _start - {offset}                   # entry_addr
     .int    0                                   # padding
 
+    # Framebuffer request tag (type 5).  This is what makes the bootloader hand
+    # the kernel a linear framebuffer at all: a kernel that does not ask for a
+    # graphical console does not get a type-8 framebuffer tag back, and on this
+    # machine the screen is the only place the kernel can say anything.
+    #
+    # Width, height and depth are zero with the optional flag clear, which asks
+    # GRUB for a mode of its own choosing rather than a specific one.  Naming a
+    # mode here would be a guess about a monitor nobody has seen; GRUB can ask
+    # the firmware for the modes this display actually supports, and the kernel
+    # only ever reads back what it was given.  The kernel also cannot draw
+    # anything at a depth it did not anticipate, but it does not have to: it
+    # accepts 32, 24 and 16 bits per pixel and refuses the rest with a log line.
+    #
+    # Size 20 makes the next tag land at 4 mod 8, which is already where the
+    # four-byte pad above left it, so no further alignment is needed.
+    .short  5                                   # type
+    .short  0                                   # flags (0 = required, 1 = optional)
+    .int    20                                  # size
+    .int    0                                   # width: no preference
+    .int    0                                   # height: no preference
+    .int    0                                   # depth: no preference
+
     .short  0                                   # end tag type
     .short  0                                   # end tag flags
     .int    8                                   # end tag size
