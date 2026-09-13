@@ -3358,6 +3358,7 @@ dependencies = [
  "spin 0.10.1",
  "thekernel-axalloc",
  "thekernel-axcpu",
+ "thekernel-axgpu",
  "thekernel-axplat-x86-pc",
  "thekernel-page-table-multiarch",
 ]

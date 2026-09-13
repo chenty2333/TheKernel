@@ -14,6 +14,7 @@ extern crate std;
 
 mod atomic;
 mod fence;
+mod format;
 mod property;
 mod resource;
 mod scanout;
@@ -24,6 +25,7 @@ pub use atomic::{
     PresentationState,
 };
 pub use fence::{Fence, Reservation};
+pub use format::{ColorChannel, PixelLayout};
 pub use property::{Property, PropertyKind, PropertyValue};
 pub use resource::{ResourceDescriptor, ResourceError, ResourceHandle, ResourceProvider};
 pub use scanout::{DisplayLimits, Mode, ScanoutId};
