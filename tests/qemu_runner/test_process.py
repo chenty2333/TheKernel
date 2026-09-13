@@ -19,6 +19,17 @@ from unittest.mock import patch
 from tools.qemu_runner.model import Interaction, QmpCheckpoint, QmpColorBlock, QmpPciHotplug, RunLimits
 from tools.qemu_runner.process import ProcessError, run_process, _pin_vcpu_threads, _QmpController, _ShellConsoleFilter
 
+# How long the signal tests wait for two fresh Python interpreters to start and
+# then to tear themselves down.  Both bounds are hang detectors, not latency
+# claims: what the tests assert is that a signalled runner reaps its child and
+# runs its `finally` cleanup, and that a broken one never returns at all.  The
+# repository's verification runs on a machine that may be executing a dozen
+# other test suites at the same time, where interpreter startup has been
+# measured past eight seconds; a bound tight enough to fail there would report
+# the machine's load as a regression in this code.
+STARTUP_BOUND_SECONDS = 30
+TEARDOWN_BOUND_SECONDS = 60
+
 
 class ProcessTests(unittest.TestCase):
     def test_diagnostics_cannot_satisfy_console_success_marker(self):
@@ -71,7 +82,7 @@ class ProcessTests(unittest.TestCase):
                 )
                 child_pid = None
                 try:
-                    deadline = time.monotonic() + 5
+                    deadline = time.monotonic() + STARTUP_BOUND_SECONDS
                     while time.monotonic() < deadline:
                         if pid_path.exists() and pid_path.read_text():
                             child_pid = int(pid_path.read_text())
@@ -80,7 +91,7 @@ class ProcessTests(unittest.TestCase):
                         time.sleep(0.01)
                     self.assertIsNotNone(child_pid, "child did not start")
                     runner.send_signal(signum)
-                    _, stderr = runner.communicate(timeout=8)
+                    _, stderr = runner.communicate(timeout=TEARDOWN_BOUND_SECONDS)
                     self.assertEqual(runner.returncode, 128 + signum, stderr.decode())
                     self.assertEqual(cleanup_path.read_text(), "cleaned")
                     with self.assertRaises(ProcessLookupError):
@@ -163,7 +174,7 @@ class ProcessTests(unittest.TestCase):
             with patch("tools.qemu_runner.process.signal.signal") as install:
                 thread = threading.Thread(target=run)
                 thread.start()
-                thread.join(timeout=5)
+                thread.join(timeout=TEARDOWN_BOUND_SECONDS)
                 self.assertFalse(thread.is_alive())
                 install.assert_not_called()
             self.assertEqual(errors, [])
