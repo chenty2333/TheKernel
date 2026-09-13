@@ -484,6 +484,15 @@ pub(crate) struct WellObservation {
     pub(crate) control_after: u32,
     /// Whether the state bit was already set before this driver asked.
     pub(crate) already_on: bool,
+    /// Whether the state bit was set when the handshake ended.
+    ///
+    /// [`enable_well`] returns an observation only once the state bit has set,
+    /// so its own answer is always `true`.  The field exists because a caller
+    /// that treats a well which never came up as a finding rather than a
+    /// failure -- reference §11 phase 2.1's caller does -- records it in the
+    /// same shape as one that came up, so that a report has one kind of line
+    /// for a well rather than two.
+    pub(crate) state_set: bool,
     /// The `PG0` poll, which happens only for `PW_1` — `[I915]`
     /// `hsw_power_well_enable` waits for `PG0` only when `pg == SKL_PG1`.
     pub(crate) pg0: Option<FusePoll>,
@@ -500,7 +509,9 @@ impl WellObservation {
             self.index,
             well_request(self.index),
             well_state(self.index),
-            if self.already_on {
+            if !self.state_set {
+                "NEVER CAME UP"
+            } else if self.already_on {
                 "was already on"
             } else {
                 "came up"
@@ -1121,6 +1132,7 @@ pub(crate) fn enable_well(
         control_before,
         control_after: read(regs, well.register)?,
         already_on,
+        state_set: true,
         pg0,
         pg,
         requesters: requesters(regs, well)?,
