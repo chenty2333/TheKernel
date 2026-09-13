@@ -8,7 +8,7 @@
 //! computes.  What no test here can establish: that any of it is accepted by a
 //! Gen12 display engine.  Nothing in this module has run on real hardware.
 
-use alloc::{rc::Rc, vec::Vec};
+use alloc::{format, rc::Rc, vec::Vec};
 use core::cell::Cell;
 
 use super::*;
@@ -84,9 +84,13 @@ fn target_plan() -> OutputProgram {
 /// same register would replace this one and a test that installed one per
 /// thing it believed in would be asserting against a mock that models only the
 /// last of them.
-fn ready_mock() -> MockRegisters {
+///
+/// The registers come from [`port_registers`], so one helper serves both combo
+/// PHYs and the registers it models are the ones the sequence will write.
+fn ready_mock_for(phy: ComboPhy) -> MockRegisters {
+    let registers = port_registers(phy);
     let regs = MockRegisters::new();
-    regs.derive(dpll::DPLL0_ENABLE, |value| {
+    regs.derive(registers.pll_enable, |value| {
         let mut stored = value;
         if value & PLL_POWER_ENABLE != 0 {
             stored |= PLL_POWER_STATE;
@@ -96,17 +100,22 @@ fn ready_mock() -> MockRegisters {
         }
         stored
     });
-    regs.derive(ddi::DDI_BUF_CTL_A, |value| {
+    regs.derive(registers.ddi_buf_ctl, |value| {
         if value & DDI_BUF_CTL_ENABLE != 0 {
             value & !DDI_BUF_CTL_IS_IDLE
         } else {
             value | DDI_BUF_CTL_IS_IDLE
         }
     });
-    regs.derive(regs::ICL_PWR_WELL_CTL_DDI2, |value| {
-        value | power::well_state(power::DDI_IO_A.index)
+    regs.derive(regs::ICL_PWR_WELL_CTL_DDI2, move |value| {
+        value | power::well_state(ddi_io_well(phy).index)
     });
     regs
+}
+
+/// The PHY A mock: DPLL0, `DDI_BUF_CTL(A)` and the DDI-IO A well.
+fn ready_mock() -> MockRegisters {
+    ready_mock_for(ComboPhy::A)
 }
 
 // -- the computed values ----------------------------------------------------
@@ -526,6 +535,255 @@ fn the_idle_poll_waits_for_a_ddi_that_takes_several_polls() {
     assert_eq!(state.ddi_buf_ctl_readback & DDI_BUF_CTL_IS_IDLE, 0);
 }
 
+// -- the second combo PHY ---------------------------------------------------
+//
+// Which combo PHY the monitor is on is not known when this module is written:
+// the connector probe decides it at run time from the EDID read on the GMBUS
+// pin (`Pin::ddi()`), and §8.1 says the rear HDMI may be on either.  So the
+// DDI B / PHY B path is exercised as a sequence of its own rather than as the
+// A path with a different argument.
+
+/// The target mode plans for DDI B, and the plan is DDI B's: PHY B, DPLL1's
+/// port, and the same divider program -- the arithmetic is `pll.rs`'s and does
+/// not depend on which combo PHY the port is on.
+#[test]
+fn combo_phy_b_plans_the_target_mode() {
+    let plan = OutputProgram::plan(&hdmi_request(Ddi::B), STRAP_38_4)
+        .expect("both combo PHYs have their PLL config registers");
+    assert_eq!(plan.ddi, Ddi::B);
+    assert_eq!(plan.phy, ComboPhy::B);
+    assert_eq!(plan.pll_registers, target_plan().pll_registers);
+    assert_eq!(plan.dividers.total_divider(), 12);
+    assert_eq!(plan.dividers.symbol_rate_khz(), 148_500);
+    assert_eq!(plan.ddi_io_well.name, "DDI_IO_B");
+    // The two port-select values carry the DDI, not the PHY (§6.3 routing step
+    // 2 and §8.4: `(port + 1)` in the top bits).
+    assert_eq!(plan.trans_clk_sel, 2 << TRANS_CLK_SEL_PORT_SHIFT);
+    assert_eq!(
+        plan.trans_ddi_func_ctl >> TRANS_DDI_PORT_SHIFT & 0b1111,
+        2,
+        "SELECT_PORT(B)"
+    );
+}
+
+/// The whole phase-5 sequence for DDI B, on the write log: every register is
+/// the B instance, and the transcoder registers are still A's -- §5.1 gives
+/// the PRM's "Transcoders A-D can connect to any DDI", so the transcoder is
+/// the pipe's and the port number rides inside the value.
+#[test]
+fn the_phy_b_write_order_is_the_sequence_with_b_registers() {
+    let regs = ready_mock_for(ComboPhy::B);
+    let plan = OutputProgram::plan(&hdmi_request(Ddi::B), STRAP_38_4).unwrap();
+    let state = program(&regs, &plan).expect("the mock's status bits all behave");
+
+    let names: Vec<&str> = regs.writes().into_iter().map(|(name, _)| name).collect();
+    assert_eq!(
+        names,
+        [
+            // 5.1: power, dividers, enable -- DPLL1's registers.
+            "DPLL1_ENABLE",
+            "DPLL1_CFGCR0",
+            "DPLL1_CFGCR1",
+            "DPLL1_ENABLE",
+            // 5.2: the clock select, then the clock-off clear, in two writes.
+            "ICL_DPCLKA_CFGCR0",
+            "ICL_DPCLKA_CFGCR0",
+            // §8.6 step 5: the port's own DDI-IO power.
+            "ICL_PWR_WELL_CTL_DDI2",
+            // 5.3: §8.5's swing sequence, then the lane power.
+            "PORT_CL_DW5(B)",
+            "PORT_TX_DW5_GRP(B)",
+            "PORT_TX_DW2_GRP(B)",
+            "PORT_TX_DW4_LN0(B)",
+            "PORT_TX_DW4_LN1(B)",
+            "PORT_TX_DW4_LN2(B)",
+            "PORT_TX_DW4_LN3(B)",
+            "PORT_TX_DW7_GRP(B)",
+            "PORT_TX_DW5_GRP(B)",
+            "PORT_CL_DW10(B)",
+            // 5.4, 5.5, 5.6, 5.7: the transcoder is A's, the DDI inside the
+            // values is B's, and the buffer is B's.
+            "TRANS_CLK_SEL(A)",
+            "TRANS_DDI_FUNC_CTL(A)",
+            "PIPECONF_A",
+            "DDI_BUF_CTL(B)",
+        ]
+    );
+    assert_eq!(state.ddi, Ddi::B);
+    assert_eq!(state.ddi_io_well.name, "DDI_IO_B");
+    assert_eq!(state.trans_clk_sel, 2 << TRANS_CLK_SEL_PORT_SHIFT);
+}
+
+/// The DPLL1 config pair is written at DPLL1's addresses and DPLL0's are left
+/// alone, which is the fact the refusal this path used to end in was about.
+///
+/// The mock stores by address, so reading DPLL0's registers back is what makes
+/// "not DPLL0's address" an address-level claim rather than a name-level one.
+#[test]
+fn the_phy_b_plan_writes_the_dpll1_config_addresses_and_not_dpll0s() {
+    // The offsets themselves, against the `[I915]` header region §6.3 cites.
+    assert_eq!(dpll::DPLL0_CFGCR0.offset(), 0x16_4284);
+    assert_eq!(dpll::DPLL0_CFGCR1.offset(), 0x16_4288);
+    assert_eq!(dpll::DPLL1_CFGCR0.offset(), 0x16_428C);
+    assert_eq!(dpll::DPLL1_CFGCR1.offset(), 0x16_4290);
+    assert_ne!(
+        dpll::DPLL1_CFGCR0.offset(),
+        dpll::DPLL0_CFGCR0.offset() + 4,
+        "DPLL1 is not the next dword after DPLL0: the pairs interleave"
+    );
+
+    let regs = ready_mock_for(ComboPhy::B);
+    let plan = OutputProgram::plan(&hdmi_request(Ddi::B), STRAP_38_4).unwrap();
+    program(&regs, &plan).unwrap();
+
+    assert_eq!(regs.write_count(dpll::DPLL1_CFGCR0), 1);
+    assert_eq!(regs.write_count(dpll::DPLL1_CFGCR1), 1);
+    assert_eq!(regs.write_count(dpll::DPLL0_CFGCR0), 0);
+    assert_eq!(regs.write_count(dpll::DPLL0_CFGCR1), 0);
+    assert_eq!(regs.write_count(dpll::DPLL0_ENABLE), 0);
+    let value = |name: &str| {
+        regs.writes()
+            .into_iter()
+            .find(|(written, _)| *written == name)
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| panic!("{name} was never written"))
+    };
+    assert_eq!(value("DPLL1_CFGCR0"), plan.pll_registers.cfgcr0);
+    assert_eq!(value("DPLL1_CFGCR1"), plan.pll_registers.cfgcr1);
+    // The same mode's divider program, byte for byte, as the reference works it
+    // through -- `pll.rs` computed it and only the address changed.
+    assert_eq!(value("DPLL1_CFGCR0"), 0x0010_01D0);
+    assert_eq!(value("DPLL1_CFGCR1"), 0x0000_0E84);
+    // Address level: DPLL0's words are untouched and DPLL1's hold the values.
+    assert_eq!(regs.read(dpll::DPLL0_CFGCR0), Some(0));
+    assert_eq!(regs.read(dpll::DPLL0_CFGCR1), Some(0));
+    assert_eq!(regs.read(dpll::DPLL1_CFGCR0), Some(0x0010_01D0));
+    assert_eq!(regs.read(dpll::DPLL1_CFGCR1), Some(0x0000_0E84));
+}
+
+/// `DPLL1_ENABLE` gets `DPLL0_ENABLE`'s dance: `POWER_ENABLE` and the
+/// `POWER_STATE` poll first, then the dividers, then `PLL_ENABLE` and the
+/// `LOCK` poll.
+#[test]
+fn dpll1_gets_the_power_enable_dance_dpll0_gets() {
+    let regs = ready_mock_for(ComboPhy::B);
+    let plan = OutputProgram::plan(&hdmi_request(Ddi::B), STRAP_38_4).unwrap();
+    let state = program(&regs, &plan).unwrap();
+
+    let writes = regs.writes();
+    let enable_writes: Vec<u32> = writes
+        .iter()
+        .filter(|(name, _)| *name == "DPLL1_ENABLE")
+        .map(|(_, value)| *value)
+        .collect();
+    assert_eq!(enable_writes.len(), 2, "one power write, one enable write");
+    assert_eq!(
+        enable_writes[0] & (PLL_POWER_ENABLE | PLL_ENABLE),
+        PLL_POWER_ENABLE,
+        "the first write must power the block and must not enable it"
+    );
+    assert_eq!(
+        enable_writes[1] & (PLL_POWER_ENABLE | PLL_ENABLE),
+        PLL_POWER_ENABLE | PLL_ENABLE,
+        "the second write enables the PLL and leaves it powered"
+    );
+    let position = |name: &str| {
+        writes
+            .iter()
+            .position(|(written, _)| *written == name)
+            .unwrap_or_else(|| panic!("{name} was never written"))
+    };
+    // The *last* enable write is the one that has to follow the dividers: the
+    // first is the power write, which comes before them.
+    let last_enable = writes
+        .iter()
+        .rposition(|(written, _)| *written == "DPLL1_ENABLE")
+        .unwrap_or_else(|| panic!("DPLL1_ENABLE was never written"));
+    assert!(
+        position("DPLL1_ENABLE") < position("DPLL1_CFGCR0"),
+        "the block is powered before its dividers are loaded"
+    );
+    assert!(
+        position("DPLL1_CFGCR0") < position("DPLL1_CFGCR1"),
+        "CFGCR0 before CFGCR1"
+    );
+    assert!(
+        position("DPLL1_CFGCR1") < last_enable,
+        "the PLL is enabled only after the dividers have landed"
+    );
+    // The run reached the end, so the register's `LOCK` bit was polled and
+    // seen: the mock sets it only when `PLL_ENABLE` is written.
+    assert_eq!(state.pll_enable_readback & PLL_LOCK, PLL_LOCK);
+    assert_eq!(state.pll_enable_readback & PLL_POWER_STATE, PLL_POWER_STATE);
+}
+
+/// The `LOCK` poll on DPLL1 is a poll and not a single read: a PLL whose lock
+/// bit takes a second read after `PLL_ENABLE` must still succeed.
+#[test]
+fn the_dpll1_lock_poll_retries() {
+    let regs = ready_mock_for(ComboPhy::B);
+    // One hook per register: this replaces `ready_mock_for`'s, so the power
+    // state still follows the power write and only LOCK is withheld from the
+    // write path.
+    regs.derive(dpll::DPLL1_ENABLE, |value| value | PLL_POWER_STATE);
+    let reads = Rc::new(Cell::new(0u32));
+    let counter = Rc::clone(&reads);
+    regs.on_read(dpll::DPLL1_ENABLE, move |stored| {
+        if stored & PLL_ENABLE == 0 {
+            return stored;
+        }
+        // Counts only the reads where the enable bit is already set, so the
+        // first `LOCK` poll sees no lock and the second one does.
+        counter.set(counter.get() + 1);
+        if counter.get() >= 2 {
+            stored | PLL_LOCK
+        } else {
+            stored
+        }
+    });
+    let plan = OutputProgram::plan(&hdmi_request(Ddi::B), STRAP_38_4).unwrap();
+    let state = program(&regs, &plan).expect("the second poll locks");
+    assert!(reads.get() >= 2, "the lock poll had to retry");
+    assert_eq!(state.pll_enable_readback & PLL_LOCK, PLL_LOCK);
+}
+
+/// `ICL_DPCLKA_CFGCR0`'s `DDI_CLK_SEL` field carries the **PLL id**, so PHY B's
+/// field selects 1 and PHY A's selects 0, and each PHY's `DDI_CLK_OFF` bit is
+/// its own (§6.3 routing step 1: the field starts at `phy * 2`, two bits wide,
+/// and `DDI_CLK_OFF` is bit 10 for A and 11 for B).
+#[test]
+fn the_clock_select_field_carries_the_pll_id_for_each_phy() {
+    let a = target_plan();
+    let b = OutputProgram::plan(&hdmi_request(Ddi::B), STRAP_38_4).unwrap();
+    assert_eq!(a.dpclka_select, 0, "PHY A selects DPLL0, whose id is 0");
+    assert_eq!(
+        b.dpclka_select,
+        1 << 2,
+        "PHY B selects DPLL1, id 1, at phy*2"
+    );
+    assert_eq!(a.dpclka_clock_off, 1 << 10, "DDI A's clock-off bit");
+    assert_eq!(b.dpclka_clock_off, 1 << 11, "DDI B's clock-off bit");
+
+    // On the wire, with the other PHY's field and the gate bit as firmware
+    // could have left them.
+    let regs = ready_mock_for(ComboPhy::B);
+    regs.set(dpll::ICL_DPCLKA_CFGCR0, (1 << 11) | 0b11);
+    program(&regs, &b).unwrap();
+    let writes: Vec<u32> = regs
+        .writes()
+        .into_iter()
+        .filter(|(name, _)| *name == "ICL_DPCLKA_CFGCR0")
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(writes.len(), 2, "select and clock-off clear are two writes");
+    assert_eq!(writes[0] >> 2 & 0b11, 1, "PHY B's field selects PLL 1");
+    assert_eq!(writes[0] & 0b11, 0b11, "PHY A's field is left alone");
+    assert_eq!(writes[0] & (1 << 11), 1 << 11, "gate still set");
+    assert_eq!(writes[1] >> 2 & 0b11, 1, "select kept");
+    assert_eq!(writes[1] & 0b11, 0b11, "PHY A's field still left alone");
+    assert_eq!(writes[1] & (1 << 11), 0, "gate cleared");
+}
+
 // -- the failures -----------------------------------------------------------
 
 /// `IS_IDLE` never clearing is the failure §11 phase 5.7 gives a field report
@@ -647,29 +905,83 @@ fn a_ddi_that_is_not_a_combo_phy_port_is_refused_before_anything_is_written() {
     );
 }
 
-/// Combo PHY B is refused for the one reason it can be: its PLL's config
-/// registers are not in the register table, because the reference never states
-/// their offsets.
+/// Every register of PHY B's port is declared, and its PLL config pair with it.
+///
+/// This is the check the old refusal was a consequence of: it used to fail on
+/// the missing `DPLL1_CFGCR*`, and the point of asserting the whole set is
+/// that a *different* register going missing on this path would be found here
+/// rather than on the machine.
 #[test]
-fn combo_phy_b_is_refused_for_its_missing_pll_config_registers() {
-    let error = OutputProgram::plan(&hdmi_request(Ddi::B), STRAP_38_4)
-        .expect_err("DPLL1's config offsets are not in the table");
-    match error {
-        OutputError::PllConfigRegisterMissing { phy } => assert_eq!(phy, ComboPhy::B),
-        other => panic!("wrong error: {other:?}"),
-    }
-    let text = error.describe();
-    for needle in ["DPLL1_CFGCR0", "0x164284", "13.4"] {
-        assert!(text.contains(needle), "{needle:?} missing from: {text}");
-    }
-    // The refusal is about the PLL config registers and nothing else: every
-    // other register of B's port is declared.
+fn every_register_of_the_phy_b_port_is_declared() {
     let registers = port_registers(ComboPhy::B);
-    assert!(registers.pll_cfgcr0.is_none());
-    assert!(registers.pll_cfgcr1.is_none());
+    assert_eq!(
+        registers
+            .pll_cfgcr0
+            .expect("DPLL1_CFGCR0 is in regs/dpll.rs")
+            .name(),
+        "DPLL1_CFGCR0"
+    );
+    assert_eq!(
+        registers
+            .pll_cfgcr1
+            .expect("DPLL1_CFGCR1 is in regs/dpll.rs")
+            .name(),
+        "DPLL1_CFGCR1"
+    );
     assert_eq!(registers.pll_enable.name(), "DPLL1_ENABLE");
-    assert_eq!(registers.ddi_buf_ctl.name(), "DDI_BUF_CTL(B)");
+    assert_eq!(registers.pll_enable.offset(), 0x4_6014, "LCPLL2_CTL");
+    assert_eq!(registers.cl_dw5.name(), "PORT_CL_DW5(B)");
     assert_eq!(registers.cl_dw10.name(), "PORT_CL_DW10(B)");
+    assert_eq!(registers.tx_dw2.name(), "PORT_TX_DW2_GRP(B)");
+    assert_eq!(registers.tx_dw5.name(), "PORT_TX_DW5_GRP(B)");
+    assert_eq!(registers.tx_dw7.name(), "PORT_TX_DW7_GRP(B)");
+    assert_eq!(
+        registers.tx_dw4.map(|register| register.name()),
+        [
+            "PORT_TX_DW4_LN0(B)",
+            "PORT_TX_DW4_LN1(B)",
+            "PORT_TX_DW4_LN2(B)",
+            "PORT_TX_DW4_LN3(B)",
+        ]
+    );
+    assert_eq!(registers.ddi_buf_ctl.name(), "DDI_BUF_CTL(B)");
+    // And A's are not B's: the two arms are different registers, not one set
+    // reached twice.
+    let a = port_registers(ComboPhy::A);
+    assert_ne!(a.ddi_buf_ctl.offset(), registers.ddi_buf_ctl.offset());
+    assert_ne!(a.pll_enable.offset(), registers.pll_enable.offset());
+}
+
+/// The refusal for a PLL whose config offsets are not in the table is still
+/// there, and still names what would have to be sourced.
+///
+/// Nothing raises it today -- DPLL0's offsets are in §6.3 and DPLL1's in the
+/// `[I915]` header region §6.3 cites, so both combo PHYs plan -- and the
+/// variant stays because the property it covers is the register table's
+/// completeness rather than this sequence's reach: a third combo PHY added
+/// without a sourced offset must be refused rather than pointed at a
+/// neighbouring address.  This pins the text it would be refused with.
+#[test]
+fn a_phy_without_its_pll_config_offsets_would_still_be_refused_by_name() {
+    for phy in [ComboPhy::A, ComboPhy::B] {
+        let error = OutputError::PllConfigRegisterMissing { phy };
+        let text = error.describe();
+        for needle in ["CFGCR0", "CFGCR1", "13.4", "Nothing was written", "pll.rs"] {
+            assert!(text.contains(needle), "{needle:?} missing from: {text}");
+        }
+        // The text names the PHY and its PLL, so a reader knows which one.
+        assert!(
+            text.contains(&format!("DPLL{}", phy.dpll_index())),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "PHY {}",
+                if phy == ComboPhy::A { "A" } else { "B" }
+            )),
+            "{text}"
+        );
+    }
 }
 
 /// §8.5's HDMI translation values are a `[GAP]`, and the honest implementation
