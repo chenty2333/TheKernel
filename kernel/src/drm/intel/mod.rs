@@ -16,6 +16,7 @@
 //! | [`pci`] | BDF arithmetic, ECAM configuration-space reads, header and BAR decoding |
 //! | [`id`] | the device table: device ids, generations, display versions, steppings, quirks, apertures |
 //! | [`regs`] | the register table, the mapped window, typed 32-bit access and its ordering |
+//! | [`pipe`] | reference section 11 phases 3.4 and 4: the timing registers, the DDB, the watermarks, the primary plane, and the pipe-side read-backs of phase 6 |
 //! | [`probe`] | the walk, the identity decision, the register reads, and the report |
 //! | [`debugfs`] | the report, exposed as a file in the DRM debug filesystem |
 //!
@@ -57,6 +58,7 @@ mod hpd;
 mod id;
 mod pci;
 mod phy;
+mod pipe;
 mod pll;
 mod power;
 mod probe;
