@@ -36,6 +36,18 @@ def plan(tier: str, state: Path) -> list[Stage]:
         Stage("build", "build", (*cli, "build", "--smp", "4", "--memory", "512M"), 1800),
         Stage("lint", "lint", (*cli, "lint", "--smp", "4", "--memory", "512M"), 1800),
         Stage("guest-tcg", "test", (*cli, "test", "--suite", "guest", "--smp", "4", "--memory", "512M", "--accel", "tcg", "--no-build", "--timeout", "300"), 360),
+        # The serial-less acceptance path: the artifacts the build stage just
+        # produced, booted on a profile with no virtio-gpu and no serial port,
+        # so the firmware framebuffer is the only output the kernel has.  The
+        # suite gates its screendump on the first KTAP line and stops there, so
+        # it needs neither the graphics rootfs nor the rest of the system suite
+        # (whose unrelated `sysv-shm` case is intermittent).
+        Stage("firmware-fbcon", "test", (*cli, "test", "--suite", "fbcon", "--smp", "4",
+                                         "--memory", "512M", "--accel", "tcg", "--no-build",
+                                         "--timeout", "240",
+                                         "--graphics-profile", "firmware-fb",
+                                         "--screenshot", str(state / "verify-fbcon/console.ppm"),
+                                         "--workdir", str(state / "verify-fbcon/run")), 300),
     ]
     if tier == "full":
         graphics = state / "verify-graphics"
