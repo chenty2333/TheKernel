@@ -78,6 +78,7 @@ mod probe;
 mod regs;
 pub(crate) mod scanout;
 mod sink;
+mod swing;
 mod timing;
 
 #[cfg(test)]
