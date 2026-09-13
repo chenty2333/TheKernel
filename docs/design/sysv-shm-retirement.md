@@ -117,7 +117,7 @@ exactly the failure the guest case reports. The one-line revert isolates the
 fix itself (same tree, same tool, only the restored call removed); the older
 tree shows the same behaviour on the code the flake was reported against.
 
-A detection power of 20–92% per round in the weakest/strongest variant means a
+A detection power of 20–94% per round in the weakest/strongest variant means a
 regression of the pre-fix kind cannot hide behind the sample sizes below; the
 rate that matters post-fix is not "a few per boot" but "any at all".
 
@@ -192,6 +192,9 @@ SYSV-SHM-STRESS-FIRST-FAIL variant=shared round=1603 kind=child-status errno=128
 SYSV-SHM-STRESS variant=shared rounds=10000 completed=10000 setup_fail=0 child_fail=1 \
   value_fail=0 attach_fail=0 errno_fail=0 retire_early_fail=0 alive_probe=0
 ```
+
+(the line shown is the original revision's; the instrumented one adds
+`grandchild_fail=0` to it)
 
 `errno=1280` is the raw `wait` status: normal exit, code 5, which in
 `round_shared` means "the child's read of the grandchild's attached byte did
@@ -275,10 +278,10 @@ instrumented revision was rebuilt and measured separately (§4.3).
 
 `shared3` (10 boots, 200000 `shared` rounds, the instrumented build with both
 report paths and the fatal-signal handler) produced **no event at all**. That
-is the uncomfortable result rather than the satisfying one: at the observed
-rate of 3 events per 490000 `shared` rounds, a clean 200000-round run happens
-with probability about 29%, so it does not show the anomaly is gone, and the
-anomaly is still unattributed. What the run does establish is that the
+is the uncomfortable result rather than the satisfying one: at the 1.0e-5 per
+round those runs measured, a clean 200000-round run happens about 13% of the
+time (0.5% at the three-sigma bound), so it does not show the anomaly is gone,
+and the anomaly is still unattributed. What the run does establish is that the
 diagnostics cost the variant nothing on the clean path (0 defects, 0 reports,
 `completed == rounds` in every boot) and that a recurrence will now name its
 cause instead of printing `child-status`:
