@@ -27,6 +27,169 @@ const MB2_TAG_MODULE: u32 = 3;
 const MB2_TAG_ACPI_OLD: u32 = 14;
 const MB2_TAG_ACPI_NEW: u32 = 15;
 
+/// Upper bound on the number of Multiboot2 tags retained for diagnostics.
+///
+/// A bare-metal bring-up has to distinguish "the bootloader did not supply a
+/// tag" from "the kernel ignored it": video, EFI and platform tags depend on
+/// the firmware, the bootloader configuration and the machine, none of which
+/// the kernel controls.  Retaining the declared headers makes that answer
+/// available from a single boot instead of a bisect.  The bound is fixed
+/// because the tag list belongs to the bootloader and the inventory must not
+/// allocate before the heap exists.
+pub(crate) const MAX_TAG_INVENTORY: usize = 32;
+
+/// One Multiboot2 tag header exactly as the bootloader declared it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TagRecord {
+    /// Multiboot2 tag type.
+    pub(crate) tag_type: u32,
+    /// Declared tag size in bytes, including the eight-byte tag header.
+    pub(crate) size: u32,
+}
+
+const MB2_TAG_FRAMEBUFFER: u32 = 8;
+
+/// Size of a framebuffer tag up to and including its `reserved` field.
+///
+/// The tag continues with a kind-dependent payload; only the fixed portion is
+/// read unconditionally, so every accessor below is checked against this base
+/// before it reads a field.
+const MB2_FRAMEBUFFER_BASE_SIZE: usize = 32;
+
+/// Framebuffer kind for palette-indexed pixels.
+const MB2_FRAMEBUFFER_INDEXED: u8 = 0;
+/// Framebuffer kind for direct RGB pixels.
+const MB2_FRAMEBUFFER_RGB: u8 = 1;
+/// Framebuffer kind for EGA text cells, which are not pixels at all.
+const MB2_FRAMEBUFFER_TEXT: u8 = 2;
+
+/// Bit position and width of one colour channel inside a pixel.
+///
+/// The position is the index of the channel's least significant bit, which is
+/// what Multiboot2 reports.  Both values are retained rather than reduced to a
+/// shift-and-mask pair because a caller drawing into the surface has to
+/// scale an 8-bit channel into a field that is not necessarily eight bits wide.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ColorField {
+    position: u8,
+    size: u8,
+}
+
+impl ColorField {
+    /// Index of the channel's least significant bit within a pixel.
+    pub fn position(&self) -> u8 {
+        self.position
+    }
+
+    /// Channel width in bits.
+    pub fn size(&self) -> u8 {
+        self.size
+    }
+}
+
+/// A bootloader-supplied linear RGB framebuffer.
+///
+/// Only the direct-RGB kind becomes a `FramebufferInfo`.  An indexed surface
+/// needs a palette this owner deliberately does not retain, and an EGA text
+/// surface addresses character cells rather than pixels; both are reported as
+/// a [`FramebufferRejection`] instead so the kernel can still boot without a
+/// display.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FramebufferInfo {
+    address: u64,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    bpp: u8,
+    red: ColorField,
+    green: ColorField,
+    blue: ColorField,
+}
+
+impl FramebufferInfo {
+    /// Physical address of the first pixel of the first scan line.
+    pub fn address(&self) -> u64 {
+        self.address
+    }
+
+    /// Bytes between the starts of two consecutive scan lines.
+    ///
+    /// This is not necessarily `width * bpp / 8`: firmware frequently pads
+    /// scan lines, and a driver that assumes a tight stride shears the image.
+    pub fn pitch(&self) -> u32 {
+        self.pitch
+    }
+
+    /// Visible width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Visible height in pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Bits per pixel.
+    pub fn bpp(&self) -> u8 {
+        self.bpp
+    }
+
+    /// Red channel layout.
+    pub fn red(&self) -> ColorField {
+        self.red
+    }
+
+    /// Green channel layout.
+    pub fn green(&self) -> ColorField {
+        self.green
+    }
+
+    /// Blue channel layout.
+    pub fn blue(&self) -> ColorField {
+        self.blue
+    }
+
+    /// Bytes actually occupied by the visible surface.
+    ///
+    /// Returns `None` rather than wrapping when the extent cannot be
+    /// represented, so a caller cannot derive a short length and map a window
+    /// smaller than the pixels it is about to write.
+    pub fn byte_len(&self) -> Option<usize> {
+        let stride = usize::try_from(self.pitch).ok()?;
+        let rows = usize::try_from(self.height).ok()?;
+        stride.checked_mul(rows)
+    }
+}
+
+/// Why a framebuffer tag did not produce a usable linear surface.
+///
+/// A missing or unusable framebuffer is not a boot failure: the machine has
+/// simply lost its display.  The reason is retained because on hardware with
+/// no serial port the display *is* the diagnostic channel, and "the tag was
+/// absent" and "the tag was rejected" call for completely different fixes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FramebufferRejection {
+    /// The tag is shorter than its fixed portion.
+    Truncated,
+    /// The declared kind is the palette-indexed one.
+    Indexed,
+    /// The declared kind is EGA text, which addresses character cells.
+    Text,
+    /// The declared kind is not one this kernel knows.
+    UnknownKind(u8),
+    /// The declared geometry, pitch, or colour layout contradicts itself.
+    Inconsistent,
+    /// The declared address is one no display can live at.
+    ///
+    /// A bootloader reports this when it filled in a mode description but
+    /// never actually programmed a display, which is a bootloader
+    /// configuration problem rather than a firmware one.
+    UnusableAddress,
+    /// The declared surface would lie inside memory the kernel may allocate.
+    OverlapsUsableMemory,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BootProtocol {
     Multiboot1,
@@ -95,6 +258,11 @@ pub(crate) struct BootInfo {
     memory_region_count: usize,
     modules: [Option<ModuleInfo>; MAX_MODULES],
     module_count: usize,
+    tags: [TagRecord; MAX_TAG_INVENTORY],
+    tag_count: usize,
+    tags_truncated: bool,
+    framebuffer: Option<FramebufferInfo>,
+    framebuffer_rejection: Option<FramebufferRejection>,
 }
 
 impl BootInfo {
@@ -107,6 +275,14 @@ impl BootInfo {
             memory_region_count: 0,
             modules: [None; MAX_MODULES],
             module_count: 0,
+            tags: [TagRecord {
+                tag_type: 0,
+                size: 0,
+            }; MAX_TAG_INVENTORY],
+            tag_count: 0,
+            tags_truncated: false,
+            framebuffer: None,
+            framebuffer_rejection: None,
         }
     }
 
@@ -128,6 +304,26 @@ impl BootInfo {
 
     pub(crate) fn modules(&self) -> &[Option<ModuleInfo>] {
         &self.modules[..self.module_count]
+    }
+
+    /// Tag headers supplied by the bootloader, in the order they appeared.
+    pub(crate) fn tags(&self) -> &[TagRecord] {
+        &self.tags[..self.tag_count]
+    }
+
+    /// Whether the bootloader supplied more tags than the inventory retains.
+    pub(crate) fn tags_truncated(&self) -> bool {
+        self.tags_truncated
+    }
+
+    /// The linear RGB framebuffer the bootloader handed over, if any.
+    pub fn framebuffer(&self) -> Option<&FramebufferInfo> {
+        self.framebuffer.as_ref()
+    }
+
+    /// Why no usable framebuffer was retained, if the bootloader tried.
+    pub(crate) fn framebuffer_rejection(&self) -> Option<FramebufferRejection> {
+        self.framebuffer_rejection
     }
 }
 
@@ -158,7 +354,53 @@ pub(crate) fn finish_handoff() {
                 .unwrap_or_else(|error| panic!("invalid Multiboot2 information: {error:?}"))
         }
     };
+    report_tag_inventory(&owner);
     BOOT_INFO.init_once(owner);
+}
+
+/// Report the bootloader-supplied tag inventory on the diagnostic channel.
+///
+/// This runs before the immutable owner is published so the evidence survives
+/// a later handoff failure.  It writes to COM2 diagnostics rather than the
+/// COM1 console: the console is the guest-visible TTY path, while this is
+/// platform bring-up evidence, and on a machine without a working console the
+/// diagnostic channel is the only one that can still be read.
+fn report_tag_inventory(info: &BootInfo) {
+    diagnostic_println!(
+        "MB2 tag inventory: protocol={:?} count={} truncated={}",
+        info.protocol(),
+        info.tag_count,
+        info.tags_truncated as u8
+    );
+    for record in info.tags() {
+        diagnostic_println!("MB2 tag type={} size={}", record.tag_type, record.size);
+    }
+    report_framebuffer(info);
+}
+
+/// Report the retained framebuffer, or the reason the bootloader's was declined.
+///
+/// This is the single most load-bearing line of a serial-less bring-up: without
+/// it, "the screen stayed black" has no distinguishable causes.
+fn report_framebuffer(info: &BootInfo) {
+    match (info.framebuffer(), info.framebuffer_rejection()) {
+        (Some(fb), _) => diagnostic_println!(
+            "MB2 framebuffer: addr={:#x} {}x{} bpp={} pitch={} len={:#x} rgb_bits={}/{}/{}",
+            fb.address(),
+            fb.width(),
+            fb.height(),
+            fb.bpp(),
+            fb.pitch(),
+            fb.byte_len().unwrap_or(0),
+            fb.red().size(),
+            fb.green().size(),
+            fb.blue().size(),
+        ),
+        (None, Some(reason)) => {
+            diagnostic_println!("MB2 framebuffer: declined reason={:?}", reason)
+        }
+        (None, None) => diagnostic_println!("MB2 framebuffer: absent"),
+    }
 }
 
 /// Parse an MB2 information block from a physical address, without retaining
@@ -357,6 +599,121 @@ fn module_is_available(module: ModuleInfo, regions: &[RawRange]) -> bool {
     })
 }
 
+/// Whether a physical range avoids every region of usable RAM.
+///
+/// The surface is written through, not merely read, so a range that shares
+/// bytes with allocatable memory would corrupt unrelated allocations once the
+/// allocator starts handing that memory out.
+fn range_is_outside_memory(start: u64, length: u64, regions: &[RawRange]) -> bool {
+    let Some(end) = start.checked_add(length) else {
+        return false;
+    };
+    !regions.iter().any(|&(region_start, region_length)| {
+        let region_start = region_start as u64;
+        region_start
+            .checked_add(region_length as u64)
+            .is_some_and(|region_end| start < region_end && region_start < end)
+    })
+}
+
+/// Validate a framebuffer tag and retain it when it describes a usable surface.
+///
+/// Every field is checked for self-consistency before it is trusted, because
+/// this range is about to become write-only kernel memory: a plausible but
+/// wrong `pitch` or `height` turns console output into arbitrary writes.  The
+/// checks therefore reject only contradictions the tag cannot survive on its
+/// own terms.
+///
+/// One contradiction is deliberately *not* checked here.  Whether the surface
+/// overlaps memory the kernel may allocate is a property of the memory map
+/// rather than of the tag, and the map may not have been seen yet when this
+/// tag arrives.  [`parse_multiboot2_info`] applies that check once the whole
+/// block has been read.
+///
+/// A tag that fails any check is *declined* rather than treated as a boot
+/// error, so losing the display never costs the machine its ability to boot.
+fn parse_framebuffer(tag: &[u8]) -> Result<FramebufferInfo, FramebufferRejection> {
+    if tag.len() < MB2_FRAMEBUFFER_BASE_SIZE {
+        return Err(FramebufferRejection::Truncated);
+    }
+    let address = read_u64(tag, 8).ok_or(FramebufferRejection::Truncated)?;
+    let pitch = read_u32(tag, 16).ok_or(FramebufferRejection::Truncated)?;
+    let width = read_u32(tag, 20).ok_or(FramebufferRejection::Truncated)?;
+    let height = read_u32(tag, 24).ok_or(FramebufferRejection::Truncated)?;
+    let bpp = *tag.get(28).ok_or(FramebufferRejection::Truncated)?;
+    let kind = *tag.get(29).ok_or(FramebufferRejection::Truncated)?;
+
+    match kind {
+        MB2_FRAMEBUFFER_RGB => {}
+        MB2_FRAMEBUFFER_INDEXED => return Err(FramebufferRejection::Indexed),
+        MB2_FRAMEBUFFER_TEXT => return Err(FramebufferRejection::Text),
+        other => return Err(FramebufferRejection::UnknownKind(other)),
+    }
+
+    // An RGB tag always carries six colour-layout bytes.  Their absence means
+    // the tag contradicts itself; the channel order must not be guessed,
+    // because guessing it wrong swaps red and blue on every pixel.
+    let layout = tag
+        .get(MB2_FRAMEBUFFER_BASE_SIZE..MB2_FRAMEBUFFER_BASE_SIZE + 6)
+        .ok_or(FramebufferRejection::Truncated)?;
+    let red = ColorField {
+        position: layout[0],
+        size: layout[1],
+    };
+    let green = ColorField {
+        position: layout[2],
+        size: layout[3],
+    };
+    let blue = ColorField {
+        position: layout[4],
+        size: layout[5],
+    };
+
+    if width == 0 || height == 0 {
+        return Err(FramebufferRejection::Inconsistent);
+    }
+    // A bootloader that describes a mode but never programmed a display
+    // reports a zero base.  Homing the surface at physical zero would write
+    // console output over the real-mode interrupt vector table.
+    if address == 0 {
+        return Err(FramebufferRejection::UnusableAddress);
+    }
+    // The pixel sizes a scanout can be driven with.  15 and 16 share a pixel
+    // size but not a layout, so they stay distinct.
+    if !matches!(bpp, 15 | 16 | 24 | 32) {
+        return Err(FramebufferRejection::Inconsistent);
+    }
+    for field in [red, green, blue] {
+        if field.size == 0 || u16::from(field.position) + u16::from(field.size) > u16::from(bpp) {
+            return Err(FramebufferRejection::Inconsistent);
+        }
+    }
+
+    // A scan line must hold its pixels.  Firmware routinely pads scan lines,
+    // so this is a lower bound: requiring equality would reject valid modes.
+    let minimum_pitch = (u64::from(width) * u64::from(bpp)).div_ceil(8);
+    if u64::from(pitch) < minimum_pitch {
+        return Err(FramebufferRejection::Inconsistent);
+    }
+    if address
+        .checked_add(u64::from(pitch) * u64::from(height))
+        .is_none()
+    {
+        return Err(FramebufferRejection::Inconsistent);
+    }
+
+    Ok(FramebufferInfo {
+        address,
+        pitch,
+        width,
+        height,
+        bpp,
+        red,
+        green,
+        blue,
+    })
+}
+
 /// Parse a complete Multiboot2 information block into an owned `BootInfo`.
 ///
 /// This function is intentionally independent of the physical-memory access
@@ -415,6 +772,20 @@ fn parse_multiboot2_info(bytes: &[u8], info_paddr: usize) -> Result<BootInfo, Pa
         }
         let tag = &bytes[cursor..cursor + tag_size];
 
+        // Record every tag the bootloader declared, including ones this
+        // platform does not interpret.  The inventory is the only evidence
+        // available when a boot on new hardware behaves differently from the
+        // reference machine, and it costs one store per tag.
+        if owner.tag_count < MAX_TAG_INVENTORY {
+            owner.tags[owner.tag_count] = TagRecord {
+                tag_type,
+                size: tag_size as u32,
+            };
+            owner.tag_count += 1;
+        } else {
+            owner.tags_truncated = true;
+        }
+
         match tag_type {
             MB2_TAG_END => {
                 if tag_size != 8 || read_u32(tag, 0) != Some(0) || cursor + 8 != total_size {
@@ -459,6 +830,18 @@ fn parse_multiboot2_info(bytes: &[u8], info_paddr: usize) -> Result<BootInfo, Pa
                     }
                 }
             }
+            // First tag wins.  A bootloader has no reason to describe two
+            // framebuffers, and if it does, the one it listed first is the one
+            // it also programmed the display for.  A later tag falls through
+            // to the catch-all arm instead of overwriting the first verdict.
+            MB2_TAG_FRAMEBUFFER
+                if owner.framebuffer.is_none() && owner.framebuffer_rejection.is_none() =>
+            {
+                match parse_framebuffer(tag) {
+                    Ok(info) => owner.framebuffer = Some(info),
+                    Err(reason) => owner.framebuffer_rejection = Some(reason),
+                }
+            }
             _ => {}
         }
 
@@ -477,6 +860,20 @@ fn parse_multiboot2_info(bytes: &[u8], info_paddr: usize) -> Result<BootInfo, Pa
             return Err(ParseError::ModuleRangeOutsideMemory);
         }
     }
+    // The framebuffer tag is not required to follow the memory map, so the
+    // overlap rule is applied once the whole block has been read rather than
+    // inside the parse arm.  A surface that shares bytes with allocatable
+    // memory is refused rather than used, because the console writes through
+    // it and would otherwise corrupt whatever the allocator places there.
+    let framebuffer_conflict = owner.framebuffer.is_some_and(|framebuffer| {
+        framebuffer.byte_len().is_none_or(|length| {
+            !range_is_outside_memory(framebuffer.address(), length as u64, owner.memory_regions())
+        })
+    });
+    if framebuffer_conflict {
+        owner.framebuffer = None;
+        owner.framebuffer_rejection = Some(FramebufferRejection::OverlapsUsableMemory);
+    }
     owner.rsdp = acpi_new.or(acpi_old);
     Ok(owner)
 }
@@ -484,7 +881,8 @@ fn parse_multiboot2_info(bytes: &[u8], info_paddr: usize) -> Result<BootInfo, Pa
 #[cfg(test)]
 mod tests {
     use super::{
-        AcpiRsdp, BootProtocol, MAX_MODULES, MAX_REGIONS, ParseError, parse_multiboot2_info,
+        AcpiRsdp, BootProtocol, FramebufferRejection, MAX_MODULES, MAX_REGIONS, MAX_TAG_INVENTORY,
+        ParseError, TagRecord, parse_multiboot2_info,
     };
 
     fn push_u32(bytes: &mut std::vec::Vec<u8>, value: u32) {
@@ -795,5 +1193,250 @@ mod tests {
         bytes[9] = 9;
         assert_eq!(bytes[9], 9);
         assert_eq!(rsdp.bytes()[9], 7);
+    }
+
+    #[test]
+    fn tag_inventory_records_every_declared_header_in_order() {
+        let mut bytes = vec![0; 8];
+        push_tag(&mut bytes, 6, &valid_mmap_tag_payload());
+        // A tag this platform does not interpret must still be inventoried:
+        // "the bootloader never sent one" and "the kernel ignored it" are
+        // different bring-up answers, and only the inventory distinguishes
+        // them.
+        push_tag(&mut bytes, 8, &[0; 32]);
+        push_tag(&mut bytes, 15, &valid_rsdp(2));
+        push_tag(&mut bytes, 0, &[]);
+        set_total_size(&mut bytes);
+
+        let info = parse_multiboot2_info(&bytes, 0x1000).unwrap();
+        assert!(!info.tags_truncated());
+        assert_eq!(
+            info.tags(),
+            &[
+                TagRecord {
+                    tag_type: 6,
+                    size: 40
+                },
+                TagRecord {
+                    tag_type: 8,
+                    size: 40
+                },
+                TagRecord {
+                    tag_type: 15,
+                    size: 44
+                },
+                TagRecord {
+                    tag_type: 0,
+                    size: 8
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tag_inventory_truncates_without_failing_the_handoff() {
+        let mut bytes = vec![0; 8];
+        push_tag(&mut bytes, 6, &valid_mmap_tag_payload());
+        for _ in 0..MAX_TAG_INVENTORY {
+            push_tag(&mut bytes, 8, &[0; 8]);
+        }
+        push_tag(&mut bytes, 0, &[]);
+        set_total_size(&mut bytes);
+
+        let info = parse_multiboot2_info(&bytes, 0x1000).unwrap();
+        assert!(info.tags_truncated());
+        assert_eq!(info.tags().len(), MAX_TAG_INVENTORY);
+        // The memory map is parsed from its own tag rather than from the
+        // inventory, so overflowing a diagnostic bound must not change any
+        // data the platform actually consumes.
+        assert_eq!(info.memory_regions(), &[(0, 0x0800_0000)]);
+    }
+
+    /// Build a framebuffer tag payload.  `push_tag` adds the eight-byte header,
+    /// so a payload of 30 bytes yields the 38-byte tag GRUB emits for RGB.
+    fn framebuffer_payload(
+        address: u64,
+        pitch: u32,
+        width: u32,
+        height: u32,
+        bpp: u8,
+        kind: u8,
+        layout: [u8; 6],
+    ) -> std::vec::Vec<u8> {
+        let mut payload = std::vec::Vec::new();
+        payload.extend_from_slice(&address.to_le_bytes());
+        payload.extend_from_slice(&pitch.to_le_bytes());
+        payload.extend_from_slice(&width.to_le_bytes());
+        payload.extend_from_slice(&height.to_le_bytes());
+        payload.push(bpp);
+        payload.push(kind);
+        payload.extend_from_slice(&[0, 0]);
+        payload.extend_from_slice(&layout);
+        payload
+    }
+
+    /// Red at bit 16, green at bit 8, blue at bit 0: the 32-bit layout the
+    /// reference QEMU firmware reports.
+    const RGB_888: [u8; 6] = [16, 8, 8, 8, 0, 8];
+
+    fn info_with_framebuffer(tag: &[u8]) -> std::vec::Vec<u8> {
+        let mut bytes = vec![0; 8];
+        push_tag(&mut bytes, 6, &valid_mmap_tag_payload());
+        push_tag(&mut bytes, 8, tag);
+        push_tag(&mut bytes, 0, &[]);
+        set_total_size(&mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn rgb_framebuffer_is_retained_with_padded_pitch() {
+        // Pitch exceeds the tight stride, which is the normal case: firmware
+        // pads scan lines, and a driver that recomputed the stride would shear
+        // the image.
+        let tag = framebuffer_payload(0x8000_0000, 4096, 800, 600, 32, 1, RGB_888);
+        assert_eq!(tag.len(), 30);
+        let info = parse_multiboot2_info(&info_with_framebuffer(&tag), 0x1000).unwrap();
+        let framebuffer = info.framebuffer().expect("RGB tag must be retained");
+        assert_eq!(framebuffer.address(), 0x8000_0000);
+        assert_eq!(framebuffer.pitch(), 4096);
+        assert_eq!(framebuffer.width(), 800);
+        assert_eq!(framebuffer.height(), 600);
+        assert_eq!(framebuffer.bpp(), 32);
+        assert_eq!(framebuffer.red().position(), 16);
+        assert_eq!(framebuffer.blue().position(), 0);
+        assert_eq!(framebuffer.byte_len(), Some(4096 * 600));
+        assert_eq!(info.framebuffer_rejection(), None);
+    }
+
+    #[test]
+    fn non_rgb_framebuffers_are_declined_without_failing_the_boot() {
+        // An indexed surface needs a palette this owner does not retain, and an
+        // EGA text surface addresses character cells.  Neither may be treated
+        // as a boot error: on a machine whose only output is the display,
+        // aborting would be strictly worse than starting without one.
+        for (kind, expected) in [
+            (0u8, FramebufferRejection::Indexed),
+            (2u8, FramebufferRejection::Text),
+            (7u8, FramebufferRejection::UnknownKind(7)),
+        ] {
+            let tag = framebuffer_payload(0x8000_0000, 4096, 800, 600, 32, kind, RGB_888);
+            let info = parse_multiboot2_info(&info_with_framebuffer(&tag), 0x1000).unwrap();
+            assert!(info.framebuffer().is_none(), "kind {kind} must be declined");
+            assert_eq!(info.framebuffer_rejection(), Some(expected));
+            // The rest of the handoff must be unaffected by the decline.
+            assert_eq!(info.memory_regions(), &[(0, 0x0800_0000)]);
+        }
+    }
+
+    #[test]
+    fn inconsistent_framebuffer_geometry_is_declined() {
+        // Each case is self-contradictory, so trusting it would turn console
+        // output into writes outside the surface the firmware described.
+        let cases = [
+            // Zero height.
+            framebuffer_payload(0x8000_0000, 4096, 800, 0, 32, 1, RGB_888),
+            // Pitch below the tight stride for 800 pixels at 32 bpp.
+            framebuffer_payload(0x8000_0000, 3199, 800, 600, 32, 1, RGB_888),
+            // Pixel size no scanout uses.
+            framebuffer_payload(0x8000_0000, 4096, 800, 600, 12, 1, RGB_888),
+            // Zero-width colour channel.
+            framebuffer_payload(0x8000_0000, 4096, 800, 600, 32, 1, [16, 0, 8, 8, 0, 8]),
+            // Red field runs past the end of the pixel.
+            framebuffer_payload(0x8000_0000, 4096, 800, 600, 32, 1, [28, 8, 8, 8, 0, 8]),
+        ];
+        for tag in cases {
+            let info = parse_multiboot2_info(&info_with_framebuffer(&tag), 0x1000).unwrap();
+            assert!(info.framebuffer().is_none());
+            assert_eq!(
+                info.framebuffer_rejection(),
+                Some(FramebufferRejection::Inconsistent)
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_rgb_framebuffer_is_declined_rather_than_guessed() {
+        // Drop the colour layout, leaving the 24-byte fixed portion.  Channel
+        // order must never be assumed: a wrong guess swaps red and blue on
+        // every pixel while looking entirely plausible.
+        let mut tag = framebuffer_payload(0x8000_0000, 4096, 800, 600, 32, 1, RGB_888);
+        tag.truncate(24);
+        let info = parse_multiboot2_info(&info_with_framebuffer(&tag), 0x1000).unwrap();
+        assert!(info.framebuffer().is_none());
+        assert_eq!(
+            info.framebuffer_rejection(),
+            Some(FramebufferRejection::Truncated)
+        );
+    }
+
+    #[test]
+    fn absent_framebuffer_is_reported_as_absent_not_as_a_rejection() {
+        // The two outcomes need different fixes, so they must stay
+        // distinguishable in the bring-up log.
+        let info = parse_multiboot2_info(&valid_info(), 0x1000).unwrap();
+        assert!(info.framebuffer().is_none());
+        assert_eq!(info.framebuffer_rejection(), None);
+    }
+
+    #[test]
+    fn zero_address_framebuffer_is_declined() {
+        // Observed from the reference QEMU firmware under a headless display
+        // topology: a well-formed mode description whose base was never
+        // programmed.  Accepting it would home the console at physical zero,
+        // over the real-mode interrupt vector table.
+        let tag = framebuffer_payload(0, 3200, 800, 600, 32, 1, RGB_888);
+        let info = parse_multiboot2_info(&info_with_framebuffer(&tag), 0x1000).unwrap();
+        assert!(info.framebuffer().is_none());
+        assert_eq!(
+            info.framebuffer_rejection(),
+            Some(FramebufferRejection::UnusableAddress)
+        );
+    }
+
+    #[test]
+    fn framebuffer_overlapping_usable_memory_is_declined() {
+        // The surface is written through rather than merely read, so sharing
+        // bytes with allocatable memory would corrupt whatever the allocator
+        // later places there.
+        let tag = framebuffer_payload(0x0001_0000, 3200, 800, 600, 32, 1, RGB_888);
+        let info = parse_multiboot2_info(&info_with_framebuffer(&tag), 0x1000).unwrap();
+        assert!(info.framebuffer().is_none());
+        assert_eq!(
+            info.framebuffer_rejection(),
+            Some(FramebufferRejection::OverlapsUsableMemory)
+        );
+    }
+
+    #[test]
+    fn framebuffer_adjacent_to_usable_memory_is_accepted() {
+        // The rule is overlap, not proximity.  A surface that begins exactly
+        // where usable RAM ends is where firmware is expected to put it, and
+        // rejecting it would cost the display on a correctly configured boot.
+        let tag = framebuffer_payload(0x0800_0000, 3200, 800, 600, 32, 1, RGB_888);
+        let info = parse_multiboot2_info(&info_with_framebuffer(&tag), 0x1000).unwrap();
+        assert_eq!(info.framebuffer().map(|fb| fb.address()), Some(0x0800_0000));
+        assert_eq!(info.framebuffer_rejection(), None);
+    }
+
+    #[test]
+    fn first_framebuffer_tag_wins() {        let mut bytes = vec![0; 8];
+        push_tag(&mut bytes, 6, &valid_mmap_tag_payload());
+        push_tag(
+            &mut bytes,
+            8,
+            &framebuffer_payload(0x8000_0000, 4096, 800, 600, 32, 1, RGB_888),
+        );
+        push_tag(
+            &mut bytes,
+            8,
+            &framebuffer_payload(0x9000_0000, 8192, 1920, 1080, 32, 1, RGB_888),
+        );
+        push_tag(&mut bytes, 0, &[]);
+        set_total_size(&mut bytes);
+
+        let info = parse_multiboot2_info(&bytes, 0x1000).unwrap();
+        let framebuffer = info.framebuffer().unwrap();
+        assert_eq!(framebuffer.address(), 0x8000_0000);
+        assert_eq!(framebuffer.width(), 800);
     }
 }
