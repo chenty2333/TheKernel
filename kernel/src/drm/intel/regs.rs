@@ -1679,7 +1679,10 @@ mod tests {
             .expect("the AUX power well register must be declared");
         assert_eq!(well.name(), "ICL_PWR_WELL_CTL_AUX2");
         assert_eq!(well.meaning(), Meaning::PowerWell);
-        assert!(well.is_writable(), "the power module programs this register");
+        assert!(
+            well.is_writable(),
+            "the power module programs this register"
+        );
         assert!(
             !BUS.iter().any(|register| register.offset() == 0x4_5444),
             "the bus table must not declare the power module's register"

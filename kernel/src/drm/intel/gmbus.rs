@@ -90,7 +90,7 @@ use super::{
     hpd::Ddi,
     regs::{
         GMBUS0, GMBUS1, GMBUS2, GMBUS3, GMBUS4, GMBUS5, ICL_PWR_WELL_CTL_AUX2, Register,
-        RegisterWindow,
+        RegisterWindow, Registers,
     },
 };
 
@@ -401,7 +401,7 @@ impl Pin {
 impl fmt::Display for Pin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let ddi = match self.ddi() {
-            Some(ddi) => format!(", DDI {ddi}"),
+            Some(ddi) => format!(", DDI {}", ddi.name()),
             None => String::new(),
         };
         write!(f, "pin {} ({}{ddi})", self.index(), self.name())
@@ -819,6 +819,24 @@ impl EdidBytes {
     }
 }
 
+/// Which EDID block a read is asking for.
+///
+/// The distinction matters and is easy to miss: the eight magic bytes
+/// `00 FF FF FF FF FF FF 00` appear **once**, at the start of the base block.
+/// An extension block starts with its own tag byte and carries no header at
+/// all -- its only structural check is the checksum.  A reader that demanded
+/// the header of every block would reject every valid extension, which is
+/// exactly the bug the integration test in `sink::tests` found: a monitor whose
+/// EDID declared one extension read as a monitor whose extension could not be
+/// read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Block {
+    /// The base block: header, then checksum.
+    Base,
+    /// An extension block: checksum only.
+    Extension,
+}
+
 /// A block that failed validation, before it is attributed to a pin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EdidFault {
@@ -826,15 +844,17 @@ enum EdidFault {
     Checksum(u8),
 }
 
-/// Check the two things that can be checked without understanding anything:
-/// the header, and the checksum.
+/// Check everything that can be checked about a block without understanding
+/// anything in it.
 ///
-/// Reference §11 phase 2.3: "Checks: header `00 FF FF FF FF FF FF 00`; the EDID
-/// checksum (sum of all 128 bytes is 0 mod 256)".  Both are checked before the
-/// bytes are returned, because a wrong EDID gives wrong timings and the bug it
-/// causes is indistinguishable from a modeset bug.
-fn validate_edid(block: &[u8; EDID_BLOCK_LEN]) -> Result<(), EdidFault> {
-    if block[..8] != EDID_HEADER {
+/// Reference §11 phase 2.3 gives the two checks for the base block: "header
+/// `00 FF FF FF FF FF FF 00`; the EDID checksum (sum of all 128 bytes is 0 mod
+/// 256)".  Both are applied before the bytes are returned, because a wrong EDID
+/// gives wrong timings and the bug it causes is indistinguishable from a
+/// modeset bug.  The checksum is a property of every block; the header is a
+/// property of the base block only, which is why [`Block`] is a parameter.
+fn validate_block(block: &[u8; EDID_BLOCK_LEN], kind: Block) -> Result<(), EdidFault> {
+    if kind == Block::Base && block[..8] != EDID_HEADER {
         let mut header = [0u8; 8];
         header.copy_from_slice(&block[..8]);
         return Err(EdidFault::Header(header));
@@ -863,31 +883,18 @@ fn all_ones(block: &[u8; EDID_BLOCK_LEN]) -> bool {
 
 /// The six registers a GMBUS transaction is a state machine over.
 ///
-/// This trait is the entire contact between the protocol and the machine.  Two
-/// implementations exist: [`RegisterWindow`], which is volatile access to the
-/// mapped aperture, and the test controller at the bottom of this file, which
-/// is a device model layered on a real window over an ordinary buffer.  The
-/// protocol therefore runs -- including its timeout, NAK, stuck-bus and
-/// recovery paths, which no machine without a fault injector can be made to
-/// produce -- on a host that has no graphics device at all.
-pub(crate) trait BusRegisters {
-    /// Read a register, or `None` when it is outside the accessible window.
-    fn read(&mut self, register: Register) -> Option<u32>;
-
-    /// Write a register, returning whether the write happened.  A register the
-    /// table declares read-only, or one outside the window, is refused.
-    fn write(&mut self, register: Register, value: u32) -> bool;
-}
-
-impl BusRegisters for RegisterWindow {
-    fn read(&mut self, register: Register) -> Option<u32> {
-        RegisterWindow::read(*self, register)
-    }
-
-    fn write(&mut self, register: Register, value: u32) -> bool {
-        RegisterWindow::write(*self, register, value)
-    }
-}
+/// The protocol is written against [`Registers`], the same abstraction the
+/// power, clock, PHY and PLL sequences are written against, rather than
+/// against MMIO.  Two implementations exist: [`RegisterWindow`], which is
+/// volatile access to the mapped aperture, and the test controller in
+/// `gmbus::tests`, which is a device model layered on a real window over an
+/// ordinary buffer.  The protocol therefore runs -- including its timeout, NAK,
+/// stuck-bus and recovery paths, which no machine without a fault injector can
+/// be made to produce -- on a host that has no graphics device at all.
+///
+/// The trait is `&self` rather than `&mut self` because a register file is
+/// shared: the bring-up sequences hold one and so does this transport, and
+/// interior mutability belongs in the test double, not in the interface.
 
 /// What a poll loop needs from the outside world: a monotonic reading, and a
 /// way to let a moment pass.
@@ -1001,15 +1008,15 @@ enum WaitOutcome {
 }
 
 /// One GMBUS transaction's worth of state.
-struct Bus<'a, R: BusRegisters, T: PollTimer> {
-    registers: &'a mut R,
+struct Bus<'a, R: Registers, T: PollTimer> {
+    registers: &'a R,
     timer: &'a T,
     pin: Pin,
     rate: Rate,
     notes: &'a mut BusNotes,
 }
 
-impl<R: BusRegisters, T: PollTimer> Bus<'_, R, T> {
+impl<R: Registers, T: PollTimer> Bus<'_, R, T> {
     fn read(&mut self, register: Register) -> Result<u32, GmbusError> {
         self.registers
             .read(register)
@@ -1311,13 +1318,14 @@ impl<R: BusRegisters, T: PollTimer> Bus<'_, R, T> {
 /// byte address `offset`, with no retries.
 ///
 /// This is the transport, with no opinion about what the bytes mean.
-fn read_block_once<R: BusRegisters, T: PollTimer>(
-    registers: &mut R,
+fn read_block_once<R: Registers, T: PollTimer>(
+    registers: &R,
     timer: &T,
     pin: Pin,
     rate: Rate,
     address: u8,
     offset: u8,
+    kind: Block,
     notes: &mut BusNotes,
 ) -> Result<EdidBytes, GmbusError> {
     notes.last_rate = rate;
@@ -1333,7 +1341,7 @@ fn read_block_once<R: BusRegisters, T: PollTimer>(
     if all_ones(&bytes) {
         return Err(GmbusError::BusFloating { pin });
     }
-    match validate_edid(&bytes) {
+    match validate_block(&bytes, kind) {
         Ok(()) => Ok(EdidBytes { bytes }),
         Err(EdidFault::Header(header)) => Err(GmbusError::EdidHeader { pin, header }),
         Err(EdidFault::Checksum(sum)) => Err(GmbusError::EdidChecksum { pin, sum }),
@@ -1360,12 +1368,13 @@ fn read_block_once<R: BusRegisters, T: PollTimer>(
 /// A floating bus, a bus already in use and a window that does not reach the
 /// registers end here: retrying cannot change any of them.  See
 /// [`GmbusError::worth_retrying`].
-fn read_block<R: BusRegisters, T: PollTimer>(
-    registers: &mut R,
+fn read_block<R: Registers, T: PollTimer>(
+    registers: &R,
     timer: &T,
     pin: Pin,
     address: u8,
     offset: u8,
+    kind: Block,
     notes: &mut BusNotes,
 ) -> Result<EdidBytes, GmbusError> {
     let mut rate = Rate::DEFAULT;
@@ -1373,7 +1382,7 @@ fn read_block<R: BusRegisters, T: PollTimer>(
     loop {
         attempt += 1;
         notes.attempts = attempt;
-        match read_block_once(registers, timer, pin, rate, address, offset, notes) {
+        match read_block_once(registers, timer, pin, rate, address, offset, kind, notes) {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
                 let retry = if attempt < MAX_ATTEMPTS && error.worth_retrying() {
@@ -1426,13 +1435,21 @@ pub(crate) fn read_edid_detailed(
 /// clock rather than MMIO and a sleep, because every path worth testing here --
 /// a timeout, a NAK, a stuck bus, a corrupt block -- is one that a working
 /// machine will not produce on request.
-pub(crate) fn read_edid_with<R: BusRegisters, T: PollTimer>(
-    registers: &mut R,
+pub(crate) fn read_edid_with<R: Registers, T: PollTimer>(
+    registers: &R,
     timer: &T,
     pin: Pin,
     notes: &mut BusNotes,
 ) -> Result<EdidBytes, GmbusError> {
-    read_block(registers, timer, pin, DDC_ADDRESS, EDID_BASE_OFFSET, notes)
+    read_block(
+        registers,
+        timer,
+        pin,
+        DDC_ADDRESS,
+        EDID_BASE_OFFSET,
+        Block::Base,
+        notes,
+    )
 }
 
 /// Read the first extension block, when a sink declares one.
@@ -1454,8 +1471,8 @@ pub(crate) fn read_edid_extension(
 }
 
 /// [`read_edid_extension`] over any register file and any clock.
-pub(crate) fn read_edid_extension_with<R: BusRegisters, T: PollTimer>(
-    registers: &mut R,
+pub(crate) fn read_edid_extension_with<R: Registers, T: PollTimer>(
+    registers: &R,
     timer: &T,
     pin: Pin,
 ) -> Result<Option<EdidBytes>, GmbusError> {
@@ -1466,6 +1483,7 @@ pub(crate) fn read_edid_extension_with<R: BusRegisters, T: PollTimer>(
         pin,
         DDC_ADDRESS,
         EDID_BASE_OFFSET,
+        Block::Base,
         &mut notes,
     )?;
     if base.extension_count() == 0 {
@@ -1477,6 +1495,7 @@ pub(crate) fn read_edid_extension_with<R: BusRegisters, T: PollTimer>(
         pin,
         DDC_ADDRESS,
         EDID_EXTENSION_OFFSET,
+        Block::Extension,
         &mut notes,
     )?;
     Ok(Some(extension))
@@ -1584,10 +1603,7 @@ pub(crate) fn probe_sink(regs: &RegisterWindow) -> SinkProbe {
 }
 
 /// [`probe_sink`] over any register file and any clock.
-pub(crate) fn probe_sink_with<R: BusRegisters, T: PollTimer>(
-    registers: &mut R,
-    timer: &T,
-) -> SinkProbe {
+pub(crate) fn probe_sink_with<R: Registers, T: PollTimer>(registers: &R, timer: &T) -> SinkProbe {
     let mut outcomes = Vec::new();
     for pin in Pin::DDC {
         let mut notes = BusNotes::default();
@@ -1598,4 +1614,4 @@ pub(crate) fn probe_sink_with<R: BusRegisters, T: PollTimer>(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
