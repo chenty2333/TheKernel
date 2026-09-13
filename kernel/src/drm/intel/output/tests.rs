@@ -189,6 +189,11 @@ fn the_two_encodings_disagree_on_the_same_divider_set() {
 }
 
 /// The encoder-side registers, to the hex digit, from §8.4's field tables.
+///
+/// `TRANS_CLK_SEL`'s `0x1000_0000` is PHY A's field on this display version
+/// (`[I915]` `display/intel_ddi.c:999-1000`), which for this port is also DDI
+/// A's number -- see
+/// `the_clock_select_is_keyed_by_phy_and_the_port_select_by_ddi`.
 #[test]
 fn the_transcoder_and_ddi_values_are_the_reference_encodings() {
     let plan = target_plan();
@@ -197,21 +202,82 @@ fn the_transcoder_and_ddi_values_are_the_reference_encodings() {
         plan.trans_ddi_func_ctl, 0x8803_0006,
         "ENABLE | SELECT_PORT(A) | HDMI | 8bpc | both syncs | four lanes"
     );
-    assert_eq!(plan.transconf, 0xC000_0000, "ENABLE | STATE_ENABLE");
+    assert_eq!(
+        plan.transconf, 0x8000_0000,
+        "TRANSCONF(A): ENABLE only, because bit 30 is a status"
+    );
     assert_eq!(
         plan.ddi_buf_ctl, 0x8200_0016,
         "ENABLE | BUF_TRANS_SELECT(2) | PORT_WIDTH(4 lanes) | A_4_LANES"
     );
 }
 
-/// No output bit depth in `TRANSCONF`: §8.4's correction and §11 phase 5.6 put
-/// it in `PIPE_MISC`, and §8.6 step 12 still lists it here.
+/// No output bit depth in `TRANSCONF`, and no `STATE_ENABLE` either.
+///
+/// §8.4's correction and §11 phase 5.6 put the bit depth in `PIPE_MISC`;
+/// §8.6 step 12 still lists it here.  Bit 30 is the other half: §11 phase 5.6
+/// prints `ENABLE | STATE_ENABLE` and bit 30 is a **hardware status**, so the
+/// value is the enable bit exactly.  The literal is asserted rather than the
+/// module's own constants, because
+/// `TRANSCONF_ENABLE | TRANSCONF_STATE_ENABLE_STATUS` is what the defect was.
 #[test]
 fn transconf_carries_no_bit_depth() {
     let plan = target_plan();
     // `TRANSCONF`'s BPC field is a pre-Haswell leftover; the value is exactly
-    // enable plus state-enable, nothing else.
-    assert_eq!(plan.transconf, (1 << 31) | (1 << 30));
+    // the enable bit, nothing else.
+    assert_eq!(plan.transconf, 0x8000_0000);
+}
+
+/// The register the sequence leaves behind holds `0x8000_0000`, whatever the
+/// module's constants say.
+///
+/// §11 phase 5.6's `TRANSCONF(A) = (1<<31) | (1<<30)` is the reference's defect
+/// and this module followed it.  `[I915]`'s `TRANSCONF_STATE_ENABLE`
+/// (`i915_reg.h:1591`) is bit 30, and i915 only ever *polls* it: clear after a
+/// disable (`display/intel_display.c:302-318`), never set by
+/// `intel_enable_transcoder`, which ORs `TRANSCONF_ENABLE` into the value it
+/// read (`:459`, `:474-475`).  Asserting the literal at the aperture is the
+/// point: a test that compared against the module's own composition would have
+/// passed with the status bit in it.
+#[test]
+fn the_transcoder_is_enabled_with_bit_31_alone() {
+    let regs = ready_mock();
+    program(&regs, &target_plan()).expect("the mock's status bits all behave");
+
+    let (_, written) = regs
+        .writes()
+        .into_iter()
+        .find(|(name, _)| *name == "PIPECONF_A")
+        .expect("the sequence writes the transcoder's own register");
+    assert_eq!(
+        written, 0x8000_0000,
+        "TRANSCONF(A) is ENABLE and nothing else"
+    );
+    assert_eq!(
+        written & 0x4000_0000,
+        0,
+        "bit 30 is STATE_ENABLE, the hardware's pipe-running status"
+    );
+    assert_eq!(
+        regs.read(pipe::PIPECONF_A),
+        Some(0x8000_0000),
+        "the register holds the enable bit alone"
+    );
+    assert_eq!(
+        TRANSCONF_STATE_ENABLE_STATUS, 0x4000_0000,
+        "the renamed constant is the status bit, and the write does not carry it"
+    );
+    // The log is the only evidence a machine with no serial port leaves, so it
+    // prints the value the register gets and names the bit it does not.
+    let log = target_plan().render();
+    assert!(
+        log.contains("TRANSCONF(A) = 0x80000000"),
+        "the plan log does not print the transcoder value:\n{log}"
+    );
+    assert!(
+        log.contains("0x40000000 is STATE_ENABLE"),
+        "the plan log does not name the status bit:\n{log}"
+    );
 }
 
 /// §11 phase 5.5's polarities: the two bits follow the mode, in both
@@ -703,6 +769,60 @@ fn the_idle_poll_waits_for_a_ddi_that_takes_several_polls() {
     assert_eq!(state.ddi_buf_ctl_readback & DDI_BUF_CTL_IS_IDLE, 0);
 }
 
+/// `DDI_BUF_CTL`'s enable is a read-modify-write over the plan's fields, so the
+/// board's `PORT_REVERSAL` bit survives it.
+///
+/// `PORT_REVERSAL[16]` (`[I915]` `i915_reg.h:3868`) is not this sequence's to
+/// set or clear.  i915 reads it out of this same register while initialising
+/// the encoder and keeps that bit alone for `DISPLAY_VER >= 11`
+/// (`display/intel_ddi.c:5115-5120`), ORs in the VBT's lane-reversal flag
+/// (`:5124`), and composes the HDMI enable as
+/// `saved_port_bits | DDI_BUF_CTL_ENABLE` (`:3353`, written at `:3375`).  A
+/// whole-value write composed from constants would clear a lane order the
+/// firmware declared, which on a board that declares one puts the TMDS pairs
+/// on the wrong lanes.  Reference §8.4 names the field in its `DDI_BUF_CTL` row
+/// and §11 phase 5.7's write does not carry it, so this write is the one place
+/// the sequence departs from §11's step -- and only by leaving a bit alone.
+#[test]
+fn the_ddi_buffer_enable_keeps_the_port_reversal_bit() {
+    /// `DDI_BUF_PORT_REVERSAL`, `[I915]` `i915_reg.h:3868`.
+    const PORT_REVERSAL: u32 = 1 << 16;
+    /// `DDI_INIT_DISPLAY_DETECTED`, bit 0 -- the legacy presence detect §8.4
+    /// describes and this sequence deliberately does not write.
+    const PRESENCE_DETECT: u32 = 1;
+
+    let regs = ready_mock();
+    // The firmware's word: the board's lane reversal is set, and the presence
+    // detect reads set.
+    regs.set(ddi::DDI_BUF_CTL_A, PORT_REVERSAL | PRESENCE_DETECT);
+    let plan = target_plan();
+    program(&regs, &plan).expect("the mock's status bits all behave");
+
+    let (_, written) = regs
+        .writes()
+        .into_iter()
+        .find(|(name, _)| *name == "DDI_BUF_CTL(A)")
+        .expect("the sequence enables the buffer");
+    assert_eq!(
+        written,
+        plan.ddi_buf_ctl | PORT_REVERSAL | PRESENCE_DETECT,
+        "the enable write is the plan's fields over the word that was already there"
+    );
+    assert_eq!(
+        regs.read(ddi::DDI_BUF_CTL_A),
+        Some(0x8200_0016 | PORT_REVERSAL | PRESENCE_DETECT),
+        "the register keeps the board's bit and holds the plan's fields, to the literal"
+    );
+    // And the plan's own word does not carry bit 16, which is exactly why the
+    // write cannot be a whole-value one.
+    assert_eq!(plan.ddi_buf_ctl & PORT_REVERSAL, 0);
+    let log = target_plan().render();
+    assert!(
+        log.contains("PORT_REVERSAL[16]"),
+        "the plan log does not say which bit the read-modify-write keeps:\n{log}"
+    );
+}
+
 // -- the second combo PHY ---------------------------------------------------
 //
 // Which combo PHY the monitor is on is not known when this module is written:
@@ -710,6 +830,46 @@ fn the_idle_poll_waits_for_a_ddi_that_takes_several_polls() {
 // pin (`Pin::ddi()`), and §8.1 says the rear HDMI may be on either.  So the
 // DDI B / PHY B path is exercised as a sequence of its own rather than as the
 // A path with a different argument.
+
+/// The two transcoder-side selects are keyed by different things:
+/// `TRANS_CLK_SEL` by PHY on this display version, `TRANS_DDI_FUNC_CTL`'s
+/// `SELECT_PORT` by DDI on every one.
+///
+/// `[I915]` `intel_ddi_enable_transcoder_clock` hands the **PHY** to
+/// `TGL_TRANS_CLK_SEL_PORT` for `DISPLAY_VER >= 13` and the port only for
+/// version 12 (`display/intel_ddi.c:996-1004`), while
+/// `intel_ddi_transcoder_func_reg_val_get` composes `SELECT_PORT` from
+/// `encoder->port` on every version (`:481,488-490`).  §11's steps 5.4 and 5.5
+/// both say "port", so the reference states one rule where the hardware has
+/// two.
+///
+/// **What this test cannot see, said plainly.**  The only DDIs this module
+/// accepts are the combo ports A and B, and i915 maps those to PHY A and PHY B
+/// one-for-one (`intel_port_to_phy` is `PHY_A + port - PORT_A` below
+/// `PORT_TC1`, `display/intel_display.c:1950-1965`).  A PHY-keyed value and a
+/// port-keyed one are therefore the *same number* for every plan that can be
+/// built today, and a revert to `Ddi::index()` would pass every assertion
+/// below.  What is pinned is the literal each field carries, and the
+/// derivation's type: [`phy_index`] takes a [`ComboPhy`], which a [`Ddi`]
+/// cannot be passed for.  A port whose PHY is not its own letter is where the
+/// two diverge, and this sequence refuses that port before computing anything.
+#[test]
+fn the_clock_select_is_keyed_by_phy_and_the_port_select_by_ddi() {
+    assert_eq!(phy_index(ComboPhy::A), 0, "PHY_A = 0");
+    assert_eq!(phy_index(ComboPhy::B), 1, "PHY_B = 1");
+    // The equality the comment above is about: true for the two combo ports,
+    // and a property of i915's port-to-PHY mapping rather than of the encoding.
+    assert_eq!(phy_index(ComboPhy::A), Ddi::A.index());
+    assert_eq!(phy_index(ComboPhy::B), Ddi::B.index());
+
+    let a = target_plan();
+    let b = OutputProgram::plan(&hdmi_request(Ddi::B), STRAP_38_4).unwrap();
+    // `(phy + 1) << 28`, and `(ddi + 1) << 27`.
+    assert_eq!(a.trans_clk_sel, 0x1000_0000);
+    assert_eq!(b.trans_clk_sel, 0x2000_0000);
+    assert_eq!(a.trans_ddi_func_ctl & (0b1111 << 27), 1 << 27);
+    assert_eq!(b.trans_ddi_func_ctl & (0b1111 << 27), 2 << 27);
+}
 
 /// The target mode plans for DDI B, and the plan is DDI B's: PHY B, DPLL1's
 /// port, and the same divider program -- the arithmetic is `pll.rs`'s and does
@@ -724,14 +884,12 @@ fn combo_phy_b_plans_the_target_mode() {
     assert_eq!(plan.dividers.total_divider(), 12);
     assert_eq!(plan.dividers.symbol_rate_khz(), 148_500);
     assert_eq!(plan.ddi_io_well.name, "DDI_IO_B");
-    // The two port-select values carry the DDI, not the PHY (§6.3 routing step
-    // 2 and §8.4: `(port + 1)` in the top bits).
-    assert_eq!(plan.trans_clk_sel, 2 << TRANS_CLK_SEL_PORT_SHIFT);
-    assert_eq!(
-        plan.trans_ddi_func_ctl >> TRANS_DDI_PORT_SHIFT & 0b1111,
-        2,
-        "SELECT_PORT(B)"
-    );
+    // `TRANS_CLK_SEL` takes PHY B here, and `SELECT_PORT` takes DDI B: the
+    // literals are the two fields' encodings, which for this platform's combo
+    // ports are the same number.  Why they are computed from different things
+    // is `the_clock_select_is_keyed_by_phy_and_the_port_select_by_ddi`.
+    assert_eq!(plan.trans_clk_sel, 0x2000_0000);
+    assert_eq!(plan.trans_ddi_func_ctl >> 27 & 0b1111, 2, "SELECT_PORT(B)");
 }
 
 /// The whole phase-5 sequence for DDI B, on the write log: every register is
@@ -789,7 +947,7 @@ fn the_phy_b_write_order_is_the_sequence_with_b_registers() {
     );
     assert_eq!(state.ddi, Ddi::B);
     assert_eq!(state.ddi_io_well.name, "DDI_IO_B");
-    assert_eq!(state.trans_clk_sel, 2 << TRANS_CLK_SEL_PORT_SHIFT);
+    assert_eq!(state.trans_clk_sel, 0x2000_0000, "PHY B's clock select");
 }
 
 /// The DPLL1 config pair is written at DPLL1's addresses and DPLL0's are left

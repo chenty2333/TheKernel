@@ -14,9 +14,9 @@
 //! 8.6.5 enable the port's DDI-IO power well, poll its state
 //! 5.3  §8.5's voltage-swing / buffer-translation writes, then
 //!      PORT_CL_DW10's PWR_DOWN_LN_MASK to power the lanes
-//! 5.4  TRANS_CLK_SEL(A)
-//! 5.5  TRANS_DDI_FUNC_CTL(A): port, HDMI/DVI, 8 bpc, polarity
-//! 5.6  TRANSCONF(A) = ENABLE | STATE_ENABLE | progressive
+//! 5.4  TRANS_CLK_SEL(A): the port's **PHY** on this display version
+//! 5.5  TRANS_DDI_FUNC_CTL(A): the **DDI**, HDMI/DVI, 8 bpc, polarity
+//! 5.6  TRANSCONF(A) = ENABLE only -- bit 30 is a status, not an enable
 //! 5.7  DDI_BUF_CTL: enable, buffer-translation level, width,
 //!      then poll IS_IDLE == 0
 //! ```
@@ -26,8 +26,14 @@
 //! and [`port_registers`] is the one place that mapping lives.  The transcoder
 //! side is not per-port: §5.1 gives the PRM's rule that *"Transcoders A-D can
 //! connect to any DDI"*, so the transcoder registers are A's and the **values**
-//! written into them carry the DDI (§5.4's `(port + 1) << 28`, §5.5's
-//! `(port + 1) << 27`).
+//! written into them name the port or the PHY the transcoder is being pointed
+//! at.  Those two values are keyed differently, and §11's phase 5 does not
+//! record it: §5.4's `(x + 1) << 28` takes the **PHY** on this display version
+//! (`[I915]` `display/intel_ddi.c:999-1000`) while §5.5's `(port + 1) << 27`
+//! takes the **DDI** on every one (`[I915]` `display/intel_ddi.c:481,488-490`).
+//! Both are the same number for the two combo ports this sequence programs,
+//! which is exactly why the difference is easy to miss: [`phy_index`] is what
+//! the first field is computed from, and `Ddi::index()` the second.
 //!
 //! # Compute, then write
 //!
@@ -39,6 +45,14 @@
 //! rate to be printed before programming, and §11 phase 3.3 makes the same
 //! demand of the dividers.  [`OutputProgram::render`] is that log, and the
 //! numbers in it come from `pll.rs` rather than from arithmetic redone here.
+//!
+//! One write is the exception, and it is the one register that carries
+//! somebody else's bit: `DDI_BUF_CTL` is enabled with a read-modify-write over
+//! the fields the plan composes ([`DDI_BUF_CTL_OWNED`]), because
+//! `PORT_REVERSAL[16]` belongs to the board.  So the plan holds the fields this
+//! sequence owns in that register, not the whole word -- and
+//! `docs/design/intel-output.md` §3.9 states which other fields were considered
+//! and why `TRANSCONF` is *not* written that way.
 //!
 //! # The PLL is `pll.rs`'s, and so is its encoding question
 //!
@@ -170,16 +184,36 @@ const PLL_POWER_STATE_TIMEOUT_US: u32 = 1_000;
 /// §6.3 quotes `[I915]`'s comment directly: "Timeout is actually 600us".
 const PLL_LOCK_TIMEOUT_US: u32 = 600;
 
-/// `TRANS_CLK_SEL`'s port field shift, `TGL_TRANS_CLK_SEL_PORT(port) = (port +
-/// 1) << 28`.  Reference §6.3 routing step 2 and §11 phase 5.4.
+/// `TRANS_CLK_SEL`'s port field shift, `TGL_TRANS_CLK_SEL_PORT(x) = (x + 1) <<
+/// 28` (`[I915]` `i915_reg.h:4015`).  Reference §6.3 routing step 2 and §11
+/// phase 5.4.
+///
+/// **`x` is the PHY on this display version, not the port.**  i915's
+/// `intel_ddi_enable_transcoder_clock` passes `intel_encoder_to_phy(encoder)`
+/// on `DISPLAY_VER >= 13` and falls back to `encoder->port` only for version 12
+/// (`[I915]` `display/intel_ddi.c:993,996-1004`).  The two are the same number
+/// for this machine's two combo ports -- `intel_port_to_phy` is `PHY_A + port -
+/// PORT_A` below `PORT_TC1` (`display/intel_display.c:1950-1965`) -- so the
+/// reference's port-keyed wording happened to give the right value here, and
+/// would not for a port whose PHY is not its own letter.  Reference §6.3
+/// routing step 2 and §11 phase 5.4 both print the encoding with `port` as the
+/// argument; §6.3's own citation for the region, `[I915]`
+/// `display/intel_ddi.c:987-1007`, is where the distinction is.
 const TRANS_CLK_SEL_PORT_SHIFT: u32 = 28;
+
+/// `TRANS_DDI_FUNC_CTL`'s `SELECT_PORT` field shift,
+/// `TGL_TRANS_DDI_SELECT_PORT(port) = (port + 1) << 27`
+/// (`[I915]` `i915_reg.h:3757`).  Reference §8.4 and §11 phase 5.5.
+///
+/// The argument here is the **port** -- the DDI -- on this display version and
+/// on every other: i915 composes the value from `encoder->port` with no PHY
+/// conversion (`[I915]` `display/intel_ddi.c:481,488-490`).  So the same DDI
+/// number is right for this field and wrong for [`TRANS_CLK_SEL_PORT_SHIFT`]'s,
+/// and the two §11 steps print "port" as if they were one rule.
+const TRANS_DDI_PORT_SHIFT: u32 = 27;
 
 /// `TRANS_DDI_FUNC_CTL`'s `TRANS_DDI_FUNC_ENABLE` bit.  Reference §8.4.
 const TRANS_DDI_FUNC_ENABLE: u32 = 1 << 31;
-
-/// `TRANS_DDI_FUNC_CTL`'s port field shift, `TGL_TRANS_DDI_SELECT_PORT(port) =
-/// (port + 1) << 27`.  Reference §8.4 and §11 phase 5.5.
-const TRANS_DDI_PORT_SHIFT: u32 = 27;
 
 /// `TRANS_DDI_FUNC_CTL`'s mode-select field, `[26:24]`.  Reference §8.4.
 const TRANS_DDI_MODE_SELECT_SHIFT: u32 = 24;
@@ -195,17 +229,40 @@ const TRANS_DDI_PORT_WIDTH_SHIFT: u32 = 1;
 
 /// `TRANSCONF`'s `ENABLE` bit.
 ///
-/// Reference §11 phase 5.6: "`TRANSCONF(A) = ENABLE | STATE_ENABLE |
-/// progressive` = `(1<<31) | (1<<30)`".  The output bit depth and dithering are
-/// **not** written here: §8.4's correction and §11 phase 5.6 both put them in
-/// `PIPE_MISC` on Gen12, and §8.6 step 12's "| 8bpc" is the pre-correction
-/// text.  Progressive is the interlace field reading zero, so no interlace bits
-/// are set; §5.2's `[23:21]` and docs/design/intel-pll.md's HSW+ `[22:21]`
-/// disagree about the mask, and a zero value makes the disagreement moot.
+/// This is the only bit §11 phase 5.6's write may set.  The output bit depth
+/// and dithering are **not** written here: §8.4's correction and §11 phase 5.6
+/// both put them in `PIPE_MISC` on Gen12, and §8.6 step 12's "| 8bpc" is the
+/// pre-correction text.  Progressive is the interlace field reading zero, so no
+/// interlace bits are set; §5.2's `[23:21]` and docs/design/intel-pll.md's HSW+
+/// `[22:21]` disagree about the mask, and a zero value makes the disagreement
+/// moot.
+///
+/// §11 phase 5.6 also sets `STATE_ENABLE` -- "`(1<<31) | (1<<30)`" -- and that
+/// is a **defect in the reference**: bit 30 is the hardware's pipe-running
+/// status, not a second enable, and writing it is writing a status bit as if it
+/// were a request.  [`TRANSCONF_STATE_ENABLE_STATUS`] carries the citations and
+/// `docs/design/intel-output.md` records the defect.
 const TRANSCONF_ENABLE: u32 = 1 << 31;
 
-/// `TRANSCONF`'s `STATE_ENABLE` bit.
-const TRANSCONF_STATE_ENABLE: u32 = 1 << 30;
+/// `TRANSCONF`'s `STATE_ENABLE` bit, which is a **hardware status** and never a
+/// value this sequence writes.
+///
+/// `[I915]` defines the bit as `TRANSCONF_STATE_ENABLE`, `REG_BIT(30)`,
+/// "i965+" (`i915_reg.h:1591`; the same bit is `TRANSCONF_DOUBLE_WIDE` on the
+/// pre-i965 parts, which is why the generation matters), and uses it for one
+/// thing only: to watch the transcoder stop.  `intel_wait_for_pipe_off` waits
+/// for it to read *clear* after a disable
+/// (`display/intel_display.c:302-318`, the wait at `:312-313`), and the enable
+/// path never sets it: `intel_enable_transcoder` reads `TRANSCONF` (`:459`) and
+/// writes the value back with `TRANSCONF_ENABLE` OR'd in (`:474-475`), so bit
+/// 30 keeps whatever the hardware had put there.
+///
+/// Reference §11 phase 5.6 states the write as `ENABLE | STATE_ENABLE`, and an
+/// earlier revision of this module followed it -- see the "reference defect"
+/// note in `docs/design/intel-output.md`.  §11's *disable* sequence ("Disable
+/// `TRANSCONF`; poll for off state") is the reading that agrees with i915, and
+/// is where the document gives the bit its status meaning.
+const TRANSCONF_STATE_ENABLE_STATUS: u32 = 1 << 30;
 
 /// `DDI_BUF_CTL`'s `ENABLE` bit.  Reference §8.4.
 const DDI_BUF_CTL_ENABLE: u32 = 1 << 31;
@@ -229,6 +286,37 @@ const DDI_BUF_CTL_A_4_LANES: u32 = 1 << 4;
 
 /// `DDI_BUF_CTL`'s `PORT_WIDTH[3:1]` shift: `(lanes - 1) << 1`.
 const DDI_BUF_CTL_PORT_WIDTH_SHIFT: u32 = 1;
+
+/// The bits of `DDI_BUF_CTL` the plan composes, and therefore the only bits the
+/// enable write may clear.
+///
+/// `[I915]` `i915_reg.h:3858-3873`: `ENABLE[31]`, `BUF_TRANS_SELECT[27:24]`,
+/// `PHY_LINK_RATE[23:20]`, `PORT_WIDTH[3:1]` and `A_4_LANES[4]`.  Everything
+/// else in the register belongs to somebody else, and one of those bits is
+/// load-bearing: `PORT_REVERSAL[16]` (`i915_reg.h:3868`) is the **board's**.
+/// i915 reads it out of this same register while initialising the encoder and
+/// keeps that bit alone for `DISPLAY_VER >= 11`
+/// (`display/intel_ddi.c:5115-5120`), ORs in the VBT's own lane-reversal flag
+/// (`:5124`), and composes the HDMI enable as
+/// `saved_port_bits | DDI_BUF_CTL_ENABLE` (`:3353`, written at `:3375`).  A
+/// whole-value write composed from constants would clear a lane order the
+/// firmware declared, and the TMDS pairs would come out on the wrong lanes.
+/// Reference §8.4 names `PORT_REVERSAL` in its `DDI_BUF_CTL` row and §11 phase
+/// 5.7's write does not carry it; `docs/design/intel-output.md` §3.9 records the
+/// difference and why this module keeps the bit.
+///
+/// The mask is the sequence's whole claim on the register, so the
+/// read-modify-write in [`program`] also hands back the read-only bits it read
+/// (`IS_IDLE[7]`, `DDI_INIT_DISPLAY_DETECTED[0]`), which hardware ignores on
+/// write.  i915 read-modify-writes this register the same way where it does not
+/// have a saved word -- `intel_de_rmw(..., DDI_BUF_CTL(port), 0,
+/// DDI_BUF_CTL_ENABLE)` (`display/icl_dsi.c:514`) and the enable clear at
+/// `display/intel_ddi.c:3615-3618`.
+const DDI_BUF_CTL_OWNED: u32 = DDI_BUF_CTL_ENABLE
+    | (0b1111 << DDI_BUF_CTL_BUF_TRANS_SELECT_SHIFT)
+    | (0b1111 << DDI_BUF_CTL_PHY_LINK_RATE_SHIFT)
+    | (0b111 << DDI_BUF_CTL_PORT_WIDTH_SHIFT)
+    | DDI_BUF_CTL_A_4_LANES;
 
 /// How long to wait for `IS_IDLE` to clear, in microseconds.
 ///
@@ -724,6 +812,26 @@ fn combo_phy_of(ddi: Ddi) -> Result<ComboPhy, OutputError> {
     }
 }
 
+/// The `enum phy` index of a combo PHY: what `TRANS_CLK_SEL`'s field carries on
+/// this display version.
+///
+/// `[I915]` `enum phy` is `PHY_A = 0, PHY_B = 1, ...`
+/// (`display/intel_display.h:192-204`), and `intel_ddi_enable_transcoder_clock`
+/// hands the PHY to `TGL_TRANS_CLK_SEL_PORT` for `DISPLAY_VER >= 13`
+/// (`display/intel_ddi.c:993,999-1000`).  The argument type is the point: this
+/// value comes from a [`ComboPhy`] and never from a [`Ddi`], because on this
+/// platform the two happen to be equal for ports A and B -- `intel_port_to_phy`
+/// is `PHY_A + port - PORT_A` below `PORT_TC1` (`display/intel_display.c:1950-1965`)
+/// -- and a port whose PHY is not its own letter gets a different number here,
+/// not a different register.  `TRANS_DDI_FUNC_CTL`'s field is the other way
+/// round; see [`TRANS_DDI_PORT_SHIFT`].
+const fn phy_index(phy: ComboPhy) -> u32 {
+    match phy {
+        ComboPhy::A => 0,
+        ComboPhy::B => 1,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The plan: every register value, computed before anything is written.
 // ---------------------------------------------------------------------------
@@ -772,7 +880,10 @@ pub(crate) struct OutputProgram {
     pub(crate) trans_ddi_func_ctl: u32,
     /// `TRANSCONF(A)`, the register `regs/pipe.rs` names `PIPECONF_A`.
     pub(crate) transconf: u32,
-    /// `DDI_BUF_CTL` for this port.
+    /// The fields this sequence owns in `DDI_BUF_CTL` for this port.  Written
+    /// as a read-modify-write, so the register keeps the bits the plan does not
+    /// name -- the board's `PORT_REVERSAL` among them; see
+    /// [`DDI_BUF_CTL_OWNED`].
     pub(crate) ddi_buf_ctl: u32,
 }
 
@@ -844,13 +955,19 @@ impl OutputProgram {
         let fraction_workaround = DcoFractionWorkaround::for_adl_p_n(platform_ref_khz);
         let pll_registers = dividers.registers(request.encoding, fraction_workaround)?;
 
-        // Port number for the two encoder-side selects.  `Ddi::index()` is the
-        // port's numeric index (PORT_A = 0, PORT_B = 1, §8.1), and the `+ 1` is
+        // The two encoder-side selects are keyed by different things, which
+        // §11's phase 5 prints as if they were one rule.  `TRANS_CLK_SEL` takes
+        // the **PHY** on this display version (`[I915]`
+        // `display/intel_ddi.c:999-1000`); `TRANS_DDI_FUNC_CTL.SELECT_PORT`
+        // takes the **DDI** on every version (`[I915]`
+        // `display/intel_ddi.c:481,488-490`, and `intel_port_to_phy` at
+        // `display/intel_display.c:1950-1965` is the conversion the first one
+        // gets and the second one does not).  `Ddi::index()` is the port's
+        // numeric index (PORT_A = 0, PORT_B = 1, §8.1) and the `+ 1` in both is
         // there because zero means "none" (§6.3).
-        let port_index = request.ddi.index();
-        let trans_clk_sel = (port_index + 1) << TRANS_CLK_SEL_PORT_SHIFT;
+        let trans_clk_sel = (phy_index(phy) + 1) << TRANS_CLK_SEL_PORT_SHIFT;
         let trans_ddi_func_ctl = TRANS_DDI_FUNC_ENABLE
-            | ((port_index + 1) << TRANS_DDI_PORT_SHIFT)
+            | ((request.ddi.index() + 1) << TRANS_DDI_PORT_SHIFT)
             | (request.port_type.mode_select() << TRANS_DDI_MODE_SELECT_SHIFT)
             // 8 bpc is 0 in `TRANS_DDI_BPC_MASK[22:20]` (§8.4), so nothing is
             // added for it.  That field is the transcoder's; the pipe's output
@@ -868,10 +985,16 @@ impl OutputProgram {
             }
             | request.width.width_field();
 
-        // §11 phase 5.6.  No bit depth: §8.4's correction and §11 phase 5.6
-        // both put it in `PIPE_MISC` on Gen12, and §8.6 step 12's "| 8bpc" is
-        // the pre-correction text.
-        let transconf = TRANSCONF_ENABLE | TRANSCONF_STATE_ENABLE;
+        // §11 phase 5.6's write, restricted to what is actually a control bit.
+        // No bit depth: §8.4's correction and §11 phase 5.6 both put it in
+        // `PIPE_MISC` on Gen12, and §8.6 step 12's "| 8bpc" is the
+        // pre-correction text.  No `STATE_ENABLE` either: §11 phase 5.6 prints
+        // `(1<<31) | (1<<30)` and bit 30 is the hardware's pipe-running status
+        // (`[I915]` `i915_reg.h:1591`, polled clear by `intel_wait_for_pipe_off`
+        // at `display/intel_display.c:312-313`), which
+        // `intel_enable_transcoder` never sets (`:459`, `:474-475`).  That is
+        // the reference defect this composition used to repeat.
+        let transconf = TRANSCONF_ENABLE;
 
         let ddi_buf_ctl = DDI_BUF_CTL_ENABLE
             | (u32::from(swing.level) << DDI_BUF_CTL_BUF_TRANS_SELECT_SHIFT)
@@ -975,12 +1098,21 @@ impl OutputProgram {
         out.push_str(&format!("intel-output: {}\n", self.link_rate.describe()));
         out.push_str(&format!(
             "intel-output: TRANS_CLK_SEL(A) = {:#010x}, TRANS_DDI_FUNC_CTL(A) = {:#010x}, \
-             TRANSCONF(A) = {:#010x}, DDI_BUF_CTL({}) = {:#010x}\n",
+             TRANSCONF(A) = {:#010x} (ENABLE only: {:#010x} is STATE_ENABLE, the hardware's \
+             pipe-running status, and is not written), DDI_BUF_CTL({}) = {:#010x}\n",
             self.trans_clk_sel,
             self.trans_ddi_func_ctl,
             self.transconf,
+            TRANSCONF_STATE_ENABLE_STATUS,
             self.ddi.name(),
             self.ddi_buf_ctl,
+        ));
+        out.push_str(&format!(
+            "intel-output: that DDI_BUF_CTL({}) word is the plan's fields only -- ENABLE, \
+             BUF_TRANS_SELECT, PHY_LINK_RATE, PORT_WIDTH and A_4_LANES.  The write is a \
+             read-modify-write, so the board's PORT_REVERSAL[16] and every other bit keep the \
+             value the firmware left\n",
+            self.ddi.name(),
         ));
         out
     }
@@ -1032,7 +1164,8 @@ pub(crate) struct OutputState {
     pub(crate) trans_ddi_func_ctl: u32,
     /// `TRANSCONF(A)` as written.
     pub(crate) transconf: u32,
-    /// `DDI_BUF_CTL` as written.
+    /// The fields this sequence owns in `DDI_BUF_CTL`, as written; the rest of
+    /// the register held what it held ([`DDI_BUF_CTL_OWNED`]).
     pub(crate) ddi_buf_ctl: u32,
     /// The `DDI_BUF_CTL` readback that showed `IS_IDLE` clear.
     pub(crate) ddi_buf_ctl_readback: u32,
@@ -1236,10 +1369,19 @@ pub(crate) fn program(
     // `TRANSCONF` and that they are one register, not two.
     write(regs, pipe::PIPECONF_A, plan.transconf)?;
 
-    // 5.7 -- the DDI buffer last, then the idle poll.  Reading the register
-    // that was just written is §2.2's read-back discipline, and the poll is
-    // what establishes the device saw the enable.
-    write(regs, registers.ddi_buf_ctl, plan.ddi_buf_ctl)?;
+    // 5.7 -- the DDI buffer last, then the idle poll.  The write is a
+    // read-modify-write over the fields the plan composes
+    // ([`DDI_BUF_CTL_OWNED`]): the register also carries the board's
+    // `PORT_REVERSAL` and i915 keeps it for this exact mode, so a whole-value
+    // write would clear a lane order the firmware declared.  Reading the
+    // register that was just written is §2.2's read-back discipline, and the
+    // poll is what establishes the device saw the enable.
+    rmw(
+        regs,
+        registers.ddi_buf_ctl,
+        DDI_BUF_CTL_OWNED,
+        plan.ddi_buf_ctl,
+    )?;
     match poll(
         regs,
         registers.ddi_buf_ctl,
