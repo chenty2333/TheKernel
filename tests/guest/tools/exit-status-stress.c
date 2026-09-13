@@ -6,8 +6,14 @@
  * shape often enough per boot to make the race frequent, and prints exactly
  * what each failing wait returned (requested pid, reaped pid, raw status).
  *
- * Usage: thekernel-exit-status-stress [workers] [rounds]
- *        defaults: 8 workers, 4000 rounds (32000 clone/exit/wait cycles)
+ * Usage: thekernel-exit-status-stress [workers] [rounds] [repeats]
+ *        defaults: 8 workers, 4000 rounds, 1 repeat
+ *        32000 clone/exit/wait cycles per repeat
+ *
+ * `repeats` re-runs the whole worker generation again, forking a fresh set of
+ * short-lived workers each time. That matches the acceptance test's churn
+ * profile (workers that live for only `rounds` children) as well as its
+ * cycle shape.
  *
  * The parent prints one line per worker plus a total, then OK/FAIL. Every bad
  * observation is printed with its round number; the count is capped so a
@@ -168,6 +174,7 @@ int main(int argc, char **argv)
 {
     unsigned workers = DEFAULT_WORKERS;
     unsigned rounds = DEFAULT_ROUNDS;
+    unsigned repeats = 1;
     pid_t pids[MAX_WORKERS];
     int pipes[MAX_WORKERS][2];
     struct worker_report reports[MAX_WORKERS];
@@ -181,91 +188,101 @@ int main(int argc, char **argv)
         workers = (unsigned)strtoul(argv[1], NULL, 0);
     if (argc > 2)
         rounds = (unsigned)strtoul(argv[2], NULL, 0);
+    if (argc > 3)
+        repeats = (unsigned)strtoul(argv[3], NULL, 0);
     if (workers == 0 || workers > MAX_WORKERS)
         workers = DEFAULT_WORKERS;
     if (rounds == 0)
         rounds = DEFAULT_ROUNDS;
+    if (repeats == 0)
+        repeats = 1;
 
-    printf("EXIT_STATUS_STRESS_START workers=%u rounds=%u\n", workers, rounds);
+    printf("EXIT_STATUS_STRESS_START workers=%u rounds=%u repeats=%u\n", workers, rounds, repeats);
     fflush(stdout);
 
-    for (unsigned index = 0; index < workers; ++index) {
-        pid_t worker;
+    for (unsigned repeat = 0; repeat < repeats; ++repeat) {
+        for (unsigned index = 0; index < workers; ++index) {
+            pid_t worker;
 
-        if (pipe(pipes[index])) {
-            printf("EXIT_STATUS_STRESS_FAIL pipe index=%u errno=%d\n", index, errno);
-            return 1;
+            if (pipe(pipes[index])) {
+                printf("EXIT_STATUS_STRESS_FAIL pipe index=%u errno=%d\n", index, errno);
+                return 1;
+            }
+            worker = fork();
+            if (worker < 0) {
+                printf("EXIT_STATUS_STRESS_FAIL fork index=%u errno=%d\n", index, errno);
+                return 1;
+            }
+            if (worker == 0) {
+                close(pipes[index][0]);
+                worker_main(index, rounds, pipes[index][1]);
+                _exit(0);
+            }
+            close(pipes[index][1]);
+            pids[index] = worker;
         }
-        worker = fork();
-        if (worker < 0) {
-            printf("EXIT_STATUS_STRESS_FAIL fork index=%u errno=%d\n", index, errno);
-            return 1;
+
+        /* Reap every worker before reading any pipe: `waitpid(worker)` must
+         * never be in flight while a worker is still creating children, or the
+         * parent would collect the worker's children and steal its waits. */
+        for (unsigned index = 0; index < workers; ++index) {
+            int status = -1;
+            pid_t reaped;
+
+            do {
+                reaped = waitpid(pids[index], &status, 0);
+            } while (reaped < 0 && errno == EINTR);
+            if (reaped != pids[index] || status != 0) {
+                printf("EXIT_STATUS_STRESS_FAIL worker_exit repeat=%u index=%u reaped=%d want=%d "
+                       "status=%#x\n",
+                       repeat, index, (int)reaped, (int)pids[index], (unsigned)status);
+                failed = 1;
+            }
         }
-        if (worker == 0) {
+
+        for (unsigned index = 0; index < workers; ++index) {
+            size_t got = 0;
+            const char *from = (const char *)&reports[index];
+
+            reports[index].first_failure_round = -1;
+            while (got < sizeof(reports[index])) {
+                ssize_t count = read(pipes[index][0], (char *)from + got,
+                                     sizeof(reports[index]) - got);
+                if (count <= 0)
+                    break;
+                got += (size_t)count;
+            }
             close(pipes[index][0]);
-            worker_main(index, rounds, pipes[index][1]);
-            _exit(0);
+            if (got != sizeof(reports[index])) {
+                printf("EXIT_STATUS_STRESS_FAIL worker_report repeat=%u index=%u got=%zu\n", repeat,
+                       index, got);
+                failed = 1;
+            }
         }
-        close(pipes[index][1]);
-        pids[index] = worker;
-    }
 
-    /* Reap every worker before reading any pipe: `waitpid(worker)` must never
-     * be in flight while a worker is still creating children, or the parent
-     * would collect the worker's children and steal its waits. */
-    for (unsigned index = 0; index < workers; ++index) {
-        int status = -1;
-        pid_t reaped;
+        for (unsigned index = 0; index < workers; ++index) {
+            const struct worker_report *report = &reports[index];
 
-        do {
-            reaped = waitpid(pids[index], &status, 0);
-        } while (reaped < 0 && errno == EINTR);
-        if (reaped != pids[index] || status != 0) {
-            printf("EXIT_STATUS_STRESS_FAIL worker_exit index=%u reaped=%d want=%d status=%#x\n",
-                   index, (int)reaped, (int)pids[index], (unsigned)status);
-            failed = 1;
-        }
-    }
-
-    for (unsigned index = 0; index < workers; ++index) {
-        size_t got = 0;
-        char *into = (char *)&reports[index];
-
-        reports[index].first_failure_round = -1;
-        while (got < sizeof(reports[index])) {
-            ssize_t count = read(pipes[index][0], into + got, sizeof(reports[index]) - got);
-            if (count <= 0)
-                break;
-            got += (size_t)count;
-        }
-        close(pipes[index][0]);
-        if (got != sizeof(reports[index])) {
-            printf("EXIT_STATUS_STRESS_FAIL worker_report index=%u got=%zu\n", index, got);
-            failed = 1;
+            total_cycles += report->cycles;
+            total_wrong_pid += report->wrong_pid;
+            total_wrong_status += report->wrong_status;
+            total_wait_errors += report->wait_errors;
+            printf("EXIT_STATUS_STRESS_WORKER repeat=%u worker=%u rounds=%u cycles=%lu ok=%lu "
+                   "wrong_pid=%lu wrong_status=%lu wait_errors=%lu pid_first=%ld pid_last=%ld "
+                   "first_round=%d first_req=%d first_reaped=%d first_status=%#x first_errno=%d\n",
+                   repeat, index, report->rounds_done, report->cycles, report->ok, report->wrong_pid,
+                   report->wrong_status, report->wait_errors, report->first_child_pid,
+                   report->last_child_pid, report->first_failure_round, report->first_requested,
+                   report->first_reaped, (unsigned)report->first_status, report->first_errno);
+            fflush(stdout);
         }
     }
 
-    for (unsigned index = 0; index < workers; ++index) {
-        const struct worker_report *report = &reports[index];
-
-        total_cycles += report->cycles;
-        total_wrong_pid += report->wrong_pid;
-        total_wrong_status += report->wrong_status;
-        total_wait_errors += report->wait_errors;
-        printf("EXIT_STATUS_STRESS_WORKER worker=%u rounds=%u cycles=%lu ok=%lu wrong_pid=%lu "
-               "wrong_status=%lu wait_errors=%lu pid_first=%ld pid_last=%ld first_round=%d "
-               "first_req=%d first_reaped=%d first_status=%#x first_errno=%d\n",
-               index, report->rounds_done, report->cycles, report->ok, report->wrong_pid,
-               report->wrong_status, report->wait_errors, report->first_child_pid,
-               report->last_child_pid, report->first_failure_round, report->first_requested,
-               report->first_reaped, (unsigned)report->first_status, report->first_errno);
-    }
-
-    printf("EXIT_STATUS_STRESS_DONE workers=%u rounds=%u cycles=%lu ok=%lu wrong_pid=%lu "
+    printf("EXIT_STATUS_STRESS_DONE workers=%u rounds=%u repeats=%u cycles=%lu ok=%lu wrong_pid=%lu "
            "wrong_status=%lu wait_errors=%lu\n",
-           workers, rounds, total_cycles, total_cycles - total_wrong_pid - total_wrong_status -
-               total_wait_errors,
-           total_wrong_pid, total_wrong_status, total_wait_errors);
+           workers, rounds, repeats, total_cycles,
+           total_cycles - total_wrong_pid - total_wrong_status - total_wait_errors, total_wrong_pid,
+           total_wrong_status, total_wait_errors);
     fflush(stdout);
     if (failed || total_wrong_pid || total_wrong_status || total_wait_errors) {
         puts("THEKERNEL_EXIT_STATUS_STRESS_FAIL");
