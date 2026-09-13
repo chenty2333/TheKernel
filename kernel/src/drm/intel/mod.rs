@@ -202,6 +202,14 @@ static HOTPLUG: Mutex<Option<HotplugWatch>> = Mutex::new(None);
 /// both leave their reason here rather than leaving the file silent about it.
 static MODESET: Mutex<Option<String>> = Mutex::new(None);
 
+/// What the graphics address space turned out to be, as text.
+///
+/// The aperture is read from the device (`ApertureSize`), not inferred from the
+/// BAR split, and the number decides how much address space may be handed out
+/// at all -- so it belongs next to the modeset in the file a person reads back,
+/// not only in a boot log that has scrolled away.
+static GTT: Mutex<Option<String>> = Mutex::new(None);
+
 /// A value as grouped hexadecimal, the way a register dump is written down.
 ///
 /// `0x0000_6000_0000_0000` can be read a field at a time; `0x600000000000`
@@ -414,7 +422,17 @@ fn modeset_at_boot(powered: &[(pci::Bdf, RegisterWindow)]) {
         return;
     };
 
-    let gtt = match gtt::Gtt::map(physical, bar0_len) {
+    // The aperture the allocator may use is the device's own statement of it:
+    // the BAR split says how much *window* there is, and i915 takes the size
+    // from the `GGMS` field instead (`gt/intel_ggtt.c:1228`, decoded by
+    // `gen8_get_total_gtt_size` at `:1107-1121`).  A machine where the field
+    // cannot be read keeps the window-derived size, with the observation
+    // visibly absent rather than assumed.
+    let aperture_size = match pci::Ecam::platform() {
+        Some(ecam) => gtt::ApertureSize::read(&ecam, connector.bdf),
+        None => gtt::ApertureSize::NotObserved,
+    };
+    let gtt = match gtt::Gtt::map(physical, bar0_len, aperture_size) {
         Ok(gtt) => gtt,
         Err(error) => {
             axlog::warn!("intel-modeset: {}", error.describe());
@@ -422,6 +440,7 @@ fn modeset_at_boot(powered: &[(pci::Bdf, RegisterWindow)]) {
             return;
         }
     };
+    *GTT.lock() = Some(gtt.describe());
 
     // The two modes `choose_mode` can return are the mode layer's choice and
     // the reference timing, so a surface that covers both covers the choice.
@@ -920,6 +939,9 @@ pub(crate) fn report_text() -> String {
     }
     if let Some(connect) = &*CONNECT.lock() {
         text.push_str(&connect.render());
+    }
+    if let Some(gtt) = &*GTT.lock() {
+        text.push_str(gtt);
     }
     if let Some(modeset) = &*MODESET.lock() {
         text.push_str(modeset);
