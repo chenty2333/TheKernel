@@ -1,9 +1,11 @@
 # GMBUS, DDC/EDID transport and hotplug detect
 
-Status: implemented on `feat/intel-gmbus` (commits `3bcb93ed`, `ad28c56a`).  This
-document describes what the GMBUS transport and the hotplug block do, what is
-sourced and what is inferred, what has been tested and — the part that matters
-most — what has not.
+Status: implemented on `feat/intel-gmbus-power`, which is this workstream merged
+onto `dev` (the merge resolved the duplicated `ICL_PWR_WELL_CTL_AUX2` declaration
+and the two `Meaning` schemes) plus the boot-time wiring of the reference's
+phase 2.  This document describes what the GMBUS transport, the hotplug block and
+the sink step do, what is sourced and what is inferred, what has been tested and
+— the part that matters most — what has not.
 
 The deep register reference is
 [`intel-display-registers.md`](intel-display-registers.md).  Section 9 is GMBUS,
@@ -18,15 +20,51 @@ that distinction is kept explicit throughout.
 
 ## What is implemented
 
-`kernel/src/drm/intel/` gained two modules and one register table:
+`kernel/src/drm/intel/` gained three modules and one register table:
 
 | module | responsibility |
 |---|---|
 | `gmbus.rs` | the pin map, the transaction state machine, the timeout, the recovery, and EDID validation |
-| `gmbus/tests.rs` | a controller that can be made to fail, and 27 tests that make it |
+| `gmbus/tests.rs` | a controller that can be made to fail, and 27 tests that make it; also the module tree's one test double for a register file |
 | `hpd.rs` | hotplug enable, live connect state, board polarity |
 | `hpd/tests.rs` | 10 tests over bit positions and over what is *not* written |
-| `regs.rs` | `BUS`: the eleven registers these two modules own, with their access classification |
+| `sink.rs` | phase 2 at boot: find the monitor, read its EDID, ask the mode layer, enable hotplug and read it once |
+| `sink/tests.rs` | 5 tests that run that whole chain against the modelled controller |
+| `regs.rs` | `BUS`: the ten registers these modules own, with their access classification |
+
+### One register, one declaration, one owner
+
+The power workstream and this one both declared `ICL_PWR_WELL_CTL_AUX2`
+(`0x45444`): power because it programs wells, this workstream because a NAKed
+DDC transaction is diagnosed against the well's state bit.  There is one
+declaration, in the power bring-up table, because the module that programs a
+register owns it.  `gmbus` reads the state bit through that declaration and
+writes nothing, which its own test double asserts, so the power side's
+read-write classification loosens nothing here.  `regs.rs` carries a test,
+`no_two_tables_declare_the_same_register`, that walks every register table —
+`NAMED`, the power and clock table, the combo PHY tables and `BUS` — and refuses
+a duplicate by name or by offset: a register declared twice is two decodings,
+two access classifications and no answer to "who owns this address".
+
+The `Meaning` tags were extended by both workstreams as well, into a `BringUp`
+bag on one side and `BusController`/`Hotplug`/`PowerWell` on the other.  The
+finer-grained set is what the tree carries, because each names a subsystem with
+a module that interprets it; `BringUp` remains for the registers with no better
+home (clocks, a clock's reference fuse, DBUF slices, combo PHY registers,
+workarounds, error masks) and its documentation says so.  The six power-well
+registers are tagged `PowerWell`.
+
+### The register file abstraction
+
+GMBUS and hotplug are written against `regs::Registers`, the same trait the
+power, clock, PHY and PLL sequences use, rather than against MMIO.  That was not
+true of the first version of this workstream — it had a `BusRegisters` of its
+own, the same shape as `Registers`, which the merge made visible as duplication
+and which is now gone.  The consequence for testing is the point: one device
+model implements one trait, so the transport, the hotplug block and phase 2 are
+all driven through the same double, and it applies the same two rules the mapped
+window applies (a read-only register refuses a write; a register outside the
+window has no address).
 
 The deliverable is one function:
 
@@ -40,22 +78,29 @@ or a named failure.  Around it:
 
 * `read_edid_detailed` — the same, plus the observations that are not failures
   (see [Bus notes](#bus-notes)).
-* `read_edid_extension` — the CTA-861 block at EEPROM address `0x80`, when the
-  base block declares one.
+* `read_edid_extension` — the extension block at EEPROM address `0x80`, when
+  the base block declares one (the CTA-861 block is the usual one).
 * `probe_sink` — the reference's port-identification procedure: ask DDI A, then
   DDI B, then DDI C, and report which pin answered.
 * `hpd::enable_and_read` — the PRM's procedure verbatim: enable hotplug
   detection, then read the status register once.
+* `sink::probe_at_boot` — phase 2 of the reference's bring-up order, run at boot
+  from `intel::probe_at_boot`, on every device whose register window the probe
+  mapped.  This is what makes the EDID reachable on the target machine.
 
 ### The handoff to the mode layer
 
-`EdidBytes` is a validated 128-byte block and nothing more; `as_slice()` is the
-byte slice `drm::modes::plan_modeset` takes.  This workstream deliberately stops
-at bytes.  `kernel/src/drm/modes/` is **not in this branch** — it lives on
-`feat/display-modes`, which is not yet merged into `dev` — and writing a second
-EDID parser to fill the hole would be worse than deferring one commit of
-integration.  The integration, when that branch lands, is a call to
-`plan_modeset(edid.as_slice(), &Constraints::unlimited())` and nothing else.
+`EdidBytes` is a validated 128-byte block and nothing more, and the parser
+belongs to `drm::modes` — this workstream does not carry a second one.  The
+integration is in `sink::probe_one`: the base block and the extension block the
+sink declared are concatenated (the mode layer's strict parse requires every
+block the base block declares, so handing it only the base block of a sink with
+an extension would report a parse error that is really a transport omission)
+and handed to `drm::modes::plan_modeset` with `Constraints::unlimited()`.
+`plan_modeset` never fails: a sink that advertises nothing usable gets the
+built-in fallback and its own log line.  The chosen mode is kept in the report,
+so `/sys/kernel/debug/dri/0/intel_gpu` says which timing this kernel would
+program.
 
 ## The pin map, and the off-by-one
 
@@ -251,15 +296,14 @@ status line prints it every time so that nobody has to look twice.
 
 ## What is verified, and by what
 
-Host tests only.  `cargo test -p thekernel-kernel --lib drm::intel`: **74
-passed**, of which 37 are this workstream's (27 in `gmbus::tests`, 10 in
-`hpd::tests`).  The tests drive the real state
-machine — the same `transfer`, `wait_for`, `failure` and `read_block` the target
-would run — through `FakeController`, which is a device model layered on a real
-`RegisterWindow` over an ordinary buffer.  That layering is deliberate: the
-register addresses, the access rules and the bounds checks under test are the
-real ones, so a write to a register the table declares read-only is refused in a
-test for the same reason it would be refused on hardware.
+Host tests only.  `cargo test -p thekernel-kernel --lib drm::intel`: **148
+passed**, of which 42 are this workstream's (27 in `gmbus::tests`, 10 in
+`hpd::tests`, 5 in `sink::tests`).  The tests drive the real state machine — the
+same `transfer`, `wait_for`, `failure`, `read_block` and `probe_one` the target
+would run — through `FakeController`, which is a device model implementing
+`regs::Registers` and applying the same two rules the mapped window applies.
+That is deliberate: a write to a register the table declares read-only is
+refused in a test for the same reason it would be refused on hardware.
 
 What the tests establish:
 
@@ -285,7 +329,25 @@ What the tests establish:
   detect field, that enabling detection never touches the polarity register,
   that the pulse filter is read and never written, that a read changes no
   register, and that a window which does not reach the block is a named error
-  rather than a zero.
+  rather than a zero;
+* phase 2 end to end, through the same double: a sink advertising 1920x1080@60
+  produces that timing from `plan_modeset` (`148_500` kHz, strict parse, the
+  sink's own detailed timing), a port with nothing on it reports the AUX well by
+  name on every pin, hotplug is enabled for all four DDIs in the same pass
+  without programming a detect field, a declared extension block is read and
+  parsed with its base block, and a window that does not reach the registers is
+  reported as that rather than as "no monitor".
+
+One real bug came out of writing the phase-2 test.  `read_block` validated every
+block with the *base block's* header check, so no EDID extension could ever be
+read: an extension block begins with its own tag byte, and its only structural
+check is the checksum.  A monitor that declared a CTA-861 extension would have
+been reported as a monitor whose extension could not be read, with `EdidHeader`
+pointing the reader at the header, which was fine.  Validation now takes the
+block kind and both directions are tested.  The bug was in the version committed
+before the merge, and it was invisible until something asked for an extension —
+which is the argument for the integration test rather than more unit tests of
+the pieces.
 
 Clippy with the repository's deny set (`-D clippy::correctness -D
 clippy::suspicious`) is clean for the crate.
@@ -311,13 +373,14 @@ Everything that involves silicon.  In particular:
   figures and in the arithmetic of 100 kHz DDC, and that is all.
 * **No interrupt is taken**, so nothing here exercises `SDE_GMBUS_ICP` or an
   HPD interrupt, by design.
-* **No call site.**  Within this workstream's file scope the only boot-time hook
-  into `kernel/src/drm/intel/` is `mod.rs::probe_at_boot`, which the brief
-  reserves to the coordinator; so `read_edid`, `probe_sink` and
-  `hpd::enable_and_read` are reachable from the tests and from a later caller,
-  but nothing calls them during a boot as landed.  Wiring them is one line each
-  (see the "Where the display driver plugs in" note in
-  [`intel-gpu-probe.md`](intel-gpu-probe.md)).
+* **Phase 2 has never run on the machine.**  The boot step is now wired, so the
+  first boot of this kernel on the N305 will be the first time anything here has
+  touched a display controller.  What it prints is the finding: either a monitor
+  on a named pin with a timing, or the name of the power well that is off.
+* **The mode layer is given `Constraints::unlimited()`**, which is honest for a
+  first bring-up and wrong for a real one: the CDCLK, the link rate and the
+  plane's limits are not known to this workstream yet, so a timing this kernel
+  *would* choose is not yet a timing it *can* program.
 
 ## Gaps and inferences this workstream bridges
 
@@ -329,15 +392,15 @@ Everything that involves silicon.  In particular:
 | `0xC2000` unnamed (§13.1 item 10) | `[I915]` `i915_reg.h` | it is `SOUTH_CHICKEN1`, one inversion bit per DDI; the gap is closed |
 | DDI D has no DDC pin on this part (§9.2's table says otherwise) | `[I915]` `gmbus_pins_icp` | `Pin` has no DDI D; `Ddi::D.pin()` is `None` |
 | which ADL-N boards invert hotplug (§9.5, §13.2) | `[I915]` applies it on DG1 only | reported, never applied unless asked |
-| EDID parsing | not this workstream | bytes are returned validated; `drm::modes` parses them when that branch lands |
+| EDID parsing | not this workstream | bytes are returned validated and handed to `drm::modes::plan_modeset` in `sink::probe_one`; no second parser exists |
 
 ## Where the next step begins
 
-1. Wire `probe_sink` and `hpd::enable_and_read` into the boot path (one line
-   each, outside this workstream's file scope), so the target machine's EDID and
-   its live hotplug state reach the boot log and the debug file.
-2. Enable the AUX/DDC power well for the pin pair with a monitor on it — the
-   power workstream's register — which `AuxWellDown` will have named.
-3. Hand `EdidBytes::as_slice()` to `drm::modes`, when that branch is in `dev`,
-   for the preferred timing and the constraints check.
-4. Only then does a mode exist to program, which is reference §11 phase 3.
+1. Boot it.  The first line to look for is `intel-sink:`: either "a monitor
+   answered on pin N" — which identifies the physical port — or the name of the
+   AUX/DDC power well that reads back as off.
+2. If the well is off, enable it for that pin pair (the power workstream's
+   register; `AuxWellDown` names it), and read the EDID again.
+3. Replace `Constraints::unlimited()` with the real limits once the CDCLK and
+   the link are known, so the chosen timing is one the hardware can carry.
+4. Program it: reference §11 phase 3 onward, which is the rest of stage 2.
