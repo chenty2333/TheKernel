@@ -1,6 +1,8 @@
 //! Special devices
 
-mod bootfb;
+/// The firmware's linear framebuffer, offered to the scanout selection in
+/// `crate::drm::screen` as the candidate of last resort.
+pub(crate) mod bootfb;
 mod console_font;
 mod dri;
 #[cfg(feature = "input")]
@@ -546,41 +548,13 @@ impl DeviceOps for BlockDevice {
 
 /// The scanout `/dev/fb0` should be published over, if this machine has one.
 ///
-/// A DRM device wins when one exists: it is a real driver with a real
-/// connector behind it.  The firmware aperture is the fallback which keeps a
-/// machine with no display device at all able to show a console, and on a
-/// machine with no serial port that console is the only way anything can be
-/// reported at all.
+/// The choice is not made here.  `crate::drm::screen` holds the kernel's single
+/// selection point: it consults every registered provider in rank order, logs
+/// what happened to each of them, and falls through a provider that cannot
+/// deliver to the next one.  DRM-owned surfaces, the firmware's aperture and
+/// anything a display driver registers are all candidates there.
 fn primary_scanout() -> Option<Arc<dyn scanout::ScanoutSurface>> {
-    if let Some(device) = crate::drm::primary_device() {
-        match crate::drm::drm_scanout(device) {
-            Ok(scanout) => return Some(scanout),
-            // Fall through rather than give up.  A DRM setup which cannot
-            // produce a scanout must not also cost the machine the aperture it
-            // could still draw into.
-            Err(error) => warn!("Failed to prepare the DRM scanout for fbdev: {error}"),
-        }
-    }
-    let framebuffer = axhal::boot::framebuffer()?;
-    let surface = match bootfb::BootFb::new(&framebuffer) {
-        Ok(surface) => surface,
-        Err(error) => {
-            error!("Failed to map the firmware framebuffer: {error}");
-            return None;
-        }
-    };
-    let surface: Arc<dyn scanout::ScanoutSurface> = match Arc::try_new(surface) {
-        Ok(surface) => surface,
-        Err(_) => {
-            error!("Failed to allocate the firmware framebuffer surface");
-            return None;
-        }
-    };
-    info!(
-        "Firmware framebuffer scanout: {}x{} pitch {} at {:#x}",
-        framebuffer.width, framebuffer.height, framebuffer.pitch, framebuffer.address
-    );
-    Some(surface)
+    crate::drm::screen::console_scanout()
 }
 
 fn builder(fs: Arc<SimpleFs>) -> DirMaker {
