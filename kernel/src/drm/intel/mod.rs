@@ -193,6 +193,15 @@ const HOTPLUG_EVENT_LIMIT: usize = 32;
 /// be a claim this kernel cannot make.
 static HOTPLUG: Mutex<Option<HotplugWatch>> = Mutex::new(None);
 
+/// What the modeset observed, as the text a reader works from afterwards.
+///
+/// Kept beside the probe's report for the reason the probe's is kept: phase 6's
+/// readings are the only evidence that the display engine is scanning this
+/// kernel's framebuffer out, and on a machine whose console is the screen a
+/// boot log scrolls away.  A run that did not happen, and a run that failed,
+/// both leave their reason here rather than leaving the file silent about it.
+static MODESET: Mutex<Option<String>> = Mutex::new(None);
+
 /// A value as grouped hexadecimal, the way a register dump is written down.
 ///
 /// `0x0000_6000_0000_0000` can be read a field at a time; `0x600000000000`
@@ -288,6 +297,13 @@ pub(crate) fn bring_up_at_boot() {
         *CONNECT.lock() = Some(connect);
     }
 
+    // The modeset runs before the watch starts, and that order is deliberate:
+    // a watch that was already polling could see a monitor arrive while the
+    // only sequence this kernel has for programming a pipe is halfway through
+    // it, and there is no second modeset to give it.
+    #[cfg(target_os = "none")]
+    modeset_at_boot(&powered);
+
     // The after-boot watch starts here and nowhere else.  Every step it depends
     // on has now run: the window is mapped, the display is powered, hotplug
     // detection is enabled, and the states the boot step read are in [`CONNECT`]
@@ -295,6 +311,244 @@ pub(crate) fn bring_up_at_boot() {
     // and never polls.
     #[cfg(target_os = "none")]
     start_hotplug_watch(&powered);
+}
+
+/// Ask the display engine to scan a pattern out, and offer the result to the
+/// console.
+///
+/// This is reference §11 phases 3.2 to 6 as one boot-time step, and the only
+/// caller of [`modeset::set_mode`] in the product build.  Everything it needs
+/// has already happened by the time it runs: the probe mapped the register
+/// window, phase 1 powered the display, phase 2 found a monitor and produced
+/// the mode layer's plan.  It takes the first device a monitor answered on
+/// whose power came up -- there is one display engine and one console, so a
+/// second monitor has nowhere to go.
+///
+/// Two of its inputs are worth naming because they are what the machine
+/// supplies and this kernel cannot:
+///
+/// * **The surface's size.**  [`modeset::choose_mode`] runs inside `set_mode`,
+///   so the framebuffer has to be allocated before the mode is known.  It is
+///   allocated for the larger of the mode layer's choice and §11 phase 3.1's
+///   1920x1080@60 preference, which are the only two modes `choose_mode` can
+///   return, so whichever it picks fits.  A larger monitor therefore costs the
+///   larger allocation, and a frame that cannot be allocated is refused by name
+///   with the firmware's console still up.
+/// * **§8.5's voltage-swing values.**  They are the board's, not ours, so they
+///   are read back out of the PHY the firmware programmed ([`swing`]).  When
+///   that read refuses -- a port the firmware never brought up -- the request
+///   carries no values and [`output::OutputProgram::plan`] refuses with
+///   `MissingBufferTranslation` *before the first write*, which is the same
+///   outcome with one error path instead of two.
+///
+/// The console is offered the surface only through [`scanout::register`], which
+/// re-checks the phase-6 verdict against the surface it was handed: on anything
+/// but a proven scanout the firmware framebuffer keeps the screen and the
+/// reason the Intel one did not is what the log carries.  The ordering that
+/// makes the offer count is the entry point's: `drm::init_virtio_gpu` runs
+/// before `pseudofs::mount_all`, and `/dev/fb0` asks for a surface only when
+/// that filesystem is built, so the candidate registered here is in the list
+/// before the console consults it.  Nothing here retries,
+/// nothing unwinds, and nothing panics -- a half-programmed mode is not a mode,
+/// and on a machine whose only output is the screen the failure's own signature
+/// is the diagnostic.
+#[cfg(target_os = "none")]
+fn modeset_at_boot(powered: &[(pci::Bdf, RegisterWindow)]) {
+    use alloc::sync::Arc;
+
+    // The report is moved out rather than cloned: `ModePlan` is not `Clone` and
+    // holding the lock across an allocation and a modeset would be worse than
+    // either.  It is put back before this function returns, so the debug file
+    // still shows what phase 2 found.
+    let Some(report) = CONNECT.lock().take() else {
+        return;
+    };
+    let Some(connector) = report.connectors.first() else {
+        axlog::info!(
+            "intel-modeset: no monitor answered on any DDC pin, so no mode is set and the \
+             firmware's framebuffer keeps the console (reference section 11 phase 3.1)"
+        );
+        *CONNECT.lock() = Some(report);
+        return;
+    };
+    let Some((window, aperture, physical)) = mapped_facts(connector.bdf) else {
+        axlog::warn!(
+            "intel-modeset: display {} has a connector but no mapped register window, so nothing \
+             was programmed",
+            connector.bdf
+        );
+        *CONNECT.lock() = Some(report);
+        return;
+    };
+    if !powered.iter().any(|(bdf, _)| *bdf == connector.bdf) {
+        axlog::warn!(
+            "intel-modeset: display {} never came up in phase 1, so it is not programmed; the \
+             power failure above is the finding, not this line",
+            connector.bdf
+        );
+        *CONNECT.lock() = Some(report);
+        return;
+    }
+    if aperture.bar != 0 {
+        axlog::warn!(
+            "intel-modeset: the window mapped for {} is {} (BAR {}), not the GTTMMADR aperture \
+             the graphics address space lives in, so nothing was programmed",
+            connector.bdf,
+            aperture.name,
+            aperture.bar
+        );
+        *CONNECT.lock() = Some(report);
+        return;
+    }
+    // The aperture's size is the model's, not a probe: §11 phase 0.4 says to
+    // read the actual BAR sizes and this probe is read-only, so it cannot use
+    // the write-all-ones trick.  A BAR the firmware shrank would fail the page
+    // table's own read-back check rather than silently addressing past it.
+    let Some(bar0_len) = aperture.size else {
+        axlog::warn!(
+            "intel-modeset: no documented size for {}, so the GTT array is not mapped and no mode \
+             is set",
+            aperture.name
+        );
+        *CONNECT.lock() = Some(report);
+        return;
+    };
+
+    let gtt = match gtt::Gtt::map(physical, bar0_len) {
+        Ok(gtt) => gtt,
+        Err(error) => {
+            axlog::warn!("intel-modeset: {}", error.describe());
+            *CONNECT.lock() = Some(report);
+            return;
+        }
+    };
+
+    // The two modes `choose_mode` can return are the mode layer's choice and
+    // the reference timing, so a surface that covers both covers the choice.
+    let chosen = connector.plan.selection.mode;
+    let width = u32::from(chosen.hdisplay).max(u32::from(modeset::REFERENCE_HDISPLAY));
+    let height = u32::from(chosen.vdisplay).max(u32::from(modeset::REFERENCE_VDISPLAY));
+    axlog::info!(
+        "intel-modeset: allocating {width}x{height} XRGB8888 for {} (phase 3.2), then programming \
+         pipe A through DDI {} (phases 3.4 to 5.7)",
+        connector.bdf,
+        connector.ddi
+    );
+    let surface = match fb::Surface::allocate(&gtt, width, height, fb::Format::Xrgb8888) {
+        Ok(surface) => surface,
+        Err(error) => {
+            axlog::warn!("intel-modeset: {}", error.describe());
+            *CONNECT.lock() = Some(report);
+            return;
+        }
+    };
+
+    // The blocks the mode layer's plan was made from, in the order it read them.
+    let mut edid = Vec::with_capacity(2 * gmbus::EDID_BLOCK_LEN);
+    edid.extend_from_slice(connector.edid.as_slice());
+    if let Some(extension) = &connector.extension {
+        edid.extend_from_slice(extension.as_slice());
+    }
+
+    let swing = match swing::read_firmware_swing(&window, connector.ddi) {
+        Ok(swing) => Some(swing),
+        Err(source) => {
+            // Not fatal here: the request below carries no values, and phase
+            // 5's own refusal names the table and the reference's gap.
+            axlog::warn!(
+                "intel-modeset: {} has no buffer-translation values to replay: {}",
+                connector.ddi,
+                source.describe()
+            );
+            None
+        }
+    };
+
+    let mut request = modeset::ModeRequest::new(
+        connector.ddi,
+        pipe::Pipe::A,
+        &connector.plan,
+        &edid,
+        &surface,
+        // The named field encoding is the one the ADL-N path writes and reads
+        // back (`icl_wrpll_params_populate`); the Skylake codes are the other
+        // convention and not this part's.
+        pll::PllFieldEncoding::Named,
+    );
+    request.frame = 0;
+    request.swing = swing;
+    // §8.6 gives no sourced HDMI encoding for PHY_LINK_RATE; zero is the
+    // honest value until a dump from this machine settles it (reference §13.4).
+    request.link_rate = output::LinkRate::NoSourcedEncoding;
+
+    let outcome = match modeset::set_mode(&window, &gmbus::MonotonicTimer, &request) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let text = alloc::format!(
+                "intel-modeset: the mode was not set: {} ({error:?}).  The firmware's framebuffer \
+                 keeps the console (reference section 11 phase 6)",
+                error.describe()
+            );
+            axlog::warn!("{text}");
+            *MODESET.lock() = Some(text);
+            *CONNECT.lock() = Some(report);
+            return;
+        }
+    };
+    outcome.log();
+    *MODESET.lock() = Some(outcome.render());
+
+    let verdict = if outcome.prove.verdict().is_scanning_out() {
+        match outcome.prove.surflive() {
+            Some(surflive) => scanout::Verdict::Scanning { surflive },
+            // A scanning verdict without the reading it was made from is not
+            // evidence, and the console is not moved on anything less.
+            None => scanout::Verdict::NotScanning {
+                reason: String::from(
+                    "phase 6 reports the pipe scanning, but the PLANE_SURFLIVE reading that \
+                     verdict rests on is absent",
+                ),
+            },
+        }
+    } else {
+        scanout::Verdict::NotScanning {
+            reason: outcome
+                .prove
+                .verdict()
+                .unavailable_reason()
+                .unwrap_or_else(|| {
+                    String::from("phase 6 did not prove the pipe is scanning this surface out")
+                }),
+        }
+    };
+    scanout::register(Arc::new(surface), verdict);
+    *CONNECT.lock() = Some(report);
+}
+
+/// The mapped window, the aperture the probe mapped it from, and the BAR's
+/// physical base, for one device.
+///
+/// Read back out of the probe's report rather than carried along: the report is
+/// what the debug file shows a reader, so a device the probe refused to map
+/// cannot be programmed by a later step that kept its own copy of the facts.
+#[cfg(target_os = "none")]
+fn mapped_facts(bdf: pci::Bdf) -> Option<(RegisterWindow, &'static Aperture, u64)> {
+    let report = REPORT.lock();
+    let report = report.as_ref()?;
+    for found in &report.displays {
+        if found.info.bdf != bdf {
+            continue;
+        }
+        if let WindowStatus::Mapped {
+            window,
+            aperture,
+            physical,
+        } = found.status
+        {
+            return Some((window, aperture, physical));
+        }
+    }
+    None
 }
 
 /// The devices whose register window the probe mapped, with those windows.
@@ -666,6 +920,9 @@ pub(crate) fn report_text() -> String {
     }
     if let Some(connect) = &*CONNECT.lock() {
         text.push_str(&connect.render());
+    }
+    if let Some(modeset) = &*MODESET.lock() {
+        text.push_str(modeset);
     }
     if let Some(watch) = &*HOTPLUG.lock() {
         text.push_str(&watch.render());
