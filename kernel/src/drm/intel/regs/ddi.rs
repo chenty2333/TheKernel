@@ -132,6 +132,62 @@ pub(crate) const TRANS_VBLANK_D: Register =
 /// `TRANS_VSYNC(D)`, vertical sync start and end; reference section 5.3.
 pub(crate) const TRANS_VSYNC_D: Register =
     Register::read_write("TRANS_VSYNC(D)", 0x63_014, Meaning::BringUp, None);
+
+/// `TRANS_SET_CONTEXT_LATENCY(A)`, the ADL+ replacement for `VBLANK_START`;
+/// `[I915]` `i915_reg.h:4027-4031`.
+///
+/// **The reference document does not have this register at all.**  Its section
+/// 5.3 table gives the transcoder block six timing registers and
+/// `TRANS_VSYNCSHIFT` and stops there, so a bring-up built from that table
+/// alone programs `TRANS_VBLANK`'s `VBLANK_START` field and leaves the pipe
+/// with the wrong vertical blanking start on this display version.
+/// `intel_set_transcoder_timings` writes this register instead, for
+/// `DISPLAY_VER >= 13`, with `crtc_vblank_start - crtc_vdisplay`, and then
+/// clears `VBLANK_START` because the hardware no longer reads it
+/// (`display/intel_display.c:2717-2735`).  The offset is `0x6007c`
+/// (`i915_reg.h:4027`), the transcoder base plus `0x7c`; the `_B`/`_C`/`_D`
+/// instances are the `+0x1000` stride section 5.3 gives the block
+/// (`intel_display_device.c:73-77`).
+pub(crate) const TRANS_SET_CONTEXT_LATENCY_A: Register = Register::read_write(
+    "TRANS_SET_CONTEXT_LATENCY(A)",
+    0x60_07c,
+    Meaning::BringUp,
+    None,
+);
+
+/// `TRANS_SET_CONTEXT_LATENCY(B)`, the same register for transcoder B.
+///
+/// See [`TRANS_SET_CONTEXT_LATENCY_A`]; the instance is transcoder B's block at
+/// `0x61000`.
+pub(crate) const TRANS_SET_CONTEXT_LATENCY_B: Register = Register::read_write(
+    "TRANS_SET_CONTEXT_LATENCY(B)",
+    0x61_07c,
+    Meaning::BringUp,
+    None,
+);
+
+/// `TRANS_SET_CONTEXT_LATENCY(C)`, the same register for transcoder C.
+///
+/// See [`TRANS_SET_CONTEXT_LATENCY_A`]; the instance is transcoder C's block at
+/// `0x62000`.
+pub(crate) const TRANS_SET_CONTEXT_LATENCY_C: Register = Register::read_write(
+    "TRANS_SET_CONTEXT_LATENCY(C)",
+    0x62_07c,
+    Meaning::BringUp,
+    None,
+);
+
+/// `TRANS_SET_CONTEXT_LATENCY(D)`, the same register for transcoder D.
+///
+/// See [`TRANS_SET_CONTEXT_LATENCY_A`]; the instance is transcoder D's block at
+/// `0x63000`.
+pub(crate) const TRANS_SET_CONTEXT_LATENCY_D: Register = Register::read_write(
+    "TRANS_SET_CONTEXT_LATENCY(D)",
+    0x63_07c,
+    Meaning::BringUp,
+    None,
+);
+
 /// `TRANS_CLK_SEL(A)`, the transcoder's port-clock select; reference section 6.3.
 ///
 /// One of the three muxes that must agree before a mode appears: it connects

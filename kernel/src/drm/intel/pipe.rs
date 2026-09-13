@@ -3,18 +3,26 @@
 //!
 //! [`compute`] turns a [`Mode`] plus a [`PlaneSurface`] into a [`PipeProgram`],
 //! which is every register value the pipe half of a modeset needs; [`program`]
-//! writes that program in one order; [`prove`] performs the pipe-side half of
-//! phase 6 -- the three reads that say whether any of it worked.
+//! writes the shadow half of that program in one order, [`arm`] writes the two
+//! registers that latch it after the pipe is running, and [`prove`] performs the
+//! pipe-side half of phase 6 -- the three reads that say whether any of it
+//! worked.
 //!
 //! ```text
-//! 3.4  HTOTAL, HBLANK, HSYNC, VTOTAL, VBLANK, VSYNC, PIPESRC   from timing.rs
+//! —    PIPE_MISC(A)  BPC 8, dither off, pixel rounding truncated
+//! —    PIPE_ARB_CTL(A)  USE_PROG_SLOTS                     Wa_22012358565:adl-p
+//! 3.4  the timing registers                                    from timing.rs
 //! 4.1  PLANE_BUF_CFG(A,1) = 0x0fff0000                         the whole DDB
-//! 4.2  PLANE_WM(A,1,0..7)  level 0 generous, 1..7 disabled     section 7.3
-//! 4.3  PLANE_STRIDE, PLANE_POS, PLANE_SIZE,
-//!      PLANE_OFFSET, PLANE_COLOR_CTL, PLANE_CTL, PLANE_SURF     section 5.6
-//!      PIPE_MISC(A)  BPC 8, dither off                          section 11 5.6
-//! 6.1  PIPEDSL(A) twice, a few milliseconds apart, must change
-//! 6.2  PLANE_SURFLIVE(A,1) must equal what PLANE_SURF was written with
+//! 4.2  PLANE_WM(A,1,0..5)  level 0 generous, 1..5 disabled     section 7.3
+//!      PLANE_WM_TRANS disabled, PLANE_WM_SAGV and
+//!      PLANE_WM_SAGV_TRANS at level 0's value                  [I915]
+//! 4.3  PLANE_STRIDE, PLANE_POS, PLANE_SIZE, PLANE_OFFSET,
+//!      PLANE_COLOR_CTL                            shadow, latched by the arm
+//! 5.6  the output workstream writes TRANSCONF and the pipe starts
+//! 4.3  PLANE_CTL then PLANE_SURF                 the arm: separate step, last
+//! 6.1  PIPEDSL(A) four times, a millisecond apart, must change
+//! 6.2  PLANE_SURFLIVE(A,1) must equal what PLANE_SURF was written with,
+//!      polled for about two frame times because the arm latches at a vblank
 //! 6.4  PIPESTAT(A) bit 31, the FIFO underrun, must be clear
 //! ```
 //!
@@ -30,22 +38,41 @@
 //! commit, and the one ordering rule this module exists to keep is that nothing
 //! is armed until the watermarks are in place.
 //!
+//! **The arm is also a separate step in time, not only a separate group of
+//! registers.**  The shadow writes are latched at the plane's update event,
+//! which is the pipe's vblank, and a disabled transcoder has no vblank to latch
+//! at: `[I915]` says "Until the pipe starts PIPEDSL reads will return a stale
+//! value" (`display/intel_display.c:478-486`).  A `PLANE_SURF` written before
+//! `TRANSCONF` therefore arms nothing until the pipe runs, and depending on
+//! that is depending on undocumented latch behaviour.  `[I915]` does not: it
+//! enables the crtc (`:7200`) and arms the plane afterwards (`:7249`), and the
+//! arm writes `PLANE_CTL` and `PLANE_SURF` adjacently
+//! (`display/skl_universal_plane.c:1530-1531`).  So [`program`] writes every
+//! shadow register and stops, and [`arm`] -- called after the output
+//! workstream's `TRANSCONF` -- writes the pair.  Coreboot's libgfxinit arms
+//! before the enable and ships that order, so the reference's order is probably
+//! not fatal; whether a pending pre-enable arm survives the enable is
+//! undocumented, and that is exactly why this module no longer relies on it.
+//!
 //! That matters more than it sounds, because section 7.1 says the failure it
 //! prevents is invisible: "The default settings of the watermark configuration
 //! registers **will not allow the display engine to operate**", and section 11
 //! step 4.2 adds that a plane whose `PLANE_WM_EN` is 0 "reads nothing".  A pipe
 //! with correct timings, a correct DDI and a correct surface address shows a
 //! black screen if the watermarks are missing, which is why [`program`] builds
-//! the entire write list -- including the value `PIPE_MISC` will end up with,
-//! which needs a read first -- *before* it writes any of it, and why the tests
-//! assert on the write log rather than on the return value.
-//!
+//! the entire write list -- including the values `PIPE_MISC` and `PIPE_ARB_CTL`
+//! will end up with, which need a read each first -- *before* it writes any of
+//! it, and why the tests assert on the write log rather than on the return
+//! value.//!
 //! # The `value − 1` convention, and the one place it is not `timing.rs`'s
 //!
-//! `timing.rs` owns the `value − 1` encoding of the seven timing registers and
-//! has a round-trip test over every published mode; this module calls
+//! `timing.rs` owns the `value − 1` encoding of the timing registers and has a
+//! round-trip test over every published mode; this module calls
 //! [`timing::timing_registers`] and writes the values it returns, and there is
-//! no timing arithmetic in this file at all.  `PLANE_SIZE` is not a timing
+//! no timing arithmetic in this file at all.  The exception inside `timing.rs`
+//! is `TRANS_SET_CONTEXT_LATENCY`, whose value is a plain line count and is
+//! zero on this display version; this module still only writes what it is
+//! given.  `PLANE_SIZE` is not a timing
 //! register, but its two halves are the same two counts as `PIPESRC`'s in the
 //! opposite order -- `[31:16]` is `height − 1` and `[15:0]` is `width − 1`
 //! (section 5.4, against section 5.2's `WIDTH[31:16]`, `HEIGHT[15:0]`), which
@@ -59,7 +86,15 @@
 //! blocks, and `[I915]`'s `skl_plane_ddb_reg_val` writes it the same way
 //! (`display/skl_universal_plane.c:699-706`).
 //!
-//! # Two reference defects this module found and did not follow
+//! # Reference defects this module found and did not follow
+//!
+//! Five, and the design document records each with its citations: the two
+//! below, which are defects of *description* that this file works around, and
+//! three the module originally followed and no longer does (`PLANE_WM` levels
+//! 6 and 7, which are not levels; `PLANE_WM_TRANS`, which the document gives no
+//! offset for although `[I915]` has one; and `TRANS_VBLANK`'s low half, which
+//! this display version no longer reads).  See
+//! `docs/design/intel-pipe.md` §4.
 //!
 //! **`PLANE_STRIDE` is not in bytes.**  Section 5.4 describes `[11:0]` as
 //! "stride in bytes", and a 1920-pixel XRGB8888 surface has a 7680-byte
@@ -86,14 +121,11 @@
 //! 4095 is one block short of the instruction and the largest legal value at
 //! the same time.  See `docs/design/intel-pipe.md`.
 //!
-//! Two further source disagreements are recorded in the design document rather
+//! One further source disagreement is recorded in the design document rather
 //! than resolved here: `PLANE_WM_LINES`' maximum (31 in section 7.3, 255 in
-//! `[I915]`'s `skl_wm_max_lines` for display version 13, which ADL-N is) and
-//! `PIPE_MISC_PIXEL_ROUNDING_TRUNC`, which `[I915]` sets for display version
-//! 12 and later (`display/intel_display.c:3289-3290`) and the reference does
-//! not mention.  The generous level's 31 is legal under both readings of the
-//! first, and `PIPE_MISC` is read-modify-written so the second is neither set
-//! nor cleared.
+//! `[I915]`'s `skl_wm_max_lines` for display version 13, which ADL-N is).  The
+//! generous level's 31 is legal under both readings, so nothing here turns on
+//! it.
 //!
 //! # What is deliberately not here
 //!
@@ -101,10 +133,14 @@
 //!   `TRANSCONF`, `TRANS_DDI_FUNC_CTL` and `DDI_BUF_CTL` are section 11 phase 5
 //!   and belong to the output workstream.  This module produces the values that
 //!   step needs and never touches those registers; the two halves meet at
-//!   [`PipeProgram`], not at a register.  `PIPE_MISC` is the exception the
-//!   brief calls out: section 11 step 5.6 puts it with the pipe enable, but it
-//!   is the pipe's output depth, it is not double buffered, it arms nothing,
-//!   and it is written here so that everything the pipe owns is in one place.
+//!   [`PipeProgram`], not at a register.  `PIPE_MISC` and `PIPE_ARB_CTL` are
+//!   the two exceptions the brief calls out or that the workaround forces:
+//!   section 11 step 5.6 puts `PIPE_MISC` with the pipe enable, but it is the
+//!   pipe's output depth, it is not double buffered, it arms nothing, and it is
+//!   written here so that everything the pipe owns is in one place;
+//!   `PIPE_ARB_CTL`'s one bit is the pipe half of `Wa_22012358565:adl-p` and
+//!   has to be set before the plane that reads `ARB_SLOTS` is armed, which
+//!   `[I915]` also does (`display/intel_display.c:441-445`).
 //! * **The framebuffer and the GGTT.**  Where the pixels are is a
 //!   [`PlaneSurface`] parameter -- a plain GGTT address and a byte stride -- and
 //!   this module obtains neither.  It checks what section 11 phase 3.2
@@ -112,21 +148,25 @@
 //!   the stride) and refuses the rest.
 //! * **The full watermark algorithm.**  Section 7.4 needs memory latency from
 //!   the PCode mailbox, `WM_LINETIME`, and a per-level calculation this module
-//!   does not implement.  Level 0 is section 7.3's generous version; levels 1-7
+//!   does not implement.  Level 0 is section 7.3's generous version; levels 1-5
 //!   are written *disabled* rather than left alone, because section 7.3's third
 //!   option is "never: leave the watermark registers at their reset values".
-//! * **`PLANE_KEYVAL`, `PLANE_KEYMSK`, `PLANE_KEYMAX`, `PLANE_AUX_DIST`,
-//!   `PLANE_AUX_OFFSET` and `PLANE_WM_TRANS`.**  Section 5.6 names all six and
-//!   gives none of them an offset, so none is in the register table and none is
-//!   invented here.  Writing "the key registers to zero" therefore means the
-//!   key registers that exist, which is none of them; a surface with an
-//!   explicit colour key or a planar auxiliary plane cannot be programmed from
-//!   this module.
+//! * **`PLANE_KEYVAL`, `PLANE_KEYMSK`, `PLANE_KEYMAX`, `PLANE_AUX_DIST` and
+//!   `PLANE_AUX_OFFSET`.**  Section 5.6 names all five and gives none of them
+//!   an offset, so none is in the register table and none is invented here.
+//!   Writing "the key registers to zero" therefore means the key registers that
+//!   exist, which is none of them; a surface with an explicit colour key or a
+//!   planar auxiliary plane cannot be programmed from this module.
+//!   `PLANE_WM_TRANS`, the sixth register section 5.6 names without an offset,
+//!   is no longer in this list: `[I915]` has the offset and the module writes
+//!   it, disabled, for the reason [`WatermarkProgram`] gives.
 //! * **Disable.**  Section 5.6's disable path is two writes (`PLANE_CTL <- 0`,
 //!   `PLANE_SURF <- 0`).  It is not implemented because section 11's bring-up
 //!   order does not use it; a retry after a failed modeset will need it.
 //! * **Scaling, colour management, gamma, CSC, tiling other than linear, NV12,
-//!   and planes other than the primary.**  All deferred by the reference.
+//!   and planes other than the primary.**  All deferred by the reference.  The
+//!   plane's *gamma is disabled*, which is a bit of `PLANE_COLOR_CTL` and not
+//!   the gamma block; nothing here programs a gamma table.
 //!
 //! # What has not been checked
 //!
@@ -171,17 +211,61 @@ pub(crate) const PLANE_CTL_FORMAT_XRGB_8888: u32 = 4 << 24;
 /// Reference section 5.5.
 pub(crate) const PLANE_CTL_TILED_LINEAR: u32 = 0;
 
+/// `PLANE_CTL_ARB_SLOTS(1)`: the plane's arbiter slot count, `[30:28]`.
+///
+/// Section 5.5 does not list the field -- it is not part of a format -- but
+/// `[I915]` writes it for display version 13 and only that version, as one
+/// half of `Wa_22012358565:adl-p` (`display/skl_universal_plane.c:1090-1092`).
+/// `adlp_plane_ctl_arb_slots` returns exactly this value for a plane that is
+/// not YUV semi-planar and whose first component is four bytes wide
+/// (`:1027-1033`, the `case 4` at `:1029-1030`), which a 32-bit XRGB8888
+/// surface is.  The field is `PLANE_CTL_ARB_SLOTS_MASK = REG_GENMASK(30, 28)`
+/// (`skl_universal_plane_regs.h:39-40`), so `ARB_SLOTS(1)` is `1 << 28`.  Its
+/// other half is `PIPE_ARB_CTL`'s `USE_PROG_SLOTS`, which
+/// [`PIPE_ARB_USE_PROG_SLOTS`] sets; the value is only meaningful when that
+/// bit is set, which is why both are written in the same program.
+pub(crate) const PLANE_CTL_ARB_SLOTS_1: u32 = 1 << 28;
+
 /// `PLANE_CTL` for a linear XRGB8888 scanout with no rotation and no alpha.
 ///
 /// Section 5.5: "For the simplest bring-up use `DRM_FORMAT_XRGB8888` +
 /// `DRM_FORMAT_MOD_LINEAR`, which is `PLANE_CTL_ENABLE | (4<<24)`".
+///
+/// `PLANE_CTL_ARB_SLOTS_1` is in here as well, and deliberately: it is the
+/// plane half of `Wa_22012358565:adl-p`, this kernel's one platform is display
+/// version 13, and `adlp_plane_ctl_arb_slots`'s answer for this format is the
+/// same `1` on every machine the value is written to.  A plane `PLANE_CTL`
+/// without it while `PIPE_ARB_CTL.USE_PROG_SLOTS` is set would leave the
+/// arbiter reading whatever slot count the register's other bits happen to
+/// hold.
 pub(crate) const PLANE_CTL_LINEAR_XRGB8888: u32 =
-    PLANE_CTL_ENABLE | PLANE_CTL_FORMAT_XRGB_8888 | PLANE_CTL_TILED_LINEAR;
+    PLANE_CTL_ENABLE | PLANE_CTL_FORMAT_XRGB_8888 | PLANE_CTL_TILED_LINEAR | PLANE_CTL_ARB_SLOTS_1;
 
-/// `PLANE_COLOR_CTL` for alpha disabled, no CSC and no gamma.  Section 5.4
-/// gives the fields (`ALPHA[5:4]`, `CSC`, `GAMMA`) and section 11 step 4.3 says
-/// "alpha disabled"; zero is that value for every field it names.
+/// `PLANE_COLOR_CTL` for alpha disabled and no CSC: `ALPHA[5:4]` is zero,
+/// which is [`PLANE_COLOR_CTL_ALPHA_DISABLE`].  Reference sections 5.4 and 11
+/// step 4.3.
 pub(crate) const PLANE_COLOR_CTL_ALPHA_DISABLE: u32 = 0;
+
+/// `PLANE_COLOR_PLANE_GAMMA_DISABLE`, bit 13.
+///
+/// Section 5.4 lists `PLANE_COLOR_CTL`'s gamma field without saying which
+/// value disables it, and `[I915]` is unambiguous: `glk_plane_color_ctl` ORs
+/// this bit into the register for **every** plane it builds, before it looks
+/// at the plane's format (`display/skl_universal_plane.c:1114-1124`, the OR at
+/// `:1123`), and the field is `REG_BIT(13)`
+/// (`skl_universal_plane_regs.h:262`).  A zero written here would *enable* the
+/// plane's gamma correction with no gamma table programmed, which is not the
+/// "no gamma" the reference's step 4.3 asks for.
+pub(crate) const PLANE_COLOR_PLANE_GAMMA_DISABLE: u32 = 1 << 13;
+
+/// `PLANE_COLOR_CTL` for a linear RGB scanout: alpha disabled, plane gamma
+/// disabled, no CSC.
+///
+/// The reference asks for "alpha disabled, no CSC" (section 11 step 4.3) and
+/// names no gamma; `[I915]`'s value for the same plane sets the gamma-disable
+/// bit unconditionally, so it is set here.
+pub(crate) const PLANE_COLOR_CTL_LINEAR_RGB: u32 =
+    PLANE_COLOR_CTL_ALPHA_DISABLE | PLANE_COLOR_PLANE_GAMMA_DISABLE;
 
 /// `PLANE_SURF`'s address field, `[31:12]`.  Reference section 5.4.
 pub(crate) const PLANE_SURF_ADDRESS_MASK: u32 = 0xffff_f000;
@@ -224,16 +308,51 @@ pub(crate) const PLANE_WM_LINES_SHIFT: u32 = 14;
 /// disagreement is recorded in `docs/design/intel-pipe.md`.
 pub(crate) const PLANE_WM_LINES_MAX: u32 = 31;
 
-/// The largest `PLANE_WM_BLOCKS` value, `[11:0]`.  Reference section 7.3.
+/// `PLANE_WM_BLOCKS`'s largest value, `[11:0]`.  Reference section 7.3.
 pub(crate) const PLANE_WM_BLOCKS_MAX: u32 = 0xfff;
 
-/// How many latency levels there are.
+/// `PLANE_WM_LINES`'s field width, `[26:14]`: thirteen bits, so the largest
+/// value the register can hold is `0x1fff`.
+///
+/// Section 7.3 says the field is 13 bits wide and that the hardware honours
+/// only 31 of them, which is the gap [`PLANE_WM_LINES_MAX`] exists for.  This
+/// constant is the field's width, not the hardware's limit, and it is what
+/// [`WatermarkLevel::generous`]'s compile-time check holds the limit against.
+pub(crate) const PLANE_WM_LINES_MASK_MAX: u32 = 0x1fff;
+
+/// `PIPE_ARB_USE_PROG_SLOTS`, bit 13 of `PIPE_ARB_CTL`.
+///
+/// The pipe half of `Wa_22012358565:adl-p`, written for display version 13
+/// only: `intel_de_rmw(..., PIPE_ARB_CTL(pipe), 0, PIPE_ARB_USE_PROG_SLOTS)`
+/// (`display/intel_display.c:441-445`).  It tells the pipe to take the plane's
+/// arbiter slot count from `PLANE_CTL`'s `ARB_SLOTS[30:28]`
+/// ([`PLANE_CTL_ARB_SLOTS_1`]) instead of from the register's own default.
+/// Reference section 5.2 states the field, and `[I915]`'s
+/// `PIPE_ARB_USE_PROG_SLOTS REG_BIT(13)` (`i915_reg.h:1706`) agrees with it.
+pub(crate) const PIPE_ARB_USE_PROG_SLOTS: u32 = 1 << 13;
+
+/// How many latency levels there are, and therefore how many `PLANE_WM`
+/// registers the six-level block holds.
 ///
 /// The reference never states a count; section 7.4 step 1 has PCode return
-/// levels 0-3 and 4-7, and the register table declares exactly eight per pipe,
-/// which is what `[I915]` programs (`i915->display.wm.num_levels`, which is 8
-/// for this generation).
-pub(crate) const PLANE_WM_LEVELS: usize = 8;
+/// levels 0-3 and 4-7, which is where the original eight came from.  `[I915]`
+/// programs **six** on this platform: `skl_setup_wm_latency` sets
+/// `num_levels = 6` when `HAS_HW_SAGV_WM`
+/// (`display/skl_watermark.c:3378-3383`), and `HAS_HW_SAGV_WM` is
+/// `DISPLAY_VER >= 13 && !IS_DGFX` (`display/intel_display_device.h:141`) --
+/// ADL-N is display version 13 and integrated, so it is six.
+///
+/// This is not a detail of how many levels to compute.  `PLANE_WM(pipe, plane,
+/// level)` is `_PLANE_WM_1_A_0 (0x70240) + level*4`
+/// (`skl_universal_plane_regs.h:315-321`), so the formula's level 6 and level 7
+/// are `0x70258` and `0x7025c`, which are `PLANE_WM_SAGV` and
+/// `PLANE_WM_SAGV_TRANS` (`:327`, `:335`) -- different registers with the same
+/// field layout and a different meaning.  Iterating to eight and clearing
+/// `PLANE_WM_EN` on the last two would therefore not "disable levels 7 and 8",
+/// as the first version of this module put it: it would disable the SAGV
+/// watermarks, and a plane whose watermark has `PLANE_WM_EN` clear "reads
+/// nothing" (section 11 step 4.2, section 7.1).
+pub(crate) const PLANE_WM_LEVELS: usize = 6;
 
 /// The DBUF's size in 512-byte blocks.
 ///
@@ -259,15 +378,31 @@ pub(crate) const PIPE_MISC_DITHER_ENABLE: u32 = 1 << 4;
 /// `PIPE_MISC_DITHER_TYPE[3:2]`.  Reference section 8.4.
 pub(crate) const PIPE_MISC_DITHER_TYPE_MASK: u32 = 0b11 << 2;
 
-/// The bits of `PIPE_MISC` this bring-up owns: the output depth and dithering.
+/// `PIPE_MISC_PIXEL_ROUNDING_TRUNC`, bit 8.
 ///
-/// `[I915]`'s `bdw_set_pipe_misc` also sets `PIXEL_ROUNDING_TRUNC` (bit 8) for
-/// display version 12 and later, and the reference says nothing about it; every
-/// other bit belongs to a colour format, an HDR mode, a YUV output or PSR, none
-/// of which this bring-up does.  Leaving them as found is the only choice that
-/// changes nothing unsourced.
-pub(crate) const PIPE_MISC_OWNED_MASK: u32 =
-    PIPE_MISC_BPC_MASK | PIPE_MISC_DITHER_ENABLE | PIPE_MISC_DITHER_TYPE_MASK;
+/// `[I915]`'s `bdw_set_pipe_misc` sets it for display version 12 and later --
+/// `if (DISPLAY_VER(dev_priv) >= 12) val |= PIPE_MISC_PIXEL_ROUNDING_TRUNC;`
+/// (`display/intel_display.c:3289-3290`) -- and the field is `REG_BIT(8)`
+/// (`i915_reg.h:1719`, commented `tgl+`).  The reference document's section
+/// 5.2 lists the bit and never says what to do with it, so this is the other
+/// place this module follows `[I915]` over the reference: truncation is what
+/// the vendor driver does to the pipe's 8-bit output on every machine this
+/// code can run on.
+pub(crate) const PIPE_MISC_PIXEL_ROUNDING_TRUNC: u32 = 1 << 8;
+
+/// The bits of `PIPE_MISC` this bring-up owns: the output depth, dithering and
+/// pixel rounding truncation.
+///
+/// `[I915]`'s `bdw_set_pipe_misc` builds the whole register and sets
+/// `PIXEL_ROUNDING_TRUNC` for display version 12 and later
+/// (`display/intel_display.c:3289-3290`); every other bit belongs to a colour
+/// format, an HDR mode, a YUV output or PSR, none of which this bring-up does.
+/// Owning bit 8 as well means the read-modify-write sets it rather than
+/// preserving whatever the firmware left, which is what the vendor driver does.
+pub(crate) const PIPE_MISC_OWNED_MASK: u32 = PIPE_MISC_BPC_MASK
+    | PIPE_MISC_DITHER_ENABLE
+    | PIPE_MISC_DITHER_TYPE_MASK
+    | PIPE_MISC_PIXEL_ROUNDING_TRUNC;
 
 /// `PIPE_FIFO_UNDERRUN_STATUS`, bit 31 of the per-pipe `PIPESTAT`.
 ///
@@ -281,16 +416,22 @@ pub(crate) const PIPEDSL_LINE_MASK: u32 = 0xf_ffff;
 /// How many times `PIPEDSL` is read before the scanline check gives up on it.
 ///
 /// Section 11 step 6.1 asks for two reads "a few milliseconds apart".  Four
-/// samples at [`SCANLINE_INTERVAL_MICROS`] each cost three milliseconds and make
-/// the check immune to the one way two reads can agree by accident: a sample
-/// taken exactly one frame apart, which a fixed two-read check would call a
-/// stopped pipe.
+/// samples at [`SCANLINE_INTERVAL_MICROS`] cost three intervals and make the
+/// check immune to the one way two reads can agree by accident: a second read
+/// that lands on the same line as the first -- at 1080p60 a line is 14.9
+/// microseconds and the counter has 1125 values, so a fixed two-read check
+/// would call a perfectly good pipe stopped once in a few hundred boots.  The
+/// samples' timestamps are kept as well, so the same four reads also produce
+/// the line rate section 12.3 asks for.
 pub(crate) const SCANLINE_SAMPLES: usize = 4;
 
 /// The gap between two `PIPEDSL` samples.
 ///
 /// At 1080p60 a whole line is 14.9 microseconds, so a millisecond is 67 lines
-/// and several frames pass across the four samples.  The reference's "a few
+/// and every interval moves the counter by tens of lines.  The four samples
+/// span three intervals -- about 3 ms, which is **less than one 1080p60 frame**
+/// (16.7 ms) -- so this is not a frame count and could not be one; it is a line
+/// rate, which is what section 12.3 asks for.  The reference's "a few
 /// milliseconds" is the outer bound this sits inside.
 pub(crate) const SCANLINE_INTERVAL_MICROS: u64 = 1_000;
 
@@ -344,14 +485,19 @@ impl Pipe {
         }
     }
 
-    /// The transcoder timing register for one of `timing.rs`'s seven.
+    /// The transcoder timing register for one of `timing.rs`'s values.
     ///
     /// Section 5.3 gives the transcoder block's base and the six offsets;
     /// section 5.2 gives `PIPESRC` at `0x6001c`.  The two are the same block,
-    /// which is why one function maps both.
+    /// which is why one function maps both.  `SET_CONTEXT_LATENCY` is the
+    /// eighth and is not in the reference at all: `[I915]` has it at the
+    /// block's `+0x7c` for display version 13 and later
+    /// (`i915_reg.h:4027-4031`, `display/intel_display.c:2725-2727`), which is
+    /// why `ddi.rs` declares it beside the six.
     pub(crate) const fn timing(self, register: TimingRegister) -> Register {
         match self {
             Self::A => match register {
+                TimingRegister::SetContextLatency => ddi::TRANS_SET_CONTEXT_LATENCY_A,
                 TimingRegister::Htotal => ddi::TRANS_HTOTAL_A,
                 TimingRegister::Hblank => ddi::TRANS_HBLANK_A,
                 TimingRegister::Hsync => ddi::TRANS_HSYNC_A,
@@ -361,6 +507,7 @@ impl Pipe {
                 TimingRegister::Pipesrc => pipe_regs::PIPESRC_A,
             },
             Self::B => match register {
+                TimingRegister::SetContextLatency => ddi::TRANS_SET_CONTEXT_LATENCY_B,
                 TimingRegister::Htotal => ddi::TRANS_HTOTAL_B,
                 TimingRegister::Hblank => ddi::TRANS_HBLANK_B,
                 TimingRegister::Hsync => ddi::TRANS_HSYNC_B,
@@ -370,6 +517,7 @@ impl Pipe {
                 TimingRegister::Pipesrc => pipe_regs::PIPESRC_B,
             },
             Self::C => match register {
+                TimingRegister::SetContextLatency => ddi::TRANS_SET_CONTEXT_LATENCY_C,
                 TimingRegister::Htotal => ddi::TRANS_HTOTAL_C,
                 TimingRegister::Hblank => ddi::TRANS_HBLANK_C,
                 TimingRegister::Hsync => ddi::TRANS_HSYNC_C,
@@ -379,6 +527,7 @@ impl Pipe {
                 TimingRegister::Pipesrc => pipe_regs::PIPESRC_C,
             },
             Self::D => match register {
+                TimingRegister::SetContextLatency => ddi::TRANS_SET_CONTEXT_LATENCY_D,
                 TimingRegister::Htotal => ddi::TRANS_HTOTAL_D,
                 TimingRegister::Hblank => ddi::TRANS_HBLANK_D,
                 TimingRegister::Hsync => ddi::TRANS_HSYNC_D,
@@ -414,6 +563,10 @@ impl Pipe {
     /// `PLANE_WM(pipe,1,level)`: one watermark level of the primary plane.
     /// Sections 5.4 and 7.3.
     ///
+    /// The six levels, not the eight the reference's `0x70240 + level*4`
+    /// formula would produce: see [`PLANE_WM_LEVELS`] for why the formula's
+    /// last two results are different registers.
+    ///
     /// # Panics
     ///
     /// If `level` is not below [`PLANE_WM_LEVELS`].  The only caller iterates
@@ -428,8 +581,6 @@ impl Pipe {
                 pipe_regs::PLANE_WM_3_A,
                 pipe_regs::PLANE_WM_4_A,
                 pipe_regs::PLANE_WM_5_A,
-                pipe_regs::PLANE_WM_6_A,
-                pipe_regs::PLANE_WM_7_A,
             ],
             Self::B => &[
                 pipe_regs::PLANE_WM_0_B,
@@ -438,8 +589,6 @@ impl Pipe {
                 pipe_regs::PLANE_WM_3_B,
                 pipe_regs::PLANE_WM_4_B,
                 pipe_regs::PLANE_WM_5_B,
-                pipe_regs::PLANE_WM_6_B,
-                pipe_regs::PLANE_WM_7_B,
             ],
             Self::C => &[
                 pipe_regs::PLANE_WM_0_C,
@@ -448,8 +597,6 @@ impl Pipe {
                 pipe_regs::PLANE_WM_3_C,
                 pipe_regs::PLANE_WM_4_C,
                 pipe_regs::PLANE_WM_5_C,
-                pipe_regs::PLANE_WM_6_C,
-                pipe_regs::PLANE_WM_7_C,
             ],
             Self::D => &[
                 pipe_regs::PLANE_WM_0_D,
@@ -458,11 +605,53 @@ impl Pipe {
                 pipe_regs::PLANE_WM_3_D,
                 pipe_regs::PLANE_WM_4_D,
                 pipe_regs::PLANE_WM_5_D,
-                pipe_regs::PLANE_WM_6_D,
-                pipe_regs::PLANE_WM_7_D,
             ],
         };
         levels[level]
+    }
+
+    /// `PLANE_WM_TRANS(pipe,1)`: the plane's transition watermark.
+    /// `[I915]` `skl_universal_plane_regs.h:343-349`.
+    pub(crate) const fn plane_wm_trans(self) -> Register {
+        match self {
+            Self::A => pipe_regs::PLANE_WM_TRANS_A,
+            Self::B => pipe_regs::PLANE_WM_TRANS_B,
+            Self::C => pipe_regs::PLANE_WM_TRANS_C,
+            Self::D => pipe_regs::PLANE_WM_TRANS_D,
+        }
+    }
+
+    /// `PLANE_WM_SAGV(pipe,1)`: the watermark used while SAGV is active.
+    /// `[I915]` `skl_universal_plane_regs.h:327-333`.
+    pub(crate) const fn plane_wm_sagv(self) -> Register {
+        match self {
+            Self::A => pipe_regs::PLANE_WM_SAGV_A,
+            Self::B => pipe_regs::PLANE_WM_SAGV_B,
+            Self::C => pipe_regs::PLANE_WM_SAGV_C,
+            Self::D => pipe_regs::PLANE_WM_SAGV_D,
+        }
+    }
+
+    /// `PLANE_WM_SAGV_TRANS(pipe,1)`: the transition half of
+    /// [`Self::plane_wm_sagv`].  `[I915]` `skl_universal_plane_regs.h:335-341`.
+    pub(crate) const fn plane_wm_sagv_trans(self) -> Register {
+        match self {
+            Self::A => pipe_regs::PLANE_WM_SAGV_TRANS_A,
+            Self::B => pipe_regs::PLANE_WM_SAGV_TRANS_B,
+            Self::C => pipe_regs::PLANE_WM_SAGV_TRANS_C,
+            Self::D => pipe_regs::PLANE_WM_SAGV_TRANS_D,
+        }
+    }
+
+    /// `PIPE_ARB_CTL(pipe)`: the pipe's arbiter control.  Section 5.2, and the
+    /// pipe half of `Wa_22012358565:adl-p` (`display/intel_display.c:441-445`).
+    pub(crate) const fn arb_ctl(self) -> Register {
+        match self {
+            Self::A => pipe_regs::PIPE_ARB_CTL_A,
+            Self::B => pipe_regs::PIPE_ARB_CTL_B,
+            Self::C => pipe_regs::PIPE_ARB_CTL_C,
+            Self::D => pipe_regs::PIPE_ARB_CTL_D,
+        }
     }
 
     /// `PLANE_STRIDE(pipe,1)`.  Section 5.4.
@@ -681,26 +870,29 @@ impl WatermarkLevel {
         }
     }
 
-    /// An enabled level, or `None` when it asks for more lines than the field
-    /// can legally hold.
+    /// Section 7.3's generous level: `PLANE_WM_EN` set, `blocks` blocks and
+    /// [`PLANE_WM_LINES_MAX`] scanlines.
     ///
-    /// Section 7.3: "**Maximum `PLANE_WM_LINES` is 31** -- a hardware limit the
-    /// PRM states explicitly, and if your calculated line count exceeds it, the
-    /// level is unusable and must be disabled."  Refusing here rather than
-    /// saturating is the difference between a named error and a register the
-    /// hardware accepts but does not honour -- section 7.3 warns that the field
-    /// is 13 bits wide, so "do not let a successful read-back convince you a
-    /// too-large value is legal".
-    pub(crate) const fn enabled(blocks: u32, lines: u32) -> Option<Self> {
-        if lines > PLANE_WM_LINES_MAX {
-            return None;
-        }
-        Some(Self {
+    /// `lines` is not a parameter, and that is the fix rather than an
+    /// oversight.  The first version of this file had an `enabled(blocks,
+    /// lines)` returning `Option`, with an `unwrap_or_else` fallback to
+    /// [`Self::disabled`] in the one caller: the `None` arm could not be
+    /// reached while [`PLANE_WM_LINES_MAX`] is what it is, and had it ever
+    /// been reached it would have written `PLANE_WM_EN = 0` over level 0 --
+    /// section 7.1's plane that reads nothing, silently, on the machine whose
+    /// only console is that plane.  Taking the line count from the constant
+    /// makes a level above the hardware maximum *unrepresentable* rather than
+    /// refused, and removes the fallback with it.
+    ///
+    /// The block count is masked to `PLANE_WM_BLOCKS[11:0]`, so a count that
+    /// does not fit the field cannot bleed into the line field.
+    pub(crate) const fn generous(blocks: u32) -> Self {
+        Self {
             enabled: true,
             ignore_lines: false,
-            blocks,
-            lines,
-        })
+            blocks: blocks & PLANE_WM_BLOCKS_MAX,
+            lines: PLANE_WM_LINES_MAX,
+        }
     }
 
     /// Whether `PLANE_WM_EN` is set.
@@ -721,8 +913,8 @@ impl WatermarkLevel {
     /// The value of `PLANE_WM(pipe,1,level)`, ready to write.
     ///
     /// The block count is masked to the field rather than trusted, so a
-    /// too-large count cannot bleed into the line field.  [`WatermarkProgram`]
-    /// is the only thing that builds a level, and it masks before it gets here.
+    /// too-large count cannot bleed into the line field; the constructors
+    /// above mask it as well, and this is the second half of the same rule.
     pub(crate) const fn register_value(self) -> u32 {
         let mut value = self.blocks & PLANE_WM_BLOCKS_MAX;
         value |= self.lines << PLANE_WM_LINES_SHIFT;
@@ -736,14 +928,55 @@ impl WatermarkLevel {
     }
 }
 
-/// Every watermark level of one plane.
+/// `PLANE_WM_LINES_MAX` fits the field it is written into.
 ///
-/// This bring-up programs section 7.3's first option: "**Simplest that can
-/// work:** program level 0 only, with generous values (`BLOCKS` = the plane's
-/// whole DDB allocation, `LINES` = 31), `EN = 1`; disable levels 1..n."  Every
-/// level is written, including the disabled ones, because section 7.3's third
-/// option is "Never: leave the watermark registers at their reset values" --
-/// and section 7.1 says those reset values are the ones that do not work.
+/// A compile-time check, not a runtime one: [`PLANE_WM_LINES_MAX`] is 31,
+/// which section 7.3's hardware limit makes true by hand, and
+/// `PLANE_WM_LINES_MASK_MAX` is the thirteen-bit field's largest value.  If
+/// either constant is ever edited apart, this is a build failure rather than a
+/// line count the hardware silently truncates.
+const _: () = assert!(PLANE_WM_LINES_MAX <= PLANE_WM_LINES_MASK_MAX);
+
+/// Every watermark value one plane has, which is more than its levels.
+///
+/// This bring-up programs section 7.3's first option for the levels: "**Simplest
+/// that can work:** program level 0 only, with generous values (`BLOCKS` = the
+/// plane's whole DDB allocation, `LINES` = 31), `EN = 1`; disable levels 1..n."
+/// Every level is written, including the disabled ones, because section 7.3's
+/// third option is "Never: leave the watermark registers at their reset
+/// values" -- and section 7.1 says those reset values are the ones that do not
+/// work.
+///
+/// Three more registers belong to the plane's watermarks and are not levels:
+/// `PLANE_WM_TRANS`, and the SAGV pair `PLANE_WM_SAGV` and
+/// `PLANE_WM_SAGV_TRANS`.  The first version of this module wrote the eight
+/// registers the reference's `0x70240 + level*4` formula names and no others,
+/// which left the SAGV pair at their reset values and, for the two offsets the
+/// formula only *looks* like levels at, wrote a disabled watermark over them.
+///
+/// * **The SAGV pair gets level 0's value**, not zero.  This kernel never
+///   writes `SAGV`'s control, so it cannot know whether the hardware is using
+///   these registers; `[I915]` programs them on this platform because
+///   `HAS_HW_SAGV_WM` is true there (`display/skl_universal_plane.c:743-748`,
+///   `display/skl_watermark.c:3378-3383`).  A watermark with `PLANE_WM_EN`
+///   clear is a plane that reads nothing, so the only safe value for a register
+///   the pipe may be reading is the generous one level 0 already uses: a plane
+///   whose SAGV watermark is *too generous* underruns later and says so in
+///   `PIPESTAT`, and one whose SAGV watermark is disabled shows nothing and
+///   says nothing.
+/// * **`PLANE_WM_TRANS` is written disabled**, and that is `[I915]`'s value
+///   here rather than a fallback.  `[I915]` computes the transition watermark
+///   from level 0 as `wm0.blocks - 1 + trans_offset + 1`, with `trans_offset`
+///   14 on this generation, and then `skl_check_wm_level` clears it when its
+///   `min_ddb_alloc` is larger than the plane's DDB allocation
+///   (`display/skl_watermark.c:2041-2100`, `:1437-1441`).  With level 0 at the
+///   largest legal 4095 blocks inside a 4096-block allocation, the value is
+///   4109 blocks -- past the allocation and past `PLANE_WM_BLOCKS`' twelve-bit
+///   field -- so the register `[I915]` would write here is zero.  It is a
+///   transition watermark, not a level: `EN = 0` on it is what
+///   `skl_check_wm_level` itself writes, and what `[I915]` leaves on a machine
+///   with IPC disabled (`:3238-3241`), not the "reads nothing" state section
+///   7.1 describes.
 ///
 /// **What the generous version costs**, which section 7.3 also says: it
 /// "over-allocates and may under-run on a busy memory system".  It does not
@@ -754,25 +987,30 @@ impl WatermarkLevel {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WatermarkProgram {
     levels: [WatermarkLevel; PLANE_WM_LEVELS],
+    transition: WatermarkLevel,
+    sagv: WatermarkLevel,
+    sagv_transition: WatermarkLevel,
 }
 
 impl WatermarkProgram {
-    /// Section 7.3's generous level 0 over a DDB allocation, with every other
-    /// level disabled.
+    /// Section 7.3's generous level 0 over a DDB allocation, every other level
+    /// disabled, and the three non-level watermark registers as described on
+    /// the type.
     ///
     /// The block count is the allocation, capped at [`PLANE_WM_BLOCKS_MAX`] --
     /// see the module documentation for why the cap is not optional and why
     /// 4095 is the value `[I915]` would also consider the largest valid one.
     pub(crate) fn generous(ddb: DdbAllocation) -> Self {
         let blocks = ddb.blocks().min(PLANE_WM_BLOCKS_MAX);
-        // `PLANE_WM_LINES_MAX` is 31, so this cannot be the `None` case; the
-        // fallback is written out rather than unwrapped so that no path in this
-        // file can panic on the boot screen's only output device.
-        let level_zero = WatermarkLevel::enabled(blocks, PLANE_WM_LINES_MAX)
-            .unwrap_or_else(WatermarkLevel::disabled);
+        let level_zero = WatermarkLevel::generous(blocks);
         let mut levels = [WatermarkLevel::disabled(); PLANE_WM_LEVELS];
         levels[0] = level_zero;
-        Self { levels }
+        Self {
+            levels,
+            transition: WatermarkLevel::disabled(),
+            sagv: level_zero,
+            sagv_transition: level_zero,
+        }
     }
 
     /// Every level, in register order.
@@ -783,6 +1021,21 @@ impl WatermarkProgram {
     /// Level 0's register value, for a log line or an error message.
     pub(crate) const fn level_zero_value(&self) -> u32 {
         self.levels[0].register_value()
+    }
+
+    /// `PLANE_WM_TRANS`'s value: disabled, for the reason on the type.
+    pub(crate) const fn transition_value(&self) -> u32 {
+        self.transition.register_value()
+    }
+
+    /// `PLANE_WM_SAGV`'s value: level 0's, for the reason on the type.
+    pub(crate) const fn sagv_value(&self) -> u32 {
+        self.sagv.register_value()
+    }
+
+    /// `PLANE_WM_SAGV_TRANS`'s value: level 0's, for the reason on the type.
+    pub(crate) const fn sagv_transition_value(&self) -> u32 {
+        self.sagv_transition.register_value()
     }
 }
 
@@ -877,6 +1130,27 @@ pub(crate) struct PlannedWrite {
     pub(crate) value: u32,
 }
 
+/// How many writes [`PipeProgram::writes`] performs: the shadow half of the
+/// program, all of which is latched by the plane's arm.
+///
+/// The terms are that function's groups, in order: the pipe's own two
+/// ([`Pipe::misc`] and [`Pipe::arb_ctl`]), the timing table's
+/// ([`timing::TIMING_REGISTERS`]), `PLANE_BUF_CFG`, the six watermark levels,
+/// `PLANE_WM_TRANS` and the SAGV pair, and the plane's three `noarm` registers
+/// plus `PLANE_OFFSET` and `PLANE_COLOR_CTL`.  It exists so that the `Vec`'s
+/// capacity and the tests' count are the same number as the list rather than a
+/// second, hand-kept one: the first version of this file reserved 23 slots for
+/// 24 writes.
+pub(crate) const PIPE_PROGRAM_WRITES: usize =
+    2 + timing::TIMING_REGISTERS + 1 + PLANE_WM_LEVELS + 3 + 3 + 2;
+
+/// How many writes [`arm`] performs: the pair that arms the plane.
+///
+/// `PLANE_CTL` and then `PLANE_SURF`, adjacent and in that order, which is the
+/// one ordering section 5.6 states absolutely.  They are a separate list
+/// because they are a separate *step*: see [`arm`].
+pub(crate) const PLANE_ARM_WRITES: usize = 2;
+
 impl PipeProgram {
     /// The `PIPE_MISC` value this program wants, given what the register holds
     /// now.
@@ -890,36 +1164,63 @@ impl PipeProgram {
         (before & !PIPE_MISC_OWNED_MASK) | self.pipe_misc
     }
 
-    /// Every write this program performs, in the order it performs them, given
-    /// `PIPE_MISC`'s current contents.
+    /// The `PIPE_ARB_CTL` value this program wants, given what the register
+    /// holds now.
+    ///
+    /// One bit, set and nothing cleared: `[I915]` writes it as
+    /// `intel_de_rmw(dev_priv, PIPE_ARB_CTL(pipe), 0, PIPE_ARB_USE_PROG_SLOTS)`
+    /// (`display/intel_display.c:443-445`), whose clear mask is **zero**.  The
+    /// register may hold settings for the pipe's own arbitration -- the
+    /// reference's section 5.2 table lists only `USE_PROG_SLOTS`, which is a
+    /// reason this module has no source for the rest rather than a reason to
+    /// write them as zero.
+    pub(crate) const fn arb_ctl_value(&self, before: u32) -> u32 {
+        before | PIPE_ARB_USE_PROG_SLOTS
+    }
+
+    /// Every shadow write this program performs, in the order it performs
+    /// them, given `PIPE_MISC`'s and `PIPE_ARB_CTL`'s current contents.
     ///
     /// The order is section 11's phases -- 3.4 timings, 4.1 DDB, 4.2 watermarks,
-    /// 4.3 plane -- with `PIPE_MISC` first and `PLANE_SURF` last.  Section 5.6
-    /// groups the plane registers into "noarm" and "arm" rather than ordering
-    /// them absolutely, and both groups take effect at the same instant, so
-    /// section 11's phase order is the one used; what section 5.6 *does* order
-    /// absolutely is that `PLANE_CTL` is written immediately before
-    /// `PLANE_SURF` and that `PLANE_SURF` is the last of them, which this list
-    /// keeps.
+    /// 4.3 plane -- with `PIPE_MISC` first.  Every one of these registers is
+    /// double buffered, and none of them takes effect until the plane's arm
+    /// latches them at a vblank: [`Self::writes_arm`] is that step, and it is a
+    /// separate entry point deliberately (see [`arm`]).
     ///
     /// `PIPE_MISC` is first rather than last for a reason that is worth stating,
     /// because section 11 puts it in step 5.6, after the plane: it is not double
     /// buffered, it arms nothing, and the property section 5.6 cares about is
     /// that nothing in the plane's double-buffered state is committed before the
-    /// watermarks are -- which `PLANE_SURF` being last is what guarantees.
-    /// Keeping it here means one call programs everything the pipe owns.
+    /// watermarks are -- which the arm pair being written after all of this is
+    /// what guarantees.  Keeping it here means one call programs everything the
+    /// pipe owns.
     /// `[I915]` gives the same ordering: `bdw_set_pipe_misc` runs before
     /// `hsw_configure_cpu_transcoder` in `intel_crtc_enable_pipe`
     /// (`display/intel_display.c:1719` against `:1723`), so the depth is
     /// programmed before the pipe is enabled there too.
-    pub(crate) fn writes(&self, pipe_misc_before: u32) -> Vec<PlannedWrite> {
-        let mut writes = Vec::with_capacity(1 + 7 + 1 + PLANE_WM_LEVELS + 6);
+    ///
+    /// `PIPE_ARB_CTL` follows it, and belongs with it for the same reasons: it
+    /// is the pipe half of `Wa_22012358565:adl-p`, the plane half is a field of
+    /// `PLANE_CTL` (`display/skl_universal_plane.c:1090-1092`), and `[I915]`
+    /// writes the pipe half in `intel_enable_transcoder`
+    /// (`display/intel_display.c:441-445`) -- that is, before the plane that
+    /// reads `ARB_SLOTS` is armed, which is the property this order keeps.  The
+    /// write sets one bit and preserves the rest, like `PIPE_MISC`'s.
+    pub(crate) fn writes(&self, pipe_misc_before: u32, arb_ctl_before: u32) -> Vec<PlannedWrite> {
+        let mut writes = Vec::with_capacity(PIPE_PROGRAM_WRITES);
 
         // The pipe's output depth.  Section 11 step 5.6, written here so that
         // one call owns the pipe; see the method documentation.
         writes.push(PlannedWrite {
             register: self.pipe.misc(),
             value: self.pipe_misc_value(pipe_misc_before),
+        });
+
+        // The pipe's arbiter slots.  Read-modify-written because only bit 13
+        // is this workaround's; see the method documentation.
+        writes.push(PlannedWrite {
+            register: self.pipe.arb_ctl(),
+            value: self.arb_ctl_value(arb_ctl_before),
         });
 
         // Phase 3.4.  The order and the values are `timing.rs`'s.
@@ -944,6 +1245,23 @@ impl PipeProgram {
             });
         }
 
+        // Phase 4.2's three non-level watermark registers, in `[I915]`'s order
+        // around them: the transition watermark immediately after the levels
+        // (`display/skl_universal_plane.c:735-749`), then the SAGV pair under
+        // `HAS_HW_SAGV_WM` (`:743-748`).
+        writes.push(PlannedWrite {
+            register: self.pipe.plane_wm_trans(),
+            value: self.watermark.transition_value(),
+        });
+        writes.push(PlannedWrite {
+            register: self.pipe.plane_wm_sagv(),
+            value: self.watermark.sagv_value(),
+        });
+        writes.push(PlannedWrite {
+            register: self.pipe.plane_wm_sagv_trans(),
+            value: self.watermark.sagv_transition_value(),
+        });
+
         // Phase 4.3, the `noarm` half.
         writes.push(PlannedWrite {
             register: self.pipe.plane_stride(),
@@ -958,11 +1276,11 @@ impl PipeProgram {
             value: self.plane.size,
         });
 
-        // Phase 4.3, the `arm` half: everything from here takes effect when
-        // `PLANE_SURF` lands.  The key and auxiliary-plane registers section 5.6
-        // lists between these two never existed in the table -- no section gives
-        // them an offset -- so the run is `PLANE_OFFSET`, `PLANE_COLOR_CTL`,
-        // `PLANE_CTL`, `PLANE_SURF`.
+        // Phase 4.3's `arm`-group registers that are *not* the arm pair.
+        // Everything here is still shadow state that the arm latches; section
+        // 5.6 lists the key and auxiliary-plane registers between them and
+        // `PLANE_CTL`, and those never existed in the table -- no section gives
+        // them an offset -- so the run is `PLANE_OFFSET`, `PLANE_COLOR_CTL`.
         writes.push(PlannedWrite {
             register: self.pipe.plane_offset(),
             value: self.plane.offset,
@@ -971,30 +1289,47 @@ impl PipeProgram {
             register: self.pipe.plane_color_ctl(),
             value: self.plane.color_ctl,
         });
-        writes.push(PlannedWrite {
-            register: self.pipe.plane_ctl(),
-            value: self.plane.ctl,
-        });
-        // Section 5.6: "PLANE_SURF <- GGTT address <-- THIS ARMS EVERYTHING".
-        writes.push(PlannedWrite {
-            register: self.pipe.plane_surf(),
-            value: self.plane.surf,
-        });
 
         writes
     }
 
-    /// The whole program as log lines, one per write.
+    /// The pair that arms the plane: `PLANE_CTL`, then `PLANE_SURF`.
+    ///
+    /// Two writes, adjacent and in that order, which is the one ordering
+    /// section 5.6 states absolutely -- "the control register self-arms if the
+    /// plane was previously disabled.  Try to make the plane enable atomic by
+    /// writing the control register just before the surface register"
+    /// (`display/skl_universal_plane.c:1525-1532`, the two writes at
+    /// `:1530-1531`) -- and they are a separate list from [`Self::writes`]
+    /// because they are a separate *step* in time.  See [`arm`].
+    pub(crate) fn writes_arm(&self) -> [PlannedWrite; PLANE_ARM_WRITES] {
+        [
+            PlannedWrite {
+                register: self.pipe.plane_ctl(),
+                value: self.plane.ctl,
+            },
+            // Section 5.6: "PLANE_SURF <- GGTT address <-- THIS ARMS EVERYTHING".
+            PlannedWrite {
+                register: self.pipe.plane_surf(),
+                value: self.plane.surf,
+            },
+        ]
+    }
+
+    /// The whole program as log lines, one per write, shadow half then arm
+    /// pair.
     ///
     /// Built as a string rather than logged as it goes because the sequence
     /// cannot be run on the target yet, so the text has to be something a host
     /// test can assert on.  [`Self::log`] puts the same text in the kernel log.
+    /// The arm pair is rendered too, marked with the step it belongs to, so
+    /// that the log shows the whole sequence even though two calls perform it.
     ///
-    /// `pipe_misc_before` is what `PIPE_MISC` holds now, which is what its
-    /// read-modify-write is applied to; a caller that wants the exact value
-    /// reads the register first, and one that only wants the rest of the
-    /// program can pass zero.
-    pub(crate) fn render(&self, pipe_misc_before: u32) -> String {
+    /// `pipe_misc_before` and `arb_ctl_before` are what those two registers
+    /// hold now, which is what their read-modify-writes are applied to; a
+    /// caller that wants the exact values reads the registers first, and one
+    /// that only wants the rest of the program can pass zeroes.
+    pub(crate) fn render(&self, pipe_misc_before: u32, arb_ctl_before: u32) -> String {
         let mut out = String::new();
         out.push_str(&format!(
             "intel-pipe: pipe {} mode {mode}, reference section 11 phases 3.4 and 4\n",
@@ -1025,15 +1360,41 @@ impl PipeProgram {
             PLANE_WM_LEVELS - 1,
         ));
         out.push_str(&format!(
-            "intel-pipe: pipe {} PIPE_MISC {:#010x} -> {:#010x} (8 bpc, dither off; other bits \
-             preserved)\n",
+            "intel-pipe: pipe {} watermarks SAGV {:#010x} (level 0's value), SAGV_TRANS {:#010x}, \
+             TRANS {:#010x} (disabled: no transition watermark fits a whole-DBUF level 0)\n",
+            self.pipe,
+            self.watermark.sagv_value(),
+            self.watermark.sagv_transition_value(),
+            self.watermark.transition_value(),
+        ));
+        out.push_str(&format!(
+            "intel-pipe: pipe {} PIPE_MISC {:#010x} -> {:#010x} (8 bpc, dither off, pixel \
+             rounding truncated; other bits preserved)\n",
             self.pipe,
             pipe_misc_before,
             self.pipe_misc_value(pipe_misc_before),
         ));
-        for write in self.writes(pipe_misc_before) {
+        out.push_str(&format!(
+            "intel-pipe: pipe {} PIPE_ARB_CTL {:#010x} -> {:#010x} (USE_PROG_SLOTS set, other \
+             bits preserved)\n",
+            self.pipe,
+            arb_ctl_before,
+            self.arb_ctl_value(arb_ctl_before),
+        ));
+        for write in self.writes(pipe_misc_before, arb_ctl_before) {
             out.push_str(&format!(
                 "intel-pipe:   {} <- {:#010x}\n",
+                write.register.name(),
+                write.value
+            ));
+        }
+        out.push_str(&format!(
+            "intel-pipe: pipe {} arm (after the pipe is enabled):\n",
+            self.pipe,
+        ));
+        for write in self.writes_arm() {
+            out.push_str(&format!(
+                "intel-pipe:   {} <- {:#010x}  (arm)\n",
                 write.register.name(),
                 write.value
             ));
@@ -1042,8 +1403,8 @@ impl PipeProgram {
     }
 
     /// Put [`Self::render`] into the kernel log.
-    pub(crate) fn log(&self, pipe_misc_before: u32) {
-        for line in self.render(pipe_misc_before).lines() {
+    pub(crate) fn log(&self, pipe_misc_before: u32, arb_ctl_before: u32) {
+        for line in self.render(pipe_misc_before, arb_ctl_before).lines() {
             axlog::info!("{line}");
         }
     }
@@ -1080,7 +1441,7 @@ pub(crate) fn compute(
         // and no subtraction happens here.
         size: timings.pipesrc().rotate_left(16),
         offset: 0,
-        color_ctl: PLANE_COLOR_CTL_ALPHA_DISABLE,
+        color_ctl: PLANE_COLOR_CTL_LINEAR_RGB,
         ctl: PLANE_CTL_LINEAR_XRGB8888,
         surf: PlaneProgram::surface_field(surface.ggtt_address)?,
     };
@@ -1091,11 +1452,13 @@ pub(crate) fn compute(
         ddb,
         watermark,
         plane,
-        // 8 bpc, dithering off.  An XRGB8888 surface is 8 bits per component
-        // and the sink is being driven at 8 bpc, so there is no depth
-        // conversion to dither; section 8.4's `[INF]` warns against enabling
-        // what the simple case does not need.
-        pipe_misc: PIPE_MISC_BPC_8,
+        // 8 bpc, dithering off, pixel rounding truncated.  An XRGB8888 surface
+        // is 8 bits per component and the sink is being driven at 8 bpc, so
+        // there is no depth conversion to dither; section 8.4's `[INF]` warns
+        // against enabling what the simple case does not need.  The rounding
+        // bit is `[I915]`'s for display version 12 and later and the reference
+        // never mentions it -- see `PIPE_MISC_PIXEL_ROUNDING_TRUNC`.
+        pipe_misc: PIPE_MISC_BPC_8 | PIPE_MISC_PIXEL_ROUNDING_TRUNC,
     })
 }
 
@@ -1225,11 +1588,11 @@ fn write(regs: &impl Registers, planned: PlannedWrite) -> Result<(), PipeError> 
     }
 }
 
-/// What phase 4 wrote, in the order it wrote it.
+/// What phase 4's shadow half wrote, in the order it wrote it.
 ///
 /// Kept rather than discarded so that the boot log can show what actually
 /// happened next to what was planned, and so that a caller can hand the same
-/// program to [`prove`].
+/// program to [`arm`] and then to [`prove`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PipeState {
     pub(crate) pipe: Pipe,
@@ -1237,7 +1600,11 @@ pub(crate) struct PipeState {
     pub(crate) pipe_misc_before: u32,
     /// `PIPE_MISC` as written.
     pub(crate) pipe_misc_after: u32,
-    /// Every write that happened, in order.
+    /// `PIPE_ARB_CTL` as it read before the program's read-modify-write.
+    pub(crate) arb_ctl_before: u32,
+    /// `PIPE_ARB_CTL` as written.
+    pub(crate) arb_ctl_after: u32,
+    /// Every shadow write that happened, in order.
     pub(crate) writes: Vec<PlannedWrite>,
 }
 
@@ -1245,14 +1612,18 @@ impl PipeState {
     /// The same text the log carries, for `/sys/kernel/debug/dri/0/intel_gpu`.
     pub(crate) fn render(&self) -> String {
         let mut out = format!(
-            "intel-pipe: pipe {} programmed with {} writes (reference section 11 phases 3.4 and \
-             4)\n",
+            "intel-pipe: pipe {} programmed with {} shadow writes (reference section 11 phases \
+             3.4 and 4), not yet armed\n",
             self.pipe,
             self.writes.len(),
         );
         out.push_str(&format!(
             "intel-pipe: pipe {} PIPE_MISC {:#010x} -> {:#010x}\n",
             self.pipe, self.pipe_misc_before, self.pipe_misc_after,
+        ));
+        out.push_str(&format!(
+            "intel-pipe: pipe {} PIPE_ARB_CTL {:#010x} -> {:#010x}\n",
+            self.pipe, self.arb_ctl_before, self.arb_ctl_after,
         ));
         for write in &self.writes {
             out.push_str(&format!(
@@ -1272,7 +1643,41 @@ impl PipeState {
     }
 }
 
-/// Reference section 11 phase 4: write the whole program, in order.
+/// What the arm step wrote, in order: `PLANE_CTL`, then `PLANE_SURF`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ArmState {
+    pub(crate) pipe: Pipe,
+    /// The pair, in the order it was written.
+    pub(crate) writes: [PlannedWrite; PLANE_ARM_WRITES],
+}
+
+impl ArmState {
+    /// The same text the log carries, for `/sys/kernel/debug/dri/0/intel_gpu`.
+    pub(crate) fn render(&self) -> String {
+        let mut out = format!(
+            "intel-pipe: pipe {} armed with {} writes (PLANE_CTL then PLANE_SURF)\n",
+            self.pipe,
+            self.writes.len(),
+        );
+        for write in &self.writes {
+            out.push_str(&format!(
+                "intel-pipe:   {} <- {:#010x}\n",
+                write.register.name(),
+                write.value
+            ));
+        }
+        out
+    }
+
+    /// Put [`Self::render`] into the kernel log.
+    pub(crate) fn log(&self) {
+        for line in self.render().lines() {
+            axlog::info!("{line}");
+        }
+    }
+}
+
+/// Reference section 11 phase 4: write the whole shadow program, in order.
 ///
 /// The write list is built before the first write, so a failure part-way
 /// through cannot leave a value that was computed against a register that no
@@ -1282,17 +1687,22 @@ impl PipeState {
 /// A refused write stops the sequence and is reported by name.  Stopping is the
 /// point: the values after the failure are the ones that arm the plane, and a
 /// plane armed with a half-written configuration is the black screen section
-/// 7.1 spends its words on.
+/// 7.1 spends its words on.  Nothing written here has taken effect yet: every
+/// register in the list is double buffered and [`arm`] is what latches them.
 ///
-/// Nothing here enables the pipe.  `TRANSCONF` is section 11 step 5.6 and
-/// belongs to the output workstream; until it is written, this program has
-/// configured a pipe that is not scanning.
+/// Nothing here enables the pipe either.  `TRANSCONF` is section 11 step 5.6
+/// and belongs to the output workstream; until it is written, this program has
+/// configured a pipe that is not scanning -- which is exactly the state the arm
+/// step waits for the end of.
 pub(crate) fn program(regs: &impl Registers, plan: &PipeProgram) -> Result<PipeState, PipeError> {
-    // The read has to happen before the list is built, because `PIPE_MISC` is a
-    // read-modify-write; everything else in the list is already in `plan`.
+    // The two reads have to happen before the list is built, because
+    // `PIPE_MISC` and `PIPE_ARB_CTL` are read-modify-writes; everything else in
+    // the list is already in `plan`.
     let pipe_misc_before = read(regs, plan.pipe.misc())?;
-    let writes = plan.writes(pipe_misc_before);
+    let arb_ctl_before = read(regs, plan.pipe.arb_ctl())?;
+    let writes = plan.writes(pipe_misc_before, arb_ctl_before);
     let pipe_misc_after = plan.pipe_misc_value(pipe_misc_before);
+    let arb_ctl_after = plan.arb_ctl_value(arb_ctl_before);
 
     for planned in &writes {
         write(regs, *planned)?;
@@ -1302,6 +1712,46 @@ pub(crate) fn program(regs: &impl Registers, plan: &PipeProgram) -> Result<PipeS
         pipe: plan.pipe,
         pipe_misc_before,
         pipe_misc_after,
+        arb_ctl_before,
+        arb_ctl_after,
+        writes,
+    })
+}
+
+/// Arm the plane: `PLANE_CTL` and `PLANE_SURF`, adjacent, in that order.
+///
+/// **This is a separate step from [`program`], and the order of the two is the
+/// point.**  `PLANE_SURF` is only the arm: the shadow registers `program`
+/// writes are latched at the plane's update event, which is the pipe's vblank,
+/// and while the transcoder is disabled there is no vblank to latch them at --
+/// "Until the pipe starts PIPEDSL reads will return a stale value"
+/// (`display/intel_display.c:478-486`).  A `PLANE_SURF` written before the pipe
+/// runs therefore cannot take effect until after `TRANSCONF` is enabled, which
+/// is step 5.6, and the sequence should not *depend* on a pre-enable write
+/// latching later: `[I915]` never does.  It enables the crtc first
+/// (`intel_enable_crtc`, `display/intel_display.c:7200`) and arms the plane
+/// afterwards (`intel_update_crtc`, `:7249`), and its arm function writes the
+/// two registers adjacently with the comment that the control register
+/// self-arms a previously disabled plane
+/// (`display/skl_universal_plane.c:1525-1532`).
+///
+/// Coreboot's libgfxinit arms before the enable instead and ships that order,
+/// so the reference's ordering is probably not fatal -- but whether a pending
+/// arm survives the enable is not documented anywhere this workstream could
+/// find, which is exactly why the sequence no longer relies on it.  Callers run
+/// [`program`], then the output workstream's `TRANSCONF`, then this.
+///
+/// A refused write stops the pair and is reported by name; a `PLANE_CTL` that
+/// did not land means `PLANE_SURF` is not written at all, because a surface
+/// address written over a plane control word that did not take is the
+/// half-armed plane this module's ordering exists to prevent.
+pub(crate) fn arm(regs: &impl Registers, plan: &PipeProgram) -> Result<ArmState, PipeError> {
+    let writes = plan.writes_arm();
+    for planned in &writes {
+        write(regs, *planned)?;
+    }
+    Ok(ArmState {
+        pipe: plan.pipe,
         writes,
     })
 }
@@ -1314,11 +1764,54 @@ pub(crate) fn program(regs: &impl Registers, plan: &PipeProgram) -> Result<PipeS
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScanlineCheck {
     /// At least two of the samples differed, so the pipe is counting lines.
-    Scanning { samples: [u32; SCANLINE_SAMPLES] },
+    ///
+    /// The samples carry their timestamps as well as their line counts, so the
+    /// verdict can report the line rate it observed and not only the fact that
+    /// the counter moved.  Section 12.3 calls `PIPEDSL` sampled over time "the
+    /// only way to verify your PLL arithmetic against reality without a
+    /// scope"; a verdict that discarded the timestamps threw that measurement
+    /// away.
+    Scanning {
+        samples: [ScanlineSample; SCANLINE_SAMPLES],
+    },
     /// Every sample was identical: the pipe is not scanning.
-    NotScanning { samples: [u32; SCANLINE_SAMPLES] },
+    NotScanning {
+        samples: [ScanlineSample; SCANLINE_SAMPLES],
+    },
     /// `PIPEDSL` could not be read at all.
     Unreadable { register: &'static str },
+}
+
+/// One `PIPEDSL` reading: the line the pipe was on, and when that was read.
+///
+/// Both fields are raw: `line` is `PIPEDSL`'s `LINE[19:0]` and `micros` is the
+/// timer's reading, so the difference between two samples is the only thing
+/// with a meaning and [`ScanlineCheck`] is where the arithmetic over them
+/// lives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScanlineSample {
+    /// `PIPEDSL`'s `LINE[19:0]`.
+    pub(crate) line: u32,
+    /// The timer's reading when the register was read, in microseconds.
+    pub(crate) micros: u64,
+}
+
+impl ScanlineSample {
+    /// The lines between this sample and `next`, signed: negative means the
+    /// counter went backwards, which is what a frame wrap looks like from
+    /// inside one sampling window.
+    pub(crate) const fn line_delta(self, next: Self) -> i64 {
+        (next.line as i64) - (self.line as i64)
+    }
+
+    /// How long after this sample `next` was taken, in microseconds.
+    ///
+    /// Saturating rather than wrapping: a timer that went backwards is a
+    /// broken timer, and the interval it produces is one no rate should be
+    /// computed from.
+    pub(crate) const fn micros_delta(self, next: Self) -> u64 {
+        next.micros.saturating_sub(self.micros)
+    }
 }
 
 impl ScanlineCheck {
@@ -1326,22 +1819,78 @@ impl ScanlineCheck {
         matches!(self, Self::Scanning { .. })
     }
 
+    /// Every interval between consecutive samples, as `(line delta, micros)`.
+    ///
+    /// Three entries for four samples, in order.  This is what the log renders,
+    /// and it is here rather than in the log because it is also the raw
+    /// material of [`Self::observed_lines_per_second`].
+    pub(crate) fn intervals(self) -> [(i64, u64); SCANLINE_SAMPLES - 1] {
+        let mut out = [(0i64, 0u64); SCANLINE_SAMPLES - 1];
+        match self {
+            Self::Scanning { samples } | Self::NotScanning { samples } => {
+                for (index, pair) in samples.windows(2).enumerate() {
+                    out[index] = (pair[0].line_delta(pair[1]), pair[0].micros_delta(pair[1]));
+                }
+            }
+            Self::Unreadable { .. } => {}
+        }
+        out
+    }
+
+    /// The line rate the samples measured, in lines per second, or `None` when
+    /// they cannot give one.
+    ///
+    /// A rate over the intervals that moved forward and took time: an interval
+    /// whose counter did not move is not a measurement of zero lines per
+    /// second, it is not a measurement, and one that went backwards is a frame
+    /// wrap or a counter that is not counting.  `None` therefore means "no
+    /// measurement", never "zero", and it is what a timer that does not advance
+    /// produces.
+    ///
+    /// This is section 12.3's observation: the delta over a known interval
+    /// gives the line rate, and the line rate is the pixel clock divided by the
+    /// line total -- 67.5 klines/s at 148.5 MHz over 2200 pixels.  The number
+    /// reported here is measured, not derived; comparing it with the mode is
+    /// the reader's step, and the boot log prints both.
+    pub(crate) fn observed_lines_per_second(self) -> Option<u32> {
+        let mut lines = 0u64;
+        let mut micros = 0u64;
+        for (delta, span) in self.intervals() {
+            if delta > 0 && span > 0 {
+                lines += delta as u64;
+                micros += span;
+            }
+        }
+        if micros == 0 || lines == 0 {
+            return None;
+        }
+        u32::try_from(lines * 1_000_000 / micros).ok()
+    }
+
     /// What to do about it, in the reference's own terms.
     pub(crate) fn describe(self) -> String {
         match self {
             Self::Scanning { samples } => format!(
-                "PIPEDSL sampled {} times over {} ms and changed: {samples:06x?}.  The pipe is \
-                 scanning (reference section 11 phase 6.1)",
+                "PIPEDSL sampled {} times over {} ms and changed: {}.  Intervals: {}.  Observed \
+                 line rate: {}.  The pipe is scanning (reference section 11 phase 6.1, and \
+                 section 12.3 for the rate).",
                 SCANLINE_SAMPLES,
                 (SCANLINE_SAMPLES as u64 - 1) * SCANLINE_INTERVAL_MICROS / 1_000,
+                render_samples(&samples),
+                render_intervals(self.intervals()),
+                render_rate(self.observed_lines_per_second()),
             ),
             Self::NotScanning { samples } => format!(
-                "PIPEDSL read {samples:06x?} on every one of {SCANLINE_SAMPLES} samples over {} \
-                 ms: the value never changed, so the pipe is not scanning and nothing downstream \
-                 of it matters (reference section 11 phase 6.1).  Check, in this order: TRANSCONF \
-                 is written with ENABLE | STATE_ENABLE (section 11 step 5.6); TRANS_CLK_SEL names \
-                 the port PLL the DDI is using (step 5.4); the PLL locked (step 5.1)",
+                "PIPEDSL read {} on every one of {SCANLINE_SAMPLES} samples over {} ms: the value \
+                 never changed, so the pipe is not scanning and nothing downstream of it matters \
+                 (reference section 11 phase 6.1).  Intervals: {}.  Observed line rate: {}.  \
+                 Check, in this order: TRANSCONF is written with ENABLE | STATE_ENABLE (section \
+                 11 step 5.6); TRANS_CLK_SEL names the port PLL the DDI is using (step 5.4); the \
+                 PLL locked (step 5.1)",
+                render_samples(&samples),
                 (SCANLINE_SAMPLES as u64 - 1) * SCANLINE_INTERVAL_MICROS / 1_000,
+                render_intervals(self.intervals()),
+                render_rate(self.observed_lines_per_second()),
             ),
             Self::Unreadable { register } => format!(
                 "{register} could not be read, so whether the pipe is scanning is unknown.  It is \
@@ -1352,14 +1901,61 @@ impl ScanlineCheck {
     }
 }
 
+/// The samples as `line@micros`, in order.
+fn render_samples(samples: &[ScanlineSample; SCANLINE_SAMPLES]) -> String {
+    let mut out = String::new();
+    for (index, sample) in samples.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("{}@{}us", sample.line, sample.micros));
+    }
+    out
+}
+
+/// The intervals as `+lines/micros`, in order.
+fn render_intervals(intervals: [(i64, u64); SCANLINE_SAMPLES - 1]) -> String {
+    let mut out = String::new();
+    for (index, (lines, micros)) in intervals.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("{lines:+}/{micros}us"));
+    }
+    out
+}
+
+/// The measured rate as a log phrase, or why there is none.
+fn render_rate(rate: Option<u32>) -> String {
+    match rate {
+        Some(rate) => format!("{rate} lines/s"),
+        None => String::from(
+            "none: no interval both moved the counter forward and took time, so nothing was \
+             measured",
+        ),
+    }
+}
+
 /// Section 11 phase 6.2's verdict on `PLANE_SURFLIVE`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SurfaceCheck {
     /// The live address is the one that was written.
     Armed { live: u32, wrote: u32 },
-    /// The live address is not the one that was written; zero means the plane
-    /// never armed at all.
-    NotArmed { live: u32, wrote: u32 },
+    /// `PLANE_SURFLIVE` still read zero at the deadline: the plane has not
+    /// latched.
+    ///
+    /// Since the arm is a separate step that runs after the pipe is enabled,
+    /// this is the *expected* result of checking too early, and it is not
+    /// evidence about the surface address: see [`SurfaceCheck::describe`].
+    NotLatched {
+        wrote: u32,
+        /// How long the poll waited, in microseconds.
+        waited_micros: u64,
+    },
+    /// `PLANE_SURFLIVE` holds a different, non-zero address: the plane is
+    /// scanning something else, and that is a wrong buffer rather than a late
+    /// latch.
+    WrongAddress { live: u32, wrote: u32 },
     /// `PLANE_SURFLIVE` could not be read at all.
     Unreadable { register: &'static str },
 }
@@ -1375,18 +1971,28 @@ impl SurfaceCheck {
                 "PLANE_SURFLIVE {live:#010x} equals the address written to PLANE_SURF \
                  {wrote:#010x}: the plane is armed (reference section 11 phase 6.2)"
             ),
-            Self::NotArmed { live, wrote } => format!(
-                "PLANE_SURFLIVE reads {live:#010x} but PLANE_SURF was written with {wrote:#010x}, \
-                 so the plane is not scanning the surface this kernel gave it (reference section \
-                 11 phase 6.2).  {} ",
-                if live == 0 {
-                    "A zero means the plane never armed: re-read PLANE_CTL, and if ENABLE is set \
-                     then the surface address was rejected -- section 11 step 4.3 names alignment \
-                     and an invalid GGTT entry as the two causes"
-                } else {
-                    "A different non-zero address means the plane is scanning something else -- \
-                     most likely the firmware's surface, so the write did not take"
-                }
+            Self::NotLatched {
+                wrote,
+                waited_micros,
+            } => format!(
+                "PLANE_SURFLIVE still reads zero {waited_micros} us after the arm, which is about \
+                 {SURFACE_LATCH_FRAMES} frame times, so PLANE_SURF's {wrote:#010x} has not been \
+                 latched yet.  **This is not \"the surface address was rejected\"**: the arm is \
+                 latched at a vblank, and while the transcoder is disabled there is no vblank to \
+                 latch it at (\"Until the pipe starts PIPEDSL reads will return a stale value\", \
+                 display/intel_display.c:478-486).  Read the phase-6.1 verdict first: if the pipe \
+                 is not scanning, the mode is not running and this check has nothing to say yet.  \
+                 If the pipe *is* scanning and this stays zero, then read PLANE_CTL back for \
+                 ENABLE and treat the address as rejected -- section 11 step 4.3 names alignment \
+                 and an invalid GGTT entry as the two causes"
+            ),
+            Self::WrongAddress { live, wrote } => format!(
+                "PLANE_SURFLIVE reads {live:#010x} after the whole \
+                 {SURFACE_LATCH_FRAMES}-frame-time wait, but PLANE_SURF was written with \
+                 {wrote:#010x}: the plane is scanning a different surface -- most likely the \
+                 firmware's -- so the arm did not take (reference section 11 phase 6.2).  This is \
+                 a wrong buffer rather than a late latch: a plane whose arm had not latched yet \
+                 would read zero"
             ),
             Self::Unreadable { register } => {
                 format!("{register} could not be read, so whether the plane armed is unknown")
@@ -1494,9 +2100,10 @@ impl PipeChecks {
 /// Reference section 11 phase 6.1, 6.2 and 6.4 against one pipe.
 ///
 /// The clock is a parameter for the same reason `sink::probe_one`'s is: the
-/// scanline check has to let a few milliseconds pass, and a host test cannot
-/// wait for real ones, so the test supply their own [`PollTimer`] and the boot
-/// path passes [`MonotonicTimer`].
+/// scanline check has to let a few milliseconds pass and the surface check has
+/// to give the plane's arm a couple of frame times to latch, and a host test
+/// cannot wait for real ones, so the test supplies its own [`PollTimer`] and
+/// the boot path passes [`MonotonicTimer`].
 ///
 /// This is the shape the top-level "prove it" step calls.  It reads registers
 /// and writes nothing: it is safe to run at any point, including against a pipe
@@ -1510,7 +2117,10 @@ pub(crate) fn prove(
 
     let scanline = match sample_scanline(regs, pipe.pipedsl(), timer) {
         Ok(samples) => {
-            if samples.windows(2).any(|pair| pair[0] != pair[1]) {
+            // The verdict is on the *lines*.  Two samples with the same line
+            // and different timestamps are a stopped counter, not a slow one:
+            // the timestamps are the measurement, never the thing measured.
+            if samples.windows(2).any(|pair| pair[0].line != pair[1].line) {
                 ScanlineCheck::Scanning { samples }
             } else {
                 ScanlineCheck::NotScanning { samples }
@@ -1519,20 +2129,7 @@ pub(crate) fn prove(
         Err(register) => ScanlineCheck::Unreadable { register },
     };
 
-    // The comparison is on the address field only.  `PLANE_SURF` also carries
-    // bit 2 as a decrypt flag (§5.4), which this bring-up writes as zero; a mask
-    // that ignored it would call a decrypt-enabled read-back a mismatch, and one
-    // that included it would call a decrypt flag a wrong address.
-    let wrote = plan.plane.surf;
-    let surface = match regs.read(pipe.plane_surflive()) {
-        Some(live) if live & PLANE_SURF_ADDRESS_MASK == wrote & PLANE_SURF_ADDRESS_MASK => {
-            SurfaceCheck::Armed { live, wrote }
-        }
-        Some(live) => SurfaceCheck::NotArmed { live, wrote },
-        None => SurfaceCheck::Unreadable {
-            register: pipe.plane_surflive().name(),
-        },
-    };
+    let surface = surface_check(regs, plan, timer);
 
     let underrun = match regs.read(pipe.pipestat()) {
         Some(stat) if stat & PIPE_FIFO_UNDERRUN_STATUS != 0 => UnderrunCheck::Underrun {
@@ -1564,25 +2161,120 @@ pub(crate) fn prove_at_boot(regs: &impl Registers, plan: &PipeProgram) -> PipeCh
     prove(regs, plan, &MonotonicTimer)
 }
 
-/// Read `PIPEDSL` [`SCANLINE_SAMPLES`] times, [`SCANLINE_INTERVAL_MICROS`]
-/// apart.
+/// How many frame times [`prove`] waits for the plane's arm to latch.
 ///
+/// Two, so that an arm written just after one vblank is still seen by the next
+/// one: the wait bounds how long a *failed* check takes, it is not a claim
+/// about how long a latch takes.  The frame time comes from the mode
+/// ([`frame_micros`]), so the bound follows the mode rather than a constant
+/// that is wrong at 4K.
+pub(crate) const SURFACE_LATCH_FRAMES: u64 = 2;
+
+/// How many times one surface poll may call [`PollTimer::pause`] before giving
+/// up on the clock.
+///
+/// The same contract as [`SCANLINE_PAUSE_BUDGET`] and a larger number for a
+/// larger wait: the real timer's pause is two microseconds and two frame times
+/// is 33 ms at 1080p60, which is about 16 500 pauses.
+const SURFACE_PAUSE_BUDGET: u32 = 32_768;
+
+/// How long one frame takes at the timing a mode carries, in microseconds.
+///
+/// `Mode::clock_khz` is pixels per millisecond, so a frame of
+/// `htotal * vtotal` pixels takes `htotal * vtotal * 1000 / clock_khz`
+/// microseconds -- 16 666 for 1920x1080@60 (2200 * 1125 / 148 500).  A mode
+/// whose clock is zero cannot give one; the caller gets a zero deadline and
+/// reads `PLANE_SURFLIVE` once, which is the honest answer for a timing that
+/// says nothing about its own rate.
+fn frame_micros(mode: &Mode) -> u64 {
+    let pixels = u64::from(mode.htotal) * u64::from(mode.vtotal);
+    let khz = u64::from(mode.clock_khz);
+    if khz == 0 {
+        return 0;
+    }
+    pixels.saturating_mul(1_000) / khz
+}
+
+/// Section 11 phase 6.2: poll `PLANE_SURFLIVE` until the arm latches, or until
+/// [`SURFACE_LATCH_FRAMES`] frame times have passed.
+///
+/// **Why a poll rather than one read.**  The arm is a separate step that runs
+/// after `TRANSCONF` (see [`arm`]), so the transfer from `PLANE_SURF` to the
+/// live register happens at the pipe's next vblank.  A single eager read would
+/// race that: it would report a plane that is about to arm as one that never
+/// did, on the boot where the arm landed microseconds before the read.
+///
+/// The comparison is on the address field only.  `PLANE_SURF` also carries bit
+/// 2 as a decrypt flag (§5.4), which this bring-up writes as zero; a mask that
+/// ignored it would call a decrypt-enabled read-back a mismatch, and one that
+/// included it would call a decrypt flag a wrong address.
+fn surface_check(
+    regs: &impl Registers,
+    plan: &PipeProgram,
+    timer: &impl PollTimer,
+) -> SurfaceCheck {
+    let wrote = plan.plane.surf;
+    let register = plan.pipe.plane_surflive();
+    let started = timer.now_micros();
+    let deadline =
+        started.saturating_add(SURFACE_LATCH_FRAMES.saturating_mul(frame_micros(&plan.mode)));
+    let mut pauses = 0;
+    loop {
+        let Some(live) = regs.read(register) else {
+            return SurfaceCheck::Unreadable {
+                register: register.name(),
+            };
+        };
+        if live & PLANE_SURF_ADDRESS_MASK == wrote & PLANE_SURF_ADDRESS_MASK {
+            return SurfaceCheck::Armed { live, wrote };
+        }
+        let now = timer.now_micros();
+        if now >= deadline || pauses >= SURFACE_PAUSE_BUDGET {
+            // Zero means the arm has not been latched; anything else means the
+            // plane is scanning something that is not what was written, which
+            // no amount of waiting fixes.
+            return if live == 0 {
+                SurfaceCheck::NotLatched {
+                    wrote,
+                    waited_micros: now.saturating_sub(started),
+                }
+            } else {
+                SurfaceCheck::WrongAddress { live, wrote }
+            };
+        }
+        timer.pause();
+        pauses += 1;
+    }
+}
+
+/// Read `PIPEDSL` [`SCANLINE_SAMPLES`] times, [`SCANLINE_INTERVAL_MICROS`]
+/// apart.///
 /// Only `LINE[19:0]` is kept: the register's other bits are reserved, and a
-/// changing reserved bit is not a scanning pipe.
+/// changing reserved bit is not a scanning pipe.  Each sample keeps the timer's
+/// reading as well, taken immediately before the register read, because the
+/// line rate section 12.3 asks for is the delta between two of these and a
+/// timestamp thrown away is an observation thrown away.
 fn sample_scanline(
     regs: &impl Registers,
     register: Register,
     timer: &impl PollTimer,
-) -> Result<[u32; SCANLINE_SAMPLES], &'static str> {
-    let mut samples = [0u32; SCANLINE_SAMPLES];
+) -> Result<[ScanlineSample; SCANLINE_SAMPLES], &'static str> {
+    let mut samples = [ScanlineSample { line: 0, micros: 0 }; SCANLINE_SAMPLES];
     for (index, sample) in samples.iter_mut().enumerate() {
         if index > 0 {
             wait_micros(timer, SCANLINE_INTERVAL_MICROS);
         }
+        // Stamped before the read, so the stamp is never later than the value
+        // it belongs to; the read itself is microseconds of MMIO and the
+        // interval is a millisecond.
+        let micros = timer.now_micros();
         let Some(value) = regs.read(register) else {
             return Err(register.name());
         };
-        *sample = value & PIPEDSL_LINE_MASK;
+        *sample = ScanlineSample {
+            line: value & PIPEDSL_LINE_MASK,
+            micros,
+        };
     }
     Ok(samples)
 }
