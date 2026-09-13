@@ -124,6 +124,37 @@ class FbconSuiteContractTests(unittest.TestCase):
         with self.assertRaisesRegex(module.ProductError, "boots the system profile"):
             module.fbcon_suite_cmd(args)
 
+    def test_a_boot_that_never_rendered_names_the_bootloaders_verdict(self) -> None:
+        """The pixel oracle cannot tell "no console" from "no framebuffer".
+
+        A screendump that never shows the expected text is the same failure
+        whether the console is broken or the bootloader handed the kernel
+        nothing to draw on.  The kernel says which, so the suite must repeat it.
+        """
+
+        module = self.module
+        for verdict, expected in (
+            ("MB2 framebuffer: absent", "no framebuffer tag at all"),
+            ("MB2 framebuffer: declined reason=UnusableAddress",
+             "a framebuffer it could not use"),
+        ):
+            with self.subTest(verdict=verdict), test_tmpdir() as directory:
+                (Path(directory) / "kernel.log").write_text(
+                    f"MB2 tag inventory: protocol=Multiboot2 count=4 truncated=0\n{verdict}\n",
+                    encoding="utf-8")
+                message = module._fbcon_boot_failure(
+                    Path(directory), module.ProcessError("QMP screenshot oracle did not settle"))
+                self.assertIn(verdict, message)
+                self.assertIn(expected, message)
+                self.assertIn("no console, font or repaint change can fix", message)
+
+    def test_a_boot_that_never_reported_a_framebuffer_says_so(self) -> None:
+        module = self.module
+        with test_tmpdir() as directory:
+            (Path(directory) / "kernel.log").write_text("nothing here\n", encoding="utf-8")
+            message = module._fbcon_boot_failure(Path(directory), module.ProcessError("boom"))
+            self.assertIn("never reported a framebuffer", message)
+
     def test_a_workdir_that_leaves_no_room_for_the_qmp_socket_is_refused(self) -> None:
         """A unix socket path is bounded, and the failure is opaque otherwise."""
 

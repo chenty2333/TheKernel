@@ -315,6 +315,27 @@ class TextCellOracleTests(unittest.TestCase):
                 _validate_ppm(path, None, (), QmpTextCells(columns=99))
             self.assertNotIsInstance(caught.exception, _ScreenshotColorMismatch)
 
+    def test_an_unsettled_oracle_reports_the_deadline_and_what_was_missing(self) -> None:
+        """A poll that expires must never look like a bare mismatch.
+
+        On a machine whose only console is the screen there is no second channel
+        to notice a false pass from, so the failure has to say how long it
+        waited and what it was waiting for.
+        """
+
+        from tools.qemu_runner.process import _QmpController
+
+        controller = _QmpController(
+            socket_path=Path("/nonexistent/qmp.sock"), screenshot=None, input_events=(),
+            input_after_marker=None, screenshot_after_marker=None, timeout_secs=12.5,
+            screenshot_size=None, screenshot_color_blocks=(), checkpoints=(),
+        )
+        error = controller._unsettled(
+            _ScreenshotColorMismatch("does not show the expected console text: 'ok 1 - mounts'"))
+        self.assertIsInstance(error, ProcessError)
+        self.assertIn("did not settle within 12.5s", str(error))
+        self.assertIn("ok 1 - mounts", str(error))
+
     def test_text_cell_expectation_is_validated_before_any_image_is_read(self) -> None:
         for cells, message in (
             (QmpTextCells(x=-1), "non-negative origin"),

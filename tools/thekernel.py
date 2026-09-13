@@ -853,7 +853,6 @@ def fbcon_suite_cmd(args: argparse.Namespace) -> int:
             f"gates its screendump on; --profile {args.profile} does not print it"
         )
     artifacts = fbcon_artifacts(args)
-    run_cpus = resolve_run_cpus(args.smp, args.run_cpus)
     if not args.no_build:
         build_rootfs(artifacts)
         build_kernel(artifacts)
@@ -878,6 +877,15 @@ def fbcon_suite_cmd(args: argparse.Namespace) -> int:
             f"{monitor} is {len(str(monitor))} characters and the kernel limit is 107; "
             f"use a shorter --workdir than {runs}"
         )
+    try:
+        return _run_fbcon_boot(args, artifacts, directory, screenshot)
+    except (ProcessError, RunnerError) as error:
+        raise ProductError(_fbcon_boot_failure(directory, error)) from error
+
+
+def _run_fbcon_boot(args: argparse.Namespace, artifacts: Artifacts, directory: Path,
+                    screenshot: Path) -> int:
+    run_cpus = resolve_run_cpus(args.smp, args.run_cpus)
     result = run_product(
         artifacts,
         RunSpec(
@@ -905,6 +913,38 @@ def fbcon_suite_cmd(args: argparse.Namespace) -> int:
     if result:
         return result
     return _check_fbcon_run(directory, screenshot, artifacts)
+
+
+def _fbcon_boot_failure(directory: Path, error: Exception) -> str:
+    """A failed boot, with the kernel's own verdict on the framebuffer attached.
+
+    The pixel oracle can only say that the expected text was not on the screen,
+    and there are two unrelated reasons for that: the console never rendered it,
+    or the bootloader never handed the kernel a framebuffer to render into.  The
+    kernel says which, on the raw early channel, so quote it -- otherwise the
+    next person hunts a font bug for an upstream bootloader problem.
+    """
+
+    verdict = None
+    try:
+        kernel_log = (directory / "kernel.log").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        kernel_log = ""
+    found = FBCON_BOOT_FRAMEBUFFER_ANY_RE.search(kernel_log)
+    if found is not None:
+        verdict = found.group(0).strip()
+    advice = ""
+    if verdict is not None and "absent" in verdict:
+        advice = ("; the bootloader handed the kernel no framebuffer tag at all, which no "
+                  "console, font or repaint change can fix")
+    elif verdict is not None and "declined" in verdict:
+        advice = ("; the bootloader handed the kernel a framebuffer it could not use, which no "
+                  "console, font or repaint change can fix")
+    elif verdict is None:
+        advice = (f"; the kernel never reported a framebuffer in {directory / 'kernel.log'}, so "
+                  f"the boot did not reach the point of reporting one")
+    return (f"fbcon suite boot failed: {error}"
+            f"{f'; the kernel reported {verdict!r}' if verdict else ''}{advice}")
 
 
 def _check_fbcon_run(directory: Path, screenshot: Path, artifacts: Artifacts) -> int:

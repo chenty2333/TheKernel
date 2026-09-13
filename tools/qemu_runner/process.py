@@ -540,6 +540,15 @@ class _QmpController:
 
         self._finished.wait(timeout=0.2)
 
+    def _unsettled(self, mismatch: _ScreenshotColorMismatch) -> ProcessError:
+        """A frame that never became what the oracle required, within budget."""
+
+        if self._cancelled.is_set():
+            return ProcessError("QMP controls cancelled")
+        return ProcessError(
+            f"QMP screenshot oracle did not settle within {self.timeout_secs:g}s: {mismatch}"
+        )
+
     def _wait_marker(self, marker: str, description: str, deadline: float) -> None:
         with self._marker_condition:
             while marker not in self._markers:
@@ -779,14 +788,17 @@ class _QmpController:
                                 checkpoint.screenshot_text_cells,
                             )
                             break
-                        except _ScreenshotColorMismatch:
+                        except _ScreenshotColorMismatch as mismatch:
+                            # The screen may simply not show it yet: the guest
+                            # records console cells and repaints behind the
+                            # writes.  Retry until the deadline, then report
+                            # what was still missing and how long was allowed,
+                            # never a bare "did not match".
                             remaining = deadline - time.monotonic()
-                            if remaining <= 0:
-                                raise
-                            if self._cancelled.wait(min(0.02, remaining)):
-                                raise ProcessError("QMP controls cancelled")
+                            if remaining <= 0 or self._cancelled.wait(min(0.02, remaining)):
+                                raise self._unsettled(mismatch) from mismatch
                             if time.monotonic() >= deadline:
-                                raise
+                                raise self._unsettled(mismatch) from mismatch
             self._complete.set()
         except (OSError, ValueError, json.JSONDecodeError) as error:
             if not self._cancelled.is_set():
