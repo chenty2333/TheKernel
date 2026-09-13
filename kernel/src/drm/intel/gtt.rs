@@ -267,6 +267,30 @@ pub(crate) trait PageTable {
     fn write(&self, index: usize, value: u64);
 }
 
+/// The physical address of the page table array inside a device's BAR 0.
+///
+/// `bar0_len` is the length the *device reports*, not the length this kernel
+/// models: §3.2 warns that `[I915]` under-maps the BAR to 2 MiB for registers,
+/// and a driver that assumed the BAR were 2 MiB would map whatever follows it
+/// and then write page table entries into it.  The check is separate from the
+/// mapping so that it can be exercised on a machine with no BAR to map, because
+/// it is the one thing standing between a wrong model of the aperture and
+/// unrelated memory.
+pub(crate) fn array_physical(bar0_physical: u64, bar0_len: u64) -> Result<u64, GttError> {
+    if bar0_len < MIN_BAR0_BYTES {
+        return Err(GttError::BarTooSmall {
+            observed: bar0_len,
+            needed: MIN_BAR0_BYTES,
+        });
+    }
+    bar0_physical
+        .checked_add(GGTT_ARRAY_OFFSET)
+        .ok_or(GttError::BarTooSmall {
+            observed: bar0_len,
+            needed: MIN_BAR0_BYTES,
+        })
+}
+
 /// The array as a window into BAR 0.
 ///
 /// The window is device memory, so accesses are volatile, and x86_64 orders
@@ -300,11 +324,6 @@ impl MappedArray {
 
     /// Map the page table array of a Gen12 device.
     ///
-    /// `bar0_len` is the length the *device reports* for BAR 0, not the length
-    /// this kernel models: §3.2 warns that `[I915]` under-maps the BAR to 2 MiB
-    /// for registers, and a driver that assumed the BAR were 2 MiB would map
-    /// whatever follows it.  A BAR too short to hold the array is refused.
-    ///
     /// The mapping is uncached, which is what `[I915]` wants here on this
     /// generation: `needs_wc_ggtt_mapping()` (`gt/intel_ggtt.c:197-208`) is
     /// false from Gen11 on precisely because a write-combining mapping of this
@@ -312,19 +331,7 @@ impl MappedArray {
     /// memory uncached.
     #[cfg(target_os = "none")]
     pub(crate) fn map_bar(bar0_physical: u64, bar0_len: u64) -> Result<Self, GttError> {
-        if bar0_len < MIN_BAR0_BYTES {
-            return Err(GttError::BarTooSmall {
-                observed: bar0_len,
-                needed: MIN_BAR0_BYTES,
-            });
-        }
-        let physical =
-            bar0_physical
-                .checked_add(GGTT_ARRAY_OFFSET)
-                .ok_or(GttError::BarTooSmall {
-                    observed: bar0_len,
-                    needed: MIN_BAR0_BYTES,
-                })?;
+        let physical = array_physical(bar0_physical, bar0_len)?;
         let address =
             usize::try_from(physical).map_err(|_| GttError::WindowUnmappable { physical })?;
         let mapped = axmm::iomap(axhal::mem::PhysAddr::from_usize(address), GGTT_ARRAY_BYTES)
@@ -1064,6 +1071,36 @@ mod tests {
             let text = error.describe();
             assert!(!text.is_empty(), "{error:?} must describe itself");
         }
+    }
+
+    #[test]
+    fn a_bar_too_short_for_the_page_table_is_refused() {
+        // Reference section 3.2's warning, as a test: i915 under-maps BAR 0 to
+        // 2 MiB for registers, and a driver that took that for the BAR size
+        // would map -- and write page table entries into -- whatever follows
+        // it.  The refusal is the only thing between that mistake and unrelated
+        // memory, so it is checked without a BAR to map.
+        assert_eq!(
+            array_physical(0x6000_0000, 0x0020_0000),
+            Err(GttError::BarTooSmall {
+                observed: 0x0020_0000,
+                needed: MIN_BAR0_BYTES,
+            })
+        );
+        // A 16 MiB BAR puts the array exactly 8 MiB into it.
+        assert_eq!(
+            array_physical(0x6000_0000, MIN_BAR0_BYTES).unwrap(),
+            0x6080_0000
+        );
+        // An address that cannot hold the offset without wrapping is refused
+        // rather than wrapped.
+        assert!(array_physical(u64::MAX - PAGE_SIZE, MIN_BAR0_BYTES).is_err());
+    }
+
+    #[test]
+    fn a_run_of_zero_pages_is_refused() {
+        let (gtt, _table) = four_page_gtt();
+        assert_eq!(gtt.map_linear(0x1000, 0), Err(GttError::EmptyRun));
     }
 
     #[test]
