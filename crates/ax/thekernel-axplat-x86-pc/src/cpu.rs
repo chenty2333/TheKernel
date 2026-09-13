@@ -462,24 +462,32 @@ pub(crate) fn assert_current_apic_id(apic_id: u32) {
     );
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+/// Visible to [`crate::acpi`], which reuses the same RSDP scan for the MCFG.
+pub(crate) fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     let bytes = bytes.get(offset..offset.checked_add(2)?)?;
     Some(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
-fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+pub(crate) fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     let bytes = bytes.get(offset..offset.checked_add(4)?)?;
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+pub(crate) fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     let bytes = bytes.get(offset..offset.checked_add(8)?)?;
     Some(u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]))
 }
 
-unsafe fn physical_bytes(address: u64, length: usize) -> Option<&'static [u8]> {
+/// Borrow `length` bytes of physical memory starting at `address`.
+///
+/// # Safety
+///
+/// The caller must ensure `address..address + length` is mapped by the page
+/// table currently installed, is readable, and outlives the returned slice.
+/// Nothing in this kernel invalidates it: firmware memory is only ever read.
+pub(crate) unsafe fn physical_bytes(address: u64, length: usize) -> Option<&'static [u8]> {
     let address = usize::try_from(address).ok()?;
     address.checked_add(length)?;
     let ptr = phys_to_virt(PhysAddr::from_usize(address)).as_ptr();
@@ -490,7 +498,8 @@ fn checksum_is_valid(bytes: &[u8]) -> bool {
     bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) == 0
 }
 
-fn find_rsdp_in_range(start: u64, end: u64) -> Option<u64> {
+/// Visible to [`crate::acpi`] as the fallback RSDP scan.
+pub(crate) fn find_rsdp_in_range(start: u64, end: u64) -> Option<u64> {
     let mut address = start;
     while address.checked_add(20)? <= end {
         let signature = unsafe { physical_bytes(address, 20)? };
@@ -511,13 +520,19 @@ fn find_rsdp_in_range(start: u64, end: u64) -> Option<u64> {
     None
 }
 
-fn find_rsdp() -> Option<u64> {
+/// Visible to [`crate::acpi`], which needs the same RSDP when Multiboot
+/// supplied no ACPI pointer.
+pub(crate) fn find_rsdp() -> Option<u64> {
     let ebda_segment = read_u16(unsafe { physical_bytes(0x40e, 2)? }, 0)? as u64;
     find_rsdp_in_range(ebda_segment << 4, (ebda_segment << 4).checked_add(1024)?)
         .or_else(|| find_rsdp_in_range(0xe0000, 0x100000))
 }
 
-fn table_length_and_bytes(address: u64) -> Option<(usize, &'static [u8])> {
+/// Read one ACPI table by physical address, validated by its declared length
+/// and checksum.
+///
+/// Visible to [`crate::acpi`], which walks the same root table for the MCFG.
+pub(crate) fn table_length_and_bytes(address: u64) -> Option<(usize, &'static [u8])> {
     let header = unsafe { physical_bytes(address, 36)? };
     let length = read_u32(header, 4)? as usize;
     if !(36..=1024 * 1024).contains(&length) {
@@ -550,18 +565,18 @@ fn find_madt_in_root(root_address: u64, entry_width: usize) -> Option<u64> {
 }
 
 fn find_madt_from_rsdp(rsdp: &[u8]) -> Option<&'static [u8]> {
-    let revision = rsdp[15];
-    let xsdt_address = read_u64(rsdp, 24).unwrap_or(0);
-    let rsdt_address = read_u32(rsdp, 16)? as u64;
+    // Decoding the RSDP lives in `crate::acpi` so MADT and MCFG discovery can
+    // never disagree about which root table an RSDP names.
+    let root = crate::acpi::root_tables(rsdp);
 
-    if revision >= 2
-        && xsdt_address != 0
-        && let Some(madt_address) = find_madt_in_root(xsdt_address, 8)
+    if root.revision >= 2
+        && root.xsdt != 0
+        && let Some(madt_address) = find_madt_in_root(root.xsdt, 8)
     {
         let (_, table) = table_length_and_bytes(madt_address)?;
         return Some(table);
     }
-    let madt_address = find_madt_in_root(rsdt_address, 4)?;
+    let madt_address = find_madt_in_root(root.rsdt, 4)?;
     let (_, table) = table_length_and_bytes(madt_address)?;
     Some(table)
 }

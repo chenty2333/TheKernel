@@ -164,6 +164,39 @@ pub mod boot {
     pub fn framebuffer() -> Option<BootFramebuffer> {
         None
     }
+
+    /// Whether the bootloader offered any framebuffer tag at all.
+    ///
+    /// False means the kernel was never handed a display; true with
+    /// [`framebuffer`] returning `None` means a display was offered and
+    /// declined, and [`framebuffer_rejection`] says why.
+    #[cfg(all(target_os = "none", feature = "defplat"))]
+    pub fn framebuffer_offered() -> bool {
+        axplat_x86_pc::boot_framebuffer_offered()
+    }
+
+    /// Host tests have no bootloader.
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
+    pub fn framebuffer_offered() -> bool {
+        false
+    }
+
+    /// Why the bootloader's framebuffer was declined, as a stable phrase.
+    ///
+    /// This exists so the reason can reach the *kernel* log.  The platform
+    /// prints it to its diagnostic UART, which a serial-less machine does not
+    /// have; the kernel log is what a framebuffer console mirrors to the
+    /// screen, and the screen is the only channel such a machine has left.
+    #[cfg(all(target_os = "none", feature = "defplat"))]
+    pub fn framebuffer_rejection() -> Option<&'static str> {
+        axplat_x86_pc::boot_framebuffer_rejection()
+    }
+
+    /// Host tests have no bootloader.
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
+    pub fn framebuffer_rejection() -> Option<&'static str> {
+        None
+    }
 }
 
 /// Fleet-owned CET terminal-handoff support.
@@ -672,6 +705,50 @@ pub use axcpu::uspace;
 pub use axplat::init::init_later;
 #[cfg(feature = "smp")]
 pub use axplat::init::{init_early_secondary, init_later_secondary};
+
+/// Runtime PCI platform facts, most importantly the memory-mapped
+/// configuration (ECAM) base.
+///
+/// This is a *runtime* answer: the platform publishes it during early
+/// initialization from the firmware's ACPI MCFG table, and falls back to
+/// `[devices] pci-ecam-base` only when firmware says nothing usable.  Callers
+/// must therefore ask here rather than read the configuration constant, or
+/// they will keep using a hardcoded address on machines whose firmware
+/// disagrees with it.
+///
+/// Hosted builds link no platform crate, so they report the configured
+/// fallback and nothing else.  That is deliberate: a host test must not be
+/// able to observe a "discovery" that never happened.
+pub mod pci {
+    #[cfg(target_os = "none")]
+    pub use axplat_x86_pc::pci::*;
+
+    #[cfg(not(target_os = "none"))]
+    mod host {
+        /// Physical base address of the configured PCI ECAM window.
+        pub fn ecam_base() -> usize {
+            axconfig::devices::PCI_ECAM_BASE
+        }
+
+        /// Inclusive bus range the configured window describes.
+        pub fn ecam_bus_range() -> (u8, u8) {
+            (0, axconfig::devices::PCI_BUS_END as u8)
+        }
+
+        /// PCI segment group the configured window describes.
+        pub fn ecam_segment() -> u16 {
+            0
+        }
+
+        /// Whether [`ecam_base`] came from firmware.  Never, on a host.
+        pub fn ecam_discovered() -> bool {
+            false
+        }
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub use host::*;
+}
 
 /// Initializes the platform and boot argument.
 /// This function should be called as early as possible.

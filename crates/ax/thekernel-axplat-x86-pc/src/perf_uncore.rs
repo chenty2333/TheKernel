@@ -659,7 +659,7 @@ fn pci_ecam_address(control: u64, register: usize, width: usize) -> Option<usize
     {
         return None;
     }
-    let address = crate::config::devices::PCI_ECAM_BASE
+    let address = crate::acpi::pci_ecam_base()
         .checked_add(bus << 20)?
         .checked_add((devfn >> 3) << 15)?
         .checked_add((devfn & 7) << 12)?

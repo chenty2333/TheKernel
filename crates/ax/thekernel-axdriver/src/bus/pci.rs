@@ -222,7 +222,12 @@ fn input_registry() -> &'static Mutex<BusDeviceRegistry> {
 }
 
 fn pci_root() -> PciRoot {
-    let base_vaddr = phys_to_virt(axconfig::devices::PCI_ECAM_BASE.into());
+    // The ECAM base is a machine fact: the platform discovers it from the
+    // firmware's MCFG table during early initialization and falls back to
+    // `[devices] pci-ecam-base` only when firmware supplies nothing usable.
+    // Asking the platform is what makes this kernel bootable on hardware whose
+    // ECAM base differs from the configured value.
+    let base_vaddr = phys_to_virt(axhal::pci::ecam_base().into());
     unsafe { PciRoot::new(base_vaddr.as_mut_ptr(), Cam::Ecam) }
 }
 

@@ -22,6 +22,12 @@ impl InitIf for InitIfImpl {
         crate::boot_info::finish_handoff();
         crate::mem::init();
         crate::cpu::init_topology();
+        // MCFG discovery has the same deadline as MADT discovery and for the
+        // same reason: the table lives in firmware memory that the runtime page
+        // table does not map.  Only the chosen ECAM region survives, which is
+        // what makes the PCI bus driver's later read of `crate::pci` a plain
+        // load instead of a second ACPI walk.
+        crate::acpi::init_early();
     }
 
     /// Initializes the platform at the early stage for secondary cores.
@@ -47,6 +53,10 @@ impl InitIf for InitIfImpl {
         init_hwp_fleet_member();
         #[cfg(feature = "pmu")]
         init_pmu_fleet_member();
+        // Report the ECAM decision here rather than in `init_early`: the logger
+        // does not exist yet at that point, and this is the last moment before
+        // the PCI bus driver starts using the published base.
+        crate::acpi::report();
         report_cpu_state(cpu_id);
     }
 
