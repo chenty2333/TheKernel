@@ -972,3 +972,44 @@ fn pll_rs_search_is_measured_against_the_documented_adl_n_search() {
     assert!(documented_total_divider(495_000).is_some());
     assert!(pll::ddi_pll_dividers(495_000, STRAP_38_4, ComboPhy::A).is_err());
 }
+
+/// DVI is the same sequence with a different mode select, and the reference
+/// names no translation table for it -- which the refusal has to say.
+#[test]
+fn dvi_differs_from_hdmi_only_in_the_mode_select_and_has_no_named_table() {
+    let mut dvi = hdmi_request(Ddi::A);
+    dvi.port_type = PortType::Dvi;
+    let dvi_plan = OutputProgram::plan(&dvi, STRAP_38_4).unwrap();
+    let hdmi_plan = target_plan();
+
+    // §8.4: `TRANS_DDI_MODE_SELECT_MASK[26:24]` is HDMI = 0, DVI = 1, and
+    // nothing else in the register moves.
+    let mode_select = 0b111 << TRANS_DDI_MODE_SELECT_SHIFT;
+    assert_eq!(hdmi_plan.trans_ddi_func_ctl & mode_select, 0);
+    assert_eq!(
+        dvi_plan.trans_ddi_func_ctl & mode_select,
+        1 << TRANS_DDI_MODE_SELECT_SHIFT
+    );
+    assert_eq!(
+        dvi_plan.trans_ddi_func_ctl & !mode_select,
+        hdmi_plan.trans_ddi_func_ctl & !mode_select
+    );
+    assert_eq!(dvi_plan.ddi_buf_ctl, hdmi_plan.ddi_buf_ctl);
+    assert_eq!(dvi_plan.trans_clk_sel, hdmi_plan.trans_clk_sel);
+    assert_eq!(dvi_plan.transconf, hdmi_plan.transconf);
+
+    dvi.swing = None;
+    let error = OutputProgram::plan(&dvi, STRAP_38_4).unwrap_err();
+    match error {
+        OutputError::MissingBufferTranslation { port_type, table } => {
+            assert_eq!(port_type, PortType::Dvi);
+            assert_eq!(table, None);
+        }
+        other => panic!("wrong error: {other:?}"),
+    }
+    assert!(
+        error
+            .describe()
+            .contains("names one for HDMI and none for DVI")
+    );
+}

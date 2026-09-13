@@ -240,12 +240,12 @@ what was done instead, and what would close it.
 
 ## 6. What the tests measure
 
-`[MEASURED]` 196 `drm::intel` host tests pass, 28 of them this module's, none failing. `cargo
+`[MEASURED]` 197 `drm::intel` host tests pass, 29 of them this module's, none failing. `cargo
 clippy` for the host test target and for the product kernel configuration (`tools/thekernel.py
 lint`, `x86_64-unknown-none`, release) reports nothing in `output.rs` or `output/tests.rs`. The
 product kernel builds.
 
-The 28 tests assert, among other things:
+The 29 tests assert, among other things:
 
 * the write order, on `writes()` rather than on the return value: twenty-one writes in the order §8.6
   gives, with the DDI-IO well between the clock mapping and the swing values;
@@ -357,3 +357,18 @@ the failure is the finding.
    this module as a literal.
 6. **`DPLL0_ENABLE` after the firmware's modeset**, to confirm the lock bit and to compare the poll
    timing the reference reports against what this machine does.
+
+### 8.1 A route that needs no offline dump
+
+The firmware on the target machine drives the same HDMI output before this kernel does, so the
+translation values that matter for *this* board are already in the PHY when the kernel starts. They
+can be read at boot — the two candidate sets are the PHY's `PORT_TX_DW2`/`DW4`/`DW5`/`DW7`
+(`0x162688`, `0x162890 + 0x100*ln`, `0x162694`, `0x16269c`, and `0x06c...` for PHY B) and the
+indexed `DDI_BUF_TRANS_LO`/`HI` pair (`0x64E00 + i*8` and `+4`, `0x64E60` for port B; the table
+declares entries 0 to 9) — and fed into `SwingProgram` with a `source` string that says where they
+came from. Reading both sets and logging the raw words answers §5 item 4 at the same time: whichever
+set holds plausible per-lane variation is the one the port uses.
+
+That is a route for whoever wires this into the boot sequence, not something this module does. It
+reads no register the sequence does not own and writes nothing it did not compute; what it must not
+do is invent the numbers, which is why a request without them is refused.
