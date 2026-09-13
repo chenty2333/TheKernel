@@ -274,7 +274,7 @@ mod tests {
         assert!(identify(INTEL_VENDOR, 0x15F3).is_some());
         assert!(identify(0x1af4, 0x15F3).is_none(), "virtio vendor, same id");
         assert!(identify(0x0000, 0x15F3).is_none());
-        assert!(identify(INTEL_VENDOR, 0x1533).is_none(), "an e1000e id");
+        assert!(identify(INTEL_VENDOR, 0x1533).is_none(), "an I210 (igb) id");
         // 0x15F9/0x15FA are the 500 Series PCH GbE controller in this host's
         // pci.ids.  They are NOT in igc_pci_tbl, so this driver must not bind
         // them: another driver owns those parts.

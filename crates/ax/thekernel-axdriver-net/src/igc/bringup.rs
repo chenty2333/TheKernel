@@ -11,7 +11,10 @@
 //! # The sequence, and where each step comes from
 //!
 //! Every step cites the vendor function it was taken from.  The order is the
-//! vendor's, not a guess:
+//! vendor's for the reset and the link; the one step whose *position* is this
+//! driver's own choice is the packet-buffer split, which Linux writes once at
+//! probe time (`igc_main.c:7097-7098`) and this driver writes as part of its
+//! reset sequence:
 //!
 //! 1. `igc_mac.c:21` `igc_disable_pcie_master` -- assert
 //!    `CTRL.GIO_MASTER_DISABLE` and poll `STATUS.GIO_MASTER_ENABLE` clear, so
@@ -28,7 +31,7 @@
 //! 5. `igc_main.c:7096-7098` -- program the packet-buffer split.
 //! 6. `igc_nvm.c:133` `igc_read_mac_addr` -- read `IGC_RAL(0)`/`IGC_RAH(0)`
 //!    and assemble the station address.
-//! 7. `igc_base.c:322` `igc_setup_copper_link_base` -- set `CTRL.SLU` and clear
+//! 7. `igc_base.c:112-115` `igc_setup_copper_link_base` -- set `CTRL.SLU` and clear
 //!    the speed/duplex force bits, so the PHY autonegotiates.
 //! 8. `igc_phy.c:64` `igc_phy_has_link` and `igc_mac.c:681`
 //!    `igc_get_speed_and_duplex_copper` -- poll the PHY's MII status register
@@ -38,7 +41,7 @@
 //! # Where this driver departs from the vendor driver, and why
 //!
 //! * **The PHY's advertisement registers are not programmed.**  Linux's
-//!   `igc_phy_setup_autoneg` (`igc_phy.c:135`) clears and rewrites MII
+//!   `igc_phy_setup_autoneg` (`igc_phy.c:216`) clears and rewrites MII
 //!   registers 4 and 9 and the 2.5 Gb/s bit in the MMD register 7.32, so the
 //!   PHY advertises exactly the speeds Linux wants.  This driver writes no PHY
 //!   register at all: it reads what the PHY is advertising and reports it, and
@@ -83,7 +86,7 @@ pub const MASTER_DISABLE_POLL_US: u32 = 2_000;
 pub const RESET_SETTLE_US: u32 = 10_000;
 
 /// How long to wait between `EECD.AUTO_RD` polls.
-/// `usleep_range(1000, 2000)` at `igc_mac.c:657`, lower bound.
+/// `usleep_range(1000, 2000)` at `igc_mac.c:658`, lower bound.
 pub const AUTO_READ_POLL_US: u32 = 1_000;
 
 /// How long to wait before each `IGC_MDIC` poll.
@@ -103,7 +106,8 @@ pub const MDIC_POLL_US: u32 = 50;
 pub const LINK_POLL_US: u32 = 10_000;
 
 /// How many times the PHY is asked for link before the wait is called a
-/// failure: 300 polls of [`LINK_POLL_US`], so at least three seconds.
+/// failure: 300 polls, each followed by [`LINK_POLL_US`] except the last, so
+/// just under three seconds.
 pub const LINK_POLL_BUDGET: u32 = 300;
 
 /// Why bringing the part up failed.
@@ -177,7 +181,7 @@ pub struct StationAddress {
     pub high: u32,
     /// `IGC_RAH_AV`, the bit that says the receive filter entry is armed.
     ///
-    /// Linux does not require it (`igc_main.c:7088` only checks
+    /// Linux does not require it (`igc_main.c:7090` only checks
     /// `is_valid_ether_addr`), and neither does this driver, but a receive
     /// filter entry with this bit clear will not accept the machine's own
     /// unicast frames, so the report prints it rather than assuming.
@@ -216,21 +220,31 @@ pub struct ResetOutcome {
 }
 
 /// What the link wait observed.
+///
+/// Four MII registers, and the *register* each bit lives in matters: an
+/// earlier version of this code read the 1000BASE-T full-duplex bit
+/// (`CR_1000T_FD_CAPS`, `igc_defines.h:174`) out of the 10/100 advertisement
+/// register, where `0x0100` means something else entirely
+/// (`NWAY_AR_100TX_FD_CAPS`, `igc_defines.h:163-164`).  Each accessor below
+/// names the register it reads, and a test pins the difference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinkOutcome {
     /// How many times the PHY was asked for link, including the successful
     /// one.
     pub polls: u32,
-    /// The MII status word of the successful poll.
+    /// The MII status word of the successful poll (register 1).
     pub phy_status: u16,
     /// `MII_SR_AUTONEG_COMPLETE` from that word.
     pub autoneg_complete: bool,
-    /// What the PHY was advertising when link came up (`PHY_AUTONEG_ADV`), if
-    /// it answered.
+    /// MII register 4, `PHY_AUTONEG_ADV`: what this PHY advertises for 10 and
+    /// 100 Mb/s, and its pause bits.
     pub advertisement: Option<u16>,
-    /// What the link partner advertised (`PHY_LP_ABILITY`), if the PHY
-    /// answered.
+    /// MII register 9, `PHY_1000T_CTRL`: the 1000BASE-T advertisement.
+    pub gigabit_control: Option<u16>,
+    /// MII register 5, `PHY_LP_ABILITY`: what the link partner advertises.
     pub partner: Option<u16>,
+    /// MII register 10, `PHY_1000T_STATUS`: the partner's 1000BASE-T status.
+    pub gigabit_status: Option<u16>,
     /// The MAC's own `IGC_STATUS` at the moment link was declared up.
     pub status: DeviceStatus,
 }
@@ -246,23 +260,44 @@ impl LinkOutcome {
         self.status.full_duplex()
     }
 
-    /// Whether the advertisement bit that means "I can do 1000BASE-T full
-    /// duplex" is set in the PHY's advertisement register.
-    ///
-    /// This is a *read* of the advertisement, not a statement about the
-    /// negotiated link: 2.5 Gb/s lives in an MMD register this driver does not
-    /// reach (register 7.32, `igc_phy.c:157`), so a link that came up at
-    /// 1000 Mb/s and an advertisement that does not mention 2.5 Gb/s are both
-    /// consistent with what is printed here.
-    pub fn advertises_gigabit_full(&self) -> bool {
+    /// Whether the PHY advertises 100 Mb/s full duplex, from MII register 4
+    /// (`NWAY_AR_100TX_FD_CAPS`, `igc_defines.h:163`).
+    pub fn advertises_100_full(&self) -> Option<bool> {
         self.advertisement
-            .is_some_and(|word| word & bits::CR_1000T_FD_CAPS != 0 || word & 0x0100 != 0)
+            .map(|word| word & bits::NWAY_AR_100TX_FD_CAPS != 0)
     }
 
-    /// Whether the PHY reports the link partner can receive (a 1000BASE-T
-    /// status bit), when it answered.
+    /// Whether the PHY advertises 1000BASE-T full duplex, from MII register 9
+    /// (`CR_1000T_FD_CAPS`, `igc_defines.h:174` — *not* the register the 10/100
+    /// bits live in).
+    ///
+    /// This is a read of the advertisement, not a statement about the
+    /// negotiated link, and it says nothing about 2.5 Gb/s: that lives in MMD
+    /// register 7.32, which this driver does not reach
+    /// (`igc_phy.c:240-244` reads it and `:379-383` writes it).  So a link at
+    /// 1000 Mb/s and an advertisement that does not mention 2.5 Gb/s are both
+    /// consistent with what is printed here, and a link at 2500 Mb/s is
+    /// perfectly possible with `advertises_gigabit_full()` false.
+    pub fn advertises_gigabit_full(&self) -> Option<bool> {
+        self.gigabit_control
+            .map(|word| word & bits::CR_1000T_FD_CAPS != 0)
+    }
+
+    /// Whether the link partner reports its receiver is ready, from MII
+    /// register 10 (`SR_1000T_REMOTE_RX_STATUS`, `igc_defines.h:177`).
+    ///
+    /// An earlier version of this answered "true" whenever the *register 5*
+    /// read had succeeded, which is not the same claim at all.
     pub fn partner_ready(&self) -> Option<bool> {
-        self.partner.map(|_| true)
+        self.gigabit_status
+            .map(|word| word & bits::SR_1000T_REMOTE_RX_STATUS != 0)
+    }
+
+    /// Whether the link partner advertises pause frames, from MII register 5
+    /// (`NWAY_LPAR_PAUSE`, `igc_defines.h:169`).
+    pub fn partner_advertises_pause(&self) -> Option<bool> {
+        self.partner
+            .map(|word| word & bits::NWAY_LPAR_PAUSE != 0)
     }
 
     /// How the report spells the negotiated link.
@@ -286,9 +321,38 @@ impl LinkOutcome {
         )
     }
 
+    /// Decode MII register 9 (`PHY_1000T_CTRL`) into the words a reader wants.
+    ///
+    /// `CR_1000T_HD_CAPS` and `CR_1000T_FD_CAPS` (`igc_defines.h:173-174`);
+    /// 1000 Mb/s half duplex is a mode the vendor driver refuses to advertise
+    /// (`igc_phy.c`, "Advertise 1000mb Half duplex request denied"), so a set
+    /// half-duplex bit is reported rather than hidden.
+    pub fn describe_gigabit_control(word: u16) -> String {
+        let mut modes = Vec::new();
+        if word & bits::CR_1000T_FD_CAPS != 0 {
+            modes.push("1000FD");
+        }
+        if word & bits::CR_1000T_HD_CAPS != 0 {
+            modes.push("1000HD");
+        }
+        if modes.is_empty() {
+            String::from("no 1000BASE-T mode advertised")
+        } else {
+            modes.join(" ")
+        }
+    }
+
+    /// Decode MII register 10 (`PHY_1000T_STATUS`).
+    pub fn describe_gigabit_status(word: u16) -> String {
+        if word & bits::SR_1000T_REMOTE_RX_STATUS != 0 {
+            String::from("the partner's receiver is ready")
+        } else {
+            String::from("the partner does not report its receiver ready")
+        }
+    }
+
     /// Decode MII register 4 (`PHY_AUTONEG_ADV`) into the words a reader
-    /// wants: which speeds and duplex modes are advertised, and the pause
-    /// bits.
+    /// wants: which 10/100 modes are advertised, and the pause bits.
     pub fn describe_advertisement(word: u16) -> String {
         let mut parts = Vec::new();
         parts.push(if word & 0x0020 != 0 { "10HD" } else { "" });
@@ -373,12 +437,28 @@ impl BringUp {
         ));
         if let Some(word) = self.link.advertisement {
             out.push_str(&format!(
-                "{}:   PHY advertisement {word:#06x} ({}){}\n",
+                "{}:   PHY advertisement {word:#06x} (10/100 and pause: {}){}\n",
                 super::probe::PREFIX,
                 LinkOutcome::describe_advertisement(word),
-                match self.link.partner {
-                    Some(partner) => format!(", link partner {partner:#06x}"),
-                    None => String::from(", link partner register not read"),
+                match self.link.gigabit_control {
+                    Some(control) => format!(
+                        "; 1000BASE-T control {control:#06x} ({})",
+                        LinkOutcome::describe_gigabit_control(control),
+                    ),
+                    None => String::from("; 1000BASE-T control register not read"),
+                },
+            ));
+            out.push_str(&format!(
+                "{}:   link partner {:#06x}{}; 2.5 Gb/s is advertised in MMD register 7.32, which \
+                 this driver does not read, so the advertisement cannot confirm or deny it\n",
+                super::probe::PREFIX,
+                self.link.partner.unwrap_or(0),
+                match self.link.gigabit_status {
+                    Some(status) => format!(
+                        " (1000BASE-T status {status:#06x}: {})",
+                        LinkOutcome::describe_gigabit_status(status),
+                    ),
+                    None => String::from(", 1000BASE-T status register not read"),
                 },
             ));
         }
@@ -590,7 +670,7 @@ pub fn read_phy<B: IgcBus>(bus: &mut B, register: u16) -> Result<u16, BringUpErr
 }
 
 /// Ask the MAC to bring the link up and let the PHY autonegotiate
-/// (`igc_base.c:322`).
+/// (`igc_base.c:112-115`).
 pub fn start_link<B: IgcBus>(
     bus: &mut B,
     journal: &mut Vec<&'static str>,
@@ -622,13 +702,17 @@ pub fn wait_for_link<B: IgcBus>(bus: &mut B) -> Result<LinkOutcome, BringUpError
             // The advertisement and partner words are read *after* link, as
             // diagnostics: this driver never writes them.
             let advertisement = read_phy(bus, mii::AUTONEG_ADV).ok();
+            let gigabit_control = read_phy(bus, mii::CTRL_1000T).ok();
             let partner = read_phy(bus, mii::LP_ABILITY).ok();
+            let gigabit_status = read_phy(bus, mii::STATUS_1000T).ok();
             return Ok(LinkOutcome {
                 polls: poll,
                 phy_status: last_phy_status,
                 autoneg_complete: last_phy_status & bits::MII_SR_AUTONEG_COMPLETE != 0,
                 advertisement,
+                gigabit_control,
                 partner,
+                gigabit_status,
                 status,
             });
         }
@@ -957,14 +1041,88 @@ mod tests {
     fn the_link_outcome_reports_what_the_advertisement_does_and_does_not_say() {
         let mut bus = seeded(NicModel::healthy(MAC, Speed::Mbit1000));
         let up = bring_up(&mut bus).unwrap();
-        // The model advertises all speeds by default, including 1000BASE-T
-        // full duplex in register 9 -- which this driver reads but does not
-        // decode into a claim about 2.5 Gb/s.
+        // The model advertises every 10/100 mode and pause in register 4,
+        // 1000BASE-T full duplex in register 9, and the partner's receiver
+        // ready in register 10.
         assert!(up.link.advertisement.is_some());
+        assert!(up.link.gigabit_control.is_some());
         assert!(up.link.partner.is_some());
+        assert!(up.link.gigabit_status.is_some());
         let described = up.link.describe();
         assert!(described.starts_with("link up, "), "{described}");
         assert!(described.contains("after 1 poll"), "{described}");
+        // The report says plainly that it cannot see the 2.5 Gb/s
+        // advertisement.
+        let text = up.render("0000:01:00.0");
+        assert!(
+            text.contains("MMD register 7.32, which this driver does not read"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_gigabit_advertisement_bit_is_read_from_register_9_not_register_4() {
+        // This is the bug an adversarial audit found: `CR_1000T_FD_CAPS` is
+        // 0x0200 in MII register 9, while 0x0100 in register 4 is
+        // `NWAY_AR_100TX_FD_CAPS` -- 100 Mb/s full duplex, not 1000.
+        let mut bus = seeded(NicModel::healthy(MAC, Speed::Mbit1000));
+        let up = bring_up(&mut bus).unwrap();
+        assert_eq!(up.link.advertises_gigabit_full(), Some(true));
+        assert_eq!(up.link.advertises_100_full(), Some(true));
+        assert_eq!(up.link.partner_ready(), Some(true));
+        assert_eq!(up.link.partner_advertises_pause(), Some(true));
+
+        // A PHY that advertises 100 Mb/s full duplex but not 1000BASE-T: the
+        // old predicate would have said "gigabit" here.
+        let mut model = NicModel::healthy(MAC, Speed::Mbit100);
+        model.phy.insert(mii::CTRL_1000T, 0);
+        model.phy.insert(mii::STATUS_1000T, 0);
+        let mut bus = seeded(model);
+        let up = bring_up(&mut bus).unwrap();
+        assert_eq!(
+            up.link
+                .advertisement
+                .map(|word| word & bits::NWAY_AR_100TX_FD_CAPS != 0),
+            Some(true)
+        );
+        assert_eq!(up.link.advertises_100_full(), Some(true));
+        assert_eq!(up.link.advertises_gigabit_full(), Some(false));
+        assert_eq!(up.link.partner_ready(), Some(false));
+
+        // And a register that was never read says so instead of guessing.
+        let outcome = LinkOutcome {
+            polls: 1,
+            phy_status: 0x0024,
+            autoneg_complete: true,
+            advertisement: None,
+            gigabit_control: None,
+            partner: None,
+            gigabit_status: None,
+            status: DeviceStatus::new(0),
+        };
+        assert_eq!(outcome.advertises_gigabit_full(), None);
+        assert_eq!(outcome.partner_ready(), None);
+    }
+
+    #[test]
+    fn the_gigabit_decodes_name_the_register_they_come_from() {
+        let control = LinkOutcome::describe_gigabit_control(bits::CR_1000T_FD_CAPS);
+        assert!(control.contains("1000FD"), "{control}");
+        assert!(!control.contains("1000HD"), "{control}");
+        let both = LinkOutcome::describe_gigabit_control(
+            bits::CR_1000T_FD_CAPS | bits::CR_1000T_HD_CAPS,
+        );
+        assert!(both.contains("1000FD") && both.contains("1000HD"), "{both}");
+        let none = LinkOutcome::describe_gigabit_control(0);
+        assert!(none.contains("no 1000BASE-T mode"), "{none}");
+
+        assert!(
+            LinkOutcome::describe_gigabit_status(bits::SR_1000T_REMOTE_RX_STATUS)
+                .contains("receiver is ready")
+        );
+        assert!(
+            LinkOutcome::describe_gigabit_status(0).contains("does not report its receiver ready")
+        );
     }
 
     #[test]

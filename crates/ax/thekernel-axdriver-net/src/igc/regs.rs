@@ -108,7 +108,7 @@ use core::sync::atomic::{Ordering, compiler_fence};
 /// firmware-assigned BAR is smaller than this.
 ///
 /// The BAR's true size is not a fact any source available here establishes:
-/// Linux's `igc` maps `pci_resource_len(pdev, 0)` (`igc_main.c:6990`) and
+/// Linux's `igc` maps `pci_resource_len(pdev, 0)` (`igc_main.c:6991-6992`) and
 /// never states a size, and the register offsets it names reach `0x12594`
 /// (`IGC_PTM_TDELAY`, `igc_regs.h:287`), so the only lower bound this project
 /// can derive is "bigger than the registers someone uses".  A window of 64 KiB
@@ -517,7 +517,7 @@ pub const NAMED: &[Register] = &[
         Group::Identity,
         Meaning::ReceiveAddressLow,
         "bytes 0..3 of the station address, little-endian, as the NVM auto-read left them",
-        "igc_regs.h:114 (IGC_RAL(_n)); read by igc_nvm.c:139 igc_read_mac_addr",
+        "igc_regs.h:114 (IGC_RAL(_n)); read by igc_nvm.c:140 igc_read_mac_addr",
     ),
     Register::read_only(
         "IGC_RAH(0)",
@@ -525,7 +525,7 @@ pub const NAMED: &[Register] = &[
         Group::Identity,
         Meaning::ReceiveAddressHigh,
         "bytes 4..5 of the station address and the RAH.AV bit that says the filter entry is armed",
-        "igc_regs.h:115 (IGC_RAH(_n)); read by igc_nvm.c:138 igc_read_mac_addr",
+        "igc_regs.h:115 (IGC_RAH(_n)); read by igc_nvm.c:139 igc_read_mac_addr",
     ),
     // -- receive ----------------------------------------------------------
     Register::read_write(
@@ -675,7 +675,7 @@ pub const IDENTIFY: &[Register] = &[
         Group::Identity,
         Meaning::ReceiveAddressLow,
         "the station address the NVM auto-read left in the receive filter",
-        "igc_regs.h:114 (IGC_RAL(_n)); read by igc_nvm.c:139 igc_read_mac_addr",
+        "igc_regs.h:114 (IGC_RAL(_n)); read by igc_nvm.c:140 igc_read_mac_addr",
     ),
     Register::read_only(
         "IGC_RAH(0)",
@@ -683,7 +683,7 @@ pub const IDENTIFY: &[Register] = &[
         Group::Identity,
         Meaning::ReceiveAddressHigh,
         "the upper half of that address and its valid bit",
-        "igc_regs.h:115 (IGC_RAH(_n)); read by igc_nvm.c:138 igc_read_mac_addr",
+        "igc_regs.h:115 (IGC_RAH(_n)); read by igc_nvm.c:139 igc_read_mac_addr",
     ),
 ];
 
@@ -933,6 +933,17 @@ pub mod bits {
     pub const MII_SR_LINK_STATUS: u16 = 0x0004;
     /// `MII_SR_AUTONEG_COMPLETE` (`igc_defines.h:629`).
     pub const MII_SR_AUTONEG_COMPLETE: u16 = 0x0020;
+    /// `NWAY_AR_10T_HD_CAPS` (`igc_defines.h:161`).
+    pub const NWAY_AR_10T_HD_CAPS: u16 = 0x0020;
+    /// `NWAY_AR_10T_FD_CAPS` (`igc_defines.h:162`).
+    pub const NWAY_AR_10T_FD_CAPS: u16 = 0x0040;
+    /// `NWAY_AR_100TX_HD_CAPS` (`igc_defines.h:163`).
+    pub const NWAY_AR_100TX_HD_CAPS: u16 = 0x0080;
+    /// `NWAY_AR_100TX_FD_CAPS` — 100 Mb/s full duplex, in MII register 4
+    /// (`igc_defines.h:164`).  It shares a bit value with the 1000BASE-T
+    /// half-duplex bit in register 9, which is exactly the confusion an
+    /// earlier version of `bringup.rs` made.
+    pub const NWAY_AR_100TX_FD_CAPS: u16 = 0x0100;
     /// `NWAY_AR_PAUSE` — we advertise pause (`igc_defines.h:165`).
     pub const NWAY_AR_PAUSE: u16 = 0x0400;
     /// `NWAY_AR_ASM_DIR` — we advertise asymmetric pause
@@ -944,6 +955,11 @@ pub mod bits {
     /// `NWAY_LPAR_ASM_DIR` — the link partner advertises asymmetric pause
     /// (`igc_defines.h:170`).
     pub const NWAY_LPAR_ASM_DIR: u16 = 0x0800;
+    /// `CR_1000T_HD_CAPS` — 1000BASE-T half duplex advertised, in MII
+    /// register 9 (`igc_defines.h:173`).  It shares its value with the
+    /// 100 Mb/s full-duplex bit in register 4, which is why the two are never
+    /// decoded from the same word here.
+    pub const CR_1000T_HD_CAPS: u16 = 0x0100;
     /// `CR_1000T_FD_CAPS` — 1000BASE-T full duplex advertised
     /// (`igc_defines.h:174`).
     pub const CR_1000T_FD_CAPS: u16 = 0x0200;
@@ -983,9 +999,10 @@ pub mod mii {
 
 /// The PHY address this driver puts in `IGC_MDIC`'s PHY field.
 ///
-/// Linux never assigns `hw->phy.addr`: the field is only ever read, inside
+/// Linux never assigns `hw->phy.addr`: the field is only ever read -- inside
 /// `igc_read_phy_reg_mdic` and `igc_write_phy_reg_mdic`
-/// (`igc_phy.c:561`/`:618`), and the `igc_hw` structure is zeroed when the
+/// (`igc_phy.c:561`/`:618`) and in ethtool's own report
+/// (`igc_ethtool.c:1805`) -- and the `igc_hw` structure is zeroed when the
 /// adapter is allocated, so the vendor driver addresses the integrated PHY at
 /// **0**.  That is a fact about the vendor driver, not about the part, and it
 /// is the first thing to check if a link-status poll on real hardware returns
@@ -1067,7 +1084,7 @@ impl DeviceStatus {
 
     /// `IGC_STATUS_FUNC`: which PCI function this is.
     ///
-    /// `igc_base.c:165` reads it the same way when it sets the LAN id.
+    /// `igc_base.c:164` reads it the same way when it sets the LAN id.
     pub const fn function_id(self) -> u8 {
         ((self.0 & bits::STATUS_FUNC_MASK) >> bits::STATUS_FUNC_SHIFT) as u8
     }
@@ -1080,6 +1097,13 @@ impl DeviceStatus {
     /// 2.5 Gb/s from 1 Gb/s.  A `SPEED_2500` without `SPEED_1000` therefore
     /// decodes as 10 Mb/s — which is what the vendor driver does, and the test
     /// below pins that behaviour rather than inventing a nicer one.
+    ///
+    /// `igc_get_speed_and_duplex_copper` guards the 2.5 Gb/s branch with
+    /// `hw->mac.type == igc_i225` (`igc_mac.c:692-693`).  There is no such
+    /// guard here because it would always be true: every device id this driver
+    /// binds maps to `igc_i225` in `igc_get_invariants_base`
+    /// (`igc_base.c:192-213`), which is also why the family column in
+    /// [`super::ids`] is not consulted anywhere in the driver.
     pub const fn speed(self) -> Speed {
         if self.0 & bits::STATUS_SPEED_1000 != 0 {
             if self.0 & bits::STATUS_SPEED_2500 != 0 {
@@ -1132,7 +1156,7 @@ impl DeviceControl {
     }
 
     /// The same value with `CTRL.GIO_MASTER_DISABLE` asserted:
-    /// `igc_disable_pcie_master` writes exactly this (`igc_mac.c:27`).
+    /// `igc_disable_pcie_master` writes exactly this (`igc_mac.c:29`).
     pub const fn with_master_disabled(self) -> Self {
         Self(self.0 | bits::CTRL_GIO_MASTER_DISABLE)
     }
@@ -1146,7 +1170,7 @@ impl DeviceControl {
     }
 
     /// The same value with `CTRL.SLU` set and both force bits clear: the link
-    /// request `igc_setup_copper_link_base` makes (`igc_base.c:322-326`).
+    /// request `igc_setup_copper_link_base` makes (`igc_base.c:112-115`).
     pub const fn with_link_up_autonegotiated(self) -> Self {
         Self((self.0 | bits::CTRL_SLU) & !(bits::CTRL_FRCSPD | bits::CTRL_FRCDPX))
     }
@@ -1170,7 +1194,7 @@ impl NvmControl {
     /// `IGC_EECD_AUTO_RD`: the hardware has finished reading the NVM into the
     /// receive-address registers.
     ///
-    /// `igc_mac.c:650-674` (`igc_get_auto_rd_done`) polls this bit after a
+    /// `igc_mac.c:650-670` (`igc_get_auto_rd_done`) polls this bit after a
     /// reset; it is the only signal this driver has that the MAC address in
     /// `IGC_RAL(0)`/`IGC_RAH(0)` is the one the NVM holds.
     pub const fn auto_read_done(self) -> bool {
@@ -1250,7 +1274,7 @@ impl MdicCommand {
     ///
     /// The register field is five bits (`MAX_PHY_REG_ADDRESS`), so a larger
     /// number cannot be encoded.  The vendor driver refuses one
-    /// (`igc_phy.c:549`); this constructor returns `None` instead of masking.
+    /// (`igc_phy.c:550`); this constructor returns `None` instead of masking.
     pub const fn read(phy: u32, register: u16) -> Option<Self> {
         Self::build(phy, register, bits::MDIC_OP_READ, 0)
     }
@@ -1320,7 +1344,7 @@ impl ReceiveControl {
     }
 
     /// The value `igc_setup_rctl` programs for a single queue with no `RXALL`
-    /// request and the default multicast filter type (`igc_main.c:835-866`).
+    /// request and the default multicast filter type (`igc_main.c:835-876`).
     ///
     /// Three of the bits it sets deserve naming, because a reader will look
     /// for them:
@@ -1429,7 +1453,7 @@ pub struct SplitReceiveControl(u32);
 
 impl SplitReceiveControl {
     /// The value `igc_configure_rx_ring` programs for one buffer per packet
-    /// (`igc_main.c:625-706`): the header-size field holds `header_bytes` in
+    /// (`igc_main.c:625-702`): the header-size field holds `header_bytes` in
     /// 64-byte units, the packet-size field holds `packet_bytes` in 1 KiB
     /// units, and the descriptor type is `ADV_ONEBUF`.
     pub const fn one_buffer(packet_bytes: u32, header_bytes: u32) -> Self {
@@ -1474,7 +1498,7 @@ pub const TX_WTHRESH: u32 = 16;
 /// The two registers have the same layout and `igc_configure_rx_ring` and
 /// `igc_configure_tx_ring` build both the same way: the prefetch threshold in
 /// bits 2:0, the host threshold in bits 10:8, the write-back threshold in bits
-/// 20:16, then the queue-enable bit (`igc_main.c:625-706` and `:728-765`, with
+/// 20:16, then the queue-enable bit (`igc_main.c:625-702` and `:728-765`, with
 /// the constants from `igc.h:480-485`).
 ///
 /// The vendor driver ORs the three constants in *without* masking them, so the
@@ -1536,6 +1560,10 @@ impl QueueControl {
     }
 
     /// The queue-enable bit.
+    ///
+    /// `RXDCTL` and `TXDCTL` carry the same bit value (`igc_base.h:89` and
+    /// `:93`, both `0x02000000`), so one accessor serves both registers; the
+    /// name is the receive one because that is where the constant is declared.
     pub const fn queue_enabled(self) -> bool {
         self.0 & bits::RXDCTL_QUEUE_ENABLE != 0
     }
@@ -1599,9 +1627,16 @@ impl RingLength {
     /// (`igc_main.c:625`), and the vendor driver rounds the *allocation* up to
     /// 4 KiB (`igc_setup_rx_resources`, `igc_main.c:534`) but not the value it
     /// puts in the register.  This constructor refuses a length that is not a
-    /// multiple of 128 bytes, which is the alignment a descriptor ring length
-    /// must have for the hardware to accept it; the vendor driver does not
-    /// check, and a ring of 8 descriptors of 16 bytes is exactly 128.
+    /// multiple of 128 bytes.
+    ///
+    /// The 128 comes from the vendor driver's own constants rather than from a
+    /// datasheet this project does not have: `REQ_RX_DESCRIPTOR_MULTIPLE` and
+    /// `REQ_TX_DESCRIPTOR_MULTIPLE` are 8 (`igc_defines.h:9-11`), applied to
+    /// the descriptor *count* by `igc_ethtool.c:601` and `:605`, and a
+    /// descriptor is 16 bytes -- so a count that is a multiple of 8 is a
+    /// length that is a multiple of 128, and a ring of 8 descriptors is
+    /// exactly 128 bytes.  The vendor driver does not check the length when it
+    /// programs the register; this constructor does.
     pub const fn new(descriptors: usize, descriptor_bytes: usize) -> Option<Self> {
         let bytes = descriptors * descriptor_bytes;
         if descriptors == 0 || descriptor_bytes == 0 || !bytes.is_multiple_of(128) {
@@ -1951,14 +1986,18 @@ mod tests {
         assert_eq!(bits::TCTL_EN, 0x0000_0002); // :330
         assert_eq!(bits::TCTL_PSP, 0x0000_0008); // :331
         assert_eq!(bits::TCTL_CT, 0x0000_0ff0); // :332
+        assert_eq!(bits::TCTL_COLD, 0x003f_f000); // :333
         assert_eq!(bits::TCTL_RTLC, 0x0100_0000); // :334
         assert_eq!(bits::COLLISION_THRESHOLD, 15); // :217
         assert_eq!(bits::CT_SHIFT, 4); // :218
+        assert_eq!(bits::RCTL_RST, 0x0000_0001); // :348
         assert_eq!(bits::RCTL_EN, 0x0000_0002); // :349
         assert_eq!(bits::RCTL_SBP, 0x0000_0004); // :350
         assert_eq!(bits::RCTL_UPE, 0x0000_0008); // :351
         assert_eq!(bits::RCTL_MPE, 0x0000_0010); // :352
         assert_eq!(bits::RCTL_LPE, 0x0000_0020); // :353
+        // The loopback field is two bits from two adjacent lines (:354-355).
+        assert_eq!(bits::RCTL_LBM, 0x0000_00c0); // :354-355
         assert_eq!(bits::RCTL_RDMTS_HALF, 0x0000_0000); // :357
         assert_eq!(bits::RCTL_BAM, 0x0000_8000); // :358
         assert_eq!(bits::RCTL_SZ_256, 0x0003_0000); // :391
@@ -1991,10 +2030,15 @@ mod tests {
         assert_eq!(bits::GEN_POLL_TIMEOUT, 1920); // :620
         assert_eq!(bits::MII_SR_LINK_STATUS, 0x0004); // :628
         assert_eq!(bits::MII_SR_AUTONEG_COMPLETE, 0x0020); // :629
+        assert_eq!(bits::NWAY_AR_10T_HD_CAPS, 0x0020); // :161
+        assert_eq!(bits::NWAY_AR_10T_FD_CAPS, 0x0040); // :162
+        assert_eq!(bits::NWAY_AR_100TX_HD_CAPS, 0x0080); // :163
+        assert_eq!(bits::NWAY_AR_100TX_FD_CAPS, 0x0100); // :164
         assert_eq!(bits::NWAY_AR_PAUSE, 0x0400); // :165
         assert_eq!(bits::NWAY_AR_ASM_DIR, 0x0800); // :166
         assert_eq!(bits::NWAY_LPAR_PAUSE, 0x0400); // :169
         assert_eq!(bits::NWAY_LPAR_ASM_DIR, 0x0800); // :170
+        assert_eq!(bits::CR_1000T_HD_CAPS, 0x0100); // :173
         assert_eq!(bits::CR_1000T_FD_CAPS, 0x0200); // :174
         assert_eq!(bits::SR_1000T_REMOTE_RX_STATUS, 0x1000); // :177
         assert_eq!(bits::COPPER_LINK_UP_LIMIT, 10); // :91

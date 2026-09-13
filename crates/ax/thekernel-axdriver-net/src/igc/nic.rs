@@ -63,9 +63,13 @@ use crate::{EthernetAddress, NetBufPtr, NetDriverOps};
 /// The device name the interface reports.
 pub const DEVICE_NAME: &str = "igc";
 
-/// The receive buffer size in the units the `SRRCTL` field takes, which is
-/// kilobytes (`igc_base.h:97-99`).
-const RX_PACKET_KILOBYTES: u32 = RX_BUFFER_BYTES as u32;
+/// The receive buffer size in bytes.
+///
+/// It is used in two places and in two different units, which is worth naming
+/// once: `IGC_RLPML` takes a byte count, and `SRRCTL`'s packet-size field
+/// takes kilobytes (`igc_base.h:97-99`), which
+/// `SplitReceiveControl::one_buffer` divides down to.
+const RX_PACKET_BYTES: u32 = RX_BUFFER_BYTES as u32;
 
 /// Counters, for the report and for the tests.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -174,7 +178,8 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
 
         // Four DMA regions: two descriptor rings and two buffer pools.  A
         // descriptor ring must be at least 128-byte aligned (its length must be
-        // a multiple of 128) and each pool is carved into fixed slots, so every
+        // a multiple of 128, see `RingLength`) and each pool is carved into
+        // fixed slots, so every
         // allocation is asked for page alignment and the alignment is checked
         // rather than assumed.
         let mut allocations = Vec::with_capacity(4);
@@ -604,14 +609,14 @@ fn enable_mac<H: IgcHal>(bus: &mut WindowBus<H>) -> DevResult {
     // (`MAX_JUMBO_FRAME_SIZE`, `igc_defines.h:147`): a receive limit larger
     // than the buffer a frame is written into is a limit this driver cannot
     // honour.
-    write(bus, "IGC_RLPML", RX_PACKET_KILOBYTES)?;
+    write(bus, "IGC_RLPML", RX_PACKET_BYTES)?;
     let current = read(bus, "IGC_TCTL")?;
     write(bus, "IGC_TCTL", TransmitControl::setup_value(current).raw())?;
     Ok(())
 }
 
 /// Program the transmit ring, the way `igc_configure_tx_ring` does
-/// (`igc_main.c:728-765`).
+/// (`igc_main.c:728-758`).
 fn configure_transmit<H: IgcHal>(
     bus: &mut WindowBus<H>,
     descriptors: u64,
@@ -633,7 +638,7 @@ fn configure_transmit<H: IgcHal>(
 }
 
 /// Program the receive ring, the way `igc_configure_rx_ring` does
-/// (`igc_main.c:625-706`).
+/// (`igc_main.c:625-702`).
 fn configure_receive<H: IgcHal>(
     bus: &mut WindowBus<H>,
     descriptors: u64,
@@ -649,7 +654,7 @@ fn configure_receive<H: IgcHal>(
     write(
         bus,
         "IGC_SRRCTL(0)",
-        SplitReceiveControl::one_buffer(RX_PACKET_KILOBYTES, RX_HEADER_BYTES as u32).raw(),
+        SplitReceiveControl::one_buffer(RX_PACKET_BYTES, RX_HEADER_BYTES as u32).raw(),
     )?;
     write(
         bus,
@@ -671,7 +676,8 @@ mod tests {
     };
 
     /// A small ring: eight descriptors is the smallest size whose byte length
-    /// is a multiple of 128, which is what the hardware requires of `RDLEN`.
+    /// is a multiple of 128, the multiple the vendor driver's own
+    /// `REQ_*_DESCRIPTOR_MULTIPLE` constants imply (`igc_defines.h:9-11`).
     const QS: usize = 8;
 
     /// A locally administered unicast address.

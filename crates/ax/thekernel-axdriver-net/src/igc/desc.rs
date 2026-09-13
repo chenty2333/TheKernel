@@ -22,7 +22,7 @@
 //!   unused is what makes "full" and "empty" distinguishable when head and
 //!   tail are equal.  Both rings here have `count - 1` usable descriptors.
 //! * **The tail register is one past the last descriptor handed over.**  In
-//!   `igc_alloc_rx_buffers` (`igc_main.c:2229-2292`) the driver fills
+//!   `igc_alloc_rx_buffers` (`igc_main.c:2229-2290`) the driver fills
 //!   descriptors from `next_to_use`, then writes `i` -- the *incremented*
 //!   index -- to the tail register, and `igc_configure_rx_ring`
 //!   (`igc_main.c:625`) starts it at zero with an empty ring.  The same holds
@@ -63,8 +63,9 @@ pub const DESCRIPTOR_BYTES: usize = 16;
 pub const MAX_FRAME_BYTES: usize = 1522;
 
 /// The receive buffer size, `IGC_RXBUFFER_2048` (`igc.h:453`), which is what
-/// `igc_configure_rx_ring` puts in the descriptor's buffer-size field
-/// (`igc_main.c:625`).
+/// `igc_configure_rx_ring` encodes into the `SRRCTL` packet-size field -- a
+/// *register* field, in units of 1 KiB (`igc_base.h:97-99`), which is why
+/// `SplitReceiveControl::one_buffer` divides before it packs.
 pub const RX_BUFFER_BYTES: usize = 2048;
 
 /// The header buffer size, `IGC_RX_HDR_LEN` = `IGC_RXBUFFER_256`
@@ -231,8 +232,14 @@ impl DescriptorMemory {
 
     /// Write a transmit descriptor's data fields.
     ///
-    /// The order is the vendor driver's: the buffer address first, then the
-    /// command word, then the offload word (`igc_tx_map`, `igc_main.c:1316`).
+    /// The *words* are the vendor driver's; the *order* here is this driver's
+    /// own.  `igc_tx_map` writes the offload word first (`igc_main.c:1333`,
+    /// through `igc_tx_olinfo_status`), then the buffer address (`:1350`), then
+    /// the command word carrying `EOP|RS` (`:1393-1394`).  This function
+    /// writes address, command, offload -- which is safe for the same reason
+    /// any order is: the hardware does not look at a descriptor until the tail
+    /// register moves, and that happens after this returns.
+    ///
     /// The write-back `status` word is left alone; the hardware owns it.
     pub fn write_tx(
         &mut self,
@@ -301,7 +308,7 @@ impl DescriptorMemory {
             // packet: clearing it here is what makes "length != 0" mean "the
             // hardware just wrote this descriptor".  The vendor driver clears
             // it for the descriptor after the ones it fills
-            // (`igc_main.c:2276`); clearing it per descriptor is the same
+            // (`igc_main.c:2270`); clearing it per descriptor is the same
             // guarantee and also holds when buffers are handed back out of
             // order.
             core::ptr::write_volatile(length.as_ptr(), 0);
@@ -313,7 +320,7 @@ impl DescriptorMemory {
     /// The receive descriptor's write-back length field, or `None`.
     ///
     /// This is the vendor driver's written-back test: a non-zero length means
-    /// the hardware has finished with the descriptor (`igc_main.c:2601`).
+    /// the hardware has finished with the descriptor (`igc_main.c:2604`).
     pub fn rx_length(&self, index: usize) -> Option<u16> {
         let address = self.word(index, 3)?;
         // The length is the low half of the fourth word.
@@ -550,7 +557,7 @@ impl TxRing {
 /// by somebody else, which is the one mistake here that would corrupt memory
 /// rather than a packet.
 ///
-/// This mirrors `igc_alloc_rx_buffers` (`igc_main.c:2229-2292`): fill from
+/// This mirrors `igc_alloc_rx_buffers` (`igc_main.c:2229-2290`): fill from
 /// `next_to_use`, clear the length of the descriptor being armed, then write
 /// the incremented index to the tail register.
 #[derive(Clone, Debug, Eq, PartialEq)]
