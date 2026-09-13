@@ -13,6 +13,7 @@ mod file;
 mod gem;
 mod ioctl;
 mod kms;
+pub mod modes;
 mod property;
 mod render;
 mod syncobj;
