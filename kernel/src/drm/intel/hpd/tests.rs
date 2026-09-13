@@ -474,7 +474,7 @@ fn a_read_that_failed_is_not_an_event_and_does_not_reset_the_baseline() {
         .expect("a poll that could not read must name the register")
         .describe();
     assert!(reason.contains("SDEISR"), "{reason}");
-    for state in failed.states().into_iter().flatten() {
+    if let Some(state) = failed.states().into_iter().flatten().next() {
         panic!("a hidden register produced a state: {state:?}");
     }
     let again = poll_connect(&working);

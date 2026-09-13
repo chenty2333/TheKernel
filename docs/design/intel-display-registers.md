@@ -902,7 +902,7 @@ Key topology rules, all from `[PRM]` "DG1 Display Overview":
 
 | Register | Pipe A | Field summary |
 |---|---|---|
-| `TRANSCONF` (a.k.a. `PIPECONF`; **i915 renamed it**) | `0x70008` | `ENABLE[31]`, `STATE_ENABLE[30]`, `INTERLACE[23:21]` |
+| `TRANSCONF` (a.k.a. `PIPECONF`; **i915 renamed it**) | `0x70008` | `ENABLE[31]` (a request), `STATE_ENABLE[30]` (**a status: i915 polls it, never sets it**), `INTERLACE[23:21]` |
 | `PIPESRC` | `0x6001c` | `WIDTH[31:16]`, `HEIGHT[15:0]` — pipe source size, **minus 1** |
 | `PIPEDSL` | `0x70000` | `LINE[19:0]` — current scanline; read this to prove the pipe is running |
 | `PIPESTAT` | `0x70024` | `PIPE_FIFO_UNDERRUN_STATUS[31]`, vblank status/enable |
@@ -1454,8 +1454,16 @@ Three separate muxes must agree. `[I915]` `display/intel_ddi.c:1487-1501` and `4
    `DDI_CLK_SEL_SHIFT(phy) = phy * 2`, 2 bits, value = **the PLL id** (0 or 1 for DPLL0/DPLL1).
    Also a per-DDI `DDI_CLK_OFF` bit at `_PICK(phy, 10, 11, 24, 4, 5)` (non-RKL encoding).
 2. **Transcoder → port clock**: `TRANS_CLK_SEL(tran)` at `0x46140 + tran*4`, field
-   `TGL_TRANS_CLK_SEL_PORT(port) = (port + 1) << 28` (Gen12 encoding; the pre-Gen12 encoding is
+   `TGL_TRANS_CLK_SEL_PORT(x) = (x + 1) << 28` (Gen12 encoding; the pre-Gen12 encoding is
    `<< 29`). `Disabled` = 0. `[I915]` `i915_reg.h:4007-4015`, `intel_ddi.c:987-1007`.
+   **The field is keyed by PHY, not by port, from display version 13 on**: i915 converts with
+   `intel_port_to_phy()` (`intel_display.c:1950-1965`) and passes the result to
+   `TGL_TRANS_CLK_SEL_PORT` on the `DISPLAY_VER >= 13` arm (`intel_ddi.c:993`, `:999-1000`), where
+   version 12 passed `encoder->port`.  For combo PHY A / DDI A the two indices are both 0 and the
+   value is the same, so this only bites a port that is not its own PHY (the Type-C DDIs).  Step 3's
+   `TRANS_DDI_FUNC_CTL` field is **not** converted -- i915 uses `encoder->port` there on every
+   display version (`intel_ddi.c:481`, `:488-490`) -- so the same number is right for one field and
+   wrong for the other, which is exactly the kind of thing to write down rather than remember.
 3. **Transcoder → DDI**: `TRANS_DDI_FUNC_CTL(tran)`, field
    `TGL_TRANS_DDI_SELECT_PORT(port) = (port + 1) << 27` (Gen12; pre-Gen12 is `<< 28`).
    `[I915]` `i915_reg.h:3742-3760`, `intel_ddi.c:483-490`.
@@ -1901,12 +1909,13 @@ precisely why they differ between two parts with the same PHY IP.
      HDMI/DVI: 4 lanes -> PWR_UP_ALL_LANES (0x0)
                 2 lanes -> PWR_DOWN_LN_3_2 (0xC)
                 1 lane  -> PWR_DOWN_LN_3_2_1 (0xE)
-8. Program TRANS_CLK_SEL(tran) = TGL_TRANS_CLK_SEL_PORT(port)
+8. Program TRANS_CLK_SEL(tran) = TGL_TRANS_CLK_SEL_PORT(phy)   (§6.3: PHY, not port, on ver 13)
 9. Program transcoder timings (§6.1) and PIPESRC
 10. Program & enable the plane(s)     (order: WM/DDB -> ... -> PLANE_CTL -> PLANE_SURF)
 11. TRANS_DDI_FUNC_CTL = ENABLE | SELECT_PORT | MODE_SELECT_HDMI/DVI
                          | BPC_8 | polarity | (scrambling if needed)
-12. TRANSCONF (0x70008) = ENABLE | STATE_ENABLE | progressive | 8bpc
+12. TRANSCONF (0x70008) = ENABLE | progressive | 8bpc   (bit 30 is the hardware's status, not a
+    request -- see the note under phase 5.6)
 13. DDI_BUF_CTL = ENABLE | BUF_TRANS_SELECT(level) | PHY_LINK_RATE(rate)
                   | PORT_WIDTH(lanes-1) | A_4_LANES if 4
 14. Poll DDI_BUF_CTL.IS_IDLE == 0   ("not idle")   [PRM] timeout 500us for HDMI
@@ -2447,7 +2456,16 @@ then, **in a separate write**, clear `DDI_CLK_OFF(phy)`.
 **5.5 `TRANS_DDI_FUNC_CTL(A) = ENABLE | SELECT_PORT(A) | MODE_SELECT_HDMI | BPC_8 | PHSYNC? | PVSYNC?`**
 — note `SELECT_PORT(A)` in Gen12 encoding is `(0+1) << 27 = 0x08000000`.
 
-**5.6 `TRANSCONF(A) = ENABLE | STATE_ENABLE | progressive`** = `(1<<31) | (1<<30)`.
+**5.6 `TRANSCONF(A) = ENABLE | progressive`** = `(1<<31)`.
+
+> **Corrected: bit 30 is a status, not a request.** Earlier revisions of this
+> document wrote `ENABLE | STATE_ENABLE = (1<<31) | (1<<30)`.  `[I915]` defines
+> bit 30 as `TRANSCONF_STATE_ENABLE` (`i915_reg.h:1591`) and only ever *polls* it
+> clear -- `intel_wait_for_pipe_off` (`display/intel_display.c:302-318`) -- while
+> `intel_enable_transcoder` reads the register and writes back
+> `val | TRANSCONF_ENABLE`, bit 31 alone (`:459`, `:474-475`).  Setting a status
+> bit is writing a request that the hardware does not read; the bit can, however,
+> be read in phase 6 as a further "the pipe is up" proof.
 Output bit depth is **not** set here on Gen12 — put `PIPE_MISC_BPC_8` (`PIPE_MISC[7:5] = 0`) and
 `PIPE_MISC_DITHER_ENABLE` (`PIPE_MISC[4]`) in `PIPE_MISC(A)` (`0x70030`) if you want dithering.
 

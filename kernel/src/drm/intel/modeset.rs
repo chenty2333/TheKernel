@@ -505,7 +505,8 @@ impl CheckId {
             CheckId::Scanning => {
                 "the pipe is not scanning and nothing downstream matters: check the PLL (\u{a7}11 \
                  phase 5.1, including `ref` and the `(P,Q,K)` used), then the DDI clock mapping \
-                 (5.2), then TRANSCONF's ENABLE and STATE_ENABLE (5.6), in that order"
+                 (5.2), then TRANSCONF's ENABLE -- bit 31 alone; bit 30 is the hardware's \"pipe \
+                 is on\" status, not a request (5.6) -- in that order"
             }
             CheckId::SurfaceLive => {
                 "the plane never armed: re-read PLANE_CTL, and if ENABLE is set while SURFLIVE is \
