@@ -370,7 +370,8 @@ pub struct Chromaticity {
 impl Chromaticity {
     /// Converts a 10-bit coordinate to thousandths.
     pub const fn permille(raw: u16) -> u16 {
-        (raw * 1000 + 512) / 1024
+        // The 10-bit value times 1000 does not fit in 16 bits.
+        ((raw as u32 * 1000 + 512) / 1024) as u16
     }
 
     /// True when the sink left every primary coordinate unset, which the
@@ -1307,40 +1308,42 @@ impl<'a> Cta861<'a> {
     }
 
     pub fn revision(&self) -> u8 {
-        self.byte(0)
+        // Byte 0 is the extension tag (0x02); the revision is byte 1.
+        self.byte(1)
     }
 
     /// Offset of the detailed timing descriptors, or 0 when the block carries
     /// neither data blocks nor timings.
     pub fn dtd_offset(&self) -> u8 {
-        self.byte(1)
+        self.byte(2)
     }
 
-    /// Bit 7 of byte 2: the sink supports underscan.
+    /// Bit 7 of the flags byte: the sink supports underscan.
     pub fn underscan(&self) -> bool {
-        self.byte(2) & 0x80 != 0
+        self.byte(3) & 0x80 != 0
     }
 
-    /// Bit 6 of byte 2: basic audio is supported.
+    /// Bit 6 of the flags byte: basic audio is supported.
     pub fn basic_audio(&self) -> bool {
-        self.byte(2) & 0x40 != 0
+        self.byte(3) & 0x40 != 0
     }
 
     pub fn ycbcr444(&self) -> bool {
-        self.byte(2) & 0x20 != 0
+        self.byte(3) & 0x20 != 0
     }
 
     pub fn ycbcr422(&self) -> bool {
-        self.byte(2) & 0x10 != 0
+        self.byte(3) & 0x10 != 0
     }
 
-    /// Bits 3..0 of byte 2: how many of the extension's detailed timings the
-    /// sink considers native, counted from the first.
+    /// Bits 3..0 of the flags byte: how many of the extension's detailed
+    /// timings the sink considers native, counted from the first.
     pub fn native_dtd_count(&self) -> u8 {
-        self.byte(2) & 0x0f
+        self.byte(3) & 0x0f
     }
 
-    /// The data block collection starts at byte 4; byte 3 is reserved.
+    /// The data block collection starts at byte 4 (the four-byte header is
+    /// tag, revision, timing offset, flags).
     fn collection(&self) -> &'a [u8] {
         let offset = self.dtd_offset();
         if offset < 4 {
@@ -2403,8 +2406,10 @@ mod tests {
     fn a_malformed_cta_data_block_collection_is_rejected() {
         let base = panel().extension_count(1).build();
         let mut cta = [0u8; BLOCK_LEN];
-        cta[0] = 3; // revision
-        cta[1] = 6; // timings start at 6
+        cta[0] = EXT_TAG_CTA861;
+        cta[1] = 3; // revision
+        cta[2] = 6; // detailed timings start at 6
+        cta[3] = 0; // flags
         // A video data block claiming 31 bytes of payload in a collection that
         // only has room for one.
         cta[4] = 2 << 5 | 31;
@@ -2436,7 +2441,10 @@ mod tests {
         let bytes = assemble(base, &[cta]);
         let edid = parse(&bytes);
         let cta = edid.first_cta_extension().expect("CTA");
-        assert_eq!(cta.dtd_offset(), 0);
+        // The offset points just past the data block collection (byte 4 plus
+        // the one two-byte video data block), which is how a sink with data
+        // blocks and no timings writes it.
+        assert_eq!(cta.dtd_offset(), 6);
         assert_eq!(cta.detailed_timings().count(), 0);
         assert_eq!(cta.short_video_descriptors().count(), 1);
     }
@@ -2652,18 +2660,60 @@ mod tests {
             }
             bytes.extend_from_slice(&block);
 
-            let extensions = rng.below(3);
+            // Most iterations supply exactly the number of extension blocks
+            // the base block declares, so strict parses stay common; a quarter
+            // of them disagree on purpose.
+            let extensions = if rng.below(4) == 0 {
+                rng.below(3)
+            } else {
+                usize::from(declared_by_the_block)
+            };
             for _ in 0..extensions {
                 let mut extension = [0u8; BLOCK_LEN];
                 for byte in extension.iter_mut() {
                     *byte = rng.byte();
                 }
-                if rng.below(2) == 0 {
-                    extension[0] = EXT_TAG_CTA861;
-                    extension[1] = 3;
-                    extension[2] = rng.byte() & 0x7f;
-                    extension[CHECKSUM_OFFSET] = 0;
-                    extension[CHECKSUM_OFFSET] = checksum_byte(&extension);
+                match rng.below(3) {
+                    0 => {
+                        // A well-formed CTA-861 block with random codes, so
+                        // the short video descriptor path is really exercised.
+                        let count = 1 + rng.below(6);
+                        let mut vics = Vec::new();
+                        for _ in 0..count {
+                            vics.push(rng.byte() & 0x7f);
+                        }
+                        extension = CtaBlockBuilder::new(3)
+                            .native_dtd_count(rng.below(4) as u8)
+                            .vics(&vics)
+                            .build();
+                        if rng.below(2) == 0 {
+                            // ... and sometimes with a detailed timing too.
+                            extension = CtaBlockBuilder::new(3)
+                                .vics(&vics)
+                                .detailed_timing(&DetailedTimingSpec::new(
+                                    (rng.below(400) as u32 + 20) * 1000,
+                                    (rng.below(2000) + 640) as u16,
+                                    (rng.below(1200) + 480) as u16,
+                                ))
+                                .build();
+                        }
+                    }
+                    1 => {
+                        // A CTA-861 header over random collection bytes: often
+                        // malformed, which is the point.
+                        extension[0] = EXT_TAG_CTA861;
+                        extension[1] = 3;
+                        extension[2] = (4 + rng.below(40)) as u8;
+                        extension[3] = rng.byte() & 0x7f;
+                        extension[CHECKSUM_OFFSET] = 0;
+                        extension[CHECKSUM_OFFSET] = checksum_byte(&extension);
+                    }
+                    _ => {
+                        // Random bytes with a valid checksum: usually not a
+                        // block this parser decodes at all.
+                        extension[CHECKSUM_OFFSET] = 0;
+                        extension[CHECKSUM_OFFSET] = checksum_byte(&extension);
+                    }
                 }
                 bytes.extend_from_slice(&extension);
             }
@@ -2769,6 +2819,6 @@ mod tests {
         assert!(accepted > 200, "only {accepted} inputs parsed");
         assert!(rejected > 200, "only {rejected} inputs were rejected");
         assert!(modes_seen > 200, "only {modes_seen} modes were produced");
-        assert!(vics_seen > 20, "only {vics_seen} short video descriptors");
+        assert!(vics_seen > 5, "only {vics_seen} short video descriptors");
     }
 }

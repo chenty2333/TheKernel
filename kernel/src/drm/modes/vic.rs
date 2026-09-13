@@ -1508,7 +1508,7 @@ mod tests {
                 97, 3840, 2160, 594_000, 4016, 4104, 4400, 2168, 2178, 2250, 60, true, true,
             ),
             (
-                95, 3840, 2160, 594_000, 3976, 4064, 4400, 2168, 2178, 2250, 30, true, true,
+                95, 3840, 2160, 297_000, 4016, 4104, 4400, 2168, 2178, 2250, 30, true, true,
             ),
             // Pixel-repeated SD formats: CTA-861 lists the repeated width and
             // the multiplied clock, for example 720(1440)x576 at 200 Hz.

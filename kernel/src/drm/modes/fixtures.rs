@@ -129,7 +129,9 @@ impl RangeLimitsSpec {
             cvt_version: 1,
             cvt_revision: 1,
             cvt_aspects: 0b1111_0000,
-            cvt_flags: 0b0010_0000 | 0x10, // preferred 16:10, reduced blanking
+            // Preferred aspect 16:10 (bits 7..5 = 010), standard blanking
+            // (bit 3) and reduced blanking (bit 4) both supported.
+            cvt_flags: 0b0100_0000 | 0x18,
             cvt_scaling: 0,
             cvt_preferred_refresh_hz: 60,
         }
@@ -497,8 +499,11 @@ impl CtaBlockBuilder {
 
     fn build_with_checksum(self, valid: bool) -> [u8; BLOCK_LEN] {
         let mut block = [0u8; BLOCK_LEN];
-        block[0] = self.revision;
-        block[2] = self.flags;
+        // CTA-861 extension header: tag, revision, detailed timing offset,
+        // flags - the offset is written below once it is known.
+        block[0] = 0x02;
+        block[1] = self.revision;
+        block[3] = self.flags;
         let mut cursor = 4usize;
         if !self.data_blocks.is_empty() {
             block[cursor..cursor + self.data_blocks.len()]
@@ -511,10 +516,11 @@ impl CtaBlockBuilder {
             // nothing at all, which is not what a sink with modes sends.
             if self.data_blocks.is_empty() { 0 } else { cursor }
         } else {
-            // Detailed timings are 18-byte aligned in the block.
-            cursor.div_ceil(18) * 18
+            // CTA-861 puts the timing area wherever the offset says; the data
+            // blocks are written contiguously, so no padding is needed.
+            cursor
         };
-        block[1] = dtd_offset as u8;
+        block[2] = dtd_offset as u8;
         let mut cursor = dtd_offset;
         for timing in &self.detailed_timings {
             assert!(cursor + 18 <= BLOCK_LEN - 1, "extension is full");

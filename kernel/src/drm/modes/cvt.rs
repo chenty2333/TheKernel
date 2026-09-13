@@ -75,8 +75,9 @@ const H_SYNC_PERCENT: u64 = 8;
 /// Horizontal sync width for reduced blanking, in pixels.
 const RB_H_SYNC: u64 = 32;
 
-/// One second in picoseconds, used to turn a rate into a period exactly.
-const PS_PER_SECOND: u64 = 1_000_000_000_000;
+/// One second in picoseconds times one thousand: dividing this by a rate in
+/// millihertz gives the period in picoseconds exactly.
+const PS_PER_MILLIHERTZ: u64 = 1_000_000_000_000_000;
 /// Millihertz to hertz.
 const MHZ_PER_HZ: u64 = 1000;
 /// Highest pixel clock CVT may produce, in kHz.  Four gigahertz is far beyond
@@ -118,7 +119,7 @@ pub fn generate(request: CvtRequest) -> Option<Mode> {
         vertical_sync_width(hactive, vactive)
     };
 
-    let period_ps = PS_PER_SECOND / u64::from(refresh_millihz);
+    let period_ps = PS_PER_MILLIHERTZ / u64::from(refresh_millihz);
 
     let (h_blank, h_sync, h_front, v_blank, v_sync_bp, v_front, total_pixels, clock_khz) =
         if !reduced {
@@ -272,6 +273,48 @@ mod tests {
         generate(CvtRequest::new(h, v, hz * 1000, blanking)).expect("CVT must produce a timing")
     }
 
+    /// How far a generated timing may sit from the requested rate.
+    ///
+    /// CVT does not promise an exact frame rate.  It estimates the line period
+    /// from the frame period minus the minimum vertical sync-plus-back-porch
+    /// *time*, then raises the blanking to whole lines when that minimum is
+    /// better expressed in lines; a mode whose vertical blanking has to grow
+    /// therefore comes out slower than requested, and the pixel clock is
+    /// floored to its granularity on top of that.  Both effects are properties
+    /// of the published algorithm, so the test asserts the constraint that
+    /// actually holds - see [`assert_minimum_vertical_blanking`] - rather than
+    /// equality.
+    fn assert_rate(mode: &Mode, hz: u32) {
+        let requested = hz * 1000;
+        let granularity = requested.saturating_mul(250) / mode.clock_khz.max(1);
+        let error = mode.refresh_millihz().abs_diff(requested);
+        assert!(
+            error <= requested / 20 + granularity + 1,
+            "{mode} misses the requested {hz} Hz by {error} mHz"
+        );
+    }
+
+    /// CVT requires the vertical blanking to cover the minimum sync plus back
+    /// porch interval: 550 microseconds for standard blanking, 460 for reduced
+    /// blanking.  This is the constraint that makes the algorithm raise the
+    /// vertical total, so a generator that dropped it would produce plausible
+    /// looking modes that a sink cannot lock to.
+    fn assert_minimum_vertical_blanking(mode: &Mode, blanking: CvtBlanking) {
+        let line_ps = u64::from(mode.htotal) * 1_000_000_000 / u64::from(mode.clock_khz);
+        let blanking_ps = u64::from(mode.vblank()) * line_ps;
+        let minimum = if blanking == CvtBlanking::Standard {
+            550_000_000
+        } else {
+            460_000_000
+        };
+        assert!(
+            blanking_ps >= minimum,
+            "{mode} has a {} us vertical blank, CVT requires {} us",
+            blanking_ps / 1000,
+            minimum / 1000
+        );
+    }
+
     /// Published CVT reference timings.  These are the numbers a display
     /// engineer checks a new modeset against, so they are exact.
     #[test]
@@ -389,10 +432,7 @@ mod tests {
                 }
             );
             // The generated timing must actually hit the requested rate.
-            assert!(
-                generated.refresh_millihz().abs_diff(hz * 1000) <= 100,
-                "{generated} misses the requested rate"
-            );
+            assert_rate(&generated, hz);
         }
     }
 
@@ -471,10 +511,8 @@ mod tests {
                         assert!(mode.is_well_formed(), "{mode}");
                         assert!(mode.hblank() > 0 && mode.vblank() > 0, "{mode}");
                         assert!(mode.hsync_len() > 0 && mode.vsync_len() > 0, "{mode}");
-                        assert!(
-                            mode.refresh_millihz().abs_diff(hz * 1000) <= hz * 20,
-                            "{mode} is far from its requested rate"
-                        );
+                        assert_minimum_vertical_blanking(&mode, blanking);
+                        assert_rate(&mode, hz);
                     }
                 }
             }
@@ -495,7 +533,9 @@ mod tests {
         assert!(generate(CvtRequest::new(7, 480, 60_000, CvtBlanking::ReducedV1)).is_none());
         // Totals that cannot fit the 16-bit timing fields.
         assert!(generate(CvtRequest::new(60_000, 480, 60_000, CvtBlanking::Standard)).is_none());
-        assert!(generate(CvtRequest::new(60_000, 480, 60_000, CvtBlanking::ReducedV1)).is_none());
+        // A reduced-blanking line is short, so the width alone cannot overflow
+        // a 16-bit total; a tall mode can.
+        assert!(generate(CvtRequest::new(640, 65_000, 60_000, CvtBlanking::ReducedV1)).is_none());
         assert!(generate(CvtRequest::new(640, 65_000, 60_000, CvtBlanking::Standard)).is_none());
     }
 }

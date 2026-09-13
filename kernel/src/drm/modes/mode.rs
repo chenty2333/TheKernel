@@ -52,14 +52,19 @@ impl fmt::Debug for ModeFlags {
         if self.is_empty() {
             return f.write_str("-");
         }
-        if self.contains(ModeFlags::INTERLACE) {
-            f.write_str("interlace")?;
-        }
-        if self.contains(ModeFlags::DOUBLE_CLOCK) {
-            if !self.contains(ModeFlags::INTERLACE) {
+        let mut first = true;
+        for (flag, name) in [
+            (ModeFlags::INTERLACE, "interlace"),
+            (ModeFlags::DOUBLE_CLOCK, "double-clock"),
+        ] {
+            if !self.contains(flag) {
+                continue;
+            }
+            if !first {
                 f.write_str("|")?;
             }
-            f.write_str("double-clock")?;
+            f.write_str(name)?;
+            first = false;
         }
         Ok(())
     }
@@ -388,7 +393,7 @@ mod tests {
             clock_khz: 147_000,
             ..mode
         };
-        assert_eq!(wrong.refresh_millihz(), 59_393);
+        assert_eq!(wrong.refresh_millihz(), 59_394);
         assert_ne!(wrong.refresh_millihz(), mode.refresh_millihz());
         assert_eq!(mode.refresh_hz_rounded(), 60);
     }
