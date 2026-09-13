@@ -189,6 +189,11 @@ fn the_two_encodings_disagree_on_the_same_divider_set() {
 }
 
 /// The encoder-side registers, to the hex digit, from §8.4's field tables.
+///
+/// `TRANS_CLK_SEL`'s `0x1000_0000` is PHY A's field on this display version
+/// (`[I915]` `display/intel_ddi.c:999-1000`), which for this port is also DDI
+/// A's number -- see
+/// `the_clock_select_is_keyed_by_phy_and_the_port_select_by_ddi`.
 #[test]
 fn the_transcoder_and_ddi_values_are_the_reference_encodings() {
     let plan = target_plan();
@@ -772,6 +777,46 @@ fn the_idle_poll_waits_for_a_ddi_that_takes_several_polls() {
 // DDI B / PHY B path is exercised as a sequence of its own rather than as the
 // A path with a different argument.
 
+/// The two transcoder-side selects are keyed by different things:
+/// `TRANS_CLK_SEL` by PHY on this display version, `TRANS_DDI_FUNC_CTL`'s
+/// `SELECT_PORT` by DDI on every one.
+///
+/// `[I915]` `intel_ddi_enable_transcoder_clock` hands the **PHY** to
+/// `TGL_TRANS_CLK_SEL_PORT` for `DISPLAY_VER >= 13` and the port only for
+/// version 12 (`display/intel_ddi.c:996-1004`), while
+/// `intel_ddi_transcoder_func_reg_val_get` composes `SELECT_PORT` from
+/// `encoder->port` on every version (`:481,488-490`).  §11's steps 5.4 and 5.5
+/// both say "port", so the reference states one rule where the hardware has
+/// two.
+///
+/// **What this test cannot see, said plainly.**  The only DDIs this module
+/// accepts are the combo ports A and B, and i915 maps those to PHY A and PHY B
+/// one-for-one (`intel_port_to_phy` is `PHY_A + port - PORT_A` below
+/// `PORT_TC1`, `display/intel_display.c:1950-1965`).  A PHY-keyed value and a
+/// port-keyed one are therefore the *same number* for every plan that can be
+/// built today, and a revert to `Ddi::index()` would pass every assertion
+/// below.  What is pinned is the literal each field carries, and the
+/// derivation's type: [`phy_index`] takes a [`ComboPhy`], which a [`Ddi`]
+/// cannot be passed for.  A port whose PHY is not its own letter is where the
+/// two diverge, and this sequence refuses that port before computing anything.
+#[test]
+fn the_clock_select_is_keyed_by_phy_and_the_port_select_by_ddi() {
+    assert_eq!(phy_index(ComboPhy::A), 0, "PHY_A = 0");
+    assert_eq!(phy_index(ComboPhy::B), 1, "PHY_B = 1");
+    // The equality the comment above is about: true for the two combo ports,
+    // and a property of i915's port-to-PHY mapping rather than of the encoding.
+    assert_eq!(phy_index(ComboPhy::A), Ddi::A.index());
+    assert_eq!(phy_index(ComboPhy::B), Ddi::B.index());
+
+    let a = target_plan();
+    let b = OutputProgram::plan(&hdmi_request(Ddi::B), STRAP_38_4).unwrap();
+    // `(phy + 1) << 28`, and `(ddi + 1) << 27`.
+    assert_eq!(a.trans_clk_sel, 0x1000_0000);
+    assert_eq!(b.trans_clk_sel, 0x2000_0000);
+    assert_eq!(a.trans_ddi_func_ctl & (0b1111 << 27), 1 << 27);
+    assert_eq!(b.trans_ddi_func_ctl & (0b1111 << 27), 2 << 27);
+}
+
 /// The target mode plans for DDI B, and the plan is DDI B's: PHY B, DPLL1's
 /// port, and the same divider program -- the arithmetic is `pll.rs`'s and does
 /// not depend on which combo PHY the port is on.
@@ -785,14 +830,12 @@ fn combo_phy_b_plans_the_target_mode() {
     assert_eq!(plan.dividers.total_divider(), 12);
     assert_eq!(plan.dividers.symbol_rate_khz(), 148_500);
     assert_eq!(plan.ddi_io_well.name, "DDI_IO_B");
-    // The two port-select values carry the DDI, not the PHY (§6.3 routing step
-    // 2 and §8.4: `(port + 1)` in the top bits).
-    assert_eq!(plan.trans_clk_sel, 2 << TRANS_CLK_SEL_PORT_SHIFT);
-    assert_eq!(
-        plan.trans_ddi_func_ctl >> TRANS_DDI_PORT_SHIFT & 0b1111,
-        2,
-        "SELECT_PORT(B)"
-    );
+    // `TRANS_CLK_SEL` takes PHY B here, and `SELECT_PORT` takes DDI B: the
+    // literals are the two fields' encodings, which for this platform's combo
+    // ports are the same number.  Why they are computed from different things
+    // is `the_clock_select_is_keyed_by_phy_and_the_port_select_by_ddi`.
+    assert_eq!(plan.trans_clk_sel, 0x2000_0000);
+    assert_eq!(plan.trans_ddi_func_ctl >> 27 & 0b1111, 2, "SELECT_PORT(B)");
 }
 
 /// The whole phase-5 sequence for DDI B, on the write log: every register is
@@ -850,7 +893,7 @@ fn the_phy_b_write_order_is_the_sequence_with_b_registers() {
     );
     assert_eq!(state.ddi, Ddi::B);
     assert_eq!(state.ddi_io_well.name, "DDI_IO_B");
-    assert_eq!(state.trans_clk_sel, 2 << TRANS_CLK_SEL_PORT_SHIFT);
+    assert_eq!(state.trans_clk_sel, 0x2000_0000, "PHY B's clock select");
 }
 
 /// The DPLL1 config pair is written at DPLL1's addresses and DPLL0's are left

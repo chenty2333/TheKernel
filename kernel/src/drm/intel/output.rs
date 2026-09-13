@@ -14,8 +14,8 @@
 //! 8.6.5 enable the port's DDI-IO power well, poll its state
 //! 5.3  §8.5's voltage-swing / buffer-translation writes, then
 //!      PORT_CL_DW10's PWR_DOWN_LN_MASK to power the lanes
-//! 5.4  TRANS_CLK_SEL(A)
-//! 5.5  TRANS_DDI_FUNC_CTL(A): port, HDMI/DVI, 8 bpc, polarity
+//! 5.4  TRANS_CLK_SEL(A): the port's **PHY** on this display version
+//! 5.5  TRANS_DDI_FUNC_CTL(A): the **DDI**, HDMI/DVI, 8 bpc, polarity
 //! 5.6  TRANSCONF(A) = ENABLE only -- bit 30 is a status, not an enable
 //! 5.7  DDI_BUF_CTL: enable, buffer-translation level, width,
 //!      then poll IS_IDLE == 0
@@ -26,8 +26,14 @@
 //! and [`port_registers`] is the one place that mapping lives.  The transcoder
 //! side is not per-port: §5.1 gives the PRM's rule that *"Transcoders A-D can
 //! connect to any DDI"*, so the transcoder registers are A's and the **values**
-//! written into them carry the DDI (§5.4's `(port + 1) << 28`, §5.5's
-//! `(port + 1) << 27`).
+//! written into them name the port or the PHY the transcoder is being pointed
+//! at.  Those two values are keyed differently, and §11's phase 5 does not
+//! record it: §5.4's `(x + 1) << 28` takes the **PHY** on this display version
+//! (`[I915]` `display/intel_ddi.c:999-1000`) while §5.5's `(port + 1) << 27`
+//! takes the **DDI** on every one (`[I915]` `display/intel_ddi.c:481,488-490`).
+//! Both are the same number for the two combo ports this sequence programs,
+//! which is exactly why the difference is easy to miss: [`phy_index`] is what
+//! the first field is computed from, and `Ddi::index()` the second.
 //!
 //! # Compute, then write
 //!
@@ -170,16 +176,36 @@ const PLL_POWER_STATE_TIMEOUT_US: u32 = 1_000;
 /// §6.3 quotes `[I915]`'s comment directly: "Timeout is actually 600us".
 const PLL_LOCK_TIMEOUT_US: u32 = 600;
 
-/// `TRANS_CLK_SEL`'s port field shift, `TGL_TRANS_CLK_SEL_PORT(port) = (port +
-/// 1) << 28`.  Reference §6.3 routing step 2 and §11 phase 5.4.
+/// `TRANS_CLK_SEL`'s port field shift, `TGL_TRANS_CLK_SEL_PORT(x) = (x + 1) <<
+/// 28` (`[I915]` `i915_reg.h:4015`).  Reference §6.3 routing step 2 and §11
+/// phase 5.4.
+///
+/// **`x` is the PHY on this display version, not the port.**  i915's
+/// `intel_ddi_enable_transcoder_clock` passes `intel_encoder_to_phy(encoder)`
+/// on `DISPLAY_VER >= 13` and falls back to `encoder->port` only for version 12
+/// (`[I915]` `display/intel_ddi.c:993,996-1004`).  The two are the same number
+/// for this machine's two combo ports -- `intel_port_to_phy` is `PHY_A + port -
+/// PORT_A` below `PORT_TC1` (`display/intel_display.c:1950-1965`) -- so the
+/// reference's port-keyed wording happened to give the right value here, and
+/// would not for a port whose PHY is not its own letter.  Reference §6.3
+/// routing step 2 and §11 phase 5.4 both print the encoding with `port` as the
+/// argument; §6.3's own citation for the region, `[I915]`
+/// `display/intel_ddi.c:987-1007`, is where the distinction is.
 const TRANS_CLK_SEL_PORT_SHIFT: u32 = 28;
+
+/// `TRANS_DDI_FUNC_CTL`'s `SELECT_PORT` field shift,
+/// `TGL_TRANS_DDI_SELECT_PORT(port) = (port + 1) << 27`
+/// (`[I915]` `i915_reg.h:3757`).  Reference §8.4 and §11 phase 5.5.
+///
+/// The argument here is the **port** -- the DDI -- on this display version and
+/// on every other: i915 composes the value from `encoder->port` with no PHY
+/// conversion (`[I915]` `display/intel_ddi.c:481,488-490`).  So the same DDI
+/// number is right for this field and wrong for [`TRANS_CLK_SEL_PORT_SHIFT`]'s,
+/// and the two §11 steps print "port" as if they were one rule.
+const TRANS_DDI_PORT_SHIFT: u32 = 27;
 
 /// `TRANS_DDI_FUNC_CTL`'s `TRANS_DDI_FUNC_ENABLE` bit.  Reference §8.4.
 const TRANS_DDI_FUNC_ENABLE: u32 = 1 << 31;
-
-/// `TRANS_DDI_FUNC_CTL`'s port field shift, `TGL_TRANS_DDI_SELECT_PORT(port) =
-/// (port + 1) << 27`.  Reference §8.4 and §11 phase 5.5.
-const TRANS_DDI_PORT_SHIFT: u32 = 27;
 
 /// `TRANS_DDI_FUNC_CTL`'s mode-select field, `[26:24]`.  Reference §8.4.
 const TRANS_DDI_MODE_SELECT_SHIFT: u32 = 24;
@@ -742,6 +768,26 @@ fn combo_phy_of(ddi: Ddi) -> Result<ComboPhy, OutputError> {
     }
 }
 
+/// The `enum phy` index of a combo PHY: what `TRANS_CLK_SEL`'s field carries on
+/// this display version.
+///
+/// `[I915]` `enum phy` is `PHY_A = 0, PHY_B = 1, ...`
+/// (`display/intel_display.h:192-204`), and `intel_ddi_enable_transcoder_clock`
+/// hands the PHY to `TGL_TRANS_CLK_SEL_PORT` for `DISPLAY_VER >= 13`
+/// (`display/intel_ddi.c:993,999-1000`).  The argument type is the point: this
+/// value comes from a [`ComboPhy`] and never from a [`Ddi`], because on this
+/// platform the two happen to be equal for ports A and B -- `intel_port_to_phy`
+/// is `PHY_A + port - PORT_A` below `PORT_TC1` (`display/intel_display.c:1950-1965`)
+/// -- and a port whose PHY is not its own letter gets a different number here,
+/// not a different register.  `TRANS_DDI_FUNC_CTL`'s field is the other way
+/// round; see [`TRANS_DDI_PORT_SHIFT`].
+const fn phy_index(phy: ComboPhy) -> u32 {
+    match phy {
+        ComboPhy::A => 0,
+        ComboPhy::B => 1,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The plan: every register value, computed before anything is written.
 // ---------------------------------------------------------------------------
@@ -862,13 +908,19 @@ impl OutputProgram {
         let fraction_workaround = DcoFractionWorkaround::for_adl_p_n(platform_ref_khz);
         let pll_registers = dividers.registers(request.encoding, fraction_workaround)?;
 
-        // Port number for the two encoder-side selects.  `Ddi::index()` is the
-        // port's numeric index (PORT_A = 0, PORT_B = 1, §8.1), and the `+ 1` is
+        // The two encoder-side selects are keyed by different things, which
+        // §11's phase 5 prints as if they were one rule.  `TRANS_CLK_SEL` takes
+        // the **PHY** on this display version (`[I915]`
+        // `display/intel_ddi.c:999-1000`); `TRANS_DDI_FUNC_CTL.SELECT_PORT`
+        // takes the **DDI** on every version (`[I915]`
+        // `display/intel_ddi.c:481,488-490`, and `intel_port_to_phy` at
+        // `display/intel_display.c:1950-1965` is the conversion the first one
+        // gets and the second one does not).  `Ddi::index()` is the port's
+        // numeric index (PORT_A = 0, PORT_B = 1, §8.1) and the `+ 1` in both is
         // there because zero means "none" (§6.3).
-        let port_index = request.ddi.index();
-        let trans_clk_sel = (port_index + 1) << TRANS_CLK_SEL_PORT_SHIFT;
+        let trans_clk_sel = (phy_index(phy) + 1) << TRANS_CLK_SEL_PORT_SHIFT;
         let trans_ddi_func_ctl = TRANS_DDI_FUNC_ENABLE
-            | ((port_index + 1) << TRANS_DDI_PORT_SHIFT)
+            | ((request.ddi.index() + 1) << TRANS_DDI_PORT_SHIFT)
             | (request.port_type.mode_select() << TRANS_DDI_MODE_SELECT_SHIFT)
             // 8 bpc is 0 in `TRANS_DDI_BPC_MASK[22:20]` (§8.4), so nothing is
             // added for it.  That field is the transcoder's; the pipe's output

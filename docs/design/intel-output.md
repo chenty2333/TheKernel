@@ -42,8 +42,9 @@ Which PLL and which port registers those steps use is the DDI's, and `port_regis
 single place that mapping lives: combo PHY A is DPLL0's port and combo PHY B is DPLL1's (`[REF]` §6.3),
 so the `CFGCR` pair, the enable register, the `PORT_*` registers and `DDI_BUF_CTL` are the B
 instances for DDI B. The transcoder registers are *not* per-port: `[REF]` §5.1 gives the PRM's rule
-that *"Transcoders A-D can connect to any DDI"*, so they stay A's and the DDI rides inside the value
-(`(port + 1) << 28` in `TRANS_CLK_SEL`, `(port + 1) << 27` in `TRANS_DDI_FUNC_CTL`).
+that *"Transcoders A-D can connect to any DDI"*, so they stay A's and the port or PHY the transcoder
+is pointed at rides inside the value. Those two values are keyed by different things —
+`TRANS_CLK_SEL` by **PHY**, `TRANS_DDI_FUNC_CTL.SELECT_PORT` by **DDI** — which §3.8 works through.
 
 ## 2. Provenance
 
@@ -173,7 +174,7 @@ widths with an unrelated bit set in the register to prove the read-modify-write 
 
 | Register | Value for HDMI, four lanes, both syncs positive | Source |
 |---|---|---|
-| `TRANS_CLK_SEL(A)` | `0x10000000` = `(PORT_A + 1) << 28` | §6.3 routing step 2, §11 5.4 |
+| `TRANS_CLK_SEL(A)` | `0x10000000` = `(PHY_A + 1) << 28` | §6.3 routing step 2, §11 5.4, and §3.8 for the PHY |
 | `TRANS_DDI_FUNC_CTL(A)` | `0x88030006` = `ENABLE \| SELECT_PORT(A) \| MODE_SELECT_HDMI \| BPC_8 \| PHSYNC \| PVSYNC \| PORT_WIDTH(4)` | §8.4's corrected table, §11 5.5 |
 | `TRANSCONF(A)` (`PIPECONF_A`) | `0x80000000` = `ENABLE` alone | §11 5.6 minus its status bit — §3.7 |
 | `DDI_BUF_CTL(A)` | `0x80000000 \| level << 24 \| width \| A_4_LANES` | §8.4, §11 5.7 |
@@ -188,8 +189,9 @@ the two bits move and nothing else does.
 **Two disagreements in the reference, both followed the corrected way.**
 
 * §8.6 step 12 still writes `TRANSCONF = ... | 8bpc`; §8.4's correction and §11 phase 5.6 both put
-  the output bit depth and dithering in `PIPE_MISC` on Gen12. `TRANSCONF` is written as enable plus
-  state-enable only. `PIPE_MISC` is the pipe workstream's register and is not written here.
+  the output bit depth and dithering in `PIPE_MISC` on Gen12. `TRANSCONF` is written as the enable bit
+  alone — §3.7 is the other half of that write. `PIPE_MISC` is the pipe workstream's register and is
+  not written here.
 * §8.4's `[INF]` note and §8.6 step 13 both put `PHY_LINK_RATE` in the enable write, but §8.6's
   table of encodings has eight *DisplayPort* link rates and no HDMI TMDS entry. See §5.
 
@@ -229,6 +231,44 @@ own composition, which is what let the defect through (`[MEASURED]`,
 **The reference still carries the defect.** `docs/design/intel-display-registers.md` §11 phase 5.6
 and its §8.6 step 12 both print the old value, and this workstream does not own that document; it is
 listed for the coordinator in the workstream report rather than edited here.
+
+### 3.8 `TRANS_CLK_SEL` is keyed by PHY, `SELECT_PORT` by DDI
+
+Steps 5.4 and 5.5 both look like "put the port number in the top bits", and the reference states them
+that way: §11 phase 5.4 gives `TRANS_CLK_SEL(A) = (PORT_A + 1) << 28` and §11 phase 5.5 gives
+`SELECT_PORT(A) = (0+1) << 27`, and §6.3's routing step 2 prints
+`TGL_TRANS_CLK_SEL_PORT(port) = (port + 1) << 28`. On this display version the first field is not
+keyed by the port at all. `[I915]` `intel_ddi_enable_transcoder_clock` computes it as
+`TGL_TRANS_CLK_SEL_PORT(intel_encoder_to_phy(encoder))` for `DISPLAY_VER >= 13`, and uses
+`encoder->port` only on version 12 (`display/intel_ddi.c:993,996-1004`); the value is the **`enum phy`
+index**, `PHY_A = 0, PHY_B = 1` (`display/intel_display.h:192-204`) with `(phy + 1) << 28` from
+`i915_reg.h:4015`. `TRANS_DDI_FUNC_CTL`'s field is the other way round and stays that way on every
+version: `intel_ddi_transcoder_func_reg_val_get` composes it from `encoder->port` with no conversion
+(`display/intel_ddi.c:481,488-490`).
+
+**Why it was latent, and why it is still worth fixing.** The module's only two DDIs are the combo
+ports A and B, and i915's `intel_port_to_phy` is `PHY_A + port - PORT_A` for everything below
+`PORT_TC1` (`display/intel_display.c:1950-1965`), so port index and PHY index are the *same number*
+for both and the old port-keyed expression produced the byte-identical word this one does. The
+difference appears where the two diverge — a Type-C DDI, which this sequence refuses at
+`UnsupportedDdi` before it computes anything, and any future extension to `DDI_TC_1..4`, where
+`intel_port_to_phy` returns `PHY_F + port - PORT_TC1` and a port-keyed field would point the
+transcoder at a clock the port is not on.
+
+**What the fix is.** `phy_index(ComboPhy)` in `output.rs` is the one place the PHY's index is
+computed, and it takes a `ComboPhy` rather than a `Ddi`, so the two cannot be confused at the call
+site; `TRANS_CLK_SEL` is built from it and `SELECT_PORT` from `Ddi::index()`, with both fields'
+citations on their shift constants. The tests pin the literals `0x10000000` and `0x20000000` and the
+two `SELECT_PORT` values, and say in as many words that a revert to the DDI index would pass them,
+because for these two ports the numbers coincide — a test cannot see a distinction the hardware
+does not expose until a port whose PHY is not its own letter exists
+(`the_clock_select_is_keyed_by_phy_and_the_port_select_by_ddi`). That is a limit of the measurement,
+not a claim about the fix: what changed is which quantity the value is derived from, and the type is
+what makes that stick.
+
+**The reference still states one rule where there are two.** `[REF]` §6.3 routing step 2 and §11
+phase 5.4 both name the argument `port`; `intel-display-registers.md` is not this workstream's file
+and the correction is listed for the coordinator in the workstream report.
 
 ## 4. The failures, and what they say
 
@@ -339,6 +379,9 @@ The module's tests assert, among other things:
 * `SUS_CLOCK_CONFIG` does not clobber `CL_POWER_DOWN_ENABLE`;
 * the transcoder is enabled with bit 31 alone: the write log and the register both hold the literal
   `0x80000000`, and bit 30 — `STATE_ENABLE`, the hardware's pipe-running status — is not in it (§3.7);
+* the two transcoder-side selects carry the literals `0x10000000`/`0x20000000` for `TRANS_CLK_SEL` and
+  `1 << 27`/`2 << 27` for `SELECT_PORT`, with the test stating that the PHY keying and the DDI keying
+  coincide for both ports this sequence accepts, so a revert would pass it (§3.8);
 * the polarity bits follow the mode in both directions and change nothing else;
 * a DDI that is not a combo-PHY port is refused before any write — including a tampered plan, which
   is how the re-check inside `program` is shown to be real;
@@ -414,9 +457,18 @@ reproducible and a revert to the Skylake path would fail rather than be believed
   `LOCK` follows `PLL_ENABLE`, the DDI leaves idle when it is enabled, the IO well reports state when
   requested. Whether the real bits behave that way, and how long they take, is unmeasured. The poll
   budgets are the reference's figures, not observations.
+* **`TRANS_CLK_SEL`'s PHY keying is unobservable on this machine's two ports.** `[I915]` keys the field
+  by PHY on this display version, and the fix derives it from a `ComboPhy` rather than from the DDI;
+  but port A→PHY A and port B→PHY B, so the word written is the same either way and no host test can
+  tell the two derivations apart (§3.8). The claim rests on i915's source, not on a measurement.
 * **The two caller-supplied value sets** — the swing program and any `PHY_LINK_RATE` code — are
   untested by construction; the tests use invented numbers to exercise the write order and say so in
   the logged `source`.
+* **`TRANSCONF`'s bit 30 is a status on i915's word, not on a measurement here.** The fix follows
+  `[I915]` (`i915_reg.h:1591`, `display/intel_display.c:302-318`) and `[REF]` §11's own disable
+  sequence against `[REF]` §11 phase 5.6's enable step (§3.7). Reading `TRANSCONF` from a working
+  configuration — the firmware's mode, before this kernel programs anything — is what would settle it
+  on this machine: bit 30 set with the pipe running and clear after a disable is the status reading.
 * **The byte-level effect of `TRANS_DDI_FUNC_CTL`, `TRANSCONF` and `DDI_BUF_CTL`** is unverified:
   the values match the field tables, which is a statement about the document, not about the wire.
 * **The `[INF]` choices** (writing `PHY_LINK_RATE` as 0; the scrambling threshold at 340 MHz rather
