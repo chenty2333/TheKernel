@@ -50,9 +50,11 @@
 //! the device identity and register access that implementation will need, and
 //! nothing else.
 
+mod clk;
 pub(crate) mod debugfs;
 mod id;
 mod pci;
+mod phy;
 mod probe;
 mod regs;
 

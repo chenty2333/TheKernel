@@ -111,6 +111,14 @@ pub(crate) enum Meaning {
     StolenMemoryBase,
     /// The physical base of the global page table.
     GttBase,
+    /// A register the display bring-up owns: a power well, a clock, a fuse that
+    /// selects a clock's reference, a display buffer slice or a combo PHY.
+    ///
+    /// It carries no decoding here on purpose.  These registers are read and
+    /// written by `power`, `clk` and `phy`, which interpret them and log what
+    /// they observed at the point where they observed it; a second, thinner
+    /// decoding in the probe's report would be a place for the two to disagree.
+    BringUp,
 }
 
 /// How wide a register's value is.
@@ -419,6 +427,101 @@ impl RegisterWindow {
     }
 }
 
+/// The register operations a bring-up sequence needs, as a trait.
+///
+/// [`RegisterWindow`] is the real implementation and is the only one that
+/// touches hardware.  The sequences in `power`, `clk` and `phy` are written
+/// against this trait so that a host test can drive them through a mock whose
+/// status bits set, or fail to set, on command -- which is the only way to test
+/// a handshake's success path, its timeout path and its rollback on a machine
+/// that has no graphics device.
+///
+/// It is deliberately three methods: a sequence that needs more than reading
+/// and writing a named register is a sequence that has stopped being checkable
+/// against the reference by eye.
+pub(crate) trait Registers {
+    /// Read a 32-bit register, or `None` when it is outside the window.
+    fn read(&self, register: Register) -> Option<u32>;
+
+    /// Read a 64-bit register, or `None` when it is not 64 bits wide or does
+    /// not fit in the window.
+    fn read64(&self, register: Register) -> Option<u64>;
+
+    /// Write a register, returning whether the write happened.  A read-only
+    /// register is refused rather than silently skipped.
+    fn write(&self, register: Register, value: u32) -> bool;
+}
+
+impl Registers for RegisterWindow {
+    fn read(&self, register: Register) -> Option<u32> {
+        RegisterWindow::read(*self, register)
+    }
+
+    fn read64(&self, register: Register) -> Option<u64> {
+        RegisterWindow::read64(*self, register)
+    }
+
+    fn write(&self, register: Register, value: u32) -> bool {
+        RegisterWindow::write(*self, register, value)
+    }
+}
+
+/// What one poll of a status register is assumed to cost, in microseconds.
+///
+/// A poll is an uncached read of a device register, which on this platform is a
+/// non-posted transaction of the order of a microsecond.  The number is an
+/// estimate and it is used only to turn a documented timeout into a count --
+/// see [`poll_attempts`].
+pub(crate) const POLL_COST_US: u32 = 1;
+
+/// How many polls a documented microsecond timeout is worth.
+///
+/// This is the one place where a timeout is expressed, and it is expressed as a
+/// **count of reads rather than a clock reading**.  Two consequences are
+/// deliberate:
+///
+/// * A sequence cannot hang because a clock is not running, and it behaves
+///   identically on the target and in a host test.  This kernel's platform time
+///   interface is registered only for `target_os = "none"`, so a poll loop that
+///   read `monotonic_time` would not be testable at all -- and the handshake's
+///   success path, its timeout path and its rollback are exactly what a host
+///   test has to be able to drive.
+/// * The bound stays traceable: a caller passes the microsecond figure the
+///   reference gives for that status bit, and the count is that figure divided
+///   by [`POLL_COST_US`].  A poll that fails means "the status did not appear
+///   within N reads", which is what the error says.
+///
+/// What it is *not* is a precise timer.  A tighter bound than the reference's
+/// would refuse hardware that is merely slow, so every caller passes the
+/// longest figure any source gives for its status bit -- usually the vendor
+/// driver's, which is deliberately more generous than the PRM's.
+pub(crate) const fn poll_attempts(timeout_us: u32) -> u32 {
+    let attempts = timeout_us / POLL_COST_US;
+    if attempts == 0 { 1 } else { attempts }
+}
+
+/// Poll a register until `mask` reads `value`, or the poll budget runs out.
+///
+/// Returns `Some(true)` when the register came back with the value, `Some(false)`
+/// when the budget ran out, and `None` when the register could not be read at
+/// all -- which a caller must not confuse with a register that read zero.
+pub(crate) fn poll(
+    regs: &impl Registers,
+    register: Register,
+    mask: u32,
+    value: u32,
+    timeout_us: u32,
+) -> Option<bool> {
+    for _ in 0..poll_attempts(timeout_us) {
+        let readback = regs.read(register)?;
+        if readback & mask == value {
+            return Some(true);
+        }
+        core::hint::spin_loop();
+    }
+    Some(false)
+}
+
 /// The registers a probe reads, in report order.
 ///
 /// Every entry is read-only and answerable without forcewake.  They are chosen
@@ -460,6 +563,444 @@ pub(crate) const NAMED: &[Register] = &[
     Register::read_only_64("DSMBASE", 0x10_80c0, Meaning::StolenMemoryBase, None),
     Register::read_only_64("GSMBASE", 0x10_8100, Meaning::GttBase, None),
 ];
+
+// ---------------------------------------------------------------------------
+// The registers the display power, clock and PHY bring-up owns.
+//
+// These are separate from `NAMED` for two reasons.  `NAMED` is what the boot
+// probe reads, and the probe's claim is that it writes nothing; every register
+// here is either writable or is a fuse whose value only means something to the
+// bring-up path.  And a register belongs in this table only when a sequence in
+// `power`, `clk` or `phy` names it, so the table is a complete inventory of what
+// this kernel will program -- which is what a reviewer needs in order to check
+// the sequences against the reference without reading four modules.
+//
+// Every offset below is cited to `docs/design/intel-display-registers.md` by
+// section, and the section in turn cites the PRM or the Linux `drm/i915` tree.
+// Where the two disagree, the comment says so.
+// ---------------------------------------------------------------------------
+
+/// `SKL_DFSM`, the display fuse register.
+///
+/// Which pipes are fused off, and whether DMC/DSC/HDCP/FBC exist at all.
+/// Reference §3.4 and §12.1; `[I915]` `i915_reg.h:2858-2870`.
+pub(crate) const SKL_DFSM: Register =
+    Register::read_only("SKL_DFSM", 0x5_1000, Meaning::BringUp, None);
+
+/// `SKL_DSSM`, which carries the CDCLK PLL reference frequency in bits `[31:29]`.
+///
+/// Reference §4.6 ("The reference clock") and §12.1; `[I915]` `i915_reg.h:2880-2884`.
+/// This register selects both the CDCLK ratio table and, on the PRM's numbers,
+/// the PG1 enable timeout, so it is read before either is used.
+pub(crate) const SKL_DSSM: Register =
+    Register::read_only("SKL_DSSM", 0x5_1004, Meaning::BringUp, None);
+
+/// `SFUSE_STRAP`, the south display fuse strap.
+///
+/// Bit 8 is the raw-clock strap and bit 7 declares the SKU headless.
+/// Reference §3.5 and §4.8; `[I915]` `i915_reg.h:4391-4399`.
+pub(crate) const SFUSE_STRAP: Register =
+    Register::read_only("SFUSE_STRAP", 0xC_2014, Meaning::BringUp, None);
+
+/// `SKL_FUSE_STATUS`, the per-power-gate distribution status.
+///
+/// Reference §4.4; `[I915]` `i915_reg.h:3724-3738`.
+pub(crate) const SKL_FUSE_STATUS: Register =
+    Register::read_only("SKL_FUSE_STATUS", 0x4_2000, Meaning::BringUp, None);
+
+/// `HSW_PWR_WELL_CTL1`, the firmware's power well request register.
+///
+/// Read-only here, and read only to diagnose a well that will not come up: the
+/// four request registers are OR-ed by hardware, so a well that stays off while
+/// this one has its request bit set was requested by the firmware all along.
+/// Reference §4.2; `[I915]` `i915_reg.h:3626`.
+pub(crate) const HSW_PWR_WELL_CTL1: Register =
+    Register::read_only("HSW_PWR_WELL_CTL1", 0x4_5400, Meaning::BringUp, None);
+
+/// `HSW_PWR_WELL_CTL2`, the driver's power well request register.
+///
+/// The only power well register this kernel writes.  Reference §4.2 and §4.4;
+/// `[I915]` `i915_reg.h:3627`.
+pub(crate) const HSW_PWR_WELL_CTL2: Register =
+    Register::read_write("HSW_PWR_WELL_CTL2", 0x4_5404, Meaning::BringUp, None);
+
+/// `HSW_PWR_WELL_CTL3`, the KVMR requester's register.  Read for diagnosis.
+/// Reference §4.2; `[I915]` `i915_reg.h:3628`.
+pub(crate) const HSW_PWR_WELL_CTL3: Register =
+    Register::read_only("HSW_PWR_WELL_CTL3", 0x4_5408, Meaning::BringUp, None);
+
+/// `HSW_PWR_WELL_CTL4`, the debug requester's register.  Read for diagnosis.
+/// Reference §4.2; `[I915]` `i915_reg.h:3629`.
+pub(crate) const HSW_PWR_WELL_CTL4: Register =
+    Register::read_only("HSW_PWR_WELL_CTL4", 0x4_540C, Meaning::BringUp, None);
+
+/// `ICL_PWR_WELL_CTL_AUX2`, the driver's AUX power well request register.
+///
+/// Declared because the AUX wells for a port have to be enabled before GMBUS or
+/// AUX can use that pin pair (reference §11 phase 2.1), which is another
+/// workstream's step; the well machinery in `power` is generic over the request
+/// register so that step needs a name, not a new mechanism.
+/// Reference §4.2; `[I915]` `i915_reg.h:3663`.
+pub(crate) const ICL_PWR_WELL_CTL_AUX2: Register =
+    Register::read_write("ICL_PWR_WELL_CTL_AUX2", 0x4_5444, Meaning::BringUp, None);
+
+/// `ICL_PWR_WELL_CTL_DDI2`, the driver's DDI IO power well request register.
+/// Reference §4.2 and §11 phase 5; `[I915]` `i915_reg.h:3691`.
+pub(crate) const ICL_PWR_WELL_CTL_DDI2: Register =
+    Register::read_write("ICL_PWR_WELL_CTL_DDI2", 0x4_5454, Meaning::BringUp, None);
+
+/// `DC_STATE_EN`, the display C-state request.
+///
+/// Written to zero for the whole of a first bring-up: with DC states disabled
+/// the display engine never hands power management to the DMC, which is what
+/// makes a DMC-less kernel viable.  Reference §4.9 step 0 and §4.10;
+/// `[I915]` `i915_reg.h:4364-4373`.
+pub(crate) const DC_STATE_EN: Register =
+    Register::read_write("DC_STATE_EN", 0x4_5504, Meaning::BringUp, None);
+
+/// `DBUF_CTL_S0`; the four display buffer slice control registers.
+///
+/// The addresses are not monotonic in the slice number and the numbering is a
+/// documented trap: `[I915]`'s slice index 0 (`DBUF_S1`) is `0x45008`, which the
+/// hardware register name calls `S0`, while `0x44FE8` is both `DBUF_CTL_S1` to
+/// the register name and `DBUF_S2` to the slice index.  This kernel names them
+/// by register address as the reference does, and enables all four.
+/// Reference §4.7; `[I915]` `skl_watermark_regs.h:54-68`.
+pub(crate) const DBUF_CTL_S0: Register =
+    Register::read_write("DBUF_CTL_S0", 0x4_5008, Meaning::BringUp, None);
+pub(crate) const DBUF_CTL_S1: Register =
+    Register::read_write("DBUF_CTL_S1", 0x4_4FE8, Meaning::BringUp, None);
+pub(crate) const DBUF_CTL_S2: Register =
+    Register::read_write("DBUF_CTL_S2", 0x4_4300, Meaning::BringUp, None);
+pub(crate) const DBUF_CTL_S3: Register =
+    Register::read_write("DBUF_CTL_S3", 0x4_4304, Meaning::BringUp, None);
+
+/// `CDCLK_CTL`, the core display clock control register.
+///
+/// Reference §4.6; `[I915]` `i915_reg.h:4060-4082`.
+pub(crate) const CDCLK_CTL: Register =
+    Register::read_write("CDCLK_CTL", 0x4_6000, Meaning::BringUp, None);
+
+/// `CDCLK_PLL_ENABLE`, the CDCLK PLL's enable register.
+///
+/// `[I915]` names this register `BXT_DE_PLL_ENABLE` and the reference calls it
+/// by both names; on Gen11 and later the PLL ratio lives in this register rather
+/// than in a separate control register.  Reference §4.6; `[I915]`
+/// `i915_reg.h:4355-4364`.
+pub(crate) const CDCLK_PLL_ENABLE: Register =
+    Register::read_write("CDCLK_PLL_ENABLE", 0x4_6070, Meaning::BringUp, None);
+
+/// `PCH_RAWCLK_FREQ`, the south display's raw clock frequency.
+///
+/// It must state the real crystal frequency before any south display function
+/// is enabled; a wrong value mis-times GMBUS and hotplug de-glitching, which
+/// presents as intermittent EDID failures rather than clean ones.
+/// Reference §4.8; `[I915]` `i915_reg.h:3133-3143`.
+pub(crate) const PCH_RAWCLK_FREQ: Register =
+    Register::read_write("PCH_RAWCLK_FREQ", 0xC_6204, Meaning::BringUp, None);
+
+/// `GEN8_CHICKEN_DCPR_1`, which carries `DISABLE_FLR_SRC` (bit 15).
+///
+/// Set before the `PW_1` request, per `Wa_16013190616` for ADL-P and its
+/// subplatforms.  Reference §4.5 item 1; `[I915]` `i915_reg.h:2838-2845`.
+pub(crate) const GEN8_CHICKEN_DCPR_1: Register =
+    Register::read_write("GEN8_CHICKEN_DCPR_1", 0x4_6430, Meaning::BringUp, None);
+
+/// `GEN11_CHICKEN_DCPR_2`, programmed after CDCLK and DBUF come up.
+///
+/// Cleared bits here are `Wa_14011508470`.  Reference §4.5 item 2 and §4.9
+/// step 10; `[I915]` `i915_reg.h:2849-2853`.
+pub(crate) const GEN11_CHICKEN_DCPR_2: Register =
+    Register::read_write("GEN11_CHICKEN_DCPR_2", 0x4_6434, Meaning::BringUp, None);
+
+/// `XELPD_DISPLAY_ERR_FATAL_MASK`, declared so that leaving it alone is a
+/// decision rather than an omission.
+///
+/// `[I915]` writes all-ones here, masking every fatal display error
+/// (`Wa_14011503030`).  This kernel does not: an error that is masked is an
+/// error nobody sees, and a first bring-up wants the noise.  Reference §4.9
+/// step 11; `[I915]` `i915_reg.h:2485`, `display/intel_display_power.c`
+/// `icl_display_core_init`.
+pub(crate) const XELPD_DISPLAY_ERR_FATAL_MASK: Register = Register::read_write(
+    "XELPD_DISPLAY_ERR_FATAL_MASK",
+    0x4_421C,
+    Meaning::BringUp,
+    None,
+);
+
+/// One combo PHY's register set.
+///
+/// The PHY blocks are structured as a base plus fixed sub-block offsets, so the
+/// two instances present on `XE_LPD` differ only in the base:
+///
+/// | sub-block | offset within the PHY | register used here |
+/// |---|---|---|
+/// | `PORT_CL_DW*` | `4 * dw` | `DW5` |
+/// | `PORT_COMP_DW*` | `0x100 + 4 * dw` | `DW0`, `DW1`, `DW3`, `DW8`, `DW9`, `DW10` |
+/// | `PORT_TX_DW*` (group) | `0x680 + 4 * dw` | `DW8` |
+/// | `PORT_TX_DW*` (lane 0) | `0x880 + 4 * dw` | `DW8`, read only |
+/// | `PORT_PCS_DW*` (group) | `0x600 + 4 * dw` | `DW1` |
+/// | `PORT_PCS_DW*` (lane 0) | `0x800 + 4 * dw` | `DW1`, read only |
+///
+/// The `PORT_TX_DW*` group base is a correction to the reference document: its
+/// §8.2 table gives `+0x400` for the `PORT_TX` group, but the header it cites
+/// for that table (`[I915]` `display/intel_combo_phy_regs.h:96-105`) defines
+/// `_ICL_PORT_TX_GRP` as `0x680` and `_ICL_PORT_TX_LN(ln)` as
+/// `0x880 + ln * 0x100`.  The `0x400` figure would address the `PORT_PCS`
+/// region's tail and land on the wrong register entirely, so the offsets here
+/// are the header's.  Recorded in `docs/design/intel-power.md`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ComboPhyRegisters {
+    /// The name a log line uses: `A` or `B` on `XE_LPD`.
+    pub(crate) port: &'static str,
+    pub(crate) comp_dw0: Register,
+    pub(crate) comp_dw1: Register,
+    pub(crate) comp_dw3: Register,
+    pub(crate) comp_dw8: Register,
+    pub(crate) comp_dw9: Register,
+    pub(crate) comp_dw10: Register,
+    pub(crate) tx_dw8: Register,
+    pub(crate) pcs_dw1: Register,
+    /// Lane 0's `PORT_TX_DW8`, which is where the initialisation *reads* the
+    /// value it then writes to the group register.
+    pub(crate) tx_dw8_ln0: Register,
+    /// Lane 0's `PORT_PCS_DW1`, read for the same reason.
+    pub(crate) pcs_dw1_ln0: Register,
+    pub(crate) cl_dw5: Register,
+    pub(crate) phy_misc: Register,
+}
+
+impl ComboPhyRegisters {
+    /// Every register of this PHY, for the table's own consistency test.
+    pub(crate) const fn all(self) -> [Register; 12] {
+        [
+            self.comp_dw0,
+            self.comp_dw1,
+            self.comp_dw3,
+            self.comp_dw8,
+            self.comp_dw9,
+            self.comp_dw10,
+            self.tx_dw8,
+            self.pcs_dw1,
+            self.tx_dw8_ln0,
+            self.pcs_dw1_ln0,
+            self.cl_dw5,
+            self.phy_misc,
+        ]
+    }
+}
+
+/// Combo PHY A, base `0x162000`, the compensation source for PHY B.
+/// Reference §8.2 and §8.3; `[I915]` `intel_combo_phy_regs.h:11,17-21`.
+pub(crate) const COMBO_PHY_A: ComboPhyRegisters = ComboPhyRegisters {
+    port: "A",
+    comp_dw0: Register::read_write("PORT_COMP_DW0(A)", 0x16_2100, Meaning::BringUp, None),
+    comp_dw1: Register::read_write("PORT_COMP_DW1(A)", 0x16_2104, Meaning::BringUp, None),
+    comp_dw3: Register::read_only("PORT_COMP_DW3(A)", 0x16_210C, Meaning::BringUp, None),
+    comp_dw8: Register::read_write("PORT_COMP_DW8(A)", 0x16_2120, Meaning::BringUp, None),
+    comp_dw9: Register::read_write("PORT_COMP_DW9(A)", 0x16_2124, Meaning::BringUp, None),
+    comp_dw10: Register::read_write("PORT_COMP_DW10(A)", 0x16_2128, Meaning::BringUp, None),
+    tx_dw8: Register::read_write("PORT_TX_DW8(A)", 0x16_26A0, Meaning::BringUp, None),
+    pcs_dw1: Register::read_write("PORT_PCS_DW1(A)", 0x16_2604, Meaning::BringUp, None),
+    tx_dw8_ln0: Register::read_only("PORT_TX_DW8_LN0(A)", 0x16_28A0, Meaning::BringUp, None),
+    pcs_dw1_ln0: Register::read_only("PORT_PCS_DW1_LN0(A)", 0x16_2804, Meaning::BringUp, None),
+    cl_dw5: Register::read_write("PORT_CL_DW5(A)", 0x16_2014, Meaning::BringUp, None),
+    phy_misc: Register::read_write("ICL_PHY_MISC(A)", 0x6_4C00, Meaning::BringUp, None),
+};
+
+/// Combo PHY B, base `0x06C000`, a compensation sink.
+/// Reference §8.2 and §8.3; `[I915]` `intel_combo_phy_regs.h:12`.
+pub(crate) const COMBO_PHY_B: ComboPhyRegisters = ComboPhyRegisters {
+    port: "B",
+    comp_dw0: Register::read_write("PORT_COMP_DW0(B)", 0x6_C100, Meaning::BringUp, None),
+    comp_dw1: Register::read_write("PORT_COMP_DW1(B)", 0x6_C104, Meaning::BringUp, None),
+    comp_dw3: Register::read_only("PORT_COMP_DW3(B)", 0x6_C10C, Meaning::BringUp, None),
+    comp_dw8: Register::read_write("PORT_COMP_DW8(B)", 0x6_C120, Meaning::BringUp, None),
+    comp_dw9: Register::read_write("PORT_COMP_DW9(B)", 0x6_C124, Meaning::BringUp, None),
+    comp_dw10: Register::read_write("PORT_COMP_DW10(B)", 0x6_C128, Meaning::BringUp, None),
+    tx_dw8: Register::read_write("PORT_TX_DW8(B)", 0x6_C6A0, Meaning::BringUp, None),
+    pcs_dw1: Register::read_write("PORT_PCS_DW1(B)", 0x6_C604, Meaning::BringUp, None),
+    tx_dw8_ln0: Register::read_only("PORT_TX_DW8_LN0(B)", 0x6_C8A0, Meaning::BringUp, None),
+    pcs_dw1_ln0: Register::read_only("PORT_PCS_DW1_LN0(B)", 0x6_C804, Meaning::BringUp, None),
+    cl_dw5: Register::read_write("PORT_CL_DW5(B)", 0x6_C014, Meaning::BringUp, None),
+    phy_misc: Register::read_write("ICL_PHY_MISC(B)", 0x6_4C04, Meaning::BringUp, None),
+};
+
+/// The combo PHYs `XE_LPD` has, in the order they must be initialised.
+///
+/// PHY A is the compensation source and PHY B its sink, so A comes first: a
+/// sink initialised while its source is not produces wrong termination, which
+/// does not announce itself until a link fails to train.
+/// Reference §8.1 and §8.3 ("Comp source / sink"); `[I915]`
+/// `display/intel_combo_phy.c:189-215` (`phy_is_master`) and
+/// `intel_combo_phy_regs.h:11-21`, whose `C`/`D`/`E` instances are documented
+/// there as EHL's, RKL's and ADL-S's respectively.
+pub(crate) const COMBO_PHYS: &[ComboPhyRegisters] = &[COMBO_PHY_A, COMBO_PHY_B];
+
+/// Every register in this table, for the consistency test below.
+pub(crate) const POWER_AND_CLOCK_REGISTERS: &[Register] = &[
+    SKL_DFSM,
+    SKL_DSSM,
+    SFUSE_STRAP,
+    SKL_FUSE_STATUS,
+    HSW_PWR_WELL_CTL1,
+    HSW_PWR_WELL_CTL2,
+    HSW_PWR_WELL_CTL3,
+    HSW_PWR_WELL_CTL4,
+    ICL_PWR_WELL_CTL_AUX2,
+    ICL_PWR_WELL_CTL_DDI2,
+    DC_STATE_EN,
+    DBUF_CTL_S0,
+    DBUF_CTL_S1,
+    DBUF_CTL_S2,
+    DBUF_CTL_S3,
+    CDCLK_CTL,
+    CDCLK_PLL_ENABLE,
+    PCH_RAWCLK_FREQ,
+    GEN8_CHICKEN_DCPR_1,
+    GEN11_CHICKEN_DCPR_2,
+    XELPD_DISPLAY_ERR_FATAL_MASK,
+];
+
+#[cfg(test)]
+pub(crate) mod mock {
+    //! A register window a host test can drive.
+    //!
+    //! The bring-up sequences are the part of this driver that cannot be run on
+    //! the target machine yet, and their interesting behaviour is not the writes
+    //! but what they do when a status bit does not appear, when a register is
+    //! not there, or when the device drops a write.  Those are exactly the cases
+    //! a real aperture never produces on demand, so the sequences are written
+    //! against [`Registers`] and the tests drive them through this.
+    //!
+    //! A word that has not been set reads zero, as it does on a real aperture
+    //! whose power well is down; that is deliberate, because "reads zero" is the
+    //! failure mode the reference document spends the most words on.
+
+    use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+    use core::cell::RefCell;
+
+    use super::{Register, Registers};
+
+    /// How a register's stored value is derived from the value written to it.
+    type WriteHook = Box<dyn Fn(u32) -> u32>;
+
+    /// How a register's value is derived when it is read.
+    type ReadHook = Box<dyn Fn(u32) -> u32>;
+
+    /// A mock aperture.
+    pub(crate) struct MockRegisters {
+        words: RefCell<BTreeMap<u32, u32>>,
+        write_hooks: RefCell<BTreeMap<u32, WriteHook>>,
+        read_hooks: RefCell<BTreeMap<u32, ReadHook>>,
+        refused: RefCell<Vec<&'static str>>,
+        hidden: RefCell<Vec<&'static str>>,
+        log: RefCell<Vec<(&'static str, u32)>>,
+    }
+
+    impl MockRegisters {
+        pub(crate) fn new() -> Self {
+            Self {
+                words: RefCell::new(BTreeMap::new()),
+                write_hooks: RefCell::new(BTreeMap::new()),
+                read_hooks: RefCell::new(BTreeMap::new()),
+                refused: RefCell::new(Vec::new()),
+                hidden: RefCell::new(Vec::new()),
+                log: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// Set a register's value, as firmware would have left it.
+        pub(crate) fn set(&self, register: Register, value: u32) {
+            self.words.borrow_mut().insert(register.offset(), value);
+        }
+
+        /// Make writes to `register` derive the stored value from the written
+        /// one: the status bit that follows a request bit, or a lock bit that
+        /// follows an enable bit.
+        pub(crate) fn derive(&self, register: Register, hook: impl Fn(u32) -> u32 + 'static) {
+            self.write_hooks
+                .borrow_mut()
+                .insert(register.offset(), Box::new(hook));
+        }
+
+        /// Make reads of `register` derive their answer, which is how a
+        /// handshake that takes several polls is modelled.
+        pub(crate) fn on_read(&self, register: Register, hook: impl Fn(u32) -> u32 + 'static) {
+            self.read_hooks
+                .borrow_mut()
+                .insert(register.offset(), Box::new(hook));
+        }
+
+        /// Make writes to `register` fail, as a read-only register or a
+        /// register outside the window would.
+        pub(crate) fn refuse(&self, register: Register) {
+            self.refused.borrow_mut().push(register.name());
+        }
+
+        /// Make reads of `register` fail, as a register outside the mapped
+        /// window does.
+        pub(crate) fn hide(&self, register: Register) {
+            self.hidden.borrow_mut().push(register.name());
+        }
+
+        /// Every write that happened, in order, as `(name, value)`.
+        pub(crate) fn writes(&self) -> Vec<(&'static str, u32)> {
+            self.log.borrow().clone()
+        }
+
+        /// How many times a register was written.
+        pub(crate) fn write_count(&self, register: Register) -> usize {
+            self.log
+                .borrow()
+                .iter()
+                .filter(|(name, _)| *name == register.name())
+                .count()
+        }
+    }
+
+    impl Registers for MockRegisters {
+        fn read(&self, register: Register) -> Option<u32> {
+            if self.hidden.borrow().contains(&register.name()) {
+                return None;
+            }
+            let stored = self
+                .words
+                .borrow()
+                .get(&register.offset())
+                .copied()
+                .unwrap_or(0);
+            match self.read_hooks.borrow().get(&register.offset()) {
+                Some(hook) => Some(hook(stored)),
+                None => Some(stored),
+            }
+        }
+
+        fn read64(&self, register: Register) -> Option<u64> {
+            let low = self.read(register)? as u64;
+            let high = self
+                .words
+                .borrow()
+                .get(&(register.offset() + 4))
+                .copied()
+                .unwrap_or(0) as u64;
+            Some(low | (high << 32))
+        }
+
+        fn write(&self, register: Register, value: u32) -> bool {
+            if self.refused.borrow().contains(&register.name()) {
+                return false;
+            }
+            self.log.borrow_mut().push((register.name(), value));
+            let stored = match self.write_hooks.borrow().get(&register.offset()) {
+                Some(hook) => hook(value),
+                None => value,
+            };
+            self.words.borrow_mut().insert(register.offset(), stored);
+            true
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -650,5 +1191,239 @@ mod tests {
         }
         assert!(PROBE_WINDOW as u32 > 0x1b_ffff);
         assert!(!is_forcewake_free(PROBE_WINDOW as u32 - 4));
+    }
+
+    /// Every register of every combo PHY, as one list.
+    fn every_combo_phy_register() -> vec::Vec<Register> {
+        COMBO_PHYS
+            .iter()
+            .flat_map(|phy| phy.all())
+            .collect::<vec::Vec<_>>()
+    }
+
+    #[test]
+    fn every_bring_up_register_is_inside_a_window_that_needs_no_forcewake() {
+        // The same three properties the probe's own table has to satisfy, for
+        // the same reason: a register outside a band answers zero for the wrong
+        // reason, and a register outside the window has no address at all.  A
+        // bring-up register that fails this is a bug in the table, and the
+        // assertion in `Register::declare` is what makes it a compile error --
+        // this test covers the `all()` lists, which `declare` cannot see.
+        let registers = POWER_AND_CLOCK_REGISTERS
+            .iter()
+            .copied()
+            .chain(every_combo_phy_register());
+        for register in registers {
+            assert_eq!(
+                register.offset() % 4,
+                0,
+                "{} is not dword aligned",
+                register.name()
+            );
+            assert_eq!(register.width(), Width::Bits32, "{}", register.name());
+            assert!(
+                is_forcewake_free(register.offset()),
+                "{} is outside the forcewake-free bands",
+                register.name()
+            );
+            assert!(
+                register.fits_in(PROBE_WINDOW),
+                "{} is outside the mapped window",
+                register.name()
+            );
+        }
+    }
+
+    #[test]
+    fn the_writable_registers_are_exactly_the_ones_the_bring_up_programs() {
+        // Freezing the write set is the point of this test: a register that
+        // becomes writable without a sequence that needs it is the first step
+        // towards a driver that pokes at hardware nobody has reasoned about.
+        let writable: vec::Vec<&str> = POWER_AND_CLOCK_REGISTERS
+            .iter()
+            .chain(every_combo_phy_register().iter())
+            .filter(|register| register.is_writable())
+            .map(|register| register.name())
+            .collect();
+        assert_eq!(
+            writable,
+            vec![
+                "HSW_PWR_WELL_CTL2",
+                "ICL_PWR_WELL_CTL_AUX2",
+                "ICL_PWR_WELL_CTL_DDI2",
+                "DC_STATE_EN",
+                "DBUF_CTL_S0",
+                "DBUF_CTL_S1",
+                "DBUF_CTL_S2",
+                "DBUF_CTL_S3",
+                "CDCLK_CTL",
+                "CDCLK_PLL_ENABLE",
+                "PCH_RAWCLK_FREQ",
+                "GEN8_CHICKEN_DCPR_1",
+                "GEN11_CHICKEN_DCPR_2",
+                "XELPD_DISPLAY_ERR_FATAL_MASK",
+                "PORT_COMP_DW0(A)",
+                "PORT_COMP_DW1(A)",
+                "PORT_COMP_DW8(A)",
+                "PORT_COMP_DW9(A)",
+                "PORT_COMP_DW10(A)",
+                "PORT_TX_DW8(A)",
+                "PORT_PCS_DW1(A)",
+                "PORT_CL_DW5(A)",
+                "ICL_PHY_MISC(A)",
+                "PORT_COMP_DW0(B)",
+                "PORT_COMP_DW1(B)",
+                "PORT_COMP_DW8(B)",
+                "PORT_COMP_DW9(B)",
+                "PORT_COMP_DW10(B)",
+                "PORT_TX_DW8(B)",
+                "PORT_PCS_DW1(B)",
+                "PORT_CL_DW5(B)",
+                "ICL_PHY_MISC(B)",
+            ]
+        );
+        // The probe reads fuses; the bring-up must never write one, and the
+        // probe must never write at all.
+        for register in NAMED {
+            assert!(
+                !register.is_writable(),
+                "{} is a probe register and must stay read-only",
+                register.name()
+            );
+        }
+        for register in [SKL_DFSM, SKL_DSSM, SFUSE_STRAP, SKL_FUSE_STATUS] {
+            assert!(
+                !register.is_writable(),
+                "{} is a fuse or a strap: read it, never write it",
+                register.name()
+            );
+        }
+        let read_only: vec::Vec<&str> = POWER_AND_CLOCK_REGISTERS
+            .iter()
+            .chain(every_combo_phy_register().iter())
+            .filter(|register| !register.is_writable())
+            .map(|register| register.name())
+            .collect();
+        assert_eq!(
+            read_only,
+            vec![
+                "SKL_DFSM",
+                "SKL_DSSM",
+                "SFUSE_STRAP",
+                "SKL_FUSE_STATUS",
+                "HSW_PWR_WELL_CTL1",
+                "HSW_PWR_WELL_CTL3",
+                "HSW_PWR_WELL_CTL4",
+                "PORT_COMP_DW3(A)",
+                "PORT_TX_DW8_LN0(A)",
+                "PORT_PCS_DW1_LN0(A)",
+                "PORT_COMP_DW3(B)",
+                "PORT_TX_DW8_LN0(B)",
+                "PORT_PCS_DW1_LN0(B)",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_combo_phys_registers_are_at_the_documented_sub_block_offsets() {
+        // The PHY blocks are a base plus fixed sub-block offsets, so the offset
+        // of every register can be recomputed from the rule rather than
+        // eyeballed from a table.  This is the test that would have caught the
+        // reference document's `PORT_TX_DW*` group base: it gives `+0x400`,
+        // while the header it cites gives `+0x680`, and the two cannot both
+        // address `PORT_TX_DW8`.
+        const COMP: u32 = 0x100;
+        const TX_GRP: u32 = 0x680;
+        const TX_LN0: u32 = 0x880;
+        const PCS_GRP: u32 = 0x600;
+        const PCS_LN0: u32 = 0x800;
+        for (phy, base) in [(COMBO_PHY_A, 0x16_2000), (COMBO_PHY_B, 0x6_C000)] {
+            let name = phy.port;
+            assert_eq!(
+                phy.comp_dw0.offset(),
+                base + COMP + 4 * 0,
+                "COMP_DW0({name})"
+            );
+            assert_eq!(
+                phy.comp_dw1.offset(),
+                base + COMP + 4 * 1,
+                "COMP_DW1({name})"
+            );
+            assert_eq!(
+                phy.comp_dw3.offset(),
+                base + COMP + 4 * 3,
+                "COMP_DW3({name})"
+            );
+            assert_eq!(
+                phy.comp_dw8.offset(),
+                base + COMP + 4 * 8,
+                "COMP_DW8({name})"
+            );
+            assert_eq!(
+                phy.comp_dw9.offset(),
+                base + COMP + 4 * 9,
+                "COMP_DW9({name})"
+            );
+            assert_eq!(
+                phy.comp_dw10.offset(),
+                base + COMP + 4 * 10,
+                "COMP_DW10({name})"
+            );
+            assert_eq!(phy.tx_dw8.offset(), base + TX_GRP + 4 * 8, "TX_DW8({name})");
+            assert_eq!(
+                phy.pcs_dw1.offset(),
+                base + PCS_GRP + 4 * 1,
+                "PCS_DW1({name})"
+            );
+            // The lane 0 registers are read and never written: the
+            // initialisation takes its starting value from lane 0 and writes
+            // the result to the group register, which is what `[I915]`
+            // `icl_combo_phys_init` does (`display/intel_combo_phy.c:350-359`).
+            // A group write and a lane write are different facts, so the
+            // distinction is kept rather than collapsed into one register.
+            assert_eq!(
+                phy.tx_dw8_ln0.offset(),
+                base + TX_LN0 + 4 * 8,
+                "TX_DW8_LN0({name})"
+            );
+            assert_eq!(
+                phy.pcs_dw1_ln0.offset(),
+                base + PCS_LN0 + 4 * 1,
+                "PCS_DW1_LN0({name})"
+            );
+            assert!(!phy.tx_dw8_ln0.is_writable(), "TX_DW8_LN0({name})");
+            assert!(!phy.pcs_dw1_ln0.is_writable(), "PCS_DW1_LN0({name})");
+            assert_eq!(phy.cl_dw5.offset(), base + 4 * 5, "CL_DW5({name})");
+        }
+        // `ICL_PHY_MISC` is the exception: it lives in the DDI block, not in
+        // the PHY block.  Reference §8.2; `[I915]` `i915_reg.h:4458-4465`.
+        assert_eq!(COMBO_PHY_A.phy_misc.offset(), 0x6_4C00);
+        assert_eq!(COMBO_PHY_B.phy_misc.offset(), 0x6_4C04);
+        // The two PHY register sets must not overlap: an aliased register would
+        // mean one PHY's init silently rewrote the other's.
+        let mut offsets: vec::Vec<u32> = every_combo_phy_register()
+            .iter()
+            .map(|register| register.offset())
+            .collect();
+        let before = offsets.len();
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets.len(), before, "two PHY registers share an offset");
+    }
+
+    #[test]
+    fn the_register_mock_stands_in_for_a_window() {
+        // The bring-up sequences are written against `Registers`, so the trait
+        // has to be usable through a plain window as well as through a mock.
+        let _guard = scheduler_test_context();
+        let mut scratch = Scratch::new();
+        let window = scratch.window();
+        let register: &dyn Registers = &window;
+        assert!(register.write(DBUF_CTL_S0, 0x8000_0000));
+        assert_eq!(register.read(DBUF_CTL_S0), Some(0x8000_0000));
+        // A read-only register is refused through the trait exactly as it is
+        // through the window.
+        assert!(!register.write(SKL_DFSM, 0));
+        assert_eq!(register.read64(SKL_DFSM), None);
     }
 }
