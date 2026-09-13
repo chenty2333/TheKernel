@@ -81,6 +81,9 @@ SUMMARY_RE = re.compile(
     r"^SYSV-SHM-STRESS variant=(\w+) ((?:[a-z_]+=\d+\s*)+)$", re.MULTILINE
 )
 COUNTER_RE = re.compile(r"([a-z_]+)=(\d+)")
+# The guest command line a boot recorded, used to recover which variants it
+# actually asked for when stored logs are re-analysed.
+COMMAND_VARIANT_RE = re.compile(rf"{re.escape(GUEST_TOOL)} (\w+) \d+ \d+")
 VERDICT_RE = re.compile(r"^SYSV-SHM-STRESS-(OK|FAIL) (\w+)\s*$", re.MULTILINE)
 FIRST_FAIL_RE = re.compile(
     r"^SYSV-SHM-STRESS-FIRST-FAIL variant=(\w+) round=(\d+) kind=(\S+) "
@@ -247,9 +250,14 @@ class BootParse:
 
 
 def parse_boot_text(
-    text: str, planned: Sequence[str], expected_rounds: int
+    text: str, planned: Sequence[str], expected_rounds: int | None
 ) -> BootParse:
-    """Parse one console log against the variants and round count requested."""
+    """Parse one console log against the variants and round count requested.
+
+    `expected_rounds=None` accepts whatever round count each summary reports,
+    which is what re-analysing stored logs of runs with different `--rounds`
+    needs; a live boot always passes the number it asked for.
+    """
 
     problems: list[str] = []
     timed_out = bool(TIMEOUT_RE.search(text))
@@ -293,7 +301,7 @@ def parse_boot_text(
     if missing:
         problems.append(f"no summary for {', '.join(missing)}")
     for invocation in invocations:
-        if invocation.rounds != expected_rounds:
+        if expected_rounds is not None and invocation.rounds != expected_rounds:
             problems.append(
                 f"{invocation.variant} ran {invocation.rounds} rounds, "
                 f"expected {expected_rounds}"
@@ -731,14 +739,24 @@ def summary_json(runs: Sequence[BootRun], attempts: int) -> dict[str, object]:
 
 
 def analyze_only(args: argparse.Namespace) -> tuple[tuple[BootRun, ...], int]:
-    """Re-parse existing `runs/<label>-<n>/` boots without booting anything."""
+    """Re-parse existing `runs/<label>-<n>/` boots without booting anything.
+
+    `--label` may be a comma list, which is how the boots of several runs with
+    different `--rounds` are pooled into one table; each summary's own round
+    count is the denominator.
+    """
 
     runs_root = Path(args.state_dir) / "runs"
+    labels = [part.strip() for part in args.label.split(",") if part.strip()]
     directories = sorted(
         (
             path
-            for path in runs_root.glob(f"{args.label}-*")
-            if path.is_dir() and not path.name.startswith(f"{args.label}-host-")
+            for path in runs_root.iterdir()
+            if path.is_dir()
+            and any(
+                path.name.startswith(f"{label}-") and not path.name.startswith(f"{label}-host-")
+                for label in labels
+            )
         ),
         key=lambda path: path.name,
     )
@@ -753,7 +771,17 @@ def analyze_only(args: argparse.Namespace) -> tuple[tuple[BootRun, ...], int]:
             if console is not None
             else ""
         )
-        parsed = parse_boot_text(text, split_variants(args.variant), args.rounds)
+        # The boot's own commands file records what was actually requested, so
+        # a run that exercised one variant is not judged against all five.
+        planned = split_variants(args.variant)
+        for commands in directory.glob("*/commands"):
+            requested = COMMAND_VARIANT_RE.findall(
+                commands.read_text(encoding="utf-8", errors="replace")
+            )
+            if requested:
+                planned = tuple(requested)
+                break
+        parsed = parse_boot_text(text, planned, None)
         runs.append(
             BootRun(
                 name=directory.name,
@@ -814,7 +842,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--analyze-only",
         action="store_true",
-        help="re-parse runs/<label>-*/ console logs instead of booting",
+        help=(
+            "re-parse runs/<label>-*/ console logs instead of booting; "
+            "--label may be a comma list and each summary's own round count "
+            "is used"
+        ),
     )
     parser.add_argument(
         "--host-control",

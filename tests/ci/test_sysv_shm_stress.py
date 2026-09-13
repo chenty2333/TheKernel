@@ -102,6 +102,20 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(parsed.timed_out)
         self.assertFalse(parsed.valid)
 
+    def test_round_count_can_be_left_to_the_log(self):
+        """Re-analysis of stored runs trusts each summary's own denominator."""
+
+        text = "\n".join([summary("wait", 900), "SYSV-SHM-STRESS-OK wait", stress.BOOT_MARKER])
+        parsed = stress.parse_boot_text(text, ["wait"], None)
+        self.assertTrue(parsed.valid, parsed.problems)
+        self.assertEqual(parsed.rounds, 900)
+
+    def test_the_requested_variants_are_recoverable_from_the_command_line(self):
+        """A stored boot's commands file says which variants it asked for."""
+
+        command = stress.guest_command(["wait", "shared"], 100, 300)
+        self.assertEqual(stress.COMMAND_VARIANT_RE.findall(command), ["wait", "shared"])
+
     def test_defect_counters_and_first_fail_are_summed(self):
         text = "\n".join(
             [
