@@ -11,6 +11,7 @@ mod fbdev;
 pub(crate) mod fence;
 mod file;
 mod gem;
+pub(crate) mod intel;
 mod ioctl;
 mod kms;
 mod property;
@@ -32,6 +33,12 @@ pub use kms::{ConnectorInfo, CrtcInfo, FramebufferId, KmsResources, Mode, PageFl
 pub use render::RenderAdapter;
 
 pub fn init_virtio_gpu() -> DrmResult<bool> {
+    // An Intel GPU is not a VirtIO device, but this is the DRM initialization
+    // hook the kernel entry point already calls, so the Intel probe runs here:
+    // before devfs is mounted, and therefore before any debug file could be
+    // read, so that its report reaches the console on a machine that has no
+    // other way to show one.
+    intel::probe_at_boot();
     virtio::init()
 }
 

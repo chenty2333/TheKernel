@@ -24,6 +24,13 @@ fn builder(fs: Arc<SimpleFs>) -> crate::pseudofs::DirMaker {
         "thekernel_metrics",
         SimpleFile::new_regular(fs.clone(), || -> VfsResult<String> { Ok(snapshot_json()) }),
     );
+    // The Intel display probe's report.  It is a text file rather than part of
+    // the metrics snapshot above because it is read by a person looking at a
+    // machine with no serial port, not by a collector.
+    root.add(
+        "intel_gpu",
+        SimpleFile::new_regular(fs.clone(), crate::drm::intel::debugfs::report),
+    );
     SimpleDir::new_maker(fs, Arc::new(root))
 }
 
