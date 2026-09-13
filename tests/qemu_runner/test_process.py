@@ -58,56 +58,66 @@ class ProcessTests(unittest.TestCase):
 
     def test_termination_signals_reap_child_and_unwind_caller_cleanup(self) -> None:
         for signum in (signal.SIGTERM, signal.SIGHUP):
-            with self.subTest(signum=signum), test_tmpdir() as directory:
-                root = Path(directory)
-                pid_path = root / "child.pid"
-                cleanup_path = root / "cleaned"
-                child_code = (
-                    "import os, pathlib, time; "
-                    f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
-                    "time.sleep(60)"
-                )
-                runner_code = (
-                    "from pathlib import Path; "
-                    "from tools.qemu_runner.process import run_process; "
-                    "from tools.qemu_runner.model import RunLimits, Interaction\n"
-                    "try:\n"
-                    f"    run_process(command=({sys.executable!r}, '-c', {child_code!r}), "
-                    f"workdir=Path({str(root)!r}), log_path=Path({str(root / 'serial.log')!r}), "
-                    "limits=RunLimits(), interaction=Interaction())\n"
-                    "finally:\n"
-                    f"    Path({str(cleanup_path)!r}).write_text('cleaned')\n"
-                )
-                runner = subprocess.Popen(
-                    (sys.executable, "-c", runner_code),
-                    cwd=Path(__file__).resolve().parents[2],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                )
-                child_pid = None
-                try:
-                    deadline = time.monotonic() + STARTUP_BOUND_SECONDS
-                    while time.monotonic() < deadline:
-                        if pid_path.exists() and pid_path.read_text():
-                            child_pid = int(pid_path.read_text())
-                            break
-                        self.assertIsNone(runner.poll())
-                        time.sleep(0.01)
-                    self.assertIsNotNone(child_pid, "child did not start")
-                    runner.send_signal(signum)
-                    _, stderr = runner.communicate(timeout=TEARDOWN_BOUND_SECONDS)
-                    self.assertEqual(runner.returncode, 128 + signum, stderr.decode())
-                    self.assertEqual(cleanup_path.read_text(), "cleaned")
-                    with self.assertRaises(ProcessLookupError):
-                        os.killpg(child_pid, 0)
-                finally:
-                    if runner.poll() is None:
-                        runner.kill()
-                    runner.communicate()
-                    if child_pid is not None:
-                        try:
-                            os.killpg(child_pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+            # The runner deliberately keeps an ignored signal ignored -- see
+            # `test_ignored_signal_stays_ignored_and_handlers_are_restored` -- so
+            # a disposition this test inherits decides what it measures.  It has
+            # been observed returning 0 where 128 + signum was expected, which is
+            # a runner that inherited the signal ignored and never saw it at all.
+            # State the precondition rather than inherit it.
+            previous_disposition = signal.signal(signum, signal.SIG_DFL)
+            try:
+                with self.subTest(signum=signum), test_tmpdir() as directory:
+                    root = Path(directory)
+                    pid_path = root / "child.pid"
+                    cleanup_path = root / "cleaned"
+                    child_code = (
+                        "import os, pathlib, time; "
+                        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+                        "time.sleep(60)"
+                    )
+                    runner_code = (
+                        "from pathlib import Path; "
+                        "from tools.qemu_runner.process import run_process; "
+                        "from tools.qemu_runner.model import RunLimits, Interaction\n"
+                        "try:\n"
+                        f"    run_process(command=({sys.executable!r}, '-c', {child_code!r}), "
+                        f"workdir=Path({str(root)!r}), log_path=Path({str(root / 'serial.log')!r}), "
+                        "limits=RunLimits(), interaction=Interaction())\n"
+                        "finally:\n"
+                        f"    Path({str(cleanup_path)!r}).write_text('cleaned')\n"
+                    )
+                    runner = subprocess.Popen(
+                        (sys.executable, "-c", runner_code),
+                        cwd=Path(__file__).resolve().parents[2],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    )
+                    child_pid = None
+                    try:
+                        deadline = time.monotonic() + STARTUP_BOUND_SECONDS
+                        while time.monotonic() < deadline:
+                            if pid_path.exists() and pid_path.read_text():
+                                child_pid = int(pid_path.read_text())
+                                break
+                            self.assertIsNone(runner.poll())
+                            time.sleep(0.01)
+                        self.assertIsNotNone(child_pid, "child did not start")
+                        runner.send_signal(signum)
+                        _, stderr = runner.communicate(timeout=TEARDOWN_BOUND_SECONDS)
+                        self.assertEqual(runner.returncode, 128 + signum, stderr.decode())
+                        self.assertEqual(cleanup_path.read_text(), "cleaned")
+                        with self.assertRaises(ProcessLookupError):
+                            os.killpg(child_pid, 0)
+                    finally:
+                        if runner.poll() is None:
+                            runner.kill()
+                        runner.communicate()
+                        if child_pid is not None:
+                            try:
+                                os.killpg(child_pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+            finally:
+                signal.signal(signum, previous_disposition)
 
     def test_signal_during_launch_is_deferred_until_child_cleanup(self) -> None:
         original_popen = subprocess.Popen
