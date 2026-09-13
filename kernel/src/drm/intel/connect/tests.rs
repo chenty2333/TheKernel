@@ -21,6 +21,7 @@ use core::cell::{Cell, RefCell};
 use super::*;
 use crate::{
     drm::intel::{
+        gmbus,
         gmbus::tests::{FakeClock, FakeController},
         probe::BusFacts,
         regs::{GMBUS0, ICL_PWR_WELL_CTL_AUX2, Register},

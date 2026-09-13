@@ -45,7 +45,7 @@ use alloc::{format, string::String, vec::Vec};
 use axlog::{info, warn};
 
 use super::{
-    gmbus::{self, AuxWell, EdidBytes, GmbusError, MonotonicTimer, Pin, PollTimer, SinkProbe},
+    gmbus::{AuxWell, EdidBytes, GmbusError, MonotonicTimer, Pin, PollTimer, SinkProbe},
     hpd::{Ddi, HpdError, HpdStatus},
     pci::Bdf,
     power::{self, PowerError, Requesters, Well, WellObservation},
