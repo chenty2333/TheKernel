@@ -17,6 +17,12 @@ Two procedures are described and it matters which is which:
   *not* end, so that the evidence stays on the screen; §3 replaces screen
   reading with a network transcript.
 
+The Intel display work has its own acceptance procedure,
+[`n305-display-acceptance.md`](n305-display-acceptance.md): it takes §1 and §2
+of this document as given — the stick, the firmware preconditions, the shell
+profile, the photographs — and adds what each phase of the display bring-up
+must show on the panel, which log lines confirm it, and how to falsify it.
+
 ## 1. Capture the machine's hardware facts
 
 The kernel now reads the one fact firmware can tell it: the **PCI ECAM base**

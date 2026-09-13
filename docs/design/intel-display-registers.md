@@ -902,7 +902,7 @@ Key topology rules, all from `[PRM]` "DG1 Display Overview":
 
 | Register | Pipe A | Field summary |
 |---|---|---|
-| `TRANSCONF` (a.k.a. `PIPECONF`; **i915 renamed it**) | `0x70008` | `ENABLE[31]`, `STATE_ENABLE[30]`, `INTERLACE[23:21]` |
+| `TRANSCONF` (a.k.a. `PIPECONF`; **i915 renamed it**) | `0x70008` | `ENABLE[31]` (a request), `STATE_ENABLE[30]` (**a status: i915 polls it, never sets it**), `INTERLACE[23:21]` |
 | `PIPESRC` | `0x6001c` | `WIDTH[31:16]`, `HEIGHT[15:0]` — pipe source size, **minus 1** |
 | `PIPEDSL` | `0x70000` | `LINE[19:0]` — current scanline; read this to prove the pipe is running |
 | `PIPESTAT` | `0x70024` | `PIPE_FIFO_UNDERRUN_STATUS[31]`, vblank status/enable |
@@ -1089,12 +1089,28 @@ is all you need.** Ignore the DKL/Type-C PLLs entirely.
 |---|---|---|
 | `DPLL0_CFGCR0` | `0x164284` | DCO integer + fraction |
 | `DPLL0_CFGCR1` | `0x164288` | pdiv/kdiv/qdiv/central freq |
+| `DPLL1_CFGCR0` | `0x16428C` | the same fields as `DPLL0_CFGCR0`; this is combo PHY B's pair |
+| `DPLL1_CFGCR1` | `0x164290` | the same fields as `DPLL0_CFGCR1` |
 | `DPLL0_DIV0` | `0x164B00` | AFC startup (only if VBT overrides it) |
+| `DPLL1_DIV0` | `0x164C00` | the same, for DPLL1 |
 | `DPLL0_ENABLE` (**= `LCPLL1_CTL`**) | `0x46010` | `PLL_ENABLE[31]`, `LOCK[30]`, `POWER_ENABLE[27]`, `POWER_STATE[26]` |
 | `DPLL1_ENABLE` (**= `LCPLL2_CTL`**) | `0x46014` | same bits |
 | `ICL_DPCLKA_CFGCR0` | `0x164280` | DDI → PLL select + per-DDI clock-off |
 
 `[I915]` `i915_reg.h:4301-4322`, `4213-4221`, `4158`.
+
+> **The `DPLL1_CFGCR*` rows, and how this table came to be missing them.** Earlier revisions stated
+> the config offsets for DPLL0 only, as "`DPLLn_CFGCR0` (`0x164284` for DPLL0)" and "`DPLLn_CFGCR1`
+> (`0x164288` for DPLL0)", which read on its own leaves combo PHY B's PLL with no address: a driver
+> built from this table refuses DDI B rather than lighting the screen. The citation printed for the
+> whole block, `i915_reg.h:4301-4322`, is precisely the region that defines both pairs --
+> `_TGL_DPLL0_CFGCR0/1 = 0x164284/0x164288` at `:4301`/`:4316` and
+> `_TGL_DPLL1_CFGCR0/1 = 0x16428C/0x164290` at `:4302`/`:4317`, selected by PLL id through
+> `TGL_DPLL_CFGCR0/1(pll)` (`:4304-4306`, `:4319-4321`), which is what `icl_dpll_write` uses for
+> `DISPLAY_VER >= 12` (`[I915]` `display/intel_dpll_mgr.c:3767-3769`). The two pairs interleave, so
+> DPLL1 is **not** DPLL0 + 4. `DPLL1_DIV0` is listed for symmetry and is written only when the VBT
+> overrides the AFC startup value, the same rule as DPLL0's
+> (`[I915]` `intel_dpll_mgr.c:3784-3789`); nothing in this kernel writes either.
 
 > **Two names, one register.** `_DPLL0_ENABLE = 0x46010` and `LCPLL1_CTL = 0x46010` are the same
 > address; likewise `0x46014`. `[I915]` `i915_reg.h:4093-4095` and `4213-4214`. The `LCPLL_PLL_ENABLE`
@@ -1138,10 +1154,10 @@ block, used for `DISPLAY_VER >= 12`) **agree exactly**:
 
 | Register | Field | Bits | Notes |
 |---|---|---|---|
-| `DPLLn_CFGCR0` (`0x164284` for DPLL0) | `DCO_FRACTION` | `[24:10]` | reset default `0x4000` |
+| `DPLLn_CFGCR0` (`0x164284` for DPLL0, `0x16428C` for DPLL1) | `DCO_FRACTION` | `[24:10]` | reset default `0x4000` |
 | | `DCO_INTEGER` | `[9:0]` | reset default `0x151` |
 | | `LINK_RATE` override | mask `[28:25]`, defined values in `[27:25]` | HDMI link-rate override; leave 0 |
-| `DPLLn_CFGCR1` (`0x164288` for DPLL0) | `QDIV_RATIO` | `[17:10]` | |
+| `DPLLn_CFGCR1` (`0x164288` for DPLL0, `0x164290` for DPLL1) | `QDIV_RATIO` | `[17:10]` | |
 | | `QDIV_MODE` | `[9]` | 0 if `qdiv_ratio == 1`, else 1 |
 | | `KDIV` | `[8:6]` | `K=1→1`, `K=2→2`, `K=3→4` |
 | | `PDIV` | `[5:2]` | `P=2→1`, `P=3→2`, `P=5→4`, `P=7→8` |
@@ -1438,8 +1454,16 @@ Three separate muxes must agree. `[I915]` `display/intel_ddi.c:1487-1501` and `4
    `DDI_CLK_SEL_SHIFT(phy) = phy * 2`, 2 bits, value = **the PLL id** (0 or 1 for DPLL0/DPLL1).
    Also a per-DDI `DDI_CLK_OFF` bit at `_PICK(phy, 10, 11, 24, 4, 5)` (non-RKL encoding).
 2. **Transcoder → port clock**: `TRANS_CLK_SEL(tran)` at `0x46140 + tran*4`, field
-   `TGL_TRANS_CLK_SEL_PORT(port) = (port + 1) << 28` (Gen12 encoding; the pre-Gen12 encoding is
+   `TGL_TRANS_CLK_SEL_PORT(x) = (x + 1) << 28` (Gen12 encoding; the pre-Gen12 encoding is
    `<< 29`). `Disabled` = 0. `[I915]` `i915_reg.h:4007-4015`, `intel_ddi.c:987-1007`.
+   **The field is keyed by PHY, not by port, from display version 13 on**: i915 converts with
+   `intel_port_to_phy()` (`intel_display.c:1950-1965`) and passes the result to
+   `TGL_TRANS_CLK_SEL_PORT` on the `DISPLAY_VER >= 13` arm (`intel_ddi.c:993`, `:999-1000`), where
+   version 12 passed `encoder->port`.  For combo PHY A / DDI A the two indices are both 0 and the
+   value is the same, so this only bites a port that is not its own PHY (the Type-C DDIs).  Step 3's
+   `TRANS_DDI_FUNC_CTL` field is **not** converted -- i915 uses `encoder->port` there on every
+   display version (`intel_ddi.c:481`, `:488-490`) -- so the same number is right for one field and
+   wrong for the other, which is exactly the kind of thing to write down rather than remember.
 3. **Transcoder → DDI**: `TRANS_DDI_FUNC_CTL(tran)`, field
    `TGL_TRANS_DDI_SELECT_PORT(port) = (port + 1) << 27` (Gen12; pre-Gen12 is `<< 28`).
    `[I915]` `i915_reg.h:3742-3760`, `intel_ddi.c:483-490`.
@@ -1885,12 +1909,13 @@ precisely why they differ between two parts with the same PHY IP.
      HDMI/DVI: 4 lanes -> PWR_UP_ALL_LANES (0x0)
                 2 lanes -> PWR_DOWN_LN_3_2 (0xC)
                 1 lane  -> PWR_DOWN_LN_3_2_1 (0xE)
-8. Program TRANS_CLK_SEL(tran) = TGL_TRANS_CLK_SEL_PORT(port)
+8. Program TRANS_CLK_SEL(tran) = TGL_TRANS_CLK_SEL_PORT(phy)   (§6.3: PHY, not port, on ver 13)
 9. Program transcoder timings (§6.1) and PIPESRC
 10. Program & enable the plane(s)     (order: WM/DDB -> ... -> PLANE_CTL -> PLANE_SURF)
 11. TRANS_DDI_FUNC_CTL = ENABLE | SELECT_PORT | MODE_SELECT_HDMI/DVI
                          | BPC_8 | polarity | (scrambling if needed)
-12. TRANSCONF (0x70008) = ENABLE | STATE_ENABLE | progressive | 8bpc
+12. TRANSCONF (0x70008) = ENABLE | progressive | 8bpc   (bit 30 is the hardware's status, not a
+    request -- see the note under phase 5.6)
 13. DDI_BUF_CTL = ENABLE | BUF_TRANS_SELECT(level) | PHY_LINK_RATE(rate)
                   | PORT_WIDTH(lanes-1) | A_4_LANES if 4
 14. Poll DDI_BUF_CTL.IS_IDLE == 0   ("not idle")   [PRM] timeout 500us for HDMI
@@ -2431,7 +2456,16 @@ then, **in a separate write**, clear `DDI_CLK_OFF(phy)`.
 **5.5 `TRANS_DDI_FUNC_CTL(A) = ENABLE | SELECT_PORT(A) | MODE_SELECT_HDMI | BPC_8 | PHSYNC? | PVSYNC?`**
 — note `SELECT_PORT(A)` in Gen12 encoding is `(0+1) << 27 = 0x08000000`.
 
-**5.6 `TRANSCONF(A) = ENABLE | STATE_ENABLE | progressive`** = `(1<<31) | (1<<30)`.
+**5.6 `TRANSCONF(A) = ENABLE | progressive`** = `(1<<31)`.
+
+> **Corrected: bit 30 is a status, not a request.** Earlier revisions of this
+> document wrote `ENABLE | STATE_ENABLE = (1<<31) | (1<<30)`.  `[I915]` defines
+> bit 30 as `TRANSCONF_STATE_ENABLE` (`i915_reg.h:1591`) and only ever *polls* it
+> clear -- `intel_wait_for_pipe_off` (`display/intel_display.c:302-318`) -- while
+> `intel_enable_transcoder` reads the register and writes back
+> `val | TRANSCONF_ENABLE`, bit 31 alone (`:459`, `:474-475`).  Setting a status
+> bit is writing a request that the hardware does not read; the bit can, however,
+> be read in phase 6 as a further "the pipe is up" proof.
 Output bit depth is **not** set here on Gen12 — put `PIPE_MISC_BPC_8` (`PIPE_MISC[7:5] = 0`) and
 `PIPE_MISC_DITHER_ENABLE` (`PIPE_MISC[4]`) in `PIPE_MISC(A)` (`0x70030`) if you want dithering.
 
@@ -2599,7 +2633,14 @@ trust this document.
    reading `SFUSE_STRAP[8]` and `PCH_RAWCLK_FREQ`.
 6. **The ADL-N CDCLK voltage-level table.** `tgl_calc_voltage_level` is Gen12-specific and I did
    not verify it against a PRM.
-7. **The `PDIV`/`KDIV` field encoding.** `[TGL12]` and i915's executed path disagree; see §6.3.
+7. **The `PDIV`/`KDIV` field encoding.** **CLOSED — it was a false alarm of this document's own
+   making.** §6.3's "The `PDIV`/`KDIV` encoding — resolved" records what the apparent conflict
+   actually was: the *Skylake* encoder `skl_wrpll_params_populate` compared against the *Gen12*
+   decoder, which are not on the same path. ADL-N runs `icl_wrpll_params_populate`, which emits
+   exactly the Gen12 named-constant values, so write and read round-trip and there is no
+   discrepancy to settle. What remains live is the trap §6.3 describes — both encoders write one
+   `struct skl_wrpll_params` — and what remains *unverified* is only whether the silicon implements
+   the named-constant encoding, which §13.4's read-back settles rather than any document.
 8. **Where ADL-P/N programs `DBUF_TRACKER_STATE_SERVICE`.** `gen12_dbuf_slices_config` explicitly
    returns early for ADL-P. Either the reset value is correct or the programming is elsewhere.
 9. **Whether ADL-N needs the 16 Gb-DIMM level-0 latency adjustment** for its soldered LPDDR5.

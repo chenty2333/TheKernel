@@ -29,6 +29,11 @@ pub(crate) struct Header {
     pub(crate) subsystem_vendor_id: u16,
     pub(crate) subsystem_id: u16,
     pub(crate) command: u16,
+    /// `Interrupt Line`, `0x3c`.  Zero means the same thing it means in a real
+    /// header: no legacy IRQ is programmed here.
+    pub(crate) interrupt_line: u8,
+    /// `Interrupt Pin`, `0x3d`.  Zero means the function asserts no `INTx#`.
+    pub(crate) interrupt_pin: u8,
     pub(crate) bars: [u32; pci::BAR_SLOTS],
 }
 
@@ -46,6 +51,8 @@ impl Header {
             subsystem_vendor_id: pci::VENDOR_INTEL,
             subsystem_id: 0,
             command: 0x0000_0006,
+            interrupt_line: 0x00,
+            interrupt_pin: 0x00,
             bars: [0; pci::BAR_SLOTS],
         }
     }
@@ -69,6 +76,18 @@ impl Header {
     pub(crate) fn subsystem(mut self, vendor_id: u16, device_id: u16) -> Self {
         self.subsystem_vendor_id = vendor_id;
         self.subsystem_id = device_id;
+        self
+    }
+
+    /// Declare the two interrupt bytes, as firmware would have left them.
+    ///
+    /// They are in the same dword as the header's `Min_Gnt`/`Max_Lat`, which a
+    /// PCI Express function does not implement; the model puts the two bytes at
+    /// `0x3c` and `0x3d` and leaves the upper half zero, which is what a real
+    /// header answers with.
+    pub(crate) fn interrupt(mut self, line: u8, pin: u8) -> Self {
+        self.interrupt_line = line;
+        self.interrupt_pin = pin;
         self
     }
 
@@ -107,6 +126,13 @@ impl Header {
             (
                 pci::offset::SUBSYSTEM_VENDOR_ID,
                 u32::from(self.subsystem_vendor_id) | (u32::from(self.subsystem_id) << 16)
+            ),
+            // `Interrupt Line` and `Interrupt Pin` share this dword with the
+            // header's `Min_Gnt`/`Max_Lat`, which firmware leaves zero on a
+            // function that does not implement them.
+            (
+                pci::offset::INTERRUPT_LINE,
+                u32::from(self.interrupt_line) | (u32::from(self.interrupt_pin) << 8)
             ),
         ];
         for (slot, raw) in self.bars.iter().enumerate() {

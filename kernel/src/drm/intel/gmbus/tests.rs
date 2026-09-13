@@ -20,56 +20,48 @@
 use alloc::{vec, vec::Vec};
 
 use super::*;
-use crate::{
-    drm::intel::regs::{PROBE_WINDOW, RegisterWindow},
-    test_support::scheduler_test_context,
-};
+use crate::{drm::intel::regs::PROBE_WINDOW, test_support::scheduler_test_context};
 
-/// A register file standing in for the aperture, sized like the window the
-/// probe maps.
-struct RegisterFile {
+/// A register file standing in for the aperture, and a device model on top of
+/// it, with every knob a bring-up needs to turn but cannot turn on real
+/// hardware.
+///
+/// This is the single test double for a register file in this module tree: it
+/// implements [`Registers`], the same trait the mapped window implements and
+/// the same one the power, clock, PHY and PLL sequences are written against, so
+/// the GMBUS protocol and the hotplug block are driven here exactly as they
+/// would be against an aperture.
+///
+/// The model applies the two rules [`RegisterWindow`] applies -- a read-only
+/// register refuses a write, and a register outside the mapped window has no
+/// address -- so a test that gets a refusal is getting it for the same reason
+/// it would on hardware.
+pub(crate) struct FakeController {
+    state: core::cell::RefCell<FakeState>,
+    /// The window the "aperture" is mapped as.  Shrinking it is how the tests
+    /// reach the paths where a register has no address.
+    window_len: core::cell::Cell<usize>,
+}
+
+/// The controller's registers, and what the device behind them is doing.
+struct FakeState {
+    /// Register storage, addressed by offset like the real aperture.
     words: Vec<u32>,
-    window_len: usize,
-}
-
-impl RegisterFile {
-    fn new() -> Self {
-        Self {
-            words: vec![0; PROBE_WINDOW / 4],
-            window_len: PROBE_WINDOW,
-        }
-    }
-
-    /// The window this file presents, which is the only way it is reached.
-    fn window(&mut self) -> RegisterWindow {
-        // SAFETY: `words` is a live, 4-byte aligned buffer of exactly
-        // `PROBE_WINDOW` bytes, and `window_len` never exceeds it, so the
-        // window is inside the allocation for as long as it is used.  The
-        // buffer is owned by the test and is not aliased while a window over it
-        // exists.
-        unsafe { RegisterWindow::from_mapped(self.words.as_mut_ptr() as usize, self.window_len) }
-    }
-}
-
-/// The controller, and a monitor behind it, with every knob a bring-up needs to
-/// turn but cannot turn on real hardware.
-struct FakeController {
-    file: RegisterFile,
     /// The bytes the monitor answers with, from EEPROM address 0.
     eeprom: Vec<u8>,
     /// The same, for a transfer the model sees running at 50 kHz.  A sink that
     /// answers correctly only when the clock is slowed down is the case
     /// reference §11.1's rate-change recovery exists for.
     eeprom_at_50khz: Vec<u8>,
-    /// Which pin the monitor is wired to; `None` for a port with nothing on it.
+    /// Which pin the monitor is wired to; `None` for "any pin" and
+    /// [`FakeController::detach`] for a port with nothing on it.
     answering_pin: Option<Pin>,
-    /// Whether the device acknowledges at all.  A false here is what the
-    /// reference calls "GMBUS returns NAK on every address".
-    acknowledges: bool,
-    /// How many four-byte words this device produces before it stops raising
-    /// HW_RDY.  A number smaller than the transfer is a partial read.
+    /// Whether the monitor answers at all, whatever the pin.
+    attached: bool,
+    /// How many four-byte words the device produces before it stops raising
+    /// HW_RDY.  Fewer than the transfer is a partial read.
     words_available: usize,
-    /// Status bits the device holds.
+    /// Status the device holds.
     in_use: bool,
     active: bool,
     satoer: bool,
@@ -79,20 +71,12 @@ struct FakeController {
     /// NAK the first transaction only, as a passive adapter that needs a second
     /// try does.
     nak_first_transaction: bool,
-    /// Writes, in order, as `(offset, value)`.
-    writes: Vec<(u32, u32)>,
-    /// Every command word written to `GMBUS1`.
-    commands: Vec<u32>,
-    /// Transactions started: a command with `SW_RDY` that is not a stop cycle
-    /// and not an interrupt clear.
-    transactions: u32,
     /// Words served in the current transaction.
     served: usize,
     /// The EEPROM address of the current transaction's index cycle.
     index_offset: usize,
-    /// The rate field of the last pin selection.
+    /// The rate and pin fields of the last selection.
     rate_field: u32,
-    /// The pin field of the last pin selection.
     pin_field: u32,
     /// Whether a transaction is in progress.
     running: bool,
@@ -100,60 +84,191 @@ struct FakeController {
     /// protocol that reads data before the controller offers it would be
     /// building an EDID out of whatever the register happened to hold.
     reads_without_ready: u32,
+    /// Transactions started: a command with `SW_RDY` that is not a stop cycle
+    /// and not an interrupt clear.
+    transactions: u32,
+    /// Writes, in order, as `(offset, value)`.
+    writes: Vec<(u32, u32)>,
+    /// Every command word written to `GMBUS1`.
+    commands: Vec<u32>,
 }
 
 impl FakeController {
     /// A controller with a monitor on `pin` answering with `block`.
-    fn with_monitor(pin: Pin, block: &[u8; EDID_BLOCK_LEN]) -> Self {
+    pub(crate) fn with_monitor(pin: Pin, block: &[u8; EDID_BLOCK_LEN]) -> Self {
+        let controller = Self::bare();
+        controller.attach(pin);
+        controller.load_eeprom(block);
+        controller
+    }
+
+    /// A controller with a monitor that answers whatever pin is selected.
+    pub(crate) fn with_monitor_anywhere(block: &[u8; EDID_BLOCK_LEN]) -> Self {
+        let controller = Self::bare();
+        controller.load_eeprom(block);
+        controller
+    }
+
+    /// A controller with nothing behind it, which acknowledges.
+    pub(crate) fn bare() -> Self {
         Self {
-            eeprom: block.to_vec(),
-            eeprom_at_50khz: block.to_vec(),
-            answering_pin: Some(pin),
-            words_available: usize::MAX,
-            ..Self::bare()
+            state: core::cell::RefCell::new(FakeState {
+                words: vec![0; PROBE_WINDOW / 4],
+                eeprom: Vec::new(),
+                eeprom_at_50khz: Vec::new(),
+                answering_pin: None,
+                attached: true,
+                words_available: usize::MAX,
+                in_use: false,
+                active: false,
+                satoer: false,
+                stall: false,
+                stuck_after_stop: false,
+                nak_first_transaction: false,
+                served: 0,
+                index_offset: 0,
+                rate_field: 0,
+                pin_field: 0,
+                running: false,
+                reads_without_ready: 0,
+                transactions: 0,
+                writes: Vec::new(),
+                commands: Vec::new(),
+            }),
+            window_len: core::cell::Cell::new(PROBE_WINDOW),
         }
     }
 
-    /// A controller with nothing behind it.
-    fn bare() -> Self {
-        Self {
-            file: RegisterFile::new(),
-            eeprom: Vec::new(),
-            eeprom_at_50khz: Vec::new(),
-            answering_pin: None,
-            acknowledges: true,
-            words_available: usize::MAX,
-            in_use: false,
-            active: false,
-            satoer: false,
-            stall: false,
-            stuck_after_stop: false,
-            nak_first_transaction: false,
-            writes: Vec::new(),
-            commands: Vec::new(),
-            transactions: 0,
-            served: 0,
-            index_offset: 0,
-            rate_field: 0,
-            pin_field: 0,
-            running: false,
-            reads_without_ready: 0,
+    // -- the knobs a test turns ------------------------------------------
+
+    /// Wire the monitor to `pin`.
+    pub(crate) fn attach(&self, pin: Pin) {
+        self.state.borrow_mut().answering_pin = Some(pin);
+        self.state.borrow_mut().attached = true;
+    }
+
+    /// Unplug everything: every pin NAKs, as if no sink were on the pair.
+    pub(crate) fn detach(&self) {
+        let mut state = self.state.borrow_mut();
+        state.attached = false;
+    }
+
+    /// Make the monitor answer on every pin.
+    pub(crate) fn attach_anywhere(&self) {
+        self.state.borrow_mut().answering_pin = None;
+        self.state.borrow_mut().attached = true;
+    }
+
+    /// Load the EEPROM image the monitor answers with, at both rates.
+    pub(crate) fn load_eeprom(&self, bytes: &[u8]) {
+        let mut state = self.state.borrow_mut();
+        state.eeprom = bytes.to_vec();
+        state.eeprom_at_50khz = bytes.to_vec();
+    }
+
+    /// Load an image the monitor answers with only when the clock is at 50 kHz.
+    pub(crate) fn load_eeprom_at_50khz(&self, bytes: &[u8]) {
+        self.state.borrow_mut().eeprom_at_50khz = bytes.to_vec();
+    }
+
+    /// How many words the device will produce before it stops raising HW_RDY.
+    pub(crate) fn serve_words(&self, count: usize) {
+        self.state.borrow_mut().words_available = count;
+    }
+
+    /// NAK the first transaction only.
+    pub(crate) fn nak_first_transaction(&self) {
+        self.state.borrow_mut().nak_first_transaction = true;
+    }
+
+    /// Hold STALL_TIMEOUT set.  The controller reset does not clear it: a
+    /// secondary holding the clock is not something SW_CLR_INT fixes.
+    pub(crate) fn stall(&self) {
+        self.state.borrow_mut().stall = true;
+    }
+
+    /// Never clear ACTIVE after the stop cycle.
+    pub(crate) fn stick_bus(&self) {
+        self.state.borrow_mut().stuck_after_stop = true;
+    }
+
+    /// Report INUSE before the transaction.
+    pub(crate) fn in_use(&self) {
+        self.state.borrow_mut().in_use = true;
+    }
+
+    /// Change the mapped window's length.
+    pub(crate) fn set_window_len(&self, len: usize) {
+        self.window_len.set(len);
+    }
+
+    /// Write a register's storage directly, as the firmware would have left it.
+    pub(crate) fn set_word(&self, register: Register, value: u32) {
+        self.state.borrow_mut().words[register.offset() as usize / 4] = value;
+    }
+
+    /// Make `pin`'s AUX/DDC power well read back as on.
+    ///
+    /// The well is a register, so the test writes the register: anything else
+    /// would be testing the test's idea of the power well rather than the state
+    /// bit the driver reads.
+    pub(crate) fn set_well_on(&self, pin: Pin) {
+        self.set_word(ICL_PWR_WELL_CTL_AUX2, pin.aux_well().state_bit());
+    }
+
+    // -- what the device did ---------------------------------------------
+
+    /// Every value written to `register`, in order.
+    pub(crate) fn writes_to(&self, register: Register) -> Vec<u32> {
+        self.state
+            .borrow()
+            .writes
+            .iter()
+            .filter(|(offset, _)| *offset == register.offset())
+            .map(|(_, value)| *value)
+            .collect()
+    }
+
+    /// The last value written to `register`.
+    pub(crate) fn last_write(&self, register: Register) -> Option<u32> {
+        self.writes_to(register).pop()
+    }
+
+    /// Every command word written to `GMBUS1`.
+    pub(crate) fn commands(&self) -> Vec<u32> {
+        self.state.borrow().commands.clone()
+    }
+
+    /// The last transfer command: an index cycle, not a stop and not a clear.
+    pub(crate) fn last_transfer_command(&self) -> Option<u32> {
+        self.commands()
+            .into_iter()
+            .filter(|command| command & GMBUS1_CYCLE_INDEX != 0)
+            .next_back()
+    }
+
+    /// How many transactions the device was asked to run.
+    pub(crate) fn transactions(&self) -> u32 {
+        self.state.borrow().transactions
+    }
+
+    /// How many times data was read before the controller offered it.
+    pub(crate) fn reads_without_ready(&self) -> u32 {
+        self.state.borrow().reads_without_ready
+    }
+
+    /// What `register` holds now.
+    pub(crate) fn peek(&self, register: Register) -> Option<u32> {
+        let state = self.state.borrow();
+        let offset = register.offset() as usize;
+        if offset + register.width().bytes() > self.window_len.get() {
+            return None;
         }
+        state.words.get(offset / 4).copied()
     }
+}
 
-    /// The bytes the monitor is offering right now.
-    fn eeprom(&self) -> &[u8] {
-        if self.rate_field == Rate::Khz50.field() {
-            &self.eeprom_at_50khz
-        } else {
-            &self.eeprom
-        }
-    }
-
-    fn window(&mut self) -> RegisterWindow {
-        self.file.window()
-    }
-
+impl FakeState {
     /// `GMBUS2` as the device would drive it.
     fn status(&self) -> u32 {
         let mut status = 0;
@@ -170,7 +285,7 @@ impl FakeController {
             status |= GMBUS2_STALL_TIMEOUT;
         }
         if self.running
-            && self.acknowledges
+            && self.attached
             && self.words_available != 0
             && self.served < self.words_available
         {
@@ -186,7 +301,11 @@ impl FakeController {
             self.reads_without_ready += 1;
         }
         let base = self.index_offset + self.served * 4;
-        let eeprom = self.eeprom();
+        let eeprom = if self.rate_field == Rate::Khz50.field() {
+            &self.eeprom_at_50khz
+        } else {
+            &self.eeprom
+        };
         let mut word = 0u32;
         for byte in 0..4 {
             let value = eeprom.get(base + byte).copied().unwrap_or(0xff);
@@ -235,7 +354,7 @@ impl FakeController {
             None => false,
         };
         let nak_now = self.nak_first_transaction && self.transactions == 1;
-        if !self.acknowledges || wrong_pin || nak_now {
+        if !self.attached || wrong_pin || nak_now {
             self.satoer = true;
             self.running = false;
             self.active = false;
@@ -244,69 +363,64 @@ impl FakeController {
             self.active = true;
         }
     }
-
-    /// Every value written to `register`, in order.
-    fn writes_to(&self, register: Register) -> Vec<u32> {
-        self.writes
-            .iter()
-            .filter(|(offset, _)| *offset == register.offset())
-            .map(|(_, value)| *value)
-            .collect()
-    }
-
-    /// The last value written to `register`.
-    fn last_write(&self, register: Register) -> Option<u32> {
-        self.writes_to(register).pop()
-    }
-
-    /// What `register` holds now, read through the real window.
-    fn peek(&mut self, register: Register) -> Option<u32> {
-        self.window().read(register)
-    }
-
-    /// Make `pin`'s AUX/DDC power well read back as on.
-    ///
-    /// The well is a register, so the test writes the register: anything else
-    /// would be testing the test's idea of the power well rather than the
-    /// state bit the driver reads.
-    fn set_well_on(&mut self, pin: Pin) {
-        let word = ICL_PWR_WELL_CTL_AUX2.offset() as usize / 4;
-        self.file.words[word] |= pin.aux_well().state_bit();
-    }
 }
 
-impl BusRegisters for FakeController {
-    fn read(&mut self, register: Register) -> Option<u32> {
+impl Registers for FakeController {
+    fn read(&self, register: Register) -> Option<u32> {
+        let mut state = self.state.borrow_mut();
         if register.offset() == GMBUS2.offset() {
-            return Some(self.status());
+            return Some(state.status());
         }
         if register.offset() == GMBUS3.offset() {
-            return Some(self.take_word());
+            return Some(state.take_word());
         }
-        self.window().read(register)
+        let offset = register.offset() as usize;
+        if offset + register.width().bytes() > self.window_len.get() {
+            return None;
+        }
+        state.words.get(offset / 4).copied()
     }
 
-    fn write(&mut self, register: Register, value: u32) -> bool {
-        // The real window enforces the register table's access rules, so a
-        // write to a read-only register is refused here for the same reason it
-        // would be on hardware.
-        if !self.window().write(register, value) {
+    fn read64(&self, register: Register) -> Option<u64> {
+        if register.width() != crate::drm::intel::regs::Width::Bits64 {
+            return None;
+        }
+        let low = u64::from(self.read(register)?);
+        let high = u64::from(self.read(Register::read_only(
+            "SECOND_HALF",
+            register.offset() + 4,
+            register.meaning(),
+            None,
+        ))?);
+        Some(low | (high << 32))
+    }
+
+    fn write(&self, register: Register, value: u32) -> bool {
+        // The two rules the mapped window applies, applied here: this is what
+        // makes a refusal in a test mean the same thing as a refusal on
+        // hardware.
+        if !register.is_writable() {
             return false;
         }
-        self.writes.push((register.offset(), value));
+        if register.offset() as usize + register.width().bytes() > self.window_len.get() {
+            return false;
+        }
+        let mut state = self.state.borrow_mut();
+        state.words[register.offset() as usize / 4] = value;
+        state.writes.push((register.offset(), value));
         if register.offset() == GMBUS1.offset() {
-            self.command(value);
+            state.command(value);
         }
         if register.offset() == GMBUS0.offset() {
-            self.pin_field = value & GMBUS0_PIN_MASK;
-            self.rate_field = (value & GMBUS0_RATE_MASK) >> GMBUS0_RATE_SHIFT;
+            state.pin_field = value & GMBUS0_PIN_MASK;
+            state.rate_field = (value & GMBUS0_RATE_MASK) >> GMBUS0_RATE_SHIFT;
         }
         true
     }
 }
 
 /// A clock the test owns, so that a 50 ms timeout costs microseconds.
-struct FakeClock {
+pub(crate) struct FakeClock {
     micros: core::cell::Cell<u64>,
 }
 
@@ -317,7 +431,7 @@ struct FakeClock {
 const CLOCK_STEP_MICROS: u64 = 25;
 
 impl FakeClock {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             micros: core::cell::Cell::new(0),
         }
@@ -338,7 +452,7 @@ impl PollTimer for FakeClock {
 /// declared extension count, and a checksum that makes the 128 bytes sum to
 /// zero.  The descriptors are left as zeroes, which is not a monitor anybody
 /// would ship, but every check the transport makes passes.
-fn valid_edid(extension_count: u8) -> [u8; EDID_BLOCK_LEN] {
+pub(crate) fn valid_edid(extension_count: u8) -> [u8; EDID_BLOCK_LEN] {
     let mut block = [0u8; EDID_BLOCK_LEN];
     block[..8].copy_from_slice(&EDID_HEADER);
     block[8] = 0x04;
@@ -354,7 +468,7 @@ fn valid_edid(extension_count: u8) -> [u8; EDID_BLOCK_LEN] {
 }
 
 /// Read one block from a fake, with the notes, the way the driver does.
-fn read(controller: &mut FakeController, pin: Pin) -> (Result<EdidBytes, GmbusError>, BusNotes) {
+fn read(controller: &FakeController, pin: Pin) -> (Result<EdidBytes, GmbusError>, BusNotes) {
     let clock = FakeClock::new();
     let mut notes = BusNotes::default();
     let result = read_edid_with(controller, &clock, pin, &mut notes);
@@ -440,7 +554,7 @@ fn the_command_word_is_the_one_the_sources_say() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
     let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
-    let (result, notes) = read(&mut controller, Pin::DdiA);
+    let (result, notes) = read(&controller, Pin::DdiA);
     assert_eq!(result, Ok(EdidBytes { bytes: block }), "{notes:?}");
 
     // Pin select: rate 100 kHz (field 0) and pin 1.  GMBUS0 is written more
@@ -464,7 +578,7 @@ fn the_command_word_is_the_one_the_sources_say() {
     // software ready.  `[I915]` builds exactly this at
     // `display/intel_gmbus.c:596-611` and writes it at `:451-452`.
     let command = *controller
-        .commands
+        .commands()
         .first()
         .expect("a command word was written");
     assert_eq!(
@@ -499,12 +613,12 @@ fn the_command_word_is_the_one_the_sources_say() {
 
     // The stop cycle is issued after the data, unconditionally ([I915]
     // `intel_gmbus.c:660-664`).
-    let stop = *controller.commands.last().expect("a stop cycle");
+    let stop = *controller.commands().last().expect("a stop cycle");
     assert_eq!(stop & GMBUS1_CYCLE_MASK, GMBUS1_CYCLE_STOP);
     // The interrupt mask is left cleared: this driver polls.
     assert_eq!(controller.writes_to(GMBUS4), vec![0]);
     // And the protocol never took data the controller had not offered.
-    assert_eq!(controller.reads_without_ready, 0);
+    assert_eq!(controller.reads_without_ready(), 0);
 }
 
 #[test]
@@ -513,7 +627,7 @@ fn the_command_selects_the_pin_the_caller_asked_for() {
     for pin in Pin::DDC {
         let block = valid_edid(0);
         let mut controller = FakeController::with_monitor(pin, &block);
-        assert_eq!(read(&mut controller, pin).0, Ok(EdidBytes { bytes: block }));
+        assert_eq!(read(&controller, pin).0, Ok(EdidBytes { bytes: block }));
         assert!(
             controller.writes_to(GMBUS0).contains(&pin.index()),
             "{} should have selected GMBUS0[4:0] = {}",
@@ -538,14 +652,14 @@ fn a_valid_block_is_returned_byte_for_byte() {
     block[EDID_BLOCK_LEN - 1] = 0u8.wrapping_sub(sum);
 
     let mut controller = FakeController::with_monitor(Pin::DdiB, &block);
-    let (result, notes) = read(&mut controller, Pin::DdiB);
+    let (result, notes) = read(&controller, Pin::DdiB);
     let bytes = result.expect("a valid block must read");
     assert_eq!(bytes.as_slice(), &block[..]);
     assert_eq!(bytes.bytes(), &block);
     assert_eq!(bytes.extension_count(), 1);
     assert!(notes.is_quiet(), "{notes:?}");
     assert_eq!(notes.attempts, 1);
-    assert_eq!(controller.reads_without_ready, 0);
+    assert_eq!(controller.reads_without_ready(), 0);
 }
 
 #[test]
@@ -555,13 +669,13 @@ fn a_bad_checksum_is_named_and_retried_at_a_lower_rate() {
     let good = valid_edid(0);
     let mut corrupt = good;
     corrupt[EDID_BLOCK_LEN - 1] ^= 0x5a;
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &corrupt);
+    let controller = FakeController::with_monitor(Pin::DdiA, &corrupt);
     // A second controller whose sink only answers correctly at 50 kHz: the
     // reference's recovery (§11.1, "Re-read; if persistent, lower the rate").
-    let mut recovered = FakeController::with_monitor(Pin::DdiA, &corrupt);
-    recovered.eeprom_at_50khz = good.to_vec();
+    let recovered = FakeController::with_monitor(Pin::DdiA, &corrupt);
+    recovered.load_eeprom_at_50khz(&good);
 
-    let (result, notes) = read(&mut controller, Pin::DdiA);
+    let (result, notes) = read(&controller, Pin::DdiA);
     let error = result.expect_err("a corrupt block must not be returned");
     assert!(matches!(error, GmbusError::EdidChecksum { sum, .. } if sum != 0));
     assert_eq!(notes.attempts, 2, "the read is retried once");
@@ -575,7 +689,7 @@ fn a_bad_checksum_is_named_and_retried_at_a_lower_rate() {
         error.describe()
     );
 
-    let (result, notes) = read(&mut recovered, Pin::DdiA);
+    let (result, notes) = read(&recovered, Pin::DdiA);
     assert_eq!(result, Ok(EdidBytes { bytes: good }), "{notes:?}");
     assert_eq!(notes.attempts, 2);
 }
@@ -585,10 +699,9 @@ fn a_bad_header_is_named_and_not_reported_as_a_checksum_problem() {
     let _guard = scheduler_test_context();
     // All zeroes: the checksum is right (it is zero) and the header is not, so
     // this isolates the header check from the checksum check.
-    let mut block = [0u8; EDID_BLOCK_LEN];
-    block[0] = 0x00;
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
-    let (result, _) = read(&mut controller, Pin::DdiA);
+    let block = [0u8; EDID_BLOCK_LEN];
+    let controller = FakeController::with_monitor(Pin::DdiA, &block);
+    let (result, _) = read(&controller, Pin::DdiA);
     match result {
         Err(GmbusError::EdidHeader { pin, header }) => {
             assert_eq!(pin, Pin::DdiA);
@@ -606,8 +719,8 @@ fn a_floating_bus_is_named_rather_than_called_a_bad_header() {
     // differ (§11.1).
     let block = [0xffu8; EDID_BLOCK_LEN];
     let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
-    controller.answering_pin = None;
-    let (result, _) = read(&mut controller, Pin::DdiA);
+    controller.attach_anywhere();
+    let (result, _) = read(&controller, Pin::DdiA);
     assert_eq!(result, Err(GmbusError::BusFloating { pin: Pin::DdiA }));
 }
 
@@ -617,8 +730,8 @@ fn a_bus_that_never_offers_data_times_out_and_is_left_released() {
     let block = valid_edid(0);
     let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
     // The controller accepts the command and then says nothing.
-    controller.words_available = 0;
-    let (result, _) = read(&mut controller, Pin::DdiA);
+    controller.serve_words(0);
+    let (result, _) = read(&controller, Pin::DdiA);
     match result {
         Err(GmbusError::ReadyTimeout {
             pin,
@@ -639,14 +752,14 @@ fn a_bus_that_never_offers_data_times_out_and_is_left_released() {
     // the controller was reset through SW_CLR_INT.
     assert_eq!(controller.peek(GMBUS0), Some(0));
     assert_eq!(controller.peek(GMBUS4), Some(0));
-    let commands = &controller.commands;
+    let commands = controller.commands();
     assert!(
         commands
             .iter()
             .any(|command| command & GMBUS1_SW_CLR_INT != 0),
         "the latched error must be cleared"
     );
-    assert_eq!(controller.transactions, 2, "the timeout is retried once");
+    assert_eq!(controller.transactions(), 2, "the timeout is retried once");
 }
 
 #[test]
@@ -655,15 +768,15 @@ fn a_partial_read_never_becomes_a_short_block() {
     let block = valid_edid(0);
     let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
     // Two words out of thirty-two, then silence.
-    controller.words_available = 2;
-    let (result, _) = read(&mut controller, Pin::DdiA);
+    controller.serve_words(2);
+    let (result, _) = read(&controller, Pin::DdiA);
     assert!(
         matches!(result, Err(GmbusError::ReadyTimeout { .. })),
         "a partial transfer is a failure, not a short block: {result:?}"
     );
     // The bytes the device did send are not available to anybody: there is no
     // partial `EdidBytes` to be mistaken for a block.
-    assert_eq!(controller.reads_without_ready, 0);
+    assert_eq!(controller.reads_without_ready(), 0);
 }
 
 #[test]
@@ -672,10 +785,10 @@ fn a_nak_with_the_power_well_off_names_the_well() {
     // The case the brief and the reference both single out: GMBUS NAKs on
     // every address because the AUX/DDC power well for that pin pair is not
     // enabled.  It must be that, and not a timeout.
-    let mut controller = FakeController::bare();
-    controller.acknowledges = false;
-    controller.answering_pin = Some(Pin::DdiB);
-    let (result, _) = read(&mut controller, Pin::DdiB);
+    let controller = FakeController::bare();
+    // Nothing acknowledges anything: the reference's "NAK on every address".
+    controller.detach();
+    let (result, _) = read(&controller, Pin::DdiB);
     match result {
         Err(GmbusError::AuxWellDown {
             pin, well, address, ..
@@ -697,11 +810,10 @@ fn a_nak_with_the_power_well_off_names_the_well() {
 #[test]
 fn a_nak_with_the_power_well_on_is_only_a_nak() {
     let _guard = scheduler_test_context();
-    let mut controller = FakeController::bare();
-    controller.acknowledges = false;
-    controller.answering_pin = Some(Pin::DdiA);
+    let controller = FakeController::bare();
+    controller.detach();
     controller.set_well_on(Pin::DdiA);
-    let (result, _) = read(&mut controller, Pin::DdiA);
+    let (result, _) = read(&controller, Pin::DdiA);
     match result {
         Err(GmbusError::NoAck { well, address, .. }) => {
             assert_eq!(well, AuxWellReading::On);
@@ -719,11 +831,11 @@ fn a_nak_is_retried_once_and_a_late_answer_is_used() {
     let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
     // "Passive adapters sometimes NAK the first probe" ([I915]
     // `display/intel_gmbus.c:714-725`).
-    controller.nak_first_transaction = true;
-    let (result, notes) = read(&mut controller, Pin::DdiA);
+    controller.nak_first_transaction();
+    let (result, notes) = read(&controller, Pin::DdiA);
     assert_eq!(result, Ok(EdidBytes { bytes: block }));
     assert_eq!(notes.attempts, 2);
-    assert_eq!(controller.transactions, 2);
+    assert_eq!(controller.transactions(), 2);
 }
 
 #[test]
@@ -732,8 +844,8 @@ fn a_stuck_bus_is_named_and_the_recovery_releases_the_pin() {
     let block = valid_edid(0);
     let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
     // The transaction completes and the bus never goes idle afterwards.
-    controller.stuck_after_stop = true;
-    let (result, _) = read(&mut controller, Pin::DdiA);
+    controller.stick_bus();
+    let (result, _) = read(&controller, Pin::DdiA);
     match result {
         Err(GmbusError::BusStuck {
             pin,
@@ -753,8 +865,8 @@ fn a_stuck_bus_is_named_and_the_recovery_releases_the_pin() {
 fn a_stall_is_reported_with_the_status_bit_that_says_so() {
     let _guard = scheduler_test_context();
     let mut controller = FakeController::bare();
-    controller.stall = true;
-    let (result, _) = read(&mut controller, Pin::DdiA);
+    controller.stall();
+    let (result, _) = read(&controller, Pin::DdiA);
     match result {
         Err(GmbusError::BusStuck { status, .. }) => {
             assert_ne!(status & GMBUS2_STALL_TIMEOUT, 0);
@@ -777,8 +889,8 @@ fn the_firmware_leaving_the_index_register_in_two_byte_mode_is_recorded() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
     let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
-    controller.file.words[GMBUS5.offset() as usize / 4] = GMBUS5_2BYTE_INDEX_EN | 0x1234;
-    let (result, notes) = read(&mut controller, Pin::DdiA);
+    controller.set_word(GMBUS5, GMBUS5_2BYTE_INDEX_EN | 0x1234);
+    let (result, notes) = read(&controller, Pin::DdiA);
     assert_eq!(result, Ok(EdidBytes { bytes: block }));
     assert!(notes.stale_two_byte_index);
     assert!(!notes.is_quiet());
@@ -798,8 +910,8 @@ fn a_bus_already_in_use_is_recorded() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
     let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
-    controller.in_use = true;
-    let (result, notes) = read(&mut controller, Pin::DdiA);
+    controller.in_use();
+    let (result, notes) = read(&controller, Pin::DdiA);
     assert_eq!(result, Ok(EdidBytes { bytes: block }));
     assert!(notes.was_in_use);
 }
@@ -812,8 +924,8 @@ fn a_window_that_stops_before_the_index_register_is_named() {
     // is interpreted is the one that is missing.
     let block = valid_edid(0);
     let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
-    controller.file.window_len = GMBUS5.offset() as usize;
-    let (result, _) = read(&mut controller, Pin::DdiA);
+    controller.set_window_len(GMBUS5.offset() as usize);
+    let (result, _) = read(&controller, Pin::DdiA);
     assert_eq!(
         result,
         Err(GmbusError::WindowTooSmall { register: "GMBUS5" })
@@ -825,8 +937,8 @@ fn a_window_that_does_not_reach_gmbus_at_all_refuses_the_write() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
     let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
-    controller.file.window_len = 0x100;
-    let (result, _) = read(&mut controller, Pin::DdiA);
+    controller.set_window_len(0x100);
+    let (result, _) = read(&controller, Pin::DdiA);
     assert_eq!(
         result,
         Err(GmbusError::RegisterRefused { register: "GMBUS0" })
@@ -834,7 +946,7 @@ fn a_window_that_does_not_reach_gmbus_at_all_refuses_the_write() {
 }
 
 #[test]
-fn reading_a_later_block_asks_the_eeprom_for_that_offset() {
+fn reading_a_later_block_asks_the_eeprom_for_that_offset_and_takes_its_checksum() {
     let _guard = scheduler_test_context();
     let base = valid_edid(1);
     let extension = {
@@ -849,30 +961,28 @@ fn reading_a_later_block_asks_the_eeprom_for_that_offset() {
     let mut controller = FakeController::with_monitor(Pin::DdiA, &base);
     // The monitor's EEPROM is one image: the base block at 0 and the extension
     // at 0x80.
-    controller.eeprom.resize(2 * EDID_BLOCK_LEN, 0);
-    controller.eeprom[..EDID_BLOCK_LEN].copy_from_slice(&base);
-    controller.eeprom[EDID_BLOCK_LEN..].copy_from_slice(&extension);
-    controller.eeprom_at_50khz = controller.eeprom.clone();
+    let mut eeprom = alloc::vec![0u8; 2 * EDID_BLOCK_LEN];
+    eeprom[..EDID_BLOCK_LEN].copy_from_slice(&base);
+    eeprom[EDID_BLOCK_LEN..].copy_from_slice(&extension);
+    controller.load_eeprom(&eeprom);
 
     let clock = FakeClock::new();
     let mut notes = BusNotes::default();
     let block = read_block(
-        &mut controller,
+        &controller,
         &clock,
         Pin::DdiA,
         DDC_ADDRESS,
         EDID_EXTENSION_OFFSET,
+        Block::Extension,
         &mut notes,
     )
     .expect("the extension block must read");
     assert_eq!(block.bytes(), &extension);
     // The second transaction's index cycle carried 0x80.  The *last* command
     // is the stop cycle, so this looks for the last transfer command.
-    let command = *controller
-        .commands
-        .iter()
-        .filter(|command| *command & GMBUS1_CYCLE_INDEX != 0)
-        .next_back()
+    let command = controller
+        .last_transfer_command()
         .expect("a transfer command");
     assert_eq!(
         (command & GMBUS1_SLAVE_INDEX_MASK) >> GMBUS1_SLAVE_INDEX_SHIFT,
@@ -894,23 +1004,23 @@ fn the_extension_read_follows_the_count_in_the_base_block() {
         block
     };
     let mut controller = FakeController::with_monitor(Pin::DdiA, &base);
-    controller.eeprom.resize(2 * EDID_BLOCK_LEN, 0);
-    controller.eeprom[..EDID_BLOCK_LEN].copy_from_slice(&base);
-    controller.eeprom[EDID_BLOCK_LEN..].copy_from_slice(&extension);
-    controller.eeprom_at_50khz = controller.eeprom.clone();
+    let mut eeprom = alloc::vec![0u8; 2 * EDID_BLOCK_LEN];
+    eeprom[..EDID_BLOCK_LEN].copy_from_slice(&base);
+    eeprom[EDID_BLOCK_LEN..].copy_from_slice(&extension);
+    controller.load_eeprom(&eeprom);
 
-    let block = read_edid_extension_with(&mut controller, &FakeClock::new(), Pin::DdiA)
+    let block = read_edid_extension_with(&controller, &FakeClock::new(), Pin::DdiA)
         .expect("the base and its declared extension must read");
     assert_eq!(block.map(|block| *block.bytes()), Some(extension));
     // The extension is a second transaction at EEPROM address 0x80.
-    assert_eq!(controller.transactions, 2);
+    assert_eq!(controller.transactions(), 2);
 
     // A sink that declares no extension costs one transaction and no guess.
-    let mut plain = FakeController::with_monitor(Pin::DdiA, &valid_edid(0));
-    let none = read_edid_extension_with(&mut plain, &FakeClock::new(), Pin::DdiA)
+    let plain = FakeController::with_monitor(Pin::DdiA, &valid_edid(0));
+    let none = read_edid_extension_with(&plain, &FakeClock::new(), Pin::DdiA)
         .expect("a base block with no extensions is a valid answer");
     assert_eq!(none, None);
-    assert_eq!(plain.transactions, 1);
+    assert_eq!(plain.transactions(), 1);
 }
 
 #[test]
@@ -919,7 +1029,7 @@ fn the_sink_probe_tries_every_ddc_pin_and_says_which_one_answered() {
     let block = valid_edid(0);
     let mut controller = FakeController::with_monitor(Pin::DdiB, &block);
     controller.set_well_on(Pin::DdiA);
-    let probe = probe_sink_with(&mut controller, &FakeClock::new());
+    let probe = probe_sink_with(&controller, &FakeClock::new());
     assert_eq!(probe.found(), Some(Pin::DdiB));
     assert_eq!(probe.edid(), Some(EdidBytes { bytes: block }));
     assert_eq!(probe.outcomes.len(), Pin::DDC.len());
@@ -940,8 +1050,8 @@ fn the_sink_probe_tries_every_ddc_pin_and_says_which_one_answered() {
 fn a_probe_with_no_monitor_says_so_on_every_pin() {
     let _guard = scheduler_test_context();
     let mut controller = FakeController::bare();
-    controller.acknowledges = false;
-    let probe = probe_sink_with(&mut controller, &FakeClock::new());
+    controller.detach();
+    let probe = probe_sink_with(&controller, &FakeClock::new());
     assert_eq!(probe.found(), None);
     assert_eq!(probe.edid(), None);
     let text = probe.render();
@@ -989,7 +1099,7 @@ fn a_transfer_length_outside_one_block_is_refused() {
     let clock = FakeClock::new();
     let mut notes = BusNotes::default();
     let mut bus = Bus {
-        registers: &mut controller,
+        registers: &controller,
         timer: &clock,
         pin: Pin::DdiA,
         rate: Rate::DEFAULT,
@@ -1008,13 +1118,13 @@ fn a_transfer_length_outside_one_block_is_refused() {
         Err(GmbusError::WindowTooSmall { .. })
     ));
     // Nothing was written: the refusal happens before the bus is touched.
-    assert!(controller.commands.is_empty());
+    assert!(controller.commands().is_empty());
 }
 
 #[test]
-fn edid_validation_rejects_exactly_the_two_things_it_checks() {
+fn edid_validation_checks_the_base_blocks_header_and_every_blocks_checksum() {
     let block = valid_edid(0);
-    assert_eq!(validate_edid(&block), Ok(()));
+    assert_eq!(validate_block(&block, Block::Base), Ok(()));
     assert!(!all_ones(&block));
 
     let mut bad_header = block;
@@ -1026,15 +1136,29 @@ fn edid_validation_rejects_exactly_the_two_things_it_checks() {
         .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
     bad_header[EDID_BLOCK_LEN - 1] = 0u8.wrapping_sub(sum);
     assert!(matches!(
-        validate_edid(&bad_header),
+        validate_block(&bad_header, Block::Base),
         Err(EdidFault::Header(_))
     ));
 
     let mut bad_checksum = block;
     bad_checksum[0x20] ^= 0xff;
     assert!(matches!(
-        validate_edid(&bad_checksum),
+        validate_block(&bad_checksum, Block::Base),
         Err(EdidFault::Checksum(_))
+    ));
+    // The header belongs to the base block only: an extension block starts with
+    // its own tag byte, so a reader that demanded the header of every block
+    // would reject every extension block in existence.
+    let mut extension = [0u8; EDID_BLOCK_LEN];
+    extension[0] = 0x70;
+    let sum = extension[..EDID_BLOCK_LEN - 1]
+        .iter()
+        .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    extension[EDID_BLOCK_LEN - 1] = 0u8.wrapping_sub(sum);
+    assert_eq!(validate_block(&extension, Block::Extension), Ok(()));
+    assert!(matches!(
+        validate_block(&extension, Block::Base),
+        Err(EdidFault::Header(_))
     ));
     assert!(all_ones(&[0xffu8; EDID_BLOCK_LEN]));
 }

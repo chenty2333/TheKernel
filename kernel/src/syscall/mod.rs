@@ -12,7 +12,7 @@ mod seccomp;
 pub(crate) mod signal;
 mod sync;
 mod sys;
-mod task;
+pub(crate) mod task;
 mod time;
 
 use core::time::Duration;
