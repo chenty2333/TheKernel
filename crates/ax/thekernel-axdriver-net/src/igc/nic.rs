@@ -582,7 +582,7 @@ fn allocate<H: IgcHal>(
     let Some((bus, cpu)) = H::dma_alloc(pages) else {
         return Err(DevError::NoMemory);
     };
-    if cpu.as_ptr() as usize % align != 0 {
+    if !(cpu.as_ptr() as usize).is_multiple_of(align) {
         // SAFETY: the allocation came from `H::dma_alloc` and is being given
         // straight back because it does not satisfy the alignment the rings
         // need.

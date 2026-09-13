@@ -1652,6 +1652,15 @@ impl RegisterWindow {
         self.len
     }
 
+    /// Whether the window is empty.
+    ///
+    /// A window a caller would ever take is not, but the pair exists so that
+    /// the length is not the only way to ask, which is what a reader of
+    /// `len()` expects to find beside it.
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
     /// The address the window starts at.
     pub const fn base(self) -> usize {
         self.base
