@@ -54,6 +54,7 @@ mod clk;
 pub(crate) mod debugfs;
 mod id;
 mod pci;
+mod phy;
 mod probe;
 mod regs;
 

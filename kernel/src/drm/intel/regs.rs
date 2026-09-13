@@ -738,7 +738,9 @@ pub(crate) const XELPD_DISPLAY_ERR_FATAL_MASK: Register = Register::read_write(
 /// | `PORT_CL_DW*` | `4 * dw` | `DW5` |
 /// | `PORT_COMP_DW*` | `0x100 + 4 * dw` | `DW0`, `DW1`, `DW3`, `DW8`, `DW9`, `DW10` |
 /// | `PORT_TX_DW*` (group) | `0x680 + 4 * dw` | `DW8` |
+/// | `PORT_TX_DW*` (lane 0) | `0x880 + 4 * dw` | `DW8`, read only |
 /// | `PORT_PCS_DW*` (group) | `0x600 + 4 * dw` | `DW1` |
+/// | `PORT_PCS_DW*` (lane 0) | `0x800 + 4 * dw` | `DW1`, read only |
 ///
 /// The `PORT_TX_DW*` group base is a correction to the reference document: its
 /// §8.2 table gives `+0x400` for the `PORT_TX` group, but the header it cites
@@ -759,13 +761,18 @@ pub(crate) struct ComboPhyRegisters {
     pub(crate) comp_dw10: Register,
     pub(crate) tx_dw8: Register,
     pub(crate) pcs_dw1: Register,
+    /// Lane 0's `PORT_TX_DW8`, which is where the initialisation *reads* the
+    /// value it then writes to the group register.
+    pub(crate) tx_dw8_ln0: Register,
+    /// Lane 0's `PORT_PCS_DW1`, read for the same reason.
+    pub(crate) pcs_dw1_ln0: Register,
     pub(crate) cl_dw5: Register,
     pub(crate) phy_misc: Register,
 }
 
 impl ComboPhyRegisters {
     /// Every register of this PHY, for the table's own consistency test.
-    pub(crate) const fn all(self) -> [Register; 10] {
+    pub(crate) const fn all(self) -> [Register; 12] {
         [
             self.comp_dw0,
             self.comp_dw1,
@@ -775,6 +782,8 @@ impl ComboPhyRegisters {
             self.comp_dw10,
             self.tx_dw8,
             self.pcs_dw1,
+            self.tx_dw8_ln0,
+            self.pcs_dw1_ln0,
             self.cl_dw5,
             self.phy_misc,
         ]
@@ -793,6 +802,8 @@ pub(crate) const COMBO_PHY_A: ComboPhyRegisters = ComboPhyRegisters {
     comp_dw10: Register::read_write("PORT_COMP_DW10(A)", 0x16_2128, Meaning::BringUp, None),
     tx_dw8: Register::read_write("PORT_TX_DW8(A)", 0x16_26A0, Meaning::BringUp, None),
     pcs_dw1: Register::read_write("PORT_PCS_DW1(A)", 0x16_2604, Meaning::BringUp, None),
+    tx_dw8_ln0: Register::read_only("PORT_TX_DW8_LN0(A)", 0x16_28A0, Meaning::BringUp, None),
+    pcs_dw1_ln0: Register::read_only("PORT_PCS_DW1_LN0(A)", 0x16_2804, Meaning::BringUp, None),
     cl_dw5: Register::read_write("PORT_CL_DW5(A)", 0x16_2014, Meaning::BringUp, None),
     phy_misc: Register::read_write("ICL_PHY_MISC(A)", 0x6_4C00, Meaning::BringUp, None),
 };
@@ -809,6 +820,8 @@ pub(crate) const COMBO_PHY_B: ComboPhyRegisters = ComboPhyRegisters {
     comp_dw10: Register::read_write("PORT_COMP_DW10(B)", 0x6_C128, Meaning::BringUp, None),
     tx_dw8: Register::read_write("PORT_TX_DW8(B)", 0x6_C6A0, Meaning::BringUp, None),
     pcs_dw1: Register::read_write("PORT_PCS_DW1(B)", 0x6_C604, Meaning::BringUp, None),
+    tx_dw8_ln0: Register::read_only("PORT_TX_DW8_LN0(B)", 0x6_C8A0, Meaning::BringUp, None),
+    pcs_dw1_ln0: Register::read_only("PORT_PCS_DW1_LN0(B)", 0x6_C804, Meaning::BringUp, None),
     cl_dw5: Register::read_write("PORT_CL_DW5(B)", 0x6_C014, Meaning::BringUp, None),
     phy_misc: Register::read_write("ICL_PHY_MISC(B)", 0x6_4C04, Meaning::BringUp, None),
 };
@@ -1302,7 +1315,11 @@ mod tests {
                 "HSW_PWR_WELL_CTL3",
                 "HSW_PWR_WELL_CTL4",
                 "PORT_COMP_DW3(A)",
+                "PORT_TX_DW8_LN0(A)",
+                "PORT_PCS_DW1_LN0(A)",
                 "PORT_COMP_DW3(B)",
+                "PORT_TX_DW8_LN0(B)",
+                "PORT_PCS_DW1_LN0(B)",
             ]
         );
     }
@@ -1317,7 +1334,9 @@ mod tests {
         // address `PORT_TX_DW8`.
         const COMP: u32 = 0x100;
         const TX_GRP: u32 = 0x680;
+        const TX_LN0: u32 = 0x880;
         const PCS_GRP: u32 = 0x600;
+        const PCS_LN0: u32 = 0x800;
         for (phy, base) in [(COMBO_PHY_A, 0x16_2000), (COMBO_PHY_B, 0x6_C000)] {
             let name = phy.port;
             assert_eq!(
@@ -1356,6 +1375,24 @@ mod tests {
                 base + PCS_GRP + 4 * 1,
                 "PCS_DW1({name})"
             );
+            // The lane 0 registers are read and never written: the
+            // initialisation takes its starting value from lane 0 and writes
+            // the result to the group register, which is what `[I915]`
+            // `icl_combo_phys_init` does (`display/intel_combo_phy.c:350-359`).
+            // A group write and a lane write are different facts, so the
+            // distinction is kept rather than collapsed into one register.
+            assert_eq!(
+                phy.tx_dw8_ln0.offset(),
+                base + TX_LN0 + 4 * 8,
+                "TX_DW8_LN0({name})"
+            );
+            assert_eq!(
+                phy.pcs_dw1_ln0.offset(),
+                base + PCS_LN0 + 4 * 1,
+                "PCS_DW1_LN0({name})"
+            );
+            assert!(!phy.tx_dw8_ln0.is_writable(), "TX_DW8_LN0({name})");
+            assert!(!phy.pcs_dw1_ln0.is_writable(), "PCS_DW1_LN0({name})");
             assert_eq!(phy.cl_dw5.offset(), base + 4 * 5, "CL_DW5({name})");
         }
         // `ICL_PHY_MISC` is the exception: it lives in the DDI block, not in
