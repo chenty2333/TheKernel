@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools.product_state import (
     Artifacts, Variant, ProductError, TARGET, PLATFORM, MEMORY_RE,
+    MACHINE_PROFILES, machine_profile,
     state_root, validate_storage, state_lock, serialized_build, isolated_run,
     artifact_config_stamp, artifact_config_key, artifact_input_key, validate_artifact_config,
     rootfs_stamp_path, rootfs_fingerprint,
@@ -50,7 +51,11 @@ from tools.qemu_runner.profiles import BENCHMARK_FAULTS, BENCHMARK_PROFILES, GRA
 
 
 PRODUCT_FEATURE = "x86-product"
-PRODUCT_MAX_CPUS = 4
+# The compile-time CPU admission limit now comes from the selected machine
+# profile: a four-slot product ELF is the q35 shape, and a real eight-core
+# machine needs eight.  `MachineProfile.max_cpus` is the single source of
+# truth; this name is kept because `--smp` validation reads it.
+PRODUCT_MAX_CPUS = machine_profile("q35-uefi").max_cpus
 SYSTEM_TEST_SHUTDOWN_COMMANDS = "/bin/busybox poweroff -f\nexit\n"
 MAX_KERNEL_BYTES = 800 * 1024 * 1024
 KERNEL_LOAD_PADDR = 2 * 1024 * 1024
@@ -78,11 +83,24 @@ def parse_variant(args: argparse.Namespace) -> Variant:
         raise ProductError(
             f"--memory must not exceed {X86_64_MAX_MEMORY_BYTES // GIB}G on x86_64"
         )
-    if args.smp < 1 or args.smp > PRODUCT_MAX_CPUS:
+    max_cpus = machine_profile(getattr(args, "platform", "q35-uefi")).max_cpus
+    if args.smp < 1 or args.smp > max_cpus:
         raise ProductError(
-            f"--smp must be an integer between 1 and {PRODUCT_MAX_CPUS}: {args.smp}"
+            f"--smp must be an integer between 1 and {max_cpus}: {args.smp}"
         )
     return variant
+
+
+def artifacts_for(args: argparse.Namespace, profile: str | None = None) -> Artifacts:
+    """Build the artifact layout for the selected machine profile.
+
+    Parsers that omit `--profile` (the graphics benchmark) still carry the
+    default layout, so the attribute is read defensively.
+    """
+
+    return Artifacts(state_root(), parse_variant(args),
+                     profile or getattr(args, "profile", "system"),
+                     machine_profile(getattr(args, "platform", "q35-uefi")))
 
 
 def resolve_run_cpus(max_cpus: int, run_cpus: int | None) -> int:
@@ -197,13 +215,14 @@ def generate_config(artifacts: Artifacts) -> None:
         [
             generator,
             str(REPO_ROOT / "config" / "kernel.toml"),
-            str(REPO_ROOT / "config" / "x86_64" / "q35-uefi.toml"),
+            str(REPO_ROOT / artifacts.machine.config),
             "-w",
             'arch="x86_64"',
             "-w",
-            # One product ELF has four preallocated slots; QEMU's `-smp`
-            # chooses how many of them come online for an UP or SMP4 run.
-            f"plat.max-cpu-num={PRODUCT_MAX_CPUS}",
+            # The machine profile owns the admission limit: a four-slot ELF is
+            # the q35 shape, an eight-core machine needs eight.  QEMU's `-smp`
+            # chooses how many of the preallocated slots come online.
+            f"plat.max-cpu-num={artifacts.machine.max_cpus}",
             "-w",
             f"plat.phys-memory-size={artifacts.variant.memory_bytes}",
             "-o",
@@ -551,7 +570,7 @@ def reject_ktap_skips_in_log(log_path: Path) -> None:
 
 
 def build_cmd(args: argparse.Namespace) -> int:
-    artifacts = Artifacts(state_root(), parse_variant(args), args.profile)
+    artifacts = artifacts_for(args)
     rootfs = Path(args.rootfs).expanduser().resolve() if args.rootfs else None
     if rootfs is None:
         build_rootfs(artifacts)
@@ -565,7 +584,7 @@ def build_cmd(args: argparse.Namespace) -> int:
 
 
 def lint_cmd(args: argparse.Namespace) -> int:
-    lint_kernel(Artifacts(state_root(), parse_variant(args), args.profile))
+    lint_kernel(artifacts_for(args))
     return 0
 
 
@@ -648,7 +667,7 @@ def run_gui_cmd(args: argparse.Namespace) -> int:
         raise ProductError("--width and --height must be positive")
     if args.extra_block:
         raise ProductError("run-gui reserves the extra disk for persistent home; use --home-disk")
-    artifacts = Artifacts(state_root(), parse_variant(args), "system")
+    artifacts = artifacts_for(args, "system")
     resolve_run_cpus(args.smp, args.run_cpus)
     if not args.rootfs:
         rootfs = artifacts.root / "graphics-desktop" / "images" / "rootfs.ext2"
@@ -663,7 +682,7 @@ def run_cmd(args: argparse.Namespace) -> int:
     width, height = getattr(args, "width", 800), getattr(args, "height", 600)
     if width <= 0 or height <= 0:
         raise ProductError("--width and --height must be positive")
-    artifacts = Artifacts(state_root(), parse_variant(args), args.profile)
+    artifacts = artifacts_for(args)
     run_cpus = resolve_run_cpus(args.smp, args.run_cpus)
     rootfs = Path(args.rootfs).expanduser().resolve() if args.rootfs else None
     if rootfs is not None and not rootfs.is_file():
@@ -706,7 +725,7 @@ def run_cmd(args: argparse.Namespace) -> int:
 
 
 def system_test_cmd(args: argparse.Namespace) -> int:
-    artifacts = Artifacts(state_root(), parse_variant(args), "system")
+    artifacts = artifacts_for(args, "system")
     run_cpus = resolve_run_cpus(args.smp, args.run_cpus)
     if not args.no_build:
         build_rootfs(artifacts)
@@ -893,7 +912,7 @@ def graphics_smoke_cmd(args: argparse.Namespace) -> int:
         # silently run Venus with the smaller software/legacy-virgl guest.
         args.smp = 4
         args.memory = "4G"
-    artifacts = Artifacts(state_root(), parse_variant(args), args.profile)
+    artifacts = artifacts_for(args)
     rootfs = Path(args.rootfs).expanduser().resolve()
     screenshot = Path(args.screenshot).expanduser().resolve()
     if not rootfs.is_file():
@@ -973,7 +992,7 @@ def graphics_benchmark_cmd(args: argparse.Namespace) -> int:
     if args.accel != "kvm":
         raise ProductError("graphics benchmark requires KVM; TCG is correctness-only")
     args.smp, args.memory = 4, "4G"
-    artifacts = Artifacts(state_root(), parse_variant(args), "system")
+    artifacts = artifacts_for(args, "system")
     rootfs = Path(args.rootfs).expanduser().resolve()
     if not rootfs.is_file():
         raise ProductError(f"rootfs does not exist: {rootfs}")
@@ -1052,6 +1071,13 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
                         help="enable the experimental I/O submission batch independently in separate artifact paths")
     parser.add_argument("--io-notify-fastpath", action="store_true",
                         help="enable the experimental no-mark fanotify permission fast path in separate artifact paths")
+    parser.add_argument(
+        "--platform",
+        choices=tuple(sorted(MACHINE_PROFILES)),
+        default="q35-uefi",
+        help="machine profile to build or boot; it selects the configuration file "
+             "and the compile-time CPU admission limit, not the QEMU machine",
+    )
     if profiles:
         parser.add_argument(
             "--profile",
@@ -1281,7 +1307,7 @@ def test_cmd(args: argparse.Namespace) -> int:
 
 
 def guest_tool_run(args: argparse.Namespace, command: str, marker: str, cpus: int) -> tuple[int, Path]:
-    artifacts = Artifacts(state_root(), parse_variant(args), "shell")
+    artifacts = artifacts_for(args, "shell")
     if not args.no_build:
         build_rootfs(artifacts)
         build_kernel(artifacts)
@@ -1425,7 +1451,7 @@ def cpu_test_cmd(args: argparse.Namespace) -> int:
 def abi_test_cmd(args: argparse.Namespace) -> int:
     if args.accel != "kvm":
         raise ProductError("ABI differential requires --accel kvm")
-    artifacts = Artifacts(state_root(), parse_variant(args), "shell")
+    artifacts = artifacts_for(args, "shell")
     # --rootfs belongs to the graphics suite. ABI always uses the product
     # shell rootfs, including when test --suite all also exercises graphics.
     rootfs = artifacts.rootfs
@@ -1489,7 +1515,7 @@ def bench_cmd(args: argparse.Namespace) -> int:
         raise ProductError("benchmark requires 32..1000000 iterations and positive trials")
     if bool(args.candidate_kernel) != bool(args.candidate_esp):
         raise ProductError("candidate comparison requires both --candidate-kernel and --candidate-esp")
-    artifacts = Artifacts(state_root(), parse_variant(args), "shell")
+    artifacts = artifacts_for(args, "shell")
     rootfs = Path(args.rootfs).expanduser().resolve() if args.rootfs else artifacts.rootfs
     if not args.no_build:
         if not args.rootfs:

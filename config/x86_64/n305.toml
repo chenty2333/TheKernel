@@ -1,0 +1,99 @@
+# Acer mini PC, Intel Core i3-N305 (Alder Lake-N, Gracemont E-cores only).
+#
+# ============================================================================
+# THIS PROFILE HAS NEVER BEEN BOOTED ON THE MACHINE IT DESCRIBES.
+# ============================================================================
+# Every address below is either derived from the kernel's own fallback policy
+# or read out of public Intel documentation.  None of it has been confirmed
+# against this machine's firmware.  Boot this image on the target with
+# `loglevel=info` (or higher) and read the `pci-ecam:` and `Memory regions`
+# lines before trusting anything here.  The full list of assumptions is in
+# `docs/design/n305-platform.md`.
+#
+# What must be confirmed on the machine itself:
+#   * the ECAM base and its bus range from the ACPI MCFG table.  The kernel
+#     discovers these at runtime, so `pci-ecam-base` below is only a fallback;
+#     the boot log states which of the two was used.
+#   * which buses the root complex actually implements, i.e. the real
+#     `pci-bus-end`.
+#   * the physical address ranges firmware reserves for PCIe MMIO/BARs, below
+#     and above 4 GiB.  `mmio-ranges` is a compile-time declaration: the kernel
+#     maps these as uncached device memory and will not allocate RAM inside
+#     them, so a wrong range is a real fault, not a cosmetic error.
+#   * whether the machine has a legacy 16550 UART at all.  It does not: the
+#     kernel's primary console is hardcoded to 0x3f8 (see below).
+#
+# `plat.phys-memory-size` is inert.  No Rust code reads it; installed RAM comes
+# from the Multiboot2 memory map at boot.  Do not use it to describe this
+# machine's 16 GiB.
+#
+# The package remains the existing Multiboot x86 PC platform; GRUB supplies its
+# Multiboot handoff.
+arch = "x86_64"
+platform = "x86-pc"
+package = "thekernel-axplat-x86-pc"
+
+[plat]
+# The i3-N305 has eight Gracemont E-cores and no SMT: eight logical CPUs, all
+# of them cores.  MADT discovery still decides which of them exist and how they
+# are numbered; this is only the compile-time admission limit, and it must be
+# at least eight or the kernel can never bring up the whole machine.
+#
+# `tools/thekernel.py` currently overrides this value with `PRODUCT_MAX_CPUS`
+# (4), so building today's product image from this profile still yields an
+# eight-core kernel capped at four CPUs.  See `docs/design/n305-platform.md`.
+max-cpu-num = 8
+phys-memory-base = 0
+# Inert: see the header.  Kept at the q35 value so the generated configuration
+# stays structurally identical to the profile that is actually booted.
+phys-memory-size = 0x0800_0000
+kernel-base-paddr = 0x0020_0000
+kernel-base-vaddr = "0xffff_8000_0020_0000"
+phys-virt-offset = "0xffff_8000_0000_0000"
+phys-bus-offset = 0
+kernel-aspace-base = "0xffff_8000_0000_0000"
+kernel-aspace-size = "0x0000_7fff_ffff_f000"
+# Eight 4 KiB per-CPU secret mapping slots, immediately below the exclusive
+# kernel-aspace end (0xffff_8000_0000_0000 + 0x0000_7fff_ffff_f000 =
+# 0xffff_ffff_ffff_f000).  The q35 profile's 0xffff_ffff_ffff_b000/0x4000 is
+# four slots and must grow with `max-cpu-num`; the value is not read by any
+# Rust code today, but leaving it at four would state a bound the machine
+# exceeds.
+secret-window-base = "0xffff_ffff_ffff_7000"
+secret-window-size = 0x8000
+boot-stack-size = 0x0004_0000
+
+[devices]
+# Every entry here is a *physical* range the kernel maps as uncached device
+# memory and refuses to allocate RAM from.  They must describe what this
+# machine's firmware reserves, not what the kernel would like it to reserve.
+mmio-ranges = [
+    [0x8000_0000, 0x6000_0000],       # 32-bit PCIe BAR window, 2.0-3.5 GiB
+    [0xe000_0000, 0x1000_0000],       # ECAM fallback (buses 0-255); MCFG wins
+    [0xfec0_0000, 0x0000_1000],       # I/O APIC
+    [0xfed0_0000, 0x0000_1000],       # HPET
+    [0xfee0_0000, 0x0000_1000],       # Local APIC
+    ["0x0000_0001_0000_0000", 0x4000_0000], # 64-bit PCIe BAR window, 4-5 GiB
+] # [(uint, uint)]
+virtio-mmio-ranges = [] # [(uint, uint)]
+# FALLBACK ONLY.  The ECAM base is a machine fact and the kernel reads it from
+# the ACPI MCFG table during early boot; this value is used only when firmware
+# supplies no usable MCFG.  It is the documented Alder Lake PCIEXBAR default
+# (256 MiB window covering buses 0-255), not a measurement of this machine.
+pci-ecam-base = 0xe000_0000
+# Highest PCI bus number the kernel will scan.  Alder Lake-N exposes a handful
+# of root ports, so scanning all 256 buses is wasted work, but this is the
+# conservative bound: a value below the true top bus silently hides devices.
+pci-bus-end = 0xff
+# BAR allocation windows.  The leading [0, 0] excludes bus 0, whose devices are
+# already assigned by firmware and must not be reallocated.
+pci-ranges = [
+    [0, 0],
+    [0x8000_0000, 0x6000_0000],
+    ["0x0000_0001_0000_0000", 0x4000_0000],
+] # [(uint, uint)]
+# Local-APIC vector numbers, not machine IRQs.  They are identical to the q35
+# profile because they are a kernel convention: device IRQs arrive through the
+# MADT/ACPI interrupt-source overrides, which the kernel reads at runtime.
+timer-irq = 0xf0
+ipi-irq = 0xf3

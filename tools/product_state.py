@@ -119,18 +119,65 @@ class Variant:
 
 
 @dataclass(frozen=True)
+class MachineProfile:
+    """One machine profile a product image can be built for.
+
+    A profile fixes the machine facts the kernel needs at compile time: which
+    configuration file to generate from, how many per-CPU slots the image must
+    preallocate, and how many QEMU CPUs a run may request.  Everything the
+    firmware can answer instead (installed RAM, the CPUs that actually exist,
+    the PCI ECAM base) is deliberately *not* here.
+    """
+
+    name: str
+    config: str
+    max_cpus: int
+
+
+Q35_UEFI_PROFILE = MachineProfile(
+    name="q35-uefi",
+    config="config/x86_64/q35-uefi.toml",
+    # One product ELF has four preallocated slots; QEMU's `-smp` chooses how
+    # many of them come online for an UP or SMP4 run.
+    max_cpus=4,
+)
+
+# A real machine needs more slots than a QEMU smoke test: the i3-N305 has eight
+# E-cores and no SMT, so a four-slot image can never bring the whole machine up.
+N305_PROFILE = MachineProfile(
+    name="n305",
+    config="config/x86_64/n305.toml",
+    max_cpus=8,
+)
+
+MACHINE_PROFILES = {profile.name: profile for profile in (Q35_UEFI_PROFILE, N305_PROFILE)}
+
+
+def machine_profile(name: str) -> MachineProfile:
+    try:
+        return MACHINE_PROFILES[name]
+    except KeyError:
+        raise ProductError(
+            f"unknown machine profile {name!r}; expected one of "
+            f"{', '.join(sorted(MACHINE_PROFILES))}"
+        ) from None
+
+
+@dataclass(frozen=True)
 class Artifacts:
     root: Path
     variant: Variant
     profile: str = "system"
+    machine: MachineProfile = Q35_UEFI_PROFILE
 
     @property
     def output_dir(self) -> Path:
-        return self.root / "out" / "x86_64" / "q35-uefi" / self.profile / self.variant.name
+        return self.root / "out" / "x86_64" / self.machine.name / self.profile / self.variant.name
 
     @property
     def cargo_target_dir(self) -> Path:
-        return self.root / "target" / "thekernel" / "x86_64" / "q35-uefi" / self.profile / self.variant.name
+        return (self.root / "target" / "thekernel" / "x86_64" / self.machine.name
+                / self.profile / self.variant.name)
 
     @property
     def config_path(self) -> Path:
@@ -177,13 +224,14 @@ def artifact_config_stamp(artifacts: Artifacts, transport: str) -> Path:
 def artifact_input_key(artifacts: Artifacts, rootfs: Path | None, transport: str) -> str:
     digest = hashlib.sha256()
     grub = "grub.cfg" if transport == "module" else "grub-drive.cfg"
-    for relative in ("config/kernel.toml", "config/x86_64/q35-uefi.toml", "rust-toolchain.toml",
+    for relative in ("config/kernel.toml", artifacts.machine.config, "rust-toolchain.toml",
                      "scripts/build-x86-uefi-esp.sh", f"config/x86_64/{grub}"):
         content = (REPO_ROOT / relative).read_bytes()
         digest.update(len(content).to_bytes(8, "little"))
         digest.update(content)
     image = (rootfs or artifacts.rootfs).resolve()
-    digest.update(repr((artifacts.variant, artifacts.profile, transport, str(image))).encode())
+    digest.update(repr((artifacts.variant, artifacts.profile, artifacts.machine.name, transport,
+                        str(image))).encode())
     with image.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
