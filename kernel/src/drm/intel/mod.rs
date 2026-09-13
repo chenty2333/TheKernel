@@ -56,6 +56,7 @@ pub(crate) mod debugfs;
 mod gmbus;
 mod hpd;
 mod id;
+mod output;
 mod pci;
 mod phy;
 mod pipe;
