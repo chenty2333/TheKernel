@@ -244,6 +244,16 @@ pub(crate) struct ConnectReport {
     /// One per display device that did not produce a connector, with the
     /// reason.
     pub(crate) failures: Vec<(Bdf, ConnectError)>,
+    /// Every device the sink step read hotplug for, and what each DDI answered.
+    ///
+    /// Kept because the reading is a step's result and not only a line in a
+    /// log: the after-boot hotplug watch compares each poll against the state
+    /// this pass already reported, and a watch that treated its own first look
+    /// as an event would announce a monitor that was there all along.  It is
+    /// kept here rather than in a report type of its own because this pass is
+    /// the only place phase 2 runs -- reading the bus twice to fill two
+    /// structures would be two transactions to answer one question.
+    pub(crate) hotplug: Vec<(Bdf, Vec<HpdStatus>)>,
 }
 
 impl ConnectReport {
@@ -292,6 +302,33 @@ pub(crate) fn resolve<R: Registers, T: PollTimer>(
     regs: &R,
     timer: &T,
 ) -> Result<Connector, ConnectError> {
+    resolve_device(bdf, regs, timer).outcome
+}
+
+/// One device's phase-2 outcome: what the sink step read, and what the
+/// connector step made of it.
+///
+/// The two travel together because that reading is a result and not only a log
+/// line: [`ConnectReport::hotplug`] keeps it as the baseline the after-boot
+/// watch compares against, and this pass is the only place phase 2 runs.
+pub(crate) struct Resolved {
+    /// Every DDI the sink step read hotplug for, in [`Ddi::ALL`] order.
+    pub(crate) hotplug: Vec<HpdStatus>,
+    /// The connector, or the named reason there is none.
+    pub(crate) outcome: Result<Connector, ConnectError>,
+}
+
+/// Resolve one display device, keeping the reading the sink step made.
+///
+/// [`resolve`] is this function without the reading.  The decisions live in a
+/// closure so that every early return below still reaches it: a device that
+/// produced no connector has still answered the hotplug read, and that answer
+/// is the baseline the after-boot watch needs.
+pub(crate) fn resolve_device<R: Registers, T: PollTimer>(
+    bdf: Bdf,
+    regs: &R,
+    timer: &T,
+) -> Resolved {
     let Wells { records, down } = enable_wells(regs);
 
     // Steps 2.2 and 2.3 are one call: hotplug enabled and read once, then the
@@ -299,58 +336,61 @@ pub(crate) fn resolve<R: Registers, T: PollTimer>(
     // layer's plan over whatever validated.  Nothing about that read is
     // duplicated here.
     let device = sink::probe_one(bdf, regs, timer);
+    let hotplug = device.hotplug.clone();
+    let outcome = (move || -> Result<Connector, ConnectError> {
+        let (Some(pin), Some(edid), Some(plan)) = (device.monitor, device.edid, device.plan) else {
+            // A pin cannot answer without a block that validated -- GMBUS validates
+            // header and checksum before it returns one -- so a read that produced
+            // bytes this kernel would not believe is a different answer from a bus
+            // that NAKed, and it is reported as itself.
+            if let Some((pin, error)) = rejected(&device.pins) {
+                return Err(ConnectError::EdidRejected { pin, error });
+            }
+            // Nothing answered anywhere.  A well that did not come up is the more
+            // actionable of the two facts, and it carries the register words a
+            // reader compares against §11 phase 1.3.
+            if let Some((well, observation, cause)) = down {
+                return Err(ConnectError::WellDown {
+                    well,
+                    observation,
+                    cause,
+                });
+            }
+            return Err(ConnectError::NoMonitor { pins: device.pins });
+        };
 
-    let (Some(pin), Some(edid), Some(plan)) = (device.monitor, device.edid, device.plan) else {
-        // A pin cannot answer without a block that validated -- GMBUS validates
-        // header and checksum before it returns one -- so a read that produced
-        // bytes this kernel would not believe is a different answer from a bus
-        // that NAKed, and it is reported as itself.
-        if let Some((pin, error)) = rejected(&device.pins) {
-            return Err(ConnectError::EdidRejected { pin, error });
-        }
-        // Nothing answered anywhere.  A well that did not come up is the more
-        // actionable of the two facts, and it carries the register words a
-        // reader compares against §11 phase 1.3.
-        if let Some((well, observation, cause)) = down {
-            return Err(ConnectError::WellDown {
-                well,
-                observation,
-                cause,
-            });
-        }
-        return Err(ConnectError::NoMonitor { pins: device.pins });
-    };
+        let Some(ddi) = pin.ddi() else {
+            return Err(ConnectError::NoDdiForPin { pin });
+        };
+        // Hotplug was read for every DDI in the same pass; the connector takes the
+        // line for its own DDI, or the named reason there is not one.
+        let hotplug = match device.hotplug.iter().find(|status| status.ddi == ddi) {
+            Some(status) => *status,
+            None => {
+                let error = device
+                    .hotplug_errors
+                    .iter()
+                    .find(|(candidate, _)| *candidate == ddi)
+                    .map(|(_, error)| *error);
+                return Err(match error {
+                    Some(error) => ConnectError::HotplugUnreadable { ddi, error },
+                    None => ConnectError::HotplugNotRecorded { ddi },
+                });
+            }
+        };
 
-    let Some(ddi) = pin.ddi() else {
-        return Err(ConnectError::NoDdiForPin { pin });
-    };
-    // Hotplug was read for every DDI in the same pass; the connector takes the
-    // line for its own DDI, or the named reason there is not one.
-    let hotplug = match device.hotplug.iter().find(|status| status.ddi == ddi) {
-        Some(status) => *status,
-        None => {
-            let error = device
-                .hotplug_errors
-                .iter()
-                .find(|(candidate, _)| *candidate == ddi)
-                .map(|(_, error)| *error);
-            return Err(match error {
-                Some(error) => ConnectError::HotplugUnreadable { ddi, error },
-                None => ConnectError::HotplugNotRecorded { ddi },
-            });
-        }
-    };
-
-    Ok(Connector {
-        bdf,
-        pin,
-        ddi,
-        edid,
-        extension: device.extension,
-        plan,
-        hotplug,
-        wells: records,
-    })
+        Ok(Connector {
+            bdf,
+            pin,
+            ddi,
+            edid,
+            extension: device.extension,
+            plan,
+            hotplug,
+            wells: records,
+        })
+    })();
+    Resolved { hotplug, outcome }
 }
 
 /// What phase 2.1 found on one display device.
@@ -517,7 +557,12 @@ pub(crate) fn resolve_at_boot(report: &ProbeReport) -> ConnectReport {
              (reference section 11 phase 2)",
             found.info.bdf
         );
-        match resolve(found.info.bdf, &window, &MonotonicTimer) {
+        let resolved = resolve_device(found.info.bdf, &window, &MonotonicTimer);
+        // The reading is kept whatever the outcome: a device that produced no
+        // connector has still answered the hotplug read, and that answer is
+        // what the after-boot watch compares its first poll against.
+        result.hotplug.push((found.info.bdf, resolved.hotplug));
+        match resolved.outcome {
             Ok(connector) => {
                 info!("intel-connect: {}", connector.describe());
                 result.connectors.push(connector);

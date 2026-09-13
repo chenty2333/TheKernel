@@ -290,7 +290,7 @@ pub(crate) fn bring_up_at_boot() {
 
     // The after-boot watch starts here and nowhere else.  Every step it depends
     // on has now run: the window is mapped, the display is powered, hotplug
-    // detection is enabled, and the states the boot step read are in [`SINK`]
+    // detection is enabled, and the states the boot step read are in [`CONNECT`]
     // to be the baseline.  A machine that reached none of that never gets here
     // and never polls.
     #[cfg(target_os = "none")]
@@ -507,21 +507,21 @@ fn reconcile_once<R: Registers, T: PollTimer>(
     }
 }
 
-/// The baseline the watch starts from: what the sink step already reported.
+/// The baseline the watch starts from: what the phase-2 pass already reported.
 ///
 /// A watch that reported the state it found on its first poll would be
-/// reporting its own first look as a hotplug.  The sink step read every DDI
-/// once and logged each one, so that reading is the baseline and only a change
-/// from it is an event.  A DDI the boot read could not answer for gets no
-/// baseline, and its first answered poll is adopted in silence -- see
+/// reporting its own first look as a hotplug.  The connector step read every
+/// DDI once and logged each one, so that reading is the baseline and only a
+/// change from it is an event.  A DDI the boot read could not answer for gets
+/// no baseline, and its first answered poll is adopted in silence -- see
 /// [`hpd::ConnectTracker`], which is where that rule and its reason live.
-fn boot_baseline(report: &sink::SinkReport, bdf: Bdf) -> hpd::ConnectTracker {
+fn boot_baseline(report: &connect::ConnectReport, bdf: Bdf) -> hpd::ConnectTracker {
     let mut tracker = hpd::ConnectTracker::new();
-    for device in &report.devices {
-        if device.bdf != bdf {
+    for (device, statuses) in &report.hotplug {
+        if *device != bdf {
             continue;
         }
-        for status in &device.hotplug {
+        for status in statuses {
             tracker.seed(status.ddi, status.effective_connect());
         }
     }
@@ -564,7 +564,7 @@ fn start_hotplug_watch(powered: &[(Bdf, RegisterWindow)]) {
     }
     // The baseline is taken before the task starts, and the lock is released
     // before anything that allocates.
-    let tracker = match &*SINK.lock() {
+    let tracker = match &*CONNECT.lock() {
         Some(report) => boot_baseline(report, bdf),
         None => hpd::ConnectTracker::new(),
     };
@@ -795,10 +795,13 @@ mod tests {
     }
 
     /// The baseline a watch starts from, for a controller the test owns: the
-    /// states the sink step reported at boot.
-    fn boot_report(controller: &FakeController) -> sink::SinkReport {
-        sink::SinkReport {
-            devices: vec![sink::probe_one(bdf(), controller, &FakeClock::new())],
+    /// states the sink step reported at boot, in the shape the connector step
+    /// keeps them in.
+    fn boot_report(controller: &FakeController) -> connect::ConnectReport {
+        let device = sink::probe_one(bdf(), controller, &FakeClock::new());
+        connect::ConnectReport {
+            hotplug: vec![(device.bdf, device.hotplug.clone())],
+            ..connect::ConnectReport::default()
         }
     }
 

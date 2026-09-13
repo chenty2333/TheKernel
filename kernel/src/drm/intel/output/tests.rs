@@ -761,12 +761,22 @@ fn the_phy_b_write_order_is_the_sequence_with_b_registers() {
             // 5.3: §8.5's swing sequence, then the lane power.
             "PORT_CL_DW5(B)",
             "PORT_TX_DW5_GRP(B)",
-            "PORT_TX_DW2_GRP(B)",
+            // §8.5 steps 2 and 5, in i915's per-lane shape: `DW2`, `DW4` and
+            // `DW7` are written once per lane and `DW5` twice to the group, so
+            // the firmware's per-lane values are replayed where they were read
+            // ([I915] `intel_ddi.c:1148-1178`).
+            "PORT_TX_DW2_LN0(B)",
+            "PORT_TX_DW2_LN1(B)",
+            "PORT_TX_DW2_LN2(B)",
+            "PORT_TX_DW2_LN3(B)",
             "PORT_TX_DW4_LN0(B)",
             "PORT_TX_DW4_LN1(B)",
             "PORT_TX_DW4_LN2(B)",
             "PORT_TX_DW4_LN3(B)",
-            "PORT_TX_DW7_GRP(B)",
+            "PORT_TX_DW7_LN0(B)",
+            "PORT_TX_DW7_LN1(B)",
+            "PORT_TX_DW7_LN2(B)",
+            "PORT_TX_DW7_LN3(B)",
             "PORT_TX_DW5_GRP(B)",
             "PORT_CL_DW10(B)",
             // 5.4, 5.5, 5.6, 5.7: the transcoder is A's, the DDI inside the

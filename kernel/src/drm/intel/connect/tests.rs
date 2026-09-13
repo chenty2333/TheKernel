@@ -298,6 +298,7 @@ fn a_well_that_never_comes_up_is_recorded_and_the_probe_runs_anyway() {
     let report = ConnectReport {
         connectors: vec![connector],
         failures: Vec::new(),
+        hotplug: Vec::new(),
     };
     let text = report.render();
     assert!(text.contains("AUX_A"), "{text}");
@@ -396,6 +397,7 @@ fn no_monitor_on_any_pin_is_reported_with_what_every_pin_answered() {
     let report = ConnectReport {
         connectors: Vec::new(),
         failures: vec![(bdf(), error)],
+        hotplug: Vec::new(),
     };
     let rendered = report.render();
     assert!(rendered.contains("display 0000:00:02.0"), "{rendered}");
