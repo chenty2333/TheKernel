@@ -226,10 +226,15 @@ chosen for: the evidence is still on the glass minutes later.
 
 Two things the same run makes plain:
 
-* the glass showed the readiness marker and **no kernel log**. "The log is
-  visible on screen" is therefore not yet something this procedure can claim —
-  the log mirror is a separate workstream's artefact, and until it lands the
-  screen carries the marker, not the transcript;
+* the glass showed the readiness marker and **no kernel log**. That observation
+  is overtaken: it was taken before `fix/klog-loss` (merged as `0e640c92`) made
+  the console a reader of the kernel's log ring instead of a consumer of a copy
+  queue that dropped records once it filled. The `firmware-fbcon` stage of
+  `verify --tier daily` now reads a kernel log line (`Enter user space: ip=0x`)
+  off a screendump of the firmware framebuffer, on a profile with no virtio-gpu
+  and no serial port. So "the log reaches a serial-less screen" is gated
+  evidence — but the *shell* profile above has not been re-run since the fix,
+  and the frame that would show its log mirror has not been taken;
 * the bootloader has to pass a Multiboot2 framebuffer tag. With GRUB's terminal
   left on the serial port, GRUB prints `WARNING: no console will be available
   to OS` and the glass stays black — the failure in the table below.
@@ -252,8 +257,8 @@ Telling a good boot from a bad one, from the screen alone:
 | nothing at all, not even the firmware logo | no boot from USB: wrong boot entry, CSM mode, or Secure Boot refusing the stick | firmware setup: UEFI mode, Secure Boot off, boot the USB entry |
 | firmware logo, then nothing | the firmware did not execute `BOOTX64.EFI`; Secure Boot is the first suspect | disable Secure Boot, or clear the platform keys |
 | GRUB text, then no kernel log at all — and a kernel log read elsewhere says `MB2 framebuffer: absent` | the bootloader passed no Multiboot2 framebuffer tag, so the kernel has no console to draw on. This is *not* the same failure as a kernel that produced no output: here the kernel has nowhere to write, and the fix belongs in the bootloader's video configuration | fix the bootloader's video setup (a mode must be set before handoff); keep the frames as evidence |
-| GRUB text, then a dark screen | GRUB ran and passed a framebuffer, but the kernel drew nothing | keep the frames and report; the kernel's early screen is another workstream |
-| log appears, then stops before `THEKERNEL_SHELL_READY` | the kernel stopped — a hang or a panic | keep the frames: they are the evidence. A panic display is landing in another workstream and will separate the two; do not wait for it |
+| GRUB text, then a dark screen | GRUB ran and passed a framebuffer, but nothing was drawn. The kernel paints this surface from the moment `axhal::init_early` returns and mirrors its log ring into it, so this is either a handoff that never reached the kernel or a stop inside the window that closes a few milliseconds into `rust_main` | keep the frames and report; `docs/design/early-screen.md` §5 names that window |
+| log appears, then stops before `THEKERNEL_SHELL_READY` | the kernel stopped — and the screen now separates the two cases: `*** PANIC ***` on a red bar is a panic, its absence is a hang | keep the frames: they are the evidence. `docs/design/early-screen.md` §4 describes the panic screen |
 | log, then `THEKERNEL_SHELL_READY` and no further change | acceptance (a) passed | turn the frames into gate evidence, below |
 
 That last line is why the shell profile matters: the frame that proves the boot
