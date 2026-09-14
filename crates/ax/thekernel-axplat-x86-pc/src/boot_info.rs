@@ -59,12 +59,26 @@ pub(crate) struct TagRecord {
 
 const MB2_TAG_FRAMEBUFFER: u32 = 8;
 
-/// Size of a framebuffer tag up to and including its `reserved` field.
+/// Size of the fixed portion of a framebuffer tag: the tag header, the
+/// geometry, the kind, and the two reserved bytes that follow it.
 ///
-/// The tag continues with a kind-dependent payload; only the fixed portion is
-/// read unconditionally, so every accessor below is checked against this base
-/// before it reads a field.
-const MB2_FRAMEBUFFER_BASE_SIZE: usize = 32;
+/// An RGB tag continues with six colour-layout bytes, which an indexed or text
+/// tag does not have, so this is the only prefix that may be read before the
+/// kind is known.  The checks below admit a tag that stops here and report the
+/// missing colour bytes as `Truncated`; anything shorter cannot even be asked
+/// what kind it is.
+///
+/// The two reserved bytes matter to the arithmetic: the colour layout starts at
+/// 32, not 30.  This is the tag's own length, with no padding.
+const MB2_FRAMEBUFFER_BASE_SIZE: usize = 30;
+
+/// Offset of the colour layout inside an RGB framebuffer tag.
+///
+/// The fixed portion ends at [`MB2_FRAMEBUFFER_BASE_SIZE`], but it ends with
+/// two reserved bytes that belong to the pixel geometry rather than to the
+/// layout, so the first colour byte is two bytes later.  Reading from the base
+/// would shift every channel by one and hand back green as blue.
+const MB2_FRAMEBUFFER_LAYOUT_OFFSET: usize = MB2_FRAMEBUFFER_BASE_SIZE + 2;
 
 /// Framebuffer kind for palette-indexed pixels.
 const MB2_FRAMEBUFFER_INDEXED: u8 = 0;
@@ -799,7 +813,7 @@ fn parse_framebuffer(tag: &[u8]) -> Result<FramebufferInfo, FramebufferRejection
     // the tag contradicts itself; the channel order must not be guessed,
     // because guessing it wrong swaps red and blue on every pixel.
     let layout = tag
-        .get(MB2_FRAMEBUFFER_BASE_SIZE..MB2_FRAMEBUFFER_BASE_SIZE + 6)
+        .get(MB2_FRAMEBUFFER_LAYOUT_OFFSET..MB2_FRAMEBUFFER_LAYOUT_OFFSET + 6)
         .ok_or(FramebufferRejection::Truncated)?;
     let red = ColorField {
         position: layout[0],
@@ -1046,7 +1060,8 @@ mod tests {
 
     use super::{
         AcpiRsdp, BootProtocol, FramebufferRejection, MAX_MODULES, MAX_REGIONS, MAX_TAG_INVENTORY,
-        ParseError, TagRecord, parse_multiboot2_info,
+        MB2_FRAMEBUFFER_BASE_SIZE, MB2_FRAMEBUFFER_LAYOUT_OFFSET, ParseError, TagRecord,
+        parse_multiboot2_info,
     };
 
     fn push_u32(bytes: &mut std::vec::Vec<u8>, value: u32) {        bytes.extend_from_slice(&value.to_le_bytes());
@@ -1567,6 +1582,58 @@ mod tests {
     /// Red at bit 16, green at bit 8, blue at bit 0: the 32-bit layout the
     /// reference QEMU firmware reports.
     const RGB_888: [u8; 6] = [16, 8, 8, 8, 0, 8];
+
+    /// The tag layout is the ABI, so pin the offsets the parser uses against
+    /// the specification rather than against this file's own arithmetic.
+    ///
+    /// `multiboot2.h` lays the tag out as
+    /// `struct multiboot_tag_framebuffer_common { type, size, addr, pitch,
+    /// width, height, bpp, type, uint16_t reserved; }` and then the colour
+    /// fields, which makes the common struct exactly 32 bytes: the geometry
+    /// ends at 30 and the two reserved bytes sit at 30 and 31.  Reading the
+    /// layout from 30 would take a reserved byte as red's position and shift
+    /// every channel by one, so green would come back as blue.
+    #[test]
+    fn the_framebuffer_tag_layout_matches_the_multiboot2_abi() {
+        assert_eq!(MB2_FRAMEBUFFER_BASE_SIZE, 30, "geometry ends after the kind");
+        assert_eq!(
+            MB2_FRAMEBUFFER_LAYOUT_OFFSET, 32,
+            "the reserved uint16_t precedes the colour fields"
+        );
+        // The payload helper writes from the byte after the eight-byte tag
+        // header, so the parser's offsets are two less than the payload's.
+        let payload = framebuffer_payload(0x8000_0000, 4096, 800, 600, 32, 1, RGB_888);
+        assert_eq!(payload.len(), MB2_FRAMEBUFFER_LAYOUT_OFFSET + 6 - 8);
+        assert_eq!(payload[20], 32, "bpp");
+        assert_eq!(payload[21], 1, "kind");
+        assert_eq!(&payload[22..24], &[0, 0], "reserved");
+        assert_eq!(
+            &payload[MB2_FRAMEBUFFER_LAYOUT_OFFSET - 8..MB2_FRAMEBUFFER_LAYOUT_OFFSET - 2],
+            &RGB_888,
+            "the colour fields begin immediately after the reserved bytes"
+        );
+    }
+
+    /// A tag that carries the geometry but stops before the colour fields is
+    /// declined as truncated: RGB has no default channel order, and guessing
+    /// it would swap red and blue on every pixel.
+    #[test]
+    fn an_rgb_tag_without_its_colour_fields_is_truncated() {
+        // The whole payload is 30 bytes; this one keeps the header, the
+        // geometry and the reserved bytes, and stops where the colour fields
+        // would begin.
+        let mut payload = framebuffer_payload(0x8000_0000, 4096, 800, 600, 32, 1, RGB_888);
+        assert_eq!(payload.len(), 30);
+        payload.truncate(24);
+        let info = parse_multiboot2_info(&info_with_framebuffer(&payload), 0x1000).unwrap();
+        assert!(info.framebuffer().is_none());
+        assert_eq!(
+            info.framebuffer_rejection(),
+            Some(FramebufferRejection::Truncated)
+        );
+        // Whatever the display costs, the rest of the handoff survives it.
+        assert_eq!(info.memory_regions(), &[(0, 0x0800_0000)]);
+    }
 
     fn info_with_framebuffer(tag: &[u8]) -> std::vec::Vec<u8> {
         let mut bytes = vec![0; 8];

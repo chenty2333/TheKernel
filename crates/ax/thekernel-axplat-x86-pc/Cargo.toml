@@ -125,3 +125,11 @@ optional = true
 
 [package.metadata.thekernel]
 layer = "platform"
+
+# The platform layer is where the boot ABI is decoded, and a mistake there is
+# invisible until a machine boots -- or does not.  Its tests need no hardware:
+# they parse byte images handed to them, including the Multiboot2 framebuffer
+# tag whose layout decides whether the early screen comes up at all.  Selected
+# explicitly because the platform layer is otherwise outside the host suite.
+[package.metadata.thekernel.host-test]
+selected = true
