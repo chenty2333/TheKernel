@@ -126,7 +126,10 @@ fetch_rpm() {
     if [ ! -f "$path" ]; then
         mkdir -p "$dir"
         log "downloading $package"
-        ( cd "$dir" && dnf download --destdir . "$package" 2>&1 | tail -2 ) || true
+        # dnf's progress output is *not* silenced: a download that stalls is a
+        # thing worth seeing.  It does have to be kept off stdout, though,
+        # because stdout of this function is the result.
+        ( cd "$dir" && dnf download --destdir . "$package" ) >&2 || true
         [ -f "$path" ] || die "cannot download $package into $dir"
     fi
     local actual
@@ -152,9 +155,11 @@ mkdir -p "$BUILD_ROOT"
 log "unpacking glibc $GLIBC_RPM_RELEASE"
 # A failure inside `$( )` exits only the subshell, and `set -e` does not look
 # at an assignment's status, so the call is its own checked statement.
-fetch_rpm glibc "$GLIBC_RPM_FILE" "$GLIBC_RPM_SHA256" > "$BUILD_ROOT/.rpm-path" ||
+glibc_rpm_path="$BUILD_ROOT/.path-glibc"
+# Assigned, then checked: see the note in build-gcc-payload.sh.
+fetch_rpm glibc "$GLIBC_RPM_FILE" "$GLIBC_RPM_SHA256" > "$glibc_rpm_path" ||
     die "cannot fetch glibc"
-glibc_rpm=$(cat "$BUILD_ROOT/.rpm-path")
+glibc_rpm=$(cat "$glibc_rpm_path")
 if [ ! -e "$RPM_TREE$RPM_LOADER_PATH" ] || [ ! -e "$RPM_TREE$RPM_LIBC_PATH" ]; then
     rm -rf "$RPM_TREE"
     mkdir -p "$RPM_TREE"

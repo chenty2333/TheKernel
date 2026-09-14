@@ -135,7 +135,10 @@ fetch_rpm() {
     if [ ! -f "$path" ]; then
         mkdir -p "$dir"
         log "downloading $package"
-        ( cd "$dir" && dnf download --destdir . "$package" 2>&1 | tail -2 ) || true
+        # dnf's progress output is *not* silenced: a download that stalls is a
+        # thing worth seeing.  It does have to be kept off stdout, though,
+        # because stdout of this function is the result.
+        ( cd "$dir" && dnf download --destdir . "$package" ) >&2 || true
         [ -f "$path" ] || die "cannot download $package into $dir"
     fi
     local actual
@@ -174,9 +177,13 @@ for pin in "${RPM_PINS[@]}"; do
     # building from a fresh state directory: without this the build reported a
     # download failure and then failed much later with "cpio: premature end of
     # archive", which reads as a corrupt RPM rather than as a failed download.
-    fetch_rpm "$package" "$file" "$expected" > "$BUILD_ROOT/.rpm-path" ||
+    rpm_path=$RPM_TREE/.path-$package
+    # Assigned, then checked.  `rpm=$(fetch_rpm ...)` would discard the failure:
+    # a `die` inside the substitution exits only the subshell, and `set -e` does
+    # not inspect an assignment's status.
+    fetch_rpm "$package" "$file" "$expected" > "$rpm_path" ||
         die "cannot fetch $package-$release"
-    rpm=$(cat "$BUILD_ROOT/.rpm-path")
+    rpm=$(cat "$rpm_path")
     tree="$RPM_TREE/$package-$release"
     # The marker, not the directory, decides whether the tree is usable.  An
     # interrupted unpack leaves a directory that looks present and is missing
