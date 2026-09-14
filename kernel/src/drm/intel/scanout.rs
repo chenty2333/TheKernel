@@ -556,6 +556,25 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_modeset_keeps_its_ggtt_backing_but_cannot_take_the_console() {
+        let _guard = crate::test_support::scheduler_test_context();
+        let (surface, _gtt) = surface(64, 64);
+        let weak = Arc::downgrade(&surface);
+        register(
+            surface,
+            Verdict::NotScanning {
+                reason: "plane arm failed".into(),
+            },
+        );
+        assert!(
+            weak.upgrade().is_some(),
+            "GGTT backing must remain allocated"
+        );
+        assert!(matches!(acquire(), Err(Unavailable::Failed(_))));
+        assert_eq!(decide(&[candidate()], &mut |_| {}).winner(), None);
+    }
+
+    #[test]
     fn a_modeset_that_did_not_prove_it_is_scanning_is_refused_and_the_search_continues() {
         let _guard = crate::test_support::scheduler_test_context();
         // The failure this pins down is the expensive one on a machine with no

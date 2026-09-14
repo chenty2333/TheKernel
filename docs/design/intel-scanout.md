@@ -16,6 +16,15 @@ means memory mapped through the GGTT".  Phases 4 and 5 (the pipe, the plane,
 the DDB, the watermarks, the DDI) are other workstreams; §11 phase 6 is the
 evidence they produce, and §5.1 below is where this module consumes it.
 
+The boot coordinator now selects the exact mode before allocating the surface,
+rather than allocating the maximum dimensions of the preferred and fallback
+modes. `set_mode` refuses a mismatch between the surface's visible dimensions
+and the mode before programming any registers. Otherwise the console could
+advertise pixels the display never scans, or a small allocation could be read
+past its end. A modeset error also retains the allocated surface through a
+refused scanout offer: the GGTT entries already exist, even when programming
+returned an error, so the backing pages must not be freed on that return path.
+
 Provenance markers follow the reference document's §0.1: `[I915]` is the Linux
 v6.12 `drm/i915` tree at commit `adc218676eef25575469234709c2d87185ca223a`,
 `[PRM]` is Intel's DG1 (Xe-LP) display PRM, `[INF]` is inference from sourced

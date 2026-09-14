@@ -1438,6 +1438,11 @@ pub(crate) enum ModesetError {
     NoCdclk { cdclk_khz: u32, detail: String },
     /// The DDI has no `DDI_BUF_CTL` in the register table.
     UnsupportedPort { ddi: Ddi },
+    /// The visible console dimensions must equal the programmed mode.
+    SurfaceGeometry {
+        surface: (u32, u32),
+        mode: (u16, u16),
+    },
     /// The pattern does not fit the surface.
     Pattern(PatternError),
     /// The framebuffer refused a write.
@@ -1473,6 +1478,10 @@ impl ModesetError {
                  entirely",
                 ddi.name()
             ),
+            ModesetError::SurfaceGeometry { surface, mode } => format!(
+                "framebuffer {}x{} does not match scanout {}x{}",
+                surface.0, surface.1, mode.0, mode.1
+            ),
             ModesetError::Pattern(error) => {
                 format!(
                     "the test pattern does not fit the surface: {}",
@@ -1489,6 +1498,35 @@ impl ModesetError {
             }
         }
     }
+}
+
+/// Select the exact scanout geometry before allocating its backing. The boot
+/// coordinator and the programming path share this read-only preflight so a
+/// reference fallback cannot silently change the console's visible dimensions.
+pub(crate) fn preflight_mode<R: Registers>(
+    regs: &R,
+    plan: &ModePlan,
+    edid: &[u8],
+) -> Result<(ModeChoice, Mode), ModesetError> {
+    // §11 phase 3.1's sanity check, and the ceiling the mode choice needs: one
+    // pixel per clock, so the pixel clock cannot exceed CDCLK.  Reading it here
+    // rather than taking it as a parameter means the choice reflects the
+    // registers as they are now, which is what the pipe will actually run on.
+    let cdclk = clk::observe(regs).map_err(ModesetError::Clock)?;
+    if !cdclk.usable() {
+        return Err(ModesetError::NoCdclk {
+            cdclk_khz: cdclk.cdclk_khz,
+            detail: cdclk.describe(),
+        });
+    }
+
+    let choice = choose_mode(plan, edid, EngineLimits::at_cdclk(cdclk.cdclk_khz));
+    let mode = match choice.into_mode() {
+        Ok(mode) => mode,
+        Err(refusal) => return Err(ModesetError::Refused(refusal)),
+    };
+
+    Ok((choice, mode))
 }
 
 /// Reference §11 phases 3.2 to 6 against one device, in one sequence.
@@ -1548,27 +1586,15 @@ pub(crate) fn set_mode<R: Registers, T: PollTimer>(
     timer: &T,
     request: &ModeRequest<'_>,
 ) -> Result<ModeOutcome, ModesetError> {
-    // §11 phase 3.1's sanity check, and the ceiling the mode choice needs: one
-    // pixel per clock, so the pixel clock cannot exceed CDCLK.  Reading it here
-    // rather than taking it as a parameter means the choice reflects the
-    // registers as they are now, which is what the pipe will actually run on.
-    let cdclk = clk::observe(regs).map_err(ModesetError::Clock)?;
-    if !cdclk.usable() {
-        return Err(ModesetError::NoCdclk {
-            cdclk_khz: cdclk.cdclk_khz,
-            detail: cdclk.describe(),
+    let (choice, mode) = preflight_mode(regs, request.plan, request.edid)?;
+    if request.surface.width() != u32::from(mode.hdisplay)
+        || request.surface.height() != u32::from(mode.vdisplay)
+    {
+        return Err(ModesetError::SurfaceGeometry {
+            surface: (request.surface.width(), request.surface.height()),
+            mode: (mode.hdisplay, mode.vdisplay),
         });
     }
-
-    let choice = choose_mode(
-        request.plan,
-        request.edid,
-        EngineLimits::at_cdclk(cdclk.cdclk_khz),
-    );
-    let mode = match choice.into_mode() {
-        Ok(mode) => mode,
-        Err(refusal) => return Err(ModesetError::Refused(refusal)),
-    };
 
     // The port's register, which phase 6.3 needs as well as phase 5.
     let Some(ddi_buf_ctl) = ddi_buf_ctl_register(request.ddi) else {

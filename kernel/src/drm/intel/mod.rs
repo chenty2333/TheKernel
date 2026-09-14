@@ -109,6 +109,12 @@ use spin::Mutex;
 /// to do, and the machine's clock is what the log line is stamped with.
 #[cfg(target_os = "none")]
 use self::gmbus::MonotonicTimer;
+use self::{
+    gmbus::PollTimer,
+    pci::Bdf,
+    probe::{BusFacts, ProbeReport, WindowStatus},
+    regs::{RegisterWindow, Registers},
+};
 /// The aperture type and the window length are named only by the bare-metal
 /// half: [`mapped_facts`] answers with the one and [`open_register_window`]
 /// maps the other, and no host-test caller names either.  They are gated here
@@ -116,12 +122,6 @@ use self::gmbus::MonotonicTimer;
 /// builds have in common.
 #[cfg(target_os = "none")]
 use self::{id::Aperture, regs::PROBE_WINDOW};
-use self::{
-    gmbus::PollTimer,
-    pci::Bdf,
-    probe::{BusFacts, ProbeReport, WindowStatus},
-    regs::{RegisterWindow, Registers},
-};
 
 /// The report of the one probe this kernel runs, kept for the debug file.
 ///
@@ -448,11 +448,25 @@ fn modeset_at_boot(powered: &[(pci::Bdf, RegisterWindow)]) {
     };
     *GTT.lock() = Some(gtt.describe());
 
-    // The two modes `choose_mode` can return are the mode layer's choice and
-    // the reference timing, so a surface that covers both covers the choice.
-    let chosen = connector.plan.selection.mode;
-    let width = u32::from(chosen.hdisplay).max(u32::from(modeset::REFERENCE_HDISPLAY));
-    let height = u32::from(chosen.vdisplay).max(u32::from(modeset::REFERENCE_VDISPLAY));
+    // Select before allocating: a surface large enough for two candidate
+    // modes is not a console with the dimensions of the mode actually scanned.
+    let mut edid = Vec::with_capacity(2 * gmbus::EDID_BLOCK_LEN);
+    edid.extend_from_slice(connector.edid.as_slice());
+    if let Some(extension) = &connector.extension {
+        edid.extend_from_slice(extension.as_slice());
+    }
+    let mode = match modeset::preflight_mode(&window, &connector.plan, &edid) {
+        Ok((_, mode)) => mode,
+        Err(error) => {
+            let text = alloc::format!("intel-modeset: {}", error.describe());
+            axlog::warn!("{text}");
+            *MODESET.lock() = Some(text);
+            *CONNECT.lock() = Some(report);
+            return;
+        }
+    };
+    let width = u32::from(mode.hdisplay);
+    let height = u32::from(mode.vdisplay);
     axlog::info!(
         "intel-modeset: allocating {width}x{height} XRGB8888 for {} (phase 3.2), then programming \
          pipe A through DDI {} (phases 3.4 to 5.7)",
@@ -467,13 +481,6 @@ fn modeset_at_boot(powered: &[(pci::Bdf, RegisterWindow)]) {
             return;
         }
     };
-
-    // The blocks the mode layer's plan was made from, in the order it read them.
-    let mut edid = Vec::with_capacity(2 * gmbus::EDID_BLOCK_LEN);
-    edid.extend_from_slice(connector.edid.as_slice());
-    if let Some(extension) = &connector.extension {
-        edid.extend_from_slice(extension.as_slice());
-    }
 
     let swing = match swing::read_firmware_swing(&window, connector.ddi) {
         Ok(swing) => Some(swing),
@@ -515,6 +522,16 @@ fn modeset_at_boot(powered: &[(pci::Bdf, RegisterWindow)]) {
                 error.describe()
             );
             axlog::warn!("{text}");
+            // The GGTT mapping already exists, and an error from `arm` can
+            // follow writes that exposed it to the display engine. Keep the
+            // pages just as we do after an inconclusive phase-6 verdict;
+            // returning here must not free memory still named by the GGTT.
+            scanout::register(
+                Arc::new(surface),
+                scanout::Verdict::NotScanning {
+                    reason: text.clone(),
+                },
+            );
             *MODESET.lock() = Some(text);
             *CONNECT.lock() = Some(report);
             return;

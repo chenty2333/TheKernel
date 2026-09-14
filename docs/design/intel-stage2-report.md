@@ -1,11 +1,12 @@
 # Stage 2: the Intel display engine
 
-This is the review entry point for the branch `dev`, which carries the Intel
-display work on top of `main`.  Read this first; it says what was built, what
+This is the review entry point for the Intel display work originally developed
+on `dev`. Read this first; it says what was built, what
 was measured, what is still unverified, and where every claim is written down.
 
-`main` is untouched.  `dev` is 206 commits ahead of it, of which the Intel work
-is one merge away from the platform work that preceded it.
+The commit counts and test results below describe the original workstream
+runs, not the status of every later revision. Integration into `main` does not
+remove the hardware-validation limits recorded here.
 
 ## 1. What stage 2 was, and what it now does
 

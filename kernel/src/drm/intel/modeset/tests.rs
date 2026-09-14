@@ -1512,7 +1512,7 @@ fn a_port_the_table_has_no_ddi_buf_ctl_for_is_refused_by_name() {
 }
 
 #[test]
-fn a_surface_too_narrow_for_the_pattern_is_refused_by_name() {
+fn a_surface_smaller_than_the_mode_is_refused_before_programming() {
     let _guard = scheduler_test_context();
     let (edid, plan) = plan_1080p60();
     // Four columns cannot carry eight bars, and the sequence says so rather
@@ -1527,7 +1527,10 @@ fn a_surface_too_narrow_for_the_pattern_is_refused_by_name() {
     };
     assert_eq!(
         error,
-        ModesetError::Pattern(PatternError::TooNarrow { width: 4 })
+        ModesetError::SurfaceGeometry {
+            surface: (4, 4),
+            mode: (1920, 1080)
+        }
     );
     assert!(regs.writes().is_empty());
 }
@@ -1609,4 +1612,21 @@ fn a_repaint_writes_a_different_frame_into_the_same_surface() {
         pattern::BAR_COLORS[0],
         "and the bar is back once it has moved on"
     );
+}
+
+#[test]
+fn a_larger_surface_cannot_advertise_pixels_outside_the_scanout() {
+    let _guard = scheduler_test_context();
+    let (edid, plan) = plan_1080p60();
+    let surface = fb::Surface::allocate(&test_gtt(), 1920, 1200, fb::Format::Xrgb8888).unwrap();
+    let (regs, _armed) = working_device(67);
+    let result = set_mode(&regs, &FakeClock::new(), &request(&plan, &edid, &surface));
+    assert!(matches!(
+        result,
+        Err(ModesetError::SurfaceGeometry {
+            surface: (1920, 1200),
+            mode: (1920, 1080),
+        })
+    ));
+    assert!(regs.writes().is_empty());
 }
