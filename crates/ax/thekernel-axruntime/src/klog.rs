@@ -188,6 +188,14 @@ impl Store {
     ///
     /// A cursor the ring has already passed is moved up to the next retained
     /// record: the records it skipped are counted lost by [`Store::append`].
+    ///
+    /// A record ends at the next record's start mark, or at [`Store::end`] for
+    /// the newest record -- never at a newline.  `Text::finish` terminates every
+    /// record with a newline, but the text inside one may contain newlines of
+    /// its own (the igc driver's absence report is two lines in one `info!`), so
+    /// a newline is data and only a mark delimits.  `RECORD_BYTES` is the bound
+    /// the producer side enforces on one `Text`, so a reader that stops there
+    /// stops at the end of a maximal record, not inside a shorter one.
     fn peek(&self, cursor: u64) -> Option<(Queued, u64)> {
         let mut at = self.record_start(cursor);
         if at >= self.end {
@@ -195,14 +203,18 @@ impl Store {
         }
         let priority = self.marks[at as usize % CAPACITY] & PRIORITY_MASK;
         let mut text = Text::new();
-        while at < self.end && text.len < RECORD_BYTES {
-            let byte = self.bytes[at as usize % CAPACITY];
-            text.bytes[text.len] = byte;
-            text.len += 1;
-            at += 1;
-            if byte == b'\n' {
+        while text.len < RECORD_BYTES {
+            if at >= self.end {
                 break;
             }
+            // Once the first byte is copied, a start mark on the byte at `at`
+            // belongs to the next record and is this record's end.
+            if text.len > 0 && self.marks[at as usize % CAPACITY] & RECORD_START != 0 {
+                break;
+            }
+            text.bytes[text.len] = self.bytes[at as usize % CAPACITY];
+            text.len += 1;
+            at += 1;
         }
         Some((Queued { text, priority }, at))
     }
