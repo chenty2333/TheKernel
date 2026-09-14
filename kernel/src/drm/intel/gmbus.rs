@@ -1412,8 +1412,7 @@ pub(crate) fn read_edid_detailed(
     pin: Pin,
 ) -> (Result<EdidBytes, GmbusError>, BusNotes) {
     let mut notes = BusNotes::default();
-    let mut registers = *regs;
-    let result = read_edid_with(&mut registers, &MonotonicTimer, pin, &mut notes);
+    let result = read_edid_with(regs, &MonotonicTimer, pin, &mut notes);
     (result, notes)
 }
 
@@ -1454,8 +1453,7 @@ pub(crate) fn read_edid_extension(
     regs: &RegisterWindow,
     pin: Pin,
 ) -> Result<Option<EdidBytes>, GmbusError> {
-    let mut registers = *regs;
-    read_edid_extension_with(&mut registers, &MonotonicTimer, pin)
+    read_edid_extension_with(regs, &MonotonicTimer, pin)
 }
 
 /// [`read_edid_extension`] over any register file and any clock.
@@ -1586,8 +1584,7 @@ impl SinkProbe {
 /// or an interrupt: this reads the bus and reports, and the only writes it
 /// makes are the transaction's own.
 pub(crate) fn probe_sink(regs: &RegisterWindow) -> SinkProbe {
-    let mut registers = *regs;
-    probe_sink_with(&mut registers, &MonotonicTimer)
+    probe_sink_with(regs, &MonotonicTimer)
 }
 
 /// [`probe_sink`] over any register file and any clock.
