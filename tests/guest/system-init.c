@@ -358,6 +358,32 @@ static int test_signal_fp(void) {
         "signal-fp-child");
 }
 
+/* Phase-0 contract probes for the guest toolchain and nested QEMU plan
+ * (docs/design/guest-toolchain-and-nested-qemu.md).  Each one measures a
+ * contract a compiler or an emulator depends on and classifies its own
+ * findings as required or informational, so a non-zero result here means a
+ * required contract failed rather than that a probe was unable to look. */
+static int test_jit_mem(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-jit-mem-smoke",
+        NULL,
+        "jit-mem-child");
+}
+
+static int test_proc_shape(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-proc-shape-smoke",
+        NULL,
+        "proc-shape-child");
+}
+
+static int test_threads_futex(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-threads-futex-smoke",
+        NULL,
+        "threads-futex-child");
+}
+
 static int test_ioprio(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-ioprio-smoke",
@@ -793,6 +819,9 @@ int main(int argc, char **argv) {
         { "time", test_time_differential, 60 },
         { "umask", test_umask_differential, 60 },
         { "signal-fp", test_signal_fp, 60 },
+        { "jit-mem", test_jit_mem, 30 },
+        { "proc-shape", test_proc_shape, 30 },
+        { "threads-futex", test_threads_futex, 60 },
         { "io-uring", test_io_uring, 60 },
         { "io-uring-trace", test_io_uring_trace, 60 },
         { "log-diagnostics", test_log_diagnostics, 60 },
