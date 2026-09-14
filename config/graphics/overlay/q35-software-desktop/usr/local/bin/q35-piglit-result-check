@@ -12,6 +12,8 @@ from typing import Any
 
 
 ALLOWED_RESULTS = frozenset({"pass", "skip", "warn", "notrun"})
+MAX_FAILURE_DETAILS = 16
+MAX_DETAIL_CHARS = 1024
 
 
 def result_file(argument: str) -> Path:
@@ -47,6 +49,31 @@ def count_results(tests: dict[str, Any]) -> Counter[str]:
     return counts
 
 
+def report_failures(tests: dict[str, Any], errors: int) -> None:
+    """Expose bounded native test output, not environment or command metadata."""
+    reported = 0
+    for name, record in tests.items():
+        if record["result"] in ALLOWED_RESULTS:
+            continue
+        if reported == MAX_FAILURE_DETAILS:
+            break
+        detail = {"name": name, "result": record["result"]}
+        for field in ("out", "err"):
+            value = record.get(field)
+            if isinstance(value, str) and value:
+                detail[field] = value
+        detail = {
+            key: value[:MAX_DETAIL_CHARS] + ("...[truncated]" if len(value) > MAX_DETAIL_CHARS else "")
+            for key, value in detail.items()
+        }
+        # JSON escaping prevents test newlines/terminal controls from forging
+        # runner markers, while preserving useful shader/compiler diagnostics.
+        print("q35-piglit-result-check: failure " + json.dumps(detail), file=sys.stderr)
+        reported += 1
+    if errors > reported:
+        print(f"q35-piglit-result-check: {errors - reported} further failures omitted", file=sys.stderr)
+
+
 def main(arguments: list[str]) -> int:
     if len(arguments) != 1:
         print(f"usage: {Path(sys.argv[0]).name} RESULTS_DIR_OR_JSON_BZ2", file=sys.stderr)
@@ -54,7 +81,8 @@ def main(arguments: list[str]) -> int:
 
     try:
         path = result_file(arguments[0])
-        counts = count_results(read_results(path))
+        tests = read_results(path)
+        counts = count_results(tests)
     except ValueError as exc:
         print(f"q35-piglit-result-check: {exc}", file=sys.stderr)
         return 2
@@ -62,6 +90,7 @@ def main(arguments: list[str]) -> int:
     ordered_counts = " ".join(f"{result}={counts[result]}" for result in sorted(counts))
     errors = sum(count for result, count in counts.items() if result not in ALLOWED_RESULTS)
     print(f"THEKERNEL_Q35_VIRGL_PIGLIT_RESULTS {ordered_counts} errors={errors}")
+    report_failures(tests, errors)
     return 1 if errors else 0
 
 

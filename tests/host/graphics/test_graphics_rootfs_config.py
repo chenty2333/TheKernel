@@ -362,7 +362,7 @@ sleep() { echo wait; }
         )
         piglit = self.read("overlay/q35-software-desktop/usr/local/bin/q35-piglit-quick")
         self.assertIn("runner=/usr/bin/piglit", piglit)
-        self.assertIn('-p wayland -1 --timeout 60 quick "$results"', piglit)
+        self.assertIn('-p wayland -1 --log-level verbose --timeout 60 quick "$results"', piglit)
         self.assertIn("q35-piglit-result-check", piglit)
         self.assertNotIn("piglit-runner", piglit)
 

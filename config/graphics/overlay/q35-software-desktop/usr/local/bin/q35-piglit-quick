@@ -1,6 +1,6 @@
 #!/bin/sh
-# Keep this deliberately bounded: quick is the Phase-5 conformance smoke, not
-# a replacement for the full nightly Piglit profile.
+# Run the complete upstream quick profile, serially with a per-test timeout.
+# "quick" excludes some expensive cases; it is not a whole-suite time bound.
 set -eu
 
 runner=/usr/bin/piglit
@@ -17,7 +17,7 @@ results=/tmp/thekernel-piglit-quick
 rm -rf "$results"
 mkdir -p "$results"
 MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu "$runner" run \
-    -p wayland -1 --timeout 60 quick "$results" || {
+    -p wayland -1 --log-level verbose --timeout 60 quick "$results" || {
     ls -ld /dev/shm
     id
     echo 'THEKERNEL_Q35_VIRGL_PIGLIT_READY state=FAIL reason=piglit_quick'

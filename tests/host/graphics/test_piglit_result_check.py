@@ -81,7 +81,36 @@ class PiglitResultCheckTests(unittest.TestCase):
             completed.stdout,
             "THEKERNEL_Q35_VIRGL_PIGLIT_RESULTS crash=1 fail=1 pass=1 timeout=1 errors=3\n",
         )
-        self.assertEqual(completed.stderr, "")
+        details = [json.loads(line.removeprefix("q35-piglit-result-check: failure "))
+                   for line in completed.stderr.splitlines()]
+        self.assertEqual([detail["name"] for detail in details],
+                         ["quick/fail", "quick/crash", "quick/timeout"])
+
+    def test_failure_details_are_bounded_and_escape_test_output(self) -> None:
+        with test_tmpdir() as temporary:
+            tests = {f"quick/fail-{index}": {
+                "result": "fail", "out": "shader diagnostic\n\x1b[2J" + "x" * 2048,
+                "err": "link failed", "environment": {"PRIVATE": "do not print"},
+                "command": "do not print this either",
+            } for index in range(18)}
+            tests["quick/pass"] = {"result": "pass", "out": "unused passing output"}
+            results = self.write_results(pathlib.Path(temporary), {"tests": tests})
+            completed = self.run_checker(results)
+
+        self.assertEqual(completed.returncode, 1)
+        lines = completed.stderr.splitlines()
+        self.assertEqual(len(lines), 17)
+        self.assertEqual(lines[-1], "q35-piglit-result-check: 2 further failures omitted")
+        first = json.loads(lines[0].removeprefix("q35-piglit-result-check: failure "))
+        self.assertEqual(first["name"], "quick/fail-0")
+        self.assertTrue(first["out"].startswith("shader diagnostic\n\x1b[2J"))
+        self.assertTrue(first["out"].endswith("...[truncated]"))
+        self.assertLess(len(first["out"]), 1100)
+        self.assertEqual(first["err"], "link failed")
+        self.assertNotIn("\x1b", completed.stderr)
+        self.assertNotIn("do not print", completed.stderr)
+        self.assertNotIn("unused passing output", completed.stderr)
+        self.assertIn("errors=18", completed.stdout)
 
     def test_rejects_missing_or_empty_test_mappings_as_invalid_input(self) -> None:
         for document in ({}, {"tests": {}}):
