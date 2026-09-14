@@ -251,12 +251,24 @@ fn fix_screen_info_to_user_bytes(value: FixScreenInfo) -> [u8; size_of::<FixScre
     bytes
 }
 
-fn get_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_ne_bytes(bytes[offset..offset + size_of::<u32>()].try_into().unwrap())
+/// Read a `u32` field from the byte image of a `#[repr(C)]` structure.
+///
+/// Both the image's length and the field's offset are const generics of this
+/// function, so the assertion below is evaluated for the exact pair of values
+/// each call site passes: an offset that does not name a whole `u32` inside the
+/// image fails the build instead of panicking on a path a process reaches
+/// through an ioctl.
+fn get_u32<const LEN: usize, const OFFSET: usize>(bytes: &[u8; LEN]) -> u32 {
+    const { assert!(OFFSET + size_of::<u32>() <= LEN, "outside image") };
+    u32::from_ne_bytes(bytes[OFFSET..OFFSET + size_of::<u32>()].try_into().unwrap())
 }
 
-fn get_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_ne_bytes(bytes[offset..offset + size_of::<u64>()].try_into().unwrap())
+/// Read a `u64` field from the byte image of a `#[repr(C)]` structure.
+///
+/// As [`get_u32`], including the bound the build checks.
+fn get_u64<const LEN: usize, const OFFSET: usize>(bytes: &[u8; LEN]) -> u64 {
+    const { assert!(OFFSET + size_of::<u64>() <= LEN, "outside image") };
+    u64::from_ne_bytes(bytes[OFFSET..OFFSET + size_of::<u64>()].try_into().unwrap())
 }
 
 /// Linux `struct fb_cmap` on x86_64.  Truecolor devices use this only for
@@ -287,12 +299,12 @@ fn color_map_from_user(context: &IoctlContext, arg: usize) -> VfsResult<ColorMap
         .map_err(crate::mm::map_usercopy_error)?;
     let bytes = raw.map(|byte| unsafe { byte.assume_init() });
     Ok(ColorMap {
-        start: get_u32(&bytes, offset_of!(ColorMap, start)),
-        len: get_u32(&bytes, offset_of!(ColorMap, len)),
-        red: get_u64(&bytes, offset_of!(ColorMap, red)),
-        green: get_u64(&bytes, offset_of!(ColorMap, green)),
-        blue: get_u64(&bytes, offset_of!(ColorMap, blue)),
-        transp: get_u64(&bytes, offset_of!(ColorMap, transp)),
+        start: get_u32::<_, { offset_of!(ColorMap, start) }>(&bytes),
+        len: get_u32::<_, { offset_of!(ColorMap, len) }>(&bytes),
+        red: get_u64::<_, { offset_of!(ColorMap, red) }>(&bytes),
+        green: get_u64::<_, { offset_of!(ColorMap, green) }>(&bytes),
+        blue: get_u64::<_, { offset_of!(ColorMap, blue) }>(&bytes),
+        transp: get_u64::<_, { offset_of!(ColorMap, transp) }>(&bytes),
     })
 }
 
@@ -443,16 +455,16 @@ fn var_screen_info_from_user_bytes(
     bytes: &[u8; size_of::<VarScreenInfo>()],
 ) -> RequestedVarScreenInfo {
     RequestedVarScreenInfo {
-        xres: get_u32(bytes, offset_of!(VarScreenInfo, xres)),
-        yres: get_u32(bytes, offset_of!(VarScreenInfo, yres)),
-        xres_virtual: get_u32(bytes, offset_of!(VarScreenInfo, xres_virtual)),
-        yres_virtual: get_u32(bytes, offset_of!(VarScreenInfo, yres_virtual)),
-        xoffset: get_u32(bytes, offset_of!(VarScreenInfo, xoffset)),
-        yoffset: get_u32(bytes, offset_of!(VarScreenInfo, yoffset)),
-        bits_per_pixel: get_u32(bytes, offset_of!(VarScreenInfo, bits_per_pixel)),
-        grayscale: get_u32(bytes, offset_of!(VarScreenInfo, grayscale)),
-        nonstd: get_u32(bytes, offset_of!(VarScreenInfo, nonstd)),
-        rotate: get_u32(bytes, offset_of!(VarScreenInfo, rotate)),
+        xres: get_u32::<_, { offset_of!(VarScreenInfo, xres) }>(bytes),
+        yres: get_u32::<_, { offset_of!(VarScreenInfo, yres) }>(bytes),
+        xres_virtual: get_u32::<_, { offset_of!(VarScreenInfo, xres_virtual) }>(bytes),
+        yres_virtual: get_u32::<_, { offset_of!(VarScreenInfo, yres_virtual) }>(bytes),
+        xoffset: get_u32::<_, { offset_of!(VarScreenInfo, xoffset) }>(bytes),
+        yoffset: get_u32::<_, { offset_of!(VarScreenInfo, yoffset) }>(bytes),
+        bits_per_pixel: get_u32::<_, { offset_of!(VarScreenInfo, bits_per_pixel) }>(bytes),
+        grayscale: get_u32::<_, { offset_of!(VarScreenInfo, grayscale) }>(bytes),
+        nonstd: get_u32::<_, { offset_of!(VarScreenInfo, nonstd) }>(bytes),
+        rotate: get_u32::<_, { offset_of!(VarScreenInfo, rotate) }>(bytes),
     }
 }
 
