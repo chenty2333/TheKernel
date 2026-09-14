@@ -290,6 +290,8 @@ pub(super) enum IoUringBufferLeaseOwner {
 
 impl Drop for IoUringBufferLease {
     fn drop(&mut self) {
+        #[cfg(test)]
+        super::adapter_state_tests::publish_at_buffer_retirement(&self.ring);
         match &mut self.owner {
             IoUringBufferLeaseOwner::Registered(lease) => {
                 if let Some(lease) = lease.take() {

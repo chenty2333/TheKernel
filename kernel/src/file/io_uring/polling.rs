@@ -937,13 +937,24 @@ impl IoUring {
         Ok(())
     }
 
-    pub(super) fn take_pending_stream(&self, request: RequestId) -> Option<PendingStreamWork> {
+    pub(super) fn claim_pending_stream(&self, request: RequestId) -> Option<PendingStreamWork> {
         let mut state = self.state.lock();
         let slot = state.pending_stream.iter().position(|entry| {
             entry
                 .as_ref()
                 .is_some_and(|work| work.request_id() == request)
         })?;
+        // Claim the side-effect fence before the exact buffer owner leaves
+        // the table. Cancellation must never see Issued without that owner.
+        {
+            let RingState {
+                requests,
+                pending_stream,
+                ..
+            } = &mut *state;
+            let issued = pending_stream[slot].as_ref()?.issued.as_ref()?;
+            requests.begin_side_effect(issued).ok()?;
+        }
         let work = state.pending_stream[slot].take();
         if work.is_some() {
             state.pending_stream_count = state.pending_stream_count.saturating_sub(1);
@@ -958,20 +969,9 @@ impl IoUring {
     ) -> Result<(), PendingStreamWork> {
         let slot = work.slot;
         let mut state = self.state.lock();
-        // A readiness worker temporarily owns the table slot while it tries
-        // one read.  ASYNC_CANCEL/final-close may have consumed the request's
-        // terminal credit during that interval; such work must be dropped,
-        // never rearmed for a second I/O attempt.
-        if !work
-            .issued
-            .as_ref()
-            .is_some_and(|issued| state.requests.issued_is_live(issued))
-        {
-            return Err(work);
-        }
-        // The close cursor can have passed this slot while the worker held
-        // it in ShotInFlight.  Never reintroduce a readable-owner after close
-        // begins; the caller terminalizes this restored Issued request below.
+        // Keep the worker in ShotInFlight through readiness registration.
+        // Close may have swept the empty slot; in that case the caller owns
+        // the shot's terminal transition rather than restoring an orphan.
         if self.final_close_requested.load(Ordering::Acquire) {
             return Err(work);
         }
@@ -981,6 +981,13 @@ impl IoUring {
         if state.pending_stream_count >= IO_URING_PENDING_STREAM_CAPACITY {
             return Err(work);
         }
+        let Some(issued) = work.issued.as_ref() else {
+            return Err(work);
+        };
+        if state.requests.abort_nonterminal_shot(issued).is_err() {
+            return Err(work);
+        }
+        // Restore cancellability and custody in the same critical section.
         state.pending_stream[slot] = Some(work);
         state.pending_stream_count += 1;
         Ok(())
@@ -1052,51 +1059,14 @@ impl IoUring {
         self.complete_pending_stream_work(work, -LinuxError::from(error).code());
     }
 
-    /// Fails an owner after it has been returned from ShotInFlight to Issued
-    /// for a readiness rearm.  This path must not use the shot finalizer: it
-    /// intentionally exposes a normal cancellable request again before the
-    /// rearm decision.
-    pub(super) fn fail_pending_stream_rearm(
-        self: &Arc<Self>,
-        mut work: PendingStreamWork,
-        error: AxError,
-    ) {
-        let issued = work
-            .issued
-            .take()
-            .expect("pending stream rearm lost issued request");
-        let lease = work.control.deactivate();
-        drop(lease);
-        drop(work);
-        let _ = self.complete_issued(
-            issued,
-            TerminalCause::PreparationFailed,
-            -LinuxError::from(error).code(),
-            0,
-        );
-    }
-
     /// Retries one exact pending stream owner in task context. IRQ/readiness
     /// callbacks only set the source-wake bit and enqueue this ring; all user
     /// memory and pipe consumption happens here under a fixed worker budget.
     pub(super) fn retry_pending_stream(self: &Arc<Self>, control: Arc<PollControl>) {
         let request = control.request;
-        let Some(work) = self.take_pending_stream(request) else {
+        let Some(work) = self.claim_pending_stream(request) else {
             return;
         };
-        let begun = work
-            .issued
-            .as_ref()
-            .map(|issued| self.state.lock().requests.begin_side_effect(issued))
-            .unwrap_or(Err(IoUringError::UnknownRequest));
-        if begun.is_err() {
-            // Cancellation/close (or another execution claimant) has
-            // already won. Do not touch the FIFO or supplied buffer from a
-            // stale readiness hint.
-            drop(work.control.deactivate());
-            drop(work);
-            return;
-        }
         let result = work.control.description().and_then(|description| {
             crate::syscall::io_uring_pending_read_fixed(
                 &work.capability,
@@ -1108,16 +1078,6 @@ impl IoUring {
         match result {
             Ok(result) => self.complete_pending_stream_work(work, result as i32),
             Err(AxError::WouldBlock) => {
-                let aborted = work
-                    .issued
-                    .as_ref()
-                    .map(|issued| self.state.lock().requests.abort_nonterminal_shot(issued))
-                    .unwrap_or(Err(IoUringError::UnknownRequest));
-                if aborted.is_err() {
-                    drop(work.control.deactivate());
-                    drop(work);
-                    return;
-                }
                 let ready = work.control.check_arm_check();
                 match ready {
                     Ok(ready) if !ready.is_empty() || work.control.has_source_wake() => {
@@ -1125,16 +1085,16 @@ impl IoUring {
                             Ok(()) => self.publish_poll_hint(request),
                             Err(work) => {
                                 error!("io_uring pending stream owner lost while rearming");
-                                self.fail_pending_stream_rearm(work, AxError::BadState);
+                                self.complete_pending_stream_error(work, AxError::BadState);
                             }
                         }
                     }
                     Ok(_) => {
                         if let Err(work) = self.reinsert_pending_stream(work) {
-                            self.fail_pending_stream_rearm(work, AxError::BadState);
+                            self.complete_pending_stream_error(work, AxError::BadState);
                         }
                     }
-                    Err(error) => self.fail_pending_stream_rearm(work, error),
+                    Err(error) => self.complete_pending_stream_error(work, error),
                 }
             }
             Err(error) => self.complete_pending_stream_error(work, error),

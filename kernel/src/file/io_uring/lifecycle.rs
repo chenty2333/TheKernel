@@ -101,7 +101,7 @@ impl IoUring {
         };
 
         for slot in slots.clone() {
-            let (control, pending_stream_work, socket_work) = {
+            let (permit, control, pending_stream_work, socket_work) = {
                 let mut state = self.state.lock();
                 let request = state
                     .polls
@@ -132,11 +132,6 @@ impl IoUring {
                     .claim_terminal(request, TerminalCause::Closing)
                 {
                     Ok(permit) => {
-                        let token = state
-                            .requests
-                            .finish_terminal(permit, -LinuxError::ECANCELED.code(), 0)
-                            .map_err(map_core_error)?;
-                        self.queue_completion_locked(&mut state, token)?;
                         let control = state.polls[slot].take();
                         let pending_stream_work = state
                             .pending_stream
@@ -163,7 +158,7 @@ impl IoUring {
                                     .is_some_and(|work| work.request_id() == request)
                             })
                             .and_then(|index| state.socket_multishot[index].take());
-                        (control, pending_stream_work, socket_work)
+                        (Some(permit), control, pending_stream_work, socket_work)
                     }
                     Err(
                         IoUringError::TerminalAlreadyClaimed
@@ -196,7 +191,7 @@ impl IoUring {
                                     .is_some_and(|work| work.request_id() == request)
                             })
                             .and_then(|index| state.socket_multishot[index].take());
-                        (control, pending_stream_work, socket_work)
+                        (None, control, pending_stream_work, socket_work)
                     }
                     Err(error) => return Err(map_core_error(error)),
                 }
@@ -214,6 +209,16 @@ impl IoUring {
             drop(socket_lease);
             drop(control);
             drop(socket_work);
+            // A concurrent CQ drainer must not observe this request until
+            // every detached buffer/file owner has retired outside the lock.
+            if let Some(permit) = permit {
+                let mut state = self.state.lock();
+                let token = state
+                    .requests
+                    .finish_terminal(permit, -LinuxError::ECANCELED.code(), 0)
+                    .map_err(map_core_error)?;
+                self.queue_completion_locked(&mut state, token)?;
+            }
         }
 
         // Poll controls own a readiness registration and were detached above.
@@ -366,13 +371,14 @@ impl IoUring {
                             .finish_provider_cancel(id, ProviderCancelOutcome::Cancelled)
                             .map_err(map_core_error)?
                             .ok_or(AxError::BadState)?;
+                        drop(state);
+                        drop(owner);
+                        let mut state = self.state.lock();
                         let token = state
                             .requests
                             .finish_terminal(permit, -LinuxError::ECANCELED.code(), 0)
                             .map_err(map_core_error)?;
                         self.queue_completion_locked(&mut state, token)?;
-                        drop(state);
-                        drop(owner);
                         (None, true)
                     }
                     axfs_ng_vfs::FileIoCancelOutcome::InFlight
@@ -685,13 +691,14 @@ impl IoUring {
                             .finish_provider_cancel(target_id, ProviderCancelOutcome::Cancelled)
                             .map_err(map_core_error)?;
                         let permit = permit.ok_or(AxError::BadState)?;
+                        drop(state);
+                        drop(owner);
+                        let mut state = self.state.lock();
                         let token = state
                             .requests
                             .finish_terminal(permit, -LinuxError::ECANCELED.code(), 0)
                             .map_err(map_core_error)?;
                         self.queue_completion_locked(&mut state, token)?;
-                        drop(state);
-                        drop(owner);
                         (None, true, 0)
                     }
                     axfs_ng_vfs::FileIoCancelOutcome::InFlight => {
@@ -785,6 +792,7 @@ impl IoUring {
         let cancel_id = cancel.id();
         let (
             target_id,
+            permits,
             cancel_completion,
             control,
             pending_stream_work,
@@ -796,20 +804,10 @@ impl IoUring {
             match state.requests.claim_cancel(selector, Some(cancel_id)) {
                 Ok(target) => {
                     let target_id = target.id();
-                    let target_token = state
-                        .requests
-                        .finish_terminal(target, -LinuxError::ECANCELED.code(), 0)
-                        .map_err(map_core_error)?;
-                    self.queue_completion_locked(&mut state, target_token)?;
                     let cancel_permit = state
                         .requests
                         .claim_terminal(cancel_id, TerminalCause::Completed)
                         .map_err(map_core_error)?;
-                    let cancel_token = state
-                        .requests
-                        .finish_terminal(cancel_permit, 0, 0)
-                        .map_err(map_core_error)?;
-                    self.queue_completion_locked(&mut state, cancel_token)?;
                     let control = usize::try_from(target_id.slot())
                         .ok()
                         .and_then(|slot| state.polls.get_mut(slot))
@@ -881,6 +879,7 @@ impl IoUring {
                         });
                     (
                         Some(target_id),
+                        (Some(target), cancel_permit),
                         0,
                         control,
                         pending_stream_work,
@@ -894,13 +893,9 @@ impl IoUring {
                         .requests
                         .claim_terminal(cancel_id, TerminalCause::Completed)
                         .map_err(map_core_error)?;
-                    let cancel_token = state
-                        .requests
-                        .finish_terminal(cancel_permit, -LinuxError::ENOENT.code(), 0)
-                        .map_err(map_core_error)?;
-                    self.queue_completion_locked(&mut state, cancel_token)?;
                     (
                         None,
+                        (None, cancel_permit),
                         -LinuxError::ENOENT.code(),
                         None,
                         None,
@@ -919,6 +914,34 @@ impl IoUring {
         let socket_lease = socket_work
             .as_ref()
             .and_then(|work| work.control.deactivate());
+        // Holding terminal claims fences cancellation/readiness, while
+        // keeping both CQEs invisible to independent pending-CQ drainers.
+        drop(lease);
+        drop(pending_stream_lease);
+        drop(pending_stream_work);
+        drop(socket_lease);
+        drop(socket_work);
+        drop(control);
+        drop(parked_work);
+        if let Some((request, provider, _iopoll)) = iopoll_provider {
+            provider.cancel_uring_cmd(request);
+            drop(provider);
+        }
+        {
+            let mut state = self.state.lock();
+            if let Some(target) = permits.0 {
+                let token = state
+                    .requests
+                    .finish_terminal(target, -LinuxError::ECANCELED.code(), 0)
+                    .map_err(map_core_error)?;
+                self.queue_completion_locked(&mut state, token)?;
+            }
+            let token = state
+                .requests
+                .finish_terminal(permits.1, cancel_completion, 0)
+                .map_err(map_core_error)?;
+            self.queue_completion_locked(&mut state, token)?;
+        }
         let target_linked = match target_id {
             Some(id) => self.release_linked_after_terminal(id, -LinuxError::ECANCELED.code())?,
             None => None,
@@ -931,17 +954,6 @@ impl IoUring {
         let cancel_result = self
             .publish_pending_slot(cancel_id.slot() as usize)
             .map(|_| ());
-        drop(lease);
-        drop(pending_stream_lease);
-        drop(pending_stream_work);
-        drop(socket_lease);
-        drop(socket_work);
-        drop(control);
-        drop(parked_work);
-        if let Some((request, provider, _iopoll)) = iopoll_provider {
-            provider.cancel_uring_cmd(request);
-            drop(provider);
-        }
         target_result.and(cancel_result)?;
         if let Some(dispatch) = target_linked {
             let _ = crate::syscall::dispatch_dependency_submission(self, dispatch)?;

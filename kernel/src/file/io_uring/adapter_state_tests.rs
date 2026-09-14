@@ -329,13 +329,61 @@ impl axfs_ng_vfs::SubmittedFileIoControl for CancelledFileIoControl {
     }
 }
 
+// A synchronous scheduling edge at the start of lease destruction models
+// another CPU draining pending CQEs before that destruction can acquire the
+// ring lock. Target one ring so unrelated parallel tests remain unaffected.
+static BUFFER_RETIREMENT_PUBLISHER: spin::Mutex<Option<Weak<IoUring>>> = spin::Mutex::new(None);
+
+pub(super) fn publish_at_buffer_retirement(ring: &Arc<IoUring>) {
+    let selected = BUFFER_RETIREMENT_PUBLISHER
+        .lock()
+        .as_ref()
+        .is_some_and(|selected| selected.ptr_eq(&Arc::downgrade(ring)));
+    if selected {
+        ring.flush_pending_publications_now().unwrap();
+        assert_eq!(
+            ring.cq_tail.load_acquire(),
+            0,
+            "CQE visible before buffer retirement"
+        );
+        assert_eq!(ring.pending_publication_count.load(Ordering::Acquire), 0);
+    }
+}
+
+struct BufferRetirementPublisher;
+
+impl Drop for BufferRetirementPublisher {
+    fn drop(&mut self) {
+        *BUFFER_RETIREMENT_PUBLISHER.lock() = None;
+    }
+}
+
 #[test]
 fn fixed_buffer_retires_before_terminal_cq_notification() {
+    check_fixed_buffer_retirement(false);
+}
+
+#[test]
+fn fixed_buffer_retires_before_independent_pending_cq_drain() {
+    check_fixed_buffer_retirement(true);
+}
+
+fn check_fixed_buffer_retirement(interleave_publication: bool) {
     use axhal::paging::MappingFlags;
     use memory_addr::VirtAddr;
 
     let _context = crate::test_support::scheduler_test_context();
-    for path in ["owned", "stream", "stream-rearm-error", "cancel", "close"] {
+    for path in [
+        "owned",
+        "stream",
+        "stream-rearm-error",
+        "cancel",
+        "close",
+        "stream-cancel",
+        "stream-close",
+        "stream-worker-rearm",
+        "stream-worker-close",
+    ] {
         let layout = SetupRequest::new(2, 0, SetupFlags::NO_SQARRAY)
             .resolve(FeatureFlags::EMPTY)
             .unwrap();
@@ -359,6 +407,10 @@ fn fixed_buffer_retires_before_terminal_cq_notification() {
             .unwrap();
         ring.unregister_buffers().unwrap();
         assert!(ring.state.lock().registered_buffers.is_some());
+        let _publisher = BufferRetirementPublisher;
+        if interleave_publication {
+            *BUFFER_RETIREMENT_PUBLISHER.lock() = Some(Arc::downgrade(&ring));
+        }
         let wake = Arc::new(BufferRetirementWake {
             ring: ring.clone(),
             retired: AtomicBool::new(false),
@@ -434,7 +486,7 @@ fn fixed_buffer_retires_before_terminal_cq_notification() {
             else {
                 unreachable!()
             };
-            if path == "stream" {
+            if path == "stream" || path == "stream-rearm-error" {
                 ring.state
                     .lock()
                     .requests
@@ -450,10 +502,59 @@ fn fixed_buffer_retires_before_terminal_cq_notification() {
                 context,
                 capability: capability.clone(),
             };
-            if path == "stream" {
-                ring.complete_pending_stream_work(work, 32);
-            } else {
-                ring.fail_pending_stream_rearm(work, AxError::NoMemory);
+            match path {
+                "stream" => ring.complete_pending_stream_work(work, 32),
+                "stream-cancel"
+                | "stream-close"
+                | "stream-worker-rearm"
+                | "stream-worker-close" => {
+                    ring.state.lock().pending_stream[0] = Some(work);
+                    ring.state.lock().pending_stream_count = 1;
+                    if path.starts_with("stream-worker-") {
+                        let id = ring.state.lock().pending_stream[0]
+                            .as_ref()
+                            .unwrap()
+                            .request_id();
+                        let work = ring.claim_pending_stream(id).unwrap();
+                        assert!(
+                            matches!(
+                                ring.state
+                                    .lock()
+                                    .requests
+                                    .claim_cancel(CancelSelector::UserData(0), None),
+                                Err(IoUringError::CancellationTargetNotFound)
+                            ),
+                            "private stream worker must remain uncancellable"
+                        );
+                        if path == "stream-worker-close" {
+                            ring.final_close_requested.store(true, Ordering::Release);
+                            let work = ring.reinsert_pending_stream(work).err().unwrap();
+                            assert!(matches!(
+                                ring.state
+                                    .lock()
+                                    .requests
+                                    .claim_cancel(CancelSelector::UserData(0), None),
+                                Err(IoUringError::CancellationTargetNotFound)
+                            ));
+                            // The flag above tests the real reinsert guard;
+                            // clear it before completion to avoid enqueuing
+                            // synthetic teardown work in the global worker.
+                            ring.final_close_requested.store(false, Ordering::Release);
+                            ring.complete_pending_stream_error(work, AxError::BadState);
+                        } else {
+                            assert!(ring.reinsert_pending_stream(work).is_ok());
+                            ring.cancel_request(issue_test_request(&ring), 0).unwrap();
+                        }
+                    } else if path == "stream-cancel" {
+                        ring.cancel_request(issue_test_request(&ring), 0).unwrap();
+                    } else {
+                        ring.state.lock().final_close.enter(FinalClosePhase::Polls);
+                        ring.close_polls_step().unwrap();
+                        ring.state.lock().final_close.phase = FinalClosePhase::Begin;
+                        ring.flush_pending_publications_now().unwrap();
+                    }
+                }
+                _ => ring.complete_pending_stream_error(work, AxError::NoMemory),
             }
         }
         assert!(
