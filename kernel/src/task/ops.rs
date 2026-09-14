@@ -1587,6 +1587,22 @@ impl ExitStatusTrace {
 static EXIT_STATUS_TRACE: axsync::spin::SpinNoIrq<ExitStatusTrace> =
     axsync::spin::SpinNoIrq::new(ExitStatusTrace::new());
 
+/// The ring plus one record of slack has to fit in one task stack.
+///
+/// The dump renders on the reader's own kernel stack, and
+/// [`exit_status_trace_dump`] copies the ring into a `Vec` precisely because a
+/// by-value copy does not fit: it was 364 KiB against a 256 KiB
+/// `TASK_STACK_SIZE`.  Task stacks come from `alloc::alloc` with no guard page,
+/// so a frame that grows past the bottom writes into the heap instead of
+/// faulting.  This makes the next enlargement of the ring, or of the record, a
+/// compile error rather than a corruption that only appears on a machine that
+/// reads the file.
+const _: () = assert!(
+    core::mem::size_of::<ExitStatusRecord>() * (EXIT_STATUS_TRACE_LEN + 1)
+        < axconfig::TASK_STACK_SIZE,
+    "the ring must stay small enough to render inside a task stack"
+);
+
 fn exit_status_trace_push(record: ExitStatusRecord) {
     let mut trace = EXIT_STATUS_TRACE.lock();
     trace.sequence = trace.sequence.wrapping_add(1);
@@ -1801,11 +1817,34 @@ pub(crate) fn exit_status_trace_publish(process: &Arc<Process>, wait_status: i32
 /// Called from the `/proc` read handler, i.e. from the guest's own context
 /// while the kernel is still running, so the whole ring is preserved rather
 /// than only the tail that survived a boot-long kernel log.
-pub(crate) fn exit_status_trace_dump() -> Vec<u8> {
-    let (records, sequence) = {
+///
+/// The ring is copied into a heap buffer rather than into a local, and that is
+/// a requirement rather than a preference.  The array is
+/// `EXIT_STATUS_TRACE_LEN * size_of::<ExitStatusRecord>()` bytes -- 182 KiB as
+/// this is written -- and destructuring `(trace.records, trace.sequence)` copied
+/// it twice, which the compiler turned into a **364 KiB stack frame** against a
+/// `TASK_STACK_SIZE` of 256 KiB.  Task stacks come from `alloc::alloc` with no
+/// guard page, so this did not fault: the frame's stack probe walked below the
+/// stack and wrote a zero into every page it crossed, inside whatever the
+/// allocator had put there.  A world-readable `/proc` file could therefore
+/// corrupt the kernel heap.  The `const _` assertion beside `EXIT_STATUS_TRACE`
+/// bounds the ring against the stack, and
+/// `the_dump_renders_inside_a_stack_far_smaller_than_the_ring` fails if a
+/// by-value copy comes back.
+///
+/// The reservation happens before the lock, because pushing into reserved
+/// capacity does not allocate and the lock is taken with interrupts disabled.
+pub(crate) fn exit_status_trace_dump() -> AxResult<Vec<u8>> {
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(EXIT_STATUS_TRACE_LEN)
+        .map_err(|_| AxError::NoMemory)?;
+    let sequence;
+    {
         let trace = EXIT_STATUS_TRACE.lock();
-        (trace.records, trace.sequence)
-    };
+        sequence = trace.sequence;
+        records.extend_from_slice(&trace.records);
+    }
     let width = EXIT_STATUS_TRACE_LEN as u32;
     // Entries `sequence - width + 1 ..= sequence` are the ones the ring still
     // holds once it has wrapped; before that, the whole prefix is live.
@@ -1892,7 +1931,7 @@ pub(crate) fn exit_status_trace_dump() -> Vec<u8> {
         out.extend_from_slice(line.as_bytes());
     }
     out.extend_from_slice(b"EXITSTATUS_TRACE_END\n");
-    out
+    Ok(out)
 }
 
 
