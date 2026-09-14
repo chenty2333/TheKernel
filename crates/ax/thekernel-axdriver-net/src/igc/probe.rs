@@ -23,11 +23,13 @@
 //! A confirmed verdict means: a PCI function with one of the 16 device ids
 //! `igc_pci_tbl` binds is present at a specific bus address, the aperture its
 //! BAR names answered, and the registers that identify the part read back
-//! values a part of this family can produce.  It does **not** mean the MAC
-//! address is usable (nothing has reset the part, so the NVM auto-read may not
-//! have run), it does not mean the link will come up, and it is not evidence
-//! about any other machine: the only machine this code has ever run on is
-//! QEMU, which has no such device.
+//! values a part of this family can produce -- including a receive address that
+//! is a usable unicast address.  That last one is a real requirement rather
+//! than a formality, so a part whose NVM has never been programmed is reported
+//! and refused instead of driven (see `ids.rs`).  The verdict still does not
+//! mean the link will come up, and it is not evidence about any other machine:
+//! the only machine this code has ever run on is QEMU, which has no such
+//! device.
 //!
 //! The negative case matters at least as much.  A machine without the part
 //! must produce one greppable line saying so, plus -- when an Intel network
@@ -67,8 +69,15 @@ pub struct BarFacts {
 
 impl BarFacts {
     /// Whether this BAR can hold the registers the driver names.
+    ///
+    /// The test is against the whole window the driver maps, not merely the
+    /// span the named registers occupy.  Those differ: the highest named
+    /// register ends at [`NAMED_SPAN`], while every access is bounds-checked
+    /// against [`WINDOW_BYTES`], so a BAR between the two would be mapped past
+    /// its own end.  Requiring the window makes the mapping's safety argument
+    /// true by construction rather than by accident of the named set.
     pub const fn holds_the_named_registers(&self) -> bool {
-        self.is_memory && self.address != 0 && (self.size as usize) >= NAMED_SPAN
+        self.is_memory && self.address != 0 && (self.size as usize) >= WINDOW_BYTES
     }
 
     /// How the report spells it.
@@ -557,16 +566,20 @@ pub fn run<B: IgcBus>(facts: ConfigFacts, device: &'static DeviceId, bus: &mut B
         name: "bar size",
         agrees: facts.bar0.holds_the_named_registers(),
         note: format!(
-            "{} holds the highest named register end {:#x}",
+            "{} holds the {WINDOW_BYTES}-byte window mapped for {} named registers \
+             (highest named end {NAMED_SPAN:#x})",
             facts.bar0.describe(),
-            NAMED_SPAN,
+            NAMED.len(),
         ),
     });
 
     // The receive address the NVM auto-read leaves in RAL0/RAH0.  Nothing has
-    // reset the part in this phase, so these may legitimately read as zero --
-    // which is reported as what it is rather than treated as a failure of
-    // identity.
+    // reset the part in this phase, so these may legitimately read as zero: no
+    // reset has run, so the auto-read may not have happened yet.  The reading
+    // is recorded as its own check and it also decides the verdict -- a part
+    // with no usable address is refused rather than driven, which is what
+    // `ids.rs` documents and what the bring-up phase would refuse anyway after
+    // its own reset.
     let low = value(Meaning::ReceiveAddressLow);
     let high = value(Meaning::ReceiveAddressHigh);
     if let (Some(low), Some(high)) = (low, high) {
@@ -823,6 +836,41 @@ mod tests {
         assert!(text.contains("the aperture did not answer"), "{text}");
         // Nothing may be claimed about a part whose aperture never answered.
         assert!(!text.contains("identified as"), "{text}");
+    }
+
+    /// Admission rests on the window the driver maps, not on the span the
+    /// named registers happen to occupy.
+    ///
+    /// The two differ: `NAMED_SPAN` is where the highest named register ends,
+    /// while every access is bounds-checked against `WINDOW_BYTES`.  A BAR
+    /// that covers the named registers but not the window would be mapped past
+    /// its own end, so the boundary sits at the window.
+    #[test]
+    fn the_bar_admission_boundary_is_the_mapped_window() {
+        let mut bar = BarFacts {
+            index: 0,
+            is_memory: true,
+            is_64bit: false,
+            prefetchable: false,
+            address: 0xfeb0_0000,
+            size: 0x20_0000,
+        };
+        assert!(bar.holds_the_named_registers(), "the real BAR0 is 2 MiB");
+        bar.size = WINDOW_BYTES as u32;
+        assert!(bar.holds_the_named_registers(), "the window exactly fits");
+        bar.size = NAMED_SPAN as u32;
+        assert!(
+            !bar.holds_the_named_registers(),
+            "covering the named registers is not enough to map the window"
+        );
+        bar.size = 0xf000;
+        assert!(!bar.holds_the_named_registers());
+        bar.size = 0x20_0000;
+        bar.is_memory = false;
+        assert!(!bar.holds_the_named_registers(), "I/O space is not the aperture");
+        bar.is_memory = true;
+        bar.address = 0;
+        assert!(!bar.holds_the_named_registers(), "an unassigned BAR is not mapped");
     }
 
     #[test]
