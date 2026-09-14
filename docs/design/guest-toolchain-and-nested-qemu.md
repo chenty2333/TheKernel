@@ -363,6 +363,58 @@ resolution, and the fallback paths of `rseq`, `clone3`, `statx` and
 the GCC/Clang payload on a dynamic-glibc smoke case. musl remains the
 Phase 1/2 vehicle; this milestone gates Phase 3 rather than replacing it.
 
+**The dynamic-glibc milestone is implemented and measured in the guest.** It
+turned out to need no kernel change at all, which is the milestone's most useful
+result and was not the expectation when the plan was written.
+
+Reconnaissance read the kernel's ELF loader directly and found the whole
+contract already implemented: the interpreter path is read out of the file,
+resolved in the caller's VFS view, mapped, and started with `AT_BASE` pointing
+at it, and the auxiliary vector was measured numerically identical to Linux's on
+every entry glibc reads. Forcing eight of glibc's optional syscalls to `-ENOSYS`
+simultaneously still starts a program, so the required set is eleven calls, all
+of which the kernel implements; `arch_prctl(ARCH_SET_FS)` is the only one with
+no fallback, and static glibc in the guest already depended on it. The blocker
+was the *image*: no `/lib64`, no loader, no `libc.so.6`, and no dynamically
+linked binary anywhere.
+
+So the milestone is a staging milestone. A `glibc` payload takes the loader and
+shared libc out of a pinned Fedora 44 RPM (`glibc-2.43-8.fc44`, sha256
+`84f0af45...`) and puts them unchanged at `/lib64`, and ships one dynamically
+linked smoke program built with the host gcc. Two decisions are worth
+recording:
+
+- **The loader is not rebuilt.** A glibc built with `-march=x86-64-v3` produces
+  a loader that aborts on a CPU below that ISA level — a failure that reads as a
+  kernel bug. The pinned binary RPM is baseline and identical for everyone.
+- **No `ld.so.cache` is staged.** Sixteen corruption modes of the cache were
+  measured to be completely silent, falling back to the default directories, so
+  the loader's built-in search path is enough and `ldconfig` is not needed.
+
+Measured in the guest, `--toolchain glibc`:
+
+| Quantity | Guest |
+|---|---|
+| KTAP plan | `1..46`, 46 ok, 0 skips, `THEKERNEL_SYSTEM_TEST_COMPLETE` |
+| Runner | `qemu-runner exit=0` (normal shutdown) |
+| `PT_INTERP` | `/lib64/ld-linux-x86-64.so.2`, 1 `DT_NEEDED` |
+| `AT_BASE` (interpreter base) | `0x6c49000` — non-zero, so a loader really ran |
+| `AT_PHDR` / `AT_PHNUM` / `AT_ENTRY` | `0x400040` / `0xd` / `0x400590` |
+| glibc version, as reported by the relocated library | `2.43` |
+| Child exit status | 0 |
+
+The case checks two things separately, because either alone is worthless: that
+the program really is dynamic (a static binary would exit 0 while proving
+nothing about a loader), and that `AT_BASE` is non-zero (a loader that ran while
+the program never started would prove nothing about glibc).
+
+The two kernel-side risks reconnaissance identified remain latent and untested:
+`uspace.map` refuses overlapping `PT_LOAD` ranges where Linux's `elf_map`
+replaces them, and `libc.so.6` is mapped whole and then `MAP_FIXED` over live
+sub-ranges with changed protections. The pinned artifact set was measured not to
+trigger the first. Neither is exercised by this milestone's workload, so neither
+is claimed fixed.
+
 Keep the claims separate: compiling hello is native compilation; guest GCC
 rebuilding tcc is a guest source build; tcc rebuilding itself can demonstrate
 compiler self-hosting if the rebuilt compiler is also tested. Rebuilding

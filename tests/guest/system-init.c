@@ -494,6 +494,23 @@ static int test_compiler_smoke(void) {
 }
 #endif
 
+#if defined(THEKERNEL_TOOL_PAYLOAD_GLIBC)
+/* Phase 3, first milestone: a dynamically linked glibc program runs in the
+ * guest.  This is a compile-time selection for the same reason the compiler and
+ * nested cases are: an image built for this payload that cannot run a dynamic
+ * program must fail, not quietly report a smaller plan.
+ *
+ * The helper checks two things separately, because either alone is worthless: a
+ * static binary would exit 0 while proving nothing about a loader, and a loader
+ * that runs while the program never starts would prove nothing about glibc. */
+static int test_glibc_smoke(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-glibc-smoke",
+        NULL,
+        "glibc-smoke-child");
+}
+#endif
+
 #if defined(THEKERNEL_TOOL_PAYLOAD_NESTED)
 /* Phase 2a: a system emulator that lives in the guest boots a second kernel in
  * the guest's own userspace under TCG.  Like the compiler case, this is a
@@ -964,6 +981,9 @@ int main(int argc, char **argv) {
         { "threads-futex", test_threads_futex, 60 },
 #if defined(THEKERNEL_TOOL_PAYLOAD_TCC)
         { "compiler-smoke", test_compiler_smoke, 120 },
+#endif
+#if defined(THEKERNEL_TOOL_PAYLOAD_GLIBC)
+        { "glibc-smoke", test_glibc_smoke, 60 },
 #endif
 #if defined(THEKERNEL_TOOL_PAYLOAD_NESTED)
         { "nested-tcg-hello", test_nested_tcg_hello, 300 },

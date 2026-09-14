@@ -89,7 +89,14 @@ case "$PAYLOAD" in
         [ -n "$OUTPUT" ] || { printf '%s\n' '--output is required' >&2; exit 2; }
         exec "$SCRIPT_DIR/build-nested-payload.sh" --output "$OUTPUT" --jobs "$JOBS"
         ;;
-    *) printf '%s\n' '--payload must be none, tcc or nested' >&2; exit 2 ;;
+    # The glibc payload is the opposite of the others: nothing is built, only
+    # staged.  It exists because the guest image had no dynamic loader at all,
+    # so the kernel's dynamic-linking contract could not be tested.
+    glibc)
+        [ -n "$OUTPUT" ] || { printf '%s\n' '--output is required' >&2; exit 2; }
+        exec "$SCRIPT_DIR/build-glibc-payload.sh" --output "$OUTPUT"
+        ;;
+    *) printf '%s\n' '--payload must be none, tcc, nested or glibc' >&2; exit 2 ;;
 esac
 
 # `none` is a valid request that produces an empty staging tree; the caller

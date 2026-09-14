@@ -154,11 +154,15 @@ class SystemTestGateTests(unittest.TestCase):
             "tcc": ["-DTHEKERNEL_TOOL_PAYLOAD_TCC=1"],
             "nested": ["-DTHEKERNEL_TOOL_PAYLOAD_TCC=1",
                        "-DTHEKERNEL_TOOL_PAYLOAD_NESTED=1"],
+            # `glibc` is a staging milestone and deliberately excludes the
+            # compiler case: it is a separate payload with its own cost.
+            "glibc": ["-DTHEKERNEL_TOOL_PAYLOAD_GLIBC=1"],
         }
         expected = {
             "none": [],
             "tcc": ["compiler-smoke"],
             "nested": ["compiler-smoke", "nested-tcg-hello", "nested-linux-boot"],
+            "glibc": ["glibc-smoke"],
         }
         with test_tmpdir() as directory:
             for payload, flags in defines.items():
@@ -171,7 +175,7 @@ class SystemTestGateTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     text = result.stdout
                     present = [name for name in ("compiler-smoke", "nested-tcg-hello",
-                                                 "nested-linux-boot")
+                                                 "nested-linux-boot", "glibc-smoke")
                                if f'{{ "{name}",' in text]
                     self.assertEqual(present, expected[payload])
                     # Both payloads are supersets of `none`, so the baseline
@@ -261,6 +265,43 @@ class SystemTestGateTests(unittest.TestCase):
         initrd = inner_initrd.read_bytes()
         self.assertEqual(initrd[:2], b"\x1f\x8b", "the initramfs must be gzip")
         self.assertGreater(len(initrd), 100_000)
+
+    def test_staged_glibc_payload_satisfies_its_interface(self) -> None:
+        """The glibc payload must stage what a dynamic program needs.
+
+        Checked here rather than only in the guest because the interesting
+        failure -- a loader at the wrong path, or a smoke binary that is not
+        actually dynamic -- is a staging bug that looks like a kernel bug when
+        it surfaces two minutes later as an ENOENT inside the guest.
+        """
+
+        root = Path(os.environ.get(
+            "THEKERNEL_STATE_DIR",
+            Path.home() / ".cache/thekernel-targets/guest-toolchain",
+        ))
+        tools = root / "guest-tools" / "glibc"
+        loader = tools / "lib64" / "ld-linux-x86-64.so.2"
+        libc = tools / "lib64" / "libc.so.6"
+        program = tools / "opt/thekernel-tools/bin/glibc-smoke"
+        if not program.is_file():
+            self.skipTest(f"no staged glibc payload at {tools}")
+
+        # PT_INTERP is a fixed string in the executable and the kernel resolves
+        # exactly it, so the staged path has to be that string.
+        self.assertTrue(loader.is_file(), "the loader is not staged where PT_INTERP points")
+        self.assertTrue(libc.is_file())
+        header = program.read_bytes()[:64]
+        self.assertEqual(header[:4], b"\x7fELF")
+        self.assertEqual(header[4], 2, "the smoke program must be ELF64")
+        text = program.read_bytes()
+        self.assertIn(b"/lib64/ld-linux-x86-64.so.2\x00", text,
+                      "the program's PT_INTERP does not name the staged loader")
+        self.assertIn(b"libc.so.6\x00", text,
+                      "the program has no DT_NEEDED for the staged libc")
+
+        # The loader must be able to run first, so it cannot need a loader.
+        self.assertNotIn(b"ld-linux-x86-64.so.2\x00", loader.read_bytes()[:4096],
+                         "the staged loader looks like it has its own PT_INTERP")
 
     def test_image_reuse_follows_the_payload_it_embeds(self) -> None:
         """A rebuilt payload must invalidate the image built from it.

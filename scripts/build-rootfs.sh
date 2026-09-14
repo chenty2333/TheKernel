@@ -302,6 +302,9 @@ INIT_DEFINES=""
 case "$TOOLCHAIN" in
     tcc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1" ;;
     nested) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1 -DTHEKERNEL_TOOL_PAYLOAD_NESTED=1" ;;
+    # `glibc` deliberately does not include the tcc case: it is a staging
+    # milestone, and the compiler is a separate payload with its own cost.
+    glibc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_GLIBC=1" ;;
 esac
 # shellcheck disable=SC2086 # INIT_DEFINES is a deliberate flag list
 "${CROSS_COMPILE}gcc" -O2 -static -s -std=c11 -Wall -Wextra -Werror \
