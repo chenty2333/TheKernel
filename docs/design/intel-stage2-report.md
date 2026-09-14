@@ -292,3 +292,12 @@ Reading order, if you want the argument rather than the diff:
 
 Every design record ends with what is *not* verified.  Those sections are the
 honest edge of this work and are worth reading before the code.
+
+Two things about the records themselves.  They were written in per-workstream
+worktrees, and several carry a `Branch:` or `Worktree:` line naming the one they
+came from; those branches have been merged and the worktrees removed, so the
+names identify a workstream rather than a ref to check out, and the history is
+`git log dev`.  And where a record states a number -- a test count, a warning
+count, what a boot's log carried -- it was true of the tree it was written on and
+is re-measured on the merged tip before it is trusted here; §2 of this document
+is the case that taught the rule.
