@@ -885,7 +885,7 @@ impl Gtt {
 
     /// Take a page table window over memory that is already mapped.
     ///
-    /// The test-side twin of [`MappedArray::map_bar`]: a test stands ordinary
+    /// The test-side twin of `MappedArray::map_bar`: a test stands ordinary
     /// memory in for the device aperture, and no production path has a reason
     /// to point the page table at memory this driver did not map.  The test
     /// gate keeps that true by construction rather than by inspection.
