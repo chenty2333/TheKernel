@@ -140,11 +140,22 @@ impl Store {
         let priority = priority & PRIORITY_MASK;
         for (index, byte) in text.as_bytes().iter().enumerate() {
             let slot = self.end as usize % CAPACITY;
-            if self.marks[slot] & RECORD_START != 0 && self.console <= self.end {
+            // The byte this write destroys sits a whole ring behind the write
+            // cursor, so the question "had the console secured it?" is about
+            // that offset and not about `end`.  Comparing against `end` asks
+            // whether the console is behind the *writer*, which is true almost
+            // always, and counts every record the ring wraps over as lost even
+            // when the console printed it long ago.
+            let overwritten = self.end.saturating_sub(CAPACITY as u64);
+            if self.marks[slot] & RECORD_START != 0 && self.console <= overwritten {
                 // About to overwrite the first byte of a record the console had
                 // not secured.  Count the record, not the event: `log_stats`
                 // reports records, and a reader must be able to tell "the ring
                 // wrapped" from "the console lost this many records".
+                //
+                // Equality counts.  `console` only advances past a record once
+                // the console has copied it out, so a console equal to this
+                // offset has not read the record whose head is here yet.
                 self.console_lost += 1;
             }
             self.bytes[slot] = *byte;
@@ -765,6 +776,88 @@ mod tests {
         assert!(core::str::from_utf8(text.as_bytes()).is_ok());
         assert!(text.as_bytes().ends_with(b" [truncated]\n"));
     }
+    /// A console that keeps up loses nothing, however many times the ring
+    /// wraps around it.  The count is about records the ring destroyed before
+    /// the console could copy them out, not about how often the ring wrapped:
+    /// a counter that grew with every wrap would make every long boot report
+    /// dropped records that all reached the console.
+    #[test]
+    fn a_console_that_keeps_up_loses_nothing_however_often_the_ring_wraps() {
+        let mut text = Text::new();
+        text.write_str("twenty-four bytes long..\n").unwrap();
+        text.finish();
+        let per_record = text.len as u64;
+        let records_to_wrap = (CAPACITY as u64 / per_record) as usize;
+
+        let mut store = Store::new();
+        // Wrap the ring once with nobody reading, then let the console catch
+        // up completely.  Everything the ring still holds is now secured.
+        for _ in 0..records_to_wrap + 3 {
+            store.append(&text, 6);
+        }
+        store.console = store.end;
+        let after_catch_up = store.console_lost;
+
+        // Two more records force another wrap.  The heads they overwrite are
+        // records the console has already copied out, so they are not losses.
+        for _ in 0..2 {
+            store.append(&text, 6);
+        }
+        assert_eq!(
+            store.console_lost, after_catch_up,
+            "the ring wrapped over records the console had already secured"
+        );
+    }
+
+    /// The counter agrees with the definition it names: one more loss for each
+    /// record head the ring destroys while the console had not secured it, and
+    /// nothing else.
+    #[test]
+    fn the_lost_count_is_the_heads_the_ring_destroyed_unread() {
+        let mut text = Text::new();
+        text.write_str("twenty-four bytes long..\n").unwrap();
+        text.finish();
+        let per_record = text.len as u64;
+        let records_to_wrap = (CAPACITY as u64 / per_record) as usize;
+
+        for records in [records_to_wrap - 2, records_to_wrap, records_to_wrap + 9] {
+            for console in [0, per_record * 3 / 2, 40 * per_record, u64::MAX] {
+                let mut store = Store::new();
+                for _ in 0..records {
+                    store.append(&text, 6);
+                }
+                let console = console.min(store.end);
+                store.console = console;
+                let before = store.console_lost;
+                let oldest = store.oldest;
+                // The marks of the bytes this append is about to destroy.
+                // Reading them afterwards would read the replacements.
+                let doomed_marks = store.marks;
+                store.append(&text, 6);
+
+                // One append moves `oldest` forward over the heads this record
+                // destroyed.  A head sits at a ring offset whose mark says the
+                // byte starts a record, and the console still owes it when the
+                // head is at or past the console cursor.
+                let mut destroyed_unread = 0;
+                let mut at = oldest;
+                while at < store.oldest {
+                    let starts_record = doomed_marks[at as usize % CAPACITY] & RECORD_START != 0;
+                    if starts_record && at >= console {
+                        destroyed_unread += 1;
+                    }
+                    at += 1;
+                }
+                assert_eq!(
+                    store.console_lost - before,
+                    destroyed_unread,
+                    "records={records} console={console} oldest={oldest}..{}",
+                    store.oldest
+                );
+            }
+        }
+    }
+
     /// A record is only lost to the console when the ring overwrites it before
     /// the console reads it, and then it is counted, not silent.
     #[test]
