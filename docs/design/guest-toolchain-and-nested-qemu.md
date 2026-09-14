@@ -484,6 +484,28 @@ not staged), dynamic output only (`-static` needs `glibc-static`, +43 MiB), and
 the staged toolchain targets the guest's own x86_64 -- it is not a cross
 compiler.
 
+**Clang was measured and is not added.** It is feasible -- a staged clang tree
+was proven to compile, link and run a C program with no extra flags at all, no
+`-fuse-ld=`, no `--sysroot`, no `-B`, and a three-program exec chain
+(`clang` -> `clang-22 -cc1` -> `ld`) that reuses the `as`-free integrated
+assembler and the `clone3` shape this milestone already proved. But it adds
+218.93 MiB on top of the gcc payload -- `libLLVM.so.22.1` alone is 147 MiB -- and
+removes nothing, so it needs a new 448 MiB image class. The only thing it buys
+at that price is C++ for +13.98 MiB, where gcc's own C++ costs about +60.4 MiB.
+So the decision is not about clang's cost but about whether the guest wants C++
+at all: if it does, clang is the cheaper route to it and worth adding; if it does
+not, clang is 219 MiB for nothing.
+
+The measurement also closed a question the earlier plan left open: a full clang
+compile *and* the program it produced both succeed with `/proc` replaced by an
+empty tmpfs, so clang needs neither `/proc/self/exe` nor `/proc/self/fd`, and it
+never reads `auxv`. Its closure declares `PT_GNU_STACK` read-write with four
+non-overlapping `PT_LOAD` segments, the same benign shape as `libc.so.6`, so the
+latent `uspace.map` risks are not obviously triggered -- though at ~263x
+`libc.so.6`'s relocation count, loading `libLLVM` would be the largest object the
+guest has ever mapped, and that is where a first failure would most likely
+appear.
+
 Keep the claims separate: compiling hello is native compilation; guest GCC
 rebuilding tcc is a guest source build; tcc rebuilding itself can demonstrate
 compiler self-hosting if the rebuilt compiler is also tested. Rebuilding
