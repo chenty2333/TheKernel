@@ -80,7 +80,7 @@ MCFG_ENTRY_LENGTH = 16
 
 # Signals that we look for in text artefacts.  These are deliberately narrow:
 # a broad grep is a guess dressed up as evidence.
-_IOMMU_ENABLED_PATTERNS = (
+_IOMMU_TRANSLATED_PATTERNS = (
     re.compile(r"iommu: Default domain type: Translated", re.IGNORECASE),
 )
 _IOMMU_PASSTHROUGH_PATTERNS = (
@@ -1182,9 +1182,9 @@ def extract_iommu(capture: Capture) -> IommuFacts:
             f"{'y' if len(iommu_entries) == 1 else 'ies'}: " + ", ".join(iommu_entries[:8])
         )
 
-    enabled_signals = [
+    translated_signals = [
         match.group(0).strip()
-        for pattern in _IOMMU_ENABLED_PATTERNS
+        for pattern in _IOMMU_TRANSLATED_PATTERNS
         for match in pattern.finditer(dmesg)
     ]
     passthrough_signals = [
@@ -1192,24 +1192,23 @@ def extract_iommu(capture: Capture) -> IommuFacts:
         for pattern in _IOMMU_PASSTHROUGH_PATTERNS
         for match in pattern.finditer(dmesg)
     ]
-    for signal in enabled_signals[:4]:
+    for signal in translated_signals[:4]:
         evidence.append(f"dmesg: {signal}")
     for signal in passthrough_signals[:4]:
         evidence.append(f"dmesg (passthrough): {signal}")
 
-    # IRQ remapping and registered IOMMUs do not establish the DMA domain.
-    # Conflicting domain reports must remain contradictory rather than choosing
-    # whichever log pattern happens to be checked first.
-    if enabled_signals and passthrough_signals:
+    # Linux prints its default policy before probing IOMMU hardware. Neither
+    # that policy, IRQ remapping nor registration proves device DMA translation.
+    # Keep contradictory policies explicit without treating either as enabled.
+    if translated_signals and passthrough_signals:
         kernel_enabled = Fact.conflicted(
             "Translated and Passthrough", "capture reports conflicting default DMA domains", "dmesg"
         )
-    elif enabled_signals:
-        kernel_enabled = Fact.ok("enabled (default DMA domain translated)", "dmesg")
-    elif passthrough_signals:
-        kernel_enabled = Fact.ok(
-            "present but in passthrough mode (no DMA translation for the kernel's devices)",
-            "dmesg",
+    elif translated_signals or passthrough_signals:
+        policy = "Translated" if translated_signals else "Passthrough"
+        kernel_enabled = Fact.unavailable(
+            f"default DMA domain policy is {policy}; this does not establish whether "
+            "IOMMU hardware is enabled or which devices use DMA translation"
         )
     elif iommu_entries:
         kernel_enabled = Fact.unavailable(

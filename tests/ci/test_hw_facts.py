@@ -74,15 +74,10 @@ def mcfg_table(ranges: list[tuple[int, int, int, int]]) -> bytes:
 
 
 def dmar_table(flags: int = 0x07) -> bytes:
-    """A DMAR table: a 12-byte DRHD unit follows the 36-byte header.
+    """ACPI DMAR header-specific fields followed by one 16-byte DRHD unit."""
 
-    ACPI puts Host Address Base (8 bytes) then Segment (2 bytes) at offset 36,
-    which lands the flags byte at offset 37 where hw_facts.py reads it.
-    """
-
-    body = struct.pack("<QH", 0xFED90000, 0)  # host address base, segment
-    body += bytes([flags, 0, 0, 0])  # flags, reserved[3]
-    body += struct.pack("<HH", 0, 16) + bytes(12)  # one DRHD unit: type 0, len 16
+    body = bytes([47, flags]) + bytes(10)  # host address width minus one, flags, reserved
+    body += struct.pack("<HHBBHQ", 0, 16, 1, 0, 0, 0xFED90000)
     return acpi_table(b"DMAR", body)
 
 
@@ -593,14 +588,15 @@ class FactExtractionTests(unittest.TestCase):
         self.assertFalse(facts.cpu.logical_count.available)
         self.assertIn("no artefact", facts.cpu.logical_count.reason or "")
 
-    def test_vtd_enabled_is_proven_by_dmesg_and_dmar(self) -> None:
+    def test_dmar_and_default_policy_do_not_prove_device_translation(self) -> None:
         capture, _ = fixture(self)
         capture.minimal()
         capture.write("dmesg/dmesg.txt", "iommu: Default domain type: Translated\n")
         facts = hw_facts.load_facts(capture.root)
         self.assertTrue(facts.iommu.dmar_table_present.available)
         self.assertIn("present", str(facts.iommu.dmar_table_present.value))
-        self.assertIn("enabled", str(facts.iommu.kernel_enabled.value))
+        self.assertFalse(facts.iommu.kernel_enabled.available)
+        self.assertIn("Translated", facts.iommu.kernel_enabled.reason)
 
     def test_a_dmar_table_in_passthrough_mode_is_not_reported_as_enabled(self) -> None:
         capture, _ = fixture(self)
@@ -614,7 +610,8 @@ class FactExtractionTests(unittest.TestCase):
         capture.write("iommu/sys_class_iommu.txt", "UNAVAILABLE: /sys/class/iommu is absent\n")
         facts = hw_facts.load_facts(capture.root)
         self.assertTrue(facts.iommu.dmar_table_present.available)
-        self.assertIn("passthrough", str(facts.iommu.kernel_enabled.value))
+        self.assertFalse(facts.iommu.kernel_enabled.available)
+        self.assertIn("Passthrough", facts.iommu.kernel_enabled.reason)
         self.assertTrue(any("passthrough" in item for item in facts.iommu.evidence))
 
     def test_no_iommu_evidence_is_unavailable(self) -> None:
@@ -1013,6 +1010,27 @@ class InputHandlingTests(unittest.TestCase):
 
 
 class CaptureReliabilityTests(unittest.TestCase):
+    def test_default_policy_without_iommu_hardware_is_only_policy(self):
+        capture, _ = fixture(self)
+        capture.minimal()
+        (capture.root / "acpi/tables/DMAR.hex").unlink()
+        capture.write("iommu/names.txt", "")
+        capture.write("iommu/sys_class_iommu.txt", "UNAVAILABLE: absent")
+        for domain in ("Translated", "Passthrough"):
+            capture.write("dmesg/dmesg.txt", f"iommu: Default domain type: {domain}\n")
+            facts = hw_facts.load_facts(capture.root)
+            self.assertFalse(facts.iommu.kernel_enabled.available)
+            self.assertIn(domain, facts.iommu.kernel_enabled.reason)
+            self.assertTrue(any(domain in item for item in facts.iommu.evidence))
+
+    def test_dmar_flags_are_at_the_acpi_defined_offset(self):
+        capture, _ = fixture(self)
+        capture.minimal()
+        for flags in (0, 1, 7):
+            capture.write_hexdump("acpi/tables/DMAR.hex", dmar_table(flags))
+            fact = hw_facts.load_facts(capture.root).iommu
+            self.assertIn(f"flags=0x{flags:02x}", fact.dmar_table_present.value)
+
     def test_hpet_minimum_tick_is_not_a_period(self):
         capture, _ = fixture(self)
         capture.minimal()
@@ -1058,8 +1076,8 @@ class CaptureReliabilityTests(unittest.TestCase):
         for domain in ("Passthrough", "Translated"):
             capture.write("dmesg/dmesg.txt", f"iommu: Default domain type: {domain}\nDMAR-IR: Enabled IRQ remapping in x2apic mode\n")
             fact = hw_facts.load_facts(capture.root).iommu.kernel_enabled
-            self.assertTrue(fact.available)
-            self.assertIn(domain.lower(), str(fact.value))
+            self.assertFalse(fact.available)
+            self.assertIn(domain, fact.reason)
         capture.write("dmesg/dmesg.txt", "iommu: Default domain type: Passthrough\niommu: Default domain type: Translated\n")
         self.assertIsNotNone(hw_facts.load_facts(capture.root).iommu.kernel_enabled.contradiction)
 
