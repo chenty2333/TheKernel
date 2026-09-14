@@ -704,7 +704,7 @@ impl DdiPllDividers {
             // i915 uses DIV_ROUND_CLOSEST here (`intel_dpll_mgr.c:2892`);
             // rounding to nearest rather than truncating halves the error the
             // halving itself introduces.
-            DcoFractionWorkaround::HalveFraction => (self.dco_fraction + 1) / 2,
+            DcoFractionWorkaround::HalveFraction => self.dco_fraction.div_ceil(2),
         };
         (fraction << 10) | self.dco_integer
     }
@@ -986,7 +986,7 @@ fn search_total_divider(afe_clock_hz: u64) -> Option<Chosen> {
     let mut best: Option<Chosen> = None;
     for &total_divider in ADL_N_TOTAL_DIVIDERS {
         let dco_hz = u64::from(total_divider) * afe_clock_hz;
-        if dco_hz < DCO_MIN_HZ || dco_hz > DCO_MAX_HZ {
+        if !(DCO_MIN_HZ..=DCO_MAX_HZ).contains(&dco_hz) {
             continue;
         }
         let centrality_hz = dco_hz.abs_diff(DCO_MIDPOINT_HZ);
@@ -1028,16 +1028,16 @@ fn search_total_divider(afe_clock_hz: u64) -> Option<Chosen> {
 ///   [`ADL_N_TOTAL_DIVIDERS`] cannot silently acquire an entry that decomposes
 ///   to something else.  11 is not in that list and never was.
 fn icl_wrpll_get_multipliers(total_divider: u32) -> Option<(u32, u32, u32)> {
-    if total_divider % 2 == 0 {
+    if total_divider.is_multiple_of(2) {
         if total_divider == 2 {
             Some((2, 1, 1))
-        } else if total_divider % 4 == 0 {
+        } else if total_divider.is_multiple_of(4) {
             Some((2, total_divider / 4, 2))
-        } else if total_divider % 6 == 0 {
+        } else if total_divider.is_multiple_of(6) {
             Some((3, total_divider / 6, 2))
-        } else if total_divider % 5 == 0 {
+        } else if total_divider.is_multiple_of(5) {
             Some((5, total_divider / 10, 2))
-        } else if total_divider % 14 == 0 {
+        } else if total_divider.is_multiple_of(14) {
             Some((7, total_divider / 14, 2))
         } else {
             None
@@ -1069,7 +1069,7 @@ fn prm_legal_divider_set(total_divider: u32) -> Option<(u32, u32, u32)> {
     for k in [1u32, 2, 3] {
         for p in [2u32, 3, 5, 7] {
             let product = p * k;
-            if total_divider % product != 0 {
+            if !total_divider.is_multiple_of(product) {
                 continue;
             }
             let q = total_divider / product;
