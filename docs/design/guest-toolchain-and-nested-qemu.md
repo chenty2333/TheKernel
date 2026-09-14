@@ -408,6 +408,28 @@ the program really is dynamic (a static binary would exit 0 while proving
 nothing about a loader), and that `AT_BASE` is non-zero (a loader that ran while
 the program never started would prove nothing about glibc).
 
+**The nested boot no longer panics when the host is busy.** The inner kernel
+calibrates its IO-APIC timer against the PIT while booting, and under
+TCG-in-TCG that calibration only holds while the host has cycles to spare. When
+it does not, the inner kernel gives up before any userspace runs:
+
+```
+Kernel panic - not syncing: IO-APIC + timer doesn't work!
+Boot with apic=debug and send a report.  Then try booting with the 'noapic' option.
+```
+
+Measured: the same image and arguments boot in 75.7 s on an idle machine and
+panic with that trace while a concurrent compile saturates the host. That is
+worse than a deadline that fires under load, because it reports host contention
+as a failure of the nested boot and does so with a kernel trace that reads like
+evidence. The inner command line now carries `noapic`, which is what the kernel
+itself recommends, and the panic is gone under load: with the host deliberately
+loaded, `1..49`, no failures, and the nested boot exits after 87.7 s.
+
+Everything here is emulated, so declining to program an IO-APIC through two
+layers of emulation costs nothing the case is trying to measure: the claim is
+that a second kernel boots and runs userspace in the guest.
+
 The two kernel-side risks reconnaissance identified remain latent and untested:
 `uspace.map` refuses overlapping `PT_LOAD` ranges where Linux's `elf_map`
 replaces them, and `libc.so.6` is mapped whole and then `MAP_FIXED` over live

@@ -85,7 +85,30 @@
  * with no init system and no boot media.  quiet suppresses the ~200-line
  * kernel log: worth ~5% of the boot, and not what is being tested.  There is
  * deliberately no root= and no modloop= -- the initramfs is the root. */
-#define INNER_APPEND "console=ttyS0 rdinit=/init quiet"
+/* `noapic` is not a convenience.
+ *
+ * The inner kernel calibrates its IO-APIC timer against the PIT during boot,
+ * and under TCG-in-TCG that calibration is only reliable while the host has
+ * cycles to spare.  When the host is busy the inner kernel gives up and panics
+ * at 0.106 s -- before any userspace runs -- with
+ *
+ *     Kernel panic - not syncing: IO-APIC + timer doesn't work!
+ *     Boot with apic=debug and send a report.  Then try booting with the
+ *     'noapic' option.
+ *
+ * Measured: the same image and arguments boot in 75.7 s on an idle machine and
+ * panic with that message while a concurrent compile saturates the host.  A
+ * deadline that fails under load is one thing (there is one of those above),
+ * but a *panic* under load is worse: it reports host contention as a failure of
+ * the nested boot, and it does so with a kernel trace that looks like real
+ * evidence.
+ *
+ * The outer machine already runs with no local APIC of its own to speak of, and
+ * the inner one is fully emulated, so taking the kernel's own advice costs
+ * nothing this test is trying to measure: the claim under test is that a second
+ * kernel boots and runs userspace inside the guest, not that it programs an
+ * IO-APIC through two layers of emulation. */
+#define INNER_APPEND "console=ttyS0 rdinit=/init quiet noapic"
 
 /* Deadlines.  This inner boot takes ~1.7 s on host TCG.  Measured inside the
  * guest it costs 77-88 s: the same boot under TCG-in-TCG, a factor of 45-50,
