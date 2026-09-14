@@ -81,8 +81,9 @@
 //! (`BDW_GMCH_GGMS_SHIFT`/`BDW_GMCH_GGMS_MASK`,
 //! `include/drm/intel/i915_drm.h:54-55`, read at `gt/intel_ggtt.c:1228-1232`),
 //! which `gen8_get_total_gtt_size()` (`:1107-1121`) turns into a power-of-two
-//! number of MiB of page table, and `ggtt->vm.total = (size / sizeof(gen8_pte_t))
-//! * I915_GTT_PAGE_SIZE` (`:1238`) turns into bytes of graphics address space.
+//! number of MiB of page table, and `ggtt->vm.total = (size /
+//! sizeof(gen8_pte_t)) * I915_GTT_PAGE_SIZE` (`:1238`) turns into bytes of
+//! graphics address space.
 //! The values the field names on this generation are 2, 4 and 8 MiB of page
 //! table, which -- one 8-byte entry per 4 KiB page -- are a **1, 2 or 4 GiB
 //! aperture**.
