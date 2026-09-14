@@ -14,7 +14,6 @@ import time
 from dataclasses import dataclass
 
 from tools.product_state import (
-    Q35_UEFI_PROFILE,
     Artifacts,
     ProductError,
     Variant,
