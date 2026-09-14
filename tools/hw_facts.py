@@ -81,13 +81,10 @@ MCFG_ENTRY_LENGTH = 16
 # Signals that we look for in text artefacts.  These are deliberately narrow:
 # a broad grep is a guess dressed up as evidence.
 _IOMMU_ENABLED_PATTERNS = (
-    re.compile(r"DMAR-IR: Enabled IRQ remapping", re.IGNORECASE),
-    re.compile(r"x2apic: IRQ remapping", re.IGNORECASE),
     re.compile(r"iommu: Default domain type: Translated", re.IGNORECASE),
 )
 _IOMMU_PASSTHROUGH_PATTERNS = (
     re.compile(r"iommu: Default domain type: Passthrough", re.IGNORECASE),
-    re.compile(r"DMAR: Intel\(R\) Virtualization Technology for Directed I/O", re.IGNORECASE),
 )
 
 
@@ -412,12 +409,13 @@ def hexdump_bytes(text: str) -> bytes:
                 continue
             tokens = tokens[1:]
         else:
-            # xxd -g1: "00000000: 4d43 4647 0000 0000  MCFG...."
-            tokens = stripped.split()
-            if tokens and tokens[0].endswith(":"):
-                tokens = tokens[1:]
-            elif tokens and re.fullmatch(r"[0-9a-fA-F]{4,8}:", tokens[0]):
-                tokens = tokens[1:]
+            # xxd -g1 separates its byte field from ASCII with two spaces.
+            # ASCII can itself be a hex byte (e.g. "ab"), so never tokenize it.
+            xxd = re.match(r"^[0-9a-fA-F]+:\s(.*)$", stripped)
+            if xxd:
+                tokens = re.split(r"\s{2,}", xxd.group(1), maxsplit=1)[0].split()
+            else:
+                tokens = stripped.split()  # od -An -tx1 -v: bytes only
         for token in tokens:
             if len(token) > 2 or not re.fullmatch(r"[0-9a-fA-F]{1,2}", token):
                 # Not a byte: xxd's grouped words have len 4, the ASCII column
@@ -457,7 +455,7 @@ class AcpiTable:
 
 
 def parse_acpi_table(blob: bytes, source: str) -> AcpiTable:
-    """Parse the ACPI header.  Raises ValueError on anything too short."""
+    """Validate length/checksum and expose only the declared ACPI table bytes."""
 
     if len(blob) < ACPI_HEADER_LENGTH:
         raise ValueError(
@@ -468,6 +466,13 @@ def parse_acpi_table(blob: bytes, source: str) -> AcpiTable:
         declared_length = struct.unpack_from("<I", blob, 4)[0]
     except (struct.error, IndexError) as exc:  # pragma: no cover - guarded above
         raise ValueError(f"ACPI table header is not decodable: {exc}") from exc
+    if declared_length < ACPI_HEADER_LENGTH:
+        raise ValueError(f"ACPI declares {declared_length} bytes, shorter than its header")
+    if declared_length > len(blob):
+        raise ValueError(f"ACPI table truncated: declares {declared_length} bytes, captured {len(blob)}")
+    body = blob[:declared_length]
+    if sum(body) % 256:
+        raise ValueError("ACPI table checksum is invalid")
     revision = blob[8]
     oem_id = blob[10:16].decode("ascii", "replace").rstrip("\x00 ")
     return AcpiTable(
@@ -476,7 +481,7 @@ def parse_acpi_table(blob: bytes, source: str) -> AcpiTable:
         revision=revision,
         oem_id=oem_id,
         declared_length=declared_length,
-        body=blob,
+        body=body,
         source=source,
     )
 
@@ -504,21 +509,14 @@ def parse_mcfg(table: AcpiTable) -> tuple[int, tuple[EcamRange, ...]]:
     if base in (0, 0xFFFFFFFFFFFFFFFF):
         raise ValueError(f"MCFG ECAM base is 0x{base:016x}, which is not a usable address")
 
-    # Trailing bytes are ignored: an allocation's own reserved dword is part of
-    # the 16-byte entry, and a firmware that pads the table should not turn a
-    # fully captured table into a failure.  A table that is *short* is caught by
-    # the loop's bound instead.
-    #
-    # Note for whoever reads a capture where the table looks 8 bytes shorter
-    # than expected: the spec (struct acpi_table_mcfg), the kernel's own
-    # pci_parse_mcfg (which takes the first entry from &mcfg[1]), and QEMU's
-    # build_mcfg all put the base address at offset 44, so that is the offset
-    # used here.  A short table is reported through the truncated flag rather
-    # than silently decoded at a different offset.
+    if (len(body) - ACPI_BODY_OFFSET) % MCFG_ENTRY_LENGTH:
+        raise ValueError("MCFG allocation list ends with an incomplete entry")
     ranges: list[EcamRange] = []
     offset = ACPI_BODY_OFFSET
     while offset + MCFG_ENTRY_LENGTH <= len(body):
         entry_base, segment, first_bus, last_bus = struct.unpack_from("<QHBB", body, offset)
+        if entry_base in (0, 0xFFFFFFFFFFFFFFFF):
+            raise ValueError(f"MCFG allocation at offset {offset} is not a usable address")
         if last_bus < first_bus:
             raise ValueError(
                 f"MCFG allocation at offset {offset} has an inverted bus range "
@@ -529,13 +527,6 @@ def parse_mcfg(table: AcpiTable) -> tuple[int, tuple[EcamRange, ...]]:
         )
         offset += MCFG_ENTRY_LENGTH
 
-    captured_entries = len(ranges)
-    declared_entries = max(table.declared_length - ACPI_BODY_OFFSET, 0) // MCFG_ENTRY_LENGTH
-    if declared_entries > captured_entries:
-        raise ValueError(
-            f"MCFG declares {declared_entries} allocation entries but only "
-            f"{captured_entries} were captured; the table was truncated"
-        )
     if not ranges:
         raise ValueError(
             "MCFG contains no allocation entries, so it does not name a usable ECAM region"
@@ -562,28 +553,29 @@ def decode_madt(table: AcpiTable) -> dict[str, Any]:
     counts: dict[int, int] = {}
     ioapics: list[dict[str, int]] = []
     x2apics: list[int] = []
-    while offset + 2 <= len(body):
+    while offset < len(body):
+        if offset + 2 > len(body):
+            raise ValueError(f"MADT entry header at offset {offset} is truncated")
         kind = body[offset]
         length = body[offset + 1]
-        if length == 0:
-            raise ValueError(f"MADT entry at offset {offset} declares zero length")
+        minimum = {0: 8, 1: 12, 9: 16}.get(kind, 2)
+        if length < minimum:
+            raise ValueError(f"MADT entry type {kind} at offset {offset} needs at least {minimum} bytes, declares {length}")
         if offset + length > len(body):
             raise ValueError(
                 f"MADT entry at offset {offset} declares {length} bytes but the table ends "
                 f"{len(body) - offset} bytes later"
             )
         counts[kind] = counts.get(kind, 0) + 1
-        if kind == 1 and offset + 8 <= len(body):  # IOAPIC
+        if kind == 1:  # IOAPIC
             ioapics.append(
                 {
                     "id": body[offset + 2],
                     "address": struct.unpack_from("<I", body, offset + 4)[0],
-                    "gsi_base": struct.unpack_from("<I", body, offset + 8)[0]
-                    if offset + 12 <= len(body)
-                    else 0,
+                    "gsi_base": struct.unpack_from("<I", body, offset + 8)[0],
                 }
             )
-        elif kind == 9 and offset + 8 <= len(body):  # x2APIC
+        elif kind == 9:  # x2APIC
             x2apics.append(struct.unpack_from("<I", body, offset + 4)[0])
         offset += length
     return {
@@ -804,13 +796,16 @@ def _extract_archive(path: Path) -> tuple[tempfile.TemporaryDirectory, Path]:
                 total += max(member.size, 0)
                 if total > 2 * 1024 * 1024 * 1024:
                     raise CaptureError("capture archive expands beyond 2 GiB; refusing to extract")
-                # The "data" filter (which strips setuid bits, device nodes, and
-                # absolute links) only exists from 3.12; _safe_member_path already
-                # rejects traversal on every supported version.
-                if sys.version_info >= (3, 12):
-                    tar.extract(member, path=destination, filter="data")
-                else:  # pragma: no cover - depends on the interpreter running the tests
-                    tar.extract(member, path=destination)
+                # Captures contain data files and directories, never links or
+                # devices. Reject these before extraction on every interpreter.
+                if not (member.isfile() or member.isdir()):
+                    raise CaptureError(f"refusing non-data tar member: {member.name!r}")
+                if member.isdir():
+                    staged.mkdir(parents=True, exist_ok=True)
+                else:
+                    staged.parent.mkdir(parents=True, exist_ok=True)
+                    with tar.extractfile(member) as source, staged.open("wb") as output:
+                        shutil.copyfileobj(source, output)
     except (tarfile.TarError, OSError, EOFError) as exc:
         temporary.cleanup()
         raise CaptureError(f"cannot read {path} as a tar archive: {exc}") from exc
@@ -837,7 +832,7 @@ def _make_extraction_directory() -> tempfile.TemporaryDirectory:
 
     A capture is tens of megabytes of text and tables; the project convention is
     to keep large artefacts off /tmp when a real disk is available, so the home
-    cache is preferred and /tmp is only the fallback.
+    cache is required; failures must not silently redirect large data to RAM.
     """
 
     preferred = Path(
@@ -846,8 +841,8 @@ def _make_extraction_directory() -> tempfile.TemporaryDirectory:
     try:
         preferred.mkdir(parents=True, exist_ok=True)
         return tempfile.TemporaryDirectory(prefix="capture-", dir=preferred)
-    except OSError:
-        return tempfile.TemporaryDirectory(prefix="thekernel-hw-facts-")
+    except OSError as exc:
+        raise CaptureError(f"cannot create capture directory in {preferred}: {exc}") from exc
 
 
 def _open_tar(path: Path):
@@ -1202,21 +1197,23 @@ def extract_iommu(capture: Capture) -> IommuFacts:
     for signal in passthrough_signals[:4]:
         evidence.append(f"dmesg (passthrough): {signal}")
 
-    # Order matters.  A kernel that reports passthrough is telling us the truth
-    # even when IOMMU devices are registered, so that signal must not be masked
-    # by the weaker "a device exists" signal.
-    if enabled_signals:
-        kernel_enabled = Fact.ok("enabled (translation active)", "dmesg")
+    # IRQ remapping and registered IOMMUs do not establish the DMA domain.
+    # Conflicting domain reports must remain contradictory rather than choosing
+    # whichever log pattern happens to be checked first.
+    if enabled_signals and passthrough_signals:
+        kernel_enabled = Fact.conflicted(
+            "Translated and Passthrough", "capture reports conflicting default DMA domains", "dmesg"
+        )
+    elif enabled_signals:
+        kernel_enabled = Fact.ok("enabled (default DMA domain translated)", "dmesg")
     elif passthrough_signals:
         kernel_enabled = Fact.ok(
             "present but in passthrough mode (no DMA translation for the kernel's devices)",
             "dmesg",
         )
     elif iommu_entries:
-        kernel_enabled = Fact.ok(
-            f"enabled ({len(iommu_entries)} IOMMU device(s) registered, and dmesg does not "
-            "report passthrough)",
-            "iommu/names.txt",
+        kernel_enabled = Fact.unavailable(
+            f"{len(iommu_entries)} IOMMU device(s) registered, but DMA translation state is unknown"
         )
     else:
         kernel_enabled = Fact.unavailable(
@@ -1265,7 +1262,7 @@ def _iommu_entry_names(capture: Capture) -> tuple[str, ...]:
 def extract_hpet(capture: Capture) -> HpetFacts:
     notes: list[str] = []
     base: Fact = Fact.unavailable("no HPET base address found in any capture artefact")
-    period: Fact = Fact.unavailable("no HPET period found in any capture artefact")
+    period: Fact = Fact.unavailable("HPET period requires the MMIO capabilities register; ACPI does not carry it")
 
     # 1. The ACPI HPET table is authoritative: it is what firmware tells the OS.
     hpet_table = capture.find("HPET.hex")
@@ -1282,11 +1279,9 @@ def extract_hpet(capture: Capture) -> HpetFacts:
                 if len(table.body) < 56:
                     raise ValueError(f"HPET table is only {len(table.body)} bytes")
                 base_address = struct.unpack_from("<Q", table.body, 44)[0]
-                period_fs = struct.unpack_from("<I", table.body, 52)[0]
                 if base_address == 0:
                     raise ValueError("HPET table base address field is zero")
                 base = Fact.ok_hex(base_address, capture.rel(hpet_table))
-                period = Fact.ok(period_fs, capture.rel(hpet_table))
             except ValueError as exc:
                 notes.append(f"ACPI HPET table is not decodable: {exc}")
 

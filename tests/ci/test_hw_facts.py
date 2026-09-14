@@ -20,6 +20,7 @@ import struct
 import tarfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.support import test_tmpdir
 from tools import hw_facts
@@ -31,19 +32,13 @@ from tools import hw_facts
 
 
 def acpi_table(signature: bytes, body: bytes, revision: int = 1) -> bytes:
-    """Build an ACPI table: the 36-byte common header (checksum 0), then body.
-
-    The header layout is fixed by struct acpi_table_header: signature[4],
-    length, revision, checksum, oem_id[6], oem_table_id[8], oem_revision,
-    creator_id[4], creator_revision.  Nothing here verifies the checksum, and
-    neither does hw_facts.py, so zero is fine.
-    """
+    """Build a complete ACPI table with a valid checksum."""
 
     assert len(signature) == 4, "an ACPI signature is exactly four bytes"
     header = (
         signature
         + struct.pack("<I", 36 + len(body))
-        + bytes([revision, 0])  # checksum 0: nothing in hw_facts.py verifies it
+        + bytes([revision, 0])  # checksum filled after assembling the table
         + b"TKRNL "  # OEM id, six bytes
         + b"THEKERNL"  # OEM table id, eight bytes
         + struct.pack("<I", 1)  # OEM revision
@@ -51,7 +46,9 @@ def acpi_table(signature: bytes, body: bytes, revision: int = 1) -> bytes:
         + struct.pack("<I", 1)  # creator revision
     )
     assert len(header) == 36, len(header)
-    return header + body
+    table = bytearray(header + body)
+    table[9] = -sum(table) % 256
+    return bytes(table)
 
 
 def mcfg_table(ranges: list[tuple[int, int, int, int]]) -> bytes:
@@ -89,12 +86,12 @@ def dmar_table(flags: int = 0x07) -> bytes:
     return acpi_table(b"DMAR", body)
 
 
-def hpet_table(base: int = 0xFED00000, period_fs: int = 14_318_180) -> bytes:
-    """An ACPI HPET table: base address at offset 44, period at offset 52."""
+def hpet_table(base: int = 0xFED00000, minimum_tick: int = 128) -> bytes:
+    """ACPI HPET: hardware ID, generic address, sequence, minimum tick, flags."""
 
-    body = bytes(8)  # hardware revision / comparator count / capabilities
+    body = struct.pack("<I", 0x8086A201) + bytes([0, 64, 0, 0])
     body += struct.pack("<Q", base)
-    body += struct.pack("<I", period_fs)
+    body += struct.pack("<BHB", 0, minimum_tick, 0)
     return acpi_table(b"HPET", body)
 
 
@@ -599,6 +596,7 @@ class FactExtractionTests(unittest.TestCase):
     def test_vtd_enabled_is_proven_by_dmesg_and_dmar(self) -> None:
         capture, _ = fixture(self)
         capture.minimal()
+        capture.write("dmesg/dmesg.txt", "iommu: Default domain type: Translated\n")
         facts = hw_facts.load_facts(capture.root)
         self.assertTrue(facts.iommu.dmar_table_present.available)
         self.assertIn("present", str(facts.iommu.dmar_table_present.value))
@@ -638,7 +636,8 @@ class FactExtractionTests(unittest.TestCase):
         self.assertEqual(facts.hpet.base.value, 0xFED00000)
         self.assertEqual(facts.hpet.base.render().split()[0], "0x00000000fed00000")
         self.assertIn("HPET.hex", facts.hpet.base.sources[0])
-        self.assertEqual(facts.hpet.period_fs.value, 14_318_180)
+        self.assertFalse(facts.hpet.period_fs.available)
+        self.assertIn("MMIO", facts.hpet.period_fs.reason)
 
     def test_hpet_base_falls_back_to_dmesg_when_the_table_is_gone(self) -> None:
         capture, _ = fixture(self)
@@ -841,20 +840,15 @@ class FactExtractionTests(unittest.TestCase):
             facts.iommu.evidence,
         )
 
-    def test_iommu_registration_alone_counts_as_enabled(self) -> None:
-        # With no dmesg evidence at all, a registered IOMMU device is still
-        # proof that DMA remapping is on, and the fact must say which evidence
-        # it rests on.
+    def test_iommu_registration_alone_leaves_translation_unknown(self) -> None:
+        # Registration is not evidence that device DMA uses translated domains.
         capture, _ = fixture(self)
         capture.minimal()
         capture.write("dmesg/dmesg.txt", "[    0.000000] Linux version 6.11.0\n")
         facts = hw_facts.load_facts(capture.root)
-        self.assertIn("enabled", str(facts.iommu.kernel_enabled.value))
-        self.assertTrue(
-            any("sys_class_iommu" in source or "names.txt" in source
-                for source in facts.iommu.kernel_enabled.sources),
-            facts.iommu.kernel_enabled.sources,
-        )
+        self.assertFalse(facts.iommu.kernel_enabled.available)
+        self.assertIn("unknown", facts.iommu.kernel_enabled.reason)
+
 
 
 # ---------------------------------------------------------------------------
@@ -1016,6 +1010,83 @@ class InputHandlingTests(unittest.TestCase):
             status = hw_facts.main([str(capture.root / "missing")])
         self.assertEqual(status, 2)
         self.assertIn("error:", err.getvalue())
+
+
+class CaptureReliabilityTests(unittest.TestCase):
+    def test_hpet_minimum_tick_is_not_a_period(self):
+        capture, _ = fixture(self)
+        capture.minimal()
+        for minimum_tick in (1, 128, 65535):
+            capture.write_hexdump("acpi/tables/HPET.hex", hpet_table(minimum_tick=minimum_tick))
+            fact = hw_facts.load_facts(capture.root).hpet
+            self.assertEqual(fact.base.value, 0xFED00000)
+            self.assertFalse(fact.period_fs.available)
+
+    def test_xxd_ascii_that_looks_hex_is_not_data(self):
+        for text, expected in (("ab", b"ab"), ("a", b"a"), ("dead", b"dead")):
+            line = "00000000: " + " ".join(f"{b:02x}" for b in expected).ljust(47) + "  " + text
+            self.assertEqual(hw_facts.hexdump_bytes(line), expected)
+
+    def test_acpi_checksum_and_declared_length_are_enforced(self):
+        valid = mcfg_table([(0xE0000000, 0, 0, 255)])
+        corrupt = bytearray(valid)
+        corrupt[44] ^= 1
+        for blob in (bytes(corrupt), valid[:-1], valid[:36]):
+            with self.subTest(blob=blob), self.assertRaises(ValueError):
+                hw_facts.parse_acpi_table(blob, "fixture")
+        header_only = acpi_table(b"MCFG", b"") + valid[36:]
+        with self.assertRaises(ValueError):
+            hw_facts.parse_mcfg(hw_facts.parse_acpi_table(header_only, "fixture"))
+        self.assertEqual(hw_facts.parse_acpi_table(valid + b"ignored", "fixture").body, valid)
+
+    def test_mcfg_rejects_incomplete_and_invalid_later_allocations(self):
+        for blob in (mcfg_table([(0xE0000000, 0, 0, 255), (0, 1, 0, 255)]),
+                     acpi_table(b"MCFG", mcfg_table([(0xE0000000, 0, 0, 255)])[36:] + b"x")):
+            with self.subTest(blob=blob), self.assertRaises(ValueError):
+                hw_facts.parse_mcfg(hw_facts.parse_acpi_table(blob, "fixture"))
+
+    def test_madt_rejects_short_records_even_with_bytes_after_them(self):
+        for record in (bytes([1, 2]) + bytes([127, 12]) + bytes(10),
+                       bytes([9, 8]) + bytes(6), bytes([127, 1]), b"x"):
+            blob = acpi_table(b"APIC", struct.pack("<II", 0xFEE00000, 1) + record)
+            with self.subTest(record=record), self.assertRaises(ValueError):
+                hw_facts.decode_madt(hw_facts.parse_acpi_table(blob, "fixture"))
+
+    def test_irq_remapping_does_not_override_passthrough(self):
+        capture, _ = fixture(self)
+        capture.minimal()
+        for domain in ("Passthrough", "Translated"):
+            capture.write("dmesg/dmesg.txt", f"iommu: Default domain type: {domain}\nDMAR-IR: Enabled IRQ remapping in x2apic mode\n")
+            fact = hw_facts.load_facts(capture.root).iommu.kernel_enabled
+            self.assertTrue(fact.available)
+            self.assertIn(domain.lower(), str(fact.value))
+        capture.write("dmesg/dmesg.txt", "iommu: Default domain type: Passthrough\niommu: Default domain type: Translated\n")
+        self.assertIsNotNone(hw_facts.load_facts(capture.root).iommu.kernel_enabled.contradiction)
+
+    def test_irq_remapping_and_vtd_presence_do_not_prove_dma_mode(self):
+        capture, _ = fixture(self)
+        capture.minimal()
+        for text in ("DMAR-IR: Enabled IRQ remapping", "DMAR: Intel(R) Virtualization Technology for Directed I/O"):
+            capture.write("dmesg/dmesg.txt", text)
+            self.assertFalse(hw_facts.load_facts(capture.root).iommu.kernel_enabled.available)
+
+    def test_archive_rejects_links_and_special_files(self):
+        capture, _ = fixture(self)
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE, tarfile.CHRTYPE, tarfile.BLKTYPE):
+            archive = capture.root.parent / "unsafe.tar"
+            with tarfile.open(archive, "w") as tar:
+                member = tarfile.TarInfo("unsafe")
+                member.type = kind
+                member.linkname = "/outside/capture"
+                tar.addfile(member)
+            with self.subTest(kind=kind), self.assertRaises(hw_facts.CaptureError):
+                hw_facts.Capture.open(archive)
+
+    def test_extraction_directory_failure_does_not_fall_back_to_tmpfs(self):
+        with patch.object(Path, "mkdir", side_effect=PermissionError("denied")), patch.object(hw_facts.tempfile, "TemporaryDirectory") as temporary:
+            with self.assertRaises(hw_facts.CaptureError):
+                hw_facts._make_extraction_directory()
+            temporary.assert_not_called()
 
 
 if __name__ == "__main__":
