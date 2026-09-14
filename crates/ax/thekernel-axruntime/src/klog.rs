@@ -786,6 +786,147 @@ mod tests {
         assert_eq!(next, 4 * per_record);
         assert!(next - per_record >= store.oldest);
     }
+    /// The delimiter between records is the next record's start mark, not a
+    /// newline.  A record's own text may contain newlines -- the igc driver's
+    /// absence report is two lines in one `info!` -- and a reader that stopped
+    /// at the first one returned the first line, left the cursor past the whole
+    /// record and dropped the rest, which is how that report lost its verdict.
+    #[test]
+    fn a_record_whose_text_contains_newlines_is_read_whole() {
+        let mut store = Store::new();
+        let mut text = Text::new();
+        text.write_str("bus walk: nothing matched\nverdict: no supported device present\n")
+            .unwrap();
+        text.finish();
+        store.append(&text, 6);
+        let (record, next) = store.peek(0).unwrap();
+        assert_eq!(record.text.as_bytes(), text.as_bytes());
+        assert_eq!(next, text.len as u64);
+        assert_eq!(record.priority, 6);
+    }
+    /// A reader that reaches a multi-line record must leave the cursor on the
+    /// next record's first byte: stopping inside it would hand the following
+    /// record to the reader as a tail, and that record is retained.
+    #[test]
+    fn a_multiline_record_does_not_consume_the_record_after_it() {
+        let mut store = Store::new();
+        let mut first = Text::new();
+        first.write_str("first line\nsecond line\n").unwrap();
+        first.finish();
+        let mut second = Text::new();
+        second.write_str("following").unwrap();
+        second.finish();
+        store.append(&first, 6);
+        store.append(&second, 6);
+        let (record, next) = store.peek(0).unwrap();
+        assert_eq!(record.text.as_bytes(), first.as_bytes());
+        let (record, next) = store.peek(next).unwrap();
+        assert_eq!(record.text.as_bytes(), second.as_bytes());
+        assert_eq!(next, (first.len + second.len) as u64);
+    }
+    /// The newest record has no following start mark, so the reader's other
+    /// boundary -- the newest retained byte -- is what stops it, and the
+    /// `RECORD_BYTES` bound must not cut a record `Text` was allowed to build
+    /// in full.
+    #[test]
+    fn a_record_ending_at_the_rings_end_is_read_whole() {
+        let mut store = Store::new();
+        let mut text = Text::new();
+        // `RECORD_BYTES` exactly once `finish` terminates it: the longest record
+        // a producer can retain, and one that contains newlines of its own.
+        text.write_str(&"l\n".repeat((RECORD_BYTES - 2) / 2))
+            .unwrap();
+        text.write_str("x").unwrap();
+        text.finish();
+        assert_eq!(text.len, RECORD_BYTES);
+        for _ in 0..CAPACITY / RECORD_BYTES {
+            store.append(&text, 6);
+        }
+        assert_eq!(store.end, CAPACITY as u64);
+        // The record whose last byte is the newest retained byte.
+        let (record, next) = store.peek(store.end - RECORD_BYTES as u64).unwrap();
+        assert_eq!(record.text.as_bytes(), text.as_bytes());
+        assert_eq!(next, store.end);
+        assert!(
+            store.peek(next).is_none(),
+            "nothing is retained past the newest byte"
+        );
+        // And the record the ring wrapped onto, at the ring's first byte, is a
+        // record rather than the tail of one.
+        let (record, next) = store.peek(0).unwrap();
+        assert_eq!(record.text.as_bytes(), text.as_bytes());
+        assert_eq!(next, RECORD_BYTES as u64);
+    }
+    /// A reader that has fallen behind resumes at the next record boundary, and
+    /// a boundary is a start mark: the newline inside a multi-line record must
+    /// not be mistaken for one, or the reader would print a record's tail as a
+    /// record of its own.
+    #[test]
+    fn a_multiline_record_whose_head_the_ring_overwrote_is_skipped() {
+        let mut store = Store::new();
+        let mut text = Text::new();
+        text.write_str("record 000\nsecond line 000\n").unwrap();
+        text.finish();
+        let per_record = text.len as u64;
+        assert_ne!(
+            CAPACITY as u64 % per_record,
+            0,
+            "the test needs the ring to stop mid-record"
+        );
+        for _ in 0..CAPACITY as u64 / per_record + 3 {
+            store.append(&text, 6);
+        }
+        assert!(
+            store.oldest % per_record != 0,
+            "the test needs a cut record"
+        );
+        let (record, next) = store.peek(0).unwrap();
+        assert_eq!(record.text.as_bytes(), text.as_bytes());
+        assert_eq!(next % per_record, 0, "a reader must resume at a boundary");
+        assert!(next - per_record >= store.oldest);
+    }
+    /// The console prints the record the ring retains, once, and stops where
+    /// the UART stopped: a partly written multi-line record resumes at the byte
+    /// after the one sent rather than reprinting a line or skipping the next
+    /// record, and the byte-oriented reader the screen uses sees the same bytes.
+    #[test]
+    fn the_console_prints_a_multiline_record_once_and_resumes_where_it_stopped() {
+        let _serial = global();
+        // Other tests log too, so the shared arrival edge may already be set.
+        let _ = take_reader_notification();
+        set_console_enabled(true);
+        set_console_threshold(8);
+        let mut drain = DiagnosticDrain::new();
+        let start = STORE.lock().end;
+        drain.cursor = start;
+        diagnostic(format_args!("first line\nsecond line"));
+        diagnostic(format_args!("third"));
+        let mut printed = std::vec::Vec::new();
+        // A UART that accepts three bytes per turn stops inside the first line.
+        drain.drain_with(|bytes| {
+            let n = 3.min(bytes.len());
+            printed.extend_from_slice(&bytes[..n]);
+            n
+        });
+        assert_eq!(printed, b"fir");
+        drain.drain_with(|bytes| {
+            printed.extend_from_slice(bytes);
+            bytes.len()
+        });
+        assert_eq!(printed, b"first line\nsecond line\n");
+        drain.drain_with(|bytes| {
+            printed.extend_from_slice(bytes);
+            bytes.len()
+        });
+        assert_eq!(printed, b"first line\nsecond line\nthird\n");
+        // The readers that copy bytes rather than delimit records -- the early
+        // screen and the framebuffer mirror -- agree with the console, byte for
+        // byte: the record is printed once, not once per line and not twice.
+        let mut mirror = [0u8; 64];
+        let (n, end) = snapshot_into(start, &mut mirror, false);
+        assert_eq!(&mirror[..n], &printed[..]);
+        assert_eq!(end, start + printed.len() as u64);
+    }
     /// The reported bug: a burst larger than a bounded console queue reached
     /// the ring and only part of it reached the console, so the serial log
     /// disagreed with `/dev/kmsg` about what the kernel had said.
