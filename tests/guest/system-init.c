@@ -526,6 +526,102 @@ static int test_exit_status(void) {
         "exit-status-child");
 }
 
+/* The kernel renders this ring on the stack of whichever process reads the
+ * file, so the read is part of the contract: the file is world-readable, and
+ * the kernel has to answer without touching memory it does not own.  The header
+ * is also what makes a wrapped ring legible -- `first` is the oldest record the
+ * ring still holds and `entries` is the width of the window -- so this checks
+ * the header's arithmetic and then holds every record line to the window it
+ * names, oldest first, with no holes. */
+static int test_exit_status_trace_read(void) {
+    static const char *const kinds[] = { "CLONE", "EXIT", "WAIT" };
+    char line[4096];
+    char kind[8];
+    FILE *trace = fopen("/proc/sys/kernel/exit-status", "r");
+    long sequence = -1;
+    long first = -1;
+    long entries = -1;
+    long previous = -1;
+    int records = 0;
+    int terminated = 0;
+
+    if (trace == NULL) {
+        return fail("exit-status-trace-open");
+    }
+    if (fgets(line, sizeof(line), trace) == NULL ||
+        sscanf(line, "EXITSTATUS_TRACE_BEGIN seq=%ld first=%ld entries=%ld",
+               &sequence, &first, &entries) != 3) {
+        (void)fclose(trace);
+        errno = EPROTO;
+        return fail("exit-status-trace-header");
+    }
+    /* 512 is `EXIT_STATUS_TRACE_LEN`, the length the ring is declared with. */
+    if (first < 1 || sequence < first || entries != sequence - first + 1 ||
+        entries > 512) {
+        (void)fclose(trace);
+        fprintf(stderr,
+                "THEKERNEL_SYSTEM_TEST_FAIL exit-status-trace-window seq=%ld "
+                "first=%ld entries=%ld\n",
+                sequence, first, entries);
+        return 1;
+    }
+    while (fgets(line, sizeof(line), trace) != NULL) {
+        long seq = -1;
+        size_t index = 0;
+
+        /* The dump closes with a terminator, so a reader can tell a complete
+         * answer from one that stopped early. */
+        if (strcmp(line, "EXITSTATUS_TRACE_END\n") == 0) {
+            terminated = 1;
+            break;
+        }
+        /* A line that does not end in a newline was longer than the buffer,
+         * which would mean a rendered record had grown past every bound. */
+        if (strchr(line, '\n') == NULL) {
+            (void)fclose(trace);
+            errno = EOVERFLOW;
+            return fail("exit-status-trace-line");
+        }
+        if (sscanf(line, "%7s seq=%ld", kind, &seq) != 2) {
+            (void)fclose(trace);
+            fprintf(stderr,
+                    "THEKERNEL_SYSTEM_TEST_FAIL exit-status-trace-record line=%s",
+                    line);
+            return 1;
+        }
+        while (index < sizeof(kinds) / sizeof(kinds[0]) &&
+               strcmp(kind, kinds[index]) != 0) {
+            index++;
+        }
+        if (index == sizeof(kinds) / sizeof(kinds[0]) || seq < first ||
+            seq > sequence || seq <= previous) {
+            (void)fclose(trace);
+            fprintf(stderr,
+                    "THEKERNEL_SYSTEM_TEST_FAIL exit-status-trace-record line=%s",
+                    line);
+            return 1;
+        }
+        previous = seq;
+        records++;
+    }
+    if (!terminated || fgets(line, sizeof(line), trace) != NULL) {
+        (void)fclose(trace);
+        errno = EPROTO;
+        return fail("exit-status-trace-terminator");
+    }
+    (void)fclose(trace);
+    if (records != entries || (records > 0 && previous != sequence)) {
+        fprintf(stderr,
+                "THEKERNEL_SYSTEM_TEST_FAIL exit-status-trace-count records=%d "
+                "entries=%ld last=%ld\n",
+                records, entries, previous);
+        return 1;
+    }
+    printf("exit-status-trace seq=%ld first=%ld entries=%ld records=%d\n",
+           sequence, first, entries, records);
+    return 0;
+}
+
 static int test_timer_create_validation(void) {
     return run_guest_program(
         "/opt/thekernel-tests/portable/timer-create-validation", NULL,
@@ -685,6 +781,7 @@ int main(int argc, char **argv) {
         { "anon-fd-flags", test_anon_fd_flags, 20 },
         { "select", test_select, 20 },
         { "exit-status", test_exit_status, 20 },
+        { "exit-status-trace-read", test_exit_status_trace_read, 20 },
         { "timer-create-validation", test_timer_create_validation, 20 },
         { "signal-order", test_signal_order_differential, 60 },
         { "signal-boundary", test_signal_boundary_differential, 60 },

@@ -13,7 +13,14 @@ import tomllib
 import time
 from dataclasses import dataclass
 
-from tools.product_state import REPO_ROOT, ProductError, state_root
+from tools.product_state import (
+    Q35_UEFI_PROFILE,
+    Artifacts,
+    ProductError,
+    Variant,
+    REPO_ROOT,
+    state_root,
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +41,15 @@ def plan(tier: str, state: Path) -> list[Stage]:
         Stage("graphics-config-desktop", "static", ("scripts/build-graphics-rootfs.sh", "--flavor", "q35-software-desktop", "--check"), 120),
         Stage("host", "test", (*cli, "test", "--suite", "host"), 1800),
         Stage("build", "build", (*cli, "build", "--smp", "4", "--memory", "512M"), 1800),
+        # A frame that does not fit a task stack is invisible to every other
+        # stage: task stacks have no guard page, so the compiler's stack probe
+        # writes below the stack instead of faulting (see
+        # docs/design/exit-status-race.md).  This reads the release ELF the
+        # build stage just produced -- the artifact layout says where it is,
+        # and it is the unstripped one, so a finding names the function.
+        Stage("stack-frames", "static",
+              (sys.executable, "tools/stack_frames.py",
+               str(Artifacts(state, Variant(memory="512M")).cargo_elf)), 600),
         Stage("lint", "lint", (*cli, "lint", "--smp", "4", "--memory", "512M"), 1800),
         Stage("guest-tcg", "test", (*cli, "test", "--suite", "guest", "--smp", "4", "--memory", "512M", "--accel", "tcg", "--no-build", "--timeout", "300"), 360),
         # The serial-less acceptance path: the artifacts the build stage just

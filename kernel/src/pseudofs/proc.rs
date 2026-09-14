@@ -3999,7 +3999,7 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
                     // most recent events: the diagnostic exists to be read
                     // immediately after a failing wait, from a boot that is
                     // still running.
-                    || Ok(crate::task::exit_status_trace_dump()),
+                    || crate::task::exit_status_trace_dump().map_err(|_| VfsError::NoMemory),
                 ),
             );
             kernel.add(
