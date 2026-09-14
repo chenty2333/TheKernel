@@ -553,7 +553,7 @@ fn the_aux_well_bits_match_the_reference_table() {
 fn the_command_word_is_the_one_the_sources_say() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
+    let controller = FakeController::with_monitor(Pin::DdiA, &block);
     let (result, notes) = read(&controller, Pin::DdiA);
     assert_eq!(result, Ok(EdidBytes { bytes: block }), "{notes:?}");
 
@@ -626,7 +626,7 @@ fn the_command_selects_the_pin_the_caller_asked_for() {
     let _guard = scheduler_test_context();
     for pin in Pin::DDC {
         let block = valid_edid(0);
-        let mut controller = FakeController::with_monitor(pin, &block);
+        let controller = FakeController::with_monitor(pin, &block);
         assert_eq!(read(&controller, pin).0, Ok(EdidBytes { bytes: block }));
         assert!(
             controller.writes_to(GMBUS0).contains(&pin.index()),
@@ -651,7 +651,7 @@ fn a_valid_block_is_returned_byte_for_byte() {
         .fold(0u8, |sum, byte| sum.wrapping_add(*byte));
     block[EDID_BLOCK_LEN - 1] = 0u8.wrapping_sub(sum);
 
-    let mut controller = FakeController::with_monitor(Pin::DdiB, &block);
+    let controller = FakeController::with_monitor(Pin::DdiB, &block);
     let (result, notes) = read(&controller, Pin::DdiB);
     let bytes = result.expect("a valid block must read");
     assert_eq!(bytes.as_slice(), &block[..]);
@@ -718,7 +718,7 @@ fn a_floating_bus_is_named_rather_than_called_a_bad_header() {
     // reference lists that separately from a wrong header because the causes
     // differ (§11.1).
     let block = [0xffu8; EDID_BLOCK_LEN];
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
+    let controller = FakeController::with_monitor(Pin::DdiA, &block);
     controller.attach_anywhere();
     let (result, _) = read(&controller, Pin::DdiA);
     assert_eq!(result, Err(GmbusError::BusFloating { pin: Pin::DdiA }));
@@ -728,7 +728,7 @@ fn a_floating_bus_is_named_rather_than_called_a_bad_header() {
 fn a_bus_that_never_offers_data_times_out_and_is_left_released() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
+    let controller = FakeController::with_monitor(Pin::DdiA, &block);
     // The controller accepts the command and then says nothing.
     controller.serve_words(0);
     let (result, _) = read(&controller, Pin::DdiA);
@@ -766,7 +766,7 @@ fn a_bus_that_never_offers_data_times_out_and_is_left_released() {
 fn a_partial_read_never_becomes_a_short_block() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
+    let controller = FakeController::with_monitor(Pin::DdiA, &block);
     // Two words out of thirty-two, then silence.
     controller.serve_words(2);
     let (result, _) = read(&controller, Pin::DdiA);
@@ -828,7 +828,7 @@ fn a_nak_with_the_power_well_on_is_only_a_nak() {
 fn a_nak_is_retried_once_and_a_late_answer_is_used() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
+    let controller = FakeController::with_monitor(Pin::DdiA, &block);
     // "Passive adapters sometimes NAK the first probe" ([I915]
     // `display/intel_gmbus.c:714-725`).
     controller.nak_first_transaction();
@@ -842,7 +842,7 @@ fn a_nak_is_retried_once_and_a_late_answer_is_used() {
 fn a_stuck_bus_is_named_and_the_recovery_releases_the_pin() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
+    let controller = FakeController::with_monitor(Pin::DdiA, &block);
     // The transaction completes and the bus never goes idle afterwards.
     controller.stick_bus();
     let (result, _) = read(&controller, Pin::DdiA);
@@ -864,7 +864,7 @@ fn a_stuck_bus_is_named_and_the_recovery_releases_the_pin() {
 #[test]
 fn a_stall_is_reported_with_the_status_bit_that_says_so() {
     let _guard = scheduler_test_context();
-    let mut controller = FakeController::bare();
+    let controller = FakeController::bare();
     controller.stall();
     let (result, _) = read(&controller, Pin::DdiA);
     match result {
@@ -888,7 +888,7 @@ fn a_stall_is_reported_with_the_status_bit_that_says_so() {
 fn the_firmware_leaving_the_index_register_in_two_byte_mode_is_recorded() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
+    let controller = FakeController::with_monitor(Pin::DdiA, &block);
     controller.set_word(GMBUS5, GMBUS5_2BYTE_INDEX_EN | 0x1234);
     let (result, notes) = read(&controller, Pin::DdiA);
     assert_eq!(result, Ok(EdidBytes { bytes: block }));
@@ -909,7 +909,7 @@ fn the_firmware_leaving_the_index_register_in_two_byte_mode_is_recorded() {
 fn a_bus_already_in_use_is_recorded() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
+    let controller = FakeController::with_monitor(Pin::DdiA, &block);
     controller.in_use();
     let (result, notes) = read(&controller, Pin::DdiA);
     assert_eq!(result, Ok(EdidBytes { bytes: block }));
@@ -923,7 +923,7 @@ fn a_window_that_stops_before_the_index_register_is_named() {
     // the status read succeed, and the register that says how the index phase
     // is interpreted is the one that is missing.
     let block = valid_edid(0);
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
+    let controller = FakeController::with_monitor(Pin::DdiA, &block);
     controller.set_window_len(GMBUS5.offset() as usize);
     let (result, _) = read(&controller, Pin::DdiA);
     assert_eq!(
@@ -936,7 +936,7 @@ fn a_window_that_stops_before_the_index_register_is_named() {
 fn a_window_that_does_not_reach_gmbus_at_all_refuses_the_write() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &block);
+    let controller = FakeController::with_monitor(Pin::DdiA, &block);
     controller.set_window_len(0x100);
     let (result, _) = read(&controller, Pin::DdiA);
     assert_eq!(
@@ -958,7 +958,7 @@ fn reading_a_later_block_asks_the_eeprom_for_that_offset_and_takes_its_checksum(
         block[EDID_BLOCK_LEN - 1] = 0u8.wrapping_sub(sum);
         block
     };
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &base);
+    let controller = FakeController::with_monitor(Pin::DdiA, &base);
     // The monitor's EEPROM is one image: the base block at 0 and the extension
     // at 0x80.
     let mut eeprom = alloc::vec![0u8; 2 * EDID_BLOCK_LEN];
@@ -1003,7 +1003,7 @@ fn the_extension_read_follows_the_count_in_the_base_block() {
         block[EDID_BLOCK_LEN - 1] = 0u8.wrapping_sub(sum);
         block
     };
-    let mut controller = FakeController::with_monitor(Pin::DdiA, &base);
+    let controller = FakeController::with_monitor(Pin::DdiA, &base);
     let mut eeprom = alloc::vec![0u8; 2 * EDID_BLOCK_LEN];
     eeprom[..EDID_BLOCK_LEN].copy_from_slice(&base);
     eeprom[EDID_BLOCK_LEN..].copy_from_slice(&extension);
@@ -1027,7 +1027,7 @@ fn the_extension_read_follows_the_count_in_the_base_block() {
 fn the_sink_probe_tries_every_ddc_pin_and_says_which_one_answered() {
     let _guard = scheduler_test_context();
     let block = valid_edid(0);
-    let mut controller = FakeController::with_monitor(Pin::DdiB, &block);
+    let controller = FakeController::with_monitor(Pin::DdiB, &block);
     controller.set_well_on(Pin::DdiA);
     let probe = probe_sink_with(&controller, &FakeClock::new());
     assert_eq!(probe.found(), Some(Pin::DdiB));
@@ -1049,7 +1049,7 @@ fn the_sink_probe_tries_every_ddc_pin_and_says_which_one_answered() {
 #[test]
 fn a_probe_with_no_monitor_says_so_on_every_pin() {
     let _guard = scheduler_test_context();
-    let mut controller = FakeController::bare();
+    let controller = FakeController::bare();
     controller.detach();
     let probe = probe_sink_with(&controller, &FakeClock::new());
     assert_eq!(probe.found(), None);
@@ -1095,7 +1095,7 @@ fn a_status_word_is_decoded_for_the_log() {
 #[test]
 fn a_transfer_length_outside_one_block_is_refused() {
     let _guard = scheduler_test_context();
-    let mut controller = FakeController::bare();
+    let controller = FakeController::bare();
     let clock = FakeClock::new();
     let mut notes = BusNotes::default();
     let mut bus = Bus {
