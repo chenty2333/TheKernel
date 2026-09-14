@@ -6528,8 +6528,8 @@ impl PollControl {
 
 /// One bounded pending zero-offset FIFO read. The callback/control path is
 /// intentionally weak; the exact buffer lease keeps the ring alive after the
-/// ring fd is closed, and it is removed only after the issued request has won
-/// its terminal transition and the CQE has been published.
+/// ring fd is closed. It is removed after the issued request has won its
+/// terminal transition, before publishing the CQE permits buffer reuse.
 struct PendingStreamWork {
     slot: usize,
     issued: Option<IssuedRequest>,
@@ -7861,6 +7861,10 @@ impl IoUring {
                         buffer.consume_provided();
                     }
                 }
+                // Completion permits userspace to re-register an unregistered
+                // fixed-buffer table immediately. Retire its final lease
+                // before publishing the CQ tail, not after waking its reader.
+                drop(buffer.take());
             },
         );
         drop(buffer);
@@ -10656,9 +10660,12 @@ impl IoUring {
             };
             let outcome = control.cancel();
             let (callback, cancelled) = {
+                // Declare custody first so error returns also unlock before
+                // its buffer lease re-enters the ring during Drop.
+                let mut owner;
                 let mut state = self.state.lock();
                 let slot = id.slot() as usize;
-                let mut owner = state
+                owner = state
                     .owned_file_io
                     .get_mut(slot)
                     .and_then(Option::take)
@@ -10693,6 +10700,7 @@ impl IoUring {
                             .finish_terminal(permit, -LinuxError::ECANCELED.code(), 0)
                             .map_err(map_core_error)?;
                         self.queue_completion_locked(&mut state, token)?;
+                        drop(state);
                         drop(owner);
                         (None, true)
                     }
@@ -11073,11 +11081,17 @@ impl IoUring {
         // externally visible read.  Finish from that state atomically rather
         // than reopening cancellation between the read and its final CQE.
         let completed = (|| {
-            let mut state = self.state.lock();
-            let permit = state
+            let permit = self
+                .state
+                .lock()
                 .requests
                 .claim_terminal_after_nonterminal_shot(&issued, TerminalCause::Completed)
                 .map_err(map_core_error)?;
+            // The read has stopped and cancellation cannot win. Release the
+            // exact owners outside the ring lock, before making a CQE pending.
+            drop(lease);
+            drop(work);
+            let mut state = self.state.lock();
             let token = state
                 .requests
                 .finish_terminal(permit, result, 0)
@@ -11106,12 +11120,6 @@ impl IoUring {
                 }
             }
         }
-        // The CQE publication boundary is above the exact registered-buffer
-        // lease drop. Unregister can therefore detach its table while this
-        // owner still pins the slot, but it cannot release the pin before the
-        // terminal CQE is visible.
-        drop(lease);
-        drop(work);
         if self.final_close_requested.load(Ordering::Acquire) {
             self.enqueue_deferred();
         }
@@ -11131,14 +11139,14 @@ impl IoUring {
             .take()
             .expect("pending stream rearm lost issued request");
         let lease = work.control.deactivate();
+        drop(lease);
+        drop(work);
         let _ = self.complete_issued(
             issued,
             TerminalCause::PreparationFailed,
             -LinuxError::from(error).code(),
             0,
         );
-        drop(lease);
-        drop(work);
     }
 
     /// Retries one exact pending stream owner in task context. IRQ/readiness
@@ -11596,9 +11604,10 @@ impl IoUring {
             // only this path resolves the registry's ShotInFlight fence.
             let outcome = control.cancel();
             let (callback, target_cancelled, cancel_result) = {
+                let mut owner;
                 let mut state = self.state.lock();
                 let slot = target_id.slot() as usize;
-                let mut owner = state
+                owner = state
                     .owned_file_io
                     .get_mut(slot)
                     .and_then(Option::take)
@@ -11633,6 +11642,7 @@ impl IoUring {
                             .finish_terminal(permit, -LinuxError::ECANCELED.code(), 0)
                             .map_err(map_core_error)?;
                         self.queue_completion_locked(&mut state, token)?;
+                        drop(state);
                         drop(owner);
                         (None, true, 0)
                     }
@@ -12569,6 +12579,172 @@ mod adapter_state_tests {
             .unwrap();
         let prepared = state.requests.commit(reservation).unwrap();
         state.requests.issue(prepared).unwrap()
+    }
+
+    struct BufferRetirementWake {
+        ring: Arc<IoUring>,
+        retired: AtomicBool,
+    }
+
+    impl Wake for BufferRetirementWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            // This is the first synchronous CQ notification, not a check
+            // after the completing executor has returned and dropped locals.
+            self.retired.fetch_or(
+                self.ring.cq_tail.load_acquire() == 1
+                    && self.ring.state.lock().registered_buffers.is_none(),
+                Ordering::Release,
+            );
+        }
+    }
+
+    struct CancelledFileIoControl;
+
+    impl axfs_ng_vfs::SubmittedFileIoControl for CancelledFileIoControl {
+        fn cancel(self: Box<Self>) -> axfs_ng_vfs::FileIoCancelOutcome {
+            axfs_ng_vfs::FileIoCancelOutcome::Cancelled
+        }
+    }
+
+    #[test]
+    fn fixed_buffer_retires_before_terminal_cq_notification() {
+        use axhal::paging::MappingFlags;
+        use memory_addr::VirtAddr;
+
+        let _context = crate::test_support::scheduler_test_context();
+        for path in ["owned", "stream", "stream-rearm-error", "cancel", "close"] {
+            let layout = SetupRequest::new(2, 0, SetupFlags::NO_SQARRAY)
+                .resolve(FeatureFlags::EMPTY)
+                .unwrap();
+            let ring = IoUring::try_new(layout).unwrap();
+            let base = VirtAddr::from(0x1000);
+            let mut space = crate::mm::AddrSpace::new_empty(base, PAGE_BYTES).unwrap();
+            space
+                .map(
+                    base,
+                    PAGE_BYTES,
+                    MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                    false,
+                    crate::mm::Backend::new_alloc(base, PageSize::Size4K),
+                )
+                .unwrap();
+            let capability = UserMemoryCapability::new(Arc::new(Mutex::new(space)));
+            ring.register_buffers(ring.world, &capability, vec![(0x1000, PAGE_BYTES)])
+                .unwrap();
+            let buffer = ring
+                .acquire_registered_buffer(ring.world, BufferSlot::new(0), 0x1000, 32)
+                .unwrap();
+            ring.unregister_buffers().unwrap();
+            assert!(ring.state.lock().registered_buffers.is_some());
+            let wake = Arc::new(BufferRetirementWake {
+                ring: ring.clone(),
+                retired: AtomicBool::new(false),
+            });
+            let waker = Waker::from(wake.clone());
+            let _registration = ring.completion_wait.register(&waker).unwrap();
+            let issued = if path == "cancel" || path == "close" {
+                let mut state = ring.state.lock();
+                let reservation = state
+                    .requests
+                    .reserve(RequestDescriptor::new(7, RequestOperation::Read))
+                    .unwrap();
+                let prepared = state.requests.commit(reservation).unwrap();
+                state
+                    .requests
+                    .issue_with_cancellation_mode(
+                        prepared,
+                        Some(thekernel_linux_io_uring::CancellationMode::ProviderControlled),
+                    )
+                    .unwrap()
+            } else {
+                issue_test_request(&ring)
+            };
+            if path == "owned" {
+                ring.complete_owned_immediate(issued, 32, Some(buffer))
+                    .unwrap();
+            } else if path == "cancel" || path == "close" {
+                let id = issued.id();
+                ring.state.lock().owned_file_io[id.slot() as usize] = Some(OwnedFileIoOwner {
+                    id,
+                    state: OwnedFileIoControlState::Submitted {
+                        generation: id.generation(),
+                        bridge: OwnedFileIoBridge { issued },
+                        control: SubmittedFileIo::new(Box::new(CancelledFileIoControl)),
+                    },
+                    buffer: Some(buffer),
+                });
+                if path == "cancel" {
+                    ring.cancel_request(issue_test_request(&ring), 7).unwrap();
+                } else {
+                    ring.state
+                        .lock()
+                        .final_close
+                        .enter(FinalClosePhase::OwnedFileIo);
+                    ring.close_owned_file_io_step().unwrap();
+                    // Reopen only this synthetic close phase for the final
+                    // registration assertion; production close is terminal.
+                    ring.state.lock().final_close.phase = FinalClosePhase::Begin;
+                }
+            } else {
+                let description = FileDescription::new(Arc::new(FixedFileTestObject)).unwrap();
+                let context = description.capture_io_operation_context(
+                    VfsSecurityContext::new(
+                        crate::task::Cred::try_root(
+                            crate::task::UserNamespace::try_new_root().unwrap(),
+                        )
+                        .unwrap(),
+                    ),
+                    FanotifyEventActor::default(),
+                );
+                let control = PollControl::try_new(
+                    Arc::downgrade(&ring),
+                    issued.id(),
+                    IoUringFileLease::Descriptor(description),
+                    pending_stream_events(),
+                    false,
+                )
+                .unwrap_or_else(|_| panic!("control allocation failed"));
+                let mut bytes = [0; thekernel_linux_io_uring::SQE_BYTES as usize];
+                bytes[0] = 4; // IORING_OP_READ_FIXED
+                let thekernel_linux_io_uring::SubmissionOperation::Read(request) =
+                    ParsedSubmission::parse(bytes).unwrap().operation()
+                else {
+                    unreachable!()
+                };
+                if path == "stream" {
+                    ring.state
+                        .lock()
+                        .requests
+                        .begin_side_effect(&issued)
+                        .unwrap();
+                }
+                let work = PendingStreamWork {
+                    slot: issued.id().slot() as usize,
+                    issued: Some(issued),
+                    request,
+                    control,
+                    buffer,
+                    context,
+                    capability: capability.clone(),
+                };
+                if path == "stream" {
+                    ring.complete_pending_stream_work(work, 32);
+                } else {
+                    ring.fail_pending_stream_rearm(work, AxError::NoMemory);
+                }
+            }
+            assert!(
+                wake.retired.load(Ordering::Acquire),
+                "{path}: CQE preceded lease retirement"
+            );
+            ring.register_buffers(ring.world, &capability, vec![(0x1000, PAGE_BYTES)])
+                .unwrap();
+            ring.unregister_buffers().unwrap();
+        }
     }
 
     #[test]
