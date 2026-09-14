@@ -297,6 +297,26 @@ impl ConnectReport {
 /// The order is the reference's and it is load-bearing: the wells are requested
 /// before the first GMBUS transaction, because a channel behind a shut gate
 /// NAKs every address and looks exactly like a port with nothing on it.
+//
+// `clippy::result_large_err` fires here and on the closure in
+// `resolve_device` that produces this value.  What it measures is real:
+// clippy sizes the largest variant, `ConnectError::WellDown`, at 128 bytes,
+// because a well record and a `PowerError` travel together in it.  Boxing is
+// still the wrong answer, for two reasons.
+//
+// The error path is cold.  `resolve` runs once per display device at boot, and
+// `resolve_at_boot` renders the `Err` into one log line and keeps it in the
+// report; an allocation on that path buys nothing that is measured.
+//
+// And it would not make this `Result` smaller.  The `Ok` half is `Connector`,
+// which holds a 128-byte validated EDID block and an optional second block
+// before its mode plan and well records are counted, so the value returned here
+// is already the size of `Connector` and a `Box`ed error would not change it.
+//
+// What would change the decision: an `Err` on a path walked per frame, or a
+// caller whose `Ok` type is smaller than these 128 bytes.  Either makes the
+// move the expensive half, and then the indirection is worth paying for.
+#[allow(clippy::result_large_err)]
 pub(crate) fn resolve<R: Registers, T: PollTimer>(
     bdf: Bdf,
     regs: &R,
@@ -324,6 +344,11 @@ pub(crate) struct Resolved {
 /// closure so that every early return below still reaches it: a device that
 /// produced no connector has still answered the hotplug read, and that answer
 /// is the baseline the after-boot watch needs.
+//
+// The closure returns the same `Result<Connector, ConnectError>` as `resolve`,
+// and the note above that function is where the reason this lint is allowed
+// rather than answered with a `Box` is written out.
+#[allow(clippy::result_large_err)]
 pub(crate) fn resolve_device<R: Registers, T: PollTimer>(
     bdf: Bdf,
     regs: &R,
