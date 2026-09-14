@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import struct
 import sys
 import tarfile
@@ -180,6 +181,15 @@ def decode_edid(data: bytes) -> Edid:
         hblank = descriptor[3] | ((descriptor[4] & 0x0F) << 8)
         vactive = descriptor[5] | ((descriptor[7] & 0xF0) << 4)
         vblank = descriptor[6] | ((descriptor[7] & 0x0F) << 8)
+        # A total of zero means the descriptor contradicts itself: a real mode
+        # has at least one pixel and one line.  Refusing it here keeps the
+        # failure a decoded finding instead of a ZeroDivisionError that would
+        # abandon every later EDID in the bundle.
+        if hactive + hblank == 0 or vactive + vblank == 0:
+            raise BundleError(
+                "EDID detailed timing declares a zero total extent: "
+                f"{hactive}+{hblank} by {vactive}+{vblank}"
+            )
         preferred = {
             "pixel_clock_khz": pixel_clock * 10,
             "hactive": hactive,
@@ -192,8 +202,7 @@ def decode_edid(data: bytes) -> Edid:
             "vsync": (descriptor[10] & 0x0F) | ((descriptor[11] & 0x03) << 4),
         }
         preferred["refresh_hz"] = round(
-            preferred["pixel_clock_khz"] * 1000
-            / ((hactive + hblank) * (vactive + vblank))
+            preferred["pixel_clock_khz"] * 1000 / ((hactive + hblank) * (vactive + vblank))
         )
         break
     return Edid(
@@ -214,6 +223,11 @@ def decode_edid(data: bytes) -> Edid:
 class Bundle:
     root: Path
     files: dict[str, Path]
+    #: Directory this bundle unpacked a tarball into, or ``None`` when it reads
+    #: a directory that belongs to the caller.  The bundle owns this one and
+    #: removes it again, because a capture tarball can be hundreds of megabytes
+    #: and leaves behind a full second copy of itself otherwise.
+    extract_dir: Path | None = None
 
     @classmethod
     def open(cls, path: Path) -> Bundle:
@@ -221,16 +235,29 @@ class Bundle:
             import tempfile
 
             extract_dir = Path(tempfile.mkdtemp(prefix="hw-facts-", dir=path.parent))
-            with tarfile.open(path) as archive:
-                for member in archive.getmembers():
-                    if member.name.startswith("/") or ".." in Path(member.name).parts:
-                        raise BundleError(f"refusing unsafe tar member: {member.name}")
-                    if member.islnk() or member.issym():
-                        raise BundleError(f"refusing linked tar member: {member.name}")
-                archive.extractall(extract_dir, filter="data")
-            roots = [entry for entry in extract_dir.iterdir() if entry.is_dir()]
-            root = roots[0] if len(roots) == 1 else extract_dir
-        elif path.is_dir():
+            try:
+                with tarfile.open(path) as archive:
+                    for member in archive.getmembers():
+                        if member.name.startswith("/") or ".." in Path(member.name).parts:
+                            raise BundleError(f"refusing unsafe tar member: {member.name}")
+                        if member.islnk() or member.issym():
+                            raise BundleError(f"refusing linked tar member: {member.name}")
+                    archive.extractall(extract_dir, filter="data")
+                roots = [entry for entry in extract_dir.iterdir() if entry.is_dir()]
+                root = roots[0] if len(roots) == 1 else extract_dir
+                files = {
+                    str(item.relative_to(root)): item for item in root.rglob("*") if item.is_file()
+                }
+            except BaseException:
+                # A refusal half way through extraction still owes the disk the
+                # space it took, and the caller cannot know the directory name.
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                raise
+            if not files:
+                shutil.rmtree(extract_dir, ignore_errors=True)
+                raise BundleError(f"bundle contains no files: {root}")
+            return cls(root=root, files=files, extract_dir=extract_dir)
+        if path.is_dir():
             root = path
         else:
             raise BundleError(f"not a bundle directory or tarball: {path}")
@@ -238,6 +265,29 @@ class Bundle:
         if not files:
             raise BundleError(f"bundle contains no files: {root}")
         return cls(root=root, files=files)
+
+    def close(self) -> None:
+        """Remove the unpacked copy, if this bundle made one.  Idempotent."""
+
+        if self.extract_dir is not None:
+            shutil.rmtree(self.extract_dir, ignore_errors=True)
+            self.extract_dir = None
+
+    def __enter__(self) -> Bundle:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # The command line reads one bundle and exits, so an explicit close is
+        # wasted ceremony there; this covers that path.  It runs at interpreter
+        # shutdown too, which is why ``close`` tolerates a partly-torn-down
+        # ``shutil`` and refuses to raise.
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def find(self, *candidates: str) -> Path | None:
         for candidate in candidates:
@@ -501,8 +551,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        bundle = Bundle.open(args.bundle)
-        facts = collect(bundle)
+        with Bundle.open(args.bundle) as bundle:
+            facts = collect(bundle)
     except (BundleError, OSError, tarfile.TarError) as error:
         print(f"hw-facts-bundle: FAIL {error}", file=sys.stderr)
         return 1

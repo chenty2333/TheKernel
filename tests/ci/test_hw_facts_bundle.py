@@ -159,6 +159,23 @@ class EdidTests(unittest.TestCase):
         block[127] = (-sum(block[:127])) % 256
         self.assertIsNone(self.reader.decode_edid(bytes(block)).preferred)
 
+    def test_a_timing_with_no_pixels_is_a_finding_not_a_crash(self) -> None:
+        # A malformed descriptor can declare a zero total extent: a real mode
+        # holds at least one pixel and one line.  That is a finding about the
+        # capture, and it must not become a ZeroDivisionError that abandons the
+        # facts from every other file in the bundle.
+        for fields, decoded in (
+            ((2, 3, 4), "0+0 by 1080+45"),  # horizontal active and blanking
+            ((5, 6, 7), "1920+280 by 0+0"),  # vertical active and blanking
+        ):
+            block = bytearray(edid_block())
+            for field in fields:
+                block[54 + field] = 0
+            block[127] = (-sum(block[:127])) % 256
+            with self.assertRaises(self.reader.BundleError) as raised:
+                self.reader.decode_edid(bytes(block))
+            self.assertIn(f"zero total extent: {decoded}", str(raised.exception))
+
 
 class BundleTests(unittest.TestCase):
     """End-to-end reading of a synthetic bundle that looks like a real capture."""
@@ -232,22 +249,66 @@ class BundleTests(unittest.TestCase):
 
     def test_a_tarball_bundle_reads_the_same_way(self) -> None:
         self.populate()
+        with self.reader.Bundle.open(self.tarball()) as bundle:
+            facts = self.reader.collect(bundle)
+        self.assertEqual(facts["ecam"]["mcfg"]["ecam_base"], "0xe0000000")
+
+    def test_a_tarball_leaves_no_unpacked_copy_behind(self) -> None:
+        # A capture tarball is hundreds of megabytes, so unpacking it and
+        # walking away leaves a second copy on the host per invocation.
+        self.populate()
+        with self.reader.Bundle.open(self.tarball()) as bundle:
+            self.assertTrue(bundle.files, "the unpacked copy is readable while open")
+            extracted = bundle.extract_dir
+            self.assertIsNotNone(extracted)
+            self.assertTrue(extracted.is_dir())
+        self.assertFalse(extracted.exists(), "closing the bundle removes the copy")
+        self.assertEqual(
+            sorted(path.name for path in Path(self._tmp.name).iterdir()),
+            ["bundle.tar.gz", self.root.name],
+        )
+
+    def test_closing_a_directory_bundle_does_not_delete_it(self) -> None:
+        # The directory belongs to the caller: a capture directory on the
+        # development host is not the reader's to remove.
+        self.populate()
+        with self.reader.Bundle.open(self.root) as bundle:
+            self.assertIsNone(bundle.extract_dir)
+        self.assertTrue(self.root.is_dir())
+        bundle.close()  # idempotent, and still not the reader's directory
+
+    def test_a_tarball_that_tries_to_escape_is_refused(self) -> None:
+        with self.assertRaisesRegex(self.reader.BundleError, "unsafe tar member"):
+            self.reader.Bundle.open(self.evil_tarball())
+
+    def test_a_refused_tarball_leaves_no_unpacked_copy_behind(self) -> None:
+        # The refusal happens part way through extraction, so the copy is
+        # already on disk when it is raised.
+        with self.assertRaisesRegex(self.reader.BundleError, "unsafe tar member"):
+            self.reader.Bundle.open(self.evil_tarball())
+        self.assertEqual(
+            sorted(path.name for path in Path(self._tmp.name).iterdir()),
+            ["evil.tar", self.root.name],
+            "no hw-facts-* extraction directory survives the refusal",
+        )
+
+    def tarball(self) -> Path:
+        """Pack the populated bundle the way the capture image would."""
+
         archive = Path(self._tmp.name) / "bundle.tar.gz"
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
             tar.add(self.root, arcname=self.root.name)
         archive.write_bytes(buffer.getvalue())
-        facts = self.reader.collect(self.reader.Bundle.open(archive))
-        self.assertEqual(facts["ecam"]["mcfg"]["ecam_base"], "0xe0000000")
+        return archive
 
-    def test_a_tarball_that_tries_to_escape_is_refused(self) -> None:
+    def evil_tarball(self) -> Path:
         evil = Path(self._tmp.name) / "evil.tar"
         with tarfile.open(evil, "w") as tar:
             info = tarfile.TarInfo("../../escaped")
             info.size = 3
             tar.addfile(info, io.BytesIO(b"bad"))
-        with self.assertRaisesRegex(self.reader.BundleError, "unsafe tar member"):
-            self.reader.Bundle.open(evil)
+        return evil
 
 
 if __name__ == "__main__":
