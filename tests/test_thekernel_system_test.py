@@ -748,6 +748,20 @@ class DesktopHomeTests(unittest.TestCase):
             self.assertEqual(run.call_args.args[0].extra_block, "/home/example/home.ext4")
             self.assertEqual(run.call_args.args[0].rootfs_transport, "drive")
 
+    def test_missing_default_desktop_explains_rebuild_before_touching_home(self):
+        product = load_product()
+        with test_tmpdir() as directory:
+            args = product.build_parser().parse_args(["run-gui"])
+            with patch.object(product, "state_root", return_value=Path(directory)), \
+                    patch.object(product, "prepare_desktop_home") as prepare, \
+                    patch.object(product, "build_desktop_rootfs") as build, \
+                    patch.object(product, "run_cmd") as run:
+                with self.assertRaisesRegex(product.ProductError, "make run-gui RUN_ARGS=--build"):
+                    product.run_gui_cmd(args)
+                prepare.assert_not_called()
+                build.assert_not_called()
+                run.assert_not_called()
+
     def test_run_gui_rejects_conflicting_extra_disk(self):
         product = load_product()
         args = product.build_parser().parse_args(["run-gui", "--extra-block", "/home/example/other.ext4"])

@@ -687,6 +687,12 @@ def run_gui_cmd(args: argparse.Namespace) -> int:
         rootfs = artifacts.root / "graphics-desktop" / "images" / "rootfs.ext2"
         if not args.no_build:
             rootfs = build_desktop_rootfs(artifacts)
+        elif not rootfs.is_file():
+            raise ProductError(
+                f"desktop rootfs is missing: {rootfs}; rebuild it with "
+                "make run-gui RUN_ARGS=--build (preserves the desktop home disk); "
+                "a cold desktop/WebKit build can take a long time"
+            )
         args.rootfs = str(rootfs)
     args.extra_block = str(prepare_desktop_home(Path(args.home_disk) if args.home_disk else None))
     return run_cmd(args)
