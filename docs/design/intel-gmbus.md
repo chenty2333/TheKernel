@@ -308,14 +308,14 @@ Host tests only.  The kernel's host suite, filtered to `drm::intel`: **388
 passed**, 0 failed, of which 48 are this workstream's (27 in `gmbus::tests`, 16
 in `hpd::tests`, 5 in `sink::tests`).  The tests drive the real code the target
 would run — the same `transfer`, `wait_for`, `failure`, `read_block` and
-`probe_one` — through `FakeController` for the transport and phase 2, and through
-a real `RegisterWindow` over an ordinary buffer, or the shared `regs::mock`
-register file, for the hotplug reads.  `FakeController` is a device model
-implementing `regs::Registers` and applying the same two rules the mapped window
-applies.  That is deliberate: the register addresses, the access rules and the
-bounds checks under test are the real ones, so a write to a register the table
-declares read-only is refused in a test for the same reason it would be refused
-on hardware.
+`probe_one` — through `FakeController` for the transport and phase 2, and
+through a real `RegisterWindow` over an ordinary buffer, or the shared
+`regs::mock` register file, for the hotplug reads.  `FakeController` is a device
+model implementing `regs::Registers` and applying the same two rules the mapped
+window applies.  That is deliberate: the register addresses, the access rules
+and the bounds checks under test are the real ones, so a write to a register the
+table declares read-only is refused in a test for the same reason it would be
+refused on hardware.
 
 What the tests establish:
 
