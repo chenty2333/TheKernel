@@ -139,6 +139,16 @@ class MachineProfileTests(unittest.TestCase):
                     (0, 0),
                     "bus 0 is firmware-assigned and must not be reallocated",
                 )
+                # The driver indexes this list positionally: entry 0 means "the
+                # firmware assigned it" and entry 1 is the allocator that has to
+                # exist for a BAR left unassigned.  A profile with only the
+                # first entry panics the first time it meets such a BAR, so the
+                # invariant the driver assumes is pinned here.
+                self.assertGreaterEqual(
+                    len(ranges),
+                    2,
+                    "a machine profile must declare an allocation window besides bus 0",
+                )
                 windows = sorted(ranges[1:])
                 for (start, size), (next_start, _) in zip(windows, windows[1:]):
                     self.assertLessEqual(start + size, next_start)

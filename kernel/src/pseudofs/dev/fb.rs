@@ -866,11 +866,11 @@ impl DisplayCore {
     }
 
     fn read_bytes(&self, offset: usize, dst: &mut [u8]) -> VfsResult<()> {
-        self.scanout.read_bytes(offset, dst).map_err(VfsError::from)
+        self.scanout.read_bytes(offset, dst)
     }
 
     fn write_bytes(&self, offset: usize, src: &[u8]) -> VfsResult<()> {
-        self.scanout.write_bytes(offset, src).map_err(VfsError::from)
+        self.scanout.write_bytes(offset, src)
     }
 
     fn commit_if_needed(&self) {

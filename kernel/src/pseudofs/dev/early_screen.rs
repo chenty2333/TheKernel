@@ -317,8 +317,8 @@ impl TextView {
     /// Draw `text` into one scan line of cells, clipping anything that does
     /// not fit.
     fn draw_row(&self, dst: &mut [u8], row: usize, text: &[u8], cols: usize, fg: u32, bg: u32) {
-        for col in 0..cols.min(text.len()) {
-            self.draw_cell(dst, col, row, text[col], fg, bg);
+        for (col, &byte) in text.iter().enumerate().take(cols) {
+            self.draw_cell(dst, col, row, byte, fg, bg);
         }
     }
 

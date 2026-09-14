@@ -136,7 +136,7 @@ pub fn parse_regions(bytes: &[u8]) -> Result<heapless::Vec<ConfigRegion, MAX_REG
     // 16-byte allocation structures: a trailing partial entry means the length
     // field and the entry array disagree.
     if declared < MCFG_ENTRIES_OFFSET
-        || (declared - MCFG_ENTRIES_OFFSET) % MCFG_ENTRY_LEN != 0
+        || !(declared - MCFG_ENTRIES_OFFSET).is_multiple_of(MCFG_ENTRY_LEN)
     {
         return Err(McfgError::BadLength);
     }
