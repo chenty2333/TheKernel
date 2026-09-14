@@ -334,6 +334,11 @@ sleep() { echo wait; }
         evdev_oracle = (ROOT / "tests/guest/graphics/evdev-uapi-oracle.c").read_text()
         self.assertIn('result("evdev.open", "FAIL"', evdev_oracle)
         self.assertIn("bit_bytes == (int)sizeof(unsigned long)", evdev_oracle)
+        self.assertIn("ioctl(fd, EVIOCGRAB, 1)", evdev_oracle)
+        self.assertIn("ioctl(fd, EVIOCGRAB, 0)", evdev_oracle)
+        self.assertNotIn("EVIOCGRAB, &", evdev_oracle)
+        self.assertIn('result("evdev.grab_duplicate", "FAIL"', evdev_oracle)
+        self.assertIn('result("evdev.grab_unowned_release", "FAIL"', evdev_oracle)
         self.assertIn("return failures == 0 ? 0 : 1", evdev_oracle)
 
     def test_graphics_smoke_hands_an_existing_rootfs_to_the_drive_transport_without_building(self) -> None:

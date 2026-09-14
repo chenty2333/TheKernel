@@ -128,7 +128,7 @@ int main(void) {
            (unsigned long)EVIOCGVERSION, (unsigned long)EVIOCGID, (unsigned long)EVIOCGBIT(0, 64), (unsigned long)EVIOCGABS(ABS_X), (unsigned long)EVIOCSCLOCKID, (unsigned long)EVIOCGRAB);
     int fd = open_event();
     if (fd < 0) { result("evdev.open", "FAIL", errno); return 1; }
-    int version = 0, clockid = -1, grab = 1;
+    int version = 0, clockid = -1;
     struct input_id id; struct input_absinfo abs; unsigned char bits[64]; char bit_text[129];
     memset(&id, 0, sizeof(id)); memset(&abs, 0, sizeof(abs)); memset(bits, 0, sizeof(bits));
     if (ioctl(fd, EVIOCGVERSION, &version) == 0) printf("TK_GRAPHICS kind=evdev.version state=OK value=0x%x\n", version); else result("evdev.version", "FAIL", errno);
@@ -148,7 +148,17 @@ int main(void) {
         if (ioctl(fd, EVIOCSCLOCKID, &restore_clockid) == 0) printf("TK_GRAPHICS kind=evdev.clockid state=OK\n");
         else result("evdev.clockid_restore", "FAIL", errno);
     } else result("evdev.clockid", "FAIL", errno);
-    if (ioctl(fd, EVIOCGRAB, &grab) == 0) { grab = 0; if (ioctl(fd, EVIOCGRAB, &grab) == 0) printf("TK_GRAPHICS kind=evdev.grab state=OK\n"); else result("evdev.grab_release", "FAIL", errno); } else result("evdev.grab", "FAIL", errno);
+    /* Despite its _IOW encoding, EVIOCGRAB uses the scalar argument. */
+    if (ioctl(fd, EVIOCGRAB, 1) == 0) {
+        int rc = ioctl(fd, EVIOCGRAB, 1);
+        if (rc != -1 || errno != EBUSY)
+            result("evdev.grab_duplicate", "FAIL", rc < 0 ? errno : EPROTO);
+        if (ioctl(fd, EVIOCGRAB, 0) == 0) {
+            rc = ioctl(fd, EVIOCGRAB, 0);
+            if (rc == -1 && errno == EINVAL) printf("TK_GRAPHICS kind=evdev.grab state=OK\n");
+            else result("evdev.grab_unowned_release", "FAIL", rc < 0 ? errno : EPROTO);
+        } else result("evdev.grab_release", "FAIL", errno);
+    } else result("evdev.grab", "FAIL", errno);
     close(fd);
     probe_initialization_bitmaps();
     return failures == 0 ? 0 : 1;

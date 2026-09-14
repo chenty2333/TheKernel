@@ -157,6 +157,23 @@ struct EvdevClientState {
     overflowed: bool,
 }
 
+/// Linux grab ownership is exclusive even when the owner asks twice.
+/// Release succeeds only for the currently owning open file description.
+fn update_grab_owner(owner: &mut Option<u64>, client: u64, argument: usize) -> AxResult<()> {
+    if argument != 0 {
+        if owner.is_some() {
+            return Err(LinuxError::EBUSY.into());
+        }
+        *owner = Some(client);
+    } else {
+        if *owner != Some(client) {
+            return Err(LinuxError::EINVAL.into());
+        }
+        *owner = None;
+    }
+    Ok(())
+}
+
 impl EvdevDevice {
     pub fn new(device: AxInputDevice) -> Arc<Self> {
         let irq = device.irq_num();
@@ -470,22 +487,8 @@ impl EvdevDevice {
         Ok(())
     }
 
-    fn set_grab(&self, client: u64, grab: bool) -> AxResult<()> {
-        let mut state = self.state.lock();
-        if grab {
-            match state.grab_owner {
-                Some(owner) if owner != client => Err(LinuxError::EBUSY.into()),
-                _ => {
-                    state.grab_owner = Some(client);
-                    Ok(())
-                }
-            }
-        } else {
-            if state.grab_owner == Some(client) {
-                state.grab_owner = None;
-            }
-            Ok(())
-        }
+    fn set_grab(&self, client: u64, argument: usize) -> AxResult<()> {
+        update_grab_owner(&mut self.state.lock().grab_owner, client, argument)
     }
 
     fn close_client(&self, client: u64) {
@@ -627,14 +630,16 @@ impl EvdevClient {
         }
     }
 
-    pub fn grab(&self, grab: bool) -> AxResult<()> {
+    // EVIOCGRAB encodes _IOW(int), but Linux tests the ioctl argument
+    // itself for zero/nonzero; unlike EVIOCSCLOCKID it is not a pointer.
+    fn grab(&self, argument: usize) -> AxResult<()> {
         if self.revoked.load(Ordering::Acquire) || !self.valid_lease() {
             return Err(LinuxError::ENODEV.into());
         }
         self.device
             .upgrade()
             .ok_or(AxError::InvalidInput)?
-            .set_grab(self.id, grab)
+            .set_grab(self.id, argument)
     }
 
     pub fn poll_ready(&self) -> bool {
@@ -976,13 +981,7 @@ impl EvdevFile {
                 Ok(0)
             }
             EVIOCGRAB => {
-                let mut bytes = [core::mem::MaybeUninit::uninit(); size_of::<i32>()];
-                context
-                    .user_memory()
-                    .read_bytes(arg, &mut bytes)
-                    .map_err(map_usercopy_error)?;
-                let bytes = bytes.map(|byte| unsafe { byte.assume_init() });
-                self.client.grab(i32::from_ne_bytes(bytes) != 0)?;
+                self.client.grab(arg)?;
                 Ok(0)
             }
             EVIOCREVOKE => {
@@ -1996,6 +1995,40 @@ mod tests {
                 overflowed: false,
             }),
         }
+    }
+
+    #[test]
+    fn grab_ioctl_uses_scalar_arguments_and_exact_ofd_ownership() {
+        let mut owner = None;
+        assert_eq!(
+            update_grab_owner(&mut owner, 1, 0),
+            Err(LinuxError::EINVAL.into())
+        );
+        assert_eq!(update_grab_owner(&mut owner, 1, 1), Ok(()));
+        assert_eq!(
+            update_grab_owner(&mut owner, 1, 1),
+            Err(LinuxError::EBUSY.into())
+        );
+        assert_eq!(
+            update_grab_owner(&mut owner, 2, 1),
+            Err(LinuxError::EBUSY.into())
+        );
+        assert_eq!(
+            update_grab_owner(&mut owner, 2, 0),
+            Err(LinuxError::EINVAL.into())
+        );
+        assert_eq!(owner, Some(1));
+        assert_eq!(update_grab_owner(&mut owner, 1, 0), Ok(()));
+        assert_eq!(
+            update_grab_owner(&mut owner, 1, 0),
+            Err(LinuxError::EINVAL.into())
+        );
+        // Even an unmappable nonzero scalar means grab, never usercopy.
+        assert_eq!(update_grab_owner(&mut owner, 2, usize::MAX), Ok(()));
+        assert_eq!(owner, Some(2));
+        assert_eq!(update_grab_owner(&mut owner, 2, 0), Ok(()));
+        assert_eq!(update_grab_owner(&mut owner, 1, 2), Ok(()));
+        assert_eq!(update_grab_owner(&mut owner, 1, 0), Ok(()));
     }
 
     fn record(event_type: u16, code: u16) -> EvdevRecord {
