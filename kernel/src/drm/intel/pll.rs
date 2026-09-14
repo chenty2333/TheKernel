@@ -1436,7 +1436,7 @@ mod tests {
                 "divider {total_divider}: P = {p}"
             );
             assert!([1, 2, 3].contains(&k), "divider {total_divider}: K = {k}");
-            assert!(q >= 1 && q <= 255, "divider {total_divider}: Q = {q}");
+            assert!((1..=255).contains(&q), "divider {total_divider}: Q = {q}");
             if k != 2 {
                 assert_eq!(q, 1, "divider {total_divider}: K = {k} requires Q = 1");
             }
@@ -2345,7 +2345,7 @@ mod tests {
             assert_eq!(p * q * k, total);
             assert!([2, 3, 5, 7].contains(&p), "total {total}: P = {p}");
             assert!([1, 2, 3].contains(&k), "total {total}: K = {k}");
-            assert!(q >= 1 && q <= 255, "total {total}: Q = {q}");
+            assert!((1..=255).contains(&q), "total {total}: Q = {q}");
             assert!(k == 2 || q == 1, "total {total}: K = {k} requires Q = 1");
         }
     }
