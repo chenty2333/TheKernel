@@ -222,7 +222,12 @@ class Artifacts:
 
     @property
     def rootfs(self) -> Path:
-        return self.root / "out" / "rootfs" / "x86" / "rootfs-x86.img"
+        payload = selected_tool_payload()
+        # A tool payload changes what the image contains, so it must not share
+        # the baseline image: the kernel embeds this file, and a payload image
+        # replacing the default one would silently change an unrelated suite.
+        name = "rootfs-x86.img" if payload == "none" else f"rootfs-x86-{payload}.img"
+        return self.root / "out" / "rootfs" / "x86" / name
 
 
 def artifact_config_stamp(artifacts: Artifacts, transport: str) -> Path:
@@ -285,6 +290,7 @@ def validate_artifact_config(artifacts: Artifacts, rootfs: Path | None, transpor
 # them.
 ROOTFS_INPUT_FILES = (
     "scripts/build-rootfs.sh",
+    "scripts/build-guest-tools.sh",
     "scripts/create-rootfs-image.sh",
     "tests/guest/shell-init.sh",
     "tests/guest/system-init.c",
@@ -302,7 +308,37 @@ ROOTFS_INPUT_ENV = (
     "THEKERNEL_MUSL_LINUX_UAPI_INCLUDE",
     "THEKERNEL_MUSL_LINUX_ARCH_INCLUDE",
     "THEKERNEL_ROOTFS_OWNER_MODE",
+    "THEKERNEL_TOOLCHAIN",
 )
+
+# The optional guest tool payload selected by --toolchain.  `none` keeps the
+# baseline image and is the only selection the ordinary suites use; a tool
+# payload adds a compiler and its development sysroot, which is tens of MiB.
+TOOL_PAYLOADS = ("none", "tcc")
+
+
+def selected_tool_payload() -> str:
+    """The guest tool payload this process is building for."""
+
+    payload = os.environ.get("THEKERNEL_TOOLCHAIN", "none").strip() or "none"
+    if payload not in TOOL_PAYLOADS:
+        raise ProductError(
+            f"unknown guest tool payload {payload!r}; expected one of "
+            f"{', '.join(TOOL_PAYLOADS)}"
+        )
+    return payload
+
+
+def rootfs_image_bytes(payload: str) -> int:
+    """Image size for a payload.
+
+    These are allocations, not measurements: the baseline image is the
+    historical 96 MiB, and each payload's size was chosen from what it
+    actually stages with headroom for the build tree that lands beside it.
+    """
+
+    return {"none": 96, "tcc": 160}[payload] * 1024 * 1024
+
 
 
 def rootfs_stamp_path(artifacts: Artifacts) -> Path:

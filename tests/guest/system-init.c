@@ -384,6 +384,21 @@ static int test_threads_futex(void) {
         "threads-futex-child");
 }
 
+#if defined(THEKERNEL_TOOL_PAYLOAD_TCC)
+/* The native C compilation case exists only in an image that carries the tcc
+ * payload.  It is a compile-time selection, not a runtime probe: the case
+ * table is the suite's plan, and a payload image must not be able to report a
+ * different plan than the one it was built for.  An image built for the
+ * payload that is missing the compiler therefore fails, which is what makes
+ * the payload claim testable. */
+static int test_compiler_smoke(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-compiler-smoke",
+        NULL,
+        "compiler-smoke-child");
+}
+#endif
+
 static int test_ioprio(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-ioprio-smoke",
@@ -822,6 +837,9 @@ int main(int argc, char **argv) {
         { "jit-mem", test_jit_mem, 30 },
         { "proc-shape", test_proc_shape, 30 },
         { "threads-futex", test_threads_futex, 60 },
+#if defined(THEKERNEL_TOOL_PAYLOAD_TCC)
+        { "compiler-smoke", test_compiler_smoke, 120 },
+#endif
         { "io-uring", test_io_uring, 60 },
         { "io-uring-trace", test_io_uring_trace, 60 },
         { "log-diagnostics", test_log_diagnostics, 60 },

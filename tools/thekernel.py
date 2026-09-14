@@ -27,6 +27,7 @@ from tools.product_state import (
     state_root, validate_storage, state_lock, serialized_build, isolated_run,
     artifact_config_stamp, artifact_config_key, artifact_input_key, validate_artifact_config,
     rootfs_stamp_path, rootfs_fingerprint,
+    TOOL_PAYLOADS, selected_tool_payload, rootfs_image_bytes,
 )
 from tools.verification import verify_cmd
 from tools.ktap import COMPLETION_MARKER, KtapError, reject_ktap_skips, validate_ktap_log
@@ -361,9 +362,26 @@ def build_rootfs(artifacts: Artifacts) -> None:
         print(f"thekernel: rootfs unchanged, reusing {artifacts.rootfs}", file=sys.stderr)
         return
     stamp.unlink(missing_ok=True)
+    payload = selected_tool_payload()
+    tools_dir = artifacts.root / "guest-tools" / payload
+    if payload != "none":
+        run_checked(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts" / "build-guest-tools.sh"),
+                "--payload",
+                payload,
+                "--output",
+                str(tools_dir),
+            ],
+            env={**os.environ, "THEKERNEL_SOURCE_CACHE": str(artifacts.root / "source-cache")},
+        )
     env = {
         **os.environ,
         "THEKERNEL_SOURCE_CACHE": str(artifacts.root / "source-cache"),
+        "THEKERNEL_TOOLCHAIN": payload,
+        "THEKERNEL_ROOTFS_TOOLS_DIR": str(tools_dir),
+        "THEKERNEL_ROOTFS_SIZE_MB": str(rootfs_image_bytes(payload) // (1024 * 1024)),
     }
     run_checked(
         [
@@ -1348,6 +1366,13 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
         help="machine profile to build or boot; it selects the configuration file "
              "and the compile-time CPU admission limit, not the QEMU machine",
     )
+    parser.add_argument(
+        "--toolchain",
+        choices=TOOL_PAYLOADS,
+        default="none",
+        help="guest tool payload to build into the image; `none` is the baseline "
+             "image, `tcc` adds a native C compiler and its musl sysroot",
+    )
     if profiles:
         parser.add_argument(
             "--profile",
@@ -1921,6 +1946,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
+        # The payload selection changes which rootfs image is built and which
+        # one the kernel embeds, so it is exported before any command resolves
+        # artifact paths.
+        os.environ["THEKERNEL_TOOLCHAIN"] = selected_tool_payload()
         with state_lock("activity", shared=args.command != "clean", blocking=args.command != "clean"):
             return int(args.func(args))
     except (ProductError, RunnerError, ProcessError, OSError) as error:
