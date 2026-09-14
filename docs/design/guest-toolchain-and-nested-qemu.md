@@ -415,6 +415,53 @@ sub-ranges with changed protections. The pinned artifact set was measured not to
 trigger the first. Neither is exercised by this milestone's workload, so neither
 is claimed fixed.
 
+**Real GCC now compiles and runs a program in the guest.** Measured:
+`--toolchain gcc` gives `1..48`, no failures, no skips, normal shutdown; the
+driver prints its version in 187 ms, a two-translation-unit
+pthread-plus-`libm` program compiles and links in 9 334 ms, and the product
+prints `folded=2.414214 runtime=1.414214` and exits 0.
+
+The compiler is Fedora 44's GCC, glibc-hosted and dynamic, staged from pinned
+RPMs. Two things were established *before* anything large was staged, and both
+changed what the milestone had to be:
+
+- The clone3 shape glibc's `posix_spawn` uses, which is how a compiler driver
+  launches `cc1`, `as` and `collect2`, had never been exercised in the guest.
+  A payload-free probe now checks it directly and through `posix_spawnp`; it
+  passes, so the compiler's first spawn is not untested kernel code.
+- `cc1` is not in the `gcc` package. It is in `cpp`. A payload built from `gcc`
+  alone has a driver and no compiler, and fails only when asked to compile.
+
+The payload builder compiles and runs a program with the staged toolchain
+before reporting success, because the three staging traps that cost a guest boot
+each -- `cc1`, gcc's private `stddef.h`, and the `*_asneeded.so` files that
+gcc's specs name -- are all link-time failures behind a file tree that looks
+complete. That check lives on the host, where a failure costs seconds.
+
+| Quantity | Value |
+|---|---|
+| Payload staged | 81 MiB |
+| Guest image | 224 MiB (reuses the nested payload's size; baseline measured 48.2 MiB used) |
+| Driver `--version` | 187 ms |
+| Compile and link, 2 TU + pthread + `-lm` | 9 334 ms |
+| Product run | 138 ms |
+| KTAP | `1..48`, 48 ok, 0 skips, `THEKERNEL_SYSTEM_TEST_COMPLETE`, `qemu-runner exit=0` |
+
+Alternatives were measured and rejected rather than assumed. Alpine's musl GCC
+is ~17 MB smaller but its `PT_INTERP` is `/lib/ld-musl-x86_64.so.1`, so it
+discards the loader milestone instead of building on it. A musl.cc cross
+toolchain is 307 MiB unpacked. Clang is ~231 MiB, because 95% of its closure is
+`libLLVM` and `libclang-cpp`, and it still needs GCC's `crtbegin`/`crtend`/
+`libgcc`, so it does not even remove the runtime it would replace; no
+authoritative static clang build exists. The one static option is Zig, which
+embeds clang and is 204 MiB -- recorded as the fallback if a static compiler is
+ever needed, not as a candidate at this image size.
+
+Known limits, stated rather than implied: C only (`cc1plus` and `libstdc++` are
+not staged), dynamic output only (`-static` needs `glibc-static`, +43 MiB), and
+the staged toolchain targets the guest's own x86_64 -- it is not a cross
+compiler.
+
 Keep the claims separate: compiling hello is native compilation; guest GCC
 rebuilding tcc is a guest source build; tcc rebuilding itself can demonstrate
 compiler self-hosting if the rebuilt compiler is also tested. Rebuilding

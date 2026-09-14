@@ -157,12 +157,18 @@ class SystemTestGateTests(unittest.TestCase):
             # `glibc` is a staging milestone and deliberately excludes the
             # compiler case: it is a separate payload with its own cost.
             "glibc": ["-DTHEKERNEL_TOOL_PAYLOAD_GLIBC=1"],
+            # `gcc` is a superset: the compiler is a dynamic glibc program, so
+            # the loader case runs in its image too and the image proves its own
+            # prerequisite rather than assuming it.
+            "gcc": ["-DTHEKERNEL_TOOL_PAYLOAD_GLIBC=1",
+                    "-DTHEKERNEL_TOOL_PAYLOAD_GCC=1"],
         }
         expected = {
             "none": [],
             "tcc": ["compiler-smoke"],
             "nested": ["compiler-smoke", "nested-tcg-hello", "nested-linux-boot"],
             "glibc": ["glibc-smoke"],
+            "gcc": ["glibc-smoke", "gcc-smoke"],
         }
         with test_tmpdir() as directory:
             for payload, flags in defines.items():
@@ -175,7 +181,8 @@ class SystemTestGateTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     text = result.stdout
                     present = [name for name in ("compiler-smoke", "nested-tcg-hello",
-                                                 "nested-linux-boot", "glibc-smoke")
+                                                 "nested-linux-boot", "glibc-smoke",
+                                                 "gcc-smoke")
                                if f'{{ "{name}",' in text]
                     self.assertEqual(present, expected[payload])
                     # Both payloads are supersets of `none`, so the baseline

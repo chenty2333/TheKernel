@@ -511,6 +511,22 @@ static int test_glibc_smoke(void) {
 }
 #endif
 
+#if defined(THEKERNEL_TOOL_PAYLOAD_GCC)
+/* Phase 3, second milestone: a real distribution C compiler runs in the guest.
+ *
+ * `gcc` here is a driver, not a compiler: it locates and runs cc1, as and
+ * collect2 as separate processes.  So this case depends on the payload being
+ * complete in a way the tcc case does not -- gcc's private headers, glibc's
+ * startup objects, the linker scripts and a dozen shared libraries all have to
+ * be present and at the paths the driver and the loader name absolutely. */
+static int test_gcc_smoke(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-gcc-smoke",
+        NULL,
+        "gcc-smoke-child");
+}
+#endif
+
 #if defined(THEKERNEL_TOOL_PAYLOAD_NESTED)
 /* Phase 2a: a system emulator that lives in the guest boots a second kernel in
  * the guest's own userspace under TCG.  Like the compiler case, this is a
@@ -998,6 +1014,12 @@ int main(int argc, char **argv) {
 #endif
 #if defined(THEKERNEL_TOOL_PAYLOAD_GLIBC)
         { "glibc-smoke", test_glibc_smoke, 60 },
+#endif
+#if defined(THEKERNEL_TOOL_PAYLOAD_GCC)
+        /* Above the compile deadline the helper enforces, so a compile that
+         * hits its own bound is reported with its transcript instead of being
+         * killed by the suite with nothing to show. */
+        { "gcc-smoke", test_gcc_smoke, 330 },
 #endif
 #if defined(THEKERNEL_TOOL_PAYLOAD_NESTED)
         { "nested-tcg-hello", test_nested_tcg_hello, 300 },

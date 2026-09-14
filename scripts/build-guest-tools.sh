@@ -96,7 +96,13 @@ case "$PAYLOAD" in
         [ -n "$OUTPUT" ] || { printf '%s\n' '--output is required' >&2; exit 2; }
         exec "$SCRIPT_DIR/build-glibc-payload.sh" --output "$OUTPUT"
         ;;
-    *) printf '%s\n' '--payload must be none, tcc, nested or glibc' >&2; exit 2 ;;
+    # A real distribution C compiler.  Nothing is compiled here either: the
+    # artifacts come from pinned RPMs and the work is staging the closure.
+    gcc)
+        [ -n "$OUTPUT" ] || { printf '%s\n' '--output is required' >&2; exit 2; }
+        exec "$SCRIPT_DIR/build-gcc-payload.sh" --output "$OUTPUT"
+        ;;
+    *) printf '%s\n' '--payload must be none, tcc, nested, glibc or gcc' >&2; exit 2 ;;
 esac
 
 # `none` is a valid request that produces an empty staging tree; the caller

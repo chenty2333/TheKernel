@@ -305,6 +305,9 @@ case "$TOOLCHAIN" in
     # `glibc` deliberately does not include the tcc case: it is a staging
     # milestone, and the compiler is a separate payload with its own cost.
     glibc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_GLIBC=1" ;;
+    # `gcc` is a superset of `glibc`: the compiler is dynamic, so the glibc
+    # loader case runs too and the image proves its own prerequisite.
+    gcc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_GLIBC=1 -DTHEKERNEL_TOOL_PAYLOAD_GCC=1" ;;
 esac
 # shellcheck disable=SC2086 # INIT_DEFINES is a deliberate flag list
 "${CROSS_COMPILE}gcc" -O2 -static -s -std=c11 -Wall -Wextra -Werror \

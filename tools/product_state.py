@@ -321,7 +321,7 @@ ROOTFS_INPUT_ENV = (
 # it that also adds a static system emulator and the image it boots.  Each
 # selection gets its own image, because the kernel embeds it and the two
 # payloads must never be confused for one another.
-TOOL_PAYLOADS = ("none", "tcc", "nested", "glibc")
+TOOL_PAYLOADS = ("none", "tcc", "nested", "glibc", "gcc")
 
 
 def selected_tool_payload(requested: str | None = None) -> str:
@@ -352,7 +352,13 @@ def rootfs_image_bytes(payload: str) -> int:
 
     # `glibc` stages a loader, a shared libc and one dynamic binary: about
     # 3.5 MiB of content, so it needs no more room than the baseline.
-    return {"none": 96, "tcc": 160, "nested": 224, "glibc": 160}[payload] * 1024 * 1024
+    #
+    # `gcc` stages 81 MiB of toolchain on top of a baseline measured at 48.2 MiB
+    # used, so it reuses the nested payload's 224 MiB rather than adding a size
+    # class; 160 MiB would leave under 30 MiB free, which is not enough room for
+    # a compile's intermediate files.
+    return {"none": 96, "tcc": 160, "nested": 224, "glibc": 160,
+            "gcc": 224}[payload] * 1024 * 1024
 
 
 
