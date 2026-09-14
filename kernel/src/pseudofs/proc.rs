@@ -3466,6 +3466,25 @@ impl SimpleDirOps for ProcFsHandler {
     }
 }
 
+/// The `flags` field for one x86 `/proc/cpuinfo` processor record.
+///
+/// The names are decoded from CPUID by the architecture crate, which also
+/// decides which of them this kernel can honour for user mode.  Only the CET
+/// fleet bit is added here, because that is a platform-wide commitment rather
+/// than a per-CPU CPUID bit.
+#[cfg(target_arch = "x86_64")]
+fn render_x86_cpuinfo_flags() -> String {
+    let mut flags = Vec::new();
+    let observed = axhal::asm::read_x86_feature_observations();
+    flags.extend(axhal::asm::x86_user_feature_flags(observed));
+    // CET is committed only after every online CPU accepted it, so this flag
+    // is never a per-reader capability lie.
+    if axhal::asm::user_shadow_stack_enabled() {
+        flags.push("user_shstk");
+    }
+    flags.join(" ")
+}
+
 fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
     fn write_proc_u32(data: &[u8]) -> VfsResult<u32> {
         str::from_utf8(data)
@@ -3645,11 +3664,7 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
                 }
                 let _ = writeln!(out, "processor\t: {i}");
                 #[cfg(target_arch = "x86_64")]
-                if axhal::asm::user_shadow_stack_enabled() {
-                    // CET is committed only after every online CPU accepted
-                    // it, so this flag is never a per-reader capability lie.
-                    let _ = writeln!(out, "flags\t\t: user_shstk");
-                }
+                let _ = writeln!(out, "flags\t\t: {}", render_x86_cpuinfo_flags());
             }
             Ok(out)
         }),
