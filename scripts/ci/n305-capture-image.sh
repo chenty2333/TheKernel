@@ -149,7 +149,17 @@ done
 OUT=$(readlink -m "$OUT")
 case "$OUT" in
 /tmp/* | /dev/shm/*) die "--out must not be under /tmp or /dev/shm" ;;
+# The image is a file this script removes and rewrites: `rm -f "$OUT"`, then
+# `cp`, `truncate` and `dd of=`.  A device node is never what is meant here and
+# is destructive in a way the rest of the script cannot detect -- `rm -f` would
+# unlink the node and the `cp` behind it would recreate the path as a regular
+# file.  The closing note prints `sudo dd if=$OUT of=/dev/sdX`, which is exactly
+# the pair of paths a hurried operator can transpose.
+/dev/*) die "--out is an image file to create, not a device: $OUT" ;;
 esac
+# `-f` follows the symlink `readlink -m` already resolved, so this refuses a
+# directory, a fifo, or a device node made outside /dev.
+[ ! -e "$OUT" ] || [ -f "$OUT" ] || die "--out exists and is not a regular file: $OUT"
 mkdir -p "$CACHE/downloads" "$(dirname -- "$OUT")"
 CACHE=$(readlink -m "$CACHE")
 [ -f "$PAYLOAD" ] || die "payload script not found: $PAYLOAD"
