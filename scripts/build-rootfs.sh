@@ -284,10 +284,16 @@ rm -f "$STAGE/sbin/init"
 # native-compilation case is only meaningful when the compiler is installed,
 # and compiling it in only then keeps the case table (and therefore the KTAP
 # plan) a property of the image rather than of what happens to be present.
+#
+# `nested` is a superset of `tcc`: it stages the compiler *and* the system
+# emulator, so its image carries both cases.  Selecting cases this way means
+# `--toolchain nested` runs one more case than `--toolchain tcc`, and the plan
+# line in the transcript always says which image was booted.
 INIT_DEFINES=""
-if [ "$TOOLCHAIN" = tcc ]; then
-    INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1"
-fi
+case "$TOOLCHAIN" in
+    tcc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1" ;;
+    nested) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1 -DTHEKERNEL_TOOL_PAYLOAD_NESTED=1" ;;
+esac
 # shellcheck disable=SC2086 # INIT_DEFINES is a deliberate flag list
 "${CROSS_COMPILE}gcc" -O2 -static -s -std=c11 -Wall -Wextra -Werror \
     $INIT_DEFINES \

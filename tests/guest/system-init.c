@@ -399,6 +399,24 @@ static int test_compiler_smoke(void) {
 }
 #endif
 
+#if defined(THEKERNEL_TOOL_PAYLOAD_NESTED)
+/* Phase 2a: a system emulator that lives in the guest boots a second kernel in
+ * the guest's own userspace under TCG.  Like the compiler case, this is a
+ * compile-time selection, so an image built for the nested payload that cannot
+ * actually run the emulator fails instead of quietly reporting a smaller plan.
+ *
+ * The case's whole meaning is in the four conditions the helper checks
+ * together: the emulator is static, the inner banner arrives, the inner
+ * machine reached normal shutdown, and the whole thing finished inside its
+ * deadline.  See tests/guest/tools/nested-tcg-hello.c. */
+static int test_nested_tcg_hello(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-nested-tcg-hello",
+        NULL,
+        "nested-tcg-hello-child");
+}
+#endif
+
 static int test_ioprio(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-ioprio-smoke",
@@ -839,6 +857,9 @@ int main(int argc, char **argv) {
         { "threads-futex", test_threads_futex, 60 },
 #if defined(THEKERNEL_TOOL_PAYLOAD_TCC)
         { "compiler-smoke", test_compiler_smoke, 120 },
+#endif
+#if defined(THEKERNEL_TOOL_PAYLOAD_NESTED)
+        { "nested-tcg-hello", test_nested_tcg_hello, 180 },
 #endif
         { "io-uring", test_io_uring, 60 },
         { "io-uring-trace", test_io_uring_trace, 60 },

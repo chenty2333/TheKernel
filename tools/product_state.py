@@ -312,9 +312,13 @@ ROOTFS_INPUT_ENV = (
 )
 
 # The optional guest tool payload selected by --toolchain.  `none` keeps the
-# baseline image and is the only selection the ordinary suites use; a tool
-# payload adds a compiler and its development sysroot, which is tens of MiB.
-TOOL_PAYLOADS = ("none", "tcc")
+# baseline image and is the only selection the ordinary suites use.  A tool
+# payload adds executables and data to the image, which is tens of MiB: `tcc`
+# adds a native C compiler and its musl sysroot, and `nested` is a superset of
+# it that also adds a static system emulator and the image it boots.  Each
+# selection gets its own image, because the kernel embeds it and the two
+# payloads must never be confused for one another.
+TOOL_PAYLOADS = ("none", "tcc", "nested")
 
 
 def selected_tool_payload(requested: str | None = None) -> str:
@@ -343,7 +347,7 @@ def rootfs_image_bytes(payload: str) -> int:
     actually stages with headroom for the build tree that lands beside it.
     """
 
-    return {"none": 96, "tcc": 160}[payload] * 1024 * 1024
+    return {"none": 96, "tcc": 160, "nested": 224}[payload] * 1024 * 1024
 
 
 

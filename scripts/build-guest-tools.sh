@@ -82,7 +82,14 @@ done
 
 case "$PAYLOAD" in
     none|tcc) ;;
-    *) printf '%s\n' '--payload must be none or tcc' >&2; exit 2 ;;
+    # The nested payload is a superset of `tcc` and is built by its own script,
+    # which owns the GLib/QEMU pins.  It is accepted here so that the payload
+    # vocabulary has one definition rather than one per builder.
+    nested)
+        [ -n "$OUTPUT" ] || { printf '%s\n' '--output is required' >&2; exit 2; }
+        exec "$SCRIPT_DIR/build-nested-payload.sh" --output "$OUTPUT" --jobs "$JOBS"
+        ;;
+    *) printf '%s\n' '--payload must be none, tcc or nested' >&2; exit 2 ;;
 esac
 
 # `none` is a valid request that produces an empty staging tree; the caller

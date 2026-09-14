@@ -52,6 +52,38 @@
 #define ISA_DEBUG_EXIT_OK   0x10u   /* -> process exit status 33            */
 #define ISA_DEBUG_EXIT_BAD  0x11u   /* -> process exit status 35            */
 
+/*
+ * ACPI PM1a control port, written to for an S5 (soft off) transition.
+ *
+ * 0x604 is the QEMU default: the PIIX4 southbridge of the `pc` machine and
+ * the ICH9 of `q35` both decode PM1a_CNT at 0x604 when firmware did not
+ * relocate it.  With `-kernel` there is no firmware and no ACPI table walk,
+ * so these are the effective values.  acpi_s5() below still checks that the
+ * machine actually powered off rather than trusting the port.
+ */
+#define ACPI_PM1A_CNT_PORT  0x0604u
+#define ACPI_SLP_TYP_S5     0x0000u /* suspended to soft-off                 */
+#define ACPI_SLP_EN         0x2000u /* bit 13: enable the sleep transition   */
+#define ACPI_S5_VALUE       (ACPI_SLP_TYP_S5 | ACPI_SLP_EN)
+
+/*
+ * With -DHELLO_ACPI_SHUTDOWN=1 the *success* path powers the machine off
+ * through ACPI S5 instead of writing isa-debug-exit.
+ *
+ * The distinction is the whole point of having both: isa-debug-exit is a
+ * forced exit of the emulator process (QEMU documents it as a debugging
+ * device), so it can prove "the inner kernel ran and reached this point" but
+ * it can never satisfy an acceptance condition that requires a normal
+ * shutdown.  ACPI S5 is the mechanism a real Linux guest uses, so exercising
+ * it here validates the S5 path that Phase 2b depends on.  The failure path
+ * keeps using isa-debug-exit, where a forced exit is exactly right.
+ */
+#ifdef HELLO_ACPI_SHUTDOWN
+#define HELLO_SHUTDOWN_KIND "acpi-s5"
+#else
+#define HELLO_SHUTDOWN_KIND "isa-debug-exit"
+#endif
+
 #define EFER_MSR            0xC0000080u
 #define EFER_LME            0x00000100ull
 #define EFER_LMA            0x00000400ull
@@ -70,6 +102,17 @@ static inline void outb(mb_u16 port, mb_u8 value)
 static inline void outl(mb_u16 port, mb_u32 value)
 {
     __asm__ __volatile__("outl %0, %1" : : "a"(value), "Nd"(port));
+}
+
+/*
+ * PM1a_CNT is a 16-bit register; SLP_EN is bit 13, in the high byte.  Two
+ * byte stores would work on a little-endian x86 only because the enable bit
+ * happens to live in the second byte, which is an accident worth not
+ * depending on -- one word store is what the ACPI spec describes.
+ */
+static inline void outw(mb_u16 port, mb_u16 value)
+{
+    __asm__ __volatile__("outw %0, %1" : : "a"(value), "Nd"(port));
 }
 
 static inline mb_u8 inb(mb_u16 port)
@@ -269,6 +312,52 @@ static void __attribute__((noreturn)) qemu_exit(mb_u8 code)
     }
 }
 
+/*
+ * Power the machine off with an ACPI S5 transition.  Never returns.
+ *
+ * This is a *normal* shutdown from the machine's point of view: QEMU reports
+ * it as a guest-initiated poweroff and exits with status 0, unlike
+ * isa-debug-exit, which is a forced exit with a status QEMU computes.
+ *
+ * The wait is bounded on purpose.  If the port write does not take effect --
+ * a relocated PM1a_CNT, a machine without ACPI, or an emulator that does not
+ * implement S5 -- the loop ends and the caller falls back to the forced exit
+ * path so the failure is visible as a wrong status rather than a hang.
+ */
+#define ACPI_S5_WAIT_SPINS 200000000ul
+
+/*
+ * Marked unused because the default build compiles this and never calls it;
+ * the shutdown flavour is chosen at compile time, and both paths must stay
+ * compiled and warning-clean under -Werror.
+ */
+static void __attribute__((noreturn, unused)) acpi_s5(void)
+{
+    unsigned long spins;
+
+    serial_puts("INNER_HELLO_ACPI port=0x");
+    serial_put_hex(ACPI_PM1A_CNT_PORT, 4);
+    serial_puts(" value=0x");
+    serial_put_hex(ACPI_S5_VALUE, 4);
+    serial_puts(" slp_typ=0x");
+    serial_put_hex(ACPI_SLP_TYP_S5, 4);
+    serial_puts(" slp_en=1\n");
+    serial_drain();
+
+    outw((mb_u16)ACPI_PM1A_CNT_PORT, (mb_u16)ACPI_S5_VALUE);
+
+    for (spins = 0; spins < ACPI_S5_WAIT_SPINS; spins++) {
+        __asm__ __volatile__("pause");
+    }
+
+    serial_puts("INNER_HELLO_ACPI_NO_SHUTDOWN spins=");
+    serial_put_dec((mb_u64)ACPI_S5_WAIT_SPINS);
+    serial_putc('\n');
+    serial_drain();
+
+    qemu_exit(ISA_DEBUG_EXIT_BAD);
+}
+
 /* ==================================================================== */
 /* Entry point                                                           */
 /* ==================================================================== */
@@ -361,8 +450,21 @@ void kmain(mb_u32 magic, const struct multiboot_info *mbi)
     serial_put_dec(cs_long_bit() != 0);
     serial_putc('\n');
 
-    /* ---- 5. Deterministic termination: exit status (0x10 << 1) | 1 = 33 */
+    /* ---- 5. Deterministic termination ---------------------------------
+     *
+     * The shutdown kind is printed before either path runs, so a transcript
+     * always says which one was configured.  Without HELLO_ACPI_SHUTDOWN the
+     * result is the forced exit status (0x10 << 1) | 1 = 33 that Phase 2a
+     * originally measured; with it, the machine powers off and QEMU exits 0.
+     */
+    serial_puts("INNER_HELLO_SHUTDOWN_KIND=" HELLO_SHUTDOWN_KIND "\n");
+    serial_drain();
+
+#ifdef HELLO_ACPI_SHUTDOWN
+    acpi_s5();
+#else
     qemu_exit(ISA_DEBUG_EXIT_OK);
+#endif
 }
 
 /* ==================================================================== */

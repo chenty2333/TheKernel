@@ -1372,9 +1372,10 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
         choices=TOOL_PAYLOADS,
         default=argparse.SUPPRESS,
         help="guest tool payload to build into the image; `none` is the baseline "
-             "image, `tcc` adds a native C compiler and its musl sysroot.  The "
-             "default follows THEKERNEL_TOOLCHAIN, and passing the flag wins over "
-             "it",
+             "image, `tcc` adds a native C compiler and its musl sysroot, and "
+             "`nested` is `tcc` plus a static system emulator and the image it "
+             "boots.  The default follows THEKERNEL_TOOLCHAIN, and passing the "
+             "flag wins over it",
     )
     if profiles:
         parser.add_argument(

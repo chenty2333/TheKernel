@@ -10,6 +10,12 @@
 #   * prints an INNER_-prefixed banner on COM1, and
 #   * terminates QEMU through isa-debug-exit with host status 33.
 #
+# Setting HELLO_ACPI_SHUTDOWN=1 produces <output-dir>/hello-acpi.elf instead:
+# the same artifact, except that the success path powers the machine off with
+# an ACPI S5 transition and QEMU therefore exits 0.  The default build is
+# unchanged and stays byte-identical, because the isa-debug-exit variant is
+# the measured Phase 2a result and its hash is recorded in the design note.
+#
 # The build needs no network, no libc, no libgcc and no cross toolchain: only
 # the host's gcc/binutils/as/ld/objcopy.  No *library* is ever linked -- the
 # only input objects are the three compiled from the sources next to this
@@ -41,6 +47,17 @@ fi
 OUT_DIR="$1"
 mkdir -p -- "$OUT_DIR"
 OUT_DIR="$(cd -- "$OUT_DIR" && pwd)"
+
+# Shutdown flavour.  Off (the default) is the measured Phase 2a artifact; on
+# swaps the success path to ACPI S5 and names the result differently so the
+# two can never be confused in an output directory or in a transcript.
+if [ "${HELLO_ACPI_SHUTDOWN:-0}" = "1" ]; then
+    readonly OUTPUT_NAME="hello-acpi.elf"
+    readonly EXTRA_CFLAGS=(-DHELLO_ACPI_SHUTDOWN=1)
+else
+    readonly OUTPUT_NAME="hello.elf"
+    readonly EXTRA_CFLAGS=()
+fi
 
 # Host tools.  Overridable so a caller can pin an exact toolchain, but the
 # defaults are the plain host binutils/gcc.
@@ -188,11 +205,11 @@ expect_value() {
 cd -- "$OUT_DIR"
 
 # Never leave a stale bootable image behind if a later step fails: the whole
-# point of this artifact is that hello.elf existing means "it built".
-rm -f -- "$OUT_DIR/hello.elf"
+# point of this artifact is that $OUTPUT_NAME existing means "it built".
+rm -f -- "$OUT_DIR/$OUTPUT_NAME"
 
 # 1. The x86_64 kernel half: one C translation unit.
-run "$CC" "${CFLAGS_64[@]}" -c "$SRC_DIR/hello.c" -o "$OUT_DIR/hello64.o"
+run "$CC" "${CFLAGS_64[@]}" "${EXTRA_CFLAGS[@]}" -c "$SRC_DIR/hello.c" -o "$OUT_DIR/hello64.o"
 
 # 2. The x86_64 entry trampoline (no C preprocessor; assembled directly).
 run "$AS" --64 -o "$OUT_DIR/entry64.o" "$SRC_DIR/entry64.S"
@@ -220,7 +237,7 @@ run "$LD" "${LDFLAGS_32[@]}" \
     -T "$SRC_DIR/linker.ld" \
     --defsym LOAD_BASE="$LOAD_BASE" \
     --defsym KERNEL64_BASE="$KERNEL64_BASE" \
-    -o "$OUT_DIR/hello.elf" \
+    -o "$OUT_DIR/$OUTPUT_NAME" \
     "$OUT_DIR/boot.o"
 
 # ------------------------------------------------------- layout verification
@@ -240,27 +257,27 @@ expect_value "_start64 address" \
 
 # The embedded payload must land exactly at KERNEL64_BASE.
 expect_value "__kernel64_start" \
-    "$(symbol_value "$OUT_DIR/hello.elf" __kernel64_start)" "$KERNEL64_BASE"
+    "$(symbol_value "$OUT_DIR/$OUTPUT_NAME" __kernel64_start)" "$KERNEL64_BASE"
 
 # ...and the 32-bit stub must not have run into it.
-boot_end="$(symbol_value "$OUT_DIR/hello.elf" __boot_end)"
+boot_end="$(symbol_value "$OUT_DIR/$OUTPUT_NAME" __boot_end)"
 [ "$((boot_end))" -le "$((KERNEL64_BASE))" ] \
     || fail "__boot_end ($boot_end) overlaps KERNEL64_BASE ($KERNEL64_BASE)"
 
 # The image must start at LOAD_BASE...
 expect_value "__boot_start" \
-    "$(symbol_value "$OUT_DIR/hello.elf" __boot_start)" "$LOAD_BASE"
+    "$(symbol_value "$OUT_DIR/$OUTPUT_NAME" __boot_start)" "$LOAD_BASE"
 
 # ...with _start inside the stub slot.  It is deliberately not LOAD_BASE: the
 # 12-byte Multiboot header has to come first so that QEMU finds it in the
 # file's leading bytes.
-start_addr="$(symbol_value "$OUT_DIR/hello.elf" _start)"
+start_addr="$(symbol_value "$OUT_DIR/$OUTPUT_NAME" _start)"
 [ "$((start_addr))" -ge "$((LOAD_BASE))" ] \
     && [ "$((start_addr))" -lt "$((KERNEL64_BASE))" ] \
     || fail "_start ($start_addr) is outside the 32-bit stub slot"
 
 # The ELF entry point QEMU will jump to must be exactly that _start.
-entry_hex="$("$READELF" -h "$OUT_DIR/hello.elf" \
+entry_hex="$("$READELF" -h "$OUT_DIR/$OUTPUT_NAME" \
     | awk '$1 == "Entry" && $2 == "point" { print $NF }')"
 [ -n "$entry_hex" ] || fail "could not read the ELF entry point"
 expect_value "ELF entry point" "$(normalise_hex "$entry_hex")" "$start_addr"
@@ -268,19 +285,19 @@ expect_value "ELF entry point" "$(normalise_hex "$entry_hex")" "$start_addr"
 # The image is contiguous: the payload ends where .bootdata begins and the
 # lowest load address is LOAD_BASE.
 expect_value "__image_end > __kernel64_end" \
-    "$([ "$(( $(symbol_value "$OUT_DIR/hello.elf" __image_end) ))" -gt \
-         "$(( $(symbol_value "$OUT_DIR/hello.elf" __kernel64_end) ))" ] \
+    "$([ "$(( $(symbol_value "$OUT_DIR/$OUTPUT_NAME" __image_end) ))" -gt \
+         "$(( $(symbol_value "$OUT_DIR/$OUTPUT_NAME" __kernel64_end) ))" ] \
        && echo yes || echo no)" "yes"
 
 # ELF class/machine of the outer container: QEMU requires ELF32 / EM_386.
-"$READELF" -h "$OUT_DIR/hello.elf" | grep -q 'ELF32' \
-    || fail "hello.elf is not ELF32"
-"$READELF" -h "$OUT_DIR/hello.elf" | grep -q 'Intel 80386' \
-    || fail "hello.elf is not EM_386"
+"$READELF" -h "$OUT_DIR/$OUTPUT_NAME" | grep -q 'ELF32' \
+    || fail "$OUTPUT_NAME is not ELF32"
+"$READELF" -h "$OUT_DIR/$OUTPUT_NAME" | grep -q 'Intel 80386' \
+    || fail "$OUTPUT_NAME is not EM_386"
 
 # The Multiboot header must sit inside the first 8192 bytes of the file,
 # 4-byte aligned.  QEMU scans exactly that window for 0x1BADB002.
-if ! head -c 8192 "$OUT_DIR/hello.elf" \
+if ! head -c 8192 "$OUT_DIR/$OUTPUT_NAME" \
         | od -An -tx4 -v \
         | tr -s ' \n' '\n' \
         | grep -qx '1badb002'; then
@@ -289,11 +306,11 @@ fi
 
 # ------------------------------------------------------------------- summary
 
-printf '\nbuilt: %s\n' "$OUT_DIR/hello.elf"
-file "$OUT_DIR/hello.elf" || true
-printf 'size:  %s bytes\n' "$(stat -c %s "$OUT_DIR/hello.elf")"
+printf '\nbuilt: %s\n' "$OUT_DIR/$OUTPUT_NAME"
+file "$OUT_DIR/$OUTPUT_NAME" || true
+printf 'size:  %s bytes\n' "$(stat -c %s "$OUT_DIR/$OUTPUT_NAME")"
 printf 'payload64.bin: %s bytes\n' "$(stat -c %s "$OUT_DIR/payload64.bin")"
 printf '\nlayout:\n'
-"$NM" --defined-only "$OUT_DIR/hello.elf" \
+"$NM" --defined-only "$OUT_DIR/$OUTPUT_NAME" \
     | grep -E ' (_start|__boot_end|__kernel64_start|__kernel64_end|__image_end)$' \
     | sort || true
