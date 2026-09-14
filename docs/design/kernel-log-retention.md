@@ -21,7 +21,7 @@ One producer path and four readers, all in `crates/ax/thekernel-axruntime/src/kl
 | Piece | What it is |
 |---|---|
 | `STORE` ring | `CAPACITY` = 64 KiB of record text, byte-addressed, wrapping. `oldest`/`end` are byte cursors; `retention_bytes_overwritten` in `/proc/sys/kernel/log_stats` reports `oldest`, i.e. how much text the ring has dropped off its front. |
-| `Text` | One formatted record, at most `RECORD_BYTES` = 1024 bytes, always newline-terminated. A longer record is cut and marked ` [truncated]`, counted as `records_truncated`. |
+| `Text` | One formatted record, at most `RECORD_BYTES` = 1024 bytes, always newline-terminated. The terminating newline is not the record delimiter, and the text inside one may contain newlines of its own (§6). A longer record is cut and marked ` [truncated]`, counted as `records_truncated`. |
 | producers | `Logger::log`, `diagnostic()` and `record()` (the `ax_print` path). A per-CPU bit (`PRODUCING`) keeps a CPU from re-entering the path. |
 | readers | `snapshot_into` / `available_from` for `syslog(2)`+`/dev/kmsg`, the framebuffer console mirror, the early boot screen (`try_snapshot_into`, which refuses rather than waits so a panic cannot hang), and the diagnostic console (`DiagnosticDrain`, the serial port at `0x2f8`). |
 
@@ -154,7 +154,80 @@ refuse.
 None of these was observed in the measured boots except by construction in the
 tests.
 
-## 6. Checking it by hand
+## 6. What delimits one record from the next
+
+A record's text is not its own delimiter.  `Text::finish` terminates every
+record with a newline, but the text inside one may contain newlines of its own:
+the igc driver's absence report (`absence_report` in
+`crates/ax/thekernel-axdriver-net/src/igc/probe.rs`) is a single `info!` whose
+first line is the bus walk and whose second is `verdict: no supported device
+present`.
+
+The delimiter is the **`RECORD_START` mark on the next record's first byte**,
+which `Store::append` writes in lockstep with the text; the newest record has no
+next record, so `Store::end` ends it.  `Store::peek` reads to whichever comes
+first, and the offset it returns as the reader's cursor is therefore always a
+record boundary.  `RECORD_BYTES` is the producer's bound, not a second
+delimiter: `Text` cannot retain more than `RECORD_BYTES` bytes for one record,
+so a reader that stops there stops at the end of a maximal record and never
+inside a shorter one.
+
+This was wrong until `fix/klog-multiline-record`.  `peek` stopped at the first
+newline it copied, so it returned the first line of a multi-line record, moved
+its cursor past the whole record and dropped the rest.  It cost the igc verdict
+on a `--net-igc` boot, because `kernel.log` is the one reader that delimits
+records (`DiagnosticDrain`): the run's log carried
+
+```
+<6>[0.201387 cpu=None tid=None INFO target=axdriver::igc module=axdriver::igc] igc: bus walk: 5 PCI functions answered on buses 0..=255, 4 from Intel, none matching a device id this driver binds (16 ids, vendor 8086)
+```
+
+and the string `no supported device present` appeared nowhere in it, though the
+record the ring retains is the whole report -- only the console's reader cut it.
+Two readers never had the bug and were not changed: `snapshot_into` and
+`try_snapshot_into` copy bytes between two cursors and do not delimit records at
+all, which is why the early screen and the framebuffer mirror showed the whole
+report while the serial log did not.
+
+A later boot of the same variant after the fix carries both lines of the one
+record (a different boot, hence a different timestamp).  The second line has no
+`<priority>[time …]` prefix because it is the continuation of the record the
+first line started, which is what a multi-line record looks like on the console:
+
+```
+<6>[0.192577 cpu=None tid=None INFO target=axdriver::igc module=axdriver::igc] igc: bus walk: 5 PCI functions answered on buses 0..=255, 4 from Intel, none matching a device id this driver binds (16 ids, vendor 8086)
+igc: verdict: no supported device present: no PCI function matched a device id this driver binds. No aperture was mapped, no register was read, and nothing was written
+```
+
+That walk saw no Intel function that reports the Ethernet class, so no candidate
+line precedes the verdict and the report ends where `absence_report` ends it; a
+walk that does see one prints the candidate line above the verdict, as
+[`nic-igc.md`](nic-igc.md) §7 describes.
+
+What a record reader has to keep, and what the host tests in the `klog` module
+pin:
+
+* A record's embedded newlines are data, preserved byte for byte rather than
+  normalized or read as ends.
+* A record ends at the next start mark, or at the end of the ring.
+* A cursor is a record boundary.  A reader that fell behind resumes at the next
+  start mark (§3), so a record the ring cut is skipped rather than printed as a
+  tail.
+* A reader that stops in the middle of a record resumes at the byte it stopped
+  at, which is what keeps a partly written record from being printed twice.
+
+What it costs: one `RECORD_START` test per byte a reader copies, on top of the
+`marks` byte per retained byte the console priority already pays for (§3).  What
+not having it cost: the second line of every multi-line record ever written to
+the ring, silently, on the one reader that feeds `kernel.log`.
+
+What is not covered here: the measurement above is a host test suite plus one
+`--net-igc` boot.  No measured boot has produced a record of exactly
+`RECORD_BYTES` (`records_truncated` is 0 in every boot), so the maximal-record
+case is a host test only, and neither the `syslog(2)`/`/dev/kmsg` reader nor the
+framebuffer mirror was measured against a multi-line record on a boot.
+
+## 7. Checking it by hand
 
 ```sh
 # In the guest: what the ring retained.
@@ -173,7 +246,7 @@ which boots the guest, has it print `dmesg`, the debugfs report and
 `/proc/sys/kernel/log_stats`, and compares the Intel lines the guest rendered
 with the ones that reached the host-side `kernel.log`.
 
-## 7. What is not verified
+## 8. What is not verified
 
 * No real hardware.  The target machine has no serial port, so on that machine
   the diagnostic console is absent and `diagnostic_supported` is 0 — the ring
