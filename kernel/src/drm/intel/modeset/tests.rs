@@ -186,7 +186,7 @@ fn the_mode_layers_own_choice_stands_when_the_sink_prefers_it() {
     }
     assert!(!choice.overrode_the_mode_layer());
     assert_eq!(
-        mode_line_rate_hz(&choice.mode().expect("a mode")),
+        mode_line_rate_hz(&choice.into_mode().expect("a mode")),
         Some(67_500)
     );
 }
@@ -311,7 +311,10 @@ fn no_edid_is_a_refusal_and_not_a_guessed_timing() {
     let plan = plan_modeset(&[], &Constraints::unlimited());
     assert!(!plan.used_edid());
     let choice = choose_mode(&plan, &[], EngineLimits::at_cdclk(CDCLK_KHZ));
-    assert_eq!(choice.mode(), None, "nothing may be programmed here");
+    assert!(
+        choice.into_mode().is_err(),
+        "nothing may be programmed here"
+    );
     match choice {
         ModeChoice::Refused(ModeRefusal::NoAdvertisedMode { because, fallback }) => {
             assert_eq!(because, crate::drm::modes::FallbackReason::NoEdid);

@@ -250,13 +250,18 @@ pub(crate) enum ModeChoice {
 }
 
 impl ModeChoice {
-    /// The mode to program, or `None` when nothing will be programmed.
-    pub(crate) fn mode(&self) -> Option<Mode> {
+    /// The mode to program, or the refusal that stops the modeset.
+    ///
+    /// This is the only way out of a `ModeChoice`, so no variant can reach
+    /// `set_mode` without a decision: the match is exhaustive and has no `_`
+    /// arm, which is what makes a new variant a compile error here instead of
+    /// an unreachable `expect` that a reader has to re-derive.
+    pub(crate) fn into_mode(self) -> Result<Mode, ModeRefusal> {
         match self {
             ModeChoice::ModeLayer { mode, .. } | ModeChoice::ReferencePreference { mode, .. } => {
-                Some(*mode)
+                Ok(mode)
             }
-            ModeChoice::Refused(_) => None,
+            ModeChoice::Refused(refusal) => Err(refusal),
         }
     }
 
@@ -1560,10 +1565,10 @@ pub(crate) fn set_mode<R: Registers, T: PollTimer>(
         request.edid,
         EngineLimits::at_cdclk(cdclk.cdclk_khz),
     );
-    if let ModeChoice::Refused(refusal) = choice {
-        return Err(ModesetError::Refused(refusal));
-    }
-    let mode = choice.mode().expect("a non-refusal names a mode");
+    let mode = match choice.into_mode() {
+        Ok(mode) => mode,
+        Err(refusal) => return Err(ModesetError::Refused(refusal)),
+    };
 
     // The port's register, which phase 6.3 needs as well as phase 5.
     let Some(ddi_buf_ctl) = ddi_buf_ctl_register(request.ddi) else {
