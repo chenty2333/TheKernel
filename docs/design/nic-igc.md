@@ -114,6 +114,15 @@ driver's pool and was actually handed out, so a foreign pointer or a second
 return of the same buffer is refused instead of becoming a descriptor the
 hardware would write through.
 
+Transmit ownership leaves the caller when the descriptor is queued, not when
+it completes. This rejects a duplicate submission while DMA is still pending;
+only completion returns the slot to the free list. DMA allocations have owners
+during initialization too, so a failed second, third or fourth allocation
+releases the unpublished prefix. Teardown uses the reset path's bounded
+`GIO_MASTER_DISABLE` / `GIO_MASTER_ENABLE` handshake before freeing any DMA
+memory. If stopping cannot be confirmed, those allocations are retained rather
+than returned to the allocator. Queue-disable writes alone are not that proof.
+
 ## 4. What is verified, and how
 
 **Host tests are the only automated evidence for anything that depends on

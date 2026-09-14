@@ -42,7 +42,7 @@
 //! either sends the buffer or reports the failure.
 
 use alloc::{vec, vec::Vec};
-use core::ptr::NonNull;
+use core::{marker::PhantomData, mem::ManuallyDrop, ptr::NonNull};
 
 use axdriver_base::{BaseDriverOps, DevError, DevResult, DeviceType};
 
@@ -123,11 +123,19 @@ impl Stats {
 }
 
 /// One DMA allocation this driver owns, kept so it can be given back.
-#[derive(Clone, Copy, Debug)]
-struct Allocation {
+struct Allocation<H: IgcHal> {
     bus: u64,
     cpu: NonNull<u8>,
     pages: usize,
+    _hal: PhantomData<H>,
+}
+
+impl<H: IgcHal> Drop for Allocation<H> {
+    fn drop(&mut self) {
+        // SAFETY: this owner is only dropped before publication to hardware,
+        // or after the NIC has observed that bus mastering has stopped.
+        unsafe { H::dma_dealloc(self.bus, self.cpu, self.pages) };
+    }
 }
 
 /// The Intel i225/i226 NIC, with `QS` descriptors in each ring.
@@ -138,6 +146,15 @@ pub struct IgcNic<H: IgcHal, const QS: usize> {
     tx_ring: TxRing,
     tx_pool: BufferPool,
     tx_free: Vec<usize>,
+    /// Which slots are currently out with the *caller*, not with the ring.
+    ///
+    /// Set when [`IgcNic::alloc_tx_buffer`] hands a slot out and cleared the
+    /// moment [`IgcNic::transmit`] commits it to the ring, so it answers one
+    /// question: may this pointer be returned to the driver again?  A buffer
+    /// that has been transmitted is the ring's until the done bit retires it,
+    /// and a second `transmit` of the same pointer would enqueue one DMA slot
+    /// twice and later free it twice, so that case has to be refused rather
+    /// than tracked here.
     tx_in_flight: Vec<bool>,
     tx_owner: Vec<usize>,
     rx_memory: DescriptorMemory,
@@ -147,7 +164,8 @@ pub struct IgcNic<H: IgcHal, const QS: usize> {
     rx_free: Vec<usize>,
     rx_in_flight: Vec<bool>,
     stats: Stats,
-    allocations: Vec<Allocation>,
+    // A failed stop must retain DMA memory, not return live pages to the heap.
+    allocations: ManuallyDrop<[Allocation<H>; 4]>,
 }
 
 // SAFETY: every field is either plain data, a bounded handle over DMA memory
@@ -166,7 +184,7 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
     /// The caller has already reset the part and read its station address; the
     /// address is passed in so that this function cannot be reached without
     /// one.
-    pub fn init(mut bus: WindowBus<H>, station: &StationAddress) -> DevResult<Self> {
+    pub fn init(bus: WindowBus<H>, station: &StationAddress) -> DevResult<Self> {
         // One descriptor is always left unused, so a ring of one descriptor
         // could never hand anything over.
         if QS < 2 {
@@ -182,26 +200,27 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
         // fixed slots, so every
         // allocation is asked for page alignment and the alignment is checked
         // rather than assumed.
-        let mut allocations = Vec::with_capacity(4);
-        let tx_descriptors = allocate::<H>(&mut allocations, QS * DESCRIPTOR_BYTES, 4096)?;
-        let rx_descriptors = allocate::<H>(&mut allocations, QS * DESCRIPTOR_BYTES, 4096)?;
-        let tx_buffers = allocate::<H>(&mut allocations, QS * RX_BUFFER_BYTES, 4096)?;
-        let rx_buffers = allocate::<H>(&mut allocations, QS * RX_BUFFER_BYTES, 4096)?;
+        // Array construction drops the preceding owners if a later allocation
+        // fails. No address has been published to the device at this point.
+        let allocations = [
+            allocate::<H>(QS * DESCRIPTOR_BYTES, 4096)?,
+            allocate::<H>(QS * DESCRIPTOR_BYTES, 4096)?,
+            allocate::<H>(QS * RX_BUFFER_BYTES, 4096)?,
+            allocate::<H>(QS * RX_BUFFER_BYTES, 4096)?,
+        ];
+        let [tx_descriptors, rx_descriptors, tx_buffers, rx_buffers] = &allocations;
+        let tx_base = tx_descriptors.bus;
+        let rx_base = rx_descriptors.bus;
 
         // SAFETY: every pointer below comes from `allocate`, which checks that
         // the region is live, non-null, aligned and long enough, and each value
         // is built over exactly the region its allocation describes.
         let tx_memory = unsafe { DescriptorMemory::new(tx_descriptors.cpu, QS) };
-        let tx_pool = unsafe { BufferPool::new(tx_buffers.cpu, tx_buffers.bus, QS, RX_BUFFER_BYTES) };
+        let tx_pool =
+            unsafe { BufferPool::new(tx_buffers.cpu, tx_buffers.bus, QS, RX_BUFFER_BYTES) };
         let rx_memory = unsafe { DescriptorMemory::new(rx_descriptors.cpu, QS) };
-        let rx_pool = unsafe { BufferPool::new(rx_buffers.cpu, rx_buffers.bus, QS, RX_BUFFER_BYTES) };
-
-        // The rings are programmed before anything else touches them, in the
-        // order igc_configure uses: the control registers, then the transmit
-        // ring, then the receive ring.
-        enable_mac(&mut bus)?;
-        configure_transmit(&mut bus, tx_descriptors.bus, ring_length)?;
-        configure_receive(&mut bus, rx_descriptors.bus, ring_length)?;
+        let rx_pool =
+            unsafe { BufferPool::new(rx_buffers.cpu, rx_buffers.bus, QS, RX_BUFFER_BYTES) };
 
         let mut nic = Self {
             bus,
@@ -219,12 +238,18 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
             rx_free: (0..QS).rev().collect(),
             rx_in_flight: vec![false; QS],
             stats: Stats::default(),
-            allocations,
+            allocations: ManuallyDrop::new(allocations),
         };
         nic.tx_memory.zero();
         nic.rx_memory.zero();
         // Fill the receive ring before anything can arrive, and hand it over.
         nic.fill_receive_ring();
+        // Establish the owner before any fallible register write, and prepare
+        // the descriptors before enabling the queues. Errors now use the same
+        // DMA stop discipline as ordinary teardown.
+        enable_mac(&mut nic.bus)?;
+        configure_transmit(&mut nic.bus, tx_base, ring_length)?;
+        configure_receive(&mut nic.bus, rx_base, ring_length)?;
         nic.write_receive_tail();
         Ok(nic)
     }
@@ -446,6 +471,10 @@ impl<H: IgcHal, const QS: usize> NetDriverOps for IgcNic<H, QS> {
             return Err(DevError::BadState);
         }
         self.tx_owner[index] = slot;
+        // Ownership has moved from the caller to the ring. A second return
+        // of this pointer must not enqueue the same DMA slot again and later
+        // insert it into the free list twice. Completion alone frees it.
+        self.tx_in_flight[slot] = false;
         let tail = self.tx_ring.tail() as u32;
         if !self.bus.write(named("IGC_TDT(0)"), tail) {
             self.stats.register_refused += 1;
@@ -509,11 +538,17 @@ impl<H: IgcHal, const QS: usize> Drop for IgcNic<H, QS> {
         let _ = self
             .bus
             .write(named("IGC_TXDCTL(0)"), QueueControl::disabled().raw());
-        for allocation in &self.allocations {
-            // SAFETY: every allocation in this list came from `H::dma_alloc`
-            // with exactly these parameters, and the rings built over them are
-            // being torn down with this value.
-            unsafe { H::dma_dealloc(allocation.bus, allocation.cpu, allocation.pages) };
+        // Posted queue-disable writes are not proof that outstanding DMA has
+        // completed. Reuse the reset path's bounded PCIe-master handshake.
+        if matches!(
+            super::bringup::disable_pcie_master(&mut self.bus),
+            Ok(Some(_))
+        ) {
+            // SAFETY: the device reported that it can no longer access these
+            // pages. This is the sole destruction of these four owners.
+            unsafe { ManuallyDrop::drop(&mut self.allocations) };
+        } else {
+            log::warn!("igc: DMA stop was not confirmed; retaining ring and packet memory");
         }
     }
 }
@@ -575,11 +610,7 @@ fn read<B: IgcBus>(bus: &mut B, name: &str) -> DevResult<u32> {
 /// than assumed: a page allocation satisfies every alignment up to the page
 /// size, and a caller that needs more than that gets an error instead of a
 /// ring the hardware would read from the wrong place.
-fn allocate<H: IgcHal>(
-    allocations: &mut Vec<Allocation>,
-    size: usize,
-    align: usize,
-) -> DevResult<Allocation> {
+fn allocate<H: IgcHal>(size: usize, align: usize) -> DevResult<Allocation<H>> {
     if align > DMA_PAGE_BYTES {
         return Err(DevError::InvalidParam);
     }
@@ -594,9 +625,12 @@ fn allocate<H: IgcHal>(
         unsafe { H::dma_dealloc(bus, cpu, pages) };
         return Err(DevError::NoMemory);
     }
-    let allocation = Allocation { bus, cpu, pages };
-    allocations.push(allocation);
-    Ok(allocation)
+    Ok(Allocation {
+        bus,
+        cpu,
+        pages,
+        _hal: PhantomData,
+    })
 }
 
 /// Program the receive and transmit control registers
@@ -700,8 +734,10 @@ mod tests {
     /// it this way.  DMA memory comes from [`FakeHal`], whose allocations are
     /// page-aligned and zeroed, exactly like the platform allocator's.
     struct Harness {
-        aperture: vec::Vec<u32>,
         nic: IgcNic<FakeHal, QS>,
+        // Fields drop in declaration order: the NIC writes queue registers
+        // during Drop, so its register window must still be allocated then.
+        aperture: vec::Vec<u32>,
     }
 
     impl Harness {
@@ -748,7 +784,7 @@ mod tests {
         /// Write a transmit descriptor's write-back status word, which is what
         /// the hardware does when it finishes with a frame.
         fn complete_transmit(&mut self, index: usize) {
-            let (tx_descriptors, _, _, _) = self.regions();
+            let (tx_descriptors, ..) = self.regions();
             // SAFETY: the offset is inside the transmit descriptor ring.
             unsafe {
                 core::ptr::write_volatile(
@@ -764,7 +800,7 @@ mod tests {
         /// Write a receive descriptor's write-back words, which is what the
         /// hardware does when a frame arrives.
         fn receive_frame(&mut self, index: usize, length: u16, status: u32) {
-            let (_, rx_descriptors, _, _) = self.regions();
+            let (_, rx_descriptors, ..) = self.regions();
             let offset = index * DESCRIPTOR_BYTES;
             // SAFETY: the offsets are inside the receive descriptor ring:
             // `status_error` is the third word and `length` the low half of
@@ -790,7 +826,7 @@ mod tests {
     #[test]
     fn init_programs_both_rings_the_way_the_vendor_driver_does() {
         let harness = Harness::new();
-        let (tx_descriptors, rx_descriptors, _, _) = harness.regions();
+        let (tx_descriptors, rx_descriptors, ..) = harness.regions();
         let ring_bytes = (QS * DESCRIPTOR_BYTES) as u32;
 
         // The register writes igc_configure_tx_ring and
@@ -845,7 +881,10 @@ mod tests {
             );
             // The length field is clear, so a stale value cannot look like a
             // frame.
-            assert_eq!(harness.word(rx_descriptors, index * DESCRIPTOR_BYTES + 12), 0);
+            assert_eq!(
+                harness.word(rx_descriptors, index * DESCRIPTOR_BYTES + 12),
+                0
+            );
         }
         // The descriptor the tail stops before is untouched: it is the one the
         // ring always leaves unused.
@@ -908,11 +947,7 @@ mod tests {
         // then writes the descriptor back.
         // SAFETY: the first receive buffer is live and 64 bytes fit in it.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                payload.as_ptr(),
-                rx_buffers.as_ptr(),
-                payload.len(),
-            );
+            core::ptr::copy_nonoverlapping(payload.as_ptr(), rx_buffers.as_ptr(), payload.len());
         }
         harness.receive_frame(0, 64, bits::RXD_STAT_DD | bits::RXD_STAT_EOP);
 
@@ -962,7 +997,9 @@ mod tests {
         // A buffer that is not from this driver's pool at all.
         let foreign = FakeHal::foreign_allocation(RX_BUFFER_BYTES, 4096);
         assert!(matches!(
-            harness.nic.recycle_rx_buffer(NetBufPtr::new(foreign, foreign, 64)),
+            harness
+                .nic
+                .recycle_rx_buffer(NetBufPtr::new(foreign, foreign, 64)),
             Err(DevError::BadState)
         ));
         assert!(matches!(
@@ -1001,6 +1038,23 @@ mod tests {
             Err(DevError::BadState)
         ));
         assert_eq!(harness.nic.stats().foreign_buffers, 1);
+    }
+
+    #[test]
+    fn a_transmit_buffer_cannot_be_queued_twice_before_completion() {
+        let mut harness = Harness::new();
+        let buffer = harness.nic.alloc_tx_buffer(64).unwrap();
+        let pointer = NonNull::new(buffer.raw_ptr::<u8>()).unwrap();
+        let duplicate = NetBufPtr::new(pointer, pointer, 64);
+        harness.nic.transmit(buffer).unwrap();
+        assert!(matches!(
+            harness.nic.transmit(duplicate),
+            Err(DevError::BadState)
+        ));
+        assert_eq!(harness.register("IGC_TDT(0)"), 1);
+        harness.complete_transmit(0);
+        harness.nic.recycle_tx_buffers().unwrap();
+        assert_eq!(harness.nic.test_free_tx_slots(), QS);
     }
 
     #[test]
@@ -1043,7 +1097,7 @@ mod tests {
     #[test]
     fn a_malformed_receive_descriptor_is_dropped_and_the_ring_moves_on() {
         let mut harness = Harness::new();
-        let (_, rx_descriptors, _, _) = harness.regions();
+        let (_, rx_descriptors, ..) = harness.regions();
         // A length with no end-of-packet bit: this driver's single-buffer
         // receive path cannot assemble a split packet, so the descriptor is
         // dropped rather than handed to the stack as a fragment.
@@ -1109,7 +1163,8 @@ mod tests {
         }
         // The queues were stopped before their rings went away, and every
         // allocation was given back.
-        let aperture_words = |name: &str| aperture[regs::named(name).unwrap().offset() as usize / 4];
+        let aperture_words =
+            |name: &str| aperture[regs::named(name).unwrap().offset() as usize / 4];
         assert_eq!(aperture_words("IGC_RXDCTL(0)"), 0);
         assert_eq!(aperture_words("IGC_TXDCTL(0)"), 0);
         assert_eq!(FakeHal::live_allocations(), 0, "nothing leaked");
@@ -1134,6 +1189,79 @@ mod tests {
             Err(DevError::InvalidParam)
         ));
         assert_eq!(FakeHal::live_allocations(), 0, "nothing was leaked");
+    }
+
+    #[test]
+    fn partial_dma_allocation_failure_releases_every_unpublished_region() {
+        struct FailAfter<const N: usize>;
+        impl<const N: usize> IgcHal for FailAfter<N> {
+            fn busy_wait_us(us: u32) {
+                FakeHal::busy_wait_us(us);
+            }
+            fn dma_alloc(pages: usize) -> Option<(u64, NonNull<u8>)> {
+                if FakeHal::live_allocations() == N {
+                    None
+                } else {
+                    FakeHal::dma_alloc(pages)
+                }
+            }
+            unsafe fn dma_dealloc(bus: u64, cpu: NonNull<u8>, pages: usize) {
+                unsafe { FakeHal::dma_dealloc(bus, cpu, pages) };
+            }
+        }
+        fn check<const N: usize>() {
+            assert_eq!(FakeHal::live_allocations(), 0);
+            let mut aperture = vec![0u32; WINDOW_BYTES / 4];
+            // SAFETY: aperture remains live until init and any teardown finish.
+            let bus = unsafe {
+                WindowBus::<FailAfter<N>>::new(RegisterWindow::from_mapped(
+                    aperture.as_mut_ptr() as usize,
+                    WINDOW_BYTES,
+                ))
+            };
+            assert!(matches!(
+                IgcNic::<FailAfter<N>, QS>::init(bus, &station()),
+                Err(DevError::NoMemory)
+            ));
+            assert_eq!(
+                FakeHal::live_allocations(),
+                0,
+                "allocation failure after {N} successes"
+            );
+            assert!(
+                aperture.iter().all(|word| *word == 0),
+                "nothing was programmed"
+            );
+        }
+        check::<0>();
+        check::<1>();
+        check::<2>();
+        check::<3>();
+    }
+
+    #[test]
+    fn a_dma_engine_that_does_not_stop_keeps_its_allocations() {
+        let mut harness = Harness::new();
+        let allocations: Vec<_> = harness
+            .nic
+            .allocations
+            .iter()
+            .map(|a| (a.bus, a.cpu, a.pages))
+            .collect();
+        harness.aperture[named("IGC_STATUS").offset() as usize / 4] =
+            bits::STATUS_GIO_MASTER_ENABLE;
+        drop(harness);
+        assert_eq!(FakeHal::live_allocations(), 4);
+        assert_eq!(
+            FakeHal::delay_count(),
+            bits::MASTER_DISABLE_TIMEOUT as usize
+        );
+        // No device exists in this test. Release the deliberately retained
+        // buffers after observing the failure policy, so the test does not leak.
+        for (bus, cpu, pages) in allocations {
+            unsafe { FakeHal::dma_dealloc(bus, cpu, pages) };
+        }
+        assert_eq!(FakeHal::live_allocations(), 0);
     }
 
     #[test]
@@ -1162,6 +1290,9 @@ mod tests {
         assert!(regs::named("IGC_STATUS").unwrap().is_readable());
         assert!(!regs::named("IGC_STATUS").unwrap().is_writable());
         let _ = FakeBus::new();
-        assert!(harness.register("IGC_CTRL") == 0, "the driver never writes CTRL here");
+        assert!(
+            harness.register("IGC_CTRL") == 0,
+            "the driver never writes CTRL here"
+        );
     }
 }

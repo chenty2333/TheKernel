@@ -193,7 +193,12 @@ impl StationAddress {
     pub fn describe(&self) -> String {
         format!(
             "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3], self.bytes[4], self.bytes[5],
+            self.bytes[0],
+            self.bytes[1],
+            self.bytes[2],
+            self.bytes[3],
+            self.bytes[4],
+            self.bytes[5],
         )
     }
 }
@@ -296,8 +301,7 @@ impl LinkOutcome {
     /// Whether the link partner advertises pause frames, from MII register 5
     /// (`NWAY_LPAR_PAUSE`, `igc_defines.h:169`).
     pub fn partner_advertises_pause(&self) -> Option<bool> {
-        self.partner
-            .map(|word| word & bits::NWAY_LPAR_PAUSE != 0)
+        self.partner.map(|word| word & bits::NWAY_LPAR_PAUSE != 0)
     }
 
     /// How the report spells the negotiated link.
@@ -406,7 +410,10 @@ impl BringUp {
             super::probe::PREFIX,
             match self.reset.master_disable_polls {
                 Some(polls) => format!("GIO master stopped after {polls} polls"),
-                None => String::from("GIO master never stopped (reported, not fatal, as the vendor driver treats it)"),
+                None => String::from(
+                    "GIO master never stopped (reported, not fatal, as the vendor driver treats \
+                     it)"
+                ),
             },
             match self.reset.auto_read_polls {
                 Some(polls) => format!("NVM auto-read done after {polls} polls"),
@@ -469,8 +476,8 @@ impl BringUp {
             self.written.join(", "),
         ));
         out.push_str(&format!(
-            "{}: this phase programs the MAC and reads the PHY; it sets up no descriptor ring, \
-             so no frame can be sent or received yet, and no PHY register was written\n",
+            "{}: this phase programs the MAC and reads the PHY; it sets up no descriptor ring, so \
+             no frame can be sent or received yet, and no PHY register was written\n",
             super::probe::PREFIX,
         ));
         out
@@ -524,9 +531,11 @@ fn read<B: IgcBus>(bus: &mut B, register: Register) -> Result<u32, BringUpError>
 /// Returns how many polls it took, or `None` if the bit never cleared.  The
 /// vendor driver treats that as a diagnostic and continues, and so does this
 /// one; the caller reports it.
-fn disable_pcie_master<B: IgcBus>(bus: &mut B, journal: &mut Journal) -> Result<Option<u32>, BringUpError> {
+pub(super) fn disable_pcie_master<B: IgcBus>(bus: &mut B) -> Result<Option<u32>, BringUpError> {
     let control = DeviceControl::new(read(bus, regs_ctl())?);
-    journal.write(bus, regs_ctl(), control.with_master_disabled().raw())?;
+    if !bus.write(regs_ctl(), control.with_master_disabled().raw()) {
+        return Err(BringUpError::RegisterNotWritable(regs_ctl().name()));
+    }
     for poll in 1..=bits::MASTER_DISABLE_TIMEOUT {
         let status = DeviceStatus::new(read(bus, regs_status())?);
         if !status.master_enabled() {
@@ -551,7 +560,8 @@ fn regs_status() -> Register {
 pub fn reset<B: IgcBus>(bus: &mut B) -> Result<(ResetOutcome, Vec<&'static str>), BringUpError> {
     let mut journal = Journal::new();
 
-    let master_disable_polls = disable_pcie_master(bus, &mut journal)?;
+    let master_disable_polls = disable_pcie_master(bus)?;
+    journal.written.push(regs_ctl().name());
 
     // Mask every interrupt, then stop both queues.
     journal.write(
@@ -560,11 +570,7 @@ pub fn reset<B: IgcBus>(bus: &mut B) -> Result<(ResetOutcome, Vec<&'static str>)
         bits::INTERRUPT_MASK_ALL,
     )?;
     journal.write(bus, regs::named("IGC_RCTL").expect("named"), 0)?;
-    journal.write(
-        bus,
-        regs::named("IGC_TCTL").expect("named"),
-        bits::TCTL_PSP,
-    )?;
+    journal.write(bus, regs::named("IGC_TCTL").expect("named"), bits::TCTL_PSP)?;
     // The vendor driver's flush: a read of a register that is always there.
     let _ = read(bus, regs_status())?;
     bus.delay_us(RESET_SETTLE_US);
@@ -1109,9 +1115,8 @@ mod tests {
         let control = LinkOutcome::describe_gigabit_control(bits::CR_1000T_FD_CAPS);
         assert!(control.contains("1000FD"), "{control}");
         assert!(!control.contains("1000HD"), "{control}");
-        let both = LinkOutcome::describe_gigabit_control(
-            bits::CR_1000T_FD_CAPS | bits::CR_1000T_HD_CAPS,
-        );
+        let both =
+            LinkOutcome::describe_gigabit_control(bits::CR_1000T_FD_CAPS | bits::CR_1000T_HD_CAPS);
         assert!(both.contains("1000FD") && both.contains("1000HD"), "{both}");
         let none = LinkOutcome::describe_gigabit_control(0);
         assert!(none.contains("no 1000BASE-T mode"), "{none}");
