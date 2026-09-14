@@ -279,7 +279,7 @@ mod tests {
         use axnet::unix::{DgramTransport, UnixNamespace, UnixSocketAddr};
         use crate::task::{Cred, UserNamespace};
 
-        let filesystem = crate::pseudofs::dev::new_devfs();
+        let filesystem = crate::pseudofs::dev::new_test_devfs();
         let mount = Mountpoint::new_root(&filesystem);
         crate::mounts::initialize_test_mount(&mount, 0).unwrap();
         let root = mount.root_location();

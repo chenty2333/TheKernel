@@ -333,6 +333,16 @@ pub(crate) fn new_devfs() -> Filesystem {
     SimpleFs::new_with("devfs".into(), 0x01021994, builder)
 }
 
+/// An isolated namespace for host tests of sockets, mounts and device nodes.
+/// These tests do not own the boot-global input listener or physical devices.
+#[cfg(test)]
+pub(crate) fn new_test_devfs() -> Filesystem {
+    SimpleFs::new_with("devfs".into(), 0x01021994, |fs| {
+        let root = device_namespace(fs.clone());
+        SimpleDir::new_maker(fs, Arc::new(root))
+    })
+}
+
 struct Null;
 
 impl DeviceOps for Null {
@@ -559,6 +569,17 @@ fn primary_scanout() -> Option<Arc<dyn scanout::ScanoutSurface>> {
 }
 
 fn builder(fs: Arc<SimpleFs>) -> DirMaker {
+    #[allow(unused_mut)]
+    let mut root = device_namespace(fs.clone());
+    #[cfg(feature = "input")]
+    root.add(
+        "input",
+        SimpleDir::new_maker(fs.clone(), event::input_devices(fs.clone())),
+    );
+    SimpleDir::new_maker(fs, Arc::new(root))
+}
+
+fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
     let mut root = DevRoot::new(fs.clone());
     root.add(
         "null",
@@ -804,14 +825,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         );
     }
 
-    // Input devices
-    #[cfg(feature = "input")]
-    root.add(
-        "input",
-        SimpleDir::new_maker(fs.clone(), event::input_devices(fs.clone())),
-    );
-
-    SimpleDir::new_maker(fs, Arc::new(root))
+    root
 }
 
 #[cfg(test)]
@@ -823,7 +837,7 @@ mod tests {
     #[test]
     fn devfs_socket_creation_preserves_shared_memory_mount() {
         let _scheduler = crate::test_support::scheduler_test_context();
-        let devfs = new_devfs();
+        let devfs = new_test_devfs();
         let root = axfs_ng_vfs::Mountpoint::new_root(&devfs).root_location();
         let shm = root.lookup_no_follow(FsName::new(b"shm")).unwrap();
         let tmpfs = crate::pseudofs::MemoryFs::new_with_permission(
@@ -851,7 +865,7 @@ mod tests {
 
     #[test]
     fn devfs_publishes_linux_virtual_console_nodes() {
-        let devfs = new_devfs();
+        let devfs = new_test_devfs();
         let root = devfs.root_dir();
         let root = root.as_dir().unwrap();
 
@@ -891,7 +905,7 @@ mod tests {
 
     #[test]
     fn devfs_allows_userspace_owned_pathname_sockets() {
-        let devfs = new_devfs();
+        let devfs = new_test_devfs();
         let root = devfs.root_dir();
         let root = root.as_dir().unwrap();
         let name = FsName::new(b"log");
