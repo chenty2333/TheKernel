@@ -180,7 +180,26 @@ Landed with the fix:
   renders the ring on a 128 KiB thread stack (the by-value version overflows it
   and aborts with `fatal runtime error: stack overflow`); and
   `tools/stack_frames.py`, which reads `task-stack-size` and fails if any
-  function in a built kernel reserves more than that.
+  function in a built kernel reserves more than that.  The tool is the
+  `stack-frames` stage of `verify --tier daily`, run against the release ELF the
+  build stage just produced, so the bound is held by the gate rather than by
+  remembering to run the check.
+* **What the frame check does not cover.**  It reads a function's own
+  adjustments: a frame split across several lands under the bound, and the sum
+  that catches that is only added up when the image has per-function symbols (no
+  function in the tree splits its frame today).  It also sees a function, not the
+  chain below it, and the deepest chain in the tree is
+  `file::io_uring::retire_physical_completion_after_reset_for_device` -- 176 KiB
+  of local plus a worker's callees, about 195 KiB or 76% of a task stack, on a
+  stack that likewise has no guard page.  It fits, and nothing here changes that.
+* **The dump's rendering is not fallible.**  The 182 KiB snapshot is reserved
+  with `try_reserve_exact` and answers `ENOMEM`; the text is then built with
+  `format!`, `extend_from_slice` and `join`, which abort the kernel if an
+  allocation fails.  A full ring renders up to roughly 900 KiB -- 512 lines of up
+  to 1.8 KiB -- and `SimpleFile::read_at` renders the whole file again on every
+  `read(2)`, so a reader asking for 4 KiB at a time pays for the whole render per
+  read.  That is a diagnostic interface on a debug kernel rather than a hot path,
+  and it is recorded rather than changed: what had to go was the corruption.
 
 ## What is not explained
 
