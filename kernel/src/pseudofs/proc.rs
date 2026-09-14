@@ -3533,6 +3533,16 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
     }
 
     let mut root = DirMapping::new();
+    root.add(
+        "stat",
+        SimpleFile::new_regular(fs.clone(), || Ok(crate::task::cpu_stats::proc_stat())),
+    );
+    root.add("loadavg", {
+        let pid_ns = pid_ns.clone();
+        SimpleFile::new_regular(fs.clone(), move || {
+            Ok(crate::task::proc_loadavg(&pid_ns)?)
+        })
+    });
     root.add("mounts", SimpleFile::new_regular(fs.clone(), render_mounts));
     root.add(
         "mountinfo",

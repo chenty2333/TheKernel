@@ -2,6 +2,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <math.h>
+#include <pwd.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +15,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int fail(const char *stage) {
@@ -173,6 +177,97 @@ out:
     }
 }
 
+static int read_proc_cpu_times(unsigned long long ticks[2][4]) {
+    FILE *file = fopen("/proc/stat", "r");
+    if (file == NULL) return fail("proc-stat-open");
+    char line[256];
+    unsigned found = 0;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        int row = strncmp(line, "cpu ", 4) == 0 ? 0 :
+                  strncmp(line, "cpu0 ", 5) == 0 ? 1 : -1;
+        if (row < 0) continue;
+        if (sscanf(line + (row == 0 ? 4 : 5), "%llu %llu %llu %llu",
+                   &ticks[row][0], &ticks[row][1], &ticks[row][2], &ticks[row][3]) != 4)
+            break;
+        found |= 1u << row;
+    }
+    int error = ferror(file);
+    if (fclose(file) != 0 || error || found != 3) {
+        errno = EPROTO;
+        return fail("proc-stat-cpu-fields");
+    }
+    return 0;
+}
+
+static int check_busybox_identity_and_top(int top) {
+    FILE *output = popen(top ? "/bin/busybox top -b -n 1" : "/bin/busybox whoami", "r");
+    if (output == NULL) return fail("proc-busybox-popen");
+    char line[512];
+    unsigned seen = 0;
+    while (fgets(line, sizeof(line), output) != NULL) {
+        if (top) {
+            if (strstr(line, "CPU:") != NULL) seen |= 1;
+            if (strstr(line, "Load average:") != NULL) seen |= 2;
+            if (strstr(line, "PID") != NULL && strstr(line, "COMMAND") != NULL) seen |= 4;
+        } else if (strcmp(line, "root\n") == 0) seen = 7;
+    }
+    int error = ferror(output);
+    int status = pclose(output);
+    if (error || status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || seen != 7) {
+        fprintf(stderr, "THEKERNEL_SYSTEM_TEST_FAIL busybox-%s status=%d output_fields=%u\n",
+                top ? "top" : "whoami", status, seen);
+        errno = EPROTO;
+        return fail("proc-busybox-output");
+    }
+    return 0;
+}
+
+static int check_proc_cpu_and_identity(void) {
+    unsigned long long before[2][4], after[2][4];
+    if (read_proc_cpu_times(before)) return 1;
+    struct timespec pause = { .tv_sec = 0, .tv_nsec = 250000000 };
+    while (nanosleep(&pause, &pause) != 0)
+        if (errno != EINTR) return fail("proc-stat-sample-delay");
+    if (read_proc_cpu_times(after)) return 1;
+    for (int row = 0; row < 2; ++row) {
+        unsigned long long total_before = 0, total_after = 0;
+        for (int field = 0; field < 4; ++field) {
+            if (after[row][field] < before[row][field]) {
+                errno = EPROTO;
+                return fail("proc-stat-counter-regressed");
+            }
+            total_before += before[row][field];
+            total_after += after[row][field];
+        }
+        if (total_after <= total_before) {
+            errno = EPROTO;
+            return fail("proc-stat-counter-stalled");
+        }
+    }
+    FILE *load = fopen("/proc/loadavg", "r");
+    if (load == NULL) return fail("proc-loadavg-open");
+    double averages[3];
+    unsigned running, total, last_pid;
+    char extra;
+    int fields = fscanf(load, "%lf %lf %lf %u/%u %u %c", &averages[0], &averages[1],
+                        &averages[2], &running, &total, &last_pid, &extra);
+    if (fclose(load) != 0 || fields != 6 || total == 0 || running > total ||
+        !isfinite(averages[0]) || !isfinite(averages[1]) || !isfinite(averages[2]) ||
+        averages[0] < 0 || averages[1] < 0 || averages[2] < 0) {
+        errno = EPROTO;
+        return fail("proc-loadavg-fields");
+    }
+    struct passwd *root = getpwuid(0);
+    struct group *group = getgrgid(0);
+    if (root == NULL || group == NULL || strcmp(root->pw_name, "root") != 0 ||
+        root->pw_gid != 0 || strcmp(root->pw_dir, "/root") != 0 ||
+        strcmp(group->gr_name, "root") != 0) {
+        errno = EPROTO;
+        return fail("proc-root-account-lookup");
+    }
+    return check_busybox_identity_and_top(0) || check_busybox_identity_and_top(1);
+}
+
 static int test_procfs(void) {
     char buffer[1024] = {0};
     int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
@@ -200,7 +295,7 @@ static int test_procfs(void) {
         errno = EPROTO;
         return fail("proc-memory-pressure-schema");
     }
-    return 0;
+    return check_proc_cpu_and_identity();
 }
 
 static int wait_for_success(pid_t child, const char *stage) {

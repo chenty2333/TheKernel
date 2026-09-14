@@ -1,6 +1,5 @@
 //! Linux-style global load averages derived from the scheduler's lock-free
-//! runnable snapshots.  The scheduler currently has no uninterruptible-task
-//! counter, so this accounts the runnable component it does expose.
+//! runnable snapshots and the tracked uninterruptible-task count.
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -138,6 +137,48 @@ pub(crate) fn load_average_sysinfo() -> [u64; 3] {
     ]
 }
 
+/// The averages are system-wide; task counts and the allocator cursor describe
+/// the user threads visible through this procfs mount's PID namespace.
+pub(crate) fn proc_loadavg(
+    namespace: &super::PidNamespace,
+) -> axerrno::AxResult<alloc::string::String> {
+    use super::AsThread;
+    load_average_sample_now();
+    let mut running = 0;
+    let mut total = 0;
+    for task in super::try_tasks()? {
+        if namespace
+            .visible_pid_checked(task.as_thread().tid())
+            .is_some()
+        {
+            total += 1;
+            running += usize::from(super::task_state(&task) == 'R');
+        }
+    }
+    Ok(render_loadavg(
+        load_average_sysinfo(),
+        running,
+        total,
+        namespace.last_allocated_pid(),
+    ))
+}
+
+fn render_loadavg(
+    loads: [u64; 3],
+    running: usize,
+    total: usize,
+    last_pid: u32,
+) -> alloc::string::String {
+    use core::fmt::Write;
+    let mut output = alloc::string::String::new();
+    for load in loads {
+        let hundredths = (load as u128 * 100 + (1 << 15)) >> 16;
+        let _ = write!(output, "{}.{:02} ", hundredths / 100, hundredths % 100);
+    }
+    let _ = writeln!(output, "{running}/{total} {last_pid}");
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::{FIXED_1, calc_load};
@@ -147,6 +188,14 @@ mod tests {
         assert_eq!(calc_load(0, FIXED_1, 0), 0);
         assert_eq!(calc_load(FIXED_1, FIXED_1, FIXED_1), FIXED_1);
         assert!(calc_load(0, 1_884, FIXED_1) > 0);
+    }
+
+    #[test]
+    fn proc_loadavg_formats_existing_fixed_point_values() {
+        assert_eq!(
+            super::render_loadavg([0, 98_304, 655_036], 2, 7, 42),
+            "0.00 1.50 10.00 2/7 42\n"
+        );
     }
 
     #[test]

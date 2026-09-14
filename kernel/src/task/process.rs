@@ -1212,6 +1212,11 @@ impl PidNamespace {
         }
     }
 
+    /// Last PID allocated in this namespace, including subsequently reaped tasks.
+    pub(crate) fn last_allocated_pid(&self) -> Pid {
+        self.pids.lock().next.saturating_sub(1)
+    }
+
     /// The namespace-local, exclusive PID allocation bound.
     pub(crate) fn pid_max(&self) -> Pid {
         self.pids.lock().pid_max()

@@ -217,6 +217,19 @@ class SystemTestGateTests(unittest.TestCase):
             self.assertEqual(artifacts.kernel.read_bytes(), b"known working kernel")
             self.assertFalse(product.artifact_config_stamp(artifacts, "module").exists())
 
+    def test_rootfs_includes_locked_root_identity_for_busybox_name_lookup(self) -> None:
+        script = (REPO_ROOT / "scripts/build-rootfs.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            """cat > "$STAGE/etc/passwd" <<'EOF'\nroot:!:0:0:root:/root:/bin/sh\nEOF""",
+            script,
+        )
+        self.assertIn(
+            """cat > "$STAGE/etc/group" <<'EOF'\nroot:!:0:\nEOF""",
+            script,
+        )
+        self.assertIn('"$STAGE/root"', script)
+        self.assertIn('chmod 0644 "$STAGE/etc/passwd" "$STAGE/etc/group"', script)
+
     def test_rootfs_inputs_changing_during_build_do_not_publish_success_stamp(self) -> None:
         product = load_product()
         with test_tmpdir() as directory:

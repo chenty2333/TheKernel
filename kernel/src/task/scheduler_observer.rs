@@ -1,4 +1,4 @@
-//! CPU-wide perf scheduling edges.
+//! CPU accounting and CPU-wide perf scheduling edges.
 //!
 //! Task-attached perf remains a `TaskExt` concern.  CPU, system-wide, and
 //! cgroup perf contexts must also observe idle and kernel-only intervals, so
@@ -8,7 +8,7 @@ use axtask::{SchedulerObserver, SwitchReason, TaskInner};
 
 use crate::{file::PerfGroup, task::AsThread};
 
-struct PerfSchedulerObserver;
+struct KernelSchedulerObserver;
 
 #[inline]
 fn task_identity(task: &TaskInner) -> (u32, u32) {
@@ -33,7 +33,7 @@ fn initial_trace_identity(
 }
 
 #[crate_interface::impl_interface]
-impl SchedulerObserver for PerfSchedulerObserver {
+impl SchedulerObserver for KernelSchedulerObserver {
     fn on_wakeup(task: &TaskInner, target_cpu: usize, timestamp: u64, priority: i32) {
         // A perf ring notification can enqueue its reader while the source
         // still owns perf-group locks. Do not recursively trace that internal
@@ -107,6 +107,7 @@ impl SchedulerObserver for PerfSchedulerObserver {
         // rotation edge as task-attached groups, even while the idle task is
         // current.
         let cpu = axhal::percpu::this_cpu_id();
+        super::cpu_stats::account_tick(cpu, current, interrupted_user);
         PerfGroup::cpu_context_account_clock_domain(cpu, interrupted_user);
         if let Some(thread) = current.try_as_thread() {
             thread.perf_on_timer_tick(interrupted_user);

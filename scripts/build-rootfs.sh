@@ -263,6 +263,15 @@ mkdir -p "$STAGE/etc/thekernel" \
     "$STAGE/dev" "$STAGE/proc" "$STAGE/sys" "$STAGE/tmp" \
     "$STAGE/var/tmp" "$STAGE/root"
 chmod 1777 "$STAGE/tmp" "$STAGE/var/tmp"
+# Name-service identity for the existing root shell (whoami/id/ls). Locked
+# password fields do not enable password login or add another entrypoint.
+cat > "$STAGE/etc/passwd" <<'EOF'
+root:!:0:0:root:/root:/bin/sh
+EOF
+cat > "$STAGE/etc/group" <<'EOF'
+root:!:0:
+EOF
+chmod 0644 "$STAGE/etc/passwd" "$STAGE/etc/group"
 install -m 0644 "$SOURCE_DIR/LICENSE" \
     "$STAGE/usr/share/licenses/busybox/LICENSE"
 install -m 0644 "$BUSYBOX_BUILD/.config" \

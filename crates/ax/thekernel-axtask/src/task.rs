@@ -1745,7 +1745,8 @@ impl TaskInner {
     }
 
     #[inline]
-    pub(crate) const fn is_idle(&self) -> bool {
+    /// Whether this is a per-CPU idle task, rather than a runnable worker.
+    pub const fn is_idle(&self) -> bool {
         self.is_idle
     }
 
