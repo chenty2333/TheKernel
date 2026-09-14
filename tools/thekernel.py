@@ -842,7 +842,7 @@ def fbcon_text_cells() -> QmpTextCells:
 def fbcon_artifacts(args: argparse.Namespace) -> Artifacts:
     """Resolve the system artifacts for exactly the requested variant."""
 
-    artifacts = Artifacts(state_root(), parse_variant(args), "system")
+    artifacts = artifacts_for(args, "system")
     if args.no_build and (not artifacts.kernel.is_file() or not artifacts.esp.is_file()):
         # Artifact paths are keyed by memory size, so a kernel built at a
         # different --memory is not "stale" here -- it is simply absent, and

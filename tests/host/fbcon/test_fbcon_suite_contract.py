@@ -213,6 +213,20 @@ class FbconSuiteContractTests(unittest.TestCase):
         self.assertIn('f"QMP timeout waiting for {description}"', source)
         self.assertIn('f"screenshot marker: {checkpoint.screenshot_after_marker}"', source)
 
+    def test_fbcon_uses_the_selected_machine_profile(self) -> None:
+        module = self.module
+        args = SimpleNamespace(
+            smp=4, memory="1G", platform="n305", net_igc=True,
+            no_build=False, asid_fast_switch=False, m5_candidate=False,
+            io_submit_batch=False, io_notify_fastpath=False,
+        )
+        with test_tmpdir() as directory, \
+             mock.patch.object(module, "state_root", return_value=Path(directory)):
+            expected = module.artifacts_for(args, "system")
+            actual = module.fbcon_artifacts(args)
+            self.assertEqual(actual.kernel, expected.kernel)
+            self.assertEqual(actual.esp, expected.esp)
+
 
 class FbconAcceptanceCheckTests(unittest.TestCase):
     """`_check_fbcon_run`: the assertions made after the guest has stopped."""
