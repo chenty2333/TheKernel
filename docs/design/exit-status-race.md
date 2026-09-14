@@ -165,6 +165,22 @@ Landed with the fix:
   observation, per clone publication, and per exit publication.  A ring read
   never goes through the kernel log, because the log drops records under exactly
   the contention the race needs.
+* **The ring costs 182 KiB of `.bss` and is rendered on the reader's stack**,
+  which is a constraint on the code rather than a detail: the dump copies the
+  ring into a heap buffer because copying it into a local does not fit.  The
+  first version destructured `(trace.records, trace.sequence)`, which copied the
+  array twice, and the compiler reserved a **364 KiB stack frame** against a
+  `TASK_STACK_SIZE` of 256 KiB.  Task stacks come from `alloc::alloc` with no
+  guard page, so nothing faulted: the frame's stack probe wrote a zero into each
+  page it crossed below the stack, inside whatever the allocator had put there.
+  Reading a world-readable `/proc` file could corrupt the kernel heap.  Three
+  things hold that now, and each is checked rather than argued: a `const _`
+  assertion in `ops.rs` that the ring plus one record fits a task stack; the
+  host test `the_dump_renders_inside_a_stack_far_smaller_than_the_ring`, which
+  renders the ring on a 128 KiB thread stack (the by-value version overflows it
+  and aborts with `fatal runtime error: stack overflow`); and
+  `tools/stack_frames.py`, which reads `task-stack-size` and fails if any
+  function in a built kernel reserves more than that.
 
 ## What is not explained
 
