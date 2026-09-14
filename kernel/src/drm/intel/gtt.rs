@@ -885,12 +885,18 @@ impl Gtt {
 
     /// Take a page table window over memory that is already mapped.
     ///
+    /// The test-side twin of `MappedArray::map_bar`: a test stands ordinary
+    /// memory in for the device aperture, and no production path has a reason
+    /// to point the page table at memory this driver did not map.  The test
+    /// gate keeps that true by construction rather than by inspection.
+    ///
     /// The window must be a whole number of entries; a window that is not is an
     /// error rather than a silently shortened aperture.
     ///
     /// # Safety
     ///
     /// As [`MappedArray::over_mapped`].
+    #[cfg(test)]
     pub(crate) unsafe fn from_mapped(base: usize, len: usize) -> Result<Self, GttError> {
         if len < PTE_BYTES || !len.is_multiple_of(PTE_BYTES) {
             return Err(GttError::WindowTooSmall { bytes: len });

@@ -710,6 +710,12 @@ pub const NAMED_SPAN: usize = {
 const _: () = assert!(NAMED_SPAN <= WINDOW_BYTES);
 
 /// The named register called `name`, or `None`.
+///
+/// Bring-up refers to registers by name -- `regs::named("IGC_CTRL").expect(..)`
+/// -- rather than by offset, so a name that left this table would be a panic on
+/// the boot path.  It cannot go unnoticed: `bring_up` and `start_link` run in
+/// the host tests below, and a name missing from the table fails the test that
+/// asks for it rather than the driver that boots.
 pub fn named(name: &str) -> Option<Register> {
     NAMED.iter().copied().find(|register| register.name == name)
 }
