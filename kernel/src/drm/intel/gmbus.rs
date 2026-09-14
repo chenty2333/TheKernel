@@ -995,6 +995,24 @@ enum WaitOutcome {
     TimedOut,
 }
 
+/// Which terminal condition a `GMBUS2` reading carries, if any.
+///
+/// `SATOER` wins when both bits are set, and a reading with neither is
+/// [`WaitOutcome::Met`] as far as a wait is concerned.  The two terminal bits
+/// mean different things -- a NAK names the sink and the AUX well, a stall
+/// names the bus -- so every reader of the register classifies them here
+/// rather than repeating the order and getting it wrong.
+fn terminal_outcome(status: u32) -> WaitOutcome {
+    if status & GMBUS2_TERMINAL == 0 {
+        return WaitOutcome::Met;
+    }
+    if status & GMBUS2_SATOER != 0 {
+        WaitOutcome::NoAck
+    } else {
+        WaitOutcome::Stalled
+    }
+}
+
 /// One GMBUS transaction's worth of state.
 struct Bus<'a, R: Registers, T: PollTimer> {
     registers: &'a R,
@@ -1100,10 +1118,9 @@ impl<R: Registers, T: PollTimer> Bus<'_, R, T> {
         let deadline = start.saturating_add(timeout_micros);
         let mut status = self.read(GMBUS2)?;
         loop {
-            let outcome = if status & GMBUS2_SATOER != 0 {
-                WaitOutcome::NoAck
-            } else if status & GMBUS2_STALL_TIMEOUT != 0 {
-                WaitOutcome::Stalled
+            let terminal = terminal_outcome(status);
+            let outcome = if terminal != WaitOutcome::Met {
+                terminal
             } else if status & mask != 0 {
                 WaitOutcome::Met
             } else if self.timer.now_micros() >= deadline {
@@ -1282,10 +1299,16 @@ impl<R: Registers, T: PollTimer> Bus<'_, R, T> {
         let _ = self.posting_read(GMBUS1)?;
         let idle = self.wait_idle()?;
         self.write(GMBUS0, 0)?;
-        if idle.status & GMBUS2_TERMINAL != 0 {
+        // `wait_idle` only reports whether ACTIVE cleared, so a terminal bit
+        // latched during the stop cycle is read here.  Which bit it is matters:
+        // a stall is a stuck bus, not a sink that refused the address, and
+        // reporting a stall as `NoAck` blames the AUX well for a bus fault and
+        // throws away a block that was read in full.
+        let terminal = terminal_outcome(idle.status);
+        if terminal != WaitOutcome::Met {
             return Err(self.failure(
                 Waited {
-                    outcome: WaitOutcome::NoAck,
+                    outcome: terminal,
                     ..idle
                 },
                 address,

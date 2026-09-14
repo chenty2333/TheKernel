@@ -66,6 +66,12 @@ struct FakeState {
     active: bool,
     satoer: bool,
     stall: bool,
+    /// Arm `stall` only once this many words have been served, so the stall
+    /// latches during the stop cycle rather than during the data phase.  This
+    /// is the shape a real secondary produces when it holds the clock after the
+    /// last byte: the block is already complete, and the fault appears in the
+    /// one place `wait_idle` looks.
+    stall_after_words: Option<usize>,
     /// Leave ACTIVE set after the stop cycle: a bus that never goes idle.
     stuck_after_stop: bool,
     /// NAK the first transaction only, as a passive adapter that needs a second
@@ -123,6 +129,7 @@ impl FakeController {
                 active: false,
                 satoer: false,
                 stall: false,
+                stall_after_words: None,
                 stuck_after_stop: false,
                 nak_first_transaction: false,
                 served: 0,
@@ -185,6 +192,14 @@ impl FakeController {
     /// secondary holding the clock is not something SW_CLR_INT fixes.
     pub(crate) fn stall(&self) {
         self.state.borrow_mut().stall = true;
+    }
+
+    /// Let the transfer deliver `words` words and then stall, so the fault
+    /// latches after the data phase is over.
+    pub(crate) fn stall_after_words(&self, words: usize) {
+        let mut state = self.state.borrow_mut();
+        state.stall_after_words = Some(words);
+        state.words_available = words;
     }
 
     /// Never clear ACTIVE after the stop cycle.
@@ -281,7 +296,7 @@ impl FakeState {
         if self.satoer {
             status |= GMBUS2_SATOER;
         }
-        if self.stall {
+        if self.stall || self.stall_after_words.is_some_and(|words| self.served >= words) {
             status |= GMBUS2_STALL_TIMEOUT;
         }
         if self.running
@@ -859,6 +874,28 @@ fn a_stuck_bus_is_named_and_the_recovery_releases_the_pin() {
         other => panic!("expected a stuck bus, got {other:?}"),
     }
     assert_eq!(controller.peek(GMBUS0), Some(0));
+}
+
+/// A stall that latches while the stop cycle is running is a stuck bus, not a
+/// sink refusing the address.
+///
+/// The block is already read in full at that point, so the only thing left to
+/// get wrong is what to call the failure.  A stall is not a NAK: reporting it
+/// as one sends a reader to inspect the AUX well and the monitor, and discards
+/// a block that was read successfully.
+#[test]
+fn a_stall_after_the_last_word_is_a_stuck_bus_not_a_nak() {
+    let _guard = scheduler_test_context();
+    let block = valid_edid(0);
+    let controller = FakeController::with_monitor(Pin::DdiA, &block);
+    controller.stall_after_words(EDID_BLOCK_LEN / 4);
+    let (result, _) = read(&controller, Pin::DdiA);
+    match result {
+        Err(GmbusError::BusStuck { status, .. }) => {
+            assert_ne!(status & GMBUS2_STALL_TIMEOUT, 0, "the stall bit is the story");
+        }
+        other => panic!("a stall must be reported as a stuck bus, got {other:?}"),
+    }
 }
 
 #[test]
