@@ -230,7 +230,14 @@ int main(void) {
             reclaimed = 1;
             break;
         }
-        if (observed.free_pages <= observed.low_watermark_pages) {
+        /* The kernel's reclaim pass runs when free memory is *below* the low
+         * watermark (`kernel/src/mm/pressure.rs`: `free_pages >= low_pages`
+         * returns without a pass).  Stopping at equality parks this test
+         * exactly where nothing fires -- observed_free=1979 against
+         * low=1979, zero pressure events, then the poll loop times out.  The
+         * `max_pages` budget above already pays for going below, so keep
+         * driving: the next chunk is 1 MiB, which crosses the line. */
+        if (observed.free_pages < observed.low_watermark_pages) {
             break;
         }
         if (usleep(25000) != 0) {
