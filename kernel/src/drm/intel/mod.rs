@@ -109,12 +109,18 @@ use spin::Mutex;
 /// to do, and the machine's clock is what the log line is stamped with.
 #[cfg(target_os = "none")]
 use self::gmbus::MonotonicTimer;
+/// The aperture type and the window length are named only by the bare-metal
+/// half: [`mapped_facts`] answers with the one and [`open_register_window`]
+/// maps the other, and no host-test caller names either.  They are gated here
+/// rather than in the group below so that the group stays a list of what both
+/// builds have in common.
+#[cfg(target_os = "none")]
+use self::{id::Aperture, regs::PROBE_WINDOW};
 use self::{
     gmbus::PollTimer,
-    id::Aperture,
     pci::Bdf,
     probe::{BusFacts, ProbeReport, WindowStatus},
-    regs::{PROBE_WINDOW, RegisterWindow, Registers},
+    regs::{RegisterWindow, Registers},
 };
 
 /// The report of the one probe this kernel runs, kept for the debug file.
