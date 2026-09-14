@@ -757,7 +757,10 @@ fn select_reaper_for_exit_locked<Z>(
         }
         // Namespace init can already be reaped. Keep the acyclic outer-scope
         // chain alive independently of that process and skip retired scopes.
-        let outer = fallback_scope.outer_scope.lock().clone()
+        let outer = fallback_scope
+            .outer_scope
+            .lock()
+            .clone()
             .expect("a non-root scope init has an outer scope");
         fallback_scope = outer;
     };
@@ -1715,7 +1718,7 @@ impl<Z> Iterator for Processes<'_, Z> {
     type Item = Arc<Process<Z>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
+        while !self.finished {
             if self.remaining == 0 {
                 // The budget expired without the tree ending. Re-arm it from
                 // the live count: insertion raises `memberships` monotonically
@@ -2619,6 +2622,17 @@ impl<Z> Iterator for ThreadIds<Z> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_exhausted_registry_walk_does_not_restart_after_insertion() {
+        let domain = ProcessDomain::<()>::try_new().unwrap();
+        let init = domain.try_new_init(1, None).unwrap();
+        let mut processes = domain.registry().processes();
+        assert_eq!(processes.next().unwrap().pid(), 1);
+        assert!(processes.next().is_none());
+        domain.prepare_fork(&init, 2, Some(17)).unwrap().commit();
+        assert!(processes.next().is_none());
+    }
 
     /// Regression: an exhausted visit budget is not proof that the walk has
     /// finished.
