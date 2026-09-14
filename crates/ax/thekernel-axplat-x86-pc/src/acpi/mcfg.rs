@@ -49,6 +49,7 @@ impl ConfigRegion {
     /// Number of PCI buses covered by this region.
     ///
     /// The MCFG end bus is inclusive, so a single-bus region covers one bus.
+    #[cfg(test)]
     pub const fn bus_count(&self) -> u32 {
         self.end_bus as u32 - self.start_bus as u32 + 1
     }
@@ -65,6 +66,7 @@ impl ConfigRegion {
     /// Number of bytes of memory-mapped configuration space the region spans.
     ///
     /// Each bus contributes 1 MiB: 32 devices x 8 functions x 4 KiB.
+    #[cfg(test)]
     pub const fn size(&self) -> u64 {
         self.bus_count() as u64 * (1 << 20)
     }
@@ -82,6 +84,10 @@ impl ConfigRegion {
 /// a short or lying length field, a wrong signature, a revision below 1, a
 /// checksum that does not add to zero, or a trailing partial entry.  Such a
 /// table is firmware corruption; the caller falls back to configuration.
+///
+/// Boot uses [`parse_regions`] directly, because the boot log reports *why* a
+/// table was rejected.  This `Option`-shaped wrapper is the tests' shorthand.
+#[cfg(test)]
 pub fn parse(bytes: &[u8]) -> Option<heapless::Vec<ConfigRegion, MAX_REGIONS>> {
     parse_regions(bytes).ok()
 }

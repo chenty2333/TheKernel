@@ -241,8 +241,12 @@ BUSYBOX_BUILD="$WORK_ROOT/busybox-build"
 mkdir -p "$BUSYBOX_BUILD"
 install -m 0644 "$REPO_ROOT/tests/rootfs/busybox-${BUSYBOX_VERSION}.config" \
     "$BUSYBOX_BUILD/.config"
+# BusyBox's own kconfig host tool is compiled here, before any .config-supplied
+# flags can reach it, and its single diagnostic is one more instance of the
+# third-party noise the target flags below exist to keep out of `make run`.
 KCONFIG_NOTIMESTAMP=1 make -C "$SOURCE_DIR" O="$BUSYBOX_BUILD" \
-    ARCH="$BUSYBOX_ARCH" CROSS_COMPILE="$CROSS_COMPILE" silentoldconfig </dev/null
+    ARCH="$BUSYBOX_ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+    HOSTCFLAGS="-Wno-discarded-qualifiers" silentoldconfig </dev/null
 KCONFIG_NOTIMESTAMP=1 make -C "$BUSYBOX_BUILD" ARCH="$BUSYBOX_ARCH" \
     CROSS_COMPILE="$CROSS_COMPILE" -j"$(getconf _NPROCESSORS_ONLN)"
 

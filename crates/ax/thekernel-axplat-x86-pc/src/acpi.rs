@@ -208,7 +208,6 @@ static ECAM_BUS_END: AtomicU32 = AtomicU32::new(0);
 /// 0 = not published, 1 = discovered from MCFG, 2 = configured fallback.
 static ECAM_SOURCE: AtomicU8 = AtomicU8::new(0);
 
-const SOURCE_UNPUBLISHED: u8 = 0;
 const SOURCE_DISCOVERED: u8 = 1;
 const SOURCE_CONFIGURED: u8 = 2;
 

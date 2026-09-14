@@ -195,7 +195,7 @@ impl DemotedHugeBacking {
     fn retain(&self, page_size: PageSize) -> AxResult {
         let units = page_size as usize / PAGE_SIZE_4K;
         self.mapped_units
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(units)
             })
             .map(|_| ())
@@ -206,7 +206,7 @@ impl DemotedHugeBacking {
         let units = page_size as usize / PAGE_SIZE_4K;
         let previous = self
             .mapped_units
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_sub(units)
             })
             .expect("dropping unreferenced demoted huge leaf");
