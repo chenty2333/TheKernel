@@ -598,6 +598,19 @@ static int test_signal_wait_boundary(void) {
         "signal-wait-child");
 }
 
+/* Does a process start a child the way glibc's posix_spawn does?
+ *
+ * Not payload-gated: it needs no payload, and it is the mechanism a
+ * distribution C compiler uses to launch cc1, as and collect2.  Checking it
+ * before staging eighty megabytes of compiler separates "the kernel cannot
+ * launch a child this way" from "a file is missing from the payload". */
+static int test_posix_spawn_smoke(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-posix-spawn-smoke",
+        NULL,
+        "posix-spawn-child");
+}
+
 static int test_pause(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-pause-smoke",
@@ -953,6 +966,7 @@ int main(int argc, char **argv) {
         { "vfork", test_vfork, 60 },
         { "signal-mask-alias", test_signal_mask_alias, 60 },
         { "signal-wait", test_signal_wait_boundary, 60 },
+        { "posix-spawn", test_posix_spawn_smoke, 60 },
         { "pause", test_pause, 60 },
         { "alarm", test_alarm, 60 },
         { "wait-boundary", test_wait_boundary, 60 },
