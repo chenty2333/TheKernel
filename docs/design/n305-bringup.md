@@ -162,6 +162,20 @@ is the table that says so".
 asserts the whole pipeline works. It proves nothing about the N305: QEMU is not
 that machine.
 
+**Its guest half does not currently pass, and the `--out` guard is not the
+reason.** Booting the image under OVMF reaches Alpine's `localhost login:`
+prompt, the run ends at its boot timeout, and the image contains no
+`dump/n305-*` directory: the capture wrote no bundle and the guest never powered
+itself off. An image built from this script before the guard existed behaves
+identically -- the two differ only in tar member mtimes and the FAT volume
+serial, and their screen frames are byte-identical -- so the failure predates
+that change. What is not established is why: the vendor ISO boots with `quiet`,
+the capture writes to the screen, and the serial console carries neither the
+initramfs apkovl scan nor the service output, so "the apkovl was not applied"
+and "the payload failed before its first write" cannot be told apart from this
+run. Until that is settled, the image's end-to-end behaviour is asserted by this
+selfcheck alone, and it fails.
+
 ## 2. Acceptance (a): the kernel boots and its log is visible on screen
 
 ### 2.1 Build the shell profile, and why not the system profile
