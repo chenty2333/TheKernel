@@ -459,11 +459,36 @@ class SystemTestGateTests(unittest.TestCase):
         product = load_product()
         with test_tmpdir() as directory:
             artifacts = product.Artifacts(Path(directory), product.Variant("1G"))
-            with patch.object(product, "rootfs_fingerprint", side_effect=["before", "after"]), \
+            # The repository half changes while its own image is being built, so
+            # the image is a mixture of two revisions and no stamp describes it.
+            with patch.object(product, "rootfs_fingerprint",
+                              side_effect=["before", "after"]), \
+                    patch.object(product, "guest_tools_fingerprint",
+                                 return_value="payload"), \
                     patch.object(product, "run_checked"):
                 with self.assertRaisesRegex(product.ProductError, "changed during compilation"):
                     product.build_rootfs(artifacts)
             self.assertFalse(product.rootfs_stamp_path(artifacts).exists())
+
+    def test_rebuilt_payload_does_not_stop_the_stamp_being_written(self) -> None:
+        product = load_product()
+        with test_tmpdir() as directory:
+            artifacts = product.Artifacts(Path(directory), product.Variant("1G"))
+            # The payload is rebuilt during the build, on purpose, and its bytes
+            # are not reproducible -- tcc's own archive differs between two
+            # builds of identical inputs.  That must not be read as the inputs
+            # changing underneath the build, or no tcc image could ever be
+            # published.  The stamp has to describe the payload that was
+            # actually embedded, which is the post-build read.
+            with patch.object(product, "rootfs_fingerprint",
+                              side_effect=["repo", "repo"]), \
+                    patch.object(product, "guest_tools_fingerprint",
+                                 return_value="payload"), \
+                    patch.object(product, "run_checked"):
+                product.build_rootfs(artifacts)
+            stamp = product.rootfs_stamp_path(artifacts)
+            self.assertTrue(stamp.exists())
+            self.assertEqual(stamp.read_text().strip(), "repo:payload")
 
     def test_kernel_inputs_changing_during_build_do_not_publish_success_stamp(self) -> None:
         product = load_product()

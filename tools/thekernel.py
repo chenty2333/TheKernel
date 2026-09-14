@@ -355,15 +355,12 @@ def build_rootfs(artifacts: Artifacts) -> None:
     artifacts.rootfs.parent.mkdir(parents=True, exist_ok=True)
     payload = selected_tool_payload()
     tools_dir = guest_tools_dir(artifacts.root, payload)
-    # Two inputs decide the image: the repository files (and environment
-    # switches) hashed by the repository fingerprint, and the staged payload
-    # the image embeds.  Both are read from disk before anything is rebuilt, so
-    # the decision to reuse an image is made against what is actually there.
-    # One identity for the image, computed one way.  The staged payload is part
-    # of it because the image embeds that tree.
-    inputs_before = rootfs_fingerprint()
-    staged = guest_tools_fingerprint(artifacts.root, payload)
-    fingerprint = rootfs_image_fingerprint(artifacts, payload)
+    # The image's identity is the repository inputs plus the staged payload the
+    # image embeds, read from disk before anything is rebuilt so the decision to
+    # reuse an image is made against what is actually there.
+    git_before = rootfs_fingerprint()
+    payload_before = guest_tools_fingerprint(artifacts.root, payload)
+    fingerprint = f"{git_before}:{payload_before}"
     stamp = rootfs_stamp_path(artifacts)
     if (
         artifacts.rootfs.is_file()
@@ -407,21 +404,40 @@ def build_rootfs(artifacts: Artifacts) -> None:
         ],
         env=env,
     )
-    if payload != "none":
-        # The payload is normally rebuilt above, so this is the value that
-        # describes the tree the image was actually made from -- not the one
-        # that happened to be on disk a moment earlier.
-        staged = guest_tools_fingerprint(artifacts.root, payload)
-    inputs_after = rootfs_fingerprint()
-    if inputs_after != inputs_before or f"{inputs_after}:{staged}" != fingerprint:
+    # The stamp records what the image was actually made from: both inputs are
+    # re-read now, because the payload was normally rebuilt just above and
+    # describing it from the pre-build read would name a tree that no longer
+    # exists.  This is the value the next run's reuse decision compares against.
+    #
+    # Nothing here requires the *build* to be reproducible, and that distinction
+    # matters: the tcc payload contains an archive whose bytes differ between
+    # two builds of identical inputs, so demanding pre-build == post-build would
+    # refuse every tcc image.  What has to hold is that the image and its stamp
+    # describe the same tree, and they do, because both are read after the
+    # build.
+    git_after = rootfs_fingerprint()
+    payload_after = guest_tools_fingerprint(artifacts.root, payload)
+    rebuilt = f"{git_after}:{payload_after}"
+    if git_after != git_before:
+        # The repository side must not change while its own image is being
+        # built; if it did, the image is a mixture of two revisions and no
+        # single stamp describes it.  The payload side is deliberately not
+        # compared: it is rebuilt above, on purpose, and its bytes need not be
+        # reproducible for the image and the stamp to agree.
         if os.environ.get("THEKERNEL_DEBUG_FINGERPRINT"):
             print(
-                f"fingerprint before: repo={inputs_before[:16]} staged={fingerprint.split(':')[1][:16]}\n"
-                f"fingerprint after : repo={inputs_after[:16]} staged={staged[:16]}",
+                f"fingerprint before: repo={git_before[:16]} payload={payload_before[:16]}\n"
+                f"fingerprint after : repo={git_after[:16]} payload={payload_after[:16]}",
                 file=sys.stderr,
             )
         raise ProductError("rootfs build inputs changed during compilation; rebuild before running")
-    stamp.write_text(f"{inputs_after}:{staged}\n", encoding="utf-8")
+    if os.environ.get("THEKERNEL_DEBUG_FINGERPRINT"):
+        print(
+            f"fingerprint before: repo={git_before[:16]} payload={payload_before[:16]}\n"
+            f"fingerprint after : repo={git_after[:16]} payload={payload_after[:16]}",
+            file=sys.stderr,
+        )
+    stamp.write_text(f"{rebuilt}\n", encoding="utf-8")
 
 
 @serialized_build
