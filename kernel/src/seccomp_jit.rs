@@ -512,6 +512,33 @@ mod tests {
 
     use super::*;
 
+    // Match FilterChain's native-input ABI rather than relying on the
+    // incidental address of a byte-array literal. The spare byte also lets
+    // the boundary test construct an exactly 64-byte misaligned view.
+    #[repr(align(4))]
+    struct AlignedInput([u8; thekernel_linux_seccomp::SECCOMP_DATA_SIZE + 1]);
+
+    impl AlignedInput {
+        fn zeroed() -> Self {
+            Self([0; thekernel_linux_seccomp::SECCOMP_DATA_SIZE + 1])
+        }
+
+        fn bytes(&self) -> &[u8] {
+            &self.0[..thekernel_linux_seccomp::SECCOMP_DATA_SIZE]
+        }
+    }
+
+    #[cfg(feature = "test-io-control")]
+    struct RestoreExecutorPolicies((ExecutorPolicy, ExecutorPolicy));
+
+    #[cfg(feature = "test-io-control")]
+    impl Drop for RestoreExecutorPolicies {
+        fn drop(&mut self) {
+            let (seccomp, packet) = self.0;
+            set_executor_policies_for_control(Some(seccomp), Some(packet));
+        }
+    }
+
     fn allow_program() -> VerifiedProgram {
         VerifiedProgram::try_from_vec(vec![ClassicBpfInstruction::new(
             opcode::RET_K,
@@ -552,25 +579,53 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn interpreter_enforces_the_native_snapshot_alignment_boundary() {
+        let executor =
+            try_compile_with_policy(&allow_program(), ExecutorPolicy::Interpreter).unwrap();
+        let input = AlignedInput::zeroed();
+        assert_eq!(executor.execute(input.bytes()), SECCOMP_RET_ALLOW);
+        let unaligned = &input.0[1..];
+        assert_eq!(unaligned.len(), thekernel_linux_seccomp::SECCOMP_DATA_SIZE);
+        assert_eq!(executor.execute(unaligned), 0);
+    }
+
+    #[cfg(feature = "test-io-control")]
+    #[test]
+    fn control_policy_guard_restores_both_domains_during_unwind() {
+        let old = executor_policies();
+        let panic = std::panic::catch_unwind(|| {
+            let _restore = RestoreExecutorPolicies(executor_policies());
+            set_executor_policies_for_control(
+                Some(ExecutorPolicy::Interpreter),
+                Some(ExecutorPolicy::Jit),
+            );
+            panic!("synthetic assertion failure after policy change");
+        });
+        assert!(panic.is_err());
+        assert_eq!(executor_policies(), old);
+    }
+
     #[cfg(feature = "test-io-control")]
     #[test]
     fn control_policy_changes_only_future_seccomp_admissions() {
-        let old = executor_policies();
+        let _restore = RestoreExecutorPolicies(executor_policies());
         set_executor_policies_for_control(Some(ExecutorPolicy::Interpreter), None);
         let old_program_executor = try_compile(&allow_program()).unwrap();
         set_executor_policies_for_control(Some(ExecutorPolicy::Jit), None);
         let new_program_executor = try_compile(&allow_program());
 
-        assert_eq!(old_program_executor.execute(&[0; 64]), SECCOMP_RET_ALLOW);
+        assert_eq!(
+            old_program_executor.execute(AlignedInput::zeroed().bytes()),
+            SECCOMP_RET_ALLOW
+        );
         assert!(new_program_executor.is_err());
-
-        set_executor_policies_for_control(Some(old.0), Some(old.1));
     }
 
     #[cfg(feature = "test-io-control")]
     #[test]
     fn control_policies_are_independent() {
-        let old = executor_policies();
+        let _restore = RestoreExecutorPolicies(executor_policies());
         set_executor_policies_for_control(
             Some(ExecutorPolicy::Interpreter),
             Some(ExecutorPolicy::Jit),
@@ -579,7 +634,6 @@ mod tests {
             executor_policies(),
             (ExecutorPolicy::Interpreter, ExecutorPolicy::Jit)
         );
-        set_executor_policies_for_control(Some(old.0), Some(old.1));
     }
 
     #[cfg(not(feature = "bpf"))]
@@ -596,7 +650,10 @@ mod tests {
         let result = try_compile_with_policy(&allow_program(), ExecutorPolicy::Jit);
         match result {
             Ok(executor) => {
-                assert_eq!(executor.execute(&[0; 64]), SECCOMP_RET_ALLOW);
+                assert_eq!(
+                    executor.execute(AlignedInput::zeroed().bytes()),
+                    SECCOMP_RET_ALLOW
+                );
                 let after = counters();
                 assert_eq!(after.native_executed, before.native_executed + 1);
                 assert_eq!(after.interpreter_executed, before.interpreter_executed);
