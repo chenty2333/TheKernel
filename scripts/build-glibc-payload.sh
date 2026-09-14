@@ -150,7 +150,11 @@ mkdir -p "$BUILD_ROOT"
 # --- 1. the pinned RPM ------------------------------------------------------
 
 log "unpacking glibc $GLIBC_RPM_RELEASE"
-glibc_rpm=$(fetch_rpm glibc "$GLIBC_RPM_FILE" "$GLIBC_RPM_SHA256")
+# A failure inside `$( )` exits only the subshell, and `set -e` does not look
+# at an assignment's status, so the call is its own checked statement.
+fetch_rpm glibc "$GLIBC_RPM_FILE" "$GLIBC_RPM_SHA256" > "$BUILD_ROOT/.rpm-path" ||
+    die "cannot fetch glibc"
+glibc_rpm=$(cat "$BUILD_ROOT/.rpm-path")
 if [ ! -e "$RPM_TREE$RPM_LOADER_PATH" ] || [ ! -e "$RPM_TREE$RPM_LIBC_PATH" ]; then
     rm -rf "$RPM_TREE"
     mkdir -p "$RPM_TREE"

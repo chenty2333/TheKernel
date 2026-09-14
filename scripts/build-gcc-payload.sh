@@ -167,7 +167,16 @@ for pin in "${RPM_PINS[@]}"; do
     expected=${rest#*:}
     file="$package-$release.x86_64.rpm"
 
-    rpm=$(fetch_rpm "$package" "$file" "$expected")
+    # Assigning the result of a function that can `die` is not enough to stop
+    # the build: a failure inside `$( )` exits only the subshell, and `set -e`
+    # does not inspect an assignment's status.  So the call is its own statement
+    # whose status is checked, and the assignment follows.  Measured while
+    # building from a fresh state directory: without this the build reported a
+    # download failure and then failed much later with "cpio: premature end of
+    # archive", which reads as a corrupt RPM rather than as a failed download.
+    fetch_rpm "$package" "$file" "$expected" > "$BUILD_ROOT/.rpm-path" ||
+        die "cannot fetch $package-$release"
+    rpm=$(cat "$BUILD_ROOT/.rpm-path")
     tree="$RPM_TREE/$package-$release"
     # The marker, not the directory, decides whether the tree is usable.  An
     # interrupted unpack leaves a directory that looks present and is missing
