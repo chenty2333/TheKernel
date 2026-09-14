@@ -35,7 +35,12 @@ done
 LOCAL_SPECS="$MUSL_ROOT/local-musl-gcc.specs"
 sed "s|/usr/x86_64-linux-musl|$MUSL_PREFIX|g" \
     "$MUSL_PREFIX/lib64/musl-gcc.specs" >"$LOCAL_SPECS"
-MUSL_CC="$WORK_ROOT/musl-gcc"
+# The wrapper lives at a stable path, not under the per-run work directory.  It
+# is the compiler recorded in every build system generated from it -- meson
+# bakes it into its configuration and into the commands it regenerates -- so a
+# wrapper under `mktemp -d` makes the generated trees unrepeatable and makes
+# their regeneration fail once the directory is gone.
+MUSL_CC="$MUSL_ROOT/musl-gcc"
 cat >"$MUSL_CC" <<EOF
 #!/bin/sh
 exec "\${REALGCC:-gcc}" "\$@" -specs "$LOCAL_SPECS"

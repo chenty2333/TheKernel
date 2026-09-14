@@ -26,8 +26,9 @@ from tools.product_state import (
     MACHINE_PROFILES, machine_profile,
     state_root, validate_storage, state_lock, serialized_build, isolated_run,
     artifact_config_stamp, artifact_config_key, artifact_input_key, validate_artifact_config,
-    rootfs_stamp_path, rootfs_fingerprint,
+    rootfs_stamp_path, rootfs_fingerprint, rootfs_image_fingerprint,
     TOOL_PAYLOADS, selected_tool_payload, rootfs_image_bytes,
+    guest_tools_dir, guest_tools_fingerprint,
 )
 from tools.verification import verify_cmd
 from tools.ktap import COMPLETION_MARKER, KtapError, reject_ktap_skips, validate_ktap_log
@@ -352,7 +353,17 @@ def build_kernel(
 @serialized_build
 def build_rootfs(artifacts: Artifacts) -> None:
     artifacts.rootfs.parent.mkdir(parents=True, exist_ok=True)
-    fingerprint = rootfs_fingerprint()
+    payload = selected_tool_payload()
+    tools_dir = guest_tools_dir(artifacts.root, payload)
+    # Two inputs decide the image: the repository files (and environment
+    # switches) hashed by the repository fingerprint, and the staged payload
+    # the image embeds.  Both are read from disk before anything is rebuilt, so
+    # the decision to reuse an image is made against what is actually there.
+    # One identity for the image, computed one way.  The staged payload is part
+    # of it because the image embeds that tree.
+    inputs_before = rootfs_fingerprint()
+    staged = guest_tools_fingerprint(artifacts.root, payload)
+    fingerprint = rootfs_image_fingerprint(artifacts, payload)
     stamp = rootfs_stamp_path(artifacts)
     if (
         artifacts.rootfs.is_file()
@@ -362,8 +373,6 @@ def build_rootfs(artifacts: Artifacts) -> None:
         print(f"thekernel: rootfs unchanged, reusing {artifacts.rootfs}", file=sys.stderr)
         return
     stamp.unlink(missing_ok=True)
-    payload = selected_tool_payload()
-    tools_dir = artifacts.root / "guest-tools" / payload
     if payload != "none":
         run_checked(
             [
@@ -395,9 +404,21 @@ def build_rootfs(artifacts: Artifacts) -> None:
         ],
         env=env,
     )
-    if rootfs_fingerprint() != fingerprint:
+    if payload != "none":
+        # The payload is normally rebuilt above, so this is the value that
+        # describes the tree the image was actually made from -- not the one
+        # that happened to be on disk a moment earlier.
+        staged = guest_tools_fingerprint(artifacts.root, payload)
+    inputs_after = rootfs_fingerprint()
+    if inputs_after != inputs_before or f"{inputs_after}:{staged}" != fingerprint:
+        if os.environ.get("THEKERNEL_DEBUG_FINGERPRINT"):
+            print(
+                f"fingerprint before: repo={inputs_before[:16]} staged={fingerprint.split(':')[1][:16]}\n"
+                f"fingerprint after : repo={inputs_after[:16]} staged={staged[:16]}",
+                file=sys.stderr,
+            )
         raise ProductError("rootfs build inputs changed during compilation; rebuild before running")
-    stamp.write_text(fingerprint + "\n", encoding="utf-8")
+    stamp.write_text(f"{inputs_after}:{staged}\n", encoding="utf-8")
 
 
 @serialized_build

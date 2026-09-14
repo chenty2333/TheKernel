@@ -271,7 +271,10 @@ def validate_artifact_config(artifacts: Artifacts, rootfs: Path | None, transpor
     image = (rootfs or artifacts.rootfs).resolve()
     if image == artifacts.rootfs.resolve():
         try:
-            current_tests = rootfs_stamp_path(artifacts).read_text().strip() == rootfs_fingerprint()
+            current_tests = (
+                rootfs_stamp_path(artifacts).read_text().strip()
+                == rootfs_image_fingerprint(artifacts, selected_tool_payload())
+            )
         except OSError:
             current_tests = False
         if not current_tests:
@@ -353,6 +356,71 @@ def rootfs_image_bytes(payload: str) -> int:
 
 def rootfs_stamp_path(artifacts: Artifacts) -> Path:
     return artifacts.rootfs.with_name(artifacts.rootfs.name + ".stamp")
+
+
+def rootfs_image_fingerprint(artifacts: Artifacts, payload: str) -> str:
+    """The identity of the image a rootfs build would produce.
+
+    Two things go into the image and therefore into its identity: the
+    repository-side build inputs, and the staged tool payload the image embeds.
+    They are combined here, in one place, because the writer and the reader of
+    the stamp must agree exactly.  They did not: the build wrote the pair while
+    the validator compared the repository half alone, so every run after a
+    successful build reported "guest test sources or rootfs build inputs
+    changed; rebuild before running" and refused to test an image it had just
+    built correctly.
+    """
+
+    return f"{rootfs_fingerprint()}:{guest_tools_fingerprint(artifacts.root, payload)}"
+
+
+def guest_tools_dir(root, payload: str):
+    """Where build-guest-tools.sh stages `payload` under the state root."""
+
+    return Path(root) / "guest-tools" / payload
+
+
+def guest_tools_fingerprint(root, payload: str) -> str:
+    """Identify the staged guest tool payload a rootfs image would be built from.
+
+    The rootfs image embeds this tree, so a change in it has to change the
+    image.  Without this, rebuilding the payload and rebuilding the image were
+    independent events: an image built from a payload that lacked the compiler
+    was reused for a payload that had it, and the extra case the image's own
+    plan promised then failed inside the guest.  That failure is reported by
+    the suite as a compiler that is not there, which points at the compiler
+    rather than at a stale image.
+
+    Content is hashed, not timestamps.  The payload is rebuilt on every build,
+    so every file it contains gets a fresh modification time even when its
+    bytes are identical -- which is the normal case.  A timestamp-based
+    fingerprint therefore reports a change on every single run, and a check
+    that compares the payload before and after a rebuild can never agree with
+    itself.  Content is what decides whether the embedded image differs, so
+    content is what is hashed.  It costs a few hundred milliseconds over the
+    payload's hundred MiB, and only when a tool payload is selected at all.
+    """
+
+    directory = guest_tools_dir(root, payload)
+    if not directory.is_dir():
+        return "absent"
+    digest = hashlib.sha256()
+    entries = sorted(
+        path for path in directory.rglob("*") if path.is_file() or path.is_symlink()
+    )
+    for path in entries:
+        relative = path.relative_to(directory).as_posix().encode()
+        digest.update(len(relative).to_bytes(8, "little"))
+        digest.update(relative)
+        if path.is_symlink():
+            # A symlink's own content is its target; the payload uses them to
+            # deduplicate libc.a and the header tree, so the target matters.
+            digest.update(b"->" + os.readlink(path).encode())
+        elif path.is_file():
+            content = path.read_bytes()
+            digest.update(len(content).to_bytes(8, "little"))
+            digest.update(content)
+    return digest.hexdigest()
 
 
 def rootfs_fingerprint() -> str:

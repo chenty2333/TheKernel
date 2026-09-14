@@ -252,18 +252,37 @@ runtime support rather than assuming that ordinary ELF output proves `-run`.
   leans on glibc assumptions, so validate the host build before any guest
   experiment, using Alpine's qemu aport as the reference for musl-specific
   patches and configure options.
-* Boot the inner machine with `-kernel`/`-initrd`/`-append`, skipping firmware
-  entirely — firmware POST under TCG is a significant share of boot time.
+* Boot the inner machine with `-kernel`/`-initrd`/`-append`, which removes the
+  *need* to install a bootloader and to walk firmware tables. It does **not**
+  remove firmware: on `pc`/`q35` QEMU still loads and executes SeaBIOS
+  (`bios-256k.bin`) before the kernel, and it needs that blob on disk at run
+  time. **Measured**: a QEMU binary staged away from its data directory dies
+  instantly with `qemu: could not load PC BIOS 'bios-256k.bin'`, inside the
+  guest as well as on the host. The payload must therefore ship QEMU's data
+  directory and pass `-L <dir>`; see section 6. `microvm` is not
+  firmware-free either — it needs `bios-microvm.bin` and `linuxboot_dma.bin`.
   Use the `pc`/`q35` machine by default so ACPI poweroff satisfies the
   normal-shutdown condition below. Consider `microvm` only after verifying
   that its optional ACPI provides a working S5 path on the pinned QEMU
   version; do not assume it.
 * Stage the boot in three rungs, each with its own acceptance:
   1. **Freestanding hello kernel (Phase 2a).** A minimal `-kernel`-loadable
-     ELF that prints a serial banner and exits QEMU through `isa-debug-exit`
-     with a fixed result code. Boots in seconds and isolates "TCG works in
-     TheKernel userspace" from "Linux boot is slow". Add guest case
-     `nested-tcg-hello` for it.
+     ELF that prints a serial banner and then powers the inner machine off
+     with an ACPI S5 transition. Boots in seconds and isolates "TCG works in
+     TheKernel userspace" from "Linux boot is slow". Guest case
+     `nested-tcg-hello`.
+     The image is built in two flavours from one source, selected at compile
+     time: the default one exits through `isa-debug-exit` with a fixed result
+     code, and `HELLO_ACPI_SHUTDOWN=1` replaces that with the S5 write. The
+     distinction is not cosmetic. `isa-debug-exit` is a *forced exit of the
+     emulator process* — QEMU documents it as a debugging device — so it can
+     prove "the inner code ran and reached this point" but it can never
+     satisfy an acceptance condition that requires a normal shutdown. The
+     case therefore boots the S5 flavour with **no `isa-debug-exit` device
+     configured at all**, which also means a forced-exit shortcut cannot
+     produce exit status 0 and a wedged inner boot surfaces as the case's
+     bounded deadline instead of as a pass. Exercising S5 here is what makes
+     Phase 2b's shutdown condition a known quantity rather than a hope.
   2. **Alpine Linux (Phase 2b — the nested-Linux acceptance target).** A
      pinned Alpine release: the `linux-virt` kernel flavour plus the
      minirootfs (musl + BusyBox), staged from host-downloaded release
@@ -271,6 +290,14 @@ runtime support rather than assuming that ordinary ELF output proves `-run`.
      real, widely used distribution kernel and userland"; the narrowing is
      accepted. No `apk`, no guest networking. A prebuilt VM-oriented kernel
      is preferred here over maintaining a custom config from the start.
+     **Measured**: `vmlinuz-virt` boots correctly with `-kernel` and honours an
+     externally supplied `-initrd`, but the distribution's own
+     `initramfs-virt` is unusable in this topology — with no disk, no CD-ROM
+     and no network it cannot find the media needed to mount `modloop-virt`
+     and falls back to an emergency shell. The kernel is fine; the distro's
+     initramfs is not. A minimal initramfs built from the minirootfs replaces
+     it, and the boot then reports PID 1, an `INNER_` marker set and the
+     kernel's own `reboot: Power down` S5 path.
   3. **Custom trimmed kernel (Phase 2c, conditional).** Only if the measured
      Phase 2b boot time breaks the runner timeout budget. Build up from
      `tinyconfig`, not down from `defconfig`: no modules, serial plus the
@@ -433,13 +460,81 @@ banner, reads its CPU mode back from hardware, and exits QEMU through
 `isa-debug-exit` with status **33**, in about **0.1 s**, identically under TCG
 and KVM.
 
-The nested payload is not yet wired into the image, and **QEMU itself has not
-been built yet**. Its dependency question is the plan's largest open risk: the
-static musl build needs static `glib-2.0`, `pcre2`, `libffi` and `zlib`
-archives, and upstream states that most libraries used by system-mode
-emulation are not available for static linking. The dependency stack is being
-built from pinned sources as the next step; until that resolves, no claim is
-made about the nested boot.
+The static-musl dependency question — the plan's largest open risk — **is
+resolved: yes, the stack exists and links.** Upstream's warning is about
+libraries it does not control; the four that system-mode x86_64 emulation
+actually needs are all buildable as static musl archives from pinned sources,
+and the build proves it by using them:
+
+| Library | Version | Result |
+|---|---|---|
+| zlib | 1.3.1 | static, one pass |
+| libffi | 3.4.6 | static; needs the kernel UAPI headers, which musl does not ship |
+| pcre2 | 10.44 | static, one pass |
+| GLib (`glib-2.0`, `gobject-2.0`, `gio-2.0`, `gmodule-2.0`, `gthread-2.0`) | 2.88.3 | static, 596/596 targets |
+
+`pkg-config --static --libs glib-2.0` in a musl-only sysroot reports
+`-lglib-2.0 -lm -pthread -lpcre2-8`, `pkg-config --list-all` shows only
+sysroot packages, and a GLib program links with no dynamic section, reports
+`not a dynamic executable`, and runs. QEMU 11.1.1 then builds with
+`--target-list=x86_64-softmmu --without-default-features --static`, TCG
+backend native x86_64, and produces a **25 MiB stripped static executable**
+with no `DT_NEEDED` and no glibc-libatomic symbols.
+
+Three things that were not obvious and are now pinned in the build script:
+
+1. **GLib needs an `exe_wrapper` when cross-built.** It has 22 `cc.run()`
+   probes and two target programs it must execute during setup. Given a
+   passthrough wrapper — correct here, because the target is x86_64-linux-musl
+   and the static target binaries run natively on the build machine — the
+   answers are musl's real answers (`Checking if "C99 vsnprintf" runs: YES`).
+   Without one, every probe silently falls back and GLib compiles in its
+   gnulib printf replacements. The build script now *requires* that log line
+   rather than assuming the wrapper worked.
+2. **`-latomic` must not be used.** Meson writes it into `glib-2.0.pc`, and
+   the only `libatomic.a` reachable on this host is Fedora's glibc build.
+   Linking it into a musl binary produces something that starts, runs, and
+   then dies with no diagnostic (measured: `exit=160` at the first 16-byte
+   atomic, because glibc's `libat_lock_n` calls `__pthread_mutex_lock` with a
+   glibc-layout mutex). The script removes the flag so a real 16-byte-atomic
+   requirement fails loudly at link time instead. QEMU 11.1.1 independently
+   agrees: its build adds `-fno-link-libatomic` for system-mode builds, so the
+   emulator needs no musl libatomic at all.
+3. **The emulator needs QEMU's data directory, and it needs all of it.**
+   See the firmware correction in section 5; the payload ships `share/qemu`
+   and the guest helper passes `-L`. A full install is 316 MiB because it
+   carries the EDK2 blobs for four non-x86 architectures, so staging is an
+   explicit allowlist — and an allowlist is exactly the kind of thing that
+   passes its own test and fails someone else's. The first version omitted the
+   network option ROMs on the correct-sounding grounds that the inner machine
+   boots with `-nodefaults` and has no network; a plain `-machine pc` run then
+   died with `failed to find romfile "efi-e1000.rom"`. The lesson generalises:
+   **a smoke test that uses only your own command line certifies only your own
+   command line.** The build now smoke-tests with QEMU's *default* device set
+   (VGA and a NIC, so both families of option ROM are exercised) and fails on
+   any "could not load" line in QEMU's output, so the completeness of the
+   staged data directory is a property the build checks rather than one it
+   assumes. The payload is 25 MiB, of which 18 MiB is that data directory.
+
+**Phase 2a is implemented and measured on the host.** The guest case
+`nested-tcg-hello` exists, is selected only by the `nested` payload, and is
+`1..` in the plan for that image:
+
+| Quantity | Measured |
+|---|---|
+| Inner image boot, host TCG | 58–243 ms |
+| Inner QEMU exit status | **0** (ACPI S5, not a forced exit) |
+| Emulator | 25 MiB stripped, static, TCG only |
+| Nested payload, installed | 25 MiB (69 MiB before stripping) |
+| Guest-case deadline | 60 s, from the ~46x double-emulation factor below |
+
+The 60 s deadline is not a guess. Booting a **full Alpine Linux kernel** under
+this same double emulation was measured at **86.3 s** versus **1.86 s** on host
+TCG — a factor of **46** — so any deadline derived from the host figure would
+spuriously fail. That measurement also settles Phase 2c: the plan made a custom
+trimmed kernel conditional on the nested boot time breaking the runner budget,
+and with a ~120 s inner phase the budget holds, so **Phase 2c is not needed**.
+
 
 ## 7. Minimal integration with existing entry points
 

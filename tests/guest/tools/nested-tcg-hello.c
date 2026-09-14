@@ -134,6 +134,12 @@
 #define KERNEL_ENV "THEKERNEL_NESTED_KERNEL"
 #define DEFAULT_QEMU "/opt/thekernel-tools/bin/qemu-system-x86_64"
 #define DEFAULT_KERNEL "/opt/thekernel-tools/payloads/hello-acpi.elf"
+/* QEMU finds its firmware data relative to the binary, and the payload lives
+ * under /opt, so the search path is given explicitly rather than guessed.  A
+ * missing data directory is not a warning: QEMU exits before it ever loads the
+ * inner image ("could not load PC BIOS 'bios-256k.bin'"). */
+#define QEMU_DATA_ENV "THEKERNEL_NESTED_QEMU_DATA"
+#define DEFAULT_QEMU_DATA "/opt/thekernel-tools/share"
 
 /* Inner machine sizing.  The inner kernel is freestanding and needs a few MiB,
  * but QEMU's own TCG start-up cost dominates, so the inner RAM is kept small
@@ -142,11 +148,18 @@
 #define INNER_ACCEL "tcg"
 #define INNER_CPU_MODEL "qemu64"
 
-/* Deadlines.  Measured on the host at ~0.10 s for this image, so the budget is
- * three orders of magnitude of headroom for a TCG-under-TCG guest; it exists
- * to bound a wedged emulator, not to measure performance.  The runner's own
- * case timeout must exceed NESTED_TIMEOUT_MS plus the kill grace. */
-#define NESTED_TIMEOUT_MS 20000
+/* Deadlines.  This image boots in ~0.1 s on the host and was measured at
+ * ~0.2 s under TCG.  The budget is sized from the neighbouring measurement
+ * rather than from the host figure: booting a full Alpine Linux kernel under
+ * this same double emulation takes ~86 s, roughly 46x its host time.  Scaling
+ * this image's host time by that factor would still leave a wide margin, but
+ * the factor is for a much heavier guest, so 60 s is generous on purpose.
+ *
+ * The budget exists to bound a wedged emulator, not to measure performance,
+ * and a failure costs the whole budget -- so it is not raised further without
+ * evidence.  The runner's own case timeout must exceed NESTED_TIMEOUT_MS plus
+ * the kill grace. */
+#define NESTED_TIMEOUT_MS 60000
 #define KILL_GRACE_MS 5000
 #define POLL_SLICE_MS 100
 
@@ -608,7 +621,8 @@ static void child_reap(struct child *child)
  *   -1  a setup or read error; errno is set
  */
 static int run_emulator(struct child *child, const char *qemu, const char *kernel,
-                        struct transcript *t, int64_t *exit_status, int64_t *elapsed_ms)
+                        const char *data, struct transcript *t, int64_t *exit_status,
+                        int64_t *elapsed_ms)
 {
     int pipe_fds[2];
     char memory_argument[64];
@@ -636,6 +650,7 @@ static int run_emulator(struct child *child, const char *qemu, const char *kerne
     if (child->pid == 0) {
         char *const arguments[] = {
             (char *)qemu,
+            (char *)"-L", (char *)data,
             (char *)"-accel", (char *)INNER_ACCEL,
             (char *)"-cpu", (char *)INNER_CPU_MODEL,
             (char *)"-m", memory_argument,
@@ -776,6 +791,7 @@ int main(void)
 {
     const char *qemu = getenv(QEMU_ENV);
     const char *kernel = getenv(KERNEL_ENV);
+    const char *data = getenv(QEMU_DATA_ENV);
     struct elf_report qemu_report, kernel_report;
     struct transcript t;
     struct child child = { -1, -1 };
@@ -791,9 +807,12 @@ int main(void)
     if (kernel == NULL || kernel[0] == '\0') {
         kernel = DEFAULT_KERNEL;
     }
+    if (data == NULL || data[0] == '\0') {
+        data = DEFAULT_QEMU_DATA;
+    }
 
-    emit("THEKERNEL_NESTED_TCG_HELLO_INTERFACE qemu=%s kernel=%s timeout_ms=%d",
-         qemu, kernel, NESTED_TIMEOUT_MS);
+    emit("THEKERNEL_NESTED_TCG_HELLO_INTERFACE qemu=%s kernel=%s data=%s timeout_ms=%d",
+         qemu, kernel, data, NESTED_TIMEOUT_MS);
 
     /* Stage 1: the emulator must be a static x86_64 executable.  Checked
      * before running it, because a dynamic emulator's failure would otherwise
@@ -847,7 +866,7 @@ int main(void)
 
     /* Stage 3: run it.  This is the claim under test. */
     transcript_init(&t);
-    outcome = run_emulator(&child, qemu, kernel, &t, &exit_status, &elapsed_ms);
+    outcome = run_emulator(&child, qemu, kernel, data, &t, &exit_status, &elapsed_ms);
     if (outcome < 0) {
         fail("run-emulator", "fork-and-read", "path=%s", qemu);
         return 1;

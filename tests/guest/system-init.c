@@ -415,6 +415,18 @@ static int test_nested_tcg_hello(void) {
         NULL,
         "nested-tcg-hello-child");
 }
+
+/* Phase 2b: a real Linux distribution -- Alpine, unmodified -- boots inside the
+ * guest under that same emulator.  Its four conditions are the design's: the
+ * inner workload reports INNER_ markers, the inner OS shuts down normally, the
+ * emulator's exit status is checked, and the outer suite still completes.  The
+ * first three belong to the helper; the fourth is this table. */
+static int test_nested_linux_boot(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-nested-linux-boot",
+        NULL,
+        "nested-linux-boot-child");
+}
 #endif
 
 static int test_ioprio(void) {
@@ -859,7 +871,11 @@ int main(int argc, char **argv) {
         { "compiler-smoke", test_compiler_smoke, 120 },
 #endif
 #if defined(THEKERNEL_TOOL_PAYLOAD_NESTED)
-        { "nested-tcg-hello", test_nested_tcg_hello, 180 },
+        { "nested-tcg-hello", test_nested_tcg_hello, 300 },
+        /* The helper's own inner deadline is 180 s plus a 5 s kill grace, so
+         * this must exceed both; a slower failure would otherwise be reported
+         * as a runner timeout rather than as the condition that broke. */
+        { "nested-linux-boot", test_nested_linux_boot, 300 },
 #endif
         { "io-uring", test_io_uring, 60 },
         { "io-uring-trace", test_io_uring_trace, 60 },
