@@ -336,6 +336,41 @@ class TextCellOracleTests(unittest.TestCase):
         self.assertIn("did not settle within 12.5s", str(error))
         self.assertIn("ok 1 - mounts", str(error))
 
+    def test_qmp_disconnect_retains_only_the_current_unsettled_oracle(self) -> None:
+        from tools.qemu_runner.process import _QmpController
+
+        for settled in (False, True):
+            with self.subTest(settled=settled), test_tmpdir() as directory:
+                root = Path(directory)
+                controller = _QmpController(
+                    socket_path=root / "qmp.sock", screenshot=None, input_events=(),
+                    input_after_marker=None, screenshot_after_marker=None, timeout_secs=5,
+                    screenshot_size=None, screenshot_color_blocks=(), checkpoints=(
+                        QmpCheckpoint(input_after_marker="", screenshot=root / "first.ppm"),
+                        QmpCheckpoint(input_after_marker="", screenshot=root / "next.ppm"),
+                    ),
+                )
+                first = _ScreenshotColorMismatch("first frame lacks expected text")
+                latest = _ScreenshotColorMismatch("latest frame still lacks expected text")
+                # Capabilities, two screendumps, then either another retry or
+                # the next checkpoint loses its monitor connection.
+                with mock.patch.object(controller, "_connect"), \
+                     mock.patch.object(controller, "_read_json", return_value={"QMP": {}}), \
+                     mock.patch.object(controller, "_request", side_effect=[
+                         {}, {}, {}, ProcessError("QMP disconnected during screendump"),
+                     ]), \
+                     mock.patch("tools.qemu_runner.process._validate_ppm",
+                                side_effect=[first, None if settled else latest]):
+                    controller._run()
+                self.assertFalse(controller.complete)
+                self.assertIn("QMP disconnected during screendump", str(controller.error))
+                self.assertNotIn(str(first), str(controller.error))
+                if settled:
+                    self.assertNotIn("Last screenshot mismatch", str(controller.error))
+                else:
+                    self.assertIn("Last screenshot mismatch", str(controller.error))
+                    self.assertIn(str(latest), str(controller.error))
+
     def test_text_cell_expectation_is_validated_before_any_image_is_read(self) -> None:
         for cells, message in (
             (QmpTextCells(x=-1), "non-negative origin"),

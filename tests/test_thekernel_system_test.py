@@ -517,6 +517,36 @@ class SystemTestGateTests(unittest.TestCase):
         self.assertEqual(observed["extra_args"], (
             "-d", "guest_errors,cpu_reset,int", "-D", str(root / "run" / "qemu-debug.log")))
 
+    def test_failed_marker_stop_does_not_claim_the_marker_was_missing(self) -> None:
+        from io import StringIO
+        from types import SimpleNamespace
+
+        product = load_product()
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            artifacts = product.Artifacts(root / "state", product.Variant(memory="1G"), "system")
+            for path in (artifacts.kernel, artifacts.esp, artifacts.rootfs):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"artifact")
+            result = SimpleNamespace(
+                returncode=4, error_message="QMP control failed: Broken pipe",
+                log_path=root / "console.log", diagnostic_log_path=root / "kernel.log",
+                intentionally_stopped=False,
+            )
+            result.log_path.write_text(product.FBCON_MARKER + "\n", encoding="utf-8")
+            stderr = StringIO()
+            with patch.object(product, "run", return_value=result), patch("sys.stderr", stderr):
+                code = product.run_product.__wrapped__(artifacts, product.RunSpec(
+                    accel="kvm", timeout=30, workdir=root / "run", interactive=False,
+                    input_after_marker=None, stop_after_marker=product.FBCON_MARKER,
+                    commands=None, extra_block=None, run_cpus=4,
+                ))
+            self.assertEqual(code, 4)
+            self.assertIn(result.error_message, stderr.getvalue())
+            self.assertIn("marker-gated stop/acceptance did not complete", stderr.getvalue())
+            self.assertIn(product.FBCON_MARKER, stderr.getvalue())
+            self.assertNotIn("without completion marker", stderr.getvalue())
+
     def test_run_product_drive_uses_the_separate_drive_esp(self) -> None:
         product = load_product()
         with test_tmpdir() as directory:

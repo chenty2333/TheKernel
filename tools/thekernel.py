@@ -552,7 +552,7 @@ def run_product(artifacts: Artifacts, spec: RunSpec) -> int:
         if result.intentionally_stopped:
             return 0
         print(
-            f"thekernel: guest exited without completion marker: {spec.stop_after_marker}",
+            f"thekernel: marker-gated stop/acceptance did not complete: {spec.stop_after_marker}",
             file=sys.stderr,
         )
         return result.returncode if result.returncode != 0 else 1

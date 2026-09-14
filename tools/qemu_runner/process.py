@@ -683,6 +683,7 @@ class _QmpController:
     def _run(self) -> None:
         deadline = time.monotonic() + self.timeout_secs
         negotiated = False
+        last_mismatch: _ScreenshotColorMismatch | None = None
         try:
             client = self._connect(deadline)
             buffer = bytearray()
@@ -787,8 +788,10 @@ class _QmpController:
                                 checkpoint.screenshot_color_blocks,
                                 checkpoint.screenshot_text_cells,
                             )
+                            last_mismatch = None
                             break
                         except _ScreenshotColorMismatch as mismatch:
+                            last_mismatch = mismatch
                             # The screen may simply not show it yet: the guest
                             # records console cells and repaints behind the
                             # writes.  Retry until the deadline, then report
@@ -856,6 +859,12 @@ class _QmpController:
                                 failure = ProcessError(f"{failure}\nVirtIO GPU state at timeout:\n{state[:8192]}")
                     except (OSError, ValueError):
                         pass  # Diagnostics must not replace the original failure.
+                # A disconnect can end the retry loop before its deadline.
+                # Preserve the actual transport failure and the last reason
+                # this checkpoint was still unaccepted, not an older frame
+                # from a checkpoint which has already passed.
+                if last_mismatch is not None and str(last_mismatch) not in str(failure):
+                    failure = ProcessError(f"{failure}\nLast screenshot mismatch: {last_mismatch}")
                 self.error = failure
         finally:
             with self._lock:
