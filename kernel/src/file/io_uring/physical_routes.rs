@@ -1027,13 +1027,16 @@ pub(super) fn release_physical_completion_owner_set(
     Ok(())
 }
 
-pub(super) fn restore_physical_completion_reset_works(mut works: PhysicalCompletionResetWorks) {
+pub(super) fn restore_physical_completion_reset_works(works: &mut PhysicalCompletionResetWorks) {
+    // This bounded owner slab is large. Borrow it during rollback rather than
+    // materializing a second full slab on the recovery worker's task stack.
     for entry in works.works[..works.len].iter_mut() {
         let Some(entry) = entry.take() else {
             continue;
         };
         let _ = entry.owner.ring.retain_physical_worker_work(entry.work);
     }
+    works.len = 0;
 }
 
 /// Completes the upper reset protocol only after the lower device has
@@ -1059,7 +1062,7 @@ pub(super) fn retire_physical_completion_after_reset_for_device(
             owner.slot,
             owner.generation,
         ) {
-            restore_physical_completion_reset_works(works);
+            restore_physical_completion_reset_works(&mut works);
             return Err(AxError::BadState);
         }
         let Some(work) = owner.ring.take_physical_worker_for_reset_for_device(
@@ -1068,7 +1071,7 @@ pub(super) fn retire_physical_completion_after_reset_for_device(
             owner.slot,
             owner.generation,
         ) else {
-            restore_physical_completion_reset_works(works);
+            restore_physical_completion_reset_works(&mut works);
             return Err(AxError::BadState);
         };
         works.works[works.len] = Some(PhysicalCompletionResetWork {
@@ -1084,7 +1087,7 @@ pub(super) fn retire_physical_completion_after_reset_for_device(
         works.len += 1;
     }
     if let Err(error) = release_physical_completion_owner_set(&owners) {
-        restore_physical_completion_reset_works(works);
+        restore_physical_completion_reset_works(&mut works);
         return Err(error);
     }
     for entry in works.works[..works.len].iter_mut() {

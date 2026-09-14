@@ -91,7 +91,21 @@ fn extracted_physical_slot_is_fenced_until_reinsert_or_drop() {
     drop(reservation);
     assert_eq!(ring.physical_worker_len(), 1);
 
-    ring.retain_physical_worker_work(work).unwrap();
+    let mut rollback = PhysicalCompletionResetWorks::new();
+    rollback.works[0] = Some(PhysicalCompletionResetWork {
+        owner: PhysicalCompletionResetOwner {
+            device_identity: 0,
+            ring: ring.clone(),
+            request: reserve_test_request_id(&ring),
+            slot,
+            generation: 0,
+        },
+        work,
+    });
+    rollback.len = 1;
+    restore_physical_completion_reset_works(&mut rollback);
+    assert_eq!(rollback.len, 0);
+    assert!(rollback.works.iter().all(Option::is_none));
     assert!(!ring.state.lock().physical_slot_reserved[slot]);
     assert_eq!(ring.physical_worker_len(), 1);
 
