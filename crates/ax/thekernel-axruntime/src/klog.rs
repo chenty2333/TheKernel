@@ -302,7 +302,14 @@ impl Filter {
             write!(
                 out,
                 ",{}={}",
-                core::str::from_utf8(&entry.prefix[..entry.len]).unwrap(),
+                // `parse` admits only ASCII alphanumerics and four punctuation
+                // bytes, so this decodes for every prefix the filter can hold.
+                // It is still `unwrap_or` rather than `unwrap`, as `record`
+                // below is: this renders into a file, and a panic in the
+                // kernel's own formatting path is a worse answer to a bad
+                // prefix than printing that it is one.
+                core::str::from_utf8(&entry.prefix[..entry.len])
+                    .unwrap_or("[invalid filter prefix]"),
                 level_name(entry.level)
             )?;
         }
