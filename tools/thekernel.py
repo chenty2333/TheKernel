@@ -1370,9 +1370,11 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
     parser.add_argument(
         "--toolchain",
         choices=TOOL_PAYLOADS,
-        default="none",
+        default=argparse.SUPPRESS,
         help="guest tool payload to build into the image; `none` is the baseline "
-             "image, `tcc` adds a native C compiler and its musl sysroot",
+             "image, `tcc` adds a native C compiler and its musl sysroot.  The "
+             "default follows THEKERNEL_TOOLCHAIN, and passing the flag wins over "
+             "it",
     )
     if profiles:
         parser.add_argument(
@@ -1948,9 +1950,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
         # The payload selection changes which rootfs image is built and which
-        # one the kernel embeds, so it is exported before any command resolves
-        # artifact paths.
-        os.environ["THEKERNEL_TOOLCHAIN"] = selected_tool_payload()
+        # one the kernel embeds, so the parsed `--toolchain` value is exported
+        # before any command resolves artifact paths.  Reading
+        # selected_tool_payload() here instead would just echo the environment
+        # back and silently discard the flag.
+        os.environ["THEKERNEL_TOOLCHAIN"] = selected_tool_payload(
+            getattr(args, "toolchain", None)
+        )
         with state_lock("activity", shared=args.command != "clean", blocking=args.command != "clean"):
             return int(args.func(args))
     except (ProductError, RunnerError, ProcessError, OSError) as error:

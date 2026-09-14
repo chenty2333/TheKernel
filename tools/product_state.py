@@ -317,10 +317,16 @@ ROOTFS_INPUT_ENV = (
 TOOL_PAYLOADS = ("none", "tcc")
 
 
-def selected_tool_payload() -> str:
-    """The guest tool payload this process is building for."""
+def selected_tool_payload(requested: str | None = None) -> str:
+    """The guest tool payload this process is building for.
 
-    payload = os.environ.get("THEKERNEL_TOOLCHAIN", "none").strip() or "none"
+    `requested` is the parsed `--toolchain` value; it takes precedence over
+    THEKERNEL_TOOLCHAIN so the flag is never silently discarded by an exported
+    environment variable.  Callers without the flag pass nothing and inherit
+    the environment.
+    """
+
+    payload = (requested or os.environ.get("THEKERNEL_TOOLCHAIN", "")).strip() or "none"
     if payload not in TOOL_PAYLOADS:
         raise ProductError(
             f"unknown guest tool payload {payload!r}; expected one of "

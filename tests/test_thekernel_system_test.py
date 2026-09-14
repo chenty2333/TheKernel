@@ -100,6 +100,43 @@ class SystemTestGateTests(unittest.TestCase):
                 source.rename(root / "second" / "probe.c")
                 self.assertNotEqual(before, product_state.rootfs_fingerprint())
 
+    def test_toolchain_flag_selects_the_payload_over_the_environment(self) -> None:
+        """`--toolchain` must reach the artifact layout, not be echoed away.
+
+        The regression this pins: main() used to write the *environment* value
+        back into THEKERNEL_TOOLCHAIN, so an exported default silently replaced
+        the flag and the guest suite built and booted the baseline image while
+        reporting success.
+        """
+
+        product = load_product()
+        for environment, flag, expected in (
+            (None, "tcc", "tcc"),
+            ("none", "tcc", "tcc"),
+            ("tcc", "none", "none"),
+            ("tcc", None, "tcc"),
+        ):
+            with self.subTest(environment=environment, flag=flag), \
+                    test_tmpdir() as directory:
+                argv = ["test", "--suite", "guest", "--no-build"]
+                if flag is not None:
+                    argv += ["--toolchain", flag]
+                with patch.dict(os.environ, {"THEKERNEL_STATE_DIR": directory}, clear=False):
+                    if environment is None:
+                        os.environ.pop("THEKERNEL_TOOLCHAIN", None)
+                    else:
+                        os.environ["THEKERNEL_TOOLCHAIN"] = environment
+                    with patch.object(product, "run_product", return_value=0) as run:
+                        self.assertEqual(product.main(argv), 0)
+                    self.assertEqual(os.environ["THEKERNEL_TOOLCHAIN"], expected)
+                    rootfs = run.call_args.args[0].rootfs
+                    self.assertEqual(
+                        rootfs.name,
+                        "rootfs-x86.img" if expected == "none"
+                        else f"rootfs-x86-{expected}.img",
+                    )
+                    self.assertTrue(rootfs.is_relative_to(directory))
+
     def test_clean_rejects_an_active_operation(self) -> None:
         product = load_product()
         with test_tmpdir() as directory, patch.dict(os.environ, {"THEKERNEL_STATE_DIR": directory}):
