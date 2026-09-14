@@ -26,7 +26,9 @@ from tools.product_state import (
     MACHINE_PROFILES, machine_profile,
     state_root, validate_storage, state_lock, serialized_build, isolated_run,
     artifact_config_stamp, artifact_config_key, artifact_input_key, validate_artifact_config,
-    rootfs_stamp_path, rootfs_fingerprint,
+    rootfs_stamp_path, rootfs_fingerprint, rootfs_image_fingerprint,
+    TOOL_PAYLOADS, selected_tool_payload, rootfs_image_bytes,
+    guest_tools_dir, guest_tools_fingerprint,
 )
 from tools.verification import verify_cmd
 from tools.ktap import COMPLETION_MARKER, KtapError, reject_ktap_skips, validate_ktap_log
@@ -351,7 +353,17 @@ def build_kernel(
 @serialized_build
 def build_rootfs(artifacts: Artifacts) -> None:
     artifacts.rootfs.parent.mkdir(parents=True, exist_ok=True)
-    fingerprint = rootfs_fingerprint()
+    payload = selected_tool_payload()
+    tools_dir = guest_tools_dir(artifacts.root, payload)
+    # Two inputs decide the image: the repository files (and environment
+    # switches) hashed by the repository fingerprint, and the staged payload
+    # the image embeds.  Both are read from disk before anything is rebuilt, so
+    # the decision to reuse an image is made against what is actually there.
+    # One identity for the image, computed one way.  The staged payload is part
+    # of it because the image embeds that tree.
+    inputs_before = rootfs_fingerprint()
+    staged = guest_tools_fingerprint(artifacts.root, payload)
+    fingerprint = rootfs_image_fingerprint(artifacts, payload)
     stamp = rootfs_stamp_path(artifacts)
     if (
         artifacts.rootfs.is_file()
@@ -361,10 +373,29 @@ def build_rootfs(artifacts: Artifacts) -> None:
         print(f"thekernel: rootfs unchanged, reusing {artifacts.rootfs}", file=sys.stderr)
         return
     stamp.unlink(missing_ok=True)
+    if payload != "none":
+        run_checked(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts" / "build-guest-tools.sh"),
+                "--payload",
+                payload,
+                "--output",
+                str(tools_dir),
+            ],
+            env={**os.environ, "THEKERNEL_SOURCE_CACHE": str(artifacts.root / "source-cache")},
+        )
     env = {
         **os.environ,
         "THEKERNEL_SOURCE_CACHE": str(artifacts.root / "source-cache"),
+        "THEKERNEL_TOOLCHAIN": payload,
+        "THEKERNEL_ROOTFS_SIZE_MB": str(rootfs_image_bytes(payload) // (1024 * 1024)),
+        # A diagnostic image carries cases the accepted image does not, so the
+        # opt-in is passed through explicitly rather than inherited.
+        "THEKERNEL_ROOTFS_DIAGNOSTICS": os.environ.get("THEKERNEL_ROOTFS_DIAGNOSTICS", "0"),
     }
+    if payload != "none":
+        env["THEKERNEL_ROOTFS_TOOLS_DIR"] = str(tools_dir)
     run_checked(
         [
             "bash",
@@ -376,9 +407,21 @@ def build_rootfs(artifacts: Artifacts) -> None:
         ],
         env=env,
     )
-    if rootfs_fingerprint() != fingerprint:
+    if payload != "none":
+        # The payload is normally rebuilt above, so this is the value that
+        # describes the tree the image was actually made from -- not the one
+        # that happened to be on disk a moment earlier.
+        staged = guest_tools_fingerprint(artifacts.root, payload)
+    inputs_after = rootfs_fingerprint()
+    if inputs_after != inputs_before or f"{inputs_after}:{staged}" != fingerprint:
+        if os.environ.get("THEKERNEL_DEBUG_FINGERPRINT"):
+            print(
+                f"fingerprint before: repo={inputs_before[:16]} staged={fingerprint.split(':')[1][:16]}\n"
+                f"fingerprint after : repo={inputs_after[:16]} staged={staged[:16]}",
+                file=sys.stderr,
+            )
         raise ProductError("rootfs build inputs changed during compilation; rebuild before running")
-    stamp.write_text(fingerprint + "\n", encoding="utf-8")
+    stamp.write_text(f"{inputs_after}:{staged}\n", encoding="utf-8")
 
 
 @serialized_build
@@ -1363,6 +1406,16 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
         help="machine profile to build or boot; it selects the configuration file "
              "and the compile-time CPU admission limit, not the QEMU machine",
     )
+    parser.add_argument(
+        "--toolchain",
+        choices=TOOL_PAYLOADS,
+        default=argparse.SUPPRESS,
+        help="guest tool payload to build into the image; `none` is the baseline "
+             "image, `tcc` adds a native C compiler and its musl sysroot, and "
+             "`nested` is `tcc` plus a static system emulator and the image it "
+             "boots.  The default follows THEKERNEL_TOOLCHAIN, and passing the "
+             "flag wins over it",
+    )
     if profiles:
         parser.add_argument(
             "--profile",
@@ -1937,6 +1990,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
+        # The payload selection changes which rootfs image is built and which
+        # one the kernel embeds, so the parsed `--toolchain` value is exported
+        # before any command resolves artifact paths.  Reading
+        # selected_tool_payload() here instead would just echo the environment
+        # back and silently discard the flag.
+        os.environ["THEKERNEL_TOOLCHAIN"] = selected_tool_payload(
+            getattr(args, "toolchain", None)
+        )
         with state_lock("activity", shared=args.command != "clean", blocking=args.command != "clean"):
             return int(args.func(args))
     except (ProductError, RunnerError, ProcessError, OSError) as error:

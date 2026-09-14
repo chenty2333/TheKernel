@@ -222,7 +222,12 @@ class Artifacts:
 
     @property
     def rootfs(self) -> Path:
-        return self.root / "out" / "rootfs" / "x86" / "rootfs-x86.img"
+        payload = selected_tool_payload()
+        # A tool payload changes what the image contains, so it must not share
+        # the baseline image: the kernel embeds this file, and a payload image
+        # replacing the default one would silently change an unrelated suite.
+        name = "rootfs-x86.img" if payload == "none" else f"rootfs-x86-{payload}.img"
+        return self.root / "out" / "rootfs" / "x86" / name
 
 
 def artifact_config_stamp(artifacts: Artifacts, transport: str) -> Path:
@@ -266,7 +271,10 @@ def validate_artifact_config(artifacts: Artifacts, rootfs: Path | None, transpor
     image = (rootfs or artifacts.rootfs).resolve()
     if image == artifacts.rootfs.resolve():
         try:
-            current_tests = rootfs_stamp_path(artifacts).read_text().strip() == rootfs_fingerprint()
+            current_tests = (
+                rootfs_stamp_path(artifacts).read_text().strip()
+                == rootfs_image_fingerprint(artifacts, selected_tool_payload())
+            )
         except OSError:
             current_tests = False
         if not current_tests:
@@ -285,6 +293,7 @@ def validate_artifact_config(artifacts: Artifacts, rootfs: Path | None, transpor
 # them.
 ROOTFS_INPUT_FILES = (
     "scripts/build-rootfs.sh",
+    "scripts/build-guest-tools.sh",
     "scripts/create-rootfs-image.sh",
     "tests/guest/shell-init.sh",
     "tests/guest/system-init.c",
@@ -302,11 +311,116 @@ ROOTFS_INPUT_ENV = (
     "THEKERNEL_MUSL_LINUX_UAPI_INCLUDE",
     "THEKERNEL_MUSL_LINUX_ARCH_INCLUDE",
     "THEKERNEL_ROOTFS_OWNER_MODE",
+    "THEKERNEL_TOOLCHAIN",
 )
+
+# The optional guest tool payload selected by --toolchain.  `none` keeps the
+# baseline image and is the only selection the ordinary suites use.  A tool
+# payload adds executables and data to the image, which is tens of MiB: `tcc`
+# adds a native C compiler and its musl sysroot, and `nested` is a superset of
+# it that also adds a static system emulator and the image it boots.  Each
+# selection gets its own image, because the kernel embeds it and the two
+# payloads must never be confused for one another.
+TOOL_PAYLOADS = ("none", "tcc", "nested")
+
+
+def selected_tool_payload(requested: str | None = None) -> str:
+    """The guest tool payload this process is building for.
+
+    `requested` is the parsed `--toolchain` value; it takes precedence over
+    THEKERNEL_TOOLCHAIN so the flag is never silently discarded by an exported
+    environment variable.  Callers without the flag pass nothing and inherit
+    the environment.
+    """
+
+    payload = (requested or os.environ.get("THEKERNEL_TOOLCHAIN", "")).strip() or "none"
+    if payload not in TOOL_PAYLOADS:
+        raise ProductError(
+            f"unknown guest tool payload {payload!r}; expected one of "
+            f"{', '.join(TOOL_PAYLOADS)}"
+        )
+    return payload
+
+
+def rootfs_image_bytes(payload: str) -> int:
+    """Image size for a payload.
+
+    These are allocations, not measurements: the baseline image is the
+    historical 96 MiB, and each payload's size was chosen from what it
+    actually stages with headroom for the build tree that lands beside it.
+    """
+
+    return {"none": 96, "tcc": 160, "nested": 224}[payload] * 1024 * 1024
+
 
 
 def rootfs_stamp_path(artifacts: Artifacts) -> Path:
     return artifacts.rootfs.with_name(artifacts.rootfs.name + ".stamp")
+
+
+def rootfs_image_fingerprint(artifacts: Artifacts, payload: str) -> str:
+    """The identity of the image a rootfs build would produce.
+
+    Two things go into the image and therefore into its identity: the
+    repository-side build inputs, and the staged tool payload the image embeds.
+    They are combined here, in one place, because the writer and the reader of
+    the stamp must agree exactly.  They did not: the build wrote the pair while
+    the validator compared the repository half alone, so every run after a
+    successful build reported "guest test sources or rootfs build inputs
+    changed; rebuild before running" and refused to test an image it had just
+    built correctly.
+    """
+
+    return f"{rootfs_fingerprint()}:{guest_tools_fingerprint(artifacts.root, payload)}"
+
+
+def guest_tools_dir(root, payload: str):
+    """Where build-guest-tools.sh stages `payload` under the state root."""
+
+    return Path(root) / "guest-tools" / payload
+
+
+def guest_tools_fingerprint(root, payload: str) -> str:
+    """Identify the staged guest tool payload a rootfs image would be built from.
+
+    The rootfs image embeds this tree, so a change in it has to change the
+    image.  Without this, rebuilding the payload and rebuilding the image were
+    independent events: an image built from a payload that lacked the compiler
+    was reused for a payload that had it, and the extra case the image's own
+    plan promised then failed inside the guest.  That failure is reported by
+    the suite as a compiler that is not there, which points at the compiler
+    rather than at a stale image.
+
+    Content is hashed, not timestamps.  The payload is rebuilt on every build,
+    so every file it contains gets a fresh modification time even when its
+    bytes are identical -- which is the normal case.  A timestamp-based
+    fingerprint therefore reports a change on every single run, and a check
+    that compares the payload before and after a rebuild can never agree with
+    itself.  Content is what decides whether the embedded image differs, so
+    content is what is hashed.  It costs a few hundred milliseconds over the
+    payload's hundred MiB, and only when a tool payload is selected at all.
+    """
+
+    directory = guest_tools_dir(root, payload)
+    if not directory.is_dir():
+        return "absent"
+    digest = hashlib.sha256()
+    entries = sorted(
+        path for path in directory.rglob("*") if path.is_file() or path.is_symlink()
+    )
+    for path in entries:
+        relative = path.relative_to(directory).as_posix().encode()
+        digest.update(len(relative).to_bytes(8, "little"))
+        digest.update(relative)
+        if path.is_symlink():
+            # A symlink's own content is its target; the payload uses them to
+            # deduplicate libc.a and the header tree, so the target matters.
+            digest.update(b"->" + os.readlink(path).encode())
+        elif path.is_file():
+            content = path.read_bytes()
+            digest.update(len(content).to_bytes(8, "little"))
+            digest.update(content)
+    return digest.hexdigest()
 
 
 def rootfs_fingerprint() -> str:

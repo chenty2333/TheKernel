@@ -453,6 +453,77 @@ static int test_signal_fp(void) {
         "signal-fp-child");
 }
 
+/* Phase-0 contract probes for the guest toolchain and nested QEMU plan
+ * (docs/design/guest-toolchain-and-nested-qemu.md).  Each one measures a
+ * contract a compiler or an emulator depends on and classifies its own
+ * findings as required or informational, so a non-zero result here means a
+ * required contract failed rather than that a probe was unable to look. */
+static int test_jit_mem(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-jit-mem-smoke",
+        NULL,
+        "jit-mem-child");
+}
+
+static int test_proc_shape(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-proc-shape-smoke",
+        NULL,
+        "proc-shape-child");
+}
+
+static int test_threads_futex(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-threads-futex-smoke",
+        NULL,
+        "threads-futex-child");
+}
+
+#if defined(THEKERNEL_TOOL_PAYLOAD_TCC)
+/* The native C compilation case exists only in an image that carries the tcc
+ * payload.  It is a compile-time selection, not a runtime probe: the case
+ * table is the suite's plan, and a payload image must not be able to report a
+ * different plan than the one it was built for.  An image built for the
+ * payload that is missing the compiler therefore fails, which is what makes
+ * the payload claim testable. */
+static int test_compiler_smoke(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-compiler-smoke",
+        NULL,
+        "compiler-smoke-child");
+}
+#endif
+
+#if defined(THEKERNEL_TOOL_PAYLOAD_NESTED)
+/* Phase 2a: a system emulator that lives in the guest boots a second kernel in
+ * the guest's own userspace under TCG.  Like the compiler case, this is a
+ * compile-time selection, so an image built for the nested payload that cannot
+ * actually run the emulator fails instead of quietly reporting a smaller plan.
+ *
+ * The case's whole meaning is in the four conditions the helper checks
+ * together: the emulator is static, the inner banner arrives, the inner
+ * machine reached normal shutdown, and the whole thing finished inside its
+ * deadline.  See tests/guest/tools/nested-tcg-hello.c. */
+static int test_nested_tcg_hello(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-nested-tcg-hello",
+        NULL,
+        "nested-tcg-hello-child");
+}
+
+/* Phase 2b: a real Linux distribution -- Alpine, unmodified -- boots inside the
+ * guest under that same emulator.  Its four conditions are the design's: the
+ * inner workload reports INNER_ markers, the inner OS shuts down normally, the
+ * emulator's exit status is checked, and the outer suite still completes.  The
+ * first three belong to the helper; the fourth is this table. */
+static int test_nested_linux_boot(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-nested-linux-boot",
+        NULL,
+        "nested-linux-boot-child");
+}
+#endif
+
 static int test_ioprio(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-ioprio-smoke",
@@ -888,6 +959,19 @@ int main(int argc, char **argv) {
         { "time", test_time_differential, 60 },
         { "umask", test_umask_differential, 60 },
         { "signal-fp", test_signal_fp, 60 },
+        { "jit-mem", test_jit_mem, 30 },
+        { "proc-shape", test_proc_shape, 30 },
+        { "threads-futex", test_threads_futex, 60 },
+#if defined(THEKERNEL_TOOL_PAYLOAD_TCC)
+        { "compiler-smoke", test_compiler_smoke, 120 },
+#endif
+#if defined(THEKERNEL_TOOL_PAYLOAD_NESTED)
+        { "nested-tcg-hello", test_nested_tcg_hello, 300 },
+        /* The helper's own inner deadline is 300 s plus a 5 s kill grace, so
+         * this must exceed both; otherwise a slow inner boot would be reported
+         * as a runner timeout rather than as the condition that broke. */
+        { "nested-linux-boot", test_nested_linux_boot, 330 },
+#endif
         { "io-uring", test_io_uring, 60 },
         { "io-uring-trace", test_io_uring_trace, 60 },
         { "log-diagnostics", test_log_diagnostics, 60 },
