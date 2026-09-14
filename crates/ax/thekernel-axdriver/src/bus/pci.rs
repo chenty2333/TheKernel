@@ -485,6 +485,11 @@ impl AllDevices {
         // even when the xHCI function precedes VirtIO block on the PCI bus.
         #[cfg(feature = "usb-xhci")]
         for device in usb_devices { self.add_device(device); }
+
+        // The igc driver's negative case, printed once so that a machine
+        // without the assumed part says so in one greppable line.
+        #[cfg(net_dev = "igc")]
+        crate::igc::finish_probe(axconfig::devices::PCI_BUS_END as u8);
     }
 }
 

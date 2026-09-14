@@ -85,7 +85,8 @@ def parse_variant(args: argparse.Namespace) -> Variant:
     variant = Variant(memory=memory, asid_fast_switch=args.asid_fast_switch,
                       m5_candidate=getattr(args, "m5_candidate", False),
                       io_submit_batch=getattr(args, "io_submit_batch", False),
-                      io_notify_fastpath=getattr(args, "io_notify_fastpath", False))
+                      io_notify_fastpath=getattr(args, "io_notify_fastpath", False),
+                      net_igc=getattr(args, "net_igc", False))
     if variant.memory_bytes <= KERNEL_LOAD_PADDR:
         raise ProductError("--memory must extend beyond the 2 MiB kernel load address")
     if variant.memory_bytes > X86_64_MAX_MEMORY_BYTES:
@@ -264,6 +265,8 @@ def kernel_features(artifacts: Artifacts) -> str:
         features.append("io-submit-batch")
     if variant.io_notify_fastpath:
         features.append("io-notify-fastpath")
+    if variant.net_igc:
+        features.append("net-igc")
     return " ".join(features)
 
 
@@ -1334,6 +1337,10 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
                         help="enable the experimental I/O submission batch independently in separate artifact paths")
     parser.add_argument("--io-notify-fastpath", action="store_true",
                         help="enable the experimental no-mark fanotify permission fast path in separate artifact paths")
+    parser.add_argument("--net-igc", action="store_true",
+                        help="build the Intel i225/i226 (igc) NIC probe into the product kernel; "
+                             "no QEMU machine has this device, so a boot exercises the "
+                             "'no supported device present' verdict and nothing else")
     parser.add_argument(
         "--platform",
         choices=tuple(sorted(MACHINE_PROFILES)),

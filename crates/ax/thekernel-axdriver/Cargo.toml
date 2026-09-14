@@ -59,6 +59,12 @@ dyn = [
 ]
 input = ["dep:axdriver_input"]
 irq = ["axdriver_virtio?/irq"]
+igc = [
+    "net",
+    "axdriver_net/igc",
+    "dep:axalloc",
+    "dep:axhal",
+]
 ixgbe = [
     "net",
     "axdriver_net/ixgbe",

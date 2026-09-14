@@ -13,6 +13,10 @@ workspace = true
 
 [features]
 bpf = ["dep:axbpf", "dep:thekernel-linux-bpf", "perf-sampling"]
+# The Intel i225/i226 (igc) work.  Selected by an explicit build flag rather
+# than by the platform profile, because the product's network device is
+# `virtio-net` and the two cannot both be the one static NIC type.
+net-igc = ["axfeat/driver-igc"]
 asid-fast-switch = ["axhal/asid-fast-switch"]
 asid-switch-diagnostics = ["asid-fast-switch", "axhal/asid-switch-diagnostics"]
 hwp-uclamp = ["axhal/hwp-uclamp", "axruntime/ipi", "axtask/hwp-uclamp"]

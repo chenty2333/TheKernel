@@ -1,13 +1,23 @@
 //! Common traits and types for network device (NIC) drivers.
 
-#![no_std]
+// The crate is `no_std` in every kernel build; the host test build links `std`
+// because the test harness needs it, and the pure logic in this crate -- the
+// parts a machine without the hardware can still check -- lives where that
+// harness can reach it.
+#![cfg_attr(not(test), no_std)]
 #![cfg_attr(doc, feature(doc_cfg))]
 
 extern crate alloc;
 
+#[cfg(test)]
+extern crate std;
+
 #[cfg(feature = "fxmac")]
 /// fxmac driver for PhytiumPi
 pub mod fxmac;
+#[cfg(feature = "igc")]
+/// Intel i225/i226 (2.5 GbE) NIC device driver.
+pub mod igc;
 #[cfg(feature = "ixgbe")]
 /// ixgbe NIC device driver.
 pub mod ixgbe;

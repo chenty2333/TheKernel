@@ -148,6 +148,11 @@ boot-shell = []
 sched-wake-locality = ["thekernel-kernel/sched-wake-locality"]
 io-submit-batch = ["thekernel-kernel/io-submit-batch"]
 io-notify-fastpath = ["thekernel-kernel/io-notify-fastpath"]
+# The Intel i225/i226 (igc) NIC work: builds the identify-only probe into the
+# product kernel so a boot on a machine that has no such part produces the
+# "no supported device present" verdict.  There is no QEMU model for this
+# device, so that verdict is the only end-to-end run the driver has.
+net-igc = ["thekernel-kernel/net-igc"]
 # The shipped x86_64 product keeps its hardware-backed Linux ABI paths in one
 # explicit opt-in.  CET and cachestat have no feature gate: both are always
 # compiled, while their hardware use is capability-gated at runtime.

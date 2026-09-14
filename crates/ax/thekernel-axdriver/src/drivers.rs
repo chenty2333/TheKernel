@@ -84,6 +84,26 @@ cfg_if::cfg_if! {
 }
 
 cfg_if::cfg_if! {
+    if #[cfg(net_dev = "igc")] {
+        pub struct IgcDriver;
+        register_net_driver!(
+            IgcDriver,
+            axdriver_net::igc::IgcNic<crate::igc::IgcHalImpl, { crate::igc::QUEUE_SIZE }>
+        );
+        impl DriverProbe for IgcDriver {
+            #[cfg(bus = "pci")]
+            fn probe_pci(
+                root: &mut axdriver_pci::PciRoot,
+                bdf: axdriver_pci::DeviceFunction,
+                dev_info: &axdriver_pci::DeviceFunctionInfo,
+            ) -> BusProbeResult {
+                crate::igc::probe_and_init(root, bdf, dev_info)
+            }
+        }
+    }
+}
+
+cfg_if::cfg_if! {
     if #[cfg(net_dev = "ixgbe")] {
         use crate::ixgbe::IxgbeHalImpl;
         pub struct IxgbeDriver;
