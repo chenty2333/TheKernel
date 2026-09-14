@@ -262,6 +262,25 @@ class DutGateTests(unittest.TestCase):
         with self.assertRaisesRegex(gate.GateError, "exit status 7"):
             self.run_with(gate, hooks, dut="n305", runs=1)
 
+    def test_a_hook_that_never_returns_ends_the_run_instead_of_hanging(self) -> None:
+        # Fail closed, not forever: a DUT that stops answering mid-capture must
+        # produce a verdict.  The bound is injectable so the case is testable
+        # without waiting out the real thirty minutes.
+        gate = load_gate()
+        hooks = self.screen_hooks("valid")
+        hooks["THEKERNEL_DUT_SCREEN_CAPTURE_CMD"] = "sleep 30"
+        hooks[gate.HOOK_TIMEOUT_ENV] = "0.5"
+        with self.assertRaisesRegex(gate.GateError, "did not finish within 0.5 s"):
+            self.run_with(gate, hooks, dut="n305", runs=1)
+
+    def test_a_hook_timeout_must_be_a_positive_number(self) -> None:
+        gate = load_gate()
+        hooks = self.screen_hooks("valid")
+        for value in ("soon", "0", "-5"):
+            hooks[gate.HOOK_TIMEOUT_ENV] = value
+            with self.assertRaisesRegex(gate.GateError, "must be positive|not a number"):
+                self.run_with(gate, hooks, dut="n305", runs=1)
+
     def test_network_channel_enforces_the_full_ktap_contract(self) -> None:
         gate = load_gate()
         hook = (

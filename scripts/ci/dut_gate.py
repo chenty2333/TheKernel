@@ -81,6 +81,18 @@ SCREEN_MIN_FRAMES = 2
 #: picture: console text filling a screen is far above this floor.
 SCREEN_BLANK_FRACTION = 0.995
 SCREEN_SAMPLES = 4096
+
+#: How long one hook may run before the gate gives up on it.
+#:
+#: A hook that never returns is neither a passing DUT nor a failing one: with no
+#: bound, a DUT that stops responding mid-capture hangs the gate forever, which
+#: is the one outcome a fail-closed gate must never produce.  The bound has to
+#: clear the slowest honest capture -- a cold boot plus the whole guest suite on
+#: real silicon -- without turning a merely slow machine into a failure, so it
+#: is thirty minutes, overridable by a lab that needs longer.
+HOOK_TIMEOUT_SECONDS = 1800
+HOOK_TIMEOUT_ENV = "THEKERNEL_DUT_HOOK_TIMEOUT"
+
 SCREEN_REQUIRED_KEYS = (
     "version",
     "dut",
@@ -153,8 +165,12 @@ def validate_artifacts(artifact_dir: Path) -> dict[str, Path]:
         raise GateError(f"product artifact directory does not exist: {artifact_dir}")
     artifacts: dict[str, Path] = {}
     for filename in REQUIRED_ARTIFACTS:
-        path = (artifact_dir / filename).resolve()
-        if path.parent != artifact_dir or not path.is_file() or path.is_symlink():
+        candidate = artifact_dir / filename
+        path = candidate.resolve()
+        # The symlink test reads the unresolved name: resolving first makes it
+        # always false, which would let a link inside the directory stand in
+        # for the artifact the gate thinks it validated.
+        if path.parent != artifact_dir or not path.is_file() or candidate.is_symlink():
             raise GateError(f"required product artifact is missing or unsafe: {filename}")
         if path.stat().st_size == 0:
             raise GateError(f"required product artifact is empty: {filename}")
@@ -433,14 +449,40 @@ PROFILES: dict[str, Profile] = {
 }
 
 
+def hook_timeout() -> float:
+    """The bound for one hook, from the environment when the lab sets one."""
+
+    raw = os.environ.get(HOOK_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return float(HOOK_TIMEOUT_SECONDS)
+    try:
+        seconds = float(raw)
+    except ValueError as error:
+        raise GateError(f"{HOOK_TIMEOUT_ENV} is not a number of seconds: {raw!r}") from error
+    if seconds <= 0:
+        raise GateError(f"{HOOK_TIMEOUT_ENV} must be positive: {raw!r}")
+    return seconds
+
+
 def run_hook(command: str, *, environment: dict[str, str], description: str) -> None:
-    completed = subprocess.run(
-        command,
-        shell=True,
-        executable="/bin/bash",
-        env=environment,
-        check=False,
-    )
+    timeout = hook_timeout()
+    try:
+        completed = subprocess.run(
+            command,
+            shell=True,
+            executable="/bin/bash",
+            env=environment,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        # Fail closed rather than hang: a DUT that never answers ends the run
+        # with a verdict, and the process that hung is already reaped.  Any
+        # grandchild it left behind is the hook's business, not the gate's.
+        raise GateError(
+            f"{description} hook did not finish within {timeout:g} s "
+            f"(raise {HOOK_TIMEOUT_ENV} if this DUT is honestly slower)"
+        ) from error
     if completed.returncode:
         raise GateError(f"{description} hook failed with exit status {completed.returncode}")
 

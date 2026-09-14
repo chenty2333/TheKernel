@@ -58,6 +58,23 @@ class PantherLakeDutGateTests(unittest.TestCase):
             with self.assertRaisesRegex(gate.GateError, "empty"):
                 gate.validate_artifacts(artifact_dir)
 
+    def test_a_symlinked_artifact_is_refused_however_well_it_resolves(self) -> None:
+        # A link inside the artifact directory resolves to a real non-empty
+        # file in the same directory, so only the unresolved name reveals that
+        # the gate would be validating something other than what it was given.
+        gate = load_gate()
+        with self.temporary_directory() as directory:
+            artifact_dir = Path(directory) / "artifact"
+            artifact_dir.mkdir()
+            for name in gate.REQUIRED_ARTIFACTS:
+                (artifact_dir / name).write_bytes(b"product")
+            target = artifact_dir / "elsewhere.img"
+            target.write_bytes(b"product")
+            (artifact_dir / "rootfs-x86.img").unlink()
+            (artifact_dir / "rootfs-x86.img").symlink_to(target)
+            with self.assertRaisesRegex(gate.GateError, "unsafe"):
+                gate.validate_artifacts(artifact_dir)
+
     def test_only_three_cold_boots_are_accepted(self) -> None:
         gate = load_gate()
         with self.temporary_directory() as directory:
