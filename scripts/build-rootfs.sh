@@ -322,6 +322,13 @@ done
 # built on the host by build-guest-tools.sh and copied in as-is.  Nothing here
 # downloads or installs anything at run time, and the baseline image (no
 # payload requested) is untouched by this step.
+# The nested diagnostics are development evidence, not part of the acceptance
+# criteria, so they are gated on a file that only exists when explicitly asked
+# for.  THEKERNEL_ROOTFS_DIAGNOSTICS=1 builds the image that way.
+if [ "${THEKERNEL_ROOTFS_DIAGNOSTICS:-0}" = "1" ]; then
+    : > "$STAGE/opt/thekernel-tests/run-nested-diagnostics"
+fi
+
 if [ -n "$TOOLS_DIR" ]; then
     [ "$TOOLCHAIN" != none ] || {
         printf '%s\n' 'a guest tools directory was given without a payload name' >&2

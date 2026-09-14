@@ -390,6 +390,9 @@ def build_rootfs(artifacts: Artifacts) -> None:
         "THEKERNEL_SOURCE_CACHE": str(artifacts.root / "source-cache"),
         "THEKERNEL_TOOLCHAIN": payload,
         "THEKERNEL_ROOTFS_SIZE_MB": str(rootfs_image_bytes(payload) // (1024 * 1024)),
+        # A diagnostic image carries cases the accepted image does not, so the
+        # opt-in is passed through explicitly rather than inherited.
+        "THEKERNEL_ROOTFS_DIAGNOSTICS": os.environ.get("THEKERNEL_ROOTFS_DIAGNOSTICS", "0"),
     }
     if payload != "none":
         env["THEKERNEL_ROOTFS_TOOLS_DIR"] = str(tools_dir)

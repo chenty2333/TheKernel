@@ -872,10 +872,10 @@ int main(int argc, char **argv) {
 #endif
 #if defined(THEKERNEL_TOOL_PAYLOAD_NESTED)
         { "nested-tcg-hello", test_nested_tcg_hello, 300 },
-        /* The helper's own inner deadline is 180 s plus a 5 s kill grace, so
-         * this must exceed both; a slower failure would otherwise be reported
+        /* The helper's own inner deadline is 300 s plus a 5 s kill grace, so
+         * this must exceed both; otherwise a slow inner boot would be reported
          * as a runner timeout rather than as the condition that broke. */
-        { "nested-linux-boot", test_nested_linux_boot, 300 },
+        { "nested-linux-boot", test_nested_linux_boot, 330 },
 #endif
         { "io-uring", test_io_uring, 60 },
         { "io-uring-trace", test_io_uring_trace, 60 },

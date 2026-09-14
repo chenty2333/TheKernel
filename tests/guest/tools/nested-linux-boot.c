@@ -87,12 +87,20 @@
  * deliberately no root= and no modloop= -- the initramfs is the root. */
 #define INNER_APPEND "console=ttyS0 rdinit=/init quiet"
 
-/* Deadlines.  This inner boot takes ~1.6-1.9 s on host TCG and was measured at
- * 54-86 s under nested TCG, a factor of 30-50.  The design budget of 120 s for
- * the inner phase comes from that measurement; 180 s keeps it with room for a
- * slower host.  Sizing this from the host figure would fail every correct run.
- * The suite's case timeout is set above this plus the kill grace. */
-#define NESTED_TIMEOUT_MS 180000
+/* Deadlines.  This inner boot takes ~1.7 s on host TCG.  Measured inside the
+ * guest it costs 77-88 s: the same boot under TCG-in-TCG, a factor of 45-50,
+ * agreeing with the design's independently measured 86 s.
+ *
+ * 180 s was tried first and was too close to the mark -- a diagnostic run with
+ * three extra nested boots in flight had it fail at the deadline while the
+ * same configuration passed at 77 s in a quiet run.  A deadline that fails
+ * when the machine is busy is a deadline that reports load as a product
+ * failure, so it is set well clear of the measurement instead: 300 s is over
+ * 3x the slowest observed boot, and still bounded.
+ *
+ * Sizing this from the 1.7 s host figure would fail every correct run.  The
+ * suite's case timeout is set above this plus the kill grace. */
+#define NESTED_TIMEOUT_MS 300000
 #define KILL_GRACE_MS 5000
 #define POLL_SLICE_MS 100
 
@@ -336,29 +344,49 @@ static int run_emulator(struct child *child, const char *qemu, const char *kerne
         return -1;
     }
     if (child->pid == 0) {
-        char *const arguments[] = {
-            (char *)qemu,
-            /* The data directory, explicitly: without it QEMU cannot find the
-             * firmware it executes even for -kernel. */
-            (char *)"-L", (char *)data,
-            (char *)"-machine", (char *)INNER_MACHINE,
-            (char *)"-accel", (char *)INNER_ACCEL,
-            (char *)"-m", memory_argument,
-            (char *)"-smp", (char *)INNER_CPUS,
-            /* No VGA and no NIC.  Unused, and both cost boot time; leaving
-             * them out also keeps the video and network option ROMs out of the
-             * critical path.  Note there is still no isa-debug-exit: the only
-             * way out of this machine is the guest shutting it down. */
-            (char *)"-vga", (char *)"none",
-            (char *)"-nic", (char *)"none",
-            (char *)"-display", (char *)"none",
-            (char *)"-serial", (char *)"stdio",
-            (char *)"-no-reboot",
-            (char *)"-kernel", (char *)kernel,
-            (char *)"-initrd", (char *)initrd,
-            (char *)"-append", (char *)INNER_APPEND,
-            NULL,
-        };
+        /* The emulator adds its own defaults to a fixed list, so the argument
+         * vector is built here rather than written as one array literal. */
+        const char *arguments[32];
+        size_t count = 0;
+        /* The data directory, explicitly: without it QEMU cannot find the
+         * firmware it executes even for -kernel. */
+        arguments[count++] = (char *)qemu;
+        arguments[count++] = (char *)"-L";
+        arguments[count++] = (char *)data;
+        arguments[count++] = (char *)"-machine";
+        arguments[count++] = (char *)INNER_MACHINE;
+        arguments[count++] = (char *)"-accel";
+        arguments[count++] = (char *)INNER_ACCEL;
+        arguments[count++] = (char *)"-m";
+        arguments[count++] = memory_argument;
+        arguments[count++] = (char *)"-smp";
+        arguments[count++] = (char *)INNER_CPUS;
+        arguments[count++] = (char *)"-display";
+        arguments[count++] = (char *)"none";
+        arguments[count++] = (char *)"-serial";
+        arguments[count++] = (char *)"stdio";
+        arguments[count++] = (char *)"-no-reboot";
+        /* No VGA and no NIC: unused, and both cost boot time.  Leaving them
+         * out also keeps the video and network option ROMs off the critical
+         * path -- measured inside the guest, the full default set costs ~8 s
+         * more than this one.  There is deliberately no isa-debug-exit: the
+         * only way out of this machine is the guest shutting it down. */
+        arguments[count++] = (char *)"-vga";
+        arguments[count++] = (char *)"none";
+        arguments[count++] = (char *)"-nic";
+        arguments[count++] = (char *)"none";
+        arguments[count++] = (char *)"-kernel";
+        arguments[count++] = (char *)kernel;
+        arguments[count++] = (char *)"-initrd";
+        arguments[count++] = (char *)initrd;
+        arguments[count++] = (char *)"-append";
+        arguments[count++] = (char *)INNER_APPEND;
+        arguments[count] = NULL;
+        /* Checked here rather than trusted: the vector is built by hand, and an
+         * overflow would silently truncate the command line. */
+        if (count + 1 > sizeof(arguments) / sizeof(arguments[0])) {
+            _exit(CHILD_SETUP_EXIT_STATUS);
+        }
 
         /* Own process group so the parent can reap the whole emulator. */
         (void)setpgid(0, 0);
@@ -369,7 +397,7 @@ static int run_emulator(struct child *child, const char *qemu, const char *kerne
         if (pipe_fds[1] > STDERR_FILENO) {
             close(pipe_fds[1]);
         }
-        execv(qemu, arguments);
+        execv(qemu, (char *const *)arguments);
         _exit(CHILD_EXEC_EXIT_STATUS);
     }
 
@@ -561,6 +589,27 @@ static void note_line(const char *line, void *context)
 
 /* -------------------------------------------------------------------- main */
 
+/* Report the retained inner transcript.  Called on every failure path, not
+ * only on success: the timeout is exactly the case where the inner output is
+ * the only evidence of how far the machine got. */
+static void report_transcript(struct transcript *t)
+{
+    char *cursor = t->buffer;
+    size_t remaining = t->length;
+
+    while (remaining > 0) {
+        char *newline = memchr(cursor, '\n', remaining);
+        size_t line_bytes = newline ? (size_t)(newline - cursor) : remaining;
+
+        if (line_bytes > 0) {
+            printf("THEKERNEL_" CATEGORY "_INNER: %.*s\n", (int)line_bytes, cursor);
+        }
+        cursor += line_bytes + (newline ? 1 : 0);
+        remaining -= line_bytes + (newline ? 1 : 0);
+    }
+    fflush(stdout);
+}
+
 int main(void)
 {
     const char *qemu = getenv(QEMU_ENV);
@@ -593,7 +642,8 @@ int main(void)
 
     emit("THEKERNEL_" CATEGORY "_INTERFACE qemu=%s kernel=%s initrd=%s data=%s "
          "machine=%s append=\"%s\" timeout_ms=%d",
-         qemu, kernel, initrd, data, INNER_MACHINE, INNER_APPEND, NESTED_TIMEOUT_MS);
+         qemu, kernel, initrd, data, INNER_MACHINE, INNER_APPEND,
+         NESTED_TIMEOUT_MS);
 
     /* Stage 1: the inputs are what they claim to be.  All of this is checked
      * before anything is forked, because a missing or wrong file would
@@ -625,23 +675,28 @@ int main(void)
     transcript_set_sink(&t, note_line, &markers);
     outcome = run_emulator(&child, qemu, kernel, initrd, data, &t, &exit_status, &elapsed_ms);
     if (outcome < 0) {
+        report_transcript(&t);
         fail("run-emulator", "fork-and-read", "path=%s", qemu);
         return 1;
     }
     if (outcome > 0) {
+        emit("THEKERNEL_" CATEGORY "_SERIAL lines=%llu bytes=%llu truncated=%d",
+             (unsigned long long)t.lines, (unsigned long long)t.total, t.truncated);
+        report_transcript(&t);
         fail("run-emulator", "bounded-deadline", "elapsed_ms=%lld timeout_ms=%d",
              (long long)elapsed_ms, NESTED_TIMEOUT_MS);
         return 1;
     }
 
     emit("THEKERNEL_" CATEGORY "_SERIAL lines=%llu bytes=%llu truncated=%d",
-         (unsigned long long)t.total, (unsigned long long)t.total, t.truncated);
+         (unsigned long long)t.lines, (unsigned long long)t.total, t.truncated);
     emit("THEKERNEL_" CATEGORY "_EXIT status=%lld elapsed_ms=%lld",
          (long long)exit_status, (long long)elapsed_ms);
 
     /* Stage 3: the four conditions, each reported separately so a failure says
      * which one broke instead of only "the emulator did not work". */
     if (!markers.release || !markers.kernel) {
+        report_transcript(&t);
         fail("inner-kernel", "alpine-kernel-identified",
              "release_marker=%d kernel_marker=%d", markers.release, markers.kernel);
         return 1;
@@ -663,12 +718,13 @@ int main(void)
     if (exit_status != 0) {
         /* A negative status is a signal.  The emulator only returns non-zero
          * here if the inner machine did not complete its poweroff. */
+        report_transcript(&t);
         fail("inner-shutdown", "emulator-exit-zero", "status=%lld elapsed_ms=%lld",
              (long long)exit_status, (long long)elapsed_ms);
         return 1;
     }
 
     emit("THEKERNEL_" CATEGORY "_OK elapsed_ms=%lld inner_lines=%llu release=\"%s\"",
-         (long long)elapsed_ms, (unsigned long long)t.total, markers.release_value);
+         (long long)elapsed_ms, (unsigned long long)t.lines, markers.release_value);
     return 0;
 }

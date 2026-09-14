@@ -535,6 +535,45 @@ spuriously fail. That measurement also settles Phase 2c: the plan made a custom
 trimmed kernel conditional on the nested boot time breaking the runner budget,
 and with a ~120 s inner phase the budget holds, so **Phase 2c is not needed**.
 
+**Phase 2b is implemented and measured inside the guest.** The payload carries
+Alpine 3.24.1's own kernel and an initramfs built from that release's
+minirootfs, and `nested-linux-boot` boots it under the staged emulator:
+
+| Quantity | Measured on host TCG | Measured inside the guest |
+|---|---|---|
+| Alpine 3.24.1 boot to ACPI S5 | 1.65 s | 77.5–88.4 s |
+| Inner kernel version | `6.18.35-0-virt` | `6.18.35-0-virt` |
+| Inner serial lines | 9 (`quiet`) | 9 (`quiet`), 315 (verbose) |
+| Inner ACPI line | `reboot: Power down` | `reboot: Power down` |
+| Emulator exit status | 0 | **0** |
+
+The guest figure confirms the independent 86.3 s estimate rather than replacing
+it, and the two agreeing is the point: the cost is a property of double
+emulation, not of one measurement.
+
+Three findings are worth keeping, because each cost a full rebuild-and-run cycle
+to find:
+
+1. **A deadline sized from a single quiet run fails under load.** The first
+   accepted-looking budget was 180 s — over twice the 86 s estimate — and it
+   still failed once, in a run with three extra nested boots in flight, while
+   the same configuration passed at 77 s in a quiet run. A deadline that
+   reports machine load as a product failure is not a deadline; 300 s is over
+   3x the slowest observed boot.
+2. **The inner kernel's own clock is not wall time.** In the verbose run the
+   kernel's last timestamp reads `[47.7]` after 88.4 s of measured wall time,
+   because the inner kernel's timekeeping runs off emulated hardware whose
+   notion of a second is not the host's. Only the outer measurement is
+   meaningful for budgeting.
+3. **The default device set costs ~8 s.** The full set boots in 85.3 s against
+   77.5 s for `-vga none -nic none`, so `nodefaults`-style trimming is worth
+   keeping even though both work.
+
+The nested Linux boot passes as part of the full suite: `1..48`, no failures, no
+skips, `THEKERNEL_SYSTEM_TEST_COMPLETE`, and `qemu-runner exit=0`. That is the
+whole plan, with the outer suite's own normal shutdown, so all four of Phase
+2b's conditions hold in one run.
+
 
 ## 7. Minimal integration with existing entry points
 

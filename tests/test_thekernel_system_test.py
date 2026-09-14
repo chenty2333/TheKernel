@@ -335,7 +335,12 @@ class SystemTestGateTests(unittest.TestCase):
             artifacts.rootfs.write_bytes(b"initial")
             artifacts.kernel.write_bytes(b"kernel")
             artifacts.esp.write_bytes(b"esp")
-            product.rootfs_stamp_path(artifacts).write_text(product.rootfs_fingerprint())
+            # The stamp records the whole image identity -- repository inputs
+            # plus the staged payload -- so it is written the same way the
+            # build writes it, through the one function both sides share.
+            product.rootfs_stamp_path(artifacts).write_text(
+                product.rootfs_image_fingerprint(artifacts, "none")
+            )
             stamp = product.artifact_config_stamp(artifacts, "module")
             stamp.write_text(product.artifact_config_key(artifacts, None, "module"))
             product.validate_artifact_config(artifacts, None, "module")
@@ -355,7 +360,12 @@ class SystemTestGateTests(unittest.TestCase):
                 artifacts.rootfs.write_bytes(b"rootfs")
                 artifacts.kernel.write_bytes(b"kernel")
                 artifacts.esp.write_bytes(b"esp")
-                product.rootfs_stamp_path(artifacts).write_text(product.rootfs_fingerprint())
+                # The stamp records the whole image identity -- repository
+                # inputs plus the staged payload -- so it is written the same
+                # way the build writes it, through the shared function.
+                product.rootfs_stamp_path(artifacts).write_text(
+                    product.rootfs_image_fingerprint(artifacts, "none")
+                )
                 product.artifact_config_stamp(artifacts, "module").write_text(
                     product.artifact_config_key(artifacts, None, "module"))
                 getattr(artifacts, changed).write_bytes(b"different")
