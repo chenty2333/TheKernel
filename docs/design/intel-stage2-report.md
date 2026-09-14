@@ -69,10 +69,23 @@ reports `readable on screen` for the banner, the gated marker and the kernel log
 mirror.
 
 **`drm::intel` host tests: 388, none failing**, and `lint --platform n305` exits
-0 with no findings in the Intel modules.  The target lint matters here more than
-usual: it is the only thing that compiles the `#[cfg(target_os = "none")]` halves
--- the BAR mapping, the device-uncached framebuffer view, the GTT aperture read
-and the hotplug watch's task body -- which no host test can reach.
+0 with no findings in the Intel modules.  The second half of that sentence was
+not true of the branch when it was first written, and the way it was wrong is
+worth keeping: the Intel modules carried 20 findings between them (`gmbus.rs` 3,
+`connect.rs` 2, `pll.rs` 12, `gtt.rs` 3), with 19 more in the host build
+(`mod.rs`, `gmbus/tests.rs`), and **the gate exits 0 either way**, because it
+denies only `correctness` and `suspicious` lints -- the rest are warnings that
+scroll past.  `fix/intel-lint-warnings` (merged as `a23e8448`) cleared both sets.
+Measured on the merged tip: `lint --platform n305` reports `thekernel-kernel
+(lib) generated 337 warnings`, down from 357, the difference being exactly those
+20, and **none of the 337 is under `kernel/src/drm/intel/`**; no denied lint
+anywhere in the tree.  Every number in this document was re-measured on the
+merged tip rather than carried over from the branch it was written on.
+
+The target lint matters here more than usual: it is the only thing that compiles
+the `#[cfg(target_os = "none")]` halves -- the BAR mapping, the device-uncached
+framebuffer view, the GTT aperture read and the hotplug watch's task body --
+which no host test can reach.
 
 What the tests are worth, stated plainly:
 
@@ -219,9 +232,10 @@ was already on the branch.
 
 ### What else `dev` carries
 
-Stage 2 is not all of `dev`.  Two merges were made after it, both because the
+Stage 2 is not all of `dev`.  Four merges were made after it, each because the
 work was finished and was otherwise sitting outside the branch a reviewer is
-asked to read:
+asked to read: `feat/nic-igc` and `feat/hw-bringup` below,
+`fix/klog-multiline-record` below that, and `fix/intel-lint-warnings` in §2.
 
 * `feat/nic-igc`, merged as `2284b239` -- the Intel i225/i226 driver for the
   acceptance (b) channel, six commits.  It was written 159 commits earlier, so
@@ -238,6 +252,23 @@ asked to read:
   overtaken -- the run that showed "the marker and no kernel log" predates
   `fix/klog-loss` -- and by the same commit's correction of two rows of the
   acceptance table that pointed at workstreams which have since landed.
+* `fix/klog-multiline-record`, merged as `b336bd89` -- the kernel log's record
+  delimiter, found by disbelieving the igc evidence rather than by reading the
+  log code.  `Store::peek` ended a record at the first newline it copied, so a
+  record whose text contains newlines came back as its first line with the
+  cursor already past the whole record: the tail was dropped, not re-read.  The
+  diagnostic console is the **only** reader that delimits records -- the screen,
+  the framebuffer mirror and `syslog(2)` copy bytes between two cursors -- so
+  the loss was invisible everywhere except the serial log, which is the file the
+  evidence is read from.  The igc absence report is one `info!` in two lines
+  (`probe.rs`), and it lost its verdict line exactly there.  This is what makes
+  the claim `nic-igc.md` §4 and §7 were already making -- that a `--net-igc`
+  boot's log carries `no supported device present` -- true instead of false, and
+  it is the second reason that negative case is worth booting.  A record now
+  ends at the next record's start mark or at the end of the ring, and the
+  newlines inside one are data; the host tests that pin it fail on the old
+  `peek` and pass on the new one, and `kernel-log-retention.md` §6 states the
+  rule a future reader owes the ring.
 
 One branch is **deliberately not merged**: `feat/hw-facts` is marked `wip` by
 its own commit message.  It is the N305 hardware-facts capture tooling
