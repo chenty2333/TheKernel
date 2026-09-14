@@ -119,6 +119,7 @@ class FbconSuiteContractTests(unittest.TestCase):
         # never given.
         self.assertEqual(artifacts.variant.name, "mem512m")
         self.assertEqual(spec.graphics_profile, "firmware-fb")
+        self.assertEqual(spec.accel, "tcg")
         self.assertEqual(spec.stop_after_marker, module.FBCON_MARKER)
         self.assertEqual(spec.qmp_screenshot_after_marker, module.FBCON_MARKER)
         self.assertEqual(spec.qmp_screenshot_text_cells, module.fbcon_text_cells())
@@ -130,6 +131,23 @@ class FbconSuiteContractTests(unittest.TestCase):
         args = SimpleNamespace(graphics_profile="headless", screenshot="out.ppm", profile="system")
         with self.assertRaisesRegex(module.ProductError, "requires --graphics-profile firmware-fb"):
             module.fbcon_suite_cmd(args)
+
+    def test_fbcon_rejects_kvm_before_build_or_screenshot_changes(self) -> None:
+        module = self.module
+        with test_tmpdir() as directory:
+            screenshot = Path(directory) / "console.ppm"
+            screenshot.write_bytes(b"existing screenshot")
+            args = SimpleNamespace(
+                graphics_profile="firmware-fb", screenshot=str(screenshot),
+                profile="system", accel="kvm",
+            )
+            with mock.patch.object(module, "fbcon_artifacts") as artifacts, \
+                 mock.patch.object(module, "run_product") as run, \
+                 self.assertRaisesRegex(module.ProductError, "requires --accel tcg"):
+                module.fbcon_suite_cmd(args)
+            artifacts.assert_not_called()
+            run.assert_not_called()
+            self.assertEqual(screenshot.read_bytes(), b"existing screenshot")
 
     def test_fbcon_suite_refuses_a_guest_without_the_marker(self) -> None:
         """A shell guest never prints the KTAP line this suite gates on."""
@@ -307,6 +325,7 @@ class FbconVerificationStageTests(unittest.TestCase):
         self.assertIn("firmware-fb", command)
         self.assertIn("--screenshot", command)
         self.assertIn("--no-build", command)
+        self.assertEqual(command[command.index("--accel") + 1], "tcg")
         # The stage boots what `build` produced, and artifact paths are keyed
         # by memory size: a different size here would boot nothing at all.
         build = stages[names.index("build")]

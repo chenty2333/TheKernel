@@ -874,6 +874,15 @@ def fbcon_suite_cmd(args: argparse.Namespace) -> int:
             f"the fbcon suite boots the system profile, whose KTAP output is the line it "
             f"gates its screendump on; --profile {args.profile} does not print it"
         )
+    # This is a glyph correctness gate, not an accelerator benchmark. The
+    # guest keeps logging after the marker, so KVM can scroll the expected
+    # lines away before QMP captures them. Keep the supported TCG gate rather
+    # than accepting a weaker image or silently changing the requested accel.
+    if args.accel != "tcg":
+        raise ProductError(
+            "the fbcon suite requires --accel tcg: KVM can scroll the marker "
+            "off screen before capture; use --suite graphics for KVM graphics validation"
+        )
     artifacts = fbcon_artifacts(args)
     if not args.no_build:
         build_rootfs(artifacts)
@@ -1893,6 +1902,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--suite",
         choices=("host", "guest", "abi", "graphics", "cpu", "fbcon", "all"),
         required=True,
+        help="suite to run; fbcon requires --accel tcg (use graphics for KVM)",
     )
     test.add_argument("--run-cpus", type=int)
     test.add_argument("--allow-skip", action="store_true")
