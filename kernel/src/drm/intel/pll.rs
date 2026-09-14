@@ -204,14 +204,14 @@ const ADL_N_TOTAL_DIVIDERS: &[u32] = &[
 /// per billion, before the search refuses its own answer.
 ///
 /// The divider set does not introduce any error at all: the DCO is
-/// `afe_clock * P * Q * K` by construction, so dividing it back by `5 * P * Q
-/// * K` returns the requested symbol rate exactly.  The only error is the
-/// quantisation of `DCO_FRACTION`, which has 15 bits and therefore steps by
-/// `ref / 0x8000`: 24 MHz / 32768 = 732 Hz at the largest reference this part
-/// uses, against a DCO of at least 7998 MHz, which is under 92 parts per
-/// billion.  1000 ppb (1 ppm) is ten times that bound, so a solution that trips
-/// it is a bug in this module rather than a hardware limit -- which is the
-/// point of checking.
+/// `afe_clock * P * Q * K` by construction, so dividing it back by
+/// `5 * P * Q * K` returns the requested symbol rate exactly.  The only error
+/// is the quantisation of `DCO_FRACTION`, which has 15 bits and therefore
+/// steps by `ref / 0x8000`: 24 MHz / 32768 = 732 Hz at the largest reference
+/// this part uses, against a DCO of at least 7998 MHz, which is under 92 parts
+/// per billion.  1000 ppb (1 ppm) is ten times that bound, so a solution that
+/// trips it is a bug in this module rather than a hardware limit -- which is
+/// the point of checking.
 const MAX_SYMBOL_RATE_ERROR_PPB: u64 = 1000;
 
 /// The `SKL_DSSM` register's reference-clock field, as a mask.
