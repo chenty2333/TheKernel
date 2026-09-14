@@ -217,6 +217,34 @@ their content was ported file by file into the integration branch, and
 `feat/intel-pll` contains only formatting and visibility commits -- its `pll.rs`
 was already on the branch.
 
+### What else `dev` carries
+
+Stage 2 is not all of `dev`.  Two merges were made after it, both because the
+work was finished and was otherwise sitting outside the branch a reviewer is
+asked to read:
+
+* `feat/nic-igc`, merged as `2284b239` -- the Intel i225/i226 driver for the
+  acceptance (b) channel, six commits.  It was written 159 commits earlier, so
+  the merge was clean textually and it took a build and the suites to believe
+  it; `docs/design/nic-igc.md` is its own record, including the long list of
+  what host tests and one QEMU boot cannot establish.  Note the shape: nothing
+  in `verify --tier daily` compiles it, because the driver exists only in the
+  `--net-igc` variant and the product variant's static NIC type is `virtio-net`.
+* `feat/hw-bringup`'s last two commits, merged as `608f98cf` -- the capture
+  image's measured unreliability on the UEFI path (three misses out of three,
+  against a QEMU kernel-loader path that finds the payload every time) and the
+  shell profile's byte-identical screenshots.  The merge is followed by
+  `7d585ed6`, which corrects the one sentence in it that this tree had
+  overtaken -- the run that showed "the marker and no kernel log" predates
+  `fix/klog-loss` -- and by the same commit's correction of two rows of the
+  acceptance table that pointed at workstreams which have since landed.
+
+One branch is **deliberately not merged**: `feat/hw-facts` is marked `wip` by
+its own commit message.  It is the N305 hardware-facts capture tooling
+(`tools/hw_facts.py`, `scripts/hw-facts/capture-n305.sh`, and its tests),
+written for review rather than for `dev`, and it stays on its branch until it
+has been reviewed.
+
 ## 7. How to review this
 
 Reading order, if you want the argument rather than the diff:

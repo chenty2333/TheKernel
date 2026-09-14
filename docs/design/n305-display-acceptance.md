@@ -499,11 +499,15 @@ the last of which does not exist yet:
   the OpRegion and VBT, i915's own debug state, the framebuffer format and **the decoded EDID**
   (which the DUT cannot decode: `edid-decode` is not packaged for that Alpine release). It says
   nothing about TheKernel's log.
-* **The network** is the third path and is not available on this branch: the kernel's network stack
-  is `axfeat/net-ng`, whose only device driver is `virtio-net` (`kernel/Cargo.toml`;
-  `crates/ax/thekernel-axfeat/Cargo.toml`), and there is no virtio device on this machine. The
-  Ethernet cable is for the guest-side network workstream; the moment it lands, the same files come
-  off over the wire and `docs/design/n305-bringup.md` §3 applies unchanged.
+* **The network** is the third path and is still not available, although its lowest layer has
+  landed: the target's NIC is an Intel i225/i226, and `feat/nic-igc` (merged as `2284b239`) brings a
+  driver for it (`docs/design/nic-igc.md`), built by the `--net-igc` variant because the product
+  variant's static NIC type is `virtio-net` and one non-`dyn` build cannot be both. What is missing
+  is everything above the driver: nothing in the guest puts the KTAP transcript on the wire, and the
+  driver itself has never run on real silicon -- its only automated evidence is host tests over a
+  synthetic device, plus a QEMU boot that exercises the one path QEMU can exercise, the verdict for
+  a machine that has no such part. So the Ethernet cable is still for that workstream, and
+  `docs/design/n305-bringup.md` §3 applies once it lands.
 
 ### 4.3 The minimal reproducer
 

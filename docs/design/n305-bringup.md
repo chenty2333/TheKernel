@@ -329,7 +329,10 @@ guest's, not a summary of it.
 
 The gate takes one channel per invocation, so requiring both costs two
 invocations (six cold boots). Use the screen channel while the network channel
-does not exist, and switch as soon as it does.
+does not exist, and switch as soon as it does. Its lowest layer now does: the
+target's i225/i226 has a driver in this tree (`--net-igc`,
+`docs/design/nic-igc.md`), so what is missing is the guest-side transport above
+it rather than the driver underneath.
 
 ## 4. What is still an assumption
 
