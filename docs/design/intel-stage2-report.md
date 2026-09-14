@@ -230,6 +230,26 @@ their content was ported file by file into the integration branch, and
 `feat/intel-pll` contains only formatting and visibility commits -- its `pll.rs`
 was already on the branch.
 
+All four were re-audited file by file before this tip was handed over, and the
+audit confirmed the absorption rather than trusting it.  Nothing in their trees
+is missing from `dev`, every conflicting file is newer on `dev`'s side, and
+merging any of them would regress: `feat/intel-power`'s `power.rs` predates
+`state_set`, so `connect.rs` -- which constructs `WellObservation` with that
+field -- would not compile, and its `regs::mock` composes the mock hooks that
+two PLL-lock tests in `output/tests.rs` depend on *replacing*;
+`feat/intel-pll` would revert the ADL-N divider search that `97c9f7aa` fixed,
+putting 12 of 114 measured rates outside the DCO window; and
+`feat/intel-gmbus-power` would delete the nine live `hpd.rs` symbols the
+after-boot hotplug watch calls.  They are therefore recorded as merged by
+strategy `ours`: their tips are ancestors of this history, so the branches can
+be deleted without orphaning a commit, and `dev`'s tree is untouched by the
+record.  The two things they did hold and `dev` did not -- six style sites
+(four rustfmt rewraps in `timing.rs`, two `manual_range_contains` asserts in
+`pll.rs`), and the phase-2 revision of `docs/design/intel-gmbus.md` -- were
+ported by hand instead.
+`feat/display-modes` is in the same position for a different reason: its single
+commit is `81ee6e81` under another hash, so it was absorbed the same way.
+
 ### What else `dev` carries
 
 Stage 2 is not all of `dev`.  Four merges were made after it, each because the
@@ -270,11 +290,16 @@ asked to read: `feat/nic-igc` and `feat/hw-bringup` below,
   `peek` and pass on the new one, and `kernel-log-retention.md` §6 states the
   rule a future reader owes the ring.
 
-One branch is **deliberately not merged**: `feat/hw-facts` is marked `wip` by
-its own commit message.  It is the N305 hardware-facts capture tooling
-(`tools/hw_facts.py`, `scripts/hw-facts/capture-n305.sh`, and its tests),
-written for review rather than for `dev`, and it stays on its branch until it
-has been reviewed.
+One branch was **merged only at the maintainer's request**: `feat/hw-facts` is
+marked `wip` by its own commit message, and the merge keeps that status in the
+history rather than overriding it.  It is the N305 hardware-facts capture
+tooling (`tools/hw_facts.py`, `scripts/hw-facts/capture-n305.sh`, and its 73
+unit tests), written for review rather than for `dev`.  `dev` already carries
+the reviewed tool for the same job -- `scripts/ci/hw_facts_bundle.py` with
+`scripts/ci/n305-capture-payload.sh` (`d05f0ddd`), which captures unattended
+inside the capture image and powers the machine off -- so the WIP tool is a
+second, unreviewed path to the same facts rather than the bring-up's, and a
+reader who finds both should reach for the reviewed one.
 
 ## 7. How to review this
 

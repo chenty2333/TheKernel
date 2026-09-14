@@ -1,6 +1,7 @@
 # Display modes: EDID to a programmable timing
 
-**Component:** `kernel/src/drm/modes/**` (branch `feat/display-modes`).
+**Component:** `kernel/src/drm/modes/**` (landed as `d1732266`; the branch
+`feat/display-modes` was retired once its work was in `dev`).
 **Scope:** the hardware-free half of a modeset - turning what a monitor says
 about itself into a timing a display engine can be programmed with.
 

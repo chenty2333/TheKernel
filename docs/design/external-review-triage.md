@@ -101,9 +101,13 @@ seq=1664 first=1153 entries=512` was read out of a guest whose ring had wrapped.
 
 The three fixes and the hardening are four branches off `dev`, each in its own
 worktree: `fix/exit-status-dump-frame`, `fix/unreachable-panics`,
-`fix/n305-capture-out-guard` and `fix/review-followups`.  They are merged into
-`dev` and never into `main`, and the merged tip is gated once more with
-`verify --tier daily` before it is handed over.  The report's eight items did
-not include the frame bound, the guest read path, or anything under
-`kernel/src/drm/intel/` other than the accessor above, and no item here changes
-a decision recorded in the stage-2 report.
+`fix/n305-capture-out-guard` and `fix/review-followups`.  They were merged into
+`dev` -- as `ac428e6d`, `9df59d4c`, `bea37d88` and `51531445`, with the
+memory-pressure test fix that followed them as `cae4f2fb` -- and never into
+`main`, and the merged tip is gated once more with `verify --tier daily` before
+it is handed over.  The five `fix` branches were retired once their merges were
+on `dev`, so the names here identify the workstream that produced a commit
+rather than a ref to check out; `git log dev` is the history.  The report's
+eight items did not include the frame bound, the guest read path, or anything
+under `kernel/src/drm/intel/` other than the accessor above, and no item here
+changes a decision recorded in the stage-2 report.

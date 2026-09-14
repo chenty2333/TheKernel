@@ -51,11 +51,14 @@ or a named failure.  Around it:
 
 `EdidBytes` is a validated 128-byte block and nothing more; `as_slice()` is the
 byte slice `drm::modes::plan_modeset` takes.  This workstream deliberately stops
-at bytes.  `kernel/src/drm/modes/` is **not in this branch** — it lives on
-`feat/display-modes`, which is not yet merged into `dev` — and writing a second
-EDID parser to fill the hole would be worse than deferring one commit of
-integration.  The integration, when that branch lands, is a call to
-`plan_modeset(edid.as_slice(), &Constraints::unlimited())` and nothing else.
+at bytes.  `kernel/src/drm/modes/` was **not in this workstream's branch** — it
+landed separately (`d1732266`, polished by `81ee6e81`, both in `dev`) — and
+writing a second EDID parser to fill the hole would have been worse than
+deferring one commit of integration.  The integration is the call this section
+predicted: `sink::probe_one` runs `plan_modeset(edid.as_slice(),
+&Constraints::unlimited())` over the blocks that passed their own checks,
+`connect::resolve_at_boot` carries that plan out of bring-up, and `mod.rs`
+consumes it when it sets the mode at boot (`c79ddc25`).
 
 ## The pin map, and the off-by-one
 
