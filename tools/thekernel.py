@@ -380,9 +380,10 @@ def build_rootfs(artifacts: Artifacts) -> None:
         **os.environ,
         "THEKERNEL_SOURCE_CACHE": str(artifacts.root / "source-cache"),
         "THEKERNEL_TOOLCHAIN": payload,
-        "THEKERNEL_ROOTFS_TOOLS_DIR": str(tools_dir),
         "THEKERNEL_ROOTFS_SIZE_MB": str(rootfs_image_bytes(payload) // (1024 * 1024)),
     }
+    if payload != "none":
+        env["THEKERNEL_ROOTFS_TOOLS_DIR"] = str(tools_dir)
     run_checked(
         [
             "bash",

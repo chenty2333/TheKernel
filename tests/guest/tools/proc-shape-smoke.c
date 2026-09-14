@@ -37,6 +37,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #if !defined(__x86_64__)
@@ -1291,6 +1292,29 @@ static int report_placement(void) {
         free(heap);
     }
     (void)munmap(fresh, page_bytes);
+
+    /* INFORMATIONAL: the libc queries a sizing consumer actually makes.  A
+     * JIT sizing its code cache from the host's physical page count reads
+     * _SC_PHYS_PAGES, and musl answers it from /proc/meminfo; a consumer that
+     * cannot find that file falls back to a default rather than failing, so
+     * these values are reported instead of asserted.  _SC_NPROCESSORS_ONLN
+     * and the uname identity are recorded for the same reason. */
+    long phys_pages = sysconf(_SC_PHYS_PAGES);
+    info("sysconf phys_pages=%ld errno=%d (%s) available_pages=%ld "
+         "processors_onln=%ld",
+         phys_pages, phys_pages < 0 ? errno : 0,
+         phys_pages < 0 ? strerror(errno) : "n/a",
+         sysconf(_SC_AVPHYS_PAGES), sysconf(_SC_NPROCESSORS_ONLN));
+    struct utsname identity;
+    if (uname(&identity) == 0) {
+        info("uname sysname=%s release=%s machine=%s", identity.sysname,
+             identity.release, identity.machine);
+    } else {
+        info("uname=unavailable errno=%d (%s)", errno, strerror(errno));
+    }
+    long cpus_configured = sysconf(_SC_NPROCESSORS_CONF);
+    info("sysconf processors_conf=%ld clock_ticks=%ld", cpus_configured,
+         sysconf(_SC_CLK_TCK));
     return result;
 }
 

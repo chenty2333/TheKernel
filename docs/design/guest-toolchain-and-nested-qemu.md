@@ -89,13 +89,13 @@ failure still exists at the current tip.
 
 **Before adding guest functionality**, rerun the official guest runner with
 the original TCG / 512 MiB / 4-CPU parameters, rebuilding through that entry
-point (§9). This is now a routine confirmation, not an investigation: require
+point (§10). This is now a routine confirmation, not an investigation: require
 the current suite, no failures or skips, and normal shutdown. If the I/O
 failure recurs, resolve it before extending the baseline.
 
 That confirmation was completed on branch `feat/guest-toolchain` at
 `44621445`, built and booted through `./tools/thekernel.py test --suite guest`
-(§9). Result: `1..42`, **42 `ok`, 0 `not ok`, 0 skips**,
+(§10). Result: `1..42`, **42 `ok`, 0 `not ok`, 0 skips**,
 `# THEKERNEL_SYSTEM_TEST_COMPLETE`, then `/bin/busybox poweroff -f` and
 `qemu-runner exit=0`. `io-uring-directio` ran at ordinal 27 with
 `result=0`; the `errno=16` completion observed in the old
@@ -343,7 +343,105 @@ TheKernel additionally requires Rust/Cargo, freestanding LLVM and image-build
 tools and is outside this plan. Nested TheKernel acceptance can instead use
 host-built images, but still needs its own later end-to-end gate.
 
-## 6. Minimal integration with existing entry points
+## 6. Measured results so far
+
+This section records what the implementation has actually produced. Everything
+below was run on this host; anything not listed here is still plan.
+
+### Phase 0 — the probes, and what they found
+
+Three probes were added to the guest suite. They run in the ordinary image, so
+they are also a regression test for the contracts the plan depends on.
+
+| Probe | Result in the guest |
+|---|---|
+| `jit-mem` | **Passes.** Anonymous RW→RX allocation, execution, a second generation written into the same region and re-executed, a live earlier generation, `munmap` teardown, and split-WX aliases built from one `memfd_create` + two `MAP_SHARED` mappings with write visibility and execution through the read-execute alias. |
+| `proc-shape` | **Failed on one required check, now fixed** (below). Everything else passed: `/proc/self/maps` self-consistency, the `/proc/self/status` fields, `MAP_FIXED_NOREPLACE` refusing an occupied range with `EEXIST` without clobbering it, and exact placement in a free range. |
+| `threads-futex` | **Passes.** libc `pthread_create`/`join` value passing, futex-backed mutex mutual exclusion, a bounded condvar handshake, batched thread reuse, `fork` from a thread, `sched_yield`/`gettid` identity, and one minimal raw futex round trip. |
+
+Two informational observations are worth carrying forward. `memfd_create`
+rejects `MFD_EXEC` and `MFD_NOEXEC_SEAL` with `EINVAL`, which the reviewed QEMU
+allocator never requests, so it is not a blocker. And `/proc/self/auxv` is
+absent while `/proc/self/cmdline` is readable and `/proc/self/environ` is not;
+neither was required by the probe.
+
+**The one required failure was real and has been fixed.** `/proc/cpuinfo`
+emitted `processor` records and nothing else — no `flags` field at all — so
+nothing in the guest could discover which CPU features are usable. The fix
+decodes the flags from CPUID in a pure function in the `thekernel-axcpu`
+crate, host-tested against real CPUID values, keeping the OS-state gating that
+crate already applies: `xsave`/`osxsave` follow `CR4.OSXSAVE`, `avx` requires
+`XCR0` to select SSE and YMM, and `fsgsbase` requires `CR4.FSGSBASE`. That last
+gate is why `fsgsbase` is deliberately **absent** in the guest today:
+`RDFSBASE` and `WRFSBASE` fault while `CR4.FSGSBASE` is clear, so advertising
+it would be a capability lie. A compiler does not need that flag; a JIT that
+did would have to be given the kernel change first, which is a userspace
+state-management change, not a procfs one.
+
+### Phase 1 — the tool payload is built and its interface verified
+
+`scripts/build-guest-tools.sh --payload tcc` builds TinyCC (`mob`,
+`0fb54300b56512754221d80adda85ddb9815bceb`) as a **static musl** binary in
+about 45 seconds from a cold cache, with no root:
+
+* the host compiler is the pinned Fedora `musl-gcc` RPM (1.2.5-6.fc44),
+  unpacked from the download cache rather than installed, with the specs file's
+  install prefix rewritten to the unpacked location;
+* the headers tcc compiles against are tcc's own compiler headers
+  (`stdarg.h`, `stddef.h`, …) and musl's libc headers, plus the host's Linux
+  UAPI headers, which musl does not ship;
+* tcc's own `libtcc1.a` and `libtcc.a` are produced by the freshly built tcc.
+
+Measured sizes, which replace the previous draft's guesses:
+
+| Item | Measured |
+|---|---|
+| tcc, static musl, stripped | 861 KiB |
+| `libtcc1.a` / `libtcc.a` | 48 KiB / 612 KiB |
+| musl `libc.a` (this RPM) | 10.9 MiB |
+| merged header tree | 11 MiB, 1189 files |
+| staged payload, after symlinking the duplicate paths | **23 MiB** |
+| baseline image / image with the compiler | 96 MiB / 160 MiB |
+
+The compiler interface was verified on the host, not merely built: the staged
+tcc compiles a program using `<stdio.h>`, `<stdlib.h>` and `<string.h>` into a
+binary with **no `PT_INTERP` and no dynamic section**, and that binary runs.
+The guest-side case (`compiler-smoke`) compiles, inspects the ELF header
+itself, runs the result, and also requires a deliberately broken program to be
+*rejected*, so a compiler that accepts anything cannot pass.
+
+### Phase 2 — first measurements, and a loader constraint
+
+Staged from the pinned Alpine `latest-stable` release (3.24.1):
+
+| Artifact | Measured |
+|---|---|
+| `vmlinuz-virt` (bzImage, 6.18.35-0-virt) | 12.0 MiB |
+| `initramfs-virt` | 9.2 MiB |
+| `modloop-virt` (not needed for the first rung) | 21.8 MiB |
+| `alpine-minirootfs` tarball | 3.5 MiB |
+| `alpine-netboot` tarball the kernel comes from | 374 MiB |
+
+`-kernel` does **not** accept an arbitrary ELF, which changes Phase 2a's
+shape. Measured against QEMU 10.2.2: a multiboot v1 header in an ELF32 boots;
+the same header in an ELF64 is rejected with "Cannot load x86-64 image, give a
+32bit one"; a plain ELF32 or ELF64 with no header is rejected with "Error
+loading uncompressed kernel without PVH ELF Note"; an ELF64 carrying a Xen PVH
+note boots. The Phase 2a artifact is therefore multiboot v1 in an **ELF32**
+container with the 64-bit payload embedded, and it is verified: it prints its
+banner, reads its CPU mode back from hardware, and exits QEMU through
+`isa-debug-exit` with status **33**, in about **0.1 s**, identically under TCG
+and KVM.
+
+The nested payload is not yet wired into the image, and **QEMU itself has not
+been built yet**. Its dependency question is the plan's largest open risk: the
+static musl build needs static `glib-2.0`, `pcre2`, `libffi` and `zlib`
+archives, and upstream states that most libraries used by system-mode
+emulation are not available for static linking. The dependency stack is being
+built from pinned sources as the next step; until that resolves, no claim is
+made about the nested boot.
+
+## 7. Minimal integration with existing entry points
 
 Use one explicit payload selection, proposed as
 `--toolchain {none,tcc,nested}`, default `none`; `nested` includes tcc and
@@ -373,7 +471,7 @@ exists for the run path, but `system_test_cmd` currently passes
 `extra_block=None`; guest-test attachment, mounting and read-only usage would
 still need deliberate integration. No second-disk workflow is added now.
 
-## 7. Risks and stop conditions
+## 8. Risks and stop conditions
 
 * The §2 baseline mismatch is explained as version drift, but the
   confirmation rerun must still complete before attributing new guest
@@ -399,7 +497,7 @@ still need deliberate integration. No second-disk workflow is added now.
 * Guest KVM, other TheKernel architectures, custom TCG machines and full OS
   source bootstrap remain out of scope.
 
-## 8. Decisions retained after review
+## 9. Decisions retained after review
 
 1. tcc first, static musl, with a complete development sysroot, pinned source
    versions and explicit static ELF output.
@@ -417,7 +515,7 @@ still need deliberate integration. No second-disk workflow is added now.
 6. Select versions/options before their host smoke and guest probes; defer
    nested TheKernel acceptance until its consumers are explicit.
 
-## 9. Baseline verification commands (existing interfaces only)
+## 10. Baseline verification commands (existing interfaces only)
 
 These are the commands the baseline gate was completed with on branch
 `feat/guest-toolchain` (result in §2). They remain reproducible as written;
