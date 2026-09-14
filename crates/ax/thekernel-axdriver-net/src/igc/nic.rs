@@ -279,7 +279,11 @@ impl<H: IgcHal, const QS: usize> IgcNic<H, QS> {
 
     /// Whether a frame can be handed to the hardware right now.
     pub fn transmit_ready(&self) -> bool {
-        self.tx_ring.has_room() && !self.tx_free.is_empty()
+        // Reserve a descriptor for every buffer already handed to a caller,
+        // not only those queued to hardware. The ring leaves one slot unused;
+        // admitting the last pool slot would let a valid transmit hit Full
+        // after consuming its buffer, with no way for the caller to return it.
+        self.tx_ring.has_room() && self.tx_free.len() > 1
     }
 
     /// Fill the receive ring from the free list, as far as it will go.
@@ -1053,6 +1057,30 @@ mod tests {
         ));
         assert_eq!(harness.register("IGC_TDT(0)"), 1);
         harness.complete_transmit(0);
+        harness.nic.recycle_tx_buffers().unwrap();
+        assert_eq!(harness.nic.test_free_tx_slots(), QS);
+    }
+
+    #[test]
+    fn allocated_transmit_buffers_reserve_descriptor_capacity() {
+        let mut harness = Harness::new();
+        let buffers: Vec<_> = (0..QS - 1)
+            .map(|_| harness.nic.alloc_tx_buffer(64).unwrap())
+            .collect();
+        assert!(!harness.nic.can_transmit());
+        assert!(matches!(
+            harness.nic.alloc_tx_buffer(64),
+            Err(DevError::Again)
+        ));
+        for buffer in buffers {
+            harness
+                .nic
+                .transmit(buffer)
+                .expect("each admitted buffer has a descriptor");
+        }
+        for index in 0..QS - 1 {
+            harness.complete_transmit(index);
+        }
         harness.nic.recycle_tx_buffers().unwrap();
         assert_eq!(harness.nic.test_free_tx_slots(), QS);
     }
