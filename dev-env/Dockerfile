@@ -134,6 +134,7 @@ RUN sed -i \
       u-boot-tools \
       unzip \
       util-linux \
+      wget \
       xz-utils \
       zip \
  && rm -rf /var/lib/apt/lists/*
