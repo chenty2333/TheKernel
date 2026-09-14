@@ -114,15 +114,14 @@ use physical_worker::*;
 pub(crate) use physical_worker::{
     drain_physical_completion_work, has_physical_completion_work,
     install_default_physical_completion_device, note_physical_completion_worker_started,
-    note_physical_completion_worker_stopped, physical_completion_device_ready,
-    physical_completion_device_ready_for, physical_completion_worker_is_stopped,
-    reset_physical_completion_device, stop_physical_completion_device,
-    wake_physical_completion_worker,
+    note_physical_completion_worker_stopped, physical_completion_device_ready_for,
+    physical_completion_worker_is_stopped, wake_physical_completion_worker,
 };
 mod resources;
 use resources::*;
 pub(crate) use resources::{IoUringBufferLease, IoUringFileLease};
 mod physical_io;
+#[cfg(test)]
 use physical_io::*;
 pub(crate) use physical_io::{
     PhysicalIoCompletionDisposition, PhysicalIoCompletionPass, PhysicalIoWork,
