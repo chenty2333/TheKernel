@@ -2755,4 +2755,54 @@ mod tests {
         registry.release_slot(2);
         assert_eq!(registry.reserved, 0);
     }
+
+    /// The dump renders a ring that does not fit its own stack.
+    ///
+    /// This is the regression test for the frame that made reading
+    /// `/proc/sys/kernel/exit-status` write below the kernel stack: the ring is
+    /// 182 KiB, the dump copied it by value twice, and this thread's stack is
+    /// 128 KiB -- smaller than a single copy, let alone two.  Reintroducing a
+    /// by-value array overflows this thread and takes the test process down
+    /// with `SIGSEGV`, which is the loud version of what the guest did quietly
+    /// (`TASK_STACK_SIZE` is 256 KiB there, and a task stack has no guard page).
+    #[test]
+    fn the_dump_renders_inside_a_stack_far_smaller_than_the_ring() {
+        const STACK: usize = 128 * 1024;
+        let ring = core::mem::size_of::<ExitStatusRecord>() * EXIT_STATUS_TRACE_LEN;
+        assert!(
+            ring > STACK,
+            "the ring ({ring} bytes) must not fit the {STACK}-byte stack this test allows, or it \
+             says nothing about by-value copies"
+        );
+
+        // One published exit, so the dump renders a record rather than a bare
+        // header.
+        exit_status_trace_push(ExitStatusRecord {
+            event: 9,
+            process_pid: 7,
+            status: 37 << 8,
+            ..ExitStatusRecord::EMPTY
+        });
+
+        let text = std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(exit_status_trace_dump)
+            .expect("a thread with a bounded stack")
+            .join()
+            .expect("the dump must not overflow the stack it was given")
+            .expect("the dump must render");
+        let head = &text[..text.len().min(64)];
+        assert!(
+            text.starts_with(b"EXITSTATUS_TRACE_BEGIN seq="),
+            "the dump must open with its header: {head:?}"
+        );
+        assert!(
+            text.windows(10).any(|window| window == b"\nEXIT seq="),
+            "the dump must carry the published exit: {head:?}"
+        );
+        assert!(
+            text.ends_with(b"EXITSTATUS_TRACE_END\n"),
+            "the dump must close with its terminator: {head:?}"
+        );
+    }
 }
