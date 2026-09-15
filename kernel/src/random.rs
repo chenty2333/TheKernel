@@ -31,6 +31,39 @@ pub fn fill_secure(buf: &mut [u8]) -> AxResult<()> {
         .map_err(|()| AxError::WouldBlock)
 }
 
+/// Wait for initial entropy without holding the DRBG lock across a sleep.
+/// The driver interface has no readiness notifier, so retry on a bounded
+/// interruptible timer rather than returning EAGAIN for blocking getrandom.
+pub fn fill_secure_wait(buf: &mut [u8], nonblocking: bool) -> AxResult<()> {
+    retry_secure_fill(
+        nonblocking,
+        || fill_secure(buf),
+        || {
+            crate::task::with_proc_state_hint(crate::task::ProcStateHint::Interruptible, || {
+                axtask::future::block_on(axtask::future::interruptible(axtask::future::sleep(
+                    core::time::Duration::from_millis(10),
+                )))
+            })
+            .map_err(AxError::from)?
+            .map_err(AxError::from)?
+            .map_err(AxError::from)
+        },
+    )
+}
+
+fn retry_secure_fill(
+    nonblocking: bool,
+    mut fill: impl FnMut() -> AxResult<()>,
+    mut wait: impl FnMut() -> AxResult<()>,
+) -> AxResult<()> {
+    loop {
+        match fill() {
+            Err(AxError::WouldBlock) if !nonblocking => wait()?,
+            result => return result,
+        }
+    }
+}
+
 fn insecure_seed() -> [u8; 32] {
     let counter = INSECURE_SEED_COUNTER.fetch_add(1, Ordering::Relaxed);
     let stack_marker = 0u8;
@@ -62,5 +95,46 @@ pub fn entropy_bits() -> i32 {
         ENTROPY_BITS_READY
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn secure_wait_retries_only_blocking_calls_and_propagates_signals() {
+        assert_eq!(
+            retry_secure_fill(
+                true,
+                || Err(AxError::WouldBlock),
+                || panic!("nonblocking call slept")
+            ),
+            Err(AxError::WouldBlock)
+        );
+        let mut attempts = 0;
+        assert_eq!(
+            retry_secure_fill(
+                false,
+                || {
+                    attempts += 1;
+                    if attempts == 1 {
+                        Err(AxError::WouldBlock)
+                    } else {
+                        Ok(())
+                    }
+                },
+                || Ok(())
+            ),
+            Ok(())
+        );
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            retry_secure_fill(
+                false,
+                || Err(AxError::WouldBlock),
+                || Err(AxError::Interrupted)
+            ),
+            Err(AxError::Interrupted)
+        );
     }
 }

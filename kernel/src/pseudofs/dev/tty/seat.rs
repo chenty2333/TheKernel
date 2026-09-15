@@ -299,7 +299,13 @@ mod tests {
 
     struct Adapter;
     impl DisplayAdapter for Adapter {
-        fn create_dumb(&self, _: DumbRequest, _: u32, _: u64) -> DrmResult<Arc<dyn GemBacking>> {
+        fn create_dumb(
+            &self,
+            _: DumbRequest,
+            _: u32,
+            _: u64,
+            _allocation_owner: Arc<dyn Send + Sync>,
+        ) -> DrmResult<Arc<dyn GemBacking>> {
             Err(DrmError::Unsupported)
         }
         fn present(&self, _: Scanout) -> DrmResult<Arc<crate::drm::fence::Fence>> {

@@ -22,9 +22,9 @@ use crate::{
     mm::{
         AddrSpace, Backend, DeferredUffdWake, FileMappingLease, FileMappingSharing,
         MadviseReadahead, MadviseThp, PreparedFixedSharedMapping, PreparedProtect,
-        SharedFolioDemotionReplacement, SharedFolioPteRedirect,
-        SharedFolioPteReplacement, SharedPages, WritableMappingAdmission, check_memory_overcommit,
-        check_rlimit_as_growth, checked_align_up, checked_align_up_4k, remap_user_mapping,
+        SharedFolioDemotionReplacement, SharedFolioPteRedirect, SharedFolioPteReplacement,
+        SharedPages, WritableMappingAdmission, check_memory_overcommit, check_rlimit_as_growth,
+        checked_align_up, checked_align_up_4k, remap_user_mapping,
     },
     pseudofs::{Device, DeviceMmap},
     task::{
@@ -32,6 +32,22 @@ use crate::{
         security::{file_mprotect, initial_user_namespace, mmap_addr, mmap_file},
     },
 };
+
+/// Offset arithmetic must be checked before constructing a physical range.
+fn physical_mmap_window(
+    start: usize,
+    end: usize,
+    offset: usize,
+    page_size: usize,
+) -> AxResult<(usize, usize)> {
+    let start = start.checked_add(offset).ok_or(AxError::InvalidInput)?;
+    let remaining = end.checked_sub(start).ok_or(AxError::InvalidInput)?;
+    let size = remaining & !(page_size - 1);
+    if size == 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok((start, size))
+}
 
 const READ_IMPLIES_EXEC: u32 = 0x0040_0000;
 /// Use Linux's bottom-up compatibility mmap placement rather than the normal
@@ -499,11 +515,13 @@ fn prepare_file_mmap_backend(
                     sigbus_on_eof: false,
                 }),
                 DeviceMmap::Physical(mut range) => {
-                    range.start += offset;
-                    if range.is_empty() {
-                        return Err(AxError::InvalidInput);
-                    }
-                    let max_size = range.size().align_down(page_size);
+                    let (start, max_size) = physical_mmap_window(
+                        range.start.as_usize(),
+                        range.end.as_usize(),
+                        offset,
+                        page_size as usize,
+                    )?;
+                    range.start = start.into();
                     *length = (*length).min(max_size);
                     Ok(PreparedFileMmapBackend::Linear {
                         physical_start: range.start,
@@ -532,11 +550,13 @@ fn prepare_file_mmap_backend(
                 Some(DeviceMmap::None) => Err(AxError::NoSuchDevice),
                 Some(DeviceMmap::Anonymous) => Ok(PreparedFileMmapBackend::AnonymousCow),
                 Some(DeviceMmap::Physical(mut range)) => {
-                    range.start += offset;
-                    if range.is_empty() {
-                        return Err(AxError::InvalidInput);
-                    }
-                    let max_size = range.size().align_down(page_size);
+                    let (start, max_size) = physical_mmap_window(
+                        range.start.as_usize(),
+                        range.end.as_usize(),
+                        offset,
+                        page_size as usize,
+                    )?;
+                    range.start = start.into();
                     *length = (*length).min(max_size);
                     Ok(PreparedFileMmapBackend::Linear {
                         physical_start: range.start,
@@ -1641,9 +1661,10 @@ fn sys_mprotect_inner(
                 let shadow_stack = area.flags().contains(MappingFlags::SHADOW_STACK);
                 // CET leaves are architecturally W=0,D=1; generic mprotect may
                 // retain read access but never convert them into ordinary pages.
-                // A shadow stack keeps its type across mprotect.  Access can be
-                // reduced to PROT_NONE or PROT_READ, but ordinary WRITE/EXECUTE
-                // permission is never admitted for a SHSTK VMA.
+                // A shadow stack keeps its type across mprotect. PROT_WRITE
+                // permits shadow-stack writes, not ordinary stores: backend
+                // page_table_flags strips hardware W and uses the CET dirty
+                // bit. PROT_READ clears that bit; executable access is rejected.
                 if shadow_stack
                     && requested_protection != MappingFlags::READ
                     && requested_protection != (MappingFlags::READ | MappingFlags::WRITE)
@@ -3008,13 +3029,36 @@ fn process_madvise_collapse_locked(aspace: &mut AddrSpace, addr: usize, length: 
 }
 
 pub(super) fn madvise_behavior_valid(advice: u32) -> bool {
-    matches!(advice, MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED |
-        MADV_DONTNEED | MADV_FREE | MADV_REMOVE | MADV_DONTFORK | MADV_DOFORK |
-        MADV_MERGEABLE | MADV_UNMERGEABLE | MADV_HUGEPAGE | MADV_NOHUGEPAGE |
-        MADV_DONTDUMP | MADV_DODUMP | MADV_WIPEONFORK | MADV_KEEPONFORK |
-        MADV_COLD | MADV_PAGEOUT | MADV_POPULATE_READ | MADV_POPULATE_WRITE |
-        MADV_DONTNEED_LOCKED | MADV_COLLAPSE | MADV_GUARD_INSTALL | MADV_GUARD_REMOVE |
-        MADV_HWPOISON | MADV_SOFT_OFFLINE)
+    matches!(
+        advice,
+        MADV_NORMAL
+            | MADV_RANDOM
+            | MADV_SEQUENTIAL
+            | MADV_WILLNEED
+            | MADV_DONTNEED
+            | MADV_FREE
+            | MADV_REMOVE
+            | MADV_DONTFORK
+            | MADV_DOFORK
+            | MADV_MERGEABLE
+            | MADV_UNMERGEABLE
+            | MADV_HUGEPAGE
+            | MADV_NOHUGEPAGE
+            | MADV_DONTDUMP
+            | MADV_DODUMP
+            | MADV_WIPEONFORK
+            | MADV_KEEPONFORK
+            | MADV_COLD
+            | MADV_PAGEOUT
+            | MADV_POPULATE_READ
+            | MADV_POPULATE_WRITE
+            | MADV_DONTNEED_LOCKED
+            | MADV_COLLAPSE
+            | MADV_GUARD_INSTALL
+            | MADV_GUARD_REMOVE
+            | MADV_HWPOISON
+            | MADV_SOFT_OFFLINE
+    )
 }
 
 pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
@@ -3458,8 +3502,13 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
         apply_lock_prefix(&mut aspace, start, length, true)?;
         drop(aspace);
         if flags & MLOCK_ONFAULT == 0 {
-            populate_explicit_with_reclaim(&aspace_handle, start, length,
-                MappingFlags::empty(), |_| Ok(()))?;
+            populate_explicit_with_reclaim(
+                &aspace_handle,
+                start,
+                length,
+                MappingFlags::empty(),
+                |_| Ok(()),
+            )?;
         }
         return Ok(0);
     }
@@ -3467,7 +3516,12 @@ pub fn sys_mlock2(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
 
 // Linux apply_vma_lock_flags commits each VMA before encountering a hole.
 // Keep the mm lock across this walk so its successful prefix is unambiguous.
-fn apply_lock_prefix(aspace: &mut AddrSpace, start: VirtAddr, length: usize, enabled: bool) -> AxResult {
+fn apply_lock_prefix(
+    aspace: &mut AddrSpace,
+    start: VirtAddr,
+    length: usize,
+    enabled: bool,
+) -> AxResult {
     let end = start.checked_add(length).ok_or(AxError::InvalidInput)?;
     let mut cursor = start;
     while cursor < end {
@@ -3576,6 +3630,30 @@ mod tests {
         pseudofs::tmp::MemoryFs,
         task::UserNamespace,
     };
+
+    #[test]
+    fn physical_mmap_rejects_wrapped_and_out_of_window_offsets() {
+        assert_eq!(
+            physical_mmap_window(0x1000, 0x5000, usize::MAX - 0xfff, 4096),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            physical_mmap_window(0x1000, 0x5000, 0x4000, 4096),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            physical_mmap_window(0x1000, 0x5000, 0x5000, 4096),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            physical_mmap_window(0x1000, 0x1800, 0, 4096),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            physical_mmap_window(0x1000, 0x5000, 0x1000, 4096),
+            Ok((0x2000, 0x3000))
+        );
+    }
 
     #[test]
     fn pkey_alloc_rejects_full_width_invalid_arguments_before_task_access() {
@@ -3814,38 +3892,63 @@ mod tests {
 
     impl MsyncBackingFile {
         fn node(&self) -> &axfs_ng_vfs::FileNode {
-            self.backing.entry().as_file().expect("test backing is a regular file")
+            self.backing
+                .entry()
+                .as_file()
+                .expect("test backing is a regular file")
         }
     }
 
     impl axfs_ng_vfs::FilesystemOps for MsyncBackingFile {
-        fn name(&self) -> &str { "msync-writeback-test" }
+        fn name(&self) -> &str {
+            "msync-writeback-test"
+        }
         fn root_dir(&self) -> axfs_ng_vfs::DirEntry {
             axfs_ng_vfs::DirEntry::new_file(
                 axfs_ng_vfs::FileNode::new(self.this.upgrade().unwrap()),
-                NodeType::RegularFile, axfs_ng_vfs::Reference::root())
+                NodeType::RegularFile,
+                axfs_ng_vfs::Reference::root(),
+            )
         }
         fn stat(&self) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::StatFs> {
             self.node().filesystem().stat()
         }
     }
     impl axfs_ng_vfs::NodeOps for MsyncBackingFile {
-        fn inode(&self) -> u64 { self.node().inode() }
-        fn metadata(&self) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::Metadata> { self.node().metadata() }
-        fn update_metadata(&self, update: axfs_ng_vfs::MetadataUpdate) -> axfs_ng_vfs::VfsResult<()> {
+        fn inode(&self) -> u64 {
+            self.node().inode()
+        }
+        fn metadata(&self) -> axfs_ng_vfs::VfsResult<axfs_ng_vfs::Metadata> {
+            self.node().metadata()
+        }
+        fn update_metadata(
+            &self,
+            update: axfs_ng_vfs::MetadataUpdate,
+        ) -> axfs_ng_vfs::VfsResult<()> {
             self.node().update_metadata(update)
         }
-        fn filesystem(&self) -> &dyn axfs_ng_vfs::FilesystemOps { self }
-        fn sync(&self, data_only: bool) -> axfs_ng_vfs::VfsResult<()> { self.node().sync(data_only) }
+        fn filesystem(&self) -> &dyn axfs_ng_vfs::FilesystemOps {
+            self
+        }
+        fn sync(&self, data_only: bool) -> axfs_ng_vfs::VfsResult<()> {
+            self.node().sync(data_only)
+        }
         fn persistent_user_data(&self) -> Option<&axfs_ng_vfs::NodeUserData> {
             self.node().persistent_user_data()
         }
-        fn into_any(self: Arc<Self>) -> Arc<dyn core::any::Any + Send + Sync> { self }
+        fn into_any(self: Arc<Self>) -> Arc<dyn core::any::Any + Send + Sync> {
+            self
+        }
     }
     impl axpoll::Pollable for MsyncBackingFile {
-        fn poll(&self) -> axpoll::IoEvents { axpoll::IoEvents::READABLE | axpoll::IoEvents::WRITABLE }
-        fn register<'a>(&'a self, _: &mut core::task::Context<'_>, _: axpoll::IoEvents)
-            -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        fn poll(&self) -> axpoll::IoEvents {
+            axpoll::IoEvents::READABLE | axpoll::IoEvents::WRITABLE
+        }
+        fn register<'a>(
+            &'a self,
+            _: &mut core::task::Context<'_>,
+            _: axpoll::IoEvents,
+        ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
             axpoll::PollRegistration::empty()
         }
     }
@@ -3856,8 +3959,12 @@ mod tests {
         fn write_at(&self, buf: &[u8], offset: u64) -> axfs_ng_vfs::VfsResult<usize> {
             self.node().write_at(buf, offset)
         }
-        fn set_len(&self, len: u64) -> axfs_ng_vfs::VfsResult<()> { self.node().set_len(len) }
-        fn append(&self, buf: &[u8]) -> axfs_ng_vfs::VfsResult<(usize, u64)> { self.node().append(buf) }
+        fn set_len(&self, len: u64) -> axfs_ng_vfs::VfsResult<()> {
+            self.node().set_len(len)
+        }
+        fn append(&self, buf: &[u8]) -> axfs_ng_vfs::VfsResult<(usize, u64)> {
+            self.node().append(buf)
+        }
         fn set_symlink(&self, target: &axfs_ng_vfs::FsPath) -> axfs_ng_vfs::VfsResult<()> {
             self.node().set_symlink(target)
         }
@@ -3868,30 +3975,42 @@ mod tests {
         let _context = crate::test_support::scheduler_test_context();
         let fs = MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&fs);
-        let location = mount.root_location().create(
-            axfs_ng_vfs::FsName::new(b"msync-holes"),
-            NodeType::RegularFile,
-            NodePermission::from_bits_truncate(0o600),
-        ).unwrap();
+        let location = mount
+            .root_location()
+            .create(
+                axfs_ng_vfs::FsName::new(b"msync-holes"),
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
         let backing = location;
-        let provider = Arc::new_cyclic(|this| MsyncBackingFile { this: this.clone(), backing });
+        let provider = Arc::new_cyclic(|this| MsyncBackingFile {
+            this: this.clone(),
+            backing,
+        });
         let disk = axfs_ng_vfs::Filesystem::new(provider);
         let location = Mountpoint::new_root(&disk).root_location();
         let node = location.entry().as_file().unwrap();
         node.set_len((PAGE_SIZE_4K * 6) as u64).unwrap();
         let cache = CachedFile::get_or_create(location.clone());
         for page in 0..6 {
-            cache.write_at_slice(&[page as u8 + 1], (page * PAGE_SIZE_4K) as u64).unwrap();
+            cache
+                .write_at_slice(&[page as u8 + 1], (page * PAGE_SIZE_4K) as u64)
+                .unwrap();
         }
         let description = FileDescription::new(Arc::new(File::new(axfs::File::new(
             FileBackend::Cached(cache.clone()),
             FileFlags::READ | FileFlags::WRITE,
-        )))).unwrap();
+        ))))
+        .unwrap();
         let file = FileHandle::<dyn FileLike>::from_description_for_test(description)
-            .downcast::<File>().unwrap();
+            .downcast::<File>()
+            .unwrap();
         let owner = UserNamespace::try_new_root().unwrap();
         let base = VirtAddr::from(0x4000);
-        let aspace = Arc::new(Mutex::new(AddrSpace::new_empty(base, PAGE_SIZE_4K * 6).unwrap()));
+        let aspace = Arc::new(Mutex::new(
+            AddrSpace::new_empty(base, PAGE_SIZE_4K * 6).unwrap(),
+        ));
         for (page, pages, sharing) in [
             (0, 1, FileMappingSharing::Shared),
             (2, 2, FileMappingSharing::Shared),
@@ -3899,29 +4018,45 @@ mod tests {
         ] {
             let start = base + page * PAGE_SIZE_4K;
             let lease = FileMappingLease::new(
-                file.clone(), owner.clone(), start, (page * PAGE_SIZE_4K) as u64,
+                file.clone(),
+                owner.clone(),
+                start,
+                (page * PAGE_SIZE_4K) as u64,
                 MappingFlags::USER | MappingFlags::READ,
                 MappingFlags::READ | MappingFlags::WRITE,
                 sharing,
             );
             let backend = if sharing == FileMappingSharing::Shared {
                 Backend::new_file(
-                    start, cache.clone(), FileFlags::READ | FileFlags::WRITE,
-                    page * PAGE_SIZE_4K, Some((PAGE_SIZE_4K * 6) as u64), &aspace,
-                ).unwrap()
+                    start,
+                    cache.clone(),
+                    FileFlags::READ | FileFlags::WRITE,
+                    page * PAGE_SIZE_4K,
+                    Some((PAGE_SIZE_4K * 6) as u64),
+                    &aspace,
+                )
+                .unwrap()
             } else {
                 Backend::new_alloc(start, PageSize::Size4K)
-            }.with_file_mapping(lease);
-            aspace.lock().map(
-                start, pages * PAGE_SIZE_4K, MappingFlags::USER | MappingFlags::READ,
-                false, backend,
-            ).unwrap();
+            }
+            .with_file_mapping(lease);
+            aspace
+                .lock()
+                .map(
+                    start,
+                    pages * PAGE_SIZE_4K,
+                    MappingFlags::USER | MappingFlags::READ,
+                    false,
+                    backend,
+                )
+                .unwrap();
         }
         // Read the backing node directly, bypassing the dirty page cache.
         // A cached read could conceal missing writeback after a hole.
         let mut byte = [0];
         for page in 0..6 {
-            node.read_at(&mut byte, (page * PAGE_SIZE_4K) as u64).unwrap();
+            node.read_at(&mut byte, (page * PAGE_SIZE_4K) as u64)
+                .unwrap();
             assert_eq!(byte, [0]);
         }
         assert_eq!(
@@ -3929,12 +4064,21 @@ mod tests {
             Err(AxError::NoMemory),
         );
         for page in 0..6 {
-            node.read_at(&mut byte, (page * PAGE_SIZE_4K) as u64).unwrap();
-            let expected = if matches!(page, 0 | 2 | 3) { page as u8 + 1 } else { 0 };
+            node.read_at(&mut byte, (page * PAGE_SIZE_4K) as u64)
+                .unwrap();
+            let expected = if matches!(page, 0 | 2 | 3) {
+                page as u8 + 1
+            } else {
+                0
+            };
             assert_eq!(byte, [expected], "backing page {page}");
         }
-        cache.write_at_slice(&[42], (PAGE_SIZE_4K * 2) as u64).unwrap();
-        cache.write_at_slice(&[43], (PAGE_SIZE_4K * 3) as u64).unwrap();
+        cache
+            .write_at_slice(&[42], (PAGE_SIZE_4K * 2) as u64)
+            .unwrap();
+        cache
+            .write_at_slice(&[43], (PAGE_SIZE_4K * 3) as u64)
+            .unwrap();
         let leading_hole = (base + PAGE_SIZE_4K).as_usize();
         assert_eq!(
             msync_address_space(&aspace, leading_hole, PAGE_SIZE_4K * 2, MS_ASYNC),

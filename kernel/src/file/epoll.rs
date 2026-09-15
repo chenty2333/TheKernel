@@ -35,7 +35,7 @@ use crate::task::AX_FILE_LIMIT;
 const EPOLL_MAX_NESTS: usize = 5;
 const EPOLL_CORE_CAPACITY: usize = AX_FILE_LIMIT;
 const EPOLL_GLOBAL_CORE_SLOTS: usize = 65_536;
-const EPOLL_GRAPH_NODES: usize = 64;
+const EPOLL_GRAPH_NODES: usize = 4096;
 const EPOLL_GRAPH_EDGES: usize = 16_384;
 const EPOLL_GRAPH_WALK_LIMIT: usize = 65_536;
 const EPOLL_WAITER_SLOTS: usize = 64;
@@ -533,6 +533,7 @@ impl PendingQueue {
 }
 
 struct InterestRecord {
+    _charge: EpollCoreCharge,
     key: EpollKey,
     token: EpollToken,
     edge: GraphEdgeToken,
@@ -579,13 +580,11 @@ struct EpollInner {
     state: SpinNoIrq<EpollState>,
     wake_port: Arc<EpollWakePort>,
     fault: AtomicU8,
-    _charge: EpollCoreCharge,
 }
 
 impl EpollInner {
     fn try_new() -> AxResult<Arc<Self>> {
         let id = allocate_epoll_id()?;
-        let charge = EpollCoreCharge::try_new(EPOLL_CORE_CAPACITY)?;
         let state = EpollState::try_new(id)?;
         let wake_port = Arc::try_new(EpollWakePort {
             poll_ready: PollSet::new(),
@@ -601,7 +600,6 @@ impl EpollInner {
             state: SpinNoIrq::new(state),
             wake_port,
             fault: AtomicU8::new(EPOLL_FAULT_NONE),
-            _charge: charge,
         })
         .map_err(|_| AxError::NoMemory)
     }
@@ -1086,6 +1084,7 @@ impl Epoll {
     pub fn add(&self, fd: i32, event: EpollEvent, flags: EpollFlags) -> AxResult<()> {
         let (key, file) = Self::target(fd)?;
         Self::validate_target(&file)?;
+        let charge = EpollCoreCharge::try_new(1)?;
         let interest = interest_from_io(event.events)?;
         let mode = InterestMode {
             edge: flags.contains(EpollFlags::EDGE_TRIGGER),
@@ -1159,6 +1158,7 @@ impl Epoll {
         }
         state.by_key.insert(key, token);
         state.by_slot[token.slot()] = Some(InterestRecord {
+            _charge: charge,
             key,
             token,
             edge,
@@ -1237,6 +1237,7 @@ impl Epoll {
         };
         state.by_key.insert(key, token);
         state.by_slot[token.slot()] = Some(InterestRecord {
+            _charge: old_record._charge,
             key,
             token,
             edge: old_record.edge,
@@ -1249,7 +1250,7 @@ impl Epoll {
         old_record.control.deactivate();
         let (_, _, _, _, retired_control) = retired.into_parts();
         drop(retired_control);
-        drop(old_record);
+        drop(old_record.control);
         if publication.target_closed {
             self.inner.remove_closed_target(token, &control);
             return Ok(());
@@ -1503,11 +1504,23 @@ mod tests {
     }
 
     #[test]
-    fn per_instance_core_storage_has_a_global_charge() {
+    fn interests_have_refundable_global_charges() {
         let before = EPOLL_CORE_SLOTS.load(Ordering::Acquire);
         let charge = EpollCoreCharge::try_new(7).unwrap();
         assert_eq!(EPOLL_CORE_SLOTS.load(Ordering::Acquire), before + 7);
         drop(charge);
+        assert_eq!(EPOLL_CORE_SLOTS.load(Ordering::Acquire), before);
+    }
+
+    #[test]
+    fn empty_instances_do_not_consume_interest_budget() {
+        let before = EPOLL_CORE_SLOTS.load(Ordering::Acquire);
+        let mut instances = Vec::new();
+        for _ in 0..65 {
+            instances.push(Epoll::new().unwrap());
+        }
+        assert_eq!(EPOLL_CORE_SLOTS.load(Ordering::Acquire), before);
+        drop(instances);
         assert_eq!(EPOLL_CORE_SLOTS.load(Ordering::Acquire), before);
     }
 
@@ -1548,6 +1561,7 @@ mod tests {
             .unwrap();
         state.by_key.insert(key, token);
         state.by_slot[token.slot()] = Some(InterestRecord {
+            _charge: EpollCoreCharge::try_new(1).unwrap(),
             key,
             token,
             edge,

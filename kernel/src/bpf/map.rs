@@ -2269,6 +2269,10 @@ impl BpfMap for RingBufMap {
         if state.reserved_bytes < size {
             return Err(AxError::InvalidInput);
         }
+        state
+            .records
+            .try_reserve(1)
+            .map_err(|_| AxError::NoMemory)?;
         state.reserved_bytes -= size;
         state.committed_bytes = state.committed_bytes.saturating_add(size);
         state.records.push_back(data);
@@ -2297,6 +2301,42 @@ impl BpfMap for RingBufMap {
         if data.len() > self.max_entries as usize {
             return Err(AxError::NoMemory);
         }
-        self.ringbuf_submit(data.to_vec(), flags)
+        let mut record = Vec::new();
+        record
+            .try_reserve_exact(data.len())
+            .map_err(|_| AxError::NoMemory)?;
+        record.extend_from_slice(data);
+        self.ringbuf_reserve(data.len(), flags)?;
+        if let Err(error) = self.ringbuf_submit(record, flags) {
+            self.ringbuf_discard(data.len(), flags)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ringbuf_output_tests {
+    use super::*;
+
+    #[test]
+    fn output_reserves_and_commits_without_a_prior_reservation() {
+        let map = RingBufMap::new(0, 0, 8, 0, [0; BPF_OBJ_NAME_LEN], 1).unwrap();
+        map.ringbuf_output(&[1, 2, 3, 4], 0).unwrap();
+        let state = map.state.lock();
+        assert_eq!(state.reserved_bytes, 0);
+        assert_eq!(state.committed_bytes, 4);
+        assert_eq!(state.records.front().unwrap().as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn failed_output_preserves_other_reservations_and_records() {
+        let map = RingBufMap::new(0, 0, 8, 0, [0; BPF_OBJ_NAME_LEN], 1).unwrap();
+        map.ringbuf_reserve(4, 0).unwrap();
+        assert_eq!(map.ringbuf_output(&[0; 5], 0), Err(AxError::NoMemory));
+        let state = map.state.lock();
+        assert_eq!(state.reserved_bytes, 4);
+        assert_eq!(state.committed_bytes, 0);
+        assert!(state.records.is_empty());
     }
 }

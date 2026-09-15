@@ -7,9 +7,7 @@ use core::{
     any::Any,
     cell::RefCell,
     ops::Deref,
-    sync::atomic::{
-        AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-    },
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 use axcpu::ioport::{self, IO_BITMAP_BYTES};
@@ -867,6 +865,16 @@ pub struct FdTableSlot {
 }
 
 impl FdTableSlot {
+    fn try_snapshot(slot: &SpinNoIrq<Option<Arc<Self>>>) -> Option<Arc<crate::file::FdTable>> {
+        slot.lock().as_ref().map(|slot| slot.table.clone())
+    }
+
+    fn retire(slot: &SpinNoIrq<Option<Arc<Self>>>) -> Arc<Self> {
+        let retired = slot.lock().take().expect("files_struct retired twice");
+        retired.release_task();
+        retired
+    }
+
     pub(crate) fn new(table: Arc<crate::file::FdTable>) -> Arc<Self> {
         Arc::new(Self {
             table,
@@ -891,6 +899,16 @@ impl FdTableSlot {
 }
 
 impl FsContextSlot {
+    fn try_snapshot(slot: &SpinNoIrq<Option<Arc<Self>>>) -> Option<Arc<Mutex<FsContext>>> {
+        slot.lock().as_ref().map(|slot| slot.context.clone())
+    }
+
+    fn retire(slot: &SpinNoIrq<Option<Arc<Self>>>) -> Arc<Self> {
+        let retired = slot.lock().take().expect("fs_struct retired twice");
+        retired.release_task();
+        retired
+    }
+
     pub(crate) fn new(context: Arc<Mutex<FsContext>>) -> Arc<Self> {
         Arc::new(Self {
             context,
@@ -1117,7 +1135,7 @@ pub struct Thread {
     ioport: SpinNoIrq<IoPortState>,
 
     /// The OOM score adjustment value.
-    oom_score_adj: AtomicI32,
+    oom_score_adj: SpinNoIrq<OomScoreAdjustment>,
 
     /// Ready to exit
     pub exit: Arc<AtomicBool>,
@@ -1556,7 +1574,12 @@ impl Thread {
             !group.is_prunable()
         });
         drop(events);
-        crate::file::PerfGroup::cpu_context_tracepoint(axhal::percpu::this_cpu_id(), id, raw, timestamp);
+        crate::file::PerfGroup::cpu_context_tracepoint(
+            axhal::percpu::this_cpu_id(),
+            id,
+            raw,
+            timestamp,
+        );
     }
 
     pub(crate) fn perf_emit_debug_exception(&self, slot_mask: u64, ip: u64, user: bool) {
@@ -1718,7 +1741,10 @@ impl Thread {
             mce_kill_policy: AtomicU8::new(2),
             ioport: SpinNoIrq::new(IoPortState::default()),
             exit,
-            oom_score_adj: AtomicI32::new(200),
+            oom_score_adj: SpinNoIrq::new(OomScoreAdjustment {
+                value: 200,
+                minimum: 0,
+            }),
             active_scope_read_held: AtomicBool::new(false),
             restart: SpinNoIrq::new(restart),
             exit_event,
@@ -1978,10 +2004,7 @@ impl Thread {
     /// Takes a live fs_struct reference without treating an exiting task's
     /// already-retired slot as a kernel invariant violation.
     pub(crate) fn try_fs_context(&self) -> Option<Arc<Mutex<FsContext>>> {
-        self.fs_context
-            .lock()
-            .as_ref()
-            .map(|slot| slot.context.clone())
+        FsContextSlot::try_snapshot(&self.fs_context)
     }
 
     /// Acquires one Linux task ownership of this `fs_struct`.
@@ -2003,7 +2026,7 @@ impl Thread {
     /// task-table reference can race exit after lookup, and that race is an
     /// ordinary missing-FD result rather than a kernel invariant failure.
     pub(crate) fn try_fd_table(&self) -> Option<Arc<crate::file::FdTable>> {
-        self.fd_table.lock().as_ref().map(|slot| slot.table.clone())
+        FdTableSlot::try_snapshot(&self.fd_table)
     }
     pub(crate) fn fd_table_is_shared(&self) -> bool {
         self.fd_table
@@ -2051,13 +2074,7 @@ impl Thread {
     /// accesses are invalid, and dropping the returned Arc performs final
     /// descriptor/resource close when it was the last owner.
     pub(crate) fn retire_fd_table(&self) -> Arc<FdTableSlot> {
-        let slot = self
-            .fd_table
-            .lock()
-            .take()
-            .expect("files_struct retired twice");
-        slot.release_task();
-        slot
+        FdTableSlot::retire(&self.fd_table)
     }
 
     /// Creates a private `fs_struct` only when this task's slot actually
@@ -2168,13 +2185,7 @@ impl Thread {
 
     /// Removes the exact task owner's fs_struct at authoritative task unlink.
     pub(crate) fn retire_fs_context(&self) -> Arc<FsContextSlot> {
-        let slot = self
-            .fs_context
-            .lock()
-            .take()
-            .expect("fs_struct retired twice");
-        slot.release_task();
-        slot
+        FsContextSlot::retire(&self.fs_context)
     }
 
     /// Returns the shared I/O-priority context used by `CLONE_IO`, if Linux
@@ -2487,12 +2498,17 @@ impl Thread {
 
     /// Get the oom score adjustment value.
     pub fn oom_score_adj(&self) -> i32 {
-        self.oom_score_adj.load(Ordering::SeqCst)
+        self.oom_score_adj.lock().value
     }
 
-    /// Set the oom score adjustment value.
-    pub fn set_oom_score_adj(&self, value: i32) {
-        self.oom_score_adj.store(value, Ordering::SeqCst);
+    /// Keep the value and the privileged floor in one critical section.
+    pub fn set_oom_score_adj(&self, value: i32, can_lower: bool) -> AxResult<()> {
+        self.oom_score_adj.lock().set(value, can_lower)
+    }
+
+    pub(crate) fn inherit_oom_score_adj(&self, parent: &Thread) {
+        let inherited = *parent.oom_score_adj.lock();
+        *self.oom_score_adj.lock() = inherited;
     }
 
     /// Check if the thread is ready to exit.
@@ -2939,6 +2955,73 @@ mod ioport_tests {
     }
 }
 
+/// Linux allows unprivileged writes back down to the last privileged floor,
+/// rather than forbidding every decrease after an unprivileged increase.
+#[derive(Clone, Copy)]
+struct OomScoreAdjustment {
+    value: i32,
+    minimum: i32,
+}
+
+impl OomScoreAdjustment {
+    fn set(&mut self, value: i32, privileged: bool) -> AxResult<()> {
+        if !(-1000..=1000).contains(&value) {
+            return Err(AxError::InvalidInput);
+        }
+        if value < self.minimum && !privileged {
+            return Err(AxError::PermissionDenied);
+        }
+        self.value = value;
+        if privileged {
+            self.minimum = value;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod retired_task_resource_tests {
+    use super::*;
+
+    #[test]
+    fn files_snapshot_survives_retirement_while_new_inspection_returns_none() {
+        let _context = crate::test_support::scheduler_test_context();
+        let table = Arc::new(crate::file::FdTable::new().unwrap());
+        let owned = FdTableSlot::new(table.clone());
+        owned.acquire_task();
+        let slot = SpinNoIrq::new(Some(owned));
+        let pinned = FdTableSlot::try_snapshot(&slot).unwrap();
+        assert!(Arc::ptr_eq(&pinned, &table));
+        let retired = FdTableSlot::retire(&slot);
+        // do_exit retires the slot before publishing its exit flag. A
+        // cross-task inspection in that exact window must simply miss.
+        assert!(FdTableSlot::try_snapshot(&slot).is_none());
+        assert!(!retired.has_task_users());
+        drop(retired);
+        assert!(pinned.try_fd_numbers().unwrap().is_empty());
+        assert!(FdTableSlot::try_snapshot(&slot).is_none());
+    }
+
+    #[test]
+    fn fs_snapshot_survives_retirement_while_new_inspection_returns_none() {
+        let _context = crate::test_support::scheduler_test_context();
+        let filesystem = crate::pseudofs::MemoryFs::new().unwrap();
+        let root = axfs_ng_vfs::Mountpoint::new_root(&filesystem);
+        let context = Arc::new(Mutex::new(FsContext::new(root.root_location())));
+        let owned = FsContextSlot::new(context.clone());
+        owned.acquire_task();
+        let slot = SpinNoIrq::new(Some(owned));
+        let pinned = FsContextSlot::try_snapshot(&slot).unwrap();
+        assert!(Arc::ptr_eq(&pinned, &context));
+        let retired = FsContextSlot::retire(&slot);
+        assert!(FsContextSlot::try_snapshot(&slot).is_none());
+        assert_eq!(retired.task_users.load(Ordering::Acquire), 0);
+        drop(retired);
+        assert!(pinned.lock().root_dir().is_root());
+        assert!(FsContextSlot::try_snapshot(&slot).is_none());
+    }
+}
+
 #[cfg(test)]
 mod task_parent_tests {
     extern crate std;
@@ -2947,6 +3030,25 @@ mod task_parent_tests {
 
     use super::*;
     use crate::task::UserNamespace;
+
+    #[test]
+    fn oom_adjustment_requires_privilege_below_floor_and_preserves_denied_state() {
+        let mut adjustment = OomScoreAdjustment {
+            value: 200,
+            minimum: 0,
+        };
+        assert_eq!(adjustment.set(-1000, false), Err(AxError::PermissionDenied));
+        assert_eq!(adjustment.value, 200);
+        assert_eq!(adjustment.set(500, false), Ok(()));
+        assert_eq!(adjustment.set(0, false), Ok(()));
+        assert_eq!(adjustment.set(-500, true), Ok(()));
+        assert_eq!(adjustment.set(100, false), Ok(()));
+        assert_eq!(adjustment.set(-500, false), Ok(()));
+        assert_eq!(adjustment.set(-501, false), Err(AxError::PermissionDenied));
+        assert_eq!(adjustment.set(-1001, true), Err(AxError::InvalidInput));
+        assert_eq!(adjustment.minimum, -500);
+        assert_eq!(adjustment.value, -500);
+    }
 
     fn node(tid: Pid) -> Arc<TaskParentNode> {
         TaskParentNode::try_new(tid, Weak::new(), Weak::new()).unwrap()

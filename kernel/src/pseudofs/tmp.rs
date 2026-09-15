@@ -781,6 +781,11 @@ impl FileContent {
 
     fn write_at(&self, fs: &MemoryFs, buf: &[u8], offset: u64) -> VfsResult<usize> {
         let _mutation = self.huge_mutation.lock();
+        self.write_at_locked(fs, buf, offset)
+    }
+
+    // Caller holds huge_mutation, shared with truncate and range mutation.
+    fn write_at_locked(&self, fs: &MemoryFs, buf: &[u8], offset: u64) -> VfsResult<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -1993,11 +1998,9 @@ impl FileNodeOps for MemoryNode {
 
     fn append(&self, buf: &[u8]) -> VfsResult<(usize, u64)> {
         let file = self.inode.as_file()?;
-        if buf.is_empty() {
-            return Ok((0, *file.length.lock()));
-        }
+        let _mutation = file.huge_mutation.lock();
         let offset = *file.length.lock();
-        let written = file.write_at(&self.fs, buf, offset)?;
+        let written = file.write_at_locked(&self.fs, buf, offset)?;
         Ok((written, offset + written as u64))
     }
 
@@ -2677,6 +2680,48 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_appends_do_not_overwrite_each_other() {
+        let file = regular_file("append-race");
+        let start = Arc::new(Barrier::new(4));
+        let workers: Vec<_> = (0..4u8)
+            .map(|id| {
+                let file = file.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..128 {
+                        assert_eq!(
+                            file.entry().as_file().unwrap().append(&[id; 16]).unwrap().0,
+                            16
+                        );
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let mut data = vec![0; 4 * 128 * 16];
+        assert_eq!(file.len().unwrap(), data.len() as u64);
+        assert_eq!(
+            file.entry()
+                .as_file()
+                .unwrap()
+                .read_at(&mut data, 0)
+                .unwrap(),
+            data.len()
+        );
+        for id in 0..4u8 {
+            assert_eq!(
+                data.chunks_exact(16)
+                    .filter(|chunk| *chunk == [id; 16])
+                    .count(),
+                128
+            );
+        }
+    }
+
+    #[test]
     fn xattr_provider_serializes_modes_and_persists_across_hard_links() {
         let fs = MemoryFs::new().unwrap();
         let mount = Mountpoint::new_root(&fs);
@@ -2773,7 +2818,9 @@ mod tests {
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
-        let alias = root.link(FsName::new(b"xattr-create-alias"), &file).unwrap();
+        let alias = root
+            .link(FsName::new(b"xattr-create-alias"), &file)
+            .unwrap();
         let start = Arc::new(Barrier::new(3));
         let first_start = start.clone();
         let first = file.clone();
@@ -2952,7 +2999,8 @@ mod tests {
         assert_eq!(source.metadata().unwrap().nlink, 2);
 
         install_removal_timestamp_sentinels(&root, &source);
-        root.unlink_checked(FsName::new(b"unlink-first"), false, &source).unwrap();
+        root.unlink_checked(FsName::new(b"unlink-first"), false, &source)
+            .unwrap();
         let source_metadata = source.metadata().unwrap();
         let parent_metadata = root.metadata().unwrap();
         assert_eq!(source_metadata.nlink, 1);
@@ -2964,7 +3012,8 @@ mod tests {
         assert_eq!(parent_metadata.ctime, source_metadata.ctime);
 
         install_removal_timestamp_sentinels(&root, &source);
-        root.unlink_checked(FsName::new(b"unlink-last"), false, &alias).unwrap();
+        root.unlink_checked(FsName::new(b"unlink-last"), false, &alias)
+            .unwrap();
         let source_metadata = source.metadata().unwrap();
         let parent_metadata = root.metadata().unwrap();
         assert_eq!(source_metadata.nlink, 0);
@@ -3039,7 +3088,8 @@ mod tests {
         assert_eq!(metadata_state(&victim), victim_before);
 
         assert_eq!(
-            root.unlink_checked(FsName::new(b"victim"), true, &victim).unwrap_err(),
+            root.unlink_checked(FsName::new(b"victim"), true, &victim)
+                .unwrap_err(),
             VfsError::NotADirectory
         );
         assert_eq!(metadata_state(&root), parent_before);
@@ -3102,10 +3152,7 @@ mod tests {
         assert_eq!(anonymous_meta.nlink, 0);
         assert_eq!((anonymous_meta.uid, anonymous_meta.gid), (1000, 1001));
         assert!(!anonymous.entry().is_root_of_mount());
-        assert_ne!(
-            anonymous.entry().object_key(),
-            root.entry().object_key()
-        );
+        assert_ne!(anonymous.entry().object_key(), root.entry().object_key());
         assert_eq!(
             anonymous.absolute_path().unwrap_err(),
             axfs_ng_vfs::VfsError::InvalidInput
@@ -3137,13 +3184,16 @@ mod tests {
         assert!(after.iter().any(|name| name == "published"));
         assert!(!after.iter().any(|name| name.starts_with(".tmpfile-")));
 
-        let second = root.link(FsName::new(b"published-again"), &anonymous).unwrap();
+        let second = root
+            .link(FsName::new(b"published-again"), &anonymous)
+            .unwrap();
         assert_eq!(second.metadata().unwrap().nlink, 2);
         root.unlink(FsName::new(b"published"), false).unwrap();
         root.unlink(FsName::new(b"published-again"), false).unwrap();
         assert_eq!(anonymous.metadata().unwrap().nlink, 0);
         assert_eq!(
-            root.link(FsName::new(b"resurrected"), &anonymous).unwrap_err(),
+            root.link(FsName::new(b"resurrected"), &anonymous)
+                .unwrap_err(),
             axfs_ng_vfs::VfsError::NotFound
         );
 
@@ -3151,7 +3201,8 @@ mod tests {
         unpublishable_options.linkable = false;
         let unpublishable = root.create_anonymous(&unpublishable_options).unwrap();
         assert_eq!(
-            root.link(FsName::new(b"exclusive"), &unpublishable).unwrap_err(),
+            root.link(FsName::new(b"exclusive"), &unpublishable)
+                .unwrap_err(),
             axfs_ng_vfs::VfsError::NotFound
         );
     }
@@ -3255,7 +3306,8 @@ mod tests {
             axfs_ng_vfs::VfsError::OperationNotPermitted
         );
         assert_eq!(
-            root.lookup_no_follow(FsName::new(b"empty-link")).unwrap_err(),
+            root.lookup_no_follow(FsName::new(b"empty-link"))
+                .unwrap_err(),
             axfs_ng_vfs::VfsError::NotFound
         );
 
@@ -3289,7 +3341,11 @@ mod tests {
         };
 
         let created = root
-            .create_named(FsName::new(b"device"), &options, CreateDisposition::Exclusive)
+            .create_named(
+                FsName::new(b"device"),
+                &options,
+                CreateDisposition::Exclusive,
+            )
             .unwrap();
         assert!(created.created);
         let metadata = created.entry.metadata().unwrap();
@@ -3320,8 +3376,12 @@ mod tests {
             ..options.clone()
         };
         assert_eq!(
-            root.create_named(FsName::new(b"invalid"), &invalid, CreateDisposition::Exclusive)
-                .unwrap_err(),
+            root.create_named(
+                FsName::new(b"invalid"),
+                &invalid,
+                CreateDisposition::Exclusive
+            )
+            .unwrap_err(),
             axfs_ng_vfs::VfsError::InvalidInput
         );
         assert_eq!(
@@ -3356,7 +3416,9 @@ mod tests {
         assert!(Arc::ptr_eq(&attached, &marker));
         assert_eq!(attached.0, 0xfeed_beef);
 
-        let _alias = root.link(FsName::new(b"socket-alias"), &created.entry).unwrap();
+        let _alias = root
+            .link(FsName::new(b"socket-alias"), &created.entry)
+            .unwrap();
         let unrelated = root
             .create(
                 FsName::new(b"unrelated"),
@@ -3364,7 +3426,8 @@ mod tests {
                 NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
-        root.unlink_checked(FsName::new(b"unrelated"), false, &unrelated).unwrap();
+        root.unlink_checked(FsName::new(b"unrelated"), false, &unrelated)
+            .unwrap();
 
         let visible = root.lookup_no_follow(FsName::new(b"socket")).unwrap();
         let visible_marker = visible.user_data().get::<Marker>().unwrap();

@@ -5,7 +5,7 @@ use core::mem::{offset_of, size_of};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axsync::spin::SpinNoIrq;
-use linux_raw_sys::general::CAP_NET_ADMIN;
+use linux_raw_sys::general::{CAP_NET_ADMIN, CAP_SYS_ADMIN};
 use thekernel_linux_bpf::{
     BPF_PERF_EVENT, BPF_PROG_TYPE_PERF_EVENT, BpfAttrLinkCreate, BpfAttrRawTracepointOpen,
 };
@@ -412,6 +412,13 @@ pub fn bpf_raw_tracepoint_open<M: UserMemory + ?Sized>(
     attr_ptr: usize,
     attr_size: u32,
 ) -> AxResult<isize> {
+    // A received FD conveys object access, not authority to inspect global tasks.
+    if !axtask::current()
+        .as_thread()
+        .has_effective_capability(CAP_SYS_ADMIN)
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
     require_bpf_attr_range::<BpfAttrRawTracepointOpen>(
         attr_size,
         size_of::<BpfAttrRawTracepointOpen>(),

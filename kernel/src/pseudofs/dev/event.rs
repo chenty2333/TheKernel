@@ -62,6 +62,16 @@ const SYN_DROPPED: u16 = 3;
 const EVDEV_CLIENT_QUEUE_EVENTS: usize = 256;
 const EVDEV_DEVICE_FRAME_EVENTS: usize = 256;
 const EVDEV_PUMP_EVENTS: usize = 256;
+// Linux input_mt_init_slots also bounds a device to 1024 contacts.
+const EVDEV_MAX_MT_SLOTS: usize = 1024;
+const ABS_MT_SLOT: u16 = 0x2f;
+const ABS_MT_LAST: u16 = 0x3d;
+
+fn valid_mt_slot(value: u32, maximum: u32) -> Option<usize> {
+    let slot = value as usize;
+    (slot < EVDEV_MAX_MT_SLOTS && value <= maximum).then_some(slot)
+}
+
 const EVENT_NODE_MODE: u16 = 0o660;
 
 lazy_static! {
@@ -357,13 +367,24 @@ impl EvdevDevice {
                     .insert(event.code as u8, event.value as i32);
             }
             if event.event_type == EventType::Absolute as u16 {
-                const ABS_MT_SLOT: u16 = 0x2f;
                 if event.code == ABS_MT_SLOT {
-                    state.mt_current_slot = event.value as usize;
-                } else if event.code >= 0x2f {
+                    let maximum = state
+                        .device
+                        .get_abs_info(ABS_MT_SLOT as u8)
+                        .ok()
+                        .flatten()
+                        .map(|info| info.max);
+                    let Some(slot) = maximum.and_then(|max| valid_mt_slot(event.value, max)) else {
+                        continue;
+                    };
+                    state.mt_current_slot = slot;
+                } else if (ABS_MT_SLOT + 1..=ABS_MT_LAST).contains(&event.code) {
                     let slot = state.mt_current_slot;
                     let slots = state.mt_slots.entry(event.code as u8).or_default();
                     if slot >= slots.len() {
+                        slots
+                            .try_reserve(slot + 1 - slots.len())
+                            .map_err(|_| AxError::NoMemory)?;
                         slots.resize(slot + 1, 0);
                     }
                     slots[slot] = event.value as i32;
@@ -1230,14 +1251,16 @@ impl EvdevFile {
         // These are the EVIOCGBIT classes accepted by Linux's
         // handle_eviocgbit(), independently of the device's evbit support.
         let event_type = match EventType::from_repr(ty) {
-            Some(event_type @ (EventType::Key
+            Some(
+                event_type @ (EventType::Key
                 | EventType::Relative
                 | EventType::Absolute
                 | EventType::Misc
                 | EventType::Switch
                 | EventType::Led
                 | EventType::Sound
-                | EventType::ForceFeedback)) => event_type,
+                | EventType::ForceFeedback),
+            ) => event_type,
             _ => return Err(LinuxError::EINVAL.into()),
         };
         let max_bit = event_type.bits_count().saturating_sub(1);
@@ -1491,8 +1514,7 @@ impl InputManager {
             DeviceIdentity::new("pci".into(), "input".into(), event_name.clone(), dev_id)
                 .and_then(|identity| identity.with_devname(format!("input/{event_name}")))
                 .and_then(|identity| {
-                    identity
-                        .child_of_path(format!("{transport_path}/input"), input_name.clone())
+                    identity.child_of_path(format!("{transport_path}/input"), input_name.clone())
                 });
         let published = (|| -> VfsResult<_> {
             let parent = DeviceRegistration::try_new(
@@ -1504,8 +1526,10 @@ impl InputManager {
             let event =
                 DeviceRegistration::try_new(event_identity?, "input".into(), Vec::new(), None)?;
             if !has_pci_transport(bus_identity) {
-                let parent_reservation = global_device_registry().reserve(parent.identity().clone())?;
-                let event_reservation = global_device_registry().reserve(event.identity().clone())?;
+                let parent_reservation =
+                    global_device_registry().reserve(parent.identity().clone())?;
+                let event_reservation =
+                    global_device_registry().reserve(event.identity().clone())?;
                 let (parent_handle, event_handle) = DeviceReservation::publish_pair_quiet(
                     parent_reservation,
                     parent,
@@ -1527,7 +1551,11 @@ impl InputManager {
                     (parent_reservation, parent),
                     (event_reservation, event),
                 ])?;
-            Ok((Some([pci_handle, virtio_handle]), parent_handle, event_handle))
+            Ok((
+                Some([pci_handle, virtio_handle]),
+                parent_handle,
+                event_handle,
+            ))
         })();
         let (transport_handles, parent_handle, event_handle) = match published {
             Ok(handles) => handles,
@@ -2089,9 +2117,11 @@ mod tests {
             .child_of_path(transport.into(), "input".into())
             .unwrap();
         let parent = DeviceRegistration::try_new(parent, "input".into(), Vec::new(), None).unwrap();
-        assert!(parent.uevent_payload().contains(
-            "DEVPATH=/devices/pci0000:00/0000:00:03.0/virtio0/input/input0\n"
-        ));
+        assert!(
+            parent
+                .uevent_payload()
+                .contains("DEVPATH=/devices/pci0000:00/0000:00:03.0/virtio0/input/input0\n")
+        );
 
         let identity = DeviceIdentity::new(
             "pci".into(),
@@ -2102,16 +2132,15 @@ mod tests {
         .unwrap()
         .with_devname("input/event0".into())
         .unwrap()
-        .child_of_path(
-            format!("{transport}/input"),
-            "input0".into(),
-        )
+        .child_of_path(format!("{transport}/input"), "input0".into())
         .unwrap();
         let registration =
             DeviceRegistration::try_new(identity, "input".into(), Vec::new(), None).unwrap();
-        assert!(registration.uevent_payload().contains(
-            "DEVPATH=/devices/pci0000:00/0000:00:03.0/virtio0/input/input0/event0\n"
-        ));
+        assert!(
+            registration
+                .uevent_payload()
+                .contains("DEVPATH=/devices/pci0000:00/0000:00:03.0/virtio0/input/input0/event0\n")
+        );
     }
 
     #[test]
@@ -2166,11 +2195,21 @@ mod tests {
             ]
         );
         assert_eq!(
-            attributes.iter().find(|attribute| attribute.name() == "id").unwrap().directory_child_names().unwrap(),
+            attributes
+                .iter()
+                .find(|attribute| attribute.name() == "id")
+                .unwrap()
+                .directory_child_names()
+                .unwrap(),
             vec!["bustype", "vendor", "product", "version"]
         );
         assert_eq!(
-            attributes.iter().find(|attribute| attribute.name() == "capabilities").unwrap().directory_child_names().unwrap(),
+            attributes
+                .iter()
+                .find(|attribute| attribute.name() == "capabilities")
+                .unwrap()
+                .directory_child_names()
+                .unwrap(),
             vec!["ev", "key", "rel", "abs", "msc", "led", "snd", "ff", "sw"]
         );
     }
@@ -2298,5 +2337,19 @@ mod tests {
         );
         assert_eq!(input_mask_event_type(EventType::Key as u32), Some(1));
         assert_eq!(input_mask_event_type(u32::MAX), None);
+    }
+}
+
+#[cfg(test)]
+mod mt_slot_bounds_tests {
+    use super::*;
+    #[test]
+    fn malformed_mt_slot_never_becomes_an_allocation_size() {
+        assert_eq!(valid_mt_slot(u32::MAX, u32::MAX), None);
+        assert_eq!(valid_mt_slot(i32::MAX as u32, u32::MAX), None);
+        assert_eq!(valid_mt_slot(1024, u32::MAX), None);
+        assert_eq!(valid_mt_slot(10, 9), None);
+        assert_eq!(valid_mt_slot(9, 9), Some(9));
+        assert_eq!(valid_mt_slot(0, 0), Some(0));
     }
 }

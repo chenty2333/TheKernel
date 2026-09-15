@@ -175,7 +175,7 @@ impl DrmFbdev {
     /// The fbdev GEM remains allocated, but it cannot submit or modeset until
     /// mastership is reacquired for text mode.
     pub fn release_master(&self) {
-        self.file.drop_master();
+        let _ = self.file.drop_master();
     }
 
     pub fn acquire_master(&self) -> DrmResult<()> {

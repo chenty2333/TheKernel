@@ -2,7 +2,9 @@ use core::ffi::{c_char, c_int};
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::FsPathBuf;
-use linux_raw_sys::general::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, O_NONBLOCK, O_RDWR};
+use linux_raw_sys::general::{
+    AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW, CAP_SYS_ADMIN, O_NONBLOCK, O_RDWR,
+};
 
 use crate::{
     file::{
@@ -10,10 +12,19 @@ use crate::{
         inotify::location_for_fd, resolve_at,
     },
     mm::{UserMemoryCapability, map_usercopy_error},
+    task::AsThread,
 };
 
 pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> AxResult<isize> {
     validate_init_flags(flags, event_f_flags)?;
+    // This implementation supports global and permission events, not Linux's
+    // restricted unprivileged notification-only groups.
+    if !axtask::current()
+        .as_thread()
+        .has_effective_capability(CAP_SYS_ADMIN)
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
 
     add_file_like_with_flags(
         FanotifyFile::new(flags, event_f_flags)?,

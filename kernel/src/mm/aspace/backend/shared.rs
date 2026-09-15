@@ -115,6 +115,7 @@ fn uncharge_shmem_pages(charge: &AtomicUsize, resident_frames: usize, page_size:
 }
 
 pub struct SharedPages {
+    allocation_owner: Mutex<Option<Arc<dyn Send + Sync>>>,
     backing_key: SharedBackingKey,
     phys_pages: Mutex<SharedPageStorage>,
     // Secret objects keep their frames in a separate owner.  The ordinary
@@ -220,6 +221,17 @@ impl ExternalPageLease {
     }
 }
 impl SharedPages {
+    /// Retain a pre-admitted allocation charge until the final backing drop,
+    /// including VMA, PRIME and asynchronous device references.
+    pub(crate) fn retain_allocation_owner(&self, owner: Arc<dyn Send + Sync>) -> AxResult<()> {
+        let mut slot = self.allocation_owner.lock();
+        if slot.is_some() {
+            return Err(AxError::AlreadyExists);
+        }
+        *slot = Some(owner);
+        Ok(())
+    }
+
     pub(crate) const fn is_secret(&self) -> bool {
         self.secret_frames.is_some()
     }
@@ -243,6 +255,7 @@ impl SharedPages {
             direct_view_pins: AtomicUsize::new(0),
             resident_charge: None,
             external_lease: None,
+            allocation_owner: Mutex::new(None),
             external_mapping_flags: MappingFlags::empty(),
         })
     }
@@ -320,6 +333,7 @@ impl SharedPages {
             direct_view_pins: AtomicUsize::new(0),
             resident_charge,
             external_lease: None,
+            allocation_owner: Mutex::new(None),
             external_mapping_flags: MappingFlags::empty(),
         })
     }
@@ -358,6 +372,7 @@ impl SharedPages {
             direct_view_pins: AtomicUsize::new(0),
             resident_charge: None,
             external_lease: Some(lease),
+            allocation_owner: Mutex::new(None),
             external_mapping_flags: MappingFlags::DEVICE | MappingFlags::UNCACHED,
         })
     }
@@ -1851,8 +1866,9 @@ impl PreparedFixedSharedMapping {
                 may_protect,
                 FileMappingSharing::Shared,
             ),
-        }.with_mapping_lifetime(mapping_lifetime)
-            .with_excluded_fork_and_dump(excludes_fork_and_dump);
+        }
+        .with_mapping_lifetime(mapping_lifetime)
+        .with_excluded_fork_and_dump(excludes_fork_and_dump);
         Backend::Shared(SharedBackend {
             start,
             page_offset,

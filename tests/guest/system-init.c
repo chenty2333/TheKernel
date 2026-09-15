@@ -852,6 +852,12 @@ static int test_io_uring_directio_differential(void) {
         NULL, "io-uring-directio-differential-child");
 }
 
+static int test_tty_termios_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/tty-termios-differential", NULL,
+        "tty-termios-differential-child");
+}
+
 static int test_proc_zombie_differential(void) {
     return run_guest_program(
         "/opt/thekernel-tests/portable/proc-zombie-differential", NULL,
@@ -1000,6 +1006,7 @@ int main(int argc, char **argv) {
         { "signal-boundary", test_signal_boundary_differential, 60 },
         { "fs-boundary", test_fs_boundary_differential, 60 },
         { "io-uring-directio", test_io_uring_directio_differential, 60 },
+        { "tty-termios", test_tty_termios_differential, 30 },
         { "proc-zombie", test_proc_zombie_differential, 60 },
         { "native-ni", test_native_ni_differential, 60 },
         { "creat", test_creat_differential, 60 },

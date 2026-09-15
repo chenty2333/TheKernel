@@ -658,7 +658,9 @@ struct ConntrackEntry {
     expires_at: u64,
 }
 static CONNTRACK: Lazy<Mutex<Vec<ConntrackEntry>>> = Lazy::new(|| Mutex::new(Vec::new()));
-static CONNTRACK_CLOCK: AtomicU64 = AtomicU64::new(0);
+const CONNTRACK_MAX_ENTRIES: usize = 4096;
+const CONNTRACK_MAX_NAMESPACE_ENTRIES: usize = 1024;
+const CONNTRACK_TIMEOUT_MILLIS: u64 = 60_000;
 
 /// Executes the namespace's nft OUTPUT verdict chain at the packet emission
 /// boundary.  Rule order is insertion order, matching the retained nft
@@ -705,13 +707,13 @@ pub(crate) fn nft_packet_hook(
         .filter(|state| Weak::ptr_eq(&state.namespace, &needle))
     {
         let mut stack = Vec::new();
-        let output_chains: Vec<(String, String)> = state
-            .chains
-            .iter()
-            .filter(|chain| chain.hook == Some(hook))
-            .map(|chain| (chain.table.clone(), chain.name.clone()))
-            .collect();
-        for (table, chain) in output_chains {
+        for index in 0..state.chains.len() {
+            let selected = &state.chains[index];
+            if selected.hook != Some(hook) {
+                continue;
+            }
+            let table = nft_owned_name(&selected.table)?;
+            let chain = nft_owned_name(&selected.name)?;
             nft_evaluate_chain(namespace, state, &table, &chain, packet, &mut stack)?;
         }
     }
@@ -771,10 +773,19 @@ fn conntrack_reverse(tuple: ConntrackTuple) -> ConntrackTuple {
 }
 
 fn conntrack_observe(namespace: &Arc<NetworkNamespace>, tuple: ConntrackTuple) -> AxResult {
-    let now = CONNTRACK_CLOCK
-        .fetch_add(1, Ordering::Relaxed)
-        .wrapping_add(1);
     let mut state = CONNTRACK.lock();
+    // Sample under the lock so concurrent observations cannot move an entry's
+    // deadline backwards. Idle entries expire even when no packets arrive.
+    let now = axhal::time::monotonic_time_nanos() / 1_000_000;
+    conntrack_observe_at(&mut state, namespace, tuple, now)
+}
+
+fn conntrack_observe_at(
+    state: &mut Vec<ConntrackEntry>,
+    namespace: &Arc<NetworkNamespace>,
+    tuple: ConntrackTuple,
+    now: u64,
+) -> AxResult {
     state.retain(|entry| entry.namespace.strong_count() != 0 && entry.expires_at > now);
     let needle = Arc::downgrade(namespace);
     if let Some(entry) = state.iter_mut().find(|entry| {
@@ -782,8 +793,17 @@ fn conntrack_observe(namespace: &Arc<NetworkNamespace>, tuple: ConntrackTuple) -
             && (entry.original == tuple || entry.translated == tuple || entry.reply == tuple)
     }) {
         entry.packets = entry.packets.saturating_add(1);
-        entry.expires_at = now.saturating_add(60_000);
+        entry.expires_at = now.saturating_add(CONNTRACK_TIMEOUT_MILLIS);
         return Ok(());
+    }
+    if state.len() >= CONNTRACK_MAX_ENTRIES
+        || state
+            .iter()
+            .filter(|entry| Weak::ptr_eq(&entry.namespace, &needle))
+            .count()
+            >= CONNTRACK_MAX_NAMESPACE_ENTRIES
+    {
+        return Err(LinuxError::ENOBUFS.into());
     }
     state.try_reserve(1).map_err(|_| AxError::NoMemory)?;
     state.push(ConntrackEntry {
@@ -792,9 +812,18 @@ fn conntrack_observe(namespace: &Arc<NetworkNamespace>, tuple: ConntrackTuple) -
         translated: tuple,
         reply: conntrack_reverse(tuple),
         packets: 1,
-        expires_at: now.saturating_add(60_000),
+        expires_at: now.saturating_add(CONNTRACK_TIMEOUT_MILLIS),
     });
     Ok(())
+}
+
+fn nft_owned_name(name: &str) -> AxResult<String> {
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(name.len())
+        .map_err(|_| AxError::NoMemory)?;
+    owned.push_str(name);
+    Ok(owned)
 }
 
 fn nft_evaluate_chain(
@@ -812,40 +841,35 @@ fn nft_evaluate_chain(
         return Err(LinuxError::ELOOP.into());
     }
     stack.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-    stack.push(chain.to_string());
+    stack.push(nft_owned_name(chain)?);
     let policy = state
         .chains
         .iter()
         .find(|item| item.table == table && item.name == chain)
         .map(|item| item.policy)
         .ok_or(AxError::NotFound)?;
-    let rule_indexes: Vec<usize> = state
-        .rules
-        .iter()
-        .enumerate()
-        .filter_map(|(index, item)| (item.table == table && item.chain == chain).then_some(index))
-        .collect();
-    for index in rule_indexes {
-        let (verdict, target, lookup, expressions) = {
-            let rule = &mut state.rules[index];
-            rule.counter = rule.counter.saturating_add(1);
-            (
-                rule.verdict,
-                rule.target_chain.clone(),
-                rule.lookup.clone(),
-                rule.expressions.clone(),
-            )
-        };
-        if !nft_evaluate_expressions(namespace, packet, &expressions)? {
+    for index in 0..state.rules.len() {
+        let rule = &mut state.rules[index];
+        if rule.table != table || rule.chain != chain {
             continue;
         }
-        if let Some((set, key)) = lookup {
+        rule.counter = rule.counter.saturating_add(1);
+        if !nft_evaluate_expressions(namespace, packet, &rule.expressions)? {
+            continue;
+        }
+        if let Some((set, key)) = &rule.lookup {
             if !state.elements.iter().any(|item| {
-                item.table == table && item.set == set && (key.is_empty() || item.key == key)
+                item.table == table && item.set == *set && (key.is_empty() || item.key == *key)
             }) {
                 continue;
             }
         }
+        let verdict = rule.verdict;
+        let target = rule
+            .target_chain
+            .as_deref()
+            .map(nft_owned_name)
+            .transpose()?;
         match verdict {
             NftVerdict::Continue => {}
             NftVerdict::Accept => {
@@ -1249,7 +1273,7 @@ fn nft_expression_verdict(
                 }
                 for_each_rtattr(expr_body, |kind, data| {
                     if kind == 2 && target.is_none() {
-                        target = Some(decode_link_name(data)?);
+                        target = Some(decode_nft_name(data)?);
                     }
                     Ok(())
                 })
@@ -1261,7 +1285,7 @@ fn nft_expression_verdict(
                 }
                 for_each_rtattr(expr_body, |kind, data| {
                     if kind == 1 && lookup.is_none() {
-                        lookup = Some(decode_link_name(data)?);
+                        lookup = Some(decode_nft_name(data)?);
                     }
                     Ok(())
                 })
@@ -1271,7 +1295,7 @@ fn nft_expression_verdict(
             let mut data = None;
             for_each_rtattr(expression, |kind, value| match kind {
                 1 if name.is_none() => {
-                    name = Some(decode_link_name(value)?);
+                    name = Some(decode_nft_name(value)?);
                     Ok(())
                 }
                 2 if data.is_none() => {
@@ -1953,14 +1977,7 @@ impl NetlinkSocket {
                 let port_id = permit.port_id();
                 let err = match result {
                     Ok(()) => 0,
-                    Err(AxError::InvalidInput) => -LinuxError::EINVAL.code(),
-                    Err(AxError::NotFound) => -LinuxError::ENOENT.code(),
-                    Err(AxError::NoSuchDevice) => -LinuxError::ENODEV.code(),
-                    Err(AxError::PermissionDenied) => -LinuxError::EPERM.code(),
-                    Err(AxError::OperationNotPermitted) => -LinuxError::EPERM.code(),
-                    Err(AxError::AlreadyExists) => -LinuxError::EEXIST.code(),
-                    Err(AxError::OperationNotSupported) => -LinuxError::EOPNOTSUPP.code(),
-                    Err(_) => -LinuxError::EINVAL.code(),
+                    Err(error) => -LinuxError::from(error).code(),
                 };
                 self.enqueue_kernel_permitted(permit, netlink_ack(&hdr, port_id, err));
                 nft_failed |= self.protocol == NETLINK_NETFILTER && err != 0;
@@ -2525,11 +2542,11 @@ impl NetlinkSocket {
             let mut elements = None;
             for_each_rtattr(&payload[4..], |kind, value| match kind {
                 NFTA_SET_ELEM_LIST_TABLE if table.is_none() => {
-                    table = Some(decode_link_name(value)?);
+                    table = Some(decode_nft_name(value)?);
                     Ok(())
                 }
                 NFTA_SET_ELEM_LIST_SET if set.is_none() => {
-                    set = Some(decode_link_name(value)?);
+                    set = Some(decode_nft_name(value)?);
                     Ok(())
                 }
                 NFTA_SET_ELEM_LIST_ELEMENTS if elements.is_none() => {
@@ -2592,23 +2609,23 @@ impl NetlinkSocket {
         let mut set_data_type = 0;
         for_each_rtattr(&payload[4..], |kind, value| match (command, kind) {
             (NFT_MSG_NEWTABLE | NFT_MSG_DELTABLE, NFTA_TABLE_NAME) if name.is_none() => {
-                name = Some(decode_link_name(value)?);
+                name = Some(decode_nft_name(value)?);
                 Ok(())
             }
             (NFT_MSG_NEWSET | NFT_MSG_DELSET, NFTA_SET_TABLE) if table.is_none() => {
-                table = Some(decode_link_name(value)?);
+                table = Some(decode_nft_name(value)?);
                 Ok(())
             }
             (NFT_MSG_NEWSET | NFT_MSG_DELSET, NFTA_SET_NAME) if name.is_none() => {
-                name = Some(decode_link_name(value)?);
+                name = Some(decode_nft_name(value)?);
                 Ok(())
             }
             (NFT_MSG_NEWRULE | NFT_MSG_DELRULE, NFTA_RULE_TABLE) if table.is_none() => {
-                table = Some(decode_link_name(value)?);
+                table = Some(decode_nft_name(value)?);
                 Ok(())
             }
             (NFT_MSG_NEWRULE | NFT_MSG_DELRULE, NFTA_RULE_CHAIN) if name.is_none() => {
-                name = Some(decode_link_name(value)?);
+                name = Some(decode_nft_name(value)?);
                 Ok(())
             }
             (NFT_MSG_NEWRULE | NFT_MSG_DELRULE, NFTA_RULE_HANDLE) if value.len() == 8 => {
@@ -2637,11 +2654,11 @@ impl NetlinkSocket {
             }
             (NFT_MSG_NEWCHAIN, NFTA_CHAIN_TYPE) => Ok(()),
             (_, NFTA_CHAIN_TABLE) if table.is_none() => {
-                table = Some(decode_link_name(value)?);
+                table = Some(decode_nft_name(value)?);
                 Ok(())
             }
             (_, NFTA_CHAIN_NAME) if name.is_none() => {
-                name = Some(decode_link_name(value)?);
+                name = Some(decode_nft_name(value)?);
                 Ok(())
             }
             // Keep forward-compatible userspace metadata opaque.  It has no
@@ -4375,6 +4392,14 @@ fn for_each_rtattr<'a>(
     Ok(())
 }
 
+fn decode_nft_name(bytes: &[u8]) -> AxResult<String> {
+    let name = bytes.strip_suffix(&[0]).ok_or(AxError::InvalidInput)?;
+    if name.is_empty() || name.len() >= 256 || name.contains(&0) {
+        return Err(AxError::InvalidInput);
+    }
+    nft_owned_name(core::str::from_utf8(name).map_err(|_| AxError::InvalidInput)?)
+}
+
 fn decode_link_name(bytes: &[u8]) -> AxResult<String> {
     let name = bytes.strip_suffix(&[0]).ok_or(AxError::InvalidInput)?;
     if name.is_empty() || name.len() > 15 || name.contains(&0) {
@@ -4622,6 +4647,66 @@ mod tests {
         fn remaining(&self) -> usize {
             self.remaining
         }
+    }
+
+    #[test]
+    fn conntrack_namespace_budget_bounds_unique_tuples_but_allows_refresh() {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let namespace = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
+        let mut tuple = ConntrackTuple {
+            family: 4,
+            protocol: 17,
+            source: [1; 16],
+            destination: [2; 16],
+            source_port: 0,
+            destination_port: 80,
+        };
+        let mut entries = Vec::new();
+        for port in 0..CONNTRACK_MAX_NAMESPACE_ENTRIES {
+            tuple.source_port = port as u16;
+            conntrack_observe_at(&mut entries, &namespace, tuple, 0).unwrap();
+        }
+        let refreshed = tuple;
+        conntrack_observe_at(&mut entries, &namespace, refreshed, 1).unwrap();
+        tuple.source_port += 1;
+        assert_eq!(
+            conntrack_observe_at(
+                &mut entries,
+                &namespace,
+                tuple,
+                CONNTRACK_TIMEOUT_MILLIS - 1
+            ),
+            Err(LinuxError::ENOBUFS.into())
+        );
+        // One minute of idle wall-clock time, not 60,000 more packets, reopens
+        // admission. The refreshed entry survives while the older ones expire.
+        conntrack_observe_at(&mut entries, &namespace, tuple, CONNTRACK_TIMEOUT_MILLIS).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.original == refreshed && entry.packets == 2)
+        );
+        conntrack_observe_at(
+            &mut entries,
+            &namespace,
+            tuple,
+            CONNTRACK_TIMEOUT_MILLIS + 1,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].original == tuple);
+        assert_eq!(entries[0].packets, 2);
+    }
+
+    #[test]
+    fn nft_names_do_not_inherit_the_interface_name_limit() {
+        let mut name = alloc::vec![b'x'; 255];
+        name.push(0);
+        assert_eq!(decode_nft_name(&name).unwrap().len(), 255);
+        assert!(decode_link_name(&name).is_err());
+        name.insert(0, b'x');
+        assert!(decode_nft_name(&name).is_err());
     }
 
     fn route_socket() -> Arc<NetlinkSocket> {

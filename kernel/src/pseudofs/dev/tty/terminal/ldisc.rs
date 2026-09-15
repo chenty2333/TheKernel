@@ -2,7 +2,7 @@ use alloc::{boxed::Box, collections::vec_deque::VecDeque, string::String, sync::
 use core::{
     future::poll_fn,
     ops::Range,
-    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering},
     task::{Context, Poll, Waker},
 };
 
@@ -16,7 +16,7 @@ use axtask::{
     },
 };
 use linux_raw_sys::general::{
-    ECHOCTL, ECHOE, ECHOK, ICRNL, IGNCR, ISIG, ONLCR, OPOST, VEOF, VERASE, VKILL,
+    ECHOCTL, ECHOE, ECHOK, ICRNL, IGNCR, ISIG, NOFLSH, ONLCR, OPOST, VEOF, VERASE, VKILL,
 };
 use ringbuf::{
     CachingCons, CachingProd,
@@ -204,6 +204,8 @@ struct InputReader<R, W> {
     reader: R,
     writer: W,
     buf_tx: CachingProd<ReadBuf>,
+    produced: usize,
+    discard_before: Arc<AtomicUsize>,
     read_buf: [u8; BUF_SIZE],
     read_range: Range<usize>,
     // Linux N_TTY bounds a canonical input line to 4096 bytes. Reserving the
@@ -255,6 +257,7 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
         loop {
             if let Some(offset) = &mut self.line_read {
                 let read = self.buf_tx.push_slice(&self.line_buf[*offset..]);
+                self.produced = self.produced.wrapping_add(read);
                 if read == 0 {
                     break;
                 }
@@ -283,13 +286,17 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
                 }
             }
 
-            self.check_send_signal(&term, ch);
+            if self.check_send_signal(&term, ch) {
+                continue;
+            }
 
             if term.echo() {
                 self.output_char(&term, ch);
             }
             if !term.canonical() {
-                let _ = self.buf_tx.try_push(ch);
+                if self.buf_tx.try_push(ch).is_ok() {
+                    self.produced = self.produced.wrapping_add(1);
+                }
                 continue;
             }
 
@@ -347,21 +354,37 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
         Ok(progressed)
     }
 
-    fn check_send_signal(&self, term: &Termios2, ch: u8) {
-        // The current signal path implements canonical N_TTY delivery. A
-        // noncanonical+ISIG configuration is rejected by termios admission
-        // until its flush and byte-consumption rules are implemented.
-        if !term.canonical() || !term.has_lflag(ISIG) {
-            return;
+    fn check_send_signal(&mut self, term: &Termios2, ch: u8) -> bool {
+        if !term.has_lflag(ISIG) {
+            return false;
         }
-        if let Some(signo) = term.signo_for(ch)
-            && let Some(pg) = self.terminal.job_control.foreground()
-        {
+        let Some(signo) = term.signo_for(ch) else {
+            return false;
+        };
+        if !term.has_lflag(NOFLSH) {
+            self.line_buf.clear();
+            self.line_read = None;
+            self.echo_buf.clear();
+            self.echo_pending.store(0, Ordering::Release);
+            self.empty_eof_pending.store(false, Ordering::Release);
+            // Only the consumer may advance the SPSC ring's read cursor.
+            // Publish the pre-signal prefix to discard; later input in this
+            // transport batch remains readable, just as in Linux N_TTY.
+            self.discard_before.store(self.produced, Ordering::Release);
+            self.writer.flush_output();
+        }
+        if term.echo() {
+            self.output_char(term, ch);
+        }
+        if let Some(pg) = self.terminal.job_control.foreground() {
             let sig = SignalInfo::new_kernel(signo);
             if let Err(err) = send_signal_to_process_group(pg.pgid(), Some(sig)) {
                 warn!("Failed to send signal: {err:?}");
             }
         }
+        // Signal characters never become input bytes, including in cbreak
+        // mode and when there is currently no foreground process group.
+        true
     }
 
     fn output_char(&mut self, term: &Termios2, ch: u8) {
@@ -824,6 +847,8 @@ pub struct LineDiscipline<R, W> {
     input_generation: u64,
     terminal: Arc<Terminal>,
     buf_rx: CachingCons<ReadBuf>,
+    consumed: usize,
+    discard_before: Arc<AtomicUsize>,
     poll_tx: Arc<PollSet>,
     empty_eof_pending: Arc<AtomicBool>,
     source_drained: Arc<AtomicBool>,
@@ -850,11 +875,14 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         echo_buf
             .try_reserve_exact(ECHO_BUF_SIZE)
             .map_err(|_| AxError::NoMemory)?;
+        let discard_before = Arc::try_new(AtomicUsize::new(0)).map_err(|_| AxError::NoMemory)?;
         let reader = InputReader {
             terminal: terminal.clone(),
             reader: config.reader,
             writer: config.writer,
             buf_tx,
+            produced: 0,
+            discard_before: discard_before.clone(),
             read_buf: [0; BUF_SIZE],
             read_range: 0..0,
             line_buf,
@@ -920,6 +948,8 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             input_generation: 0,
             terminal,
             buf_rx,
+            consumed: 0,
+            discard_before,
             poll_tx,
             empty_eof_pending,
             source_drained,
@@ -954,7 +984,20 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
                 }
             }
         }
+        self.discard_signal_prefix();
         Ok(())
+    }
+
+    fn discard_signal_prefix(&mut self) {
+        let before = self.discard_before.load(Ordering::Acquire);
+        let count = before.wrapping_sub(self.consumed);
+        // At most the ring capacity can be outstanding. A wrapped difference
+        // larger than that means the consumer already passed this cutoff.
+        if count <= BUF_SIZE && count != 0 {
+            let skipped = self.buf_rx.skip(count);
+            self.consumed = self.consumed.wrapping_add(skipped);
+            self.poll_tx.wake();
+        }
     }
 
     pub fn readiness_source(&self) -> Option<&Arc<PollSet>> {
@@ -1044,7 +1087,13 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             })?;
         }
         let mut discarded = [0u8; BUF_SIZE];
-        while self.buf_rx.pop_slice(&mut discarded) != 0 {}
+        loop {
+            let read = self.buf_rx.pop_slice(&mut discarded);
+            self.consumed = self.consumed.wrapping_add(read);
+            if read == 0 {
+                break;
+            }
+        }
         self.empty_eof_pending.store(false, Ordering::Release);
         self.source_drained.store(false, Ordering::Release);
         self.poll_tx.wake();
@@ -1096,6 +1145,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
         }
 
         let total_read = self.buf_rx.pop_slice(buf);
+        self.consumed = self.consumed.wrapping_add(total_read);
         if total_read != 0
             && let Processor::Manual(reader) = &self.processor
         {
@@ -1292,6 +1342,8 @@ mod tests {
             reader: EndlessKillReader(reads.clone()),
             writer: Sink,
             buf_tx,
+            produced: 0,
+            discard_before: Arc::new(AtomicUsize::new(0)),
             read_buf: [0; BUF_SIZE],
             read_range: 0..0,
             line_buf,
@@ -1394,6 +1446,8 @@ mod tests {
             },
             writer: Sink,
             buf_tx,
+            produced: 0,
+            discard_before: Arc::new(AtomicUsize::new(0)),
             read_buf: [0; BUF_SIZE],
             read_range: 0..0,
             line_buf,
@@ -1598,6 +1652,66 @@ mod tests {
         }
         assert_eq!(ldisc.read(&mut output), Ok(2));
         assert_eq!(&output[..2], b"x\n");
+    }
+
+    fn signal_input(canonical: bool, isig: bool, noflsh: bool) -> (Vec<u8>, usize) {
+        struct SignalSink(Arc<AtomicUsize>);
+        impl TtyWrite for SignalSink {
+            fn write(&self, bytes: &[u8]) -> AxResult<usize> {
+                Ok(bytes.len())
+            }
+            fn flush_output(&self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let terminal = Arc::new(Terminal::default());
+        let mut bytes = terminal.load_termios().to_user_bytes();
+        let mut flags = u32::from_ne_bytes(bytes[12..16].try_into().unwrap());
+        flags &= !(linux_raw_sys::general::ICANON | ISIG | NOFLSH | linux_raw_sys::general::ECHO);
+        if canonical {
+            flags |= linux_raw_sys::general::ICANON;
+        }
+        if isig {
+            flags |= ISIG;
+        }
+        if noflsh {
+            flags |= NOFLSH;
+        }
+        bytes[12..16].copy_from_slice(&flags.to_ne_bytes());
+        *terminal.termios.lock() = Termios2::from_user_bytes(bytes);
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let mut ldisc = LineDiscipline::try_new(
+            terminal,
+            TtyConfig {
+                reader: VecReader {
+                    input: b"old\x03new\n".to_vec(),
+                    offset: 0,
+                    eof: false,
+                },
+                writer: SignalSink(flushes.clone()),
+                process_mode: ProcessMode::Manual,
+            },
+        )
+        .unwrap();
+        let mut output = [0; 32];
+        let read = ldisc.read(&mut output).unwrap();
+        (output[..read].to_vec(), flushes.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn cbreak_signals_consume_control_bytes_and_flush_only_the_prior_prefix() {
+        assert_eq!(signal_input(false, true, false), (b"new\n".to_vec(), 1));
+        assert_eq!(signal_input(false, true, true), (b"oldnew\n".to_vec(), 0));
+        assert_eq!(
+            signal_input(false, false, false),
+            (b"old\x03new\n".to_vec(), 0)
+        );
+    }
+
+    #[test]
+    fn canonical_signals_flush_partial_line_and_respect_noflsh() {
+        assert_eq!(signal_input(true, true, false), (b"new\n".to_vec(), 1));
+        assert_eq!(signal_input(true, true, true), (b"oldnew\n".to_vec(), 0));
     }
 
     #[test]

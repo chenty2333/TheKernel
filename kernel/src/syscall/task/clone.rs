@@ -24,17 +24,17 @@ use crate::{
     keyring::{self, KeyTaskOwner},
     mm::{UserMemoryCapability, copy_from_kernel, map_usercopy_error},
     pseudofs::cgroup,
-    readiness::block_on_poll_set_uninterruptible,
+    readiness::block_on_poll_set_interruptible_if,
     syscall::task::thread::{cet_default_shadow_stack_size, map_cet_default_shadow_stack},
     task::{
         AsThread, Cred, CredentialSlot, Dumpability, FsContextSlot, InitialProcessThreadAdmission,
-        NamespaceProxy, NetworkNamespace, PendingCredentialPublication,
-        PendingThreadPublication, ProcessAccessState, ProcessData, ProcessInitialAdmission,
-        ProcessThreadAdmission, PtraceRelationshipOrigin, SchedulerSeed, SemUndoState,
-        TaskParentChoice, Thread, fs_context_publication, get_process_data, get_task,
-        linux_pid_from_task_id, lock_task_parent_publication, notify_ptrace_attach_stop,
-        prepare_task_table_admission, process_domain, send_signal_thread_inner,
-        set_task_user_address_space, try_new_user_task, try_tasks,
+        NamespaceProxy, NetworkNamespace, PendingCredentialPublication, PendingThreadPublication,
+        ProcessAccessState, ProcessData, ProcessInitialAdmission, ProcessThreadAdmission,
+        PtraceRelationshipOrigin, SchedulerSeed, SemUndoState, TaskParentChoice, Thread,
+        fs_context_publication, get_process_data, get_task, linux_pid_from_task_id,
+        lock_task_parent_publication, notify_ptrace_attach_stop, prepare_task_table_admission,
+        process_domain, send_signal_thread_inner, set_task_user_address_space, try_new_user_task,
+        try_tasks,
     },
 };
 
@@ -476,13 +476,23 @@ pub(super) enum CloneApi {
 
 impl CloneArgs {
     fn wait_for_vfork(proc_data: &ProcessData) -> AxResult<()> {
-        block_on_poll_set_uninterruptible(&proc_data.vfork_event, || {
-            if !proc_data.vfork_in_progress() {
-                Ok(())
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        })
+        block_on_poll_set_interruptible_if(
+            &proc_data.vfork_event,
+            || {
+                if !proc_data.vfork_in_progress() {
+                    Ok(())
+                } else {
+                    Err(AxError::WouldBlock)
+                }
+            },
+            || {
+                let current = current();
+                let thread = current.as_thread();
+                thread.pending_exit()
+                    || crate::task::has_pending_sigkill(thread)
+                    || thread.proc_data.should_exit_for_exec(thread.kernel_tid())
+            },
+        )
     }
 
     pub(super) fn validate_for(&self, api: CloneApi) -> AxResult<()> {
@@ -1171,6 +1181,7 @@ impl CloneArgs {
         // state stays private after this point: the bitmap Arc is copied on
         // either task's first ioperm mutation.
         thr.install_ioport_snapshot(child_ioport);
+        thr.inherit_oom_score_adj(calling_thread);
         if thread_publication.is_initial() {
             new_proc_data.bind_initial_group_leader_signal(
                 tid,

@@ -758,7 +758,7 @@ const XCR0_AVX_STATE: u64 = (1 << 1) | (1 << 2);
 // driver and a user-mode emulator already parse.
 const CPUID_1_EDX_FPU: u32 = 1 << 0;
 const CPUID_1_EDX_TSC: u32 = 1 << 4;
-const CPUID_1_EDX_CX16: u32 = 1 << 9;
+const CPUID_1_ECX_CX16: u32 = 1 << 13;
 const CPUID_1_EDX_SSE2: u32 = 1 << 26;
 const CPUID_1_ECX_SSE3: u32 = 1 << 0;
 const CPUID_1_ECX_SSSE3: u32 = 1 << 9;
@@ -880,7 +880,7 @@ pub fn x86_user_feature_flags(
         // reported straight from CPUID exactly as Linux's cpuinfo does.
         set_feature_flag(&mut flags, edx & CPUID_1_EDX_FPU != 0, FLAG_FPU);
         set_feature_flag(&mut flags, edx & CPUID_1_EDX_TSC != 0, FLAG_TSC);
-        set_feature_flag(&mut flags, edx & CPUID_1_EDX_CX16 != 0, FLAG_CX16);
+        set_feature_flag(&mut flags, ecx & CPUID_1_ECX_CX16 != 0, FLAG_CX16);
         set_feature_flag(&mut flags, edx & CPUID_1_EDX_SSE2 != 0, FLAG_SSE2);
         set_feature_flag(&mut flags, ecx & CPUID_1_ECX_SSE3 != 0, FLAG_SSE3);
         set_feature_flag(&mut flags, ecx & CPUID_1_ECX_SSSE3 != 0, FLAG_SSSE3);
@@ -1030,6 +1030,19 @@ mod x86_user_feature_flag_tests {
 
     fn decode(observed: X86FeatureObservations) -> Vec<&'static str> {
         x86_user_feature_flags(observed).collect()
+    }
+
+    #[test]
+    fn cx16_is_ecx_bit_13_not_edx_apic() {
+        let mut observed = X86FeatureObservations {
+            max_basic_leaf: 1,
+            leaf1_edx: 1 << 9,
+            ..Default::default()
+        };
+        assert!(!decode(observed).contains(&"cx16"));
+        observed.leaf1_edx = 0;
+        observed.leaf1_ecx = 1 << 13;
+        assert_eq!(decode(observed), ["cx16"]);
     }
 
     #[test]

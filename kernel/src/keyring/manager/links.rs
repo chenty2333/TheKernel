@@ -81,18 +81,6 @@ impl KeyManager {
             .iter()
             .filter(|(_, key)| key.links.contains(&serial))
             .count();
-        let mut parents = Vec::new();
-        parents
-            .try_reserve_exact(parent_count)
-            .map_err(|_| AxError::NoMemory)?;
-        parents.extend(
-            self.keys
-                .iter()
-                .filter_map(|(parent, key)| key.links.contains(&serial).then_some(*parent)),
-        );
-        if parents.len() != parent_count {
-            return Err(AxError::BadState);
-        }
         let removed_roots = self
             .thread_keyrings
             .values()
@@ -106,16 +94,21 @@ impl KeyManager {
             .filter(|linked| **linked == serial)
             .count();
         let key = self.keys.get(&serial).ok_or(AxError::BadState)?;
-        if key.root_refs != removed_roots || key.link_refs != parents.len() {
+        if key.root_refs != removed_roots || key.link_refs != parent_count {
             return Err(AxError::BadState);
         }
-        for parent in &parents {
-            let parent = self.keys.get(parent).ok_or(AxError::BadState)?;
-            if !parent.is_keyring() || !parent.links.contains(&serial) {
+        for parent in self.keys.values().filter(|key| key.links.contains(&serial)) {
+            if !parent.is_keyring() {
                 return Err(AxError::BadState);
             }
         }
-        for parent in parents {
+        // Teardown must work under memory pressure. Scan the bounded key
+        // registry rather than allocating a temporary parent list.
+        while let Some(parent) = self
+            .keys
+            .iter()
+            .find_map(|(id, key)| key.links.contains(&serial).then_some(*id))
+        {
             self.unlink_key_from_keyring(parent, serial)?;
         }
         if !self.keys.contains_key(&serial) {

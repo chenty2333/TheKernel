@@ -31,8 +31,6 @@ use kspin::SpinNoIrq;
 use spin::Once;
 use thekernel_linux_signal::{SignalInfo, Signo};
 
-pub(crate) use self::pts::{DevPtsOptions, new_devpts};
-pub(crate) use self::seat::{remember_input_node, remember_primary_node};
 pub use self::{
     ntty::{N_TTY, NTtyDriver},
     ptm::Ptmx,
@@ -48,6 +46,10 @@ use self::{
         ldisc::{LineDiscipline, TtyConfig, TtyRead, TtyWrite},
         termios::{Termio, Termios, Termios2},
     },
+};
+pub(crate) use self::{
+    pts::{DevPtsOptions, new_devpts},
+    seat::{remember_input_node, remember_primary_node},
 };
 use crate::{
     file::{DescriptionResource, FileLike, IoDst, IoSrc, IoctlContext, Kstat, OfdIoStatus},
@@ -159,9 +161,16 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
             .ok_or(AxError::NotATty)
     }
 
-    pub(crate) fn remember_pts_location(&self, location: &Location, device: &Arc<crate::pseudofs::Device>) {
+    pub(crate) fn remember_pts_location(
+        &self,
+        location: &Location,
+        device: &Arc<crate::pseudofs::Device>,
+    ) {
         if !self.is_ptm {
-            *self.pts_node.lock() = Some((Arc::downgrade(location.mountpoint()), Arc::downgrade(device)));
+            *self.pts_node.lock() = Some((
+                Arc::downgrade(location.mountpoint()),
+                Arc::downgrade(device),
+            ));
         }
     }
 
@@ -173,16 +182,25 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
         let mount = mount.upgrade().ok_or(AxError::NotFound)?;
         let device = device.upgrade().ok_or(AxError::NotFound)?;
         let root = mount.root_location();
-        if root.entry().downcast::<crate::pseudofs::Device>()
-            .is_ok_and(|root_device| Arc::ptr_eq(&root_device, &device)) {
+        if root
+            .entry()
+            .downcast::<crate::pseudofs::Device>()
+            .is_ok_and(|root_device| Arc::ptr_eq(&root_device, &device))
+        {
             return Ok(root);
         }
         let mut name = String::new();
         name.try_reserve_exact(10).map_err(|_| AxError::NoMemory)?;
         core::fmt::write(&mut name, format_args!("{}", self.pty_number()))
             .map_err(|_| AxError::NoMemory)?;
-        let entry = DirEntry::try_new_file(FileNode::new(device), NodeType::CharacterDevice,
-            Reference::new(Some(root.entry().clone()), FsNameBuf::from_vec(name.into_bytes())?))?;
+        let entry = DirEntry::try_new_file(
+            FileNode::new(device),
+            NodeType::CharacterDevice,
+            Reference::new(
+                Some(root.entry().clone()),
+                FsNameBuf::from_vec(name.into_bytes())?,
+            ),
+        )?;
         Ok(Location::new(mount, entry))
     }
 
@@ -278,6 +296,20 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
 
     pub fn is_locked_pty_slave(&self) -> bool {
         !self.is_ptm && self.terminal.pty_locked.load(Ordering::Acquire)
+    }
+
+    pub(super) fn resize_window_size(&self, window_size: WindowSize) {
+        if self.terminal.update_window_size(window_size)
+            && let Some(group) = self.terminal.job_control.foreground()
+        {
+            // Geometry is committed and the winsize lock is released before
+            // notification. Like Linux, a missing/exiting group is not an
+            // ioctl failure after the new geometry has been accepted.
+            let _ = send_signal_to_process_group(
+                group.pgid(),
+                Some(SignalInfo::new_kernel(Signo::SIGWINCH)),
+            );
+        }
     }
 
     /// Implements the drain/flush ordering shared by all termios setters.
@@ -897,7 +929,7 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
             }
             TIOCSWINSZ => {
                 let window_size = window_size_from_user_bytes(read_user_bytes(context, arg)?);
-                *self.terminal.window_size.lock() = window_size;
+                self.resize_window_size(window_size);
             }
             TIOCSPTLCK => {
                 if !self.is_ptm {

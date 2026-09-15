@@ -161,17 +161,16 @@ impl KeyManager {
     }
 
     fn abandon_construction(&mut self, thread_owner: u32) -> AxResult<()> {
-        let Some(serial) = self.construction_authorities.remove(&thread_owner) else {
+        let Some(serial) = self.construction_authorities.get(&thread_owner).copied() else {
             return Ok(());
         };
         let key = self.keys.get(&serial).ok_or(AxError::BadState)?;
         if key.state != KeyState::Pending || key.construction_owner != Some(thread_owner) {
             return Err(AxError::BadState);
         }
-        let result = self.remove_key_everywhere(serial);
-        if result.is_ok() {
-            self.remove_pending_construction(serial);
-        }
+        // Share the abort transaction: authority cannot disappear while a
+        // still-pending key remains visible if cleanup fails.
+        let result = self.abort_request_key(serial);
         crate::keyring::service::notify_request_key_waiters();
         result
     }

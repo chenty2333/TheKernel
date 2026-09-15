@@ -560,7 +560,7 @@ fn do_execve(
     let layout = if effective_personality & crate::syscall::sys::ADDR_NO_RANDOMIZE != 0 {
         ExecLayout::fixed()
     } else {
-        ExecLayout::randomized()
+        ExecLayout::randomized()?
     };
     let mut new_aspace = if mmap_page_zero {
         new_user_aspace_with_page_zero()?

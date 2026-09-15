@@ -808,7 +808,10 @@ pub fn sys_getrandom<M: UserMemory + ?Sized>(
             crate::random::fill_insecure(&mut kbuf[..chunk]);
             Ok(())
         } else {
-            crate::random::fill_secure(&mut kbuf[..chunk])
+            crate::random::fill_secure_wait(
+                &mut kbuf[..chunk],
+                flags.contains(GetRandomFlags::NONBLOCK) || total != 0,
+            )
         };
         if let Err(error) = fill_result {
             return if total == 0 {
@@ -904,13 +907,12 @@ mod tests {
 
     #[test]
     fn syslog_empty_wait_parks_until_arrival_and_cancels_on_interrupt() {
-        use alloc::sync::Arc;
+        use alloc::{sync::Arc, task::Wake};
         use core::{
             future::Future,
             sync::atomic::{AtomicUsize, Ordering},
             task::{Context, Poll, Waker},
         };
-        use alloc::task::Wake;
 
         struct CountWake(AtomicUsize);
         impl Wake for CountWake {

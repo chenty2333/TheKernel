@@ -451,7 +451,11 @@ pub fn sys_pidfd_getfd(pidfd: i32, target_fd: i32, flags: u32) -> AxResult<isize
         Some(task) => task,
         None => crate::task::get_visible_task(proc_data.proc.pid())?,
     };
-    let description = target.as_thread().fd_table().get_description(target_fd)?;
+    let description = target
+        .as_thread()
+        .try_fd_table()
+        .ok_or(AxError::NoSuchProcess)?
+        .get_description(target_fd)?;
     if proc_data.exec_in_progress() || !proc_data.image_matches(&authorized_image) {
         return Err(AxError::OperationNotPermitted);
     }

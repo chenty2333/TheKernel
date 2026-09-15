@@ -22,7 +22,8 @@ use axtask::{AxTaskRef, WeakAxTaskRef, current};
 use inherit_methods_macro::inherit_methods;
 use linux_raw_sys::{
     general::{
-        CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC, RLIM_INFINITY, RLIM_NLIMITS,
+        CAP_SYS_ADMIN, CAP_SYS_NICE, CAP_SYS_RESOURCE, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
+        RLIM_INFINITY, RLIM_NLIMITS,
     },
     mempolicy::{
         MPOL_BIND, MPOL_DEFAULT, MPOL_INTERLEAVE, MPOL_LOCAL, MPOL_PREFERRED, MPOL_PREFERRED_MANY,
@@ -2299,7 +2300,8 @@ impl SimpleFileOps for PreparedFdMagicLink {
         let authorized_image = proc_fd_image_access(&task, self.process_view)?;
         let description = task
             .as_thread()
-            .fd_table()
+            .try_fd_table()
+            .ok_or(VfsError::NotFound)?
             .get_description_number(self.fd)
             .map_err(|_| VfsError::NotFound)?;
         let target: FsPathBuf = try_path_into_owned(description.inner.path()?)?;
@@ -2320,7 +2322,8 @@ impl SimpleDirOps for ThreadFdDir {
         let authorized_image = proc_fd_image_access(&task, self.process_view)?;
         let ids = task
             .as_thread()
-            .fd_table()
+            .try_fd_table()
+            .ok_or(VfsError::NotFound)?
             .try_fd_numbers()?
             .into_iter()
             .map(|id| FsNameBuf::from_vec(id.to_string().into_bytes()).map(Cow::Owned))
@@ -2338,7 +2341,8 @@ impl SimpleDirOps for ThreadFdDir {
             .parse::<u32>()
             .map_err(|_| VfsError::NotFound)?;
         task.as_thread()
-            .fd_table()
+            .try_fd_table()
+            .ok_or(VfsError::NotFound)?
             .get_description_number(fd)
             .map_err(|_| VfsError::NotFound)?;
         validate_proc_fd_image(&task, &authorized_image)?;
@@ -2375,7 +2379,8 @@ impl ThreadFdInfoDir {
             .map_err(|_| VfsError::NotFound)?;
         let description = task
             .as_thread()
-            .fd_table()
+            .try_fd_table()
+            .ok_or(VfsError::NotFound)?
             .get_description_number(u32::try_from(fd).map_err(|_| VfsError::NotFound)?)
             .map_err(|_| VfsError::NotFound)?;
         validate_proc_fd_image(&task, &authorized_image)?;
@@ -2418,7 +2423,8 @@ impl SimpleDirOps for ThreadFdInfoDir {
         let authorized_image = proc_fd_image_access(&task, self.process_view)?;
         let ids = task
             .as_thread()
-            .fd_table()
+            .try_fd_table()
+            .ok_or(VfsError::NotFound)?
             .try_fd_numbers()?
             .into_iter()
             .map(|id| FsNameBuf::from_vec(id.to_string().into_bytes()).map(Cow::Owned))
@@ -2926,11 +2932,10 @@ fn write_timens_offsets(task: &AxTaskRef, data: &[u8]) -> VfsResult<()> {
 struct ProcPagemapFile {
     node: SimpleFsNode,
     aspace: Arc<Mutex<AddrSpace>>,
-    show_pfn: bool,
 }
 
 impl ProcPagemapFile {
-    fn new(fs: Arc<SimpleFs>, aspace: Arc<Mutex<AddrSpace>>, show_pfn: bool) -> Arc<Self> {
+    fn new(fs: Arc<SimpleFs>, aspace: Arc<Mutex<AddrSpace>>) -> Arc<Self> {
         Arc::new(Self {
             node: SimpleFsNode::new(
                 fs,
@@ -2938,11 +2943,10 @@ impl ProcPagemapFile {
                 NodePermission::from_bits_truncate(0o444),
             ),
             aspace,
-            show_pfn,
         })
     }
 
-    fn pagemap_entry(&self, vpn: u64) -> u64 {
+    fn pagemap_entry(&self, vpn: u64, show_pfn: bool) -> u64 {
         let Some(vaddr) = vpn
             .checked_mul(PAGE_SIZE_4K as u64)
             .and_then(|addr| usize::try_from(addr).ok())
@@ -2953,7 +2957,7 @@ impl ProcPagemapFile {
         let aspace = self.aspace.lock();
         match aspace.page_table().query_mapped(vaddr) {
             Ok((paddr, ..)) => {
-                let pfn = if self.show_pfn {
+                let pfn = if show_pfn {
                     paddr.as_usize() as u64 / PAGE_SIZE_4K as u64
                 } else {
                     0
@@ -2992,18 +2996,22 @@ impl NodeOps for ProcPagemapFile {
     }
 
     fn flags(&self) -> NodeFlags {
-        NodeFlags::NON_CACHEABLE
+        NodeFlags::NON_CACHEABLE | NodeFlags::OPEN_CREDENTIAL
     }
 }
 
 impl FileNodeOps for ProcPagemapFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        // PFN authority belongs to the opener's immutable credential, never
+        // to whichever task happened to resolve this inode first.
+        let show_pfn = current_file_operation_security_credential()
+            .is_some_and(|credential| credential.has_effective_capability(CAP_SYS_ADMIN));
         let mut written = 0;
         let mut entry_index = offset / PROC_PAGEMAP_ENTRY_BYTES;
         let mut entry_offset = (offset % PROC_PAGEMAP_ENTRY_BYTES) as usize;
 
         while written < buf.len() {
-            let entry = self.pagemap_entry(entry_index).to_le_bytes();
+            let entry = self.pagemap_entry(entry_index, show_pfn).to_le_bytes();
             let copy_len =
                 (PROC_PAGEMAP_ENTRY_BYTES as usize - entry_offset).min(buf.len() - written);
             buf[written..written + copy_len]
@@ -3181,7 +3189,12 @@ impl SimpleDirOps for ThreadDir {
                         if !data.is_empty() {
                             drop(proc_image_access(&task, process_view)?);
                             let value = parse_oom_score_adj_value(data)?;
-                            task.as_thread().set_oom_score_adj(value);
+                            task.as_thread().set_oom_score_adj(
+                                value,
+                                current()
+                                    .as_thread()
+                                    .has_effective_capability(CAP_SYS_RESOURCE),
+                            )?;
                         }
                         Ok(None)
                     }
@@ -3237,10 +3250,7 @@ impl SimpleDirOps for ThreadDir {
             }
             b"pagemap" => {
                 let aspace = proc_image_access(&task, process_view)?.into_aspace();
-                let show_pfn = current()
-                    .as_thread()
-                    .has_effective_capability(CAP_SYS_ADMIN);
-                ProcPagemapFile::new(fs, aspace, show_pfn).into()
+                ProcPagemapFile::new(fs, aspace).into()
             }
             b"mounts" => SimpleFile::new_regular(fs, render_mounts).into(),
             b"mountinfo" => SimpleFile::new_regular(fs, render_mountinfo).into(),
@@ -3431,10 +3441,7 @@ impl SimpleDirOps for ProcFsHandler {
             .map_err(|_| VfsError::NotFound)?
             .parse::<u32>()
             .map_err(|_| VfsError::NotFound)?;
-        let pid = self
-            .1
-            .resolve_visible_pid(pid)
-            .ok_or(VfsError::NotFound)?;
+        let pid = self.1.resolve_visible_pid(pid).ok_or(VfsError::NotFound)?;
         if let Ok(task) = proc_task_for_pid(pid) {
             return Ok(NodeOpsMux::Dir(SimpleDir::new_maker(
                 self.0.clone(),
@@ -3558,9 +3565,7 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
     );
     root.add("loadavg", {
         let pid_ns = pid_ns.clone();
-        SimpleFile::new_regular(fs.clone(), move || {
-            Ok(crate::task::proc_loadavg(&pid_ns)?)
-        })
+        SimpleFile::new_regular(fs.clone(), move || Ok(crate::task::proc_loadavg(&pid_ns)?))
     });
     root.add("mounts", SimpleFile::new_regular(fs.clone(), render_mounts));
     root.add(
@@ -3962,11 +3967,10 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
                         fs.clone(),
                         NodePermission::from_bits_truncate(0o444),
                         || {
-                            Ok(format!(
-                                "{}\n",
-                                thekernel_linux_cred::USER_NAMESPACE_OVERFLOW_ID
+                            Ok(
+                                format!("{}\n", thekernel_linux_cred::USER_NAMESPACE_OVERFLOW_ID)
+                                    .into_bytes(),
                             )
-                            .into_bytes())
                         },
                     ),
                 );
@@ -3996,7 +4000,8 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
                                 return Ok(None);
                             }
                             let text = str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
-                            axruntime::klog::set_filter(text).map_err(|_| VfsError::InvalidInput)?;
+                            axruntime::klog::set_filter(text)
+                                .map_err(|_| VfsError::InvalidInput)?;
                             Ok(None)
                         }
                     }),

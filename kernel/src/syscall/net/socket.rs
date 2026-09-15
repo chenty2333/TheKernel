@@ -488,6 +488,9 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     }
 
     if domain == af_xdp::AF_XDP {
+        if !ns_capable(actor, snapshot.net_namespace().owner_user_ns(), CAP_NET_RAW) {
+            return Err(AxError::OperationNotPermitted);
+        }
         // AF_XDP is SOCK_RAW/protocol 0 only.  It is a dedicated FileLike
         // backend because its ABI is setsockopt/bind/mmap rings, not axnet
         // byte-stream socket operations.

@@ -23,6 +23,7 @@ COMPLETE_MARKER = "THEKERNEL_ABI_EXIT_ZERO"
 # Explicit expectations prevent an accidentally deleted guest assertion from
 # reducing acceptance coverage. Keep these aligned with tests/guest/portable.
 CONTRACTS = {
+    "tty-termios": ("portable-differential", "pass", "PYREPL_PREPARE_RESTORE CBREAK_SIGINT_FLUSH NOFLSH_PRESERVES_INPUT RAW_ESCAPE_CR_BYTES WINSIZE_SIGWINCH_NOOP"),
     "unix-write-credentials": ("raw-differential", "pass", "UNIX_SOCKET_IDENTITY PEER_PID_EFFECTIVE_IDS WRITE_SENDER_PID_REAL_IDS WRITEV_SENDER_PID_REAL_IDS SENDMSG_SENDER_PID_REAL_IDS CHILD_EXIT_CLEAN REAL_EFFECTIVE_IDS RIGHTS_RECEIVER_LIFETIME"),
     "eventfd": ("portable-differential", "pass", "LEGACY_FLAGS IO_ERRNO_STATE COUNTER_POLL SEMAPHORE CLOEXEC_TEARDOWN"),
     "creat": ("raw-differential", "pass", "PROVIDER_EXT4 CREATE_UMASK_STATUS TRUNCATE_EXISTING BAD_PATH_EFAULT TEARDOWN"),
@@ -93,6 +94,7 @@ CONTRACTS.update({
     "sched_get_priority_min": ("raw-differential", "pass", "ext-priority-min"),
 })
 PROGRAM_CASES = {
+    "tty-termios": ("tty-termios",),
     "unix-write-credentials": ("unix-write-credentials",),
     "scheduler-basic": ('sched_getaffinity', 'sched_setaffinity', 'getcpu', 'sched_setparam', 'sched_setscheduler', 'sched_get_priority_max', 'sched_get_priority_min'),
     "fs-boundary": ("flock", "utimensat", "fallocate", "readahead", "inotify_add_watch", "signalfd4", "timerfd_settime"),
@@ -106,6 +108,7 @@ PROGRAM_CASES = {
 }
 PROGRAMS = tuple(PROGRAM_CASES)
 PROGRAM_SUCCESS = {
+    "tty-termios": "THEKERNEL_TTY_TERMIOS_OK",
     "unix-write-credentials": "THEKERNEL_UNIX_WRITE_CREDENTIALS_OK",
     "scheduler-basic": "THEKERNEL_SCHEDULER_BASIC_DIFFERENTIAL_OK",
     "fs-boundary": "THEKERNEL_FS_BOUNDARY_PASS",

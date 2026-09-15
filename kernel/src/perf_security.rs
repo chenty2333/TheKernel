@@ -3,6 +3,7 @@
 //! Event authority is retained at open. Ring locked-memory admission instead
 //! uses mmap-time credentials, limits, and online CPU count, as Linux does.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use axerrno::{AxError, AxResult};
@@ -16,7 +17,6 @@ use thekernel_linux_perf::{
 
 use crate::task::AsThread;
 
-const PERF_LOCKED_MEMORY_OWNERS: usize = 16_384;
 // Intel EventSel bit 21 is AnyThread.  The PMU programming path deliberately
 // owns this bit and clears it; until the scheduler can reserve an SMT
 // exclusive placement, admitting the request would silently change its
@@ -41,8 +41,7 @@ struct PerfMlockEntry {
 impl PerfMlockEntry {
     const EMPTY: Self = Self { owner: None, user_bytes: 0, pinned_bytes: 0 };
 }
-static PERF_LOCKED_MEMORY: SpinNoIrq<[PerfMlockEntry; PERF_LOCKED_MEMORY_OWNERS]> =
-    SpinNoIrq::new([PerfMlockEntry::EMPTY; PERF_LOCKED_MEMORY_OWNERS]);
+static PERF_LOCKED_MEMORY: SpinNoIrq<Vec<PerfMlockEntry>> = SpinNoIrq::new(Vec::new());
 
 pub(crate) struct PerfMlockReservation {
     owner: PerfMlockOwner,
@@ -59,11 +58,12 @@ impl PerfMlockReservation {
 impl Drop for PerfMlockReservation {
     fn drop(&mut self) {
         let mut ledger = PERF_LOCKED_MEMORY.lock();
-        let entry = ledger.iter_mut().find(|entry| entry.owner == Some(self.owner))
+        let index = ledger.iter().position(|entry| entry.owner == Some(self.owner))
             .expect("perf locked-memory refund without an owner slot");
+        let entry = &mut ledger[index];
         entry.user_bytes = entry.user_bytes.checked_sub(self.user_bytes).expect("perf user charge underflow");
         entry.pinned_bytes = entry.pinned_bytes.checked_sub(self.pinned_bytes).expect("perf pinned charge underflow");
-        if entry.user_bytes == 0 && entry.pinned_bytes == 0 { *entry = PerfMlockEntry::EMPTY; }
+        if entry.user_bytes == 0 && entry.pinned_bytes == 0 { ledger.swap_remove(index); }
     }
 }
 
@@ -126,8 +126,16 @@ fn reserve_perf_locked_memory_for(
     }
     let (user_bytes, pinned_bytes) = split_perf_locked_memory(
         bytes, user_used, user_limit, pinned_used, memlock_limit, bypass_limit)?;
-    let index = ledger.iter().position(|entry| entry.owner == Some(owner))
-        .or_else(|| ledger.iter().position(|entry| entry.owner.is_none())).ok_or(AxError::NoMemory)?;
+    let index = match ledger.iter().position(|entry| entry.owner == Some(owner))
+        .or_else(|| ledger.iter().position(|entry| entry.owner.is_none())) {
+        Some(index) => index,
+        None => {
+            ledger.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            let index = ledger.len();
+            ledger.push(PerfMlockEntry::EMPTY);
+            index
+        }
+    };
     let entry = &mut ledger[index];
     let user_total = entry.user_bytes.checked_add(user_bytes).ok_or(AxError::NoMemory)?;
     let pinned_total = entry.pinned_bytes.checked_add(pinned_bytes).ok_or(AxError::NoMemory)?;

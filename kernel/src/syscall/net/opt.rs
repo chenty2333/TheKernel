@@ -21,7 +21,7 @@ use linux_raw_sys::{
         SOL_PACKET, SOL_SOCKET, socklen_t,
     },
 };
-use spin::{Lazy, Mutex, MutexGuard};
+use spin::{Lazy, Mutex};
 use thekernel_linux_net::{
     RawSocketOption, SocketOption as LinuxSocketOption, SocketOptionErrno, UcredWire,
     plan_get_socket_option, plan_set_socket_option,
@@ -159,75 +159,67 @@ struct IptTable {
 }
 static IPTABLES: Lazy<Mutex<Vec<IptTable>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
-/// Retained legacy-filter OUTPUT admission for a packet submission.
-///
-/// The guard is intentionally held through source import and lower packet
-/// submit.  A NOWAIT call therefore either obtains all of its shared
-/// admission before touching a TX ring/user source, or returns EAGAIN with no
-/// packet-side mutation.  Packet code may only consume this permit; it must
-/// not reacquire `IPTABLES` further down the transmit stack.
-pub(crate) struct IptablesOutputPermit<'a> {
-    tables: MutexGuard<'a, Vec<IptTable>>,
-    namespace: &'a Arc<crate::task::NetworkNamespace>,
+/// An OUTPUT decision made against one locked policy snapshot. No shared
+/// lock survives admission: usercopy and device submission may sleep.
+pub(crate) struct IptablesOutputPermit {
+    _private: (),
 }
 
-impl IptablesOutputPermit<'_> {
-    pub(crate) fn verify(&mut self) -> AxResult<()> {
-        self.tables
-            .retain(|table| table.namespace.strong_count() != 0);
-        for table in self
-            .tables
-            .iter()
-            .filter(|table| Weak::ptr_eq(&table.namespace, &Arc::downgrade(self.namespace)))
-        {
-            if table.valid_hooks & (1u32 << 3) == 0 {
-                continue;
+fn verify_iptables_hook(
+    tables: &mut Vec<IptTable>,
+    namespace: &Arc<crate::task::NetworkNamespace>,
+    hook: usize,
+) -> AxResult<()> {
+    if hook >= NF_INET_NUMHOOKS {
+        return Err(AxError::InvalidInput);
+    }
+    tables.retain(|table| table.namespace.strong_count() != 0);
+    for table in tables
+        .iter()
+        .filter(|table| Weak::ptr_eq(&table.namespace, &Arc::downgrade(namespace)))
+    {
+        if table.valid_hooks & (1u32 << hook) == 0 {
+            continue;
+        }
+        let mut cursor = table.hook_entry[hook];
+        let underflow = table.underflow[hook];
+        let mut steps = 0usize;
+        loop {
+            if steps >= table.rules.len() {
+                return Err(AxError::InvalidInput);
             }
-            let mut cursor = table.hook_entry[3];
-            let underflow = table.underflow[3];
-            let mut steps = 0usize;
-            loop {
-                if steps >= table.rules.len() {
-                    return Err(AxError::InvalidInput);
-                }
-                steps += 1;
-                let rule = table
-                    .rules
-                    .iter()
-                    .find(|rule| rule.offset == cursor)
-                    .ok_or(AxError::InvalidInput)?;
-                match rule.verdict {
-                    IptVerdict::Drop => return Err(LinuxError::EPERM.into()),
-                    IptVerdict::Reject => return Err(LinuxError::ECONNREFUSED.into()),
-                    IptVerdict::Accept if cursor == underflow => break,
-                    IptVerdict::Accept => {
-                        cursor = cursor.checked_add(rule.next).ok_or(AxError::InvalidInput)?
-                    }
+            steps += 1;
+            let rule = table
+                .rules
+                .iter()
+                .find(|rule| rule.offset == cursor)
+                .ok_or(AxError::InvalidInput)?;
+            match rule.verdict {
+                IptVerdict::Drop => return Err(LinuxError::EPERM.into()),
+                IptVerdict::Reject => return Err(LinuxError::ECONNREFUSED.into()),
+                IptVerdict::Accept if cursor == underflow => break,
+                IptVerdict::Accept => {
+                    cursor = cursor.checked_add(rule.next).ok_or(AxError::InvalidInput)?
                 }
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 pub(crate) fn acquire_iptables_output_permit(
     namespace: &Arc<crate::task::NetworkNamespace>,
-) -> AxResult<IptablesOutputPermit<'_>> {
-    let mut permit = IptablesOutputPermit {
-        tables: IPTABLES.lock(),
-        namespace,
-    };
-    permit.verify()?;
-    Ok(permit)
+) -> AxResult<IptablesOutputPermit> {
+    verify_iptables_hook(&mut IPTABLES.lock(), namespace, 3)?;
+    Ok(IptablesOutputPermit { _private: () })
 }
 
 pub(crate) fn try_acquire_iptables_output_permit(
     namespace: &Arc<crate::task::NetworkNamespace>,
-) -> AxResult<IptablesOutputPermit<'_>> {
-    let tables = IPTABLES.try_lock().ok_or(AxError::WouldBlock)?;
-    let mut permit = IptablesOutputPermit { tables, namespace };
-    permit.verify()?;
-    Ok(permit)
+) -> AxResult<IptablesOutputPermit> {
+    let mut tables = IPTABLES.try_lock().ok_or(AxError::WouldBlock)?;
+    verify_iptables_hook(&mut tables, namespace, 3)?;
+    Ok(IptablesOutputPermit { _private: () })
 }
 
 fn socket_option_errno(error: SocketOptionErrno) -> AxError {
@@ -723,40 +715,7 @@ pub(crate) fn iptables_output_verdict_nowait(
     namespace: &Arc<crate::task::NetworkNamespace>,
 ) -> AxResult<()> {
     let mut tables = IPTABLES.try_lock().ok_or(AxError::WouldBlock)?;
-    tables.retain(|table| table.namespace.strong_count() != 0);
-    for table in tables
-        .iter()
-        .filter(|table| Weak::ptr_eq(&table.namespace, &Arc::downgrade(namespace)))
-    {
-        if table.valid_hooks & (1u32 << 3) == 0 {
-            continue;
-        }
-        let mut cursor = table.hook_entry[3];
-        let underflow = table.underflow[3];
-        let mut steps = 0usize;
-        loop {
-            if steps >= table.rules.len() {
-                return Err(AxError::InvalidInput);
-            }
-            steps += 1;
-            let rule = table
-                .rules
-                .iter()
-                .find(|rule| rule.offset == cursor)
-                .ok_or(AxError::InvalidInput)?;
-            match rule.verdict {
-                IptVerdict::Drop => return Err(LinuxError::EPERM.into()),
-                IptVerdict::Reject => return Err(LinuxError::ECONNREFUSED.into()),
-                IptVerdict::Accept => {
-                    if cursor == underflow {
-                        break;
-                    }
-                    cursor = cursor.checked_add(rule.next).ok_or(AxError::InvalidInput)?;
-                }
-            }
-        }
-    }
-    Ok(())
+    verify_iptables_hook(&mut tables, namespace, 3)
 }
 
 /// Execute one installed legacy iptables hook.  `hook_entry` and `underflow`
@@ -766,44 +725,7 @@ pub(crate) fn iptables_hook_verdict(
     namespace: &Arc<crate::task::NetworkNamespace>,
     hook: usize,
 ) -> AxResult<()> {
-    if hook >= NF_INET_NUMHOOKS {
-        return Err(AxError::InvalidInput);
-    }
-    let mut tables = IPTABLES.lock();
-    tables.retain(|table| table.namespace.strong_count() != 0);
-    for table in tables
-        .iter()
-        .filter(|table| Weak::ptr_eq(&table.namespace, &Arc::downgrade(namespace)))
-    {
-        if table.valid_hooks & (1u32 << hook) == 0 {
-            continue;
-        }
-        let mut cursor = table.hook_entry[hook];
-        let underflow = table.underflow[hook];
-        let mut steps = 0usize;
-        loop {
-            if steps >= table.rules.len() {
-                return Err(AxError::InvalidInput);
-            };
-            steps += 1;
-            let rule = table
-                .rules
-                .iter()
-                .find(|rule| rule.offset == cursor)
-                .ok_or(AxError::InvalidInput)?;
-            match rule.verdict {
-                IptVerdict::Drop => return Err(LinuxError::EPERM.into()),
-                IptVerdict::Reject => return Err(LinuxError::ECONNREFUSED.into()),
-                IptVerdict::Accept => {
-                    if cursor == underflow {
-                        break;
-                    }
-                    cursor = cursor.checked_add(rule.next).ok_or(AxError::InvalidInput)?;
-                }
-            }
-        }
-    }
-    Ok(())
+    verify_iptables_hook(&mut IPTABLES.lock(), namespace, hook)
 }
 
 fn read_option<T: Copy>(
@@ -811,7 +733,7 @@ fn read_option<T: Copy>(
     val: UserConstPtr<u8>,
     len: socklen_t,
 ) -> AxResult<T> {
-    if len as usize != size_of::<T>() {
+    if (len as usize) < size_of::<T>() {
         return Err(AxError::InvalidInput);
     }
     capability
@@ -936,10 +858,10 @@ fn write_option<T: Copy>(
 fn handle_ipt_set_replace(
     capability: &UserMemoryCapability,
     optval: UserConstPtr<u8>,
+    optlen: socklen_t,
     namespace: &Arc<crate::task::NetworkNamespace>,
 ) -> AxResult<isize> {
-    let header =
-        read_option::<IptReplaceHeader>(capability, optval, size_of::<IptReplaceHeader>() as _)?;
+    let header = read_option::<IptReplaceHeader>(capability, optval, optlen)?;
     if header.num_counters == 0 {
         return Err(AxError::InvalidInput);
     }
@@ -949,7 +871,7 @@ fn handle_ipt_set_replace(
     let total_len = header_len
         .checked_add(table_len)
         .ok_or(AxError::InvalidInput)?;
-    if total_len > IPT_REPLACE_MAX_BYTES {
+    if total_len > IPT_REPLACE_MAX_BYTES || total_len != optlen as usize {
         return Err(AxError::InvalidInput);
     }
 
@@ -1881,7 +1803,7 @@ pub fn sys_setsockopt(
         ) {
             return Err(LinuxError::EPERM.into());
         }
-        return handle_ipt_set_replace(&capability, optval, socket.net_namespace());
+        return handle_ipt_set_replace(&capability, optval, optlen, socket.net_namespace());
     }
     if level == SOL_SOCKET {
         match optname {
@@ -2017,6 +1939,14 @@ mod tests {
             packet_sol_socket_value(PacketSocketType::Raw, SO_RCVBUF).map_err(errno),
             Err(LinuxError::ENOPROTOOPT)
         );
+    }
+
+    #[test]
+    fn output_admission_does_not_retain_the_policy_lock() {
+        let owner = crate::task::UserNamespace::try_new_root().unwrap();
+        let namespace = crate::task::NetworkNamespace::try_new_loopback_only(owner).unwrap();
+        let _permit = try_acquire_iptables_output_permit(&namespace).unwrap();
+        assert!(IPTABLES.try_lock().is_some());
     }
 
     #[test]

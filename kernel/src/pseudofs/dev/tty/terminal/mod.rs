@@ -11,7 +11,7 @@ pub mod ldisc;
 pub mod termios;
 
 #[repr(C)]
-#[derive(Debug, Copy, Clone, AnyBitPattern)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, AnyBitPattern)]
 pub struct WindowSize {
     pub ws_row: u16,
     pub ws_col: u16,
@@ -54,6 +54,17 @@ impl Default for Terminal {
     }
 }
 impl Terminal {
+    /// Commit the new geometry before notifying its foreground group. This
+    /// lock must not be held across signal delivery or a signal handler's query.
+    pub fn update_window_size(&self, next: WindowSize) -> bool {
+        let mut current = self.window_size.lock();
+        if *current == next {
+            return false;
+        }
+        *current = next;
+        true
+    }
+
     pub fn load_termios(&self) -> termios::Termios2 {
         *self.termios.lock()
     }
@@ -71,5 +82,25 @@ impl Terminal {
                 return (after, termios);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn winsize_changes_include_pixel_geometry_but_identical_updates_are_noops() {
+        let terminal = Terminal::default();
+        let original = *terminal.window_size.lock();
+        assert!(!terminal.update_window_size(original));
+        let mut next = original;
+        next.ws_col += 1;
+        assert!(terminal.update_window_size(next));
+        assert_eq!(*terminal.window_size.lock(), next);
+        assert!(!terminal.update_window_size(next));
+        next.ws_xpixel = 640;
+        assert!(terminal.update_window_size(next));
+        assert_eq!(*terminal.window_size.lock(), next);
     }
 }

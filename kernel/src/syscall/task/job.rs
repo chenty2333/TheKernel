@@ -175,6 +175,18 @@ pub fn sys_getpgid(pid: Pid) -> AxResult<isize> {
         .unwrap_or(0))
 }
 
+fn validate_setpgid_target(is_self: bool, is_child: bool, exec_committed: bool) -> AxResult<()> {
+    if !is_self {
+        if !is_child {
+            return Err(AxError::NoSuchProcess);
+        }
+        if exec_committed {
+            return Err(AxError::PermissionDenied);
+        }
+    }
+    Ok(())
+}
+
 pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
     let _operation = JOB_CONTROL_OPERATION.lock();
     let curr = current();
@@ -209,14 +221,17 @@ pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
         return Err(AxError::from(LinuxError::ESRCH));
     };
 
-    if proc.pid() != caller.pid() {
-        let is_child = proc
-            .parent()
-            .is_some_and(|parent| parent.pid() == caller.pid());
-        if !is_child {
-            return Err(AxError::from(LinuxError::ESRCH));
-        }
-    }
+    // Keep this guard through group mutation, paired with successful exec's
+    // image publication. Checking a flag without serialization would still
+    // allow a parent to change its child's group after exec committed.
+    let target_data = get_process_data(proc.pid())?;
+    let exec_committed = target_data.exec_committed.lock();
+    validate_setpgid_target(
+        proc.pid() == caller.pid(),
+        proc.parent()
+            .is_some_and(|parent| parent.pid() == caller.pid()),
+        *exec_committed,
+    )?;
 
     if proc.group().session().sid() == proc.pid() {
         return Err(AxError::OperationNotPermitted);
@@ -259,4 +274,27 @@ pub fn sys_setpgid(pid: i32, pgid: i32) -> AxResult<isize> {
     }
 
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setpgid_exec_restriction_applies_only_to_own_children() {
+        assert_eq!(validate_setpgid_target(false, true, false), Ok(()));
+        assert_eq!(
+            validate_setpgid_target(false, true, true),
+            Err(AxError::PermissionDenied)
+        );
+        assert_eq!(validate_setpgid_target(true, false, true), Ok(()));
+        assert_eq!(
+            validate_setpgid_target(false, false, false),
+            Err(AxError::NoSuchProcess)
+        );
+        assert_eq!(
+            validate_setpgid_target(false, false, true),
+            Err(AxError::NoSuchProcess)
+        );
+    }
 }

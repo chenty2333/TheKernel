@@ -33,76 +33,380 @@ const MAX_ROWS: usize = 64;
 const CELL_WIDTH: usize = 8;
 const CELL_HEIGHT: usize = 16;
 
+const DEFAULT_FG: u8 = 16;
+const BOLD: u8 = 1;
+const REVERSE: u8 = 2;
+const PALETTE: [u32; 17] = [
+    0x000000, 0xaa0000, 0x00aa00, 0xaa5500, 0x0000aa, 0xaa00aa, 0x00aaaa, 0xaaaaaa, 0x555555,
+    0xff5555, 0x55ff55, 0xffff55, 0x5555ff, 0xff55ff, 0x55ffff, 0xffffff, 0xd0d0d0,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Cell {
+    byte: u8,
+    fg: u8,
+    bg: u8,
+    attributes: u8,
+}
+impl Cell {
+    const DEFAULT: Self = Self {
+        byte: b' ',
+        fg: DEFAULT_FG,
+        bg: 0,
+        attributes: 0,
+    };
+    fn colors(self) -> (u32, u32) {
+        let foreground = if self.attributes & BOLD != 0 {
+            match self.fg {
+                0..=7 => self.fg + 8,
+                DEFAULT_FG => 15,
+                _ => self.fg,
+            }
+        } else {
+            self.fg
+        };
+        let (fg, bg) = (PALETTE[foreground as usize], PALETTE[self.bg as usize]);
+        if self.attributes & REVERSE != 0 {
+            (bg, fg)
+        } else {
+            (fg, bg)
+        }
+    }
+}
+
 struct Screen {
-    cells: Box<[u8; MAX_COLS * MAX_ROWS]>,
+    cells: Box<[Cell]>,
     row: usize,
     col: usize,
+    style: Cell,
+    saved: (usize, usize, Cell),
+    scroll_top: usize,
+    scroll_bottom: usize,
+    wrap_pending: bool,
+    autowrap: bool,
+    cursor_visible: bool,
     escape: u8,
+    params: [usize; 16],
+    param: usize,
+    private: bool,
+    malformed: bool,
 }
 
 impl Screen {
     fn try_new() -> Option<Self> {
+        // Allocate on the heap: a Cell array is larger than a kernel stack.
+        let mut cells = Vec::new();
+        cells.try_reserve_exact(MAX_COLS * MAX_ROWS).ok()?;
+        cells.resize(MAX_COLS * MAX_ROWS, Cell::DEFAULT);
         Some(Self {
-            cells: Box::try_new([b' '; MAX_COLS * MAX_ROWS]).ok()?,
+            cells: cells.into_boxed_slice(),
             row: 0,
             col: 0,
+            style: Cell::DEFAULT,
+            saved: (0, 0, Cell::DEFAULT),
+            scroll_top: 0,
+            scroll_bottom: MAX_ROWS - 1,
+            wrap_pending: false,
+            autowrap: true,
+            cursor_visible: true,
             escape: 0,
+            params: [0; 16],
+            param: 0,
+            private: false,
+            malformed: false,
         })
     }
 
     fn clear(&mut self) {
-        self.cells.fill(b' ');
+        self.cells.fill(Cell::DEFAULT);
         self.row = 0;
         self.col = 0;
+        self.style = Cell::DEFAULT;
+        self.saved = (0, 0, Cell::DEFAULT);
+        self.scroll_top = 0;
+        self.scroll_bottom = MAX_ROWS - 1;
+        self.wrap_pending = false;
+        self.autowrap = true;
+        self.cursor_visible = true;
         self.escape = 0;
     }
 
-    fn put(&mut self, byte: u8, cols: usize, rows: usize) {
-        match self.escape {
-            1 => {
-                self.escape = u8::from(byte == b'[') * 2;
-                return;
+    fn scroll(&mut self, rows: usize, count: usize, down: bool) {
+        let top = self.scroll_top.min(rows - 1);
+        let bottom = self.scroll_bottom.min(rows - 1);
+        if top > bottom {
+            return;
+        }
+        let count = count.min(bottom - top + 1);
+        let begin = top * MAX_COLS;
+        let end = (bottom + 1) * MAX_COLS;
+        let shift = count * MAX_COLS;
+        if down {
+            self.cells.copy_within(begin..end - shift, begin + shift);
+            self.cells[begin..begin + shift].fill(self.style);
+        } else {
+            self.cells.copy_within(begin + shift..end, begin);
+            self.cells[end - shift..end].fill(self.style);
+        }
+    }
+
+    fn linefeed(&mut self, rows: usize) {
+        if self.row == self.scroll_bottom.min(rows - 1) {
+            self.scroll(rows, 1, false);
+        } else {
+            self.row = (self.row + 1).min(rows - 1);
+        }
+        self.wrap_pending = false;
+    }
+
+    fn restore(&mut self, cols: usize, rows: usize) {
+        self.row = self.saved.0.min(rows - 1);
+        self.col = self.saved.1.min(cols - 1);
+        self.style = self.saved.2;
+        self.wrap_pending = false;
+    }
+
+    fn csi(&mut self, byte: u8, cols: usize, rows: usize) {
+        if self.malformed {
+            return;
+        }
+        let n = self.params[0].max(1);
+        if self.private {
+            if matches!(byte, b'h' | b'l') {
+                for index in 0..=self.param {
+                    match self.params[index] {
+                        7 => self.autowrap = byte == b'h',
+                        25 => self.cursor_visible = byte == b'h',
+                        _ => {}
+                    }
+                }
             }
-            2 => {
-                if (0x40..=0x7e).contains(&byte) {
-                    self.escape = 0;
+            return;
+        }
+        match byte {
+            b'H' | b'f' => {
+                self.row = self.params[0].max(1).saturating_sub(1).min(rows - 1);
+                self.col = self.params[1].max(1).saturating_sub(1).min(cols - 1);
+            }
+            b'A' => self.row = self.row.saturating_sub(n),
+            b'B' | b'e' => self.row = self.row.saturating_add(n).min(rows - 1),
+            b'C' | b'a' => self.col = self.col.saturating_add(n).min(cols - 1),
+            b'D' => self.col = self.col.saturating_sub(n),
+            b'E' => {
+                self.row = self.row.saturating_add(n).min(rows - 1);
+                self.col = 0;
+            }
+            b'F' => {
+                self.row = self.row.saturating_sub(n);
+                self.col = 0;
+            }
+            b'G' | b'`' => self.col = n.saturating_sub(1).min(cols - 1),
+            b'd' => self.row = n.saturating_sub(1).min(rows - 1),
+            b'K' => {
+                let begin = self.row * MAX_COLS;
+                let range = match self.params[0] {
+                    0 => begin + self.col..begin + cols,
+                    1 => begin..begin + self.col + 1,
+                    2 => begin..begin + cols,
+                    _ => return,
+                };
+                self.cells[range].fill(self.style);
+            }
+            b'J' => {
+                let cursor = self.row * MAX_COLS + self.col;
+                let range = match self.params[0] {
+                    0 => cursor..rows * MAX_COLS,
+                    1 => 0..cursor + 1,
+                    2 => 0..rows * MAX_COLS,
+                    _ => return,
+                };
+                self.cells[range].fill(self.style);
+            }
+            b'm' => {
+                let mut index = 0;
+                while index <= self.param {
+                    match self.params[index] {
+                        0 => self.style = Cell::DEFAULT,
+                        1 => self.style.attributes |= BOLD,
+                        7 => self.style.attributes |= REVERSE,
+                        22 => self.style.attributes &= !BOLD,
+                        27 => self.style.attributes &= !REVERSE,
+                        30..=37 => self.style.fg = (self.params[index] - 30) as u8,
+                        40..=47 => self.style.bg = (self.params[index] - 40) as u8,
+                        90..=97 => self.style.fg = (self.params[index] - 90 + 8) as u8,
+                        100..=107 => self.style.bg = (self.params[index] - 100 + 8) as u8,
+                        39 => self.style.fg = DEFAULT_FG,
+                        49 => self.style.bg = 0,
+                        38 | 48 => {
+                            index += match self.params.get(index + 1) {
+                                Some(2) => 4,
+                                Some(5) => 2,
+                                _ => self.param,
+                            };
+                        }
+                        _ => {}
+                    }
+                    index += 1;
                 }
                 return;
             }
-            _ => {}
+            b'r' => {
+                let top = n - 1;
+                let bottom = if self.params[1] == 0 {
+                    rows
+                } else {
+                    self.params[1]
+                };
+                if top < bottom.saturating_sub(1) && bottom <= rows {
+                    self.scroll_top = top;
+                    self.scroll_bottom = bottom - 1;
+                    self.row = 0;
+                    self.col = 0;
+                }
+            }
+            b'S' => self.scroll(rows, n, false),
+            b'T' => self.scroll(rows, n, true),
+            b'L' | b'M'
+                if (self.scroll_top..=self.scroll_bottom.min(rows - 1)).contains(&self.row) =>
+            {
+                let top = self.scroll_top;
+                self.scroll_top = self.row;
+                self.scroll(rows, n, byte == b'L');
+                self.scroll_top = top;
+            }
+            b'P' | b'@' | b'X' => {
+                let begin = self.row * MAX_COLS + self.col;
+                let end = self.row * MAX_COLS + cols;
+                let count = n.min(cols - self.col);
+                match byte {
+                    b'P' => {
+                        self.cells.copy_within(begin + count..end, begin);
+                        self.cells[end - count..end].fill(self.style);
+                    }
+                    b'@' => {
+                        self.cells.copy_within(begin..end - count, begin + count);
+                        self.cells[begin..begin + count].fill(self.style);
+                    }
+                    _ => self.cells[begin..begin + count].fill(self.style),
+                }
+            }
+            b's' => self.saved = (self.row, self.col, self.style),
+            b'u' => self.restore(cols, rows),
+            _ => return,
+        }
+        self.wrap_pending = false;
+    }
+
+    fn put(&mut self, byte: u8, cols: usize, rows: usize) {
+        let cols = cols.clamp(1, MAX_COLS);
+        let rows = rows.clamp(1, MAX_ROWS);
+        self.row = self.row.min(rows - 1);
+        self.col = self.col.min(cols - 1);
+        // OSC titles must not leak their payload into the text screen.
+        if self.escape == 3 || self.escape == 4 {
+            self.escape = if byte == 7 || (self.escape == 4 && byte == b'\\') {
+                0
+            } else if byte == 0x1b {
+                4
+            } else {
+                3
+            };
+            return;
+        }
+        if matches!(byte, 0x18 | 0x1a) {
+            self.escape = 0;
+            return;
         }
         if byte == 0x1b {
             self.escape = 1;
             return;
         }
-        match byte {
-            b'\r' => self.col = 0,
-            b'\n' => {
-                self.col = 0;
-                self.row += 1;
-            }
-            8 => self.col = self.col.saturating_sub(1),
-            b'\t' => {
-                self.col = (self.col + 8) & !7;
-                if self.col >= cols {
-                    self.col = 0;
-                    self.row += 1;
+        match self.escape {
+            1 => {
+                self.escape = 0;
+                match byte {
+                    b'[' => {
+                        self.escape = 2;
+                        self.params.fill(0);
+                        self.param = 0;
+                        self.private = false;
+                        self.malformed = false;
+                    }
+                    b']' => self.escape = 3,
+                    b'(' | b')' => self.escape = 5,
+                    b'7' => self.saved = (self.row, self.col, self.style),
+                    b'8' => self.restore(cols, rows),
+                    b'D' => self.linefeed(rows),
+                    b'E' => {
+                        self.col = 0;
+                        self.linefeed(rows);
+                    }
+                    b'M' => {
+                        if self.row == self.scroll_top {
+                            self.scroll(rows, 1, true);
+                        } else {
+                            self.row = self.row.saturating_sub(1);
+                        }
+                        self.wrap_pending = false;
+                    }
+                    b'c' => self.clear(),
+                    _ => {}
                 }
+                return;
             }
-            0x20..=0x7e => {
-                self.cells[self.row * MAX_COLS + self.col] = byte;
-                self.col += 1;
-                if self.col == cols {
-                    self.col = 0;
-                    self.row += 1;
+            2 => {
+                match byte {
+                    b'0'..=b'9' => {
+                        self.params[self.param] = self.params[self.param]
+                            .saturating_mul(10)
+                            .saturating_add((byte - b'0') as usize)
+                    }
+                    b';' if self.param + 1 < self.params.len() => self.param += 1,
+                    b'?' if self.param == 0 && self.params[0] == 0 => self.private = true,
+                    0x40..=0x7e => {
+                        self.escape = 0;
+                        self.csi(byte, cols, rows);
+                    }
+                    _ => self.malformed = true,
                 }
+                return;
+            }
+            5 => {
+                self.escape = 0;
+                return;
             }
             _ => {}
         }
-        if self.row >= rows {
-            self.cells.copy_within(MAX_COLS..MAX_COLS * rows, 0);
-            self.cells[MAX_COLS * (rows - 1)..MAX_COLS * rows].fill(b' ');
-            self.row = rows - 1;
+        match byte {
+            b'\r' => {
+                self.col = 0;
+                self.wrap_pending = false;
+            }
+            b'\n' => {
+                self.col = 0;
+                self.linefeed(rows);
+            }
+            8 => {
+                self.col = self.col.saturating_sub(1);
+                self.wrap_pending = false;
+            }
+            b'\t' => {
+                self.col = ((self.col + 8) & !7).min(cols - 1);
+                self.wrap_pending = false;
+            }
+            0x20..=0x7e => {
+                if self.wrap_pending && self.autowrap {
+                    self.col = 0;
+                    self.linefeed(rows);
+                }
+                self.cells[self.row * MAX_COLS + self.col] = Cell { byte, ..self.style };
+                if self.col + 1 == cols {
+                    self.wrap_pending = true;
+                } else {
+                    self.col += 1;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -155,6 +459,15 @@ pub(crate) fn install() {
     let installed = console.is_some();
     *FBCON.lock() = console;
     if installed {
+        if let Some((width, height)) = fb::fbcon_dimensions() {
+            let size = console_window_size(width, height);
+            // No fbcon, framebuffer or VT-state lock spans notification.
+            // PTYs have independent emulator-supplied geometry, unchanged here.
+            super::N_TTY.resize_window_size(size);
+            for vt in 1..=VT_COUNT as u16 {
+                VT_MANAGER.tty_for(vt).resize_window_size(size);
+            }
+        }
         install_log_mirror();
     }
 }
@@ -288,12 +601,19 @@ fn mirror_new_log_bytes(cursor: &mut u64) -> bool {
     chunks == LOG_MIRROR_CHUNKS_PER_PASS
 }
 
+fn console_window_size(width: usize, height: usize) -> super::terminal::WindowSize {
+    super::terminal::WindowSize {
+        ws_col: (width / CELL_WIDTH).clamp(1, MAX_COLS) as u16,
+        ws_row: (height / CELL_HEIGHT).clamp(1, MAX_ROWS) as u16,
+        ws_xpixel: width.min(u16::MAX as usize) as u16,
+        ws_ypixel: height.min(u16::MAX as usize) as u16,
+    }
+}
+
 fn dimensions() -> Option<(usize, usize)> {
     fb::fbcon_dimensions().map(|(width, height)| {
-        (
-            (width / CELL_WIDTH).clamp(1, MAX_COLS),
-            (height / CELL_HEIGHT).clamp(1, MAX_ROWS),
-        )
+        let size = console_window_size(width, height);
+        (usize::from(size.ws_col), usize::from(size.ws_row))
     })
 }
 
@@ -394,9 +714,9 @@ pub(crate) fn present_while_text_active(vt: u16) {
         frame.clear(0x0000_0000);
         // Snapshot one row at a time so writers are never excluded for the
         // MMIO-bound glyph drawing, only for a bounded cell copy.
-        let mut row_cells = [b' '; MAX_COLS];
+        let mut row_cells = [Cell::DEFAULT; MAX_COLS];
         for row in 0..rows {
-            {
+            let cursor_col = {
                 let console = FBCON.lock();
                 let Some(console) = console.as_ref() else {
                     return;
@@ -406,9 +726,18 @@ pub(crate) fn present_while_text_active(vt: u16) {
                 };
                 row_cells[..cols]
                     .copy_from_slice(&screen.cells[row * MAX_COLS..row * MAX_COLS + cols]);
-            }
-            for (col, &byte) in row_cells[..cols].iter().enumerate() {
-                frame.glyph(col * CELL_WIDTH, row * CELL_HEIGHT, byte);
+                (screen.cursor_visible && screen.row == row).then_some(screen.col)
+            };
+            for (col, &cell) in row_cells[..cols].iter().enumerate() {
+                let (fg, bg) = cell.colors();
+                frame.glyph(
+                    col * CELL_WIDTH,
+                    row * CELL_HEIGHT,
+                    cell.byte,
+                    fg,
+                    bg,
+                    cursor_col == Some(col),
+                );
             }
         }
     });
@@ -521,6 +850,145 @@ mod tests {
         );
     }
 
+    fn feed(screen: &mut Screen, bytes: &[u8], cols: usize, rows: usize) {
+        for &byte in bytes {
+            screen.put(byte, cols, rows);
+        }
+    }
+
+    #[test]
+    fn vi_bottom_command_replaces_reverse_status_without_stale_text() {
+        let mut screen = Screen::try_new().unwrap();
+        feed(
+            &mut screen,
+            b"file contents\x1b[24;1H\x1b[7mfile 1L, 5C\x1b[0m",
+            80,
+            24,
+        );
+        let bottom = 23 * MAX_COLS;
+        assert_eq!(screen.cells[bottom].colors(), (0, 0xd0d0d0));
+        // Deliberately split a CUP between writes, as vi's stdio may do.
+        feed(&mut screen, b"\x1b[24;", 80, 24);
+        feed(&mut screen, b"1H\x1b[K:q", 80, 24);
+        assert_eq!(screen.cells[bottom].byte, b':');
+        assert_eq!(screen.cells[bottom + 1].byte, b'q');
+        assert_eq!(screen.cells[bottom].colors(), (0xd0d0d0, 0));
+        assert!(
+            screen.cells[bottom + 2..bottom + 80]
+                .iter()
+                .all(|cell| cell.byte == b' ')
+        );
+        assert_eq!(screen.cells[0].byte, b'f');
+        feed(&mut screen, b"\r\x1b[2K", 80, 24);
+        assert!(
+            screen.cells[bottom..bottom + 80]
+                .iter()
+                .all(|cell| *cell == Cell::DEFAULT)
+        );
+    }
+
+    #[test]
+    fn colors_save_restore_and_erase_do_not_move_the_cursor() {
+        let mut screen = Screen::try_new().unwrap();
+        feed(
+            &mut screen,
+            b"\x1b[2;3H\x1b[31;44;1m\x1b7\x1b[0m\x1b[Hn\x1b8R",
+            8,
+            4,
+        );
+        let cell = screen.cells[MAX_COLS + 2];
+        assert_eq!(cell.byte, b'R');
+        assert_eq!(cell.colors(), (0xff5555, 0x0000aa));
+        feed(
+            &mut screen,
+            b"\x1b[0m\x1b[38;5;31m\x1b[38;2;1;2;3m\x1b[48;2;0;0;31m",
+            8,
+            4,
+        );
+        assert_eq!(screen.style, Cell::DEFAULT);
+        feed(&mut screen, b"\x1b[0m\x1b[2J", 8, 4);
+        assert_eq!((screen.row, screen.col), (1, 3));
+        assert!(
+            screen.cells[..4 * MAX_COLS]
+                .iter()
+                .all(|cell| *cell == Cell::DEFAULT)
+        );
+    }
+
+    #[test]
+    fn wrap_is_deferred_and_scroll_region_preserves_the_status_line() {
+        let mut screen = Screen::try_new().unwrap();
+        feed(&mut screen, b"ab\n", 2, 2);
+        assert_eq!(screen.cells[0].byte, b'a');
+        assert_eq!((screen.row, screen.col), (1, 0));
+        screen.clear();
+        feed(
+            &mut screen,
+            b"A\x1b[2;1HB\x1b[3;1HC\x1b[4;1HD\x1b[1;3r\x1b[3;1H\n",
+            8,
+            4,
+        );
+        assert_eq!(screen.cells[0].byte, b'B');
+        assert_eq!(screen.cells[MAX_COLS].byte, b'C');
+        assert_eq!(screen.cells[2 * MAX_COLS].byte, b' ');
+        assert_eq!(screen.cells[3 * MAX_COLS].byte, b'D');
+    }
+
+    #[test]
+    fn malformed_and_overlong_csi_are_bounded_even_on_one_cell_geometry() {
+        let mut screen = Screen::try_new().unwrap();
+        feed(&mut screen, b"\x1b[", 1, 1);
+        for _ in 0..512 {
+            screen.put(b'9', 1, 1);
+        }
+        feed(&mut screen, b";999999999999999999999999H!", 1, 1);
+        assert_eq!((screen.row, screen.col), (0, 0));
+        assert_eq!(screen.cells[0].byte, b'!');
+        feed(
+            &mut screen,
+            b"\x1b[1;2;3;4;5;6;7;8;9;0;1;2;3;4;5;6;7;8m",
+            1,
+            1,
+        );
+        assert_eq!(screen.style, Cell::DEFAULT);
+        feed(
+            &mut screen,
+            b"\x1b[999999999999999999999S\x1b[999999999999999999999T",
+            1,
+            1,
+        );
+        feed(&mut screen, b"\x1b]ignored title\x07z", 1, 1);
+        assert_eq!(screen.cells[0].byte, b'z');
+        feed(&mut screen, b"\x1b[999999;999999H", usize::MAX, usize::MAX);
+        assert_eq!((screen.row, screen.col), (MAX_ROWS - 1, MAX_COLS - 1));
+    }
+
+    #[test]
+    fn cursor_is_visible_by_default_and_obeys_deferred_private_mode_updates() {
+        let mut screen = Screen::try_new().unwrap();
+        assert!(screen.cursor_visible);
+        feed(&mut screen, b"\x1b[?25", 80, 24);
+        assert!(screen.cursor_visible);
+        feed(&mut screen, b"l", 80, 24);
+        assert!(!screen.cursor_visible);
+        feed(&mut screen, b"\x1b[24;1H:q\x1b[?25h", 80, 24);
+        assert!(screen.cursor_visible);
+        assert_eq!((screen.row, screen.col), (23, 2));
+    }
+
+    #[test]
+    fn physical_console_reports_the_same_bounded_grid_it_renders() {
+        let size = console_window_size(1024, 768);
+        assert_eq!((size.ws_col, size.ws_row), (128, 48));
+        let size = console_window_size(usize::MAX, usize::MAX);
+        assert_eq!(
+            (usize::from(size.ws_col), usize::from(size.ws_row)),
+            (MAX_COLS, MAX_ROWS)
+        );
+        let size = console_window_size(0, 0);
+        assert_eq!((size.ws_col, size.ws_row), (1, 1));
+    }
+
     #[test]
     fn cells_wrap_and_scroll_without_allocating() {
         let mut screen = Screen::try_new().unwrap();
@@ -529,9 +997,9 @@ mod tests {
         screen.put(b'c', 2, 2);
         screen.put(b'd', 2, 2);
         screen.put(b'e', 2, 2);
-        assert_eq!(screen.cells[0], b'c');
-        assert_eq!(screen.cells[1], b'd');
-        assert_eq!(screen.cells[MAX_COLS], b'e');
-        assert_eq!(screen.cells[MAX_COLS + 1], b' ');
+        assert_eq!(screen.cells[0].byte, b'c');
+        assert_eq!(screen.cells[1].byte, b'd');
+        assert_eq!(screen.cells[MAX_COLS].byte, b'e');
+        assert_eq!(screen.cells[MAX_COLS + 1].byte, b' ');
     }
 }
