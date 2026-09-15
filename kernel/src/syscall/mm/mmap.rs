@@ -2470,12 +2470,52 @@ fn process_madvise_walk(
     let (start, length) = validate_page_aligned_range(addr, length)?;
     let end = start + length;
     let mut cursor = start;
+    // `madvise_walk_vmas()` distinguishes two ways a range can fail to be
+    // covered (`mm/madvise.c:1683-1704`):
+    //
+    // 	for (;;) {
+    // 		/* Still start < end. */
+    // 		if (!vma)
+    // 			return -ENOMEM;
+    //
+    // 		if (range->start < vma->vm_start) {
+    // 			/*
+    // 			 * This indicates a gap between VMAs in the input
+    // 			 * range. This does not cause the operation to abort,
+    // 			 * rather we simply return -ENOMEM to indicate that this
+    // 			 * has happened, but carry on.
+    // 			 */
+    // 			unmapped_error = -ENOMEM;
+    // 			range->start = vma->vm_start;
+    // 			if (range->start >= last_end)
+    // 				break;
+    // 		}
+    // 		...
+    // 	}
+    // 	return unmapped_error;
+    //
+    // Running off the end of the final VMA aborts immediately, but a hole
+    // with another VMA behind it only records the verdict: the later VMAs in
+    // the range still receive the advice, and the caller still sees -ENOMEM.
+    let mut unmapped_error = false;
     while cursor < end {
-        let Some(area) = aspace.find_area(cursor) else {
-            return Err(AxError::NoMemory);
+        // `find_vma()` finds the VMA containing the address, so an address in
+        // a hole has none; Linux then tests that VMA against `range->start`,
+        // which is why the search continues with the next VMA at or after the
+        // cursor rather than reporting the hole.
+        let area = match aspace.find_area(cursor) {
+            Some(area) => area,
+            None => match aspace.areas_overlapping(VirtAddrRange::new(cursor, end)).next() {
+                Some(area) => area,
+                None => return Err(AxError::NoMemory),
+            },
         };
         if area.start() > cursor {
-            return Err(AxError::NoMemory);
+            unmapped_error = true;
+            cursor = area.start();
+            if cursor >= end {
+                break;
+            }
         }
         let area_end = area.end().min(end);
         if reject_locked {
@@ -2494,6 +2534,9 @@ fn process_madvise_walk(
         let backend = area.backend().clone();
         apply(aspace, backend, VirtAddrRange::new(cursor, area_end))?;
         cursor = area_end;
+    }
+    if unmapped_error {
+        return Err(AxError::NoMemory);
     }
     Ok(())
 }
@@ -5000,6 +5043,46 @@ mod tests {
             next_madvise_run(&aspace, base + 2 * PAGE_SIZE_4K, end),
             Some((base + 2 * PAGE_SIZE_4K, end, false))
         );
+    }
+
+    #[test]
+    fn process_madvise_walk_reaches_the_vmas_after_a_hole() {
+        // The remote walk answers to the same rule as the local one: a hole
+        // with another VMA behind it records `unmapped_error = -ENOMEM` and
+        // carries on (mm/madvise.c:1683-1704), so the VMAs after the gap
+        // still receive the advice and only the return value reports the
+        // hole.  Only running off the final VMA returns before the gap is
+        // resolved.  Before this held, `process_madvise(2)` over a range
+        // with a hole left everything past the hole untouched.
+        let base = VirtAddr::from(0x4000);
+        let mut aspace = AddrSpace::new_empty(base, PAGE_SIZE_4K * 3).unwrap();
+        let flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+        for offset in [0, 2 * PAGE_SIZE_4K] {
+            let start = base + offset;
+            aspace
+                .map(
+                    start,
+                    PAGE_SIZE_4K,
+                    flags,
+                    false,
+                    Backend::new_alloc(start, PageSize::Size4K),
+                )
+                .unwrap();
+        }
+        let mut visited = Vec::new();
+        let result = process_madvise_walk(
+            &mut aspace,
+            base.as_usize(),
+            3 * PAGE_SIZE_4K,
+            false,
+            |_, _, range| {
+                visited.push(range.start.as_usize());
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(AxError::NoMemory)));
+        let expected = [base.as_usize(), base.as_usize() + 2 * PAGE_SIZE_4K];
+        assert_eq!(visited.as_slice(), expected.as_slice());
     }
 
     #[test]
