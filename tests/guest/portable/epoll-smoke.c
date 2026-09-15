@@ -533,39 +533,98 @@ static int thread_is_blocked(pid_t tid) {
     return state[2] == 'S';
 }
 
-/* The maintained fd core intentionally has no EPOLLEXCLUSIVE capability in
- * its 0.1.0 contract: implementing Linux's selector requires a registry that
- * arbitrates wake ownership across distinct epoll instances sharing one
- * source. TheKernel must reject the flag explicitly until that mechanism
- * exists; accepting it as ordinary level-triggered interest would be a false
- * Linux-semantic claim. */
-static int test_exclusive_unsupported(void) {
+/* The maintained fd core has Linux's `EPOLLEXCLUSIVE` admission table but no
+ * exclusive *wake distribution*: honouring the flag needs a source-side
+ * registry that arbitrates wake ownership across distinct epoll instances
+ * sharing one source file (`WQ_FLAG_EXCLUSIVE` plus the `ewake`/`nr_exclusive`
+ * accounting in Linux's `__wake_up_common()`), and this kernel's wake path
+ * drains every registered waiter. Accepting the flag would silently turn a
+ * request for one-waiter-per-event into "wake everyone", which is a false
+ * Linux-semantic claim, so a request Linux would admit is refused with EPERM --
+ * the errno Linux itself returns from `do_epoll_ctl_file()` for a target file
+ * that cannot support the operation (`!file_can_poll()`), which is the closest
+ * honest answer for a target that cannot support exclusive wakeups.
+ *
+ * Everything the table itself decides must still match Linux bit for bit:
+ * EPOLL_CTL_MOD never carries the flag, EPOLL_CTL_ADD rejects any bit outside
+ * EPOLLEXCLUSIVE_OK_BITS, and a nested eventpoll target is rejected too. */
+static int test_exclusive_admission(void) {
     int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     int event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (epoll_fd < 0 || event_fd < 0) {
-        return fail("exclusive-unsupported-create");
+    int nested_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd < 0 || event_fd < 0 || nested_fd < 0) {
+        return fail("exclusive-admission-create");
     }
 
     struct epoll_event event = {.events = EPOLLIN | EPOLLEXCLUSIVE};
     event.data.u32 = EXCLUSIVE_SHARED_TAG;
-    if (ctl_expect_errno(epoll_fd, EPOLL_CTL_ADD, event_fd, &event, EINVAL,
-                         "exclusive-unsupported-add")) {
+    /* Linux admits this request; this kernel cannot honour the exclusive wake
+     * selection it asks for, so it reports the target-incapable errno. */
+    if (ctl_expect_errno(epoll_fd, EPOLL_CTL_ADD, event_fd, &event, EPERM,
+                         "exclusive-admission-add")) {
         return 1;
     }
+    marker("THEKERNEL_EPOLL_EXCLUSIVE_ADD_EPERM_OK");
+
+    /* EPOLLEXCLUSIVE_OK_BITS is EPOLLIN|EPOLLOUT|EPOLLERR|EPOLLHUP|EPOLLWAKEUP|
+     * EPOLLET|EPOLLEXCLUSIVE; EPOLLONESHOT and EPOLLPRI are outside it and are
+     * rejected before any capability question is asked. */
+    struct epoll_event oneshot = {.events = EPOLLIN | EPOLLEXCLUSIVE | EPOLLONESHOT};
+    oneshot.data.u32 = EXCLUSIVE_SHARED_TAG;
+    if (ctl_expect_errno(epoll_fd, EPOLL_CTL_ADD, event_fd, &oneshot, EINVAL,
+                         "exclusive-admission-oneshot")) {
+        return 1;
+    }
+    struct epoll_event pri = {.events = EPOLLIN | EPOLLEXCLUSIVE | EPOLLPRI};
+    pri.data.u32 = EXCLUSIVE_SHARED_TAG;
+    if (ctl_expect_errno(epoll_fd, EPOLL_CTL_ADD, event_fd, &pri, EINVAL,
+                         "exclusive-admission-pri")) {
+        return 1;
+    }
+    /* Nested exclusive wakeups are unsupported: an eventpoll target cannot be
+     * added with the flag. */
+    if (ctl_expect_errno(epoll_fd, EPOLL_CTL_ADD, nested_fd, &event, EINVAL,
+                         "exclusive-admission-nested")) {
+        return 1;
+    }
+    marker("THEKERNEL_EPOLL_EXCLUSIVE_EINVAL_TABLE_OK");
+
+    /* A plain registration, and then the flag on EPOLL_CTL_MOD: Linux rejects
+     * that before looking the item up, because epoll installs the wakeup queue
+     * at ADD time only. */
     if (ctl_add(epoll_fd, event_fd, EPOLLIN, EXCLUSIVE_SHARED_TAG,
-                "exclusive-unsupported-add-plain")) {
+                "exclusive-admission-add-plain")) {
         return 1;
     }
-    if (ctl_expect_errno(epoll_fd, EPOLL_CTL_MOD, event_fd, &event, EINVAL,
-                         "exclusive-unsupported-mod")) {
+    struct epoll_event unregistered = {.events = EPOLLIN | EPOLLEXCLUSIVE};
+    unregistered.data.u32 = EXCLUSIVE_SHARED_TAG;
+    if (ctl_expect_errno(epoll_fd, EPOLL_CTL_MOD, event_fd, &unregistered, EINVAL,
+                         "exclusive-admission-mod")) {
         return 1;
     }
     marker("THEKERNEL_EPOLL_EXCLUSIVE_MOD_EINVAL_OK");
-    printf("THEKERNEL_EPOLL_EXCLUSIVE_UNSUPPORTED_BOUNDARY "
-           "capability=unsupported add_errno=EINVAL mod_errno=EINVAL\n");
+
+    /* EPOLLMSG and EPOLLWAKEUP are not validated away: Linux stores the caller
+     * mask verbatim (after clearing EPOLLWAKEUP without CAP_BLOCK_SUSPEND) and
+     * only ever intersects it with what the target's ->poll() reports. */
+    struct epoll_event msg = {.events = EPOLLIN | EPOLLMSG};
+    msg.data.u32 = EXCLUSIVE_SHARED_TAG;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, event_fd, &msg) != 0) {
+        return fail("exclusive-admission-msg");
+    }
+    struct epoll_event wakeup = {.events = EPOLLIN | EPOLLWAKEUP};
+    wakeup.data.u32 = EXCLUSIVE_SHARED_TAG;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, event_fd, &wakeup) != 0) {
+        return fail("exclusive-admission-wakeup");
+    }
+    marker("THEKERNEL_EPOLL_TRIGGER_FLAGS_ACCEPTED_OK");
+
+    printf("THEKERNEL_EPOLL_EXCLUSIVE_BOUNDARY "
+           "capability=admission-only add_errno=EPERM mod_errno=EINVAL\n");
     fflush(stdout);
     marker("THEKERNEL_EPOLL_EXCLUSIVE_UNSUPPORTED_OK");
 
+    close(nested_fd);
     close(event_fd);
     close(epoll_fd);
     return 0;
@@ -702,7 +761,7 @@ int main(int argc, char **argv) {
     if (test_level_vs_edge() || test_et_partial_read() || test_oneshot() ||
         test_ctl_errors() || test_hup() || test_timeouts() ||
         test_ofd_close_and_fd_reuse() || test_nested() ||
-        (thekernel_mode ? test_exclusive_unsupported() : test_exclusive())) {
+        (thekernel_mode ? test_exclusive_admission() : test_exclusive())) {
         return 1;
     }
 
