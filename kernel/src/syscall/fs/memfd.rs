@@ -5,16 +5,22 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
-use axfs_ng_vfs::{FsPath, FsPathBuf, NodePermission};
+use axfs_ng_vfs::{FsPath, FsPathBuf, MetadataUpdate, NodePermission};
 use linux_raw_sys::general::{AT_FDCWD, MFD_CLOEXEC, O_CLOEXEC, O_CREAT, O_EXCL, O_RDWR};
+use tk_linux_mm::{
+    F_SEAL_EXEC, F_SEAL_SEAL, MFD_NAME_MAX_LEN, MemfdPlan, inode_mode, sanitize_flags,
+};
 
 use super::fd_ops::openat_inner;
 use crate::{
     file::{File, current_fd_table, get_file_description, memfd},
-    mm::{UserMemoryCapability, map_usercopy_error},
+    mm::{UserMemoryCapability, map_usercopy_error, memfd_noexec_scope},
 };
 
-const MEMFD_NAME_MAX: usize = 249;
+/// `mm/memfd.c:alloc_name()` copies at most `MFD_NAME_MAX_LEN + 1` bytes and
+/// rejects a length above `MFD_NAME_MAX_LEN`, so the terminating NUL must
+/// appear within this many bytes of the user pointer.
+const MEMFD_NAME_SCAN_LEN: usize = MFD_NAME_MAX_LEN + 1;
 const MEMFD_DIR: &FsPath = FsPath::new(b"/tmp/memfd");
 
 static MEMFD_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -41,9 +47,14 @@ fn memfd_path(id: u64) -> AxResult<FsPathBuf> {
     Ok(FsPathBuf::from_vec(path))
 }
 
+/// `mm/memfd.c:alloc_name()`: scan for the NUL exactly like
+/// `strncpy_from_user(&name[6], uname, MFD_NAME_MAX_LEN + 1)`, which returns
+/// the length *without* the terminator and rejects anything above
+/// `MFD_NAME_MAX_LEN`. An empty name is accepted, and any read fault —
+/// including a NULL pointer — is `-EFAULT`.
 fn validate_memfd_name(capability: &UserMemoryCapability, name: *const c_char) -> AxResult<()> {
     let start = name as usize;
-    for offset in 0..=MEMFD_NAME_MAX {
+    for offset in 0..MEMFD_NAME_SCAN_LEN {
         let address = start.checked_add(offset).ok_or(AxError::BadAddress)?;
         let byte = capability
             .read_value(address as *const u8)
@@ -69,20 +80,48 @@ fn ensure_memfd_dir() -> AxResult<()> {
     }
 }
 
+/// Applies the mode Linux gives a `memfd_create(2)` inode.
+///
+/// `mm/shmem.c:__shmem_file_setup()` creates `S_IFREG | S_IRWXUGO` through an
+/// inode setup that never consults the caller's umask, and
+/// `mm/memfd.c:memfd_alloc_file()` then clears the execute bits for
+/// `MFD_NOEXEC_SEAL`. The mode is user-visible through `fstat(2)`, and it is
+/// the mechanism by which `MFD_NOEXEC_SEAL` denies `execve(2)`, so the umask
+/// applied by the local create path has to be undone explicitly.
+fn apply_memfd_inode_mode(location: &axfs_ng_vfs::Location, plan: MemfdPlan) -> AxResult<()> {
+    location.update_metadata(MetadataUpdate {
+        mode: Some(NodePermission::from_bits_truncate(inode_mode(plan))),
+        ..Default::default()
+    })?;
+    Ok(())
+}
+
 pub fn sys_memfd_create(
     capability: UserMemoryCapability,
     name: *const c_char,
     flags: u32,
 ) -> AxResult<isize> {
+    // Linux `SYSCALL_DEFINE2(memfd_create)` runs `sanitize_flags()` *before*
+    // `alloc_name()`, so a bad flag word is reported even when the name
+    // pointer is also bad. The reverse order made a bad pointer win.
+    let plan = sanitize_flags(flags, memfd_noexec_scope() as u8).map_err(|error| match error {
+        tk_linux_mm::MmError::InvalidMemfdFlags => AxError::InvalidInput,
+        tk_linux_mm::MmError::MemfdNoexecEnforced => AxError::PermissionDenied,
+        _ => AxError::InvalidInput,
+    })?;
     validate_memfd_name(&capability, name)?;
-    if flags & !memfd::MEMFD_SUPPORTED_CREATE_FLAGS != 0 {
-        return Err(AxError::InvalidInput);
+
+    // This kernel has a real hugetlbfs type but no anonymous per-hstate
+    // hugetlb file setup, so it matches a Linux built without
+    // `CONFIG_HUGETLBFS`, whose `hugetlb_file_setup()` stub returns
+    // `ERR_PTR(-ENOSYS)`.
+    if plan.hugetlb {
+        return Err(AxError::Unsupported);
     }
 
     ensure_memfd_dir()?;
-    let allow_sealing = flags & linux_raw_sys::general::MFD_ALLOW_SEALING != 0;
     let mut open_flags = O_RDWR | O_CREAT | O_EXCL;
-    if flags & MFD_CLOEXEC != 0 {
+    if plan.flags & MFD_CLOEXEC != 0 {
         open_flags |= O_CLOEXEC;
     }
 
@@ -98,7 +137,17 @@ pub fn sys_memfd_create(
                     .downcast_ref::<File>()
                     .ok_or(AxError::BadFileDescriptor)
                     .and_then(|file| {
-                        memfd::install_memfd_state(file.inner().location(), allow_sealing).map(drop)
+                        let location = file.inner().location();
+                        apply_memfd_inode_mode(location, plan)?;
+                        memfd::install_memfd_state(
+                            location,
+                            if plan.may_seal {
+                                if plan.noexec_seal { F_SEAL_EXEC } else { 0 }
+                            } else {
+                                F_SEAL_SEAL
+                            },
+                        )
+                        .map(drop)
                     });
                 if let Err(error) = install {
                     drop(description);

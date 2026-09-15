@@ -2105,7 +2105,7 @@ mod tests {
         let _context = test_context();
         executable::init().unwrap();
         let loc = test_location("dropped-writable-admission");
-        memfd::install_memfd_state(&loc, true).unwrap();
+        memfd::install_memfd_state(&loc, 0).unwrap();
         let backend = test_backend(&loc, Arc::new(()));
 
         let admission = backend.begin_writable_mapping_admission().unwrap();
@@ -2129,7 +2129,7 @@ mod tests {
         let _context = test_context();
         executable::init().unwrap();
         let loc = test_location("completed-writable-admission");
-        memfd::install_memfd_state(&loc, true).unwrap();
+        memfd::install_memfd_state(&loc, 0).unwrap();
         let backend = test_backend(&loc, Arc::new(()));
 
         let admission = backend.begin_writable_mapping_admission().unwrap();
@@ -2149,7 +2149,7 @@ mod tests {
         let _context = test_context();
         executable::init().unwrap();
         let loc = test_location("split-writable-memfd");
-        memfd::install_memfd_state(&loc, true).unwrap();
+        memfd::install_memfd_state(&loc, 0).unwrap();
         install_capability(&loc);
         let backend = test_backend(&loc, Arc::new(()));
 
@@ -2189,7 +2189,7 @@ mod tests {
         let _context = test_context();
         executable::init().unwrap();
         let loc = test_location("real-memory-set-split");
-        memfd::install_memfd_state(&loc, true).unwrap();
+        memfd::install_memfd_state(&loc, 0).unwrap();
         let base = VirtAddr::from(0x2000_0000);
         let mut file_backend = test_backend(&loc, Arc::new(()));
         let lease = test_mapping_lease(&loc);
@@ -2303,7 +2303,7 @@ mod tests {
         let _context = test_context();
         executable::init().unwrap();
         let loc = test_location("inactive-split");
-        memfd::install_memfd_state(&loc, true).unwrap();
+        memfd::install_memfd_state(&loc, 0).unwrap();
         let backend = test_backend(&loc, Arc::new(()));
 
         let split = backend.clone();
@@ -2322,7 +2322,7 @@ mod tests {
         let _context = test_context();
         executable::init().unwrap();
         let loc = test_location("independent-mappings");
-        memfd::install_memfd_state(&loc, true).unwrap();
+        memfd::install_memfd_state(&loc, 0).unwrap();
         let map_id = Arc::new(());
         let first = test_backend(&loc, map_id.clone());
         let second = test_backend(&loc, map_id);
@@ -2355,7 +2355,7 @@ mod tests {
         let _context = test_context();
         executable::init().unwrap();
         let loc = test_location("sealed-mapping");
-        memfd::install_memfd_state(&loc, true).unwrap();
+        memfd::install_memfd_state(&loc, 0).unwrap();
         memfd::add_seals(&loc, true, F_SEAL_WRITE).unwrap();
         install_capability(&loc);
         loc.update_metadata(axfs_ng_vfs::MetadataUpdate {
@@ -2385,7 +2385,7 @@ mod tests {
         let _context = test_context();
         executable::init().unwrap();
         let loc = test_location("leased-executable");
-        memfd::install_memfd_state(&loc, true).unwrap();
+        memfd::install_memfd_state(&loc, 0).unwrap();
         install_capability(&loc);
         let lease = executable::CredentialReadLease::acquire(&loc).unwrap();
         let backend = test_backend(&loc, Arc::new(()));
@@ -2409,7 +2409,7 @@ mod tests {
         let _context = test_context();
         executable::init().unwrap();
         let loc = test_location("clone-map-refund");
-        memfd::install_memfd_state(&loc, true).unwrap();
+        memfd::install_memfd_state(&loc, 0).unwrap();
         memfd::add_seals(&loc, true, F_SEAL_WRITE).unwrap();
         install_capability(&loc);
         let source = test_backend(&loc, Arc::new(()));
@@ -2490,7 +2490,7 @@ mod tests {
         let _context = test_context();
         executable::init().unwrap();
         let loc = test_location("idempotent-segment");
-        memfd::install_memfd_state(&loc, true).unwrap();
+        memfd::install_memfd_state(&loc, 0).unwrap();
         let backend = test_backend(&loc, Arc::new(()));
 
         backend.activate_writable_segment().unwrap();
