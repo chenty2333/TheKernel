@@ -130,6 +130,8 @@ pub const FAN_MARK_FILESYSTEM: u32 = 0x0000_0100;
 pub const FAN_MARK_EVICTABLE: u32 = 0x0000_0200;
 /// Add an ignore mark.
 pub const FAN_MARK_IGNORE: u32 = 0x0000_0400;
+/// Mark a single inode: the zero-valued default mark type.
+pub const FAN_MARK_INODE: u32 = 0x0000_0000;
 
 /// Linux fanotify metadata wire-format version.
 pub const FANOTIFY_METADATA_VERSION: u8 = 3;
@@ -142,25 +144,20 @@ pub const FAN_EPIDFD: i32 = -2;
 /// fanotify event-info record type for a pidfd.
 pub const FAN_EVENT_INFO_TYPE_PIDFD: u8 = 4;
 
-/// All fanotify permission-event bits.
-pub const FANOTIFY_PERM_EVENTS: u64 = FAN_OPEN_PERM | FAN_ACCESS_PERM | FAN_OPEN_EXEC_PERM;
-/// All ordinary fanotify event bits.
-pub const FANOTIFY_EVENTS: u64 = FAN_ACCESS
-    | FAN_MODIFY
-    | FAN_ATTRIB
-    | FAN_CLOSE
-    | FAN_OPEN
-    | FAN_OPEN_EXEC
-    | FAN_MOVE
-    | FAN_CREATE
-    | FAN_DELETE
-    | FAN_RENAME
-    | FAN_DELETE_SELF
-    | FAN_MOVE_SELF
-    | FAN_FS_ERROR;
-/// All event-mask bits accepted by fanotify mark commands.
-pub const ALL_FANOTIFY_EVENT_BITS: u64 =
-    FANOTIFY_EVENTS | FANOTIFY_PERM_EVENTS | FAN_Q_OVERFLOW | FAN_ONDIR | FAN_EVENT_ON_CHILD;
+/// All fanotify permission-event bits (requires
+/// `CONFIG_FANOTIFY_ACCESS_PERMISSIONS` in Linux).
+pub const FANOTIFY_PERM_EVENTS: u64 = FANOTIFY_CONTENT_PERM_EVENTS | FANOTIFY_PRE_CONTENT_EVENTS;
+/// All ordinary fanotify event bits (`FANOTIFY_PATH_EVENTS |
+/// FANOTIFY_INODE_EVENTS | FANOTIFY_ERROR_EVENTS | FANOTIFY_MOUNT_EVENTS`).
+pub const FANOTIFY_EVENTS: u64 = FANOTIFY_PATH_EVENTS
+    | FANOTIFY_INODE_EVENTS
+    | FANOTIFY_ERROR_EVENTS
+    | FANOTIFY_MOUNT_EVENTS;
+/// `FANOTIFY_OUTGOING_EVENTS` — the bits that may be reported to user space.
+pub const FANOTIFY_OUTGOING_EVENTS: u64 =
+    FANOTIFY_EVENTS | FANOTIFY_PERM_EVENTS | FAN_Q_OVERFLOW | FAN_ONDIR;
+/// `ALL_FANOTIFY_EVENT_BITS`.
+pub const ALL_FANOTIFY_EVENT_BITS: u64 = FANOTIFY_OUTGOING_EVENTS | FANOTIFY_EVENT_FLAGS;
 /// All file-identifier report flags.
 pub const FANOTIFY_FID_BITS: u32 = FAN_REPORT_DFID_NAME_TARGET;
 /// fanotify-init flags requiring elevated accounting or authority.
@@ -168,26 +165,23 @@ pub const FANOTIFY_ADMIN_INIT_FLAGS: u32 = FAN_CLASS_CONTENT
     | FAN_CLASS_PRE_CONTENT
     | FAN_REPORT_TID
     | FAN_REPORT_PIDFD
+    | FAN_REPORT_FD_ERROR
     | FAN_UNLIMITED_QUEUE
-    | FAN_UNLIMITED_MARKS
-    | FAN_ENABLE_AUDIT;
+    | FAN_UNLIMITED_MARKS;
 /// fanotify-init flags available without elevated authority.
 pub const FANOTIFY_USER_INIT_FLAGS: u32 =
-    FAN_CLASS_NOTIF | FANOTIFY_FID_BITS | FAN_CLOEXEC | FAN_NONBLOCK;
-/// All recognized fanotify-init flags.
+    FAN_CLASS_NOTIF | FANOTIFY_FID_BITS | FAN_REPORT_MNT | FAN_CLOEXEC | FAN_NONBLOCK;
+/// All recognized fanotify-init flags except `FAN_ENABLE_AUDIT`, which Linux
+/// admits only under `CONFIG_AUDITSYSCALL`.
 pub const FANOTIFY_INIT_FLAGS: u32 = FANOTIFY_ADMIN_INIT_FLAGS | FANOTIFY_USER_INIT_FLAGS;
 /// All recognized fanotify-mark flags.
-pub const FANOTIFY_MARK_FLAGS: u32 = FAN_MARK_ADD
-    | FAN_MARK_REMOVE
-    | FAN_MARK_FLUSH
+pub const FANOTIFY_MARK_FLAGS: u32 = FANOTIFY_MARK_TYPE_BITS
+    | FANOTIFY_MARK_CMD_BITS
+    | FANOTIFY_MARK_IGNORE_BITS
     | FAN_MARK_DONT_FOLLOW
     | FAN_MARK_ONLYDIR
-    | FAN_MARK_MOUNT
-    | FAN_MARK_FILESYSTEM
-    | FAN_MARK_IGNORED_MASK
     | FAN_MARK_IGNORED_SURV_MODIFY
-    | FAN_MARK_EVICTABLE
-    | FAN_MARK_IGNORE;
+    | FAN_MARK_EVICTABLE;
 /// The mutually-exclusive action bits in a permission response.
 pub const FANOTIFY_RESPONSE_ACCESS: u32 = FAN_ALLOW | FAN_DENY;
 /// Optional permission-response flags.
@@ -201,6 +195,67 @@ pub const FANOTIFY_RESPONSE_VALID_MASK: u32 =
 pub const FANOTIFY_DIR_ENTRY_EVENTS: u64 = FAN_CREATE | FAN_DELETE | FAN_MOVE | FAN_RENAME;
 /// Permission-group dispatch order, from highest to lowest Linux priority.
 pub const FANOTIFY_PERMISSION_CLASSES: [u32; 2] = [FAN_CLASS_PRE_CONTENT, FAN_CLASS_CONTENT];
+
+/// Pre-content access event (`FAN_PRE_ACCESS`).
+pub const FAN_PRE_ACCESS: u64 = 0x0010_0000;
+/// Mount-attach event (`FAN_MNT_ATTACH`).
+pub const FAN_MNT_ATTACH: u64 = 0x0100_0000;
+/// Mount-detach event (`FAN_MNT_DETACH`).
+pub const FAN_MNT_DETACH: u64 = 0x0200_0000;
+/// Report mount events (`FAN_REPORT_MNT`).
+pub const FAN_REPORT_MNT: u32 = 0x0000_4000;
+/// Report the failure errno in `event->fd` (`FAN_REPORT_FD_ERROR`).
+pub const FAN_REPORT_FD_ERROR: u32 = 0x0000_2000;
+/// Mark a whole mount namespace (`FAN_MARK_MNTNS == FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM`).
+pub const FAN_MARK_MNTNS: u32 = 0x0000_0110;
+
+/// `FANOTIFY_PATH_EVENTS` (include/linux/fanotify.h).
+pub const FANOTIFY_PATH_EVENTS: u64 = FAN_ACCESS
+    | FAN_MODIFY
+    | FAN_CLOSE
+    | FAN_OPEN
+    | FAN_OPEN_EXEC;
+/// `FANOTIFY_DIRENT_EVENTS`.
+pub const FANOTIFY_DIRENT_EVENTS: u64 = FAN_MOVE | FAN_CREATE | FAN_DELETE | FAN_RENAME;
+/// `FANOTIFY_CONTENT_PERM_EVENTS`.
+pub const FANOTIFY_CONTENT_PERM_EVENTS: u64 =
+    FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | FAN_ACCESS_PERM;
+/// `FANOTIFY_PRE_CONTENT_EVENTS`.
+pub const FANOTIFY_PRE_CONTENT_EVENTS: u64 = FAN_PRE_ACCESS;
+/// `FANOTIFY_PERM_EVENTS` (requires `CONFIG_FANOTIFY_ACCESS_PERMISSIONS`).
+/// `FANOTIFY_FD_EVENTS`.
+pub const FANOTIFY_FD_EVENTS: u64 = FANOTIFY_PATH_EVENTS | FANOTIFY_PERM_EVENTS;
+/// `FANOTIFY_INODE_EVENTS`.
+pub const FANOTIFY_INODE_EVENTS: u64 =
+    FANOTIFY_DIRENT_EVENTS | FAN_ATTRIB | FAN_MOVE_SELF | FAN_DELETE_SELF;
+/// `FANOTIFY_ERROR_EVENTS`.
+pub const FANOTIFY_ERROR_EVENTS: u64 = FAN_FS_ERROR;
+/// `FANOTIFY_MOUNT_EVENTS`.
+pub const FANOTIFY_MOUNT_EVENTS: u64 = FAN_MNT_ATTACH | FAN_MNT_DETACH;
+/// `FANOTIFY_EVENT_FLAGS`.
+pub const FANOTIFY_EVENT_FLAGS: u64 = FAN_EVENT_ON_CHILD | FAN_ONDIR;
+/// `valid_mask` in `do_fanotify_mark()`: `FANOTIFY_EVENTS |
+/// FANOTIFY_EVENT_FLAGS` plus `FANOTIFY_PERM_EVENTS` under
+/// `CONFIG_FANOTIFY_ACCESS_PERMISSIONS`.  `FAN_Q_OVERFLOW` is deliberately
+/// absent, so requesting it is `EINVAL` rather than an accepted mark.
+pub const FANOTIFY_MARK_VALID_MASK: u64 =
+    FANOTIFY_EVENTS | FANOTIFY_EVENT_FLAGS | FANOTIFY_PERM_EVENTS;
+/// `FANOTIFY_DIRONLY_EVENT_BITS` — the bits rejected with `ENOTDIR` on a
+/// non-directory inode mark for the strict (v5.17+) APIs.
+pub const FANOTIFY_DIRONLY_EVENT_BITS: u64 =
+    FANOTIFY_DIRENT_EVENTS | FAN_EVENT_ON_CHILD | FAN_ONDIR;
+/// `FANOTIFY_INIT_ALL_EVENT_F_BITS` — every open flag `fanotify_init`'s
+/// `event_f_flags` may carry.
+pub const FANOTIFY_INIT_EVENT_F_FLAGS: u32 = 0x001C_9C03;
+/// `FANOTIFY_CLASS_BITS`.
+pub const FANOTIFY_CLASS_BITS: u32 = FAN_CLASS_NOTIF | FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT;
+/// `FANOTIFY_MARK_TYPE_BITS`.
+pub const FANOTIFY_MARK_TYPE_BITS: u32 =
+    FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM | FAN_MARK_MNTNS;
+/// `FANOTIFY_MARK_CMD_BITS`.
+pub const FANOTIFY_MARK_CMD_BITS: u32 = FAN_MARK_ADD | FAN_MARK_REMOVE | FAN_MARK_FLUSH;
+/// `FANOTIFY_MARK_IGNORE_BITS`.
+pub const FANOTIFY_MARK_IGNORE_BITS: u32 = FAN_MARK_IGNORED_MASK | FAN_MARK_IGNORE;
 
 /// The fixed header that begins every fanotify event record.
 #[repr(C)]
@@ -352,88 +407,163 @@ pub enum FanotifyMarkPlan {
     /// Remove a mark.
     Remove,
 }
-/// Validates mark command and target grammar from copied scalar inputs.
+/// `do_fanotify_mark()` steps 1-6 (fs/notify/fanotify/fanotify_user.c): every
+/// rejection that depends only on the two copied scalars, and therefore every
+/// rejection that Linux reports *before* it looks at the fanotify descriptor:
+///   if (upper_32_bits(mask)) return -EINVAL;
+///   if (flags & ~FANOTIFY_MARK_FLAGS) return -EINVAL;
+///   switch (mark_type) { ... default: return -EINVAL; }
+///   switch (mark_cmd) { case ADD: case REMOVE: if (!mask) return -EINVAL; ...
+///                       case FLUSH: if (flags & ~(TYPE_BITS | FLUSH)) return -EINVAL;
+///                       default: return -EINVAL; }
+///   if (mask & ~valid_mask) return -EINVAL;
+///   if (ignore == (FAN_MARK_IGNORE | FAN_MARK_IGNORED_MASK)) return -EINVAL;
+pub const fn fanotify_mark_scalars(flags: u32, mask: u64) -> Result<(), FanotifyMarkReject> {
+    if mask >> 32 != 0 {
+        return Err(FanotifyMarkReject::Invalid);
+    }
+    if flags & !FANOTIFY_MARK_FLAGS != 0 {
+        return Err(FanotifyMarkReject::Invalid);
+    }
+    // The mark-type switch accepts every value of the two type bits: inode
+    // (zero), mount, filesystem and `FAN_MARK_MNTNS` (both bits).  Whether the
+    // mount-namespace scope is usable depends on the group and is decided
+    // after the descriptor lookup.
+    let mark_cmd = flags & FANOTIFY_MARK_CMD_BITS;
+    match mark_cmd {
+        FAN_MARK_ADD | FAN_MARK_REMOVE => {
+            if mask & 0xffff_ffff == 0 {
+                return Err(FanotifyMarkReject::Invalid);
+            }
+        }
+        FAN_MARK_FLUSH => {
+            if flags & !(FANOTIFY_MARK_TYPE_BITS | FAN_MARK_FLUSH) != 0 {
+                return Err(FanotifyMarkReject::Invalid);
+            }
+        }
+        _ => return Err(FanotifyMarkReject::Invalid),
+    }
+    // `valid_mask` excludes FAN_Q_OVERFLOW (0x4000) and the reserved
+    // FAN_DIR_MODIFY bit; an unknown bit is EINVAL rather than EOPNOTSUPP.
+    if mask & !FANOTIFY_MARK_VALID_MASK != 0 {
+        return Err(FanotifyMarkReject::Invalid);
+    }
+    if flags & FANOTIFY_MARK_IGNORE_BITS == FANOTIFY_MARK_IGNORE_BITS {
+        return Err(FanotifyMarkReject::Invalid);
+    }
+    Ok(())
+}
+
+/// `do_fanotify_mark()` from the group report-mode checks onward.  The
+/// `target_is_dir` argument is `None` when the caller has no resolved object
+/// (which is only reachable for `FAN_MARK_FLUSH`, short-circuited here) and
+/// `Some` afterwards:
+///   if (FAN_GROUP_FLAG(group, FAN_REPORT_MNT)) { ... } else {
+///           if (mask & FANOTIFY_MOUNT_EVENTS) return -EINVAL;
+///           if (mark_type == FAN_MARK_MNTNS) return -EINVAL; }
+///   if (mask & FANOTIFY_PERM_EVENTS && group->priority == FSNOTIFY_PRIO_NORMAL) return -EINVAL;
+///   else if (mask & FANOTIFY_PRE_CONTENT_EVENTS && group->priority == FSNOTIFY_PRIO_CONTENT)
+///           return -EINVAL;
+///   if (mask & FAN_FS_ERROR && mark_type != FAN_MARK_FILESYSTEM) return -EINVAL;
+///   if (flags & FAN_MARK_EVICTABLE && mark_type != FAN_MARK_INODE) return -EINVAL;
+///   if (mask & ~(FANOTIFY_FD_EVENTS|FANOTIFY_MOUNT_EVENTS|FANOTIFY_EVENT_FLAGS) &&
+///       (!fid_mode || mark_type == FAN_MARK_MOUNT)) return -EINVAL;
+///   if (mask & FAN_RENAME && !(fid_mode & FAN_REPORT_NAME)) return -EINVAL;
+///   if (mask & FANOTIFY_PRE_CONTENT_EVENTS && mask & FAN_ONDIR) return -EINVAL;
 pub const fn plan_fanotify_mark(
     flags: u32,
     mask: u64,
     group_flags: u32,
     target_is_dir: Option<bool>,
 ) -> Result<FanotifyMarkPlan, FanotifyMarkReject> {
-    if flags & !FANOTIFY_MARK_FLAGS != 0 || mask & !ALL_FANOTIFY_EVENT_BITS != 0 {
+    if let Err(reject) = fanotify_mark_scalars(flags, mask) {
+        return Err(reject);
+    }
+    let mask = mask & 0xffff_ffff;
+    let mark_type = flags & FANOTIFY_MARK_TYPE_BITS;
+    // Only a group created with FAN_REPORT_MNT may carry mount events, and
+    // only FAN_MARK_MNTNS may take them.  TheKernel cannot create such a
+    // group, so the first branch is unreachable and the second is the rule.
+    if group_flags & FAN_REPORT_MNT != 0 {
+        if mask & !FANOTIFY_MOUNT_EVENTS != 0 || mark_type != FAN_MARK_MNTNS {
+            return Err(FanotifyMarkReject::Invalid);
+        }
+    } else if mask & FANOTIFY_MOUNT_EVENTS != 0 || mark_type == FAN_MARK_MNTNS {
         return Err(FanotifyMarkReject::Invalid);
     }
-    let commands = (flags & FAN_MARK_ADD != 0) as u8
-        + (flags & FAN_MARK_REMOVE != 0) as u8
-        + (flags & FAN_MARK_FLUSH != 0) as u8;
-    if commands != 1
-        || flags & FAN_MARK_IGNORED_MASK != 0 && flags & FAN_MARK_IGNORE != 0
-        || flags & FAN_MARK_MOUNT != 0 && flags & FAN_MARK_FILESYSTEM != 0
+    let class = group_flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT);
+    if mask & FANOTIFY_PERM_EVENTS != 0 && class == FAN_CLASS_NOTIF {
+        return Err(FanotifyMarkReject::Invalid);
+    }
+    if mask & FANOTIFY_PRE_CONTENT_EVENTS != 0 && class == FAN_CLASS_CONTENT {
+        return Err(FanotifyMarkReject::Invalid);
+    }
+    if mask & FAN_FS_ERROR != 0 && mark_type != FAN_MARK_FILESYSTEM {
+        return Err(FanotifyMarkReject::Invalid);
+    }
+    // Eviction only applies to inode marks.
+    if flags & FAN_MARK_EVICTABLE != 0 && mark_type != FAN_MARK_INODE {
+        return Err(FanotifyMarkReject::Invalid);
+    }
+    // Events that cannot carry an event fd need a group that reports file
+    // identifiers, and are never valid on a mount mark.
+    let fid_mode = group_flags & FANOTIFY_FID_BITS;
+    if mask & !(FANOTIFY_FD_EVENTS | FANOTIFY_MOUNT_EVENTS | FANOTIFY_EVENT_FLAGS) != 0
+        && (fid_mode == 0 || mark_type == FAN_MARK_MOUNT)
     {
+        return Err(FanotifyMarkReject::Invalid);
+    }
+    if mask & FAN_RENAME != 0 && fid_mode & FAN_REPORT_NAME == 0 {
+        return Err(FanotifyMarkReject::Invalid);
+    }
+    if mask & FANOTIFY_PRE_CONTENT_EVENTS != 0 && mask & FAN_ONDIR != 0 {
         return Err(FanotifyMarkReject::Invalid);
     }
     if flags & FAN_MARK_FLUSH != 0 {
-        if flags & !(FAN_MARK_FLUSH | FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) != 0 {
-            return Err(FanotifyMarkReject::Invalid);
-        }
+        // `fsnotify_clear_marks_by_group(group, obj_type); return 0;`
         return Ok(FanotifyMarkPlan::Flush);
     }
-    if mask == 0 {
-        return Err(FanotifyMarkReject::Invalid);
-    }
-    if target_is_dir.is_none() {
-        return Ok(if flags & (FAN_MARK_IGNORED_MASK | FAN_MARK_IGNORE) != 0 {
-            FanotifyMarkPlan::Ignored
-        } else if flags & FAN_MARK_ADD != 0 {
-            FanotifyMarkPlan::Add
-        } else {
-            FanotifyMarkPlan::Remove
-        });
-    }
-    let target_is_dir = match target_is_dir {
-        Some(value) => value,
-        None => return Err(FanotifyMarkReject::Invalid),
-    };
-    if flags & FAN_MARK_ONLYDIR != 0 && !target_is_dir {
+    if flags & FAN_MARK_ONLYDIR != 0 && matches!(target_is_dir, Some(false)) {
         return Err(FanotifyMarkReject::NotDirectory);
     }
-    if flags & FAN_MARK_EVICTABLE != 0 && flags & (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) != 0 {
-        return Err(FanotifyMarkReject::Invalid);
+    if flags & FAN_MARK_ADD != 0 {
+        // `fanotify_events_supported()` is called only for FAN_MARK_ADD.  Its
+        // strict dir-only rejection does not apply to directory marks, to the
+        // legacy APIs, or to scope marks:
+        //   bool strict_dir_events = FAN_GROUP_FLAG(group, FAN_REPORT_TARGET_FID) ||
+        //                            (mask & FAN_RENAME) || (flags & FAN_MARK_IGNORE);
+        //   if (strict_dir_events && mark_type == FAN_MARK_INODE && !is_dir &&
+        //       (mask & FANOTIFY_DIRONLY_EVENT_BITS)) return -ENOTDIR;
+        let strict_dir_events = group_flags & FAN_REPORT_TARGET_FID != 0
+            || mask & FAN_RENAME != 0
+            || flags & FAN_MARK_IGNORE != 0;
+        if strict_dir_events
+            && mark_type == FAN_MARK_INODE
+            && matches!(target_is_dir, Some(false))
+            && mask & FANOTIFY_DIRONLY_EVENT_BITS != 0
+        {
+            return Err(FanotifyMarkReject::NotDirectory);
+        }
     }
-    if mask & FANOTIFY_PERM_EVENTS != 0
-        && group_flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT) == 0
-    {
-        return Err(FanotifyMarkReject::Invalid);
-    }
-    if group_flags & FANOTIFY_FID_BITS == 0
-        && mask & (FAN_ATTRIB | FANOTIFY_DIR_ENTRY_EVENTS | FAN_DELETE_SELF | FAN_MOVE_SELF) != 0
-        || group_flags & FAN_REPORT_NAME == 0 && mask & FAN_RENAME != 0
-        || flags & FAN_MARK_MOUNT != 0 && mask & FANOTIFY_DIR_ENTRY_EVENTS != 0
-    {
-        return Err(FanotifyMarkReject::Invalid);
-    }
-    let inode_mark = flags & (FAN_MARK_MOUNT | FAN_MARK_FILESYSTEM) == 0;
-    let strict_dir_events = group_flags & FAN_REPORT_TARGET_FID != 0
-        || mask & FAN_RENAME != 0
-        || flags & FAN_MARK_IGNORE != 0;
-    if inode_mark
-        && strict_dir_events
-        && !target_is_dir
-        && mask & (FANOTIFY_DIR_ENTRY_EVENTS | FAN_ONDIR | FAN_EVENT_ON_CHILD) != 0
-    {
-        return Err(FanotifyMarkReject::NotDirectory);
-    }
+    // `do_fanotify_mark()` applies this rule only after the target inode is
+    // known, so the descriptor precheck (target still unknown) must not answer
+    // for it: `fanotify_find_path()` reports EFAULT/ENOENT/EACCES first.
     if flags & FAN_MARK_ADD != 0
-        && flags & FAN_MARK_IGNORE != 0
+        && flags & FANOTIFY_MARK_IGNORE_BITS != 0
         && flags & FAN_MARK_IGNORED_SURV_MODIFY == 0
+        && target_is_dir.is_some()
     {
-        if !inode_mark {
+        // Legacy FAN_MARK_IGNORED_MASK forbids the non-inode scopes outright;
+        // FAN_MARK_IGNORE additionally requires SURV_MODIFY for a directory.
+        // A writable-open directory is the caller's EISDIR check.
+        if mark_type != FAN_MARK_INODE {
             return Err(FanotifyMarkReject::Invalid);
         }
-        if target_is_dir {
+        if matches!(target_is_dir, Some(true)) && flags & FAN_MARK_IGNORE != 0 {
             return Err(FanotifyMarkReject::IsDirectory);
         }
     }
-    Ok(if flags & (FAN_MARK_IGNORED_MASK | FAN_MARK_IGNORE) != 0 {
+    Ok(if flags & FANOTIFY_MARK_IGNORE_BITS != 0 {
         FanotifyMarkPlan::Ignored
     } else if flags & FAN_MARK_ADD != 0 {
         FanotifyMarkPlan::Add
@@ -442,28 +572,107 @@ pub const fn plan_fanotify_mark(
     })
 }
 
-/// Validates Linux fanotify_init flag grammar independent of FD allocation.
+/// Validates Linux `fanotify_init` flag grammar independent of FD allocation,
+/// in Linux's own order (fs/notify/fanotify/fanotify_user.c):
+///   if (flags & ~(FANOTIFY_INIT_FLAGS | FAN_ENABLE_AUDIT)) return -EINVAL;
+///   if (flags & FAN_REPORT_MNT) { if (class != FAN_CLASS_NOTIF) return -EINVAL;
+///           if (flags & (FANOTIFY_FID_BITS | FAN_REPORT_FD_ERROR)) return -EINVAL; }
+///   if (event_f_flags & ~FANOTIFY_INIT_ALL_EVENT_F_BITS) return -EINVAL;
+///   switch (event_f_flags & O_ACCMODE) { ... default: return -EINVAL; }
+///   if (fid_mode && class != FAN_CLASS_NOTIF) return -EINVAL;
+///   if ((fid_mode & FAN_REPORT_NAME) && !(fid_mode & FAN_REPORT_DIR_FID)) return -EINVAL;
+///   if ((fid_mode & FAN_REPORT_TARGET_FID) &&
+///       (!(fid_mode & FAN_REPORT_NAME) || !(fid_mode & FAN_REPORT_FID))) return -EINVAL;
+///   switch (class) { ... default: return -EINVAL; }
+pub const fn fanotify_init_grammar(
+    flags: u32,
+    event_flags: u32,
+) -> Result<(), FanotifyInitReject> {
+    // FAN_ENABLE_AUDIT is admitted here because this kernel audits responses
+    // through the same capability Linux checks with CONFIG_AUDITSYSCALL.
+    if flags & !(FANOTIFY_INIT_FLAGS | FAN_ENABLE_AUDIT) != 0 {
+        return Err(FanotifyInitReject::Invalid);
+    }
+    let class = flags & FANOTIFY_CLASS_BITS;
+    if flags & FAN_REPORT_MNT != 0 {
+        if class != FAN_CLASS_NOTIF {
+            return Err(FanotifyInitReject::Invalid);
+        }
+        if flags & (FANOTIFY_FID_BITS | FAN_REPORT_FD_ERROR) != 0 {
+            return Err(FanotifyInitReject::Invalid);
+        }
+    }
+    if event_flags & !FANOTIFY_INIT_EVENT_F_FLAGS != 0 {
+        return Err(FanotifyInitReject::Invalid);
+    }
+    // O_ACCMODE == 3 is the only rejected access mode.
+    if event_flags & 0x3 == 0x3 {
+        return Err(FanotifyInitReject::Invalid);
+    }
+    let fid_mode = flags & FANOTIFY_FID_BITS;
+    if fid_mode != 0 && class != FAN_CLASS_NOTIF {
+        return Err(FanotifyInitReject::Invalid);
+    }
+    if fid_mode & FAN_REPORT_NAME != 0 && fid_mode & FAN_REPORT_DIR_FID == 0 {
+        return Err(FanotifyInitReject::Invalid);
+    }
+    if fid_mode & FAN_REPORT_TARGET_FID != 0
+        && fid_mode & (FAN_REPORT_NAME | FAN_REPORT_FID)
+            != FAN_REPORT_NAME | FAN_REPORT_FID
+    {
+        return Err(FanotifyInitReject::Invalid);
+    }
+    // The class switch runs after group allocation; both class bits at once
+    // select FAN_CLASS_CONTENT|FAN_CLASS_PRE_CONTENT and fall through to
+    // `default: return -EINVAL;`.
+    if class == FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT {
+        return Err(FanotifyInitReject::Invalid);
+    }
+    // Every remaining grammar rule is satisfied.  Linux now finishes with the
+    // FAN_ENABLE_AUDIT capability check and the unprivileged-group decisions.
+    Ok(())
+}
+
+/// Facilities TheKernel has no provider for.  They are well-formed Linux
+/// requests, so [`fanotify_init_admission`] reports them as unsupported rather
+/// than invalid:
+///   * `FAN_REPORT_MNT` needs mount-event delivery (see `FAN_MNT_ATTACH`);
+///   * `FAN_REPORT_FD_ERROR` needs error events carrying an errno in `fd`;
+///   * the unlimited queue and mark budgets are fixed in this kernel.
+pub const fn fanotify_init_unsupported(flags: u32) -> bool {
+    flags & (FAN_REPORT_MNT | FAN_REPORT_FD_ERROR | FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS)
+        != 0
+}
+
+/// Validates `fanotify_init` grammar and provider availability together.  The
+/// kernel entry point must interleave the `CAP_SYS_ADMIN`/`CAP_AUDIT_WRITE`
+/// decisions, so it calls [`fanotify_init_grammar`] and
+/// [`fanotify_init_unsupported`] separately.
 pub const fn fanotify_init_admission(
     flags: u32,
     event_flags: u32,
 ) -> Result<(), FanotifyInitReject> {
-    if flags & !FANOTIFY_INIT_FLAGS != 0
-        || flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT)
-            == FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT
-        || flags & FAN_REPORT_PIDFD != 0 && flags & FAN_REPORT_TID != 0
-        || flags & FAN_REPORT_FID != 0 && flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT) != 0
-        || flags & FAN_REPORT_NAME != 0 && flags & FAN_REPORT_DIR_FID == 0
-        || flags & FAN_REPORT_TARGET_FID != 0
-            && flags & (FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME)
-                != FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME
-        || event_flags & !(3 | 0x80000) != 0
-    {
-        return Err(FanotifyInitReject::Invalid);
+    if let Err(reject) = fanotify_init_grammar(flags, event_flags) {
+        return Err(reject);
     }
-    if flags & (FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS) != 0 {
+    if fanotify_init_unsupported(flags) {
         return Err(FanotifyInitReject::Unsupported);
     }
     Ok(())
+}
+
+/// The event-flag normalizations Linux applies to a mark mask before it is
+/// stored:
+///   * step 7: `FAN_MARK_IGNORED_MASK` cannot carry `FAN_ONDIR` or
+///     `FAN_EVENT_ON_CHILD`, which are kept in a separate `umask`;
+///   * step 22: `FAN_EVENT_ON_CHILD` is meaningless outside a directory mark.
+pub const fn fanotify_mark_stored_mask(mask: u64, flags: u32, is_dir: bool) -> u64 {
+    let mask = if flags & FANOTIFY_MARK_IGNORE_BITS == FAN_MARK_IGNORED_MASK {
+        mask & !FANOTIFY_EVENT_FLAGS
+    } else {
+        mask
+    };
+    if is_dir { mask } else { mask & !FAN_EVENT_ON_CHILD }
 }
 
 /// Admits the non-FD portion of a Linux fanotify permission response.
@@ -1017,10 +1226,274 @@ mod tests {
         assert_eq!(dnotify_mask((1usize << 32) | 3, 7), 3);
     }
 
+    /// `do_fanotify_mark()` steps 1-6: every rejection that precedes the
+    /// fanotify descriptor lookup.
+    #[test]
+    fn fanotify_mark_scalars_reject_before_the_descriptor() {
+        assert_eq!(fanotify_mark_scalars(FAN_MARK_ADD, 1 << 32), Err(FanotifyMarkReject::Invalid));
+        assert_eq!(
+            fanotify_mark_scalars(FAN_MARK_ADD | 0x8000, FAN_ACCESS),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        // No command, two commands, and every FLUSH companion flag.
+        assert_eq!(fanotify_mark_scalars(0, FAN_ACCESS), Err(FanotifyMarkReject::Invalid));
+        assert_eq!(
+            fanotify_mark_scalars(FAN_MARK_ADD | FAN_MARK_REMOVE, FAN_ACCESS),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        assert_eq!(
+            fanotify_mark_scalars(FAN_MARK_FLUSH | FAN_MARK_DONT_FOLLOW, 0),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        assert_eq!(
+            fanotify_mark_scalars(FAN_MARK_FLUSH | FAN_MARK_ONLYDIR, 0),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        assert_eq!(fanotify_mark_scalars(FAN_MARK_ADD, 0), Err(FanotifyMarkReject::Invalid));
+        assert_eq!(fanotify_mark_scalars(FAN_MARK_REMOVE, 0), Err(FanotifyMarkReject::Invalid));
+        assert_eq!(fanotify_mark_scalars(FAN_MARK_FLUSH, 0), Ok(()));
+        // FAN_MARK_FLUSH admits any mark type, including FAN_MARK_MNTNS; the
+        // scope is then checked against the group after the fd lookup.
+        assert_eq!(fanotify_mark_scalars(FAN_MARK_FLUSH | FAN_MARK_MNTNS, 0), Ok(()));
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_FLUSH | FAN_MARK_MNTNS, 0, 0, None),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        // FAN_Q_OVERFLOW is outside `valid_mask`.
+        assert_eq!(
+            fanotify_mark_scalars(FAN_MARK_ADD, FAN_Q_OVERFLOW),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        // The two ignore forms are mutually exclusive.
+        assert_eq!(
+            fanotify_mark_scalars(FAN_MARK_ADD | FAN_MARK_IGNORE | FAN_MARK_IGNORED_MASK, 1),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        assert_eq!(fanotify_mark_scalars(FAN_MARK_ADD, FAN_PRE_ACCESS), Ok(()));
+        assert_eq!(
+            fanotify_mark_scalars(FAN_MARK_ADD | FAN_MARK_MNTNS, FAN_MNT_ATTACH),
+            Ok(())
+        );
+    }
+
+    /// The group-dependent half of `do_fanotify_mark()`.
+    #[test]
+    fn fanotify_mark_group_rules_follow_linux_priority_order() {
+        let fid_group = FAN_REPORT_DFID_NAME_TARGET;
+        // Mount events and mntns marks need a FAN_REPORT_MNT group.
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_MNT_ATTACH, fid_group, Some(true)),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_MNTNS, FAN_ACCESS, 0, Some(true)),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        // Permission events need a permission class: EINVAL, never EPERM.
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_OPEN_PERM, 0, Some(false)),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_OPEN_PERM, FAN_CLASS_CONTENT, Some(false)),
+            Ok(FanotifyMarkPlan::Add)
+        );
+        // Pre-content events are rejected for FAN_CLASS_CONTENT.
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_PRE_ACCESS, FAN_CLASS_CONTENT, Some(false)),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_PRE_ACCESS, FAN_CLASS_PRE_CONTENT, Some(false)),
+            Ok(FanotifyMarkPlan::Add)
+        );
+        assert_eq!(
+            plan_fanotify_mark(
+                FAN_MARK_ADD,
+                FAN_PRE_ACCESS | FAN_ONDIR,
+                FAN_CLASS_PRE_CONTENT,
+                Some(true)
+            ),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        // FAN_FS_ERROR is filesystem-scope only.
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_FS_ERROR, fid_group, Some(false)),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        assert_eq!(
+            plan_fanotify_mark(
+                FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                FAN_FS_ERROR,
+                fid_group,
+                Some(true)
+            ),
+            Ok(FanotifyMarkPlan::Add)
+        );
+        // Events without an event fd need a file-identifier group, and are
+        // never valid on a mount mark.
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_ATTRIB, 0, Some(false)),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_ATTRIB, FAN_REPORT_FID, Some(false)),
+            Ok(FanotifyMarkPlan::Add)
+        );
+        assert_eq!(
+            plan_fanotify_mark(
+                FAN_MARK_ADD | FAN_MARK_MOUNT,
+                FAN_CREATE,
+                FAN_REPORT_DFID_NAME,
+                Some(true)
+            ),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_RENAME, FAN_REPORT_DFID_NAME, Some(true)),
+            Ok(FanotifyMarkPlan::Add)
+        );
+        // The strict dir-only rule is ADD-only and needs a non-directory.
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_RENAME, FAN_REPORT_DFID_NAME, Some(false)),
+            Err(FanotifyMarkReject::NotDirectory)
+        );
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_REMOVE, FAN_RENAME, FAN_REPORT_DFID_NAME, Some(false)),
+            Ok(FanotifyMarkPlan::Remove)
+        );
+        // Evictable marks are inode marks.
+        assert_eq!(
+            plan_fanotify_mark(
+                FAN_MARK_ADD | FAN_MARK_EVICTABLE | FAN_MARK_MOUNT,
+                FAN_ACCESS,
+                0,
+                Some(true)
+            ),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        // Ignore masks without FAN_MARK_IGNORED_SURV_MODIFY.
+        assert_eq!(
+            plan_fanotify_mark(
+                FAN_MARK_ADD | FAN_MARK_IGNORE | FAN_MARK_MOUNT,
+                FAN_ACCESS,
+                0,
+                Some(true)
+            ),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_IGNORE, FAN_ACCESS, 0, Some(true)),
+            Err(FanotifyMarkReject::IsDirectory)
+        );
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_IGNORE, FAN_ACCESS, 0, Some(false)),
+            Ok(FanotifyMarkPlan::Ignored)
+        );
+        // The legacy ignore API accepts a directory without SURV_MODIFY.
+        assert_eq!(
+            plan_fanotify_mark(
+                FAN_MARK_ADD | FAN_MARK_IGNORED_MASK,
+                FAN_ACCESS,
+                0,
+                Some(true)
+            ),
+            Ok(FanotifyMarkPlan::Ignored)
+        );
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_FLUSH | FAN_MARK_MOUNT, FAN_ACCESS, 0, None),
+            Ok(FanotifyMarkPlan::Flush)
+        );
+    }
+
+    /// `fanotify_init`'s ordered admission rules.
+    #[test]
+    fn fanotify_init_admission_matches_v7_2_3_flag_matrix() {
+        assert_eq!(fanotify_init_admission(1 << 31, 0), Err(FanotifyInitReject::Invalid));
+        // Both class bits: the class switch default.
+        assert_eq!(
+            fanotify_init_admission(FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT, 0),
+            Err(FanotifyInitReject::Invalid)
+        );
+        // FAN_REPORT_MNT demands the notification class and no inode reports.
+        assert_eq!(
+            fanotify_init_admission(FAN_REPORT_MNT | FAN_CLASS_CONTENT, 0),
+            Err(FanotifyInitReject::Invalid)
+        );
+        assert_eq!(
+            fanotify_init_admission(FAN_REPORT_MNT | FAN_REPORT_FID, 0),
+            Err(FanotifyInitReject::Invalid)
+        );
+        assert_eq!(
+            fanotify_init_admission(FAN_REPORT_MNT | FAN_REPORT_FD_ERROR, 0),
+            Err(FanotifyInitReject::Invalid)
+        );
+        assert_eq!(
+            fanotify_init_admission(FAN_REPORT_MNT, 0),
+            Err(FanotifyInitReject::Unsupported)
+        );
+        assert_eq!(
+            fanotify_init_admission(FAN_REPORT_FD_ERROR, 0),
+            Err(FanotifyInitReject::Unsupported)
+        );
+        // event_f_flags outside FANOTIFY_INIT_ALL_EVENT_F_BITS, and O_ACCMODE 3.
+        assert_eq!(
+            fanotify_init_admission(0, 0x0020_0000),
+            Err(FanotifyInitReject::Invalid)
+        );
+        assert_eq!(fanotify_init_admission(0, 0x3), Err(FanotifyInitReject::Invalid));
+        assert_eq!(fanotify_init_admission(0, 0x001C_9C00), Ok(()));
+        // FID modes require the notification class, NAME requires DIR_FID and
+        // TARGET_FID requires both NAME and FID.
+        assert_eq!(
+            fanotify_init_admission(FAN_REPORT_FID | FAN_CLASS_CONTENT, 0),
+            Err(FanotifyInitReject::Invalid)
+        );
+        assert_eq!(
+            fanotify_init_admission(FAN_REPORT_NAME, 0),
+            Err(FanotifyInitReject::Invalid)
+        );
+        assert_eq!(
+            fanotify_init_admission(FAN_REPORT_DFID_NAME | FAN_REPORT_TARGET_FID, 0),
+            Err(FanotifyInitReject::Invalid)
+        );
+        assert_eq!(
+            fanotify_init_admission(FAN_REPORT_DFID_NAME_TARGET, 0),
+            Ok(())
+        );
+        assert_eq!(
+            fanotify_init_admission(FAN_CLASS_PRE_CONTENT | FAN_CLOEXEC, 0),
+            Ok(())
+        );
+        assert_eq!(
+            fanotify_init_admission(FAN_UNLIMITED_MARKS, 0),
+            Err(FanotifyInitReject::Unsupported)
+        );
+        // FAN_ENABLE_AUDIT is anchored on CAP_AUDIT_WRITE in Linux, not on the
+        // flag table.
+        assert_eq!(fanotify_init_admission(FAN_ENABLE_AUDIT, 0), Ok(()));
+        assert_eq!(
+            fanotify_init_admission(FAN_PRE_ACCESS as u32, 0),
+            Err(FanotifyInitReject::Invalid)
+        );
+    }
+
     #[test]
     fn fanotify_init_grammar_rejects_incompatible_reports() {
+        // FAN_REPORT_PIDFD and FAN_REPORT_TID combine in v7.2.3; the second
+        // selects per-thread pidfds through PIDFD_THREAD.
+        assert_eq!(fanotify_init_admission(0x80 | 0x100, 0), Ok(()));
+        // FAN_Q_OVERFLOW is not in `valid_mask`.
         assert_eq!(
-            fanotify_init_admission(0x80 | 0x100, 0),
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_Q_OVERFLOW, 0, Some(false)),
+            Err(FanotifyMarkReject::Invalid)
+        );
+        assert_eq!(
+            fanotify_init_admission(0, 0x3),
+            Err(FanotifyInitReject::Invalid)
+        );
+        assert_eq!(
+            fanotify_init_admission(FAN_REPORT_FID | FAN_CLASS_CONTENT, 0),
             Err(FanotifyInitReject::Invalid)
         );
         assert_eq!(
@@ -1122,7 +1595,7 @@ mod tests {
             FANOTIFY_RESPONSE_VALID_MASK,
             FAN_ALLOW | FAN_DENY | FAN_AUDIT | FAN_INFO | FANOTIFY_RESPONSE_ERRNO_MASK
         );
-        assert_eq!(ALL_FANOTIFY_EVENT_BITS, 0x0000_0000_5807_dfff);
+        assert_eq!(ALL_FANOTIFY_EVENT_BITS, 0x0000_0000_5b17_dfff);
         assert_eq!(
             FANOTIFY_PERMISSION_CLASSES,
             [FAN_CLASS_PRE_CONTENT, FAN_CLASS_CONTENT]

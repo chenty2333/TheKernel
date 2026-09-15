@@ -29,13 +29,18 @@ pub const FSCONFIG_CMD_CREATE: u32 = 6;
 pub const FSCONFIG_CMD_RECONFIGURE: u32 = 7;
 pub const FSCONFIG_CMD_CREATE_EXCL: u32 = 8;
 pub const FSMOUNT_CLOEXEC: u32 = 0x0000_0001;
+/// `FSMOUNT_NAMESPACE` clones the new mount into a fresh mount namespace.
+pub const FSMOUNT_NAMESPACE: u32 = 0x0000_0002;
 pub const AT_EMPTY_PATH: u32 = 0x1000;
 pub const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
 pub const AT_NO_AUTOMOUNT: u32 = 0x800;
 pub const AT_RECURSIVE: u32 = 0x8000;
 pub const OPEN_TREE_CLONE: u32 = 0x0000_0001;
+/// `OPEN_TREE_NAMESPACE` clones the target tree into a new mount namespace.
+pub const OPEN_TREE_NAMESPACE: u32 = 0x0000_0002;
 pub const OPEN_TREE_CLOEXEC: u32 = 0x0008_0000;
 pub const OPEN_TREE_MASK: u32 = OPEN_TREE_CLONE
+    | OPEN_TREE_NAMESPACE
     | OPEN_TREE_CLOEXEC
     | AT_EMPTY_PATH
     | AT_NO_AUTOMOUNT
@@ -140,6 +145,13 @@ pub const MNT_ID_REQ_SIZE_VER0: usize = 24;
 pub const MNT_ID_REQ_SIZE_VER1: usize = 32;
 pub const LISTMOUNT_REVERSE: u32 = 1;
 pub const LSMT_ROOT: u64 = u64::MAX;
+
+pub const FSPICK_CLOEXEC: u32 = 0x0000_0001;
+pub const FSPICK_SYMLINK_NOFOLLOW: u32 = 0x0000_0002;
+pub const FSPICK_NO_AUTOMOUNT: u32 = 0x0000_0004;
+pub const FSPICK_EMPTY_PATH: u32 = 0x0000_0008;
+pub const FSPICK_MASK: u32 =
+    FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH;
 pub const STATMOUNT_SB_BASIC: u64 = 0x001;
 pub const STATMOUNT_MNT_BASIC: u64 = 0x002;
 pub const STATMOUNT_PROPAGATE_FROM: u64 = 0x004;
@@ -171,9 +183,13 @@ pub const STATMOUNT_SUPPORTED: u64 = STATMOUNT_SB_BASIC
     | STATMOUNT_MNT_UIDMAP
     | STATMOUNT_MNT_GIDMAP;
 
-pub const fn validate_statmount_flags(flags: u32) -> Result<(), UapiError> {
-    if flags == 0 {
-        Ok(())
+/// `statmount(2)` accepts only this flag bit; `mnt_id_req.mnt_fd` then names the
+/// mount to describe instead of `mnt_id`.
+pub const STATMOUNT_BY_FD: u32 = 0x0000_0001;
+
+pub const fn validate_statmount_flags(flags: u32) -> Result<bool, UapiError> {
+    if flags & !STATMOUNT_BY_FD == 0 {
+        Ok(flags & STATMOUNT_BY_FD != 0)
     } else {
         Err(UapiError::Invalid)
     }
@@ -192,6 +208,21 @@ pub const fn validate_mnt_id_request(request: MntIdReq) -> Result<(), UapiError>
         Err(UapiError::Invalid)
     } else {
         Ok(())
+    }
+}
+/// `copy_mnt_id_req()` in `fs/namespace.c` validates the request object
+/// differently depending on `STATMOUNT_BY_FD`: the descriptor form forbids the
+/// mount-id fields entirely, while the id form forbids mixing `mnt_ns_fd` with
+/// `mnt_ns_id` and requires a unique mount id above `MNT_UNIQUE_ID_OFFSET`.
+pub const fn validate_statmount_request(request: MntIdReq, by_fd: bool) -> Result<(), UapiError> {
+    if by_fd {
+        if request.mnt_id != 0 || request.ns_id != 0 {
+            Err(UapiError::Invalid)
+        } else {
+            Ok(())
+        }
+    } else {
+        validate_mnt_id_request(request)
     }
 }
 pub const fn validate_unique_mount_id(mount_id: u64) -> Result<(), UapiError> {
@@ -248,6 +279,13 @@ pub struct MntIdReq {
     pub ns_id: u64,
 }
 impl MntIdReq {
+    /// The 32-bit word after `size` is a union in Linux: `mnt_ns_fd` for the
+    /// identifier form of `statmount`/`listmount` and `mnt_fd` for the
+    /// `STATMOUNT_BY_FD` form of `statmount`.
+    pub const fn descriptor_word(self) -> u32 {
+        self.mnt_ns_fd
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self, UapiError> {
         if bytes.len() < MNT_ID_REQ_SIZE_VER0 {
             return Err(UapiError::Invalid);
@@ -266,6 +304,25 @@ impl MntIdReq {
     }
 }
 
+/// `fspick(2)`'s two pre-lookup rejections. Linux tests `may_mount()` first
+/// and only then the flag word, so a caller that cannot mount observes `EPERM`
+/// even for a malformed flag set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FspickReject {
+    /// `!may_mount()`: `-EPERM`.
+    NotCapable,
+    /// A bit outside `FSPICK_VALID_FLAGS`: `-EINVAL`.
+    InvalidFlags,
+}
+pub const fn validate_fspick(flags: u32, may_mount: bool) -> Result<bool, FspickReject> {
+    if !may_mount {
+        Err(FspickReject::NotCapable)
+    } else if flags & !FSPICK_MASK != 0 {
+        Err(FspickReject::InvalidFlags)
+    } else {
+        Ok(flags & FSPICK_CLOEXEC != 0)
+    }
+}
 pub const fn validate_fsopen_flags(flags: u32) -> Result<bool, UapiError> {
     if flags & !FSOPEN_CLOEXEC != 0 {
         Err(UapiError::Invalid)
@@ -299,8 +356,11 @@ pub const fn validate_fsconfig_shape(
         Err(UapiError::Invalid)
     }
 }
+/// `SYSCALL_DEFINE3(fsmount, ...)` / `SYSCALL_DEFINE3(fsopen, ...)` share this
+/// admission for the descriptor flags.  Linux's own table is
+/// `FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE` (include/uapi/linux/mount.h).
 pub const fn validate_fsmount(flags: u32, attrs: u32) -> Result<bool, UapiError> {
-    if flags & !FSMOUNT_CLOEXEC != 0
+    if flags & !(FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE) != 0
         || attrs & !(MOUNT_ATTR_SUPPORTED & !MOUNT_ATTR_IDMAP) != 0
         || !valid_atime_set(attrs)
     {
@@ -309,8 +369,16 @@ pub const fn validate_fsmount(flags: u32, attrs: u32) -> Result<bool, UapiError>
         Ok(flags & FSMOUNT_CLOEXEC != 0)
     }
 }
+/// `vfs_open_tree()` in `fs/namespace.c` rejects, in this order, any bit
+/// outside `AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_RECURSIVE |
+/// AT_SYMLINK_NOFOLLOW | OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC |
+/// OPEN_TREE_NAMESPACE`, `AT_RECURSIVE` without either clone flag, and both
+/// clone flags together.
 pub const fn validate_open_tree(flags: u32) -> Result<bool, UapiError> {
-    if flags & !OPEN_TREE_MASK != 0 || flags & AT_RECURSIVE != 0 && flags & OPEN_TREE_CLONE == 0 {
+    if flags & !OPEN_TREE_MASK != 0
+        || flags & (AT_RECURSIVE | OPEN_TREE_CLONE | OPEN_TREE_NAMESPACE) == AT_RECURSIVE
+        || (flags & (OPEN_TREE_CLONE | OPEN_TREE_NAMESPACE)).count_ones() > 1
+    {
         Err(UapiError::Invalid)
     } else {
         Ok(flags & OPEN_TREE_CLOEXEC != 0)
@@ -891,6 +959,130 @@ mod tests {
         );
     }
 
+    /// `vfs_open_tree()` (fs/namespace.c) — the accepted bit set, the
+    /// `AT_RECURSIVE`-without-a-clone rejection and the "only one of
+    /// OPEN_TREE_CLONE/OPEN_TREE_NAMESPACE" rejection.
+    #[test]
+    fn open_tree_admits_linux_clone_flags_and_rejects_invalid_combinations() {
+        assert_eq!(validate_open_tree(0), Ok(false));
+        assert_eq!(validate_open_tree(OPEN_TREE_CLONE), Ok(false));
+        assert_eq!(validate_open_tree(OPEN_TREE_NAMESPACE), Ok(false));
+        assert_eq!(validate_open_tree(OPEN_TREE_NAMESPACE | AT_RECURSIVE), Ok(false));
+        assert_eq!(
+            validate_open_tree(OPEN_TREE_CLONE | AT_RECURSIVE | AT_EMPTY_PATH),
+            Ok(false)
+        );
+        assert_eq!(
+            validate_open_tree(OPEN_TREE_NAMESPACE | OPEN_TREE_CLOEXEC),
+            Ok(true)
+        );
+        // Both clone flags at once is `hweight32(...) > 1`.
+        assert_eq!(
+            validate_open_tree(OPEN_TREE_CLONE | OPEN_TREE_NAMESPACE),
+            Err(UapiError::Invalid)
+        );
+        // AT_RECURSIVE alone (neither clone flag) is rejected.
+        assert_eq!(validate_open_tree(AT_RECURSIVE), Err(UapiError::Invalid));
+        assert_eq!(
+            validate_open_tree(OPEN_TREE_CLOEXEC | AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW),
+            Ok(true)
+        );
+        assert_eq!(
+            validate_open_tree(AT_RECURSIVE | 1 << 31),
+            Err(UapiError::Invalid)
+        );
+    }
+
+    /// `SYSCALL_DEFINE3(fsmount, ...)` — `FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE`
+    /// plus `FSMOUNT_VALID_FLAGS` and the `MOUNT_ATTR__ATIME` enum switch.
+    #[test]
+    fn fsmount_admits_namespace_flag_and_linux_mount_attributes() {
+        assert_eq!(validate_fsmount(FSMOUNT_NAMESPACE, 0), Ok(false));
+        assert_eq!(
+            validate_fsmount(FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE, 0),
+            Ok(true)
+        );
+        assert_eq!(validate_fsmount(0x4, 0), Err(UapiError::Invalid));
+        // FSMOUNT_VALID_FLAGS excludes MOUNT_ATTR_IDMAP.
+        assert_eq!(
+            validate_fsmount(0, MOUNT_ATTR_IDMAP),
+            Err(UapiError::Invalid)
+        );
+        assert_eq!(validate_fsmount(0, MOUNT_ATTR_RDONLY), Ok(false));
+        assert_eq!(validate_fsmount(0, MOUNT_ATTR_ATIME), Err(UapiError::Invalid));
+        assert_eq!(
+            validate_fsmount(0, MOUNT_ATTR_NOATIME | MOUNT_ATTR_NODIRATIME),
+            Ok(false)
+        );
+    }
+
+    /// `copy_mnt_id_req()` (fs/namespace.c) — the descriptor form forbids the
+    /// mount-id fields; the id form requires a unique id and forbids mixing
+    /// `mnt_ns_fd` with `mnt_ns_id`.
+    #[test]
+    fn statmount_request_validation_follows_linux_by_fd_split() {
+        let id_only = MntIdReq {
+            mnt_ns_fd: 0,
+            mnt_id: (1u64 << 31) + 1,
+            param: 0,
+            ns_id: 0,
+        };
+        assert_eq!(validate_statmount_request(id_only, false), Ok(()));
+        assert_eq!(validate_statmount_request(id_only, true), Err(UapiError::Invalid));
+        assert_eq!(validate_mnt_id_request(id_only), Ok(()));
+
+        let by_fd = MntIdReq {
+            mnt_ns_fd: 7,
+            mnt_id: 0,
+            param: STATMOUNT_SUPPORTED,
+            ns_id: 0,
+        };
+        assert_eq!(validate_statmount_request(by_fd, true), Ok(()));
+        // The legacy id form rejects a mount id inside the 31-bit range.
+        assert_eq!(
+            validate_statmount_request(by_fd, false),
+            Err(UapiError::Invalid)
+        );
+
+        let mixed = MntIdReq {
+            mnt_ns_fd: 7,
+            mnt_id: (1u64 << 31) + 1,
+            param: 0,
+            ns_id: 9,
+        };
+        assert_eq!(validate_statmount_request(mixed, false), Err(UapiError::Invalid));
+        assert_eq!(validate_statmount_request(mixed, true), Err(UapiError::Invalid));
+    }
+
+    /// `SYSCALL_DEFINE4(statmount, ...)` accepts only `STATMOUNT_BY_FD`.
+    #[test]
+    fn statmount_flags_admit_only_by_fd() {
+        assert_eq!(validate_statmount_flags(0), Ok(false));
+        assert_eq!(validate_statmount_flags(STATMOUNT_BY_FD), Ok(true));
+        assert_eq!(validate_statmount_flags(0x2), Err(UapiError::Invalid));
+        assert_eq!(validate_statmount_flags(1 << 31), Err(UapiError::Invalid));
+    }
+
+    /// `SYSCALL_DEFINE3(fspick, ...)`: `may_mount()` precedes the flag word.
+    #[test]
+    fn fspick_capability_precedes_flag_validation() {
+        assert_eq!(
+            validate_fspick(FSPICK_CLOEXEC | FSPICK_EMPTY_PATH, true),
+            Ok(true)
+        );
+        assert_eq!(
+            validate_fspick(FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT, true),
+            Ok(false)
+        );
+        assert_eq!(validate_fspick(0x10, true), Err(FspickReject::InvalidFlags));
+        assert_eq!(validate_fspick(0, false), Err(FspickReject::NotCapable));
+        // The capability gate wins even when the flags are also invalid.
+        assert_eq!(
+            validate_fspick(0x8000_0000, false),
+            Err(FspickReject::NotCapable)
+        );
+    }
+
     #[test]
     fn wire_records_have_fixed_x86_64_layout_and_decode_versioned_requests() {
         assert_eq!(STATMOUNT_PREFIX_SIZE, 512);
@@ -946,7 +1138,7 @@ mod tests {
             validate_fsconfig_shape(99, false, false, 0, -100),
             Err(UapiError::Unsupported)
         );
-        assert_eq!(validate_statmount_flags(1), Err(UapiError::Invalid));
+        assert_eq!(validate_statmount_flags(2), Err(UapiError::Invalid));
         assert_eq!(validate_listmount_flags(LISTMOUNT_REVERSE), Ok(true));
     }
 

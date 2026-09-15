@@ -25,7 +25,7 @@ use spin::Mutex;
 pub use tk_linux_fsnotify::{
     ALL_FANOTIFY_EVENT_BITS, FAN_ACCESS, FAN_ACCESS_PERM, FAN_CLASS_PRE_CONTENT, FAN_CLOEXEC,
     FAN_CLOSE, FAN_ENABLE_AUDIT, FAN_EPIDFD, FAN_EVENT_INFO_TYPE_PIDFD, FAN_EVENT_ON_CHILD,
-    FAN_MARK_DONT_FOLLOW, FAN_MARK_EVICTABLE, FAN_MARK_FILESYSTEM, FAN_MARK_FLUSH, FAN_MARK_IGNORE,
+    FAN_MARK_DONT_FOLLOW, FAN_MARK_EVICTABLE, FAN_MARK_FILESYSTEM, FAN_MARK_IGNORE,
     FAN_MARK_IGNORED_SURV_MODIFY, FAN_MARK_MOUNT, FAN_MARK_REMOVE, FAN_MODIFY, FAN_NOFD,
     FAN_NONBLOCK, FAN_NOPIDFD, FAN_ONDIR, FAN_OPEN, FAN_OPEN_EXEC, FAN_OPEN_EXEC_PERM,
     FAN_OPEN_PERM, FAN_Q_OVERFLOW, FAN_REPORT_PIDFD, FAN_REPORT_TID, FANOTIFY_FID_BITS,
@@ -310,6 +310,15 @@ pub(crate) fn drain_deferred_cleanup_work() {
     }
 }
 
+/// Maps a fanotify mark grammar rejection onto its Linux errno.
+pub(crate) fn map_mark_reject(reject: tk_linux_fsnotify::FanotifyMarkReject) -> AxError {
+    match reject {
+        tk_linux_fsnotify::FanotifyMarkReject::Invalid => AxError::InvalidInput,
+        tk_linux_fsnotify::FanotifyMarkReject::NotDirectory => AxError::NotADirectory,
+        tk_linux_fsnotify::FanotifyMarkReject::IsDirectory => AxError::IsADirectory,
+    }
+}
+
 pub fn validate_init_flags(flags: u32, event_f_flags: u32) -> AxResult<()> {
     match tk_linux_fsnotify::fanotify_init_admission(flags, event_f_flags) {
         Ok(()) => Ok(()),
@@ -371,28 +380,37 @@ impl FanotifyFile {
         Ok(file)
     }
 
-    pub fn mark(&self, flags: u32, mask: u64, loc: Option<&Location>) -> AxResult<()> {
+    /// The group-dependent half of `do_fanotify_mark()`, run before any path
+    /// is resolved.  `Ok(true)` means the command is `FAN_MARK_FLUSH`, which
+    /// Linux completes at this point; every other successful result proceeds
+    /// to target resolution and [`Self::mark`].
+    pub fn precheck(&self, flags: u32, mask: u64) -> AxResult<bool> {
+        let plan = tk_linux_fsnotify::plan_fanotify_mark(flags, mask, self.flags, None)
+            .map_err(map_mark_reject)?;
+        Ok(plan == tk_linux_fsnotify::FanotifyMarkPlan::Flush)
+    }
+
+    /// Clears the marks selected by a `FAN_MARK_FLUSH` command.
+    pub fn flush(&self, flags: u32) {
         let mut state = self.state.lock();
-        let target_is_dir = loc.map(Location::is_dir);
-        let plan =
-            tk_linux_fsnotify::plan_fanotify_mark(flags, mask, self.flags, target_is_dir)
-                .map_err(|error| match error {
-                    tk_linux_fsnotify::FanotifyMarkReject::Invalid => AxError::InvalidInput,
-                    tk_linux_fsnotify::FanotifyMarkReject::NotDirectory => {
-                        AxError::NotADirectory
-                    }
-                    tk_linux_fsnotify::FanotifyMarkReject::IsDirectory => {
-                        AxError::IsADirectory
-                    }
-                })?;
+        flush_marks(&mut state, flags);
+    }
+
+    /// Applies the post-resolution half of `do_fanotify_mark()`: the
+    /// directory-dependent rules, the mask normalization, and the mark update.
+    pub fn mark(&self, flags: u32, mask: u64, loc: &Location) -> AxResult<()> {
+        let mut state = self.state.lock();
+        let is_dir = loc.is_dir();
+        let plan = tk_linux_fsnotify::plan_fanotify_mark(flags, mask, self.flags, Some(is_dir))
+            .map_err(map_mark_reject)?;
         if plan == tk_linux_fsnotify::FanotifyMarkPlan::Flush {
             flush_marks(&mut state, flags);
             return Ok(());
         }
 
-        let loc = loc.ok_or(AxError::BadFileDescriptor)?;
         let key = WatchKey::from_location(loc)?;
         let scope = mark_scope(flags, loc)?;
+        let mask = tk_linux_fsnotify::fanotify_mark_stored_mask(mask, flags, is_dir);
 
         match plan {
             tk_linux_fsnotify::FanotifyMarkPlan::Ignored => {
@@ -408,6 +426,7 @@ impl FanotifyFile {
         }
         Ok(())
     }
+
 
     fn has_events(&self) -> bool {
         let state = self.state.lock();
@@ -1512,7 +1531,7 @@ mod tests {
             let file = FanotifyFile::new(FAN_NONBLOCK, 0).unwrap();
             let description = wrapped.then(|| FileDescription::new(file.clone()).unwrap());
             for mask in [FAN_ACCESS, super::FAN_MODIFY] {
-                file.mark(tk_linux_fsnotify::FAN_MARK_ADD, mask, Some(&target))
+                file.mark(tk_linux_fsnotify::FAN_MARK_ADD, mask, &target)
                     .unwrap();
                 assert_eq!(count(), before + 1);
             }
@@ -1637,18 +1656,14 @@ mod tests {
         );
 
         let file = FanotifyFile::new(FAN_NONBLOCK | FAN_CLASS_PRE_CONTENT, 0).unwrap();
-        file.mark(
-            tk_linux_fsnotify::FAN_MARK_ADD,
-            FAN_OPEN_PERM,
-            Some(&target),
-        )
-        .unwrap();
+        file.mark(tk_linux_fsnotify::FAN_MARK_ADD, FAN_OPEN_PERM, &target)
+            .unwrap();
         assert_eq!(super::FANOTIFY_MARKS.load(Ordering::Acquire), 1);
         calls.store(0, Ordering::Relaxed);
         assert_eq!(check(), Err(AxError::Io));
         assert_eq!(calls.load(Ordering::Relaxed), 1);
 
-        file.mark(super::FAN_MARK_REMOVE, FAN_OPEN_PERM, Some(&target))
+        file.mark(super::FAN_MARK_REMOVE, FAN_OPEN_PERM, &target)
             .unwrap();
         assert_eq!(super::FANOTIFY_MARKS.load(Ordering::Acquire), 0);
         calls.store(0, Ordering::Relaxed);

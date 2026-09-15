@@ -8,7 +8,7 @@ use alloc::{
 use core::ffi::c_char;
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axfs_ng_vfs::{DeviceId, FsPathBuf, Location};
+use axfs_ng_vfs::{DeviceId, FsPathBuf, Location, NodeType};
 use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::{AT_FDCWD, CAP_SYS_ADMIN};
@@ -52,6 +52,11 @@ const QIF_FLAGS: u32 = 4;
 const DQBLK_VALID_MASK: u32 =
     QIF_BLIMITS | QIF_SPACE | QIF_ILIMITS | QIF_INODES | QIF_BTIME | QIF_ITIME;
 const DQINFO_VALID_MASK: u32 = QIF_BGRACE | QIF_IGRACE | QIF_FLAGS;
+// `DQF_SETINFO_MASK` is DQF_ROOT_SQUASH: the only quota-info flag a
+// Q_SETINFO caller may set.  DQF_SYS_FILE is reported by Q_GETINFO but is
+// owned by the kernel.
+const DQF_ROOT_SQUASH: u32 = 1;
+const DQF_SETINFO_MASK: u32 = DQF_ROOT_SQUASH;
 // Linux's v2 on-disk quota format.  All fields are explicitly little endian:
 // quota files are data files, not native-endian kernel snapshots.
 const V2_VERSION: u32 = 1;
@@ -466,13 +471,22 @@ fn merge_info(old: &mut IfDqinfo, new: IfDqinfo) {
     }
     old.valid |= valid;
 }
-fn root_for_path<M: UserMemory + ?Sized>(
+/// `lookup_bdev()` followed by `user_get_super()`: the `special` argument of
+/// `quotactl` names a block device, and the filesystem the command operates on
+/// is whichever live superblock is backed by that device.
+///
+///   error = kern_path(pathname, LOOKUP_FOLLOW, &path);      /* ENOENT, ... */
+///   if (!S_ISBLK(inode->i_mode)) { error = -ENOTBLK; ... }
+///   if (!may_open_dev(&path))    { error = -EACCES;  ... }
+///   sb = user_get_super(dev, excl); if (!sb) return ERR_PTR(-ENODEV);
+fn root_for_device<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ptr: *const c_char,
 ) -> AxResult<Location> {
     let bytes = vm_load_until_nul(memory, ptr.cast()).map_err(map_usercopy_error)?;
+    // lookup_bdev(): `if (!pathname || !*pathname) return -EINVAL;`
     if bytes.is_empty() {
-        return Err(LinuxError::ENOENT.into());
+        return Err(AxError::InvalidInput);
     }
     let path = FsPathBuf::from_vec(bytes);
     validate_pathname(&path)?;
@@ -481,8 +495,42 @@ fn root_for_path<M: UserMemory + ?Sized>(
         ResolveAtResult::File(loc) => loc,
         ResolveAtResult::Other(_) => return Err(AxError::InvalidInput),
     };
-    Ok(loc.mountpoint().root_location())
+    let metadata = loc.metadata()?;
+    let is_block_device = metadata.node_type == NodeType::BlockDevice;
+    let nodev = crate::mounts::is_nodev(&loc)?;
+    let superblock = if is_block_device && !nodev {
+        crate::mounts::mounted_root_location(metadata.rdev).ok()
+    } else {
+        None
+    };
+    match linux_vfs::admit_quota_device(is_block_device, nodev, superblock.is_some()) {
+        Ok(()) => Ok(superblock.expect("admitted device has a superblock")),
+        Err(linux_vfs::QuotaDeviceReject::NotBlockDevice) => Err(LinuxError::ENOTBLK.into()),
+        Err(linux_vfs::QuotaDeviceReject::Nodev) => Err(AxError::PermissionDenied),
+        Err(linux_vfs::QuotaDeviceReject::NoSuperblock) => Err(LinuxError::ENODEV.into()),
+    }
 }
+
+/// Resolves the `Q_QUOTAON` quota-file path.  Linux resolves it in the syscall
+/// before the superblock lookup and reports a failure only from
+/// `quota_quotaon()`, after the provider and permission decisions.
+fn quota_file_for_on<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    addr: usize,
+) -> AxResult<Location> {
+    let path = vm_load_until_nul(memory, addr as *const u8).map_err(map_usercopy_error)?;
+    if path.is_empty() {
+        return Err(LinuxError::ENOENT.into());
+    }
+    let path = FsPathBuf::from_vec(path);
+    validate_pathname(&path)?;
+    let security = VfsSecurityContext::new(current().as_thread().current_cred());
+    match resolve_at_with_security(AT_FDCWD, Some(&path), 0, &security)? {
+        ResolveAtResult::File(file) => Ok(file),
+        ResolveAtResult::Other(_) => Err(AxError::InvalidInput),
+    }
+}
+
 fn location_for_fd(fd: i32) -> AxResult<Location> {
     let file = get_file_like(fd)?;
     let loc = if let Some(file) = file.downcast_ref::<File>() {
@@ -490,7 +538,10 @@ fn location_for_fd(fd: i32) -> AxResult<Location> {
     } else if let Some(dir) = file.downcast_ref::<Directory>() {
         dir.inner().clone()
     } else {
-        return Err(AxError::InvalidInput);
+        // A descriptor with no path - a pipe, socket or anonymous inode - has
+        // no mount to name.  Linux reaches do_quotactl() through the
+        // descriptor's mount and reports the missing provider as ENOSYS.
+        return Err(AxError::Unsupported);
     };
     Ok(loc)
 }
@@ -785,119 +836,138 @@ fn write_struct<M: UserMemory + ?Sized, T: bytemuck::NoUninit>(
     }
     vm_write_slice(memory, addr as *mut u8, bytemuck::bytes_of(value)).map_err(map_usercopy_error)
 }
+/// `do_quotactl()`: provider support, quota-type support, the permission table
+/// and then the command itself.
+///
+///   if (!sb->s_qcop) return -ENOSYS;
+///   if (!(sb->s_quota_types & (1 << type))) return -EINVAL;
+///   ret = check_quotactl_permission(sb, type, cmd, id);
+///   if (ret < 0) return ret;
+///   switch (cmd) { ... }
 fn quotactl<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     root: Location,
     cmd: u32,
     id: u32,
     addr: usize,
+    on_path: AxResult<Location>,
+    read_only: bool,
 ) -> AxResult<isize> {
     let op = quota_command(cmd);
     let ty = quota_type(cmd)?;
+    if read_only {
+        // `quotactl_fd()` runs `mnt_want_write()` for the commands of
+        // `quotactl_cmd_write()` before it ever reads the superblock.
+        return Err(AxError::ReadOnlyFilesystem);
+    }
+    // FAT has no durable project-id representation.  Linux reports a missing
+    // quotactl provider here, before it checks permissions.
+    if ty == 2 && root.filesystem().name() == "fat" {
+        return Err(AxError::OperationNotSupported);
+    }
+    match linux_vfs::quota_command_privilege(op) {
+        linux_vfs::QuotaCommandPrivilege::None => {}
+        // Q_GETQUOTA and Q_XGETQUOTA admit the caller's own identifier.
+        linux_vfs::QuotaCommandPrivilege::OwnIdentity if may_read(ty, id) => {}
+        _ => admin()?,
+    }
     let state = state(&root)?;
     match op {
         Q_SYNC => {
-            admin()?;
+            // dquot_quota_sync() writes back whatever is active and succeeds
+            // when a type is not enabled.
             let mut data = state.0.lock();
             flush_locked(&mut data)?;
             Ok(0)
         }
         Q_QUOTAON => {
-            admin()?;
-            if ty == 2 && root.filesystem().name() == "fat" {
-                // FAT has no durable inode project-id representation.  Do
-                // not silently collapse all project IDs into zero.
-                return Err(AxError::OperationNotSupported);
-            }
-            if id != QFMT_VFS_V1 && id != QFMT_VFS_OLD {
-                return Err(AxError::InvalidInput);
-            }
-            let path = vm_load_until_nul(memory, addr as *const u8).map_err(map_usercopy_error)?;
-            if path.is_empty() {
-                return Err(LinuxError::ENOENT.into());
-            }
-            let path = FsPathBuf::from_vec(path);
-            validate_pathname(&path)?;
-            let security = VfsSecurityContext::new(current().as_thread().current_cred());
-            let quota_file = match resolve_at_with_security(AT_FDCWD, Some(&path), 0, &security)? {
-                ResolveAtResult::File(file) => file,
-                ResolveAtResult::Other(_) => return Err(AxError::InvalidInput),
-            };
+            // quota_quotaon() reports the deferred quota-file lookup error.
+            let quota_file = on_path?;
+            // dquot_quota_on(): the quota file must live on the same
+            // superblock.
             if !quota_file.same_mount(&root) {
                 return Err(LinuxError::EXDEV.into());
             }
+            let metadata = quota_file.metadata()?;
+            // vfs_setup_quota_inode(): a regular, writable quota file that is
+            // not already carrying this quota type.
+            if metadata.node_type != NodeType::RegularFile {
+                return Err(AxError::PermissionDenied);
+            }
+            if crate::mounts::is_readonly(&quota_file)? {
+                return Err(AxError::ReadOnlyFilesystem);
+            }
             let mut q = state.0.lock();
+            if q.enabled[ty] {
+                return Err(AxError::ResourceBusy);
+            }
+            // dquot_load_quota_sb(): find_quota_format() -> ESRCH.
+            if id != QFMT_VFS_V1 && id != QFMT_VFS_OLD {
+                return Err(LinuxError::ESRCH.into());
+            }
             // Everything below is fallible, including parsing the supplied
             // file and enumerating the mount. Keep the published state intact
             // until both have succeeded.
             let mut next = q.clone();
-            if !next.enabled[ty] {
-                let len = usize::try_from(quota_file.metadata()?.size)
-                    .map_err(|_| AxError::InvalidInput)?;
-                if len > MAX_QUOTA_FILE_BYTES {
-                    return Err(AxError::InvalidInput);
-                }
-                if len != 0 {
-                    let mut bytes = Vec::new();
-                    bytes
-                        .try_reserve_exact(len)
-                        .map_err(|_| AxError::NoMemory)?;
-                    bytes.resize(len, 0);
-                    let read = quota_file.entry().as_file()?.read_at(&mut bytes, 0)?;
-                    bytes.truncate(read);
-                    next.formats[ty] =
-                        if bytes.len() >= 8 && get32(&bytes, 0).ok() == Some(V2_MAGICS[ty]) {
-                            QuotaFormat::V2
-                        } else {
-                            QuotaFormat::OldV1
-                        };
-                    if next.formats[ty] == QuotaFormat::V2 {
-                        decode_state(&bytes, &mut next, ty)?;
-                    } else {
-                        decode_v1(&bytes, &mut next, ty)?;
-                    }
-                    // Each quota type is explicitly activated by Q_QUOTAON;
-                    // persisted enabled bits describe the prior clean state,
-                    // not an implicit mount-time activation.
-                    next.enabled = [false; 3];
-                }
+            let len = usize::try_from(metadata.size).map_err(|_| AxError::InvalidInput)?;
+            if len > MAX_QUOTA_FILE_BYTES {
+                return Err(AxError::InvalidInput);
             }
-            if next.enabled[ty] {
-                Err(LinuxError::EBUSY.into())
-            } else {
-                next.formats[ty] = if id == QFMT_VFS_OLD {
-                    QuotaFormat::OldV1
-                } else {
+            if len != 0 {
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(len)
+                    .map_err(|_| AxError::NoMemory)?;
+                bytes.resize(len, 0);
+                let read = quota_file.entry().as_file()?.read_at(&mut bytes, 0)?;
+                bytes.truncate(read);
+                next.formats[ty] = if bytes.len() >= 8 && get32(&bytes, 0).ok() == Some(V2_MAGICS[ty])
+                {
                     QuotaFormat::V2
+                } else {
+                    QuotaFormat::OldV1
                 };
-                next.quota_files[ty] = Some(quota_file);
-                // Existing inodes predate quota activation.  Their current
-                // uid/gid/project and allocated 512-byte block count seed the
-                // ledger before new mutations are admitted.
-                seed_usage(&root, &mut next, ty)?;
-                next.enabled[ty] = true;
-                next.dirty = true;
-                *q = next;
-                Ok(0)
+                if next.formats[ty] == QuotaFormat::V2 {
+                    decode_state(&bytes, &mut next, ty)?;
+                } else {
+                    decode_v1(&bytes, &mut next, ty)?;
+                }
+                // Each quota type is explicitly activated by Q_QUOTAON;
+                // persisted enabled bits describe the prior clean state,
+                // not an implicit mount-time activation.
+                next.enabled = [false; 3];
             }
+            next.formats[ty] = if id == QFMT_VFS_OLD {
+                QuotaFormat::OldV1
+            } else {
+                QuotaFormat::V2
+            };
+            next.quota_files[ty] = Some(quota_file);
+            // Existing inodes predate quota activation.  Their current
+            // uid/gid/project and allocated 512-byte block count seed the
+            // ledger before new mutations are admitted.
+            seed_usage(&root, &mut next, ty)?;
+            next.enabled[ty] = true;
+            next.dirty = true;
+            *q = next;
+            Ok(0)
         }
         Q_QUOTAOFF => {
-            admin()?;
             let mut q = state.0.lock();
+            // dquot_disable() returns 0 when nothing is loaded; disabling an
+            // inactive type is a successful no-op.
             if !q.enabled[ty] {
-                Err(AxError::InvalidInput)
-            } else {
-                flush_locked(&mut q)?;
-                q.enabled[ty] = false;
-                q.quota_files[ty] = None;
-                Ok(0)
+                return Ok(0);
             }
+            flush_locked(&mut q)?;
+            q.enabled[ty] = false;
+            q.quota_files[ty] = None;
+            Ok(0)
         }
         Q_GETFMT => {
             let q = state.0.lock();
+            // quota_getfmt(): `if (!sb_has_quota_active(sb, type)) return -ESRCH;`
             if !q.enabled[ty] {
-                // quota_getfmt() distinguishes a valid quota type whose
-                // accounting is inactive from a malformed command.
                 return Err(LinuxError::ESRCH.into());
             }
             let format = match q.formats[ty] {
@@ -909,8 +979,9 @@ fn quotactl<M: UserMemory + ?Sized>(
         }
         Q_GETINFO => {
             let q = state.0.lock();
+            // quota_getinfo(): the acct-enabled flag of get_state() -> ESRCH.
             if !q.enabled[ty] {
-                return Err(AxError::InvalidInput);
+                return Err(LinuxError::ESRCH.into());
             }
             let info = IfDqinfo {
                 valid: DQINFO_VALID_MASK,
@@ -920,22 +991,35 @@ fn quotactl<M: UserMemory + ?Sized>(
             Ok(0)
         }
         Q_SETINFO => {
-            admin()?;
+            // quota_setinfo() copies the structure before it validates it.
             let new: IfDqinfo = read_struct(memory, addr)?;
             if new.valid & !DQINFO_VALID_MASK != 0 {
                 return Err(AxError::InvalidInput);
             }
-            merge_info(&mut state.0.lock().info[ty], new);
-            state.0.lock().dirty = true;
+            if new.valid & QIF_FLAGS != 0 && new.flags & !DQF_SETINFO_MASK != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let mut q = state.0.lock();
+            // dquot_set_dqinfo(): `if (!sb_has_quota_active(sb, type)) return -ESRCH;`
+            if !q.enabled[ty] {
+                return Err(LinuxError::ESRCH.into());
+            }
+            if new.valid & QIF_FLAGS != 0
+                && new.flags & DQF_ROOT_SQUASH != 0
+                && q.formats[ty] != QuotaFormat::OldV1
+            {
+                // Root squash is only representable in the old format.
+                return Err(AxError::InvalidInput);
+            }
+            merge_info(&mut q.info[ty], new);
+            q.dirty = true;
             Ok(0)
         }
         Q_GETQUOTA => {
-            if !may_read(ty, id) {
-                return Err(LinuxError::EPERM.into());
-            }
             let q = state.0.lock();
+            // dquot_get_dqblk() -> dqget() -> ESRCH when the type is inactive.
             if !q.enabled[ty] {
-                return Err(AxError::InvalidInput);
+                return Err(LinuxError::ESRCH.into());
             }
             write_struct(
                 memory,
@@ -948,37 +1032,33 @@ fn quotactl<M: UserMemory + ?Sized>(
             Ok(0)
         }
         Q_SETQUOTA => {
-            admin()?;
+            // quota_setquota() copies the structure first; unknown `dqb_valid`
+            // bits are ignored rather than rejected.
             let record: IfDqblk = read_struct(memory, addr)?;
-            if record.valid & !DQBLK_VALID_MASK != 0 {
-                return Err(AxError::InvalidInput);
-            }
             let mut q = state.0.lock();
+            // dquot_set_dqblk() -> dqget() -> ESRCH when the type is inactive.
             if !q.enabled[ty] {
-                return Err(AxError::InvalidInput);
+                return Err(LinuxError::ESRCH.into());
             }
             merge_record(q.records.entry((ty as u8, id)).or_default(), record);
             q.dirty = true;
             Ok(0)
         }
         Q_GETNEXTQUOTA => {
-            if !may_read(ty, id) {
-                return Err(LinuxError::EPERM.into());
-            }
             let q = state.0.lock();
             if !q.enabled[ty] {
-                return Err(AxError::InvalidInput);
+                return Err(LinuxError::ESRCH.into());
             }
+            // qtree_get_next_id() walks from the requested identifier and
+            // reports the smallest entry at or after it; running out of the
+            // tree is ENOENT, not ESRCH.
             let Some((&(_, next), record)) = q
                 .records
                 .range((ty as u8, id)..)
                 .find(|((kind, _), _)| *kind == ty as u8)
             else {
-                return Err(LinuxError::ESRCH.into());
+                return Err(LinuxError::ENOENT.into());
             };
-            if !may_read(ty, next) {
-                return Err(LinuxError::EPERM.into());
-            }
             write_struct(
                 memory,
                 addr,
@@ -1000,6 +1080,7 @@ fn quotactl<M: UserMemory + ?Sized>(
         _ => Err(AxError::InvalidInput),
     }
 }
+
 pub fn sys_quotactl<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     cmd: u32,
@@ -1007,23 +1088,47 @@ pub fn sys_quotactl<M: UserMemory + ?Sized>(
     id: u32,
     addr: usize,
 ) -> AxResult<isize> {
-    if quota_command(cmd) == Q_SYNC && special.is_null() {
-        admin()?;
-        let _ = quota_type(cmd)?;
+    let op = quota_command(cmd);
+    // SYSCALL_DEFINE4(quotactl) validates the quota type before anything else.
+    let ty = quota_type(cmd)?;
+    if special.is_null() {
+        // "As a special case Q_SYNC can be called without a specific device."
+        // It iterates every superblock with quota enabled and needs no
+        // capability, while every other command is ENODEV.
+        if op != Q_SYNC {
+            return Err(LinuxError::ENODEV.into());
+        }
         let mut devices = BTreeSet::new();
         for mount in crate::mounts::snapshot()? {
             if !devices.insert(mount.dev) {
                 continue;
             }
-            let root = crate::mounts::mounted_root_location(DeviceId(mount.dev))?;
+            // quota_sync_one() reports success for everything it cannot
+            // address, and iterate_supers() ignores per-superblock errors.
+            let Ok(root) = crate::mounts::mounted_root_location(DeviceId(mount.dev)) else {
+                continue;
+            };
             let state = state(&root)?;
-            flush_locked(&mut state.0.lock())?;
+            let mut data = state.0.lock();
+            if data.enabled[ty] {
+                flush_locked(&mut data)?;
+            }
         }
         return Ok(0);
     }
-    let root = root_for_path(memory, special)?;
-    quotactl(memory, root, cmd, id, addr)
+    // Q_QUOTAON resolves its quota file first and defers a failure until the
+    // provider and permission decisions have run.
+    let on_path = if op == Q_QUOTAON {
+        quota_file_for_on(memory, addr)
+    } else {
+        Err(AxError::InvalidInput)
+    };
+    let root = root_for_device(memory, special)?;
+    // `quotactl_block()` takes no mount write reference: the path form reaches
+    // the provider without `mnt_want_write()`.
+    quotactl(memory, root, cmd, id, 0, on_path, false)
 }
+
 pub fn sys_quotactl_fd<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     fd: i32,
@@ -1031,8 +1136,16 @@ pub fn sys_quotactl_fd<M: UserMemory + ?Sized>(
     id: u32,
     addr: usize,
 ) -> AxResult<isize> {
-    let root = root_for_location(&location_for_fd(fd)?);
-    quotactl(memory, root, cmd, id, addr)
+    // SYSCALL_DEFINE4(quotactl_fd): `fd_empty(f) -> EBADF`, then the quota
+    // type, and the quota file is never resolved - `do_quotactl()` receives
+    // `ERR_PTR(-EINVAL)`, so Q_QUOTAON through a descriptor is EINVAL.
+    let loc = location_for_fd(fd)?;
+    let root = root_for_location(&loc);
+    let op = quota_command(cmd);
+    quota_type(cmd)?;
+    let read_only =
+        linux_vfs::quota_command_is_write(op) && crate::mounts::is_readonly(&root)?;
+    quotactl(memory, root, cmd, id, addr, Err(AxError::InvalidInput), read_only)
 }
 
 #[cfg(test)]
