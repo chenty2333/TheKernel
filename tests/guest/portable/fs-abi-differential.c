@@ -696,22 +696,22 @@ int main(void) {
         iov.iov_base = buf;
         iov.iov_len = sizeof(buf);
         errno = 0;
-        check(syscall(NR_PREADV2, file, &iov, 1, 0LL, 0x200U) == -1 &&
+        check(syscall(NR_PREADV2, file, &iov, 1, 0LL, 0LL, 0x200U) == -1 &&
               errno == EOPNOTSUPP, "unknown-flag");
         mark("UNKNOWN_FLAG_EOPNOTSUPP");
         errno = 0;
-        check(syscall(NR_PREADV2, file, &iov, 1, 0LL,
+        check(syscall(NR_PREADV2, file, &iov, 1, 0LL, 0LL,
                       RWF_APPEND | RWF_NOAPPEND) == -1 && errno == EINVAL,
               "append-conflict");
         mark("APPEND_NOAPPEND_EINVAL");
-        check(syscall(NR_PREADV2, file, &iov, 1, 0LL, RWF_HIPRI) ==
+        check(syscall(NR_PREADV2, file, &iov, 1, 0LL, 0LL, RWF_HIPRI) ==
               (long)sizeof(buf), "hipri");
         mark("HIPRI_ACCEPTED");
-        check(syscall(NR_PREADV2, file, &iov, 1, 0LL, RWF_DSYNC) ==
+        check(syscall(NR_PREADV2, file, &iov, 1, 0LL, 0LL, RWF_DSYNC) ==
               (long)sizeof(buf), "dsync");
         mark("DSYNC_ACCEPTED");
         errno = 0;
-        check(syscall(NR_PREADV2, file, BAD, 1, 0LL, RWF_HIPRI) == -1 &&
+        check(syscall(NR_PREADV2, file, BAD, 1, 0LL, 0LL, RWF_HIPRI) == -1 &&
               errno == EFAULT, "bad-iov");
         mark("IOVEC_COPY_BEFORE_FLAGS");
     }
@@ -725,22 +725,22 @@ int main(void) {
         iov.iov_base = buf;
         iov.iov_len = sizeof(buf);
         errno = 0;
-        check(syscall(NR_PWRITEV2, file, &iov, 1, 0LL, 0x200U) == -1 &&
+        check(syscall(NR_PWRITEV2, file, &iov, 1, 0LL, 0LL, 0x200U) == -1 &&
               errno == EOPNOTSUPP, "unknown-flag");
         mark("UNKNOWN_FLAG_EOPNOTSUPP");
         errno = 0;
-        check(syscall(NR_PWRITEV2, file, &iov, 1, 0LL,
+        check(syscall(NR_PWRITEV2, file, &iov, 1, 0LL, 0LL,
                       RWF_APPEND | RWF_NOAPPEND) == -1 && errno == EINVAL,
               "append-conflict");
         mark("APPEND_NOAPPEND_EINVAL");
-        check(syscall(NR_PWRITEV2, file, &iov, 1, 0LL, RWF_HIPRI) ==
+        check(syscall(NR_PWRITEV2, file, &iov, 1, 0LL, 0LL, RWF_HIPRI) ==
               (long)sizeof(buf), "hipri");
         mark("HIPRI_ACCEPTED");
-        check(syscall(NR_PWRITEV2, file, &iov, 1, 0LL, RWF_DSYNC) ==
+        check(syscall(NR_PWRITEV2, file, &iov, 1, 0LL, 0LL, RWF_DSYNC) ==
               (long)sizeof(buf), "dsync");
         mark("DSYNC_ACCEPTED");
         errno = 0;
-        check(syscall(NR_PWRITEV2, file, BAD, 1, 0LL, RWF_HIPRI) == -1 &&
+        check(syscall(NR_PWRITEV2, file, BAD, 1, 0LL, 0LL, RWF_HIPRI) == -1 &&
               errno == EFAULT, "bad-iov");
         mark("IOVEC_COPY_BEFORE_FLAGS");
     }
