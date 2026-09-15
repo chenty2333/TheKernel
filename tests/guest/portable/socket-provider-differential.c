@@ -18,9 +18,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/if_ether.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef AF_MAX
@@ -65,11 +67,15 @@ static void mark(const char *name, int good) {
 static void done(void) { printf("THEKERNEL_ABI_RESULT %s pass\n", active); }
 static void check(const char *name, int good) { if (!good) mark(name, 0); }
 
-static int effective_capability(int capability) {
+static unsigned long effective_capability_bits(void) {
     struct __user_cap_header_struct header = {.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
     struct __user_cap_data_struct data[2] = {{0}, {0}};
     if (syscall(SYS_capget, &header, data) != 0) return 0;
-    return (data[capability / 32].effective & (1U << (capability % 32))) != 0;
+    return ((unsigned long)data[1].effective << 32) | data[0].effective;
+}
+
+static int effective_capability(int capability) {
+    return (effective_capability_bits() & (1UL << capability)) != 0;
 }
 
 /* `__sys_socket_create` rejects a flag bit outside
@@ -423,6 +429,7 @@ static void sol_socket_table(void) {
     int value = 0, expected = 0, result = 0;
     socklen_t length = sizeof(value);
     struct linger linger = {0};
+    char devname[32];
     int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
     check("ROUTE_SOCKET", fd >= 0);
 
@@ -565,6 +572,165 @@ static void sol_socket_table(void) {
     errno = 0;
     mark("SET_NEGATIVE_OPTLEN_EINVAL",
          setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, (socklen_t)-1) == -1 && errno == EINVAL);
+
+    /* The getter has no such early site: `do_sock_getsockopt()` copies the
+     * caller's `int len` and discards the result (`net/socket.c:2450-2451`),
+     * so only a provider that goes on to use the value reports a bad length.
+     * `sk_getsockopt()` does that for every SOL_SOCKET name
+     * (`net/core/sock.c:1751-1754`), while an AF_UNIX `proto_ops` has no
+     * `->getsockopt` at all (`net/unix/af_unix.c:967-990`), so any other level
+     * is the dispatcher's -EOPNOTSUPP (`net/socket.c:2476-2477`) with user
+     * memory left untouched. */
+    length = (socklen_t) -1;
+    errno = 0;
+    mark("GET_NEGATIVE_OPTLEN_EINVAL",
+         getsockopt(fd, SOL_SOCKET, SO_TYPE, &value, &length) == -1 && errno == EINVAL);
+    errno = 0;
+    mark("GET_UNREADABLE_OPTLEN_EFAULT",
+         getsockopt(fd, SOL_SOCKET, SO_TYPE, &value, NULL) == -1 && errno == EFAULT);
+    int unix_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    check("TABLE_UNIX_SOCKET", unix_fd >= 0);
+    length = (socklen_t) -1;
+    errno = 0;
+    mark("GET_UNKNOWN_LEVEL_NEGATIVE_OPTLEN_EOPNOTSUPP",
+         getsockopt(unix_fd, 999, 999, &value, &length) == -1 && errno == EOPNOTSUPP);
+    errno = 0;
+    mark("GET_UNKNOWN_LEVEL_UNREADABLE_OPTLEN_EOPNOTSUPP",
+         getsockopt(unix_fd, 999, 999, &value, NULL) == -1 && errno == EOPNOTSUPP);
+    length = sizeof(value);
+    errno = 0;
+    mark("GET_UNKNOWN_LEVEL_EOPNOTSUPP",
+         getsockopt(unix_fd, 999, 999, &value, &length) == -1 && errno == EOPNOTSUPP);
+    close(unix_fd);
+
+    /* `sock_setsockopt()` serves `SO_BINDTODEVICE` itself, ahead of its
+     * `optlen < sizeof(int)` gate, so a device name is not an int-sized value
+     * (`net/core/sock.c:1209-1214`).  `sock_setbindtodevice()` imports at most
+     * `IFNAMSIZ - 1` bytes into a zero-filled buffer, resolves the name with
+     * `dev_get_by_name_rcu` (-ENODEV when it is absent) and stores the index
+     * through `sock_bindtoindex_locked()`, which needs `CAP_NET_RAW` only when
+     * the socket is already bound (`:689-701`, `:708-714`, `:641-643`).
+     * `sk_getsockopt()` reports it back through `sock_getbindtodevice()`:
+     * an unbound socket writes only `*optlen = 0`, a bound one needs the whole
+     * `IFNAMSIZ` buffer and reports `strlen(name) + 1` (`:2044-2045`,
+     * `:735-752`). */
+    memset(devname, 'X', sizeof(devname));
+    length = sizeof(devname);
+    mark("BINDTODEVICE_NETLINK_FRESH_UNBOUND",
+         getsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, devname, &length) == 0 && length == 0
+             && devname[0] == 'X');
+    memset(devname, 0, sizeof(devname));
+    memcpy(devname, "lo", 3);
+    errno = 0;
+    mark("BINDTODEVICE_NETLINK_ROUND_TRIP",
+         setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, devname, 3) == 0
+             && (memset(devname, 0, sizeof(devname)),
+                 length = sizeof(devname),
+                 getsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, devname, &length) == 0)
+             && length == 3 && memcmp(devname, "lo\0", 3) == 0);
+    length = 15;
+    errno = 0;
+    mark("BINDTODEVICE_NETLINK_SHORT_BUFFER_EINVAL",
+         getsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, devname, &length) == -1 && errno == EINVAL
+             && length == 15);
+    memset(devname, 'Z', sizeof(devname));
+    memcpy(devname, "lo", 2);
+    devname[2] = '\0';
+    errno = 0;
+    mark("BINDTODEVICE_NETLINK_LONG_REQUEST_TRUNCATES",
+         setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, devname, sizeof(devname)) == 0
+             && (memset(devname, 0, sizeof(devname)),
+                 length = sizeof(devname),
+                 getsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, devname, &length) == 0)
+             && length == 3 && memcmp(devname, "lo\0", 3) == 0);
+    memset(devname, 0, sizeof(devname));
+    memcpy(devname, "nosuchif0", 10);
+    errno = 0;
+    mark("BINDTODEVICE_NETLINK_UNKNOWN_NAME_ENODEV",
+         setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, devname, 10) == -1 && errno == ENODEV);
+    errno = 0;
+    mark("BINDTODEVICE_NETLINK_UNREADABLE_NAME_EFAULT",
+         setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, NULL, 3) == -1 && errno == EFAULT);
+    /* An empty request is the unbind; the name pointer is never dereferenced,
+     * so even a NULL one is accepted. */
+    errno = 0;
+    mark("BINDTODEVICE_NETLINK_EMPTY_UNBINDS",
+         setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, NULL, 0) == 0
+             && (length = sizeof(devname),
+                 getsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, devname, &length) == 0)
+             && length == 0);
+    memset(devname, 0, sizeof(devname));
+    memcpy(devname, "lo", 3);
+    errno = 0;
+    mark("BINDTODEVICE_NETLINK_REBIND_ALLOWED",
+         setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, devname, 3) == 0);
+
+    /* The same option is served for a network endpoint and an AF_PACKET one:
+     * `sock_setsockopt()` runs before the family's own option table. */
+    int device_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    check("BINDTODEVICE_UNIX_SOCKET", device_fd >= 0);
+    errno = 0;
+    mark("BINDTODEVICE_UNIX_ROUND_TRIP",
+         setsockopt(device_fd, SOL_SOCKET, SO_BINDTODEVICE, devname, 3) == 0
+             && (memset(devname, 0, sizeof(devname)),
+                 length = sizeof(devname),
+                 getsockopt(device_fd, SOL_SOCKET, SO_BINDTODEVICE, devname, &length) == 0)
+             && length == 3 && memcmp(devname, "lo\0", 3) == 0);
+    close(device_fd);
+    device_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    check("BINDTODEVICE_PACKET_SOCKET", device_fd >= 0);
+    memset(devname, 0, sizeof(devname));
+    memcpy(devname, "lo", 3);
+    errno = 0;
+    mark("BINDTODEVICE_PACKET_ROUND_TRIP",
+         setsockopt(device_fd, SOL_SOCKET, SO_BINDTODEVICE, devname, 3) == 0
+             && (memset(devname, 0, sizeof(devname)),
+                 length = sizeof(devname),
+                 getsockopt(device_fd, SOL_SOCKET, SO_BINDTODEVICE, devname, &length) == 0)
+             && length == 3 && memcmp(devname, "lo\0", 3) == 0);
+    close(device_fd);
+
+    /* Both SO_BINDTODEVICE's rebind and the `*BUFFORCE` pair consult a
+     * capability in the namespace that owns the socket: `sock_bindtoindex_locked`
+     * wants `CAP_NET_RAW` for an already-bound socket (`net/core/sock.c:641-643`)
+     * and `sock_setsockopt` wants `CAP_NET_ADMIN` for the force variants
+     * (`:1355-1365`, `:1377-1385`).  A forked child drops both, so the
+     * privileged branch the assertions above take is not the only one under
+     * test; binding an *unbound* socket still succeeds. */
+    int status = 0;
+    pid_t child = fork();
+    check("UNPRIVILEGED_POLICY_FORK", child >= 0);
+    if (child == 0) {
+        struct __user_cap_header_struct header = {.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+        struct __user_cap_data_struct caps[2] = {{0}, {0}};
+        unsigned long mask = effective_capability_bits();
+        mask &= ~(1UL << CAP_NET_ADMIN);
+        mask &= ~(1UL << CAP_NET_RAW);
+        caps[0].effective = caps[0].permitted = (unsigned)mask;
+        caps[1].effective = caps[1].permitted = (unsigned)(mask >> 32);
+        if (syscall(SYS_capset, &header, caps) != 0) {
+            mark("UNPRIVILEGED_CAPSET", 0);
+            _exit(1);
+        }
+        int child_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+        check("UNPRIVILEGED_POLICY_SOCKET", child_fd >= 0);
+        value = 4194305;
+        errno = 0;
+        mark("UNPRIVILEGED_RCVBUFFORCE_EPERM",
+             setsockopt(child_fd, SOL_SOCKET, SO_RCVBUFFORCE, &value, sizeof(value)) == -1
+                 && errno == EPERM);
+        memset(devname, 0, sizeof(devname));
+        memcpy(devname, "lo", 3);
+        errno = 0;
+        mark("UNPRIVILEGED_BINDTODEVICE_FIRST_SET",
+             setsockopt(child_fd, SOL_SOCKET, SO_BINDTODEVICE, devname, 3) == 0);
+        errno = 0;
+        mark("UNPRIVILEGED_BINDTODEVICE_REBIND_EPERM",
+             setsockopt(child_fd, SOL_SOCKET, SO_BINDTODEVICE, devname, 3) == -1
+                 && errno == EPERM);
+        _exit(0);
+    }
+    waitpid(child, &status, 0);
 
     /* `SO_SNDBUF`/`SO_RCVBUF` never fail on a negative request: the unsigned
      * `min_t(u32, val, sysctl_*mem_max)` clamp turns it into the sysctl

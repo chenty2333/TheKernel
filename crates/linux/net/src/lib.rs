@@ -337,21 +337,88 @@ pub const fn address_import_admitted(addrlen: i32) -> bool {
     addrlen >= 0 && (addrlen as usize) <= SOCKADDR_STORAGE_LEN
 }
 
-/// `net/socket.c:do_sock_setsockopt()` / `do_sock_getsockopt()` reject a
-/// negative option length before any protocol runs:
+/// `do_sock_setsockopt()` rejects a negative option length before any protocol
+/// runs:
 ///
 /// ```c
 /// 	if (optlen < 0)
 /// 		return -EINVAL;
 /// ```
 ///
-/// `setsockopt` reaches it at `:2342-2343` and `getsockopt` at `:2366-2367`;
-/// the descriptor lookup that precedes both reports EBADF first.  Because
-/// `socklen_t` is unsigned in the ABI, a caller can pass `(socklen_t)-1`, which
-/// every lower-bound test in the option table would otherwise read as a 4 GiB
-/// buffer.
+/// `setsockopt` reaches it at `net/socket.c:2342-2343`; the descriptor lookup
+/// that precedes it reports EBADF first.  `getsockopt` has no such site: its
+/// own `copy_from_sockptr(&max_optlen, optlen, sizeof(int))`
+/// (`net/socket.c:2450-2451`) discards the result, and each provider that uses
+/// the length applies the same `len < 0` test where it reads it —
+/// `sk_getsockopt()` (`net/core/sock.c:1751-1754`) and `sockptr_to_sockopt()`
+/// (`net/socket.c:2416-2420`).  Because `socklen_t` is unsigned in the ABI, a
+/// caller can pass `(socklen_t)-1`, which every lower-bound test in the option
+/// table would otherwise read as a 4 GiB buffer.
 pub const fn option_length_admitted(optlen: u32) -> bool {
     (optlen as i32) >= 0
+}
+
+/// The interface-name import of `sock_setbindtodevice()`
+/// (`net/core/sock.c:689-701`):
+///
+/// ```c
+/// 	ret = -EINVAL;
+/// 	if (optlen < 0)
+/// 		goto out;
+/// 	...
+/// 	if (optlen > IFNAMSIZ - 1)
+/// 		optlen = IFNAMSIZ - 1;
+/// 	memset(devname, 0, sizeof(devname));
+///
+/// 	ret = -EFAULT;
+/// 	if (copy_from_sockptr(devname, optval, optlen))
+/// 		goto out;
+/// ```
+///
+/// A request longer than a name is truncated rather than rejected, and the
+/// zero-filled tail is what terminates the imported name.  Returns how many
+/// bytes of the caller's buffer take part.
+pub const fn bound_device_name_length(optlen: usize) -> usize {
+    if optlen > IFNAMSIZ - 1 {
+        IFNAMSIZ - 1
+    } else {
+        optlen
+    }
+}
+
+/// `sock_setbindtodevice()`'s empty-name rule (`net/core/sock.c:703-716`): the
+/// name ends at the first NUL, and an empty one leaves `index` at zero — which
+/// `sock_bindtoindex_locked()` stores as "not bound" — regardless of the
+/// capability that a *rebind* would need.
+pub fn bound_device_name(bytes: &[u8]) -> Option<&[u8]> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    let name = &bytes[..end];
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// `sock_getbindtodevice()`'s buffer rule (`net/core/sock.c:740-742`): the
+/// stored name and its terminating NUL must fit, otherwise `-EINVAL`.  An
+/// unbound socket reports a zero length without the buffer being consulted at
+/// all (`:735-737`).
+pub const fn bound_device_get_length_admitted(len: i32) -> bool {
+    len >= IFNAMSIZ as i32
+}
+
+/// `sock_bindtoindex_locked()`'s capability rule (`net/core/sock.c:641-643`):
+///
+/// ```c
+/// 	ret = -EPERM;
+/// 	if (sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW))
+/// 		goto out;
+/// ```
+///
+/// Binding a socket that is not bound yet is unprivileged; replacing an
+/// existing binding needs `CAP_NET_RAW` in the namespace that owns it.
+pub const fn bound_device_set_permitted(current_index: i32, net_raw: bool) -> bool {
+    current_index == 0 || net_raw
 }
 
 /// `min_t(u32, val, READ_ONCE(sysctl_wmem_max))` (`net/core/sock.c:1342`) and
@@ -718,6 +785,10 @@ pub const SO_PASSCRED: i32 = 16;
 pub const SO_PEERCRED: i32 = 17;
 pub const SO_RCVLOWAT: i32 = 18;
 pub const SO_SNDLOWAT: i32 = 19;
+/// `SO_BINDTODEVICE`: handled by `sock_setsockopt()`/`sk_getsockopt()`
+/// themselves for every family (`net/core/sock.c:1209-1210`, `:2044-2045`), so
+/// it never reaches the protocol option tables.
+pub const SO_BINDTODEVICE: i32 = 25;
 pub const SO_MARK: i32 = 36;
 pub const SO_ACCEPTCONN: i32 = 30;
 pub const SO_PROTOCOL: i32 = 38;
@@ -1542,6 +1613,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bound_device_rules_mirror_sock_setbindtodevice() {
+        // `if (optlen > IFNAMSIZ - 1) optlen = IFNAMSIZ - 1;`
+        assert_eq!(bound_device_name_length(0), 0);
+        assert_eq!(bound_device_name_length(3), 3);
+        assert_eq!(bound_device_name_length(IFNAMSIZ - 1), IFNAMSIZ - 1);
+        assert_eq!(bound_device_name_length(IFNAMSIZ), IFNAMSIZ - 1);
+        assert_eq!(bound_device_name_length(4096), IFNAMSIZ - 1);
+
+        // The zero-filled tail of `devname` terminates the name, and an empty
+        // name is the unbind request rather than an error.
+        assert_eq!(bound_device_name(b"lo\0"), Some(&b"lo"[..]));
+        assert_eq!(bound_device_name(b"lo"), Some(&b"lo"[..]));
+        assert_eq!(bound_device_name(b"eth0\0garbage"), Some(&b"eth0"[..]));
+        assert_eq!(bound_device_name(b"\0\0"), None);
+        assert_eq!(bound_device_name(b""), None);
+
+        // `if (len < IFNAMSIZ) return -EINVAL;` for a bound socket.
+        assert!(!bound_device_get_length_admitted(0));
+        assert!(!bound_device_get_length_admitted((IFNAMSIZ - 1) as i32));
+        assert!(bound_device_get_length_admitted(IFNAMSIZ as i32));
+
+        // Only replacing an existing binding needs CAP_NET_RAW.
+        assert!(bound_device_set_permitted(0, false));
+        assert!(bound_device_set_permitted(0, true));
+        assert!(!bound_device_set_permitted(1, false));
+        assert!(bound_device_set_permitted(1, true));
+    }
+
+    #[test]
     fn socket_type_admission_matches_sock_max() {
         for ty in 0..SOCK_MAX {
             assert!(socket_type_in_range(ty), "type {ty}");
@@ -1940,9 +2040,9 @@ mod tests {
         );
         // The names this audit still leaves out must stay unknown to the
         // table, so the endpoint keeps answering `-ENOPROTOOPT` for them:
-        // `SO_BINDTODEVICE` (25), `SO_TIMESTAMP_OLD` (29), `SO_PEERSEC` (31)
-        // and `SO_COOKIE` (57).
-        for optname in [25, 29, 31, 57] {
+        // `SO_BINDTODEVICE` (25, served by the socket layer itself),
+        // `SO_TIMESTAMP_OLD` (29), `SO_PEERSEC` (31) and `SO_COOKIE` (57).
+        for optname in [SO_BINDTODEVICE, 29, 31, 57] {
             assert_eq!(generic_socket_get_option(optname), None, "{optname}");
             assert_eq!(generic_socket_set_option(optname), None, "{optname}");
         }

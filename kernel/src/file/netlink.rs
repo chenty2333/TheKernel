@@ -8,7 +8,7 @@ use alloc::{
 };
 use core::{
     mem::size_of,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
     task::Context,
 };
 
@@ -487,6 +487,10 @@ pub struct NetlinkSocket {
     overrun: AtomicBool,
     nonblocking: AtomicBool,
     poll_rx: PollSet,
+    /// `sk->sk_bound_dev_if` (`net/core/sock.c:650`): `SO_BINDTODEVICE` state
+    /// is per-socket, not part of the netlink option table, and zero means
+    /// "not bound".
+    bound_dev_if: AtomicI32,
 }
 
 struct NetlinkDatagram {
@@ -1699,6 +1703,17 @@ impl NetlinkSocket {
         Self::audit_socket_creation_authorized(&credential)
             && is_initial_network_namespace(&self.net_ns)
     }
+    /// The `sk_bound_dev_if` this endpoint currently carries.
+    pub(crate) fn bound_device_index(&self) -> i32 {
+        self.bound_dev_if.load(Ordering::Acquire)
+    }
+
+    /// `WRITE_ONCE(sk->sk_bound_dev_if, ifindex)` from
+    /// `sock_bindtoindex_locked()` (`net/core/sock.c:650`).
+    pub(crate) fn set_bound_device_index(&self, index: i32) {
+        self.bound_dev_if.store(index, Ordering::Release);
+    }
+
     pub(crate) fn net_namespace(&self) -> &Arc<NetworkNamespace> {
         &self.net_ns
     }
@@ -1747,6 +1762,7 @@ impl NetlinkSocket {
             overrun: AtomicBool::new(false),
             nonblocking: AtomicBool::new(false),
             poll_rx: PollSet::new(),
+            bound_dev_if: AtomicI32::new(0),
         })
         .map_err(|_| AxError::NoMemory)?;
         if protocol == NETLINK_KOBJECT_UEVENT {

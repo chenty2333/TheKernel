@@ -12,7 +12,7 @@ use alloc::{borrow::Cow, boxed::Box, sync::Arc, vec::Vec};
 use core::{
     future::Future,
     pin::Pin,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering},
     task::{Context, Poll, Waker},
 };
 
@@ -160,6 +160,10 @@ pub(crate) struct PacketSocket {
     v3_timer: Mutex<Option<PacketV3Timer>>,
     v3_timeout: Arc<PollSet>,
     inode: PseudoInode,
+    /// `sk->sk_bound_dev_if` (`net/core/sock.c:650`): `SO_BINDTODEVICE` state,
+    /// which is separate from the AF_PACKET bind (`PACKET_ADD_MEMBERSHIP`)
+    /// state and zero when the socket is not bound.
+    bound_dev_if: AtomicI32,
 }
 
 struct PacketV3Timer {
@@ -788,12 +792,24 @@ impl PacketSocket {
             v3_timer: Mutex::new(None),
             v3_timeout: Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?,
             inode: PseudoInode::socket(),
+            bound_dev_if: AtomicI32::new(0),
         })
         .map_err(|_| AxError::NoMemory)
     }
 
     pub(crate) fn net_namespace(&self) -> &Arc<NetworkNamespace> {
         &self.net_ns
+    }
+
+    /// The `sk_bound_dev_if` this endpoint currently carries.
+    pub(crate) fn bound_device_index(&self) -> i32 {
+        self.bound_dev_if.load(Ordering::Acquire)
+    }
+
+    /// `WRITE_ONCE(sk->sk_bound_dev_if, ifindex)` from
+    /// `sock_bindtoindex_locked()` (`net/core/sock.c:650`).
+    pub(crate) fn set_bound_device_index(&self, index: i32) {
+        self.bound_dev_if.store(index, Ordering::Release);
     }
 
     pub(crate) fn binding(&self) -> PacketBinding {

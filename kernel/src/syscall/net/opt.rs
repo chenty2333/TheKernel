@@ -11,7 +11,7 @@ use axnet::{
 };
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::{
-    general::CAP_NET_ADMIN,
+    general::{CAP_NET_ADMIN, CAP_NET_RAW},
     if_packet::{PACKET_RX_RING, PACKET_TX_RING, tpacket_req, tpacket_stats},
     net::{
         AF_INET, AF_INET6, AF_PACKET, IP_HDRINCL, IPV6_ADDRFORM, SO_ATTACH_BPF, SO_ATTACH_FILTER,
@@ -31,7 +31,7 @@ use tk_linux_packet::{
     PacketSocketType, SetPacketOption,
 };
 
-use super::{SocketSyscallSnapshot, import_socket_output_after_policy};
+use super::SocketSyscallSnapshot;
 #[cfg(feature = "bpf")]
 use crate::file::FileLike;
 use crate::{
@@ -40,7 +40,7 @@ use crate::{
     },
     mm::{UserConstPtr, UserMemoryCapability, UserPtr, map_usercopy_error},
     task::{
-        ns_capable,
+        Cred, NetworkNamespace, ns_capable,
         security::{SocketOption, SocketSecurityContext, dispatch_socket},
     },
 };
@@ -319,6 +319,171 @@ fn packet_option_copy_len(requested: socklen_t, available: usize) -> usize {
 
 fn option_copy_len(requested: socklen_t, available: usize) -> usize {
     (requested as usize).min(available)
+}
+
+/// Linux's `if (len < 0) return -EINVAL;` for a `getsockopt` length.
+///
+/// `optlen` is a `socklen_t`, which is unsigned in the ABI, while every kernel
+/// reader copies it into an `int`: `sk_getsockopt()` at
+/// `net/core/sock.c:1751-1754`, `sockptr_to_sockopt()` at
+/// `net/socket.c:2416-2420`, and each protocol handler in between.  This is
+/// exactly `do_sock_setsockopt()`'s `if (optlen < 0) return -EINVAL;`
+/// (`net/socket.c:2342-2343`) applied to the value the getter imported.
+fn admitted_option_length(optlen: socklen_t) -> AxResult<socklen_t> {
+    if tk_linux_net::option_length_admitted(optlen) {
+        Ok(optlen)
+    } else {
+        Err(AxError::InvalidInput)
+    }
+}
+
+/// `dev_get_by_name_rcu()` (`net/core/dev.c`): the namespace's interface index
+/// for an exact name, or `-ENODEV` when no device carries it — the errno
+/// `sock_setbindtodevice()` reports before it reaches the capability test.
+fn interface_index_by_name(namespace: &Arc<NetworkNamespace>, name: &[u8]) -> AxResult<i32> {
+    let interfaces = namespace.stack().interfaces();
+    interfaces
+        .iter()
+        .find(|interface| interface.name.as_bytes() == name)
+        .map(|interface| interface.index as i32)
+        .ok_or_else(|| LinuxError::ENODEV.into())
+}
+
+/// `netdev_get_name()` (`net/core/dev.c`): the reverse lookup
+/// `sock_getbindtodevice()` performs, with Linux's `-ENODEV` when the device
+/// disappeared after it was bound.
+fn interface_name_by_index(namespace: &Arc<NetworkNamespace>, index: i32) -> AxResult<Vec<u8>> {
+    let interfaces = namespace.stack().interfaces();
+    interfaces
+        .iter()
+        .find(|interface| interface.index == index as u32)
+        .map(|interface| interface.name.as_bytes().to_vec())
+        .ok_or_else(|| LinuxError::ENODEV.into())
+}
+
+/// The interface index one `SO_BINDTODEVICE` request asks for, following
+/// `sock_setbindtodevice()` and `sock_bindtoindex_locked()`
+/// (`net/core/sock.c:678-720`, `:634-655`):
+///
+/// ```c
+/// 	if (optlen > IFNAMSIZ - 1)		/* :695-696 */
+/// 		optlen = IFNAMSIZ - 1;
+/// 	memset(devname, 0, sizeof(devname));	/* :697 */
+/// 	if (copy_from_sockptr(devname, optval, optlen))	/* :699-701 */
+/// 		goto out;			/* -EFAULT */
+/// 	index = 0;
+/// 	if (devname[0] != '\0') {
+/// 		dev = dev_get_by_name_rcu(net, devname);	/* :708 */
+/// 		if (!dev) { ret = -ENODEV; goto out; }		/* :712-714 */
+/// 		index = dev->ifindex;
+/// 	}
+/// 	/* sock_bindtoindex_locked */
+/// 	if (sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW))
+/// 		return -EPERM;					/* :641-643 */
+/// ```
+///
+/// An empty request therefore means "not bound" and never consults the
+/// capability, which is what makes `bound_device_set_permitted()` depend on the
+/// socket's *current* index.  A name that does not resolve is `-ENODEV` even
+/// for a caller that lacks `CAP_NET_RAW`, because the lookup precedes the
+/// capability test.
+fn resolve_bound_device_index(
+    capability: &UserMemoryCapability,
+    actor: &Arc<Cred>,
+    namespace: &Arc<NetworkNamespace>,
+    optval: UserConstPtr<u8>,
+    optlen: socklen_t,
+    current_index: i32,
+) -> AxResult<i32> {
+    if !tk_linux_net::option_length_admitted(optlen) {
+        return Err(AxError::InvalidInput);
+    }
+    let mut devname = [0_u8; tk_linux_net::IFNAMSIZ];
+    let copied = tk_linux_net::bound_device_name_length(optlen as usize);
+    capability
+        .read_slice(
+            optval.address().as_usize() as *const u8,
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    devname.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
+                    copied,
+                )
+            },
+        )
+        .map_err(map_usercopy_error)?;
+    let index = match tk_linux_net::bound_device_name(&devname[..copied]) {
+        None => 0,
+        Some(name) => interface_index_by_name(namespace, name)?,
+    };
+    if !tk_linux_net::bound_device_set_permitted(
+        current_index,
+        ns_capable(actor, namespace.owner_user_ns(), CAP_NET_RAW),
+    ) {
+        return Err(LinuxError::EPERM.into());
+    }
+    Ok(index)
+}
+
+/// One `SO_BINDTODEVICE` read, following `sock_getbindtodevice()`
+/// (`net/core/sock.c:726-763`):
+///
+/// ```c
+/// 	if (bound_dev_if == 0) {		/* :735-737 */
+/// 		len = 0;
+/// 		goto zero;			/* only *optlen is written */
+/// 	}
+/// 	if (len < IFNAMSIZ)			/* :740-742 */
+/// 		goto out;			/* -EINVAL */
+/// 	ret = netdev_get_name(net, devname, bound_dev_if);	/* :744-746 */
+/// 	if (ret)
+/// 		goto out;			/* -ENODEV */
+/// 	len = strlen(devname) + 1;		/* :748 */
+/// 	if (copy_to_sockptr(optval, devname, len))		/* :750-752 */
+/// 		goto out;			/* -EFAULT, *optlen untouched */
+/// ```
+///
+/// The reported length includes the terminating NUL, and an unbound socket
+/// reports zero without the caller's buffer being touched at all.
+fn get_bound_device(
+    capability: &UserMemoryCapability,
+    namespace: &Arc<NetworkNamespace>,
+    optval: UserPtr<u8>,
+    optlen_ptr: UserPtr<socklen_t>,
+    current_index: i32,
+    len: socklen_t,
+) -> AxResult<()> {
+    let mut name = None;
+    if current_index != 0 {
+        if !tk_linux_net::bound_device_get_length_admitted(len as i32) {
+            return Err(AxError::InvalidInput);
+        }
+        name = Some(interface_name_by_index(namespace, current_index)?);
+    }
+    let reported = match &name {
+        Some(name) => {
+            let mut terminated = Vec::new();
+            terminated
+                .try_reserve_exact(name.len() + 1)
+                .map_err(|_| AxError::NoMemory)?;
+            terminated.extend_from_slice(name);
+            terminated.push(0);
+            capability
+                .write_slice(
+                    optval.address().as_usize() as *mut u8,
+                    terminated.as_slice(),
+                )
+                .map_err(map_usercopy_error)?;
+            terminated.len()
+        }
+        None => 0,
+    };
+    capability
+        .write_value(
+            optlen_ptr.address().as_usize() as *mut socklen_t,
+            reported as socklen_t,
+        )
+        .map_err(map_usercopy_error)?;
+    Ok(())
 }
 
 pub(super) const fn socket_fault_error(fault: axnet::options::SocketFault) -> LinuxError {
@@ -1163,33 +1328,38 @@ pub fn sys_getsockopt(
     let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
     let socket_ref = pinned.security_ref()?;
-    let mut optlen = import_socket_output_after_policy(
-        || {
-            dispatch_socket(&SocketSecurityContext::get_option(
-                snapshot.actor(),
-                &socket_ref,
-                SocketOption::new(level as i32, optname as i32),
-            ))
-        },
-        || {
-            capability
-                .read_value(optlen_ptr.address().as_usize() as *const socklen_t)
-                .map_err(map_usercopy_error)
-        },
-    )?;
+    // `do_sock_getsockopt()` runs the security hook before any provider sees
+    // the request, and its own
+    // `copy_from_sockptr(&max_optlen, optlen, sizeof(int))`
+    // (`net/socket.c:2450-2451`) discards the result: an unreadable `optlen`
+    // is not an error there.  Each provider below therefore imports the
+    // caller's length exactly where its Linux mirror does, and a level the
+    // provider rejects is answered without user memory being touched.
+    dispatch_socket(&SocketSecurityContext::get_option(
+        snapshot.actor(),
+        &socket_ref,
+        SocketOption::new(level as i32, optname as i32),
+    ))?;
     debug!(
-        "sys_getsockopt <= fd: {}, level: {}, optname: {}, optval: {:?}, optlen: {}",
+        "sys_getsockopt <= fd: {}, level: {}, optname: {}, optval: {:?}, optlen: {:?}",
         fd,
         level,
         optname,
         optval.address(),
-        optlen,
+        optlen_ptr.address(),
     );
+    let import_option_length = || -> AxResult<socklen_t> {
+        capability
+            .read_value(optlen_ptr.address().as_usize() as *const socklen_t)
+            .map_err(map_usercopy_error)
+    };
 
-    if optlen > i32::MAX as socklen_t {
-        return Err(AxError::InvalidInput);
-    }
     if pinned.backend()? == SocketBackendKind::Xdp {
+        // `xsk_getsockopt` is an `ops->getsockopt_iter`, so
+        // `sockptr_to_sockopt()` (`net/socket.c:2411-2420`) copies and rejects
+        // a negative length before `xsk_getsockopt()` tests the level
+        // (`net/xdp/xsk.c:1931-1943`).
+        let mut optlen = admitted_option_length(import_option_length()?)?;
         if level != af_xdp::SOL_XDP || optname != 8 {
             return Err(LinuxError::ENOPROTOOPT.into());
         }
@@ -1209,7 +1379,26 @@ pub fn sys_getsockopt(
         // `do_sock_getsockopt` tests `level == SOL_SOCKET` before it consults
         // `ops->getsockopt_iter`, so the generic `sk_getsockopt` table serves
         // netlink endpoints too.  `netlink_getsockopt` then answers everything
-        // outside `SOL_NETLINK` with `ENOPROTOOPT`.
+        // outside `SOL_NETLINK` with `ENOPROTOOPT` — but only after
+        // `sockptr_to_sockopt()` has already copied and validated the length
+        // in `do_sock_getsockopt` (`net/socket.c:2456-2457`), which is why an
+        // unknown level reports EINVAL or EFAULT for a length Linux cannot use
+        // instead of ENOPROTOOPT (`net/netlink/af_netlink.c:1733-1738`).
+        let mut optlen = admitted_option_length(import_option_length()?)?;
+        // `sk_getsockopt`'s own `case SO_BINDTODEVICE` runs inside the
+        // `SOL_SOCKET` arm, before the generic option table
+        // (`net/core/sock.c:2044-2045`).
+        if level == SOL_SOCKET && optname == SO_BINDTODEVICE {
+            get_bound_device(
+                &capability,
+                socket.net_namespace(),
+                optval,
+                optlen_ptr,
+                socket.bound_device_index(),
+                optlen,
+            )?;
+            return Ok(0);
+        }
         let value = if level == SOL_SOCKET {
             socket.get_sol_socket_option(optname)?
         } else if level == SOL_NETLINK {
@@ -1225,6 +1414,22 @@ pub fn sys_getsockopt(
     }
 
     if pinned.backend()? == SocketBackendKind::Packet {
+        // AF_PACKET is the other `getsockopt_iter` endpoint, so the same
+        // `sockptr_to_sockopt()` import precedes `packet_getsockopt`'s own
+        // `level != SOL_PACKET` test (`net/packet/af_packet.c:4098-4104`).
+        let mut optlen = admitted_option_length(import_option_length()?)?;
+        if level == SOL_SOCKET && optname == SO_BINDTODEVICE {
+            let socket = pinned.packet()?;
+            get_bound_device(
+                &capability,
+                socket.net_namespace(),
+                optval,
+                optlen_ptr,
+                socket.bound_device_index(),
+                optlen,
+            )?;
+            return Ok(0);
+        }
         if level == SOL_SOCKET {
             let value = if optname == SO_LOCK_FILTER {
                 i32::from(pinned.packet()?.filter_locked())
@@ -1299,6 +1504,41 @@ pub fn sys_getsockopt(
     }
 
     let socket = pinned.network()?;
+    // Only a level whose Linux handler copies the caller's `int len` may
+    // report a length problem.  `sk_getsockopt()` does it for every
+    // `SOL_SOCKET` name (`net/core/sock.c:1751-1754`) and
+    // `do_ip_getsockopt()` for `SOL_IP` (`net/ipv4/ip_sockglue.c:1515-1524`),
+    // both of which this path serves for every endpoint kind.  The remaining
+    // protocol levels belong to AF_INET/AF_INET6 endpoints:
+    // `do_tcp_getsockopt()` copies the length itself
+    // (`net/ipv4/tcp.c:4490-4494`) and `do_ipv6_getsockopt()` is only reached
+    // for `SOL_IPV6`.  An AF_UNIX endpoint's `proto_ops`
+    // (`net/unix/af_unix.c:967-990`) leaves `->getsockopt` NULL, so every
+    // other level is the dispatcher's `-EOPNOTSUPP`
+    // (`net/socket.c:2476-2477`) and the caller's length is never read.
+    let length_reading_level = level == SOL_SOCKET as u32
+        || level == PROTO_IP
+        || (socket.inet_identity().is_some()
+            && matches!(level, PROTO_TCP | SOL_IPV6 | SOL_SCTP | SOL_DCCP));
+    let mut optlen = if length_reading_level {
+        admitted_option_length(import_option_length()?)?
+    } else {
+        0
+    };
+    // `sk_getsockopt`'s `case SO_BINDTODEVICE` sits in the `SOL_SOCKET` arm of
+    // its switch (`net/core/sock.c:2044-2045`), ahead of the introspection
+    // names below.
+    if level == SOL_SOCKET && optname == SO_BINDTODEVICE {
+        get_bound_device(
+            &capability,
+            socket.net_namespace(),
+            optval,
+            optlen_ptr,
+            socket.bound_device_index(),
+            optlen,
+        )?;
+        return Ok(0);
+    }
     // `SO_DOMAIN`, `SO_TYPE`, and `SO_PROTOCOL` describe the creation
     // request, not the raw endpoint's current bind/connect state.  DCCP in
     // particular remains unbound while these values must already be visible.
@@ -1730,14 +1970,19 @@ pub fn sys_setsockopt(
             // special case: no `SOL_SOCKET` name accepts fewer than four
             // bytes, and none of them accept a one-byte boolean.
             if optname == SO_BINDTODEVICE {
-                // `sock_setbindtodevice` resolves the name through
-                // `dev_get_by_name` and stores the resulting ifindex.
-                // Netlink's send and receive paths never consult
-                // `sk_bound_dev_if`, so the value is inert state; reporting
-                // `ENOPROTOOPT` (the errno Linux itself uses when
-                // `CONFIG_NETDEVICES` is unset) keeps the endpoint from
-                // pretending to have bound a device it cannot name.
-                return Err(AxError::from(LinuxError::ENOPROTOOPT));
+                // `sock_setsockopt` handles this name before its
+                // `optlen < sizeof(int)` gate (`net/core/sock.c:1209-1214`),
+                // because a device name is not an int-sized value: a
+                // three-byte "lo\0" is a complete request.
+                socket.set_bound_device_index(resolve_bound_device_index(
+                    &capability,
+                    snapshot.actor(),
+                    socket.net_namespace(),
+                    optval,
+                    optlen,
+                    socket.bound_device_index(),
+                )?);
+                return Ok(0);
             }
             if (optlen as usize) < size_of::<i32>() {
                 return Err(AxError::InvalidInput);
@@ -1791,6 +2036,18 @@ pub fn sys_setsockopt(
     if pinned.backend()? == SocketBackendKind::Packet {
         if level == SOL_SOCKET {
             match optname {
+                SO_BINDTODEVICE => {
+                    let socket = pinned.packet()?;
+                    socket.set_bound_device_index(resolve_bound_device_index(
+                        &capability,
+                        snapshot.actor(),
+                        socket.net_namespace(),
+                        optval,
+                        optlen,
+                        socket.bound_device_index(),
+                    )?);
+                    return Ok(0);
+                }
                 SO_ATTACH_FILTER => {
                     // Linux first copies the complete sock_fprog envelope.
                     // This preserves EFAULT for an unreadable header even on
@@ -1995,6 +2252,17 @@ pub fn sys_setsockopt(
     }
     if level == SOL_SOCKET {
         match optname {
+            SO_BINDTODEVICE => {
+                socket.set_bound_device_index(resolve_bound_device_index(
+                    &capability,
+                    snapshot.actor(),
+                    socket.net_namespace(),
+                    optval,
+                    optlen,
+                    socket.bound_device_index(),
+                )?);
+                return Ok(0);
+            }
             SO_SNDBUFFORCE => {
                 if !ns_capable(
                     snapshot.actor(),
