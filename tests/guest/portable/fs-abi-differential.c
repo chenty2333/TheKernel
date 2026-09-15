@@ -1625,10 +1625,15 @@ int main(void) {
         /* A descriptor whose PID never led a group does not name one. */
         errno = 0;
         pid_t group_absent = fork();
-        check(group_absent > 0, "absent-fork");
+        /* The child must branch before the parent's verdict: `check` reports
+         * and exits on failure, so evaluating `> 0` here made the child print
+         * a spurious THEKERNEL_FS_ABI_FAIL for a probe only the parent can
+         * judge.  Whether that line survived the console race was luck, and
+         * when it did the runner rejected the whole oracle guest. */
         if (group_absent == 0) {
             for (;;) pause();
         }
+        check(group_absent > 0, "absent-fork");
         {
             int absent_fd = (int)syscall(SYS_pidfd_open, group_absent, 0);
             check(absent_fd >= 0, "absent-pidfd");

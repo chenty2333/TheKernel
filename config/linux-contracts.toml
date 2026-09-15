@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 318
-implemented = 299
+resolved = 319
+implemented = 300
 explicit_enosys = 19
 fallback = 0
-partial = 67
+partial = 66
 unknown = 0
 
 [[contract]]
@@ -7947,13 +7947,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 272
 name = "unshare"
-status = "partial"
+status = "implemented"
 contract = "linux-unshare"
 handler = "kernel/src/syscall/task/ctl.rs:sys_unshare"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/sysadmin-abi-differential.c:main"]
-validation_gaps = ["The flag implication chain and thread-group constraints are exercised by the sysadmin raw differential; CLONE_EMPTY_MNTNS has no assertion"]
-limitations = ["unshare(UNSHARE_EMPTY_MNTNS) (0x00100000, include/uapi/linux/sched.h:54) is still EINVAL: there is no root-mount-only mount-namespace constructor behind the flag"]
+validation_gaps = ["UNSHARE_EMPTY_MNTNS_ACCEPTED, UNSHARE_EMPTY_MNTNS_ROOT_IS_NAMESPACE_ROOT and UNSHARE_EMPTY_MNTNS_DROPS_SUBMOUNTS discriminate the empty mount namespace on both guests"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-setns"
@@ -8642,8 +8642,8 @@ contract = "linux-clone3"
 handler = "kernel/src/syscall/task/clone3.rs:sys_clone3"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/task/clone3.rs:clone3_copy_checks_extension_before_faulting_common_prefix", "tests/guest/portable/task-control-differential.c:main"]
-validation_gaps = ["clone3 flag admission is exercised by the task-control raw differential; the missing flags have no paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["CLONE_NNP, CLONE_PIDFD_AUTOKILL and CLONE_EMPTY_MNTNS flags and their lifecycle semantics are missing; CLONE_AUTOREAP is implemented end to end"]
+validation_gaps = ["EMPTY_MNTNS discriminates the empty mount namespace on both guests"]
+limitations = ["CLONE_NNP and CLONE_PIDFD_AUTOKILL flags and their lifecycle semantics are missing; CLONE_AUTOREAP is implemented end to end, and CLONE_EMPTY_MNTNS installs a root-mount-only mount namespace"]
 
 [[contract]]
 id = "linux-process_mrelease"
