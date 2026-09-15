@@ -132,11 +132,13 @@ impl Drop for EpollCoreCharge {
 }
 
 fn interest_from_io(events: IoEvents) -> AxResult<InterestMask> {
-    if events.contains(IoEvents::MESSAGE) {
-        // Linux defines EPOLLMSG but does not implement a useful readiness
-        // contract for it. The 0.1 core therefore rejects it explicitly.
-        return Err(AxError::OperationNotSupported);
-    }
+    // Linux stores the caller's event mask verbatim in `epi->event.events` and
+    // only ever intersects it with what `->poll()` reported
+    // (`ep_item_poll()`'s `res & epi->event.events`). `EPOLLMSG` therefore has
+    // to be accepted even though no readiness producer in this kernel raises a
+    // message: it simply contributes no interest bit, exactly as on a Linux
+    // target whose `->poll()` never returns `POLLMSG`.
+    let events = events & !IoEvents::MESSAGE;
     let mut bits = 0;
     for (event, interest) in [
         (IoEvents::READABLE, InterestMask::IN),
@@ -1490,6 +1492,18 @@ mod tests {
         );
         let ready = ready_from_io(io);
         assert_eq!(io_from_ready(ready), io);
+    }
+
+    #[test]
+    fn epollmsg_is_accepted_but_arms_no_interest_bit() {
+        // Linux accepts `EPOLLMSG` without validating the mask and stores it in
+        // `epi->event.events`; this kernel has no readiness source that raises
+        // `POLLMSG`, so the interest mask it can actually wait on is empty.
+        assert_eq!(interest_from_io(IoEvents::MESSAGE).unwrap().bits(), 0);
+        assert_eq!(
+            interest_from_io(IoEvents::MESSAGE | IoEvents::READABLE).unwrap(),
+            InterestMask::IN
+        );
     }
 
     #[test]

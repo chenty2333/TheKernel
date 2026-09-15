@@ -276,6 +276,11 @@ static int run_exec_check(int linux_host)
                      0, -1, EPERM) != 0) {
         return 1;
     }
+    errno = 0;
+    long inherited = membarrier_call(MEMBARRIER_CMD_GET_REGISTRATIONS, 0, -1);
+    if (inherited != 0) {
+        return fail_value("exec-registration-mask", inherited, 0);
+    }
     if (expect_success("exec-register-private",
                        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, -1) != 0 ||
         expect_success("exec-register-sync-core",
@@ -292,31 +297,35 @@ static int run_exec_check(int linux_host)
 
 static int run_errno_matrix(int linux_host)
 {
-    /* Commands this kernel does not advertise must fail with EINVAL, which
-     * is Linux's errno for a command outside the advertised QUERY mask.
-     * Linux hosts advertise (and implement) the global/rseq commands, so
-     * those assertions are TheKernel-only by design. */
+    /* The RSEQ pair is not implemented here, so it stays outside the
+     * advertised QUERY mask and reports EINVAL, which is Linux's errno for a
+     * command this kernel does not provide. A host Linux may implement it, so
+     * that assertion is TheKernel-only by design.  The same holds for the
+     * MEMBARRIER_CMD_FLAG_CPU rule: only MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ
+     * accepts the flag in this kernel's target ABI, while older hosts accepted
+     * it on every private expedited command. */
     int guest_only_failed =
         !linux_host &&
-        (expect_errno("matrix-global-expedited", MEMBARRIER_CMD_GLOBAL_EXPEDITED,
-                      0, -1, EINVAL) != 0 ||
-         expect_errno("matrix-register-global-expedited",
-                      MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, 0, -1,
-                      EINVAL) != 0 ||
-         expect_errno("matrix-private-rseq",
+        (expect_errno("matrix-private-rseq",
                       MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ, 0, -1,
                       EINVAL) != 0 ||
          expect_errno("matrix-register-private-rseq",
                       MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ, 0, -1,
                       EINVAL) != 0 ||
+         expect_errno("matrix-rseq-cpu-flag",
+                      MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ,
+                      MEMBARRIER_CMD_FLAG_CPU, 0, EINVAL) != 0 ||
          expect_errno("matrix-private-cpu-flag",
                       MEMBARRIER_CMD_PRIVATE_EXPEDITED,
+                      MEMBARRIER_CMD_FLAG_CPU, 0, EINVAL) != 0 ||
+         expect_errno("matrix-sync-core-cpu-flag",
+                      MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE,
                       MEMBARRIER_CMD_FLAG_CPU, 0, EINVAL) != 0);
     if (guest_only_failed) {
         return 1;
     }
-    /* Both platforms must reject multi-bit command combinations, negative
-     * commands, and the CPU flag on commands that never accept it. */
+    /* Every platform must reject multi-bit command combinations, negative
+     * commands, and the CPU flag on the commands that never accept it. */
     if (expect_errno("matrix-combined-private-get-registrations",
                      MEMBARRIER_CMD_PRIVATE_EXPEDITED |
                          MEMBARRIER_CMD_GET_REGISTRATIONS,
@@ -328,6 +337,8 @@ static int run_errno_matrix(int linux_host)
         expect_errno("matrix-negative-command", -1, 0, -1, EINVAL) != 0 ||
         expect_errno("matrix-get-registrations-cpu-flag",
                      MEMBARRIER_CMD_GET_REGISTRATIONS,
+                     MEMBARRIER_CMD_FLAG_CPU, 0, EINVAL) != 0 ||
+        expect_errno("matrix-global-cpu-flag", MEMBARRIER_CMD_GLOBAL,
                      MEMBARRIER_CMD_FLAG_CPU, 0, EINVAL) != 0) {
         return 1;
     }
@@ -353,13 +364,38 @@ static int run_smoke(const char *self, int linux_host)
         expect_errno("unknown-command", 1 << 20, 0, -1, EINVAL) != 0) {
         return 1;
     }
-    if (!linux_host &&
-        (expect_errno("global-not-advertised", MEMBARRIER_CMD_GLOBAL, 0, -1,
-                      EINVAL) != 0 ||
-         expect_errno("rseq-not-advertised",
-                      MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ, 0, -1, EINVAL) !=
-             0)) {
+    /* The global commands are implemented, so they must be advertised and
+     * callable; the RSEQ pair is not, so it must stay outside the mask (a mask
+     * bit this kernel cannot honour would over-report). */
+    const long global_commands = MEMBARRIER_CMD_GLOBAL |
+                                 MEMBARRIER_CMD_GLOBAL_EXPEDITED |
+                                 MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED;
+    if ((query & global_commands) != global_commands) {
+        return fail_value("query-global-mask", query, global_commands);
+    }
+    if (!linux_host) {
+        const long rseq_commands = MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ |
+                                   MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_RSEQ;
+        if ((query & rseq_commands) != 0) {
+            return fail_value("query-rseq-mask", query, 0);
+        }
+    }
+    /* Both process-wide commands take no registration and no privilege, and a
+     * registered global expedited command is reported back verbatim. */
+    if (expect_success("global", MEMBARRIER_CMD_GLOBAL, 0, -1) != 0 ||
+        expect_success("global-expedited", MEMBARRIER_CMD_GLOBAL_EXPEDITED, 0,
+                       -1) != 0 ||
+        expect_success("register-global-expedited",
+                       MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED, 0, -1) != 0) {
         return 1;
+    }
+    errno = 0;
+    long global_registrations =
+        membarrier_call(MEMBARRIER_CMD_GET_REGISTRATIONS, 0, -1);
+    if (global_registrations < 0 ||
+        (global_registrations & MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED) == 0) {
+        return fail_value("get-global-registration", global_registrations,
+                          MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED);
     }
 
     if (expect_errno("private-before-registration",

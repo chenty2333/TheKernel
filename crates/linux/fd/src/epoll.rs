@@ -2,6 +2,134 @@ use alloc::vec::Vec;
 
 use crate::{EpollId, FdNumber, InterestMask, InterestMode, OfdId, ReadyMask};
 
+/// Linux `EPOLL_CTL_ADD`.
+pub const EPOLL_CTL_ADD: u32 = 1;
+/// Linux `EPOLL_CTL_DEL`.
+pub const EPOLL_CTL_DEL: u32 = 2;
+/// Linux `EPOLL_CTL_MOD`.
+pub const EPOLL_CTL_MOD: u32 = 3;
+
+/// Linux `EPOLLIN`.
+pub const EPOLLIN: u32 = 0x0000_0001;
+/// Linux `EPOLLOUT`.
+pub const EPOLLOUT: u32 = 0x0000_0004;
+/// Linux `EPOLLERR`.
+pub const EPOLLERR: u32 = 0x0000_0008;
+/// Linux `EPOLLHUP`.
+pub const EPOLLHUP: u32 = 0x0000_0010;
+/// Linux `EPOLLEXCLUSIVE`.
+pub const EPOLLEXCLUSIVE: u32 = 1 << 28;
+/// Linux `EPOLLWAKEUP`.
+pub const EPOLLWAKEUP: u32 = 1 << 29;
+/// Linux `EPOLLONESHOT`.
+pub const EPOLLONESHOT: u32 = 1 << 30;
+/// Linux `EPOLLET`.
+pub const EPOLLET: u32 = 1 << 31;
+
+/// Linux `EPOLLEXCLUSIVE_OK_BITS` (`fs/eventpoll.c`).
+///
+/// These are the only bits an `EPOLL_CTL_ADD` request may combine with
+/// `EPOLLEXCLUSIVE`; anything else, including `EPOLLONESHOT` and `EPOLLPRI`,
+/// is rejected with `-EINVAL`.
+pub const EPOLLEXCLUSIVE_OK_BITS: u32 =
+    EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLWAKEUP | EPOLLET | EPOLLEXCLUSIVE;
+
+/// Linux `epoll_ctl(2)` control operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpollControl {
+    /// `EPOLL_CTL_ADD`.
+    Add,
+    /// `EPOLL_CTL_DEL`.
+    Delete,
+    /// `EPOLL_CTL_MOD`.
+    Modify,
+    /// Any other value; Linux reaches the `switch` default and returns
+    /// `-EINVAL`.
+    Unknown,
+}
+
+impl EpollControl {
+    /// Decodes the raw `op` argument.
+    pub const fn from_raw(op: u32) -> Self {
+        match op {
+            EPOLL_CTL_ADD => Self::Add,
+            EPOLL_CTL_DEL => Self::Delete,
+            EPOLL_CTL_MOD => Self::Modify,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Linux `ep_op_has_event(op)`: every operation except `DEL` supplies an
+    /// `epoll_event`, so only `DEL` skips the copy-in and the event-mask
+    /// admission steps.
+    pub const fn carries_event(self) -> bool {
+        !matches!(self, Self::Delete)
+    }
+}
+
+/// Result of Linux's `EPOLLEXCLUSIVE` admission step in `do_epoll_ctl_file()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusiveAdmission {
+    /// The request does not carry `EPOLLEXCLUSIVE`; the ordinary path applies.
+    Absent,
+    /// Linux admits the request here. Whether the caller can honour exclusive
+    /// wake selection is a separate, lower-layer capability question.
+    Admitted,
+    /// Linux rejects the request with `-EINVAL` before any interest lookup.
+    Rejected,
+}
+
+/// Applies Linux `do_epoll_ctl_file()`'s `EPOLLEXCLUSIVE` admission rule.
+///
+/// ```text
+/// if (ep_op_has_event(op) && (epds->events & EPOLLEXCLUSIVE)) {
+///         if (op == EPOLL_CTL_MOD)
+///                 return -EINVAL;
+///         if (op == EPOLL_CTL_ADD && (is_file_epoll(tf->file) ||
+///                         (epds->events & ~EPOLLEXCLUSIVE_OK_BITS)))
+///                 return -EINVAL;
+/// }
+/// ```
+///
+/// `events` must already have had `EPOLLWAKEUP` handled the way
+/// `ep_take_care_of_epollwakeup()` handles it, because Linux strips that bit
+/// from `epds->events` in place before this test. `target_is_epoll` is
+/// Linux's `is_file_epoll(tf->file)`: exclusive wakeups may not be nested
+/// inside another eventpoll. An unknown operation is `Admitted` here because
+/// Linux's admission block matches neither `MOD` nor `ADD`; the operation
+/// switch rejects it afterwards with the same `-EINVAL`.
+pub const fn exclusive_admission(
+    control: EpollControl,
+    events: u32,
+    target_is_epoll: bool,
+) -> ExclusiveAdmission {
+    if !control.carries_event() || events & EPOLLEXCLUSIVE == 0 {
+        return ExclusiveAdmission::Absent;
+    }
+    match control {
+        EpollControl::Modify => ExclusiveAdmission::Rejected,
+        EpollControl::Add => {
+            if target_is_epoll || events & !EPOLLEXCLUSIVE_OK_BITS != 0 {
+                ExclusiveAdmission::Rejected
+            } else {
+                ExclusiveAdmission::Admitted
+            }
+        }
+        EpollControl::Delete | EpollControl::Unknown => ExclusiveAdmission::Admitted,
+    }
+}
+
+/// Linux `ep_take_care_of_epollwakeup()` for a caller without
+/// `CAP_BLOCK_SUSPEND`.
+///
+/// Linux only implements the "keep the bit" branch under `CONFIG_PM_SLEEP`;
+/// this kernel has no suspend blocker to attach, so the bit is cleared exactly
+/// like the `#else` stub and the cleared mask is what the exclusive admission
+/// rule then inspects.
+pub const fn strip_epollwakeup(events: u32) -> u32 {
+    events & !EPOLLWAKEUP
+}
+
 /// Linux epoll interest identity: the shared OFD plus descriptor used by ADD.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EpollKey {
@@ -877,6 +1005,117 @@ mod tests {
 
     fn ofd(raw: u64) -> OfdId {
         OfdId::new(raw).unwrap()
+    }
+
+    #[test]
+    fn exclusive_admission_matches_linux_do_epoll_ctl_file() {
+        use ExclusiveAdmission::{Absent, Admitted, Rejected};
+
+        // `EPOLL_CTL_ADD` admits the flag only as the sole private bit
+        // alongside `EPOLLEXCLUSIVE_OK_BITS`.
+        assert_eq!(
+            exclusive_admission(EpollControl::Add, EPOLLEXCLUSIVE, false),
+            Admitted
+        );
+        assert_eq!(
+            exclusive_admission(EpollControl::Add, EPOLLEXCLUSIVE | EPOLLIN, false),
+            Admitted
+        );
+        assert_eq!(
+            exclusive_admission(
+                EpollControl::Add,
+                EPOLLEXCLUSIVE | EPOLLIN | EPOLLET | EPOLLWAKEUP,
+                false
+            ),
+            Admitted
+        );
+        // `EPOLLONESHOT`, `EPOLLPRI`, `EPOLLRDHUP`, `EPOLLMSG`, and any
+        // unknown bit are outside `EPOLLEXCLUSIVE_OK_BITS`.
+        for extra in [
+            EPOLLONESHOT,
+            0x0000_0002,
+            0x0000_2000,
+            0x0000_0400,
+            0x0800_0000,
+            0x0000_1000,
+        ] {
+            assert_eq!(
+                exclusive_admission(EpollControl::Add, EPOLLEXCLUSIVE | extra, false),
+                Rejected,
+                "extra={extra:#x}"
+            );
+        }
+        // A nested eventpoll target cannot carry an exclusive interest.
+        assert_eq!(
+            exclusive_admission(EpollControl::Add, EPOLLEXCLUSIVE | EPOLLIN, true),
+            Rejected
+        );
+
+        // `EPOLL_CTL_MOD` may never carry the flag, and a stored exclusive
+        // interest may never be modified.
+        assert_eq!(
+            exclusive_admission(EpollControl::Modify, EPOLLEXCLUSIVE, false),
+            Rejected
+        );
+        assert_eq!(
+            exclusive_admission(EpollControl::Modify, EPOLLEXCLUSIVE | EPOLLIN, false),
+            Rejected
+        );
+
+        // `DEL` carries no event, so the admission step is skipped entirely.
+        assert_eq!(
+            exclusive_admission(EpollControl::Delete, EPOLLEXCLUSIVE, true),
+            Absent
+        );
+        assert_eq!(
+            exclusive_admission(EpollControl::Delete, u32::MAX, true),
+            Absent
+        );
+
+        // An unknown operation is admitted here and rejected by the switch.
+        assert_eq!(
+            exclusive_admission(EpollControl::Unknown, EPOLLEXCLUSIVE, true),
+            Admitted
+        );
+
+        assert_eq!(
+            exclusive_admission(EpollControl::Add, EPOLLIN | EPOLLOUT, false),
+            Absent
+        );
+        assert_eq!(exclusive_admission(EpollControl::Add, 0, false), Absent);
+    }
+
+    #[test]
+    fn epollwakeup_is_stripped_before_the_exclusive_admission_test() {
+        // Linux's `ep_take_care_of_epollwakeup()` mutates `epds->events` in
+        // place before the `EPOLLEXCLUSIVE` test, so the cleared mask is what
+        // the admission rule sees.
+        assert_eq!(strip_epollwakeup(EPOLLWAKEUP | EPOLLIN), EPOLLIN);
+        assert_eq!(
+            exclusive_admission(
+                EpollControl::Add,
+                strip_epollwakeup(EPOLLEXCLUSIVE | EPOLLWAKEUP),
+                false
+            ),
+            ExclusiveAdmission::Admitted
+        );
+        assert_eq!(
+            strip_epollwakeup(EPOLLEXCLUSIVE | EPOLLWAKEUP | EPOLLONESHOT),
+            EPOLLEXCLUSIVE | EPOLLONESHOT
+        );
+    }
+
+    #[test]
+    fn control_decoding_keeps_del_as_the_only_eventless_operation() {
+        assert_eq!(EpollControl::from_raw(1), EpollControl::Add);
+        assert_eq!(EpollControl::from_raw(2), EpollControl::Delete);
+        assert_eq!(EpollControl::from_raw(3), EpollControl::Modify);
+        assert_eq!(EpollControl::from_raw(0), EpollControl::Unknown);
+        assert_eq!(EpollControl::from_raw(u32::MAX), EpollControl::Unknown);
+        assert!(EpollControl::Add.carries_event());
+        assert!(EpollControl::Modify.carries_event());
+        assert!(EpollControl::Unknown.carries_event());
+        assert!(!EpollControl::Delete.carries_event());
     }
 
     fn interest(

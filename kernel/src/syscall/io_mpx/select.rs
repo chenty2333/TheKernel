@@ -258,7 +258,7 @@ fn select_timeval_duration(value: timeval) -> AxResult<Duration> {
     ))
 }
 
-fn finish_timeout(
+pub(super) fn finish_timeout(
     caller: &UserMemoryCapability,
     address: usize,
     timeout: Option<Duration>,

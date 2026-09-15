@@ -16,7 +16,8 @@ use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_write
 
 use super::sync::restart_futex_wait;
 use crate::{
-    mm::{map_usercopy_error, shmem_resident_pages, system_memory_stats},
+    mm::{map_usercopy_error, shmem_resident_pages, system_memory_stats, with_user_memory},
+    syscall::{restart_nanosleep, restart_poll},
     task::{
         AsThread, Kgid, ProcStateHint, RestartBlock, UTS_FIELD_LEN, has_pending_syscall_signal,
         live_thread_count, load_average_sample_now, load_average_sysinfo, ns_capable,
@@ -848,10 +849,16 @@ pub fn sys_restart_syscall(uctx: &UserContext) -> AxResult<isize> {
     let curr = current();
     let thr = curr.as_thread();
     let Some(block) = thr.begin_restart_syscall(uctx) else {
+        // Linux `do_no_restart_syscall()`: with no block published by the
+        // interrupted syscall, `restart_syscall` is just `-EINTR`.
         return Err(AxError::Interrupted);
     };
     match block {
         RestartBlock::FutexWait(block) => restart_futex_wait(thr.proc_data.aspace(), block),
+        RestartBlock::Nanosleep(block) => with_user_memory(thr.proc_data.aspace(), |memory| {
+            restart_nanosleep(memory, block)
+        }),
+        RestartBlock::Poll(block) => restart_poll(thr.proc_data.aspace(), block),
     }
 }
 

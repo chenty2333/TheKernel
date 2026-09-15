@@ -102,6 +102,20 @@ fn restart_class_for_syscall(sysno: Sysno, uctx: &UserContext) -> Option<Restart
         Sysno::futex_waitv => Some(RestartClass::Sys),
         #[cfg(target_arch = "x86_64")]
         Sysno::futex_wait => Some(RestartClass::Sys),
+        // `nanosleep`/relative `clock_nanosleep` report
+        // `-ERESTART_RESTARTBLOCK` (Linux `do_nanosleep()`), and
+        // `clock_nanosleep(TIMER_ABSTIME)` reports `-ERESTARTNOHAND`. Both are
+        // restartable only without a handler: `handle_signal()` on x86_64 maps
+        // `-ERESTARTNOHAND` and `-ERESTART_RESTARTBLOCK` to `-EINTR` even when
+        // the handler set `SA_RESTART`.
+        Sysno::nanosleep | Sysno::clock_nanosleep => Some(RestartClass::NoHand),
+        // `poll` reports `-ERESTARTNOHAND` from `do_sys_poll()` and `sys_poll()`
+        // then publishes `restart_block->poll` for `do_restart_poll()`.
+        Sysno::poll => Some(RestartClass::NoHand),
+        // `ppoll`, `select`, and `pselect6` report `-ERESTARTNOHAND` with no
+        // restart block; their remaining-time write-back is what makes the
+        // no-handler replay resume with the shortened timeout.
+        Sysno::ppoll | Sysno::select | Sysno::pselect6 => Some(RestartClass::NoHand),
         _ => None,
     }
 }

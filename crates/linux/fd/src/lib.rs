@@ -51,9 +51,11 @@ pub use types::{
 
 #[cfg(feature = "alloc")]
 pub use epoll::{
-    DeliveryCommitError, DeliveryOutcome, DeliveryPreparation, DeliveryToken, EpollCore,
-    EpollError, EpollInterest, EpollKey, EpollPublishError, EpollToken, NotifyOutcome, ReadyEvent,
-    RescanProgress, RescanToken,
+    DeliveryCommitError, DeliveryOutcome, DeliveryPreparation, DeliveryToken, EPOLL_CTL_ADD,
+    EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLEXCLUSIVE, EPOLLEXCLUSIVE_OK_BITS, EPOLLIN, EPOLLONESHOT,
+    EPOLLOUT, EPOLLWAKEUP, EpollControl, EpollCore, EpollError, EpollInterest, EpollKey,
+    EpollPublishError, EpollToken, ExclusiveAdmission, NotifyOutcome, ReadyEvent, RescanProgress,
+    RescanToken, exclusive_admission, strip_epollwakeup,
 };
 #[cfg(feature = "alloc")]
 pub use graph::{EpollGraph, EpollGraphLimits, GraphEdgeToken, GraphError, GraphNodeToken};

@@ -9,8 +9,11 @@ use axhal::uspace::UserContext;
 use axpoll::IoEvents;
 use bitflags::bitflags;
 use linux_raw_sys::general::{
-    EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLET, EPOLLONESHOT, epoll_event,
+    EPOLL_CLOEXEC, EPOLLET, EPOLLEXCLUSIVE as RAW_EPOLLEXCLUSIVE, EPOLLONESHOT, epoll_event,
     timespec,
+};
+use tk_linux_fd::{
+    EPOLLEXCLUSIVE, EpollControl, ExclusiveAdmission, exclusive_admission, strip_epollwakeup,
 };
 use tk_linux_signal::SignalSet;
 use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
@@ -39,6 +42,10 @@ const _: () = {
     assert!(size_of::<timespec>() == 16);
     assert!(offset_of!(timespec, tv_sec) == 0);
     assert!(offset_of!(timespec, tv_nsec) == 8);
+    // The exclusive-admission rule is a `tk-linux-fd` policy contract, so it
+    // owns its own copy of the flag values; pin them to the generated ABI
+    // constants used by the rest of this file.
+    assert!(EPOLLEXCLUSIVE == RAW_EPOLLEXCLUSIVE);
 };
 
 bitflags! {
@@ -64,6 +71,44 @@ fn check_epoll_target(path_only: bool) -> AxResult<()> {
     } else {
         Ok(())
     }
+}
+
+/// One fully parsed `epoll_ctl` event argument.
+struct EpollCtlRequest {
+    /// Interest and user data in the kernel's readiness domain.
+    event: EpollEvent,
+    /// `EPOLLET` / `EPOLLONESHOT` trigger flags.
+    flags: EpollFlags,
+    /// The raw mask after Linux's `ep_take_care_of_epollwakeup()` strip. The
+    /// `EPOLLEXCLUSIVE` admission rule inspects this value, so it must keep
+    /// bits the readiness translation rejects.
+    raw_events: u32,
+}
+
+/// Parses the `epoll_event` argument the way Linux `SYSCALL_DEFINE4(epoll_ctl)`
+/// and `do_epoll_ctl_file()` do: copy in, strip `EPOLLWAKEUP`, then translate.
+///
+/// `EPOLLEXCLUSIVE` is a private control bit rather than a readiness interest,
+/// so it never contributes an interest bit here; the caller decides its fate
+/// through [`exclusive_admission`] before this parser runs for an admitted
+/// request.
+fn parse_epoll_ctl_event<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    event: *const epoll_event,
+) -> AxResult<EpollCtlRequest> {
+    let raw = read_epoll_event(memory, event)?;
+    let raw_events = strip_epollwakeup(raw.events);
+    let flag_bits = raw_events & (EPOLLET | EPOLLONESHOT);
+    let events = linux_epoll_events(raw_events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE))?;
+    let flags = EpollFlags::from_bits(flag_bits).ok_or(AxError::InvalidInput)?;
+    Ok(EpollCtlRequest {
+        event: EpollEvent {
+            events,
+            user_data: raw.data,
+        },
+        flags,
+        raw_events,
+    })
 }
 
 fn epoll_timeout(timeout_ms: i32) -> Option<Duration> {
@@ -114,34 +159,62 @@ pub fn sys_epoll_ctl<M: UserMemory + ?Sized>(
     // control operation; ADD, MOD, DEL, and even an unknown op report EBADF.
     check_epoll_target(target.is_path_only())?;
 
-    let mut parse_event = || -> AxResult<(EpollEvent, EpollFlags)> {
-        let event = read_epoll_event(memory, event)?;
-        let flag_bits = event.events & (EPOLLET | EPOLLONESHOT);
-        let events = linux_epoll_events(event.events & !flag_bits)?;
-        let flags = EpollFlags::from_bits(flag_bits).ok_or(AxError::InvalidInput)?;
-        Ok((
-            EpollEvent {
-                events,
-                user_data: event.data,
-            },
-            flags,
-        ))
+    // Linux `SYSCALL_DEFINE4(epoll_ctl)` copies the event for every operation
+    // except DEL (`ep_op_has_event()`), and `do_epoll_ctl_file()` then applies
+    // `ep_take_care_of_epollwakeup()` and the EPOLLEXCLUSIVE admission rule
+    // *before* the operation switch and any interest lookup. Keeping that
+    // order keeps EFAULT, EINVAL, EEXIST, and ENOENT precedence intact.
+    let control = EpollControl::from_raw(op);
+    let request = if control.carries_event() {
+        Some(parse_epoll_ctl_event(memory, event)?)
+    } else {
+        None
     };
-    match op {
-        EPOLL_CTL_ADD => {
-            let (mut event, flags) = parse_event()?;
+    if let Some(request) = &request {
+        // `ep_take_care_of_epollwakeup()` clears the bit in place. With no
+        // suspend blocker to attach, the cleared mask is also what this kernel
+        // implements, so the strip is unconditional.
+        let admitted = exclusive_admission(
+            control,
+            strip_epollwakeup(request.raw_events),
+            target.inner.downcast_ref::<Epoll>().is_some(),
+        );
+        match admitted {
+            ExclusiveAdmission::Rejected => return Err(AxError::InvalidInput),
+            // Linux accepts the request here. This kernel's readiness adapter
+            // registers a plain waker per interest and `PollSet::wake()` drains
+            // every registration on the source, so there is no
+            // WQ_FLAG_EXCLUSIVE equivalent and no per-event round in which
+            // `ep_poll_callback()` could hand the single exclusive slot to one
+            // waiter (`__wake_up_common()` with `nr_exclusive == 1`). Accepting
+            // the flag would silently wake every waiter: a thundering herd the
+            // caller explicitly asked to avoid. Report it the way Linux reports
+            // a target that cannot participate in the epoll wakeup contract,
+            // `do_epoll_ctl_file()`'s `!file_can_poll(tf->file) -> -EPERM`.
+            ExclusiveAdmission::Admitted => return Err(AxError::OperationNotPermitted),
+            ExclusiveAdmission::Absent => {}
+        }
+    }
+
+    match control {
+        EpollControl::Add => {
+            let EpollCtlRequest {
+                mut event, flags, ..
+            } = request.expect("ADD carries an event");
             event.events |= IoEvents::ALWAYS;
             epoll.add(fd, event, flags)?;
         }
-        EPOLL_CTL_MOD => {
-            let (mut event, flags) = parse_event()?;
+        EpollControl::Modify => {
+            let EpollCtlRequest {
+                mut event, flags, ..
+            } = request.expect("MOD carries an event");
             event.events |= IoEvents::ALWAYS;
             epoll.modify(fd, event, flags)?;
         }
-        EPOLL_CTL_DEL => {
+        EpollControl::Delete => {
             epoll.delete(fd)?;
         }
-        _ => return Err(AxError::InvalidInput),
+        EpollControl::Unknown => return Err(AxError::InvalidInput),
     }
     Ok(0)
 }
@@ -311,7 +384,99 @@ pub fn sys_epoll_pwait2<M: UserMemory + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    use core::mem::MaybeUninit;
+
+    use linux_raw_sys::general::{EPOLLIN, EPOLLMSG, EPOLLWAKEUP};
+    use tk_linux_usercopy::{UserCopyError, VmResult};
+
     use super::*;
+
+    /// Byte-addressed user memory whose first 12 bytes hold one
+    /// `epoll_event`.
+    struct EventMemory {
+        bytes: [u8; size_of::<epoll_event>()],
+    }
+
+    impl EventMemory {
+        fn new(events: u32, data: u64) -> Self {
+            let mut bytes = [0u8; size_of::<epoll_event>()];
+            bytes[..4].copy_from_slice(&events.to_ne_bytes());
+            bytes[4..].copy_from_slice(&data.to_ne_bytes());
+            Self { bytes }
+        }
+    }
+
+    // SAFETY: EventMemory bounds-checks the opaque user address and
+    // initializes every destination byte before returning a successful read.
+    unsafe impl UserMemory for EventMemory {
+        fn read(&mut self, start: usize, dst: &mut [MaybeUninit<u8>]) -> VmResult {
+            let end = start
+                .checked_add(dst.len())
+                .ok_or(UserCopyError::BadAddress)?;
+            let source = self
+                .bytes
+                .get(start..end)
+                .ok_or(UserCopyError::BadAddress)?;
+            for (output, input) in dst.iter_mut().zip(source) {
+                output.write(*input);
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, start: usize, src: &[u8]) -> VmResult {
+            let end = start
+                .checked_add(src.len())
+                .ok_or(UserCopyError::BadAddress)?;
+            let destination = self
+                .bytes
+                .get_mut(start..end)
+                .ok_or(UserCopyError::BadAddress)?;
+            destination.copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    fn parse(events: u32) -> AxResult<EpollCtlRequest> {
+        let mut memory = EventMemory::new(events, 7);
+        let mut context = UserMemoryContext::new(&mut memory);
+        parse_epoll_ctl_event(&mut context, core::ptr::null())
+    }
+
+    #[test]
+    fn epollmsg_is_stored_in_the_interest_mask_like_linux() {
+        // Linux never validates the caller's mask: `epi->event.events` keeps
+        // `EPOLLMSG` verbatim and only ever intersects it with what `->poll()`
+        // reports, so a target that never raises `POLLMSG` simply never sees
+        // the bit again.
+        let request = parse(EPOLLMSG).unwrap();
+        assert_eq!(request.event.events, IoEvents::MESSAGE);
+        assert_eq!(request.raw_events, EPOLLMSG);
+        assert_eq!(request.event.user_data, 7);
+    }
+
+    #[test]
+    fn epollwakeup_is_accepted_and_stripped_from_the_stored_mask() {
+        let request = parse(EPOLLWAKEUP).unwrap();
+        assert_eq!(request.event.events, IoEvents::empty());
+        assert_eq!(request.raw_events, 0);
+        let request = parse(EPOLLWAKEUP | EPOLLIN).unwrap();
+        assert_eq!(request.event.events, IoEvents::READABLE);
+        assert_eq!(request.raw_events, EPOLLIN);
+    }
+
+    #[test]
+    fn trigger_flags_and_the_exclusive_control_bit_are_not_interests() {
+        let request = parse(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLIN).unwrap();
+        assert_eq!(request.event.events, IoEvents::READABLE);
+        assert!(request.flags.contains(EpollFlags::EDGE_TRIGGER));
+        assert!(request.flags.contains(EpollFlags::ONESHOT));
+        assert_eq!(request.raw_events, EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE | EPOLLIN);
+    }
+
+    #[test]
+    fn unknown_event_bits_remain_rejected() {
+        assert!(matches!(parse(0x0000_1000), Err(AxError::InvalidInput)));
+    }
 
     #[test]
     fn epoll_copyout_address_arithmetic_never_wraps() {
