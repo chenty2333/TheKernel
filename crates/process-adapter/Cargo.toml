@@ -4,7 +4,7 @@ rust-version.workspace = true
 name = "tk-linux-process-adapter"
 version = "0.1.0"
 edition = "2024"
-publish.workspace = true
+publish = ["crates-io"]
 description = "TheKernel zombie payload and type aliases over the explicit Linux process domain"
 license = "Apache-2.0"
 

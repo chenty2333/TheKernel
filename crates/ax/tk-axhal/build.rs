@@ -1,6 +1,9 @@
 use std::{io::Result, path::PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-changed=linker.lds.S");
+    println!("cargo:rerun-if-env-changed=DWARF");
+    println!("cargo:rerun-if-env-changed=AX_LINKER_SCRIPT_OUTPUT");
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     assert_eq!(arch, "x86_64", "axhal supports x86_64 targets only");
     let platform = axconfig::PLATFORM;
@@ -38,21 +41,9 @@ fn gen_linker_script(platform: &str) -> Result<()> {
         },
     );
 
-    println!("cargo:rerun-if-env-changed=AX_LINKER_SCRIPT_OUTPUT");
     let out_path = match std::env::var_os("AX_LINKER_SCRIPT_OUTPUT") {
         Some(path) => PathBuf::from(path),
-        None => {
-            // Cargo has used both `build/axhal-<hash>/out` and
-            // `build/axhal/<hash>/out` layouts. Find the profile directory by
-            // name instead of assuming a fixed number of parent components.
-            let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-            let profile = std::env::var_os("PROFILE").unwrap();
-            out_dir
-                .ancestors()
-                .find(|path| path.file_name() == Some(profile.as_ref()))
-                .expect("OUT_DIR must be nested below Cargo's profile directory")
-                .join(fname)
-        }
+        None => PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join(fname),
     };
     std::fs::write(out_path, ld_content)?;
     Ok(())

@@ -10,7 +10,7 @@
 
 [package]
 repository.workspace = true
-publish.workspace = true
+publish = ["crates-io"]
 rust-version.workspace = true
 edition = "2024"
 name = "tk-axfs-ng"
@@ -172,6 +172,7 @@ features = ["virtio-blk"]
 [dev-dependencies.axdriver_block]
 package = "tk-axdriver-block"
 path = "../tk-axdriver-block"
+version = "0.1.0"
 features = ["ramdisk"]
 
 # Host tests link axtask (via axdriver) with percpu's naive thread-local

@@ -1,6 +1,6 @@
 # TheKernel Linux process adapter
 
-This unpublished adapter binds TheKernel's durable wait/accounting/security
+This adapter binds TheKernel's durable wait/accounting/security
 payload to the explicit-domain `tk-linux-process` 0.1.0 core. It
 deliberately owns no hidden global process registry or zombie side table. The
 kernel creates one `ProcessDomain` and chooses the credential parameter used
@@ -53,3 +53,12 @@ The kernel integration should keep exactly one preparation in each unpublished
 `ProcessData`, complete it only after the final thread and accounting state are
 known, and pass the returned `Arc` directly to `ProcessDomain::exit()` even for
 an immediately reaped process.
+
+## TheKernel integration
+
+This package targets x86_64 and uses `nightly-2026-08-23`
+(`rustc 1.100.0-nightly`, `c54751567`, 2026-08-22); the manifest
+Rust version does not promise stable-compiler support. Kernel consumers
+should check against `x86_64-unknown-none`. Platform initialization and any
+required per-CPU/linker symbols belong to the final kernel image; successful
+library compilation alone does not validate that image integration.

@@ -3,7 +3,7 @@
 
 Maintained scheduler algorithms in a unified `no_std` interface. This package
 is a fork of upstream `axsched`; its package name is independent while the Rust
-library name remains `axsched`. It is currently unpublished (`publish = false`).
+library name remains `axsched`.
 
 Currently supported algorithms:
 

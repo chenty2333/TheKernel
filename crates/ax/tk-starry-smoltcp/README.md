@@ -1,7 +1,7 @@
 # smoltcp
 
-These links describe the upstream project, not a registry release of the
-unpublished `tk-starry-smoltcp` workspace fork.
+The badges below describe upstream smoltcp. This maintained fork is packaged
+as `tk-starry-smoltcp`; its Rust library name remains `smoltcp`.
 
 [![docs.rs](https://docs.rs/smoltcp/badge.svg)](https://docs.rs/smoltcp)
 [![crates.io](https://img.shields.io/crates/v/smoltcp.svg)](https://crates.io/crates/smoltcp)
@@ -151,7 +151,7 @@ To use the _smoltcp_ library in your project, add the following to `Cargo.toml`:
 
 ```toml
 [dependencies]
-smoltcp = "0.10.0"
+smoltcp = { package = "tk-starry-smoltcp", version = "0.1" }
 ```
 
 The default configuration assumes a hosted environment, for ease of evaluation.
@@ -159,7 +159,7 @@ You probably want to disable default features and configure them one by one:
 
 ```toml
 [dependencies]
-smoltcp = { version = "0.10.0", default-features = false, features = ["log"] }
+smoltcp = { package = "tk-starry-smoltcp", version = "0.1", default-features = false, features = ["log"] }
 ```
 
 ## Feature flags

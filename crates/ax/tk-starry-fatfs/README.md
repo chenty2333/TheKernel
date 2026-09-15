@@ -27,7 +27,7 @@ Usage
 Add this to your `Cargo.toml`:
 
     [dependencies]
-    fatfs = "0.4"
+    fatfs = { package = "tk-starry-fatfs", version = "0.1" }
 
 You can start using the `fatfs` library now:
 
@@ -51,7 +51,7 @@ no_std usage
 Add this to your `Cargo.toml`:
 
     [dependencies]
-    fatfs = { version = "0.4", default-features = false }
+    fatfs = { package = "tk-starry-fatfs", version = "0.1", default-features = false }
 
 Additional features:
 

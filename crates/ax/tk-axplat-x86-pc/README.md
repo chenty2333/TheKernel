@@ -98,3 +98,12 @@ Some symbols and sections are required to be defined in the linker script, liste
 - `.percpu` section and related symbols: CPU-local data managed by the [percpu](https://crates.io/crates/percpu) crate.
 
 [hello-kernel](https://github.com/arceos-org/axplat_crates/tree/main/examples/hello-kernel) is a complete example of a minimal kernel implemented using [axplat](https://github.com/arceos-org/axplat_crates/tree/main/axplat) and related platform packages.
+
+## TheKernel integration
+
+This package targets x86_64 and uses `nightly-2026-08-23`
+(`rustc 1.100.0-nightly`, `c54751567`, 2026-08-22); the manifest
+Rust version does not promise stable-compiler support. Kernel consumers
+should check against `x86_64-unknown-none`. Platform initialization and any
+required per-CPU/linker symbols belong to the final kernel image; successful
+library compilation alone does not validate that image integration.

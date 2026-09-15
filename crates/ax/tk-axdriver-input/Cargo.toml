@@ -1,6 +1,6 @@
 [package]
 repository.workspace = true
-publish.workspace = true
+publish = ["crates-io"]
 rust-version.workspace = true
 name = "tk-axdriver-input"
 version = "0.1.0"

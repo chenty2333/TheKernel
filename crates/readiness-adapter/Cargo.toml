@@ -4,7 +4,7 @@ rust-version.workspace = true
 name = "tk-readiness-adapter"
 version = "0.1.0"
 edition = "2024"
-publish.workspace = true
+publish = ["crates-io"]
 description = "TheKernel object-readiness adapter over bounded ax and Linux FD contracts"
 license = "Apache-2.0"
 

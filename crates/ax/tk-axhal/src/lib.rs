@@ -716,14 +716,14 @@ pub use axplat::init::{init_early_secondary, init_later_secondary};
 /// they will keep using a hardcoded address on machines whose firmware
 /// disagrees with it.
 ///
-/// Hosted builds link no platform crate, so they report the configured
-/// fallback and nothing else.  That is deliberate: a host test must not be
-/// able to observe a "discovery" that never happened.
+/// Hosted builds and builds without `defplat` have no active PCI platform,
+/// so they report the configured fallback and nothing else. A host test must
+/// not observe a "discovery" that never happened.
 pub mod pci {
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", feature = "defplat"))]
     pub use axplat_x86_pc::pci::*;
 
-    #[cfg(not(target_os = "none"))]
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
     mod host {
         /// Physical base address of the configured PCI ECAM window.
         pub fn ecam_base() -> usize {
@@ -746,7 +746,7 @@ pub mod pci {
         }
     }
 
-    #[cfg(not(target_os = "none"))]
+    #[cfg(not(all(target_os = "none", feature = "defplat")))]
     pub use host::*;
 }
 

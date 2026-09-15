@@ -1,7 +1,7 @@
 # tk-axtask
 
 `tk-axtask` is the maintained generic task/run-queue mechanism used by
-TheKernel. This unpublished workspace package retains the Rust library name
+TheKernel. This workspace package retains the Rust library name
 `axtask`; workspace consumers use:
 
 ```toml
@@ -137,3 +137,12 @@ The successful commit clears its task-level publication claim under the same
 target scheduler lock after linking and before the task becomes selectable;
 this prevents a newly running task from observing its own stale reservation
 when it immediately blocks.
+
+## TheKernel integration
+
+This package targets x86_64 and uses `nightly-2026-08-23`
+(`rustc 1.100.0-nightly`, `c54751567`, 2026-08-22); the manifest
+Rust version does not promise stable-compiler support. Kernel consumers
+should check against `x86_64-unknown-none`. Platform initialization and any
+required per-CPU/linker symbols belong to the final kernel image; successful
+library compilation alone does not validate that image integration.

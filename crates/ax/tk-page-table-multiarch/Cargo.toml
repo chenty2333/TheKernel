@@ -9,7 +9,7 @@
 # will likely look very different (and much more reasonable).
 
 [package]
-publish.workspace = true
+publish = ["crates-io"]
 edition = "2024"
 rust-version.workspace = true
 name = "tk-page-table-multiarch"

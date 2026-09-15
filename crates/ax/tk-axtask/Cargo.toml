@@ -1,5 +1,5 @@
 [package]
-publish.workspace = true
+publish = ["crates-io"]
 rust-version.workspace = true
 name = "tk-axtask"
 version = "0.1.0"

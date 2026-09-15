@@ -232,6 +232,10 @@ crate boundary does not imply a separately released public product.
 Release-ready components explicitly permit only crates.io after package and
 independent-consumer validation. Other packages retain the private default;
 publication follows dependency order rather than the workspace directory order.
+The `thekernel` image and `tk-kernel` integration remain internal: their boot,
+linking and integration-test setup is supplied by this repository, not by a
+standalone library consumer. Platform libraries target x86_64 bare metal and
+require the final image to supply their documented platform interfaces.
 Repository metadata points here; upstream licenses and attribution remain intact.
 
 Keep integration in `kernel/` and adapters, rather than making lower layers
