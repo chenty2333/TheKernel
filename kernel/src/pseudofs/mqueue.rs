@@ -20,8 +20,9 @@ use spin::Mutex;
 use crate::{
     pseudofs::{ChildNames, NodeOpsMux, SimpleDirOps, SimpleFs, SimpleFsNode, try_boxed_names},
     syscall::ipc::{
-        IpcNamespace, MqReadiness, PosixMqueue, mqueuefs_lookup, mqueuefs_metadata, mqueuefs_names,
-        mqueuefs_poll, mqueuefs_read, mqueuefs_readiness, mqueuefs_unlink, mqueuefs_write,
+        IpcNamespace, MQUEUE_DIR_MODE, MqReadiness, PosixMqueue, mqueuefs_lookup,
+        mqueuefs_metadata, mqueuefs_names, mqueuefs_poll, mqueuefs_read, mqueuefs_readiness,
+        mqueuefs_unlink, mqueuefs_write,
     },
 };
 
@@ -58,7 +59,7 @@ impl MqueueDir {
                 node: SimpleFsNode::new(
                     fs.clone(),
                     NodeType::Directory,
-                    NodePermission::from_bits_truncate(0o1777),
+                    NodePermission::from_bits_truncate(MQUEUE_DIR_MODE),
                 ),
                 fs: fs.clone(),
                 namespace: namespace.clone(),
