@@ -19,7 +19,7 @@ use kspin::SpinNoIrq;
 use linux_raw_sys::general::{EPOLLET, EPOLLONESHOT};
 use ouroboros::self_referencing;
 use spin::Once;
-use thekernel_linux_fd::{
+use tk_linux_fd::{
     DeliveryOutcome, EpollCore, EpollError, EpollGraph, EpollGraphId, EpollGraphLimits, EpollId,
     EpollInterest as LinuxEpollInterest, EpollKey, EpollToken, FdNumber, GraphEdgeToken,
     GraphError, GraphNodeToken, InterestMask, InterestMode, NotifyOutcome, ReadyEvent, ReadyMask,
@@ -1419,7 +1419,7 @@ mod tests {
     fn token(core: &mut EpollCore<u64, ()>, fd: u32) -> EpollToken {
         core.add(LinuxEpollInterest::new(
             EpollKey {
-                ofd: thekernel_linux_fd::OfdId::new(fd as u64 + 1).unwrap(),
+                ofd: tk_linux_fd::OfdId::new(fd as u64 + 1).unwrap(),
                 fd: FdNumber::new(fd),
             },
             InterestMask::IN,

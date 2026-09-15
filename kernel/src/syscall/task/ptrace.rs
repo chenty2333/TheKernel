@@ -3,9 +3,9 @@ use axtask::{
     TaskState, current, replace_inactive_task_user_cet_state,
     snapshot_inactive_task_user_cet_state, yield_now,
 };
-use thekernel_linux_arch_x86_64::{ARCH_SHSTK_UNLOCK, NT_X86_SHSTK, X86ShstkRegset};
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_signal::{SignalInfo, Signo};
+use tk_linux_arch_x86_64::{ARCH_SHSTK_UNLOCK, NT_X86_SHSTK, X86ShstkRegset};
+use tk_linux_process_adapter::Pid;
+use tk_linux_signal::{SignalInfo, Signo};
 
 use crate::{
     mm::{IoVec, UserMemoryCapability, map_usercopy_error},

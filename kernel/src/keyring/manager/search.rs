@@ -3,7 +3,7 @@
 
 use core::cell::Cell;
 
-use thekernel_linux_keyring::{
+use tk_linux_keyring::{
     BfsRequest as LinuxBfsRequest, KeyError as LinuxKeyError, KeyId as LinuxKeyId,
     TraversalNode as LinuxTraversalNode, bfs as linux_bfs,
 };

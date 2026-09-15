@@ -268,7 +268,7 @@ fn security_test_dac(uid: u32, gid: u32) -> DacCredentialView {
     DacCredentialView::new(
         Kuid::from_raw(uid).unwrap(),
         Kgid::from_raw(gid).unwrap(),
-        thekernel_linux_cred::GroupInfo::try_new(Vec::new()).unwrap(),
+        tk_linux_cred::GroupInfo::try_new(Vec::new()).unwrap(),
         [0; CAPABILITY_WORDS],
         true,
     )
@@ -5354,8 +5354,8 @@ fn bare_packet_accept_context_is_typed_and_policy_denial_precedes_no_accept() {
     let actor = Cred::try_root_with_registry(registry, user_namespace.clone()).unwrap();
     let net_namespace = NetworkNamespace::try_new_loopback_only(user_namespace).unwrap();
     let packet = PacketSocket::try_new(
-        thekernel_linux_packet::PacketSocketType::Raw,
-        thekernel_linux_packet::ProtocolSelector::Disabled,
+        tk_linux_packet::PacketSocketType::Raw,
+        tk_linux_packet::ProtocolSelector::Disabled,
         net_namespace.clone(),
     )
     .unwrap();
@@ -5397,8 +5397,8 @@ fn invalid_packet_addresses_are_copied_into_context_before_policy_denial() {
     let actor = Cred::try_root_with_registry(registry, user_namespace.clone()).unwrap();
     let net_namespace = NetworkNamespace::try_new_loopback_only(user_namespace).unwrap();
     let packet = PacketSocket::try_new(
-        thekernel_linux_packet::PacketSocketType::Raw,
-        thekernel_linux_packet::ProtocolSelector::Disabled,
+        tk_linux_packet::PacketSocketType::Raw,
+        tk_linux_packet::ProtocolSelector::Disabled,
         net_namespace,
     )
     .unwrap();
@@ -6137,7 +6137,7 @@ fn setid_planner_honors_typed_capability_hook_denial_without_publication() {
     CRED_STATE_CAPABLE_DENY_KEY.store(2, Ordering::SeqCst);
     let error = prepare_user_id_update(
         &slot,
-        thekernel_linux_cred::UserIdTransitionInput::setuid(Kuid::from_raw(1000).unwrap()),
+        tk_linux_cred::UserIdTransitionInput::setuid(Kuid::from_raw(1000).unwrap()),
     )
     .err()
     .unwrap();
@@ -6949,7 +6949,7 @@ fn ordinary_mutation_reports_every_changed_credential_family() {
 
     let mut update = slot.prepare();
     update.builder.ids.ruid = Kuid::from_raw(1000).unwrap();
-    update.builder.groups = thekernel_linux_cred::GroupInfo::try_new(vec![
+    update.builder.groups = tk_linux_cred::GroupInfo::try_new(vec![
         Kgid::from_raw(100).unwrap(),
         Kgid::from_raw(200).unwrap(),
         Kgid::from_raw(200).unwrap(),
@@ -6964,7 +6964,7 @@ fn ordinary_mutation_reports_every_changed_credential_family() {
         inheritable,
         caps.bounding(),
         caps.ambient(),
-        caps.securebits() | thekernel_linux_cred::SECBIT_KEEP_CAPS,
+        caps.securebits() | tk_linux_cred::SECBIT_KEEP_CAPS,
     );
     update.builder.no_new_privs = true;
 

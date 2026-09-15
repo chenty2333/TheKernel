@@ -6,8 +6,8 @@ use axhal::uspace::UserContext;
 use axsync::Mutex;
 use linux_raw_sys::general::AT_FDCWD;
 use syscalls::Sysno;
-use thekernel_linux_signal::SignalSet;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+use tk_linux_signal::SignalSet;
+use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use super::*;
 use crate::{

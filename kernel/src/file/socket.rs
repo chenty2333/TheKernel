@@ -517,8 +517,8 @@ mod tests {
         let network = Socket::new(SocketInner::Unix(unix), net_ns.clone());
         let netlink = NetlinkSocket::try_new(0, net_ns.clone()).unwrap();
         let packet = PacketSocket::try_new(
-            thekernel_linux_packet::PacketSocketType::Raw,
-            thekernel_linux_packet::ProtocolSelector::Disabled,
+            tk_linux_packet::PacketSocketType::Raw,
+            tk_linux_packet::ProtocolSelector::Disabled,
             net_ns,
         )
         .unwrap();

@@ -199,7 +199,7 @@ have an 8 GiB memory limit with no additional swap allowance.
 ## Repository layout
 
 - `kernel/`: Linux-compatible kernel and syscall integration.
-- `crates/ax/`: reusable mechanism crates.
+- `crates/ax/`: mechanism and platform crates.
 - `crates/linux/`: reusable Linux ABI crates.
 - Other `crates/` directories: maintained adapters and reusable components.
 - `config/`: x86_64 product configuration and GRUB configuration.
@@ -213,6 +213,28 @@ all declared local dependency edges, including optional and test dependencies:
 `linux_abi` uses Linux ABI and mechanism crates; `integration` may use all layers.
 Standalone algorithms, ABI types, and driver interfaces remain mechanisms;
 hardware access and the AX runtime belong to the platform layer.
+
+## Workspace compiler and packages
+
+All components inherit the root `rust-toolchain.toml`: `nightly-2026-08-23`,
+which provides `rustc 1.100.0-nightly (c54751567 2026-08-22)`.
+The inherited `rust-version = "1.100"` is Cargo's numeric compiler floor,
+not a claim that these nightly-dependent components support stable Rust.
+Do not add component-local toolchain overrides or separate MSRV matrices.
+
+Component package names use `tk-` (for example `tk-axcbpf` and
+`tk-linux-vfs`); the top-level product remains `thekernel`. Existing short
+library names such as `axcbpf` are intentional, not legacy package aliases.
+All workspace packages currently inherit `publish = false`: being a crate
+boundary does not imply being a separately released public product.
+`tk-axcbpf` is the initial standalone packaging candidate; publication and
+registry names must be decided explicitly before enabling uploads.
+Repository metadata points here; upstream licenses and attribution remain intact.
+
+Keep integration in `kernel/` and adapters, rather than making lower layers
+aware of Linux objects or product runtime policy. Large integration test modules
+live in sibling test files; splitting source files alone does not justify a new
+crate. Use the dependency-layer CI gate when changing these boundaries.
 
 ## License
 

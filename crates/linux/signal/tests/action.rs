@@ -1,7 +1,7 @@
-use thekernel_linux_signal::{
+use tk_linux_signal::{
     RawSignalAction, SignalAction, SignalActionFlags, SignalDisposition, SignalSet, Signo,
 };
-use thekernel_linux_usercopy::UserMemoryContext;
+use tk_linux_usercopy::UserMemoryContext;
 
 mod common;
 use common::{initial_sp, memory_provider};

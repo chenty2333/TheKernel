@@ -12,7 +12,7 @@ use linux_raw_sys::{
     if_packet::sockaddr_ll,
     net::{AF_PACKET, sockaddr, socklen_t},
 };
-use thekernel_linux_packet::{PacketBindRequest, PacketError, PacketSendAddress, SockAddrLl};
+use tk_linux_packet::{PacketBindRequest, PacketError, PacketSendAddress, SockAddrLl};
 
 use crate::{
     file::{PACKET_SOCKADDR_STORAGE_LEN, PacketSockaddrSnapshot, packet_socket::packet_error},

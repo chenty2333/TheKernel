@@ -12,7 +12,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axnet::vsock::VsockAddr;
 use axnet::{SocketAddrEx, unix::UnixSocketAddr};
 use linux_raw_sys::net::*;
-use thekernel_linux_net::{UnixName as AbiUnixName, UnixSockAddr as AbiUnixSockAddr};
+use tk_linux_net::{UnixName as AbiUnixName, UnixSockAddr as AbiUnixSockAddr};
 
 use crate::mm::{UserConstPtr, UserMemoryCapability, UserPtr, map_usercopy_error};
 
@@ -89,7 +89,7 @@ fn parse_unix_socket_addr(snapshot: &[u8]) -> AxResult<UnixSocketAddr> {
     // byte-exact pathname storage remain in the kernel layer.
     match AbiUnixSockAddr::decode(snapshot)
         .map_err(|error| match error {
-            thekernel_linux_net::NetError::InvalidFamily => AxError::from(LinuxError::EAFNOSUPPORT),
+            tk_linux_net::NetError::InvalidFamily => AxError::from(LinuxError::EAFNOSUPPORT),
             _ => AxError::InvalidInput,
         })?
         .name

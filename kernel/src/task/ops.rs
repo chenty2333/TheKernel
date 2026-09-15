@@ -21,8 +21,8 @@ use kernel_guard::NoPreemptIrqSave;
 use linux_raw_sys::general::{FUTEX_OWNER_DIED, FUTEX_TID_MASK, FUTEX_WAITERS, ROBUST_LIST_LIMIT};
 use memory_addr::{MemoryAddr, PhysAddr, VirtAddr};
 use spin::Lazy;
-use thekernel_linux_process_adapter::{ExitOutcome, Pid, ProcessError};
-use thekernel_linux_signal::{SignalActionFlags, SignalDisposition, SignalInfo, Signo};
+use tk_linux_process_adapter::{ExitOutcome, Pid, ProcessError};
+use tk_linux_signal::{SignalActionFlags, SignalDisposition, SignalInfo, Signo};
 
 use super::{
     AsThread, CommittedProcessExit, CommittingExecCredential, ExecImageCommit, FutexKey,

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use thekernel_linux_process::{Process, ProcessDomain, ProcessError, ThreadExitOutcome};
+use tk_linux_process::{Process, ProcessDomain, ProcessError, ThreadExitOutcome};
 
 mod common;
 use common::{Zombie, domain, exit_and_reap, init, zombie};

@@ -25,7 +25,7 @@ use crate::{Credential, UserNamespaceView};
 /// rejected by [`Self::try_from_bits`].
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::MemoryProtection;
+/// use tk_linux_cred::MemoryProtection;
 ///
 /// // Raw tuple construction is not part of the public contract.
 /// let _ = MemoryProtection(1);
@@ -110,7 +110,7 @@ impl BitOrAssign for MemoryProtection {
 /// combinations before preserving that exact word here.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::MmapFileFlags;
+/// use tk_linux_cred::MmapFileFlags;
 ///
 /// // The private representation cannot be forged without `from_raw`.
 /// let _ = MmapFileFlags(usize::MAX);
@@ -139,7 +139,7 @@ impl MmapFileFlags {
 /// embedding kernel.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::{MemoryProtection, MmapFileFlags, MmapFileOperation};
+/// use tk_linux_cred::{MemoryProtection, MmapFileFlags, MmapFileOperation};
 ///
 /// // Field-private construction prevents replacing a frozen operation fact.
 /// let _ = MmapFileOperation {
@@ -193,7 +193,7 @@ impl MmapFileOperation {
 ///
 /// ```compile_fail
 /// use std::sync::Arc;
-/// use thekernel_linux_cred::{MmapFileSecurityRef, UserNamespaceView};
+/// use tk_linux_cred::{MmapFileSecurityRef, UserNamespaceView};
 ///
 /// fn forge<'a, N: UserNamespaceView, F: ?Sized>(
 ///     namespace: &'a Arc<N>,
@@ -282,7 +282,7 @@ impl<'a, N: UserNamespaceView, F: ?Sized> MmapFileTarget<'a, N, F> {
 /// the Linux v6.18 leaf signature.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::{MmapFileContext, UserNamespaceView};
+/// use tk_linux_cred::{MmapFileContext, UserNamespaceView};
 ///
 /// fn inspect_private_fields<N: UserNamespaceView>(context: MmapFileContext<'_, N>) {
 ///     let MmapFileContext { actor, target, operation } = context;
@@ -334,7 +334,7 @@ impl<'a, N: UserNamespaceView, F: ?Sized> MmapFileContext<'a, N, F> {
 ///
 /// ```compile_fail
 /// use std::sync::Arc;
-/// use thekernel_linux_cred::{
+/// use tk_linux_cred::{
 ///     Credential, MmapAddressContext, UserNamespaceView,
 /// };
 ///
@@ -399,7 +399,7 @@ impl<'a, N: UserNamespaceView, I: ?Sized> MmapAddressContext<'a, N, I> {
 ///
 /// ```compile_fail
 /// use std::sync::Arc;
-/// use thekernel_linux_cred::{
+/// use tk_linux_cred::{
 ///     Credential, FileMprotectContext, MemoryProtection, UserNamespaceView,
 /// };
 ///

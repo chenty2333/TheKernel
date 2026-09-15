@@ -3,7 +3,7 @@
 use axerrno::{AxError, AxResult};
 use axtask::current;
 use linux_raw_sys::general::CAP_SYS_RAWIO;
-use thekernel_linux_arch_x86_64::{ArchPolicyError, IoPortPlan, IoplPlan};
+use tk_linux_arch_x86_64::{ArchPolicyError, IoPortPlan, IoplPlan};
 
 use crate::task::AsThread;
 

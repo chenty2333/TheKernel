@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::{Location, Metadata, MetadataUpdate, NodePermission, NodeType};
 use linux_raw_sys::general::CAP_FSETID;
-use thekernel_linux_cred::{
+use tk_linux_cred::{
     ContentWriteMode, ContentWriteSetIdAuthority,
     InodeSetattrPrivilegeCleanup as CredentialPrivilegeCleanup, plan_content_write_setid_cleanup,
 };

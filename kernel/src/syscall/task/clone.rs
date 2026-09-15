@@ -11,10 +11,10 @@ use axtask::{
 };
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
-use thekernel_linux_process::{ClonePlan as LinuxClonePlan, ProcessAbiError};
-use thekernel_linux_process_adapter::{Pid, ProcessError};
-use thekernel_linux_sched as linux_sched;
-use thekernel_linux_signal::{
+use tk_linux_process::{ClonePlan as LinuxClonePlan, ProcessAbiError};
+use tk_linux_process_adapter::{Pid, ProcessError};
+use tk_linux_sched as linux_sched;
+use tk_linux_signal::{
     SignalInfo, Signo,
     api::{SharedSignalActions, SignalActions},
 };
@@ -464,7 +464,7 @@ pub struct CloneArgs {
     /// clone3 namespace-local PIDs, ordered innermost-to-outermost.
     /// The task runtime identity remains opaque; these values are installed
     /// only in the Linux PID namespace tables during publication.
-    pub set_tid: [Pid; thekernel_linux_process::SetTidPlan::MAX_ENTRIES],
+    pub set_tid: [Pid; tk_linux_process::SetTidPlan::MAX_ENTRIES],
     pub set_tid_size: usize,
 }
 
@@ -1715,7 +1715,7 @@ pub fn sys_clone(
             0
         },
         cgroup_fd: None,
-        set_tid: [0; thekernel_linux_process::SetTidPlan::MAX_ENTRIES],
+        set_tid: [0; tk_linux_process::SetTidPlan::MAX_ENTRIES],
         set_tid_size: 0,
     };
 

@@ -2,7 +2,7 @@
 #![feature(allocator_api)]
 
 #[cfg(not(target_pointer_width = "64"))]
-compile_error!("thekernel-linux-signal 0.1.0 supports only 64-bit Linux ABIs");
+compile_error!("tk-linux-signal 0.1.0 supports only 64-bit Linux ABIs");
 
 #[macro_use]
 extern crate log;

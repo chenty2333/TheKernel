@@ -31,7 +31,7 @@ cat /proc/sys/kernel/log_stats
 Change capture filtering as a guest task with `CAP_SYSLOG`:
 
 ```sh
-echo 'info,thekernel_kernel::file::io_uring=debug' > /proc/sys/kernel/log_filter
+echo 'info,tk_kernel::file::io_uring=debug' > /proc/sys/kernel/log_filter
 # Reproduce the operation, then restore the normal filter.
 echo info > /proc/sys/kernel/log_filter
 ```

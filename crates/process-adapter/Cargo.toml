@@ -1,8 +1,10 @@
 [package]
-name = "thekernel-linux-process-adapter"
+repository.workspace = true
+rust-version.workspace = true
+name = "tk-linux-process-adapter"
 version = "0.1.0"
 edition = "2024"
-publish = false
+publish.workspace = true
 description = "TheKernel zombie payload and type aliases over the explicit Linux process domain"
 license = "Apache-2.0"
 
@@ -10,11 +12,11 @@ license = "Apache-2.0"
 workspace = true
 
 [lib]
-name = "thekernel_linux_process_adapter"
+name = "tk_linux_process_adapter"
 path = "src/lib.rs"
 
 [dependencies]
-thekernel-linux-process.workspace = true
+tk-linux-process.workspace = true
 
 [package.metadata.thekernel]
 layer = "integration"

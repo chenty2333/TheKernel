@@ -40,7 +40,7 @@ use linux_raw_sys::general::{
 };
 use ouroboros::self_referencing;
 use spin::Once;
-use thekernel_linux_io_uring::{
+use tk_linux_io_uring::{
     BufferLeaseRelease, BufferSlot, BufferTableId, CancelSelector, CompletionPublication,
     CompletionToken, CopiedSubmission, FileSlot, FileTableId, IoUringError, IssuedRequest,
     LeaseRelease, MappingRegion, ParsedSubmission, PreparedRequest, ProviderCancelOutcome,
@@ -48,8 +48,8 @@ use thekernel_linux_io_uring::{
     RegisteredFileTable, RequestDescriptor, RequestId, RequestIssueError, RequestRegistry,
     RequestReservation, RingId, RingLayout, SetupFlags, TerminalCause,
 };
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_signal::SignalSet;
+use tk_linux_process_adapter::Pid;
+use tk_linux_signal::SignalSet;
 
 use super::{
     DescriptionResource, FileDescription, FileHandle, FileLike, FileMmapProtection,
@@ -357,7 +357,7 @@ struct RingState {
     /// after consuming an SQE.
     parked_submissions: Vec<Option<ParkedSubmission>>,
     /// The request whose IOSQE_IO_LINK/HARDLINK flag binds the next SQE.
-    link_tail: Option<(RequestId, thekernel_linux_io_uring::SubmissionLink)>,
+    link_tail: Option<(RequestId, tk_linux_io_uring::SubmissionLink)>,
     /// Terminal result retained until its slot can be reused; dependency
     /// release is deliberately independent of CQ publication/task-work.
     terminal_results: Vec<Option<(RequestId, i32)>>,
@@ -572,7 +572,7 @@ impl SubmissionWork {
         self.prepared.id()
     }
 
-    pub(crate) fn dependencies(&self) -> Option<thekernel_linux_io_uring::SubmissionDependencies> {
+    pub(crate) fn dependencies(&self) -> Option<tk_linux_io_uring::SubmissionDependencies> {
         self.parsed.ok().map(ParsedSubmission::dependencies)
     }
     pub(crate) fn into_parts(self) -> SubmissionWorkParts {
@@ -818,7 +818,7 @@ impl IoUring {
         world: crate::task::WorldId,
     ) -> AxResult<Arc<Self>> {
         let profile = world.profile();
-        if !profile.enables(thekernel_linux_profile::Capability::AsyncFileIo) {
+        if !profile.enables(tk_linux_profile::Capability::AsyncFileIo) {
             return Err(AxError::OperationNotSupported);
         }
         if layout.sq_entries() > profile.limits().io_uring_entries {
@@ -844,17 +844,17 @@ impl IoUring {
         let cq_tail = rings.atomic_u32(cq_offsets.tail() as usize)?;
         let sq_dropped = rings.atomic_u32(sq_offsets.dropped() as usize)?;
         let ring_region = FixedSharedMmapRegion::try_new_detached(
-            thekernel_linux_io_uring::IORING_OFF_SQ_RING,
+            tk_linux_io_uring::IORING_OFF_SQ_RING,
             Arc::clone(&rings),
             super::FileMmapProtection::READ | super::FileMmapProtection::WRITE,
         )?;
         let cq_ring_region = FixedSharedMmapRegion::try_new_detached(
-            thekernel_linux_io_uring::IORING_OFF_CQ_RING,
+            tk_linux_io_uring::IORING_OFF_CQ_RING,
             Arc::clone(&rings),
             super::FileMmapProtection::READ | super::FileMmapProtection::WRITE,
         )?;
         let sqe_region = FixedSharedMmapRegion::try_new_detached(
-            thekernel_linux_io_uring::IORING_OFF_SQES,
+            tk_linux_io_uring::IORING_OFF_SQES,
             Arc::clone(&sqes),
             super::FileMmapProtection::READ | super::FileMmapProtection::WRITE,
         )?;
@@ -1201,11 +1201,11 @@ impl IoUring {
             .checked_add(
                 publication
                     .slot()
-                    .checked_mul(thekernel_linux_io_uring::CQE_BYTES)
+                    .checked_mul(tk_linux_io_uring::CQE_BYTES)
                     .ok_or(AxError::BadState)?,
             )
             .ok_or(AxError::BadState)? as usize;
-        let mut bytes = [0_u8; thekernel_linux_io_uring::CQE_BYTES as usize];
+        let mut bytes = [0_u8; tk_linux_io_uring::CQE_BYTES as usize];
         bytes[0..8].copy_from_slice(&completion.user_data().to_ne_bytes());
         bytes[8..12].copy_from_slice(&completion.result().to_ne_bytes());
         bytes[12..16].copy_from_slice(&completion.flags().to_ne_bytes());
@@ -1356,9 +1356,9 @@ impl IoUring {
 
         let offset = usize::try_from(sqe_index)
             .ok()
-            .and_then(|index| index.checked_mul(thekernel_linux_io_uring::SQE_BYTES as usize))
+            .and_then(|index| index.checked_mul(tk_linux_io_uring::SQE_BYTES as usize))
             .ok_or(AxError::BadState)?;
-        let mut bytes = [0_u8; thekernel_linux_io_uring::SQE_BYTES as usize];
+        let mut bytes = [0_u8; tk_linux_io_uring::SQE_BYTES as usize];
         self.sqes.read_bytes(offset, &mut bytes)?;
         let copied = CopiedSubmission::new(bytes);
         let descriptor = copied.descriptor();
@@ -1392,7 +1392,7 @@ impl IoUring {
     pub(crate) fn issue_request_with_cancellation_mode(
         &self,
         prepared: PreparedRequest,
-        mode: thekernel_linux_io_uring::CancellationMode,
+        mode: tk_linux_io_uring::CancellationMode,
     ) -> Result<IssuedRequest, RequestIssueError> {
         self.state
             .lock()
@@ -1563,7 +1563,7 @@ impl FileLike for IoUring {
             .map_err(map_core_error)?
         {
             MappingRegion::Rings
-                if request.offset() == thekernel_linux_io_uring::IORING_OFF_CQ_RING =>
+                if request.offset() == tk_linux_io_uring::IORING_OFF_CQ_RING =>
             {
                 self.cq_ring_region.prepare(request)
             }

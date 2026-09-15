@@ -6,7 +6,7 @@ use linux_raw_sys::general::{
     RLIMIT_RSS, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL, SCHED_RR,
 };
 use memory_addr::PAGE_SIZE_4K;
-use thekernel_linux_signal::Signo;
+use tk_linux_signal::Signo;
 
 use crate::task::{
     AsThread, PidNamespace, ProcStateHint, Process, TaskUsage, nanos_to_clock_ticks,

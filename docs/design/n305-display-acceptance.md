@@ -45,7 +45,7 @@ carries the same status. The first run is also the first test of this document.
   `EFI/BOOT/BOOTX64.EFI`; a CSM boot of it is not a supported path.
 * **The screen is the only console, and nothing can be typed on it.** The machine has no serial
   port: `config/x86_64/n305.toml` states it, and the kernel's console probes `0x3f8` for a 16550 and
-  writes to no port when none answers (`crates/ax/thekernel-axplat-x86-pc/src/console.rs`). Console
+  writes to no port when none answers (`crates/ax/tk-axplat-x86-pc/src/console.rs`). Console
   input has exactly one source — that same UART — so the VT line discipline behind `/bin/sh -i` is
   fed by `axhal::console::read_bytes` and by nothing else
   (`kernel/src/pseudofs/dev/tty/ntty.rs`). A USB keyboard does not change this even if it
@@ -162,7 +162,7 @@ it. Nothing is typed on the machine at any point.
 |---|---|---|
 | 1 | the firmware's own logo or splash | firmware |
 | 2 | GRUB's output, brief or absent: `timeout=0` and one entry means the menu does not linger, but GRUB's terminal is on the console as well as the serial port, so anything GRUB has to say — an unreadable kernel, a missing module — is said on the screen | `config/x86_64/grub.cfg`, whose comment records that the screen carries GRUB's output with `console` in `terminal_output` and is untouched without it |
-| 3 | `THEKERNEL  <step>` in the top row, with the newest log lines beneath it, the step advancing through `runtime entry`, `heap allocator`, `memory management`, `platform devices`, `scheduler`, `driver init`, `filesystems`, `secondary CPU bring-up`, `interrupt init`, `kernel main` | the early screen: `crates/ax/thekernel-axruntime/src/lib.rs` calls `early_screen_milestone` at each step, `kernel/src/pseudofs/dev/early_screen.rs` paints it. It exists because the framebuffer console is installed from the device filesystem, which is far too late to report a failure before it (`docs/design/early-screen.md`) |
+| 3 | `THEKERNEL  <step>` in the top row, with the newest log lines beneath it, the step advancing through `runtime entry`, `heap allocator`, `memory management`, `platform devices`, `scheduler`, `driver init`, `filesystems`, `secondary CPU bring-up`, `interrupt init`, `kernel main` | the early screen: `crates/ax/tk-axruntime/src/lib.rs` calls `early_screen_milestone` at each step, `kernel/src/pseudofs/dev/early_screen.rs` paints it. It exists because the framebuffer console is installed from the device filesystem, which is far too late to report a failure before it (`docs/design/early-screen.md`) |
 | 4 | the retained kernel log, then `THEKERNEL_SHELL_READY` and a `# ` prompt, and then **no further change** | the framebuffer console mirrors the kernel log ring to the screen once the device filesystem publishes fbdev (`kernel/src/pseudofs/dev/tty/fbcon.rs`), replaying the ring from its start, so the probe's lines — printed before there was a console — arrive on the panel rather than being lost |
 
 The screen holds `MAX_ROWS` = 64 rows at most — fewer on a smaller mode, since the console's
@@ -188,9 +188,9 @@ the machine exists. `/proc/sys/kernel/log_stats` says whether the ring overlappe
 | log, then `THEKERNEL_SHELL_READY` and no further change | the boot reached the shell and stayed there | acceptance of the boot path; go to §3 |
 
 `MB2 framebuffer: …` is not in this table on purpose: it is written by
-`crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs` through the diagnostic channel at `0x2f8`,
+`crates/ax/tk-axplat-x86-pc/src/boot_info.rs` through the diagnostic channel at `0x2f8`,
 which this machine does not have. The same verdict is in the kernel log as
-`boot framebuffer: …` (`crates/ax/thekernel-axruntime/src/lib.rs`), and that is the form the panel
+`boot framebuffer: …` (`crates/ax/tk-axruntime/src/lib.rs`), and that is the form the panel
 can show.
 
 ---
@@ -199,10 +199,10 @@ can show.
 
 Every log record is one line shaped
 `<6>[<secs>.<micros> cpu=<n> tid=<n> INFO target=<module path> module=<module path>] <message>`
-(`crates/ax/thekernel-axruntime/src/klog.rs`), so a display line on the panel looks like:
+(`crates/ax/tk-axruntime/src/klog.rs`), so a display line on the panel looks like:
 
 ```text
-<6>[0.910000 cpu=Some(0) tid=Some(1) INFO target=thekernel_kernel::drm::intel::probe module=thekernel_kernel::drm::intel::probe] intel-gpu: Intel display probe
+<6>[0.910000 cpu=Some(0) tid=Some(1) INFO target=tk_kernel::drm::intel::probe module=tk_kernel::drm::intel::probe] intel-gpu: Intel display probe
 ```
 
 The strings quoted below are the message text, which is what to look for on the panel: everything is

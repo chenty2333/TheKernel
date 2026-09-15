@@ -6,10 +6,10 @@ use core::mem::{offset_of, size_of};
 use axerrno::{AxError, AxResult, LinuxError};
 use axsync::spin::SpinNoIrq;
 use linux_raw_sys::general::{CAP_NET_ADMIN, CAP_SYS_ADMIN};
-use thekernel_linux_bpf::{
+use tk_linux_bpf::{
     BPF_PERF_EVENT, BPF_PROG_TYPE_PERF_EVENT, BpfAttrLinkCreate, BpfAttrRawTracepointOpen,
 };
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use crate::{
     bpf::{

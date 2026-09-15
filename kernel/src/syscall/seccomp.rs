@@ -8,7 +8,7 @@ use axhal::uspace::UserContext;
 use axtask::current;
 use linux_raw_sys::general::CAP_SYS_ADMIN;
 use syscalls::Sysno;
-use thekernel_linux_seccomp::{
+use tk_linux_seccomp::{
     ActionClass, BPF_MAXINSNS, ClassicBpfInstruction, FilterInstallError, FilterMetadata,
     ProgramError, SECCOMP_FILTER_FLAG_LOG, SECCOMP_FILTER_FLAG_MASK,
     SECCOMP_FILTER_FLAG_NEW_LISTENER, SECCOMP_FILTER_FLAG_SPEC_ALLOW, SECCOMP_FILTER_FLAG_TSYNC,
@@ -17,8 +17,8 @@ use thekernel_linux_seccomp::{
     SECCOMP_RET_LOG, SECCOMP_RET_TRAP, SECCOMP_SET_MODE_FILTER, SECCOMP_SET_MODE_STRICT,
     SeccompData, SeccompMode, VerifiedProgram,
 };
-use thekernel_linux_signal::{SignalInfo, Signo};
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
+use tk_linux_signal::{SignalInfo, Signo};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::{
     file::{
@@ -178,7 +178,7 @@ fn install_filter<M: UserMemory + ?Sized>(
     if flags & SECCOMP_FILTER_FLAG_TSYNC_ESRCH != 0 && flags & SECCOMP_FILTER_FLAG_TSYNC == 0 {
         return Err(AxError::InvalidInput);
     }
-    if flags & thekernel_linux_seccomp::SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV != 0
+    if flags & tk_linux_seccomp::SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV != 0
         && flags & SECCOMP_FILTER_FLAG_NEW_LISTENER == 0
     {
         return Err(AxError::InvalidInput);
@@ -219,7 +219,7 @@ fn install_filter<M: UserMemory + ?Sized>(
     }
     let listener = if flags & SECCOMP_FILTER_FLAG_NEW_LISTENER != 0 {
         Some(SeccompListener::try_new(
-            flags & thekernel_linux_seccomp::SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV != 0,
+            flags & tk_linux_seccomp::SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV != 0,
         )?)
     } else {
         None
@@ -329,7 +329,7 @@ fn get_action_available<M: UserMemory + ?Sized>(
         | SECCOMP_RET_TRAP
         | SECCOMP_RET_ERRNO
         | SECCOMP_RET_LOG
-        | thekernel_linux_seccomp::SECCOMP_RET_USER_NOTIF
+        | tk_linux_seccomp::SECCOMP_RET_USER_NOTIF
         | SECCOMP_RET_ALLOW => Ok(0),
         _ => Err(LinuxError::EOPNOTSUPP.into()),
     }

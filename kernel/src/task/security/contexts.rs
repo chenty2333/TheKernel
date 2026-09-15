@@ -10,56 +10,56 @@ use axfs_ng_vfs::FsPath;
 use super::*;
 
 pub(crate) type CorePtraceAccessContext<'a> =
-    thekernel_linux_cred::PtraceAccessContext<'a, UserNamespace, ProcessImageSecurityRef<'a>>;
+    tk_linux_cred::PtraceAccessContext<'a, UserNamespace, ProcessImageSecurityRef<'a>>;
 pub(crate) type CorePtraceTracemeContext<'a> =
-    thekernel_linux_cred::PtraceTracemeContext<'a, UserNamespace, ProcessImageSecurityRef<'a>>;
+    tk_linux_cred::PtraceTracemeContext<'a, UserNamespace, ProcessImageSecurityRef<'a>>;
 pub(crate) type CoreSchedulerSecurityContext<'a> =
-    thekernel_linux_cred::SchedulerSecurityContext<'a, UserNamespace>;
+    tk_linux_cred::SchedulerSecurityContext<'a, UserNamespace>;
 pub(crate) type CoreTaskGetSchedulerContext<'a> =
-    thekernel_linux_cred::TaskGetSchedulerContext<'a, UserNamespace>;
+    tk_linux_cred::TaskGetSchedulerContext<'a, UserNamespace>;
 pub(crate) type CoreSignalSecurityContext<'a> =
-    thekernel_linux_cred::SignalSecurityContext<'a, UserNamespace, SignalTargetSecurityRef<'a>>;
+    tk_linux_cred::SignalSecurityContext<'a, UserNamespace, SignalTargetSecurityRef<'a>>;
 pub(crate) type CoreInodePermissionContext<'context, 'location> =
-    thekernel_linux_cred::InodePermissionContext<
+    tk_linux_cred::InodePermissionContext<
         'context,
         UserNamespace,
         InodeSecurityRef<'location>,
     >;
 pub(crate) type CoreInodeXattrContext<'context, 'location> =
-    thekernel_linux_cred::InodeXattrContext<'context, UserNamespace, InodeSecurityRef<'location>>;
+    tk_linux_cred::InodeXattrContext<'context, UserNamespace, InodeSecurityRef<'location>>;
 pub(crate) type CoreInodeSetattrContext<'context, 'location> =
-    thekernel_linux_cred::InodeSetattrContext<'context, UserNamespace, InodeSecurityRef<'location>>;
+    tk_linux_cred::InodeSetattrContext<'context, UserNamespace, InodeSecurityRef<'location>>;
 pub(crate) type CoreInodePostSetattrContext<'context, 'location> =
-    thekernel_linux_cred::InodePostSetattrContext<
+    tk_linux_cred::InodePostSetattrContext<
         'context,
         UserNamespace,
         InodeSetattrCommittedSecurityRef<'location>,
     >;
 pub(crate) type CoreFileOpenContext<'context, 'location> =
-    thekernel_linux_cred::FileOpenContext<'context, UserNamespace, InodeSecurityRef<'location>>;
+    tk_linux_cred::FileOpenContext<'context, UserNamespace, InodeSecurityRef<'location>>;
 pub(crate) type CoreInodeCreateContext<'context, 'name, 'location> =
-    thekernel_linux_cred::InodeCreateContext<
+    tk_linux_cred::InodeCreateContext<
         'context,
         UserNamespace,
         InodeSecurityRef<'location>,
         PlannedInodeSecurityRef<'name, 'location>,
     >;
 pub(crate) type CoreInodeMkdirContext<'context, 'name, 'location> =
-    thekernel_linux_cred::InodeMkdirContext<
+    tk_linux_cred::InodeMkdirContext<
         'context,
         UserNamespace,
         InodeSecurityRef<'location>,
         PlannedInodeSecurityRef<'name, 'location>,
     >;
 pub(crate) type CoreInodeMknodContext<'context, 'name, 'location> =
-    thekernel_linux_cred::InodeMknodContext<
+    tk_linux_cred::InodeMknodContext<
         'context,
         UserNamespace,
         InodeSecurityRef<'location>,
         PlannedInodeSecurityRef<'name, 'location>,
     >;
 pub(crate) type CoreInodeSymlinkContext<'context, 'name, 'location> =
-    thekernel_linux_cred::InodeSymlinkContext<
+    tk_linux_cred::InodeSymlinkContext<
         'context,
         UserNamespace,
         InodeSecurityRef<'location>,
@@ -67,7 +67,7 @@ pub(crate) type CoreInodeSymlinkContext<'context, 'name, 'location> =
         FsPath,
     >;
 pub(crate) type CoreInodeLinkContext<'context, 'name, 'location> =
-    thekernel_linux_cred::InodeLinkContext<
+    tk_linux_cred::InodeLinkContext<
         'context,
         UserNamespace,
         InodeSecurityRef<'location>,
@@ -75,21 +75,21 @@ pub(crate) type CoreInodeLinkContext<'context, 'name, 'location> =
         PlannedInodeSecurityRef<'name, 'location>,
     >;
 pub(crate) type CoreInodeUnlinkContext<'context, 'name, 'location> =
-    thekernel_linux_cred::InodeUnlinkContext<
+    tk_linux_cred::InodeUnlinkContext<
         'context,
         UserNamespace,
         InodeSecurityRef<'location>,
         ExistingInodeSecurityRef<'name, 'location>,
     >;
 pub(crate) type CoreInodeRmdirContext<'context, 'name, 'location> =
-    thekernel_linux_cred::InodeRmdirContext<
+    tk_linux_cred::InodeRmdirContext<
         'context,
         UserNamespace,
         InodeSecurityRef<'location>,
         ExistingInodeSecurityRef<'name, 'location>,
     >;
 pub(crate) type CoreInodeRenameContext<'context, 'old_name, 'new_name, 'location> =
-    thekernel_linux_cred::InodeRenameContext<
+    tk_linux_cred::InodeRenameContext<
         'context,
         UserNamespace,
         InodeSecurityRef<'location>,

@@ -3,11 +3,11 @@ use core::{mem::MaybeUninit, slice};
 
 use axerrno::{AxError, AxResult};
 use axhal::uspace::UserContext;
-use thekernel_linux_process::{
+use tk_linux_process::{
     Clone3Args as LinuxClone3Args, Clone3Plan, ProcessAbiError, SetTidPlan,
 };
-use thekernel_linux_signal::Signo;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+use tk_linux_signal::Signo;
+use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use super::clone::{CloneApi, CloneArgs, CloneFlags};
 use crate::{
@@ -169,7 +169,7 @@ pub fn sys_clone3(
     validate_clone3_wire_args(&wire_args)?;
     validate_clone3_pre_set_tid_args(&wire_args, size)?;
     let set_tid_count = wire_args.set_tid_size as usize;
-    let mut tids = [0u32; thekernel_linux_process::SetTidPlan::MAX_ENTRIES];
+    let mut tids = [0u32; tk_linux_process::SetTidPlan::MAX_ENTRIES];
     if set_tid_count != 0 {
         let byte_count = set_tid_count
             .checked_mul(core::mem::size_of::<u32>())
@@ -203,7 +203,7 @@ mod tests {
     use linux_raw_sys::general::{
         CLONE_DETACHED, CLONE_FS, CLONE_NEWNS, CLONE_NEWPID, CLONE_PIDFD,
     };
-    use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
+    use tk_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
 
     use super::{
         CloneApi, CloneArgs, CloneFlags, LinuxClone3Args, clone3_stack_top, copy_clone3_wire_args,

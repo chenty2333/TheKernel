@@ -263,7 +263,7 @@ impl IoUring {
                     .and_then(Option::as_ref)
                     .and_then(|owner| {
                         state.requests.request(owner.id).ok().map(|(_, request)| {
-                            !matches!(request, thekernel_linux_io_uring::RequestState::Issued(_))
+                            !matches!(request, tk_linux_io_uring::RequestState::Issued(_))
                         })
                     })
                     .unwrap_or(false);

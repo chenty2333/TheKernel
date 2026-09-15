@@ -9,7 +9,7 @@ use linux_raw_sys::general::{
     STATX_ATTR_MOUNT_ROOT, STATX_ATTR_NODUMP,
 };
 use linux_vfs::validate_file_setattr_xflags;
-use thekernel_linux_cred::InodeFileAttrIntent;
+use tk_linux_cred::InodeFileAttrIntent;
 
 use super::{
     IoctlContext,

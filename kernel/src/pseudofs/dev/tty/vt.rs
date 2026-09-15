@@ -10,8 +10,8 @@ use axsync::Mutex;
 use axtask::{WaitQueue, current};
 use kspin::SpinNoIrq;
 use lazy_static::lazy_static;
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_signal::{SignalInfo, Signo};
+use tk_linux_process_adapter::Pid;
+use tk_linux_signal::{SignalInfo, Signo};
 
 use super::{
     NTtyDriver, TtyFile,

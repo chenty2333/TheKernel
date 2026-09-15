@@ -2,7 +2,7 @@
 
 use alloc::{string::String, vec};
 
-use thekernel_linux_cred::{CAPABILITY_WORDS, GroupInfo};
+use tk_linux_cred::{CAPABILITY_WORDS, GroupInfo};
 
 use super::*;
 
@@ -973,11 +973,11 @@ fn namespace_prune_leaves_foreign_gc_scratch_untouched() {
         )
         .unwrap();
     let foreign_scratch = GcPlanScratch {
-        policy: thekernel_linux_keyring::GcScratch {
+        policy: tk_linux_keyring::GcScratch {
             epoch: u64::MAX,
             root_drops: 7,
             link_drops: 3,
-            state: thekernel_linux_keyring::GcScratchState::Touched,
+            state: tk_linux_keyring::GcScratchState::Touched,
         },
         touched_next: Some(1234),
         work_next: None,

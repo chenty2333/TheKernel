@@ -13,8 +13,8 @@ use lazy_static::lazy_static;
 use linux_raw_sys::general::{
     CAP_LEASE, F_RDLCK, F_UNLCK, F_WRLCK, O_ACCMODE, O_PATH, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
 };
-use thekernel_linux_fd::{LeaseId, LeaseSnapshot, LeaseType as AbiLeaseType};
-use thekernel_linux_signal::{SignalInfo, Signo};
+use tk_linux_fd::{LeaseId, LeaseSnapshot, LeaseType as AbiLeaseType};
+use tk_linux_signal::{SignalInfo, Signo};
 
 use super::File;
 use crate::{
@@ -597,7 +597,7 @@ pub(crate) fn set_lease(file: &File, owner: LeaseOwner, arg: i32) -> AxResult<()
             .plan_release(abi_lease_id(owner)?)
             .map_err(|_| AxError::BadState)?
         {
-            thekernel_linux_fd::LeasePlan::Release { after, .. } => after,
+            tk_linux_fd::LeasePlan::Release { after, .. } => after,
             _ => return Err(AxError::BadState),
         };
         after_release

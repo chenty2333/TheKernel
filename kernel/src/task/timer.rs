@@ -31,8 +31,8 @@ use lazy_static::lazy_static;
 use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_CPU, SI_TIMER};
 use spin::Once;
 use strum::FromRepr;
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_signal::{SignalInfo, SignalTimerPayload, Signo};
+use tk_linux_process_adapter::Pid;
+use tk_linux_signal::{SignalInfo, SignalTimerPayload, Signo};
 
 use super::{
     AsThread, ProcessData, TaskUsage, send_queued_signal_to_process_data,

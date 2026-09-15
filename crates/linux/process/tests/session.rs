@@ -1,6 +1,6 @@
 use std::{any::Any, sync::Arc};
 
-use thekernel_linux_process::ProcessError;
+use tk_linux_process::ProcessError;
 
 mod common;
 use common::{child, domain, exit_and_reap, init};

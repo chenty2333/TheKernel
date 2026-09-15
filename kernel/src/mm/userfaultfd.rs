@@ -1,7 +1,7 @@
 //! Address-space adapter for the bounded generic fault broker.
 //!
-//! Linux-visible validation remains in `thekernel-linux-mm`; queue identity,
-//! coalescing, and waiter ownership remain in `thekernel-axfault`.  This
+//! Linux-visible validation remains in `tk-linux-mm`; queue identity,
+//! coalescing, and waiter ownership remain in `tk-axfault`.  This
 //! adapter owns bounded REGISTER/UNREGISTER transactions, per-address-space
 //! handler state, MISSING admission, resolver completion, and lock-external
 //! waiter publication.
@@ -17,8 +17,8 @@ use axfault::{
 use axpoll::PollSet;
 use memory_addr::VirtAddr;
 #[cfg(test)]
-use thekernel_linux_mm::MappingGeneration;
-use thekernel_linux_mm::{
+use tk_linux_mm::MappingGeneration;
+use tk_linux_mm::{
     AddressSpaceId, FaultAccess, FaultAdmissionContext, FaultAdmissionKind, FaultCapacity,
     FaultCompletionPermit, FaultDisposition, FaultHandlerId, FaultKey, FaultLifecycleState,
     FaultLoad, FaultRequest, FaultType, MappingId, MappingSnapshot, MmError, PageRange,
@@ -2316,7 +2316,7 @@ mod tests {
     };
 
     use memory_addr::PAGE_SIZE_4K;
-    use thekernel_linux_mm::{
+    use tk_linux_mm::{
         FaultAccess, FaultKey, FaultType, MappingAccess, MappingKind, MappingSnapshot, UFFD_API,
     };
 
@@ -2547,7 +2547,7 @@ mod tests {
                 lease,
                 current,
                 page,
-                FaultDisposition::Failure(thekernel_linux_mm::FaultFailure::Io),
+                FaultDisposition::Failure(tk_linux_mm::FaultFailure::Io),
             ),
             Err(AxError::InvalidInput)
         );

@@ -19,8 +19,8 @@ use axtask::current;
 use kernel_guard::NoPreemptIrqSave;
 use memory_addr::PAGE_SIZE_4K;
 #[cfg(test)]
-use thekernel_linux_perf::encode_sample_record;
-use thekernel_linux_perf::{
+use tk_linux_perf::encode_sample_record;
+use tk_linux_perf::{
     AuxRecord, PERF_EVENT_IOC_DISABLE, PERF_EVENT_IOC_ENABLE, PERF_EVENT_IOC_ID,
     PERF_EVENT_IOC_MODIFY_ATTRIBUTES, PERF_EVENT_IOC_PAUSE_OUTPUT, PERF_EVENT_IOC_PERIOD,
     PERF_EVENT_IOC_REFRESH, PERF_EVENT_IOC_RESET, PERF_EVENT_IOC_SET_FILTER, PERF_FORMAT_ID,
@@ -157,8 +157,8 @@ pub(crate) struct SamplingCount {
 
 #[derive(Clone, Copy)]
 pub(crate) struct PerfOpenIdentity {
-    pub attr: thekernel_linux_perf::PerfEventAttr,
-    pub target: thekernel_linux_perf::PerfOpenTarget,
+    pub attr: tk_linux_perf::PerfEventAttr,
+    pub target: tk_linux_perf::PerfOpenTarget,
     pub authority: crate::perf_security::PerfAuthority,
 }
 
@@ -253,19 +253,19 @@ struct Ring {
 }
 
 fn publication_should_wake(
-    wakeup: thekernel_linux_perf::Wakeup,
+    wakeup: tk_linux_perf::Wakeup,
     ring: &mut Ring,
     published: bool,
 ) -> bool {
     if !published {
         return false;
     }
-    if let thekernel_linux_perf::Wakeup::Watermark(threshold) = wakeup {
+    if let tk_linux_perf::Wakeup::Watermark(threshold) = wakeup {
         let used = producer_window(ring.producer_head, ring.tail.load_acquire(), ring.data_size)
             .unwrap_or(ring.data_size as u64);
         used >= u64::from(threshold.max(1))
     } else {
-        let thekernel_linux_perf::Wakeup::Events(threshold) = wakeup else {
+        let tk_linux_perf::Wakeup::Events(threshold) = wakeup else {
             unreachable!()
         };
         ring.records_since_wakeup = ring.records_since_wakeup.saturating_add(1);
@@ -316,7 +316,7 @@ struct SamplingState {
     period: u64,
     frequency: Option<u64>,
     sample_type: u64,
-    wakeup: thekernel_linux_perf::Wakeup,
+    wakeup: tk_linux_perf::Wakeup,
     last_frequency_adjust: u64,
     /// Units accumulated since the last emitted source sample. Source units
     /// are occurrences for trace/probe/software events and nanoseconds for
@@ -374,7 +374,7 @@ fn initialize_metadata_page(
     write_metadata(
         view,
         META_SIZE,
-        &(core::mem::size_of::<thekernel_linux_perf::PerfEventMmapPage>() as u32).to_ne_bytes(),
+        &(core::mem::size_of::<tk_linux_perf::PerfEventMmapPage>() as u32).to_ne_bytes(),
     )?;
     view.atomic_u64(DATA_OFFSET)?.store_release(PAGE as u64);
     view.atomic_u64(DATA_SIZE)?.store_release(data_size as u64);
@@ -683,7 +683,7 @@ impl PerfSampleBackend {
         let attr = crate::syscall::read_attr(
             memory,
             arg as *const _,
-            copy_len.min(thekernel_linux_perf::PERF_ATTR_SIZE_VER9 as usize),
+            copy_len.min(tk_linux_perf::PERF_ATTR_SIZE_VER9 as usize),
         )?;
         crate::syscall::read_attr_tail(memory, arg as *const _, copy_len)?;
 
@@ -693,9 +693,9 @@ impl PerfSampleBackend {
         // credentials, target selection, or an FD supplied by the caller.
         let (_, plan) = crate::syscall::perf_plan(attr, size, &[], identity.target)?;
         let (pid, cpu) = match identity.target.target {
-            thekernel_linux_perf::PerfTarget::Task { pid, cpu } => (pid, cpu),
-            thekernel_linux_perf::PerfTarget::Cpu { cpu } => (-1, cpu),
-            thekernel_linux_perf::PerfTarget::Cgroup { cpu, .. } => (-1, cpu),
+            tk_linux_perf::PerfTarget::Task { pid, cpu } => (pid, cpu),
+            tk_linux_perf::PerfTarget::Cpu { cpu } => (-1, cpu),
+            tk_linux_perf::PerfTarget::Cgroup { cpu, .. } => (-1, cpu),
         };
         // Reapply the opening credential snapshot to replacement attributes.
         // In particular, an unprivileged descriptor must not gain LBR/PEBS
@@ -713,9 +713,9 @@ impl PerfSampleBackend {
         // runtime state/ring metadata, so a rejected request is inert.
         authorize_sampling_rate(&attr)?;
         let old = identity.attr;
-        const MUTABLE_FLAGS: u64 = thekernel_linux_perf::ATTR_DISABLED
-            | thekernel_linux_perf::ATTR_FREQ
-            | thekernel_linux_perf::ATTR_WATERMARK;
+        const MUTABLE_FLAGS: u64 = tk_linux_perf::ATTR_DISABLED
+            | tk_linux_perf::ATTR_FREQ
+            | tk_linux_perf::ATTR_WATERMARK;
         if attr.event_type != old.event_type
             || attr.config != old.config
             || attr.config1 != old.config1
@@ -790,7 +790,7 @@ impl PerfSampleBackend {
             state.pebs = pebs_upgrade;
         }
         let frequency =
-            (attr.flags & thekernel_linux_perf::ATTR_FREQ != 0).then_some(attr.sample_period);
+            (attr.flags & tk_linux_perf::ATTR_FREQ != 0).then_some(attr.sample_period);
         // The union carries Hz in frequency mode.  Preserve the last real
         // counter period across a mode switch so the first rearm cannot turn
         // (for example) 99Hz into a 99-event PMI storm.
@@ -801,10 +801,10 @@ impl PerfSampleBackend {
         }
         state.frequency = frequency;
         state.sample_type = sample.sample_type;
-        state.wakeup = if attr.flags & thekernel_linux_perf::ATTR_WATERMARK != 0 {
-            thekernel_linux_perf::Wakeup::Watermark(attr.wakeup_events)
+        state.wakeup = if attr.flags & tk_linux_perf::ATTR_WATERMARK != 0 {
+            tk_linux_perf::Wakeup::Watermark(attr.wakeup_events)
         } else {
-            thekernel_linux_perf::Wakeup::Events(attr.wakeup_events)
+            tk_linux_perf::Wakeup::Events(attr.wakeup_events)
         };
         state.last_frequency_adjust = now;
         state.source_frequency_observed = 0;
@@ -847,10 +847,10 @@ impl PerfSampleBackend {
     }
     pub(crate) fn try_new(config: SamplingConfig) -> AxResult<Arc<Self>> {
         let now = axhal::time::monotonic_time_nanos();
-        let wakeup = if config.identity.attr.flags & thekernel_linux_perf::ATTR_WATERMARK != 0 {
-            thekernel_linux_perf::Wakeup::Watermark(config.identity.attr.wakeup_events)
+        let wakeup = if config.identity.attr.flags & tk_linux_perf::ATTR_WATERMARK != 0 {
+            tk_linux_perf::Wakeup::Watermark(config.identity.attr.wakeup_events)
         } else {
-            thekernel_linux_perf::Wakeup::Events(config.identity.attr.wakeup_events)
+            tk_linux_perf::Wakeup::Events(config.identity.attr.wakeup_events)
         };
         Arc::try_new(Self {
             state: SpinNoIrq::new(SamplingState {
@@ -925,16 +925,16 @@ impl PerfSampleBackend {
             event: SamplingEvent::BpfOutput,
             period: 0,
             frequency: None,
-            sample_type: thekernel_linux_perf::PERF_SAMPLE_RAW,
+            sample_type: tk_linux_perf::PERF_SAMPLE_RAW,
             count_user: true,
             count_kernel: true,
             disabled,
             read_format: 0,
             aux: None,
             identity: PerfOpenIdentity {
-                attr: thekernel_linux_perf::PerfEventAttr::default(),
-                target: thekernel_linux_perf::PerfOpenTarget {
-                    target: thekernel_linux_perf::PerfTarget::Task { pid: 0, cpu: -1 },
+                attr: tk_linux_perf::PerfEventAttr::default(),
+                target: tk_linux_perf::PerfOpenTarget {
+                    target: tk_linux_perf::PerfTarget::Task { pid: 0, cpu: -1 },
                     group_fd: -1,
                     output_fd: -1,
                     open_flags: 0,
@@ -1227,16 +1227,16 @@ impl PerfSampleBackend {
         if let Some(output) = self.output_target() {
             return output.emit_metadata_record(record);
         }
-        if record.len() < thekernel_linux_perf::PERF_RECORD_HEADER_SIZE
+        if record.len() < tk_linux_perf::PERF_RECORD_HEADER_SIZE
             || record.len() > u16::MAX as usize
             || !record.len().is_multiple_of(8)
         {
             return Err(AxError::InvalidInput);
         }
-        let header = thekernel_linux_perf::decode_record_header(record)
+        let header = tk_linux_perf::decode_record_header(record)
             .map_err(|_| AxError::InvalidInput)?;
         if usize::from(header.size) != record.len()
-            || header.kind == thekernel_linux_perf::PERF_RECORD_SAMPLE
+            || header.kind == tk_linux_perf::PERF_RECORD_SAMPLE
         {
             return Err(AxError::InvalidInput);
         }
@@ -1621,7 +1621,7 @@ impl PerfSampleBackend {
     }
 
     pub(crate) const fn pinned(&self) -> bool {
-        self.config.identity.attr.flags & thekernel_linux_perf::ATTR_PINNED != 0
+        self.config.identity.attr.flags & tk_linux_perf::ATTR_PINNED != 0
     }
 
     pub(crate) fn leave_current() {
@@ -2238,7 +2238,7 @@ impl PerfSampleBackend {
                     let mut throttle = [0u8; 32];
                     encode_throttle_record(
                         &mut throttle,
-                        thekernel_linux_perf::PERF_RECORD_THROTTLE,
+                        tk_linux_perf::PERF_RECORD_THROTTLE,
                         axhal::time::monotonic_time_nanos(),
                         event.config.id,
                     );
@@ -2675,7 +2675,7 @@ impl PerfSampleBackend {
                     let mut unthrottle = [0u8; 32];
                     encode_throttle_record(
                         &mut unthrottle,
-                        thekernel_linux_perf::PERF_RECORD_UNTHROTTLE,
+                        tk_linux_perf::PERF_RECORD_UNTHROTTLE,
                         now,
                         self.config.id,
                     );
@@ -2830,7 +2830,7 @@ fn has_space(size: usize, used: u64, record: usize) -> bool {
 /// identifiers because they have one stream per FD.
 fn encode_throttle_record(out: &mut [u8; 32], kind: u32, time: u64, id: u64) {
     let mut header = [0u8; 8];
-    thekernel_linux_perf::PerfRecordHeader::new(kind, 0, 32).encode(&mut header);
+    tk_linux_perf::PerfRecordHeader::new(kind, 0, 32).encode(&mut header);
     out[..8].copy_from_slice(&header);
     out[8..16].copy_from_slice(&time.to_ne_bytes());
     out[16..24].copy_from_slice(&id.to_ne_bytes());
@@ -2968,7 +2968,7 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use spin::{Mutex, MutexGuard};
-    use thekernel_linux_perf::{
+    use tk_linux_perf::{
         PERF_SAMPLE_CPU, PERF_SAMPLE_IP, PERF_SAMPLE_PERIOD, PERF_SAMPLE_TIME,
     };
 
@@ -3016,9 +3016,9 @@ mod tests {
             read_format: 0,
             aux: None,
             identity: PerfOpenIdentity {
-                attr: thekernel_linux_perf::PerfEventAttr::default(),
-                target: thekernel_linux_perf::PerfOpenTarget {
-                    target: thekernel_linux_perf::PerfTarget::Task { pid: 0, cpu: -1 },
+                attr: tk_linux_perf::PerfEventAttr::default(),
+                target: tk_linux_perf::PerfOpenTarget {
+                    target: tk_linux_perf::PerfTarget::Task { pid: 0, cpu: -1 },
                     group_fd: -1,
                     output_fd: -1,
                     open_flags: 0,
@@ -3048,7 +3048,7 @@ mod tests {
         {
             let mut state = event.state.lock();
             state.enabled = true;
-            state.sample_type = PERF_SAMPLE_TIME | thekernel_linux_perf::PERF_SAMPLE_RAW;
+            state.sample_type = PERF_SAMPLE_TIME | tk_linux_perf::PERF_SAMPLE_RAW;
         }
         let captured = 123_456_789;
         // No ring was mapped: encoding runs, then the provider reports the
@@ -3101,11 +3101,11 @@ mod tests {
         assert_eq!(n, 40);
         assert_eq!(
             u32::from_ne_bytes(out[..4].try_into().unwrap()),
-            thekernel_linux_perf::PERF_RECORD_SAMPLE
+            tk_linux_perf::PERF_RECORD_SAMPLE
         );
         assert_eq!(
             u16::from_ne_bytes(out[4..6].try_into().unwrap()),
-            thekernel_linux_perf::PERF_RECORD_MISC_USER
+            tk_linux_perf::PERF_RECORD_MISC_USER
         );
         assert_eq!(u64::from_ne_bytes(out[8..16].try_into().unwrap()), 1);
         assert_eq!(u64::from_ne_bytes(out[16..24].try_into().unwrap()), 2);
@@ -3118,7 +3118,7 @@ mod tests {
         encode_sample_record(&mut out, PERF_SAMPLE_IP, 1, false, 0, 0, 0);
         assert_eq!(
             u16::from_ne_bytes(out[4..6].try_into().unwrap()),
-            thekernel_linux_perf::PERF_RECORD_MISC_KERNEL
+            tk_linux_perf::PERF_RECORD_MISC_KERNEL
         );
     }
 
@@ -3154,9 +3154,9 @@ mod tests {
         let requirements = exact_capture_requirements(
             PERF_SAMPLE_DATA_SRC,
             Some(
-                AuxRequest::from_v0(&thekernel_linux_perf::PerfEventAttrV0 {
-                    flags: thekernel_linux_perf::ATTR_PRECISE_IP,
-                    ..thekernel_linux_perf::PerfEventAttrV0::default()
+                AuxRequest::from_v0(&tk_linux_perf::PerfEventAttrV0 {
+                    flags: tk_linux_perf::ATTR_PRECISE_IP,
+                    ..tk_linux_perf::PerfEventAttrV0::default()
                 })
                 .unwrap(),
             ),
@@ -3174,10 +3174,10 @@ mod tests {
         let requirements = exact_capture_requirements(
             PERF_SAMPLE_ADDR | PERF_SAMPLE_DATA_SRC | PERF_SAMPLE_BRANCH_STACK,
             Some(
-                AuxRequest::from_v0(&thekernel_linux_perf::PerfEventAttrV0 {
-                    flags: thekernel_linux_perf::ATTR_PRECISE_IP,
+                AuxRequest::from_v0(&tk_linux_perf::PerfEventAttrV0 {
+                    flags: tk_linux_perf::ATTR_PRECISE_IP,
                     sample_type: PERF_SAMPLE_BRANCH_STACK,
-                    ..thekernel_linux_perf::PerfEventAttrV0::default()
+                    ..tk_linux_perf::PerfEventAttrV0::default()
                 })
                 .unwrap(),
             ),

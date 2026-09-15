@@ -2,7 +2,7 @@ use alloc::{sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult};
 use linux_raw_sys::general::{CAP_SETGID, CAP_SETPCAP, CAP_SETUID};
-use thekernel_linux_cred::{
+use tk_linux_cred::{
     CapsetAuthority, CapsetRequest, GroupIdAuthority, GroupIdTransitionInput,
     SECURE_ALL_UNPRIVILEGED, UserIdAuthority, UserIdTransitionInput, plan_capset,
     plan_group_id_transition, plan_user_id_transition,
@@ -487,7 +487,7 @@ impl Thread {
 
     pub fn clear_ambient_capabilities(&self) -> AxResult<()> {
         let mut update = self.credential.prepare();
-        if update.builder.caps.ambient() == [0; thekernel_linux_cred::CAPABILITY_WORDS] {
+        if update.builder.caps.ambient() == [0; tk_linux_cred::CAPABILITY_WORDS] {
             return Ok(());
         }
         update.builder.caps.clear_ambient();
@@ -799,7 +799,7 @@ mod tests {
         );
         restrict.finish().unwrap().commit();
 
-        let requested = thekernel_linux_cred::SECBIT_EXEC_RESTRICT_FILE;
+        let requested = tk_linux_cred::SECBIT_EXEC_RESTRICT_FILE;
         let update = prepare_securebits_update(&slot, requested)
             .unwrap()
             .unwrap();

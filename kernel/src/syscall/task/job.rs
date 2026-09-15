@@ -1,7 +1,7 @@
 use axerrno::{AxError, AxResult, LinuxError};
 use axsync::Mutex;
 use axtask::{AxTaskRef, current};
-use thekernel_linux_process_adapter::{Pid, ProcessError};
+use tk_linux_process_adapter::{Pid, ProcessError};
 
 use crate::task::{
     AsThread, Cred, PidNamespace, Process, get_process_data, get_process_group,

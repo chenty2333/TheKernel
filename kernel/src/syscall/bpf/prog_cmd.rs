@@ -4,7 +4,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::mem::{offset_of, size_of};
 
 use axerrno::{AxError, AxResult};
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use crate::{
     bpf::{
@@ -290,7 +290,7 @@ fn valid_trace_expected_attach_type(prog_type: u32, attach_type: u32) -> bool {
         | crate::bpf::defs::BPF_PROG_TYPE_RAW_TRACEPOINT
         | crate::bpf::defs::BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE
         | crate::bpf::defs::BPF_PROG_TYPE_KPROBE => {
-            attach_type == thekernel_linux_bpf::BPF_PERF_EVENT
+            attach_type == tk_linux_bpf::BPF_PERF_EVENT
         }
         _ => false,
     }

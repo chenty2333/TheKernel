@@ -1,5 +1,5 @@
 #[cfg(not(target_arch = "x86_64"))]
-compile_error!("thekernel-linux-signal supports only x86_64");
+compile_error!("tk-linux-signal supports only x86_64");
 
 mod x86_64;
 pub use self::x86_64::*;

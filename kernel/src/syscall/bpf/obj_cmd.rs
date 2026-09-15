@@ -5,7 +5,7 @@ use core::mem::{offset_of, size_of};
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::FsPathBuf;
 use linux_raw_sys::general::AT_FDCWD;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use crate::{
     bpf::{

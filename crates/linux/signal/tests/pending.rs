@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use thekernel_linux_signal::{
+use tk_linux_signal::{
     PreparedSignal, SignalAction, SignalDisposition, SignalInfo, SignalQueueAccount, SignalSet,
     Signo,
     api::{ProcessSignalManager, SharedSignalActions, SignalActions, ThreadSignalManager},

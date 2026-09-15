@@ -12,7 +12,7 @@ use core::{
     mem::{self, offset_of},
 };
 
-use thekernel_linux_usercopy::{
+use tk_linux_usercopy::{
     UserCopyError, UserMemory, UserMemoryContext, VmMutPtr, VmPtr, VmResult,
 };
 

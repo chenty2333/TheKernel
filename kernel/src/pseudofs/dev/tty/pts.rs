@@ -410,7 +410,7 @@ mod tests {
 
     #[test]
     fn devpts_options_map_ids_and_reject_unmapped_or_malformed_values() {
-        use thekernel_linux_cred::{IdMapInputExtent, Kgid, Kuid};
+        use tk_linux_cred::{IdMapInputExtent, Kgid, Kuid};
         let _context = crate::test_support::scheduler_test_context();
         let ns = crate::task::UserNamespace::try_new_root().unwrap();
         let bwrap = DevPtsOptions::parse("newinstance,ptmxmode=0666,mode=620", &ns).unwrap();

@@ -1,6 +1,6 @@
-# thekernel-linux-signal
+# tk-linux-signal
 
-`thekernel-linux-signal` provides bounded Linux signal queues, process/thread
+`tk-linux-signal` provides bounded Linux signal queues, process/thread
 signal managers, architecture signal frames, alternate-stack handling, and
 transactional signal restore validation.
 
@@ -63,7 +63,7 @@ leader queues.
 Every userspace action/frame copy receives an explicit
 `UserMemoryContext`; the crate never obtains the current task or address space.
 Its only TheKernel Linux ABI workspace dependency is
-`thekernel-linux-usercopy`. Action and frame copies accept Linux-compatible
+`tk-linux-usercopy`. Action and frame copies accept Linux-compatible
 unaligned userspace addresses.
 
 Each `SignalQueueAccount` requires an explicit finite hard limit and rejects
@@ -87,9 +87,11 @@ invalidates it, and generation exhaustion is a typed error rather than an ABA
 wrap. Signal frames expose the actual interrupted alternate-stack snapshot,
 including computed `SS_ONSTACK` state.
 
-Version 0.1.0 is nightly-only because fallible `Arc::try_new` queue and
-endpoint allocation requires `allocator_api`. It follows the workspace's
-rolling nightly toolchain and does not claim a stable `rust-version`.
+The crate uses the root-pinned `nightly-2026-08-23` toolchain
+(`rustc 1.100.0-nightly`, commit `c54751567`, dated 2026-08-22).
+`rust-version` inherits the workspace's `1.100`; this is not a stable-Rust
+compatibility guarantee. Fallible `Arc::try_new` queue and endpoint allocation
+requires `allocator_api`.
 
 The 0.1.0 release-supported target is x86_64. Signal frames and the restorer
 layout are fixed to the Linux x86_64 ABI.

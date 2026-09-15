@@ -1259,7 +1259,7 @@ mod tests {
         VfsResult,
     };
     use linux_raw_sys::general::{CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_MKNOD, CAP_SYS_ADMIN};
-    use thekernel_linux_cred::{InodeMknodKind, Kgid, Kuid};
+    use tk_linux_cred::{InodeMknodKind, Kgid, Kuid};
 
     use super::*;
     use crate::{

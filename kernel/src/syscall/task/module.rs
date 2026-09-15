@@ -9,7 +9,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axtask::{WaitQueue, current};
 use linux_raw_sys::general::{CAP_SYS_MODULE, O_ACCMODE, O_NONBLOCK, O_TRUNC, O_WRONLY};
 use spin::Lazy;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded};
 
 use crate::{
     file::{File, FileLike, get_typed_file},

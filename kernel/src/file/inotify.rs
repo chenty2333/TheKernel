@@ -87,7 +87,7 @@ impl QueuedEvent {
     }
 
     fn encoded_name_len(&self) -> usize {
-        thekernel_linux_fsnotify::inotify_name_wire_len(self.name.len(), size_of::<inotify_event>())
+        tk_linux_fsnotify::inotify_name_wire_len(self.name.len(), size_of::<inotify_event>())
     }
 }
 
@@ -500,18 +500,18 @@ impl InotifyFile {
             .iter_mut()
             .flatten()
             .find(|watch| watch.key == key);
-        let plan = thekernel_linux_fsnotify::plan_inotify_watch(mask, existing.is_some()).map_err(
+        let plan = tk_linux_fsnotify::plan_inotify_watch(mask, existing.is_some()).map_err(
             |error| match error {
-                thekernel_linux_fsnotify::InotifyWatchReject::ConflictingUpdateFlags => {
+                tk_linux_fsnotify::InotifyWatchReject::ConflictingUpdateFlags => {
                     AxError::InvalidInput
                 }
-                thekernel_linux_fsnotify::InotifyWatchReject::ExistingWatch => {
+                tk_linux_fsnotify::InotifyWatchReject::ExistingWatch => {
                     AxError::AlreadyExists
                 }
             },
         )?;
         if let Some(watch) = existing {
-            if plan == thekernel_linux_fsnotify::InotifyWatchPlan::Add {
+            if plan == tk_linux_fsnotify::InotifyWatchPlan::Add {
                 watch.mask |= persistent_mask;
             } else {
                 watch.mask = persistent_mask;
@@ -623,13 +623,13 @@ impl InotifyFile {
             return false;
         }
         if matches!(
-            thekernel_linux_fsnotify::plan_queue_admission(
+            tk_linux_fsnotify::plan_queue_admission(
                 state.queue.len(),
                 MAX_QUEUED_EVENTS,
                 false,
                 event.mask == IN_Q_OVERFLOW,
             ),
-            thekernel_linux_fsnotify::QueueAdmission::Overflow
+            tk_linux_fsnotify::QueueAdmission::Overflow
         ) {
             return Self::enqueue_overflow_locked(state);
         }
@@ -1094,7 +1094,7 @@ fn emit_to_matching_watches(
 }
 
 fn exact_dir_mask(mask: u32, is_dir: bool) -> u32 {
-    thekernel_linux_fsnotify::inotify_exact_mask(
+    tk_linux_fsnotify::inotify_exact_mask(
         mask,
         is_dir,
         IN_MOVE_SELF,
@@ -1238,7 +1238,7 @@ pub(crate) fn notify_parent_with_name(
 }
 
 fn inotify_to_fanotify(mask: u32) -> u64 {
-    thekernel_linux_fsnotify::inotify_to_fanotify(mask)
+    tk_linux_fsnotify::inotify_to_fanotify(mask)
 }
 
 pub(crate) fn notify_dnotify_rename(old_parent: &Location, new_parent: &Location) -> AxResult<()> {

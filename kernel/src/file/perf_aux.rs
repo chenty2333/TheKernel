@@ -5,7 +5,7 @@
 //! only after the platform has identified a concrete PT or BTS backend.
 
 use axerrno::{AxError, AxResult};
-use thekernel_linux_perf::{
+use tk_linux_perf::{
     ATTR_EXCLUDE_KERNEL, ATTR_EXCLUDE_USER, ATTR_PRECISE_IP, PERF_AUX_ACTION_ALL,
     PERF_AUX_FLAG_OVERWRITE, PERF_AUX_FLAG_TRUNCATED, PERF_SAMPLE_AUX, PERF_SAMPLE_BRANCH_STACK,
     PerfEventAttr, PerfEventAttrV0,

@@ -6,7 +6,7 @@
 use core::mem::{offset_of, size_of};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use crate::{
     bpf::{read_bpf_attr, read_user_bytes, write_bpf_attr_value, write_user_bytes},

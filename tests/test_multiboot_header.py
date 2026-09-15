@@ -33,9 +33,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BOOT_RS = ROOT / "crates/ax/thekernel-axplat-x86-pc/src/boot.rs"
-MULTIBOOT_S = ROOT / "crates/ax/thekernel-axplat-x86-pc/src/multiboot.S"
-BUILD_RS = ROOT / "crates/ax/thekernel-axplat-x86-pc/build.rs"
+BOOT_RS = ROOT / "crates/ax/tk-axplat-x86-pc/src/boot.rs"
+MULTIBOOT_S = ROOT / "crates/ax/tk-axplat-x86-pc/src/multiboot.S"
+BUILD_RS = ROOT / "crates/ax/tk-axplat-x86-pc/build.rs"
 
 # The Multiboot2 header tag alignment.  GRUB's `multiboot_mbi2.c` advances with
 # `ALIGN_UP(tag->size, MULTIBOOT_TAG_ALIGN)`, and that constant is 8.

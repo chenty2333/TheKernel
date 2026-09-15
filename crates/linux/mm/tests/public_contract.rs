@@ -1,4 +1,4 @@
-use thekernel_linux_mm::*;
+use tk_linux_mm::*;
 
 const PAGE: usize = 4096;
 

@@ -3968,7 +3968,7 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
                         NodePermission::from_bits_truncate(0o444),
                         || {
                             Ok(
-                                format!("{}\n", thekernel_linux_cred::USER_NAMESPACE_OVERFLOW_ID)
+                                format!("{}\n", tk_linux_cred::USER_NAMESPACE_OVERFLOW_ID)
                                     .into_bytes(),
                             )
                         },
@@ -4600,7 +4600,7 @@ mod tests {
             let count = file.read_at(&mut bytes, 0).unwrap();
             assert_eq!(
                 &bytes[..count],
-                format!("{}\n", thekernel_linux_cred::USER_NAMESPACE_OVERFLOW_ID).as_bytes()
+                format!("{}\n", tk_linux_cred::USER_NAMESPACE_OVERFLOW_ID).as_bytes()
             );
             assert_eq!(file.read_at(&mut bytes, count as u64).unwrap(), 0);
         }

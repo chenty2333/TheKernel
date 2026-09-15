@@ -1,7 +1,7 @@
 # TheKernel Linux process adapter
 
 This unpublished adapter binds TheKernel's durable wait/accounting/security
-payload to the explicit-domain `thekernel-linux-process` 0.1.0 core. It
+payload to the explicit-domain `tk-linux-process` 0.1.0 core. It
 deliberately owns no hidden global process registry or zombie side table. The
 kernel creates one `ProcessDomain` and chooses the credential parameter used
 by `ZombieSnapshot<C>`.

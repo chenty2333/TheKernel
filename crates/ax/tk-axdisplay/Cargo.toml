@@ -1,0 +1,18 @@
+[package]
+description = "Display surface management for the TheKernel platform"
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+name = "tk-axdisplay"
+version = "0.3.0-preview.2"
+edition = "2024"
+license = "GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0"
+
+[dependencies]
+axdriver = { package = "tk-axdriver", path = "../tk-axdriver", version = "=0.3.0-preview.2", features = ["display"] }
+axsync = { package = "tk-axsync", path = "../tk-axsync", version = "=0.3.0-preview.2" }
+lazyinit = "0.2"
+log = "0.4"
+
+[package.metadata.thekernel]
+layer = "platform"

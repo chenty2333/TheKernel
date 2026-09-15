@@ -1,6 +1,6 @@
-# thekernel-linux-rseq
+# tk-linux-rseq
 
-`thekernel-linux-rseq` is a `no_std`, `forbid(unsafe_code)` policy leaf for
+`tk-linux-rseq` is a `no_std`, `forbid(unsafe_code)` policy leaf for
 the Linux v6.6 restartable-sequence ABI. It provides:
 
 - ABI-compatible 32-byte, 32-byte-aligned `RseqArea` and

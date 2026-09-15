@@ -29,8 +29,8 @@ use linux_raw_sys::{
 };
 use spin::{Lazy, Mutex, MutexGuard};
 #[cfg(test)]
-use thekernel_linux_net::NETLINK_MAX_MESSAGE_BYTES;
-use thekernel_linux_net::{
+use tk_linux_net::NETLINK_MAX_MESSAGE_BYTES;
+use tk_linux_net::{
     NETLINK_DEFAULT_SEND_BUFFER_BYTES, NetlinkQueueAdmission, NetlinkWriteAdmission,
     admit_netlink_queue, admit_netlink_write,
 };

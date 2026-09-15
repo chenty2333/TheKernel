@@ -1,8 +1,10 @@
 [package]
-name = "thekernel-linux-arch-x86-64"
+repository.workspace = true
+publish.workspace = true
+name = "tk-linux-arch-x86-64"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 license = "Apache-2.0"
 description = "Pure x86_64 Linux ABI policy plans"
 

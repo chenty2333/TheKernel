@@ -15,7 +15,7 @@ use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
 use bytemuck::{Pod, Zeroable};
 use linux_raw_sys::general::CAP_SYS_ADMIN;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::{
     file::{
@@ -202,7 +202,7 @@ impl LandlockRuleset {
         // Rules covering different ancestors compose: a child may grant one
         // handled right while an enclosing hierarchy grants another.  A bit
         // absent from every matching rule remains denied.
-        thekernel_linux_landlock::allows_path_access(
+        tk_linux_landlock::allows_path_access(
             self.fs,
             access,
             self.paths
@@ -218,7 +218,7 @@ impl LandlockRuleset {
         destination: &axfs_ng_vfs::Location,
         access: u64,
     ) -> bool {
-        thekernel_linux_landlock::destination_is_no_less_restrictive(
+        tk_linux_landlock::destination_is_no_less_restrictive(
             self.fs,
             access,
             self.allowed_path_access(source),
@@ -335,14 +335,14 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
     match rule_type {
         RULE_PATH_BENEATH => {
             let a: PathBeneathAttr = read_value(memory, rule_attr.cast())?;
-            match thekernel_linux_landlock::admit_path_rule_access(ruleset.fs, a.allowed) {
-                Err(thekernel_linux_landlock::PathRuleReject::EmptyAccess) => {
+            match tk_linux_landlock::admit_path_rule_access(ruleset.fs, a.allowed) {
+                Err(tk_linux_landlock::PathRuleReject::EmptyAccess) => {
                     return Err(LinuxError::ENOMSG.into());
                 }
-                Err(thekernel_linux_landlock::PathRuleReject::UnhandledAccess) => {
+                Err(tk_linux_landlock::PathRuleReject::UnhandledAccess) => {
                     return Err(AxError::InvalidInput);
                 }
-                Err(thekernel_linux_landlock::PathRuleReject::NonDirectoryAccess) | Ok(()) => {}
+                Err(tk_linux_landlock::PathRuleReject::NonDirectoryAccess) | Ok(()) => {}
             }
             // A present descriptor of an unsupported object type is EBADFD;
             // an absent descriptor remains EBADF.
@@ -353,17 +353,17 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
                     return Err(LinuxError::EBADFD.into());
                 }
             };
-            match thekernel_linux_landlock::admit_path_rule(
+            match tk_linux_landlock::admit_path_rule(
                 ruleset.fs,
                 a.allowed,
                 location.is_dir(),
             ) {
-                Err(thekernel_linux_landlock::PathRuleReject::NonDirectoryAccess) => {
+                Err(tk_linux_landlock::PathRuleReject::NonDirectoryAccess) => {
                     return Err(AxError::InvalidInput);
                 }
                 Err(
-                    thekernel_linux_landlock::PathRuleReject::EmptyAccess
-                    | thekernel_linux_landlock::PathRuleReject::UnhandledAccess,
+                    tk_linux_landlock::PathRuleReject::EmptyAccess
+                    | tk_linux_landlock::PathRuleReject::UnhandledAccess,
                 ) => unreachable!("validated before descriptor lookup"),
                 Ok(()) => {}
             }

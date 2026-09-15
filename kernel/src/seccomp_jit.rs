@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 use axcbpf::{Instruction, NativeWordInput, Program};
 use axerrno::{AxError, LinuxError};
-use thekernel_linux_seccomp::{SeccompExecutor, VerifiedProgram};
+use tk_linux_seccomp::{SeccompExecutor, VerifiedProgram};
 
 /// Executor choice used by the two classic-BPF adapters.
 ///
@@ -508,7 +508,7 @@ mod tests {
     use alloc::{vec, vec::Vec};
 
     use axcbpf::opcode;
-    use thekernel_linux_seccomp::{ClassicBpfInstruction, SECCOMP_RET_ALLOW, VerifiedProgram};
+    use tk_linux_seccomp::{ClassicBpfInstruction, SECCOMP_RET_ALLOW, VerifiedProgram};
 
     use super::*;
 
@@ -516,15 +516,15 @@ mod tests {
     // incidental address of a byte-array literal. The spare byte also lets
     // the boundary test construct an exactly 64-byte misaligned view.
     #[repr(align(4))]
-    struct AlignedInput([u8; thekernel_linux_seccomp::SECCOMP_DATA_SIZE + 1]);
+    struct AlignedInput([u8; tk_linux_seccomp::SECCOMP_DATA_SIZE + 1]);
 
     impl AlignedInput {
         fn zeroed() -> Self {
-            Self([0; thekernel_linux_seccomp::SECCOMP_DATA_SIZE + 1])
+            Self([0; tk_linux_seccomp::SECCOMP_DATA_SIZE + 1])
         }
 
         fn bytes(&self) -> &[u8] {
-            &self.0[..thekernel_linux_seccomp::SECCOMP_DATA_SIZE]
+            &self.0[..tk_linux_seccomp::SECCOMP_DATA_SIZE]
         }
     }
 
@@ -586,7 +586,7 @@ mod tests {
         let input = AlignedInput::zeroed();
         assert_eq!(executor.execute(input.bytes()), SECCOMP_RET_ALLOW);
         let unaligned = &input.0[1..];
-        assert_eq!(unaligned.len(), thekernel_linux_seccomp::SECCOMP_DATA_SIZE);
+        assert_eq!(unaligned.len(), tk_linux_seccomp::SECCOMP_DATA_SIZE);
         assert_eq!(executor.execute(unaligned), 0);
     }
 

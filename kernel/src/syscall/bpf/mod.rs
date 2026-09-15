@@ -10,8 +10,8 @@ mod prog_cmd;
 mod task_fd_cmd;
 
 use axerrno::{AxError, AxResult};
-use thekernel_linux_bpf::BpfCommand;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+use tk_linux_bpf::BpfCommand;
+use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
 pub use self::{
     batch_cmd::*, id_cmd::*, link_cmd::*, map_cmd::*, obj_cmd::*, object_cmd::*, prog_cmd::*,

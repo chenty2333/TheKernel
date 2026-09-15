@@ -1,6 +1,6 @@
 use std::sync::{Arc, Barrier};
 
-use thekernel_linux_signal::{
+use tk_linux_signal::{
     PreparedSignal, SignalAction, SignalActionFlags, SignalDisposition, SignalInfo,
     SignalQueueAccount, SignalSet, Signo,
     api::{ProcessSignalManager, SharedSignalActions, SignalActions, ThreadSignalManager},
@@ -341,7 +341,7 @@ fn can_restart() {
 
 #[test]
 fn registration_identity_is_explicit_unique_and_reusable_after_cancel() {
-    use thekernel_linux_signal::api::ThreadRegistrationError;
+    use tk_linux_signal::api::ThreadRegistrationError;
 
     let env = TestEnv::new();
     let first = ThreadSignalManager::try_new(env.proc.clone()).unwrap();
@@ -367,7 +367,7 @@ fn registration_identity_is_explicit_unique_and_reusable_after_cancel() {
 
 #[test]
 fn thread_registry_limit_is_finite_refunded_and_configurable() {
-    use thekernel_linux_signal::api::{SignalManagerConfigError, ThreadRegistrationError};
+    use tk_linux_signal::api::{SignalManagerConfigError, ThreadRegistrationError};
 
     assert!(matches!(
         ProcessSignalManager::try_with_thread_limit(
@@ -400,7 +400,7 @@ fn thread_registry_limit_is_finite_refunded_and_configurable() {
 
 #[test]
 fn cancelled_admission_token_cannot_resurrect_a_stale_endpoint() {
-    use thekernel_linux_signal::api::ThreadRegistrationError;
+    use tk_linux_signal::api::ThreadRegistrationError;
 
     let env = TestEnv::new();
     let thread = ThreadSignalManager::try_new(env.proc.clone()).unwrap();
@@ -604,7 +604,7 @@ fn sigkill_and_sigstop_actions_are_rejected_and_remain_default() {
 
             assert!(matches!(
                 manager.try_replace_action(signo, decorated_action(disposition)),
-                Err(thekernel_linux_signal::api::SignalActionUpdateError::UncatchableSignal)
+                Err(tk_linux_signal::api::SignalActionUpdateError::UncatchableSignal)
             ));
             assert_canonical_default(manager.action(signo));
         }

@@ -77,7 +77,7 @@ worth keeping: the Intel modules carried 20 findings between them (`gmbus.rs` 3,
 (`mod.rs`, `gmbus/tests.rs`), and **the gate exits 0 either way**, because it
 denies only `correctness` and `suspicious` lints -- the rest are warnings that
 scroll past.  `fix/intel-lint-warnings` (merged as `a23e8448`) cleared both sets.
-Measured on the merged tip: `lint --platform n305` reports `thekernel-kernel
+Measured on the merged tip: `lint --platform n305` reports `tk-kernel
 (lib) generated 337 warnings`, down from 357, the difference being exactly those
 20, and **none of the 337 is under `kernel/src/drm/intel/`**; no denied lint
 anywhere in the tree.  Every number in this document was re-measured on the

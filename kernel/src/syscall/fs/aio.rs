@@ -32,10 +32,10 @@ use linux_raw_sys::general::{
 // the same critical sections with a spin mutex.
 #[cfg(test)]
 use spin::Mutex;
-use thekernel_linux_aio::{AioContextId as AbiAioContextId, AioContextSnapshot, plan_destroy};
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_signal::SignalSet;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
+use tk_linux_aio::{AioContextId as AbiAioContextId, AioContextSnapshot, plan_destroy};
+use tk_linux_process_adapter::Pid;
+use tk_linux_signal::SignalSet;
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use super::io::{
     ClassicAioOperation, ClassicAioOwnedPreparation, execute_classic_aio_operation_cancellable,

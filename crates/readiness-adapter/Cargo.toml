@@ -1,8 +1,10 @@
 [package]
-name = "thekernel-readiness-adapter"
+repository.workspace = true
+rust-version.workspace = true
+name = "tk-readiness-adapter"
 version = "0.1.0"
 edition = "2024"
-publish = false
+publish.workspace = true
 description = "TheKernel object-readiness adapter over bounded ax and Linux FD contracts"
 license = "Apache-2.0"
 
@@ -15,7 +17,7 @@ path = "src/lib.rs"
 
 [dependencies]
 axerrno = "0.2"
-axpoll-core = { package = "thekernel-axpoll", path = "../ax/thekernel-axpoll", version = "=0.1.0" }
+axpoll-core = { package = "tk-axpoll", path = "../ax/tk-axpoll", version = "=0.1.0" }
 
 [package.metadata.thekernel]
 layer = "integration"

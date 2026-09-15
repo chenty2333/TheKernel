@@ -63,7 +63,7 @@ and [Generic Loader](https://www.qemu.org/docs/master/system/generic-loader.html
 | Observation | Source and limit |
 |---|---|
 | Host tools are available | Reviewed host: GCC 16.2.1, clang 22.1.8, QEMU 10.2.2; accelerator help includes `tcg` and `kvm`. These are not guest-tool version selections. |
-| Kernel C and guest C have different build paths | `crates/ax/thekernel-lwext4-rust/build.rs::discover_llvm_freestanding_toolchain` selects clang for the freestanding C component. `scripts/build-rootfs.sh` uses the selected host/cross GCC to statically build BusyBox, init and guest helpers. |
+| Kernel C and guest C have different build paths | `crates/ax/tk-lwext4-rust/build.rs::discover_llvm_freestanding_toolchain` selects clang for the freestanding C component. `scripts/build-rootfs.sh` uses the selected host/cross GCC to statically build BusyBox, init and guest helpers. |
 | The default rootfs is 96 MiB | `scripts/build-rootfs.sh`: `SIZE_MB=96`; `--size-mb` already exists. |
 | The current system suite has 42 cases | `tests/guest/system-init.c::suite`; `io-uring-directio` is case 27. |
 | An existing daily log reports success | `~/.cache/thekernel-targets/dev/accept-daily.log` contains `1..42`, case 27 `result=0`, `guest-tcg: PASS` and `daily: PASS`. Reading this log is not a fresh acceptance run. |
@@ -536,7 +536,7 @@ neither was required by the probe.
 **The one required failure was real and has been fixed.** `/proc/cpuinfo`
 emitted `processor` records and nothing else — no `flags` field at all — so
 nothing in the guest could discover which CPU features are usable. The fix
-decodes the flags from CPUID in a pure function in the `thekernel-axcpu`
+decodes the flags from CPUID in a pure function in the `tk-axcpu`
 crate, host-tested against real CPUID values, keeping the OS-state gating that
 crate already applies: `xsave`/`osxsave` follow `CR4.OSXSAVE`, `avx` requires
 `XCR0` to select SSE and YMM, and `fsgsbase` requires `CR4.FSGSBASE`. That last

@@ -12,8 +12,8 @@ use axerrno::{AxError, AxResult};
 use axhal::paging::MappingFlags;
 use axsync::Mutex;
 use memory_addr::{PAGE_SIZE_4K, VirtAddr};
-use thekernel_linux_mm::{MincorePlan, MmError};
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, vm_write_slice};
+use tk_linux_mm::{MincorePlan, MmError};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, vm_write_slice};
 
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
@@ -176,7 +176,7 @@ mod tests {
     use alloc::sync::Arc;
     use core::{mem::MaybeUninit, ptr};
 
-    use thekernel_linux_usercopy::{UserCopyError, VmResult};
+    use tk_linux_usercopy::{UserCopyError, VmResult};
 
     use super::*;
 

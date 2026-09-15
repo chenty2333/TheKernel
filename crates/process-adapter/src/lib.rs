@@ -1,4 +1,4 @@
-//! TheKernel-specific payload adapter for `thekernel-linux-process`.
+//! TheKernel-specific payload adapter for `tk-linux-process`.
 //!
 //! The reusable crate keeps zombie state generic and requires an explicit
 //! [`ProcessDomain`]. TheKernel records Linux wait status, CPU accounting, and
@@ -270,7 +270,7 @@ impl<C, R> PreparedZombieExit<C, R> {
 }
 
 /// Process identifier, also used for thread, group, and session identifiers.
-pub type Pid = thekernel_linux_process::Pid;
+pub type Pid = tk_linux_process::Pid;
 
 /// Largest Linux PID/TID representable through signed `pid_t` syscall ABIs.
 ///
@@ -307,53 +307,53 @@ pub const fn try_pid_from_task_id(task_id: u64) -> Result<Pid, LinuxTaskIdError>
 }
 
 /// TheKernel process object parameterized by credential and reap provenance.
-pub type Process<C, R = ()> = thekernel_linux_process::Process<ZombieSnapshot<C, R>>;
+pub type Process<C, R = ()> = tk_linux_process::Process<ZombieSnapshot<C, R>>;
 /// TheKernel process group parameterized by credential and reap provenance.
-pub type ProcessGroup<C, R = ()> = thekernel_linux_process::ProcessGroup<ZombieSnapshot<C, R>>;
+pub type ProcessGroup<C, R = ()> = tk_linux_process::ProcessGroup<ZombieSnapshot<C, R>>;
 /// TheKernel session parameterized by credential and reap provenance.
-pub type Session<C, R = ()> = thekernel_linux_process::Session<ZombieSnapshot<C, R>>;
+pub type Session<C, R = ()> = tk_linux_process::Session<ZombieSnapshot<C, R>>;
 /// TheKernel explicit process-domain owner.
-pub type ProcessDomain<C, R = ()> = thekernel_linux_process::ProcessDomain<ZombieSnapshot<C, R>>;
+pub type ProcessDomain<C, R = ()> = tk_linux_process::ProcessDomain<ZombieSnapshot<C, R>>;
 /// One PID-namespace reparenting scope owned by a process domain.
-pub type ReaperScope<C, R = ()> = thekernel_linux_process::ReaperScope<ZombieSnapshot<C, R>>;
+pub type ReaperScope<C, R = ()> = tk_linux_process::ReaperScope<ZombieSnapshot<C, R>>;
 /// Read-only registry handle supplied by the explicit domain.
 pub type ProcessRegistry<C, R = ()> =
-    thekernel_linux_process::ProcessRegistry<ZombieSnapshot<C, R>>;
+    tk_linux_process::ProcessRegistry<ZombieSnapshot<C, R>>;
 /// Unpublished process admission transaction.
 pub type ProcessAdmission<C, R = ()> =
-    thekernel_linux_process::ProcessAdmission<ZombieSnapshot<C, R>>;
+    tk_linux_process::ProcessAdmission<ZombieSnapshot<C, R>>;
 /// Type-bound unpublished process plus initial-thread publication transaction.
 pub type InitialProcessAdmission<C, R = ()> =
-    thekernel_linux_process::InitialProcessAdmission<ZombieSnapshot<C, R>>;
+    tk_linux_process::InitialProcessAdmission<ZombieSnapshot<C, R>>;
 /// Reserved namespace-init process plus its initial-thread publication.
 pub type ScopedInitialProcessAdmission<C, R = ()> =
-    thekernel_linux_process::ScopedInitialProcessAdmission<ZombieSnapshot<C, R>>;
+    tk_linux_process::ScopedInitialProcessAdmission<ZombieSnapshot<C, R>>;
 /// Fully validated final process-exit transaction.
 pub type ProcessExitAdmission<C, R = ()> =
-    thekernel_linux_process::ProcessExitAdmission<ZombieSnapshot<C, R>>;
+    tk_linux_process::ProcessExitAdmission<ZombieSnapshot<C, R>>;
 /// Completed zombie publication with its linearized notification parent.
 pub type CommittedProcessExit<C, R = ()> =
-    thekernel_linux_process::CommittedProcessExit<ZombieSnapshot<C, R>>;
+    tk_linux_process::CommittedProcessExit<ZombieSnapshot<C, R>>;
 /// One authoritative bounded child-to-reaper handoff batch.
 pub type ProcessReparentBatch<C, R = ()> =
-    thekernel_linux_process::ProcessReparentBatch<ZombieSnapshot<C, R>>;
+    tk_linux_process::ProcessReparentBatch<ZombieSnapshot<C, R>>;
 /// One process moved by an authoritative reparent handoff batch.
 pub type ReparentedProcess<C, R = ()> =
-    thekernel_linux_process::ReparentedProcess<ZombieSnapshot<C, R>>;
+    tk_linux_process::ReparentedProcess<ZombieSnapshot<C, R>>;
 /// Domain-coordinated live-thread removal and final-exit admission result.
 pub type ThreadExitTransition<C, R = ()> =
-    thekernel_linux_process::ThreadExitTransition<ZombieSnapshot<C, R>>;
+    tk_linux_process::ThreadExitTransition<ZombieSnapshot<C, R>>;
 /// Unpublished thread admission transaction.
 pub type ThreadAdmission<C, R = ()> =
-    thekernel_linux_process::ThreadAdmission<ZombieSnapshot<C, R>>;
+    tk_linux_process::ThreadAdmission<ZombieSnapshot<C, R>>;
 /// Ordered live-thread iterator.
-pub type ThreadIds<C, R = ()> = thekernel_linux_process::ThreadIds<ZombieSnapshot<C, R>>;
+pub type ThreadIds<C, R = ()> = tk_linux_process::ThreadIds<ZombieSnapshot<C, R>>;
 /// PID-ordered iterator over the explicit domain's published processes.
-pub type Processes<'a, C, R = ()> = thekernel_linux_process::Processes<'a, ZombieSnapshot<C, R>>;
+pub type Processes<'a, C, R = ()> = tk_linux_process::Processes<'a, ZombieSnapshot<C, R>>;
 /// Newly created session and process-group pair.
-pub type CreatedSession<C, R = ()> = thekernel_linux_process::CreatedSession<ZombieSnapshot<C, R>>;
+pub type CreatedSession<C, R = ()> = tk_linux_process::CreatedSession<ZombieSnapshot<C, R>>;
 
-pub use thekernel_linux_process::{
+pub use tk_linux_process::{
     ExitOutcome, PROCESS_MEMBERSHIP_LIMIT, ProcessError, ThreadExitOutcome,
     ThreadPublicationOutcome,
 };

@@ -4,7 +4,7 @@
 //! closure, accounting — before anything is mutated, so a planning failure
 //! aborts with the manager untouched.
 
-use thekernel_linux_keyring::GcScratchState as LinuxGcScratchState;
+use tk_linux_keyring::GcScratchState as LinuxGcScratchState;
 
 use super::*;
 
@@ -34,7 +34,7 @@ impl KeyManager {
             .checked_add(1)
             .ok_or(AxError::BadState)?;
         key.gc_plan = GcPlanScratch {
-            policy: thekernel_linux_keyring::GcScratch::touch(build.epoch)
+            policy: tk_linux_keyring::GcScratch::touch(build.epoch)
                 .map_err(|_| AxError::BadState)?,
             touched_next: build.touched_head,
             work_next: None,

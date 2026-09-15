@@ -17,7 +17,7 @@ use axnet::packet::{
 use axnet::packet::{PacketAncillaryMetadata, PacketMetadata as LinkPacketMetadata};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::net::socklen_t;
-use thekernel_linux_packet::{
+use tk_linux_packet::{
     SocketFilterAncillary, SocketFilterSnapshot, classify_socket_filter_ancillary,
     is_socket_filter_ancillary_offset,
 };
@@ -640,7 +640,7 @@ mod tests {
                 Self::VlanTagPresent => SocketFilterAncillary::VlanTagPresent,
                 Self::VlanTpid => SocketFilterAncillary::VlanTpid,
             };
-            thekernel_linux_packet::encoded_socket_filter_ancillary(field)
+            tk_linux_packet::encoded_socket_filter_ancillary(field)
         }
     }
 

@@ -31,7 +31,7 @@
 # Multiboot handoff.
 arch = "x86_64"
 platform = "x86-pc"
-package = "thekernel-axplat-x86-pc"
+package = "tk-axplat-x86-pc"
 
 [plat]
 # The i3-N305 has eight Gracemont E-cores and no SMT: eight logical CPUs, all

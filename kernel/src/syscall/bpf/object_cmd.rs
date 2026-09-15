@@ -4,8 +4,8 @@ use core::mem::{offset_of, size_of};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use linux_raw_sys::general::CAP_SYS_ADMIN;
-use thekernel_linux_bpf::BpfAttrEnableStats;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+use tk_linux_bpf::BpfAttrEnableStats;
+use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use crate::{
     bpf::{

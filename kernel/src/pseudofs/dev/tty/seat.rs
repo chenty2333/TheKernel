@@ -11,7 +11,7 @@ use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::Location;
 use axsync::Mutex;
 use lazy_static::lazy_static;
-use thekernel_linux_process_adapter::Pid;
+use tk_linux_process_adapter::Pid;
 
 use crate::file::posix_acl;
 

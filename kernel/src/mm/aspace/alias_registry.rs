@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use axerrno::{AxError, AxResult};
 use axsync::Mutex;
-use thekernel_linux_mm::AddressSpaceId;
+use tk_linux_mm::AddressSpaceId;
 
 use super::AddrSpace;
 

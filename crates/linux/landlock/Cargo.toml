@@ -1,9 +1,10 @@
 [package]
-name = "thekernel-linux-landlock"
+repository.workspace = true
+name = "tk-linux-landlock"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-publish = false
+rust-version.workspace = true
+publish.workspace = true
 description = "Bounded immutable filesystem access-policy planning for TheKernel"
 license = "Apache-2.0"
 

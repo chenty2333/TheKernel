@@ -21,7 +21,7 @@ use axerrno::AxError;
 use axfs_ng_vfs::{Location, ObjectKey};
 use axsync::spin::SpinNoIrq;
 use bytemuck::AnyBitPattern;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use crate::mm::map_usercopy_error;
 

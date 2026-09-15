@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use axerrno::{AxError, AxResult, LinuxError};
 use axnet::{InterfaceInfo, InterfaceKind, IpAddress, NetStack};
 use linux_raw_sys::net::net_device_flags;
-use thekernel_linux_net::{
+use tk_linux_net::{
     IFCONF_SIZE, IFREQ_SIZE, IfconfWire, IfreqOutput, IfreqRequest, IfreqWire, encode_ifconf_ipv4,
     ifconf_entry_offset, ifreq_name_eq,
 };
@@ -36,7 +36,7 @@ fn read_ifreq(context: &IoctlContext, address: usize) -> AxResult<IfreqWire> {
 
 fn interface_by_name<'a>(
     interfaces: &'a [InterfaceInfo],
-    name: &[u8; thekernel_linux_net::IFNAMSIZ],
+    name: &[u8; tk_linux_net::IFNAMSIZ],
 ) -> Option<&'a InterfaceInfo> {
     interfaces
         .iter()

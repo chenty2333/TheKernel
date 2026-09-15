@@ -29,7 +29,7 @@ mod world;
 // Re-exports from split sub-modules — keep the old `crate::task::*` paths unchanged.
 #[cfg(test)]
 pub(crate) use creds::CapabilityState;
-pub(crate) use thekernel_linux_cred::{
+pub(crate) use tk_linux_cred::{
     CredError, FileCapabilities, ID_MAP_MAX_EXTENTS, IdMap, IdMapInputExtent, Kgid, Kuid,
     SECURITY_CAPABILITY_XATTR_NAME, SignalDeliveryScope, SignalNumber, SignalSecurityOperation,
     SignalSecuritySource, UserGid, UserUid, XATTR_NAME_MAX, validate_id_map_input,

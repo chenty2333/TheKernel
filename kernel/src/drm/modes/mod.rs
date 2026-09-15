@@ -10,7 +10,7 @@
 //! debug endpoint) calls one function:
 //!
 //! ```
-//! # use thekernel_kernel::drm::modes::{Constraints, plan_modeset};
+//! # use tk_kernel::drm::modes::{Constraints, plan_modeset};
 //! # fn main() {
 //! # let edid_bytes: &[u8] = &[];
 //! let plan = plan_modeset(edid_bytes, &Constraints::unlimited());
@@ -30,8 +30,8 @@
 //! Drivers that want to make their own decision use the pieces directly:
 //!
 //! ```
-//! # use thekernel_kernel::drm::modes::{Constraints, ModeList, collect_modes, select, Edid};
-//! # fn main() -> Result<(), thekernel_kernel::drm::modes::EdidError> {
+//! # use tk_kernel::drm::modes::{Constraints, ModeList, collect_modes, select, Edid};
+//! # fn main() -> Result<(), tk_kernel::drm::modes::EdidError> {
 //! # let edid_bytes: &[u8] = &[];
 //! let edid = Edid::parse(edid_bytes)?;
 //! let mut modes = ModeList::new();

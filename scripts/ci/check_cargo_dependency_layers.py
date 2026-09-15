@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
 
 ALLOWED = {
     "mechanism": {"mechanism"},
@@ -50,6 +51,31 @@ def violations(data: dict, root: Path) -> list[str]:
     return errors
 
 
+def workspace_policy_violations(data: dict, root: Path) -> list[str]:
+    """Keep controlled packages on one compiler and an explicit release policy."""
+    policy = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]
+    errors = []
+    members = set(data["workspace_members"])
+    for package in data["packages"]:
+        if package["id"] not in members:
+            continue
+        name = package["name"]
+        if name != "thekernel" and not name.startswith("tk-"):
+            errors.append(f"{name}: component package must use the tk- prefix")
+        for field, expected in (("rust_version", policy["rust-version"]),
+                                ("repository", policy["repository"]),
+                                ("publish", [] if policy["publish"] is False else policy["publish"])):
+            if package.get(field) != expected:
+                errors.append(f"{name}: {field} differs from workspace policy")
+        directory = Path(package["manifest_path"]).resolve().parent
+        while directory != root and root in directory.parents:
+            for filename in ("rust-toolchain", "rust-toolchain.toml"):
+                if (directory / filename).exists():
+                    errors.append(f"{name}: component-local {filename} overrides workspace compiler")
+            directory = directory.parent
+    return errors
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--thekernel", type=Path, default=Path.cwd())
@@ -60,7 +86,9 @@ def main(argv: list[str] | None = None) -> int:
             "--filter-platform", "x86_64-unknown-none", "--manifest-path",
             str(args.thekernel.resolve() / "Cargo.toml"),
         ], check=True, capture_output=True, text=True)
-        errors = violations(json.loads(result.stdout), args.thekernel.resolve())
+        data = json.loads(result.stdout)
+        errors = violations(data, args.thekernel.resolve())
+        errors += workspace_policy_violations(data, args.thekernel.resolve())
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
         print(f"cargo dependency layers: {exc}", file=sys.stderr)
         return 1

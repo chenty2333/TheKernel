@@ -22,9 +22,9 @@ use linux_raw_sys::{
     },
 };
 use memory_addr::PAGE_SIZE_4K;
-use thekernel_linux_net::{PendingErrorPolicy, SocketWaitKind, plan_pending_error};
-use thekernel_linux_packet::ReceiveFlags as PacketReceiveFlags;
-use thekernel_linux_signal::{SignalInfo, Signo};
+use tk_linux_net::{PendingErrorPolicy, SocketWaitKind, plan_pending_error};
+use tk_linux_packet::ReceiveFlags as PacketReceiveFlags;
+use tk_linux_signal::{SignalInfo, Signo};
 
 use super::{
     SocketSyscallSnapshot,
@@ -932,7 +932,7 @@ const fn effective_message_flags(flags: u32, nonblocking: bool) -> u32 {
 fn send_packet_after_security(
     socket: &PacketSocket,
     mut src: impl Read + IoBuf,
-    destination: Option<thekernel_linux_packet::PacketSendAddress>,
+    destination: Option<tk_linux_packet::PacketSendAddress>,
     ancillary_items: usize,
 ) -> AxResult<usize> {
     // A TPACKET_TX_RING is producer-owned by userspace and has no separate
@@ -1138,7 +1138,7 @@ fn send_impl(
     }
     if matches!(&socket.inner, AxSocket::Udp(_)) && src.remaining() > axnet::udp::MAX_UDP_SEND_LEN {
         return Err(socket_failure(
-            thekernel_linux_net::SocketFailure::MessageTooLarge,
+            tk_linux_net::SocketFailure::MessageTooLarge,
         ));
     }
     // Socket transports hand payload to axnet after this boundary, where the
@@ -1421,7 +1421,7 @@ pub fn sys_sendmsg(
 enum ReceivedSocketAddress {
     Network(SocketAddrEx),
     Netlink { pid: u32, groups: u32 },
-    Packet(thekernel_linux_packet::SockAddrLl),
+    Packet(tk_linux_packet::SockAddrLl),
 }
 
 impl ReceivedSocketAddress {
@@ -2472,12 +2472,12 @@ mod tests {
         let net_namespace =
             crate::task::NetworkNamespace::try_new_loopback_only(user_namespace).unwrap();
         let socket = PacketSocket::try_new(
-            thekernel_linux_packet::PacketSocketType::Datagram,
-            thekernel_linux_packet::ProtocolSelector::Disabled,
+            tk_linux_packet::PacketSocketType::Datagram,
+            tk_linux_packet::ProtocolSelector::Disabled,
             net_namespace,
         )
         .unwrap();
-        let invalid = thekernel_linux_packet::PacketSendAddress::try_from_network_order_fields(
+        let invalid = tk_linux_packet::PacketSendAddress::try_from_network_order_fields(
             0x0800_u16.to_be(),
             999,
             6,
@@ -2499,7 +2499,7 @@ mod tests {
         );
         assert_eq!(reads.get(), 0);
 
-        let valid = thekernel_linux_packet::PacketSendAddress::try_from_network_order_fields(
+        let valid = tk_linux_packet::PacketSendAddress::try_from_network_order_fields(
             0x0800_u16.to_be(),
             1,
             6,

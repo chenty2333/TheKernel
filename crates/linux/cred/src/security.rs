@@ -54,7 +54,7 @@ impl fmt::Display for AuthorizationError {
 /// cannot bypass those invariants.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::InodePermissionAccess;
+/// use tk_linux_cred::InodePermissionAccess;
 ///
 /// // Raw tuple construction is not part of the public contract.
 /// let _ = InodePermissionAccess(1);
@@ -197,7 +197,7 @@ impl<'a, N: UserNamespaceView, O: ?Sized> InodePermissionContext<'a, N, O> {
 /// Linux-style `setattr_prepare` step may clear SGID.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::InodeSetattrMode;
+/// use tk_linux_cred::InodeSetattrMode;
 ///
 /// // Raw tuple construction is not part of the public contract.
 /// let _ = InodeSetattrMode(0o644);
@@ -398,7 +398,7 @@ impl InodeFileAttrIntent {
 /// the consumer from the same old-inode snapshot.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::{InodeSetattrIntent, InodeSetattrProposal};
+/// use tk_linux_cred::{InodeSetattrIntent, InodeSetattrProposal};
 ///
 /// // External consumers cannot forge mismatched intent/proposal fields.
 /// let _ = InodeSetattrProposal {
@@ -671,7 +671,7 @@ impl<'a, N: UserNamespaceView, O: ?Sized> InodePostSetattrContext<'a, N, O> {
 /// normalized-bit invariant.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::InodeCreateMode;
+/// use tk_linux_cred::InodeCreateMode;
 ///
 /// // Raw tuple construction is not part of the public contract.
 /// let _ = InodeCreateMode(0o644);
@@ -843,35 +843,35 @@ impl<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized> InodeMkdirContext<'a, N, P,
 /// hard links are namespace-link operations rather than `mknod` kinds.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::InodeMknodKind;
+/// use tk_linux_cred::InodeMknodKind;
 ///
 /// // Symlinks use the distinct InodeSymlinkContext contract.
 /// let _ = InodeMknodKind::Symlink;
 /// ```
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::InodeMknodKind;
+/// use tk_linux_cred::InodeMknodKind;
 ///
 /// // Hard links use the distinct InodeLinkContext contract.
 /// let _ = InodeMknodKind::HardLink;
 /// ```
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::InodeMknodKind;
+/// use tk_linux_cred::InodeMknodKind;
 ///
 /// // Named regular files use the inode_create contract.
 /// let _ = InodeMknodKind::RegularFile;
 /// ```
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::InodeMknodKind;
+/// use tk_linux_cred::InodeMknodKind;
 ///
 /// // Directories use the inode_mkdir contract.
 /// let _ = InodeMknodKind::Directory;
 /// ```
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::InodeMknodKind;
+/// use tk_linux_cred::InodeMknodKind;
 ///
 /// // O_TMPFILE is unnamed and never enters a named mknod hook.
 /// let _ = InodeMknodKind::UnnamedTemporaryFile;
@@ -904,7 +904,7 @@ impl InodeMknodKind {
 /// responsibilities.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::{InodeCreateMode, InodeMknodKind, InodeMknodOperation};
+/// use tk_linux_cred::{InodeCreateMode, InodeMknodKind, InodeMknodOperation};
 ///
 /// // External code cannot forge an invalid kind/device combination.
 /// let _ = InodeMknodOperation {
@@ -1088,7 +1088,7 @@ pub struct InodeRmdirContext<'a, N: UserNamespaceView, P: ?Sized, E: ?Sized> {
 ///
 /// ```compile_fail
 /// use std::sync::Arc;
-/// use thekernel_linux_cred::{
+/// use tk_linux_cred::{
 ///     Credential, FsCredentialSnapshot, InodeRenameContext, UserNamespaceView,
 /// };
 ///
@@ -1450,7 +1450,7 @@ pub const XATTR_NAME_MAX: usize = LINUX_XATTR_NAME_MAX as usize;
 /// Unknown bits are rejected.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::XattrSetFlags;
+/// use tk_linux_cred::XattrSetFlags;
 ///
 /// // Raw tuple construction is not part of the public contract.
 /// let _ = XattrSetFlags(0);
@@ -1539,7 +1539,7 @@ impl XattrValueClass {
 /// The operation cannot outlive the borrowed name:
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::InodeXattrOperation;
+/// use tk_linux_cred::InodeXattrOperation;
 ///
 /// fn name_cannot_escape() -> InodeXattrOperation<'static> {
 ///     let name = b"user.example".to_vec();
@@ -1550,7 +1550,7 @@ impl XattrValueClass {
 /// A set operation cannot outlive its value either:
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::{InodeXattrOperation, XattrSetFlags};
+/// use tk_linux_cred::{InodeXattrOperation, XattrSetFlags};
 ///
 /// fn value_cannot_escape() -> InodeXattrOperation<'static> {
 ///     let value = vec![1_u8, 2, 3];
@@ -1560,7 +1560,7 @@ impl XattrValueClass {
 /// ```
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::{InodeXattrOperation, XattrSetFlags, XattrValueClass};
+/// use tk_linux_cred::{InodeXattrOperation, XattrSetFlags, XattrValueClass};
 ///
 /// // Named variants are non-exhaustive so external code cannot bypass name
 /// // validation or forge the name-derived value class.
@@ -1748,7 +1748,7 @@ impl<'a, N: UserNamespaceView, O: ?Sized> InodeXattrContext<'a, N, O> {
 /// before that hook and is intentionally not representable here.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::FileOpenAccess;
+/// use tk_linux_cred::FileOpenAccess;
 ///
 /// // Path-only opens do not enter the file-open hook contract.
 /// let _ = FileOpenAccess::Path;
@@ -1806,7 +1806,7 @@ impl FileOpenAccess {
 /// [`FileOpenAccess::writes`] remains false.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::{FileOpenAccess, FileOpenOperation};
+/// use tk_linux_cred::{FileOpenAccess, FileOpenOperation};
 ///
 /// // External code cannot forge a combination through raw fields.
 /// let _ = FileOpenOperation {
@@ -2008,7 +2008,7 @@ pub enum PreparedCredentialCapabilityOperation {
 ///
 /// ```compile_fail
 /// use std::sync::Arc;
-/// use thekernel_linux_cred::{
+/// use tk_linux_cred::{
 ///     CapabilityNumber, CapabilitySecurityContext, CapabilitySecurityOperation,
 ///     Credential, UserNamespaceView,
 /// };
@@ -2030,7 +2030,7 @@ pub enum PreparedCredentialCapabilityOperation {
 ///
 /// ```compile_fail
 /// use std::sync::Arc;
-/// use thekernel_linux_cred::{
+/// use tk_linux_cred::{
 ///     CapabilityNumber, CapabilitySecurityContext, CapabilitySecurityOperation,
 ///     Credential, UserNamespaceView, authorize_capability_core,
 /// };
@@ -2201,7 +2201,7 @@ pub enum CredentialPublicationOperation {
 /// The notification cannot outlive the consumer-owned publication target:
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::{
+/// use tk_linux_cred::{
 ///     Credential, CredentialPublicationContext, UserNamespaceView,
 /// };
 ///

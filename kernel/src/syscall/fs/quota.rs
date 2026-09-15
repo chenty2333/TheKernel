@@ -12,8 +12,8 @@ use axfs_ng_vfs::{DeviceId, FsPathBuf, Location};
 use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::{AT_FDCWD, CAP_SYS_ADMIN};
-use thekernel_linux_cred::Kgid;
-use thekernel_linux_usercopy::{
+use tk_linux_cred::Kgid;
+use tk_linux_usercopy::{
     UserMemory, UserMemoryContext, vm_load, vm_load_until_nul, vm_write_slice,
 };
 

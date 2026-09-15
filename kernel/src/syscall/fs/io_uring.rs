@@ -25,13 +25,13 @@ use axtask::future;
 use linux_raw_sys::general::{AT_FDCWD, RESOLVE_IN_ROOT};
 use memory_addr::PAGE_SIZE_4K;
 use spin::Mutex;
-use thekernel_linux_io_uring::{
+use tk_linux_io_uring::{
     BufferSlot, EnterFlags, EnterRequest, FeatureFlags, FileTarget, IO_URING_PARAMS_BYTES,
     IoUringError, IoUringGeteventsArg, IoUringParams, LegacySignalMask, ParsedSubmission,
     PreparedRequest, ReadWriteRequest, RegistrationOperation, RegistrationRequest, SetupRequest,
     SubmissionOperation, TerminalCause, encode_probe, probe_output_bytes,
 };
-use thekernel_linux_signal::SignalSet;
+use tk_linux_signal::SignalSet;
 
 use super::{
     ClassicAioOperation, IoUringWorkerResult, capture_io_operation_context_for_actor,
@@ -50,7 +50,7 @@ use crate::file::io_uring::SubmissionCompletionBatch;
 /// provider-held long-term pin from extending a closed ring's lifetime.
 struct OwnedFileIoCompletionBridge {
     ring: alloc::sync::Weak<IoUring>,
-    id: thekernel_linux_io_uring::RequestId,
+    id: tk_linux_io_uring::RequestId,
 }
 
 impl OwnedFileIoCompletion for OwnedFileIoCompletionBridge {
@@ -365,7 +365,7 @@ fn registered_buffer_count(argument: u64, count: u32) -> AxResult<usize> {
         return Err(AxError::BadAddress);
     }
     let count = usize::try_from(count).map_err(|_| AxError::InvalidInput)?;
-    if count == 0 || count > thekernel_linux_io_uring::IORING_MAX_REGISTERED_BUFFERS as usize {
+    if count == 0 || count > tk_linux_io_uring::IORING_MAX_REGISTERED_BUFFERS as usize {
         return Err(AxError::InvalidInput);
     }
     Ok(count)
@@ -886,7 +886,7 @@ fn copy_openat2_submission(
 /// provision operation into a deferred usercopy fault.
 fn copy_provided_buffers(
     capability: &UserMemoryCapability,
-    request: thekernel_linux_io_uring::ProvideBuffersRequest,
+    request: tk_linux_io_uring::ProvideBuffersRequest,
 ) -> AxResult<Vec<(usize, usize, UserMemoryCapability)>> {
     let base = usize::try_from(request.address()).map_err(|_| AxError::BadAddress)?;
     let length = usize::try_from(request.length()).map_err(|_| AxError::InvalidInput)?;
@@ -1026,7 +1026,7 @@ fn generic_owned_submission_supported(operation: SubmissionOperation) -> bool {
 /// A provider's explicit pre-publication refusal is the only fallback signal.
 fn prepare_owned_submission(
     ring: &IoUring,
-    id: thekernel_linux_io_uring::RequestId,
+    id: tk_linux_io_uring::RequestId,
     capability: UserMemoryCapability,
     description: &Arc<FileDescription>,
     context: IoOperationContext,
@@ -1154,8 +1154,8 @@ fn pending_stream_read_supported(file: &IoUringFileLease, request: ReadWriteRequ
 fn issue_prepared(
     ring: &IoUring,
     prepared: PreparedRequest,
-    cancellation_mode: Option<thekernel_linux_io_uring::CancellationMode>,
-) -> AxResult<Option<thekernel_linux_io_uring::IssuedRequest>> {
+    cancellation_mode: Option<tk_linux_io_uring::CancellationMode>,
+) -> AxResult<Option<tk_linux_io_uring::IssuedRequest>> {
     let id = prepared.id();
     let issued = match cancellation_mode {
         Some(mode) => ring.issue_request_with_cancellation_mode(prepared, mode),
@@ -1220,7 +1220,7 @@ fn copy_timeout_duration(capability: &UserMemoryCapability, address: u64) -> AxR
 
 fn spawn_timeout(
     ring: &IoUring,
-    issued: thekernel_linux_io_uring::IssuedRequest,
+    issued: tk_linux_io_uring::IssuedRequest,
     duration: Duration,
 ) -> AxResult<()> {
     let owner = ring.arc_owner()?;
@@ -1253,7 +1253,7 @@ fn start_sqpoll_worker(ring: Arc<IoUring>) -> AxResult<()> {
     let sq_aff = ring
         .layout()
         .setup_flags()
-        .contains(thekernel_linux_io_uring::SetupFlags::SQ_AFF);
+        .contains(tk_linux_io_uring::SetupFlags::SQ_AFF);
     if sq_aff
         && usize::try_from(ring.layout().sq_thread_cpu())
             .ok()
@@ -1353,7 +1353,7 @@ pub(crate) enum SubmissionOutcome {
 #[allow(clippy::large_enum_variant)]
 enum PhysicalPublishDecision {
     NotSubmitted {
-        issued: thekernel_linux_io_uring::IssuedRequest,
+        issued: tk_linux_io_uring::IssuedRequest,
         admission: PreparedPhysicalIoAdmission,
     },
     /// The fixed logical owner is queued before lower publication and will
@@ -1374,7 +1374,7 @@ enum PhysicalPublishDecision {
 
 fn publish_physical_admission(
     ring: &IoUring,
-    issued: thekernel_linux_io_uring::IssuedRequest,
+    issued: tk_linux_io_uring::IssuedRequest,
     mut admission: PreparedPhysicalIoAdmission,
 ) -> AxResult<PhysicalPublishDecision> {
     let device_identity = admission.plan().device_identity();
@@ -1493,9 +1493,9 @@ impl SubmissionOutcome {
 fn submission_cancellation_mode(
     requires_retirement: bool,
     owned: bool,
-    command: Option<thekernel_linux_io_uring::CancellationMode>,
-) -> Option<thekernel_linux_io_uring::CancellationMode> {
-    use thekernel_linux_io_uring::CancellationMode;
+    command: Option<tk_linux_io_uring::CancellationMode>,
+) -> Option<tk_linux_io_uring::CancellationMode> {
+    use tk_linux_io_uring::CancellationMode;
     if requires_retirement {
         Some(CancellationMode::Uncancellable)
     } else if owned {
@@ -1549,9 +1549,9 @@ fn execute_submission(
             })
             .map(|manifest| {
                 if manifest.cancellable() {
-                    thekernel_linux_io_uring::CancellationMode::Cancellable
+                    tk_linux_io_uring::CancellationMode::Cancellable
                 } else {
-                    thekernel_linux_io_uring::CancellationMode::Uncancellable
+                    tk_linux_io_uring::CancellationMode::Uncancellable
                 }
             })
     } else {
@@ -3371,7 +3371,7 @@ mod tests {
 
     #[test]
     fn physical_read_handoff_blocks_cancel_and_close_until_retirement() {
-        use thekernel_linux_io_uring::{
+        use tk_linux_io_uring::{
             CancelSelector, CancellationMode, RequestDescriptor, RequestOperation, RequestRegistry,
             RingId,
         };
@@ -3508,7 +3508,7 @@ mod tests {
             LinuxError::from(
                 registered_buffer_count(
                     1,
-                    thekernel_linux_io_uring::IORING_MAX_REGISTERED_BUFFERS + 1,
+                    tk_linux_io_uring::IORING_MAX_REGISTERED_BUFFERS + 1,
                 )
                 .unwrap_err(),
             ),
@@ -3526,7 +3526,7 @@ mod tests {
     fn fixed_nowait_flags_reach_executor_selection_without_mutating_ofd() {
         let base = crate::file::OfdIoStatus::new(0);
         for opcode in [4, 5] {
-            let mut bytes = [0; thekernel_linux_io_uring::SQE_BYTES as usize];
+            let mut bytes = [0; tk_linux_io_uring::SQE_BYTES as usize];
             bytes[0] = opcode;
             bytes[28..32].copy_from_slice(&8_u32.to_le_bytes());
             let operation = ParsedSubmission::parse(bytes).unwrap().operation();
@@ -3548,7 +3548,7 @@ mod tests {
             (1, true),
             (2, true),
         ] {
-            let mut bytes = [0; thekernel_linux_io_uring::SQE_BYTES as usize];
+            let mut bytes = [0; tk_linux_io_uring::SQE_BYTES as usize];
             bytes[0] = opcode;
             let operation = ParsedSubmission::parse(bytes).unwrap().operation();
             assert_eq!(
@@ -3594,7 +3594,7 @@ mod tests {
     fn batched_fixed_geometry_keeps_admitted_owner_and_range_through_unregister() {
         use axhal::paging::{MappingFlags, PageSize};
         use memory_addr::VirtAddr;
-        use thekernel_linux_io_uring::SetupFlags;
+        use tk_linux_io_uring::SetupFlags;
 
         let _context = crate::test_support::scheduler_test_context();
         let mapped_capability = || {
@@ -3633,7 +3633,7 @@ mod tests {
             .unwrap();
         // Supply different raw SQE geometry: after admission the retained
         // lease, rather than those untrusted fields, determines the I/O range.
-        let mut bytes = [0; thekernel_linux_io_uring::SQE_BYTES as usize];
+        let mut bytes = [0; tk_linux_io_uring::SQE_BYTES as usize];
         bytes[0] = 4; // IORING_OP_READ_FIXED
         bytes[16..24].copy_from_slice(&0x1180_u64.to_le_bytes());
         bytes[24..28].copy_from_slice(&0x40_u32.to_le_bytes());

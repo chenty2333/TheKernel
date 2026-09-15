@@ -1,6 +1,6 @@
-# thekernel-linux-process
+# tk-linux-process
 
-`thekernel-linux-process` provides bounded process, thread-group, session, and
+`tk-linux-process` provides bounded process, thread-group, session, and
 zombie lifecycle state without a crate-owned singleton. A kernel explicitly
 owns a `ProcessDomain<Z>`; its `ProcessRegistry<Z>` is passed to topology
 queries, and independent domains may safely reuse the same PID values.
@@ -14,15 +14,16 @@ permission paths require.
 
 ## Toolchain
 
-Version 0.1.0 is intentionally **nightly-only** and is tested with the rolling
-`nightly` toolchain. It uses `Arc::try_new` through Rust's `allocator_api`
-feature so process-object allocation can return `ProcessError::NoMemory`.
-There is no `rust-version` claim for this package.
+The crate uses the root-pinned `nightly-2026-08-23` toolchain
+(`rustc 1.100.0-nightly`, commit `c54751567`, dated 2026-08-22).
+`rust-version` inherits the workspace's `1.100`; this is not a stable-Rust
+compatibility guarantee. It uses `Arc::try_new` through `allocator_api`
+so process-object allocation can return `ProcessError::NoMemory`.
 
 ```rust
 use std::sync::Arc;
 
-use thekernel_linux_process::{ExitOutcome, ProcessDomain};
+use tk_linux_process::{ExitOutcome, ProcessDomain};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LinuxZombie {

@@ -5,7 +5,7 @@ use axtask::{AxTaskRef, current};
 use linux_raw_sys::general::{
     CAP_SETFCAP, CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN, CAP_SYS_PTRACE, CAP_SYS_RESOURCE,
 };
-use thekernel_linux_process_adapter::Pid;
+use tk_linux_process_adapter::Pid;
 
 use super::{
     AsThread, Cred, Credentials, Dumpability, IdMapInputExtent, Kgid, Kuid, LandlockDomain,
@@ -774,7 +774,7 @@ mod tests {
             crate::task::SignalDeliveryScope::ThreadGroup,
         );
         assert!(
-            thekernel_linux_cred::authorize_signal_core(
+            tk_linux_cred::authorize_signal_core(
                 actor.core(),
                 saved_uid_target.core(),
                 probe,
@@ -800,7 +800,7 @@ mod tests {
         let sibling_target = publish_ids(&sibling_target_slot, 3000, 300);
 
         assert!(
-            thekernel_linux_cred::authorize_signal_core(
+            tk_linux_cred::authorize_signal_core(
                 child_actor.core(),
                 root_target.core(),
                 probe,
@@ -810,7 +810,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            thekernel_linux_cred::authorize_signal_core(
+            tk_linux_cred::authorize_signal_core(
                 root_cred.core(),
                 child_target.core(),
                 probe,
@@ -820,7 +820,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            thekernel_linux_cred::authorize_signal_core(
+            tk_linux_cred::authorize_signal_core(
                 child_actor.core(),
                 child_target.core(),
                 probe,
@@ -830,7 +830,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            thekernel_linux_cred::authorize_signal_core(
+            tk_linux_cred::authorize_signal_core(
                 child_actor.core(),
                 sibling_target.core(),
                 probe,
@@ -872,7 +872,7 @@ mod tests {
         start.wait();
         for _ in 0..2000 {
             assert!(
-                thekernel_linux_cred::authorize_signal_core(
+                tk_linux_cred::authorize_signal_core(
                     actor.core(),
                     frozen_target.core(),
                     operation,
@@ -887,7 +887,7 @@ mod tests {
 
         let fresh_target = target_slot.current();
         assert!(
-            thekernel_linux_cred::authorize_signal_core(
+            tk_linux_cred::authorize_signal_core(
                 actor.core(),
                 fresh_target.core(),
                 operation,

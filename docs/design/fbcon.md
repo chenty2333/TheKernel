@@ -29,7 +29,7 @@ them **contradict** the reasoning recorded in §1.2, §6.2 and change-set item 1
 original text is left in place; the corrections below supersede it.
 
 The instrument was a temporary MB2 tag inventory added to
-`crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs` and reported on the COM2 diagnostic
+`crates/ax/tk-axplat-x86-pc/src/boot_info.rs` and reported on the COM2 diagnostic
 channel, which the QEMU runner captures to `workdir/kernel.log`.
 
 **Correction 1 — GRUB *does* emit the type-8 tag without `gfxmode`/`gfxpayload`.**
@@ -105,7 +105,7 @@ rendered as glyphs in the console's grey on black, beginning:
 ```
 <6>[0.198049 cpu=None tid=None INFO target=axnet_ng ...] mac: 52-54-00-12-34-56
 ...
-<6>[0.301987 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::pseudofs::dev ...]
+<6>[0.301987 cpu=Some(0) tid=Some(2) INFO target=tk_kernel::pseudofs::dev ...]
     Firmware framebuffer scanout: 1280x800 pitch 5120 at 0x80000000
 <6>[0.321577 ...] Mounted devfs at FsPath([47, 100, 101, 118])
 ```
@@ -176,10 +176,10 @@ screendump cell by cell with the kernel's own generated font
 (`kernel/src/pseudofs/dev/console_font/glyphs.rs`) recovered the boot log:
 
 ```
-31|<6>[0.379222 cpu=Some(2) tid=Some(2) INFO target=thekernel_kernel::pseudofs module=thekernel_kernel::pseudofs] Mounted tmpfs at FsPath([47, 100, 101, 118, 47, 1
-36|<6>[0.387974 cpu=Some(2) tid=Some(2) INFO target=thekernel_kernel::pseudofs module=thekernel_kernel::pseudofs] Mounted proc at FsPath([47, 112, 114, 111, 99])
-37|<6>[0.396903 cpu=Some(2) tid=Some(2) INFO target=thekernel_kernel::pseudofs module=thekernel_kernel::pseudofs] Mounted sysfs at FsPath([47, 115, 121, 115])
-47|<6>[0.442961 cpu=Some(0) tid=Some(32) INFO target=thekernel_kernel::task::user module=thekernel_kernel::task::user] Enter user space: ip=0x401dc0, sp=0x7ffeffff
+31|<6>[0.379222 cpu=Some(2) tid=Some(2) INFO target=tk_kernel::pseudofs module=tk_kernel::pseudofs] Mounted tmpfs at FsPath([47, 100, 101, 118, 47, 1
+36|<6>[0.387974 cpu=Some(2) tid=Some(2) INFO target=tk_kernel::pseudofs module=tk_kernel::pseudofs] Mounted proc at FsPath([47, 112, 114, 111, 99])
+37|<6>[0.396903 cpu=Some(2) tid=Some(2) INFO target=tk_kernel::pseudofs module=tk_kernel::pseudofs] Mounted sysfs at FsPath([47, 115, 121, 115])
+47|<6>[0.442961 cpu=Some(0) tid=Some(32) INFO target=tk_kernel::task::user module=tk_kernel::task::user] Enter user space: ip=0x401dc0, sp=0x7ffeffff
 ```
 
 This is the acceptance condition of §6.4 in literal form: the kernel's own log, on the
@@ -206,8 +206,8 @@ decoded with the kernel's own font, reads with **0 unmatched cells**:
 ```
 02|KTAP version 1
 04|# THEKERNEL_TEST_BEGIN 1 mounts timeout_seconds=60
-05|<6>[0.834545 cpu=Some(2) tid=Some(36) INFO target=thekernel_kernel::task::user ...] Enter user space: ip=0x4633b6, sp=0x7ffef3c9
-07|<6>[0.872622 cpu=Some(2) tid=Some(36) INFO target=thekernel_kernel::task::ops ...] Task(36, init) exit with code: 0
+05|<6>[0.834545 cpu=Some(2) tid=Some(36) INFO target=tk_kernel::task::user ...] Enter user space: ip=0x4633b6, sp=0x7ffef3c9
+07|<6>[0.872622 cpu=Some(2) tid=Some(36) INFO target=tk_kernel::task::ops ...] Task(36, init) exit with code: 0
 09|# THEKERNEL_TEST_END 1 mounts result=0
 10|ok 1 - mounts
 42|ok 5 - procfs
@@ -284,28 +284,28 @@ a suite that rebuilds despite `--no-build` fails.
 
 2. **Multiboot2 tag type 8 (framebuffer) is silently discarded.** The parser's known-tag
    set is `{0=end, 3=module, 6=mmap, 14=ACPI old, 15=ACPI new}`
-   (`crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs:24-28`) and everything else falls
+   (`crates/ax/tk-axplat-x86-pc/src/boot_info.rs:24-28`) and everything else falls
    into the catch-all `_ => {}` (`:462`).
 
 3. **The boot identity map does cover a high GOP address, but the runtime page table
    replaces it.** The boot PML4 maps 512 GiB at `0` and 512 GiB at `0xffff_8000_0000_0000`
-   with 1 GiB huge pages (`crates/ax/thekernel-axplat-x86-pc/src/multiboot.S:153-175`).
-   After `axmm::init_memory_management()` (`crates/ax/thekernel-axruntime/src/lib.rs:424`)
+   with 1 GiB huge pages (`crates/ax/tk-axplat-x86-pc/src/multiboot.S:153-175`).
+   After `axmm::init_memory_management()` (`crates/ax/tk-axruntime/src/lib.rs:424`)
    the live kernel page table is a *new*, sparse table that directly maps only
-   `axhal::mem::memory_regions()` (`crates/ax/thekernel-axmm/src/lib.rs:53-68`) — i.e. RAM
+   `axhal::mem::memory_regions()` (`crates/ax/tk-axmm/src/lib.rs:53-68`) — i.e. RAM
    plus the compile-time `mmio-ranges` list. The product q35 profile lists
    `[0x8000_0000, 0x2000_0000]` (`config/x86_64/q35-uefi.toml:27`) but the bare
-   `axconfig.toml` fallback does **not** (`crates/ax/thekernel-axplat-x86-pc/axconfig.toml:45-51`).
+   `axconfig.toml` fallback does **not** (`crates/ax/tk-axplat-x86-pc/axconfig.toml:45-51`).
    A framebuffer above 4 GiB is mapped by **neither**.
 
 4. **`DisplayDriverOps` has no mode-setting verb, and the static device model permits
    exactly one display driver type per kernel image.** The full trait is 12 methods
-   (`crates/ax/thekernel-axdriver-display/src/lib.rs:383-429`); none programs a display
+   (`crates/ax/tk-axdriver-display/src/lib.rs:383-429`); none programs a display
    controller. `register_display_driver!` only emits a type alias
-   (`crates/ax/thekernel-axdriver/src/macros.rs:21-27`) and the `dyn` feature — the only
+   (`crates/ax/tk-axdriver/src/macros.rs:21-27`) and the `dyn` feature — the only
    model that could alias to `Box<dyn DisplayDriverOps>` — is **not enabled by the product
    build**, and its probe function enumerates block devices only
-   (`crates/ax/thekernel-axdriver/src/dyn_drivers/mod.rs:27-41`).
+   (`crates/ax/tk-axdriver/src/dyn_drivers/mod.rs:27-41`).
 
 5. **Kernel `printk` output never reaches fbcon today.** `println!`/`info!` land in a ring
    buffer and are drained to the **diagnostic UART at 0x2f8**, not to the console UART at
@@ -320,9 +320,9 @@ a suite that rebuilds despite `--no-build` fails.
 ### 1.1 Where the Multiboot2 information block is parsed
 
 The exact function is **`parse_multiboot2_info`**, and the exact tag dispatch is its
-`match tag_type` at `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs:418`.
+`match tag_type` at `crates/ax/tk-axplat-x86-pc/src/boot_info.rs:418`.
 
-`[V]` `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs:360-364`
+`[V]` `crates/ax/tk-axplat-x86-pc/src/boot_info.rs:360-364`
 
 ```rust
 /// Parse a complete Multiboot2 information block into an owned `BootInfo`.
@@ -332,7 +332,7 @@ The exact function is **`parse_multiboot2_info`**, and the exact tag dispatch is
 fn parse_multiboot2_info(bytes: &[u8], info_paddr: usize) -> Result<BootInfo, ParseError> {
 ```
 
-`[V]` `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs:404-418`
+`[V]` `crates/ax/tk-axplat-x86-pc/src/boot_info.rs:404-418`
 
 ```rust
         let tag_type = read_u32(bytes, cursor).ok_or(ParseError::TagHeaderTruncated)?;
@@ -353,7 +353,7 @@ fn parse_multiboot2_info(bytes: &[u8], info_paddr: usize) -> Result<BootInfo, Pa
 ```
 
 The caller is the early-handoff finaliser: `[V]`
-`crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs:143-162`
+`crates/ax/tk-axplat-x86-pc/src/boot_info.rs:143-162`
 
 ```rust
 pub(crate) fn finish_handoff() {
@@ -379,7 +379,7 @@ pub(crate) fn finish_handoff() {
 ```
 
 `finish_handoff` is invoked from `InitIf::init_early` — `[V]`
-`crates/ax/thekernel-axplat-x86-pc/src/init.rs:11-21`:
+`crates/ax/tk-axplat-x86-pc/src/init.rs:11-21`:
 
 ```rust
     fn init_early(_cpu_id: usize, _mbi: usize) {
@@ -402,7 +402,7 @@ pub(crate) fn finish_handoff() {
 
 **No. Tag 8 is not handled.** It is not even named.
 
-`[V]` Known-tag constants — `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs:24-28`
+`[V]` Known-tag constants — `crates/ax/tk-axplat-x86-pc/src/boot_info.rs:24-28`
 
 ```rust
 const MB2_TAG_END: u32 = 0;
@@ -412,7 +412,7 @@ const MB2_TAG_ACPI_OLD: u32 = 14;
 const MB2_TAG_ACPI_NEW: u32 = 15;
 ```
 
-`[V]` The full dispatch, including the catch-all — `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs:418-463`
+`[V]` The full dispatch, including the catch-all — `crates/ax/tk-axplat-x86-pc/src/boot_info.rs:418-463`
 
 ```rust
         match tag_type {
@@ -469,7 +469,7 @@ ignored without comment.**
 The kernel also never *asks* for a framebuffer. The Multiboot1 header flags are
 `0x0001_0002` — page-align plus memory-info only, no video bit:
 
-`[V]` `crates/ax/thekernel-axplat-x86-pc/src/boot.rs:15-19`
+`[V]` `crates/ax/tk-axplat-x86-pc/src/boot.rs:15-19`
 
 ```rust
 /// Flags set in the ’flags’ member of the Multiboot1 header.
@@ -481,7 +481,7 @@ const MULTIBOOT_HEADER_FLAGS: usize = 0x0001_0002;
 
 and the Multiboot2 header contains only header/address/entry/end tags:
 
-`[V]` `crates/ax/thekernel-axplat-x86-pc/src/boot.rs:39-42`
+`[V]` `crates/ax/tk-axplat-x86-pc/src/boot.rs:39-42`
 
 ```rust
 // Header (16 bytes), address tag (24 bytes), entry tag (16 bytes including
@@ -490,7 +490,7 @@ and the Multiboot2 header contains only header/address/entry/end tags:
 const MULTIBOOT2_HEADER_LENGTH: u32 = 16 + 24 + 16 + 8;
 ```
 
-`[V]` matching assembly — `crates/ax/thekernel-axplat-x86-pc/src/multiboot.S:24-53` emits
+`[V]` matching assembly — `crates/ax/tk-axplat-x86-pc/src/multiboot.S:24-53` emits
 exactly four tags (magic/arch/length/checksum header, type 2 address tag, type 3 entry
 tag, type 0 end tag). No optional tag of type 8 is requested.
 
@@ -531,7 +531,7 @@ This is **specification-derived** (`[X]`), with the byte-for-byte reference take
 That crate is *not* a dependency of this repository — `[V]` `Cargo.lock` has no
 `multiboot2` entry (`grep -n "multiboot2" Cargo.lock` → no output), and the only
 Multiboot crate in the lock is `multiboot 0.8.0` (`Cargo.lock:2140-2146`), which is the
-Multiboot**1** parser used at `crates/ax/thekernel-axplat-x86-pc/src/mem.rs:36-52`.
+Multiboot**1** parser used at `crates/ax/tk-axplat-x86-pc/src/mem.rs:36-52`.
 
 Base tag (`[X]` `multiboot2-0.24.1/src/framebuffer.rs:63-96`, `:226-235`):
 
@@ -597,10 +597,10 @@ panicked on) so that a BIOS/CSM or pure-text boot still produces a working kerne
 
 | # | Structure | Location | Role |
 |---|---|---|---|
-| 1 | `EarlyBootRecord { magic, info_paddr }` | `crates/ax/thekernel-axplat-x86-pc/src/boot.rs:50-55`, static at `:59-64` | Raw boot arguments surviving the `.bss` clear. `[V]` `:57-58` *"rust_entry runs before axruntime clears .bss. Keep this record in the initialized data segment so the raw boot arguments survive that clear."* |
-| 2 | `BootInfo` (private) owned by `static BOOT_INFO: LazyInit<BootInfo>` | `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs:88-98`, static at `:134`, accessor `get()` at `:136-140` | The sole owner of post-handoff platform data. `[V]` `:88` `/// The sole owner of boot protocol data after early handoff.` |
+| 1 | `EarlyBootRecord { magic, info_paddr }` | `crates/ax/tk-axplat-x86-pc/src/boot.rs:50-55`, static at `:59-64` | Raw boot arguments surviving the `.bss` clear. `[V]` `:57-58` *"rust_entry runs before axruntime clears .bss. Keep this record in the initialized data segment so the raw boot arguments survive that clear."* |
+| 2 | `BootInfo` (private) owned by `static BOOT_INFO: LazyInit<BootInfo>` | `crates/ax/tk-axplat-x86-pc/src/boot_info.rs:88-98`, static at `:134`, accessor `get()` at `:136-140` | The sole owner of post-handoff platform data. `[V]` `:88` `/// The sole owner of boot protocol data after early handoff.` |
 
-`[V]` `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs:88-98`
+`[V]` `crates/ax/tk-axplat-x86-pc/src/boot_info.rs:88-98`
 
 ```rust
 /// The sole owner of boot protocol data after early handoff.
@@ -618,7 +618,7 @@ pub(crate) struct BootInfo {
 
 `AcpiRsdp` is the precedent to copy: it is a **fixed-size owned copy** copied out of the
 bootloader-owned bytes while they are still borrowed. `[V]`
-`crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs:36-45`
+`crates/ax/tk-axplat-x86-pc/src/boot_info.rs:36-45`
 
 ```rust
 /// The subset of the ACPI RSDP needed to locate the root table.
@@ -639,11 +639,11 @@ with a `#[derive(Clone, Copy)]` POD struct holding exactly the validated tag fie
 `rsdp()` (`:121-123`), `memory_regions()` (`:125-127`) and `modules()` (`:129-131`).
 
 **The cross-layer handoff (platform → display driver) does not exist yet and must be
-created.** The platform crate is `thekernel-axplat-x86-pc`; the consumer would be a driver
-in `thekernel-axdriver*`. The established pattern for that direction is the
-`thekernel-axhal` façade, and the boot-module accessor is the exact precedent:
+created.** The platform crate is `tk-axplat-x86-pc`; the consumer would be a driver
+in `tk-axdriver*`. The established pattern for that direction is the
+`tk-axhal` façade, and the boot-module accessor is the exact precedent:
 
-`[V]` `crates/ax/thekernel-axhal/src/lib.rs:57-65`
+`[V]` `crates/ax/tk-axhal/src/lib.rs:57-65`
 
 ```rust
 pub mod dtb;
@@ -656,7 +656,7 @@ pub mod boot {
         axplat_x86_pc::boot_modules()
 ```
 
-which is `[V]` consumed at `crates/ax/thekernel-axdriver/src/lib.rs:519`
+which is `[V]` consumed at `crates/ax/tk-axdriver/src/lib.rs:519`
 (`let Some((start, end)) = axhal::boot::rootfs_module() else {`). That is the only existing
 "bootloader handed us a physical region, a driver consumes it" path in the tree, and the
 framebuffer must reuse it.
@@ -665,7 +665,7 @@ framebuffer must reuse it.
 
 Today, **any** parse failure is fatal and unconditional:
 
-`[V]` `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs:154-159`
+`[V]` `crates/ax/tk-axplat-x86-pc/src/boot_info.rs:154-159`
 
 ```rust
             let bytes = unsafe { multiboot2_info_bytes(info_paddr) }.unwrap_or_else(|| {
@@ -721,7 +721,7 @@ non-overlapping and inside usable RAM (`:474-479`). Its host-test coverage is ex
 
 They are built statically in assembly and loaded before long mode is entered.
 
-`[V]` `crates/ax/thekernel-axplat-x86-pc/src/multiboot.S:65-72`
+`[V]` `crates/ax/tk-axplat-x86-pc/src/multiboot.S:65-72`
 
 ```asm
     # set PAE, PGE bit in CR4
@@ -733,7 +733,7 @@ They are built statically in assembly and loaded before long mode is entered.
     mov     cr3, eax
 ```
 
-`[V]` PML4 — `crates/ax/thekernel-axplat-x86-pc/src/multiboot.S:153-160`
+`[V]` PML4 — `crates/ax/tk-axplat-x86-pc/src/multiboot.S:153-160`
 
 ```asm
 .balign 4096
@@ -746,7 +746,7 @@ They are built statically in assembly and loaded before long mode is entered.
     .zero 8 * 255
 ```
 
-`[V]` the two PDPTs, each 512 × 1 GiB huge pages — `crates/ax/thekernel-axplat-x86-pc/src/multiboot.S:162-175`
+`[V]` the two PDPTs, each 512 × 1 GiB huge pages — `crates/ax/tk-axplat-x86-pc/src/multiboot.S:162-175`
 
 ```asm
 # FIXME: may not work on macOS using hvf as the CPU does not support 1GB page (pdpe1gb)
@@ -768,7 +768,7 @@ They are built statically in assembly and loaded before long mode is entered.
 **Extent:** identity `0 .. 512 GiB` and `PHYS_VIRT_OFFSET .. PHYS_VIRT_OFFSET + 512 GiB`,
 all present, writable, 4 KiB-page… actually 1 GiB-page, **cacheable WB** (no PCD/PWT bits).
 `PHYS_VIRT_OFFSET` is `0xffff_8000_0000_0000` (`[V]`
-`crates/ax/thekernel-axplat-x86-pc/axconfig.toml:25`, and the product profile
+`crates/ax/tk-axplat-x86-pc/axconfig.toml:25`, and the product profile
 `config/x86_64/q35-uefi.toml:15`).
 
 ### 2.2 Would a typical UEFI GOP framebuffer address be covered? — precise answer
@@ -784,7 +784,7 @@ below 512 GiB) is covered by `[V]` `multiboot.S:163-168`.
 **After the switch (no, unless listed).** The runtime replaces CR3 with a brand-new,
 sparse hierarchy:
 
-`[V]` `crates/ax/thekernel-axmm/src/lib.rs:88-105`
+`[V]` `crates/ax/tk-axmm/src/lib.rs:88-105`
 
 ```rust
 pub fn init_memory_management() {
@@ -803,15 +803,15 @@ pub fn init_memory_management() {
 }
 ```
 
-(It is called at `[V]` `crates/ax/thekernel-axruntime/src/lib.rs:424` —
+(It is called at `[V]` `crates/ax/tk-axruntime/src/lib.rs:424` —
 `axmm::init_memory_management();` — and the CR3 write is `[V]`
-`crates/ax/thekernel-axcpu/src/x86_64/asm.rs:1410-1412`
+`crates/ax/tk-axcpu/src/x86_64/asm.rs:1410-1412`
 `pub unsafe fn write_kernel_page_table(root_paddr: PhysAddr) {` /
 `    unsafe { write_user_page_table(root_paddr) }`.)
 
 What the new table maps is exactly the region list:
 
-`[V]` `crates/ax/thekernel-axmm/src/lib.rs:51-68`
+`[V]` `crates/ax/tk-axmm/src/lib.rs:51-68`
 
 ```rust
 /// Creates a new address space for kernel itself.
@@ -835,7 +835,7 @@ pub fn new_kernel_aspace() -> AxResult<AddrSpace> {
 
 and that list includes MMIO ranges as **device** regions:
 
-`[V]` `crates/ax/thekernel-axhal/src/mem.rs:56-59`
+`[V]` `crates/ax/tk-axhal/src/mem.rs:56-59`
 
 ```rust
     // Push MMIO & reserved regions
@@ -886,7 +886,7 @@ and the profile's own comment states the direct-map extent:
 
 — but the **bare platform default** does not contain `0x8000_0000`:
 
-`[V]` `crates/ax/thekernel-axplat-x86-pc/axconfig.toml:44-51`
+`[V]` `crates/ax/tk-axplat-x86-pc/axconfig.toml:44-51`
 
 ```toml
 # MMIO ranges with format (`base_paddr`, `size`).
@@ -905,7 +905,7 @@ existing linear map, and must do so on every profile.
 
 ### 2.3 The runtime iomap facility
 
-`[V]` Exact signature, flags and duplicate tolerance — `crates/ax/thekernel-axmm/src/lib.rs:108-129`
+`[V]` Exact signature, flags and duplicate tolerance — `crates/ax/tk-axmm/src/lib.rs:108-129`
 
 ```rust
 /// Maps a physical memory region to virtual address space for device access.
@@ -934,8 +934,8 @@ pub fn iomap(addr: PhysAddr, size: usize) -> AxResult<VirtAddr> {
 
 | Property | Value | Evidence |
 |---|---|---|
-| Signature | `pub fn iomap(addr: PhysAddr, size: usize) -> AxResult<VirtAddr>` | `crates/ax/thekernel-axmm/src/lib.rs:109` |
-| Returned VA | `phys_to_virt(addr)` = `addr + PHYS_VIRT_OFFSET` | `:110`; `crates/ax/thekernel-axplat-x86-pc/src/mem.rs:109-111` |
+| Signature | `pub fn iomap(addr: PhysAddr, size: usize) -> AxResult<VirtAddr>` | `crates/ax/tk-axmm/src/lib.rs:109` |
+| Returned VA | `phys_to_virt(addr)` = `addr + PHYS_VIRT_OFFSET` | `:110`; `crates/ax/tk-axplat-x86-pc/src/mem.rs:109-111` |
 | Flags | `MappingFlags::DEVICE \| READ \| WRITE` | `:116` |
 | Tolerates existing mapping | **Yes** — `Err(AxError::AlreadyExists) => {}` | `:119` |
 | Always reprotects | `tb.protect(virt_aligned, size_aligned, flags)?` | `:127` |
@@ -943,7 +943,7 @@ pub fn iomap(addr: PhysAddr, size: usize) -> AxResult<VirtAddr> {
 
 The `axklib` façade used by the `dyn` driver path forwards to the same function:
 
-`[V]` `crates/ax/thekernel-axruntime/src/klib.rs:23-28`
+`[V]` `crates/ax/tk-axruntime/src/klib.rs:23-28`
 
 ```rust
         /// This function forwards the request to `axmm::iomap` and returns the
@@ -954,7 +954,7 @@ The `axklib` façade used by the `dyn` driver path forwards to the same function
         }
 ```
 
-`[V]` consumed as `axklib::mem::iomap` at `crates/ax/thekernel-axdriver/src/dyn_drivers/mod.rs:18-25`.
+`[V]` consumed as `axklib::mem::iomap` at `crates/ax/tk-axdriver/src/dyn_drivers/mod.rs:18-25`.
 
 `[I]` The `AlreadyExists` tolerance plus the unconditional `protect` means `iomap` is
 **idempotent and safe to call on a range that is already linearly mapped as RAM** — but it
@@ -965,7 +965,7 @@ tag, and §2.4 adds an explicit `phys_ram_ranges()` overlap check).
 ### 2.4 How the framebuffer must be mapped; existing cache-attribute control
 
 **Current attribute model.** `MappingFlags` is a generic bitflags type
-(`[V]` `crates/ax/thekernel-page-table-entry/src/lib.rs:12-39`):
+(`[V]` `crates/ax/tk-page-table-entry/src/lib.rs:12-39`):
 
 ```rust
         /// The memory is device memory.
@@ -976,7 +976,7 @@ tag, and §2.4 adds an explicit `phys_ram_ranges()` overlap check).
 
 On x86_64 **both** collapse to the same PTE encoding:
 
-`[V]` `crates/ax/thekernel-page-table-entry/src/arch/x86_64.rs:95-97`
+`[V]` `crates/ax/tk-page-table-entry/src/arch/x86_64.rs:95-97`
 
 ```rust
         if f.contains(MappingFlags::DEVICE) || f.contains(MappingFlags::UNCACHED) {
@@ -1011,19 +1011,19 @@ of UC stores, and the existing fbcon already coalesces repaints to at most one p
 
 *Option 2 (write-combining, a follow-up).* Add a new `MappingFlags` bit
 (e.g. `WRITE_COMBINE = 1 << 11`, free — the highest currently used is `SHADOW_STACK = 1 << 10`
-at `crates/ax/thekernel-page-table-entry/src/lib.rs:38`), program `IA32_PAT` entry 1 to
+at `crates/ax/tk-page-table-entry/src/lib.rs:38`), program `IA32_PAT` entry 1 to
 `WC` during early per-CPU init, and encode the flag as `PWT=0, PCD=0` **plus** a PAT bit.
 `[I]` This is a real, self-contained project: the x86_64 `X64PTE` type
-(`crates/ax/thekernel-page-table-entry/src/arch/x86_64.rs:102-105`) has no PAT-bit accessor
+(`crates/ax/tk-page-table-entry/src/arch/x86_64.rs:102-105`) has no PAT-bit accessor
 today, and PAT must be set identically on every CPU before any WC mapping is used. The
 design therefore gates Option 2 behind a feature and ships Option 1 first.
 
 **Additional required guard (both options).** Before mapping, verify the tag's
 `[addr, addr + pitch*height)` does not intersect `axhal::mem::phys_ram_ranges()`
-(`[V]` `crates/ax/thekernel-axhal/src/mem.rs:4` re-exports `phys_ram_ranges`), because
-`iomap`'s unconditional `protect` at `crates/ax/thekernel-axmm/src/lib.rs:127` would
+(`[V]` `crates/ax/tk-axhal/src/mem.rs:4` re-exports `phys_ram_ranges`), because
+`iomap`'s unconditional `protect` at `crates/ax/tk-axmm/src/lib.rs:127` would
 silently make RAM uncached. The overlap primitives already exist: `ranges_difference` /
-`check_sorted_ranges_overlap` are imported at `crates/ax/thekernel-axhal/src/mem.rs:7`.
+`check_sorted_ranges_overlap` are imported at `crates/ax/tk-axhal/src/mem.rs:7`.
 
 ---
 
@@ -1032,11 +1032,11 @@ silently make RAM uncached. The overlap primitives already exist: `ranges_differ
 ### 3.1 The interface: exact name and every method
 
 The trait is **`DisplayDriverOps`**, defined at
-`crates/ax/thekernel-axdriver-display/src/lib.rs:383`, with supertrait
+`crates/ax/tk-axdriver-display/src/lib.rs:383`, with supertrait
 `BaseDriverOps` (`:11` re-exports it from `axdriver_base`).
 
 `[V]` Full method list, quoted verbatim from
-`crates/ax/thekernel-axdriver-display/src/lib.rs:378-429`:
+`crates/ax/tk-axdriver-display/src/lib.rs:378-429`:
 
 ```rust
 /// Operations required by display drivers.
@@ -1094,8 +1094,8 @@ pub trait DisplayDriverOps: BaseDriverOps {
 ```
 
 Inherited from `BaseDriverOps`, re-exported at
-`crates/ax/thekernel-axdriver-display/src/lib.rs:11` and defined at
-`crates/ax/thekernel-axdriver-base/src/lib.rs:75-84`:
+`crates/ax/tk-axdriver-display/src/lib.rs:11` and defined at
+`crates/ax/tk-axdriver-base/src/lib.rs:75-84`:
 
 ```rust
 pub trait BaseDriverOps: Send + Sync {
@@ -1105,7 +1105,7 @@ pub trait BaseDriverOps: Send + Sync {
 ```
 
 (all three used by `StaticBlockDevice` at
-`crates/ax/thekernel-axdriver/src/structs/static.rs:34-61`).
+`crates/ax/tk-axdriver/src/structs/static.rs:34-61`).
 
 | Method | Required? | Implementable by a linear-framebuffer driver? |
 |---|---|---|
@@ -1127,7 +1127,7 @@ pub trait BaseDriverOps: Send + Sync {
 `set_resolution`, `mode`, `preferred_mode`, or equivalent. The only mode-shaped data is
 the plain value struct:
 
-`[V]` `crates/ax/thekernel-axdriver-display/src/lib.rs:26-32`
+`[V]` `crates/ax/tk-axdriver-display/src/lib.rs:26-32`
 
 ```rust
 #[derive(Debug, Clone, Copy)]
@@ -1150,8 +1150,8 @@ pub struct DisplayInfo {
   userspace `FBIOPUT_VSCREENINFO` with new timings) **cannot** be expressed against this
   trait. Adding it means either (a) a new `fn set_mode(&mut self, info: DisplayInfo) -> DevResult`
   on `DisplayDriverOps` with a default `Err(DevError::Unsupported)` — cheap, but every
-  existing implementor (virtio-gpu at `crates/ax/thekernel-axdriver-virtio/src/gpu.rs:70`,
-  the dummy at `crates/ax/thekernel-axdriver/src/dummy.rs:88`) must still compile, which a
+  existing implementor (virtio-gpu at `crates/ax/tk-axdriver-virtio/src/gpu.rs:70`,
+  the dummy at `crates/ax/tk-axdriver/src/dummy.rs:88`) must still compile, which a
   defaulted method guarantees — or (b) leaving mode setting entirely to the DRM layer,
   which is what happens today. The design chooses **(b)**: the fbcon path never changes
   the mode.
@@ -1160,7 +1160,7 @@ pub struct DisplayInfo {
 
 **Build-time macros.**
 
-`[V]` `crates/ax/thekernel-axdriver/src/macros.rs:21-27`
+`[V]` `crates/ax/tk-axdriver/src/macros.rs:21-27`
 
 ```rust
 macro_rules! register_display_driver {
@@ -1172,7 +1172,7 @@ macro_rules! register_display_driver {
 }
 ```
 
-`[V]` the dispatch macro's display arm — `crates/ax/thekernel-axdriver/src/macros.rs:73-77`
+`[V]` the dispatch macro's display arm — `crates/ax/tk-axdriver/src/macros.rs:73-77`
 
 ```rust
         #[cfg(display_dev = "virtio-gpu")]
@@ -1183,11 +1183,11 @@ macro_rules! register_display_driver {
 ```
 
 `[V]` the `display_dev` cfg is generated by the build script —
-`crates/ax/thekernel-axdriver/build.rs:3` (`const DISPLAY_DEV_FEATURES: &[&str] = &["virtio-gpu"];`)
+`crates/ax/tk-axdriver/build.rs:3` (`const DISPLAY_DEV_FEATURES: &[&str] = &["virtio-gpu"];`)
 and `:39-58`, which emits `display_dev="virtio-gpu"` when the feature is on and
 `display_dev="dummy"` when `display` is on with no listed device.
 
-`[V]` the actual registration site — `crates/ax/thekernel-axdriver/src/drivers.rs:52-56`
+`[V]` the actual registration site — `crates/ax/tk-axdriver/src/drivers.rs:52-56`
 
 ```rust
 #[cfg(display_dev = "virtio-gpu")]
@@ -1200,7 +1200,7 @@ register_display_driver!(
 **Runtime discovery path (static model, which is what the product builds).**
 
 1. `AllDevices::probe()` iterates the compile-time driver list —
-   `[V]` `crates/ax/thekernel-axdriver/src/lib.rs:495-512`
+   `[V]` `crates/ax/tk-axdriver/src/lib.rs:495-512`
 
 ```rust
         #[cfg(not(feature = "dyn"))]
@@ -1224,20 +1224,20 @@ register_display_driver!(
 ```
 
 2. `probe_bus_devices` lives on `AllDevices` in the bus module —
-   `[V]` `crates/ax/thekernel-axdriver/src/bus/pci.rs:389-390`
+   `[V]` `crates/ax/tk-axdriver/src/bus/pci.rs:389-390`
    (`pub(crate) fn probe_bus_devices(&mut self) {` / `let mut root = pci_root();`), which
    walks every reachable PCI function and calls each driver's `probe_pci` —
-   `[V]` `crates/ax/thekernel-axdriver/src/bus/pci.rs:430-431`
+   `[V]` `crates/ax/tk-axdriver/src/bus/pci.rs:430-431`
    (`for_each_drivers!(type Driver, {` / `match Driver::probe_pci(root, bdf, dev_info) {`).
-   (The MMIO variant is `crates/ax/thekernel-axdriver/src/bus/mmio.rs:5-26`.)
+   (The MMIO variant is `crates/ax/tk-axdriver/src/bus/mmio.rs:5-26`.)
 3. The `DriverProbe` trait with its three defaulted hooks is
-   `[V]` `crates/ax/thekernel-axdriver/src/drivers.rs:20-38`.
+   `[V]` `crates/ax/tk-axdriver/src/drivers.rs:20-38`.
 4. Devices are accumulated in `AxDeviceContainer<AxDisplayDevice>` —
-   `[V]` `crates/ax/thekernel-axdriver/src/lib.rs:466-468`
+   `[V]` `crates/ax/tk-axdriver/src/lib.rs:466-468`
    (`/// All graphics device drivers.` / `#[cfg(feature = "display")]` / `pub display: AxDeviceContainer<AxDisplayDevice>,`)
-   — a `SmallVec<[D; 1]>` (`crates/ax/thekernel-axdriver/src/structs/mod.rs:73`).
-5. `thekernel-axdisplay` consumes it and keeps **exactly one** device —
-   `[V]` `crates/ax/thekernel-axdisplay/src/lib.rs:14` and `:16-24`:
+   — a `SmallVec<[D; 1]>` (`crates/ax/tk-axdriver/src/structs/mod.rs:73`).
+5. `tk-axdisplay` consumes it and keeps **exactly one** device —
+   `[V]` `crates/ax/tk-axdisplay/src/lib.rs:14` and `:16-24`:
 
 ```rust
 static MAIN_DISPLAY: LazyInit<Mutex<Option<AxDisplayDevice>>> = LazyInit::new();
@@ -1253,7 +1253,7 @@ pub fn init_display(mut display_devs: AxDeviceContainer<AxDisplayDevice>) {
 }
 ```
 
-6. Called from the runtime — `[V]` `crates/ax/thekernel-axruntime/src/lib.rs:454-455`
+6. Called from the runtime — `[V]` `crates/ax/tk-axruntime/src/lib.rs:454-455`
    (`#[cfg(feature = "display")]` / `axdisplay::init_display(all_devices.display);`).
 
 ### 3.4 CRITICAL: can the registry hold more than one display driver?
@@ -1262,22 +1262,22 @@ pub fn init_display(mut display_devs: AxDeviceContainer<AxDisplayDevice>) {
 
 **Static model (what the product builds).** `[V]` root `Cargo.toml:156`
 (`x86-product = ["qemu", "smp", "hwp-uclamp", "pmu", "perf-sampling"]`) and `:166-169`
-(`qemu = [` … `"axfeat/display",` …); `[V]` `crates/ax/thekernel-axfeat/Cargo.toml:22-28`
+(`qemu = [` … `"axfeat/display",` …); `[V]` `crates/ax/tk-axfeat/Cargo.toml:22-28`
 (`display = [` … `"axdriver/virtio-gpu",` …). The `dyn` feature appears **nowhere** in the
 product feature graph — searching the root `Cargo.toml` and
-`crates/ax/thekernel-axfeat/Cargo.toml` for `dyn` yields no hits.
+`crates/ax/tk-axfeat/Cargo.toml` for `dyn` yields no hits.
 
 Therefore `register_display_driver!` (`macros.rs:21-27`) expands to
 `pub type AxDisplayDevice = <virtio::VirtIoGpu as VirtIoDevMeta>::Device;` — **one concrete
 type for the whole kernel image**. A second invocation would define the same alias twice in
 the same module → duplicate-definition compile error. The build script enforces the same
 singularity from the other side: it emits **one** `display_dev` value, or `dummy`
-(`crates/ax/thekernel-axdriver/build.rs:39-58`).
+(`crates/ax/tk-axdriver/build.rs:39-58`).
 
 **What happens to the display type alias when `dyn` is enabled.** The alias becomes a trait
 object:
 
-`[V]` `crates/ax/thekernel-axdriver/src/structs/dyn.rs:11-13`
+`[V]` `crates/ax/tk-axdriver/src/structs/dyn.rs:11-13`
 
 ```rust
 /// The unified type of the graphics display devices.
@@ -1287,7 +1287,7 @@ pub type AxDisplayDevice = Box<dyn DisplayDriverOps>;
 
 and a boxing constructor exists:
 
-`[V]` `crates/ax/thekernel-axdriver/src/structs/dyn.rs:34-38`
+`[V]` `crates/ax/tk-axdriver/src/structs/dyn.rs:34-38`
 
 ```rust
     /// Constructs a display device.
@@ -1300,7 +1300,7 @@ and a boxing constructor exists:
 **But a runtime-dispatch path for display does not exist and would have to be written.**
 The `dyn` probe function enumerates **block devices only**:
 
-`[V]` `crates/ax/thekernel-axdriver/src/dyn_drivers/mod.rs:27-41`
+`[V]` `crates/ax/tk-axdriver/src/dyn_drivers/mod.rs:27-41`
 
 ```rust
 pub fn probe_all_devices() -> Vec<super::AxDeviceEnum> {
@@ -1323,7 +1323,7 @@ pub fn probe_all_devices() -> Vec<super::AxDeviceEnum> {
 There is no `rd_display`, no `get_list::<...>()` for a display type, and no display entry
 in the `dyn` feature's dependency list:
 
-`[V]` `crates/ax/thekernel-axdriver/Cargo.toml:50-59`
+`[V]` `crates/ax/tk-axdriver/Cargo.toml:50-59`
 
 ```toml
 dyn = [
@@ -1340,20 +1340,20 @@ dyn = [
 
 (`dep:rd-block` present, no display equivalent.) A repository-wide search for
 `rd_display`, `rd_gpu`, `get_list::<` returns only
-`crates/ax/thekernel-axdriver/src/dyn_drivers/mod.rs:33` — `let ls = rdrive::get_list::<rd_block::Block>();`.
+`crates/ax/tk-axdriver/src/dyn_drivers/mod.rs:33` — `let ls = rdrive::get_list::<rd_block::Block>();`.
 `[V]` A workspace dependency `rdif-display = { version = "0.2.0" }` is declared at
 `Cargo.toml:127` but is **unused**: it has no `Cargo.lock` entry and no `use` site
 (`grep -rn "rdif-display\|rdif_display"` → only `Cargo.toml:127`).
 
 **And even in `dyn` mode only one display device survives**, because
 `axdisplay::init_display` calls `take_one()` on a single `Option` slot
-(`crates/ax/thekernel-axdisplay/src/lib.rs:18-20`, quoted in §3.3).
+(`crates/ax/tk-axdisplay/src/lib.rs:18-20`, quoted in §3.3).
 
 **Design decision for the framebuffer.** Do **not** attempt to enable `dyn`. Instead,
 copy the pattern the block subsystem already uses for exactly this problem — a static
 **enum** wrapping multiple concrete device types:
 
-`[V]` `crates/ax/thekernel-axdriver/src/structs/static.rs:9-17`
+`[V]` `crates/ax/tk-axdriver/src/structs/static.rs:9-17`
 
 ```rust
 #[cfg(feature = "block")]
@@ -1370,14 +1370,14 @@ pub enum StaticBlockDevice {
 The display equivalent is a `StaticDisplayDevice { Virtio(..), BootFb(..) }` enum with a
 delegating `DisplayDriverOps` impl, plus a rename of the macro-generated alias to
 `RegisteredStaticDisplayDevice` (mirroring `register_block_driver!` at
-`crates/ax/thekernel-axdriver/src/macros.rs:13-19`, which already emits
+`crates/ax/tk-axdriver/src/macros.rs:13-19`, which already emits
 `RegisteredStaticBlockDevice` rather than `AxBlockDevice`). This keeps the static model,
 adds no runtime dispatch, and is the smallest change that satisfies "more than one display
 driver in one kernel image".
 
 ### 3.5 `fb()`, `need_flush()`, `flush()` — meaning and current state
 
-`[V]` `FrameBuffer` — `crates/ax/thekernel-axdriver-display/src/lib.rs:65-67` and `:366-376`
+`[V]` `FrameBuffer` — `crates/ax/tk-axdriver-display/src/lib.rs:65-67` and `:366-376`
 
 ```rust
 pub struct FrameBuffer<'a> {
@@ -1401,12 +1401,12 @@ impl<'a> FrameBuffer<'a> {
 
 | Item | Meaning | Verified state |
 |---|---|---|
-| `fb()` | Returns a borrowed view of the driver's own linear framebuffer, `info().fb_size` bytes starting at `info().fb_base_vaddr`. | **`_raw` is private with no accessor, no `Deref`, no `AsRef`.** `grep -rn "_raw" crates/ax/thekernel-axdriver-display/src/lib.rs` returns only lines 66, 369, 374. The return value is therefore **unusable by any caller today** — a real gap the change set must close (add `as_slice`/`as_mut_slice`, or `Deref`). |
-| `need_flush()` | Whether the driver's own framebuffer is a shadow that must be pushed to the device. | `[V]` virtio-gpu returns `true` (`crates/ax/thekernel-axdriver-virtio/src/gpu.rs:89-91`); the dummy returns `false` (`crates/ax/thekernel-axdriver/src/dummy.rs:95-97`). A firmware framebuffer returns **`false`**: the memory *is* the scanout. |
-| `flush()` | Push the shadow to the device. | `[V]` virtio-gpu returns `Err(DevError::Unsupported)` (`crates/ax/thekernel-axdriver-virtio/src/gpu.rs:93-95`); the dummy likewise (`dummy.rs:98-100`). A firmware framebuffer returns `Ok(())`. |
+| `fb()` | Returns a borrowed view of the driver's own linear framebuffer, `info().fb_size` bytes starting at `info().fb_base_vaddr`. | **`_raw` is private with no accessor, no `Deref`, no `AsRef`.** `grep -rn "_raw" crates/ax/tk-axdriver-display/src/lib.rs` returns only lines 66, 369, 374. The return value is therefore **unusable by any caller today** — a real gap the change set must close (add `as_slice`/`as_mut_slice`, or `Deref`). |
+| `need_flush()` | Whether the driver's own framebuffer is a shadow that must be pushed to the device. | `[V]` virtio-gpu returns `true` (`crates/ax/tk-axdriver-virtio/src/gpu.rs:89-91`); the dummy returns `false` (`crates/ax/tk-axdriver/src/dummy.rs:95-97`). A firmware framebuffer returns **`false`**: the memory *is* the scanout. |
+| `flush()` | Push the shadow to the device. | `[V]` virtio-gpu returns `Err(DevError::Unsupported)` (`crates/ax/tk-axdriver-virtio/src/gpu.rs:93-95`); the dummy likewise (`dummy.rs:98-100`). A firmware framebuffer returns `Ok(())`. |
 
 `[V]` Note the DRM path deliberately zeroes the legacy framebuffer so nothing can double-own
-the scanout — `crates/ax/thekernel-axdriver-virtio/src/gpu.rs:44-49`:
+the scanout — `crates/ax/tk-axdriver-virtio/src/gpu.rs:44-49`:
 
 ```rust
         let info = DisplayInfo {
@@ -1420,11 +1420,11 @@ the scanout — `crates/ax/thekernel-axdriver-virtio/src/gpu.rs:44-49`:
 ```
 
 `[V]` and the legacy consumers are dead code with **zero** callers:
-`crates/ax/thekernel-axdisplay/src/lib.rs:26` (`has_display`), `:44` (`framebuffer_info`),
+`crates/ax/tk-axdisplay/src/lib.rs:26` (`has_display`), `:44` (`framebuffer_info`),
 `:52` (`framebuffer_flush`). A repository-wide grep for these three names returns only
 their definitions and the `take_drm_display` call site at `kernel/src/drm/virtio.rs:2439`.
 `[I]` `framebuffer_info()` would additionally `panic!` after the DRM handoff, because
-`take_drm_display` empties the slot — `[V]` `crates/ax/thekernel-axdisplay/src/lib.rs:44-50`:
+`take_drm_display` empties the slot — `[V]` `crates/ax/tk-axdisplay/src/lib.rs:44-50`:
 
 ```rust
 pub fn framebuffer_info() -> DisplayInfo {
@@ -1450,10 +1450,10 @@ There are **two distinct byte sinks** and it is essential not to conflate them.
 
 | Sink | Port | Code | Reached by |
 |---|---|---|---|
-| Console UART | **COM1, `0x3f8`** | `crates/ax/thekernel-axplat-x86-pc/src/console.rs:7` `static COM1: SpinNoIrq<SerialPort> = unsafe { SpinNoIrq::new(SerialPort::new(0x3f8)) };` | `ConsoleIf::write_bytes` (`:30-34`) → `putchar` (`:11-13`); i.e. the **userspace TTY path only** |
-| Diagnostic UART | **COM2, `0x2f8`** | `crates/ax/thekernel-axplat-x86-pc/src/console.rs:68-69` `#[cfg(target_os = "none")]` / `const DIAGNOSTIC_BASE: u16 = 0x2f8;` | `try_write_diagnostic_bytes` (`:179-195`) and `emergency_diagnostic_print` (`:200-219`); i.e. **all kernel logging** |
+| Console UART | **COM1, `0x3f8`** | `crates/ax/tk-axplat-x86-pc/src/console.rs:7` `static COM1: SpinNoIrq<SerialPort> = unsafe { SpinNoIrq::new(SerialPort::new(0x3f8)) };` | `ConsoleIf::write_bytes` (`:30-34`) → `putchar` (`:11-13`); i.e. the **userspace TTY path only** |
+| Diagnostic UART | **COM2, `0x2f8`** | `crates/ax/tk-axplat-x86-pc/src/console.rs:68-69` `#[cfg(target_os = "none")]` / `const DIAGNOSTIC_BASE: u16 = 0x2f8;` | `try_write_diagnostic_bytes` (`:179-195`) and `emergency_diagnostic_print` (`:200-219`); i.e. **all kernel logging** |
 
-`[V]` `crates/ax/thekernel-axplat-x86-pc/src/console.rs:20-34`
+`[V]` `crates/ax/tk-axplat-x86-pc/src/console.rs:20-34`
 
 ```rust
 pub fn init() {
@@ -1476,7 +1476,7 @@ impl ConsoleIf for ConsoleIfImpl {
 The COM1 path is only reachable through the `axplat::console::ConsoleIf` crate interface,
 re-exported as `axhal::console::write_bytes`:
 
-`[V]` `crates/ax/thekernel-axhal/src/lib.rs:472-475`
+`[V]` `crates/ax/tk-axhal/src/lib.rs:472-475`
 
 ```rust
     #[cfg(feature = "irq")]
@@ -1497,7 +1497,7 @@ ax_println!(..)  /  info!(..) error!(..) warn!(..) debug!(..)
         │                 → crate_interface call LogIf::console_write_str
         │  info!(..) etc. → log crate → registered logger
         ▼
-axruntime::klog::Logger::log                       crates/ax/thekernel-axruntime/src/klog.rs:342-369
+axruntime::klog::Logger::log                       crates/ax/tk-axruntime/src/klog.rs:342-369
         │  format!("<{prio}>[{secs}.{usec} cpu=.. tid=.. LEVEL target=.. module=..] {args}")  :354-366
         ▼
 klog::append(text, level)                          :317-336   (bounded ring buffer, CAPACITY = 64 KiB, :9)
@@ -1505,7 +1505,7 @@ klog::append(text, level)                          :317-336   (bounded ring buff
 DiagnosticDrain::drain_once()                      :444-446
         │  self.drain_with(axhal::console::try_write_diagnostic_bytes)   :445
         ▼
-axplat_x86_pc::console::try_write_diagnostic_bytes  crates/ax/thekernel-axplat-x86-pc/src/console.rs:179-195
+axplat_x86_pc::console::try_write_diagnostic_bytes  crates/ax/tk-axplat-x86-pc/src/console.rs:179-195
         ▼
 write_diagnostic(...)  →  x86::io::outb(0x2f8, byte)   console.rs:152-162, :160
         ▼
@@ -1519,7 +1519,7 @@ Step-by-step evidence:
 * `[X]` `axlog-0.3.0-preview.2/src/lib.rs:61-72` defines `ax_print!`/`ax_println!` calling
   `$crate::__print_impl`; `:221-232` defines `print_fmt`/`__print_impl`; `:126-134`
   `Logger::write_str` performs `call_interface!(LogIf::console_write_str, s)`.
-* `[V]` the `LogIf` implementation is `crates/ax/thekernel-axruntime/src/lib.rs:114-118`:
+* `[V]` the `LogIf` implementation is `crates/ax/tk-axruntime/src/lib.rs:114-118`:
 
 ```rust
 #[crate_interface::impl_interface]
@@ -1530,7 +1530,7 @@ impl axlog::LogIf for LogIfImpl {
 ```
 
 * `[V]` `klog::record` re-enters the diagnostic funnel —
-  `crates/ax/thekernel-axruntime/src/klog.rs:392-398`:
+  `crates/ax/tk-axruntime/src/klog.rs:392-398`:
 
 ```rust
 /// Legacy ax_print fragments are diagnostics, never terminal output.
@@ -1543,7 +1543,7 @@ pub fn record(bytes: &[u8]) {
 ```
 
 * `[V]` the logger is installed by `klog::init`, not by `axlog::init` —
-  `crates/ax/thekernel-axruntime/src/klog.rs:372-381`:
+  `crates/ax/tk-axruntime/src/klog.rs:372-381`:
 
 ```rust
 pub(crate) fn init(level: &str) {
@@ -1588,21 +1588,21 @@ the scratch-register probe (`console.rs:82-93`).
 `[I]` There is **no existing generic "console" abstraction** that a framebuffer backend can
 plug into. The two candidate abstractions are both crate-interface singletons with exactly
 one implementation slot: `axplat::console::ConsoleIf` (implemented once at
-`crates/ax/thekernel-axplat-x86-pc/src/console.rs:27-59`) and `axlog::LogIf` (implemented
-once at `crates/ax/thekernel-axruntime/src/lib.rs:114`). Adding a second output is not
+`crates/ax/tk-axplat-x86-pc/src/console.rs:27-59`) and `axlog::LogIf` (implemented
+once at `crates/ax/tk-axruntime/src/lib.rs:114`). Adding a second output is not
 "plugging in a backend"; it is adding a **second sink inside an existing consumer**.
 
 Required change points, in dependency order:
 
 | # | Location | Change | Why |
 |---|---|---|---|
-| 1 | `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs` | Parse and store tag 8 (§1). | Nothing downstream can exist without the mode. |
-| 2 | `crates/ax/thekernel-axplat-x86-pc/src/lib.rs` | Export a `framebuffer()` accessor (next to the existing `boot_modules` export at `:48`). | Cross-layer handoff. |
-| 3 | `crates/ax/thekernel-axhal/src/lib.rs` (`boot` module) | Re-export it as `axhal::boot::framebuffer()`, mirroring `rootfs_module()` at `:60`. | Driver-layer access. |
-| 4 | new `kernel/src/pseudofs/dev/fbcon` early sink **or** `crates/ax/thekernel-axruntime/src/klog.rs` | Add a second drain target for `DiagnosticDrain`. The clean insertion point is `drain_with` at `klog.rs:447`, which already takes `sink: impl FnMut(&[u8]) -> usize` — a generic sink parameter, so a **second consumer** (`DiagnosticDrain::drain_once` at `:444` is the only caller) can be added without touching the ring buffer. | Kernel `printk` must reach the screen. |
+| 1 | `crates/ax/tk-axplat-x86-pc/src/boot_info.rs` | Parse and store tag 8 (§1). | Nothing downstream can exist without the mode. |
+| 2 | `crates/ax/tk-axplat-x86-pc/src/lib.rs` | Export a `framebuffer()` accessor (next to the existing `boot_modules` export at `:48`). | Cross-layer handoff. |
+| 3 | `crates/ax/tk-axhal/src/lib.rs` (`boot` module) | Re-export it as `axhal::boot::framebuffer()`, mirroring `rootfs_module()` at `:60`. | Driver-layer access. |
+| 4 | new `kernel/src/pseudofs/dev/fbcon` early sink **or** `crates/ax/tk-axruntime/src/klog.rs` | Add a second drain target for `DiagnosticDrain`. The clean insertion point is `drain_with` at `klog.rs:447`, which already takes `sink: impl FnMut(&[u8]) -> usize` — a generic sink parameter, so a **second consumer** (`DiagnosticDrain::drain_once` at `:444` is the only caller) can be added without touching the ring buffer. | Kernel `printk` must reach the screen. |
 | 5 | `kernel/src/deferred_work.rs:239-268` | Drive the new sink alongside the UART drain. | The drain is task-driven; a sink with no pump emits nothing. |
 | 6 | `kernel/src/pseudofs/dev/fb.rs:616-634` (`DisplayCore`) | Generalise the scanout field from `Arc<DrmFbdev>` to a scanout abstraction, so fbcon and `/dev/fb0` work without DRM. | Removes the DRM hard dependency (§5). |
-| 7 | `crates/ax/thekernel-axdriver/src/structs/static.rs` + `macros.rs` + `drivers.rs` | Add the `StaticDisplayDevice` enum so virtio-gpu and bootfb coexist (§3.4). | Only if the bootfb is modelled as a driver; an alternative is to bypass `axdriver` entirely and construct the bootfb directly from `axhal::boot::framebuffer()` inside `kernel/src/drm/` or `kernel/src/pseudofs/dev/`. `[I]` The bypass is smaller and is what this design recommends, because the `DisplayDriverOps` trait contributes nothing the fbcon needs (no mode verb, unusable `fb()`). |
+| 7 | `crates/ax/tk-axdriver/src/structs/static.rs` + `macros.rs` + `drivers.rs` | Add the `StaticDisplayDevice` enum so virtio-gpu and bootfb coexist (§3.4). | Only if the bootfb is modelled as a driver; an alternative is to bypass `axdriver` entirely and construct the bootfb directly from `axhal::boot::framebuffer()` inside `kernel/src/drm/` or `kernel/src/pseudofs/dev/`. `[I]` The bypass is smaller and is what this design recommends, because the `DisplayDriverOps` trait contributes nothing the fbcon needs (no mode verb, unusable `fb()`). |
 | 8 | `config/x86_64/grub.cfg` (and `grub-drive.cfg`) | Add explicit `set gfxmode=` / `set gfxpayload=keep` so GRUB initialises video and emits tag 8. | Otherwise the tag may be absent (§7.1 A3). |
 
 Change points 1–5 and 8 are mandatory; 6 is mandatory for `/dev/fb0` to exist on a
@@ -1896,7 +1896,7 @@ pub fn init() -> DrmResult<bool> {
 ```
 
 `[V]` the hand-off requires `supports_drm_transport()` —
-`crates/ax/thekernel-axdisplay/src/lib.rs:30-42`:
+`crates/ax/tk-axdisplay/src/lib.rs:30-42`:
 
 ```rust
 /// Transfers the one display device to DRM only if it implements the pinned
@@ -1977,7 +1977,7 @@ pub(crate) fn render_node(
 
 | # | Requirement | Evidence |
 |---|---|---|
-| 1 | A display device that stays in `MAIN_DISPLAY` **or** a new path that does not go through `take_drm_display` — a bootfb returns `supports_drm_transport() == false` (`crates/ax/thekernel-axdriver-display/src/lib.rs:394-396`) and therefore can never be handed to DRM. | `crates/ax/thekernel-axdisplay/src/lib.rs:32-42` |
+| 1 | A display device that stays in `MAIN_DISPLAY` **or** a new path that does not go through `take_drm_display` — a bootfb returns `supports_drm_transport() == false` (`crates/ax/tk-axdriver-display/src/lib.rs:394-396`) and therefore can never be handed to DRM. | `crates/ax/tk-axdisplay/src/lib.rs:32-42` |
 | 2 | An `Arc<dyn DisplayAdapter>` with `create_dumb` + `present`. | `kernel/src/drm/device.rs:113-124` |
 | 3 | A `GemBacking` whose `shared_pages()` returns the framebuffer pages (needed by both `MAP_DUMB` and `/dev/fb0` mmap). | `kernel/src/drm/gem.rs:5-8`; used at `kernel/src/drm/fbdev.rs:48` and `kernel/src/pseudofs/dev/fb.rs:1179` |
 | 4 | `register_primary_device`, which refuses a second device with `Busy`. | `kernel/src/drm/device.rs:156-163` |
@@ -2134,7 +2134,7 @@ reusable, the assertion is not.** Evidence:
   glyph-bitmap match is therefore a sound oracle.
 * `[V]` The framebuffer console is installed unconditionally whenever the DRM primary
   device exists (`kernel/src/pseudofs/dev/fb.rs:1049-1050`), and the kernel is built with
-  the display feature in every product ELF (`Cargo.toml:166-169`, `crates/ax/thekernel-axfeat/Cargo.toml:22-28`).
+  the display feature in every product ELF (`Cargo.toml:166-169`, `crates/ax/tk-axfeat/Cargo.toml:22-28`).
 * `[V]` **But fbcon is fed only by the TTY layer, never by printk** — see §4.2/§4.3. The
   guest userspace must write a known string to `/dev/console` or `/dev/tty1`
   (`kernel/src/pseudofs/dev/tty/ntty.rs:91-100`, `kernel/src/pseudofs/dev/tty/vt.rs:1074-1085`).
@@ -2244,15 +2244,15 @@ framebuffer", which is the entire stated goal, and it needs ~40 lines of Python.
 
 | # | Failure mode | Specific reason | Detection / mitigation |
 |---|---|---|---|
-| B1 | **Black screen despite a parsed tag.** | The runtime page table replaces the boot map (`crates/ax/thekernel-axmm/src/lib.rs:95`), and the fb address is outside `mmio-ranges` for any profile except `q35-uefi.toml:27`. `[I]` A driver that writes to `phys_to_virt(fb_addr)` without `iomap` will take a **page fault in the kernel** on first pixel. | Mandatory `axmm::iomap` before the first write; assert the returned VA equals `phys_to_virt(addr)` (it always does — `axmm/src/lib.rs:110` — so the real check is that the mapping call succeeded). |
-| B2 | **Silent data corruption / UC downgrade of RAM.** | `axmm::iomap` unconditionally re-`protect`s the range (`crates/ax/thekernel-axmm/src/lib.rs:127`) and tolerates an existing mapping (`:119`). A bogus tag pointing into RAM would make RAM uncached — catastrophic but not immediately visible. | §2.4 RAM-overlap guard, plus the §1.5 validation. |
-| B3 | **The framebuffer works but the kernel still shows nothing.** | `[V]` `println!`/`info!` terminate at COM2 (`crates/ax/thekernel-axplat-x86-pc/src/console.rs:160`), and fbcon is fed only from the TTY path (`kernel/src/pseudofs/dev/tty/ntty.rs:91-100`). `[I]` Implementing only the driver, without change points 4–5 of §4.3, yields a working `/dev/fb0` and a blank screen for all kernel messages. | Implement the klog sink; the acceptance test of §6.4 asserts on rendered text, so this cannot pass silently. |
+| B1 | **Black screen despite a parsed tag.** | The runtime page table replaces the boot map (`crates/ax/tk-axmm/src/lib.rs:95`), and the fb address is outside `mmio-ranges` for any profile except `q35-uefi.toml:27`. `[I]` A driver that writes to `phys_to_virt(fb_addr)` without `iomap` will take a **page fault in the kernel** on first pixel. | Mandatory `axmm::iomap` before the first write; assert the returned VA equals `phys_to_virt(addr)` (it always does — `axmm/src/lib.rs:110` — so the real check is that the mapping call succeeded). |
+| B2 | **Silent data corruption / UC downgrade of RAM.** | `axmm::iomap` unconditionally re-`protect`s the range (`crates/ax/tk-axmm/src/lib.rs:127`) and tolerates an existing mapping (`:119`). A bogus tag pointing into RAM would make RAM uncached — catastrophic but not immediately visible. | §2.4 RAM-overlap guard, plus the §1.5 validation. |
+| B3 | **The framebuffer works but the kernel still shows nothing.** | `[V]` `println!`/`info!` terminate at COM2 (`crates/ax/tk-axplat-x86-pc/src/console.rs:160`), and fbcon is fed only from the TTY path (`kernel/src/pseudofs/dev/tty/ntty.rs:91-100`). `[I]` Implementing only the driver, without change points 4–5 of §4.3, yields a working `/dev/fb0` and a blank screen for all kernel messages. | Implement the klog sink; the acceptance test of §6.4 asserts on rendered text, so this cannot pass silently. |
 | B4 | **The screen is correct for one VT and wrong for another.** | fbcon keeps 63 bounded cell screens (`kernel/src/pseudofs/dev/tty/fbcon.rs:17`, `:101-109`) and repaints only the active VT (`:239-265`). A VT switch on hardware that never triggers `present_while_text_active` leaves stale pixels. | Verify VT switching on hardware; the mode-change path is `kernel/src/pseudofs/dev/tty/vt.rs:379` (`self.with_text_active_locked(active, || super::fbcon::present_while_text_active(active));`). |
 | B5 | **Text appears mirrored/offset.** | `[X]` the tag's pitch is in bytes (`multiboot2-0.24.1/src/framebuffer.rs:73-74`) and *may exceed* `width * bpp/8`. `[V]` the existing `FbconFrame` already multiplies by `self.pitch` (`kernel/src/pseudofs/dev/fb.rs:677-683`), but the fbdev `line_length` comes from the DRM dumb pitch (`kernel/src/pseudofs/dev/fb.rs:1127`), not from the tag. | Take `pitch` from the tag, never recompute it; expose it as `FixScreenInfo::line_length`. |
-| B6 | **A resolution mismatch between GRUB's mode and the kernel's expectation.** | GRUB may have set a mode that the kernel then changes (if it ever gains a mode verb) or that the display renegotiates. `[V]` `DisplayDriverOps` has **no** mode verb (§3.2), so the kernel cannot follow a hotplug mode change on the GOP path; `[V]` only the virtio path has `drm_display_config_changed` (`crates/ax/thekernel-axdriver-display/src/lib.rs:426-428`). | Treat the mode as immutable for the fbcon milestone; document that a display hotplug on the GOP path is unsupported. |
+| B6 | **A resolution mismatch between GRUB's mode and the kernel's expectation.** | GRUB may have set a mode that the kernel then changes (if it ever gains a mode verb) or that the display renegotiates. `[V]` `DisplayDriverOps` has **no** mode verb (§3.2), so the kernel cannot follow a hotplug mode change on the GOP path; `[V]` only the virtio path has `drm_display_config_changed` (`crates/ax/tk-axdriver-display/src/lib.rs:426-428`). | Treat the mode as immutable for the fbcon milestone; document that a display hotplug on the GOP path is unsupported. |
 | B7 | **`/dev/fb0` is absent.** | `[V]` `kernel/src/pseudofs/dev/mod.rs:639` gates the node on `crate::drm::primary_device().is_some()`, and a firmware framebuffer never registers a DRM primary device. | Mandatory §5.1 decoupling; the acceptance test must assert `/dev/fb0` exists. |
 | B8 | **Lowercase text is unreadable.** | `[V]` `glyph_row` folds with `byte.to_ascii_uppercase()` (`kernel/src/pseudofs/dev/fb.rs:758`), so `init` renders as `INIT` and error text loses information. | Font upgrade deliverable (§4.4, change set item 9). |
-| B9 | **Write-combining is assumed but absent.** | `[V]` `MappingFlags::DEVICE` and `UNCACHED` are the *same* encoding (`crates/ax/thekernel-page-table-entry/src/arch/x86_64.rs:95-97`); there is no WC anywhere in the kernel. A design that says "map it write-combining" would be unimplementable as written. | This document specifies UC for the milestone and PAT-based WC as an explicit, separate change (§2.4). |
+| B9 | **Write-combining is assumed but absent.** | `[V]` `MappingFlags::DEVICE` and `UNCACHED` are the *same* encoding (`crates/ax/tk-page-table-entry/src/arch/x86_64.rs:95-97`); there is no WC anywhere in the kernel. A design that says "map it write-combining" would be unimplementable as written. | This document specifies UC for the milestone and PAT-based WC as an explicit, separate change (§2.4). |
 
 ---
 
@@ -2262,17 +2262,17 @@ Dependency order. Sizes are rough line counts of new/changed code including test
 
 | # | File | Add / Modify | One-line description | Size |
 |---:|---|---|---|---:|
-| 1 | `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs` | Modify | Add `MB2_TAG_FRAMEBUFFER = 8`, a `BootFramebuffer` POD struct, a `framebuffer: Option<BootFramebuffer>` field on `BootInfo`, a validating parse arm before the `_ => {}` catch-all at `:462`, and ~8 host tests. | ~180 |
-| 2 | `crates/ax/thekernel-axplat-x86-pc/src/lib.rs` | Modify | Export `framebuffer()` from the boot module beside the existing `boot_modules` accessor at `:48`. | ~10 |
-| 3 | `crates/ax/thekernel-axhal/src/lib.rs` | Modify | Re-export the boot framebuffer descriptor as `axhal::boot::framebuffer()`, mirroring `rootfs_module()` at `:60`. | ~8 |
-| 4 | `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs` | Modify | Refuse a framebuffer surface which overlaps a usable-RAM region. **As built:** the guard sits in the boot parser as `FramebufferRejection::OverlapsUsableMemory` rather than in `axmm`, because the memory map is already there and the check must run after the whole tag block is read. No new `axmm` entry point was needed: `iomap` already tolerates an address its caller has validated. | ~30 |
+| 1 | `crates/ax/tk-axplat-x86-pc/src/boot_info.rs` | Modify | Add `MB2_TAG_FRAMEBUFFER = 8`, a `BootFramebuffer` POD struct, a `framebuffer: Option<BootFramebuffer>` field on `BootInfo`, a validating parse arm before the `_ => {}` catch-all at `:462`, and ~8 host tests. | ~180 |
+| 2 | `crates/ax/tk-axplat-x86-pc/src/lib.rs` | Modify | Export `framebuffer()` from the boot module beside the existing `boot_modules` accessor at `:48`. | ~10 |
+| 3 | `crates/ax/tk-axhal/src/lib.rs` | Modify | Re-export the boot framebuffer descriptor as `axhal::boot::framebuffer()`, mirroring `rootfs_module()` at `:60`. | ~8 |
+| 4 | `crates/ax/tk-axplat-x86-pc/src/boot_info.rs` | Modify | Refuse a framebuffer surface which overlaps a usable-RAM region. **As built:** the guard sits in the boot parser as `FramebufferRejection::OverlapsUsableMemory` rather than in `axmm`, because the memory map is already there and the check must run after the whole tag block is read. No new `axmm` entry point was needed: `iomap` already tolerates an address its caller has validated. | ~30 |
 | 5 | `kernel/src/pseudofs/dev/bootfb.rs` | **Add** | The firmware-framebuffer scanout provider: map the aperture, own the mode/pitch/base, and implement the `ScanoutSurface` operations that `DisplayCore`/`FbconFrame` use (`mode`, `pitch`, `virtual_height`, pixel write, `present`). | ~350 |
 | 6 | `kernel/src/pseudofs/dev/fb.rs` | Modify | Introduce `trait ScanoutSurface` and change `DisplayCore::scanout` and `FbconFrame::scanout` from `Arc<DrmFbdev>` to `Arc<dyn ScanoutSurface>`; keep `DrmFbdev` as one impl. | ~200 |
 | 7 | `kernel/src/pseudofs/dev/mod.rs` | Modify | Change the `/dev/fb0` gate at `:639` from "DRM primary device exists" to "DRM primary device **or** boot framebuffer exists", and construct the matching `ScanoutSurface`. | ~40 |
-| 8 | `crates/ax/thekernel-axruntime/src/klog.rs` + `kernel/src/deferred_work.rs` + `kernel/src/pseudofs/dev/tty/fbcon.rs` | Modify | Mirror the kernel log to the active VT. **As built:** not a second `DiagnosticDrain` sink. The drain's record queue is 64 deep and is not even fed when `Store::supported` is false — which is exactly the serial-less machine — so a drain-side sink would have shown at most the first 64 records and then stalled. (`fix/klog-loss`, merged a few hours after this was written, deleted that queue and made the console a byte cursor over the ring — `kernel-log-retention.md` §3 — so the reason above reads as history rather than as the current shape; what it argued for, a reader of the ring with its own cursor, is what shipped.) The mirror is instead a **cursor reader of the klog ring**, started by `fbcon::install`, which replays everything the ring retains and is independent of serial backpressure in both directions. The cost, stated in the module: the screen shows every retained byte rather than only the records the console threshold admits. | ~180 |
+| 8 | `crates/ax/tk-axruntime/src/klog.rs` + `kernel/src/deferred_work.rs` + `kernel/src/pseudofs/dev/tty/fbcon.rs` | Modify | Mirror the kernel log to the active VT. **As built:** not a second `DiagnosticDrain` sink. The drain's record queue is 64 deep and is not even fed when `Store::supported` is false — which is exactly the serial-less machine — so a drain-side sink would have shown at most the first 64 records and then stalled. (`fix/klog-loss`, merged a few hours after this was written, deleted that queue and made the console a byte cursor over the ring — `kernel-log-retention.md` §3 — so the reason above reads as history rather than as the current shape; what it argued for, a reader of the ring with its own cursor, is what shipped.) The mirror is instead a **cursor reader of the klog ring**, started by `fbcon::install`, which replays everything the ring retains and is independent of serial backpressure in both directions. The cost, stated in the module: the screen shows every retained byte rather than only the records the console threshold admits. | ~180 |
 | 9 | `kernel/src/pseudofs/dev/console_font/` (new module) + `tools/gen-console-font.py` | **Add** | Replace the 36-glyph 5×7 uppercase-only table with a 95-glyph 8×16 table covering 0x20–0x7e. **As built:** generated from Liberation Mono (OFL-1.1) rather than copied from a VGA ROM font, because the obvious sources (Linux `font_8x16.c`, `kbd` consolefonts) are GPL-2.0 and this tree is Apache-2.0. Data lives in a generated `glyphs.rs`; the interface and invariant tests are hand-written beside it (§0.2 result 5). | ~90 + 12 KB data |
 | 10 | `config/x86_64/grub.cfg`, `config/x86_64/grub-drive.cfg` | Modify | Add `set gfxmode=…` / `set gfxpayload=keep` so GRUB initialises video and emits the Multiboot2 type-8 tag. | ~6 each |
-| 11 | `crates/ax/thekernel-axplat-x86-pc/src/console.rs` | Modify | Emit an explicit boot diagnostic when no framebuffer tag was found, so a serial-less machine is not silently dead. | ~20 |
+| 11 | `crates/ax/tk-axplat-x86-pc/src/console.rs` | Modify | Emit an explicit boot diagnostic when no framebuffer tag was found, so a serial-less machine is not silently dead. | ~20 |
 | 12 | `tools/qemu_runner/profiles.py` | Modify | Add the `"firmware-fb"` profile (`-display none`, `-device bochs-display`). | ~4 |
 | 13 | `tools/qemu_runner/process.py`, `tools/qemu_runner/model.py` | Modify | Extend `_validate_ppm` (`process.py:59-116`) with a glyph-pixel oracle and its data model. | ~90 |
 | 14 | `tools/thekernel.py` | Modify | Add the `fbcon` suite that populates `qmp_screenshot`/`qmp_checkpoints` and reuses the marker gate (`thekernel.py:467-477`, `:1270-1275`). | ~70 |

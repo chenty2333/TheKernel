@@ -1,13 +1,14 @@
 [package]
-name = "thekernel-linux-packet"
+publish.workspace = true
+name = "tk-linux-packet"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 authors = ["朝倉水希 <asakuramizu111@gmail.com>", "Mivik <mivikq@gmail.com>", "陈天意 <hi@tychen.cc>"]
 description = "Validated Linux AF_PACKET policy values and state for no_std kernels"
 license = "Apache-2.0"
-repository = "https://github.com/chenty2333/thekernel-linux-abi"
-homepage = "https://github.com/chenty2333/thekernel-linux-abi"
+repository.workspace = true
+homepage = "https://github.com/chenty2333/TheKernel"
 readme = "README.md"
 keywords = ["kernel", "linux", "no-std", "packet", "network"]
 categories = ["no-std", "network-programming", "os"]

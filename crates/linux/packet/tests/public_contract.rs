@@ -1,4 +1,4 @@
-use thekernel_linux_packet::{
+use tk_linux_packet::{
     AF_PACKET, BindPublication, DeliveryDecision, DeliveryDirection, FrameLayout, GetPacketOption,
     InterfaceIndex, LinkLayerAddress, LinkLayerInfo, MSG_PEEK, MSG_TRUNC, PacketBindRequest,
     PacketError, PacketOption, PacketOptionOperation, PacketOptionValue, PacketSendAddress,

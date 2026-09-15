@@ -1,7 +1,7 @@
 """Parse a scripts/hw-facts/capture-n305.sh capture into kernel-build facts.
 
 The kernel currently hardcodes a PCIe ECAM base
-(crates/ax/thekernel-axplat-x86-pc/axconfig.toml: ``pci-ecam-base =
+(crates/ax/tk-axplat-x86-pc/axconfig.toml: ``pci-ecam-base =
 0xb000_0000``, with the comment "should read from ACPI 'MCFG' table").  This
 module reads the capture tarball produced on the target machine and reports the
 *real* ECAM base and the PCI bus ranges the firmware actually describes, plus

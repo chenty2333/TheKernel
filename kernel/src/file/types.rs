@@ -14,7 +14,7 @@ use linux_raw_sys::general::{
     RLIMIT_NOFILE, S_IFDIR, S_IFIFO, S_IFMT, S_IFREG, S_IFSOCK, STATX_BASIC_STATS,
     STATX_BTIME, STATX_DIOALIGN, STATX_MNT_ID, stat, statx, statx_timestamp,
 };
-use thekernel_linux_io_uring::{IssuedRequest, RequestId, TerminalCause};
+use tk_linux_io_uring::{IssuedRequest, RequestId, TerminalCause};
 
 use super::{
     FileHandle, OfdIoStatus, add_file_like, current_fd_table, fd_table::FdTable, get_typed_file,

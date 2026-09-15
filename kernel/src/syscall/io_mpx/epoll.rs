@@ -12,8 +12,8 @@ use linux_raw_sys::general::{
     EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLET, EPOLLONESHOT, epoll_event,
     timespec,
 };
-use thekernel_linux_signal::SignalSet;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
+use tk_linux_signal::SignalSet;
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use super::{io_to_linux_epoll, linux_epoll_events, wait_io_result};
 use crate::{

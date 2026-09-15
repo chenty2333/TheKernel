@@ -26,7 +26,7 @@ use linux_raw_sys::general::{
     FUTEX_WAIT_BITSET,
 };
 use syscalls::Sysno;
-pub(crate) use thekernel_linux_usercopy::RawSigevent;
+pub(crate) use tk_linux_usercopy::RawSigevent;
 
 pub(crate) use self::sync::init_membarrier_ipi;
 pub use self::{

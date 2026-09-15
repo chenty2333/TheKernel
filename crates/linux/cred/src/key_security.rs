@@ -18,7 +18,7 @@ use crate::{FsCredentialSnapshot, Kgid, Kuid};
 /// requires all of them.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::KeyPermission;
+/// use tk_linux_cred::KeyPermission;
 ///
 /// // Raw tuple construction is not part of the public contract.
 /// let _ = KeyPermission(1);
@@ -108,7 +108,7 @@ impl BitOrAssign for KeyPermission {
 /// reserved and rejected here. A zero mask is valid and denies every access.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::KeyPermissionMask;
+/// use tk_linux_cred::KeyPermissionMask;
 ///
 /// // Raw tuple construction is not part of the public contract.
 /// let _ = KeyPermissionMask(0x3f00_0000);

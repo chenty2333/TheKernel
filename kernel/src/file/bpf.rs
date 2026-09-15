@@ -889,8 +889,8 @@ impl BpfMapFd {
     ) -> AxResult<Self> {
         let access = match file_flags {
             0 => BpfMapAccess::ReadWrite,
-            thekernel_linux_bpf::BPF_F_RDONLY => BpfMapAccess::ReadOnly,
-            thekernel_linux_bpf::BPF_F_WRONLY => BpfMapAccess::WriteOnly,
+            tk_linux_bpf::BPF_F_RDONLY => BpfMapAccess::ReadOnly,
+            tk_linux_bpf::BPF_F_WRONLY => BpfMapAccess::WriteOnly,
             _ => return Err(AxError::InvalidInput),
         };
         Ok(Self {

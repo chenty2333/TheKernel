@@ -1,7 +1,7 @@
 use core::mem::{align_of, size_of};
 
 use linux_raw_sys::general::{SI_MESGQ, SI_QUEUE, SI_SIGIO, SI_TIMER, siginfo_t};
-use thekernel_linux_signal::{
+use tk_linux_signal::{
     SignalInfo, SignalPollPayload, SignalRtPayload, SignalSet, SignalTimerPayload, Signo,
 };
 

@@ -5,8 +5,8 @@ use axerrno::{AxError, AxResult};
 use axhal::uspace::{UserContext, UserReturnHookAction};
 use axtask::{TaskInner, current};
 use linux_raw_sys::general::{RLIMIT_SIGPENDING, SI_TIMER};
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_signal::{
+use tk_linux_process_adapter::Pid;
+use tk_linux_signal::{
     DefaultSignalAction, PreparedSignal, SignalAction, SignalDisposition, SignalInfo,
     SignalOSAction, SignalQueueAccount, SignalRecordGeneration, SignalSet, Signo,
     api::{
@@ -15,7 +15,7 @@ use thekernel_linux_signal::{
     },
     arch::UserContext as SignalUserContext,
 };
-use thekernel_linux_usercopy::UserMemoryContext;
+use tk_linux_usercopy::UserMemoryContext;
 
 use super::{
     AsThread, ContinueResult, Cred, ProcessData, Thread, acknowledge_posix_timer_signal, do_exit,
@@ -428,9 +428,9 @@ pub(crate) fn publish_cet_signal_frame(thr: &Thread, restorer: usize) -> AxResul
     }
     let saved_ssp = state.pl3_ssp;
     let shadow_start = saved_ssp
-        .checked_sub(thekernel_linux_arch_x86_64::CET_SIGNAL_FRAME_SIZE)
+        .checked_sub(tk_linux_arch_x86_64::CET_SIGNAL_FRAME_SIZE)
         .ok_or(AxError::BadAddress)?;
-    let token = thekernel_linux_arch_x86_64::cet_signal_restore_token(saved_ssp)
+    let token = tk_linux_arch_x86_64::cet_signal_restore_token(saved_ssp)
         .map_err(|_| AxError::BadAddress)?;
     {
         let aspace = thr.proc_data.aspace();
@@ -1297,7 +1297,7 @@ pub fn notify_ptrace_attach_stop(proc_data: &ProcessData) {
 #[cfg(test)]
 mod tests {
     use linux_raw_sys::general::SI_MESGQ;
-    use thekernel_linux_signal::{
+    use tk_linux_signal::{
         PreparedSignal, SignalInfo, SignalQueueAccount, SignalRtPayload, SignalTimerPayload, Signo,
     };
 

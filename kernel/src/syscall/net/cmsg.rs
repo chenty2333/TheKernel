@@ -749,12 +749,12 @@ impl<'a> CMsgBuilder<'a> {
         // Transport identities are kernel-wide; only the receiving ABI
         // boundary projects them into the caller's PID namespace.
         let pid = super::socket_credential_pid(&self.pid_namespace, pid);
-        let uid = thekernel_linux_cred::Kuid::from_raw(uid)
+        let uid = tk_linux_cred::Kuid::from_raw(uid)
             .map(|uid| self.user_namespace.from_kuid_munged(uid))
-            .unwrap_or(thekernel_linux_cred::USER_NAMESPACE_OVERFLOW_ID);
-        let gid = thekernel_linux_cred::Kgid::from_raw(gid)
+            .unwrap_or(tk_linux_cred::USER_NAMESPACE_OVERFLOW_ID);
+        let gid = tk_linux_cred::Kgid::from_raw(gid)
             .map(|gid| self.user_namespace.from_kgid_munged(gid))
-            .unwrap_or(thekernel_linux_cred::USER_NAMESPACE_OVERFLOW_ID);
+            .unwrap_or(tk_linux_cred::USER_NAMESPACE_OVERFLOW_ID);
         let Some((header, credentials)) = credentials_cmsg(pid, uid, gid) else {
             return false;
         };

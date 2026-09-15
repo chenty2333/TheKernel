@@ -1,6 +1,6 @@
 use alloc::vec;
 
-use thekernel_linux_io_uring::{
+use tk_linux_io_uring::{
     FeatureFlags, RequestDescriptor, RequestOperation, SetupFlags, SetupRequest,
 };
 
@@ -428,7 +428,7 @@ fn check_fixed_buffer_retirement(interleave_publication: bool) {
                 .requests
                 .issue_with_cancellation_mode(
                     prepared,
-                    Some(thekernel_linux_io_uring::CancellationMode::ProviderControlled),
+                    Some(tk_linux_io_uring::CancellationMode::ProviderControlled),
                 )
                 .unwrap()
         } else {
@@ -479,9 +479,9 @@ fn check_fixed_buffer_retirement(interleave_publication: bool) {
                 false,
             )
             .unwrap_or_else(|_| panic!("control allocation failed"));
-            let mut bytes = [0; thekernel_linux_io_uring::SQE_BYTES as usize];
+            let mut bytes = [0; tk_linux_io_uring::SQE_BYTES as usize];
             bytes[0] = 4; // IORING_OP_READ_FIXED
-            let thekernel_linux_io_uring::SubmissionOperation::Read(request) =
+            let tk_linux_io_uring::SubmissionOperation::Read(request) =
                 ParsedSubmission::parse(bytes).unwrap().operation()
             else {
                 unreachable!()
@@ -586,7 +586,7 @@ fn owned_publishing_cancel_waits_for_real_completion_and_reuses_slot() {
                 .requests
                 .issue_with_cancellation_mode(
                     prepared,
-                    Some(thekernel_linux_io_uring::CancellationMode::ProviderControlled),
+                    Some(tk_linux_io_uring::CancellationMode::ProviderControlled),
                 )
                 .unwrap();
             let id = issued.id();
@@ -610,8 +610,8 @@ fn owned_publishing_cancel_waits_for_real_completion_and_reuses_slot() {
             assert!(state.owned_file_io[id.slot() as usize].is_some());
             assert_eq!(
                 state.requests.request(id).unwrap().1,
-                thekernel_linux_io_uring::RequestState::Issued(
-                    thekernel_linux_io_uring::CancellationMode::ProviderControlled
+                tk_linux_io_uring::RequestState::Issued(
+                    tk_linux_io_uring::CancellationMode::ProviderControlled
                 )
             );
         }

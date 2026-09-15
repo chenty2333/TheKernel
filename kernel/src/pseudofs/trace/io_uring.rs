@@ -9,7 +9,7 @@ use core::{
 };
 
 use axsync::spin::SpinNoIrq;
-use thekernel_linux_io_uring::{RequestId, RequestTraceEvent};
+use tk_linux_io_uring::{RequestId, RequestTraceEvent};
 
 const CAPACITY: usize = 1024;
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -281,13 +281,13 @@ fn simple(output: &mut SnapshotText, id: RequestId, event: &str) -> fmt::Result 
 
 #[cfg(test)]
 mod tests {
-    use thekernel_linux_io_uring::RingId;
+    use tk_linux_io_uring::RingId;
 
     use super::*;
 
     #[test]
     fn executor_stages_preserve_the_reserved_request_identity() {
-        use thekernel_linux_io_uring::{RequestDescriptor, RequestOperation, RequestRegistry};
+        use tk_linux_io_uring::{RequestDescriptor, RequestOperation, RequestRegistry};
 
         let mut registry = RequestRegistry::new(RingId::new(7).unwrap(), 1, 1).unwrap();
         let reservation = registry
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn read_stages_preserve_request_identity_and_fit_target_capture() {
-        use thekernel_linux_io_uring::{RequestDescriptor, RequestOperation, RequestRegistry};
+        use tk_linux_io_uring::{RequestDescriptor, RequestOperation, RequestRegistry};
 
         let mut registry = RequestRegistry::new(RingId::new(7).unwrap(), 1, 1).unwrap();
         let request = registry.reserve(RequestDescriptor::new(9, RequestOperation::Read)).unwrap();

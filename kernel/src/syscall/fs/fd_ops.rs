@@ -24,8 +24,8 @@ use linux_vfs::{
     LimitKind, Openat2Policy, PathContext as LinuxPathContext, PathContextError, PathLimitError,
     PathLimits, ResolveFlags, TopologyEvent, WalkBudget, WalkError,
 };
-use thekernel_linux_cred::{FileOpenAccess, FileOpenOperation};
-use thekernel_linux_signal::Signo;
+use tk_linux_cred::{FileOpenAccess, FileOpenOperation};
+use tk_linux_signal::Signo;
 
 /// Linux's file-level write hint is inode-scoped, whereas F_GET/SET_RW_HINT
 /// lives on one open file description.  Keep the former in one VFS-identity

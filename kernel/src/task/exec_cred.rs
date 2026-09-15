@@ -1,17 +1,17 @@
 //! Kernel transaction and security-hook adapter for Linux exec credentials.
 //!
-//! Linux-visible derivation lives in `thekernel-linux-cred`. This module keeps
+//! Linux-visible derivation lives in `tk-linux-cred`. This module keeps
 //! the writer guard, hook call, and unpublished publication token together so
 //! a denied or dropped proposal has no observable effect.
 
 use alloc::sync::Arc;
 
 use axerrno::AxResult;
-pub(crate) use thekernel_linux_cred::{
+pub(crate) use tk_linux_cred::{
     ExecAuxIdentity, ExecCredentialEffects, ExecCredentialInput, ExecDumpability, ExecFileOwner,
     ExecImageReadability, ExecMountPrivilege, ExecPtraceRevalidation, ExecTraceState,
 };
-use thekernel_linux_cred::{
+use tk_linux_cred::{
     ExecCredentialProposal, commoncap_exec_transition, derive_exec_credential,
 };
 
@@ -181,7 +181,7 @@ impl ExecFileSecurityObject {
 
 /// Maps the policy-neutral parser error at the kernel adapter boundary.
 pub(crate) fn parse_file_capabilities(value: &[u8]) -> AxResult<FileCapabilities> {
-    thekernel_linux_cred::parse_file_capabilities(value).map_err(cred_error)
+    tk_linux_cred::parse_file_capabilities(value).map_err(cred_error)
 }
 
 /// Maps a Linux exec policy decision into the process layer's implemented
@@ -438,7 +438,7 @@ mod tests {
     use std::thread;
 
     use axerrno::AxError;
-    use thekernel_linux_cred::{CAPABILITY_WORDS, GroupInfo};
+    use tk_linux_cred::{CAPABILITY_WORDS, GroupInfo};
 
     use super::*;
     use crate::task::{
@@ -470,7 +470,7 @@ mod tests {
                 [0; CAPABILITY_WORDS],
                 [0; CAPABILITY_WORDS],
                 [0; CAPABILITY_WORDS],
-                thekernel_linux_cred::CAPABILITY_VALID_MASK,
+                tk_linux_cred::CAPABILITY_VALID_MASK,
                 [0; CAPABILITY_WORDS],
                 0,
             );
@@ -577,7 +577,7 @@ mod tests {
         let old = slot.current();
         reset_commoncap_post_commit_probe();
         let proposal =
-            thekernel_linux_cred::derive_exec_credential(old.core_arc(), setuid_root_input())
+            tk_linux_cred::derive_exec_credential(old.core_arc(), setuid_root_input())
                 .unwrap();
         assert!(
             proposal
@@ -594,7 +594,7 @@ mod tests {
             None,
         );
         let proposal =
-            thekernel_linux_cred::derive_exec_credential(old.core_arc(), already_suppressed)
+            tk_linux_cred::derive_exec_credential(old.core_arc(), already_suppressed)
                 .unwrap();
         assert!(
             !proposal

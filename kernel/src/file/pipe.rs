@@ -20,7 +20,7 @@ use ringbuf::{
     HeapRb,
     traits::{Consumer, Observer, Producer},
 };
-use thekernel_linux_signal::{SignalInfo, Signo};
+use tk_linux_signal::{SignalInfo, Signo};
 
 use super::{
     AsyncIoState, FileLike, IoctlContext, Kstat, PseudoInode, fs::location_to_kstat, send_sigio,

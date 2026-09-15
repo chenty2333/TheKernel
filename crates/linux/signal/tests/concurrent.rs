@@ -9,13 +9,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use thekernel_linux_signal::arch::{UserContext, XsaveState64};
-use thekernel_linux_signal::{
+use tk_linux_signal::arch::{UserContext, XsaveState64};
+use tk_linux_signal::{
     PreparedSignal, SignalAction, SignalActionFlags, SignalDisposition, SignalInfo, SignalOSAction,
     SignalQueueAccount, SignalQueueError, SignalSet, Signo,
     api::{SignalFpState, SignalFrame, SignalFrameLayoutError},
 };
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmResult};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmResult};
 
 mod common;
 use common::*;
@@ -530,7 +530,7 @@ fn action_update_does_not_fail_under_registration_churn() {
             let mut tid = 100;
             while running.load(Ordering::Acquire) {
                 let signal =
-                    thekernel_linux_signal::api::ThreadSignalManager::try_new(process.clone())
+                    tk_linux_signal::api::ThreadSignalManager::try_new(process.clone())
                         .unwrap();
                 if let Ok(registration) = signal.try_register(tid) {
                     drop(registration);

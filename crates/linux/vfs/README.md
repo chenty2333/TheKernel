@@ -1,6 +1,6 @@
-# thekernel-linux-vfs
+# tk-linux-vfs
 
-`thekernel-linux-vfs` is the Linux-visible policy layer between a generic VFS
+`tk-linux-vfs` is the Linux-visible policy layer between a generic VFS
 walker and thin syscall entry code. It provides:
 
 - an immutable, explicit `PathContext` with credential, namespace, root, cwd,
@@ -17,7 +17,7 @@ walker and thin syscall entry code. It provides:
 - an RAII mutation transaction that revalidates, runs final policy admission,
   publishes at most once, and rolls every prepared failure back.
 
-The crate is `no_std`, stable Rust 1.85 compatible, and owns no filesystem
+The crate is `no_std` and owns no filesystem
 tree. It does not call `current()`, read a global cwd/root, translate errno, or
 perform a second textual-prefix permission walk. A consumer connects the
 types to the topology events and stable handles produced by its generic VFS.
@@ -55,3 +55,10 @@ The kernel adapter normally maps:
 
 Unknown or incompatible `openat2()` resolve flags are rejected during context
 construction; they are never accepted and ignored.
+
+## Toolchain
+
+The crate uses the root-pinned `nightly-2026-08-23` toolchain
+(`rustc 1.100.0-nightly`, commit `c54751567`, dated 2026-08-22).
+`rust-version` inherits the workspace's `1.100`; this is not a stable-Rust
+compatibility guarantee.

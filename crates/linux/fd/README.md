@@ -1,6 +1,6 @@
-# thekernel-linux-fd
+# tk-linux-fd
 
-`thekernel-linux-fd` is a `no_std` Linux-visible policy core for descriptor,
+`tk-linux-fd` is a `no_std` Linux-visible policy core for descriptor,
 open-file-description, retained readiness, and epoll lifecycles. It deliberately
 does not obtain a global current task, copy userspace memory, choose a kernel
 lock, or expose raw generic-driver event bits as Linux ABI values.
@@ -29,7 +29,7 @@ Version 0.1.0 provides:
 
 ## Layer boundary
 
-Generic wake-source slot ownership belongs in `thekernel-axpoll`. This crate
+Generic wake-source slot ownership belongs in `tk-axpoll`. This crate
 owns Linux FD/OFD identity and readiness rules over those source registrations.
 The kernel adapter supplies stable handles, synchronization, source planning,
 check-arm-check orchestration, userspace copyout, timeout/signal handling, and

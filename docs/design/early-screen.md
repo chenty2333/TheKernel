@@ -46,7 +46,7 @@ replaces it exactly once. Both facts are load-bearing, so they are stated rather
 implied:
 
 ```
-.Ltmp_pml4                        (crates/ax/thekernel-axplat-x86-pc/src/multiboot.S:153)
+.Ltmp_pml4                        (crates/ax/tk-axplat-x86-pc/src/multiboot.S:153)
   0x0000_0000_0000_0000 .. 0x0000_007f_ffff_ffff   1 GiB pages, PRESENT|WRITABLE
   0xffff_8000_0000_0000 .. 0xffff_807f_ffff_ffff   1 GiB pages, PRESENT|WRITABLE
 ```
@@ -179,7 +179,7 @@ no virtio-gpu), with the PPM decoded back to text through the console font:
 
   ```
   *** PANIC ***
-  panicked at crates/ax/thekernel-axruntime/src/lib.rs:536:5:
+  panicked at crates/ax/tk-axruntime/src/lib.rs:536:5:
   early-screen panic probe: no UART at 0x2f8 on this machine
   <backtrace disabled>
   <6>[0.042357 cpu=None tid=None INFO target=axruntime] Logging is enabled.

@@ -38,7 +38,7 @@ citation beside the value, so a reader with the source open can check any of it.
 
 ## 2. What is implemented
 
-`crates/ax/thekernel-axdriver-net/src/igc/` — the driver, with no architecture
+`crates/ax/tk-axdriver-net/src/igc/` — the driver, with no architecture
 underneath it, which is what makes it testable on the host:
 
 | module | responsibility |
@@ -52,7 +52,7 @@ underneath it, which is what makes it testable on the host:
 | `nic.rs` | the rings, the buffer handover, and `NetDriverOps` |
 | `fake.rs` | `#[cfg(test)]` synthetic device: a register file, a device model, a DMA HAL |
 
-`crates/ax/thekernel-axdriver/src/igc.rs` — the platform half: BAR mapping, the
+`crates/ax/tk-axdriver/src/igc.rs` — the platform half: BAR mapping, the
 clock, the DMA allocator, configuration-space decoding, and the PCI probe that
 runs the three phases.
 

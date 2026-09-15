@@ -20,7 +20,7 @@ use axhal::time::monotonic_time_nanos;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use axsync::spin::SpinNoIrq;
 use axtask::current;
-use thekernel_linux_perf::{
+use tk_linux_perf::{
     PERF_EVENT_IOC_DISABLE, PERF_EVENT_IOC_ENABLE, PERF_EVENT_IOC_ID,
     PERF_EVENT_IOC_MODIFY_ATTRIBUTES, PERF_EVENT_IOC_QUERY_BPF, PERF_EVENT_IOC_REFRESH,
     PERF_EVENT_IOC_RESET, PERF_EVENT_IOC_SET_BPF, PERF_EVENT_IOC_SET_OUTPUT, PERF_IOC_FLAG_GROUP,
@@ -842,7 +842,7 @@ struct InheritedMemberSpec {
     event: PerfEvent,
     disabled: bool,
     read: ReadPlan,
-    lifecycle: thekernel_linux_perf::PerfLifecycle,
+    lifecycle: tk_linux_perf::PerfLifecycle,
     placement: PerfPlacementPolicy,
     count_user: bool,
     count_kernel: bool,
@@ -1282,7 +1282,7 @@ impl PerfGroup {
         match self.context {
             PerfContext::Cpu { .. } => true,
             PerfContext::Cgroup { cgroup_id, .. } => {
-                thekernel_linux_process_adapter::try_pid_from_task_id(task_id)
+                tk_linux_process_adapter::try_pid_from_task_id(task_id)
                     .ok()
                     .is_some_and(|pid| {
                         crate::pseudofs::cgroup::perf_cgroup_contains(pid, cgroup_id)
@@ -2706,7 +2706,7 @@ impl PerfGroup {
             .filter_map(|member| member.file.upgrade())
         {
             file.emit_fork_exit(
-                thekernel_linux_perf::PERF_RECORD_FORK,
+                tk_linux_perf::PERF_RECORD_FORK,
                 child_pid,
                 parent_pid,
                 child_tid,
@@ -2721,7 +2721,7 @@ impl PerfGroup {
             .iter()
             .filter_map(|member| member.file.upgrade())
         {
-            file.emit_fork_exit(thekernel_linux_perf::PERF_RECORD_EXIT, pid, ppid, tid, ptid);
+            file.emit_fork_exit(tk_linux_perf::PERF_RECORD_EXIT, pid, ppid, tid, ptid);
         }
     }
     pub(crate) fn emit_switch_record(
@@ -3118,7 +3118,7 @@ pub(crate) struct PerfPlacementPolicy {
 pub struct PerfEventFile {
     id: u64,
     event: PerfEvent,
-    lifecycle: thekernel_linux_perf::PerfLifecycle,
+    lifecycle: tk_linux_perf::PerfLifecycle,
     group: Weak<PerfGroup>,
     /// Strongly retains a redirected output owner. This is not a descriptor
     /// alias: it keeps its data ring alive after the target FD closes, while
@@ -3265,7 +3265,7 @@ impl PerfEventFile {
             disabled,
             group,
             read,
-            thekernel_linux_perf::PerfLifecycle::default(),
+            tk_linux_perf::PerfLifecycle::default(),
         )
     }
 
@@ -3275,7 +3275,7 @@ impl PerfEventFile {
         disabled: bool,
         group: &Arc<PerfGroup>,
         read: ReadPlan,
-        lifecycle: thekernel_linux_perf::PerfLifecycle,
+        lifecycle: tk_linux_perf::PerfLifecycle,
     ) -> AxResult<Arc<Self>> {
         #[cfg(feature = "perf-sampling")]
         {
@@ -3314,7 +3314,7 @@ impl PerfEventFile {
         disabled: bool,
         group: &Arc<PerfGroup>,
         read: ReadPlan,
-        lifecycle: thekernel_linux_perf::PerfLifecycle,
+        lifecycle: tk_linux_perf::PerfLifecycle,
         placement: PerfPlacementPolicy,
     ) -> AxResult<Arc<Self>> {
         Self::new_with_lifecycle_placement_domains(
@@ -3328,7 +3328,7 @@ impl PerfEventFile {
         disabled: bool,
         group: &Arc<PerfGroup>,
         read: ReadPlan,
-        lifecycle: thekernel_linux_perf::PerfLifecycle,
+        lifecycle: tk_linux_perf::PerfLifecycle,
         placement: PerfPlacementPolicy,
         count_user: bool,
         count_kernel: bool,
@@ -3370,7 +3370,7 @@ impl PerfEventFile {
         event: PerfEvent,
         group: &Arc<PerfGroup>,
         read: ReadPlan,
-        lifecycle: thekernel_linux_perf::PerfLifecycle,
+        lifecycle: tk_linux_perf::PerfLifecycle,
         backend: Arc<crate::file::PerfSampleBackend>,
     ) -> AxResult<Arc<Self>> {
         Self::new_sampling_placement(
@@ -3390,7 +3390,7 @@ impl PerfEventFile {
         event: PerfEvent,
         group: &Arc<PerfGroup>,
         read: ReadPlan,
-        lifecycle: thekernel_linux_perf::PerfLifecycle,
+        lifecycle: tk_linux_perf::PerfLifecycle,
         placement: PerfPlacementPolicy,
         backend: Arc<crate::file::PerfSampleBackend>,
     ) -> AxResult<Arc<Self>> {
@@ -3415,7 +3415,7 @@ impl PerfEventFile {
         disabled: bool,
         group: &Arc<PerfGroup>,
         read: ReadPlan,
-        lifecycle: thekernel_linux_perf::PerfLifecycle,
+        lifecycle: tk_linux_perf::PerfLifecycle,
         placement: PerfPlacementPolicy,
         count_user: bool,
         count_kernel: bool,
@@ -3622,7 +3622,7 @@ impl PerfEventFile {
         let mut record = [0u8; 256];
         if let Some(size) = crate::perf_records::comm(
             &mut record,
-            thekernel_linux_perf::PERF_RECORD_MISC_COMM_EXEC,
+            tk_linux_perf::PERF_RECORD_MISC_COMM_EXEC,
             pid,
             tid,
             comm,
@@ -3656,7 +3656,7 @@ impl PerfEventFile {
         let (pid, tid) = own;
         let mut record = [0u8; 64];
         let misc = if switch_out {
-            thekernel_linux_perf::PERF_RECORD_MISC_SWITCH_OUT
+            tk_linux_perf::PERF_RECORD_MISC_SWITCH_OUT
         } else {
             0
         };
@@ -4169,7 +4169,7 @@ impl PerfEventFile {
             PerfEvent::Tracepoint(id) => {
                 let tracepoint = crate::perf_sources::tracepoint(id)?;
                 (
-                    thekernel_linux_bpf::BPF_FD_TYPE_TRACEPOINT,
+                    tk_linux_bpf::BPF_FD_TYPE_TRACEPOINT,
                     Some(PerfBpfTaskFdQueryName::Static(tracepoint.name.as_bytes())),
                     0,
                     0,
@@ -4189,9 +4189,9 @@ impl PerfEventFile {
                 let has_name = name.is_some();
                 (
                     if retprobe {
-                        thekernel_linux_bpf::BPF_FD_TYPE_KRETPROBE
+                        tk_linux_bpf::BPF_FD_TYPE_KRETPROBE
                     } else {
-                        thekernel_linux_bpf::BPF_FD_TYPE_KPROBE
+                        tk_linux_bpf::BPF_FD_TYPE_KPROBE
                     },
                     name,
                     if has_name { query_offset } else { 0 },
@@ -4205,9 +4205,9 @@ impl PerfEventFile {
                 ..
             } => (
                 if retprobe {
-                    thekernel_linux_bpf::BPF_FD_TYPE_URETPROBE
+                    tk_linux_bpf::BPF_FD_TYPE_URETPROBE
                 } else {
-                    thekernel_linux_bpf::BPF_FD_TYPE_UPROBE
+                    tk_linux_bpf::BPF_FD_TYPE_UPROBE
                 },
                 self.probe_query_name
                     .lock()
@@ -5054,7 +5054,7 @@ mod tests {
     use alloc::{sync::Arc, vec::Vec};
     use core::sync::atomic::Ordering;
 
-    use thekernel_linux_perf::ReadPlan;
+    use tk_linux_perf::ReadPlan;
 
     use super::{
         ExtendedSolverCapacity, ExtendedSolverConstraints, HardwareEvent, HybridEventAdmission,
@@ -5268,16 +5268,16 @@ mod tests {
             event: SamplingEvent::Source,
             period: 1,
             frequency: None,
-            sample_type: thekernel_linux_perf::PERF_SAMPLE_TIME,
+            sample_type: tk_linux_perf::PERF_SAMPLE_TIME,
             count_user: true,
             count_kernel: true,
             disabled: true,
             read_format: 0,
             aux: None,
             identity: PerfOpenIdentity {
-                attr: thekernel_linux_perf::PerfEventAttr::default(),
-                target: thekernel_linux_perf::PerfOpenTarget {
-                    target: thekernel_linux_perf::PerfTarget::Cpu { cpu: 0 },
+                attr: tk_linux_perf::PerfEventAttr::default(),
+                target: tk_linux_perf::PerfOpenTarget {
+                    target: tk_linux_perf::PerfTarget::Cpu { cpu: 0 },
                     group_fd: -1,
                     output_fd: -1,
                     open_flags: 0,
@@ -5291,7 +5291,7 @@ mod tests {
             PerfEvent::Tracepoint(1),
             &group,
             NO_READ,
-            thekernel_linux_perf::PerfLifecycle::default(),
+            tk_linux_perf::PerfLifecycle::default(),
             backend.clone(),
         )
         .unwrap();
@@ -5312,7 +5312,7 @@ mod tests {
             PerfEvent::Software(SoftwareEvent::CpuClock),
             &clock_group,
             NO_READ,
-            thekernel_linux_perf::PerfLifecycle::default(),
+            tk_linux_perf::PerfLifecycle::default(),
             backend.clone(),
         )
         .unwrap();
@@ -5699,7 +5699,7 @@ mod tests {
             false,
             &group,
             NO_READ,
-            thekernel_linux_perf::PerfLifecycle {
+            tk_linux_perf::PerfLifecycle {
                 remove_on_exec: true,
                 ..Default::default()
             },
@@ -5719,7 +5719,7 @@ mod tests {
             false,
             &parent,
             NO_READ,
-            thekernel_linux_perf::PerfLifecycle {
+            tk_linux_perf::PerfLifecycle {
                 inherit: true,
                 ..Default::default()
             },

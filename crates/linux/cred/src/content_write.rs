@@ -12,7 +12,7 @@
 /// any filesystem-internal file-type bits.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::ContentWriteMode;
+/// use tk_linux_cred::ContentWriteMode;
 ///
 /// // Raw tuple construction is not part of the public contract.
 /// let _ = ContentWriteMode(0o6755);

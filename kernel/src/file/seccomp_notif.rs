@@ -19,7 +19,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable};
 use bytemuck::{Pod, Zeroable};
 use spin::Mutex;
-use thekernel_linux_seccomp::{
+use tk_linux_seccomp::{
     SECCOMP_ADDFD_FLAG_SEND, SECCOMP_ADDFD_FLAG_SETFD, SECCOMP_IOCTL_NOTIF_ADDFD,
     SECCOMP_IOCTL_NOTIF_ID_VALID, SECCOMP_IOCTL_NOTIF_RECV, SECCOMP_IOCTL_NOTIF_SEND,
     SECCOMP_IOCTL_NOTIF_SET_FLAGS, SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP,
@@ -85,7 +85,7 @@ struct Request {
     /// receiver's PID namespace, rather than the listener creator's, renders
     /// this identity during RECV; retaining the pair also prevents a numeric
     /// PID reuse from changing a queued notification's subject.
-    target_global_pid: thekernel_linux_process_adapter::Pid,
+    target_global_pid: tk_linux_process_adapter::Pid,
     target_pid_ns: Arc<PidNamespace>,
     target_task_id: u64,
     target_files: Arc<FdTable>,
@@ -167,7 +167,7 @@ impl SeccompListener {
     /// Queue one filter hit and wait for the broker's terminal response.
     pub(crate) fn notify(
         &self,
-        target_global_pid: thekernel_linux_process_adapter::Pid,
+        target_global_pid: tk_linux_process_adapter::Pid,
         target_pid_ns: Arc<PidNamespace>,
         target_task_id: u64,
         data: SeccompData,

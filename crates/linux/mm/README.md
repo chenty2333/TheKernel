@@ -1,6 +1,6 @@
-# thekernel-linux-mm
+# tk-linux-mm
 
-`thekernel-linux-mm` is a `no_std`, `forbid(unsafe_code)` Linux-visible memory
+`tk-linux-mm` is a `no_std`, `forbid(unsafe_code)` Linux-visible memory
 management policy core. It provides checked values and bounded lifecycle
 sidecars that a kernel adapter can consume without importing a page table,
 frame allocator, VFS object, task, implicit current address space, usercopy
@@ -55,7 +55,7 @@ owns raw ABI decoding and all userspace copyin/copyout.
 `FaultPort` is only a dependency-inversion seam. The crate does not contain a
 queue, waiter table, observer list, wakeup implementation, readiness source, or
 userfaultfd file. Its userfaultfd types are reusable Linux policy for a future
-adapter. TheKernel currently composes them with `thekernel-axfault` and its own
+adapter. TheKernel currently composes them with `tk-axfault` and its own
 MM/file/syscall adapters to expose a bounded anonymous-private 4-KiB MISSING
 profile. That consumer integration is not part of this crate, does not make it
 available to every embedding kernel, and is not a claim of complete

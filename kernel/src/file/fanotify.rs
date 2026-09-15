@@ -22,7 +22,7 @@ use axpoll::{IoEvents, PollSet, Pollable};
 use axsync::Mutex as BlockingMutex;
 use axtask::current_may_uninit;
 use spin::Mutex;
-pub use thekernel_linux_fsnotify::{
+pub use tk_linux_fsnotify::{
     ALL_FANOTIFY_EVENT_BITS, FAN_ACCESS, FAN_ACCESS_PERM, FAN_CLASS_PRE_CONTENT, FAN_CLOEXEC,
     FAN_CLOSE, FAN_ENABLE_AUDIT, FAN_EPIDFD, FAN_EVENT_INFO_TYPE_PIDFD, FAN_EVENT_ON_CHILD,
     FAN_MARK_DONT_FOLLOW, FAN_MARK_EVICTABLE, FAN_MARK_FILESYSTEM, FAN_MARK_FLUSH, FAN_MARK_IGNORE,
@@ -31,7 +31,7 @@ pub use thekernel_linux_fsnotify::{
     FAN_OPEN_PERM, FAN_Q_OVERFLOW, FAN_REPORT_PIDFD, FAN_REPORT_TID, FANOTIFY_FID_BITS,
     FANOTIFY_INIT_FLAGS, FANOTIFY_METADATA_VERSION, FANOTIFY_PERMISSION_CLASSES,
 };
-use thekernel_linux_fsnotify::{
+use tk_linux_fsnotify::{
     FanotifyEventInfoPidfd, FanotifyEventMetadata, FanotifyResponse, FanotifyResponsePlan,
     FanotifyResponseReject,
 };
@@ -311,10 +311,10 @@ pub(crate) fn drain_deferred_cleanup_work() {
 }
 
 pub fn validate_init_flags(flags: u32, event_f_flags: u32) -> AxResult<()> {
-    match thekernel_linux_fsnotify::fanotify_init_admission(flags, event_f_flags) {
+    match tk_linux_fsnotify::fanotify_init_admission(flags, event_f_flags) {
         Ok(()) => Ok(()),
-        Err(thekernel_linux_fsnotify::FanotifyInitReject::Invalid) => Err(AxError::InvalidInput),
-        Err(thekernel_linux_fsnotify::FanotifyInitReject::Unsupported) => {
+        Err(tk_linux_fsnotify::FanotifyInitReject::Invalid) => Err(AxError::InvalidInput),
+        Err(tk_linux_fsnotify::FanotifyInitReject::Unsupported) => {
             Err(AxError::OperationNotSupported)
         }
     }
@@ -375,17 +375,17 @@ impl FanotifyFile {
         let mut state = self.state.lock();
         let target_is_dir = loc.map(Location::is_dir);
         let plan =
-            thekernel_linux_fsnotify::plan_fanotify_mark(flags, mask, self.flags, target_is_dir)
+            tk_linux_fsnotify::plan_fanotify_mark(flags, mask, self.flags, target_is_dir)
                 .map_err(|error| match error {
-                    thekernel_linux_fsnotify::FanotifyMarkReject::Invalid => AxError::InvalidInput,
-                    thekernel_linux_fsnotify::FanotifyMarkReject::NotDirectory => {
+                    tk_linux_fsnotify::FanotifyMarkReject::Invalid => AxError::InvalidInput,
+                    tk_linux_fsnotify::FanotifyMarkReject::NotDirectory => {
                         AxError::NotADirectory
                     }
-                    thekernel_linux_fsnotify::FanotifyMarkReject::IsDirectory => {
+                    tk_linux_fsnotify::FanotifyMarkReject::IsDirectory => {
                         AxError::IsADirectory
                     }
                 })?;
-        if plan == thekernel_linux_fsnotify::FanotifyMarkPlan::Flush {
+        if plan == tk_linux_fsnotify::FanotifyMarkPlan::Flush {
             flush_marks(&mut state, flags);
             return Ok(());
         }
@@ -395,16 +395,16 @@ impl FanotifyFile {
         let scope = mark_scope(flags, loc)?;
 
         match plan {
-            thekernel_linux_fsnotify::FanotifyMarkPlan::Ignored => {
+            tk_linux_fsnotify::FanotifyMarkPlan::Ignored => {
                 update_ignored_mark(&mut state, key, scope, flags, mask);
             }
-            thekernel_linux_fsnotify::FanotifyMarkPlan::Add => {
+            tk_linux_fsnotify::FanotifyMarkPlan::Add => {
                 add_mark(&mut state, key, scope, flags, mask, loc)?;
             }
-            thekernel_linux_fsnotify::FanotifyMarkPlan::Remove => {
+            tk_linux_fsnotify::FanotifyMarkPlan::Remove => {
                 remove_mark(&mut state, key, scope, mask)?;
             }
-            thekernel_linux_fsnotify::FanotifyMarkPlan::Flush => unreachable!("handled above"),
+            tk_linux_fsnotify::FanotifyMarkPlan::Flush => unreachable!("handled above"),
         }
         Ok(())
     }
@@ -443,13 +443,13 @@ impl FanotifyFile {
             return false;
         }
         if matches!(
-            thekernel_linux_fsnotify::plan_queue_admission(
+            tk_linux_fsnotify::plan_queue_admission(
                 state.queue.len(),
                 MAX_QUEUED_EVENTS,
                 state.overflowed,
                 event.mask == FAN_Q_OVERFLOW,
             ),
-            thekernel_linux_fsnotify::QueueAdmission::Overflow
+            tk_linux_fsnotify::QueueAdmission::Overflow
         ) || state.queue.try_reserve(2).is_err()
         {
             return Self::enqueue_overflow_locked(state);
@@ -551,7 +551,7 @@ impl FanotifyFile {
         fd: c_int,
         response: u32,
     ) -> AxResult<()> {
-        let response = thekernel_linux_fsnotify::fanotify_response_admission(
+        let response = tk_linux_fsnotify::fanotify_response_admission(
             response,
             self.flags & FAN_ENABLE_AUDIT != 0,
             self.flags & FAN_CLASS_PRE_CONTENT != 0,
@@ -1512,7 +1512,7 @@ mod tests {
             let file = FanotifyFile::new(FAN_NONBLOCK, 0).unwrap();
             let description = wrapped.then(|| FileDescription::new(file.clone()).unwrap());
             for mask in [FAN_ACCESS, super::FAN_MODIFY] {
-                file.mark(thekernel_linux_fsnotify::FAN_MARK_ADD, mask, Some(&target))
+                file.mark(tk_linux_fsnotify::FAN_MARK_ADD, mask, Some(&target))
                     .unwrap();
                 assert_eq!(count(), before + 1);
             }
@@ -1638,7 +1638,7 @@ mod tests {
 
         let file = FanotifyFile::new(FAN_NONBLOCK | FAN_CLASS_PRE_CONTENT, 0).unwrap();
         file.mark(
-            thekernel_linux_fsnotify::FAN_MARK_ADD,
+            tk_linux_fsnotify::FAN_MARK_ADD,
             FAN_OPEN_PERM,
             Some(&target),
         )
@@ -1779,9 +1779,9 @@ mod tests {
 
     #[test]
     fn root_enacts_abi_admission_without_redefining_it() {
-        assert_eq!(FAN_ACCESS, thekernel_linux_fsnotify::FAN_ACCESS);
+        assert_eq!(FAN_ACCESS, tk_linux_fsnotify::FAN_ACCESS);
         assert_eq!(
-            validate_init_flags(thekernel_linux_fsnotify::FAN_UNLIMITED_QUEUE, 0),
+            validate_init_flags(tk_linux_fsnotify::FAN_UNLIMITED_QUEUE, 0),
             Err(AxError::OperationNotSupported)
         );
 
@@ -1791,7 +1791,7 @@ mod tests {
             file.handle_permission_response_in_table(
                 &table,
                 0,
-                thekernel_linux_fsnotify::FAN_DENY | thekernel_linux_fsnotify::FAN_AUDIT,
+                tk_linux_fsnotify::FAN_DENY | tk_linux_fsnotify::FAN_AUDIT,
             ),
             Err(AxError::InvalidInput)
         );
@@ -1801,7 +1801,7 @@ mod tests {
     fn pre_content_deny_errno_is_preserved_for_the_permission_waiter() {
         assert_eq!(
             FANOTIFY_PERMISSION_CLASSES,
-            thekernel_linux_fsnotify::FANOTIFY_PERMISSION_CLASSES
+            tk_linux_fsnotify::FANOTIFY_PERMISSION_CLASSES
         );
         let file = FanotifyFile::new(FAN_NONBLOCK | FAN_CLASS_PRE_CONTENT, 0).unwrap();
         let table = FdTable::new().unwrap();
@@ -1823,7 +1823,7 @@ mod tests {
         file.handle_permission_response_in_table(
             &table,
             event_fd,
-            thekernel_linux_fsnotify::fan_deny_errno(5),
+            tk_linux_fsnotify::fan_deny_errno(5),
         )
         .unwrap();
         assert_eq!(
@@ -1836,7 +1836,7 @@ mod tests {
             ordinary.handle_permission_response_in_table(
                 &table,
                 9,
-                thekernel_linux_fsnotify::fan_deny_errno(5),
+                tk_linux_fsnotify::fan_deny_errno(5),
             ),
             Err(AxError::InvalidInput)
         );

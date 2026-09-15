@@ -12,7 +12,7 @@ use linux_raw_sys::general::{
     ONLCR, OPOST, VEOF, VEOL, VERASE, VINTR, VKILL, VMIN, VQUIT, VSTART, VSTOP, VSUSP, VTIME,
     speed_t, tcflag_t,
 };
-use thekernel_linux_signal::Signo;
+use tk_linux_signal::Signo;
 
 // These byte-stream transports do not report hardware BREAK events. BRKINT
 // is retained for libc raw/cbreak profiles; a NUL byte is not a BREAK event.

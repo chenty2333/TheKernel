@@ -1,6 +1,6 @@
 use core::mem::{align_of, offset_of, size_of};
 
-use thekernel_linux_rseq::*;
+use tk_linux_rseq::*;
 
 const USER_LIMIT: UserAddressLimit = UserAddressLimit::new(0x10_0000);
 

@@ -451,11 +451,11 @@ def lint_kernel(artifacts: Artifacts) -> None:
             "--package",
             "thekernel",
             "--package",
-            "thekernel-kernel",
+            "tk-kernel",
             "--package",
-            "thekernel-linux-process-adapter",
+            "tk-linux-process-adapter",
             "--package",
-            "thekernel-readiness-adapter",
+            "tk-readiness-adapter",
             "--target",
             TARGET,
             "--release",
@@ -844,7 +844,7 @@ FBCON_PROFILE = "firmware-fb"
 # guest_prints` proves this literal against the guest source on the host, before
 # a boot can burn a run discovering the same thing.
 FBCON_MARKER = "# THEKERNEL_TEST_BEGIN 1 mounts timeout_seconds=60"
-# `report_framebuffer` in crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs
+# `report_framebuffer` in crates/ax/tk-axplat-x86-pc/src/boot_info.rs
 # prints the mode the kernel accepted from the Multiboot2 tag, on the raw early
 # diagnostic channel.  That channel is written before the log ring exists, so
 # unlike the later `info!` lines it is always complete in kernel.log even when
@@ -1629,14 +1629,14 @@ def host_test_cmd() -> int:
         settings = package.get("metadata", {}).get("thekernel", {})
         if (settings.get("layer") in {"mechanism", "linux_abi"}
                 or settings.get("host-test", {}).get("selected", False)
-                or package["name"] in {"thekernel-readiness-adapter", "thekernel-linux-process-adapter"}):
+                or package["name"] in {"tk-readiness-adapter", "tk-linux-process-adapter"}):
             selected.append(package)
     # Separate invocations preserve declared component test features; a
     # workspace-wide union changes scheduler and platform semantics.
     for package in sorted(selected, key=lambda item: item["name"]):
         run_checked(component_host_test_command(package), env=env)
     env["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"] = (
-        f"-C link-arg=-T{REPO_ROOT / 'crates/ax/thekernel-scope-local/percpu.x'}")
+        f"-C link-arg=-T{REPO_ROOT / 'crates/ax/tk-scope-local/percpu.x'}")
     run_checked(["cargo", "test", "--locked", "--manifest-path", "kernel/Cargo.toml",
                  "--tests", "--features", "bpf,perf-sampling,axtask/test", "--target",
                  "x86_64-unknown-linux-gnu", "--", "--test-threads=1"], env=env)

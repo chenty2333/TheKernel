@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use axerrno::{AxError, AxResult};
 use axsync::spin::SpinNoIrq;
-use thekernel_linux_bpf::ProgramProfile;
+use tk_linux_bpf::ProgramProfile;
 
 use super::{defs::*, map::BpfMap};
 

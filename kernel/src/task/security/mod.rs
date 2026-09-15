@@ -53,7 +53,7 @@ use axsync::Mutex;
 use axtask::AxTaskRef;
 use memory_addr::VirtAddr;
 use spin::Once;
-use thekernel_linux_cred::{
+use tk_linux_cred::{
     AuthorizationError, CapabilityNumber, FileMprotectContext, MemoryProtection,
     MmapAddressContext, MmapFileContext, MmapFileFlags, MmapFileOperation, MmapFileSecurityRef,
     MmapFileTarget, SocketAcceptContext, SocketBindContext, SocketConnectContext,
@@ -79,7 +79,7 @@ pub(crate) enum KernelLoadKind {
 // host test surface another, so an unused re-export here is a property of
 // the profile rather than dead surface.
 #[allow(unused_imports)]
-pub(crate) use thekernel_linux_cred::{
+pub(crate) use tk_linux_cred::{
     CapabilitySecurityOperation, CredentialPublicationOperation, FileOpenAccess, FileOpenOperation,
     InodeChmodIntent, InodeCreateMode, InodeMknodKind, InodeMknodOperation, InodePermissionAccess,
     InodeSetattrIntent, InodeSetattrMode, InodeSetattrProposal, InodeXattrOperation,
@@ -112,13 +112,13 @@ pub(crate) struct ModuleKey(u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ModuleId(u8);
 
-pub(crate) type CoreCred = thekernel_linux_cred::Credential<UserNamespace>;
+pub(crate) type CoreCred = tk_linux_cred::Credential<UserNamespace>;
 pub(crate) type CoreCapabilitySecurityContext<'a> =
-    thekernel_linux_cred::CapabilitySecurityContext<'a, UserNamespace>;
+    tk_linux_cred::CapabilitySecurityContext<'a, UserNamespace>;
 pub(crate) type CorePreparedCredentialCapabilityContext<'a> =
-    thekernel_linux_cred::PreparedCredentialCapabilityContext<'a, UserNamespace>;
+    tk_linux_cred::PreparedCredentialCapabilityContext<'a, UserNamespace>;
 pub(crate) type CoreCredentialPublicationContext<'a> =
-    thekernel_linux_cred::CredentialPublicationContext<
+    tk_linux_cred::CredentialPublicationContext<
         'a,
         UserNamespace,
         CredentialPublicationTarget,

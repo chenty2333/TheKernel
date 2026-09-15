@@ -1,6 +1,6 @@
 //! Special-keyring resolution, possession, and permission checks.
 
-use thekernel_linux_keyring::{
+use tk_linux_keyring::{
     KeyAvailability as LinuxKeyAvailability, KeyError as LinuxKeyError, KeyId as LinuxKeyId,
     KeyPermissions as LinuxKeyPermissions, MissingSessionPlan as LinuxMissingSessionPlan,
     PermissionInput as LinuxPermissionInput, PermissionLanes as LinuxPermissionLanes,

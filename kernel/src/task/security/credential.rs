@@ -272,14 +272,14 @@ impl<T: CredentialPublicationTargetOwner> PendingCredentialPublication<T> {
         let target = target_owner.credential_publication_target();
         let context = match kind {
             CredentialPublicationKind::Fork => {
-                thekernel_linux_cred::CredentialPublicationContext::fork(
+                tk_linux_cred::CredentialPublicationContext::fork(
                     source.core(),
                     published.core(),
                     &target,
                 )
             }
             CredentialPublicationKind::UserNamespace => {
-                thekernel_linux_cred::CredentialPublicationContext::user_namespace(
+                tk_linux_cred::CredentialPublicationContext::user_namespace(
                     source.core(),
                     published.core(),
                     &target,

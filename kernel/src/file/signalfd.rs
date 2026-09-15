@@ -9,7 +9,7 @@ use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::current;
 use spin::RwLock;
-use thekernel_linux_signal::{SignalInfo, SignalSet, SignalfdMask, SignalfdSiginfo};
+use tk_linux_signal::{SignalInfo, SignalSet, SignalfdMask, SignalfdSiginfo};
 
 use crate::{
     file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat},
@@ -166,7 +166,7 @@ impl Pollable for Signalfd {
 #[cfg(test)]
 mod tests {
     use linux_raw_sys::general::SI_MESGQ;
-    use thekernel_linux_signal::{SignalPollPayload, SignalRtPayload, SignalTimerPayload, Signo};
+    use tk_linux_signal::{SignalPollPayload, SignalRtPayload, SignalTimerPayload, Signo};
 
     use super::*;
 

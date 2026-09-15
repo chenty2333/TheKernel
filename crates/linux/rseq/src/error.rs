@@ -41,7 +41,7 @@ impl ErrnoClass {
 /// not the concrete errno type owned by a syscall adapter.
 pub type RseqErrno = ErrnoClass;
 
-/// Stable pure-policy failures returned by `thekernel-linux-rseq`.
+/// Stable pure-policy failures returned by `tk-linux-rseq`.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum RseqError {

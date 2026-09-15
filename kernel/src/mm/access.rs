@@ -20,8 +20,8 @@ use axsync::Mutex;
 #[cfg(feature = "test-io-control")]
 use axtask::sleep;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr};
-use thekernel_linux_mm::{PinAccess, PinDuration, PinRequest, PinToken, PinUse, UserRange};
-use thekernel_linux_usercopy::{UserCopyError, VmResult};
+use tk_linux_mm::{PinAccess, PinDuration, PinRequest, PinToken, PinUse, UserRange};
+use tk_linux_usercopy::{UserCopyError, VmResult};
 
 use super::{
     AddrSpace, Backend, PhysicalFramePins, PreparedPhysicalFramePins, SharedFutexKey,
@@ -738,7 +738,7 @@ impl Drop for UserIoRangePin {
 /// revalidation, and successful-call construction failures.
 struct UnpublishedUserIoPin {
     aspace: Arc<Mutex<AddrSpace>>,
-    reservation: Option<thekernel_linux_mm::PinReservation>,
+    reservation: Option<tk_linux_mm::PinReservation>,
     system_charge: Option<super::UserIoSystemPinCharge>,
     expectations: Vec<UserIoMappingExpectation>,
     frame_pins: Vec<PhysicalFramePins>,
@@ -752,7 +752,7 @@ struct UnpublishedUserIoPin {
 impl UnpublishedUserIoPin {
     fn try_new(
         aspace: Arc<Mutex<AddrSpace>>,
-        reservation: thekernel_linux_mm::PinReservation,
+        reservation: tk_linux_mm::PinReservation,
         system_charge: super::UserIoSystemPinCharge,
         page_count: usize,
     ) -> Option<Self> {
@@ -791,7 +791,7 @@ impl UnpublishedUserIoPin {
         Some(preparation)
     }
 
-    fn reservation(&self) -> thekernel_linux_mm::PinReservation {
+    fn reservation(&self) -> tk_linux_mm::PinReservation {
         self.reservation.expect("active user-I/O pin preparation")
     }
 

@@ -25,8 +25,8 @@ use iced_x86::{
     InstructionBlock, Mnemonic, OpKind, Register,
 };
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
-use thekernel_linux_arch_x86_64::SEGV_CPERR;
-use thekernel_linux_signal::{SignalInfo, Signo};
+use tk_linux_arch_x86_64::SEGV_CPERR;
+use tk_linux_signal::{SignalInfo, Signo};
 
 use crate::{
     file::PerfEvent,
@@ -4683,8 +4683,8 @@ pub(crate) fn syscall_uretprobe(frame: &mut TrapFrame) -> AxResult<isize> {
             })
     });
     if !frame_owned {
-        force_signal_current_thread(thekernel_linux_signal::SignalInfo::new_kernel(
-            thekernel_linux_signal::Signo::SIGILL,
+        force_signal_current_thread(tk_linux_signal::SignalInfo::new_kernel(
+            tk_linux_signal::Signo::SIGILL,
         ));
         return Ok(-1);
     }
@@ -4738,8 +4738,8 @@ pub(crate) fn syscall_uretprobe(frame: &mut TrapFrame) -> AxResult<isize> {
     }) {
         Ok(value) => value,
         Err(_) => {
-            force_signal_current_thread(thekernel_linux_signal::SignalInfo::new_kernel(
-                thekernel_linux_signal::Signo::SIGILL,
+            force_signal_current_thread(tk_linux_signal::SignalInfo::new_kernel(
+                tk_linux_signal::Signo::SIGILL,
             ));
             return Ok(-1);
         }
@@ -4829,8 +4829,8 @@ pub(crate) fn syscall_uretprobe(frame: &mut TrapFrame) -> AxResult<isize> {
         Ok(())
     });
     if write_result.is_err() {
-        force_signal_current_thread(thekernel_linux_signal::SignalInfo::new_kernel(
-            thekernel_linux_signal::Signo::SIGILL,
+        force_signal_current_thread(tk_linux_signal::SignalInfo::new_kernel(
+            tk_linux_signal::Signo::SIGILL,
         ));
         return Ok(-1);
     }
@@ -4894,8 +4894,8 @@ pub(crate) fn syscall_uprobe(frame: &mut TrapFrame) -> AxResult<isize> {
                 .lock()
                 .get_mut(&task)
                 .and_then(|state| state.pending_uprobe_syscall.take());
-            force_signal_current_thread(thekernel_linux_signal::SignalInfo::new_kernel(
-                thekernel_linux_signal::Signo::SIGILL,
+            force_signal_current_thread(tk_linux_signal::SignalInfo::new_kernel(
+                tk_linux_signal::Signo::SIGILL,
             ));
             return Ok(-1);
         }

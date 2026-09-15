@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use axerrno::{AxError, AxResult};
 use axsync::spin::SpinNoIrq;
 use linux_raw_sys::general::{CAP_PERFMON, CAP_SYS_ADMIN};
-use thekernel_linux_perf::{
+use tk_linux_perf::{
     ATTR_EXCLUDE_KERNEL, ATTR_FREQ, ATTR_PRECISE_IP, PERF_FLAG_PID_CGROUP, PERF_SAMPLE_AUX,
     PERF_SAMPLE_BRANCH_STACK, PERF_SAMPLE_REGS_INTR, PERF_TYPE_RAW, PERF_TYPE_TRACEPOINT,
     PerfEventAttr,

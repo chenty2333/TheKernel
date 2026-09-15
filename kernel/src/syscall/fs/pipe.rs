@@ -4,7 +4,7 @@ use core::ffi::c_int;
 use axerrno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{O_CLOEXEC, O_DIRECT, O_NONBLOCK, O_RDONLY, O_WRONLY};
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr};
 
 use crate::{
     file::{FileLike, Pipe, add_file_like_with_flags, close_file_like},

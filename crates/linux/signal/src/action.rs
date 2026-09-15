@@ -5,7 +5,7 @@ use linux_raw_sys::general::{
     SA_NOCLDSTOP, SA_NOCLDWAIT, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SA_RESTART, SA_SIGINFO,
     kernel_sigaction,
 };
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, VmResult};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, VmResult};
 
 use crate::SignalSet;
 

@@ -1,6 +1,6 @@
 use std::sync::{Arc, Barrier};
 
-use thekernel_linux_process::{
+use tk_linux_process::{
     ExitOutcome, Process, ProcessDomain, ThreadExitTransition, ThreadPublicationOutcome,
 };
 
@@ -106,10 +106,10 @@ fn concurrent_thread_admission_and_exit_have_one_winner() {
             let admission = admission.join().unwrap();
 
             match (exit, admission) {
-                (Ok(_), Err(thekernel_linux_process::ProcessError::NotLive)) => {
+                (Ok(_), Err(tk_linux_process::ProcessError::NotLive)) => {
                     assert_eq!(process.thread_count(), 0)
                 }
-                (Err(thekernel_linux_process::ProcessError::NotLive), Ok(())) => {
+                (Err(tk_linux_process::ProcessError::NotLive), Ok(())) => {
                     assert_eq!(process.thread_count(), 1)
                 }
                 other => panic!("unexpected exit/admission result: {other:?}"),

@@ -19,10 +19,10 @@ use linux_raw_sys::{
     mempolicy::*,
 };
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
-use thekernel_linux_cred::{
+use tk_linux_cred::{
     CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CapabilitySets, CapsetRequest,
 };
-use thekernel_linux_usercopy::{
+use tk_linux_usercopy::{
     UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load_until_nul, vm_write_slice,
 };
 

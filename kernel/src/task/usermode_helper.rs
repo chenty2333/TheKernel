@@ -16,8 +16,8 @@ use axtask::{
     AxTaskExt, AxTaskRef, SchedState, current, prepare_task_with_sched_from, publish_prepared_task,
     reserve_prepared_task,
 };
-use thekernel_linux_seccomp::SeccompState;
-use thekernel_linux_signal::api::{SharedSignalActions, SignalActions};
+use tk_linux_seccomp::SeccompState;
+use tk_linux_signal::api::{SharedSignalActions, SignalActions};
 
 use crate::{
     file::{

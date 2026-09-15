@@ -9,7 +9,7 @@ use linux_vfs::{
     LinuxVfsError, StructCopyPlan, XattrArgs, getxattrat_copy_plan, setxattrat_copy_plan,
     validate_file_at_flags, validate_getxattr_flags, validate_setxattr_flags,
 };
-use thekernel_linux_usercopy::{
+use tk_linux_usercopy::{
     UserCopyError, UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded,
     vm_write_slice,
 };

@@ -3082,12 +3082,12 @@ dependencies = [
 name = "thekernel"
 version = "0.2.0-preview.2"
 dependencies = [
- "thekernel-axfeat",
- "thekernel-kernel",
+ "tk-axfeat",
+ "tk-kernel",
 ]
 
 [[package]]
-name = "thekernel-axalloc"
+name = "tk-axalloc"
 version = "0.3.0-preview.2"
 dependencies = [
  "axbacktrace",
@@ -3099,11 +3099,11 @@ dependencies = [
  "memory_addr",
  "percpu 0.2.3-preview.1",
  "strum 0.27.2",
- "thekernel-axallocator",
+ "tk-axallocator",
 ]
 
 [[package]]
-name = "thekernel-axallocator"
+name = "tk-axallocator"
 version = "0.2.0"
 dependencies = [
  "ax_slab_allocator",
@@ -3117,18 +3117,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-axbpf"
+name = "tk-axbpf"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
 ]
 
 [[package]]
-name = "thekernel-axcbpf"
+name = "tk-axcbpf"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-axcpu"
+name = "tk-axcpu"
 version = "0.3.0-preview.8"
 dependencies = [
  "axbacktrace",
@@ -3139,24 +3139,24 @@ dependencies = [
  "memory_addr",
  "percpu 0.2.3-preview.1",
  "static_assertions",
- "thekernel-axpmu",
- "thekernel-page-table-entry",
+ "tk-axpmu",
+ "tk-page-table-entry",
  "x86",
  "x86_64",
 ]
 
 [[package]]
-name = "thekernel-axdisplay"
+name = "tk-axdisplay"
 version = "0.3.0-preview.2"
 dependencies = [
  "lazyinit",
  "log",
- "thekernel-axdriver",
- "thekernel-axsync",
+ "tk-axdriver",
+ "tk-axsync",
 ]
 
 [[package]]
-name = "thekernel-axdriver"
+name = "tk-axdriver"
 version = "0.3.0-preview.2"
 dependencies = [
  "ax-crate-interface",
@@ -3179,121 +3179,121 @@ dependencies = [
  "rdrive",
  "smallvec",
  "spin 0.10.1",
- "thekernel-axalloc",
- "thekernel-axdriver-base",
- "thekernel-axdriver-block",
- "thekernel-axdriver-display",
- "thekernel-axdriver-input",
- "thekernel-axdriver-net",
- "thekernel-axdriver-pci",
- "thekernel-axdriver-virtio",
- "thekernel-axdriver-vsock",
- "thekernel-axhal",
- "thekernel-axsync",
- "thekernel-axtask",
+ "tk-axalloc",
+ "tk-axdriver-base",
+ "tk-axdriver-block",
+ "tk-axdriver-display",
+ "tk-axdriver-input",
+ "tk-axdriver-net",
+ "tk-axdriver-pci",
+ "tk-axdriver-virtio",
+ "tk-axdriver-vsock",
+ "tk-axhal",
+ "tk-axsync",
+ "tk-axtask",
 ]
 
 [[package]]
-name = "thekernel-axdriver-base"
+name = "tk-axdriver-base"
 version = "0.1.4-preview.3"
 
 [[package]]
-name = "thekernel-axdriver-block"
+name = "tk-axdriver-block"
 version = "0.1.4-preview.3"
 dependencies = [
  "log",
  "simple-ahci",
- "thekernel-axdriver-base",
+ "tk-axdriver-base",
 ]
 
 [[package]]
-name = "thekernel-axdriver-display"
+name = "tk-axdriver-display"
 version = "0.1.4-preview.3"
 dependencies = [
- "thekernel-axdriver-base",
- "thekernel-axgpu",
+ "tk-axdriver-base",
+ "tk-axgpu",
 ]
 
 [[package]]
-name = "thekernel-axdriver-input"
+name = "tk-axdriver-input"
 version = "0.1.4-preview.3"
 dependencies = [
  "strum 0.27.2",
- "thekernel-axdriver-base",
+ "tk-axdriver-base",
 ]
 
 [[package]]
-name = "thekernel-axdriver-net"
+name = "tk-axdriver-net"
 version = "0.1.4-preview.3"
 dependencies = [
  "fxmac_rs",
  "ixgbe-driver",
  "log",
  "spin 0.9.9",
- "thekernel-axdriver-base",
+ "tk-axdriver-base",
 ]
 
 [[package]]
-name = "thekernel-axdriver-pci"
+name = "tk-axdriver-pci"
 version = "0.1.4-preview.3"
 dependencies = [
- "thekernel-virtio-drivers",
+ "tk-virtio-drivers",
 ]
 
 [[package]]
-name = "thekernel-axdriver-virtio"
+name = "tk-axdriver-virtio"
 version = "0.1.4-preview.3"
 dependencies = [
  "log",
  "spin 0.9.9",
- "thekernel-axdriver-base",
- "thekernel-axdriver-block",
- "thekernel-axdriver-display",
- "thekernel-axdriver-input",
- "thekernel-axdriver-net",
- "thekernel-axdriver-vsock",
- "thekernel-axhal",
- "thekernel-axtask",
- "thekernel-virtio-drivers",
+ "tk-axdriver-base",
+ "tk-axdriver-block",
+ "tk-axdriver-display",
+ "tk-axdriver-input",
+ "tk-axdriver-net",
+ "tk-axdriver-vsock",
+ "tk-axhal",
+ "tk-axtask",
+ "tk-virtio-drivers",
 ]
 
 [[package]]
-name = "thekernel-axdriver-vsock"
+name = "tk-axdriver-vsock"
 version = "0.1.4-preview.3"
 dependencies = [
  "log",
- "thekernel-axdriver-base",
+ "tk-axdriver-base",
 ]
 
 [[package]]
-name = "thekernel-axexec"
+name = "tk-axexec"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-axfault"
+name = "tk-axfault"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-axfeat"
+name = "tk-axfeat"
 version = "0.3.0-preview.2"
 dependencies = [
  "axbacktrace",
  "axconfig",
  "axlog",
  "kspin",
- "thekernel-axalloc",
- "thekernel-axdisplay",
- "thekernel-axdriver",
- "thekernel-axfs-ng",
- "thekernel-axhal",
- "thekernel-axinput",
- "thekernel-axruntime",
- "thekernel-axsync",
- "thekernel-axtask",
+ "tk-axalloc",
+ "tk-axdisplay",
+ "tk-axdriver",
+ "tk-axfs-ng",
+ "tk-axhal",
+ "tk-axinput",
+ "tk-axruntime",
+ "tk-axsync",
+ "tk-axtask",
 ]
 
 [[package]]
-name = "thekernel-axfs-ng"
+name = "tk-axfs-ng"
 version = "0.3.0-preview.2"
 dependencies = [
  "axerrno 0.2.2",
@@ -3309,22 +3309,22 @@ dependencies = [
  "miniz_oxide",
  "ruzstd",
  "spin 0.10.1",
- "thekernel-axalloc",
- "thekernel-axdriver",
- "thekernel-axdriver-block",
- "thekernel-axfs-ng-vfs",
- "thekernel-axhal",
- "thekernel-axio",
- "thekernel-axpoll",
- "thekernel-axsync",
- "thekernel-axtask",
- "thekernel-lwext4-rust",
- "thekernel-scope-local",
- "thekernel-starry-fatfs",
+ "tk-axalloc",
+ "tk-axdriver",
+ "tk-axdriver-block",
+ "tk-axfs-ng-vfs",
+ "tk-axhal",
+ "tk-axio",
+ "tk-axpoll",
+ "tk-axsync",
+ "tk-axtask",
+ "tk-lwext4-rust",
+ "tk-scope-local",
+ "tk-starry-fatfs",
 ]
 
 [[package]]
-name = "thekernel-axfs-ng-vfs"
+name = "tk-axfs-ng-vfs"
 version = "0.1.1"
 dependencies = [
  "axerrno 0.2.2",
@@ -3335,15 +3335,15 @@ dependencies = [
  "log",
  "smallvec",
  "spin 0.10.1",
- "thekernel-axpoll",
+ "tk-axpoll",
 ]
 
 [[package]]
-name = "thekernel-axgpu"
+name = "tk-axgpu"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-axhal"
+name = "tk-axhal"
 version = "0.3.0-preview.2"
 dependencies = [
  "axconfig",
@@ -3357,25 +3357,25 @@ dependencies = [
  "memory_addr",
  "percpu 0.2.3-preview.1",
  "spin 0.10.1",
- "thekernel-axalloc",
- "thekernel-axcpu",
- "thekernel-axgpu",
- "thekernel-axplat-x86-pc",
- "thekernel-page-table-multiarch",
+ "tk-axalloc",
+ "tk-axcpu",
+ "tk-axgpu",
+ "tk-axplat-x86-pc",
+ "tk-page-table-multiarch",
 ]
 
 [[package]]
-name = "thekernel-axinput"
+name = "tk-axinput"
 version = "0.3.0-preview.2"
 dependencies = [
  "lazyinit",
  "log",
- "thekernel-axdriver",
- "thekernel-axsync",
+ "tk-axdriver",
+ "tk-axsync",
 ]
 
 [[package]]
-name = "thekernel-axio"
+name = "tk-axio"
 version = "0.3.0-pre.1"
 dependencies = [
  "autocfg",
@@ -3385,7 +3385,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-axmm"
+name = "tk-axmm"
 version = "0.3.0-preview.2"
 dependencies = [
  "axerrno 0.2.2",
@@ -3393,14 +3393,14 @@ dependencies = [
  "lazyinit",
  "log",
  "memory_addr",
- "thekernel-axalloc",
- "thekernel-axhal",
- "thekernel-memory-set",
- "thekernel-page-table-multiarch",
+ "tk-axalloc",
+ "tk-axhal",
+ "tk-memory-set",
+ "tk-page-table-multiarch",
 ]
 
 [[package]]
-name = "thekernel-axnet-ng"
+name = "tk-axnet-ng"
 version = "0.3.0-preview.2"
 dependencies = [
  "axconfig",
@@ -3417,17 +3417,17 @@ dependencies = [
  "ringbuf",
  "sha2",
  "spin 0.10.1",
- "thekernel-axdriver",
- "thekernel-axhal",
- "thekernel-axio",
- "thekernel-axpoll",
- "thekernel-axsync",
- "thekernel-axtask",
- "thekernel-starry-smoltcp",
+ "tk-axdriver",
+ "tk-axhal",
+ "tk-axio",
+ "tk-axpoll",
+ "tk-axsync",
+ "tk-axtask",
+ "tk-starry-smoltcp",
 ]
 
 [[package]]
-name = "thekernel-axplat-x86-pc"
+name = "tk-axplat-x86-pc"
 version = "0.3.1-pre.6"
 dependencies = [
  "axconfig-macros",
@@ -3442,7 +3442,7 @@ dependencies = [
  "multiboot",
  "percpu 0.2.3-preview.1",
  "raw-cpuid 11.6.0",
- "thekernel-axcpu",
+ "tk-axcpu",
  "uart_16550",
  "x2apic",
  "x86",
@@ -3451,11 +3451,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-axpmu"
+name = "tk-axpmu"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-axpoll"
+name = "tk-axpoll"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
@@ -3465,11 +3465,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-axrandom"
+name = "tk-axrandom"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-axrcu"
+name = "tk-axrcu"
 version = "0.1.0"
 dependencies = [
  "kspin",
@@ -3477,7 +3477,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-axruntime"
+name = "tk-axruntime"
 version = "0.3.0-preview.2"
 dependencies = [
  "axbacktrace",
@@ -3493,19 +3493,19 @@ dependencies = [
  "kspin",
  "log",
  "percpu 0.2.3-preview.1",
- "thekernel-axalloc",
- "thekernel-axdisplay",
- "thekernel-axdriver",
- "thekernel-axfs-ng",
- "thekernel-axhal",
- "thekernel-axinput",
- "thekernel-axmm",
- "thekernel-axnet-ng",
- "thekernel-axtask",
+ "tk-axalloc",
+ "tk-axdisplay",
+ "tk-axdriver",
+ "tk-axfs-ng",
+ "tk-axhal",
+ "tk-axinput",
+ "tk-axmm",
+ "tk-axnet-ng",
+ "tk-axtask",
 ]
 
 [[package]]
-name = "thekernel-axsched"
+name = "tk-axsched"
 version = "0.1.0"
 dependencies = [
  "intrusive-collections",
@@ -3513,18 +3513,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-axsync"
+name = "tk-axsync"
 version = "0.3.0-preview.2"
 dependencies = [
  "event-listener",
  "fastrand",
  "kspin",
  "lock_api",
- "thekernel-axtask",
+ "tk-axtask",
 ]
 
 [[package]]
-name = "thekernel-axtask"
+name = "tk-axtask"
 version = "0.1.0"
 dependencies = [
  "axconfig",
@@ -3542,18 +3542,18 @@ dependencies = [
  "memory_addr",
  "percpu 0.2.3-preview.1",
  "spin 0.10.1",
- "thekernel-axhal",
- "thekernel-axpoll",
- "thekernel-axsched",
+ "tk-axhal",
+ "tk-axpoll",
+ "tk-axsched",
  "x86_64",
 ]
 
 [[package]]
-name = "thekernel-axtlb"
+name = "tk-axtlb"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-kernel"
+name = "tk-kernel"
 version = "0.2.0-preview.2"
 dependencies = [
  "aes",
@@ -3599,64 +3599,64 @@ dependencies = [
  "spin 0.10.1",
  "strum 0.28.0",
  "syscalls",
- "thekernel-axalloc",
- "thekernel-axbpf",
- "thekernel-axcbpf",
- "thekernel-axcpu",
- "thekernel-axdisplay",
- "thekernel-axdriver",
- "thekernel-axdriver-display",
- "thekernel-axexec",
- "thekernel-axfault",
- "thekernel-axfeat",
- "thekernel-axfs-ng",
- "thekernel-axfs-ng-vfs",
- "thekernel-axgpu",
- "thekernel-axhal",
- "thekernel-axinput",
- "thekernel-axio",
- "thekernel-axmm",
- "thekernel-axnet-ng",
- "thekernel-axpmu",
- "thekernel-axrandom",
- "thekernel-axrcu",
- "thekernel-axruntime",
- "thekernel-axsync",
- "thekernel-axtask",
- "thekernel-axtlb",
- "thekernel-kernel-elf-parser",
- "thekernel-linux-aio",
- "thekernel-linux-arch-x86-64",
- "thekernel-linux-bpf",
- "thekernel-linux-cred",
- "thekernel-linux-drm",
- "thekernel-linux-fd",
- "thekernel-linux-fsnotify",
- "thekernel-linux-futex",
- "thekernel-linux-io-uring",
- "thekernel-linux-ipc",
- "thekernel-linux-keyring",
- "thekernel-linux-landlock",
- "thekernel-linux-mm",
- "thekernel-linux-mount",
- "thekernel-linux-net",
- "thekernel-linux-packet",
- "thekernel-linux-perf",
- "thekernel-linux-process",
- "thekernel-linux-process-adapter",
- "thekernel-linux-profile",
- "thekernel-linux-rseq",
- "thekernel-linux-sched",
- "thekernel-linux-seccomp",
- "thekernel-linux-signal",
- "thekernel-linux-syslog",
- "thekernel-linux-time",
- "thekernel-linux-usercopy",
- "thekernel-linux-vfs",
- "thekernel-memory-set",
- "thekernel-page-table-multiarch",
- "thekernel-readiness-adapter",
- "thekernel-scope-local",
+ "tk-axalloc",
+ "tk-axbpf",
+ "tk-axcbpf",
+ "tk-axcpu",
+ "tk-axdisplay",
+ "tk-axdriver",
+ "tk-axdriver-display",
+ "tk-axexec",
+ "tk-axfault",
+ "tk-axfeat",
+ "tk-axfs-ng",
+ "tk-axfs-ng-vfs",
+ "tk-axgpu",
+ "tk-axhal",
+ "tk-axinput",
+ "tk-axio",
+ "tk-axmm",
+ "tk-axnet-ng",
+ "tk-axpmu",
+ "tk-axrandom",
+ "tk-axrcu",
+ "tk-axruntime",
+ "tk-axsync",
+ "tk-axtask",
+ "tk-axtlb",
+ "tk-kernel-elf-parser",
+ "tk-linux-aio",
+ "tk-linux-arch-x86-64",
+ "tk-linux-bpf",
+ "tk-linux-cred",
+ "tk-linux-drm",
+ "tk-linux-fd",
+ "tk-linux-fsnotify",
+ "tk-linux-futex",
+ "tk-linux-io-uring",
+ "tk-linux-ipc",
+ "tk-linux-keyring",
+ "tk-linux-landlock",
+ "tk-linux-mm",
+ "tk-linux-mount",
+ "tk-linux-net",
+ "tk-linux-packet",
+ "tk-linux-perf",
+ "tk-linux-process",
+ "tk-linux-process-adapter",
+ "tk-linux-profile",
+ "tk-linux-rseq",
+ "tk-linux-sched",
+ "tk-linux-seccomp",
+ "tk-linux-signal",
+ "tk-linux-syslog",
+ "tk-linux-time",
+ "tk-linux-usercopy",
+ "tk-linux-vfs",
+ "tk-memory-set",
+ "tk-page-table-multiarch",
+ "tk-readiness-adapter",
+ "tk-scope-local",
  "uluru",
  "weak-map",
  "x86",
@@ -3666,7 +3666,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-kernel-elf-parser"
+name = "tk-kernel-elf-parser"
 version = "0.3.4"
 dependencies = [
  "xmas-elf",
@@ -3674,87 +3674,87 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-linux-aio"
+name = "tk-linux-aio"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-arch-x86-64"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
-]
-
-[[package]]
-name = "thekernel-linux-bpf"
+name = "tk-linux-arch-x86-64"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
 ]
 
 [[package]]
-name = "thekernel-linux-cred"
+name = "tk-linux-bpf"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
+name = "tk-linux-cred"
 version = "0.1.0"
 dependencies = [
  "linux-raw-sys",
 ]
 
 [[package]]
-name = "thekernel-linux-drm"
+name = "tk-linux-drm"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-fd"
+name = "tk-linux-fd"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-fsnotify"
+name = "tk-linux-fsnotify"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-futex"
+name = "tk-linux-futex"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-io-uring"
+name = "tk-linux-io-uring"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-ipc"
+name = "tk-linux-ipc"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-keyring"
+name = "tk-linux-keyring"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-landlock"
+name = "tk-linux-landlock"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-mm"
+name = "tk-linux-mm"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
 ]
 
 [[package]]
-name = "thekernel-linux-mount"
+name = "tk-linux-mount"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-net"
+name = "tk-linux-net"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-packet"
+name = "tk-linux-packet"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-perf"
+name = "tk-linux-perf"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-process"
+name = "tk-linux-process"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
@@ -3763,30 +3763,30 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-linux-process-adapter"
+name = "tk-linux-process-adapter"
 version = "0.1.0"
 dependencies = [
- "thekernel-linux-process",
+ "tk-linux-process",
 ]
 
 [[package]]
-name = "thekernel-linux-profile"
+name = "tk-linux-profile"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-rseq"
+name = "tk-linux-rseq"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-sched"
+name = "tk-linux-sched"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-seccomp"
+name = "tk-linux-seccomp"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-signal"
+name = "tk-linux-signal"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
@@ -3796,36 +3796,36 @@ dependencies = [
  "log",
  "spin 0.10.1",
  "strum 0.27.2",
- "thekernel-linux-usercopy",
+ "tk-linux-usercopy",
  "x86_64",
 ]
 
 [[package]]
-name = "thekernel-linux-syslog"
+name = "tk-linux-syslog"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-time"
+name = "tk-linux-time"
 version = "0.1.0"
 
 [[package]]
-name = "thekernel-linux-usercopy"
+name = "tk-linux-usercopy"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
  "linux-raw-sys",
- "thekernel-linux-usercopy",
+ "tk-linux-usercopy",
 ]
 
 [[package]]
-name = "thekernel-linux-vfs"
+name = "tk-linux-vfs"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
 ]
 
 [[package]]
-name = "thekernel-lwext4-rust"
+name = "tk-lwext4-rust"
 version = "0.2.0"
 dependencies = [
  "bindgen",
@@ -3835,7 +3835,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-memory-set"
+name = "tk-memory-set"
 version = "0.4.1"
 dependencies = [
  "axerrno 0.1.2",
@@ -3843,7 +3843,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-page-table-entry"
+name = "tk-page-table-entry"
 version = "0.6.1"
 dependencies = [
  "bitflags 2.13.1",
@@ -3852,7 +3852,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-page-table-multiarch"
+name = "tk-page-table-multiarch"
 version = "0.6.1"
 dependencies = [
  "arrayvec",
@@ -3861,21 +3861,21 @@ dependencies = [
  "log",
  "memory_addr",
  "rand 0.10.2",
- "thekernel-page-table-entry",
+ "tk-page-table-entry",
  "x86",
  "x86_64",
 ]
 
 [[package]]
-name = "thekernel-readiness-adapter"
+name = "tk-readiness-adapter"
 version = "0.1.0"
 dependencies = [
  "axerrno 0.2.2",
- "thekernel-axpoll",
+ "tk-axpoll",
 ]
 
 [[package]]
-name = "thekernel-scope-local"
+name = "tk-scope-local"
 version = "0.1.2"
 dependencies = [
  "ctor",
@@ -3884,7 +3884,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-starry-fatfs"
+name = "tk-starry-fatfs"
 version = "0.4.1-preview.2"
 dependencies = [
  "bitflags 2.13.1",
@@ -3895,7 +3895,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-starry-smoltcp"
+name = "tk-starry-smoltcp"
 version = "0.12.1-preview.1"
 dependencies = [
  "bitflags 1.3.2",
@@ -3916,7 +3916,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "thekernel-virtio-drivers"
+name = "tk-virtio-drivers"
 version = "0.7.5"
 dependencies = [
  "bitflags 2.13.1",

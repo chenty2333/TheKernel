@@ -2,7 +2,7 @@
 """Fail if a kernel function's stack frame could run off a task stack.
 
 This kernel's task stacks come straight from `alloc::alloc`
-(`crates/ax/thekernel-axtask/src/task.rs`, `TaskStack::try_alloc`) with no guard
+(`crates/ax/tk-axtask/src/task.rs`, `TaskStack::try_alloc`) with no guard
 page, and they are `task-stack-size` from `config/kernel.toml`.  A function
 whose frame is larger than that does not fault cleanly: Rust emits a stack probe
 that writes one zero per page as it walks down, so the frame lands *below* the

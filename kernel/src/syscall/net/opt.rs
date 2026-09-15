@@ -22,11 +22,11 @@ use linux_raw_sys::{
     },
 };
 use spin::{Lazy, Mutex};
-use thekernel_linux_net::{
+use tk_linux_net::{
     RawSocketOption, SocketOption as LinuxSocketOption, SocketOptionErrno, UcredWire,
     plan_get_socket_option, plan_set_socket_option,
 };
-use thekernel_linux_packet::{
+use tk_linux_packet::{
     GetPacketOption, PacketError, PacketOption, PacketOptionOperation, PacketOptionValue,
     PacketSocketType, SetPacketOption,
 };
@@ -391,7 +391,7 @@ mod conv {
     use axerrno::{AxError, AxResult};
     use axnet::options::{SocketCredentials, SocketFault};
     use linux_raw_sys::general::timeval;
-    use thekernel_linux_net::UcredWire;
+    use tk_linux_net::UcredWire;
 
     use crate::time::TimeValueLike;
 
@@ -1784,13 +1784,13 @@ pub fn sys_setsockopt(
             .set_ipv6_addrform_to_ipv4()
             .map_err(|error| match error {
                 Ipv6AddrFormError::UnsupportedSocket => super::socket_failure(
-                    thekernel_linux_net::SocketFailure::ProtocolOptionUnsupported,
+                    tk_linux_net::SocketFailure::ProtocolOptionUnsupported,
                 ),
                 Ipv6AddrFormError::NotConnected => {
-                    super::socket_failure(thekernel_linux_net::SocketFailure::NotConnected)
+                    super::socket_failure(tk_linux_net::SocketFailure::NotConnected)
                 }
                 Ipv6AddrFormError::PeerIsNotIpv4 => {
-                    super::socket_failure(thekernel_linux_net::SocketFailure::AddressUnavailable)
+                    super::socket_failure(tk_linux_net::SocketFailure::AddressUnavailable)
                 }
             })?;
         return Ok(0);

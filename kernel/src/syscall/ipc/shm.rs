@@ -19,8 +19,8 @@ use linux_raw_sys::{
 use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 #[cfg(all(test, not(target_os = "none")))]
 pub(super) use spin::Mutex;
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
+use tk_linux_process_adapter::Pid;
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcAccess,

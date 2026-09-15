@@ -326,7 +326,7 @@ pub fn copy_from_kernel(_aspace: &mut AddrSpace) -> AxResult {
 /// Map the signal trampoline to the user address space.
 pub fn map_trampoline(aspace: &mut AddrSpace) -> AxResult {
     let signal_trampoline_paddr =
-        virt_to_phys(thekernel_linux_signal::arch::signal_trampoline_address().into());
+        virt_to_phys(tk_linux_signal::arch::signal_trampoline_address().into());
     aspace.map_linear(
         crate::config::SIGNAL_TRAMPOLINE.into(),
         signal_trampoline_paddr,
@@ -1137,7 +1137,7 @@ mod tests {
     fn dynamic_linker_entry_uses_elf_entry_while_aux_base_stays_interp_base() {
         let layout = ExecLayout::fixed();
         let linker_bytes = include_bytes!(
-            "../../../crates/ax/thekernel-kernel-elf-parser/tests/ld-linux-x86-64.so.2"
+            "../../../crates/ax/tk-kernel-elf-parser/tests/ld-linux-x86-64.so.2"
         );
         // `include_bytes!` has byte alignment, while xmas-elf's legacy
         // header reader requires its input address to be naturally aligned.
@@ -1233,7 +1233,7 @@ mod tests {
     fn dynamic_elf_with_interp(path: &[u8]) -> Vec<u8> {
         assert_eq!(path.last(), Some(&0));
         let mut bytes = include_bytes!(
-            "../../../crates/ax/thekernel-kernel-elf-parser/tests/ld-linux-x86-64.so.2"
+            "../../../crates/ax/tk-kernel-elf-parser/tests/ld-linux-x86-64.so.2"
         )
         .to_vec();
         let note_index = {
@@ -1266,7 +1266,7 @@ mod tests {
             &root,
             "ld.so",
             include_bytes!(
-                "../../../crates/ax/thekernel-kernel-elf-parser/tests/ld-linux-x86-64.so.2"
+                "../../../crates/ax/tk-kernel-elf-parser/tests/ld-linux-x86-64.so.2"
             ),
         );
         (script, interpreter, dynamic_linker)

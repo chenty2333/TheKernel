@@ -14,7 +14,7 @@ pub const MAX_LINK_LAYER_ADDRESS_LEN: usize = 8;
 ///
 /// ```compile_fail
 /// use core::num::NonZeroI32;
-/// use thekernel_linux_packet::InterfaceIndex;
+/// use tk_linux_packet::InterfaceIndex;
 ///
 /// let negative = NonZeroI32::new(-1).unwrap();
 /// let _ = InterfaceIndex::Exact(negative);

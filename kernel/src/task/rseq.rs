@@ -10,7 +10,7 @@ use axhal::{
 };
 use axsync::{Mutex, spin::SpinNoIrq};
 use kernel_guard::NoPreemptIrqSave;
-use thekernel_linux_rseq::{
+use tk_linux_rseq::{
     ForkMode, ForkPlan, RestartDecision, ResumePlan, RseqArea, RseqCriticalSection, RseqDescriptor,
     RseqError, RseqEventMask, RseqRegistration, ThreadRseq, UserAddressLimit, decode_area,
     decode_critical_section,
@@ -23,9 +23,9 @@ use crate::mm::{
 
 /// Linux 7.2.3 feature extent, independent of optional slice capabilities.
 /// Legacy length-32 registrations keep their original alignment.
-pub(crate) const AT_RSEQ_FEATURE_SIZE: usize = thekernel_linux_rseq::RSEQ_ABI_SIZE;
+pub(crate) const AT_RSEQ_FEATURE_SIZE: usize = tk_linux_rseq::RSEQ_ABI_SIZE;
 /// Alignment of extended rseq areas advertised to a new user image.
-pub(crate) const AT_RSEQ_ALIGN: usize = thekernel_linux_rseq::RSEQ_ABI_ALIGN;
+pub(crate) const AT_RSEQ_ALIGN: usize = tk_linux_rseq::RSEQ_ABI_ALIGN;
 
 impl Thread {
     /// Runs one operation against this thread's serialized rseq state.
@@ -118,11 +118,11 @@ impl Thread {
         fault_user_range_task(
             aspace,
             area_address,
-            thekernel_linux_rseq::RSEQ_AREA_SIZE,
+            tk_linux_rseq::RSEQ_AREA_SIZE,
             MappingFlags::WRITE,
         )?;
 
-        let mut area_bytes = [0u8; thekernel_linux_rseq::RSEQ_AREA_SIZE];
+        let mut area_bytes = [0u8; tk_linux_rseq::RSEQ_AREA_SIZE];
         read_user_nofault_task(area_address, aspace, &mut area_bytes).map_err(
             |error| match error {
                 UserNofaultError::Retry => UserNofaultError::BadAddress,
@@ -148,10 +148,10 @@ impl Thread {
         fault_user_range_task(
             aspace,
             descriptor_address,
-            thekernel_linux_rseq::RSEQ_CS_SIZE,
+            tk_linux_rseq::RSEQ_CS_SIZE,
             MappingFlags::READ,
         )?;
-        let mut descriptor_bytes = [0u8; thekernel_linux_rseq::RSEQ_CS_SIZE];
+        let mut descriptor_bytes = [0u8; tk_linux_rseq::RSEQ_CS_SIZE];
         read_user_nofault_task(descriptor_address, aspace, &mut descriptor_bytes).map_err(
             |error| match error {
                 UserNofaultError::Retry => UserNofaultError::BadAddress,
@@ -189,7 +189,7 @@ impl Thread {
             // Keep every read and destination preflight under the same
             // address-space guard. No mapping can change between the clear
             // and publication writes once this closure starts committing.
-            let mut area_bytes = [0u8; thekernel_linux_rseq::RSEQ_AREA_SIZE];
+            let mut area_bytes = [0u8; tk_linux_rseq::RSEQ_AREA_SIZE];
             transaction.read(area_address, &mut area_bytes)?;
             let area = decode_rseq_area(&area_bytes);
 
@@ -215,7 +215,7 @@ impl Thread {
                     Ok(address) => address,
                     Err(_) => return Ok(UserReturnHookAction::Fault),
                 };
-                let mut descriptor_bytes = [0u8; thekernel_linux_rseq::RSEQ_CS_SIZE];
+                let mut descriptor_bytes = [0u8; tk_linux_rseq::RSEQ_CS_SIZE];
                 transaction.read(descriptor_address, &mut descriptor_bytes)?;
                 let critical_section = decode_rseq_critical_section(&descriptor_bytes);
                 let descriptor =
@@ -418,7 +418,7 @@ impl Drop for RseqForkReservation<'_> {
 /// An exec reservation that leaves registration/events intact on failure.
 pub(crate) struct RseqExecReservation<'a> {
     thread: &'a Thread,
-    plan: Option<thekernel_linux_rseq::ExecPlan>,
+    plan: Option<tk_linux_rseq::ExecPlan>,
 }
 
 impl RseqExecReservation<'_> {
@@ -442,12 +442,12 @@ impl Drop for RseqExecReservation<'_> {
 
 fn map_rseq_error(error: RseqError) -> AxError {
     match error.errno() {
-        thekernel_linux_rseq::ErrnoClass::InvalidArgument => AxError::InvalidInput,
-        thekernel_linux_rseq::ErrnoClass::PermissionDenied => LinuxError::EPERM.into(),
-        thekernel_linux_rseq::ErrnoClass::Busy => LinuxError::EBUSY.into(),
-        thekernel_linux_rseq::ErrnoClass::Fault => LinuxError::EFAULT.into(),
-        thekernel_linux_rseq::ErrnoClass::Stale => LinuxError::EAGAIN.into(),
-        thekernel_linux_rseq::ErrnoClass::Overflow => LinuxError::EOVERFLOW.into(),
+        tk_linux_rseq::ErrnoClass::InvalidArgument => AxError::InvalidInput,
+        tk_linux_rseq::ErrnoClass::PermissionDenied => LinuxError::EPERM.into(),
+        tk_linux_rseq::ErrnoClass::Busy => LinuxError::EBUSY.into(),
+        tk_linux_rseq::ErrnoClass::Fault => LinuxError::EFAULT.into(),
+        tk_linux_rseq::ErrnoClass::Stale => LinuxError::EAGAIN.into(),
+        tk_linux_rseq::ErrnoClass::Overflow => LinuxError::EOVERFLOW.into(),
     }
 }
 
@@ -475,12 +475,12 @@ fn map_rseq_gate_action(error: RseqError) -> UserReturnHookAction {
     }
 }
 
-fn decode_rseq_area(bytes: &[u8; thekernel_linux_rseq::RSEQ_AREA_SIZE]) -> RseqArea {
+fn decode_rseq_area(bytes: &[u8; tk_linux_rseq::RSEQ_AREA_SIZE]) -> RseqArea {
     decode_area(bytes).expect("fixed rseq area has ABI-required size")
 }
 
 fn decode_rseq_critical_section(
-    bytes: &[u8; thekernel_linux_rseq::RSEQ_CS_SIZE],
+    bytes: &[u8; tk_linux_rseq::RSEQ_CS_SIZE],
 ) -> RseqCriticalSection {
     decode_critical_section(bytes).expect("fixed rseq_cs has ABI-required size")
 }
@@ -489,7 +489,7 @@ fn decode_rseq_critical_section(
 mod tests {
     extern crate std;
 
-    use thekernel_linux_rseq::RseqRegistrationRequest;
+    use tk_linux_rseq::RseqRegistrationRequest;
 
     use super::*;
 
@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn cpu_publication_preserves_user_owned_rseq_fields() {
-        let mut area = [0u8; thekernel_linux_rseq::RSEQ_AREA_SIZE];
+        let mut area = [0u8; tk_linux_rseq::RSEQ_AREA_SIZE];
         area[8..16].copy_from_slice(&0x2000_u64.to_ne_bytes());
         area[16..20].copy_from_slice(&0xa5a5_a5a5_u32.to_ne_bytes());
         area[24..28].copy_from_slice(&0x5a5a_5a5a_u32.to_ne_bytes());
@@ -568,7 +568,7 @@ mod tests {
     fn auxv_feature_size_includes_the_complete_base_area() {
         assert_eq!(AT_RSEQ_FEATURE_SIZE, 33);
         assert_eq!(AT_RSEQ_ALIGN, 64);
-        assert_eq!(thekernel_linux_rseq::RSEQ_ABI_SIZE, 33);
+        assert_eq!(tk_linux_rseq::RSEQ_ABI_SIZE, 33);
     }
 
     #[test]

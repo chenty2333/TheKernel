@@ -1,7 +1,7 @@
 //! TheKernel errno and product-future bridge for generic readiness objects.
 //!
 //! Bounded source registration, aggregate token ownership, and object
-//! readiness traits are defined by `thekernel-axpoll`. This crate deliberately
+//! readiness traits are defined by `tk-axpoll`. This crate deliberately
 //! contains only TheKernel product policy built on that neutral contract.
 
 #![no_std]

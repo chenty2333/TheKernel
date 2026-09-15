@@ -30,7 +30,7 @@ use core::mem::size_of;
 use core::ops::Bound::{Excluded, Unbounded};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use thekernel_linux_cred::{KeyPermission, KeyPermissionMask};
+use tk_linux_cred::{KeyPermission, KeyPermissionMask};
 
 #[cfg(test)]
 use super::accounting::{

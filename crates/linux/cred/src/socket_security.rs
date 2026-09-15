@@ -150,7 +150,7 @@ impl<'a, N: UserNamespaceView, S: ?Sized> SocketFacts<'a, N, S> {
 /// so external consumers cannot replace the actor or forge a flagged type.
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::{SocketCreateContext, UserNamespaceView};
+/// use tk_linux_cred::{SocketCreateContext, UserNamespaceView};
 ///
 /// fn inspect_private_fields<N: UserNamespaceView>(context: SocketCreateContext<'_, N>) {
 ///     let SocketCreateContext { actor, spec } = context;
@@ -159,7 +159,7 @@ impl<'a, N: UserNamespaceView, S: ?Sized> SocketFacts<'a, N, S> {
 /// ```
 ///
 /// ```compile_fail
-/// use thekernel_linux_cred::{SocketCreateContext, UserNamespaceView};
+/// use tk_linux_cred::{SocketCreateContext, UserNamespaceView};
 ///
 /// fn duplicate<N: UserNamespaceView>(context: SocketCreateContext<'_, N>) {
 ///     let moved = context;

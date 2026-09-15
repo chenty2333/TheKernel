@@ -97,7 +97,7 @@ consequences are deliberate:
 * The sequence cannot hang because a clock is unavailable, and it behaves
   identically on the target and in a host test.  This kernel's platform time
   interface is registered only for `target_os = "none"`
-  (`crates/ax/thekernel-axplat-x86-pc/src/time.rs`, `impl_plat_interface` is
+  (`crates/ax/tk-axplat-x86-pc/src/time.rs`, `impl_plat_interface` is
   behind `cfg_attr(target_os = "none", ...)`), so a poll that read
   `monotonic_time` would not be host-testable at all — and the handshake's
   success path, its timeout path and its rollback are precisely what has to be
@@ -328,7 +328,7 @@ Nothing in this workstream has run on the target.  The evidence is:
 
 * **80 host tests** across `drm::intel`, of which 45 are new in this workstream
   (16 in `power.rs`, 15 in `clk.rs`, 10 in `phy.rs` and 4 in `regs.rs`), run
-  with `cargo test --locked -p thekernel-kernel --target
+  with `cargo test --locked -p tk-kernel --target
   x86_64-unknown-linux-gnu -- drm::intel`.  They drive the sequences through
   `regs::mock::MockRegisters`, which models a status bit that follows a request
   bit, one that never appears, a register that is not in the window, and a write

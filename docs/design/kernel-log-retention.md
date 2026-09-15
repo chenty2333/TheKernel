@@ -16,7 +16,7 @@ of it ran on real hardware.
 
 ## 1. The mechanism
 
-One producer path and four readers, all in `crates/ax/thekernel-axruntime/src/klog.rs`:
+One producer path and four readers, all in `crates/ax/tk-axruntime/src/klog.rs`:
 
 | Piece | What it is |
 |---|---|
@@ -159,7 +159,7 @@ tests.
 A record's text is not its own delimiter.  `Text::finish` terminates every
 record with a newline, but the text inside one may contain newlines of its own:
 the igc driver's absence report (`absence_report` in
-`crates/ax/thekernel-axdriver-net/src/igc/probe.rs`) is a single `info!` whose
+`crates/ax/tk-axdriver-net/src/igc/probe.rs`) is a single `info!` whose
 first line is the bus walk and whose second is `verdict: no supported device
 present`.
 

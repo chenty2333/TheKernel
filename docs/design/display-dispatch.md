@@ -16,10 +16,10 @@ registry / specification) whose full path is given. `[I]` marks an inference.
 
 ### 1.1 Nothing in this workspace enables the `dyn` display path
 
-`thekernel-axdriver` has a `dyn` feature whose entire purpose is to replace the static
+`tk-axdriver` has a `dyn` feature whose entire purpose is to replace the static
 driver type aliases with trait objects:
 
-`[V]` `crates/ax/thekernel-axdriver/src/structs/dyn.rs:11-13`
+`[V]` `crates/ax/tk-axdriver/src/structs/dyn.rs:11-13`
 
 ```rust
 /// The unified type of the graphics display devices.
@@ -35,7 +35,7 @@ $ grep -rn "axdriver/dyn\|axdriver?/dyn" --include=Cargo.toml .
 ```
 
 `[V]` The feature's own dependency list names a block probe and no display probe —
-`crates/ax/thekernel-axdriver/Cargo.toml:50-59`:
+`crates/ax/tk-axdriver/Cargo.toml:50-59`:
 
 ```toml
 dyn = [
@@ -51,7 +51,7 @@ dyn = [
 ```
 
 `[V]` and the only runtime probe function that exists under it enumerates block devices
-only — `crates/ax/thekernel-axdriver/src/dyn_drivers/mod.rs:27-41`:
+only — `crates/ax/tk-axdriver/src/dyn_drivers/mod.rs:27-41`:
 
 ```rust
 pub fn probe_all_devices() -> Vec<super::AxDeviceEnum> {
@@ -87,7 +87,7 @@ has, not add a second one.
 `[V]` `Cargo.toml:146` `default = ["x86-product"]`, `[V]` `Cargo.toml:156`
 `x86-product = ["qemu", "smp", "hwp-uclamp", "pmu", "perf-sampling"]`, `[V]`
 `Cargo.toml:165-169` `qemu = [ … "axfeat/display" … ]`, `[V]`
-`crates/ax/thekernel-axfeat/Cargo.toml:22-28`:
+`crates/ax/tk-axfeat/Cargo.toml:22-28`:
 
 ```toml
 display = [
@@ -100,7 +100,7 @@ display = [
 ```
 
 So the product image contains **exactly one** display driver type. `[V]`
-`crates/ax/thekernel-axdriver/src/macros.rs:21-27` turns it into the single alias:
+`crates/ax/tk-axdriver/src/macros.rs:21-27` turns it into the single alias:
 
 ```rust
 macro_rules! register_display_driver {
@@ -112,9 +112,9 @@ macro_rules! register_display_driver {
 }
 ```
 
-`[V]` invoked once, at `crates/ax/thekernel-axdriver/src/drivers.rs:52-56` with
+`[V]` invoked once, at `crates/ax/tk-axdriver/src/drivers.rs:52-56` with
 `<virtio::VirtIoGpu as VirtIoDevMeta>::Driver`. `[V]` The build script enforces the same
-singularity from the other side: `crates/ax/thekernel-axdriver/build.rs:3`
+singularity from the other side: `crates/ax/tk-axdriver/build.rs:3`
 `const DISPLAY_DEV_FEATURES: &[&str] = &["virtio-gpu"];` and `:36-58`, which emits one
 `display_dev` value or `dummy`.
 
@@ -125,8 +125,8 @@ one module — a compile error, not a second resident driver.
 
 | Provider | Where | Model |
 |---|---|---|
-| virtio-gpu | `crates/ax/thekernel-axdriver-virtio/src/gpu.rs` (`impl DisplayDriverOps` at `:70`) | `axdriver` static driver, registered through `VirtIoDevMeta` at `crates/ax/thekernel-axdriver/src/virtio.rs:153` |
-| dummy display | `crates/ax/thekernel-axdriver/src/dummy.rs:73-103` | Compiled only when `display` is on and no listed device is selected (`build.rs:36-58`). `info()` and `fb()` are `unreachable!()`; it exists to satisfy type resolution. |
+| virtio-gpu | `crates/ax/tk-axdriver-virtio/src/gpu.rs` (`impl DisplayDriverOps` at `:70`) | `axdriver` static driver, registered through `VirtIoDevMeta` at `crates/ax/tk-axdriver/src/virtio.rs:153` |
+| dummy display | `crates/ax/tk-axdriver/src/dummy.rs:73-103` | Compiled only when `display` is on and no listed device is selected (`build.rs:36-58`). `info()` and `fb()` are `unreachable!()`; it exists to satisfy type resolution. |
 | firmware aperture | `kernel/src/pseudofs/dev/bootfb.rs` | **Not an `axdriver` driver at all.** A `ScanoutSurface` built directly from `axhal::boot::framebuffer()`. |
 | Intel display engine (`8086:46d0`) | `kernel/src/drm/intel/**`, in flight | Not present in this tree. |
 
@@ -197,12 +197,12 @@ ABI and the damage tracker, and installs the fbcon's weak handle (`FBCON_DISPLAY
    output channel, so "why did the firmware aperture win" has to be answerable *from the
    screen*.
 3. **`DisplayInfo` cannot describe a scanout.** `[V]`
-   `crates/ax/thekernel-axdriver-display/src/lib.rs:26-32` is
+   `crates/ax/tk-axdriver-display/src/lib.rs:26-32` is
    `{width, height, fb_base_vaddr, fb_size}`: no pitch, no pixel format. Anything built on
    it has to fabricate a layout, which is exactly what the fbcon did twice before the
    `PixelLayout` consolidation.
 4. **There are two `ColorChannel` types and one `PixelLayout` type with no shared home.**
-   `[V]` `axhal::boot::ColorChannel` (`crates/ax/thekernel-axhal/src/lib.rs:66-71`) and
+   `[V]` `axhal::boot::ColorChannel` (`crates/ax/tk-axhal/src/lib.rs:66-71`) and
    `[V]` `crate::pseudofs::dev::scanout::ColorChannel`
    (`kernel/src/pseudofs/dev/scanout.rs:20-25`) are structurally identical, and
    `kernel/src/pseudofs/dev/bootfb.rs:50-84` converts between them field by field.
@@ -278,9 +278,9 @@ log at `0.45 s`): the DRM device takes the screen and the firmware aperture is r
 never asked.
 
 ```
-<6>[0.382711 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::entry module=thekernel_kernel::entry] registered VirtIO GPU as DRM primary device
-<6>[0.455935 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::drm::screen module=thekernel_kernel::drm::screen] scanout: candidate 'drm-primary' (rank 100) selected: 800x600 pitch 3200, because a driver published this device and presents through it
-<6>[0.456091 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::drm::screen module=thekernel_kernel::drm::screen] scanout: candidate 'firmware-aperture' (rank 200) not consulted: 'drm-primary' already won
+<6>[0.382711 cpu=Some(0) tid=Some(2) INFO target=tk_kernel::entry module=tk_kernel::entry] registered VirtIO GPU as DRM primary device
+<6>[0.455935 cpu=Some(0) tid=Some(2) INFO target=tk_kernel::drm::screen module=tk_kernel::drm::screen] scanout: candidate 'drm-primary' (rank 100) selected: 800x600 pitch 3200, because a driver published this device and presents through it
+<6>[0.456091 cpu=Some(0) tid=Some(2) INFO target=tk_kernel::drm::screen module=tk_kernel::drm::screen] scanout: candidate 'firmware-aperture' (rank 200) not consulted: 'drm-primary' already won
 ```
 
 **A machine with no display device at all** (`--graphics-profile firmware-fb`, a
@@ -290,10 +290,10 @@ log *before* the winning one, which is the only order in which a serial-less mac
 read it.
 
 ```
-<6>[0.578926 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::entry module=thekernel_kernel::entry] no DRM-capable VirtIO GPU found
-<6>[0.582261 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::drm::screen module=thekernel_kernel::drm::screen] scanout: candidate 'drm-primary' (rank 100) has nothing to offer: no DRM primary device is registered
-<6>[0.583333 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::drm::screen module=thekernel_kernel::drm::screen] Firmware framebuffer scanout: 1280x800 pitch 5120 at 0x80000000
-<6>[0.583728 cpu=Some(0) tid=Some(2) INFO target=thekernel_kernel::drm::screen module=thekernel_kernel::drm::screen] scanout: candidate 'firmware-aperture' (rank 200) selected: 1280x800 pitch 5120, because the firmware programmed this display and nothing in the kernel did
+<6>[0.578926 cpu=Some(0) tid=Some(2) INFO target=tk_kernel::entry module=tk_kernel::entry] no DRM-capable VirtIO GPU found
+<6>[0.582261 cpu=Some(0) tid=Some(2) INFO target=tk_kernel::drm::screen module=tk_kernel::drm::screen] scanout: candidate 'drm-primary' (rank 100) has nothing to offer: no DRM primary device is registered
+<6>[0.583333 cpu=Some(0) tid=Some(2) INFO target=tk_kernel::drm::screen module=tk_kernel::drm::screen] Firmware framebuffer scanout: 1280x800 pitch 5120 at 0x80000000
+<6>[0.583728 cpu=Some(0) tid=Some(2) INFO target=tk_kernel::drm::screen module=tk_kernel::drm::screen] scanout: candidate 'firmware-aperture' (rank 200) selected: 1280x800 pitch 5120, because the firmware programmed this display and nothing in the kernel did
 ```
 
 The `Firmware framebuffer scanout: …` line is the one the previous code emitted, unchanged
@@ -311,14 +311,14 @@ happened.
 **Gap: the bootloader's own rejection reason does not reach this log.** The platform parses
 Multiboot2 tag 8 into seven distinct rejections (`FramebufferRejection::Truncated`,
 `Indexed`, `Text`, `UnknownKind`, `Inconsistent`, `UnusableAddress`,
-`OverlapsUsableMemory` — `crates/ax/thekernel-axplat-x86-pc/src/boot_info.rs:172-191`) and
+`OverlapsUsableMemory` — `crates/ax/tk-axplat-x86-pc/src/boot_info.rs:172-191`) and
 reports them at `report_framebuffer` (`:385-405`), but only through `diagnostic_println!`,
-which is COM2 (`crates/ax/thekernel-axplat-x86-pc/src/lib.rs:12-16` →
+which is COM2 (`crates/ax/tk-axplat-x86-pc/src/lib.rs:12-16` →
 `console::emergency_diagnostic_print`). The N305 has no serial port, so on that machine the
 distinction is invisible, and all the kernel can say from `axhal::boot::framebuffer() ==
 None` is that there is no framebuffer. The enum and the accessor exist but are `pub(crate)`
 (`boot_info.rs:172`, `:325-327`), and `axplat_x86_pc::boot_framebuffer()` returns only
-`Option<FramebufferInfo>` (`crates/ax/thekernel-axplat-x86-pc/src/lib.rs:64-66`). Closing
+`Option<FramebufferInfo>` (`crates/ax/tk-axplat-x86-pc/src/lib.rs:64-66`). Closing
 this needs the platform crate, which this change does not own; §5.4 gives the two-line
 shape.
 
@@ -397,7 +397,7 @@ The brief allowed this to be declined with an argument. Three facts decide it:
 
 1. **The mode description type is not mine.** A timing description (pixel clock, blank and
    sync geometry, polarities, interlace) is being built in `kernel/src/drm/modes/**`, and
-   `thekernel-axdriver-display` is a mechanism-layer crate that cannot name a kernel type.
+   `tk-axdriver-display` is a mechanism-layer crate that cannot name a kernel type.
    A verb on `DisplayDriverOps` would therefore have to invent a second mode description, or
    reach for `axgpu::Mode`/`drm::kms::Mode` — a third and fourth way to say "mode" in one
    kernel. The repository has spent the last weeks removing exactly that duplication.
@@ -454,7 +454,7 @@ See the gap analysed in §3.2. Within this change's ownership the kernel's line 
 as the information it is given allows, and the fix belongs to the platform crate:
 
 ```rust
-// crates/ax/thekernel-axplat-x86-pc/src/lib.rs
+// crates/ax/tk-axplat-x86-pc/src/lib.rs
 /// Why the bootloader's framebuffer was declined, if it offered one.
 pub fn boot_framebuffer_rejection() -> Option<&'static str> { /* map the enum */ }
 ```

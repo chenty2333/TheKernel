@@ -1,0 +1,18 @@
+[package]
+publish.workspace = true
+name = "tk-axtlb"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+authors = ["TheKernel contributors"]
+description = "Bounded allocation-free SMP TLB and instruction-sync shootdown state"
+license = "Apache-2.0"
+repository.workspace = true
+readme = "README.md"
+
+[lib]
+name = "axtlb"
+path = "src/lib.rs"
+
+[package.metadata.thekernel]
+layer = "mechanism"

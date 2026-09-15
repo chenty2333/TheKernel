@@ -1,7 +1,7 @@
 """Exercise metadata policy independently of filesystem layout."""
 import unittest
 from pathlib import Path
-from tests.support import load_script_module
+from tests.support import load_script_module, test_tmpdir
 
 gate = load_script_module("cargo_dependency_layers", "scripts/ci/check_cargo_dependency_layers.py")
 
@@ -43,6 +43,39 @@ class CargoDependencyLayersTests(unittest.TestCase):
         external = package("queue", "mechanism")
         external["id"] = "registry-queue"
         self.assertEqual(self.check([package("queue", "mechanism"), external], ["queue"]), ["external dependency duplicates controlled workspace package queue"])
+
+
+class WorkspacePolicyTests(unittest.TestCase):
+    def setUp(self):
+        temporary = test_tmpdir()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        (self.root / "Cargo.toml").write_text(
+            '[workspace.package]\nrust-version = "1.100"\npublish = false\nrepository = "repo"\n')
+        self.component = self.root / "crates" / "tk-queue"
+        self.component.mkdir(parents=True)
+        self.package = package("tk-queue", "mechanism")
+        self.package.update(manifest_path=str(self.component / "Cargo.toml"),
+                            rust_version="1.100", publish=[], repository="repo")
+
+    def check(self):
+        return gate.workspace_policy_violations(
+            {"packages": [self.package], "workspace_members": [self.package["id"]]}, self.root)
+
+    def test_shared_policy_accepted(self):
+        self.assertEqual(self.check(), [])
+
+    def test_compiler_release_and_repository_drift_rejected(self):
+        self.package.update(rust_version="1.85", publish=None, repository="old")
+        self.assertEqual(len(self.check()), 3)
+
+    def test_legacy_package_name_rejected(self):
+        self.package["name"] = "thekernel-queue"
+        self.assertIn("tk- prefix", self.check()[0])
+
+    def test_nested_toolchain_override_rejected(self):
+        (self.component.parent / "rust-toolchain.toml").write_text('[toolchain]\nchannel="stable"\n')
+        self.assertIn("overrides workspace compiler", self.check()[0])
 
 
 if __name__ == "__main__":

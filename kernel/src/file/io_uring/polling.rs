@@ -326,7 +326,7 @@ impl IoUring {
             .requests
             .request(issued.id())
             .map_err(map_core_error)?;
-        if !matches!(request, thekernel_linux_io_uring::RequestState::Issued(_)) {
+        if !matches!(request, tk_linux_io_uring::RequestState::Issued(_)) {
             return Err(AxError::BadState);
         }
         let slot = issued.id().slot() as usize;
@@ -386,7 +386,7 @@ impl IoUring {
     pub(crate) fn begin_uring_cmd_handoff(&self, id: RequestId) -> AxResult<bool> {
         let mut state = self.state.lock();
         let (_, request) = state.requests.request(id).map_err(map_core_error)?;
-        if !matches!(request, thekernel_linux_io_uring::RequestState::Issued(_)) {
+        if !matches!(request, tk_linux_io_uring::RequestState::Issued(_)) {
             return Ok(false);
         }
         let owner = state
@@ -450,7 +450,7 @@ impl IoUring {
         &self,
         work: SubmissionWork,
     ) -> AxResult<DependencyDispatch> {
-        use thekernel_linux_io_uring::SubmissionLink;
+        use tk_linux_io_uring::SubmissionLink;
 
         let id = work.id();
         let dependencies = work.dependencies().unwrap_or_default();
@@ -1395,7 +1395,7 @@ impl IoUring {
                 .map_err(map_core_error)?;
             let descriptor = RequestDescriptor::new(
                 original.user_data(),
-                thekernel_linux_io_uring::RequestOperation::PollAdd,
+                tk_linux_io_uring::RequestOperation::PollAdd,
             );
             let reservation = state.requests.reserve(descriptor).map_err(map_core_error)?;
             let id = reservation.id();

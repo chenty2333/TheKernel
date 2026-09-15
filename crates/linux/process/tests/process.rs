@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use thekernel_linux_process::{ExitOutcome, ProcessDomain, ProcessError, ThreadExitOutcome};
+use tk_linux_process::{ExitOutcome, ProcessDomain, ProcessError, ThreadExitOutcome};
 
 mod common;
 use common::{Zombie, child, domain, exit_and_reap, init, zombie};
@@ -238,7 +238,7 @@ fn reparent_handoff_reselects_after_candidate_exit_between_batches() {
                 assert!(Arc::ptr_eq(batch.reaper(), &subreaper));
                 exited_candidate = true;
                 let exit = match domain.exit_thread(&subreaper, 2, 0).unwrap() {
-                    thekernel_linux_process::ThreadExitTransition::FinalThread(exit) => exit,
+                    tk_linux_process::ThreadExitTransition::FinalThread(exit) => exit,
                     _ => panic!("candidate must publish a final-exit admission"),
                 };
                 assert_eq!(
@@ -441,7 +441,7 @@ fn final_thread_exit_rejects_an_unpublished_membership_without_stranding_process
     drop(pending);
 
     let exit = match domain.exit_thread(&process, 2, 0).unwrap() {
-        thekernel_linux_process::ThreadExitTransition::FinalThread(exit) => exit,
+        tk_linux_process::ThreadExitTransition::FinalThread(exit) => exit,
         _ => panic!("last membership must prepare final exit"),
     };
     assert_eq!(

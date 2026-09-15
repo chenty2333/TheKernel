@@ -2,7 +2,7 @@ use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use axerrno::{AxError, AxResult, LinuxError};
-use thekernel_linux_keyring::{
+use tk_linux_keyring::{
     GcQuotaScratch as LinuxGcQuotaScratch, KeyError as LinuxKeyError,
     QuotaAdmission as LinuxQuotaAdmission, QuotaCharge as LinuxQuotaCharge,
     QuotaLimit as LinuxQuotaLimit, QuotaPlan as LinuxQuotaPlan, QuotaUsage as LinuxQuotaUsage,

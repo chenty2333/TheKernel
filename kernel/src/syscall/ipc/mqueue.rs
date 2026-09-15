@@ -29,9 +29,9 @@ use linux_raw_sys::general::{
 // mutex; blocking/wakeup behavior remains covered only by kernel/guest tests.
 #[cfg(test)]
 use spin::Mutex;
-use thekernel_linux_ipc::validate_priority;
-use thekernel_linux_signal::{PreparedSignal, SignalInfo, SignalRtPayload, Signo};
-use thekernel_linux_usercopy::{
+use tk_linux_ipc::validate_priority;
+use tk_linux_signal::{PreparedSignal, SignalInfo, SignalRtPayload, Signo};
+use tk_linux_usercopy::{
     UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_load_until_nul_bounded,
     vm_write_slice,
 };
@@ -1344,7 +1344,7 @@ mod tests {
     use alloc::vec;
     use core::{mem::MaybeUninit, ops::Range};
 
-    use thekernel_linux_usercopy::{UserCopyError, VmResult};
+    use tk_linux_usercopy::{UserCopyError, VmResult};
 
     use super::*;
 
@@ -1666,8 +1666,8 @@ mod tests {
         Arc<IpcNamespace>,
         Arc<Mutex<PosixMqueue>>,
         Arc<MqNotificationToken>,
-        Arc<thekernel_linux_signal::SignalQueueAccount>,
-        Arc<thekernel_linux_signal::SignalQueueAccount>,
+        Arc<tk_linux_signal::SignalQueueAccount>,
+        Arc<tk_linux_signal::SignalQueueAccount>,
     ) {
         let ipc_ns = IpcNamespace::try_new(UserNamespace::try_new_root().unwrap()).unwrap();
         let queue = Arc::new(Mutex::new(
@@ -1682,8 +1682,8 @@ mod tests {
             .unwrap(),
         ));
         let token = new_notification_token().unwrap();
-        let per_user = thekernel_linux_signal::SignalQueueAccount::try_new(4).unwrap();
-        let global = thekernel_linux_signal::SignalQueueAccount::try_new(4).unwrap();
+        let per_user = tk_linux_signal::SignalQueueAccount::try_new(4).unwrap();
+        let global = tk_linux_signal::SignalQueueAccount::try_new(4).unwrap();
         let info = SignalInfo::new_rt(Signo::SIGRTMIN, SI_MESGQ, SignalRtPayload::new(0, 0, 0));
         let prepared = PreparedSignal::try_accounted(info.clone(), &per_user, 4, &global).unwrap();
         let target_user_ns = UserNamespace::try_new_root().unwrap();

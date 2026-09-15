@@ -12,7 +12,7 @@ use linux_raw_sys::{
     general::{CAP_SYS_ADMIN, CAP_SYSLOG, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
 };
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_write_slice};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_write_slice};
 
 use super::sync::restart_futex_wait;
 use crate::{
@@ -653,7 +653,7 @@ pub fn sys_personality(persona: u32) -> AxResult<isize> {
     Ok(old as isize)
 }
 
-use thekernel_linux_syslog::{
+use tk_linux_syslog::{
     self as linux_syslog, Action as SyslogAction, Commit as SyslogCommit, Cursors as SyslogCursors,
     Plan as SyslogPlan, PlanError as SyslogPlanError,
 };
@@ -850,7 +850,7 @@ pub fn sys_restart_syscall(uctx: &UserContext) -> AxResult<isize> {
 mod tests {
     use core::{cell::Cell, mem::MaybeUninit};
 
-    use thekernel_linux_usercopy::{UserCopyError, VmResult};
+    use tk_linux_usercopy::{UserCopyError, VmResult};
 
     use super::*;
     use crate::task::{IdMapInputExtent, Kuid, UserNamespace};

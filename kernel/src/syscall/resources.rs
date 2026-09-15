@@ -6,9 +6,9 @@ use linux_raw_sys::general::{
     __kernel_old_timeval, CAP_SYS_RESOURCE, RLIM_INFINITY, RLIM_NLIMITS, RLIMIT_CPU, RLIMIT_NOFILE,
     rlimit, rlimit64, rusage,
 };
-use thekernel_linux_process::RusageSelector;
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
+use tk_linux_process::RusageSelector;
+use tk_linux_process_adapter::Pid;
+use tk_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::task::{
     AsThread, ProcessData, TaskUsage, check_current_process_prlimit_access, get_process_data,
@@ -263,7 +263,7 @@ pub fn sys_getrusage<M: UserMemory + ?Sized>(
 mod tests {
     use core::mem::MaybeUninit;
 
-    use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmResult};
+    use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmResult};
 
     use super::*;
 

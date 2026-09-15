@@ -12,7 +12,7 @@ use linux_raw_sys::general::{
     STATX_BTIME, STATX_DIOALIGN, STATX_MNT_ID, STATX_MNT_ID_UNIQUE,
     W_OK, X_OK, stat, statfs, statx, statx_timestamp,
 };
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load_until_nul};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load_until_nul};
 
 use super::ctl::validate_pathname;
 #[cfg(feature = "bpf")]

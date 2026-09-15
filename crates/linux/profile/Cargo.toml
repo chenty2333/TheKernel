@@ -1,5 +1,8 @@
 [package]
-name = "thekernel-linux-profile"
+repository.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+name = "tk-linux-profile"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"

@@ -9,7 +9,7 @@ use linux_raw_sys::general::{
     FUTEX_CMP_REQUEUE, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_WAIT, FUTEX_WAIT_BITSET,
     FUTEX_WAITV_MAX, FUTEX_WAKE, FUTEX_WAKE_BITSET, futex_waitv, robust_list_head, timespec,
 };
-use thekernel_linux_futex::{
+use tk_linux_futex::{
     Futex2Flags, FutexWaitV, parse_futex2_flags, plan_requeue, validate_requeue_flags,
 };
 

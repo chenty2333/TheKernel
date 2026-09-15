@@ -8,7 +8,7 @@ use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::*;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
-use thekernel_linux_arch_x86_64::{ArchPolicyError, PKEY_RIGHTS_MASK, PkeyPlan};
+use tk_linux_arch_x86_64::{ArchPolicyError, PKEY_RIGHTS_MASK, PkeyPlan};
 
 use crate::{
     file::{
@@ -3621,7 +3621,7 @@ mod tests {
 
     use axfs_ng_vfs::{Mountpoint, NodePermission, NodeType};
     use memory_addr::PAGE_SIZE_4K;
-    use thekernel_linux_fd::{DescriptorFlags, FdNumber, FdTable, FdTableId};
+    use tk_linux_fd::{DescriptorFlags, FdNumber, FdTable, FdTableId};
 
     use super::*;
     use crate::{

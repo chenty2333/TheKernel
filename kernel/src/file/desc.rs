@@ -24,9 +24,9 @@ use linux_raw_sys::general::{
     POLLWRBAND, POLLWRNORM, SI_SIGIO,
 };
 use spin::Mutex;
-use thekernel_linux_fd::{ExternalOffset, OfdId, OpenFileDescriptionState};
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_signal::{SignalInfo, SignalPollPayload, Signo};
+use tk_linux_fd::{ExternalOffset, OfdId, OpenFileDescriptionState};
+use tk_linux_process_adapter::Pid;
+use tk_linux_signal::{SignalInfo, SignalPollPayload, Signo};
 
 use super::{
     executable::{self, ExecutableKey},

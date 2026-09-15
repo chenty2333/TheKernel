@@ -1,4 +1,4 @@
-/// Stable policy failures returned by `thekernel-linux-io-uring`.
+/// Stable policy failures returned by `tk-linux-io-uring`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum IoUringError {

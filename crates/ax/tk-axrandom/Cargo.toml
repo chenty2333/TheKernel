@@ -1,0 +1,17 @@
+[package]
+publish.workspace = true
+name = "tk-axrandom"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+authors = ["TheKernel contributors"]
+description = "no_std ChaCha20 DRBG with caller-supplied entropy"
+license = "Apache-2.0"
+repository.workspace = true
+
+[lib]
+name = "axrandom"
+path = "src/lib.rs"
+
+[package.metadata.thekernel]
+layer = "mechanism"

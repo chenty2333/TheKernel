@@ -24,8 +24,8 @@ use axtask::current;
 use bytemuck::{Pod, Zeroable};
 use hashbrown::{HashMap, HashSet};
 use linux_raw_sys::general::{CAP_SYS_ADMIN, mount_attr};
-use thekernel_linux_mount::*;
-use thekernel_linux_usercopy::{
+use tk_linux_mount::*;
+use tk_linux_usercopy::{
     CopyStructError, UserMemory, UserMemoryContext, VmPtr, copy_struct_from_user, vm_load,
     vm_load_until_nul, vm_write_slice,
 };
@@ -4978,7 +4978,7 @@ mod tests {
             tmpfs_for_mount("mode=1788", (100, 105), &ns, 0o1777),
             Err(AxError::InvalidInput)
         ));
-        use thekernel_linux_cred::{IdMapInputExtent, Kgid, Kuid};
+        use tk_linux_cred::{IdMapInputExtent, Kgid, Kuid};
         let child = ns
             .try_fork(
                 Kuid::from_raw(100).unwrap(),

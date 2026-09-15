@@ -1,13 +1,14 @@
 [package]
-name = "thekernel-linux-vfs"
+publish.workspace = true
+name = "tk-linux-vfs"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 authors = ["朝倉水希 <asakuramizu111@gmail.com>", "Mivik <mivikq@gmail.com>", "陈天意 <hi@tychen.cc>"]
 description = "Explicit-context Linux path, DAC, setattr, and transactional VFS policy for no_std kernels"
 license = "Apache-2.0"
-repository = "https://github.com/chenty2333/thekernel-linux-abi"
-homepage = "https://github.com/chenty2333/thekernel-linux-abi"
+repository.workspace = true
+homepage = "https://github.com/chenty2333/TheKernel"
 readme = "README.md"
 keywords = ["kernel", "linux", "no-std", "vfs"]
 categories = ["no-std", "os"]

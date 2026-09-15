@@ -9,7 +9,7 @@ use linux_raw_sys::general::{
     CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, O_NONBLOCK, O_RDWR, TFD_CLOEXEC, TFD_NONBLOCK,
     TFD_TIMER_ABSTIME, TFD_TIMER_CANCEL_ON_SET, itimerspec, timespec,
 };
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::{
     file::{FileLike, add_file_like_with_flags, timerfd::TimerFd},

@@ -1110,17 +1110,17 @@ static void diagnostics_expect_filter(const char *expected)
 static void diagnostics(void)
 {
     static char retained[DIAGNOSTICS_BYTES + 1];
-    const char *narrow = "off,thekernel_kernel::syscall=debug";
+    const char *narrow = "off,tk_kernel::syscall=debug";
     char stats[2048];
     diagnostics_read_file(DIAGNOSTICS_FILTER, diagnostics_saved_filter,
                           sizeof(diagnostics_saved_filter));
     if (atexit(diagnostics_cleanup)) fail("diagnostics register cleanup");
     diagnostics_restore_filter = 1;
     if (diagnostics_write_filter(narrow)) fail("diagnostics set narrow filter");
-    diagnostics_expect_filter("off,thekernel_kernel::syscall=debug\n");
+    diagnostics_expect_filter("off,tk_kernel::syscall=debug\n");
     const char *invalid[] = {
-        "trace,thekernel_kernel::syscall=not_a_level",
-        "trace,thekernel_kernel::syscall=debug,thekernel_kernel::syscall=off",
+        "trace,tk_kernel::syscall=not_a_level",
+        "trace,tk_kernel::syscall=debug,tk_kernel::syscall=off",
         "trace,bad prefix=debug", "trace,"
     };
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
@@ -1128,7 +1128,7 @@ static void diagnostics(void)
         int result = diagnostics_write_filter(invalid[i]);
         diagnostics_require(result == -1 && errno == EINVAL,
                             "diagnostics invalid filter rejected");
-        diagnostics_expect_filter("off,thekernel_kernel::syscall=debug\n");
+        diagnostics_expect_filter("off,tk_kernel::syscall=debug\n");
     }
     /* Replacement must remove the old module override, not merge with it. */
     if (diagnostics_write_filter("off")) fail("diagnostics replace filter");
@@ -1206,7 +1206,7 @@ static void diagnostics(void)
         retained[n] = '\0';
         char expected[256];
         snprintf(expected, sizeof(expected),
-                 " DEBUG target=thekernel_kernel::syscall module=thekernel_kernel::syscall] "
+                 " DEBUG target=tk_kernel::syscall module=tk_kernel::syscall] "
                  "Syscall getpid return Ok(%ld)", pid);
         record = strstr(retained, expected);
         if (record) break;

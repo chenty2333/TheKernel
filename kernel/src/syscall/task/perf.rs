@@ -8,7 +8,7 @@ use linux_perf::{
     PERF_FLAG_FD_OUTPUT, PERF_FLAG_PID_CGROUP, PerfAttrInput, PerfCapabilities, PerfEventAttr,
     PerfEventAttrV0, PerfOpenTarget, PerfTarget,
 };
-use thekernel_linux_perf as linux_perf;
+use tk_linux_perf as linux_perf;
 
 use crate::{
     file::{
@@ -1808,12 +1808,12 @@ mod tests {
     fn scheduler_tracepoint_can_sample_every_edge_with_monotonic_time() {
         let _context = crate::test_support::scheduler_test_context();
         let attr = super::PerfEventAttr {
-            event_type: thekernel_linux_perf::PERF_TYPE_TRACEPOINT,
+            event_type: tk_linux_perf::PERF_TYPE_TRACEPOINT,
             config: crate::perf_sources::SCHED_WAKEUP_TRACEPOINT_ID,
-            read_format: thekernel_linux_perf::PERF_FORMAT_LOST,
+            read_format: tk_linux_perf::PERF_FORMAT_LOST,
             sample_period: 1,
-            sample_type: thekernel_linux_perf::PERF_SAMPLE_TIME | thekernel_linux_perf::PERF_SAMPLE_RAW,
-            flags: thekernel_linux_perf::ATTR_USE_CLOCKID,
+            sample_type: tk_linux_perf::PERF_SAMPLE_TIME | tk_linux_perf::PERF_SAMPLE_RAW,
+            flags: tk_linux_perf::ATTR_USE_CLOCKID,
             clockid: linux_raw_sys::general::CLOCK_MONOTONIC as i32,
             ..super::PerfEventAttr::default()
         };
@@ -1823,17 +1823,17 @@ mod tests {
             output_fd: -1,
             open_flags: 0,
         };
-        let (_, plan) = super::perf_plan(attr, thekernel_linux_perf::PERF_ATTR_SIZE_VER3, &[], target).unwrap();
+        let (_, plan) = super::perf_plan(attr, tk_linux_perf::PERF_ATTR_SIZE_VER3, &[], target).unwrap();
         assert_eq!(plan.sample.unwrap().period, 1);
         // The collector uses byte-watermark wakeups; zero event-count wakeups
         // above remain a separate valid Linux configuration.
         let collector = super::PerfEventAttr {
-            flags: attr.flags | thekernel_linux_perf::ATTR_WATERMARK,
+            flags: attr.flags | tk_linux_perf::ATTR_WATERMARK,
             wakeup_events: 64 * 4096 / 2,
             ..attr
         };
-        let (schema, _) = super::perf_plan(collector, thekernel_linux_perf::PERF_ATTR_SIZE_VER9, &[], target).unwrap();
-        assert_eq!(schema.wakeup, thekernel_linux_perf::Wakeup::Watermark(131072));
+        let (schema, _) = super::perf_plan(collector, tk_linux_perf::PERF_ATTR_SIZE_VER9, &[], target).unwrap();
+        assert_eq!(schema.wakeup, tk_linux_perf::Wakeup::Watermark(131072));
     }
 
     #[test]
@@ -1846,22 +1846,22 @@ mod tests {
             open_flags: 0,
         };
         let mut attr = super::PerfEventAttr {
-            event_type: thekernel_linux_perf::PERF_TYPE_SOFTWARE,
-            config: thekernel_linux_perf::PERF_COUNT_SW_CPU_CLOCK,
-            flags: thekernel_linux_perf::ATTR_USE_CLOCKID,
+            event_type: tk_linux_perf::PERF_TYPE_SOFTWARE,
+            config: tk_linux_perf::PERF_COUNT_SW_CPU_CLOCK,
+            flags: tk_linux_perf::ATTR_USE_CLOCKID,
             clockid: linux_raw_sys::general::CLOCK_MONOTONIC as i32,
             ..super::PerfEventAttr::default()
         };
-        assert!(super::perf_plan(attr, thekernel_linux_perf::PERF_ATTR_SIZE_VER3, &[], target).is_ok());
+        assert!(super::perf_plan(attr, tk_linux_perf::PERF_ATTR_SIZE_VER3, &[], target).is_ok());
         for clockid in [-1, 0, 2, 4, 7] {
             attr.clockid = clockid;
             assert!(matches!(
-                super::perf_plan(attr, thekernel_linux_perf::PERF_ATTR_SIZE_VER3, &[], target),
+                super::perf_plan(attr, tk_linux_perf::PERF_ATTR_SIZE_VER3, &[], target),
                 Err(AxError::OperationNotSupported),
             ));
         }
         attr.flags = 0;
-        assert!(super::perf_plan(attr, thekernel_linux_perf::PERF_ATTR_SIZE_VER3, &[], target).is_ok());
+        assert!(super::perf_plan(attr, tk_linux_perf::PERF_ATTR_SIZE_VER3, &[], target).is_ok());
     }
 
     #[test]
@@ -1903,11 +1903,11 @@ mod tests {
     #[test]
     fn task_any_cpu_keeps_the_negative_one_selector_out_of_cpu_bounds_checks() {
         assert!(super::readonly_target_is_owned(
-            thekernel_linux_perf::PerfTarget::Cpu { cpu: 3 },
+            tk_linux_perf::PerfTarget::Cpu { cpu: 3 },
             3,
         ));
         assert!(!super::readonly_target_is_owned(
-            thekernel_linux_perf::PerfTarget::Task { pid: 1, cpu: -1 },
+            tk_linux_perf::PerfTarget::Task { pid: 1, cpu: -1 },
             3,
         ));
     }
@@ -1915,7 +1915,7 @@ mod tests {
     #[cfg(feature = "perf-sampling")]
     #[test]
     fn source_sampling_never_accepts_pebs_or_lbr_only_fields() {
-        use thekernel_linux_perf::{
+        use tk_linux_perf::{
             PERF_SAMPLE_ADDR, PERF_SAMPLE_BRANCH_STACK, PERF_SAMPLE_DATA_SRC, PerfEventAttr,
         };
 
@@ -1951,7 +1951,7 @@ mod tests {
         };
         assert!(super::sampling_fields_supported_by_backend(&pebs, hardware));
         let overprecise = PerfEventAttr {
-            flags: thekernel_linux_perf::ATTR_PRECISE_IP,
+            flags: tk_linux_perf::ATTR_PRECISE_IP,
             sample_type: PERF_SAMPLE_ADDR | PERF_SAMPLE_DATA_SRC,
             ..PerfEventAttr::default()
         };

@@ -9,7 +9,7 @@ use axhal::{
 use axpoll::IoEvents;
 use axtask::current;
 use linux_raw_sys::general::{POLLNVAL, RLIMIT_NOFILE, pollfd, timespec};
-use thekernel_linux_signal::SignalSet;
+use tk_linux_signal::SignalSet;
 
 use super::{FdPollSet, io_to_linux_poll, linux_poll_events, wait_io_result, wait_signal_only};
 use crate::{

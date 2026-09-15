@@ -1,6 +1,6 @@
-# thekernel-linux-packet
+# tk-linux-packet
 
-`thekernel-linux-packet` is a dependency-free, `no_std`, `forbid(unsafe_code)`
+`tk-linux-packet` is a dependency-free, `no_std`, `forbid(unsafe_code)`
 Layer 2 policy core for the first ordinary-queue slice of Linux `AF_PACKET`.
 It accepts copied scalar values and caller-owned device facts; it never reads
 userspace memory, a current task, an FD table, a network namespace, a device
@@ -101,4 +101,7 @@ drop cmsgs. Every known option outside ignore-outgoing and statistics is
 rejected explicitly rather than silently accepted. Package existence is not a
 claim that a consumer exposes `AF_PACKET` yet.
 
-The package supports stable Rust 1.85 and x86_64 consumers.
+The crate uses the root-pinned `nightly-2026-08-23` toolchain
+(`rustc 1.100.0-nightly`, commit `c54751567`, dated 2026-08-22).
+`rust-version` inherits the workspace's `1.100`; this is not a stable-Rust
+compatibility guarantee. The supported target is x86_64.

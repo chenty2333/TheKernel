@@ -4,7 +4,7 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{FsPathBuf, Location};
 use axtask::current;
 use linux_raw_sys::general::{AT_FDCWD, CAP_SYS_ADMIN, O_RDWR};
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, vm_load_until_nul};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, vm_load_until_nul};
 
 use crate::{
     file::{

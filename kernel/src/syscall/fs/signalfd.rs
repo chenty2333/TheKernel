@@ -3,8 +3,8 @@ use core::mem::size_of;
 use axerrno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{O_CLOEXEC, O_NONBLOCK, O_RDWR};
-use thekernel_linux_signal::SignalSet;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
+use tk_linux_signal::SignalSet;
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
 
 use crate::{
     file::{FileLike, add_file_like_with_flags, signalfd::Signalfd},

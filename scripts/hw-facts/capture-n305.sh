@@ -6,7 +6,7 @@
 #   boot a live Linux install on the target machine, run this script, and ship
 #   the resulting tarball back to the development host.  tools/hw_facts.py turns
 #   that tarball into the ground truth we need in order to replace the kernel's
-#   hardcoded PCIe ECAM base (crates/ax/thekernel-axplat-x86-pc/axconfig.toml
+#   hardcoded PCIe ECAM base (crates/ax/tk-axplat-x86-pc/axconfig.toml
 #   currently guesses 0xb000_0000) and to write a native driver for the
 #   Alder Lake-N Gen12 Xe-LP iGPU (8086:46d0).
 #

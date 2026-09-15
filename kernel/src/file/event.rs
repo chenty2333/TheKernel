@@ -6,7 +6,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
-use thekernel_linux_fd::{EVENTFD_COUNTER_MAX, EventFdPlan, EventFdSnapshot};
+use tk_linux_fd::{EVENTFD_COUNTER_MAX, EventFdPlan, EventFdSnapshot};
 
 use crate::{
     file::{FileLike, IoDst, IoSrc, Kstat, anon_inode_stat},

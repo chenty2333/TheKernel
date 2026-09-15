@@ -3,8 +3,8 @@
 use core::mem::{offset_of, size_of};
 
 use axerrno::{AxError, AxResult};
-use thekernel_linux_bpf::{BpfAttr as LinuxBpfAttr, BpfCommand, MapCreateRequest};
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+use tk_linux_bpf::{BpfAttr as LinuxBpfAttr, BpfCommand, MapCreateRequest};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use crate::{
     bpf::{alloc_map_id, defs::*, map, read_bpf_attr, register_map_id, require_bpf_attr_range},

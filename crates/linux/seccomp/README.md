@@ -1,6 +1,6 @@
-# thekernel-linux-seccomp
+# tk-linux-seccomp
 
-`thekernel-linux-seccomp` is a `no_std`, `forbid(unsafe_code)` Linux seccomp
+`tk-linux-seccomp` is a `no_std`, `forbid(unsafe_code)` Linux seccomp
 policy core. It accepts only already copied syscall/filter values and delegates
 generic cBPF execution through an explicit executor port; it never dereferences
 userspace or obtains an implicit current task, credential, thread group, or
@@ -106,6 +106,8 @@ single-task publication, and per-sibling synchronization eligibility. It does
 not freeze a task/thread-group lock, credential slot, signal or ptrace model,
 audit sink, listener protocol, JIT, eBPF subsystem, or packet-filter adapter.
 
-The crate requires TheKernel's rolling nightly because fallible standard `Arc`
-allocation currently uses `allocator_api`. It is checked as a `no_std`
-consumer on x86_64.
+The crate uses the root-pinned `nightly-2026-08-23` toolchain
+(`rustc 1.100.0-nightly`, commit `c54751567`, dated 2026-08-22).
+`rust-version` inherits the workspace's `1.100`; this is not a stable-Rust
+compatibility guarantee. Fallible standard `Arc` allocation uses `allocator_api`.
+It is checked as a `no_std` consumer on x86_64.

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use thekernel_linux_process::{Process, ProcessDomain};
+use tk_linux_process::{Process, ProcessDomain};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Zombie {

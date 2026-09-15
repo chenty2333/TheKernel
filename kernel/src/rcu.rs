@@ -10,7 +10,7 @@ use axconfig::plat::MAX_CPU_NUM;
 use axerrno::{AxError, AxResult};
 use axrcu::{EpochDomain, EpochPlatform, RcuError, RcuSlot};
 use kernel_guard::{IrqSave, NoPreempt};
-use thekernel_linux_seccomp::SeccompState;
+use tk_linux_seccomp::SeccompState;
 
 pub(crate) const CREDENTIAL_RETIRE_CAPACITY: usize = 128;
 pub(crate) const SECCOMP_RETIRE_CAPACITY: usize = 128;

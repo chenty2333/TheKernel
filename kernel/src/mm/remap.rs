@@ -7,7 +7,7 @@ use axhal::paging::{MappingFlags, PageSize};
 use linux_raw_sys::general::RLIMIT_MEMLOCK;
 use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange};
 use memory_set::MappingLineage;
-use thekernel_linux_mm::{MemlockLimit, MemlockPlan, PageRange as LinuxPageRange, RemapGeometry};
+use tk_linux_mm::{MemlockLimit, MemlockPlan, PageRange as LinuxPageRange, RemapGeometry};
 
 use crate::{
     mm::{

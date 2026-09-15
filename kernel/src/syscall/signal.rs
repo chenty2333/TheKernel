@@ -14,9 +14,9 @@ use linux_raw_sys::general::{
     MINSIGSTKSZ, SI_TKILL, SI_USER, SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SS_AUTODISARM, SS_DISABLE,
     SS_ONSTACK, siginfo, timespec,
 };
-use thekernel_linux_arch_x86_64::{CetRestore, cet_signal_restore_ssp};
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_signal::{
+use tk_linux_arch_x86_64::{CetRestore, cet_signal_restore_ssp};
+use tk_linux_process_adapter::Pid;
+use tk_linux_signal::{
     RawSignalAction, SignalAction, SignalInfo, SignalSet, SignalStack, SignalStackRestoreError,
     Signo,
     api::{
@@ -25,7 +25,7 @@ use thekernel_linux_signal::{
     },
     arch::XsaveState64,
 };
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::{
     mm::{AddressSpaceUserMemory, map_usercopy_error},
@@ -1217,10 +1217,10 @@ pub(crate) fn snapshot_signal_fpstate() -> Result<SignalFpState, SignalFrameLayo
     })?;
     let state = XsaveState64::try_from_xsave_prefix(image.as_bytes(), image.layout().xfeatures)
         .map_err(|error| match error {
-            thekernel_linux_signal::arch::XsaveStateError::Allocation => {
+            tk_linux_signal::arch::XsaveStateError::Allocation => {
                 SignalFrameLayoutError::Allocation
             }
-            thekernel_linux_signal::arch::XsaveStateError::InvalidExtent => {
+            tk_linux_signal::arch::XsaveStateError::InvalidExtent => {
                 SignalFrameLayoutError::XsaveUnavailable
             }
         })?;
@@ -1761,7 +1761,7 @@ pub fn sys_rt_sigtimedwait<M: UserMemory + ?Sized>(
                                 #[cfg(target_arch = "x86_64")]
                                 if matches!(
                                     delivered.os_action,
-                                    thekernel_linux_signal::SignalOSAction::Handler
+                                    tk_linux_signal::SignalOSAction::Handler
                                 ) && let Err(error) = crate::task::publish_cet_signal_frame(
                                     thr,
                                     delivered
@@ -1992,7 +1992,7 @@ mod tests {
     use linux_raw_sys::general::{
         MINSIGSTKSZ, SI_TKILL, SI_USER, SS_AUTODISARM, SS_DISABLE, SS_ONSTACK,
     };
-    use thekernel_linux_signal::{
+    use tk_linux_signal::{
         RawSignalAction, SignalAction, SignalActionFlags, SignalDisposition, SignalInfo, SignalSet,
         SignalStack, Signo,
     };

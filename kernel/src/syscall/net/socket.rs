@@ -23,7 +23,7 @@ use linux_raw_sys::{
         SOCK_SEQPACKET, SOCK_STREAM, sockaddr, socklen_t,
     },
 };
-use thekernel_linux_net::{SocketFailure, socket_failure_errno};
+use tk_linux_net::{SocketFailure, socket_failure_errno};
 
 use super::{
     SocketSyscallSnapshot,
@@ -362,15 +362,15 @@ fn validate_packet_create_after_capability(
     ty: u32,
     proto: u32,
 ) -> AxResult<(
-    thekernel_linux_packet::PacketSocketType,
-    thekernel_linux_packet::ProtocolSelector,
+    tk_linux_packet::PacketSocketType,
+    tk_linux_packet::ProtocolSelector,
 )> {
     if !capability_granted {
         return Err(LinuxError::EPERM.into());
     }
     let socket_type =
-        thekernel_linux_packet::PacketSocketType::from_raw(ty as i32).map_err(packet_error)?;
-    let protocol = thekernel_linux_packet::ProtocolSelector::from_network_order_i32(proto as i32);
+        tk_linux_packet::PacketSocketType::from_raw(ty as i32).map_err(packet_error)?;
+    let protocol = tk_linux_packet::ProtocolSelector::from_network_order_i32(proto as i32);
     Ok((socket_type, protocol))
 }
 

@@ -3,9 +3,9 @@ use axhal::uspace::{
 };
 use axtask::{TaskCreateError, TaskInner};
 use linux_raw_sys::general::{BUS_ADRERR, BUS_MCEERR_AO, BUS_MCEERR_AR, SEGV_ACCERR, SEGV_MAPERR};
-use thekernel_linux_arch_x86_64::SEGV_CPERR;
-use thekernel_linux_process_adapter::{LINUX_PID_MAX, Pid, try_pid_from_task_id};
-use thekernel_linux_signal::{SignalInfo, Signo};
+use tk_linux_arch_x86_64::SEGV_CPERR;
+use tk_linux_process_adapter::{LINUX_PID_MAX, Pid, try_pid_from_task_id};
+use tk_linux_signal::{SignalInfo, Signo};
 
 use super::{
     AsThread, TimerState, check_signals, do_exit, fail_closed_exit,

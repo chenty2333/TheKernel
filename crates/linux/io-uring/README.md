@@ -1,6 +1,6 @@
-# thekernel-linux-io-uring
+# tk-linux-io-uring
 
-`thekernel-linux-io-uring` is a `no_std`, `forbid(unsafe_code)` policy and
+`tk-linux-io-uring` is a `no_std`, `forbid(unsafe_code)` policy and
 lifecycle core for a bounded Linux `io_uring` implementation. It accepts
 already copied ABI bytes and caller-owned mechanism facts; it never
 dereferences shared userspace memory or obtains an implicit current task, FD

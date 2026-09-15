@@ -14,8 +14,8 @@ use linux_raw_sys::{
     ctypes::{c_int, c_ulong, c_ushort},
     general::*,
 };
-use thekernel_linux_ipc::{SemBuf as AbiSemBuf, plan_sem_op};
-use thekernel_linux_usercopy::{
+use tk_linux_ipc::{SemBuf as AbiSemBuf, plan_sem_op};
+use tk_linux_usercopy::{
     UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
 };
 
@@ -1239,7 +1239,7 @@ fn wait_for_sem(
 
 fn op_has_nowait(ops: &[Sembuf]) -> bool {
     ops.iter()
-        .any(|op| op.sem_flg & thekernel_linux_ipc::IPC_NOWAIT as i16 != 0)
+        .any(|op| op.sem_flg & tk_linux_ipc::IPC_NOWAIT as i16 != 0)
 }
 
 pub fn sys_semop<M: UserMemory + ?Sized>(
@@ -1366,7 +1366,7 @@ mod setall_snapshot_tests {
         sync::atomic::{AtomicBool, Ordering},
     };
 
-    use thekernel_linux_usercopy::{UserCopyError, VmResult};
+    use tk_linux_usercopy::{UserCopyError, VmResult};
 
     use super::*;
     use crate::task::{Cred, UserNamespace};

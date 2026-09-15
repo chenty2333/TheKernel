@@ -1,4 +1,4 @@
-/// Stable policy failures returned by `thekernel-linux-mm`.
+/// Stable policy failures returned by `tk-linux-mm`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum MmError {

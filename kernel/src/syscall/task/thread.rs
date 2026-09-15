@@ -88,7 +88,7 @@ pub fn sys_getppid() -> AxResult<isize> {
 }
 
 fn render_parent_pid<C, R>(
-    parent: Option<&thekernel_linux_process_adapter::Process<C, R>>,
+    parent: Option<&tk_linux_process_adapter::Process<C, R>>,
     caller_pid_ns: &crate::task::PidNamespace,
 ) -> isize {
     let Some(parent) = parent else {
@@ -425,7 +425,7 @@ mod tests {
         // kernel process reaches PID visibility through the paired namespace
         // reservation, which binds it in every ancestor at publication.
         let child_pid_binding = child_pid_ns.reserve_process(20).unwrap();
-        let domain = thekernel_linux_process_adapter::ProcessDomain::<()>::try_new().unwrap();
+        let domain = tk_linux_process_adapter::ProcessDomain::<()>::try_new().unwrap();
         let init = domain
             .try_new_init_with_identity(1, None, root_pid_ns.clone())
             .unwrap();

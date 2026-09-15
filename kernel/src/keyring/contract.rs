@@ -1,7 +1,7 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use axerrno::{AxError, AxResult};
-use thekernel_linux_cred::KeyPermissionMask;
+use tk_linux_cred::KeyPermissionMask;
 
 use super::KeyTypeKind;
 use crate::task::{Credentials, DacCredentialView, Kgid, Kuid, UserGid, UserNamespace, UserUid};

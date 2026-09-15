@@ -1,0 +1,17 @@
+[package]
+publish.workspace = true
+name = "tk-axexec"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+authors = ["TheKernel contributors"]
+description = "Backend-neutral no_std W^X executable allocation lifecycle"
+license = "Apache-2.0"
+repository.workspace = true
+
+[lib]
+name = "axexec"
+path = "src/lib.rs"
+
+[package.metadata.thekernel]
+layer = "mechanism"

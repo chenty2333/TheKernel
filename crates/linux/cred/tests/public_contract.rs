@@ -1,6 +1,6 @@
 use std::{string::String, sync::Arc};
 
-use thekernel_linux_cred::{
+use tk_linux_cred::{
     CAPABILITY_WORDS, CapabilityNumber, CapabilitySecurityOperation, CapabilitySets,
     CapsetAuthority, CapsetRequest, ContentWriteMode, ContentWriteSetIdAuthority,
     ContentWriteSetIdCleanup, CredError, Credential, CredentialPublicationContext,
@@ -222,7 +222,7 @@ fn overridden_dac_credential(
     )
 }
 
-fn parsed_file_capabilities() -> thekernel_linux_cred::FileCapabilities {
+fn parsed_file_capabilities() -> tk_linux_cred::FileCapabilities {
     // Linux VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE, with CAP_CHOWN in
     // the permitted low word and every other capability word empty.
     let record = [
@@ -598,7 +598,7 @@ fn capable_and_credential_publication_contracts_are_publicly_composable() {
             CapabilitySecurityOperation::Use,
         )
         .err(),
-        Some(thekernel_linux_cred::AuthorizationError::NotPermitted)
+        Some(tk_linux_cred::AuthorizationError::NotPermitted)
     );
 
     let fork_target = NonCopyObject {

@@ -3,7 +3,7 @@
 //! Lifecycle code supplies stable process/MM snapshots; this module owns the
 //! exact native-endian bodies, eight-byte padding, and SAMPLE_ID_ALL trailer.
 
-use thekernel_linux_perf::{
+use tk_linux_perf::{
     PERF_RECORD_COMM, PERF_RECORD_EXIT, PERF_RECORD_FORK, PERF_RECORD_MISC_USER, PERF_RECORD_MMAP,
     PERF_RECORD_MMAP2, PERF_RECORD_READ, PERF_RECORD_SWITCH, PERF_RECORD_SWITCH_CPU_WIDE,
     PerfRecordHeader,

@@ -1,12 +1,13 @@
 [package]
-name = "thekernel-linux-sched"
+publish.workspace = true
+name = "tk-linux-sched"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 authors = ["朝倉水希 <asakuramizu111@gmail.com>", "Mivik <mivikq@gmail.com>", "陈天意 <hi@tychen.cc>"]
 license = "Apache-2.0"
-repository = "https://github.com/chenty2333/thekernel-linux-abi"
-homepage = "https://github.com/chenty2333/thekernel-linux-abi"
+repository.workspace = true
+homepage = "https://github.com/chenty2333/TheKernel"
 description = "Pure Linux scheduler attribute validation policy"
 keywords = ["linux", "scheduler", "no-std"]
 categories = ["no-std", "os"]

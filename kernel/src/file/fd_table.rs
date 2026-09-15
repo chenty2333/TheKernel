@@ -8,13 +8,13 @@ use axerrno::{AxError, AxResult};
 use axtask::current;
 use linux_raw_sys::general::RLIMIT_NOFILE;
 use spin::{Mutex, RwLock};
-pub(crate) use thekernel_linux_fd::FdTableId;
-use thekernel_linux_fd::{
+pub(crate) use tk_linux_fd::FdTableId;
+use tk_linux_fd::{
     CloseBatch as LinuxCloseBatch, DescriptorFlags, FdNumber, FdTable as LinuxFdTable,
     FdTableError, PreparedCloseOnExec as LinuxPreparedCloseOnExec,
     PreparedPublication as LinuxPreparedPublication, ReservationToken,
 };
-use thekernel_linux_process_adapter::Pid;
+use tk_linux_process_adapter::Pid;
 
 use super::{
     desc::{

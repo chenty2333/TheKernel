@@ -1,12 +1,14 @@
 [package]
-name = "thekernel-linux-signal"
+publish.workspace = true
+rust-version.workspace = true
+name = "tk-linux-signal"
 version = "0.1.0"
 edition = "2024"
 authors = ["朝倉水希 <asakuramizu111@gmail.com>", "Mivik <mivikq@gmail.com>", "陈天意 <hi@tychen.cc>"]
 description = "Bounded signal queues and explicit-usercopy frames for no_std Linux ABI kernels"
 license = "Apache-2.0"
-repository = "https://github.com/chenty2333/thekernel-linux-abi"
-homepage = "https://github.com/chenty2333/thekernel-linux-abi"
+repository.workspace = true
+homepage = "https://github.com/chenty2333/TheKernel"
 readme = "README.md"
 keywords = ["kernel", "linux", "no-std", "signal"]
 categories = ["no-std", "os"]
@@ -22,7 +24,7 @@ linux-raw-sys = { version = "0.12", default-features = false, features = ["gener
 log = "0.4"
 spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex"] }
 strum = { version = "0.27", default-features = false, features = ["derive"] }
-thekernel-linux-usercopy = { path = "../usercopy", version = "0.1" }
+tk-linux-usercopy = { path = "../usercopy", version = "0.1" }
 x86_64 = { version = "=0.15.5", default-features = false }
 
 [package.metadata.docs.rs]
@@ -30,8 +32,8 @@ all-features = true
 
 [package.metadata.thekernel]
 layer = "linux_abi"
-# The workspace selects the rolling nightly toolchain; this crate only needs
-# the allocator_api nightly feature and intentionally does not pin a date.
+# The root rust-toolchain.toml pins nightly-2026-08-23 (rustc 1.100.0-nightly).
+# The inherited rust-version is not a stable-Rust promise; allocator_api is required.
 toolchain = "nightly"
 nightly-features = ["allocator_api"]
 

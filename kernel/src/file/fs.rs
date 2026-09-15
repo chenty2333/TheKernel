@@ -27,7 +27,7 @@ use linux_raw_sys::{
     },
     ioctl::{FICLONE, FICLONERANGE, FIDEDUPERANGE},
 };
-use thekernel_linux_signal::{SignalInfo, Signo};
+use tk_linux_signal::{SignalInfo, Signo};
 
 use super::{
     FileHandle, FileLike, FileMmapRequest, IoctlContext, Kstat, OfdIoStatus, PreparedFileMmap,

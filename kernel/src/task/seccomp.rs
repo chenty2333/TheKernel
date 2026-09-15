@@ -6,8 +6,8 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axrcu::{ClearError, PublishError, RcuError};
 use axsync::Mutex;
 use spin::Once;
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_seccomp::{
+use tk_linux_process_adapter::Pid;
+use tk_linux_seccomp::{
     FilterBudget, FilterChain, SeccompMode, SeccompState, StateTransitionError,
 };
 
@@ -447,7 +447,7 @@ mod tests {
     use alloc::{sync::Arc, vec};
 
     use spin::Mutex;
-    use thekernel_linux_seccomp::{
+    use tk_linux_seccomp::{
         ClassicBpfInstruction, FilterMetadata, SECCOMP_RET_ALLOW, VerifiedProgram,
     };
 
@@ -627,7 +627,7 @@ mod tests {
         assert_eq!(child.filter_count(), 1);
         assert_eq!(
             child
-                .evaluate(&thekernel_linux_seccomp::SeccompData {
+                .evaluate(&tk_linux_seccomp::SeccompData {
                     number: 0,
                     architecture: 0xc000_003e,
                     instruction_pointer: 0,

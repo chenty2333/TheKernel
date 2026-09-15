@@ -1,6 +1,6 @@
 //! Link, unlink, move, revoke, and clear operations over keyrings.
 
-use thekernel_linux_keyring::{
+use tk_linux_keyring::{
     KeyError as LinuxKeyError, KeyGraph as LinuxKeyGraph, KeyId as LinuxKeyId,
     KeyKind as LinuxKeyKind, KeyMeta as LinuxKeyMeta, KeyPermissions as LinuxKeyPermissions,
     plan_link,

@@ -2,7 +2,7 @@
 //!
 //! This file owns only Layer 3 glue: namespace retention, lower-endpoint
 //! publication, errno conversion, ordinary queue copies, and file readiness.
-//! Linux value/state rules remain in `thekernel-linux-packet`; packet capture,
+//! Linux value/state rules remain in `tk-linux-packet`; packet capture,
 //! injection, queue budgets, and wake registration remain in `axnet-ng`.
 //! TPACKET frame and block rings are backed by AX-owned shared pages and fanout selection
 //! occurs in the broker before endpoint enqueue. Ordinary endpoint statistics
@@ -31,14 +31,14 @@ use axnet::{
 use axpoll::{IoEvents, PollSet, Pollable, PreparedPollRegistration};
 use axsync::{Mutex, MutexGuard};
 use axtask::future::{TimerRegistrationError, sleep_until};
-use thekernel_linux_packet::{
+use tk_linux_packet::{
     FrameLayout, GetPacketOption, InterfaceIndex, LinkLayerAddress, LinkLayerInfo,
     PacketBindRequest, PacketBinding, PacketError, PacketOptionValue, PacketSendAddress,
     PacketSocketState, PacketSocketType, PacketStatistics, PacketType, ProtocolSelector,
     ReceiveFlags, SetPacketOption, SockAddrLl,
 };
 #[cfg(test)]
-use thekernel_linux_packet::{SocketFilterAncillary, encoded_socket_filter_ancillary};
+use tk_linux_packet::{SocketFilterAncillary, encoded_socket_filter_ancillary};
 
 use super::{
     FileLike, FileMmapProtection, FileMmapRequest, FixedSharedMmapRegion, IoDst, IoSrc,

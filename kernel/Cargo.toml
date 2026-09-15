@@ -1,5 +1,7 @@
 [package]
-name = "thekernel-kernel"
+publish.workspace = true
+rust-version.workspace = true
+name = "tk-kernel"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
@@ -12,7 +14,7 @@ repository.workspace = true
 workspace = true
 
 [features]
-bpf = ["dep:axbpf", "dep:thekernel-linux-bpf", "perf-sampling"]
+bpf = ["dep:axbpf", "dep:tk-linux-bpf", "perf-sampling"]
 # The Intel i225/i226 (igc) work.  Selected by an explicit build flag rather
 # than by the platform profile, because the product's network device is
 # `virtio-net` and the two cannot both be the one static NIC type.
@@ -96,31 +98,31 @@ axbpf = { workspace = true, optional = true }
 axexec.workspace = true
 axgpu.workspace = true
 axrandom.workspace = true
-thekernel-linux-cred.workspace = true
-thekernel-linux-fd.workspace = true
-thekernel-linux-io-uring.workspace = true
-thekernel-linux-mm.workspace = true
-thekernel-linux-packet.workspace = true
-thekernel-linux-process.workspace = true
-thekernel-linux-rseq.workspace = true
-thekernel-linux-seccomp.workspace = true
-thekernel-linux-signal.workspace = true
-thekernel-linux-usercopy = { workspace = true, features = ["alloc"] }
-thekernel-linux-sched.workspace = true
-thekernel-linux-perf.workspace = true
-thekernel-linux-time.workspace = true
-thekernel-linux-net.workspace = true
-thekernel-linux-futex.workspace = true
-thekernel-linux-ipc.workspace = true
-thekernel-linux-arch-x86-64.workspace = true
-thekernel-linux-bpf = { workspace = true, optional = true }
-thekernel-linux-keyring.workspace = true
-thekernel-linux-landlock.workspace = true
-thekernel-linux-fsnotify.workspace = true
-thekernel-linux-mount.workspace = true
-thekernel-linux-drm.workspace = true
-thekernel-linux-aio.workspace = true
-thekernel-linux-syslog.workspace = true
+tk-linux-cred.workspace = true
+tk-linux-fd.workspace = true
+tk-linux-io-uring.workspace = true
+tk-linux-mm.workspace = true
+tk-linux-packet.workspace = true
+tk-linux-process.workspace = true
+tk-linux-rseq.workspace = true
+tk-linux-seccomp.workspace = true
+tk-linux-signal.workspace = true
+tk-linux-usercopy = { workspace = true, features = ["alloc"] }
+tk-linux-sched.workspace = true
+tk-linux-perf.workspace = true
+tk-linux-time.workspace = true
+tk-linux-net.workspace = true
+tk-linux-futex.workspace = true
+tk-linux-ipc.workspace = true
+tk-linux-arch-x86-64.workspace = true
+tk-linux-bpf = { workspace = true, optional = true }
+tk-linux-keyring.workspace = true
+tk-linux-landlock.workspace = true
+tk-linux-fsnotify.workspace = true
+tk-linux-mount.workspace = true
+tk-linux-drm.workspace = true
+tk-linux-aio.workspace = true
+tk-linux-syslog.workspace = true
 axtlb.workspace = true
 bitflags = "2.10"
 bitmaps = { version = "3.2", default-features = false }
@@ -174,8 +176,8 @@ ruzstd = { version = "0.8.3", default-features = false }
 scope-local.workspace = true
 slab = { version = "0.4.9", default-features = false }
 spin = "0.10"
-thekernel-linux-process-adapter.workspace = true
-thekernel-linux-profile.workspace = true
+tk-linux-process-adapter.workspace = true
+tk-linux-profile.workspace = true
 strum = { version = "0.28", default-features = false, features = ["derive"] }
 syscalls = { version = "0.8", default-features = false }
 

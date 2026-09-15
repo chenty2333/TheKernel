@@ -1,0 +1,25 @@
+[package]
+publish.workspace = true
+name = "tk-axpmu"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+authors = ["TheKernel contributors"]
+description = "Bounded opt-in PMU sessions for no_std operating systems"
+license = "Apache-2.0"
+repository.workspace = true
+readme = "README.md"
+
+[lib]
+name = "axpmu"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-unknown-none"
+
+[package.metadata.thekernel]
+layer = "mechanism"

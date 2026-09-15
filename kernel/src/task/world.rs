@@ -4,7 +4,7 @@
 //! select providers or create a second resource-lifetime registry.
 
 use spin::Lazy;
-use thekernel_linux_profile::{BoundProfile, Capability, LinuxProfile, Port, ResourceLimits};
+use tk_linux_profile::{BoundProfile, Capability, LinuxProfile, Port, ResourceLimits};
 
 /// The kernel owns the immutable composition; Linux namespaces and existing
 /// per-process accounts continue to own their own registries and budgets.
@@ -23,8 +23,8 @@ static BOOT_WORLD: Lazy<WorldContext> = Lazy::new(|| {
             Capability::Seccomp,
         ],
         limits: ResourceLimits {
-            io_uring_entries: thekernel_linux_io_uring::IORING_MAX_ENTRIES,
-            registered_buffers: thekernel_linux_io_uring::IORING_MAX_REGISTERED_BUFFERS,
+            io_uring_entries: tk_linux_io_uring::IORING_MAX_ENTRIES,
+            registered_buffers: tk_linux_io_uring::IORING_MAX_REGISTERED_BUFFERS,
         },
     }
     .bind(&[
@@ -81,6 +81,6 @@ mod tests {
         let profile = WorldId::BOOT.profile();
         assert!(profile.enables(Capability::AsyncFileIo));
         assert_eq!(profile.limits().io_uring_entries,
-            thekernel_linux_io_uring::IORING_MAX_ENTRIES);
+            tk_linux_io_uring::IORING_MAX_ENTRIES);
     }
 }

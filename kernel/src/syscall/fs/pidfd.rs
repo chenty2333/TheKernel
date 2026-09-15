@@ -3,9 +3,9 @@ use alloc::sync::Arc;
 use axerrno::{AxError, AxResult};
 use axtask::{AxTaskRef, current};
 use linux_raw_sys::general::SI_TKILL;
-use thekernel_linux_process::PidfdPlan;
-use thekernel_linux_signal::{SignalInfo, api::ThreadSignalManager};
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
+use tk_linux_process::PidfdPlan;
+use tk_linux_signal::{SignalInfo, api::ThreadSignalManager};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
 
 use crate::{
     file::{Directory, FileHandle, FileLike, PidFd, add_file_description},

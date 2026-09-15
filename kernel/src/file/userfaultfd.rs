@@ -33,7 +33,7 @@ use linux_raw_sys::{
     },
 };
 use memory_addr::{PAGE_SIZE_4K, VirtAddr};
-use thekernel_linux_mm::{
+use tk_linux_mm::{
     FaultAccess, FaultDisposition, FaultHandlerId, MmError, PageRange, UffdApiNegotiation,
     UffdApiState, UffdCopyMode, UffdCopyRequest, UffdCreateFlags, UffdIoctls, UffdRegisterMode,
     UffdResolverOutcome, UffdResolverResult, UffdZeroPageMode, UffdZeroPageRequest, UserRange,
@@ -1075,7 +1075,7 @@ mod tests {
 
     use axio::{IoBufMut, Write};
     use linux_raw_sys::general::{O_NONBLOCK, O_RDONLY};
-    use thekernel_linux_mm::{
+    use tk_linux_mm::{
         FaultDisposition, FaultKey, FaultRequest, FaultType, MappingAccess, MappingKind,
         MappingSnapshot, UFFD_API, UFFD_O_NONBLOCK, UFFD_USER_MODE_ONLY,
     };

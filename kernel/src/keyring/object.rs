@@ -2,8 +2,8 @@ use alloc::{string::String, vec::Vec};
 use core::{mem::size_of, sync::atomic::Ordering};
 
 use axerrno::{AxError, AxResult};
-use thekernel_linux_cred::{KeyPermission, KeyPermissionMask};
-use thekernel_linux_keyring::{GcScratch, KeyKind as LinuxKeyKind};
+use tk_linux_cred::{KeyPermission, KeyPermissionMask};
+use tk_linux_keyring::{GcScratch, KeyKind as LinuxKeyKind};
 
 use super::accounting::{AbiQuotaCharge, QuotaAdmission, ResidentCharge};
 use crate::task::{Kgid, Kuid, UserNamespaceId};
@@ -46,7 +46,7 @@ impl GcPlanScratch {
             && self.policy.link_drops == 0
             && matches!(
                 self.policy.state,
-                thekernel_linux_keyring::GcScratchState::Idle
+                tk_linux_keyring::GcScratchState::Idle
             )
             && self.touched_next.is_none()
             && self.work_next.is_none()

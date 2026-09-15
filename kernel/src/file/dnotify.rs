@@ -367,17 +367,17 @@ lazy_static! {
 }
 
 pub(crate) fn is_remove_mask(mask: u32) -> bool {
-    thekernel_linux_fsnotify::dnotify_is_remove(mask, DN_MULTISHOT)
+    tk_linux_fsnotify::dnotify_is_remove(mask, DN_MULTISHOT)
 }
 
 pub(crate) fn converted_mask(mask: u32) -> u32 {
-    thekernel_linux_fsnotify::dnotify_mask(mask as usize, DNOTIFY_ALLOWED_MASK)
+    tk_linux_fsnotify::dnotify_mask(mask as usize, DNOTIFY_ALLOWED_MASK)
 }
 
 pub(crate) const fn mask_from_fcntl_arg(arg: usize) -> u32 {
     // Linux fcntl_dirnotify takes unsigned int: the syscall's unsigned long
     // argument is truncated before convert_arg filters unknown low bits.
-    thekernel_linux_fsnotify::dnotify_mask(arg, u32::MAX)
+    tk_linux_fsnotify::dnotify_mask(arg, u32::MAX)
 }
 
 /// Registers or augments a dnotify mark for one Linux fd table and open file
@@ -611,7 +611,7 @@ mod tests {
     use core::task::Context;
 
     use axpoll::{IoEvents, Pollable};
-    use thekernel_linux_signal::Signo;
+    use tk_linux_signal::Signo;
 
     use super::*;
     use crate::file::{FdTable, FileLike, Kstat};

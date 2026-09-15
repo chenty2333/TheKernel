@@ -1,8 +1,11 @@
 [package]
-name = "thekernel-linux-syslog"
+description = "Linux syslog ABI types and policy contracts"
+repository.workspace = true
+publish.workspace = true
+name = "tk-linux-syslog"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version.workspace = true
 license = "Apache-2.0"
 
 [lints.rust]

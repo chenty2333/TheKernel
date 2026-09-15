@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use kspin::SpinNoIrq;
 use spin::Mutex as DeliveryMutex;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use super::{
     ProcessSignalManager, RegisteredThread,
@@ -2091,7 +2091,7 @@ mod signal_wait_tests {
     use alloc::sync::Arc;
     use core::mem::MaybeUninit;
 
-    use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
+    use tk_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
 
     use super::{SignalWaitObservation, ThreadSignalManager};
     use crate::{

@@ -3,7 +3,7 @@ use core::mem::{self, MaybeUninit};
 
 use axerrno::{AxError, AxResult};
 use axio::prelude::*;
-pub use thekernel_linux_mm::IoVec;
+pub use tk_linux_mm::IoVec;
 
 use super::{
     UserMemoryCapability, check_user_readable_with, check_user_writable_with, map_usercopy_error,

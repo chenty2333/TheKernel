@@ -8,7 +8,7 @@ use linux_raw_sys::general::{
     CLD_TRAPPED, P_ALL, P_PGID, P_PID, P_PIDFD, SIGCHLD, SIGCONT, WCONTINUED, WEXITED, WNOHANG,
     WNOWAIT, WUNTRACED, rusage, siginfo,
 };
-use thekernel_linux_process_adapter::{Pid, ProcessError};
+use tk_linux_process_adapter::{Pid, ProcessError};
 
 use crate::{
     file::{FileHandle, FileLike, PidFd},
@@ -191,7 +191,7 @@ pub(crate) fn should_wait_for_child(child: &Process, options: &WaitOptions) -> b
         return true;
     }
 
-    let is_clone = child.exit_signal() != Some(thekernel_linux_signal::Signo::SIGCHLD as u8);
+    let is_clone = child.exit_signal() != Some(tk_linux_signal::Signo::SIGCHLD as u8);
     if options.contains(WaitOptions::WCLONE) {
         is_clone
     } else {
@@ -884,7 +884,7 @@ mod tests {
         let user = UserNamespace::try_new_root().unwrap();
         let outer = PidNamespace::try_new_root(user.clone()).unwrap();
         outer.reserve_process(100).unwrap().commit();
-        let domain = thekernel_linux_process_adapter::ProcessDomain::try_new().unwrap();
+        let domain = tk_linux_process_adapter::ProcessDomain::try_new().unwrap();
         let root = domain
             .try_new_init_with_identity(100, None, outer.clone())
             .unwrap();

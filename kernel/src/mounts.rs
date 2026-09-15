@@ -398,15 +398,15 @@ impl Mount {
 
     pub fn propagation(&self) -> u64 {
         if self.unbindable {
-            thekernel_linux_mount::MS_UNBINDABLE as u64
+            tk_linux_mount::MS_UNBINDABLE as u64
         } else if let Some(peer) = self.peer_group {
             if peer.master.is_some() {
-                thekernel_linux_mount::MS_SLAVE as u64
+                tk_linux_mount::MS_SLAVE as u64
             } else {
-                thekernel_linux_mount::MS_SHARED as u64
+                tk_linux_mount::MS_SHARED as u64
             }
         } else {
-            thekernel_linux_mount::MS_PRIVATE as u64
+            tk_linux_mount::MS_PRIVATE as u64
         }
     }
 }
@@ -1021,7 +1021,7 @@ impl MountTopology {
         // No live record changes until commit can atomically replace it.
         for index in &selected {
             let mount = &mut next.mounts[*index];
-            mount.flags = thekernel_linux_mount::apply_mount_attr_flags(
+            mount.flags = tk_linux_mount::apply_mount_attr_flags(
                 mount.flags,
                 request.attr_set,
                 request.attr_clr,
@@ -1164,12 +1164,12 @@ fn commit_topology_batch_validated(prepared: &mut Vec<PreparedMountTopologyMutat
     }
 }
 
-fn map_topology_uapi_error(error: thekernel_linux_mount::UapiError) -> AxError {
+fn map_topology_uapi_error(error: tk_linux_mount::UapiError) -> AxError {
     match error {
-        thekernel_linux_mount::UapiError::Invalid => AxError::InvalidInput,
-        thekernel_linux_mount::UapiError::Unsupported => AxError::OperationNotSupported,
-        thekernel_linux_mount::UapiError::TooBig => axerrno::LinuxError::E2BIG.into(),
-        thekernel_linux_mount::UapiError::NotFound => AxError::NotFound,
+        tk_linux_mount::UapiError::Invalid => AxError::InvalidInput,
+        tk_linux_mount::UapiError::Unsupported => AxError::OperationNotSupported,
+        tk_linux_mount::UapiError::TooBig => axerrno::LinuxError::E2BIG.into(),
+        tk_linux_mount::UapiError::NotFound => AxError::NotFound,
     }
 }
 
@@ -1241,7 +1241,7 @@ fn apply_propagation_change(
     selected: &[usize],
     propagation: u64,
 ) -> AxResult<()> {
-    use thekernel_linux_mount::{MS_PRIVATE, MS_SHARED, MS_SLAVE, MS_UNBINDABLE};
+    use tk_linux_mount::{MS_PRIVATE, MS_SHARED, MS_SLAVE, MS_UNBINDABLE};
 
     if propagation == 0 {
         return Ok(());
@@ -1427,9 +1427,9 @@ pub fn namespace_operation() -> NamespaceOperationGuard {
 
 fn plan_mount_mutation(
     records: &[MountRecord],
-    operation: thekernel_linux_mount::MountOperation,
-) -> AxResult<thekernel_linux_mount::MountPlan> {
-    use thekernel_linux_mount::{
+    operation: tk_linux_mount::MountOperation,
+) -> AxResult<tk_linux_mount::MountPlan> {
+    use tk_linux_mount::{
         MountAuthority, MountFlags, MountId, NamespaceGeneration, NamespaceId, TopologyEntry,
         TopologySnapshot,
     };
@@ -1459,7 +1459,7 @@ fn plan_mount_mutation(
         generation,
         entries: &entries,
     };
-    thekernel_linux_mount::plan_mount(
+    tk_linux_mount::plan_mount(
         snapshot,
         MountAuthority {
             administer: true,
@@ -1471,7 +1471,7 @@ fn plan_mount_mutation(
     .map_err(|_| AxError::Io)
 }
 
-fn commit_mount_mutation(_plan: thekernel_linux_mount::MountPlan) -> AxResult<()> {
+fn commit_mount_mutation(_plan: tk_linux_mount::MountPlan) -> AxResult<()> {
     // The following `publish_current_records` / PreparedMountTopologyMutation
     // is the sole compare-and-publish point.  Keeping an independent global
     // generation here would make one namespace's change spuriously conflict
@@ -2530,15 +2530,15 @@ fn attach_tree_and_record_kind(
         .try_reserve(committed.len())
         .map_err(|_| axfs_ng_vfs::VfsError::NoMemory)?;
     let operation = match kind {
-        AttachKind::Attach => thekernel_linux_mount::MountOperation::Attach {
-            mount: thekernel_linux_mount::MountId::new(root.mount_id()).map_err(|_| AxError::Io)?,
-            parent: thekernel_linux_mount::MountId::new(target.mountpoint().mount_id())
+        AttachKind::Attach => tk_linux_mount::MountOperation::Attach {
+            mount: tk_linux_mount::MountId::new(root.mount_id()).map_err(|_| AxError::Io)?,
+            parent: tk_linux_mount::MountId::new(target.mountpoint().mount_id())
                 .map_err(|_| AxError::Io)?,
         },
-        AttachKind::Bind { source_mount_id } => thekernel_linux_mount::MountOperation::Bind {
-            source: thekernel_linux_mount::MountId::new(source_mount_id)
+        AttachKind::Bind { source_mount_id } => tk_linux_mount::MountOperation::Bind {
+            source: tk_linux_mount::MountId::new(source_mount_id)
                 .map_err(|_| AxError::Io)?,
-            parent: thekernel_linux_mount::MountId::new(target.mountpoint().mount_id())
+            parent: tk_linux_mount::MountId::new(target.mountpoint().mount_id())
                 .map_err(|_| AxError::Io)?,
         },
     };
@@ -2950,10 +2950,10 @@ pub fn remount_with_data(
     remount_metadata.data = try_string(&data)?;
     let plan = plan_mount_mutation(
         &records,
-        thekernel_linux_mount::MountOperation::Remount {
-            mount: thekernel_linux_mount::MountId::new(mountpoint.mount_id())
+        tk_linux_mount::MountOperation::Remount {
+            mount: tk_linux_mount::MountId::new(mountpoint.mount_id())
                 .map_err(|_| AxError::Io)?,
-            flags: thekernel_linux_mount::MountFlags::from_validated_kernel_bits(flags.into()),
+            flags: tk_linux_mount::MountFlags::from_validated_kernel_bits(flags.into()),
         },
     )?;
     let record = &mut records[index];
@@ -3011,9 +3011,9 @@ pub fn try_update_flags_for_mounts(
         .ok_or(AxError::Io)?;
     let plan = plan_mount_mutation(
         &records,
-        thekernel_linux_mount::MountOperation::Setattr {
-            mount: thekernel_linux_mount::MountId::new(root_mount_id).map_err(|_| AxError::Io)?,
-            flags: thekernel_linux_mount::MountFlags::from_validated_kernel_bits(root_flags.into()),
+        tk_linux_mount::MountOperation::Setattr {
+            mount: tk_linux_mount::MountId::new(root_mount_id).map_err(|_| AxError::Io)?,
+            flags: tk_linux_mount::MountFlags::from_validated_kernel_bits(root_flags.into()),
         },
     )?;
     for (index, state, flags) in updates {
@@ -3132,9 +3132,9 @@ pub fn move_tree_and_records(old: &Location, target: &Location) -> AxResult<()> 
     }
     let plan = plan_mount_mutation(
         &records,
-        thekernel_linux_mount::MountOperation::Move {
-            mount: thekernel_linux_mount::MountId::new(root_mount_id).map_err(|_| AxError::Io)?,
-            parent: thekernel_linux_mount::MountId::new(new_parent_id).map_err(|_| AxError::Io)?,
+        tk_linux_mount::MountOperation::Move {
+            mount: tk_linux_mount::MountId::new(root_mount_id).map_err(|_| AxError::Io)?,
+            parent: tk_linux_mount::MountId::new(new_parent_id).map_err(|_| AxError::Io)?,
         },
     )?;
 
@@ -3426,10 +3426,10 @@ pub fn pivot_root_and_records(
     }
     let plan = plan_mount_mutation(
         &records,
-        thekernel_linux_mount::MountOperation::PivotRoot {
-            new_root: thekernel_linux_mount::MountId::new(new_mount.mount_id())
+        tk_linux_mount::MountOperation::PivotRoot {
+            new_root: tk_linux_mount::MountId::new(new_mount.mount_id())
                 .map_err(|_| AxError::Io)?,
-            put_old: thekernel_linux_mount::MountId::new(namespace_root.mount_id())
+            put_old: tk_linux_mount::MountId::new(namespace_root.mount_id())
                 .map_err(|_| AxError::Io)?,
         },
     )?;
@@ -3655,8 +3655,8 @@ impl PreparedUnmountPropagation {
                 // unmounting.
                 let _plan = plan_mount_mutation(
                     &records,
-                    thekernel_linux_mount::MountOperation::Unmount {
-                        mount: thekernel_linux_mount::MountId::new(mount.id)
+                    tk_linux_mount::MountOperation::Unmount {
+                        mount: tk_linux_mount::MountId::new(mount.id)
                             .map_err(|_| AxError::Io)?,
                         lazy,
                     },

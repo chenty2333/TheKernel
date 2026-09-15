@@ -31,7 +31,7 @@ runs during display bring-up, before the heap is known to be usable.
 ## 2. The interface a display driver calls
 
 ```rust
-use thekernel_kernel::drm::modes::{Constraints, ModePlan, plan_modeset};
+use tk_kernel::drm::modes::{Constraints, ModePlan, plan_modeset};
 
 // `edid_bytes` is whatever the driver read: 128 bytes, or 128 * (1 + n).
 let plan: ModePlan = plan_modeset(edid_bytes, &Constraints::unlimited());

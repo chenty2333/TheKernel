@@ -7,7 +7,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult};
-use thekernel_linux_drm as abi;
+use tk_linux_drm as abi;
 
 use super::{DrmFile, DumbRequest, Mode, dmabuf, property, syncobj, uapi};
 

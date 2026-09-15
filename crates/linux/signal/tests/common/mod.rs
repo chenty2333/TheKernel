@@ -8,11 +8,11 @@ use std::{
     },
 };
 
-use thekernel_linux_signal::api::{
+use tk_linux_signal::api::{
     ProcessSignalManager, SharedSignalActions, SignalActions, ThreadSignalManager,
     ThreadSignalRegistration,
 };
-use thekernel_linux_usercopy::{UserCopyError, UserMemory, VmResult};
+use tk_linux_usercopy::{UserCopyError, UserMemory, VmResult};
 
 static POOL: LazyLock<Arc<Mutex<Box<[u8]>>>> = LazyLock::new(|| {
     let size = 0x0100_0000; // 16 MiB

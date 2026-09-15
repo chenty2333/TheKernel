@@ -12,7 +12,7 @@ use axerrno::AxError;
 use axhal::{paging::MappingFlags, trap::PageFaultFlags};
 use axsync::Mutex;
 use memory_addr::{MemoryAddr, VirtAddr};
-use thekernel_linux_mm::{FaultAccess, FaultDisposition, FaultFailure as DelegatedFaultFailure};
+use tk_linux_mm::{FaultAccess, FaultDisposition, FaultFailure as DelegatedFaultFailure};
 
 use super::{
     AddrSpace, PageFaultFailure, PageFaultKind, PageFaultResult, repair_local_spurious_fault,

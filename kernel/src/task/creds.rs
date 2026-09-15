@@ -7,12 +7,12 @@ extern crate std;
 
 use axerrno::{AxError, AxResult};
 #[cfg(test)]
-pub(crate) use thekernel_linux_cred::CAPABILITY_VALID_MASK;
-pub(crate) use thekernel_linux_cred::{
+pub(crate) use tk_linux_cred::CAPABILITY_VALID_MASK;
+pub(crate) use tk_linux_cred::{
     CAPABILITY_WORDS, CredentialIds as Credentials, FsCredentialSnapshot as DacCredentialView,
     GroupInfo, SECBIT_KEEP_CAPS, SECBIT_NO_SETUID_FIXUP,
 };
-use thekernel_linux_cred::{CapabilitySets, Credential, CredentialTransitionEffects};
+use tk_linux_cred::{CapabilitySets, Credential, CredentialTransitionEffects};
 
 #[cfg(test)]
 use super::security::test_frozen_registry;
@@ -492,8 +492,8 @@ impl CredentialSlot {
     #[cfg(test)]
     pub(crate) fn replace_fs_ids_for_test(
         &self,
-        fsuid: thekernel_linux_cred::Kuid,
-        fsgid: thekernel_linux_cred::Kgid,
+        fsuid: tk_linux_cred::Kuid,
+        fsgid: tk_linux_cred::Kgid,
     ) -> AxResult<Arc<Cred>> {
         let mut update = self.prepare();
         update.builder.ids.fsuid = fsuid;
@@ -941,15 +941,15 @@ mod tests {
         enable_keep_caps.finish().unwrap().commit();
 
         let exec = executor.prepare();
-        let input = thekernel_linux_cred::ExecCredentialInput::new(
+        let input = tk_linux_cred::ExecCredentialInput::new(
             0,
-            Some(thekernel_linux_cred::ExecFileOwner::new(
+            Some(tk_linux_cred::ExecFileOwner::new(
                 Kuid::INITIAL_ROOT,
                 Kgid::INITIAL_ROOT,
             )),
-            thekernel_linux_cred::ExecMountPrivilege::Honor,
-            thekernel_linux_cred::ExecTraceState::NotSuppressingPrivilege,
-            thekernel_linux_cred::ExecImageReadability::Readable,
+            tk_linux_cred::ExecMountPrivilege::Honor,
+            tk_linux_cred::ExecTraceState::NotSuppressingPrivilege,
+            tk_linux_cred::ExecImageReadability::Readable,
             None,
         );
         let source = crate::task::ExecFileSecurityObject::new(

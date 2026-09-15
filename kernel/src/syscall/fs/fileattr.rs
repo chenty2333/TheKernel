@@ -11,7 +11,7 @@ use linux_vfs::{
     FileAttr, LinuxVfsError, StructCopyPlan, file_getattr_copy_plan, file_setattr_copy_plan,
     validate_file_at_flags, validate_file_setattr_xflags,
 };
-use thekernel_linux_usercopy::{
+use tk_linux_usercopy::{
     UserCopyError, UserMemory, UserMemoryContext, vm_load_until_nul_bounded,
 };
 

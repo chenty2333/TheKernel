@@ -16,7 +16,7 @@ use axhal::mem::{phys_to_virt, virt_to_phys};
 use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::CAP_SYS_BOOT;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmPtr};
 
 use crate::{
     file::{File, FileLike, get_typed_file},

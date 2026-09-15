@@ -1,7 +1,7 @@
 use core::mem::size_of;
 
 use axerrno::{AxError, AxResult, LinuxError};
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use crate::{
     bpf::{

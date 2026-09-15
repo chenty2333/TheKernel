@@ -15,9 +15,9 @@ use axsync::Mutex;
 use axtask::current;
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::*;
-use thekernel_linux_ipc::{MessageSelection, select_message};
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_usercopy::{
+use tk_linux_ipc::{MessageSelection, select_message};
+use tk_linux_process_adapter::Pid;
+use tk_linux_usercopy::{
     UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
 };
 
@@ -1187,7 +1187,7 @@ mod credential_caller_tests {
 mod receive_copyout_tests {
     use core::mem::MaybeUninit;
 
-    use thekernel_linux_usercopy::{UserCopyError, VmResult};
+    use tk_linux_usercopy::{UserCopyError, VmResult};
 
     use super::*;
 

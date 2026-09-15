@@ -1,7 +1,7 @@
 use core::{mem::MaybeUninit, ops::Range};
 
 use bytemuck::{Pod, Zeroable};
-use thekernel_linux_usercopy::{
+use tk_linux_usercopy::{
     CopyStructError, MAX_NUL_SEARCH_BYTES, RawSigevent, UserCopyError, UserMemory,
     UserMemoryContext, VmMutPtr, VmPtr, VmResult, copy_struct_from_user, copy_struct_to_user,
     vm_load, vm_load_any_until_nul, vm_load_any_until_nul_bounded, vm_load_until_nul,

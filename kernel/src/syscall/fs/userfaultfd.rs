@@ -3,7 +3,7 @@ use alloc::sync::Arc;
 use axerrno::AxResult;
 use axtask::current;
 use linux_raw_sys::general::{O_CLOEXEC, O_NONBLOCK, O_RDONLY};
-use thekernel_linux_mm::{UFFD_O_CLOEXEC, UFFD_O_NONBLOCK, UFFD_USER_MODE_ONLY, UffdCreateFlags};
+use tk_linux_mm::{UFFD_O_CLOEXEC, UFFD_O_NONBLOCK, UFFD_USER_MODE_ONLY, UffdCreateFlags};
 
 use crate::{
     file::{FileDescription, reserve_fd, userfaultfd::UserfaultFile},

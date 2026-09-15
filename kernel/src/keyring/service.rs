@@ -8,7 +8,7 @@ use axpoll::PollSet;
 use axsync::Mutex as KeyManagerMutex;
 #[cfg(test)]
 use spin::Mutex as KeyManagerMutex;
-use thekernel_linux_keyring::{
+use tk_linux_keyring::{
     ForkPlan as LinuxForkPlan, KeyTaskOwner as LinuxKeyTaskOwner,
     LifecyclePlan as LinuxLifecyclePlan, ProcessOwnerId, TaskOwnerId, plan_exec, plan_exit,
 };
@@ -342,7 +342,7 @@ pub(crate) fn key_user_records() -> AxResult<Vec<KeyUserRecord>> {
 mod tests {
     use alloc::{sync::Arc, vec::Vec};
 
-    use thekernel_linux_cred::{CAPABILITY_WORDS, GroupInfo};
+    use tk_linux_cred::{CAPABILITY_WORDS, GroupInfo};
 
     use super::{
         super::manager::{KEY_SPEC_SESSION_KEYRING, KEY_SPEC_THREAD_KEYRING},

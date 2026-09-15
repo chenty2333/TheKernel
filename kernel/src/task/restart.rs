@@ -3,7 +3,7 @@ use core::time::Duration;
 
 use axhal::uspace::UserContext;
 use syscalls::Sysno;
-use thekernel_linux_signal::SignalOSAction;
+use tk_linux_signal::SignalOSAction;
 
 use super::{AlarmClock, Thread};
 

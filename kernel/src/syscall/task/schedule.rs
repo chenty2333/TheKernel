@@ -21,10 +21,10 @@ use linux_raw_sys::general::{
     PRIO_USER, RLIMIT_NICE, RLIMIT_RTPRIO, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE,
     SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
 };
-use thekernel_linux_process_adapter::{Pid, ProcessError};
-use thekernel_linux_sched as linux_sched;
-use thekernel_linux_signal::{DefaultSignalAction, SignalDisposition, Signo};
-use thekernel_linux_usercopy::{
+use tk_linux_process_adapter::{Pid, ProcessError};
+use tk_linux_sched as linux_sched;
+use tk_linux_signal::{DefaultSignalAction, SignalDisposition, Signo};
+use tk_linux_usercopy::{
     UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
 };
 
@@ -1907,7 +1907,7 @@ enum IoprioTarget {
     Zombie(Arc<Process>),
     ExitedLeader {
         runtime: Arc<crate::task::ProcessData>,
-        signal: Arc<thekernel_linux_signal::api::ThreadSignalManager>,
+        signal: Arc<tk_linux_signal::api::ThreadSignalManager>,
         credential: Arc<Cred>,
     },
 }

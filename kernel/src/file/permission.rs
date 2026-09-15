@@ -19,7 +19,7 @@ use linux_vfs::{
     initial_create_attributes as linux_initial_create_attributes, plan_chmod as linux_plan_chmod,
     plan_chown as linux_plan_chown,
 };
-use thekernel_linux_cred::{
+use tk_linux_cred::{
     FileOpenOperation, InodeChmodIntent, InodeChownIntent, InodeCreateMode, InodeMknodKind,
     InodeMknodOperation, InodePermissionAccess, InodeSetattrMode, InodeSetattrProposal,
     InodeTimestampIntent,
@@ -531,7 +531,7 @@ impl<'a> TimestampSetattrPolicy<'a> {
         if Kuid::from_raw(self.metadata.uid) != Some(credentials.uid())
             && !security.has_capability(CAP_FOWNER)
         {
-            use thekernel_linux_cred::InodeTimestampValue;
+            use tk_linux_cred::InodeTimestampValue;
             if (self.intent.atime(), self.intent.mtime())
                 != (InodeTimestampValue::Now, InodeTimestampValue::Now)
             {
@@ -2593,7 +2593,7 @@ pub(crate) fn check_open_permissions(
 mod tests {
     use alloc::vec::Vec;
 
-    use thekernel_linux_cred::{FsCredentialSnapshot, GroupInfo, Kgid, Kuid};
+    use tk_linux_cred::{FsCredentialSnapshot, GroupInfo, Kgid, Kuid};
 
     use super::*;
     use crate::task::{Cred, UserNamespace};

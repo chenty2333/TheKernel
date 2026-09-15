@@ -1,6 +1,6 @@
-# thekernel-linux-cred
+# tk-linux-cred
 
-`thekernel-linux-cred` is an independent, allocation-aware credential policy
+`tk-linux-cred` is an independent, allocation-aware credential policy
 leaf for `no_std` Linux ABI kernels. The 0.1.0 extraction slice provides:
 
 - distinct kernel-global and namespace-visible UID/GID types;
@@ -84,7 +84,7 @@ A kernel adapter selects the lock, prebuilds immutable replacement maps outside
 it, and attaches the remaining objects. Map publication borrows that
 caller-owned replacement and clones it into an empty slot, so the guarded
 operation neither retires nor destroys map ownership. In particular,
-`thekernel-linux-cred` does not depend on the process, VFS, signal, FD, MM,
+`tk-linux-cred` does not depend on the process, VFS, signal, FD, MM,
 usercopy, `kspin`, or other kernel mechanism crates.
 
 Capability authorization never samples a current task. A caller validates the
@@ -313,9 +313,10 @@ duplicate entry points.
 
 ## Toolchain
 
-Version 0.1.0 is intentionally nightly-only and is tested with the rolling
-`nightly` toolchain. Fallible `Arc` allocation uses Rust's `allocator_api` so
+The crate uses the root-pinned `nightly-2026-08-23` toolchain
+(`rustc 1.100.0-nightly`, commit `c54751567`, dated 2026-08-22).
+`rust-version` inherits the workspace's `1.100`; this is not a stable-Rust
+compatibility guarantee. Fallible `Arc` allocation uses `allocator_api` so
 allocation failure remains `CredError::NoMemory` rather than a panic or abort.
-There is no stable `rust-version` claim for this package. The nightly
-requirement is not a synchronization dependency; consumers select and own
-their publication and locking mechanism.
+The nightly requirement is not a synchronization dependency; consumers select
+and own their publication and locking mechanism.

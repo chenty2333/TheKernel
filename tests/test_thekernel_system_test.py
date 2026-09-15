@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 import tempfile
 from tests.support import test_tmpdir
@@ -23,6 +24,15 @@ def load_product():
 
 
 class SystemTestGateTests(unittest.TestCase):
+    def test_guest_tool_paths_match_installed_source_names(self) -> None:
+        # Crate/package renames must not rename the independently installed C tools.
+        installed = {f"thekernel-{path.stem}"
+                     for path in (REPO_ROOT / "tests/guest/tools").glob("*.c")}
+        source = (REPO_ROOT / "tests/guest/system-init.c").read_text()
+        referenced = set(re.findall(r'"/opt/thekernel-tests/bin/([^"/]+)"', source))
+        self.assertTrue(referenced)
+        self.assertEqual(referenced - installed, set())
+
     def test_io_submit_batch_is_independent_and_uses_separate_artifacts(self) -> None:
         product = load_product()
         artifacts = []
@@ -565,7 +575,7 @@ class SystemTestGateTests(unittest.TestCase):
             {"name": "mechanism-example", "metadata": {"thekernel": {"layer": "mechanism"}}},
             {"name": "linux-example", "metadata": {"thekernel": {"layer": "linux_abi"}}},
             {"name": "platform-example", "metadata": {"thekernel": {"layer": "platform"}}},
-            {"name": "thekernel-axtask", "metadata": {"thekernel": {"layer": "platform",
+            {"name": "tk-axtask", "metadata": {"thekernel": {"layer": "platform",
                 "host-test": {"selected": True, "features": ["test", "sched-eevdf"], "all-targets": True}}}},
         ]}
         from types import SimpleNamespace
@@ -577,7 +587,7 @@ class SystemTestGateTests(unittest.TestCase):
         for package in ("mechanism-example", "linux-example"):
             self.assertIn(["cargo", "test", "--locked", "-p", package, "--target", "x86_64-unknown-linux-gnu"], invocations)
         self.assertFalse(any("platform-example" in command for command in invocations))
-        self.assertTrue(any("thekernel-axtask" in command and "--features" in command for command in invocations))
+        self.assertTrue(any("tk-axtask" in command and "--features" in command for command in invocations))
 
     def test_host_suite_isolates_product_build_environment(self) -> None:
         product = load_product()

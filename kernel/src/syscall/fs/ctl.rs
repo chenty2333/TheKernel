@@ -17,8 +17,8 @@ use linux_raw_sys::{
         TIOCGWINSZ, TIOCINQ,
     },
 };
-use thekernel_linux_cred::{InodeSetattrProposal, InodeTimestampIntent, InodeTimestampValue};
-use thekernel_linux_usercopy::{
+use tk_linux_cred::{InodeSetattrProposal, InodeTimestampIntent, InodeTimestampValue};
+use tk_linux_usercopy::{
     UserMemory, UserMemoryContext, VmPtr, vm_load_until_nul, vm_load_until_nul_bounded,
     vm_write_slice,
 };
@@ -2291,8 +2291,8 @@ mod tests {
     use core::{cell::Cell, mem::MaybeUninit, time::Duration};
 
     use axfs_ng_vfs::{Metadata, Mountpoint};
-    use thekernel_linux_cred::{FsCredentialSnapshot, GroupInfo, Kgid, Kuid};
-    use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext};
+    use tk_linux_cred::{FsCredentialSnapshot, GroupInfo, Kgid, Kuid};
+    use tk_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext};
 
     use super::*;
     use crate::task::DacCredentialView;

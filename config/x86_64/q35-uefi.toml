@@ -2,7 +2,7 @@
 # Multiboot x86 PC platform; GRUB supplies its Multiboot handoff.
 arch = "x86_64"
 platform = "x86-pc"
-package = "thekernel-axplat-x86-pc"
+package = "tk-axplat-x86-pc"
 
 [plat]
 # The product q35 profile is an SMP kernel. MADT discovery still determines

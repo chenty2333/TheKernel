@@ -15,9 +15,9 @@ use linux_raw_sys::general::{
     CLOCK_THREAD_CPUTIME_ID, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD, SIGEV_THREAD_ID,
     TIMER_ABSTIME, itimerspec, itimerval, timespec, timeval, timezone,
 };
-use thekernel_linux_signal::Signo;
-use thekernel_linux_time as linux_time;
-use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
+use tk_linux_signal::Signo;
+use tk_linux_time as linux_time;
+use tk_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::{
     mm::map_usercopy_error,
@@ -684,7 +684,7 @@ fn read_timer_spec<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ptr: *const itimerspec,
 ) -> AxResult<itimerspec> {
-    let value = thekernel_linux_usercopy::VmPtr::vm_read_uninit(ptr, memory)
+    let value = tk_linux_usercopy::VmPtr::vm_read_uninit(ptr, memory)
         .map_err(map_timer_usercopy_error)?;
     // SAFETY: the explicit provider initialized every byte of the value, and
     // `itimerspec` contains only integer fields on the supported x86_64 ABI.
@@ -696,7 +696,7 @@ fn write_timer_id<M: UserMemory + ?Sized>(
     ptr: *mut i32,
     timerid: i32,
 ) -> AxResult<()> {
-    thekernel_linux_usercopy::VmMutPtr::vm_write(ptr, memory, timerid)
+    tk_linux_usercopy::VmMutPtr::vm_write(ptr, memory, timerid)
         .map_err(map_timer_usercopy_error)
 }
 
@@ -708,7 +708,7 @@ fn write_timer_spec<M: UserMemory + ?Sized>(
     // `linux_raw_sys` does not expose bytemuck's `NoUninit` marker for its
     // repr(C) ABI structs.  The x86_64 `itimerspec` is four integer words with
     // no padding, so its complete object representation is initialized here.
-    unsafe { thekernel_linux_usercopy::VmMutPtr::vm_write_unchecked(ptr, memory, value) }
+    unsafe { tk_linux_usercopy::VmMutPtr::vm_write_unchecked(ptr, memory, value) }
         .map_err(map_timer_usercopy_error)
 }
 
@@ -716,7 +716,7 @@ fn read_itimer_value<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ptr: *const itimerval,
 ) -> AxResult<itimerval> {
-    let value = thekernel_linux_usercopy::VmPtr::vm_read_uninit(ptr, memory)
+    let value = tk_linux_usercopy::VmPtr::vm_read_uninit(ptr, memory)
         .map_err(map_timer_usercopy_error)?;
     // SAFETY: the explicit provider initialized every byte of the value, and
     // `itimerval` contains only integer fields on the supported x86_64 ABI.
@@ -730,7 +730,7 @@ fn write_itimer_value<M: UserMemory + ?Sized>(
 ) -> AxResult<()> {
     // `itimerval` has no padding on the x86_64 Linux ABI, so its complete
     // object representation is initialized and safe to copy out.
-    unsafe { thekernel_linux_usercopy::VmMutPtr::vm_write_unchecked(ptr, memory, value) }
+    unsafe { tk_linux_usercopy::VmMutPtr::vm_write_unchecked(ptr, memory, value) }
         .map_err(map_timer_usercopy_error)
 }
 
@@ -742,7 +742,7 @@ pub fn sys_timer_create<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     // Linux copies the optional event before validating the clock, then
     // validates notification fields. The output pointer is checked at copyout.
-    let event = if let Some(ptr) = thekernel_linux_usercopy::VmPtr::nullable(sigevent_ptr) {
+    let event = if let Some(ptr) = tk_linux_usercopy::VmPtr::nullable(sigevent_ptr) {
         Some(RawSigevent::read_from_user(memory, ptr).map_err(map_timer_usercopy_error)?)
     } else {
         None
@@ -1276,7 +1276,7 @@ mod tests {
     use linux_raw_sys::general::{
         CLOCK_BOOTTIME_ALARM, CLOCK_REALTIME_ALARM, CLOCK_TAI, MAX_CLOCKS,
     };
-    use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
+    use tk_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
 
     use super::*;
 

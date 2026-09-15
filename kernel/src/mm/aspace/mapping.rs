@@ -21,7 +21,7 @@ pub(super) fn relocate_affine_origin(
     old_start: VirtAddr,
     new_start: VirtAddr,
 ) -> AxResult<(VirtAddr, usize)> {
-    let relocation = thekernel_linux_mm::relocate_affine_origin(
+    let relocation = tk_linux_mm::relocate_affine_origin(
         origin.as_usize(),
         old_start.as_usize(),
         new_start.as_usize(),

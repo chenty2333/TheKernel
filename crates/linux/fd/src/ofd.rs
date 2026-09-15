@@ -16,7 +16,7 @@ use crate::OfdId;
 /// the external cursor in a second field in the meantime.
 ///
 /// ```
-/// use thekernel_linux_fd::{ExternalOffset, OfdId, OpenFileDescriptionState};
+/// use tk_linux_fd::{ExternalOffset, OfdId, OpenFileDescriptionState};
 ///
 /// let mut state: OpenFileDescriptionState<u16, ExternalOffset> =
 ///     OpenFileDescriptionState::new_external(OfdId::new(1).unwrap(), 2, 7);
@@ -26,7 +26,7 @@ use crate::OfdId;
 /// ```
 ///
 /// ```compile_fail,E0599
-/// use thekernel_linux_fd::{ExternalOffset, OfdId, OpenFileDescriptionState};
+/// use tk_linux_fd::{ExternalOffset, OfdId, OpenFileDescriptionState};
 ///
 /// let state: OpenFileDescriptionState<(), ExternalOffset> =
 ///     OpenFileDescriptionState::new_external(OfdId::new(1).unwrap(), 0, ());

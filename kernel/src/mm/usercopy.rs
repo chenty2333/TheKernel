@@ -8,7 +8,7 @@ use axhal::paging::MappingFlags;
 use axsync::Mutex;
 use bytemuck::{NoUninit, Pod, Zeroable};
 use memory_addr::{MemoryAddr, VirtAddr};
-use thekernel_linux_usercopy::{
+use tk_linux_usercopy::{
     CopyStructError, UserCopyError, UserMemory, UserMemoryContext, VmResult,
     copy_struct_from_user as copy_struct_from_user_context,
     copy_struct_to_user as copy_struct_to_user_context, vm_load_until_nul,
@@ -359,7 +359,7 @@ mod tests {
     use axhal::paging::{MappingFlags, PageSize};
     use axsync::Mutex;
     use memory_addr::{PAGE_SIZE_4K, VirtAddr};
-    use thekernel_linux_usercopy::{UserCopyError, UserMemoryContext};
+    use tk_linux_usercopy::{UserCopyError, UserMemoryContext};
 
     use super::{
         AddrSpace, AddressSpaceUserMemory, AxError, UserMemoryCapability, map_address_space_error,

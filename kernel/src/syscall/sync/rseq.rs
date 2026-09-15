@@ -6,11 +6,11 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axsync::Mutex;
 use axtask::current;
 use memory_addr::VirtAddr;
-use thekernel_linux_rseq::{
+use tk_linux_rseq::{
     ErrnoClass, RSEQ_CPU_ID_UNINITIALIZED, RseqError, RseqRegistrationOperation,
     RseqRegistrationRequest,
 };
-use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext};
+use tk_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext};
 
 use crate::{
     mm::{AddrSpace, AddressSpaceUserMemory},
@@ -264,8 +264,8 @@ mod tests {
     use alloc::vec;
     use core::mem::MaybeUninit;
 
-    use thekernel_linux_rseq::{RSEQ_AREA_SIZE, RseqRegistrationState};
-    use thekernel_linux_usercopy::VmResult;
+    use tk_linux_rseq::{RSEQ_AREA_SIZE, RseqRegistrationState};
+    use tk_linux_usercopy::VmResult;
 
     use super::*;
 

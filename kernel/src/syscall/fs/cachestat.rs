@@ -9,7 +9,7 @@ use linux_vfs::{
     CacheStat as Cachestat, CachestatAdmissionError, CachestatRange, cachestat_write_open,
     validate_cachestat_admission,
 };
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use crate::{
     file::{

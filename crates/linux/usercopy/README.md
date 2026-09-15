@@ -1,6 +1,6 @@
-# thekernel-linux-usercopy
+# tk-linux-usercopy
 
-`thekernel-linux-usercopy` provides bounded and fallible access to a
+`tk-linux-usercopy` provides bounded and fallible access to a
 caller-supplied userspace memory implementation. It is `no_std`, contains no
 current-task or address-space global, and never dereferences a userspace
 pointer itself.
@@ -10,11 +10,11 @@ semantics. Rust alignment applies only to kernel-owned typed storage; address
 overflow and provider faults remain explicit errors, and a failed provider
 read never exposes partially initialized typed values.
 
-The Rust library name is `thekernel_linux_usercopy`. An existing consumer may
+The Rust library name is `tk_linux_usercopy`. An existing consumer may
 temporarily preserve `use starry_vm::...` with a Cargo dependency alias:
 
 ```toml
-starry-vm = { package = "thekernel-linux-usercopy", version = "0.1", features = ["alloc"] }
+starry-vm = { package = "tk-linux-usercopy", version = "0.1", features = ["alloc"] }
 ```
 
 The API intentionally differs from the historical crate: every operation
@@ -22,7 +22,7 @@ receives an explicit `UserMemoryContext`.
 
 ```rust,no_run
 use core::mem::MaybeUninit;
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext, VmResult};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmResult};
 
 struct AddressSpace;
 

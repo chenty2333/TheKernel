@@ -4,8 +4,8 @@ use core::mem::{offset_of, size_of};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use linux_raw_sys::general::CAP_SYS_ADMIN;
-use thekernel_linux_bpf::{BPF_FD_TYPE_RAW_TRACEPOINT, BpfAttrTaskFdQuery};
-use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
+use tk_linux_bpf::{BPF_FD_TYPE_RAW_TRACEPOINT, BpfAttrTaskFdQuery};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use crate::{
     bpf::{read_bpf_attr, require_bpf_attr_range, write_bpf_attr_value, write_user_bytes},

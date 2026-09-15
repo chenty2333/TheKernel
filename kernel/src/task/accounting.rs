@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use axhal::time::{NANOS_PER_SEC, TimeValue};
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::{__kernel_old_timeval, rusage};
-use thekernel_linux_process_adapter::ProcessUsage;
+use tk_linux_process_adapter::ProcessUsage;
 
 use super::{AsThread, Thread, get_task};
 use crate::time::TimeValueLike;

@@ -29,7 +29,7 @@ use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollabl
 use axsync::Mutex;
 use kspin::SpinNoIrq;
 use spin::Once;
-use thekernel_linux_signal::{SignalInfo, Signo};
+use tk_linux_signal::{SignalInfo, Signo};
 
 pub use self::{
     ntty::{N_TTY, NTtyDriver},

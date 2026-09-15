@@ -38,5 +38,5 @@ fn main() {
         .collect::<Vec<_>>();
     let envs = ENVS.iter().copied().map(str::to_owned).collect::<Vec<_>>();
 
-    thekernel_kernel::entry::init(&args, &envs);
+    tk_kernel::entry::init(&args, &envs);
 }

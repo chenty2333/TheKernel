@@ -20,10 +20,10 @@ use axtask::{
 };
 use extern_trait::extern_trait;
 use scope_local::{ActiveScope, Scope};
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_rseq::ThreadRseq;
-use thekernel_linux_seccomp::SeccompState;
-use thekernel_linux_signal::{
+use tk_linux_process_adapter::Pid;
+use tk_linux_rseq::ThreadRseq;
+use tk_linux_seccomp::SeccompState;
+use tk_linux_signal::{
     SignalSet, SignalStack,
     api::{ThreadRegistrationError, ThreadSignalManager, ThreadSignalRegistration},
 };
@@ -40,7 +40,7 @@ use super::{
 use crate::{deferred_work::DeferredWorkAccount, file::OpenCredentials};
 
 const TASK_PARENT_RELATION_HARD_LIMIT: usize =
-    thekernel_linux_process_adapter::PROCESS_MEMBERSHIP_LIMIT;
+    tk_linux_process_adapter::PROCESS_MEMBERSHIP_LIMIT;
 static LIVE_TASK_PARENT_RELATIONS: AtomicUsize = AtomicUsize::new(0);
 static TASK_PARENT_TOPOLOGY: SpinNoIrq<()> = SpinNoIrq::new(());
 
@@ -2821,7 +2821,7 @@ impl TaskExt for Box<Thread> {
         // final IRQ-disabled user-return gate.  The event publication is
         // allocation-free and intentionally best-effort while a lifecycle
         // transaction owns the rseq state.
-        let _ = self.notify_rseq(thekernel_linux_rseq::RseqEventMask::MIGRATE);
+        let _ = self.notify_rseq(tk_linux_rseq::RseqEventMask::MIGRATE);
         self.acquire_active_scope_read();
         self.resume_cpu_accounting_after_switch();
     }
@@ -2844,7 +2844,7 @@ impl TaskExt for Box<Thread> {
         // Every scheduler leave is a preemption observation.  The final
         // return gate decides whether the saved IP was in an active critical
         // section and performs any abort before user entry.
-        let _ = self.notify_rseq(thekernel_linux_rseq::RseqEventMask::PREEMPT);
+        let _ = self.notify_rseq(tk_linux_rseq::RseqEventMask::PREEMPT);
         let exit_was_preaccounted = reason == SwitchReason::Exit
             && self.exit_switch_preaccounted.swap(false, Ordering::AcqRel);
         if reason.counts_as_context_switch() && !exit_was_preaccounted {

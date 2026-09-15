@@ -34,10 +34,10 @@ region, and publishes it. Both consumers ask the platform instead of reading the
 
 | Consumer | Before | After |
 |---|---|---|
-| PCI bus walk | `crates/ax/thekernel-axdriver/src/bus/pci.rs` read `axconfig::devices::PCI_ECAM_BASE` | `axhal::pci::ecam_base()` `[R]` |
-| Uncore PCI accessor | `crates/ax/thekernel-axplat-x86-pc/src/perf_uncore.rs` read `crate::config::devices::PCI_ECAM_BASE` | `crate::acpi::pci_ecam_base()` `[R]` |
+| PCI bus walk | `crates/ax/tk-axdriver/src/bus/pci.rs` read `axconfig::devices::PCI_ECAM_BASE` | `axhal::pci::ecam_base()` `[R]` |
+| Uncore PCI accessor | `crates/ax/tk-axplat-x86-pc/src/perf_uncore.rs` read `crate::config::devices::PCI_ECAM_BASE` | `crate::acpi::pci_ecam_base()` `[R]` |
 
-The parser is pure and host-tested: `crates/ax/thekernel-axplat-x86-pc/src/acpi/mcfg.rs`
+The parser is pure and host-tested: `crates/ax/tk-axplat-x86-pc/src/acpi/mcfg.rs`
 takes raw table bytes and returns `(base_address, segment_group, start_bus, end_bus)` per
 declared region. `[R]` The ACPI header's length field is authoritative, so a caller that
 passes a whole page still gets exactly the declared table; a declared length that exceeds
@@ -51,7 +51,7 @@ root-table walk are now shared by both tables rather than duplicated. `[R]`
 ### 1.2 Selection is deterministic, and the rule is stated in code
 
 Segment group 0's region wins, first in table order. `[R]` The reasons are recorded at
-`crates/ax/thekernel-axplat-x86-pc/src/acpi.rs::select_pci_ecam`:
+`crates/ax/tk-axplat-x86-pc/src/acpi.rs::select_pci_ecam`:
 
 * the PCI root this kernel builds addresses one segment, and no segment number is
   expressible in a bus-device-function address, so segment 0 is the only eligible group;
@@ -144,11 +144,11 @@ fallback and the `mmio-ranges` in `n305.toml` are still the guesses listed in §
 | `pci-bus-end = 0xff` | `n305.toml [devices]` | A too-low bound silently hides devices |
 | `max-cpu-num = 8` | `n305.toml [plat]` | Fewer than eight CPUs come online |
 | Timer and IPI vectors | `n305.toml [devices]` | Not machine facts; kernel convention |
-| Primary console = COM1 at `0x3f8`, diagnostics = COM2 at `0x2f8` | `crates/ax/thekernel-axplat-x86-pc/src/console.rs` | No console output at all on this machine |
+| Primary console = COM1 at `0x3f8`, diagnostics = COM2 at `0x2f8` | `crates/ax/tk-axplat-x86-pc/src/console.rs` | No console output at all on this machine |
 
 `plat.phys-memory-size` is **not** on that list because it is inert: no Rust source in
 `crates/` or `kernel/` mentions `PHYS_MEMORY` `[V]`, and installed RAM comes from the
-Multiboot2 memory map (`crates/ax/thekernel-axplat-x86-pc/src/mem.rs::init` `[R]`). Do not
+Multiboot2 memory map (`crates/ax/tk-axplat-x86-pc/src/mem.rs::init` `[R]`). Do not
 use it to describe this machine's 16 GiB. A host test fails if any Rust source starts
 reading it, so the comment cannot silently go stale. `[V]`
 
@@ -170,7 +170,7 @@ The N305 has no legacy COM port. What that breaks, and what it does not:
   transmitter-ready bit, so the write path does not spin or fault — the bytes simply go
   nowhere. `[I]`
 * **The `[devices]` schema cannot express "no serial".** There is no serial key in
-  `config/x86_64/q35-uefi.toml`, in `crates/ax/thekernel-axplat-x86-pc/axconfig.toml`, or in
+  `config/x86_64/q35-uefi.toml`, in `crates/ax/tk-axplat-x86-pc/axconfig.toml`, or in
   any Rust source: `serial` appears in the platform crate only as the literal port base and
   the `uart_16550` dependency. `[V]` The schema is the profile TOML itself plus
   `axconfig-gen`'s key dump; a new key would need Rust code to read it. **This is reported
@@ -180,7 +180,7 @@ The N305 has no legacy COM port. What that breaks, and what it does not:
 The consequence for the target machine is that the framebuffer console is not a
 convenience, it is the only output channel — which is why the framebuffer verdict is now
 reported to the kernel log (§1.5; `axhal::boot::framebuffer_rejection` and the boot-path
-`info!`/`warn!` line in `crates/ax/thekernel-axruntime/src/lib.rs`). `[R]` `[V]`
+`info!`/`warn!` line in `crates/ax/tk-axruntime/src/lib.rs`). `[R]` `[V]`
 
 ---
 

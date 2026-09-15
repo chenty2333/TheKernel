@@ -4,12 +4,12 @@ use core::{ffi::c_char, mem::size_of};
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::current;
 use linux_raw_sys::general::{CAP_SETUID, CAP_SYS_ADMIN};
-use thekernel_linux_cred::KeyPermissionMask;
-use thekernel_linux_keyring::uapi::{
+use tk_linux_cred::KeyPermissionMask;
+use tk_linux_keyring::uapi::{
     KEY_CALLOUT_STRING_MAX, KEY_DESCRIPTION_STRING_MAX, KEY_TYPE_STRING_MAX, KeyctlPlan,
     KeyctlUapiError, RawKeyctlArgs, UserBuffer, UserString, capabilities_bytes, decode_keyctl,
 };
-use thekernel_linux_usercopy::{
+use tk_linux_usercopy::{
     UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded, vm_write_slice,
 };
 
@@ -61,7 +61,7 @@ fn load_keyctl_iov_payload<M: UserMemory + ?Sized>(
             .checked_add(iov.iov_len as usize)
             .ok_or(AxError::InvalidInput)
     })?;
-    if total > thekernel_linux_keyring::uapi::KEYCTL_UPDATE_PAYLOAD_MAX {
+    if total > tk_linux_keyring::uapi::KEYCTL_UPDATE_PAYLOAD_MAX {
         return Err(AxError::InvalidInput);
     }
     let mut payload = Vec::new();
@@ -435,7 +435,7 @@ pub fn sys_keyctl<M: UserMemory + ?Sized>(
 mod tests {
     use core::{mem::MaybeUninit, ptr};
 
-    use thekernel_linux_usercopy::{UserCopyError, VmResult};
+    use tk_linux_usercopy::{UserCopyError, VmResult};
 
     use super::*;
     use crate::task::{Kgid, Kuid, UserNamespace, ns_capable};
@@ -563,7 +563,7 @@ mod tests {
                 2,
                 1,
                 ptr::null::<u8>() as usize,
-                thekernel_linux_keyring::uapi::KEYCTL_UPDATE_PAYLOAD_MAX + 1,
+                tk_linux_keyring::uapi::KEYCTL_UPDATE_PAYLOAD_MAX + 1,
                 0,
             ),
             Err(AxError::InvalidInput)

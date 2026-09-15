@@ -13,9 +13,9 @@ use axhal::{
 use axtask::current;
 use linux_raw_sys::general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, CAP_SYS_PTRACE};
 use memory_addr::{PAGE_SIZE_4K, VirtAddr};
-use thekernel_linux_process_adapter::Pid;
-use thekernel_linux_signal::Signo;
-use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, vm_load_until_nul};
+use tk_linux_process_adapter::Pid;
+use tk_linux_signal::Signo;
+use tk_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, vm_load_until_nul};
 
 use crate::{
     file::{
@@ -907,7 +907,7 @@ mod tests {
 
     use axerrno::AxError;
     use linux_raw_sys::general::CAP_SYS_PTRACE;
-    use thekernel_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
+    use tk_linux_usercopy::{UserCopyError, UserMemory, UserMemoryContext, VmResult};
 
     use super::{
         ExecArgSizer, MappingFlags, PAGE_SIZE_4K, UserContext, VirtAddr, classify_exec_trace_state,

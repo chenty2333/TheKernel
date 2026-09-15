@@ -1,10 +1,10 @@
 //! Thin BPF boundary imports.
 //!
-//! Linux command values and `bpf_attr` layouts live in `thekernel-linux-bpf`.
+//! Linux command values and `bpf_attr` layouts live in `tk-linux-bpf`.
 //! The portable instruction encoding and verifier limits live in `axbpf`.
 
 pub use axbpf::Instruction as BpfInsn;
-pub use thekernel_linux_bpf::*;
+pub use tk_linux_bpf::*;
 
 // These map kinds are present in the Linux UAPI used by the kernel, but the
 // small shared BPF-layout crate intentionally does not expose the complete
