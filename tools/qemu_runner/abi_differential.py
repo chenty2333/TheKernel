@@ -82,7 +82,7 @@ CONTRACTS.update({
     "mlock": ("raw-differential", "pass", "HOLE_COMMITS_PREFIX"),
     "mlock2": ("raw-differential", "pass", "HOLE_COMMITS_PREFIX"),
     "munlock": ("raw-differential", "pass", "HOLE_COMMITS_PREFIX"),
-    "process-madvise": ("raw-differential", "pass", "SELF_DESTRUCTIVE_ADVICE"),
+    "process-madvise": ("raw-differential", "pass", "PIDFD_SELF_IDENTIFIERS NON_PIDFD_EBADF SELF_DESTRUCTIVE_ADVICE"),
     "mlockall": ("raw-differential", "pass", "POPULATE_FAILURE_IGNORED"),
 })
 CONTRACTS.update({
@@ -212,6 +212,11 @@ CONTRACTS.update({
 })
 CONTRACTS.update({
     "console_integrity": ("raw-differential", "pass", "INTERLEAVED_WRITERS"),
+    "brk": ("raw-differential", "pass", "BREAK_ALIGNMENT SHRINK_KEEPS_BREAK GROW_INTO_HOLE GUARD_GAP_BOUNDARY"),
+    "mmap": ("raw-differential", "pass", "ANON_OFFSET_IGNORED PROT_GROWSDOWN_UP DROPPABLE_MATRIX LOCKED_LIMIT_ERRNOS"),
+    "madvise": ("raw-differential", "pass", "DONTNEED_LOCKED REMOVE_BY_MAPPING_TYPE FREE_LOCKED_EINVAL UNAVAILABLE_ADVICES GUARD_AND_DONTDUMP WIPEONFORK_HOLE"),
+    "msync": ("raw-differential", "pass", "PARTIAL_LOCK_EBUSY PREFIX_FLUSHED_BEFORE_EBUSY"),
+    "process-mrelease": ("raw-differential", "pass", "SELF_IDENTIFIERS_EINVAL NON_PIDFD_EBADF"),
 })
 PROGRAM_CASES = {
     "tty-job-control": ("tty-job-control",),
@@ -222,7 +227,7 @@ PROGRAM_CASES = {
     "eventfd": ("eventfd",), "creat": ("creat",), "time": ("time",),
     "umask": ("umask",), "native-ni": ("native-ni",),
     "fsattrs": ("setxattrat", "getxattrat", "listxattrat", "removexattrat", "file-getattr", "file-setattr", "open-tree-attr"),
-    "mm-contracts": ("mprotect", "munmap", "mincore", "process-vm-readv", "process-vm-writev", "mseal", "mlock", "mlock2", "munlock", "process-madvise", "mlockall"),
+    "mm-contracts": ("mprotect", "munmap", "mincore", "process-vm-readv", "process-vm-writev", "mseal", "mlock", "mlock2", "munlock", "process-madvise", "mlockall", "brk", "mmap", "madvise", "msync", "process-mrelease"),
     "network-basic": ("network_bind", "network_connect", "network_getpeername", "network_sendto"),
     "signal-boundary": ("rt_sigaction", "sigaltstack", "rt_tgsigqueueinfo", "restart_syscall"),
     "stat-access": ("access", "faccessat", "faccessat2", "newfstatat", "statx"),
@@ -315,6 +320,9 @@ SYSCALL_CASES = {
     286: ("fs-boundary", "timerfd_settime"), 149: ("mm-contracts", "mlock"),
     325: ("mm-contracts", "mlock2"), 150: ("mm-contracts", "munlock"),
     440: ("mm-contracts", "process-madvise"), 151: ("mm-contracts", "mlockall"),
+    448: ("mm-contracts", "process-mrelease"), 12: ("mm-contracts", "brk"),
+    9: ("mm-contracts", "mmap"), 28: ("mm-contracts", "madvise"),
+    26: ("mm-contracts", "msync"),
     73: ("fs-boundary", "flock"), 280: ("fs-boundary", "utimensat"),
     285: ("fs-boundary", "fallocate"), 187: ("fs-boundary", "readahead"),
     21: ("stat-access", "access"), 269: ("stat-access", "faccessat"),

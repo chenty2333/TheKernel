@@ -708,7 +708,7 @@ handler = "kernel/src/syscall/fs/memfd.rs:sys_memfd_create"
 conditional = "explicit-none"
 tests = ["kernel/src/file/memfd.rs:writable_registration_is_idempotent_and_blocks_seal_write"]
 validation_gaps = ["No registered differential case exercises this syscall's newly aligned behaviour; host tests and source agreement against Linux v7.2.3 are the evidence"]
-limitations = ["MFD_HUGETLB returns ENOSYS for every request, where a kernel built with hugetlbfs creates a file for the default huge-page size and reports ENODEV for an unregistered one"]
+limitations = ["MFD_HUGETLB always fails with EOPNOTSUPP where the oracle, built with hugetlbfs, creates a default-size hugetlbfs file for MFD_HUGETLB and for MFD_HUGETLB|MFD_HUGE_2MB, answers ENODEV for MFD_HUGE_1GB and for an unregistered size log, and EINVAL for a reserved bit; the missing primitive is a kernel-internal anonymous hugetlbfs inode on the per-hstate MemoryFs instance, because MemoryFs files are only reachable through a path-mounted instance"]
 
 [[contract]]
 id = "linux-userfaultfd"
