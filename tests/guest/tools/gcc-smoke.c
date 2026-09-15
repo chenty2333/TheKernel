@@ -33,7 +33,7 @@
  *
  * Stable markers:
  *   THEKERNEL_GCC_SMOKE_OK
- *   THEKERNEL_GCC_SMOKE_FAIL <operation> condition=<c> k=v ... errno=<n> (<message>)
+ *   THEKERNEL_GCC_SMOKE_FAIL <operation> condition=<c> k=v ... [errno=<n> (<message>)]
  *   THEKERNEL_GCC_SMOKE_CHILD: <line>          captured child output line
  *   THEKERNEL_GCC_SMOKE_<STAGE> k=v ...        greppable progress
  */
@@ -70,7 +70,6 @@
 #define POLL_SLICE_MS 50
 
 #define TRANSCRIPT_BYTES 32768U
-#define TRANSCRIPT_LINE_BYTES 1024U
 
 /* Room for a guest path plus the longest suffix appended to one below.  Sized
  * with the suffix in mind rather than exactly: a buffer that can hold PATH_MAX
@@ -148,7 +147,14 @@ static void fail(const char *operation, const char *condition, const char *forma
     va_start(arguments, format);
     vfprintf(stdout, format, arguments);
     va_end(arguments);
-    fprintf(stdout, " errno=%d (%s)\n", saved, strerror(saved));
+    /* The errno tail is printed only when errno is nonzero: several conditions
+     * below fail on a value the case computed (an exit status, a missing
+     * marker) rather than on a syscall, and there a stale errno from an
+     * unrelated earlier call would read as evidence it is not. */
+    if (saved != 0) {
+        fprintf(stdout, " errno=%d (%s)", saved, strerror(saved));
+    }
+    fputc('\n', stdout);
     fflush(stdout);
 }
 
@@ -237,6 +243,18 @@ struct run {
     int timed_out;
 };
 
+/* The child is killed by process group so that a compiler's own children die
+ * with it.  When setpgid failed in both parent and child the group does not
+ * exist and the group kill fails with ESRCH; then the child itself is killed
+ * directly, because a waitpid on a live child would hang past the deadline
+ * the kill was enforcing. */
+static void kill_child(pid_t child)
+{
+    if (kill(-child, SIGKILL) != 0) {
+        kill(child, SIGKILL);
+    }
+}
+
 /* Run one program to completion, capturing its output.
  *
  * The child is placed in its own process group and the group is killed on the
@@ -296,7 +314,7 @@ static int run_capture(struct transcript *t, int64_t timeout_ms, struct run *run
         int ready;
 
         if (now < 0) {
-            kill(-child, SIGKILL);
+            kill_child(child);
             while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
                 continue;
             }
@@ -304,7 +322,7 @@ static int run_capture(struct transcript *t, int64_t timeout_ms, struct run *run
             return -1;
         }
         if (now >= deadline) {
-            kill(-child, SIGKILL);
+            kill_child(child);
             while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
                 continue;
             }
@@ -313,15 +331,24 @@ static int run_capture(struct transcript *t, int64_t timeout_ms, struct run *run
             close(pipe_fds[0]);
             return 0;
         }
-        descriptor.fd = pipe_fds[0];
-        descriptor.events = drained ? 0 : POLLIN;
-        descriptor.revents = 0;
-        ready = poll(&descriptor, 1, POLL_SLICE_MS);
+        /* Once the pipe has been drained it sits at POLLHUP, which poll reports
+         * regardless of the requested events: polling the descriptor anyway
+         * would return at once and spin at 100% CPU until the child exits.
+         * With nothing left to read, poll on no descriptors purely for the
+         * bounded slice. */
+        if (drained) {
+            ready = poll(NULL, 0, POLL_SLICE_MS);
+        } else {
+            descriptor.fd = pipe_fds[0];
+            descriptor.events = POLLIN;
+            descriptor.revents = 0;
+            ready = poll(&descriptor, 1, POLL_SLICE_MS);
+        }
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            kill(-child, SIGKILL);
+            kill_child(child);
             while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
                 continue;
             }
@@ -339,7 +366,7 @@ static int run_capture(struct transcript *t, int64_t timeout_ms, struct run *run
             } else if (bytes == 0) {
                 drained = 1;
             } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-                kill(-child, SIGKILL);
+                kill_child(child);
                 while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
                     continue;
                 }
@@ -352,10 +379,31 @@ static int run_capture(struct transcript *t, int64_t timeout_ms, struct run *run
 
             if (done == child) {
                 /* Drain what is left before reporting, so the last line of a
-                 * failing compile is never lost. */
+                 * failing compile is never lost.  The drain is bounded by what
+                 * remains of the deadline: a grandchild that inherited the
+                 * write end would otherwise keep this read blocking after the
+                 * child is gone. */
                 for (;;) {
                     char chunk[1024];
-                    ssize_t bytes = read(pipe_fds[0], chunk, sizeof(chunk));
+                    ssize_t bytes;
+                    int64_t remaining = deadline - monotonic_ms();
+                    struct pollfd drain_fd;
+                    int drain_ready;
+
+                    if (remaining <= 0) {
+                        break;
+                    }
+                    drain_fd.fd = pipe_fds[0];
+                    drain_fd.events = POLLIN;
+                    drain_fd.revents = 0;
+                    drain_ready = poll(&drain_fd, 1, (int)remaining);
+                    if (drain_ready < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    if (drain_ready <= 0) {
+                        break;
+                    }
+                    bytes = read(pipe_fds[0], chunk, sizeof(chunk));
 
                     if (bytes > 0) {
                         for (ssize_t index = 0; index < bytes; ++index) {
@@ -380,7 +428,7 @@ static int run_capture(struct transcript *t, int64_t timeout_ms, struct run *run
                 return 0;
             }
             if (done < 0 && errno != EINTR && errno != ECHILD) {
-                kill(-child, SIGKILL);
+                kill_child(child);
                 close(pipe_fds[0]);
                 return -1;
             }
@@ -447,7 +495,6 @@ int main(void)
     struct transcript t;
     struct run run;
     int64_t version_ms = 0, compile_ms = 0, program_ms = 0;
-    int have_version = 0;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
@@ -518,7 +565,6 @@ int main(void)
             fail("run-driver", "printed-version", "path=%s", gcc);
             return 1;
         }
-        have_version = 1;
         emit("THEKERNEL_GCC_SMOKE_VERSION elapsed_ms=%lld", (long long)version_ms);
     }
 
@@ -527,10 +573,11 @@ int main(void)
         char *const argv[] = { (char *)gcc, (char *)"-O2", (char *)"-pthread",
                                (char *)"-o", program_path, main_path, helper_path,
                                (char *)"-lm", NULL };
-        /* The scratch directory is searched for the intermediate files, so it
-         * goes into the environment the compiler sees. */
-        char *const env[] = { COMPILER_ENV[0], COMPILER_ENV[1], COMPILER_ENV[2],
-                              tmpdir, NULL };
+        /* TMPDIR is REPLACED, not appended: glibc's getenv returns the first
+         * match, so a second TMPDIR entry after COMPILER_ENV[1]'s TMPDIR=/tmp
+         * would be dead and the intermediates would land in /tmp instead of
+         * the scratch directory. */
+        char *const env[] = { COMPILER_ENV[0], tmpdir, COMPILER_ENV[2], NULL };
 
         transcript_init(&t);
         emit("THEKERNEL_GCC_SMOKE_COMPILE_BEGIN");
@@ -539,9 +586,9 @@ int main(void)
             return 1;
         }
         compile_ms = run.elapsed_ms;
-        emit("THEKERNEL_GCC_SMOKE_COMPILE_EXIT status=%lld elapsed_ms=%lld lines=%llu",
+        emit("THEKERNEL_GCC_SMOKE_COMPILE_EXIT status=%lld elapsed_ms=%lld lines=%llu truncated=%u",
              (long long)run.exit_status, (long long)compile_ms,
-             (unsigned long long)t.total);
+             (unsigned long long)t.total, t.truncated);
         if (run.timed_out) {
             fail("compile", "bounded-deadline", "elapsed_ms=%lld timeout_ms=%d",
                  (long long)compile_ms, COMPILE_TIMEOUT_MS);
@@ -591,7 +638,6 @@ int main(void)
         }
     }
 
-    (void)have_version;
     emit("THEKERNEL_GCC_SMOKE_OK version_ms=%lld compile_ms=%lld program_ms=%lld",
          (long long)version_ms, (long long)compile_ms, (long long)program_ms);
     return 0;

@@ -96,18 +96,23 @@
  *     Boot with apic=debug and send a report.  Then try booting with the
  *     'noapic' option.
  *
- * Measured: the same image and arguments boot in 75.7 s on an idle machine and
- * panic with that message while a concurrent compile saturates the host.  A
+ * Measured: the same image and arguments boot in 75.7 s on an idle machine
+ * (one quiet run; the 77-88 s band quoted with the deadline below is the range
+ * across repeated runs) and panic with that message while a concurrent compile
+ * saturates the host.  A
  * deadline that fails under load is one thing (there is one of those above),
  * but a *panic* under load is worse: it reports host contention as a failure of
  * the nested boot, and it does so with a kernel trace that looks like real
  * evidence.
  *
- * The outer machine already runs with no local APIC of its own to speak of, and
- * the inner one is fully emulated, so taking the kernel's own advice costs
- * nothing this test is trying to measure: the claim under test is that a second
- * kernel boots and runs userspace inside the guest, not that it programs an
- * IO-APIC through two layers of emulation. */
+ * The inner machine's APIC is emulated entirely by the inner QEMU, so
+ * programming it or skipping it exercises QEMU, not TheKernel -- which is why
+ * taking the kernel's own advice costs nothing this test is trying to measure:
+ * the claim under test is that a second kernel boots and runs userspace inside
+ * the guest, not that it programs an IO-APIC through two layers of emulation.
+ * Do note that `noapic` stops being free if INNER_CPUS above is ever raised
+ * past 1: SMP interrupt routing wants the IO-APIC, and this flag would have to
+ * be revisited with it. */
 #define INNER_APPEND "console=ttyS0 rdinit=/init quiet noapic"
 
 /* Deadlines.  This inner boot takes ~1.7 s on host TCG.  Measured inside the

@@ -30,7 +30,7 @@
  *
  * Stable markers:
  *   THEKERNEL_GLIBC_SMOKE_OK
- *   THEKERNEL_GLIBC_SMOKE_FAIL <operation> condition=<c> k=v ... errno=<n> (<message>)
+ *   THEKERNEL_GLIBC_SMOKE_FAIL <operation> condition=<c> k=v ... [errno=<n> (<message>)]
  *   THEKERNEL_GLIBC_SMOKE_CHILD: <line>        captured child output line
  *   THEKERNEL_GLIBC_SMOKE_<STAGE> k=v ...      greppable progress
  */
@@ -141,7 +141,14 @@ static void fail(const char *operation, const char *condition, const char *forma
     va_start(arguments, format);
     vfprintf(stdout, format, arguments);
     va_end(arguments);
-    fprintf(stdout, " errno=%d (%s)\n", saved, strerror(saved));
+    /* The errno tail is printed only when errno is nonzero: several conditions
+     * below fail on a value the case computed (an exit status, a missing
+     * marker) rather than on a syscall, and there a stale errno from an
+     * unrelated earlier call would read as evidence it is not. */
+    if (saved != 0) {
+        fprintf(stdout, " errno=%d (%s)", saved, strerror(saved));
+    }
+    fputc('\n', stdout);
     fflush(stdout);
 }
 
@@ -243,6 +250,13 @@ static int inspect_program(const char *path, struct elf_facts *facts)
     }
     facts->is_64 = 1;
     facts->machine = load_u16(header + ELF_MACHINE_OFFSET);
+    if (facts->machine != EM_X86_64) {
+        /* The case is x86_64-only, so a program built for another machine is a
+         * staging bug, reported here rather than as an exec failure later. */
+        close(fd);
+        errno = ENOEXEC;
+        return -1;
+    }
 
     phoff = load_u64(header + ELF_PHOFF64);
     phentsize = load_u16(header + ELF_PHENTSIZE64);
@@ -429,7 +443,12 @@ static void child_reap(struct child *child)
     if (child->pid <= 0) {
         return;
     }
-    kill(-child->pid, SIGKILL);
+    /* The group kill fails with ESRCH when setpgid failed in both parent and
+     * child; kill the child directly then, or the waitpid below would hang
+     * past the deadline this function was enforcing. */
+    if (kill(-child->pid, SIGKILL) != 0) {
+        kill(child->pid, SIGKILL);
+    }
     while (waitpid(child->pid, &status, 0) < 0 && errno == EINTR) {
         continue;
     }
@@ -501,10 +520,19 @@ static int run_program(struct child *child, const char *program, struct transcri
             *elapsed_ms = now - started;
             return 1;
         }
-        descriptor.fd = child->fd;
-        descriptor.events = drained ? 0 : POLLIN;
-        descriptor.revents = 0;
-        ready = poll(&descriptor, 1, POLL_SLICE_MS);
+        /* Once the pipe has been drained it sits at POLLHUP, which poll reports
+         * regardless of the requested events: polling the descriptor anyway
+         * would return at once and spin at 100% CPU until the child exits.
+         * With nothing left to read, poll on no descriptors purely for the
+         * bounded slice. */
+        if (drained) {
+            ready = poll(NULL, 0, POLL_SLICE_MS);
+        } else {
+            descriptor.fd = child->fd;
+            descriptor.events = POLLIN;
+            descriptor.revents = 0;
+            ready = poll(&descriptor, 1, POLL_SLICE_MS);
+        }
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
@@ -534,9 +562,32 @@ static int run_program(struct child *child, const char *program, struct transcri
             pid_t done = waitpid(child->pid, &status, WNOHANG);
 
             if (done == child->pid) {
+                /* Drain what is left before reporting, so the last line of a
+                 * failing program is never lost.  The drain is bounded by what
+                 * remains of the deadline: a grandchild that inherited the
+                 * write end would otherwise keep this read blocking after the
+                 * child is gone. */
                 for (;;) {
                     char chunk[1024];
-                    ssize_t bytes = read(child->fd, chunk, sizeof(chunk));
+                    ssize_t bytes;
+                    int64_t remaining = deadline - monotonic_ms();
+                    struct pollfd drain_fd;
+                    int drain_ready;
+
+                    if (remaining <= 0) {
+                        break;
+                    }
+                    drain_fd.fd = child->fd;
+                    drain_fd.events = POLLIN;
+                    drain_fd.revents = 0;
+                    drain_ready = poll(&drain_fd, 1, (int)remaining);
+                    if (drain_ready < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    if (drain_ready <= 0) {
+                        break;
+                    }
+                    bytes = read(child->fd, chunk, sizeof(chunk));
 
                     if (bytes > 0) {
                         for (ssize_t index = 0; index < bytes; ++index) {
@@ -677,7 +728,7 @@ int main(void)
         return 1;
     }
 
-    emit("THEKERNEL_GLIBC_SMOKE_OK elapsed_ms=%lld lines=%llu loader_base=0x%lx",
-         (long long)elapsed_ms, (unsigned long long)t.total, t.loader_base);
+    emit("THEKERNEL_GLIBC_SMOKE_OK elapsed_ms=%lld lines=%llu truncated=%d loader_base=0x%lx",
+         (long long)elapsed_ms, (unsigned long long)t.total, t.truncated, t.loader_base);
     return 0;
 }
