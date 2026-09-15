@@ -106,10 +106,10 @@ static void expect_value(const char *kase, const char *assertion, long result,
     report_failure(assertion, result, error);
 }
 
-#define PTRACE_CASE "sysadmin-abi.ptrace-requests"
-#define UNSHARE_CASE "sysadmin-abi.unshare-flags"
-#define SWAP_CASE "sysadmin-abi.swap-flags"
-#define MODULE_CASE "sysadmin-abi.module-image"
+#define PTRACE_CASE "sysadmin-abi.ptrace-requests.raw-differential"
+#define UNSHARE_CASE "sysadmin-abi.unshare-flags.raw-differential"
+#define SWAP_CASE "sysadmin-abi.swap-flags.raw-differential"
+#define MODULE_CASE "sysadmin-abi.module-image.raw-differential"
 
 /* --- ptrace request decoding ------------------------------------------- */
 
@@ -117,7 +117,7 @@ static void ptrace_request_case(void) {
     int status = 0;
     pid_t child = fork();
 
-    puts("THEKERNEL_ABI_CASE sysadmin-abi.ptrace-requests");
+    puts("THEKERNEL_ABI_CASE sysadmin-abi.ptrace-requests.raw-differential");
 
     if (child < 0) {
         report_failure("PTRACE_FORK", -1, errno);
@@ -246,7 +246,7 @@ static void ptrace_request_case(void) {
 #endif
 
 static void unshare_flag_case(void) {
-    puts("THEKERNEL_ABI_CASE sysadmin-abi.unshare-flags");
+    puts("THEKERNEL_ABI_CASE sysadmin-abi.unshare-flags.raw-differential");
 
     /* kernel/fork.c `check_unshare_flags()` accepts CLONE_THREAD,
      * CLONE_SIGHAND and CLONE_VM, and nothing in `ksys_unshare()` consumes
@@ -287,7 +287,7 @@ static void unshare_flag_case(void) {
 /* --- swapon / swapoff validation order --------------------------------- */
 
 static void swap_flag_case(void) {
-    puts("THEKERNEL_ABI_CASE sysadmin-abi.swap-flags");
+    puts("THEKERNEL_ABI_CASE sysadmin-abi.swap-flags.raw-differential");
 
     /* mm/swapfile.c `SYSCALL_FINE2(swapon, ...)` tests `swap_flags &
      * ~SWAP_FLAGS_VALID` *before* `capable(CAP_SYS_ADMIN)`, and both before the
@@ -319,7 +319,7 @@ static void swap_flag_case(void) {
 #endif
 
 static void module_image_case(void) {
-    puts("THEKERNEL_ABI_CASE sysadmin-abi.module-image");
+    puts("THEKERNEL_ABI_CASE sysadmin-abi.module-image.raw-differential");
 
     /* kernel/module/main.c `copy_module_from_user()`: an image shorter than
      * `sizeof(Elf_Ehdr)` (64 on x86_64) is -ENOEXEC, including a zero length,

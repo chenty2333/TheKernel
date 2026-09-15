@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 249
-implemented = 230
+resolved = 282
+implemented = 263
 explicit_enosys = 19
 fallback = 0
-partial = 136
+partial = 103
 unknown = 0
 
 [[contract]]
@@ -255,9 +255,9 @@ status = "partial"
 contract = "linux-open_tree_attr"
 handler = "kernel/src/syscall/fs/mount.rs:sys_open_tree_attr"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/fsattrs-differential.c:main"]
-validation_gaps = ["Current paired clone/provider/error cases pass; OPEN_TREE_NAMESPACE behavior remains unimplemented and unverified"]
-limitations = ["OPEN_TREE_NAMESPACE is not accepted by the shared open-tree validator"]
+tests = ["tests/guest/portable/fsattrs-differential.c:main", "tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["the shared open-tree validator admits the namespace flag but the caller reports EOPNOTSUPP for it, where Linux with CAP_SYS_ADMIN returns a descriptor"]
 
 [[cell]]
 number = 468
@@ -610,13 +610,13 @@ teardown = ["teardown:request-owned usercopy state and retained OFD released on 
 [[cell]]
 number = 16
 name = "ioctl"
-status = "partial"
+status = "implemented"
 contract = "linux-ioctl"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_ioctl"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:fionbio_uses_the_complete_int_and_treats_every_nonzero_as_enabled", "kernel/src/file/fiemap.rs:linux_fiemap_layout_matches_x86_64_uapi"]
-validation_gaps = ["The complete tty DRM socket filesystem and namespace ioctl command matrix has no combined Linux 7.2.3 differential test"]
-limitations = ["regular file provider lacks FIGETBSZ FIFREEZE FITHAW FS_IOC_GETFSUUID and FS_IOC_GETFSSYSFSPATH and returns ENOTTY for those commands"]
+tests = ["kernel/src/syscall/fs/ctl.rs:fionbio_uses_the_complete_int_and_treats_every_nonzero_as_enabled", "kernel/src/file/fiemap.rs:linux_fiemap_layout_matches_x86_64_uapi", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-landlock_create_ruleset"
@@ -633,13 +633,13 @@ teardown = ["teardown:ruleset fd and domain references retain VFS locations unti
 [[cell]]
 number = 444
 name = "landlock_create_ruleset"
-status = "partial"
+status = "implemented"
 contract = "linux-landlock_create_ruleset"
 handler = "kernel/src/syscall/landlock.rs:sys_landlock_create_ruleset"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/landlock.rs:create_ruleset_errata_query_requires_null_zero_arguments"]
-validation_gaps = ["No guest differential test for ruleset enforcement path/network denial or thread-group synchronization"]
-limitations = ["returns Landlock ABI7 instead of Linux7.2.3 ABI10; rejects FS_RESOLVE_UNIX and UDP access rights", "ruleset lacks ABI10 quiet_access_fs quiet_access_net quiet_scoped extension fields"]
+tests = ["kernel/src/syscall/landlock.rs:create_ruleset_errata_query_requires_null_zero_arguments", "tests/guest/portable/landlock-abi-differential.c:main"]
+validation_gaps = ["The ABI version, errata mask, attribute size and handled-access masks are verified against Linux v7.2.3 by source agreement and the registered case"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-landlock_add_rule"
@@ -660,9 +660,9 @@ status = "partial"
 contract = "linux-landlock_add_rule"
 handler = "kernel/src/syscall/landlock.rs:sys_landlock_add_rule"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/landlock.rs:masks_exclude_unknown_bits"]
-validation_gaps = ["No guest differential test for ruleset enforcement path/network denial or thread-group synchronization"]
-limitations = ["rejects LANDLOCK_ADD_RULE_QUIET and UDP/FS_RESOLVE_UNIX rules supported by Linux7.2.3"]
+tests = ["kernel/src/syscall/landlock.rs:masks_exclude_unknown_bits", "tests/guest/portable/landlock-abi-differential.c:main"]
+validation_gaps = ["landlock_add_rule is driven by the landlock-abi differential, but the rule-count ceiling is covered by source agreement only"]
+limitations = ["the rule count is capped at 4096 with E2BIG, which is not a Linux limit: LANDLOCK_MAX_NUM_RULES is UINT_MAX"]
 
 [[contract]]
 id = "linux-landlock_restrict_self"
@@ -683,9 +683,9 @@ status = "partial"
 contract = "linux-landlock_restrict_self"
 handler = "kernel/src/syscall/landlock.rs:sys_landlock_restrict_self"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/landlock.rs:abi_shapes_are_linux_612"]
-validation_gaps = ["No guest differential test for ruleset enforcement path/network denial or thread-group synchronization"]
-limitations = ["rejects LANDLOCK_RESTRICT_SELF_TSYNC and cannot atomically synchronize domain across the thread group"]
+tests = ["kernel/src/syscall/landlock.rs:abi_shapes_are_linux_612", "tests/guest/portable/landlock-abi-differential.c:main"]
+validation_gaps = ["landlock_restrict_self is driven by the landlock-abi differential, but the sibling no_new_privs propagation is covered by source agreement only"]
+limitations = ["TSYNC copies the domain to sibling threads but not the no_new_privs bit, which Linux sets on every sibling, so a synchronised sibling still reports no_new_privs clear and can gain privilege through execve"]
 
 [[contract]]
 id = "linux-memfd_create"
@@ -707,8 +707,8 @@ contract = "linux-memfd_create"
 handler = "kernel/src/syscall/fs/memfd.rs:sys_memfd_create"
 conditional = "explicit-none"
 tests = ["kernel/src/file/memfd.rs:writable_registration_is_idempotent_and_blocks_seal_write"]
-validation_gaps = ["No complete Linux7.2.3 guest differential covers creation flags mapping lifetime and teardown"]
-limitations = ["MFD_HUGETLB MFD_NOEXEC_SEAL and MFD_EXEC are rejected with EINVAL although Linux7.2.3 supports them"]
+validation_gaps = ["No registered differential case exercises this syscall's newly aligned behaviour; host tests and source agreement against Linux v7.2.3 are the evidence"]
+limitations = ["MFD_HUGETLB returns ENOSYS for every request, where a kernel built with hugetlbfs creates a file for the default huge-page size and reports ENODEV for an unregistered one"]
 
 [[contract]]
 id = "linux-userfaultfd"
@@ -730,8 +730,8 @@ contract = "linux-userfaultfd"
 handler = "kernel/src/syscall/fs/userfaultfd.rs:sys_userfaultfd"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/fs/userfaultfd.rs:profile_gate_distinguishes_permission_from_unknown_bits", "tests/guest/tools/userfaultfd-smoke.c:main"]
-validation_gaps = ["No complete Linux7.2.3 guest differential covers creation flags mapping lifetime and teardown"]
-limitations = ["privileged creation without UFFD_USER_MODE_ONLY is not supported; local profile always returns EPERM"]
+validation_gaps = ["The creation gate is covered by helper tests; the privileged half has no guest assertion"]
+limitations = ["Privileged userfaultfd creation still answers EPERM for every caller because this kernel never delivers kernel-mode faults, where Linux admits the privileged case"]
 
 [[contract]]
 id = "linux-memfd_secret"
@@ -776,8 +776,8 @@ contract = "linux-seccomp"
 handler = "kernel/src/syscall/seccomp.rs:sys_seccomp"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/seccomp.rs:strict_allowlist_is_exact", "tests/guest/portable/seccomp-smoke.c:main"]
-validation_gaps = ["The full action notification and ptrace interaction matrix lacks a Linux7.2.3 differential run"]
-limitations = ["SECCOMP_RET_TRACE has no ptrace ownership lifecycle: execution always returns ENOSYS and GET_ACTION_AVAIL deliberately returns EOPNOTSUPP instead of Linux7.2.3 support"]
+validation_gaps = ["SECCOMP_RET_TRACE has no ptrace ownership lifecycle, so a TRACE verdict can only take the no-tracer ENOSYS path; LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET enforcement and scope audit records are also missing"]
+limitations = ["SECCOMP_GET_ACTION_AVAIL under-reports: it answers EOPNOTSUPP for SECCOMP_RET_TRACE where Linux returns 0, and the seccomp smoke test hard-codes that divergence as the expected answer"]
 
 [[contract]]
 id = "linux-mmap"
@@ -799,8 +799,8 @@ contract = "linux-mmap"
 handler = "kernel/src/syscall/mm/mmap.rs:sys_mmap"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/mm/mmap.rs:mmap_hooks_run_file_then_address_and_stop_on_denial"]
-validation_gaps = ["No complete Linux7.2.3 differential covers the declared flag and concurrency matrix"]
-limitations = ["MAP_NORESERVE is parsed but anonymous writable mappings still use the same overcommit reservation admission"]
+validation_gaps = ["No registered differential case exercises this syscall's newly aligned behaviour; host tests and source agreement against Linux v7.2.3 are the evidence"]
+limitations = ["an anonymous mapping with a non-zero offset is EINVAL where Linux ignores pgoff, an unknown PROT bit is EINVAL where Linux ignores it, MAP_LOCKED with a zero memlock limit is EAGAIN where Linux is EPERM, and MAP_DROPPABLE is missing"]
 
 [[contract]]
 id = "linux-madvise"
@@ -822,8 +822,8 @@ contract = "linux-madvise"
 handler = "kernel/src/syscall/mm/mmap.rs:sys_madvise"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/mm/mmap.rs:mseal_madvise_discard_set_matches_linux_612"]
-validation_gaps = ["No complete Linux7.2.3 differential covers the declared flag and concurrency matrix"]
-limitations = ["MADV_MERGEABLE and MADV_UNMERGEABLE only validate range and succeed without KSM state", "MADV_SOFT_OFFLINE discards instead of migrating pages; anonymous COLD/PAGEOUT lack swap reclaim"]
+validation_gaps = ["No registered differential case exercises this syscall's newly aligned behaviour; host tests and source agreement against Linux v7.2.3 are the evidence"]
+limitations = ["MADV_HWPOISON, MADV_HUGEPAGE, MADV_COLLAPSE, MADV_DONTNEED_LOCKED, MADV_REMOVE on a locked area and MADV_FREE on a locked area do not follow the KSM, transparent-hugepage and memory-failure configuration the oracle runs"]
 
 [[contract]]
 id = "linux-select"
@@ -959,9 +959,9 @@ status = "partial"
 contract = "linux-futex"
 handler = "kernel/src/syscall/sync/futex.rs:sys_futex"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/futex-smoke.c:main"]
-validation_gaps = ["No Linux7.2.3 differential covers the priority-inheritance or NUMA command matrix"]
-limitations = ["priority-inheritance LOCK_PI UNLOCK_PI TRYLOCK_PI WAIT_REQUEUE_PI and CMP_REQUEUE_PI operations are not implemented and return ENOSYS"]
+tests = ["tests/guest/portable/futex-smoke.c:main", "tests/guest/portable/futex-abi-differential.c:main"]
+validation_gaps = ["The legacy opcode, wake, requeue and PI word protocols are exercised by the futex-abi differential; the residual gaps below have no test"]
+limitations = ["Priority inheritance covers the directly blocked owner only: there is no PI chain walk, no SCHED_DEADLINE inheritance, no exit-time FUTEX_OWNER_DIED publication, and a boost is not published through the scheduler commit path"]
 
 [[contract]]
 id = "linux-futex_waitv"
@@ -983,8 +983,8 @@ contract = "linux-futex_waitv"
 handler = "kernel/src/syscall/sync/futex.rs:sys_futex_waitv"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/sync/futex.rs:futex2_only_accepts_private_or_shared_u32_words"]
-validation_gaps = ["No Linux7.2.3 differential covers the priority-inheritance or NUMA command matrix"]
-limitations = ["FUTEX2_NUMA and FUTEX2_MPOL are rejected EINVAL instead of Linux7.2.3 NUMA-aware key placement"]
+validation_gaps = ["futex_waitv has no registered differential case; the NUMA protocol is exercised through futex_wake and futex_wait only"]
+limitations = ["futex_waitv never runs the NUMA node protocol, so a FUTEX2_NUMA entry with an impossible node is accepted and blocks, FUTEX_NO_NODE is never rewritten, and a node word that is not naturally aligned for two words is not rejected"]
 
 [[contract]]
 id = "linux-futex_wake"
@@ -1001,13 +1001,13 @@ teardown = ["teardown:timeout signal exit and invalidation unlink waiter and rel
 [[cell]]
 number = 454
 name = "futex_wake"
-status = "partial"
+status = "implemented"
 contract = "linux-futex_wake"
 handler = "kernel/src/syscall/sync/futex.rs:sys_futex_wake"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sync/futex.rs:futex2_only_accepts_private_or_shared_u32_words"]
-validation_gaps = ["No Linux7.2.3 differential covers the priority-inheritance or NUMA command matrix"]
-limitations = ["FUTEX2_NUMA and FUTEX2_MPOL are rejected EINVAL instead of Linux7.2.3 NUMA-aware key placement"]
+tests = ["kernel/src/syscall/sync/futex.rs:futex2_only_accepts_private_or_shared_u32_words", "tests/guest/portable/futex-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-futex_wait"
@@ -1024,13 +1024,13 @@ teardown = ["teardown:timeout signal exit and invalidation unlink waiter and rel
 [[cell]]
 number = 455
 name = "futex_wait"
-status = "partial"
+status = "implemented"
 contract = "linux-futex_wait"
 handler = "kernel/src/syscall/sync/futex.rs:sys_futex_wait"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sync/futex.rs:futex2_only_accepts_private_or_shared_u32_words"]
-validation_gaps = ["No Linux7.2.3 differential covers the priority-inheritance or NUMA command matrix"]
-limitations = ["FUTEX2_NUMA and FUTEX2_MPOL are rejected EINVAL instead of Linux7.2.3 NUMA-aware key placement"]
+tests = ["kernel/src/syscall/sync/futex.rs:futex2_only_accepts_private_or_shared_u32_words", "tests/guest/portable/futex-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-futex_requeue"
@@ -1047,13 +1047,13 @@ teardown = ["teardown:timeout signal exit and invalidation unlink waiter and rel
 [[cell]]
 number = 456
 name = "futex_requeue"
-status = "partial"
+status = "implemented"
 contract = "linux-futex_requeue"
 handler = "kernel/src/syscall/sync/futex.rs:sys_futex_requeue"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/sync/futex.rs:futex2_only_accepts_private_or_shared_u32_words"]
-validation_gaps = ["No Linux7.2.3 differential covers the priority-inheritance or NUMA command matrix"]
-limitations = ["FUTEX2_NUMA and FUTEX2_MPOL are rejected EINVAL instead of Linux7.2.3 NUMA-aware key placement"]
+validation_gaps = ["The futex2 NUMA and MPOL rules are covered by the futex-abi differential through futex_wake and futex_wait; futex_waitv and futex_requeue have no registered case of their own"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-membarrier"
@@ -1074,9 +1074,9 @@ status = "partial"
 contract = "linux-membarrier"
 handler = "kernel/src/syscall/sync/membarrier.rs:sys_membarrier"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/membarrier-smoke.c:main"]
-validation_gaps = ["No Linux7.2.3 differential covers the complete command and CPU-target matrix"]
-limitations = ["GLOBAL GLOBAL_EXPEDITED and RSEQ expedited commands and FLAG_CPU are not supported and return EINVAL"]
+tests = ["tests/guest/tools/membarrier-smoke.c:main", "tests/guest/portable/epoll-membarrier-differential.c:main"]
+validation_gaps = ["The global commands, QUERY mask and registration state are exercised by the epoll-membarrier differential; the RSEQ pair has no test"]
+limitations = ["MEMBARRIER_CMD_PRIVATE_EXPEDITED_RSEQ and its registration return EINVAL and stay outside the QUERY mask because the mm-scoped IPI cannot publish rseq preemption state into the interrupted thread"]
 
 [[contract]]
 id = "linux-epoll_ctl"
@@ -1097,9 +1097,9 @@ status = "partial"
 contract = "linux-epoll_ctl"
 handler = "kernel/src/syscall/io_mpx/epoll.rs:sys_epoll_ctl"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/epoll-smoke.c:main"]
-validation_gaps = ["Existing guest smoke uses TheKernel-specific rejection expectations for exclusive watches"]
-limitations = ["EPOLLEXCLUSIVE is rejected EINVAL and exclusive wake distribution is absent; EPOLLMSG is rejected EOPNOTSUPP"]
+tests = ["tests/guest/portable/epoll-smoke.c:main", "tests/guest/portable/epoll-membarrier-differential.c:main"]
+validation_gaps = ["Admission is exercised by the epoll-membarrier differential; wake distribution has no test"]
+limitations = ["EPOLLEXCLUSIVE admission matches Linux 7.2.3 but exclusive wake distribution is absent because no source-side wake-owner registry exists, so an admitted ADD+EPOLLEXCLUSIVE returns EPERM"]
 
 [[contract]]
 id = "linux-brk"
@@ -1121,8 +1121,8 @@ contract = "linux-brk"
 handler = "kernel/src/syscall/mm/brk.rs:sys_brk"
 conditional = "explicit-none"
 tests = []
-validation_gaps = ["No direct guest brk growth shrink resource-limit and failure-return test"]
-limitations = ["heap growth is capped at heap_base+512MiB by USER_HEAP_SIZE_MAX independently of Linux RLIMIT and available virtual address space"]
+validation_gaps = ["No registered differential case exercises this syscall; the change is covered by source agreement with Linux v7.2.3"]
+limitations = ["heap growth requires an existing anonymous area ending exactly at the new break, so growing back after the heap was unmapped returns the old break where Linux creates a VMA; a shrink publishes the smaller break where Linux returns the original one; the collision check omits stack_guard_gap"]
 
 [[contract]]
 id = "linux-mprotect"
@@ -1879,9 +1879,9 @@ status = "partial"
 contract = "linux-socket"
 handler = "kernel/src/syscall/net/socket.rs:sys_socket"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["SOCK_PACKET and AF_UNIX SOCK_RAW compatibility are absent; NETLINK_USERSOCK protocol is rejected"]
+tests = ["tests/guest/portable/socket-provider-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["SOCK_PACKET (10) passes the creation type range but the AF_PACKET branch admits only SOCK_RAW and SOCK_DGRAM, so a CAP_NET_RAW caller gets ESOCKTNOSUPPORT where Linux installs packet_ops_spkt"]
 
 [[contract]]
 id = "linux-socketpair"
@@ -1902,9 +1902,9 @@ status = "partial"
 contract = "linux-socketpair"
 handler = "kernel/src/syscall/net/socket.rs:sys_socketpair"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["AF_UNIX SOCK_RAW compatibility and nonzero protocol validation differ from Linux"]
+tests = ["tests/guest/portable/socket-provider-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["the two reserved descriptors are not written into usockvec before a failing protocol operation, where Linux stores them first so the vector is clobbered on failure"]
 
 [[contract]]
 id = "linux-bind"
@@ -1925,9 +1925,9 @@ status = "partial"
 contract = "linux-bind"
 handler = "kernel/src/syscall/net/socket.rs:sys_bind"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/network-basic-differential.c:main"]
-validation_gaps = ["Network basic regression passed host Linux; matched TheKernel and Linux 7.2.3 guest execution remains pending; broader provider matrix remains untested"]
-limitations = ["IPv4 and IPv6 addresses longer than sockaddr_storage are accepted; Netlink requires exactly twelve bytes instead of at least twelve"]
+tests = ["tests/guest/portable/network-basic-differential.c:main", "tests/guest/portable/socket-provider-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["the netlink arm enforces only a lower bound, so a sockaddr_nl longer than sizeof(struct sockaddr_nl), or an addrlen of (u32)-1, is accepted where Linux's move_addr_to_kernel rejects it with EINVAL"]
 
 [[contract]]
 id = "linux-connect"
@@ -1948,9 +1948,9 @@ status = "partial"
 contract = "linux-connect"
 handler = "kernel/src/syscall/net/socket.rs:sys_connect"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/network-basic-differential.c:main"]
-validation_gaps = ["Network basic regression passed host Linux; matched TheKernel and Linux 7.2.3 guest execution remains pending; broader provider matrix remains untested"]
-limitations = ["Netlink peer connect and AF_UNSPEC disconnect are absent; overlong IP sockaddr is accepted"]
+tests = ["tests/guest/portable/network-basic-differential.c:main", "tests/guest/portable/socket-provider-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["AF_ALG and AF_XDP connect report ENOTSOCK or EAFNOSUPPORT where Linux's sock_no_connect reports EOPNOTSUPP, and the NETLINK_CONNECTED state that makes a non-peer unicast send fail with ECONNREFUSED is not modelled"]
 
 [[contract]]
 id = "linux-getsockname"
@@ -1971,9 +1971,9 @@ status = "partial"
 contract = "linux-getsockname"
 handler = "kernel/src/syscall/net/name.rs:sys_getsockname"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["AF_ALG returns ENOTSOCK instead of EOPNOTSUPP and XDP exposes an address where Linux rejects getname"]
+tests = ["tests/guest/portable/socket-provider-differential.c:main"]
+validation_gaps = ["The AF_ALG and AF_XDP getname refusals are verified against the Linux source but cannot be probed on the pinned oracle build, whose configuration omits CONFIG_CRYPTO_USER_API and CONFIG_XDP_SOCKETS"]
+limitations = ["the user *addrlen is imported before the provider result, so a bad length pointer reports EFAULT where Linux runs the protocol's getname first and reports its error"]
 
 [[contract]]
 id = "linux-getpeername"
@@ -1990,13 +1990,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 52
 name = "getpeername"
-status = "partial"
+status = "implemented"
 contract = "linux-getpeername"
 handler = "kernel/src/syscall/net/name.rs:sys_getpeername"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/network-basic-differential.c:main"]
-validation_gaps = ["Network basic regression passed host Linux; matched TheKernel and Linux 7.2.3 guest execution remains pending; broader provider matrix remains untested"]
-limitations = ["Netlink peer address retrieval is absent and falls through to ENOTSOCK"]
+tests = ["tests/guest/portable/network-basic-differential.c:main", "tests/guest/portable/socket-provider-differential.c:main"]
+validation_gaps = ["The AF_ALG and AF_XDP getname refusals are verified against the Linux source but cannot be probed on the pinned oracle build, whose configuration omits CONFIG_CRYPTO_USER_API and CONFIG_XDP_SOCKETS"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-listen"
@@ -2013,13 +2013,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 50
 name = "listen"
-status = "partial"
+status = "implemented"
 contract = "linux-listen"
 handler = "kernel/src/syscall/net/socket.rs:sys_listen"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["Netlink and AF_ALG socket providers return ENOTSOCK instead of Linux EOPNOTSUPP"]
+tests = ["tests/guest/portable/socket-provider-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-accept"
@@ -2036,13 +2036,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 43
 name = "accept"
-status = "partial"
+status = "implemented"
 contract = "linux-accept"
 handler = "kernel/src/syscall/net/socket.rs:sys_accept"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["Netlink provider returns ENOTSOCK instead of Linux EOPNOTSUPP"]
+tests = ["tests/guest/portable/socket-provider-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-accept4"
@@ -2063,9 +2063,9 @@ status = "partial"
 contract = "linux-accept4"
 handler = "kernel/src/syscall/net/socket.rs:sys_accept4"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["Netlink provider returns ENOTSOCK instead of Linux EOPNOTSUPP"]
+tests = ["tests/guest/portable/socket-provider-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["flags are parsed before the descriptor is pinned, so accept4 with both a bad descriptor and an unknown flag reports EINVAL where Linux reports EBADF"]
 
 [[contract]]
 id = "linux-shutdown"
@@ -2082,13 +2082,13 @@ teardown = ["teardown:release retained endpoint and owned message/control data o
 [[cell]]
 number = 48
 name = "shutdown"
-status = "partial"
+status = "implemented"
 contract = "linux-shutdown"
 handler = "kernel/src/syscall/net/socket.rs:sys_shutdown"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["Netlink and AF_ALG providers return ENOTSOCK instead of Linux EOPNOTSUPP"]
+tests = ["tests/guest/portable/socket-provider-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-sendto"
@@ -2109,9 +2109,9 @@ status = "partial"
 contract = "linux-sendto"
 handler = "kernel/src/syscall/net/io.rs:sys_sendto"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/network-basic-differential.c:main"]
-validation_gaps = ["Network basic regression passed host Linux; matched TheKernel and Linux 7.2.3 guest execution remains pending; broader provider matrix remains untested"]
-limitations = ["Ordinary socket send path rejects protocol-supported MSG_MORE MSG_DONTROUTE and MSG_CONFIRM flags"]
+tests = ["tests/guest/portable/network-basic-differential.c:main", "tests/guest/portable/socket-msg-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["MSG_MORE is accepted but the datagram path never corks, MSG_DONTROUTE and MSG_CONFIRM are accepted with no effect, and MSG_EOR, MSG_PROBE, MSG_ZEROCOPY and MSG_FASTOPEN are rejected although Linux hands every flag to the protocol and lets it decide"]
 
 [[contract]]
 id = "linux-sendmsg"
@@ -2132,9 +2132,9 @@ status = "partial"
 contract = "linux-sendmsg"
 handler = "kernel/src/syscall/net/io.rs:sys_sendmsg"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["Ordinary socket send path rejects protocol-supported MSG_MORE MSG_DONTROUTE and MSG_CONFIRM flags"]
+tests = ["tests/guest/portable/socket-msg-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["MSG_MORE is accepted but the datagram path never corks, MSG_DONTROUTE and MSG_CONFIRM are accepted with no effect, and MSG_EOR, MSG_PROBE, MSG_ZEROCOPY and MSG_FASTOPEN are rejected although Linux hands every flag to the protocol and lets it decide"]
 
 [[contract]]
 id = "linux-sendmmsg"
@@ -2155,9 +2155,9 @@ status = "partial"
 contract = "linux-sendmmsg"
 handler = "kernel/src/syscall/net/io.rs:sys_sendmmsg"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/net/io.rs:mmsg_vlen_matches_linux_send_cap_and_unbounded_recv_batch"]
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["Each message inherits sendmsg rejection of protocol-supported MSG_MORE MSG_DONTROUTE and MSG_CONFIRM flags"]
+tests = ["kernel/src/syscall/net/io.rs:mmsg_vlen_matches_linux_send_cap_and_unbounded_recv_batch", "tests/guest/portable/socket-msg-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["MSG_MORE is accepted but the datagram path never corks, MSG_DONTROUTE and MSG_CONFIRM are accepted with no effect, and MSG_EOR, MSG_PROBE, MSG_ZEROCOPY and MSG_FASTOPEN are rejected although Linux hands every flag to the protocol and lets it decide"]
 
 [[contract]]
 id = "linux-recvfrom"
@@ -2178,9 +2178,9 @@ status = "partial"
 contract = "linux-recvfrom"
 handler = "kernel/src/syscall/net/io.rs:sys_recvfrom"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/net/io.rs:stream_copyout_returns_a_prefix_but_datagram_copyout_keeps_efault"]
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["Ordinary stream receive rejects MSG_WAITALL rather than implementing its receive completion semantics"]
+tests = ["kernel/src/syscall/net/io.rs:stream_copyout_returns_a_prefix_but_datagram_copyout_keeps_efault", "tests/guest/portable/socket-msg-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["MSG_WAITALL combined with MSG_PEEK is still single-shot on byte streams where Linux keeps counting the peeked bytes, and a receive flag outside the accepted table is rejected although Linux ignores it"]
 
 [[contract]]
 id = "linux-recvmsg"
@@ -2201,9 +2201,9 @@ status = "partial"
 contract = "linux-recvmsg"
 handler = "kernel/src/syscall/net/io.rs:sys_recvmsg"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/net/io.rs:stream_copyout_returns_a_prefix_but_datagram_copyout_keeps_efault"]
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["Ordinary stream receive rejects MSG_WAITALL rather than implementing its receive completion semantics"]
+tests = ["kernel/src/syscall/net/io.rs:stream_copyout_returns_a_prefix_but_datagram_copyout_keeps_efault", "tests/guest/portable/socket-msg-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["MSG_WAITALL combined with MSG_PEEK is still single-shot on byte streams where Linux keeps counting the peeked bytes, and a receive flag outside the accepted table is rejected although Linux ignores it"]
 
 [[contract]]
 id = "linux-recvmmsg"
@@ -2224,9 +2224,9 @@ status = "partial"
 contract = "linux-recvmmsg"
 handler = "kernel/src/syscall/net/io.rs:sys_recvmmsg"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/net/io.rs:mmsg_vlen_matches_linux_send_cap_and_unbounded_recv_batch"]
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["Nonzero batches with a non-null timeout are explicitly rejected with EOPNOTSUPP instead of using and updating a relative deadline"]
+tests = ["kernel/src/syscall/net/io.rs:mmsg_vlen_matches_linux_send_cap_and_unbounded_recv_batch", "tests/guest/portable/socket-msg-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["MSG_WAITALL combined with MSG_PEEK is still single-shot on byte streams where Linux keeps counting the peeked bytes, and a receive flag outside the accepted table is rejected although Linux ignores it; recvmmsg also does not record sk_err for every non-EAGAIN failure"]
 
 [[contract]]
 id = "linux-getsockopt"
@@ -2247,9 +2247,9 @@ status = "partial"
 contract = "linux-getsockopt"
 handler = "kernel/src/syscall/net/opt.rs:sys_getsockopt"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/net/opt.rs:generic_option_copyout_reports_the_copied_short_or_zero_length"]
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["Netlink lacks generic SOL_SOCKET getters such as SO_TYPE and SO_DOMAIN plus NETLINK_PKTINFO and LIST_MEMBERSHIPS"]
+tests = ["kernel/src/syscall/net/opt.rs:generic_option_copyout_reports_the_copied_short_or_zero_length", "tests/guest/portable/socket-provider-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["an unknown level with an optlen the kernel cannot read reports EINVAL where Linux reports ENOPROTOOPT before reading optlen"]
 
 [[contract]]
 id = "linux-setsockopt"
@@ -2270,9 +2270,9 @@ status = "partial"
 contract = "linux-setsockopt"
 handler = "kernel/src/syscall/net/opt.rs:sys_setsockopt"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Protocol/provider and combined-error raw guest differential matrix is not yet bound and executed"]
-limitations = ["Netlink lacks generic SOL_SOCKET setters and NETLINK_PKTINFO LISTEN_ALL_NSID options"]
+tests = ["tests/guest/portable/socket-provider-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["a negative optlen is accepted because every check is a lower bound, SO_BINDTODEVICE is unconditionally ENOPROTOOPT, and a negative SO_SNDBUF or SO_RCVBUF clamps differently from Linux"]
 
 [[contract]]
 id = "linux-getuid"
@@ -3259,9 +3259,9 @@ status = "partial"
 contract = "linux-gettimeofday"
 handler = "kernel/src/syscall/time.rs:sys_gettimeofday"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
-limitations = ["Timezone output is always zero instead of the timezone retained by settimeofday"]
+tests = ["tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["setting a timezone does not apply Linux's timekeeping_warp_clock on the first call, so a guest that sets one observes a different CLOCK_REALTIME than Linux"]
 
 [[contract]]
 id = "linux-times"
@@ -3305,9 +3305,9 @@ status = "partial"
 contract = "linux-adjtimex"
 handler = "kernel/src/syscall/time.rs:sys_adjtimex"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/time.rs:timex_planner_accepts_legacy_singleshot_modes"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
-limitations = ["ADJ_TAI and ADJ_SETOFFSET are rejected; offset frequency and tick changes only update metadata rather than timekeeping; error/timeconstant clamps differ"]
+tests = ["kernel/src/syscall/time.rs:timex_planner_accepts_legacy_singleshot_modes", "tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["The timex state machine, mode validation and clamps are exercised by the time-abi differential; the discipline effect has no test"]
+limitations = ["ADJ_OFFSET is scaled by the ABI's USER_HZ instead of the kernel tick rate, so a nanosecond offset that is not a multiple of the tick reads back one nanosecond higher than Linux reports"]
 
 [[contract]]
 id = "linux-settimeofday"
@@ -3328,9 +3328,9 @@ status = "partial"
 contract = "linux-settimeofday"
 handler = "kernel/src/syscall/time.rs:sys_settimeofday"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
-limitations = ["Timezone input is discarded; oversized wall time is saturated rather than rejected by Linux set-to-time bounds"]
+tests = ["tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["the timezone pointer is read before tv_usec is validated, so an out-of-range usec with a bad timezone pointer reports EFAULT where Linux reports EINVAL; the first-timezone warp is missing"]
 
 [[contract]]
 id = "linux-timer_create"
@@ -3347,13 +3347,13 @@ teardown = ["teardown:release imported data and temporary references; timer dele
 [[cell]]
 number = 222
 name = "timer_create"
-status = "partial"
+status = "implemented"
 contract = "linux-timer_create"
 handler = "kernel/src/syscall/time.rs:sys_timer_create"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/timer-create-validation.c:main"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
-limitations = ["ALARM timer admission lacks RTC availability and CAP_WAKE_ALARM checks"]
+tests = ["tests/guest/portable/timer-create-validation.c:main", "tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["The alarm-clock admission is verified against Linux v7.2.3 by source agreement; the registered case accepts more than one alarm outcome, so it cannot discriminate it"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-timer_settime"
@@ -3416,13 +3416,13 @@ teardown = ["teardown:release imported data and temporary references; timer dele
 [[cell]]
 number = 225
 name = "timer_getoverrun"
-status = "partial"
+status = "implemented"
 contract = "linux-timer_getoverrun"
 handler = "kernel/src/syscall/time.rs:sys_timer_getoverrun"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
-limitations = ["Returns the currently accumulating overrun while a signal remains pending instead of the last delivered signal overrun"]
+tests = ["tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["The overrun counter is verified against Linux v7.2.3 by source agreement; no registered assertion distinguishes it from the previous accumulating implementation"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-timer_delete"
@@ -3466,9 +3466,9 @@ status = "partial"
 contract = "linux-clock_settime"
 handler = "kernel/src/syscall/time.rs:sys_clock_settime"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
-limitations = ["Wall-time setter lacks Linux set-to-time range and wall-to-monotonic validation"]
+tests = ["tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["every identifier other than CLOCK_REALTIME is rejected with EINVAL before the timespec is copied in, where Linux copies in first and routes an encoded CPU clock to EPERM"]
 
 [[contract]]
 id = "linux-clock_gettime"
@@ -3489,9 +3489,9 @@ status = "partial"
 contract = "linux-clock_gettime"
 handler = "kernel/src/syscall/time.rs:sys_clock_gettime"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/time.rs:clock_domain_accepts_linux_encoded_cpu_clock_ids"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
-limitations = ["CLOCK_MONOTONIC_RAW omits the Linux time namespace monotonic offset; ALARM clocks do not check RTC availability"]
+tests = ["kernel/src/syscall/time.rs:clock_domain_accepts_linux_encoded_cpu_clock_ids", "tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["CLOCK_MONOTONIC_RAW omits the time-namespace offset Linux applies to it, and no registered case reads a clock other than CLOCK_REALTIME"]
 
 [[contract]]
 id = "linux-clock_getres"
@@ -3512,9 +3512,9 @@ status = "partial"
 contract = "linux-clock_getres"
 handler = "kernel/src/syscall/time.rs:sys_clock_getres"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/time.rs:clock_resolution_requires_supported_clock"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
-limitations = ["Encoded CPU PROF/VIRT clocks return one nanosecond instead of the accounting tick resolution; ALARM clocks omit RTC availability checks"]
+tests = ["kernel/src/syscall/time.rs:clock_resolution_requires_supported_clock", "tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["an encoded foreign or stale CPU-clock pid returns a resolution where Linux's pid_for_clock lookup reports EINVAL"]
 
 [[contract]]
 id = "linux-clock_adjtime"
@@ -3535,9 +3535,9 @@ status = "partial"
 contract = "linux-clock_adjtime"
 handler = "kernel/src/syscall/time.rs:sys_clock_adjtime"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/time.rs:clock_adjtime_copies_timex_before_classifying_clock"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
-limitations = ["ADJ_TAI and ADJ_SETOFFSET are rejected; offset frequency and tick changes only update metadata rather than timekeeping; error/timeconstant clamps differ"]
+tests = ["kernel/src/syscall/time.rs:clock_adjtime_copies_timex_before_classifying_clock", "tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["The timex state machine, mode validation and clamps are exercised by the time-abi differential; the discipline effect has no test"]
+limitations = ["ADJ_OFFSET is scaled by the ABI's USER_HZ instead of the kernel tick rate, so a nanosecond offset that is not a multiple of the tick reads back one nanosecond higher than Linux reports"]
 
 [[contract]]
 id = "linux-syslog"
@@ -3554,13 +3554,13 @@ teardown = ["teardown:release imported data and temporary references; timer dele
 [[cell]]
 number = 103
 name = "syslog"
-status = "partial"
+status = "implemented"
 contract = "linux-syslog"
 handler = "kernel/src/syscall/sys.rs:sys_syslog"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sys.rs:syslog_zero_length_copy_returns_without_user_memory_access"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
-limitations = ["READ READ_ALL READ_CLEAR with NULL output and zero length returns zero instead of Linux EINVAL"]
+tests = ["kernel/src/syscall/sys.rs:syslog_zero_length_copy_returns_without_user_memory_access", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-restart_syscall"
@@ -3581,9 +3581,9 @@ status = "partial"
 contract = "linux-restart_syscall"
 handler = "kernel/src/syscall/sys.rs:sys_restart_syscall"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/signal-boundary-differential.c:main"]
-validation_gaps = ["New raw signal/restart boundary assertions passed host Linux; matched Linux 7.2.3 and TheKernel guest execution remains pending"]
-limitations = ["Only FutexWait restart blocks are represented; nanosleep and poll restart-block lifecycles remain unsupported"]
+tests = ["tests/guest/portable/signal-boundary-differential.c:main", "tests/guest/portable/epoll-membarrier-differential.c:main"]
+validation_gaps = ["nanosleep and poll restart blocks are exercised by the epoll-membarrier differential; the armed-after-restart difference has no portable assertion"]
+limitations = ["The restart block is consumed exactly once, while Linux leaves restart_block.fn armed after a restart"]
 
 [[contract]]
 id = "linux-getrandom"
@@ -3604,9 +3604,9 @@ status = "partial"
 contract = "linux-getrandom"
 handler = "kernel/src/syscall/sys.rs:sys_getrandom"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest matrix for this entry remains pending; helper tests do not establish full runtime coverage"]
-limitations = ["When secure entropy is not ready the blocking flags-zero call returns EAGAIN rather than waiting; GRND_NONBLOCK does not select behavior"]
+tests = ["tests/guest/portable/keyring-random-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["the clamped range is validated one 4096-byte chunk at a time instead of with a single access_ok over the whole span, so a buffer crossing the user pointer ceiling returns a short positive count where Linux reports EFAULT"]
 
 [[contract]]
 id = "linux-getpid"
@@ -4042,8 +4042,8 @@ contract = "linux-msync"
 handler = "kernel/src/syscall/mm/mmap.rs:sys_msync"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/mm/mmap.rs:msync_flushes_shared_file_ranges_after_holes_before_reporting_enomem"]
-validation_gaps = ["Matched Linux 7.2.3 and TheKernel guest entry, boundaries and persistent-state matrix remains pending"]
-limitations = ["Whole-range locked-VMA preflight can reject before flushing an earlier shared file range; Linux applies MS_SYNC/INVALIDATE effects in VMA order"]
+validation_gaps = ["No registered differential case exercises this syscall's newly aligned behaviour; host tests and source agreement against Linux v7.2.3 are the evidence"]
+limitations = ["the locked-area probe covers the whole span, so an interior mlock reports EBUSY with no partial flush where Linux flushes the unlocked prefix"]
 
 [[contract]]
 id = "linux-mlock"
@@ -4341,8 +4341,8 @@ contract = "linux-process_madvise"
 handler = "kernel/src/syscall/mm/process_vm.rs:sys_process_madvise"
 conditional = "explicit-none"
 tests = []
-validation_gaps = ["New self-advice differential case awaits paired execution; Linux oracle disables KSM, THP and memory-failure advice and requires explicit configuration alignment for these commands"]
-limitations = ["Same-mm advice inherits madvise implementation limitations, including nominal KSM and anonymous reclamation behavior"]
+validation_gaps = ["No registered differential case exercises this syscall; the change is covered by source agreement with Linux v7.2.3"]
+limitations = ["inherits the madvise residuals, and PIDFD_SELF_THREAD, PIDFD_SELF_THREAD_GROUP and non-pidfd descriptors are rejected with errno values Linux does not use"]
 
 [[contract]]
 id = "linux-map_shadow_stack"
@@ -4846,9 +4846,9 @@ status = "partial"
 contract = "linux-fcntl"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_fcntl"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/fd_ops.rs:noatime_requires_owner_match_or_namespace_relative_fowner"]
-validation_gaps = ["Existing source/helper coverage does not establish the full fcntl raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["F_SETFL omits mutable O_NOATIME; packet-mode O_DIRECT transitions are explicitly rejected rather than implemented"]
+tests = ["kernel/src/syscall/fs/fd_ops.rs:noatime_requires_owner_match_or_namespace_relative_fowner", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["The F_SETFL mask and O_NOATIME gate are exercised by the fs-abi raw differential; packet mode and the atime effect have no test"]
+limitations = ["Packet-mode O_DIRECT on a pipe or FIFO is rejected rather than implemented, and the F_SETFL O_NOATIME transition is recorded in the descriptor without reaching the open-file atime suppression"]
 
 [[contract]]
 id = "linux-sysfs"
@@ -5647,13 +5647,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 306
 name = "syncfs"
-status = "partial"
+status = "implemented"
 contract = "linux-syncfs"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_syncfs"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full syncfs raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Filesystem lookup excludes pipe, FIFO, socket and pidfd descriptors and returns EINVAL instead of accepting their mounted filesystem as Linux does"]
+tests = ["tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-getcwd"
@@ -5670,13 +5670,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 79
 name = "getcwd"
-status = "partial"
+status = "implemented"
 contract = "linux-getcwd"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_getcwd"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full getcwd raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Current directory outside the process root returns ENOENT rather than Linux raw getcwd's (unreachable) prefix"]
+tests = ["tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-reboot"
@@ -5697,9 +5697,9 @@ status = "partial"
 contract = "linux-reboot"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_reboot"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full reboot raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["PID namespace reboot and SMP HALT are explicitly unsupported; RESTART2 ignores its user argument rather than copying and forwarding the restart command"]
+tests = ["tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["RESTART2 argument copying is exercised by the fs-abi raw differential; the unsupported reboot paths have no test"]
+limitations = ["PID namespace reboot and SMP HALT remain explicitly unsupported and answer EOPNOTSUPP"]
 
 [[contract]]
 id = "linux-read"
@@ -6130,13 +6130,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 327
 name = "preadv2"
-status = "partial"
+status = "implemented"
 contract = "linux-preadv2"
 handler = "kernel/src/syscall/fs/io.rs:sys_preadv2"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full preadv2 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["RWF_HIPRI is rejected although Linux accepts it; RWF_ATOMIC remains unsupported subject to provider capability"]
+tests = ["tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-pwritev2"
@@ -6153,13 +6153,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 328
 name = "pwritev2"
-status = "partial"
+status = "implemented"
 contract = "linux-pwritev2"
 handler = "kernel/src/syscall/fs/io.rs:sys_pwritev2"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full pwritev2 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["RWF_HIPRI is rejected although Linux accepts it; RWF_ATOMIC remains unsupported subject to provider capability"]
+tests = ["tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-tee"
@@ -6180,8 +6180,8 @@ status = "partial"
 contract = "linux-tee"
 handler = "kernel/src/syscall/fs/io.rs:sys_tee"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full tee raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["tee's argument order and stream copy are exercised by the fs-abi raw differential; packet mode has no test"]
 limitations = ["Packet-mode pipe-buffer transfers are not supported; anonymous pipes and FIFO stream endpoints are supported"]
 
 [[contract]]
@@ -6203,8 +6203,8 @@ status = "partial"
 contract = "linux-vmsplice"
 handler = "kernel/src/syscall/fs/io.rs:sys_vmsplice"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full vmsplice raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["vmsplice's argument order and gift path are exercised by the fs-abi raw differential; packet mode has no test"]
 limitations = ["Packet-mode pipe-buffer transfers are not supported; anonymous pipes and FIFO stream endpoints are supported"]
 
 [[contract]]
@@ -6337,13 +6337,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 210
 name = "io_cancel"
-status = "partial"
+status = "implemented"
 contract = "linux-io_cancel"
 handler = "kernel/src/syscall/fs/aio.rs:sys_io_cancel"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/fs/aio.rs:context_ids_wrap_skip_live_contexts_and_never_use_zero"]
-validation_gaps = ["Existing source/helper coverage does not establish the full io_cancel raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Copies the full IOCB rather than only aio_key, writes deprecated result and returns zero rather than Linux completion-ring delivery with EINPROGRESS"]
+validation_gaps = ["io_cancel is verified against Linux v7.2.3 by source agreement; the only cited host test exercises AIO context-id allocation and never calls io_cancel"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-pipe"
@@ -6387,9 +6387,9 @@ status = "partial"
 contract = "linux-pipe2"
 handler = "kernel/src/syscall/fs/pipe.rs:sys_pipe2"
 conditional = "explicit-none"
-tests = ["kernel/src/file/pipe.rs:one_write_uses_one_nonblocking_snapshot"]
-validation_gaps = ["Existing source/helper coverage does not establish the full pipe2 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["O_DIRECT does not implement packet-mode buffering; O_NOTIFICATION_PIPE returns EINVAL instead of ENOPKG for the selected Linux CONFIG_WATCH_QUEUE=n build"]
+tests = ["kernel/src/file/pipe.rs:one_write_uses_one_nonblocking_snapshot", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["pipe2 flag admission is exercised by the fs-abi raw differential; packet mode has no test"]
+limitations = ["O_DIRECT does not implement packet-mode buffering"]
 
 [[contract]]
 id = "linux-pidfd_open"
@@ -6456,9 +6456,9 @@ status = "partial"
 contract = "linux-pidfd_send_signal"
 handler = "kernel/src/syscall/fs/pidfd.rs:sys_pidfd_send_signal"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/pidfd.rs:process_pidfd_identity_rejects_reap_and_pid_reuse"]
-validation_gaps = ["Existing source/helper coverage does not establish the full pidfd_send_signal raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Only zero flags are accepted; Linux PIDFD_SIGNAL_THREAD/THREAD_GROUP/PROCESS_GROUP and PIDFD_SELF_THREAD/PIDFD_SELF_THREAD_GROUP identifiers are missing"]
+tests = ["kernel/src/syscall/fs/pidfd.rs:process_pidfd_identity_rejects_reap_and_pid_reuse", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["The flag, self-identifier and type rules are exercised by the fs-abi raw differential; the process-group scope has no test"]
+limitations = ["PIDFD_SIGNAL_PROCESS_GROUP is rejected with EOPNOTSUPP because the shared signal-delivery scope contract carries only thread and thread-group scopes"]
 
 [[contract]]
 id = "linux-cachestat"
@@ -6659,13 +6659,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 283
 name = "timerfd_create"
-status = "partial"
+status = "implemented"
 contract = "linux-timerfd_create"
 handler = "kernel/src/syscall/fs/timerfd.rs:sys_timerfd_create"
 conditional = "explicit-none"
 tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full timerfd_create raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["CLOCK_REALTIME_ALARM/CLOCK_BOOTTIME_ALARM and their CAP_WAKE_ALARM admission are missing"]
+validation_gaps = ["timerfd_create has no registered differential case and no host test reaches its alarm-clock admission, which is verified by source agreement only"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-timerfd_settime"
@@ -6732,9 +6732,9 @@ status = "partial"
 contract = "linux-fanotify_init"
 handler = "kernel/src/syscall/fs/fanotify.rs:sys_fanotify_init"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Selected Linux oracle CONFIG_FANOTIFY=n returns ENOSYS while TheKernel implements this facility; a feature-enabled oracle is required to compare the implemented subset, and the missing Linux UAPI flags remain implementation limitations"]
-limitations = ["FAN_REPORT_FD_ERROR and FAN_REPORT_MNT are not implemented"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["The flag grammar, scope rules and errno order are exercised by the mount-api differential; the absent providers have no test"]
+limitations = ["the pinned oracle disables fanotify, so both guests answer ENOSYS and every assertion passes without comparing behaviour; FAN_REPORT_FD_ERROR, FAN_UNLIMITED_QUEUE, FAN_UNLIMITED_MARKS and an unprivileged FAN_REPORT_FID group are refused where Linux admits them"]
 
 [[contract]]
 id = "linux-fanotify_mark"
@@ -6755,9 +6755,9 @@ status = "partial"
 contract = "linux-fanotify_mark"
 handler = "kernel/src/syscall/fs/fanotify.rs:sys_fanotify_mark"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Selected Linux oracle CONFIG_FANOTIFY=n returns ENOSYS while TheKernel implements this facility; a feature-enabled oracle is required to compare the implemented subset, and the missing Linux UAPI flags remain implementation limitations"]
-limitations = ["FAN_MARK_MNTNS and associated mount-notification event support are missing"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["The flag grammar, scope rules and errno order are exercised by the mount-api differential; the absent providers have no test"]
+limitations = ["the pinned oracle disables fanotify, so every mark assertion passes without comparing behaviour, and FAN_MARK_MNTNS is unreachable because there is no mount-event provider"]
 
 [[contract]]
 id = "linux-quotactl"
@@ -6778,9 +6778,9 @@ status = "partial"
 contract = "linux-quotactl"
 handler = "kernel/src/syscall/fs/quota.rs:sys_quotactl"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full quotactl raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Path lookup accepts ordinary files rather than requiring a block device; Q_XGETQSTAT/Q_XGETQSTATV/Q_XGETQUOTA/Q_XGETNEXTQUOTA are missing for ext4; Q_SETINFO does not enforce Linux dqi_valid and DQF_SETINFO_MASK validation"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["The device rule, privilege table, Q_SETINFO validation and Q_QUOTAON order are exercised by the mount-api differential; the XFS-shaped selectors have no provider"]
+limitations = ["the XFS-shaped selectors report errno values the pinned ext4 oracle does not produce: ext4 answers ENOSYS for Q_XGETQSTAT and Q_XGETQSTATV while no quota type is active, and ESRCH only for Q_XGETQUOTA and Q_XGETNEXTQUOTA"]
 
 [[contract]]
 id = "linux-quotactl_fd"
@@ -6801,9 +6801,9 @@ status = "partial"
 contract = "linux-quotactl_fd"
 handler = "kernel/src/syscall/fs/quota.rs:sys_quotactl_fd"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full quotactl_fd raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Mount fds are rejected because fd location lookup only accepts ordinary file/directory; Q_XGETQSTAT/Q_XGETQSTATV/Q_XGETQUOTA/Q_XGETNEXTQUOTA are missing for ext4; Q_SETINFO does not enforce Linux dqi_valid and DQF_SETINFO_MASK validation"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["The device rule, privilege table, Q_SETINFO validation and Q_QUOTAON order are exercised by the mount-api differential; the XFS-shaped selectors have no provider"]
+limitations = ["the XFS-shaped selectors report errno values ext4 does not produce while no quota type is active, and a mount descriptor cannot reach its superblock"]
 
 [[contract]]
 id = "linux-mount"
@@ -6824,9 +6824,9 @@ status = "partial"
 contract = "linux-mount"
 handler = "kernel/src/syscall/fs/mount.rs:sys_mount"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full mount raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["MS_SYNCHRONOUS, MS_DIRSYNC, MS_LAZYTIME and MS_I_VERSION are rejected rather than applied to the ext4 superblock"]
+tests = ["tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["mount flag admission is exercised by the fs-abi raw differential; the provider-level journal effect has no test"]
+limitations = ["MS_SYNCHRONOUS, MS_DIRSYNC, MS_I_VERSION and MS_LAZYTIME are accepted and reported through statmount but reach no ext4 per-superblock journal mode, because this ext4 implementation has none"]
 
 [[contract]]
 id = "linux-pivot_root"
@@ -6843,13 +6843,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 155
 name = "pivot_root"
-status = "partial"
+status = "implemented"
 contract = "linux-pivot_root"
 handler = "kernel/src/syscall/fs/mount.rs:sys_pivot_root"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full pivot_root raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Checks mount capability before copying/resolving new_root and put_old; Linux path lookup may report EFAULT before EPERM"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-open_tree"
@@ -6870,9 +6870,9 @@ status = "partial"
 contract = "linux-open_tree"
 handler = "kernel/src/syscall/fs/mount.rs:sys_open_tree"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full open_tree raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["OPEN_TREE_NAMESPACE is not accepted"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["the namespace flag is admitted by the validator but prepare_open_tree reports EOPNOTSUPP for it, where Linux with CAP_SYS_ADMIN returns a descriptor for a new mount namespace"]
 
 [[contract]]
 id = "linux-move_mount"
@@ -6939,9 +6939,9 @@ status = "partial"
 contract = "linux-fsconfig"
 handler = "kernel/src/syscall/fs/mount.rs:sys_fsconfig"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full fsconfig raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["SET_BINARY and non-overlay SET_PATH parameters are stored without provider consumption; CREATE_EXCL is treated as CREATE"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["The validation order and errno precedence are exercised by the mount-api differential; provider option consumption has no test"]
+limitations = ["SET_BINARY and non-overlay SET_PATH parameters are stored without provider consumption and CREATE_EXCL is treated as CREATE; fsmount inherits this"]
 
 [[contract]]
 id = "linux-fsmount"
@@ -6962,9 +6962,9 @@ status = "partial"
 contract = "linux-fsmount"
 handler = "kernel/src/syscall/fs/mount.rs:sys_fsmount"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full fsmount raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["FSMOUNT_NAMESPACE is not accepted; provider parameter consumption also inherits fsconfig limitations"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["The validation order and errno precedence are exercised by the mount-api differential; provider option consumption has no test"]
+limitations = ["FSMOUNT_NAMESPACE is admitted and reported EOPNOTSUPP, and the attribute word and atime are validated before the capability check, so an unprivileged caller with bad attributes gets EINVAL where Linux gets EPERM"]
 
 [[contract]]
 id = "linux-fspick"
@@ -6981,13 +6981,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 433
 name = "fspick"
-status = "partial"
+status = "implemented"
 contract = "linux-fspick"
 handler = "kernel/src/syscall/fs/mount.rs:sys_fspick"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full fspick raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Accepts an internal directory rather than requiring the mount root as Linux does"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-statmount"
@@ -7008,9 +7008,9 @@ status = "partial"
 contract = "linux-statmount"
 handler = "kernel/src/syscall/fs/mount.rs:sys_statmount"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full statmount raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["STATMOUNT_BY_FD and mnt_fd/mnt_ns_fd request semantics are missing"]
+tests = ["tests/guest/portable/mount-api-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["STATMOUNT_BY_FD only works for open() descriptors: the mount descriptor returned by open_tree(OPEN_TREE_CLONE) or fsmount keeps no mount ledger and reports EOPNOTSUPP where Linux succeeds; a foreign mnt_ns_id without CAP_SYS_ADMIN reports ENOENT where Linux reports EPERM"]
 
 [[contract]]
 id = "linux-listmount"
@@ -7238,9 +7238,9 @@ status = "partial"
 contract = "linux-sched_getparam"
 handler = "kernel/src/syscall/task/schedule.rs:sys_sched_getparam"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full sched_getparam raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Task lookup excludes unreaped zombie scheduler state and returns ESRCH instead of exposing the retained scheduler snapshot"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["No registered differential case exercises this query; the change is covered by source agreement with Linux v7.2.3 and module tests"]
+limitations = ["a task that is exiting but not yet a zombie still reports ESRCH instead of the retained scheduler state"]
 
 [[contract]]
 id = "linux-sched_getscheduler"
@@ -7261,9 +7261,9 @@ status = "partial"
 contract = "linux-sched_getscheduler"
 handler = "kernel/src/syscall/task/schedule.rs:sys_sched_getscheduler"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full sched_getscheduler raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Task lookup excludes unreaped zombie scheduler state and returns ESRCH instead of exposing the retained scheduler snapshot"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["No registered differential case exercises this query; the change is covered by source agreement with Linux v7.2.3 and module tests"]
+limitations = ["a task that is exiting but not yet a zombie still reports ESRCH instead of the retained scheduler state"]
 
 [[contract]]
 id = "linux-sched_rr_get_interval"
@@ -7284,9 +7284,9 @@ status = "partial"
 contract = "linux-sched_rr_get_interval"
 handler = "kernel/src/syscall/task/schedule.rs:sys_sched_rr_get_interval"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full sched_rr_get_interval raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Unreaped zombie queries return ESRCH; default SCHED_RR interval is 50ms rather than Linux default 100ms"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["No registered differential case exercises this query; the change is covered by source agreement with Linux v7.2.3 and module tests"]
+limitations = ["a task that is exiting but not yet a zombie still reports ESRCH instead of the retained scheduler state"]
 
 [[contract]]
 id = "linux-sched_get_priority_max"
@@ -7376,9 +7376,9 @@ status = "partial"
 contract = "linux-setpriority"
 handler = "kernel/src/syscall/task/schedule.rs:sys_setpriority"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full setpriority raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Process, process-group and user selection omit unreaped zombies; Linux can authorize and update their retained priority"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["No registered differential case exercises setpriority across all three selection levels"]
+limitations = ["RLIMIT_NICE is read from the calling task instead of the target, so a child that lowered its own limit can still be reniced here where Linux reports EACCES"]
 
 [[contract]]
 id = "linux-clock_nanosleep"
@@ -7399,9 +7399,9 @@ status = "partial"
 contract = "linux-clock_nanosleep"
 handler = "kernel/src/syscall/task/schedule.rs:sys_clock_nanosleep"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full clock_nanosleep raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["THREAD_CPUTIME_ID/RAW/COARSE unsupported sleep clocks have incorrect admission or errno; REALTIME_ALARM/BOOTTIME_ALARM and CAP_WAKE_ALARM admission are missing"]
+tests = ["tests/guest/portable/time-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["an unknown clock_nanosleep flag bit is rejected with EINVAL where Linux ignores every bit except TIMER_ABSTIME, and the alarm-clock flag check precedes the capability check"]
 
 [[contract]]
 id = "linux-ioprio_set"
@@ -7418,13 +7418,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 251
 name = "ioprio_set"
-status = "partial"
+status = "implemented"
 contract = "linux-ioprio_set"
 handler = "kernel/src/syscall/task/schedule.rs:sys_ioprio_set"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full ioprio_set raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Task selection excludes PF_EXITING before zombie publication; Linux can still locate and update that task in this lifecycle window"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["The aligned behaviour is verified by host tests and by agreement with the quoted Linux v7.2.3 source; no registered differential case binds this syscall"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-ioprio_get"
@@ -7441,13 +7441,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 252
 name = "ioprio_get"
-status = "partial"
+status = "implemented"
 contract = "linux-ioprio_get"
 handler = "kernel/src/syscall/task/schedule.rs:sys_ioprio_get"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full ioprio_get raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Task selection excludes PF_EXITING before zombie publication; Linux can still locate and read that task in this lifecycle window"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["The aligned behaviour is verified by host tests and by agreement with the quoted Linux v7.2.3 source; no registered differential case binds this syscall"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-sched_setattr"
@@ -7468,9 +7468,9 @@ status = "partial"
 contract = "linux-sched_setattr"
 handler = "kernel/src/syscall/task/schedule.rs:sys_sched_setattr"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full sched_setattr raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["SCHED_FLAG_RECLAIM and SCHED_FLAG_DL_OVERRUN are rejected rather than implemented for deadline scheduling"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["The attribute size, flag and write-back rules are exercised by the wait-abi differential; the deadline effects have no test"]
+limitations = ["SCHED_FLAG_RECLAIM and SCHED_FLAG_DL_OVERRUN are stored and reported but inert: the EEVDF deadline core has neither a reclaim callback nor an overrun latch"]
 
 [[contract]]
 id = "linux-sched_getattr"
@@ -7491,9 +7491,9 @@ status = "partial"
 contract = "linux-sched_getattr"
 handler = "kernel/src/syscall/task/schedule.rs:sys_sched_getattr"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full sched_getattr raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Deadline RECLAIM/DL_OVERRUN state cannot be represented because the setter rejects these Linux flags"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["The attribute size, flag and write-back rules are exercised by the wait-abi differential; the deadline effects have no test"]
+limitations = ["SCHED_FLAG_RECLAIM and SCHED_FLAG_DL_OVERRUN are stored and reported but inert: the EEVDF deadline core has neither a reclaim callback nor an overrun latch"]
 
 [[contract]]
 id = "linux-ioperm"
@@ -7533,13 +7533,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 172
 name = "iopl"
-status = "partial"
+status = "implemented"
 contract = "linux-iopl"
 handler = "kernel/src/syscall/task/ioport.rs:sys_iopl"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full iopl raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Every request requires CAP_SYS_RAWIO, including unchanged or lowered level; Linux only checks privilege when raising IOPL"]
+tests = ["tests/guest/portable/task-control-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-setpgid"
@@ -7556,13 +7556,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 109
 name = "setpgid"
-status = "partial"
+status = "implemented"
 contract = "linux-setpgid"
 handler = "kernel/src/syscall/task/job.rs:sys_setpgid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full setpgid raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Does not reject changing a child process group after that child execs; Linux requires EACCES"]
+tests = ["tests/guest/portable/task-control-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-getpgrp"
@@ -7786,13 +7786,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 126
 name = "capset"
-status = "partial"
+status = "implemented"
 contract = "linux-capset"
 handler = "kernel/src/syscall/task/ctl.rs:sys_capset"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full capset raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["A non-current nonexistent header pid is looked up and yields ESRCH; Linux capset rejects a non-current pid with EPERM before lookup"]
+tests = ["tests/guest/portable/task-control-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-mbind"
@@ -7813,9 +7813,9 @@ status = "partial"
 contract = "linux-mbind"
 handler = "kernel/src/syscall/task/ctl.rs:sys_mbind"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full mbind raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Unaligned address is rounded down rather than rejected; zero length bypasses mode/flag validation; mutually exclusive STATIC_NODES/RELATIVE_NODES and weighted interleave admission are incomplete"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["the nodemask is validated before do_mbind's own checks, so MPOL_MF_MOVE_ALL without CAP_SYS_NICE is EINVAL where Linux is EPERM and a zero length with an empty mask is EINVAL where Linux returns 0"]
 
 [[contract]]
 id = "linux-set_mempolicy"
@@ -7836,9 +7836,9 @@ status = "partial"
 contract = "linux-set_mempolicy"
 handler = "kernel/src/syscall/task/ctl.rs:sys_set_mempolicy"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full set_mempolicy raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["STATIC_NODES|RELATIVE_NODES is accepted instead of EINVAL; NUMA_BALANCING excludes PREFERRED_MANY; MPOL_WEIGHTED_INTERLEAVE is missing"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["MPOL_PREFERRED with a mask that intersects to empty is silently degenerated to MPOL_LOCAL where Linux reports EINVAL"]
 
 [[contract]]
 id = "linux-get_mempolicy"
@@ -7859,9 +7859,9 @@ status = "partial"
 contract = "linux-get_mempolicy"
 handler = "kernel/src/syscall/task/ctl.rs:sys_get_mempolicy"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full get_mempolicy raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["MPOL_F_NODE returns zero for non-interleave policy rather than EINVAL; non-NULL nodemask with maxnode below nr_node_ids is not rejected"]
+tests = ["tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["MPOL_F_MEMS_ALLOWED writes no policy, MPOL_F_NODE writes no nodemask, and the mode flags are dropped from the reported policy"]
 
 [[contract]]
 id = "linux-migrate_pages"
@@ -7901,13 +7901,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 279
 name = "move_pages"
-status = "partial"
+status = "implemented"
 contract = "linux-move_pages"
 handler = "kernel/src/syscall/task/ctl.rs:sys_move_pages"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full move_pages raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Zero count bypasses target pid and access checks; Linux resolves and authorizes the target before returning zero"]
+tests = ["tests/guest/portable/task-control-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-set_mempolicy_home_node"
@@ -7951,9 +7951,9 @@ status = "partial"
 contract = "linux-unshare"
 handler = "kernel/src/syscall/task/ctl.rs:sys_unshare"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full unshare raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Single-thread CLONE_THREAD/CLONE_SIGHAND/CLONE_VM are rejected although Linux permits their unshare no-op or implied state transition"]
+tests = ["tests/guest/portable/sysadmin-abi-differential.c:main"]
+validation_gaps = ["The flag implication chain and thread-group constraints are exercised by the sysadmin raw differential; CLONE_EMPTY_MNTNS has no assertion"]
+limitations = ["the CLONE_NEWIPC|CLONE_SYSVSEM pair is rejected with EINVAL before the CAP_SYS_ADMIN admission, so an unprivileged caller sees EINVAL where Linux reports EPERM from create_new_namespaces"]
 
 [[contract]]
 id = "linux-setns"
@@ -8016,13 +8016,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 459
 name = "lsm_get_self_attr"
-status = "partial"
+status = "implemented"
 contract = "linux-lsm_get_self_attr"
 handler = "kernel/src/syscall/landlock.rs:sys_lsm_get_self_attr"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full lsm_get_self_attr raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Unknown but structurally valid single LSM ID returns EINVAL rather than Linux EOPNOTSUPP"]
+tests = ["tests/guest/portable/lsm-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-lsm_set_self_attr"
@@ -8039,13 +8039,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 460
 name = "lsm_set_self_attr"
-status = "partial"
+status = "implemented"
 contract = "linux-lsm_set_self_attr"
 handler = "kernel/src/syscall/landlock.rs:sys_lsm_set_self_attr"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full lsm_set_self_attr raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Unknown but structurally valid single LSM ID returns EINVAL rather than Linux EOPNOTSUPP"]
+tests = ["tests/guest/portable/lsm-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-lsm_list_modules"
@@ -8066,8 +8066,8 @@ status = "implemented"
 contract = "linux-lsm_list_modules"
 handler = "kernel/src/syscall/landlock.rs:sys_lsm_list_modules"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full lsm_list_modules raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/lsm-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -8089,9 +8089,9 @@ status = "partial"
 contract = "linux-ptrace"
 handler = "kernel/src/syscall/task/ptrace.rs:sys_ptrace"
 conditional = "explicit-none"
-tests = ["kernel/src/task/access.rs:process_access_ptrace_enforces_dumpability_image_owner_and_commoncap"]
-validation_gaps = ["Existing source/helper coverage does not establish the full ptrace raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["PTRACE_PEEKUSER, PTRACE_POKEUSER and PTRACE_LISTEN return fixed EIO; regsets expose SHSTK only and omit NT_PRSTATUS, floating-point and XSTATE records"]
+tests = ["kernel/src/task/access.rs:process_access_ptrace_enforces_dumpability_image_owner_and_commoncap", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+validation_gaps = ["The request-admission matrix is exercised by the sysadmin raw differential; the PEEKUSER, POKEUSER, LISTEN, SYSEMU, regset and PEEKSIGINFO paths have no portable assertion"]
+limitations = ["PTRACE_O_EXITKILL is accepted and stored but never kills the tracee when the tracer exits, and PTRACE_SEIZE does not run check_ptrace_options, so PTRACE_O_SUSPEND_SECCOMP is admitted there without CAP_SYS_ADMIN while PTRACE_SETOPTIONS requires it"]
 
 [[contract]]
 id = "linux-acct"
@@ -8135,9 +8135,9 @@ status = "partial"
 contract = "linux-swapon"
 handler = "kernel/src/syscall/mm/swap.rs:sys_swapon"
 conditional = "explicit-none"
-tests = ["kernel/src/mm/swap.rs:mutation_gate_linearizes_writers_mappings_and_activation"]
-validation_gaps = ["Existing source/helper coverage does not establish the full swapon raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Only regular files are admitted rather than regular files and block devices; header validation omits version, last_page, badpage bounds and logical area sizing"]
+tests = ["kernel/src/mm/swap.rs:mutation_gate_linearizes_writers_mappings_and_activation", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+validation_gaps = ["Flag precedence and the default priority rule are exercised by the sysadmin raw differential; block-device admission has no test"]
+limitations = ["Only regular files are admitted rather than regular files and block devices, and header validation omits the version, last_page, badpage bounds and logical area sizing"]
 
 [[contract]]
 id = "linux-swapoff"
@@ -8158,8 +8158,8 @@ status = "partial"
 contract = "linux-swapoff"
 handler = "kernel/src/syscall/mm/swap.rs:sys_swapoff"
 conditional = "explicit-none"
-tests = ["kernel/src/mm/swap.rs:mutation_gate_linearizes_writers_mappings_and_activation"]
-validation_gaps = ["Existing source/helper coverage does not establish the full swapoff raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/mm/swap.rs:mutation_gate_linearizes_writers_mappings_and_activation", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+validation_gaps = ["Flag precedence is exercised by the sysadmin raw differential; block-device swap areas have no test"]
 limitations = ["Block-device swap areas are rejected by the regular-file-only path admission"]
 
 [[contract]]
@@ -8181,8 +8181,8 @@ status = "partial"
 contract = "linux-init_module"
 handler = "kernel/src/syscall/task/module.rs:sys_init_module"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules"]
-validation_gaps = ["Selected Linux oracle CONFIG_MODULES=n returns ENOSYS; TheKernel has a loader, so matching feature configuration and module fixtures are required before runtime comparison"]
+tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+validation_gaps = ["The length and errno rules are exercised by the sysadmin raw differential; the copy order and vermagic gaps have no assertion"]
 limitations = ["Parameter strings are copied before the module image rather than after image validation; MODULE_RELEASE remains 6.12.103 and vermagic validation only compares its first token"]
 
 [[contract]]
@@ -8204,9 +8204,9 @@ status = "partial"
 contract = "linux-finit_module"
 handler = "kernel/src/syscall/task/module.rs:sys_finit_module"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules"]
-validation_gaps = ["Selected Linux oracle CONFIG_MODULES=n returns ENOSYS; TheKernel has a loader, so matching feature configuration and module fixtures are required before runtime comparison"]
-limitations = ["Parameter string copying precedes invalid-fd rejection; module identity uses stale 6.12.103 release and incomplete vermagic matching"]
+tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+validation_gaps = ["The length and errno rules are exercised by the sysadmin raw differential; the copy order and vermagic gaps have no assertion"]
+limitations = ["Parameter string copying precedes invalid-fd rejection; module identity uses the stale 6.12.103 release and incomplete vermagic matching"]
 
 [[contract]]
 id = "linux-delete_module"
@@ -8227,9 +8227,9 @@ status = "partial"
 contract = "linux-delete_module"
 handler = "kernel/src/syscall/task/module.rs:sys_delete_module"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules"]
-validation_gaps = ["Selected Linux oracle CONFIG_MODULES=n returns ENOSYS; TheKernel has a loader, so matching feature configuration and module fixtures are required before runtime comparison"]
-limitations = ["O_TRUNC always enables force-unload rather than respecting CONFIG_MODULE_FORCE_UNLOAD admission"]
+tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+validation_gaps = ["The name and errno rules are exercised by the sysadmin raw differential; forced unload has no assertion"]
+limitations = ["O_TRUNC always enables force-unload rather than respecting the CONFIG_MODULE_FORCE_UNLOAD admission Linux applies"]
 
 [[contract]]
 id = "linux-kexec_load"
@@ -8250,9 +8250,9 @@ status = "partial"
 contract = "linux-kexec_load"
 handler = "kernel/src/syscall/task/kexec.rs:sys_kexec_load"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/kexec.rs:bzimage_requires_64_bit_boot_contract_and_cmdline_capacity"]
-validation_gaps = ["Existing source/helper coverage does not establish the full kexec_load raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["KEXEC_UPDATE_ELFCOREHDR and KEXEC_CRASH_HOTPLUG_SUPPORT are unconditionally rejected although the selected Linux CRASH_HOTPLUG build admits them"]
+tests = ["kernel/src/syscall/task/kexec.rs:bzimage_requires_64_bit_boot_contract_and_cmdline_capacity", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+validation_gaps = ["kexec_load has no registered differential case; the admitted flag set is covered by host tests only"]
+limitations = ["an entry outside a destination segment is EINVAL where Linux stores it unchecked, an unaligned or out-of-RAM destination is EINVAL where Linux reports EADDRNOTAVAIL, the total-size cap is ENOMEM where Linux is EINVAL, and KEXEC_PRESERVE_CONTEXT is admitted but never read"]
 
 [[contract]]
 id = "linux-kexec_file_load"
@@ -8296,9 +8296,9 @@ status = "partial"
 contract = "linux-add_key"
 handler = "kernel/src/syscall/task/keys.rs:sys_add_key"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/keys.rs:add_key_adapter_rejects_private_keyring_prefix_before_type_lookup"]
-validation_gaps = ["Current oracle CONFIG_BIG_KEYS=n differs from the implemented big_key feature; no complete current paired key-type and errno matrix has executed"]
-limitations = ["Asymmetric key type enabled by the Linux oracle is missing; NULL description is unconditionally copied and returns EFAULT rather than undergoing key-type preparation"]
+tests = ["kernel/src/syscall/task/keys.rs:add_key_adapter_rejects_private_keyring_prefix_before_type_lookup", "tests/guest/portable/keyring-random-differential.c:main"]
+validation_gaps = ["The validation, errno and copy-shape rules are exercised by the keyring-random differential; the missing commands have no test"]
+limitations = ["the key type and description are resolved before the payload is copied and before the destination keyring is resolved, so a bogus type with a NULL payload reports ENODEV where Linux reports EFAULT"]
 
 [[contract]]
 id = "linux-request_key"
@@ -8319,9 +8319,9 @@ status = "partial"
 contract = "linux-request_key"
 handler = "kernel/src/syscall/task/keys.rs:sys_request_key"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full request_key raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["NULL callout starts construction/upcall instead of immediate ENOKEY; helper argv and session authorization key contract differ from Linux /sbin/request-key ABI"]
+tests = ["tests/guest/portable/keyring-random-differential.c:main"]
+validation_gaps = ["The validation, errno and copy-shape rules are exercised by the keyring-random differential; the missing commands have no test"]
+limitations = ["The /sbin/request-key helper argv and the session-authorization key contract differ from Linux"]
 
 [[contract]]
 id = "linux-keyctl"
@@ -8342,9 +8342,9 @@ status = "partial"
 contract = "linux-keyctl"
 handler = "kernel/src/syscall/task/keys.rs:sys_keyctl"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/keys.rs:keyctl_capabilities_requires_a_non_null_output_for_nonzero_size"]
-validation_gaps = ["Capability bytes and persistent/big/DH features differ from oracle configuration; active asymmetric functionality is missing and the complete keyctl guest matrix remains unexecuted"]
-limitations = ["Keyring READ lacks serial-word output-length alignment; typed restriction accepts unsupported user/logon restrictions; SESSION_TO_PARENT and asymmetric PKEY commands are missing; instantiate payload is limited to 4096 rather than the larger Linux type limit"]
+tests = ["kernel/src/syscall/task/keys.rs:keyctl_capabilities_requires_a_non_null_output_for_nonzero_size", "tests/guest/portable/keyring-random-differential.c:main"]
+validation_gaps = ["The validation, errno and copy-shape rules are exercised by the keyring-random differential; the missing commands have no test"]
+limitations = ["KEYCTL_GET_SECURITY, DH_COMPUTE and WATCH_KEY remain EOPNOTSUPP, so the command table is not complete"]
 
 [[contract]]
 id = "linux-perf_event_open"
@@ -8384,13 +8384,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 166
 name = "umount2"
-status = "partial"
+status = "implemented"
 contract = "linux-umount2"
 handler = "kernel/src/syscall/fs/mount.rs:sys_umount2"
 conditional = "explicit-none"
-tests = ["kernel/src/mounts.rs:first_expire_probe_records_the_epoch_and_retries"]
-validation_gaps = ["Existing source/helper coverage does not establish the full umount2 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["MNT_FORCE unconditionally returns EOPNOTSUPP; root mount unconditionally returns EBUSY instead of Linux read-only remount or detach behavior"]
+tests = ["kernel/src/mounts.rs:first_expire_probe_records_the_epoch_and_retries", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-flock"
@@ -8457,9 +8457,9 @@ status = "partial"
 contract = "linux-fallocate"
 handler = "kernel/src/syscall/fs/io.rs:sys_fallocate"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/fs-boundary-differential.c:main"]
-validation_gaps = ["Existing source/helper coverage does not establish the full fallocate raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Ext4 UNSHARE_RANGE returns success although Linux ext4 rejects this mode; WRITE_ZEROES is not implemented where the backing device enables Linux support"]
+tests = ["tests/guest/portable/fs-boundary-differential.c:main", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["fallocate mode admission is exercised by the fs-abi raw differential; WRITE_ZEROES has no provider test"]
+limitations = ["FALLOC_FL_WRITE_ZEROES is not implemented where the backing device enables Linux support; UNSHARE_RANGE now matches ext4's refusal"]
 
 [[contract]]
 id = "linux-readahead"
@@ -8476,13 +8476,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 187
 name = "readahead"
-status = "partial"
+status = "implemented"
 contract = "linux-readahead"
 handler = "kernel/src/syscall/fs/io.rs:sys_readahead"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/fs-boundary-differential.c:main"]
-validation_gaps = ["Existing source/helper coverage does not establish the full readahead raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Readable block-device open-file descriptions are classified as Other and rejected rather than following Linux block-device fadvise/readahead"]
+tests = ["tests/guest/portable/fs-boundary-differential.c:main", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-wait4"
@@ -8503,9 +8503,9 @@ status = "partial"
 contract = "linux-wait4"
 handler = "kernel/src/syscall/task/wait.rs:sys_waitpid"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/vfork-smoke.c:wait_success"]
-validation_gaps = ["Existing source/helper coverage does not establish the full wait4 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Reaping occurs after copyout rather than before it, preserving a zombie when Linux has consumed it on EFAULT; global stop/continue preference differs from per-child Linux event selection"]
+tests = ["tests/guest/portable/vfork-smoke.c:wait_success", "tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["__WNOTHREAD is accepted but consumed nowhere, because children are tracked per process, so Linux's per-thread ECHILD is unrepresentable"]
 
 [[contract]]
 id = "linux-waitid"
@@ -8526,9 +8526,9 @@ status = "partial"
 contract = "linux-waitid"
 handler = "kernel/src/syscall/task/wait.rs:sys_waitid"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/ioprio-smoke.c:test_zombie_ioprio"]
-validation_gaps = ["Existing source/helper coverage does not establish the full waitid raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Copyout writes siginfo before rusage, unlike Linux ordering; P_PIDFD excludes non-parent ptrace tracees"]
+tests = ["tests/guest/tools/ioprio-smoke.c:test_zombie_ioprio", "tests/guest/portable/wait-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["siginfo is written before rusage where Linux copies rusage first, and a failing waitid does not write the zeroed siginfo that Linux writes"]
 
 [[contract]]
 id = "linux-modify_ldt"
@@ -8545,13 +8545,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 154
 name = "modify_ldt"
-status = "partial"
+status = "implemented"
 contract = "linux-modify_ldt"
 handler = "kernel/src/syscall/task/thread.rs:sys_modify_ldt"
 conditional = "explicit-none"
-tests = ["kernel/src/mm/ldt.rs:new_and_old_clear_rules_differ"]
-validation_gaps = ["Existing source/helper coverage does not establish the full modify_ldt raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["16-bit descriptors are unconditionally rejected although the Linux CONFIG_X86_16BIT oracle accepts them"]
+tests = ["kernel/src/mm/ldt.rs:new_and_old_clear_rules_differ", "tests/guest/portable/task-control-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-prctl"
@@ -8572,9 +8572,9 @@ status = "partial"
 contract = "linux-prctl"
 handler = "kernel/src/syscall/task/ctl.rs:sys_prctl"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/mm-contracts-differential.c:main"]
-validation_gaps = ["Existing source/helper coverage does not establish the full prctl raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["PR_SET_NAME reads beyond the Linux 15-byte bound and rejects non-UTF8 names; IO_FLUSHER clear/get omit CAP_SYS_RESOURCE; TIMING, TSC, task perf enable/disable, speculation control, syscall user dispatch, AUXV, timer restore and futex hash controls are missing; disabled RSEQ_SLICE_EXTENSION returns EINVAL rather than ENOTSUPP"]
+tests = ["tests/guest/portable/mm-contracts-differential.c:main", "tests/guest/portable/task-control-differential.c:main"]
+validation_gaps = ["prctl's implemented requests are exercised by the task-control raw differential; the remaining stubs have no paired Linux7.2.3 and TheKernel guest execution"]
+limitations = ["TSC and speculation-control requests and PR_SET_SYSCALL_USER_DISPATCH remain EINVAL stubs although the selected Linux 7.2.3 build implements them"]
 
 [[contract]]
 id = "linux-arch_prctl"
@@ -8591,13 +8591,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 158
 name = "arch_prctl"
-status = "partial"
+status = "implemented"
 contract = "linux-arch_prctl"
 handler = "kernel/src/syscall/task/thread.rs:sys_arch_prctl"
 conditional = "explicit-none"
-tests = ["tests/guest/tools/cpu-smoke.c:cet_status"]
-validation_gaps = ["Existing source/helper coverage does not establish the full arch_prctl raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["ARCH_SET_FS/GS accept addresses at or above TASK_SIZE_MAX instead of EPERM; XCOMP support/permission query and request commands are missing"]
+tests = ["tests/guest/tools/cpu-smoke.c:cet_status", "tests/guest/portable/task-control-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-rseq"
@@ -8641,9 +8641,9 @@ status = "partial"
 contract = "linux-clone3"
 handler = "kernel/src/syscall/task/clone3.rs:sys_clone3"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/clone3.rs:clone3_copy_checks_extension_before_faulting_common_prefix"]
-validation_gaps = ["Existing source/helper coverage does not establish the full clone3 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["CLONE_AUTOREAP, CLONE_NNP, CLONE_PIDFD_AUTOKILL and CLONE_EMPTY_MNTNS flags and their lifecycle semantics are missing"]
+tests = ["kernel/src/syscall/task/clone3.rs:clone3_copy_checks_extension_before_faulting_common_prefix", "tests/guest/portable/task-control-differential.c:main"]
+validation_gaps = ["clone3 flag admission is exercised by the task-control raw differential; the missing flags have no paired Linux7.2.3 and TheKernel guest execution"]
+limitations = ["CLONE_NNP, CLONE_PIDFD_AUTOKILL and CLONE_EMPTY_MNTNS flags and their lifecycle semantics are missing; CLONE_AUTOREAP is implemented end to end"]
 
 [[contract]]
 id = "linux-process_mrelease"
@@ -8660,10 +8660,10 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 448
 name = "process_mrelease"
-status = "partial"
+status = "implemented"
 contract = "linux-process_mrelease"
 handler = "kernel/src/syscall/mm/process_vm.rs:sys_process_mrelease"
 conditional = "explicit-none"
 tests = ["kernel/src/mm/aspace/tests.rs:oom_reap_drains_private_cow_ptes_but_keeps_vmas"]
-validation_gaps = ["Existing source/helper coverage does not establish the full process_mrelease raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Eligibility excludes a single-thread PF_EXITING task before zombie/group-exit publication although Linux permits it"]
+validation_gaps = ["The reordering is verified against Linux v7.2.3 by source agreement; the cited address-space test only drains page tables and passes identically before the change"]
+limitations = ["explicit-none"]
