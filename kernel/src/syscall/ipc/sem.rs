@@ -63,7 +63,12 @@ fn next_sem_array_serial() -> u64 {
 /// parent's entries.  The proxy calls `apply_sem_undo` only when the final
 /// owner exits, which is the lifetime boundary required by Linux.
 pub(crate) struct SemUndo {
-    entries: BTreeMap<(i32, u16), SemAdjustment>,
+    /// Sorted by `(semid, semnum)`, exactly one entry per semaphore of an
+    /// array - the shape Linux gives `struct sem_undo`'s
+    /// `semadj[sma->sem_nsems]` flexible array (`ipc/sem.c:1930-1937`).  A
+    /// fallible reservation replaces Linux's `kvzalloc_flex()` failure mode,
+    /// ENOMEM.
+    entries: Vec<((i32, u16), SemAdjustment)>,
 }
 
 #[derive(Clone, Copy)]
@@ -81,32 +86,62 @@ struct SemAdjustment {
 impl SemUndo {
     pub(crate) const fn new() -> Self {
         Self {
-            entries: BTreeMap::new(),
+            entries: Vec::new(),
         }
     }
 
     pub(crate) fn try_clone(&self) -> AxResult<Self> {
-        let mut entries = BTreeMap::new();
-        entries.extend(self.entries.iter().map(|(key, value)| (*key, *value)));
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| AxError::NoMemory)?;
+        entries.extend_from_slice(&self.entries);
         Ok(Self { entries })
+    }
+
+    fn find(&self, key: &(i32, u16)) -> Option<&SemAdjustment> {
+        self.entries
+            .binary_search_by_key(key, |(stored, _)| *stored)
+            .ok()
+            .map(|index| &self.entries[index].1)
+    }
+
+    fn insert(&mut self, key: (i32, u16), value: SemAdjustment) -> AxResult<()> {
+        match self.entries.binary_search_by_key(&key, |(stored, _)| *stored) {
+            Ok(index) => self.entries[index].1 = value,
+            Err(index) => {
+                self.entries
+                    .try_reserve(1)
+                    .map_err(|_| AxError::NoMemory)?;
+                self.entries.insert(index, (key, value));
+            }
+        }
+        Ok(())
     }
 
     /// Linux `sem_undo.semadj[sem_num]`: the adjustment accumulated so far for
     /// one semaphore of one array.  An entry that belongs to a different array
     /// instance or was cleared by `SETVAL` reads as zero.
     fn prior(&self, semid: i32, serial: u64, semnum: u16) -> i32 {
-        self.entries
-            .get(&(semid, semnum))
+        self.find(&(semid, semnum))
             .filter(|entry| entry.serial == serial)
             .map_or(0, |entry| entry.value)
     }
 
     /// Reserve every new undo key an operation can commit before the
-    /// semaphore values are changed.  `semop` is atomic: an allocation or
-    /// SEMUME failure must not be observed after any member of the operation
-    /// vector has taken effect.  The caller keeps this list locked through
-    /// `record`, so the reservation cannot be consumed by a CLONE_SYSVSEM
-    /// sibling in between.
+    /// semaphore values are changed.  `semop` is atomic: an allocation
+    /// failure must not be observed after any member of the operation vector
+    /// has taken effect.  The caller keeps this list locked through `record`,
+    /// so the reservation cannot be consumed by a CLONE_SYSVSEM sibling in
+    /// between.
+    ///
+    /// There is no fixed entry ceiling.  Linux grows one `struct sem_undo` per
+    /// semaphore array the task touches and sizes each by that array's
+    /// `sem_nsems` (`ipc/sem.c:1930-1937`), so a task may hold adjustments on
+    /// many arrays; the only realistic failure is the allocator's, which
+    /// surfaces as ENOMEM (`ipc/sem.c:1938-1942`).  `SEMUME` is the size of
+    /// the *unused* `sem_undo` compatibility field and bounds nothing
+    /// (`include/uapi/linux/sem.h:86-89`).
     fn prepare_records(&mut self, semid: i32, ops: &[Sembuf]) -> AxResult<()> {
         let mut additional = 0usize;
         for (index, op) in ops.iter().enumerate() {
@@ -114,7 +149,7 @@ impl SemUndo {
                 continue;
             }
             let key = (semid, op.sem_num);
-            if self.entries.contains_key(&key)
+            if self.find(&key).is_some()
                 || ops[..index].iter().any(|prior| {
                     plan_sem_op(abi_sem_buf(prior)).records_undo()
                         && prior.sem_num == op.sem_num
@@ -124,14 +159,9 @@ impl SemUndo {
             }
             additional = additional.checked_add(1).ok_or(AxError::NoMemory)?;
         }
-        if self.entries.len().saturating_add(additional) > SEMUME {
-            return Err(AxError::from(LinuxError::ENOSPC));
-        }
-        // `BTreeMap` has no fallible reservation API.  All state mutation is
-        // still deferred until the operation has passed the semantic bounds
-        // above; insertion itself owns the map allocation.
-        let _ = additional;
-        Ok(())
+        self.entries
+            .try_reserve(additional)
+            .map_err(|_| AxError::NoMemory)
     }
 
     /// Records the inverse adjustment for one successfully completed SEM_UNDO
@@ -150,27 +180,22 @@ impl SemUndo {
         serial: u64,
     ) -> AxResult<()> {
         let prior = self
-            .entries
-            .get(&(semid, semnum))
+            .find(&(semid, semnum))
             .filter(|entry| entry.serial == serial && entry.generation == generation)
             .map_or(0, |entry| entry.value);
         if !sem_undo_delta_in_range(prior, sem_op) {
             return Err(AxError::from(LinuxError::ERANGE));
         }
-        let key = (semid, semnum);
-        if !self.entries.contains_key(&key) && self.entries.len() >= SEMUME {
-            return Err(AxError::from(LinuxError::ENOSPC));
-        }
         // Linux writes the identity for a wait-for-zero, which cannot change
         // the accumulated adjustment.
-        self.entries.insert(
-            key,
+        self.insert(
+            (semid, semnum),
             SemAdjustment {
                 value: prior - sem_op as i32,
                 generation,
                 serial,
             },
-        );
+        )?;
         Ok(())
     }
 }
@@ -638,7 +663,14 @@ impl SemManager {
 /// Applies a final `sem_undo` list without sleeping. Removed arrays and stale
 /// semaphore indexes are ignored exactly as Linux ignores undo entries whose
 /// target disappeared before the owner exited.
-pub(crate) fn apply_sem_undo(manager: &Mutex<SemManager>, undo: &mut SemUndo) {
+///
+/// `pid` is the detaching task's `task_tgid()`.  Linux `exit_sem()` writes it
+/// into `sempid` for every semaphore it adjusts (`ipc/sem.c:2430-2433`), caps
+/// the result to `[0, SEMVMX]`, and then runs
+/// `do_smart_update(sma, NULL, 0, 1, ...)`, which stamps `sem_otime` - not
+/// `sem_ctime` - because an undo is an operation, not a `semctl()` change
+/// (`ipc/sem.c:997-1011`, `:2436-2438`).
+pub(crate) fn apply_sem_undo(manager: &Mutex<SemManager>, undo: &mut SemUndo, pid: Pid) {
     let entries = core::mem::take(&mut undo.entries);
     let mut wake = Vec::new();
     let state = manager.lock();
@@ -665,6 +697,9 @@ pub(crate) fn apply_sem_undo(manager: &Mutex<SemManager>, undo: &mut SemUndo) {
             if adjustment.generation != sem.undo_generation {
                 continue;
             }
+            // `ipc_update_pid()` runs for every non-zero adjustment, whether or
+            // not the clamped value differs from the stored one.
+            sem.pid = pid as __kernel_pid_t;
             let value = (sem.value as i32 + adjustment.value).clamp(0, SEMVMX as i32) as u16;
             if value == sem.value {
                 false
@@ -673,8 +708,10 @@ pub(crate) fn apply_sem_undo(manager: &Mutex<SemManager>, undo: &mut SemUndo) {
                 true
             }
         };
+        // `do_smart_update(..., otime = 1, ...)` stamps the operation time for
+        // the array; `sem_ctime` is reserved for `semctl()` changes.
+        array.semid_ds.sem_otime = ipc_time_secs();
         if changed {
-            array.mark_changed();
             wake.push(array.waiters.clone());
         }
     }
@@ -1802,14 +1839,14 @@ mod setall_snapshot_tests {
         second.record(1, 0, -4, 0, serial).unwrap();
         second.record(1, 1, -5, 0, serial).unwrap();
         array.lock().sems[0].reset_value(20, 1).unwrap();
-        apply_sem_undo(&manager, &mut first);
+        apply_sem_undo(&manager, &mut first, 0);
         assert_eq!(array.lock().sems[0].value, 20);
         assert_eq!(array.lock().sems[1].value, 3);
         // A new operation replaces, rather than combines with, the cleared
         // adjustment in a surviving process's undo list.
         let generation = array.lock().sems[0].undo_generation;
         second.record(1, 0, -7, generation, serial).unwrap();
-        apply_sem_undo(&manager, &mut second);
+        apply_sem_undo(&manager, &mut second, 0);
         assert_eq!(array.lock().sems[0].value, 27);
         assert_eq!(array.lock().sems[1].value, 8);
     }
@@ -1825,7 +1862,7 @@ mod setall_snapshot_tests {
         undo.record(1, 0, -2, 0, serial).unwrap();
         undo.record(1, 1, -3, 0, serial).unwrap();
         array.lock().reset_values(&[10, 20], 1).unwrap();
-        apply_sem_undo(&manager, &mut undo);
+        apply_sem_undo(&manager, &mut undo, 0);
         assert_eq!(array.lock().sems[0].value, 10);
         assert_eq!(array.lock().sems[1].value, 20);
     }
@@ -1868,7 +1905,7 @@ mod setall_snapshot_tests {
         successor.lock().sems[0].value = 9;
         successor.lock().sems[1].value = 9;
 
-        apply_sem_undo(&manager, &mut undo);
+        apply_sem_undo(&manager, &mut undo, 0);
 
         assert_eq!(successor.lock().sems[0].value, 9);
         assert_eq!(successor.lock().sems[1].value, 9);

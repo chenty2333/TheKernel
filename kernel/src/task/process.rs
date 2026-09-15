@@ -2378,11 +2378,13 @@ impl SemUndoState {
         &self.undo
     }
 
-    pub(crate) fn apply_on_final_exit(&self) {
+    /// `pid` is the detaching owner's `task_tgid()`, which Linux republishes as
+    /// each adjusted semaphore's `sempid` (`ipc/sem.c:2430-2438`).
+    pub(crate) fn apply_on_final_exit(&self, pid: Pid) {
         let Some(mut undo) = self.undo.lock().take() else {
             return;
         };
-        apply_sem_undo(self.ipc_ns.sem_manager(), &mut undo);
+        apply_sem_undo(self.ipc_ns.sem_manager(), &mut undo, pid);
     }
 }
 
