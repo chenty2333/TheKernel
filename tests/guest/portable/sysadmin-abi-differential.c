@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <sched.h>
@@ -12,6 +13,7 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/statfs.h>
 #include <sys/uio.h>
 #include <sys/swap.h>
 #include <sys/syscall.h>
@@ -609,6 +611,117 @@ static void ptrace_request_case(void) {
 #ifndef CLONE_CLEAR_SIGHAND
 #define CLONE_CLEAR_SIGHAND (1ULL << 32)
 #endif
+/* include/uapi/linux/sched.h:54 -- unshare(2)'s own spelling of "new mount
+ * namespace, but empty".  It is bit 20, the bit clone(2)/clone3(2) spend on
+ * CLONE_PARENT_SETTID; only unshare(2) reads it this way. */
+#ifndef UNSHARE_EMPTY_MNTNS
+#define UNSHARE_EMPTY_MNTNS 0x00100000
+#endif
+/* include/uapi/linux/magic.h:107; `nullfs_fs_fill_super()` installs it as the
+ * superblock magic (fs/nullfs.c:18) and `simple_statfs()` reports it as
+ * f_type. */
+#ifndef NULL_FS_MAGIC
+#define NULL_FS_MAGIC 0x4E554C4C
+#endif
+
+/* What a task that just unshared an empty mount namespace can see.
+ *
+ * `ksys_unshare()` turns UNSHARE_EMPTY_MNTNS into CLONE_NEWNS and then
+ * CLONE_FS (kernel/fork.c:3245-3248), `unshare_nsproxy_namespaces()` converts
+ * the bit into CLONE_EMPTY_MNTNS (kernel/nsproxy.c:226-232), and
+ * `copy_mnt_ns()` clones only the namespace root -- the immutable nullfs
+ * (fs/namespace.c:6185-6212) -- instead of copying the tree, then re-points
+ * fs->root and fs->pwd at that clone (fs/namespace.c:4279-4291).
+ *
+ * So inside the new namespace "/" is the cloned nullfs: reachable, a
+ * directory, reporting NULL_FS_MAGIC, with pwd reset to it -- and every path
+ * that lived on a submount of the old namespace (the whole rootfs, /proc) is
+ * -ENOENT.  A namespace that merely *copied* the parent's tree would still
+ * report the rootfs magic and still resolve those paths, and a kernel that
+ * ignored the flag entirely would resolve them in the parent's namespace.
+ *
+ * The child reports one bit per observation so the parent can turn each group
+ * into its own record:
+ *   1  unshare(UNSHARE_EMPTY_MNTNS) returned 0
+ *   2  "/" resolves and its statfs() magic is NULL_FS_MAGIC
+ *   4  "/" opens as a directory, so the cloned root mount is usable
+ *   8  getcwd() is "/"
+ *   16 a path that exists in the parent namespace is -ENOENT
+ *   32 /proc/uptime, a submount of the parent namespace, is -ENOENT
+ * 16 and 32 are only set when the path really was reachable before the
+ * unshare, so a missing probe target can never be mistaken for a namespace
+ * that dropped it. */
+/* A diagnostic, never an assertion: the records this case registers are the
+ * ASSERT tokens the parent prints, so an observation that fails here still has
+ * to fail through them.  stderr is a descriptor, not a path, so this works from
+ * inside an empty mount namespace. */
+static void probe_note(const char *what, int error) {
+    fprintf(stderr, "THEKERNEL_EMPTY_MNTNS_PROBE %s errno=%d (%s)\n", what, error,
+            strerror(error));
+}
+
+static int empty_mount_namespace_observations(const char *rootfs_path) {
+    int observed = 0;
+    struct statfs root_fs;
+    char cwd[8];
+    /* Both targets have to be reachable in the namespace the child is about
+     * to leave, or "gone afterwards" would say nothing. */
+    int rootfs_was_reachable = rootfs_path != NULL && access(rootfs_path, F_OK) == 0;
+    int proc_was_reachable = access("/proc/uptime", F_OK) == 0;
+    int fd;
+
+    errno = 0;
+    if (syscall(SYS_unshare, (long)UNSHARE_EMPTY_MNTNS) != 0) {
+        probe_note("unshare", errno);
+        return 0;
+    }
+    observed |= 1;
+
+    errno = 0;
+    if (statfs("/", &root_fs) == 0) {
+        if ((unsigned long)root_fs.f_type == (unsigned long)NULL_FS_MAGIC) {
+            observed |= 2;
+        } else {
+            fprintf(stderr, "THEKERNEL_EMPTY_MNTNS_PROBE statfs-root magic=0x%lx\n",
+                    (unsigned long)root_fs.f_type);
+        }
+    } else {
+        probe_note("statfs-root", errno);
+    }
+    errno = 0;
+    fd = open("/", O_RDONLY | O_DIRECTORY);
+    if (fd >= 0) {
+        observed |= 4;
+        close(fd);
+    } else {
+        probe_note("open-root", errno);
+    }
+    errno = 0;
+    if (getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, "/") == 0) {
+        observed |= 8;
+    } else {
+        probe_note("getcwd", errno);
+    }
+    errno = 0;
+    if (rootfs_was_reachable && access(rootfs_path, F_OK) == -1 && errno == ENOENT) {
+        observed |= 16;
+    } else if (rootfs_was_reachable) {
+        probe_note("rootfs-still-reachable", errno);
+    }
+    errno = 0;
+    if (proc_was_reachable && access("/proc/uptime", F_OK) == -1 && errno == ENOENT) {
+        observed |= 32;
+    } else if (proc_was_reachable) {
+        probe_note("proc-still-reachable", errno);
+    }
+    if (!rootfs_was_reachable) {
+        probe_note("rootfs-probe-absent", ENOENT);
+    }
+    if (!proc_was_reachable) {
+        probe_note("proc-probe-absent", ENOENT);
+    }
+    return observed;
+}
 
 static void unshare_flag_case(void) {
     puts("THEKERNEL_ABI_CASE sysadmin-abi.unshare-flags.raw-differential");
@@ -645,6 +758,58 @@ static void unshare_flag_case(void) {
     errno = 0;
     expect_errno(UNSHARE_CASE, "UNSHARE_CLEAR_SIGHAND_EINVAL",
                  syscall(SYS_unshare, (long)(CLONE_CLEAR_SIGHAND)), EINVAL);
+
+    /* Creating an empty mount namespace destroys the caller's view of the
+     * filesystem, and a mount namespace is shared by every process that did
+     * not unshare one -- so the probe runs in a child whose exit status carries
+     * the observations, and the namespace it empties dies with it. */
+    static const char *const rootfs_probes[] = {
+        "/opt/thekernel-tests/portable/sysadmin-abi-differential",
+        "/bin/busybox",
+        "/etc/passwd",
+    };
+    const char *rootfs_probe = NULL;
+    int empty_verdict = -1;
+
+    for (size_t index = 0; index < sizeof(rootfs_probes) / sizeof(rootfs_probes[0]); ++index) {
+        if (access(rootfs_probes[index], F_OK) == 0) {
+            rootfs_probe = rootfs_probes[index];
+            break;
+        }
+    }
+    if (rootfs_probe == NULL) {
+        /* No probe target means no observation, never a silent pass. */
+        report_failure("empty-mntns-rootfs-probe-path", -1, ENOENT);
+    }
+    fflush(stdout);
+    pid_t empty_child = fork();
+    if (empty_child == 0) {
+        _exit(empty_mount_namespace_observations(rootfs_probe));
+    }
+    if (empty_child > 0) {
+        int status = 0;
+        if (waitpid(empty_child, &status, 0) == empty_child && WIFEXITED(status)) {
+            empty_verdict = WEXITSTATUS(status);
+        }
+    }
+    if (empty_child < 0) {
+        empty_verdict = -1;
+    }
+    {
+        /* A -1 verdict must fail every record below rather than read as "all
+         * bits set"; the failure lines carry the child's bitmask as errno. */
+        int observed = empty_verdict < 0 ? 0 : empty_verdict;
+
+        errno = empty_verdict < 0 ? ECHILD : observed;
+        expect_value(UNSHARE_CASE, "UNSHARE_EMPTY_MNTNS_ACCEPTED",
+                     (observed & 1) != 0, 1);
+        errno = empty_verdict < 0 ? ECHILD : observed;
+        expect_value(UNSHARE_CASE, "UNSHARE_EMPTY_MNTNS_ROOT_IS_NAMESPACE_ROOT",
+                     (observed & (2 | 4 | 8)) == (2 | 4 | 8), 1);
+        errno = empty_verdict < 0 ? ECHILD : observed;
+        expect_value(UNSHARE_CASE, "UNSHARE_EMPTY_MNTNS_DROPS_SUBMOUNTS",
+                     (observed & (16 | 32)) == (16 | 32), 1);
+    }
 
     puts("THEKERNEL_ABI_RESULT sysadmin-abi.unshare-flags.raw-differential pass");
 }

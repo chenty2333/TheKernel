@@ -12754,6 +12754,23 @@ mod tests {
     #[cfg(feature = "ext4")]
     use super::{PhysicalIoEffect, PhysicalIoResetProof};
 
+    /// The empty mount namespace makes the immutable nullfs the visible root,
+    /// so `open("/", O_RDONLY | O_DIRECTORY)` reaches a filesystem node that no
+    /// other boot path opens.  `NullDir` is a read-only directory whose root
+    /// inode is `S_IMMUTABLE` (fs/nullfs.c:7-34), and Linux still opens it.
+    #[test]
+    fn nullfs_root_directory_opens() {
+        let fs = axfs_ng_vfs::nullfs::filesystem().unwrap();
+        let root = Mountpoint::new_root(&fs);
+        let context = crate::FsContext::new(root.root_location());
+        let mut options = OpenOptions::new();
+        options.read(true).directory(true);
+        match options.open(&context, FsPath::new(b"/")) {
+            Ok(_) => {}
+            Err(error) => panic!("opening the nullfs root failed: {error:?}"),
+        }
+    }
+
     #[cfg(feature = "ext4")]
     #[test]
     fn prepared_physical_effect_is_worker_send() {

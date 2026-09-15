@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 314
-implemented = 295
+resolved = 315
+implemented = 296
 explicit_enosys = 19
 fallback = 0
-partial = 71
+partial = 70
 unknown = 0
 
 [[contract]]
@@ -7947,13 +7947,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 272
 name = "unshare"
-status = "partial"
+status = "implemented"
 contract = "linux-unshare"
 handler = "kernel/src/syscall/task/ctl.rs:sys_unshare"
 conditional = "explicit-none"
-tests = ["tests/guest/portable/sysadmin-abi-differential.c:main"]
-validation_gaps = ["The flag implication chain and thread-group constraints are exercised by the sysadmin raw differential; CLONE_EMPTY_MNTNS has no assertion"]
-limitations = ["unshare(UNSHARE_EMPTY_MNTNS) (0x00100000, include/uapi/linux/sched.h:54) is still EINVAL: there is no root-mount-only mount-namespace constructor behind the flag"]
+tests = ["kernel/src/mounts.rs:empty_namespace_clone_keeps_only_the_namespace_root", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+validation_gaps = ["UNSHARE_EMPTY_MNTNS (0x00100000, include/uapi/linux/sched.h:54) is asserted end to end on both guests by the sysadmin raw differential: the request is accepted, the implied CLONE_NEWNS/CLONE_FS work leaves the task rooted at the cloned namespace root (NULL_FS_MAGIC, usable directory, pwd reset) and every path that lived on a submount of the old namespace is ENOENT. The root-mount-only clone shape itself is pinned by the mounts unit test; the remaining implication-chain and thread-group errno ordering is exercised only by that raw differential"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-setns"
@@ -8641,9 +8641,9 @@ status = "partial"
 contract = "linux-clone3"
 handler = "kernel/src/syscall/task/clone3.rs:sys_clone3"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/clone3.rs:clone3_copy_checks_extension_before_faulting_common_prefix", "tests/guest/portable/task-control-differential.c:main"]
-validation_gaps = ["clone3 flag admission is exercised by the task-control raw differential; the missing flags have no paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["CLONE_NNP, CLONE_PIDFD_AUTOKILL and CLONE_EMPTY_MNTNS flags and their lifecycle semantics are missing; CLONE_AUTOREAP is implemented end to end"]
+tests = ["crates/linux/process/src/linux_abi.rs:clone3_only_flags_are_admitted_but_keep_their_rules", "kernel/src/mounts.rs:empty_namespace_clone_keeps_only_the_namespace_root", "kernel/src/syscall/task/clone3.rs:clone3_copy_checks_extension_before_faulting_common_prefix", "tests/guest/portable/task-control-differential.c:main"]
+validation_gaps = ["CLONE_EMPTY_MNTNS (1ULL << 37, include/uapi/linux/sched.h:42) is admitted and asserted on both guests by the task-control raw differential: the child it creates is rooted at the cloned namespace root (NULL_FS_MAGIC, usable directory, pwd reset), every path that lived on a submount of the parent namespace is ENOENT, and the implied CLONE_NEWNS is visible to the CLONE_NEWNS|CLONE_FS rejection. clone3 flag admission, including the two flags still missing below, is exercised only by that raw differential"]
+limitations = ["CLONE_NNP and CLONE_PIDFD_AUTOKILL flags and their lifecycle semantics are missing; CLONE_AUTOREAP is implemented end to end, and CLONE_EMPTY_MNTNS installs a root-mount-only mount namespace"]
 
 [[contract]]
 id = "linux-process_mrelease"

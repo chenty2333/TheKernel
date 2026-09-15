@@ -458,6 +458,27 @@ impl ClonePlan {
         if flags & !clone_flags::KNOWN != 0 {
             return Err(ProcessAbiError::InvalidFlags);
         }
+        // `kernel_clone()` rewrites the flag word before anything validates it:
+        //
+        // 	/*
+        // 	 * Creating an empty mount namespace implies creating a new mount
+        // 	 * namespace.  Set this before copy_process() so that the
+        // 	 * CLONE_NEWNS|CLONE_FS mutual exclusion check works correctly.
+        // 	 */
+        // 	if (clone_flags & CLONE_EMPTY_MNTNS) {
+        // 		clone_flags |= CLONE_NEWNS;
+        // 		args->flags = clone_flags;
+        // 	}
+        //
+        // (`kernel/fork.c`:2703-2711).  The implication has to be visible to
+        // the `CLONE_NEWNS|CLONE_FS` exclusion, which `copy_process()` applies
+        // to the rewritten word (`kernel/fork.c`:2011-2012), so it belongs to
+        // the plan rather than to the namespace construction site.
+        let flags = if flags & clone_flags::EMPTY_MNTNS != 0 {
+            flags | clone_flags::NEWNS
+        } else {
+            flags
+        };
         if exit_signal > 64 || exit_signal != 0 && flags & clone_flags::THREAD != 0 {
             return Err(ProcessAbiError::InvalidExitSignal);
         }
@@ -939,6 +960,20 @@ mod tests {
         assert_eq!(
             clone_flag_admission(EMPTY_MNTNS | NEWNS, 0, false, false),
             Ok(())
+        );
+
+        // An empty mount namespace is a new mount namespace, and the plan is
+        // where `kernel_clone()` applies that implication -- before
+        // `copy_process()` can reject CLONE_NEWNS|CLONE_FS
+        // (`kernel/fork.c`:2011-2012, 2703-2711).
+        for flags in [EMPTY_MNTNS, EMPTY_MNTNS | FS] {
+            let plan = ClonePlan::new(flags, 0, 0, 0, 0, 0, 0, 0).unwrap();
+            assert_eq!(plan.flags & EMPTY_MNTNS, EMPTY_MNTNS);
+            assert_eq!(plan.flags & NEWNS, NEWNS);
+        }
+        assert_eq!(
+            ClonePlan::new(NEWNS, 0, 0, 0, 0, 0, 0, 0).unwrap().flags & EMPTY_MNTNS,
+            0
         );
 
         // CLONE_AUTOREAP owns a thread group's reaping, so it cannot ask for a
