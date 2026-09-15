@@ -5,8 +5,9 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axfs_ng_vfs::Timestamp;
-use axhal::time::TimeValue;
+use axhal::time::{NANOS_PER_SEC, TimeValue};
 use axpoll::PollSet;
+use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
     __kernel_old_timespec, __kernel_old_timeval, __kernel_sock_timeval, __kernel_timespec,
     timespec, timeval,
@@ -19,6 +20,39 @@ static WALL_TIME_PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const WALL_TIME_DISCONTINUITY_WAIT_CAPACITY: usize = 64;
 static WALL_TIME_DISCONTINUITY_WAITERS: PollSet<WALL_TIME_DISCONTINUITY_WAIT_CAPACITY> =
     PollSet::new();
+
+/// The timezone retained by `settimeofday(2)`: Linux keeps one process-wide
+/// `struct timezone` in `sys_tz` (`kernel/time/time.c:50`) and reports it from
+/// every later `gettimeofday(2)` (`kernel/time/time.c:140-155`).  Nothing in
+/// the kernel interprets it; it is a compatibility value owned by userspace.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SystemTimezone {
+    pub minutes_west: i32,
+    pub dst_time: i32,
+}
+
+static SYSTEM_TIMEZONE: SpinNoIrq<SystemTimezone> = SpinNoIrq::new(SystemTimezone {
+    minutes_west: 0,
+    dst_time: 0,
+});
+
+/// Returns the retained `settimeofday(2)` timezone, zero until it is set.
+pub fn system_timezone() -> SystemTimezone {
+    *SYSTEM_TIMEZONE.lock()
+}
+
+/// Retains the timezone of a successful `settimeofday(2)` request.  Linux
+/// stores it before applying the wall clock, so a later range or monotonic
+/// rejection still leaves the timezone updated
+/// (`kernel/time/time.c:205-222`).
+pub fn set_system_timezone(timezone: SystemTimezone) {
+    *SYSTEM_TIMEZONE.lock() = timezone;
+}
+
+/// The largest wall-clock second `settimeofday(2)`, `clock_settime(2)` and
+/// `ADJ_SETOFFSET` accept: `TIME_SETTOD_SEC_MAX` (`include/linux/time64.h:44`).
+const MAX_WALL_TIME_NANOS: i128 =
+    tk_linux_time::TIME_SETTOD_SEC_MAX as i128 * NANOS_PER_SEC as i128;
 
 /// Converts userspace wall-clock fields into the signed VFS timestamp model.
 /// This is intentionally separate from duration-oriented timeout conversion:
@@ -100,6 +134,15 @@ fn next_wall_time_publication(stable: u64) -> Option<(u64, u64)> {
 }
 
 pub fn set_wall_time(new_time: TimeValue) -> AxResult<()> {
+    let target_nanos = new_time.as_nanos() as i128;
+    // Linux rejects a wall-clock target at or beyond `TIME_SETTOD_SEC_MAX`
+    // instead of saturating it (`timespec64_valid_settod()`,
+    // `include/linux/time64.h:118-127`).  The callers apply the same rule
+    // through `linux_time::validate_settime_target()`; this guard keeps a
+    // future caller from silently wrapping the offset below.
+    if target_nanos >= MAX_WALL_TIME_NANOS {
+        return Err(AxError::InvalidInput);
+    }
     // A local timer interrupt may read wall time, so the writer must not be
     // interrupted or preempted while the publication sequence is odd.
     let publication_guard = kernel_guard::NoPreemptIrqSave::new();
@@ -125,8 +168,10 @@ pub fn set_wall_time(new_time: TimeValue) -> AxResult<()> {
     };
 
     let base_nanos = axhal::time::wall_time_nanos() as i128;
-    let target_nanos = new_time.as_nanos().min(u64::MAX as u128) as i128;
-    let offset = (target_nanos - base_nanos).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    // The published offset is a signed nanosecond delta against the platform
+    // wall clock; refuse to saturate it so an unrepresentable target cannot be
+    // mistaken for a successful set.
+    let offset = i64::try_from(target_nanos - base_nanos).map_err(|_| AxError::OutOfRange)?;
     // The odd/even sequence prevents readers from combining a new offset with
     // an old cancellation generation. Wake readiness consumers only after the
     // complete publication is visible, and never while holding object locks.

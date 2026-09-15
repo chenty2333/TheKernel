@@ -14,7 +14,7 @@ pub(crate) mod fuse;
 pub(crate) mod r#loop;
 #[cfg(feature = "memtrack")]
 mod memtrack;
-mod rtc;
+pub(crate) mod rtc;
 pub(crate) mod scanout;
 mod sound;
 pub mod tty;

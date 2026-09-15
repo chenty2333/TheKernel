@@ -16,10 +16,12 @@ use axtask::{
     set_task_nice as update_task_nice, task_scheduling_snapshot, update_task_scheduling,
 };
 use linux_raw_sys::general::{
-    __kernel_clockid_t, CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
-    CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP,
-    PRIO_PROCESS, PRIO_USER, RLIMIT_NICE, RLIMIT_RTPRIO, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO,
-    SCHED_IDLE, SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
+    __kernel_clockid_t, CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM,
+    CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID,
+    CLOCK_REALTIME, CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI,
+    CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS, PRIO_USER, RLIMIT_NICE, RLIMIT_RTPRIO,
+    SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE, SCHED_NORMAL, SCHED_RESET_ON_FORK,
+    SCHED_RR, TIMER_ABSTIME, timespec,
 };
 use tk_linux_process_adapter::{Pid, ProcessError};
 use tk_linux_sched as linux_sched;
@@ -879,9 +881,10 @@ impl CpuClockSleepTarget {
 }
 
 fn decode_cpu_sleep_clock(clock_id: __kernel_clockid_t) -> AxResult<(CpuSleepScope, u32, i32)> {
+    // The plain CLOCK_THREAD_CPUTIME_ID never reaches this helper: Linux has no
+    // sleep operation for it and the caller reports EOPNOTSUPP first.
     match clock_id as u32 {
         CLOCK_PROCESS_CPUTIME_ID => return Ok((CpuSleepScope::Process, 0, CPUCLOCK_SCHED)),
-        CLOCK_THREAD_CPUTIME_ID => return Ok((CpuSleepScope::Thread, 0, CPUCLOCK_SCHED)),
         _ => {}
     }
 
@@ -919,6 +922,14 @@ fn resolve_cpu_clock_sleep_target(clock_id: __kernel_clockid_t) -> AxResult<CpuC
             .ok_or(AxError::InvalidInput)?;
         get_visible_task_including_exiting(tid).map_err(|_| AxError::InvalidInput)?
     };
+
+    // Diagnose the impossible request first: a per-thread clock whose encoded
+    // pid is zero or the calling thread would wait for its own CPU time to
+    // advance, which Linux refuses before any permission check
+    // (`posix_cpu_nsleep()`, kernel/time/posix-cpu-timers.c:1630-1638).
+    if scope == CpuSleepScope::Thread && task.as_thread().tid() == current().as_thread().tid() {
+        return Err(AxError::InvalidInput);
+    }
 
     match scope {
         CpuSleepScope::Process => {
@@ -1081,11 +1092,22 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
     req: *const timespec,
     rem: *mut timespec,
 ) -> AxResult<isize> {
-    let absolute = clock_nanosleep_is_absolute(flags)?;
+    // Linux resolves the clock and its `nsleep` operation first, before the
+    // timespec is copied, so a clock without one is EOPNOTSUPP even for a
+    // faulting pointer: that is CLOCK_MONOTONIC_RAW, both *_COARSE clocks and
+    // CLOCK_THREAD_CPUTIME_ID, whose `clock_thread` table has no `nsleep`
+    // (`SYSCALL_DEFINE4(clock_nanosleep)`, kernel/time/posix-timers.c:1383-1410
+    // and the `clock_thread` initializer at kernel/time/posix-cpu-timers.c:1722).
     let clock = match clock_id as u32 {
-        CLOCK_REALTIME | CLOCK_TAI => AlarmClock::Realtime,
-        CLOCK_MONOTONIC | CLOCK_BOOTTIME => AlarmClock::Monotonic,
-        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => AlarmClock::Monotonic,
+        CLOCK_REALTIME | CLOCK_REALTIME_ALARM | CLOCK_TAI => AlarmClock::Realtime,
+        CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => AlarmClock::Monotonic,
+        CLOCK_PROCESS_CPUTIME_ID => AlarmClock::Monotonic,
+        CLOCK_MONOTONIC_RAW
+        | CLOCK_REALTIME_COARSE
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_THREAD_CPUTIME_ID => {
+            return Err(AxError::OperationNotSupported);
+        }
         _ => {
             // Negative non-CLOCKFD values may be Linux's encoded CPU clocks.
             // Resolve them below after user input is copied, so all CPU-clock
@@ -1098,19 +1120,24 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
         }
     };
 
+    // The interval is copied in and validated before `flags` is examined, so a
+    // faulting pointer reports EFAULT rather than EINVAL
+    // (`kernel/time/posix-timers.c:1394-1399`).
     let req = unsafe {
         req.vm_read_uninit(memory)
             .map_err(map_usercopy_error)?
             .assume_init()
     }
     .try_into_time_value()?;
+    let absolute = clock_nanosleep_is_absolute(flags)?;
+    // A wake-alarm sleep needs an RTC (EOPNOTSUPP) and CAP_WAKE_ALARM (EPERM)
+    // before it starts (`alarm_timer_nsleep()`,
+    // kernel/time/alarmtimer.c:766-790); the rule itself is shared with
+    // timer_create(2), clock_gettime(2), clock_getres(2) and timerfd_create(2).
+    crate::syscall::time::wake_alarm_admission(clock_id, tk_linux_time::WakeAlarmUse::Arm)?;
     debug!("sys_clock_nanosleep <= clock_id: {clock_id}, flags: {flags}, req: {req:?}");
 
-    if matches!(
-        clock_id as u32,
-        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID
-    ) || clock_id < 0
-    {
+    if clock_id as u32 == CLOCK_PROCESS_CPUTIME_ID || clock_id < 0 {
         let target = resolve_cpu_clock_sleep_target(clock_id)?;
         let start = target.now();
         let deadline = if absolute {
@@ -1159,7 +1186,9 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
         // re-reads the same absolute deadline.
         let deadline = match clock_id as u32 {
             CLOCK_MONOTONIC => current().as_thread().time_ns().host_monotonic_deadline(req),
-            CLOCK_BOOTTIME => current().as_thread().time_ns().host_boottime_deadline(req),
+            CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => {
+                current().as_thread().time_ns().host_boottime_deadline(req)
+            }
             _ => req,
         };
         let outcome = sleep_absolute(clock, deadline)?;

@@ -132,7 +132,15 @@ pub(crate) struct PosixTimer {
     cpu_target_process: Option<Weak<ProcessData>>,
     cpu_target_process_pid: Option<Pid>,
     pub sequence: u64,
+    /// The overrun of the notification that is being prepared or is pending.
+    /// It keeps accumulating while a delivery is pending, and is what
+    /// `si_overrun` reports.
     pub overrun: i32,
+    /// Linux's `it_overrun_last` (`kernel/time/posix-timers.c:279-289`): the
+    /// overrun of the last notification that was actually delivered, zero
+    /// before the first one and after every rearm.  `timer_getoverrun(2)`
+    /// reports this, not the accumulating value.
+    pub overrun_last: i32,
     signal_pending: bool,
     signal_retry_pending: bool,
     signal_token: u32,
@@ -160,6 +168,7 @@ impl core::fmt::Debug for PosixTimer {
             .field("cpu_target_process_pid", &self.cpu_target_process_pid)
             .field("sequence", &self.sequence)
             .field("overrun", &self.overrun)
+            .field("overrun_last", &self.overrun_last)
             .field("signal_pending", &self.signal_pending)
             .field("signal_retry_pending", &self.signal_retry_pending)
             .field("signal_token", &self.signal_token)
@@ -195,6 +204,7 @@ impl PosixTimer {
             cpu_target_process_pid,
             sequence: 0,
             overrun: 0,
+            overrun_last: 0,
             signal_pending: false,
             signal_retry_pending: false,
             signal_token: 0,
@@ -405,13 +415,20 @@ impl PosixTimer {
         if !self.signal_pending || self.signal_token != token {
             return false;
         }
+        // Linux latches `it_overrun_last = it_overrun` here, where the queued
+        // notification reaches the task (`__posixtimer_deliver_signal()`,
+        // kernel/time/posix-timers.c:314-322).
+        self.overrun_last = self.overrun;
         self.signal_pending = false;
         self.signal_retry_pending = false;
         true
     }
 
     pub(crate) fn reset_signal_delivery(&mut self) -> AlarmPublication {
+        // `common_timer_set()` clears both fields when a timer is armed
+        // (`kernel/time/posix-timers.c:882-883`).
         self.overrun = 0;
+        self.overrun_last = 0;
         self.signal_pending = false;
         self.signal_retry_pending = false;
         self.signal_token = 0;

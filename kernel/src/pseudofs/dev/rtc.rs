@@ -13,6 +13,21 @@ use crate::{file::IoctlContext, pseudofs::DeviceOps, time::wall_time_nanos};
 /// The device ID for /dev/rtc0
 pub const RTC0_DEVICE_ID: DeviceId = DeviceId::new(250, 0);
 
+/// Linux's `alarmtimer_get_rtcdev()` (`kernel/time/alarmtimer.c:640-650`):
+/// the wake-alarm clocks exist only while an RTC is registered, and the
+/// admission rule for `timer_create(2)`, `clock_nanosleep(2)`,
+/// `clock_gettime(2)` and `clock_getres(2)` consults it.
+///
+/// TheKernel registers `/dev/rtc0` unconditionally (`pseudofs/dev/mod.rs`) and
+/// reads the CMOS RTC for the boot wall clock
+/// (`crates/ax/tk-axplat-x86-pc/src/time.rs`), so on this x86_64-only platform
+/// an RTC is always present.  The predicate exists so the rule has one home
+/// and a future platform without an RTC has one place to change; the negative
+/// branch is covered by the host tests of `tk_linux_time::admit_wake_alarm`.
+pub const fn is_available() -> bool {
+    true
+}
+
 #[repr(C)]
 #[allow(non_camel_case_types, dead_code)]
 #[derive(Clone, Copy)]
