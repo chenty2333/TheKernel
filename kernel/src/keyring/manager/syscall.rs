@@ -7,6 +7,47 @@ enum ConstructionResult {
     Negative(i32, u64),
 }
 
+/// `keyctl_reject_key()`'s error-code filter.
+///
+/// The negative-key error must be a real errno: positive, below `MAX_ERRNO`,
+/// and not one of the restart-block codes `keyctl.c` lists explicitly.
+pub(super) fn valid_rejection_error(error: i32) -> bool {
+    const MAX_ERRNO: i32 = 4095;
+    const ERESTARTSYS: i32 = 512;
+    const ERESTARTNOINTR: i32 = 513;
+    const ERESTARTNOHAND: i32 = 514;
+    const ERESTART_RESTARTBLOCK: i32 = 516;
+    error > 0
+        && error < MAX_ERRNO
+        && error != ERESTARTSYS
+        && error != ERESTARTNOINTR
+        && error != ERESTARTNOHAND
+        && error != ERESTART_RESTARTBLOCK
+}
+
+/// The key type's own payload rule, re-applied when a pending key is
+/// instantiated.
+///
+/// `key_instantiate_and_link()` fills in `prep.orig_description` and calls
+/// `key->type->preparse()` again, so `KEYCTL_INSTANTIATE` enforces exactly the
+/// same limits as `add_key()`: a keyring takes no payload, and `user`/`logon`
+/// take 1..=32767 bytes.
+pub(super) fn validate_instantiated_payload(kind: KeyTypeKind, payload: &[u8]) -> AxResult<()> {
+    match kind {
+        KeyTypeKind::Keyring => {
+            if !payload.is_empty() {
+                return Err(AxError::InvalidInput);
+            }
+        }
+        KeyTypeKind::User | KeyTypeKind::Logon | KeyTypeKind::BigKey => {
+            if payload.is_empty() || payload.len() > kind.payload_limit() {
+                return Err(AxError::InvalidInput);
+            }
+        }
+    }
+    Ok(())
+}
+
 impl KeyManager {
     fn complete_construction(
         &mut self,
@@ -48,6 +89,8 @@ impl KeyManager {
         };
         match result {
             ConstructionResult::Positive(payload) => {
+                let kind = self.keys.get(&serial).ok_or(AxError::BadState)?.kind;
+                validate_instantiated_payload(kind, &payload)?;
                 self.replace_payload(serial, payload)?;
                 self.keys.get_mut(&serial).ok_or(AxError::BadState)?.state = KeyState::Positive;
             }
@@ -147,10 +190,17 @@ impl KeyManager {
             return Ok(RequestKeyBegin::Resolved(resolved.serial as isize));
         }
 
-        // A null callout_info is an empty callout, not an instruction to skip
-        // the request-key upcall. Description-only key types still require
-        // their helper invocation.
-        let callout = callout.unwrap_or("").to_string();
+        // `request_key_and_link()` only consults `/sbin/request-key` when
+        // `callout_info` was supplied.  A miss with a NULL callout is
+        // immediately -ENOKEY, and a keyring is never constructed by an
+        // upcall at all (`construct_key_and_link()` returns -EPERM).
+        let Some(callout) = callout else {
+            return Err(LinuxError::ENOKEY.into());
+        };
+        if kind == KeyTypeKind::Keyring {
+            return Err(AxError::OperationNotPermitted);
+        }
+        let callout = callout.to_string();
         let pending_id = PendingConstructionKey::new(namespace, kind, description);
         if let Some(serial) = self.pending_constructions.get(&pending_id).copied() {
             if self
@@ -340,6 +390,11 @@ impl KeyManager {
         let manager = self;
         let value = match command {
             KeyctlCommand::AssumeAuthority { key } => {
+                // `keyctl_assume_authority()`: every `KEY_SPEC_*` negative
+                // serial, including -1, is rejected before the lookup.
+                if key < 0 {
+                    return Err(AxError::InvalidInput);
+                }
                 let serial = if key == 0 {
                     manager
                         .construction_authorities
@@ -395,7 +450,10 @@ impl KeyManager {
                 error,
                 destination,
             } => {
-                if error <= 0 {
+                // `keyctl_reject_key()` validates the error code before it
+                // looks at the assumed authority: it must be a positive errno
+                // below MAX_ERRNO and outside the restart-block magic range.
+                if !valid_rejection_error(error) {
                     return Err(AxError::InvalidInput);
                 }
                 manager.complete_construction(
@@ -420,17 +478,9 @@ impl KeyManager {
                         return Err(AxError::OperationNotPermitted);
                     }
                     if name.is_empty() {
-                        (
-                            manager.try_create_keyring(
-                                String::new(),
-                                actor.real_uid(),
-                                actor.real_gid(),
-                                named_session_keyring_permissions(),
-                                QuotaAdmission::Enforced,
-                            )?,
-                            None,
-                            true,
-                        )
+                        // `keyring_alloc("")` reaches `key_alloc()`, which
+                        // rejects an empty description with -EINVAL.
+                        return Err(AxError::InvalidInput);
                     } else {
                         let existing = manager
                             .keys
@@ -644,7 +694,10 @@ impl KeyManager {
             } => {
                 let keyring =
                     manager.resolve_keyring_in_namespace(keyring, actor, namespace, false)?;
-                let kind = KeyTypeKind::from_name(&type_name).ok_or(AxError::NoSuchDevice)?;
+                // `keyctl_keyring_search()` propagates `key_type_lookup()`
+                // unchanged, so an unregistered type is -ENOKEY here.
+                let kind = KeyTypeKind::from_name(&type_name)
+                    .ok_or(AxError::from(LinuxError::ENOKEY))?;
                 let serial = manager
                     .search_keyring(keyring, actor, kind, &description, &mut BTreeSet::new())?
                     .ok_or(AxError::from(LinuxError::ENOKEY))?;
@@ -660,7 +713,18 @@ impl KeyManager {
                 serial.serial as isize
             }
             KeyctlCommand::Read { key, copy_limit } => {
-                let serial = manager.resolve_key_in_namespace(key, actor, namespace, false)?;
+                // `keyctl_read_key()` reports a failed lookup as -ENOKEY: a
+                // nonexistent serial, an unusable `KEY_SPEC_*` id and an
+                // out-of-range id are all collapsed into it before the key's
+                // own state is inspected.
+                let serial = manager
+                    .resolve_key_in_namespace(key, actor, namespace, false)
+                    .map_err(|error| match LinuxError::from(error) {
+                        LinuxError::ENOKEY | LinuxError::EINVAL => {
+                            AxError::from(LinuxError::ENOKEY)
+                        }
+                        other => AxError::from(other),
+                    })?;
                 if !manager.key_has_perm(serial, actor, KeyPermission::READ)? {
                     return Err(LinuxError::EACCES.into());
                 }
@@ -676,9 +740,14 @@ impl KeyManager {
                     return Err(LinuxError::EOPNOTSUPP.into());
                 }
                 let full_len = key.payload.len();
-                let bytes = copy_limit
-                    .map(|limit| key.payload[..full_len.min(limit)].to_vec())
-                    .unwrap_or_default();
+                // `keyctl_read_key()` answers a short buffer with the full
+                // length and no data at all: the payload only reaches
+                // userspace when it fits whole.
+                let bytes = if copy_limit.is_some_and(|limit| limit >= full_len) {
+                    key.payload.clone()
+                } else {
+                    Vec::new()
+                };
                 return Ok(KeyctlOutput::Payload { full_len, bytes });
             }
             KeyctlCommand::SetReqKeyring { setting } => {

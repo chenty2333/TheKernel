@@ -4,6 +4,7 @@ use alloc::{string::String, vec};
 
 use tk_linux_cred::{CAPABILITY_WORDS, GroupInfo};
 
+use super::syscall::{valid_rejection_error, validate_instantiated_payload};
 use super::*;
 
 fn actor(tid: u32, pid: u32, uid: u32, gid: u32) -> KeyActor {
@@ -1276,7 +1277,9 @@ fn named_sessions_are_namespace_scoped_and_name_metadata_owns_no_root() {
 fn empty_join_session_names_are_never_published_or_reused() {
     let owner = actor(33, 33, 1000, 1000);
     let mut manager = KeyManager::new();
-    let first = keyctl_value(
+    // `install_session_keyring_to_cred()` rejects an empty name with -EINVAL
+    // before any keyring is created.
+    assert_eq!(
         manager
             .keyctl(
                 &owner,
@@ -1284,18 +1287,22 @@ fn empty_join_session_names_are_never_published_or_reused() {
                     name: Some(String::new()),
                 },
             )
+            .err(),
+        Some(AxError::InvalidInput)
+    );
+
+    // An unnamed join still installs a fresh unpublished keyring that later
+    // unnamed joins never reuse.
+    let first = keyctl_value(
+        manager
+            .keyctl(&owner, KeyctlCommand::JoinSession { name: None })
             .unwrap(),
     ) as i32;
     assert_eq!(manager.keys[&first].published_name, None);
 
     let second = keyctl_value(
         manager
-            .keyctl(
-                &owner,
-                KeyctlCommand::JoinSession {
-                    name: Some(String::new()),
-                },
-            )
+            .keyctl(&owner, KeyctlCommand::JoinSession { name: None })
             .unwrap(),
     ) as i32;
     assert_ne!(first, second);
@@ -3061,3 +3068,48 @@ fn exiting_constructor_retires_key_and_both_authority_indexes() {
     );
     assert_accounting_consistent(&manager);
 }
+
+    #[test]
+    fn rejection_errors_are_filtered_like_keyctl_reject_key() {
+        assert!(valid_rejection_error(1));
+        assert!(valid_rejection_error(LinuxError::ENOKEY as i32));
+        assert!(valid_rejection_error(4094));
+        assert!(!valid_rejection_error(0));
+        assert!(!valid_rejection_error(-1));
+        assert!(!valid_rejection_error(4095));
+        for restart in [512, 513, 514, 516] {
+            assert!(!valid_rejection_error(restart), "error={restart}");
+        }
+    }
+
+    #[test]
+    fn pending_instantiation_reapplies_the_key_type_payload_rule() {
+        assert_eq!(
+            validate_instantiated_payload(KeyTypeKind::User, &[]),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            validate_instantiated_payload(KeyTypeKind::User, &[0_u8; 32768]),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            validate_instantiated_payload(KeyTypeKind::User, &[0_u8; 32767]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_instantiated_payload(KeyTypeKind::Logon, &[0_u8; 1]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_instantiated_payload(KeyTypeKind::BigKey, &[0_u8; 32768]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_instantiated_payload(KeyTypeKind::Keyring, &[0_u8; 1]),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            validate_instantiated_payload(KeyTypeKind::Keyring, &[]),
+            Ok(())
+        );
+    }
