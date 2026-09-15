@@ -683,6 +683,20 @@ pub enum GenericSocketOption {
     Mark,
     Protocol,
     Domain,
+    /// `SO_BSDCOMPAT`: accepted, value ignored, reported as zero.
+    BsdCompat,
+    /// `SO_SNDBUFFORCE`/`SO_RCVBUFFORCE`: the `SO_SNDBUF`/`SO_RCVBUF` stores
+    /// without the sysctl clamp, gated on `CAP_NET_ADMIN`.
+    SendBufferForce,
+    ReceiveBufferForce,
+    /// `SO_RCVTIMEO`/`SO_SNDTIMEO`: `sk_rcvtimeo`/`sk_sndtimeo` in jiffies.
+    /// Both the `_OLD` and `_NEW` numbers map here: on x86_64 the two payload
+    /// structs are the same 16 bytes.
+    ReceiveTimeout,
+    SendTimeout,
+    /// `SO_PEEK_OFF`: recognised by both tables, but `netlink_ops` leaves
+    /// `set_peek_off` NULL, so an AF_NETLINK endpoint answers `-EOPNOTSUPP`.
+    PeekOffset,
 }
 
 pub const SO_DEBUG: i32 = 1;
@@ -707,6 +721,19 @@ pub const SO_MARK: i32 = 36;
 pub const SO_ACCEPTCONN: i32 = 30;
 pub const SO_PROTOCOL: i32 = 38;
 pub const SO_DOMAIN: i32 = 39;
+pub const SO_SNDBUFFORCE: i32 = 32;
+pub const SO_RCVBUFFORCE: i32 = 33;
+pub const SO_BSDCOMPAT: i32 = 14;
+pub const SO_PEEK_OFF: i32 = 42;
+/// `SO_RCVTIMEO_OLD`/`SO_SNDTIMEO_OLD`; the uapi header aliases the plain
+/// spellings to these because `sizeof(time_t) == sizeof(__kernel_long_t)` on
+/// x86_64 (`include/uapi/asm-generic/socket.h:33-34`, `:161-162`).
+pub const SO_RCVTIMEO_OLD: i32 = 20;
+pub const SO_SNDTIMEO_OLD: i32 = 21;
+pub const SO_RCVTIMEO_NEW: i32 = 66;
+pub const SO_SNDTIMEO_NEW: i32 = 67;
+pub const SO_RCVTIMEO: i32 = SO_RCVTIMEO_OLD;
+pub const SO_SNDTIMEO: i32 = SO_SNDTIMEO_OLD;
 /// `sizeof(struct linger)`.
 pub const LINGER_LEN: usize = 8;
 /// `sizeof(struct ucred)`.
@@ -738,6 +765,12 @@ pub const fn generic_socket_get_option(optname: i32) -> Option<GenericSocketOpti
         SO_MARK => Some(GenericSocketOption::Mark),
         SO_PROTOCOL => Some(GenericSocketOption::Protocol),
         SO_DOMAIN => Some(GenericSocketOption::Domain),
+        SO_BSDCOMPAT => Some(GenericSocketOption::BsdCompat),
+        SO_SNDBUFFORCE => Some(GenericSocketOption::SendBufferForce),
+        SO_RCVBUFFORCE => Some(GenericSocketOption::ReceiveBufferForce),
+        SO_RCVTIMEO_OLD | SO_RCVTIMEO_NEW => Some(GenericSocketOption::ReceiveTimeout),
+        SO_SNDTIMEO_OLD | SO_SNDTIMEO_NEW => Some(GenericSocketOption::SendTimeout),
+        SO_PEEK_OFF => Some(GenericSocketOption::PeekOffset),
         _ => None,
     }
 }
@@ -818,6 +851,90 @@ pub const fn decode_receive_low_water(val: i32) -> i32 {
     } else {
         val
     }
+}
+
+/// The two `struct timeval` shapes `SO_RCVTIMEO`/`SO_SNDTIMEO` accept and
+/// report.  `struct __kernel_old_timeval` (the `_OLD` spellings) and
+/// `struct __kernel_sock_timeval` (the `_NEW` ones) are both two 64-bit fields
+/// on x86_64, so one length covers every accepted request
+/// (`net/core/sock.c:393-424`).
+pub const SOCKET_TIMEOUT_LEN: usize = 16;
+
+/// `CONFIG_HZ` for the pinned Linux 7.2.3 x86_64 build.  Socket timeouts are
+/// stored in jiffies, so the unit is observable: `SO_RCVTIMEO` set to one
+/// microsecond reads back as one millisecond.
+pub const TIMEOUT_HZ: i64 = 1000;
+
+/// `MAX_SCHEDULE_TIMEOUT` (`include/linux/sched.h:330`), the seeded value of
+/// `sk_rcvtimeo`/`sk_sndtimeo` (`net/core/sock.c:3784-3785`).
+pub const MAX_SCHEDULE_TIMEOUT: i64 = i64::MAX;
+
+/// Why `decode_socket_timeout` refuses a request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketTimeoutError {
+    /// `tv_usec` outside `[0, USEC_PER_SEC)`: `-EDOM`
+    /// (`net/core/sock.c:436-437`).
+    Domain,
+}
+
+/// `sock_set_timeout()`'s conversion from a user `struct timeval` to the
+/// jiffies `sk_rcvtimeo`/`sk_sndtimeo` store
+/// (`net/core/sock.c:426-457`):
+///
+/// ```c
+/// 	if (tv.tv_usec < 0 || tv.tv_usec >= USEC_PER_SEC)
+/// 		return -EDOM;
+///
+/// 	if (tv.tv_sec < 0) {
+/// 		...
+/// 		WRITE_ONCE(*timeo_p, 0);
+/// 		...
+/// 		return 0;
+/// 	}
+/// 	val = MAX_SCHEDULE_TIMEOUT;
+/// 	if ((tv.tv_sec || tv.tv_usec) &&
+/// 	    (tv.tv_sec < (MAX_SCHEDULE_TIMEOUT / HZ - 1)))
+/// 		val = tv.tv_sec * HZ + DIV_ROUND_UP((unsigned long)tv.tv_usec,
+/// 						    USEC_PER_SEC / HZ);
+/// ```
+///
+/// A negative `tv_sec` is *not* an error: it stores the zero timeout that this
+/// function's caller then reports as an immediate `-EAGAIN` rather than as an
+/// infinite wait.
+pub const fn decode_socket_timeout(
+    seconds: i64,
+    microseconds: i64,
+) -> Result<i64, SocketTimeoutError> {
+    if microseconds < 0 || microseconds >= 1_000_000 {
+        return Err(SocketTimeoutError::Domain);
+    }
+    if seconds < 0 {
+        return Ok(0);
+    }
+    if (seconds != 0 || microseconds != 0) && seconds < MAX_SCHEDULE_TIMEOUT / TIMEOUT_HZ - 1 {
+        // `DIV_ROUND_UP(microseconds, USEC_PER_SEC / HZ)` with the divisor a
+        // constant, written out because `i64::div_ceil` is not a stable `const
+        // fn`.  `microseconds` is already inside `[0, USEC_PER_SEC)`, so the
+        // addition cannot overflow.
+        let per_jiffy = 1_000_000 / TIMEOUT_HZ;
+        let jiffies = (microseconds + per_jiffy - 1) / per_jiffy;
+        return Ok(seconds.saturating_mul(TIMEOUT_HZ).saturating_add(jiffies));
+    }
+    Ok(MAX_SCHEDULE_TIMEOUT)
+}
+
+/// `sock_get_timeout()`'s inverse (`net/core/sock.c:362-391`): an infinite
+/// timeout reports as `{0, 0}`, and every other value is split back into whole
+/// seconds plus the remaining jiffies scaled to microseconds.  The jiffy
+/// quantization is therefore visible to userspace.
+pub const fn encode_socket_timeout(timeout: i64) -> (i64, i64) {
+    if timeout == MAX_SCHEDULE_TIMEOUT {
+        return (0, 0);
+    }
+    (
+        timeout / TIMEOUT_HZ,
+        (timeout % TIMEOUT_HZ) * 1_000_000 / TIMEOUT_HZ,
+    )
 }
 
 /// `sk_getsockopt`'s `SO_MARK` capability rule: `CAP_NET_RAW` or
@@ -1710,6 +1827,124 @@ mod tests {
         assert_eq!(decode_receive_low_water(-1), i32::MAX);
         assert_eq!(decode_receive_low_water(0), 1);
         assert_eq!(decode_receive_low_water(5), 5);
+    }
+
+    #[test]
+    fn socket_timeouts_round_trip_through_jiffies() {
+        // The seeded value is `MAX_SCHEDULE_TIMEOUT`, and
+        // `sock_get_timeout()` reports that sentinel as `{0, 0}`
+        // (`net/core/sock.c:362-371`), so a zero request and an infinite one
+        // are indistinguishable through `getsockopt`.
+        assert_eq!(encode_socket_timeout(MAX_SCHEDULE_TIMEOUT), (0, 0));
+        assert_eq!(encode_socket_timeout(0), (0, 0));
+        assert_eq!(decode_socket_timeout(0, 0), Ok(MAX_SCHEDULE_TIMEOUT));
+        // `DIV_ROUND_UP(usec, USEC_PER_SEC / HZ)` rounds a partial jiffy up,
+        // which is the quantization userspace can observe.
+        assert_eq!(decode_socket_timeout(0, 1), Ok(1));
+        assert_eq!(decode_socket_timeout(0, 999), Ok(1));
+        assert_eq!(decode_socket_timeout(0, 1000), Ok(1));
+        assert_eq!(decode_socket_timeout(0, 1001), Ok(2));
+        assert_eq!(decode_socket_timeout(2, 500_000), Ok(2500));
+        assert_eq!(encode_socket_timeout(2500), (2, 500_000));
+        assert_eq!(encode_socket_timeout(1), (0, 1000));
+        // A negative second is not an error: it stores the zero timeout that
+        // `__skb_recv_datagram` turns into one immediate attempt.
+        assert_eq!(decode_socket_timeout(-1, 0), Ok(0));
+        // `tv_usec` outside `[0, USEC_PER_SEC)` is `-EDOM`, and the test
+        // precedes the negative-second case (`net/core/sock.c:436-439`).
+        assert_eq!(
+            decode_socket_timeout(-1, -1),
+            Err(SocketTimeoutError::Domain)
+        );
+        assert_eq!(
+            decode_socket_timeout(0, 1_000_000),
+            Err(SocketTimeoutError::Domain)
+        );
+        // `tv_sec < MAX_SCHEDULE_TIMEOUT / HZ - 1` is what keeps `tv_sec * HZ`
+        // in range; anything at or above it reports the infinite timeout
+        // instead (`net/core/sock.c:448-453`).
+        let boundary = MAX_SCHEDULE_TIMEOUT / TIMEOUT_HZ - 1;
+        assert_eq!(decode_socket_timeout(boundary, 0), Ok(MAX_SCHEDULE_TIMEOUT));
+        assert_eq!(
+            decode_socket_timeout(boundary - 1, 0),
+            Ok((boundary - 1) * TIMEOUT_HZ)
+        );
+        assert_eq!(SOCKET_TIMEOUT_LEN, 16);
+    }
+
+    #[test]
+    fn newly_admitted_sol_socket_names_keep_their_linux_answers() {
+        // `SO_BSDCOMPAT` is a no-op in both tables: the setter's `break`
+        // leaves `ret` zero and the getter's zeroed union reports zero
+        // (`net/core/sock.c:1425-1426`, `:1756`, `:1827-1828`).
+        assert_eq!(
+            generic_socket_get_option(SO_BSDCOMPAT),
+            Some(GenericSocketOption::BsdCompat)
+        );
+        assert_eq!(
+            generic_socket_set_option(SO_BSDCOMPAT),
+            Some(GenericSocketOption::BsdCompat)
+        );
+        // The `*BUFFORCE` pair is settable and reports the same
+        // `sk_{snd,rcv}buf` as its clamped sibling.
+        assert_eq!(
+            generic_socket_set_option(SO_SNDBUFFORCE),
+            Some(GenericSocketOption::SendBufferForce)
+        );
+        assert_eq!(
+            generic_socket_get_option(SO_SNDBUFFORCE),
+            Some(GenericSocketOption::SendBufferForce)
+        );
+        assert_eq!(
+            generic_socket_set_option(SO_RCVBUFFORCE),
+            Some(GenericSocketOption::ReceiveBufferForce)
+        );
+        assert_eq!(
+            generic_socket_get_option(SO_RCVBUFFORCE),
+            Some(GenericSocketOption::ReceiveBufferForce)
+        );
+        // Both timeout spellings are one state: `SO_RCVTIMEO` aliases `_OLD`
+        // on x86_64, and `_NEW` differs only in the constant.
+        assert_eq!(SO_RCVTIMEO, SO_RCVTIMEO_OLD);
+        assert_eq!(SO_SNDTIMEO, SO_SNDTIMEO_OLD);
+        for optname in [SO_RCVTIMEO_OLD, SO_RCVTIMEO_NEW] {
+            assert_eq!(
+                generic_socket_get_option(optname),
+                Some(GenericSocketOption::ReceiveTimeout),
+                "{optname}"
+            );
+            assert_eq!(
+                generic_socket_set_option(optname),
+                Some(GenericSocketOption::ReceiveTimeout),
+                "{optname}"
+            );
+        }
+        for optname in [SO_SNDTIMEO_OLD, SO_SNDTIMEO_NEW] {
+            assert_eq!(
+                generic_socket_set_option(optname),
+                Some(GenericSocketOption::SendTimeout),
+                "{optname}"
+            );
+        }
+        // `SO_PEEK_OFF` is admitted by both tables and refused by the
+        // endpoint: `netlink_ops` leaves `set_peek_off` NULL, so the errno is
+        // `-EOPNOTSUPP` rather than `-ENOPROTOOPT`.
+        assert_eq!(
+            generic_socket_get_option(SO_PEEK_OFF),
+            Some(GenericSocketOption::PeekOffset)
+        );
+        assert_eq!(
+            generic_socket_set_option(SO_PEEK_OFF),
+            Some(GenericSocketOption::PeekOffset)
+        );
+        // The names this audit still leaves out must stay unknown to the
+        // table, so the endpoint keeps answering `-ENOPROTOOPT` for them:
+        // `SO_BINDTODEVICE` (25), `SO_TIMESTAMP_OLD` (29), `SO_PEERSEC` (31)
+        // and `SO_COOKIE` (57).
+        for optname in [25, 29, 31, 57] {
+            assert_eq!(generic_socket_get_option(optname), None, "{optname}");
+            assert_eq!(generic_socket_set_option(optname), None, "{optname}");
+        }
     }
 
     #[test]

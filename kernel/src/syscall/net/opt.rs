@@ -831,7 +831,7 @@ fn write_netlink_option(
     value: crate::file::netlink::NetlinkOptionValue,
 ) -> AxResult<usize> {
     use crate::file::netlink::NetlinkOptionValue;
-    let mut raw = [0_u8; 12];
+    let mut raw = [0_u8; 16];
     // `lv` for this option, plus the length to report when it is not simply
     // `min(user_len, lv)`.  `NETLINK_LIST_MEMBERSHIPS` is the single netlink
     // option whose reported length is the fixed
@@ -853,6 +853,14 @@ fn write_netlink_option(
                 slot.copy_from_slice(&word.to_ne_bytes());
             }
             (tk_linux_net::UCRED_LEN, None)
+        }
+        NetlinkOptionValue::Timeout {
+            seconds,
+            microseconds,
+        } => {
+            raw[..8].copy_from_slice(&seconds.to_ne_bytes());
+            raw[8..16].copy_from_slice(&microseconds.to_ne_bytes());
+            (tk_linux_net::SOCKET_TIMEOUT_LEN, None)
         }
         NetlinkOptionValue::Memberships { words, reported } => {
             for (slot, word) in raw.chunks_exact_mut(4).zip(words) {
@@ -1741,6 +1749,24 @@ pub fn sys_setsockopt(
                 }
                 let linger = read_option::<[i32; 2]>(&capability, optval, optlen)?;
                 socket.set_linger_option(linger[0], linger[1]);
+                return Ok(0);
+            }
+            if matches!(
+                optname as i32,
+                tk_linux_net::SO_RCVTIMEO_OLD
+                    | tk_linux_net::SO_RCVTIMEO_NEW
+                    | tk_linux_net::SO_SNDTIMEO_OLD
+                    | tk_linux_net::SO_SNDTIMEO_NEW
+            ) {
+                // `sock_set_timeout` needs the whole `struct timeval` (two
+                // 64-bit fields on x86_64 for both the `_OLD` and `_NEW`
+                // spellings) and answers `-EINVAL` for a shorter request
+                // (`net/core/sock.c:393-424`, `:1295-1306`).
+                if (optlen as usize) < tk_linux_net::SOCKET_TIMEOUT_LEN {
+                    return Err(AxError::InvalidInput);
+                }
+                let timeout = read_option::<[i64; 2]>(&capability, optval, optlen)?;
+                socket.set_socket_timeout(optname as i32, timeout[0], timeout[1])?;
                 return Ok(0);
             }
             let value = read_option_prefix_i32(&capability, optval, optlen)?;

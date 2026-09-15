@@ -20,6 +20,7 @@ use axnet::{
 };
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::current;
+use axhal::time::Duration;
 use linux_raw_sys::{
     general::{CAP_AUDIT_READ, CAP_NET_ADMIN, CAP_SYS_ADMIN},
     net::{
@@ -41,7 +42,8 @@ use tk_linux_net::{
 use crate::{
     file::{FileLike, IoDst, IoSrc, Kstat, PseudoInode, try_pseudo_inode_path},
     mm::{UserMemoryCapability, UserPtr, map_usercopy_error},
-    readiness::block_on_poll_io,
+    readiness::{block_on_poll_io, block_on_poll_io_until},
+    time::wall_time,
     task::{
         AsThread, Cred, NetworkNamespace, ns_capable,
         security::{AuditLandlockDenied, AuditSeccompDecision},
@@ -376,10 +378,16 @@ struct NetlinkSockOptions {
     linger_seconds: i32,
     /// `sk_rcvlowat` (`SO_RCVLOWAT`).
     rcvlowat: i32,
-    /// `sk_sndbuf` (`SO_SNDBUF`).
+    /// `sk_sndbuf` (`SO_SNDBUF`, `SO_SNDBUFFORCE`).
     sndbuf: i32,
-    /// `sk_rcvbuf` (`SO_RCVBUF`).
+    /// `sk_rcvbuf` (`SO_RCVBUF`, `SO_RCVBUFFORCE`).
     rcvbuf: i32,
+    /// `sk_rcvtimeo` in jiffies (`SO_RCVTIMEO_OLD`/`_NEW`), seeded to
+    /// `MAX_SCHEDULE_TIMEOUT` by `sock_init_data_uid` (`net/core/sock.c:3784`).
+    rcvtimeo: i64,
+    /// `sk_sndtimeo` in jiffies (`SO_SNDTIMEO_OLD`/`_NEW`)
+    /// (`net/core/sock.c:3785`).
+    sndtimeo: i64,
 }
 
 impl Default for NetlinkSockOptions {
@@ -403,6 +411,8 @@ impl Default for NetlinkSockOptions {
             rcvlowat: 1,
             sndbuf: SYSCTL_WMEM_DEFAULT,
             rcvbuf: SYSCTL_RMEM_DEFAULT,
+            rcvtimeo: tk_linux_net::MAX_SCHEDULE_TIMEOUT,
+            sndtimeo: tk_linux_net::MAX_SCHEDULE_TIMEOUT,
         }
     }
 }
@@ -435,6 +445,18 @@ impl NetlinkOptionAuthority {
     }
 }
 
+/// `sock_get_timeout()`'s report for a stored jiffies timeout
+/// (`net/core/sock.c:362-391`): the infinite seeded value reads back as
+/// `{0, 0}`, and every other value as whole seconds plus the remaining jiffies
+/// scaled to microseconds.
+fn timeout_value(timeout: i64) -> NetlinkOptionValue {
+    let (seconds, microseconds) = tk_linux_net::encode_socket_timeout(timeout);
+    NetlinkOptionValue::Timeout {
+        seconds,
+        microseconds,
+    }
+}
+
 /// One option value this endpoint reports.  `sk_getsockopt` and
 /// `netlink_getsockopt` each copy a per-optname payload and then write back the
 /// number of bytes they copied, so the provider returns the payload and the
@@ -450,6 +472,9 @@ pub(crate) enum NetlinkOptionValue {
     /// with the `ALIGN(BITS_TO_BYTES(ngroups), 4)` length Linux reports in
     /// `*optlen` regardless of how much of it fit in the caller's buffer.
     Memberships { words: [u32; 2], reported: usize },
+    /// `SO_RCVTIMEO`/`SO_SNDTIMEO`: the `struct timeval` `sock_get_timeout()`
+    /// encodes from the stored jiffies.
+    Timeout { seconds: i64, microseconds: i64 },
 }
 
 pub struct NetlinkSocket {
@@ -2062,7 +2087,53 @@ impl NetlinkSocket {
                 }
                 state.sock.mark = value;
             }
-            Option::Linger => unreachable!("SO_LINGER is decoded before the integer table"),
+            // `case SO_BSDCOMPAT: break;` ignores the value and leaves `ret`
+            // zero (`net/core/sock.c:1425-1426`), and the getter's zeroed
+            // union reports zero for the name (`:1756`, `:1827-1828`).
+            Option::BsdCompat => {}
+            Option::SendBufferForce => {
+                // `sockopt_capable(CAP_NET_ADMIN)` is
+                // `has_current_bpf_ctx() || capable(cap)`
+                // (`net/core/sock.c:1172-1175`); the BPF disjunct is not
+                // modelled because no BPF program context can call this path.
+                if !authority.init_net_admin {
+                    return Err(LinuxError::EPERM.into());
+                }
+                // `if (val < 0) val = 0;` before the shared `set_sndbuf`
+                // arithmetic, and no `sysctl_wmem_max` clamp
+                // (`net/core/sock.c:1350-1366`).
+                state.sock.sndbuf = tk_linux_net::decode_send_buffer(value.max(0));
+            }
+            Option::ReceiveBufferForce => {
+                if !authority.init_net_admin {
+                    return Err(LinuxError::EPERM.into());
+                }
+                // `__sock_set_rcvbuf(sk, max(val, 0))`, again without the
+                // `sysctl_rmem_max` clamp (`net/core/sock.c:1379-1385`).
+                state.sock.rcvbuf = tk_linux_net::decode_receive_buffer(value.max(0));
+            }
+            // `SO_RCVTIMEO`/`SO_SNDTIMEO` need the full 16-byte `struct
+            // timeval`, so `kernel/src/syscall/net/opt.rs` decodes them before
+            // the integer table and calls `set_socket_timeout`.  Keeping the
+            // arm defensive rather than unreachable matches the rule that a
+            // syscall cannot panic the kernel when another module owns an
+            // intercept; the errno is what `sk_setsockopt`'s `default:` arm
+            // answers.
+            Option::ReceiveTimeout | Option::SendTimeout => {
+                return Err(LinuxError::ENOPROTOOPT.into());
+            }
+            // `netlink_ops` leaves `set_peek_off` NULL, so
+            // `sk_setsockopt`'s `SO_PEEK_OFF` case fails the callback lookup
+            // and returns `-EOPNOTSUPP` (`net/core/sock.c:1285-1295`,
+            // `net/netlink/af_netlink.c:719-737`).
+            Option::PeekOffset => return Err(LinuxError::EOPNOTSUPP.into()),
+            // `SO_LINGER` is decoded before the integer table by
+            // `kernel/src/syscall/net/opt.rs`, the only caller that can
+            // produce this name, so this arm is unreachable *today* — but its
+            // reachability is owned by another module, and a syscall must not
+            // be able to panic the kernel if that intercept ever moves.  The
+            // errno is what `sk_setsockopt`'s `default:` arm answers.
+            Option::Linger => return Err(LinuxError::ENOPROTOOPT.into()),
             Option::PassCredentials => state.passcred = valbool != 0,
             Option::ReceiveLowWater => {
                 state.sock.rcvlowat = tk_linux_net::decode_receive_low_water(value)
@@ -2140,6 +2211,21 @@ impl NetlinkSocket {
             Option::AcceptConn => NetlinkOptionValue::Int(0),
             Option::Protocol => NetlinkOptionValue::Int(self.protocol as i32),
             Option::Domain => NetlinkOptionValue::Int(AF_NETLINK as i32),
+            // `case SO_BSDCOMPAT: break;` leaves the zeroed union in place
+            // (`net/core/sock.c:1756`, `:1827-1828`).
+            Option::BsdCompat => NetlinkOptionValue::Int(0),
+            // `SO_SNDBUFFORCE`/`SO_RCVBUFFORCE` report the same
+            // `sk_{snd,rcv}buf` as their clamped siblings: both setter paths
+            // converge on `set_sndbuf`/`__sock_set_rcvbuf`, and the getter has
+            // one case per name (`net/core/sock.c:1770-1777`).
+            Option::SendBufferForce => NetlinkOptionValue::Int(state.sock.sndbuf),
+            Option::ReceiveBufferForce => NetlinkOptionValue::Int(state.sock.rcvbuf),
+            Option::ReceiveTimeout => timeout_value(sock.rcvtimeo),
+            Option::SendTimeout => timeout_value(sock.sndtimeo),
+            // `netlink_ops.set_peek_off` is NULL, so the getter's capability
+            // test on that callback makes the name `-EOPNOTSUPP`
+            // (`net/core/sock.c:2033-2038`).
+            Option::PeekOffset => return Err(LinuxError::EOPNOTSUPP.into()),
             // `sk_peer_pid`/`sk_peer_cred` stay NULL for a netlink socket, and
             // `cred_to_ucred(NULL, NULL, ..)` reports `{pid 0, uid -1, gid -1}`.
             Option::PeerCredentials => NetlinkOptionValue::Ucred([0, -1, -1]),
@@ -2403,12 +2489,78 @@ impl NetlinkSocket {
         nonblocking: bool,
         nowait: bool,
     ) -> AxResult<NetlinkReceived> {
-        block_on_poll_io(
+        // `skb_recv_datagram()` asks `sock_rcvtimeo(sk, flags & MSG_DONTWAIT)`
+        // (`net/core/datagram.c:294-295`), so an explicit non-blocking flag
+        // replaces the configured timeout with zero, and a zero timeout leaves
+        // the receive loop after one attempt (`:296-307`).  `sock_set_timeout`
+        // stores exactly that zero for a negative `tv_sec`, which is also how a
+        // caller asks for a poll rather than a wait.
+        let nonblocking = nonblocking || flags.contains(RecvFlags::DONT_WAIT);
+        let timeout = self.receive_timeout();
+        let attempt = || self.recv_ready_with_nonblocking(dst, flags, nowait);
+        if nonblocking || timeout <= 0 {
+            return block_on_poll_io(self, IoEvents::READABLE, true, attempt);
+        }
+        let deadline = (timeout != tk_linux_net::MAX_SCHEDULE_TIMEOUT).then(|| {
+            // `sk_rcvtimeo` counts jiffies, and `CONFIG_HZ` is 1000 for the
+            // pinned build, so one jiffy is one millisecond.  A timeout that
+            // exceeds the timer range still means "effectively never", which is
+            // what the saturating conversion preserves.
+            let nanos = u128::from(timeout as u64) * 1_000_000;
+            wall_time().saturating_add(Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64))
+        });
+        match block_on_poll_io_until(
             self,
             IoEvents::READABLE,
-            nonblocking || flags.contains(RecvFlags::DONT_WAIT),
-            || self.recv_ready_with_nonblocking(dst, flags, nowait),
-        )
+            false,
+            true,
+            false,
+            deadline,
+            attempt,
+        ) {
+            Ok(result) => result,
+            // `netlink_recvmsg` reports the `-EAGAIN` that
+            // `skb_recv_datagram()` leaves behind when the wait expires
+            // (`net/netlink/af_netlink.c:1919-1921`).
+            Err(_elapsed) => Err(LinuxError::EAGAIN.into()),
+        }
+    }
+
+    /// `sk_rcvtimeo`, in jiffies.  The receive path is the only consumer: a
+    /// netlink send never waits on this socket's own timeout because
+    /// `netlink_sendmsg` completes its queue admission synchronously here.
+    fn receive_timeout(&self) -> i64 {
+        self.state.lock().sock.rcvtimeo
+    }
+
+    /// `SO_RCVTIMEO`/`SO_SNDTIMEO` in both spellings.  `sock_set_timeout()`
+    /// validates the microseconds field, treats a negative second as the zero
+    /// timeout, and stores jiffies (`net/core/sock.c:426-457`).
+    pub(crate) fn set_socket_timeout(
+        &self,
+        optname: i32,
+        seconds: i64,
+        microseconds: i64,
+    ) -> AxResult {
+        let timeout = tk_linux_net::decode_socket_timeout(seconds, microseconds)
+            .map_err(|_| LinuxError::EDOM)?;
+        let mut state = self.state.lock();
+        match optname {
+            tk_linux_net::SO_RCVTIMEO_OLD | tk_linux_net::SO_RCVTIMEO_NEW => {
+                state.sock.rcvtimeo = timeout
+            }
+            tk_linux_net::SO_SNDTIMEO_OLD | tk_linux_net::SO_SNDTIMEO_NEW => {
+                state.sock.sndtimeo = timeout
+            }
+            _ => return Err(LinuxError::ENOPROTOOPT.into()),
+        }
+        Ok(())
+    }
+
+    /// `sk_sndtimeo` in jiffies, kept for the `SO_SNDTIMEO` round trip.
+    #[cfg(test)]
+    fn send_timeout(&self) -> i64 {
+        self.state.lock().sock.sndtimeo
     }
 
     /// Consume an already-readable netlink event.  Keeping this separate from
@@ -6520,13 +6672,225 @@ mod tests {
 
     #[test]
     fn netlink_queue_rejects_messages_past_its_byte_limit() {
+        let _context = crate::test_support::scheduler_test_context();
         let socket = route_socket();
-        socket.enqueue_kernel(alloc::vec![0; super::NETLINK_QUEUE_LIMIT_BYTES + 1]);
+        // `netlink_attachskb` admits the first datagram of an empty queue
+        // whatever its size (`net/netlink/af_netlink.c:1218-1223`), so a drop
+        // needs a datagram already queued.
+        socket.enqueue_kernel(alloc::vec![0; SYSCTL_RMEM_DEFAULT as usize]);
+        socket.enqueue_kernel(alloc::vec![0; 1]);
         let mut bytes = [0_u8; 1];
         let mut dst = &mut bytes[..];
         assert_eq!(
             socket.recv_with_nonblocking(&mut dst, RecvFlags::empty(), true),
             Err(LinuxError::ENOBUFS.into())
+        );
+    }
+
+    #[test]
+    fn netlink_queue_admits_an_oversized_first_datagram() {
+        let _context = crate::test_support::scheduler_test_context();
+        let socket = route_socket();
+        socket.enqueue_kernel(alloc::vec![7; SYSCTL_RMEM_DEFAULT as usize + 4096]);
+        let mut bytes = [0_u8; 1];
+        let mut dst = &mut bytes[..];
+        // No overrun was recorded, so the datagram is still deliverable.
+        let received = socket
+            .recv_with_nonblocking(&mut dst, RecvFlags::empty(), true)
+            .unwrap();
+        assert_eq!((received.len, bytes[0]), (1, 7));
+    }
+
+    #[test]
+    fn netlink_send_budget_follows_the_sockets_own_sndbuf() {
+        let _context = crate::test_support::scheduler_test_context();
+        // `netlink_sendmsg` measures the datagram against `sk_sndbuf`
+        // (`net/netlink/af_netlink.c:1868-1873`), which `SO_SNDBUF` sets.
+        let socket = route_socket();
+        let actor = socket_owner_credential(&socket);
+        let authority = NetlinkOptionAuthority::testing();
+        assert_eq!(socket.send_buffer_limit(), SYSCTL_WMEM_DEFAULT);
+
+        let mut source = UnreadableLengthSource { remaining: 400_000 };
+        assert_eq!(
+            LinuxError::from(socket.write_with_actor(&mut source, &actor, 1).unwrap_err()),
+            LinuxError::EMSGSIZE
+        );
+
+        socket
+            .set_sol_socket_option(tk_linux_net::SO_SNDBUF as u32, SYSCTL_WMEM_MAX, authority)
+            .unwrap();
+        assert_eq!(
+            socket.send_buffer_limit(),
+            tk_linux_net::decode_send_buffer(SYSCTL_WMEM_MAX)
+        );
+
+        // The same datagram now clears the budget and reaches parsing.
+        let mut source = ZeroedSource {
+            remaining: 400_000,
+            reads: 0,
+        };
+        assert_eq!(
+            LinuxError::from(socket.write_with_actor(&mut source, &actor, 1).unwrap_err()),
+            LinuxError::EINVAL
+        );
+        assert_eq!(source.remaining, 0);
+    }
+
+    #[test]
+    fn sol_socket_timeout_options_store_jiffies_and_report_linux_bytes() {
+        let _context = crate::test_support::scheduler_test_context();
+        let socket = route_socket();
+        // `sock_init_data_uid` seeds both timeouts with `MAX_SCHEDULE_TIMEOUT`
+        // (`net/core/sock.c:3784-3785`), and `sock_get_timeout()` reports that
+        // sentinel as `{0, 0}`: a fresh socket reports zero, not "infinite".
+        assert_eq!(
+            socket.receive_timeout(),
+            tk_linux_net::MAX_SCHEDULE_TIMEOUT
+        );
+        assert_eq!(socket.send_timeout(), tk_linux_net::MAX_SCHEDULE_TIMEOUT);
+        assert_eq!(
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_RCVTIMEO as u32)
+                .unwrap(),
+            NetlinkOptionValue::Timeout {
+                seconds: 0,
+                microseconds: 0
+            }
+        );
+
+        // `DIV_ROUND_UP(usec, USEC_PER_SEC / HZ)` rounds up, so 1500 µs is two
+        // jiffies and reads back as 2000 µs.
+        socket
+            .set_socket_timeout(tk_linux_net::SO_RCVTIMEO, 0, 1500)
+            .unwrap();
+        assert_eq!(socket.receive_timeout(), 2);
+        assert_eq!(
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_RCVTIMEO_NEW as u32)
+                .unwrap(),
+            NetlinkOptionValue::Timeout {
+                seconds: 0,
+                microseconds: 2000
+            }
+        );
+        // The `_NEW` spelling writes the same state as `_OLD`.
+        socket
+            .set_socket_timeout(tk_linux_net::SO_SNDTIMEO_NEW, 3, 0)
+            .unwrap();
+        assert_eq!(socket.send_timeout(), 3000);
+        assert_eq!(
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_SNDTIMEO as u32)
+                .unwrap(),
+            NetlinkOptionValue::Timeout {
+                seconds: 3,
+                microseconds: 0
+            }
+        );
+        // A negative second stores the zero timeout instead of failing, and
+        // `tv_usec` outside its range is `-EDOM`.
+        socket
+            .set_socket_timeout(tk_linux_net::SO_RCVTIMEO, -1, 0)
+            .unwrap();
+        assert_eq!(socket.receive_timeout(), 0);
+        assert_eq!(
+            LinuxError::from(
+                socket
+                    .set_socket_timeout(tk_linux_net::SO_SNDTIMEO, 0, 1_000_000)
+                    .unwrap_err()
+            ),
+            LinuxError::EDOM
+        );
+        // The option number itself still has to be one of the two timeouts;
+        // `opt.rs` forwards whatever the caller passed.
+        assert_eq!(
+            LinuxError::from(
+                socket
+                    .set_socket_timeout(tk_linux_net::SO_RCVBUF, 1, 0)
+                    .unwrap_err()
+            ),
+            LinuxError::ENOPROTOOPT
+        );
+    }
+
+    #[test]
+    fn sol_socket_privileged_and_inert_names_keep_their_linux_answers() {
+        let _context = crate::test_support::scheduler_test_context();
+        let socket = route_socket();
+        let authority = NetlinkOptionAuthority::testing();
+
+        // `SO_SNDBUFFORCE` skips the `sysctl_wmem_max` clamp that `SO_SNDBUF`
+        // applies (`net/core/sock.c:1327-1329`, `:1350-1366`), so a request one
+        // byte above the sysctl ceiling still doubles in full.
+        socket
+            .set_sol_socket_option(
+                tk_linux_net::SO_SNDBUFFORCE as u32,
+                SYSCTL_WMEM_MAX + 1,
+                authority,
+            )
+            .unwrap();
+        assert_eq!(socket.send_buffer_limit(), (SYSCTL_WMEM_MAX + 1) * 2);
+        // The clamped spelling of the same request stops at the ceiling.
+        socket
+            .set_sol_socket_option(tk_linux_net::SO_SNDBUF as u32, SYSCTL_WMEM_MAX + 1, authority)
+            .unwrap();
+        assert_eq!(socket.send_buffer_limit(), SYSCTL_WMEM_MAX * 2);
+        // `__sock_set_rcvbuf(sk, max(val, 0))` floors a negative request at
+        // zero and then at `SOCK_MIN_RCVBUF`.
+        socket
+            .set_sol_socket_option(tk_linux_net::SO_RCVBUFFORCE as u32, -5, authority)
+            .unwrap();
+        assert_eq!(socket.receive_buffer_limit(), 2304);
+
+        // Both force names are `sockopt_capable(CAP_NET_ADMIN)`, i.e.
+        // `capable()` over the initial user namespace (`net/core/sock.c:1172-1175`).
+        let unprivileged = NetlinkOptionAuthority {
+            init_net_admin: false,
+            ..authority
+        };
+        assert_eq!(
+            LinuxError::from(
+                socket
+                    .set_sol_socket_option(
+                        tk_linux_net::SO_SNDBUFFORCE as u32,
+                        4096,
+                        unprivileged
+                    )
+                    .unwrap_err()
+            ),
+            LinuxError::EPERM
+        );
+
+        // `SO_BSDCOMPAT` is accepted and ignored, and reports zero.
+        socket
+            .set_sol_socket_option(tk_linux_net::SO_BSDCOMPAT as u32, 7, authority)
+            .unwrap();
+        assert_eq!(
+            socket
+                .get_sol_socket_option(tk_linux_net::SO_BSDCOMPAT as u32)
+                .unwrap(),
+            NetlinkOptionValue::Int(0)
+        );
+
+        // `netlink_ops` has no `set_peek_off`, so `SO_PEEK_OFF` is
+        // `-EOPNOTSUPP` in both directions (`net/core/sock.c:1285-1295`,
+        // `:2033-2038`).
+        assert_eq!(
+            LinuxError::from(
+                socket
+                    .set_sol_socket_option(tk_linux_net::SO_PEEK_OFF as u32, 4, authority)
+                    .unwrap_err()
+            ),
+            LinuxError::EOPNOTSUPP
+        );
+        assert_eq!(
+            LinuxError::from(
+                socket
+                    .get_sol_socket_option(tk_linux_net::SO_PEEK_OFF as u32)
+                    .unwrap_err()
+            ),
+            LinuxError::EOPNOTSUPP
         );
     }
 }
