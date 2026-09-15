@@ -184,8 +184,14 @@ use crate::{
     time::wall_time,
 };
 
-/// Immutable registration token for the private signal endpoint currently
-/// owning Linux thread-group-leader identity.
+/// Terminal scheduler state retained across the live task's exit.
+///
+/// Linux keeps `p->policy`, `p->prio`, `p->rt_priority`,
+/// `p->sched_reset_on_fork` and the uclamp request inside the `task_struct`,
+/// which stays allocated until `release_task()`, so `sched_getscheduler`,
+/// `sched_getparam` and `sched_rr_get_interval` answer for an unreaped zombie.
+/// TheKernel drops its live scheduler entity when the process's last thread
+/// exits, so this snapshot carries the same fields across that boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ZombieSchedulerSnapshot {
     pub(crate) class: SchedClass,
@@ -237,6 +243,10 @@ impl Default for ZombieSchedulerSnapshot {
     }
 }
 
+// `reset_on_fork` is deliberately not carried by this conversion: it is
+// published by `publish_scheduler_commit()` from the same transaction, and
+// `From<SchedState>` is also used for a task's *initial* state, where Linux's
+// `sched_reset_on_fork` has not been set yet.
 impl From<SchedState> for ZombieSchedulerSnapshot {
     fn from(state: SchedState) -> Self {
         Self {
@@ -253,6 +263,23 @@ impl From<SchedState> for ZombieSchedulerSnapshot {
             affinity: AxCpuMask::full(),
             identity_epoch: 0,
             version: 0,
+        }
+    }
+}
+
+impl ZombieSchedulerSnapshot {
+    /// Rebuilds the scheduler state Linux would still read out of the
+    /// `task_struct` of an unreaped zombie.
+    ///
+    /// `nice` and `rt_priority` are mutually exclusive by class, exactly as
+    /// they are for a live task, because both are written by the same
+    /// scheduler transaction and `EevdfTaskParams::validated()` normalises the
+    /// field the class does not use to zero.
+    pub(crate) const fn state(&self) -> SchedState {
+        SchedState {
+            class: self.class,
+            nice: self.nice,
+            rt_priority: self.rt_priority,
         }
     }
 }

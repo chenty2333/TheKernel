@@ -13,6 +13,7 @@ mod error;
 mod fault;
 mod identity;
 mod mapping;
+mod mempolicy;
 mod mincore;
 mod pin;
 mod plan;
@@ -31,6 +32,15 @@ pub use identity::{AddressSpaceId, MappingGeneration, MappingId, PinOwner};
 pub use mapping::{
     ExpectedMapping, InvalidationRange, InvalidationReason, MappingAccess, MappingKind,
     MappingSnapshot,
+};
+pub use mempolicy::{
+    ALLOWED_NODEMASK, GetMempolicyError, MAX_NODEMASK_BITS, MPOL_BIND, MPOL_DEFAULT, MPOL_F_ADDR,
+    MPOL_F_MEMS_ALLOWED, MPOL_F_NODE, MPOL_F_NUMA_BALANCING, MPOL_F_RELATIVE_NODES,
+    MPOL_F_STATIC_NODES, MPOL_INTERLEAVE, MPOL_LOCAL, MPOL_MAX, MPOL_MF_MOVE, MPOL_MF_MOVE_ALL,
+    MPOL_MF_STRICT, MPOL_MF_VALID, MPOL_MODE_FLAGS, MPOL_PREFERRED, MPOL_PREFERRED_MANY,
+    MPOL_WEIGHTED_INTERLEAVE, MbindPlan, MempolicyError, MempolicyRequest, NR_NODE_IDS,
+    effective_policy, next_interleave_node, parse_node_mask, plan_mbind, sanitize_mode_flags,
+    scanned_words, validate, validate_get,
 };
 pub use mincore::MincorePlan;
 pub use pin::{
