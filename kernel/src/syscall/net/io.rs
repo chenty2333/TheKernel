@@ -5,6 +5,7 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
+use axhal::time::{NANOS_PER_SEC, monotonic_time};
 use axio::prelude::*;
 use axnet::{
     CMsgData, RecvFlags, RecvOptions, SendFlags, SendOptions, Socket as AxSocket, SocketAddrEx,
@@ -16,13 +17,16 @@ use axnet::{
 use linux_raw_sys::{
     general::{CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN, timespec},
     net::{
-        AF_NETLINK, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_EOR, MSG_ERRQUEUE,
-        MSG_NOSIGNAL, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, SCM_CREDENTIALS, SOL_SOCKET,
-        cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t, ucred,
+        AF_NETLINK, MSG_CMSG_CLOEXEC, MSG_CONFIRM, MSG_CTRUNC, MSG_DONTROUTE, MSG_DONTWAIT,
+        MSG_EOR, MSG_ERRQUEUE, MSG_MORE, MSG_NOSIGNAL, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL,
+        SCM_CREDENTIALS, SOL_SOCKET, cmsghdr, mmsghdr, msghdr, sockaddr, socklen_t, ucred,
     },
 };
 use memory_addr::PAGE_SIZE_4K;
-use tk_linux_net::{PendingErrorPolicy, SocketWaitKind, plan_pending_error};
+use tk_linux_net::{
+    BatchDeadline, PendingErrorPolicy, ReceiveStep, SocketWaitKind, Timespec64, absolute_deadline,
+    batch_deadline, compat_flag_errno, plan_pending_error, waitall_applies, waitall_continues,
+};
 use tk_linux_packet::ReceiveFlags as PacketReceiveFlags;
 use tk_linux_signal::{SignalInfo, Signo};
 
@@ -65,7 +69,13 @@ const SCTP_NXTINFO: u32 = 4;
 const SCTP_PRINFO: u32 = 5;
 const SUPPORTED_RECVMSG_FLAGS: u32 =
     MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_WAITALL | MSG_CMSG_CLOEXEC | MSG_ERRQUEUE | MSG_OOB;
-const SUPPORTED_SENDMSG_FLAGS: u32 = MSG_DONTWAIT | MSG_NOSIGNAL | MSG_OOB;
+// `MSG_MORE`, `MSG_DONTROUTE` and `MSG_CONFIRM` are protocol flags Linux
+// accepts from `__sys_sendto`/`____sys_sendmsg` verbatim: no layer between the
+// syscall entry and the transport rejects them, and the transport decides
+// whether they mean anything.  `MSG_OOB` stays rejected here because urgent
+// data is not implemented, so accepting it would silently drop it.
+const SUPPORTED_SENDMSG_FLAGS: u32 =
+    MSG_DONTWAIT | MSG_NOSIGNAL | MSG_OOB | MSG_MORE | MSG_DONTROUTE | MSG_CONFIRM;
 
 fn remember_socket_error(socket: &PinnedSocketDescription, error: AxError) {
     if socket.backend() == Ok(SocketBackendKind::Network)
@@ -495,6 +505,19 @@ impl<T: Write + IoBufMut> IoBuf for StrictDatagramWrite<T> {
     }
 }
 
+/// `MSG_WAITALL` is a byte-stream completion rule.  Linux sets the receive
+/// target to the whole request only through `sock_rcvlowat()` in
+/// `tcp_recvmsg_locked()` and `unix_stream_read_generic()`; every datagram
+/// protocol returns exactly one record whatever the flag says.  A UNIX
+/// `SOCK_SEQPACKET` endpoint keeps its record boundaries here.
+fn is_byte_stream(socket: &AxSocket) -> bool {
+    match socket {
+        AxSocket::Tcp(_) => true,
+        AxSocket::Unix(unix) => !unix.is_record_oriented(),
+        _ => false,
+    }
+}
+
 fn recv_copyout_requires_error(socket: &PinnedSocketDescription) -> AxResult<bool> {
     // axnet's UDP receive dequeues before invoking `dst.write`, while MSG_PEEK
     // takes the non-consuming peek path. Unix datagrams follow the same
@@ -537,9 +560,9 @@ impl ValidatedRecvFlags {
         if self.raw & MSG_ERRQUEUE != 0 {
             return Err(LinuxError::EAGAIN.into());
         }
-        if self.raw & MSG_WAITALL != 0 {
-            return Err(AxError::InvalidInput);
-        }
+        // `net/packet/af_packet.c:packet_recvmsg()` never inspects
+        // `MSG_WAITALL`; the flag is accepted and the receive stays
+        // single-shot.
         let mut bits = 0;
         if self.generic.contains(RecvFlags::PEEK) {
             bits |= MSG_PEEK;
@@ -566,10 +589,11 @@ fn validate_recvmsg_flags(
     if !defer_packet_mechanism && flags & MSG_OOB != 0 && flags & MSG_ERRQUEUE == 0 {
         return Err(AxError::InvalidInput);
     }
-    if !defer_packet_mechanism && flags & MSG_WAITALL != 0 && flags & MSG_ERRQUEUE == 0 {
-        return Err(AxError::OperationNotSupported);
-    }
-
+    // `MSG_WAITALL` is not a socket-layer rejection in Linux: every protocol
+    // receives it, and only the byte-stream ones honour it through
+    // `sock_rcvlowat(sk, flags & MSG_WAITALL, len)`. The completion loop lives
+    // in `recv_impl`, which leaves datagram, netlink, packet, AF_ALG and error
+    // queue receives single-shot exactly as their protocols do.
     let mut recv_flags = RecvFlags::empty();
     if flags & MSG_PEEK != 0 {
         recv_flags |= RecvFlags::PEEK;
@@ -587,6 +611,20 @@ fn validate_recvmsg_flags(
     })
 }
 
+/// `net/socket.c` gives the `msghdr`-shaped entry points
+/// (`__sys_sendmsg`, `__sys_sendmmsg`, `__sys_recvmsg` and
+/// `SYSCALL_DEFINE5(recvmmsg)`) a `forbid_cmsg_compat` rule that returns
+/// `EINVAL` before the descriptor lookup, so a bad descriptor and a compat flag
+/// together report `EINVAL`.  `sendto` and `recvfrom` never check it.
+fn reject_compat_sendmsg_flags(flags: u32) -> AxResult {
+    match compat_flag_errno(flags) {
+        Some(errno) => Err(LinuxError::try_from(errno)
+            .map_err(|_| AxError::InvalidInput)?
+            .into()),
+        None => Ok(()),
+    }
+}
+
 fn validate_sendmsg_flags(flags: u32) -> AxResult<SendFlags> {
     if flags & !SUPPORTED_SENDMSG_FLAGS != 0 {
         return Err(AxError::OperationNotSupported);
@@ -597,6 +635,15 @@ fn validate_sendmsg_flags(flags: u32) -> AxResult<SendFlags> {
     let mut send_flags = SendFlags::empty();
     if flags & MSG_DONTWAIT != 0 {
         send_flags |= SendFlags::DONT_WAIT;
+    }
+    if flags & MSG_MORE != 0 {
+        send_flags |= SendFlags::MORE;
+    }
+    if flags & MSG_DONTROUTE != 0 {
+        send_flags |= SendFlags::DONT_ROUTE;
+    }
+    if flags & MSG_CONFIRM != 0 {
+        send_flags |= SendFlags::CONFIRM;
     }
     Ok(send_flags)
 }
@@ -892,8 +939,8 @@ fn mmsg_address(base: usize, index: usize) -> AxResult<usize> {
     base.checked_add(offset).ok_or(AxError::BadAddress)
 }
 
-const fn recvmmsg_transport_fault(error: AxError) -> bool {
-    // A partial recvmmsg return suppresses the immediate error, but only a
+const fn partial_receive_transport_fault(error: AxError) -> bool {
+    // A partial receive return suppresses the immediate error, but only a
     // fault reported by the transport belongs to the socket's SO_ERROR state.
     // Importing a later mmsghdr or publishing its result can fail locally
     // (EFAULT, EINVAL, address arithmetic, etc.); turning those into
@@ -901,8 +948,10 @@ const fn recvmmsg_transport_fault(error: AxError) -> bool {
     matches!(error, AxError::ConnectionRefused | AxError::ConnectionReset)
 }
 
-fn remember_recvmmsg_error(socket: &PinnedSocketDescription, error: AxError) {
-    if !recvmmsg_transport_fault(error) {
+/// Leaves a transport fault observable to the next admitted operation after a
+/// partial receive return, the way Linux leaves `sk_err` set.
+fn remember_receive_fault(socket: &PinnedSocketDescription, error: AxError) {
+    if !partial_receive_transport_fault(error) {
         return;
     }
     remember_socket_error(socket, error);
@@ -1412,6 +1461,9 @@ pub fn sys_sendmsg(
     msg: UserConstPtr<msghdr>,
     flags: u32,
 ) -> AxResult<isize> {
+    // `__sys_sendmsg(..., forbid_cmsg_compat = true)` rejects the compat bit
+    // before it resolves the descriptor; `sendto` never performs this check.
+    reject_compat_sendmsg_flags(flags)?;
     let snapshot = SocketSyscallSnapshot::capture();
     let socket = PinnedSocketDescription::from_fd(fd)?;
     let flags = effective_message_flags(flags, socket.nonblocking());
@@ -1669,7 +1721,8 @@ fn recv_impl(
         return Err(AxError::NotASocket);
     }
     let nonblocking = socket.nonblocking();
-    let socket = socket.network()?;
+    let pinned = socket;
+    let socket = pinned.network()?;
     let sctp = matches!(&socket.inner, axnet::Socket::Sctp(_));
     // DCCP retains application datagram boundaries even though Linux assigns
     // it its own SOCK_DCCP type rather than SOCK_SEQPACKET.  Expose the
@@ -1693,12 +1746,52 @@ fn recv_impl(
         nonblocking_override: Some(nonblocking),
     };
     let mut sctp_metadata = None;
-    let recv = match &socket.inner {
+    let mut recv = match &socket.inner {
         AxSocket::Sctp(sctp_socket) => {
             sctp_socket.recv_with_metadata(&mut dst, options, &mut sctp_metadata)?
         }
         _ => socket.recv(&mut dst, options)?,
     };
+
+    // `net/ipv4/tcp.c:tcp_recvmsg_locked()` derives the `MSG_WAITALL`
+    // completion target from `sock_rcvlowat(sk, flags & MSG_WAITALL, len)`,
+    // which is the whole request, and keeps copying until that target, a FIN,
+    // a signal, the receive-timeout expiry, or a transport error.  Only the
+    // first attempt publishes the peer address and ancillary data, because
+    // Linux fills the kernel msghdr once and later iterations append payload
+    // only.  A short count is returned as-is for every exit that is not a
+    // completed target; only an error raised before any octet was copied
+    // reaches userspace as an error.
+    if waitall_applies(
+        is_byte_stream(&socket.inner),
+        recv_flags.generic.contains(RecvFlags::PEEK),
+        record_capacity,
+    ) && waitall_continues(ReceiveStep::Copied(recv), recv, record_capacity)
+    {
+        loop {
+            let more = RecvOptions {
+                from: None,
+                flags: recv_flags.generic,
+                cmsg: None,
+                nonblocking_override: Some(nonblocking),
+            };
+            match socket.recv(&mut dst, more) {
+                Ok(bytes) => {
+                    recv += bytes;
+                    if !waitall_continues(ReceiveStep::Copied(bytes), recv, record_capacity) {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    // Linux keeps the octets already copied (`err = copied ?: err`)
+                    // and leaves a transport fault queued in `sk_err` for the
+                    // next call; a local failure is not a socket error.
+                    remember_receive_fault(pinned, error);
+                    break;
+                }
+            }
+        }
+    }
 
     let sctp_requested_control = matches!(&socket.inner, AxSocket::Sctp(sctp_socket)
         if sctp_metadata.is_some()
@@ -2029,6 +2122,7 @@ pub fn sys_recvmsg(
     msg: UserPtr<msghdr>,
     flags: u32,
 ) -> AxResult<isize> {
+    reject_compat_sendmsg_flags(flags)?;
     let snapshot = SocketSyscallSnapshot::capture();
     let socket = PinnedSocketDescription::from_fd(fd)?;
     let flags = effective_message_flags(flags, socket.nonblocking());
@@ -2074,7 +2168,9 @@ pub fn sys_sendmmsg(
     flags: u32,
 ) -> AxResult<isize> {
     // Linux validates and pins the socket even when there are no elements; a
-    // zero vlen only suppresses access to msgvec itself.
+    // zero vlen only suppresses access to msgvec itself.  `__sys_sendmmsg`
+    // rejects the compat bit before that lookup.
+    reject_compat_sendmsg_flags(flags)?;
     let snapshot = SocketSyscallSnapshot::capture();
     let socket = PinnedSocketDescription::from_fd(fd)?;
     let flags = effective_message_flags(flags, socket.nonblocking());
@@ -2112,18 +2208,31 @@ pub fn sys_sendmmsg(
     Ok(sent as isize)
 }
 
-fn recvmmsg_has_timeout(
+/// Imports `recvmmsg`'s optional relative timeout, matching
+/// `net/socket.c:__sys_recvmmsg` (`get_timespec64`) followed by
+/// `fs/select.c:poll_select_set_timeout` (`timespec64_valid`).  Both run before
+/// the descriptor is resolved, so a fault here outranks `EBADF`.
+fn recvmmsg_timeout(
     capability: &UserMemoryCapability,
     timeout: UserConstPtr<timespec>,
-) -> AxResult<bool> {
+) -> AxResult<Option<Timespec64>> {
     if timeout.is_null() {
-        return Ok(false);
+        return Ok(None);
     }
     let timeout = read_user_copy(capability, timeout)?;
-    if timeout.tv_sec < 0 || !(0..1_000_000_000).contains(&timeout.tv_nsec) {
+    let timeout = Timespec64::new(timeout.tv_sec, timeout.tv_nsec);
+    if !timeout.is_valid() {
         return Err(AxError::InvalidInput);
     }
-    Ok(true)
+    Ok(Some(timeout))
+}
+
+fn monotonic_timespec64() -> Timespec64 {
+    let nanos = monotonic_time().as_nanos() as u64;
+    Timespec64::new(
+        (nanos / NANOS_PER_SEC) as i64,
+        (nanos % NANOS_PER_SEC) as i64,
+    )
 }
 
 pub fn sys_recvmmsg(
@@ -2135,9 +2244,11 @@ pub fn sys_recvmmsg(
     timeout: UserConstPtr<timespec>,
 ) -> AxResult<isize> {
     let snapshot = SocketSyscallSnapshot::capture();
-    // The timeout object is imported before Linux enters do_recvmmsg(), even
-    // for vlen zero. Pin the endpoint next, then skip only msgvec processing.
-    let has_timeout = recvmmsg_has_timeout(&capability, timeout)?;
+    // `SYSCALL_DEFINE5(recvmmsg)` rejects the compat bit before the timeout is
+    // even imported; `__sys_recvmmsg` imports and validates the timeout before
+    // it resolves the descriptor.
+    reject_compat_sendmsg_flags(flags)?;
+    let requested_timeout = recvmmsg_timeout(&capability, timeout)?;
     let socket = PinnedSocketDescription::from_fd(fd)?;
     let Some(vlen) = admitted_recvmmsg_vlen(vlen) else {
         // A zero-length batch has no receive attempt and therefore no receive
@@ -2147,13 +2258,14 @@ pub fn sys_recvmmsg(
         }
         return Ok(0);
     };
-    // A per-call recvmmsg deadline cannot be represented by the socket's
-    // shared SO_RCVTIMEO without racing other users of the OFD. Reject it until
-    // the receive poller accepts an explicit deadline instead of silently
-    // ignoring a valid timeout.
-    if has_timeout {
-        return Err(AxError::OperationNotSupported);
-    }
+    // `do_recvmmsg()` turns the relative timeout into an absolute monotonic
+    // deadline once, then compares it after every datagram.  It never bounds
+    // the individual blocking receive, so no per-call receive timeout is
+    // needed and the shared SO_RCVTIMEO mirror stays untouched.
+    let deadline = requested_timeout.map(|requested| {
+        absolute_deadline(monotonic_timespec64(), requested).unwrap_or(Timespec64::ZERO)
+    });
+    let mut remaining = None;
     let wait_for_one = flags & MSG_WAITFORONE != 0;
     let mut active_flags = effective_message_flags(flags & !MSG_WAITFORONE, socket.nonblocking());
     let mut recv_flags =
@@ -2254,17 +2366,44 @@ pub fn sys_recvmmsg(
                     return Err(err);
                 }
                 received += 1;
+                // `do_recvmmsg()` releases MSG_WAITFORONE before it recomputes
+                // the deadline, and it stops the batch on an expired deadline
+                // after storing the remaining interval.
                 if wait_for_one && received == 1 {
                     active_flags |= MSG_DONTWAIT;
                     recv_flags.insert_dont_wait();
                 }
+                if let Some(limit) = deadline {
+                    match batch_deadline(limit, monotonic_timespec64()) {
+                        BatchDeadline::Continue(left) => remaining = Some(left),
+                        BatchDeadline::Stop(left) => {
+                            remaining = Some(left);
+                            break;
+                        }
+                    }
+                }
             }
             Err(err) if received != 0 => {
-                remember_recvmmsg_error(&socket, err);
-                return Ok(received as isize);
+                remember_receive_fault(&socket, err);
+                break;
             }
             Err(err) => return Err(err),
         }
+    }
+    // `__sys_recvmmsg()` writes the possibly shortened interval back only when
+    // the batch produced at least one datagram, and turns a failing copyout
+    // into EFAULT even though datagrams were received.
+    if let Some(remaining) = remaining
+        && received != 0
+    {
+        write_user_copy(
+            &capability,
+            UserPtr::<timespec>::from(timeout.address().as_usize()),
+            timespec {
+                tv_sec: remaining.sec,
+                tv_nsec: remaining.nsec,
+            },
+        )?;
     }
     Ok(received as isize)
 }
@@ -2534,10 +2673,18 @@ mod tests {
     #[test]
     fn packet_receive_mechanism_flags_are_rejected_only_after_policy_stage() {
         assert!(validate_recvmsg_flags(MSG_ERRQUEUE | MSG_OOB, false).is_ok());
+        // `MSG_WAITALL` is not a rejection anywhere: `packet_recvmsg()` ignores
+        // it, and the byte-stream completion rule is applied by `recv_impl`.
+        assert!(validate_recvmsg_flags(MSG_WAITALL, false).is_ok());
+        assert!(
+            validate_recvmsg_flags(MSG_WAITALL, true)
+                .unwrap()
+                .packet_flags()
+                .is_ok()
+        );
         for (flag, expected) in [
             (MSG_OOB, LinuxError::EINVAL),
             (MSG_ERRQUEUE, LinuxError::EAGAIN),
-            (MSG_WAITALL, LinuxError::EINVAL),
             (1_u32 << 31, LinuxError::EINVAL),
         ] {
             if flag != MSG_ERRQUEUE {
@@ -2631,13 +2778,13 @@ mod tests {
     }
 
     #[test]
-    fn partial_recvmmsg_only_defers_transport_socket_faults() {
-        assert!(!recvmmsg_transport_fault(AxError::WouldBlock));
-        assert!(!recvmmsg_transport_fault(AxError::BadAddress));
-        assert!(!recvmmsg_transport_fault(AxError::InvalidInput));
-        assert!(!recvmmsg_transport_fault(AxError::Io));
-        assert!(recvmmsg_transport_fault(AxError::ConnectionRefused));
-        assert!(recvmmsg_transport_fault(AxError::ConnectionReset));
+    fn partial_receive_returns_only_defer_transport_socket_faults() {
+        assert!(!partial_receive_transport_fault(AxError::WouldBlock));
+        assert!(!partial_receive_transport_fault(AxError::BadAddress));
+        assert!(!partial_receive_transport_fault(AxError::InvalidInput));
+        assert!(!partial_receive_transport_fault(AxError::Io));
+        assert!(partial_receive_transport_fault(AxError::ConnectionRefused));
+        assert!(partial_receive_transport_fault(AxError::ConnectionReset));
     }
 
     #[test]
