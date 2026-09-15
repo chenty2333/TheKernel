@@ -789,17 +789,25 @@ int main(void) {
          * an immutable nullfs with mount id 1 as the namespace root, and the
          * mutable rootfs with mount id 2 mounted on top of it
          * (fs/namespace.c:6185-6212).  "/" therefore resolves to the rootfs,
-         * which *has* a parent, so do_umount()'s `!mnt_has_parent(mnt)` guard
-         * (fs/namespace.c:1948) does not fire, MNT_DETACH takes the
-         * umount_tree() arm and the call returns 0.  The documented
-         * switch_root(8) recipe depends on exactly that.
-         *
-         * This kernel has a single mutable root mount with no parent, so it
-         * still answers EINVAL.  The assertion accepts that answer so the rest
-         * of this program can be compared, and records which answer was seen:
-         * a guest that answers 0 marks the same assertion as a guest that does
-         * not, but THEKERNEL_FS_ABI_DETACH_ROOT below says which.  Remove the
-         * tolerance once the nullfs root lands.
+         * which *has* a parent, so do_umount()'s guards all pass --
+         *         retval = -EINVAL;
+         *         if (!check_mnt(mnt))                            :1943
+         *                 goto out;
+         *         if (mnt->mnt.mnt_flags & MNT_LOCKED)            :1946
+         *                 goto out;
+         *         if (!mnt_has_parent(mnt))                       :1949
+         *                 goto out;
+         *         ...
+         *         if (flags & MNT_DETACH) {                       :1954
+         *                 umount_tree(mnt, UMOUNT_PROPAGATE);
+         *                 retval = 0;
+         *         }
+         * -- and the call returns 0.  Detaching the rootfs leaves the
+         * namespace root in place, and the root reference this process
+         * already holds keeps resolving inside the detached tree; the
+         * documented switch_root(8) recipe depends on both halves of that.
+         * The assertion is strict: the tolerance this check used to carry
+         * while the kernel had one parentless root mount is gone.
          *
          * The probe is destructive wherever it succeeds, and a mount namespace
          * is shared by every process that did not unshare one -- so the answer
@@ -809,8 +817,17 @@ int main(void) {
          * Linux 7.2.3 oracle the clock and time programs then read
          * /proc/uptime and /proc/self/timens_offsets as ENOENT.
          *
-         * The child's exit status carries the verdict: 0 detached, 1 EINVAL,
-         * 2 anything else, 3 the namespace could not be isolated.
+         * The child's exit status carries both verdicts: 0 the first request
+         * detached and a repeat request was refused with EINVAL, 1 the first
+         * request was refused with EINVAL (a single parentless root mount), 4
+         * the first request detached but the repeat was not refused, 2 anything
+         * else, 3 the namespace could not be isolated.
+         *
+         * Success is reported as DETACH_NAMESPACE_ROOT_SUCCEEDS.  Status 3
+         * reports DETACH_NAMESPACE_ROOT_SKIPPED for diagnosis and then fails
+         * the case through `detach-namespace-isolated`, because a kernel that
+         * cannot create a mount namespace has not answered this case and must
+         * not be able to hide that behind a skip.
          */
         int detach_answer = 3;
         pid_t detach_child = fork();
@@ -822,7 +839,18 @@ int main(void) {
             syscall(SYS_mount, NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
             errno = 0;
             long detached = syscall(SYS_umount2, "/", MNT_DETACH);
-            _exit(detached == 0 ? 0 : (errno == EINVAL ? 1 : 2));
+            if (detached != 0) {
+                _exit(errno == EINVAL ? 1 : 2);
+            }
+            /*
+             * umount_tree() cleared `mnt->mnt_ns` on the rootfs, so a repeat
+             * request now fails can_umount()'s `if (!check_mnt(mnt)) return
+             * -EINVAL;` (fs/namespace.c:2030) even though nothing else changed.
+             */
+            errno = 0;
+            _exit(syscall(SYS_umount2, "/", MNT_DETACH) == -1 && errno == EINVAL
+                      ? 0
+                      : 4);
         }
         if (detach_child > 0) {
             int detach_status = 0;
@@ -832,12 +860,17 @@ int main(void) {
             }
         }
         if (detach_answer == 3) {
-            /* No namespace to isolate the probe in; skip it rather than make
-             * an assertion whose side effects cannot be contained. */
+            /* No namespace to isolate the probe in.  Report why, then fail the
+             * case: `unshare(CLONE_NEWNS)` is the precondition of the whole
+             * probe, and a skip here once hid a real regression in namespace
+             * creation behind an assertion that never ran.  `check()` exits, so
+             * the case never reaches its THEKERNEL_ABI_RESULT line either. */
             mark("DETACH_NAMESPACE_ROOT_SKIPPED");
+            check(0, "detach-namespace-isolated");
         } else {
-            check(detach_answer == 0 || detach_answer == 1, "detach-root");
-            mark("DETACH_NAMESPACE_ROOT_EINVAL");
+            check(detach_answer == 0, "detach-root");
+            mark("DETACH_NAMESPACE_ROOT_SUCCEEDS");
+            check(detach_answer != 4, "detach-detached-root");
         }
         errno = 0;
         check(syscall(SYS_umount2, "/nonexistent-thekernel-fs-abi", 0) == -1 &&

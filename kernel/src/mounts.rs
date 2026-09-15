@@ -644,8 +644,40 @@ impl MountTopology {
             .ok_or(AxError::NotFound)
     }
 
+    /// The immutable namespace root, i.e. Linux `ns->root`.  Since
+    /// `init_mount_tree()` (`fs/namespace.c`:6180-6230) this is the nullfs
+    /// mount, not the mutable rootfs a task is rooted in.
     pub fn root_location(&self) -> AxResult<Location> {
         Ok(self.root_mount.lock().root_location())
+    }
+
+    /// The mount a task rooted in this namespace sees at `"/"`.
+    ///
+    /// Linux keeps `ns->root` (nullfs) distinct from `current->fs->root`
+    /// (rootfs) and recovers the latter by walking down from the former:
+    ///
+    /// ```c
+    /// 	/* Find the root */
+    /// 	err = vfs_path_lookup(mnt_ns->root->mnt.mnt_root, &mnt_ns->root->mnt,
+    /// 				"/", LOOKUP_DOWN, &root);
+    /// ```
+    ///
+    /// (`fs/namespace.c`:6505, `mntns_install()`).  `LOOKUP_DOWN` lands on the
+    /// mount stacked on top of the namespace root, which `init_mount_tree()`
+    /// makes the mutable rootfs.  A namespace with nothing stacked on top
+    /// (`CLONE_EMPTY_MNTNS`) roots its tasks at the namespace root itself.
+    ///
+    /// The walk follows the VFS attachment chain rather than the mount ledger:
+    /// a freshly cloned topology has no published records yet
+    /// (`try_prepare_clone_namespace()` commits them later), while
+    /// `clone(CLONE_NEWNS)` and `unshare(CLONE_NEWNS)` need this answer before
+    /// that commit.
+    pub fn visible_root_location(&self) -> AxResult<Location> {
+        let mut visible = self.root_location()?;
+        while let Some(covered) = visible.mounted_child() {
+            visible = covered.root_location();
+        }
+        Ok(visible)
     }
 
     /// CLONE_NEWNS copies the mount graph while sharing superblocks and
@@ -676,6 +708,7 @@ impl MountTopology {
             .iter()
             .find(|record| record.parent_id == 0)
             .ok_or(AxError::NotFound)?;
+        let root_mount_id = root.mount_id;
         let root_source = validate_record_state(root)?;
         let root_old = next_mountinfo_id()?;
         let root_clone = Mountpoint::new_root_at_with_extensions(
@@ -711,7 +744,12 @@ impl MountTopology {
             mountpoint: Arc::downgrade(&root_clone),
         });
         source_identity.insert(root_clone.mount_id(), root.mount_id);
-        let context = axfs::FsContext::new(root_clone.root_location());
+        // Mountinfo targets are absolute paths from the namespace root, but the
+        // namespace root is the immutable nullfs: an empty directory that
+        // resolves nothing.  The tree a task can actually reach hangs off the
+        // mount layered on top of it, so the resolution root is replaced by
+        // that mount's clone as soon as it is attached (see below).
+        let mut context = axfs::FsContext::new(root_clone.root_location());
         let mut pending = source
             .into_iter()
             .filter(|record| record.parent_id != 0)
@@ -729,7 +767,23 @@ impl MountTopology {
                     continue;
                 };
                 let original = validate_record_state(&record)?;
-                let target = context.resolve(&record.target).map_err(|_| AxError::Io)?;
+                // The mount layered directly on the namespace root is attached
+                // at that root's own root directory: mountinfo records the
+                // target "/" for it, and `init_mount_tree()` puts the mutable
+                // rootfs exactly there (`fs/namespace.c`:6212-6223).  Resolving
+                // that path through the namespace root's own context could only
+                // ever find the empty immutable nullfs.
+                let visible_root =
+                    record.parent_id == root_mount_id && record.target.as_bytes() == b"/";
+                let target = if visible_root {
+                    parent
+                        .mountpoint
+                        .upgrade()
+                        .ok_or(AxError::Io)?
+                        .root_location()
+                } else {
+                    context.resolve(&record.target).map_err(|_| AxError::Io)?
+                };
                 if target.mountpoint().mount_id() != parent.mount_id {
                     return Err(AxError::Io);
                 }
@@ -750,6 +804,16 @@ impl MountTopology {
                 )?;
                 register_live_superblock_mount(&clone)?;
                 clone.attach_to(&target)?;
+                // Everything else resolves from the mount a task sees at the
+                // root of the clone from now on, which is the same walk
+                // `copy_mnt_ns()` performs when it keeps the task's root and pwd
+                // on the clone of the mount they were on
+                // (`fs/namespace.c`:4296-4312); without it every nested target
+                // would be resolved against the empty nullfs and fail with
+                // -ENOENT.
+                if visible_root {
+                    context = axfs::FsContext::new(clone.root_location());
+                }
                 cloned.push(MountRecord {
                     mount_id: clone.mount_id(),
                     mount_id_old: old,
@@ -1426,13 +1490,29 @@ pub fn namespace_operation() -> NamespaceOperationGuard {
     }
 }
 
+/// Authority the syscall layer already proved before asking the pure planner
+/// to validate a topology change.
+///
+/// Linux performs these tests before it touches the mount tree: `may_mount()`
+/// at the top of `path_pivot_root()` (`fs/namespace.c`:4686-4687) and
+/// `can_umount()`'s `may_mount()` (`:2026-2027`).  Carrying the answer as a
+/// parameter is what lets a caller that *failed* those tests be rejected
+/// instead of silently inheriting authority it never established.
+pub fn syscall_established_authority() -> tk_linux_mount::MountAuthority {
+    tk_linux_mount::MountAuthority {
+        administer: true,
+        pivot_root: true,
+        lazy_unmount: true,
+    }
+}
+
 fn plan_mount_mutation(
     records: &[MountRecord],
+    authority: tk_linux_mount::MountAuthority,
     operation: tk_linux_mount::MountOperation,
 ) -> AxResult<tk_linux_mount::MountPlan> {
     use tk_linux_mount::{
-        MountAuthority, MountFlags, MountId, NamespaceGeneration, NamespaceId, TopologyEntry,
-        TopologySnapshot,
+        MountFlags, MountId, NamespaceGeneration, NamespaceId, TopologyEntry, TopologySnapshot,
     };
 
     let mut entries = Vec::new();
@@ -1460,16 +1540,7 @@ fn plan_mount_mutation(
         generation,
         entries: &entries,
     };
-    tk_linux_mount::plan_mount(
-        snapshot,
-        MountAuthority {
-            administer: true,
-            pivot_root: true,
-            lazy_unmount: true,
-        },
-        operation,
-    )
-    .map_err(|_| AxError::Io)
+    tk_linux_mount::plan_mount(snapshot, authority, operation).map_err(|_| AxError::Io)
 }
 
 fn commit_mount_mutation(_plan: tk_linux_mount::MountPlan) -> AxResult<()> {
@@ -1604,6 +1675,82 @@ pub fn snapshot() -> AxResult<Vec<MountRecord>> {
         return topology.try_records();
     }
     bootstrap_snapshot()
+}
+
+/// Linux `check_mnt()` (`fs/namespace.c`:1069-1072) tests
+/// `mnt->mnt_ns == current->nsproxy->mnt_ns`.  The namespace ledger is this
+/// kernel's authority for that relation, so an attached mount that belongs to
+/// an anonymous `open_tree(OPEN_TREE_CLONE)`/`fsmount()` tree is not a valid
+/// target for a namespace-level operation.
+pub fn is_in_current_namespace(mountpoint: &Arc<Mountpoint>) -> AxResult<bool> {
+    let mount_id = mountpoint.mount_id();
+    Ok(snapshot()?
+        .iter()
+        .any(|record| record.mount_id == mount_id))
+}
+
+/// Whether `/proc/<pid>/{mounts,mountinfo}` may report this record.
+///
+/// `show_vfsmnt()`/`show_mountinfo()` call
+/// `seq_path_root(m, &mnt_path, &p->root, ...)` and drop the whole record when
+/// `__d_path()` returns `NULL` (`fs/proc_namespace.c`:118,151 and
+/// `fs/seq_file.c`:508-530), where `p->root` is the reading task's filesystem
+/// root (`fs/proc_namespace.c`:276).  That is what hides the immutable nullfs
+/// mount: it is the *parent* of `current->fs->root`, and `__d_path()` cannot
+/// walk above the root it was given.
+pub fn visible_from_filesystem_root(record: &MountRecord) -> bool {
+    let Some(mountpoint) = record.mountpoint.upgrade() else {
+        return false;
+    };
+    let Some(task) = axtask::current_may_uninit() else {
+        // Before the first task exists nothing can read these files.
+        return true;
+    };
+    let Some(thread) = task.try_as_thread() else {
+        return true;
+    };
+    let root = thread.fs_context().lock().root_dir().clone();
+    mountpoint
+        .root_location()
+        .path_relative_to(&root)
+        .is_ok_and(|(_, reachable)| reachable)
+}
+
+/// Linux `mnt_has_parent()` (`fs/mount.h`): `mnt->mnt_parent != mnt`.  Linux
+/// points the absolute root's `mnt_parent` at itself, so "has a parent" is
+/// exactly "is attached below something in the VFS mount tree".
+pub fn mount_has_parent(mountpoint: &Arc<Mountpoint>) -> bool {
+    mountpoint.location().is_some()
+}
+
+/// The mount one step up the VFS mount tree, i.e. Linux `mnt->mnt_parent`.
+pub fn parent_mountpoint(mountpoint: &Arc<Mountpoint>) -> Option<Arc<Mountpoint>> {
+    mountpoint
+        .location()
+        .map(|location| location.mountpoint().clone())
+}
+
+/// Linux `IS_MNT_SHARED()` (`fs/pnode.h`:13): `mnt_t_flags & T_SHARED`.
+/// Propagation identities live in the namespace topology rather than in the
+/// mount record, so this reads the ledger directly.  A peer group with a
+/// master is a slave, and `change_mnt_propagation()` clears `T_SHARED` on that
+/// transition (`fs/pnode.c`:101-113).
+pub fn is_shared_mount(mountpoint: &Arc<Mountpoint>) -> AxResult<bool> {
+    let Some(topology) = current_mount_topology() else {
+        // Before the first task exists there is no propagation state at all:
+        // `init_mount_tree()` creates both mounts with mount flags 0.
+        return Ok(false);
+    };
+    let mount_id = mountpoint.mount_id();
+    let snapshot = topology.try_snapshot()?;
+    let mount = snapshot
+        .mounts
+        .iter()
+        .find(|mount| mount.id == mount_id)
+        .ok_or(AxError::NotFound)?;
+    Ok(mount
+        .peer_group
+        .is_some_and(|peer_group| peer_group.master.is_none()))
 }
 
 fn bootstrap_snapshot() -> AxResult<Vec<MountRecord>> {
@@ -1867,43 +2014,120 @@ pub(crate) fn initialize_test_mount(mountpoint: &Arc<Mountpoint>, flags: u32) ->
     )?)
 }
 
-pub fn initialize_root_mount(
-    mountpoint: &Arc<Mountpoint>,
+/// Publishes the bootstrap mount ledger for the initial mount namespace.
+///
+/// Linux `init_mount_tree()` (`fs/namespace.c`:6180-6230) creates two mounts:
+///
+/// ```c
+/// 	/* The namespace root is the nullfs mnt. */
+/// 	mnt_root		= real_mount(nullfs_mnt);
+/// 	init_mnt_ns.root	= mnt_root;
+/// 	...
+/// 	/* The root and pwd always point to the mutable rootfs. */
+/// 	root.mnt	= mnt;
+/// 	root.dentry	= mnt->mnt_root;
+/// 	set_fs_pwd(current->fs, &root);
+/// 	set_fs_root(current->fs, &root);
+/// ```
+///
+/// `mutable_root` is that second mount; this records its whole attachment
+/// chain root-most first, so the ledger's single `parent_id == 0` entry is
+/// the immutable namespace root and the mutable rootfs keeps the parent that
+/// `do_umount()`'s `mnt_has_parent()` test (`fs/namespace.c`:1949) needs.
+pub fn initialize_mount_tree(
+    mutable_root: &Arc<Mountpoint>,
     flags: u32,
     metadata: MountMetadata,
 ) -> VfsResult<()> {
-    let dev = linux_device_id(mountpoint.device()).0;
-    let record_metadata = metadata.try_clone()?;
-    let target = try_path(FsPath::new(b"/"))?;
-    let mount_id_old = next_mountinfo_id()?;
-    let extensions = mount_extensions(flags, metadata, mount_id_old)?;
-    let mut records = snapshot()?;
-    if records
-        .iter()
-        .any(|record| record.mount_id == mountpoint.mount_id())
-    {
-        return Err(AxError::AlreadyExists);
+    // Walk the VFS attachment chain to the absolute root.  Linux guarantees
+    // the chain is exactly [nullfs, rootfs] here: `init_mount_tree()` is the
+    // only mounter that runs before the first task is created.
+    let mut chain = Vec::new();
+    chain.try_reserve_exact(2).map_err(|_| AxError::NoMemory)?;
+    let mut cursor = mutable_root.clone();
+    loop {
+        let parent = cursor
+            .location()
+            .map(|location| location.mountpoint().clone());
+        chain.push(cursor);
+        match parent {
+            Some(parent) => cursor = parent,
+            None => break,
+        }
+        if chain.len() > MAX_MOUNT_RECORDS {
+            return Err(AxError::Io);
+        }
     }
-    if records.len() >= MAX_MOUNT_RECORDS {
+    chain.reverse();
+
+    let mut records = snapshot()?;
+    records
+        .try_reserve(chain.len())
+        .map_err(|_| AxError::NoMemory)?;
+    if records.len().saturating_add(chain.len()) > MAX_MOUNT_RECORDS {
         return Err(AxError::StorageFull);
     }
-    records.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-    mountpoint.initialize_extensions(extensions)?;
-    records.push(MountRecord {
-        mount_id: mountpoint.mount_id(),
-        mount_id_old,
-        parent_id: 0,
-        root: record_metadata.root,
-        source: record_metadata.source,
-        target,
-        fs_type: record_metadata.fs_type,
-        data: record_metadata.data,
-        dev,
-        flags,
-        expire_epoch: None,
-        mountpoint: Arc::downgrade(mountpoint),
-    });
-    register_live_superblock_mount(mountpoint)?;
+    let target = try_path(FsPath::new(b"/"))?;
+    let mut prepared = Vec::new();
+    prepared
+        .try_reserve_exact(chain.len())
+        .map_err(|_| AxError::NoMemory)?;
+    let mut pending_metadata = Some(metadata);
+    for (index, mountpoint) in chain.iter().enumerate() {
+        if records
+            .iter()
+            .any(|record| record.mount_id == mountpoint.mount_id())
+        {
+            return Err(AxError::AlreadyExists);
+        }
+        // The absolute root is a kernel-internal mount that userspace can
+        // neither create nor write: `nullfs_init_fs_context()` sets
+        // `SB_NOUSER` and `SB_I_NOEXEC | SB_I_NODEV` (`fs/nullfs.c`:45-49),
+        // and `vfs_kern_mount(&nullfs_fs_type, 0, "nullfs", NULL)` therefore
+        // carries no mount flags at all.
+        let (mount_flags, mount_metadata) = if index == 0 {
+            let filesystem = mountpoint.filesystem_handle();
+            let name = filesystem.name();
+            (
+                0,
+                MountMetadata::try_from_parts(
+                    FsPath::new(name.as_bytes()),
+                    name,
+                    FsPath::new(b"/"),
+                    "",
+                )?,
+            )
+        } else {
+            (flags, pending_metadata.take().ok_or(AxError::Io)?)
+        };
+        let record_metadata = mount_metadata.try_clone()?;
+        let dev = linux_device_id(mountpoint.device()).0;
+        let mount_id_old = next_mountinfo_id()?;
+        let extensions = mount_extensions(mount_flags, mount_metadata, mount_id_old)?;
+        mountpoint.initialize_extensions(extensions)?;
+        prepared.push(MountRecord {
+            mount_id: mountpoint.mount_id(),
+            mount_id_old,
+            parent_id: 0,
+            root: record_metadata.root,
+            source: record_metadata.source,
+            target: target.clone(),
+            fs_type: record_metadata.fs_type,
+            data: record_metadata.data,
+            dev,
+            flags: mount_flags,
+            expire_epoch: None,
+            mountpoint: Arc::downgrade(mountpoint),
+        });
+    }
+    for index in 0..prepared.len() {
+        if index != 0 {
+            prepared[index].parent_id = prepared[index - 1].mount_id;
+        }
+        let record = &prepared[index];
+        register_live_superblock_mount(&record.mountpoint.upgrade().ok_or(AxError::Io)?)?;
+        records.push(record.try_clone()?);
+    }
     publish_current_records(&records)?;
     Ok(())
 }
@@ -2543,7 +2767,7 @@ fn attach_tree_and_record_kind(
                 .map_err(|_| AxError::Io)?,
         },
     };
-    let plan = plan_mount_mutation(&records, operation)?;
+    let plan = plan_mount_mutation(&records, syscall_established_authority(), operation)?;
     // Register every child before publication. Recursive bind children may
     // refer to different superblocks and remain live through detached-tree or
     // lazy-unmount references after their namespace records disappear.
@@ -2951,6 +3175,7 @@ pub fn remount_with_data(
     remount_metadata.data = try_string(&data)?;
     let plan = plan_mount_mutation(
         &records,
+        syscall_established_authority(),
         tk_linux_mount::MountOperation::Remount {
             mount: tk_linux_mount::MountId::new(mountpoint.mount_id())
                 .map_err(|_| AxError::Io)?,
@@ -3012,6 +3237,7 @@ pub fn try_update_flags_for_mounts(
         .ok_or(AxError::Io)?;
     let plan = plan_mount_mutation(
         &records,
+        syscall_established_authority(),
         tk_linux_mount::MountOperation::Setattr {
             mount: tk_linux_mount::MountId::new(root_mount_id).map_err(|_| AxError::Io)?,
             flags: tk_linux_mount::MountFlags::from_validated_kernel_bits(root_flags.into()),
@@ -3133,6 +3359,7 @@ pub fn move_tree_and_records(old: &Location, target: &Location) -> AxResult<()> 
     }
     let plan = plan_mount_mutation(
         &records,
+        syscall_established_authority(),
         tk_linux_mount::MountOperation::Move {
             mount: tk_linux_mount::MountId::new(root_mount_id).map_err(|_| AxError::Io)?,
             parent: tk_linux_mount::MountId::new(new_parent_id).map_err(|_| AxError::Io)?,
@@ -3355,20 +3582,76 @@ fn propagate_moved_tree(root_id: u64, target: &Location) -> AxResult<()> {
 
 /// Performs the mount-tree and mount-record half of `pivot_root(2)` as one
 /// namespace operation. Callers must hold [`namespace_operation`].
+///
+/// `authority` is the answer the syscall layer already obtained from
+/// `may_mount()`; `path_pivot_root()` opens with exactly that test
+/// (`fs/namespace.c`:4686-4687) so the pure topology planner must be told the
+/// answer instead of assuming it.
 pub fn pivot_root_and_records(
     old_root: &Location,
     new_root: &Location,
     put_old: &Location,
+    authority: tk_linux_mount::MountAuthority,
 ) -> AxResult<()> {
     let new_mount = new_root.mountpoint();
-    if new_mount.is_root() {
-        return Err(AxError::ResourceBusy);
-    }
+    let root_mount = old_root.mountpoint();
+    // `LOCK_MOUNT(old_mp, old); old_mnt = old_mp.parent;` (`fs/namespace.c`:
+    // 4691-4693): `old_mnt` is the mount that contains `put_old`, which is the
+    // mount `put_old` resolves in.
+    let old_mount = put_old.mountpoint();
     if !old_root.is_root_of_mount()
         || !new_root.is_root_of_mount()
         || !put_old.is_dir()
         || !Arc::ptr_eq(put_old.mountpoint(), new_mount)
     {
+        return Err(AxError::InvalidInput);
+    }
+    //     ex_parent = new_mnt->mnt_parent;
+    //     root_parent = root_mnt->mnt_parent;
+    //     if (IS_MNT_SHARED(old_mnt) ||
+    //             IS_MNT_SHARED(ex_parent) ||
+    //             IS_MNT_SHARED(root_parent))
+    //             return -EINVAL;
+    // (`fs/namespace.c`:4694-4698).  Linux's absolute root is its own
+    // `mnt_parent`, so an unattached parent means the mount itself.
+    let new_parent = parent_mountpoint(new_mount).unwrap_or_else(|| new_mount.clone());
+    let root_parent = parent_mountpoint(root_mount).unwrap_or_else(|| root_mount.clone());
+    if is_shared_mount(old_mount)? || is_shared_mount(&new_parent)? || is_shared_mount(&root_parent)?
+    {
+        return Err(AxError::InvalidInput);
+    }
+    //     if (!check_mnt(root_mnt) || !check_mnt(new_mnt))
+    //             return -EINVAL;
+    //     if (new_mnt->mnt.mnt_flags & MNT_LOCKED)
+    //             return -EINVAL;
+    // (`fs/namespace.c`:4699-4702).
+    if !is_in_current_namespace(root_mount)? || !is_in_current_namespace(new_mount)? {
+        return Err(AxError::InvalidInput);
+    }
+    if new_mount.is_placement_locked() {
+        return Err(AxError::InvalidInput);
+    }
+    // `if (d_unlinked(new->dentry)) return -ENOENT;` (`fs/namespace.c`:4703)
+    // has no counterpart here: this VFS has no dcache hash/unhash state, so a
+    // removed directory is expressed by its backend namespace and not by a
+    // dentry flag.  `Location` therefore cannot answer "is this dentry still
+    // reachable from its parent", which is the primitive the test needs.
+    //
+    //     if (new_mnt == root_mnt || old_mnt == root_mnt)
+    //             return -EBUSY; /* loop, on the same file system  */
+    // (`fs/namespace.c`:4704-4705).
+    if new_mount.mount_id() == root_mount.mount_id() || old_mount.mount_id() == root_mount.mount_id()
+    {
+        return Err(AxError::ResourceBusy);
+    }
+    //     if (!path_mounted(&root)) return -EINVAL; /* not a mountpoint */
+    //     if (!mnt_has_parent(root_mnt)) return -EINVAL; /* absolute root */
+    //     if (!path_mounted(new)) return -EINVAL; /* not a mountpoint */
+    //     if (!mnt_has_parent(new_mnt)) return -EINVAL; /* absolute root */
+    // (`fs/namespace.c`:4706-4711).  The mutable rootfs has a parent (the
+    // immutable nullfs); the nullfs namespace root itself does not, so
+    // pivoting onto the absolute root stays -EINVAL.
+    if !mount_has_parent(root_mount) || !mount_has_parent(new_mount) {
         return Err(AxError::InvalidInput);
     }
     let new_root_path = new_root.absolute_path().map_err(|_| AxError::Io)?;
@@ -3386,16 +3669,32 @@ pub fn pivot_root_and_records(
     let index = MountRecordIndex::new(&records)?;
     validate_registered_mount_chain(&index, new_mount)?;
     let new_subtree = validate_registered_subtree(&index, new_mount)?;
-    let old_root_index = records
+    // `init_mnt_ns.root`: the immutable nullfs, which `path_pivot_root()`
+    // never re-parents.  The new root is attached to `root_parent`, which is
+    // that same mount, so the absolute root keeps both its `"/"` target and
+    // its empty parent.
+    let namespace_root_index = records
         .iter()
         .position(|record| record.parent_id == 0)
         .ok_or(AxError::Io)?;
-    let namespace_root = validate_record_state(&records[old_root_index])?;
+    let namespace_root = validate_record_state(&records[namespace_root_index])?;
     if !namespace_root.is_root() {
         return Err(AxError::Io);
     }
-    if !Arc::ptr_eq(old_root.mountpoint(), &namespace_root) {
+    // The mount `path_pivot_root()` moves aside is `current->fs->root.mnt`,
+    // not `ns->root`.
+    let old_root_index = records
+        .iter()
+        .position(|record| record.mount_id == root_mount.mount_id())
+        .ok_or(AxError::Io)?;
+    if old_root_index == namespace_root_index {
         return Err(AxError::InvalidInput);
+    }
+    if !Arc::ptr_eq(
+        &validate_record_state(&records[old_root_index])?,
+        root_mount,
+    ) {
+        return Err(AxError::Io);
     }
 
     // All allocations and string construction happen before the VFS tree is
@@ -3406,6 +3705,9 @@ pub fn pivot_root_and_records(
         .try_reserve_exact(records.len())
         .map_err(|_| AxError::NoMemory)?;
     for (record_index, record) in records.iter().enumerate() {
+        if record_index == namespace_root_index {
+            continue;
+        }
         let (target, parent_id) = if new_subtree.contains(&record.mount_id) {
             let suffix = path_suffix(new_root_path.as_ref(), &record.target).ok_or(AxError::Io)?;
             let target = if suffix.as_bytes().is_empty() {
@@ -3415,7 +3717,7 @@ pub fn pivot_root_and_records(
             };
             (
                 target,
-                (record.mount_id == new_mount.mount_id()).then_some(0),
+                (record.mount_id == new_mount.mount_id()).then_some(namespace_root.mount_id()),
             )
         } else {
             (
@@ -3427,6 +3729,7 @@ pub fn pivot_root_and_records(
     }
     let plan = plan_mount_mutation(
         &records,
+        authority,
         tk_linux_mount::MountOperation::PivotRoot {
             new_root: tk_linux_mount::MountId::new(new_mount.mount_id())
                 .map_err(|_| AxError::Io)?,
@@ -3448,7 +3751,7 @@ pub fn pivot_root_and_records(
     if let Some(publication) = &publication {
         publication.validate_epoch()?;
     }
-    new_root.pivot_root_to(put_old)?;
+    new_root.pivot_root_to(root_mount, put_old)?;
     if let Some(publication) = publication {
         publication.commit_validated();
     } else {
@@ -3656,6 +3959,7 @@ impl PreparedUnmountPropagation {
                 // unmounting.
                 let _plan = plan_mount_mutation(
                     &records,
+                    syscall_established_authority(),
                     tk_linux_mount::MountOperation::Unmount {
                         mount: tk_linux_mount::MountId::new(mount.id)
                             .map_err(|_| AxError::Io)?,
@@ -4209,6 +4513,76 @@ mod tests {
         assert!(state.mounts[1].unbindable);
     }
 
+    /// The mount namespace shape `init_mount_tree()` builds: the immutable
+    /// nullfs as the namespace root, the mutable rootfs layered on top of it at
+    /// `"/"`, and one extra child mount under the rootfs.
+    ///
+    /// Returns `(namespace_root, rootfs, child, records)`.
+    fn mounted_namespace_root_with_rootfs_and_child() -> (
+        Arc<Mountpoint>,
+        Arc<Mountpoint>,
+        Arc<Mountpoint>,
+        Vec<MountRecord>,
+    ) {
+        let nullfs_filesystem = MemoryFs::new().unwrap();
+        let namespace_root = Mountpoint::new_root(&nullfs_filesystem);
+        let rootfs_filesystem = MemoryFs::new().unwrap();
+        let rootfs = Mountpoint::new_detached_uninitialized(&rootfs_filesystem).unwrap();
+        rootfs
+            .attach_to(&namespace_root.root_location())
+            .unwrap();
+        let rootfs_root = rootfs.root_location();
+        let target = rootfs_root
+            .create(
+                axfs_ng_vfs::FsName::new(b"newroot"),
+                axfs_ng_vfs::NodeType::Directory,
+                axfs_ng_vfs::NodePermission::from_bits_truncate(0o755),
+            )
+            .unwrap();
+        let child_filesystem = MemoryFs::new().unwrap();
+        let child = mount_with_flags(
+            &target,
+            &child_filesystem,
+            0,
+            MountMetadata::try_from_parts(FsPath::new(b"none"), "tmpfs", FsPath::new(b"/"), "")
+                .unwrap(),
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        for (mount, parent, path, fs_type) in [
+            (&namespace_root, 0, "/", "nullfs"),
+            (&rootfs, namespace_root.mount_id(), "/", "tmpfs"),
+            (&child, rootfs.mount_id(), "/newroot", "tmpfs"),
+        ] {
+            let mut record = record(mount.mount_id(), parent, path);
+            record.dev = mount.device();
+            record.fs_type = fs_type.to_string();
+            record.mountpoint = Arc::downgrade(mount);
+            // `mount_with_flags()` already installed the child's state; only
+            // the two mounts this helper built need it here.
+            if !Arc::ptr_eq(mount, &child) {
+                mount
+                    .initialize_extensions(
+                        mount_extensions(
+                            0,
+                            MountMetadata::try_from_parts(
+                                FsPath::new(b"none"),
+                                fs_type,
+                                FsPath::new(b"/"),
+                                "",
+                            )
+                            .unwrap(),
+                            record.mount_id_old,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            records.push(record);
+        }
+        (namespace_root, rootfs, child, records)
+    }
+
     #[test]
     fn pivot_root_same_location_stacks_old_root_and_updates_records() {
         let _context = crate::test_support::scheduler_test_context();
@@ -4220,34 +4594,51 @@ mod tests {
             }
         }
         let _restore = RestoreRecords(core::mem::take(&mut *BOOTSTRAP_MOUNT_RECORDS.lock()));
-        let (old_mount, new_mount, records) = mounted_root_with_child();
+        let (namespace_root, old_mount, new_mount, records) =
+            mounted_namespace_root_with_rootfs_and_child();
         let old_root = old_mount.root_location();
         let new_root = new_mount.root_location();
         publish_bootstrap_records(records);
 
-        pivot_root_and_records(&old_root, &new_root, &new_root).unwrap();
+        pivot_root_and_records(
+            &old_root,
+            &new_root,
+            &new_root,
+            syscall_established_authority(),
+        )
+        .unwrap();
 
-        assert!(new_mount.is_root());
+        // The namespace root stays the immutable nullfs; the new root takes
+        // the old root's place beneath it.
+        assert!(namespace_root.is_root());
+        assert!(!new_mount.is_root());
         assert!(!old_mount.is_root());
         assert!(old_mount.location().unwrap().ptr_eq(&new_root));
         let records = snapshot().unwrap();
-        assert_eq!(records.len(), 2);
-        for record in &records {
-            assert_eq!(record.target.as_bytes(), b"/");
-            assert_eq!(
-                record.parent_id,
-                if record.mount_id == new_mount.mount_id() {
-                    0
-                } else {
-                    new_mount.mount_id()
-                }
-            );
-        }
+        assert_eq!(records.len(), 3);
+        let namespace_root_record = records
+            .iter()
+            .find(|record| record.mount_id == namespace_root.mount_id())
+            .unwrap();
+        assert_eq!(namespace_root_record.parent_id, 0);
+        assert_eq!(namespace_root_record.target.as_bytes(), b"/");
+        let new_record = records
+            .iter()
+            .find(|record| record.mount_id == new_mount.mount_id())
+            .unwrap();
+        assert_eq!(new_record.parent_id, namespace_root.mount_id());
+        assert_eq!(new_record.target.as_bytes(), b"/");
+        let old_record = records
+            .iter()
+            .find(|record| record.mount_id == old_mount.mount_id())
+            .unwrap();
+        assert_eq!(old_record.parent_id, new_mount.mount_id());
+        assert_eq!(old_record.target.as_bytes(), b"/");
         // Like bubblewrap's saved old-root fd, this location still identifies
         // the covered root and permits detaching it without detaching /.
         old_root.lazy_unmount().unwrap();
         assert!(new_root.mounted_child().is_none());
-        assert!(new_mount.is_root());
+        assert!(namespace_root.is_root());
     }
 
     #[test]

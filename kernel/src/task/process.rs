@@ -844,8 +844,12 @@ impl MountNamespace {
         self.topology.clone()
     }
 
+    /// The mount a task rooted in this namespace sees at `"/"`, i.e. Linux
+    /// `vfs_path_lookup(mnt_ns->root, "/", LOOKUP_DOWN, &root)`
+    /// (`fs/namespace.c`:3699-3702).  This is the mutable rootfs, not the
+    /// immutable nullfs that owns `ns->root`.
     pub(crate) fn root_location(&self) -> AxResult<axfs_ng_vfs::Location> {
-        self.topology.root_location()
+        self.topology.visible_root_location()
     }
 
     fn register(namespace: &Arc<Self>) -> AxResult<()> {

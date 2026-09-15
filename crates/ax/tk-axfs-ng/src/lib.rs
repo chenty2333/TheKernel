@@ -1240,8 +1240,23 @@ fn init_filesystems_with_root_mode(
         .expect("failed to bind root filesystem to its block device");
     info!("  filesystem type: {:?}", fs.name());
 
-    let mp = axfs_ng_vfs::Mountpoint::new_root(&fs);
-    let root_context = FsContext::new(mp.root_location());
+    // Linux `init_mount_tree()` (`fs/namespace.c`:6180-6230) builds the initial
+    // mount namespace from two mounts: the immutable `nullfs` (mount ID 1)
+    // becomes `init_mnt_ns.root`, and the mutable `rootfs` (mount ID 2) is
+    // attached on top of it.  `current->fs->root` is the rootfs, so "/" still
+    // resolves to the mutable tree while the absolute root underneath stays
+    // permanently in place.
+    let nullfs = axfs_ng_vfs::nullfs::filesystem().expect("Failed to create nullfs");
+    let namespace_root = axfs_ng_vfs::Mountpoint::new_root(&nullfs);
+    // The extension slot must stay free: the kernel installs this mount's
+    // `LinuxMountState` (mount ID 2) when it publishes the initial ledger.
+    let rootfs = axfs_ng_vfs::Mountpoint::new_detached_uninitialized(&fs)
+        .expect("Failed to allocate the mutable rootfs mount");
+    rootfs
+        .attach_to(&namespace_root.root_location())
+        .expect("VFS: Failed to mount rootfs on nullfs");
+
+    let root_context = FsContext::new(rootfs.root_location());
     ROOT_FS_CONTEXT.call_once(|| root_context.clone());
     let shared = Arc::try_new(Mutex::new(root_context))
         .expect("Failed to allocate root filesystem scope context");

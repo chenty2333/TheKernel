@@ -4441,7 +4441,7 @@ fn resolve_move_mount_path(
             security.clone()
         };
         let fs = if let Some(topology) = topology.as_ref() {
-            FsContext::new(topology.root_location()?).with_current_dir(base)?
+            FsContext::new(topology.visible_root_location()?).with_current_dir(base)?
         } else {
             // A detached tree has no parent namespace.  Its mount root is
             // both root and cwd until move_mount publishes it.
@@ -5187,11 +5187,20 @@ pub fn sys_pivot_root<M: UserMemory + ?Sized>(
     if !current_may_mount() {
         return Err(LinuxError::EPERM.into());
     }
+    // Hand the planner the answer that check produced instead of letting it
+    // assume an authority no caller established.
+    let authority = tk_linux_mount::MountAuthority {
+        administer: true,
+        pivot_root: true,
+        // `path_pivot_root()` never detaches a tree; MNT_DETACH is a
+        // `do_umount()` flag.
+        lazy_unmount: false,
+    };
     // Keep every live task pinned before the irreversible topology commit.
     // The subsequent per-context updates are allocation-free, matching
     // chroot_fs_refs(): only root/cwd references exactly at the old root move.
     let tasks = try_tasks()?;
-    mounts::pivot_root_and_records(&old_root, &new_root_loc, &put_old_loc)?;
+    mounts::pivot_root_and_records(&old_root, &new_root_loc, &put_old_loc, authority)?;
     for task in tasks {
         if let Some(thread) = task.try_as_thread() {
             // A task may have completed exit after its weak registry entry was
@@ -5235,28 +5244,50 @@ pub fn sys_umount2<M: UserMemory + ?Sized>(
     if !target.is_root_of_mount() {
         return Err(AxError::InvalidInput);
     }
-    // `do_umount()` (fs/namespace.c) runs these checks after the lookup and
-    // after `can_umount()`:
-    //     if (flags & MNT_EXPIRE) {
-    //             if (&mnt->mnt == current->fs->root.mnt ||
-    //                 flags & (MNT_FORCE | MNT_DETACH))
-    //                     return -EINVAL;
-    // so an expire request aimed at the filesystem root, or combined with
+    // `can_umount()` (`fs/namespace.c`:2021-2037) runs before `do_umount()`:
+    //     if (!may_mount())                                 -> -EPERM
+    //     if (!path_mounted(path))                          -> -EINVAL
+    //     if (!check_mnt(mnt))                              -> -EINVAL
+    //     if (mnt->mnt.mnt_flags & MNT_LOCKED)              -> -EINVAL
+    //     if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN)) -> -EPERM
+    // The two mount-tree tests therefore decide *every* flag combination
+    // before `do_umount()` looks at `flags`.  That is observable when the
+    // namespace was copied across a user namespace: `copy_mnt_ns()` runs
+    // `lock_mnt_tree(new)` for that case alone (`fs/namespace.c`:4274-4276),
+    // which sets MNT_LOCKED on every descendant of the copied namespace root,
+    // and the rootfs is one of them, so even the plain `umount2("/", 0)` is
+    // -EINVAL instead of taking do_umount()'s "remount the root read-only"
+    // arm.  A same-user-namespace `unshare(CLONE_NEWNS)` locks nothing and
+    // detaches normally.
+    if !mounts::is_in_current_namespace(target.mountpoint())? {
+        return Err(AxError::InvalidInput);
+    }
+    if target.mountpoint().is_placement_locked() {
+        return Err(AxError::InvalidInput);
+    }
+    // `do_umount()` compares against the *filesystem* root, not the namespace
+    // root: `current->fs->root.mnt` is the mutable rootfs that
+    // `init_mount_tree()` layered on top of the immutable nullfs
+    // (`fs/namespace.c`:6212-6223).  After `chroot()` into another mount this
+    // is that mount, which is why Linux remounts it read-only instead of
+    // unmounting the mount namespace's own root.
+    let fs_root_mount = current_fs_context().lock().root_dir().mountpoint().clone();
+    let targets_filesystem_root = Arc::ptr_eq(target.mountpoint(), &fs_root_mount);
+    // `if (flags & MNT_EXPIRE) { if (&mnt->mnt == current->fs->root.mnt ||
+    //         flags & (MNT_FORCE | MNT_DETACH)) return -EINVAL; }`
+    // (`fs/namespace.c`:1885-1888).  This runs before the parent test, so an
+    // expire request aimed at the filesystem root, or combined with
     // FORCE/DETACH, is -EINVAL rather than -EBUSY or a real unmount.
-    if flags & MNT_EXPIRE != 0 && (target.is_root() || flags & (MNT_FORCE | MNT_DETACH) != 0) {
+    if flags & MNT_EXPIRE != 0
+        && (targets_filesystem_root || flags & (MNT_FORCE | MNT_DETACH) != 0)
+    {
         return Err(AxError::InvalidInput);
     }
     // MNT_FORCE only ever calls `sb->s_op->umount_begin()`, and no backend
     // here exposes one, so the bit is a no-op hint exactly as in Linux.
-    if target.is_root() {
-        // `&mnt->mnt == current->fs->root.mnt`: with MNT_DETACH the special
-        // case below is skipped and the later `!mnt_has_parent(mnt)` guard
-        // rejects the namespace root with -EINVAL, since it has no parent to
-        // detach from.
-        if flags & MNT_DETACH != 0 {
-            return Err(AxError::InvalidInput);
-        }
-        // Otherwise Linux "unmounts" the root by trying to remount it
+    if targets_filesystem_root && flags & MNT_DETACH == 0 {
+        // `if (&mnt->mnt == current->fs->root.mnt && !(flags & MNT_DETACH))`:
+        // Linux "unmounts" the filesystem root by trying to remount it
         // read-only:
         //     Special case for "unmounting" root ...
         //     we just try to remount it readonly.
@@ -5282,6 +5313,19 @@ pub fn sys_umount2<M: UserMemory + ?Sized>(
         )?;
         reconcile_current_mount_topology()?;
         return Ok(0);
+    }
+    // `namespace_lock(); lock_mount_hash();
+    //  retval = -EINVAL;
+    //  if (!check_mnt(mnt)) goto out;
+    //  if (mnt->mnt.mnt_flags & MNT_LOCKED) goto out;
+    //  if (!mnt_has_parent(mnt)) /* not the absolute root */ goto out;`
+    // (`fs/namespace.c`:1938-1950).  `can_umount()` already answered the first
+    // two above, so only the parent test is left: the immutable nullfs
+    // namespace root has none, which keeps detaching *it* -EINVAL, while the
+    // mutable rootfs does have one, which is what makes
+    // `umount2("/", MNT_DETACH)` succeed and what switch_root(8) depends on.
+    if !mounts::mount_has_parent(target.mountpoint()) {
+        return Err(AxError::InvalidInput);
     }
     mounts::unmount_and_remove_records(target, flags & MNT_DETACH != 0, flags & MNT_EXPIRE != 0)?;
     reconcile_current_mount_topology()?;

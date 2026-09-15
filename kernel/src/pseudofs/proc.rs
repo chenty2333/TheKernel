@@ -1292,6 +1292,12 @@ fn escape_mount_field(field: &[u8], escaped: &mut Vec<u8>) -> VfsResult<()> {
 fn render_mounts() -> VfsResult<Vec<u8>> {
     let mut out = Vec::new();
     for record in mounts::snapshot()? {
+        // `seq_path_root()` drops records that are not reachable from the
+        // reader's filesystem root, which is what keeps the immutable nullfs
+        // namespace root out of this file.
+        if !mounts::visible_from_filesystem_root(&record) {
+            continue;
+        }
         let options = record_mount_options(&record);
         escape_mount_field(record.source.as_bytes(), &mut out)?;
         out.push(b' ');
@@ -1304,6 +1310,9 @@ fn render_mounts() -> VfsResult<Vec<u8>> {
 fn render_mountinfo() -> VfsResult<Vec<u8>> {
     let mut out = Vec::new();
     for record in mounts::snapshot()? {
+        if !mounts::visible_from_filesystem_root(&record) {
+            continue;
+        }
         let dev = DeviceId(record.dev);
         let options = record_mount_options(&record);
         out.extend_from_slice(

@@ -84,7 +84,7 @@ pub fn init(args: &[String], envs: &[String]) {
             crate::mounts::ROOT_BLOCK_DEVICE_ID,
         )
         .expect("Failed to register root block-device identity");
-        crate::mounts::initialize_root_mount(
+        crate::mounts::initialize_mount_tree(
             root.mountpoint(),
             0,
             crate::mounts::MountMetadata::try_from_parts(
