@@ -449,10 +449,10 @@ pub const RTNLGRP_IPV6_MROUTE_R: u32 = 31;
 /// hook that gates a group of an endpoint TheKernel models:
 ///
 /// ```c
-/// 	case RTNLGRP_IPV4_MROUTE_R:
-/// 	case RTNLGRP_IPV6_MROUTE_R:
-/// 		if (!ns_capable(net->user_ns, CAP_NET_ADMIN))
-/// 			return -EPERM;
+///     case RTNLGRP_IPV4_MROUTE_R:
+///     case RTNLGRP_IPV6_MROUTE_R:
+///         if (!ns_capable(net->user_ns, CAP_NET_ADMIN))
+///             return -EPERM;
 /// ```
 ///
 /// The remaining families either register no hook at all (usersock,
