@@ -14,9 +14,10 @@ use linux_raw_sys::{
     ctypes::{c_ulong, c_ushort},
     general::{CAP_CHOWN, CAP_IPC_OWNER, CAP_SYS_ADMIN, CAP_SYS_RESOURCE, *},
 };
+use tk_linux_ipc::{IpcId, IpcIdTable};
 
 pub use self::{mqueue::*, msg::*, sem::*, shm::*};
-use crate::task::{Cred, Kgid, Kuid, UserNamespace, ns_capable};
+use crate::task::{AsThread, Cred, Kgid, Kuid, UserNamespace, ns_capable};
 
 static IPC_NAMESPACE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -40,7 +41,6 @@ pub(crate) struct IpcNamespace {
     msg_next_id: AtomicI32,
     sem_next_id: AtomicI32,
     shm_next_id: AtomicI32,
-    sequence: AtomicU64,
 }
 
 impl IpcNamespace {
@@ -62,7 +62,6 @@ impl IpcNamespace {
             msg_next_id: AtomicI32::new(-1),
             sem_next_id: AtomicI32::new(-1),
             shm_next_id: AtomicI32::new(-1),
-            sequence: AtomicU64::new(0),
         })
         .map_err(|_| AxError::NoMemory)
     }
@@ -104,8 +103,23 @@ impl IpcNamespace {
         &self.shm_next_id
     }
 
-    pub(crate) fn next_sequence(&self) -> u16 {
-        self.sequence.fetch_add(1, Ordering::Relaxed) as u16
+    /// Whether the caller may write `/proc/sys/kernel/*_next_id`.
+    ///
+    /// Linux `ipc/ipc_sysctl.c:ipc_permissions()` exposes those three files,
+    /// reachable only under `CONFIG_CHECKPOINT_RESTORE`, with mode 0444 and
+    /// upgrades them to writable only for a task that is
+    /// `checkpoint_restore_ns_capable()` over the IPC namespace's user
+    /// namespace.  Arming a chosen identifier is exactly the primitive that
+    /// could otherwise defeat `ipc_checkid()`, so the capability is what keeps
+    /// identifier aliasing a privileged operation.
+    pub(crate) fn may_set_next_id(&self) -> bool {
+        let curr = axtask::current();
+        let thread = curr.as_thread();
+        ns_capable(
+            &thread.current_cred(),
+            self.owner_user_ns(),
+            linux_raw_sys::general::CAP_CHECKPOINT_RESTORE,
+        )
     }
 
     /// Charges an SHM_LOCK pin to the caller's real user.  The returned token
@@ -208,68 +222,25 @@ impl Drop for MqCharge {
     }
 }
 
-/// Allocate a Linux-visible SysV IPC ID while the caller holds its manager
-/// lock. With `n` live IDs, no more than `n + 1` distinct probes are needed
-/// to find a free ID unless the representable ID space is exhausted.
+/// Allocates the next SysV identifier for one object table.
+///
+/// The caller holds the manager lock, so the whole read-decide-register
+/// sequence is atomic with respect to every other lookup in this namespace.
+/// `requested` is the raw `*_next_id` sysctl value: Linux'
+/// `ipc/util.c:ipc_idr_alloc()` consumes it once and then restores `next_id`
+/// to `-1`, which is why the namespace atomic is reset before allocating.
 pub(crate) fn allocate_ipc_id<F>(
-    cursor: &AtomicI32,
-    requested: Option<i32>,
-    occupied_count: usize,
+    next_id: &AtomicI32,
+    table: &mut IpcIdTable,
     is_occupied: F,
-) -> AxResult<i32>
+) -> AxResult<IpcId>
 where
-    F: FnMut(i32) -> bool,
+    F: Fn(i32) -> bool,
 {
-    allocate_ipc_id_in_range(cursor, requested, occupied_count, i32::MAX, is_occupied)
-}
-
-fn allocate_ipc_id_in_range<F>(
-    cursor: &AtomicI32,
-    requested: Option<i32>,
-    occupied_count: usize,
-    maximum: i32,
-    mut is_occupied: F,
-) -> AxResult<i32>
-where
-    F: FnMut(i32) -> bool,
-{
-    debug_assert!(maximum >= 0);
-    if let Some(id) = requested
-        && id >= 0
-        && id <= maximum
-        && !is_occupied(id)
-    {
-        return Ok(id);
-    }
-
-    let probes = (occupied_count as u64)
-        .saturating_add(1)
-        .min(maximum as u64 + 1);
-    for _ in 0..probes {
-        let previous = cursor
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                let candidate = if current < 0 || current > maximum {
-                    0
-                } else {
-                    current
-                };
-                Some(if candidate == maximum {
-                    0
-                } else {
-                    candidate + 1
-                })
-            })
-            .unwrap_or(0);
-        let id = if previous < 0 || previous > maximum {
-            0
-        } else {
-            previous
-        };
-        if !is_occupied(id) {
-            return Ok(id);
-        }
-    }
-    Err(AxError::from(LinuxError::ENOSPC))
+    let requested = next_id.swap(-1, Ordering::Relaxed);
+    table
+        .allocate((requested >= 0).then_some(requested), is_occupied)
+        .map_err(|_| AxError::from(LinuxError::ENOSPC))
 }
 
 // IPC command constants
@@ -637,7 +608,9 @@ impl PreparedIpcPermissionUpdate {
 #[cfg(test)]
 mod credential_caller_tests {
     use alloc::{collections::BTreeSet, sync::Arc};
-    use core::sync::atomic::AtomicI32;
+    use core::sync::atomic::{AtomicI32, Ordering};
+
+    use tk_linux_ipc::{IPC_MIN_CYCLE, IPCMNI, ipcid_compose, ipcid_to_seqx};
 
     use super::*;
     use crate::task::{Cred, UserNamespace};
@@ -852,52 +825,90 @@ mod credential_caller_tests {
     }
 
     #[test]
-    fn ipc_id_allocator_wraps_without_negative_ids_and_skips_live_ids() {
-        let cursor = AtomicI32::new(i32::MAX - 1);
-        assert_eq!(
-            allocate_ipc_id_in_range(&cursor, None, 0, i32::MAX, |_| false),
-            Ok(i32::MAX - 1)
-        );
-        assert_eq!(
-            allocate_ipc_id_in_range(&cursor, None, 0, i32::MAX, |_| false),
-            Ok(i32::MAX)
-        );
-        assert_eq!(
-            allocate_ipc_id_in_range(&cursor, None, 1, i32::MAX, |id| id == 0),
-            Ok(1)
-        );
-
-        let negative_cursor = AtomicI32::new(-7);
-        assert_eq!(
-            allocate_ipc_id_in_range(&negative_cursor, None, 0, 7, |_| false),
-            Ok(0)
-        );
-        assert_eq!(
-            allocate_ipc_id_in_range(&AtomicI32::new(3), Some(-1), 0, 7, |_| false,),
-            Ok(3)
-        );
-    }
-
-    #[test]
-    fn ipc_id_allocator_rejects_a_full_test_range_without_unbounded_scan() {
-        let cursor = AtomicI32::new(0);
-        assert_eq!(
-            allocate_ipc_id_in_range(&cursor, None, 4, 3, |_| true),
-            Err(AxError::from(LinuxError::ENOSPC))
-        );
-    }
-
-    #[test]
-    fn ipc_id_allocation_and_publication_sequence_never_reuses_a_live_id() {
-        let cursor = AtomicI32::new(0);
-        let mut live = BTreeSet::new();
-        for _ in 0..8 {
-            let id = allocate_ipc_id_in_range(&cursor, None, live.len(), 7, |candidate| {
+    fn ipc_id_allocator_hands_out_sequential_identifiers() {
+        let next_id = AtomicI32::new(-1);
+        let mut table = IpcIdTable::new();
+        let mut live: BTreeSet<i32> = BTreeSet::new();
+        for expected in 0..8 {
+            let id = allocate_ipc_id(&next_id, &mut table, |candidate| {
                 live.contains(&candidate)
             })
             .unwrap();
-            assert!(live.insert(id));
+            assert_eq!(id.index(), expected);
+            assert_eq!(id.sequence(), 0);
+            // The published identifier is the index while the sequence is 0.
+            assert_eq!(id.raw(), expected);
+            assert!(live.insert(id.index()));
         }
-        assert_eq!(live.len(), 8);
+        assert_eq!(table.in_use(), 8);
+        assert_eq!(table.max_index(), 7);
+    }
+
+    /// Regression: the production wrappers must not hand back a retired
+    /// identifier.  The previous allocator reset its cursor with
+    /// `swap(-1)` on every call, so removing the lowest identifier and
+    /// creating again reissued it immediately and a stale handle resolved to
+    /// the successor object.
+    #[test]
+    fn ipc_id_allocator_does_not_reissue_a_retired_identifier() {
+        let next_id = AtomicI32::new(-1);
+        let mut table = IpcIdTable::new();
+        let mut live: BTreeSet<i32> = BTreeSet::new();
+        let first = allocate_ipc_id(&next_id, &mut table, |candidate| live.contains(&candidate))
+            .unwrap();
+        let second =
+            allocate_ipc_id(&next_id, &mut table, |candidate| live.contains(&candidate)).unwrap();
+        assert_eq!((first.index(), second.index()), (0, 1));
+        live.remove(&first.index());
+        table.release(first.index(), |candidate| live.contains(&candidate));
+        let third = allocate_ipc_id(&next_id, &mut table, |candidate| live.contains(&candidate))
+            .unwrap();
+        assert_eq!(third.index(), 2, "index 0 must stay retired");
+        assert_ne!(third.raw(), first.raw());
+        assert_eq!(ipcid_to_seqx(first.raw()), 0);
+        assert_eq!(ipcid_to_seqx(third.raw()), third.sequence());
+    }
+
+    #[test]
+    fn ipc_id_allocator_advances_the_sequence_when_the_window_wraps() {
+        let next_id = AtomicI32::new(-1);
+        let mut table = IpcIdTable::new();
+        // Churn the whole `ipc_min_cycle` window so the cursor reaches its end
+        // while the table never grows, exactly like a create/remove loop.
+        for expected in 0..IPC_MIN_CYCLE {
+            let id = allocate_ipc_id(&next_id, &mut table, |_| false).unwrap();
+            assert_eq!(id.index(), expected);
+            assert_eq!(id.sequence(), 0);
+            table.release(id.index(), |_| false);
+        }
+        let wrapped = allocate_ipc_id(&next_id, &mut table, |_| false).unwrap();
+        assert_eq!(wrapped.index(), 0);
+        assert_eq!(wrapped.sequence(), 1);
+        assert_eq!(wrapped.raw(), IPCMNI);
+    }
+
+    #[test]
+    fn ipc_id_allocator_reports_exhaustion_instead_of_reusing_a_live_id() {
+        let next_id = AtomicI32::new(-1);
+        let mut table = IpcIdTable::new();
+        assert_eq!(
+            allocate_ipc_id(&next_id, &mut table, |_| true),
+            Err(AxError::from(LinuxError::ENOSPC))
+        );
+        assert_eq!(table.in_use(), 0);
+    }
+
+    #[test]
+    fn ipc_id_allocator_consumes_next_id_once_and_keeps_its_sequence() {
+        let next_id = AtomicI32::new(ipcid_compose(5, 2));
+        let mut table = IpcIdTable::new();
+        let requested = allocate_ipc_id(&next_id, &mut table, |_| false).unwrap();
+        assert_eq!(requested.raw(), ipcid_compose(5, 2));
+        // Linux `ipc_idr_alloc()` restores `next_id` to -1 after consuming it,
+        // so the following create is an ordinary cyclic allocation.
+        assert_eq!(next_id.load(Ordering::Relaxed), -1);
+        let following = allocate_ipc_id(&next_id, &mut table, |_| false).unwrap();
+        assert_eq!(following.index(), 0);
+        assert_eq!(following.sequence(), 0);
     }
 }

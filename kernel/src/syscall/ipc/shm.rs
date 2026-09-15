@@ -19,6 +19,10 @@ use linux_raw_sys::{
 use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 #[cfg(all(test, not(target_os = "none")))]
 pub(super) use spin::Mutex;
+use tk_linux_ipc::{
+    IpcId, IpcIdTable, ipcid_compose, ipcid_is_stale, ipcid_to_idx, shm_creation_plan,
+    shm_supports_huge_page_hint,
+};
 use tk_linux_process_adapter::Pid;
 use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
@@ -38,7 +42,6 @@ use crate::{
 };
 
 const IPC_MODE_MASK: __kernel_mode_t = 0o777;
-const SHM_HUGETLB_FLAG: usize = 0o4000;
 const MAX_SHM_ATTACHMENTS: usize = 65_536;
 const SHMLBA: usize = PAGE_SIZE_4K;
 
@@ -455,6 +458,14 @@ pub struct ShmInner {
     pub shmid_ds: ShmidDs,
     /// Retains the namespace-local RLIMIT_MEMLOCK charge while SHM_LOCK is set.
     lock_charge: Option<ShmLockCharge>,
+    /// `SHM_NORESERVE` was requested for this segment.
+    ///
+    /// Linux records the flag in the segment's VMA flags so that its swap
+    /// reservation is skipped when overcommit is not `OVERCOMMIT_NEVER`.
+    /// TheKernel has no swap and reserves nothing beyond the frames it
+    /// actually obtains, so the flag changes no accounting here; it is kept on
+    /// the segment so the request is not silently reinterpreted.
+    pub no_reserve: bool,
 }
 
 impl ShmInner {
@@ -480,6 +491,7 @@ impl ShmInner {
             mapping_flags,
             shmid_ds: ShmidDs::new(key, size, perm_mode, pid as __kernel_pid_t, uid, gid),
             lock_charge: None,
+            no_reserve: false,
         }
     }
 
@@ -826,9 +838,9 @@ where
 /// processes. note: this struct do not modify the struct ShmInner, but only
 /// manage the mapping.
 pub struct ShmManager {
-    /// key <-> shm_id
+    /// key <-> published shmid
     key_shmid: BiBTreeMap<i32, i32>,
-    /// shm_id -> shm_inner
+    /// index -> shm_inner, exactly `shm_ids(ns).ipcs_idr`
     shmid_inner: HashMap<i32, Arc<Mutex<ShmInner>>>,
     /// Total pages reserved by live segments, including segments awaiting
     /// their final detach after IPC_RMID.
@@ -837,6 +849,8 @@ pub struct ShmManager {
     /// but filtered by every reader until their shared publication bit flips.
     pid_vaddr_shmid: HashMap<Pid, ProcessAttachmentMap<ShmAttachmentRecord>>,
     attachment_count: usize,
+    /// Linux `struct ipc_ids` bookkeeping for this table.
+    ids: IpcIdTable,
 }
 
 impl ShmManager {
@@ -847,6 +861,7 @@ impl ShmManager {
             total_pages: 0,
             pid_vaddr_shmid: HashMap::new(),
             attachment_count: 0,
+            ids: IpcIdTable::new(),
         }
     }
 
@@ -855,10 +870,35 @@ impl ShmManager {
         self.key_shmid.get_by_key(&key).cloned()
     }
 
+    /// Allocates the identifier for a new segment.  The caller holds the
+    /// manager lock, which is this table's `ipc_ids.rwsem`.
+    fn allocate_id(&mut self, next_id: &AtomicI32) -> AxResult<IpcId> {
+        let segments = &self.shmid_inner;
+        allocate_ipc_id(next_id, &mut self.ids, |index| segments.contains_key(&index))
+    }
+
+    /// Linux `ipc_obtain_object_idr()`: resolve an index without consulting
+    /// its sequence number, which is what `SHM_STAT`/`SHM_STAT_ANY` need.
+    pub fn get_inner_by_index(&self, index: i32) -> Option<Arc<Mutex<ShmInner>>> {
+        self.shmid_inner.get(&index).cloned()
+    }
+
     /// Returns the shared memory inner structure [`ShmInner`] associated with
     /// the given shared memory ID.
+    ///
+    /// Linux `ipc_obtain_object_check()`: the index must exist *and* its
+    /// stored sequence must match the identifier, so a retired shmid cannot
+    /// resolve to a segment that later reused the index.
     pub fn get_inner_by_shmid(&self, shmid: i32) -> Option<Arc<Mutex<ShmInner>>> {
-        self.shmid_inner.get(&shmid).cloned()
+        if shmid < 0 {
+            return None;
+        }
+        let inner = self.get_inner_by_index(ipcid_to_idx(shmid))?;
+        let sequence = inner.lock().shmid_ds.shm_perm.seq as i32;
+        if ipcid_is_stale(shmid, sequence) {
+            return None;
+        }
+        Some(inner)
     }
 
     pub fn active_segment_count(&self) -> usize {
@@ -869,16 +909,34 @@ impl ShmManager {
         self.total_pages
     }
 
+    /// Linux `ipc/shm.c:shm_get_stat()`: the frames of this namespace that are
+    /// actually resident, as opposed to merely reserved by `shm_tot`.
+    ///
+    /// A segment obtains its frames when its first attachment publishes them,
+    /// so until then it holds none.
+    pub fn resident_page_count(&self) -> usize {
+        self.shmid_inner
+            .values()
+            .map(|inner| {
+                let inner = inner.lock();
+                if inner.phys_pages.is_some() || inner.pending_first_pages.is_some() {
+                    inner.page_num
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
     pub fn contains_shmid(&self, shmid: i32) -> bool {
-        self.shmid_inner.contains_key(&shmid)
+        self.get_inner_by_shmid(shmid).is_some()
     }
 
     pub fn max_active_index(&self) -> isize {
-        self.shmid_inner
-            .keys()
-            .map(|&shmid| shmid as isize)
-            .max()
-            .unwrap_or(0)
+        // Linux `ipc_get_maxidx()` reports -1 for an empty table and the
+        // syscalls map that to 0.  Segments awaiting their final detach are
+        // still in the IDR, so they keep counting towards the maximum.
+        self.ids.max_index().max(0) as isize
     }
 
     /// Returns the shared memory ID associated with the given pid and virtual
@@ -934,7 +992,7 @@ impl ShmManager {
     /// structure [`ShmInner`].
     pub fn insert_shmid_inner(
         &mut self,
-        shmid: i32,
+        index: i32,
         page_num: usize,
         shm_inner: Arc<Mutex<ShmInner>>,
     ) -> AxResult<()> {
@@ -942,11 +1000,11 @@ impl ShmManager {
             .total_pages
             .checked_add(page_num)
             .ok_or(AxError::NoMemory)?;
-        if self.shmid_inner.contains_key(&shmid) {
+        if self.shmid_inner.contains_key(&index) {
             return Err(AxError::InvalidInput);
         }
-        let old = self.shmid_inner.insert(shmid, shm_inner);
-        debug_assert!(old.is_none(), "duplicate shared memory ID {shmid}");
+        let old = self.shmid_inner.insert(index, shm_inner);
+        debug_assert!(old.is_none(), "duplicate shared memory index {index}");
         self.total_pages = total_pages;
         Ok(())
     }
@@ -1043,9 +1101,10 @@ impl ShmManager {
         }
     }
 
-    /// Removes the shared memory segment.
+    /// Removes the shared memory segment named by its published identifier.
     pub fn remove_shmid(&mut self, shmid: i32, page_num: usize) -> AxResult<()> {
-        if !self.shmid_inner.contains_key(&shmid) {
+        let index = ipcid_to_idx(shmid);
+        if !self.shmid_inner.contains_key(&index) {
             return Ok(());
         }
         let total_pages = self
@@ -1053,10 +1112,15 @@ impl ShmManager {
             .checked_sub(page_num)
             .ok_or(AxError::BadState)?;
         self.key_shmid.remove_by_value(&shmid);
-        if self.shmid_inner.remove(&shmid).is_none() {
+        if self.shmid_inner.remove(&index).is_none() {
             return Err(AxError::BadState);
         }
         self.total_pages = total_pages;
+        // Linux `ipc_rmid()` updates the cached highest index after the IDR
+        // removal, which `SHM_INFO`/`IPC_INFO` report.
+        let segments = &self.shmid_inner;
+        self.ids
+            .release(index, |candidate| segments.contains_key(&candidate));
         // Per-process attach maps are cleaned on shmdt/exit. IPC_RMID only
         // removes the segment once the last attach has gone away.
         Ok(())
@@ -2422,15 +2486,6 @@ pub(crate) fn clear_proc_shm_in_namespace(namespace: &IpcNamespace, pid: Pid) {
     clear_proc_shm_in(namespace.shm_transaction(), namespace.shm_manager(), pid)
 }
 
-fn allocate_shm_id(shm_manager: &ShmManager, cursor: &AtomicI32) -> AxResult<i32> {
-    let desired = cursor.swap(-1, Ordering::Relaxed);
-    allocate_ipc_id(
-        cursor,
-        (desired >= 0).then_some(desired),
-        shm_manager.shmid_inner.len(),
-        |id| shm_manager.contains_shmid(id),
-    )
-}
 
 pub(crate) fn shm_next_id() -> i32 {
     let curr = current();
@@ -2441,14 +2496,18 @@ pub(crate) fn shm_next_id() -> i32 {
 }
 
 pub(crate) fn set_shm_next_id(value: i32) -> AxResult<()> {
-    if value < -1 {
+    // Linux `ipc/ipc_sysctl.c`: `proc_dointvec_minmax` over `[0, INT_MAX]`,
+    // writable only for a task that is `checkpoint_restore_ns_capable()` over
+    // the IPC namespace's user namespace.
+    if value < 0 {
         return Err(AxError::from(LinuxError::EINVAL));
     }
     let curr = current();
-    curr.as_thread()
-        .ipc_ns()
-        .next_shm_id()
-        .store(value, Ordering::Relaxed);
+    let ipc_ns = curr.as_thread().ipc_ns();
+    if !ipc_ns.may_set_next_id() {
+        return Err(AxError::from(LinuxError::EPERM));
+    }
+    ipc_ns.next_shm_id().store(value, Ordering::Relaxed);
     Ok(())
 }
 
@@ -2471,7 +2530,7 @@ pub(crate) fn sysvipc_shm_snapshot() -> AxResult<String> {
             manager
                 .shmid_inner
                 .iter()
-                .map(|(&shmid, inner)| (shmid, inner.clone())),
+                .map(|(_, inner)| (inner.lock().shmid, inner.clone())),
         );
     }
     let capacity = segment_count
@@ -2484,6 +2543,8 @@ pub(crate) fn sysvipc_shm_snapshot() -> AxResult<String> {
     out.push_str(HEADER);
     for (shmid, shm_inner) in segments {
         let shm_inner = shm_inner.lock();
+        // The published identifier, not the table index: `ipcs` prints it and
+        // round-trips it into `shmctl`.
         let ds = shm_inner.visible_snapshot();
         let rss_bytes = shm_inner.page_num.saturating_mul(PAGE_SIZE_4K);
         writeln!(
@@ -2516,7 +2577,11 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
     let perm_mode = (shmflg as __kernel_mode_t) & IPC_MODE_MASK;
     let create = shmflg & IPC_CREAT as usize != 0;
     let excl = shmflg & IPC_EXCL as usize != 0;
-    let huge = shmflg & SHM_HUGETLB_FLAG != 0;
+    // Linux `newseg()` decodes `SHM_HUGETLB`, the `SHM_HUGE_*` size hint and
+    // `SHM_NORESERVE` on the create path.  TheKernel has no overcommit modes,
+    // so the `OVERCOMMIT_NEVER` exception that drops `SHM_NORESERVE` never
+    // applies.
+    let creation = shm_creation_plan(shmflg as u32, false);
 
     let mut mapping_flags = MappingFlags::USER;
     if perm_mode & 0o444 != 0 {
@@ -2538,9 +2603,6 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
     let euid = context.effective_uid_raw();
     let egid = context.effective_gid_raw();
 
-    if huge {
-        return Err(AxError::from(LinuxError::EINVAL));
-    }
     let _transaction = ipc_ns.shm_transaction().lock();
 
     if key != IPC_PRIVATE {
@@ -2582,8 +2644,16 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
     {
         return Err(AxError::from(LinuxError::ENOSPC));
     }
+    if creation.hugetlb && !shm_supports_huge_page_hint(creation.huge_hint) {
+        // `newseg()` rejects a huge-page request whose hint resolves to no
+        // configured size class.  Only the create path rejects it: a lookup of
+        // an existing key resolves the segment above and returns it, which is
+        // what Linux does because `newseg()` never runs for an existing key.
+        return Err(AxError::from(LinuxError::EINVAL));
+    }
     manager.try_reserve_segment(key != IPC_PRIVATE)?;
-    let shmid = allocate_shm_id(&manager, ipc_ns.next_shm_id())?;
+    let id = manager.allocate_id(ipc_ns.next_shm_id())?;
+    let shmid = id.raw();
 
     let mut inner = ShmInner::new(
         key,
@@ -2595,9 +2665,10 @@ pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
         euid,
         egid,
     );
-    inner.shmid_ds.shm_perm.seq = ipc_ns.next_sequence();
+    inner.shmid_ds.shm_perm.seq = id.sequence() as _;
+    inner.no_reserve = creation.no_reserve;
     let shm_inner = Arc::try_new(Mutex::new(inner)).map_err(|_| AxError::NoMemory)?;
-    manager.insert_shmid_inner(shmid, page_num, shm_inner)?;
+    manager.insert_shmid_inner(id.index(), page_num, shm_inner)?;
     if key != IPC_PRIVATE {
         manager.insert_key_shmid(key, shmid);
     }
@@ -2863,6 +2934,13 @@ pub fn sys_shmctl<M: UserMemory + ?Sized>(
     let context = IpcAccessContext::for_ipc_namespace(curr.as_thread().current_cred(), &ipc_ns);
     let cmd = cmd as i32;
 
+    // Linux `ksys_shmctl()`: `if (cmd < 0 || shmid < 0) return -EINVAL;`, before
+    // the switch, so the table-wide IPC_INFO/SHM_INFO commands reject a
+    // negative identifier too.
+    if cmd < 0 || shmid < 0 {
+        return Err(AxError::InvalidInput);
+    }
+
     if cmd == IPC_INFO {
         let info = IpcInfo {
             shmmax: shmmax_limit() as c_ulong,
@@ -2886,12 +2964,13 @@ pub fn sys_shmctl<M: UserMemory + ?Sized>(
         let (info, index) = {
             let _transaction = ipc_ns.shm_transaction().lock();
             let manager = ipc_ns.shm_manager().lock();
-            let pages = manager.total_page_count() as c_ulong;
             (
                 ShmUsageInfo {
                     used_ids: manager.active_segment_count() as i32,
-                    shm_tot: pages,
-                    shm_rss: pages,
+                    // `shm_tot` is what the segments reserved; `shm_rss` is
+                    // what is actually resident.
+                    shm_tot: manager.total_page_count() as c_ulong,
+                    shm_rss: manager.resident_page_count() as c_ulong,
                     shm_swp: 0,
                     swap_attempts: 0,
                     swap_successes: 0,
@@ -2904,21 +2983,31 @@ pub fn sys_shmctl<M: UserMemory + ?Sized>(
     }
 
     if cmd == SHM_STAT || cmd == SHM_STAT_ANY {
-        let snapshot = {
+        // Linux `shmctl_stat()`: these two commands take an *index* and
+        // `shm_obtain_object()` resolves it without consulting the sequence
+        // number.  They answer with the segment's full identifier so a caller
+        // iterating by index learns the sequence it must use next.  A segment
+        // that is only marked `SHM_DEST` is still a valid object and is
+        // reported until its last attachment goes away.
+        let index = ipcid_to_idx(shmid);
+        let (snapshot, published) = {
             let _transaction = ipc_ns.shm_transaction().lock();
             let shm_inner = ipc_ns
                 .shm_manager()
                 .lock()
-                .get_inner_by_shmid(shmid)
+                .get_inner_by_index(index)
                 .ok_or(AxError::InvalidInput)?;
             let state = shm_inner.lock();
             if cmd == SHM_STAT && !context.allows(&state.shmid_ds.shm_perm, IpcAccess::Read) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
-            state.visible_snapshot()
+            (
+                state.visible_snapshot(),
+                ipcid_compose(index, state.shmid_ds.shm_perm.seq as i32),
+            )
         };
         write_shmid_ds(memory, buf as *mut ShmidDs, &snapshot)?;
-        return Ok(shmid as isize);
+        return Ok(published as isize);
     }
 
     // Preserve the old lookup-before-copyin errno ordering, but do not keep
@@ -2992,6 +3081,12 @@ pub fn sys_shmctl<M: UserMemory + ?Sized>(
         if state.lock_charge.is_none() && !context.bypasses_shm_memlock_limit() {
             let thread = curr.as_thread();
             let limit = thread.proc_data.rlim.read()[RLIMIT_MEMLOCK].current;
+            // Linux `shmctl_do_lock()`: an unprivileged caller cannot lock any
+            // segment once its RLIMIT_MEMLOCK is zero.  `RLIM_INFINITY` is
+            // nonzero and passes through to the charge below.
+            if limit == 0 {
+                return Err(AxError::from(LinuxError::EPERM));
+            }
             let bytes = state
                 .page_num
                 .checked_mul(PAGE_SIZE_4K)
@@ -3176,6 +3271,7 @@ mod tests {
                 unused5: 0,
             },
             lock_charge: None,
+            no_reserve: false,
         }))
     }
 
@@ -3515,6 +3611,45 @@ mod tests {
 
         manager.remove_shmid(shmid, page_num).unwrap();
         assert!(!manager.contains_shmid(shmid));
+        assert_eq!(manager.total_page_count(), 0);
+    }
+
+    /// Regression: the segment table used to be keyed by the published
+    /// identifier with nothing validating the sequence, and only a flat index
+    /// was ever reported back.
+    #[test]
+    fn segment_lookup_validates_the_sequence_and_stat_uses_the_index() {
+        let index = 5;
+        let sequence = 3;
+        let published = ipcid_compose(index, sequence);
+        let inner = test_segment(1, published, 1);
+        inner.lock().shmid_ds.shm_perm.seq = sequence as _;
+        let mut manager = ShmManager::new();
+
+        assert_eq!(
+            manager.allocate_id(&AtomicI32::new(published)),
+            Ok(IpcId::from_parts(index, sequence))
+        );
+        manager.insert_shmid_inner(index, 1, inner.clone()).unwrap();
+
+        assert!(manager.get_inner_by_shmid(published).is_some());
+        // The index alone is not the published identifier...
+        assert!(manager.get_inner_by_shmid(index).is_none());
+        // ...and a different sequence does not resolve it either.
+        assert!(
+            manager
+                .get_inner_by_shmid(ipcid_compose(index, sequence + 1))
+                .is_none()
+        );
+        // `SHM_STAT` resolves the index regardless of the sequence.
+        assert!(manager.get_inner_by_index(index).is_some());
+        assert_eq!(manager.max_active_index(), index as isize);
+        // A segment that was never attached holds no resident frames.
+        assert_eq!(manager.resident_page_count(), 0);
+
+        manager.remove_shmid(published, 1).unwrap();
+        assert!(manager.get_inner_by_index(index).is_none());
+        assert_eq!(manager.max_active_index(), 0);
         assert_eq!(manager.total_page_count(), 0);
     }
 

@@ -3651,7 +3651,19 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
             .ok_or(VfsError::InvalidInput)
     }
 
-    fn is_proc_truncate_write(data: &[u8]) -> bool {
+    /// Maps the `*_next_id` write failure onto the syscall error Linux reports.
+///
+/// Linux guards those files with `checkpoint_restore_ns_capable()`, so a
+/// caller without `CAP_CHECKPOINT_RESTORE` gets EPERM; a value outside the
+/// writable range is EINVAL.
+fn next_id_write_error(error: AxError) -> VfsError {
+    match error {
+        AxError::OperationNotPermitted => VfsError::PermissionDenied,
+        _ => VfsError::InvalidInput,
+    }
+}
+
+fn is_proc_truncate_write(data: &[u8]) -> bool {
         data.iter().all(|byte| byte.is_ascii_whitespace())
     }
 
@@ -4616,7 +4628,7 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
                                 return Ok(None);
                             }
                             let value = write_proc_i32(data)?;
-                            set_msg_next_id(value).map_err(|_| VfsError::InvalidInput)?;
+                            set_msg_next_id(value).map_err(next_id_write_error)?;
                             Ok(None)
                         }
                     }),
@@ -4653,7 +4665,7 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
                                 return Ok(None);
                             }
                             let value = write_proc_i32(data)?;
-                            set_sem_next_id(value).map_err(|_| VfsError::InvalidInput)?;
+                            set_sem_next_id(value).map_err(next_id_write_error)?;
                             Ok(None)
                         }
                     }),
@@ -4691,7 +4703,7 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
                                 return Ok(None);
                             }
                             let value = write_proc_i32(data)?;
-                            set_shm_next_id(value).map_err(|_| VfsError::InvalidInput)?;
+                            set_shm_next_id(value).map_err(next_id_write_error)?;
                             Ok(None)
                         }
                     }),

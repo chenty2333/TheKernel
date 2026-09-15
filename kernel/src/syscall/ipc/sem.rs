@@ -14,7 +14,10 @@ use linux_raw_sys::{
     ctypes::{c_int, c_ulong, c_ushort},
     general::*,
 };
-use tk_linux_ipc::{SemBuf as AbiSemBuf, plan_sem_op};
+use tk_linux_ipc::{
+    IpcId, IpcIdTable, SemBuf as AbiSemBuf, SemPlan, ipcid_compose, ipcid_is_stale, ipcid_to_idx,
+    plan_sem_op, sem_undo_delta_in_range,
+};
 use tk_linux_usercopy::{
     UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
 };
@@ -42,6 +45,14 @@ const SEMAEM: usize = SEMVMX;
 const SEMUME: usize = SEMOPM;
 const SEMUSZ: usize = 20;
 
+/// Never-reused identity source for `SemArray::serial`.  A wrap would require
+/// 2^64 array creations, and `fetch_add` wraps rather than panicking.
+static SEM_ARRAY_SERIAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn next_sem_array_serial() -> u64 {
+    SEM_ARRAY_SERIAL.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Adjustment values owned by one Linux `sem_undo` list.
 ///
 /// `CLONE_SYSVSEM` shares the `Arc<Mutex<SemUndo>>` supplied by the namespace
@@ -56,6 +67,12 @@ pub(crate) struct SemUndo {
 struct SemAdjustment {
     value: i32,
     generation: u64,
+    /// Identity of the array this adjustment was recorded against.  Linux
+    /// `freeary()` clears every undo entry that named an array it removed, and
+    /// `exit_sem()` re-checks the array after re-obtaining it, so an
+    /// adjustment must never reach a *different* array that happens to reuse
+    /// the identifier.
+    serial: u64,
 }
 
 impl SemUndo {
@@ -71,6 +88,16 @@ impl SemUndo {
         Ok(Self { entries })
     }
 
+    /// Linux `sem_undo.semadj[sem_num]`: the adjustment accumulated so far for
+    /// one semaphore of one array.  An entry that belongs to a different array
+    /// instance or was cleared by `SETVAL` reads as zero.
+    fn prior(&self, semid: i32, serial: u64, semnum: u16) -> i32 {
+        self.entries
+            .get(&(semid, semnum))
+            .filter(|entry| entry.serial == serial)
+            .map_or(0, |entry| entry.value)
+    }
+
     /// Reserve every new undo key an operation can commit before the
     /// semaphore values are changed.  `semop` is atomic: an allocation or
     /// SEMUME failure must not be observed after any member of the operation
@@ -80,14 +107,13 @@ impl SemUndo {
     fn prepare_records(&mut self, semid: i32, ops: &[Sembuf]) -> AxResult<()> {
         let mut additional = 0usize;
         for (index, op) in ops.iter().enumerate() {
-            if op.sem_flg & SEM_UNDO == 0 || op.sem_op == 0 {
+            if !plan_sem_op(abi_sem_buf(op)).records_undo() {
                 continue;
             }
             let key = (semid, op.sem_num);
             if self.entries.contains_key(&key)
                 || ops[..index].iter().any(|prior| {
-                    prior.sem_flg & SEM_UNDO != 0
-                        && prior.sem_op != 0
+                    plan_sem_op(abi_sem_buf(prior)).records_undo()
                         && prior.sem_num == op.sem_num
                 })
             {
@@ -106,43 +132,97 @@ impl SemUndo {
     }
 
     /// Records the inverse adjustment for one successfully completed SEM_UNDO
-    /// operation. Linux clamps an adjustment instead of overflowing it.
+    /// operation.
+    ///
+    /// Linux `ipc/sem.c:perform_atomic_semop()` rejects an adjustment outside
+    /// `[-SEMAEM - 1, SEMAEM]` with ERANGE instead of clamping it; the caller
+    /// has already made the same check while validating the operation vector,
+    /// so this is the transactional backstop rather than the error path.
     pub(crate) fn record(
         &mut self,
         semid: i32,
         semnum: u16,
         sem_op: i16,
         generation: u64,
+        serial: u64,
     ) -> AxResult<()> {
-        if sem_op == 0 {
-            return Ok(());
-        }
-        let delta = -(sem_op as i32);
-        let key = (semid, semnum);
         let prior = self
             .entries
-            .get(&key)
-            .filter(|entry| entry.generation == generation)
+            .get(&(semid, semnum))
+            .filter(|entry| entry.serial == serial && entry.generation == generation)
             .map_or(0, |entry| entry.value);
-        let next = prior
-            .saturating_add(delta)
-            .clamp(-(SEMAEM as i32), SEMAEM as i32);
-        if !self.entries.contains_key(&key) {
-            if self.entries.len() >= SEMUME {
-                return Err(AxError::from(LinuxError::ENOSPC));
-            }
-            // `sys_semtimedop` has already reserved this exact key while the
-            // same undo mutex was held.  Do not perform a fallible allocation
-            // after mutating the semaphore array: that would break semop's
-            // all-or-nothing contract.
+        if !sem_undo_delta_in_range(prior, sem_op) {
+            return Err(AxError::from(LinuxError::ERANGE));
         }
+        let key = (semid, semnum);
+        if !self.entries.contains_key(&key) && self.entries.len() >= SEMUME {
+            return Err(AxError::from(LinuxError::ENOSPC));
+        }
+        // Linux writes the identity for a wait-for-zero, which cannot change
+        // the accumulated adjustment.
         self.entries.insert(
             key,
             SemAdjustment {
-                value: next,
+                value: prior - sem_op as i32,
                 generation,
+                serial,
             },
         );
+        Ok(())
+    }
+}
+
+/// The highest semaphore number one `semop` vector names.
+///
+/// Linux `__do_semtimedop()` accumulates `max` over the vector while it
+/// copies it in and bounds it against `sma->sem_nsems` with EFBIG before it
+/// checks permission.
+fn highest_sem_num(ops: &[Sembuf]) -> u16 {
+    ops.iter().map(|op| op.sem_num).max().unwrap_or(0)
+}
+
+/// Translates one userspace `sembuf` into the ABI crate's view.
+fn abi_sem_buf(op: &Sembuf) -> AbiSemBuf {
+    AbiSemBuf {
+        num: op.sem_num,
+        op: op.sem_op,
+        flags: op.sem_flg,
+    }
+}
+
+/// The `SEM_UNDO` state one semop vector is validated against.
+///
+/// Linux `perform_atomic_semop()` walks the operation vector once, checking
+/// each operation's semaphore value *and* its deferred adjustment in order,
+/// and only then commits.  Staging the adjustments here reproduces that pass
+/// without touching the process's undo list until the vector succeeds; a
+/// repeated `sem_num` accumulates exactly as `semadj[]` does.
+struct SemUndoCheck<'a> {
+    undo: Option<&'a SemUndo>,
+    semid: i32,
+    serial: u64,
+    staged: Vec<(u16, i32)>,
+}
+
+impl SemUndoCheck<'_> {
+    fn prior(&self, semnum: u16) -> i32 {
+        if let Some((_, value)) = self.staged.iter().rev().find(|(num, _)| *num == semnum) {
+            return *value;
+        }
+        self.undo
+            .map_or(0, |undo| undo.prior(self.semid, self.serial, semnum))
+    }
+
+    /// Validates one operation's deferred adjustment, in vector order.
+    fn check(&mut self, plan: SemPlan, semnum: u16, sem_op: i16) -> AxResult<()> {
+        if !plan.undo() {
+            return Ok(());
+        }
+        let prior = self.prior(semnum);
+        if !sem_undo_delta_in_range(prior, sem_op) {
+            return Err(AxError::from(LinuxError::ERANGE));
+        }
+        self.staged.push((semnum, prior - sem_op as i32));
         Ok(())
     }
 }
@@ -162,9 +242,14 @@ fn ipc_time_secs() -> __kernel_time_t {
     wall_time().as_secs() as __kernel_time_t
 }
 
-fn wall_time_duration() -> Duration {
-    let now = wall_time();
-    Duration::new(now.as_secs(), now.subsec_nanos())
+/// Monotonic reading for the `semtimedop` deadline.
+///
+/// Linux `__do_semtimedop()` derives its deadline with `ktime_add_safe(
+/// ktime_get(), ...)` and waits on a `ktime_t` timer, both of which are
+/// monotonic.  Anchoring the deadline to the wall clock instead lets a
+/// `settimeofday` during the wait expire a blocking `semop` immediately.
+fn monotonic_duration() -> Duration {
+    Duration::from_nanos(axhal::time::monotonic_time_nanos())
 }
 
 #[repr(C)]
@@ -372,6 +457,16 @@ struct SemArray {
     sems: Vec<Semaphore>,
     removed: bool,
     waiters: Arc<axtask::WaitQueue>,
+    /// Never-reused identity of this array instance.
+    ///
+    /// Linux `ipc/sem.c:freeary()` walks `sma->list_id` and clears every undo
+    /// entry that targeted the array it is removing, and `exit_sem()` looks
+    /// the undo structure up again after re-obtaining the object, because
+    /// "the sequence number of the semaphore set can be the same" for a set
+    /// that was removed and recreated with the same identifier.  A monotonically
+    /// assigned serial gives the same guarantee here: an adjustment recorded
+    /// against a destroyed array can never be applied to its successor.
+    serial: u64,
 }
 
 struct WaitCountGuard<'a> {
@@ -401,6 +496,7 @@ impl SemArray {
             sems: alloc::vec![Semaphore::new(); nsems],
             removed: false,
             waiters: Arc::new(axtask::WaitQueue::new()),
+            serial: next_sem_array_serial(),
         }
     }
 
@@ -438,7 +534,10 @@ impl SemArray {
 
 pub(crate) struct SemManager {
     key_semid: BTreeMap<i32, i32>,
+    /// index -> semaphore array, exactly `sem_ids(ns).ipcs_idr`
     semid_arrays: BTreeMap<i32, Arc<Mutex<SemArray>>>,
+    /// Linux `struct ipc_ids` bookkeeping for this table.
+    ids: IpcIdTable,
 }
 
 impl SemManager {
@@ -446,6 +545,7 @@ impl SemManager {
         Self {
             key_semid: BTreeMap::new(),
             semid_arrays: BTreeMap::new(),
+            ids: IpcIdTable::new(),
         }
     }
 
@@ -453,20 +553,49 @@ impl SemManager {
         self.key_semid.get(&key).copied()
     }
 
+    /// Allocates the identifier for a new array.  The caller holds the manager
+    /// lock, which is this table's `ipc_ids.rwsem`.
+    fn allocate_id(&mut self, next_id: &AtomicI32) -> AxResult<IpcId> {
+        let arrays = &self.semid_arrays;
+        allocate_ipc_id(next_id, &mut self.ids, |index| arrays.contains_key(&index))
+    }
+
+    /// Linux `ipc_obtain_object_idr()`: resolve an index without checking its
+    /// sequence number, which is what `SEM_STAT`/`SEM_STAT_ANY` need.
+    fn get_array_by_index(&self, index: i32) -> Option<Arc<Mutex<SemArray>>> {
+        self.semid_arrays.get(&index).cloned()
+    }
+
+    /// Linux `ipc_obtain_object_check()`: resolve the index and verify
+    /// `ipc_checkid()`, so a stale identifier is rejected with EINVAL instead
+    /// of naming whichever array happens to sit at that index now.
     fn get_array_by_semid(&self, semid: i32) -> Option<Arc<Mutex<SemArray>>> {
-        self.semid_arrays.get(&semid).cloned()
+        if semid < 0 {
+            return None;
+        }
+        let array = self.get_array_by_index(ipcid_to_idx(semid))?;
+        let sequence = array.lock().semid_ds.sem_perm.seq as i32;
+        if ipcid_is_stale(semid, sequence) {
+            return None;
+        }
+        Some(array)
     }
 
     fn insert(&mut self, key: i32, semid: i32, array: Arc<Mutex<SemArray>>) {
         if key != IPC_PRIVATE {
             self.key_semid.insert(key, semid);
         }
-        self.semid_arrays.insert(semid, array);
+        self.semid_arrays.insert(ipcid_to_idx(semid), array);
     }
 
     fn remove_semid(&mut self, semid: i32) {
         self.key_semid.retain(|_, value| *value != semid);
-        self.semid_arrays.remove(&semid);
+        self.semid_arrays.remove(&ipcid_to_idx(semid));
+        // Linux `ipc_rmid()` updates the cached highest index after the IDR
+        // removal, which `SEM_INFO`/`IPC_INFO` report.
+        let arrays = &self.semid_arrays;
+        self.ids
+            .release(ipcid_to_idx(semid), |index| arrays.contains_key(&index));
     }
 
     fn active_array_count(&self) -> usize {
@@ -487,11 +616,9 @@ impl SemManager {
     }
 
     fn max_active_index(&self) -> isize {
-        self.semid_arrays
-            .iter()
-            .filter_map(|(semid, array)| (!array.lock().removed).then_some(*semid as isize))
-            .max()
-            .unwrap_or(0)
+        // Linux `ipc_get_maxidx()` reports -1 for an empty table and the
+        // syscalls map that to 0.
+        self.ids.max_index().max(0) as isize
     }
 }
 
@@ -503,11 +630,19 @@ pub(crate) fn apply_sem_undo(manager: &Mutex<SemManager>, undo: &mut SemUndo) {
     let mut wake = Vec::new();
     let state = manager.lock();
     for ((semid, semnum), adjustment) in entries {
-        let Some(array) = state.get_array_by_semid(semid) else {
+        let Some(array) = state.get_array_by_index(ipcid_to_idx(semid)) else {
             continue;
         };
         let mut array = array.lock();
         if array.removed {
+            continue;
+        }
+        // Linux `freeary()` drops every undo entry that targeted an array it
+        // removed, and `exit_sem()` re-checks the array it looked the undo
+        // structure up against.  A new array can be created at the same index
+        // with the same sequence number, so the array's identity - not just
+        // the identifier - has to match before an adjustment is applied.
+        if adjustment.serial != array.serial {
             continue;
         }
         let changed = {
@@ -534,16 +669,6 @@ pub(crate) fn apply_sem_undo(manager: &Mutex<SemManager>, undo: &mut SemUndo) {
     for waiters in wake {
         notify_sem_waiters(waiters);
     }
-}
-
-fn allocate_sem_id(manager: &SemManager, cursor: &AtomicI32) -> AxResult<i32> {
-    let desired = cursor.swap(-1, Ordering::Relaxed);
-    allocate_ipc_id(
-        cursor,
-        (desired >= 0).then_some(desired),
-        manager.semid_arrays.len(),
-        |id| manager.semid_arrays.contains_key(&id),
-    )
 }
 
 pub(crate) fn semmni_limit() -> usize {
@@ -607,14 +732,17 @@ pub(crate) fn sem_next_id() -> i32 {
 }
 
 pub(crate) fn set_sem_next_id(value: i32) -> AxResult<()> {
-    if value < -1 {
+    // Linux `ipc/ipc_sysctl.c`: `proc_dointvec_minmax` over `[0, INT_MAX]`,
+    // writable only for a task that is `checkpoint_restore_ns_capable()` over
+    // the IPC namespace's user namespace.
+    if value < 0 {
         return Err(AxError::from(LinuxError::EINVAL));
     }
-    current()
-        .as_thread()
-        .ipc_ns()
-        .next_sem_id()
-        .store(value, Ordering::Relaxed);
+    let ipc_ns = current().as_thread().ipc_ns();
+    if !ipc_ns.may_set_next_id() {
+        return Err(AxError::from(LinuxError::EPERM));
+    }
+    ipc_ns.next_sem_id().store(value, Ordering::Relaxed);
     Ok(())
 }
 
@@ -624,12 +752,14 @@ pub(crate) fn sysvipc_sem_snapshot() -> String {
     );
     let ipc_ns = current().as_thread().ipc_ns();
     let manager = ipc_ns.sem_manager().lock();
-    for (semid, array) in &manager.semid_arrays {
+    for (index, array) in &manager.semid_arrays {
         let array = array.lock();
         if array.removed {
             continue;
         }
         let ds = array.semid_ds;
+        // The table is keyed by index; `ipcs` prints the published identifier.
+        let semid = ipcid_compose(*index, ds.sem_perm.seq as i32);
         let _ = writeln!(
             out,
             "{:10} {:10} {:5o} {:10} {:5} {:5} {:5} {:5} {:10} {:10}",
@@ -705,9 +835,8 @@ fn sem_array_is_current(semid: i32, array: &Arc<Mutex<SemArray>>) -> bool {
     let ipc_ns = current().as_thread().ipc_ns();
     let manager = ipc_ns.sem_manager().lock();
     manager
-        .semid_arrays
-        .get(&semid)
-        .is_some_and(|current| Arc::ptr_eq(current, array))
+        .get_array_by_index(ipcid_to_idx(semid))
+        .is_some_and(|current| Arc::ptr_eq(&current, array))
 }
 
 fn notify_sem_waiters(waiters: Arc<axtask::WaitQueue>) {
@@ -722,10 +851,6 @@ fn validate_semnum(array: &SemArray, semnum: i32) -> AxResult<usize> {
     } else {
         Ok(semnum as usize)
     }
-}
-
-fn strip_ipc64(cmd: i32) -> i32 {
-    cmd & !0x100
 }
 
 pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
@@ -746,6 +871,8 @@ pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
     if key != IPC_PRIVATE
         && let Some(semid) = manager.get_semid_by_key(key)
     {
+        // Linux `ipc/util.c:ipcget_public()` rejects an exclusive create
+        // before it resolves the object or checks access.
         if create && excl {
             return Err(AxError::from(LinuxError::EEXIST));
         }
@@ -781,19 +908,19 @@ pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
         return Err(AxError::from(LinuxError::ENOSPC));
     }
 
-    let semid = allocate_sem_id(&manager, ipc_ns.next_sem_id())?;
+    let id = manager.allocate_id(ipc_ns.next_sem_id())?;
     let mut array = SemArray::new(
-        semid,
+        id.raw(),
         key,
         nsems as usize,
         (semflg & IPC_MODE_MASK as i32) as _,
         current_uid,
         current_gid,
     );
-    array.semid_ds.sem_perm.seq = ipc_ns.next_sequence();
+    array.semid_ds.sem_perm.seq = id.sequence() as _;
     let array = Arc::new(Mutex::new(array));
-    manager.insert(key, semid, array);
-    Ok(semid as isize)
+    manager.insert(key, id.raw(), array);
+    Ok(id.raw() as isize)
 }
 
 pub fn sys_semctl<M: UserMemory + ?Sized>(
@@ -807,7 +934,21 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
     let ipc_ns = current_task.as_thread().ipc_ns();
     let context =
         IpcAccessContext::for_ipc_namespace(current_task.as_thread().current_cred(), &ipc_ns);
-    let cmd = strip_ipc64(cmd);
+    // Linux `ksys_semctl()` rejects a negative identifier first, and switches
+    // on the raw command: `IPC_64` is a userland-header convention the kernel
+    // never inspects, so `semctl(id, 0, IPC_STAT | 0x100, buf)` is EINVAL.
+    if semid < 0 {
+        return Err(AxError::from(LinuxError::EINVAL));
+    }
+    // `semctl_setval()` validates the value before it resolves the array, so
+    // an out-of-range value is ERANGE even for an identifier that names
+    // nothing.
+    if cmd == SETVAL {
+        let value = arg as c_int;
+        if value < 0 || value > SEMVMX as c_int {
+            return Err(AxError::from(LinuxError::ERANGE));
+        }
+    }
 
     if cmd == IPC_INFO || cmd == SEM_INFO {
         let (info, index) = {
@@ -823,20 +964,32 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
         return Ok(index);
     }
     if cmd == SEM_STAT || cmd == SEM_STAT_ANY {
+        // Linux `semctl_stat()`: these two commands take an *index*, and
+        // `sem_obtain_object()` resolves it without consulting the sequence
+        // number.  They answer with the array's full identifier so a caller
+        // iterating by index learns the sequence it must use next.
+        let index = ipcid_to_idx(semid);
         let array = ipc_ns
             .sem_manager()
             .lock()
-            .get_array_by_semid(semid)
+            .get_array_by_index(index)
             .ok_or(AxError::from(LinuxError::EINVAL))?;
         let (snapshot, id) = {
             let array = array.lock();
-            if array.removed {
-                return Err(AxError::from(LinuxError::EINVAL));
-            }
+            // `SEM_STAT_ANY` is the unprivileged probe and skips the mode
+            // check; `SEM_STAT` requires read permission.
             if cmd == SEM_STAT && !array.readable(&context) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
-            (array.semid_ds, array.semid)
+            // Linux checks `ipc_valid_object()` after the permission test, so
+            // an array that is already gone reports EIDRM rather than EACCES.
+            if array.removed {
+                return Err(AxError::from(LinuxError::EIDRM));
+            }
+            (
+                array.semid_ds,
+                ipcid_compose(index, array.semid_ds.sem_perm.seq as i32),
+            )
         };
         write_semid_ds(memory, arg as *mut SemidDs, snapshot)?;
         return Ok(id as isize);
@@ -876,7 +1029,10 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
         }
 
         let mut array = array.lock();
-        if array.removed || array.semid != semid || array.nsems() != values.len() {
+        if array.removed {
+            return Err(AxError::from(LinuxError::EIDRM));
+        }
+        if array.semid != semid || array.nsems() != values.len() {
             return Err(AxError::from(LinuxError::EINVAL));
         }
         if !array.writable(&context) {
@@ -893,8 +1049,10 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
     }
 
     let mut array = array.lock();
+    // Linux `ipc_valid_object()` reports a removed object as EIDRM; the flag
+    // is only observable through a reference obtained before the removal.
     if array.removed {
-        return Err(AxError::from(LinuxError::EINVAL));
+        return Err(AxError::from(LinuxError::EIDRM));
     }
 
     match cmd {
@@ -970,14 +1128,13 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
             Ok(0)
         }
         SETVAL => {
+            // `semctl_setval()` order: value range (checked before the array
+            // lookup), then semnum bounds, then write permission.
+            let value = arg as c_int;
+            let index = validate_semnum(&array, semnum)?;
             if !array.writable(&context) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
-            let value = arg as c_int;
-            if value < 0 || value as usize > SEMVMX {
-                return Err(AxError::from(LinuxError::ERANGE));
-            }
-            let index = validate_semnum(&array, semnum)?;
             let pid = current().as_thread().proc_data.proc.pid() as __kernel_pid_t;
             array.sems[index].reset_value(value as u16, pid)?;
             array.mark_changed();
@@ -996,53 +1153,52 @@ enum SemTryResult {
         sem_num: usize,
         wait_zero: bool,
         needed_value: u16,
+        /// Linux `perform_atomic_semop()` returns EAGAIN only when the
+        /// operation that would block carries `IPC_NOWAIT` itself.
+        nowait: bool,
     },
-}
-
-fn validate_semop_flags(flags: i16) -> AxResult<()> {
-    // The ABI crate owns the complete `sembuf` flag grammar, including
-    // SEM_UNDO.  Adjustment ownership is installed after the operation has
-    // committed as one atomic semaphore-array transaction.
-    plan_sem_op(AbiSemBuf {
-        num: 0,
-        op: 1,
-        flags,
-    })
-    .map(|_| ())
-    .map_err(|_| AxError::InvalidInput)
 }
 
 fn try_apply_single_semop(
     array: &mut SemArray,
     op: Sembuf,
     pid: __kernel_pid_t,
+    undo: &mut SemUndoCheck<'_>,
 ) -> AxResult<SemTryResult> {
     let index = op.sem_num as usize;
     if index >= array.sems.len() {
         return Err(AxError::from(LinuxError::EFBIG));
     }
-    validate_semop_flags(op.sem_flg)?;
 
     let sem = &mut array.sems[index];
     let value = sem.value as i32;
+    let plan = plan_sem_op(abi_sem_buf(&op));
     match op.sem_op {
-        op if op > 0 => {
-            let new_value = value + op as i32;
+        delta if delta > 0 => {
+            let new_value = value + delta as i32;
             if new_value > SEMVMX as i32 {
                 return Err(AxError::from(LinuxError::ERANGE));
             }
+            // Linux `perform_atomic_semop()` validates the semaphore value and
+            // the deferred adjustment in the same pass and commits only after
+            // the whole vector is valid, so a rejected adjustment leaves the
+            // semaphore untouched.  A would-block result returns before this
+            // check on both kernels.
+            undo.check(plan, op.sem_num, op.sem_op)?;
             sem.value = new_value as u16;
         }
-        op if op < 0 => {
-            let delta = -(op as i32);
-            if value < delta {
+        delta if delta < 0 => {
+            let amount = -(delta as i32);
+            if value < amount {
                 return Ok(SemTryResult::WouldBlock {
                     sem_num: index,
                     wait_zero: false,
-                    needed_value: delta as u16,
+                    needed_value: amount as u16,
+                    nowait: op_has_nowait_flag(op.sem_flg),
                 });
             }
-            sem.value = (value - delta) as u16;
+            undo.check(plan, op.sem_num, op.sem_op)?;
+            sem.value = (value - amount) as u16;
         }
         _ => {
             if value != 0 {
@@ -1050,8 +1206,10 @@ fn try_apply_single_semop(
                     sem_num: index,
                     wait_zero: true,
                     needed_value: 0,
+                    nowait: op_has_nowait_flag(op.sem_flg),
                 });
             }
+            undo.check(plan, op.sem_num, op.sem_op)?;
         }
     }
 
@@ -1060,13 +1218,18 @@ fn try_apply_single_semop(
     Ok(SemTryResult::Ready)
 }
 
+fn op_has_nowait_flag(flags: i16) -> bool {
+    flags & tk_linux_ipc::IPC_NOWAIT as i16 != 0
+}
+
 fn try_apply_semops(
     array: &mut SemArray,
     ops: &[Sembuf],
     pid: __kernel_pid_t,
+    undo: &mut SemUndoCheck<'_>,
 ) -> AxResult<SemTryResult> {
     if let [op] = ops {
-        return try_apply_single_semop(array, *op, pid);
+        return try_apply_single_semop(array, *op, pid, undo);
     }
 
     let mut values = array.sems.iter().map(|sem| sem.value).collect::<Vec<_>>();
@@ -1075,26 +1238,26 @@ fn try_apply_semops(
         if index >= values.len() {
             return Err(AxError::from(LinuxError::EFBIG));
         }
-        validate_semop_flags(op.sem_flg)?;
         let value = values[index] as i32;
         match op.sem_op {
-            op if op > 0 => {
-                let new_value = value + op as i32;
+            delta if delta > 0 => {
+                let new_value = value + delta as i32;
                 if new_value > SEMVMX as i32 {
                     return Err(AxError::from(LinuxError::ERANGE));
                 }
                 values[index] = new_value as u16;
             }
-            op if op < 0 => {
-                let delta = -(op as i32);
-                if value < delta {
+            delta if delta < 0 => {
+                let amount = -(delta as i32);
+                if value < amount {
                     return Ok(SemTryResult::WouldBlock {
                         sem_num: index,
                         wait_zero: false,
-                        needed_value: delta as u16,
+                        needed_value: amount as u16,
+                        nowait: op_has_nowait_flag(op.sem_flg),
                     });
                 }
-                values[index] = (value - delta) as u16;
+                values[index] = (value - amount) as u16;
             }
             _ => {
                 if value != 0 {
@@ -1102,10 +1265,15 @@ fn try_apply_semops(
                         sem_num: index,
                         wait_zero: true,
                         needed_value: 0,
+                        nowait: op_has_nowait_flag(op.sem_flg),
                     });
                 }
             }
         }
+        // Linux validates the deferred adjustment in the same pass as the
+        // semaphore value, so an operation that would block is reported as
+        // such even when a later operation's adjustment is out of range.
+        undo.check(plan_sem_op(abi_sem_buf(op)), op.sem_num, op.sem_op)?;
     }
 
     for (sem, value) in array.sems.iter_mut().zip(values) {
@@ -1132,7 +1300,7 @@ fn validate_timeout<M: UserMemory + ?Sized>(
     };
     let tv = timeout.try_into_time_value()?;
     let duration = Duration::from_nanos(tv.as_nanos().min(u64::MAX as u128) as u64);
-    Ok(Some(wall_time_duration().saturating_add(duration)))
+    Ok(Some(monotonic_duration().saturating_add(duration)))
 }
 
 fn add_wait_count(
@@ -1158,7 +1326,7 @@ fn add_wait_count(
 }
 
 fn deadline_elapsed(deadline: Option<Duration>) -> bool {
-    deadline.is_some_and(|deadline| wall_time_duration() >= deadline)
+    deadline.is_some_and(|deadline| monotonic_duration() >= deadline)
 }
 
 fn sem_wait_ready(
@@ -1217,7 +1385,7 @@ fn wait_for_sem(
 
     let sleep_for = deadline
         .ok_or(AxError::BadState)?
-        .saturating_sub(wall_time_duration());
+        .saturating_sub(monotonic_duration());
     let timed_out = with_proc_state_hint(ProcStateHint::Interruptible, || {
         waiters.wait_timeout_until_interruptible(sleep_for, || {
             sem_wait_ready(array, sem_num, wait_zero, needed_value).unwrap_or(true)
@@ -1237,11 +1405,6 @@ fn wait_for_sem(
     Ok(())
 }
 
-fn op_has_nowait(ops: &[Sembuf]) -> bool {
-    ops.iter()
-        .any(|op| op.sem_flg & tk_linux_ipc::IPC_NOWAIT as i16 != 0)
-}
-
 pub fn sys_semop<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     semid: i32,
@@ -1258,7 +1421,8 @@ pub fn sys_semtimedop<M: UserMemory + ?Sized>(
     nsops: usize,
     timeout: *const timespec,
 ) -> AxResult<isize> {
-    if nsops == 0 {
+    // Linux `__do_semtimedop()`: `if (nsops < 1 || semid < 0) return -EINVAL;`
+    if nsops == 0 || semid < 0 {
         return Err(AxError::from(LinuxError::EINVAL));
     }
     if nsops > semopm_limit() {
@@ -1281,6 +1445,13 @@ pub fn sys_semtimedop<M: UserMemory + ?Sized>(
             .get_array_by_semid(semid)
             .ok_or(AxError::from(LinuxError::EINVAL))?
     };
+    // Linux `__do_semtimedop()` bounds the vector against the array with
+    // EFBIG *before* `ipcperms()`, so an operation that names a semaphore
+    // outside the set reports EFBIG even when the caller also lacks write
+    // permission.  `sem_nsems` is fixed at creation, so one check suffices.
+    if highest_sem_num(&ops) as usize >= array.lock().nsems() {
+        return Err(AxError::from(LinuxError::EFBIG));
+    }
     let mut wait_guard = None;
     let mut wait_key = None;
 
@@ -1313,16 +1484,26 @@ pub fn sys_semtimedop<M: UserMemory + ?Sized>(
                     .prepare_records(semid, &ops)?;
             }
 
-            match try_apply_semops(&mut array, &ops, current_pid)? {
+            let mut undo_check = SemUndoCheck {
+                undo: undo_guard.as_deref().and_then(|undo| undo.as_ref()),
+                semid,
+                serial: array.serial,
+                staged: Vec::new(),
+            };
+            match try_apply_semops(&mut array, &ops, current_pid, &mut undo_check)? {
                 SemTryResult::Ready => {
                     if let Some(undo) = undo_guard.as_deref_mut() {
                         let undo = undo.as_mut().ok_or(AxError::BadState)?;
-                        for op in ops.iter().filter(|op| op.sem_flg & SEM_UNDO != 0) {
+                        for op in ops.iter() {
+                            if !plan_sem_op(abi_sem_buf(op)).records_undo() {
+                                continue;
+                            }
                             undo.record(
                                 semid,
                                 op.sem_num,
                                 op.sem_op,
                                 array.sems[op.sem_num as usize].undo_generation,
+                                array.serial,
                             )?;
                         }
                     }
@@ -1335,8 +1516,11 @@ pub fn sys_semtimedop<M: UserMemory + ?Sized>(
                     sem_num,
                     wait_zero,
                     needed_value,
+                    nowait,
                 } => {
-                    if op_has_nowait(&ops) {
+                    // Linux reports EAGAIN from the flag of the operation that
+                    // would block, not from the vector as a whole.
+                    if nowait {
                         return Err(AxError::from(LinuxError::EAGAIN));
                     }
                     (array.waiters.clone(), sem_num, wait_zero, needed_value)
@@ -1405,18 +1589,106 @@ mod setall_snapshot_tests {
         }
     }
 
+    /// Regression: the array table used to be keyed by the published
+    /// identifier with nothing validating the sequence.
+    /// Linux `perform_atomic_semop()` validates the deferred adjustment in the
+    /// same pass as the semaphore value and commits only once the whole vector
+    /// is valid: a rejected adjustment must leave the value unchanged, which
+    /// the single-operation fast path used to violate.
+    #[test]
+    fn rejected_undo_adjustment_leaves_a_single_operation_unapplied() {
+        let _context = crate::test_support::scheduler_test_context();
+        let semid = ipcid_compose(2, 0);
+        let mut array = SemArray::new(semid, 1, 1, 0o600, 0, 0);
+        array.sems[0].value = 1;
+        let serial = array.serial;
+        let generation = array.sems[0].undo_generation;
+
+        let mut undo = SemUndo::new();
+        // `-SEMAEM - 1` is the lowest legal adjustment; two increments reach it
+        // exactly, so a third increment is out of range.
+        undo.record(semid, 0, SEMVMX as i16, generation, serial)
+            .unwrap();
+        undo.record(semid, 0, 1, generation, serial).unwrap();
+        assert_eq!(undo.prior(semid, serial, 0), -(SEMAEM as i32) - 1);
+
+        let ops = [Sembuf {
+            sem_num: 0,
+            sem_op: 1,
+            sem_flg: SEM_UNDO,
+        }];
+        let mut check = SemUndoCheck {
+            undo: Some(&undo),
+            semid,
+            serial,
+            staged: Vec::new(),
+        };
+        assert!(matches!(
+            try_apply_semops(&mut array, &ops, 0, &mut check),
+            Err(_)
+        ));
+        assert_eq!(array.sems[0].value, 1);
+    }
+
+    /// The bound `semop` applies to the whole vector before it checks
+    /// permission: the highest semaphore number, not the first one.
+    #[test]
+    fn highest_semaphore_number_bounds_the_operation_vector() {
+        let op = |sem_num, sem_op| Sembuf {
+            sem_num,
+            sem_op,
+            sem_flg: 0,
+        };
+        assert_eq!(highest_sem_num(&[op(0, 1)]), 0);
+        assert_eq!(highest_sem_num(&[op(0, 1), op(4, 1), op(2, 1)]), 4);
+        // `nsops < 1` is rejected before the bound is consulted, so the empty
+        // vector's placeholder cannot be observed.
+        assert_eq!(highest_sem_num(&[]), 0);
+    }
+
+    #[test]
+    fn array_lookup_validates_the_sequence_and_stat_uses_the_index() {
+        let _context = crate::test_support::scheduler_test_context();
+        let mut manager = SemManager::new();
+        let index = 5;
+        let sequence = 3;
+        let published = ipcid_compose(index, sequence);
+        assert_eq!(
+            manager.allocate_id(&AtomicI32::new(published)),
+            Ok(IpcId::from_parts(index, sequence))
+        );
+        let mut array = SemArray::new(published, 1, 2, 0o600, 0, 0);
+        array.semid_ds.sem_perm.seq = sequence as _;
+        manager.insert(1, published, Arc::new(Mutex::new(array)));
+
+        assert!(manager.get_array_by_semid(published).is_some());
+        assert!(manager.get_array_by_semid(index).is_none());
+        assert!(
+            manager
+                .get_array_by_semid(ipcid_compose(index, sequence + 1))
+                .is_none()
+        );
+        assert!(manager.get_array_by_index(index).is_some());
+        assert_eq!(manager.max_active_index(), index as isize);
+
+        manager.remove_semid(published);
+        assert!(manager.get_array_by_index(index).is_none());
+        assert_eq!(manager.max_active_index(), 0);
+    }
+
     #[test]
     fn setval_clears_all_prior_owners_only_for_the_selected_semaphore() {
         let _context = crate::test_support::scheduler_test_context();
         let array = Arc::new(Mutex::new(SemArray::new(1, 1, 2, 0o600, 0, 0)));
+        let serial = array.lock().serial;
         let manager = Mutex::new(SemManager::new());
         manager.lock().insert(1, 1, array.clone());
         let mut first = SemUndo::new();
         let mut second = SemUndo::new();
-        first.record(1, 0, -2, 0).unwrap();
-        first.record(1, 1, -3, 0).unwrap();
-        second.record(1, 0, -4, 0).unwrap();
-        second.record(1, 1, -5, 0).unwrap();
+        first.record(1, 0, -2, 0, serial).unwrap();
+        first.record(1, 1, -3, 0, serial).unwrap();
+        second.record(1, 0, -4, 0, serial).unwrap();
+        second.record(1, 1, -5, 0, serial).unwrap();
         array.lock().sems[0].reset_value(20, 1).unwrap();
         apply_sem_undo(&manager, &mut first);
         assert_eq!(array.lock().sems[0].value, 20);
@@ -1424,7 +1696,7 @@ mod setall_snapshot_tests {
         // A new operation replaces, rather than combines with, the cleared
         // adjustment in a surviving process's undo list.
         let generation = array.lock().sems[0].undo_generation;
-        second.record(1, 0, -7, generation).unwrap();
+        second.record(1, 0, -7, generation, serial).unwrap();
         apply_sem_undo(&manager, &mut second);
         assert_eq!(array.lock().sems[0].value, 27);
         assert_eq!(array.lock().sems[1].value, 8);
@@ -1434,15 +1706,63 @@ mod setall_snapshot_tests {
     fn setall_clears_every_prior_undo_adjustment() {
         let _context = crate::test_support::scheduler_test_context();
         let array = Arc::new(Mutex::new(SemArray::new(1, 1, 2, 0o600, 0, 0)));
+        let serial = array.lock().serial;
         let manager = Mutex::new(SemManager::new());
         manager.lock().insert(1, 1, array.clone());
         let mut undo = SemUndo::new();
-        undo.record(1, 0, -2, 0).unwrap();
-        undo.record(1, 1, -3, 0).unwrap();
+        undo.record(1, 0, -2, 0, serial).unwrap();
+        undo.record(1, 1, -3, 0, serial).unwrap();
         array.lock().reset_values(&[10, 20], 1).unwrap();
         apply_sem_undo(&manager, &mut undo);
         assert_eq!(array.lock().sems[0].value, 10);
         assert_eq!(array.lock().sems[1].value, 20);
+    }
+
+    /// Regression: `IPC_RMID` followed by `semget()` that recreates the very
+    /// same semid used to apply the retired owner's pending adjustments to the
+    /// new array, corrupting semaphores the process never touched.
+    ///
+    /// Linux closes this in two places: `freeary()` clears every undo entry
+    /// that named the array it removed, and `exit_sem()` re-looks-up the undo
+    /// structure after re-obtaining the object, because the recreated set "can
+    /// be the same".  TheKernel's undo lists hang off the thread, so the array
+    /// instance carries a never-reused serial that every adjustment records
+    /// and `apply_sem_undo` re-checks.
+    #[test]
+    fn undo_adjustment_never_reaches_an_array_that_reused_the_identifier() {
+        let _context = crate::test_support::scheduler_test_context();
+        // Both arrays publish the identical identifier, sequence included.
+        let semid = ipcid_compose(1, 7);
+        let retired = Arc::new(Mutex::new(SemArray::new(semid, 1, 2, 0o600, 0, 0)));
+        let retired_serial = retired.lock().serial;
+        let manager = Mutex::new(SemManager::new());
+        manager.lock().insert(1, semid, retired.clone());
+
+        let mut undo = SemUndo::new();
+        undo.record(semid, 0, -3, 0, retired_serial).unwrap();
+        undo.record(semid, 1, -4, 0, retired_serial).unwrap();
+        // Linux stores `semadj - sem_op`, so a decrement of 3 is recorded as
+        // the +3 that restores the semaphore on exit.
+        assert_eq!(undo.prior(semid, retired_serial, 0), 3);
+
+        // IPC_RMID: the array leaves the table and is marked removed.
+        retired.lock().removed = true;
+        manager.lock().remove_semid(semid);
+
+        // The successor takes over the same index and the same sequence.
+        let successor = Arc::new(Mutex::new(SemArray::new(semid, 1, 2, 0o600, 0, 0)));
+        assert_ne!(successor.lock().serial, retired_serial);
+        manager.lock().insert(1, semid, successor.clone());
+        successor.lock().sems[0].value = 9;
+        successor.lock().sems[1].value = 9;
+
+        apply_sem_undo(&manager, &mut undo);
+
+        assert_eq!(successor.lock().sems[0].value, 9);
+        assert_eq!(successor.lock().sems[1].value, 9);
+        // The adjustment is inert, not merely skipped: it reads as zero
+        // against the successor, exactly as Linux's freshly zeroed `semadj`.
+        assert_eq!(undo.prior(semid, successor.lock().serial, 0), 0);
     }
 
     #[test]
