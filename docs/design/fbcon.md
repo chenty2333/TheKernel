@@ -2312,7 +2312,8 @@ fbcon: readable on screen: 'guest userspace: KTAP banner',
 and the frame decodes with zero unmatched cells to `KTAP version 1`, `# THEKERNEL_TEST_BEGIN
 1 mounts timeout_seconds=60`, `ok 1 - mounts`, `ok 2 - rootfs` interleaved with `<6>[0.746134
 … task::ops] Task(36, init) exit with code: 0`. The daily tier runs every stage green with
-the stage in place — `whitespace`, `dependency-layers`, `graphics-config-{seatd,desktop}`,
+the stage in place — `whitespace`, `dependency-layers`, `linux-abi`,
+`graphics-config-{seatd,desktop}`,
 `host`, `build`, `lint`, `guest-tcg`, `firmware-fbcon`, then `verify: daily: PASS` — with
 `verify`'s environment preflight substituted as described in §0.3 result 12, because this
 host is not the development image.

@@ -36,6 +36,13 @@ def plan(tier: str, state: Path) -> list[Stage]:
         return [Stage("cpu-kvm", "test", (*cli, "test", "--suite", "cpu", "--smp", "4", "--accel", "kvm"), 1800)]
     stages = [
         Stage("dependency-layers", "static", (sys.executable, "scripts/ci/check_cargo_dependency_layers.py"), 120),
+        # The contract and dispatch tables are a source of truth only while
+        # something enforces them.  `test --suite abi` is run by hand, so until
+        # this stage existed no verification tier noticed a cell whose status,
+        # handler, test binding or explicit-ENOSYS routing had drifted from the
+        # kernel.  `all` also materializes the pinned Linux release, which is
+        # the network dependency and the reason for the generous timeout.
+        Stage("linux-abi", "static", (sys.executable, "scripts/ci/linux_abi_gate.py", "all"), 900),
         Stage("graphics-config-seatd", "static", ("scripts/build-graphics-rootfs.sh", "--flavor", "q35-graphics-seatd", "--check"), 120),
         Stage("graphics-config-desktop", "static", ("scripts/build-graphics-rootfs.sh", "--flavor", "q35-software-desktop", "--check"), 120),
         Stage("host", "test", (*cli, "test", "--suite", "host"), 1800),
