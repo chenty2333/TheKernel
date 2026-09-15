@@ -396,7 +396,12 @@ const ADDR_COMPAT_LAYOUT: u32 = 0x0020_0000;
 const READ_IMPLIES_EXEC: u32 = 0x0040_0000;
 pub(crate) const PER_CLEAR_ON_SETID: u32 =
     READ_IMPLIES_EXEC | ADDR_NO_RANDOMIZE | ADDR_COMPAT_LAYOUT | MMAP_PAGE_ZERO;
-const UTS_RELEASE: &str = "6.12.103";
+/// `UTS_RELEASE` (include/generated/utsrelease.h): the release token every
+/// `uname(2)` field is built from, and the first token of `VERMAGIC_STRING`
+/// (include/linux/vermagic.h:41-46).  Module admission reads the same constant
+/// so the release a module must name cannot drift from the release `uname(2)`
+/// reports.
+pub(crate) const UTS_RELEASE: &str = "6.12.103";
 const UTS_VERSION: &str = "#1 SMP PREEMPT_DYNAMIC 2026-08-10T00:00:00Z";
 const UNAME26_RELEASE_PREFIX: &[u8] = b"2.6.72";
 

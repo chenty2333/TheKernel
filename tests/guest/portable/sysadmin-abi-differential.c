@@ -758,11 +758,199 @@ static void module_image_case(void) {
     puts("THEKERNEL_ABI_RESULT sysadmin-abi.module-image.raw-differential pass");
 }
 
+/* --- kexec_load segment admission --------------------------------------- */
+
+#ifndef SYS_kexec_load
+#define SYS_kexec_load 246
+#endif
+
+/* include/uapi/linux/kexec.h */
+#define KEXEC_ON_CRASH 0x00000001UL
+#define KEXEC_ARCH_X86_64 (62UL << 16)
+
+/* `struct kexec_segment` (include/uapi/linux/kexec.h); 32 bytes on x86_64. */
+struct kexec_segment {
+    void *buf;
+    size_t bufsz;
+    void *mem;
+    size_t memsz;
+};
+
+/* A page-aligned physical destination in the low RAM both targets have.  It is
+ * only ever *named*: no probe below reaches the copy of a segment, so nothing
+ * reads or writes this page.  The two probes that do succeed carry memsz 0, so
+ * the destination owns no page at all there either. */
+#define KEXEC_DEST 0x01000000UL
+
+#define KEXEC_CASE "sysadmin-abi.kexec-load.raw-differential"
+
+/* Every probe below is either rejected by `sanity_check_segment_list()` before
+ * anything is copied, or -- for the single zero-length destination -- carries a
+ * `memsz` of 0 so that the destination owns no page at all.  No image survives
+ * the case: the one request that succeeds is unloaded again immediately. */
+static void kexec_probe(const char *name, long result, int error) {
+    printf("THEKERNEL_KEXEC_PROBE %s result=%ld errno=%d\n", name, result,
+           result == -1 ? error : 0);
+}
+
+static void kexec_seg(struct kexec_segment *segment, void *buf, size_t bufsz,
+                      unsigned long mem, size_t memsz) {
+    segment->buf = buf;
+    segment->bufsz = bufsz;
+    segment->mem = (void *)(uintptr_t)mem;
+    segment->memsz = memsz;
+}
+
+static void kexec_load_case(void) {
+    puts("THEKERNEL_ABI_CASE sysadmin-abi.kexec-load.raw-differential");
+
+    struct kexec_segment one[2];
+    struct kexec_segment many[17] = {{0}};
+    long result;
+    int error;
+
+    /* A reserved flag bit: `kexec_load_check()` admits the KEXEC_FLAGS bits
+     * (KEXEC_ON_CRASH | KEXEC_UPDATE_ELFCOREHDR | KEXEC_CRASH_HOTPLUG_SUPPORT,
+     * include/linux/kexec.h:458) plus the architecture field, so bit 4 is
+     * -EINVAL (kernel/kexec.c:230-231).  `nr_segments` is 0, so no image is
+     * unloaded on a kernel that accepts the request. */
+    errno = 0;
+    result = syscall(SYS_kexec_load, (long)0, (long)0, (void *)0,
+                     (long)(KEXEC_ARCH_X86_64 | 0x10));
+    error = errno;
+    expect_errno(KEXEC_CASE, "KEXEC_RESERVED_FLAG_BIT_EINVAL", result, EINVAL);
+
+    /* Flag bits above bit 31 escape that check on Linux.  KEXEC_ARCH_MASK is
+     * 0xffff0000 with type `unsigned int` (include/uapi/linux/kexec.h:17), so
+     * `~KEXEC_ARCH_MASK` is 0x0000ffff rather than 0xffffffff0000ffff and
+     * `flags & ~KEXEC_ARCH_MASK` drops bits 32..63 instead of testing them.
+     * The check is the one that says it leaves room for future extensions:
+     *
+     * 	if ((flags & KEXEC_FLAGS) != (flags & ~KEXEC_ARCH_MASK))
+     * 		return -EINVAL;
+     *
+     * (kernel/kexec.c:226-231).  A request that sets only `1 << 32` therefore
+     * passes with flags == 0, and `nr_segments == 0` turns it into an unload of
+     * the default image.  TheKernel compares the whole 64-bit word and answers
+     * -EINVAL, which is what the check is for, so the two kernels disagree and
+     * this probe stays a diagnostic: no assertion is registered for it. */
+    errno = 0;
+    result = syscall(SYS_kexec_load, (long)0, (long)0, (void *)0, (long)(1UL << 32));
+    error = errno;
+    kexec_probe("high-flag-bits", result, error);
+
+    /* An architecture field that is neither KEXEC_ARCH_X86_64 nor
+     * KEXEC_ARCH_DEFAULT is -EINVAL (kernel/kexec.c:242-244). */
+    errno = 0;
+    result = syscall(SYS_kexec_load, (long)0, (long)0, (void *)0, (long)(63UL << 16));
+    error = errno;
+    expect_errno(KEXEC_CASE, "KEXEC_UNKNOWN_ARCH_EINVAL", result, EINVAL);
+
+    /* KEXEC_SEGMENT_MAX is 16, and the cap is checked before the segment array
+     * is even read (kernel/kexec.c:233-236), so the answer does not depend on
+     * the contents. */
+    errno = 0;
+    result = syscall(SYS_kexec_load, (long)0, (long)17, many, (long)KEXEC_ARCH_X86_64);
+    error = errno;
+    expect_errno(KEXEC_CASE, "KEXEC_SEGMENT_COUNT_OVER_MAX_EINVAL", result, EINVAL);
+
+    /* An unaligned destination is -EADDRNOTAVAIL from the first loop of
+     * `sanity_check_segment_list()` (kernel/kexec_core.c:135-137). */
+    kexec_seg(&one[0], (void *)0, 0, KEXEC_DEST + 1, 0x1000);
+    errno = 0;
+    result = syscall(SYS_kexec_load, (long)0, (long)1, one, (long)KEXEC_ARCH_X86_64);
+    error = errno;
+    expect_errno(KEXEC_CASE, "KEXEC_UNALIGNED_DESTINATION_EADDRNOTAVAIL", result,
+                 EADDRNOTAVAIL);
+
+    /* A destination at the architecture limit is -EADDRNOTAVAIL.
+     * `KEXEC_DESTINATION_MEMORY_LIMIT` is `MAXMEM - 1` with
+     * `MAXMEM = 1 << MAX_PHYSMEM_BITS` and
+     * `MAX_PHYSMEM_BITS = pgtable_l5_enabled() ? 52 : 46`
+     * (arch/x86/include/asm/kexec.h:64, asm/pgtable_64_types.h:96,
+     * asm/sparsemem.h:29), and the first loop tests it before anything is
+     * copied, so the destination is never written. */
+    kexec_seg(&one[0], (void *)0, 0, 1UL << 46, 0x1000);
+    errno = 0;
+    result = syscall(SYS_kexec_load, (long)0, (long)1, one, (long)KEXEC_ARCH_X86_64);
+    error = errno;
+    expect_errno(KEXEC_CASE, "KEXEC_DESTINATION_ABOVE_LIMIT_EADDRNOTAVAIL", result,
+                 EADDRNOTAVAIL);
+
+    /* `bufsz > memsz` is -EINVAL from the third loop of the same function
+     * (kernel/kexec_core.c:165-173). */
+    kexec_seg(&one[0], (void *)0, 0x2000, KEXEC_DEST, 0x1000);
+    errno = 0;
+    result = syscall(SYS_kexec_load, (long)0, (long)1, one, (long)KEXEC_ARCH_X86_64);
+    error = errno;
+    expect_errno(KEXEC_CASE, "KEXEC_BUFSZ_OVER_MEMSZ_EINVAL", result, EINVAL);
+
+    /* Both loops run over the whole request, so the *second* segment's address
+     * error is reported even though the first segment's buffer size is wrong:
+     * loop 1 precedes loop 3. */
+    kexec_seg(&one[0], (void *)0, 0x2000, KEXEC_DEST, 0x1000);
+    kexec_seg(&one[1], (void *)0, 0, KEXEC_DEST + 1, 0x1000);
+    errno = 0;
+    result = syscall(SYS_kexec_load, (long)0, (long)2, one, (long)KEXEC_ARCH_X86_64);
+    error = errno;
+    expect_errno(KEXEC_CASE, "KEXEC_ADDRESS_ERROR_PRECEDES_BUFSZ_ERROR", result,
+                 EADDRNOTAVAIL);
+
+    /* Two destinations that overlap are -EINVAL (kernel/kexec_core.c:143-163). */
+    kexec_seg(&one[0], (void *)0, 0, KEXEC_DEST, 0x2000);
+    kexec_seg(&one[1], (void *)0, 0, KEXEC_DEST + 0x1000, 0x1000);
+    errno = 0;
+    result = syscall(SYS_kexec_load, (long)0, (long)2, one, (long)KEXEC_ARCH_X86_64);
+    error = errno;
+    expect_errno(KEXEC_CASE, "KEXEC_OVERLAPPING_DESTINATIONS_EINVAL", result, EINVAL);
+
+    /* A zero-length destination is not an error: `mend == mstart` passes the
+     * alignment and limit tests, intersects nothing, and `memsz == 0` leaves
+     * `kimage_load_normal_segment()`'s `while (mbytes)` loop unentered.  The
+     * request therefore *succeeds* and is unloaded again immediately, so no
+     * image outlives the probe. */
+    kexec_seg(&one[0], (void *)0, 0, KEXEC_DEST, 0);
+    errno = 0;
+    result = syscall(SYS_kexec_load, (long)0, (long)1, one, (long)KEXEC_ARCH_X86_64);
+    error = errno;
+    expect_value(KEXEC_CASE, "KEXEC_ZERO_LENGTH_DESTINATION_ACCEPTED", result, 0);
+    errno = 0;
+    result = syscall(SYS_kexec_load, (long)0, (long)0, (void *)0, (long)KEXEC_ARCH_X86_64);
+    error = errno;
+    expect_value(KEXEC_CASE, "KEXEC_UNLOAD_AFTER_ZERO_LENGTH_ACCEPTED", result, 0);
+
+    /* A crash image is refused by the entry check when the kernel booted
+     * without `crashkernel=`, because `crashk_res` is empty
+     * (kernel/kexec.c:29-36).  The probe keeps memsz 0 so that a kernel which
+     * does not check the entry reserves no destination page either.
+     *
+     * Measured: the oracle answers -EADDRNOTAVAIL and TheKernel answers 0,
+     * because TheKernel never reserves a crash kernel region
+     * (`reserve_crashkernel()` is the missing primitive), so its crash-image
+     * path cannot be held to `crashk_res`.  The two kernels disagree here and
+     * this probe stays a diagnostic: no assertion is registered for it.  The
+     * unload below releases whatever the probe published. */
+    kexec_seg(&one[0], (void *)0, 0, KEXEC_DEST, 0);
+    errno = 0;
+    result = syscall(SYS_kexec_load, (long)KEXEC_DEST, (long)1, one,
+                     (long)(KEXEC_ARCH_X86_64 | KEXEC_ON_CRASH));
+    error = errno;
+    kexec_probe("crash-entry-outside-crashk", result, error);
+    errno = 0;
+    result = syscall(SYS_kexec_load, (long)0, (long)0, (void *)0,
+                     (long)(KEXEC_ARCH_X86_64 | KEXEC_ON_CRASH));
+    error = errno;
+    kexec_probe("unload-crash-image", result, error);
+
+    puts("THEKERNEL_ABI_RESULT sysadmin-abi.kexec-load.raw-differential pass");
+}
+
 int main(void) {
     ptrace_request_case();
     unshare_flag_case();
     swap_flag_case();
     module_image_case();
+    kexec_load_case();
 
     if (failures != 0) {
         return 1;

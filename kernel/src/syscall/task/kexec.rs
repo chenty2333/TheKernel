@@ -108,7 +108,10 @@ struct ReservedSegment {
 }
 impl Drop for ReservedSegment {
     fn drop(&mut self) {
-        if self.owns_pages {
+        // A zero-length destination owns no page: `pages == 0` must not reach
+        // the allocator.  Linux keeps the same distinction by never allocating
+        // a page for a segment whose `memsz` is zero.
+        if self.owns_pages && self.pages != 0 {
             global_allocator().dealloc_pages(
                 phys_to_virt(self.paddr.into()).as_usize(),
                 self.pages,
@@ -738,8 +741,14 @@ pub fn sys_kexec_load<M: UserMemory + ?Sized>(
         .try_reserve_exact(n)
         .map_err(|_| AxError::NoMemory)?;
     for &segment in &raw {
-        validate_raw_segment(segment)?;
+        validate_segment_address(segment)?;
         destinations.push((segment.mem, segment.memsz));
+    }
+    // Linux finishes the address loop for every segment before it reads any
+    // `bufsz`, so the two passes are kept separate: a request that violates both
+    // reports the address problem.
+    for &segment in &raw {
+        validate_segment_buffer(segment)?;
     }
     admit_destination_ranges(&destinations, axhal::mem::total_ram_size() / PAGE_SIZE)?;
     let mut image = Vec::new();
@@ -752,12 +761,19 @@ pub fn sys_kexec_load<M: UserMemory + ?Sized>(
             .map_err(|_| AxError::NoMemory)?;
         uninit.resize_with(segment.bufsz, MaybeUninit::uninit);
         if crash {
-            replace_pages_at(
-                phys_to_virt(segment.mem.into()).as_usize(),
-                pages,
-                PAGE_SIZE,
-            )
-            .map_err(|_| AxError::NoMemory)?;
+            // An empty destination (memsz == 0) owns no page, so there is
+            // nothing to take over from the allocator.  Linux reaches the same
+            // place: `kimage_load_crash_segment()` copies a page at a time in a
+            // `while (mbytes)` loop (kernel/kexec_core.c:887), so an empty
+            // segment leaves the reserved window untouched.
+            if pages != 0 {
+                replace_pages_at(
+                    phys_to_virt(segment.mem.into()).as_usize(),
+                    pages,
+                    PAGE_SIZE,
+                )
+                .map_err(|_| AxError::NoMemory)?;
+            }
         }
         if segment.bufsz != 0
             && memory
@@ -804,8 +820,8 @@ pub fn sys_kexec_load<M: UserMemory + ?Sized>(
     }
     Ok(0)
 }
-/// `sanity_check_segment_list()`'s first loop (kernel/kexec_core.c), for one
-/// `struct kexec_segment`:
+/// `sanity_check_segment_list()`'s first loop (kernel/kexec_core.c:130-141), for
+/// one `struct kexec_segment`:
 ///
 /// ```c
 /// 	mstart = image->segment[i].mem;
@@ -819,11 +835,15 @@ pub fn sys_kexec_load<M: UserMemory + ?Sized>(
 /// ```
 ///
 /// `mstart > mend` is unsigned wraparound, not a zero length: a segment whose
-/// `memsz` is zero leaves `mend == mstart` and passes every one of these tests.
-/// The loop's own comment leaves RAM validation to the caller, so no test here
-/// consults the platform memory map either; `admit_destination_ranges()` below
-/// is where TheKernel adds that, and where the difference is declared.
-fn validate_raw_segment(segment: KexecSegment) -> AxResult<()> {
+/// `memsz` is zero leaves `mend == mstart`, so it passes the wraparound,
+/// alignment and limit tests and is *not* an address error.  Linux accepts such
+/// a segment and it then contributes no pages (`kimage_load_normal_segment()`
+/// loops `while (mbytes)`), so `admit_destination_ranges()` below must accept it
+/// too rather than reporting the -EINVAL a zero length suggests.  The loop's own
+/// comment leaves RAM validation to the caller, so no test here consults the
+/// platform memory map either; `admit_destination_ranges()` is where TheKernel
+/// adds that, and where the difference is declared.
+fn validate_segment_address(segment: KexecSegment) -> AxResult<()> {
     let Some(end) = segment.mem.checked_add(segment.memsz) else {
         return Err(LinuxError::EADDRNOTAVAIL.into());
     };
@@ -833,15 +853,28 @@ fn validate_raw_segment(segment: KexecSegment) -> AxResult<()> {
     {
         return Err(LinuxError::EADDRNOTAVAIL.into());
     }
-    // 	/* Ensure our buffer sizes are strictly less than
-    // 	 * our memory sizes.  This should always be the case,
-    // 	 * and it is easier to check up front than to be surprised
-    // 	 * later on.
-    // 	 */
-    // 	for (i = 0; i < nr_segments; i++) {
-    // 		if (image->segment[i].bufsz > image->segment[i].memsz)
-    // 			return -EINVAL;
-    // 	}
+    Ok(())
+}
+/// `sanity_check_segment_list()`'s third loop (kernel/kexec_core.c:165-173),
+/// for one `struct kexec_segment`:
+///
+/// ```c
+/// 	/* Ensure our buffer sizes are strictly less than
+/// 	 * our memory sizes.  This should always be the case,
+/// 	 * and it is easier to check up front than to be surprised
+/// 	 * later on.
+/// 	 */
+/// 	for (i = 0; i < nr_segments; i++) {
+/// 		if (image->segment[i].bufsz > image->segment[i].memsz)
+/// 			return -EINVAL;
+/// 	}
+/// ```
+///
+/// It is a separate pass because Linux runs the whole address loop before it:
+/// a request whose first segment has `bufsz > memsz` and whose second segment
+/// has an unaligned destination reports the *second* segment's -EADDRNOTAVAIL,
+/// not the first segment's -EINVAL.
+fn validate_segment_buffer(segment: KexecSegment) -> AxResult<()> {
     if segment.bufsz > segment.memsz {
         return Err(AxError::InvalidInput);
     }
@@ -862,8 +895,8 @@ fn admit_destination_ranges_in(
     total_bytes: usize,
     memory_regions: &[(usize, usize)],
 ) -> AxResult<()> {
-    let mut sorted = Vec::new();
-    sorted
+    let mut checked = Vec::new();
+    checked
         .try_reserve_exact(ranges.len())
         .map_err(|_| AxError::NoMemory)?;
     for &(start, bytes) in ranges {
@@ -898,10 +931,15 @@ fn admit_destination_ranges_in(
         // so an address below the limit but outside a RAM region is accepted
         // there (for a *crash* image Linux does require the crash kernel's
         // reserved window, which TheKernel does not carve out).  TheKernel
-        // answers -EINVAL for both, and a zero-length destination too, which
-        // Linux also accepts: `mend == mstart` passes the alignment, limit and
-        // overlap tests, and the segment then contributes no pages.  Both
-        // differences are declared in the `kexec_load` contract cell.
+        // answers -EINVAL for it, and that difference is declared in the
+        // `kexec_load` contract cell.
+        //
+        // An empty range is *not* an out-of-RAM range: Linux accepts it
+        // (`mend == mstart` passes the alignment, limit and overlap tests, and
+        // the segment contributes no pages), so `bytes == 0` is deliberately
+        // absent from the test below.  A caller may pass such a segment as a
+        // placeholder, and rejecting it would be an -EINVAL Linux never
+        // reports.
         let in_ram = end <= total_bytes
             && memory_regions
                 .iter()
@@ -909,30 +947,50 @@ fn admit_destination_ranges_in(
                     base.checked_add(length)
                         .is_some_and(|limit| base <= start && end <= limit)
                 });
-        if bytes == 0 || !in_ram {
+        if !in_ram {
             return Err(AxError::InvalidInput);
         }
-        sorted.push((start, end));
+        checked.push((start, end));
     }
-    sorted.sort_unstable_by_key(|&(start, _)| start);
+    // 	/* Verify our destination addresses do not overlap.
+    // 	 * If we alloed overlapping destination addresses
+    // 	 * through very weird things can happen with no
+    // 	 * easy explanation as one segment stops on another.
+    // 	 */
+    // 	for (i = 0; i < nr_segments; i++) {
+    // 		unsigned long mstart, mend;
+    // 		unsigned long j;
+    //
+    // 		mstart = image->segment[i].mem;
+    // 		mend   = mstart + image->segment[i].memsz;
+    // 		for (j = 0; j < i; j++) {
+    // 			unsigned long pstart, pend;
+    //
+    // 			pstart = image->segment[j].mem;
+    // 			pend   = pstart + image->segment[j].memsz;
+    // 			/* Do the segments overlap ? */
+    // 			if ((mend > pstart) && (mstart < pend))
+    // 				return -EINVAL;
+    // 		}
+    // 	}
+    //
+    // This is a half-open intersection, so the answer does not depend on the
+    // order of the request (`nr_segments` is capped at KEXEC_SEGMENT_MAX, so
+    // the quadratic loop costs nothing).  Transcribing it literally also keeps
+    // the zero-length destination admitted above admitted here: a segment with
+    // `mend == mstart` intersects nothing, and a sort followed by a "does this
+    // start precede the previous end" scan would report an overlap for two
+    // segments that merely share a start.
     let mut covered = 0usize;
-    let mut previous_end = None;
-    for (start, end) in sorted {
-        // 	/* Verify our destination addresses do not overlap. */
-        // 	for (i = 0; i < nr_segments; i++) {
-        // 		for (j = 0; j < i; j++) {
-        // 			/* Do the segments overlap ? */
-        // 			if ((mend > pstart) && (mstart < pend))
-        // 				return -EINVAL;
-        // 		}
-        // 	}
-        if previous_end.is_some_and(|previous| start < previous) {
-            return Err(AxError::InvalidInput);
+    for (index, &(start, end)) in checked.iter().enumerate() {
+        for &(previous_start, previous_end) in &checked[..index] {
+            if end > previous_start && start < previous_end {
+                return Err(AxError::InvalidInput);
+            }
         }
         covered = covered
             .checked_add((end - start) / PAGE_SIZE)
             .ok_or(AxError::NoMemory)?;
-        previous_end = Some(end);
     }
     // 	/*
     // 	 * Verify that no more than half of memory will be consumed. If the
@@ -1984,6 +2042,57 @@ mod tests {
     }
 
     #[test]
+    fn empty_destination_segment_is_admitted_like_linux() {
+        let memory = [(0, 4 * PAGE_SIZE)];
+        // `sanity_check_segment_list()` lets `mend == mstart` through every
+        // address test, and `kimage_load_normal_segment()` then copies nothing:
+        //
+        // 	mstart = image->segment[i].mem;
+        // 	mend   = mstart + image->segment[i].memsz;
+        // 	if (mstart > mend)
+        // 		return -EADDRNOTAVAIL;
+        // 	...
+        // 	while (mbytes) { ... }
+        //
+        // so `kexec_load` reports success for an empty destination and the
+        // segment contributes no pages.
+        assert!(
+            admit_destination_ranges_in(&[(PAGE_SIZE, 0)], 4, 4 * PAGE_SIZE, &memory).is_ok()
+        );
+        // An empty destination is still bounded by the same overlap rule, which
+        // Linux spells `(mend > pstart) && (mstart < pend)` and which therefore
+        // rejects a zero-length segment strictly inside another one:
+        assert_eq!(
+            admit_destination_ranges_in(
+                &[(0, 2 * PAGE_SIZE), (PAGE_SIZE, 0)], 4, 4 * PAGE_SIZE, &memory,
+            ),
+            Err(AxError::InvalidInput)
+        );
+        // ...and admits one that merely touches a neighbour's edge, because
+        // `mstart < pend` and `mend > pstart` are both false there.
+        assert!(
+            admit_destination_ranges_in(
+                &[(0, PAGE_SIZE), (PAGE_SIZE, 0)], 4, 4 * PAGE_SIZE, &memory,
+            )
+            .is_ok()
+        );
+        // TheKernel's RAM admission still applies to the empty range, so an
+        // empty destination outside the platform memory map stays -EINVAL -- the
+        // declared divergence that keeps out-of-RAM destinations out.  The gap
+        // between the two regions below has to be wider than a page for the
+        // range to be empty *and* strictly outside both of them.
+        assert_eq!(
+            admit_destination_ranges_in(
+                &[(2 * PAGE_SIZE, 0)],
+                8,
+                8 * PAGE_SIZE,
+                &[(0, PAGE_SIZE), (4 * PAGE_SIZE, PAGE_SIZE)],
+            ),
+            Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
     fn destination_addresses_use_eaddrnotavail_not_einval() {
         let memory = [(0, 4 * PAGE_SIZE)];
         // 	unlikely(mstart > mend) -> -EADDRNOTAVAIL
@@ -2016,35 +2125,44 @@ mod tests {
     #[test]
     fn raw_segment_keeps_linux_sanity_check_order_and_errnos() {
         // A zero-length destination is not a Linux error: `mend == mstart`
-        // passes the wraparound, alignment and limit tests.  TheKernel rejects
-        // it later, in `admit_destination_ranges()`, so segment validation must
-        // not report it as an address problem.
+        // passes the wraparound, alignment and limit tests, and the segment
+        // then contributes no pages.  `admit_destination_ranges()` admits it as
+        // well, so the whole `kexec_load` request succeeds.
         let empty = KexecSegment {
             buf: ptr::null(),
             bufsz: 0,
             mem: 2 * PAGE_SIZE,
             memsz: 0,
         };
-        assert_eq!(validate_raw_segment(empty), Ok(()));
-        // `bufsz > memsz` is -EINVAL, after the address tests.
+        assert_eq!(validate_segment_address(empty), Ok(()));
+        // The address pass never reads `bufsz`, and the buffer pass never reads
+        // `mem`, because Linux runs two separate loops over the request:
+        //
+        // 	mend = mstart + image->segment[i].memsz;      /* loop 1 */
+        // 	if ((mstart & ~PAGE_MASK) || (mend & ~PAGE_MASK))
+        // 		return -EADDRNOTAVAIL;
+        // 	...
+        // 	if (image->segment[i].bufsz > image->segment[i].memsz)  /* loop 3 */
+        // 		return -EINVAL;
+        //
+        // so a first segment with `bufsz > memsz` cannot preempt a second
+        // segment's address error, and the reverse also holds.
+        let oversized = KexecSegment {
+            buf: ptr::null(),
+            bufsz: PAGE_SIZE + 1,
+            mem: 2 * PAGE_SIZE,
+            memsz: PAGE_SIZE,
+        };
+        assert_eq!(validate_segment_address(oversized), Ok(()));
+        assert_eq!(validate_segment_buffer(oversized), Err(AxError::InvalidInput));
         assert_eq!(
-            validate_raw_segment(KexecSegment {
-                buf: ptr::null(),
-                bufsz: PAGE_SIZE + 1,
-                mem: 2 * PAGE_SIZE,
-                memsz: PAGE_SIZE,
-            }),
-            Err(AxError::InvalidInput)
+            validate_segment_address(KexecSegment { mem: 2 * PAGE_SIZE + 1, ..oversized }),
+            Err(AxError::from(LinuxError::EADDRNOTAVAIL))
         );
         // A NULL `buf` with a non-zero `bufsz` is *not* -EINVAL here: Linux
         // faults in `copy_from_user()` and reports -EFAULT at load time.
         assert_eq!(
-            validate_raw_segment(KexecSegment {
-                buf: ptr::null(),
-                bufsz: PAGE_SIZE,
-                mem: 2 * PAGE_SIZE,
-                memsz: PAGE_SIZE,
-            }),
+            validate_segment_buffer(KexecSegment { bufsz: PAGE_SIZE, ..oversized }),
             Ok(())
         );
     }
