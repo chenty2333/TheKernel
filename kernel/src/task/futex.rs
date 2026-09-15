@@ -331,6 +331,29 @@ pub enum PiUnlockOutcome {
     Aborted,
 }
 
+/// Result of a queue-gated PI requeue publication.
+///
+/// `futex_requeue()` (`kernel/futex/requeue.c:544-902`) distinguishes the case
+/// where the source queue holds no waiter to promote from the case where the
+/// publication raced against userspace: the first ends the syscall with the
+/// waiter count it managed to move, and only the second loops back to `retry`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PiRequeueOutcome {
+    /// The source queue has no live PI waiter, so there is nothing to promote
+    /// and nothing to move. `futex_requeue()` skips the chain walk and returns
+    /// its `task_count`, which is 0.
+    NoWaiters,
+    /// The publication lost the race against userspace; retry the operation.
+    Retry,
+    /// The top waiter was woken and `moved` further waiters were requeued.
+    Done {
+        /// Waiters woken on the source queue (Linux `task_count`).
+        woke: usize,
+        /// Waiters moved onto the target queue (Linux `task_count`).
+        moved: usize,
+    },
+}
+
 /// Outcome of a priority-inheritance wait.
 ///
 /// Linux tells the two interruptions of `FUTEX_WAIT_REQUEUE_PI` apart by the
@@ -1049,12 +1072,14 @@ impl WaitQueue {
         (woke, moved)
     }
 
+    /// Publishes a non-PI waiter.  The entry carries no `rt_mutex_waiter`
+    /// payload: [`Self::register_pi_waiter_if_condition`] is the only way to
+    /// publish one, and it does so under this same gate.
     fn register_waiter_if_condition(
         &self,
         owner: WaiterOwner,
         bitset: u32,
         timeout: Option<(AlarmClock, Duration)>,
-        pi: Option<PiWaiter>,
         condition: impl FnOnce() -> WaitConditionResult<bool>,
     ) -> WaitConditionResult<Option<WaitRegistration>> {
         // Allocate the waiter before taking the IRQ-safe gate.  If the
@@ -1068,7 +1093,7 @@ impl WaitQueue {
             task: Arc::downgrade(&current()),
             waker: None,
             next: None,
-            pi,
+            pi: None,
             requeued_pi: false,
         }))
         .map_err(|_| WaitConditionError::Fault(AxError::NoMemory))?;
@@ -1116,7 +1141,6 @@ impl WaitQueue {
             WaiterOwner::without_table(owner, FutexTableKey::Private(0)),
             bitset,
             timeout,
-            None,
             || condition().map_err(WaitConditionError::Fault),
         )
         .map_err(AxError::from)
@@ -1194,11 +1218,97 @@ impl WaitQueue {
         // happens before the synchronous block session starts. From this point
         // on, polling and wakeup touch only the waiter's IRQ-safe state.
         let Some(mut registration) =
-            self.register_waiter_if_condition(owner, bitset, timeout, None, condition)?
+            self.register_waiter_if_condition(owner, bitset, timeout, condition)?
         else {
             return Ok(false);
         };
         self.block_registered(&mut registration, timeout).0
+    }
+
+    /// [`Self::register_waiter_if_condition`] for a priority-inheritance wait.
+    ///
+    /// A plain waiter's entry is complete when it is allocated, so
+    /// `register_waiter_if_condition` can take its `pi` payload as an argument.
+    /// A PI waiter's `rt_mutex_waiter` payload does not exist until the
+    /// condition has classified the user word, so it is installed in the queue
+    /// entry *under the queue gate*, immediately before publication. That
+    /// ordering is what Linux does: `futex_lock_pi_atomic()` fills in
+    /// `q.rt_waiter` and `rt_mutex_enqueue()` links it while the futex hash
+    /// bucket is locked (`kernel/futex/pi.c:906-940`), so the first
+    /// `futex_top_waiter()` after the bucket lock is dropped already sees it.
+    /// Publishing the payload after the gate is released instead leaves a
+    /// window in which `wake_futex_pi()` (`kernel/futex/pi.c:1090-1100`) finds
+    /// `futex_top_waiter() == NULL`, publishes no handoff, and the waiter
+    /// sleeps until its timeout or a signal.
+    ///
+    /// `Ok(Some(pi))` publishes the entry carrying `pi`, `Ok(None)` declines
+    /// the wait (the caller has already taken the futex itself), and `Err`
+    /// reports a faulted or unavailable snapshot.
+    fn register_pi_waiter_if_condition(
+        &self,
+        owner: WaiterOwner,
+        bitset: u32,
+        timeout: Option<(AlarmClock, Duration)>,
+        condition: impl FnOnce() -> WaitConditionResult<Option<PiWaiter>>,
+    ) -> WaitConditionResult<Option<(WaitRegistration, PiWaiter)>> {
+        // Allocate the waiter before taking the IRQ-safe gate.  If the
+        // condition rejects publication, the temporary strong reference is
+        // dropped only after the gate has been released.
+        let waiter = Arc::try_new(SpinNoIrq::new(WaiterEntry {
+            bitset,
+            awakened: false,
+            cancelled: false,
+            owner,
+            task: Arc::downgrade(&current()),
+            waker: None,
+            next: None,
+            pi: None,
+            requeued_pi: false,
+        }))
+        .map_err(|_| WaitConditionError::Fault(AxError::NoMemory))?;
+        let registration_waiter = waiter.clone();
+        let mut waiter = Some(waiter);
+        let result = {
+            let _gate = self.gate.lock();
+            match condition() {
+                Err(error) => Err(error),
+                Ok(None) => Ok(None),
+                Ok(Some(_))
+                    if timeout.is_some_and(|(clock, deadline)| clock.now() >= deadline) =>
+                {
+                    Err(WaitConditionError::Fault(AxError::TimedOut))
+                }
+                Ok(Some(pi)) => {
+                    // The payload must be visible to `pi_top_locked()` before
+                    // the entry can be found in the queue.
+                    waiter
+                        .as_ref()
+                        .expect("unpublished futex waiter")
+                        .lock()
+                        .pi = Some(pi);
+                    self.queue
+                        .lock()
+                        .push_back(waiter.take().expect("unpublished futex waiter"));
+                    // The waiter belongs to the current task.  Inspecting
+                    // that task through the per-CPU current-task reference
+                    // does not create an Arc, so publication cannot drop a
+                    // task reference while the queue gate is held.
+                    if let Some(thread) = current().try_as_thread() {
+                        thread.set_proc_state_hint(ProcStateHint::Interruptible);
+                    }
+                    Ok(Some((
+                        WaitRegistration {
+                            waiter: Some(registration_waiter),
+                        },
+                        pi,
+                    )))
+                }
+            }
+        };
+        // The queue owns the publication reference; an unaccepted condition
+        // retains the preallocated reference until this gate scope ends.
+        drop(waiter);
+        result
     }
 
     /// Publishes a priority-inheritance waiter and blocks.
@@ -1229,15 +1339,9 @@ impl WaitQueue {
         C: FnOnce() -> WaitConditionResult<Option<PiWaiter>>,
         A: FnOnce(&PiWaiter) -> AxResult<()>,
     {
-        let mut published: Option<PiWaiter> = None;
-        let registration =
-            self.register_waiter_if_condition(owner, bitset, timeout, None, || {
-                let decided = condition()?;
-                published = decided;
-                Ok(decided.is_some())
-            });
-        let mut registration = match registration {
-            Ok(Some(registration)) => registration,
+        let registration = self.register_pi_waiter_if_condition(owner, bitset, timeout, condition);
+        let (mut registration, published) = match registration {
+            Ok(Some(published)) => published,
             Ok(None) => {
                 return PiWaitOutcome {
                     result: Ok(false),
@@ -1251,9 +1355,7 @@ impl WaitQueue {
                 };
             }
         };
-        if let Some(pi) = published.as_ref()
-            && let Err(error) = on_queued(pi)
-        {
+        if let Err(error) = on_queued(&published) {
             let _ = registration.resolve_terminal();
             return PiWaitOutcome {
                 result: Err(WaitConditionError::Fault(error)),
@@ -1377,20 +1479,32 @@ impl WaitQueue {
     /// word while both gates are held — and up to `nr_requeue` of the remaining
     /// PI waiters are moved onto `target`'s queue, where they keep their own
     /// `rt_mutex_waiter` payload and block until `target`'s unlock hands the
-    /// futex to the strongest of them. Returns `(woken, moved)`, or `None` when
-    /// `publish` lost the race against userspace.
+    /// futex to the strongest of them.
+    ///
+    /// The three outcomes mirror the three ways `futex_requeue()` can leave its
+    /// `retry` loop. `NoWaiters` is `futex_proxy_trylock_atomic()` returning 0
+    /// because `futex_top_waiter()` found nothing to promote; `Retry` is the
+    /// loop's own `goto retry` after a lost publication race; `Done` is the
+    /// completed move. Reporting the first two as one value makes a source
+    /// queue that will never have a waiter indistinguishable from a race that
+    /// resolves itself, and the caller then retries forever.
     pub fn pi_requeue<P>(
         &self,
         target: &WaitQueue,
         target_owner: WaiterOwner,
         nr_requeue: usize,
         mut publish: P,
-    ) -> Option<(usize, usize)>
+    ) -> PiRequeueOutcome
     where
         P: FnMut(u32) -> bool,
     {
         if core::ptr::eq(self, target) {
-            return None;
+            // Unreachable: `futex_requeue()` rejects `key1 == key2` with
+            // `-EINVAL` before it ever reaches the retry loop, so a caller
+            // that gets here has already reported an error and this arm only
+            // preserves "nothing was published, the caller must not report
+            // success".
+            return PiRequeueOutcome::Retry;
         }
         let mut pending_wakers = WakeBatch::default();
         // Waiters are either woken or moved; none is retired here.
@@ -1398,9 +1512,11 @@ impl WaitQueue {
         let result = Self::with_two_gates(self, target, || {
             let mut src = self.queue.lock();
             let mut dst = target.queue.lock();
-            let (top, pi) = Self::pi_top_locked(&src)?;
+            let Some((top, pi)) = Self::pi_top_locked(&src) else {
+                return PiRequeueOutcome::NoWaiters;
+            };
             if !publish(pi.tid) {
-                return None;
+                return PiRequeueOutcome::Retry;
             }
             let initial_len = src.len;
             let mut woke = 0;
@@ -1441,7 +1557,7 @@ impl WaitQueue {
                     src.push_back(waiter);
                 }
             }
-            Some((woke, moved))
+            PiRequeueOutcome::Done { woke, moved }
         });
         pending_wakers.finish();
         retired.finish();
@@ -2262,7 +2378,7 @@ mod tests {
         let target = table.get_or_insert_owned(&target_key);
         let registration = source
             .wq
-            .register_waiter_if_condition(source.waiter_owner(), u32::MAX, None, None, || Ok(true))
+            .register_waiter_if_condition(source.waiter_owner(), u32::MAX, None, || Ok(true))
             .unwrap()
             .expect("waiter registration failed");
 
@@ -2880,25 +2996,23 @@ mod pi_tests {
         // `FUTEX_LOCK_PI` creates the entry's `futex_pi_state` before it ever
         // queues a waiter; `is_pi()` observes exactly that.
         let _pi_state = entry.pi_state();
-        let mut published = None;
-        let registration = entry
+        let (registration, published) = entry
             .wq
-            .register_waiter_if_condition(
+            .register_pi_waiter_if_condition(
                 WaiterOwner::without_table(Arc::downgrade(entry), FutexTableKey::Private(0)),
                 u32::MAX,
                 None,
-                None,
-                || {
-                    published = Some(PiWaiter::new(tid, sched));
-                    Ok(true)
-                },
+                || Ok(Some(PiWaiter::new(tid, sched))),
             )
             .expect("PI waiter registration failed")
             .expect("PI waiter condition rejected");
-        // `register_waiter_if_condition` stores the payload at construction
-        // time, so attach it to the just-published node directly.
-        let node = registration.waiter.as_ref().unwrap();
-        node.lock().pi = published;
+        // The payload the top-waiter search reads is the one publication
+        // stored, not a copy attached afterwards.
+        assert_eq!(
+            entry.wq.pi_top_tid(),
+            Some(published.tid),
+            "a published PI waiter must be visible to rt_mutex_top_waiter()"
+        );
         registration
     }
 
@@ -3035,5 +3149,31 @@ mod pi_tests {
         assert_eq!(entry.wq.wake_inner(1, u32::MAX, true), Err(()));
         // The PI paths themselves must still be able to wake.
         assert_eq!(entry.wq.wake_inner(0, u32::MAX, false), Ok(0));
+    }
+
+    /// The regression test for a dropped hand-off.
+    ///
+    /// `wake_futex_pi()` reads the top waiter out of the queue that
+    /// `futex_lock_pi_atomic()` published (`kernel/futex/pi.c:1090-1100`), so a
+    /// `FUTEX_UNLOCK_PI` which finds `futex_top_waiter() == NULL` publishes no
+    /// hand-off and the waiter sleeps on. A payload attached to the queue node
+    /// anywhere but by the publication itself is invisible to that search.
+    #[test]
+    fn published_pi_waiter_is_the_one_unlock_hands_the_futex_to() {
+        let entry = Arc::new(FutexEntry::new());
+        let _registration = add_pi_waiter(&entry, 42, fifo(1));
+        assert_eq!(entry.wq.pi_top_tid(), Some(42));
+
+        let state = entry.pi_state();
+        state.attach(7);
+        let mut published = vec![];
+        assert_eq!(
+            entry.wq.pi_unlock(|top| {
+                published.push(top);
+                true
+            }),
+            PiUnlockOutcome::HandedOff(42)
+        );
+        assert_eq!(published, vec![Some(42)]);
     }
 }

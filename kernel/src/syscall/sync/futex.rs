@@ -20,8 +20,9 @@ use crate::{
         check_user_readable_with, check_user_writable_with, map_usercopy_error,
     },
     task::{
-        AlarmClock, AsThread, FutexHandle, FutexKey, FutexWaitRestart, PiUnlockOutcome, PiWaiter,
-        PtraceAccessMode, RestartBlock, Thread, WaitConditionError, WaitConditionResult,
+        AlarmClock, AsThread, FutexHandle, FutexKey, FutexWaitRestart, PiRequeueOutcome,
+        PiUnlockOutcome, PiWaiter, PtraceAccessMode, RestartBlock, Thread, WaitConditionError,
+        WaitConditionResult,
         check_current_thread_ptrace_image_access, futex_table_for, get_visible_task,
         pi_boost_owner, pi_deboost_owner, wait_on_any_futex_if_atomic,
     },
@@ -1498,7 +1499,7 @@ fn do_futex_cmp_requeue_pi(
         );
 
         match result {
-            Some((woke, moved)) => {
+            PiRequeueOutcome::Done { woke, moved } => {
                 if let Some(top_tid) = promoted {
                     // The promoted waiter is the target's new owner; it is the
                     // one that will boost whoever contends on it next.
@@ -1509,7 +1510,33 @@ fn do_futex_cmp_requeue_pi(
                 source_futex.release_pi_state_if_idle();
                 return Ok((woke + moved) as isize);
             }
-            None => {
+            PiRequeueOutcome::NoWaiters => {
+                // `futex_proxy_trylock_atomic()` returns 0 without taking the
+                // proxy lock when `futex_top_waiter()` finds nothing to
+                // promote:
+                //
+                //     /*
+                //      * If there are no waiters, nothing for us to do:
+                //      */
+                //     if (WARN_ON_ONCE(!top_waiter))
+                //             return 0;
+                //
+                // (`kernel/futex/requeue.c:307-310`).  `futex_requeue()` then
+                // skips the chain walk entirely and returns its `task_count`
+                // (`requeue.c:757` initialises it to 0, `requeue.c:900-903`
+                // returns `ret ? ret : task_count`), so requeueing an empty
+                // source reports that nothing was moved instead of retrying an
+                // operation which can never publish.
+                let _ = &source_expected;
+                if requeue_mapping_check(private, source_namespace) {
+                    let _ = fault_read_u32(caller, source)?;
+                }
+                if requeue_mapping_check(private, target_namespace) {
+                    let _ = fault_read_u32(caller, target)?;
+                }
+                return Ok(0);
+            }
+            PiRequeueOutcome::Retry => {
                 if let Some(error) = failure {
                     return Err(error);
                 }
