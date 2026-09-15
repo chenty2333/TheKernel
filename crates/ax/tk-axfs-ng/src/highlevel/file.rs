@@ -29,8 +29,8 @@ use axfs_ng_vfs::{
     ImmediateFileIoResult, Location, Mountpoint, NodeFlags, NodePermission, NodeType,
     NowaitAdmission, OwnedFileIoCompletion,
     PhysicalIoNotSubmittedReason as PhysicalIoAttemptNotSubmittedReason, PreparedFileIo,
-    PreparedFileIoSubmission, SubmittedFileIo, SubmittedFileIoControl, VfsError, VfsResult,
-    WeakDirEntry, WritebackAnchor,
+    PreparedFileIoSubmission, RangeMutation, SubmittedFileIo, SubmittedFileIoControl, VfsError,
+    VfsResult, WeakDirEntry, WritebackAnchor,
 };
 #[cfg(feature = "times")]
 use axfs_ng_vfs::{MetadataUpdate, Timestamp};
@@ -11212,7 +11212,7 @@ impl File {
     /// description while keeping the page cache coherent with the provider.
     /// Stateful filesystems use the per-open handle; ordinary local files use
     /// the inode node retained by the location.
-    pub fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<()> {
+    pub fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<RangeMutation> {
         let native_mutation = begin_native_location_mutation(self.location(), false)?;
         self.mutate_range_with_held_native_mutation(request, &native_mutation)
     }
@@ -11225,7 +11225,7 @@ impl File {
         &self,
         request: FileRangeRequest,
         native_mutation: &Option<FileAttrMutationGuard>,
-    ) -> VfsResult<()> {
+    ) -> VfsResult<RangeMutation> {
         self.access(FileFlags::WRITE)?;
         self.admit_native_mutation(Some(request.offset), false)?;
         let location = self.location().clone();

@@ -235,12 +235,7 @@ pub(crate) fn owner_or_capable_with_idmap(
     idmap: Option<&mounts::MountIdmap>,
 ) -> bool {
     let Some(idmap) = idmap else {
-        return security.credentials().uid().into_raw() == metadata.uid
-            || ns_capable(
-                security.actor(),
-                security.filesystem_owner_user_ns(),
-                CAP_FOWNER,
-            );
+        return owner_or_capable_uid(metadata.uid, security, None);
     };
     // Metadata stores filesystem (outside) IDs.  A mounted idmap projects
     // those through the mount's immutable outside->inside rows before owner
@@ -252,8 +247,42 @@ pub(crate) fn owner_or_capable_with_idmap(
             .then_some(row.inside.checked_add(metadata.uid - row.outside))
             .flatten()
     });
-    mapped_uid == Some(security.credentials().uid().into_raw())
-        || ns_capable(security.actor(), idmap.user_namespace(), CAP_FOWNER)
+    owner_or_capable_uid(mapped_uid.unwrap_or(u32::MAX), security, Some(idmap))
+}
+
+/// `inode_owner_or_capable(mnt_idmap, inode)` for a caller which already holds
+/// the inode's user-visible owner id.
+///
+/// `stat(2)` publishes the mount-idmap projection of the filesystem ids
+/// (`location_to_kstat_with_idmap()` applies the same rows as
+/// `i_uid_into_vfsuid()`), so a descriptor whose owner is only observable
+/// through its own inode view can still take exactly the Linux decision.
+/// That matters for anonymous objects: Linux's `inode_init_always()` gives
+/// every fresh inode `i_uid = GLOBAL_ROOT_UID` and `i_gid = GLOBAL_ROOT_GID`
+/// (fs/inode.c:244), so an eventfd, timerfd, signalfd, epoll, inotify or
+/// socket inode is root-owned even though no `vfs_location()` exists behind
+/// the descriptor.
+pub(crate) fn owner_or_capable_uid(
+    owner_uid: u32,
+    security: &VfsSecurityContext,
+    idmap: Option<&mounts::MountIdmap>,
+) -> bool {
+    let owned = security.credentials().uid().into_raw() == owner_uid;
+    match idmap {
+        None => {
+            owned
+                || ns_capable(
+                    security.actor(),
+                    security.filesystem_owner_user_ns(),
+                    CAP_FOWNER,
+                )
+        }
+        // `owner_uid` is already the projected (inside) id here, so only the
+        // capability check still needs the idmap's user namespace.
+        Some(idmap) => {
+            owned || ns_capable(security.actor(), idmap.user_namespace(), CAP_FOWNER)
+        }
+    }
 }
 
 pub(crate) fn get_file_attr(

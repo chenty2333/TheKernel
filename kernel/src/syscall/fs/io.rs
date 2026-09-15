@@ -9,7 +9,8 @@ use axfs::{FadviseReadahead, FileFlags, OpenOptions, PhysicalIoOperation, Pinned
 use axfs_ng_vfs::{
     FileIoOpcode, FileIoPolicy, FileIoPrepareError, FileIoRequest, FileIoSyncMode,
     FileIoWritePlacement, FileRangeOperation, FileRangeRequest, FsPathBuf, Location,
-    MetadataUpdate, NodeFlags, NodeType, OwnedFileIoCompletion, PhysicalIoSegment, VfsError,
+    MetadataUpdate, NodeFlags, NodeType, OwnedFileIoCompletion, PhysicalIoSegment, RangeMutation,
+    VfsError,
 };
 use axio::{IoBufMut, Seek, SeekFrom, Write};
 use axnet::SocketTransferDirection;
@@ -4431,7 +4432,7 @@ pub(crate) fn fallocate_file_like(
         // variant avoids recursively taking the same non-reentrant token.
         let native_mutation = file.begin_native_mutation(false)?;
         match file.mutate_range_with_held_native_mutation(request, &native_mutation) {
-            Ok(()) => {
+            Ok(RangeMutation::Applied) => {
                 // Native range providers have already committed their extent
                 // transaction.  FS_SYNC is nevertheless an inode attribute,
                 // so success is not reportable until the provider's normal
@@ -4448,7 +4449,28 @@ pub(crate) fn fallocate_file_like(
                 drop(native_mutation);
                 return Ok(0);
             }
+            // A provider that owns this range operation has refused it.  That
+            // refusal is the answer, exactly as `file->f_op->fallocate()`
+            // returns it: `vfs_fallocate()` only substitutes EOPNOTSUPP for
+            // the *absence* of a handler (`if (!file->f_op->fallocate) return
+            // -EOPNOTSUPP;`, fs/open.c:334-335), and ext4's handler rejects a
+            // mode bit it does not implement the same way -- the mask omits
+            // FALLOC_FL_UNSHARE_RANGE, so
+            //   /* Return error if mode is not supported */
+            //   if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
+            //                FALLOC_FL_ZERO_RANGE | FALLOC_FL_COLLAPSE_RANGE |
+            //                FALLOC_FL_INSERT_RANGE | FALLOC_FL_WRITE_ZEROES))
+            //           return -EOPNOTSUPP;
+            // (fs/ext4/extents.c:4877-4881).  Falling through to the generic
+            // range path here would answer EINVAL or silently succeed for a
+            // mutation the provider just declined to perform.
             Err(VfsError::OperationNotSupported) => {
+                drop(native_mutation);
+                return Err(AxError::OperationNotSupported);
+            }
+            // No native handler exists for this range operation, so the
+            // generic path below is the only implementation the mount has.
+            Ok(RangeMutation::NotNative) => {
                 drop(native_mutation);
             }
             Err(error) => return Err(AxError::from(error)),

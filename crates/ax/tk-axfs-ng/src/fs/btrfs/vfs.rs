@@ -20,8 +20,8 @@ use axerrno::AxError;
 use axfs_ng_vfs::{
     DirEntry, DirEntrySink, DirNode, DirNodeOps, FileAttr, FileAttrProvider, FileNode, FileNodeOps,
     FileRangeOperation, FileRangeRequest, Filesystem, FilesystemOps, FsName, LockOps, Metadata,
-    MetadataUpdate, NodeFlags, NodeOps, NodeType, NodeUserData, ObjectKey, Reference, StatFs,
-    Timestamp, VfsError, VfsResult, WeakDirEntry, XattrProvider, XattrSetMode,
+    MetadataUpdate, NodeFlags, NodeOps, NodeType, NodeUserData, ObjectKey, RangeMutation, Reference,
+    StatFs, Timestamp, VfsError, VfsResult, WeakDirEntry, XattrProvider, XattrSetMode,
 };
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use axsync::Mutex;
@@ -2366,7 +2366,7 @@ impl FileNodeOps for BtrfsOpenFile {
     fn supports_nowait_write(&self) -> bool {
         self.inode.supports_nowait_write()
     }
-    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<()> {
+    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<RangeMutation> {
         self.inode.mutate_range(request)
     }
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
@@ -2640,7 +2640,7 @@ impl FileNodeOps for BtrfsInode {
         true
     }
 
-    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<()> {
+    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<RangeMutation> {
         // One mount critical section covers the inode size, extent snapshot,
         // range plan, and mutation commit.  Sampling i_size before taking the
         // mount mutex can otherwise combine an old size with a new extent
@@ -2659,7 +2659,7 @@ impl FileNodeOps for BtrfsInode {
         // a sparse multi-terabyte inode must not turn an O(1) no-op into a
         // file-sized allocation or scan.
         if matches!(request.operation, FileRangeOperation::PunchHole) && request.offset >= size {
-            return Ok(());
+            return Ok(RangeMutation::Applied);
         }
         let final_size = match request.operation {
             FileRangeOperation::Allocate { keep_size }
@@ -2965,7 +2965,7 @@ impl FileNodeOps for BtrfsInode {
                 &segments,
             )
             .map_err(vfs)?;
-        Ok(())
+        Ok(RangeMutation::Applied)
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {

@@ -2434,20 +2434,24 @@ pub fn sys_fcntl(
             // descriptor is backed by a real filesystem inode rather than a
             // pseudo object.
             let can_odirect = description.inner.vfs_location().is_some();
-            // `IS_APPEND(inode)`, taken from the same attribute word that
-            // statx publishes.
-            let append_only =
-                description.inner.stat()?.attributes & u64::from(STATX_ATTR_APPEND) != 0;
+            // `IS_APPEND(inode)`, from the descriptor's own inode view; this is
+            // the same attribute word statx publishes.
+            let stat = description.inner.stat()?;
+            let append_only = stat.attributes & u64::from(STATX_ATTR_APPEND) != 0;
             // `inode_owner_or_capable(file_mnt_idmap(filp), inode)` against the
             // mount view this exact open file description was created under.
-            let noatime_owner_or_capable = match description.inner.vfs_location() {
-                Some(location) => inode_flags::owner_or_capable_with_idmap(
-                    &location.metadata()?,
-                    &VfsSecurityContext::new(current().as_thread().current_cred()),
-                    description.vfs_mount_idmap().as_deref(),
-                ),
-                None => false,
-            };
+            // The owner comes from the descriptor's inode (`stat(2)` applies
+            // the same mount-idmap projection as `i_uid_into_vfsuid()`), not
+            // from a VFS location: anonymous objects (eventfd, timerfd,
+            // signalfd, epoll, inotify, sockets, ...) keep no location but are
+            // still root-owned inodes on Linux, and `setfl()`
+            // (fs/fcntl.c:39-54) asks about the inode, so refusing them here
+            // denied the whole CAP_FOWNER class a legal `O_NOATIME` set.
+            let noatime_owner_or_capable = inode_flags::owner_or_capable_uid(
+                stat.uid,
+                &VfsSecurityContext::new(current().as_thread().current_cred()),
+                description.vfs_mount_idmap().as_deref(),
+            );
             let plan = tk_linux_fd::plan_setfl(
                 arg as u32,
                 current_flags,

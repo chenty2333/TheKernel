@@ -144,6 +144,23 @@ pub fn sys_epoll_ctl<M: UserMemory + ?Sized>(
     fd: i32,
     event: *const epoll_event,
 ) -> AxResult<isize> {
+    // Linux `SYSCALL_DEFINE4(epoll_ctl)` copies the event for every operation
+    // except DEL (`ep_op_has_event()`) *before* it resolves either descriptor
+    // (fs/eventpoll.c:2753-2755):
+    //     if (ep_op_has_event(op) &&
+    //         copy_from_user(&epds, event, sizeof(struct epoll_event)))
+    //             return -EFAULT;
+    //     return do_epoll_ctl(epfd, op, fd, &epds, false);
+    // so an unusable `event` pointer is EFAULT even when `epfd` or `fd` is
+    // itself invalid.  This kernel previously resolved both descriptors
+    // first, which answered EBADF for the same call.
+    let control = EpollControl::from_raw(op);
+    let request = if control.carries_event() {
+        Some(parse_epoll_ctl_event(memory, event)?)
+    } else {
+        None
+    };
+
     let epoll_description = get_file_description(epfd)?;
     let target = get_file_description(fd)?;
     if Arc::ptr_eq(&epoll_description, &target) {
@@ -159,17 +176,10 @@ pub fn sys_epoll_ctl<M: UserMemory + ?Sized>(
     // control operation; ADD, MOD, DEL, and even an unknown op report EBADF.
     check_epoll_target(target.is_path_only())?;
 
-    // Linux `SYSCALL_DEFINE4(epoll_ctl)` copies the event for every operation
-    // except DEL (`ep_op_has_event()`), and `do_epoll_ctl_file()` then applies
-    // `ep_take_care_of_epollwakeup()` and the EPOLLEXCLUSIVE admission rule
-    // *before* the operation switch and any interest lookup. Keeping that
-    // order keeps EFAULT, EINVAL, EEXIST, and ENOENT precedence intact.
-    let control = EpollControl::from_raw(op);
-    let request = if control.carries_event() {
-        Some(parse_epoll_ctl_event(memory, event)?)
-    } else {
-        None
-    };
+    // `do_epoll_ctl_file()` then applies `ep_take_care_of_epollwakeup()` and
+    // the EPOLLEXCLUSIVE admission rule *before* the operation switch and any
+    // interest lookup. Keeping that order keeps EINVAL, EEXIST, and ENOENT
+    // precedence intact.
     if let Some(request) = &request {
         // `ep_take_care_of_epollwakeup()` clears the bit in place. With no
         // suspend blocker to attach, the cleared mask is also what this kernel
@@ -191,8 +201,19 @@ pub fn sys_epoll_ctl<M: UserMemory + ?Sized>(
             // caller explicitly asked to avoid. Report it the way Linux reports
             // a target that cannot participate in the epoll wakeup contract,
             // `do_epoll_ctl_file()`'s `!file_can_poll(tf->file) -> -EPERM`.
-            ExclusiveAdmission::Admitted => return Err(AxError::OperationNotPermitted),
-            ExclusiveAdmission::Absent => {}
+            //
+            // The refusal is confined to ADD because that is the only
+            // operation Linux routes into an exclusive registration: the
+            // EPOLLEXCLUSIVE block matches `op == EPOLL_CTL_MOD` and
+            // `op == EPOLL_CTL_ADD` alone (fs/eventpoll.c:2668-2676), DEL
+            // never carries an event (`ep_op_has_event()`), and any other
+            // operation falls through to the switch below, whose default arm
+            // answers -EINVAL (fs/eventpoll.c:2690).  Answering EPERM
+            // for the unknown operation instead would hide that EINVAL.
+            ExclusiveAdmission::Admitted if control == EpollControl::Add => {
+                return Err(AxError::OperationNotPermitted);
+            }
+            ExclusiveAdmission::Admitted | ExclusiveAdmission::Absent => {}
         }
     }
 

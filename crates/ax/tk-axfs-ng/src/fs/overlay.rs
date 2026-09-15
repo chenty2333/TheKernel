@@ -24,8 +24,8 @@ use axfs_ng_vfs::{
     ExportHandleDecodeMode, ExportHandleMode, FileLock, FileNode, FileNodeOps, FileRangeRequest,
     Filesystem, FilesystemOps, FsName, FsNameBuf, FsPath, FsPathBuf, Location, LockOps, Metadata,
     MetadataUpdate, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData, ObjectKey,
-    QuotaOps, QuotaUsage, Reference, RenameRequest, StatFs, UnlinkRequest, VfsError, VfsResult,
-    XattrSetMode,
+    QuotaOps, QuotaUsage, RangeMutation, Reference, RenameRequest, StatFs, UnlinkRequest, VfsError,
+    VfsResult, XattrSetMode,
 };
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
 use axsync::Mutex;
@@ -3340,7 +3340,7 @@ impl QuotaOps for OverlayFile {
 }
 
 impl FileNodeOps for OverlayFile {
-    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<()> {
+    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<RangeMutation> {
         // Range mutations change allocation as well as data.  They must never
         // be forwarded to a visible lower inode: force the same serialized
         // workdir-backed copy-up used by ordinary writes, then delegate the
