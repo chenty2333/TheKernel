@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 309
-implemented = 290
+resolved = 310
+implemented = 291
 explicit_enosys = 19
 fallback = 0
-partial = 76
+partial = 75
 unknown = 0
 
 [[contract]]
@@ -3054,7 +3054,7 @@ handler = "kernel/src/syscall/ipc/mqueue.rs:sys_mq_open"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Direct Linux 7.2.3 guest queue permissions, blocking handoff, notification and resource-limit matrix remains unexecuted"]
-limitations = ["Configured message count/size admission differs from Linux default and CAP_SYS_RESOURCE hard-limit bypass; RLIMIT_MSGQUEUE omits per-message and priority-tree overhead"]
+limitations = ["Namespace queue-count admission counts live named queues only; Linux increments mq_queues_count in mqueue_create_attr() and decrements it only in mqueue_evict_inode() (ipc/mqueue.c:557, :586), so an unlinked-but-open queue keeps its slot and create/unlink/close bursts answer ENOSPC where this kernel admits them"]
 
 [[contract]]
 id = "linux-mq_unlink"
@@ -3077,7 +3077,7 @@ handler = "kernel/src/syscall/ipc/mqueue.rs:sys_mq_unlink"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Direct Linux 7.2.3 guest queue permissions, blocking handoff, notification and resource-limit matrix remains unexecuted"]
-limitations = ["Non-owner rejection returns EACCES rather than Linux sticky-directory EPERM; queue-owner check does not implement directory-owner unlink authority"]
+limitations = ["An unlinked queue releases its namespace queue-count slot immediately; Linux holds the slot until mqueue_evict_inode() retires the inode (ipc/mqueue.c:557), so a create/unlink/close burst is admitted here where Linux answers ENOSPC"]
 
 [[contract]]
 id = "linux-mq_timedsend"
@@ -3100,7 +3100,7 @@ handler = "kernel/src/syscall/ipc/mqueue.rs:sys_mq_timedsend"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Direct Linux 7.2.3 guest queue permissions, blocking handoff, notification and resource-limit matrix remains unexecuted"]
-limitations = ["No direct handoff to a blocked receiver; an empty-to-nonempty insertion may deliver mq_notify where Linux hands off without a notification"]
+limitations = ["Blocked queue waiters are served in arrival order; Linux's wq_add() inserts before the first waiter with task->prio <= current->prio and wq_get_first_waiter() returns the tail (ipc/mqueue.c:689-701, :757), so waiters at different nice values are ordered differently"]
 
 [[contract]]
 id = "linux-mq_timedreceive"
@@ -3123,7 +3123,7 @@ handler = "kernel/src/syscall/ipc/mqueue.rs:sys_mq_timedreceive"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/ipc/mqueue.rs:receive_copyout_fault_wakes_sender_after_freeing_capacity"]
 validation_gaps = ["Direct Linux 7.2.3 guest queue permissions, blocking handoff, notification and resource-limit matrix remains unexecuted"]
-limitations = ["Dequeued capacity wakes competing senders instead of transferring the slot through Linux priority-ordered pipelined sender handoff"]
+limitations = ["Blocked queue waiters are served in arrival order; Linux's wq_add() inserts by task->prio and wq_get_first_waiter() returns the tail (ipc/mqueue.c:689-701, :757), so waiters at different nice values are ordered differently"]
 
 [[contract]]
 id = "linux-mq_notify"
@@ -3140,13 +3140,13 @@ teardown = ["teardown:unlinked queues survive retained descriptors; notification
 [[cell]]
 number = 244
 name = "mq_notify"
-status = "partial"
+status = "implemented"
 contract = "linux-mq_notify"
 handler = "kernel/src/syscall/ipc/mqueue.rs:sys_mq_notify"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/ipc/mqueue.rs:owner_exit_cancels_unlinked_but_open_notification"]
-validation_gaps = ["Direct Linux 7.2.3 guest queue permissions, blocking handoff, notification and resource-limit matrix remains unexecuted"]
-limitations = ["Notification can fire for a message consumed by an already waiting receiver because send does not use direct handoff"]
+tests = ["kernel/src/syscall/ipc/mqueue.rs:owner_exit_cancels_unlinked_but_open_notification", "tests/guest/portable/posix-mqueue-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-mq_getsetattr"
