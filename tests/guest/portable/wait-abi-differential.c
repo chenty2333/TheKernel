@@ -45,6 +45,9 @@
 #define MPOL_INTERLEAVE 3
 #define MPOL_WEIGHTED_INTERLEAVE 4
 #define MPOL_PREFERRED_MANY 5
+#define MPOL_F_NUMA_BALANCING (1 << 13)
+#define MPOL_F_RELATIVE_NODES (1 << 14)
+#define MPOL_F_STATIC_NODES (1 << 15)
 #define MPOL_F_NODE (1 << 0)
 #define MPOL_F_ADDR (1 << 1)
 #define MPOL_F_MEMS_ALLOWED (1 << 2)
@@ -410,6 +413,36 @@ int main(void)
                syscall(SYS_mbind, 0, 0, 0xffff, (void *)1, 64, 0), EINVAL);
     EXPECT_ERR("set_mempolicy-bad-mode",
                syscall(SYS_set_mempolicy, 0xffff, NULL, 0), EINVAL);
+    /* sanitize_mpol_flags() splits MPOL_MODE_FLAGS out of the mode argument.
+     * MPOL_F_NUMA_BALANCING is only legal for MPOL_BIND and
+     * MPOL_PREFERRED_MANY; STATIC|RELATIVE together is never legal. Both are
+     * rejected before the (unreadable) mask is touched. */
+    EXPECT_ERR("set_mempolicy-balancing-default",
+               syscall(SYS_set_mempolicy, MPOL_DEFAULT | MPOL_F_NUMA_BALANCING, (void *)1, 64),
+               EINVAL);
+    EXPECT_ERR("set_mempolicy-balancing-preferred",
+               syscall(SYS_set_mempolicy, MPOL_PREFERRED | MPOL_F_NUMA_BALANCING, (void *)1, 64),
+               EINVAL);
+    EXPECT_ERR("set_mempolicy-balancing-interleave",
+               syscall(SYS_set_mempolicy, MPOL_INTERLEAVE | MPOL_F_NUMA_BALANCING, (void *)1, 64),
+               EINVAL);
+    EXPECT_ERR("set_mempolicy-static-and-relative",
+               syscall(SYS_set_mempolicy, MPOL_BIND | MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES,
+                       (void *)1, 64),
+               EINVAL);
+    /* The same bits are legal shaping for MPOL_BIND, so the mask is read. */
+    EXPECT_ERR("set_mempolicy-balancing-bind-reads-mask",
+               syscall(SYS_set_mempolicy, MPOL_BIND | MPOL_F_NUMA_BALANCING, (void *)1, 64),
+               EFAULT);
+    EXPECT_ERR("set_mempolicy-balancing-preferred-many-reads-mask",
+               syscall(SYS_set_mempolicy, MPOL_PREFERRED_MANY | MPOL_F_NUMA_BALANCING, (void *)1, 64),
+               EFAULT);
+    /* MPOL_F_STATIC_NODES/RELATIVE_NODES are *not* mode bits: putting them in
+     * an mbind mode is accepted, and they only affect mask interpretation. */
+    EXPECT_ERR("set_mempolicy-static-bind-reads-mask",
+               syscall(SYS_set_mempolicy, MPOL_BIND | MPOL_F_STATIC_NODES, (void *)1, 64), EFAULT);
+    EXPECT_ERR("set_mempolicy-relative-bind-reads-mask",
+               syscall(SYS_set_mempolicy, MPOL_BIND | MPOL_F_RELATIVE_NODES, (void *)1, 64), EFAULT);
     /* `maxnode` is a bit count compared against PAGE_SIZE * BITS_PER_BYTE
      * *after* the decrement, so 32769 is the largest admitted window. 32770 is
      * EINVAL before the mask is read at all; 32769 is admitted and then faults

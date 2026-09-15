@@ -6883,11 +6883,13 @@ mod tests {
             runtime_ns: 60,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         let contender_config = DeadlineParameters {
             runtime_ns: 50,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         scheduler
             .stage_task_deadline_config(&sleeper, sleeper_config)
@@ -6924,6 +6926,7 @@ mod tests {
             runtime_ns: 25,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         scheduler.stage_task_deadline_config(&task, config).unwrap();
         let _ = scheduler
@@ -7000,11 +7003,13 @@ mod tests {
             runtime_ns: 25,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         let replacement = DeadlineParameters {
             runtime_ns: 40,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         scheduler
             .stage_task_deadline_config(&task, original)
@@ -7038,6 +7043,7 @@ mod tests {
             runtime_ns: 25,
             deadline_ns: 100,
             period_ns: 120,
+            flags: 0,
         };
         scheduler.stage_task_deadline_config(&task, config).unwrap();
         let _ = scheduler
@@ -7070,6 +7076,7 @@ mod tests {
             runtime_ns: 25,
             deadline_ns: 100,
             period_ns: 120,
+            flags: 0,
         };
         scheduler.stage_task_deadline_config(&task, config).unwrap();
         let _ = scheduler
@@ -7124,6 +7131,7 @@ mod tests {
             runtime_ns: 60,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         let mut source = EEVDFScheduler::new();
         let mut destination = EEVDFScheduler::new();
@@ -7156,6 +7164,7 @@ mod tests {
             runtime_ns: 60,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         let mut first = EEVDFScheduler::new();
         let mut second = EEVDFScheduler::new();

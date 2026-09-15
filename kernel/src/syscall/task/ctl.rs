@@ -1,4 +1,4 @@
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::{
     mem::{self, MaybeUninit},
     sync::atomic::{AtomicU64, Ordering},
@@ -245,12 +245,10 @@ fn write_nodemask<M: UserMemory + ?Sized>(
             return Err(AxError::InvalidInput);
         }
         // `clear_user()` past the node mask; a failure there is EFAULT.
-        let mut padding = Vec::new();
-        padding.resize(copy - node_bytes, 0u8);
         vm_write_slice(
             memory,
             (nodemask as *mut u8).wrapping_add(node_bytes),
-            &padding,
+            &vec![0u8; copy - node_bytes],
         )
         .map_err(map_usercopy_error)?;
         (node_bytes, NR_NODE_IDS)
@@ -273,7 +271,7 @@ fn validate_mempolicy(
     has_nodes: bool,
 ) -> AxResult<tk_linux_mm::MempolicyRequest> {
     validate_mempolicy_request(
-        mode_with_flags as u32 & 0xffff_ffff,
+        mode_with_flags as u32,
         nodemask,
         has_nodes,
         current_allowed_nodemask(),
@@ -1656,7 +1654,7 @@ pub fn sys_set_mempolicy<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     // `sanitize_mpol_flags()` first: this rejects an out-of-range mode and a
     // STATIC|RELATIVE combination before the mask is read.
-    let mode = mode as u32 & 0xffff_ffff;
+    let mode = mode as u32;
     sanitize_mode_flags(mode).map_err(mempolicy_error)?;
     let nodes = read_nodemask(memory, nodemask, maxnode)?;
     let request = tk_linux_mm::validate(mode, nodes, !nodemask.is_null(), current_allowed_nodemask())
@@ -1685,7 +1683,7 @@ pub fn sys_mbind<M: UserMemory + ?Sized>(
     maxnode: usize,
     flags: usize,
 ) -> AxResult<isize> {
-    let mode = mode as u32 & 0xffff_ffff;
+    let mode = mode as u32;
     sanitize_mode_flags(mode).map_err(mempolicy_error)?;
     let nodes = read_nodemask(memory, nodemask, maxnode)?;
     let request = tk_linux_mm::validate(mode, nodes, !nodemask.is_null(), current_allowed_nodemask())

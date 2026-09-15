@@ -1301,6 +1301,7 @@ fn group_leader_scheduler_snapshot_retains_last_successful_policy_through_exit_o
         affinity: AxCpuMask::full(),
         identity_epoch: 0,
         version: 0,
+        dl_flags: 0,
     };
     assert_eq!(*scheduler.lock(), expected);
     assert_eq!(
@@ -1367,6 +1368,7 @@ fn group_leader_handoff_reseeds_scheduler_snapshot_in_a_new_identity_epoch() {
             affinity: AxCpuMask::full(),
             identity_epoch: 1,
             version: 3,
+            dl_flags: 0,
         }
     );
 
@@ -1406,6 +1408,7 @@ fn group_leader_handoff_reseeds_scheduler_snapshot_in_a_new_identity_epoch() {
             affinity: AxCpuMask::full(),
             identity_epoch: 1,
             version: 4,
+            dl_flags: 0,
         }
     );
 }
