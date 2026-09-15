@@ -597,6 +597,7 @@ int main(void)
               rc == 0 && attr.size == 48 && attr.sched_policy == SCHED_OTHER
                   && (attr.sched_flags & SCHED_FLAG_RESET_ON_FORK) == 0);
     }
+
     done();
 
     /* ---------------- mbind(2)/set_mempolicy(2)/get_mempolicy(2) ---------- */
@@ -1101,6 +1102,78 @@ int main(void)
                            syscall(SYS_sched_getscheduler, zombie), ESRCH);
                 EXPECT_ERR("sched-getparam-after-reap",
                            syscall(SYS_sched_getparam, zombie, &param), ESRCH);
+            }
+        }
+    }
+    /* ---------------- exiting but unreaped task policy ------------------- *
+     * `sched_getscheduler(2)` reads `p->policy` and `p->sched_reset_on_fork`
+     * straight out of the still-hashed `task_struct`: `find_process_by_pid()`
+     * finds the task and the two fields are copied back
+     * (`kernel/sched/syscalls.c:995-1015`), and only `release_task()`
+     * unhashes it at reap time.  A child that has started exiting therefore
+     * keeps answering with the policy it last installed.
+     *
+     * `waitid(WEXITED|WNOWAIT)` anchors the window: it returns as soon as the
+     * exit is published and deliberately leaves the child unreaped, so every
+     * sample below is taken while the child is a zombie whose task can still be
+     * addressed.  The sampler then polls in a tight loop, which keeps the weak
+     * task-table entry upgraded across the interval in which the scheduler
+     * entity is already gone but the task object is not. */
+    {
+        int ready[2];
+        if (pipe(ready) != 0) {
+            check("sched-getscheduler-exiting-keeps-policy", 0);
+        } else {
+            pid_t target = fork();
+            if (target == 0) {
+                struct sched_param param = {.sched_priority = 0};
+                char byte = 'R';
+                close(ready[0]);
+                if (syscall(SYS_sched_setscheduler, 0, SCHED_BATCH | SCHED_RESET_ON_FORK,
+                            &param) != 0)
+                    _exit(1);
+                if (write(ready[1], &byte, 1) != 1) _exit(1);
+                _exit(0);
+            }
+            close(ready[1]);
+            if (target < 0) {
+                close(ready[0]);
+                check("sched-getscheduler-exiting-keeps-policy", 0);
+            } else {
+                char byte = 0;
+                siginfo_t info;
+                struct timespec start, now;
+                long samples = 0, refused = 0, wrong = 0, first_errno = 0;
+                int exited = 0;
+                int ack = (int)read(ready[0], &byte, 1);
+                close(ready[0]);
+                memset(&info, 0, sizeof(info));
+                errno = 0;
+                exited = syscall(SYS_waitid, P_PID, target, &info, WEXITED | WNOWAIT, NULL) == 0
+                             && info.si_pid == target;
+                clock_gettime(CLOCK_MONOTONIC, &start);
+                for (;;) {
+                    long rc;
+                    errno = 0;
+                    rc = syscall(SYS_sched_getscheduler, target);
+                    samples++;
+                    if (rc == -1) {
+                        if (!refused) first_errno = errno;
+                        refused++;
+                    } else if (rc != (SCHED_BATCH | SCHED_RESET_ON_FORK)) {
+                        wrong++;
+                    }
+                    clock_gettime(CLOCK_MONOTONIC, &now);
+                    if ((now.tv_sec - start.tv_sec) * 1000000000L
+                            + (now.tv_nsec - start.tv_nsec) > 60000000L)
+                        break;
+                }
+                printf("THEKERNEL_SCHED_PROBE exiting_policy ack=%d exited=%d samples=%ld"
+                       " refused=%ld first_errno=%ld wrong=%ld\n",
+                       ack, exited, samples, refused, first_errno, wrong);
+                check("sched-getscheduler-exiting-keeps-policy",
+                      ack == 1 && exited == 1 && samples > 0 && refused == 0 && wrong == 0);
+                collect(target);
             }
         }
     }
