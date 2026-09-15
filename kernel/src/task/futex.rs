@@ -16,7 +16,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axsync::Mutex;
-use axtask::{WeakAxTaskRef, current, future::block_on};
+use axtask::{AxTaskRef, SchedClass, SchedState, WeakAxTaskRef, current, future::block_on};
 use hashbrown::HashMap;
 use kspin::SpinNoIrq;
 
@@ -228,6 +228,284 @@ pub struct WaitQueue {
     queue: SpinNoIrq<WaiterQueue>,
 }
 
+// ---------------------------------------------------------------------------
+// Priority inheritance.
+//
+// Linux keeps a `struct futex_pi_state` per contended PI futex; it embeds an
+// `rt_mutex` whose waiters are a priority-ordered `plist`, and boosts the owner
+// through `rt_mutex_setprio()` (`kernel/futex/pi.c`, `kernel/locking/rtmutex.c`).
+// This kernel has no rt_mutex, but it does have the two primitives the boost
+// needs: a genuine cross-task scheduling-state update (`axtask::set_sched_state`
+// with real RT/FIFO priority ordering) and the futex wait queue itself. The
+// state below is therefore the honest single-level reduction of `pi_state`:
+// it tracks the same owner and applies the same boost, but it does not walk a
+// `pi_blocked_on` chain and it does not inherit a SCHED_DEADLINE reservation.
+// ---------------------------------------------------------------------------
+
+/// `rt_mutex_waiter::prio`: Linux's kernel-internal priority domain, where a
+/// smaller value is a stronger task.
+///
+/// `include/linux/sched/prio.h`: RT tasks span `0..MAX_RT_PRIO-1` as
+/// `MAX_RT_PRIO - 1 - rt_priority` (`normal_prio()`), fair tasks span
+/// `MAX_RT_PRIO..MAX_PRIO-1` as `NICE_TO_PRIO(nice)` = `nice + DEFAULT_PRIO`
+/// with `DEFAULT_PRIO = MAX_RT_PRIO + NICE_WIDTH / 2`, and deadline tasks sit
+/// below every RT task at `MAX_DL_PRIO - 1`.
+pub const fn pi_kernel_priority(state: SchedState) -> i16 {
+    const MAX_RT_PRIO: i16 = 100;
+    /// `DEFAULT_PRIO`; `NICE_TO_PRIO(nice) == nice + DEFAULT_PRIO`.
+    const DEFAULT_PRIO: i16 = MAX_RT_PRIO + 20;
+    match state.class {
+        // Linux schedules deadline entities before every RT waiter and gives
+        // `dl_prio()` values below zero (`DEFAULT_PRIO - 1`).
+        SchedClass::Deadline => -1,
+        SchedClass::Fifo | SchedClass::RoundRobin => {
+            // The Linux ABI limits RT priorities to 1..=99 (`sched_setattr`);
+            // the mechanism range is wider, so clamp before negating.
+            let rt = if state.rt_priority > 99 {
+                99
+            } else {
+                state.rt_priority
+            };
+            (MAX_RT_PRIO - 1) - rt as i16
+        }
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => {
+            DEFAULT_PRIO + state.nice as i16
+        }
+    }
+}
+
+/// `rt_mutex_setprio()`'s boost target: `prio = min(p->normal_prio,
+/// pi_task->prio)`, restricted to what `set_sched_state` can express.
+///
+/// A fair owner of a fair waiter only gains weight (its nice is lowered). An
+/// RT waiter pulls the owner into the RT class at the waiter's priority, which
+/// is exactly what makes `FUTEX_LOCK_PI` bounding for a mixed workload.
+///
+/// A `SCHED_DEADLINE` waiter is deliberately *not* propagated: Linux inherits
+/// a deadline reservation through `pi_se`, and `EevdfTaskParams` carries no
+/// reservation, so `set_sched_state` would reject `SchedClass::Deadline` with
+/// `SchedulerError::InvalidParameters`. `pi_boost` therefore returns `None`
+/// rather than installing a broken deadline state.
+pub fn pi_boost(owner: SchedState, waiter: SchedState) -> Option<SchedState> {
+    if matches!(waiter.class, SchedClass::Deadline) {
+        return None;
+    }
+    let owner_priority = pi_kernel_priority(owner);
+    let waiter_priority = pi_kernel_priority(waiter);
+    if waiter_priority >= owner_priority {
+        return None;
+    }
+    let boosted = match waiter.class {
+        SchedClass::Fifo | SchedClass::RoundRobin => SchedState {
+            // Linux's PI boost uses the RT class without time slicing.
+            class: SchedClass::Fifo,
+            nice: 0,
+            rt_priority: if waiter.rt_priority == 0 {
+                1
+            } else {
+                waiter.rt_priority
+            },
+        },
+        SchedClass::Normal | SchedClass::Batch | SchedClass::Idle => SchedState {
+            class: owner.class,
+            nice: if waiter.nice < owner.nice {
+                waiter.nice
+            } else {
+                owner.nice
+            },
+            rt_priority: owner.rt_priority,
+        },
+        SchedClass::Deadline => return None,
+    };
+    Some(boosted)
+}
+
+/// Result of a queue-gated PI unlock publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PiUnlockOutcome {
+    /// A PI waiter was promoted and the user word now names it.
+    HandedOff(u32),
+    /// No PI waiter remained; the caller published the unowned word.
+    Cleared,
+    /// Nothing was published; the caller must retry or report its error.
+    Aborted,
+}
+
+/// Priority-inheritance payload of one queued waiter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PiWaiter {
+    /// TID this waiter publishes in the futex word when it becomes the owner.
+    pub tid: u32,
+    /// `rt_mutex_waiter::prio`, used to pick the top waiter and size the boost.
+    pub priority: i16,
+    /// Scheduling state handed to the owner through `pi_boost`.
+    pub sched: SchedState,
+}
+
+impl PiWaiter {
+    pub fn new(tid: u32, sched: SchedState) -> Self {
+        Self {
+            tid,
+            priority: pi_kernel_priority(sched),
+            sched,
+        }
+    }
+}
+
+/// Linux `struct futex_pi_state`, reduced to the state a single-level boost
+/// needs: who owns the futex (`pi_state->owner`), and the scheduling state
+/// that must be restored when the last PI waiter goes away.
+pub struct PiState {
+    inner: SpinNoIrq<PiStateInner>,
+}
+
+#[derive(Default)]
+struct PiStateInner {
+    /// TID currently published in the user word (`pi_state->owner`).
+    owner_tid: u32,
+    /// The live task named by `owner_tid`, when it is one of our threads.
+    owner: Option<WeakAxTaskRef>,
+    /// The owner's own scheduling state, captured before the first boost of
+    /// this PI state.
+    base: Option<SchedState>,
+    /// The state this PI state installed, so a deboost can tell whether the
+    /// owner replaced it (through `sched_setscheduler`) in the meantime.
+    boosted: Option<SchedState>,
+}
+
+impl Default for PiState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PiState {
+    fn new() -> Self {
+        Self {
+            inner: SpinNoIrq::new(PiStateInner::default()),
+        }
+    }
+
+    /// TID the user word currently names.
+    pub fn owner_tid(&self) -> u32 {
+        self.inner.lock().owner_tid
+    }
+
+    /// Linux `attach_to_pi_owner()`: bind this PI state to the task named by
+    /// the user word.
+    ///
+    /// Only the TID is recorded here. The task lookup is deferred to
+    /// [`Self::resolve_owner`] because it must not run while a futex queue gate
+    /// is held.
+    pub fn attach(&self, owner_tid: u32) {
+        let mut inner = self.inner.lock();
+        if inner.owner_tid != owner_tid {
+            // A different task owns the futex now, so the boost recorded for
+            // the previous owner says nothing about this one.
+            inner.base = None;
+            inner.boosted = None;
+        }
+        inner.owner_tid = owner_tid;
+        inner.owner = None;
+    }
+
+    /// Linux `pi_state_update_owner()`/`put_pi_state()`: the futex has no
+    /// owner any more.
+    pub fn detach(&self) {
+        self.attach(0);
+    }
+
+    /// Live owner task, if the TID names one of our threads.
+    ///
+    /// A miss is not cached: the owner may not have been created yet when a
+    /// `FUTEX_LOCK_PI` published `FUTEX_WAITERS` against a stale word, and
+    /// Linux's `attach_to_pi_owner()` retries the lookup on the blocking path.
+    pub fn resolve_owner(&self) -> Option<AxTaskRef> {
+        let (tid, cached) = {
+            let inner = self.inner.lock();
+            (
+                inner.owner_tid,
+                inner.owner.as_ref().and_then(WeakAxTaskRef::upgrade),
+            )
+        };
+        if tid == 0 {
+            return None;
+        }
+        if let Some(task) = cached {
+            return Some(task);
+        }
+        let task = crate::task::get_visible_task(tid).ok()?;
+        self.inner.lock().owner = Some(Arc::downgrade(&task));
+        Some(task)
+    }
+
+    /// Records the pre-boost scheduling state of the owner once.
+    fn remember_base(&self, current: SchedState) {
+        let mut inner = self.inner.lock();
+        if inner.base.is_none() {
+            inner.base = Some(current);
+        }
+    }
+
+    fn boosted(&self) -> Option<SchedState> {
+        self.inner.lock().boosted
+    }
+
+    fn set_boosted(&self, state: Option<SchedState>) {
+        self.inner.lock().boosted = state;
+    }
+
+    /// The state to restore when this PI state stops boosting, if the owner is
+    /// still running the boost this PI state installed.
+    pub fn deboost_target(&self, current: SchedState) -> Option<SchedState> {
+        let mut inner = self.inner.lock();
+        let boosted = inner.boosted.take()?;
+        if boosted == current {
+            inner.base.take()
+        } else {
+            // The owner's own `sched_setscheduler`, or a stronger boost from a
+            // second PI futex, replaced this state. Leaving it alone can only
+            // over-prioritise, never invert.
+            inner.base = None;
+            None
+        }
+    }
+}
+
+/// Applies Linux `rt_mutex_setprio()`'s boost to the owner of a PI futex.
+///
+/// The owner is raised to the stronger of its own scheduling state and the
+/// waiter's, which is the same `min(p->normal_prio, pi_task->prio)` rule and is
+/// idempotent, so several waiters converge on the strongest one without a
+/// separate priority list. A missing or already-exited owner is not an error:
+/// the user word remains authoritative for the protocol.
+pub fn pi_boost_owner(pi_state: &PiState, waiter: &PiWaiter) {
+    let Some(owner) = pi_state.resolve_owner() else {
+        return;
+    };
+    let current = axtask::sched_state(&owner);
+    let Some(target) = pi_boost(current, waiter.sched) else {
+        return;
+    };
+    pi_state.remember_base(current);
+    if axtask::set_sched_state(&owner, target).is_ok() {
+        pi_state.set_boosted(Some(target));
+    }
+}
+
+/// Restores the owner's own scheduling state once this PI state stops
+/// boosting it (`rt_mutex_adjust_prio_chain()`'s deboost).
+pub fn pi_deboost_owner(pi_state: &PiState) {
+    let Some(owner) = pi_state.resolve_owner() else {
+        pi_state.detach();
+        return;
+    };
+    let current = axtask::sched_state(&owner);
+    if let Some(base) = pi_state.deboost_target(current) {
+        let _ = axtask::set_sched_state(&owner, base);
+    }
+}
+
 struct WaiterEntry {
     bitset: u32,
     awakened: bool,
@@ -236,6 +514,10 @@ struct WaiterEntry {
     task: WeakAxTaskRef,
     waker: Option<Waker>,
     next: Option<WaiterPtr>,
+    /// Priority-inheritance payload. `Some` only for a waiter queued by
+    /// `FUTEX_LOCK_PI`/`FUTEX_WAIT_REQUEUE_PI`; it carries the `rt_mutex_waiter`
+    /// half of Linux's `struct futex_q` (`kernel/futex/pi.c`).
+    pi: Option<PiWaiter>,
 }
 
 impl WaiterQueue {
@@ -464,13 +746,17 @@ fn resolve_waiter_terminal(waiter: Arc<SpinNoIrq<WaiterEntry>>) -> WaitTerminalO
     // owns completion or observes cancellation and does not count this waiter.
     // Requeue tests `cancelled` while holding the same waiter lock, so the
     // captured owner cannot change after this point.
-    let (owner, task) = {
+    let (owner, task, was_pi) = {
         let mut waiter = waiter.lock();
         if waiter.awakened {
             return WaitTerminalOwnership::Woken;
         }
         waiter.cancelled = true;
-        (waiter.owner.clone(), waiter.task.clone())
+        (
+            waiter.owner.clone(),
+            waiter.task.clone(),
+            waiter.pi.is_some(),
+        )
     };
     // Upgrade/drop the task reference only after the waiter SpinNoIrq lock
     // has been released.  This keeps all possible task destruction out of
@@ -500,6 +786,12 @@ fn resolve_waiter_terminal(waiter: Arc<SpinNoIrq<WaiterEntry>>) -> WaitTerminalO
     // Do this after the queue gate, the deferred waiter drops, and the local
     // owner entry reference have all gone away.  This is the cancellation path
     // that removes a target entry when its last waiter disappears.
+    if was_pi && let Some(owner_entry) = owner_entry.as_ref() {
+        // Linux `rt_mutex_cleanup_proxy_lock()`: a PI waiter that leaves
+        // without being handed the futex may be the last reason the owner
+        // carries a boost, so the chain is re-evaluated on the way out.
+        owner_entry.release_pi_state_if_idle();
+    }
     drop(owner_entry);
     owner.cleanup_if_idle();
 
@@ -716,6 +1008,7 @@ impl WaitQueue {
         owner: WaiterOwner,
         bitset: u32,
         timeout: Option<(AlarmClock, Duration)>,
+        pi: Option<PiWaiter>,
         condition: impl FnOnce() -> WaitConditionResult<bool>,
     ) -> WaitConditionResult<Option<WaitRegistration>> {
         // Allocate the waiter before taking the IRQ-safe gate.  If the
@@ -729,6 +1022,7 @@ impl WaitQueue {
             task: Arc::downgrade(&current()),
             waker: None,
             next: None,
+            pi,
         }))
         .map_err(|_| WaitConditionError::Fault(AxError::NoMemory))?;
         let registration_waiter = waiter.clone();
@@ -775,35 +1069,21 @@ impl WaitQueue {
             WaiterOwner::without_table(owner, FutexTableKey::Private(0)),
             bitset,
             timeout,
+            None,
             || condition().map_err(WaitConditionError::Fault),
         )
         .map_err(AxError::from)
     }
 
-    /// Waits if the given condition is met.
+    /// Blocks the current task on a futex queue until the waiter is woken.
     ///
-    /// Returns `false` if the condition is not met and no actual waiting
-    /// occurs.
-    ///
-    /// The condition callback runs under the queue gate. It must therefore be
-    /// a bounded, nonblocking, nonallocating snapshot; a raced user-memory
-    /// snapshot must return [`WaitConditionError::Retry`] so the caller can
-    /// fault and retry after this method releases the gate.
-    pub fn wait_if(
+    /// Shared by the plain and the priority-inheritance wait paths; the
+    /// registration has already been published under the queue gate.
+    fn block_registered(
         &self,
-        owner: WaiterOwner,
-        bitset: u32,
+        registration: &mut WaitRegistration,
         timeout: Option<(AlarmClock, Duration)>,
-        condition: impl FnOnce() -> WaitConditionResult<bool>,
     ) -> WaitConditionResult<bool> {
-        // Registration may fault while evaluating `condition` and therefore
-        // happens before the synchronous block session starts. From this point
-        // on, polling and wakeup touch only the waiter's IRQ-safe state.
-        let Some(mut registration) =
-            self.register_waiter_if_condition(owner, bitset, timeout, condition)?
-        else {
-            return Ok(false);
-        };
         let wait = WaitFuture {
             waiter: registration
                 .waiter
@@ -814,7 +1094,7 @@ impl WaitQueue {
             Some((clock, deadline)) => match prepare_clock_sleep(clock, deadline) {
                 Ok(sleeper) => Some(sleeper),
                 Err(error) => {
-                    return resolve_single_wait(&mut registration, Err(error))
+                    return resolve_single_wait(registration, Err(error))
                         .map_err(WaitConditionError::Fault);
                 }
             },
@@ -841,17 +1121,287 @@ impl WaitQueue {
             Ok(result) => result,
             Err(error) => Err(AxError::from(error)),
         };
-        resolve_single_wait(&mut registration, result).map_err(WaitConditionError::Fault)
+        resolve_single_wait(registration, result).map_err(WaitConditionError::Fault)
+    }
+
+    /// Waits if the given condition is met.
+    ///
+    /// Returns `false` if the condition is not met and no actual waiting
+    /// occurs.
+    ///
+    /// The condition callback runs under the queue gate. It must therefore be
+    /// a bounded, nonblocking, nonallocating snapshot; a raced user-memory
+    /// snapshot must return [`WaitConditionError::Retry`] so the caller can
+    /// fault and retry after this method releases the gate.
+    pub fn wait_if(
+        &self,
+        owner: WaiterOwner,
+        bitset: u32,
+        timeout: Option<(AlarmClock, Duration)>,
+        condition: impl FnOnce() -> WaitConditionResult<bool>,
+    ) -> WaitConditionResult<bool> {
+        // Registration may fault while evaluating `condition` and therefore
+        // happens before the synchronous block session starts. From this point
+        // on, polling and wakeup touch only the waiter's IRQ-safe state.
+        let Some(mut registration) =
+            self.register_waiter_if_condition(owner, bitset, timeout, None, condition)?
+        else {
+            return Ok(false);
+        };
+        self.block_registered(&mut registration, timeout)
+    }
+
+    /// Publishes a priority-inheritance waiter and blocks.
+    ///
+    /// The condition runs under the queue gate exactly like [`Self::wait_if`],
+    /// but returns the waiter's `rt_mutex_waiter` payload instead of a bare
+    /// bool: `Ok(Some(pi))` publishes and blocks, `Ok(None)` declines the wait
+    /// (the caller has already taken the futex itself), and `Err` reports a
+    /// faulted or unavailable snapshot.
+    ///
+    /// `on_queued` runs after the gate has been released and before the task
+    /// sleeps. That is where the PI boost is applied: the owner must already be
+    /// reachable through the queue, but neither the scheduler update nor the
+    /// owner task lookup may run under the futex gate, because both take locks
+    /// a run-queue or registry owner may hold. Returning `Err` abandons the
+    /// wait: the registration is cancelled and the error is propagated, which
+    /// is how `attach_to_pi_owner()`'s `-ESRCH`/`-EAGAIN` are surfaced without
+    /// ever sleeping on a futex whose owner cannot hand it over.
+    pub fn wait_pi<C, A>(
+        &self,
+        owner: WaiterOwner,
+        bitset: u32,
+        timeout: Option<(AlarmClock, Duration)>,
+        condition: C,
+        on_queued: A,
+    ) -> WaitConditionResult<bool>
+    where
+        C: FnOnce() -> WaitConditionResult<Option<PiWaiter>>,
+        A: FnOnce(&PiWaiter) -> AxResult<()>,
+    {
+        let mut published: Option<PiWaiter> = None;
+        let registration =
+            self.register_waiter_if_condition(owner, bitset, timeout, None, || {
+                let decided = condition()?;
+                published = decided;
+                Ok(decided.is_some())
+            })?;
+        let Some(mut registration) = registration else {
+            return Ok(false);
+        };
+        if let Some(pi) = published.as_ref()
+            && let Err(error) = on_queued(pi)
+        {
+            let _ = registration.resolve_terminal();
+            return Err(WaitConditionError::Fault(error));
+        }
+        self.block_registered(&mut registration, timeout)
+    }
+
+    /// The highest-priority live PI waiter, mirroring `rt_mutex_top_waiter()`.
+    /// The queue is not a `plist`, so the walk is O(n); the selection rule
+    /// (smallest `rt_mutex_waiter::prio`, FIFO on ties) is the same.
+    pub fn pi_top_tid(&self) -> Option<u32> {
+        let queue = self.queue.lock();
+        Self::pi_top_locked(&queue).map(|(_, pi)| pi.tid)
+    }
+
+    fn pi_top_locked(queue: &WaiterQueue) -> Option<(WaiterPtr, PiWaiter)> {
+        let mut cursor = queue.head;
+        let mut best: Option<(WaiterPtr, PiWaiter)> = None;
+        let mut seen = 0;
+        while let Some(ptr) = cursor {
+            if seen >= queue.len {
+                break;
+            }
+            seen += 1;
+            // SAFETY: the queue owns a strong reference for every linked
+            // pointer and the queue lock is held for the whole walk.
+            let node = unsafe { ptr.as_ref() };
+            let waiter = node.lock();
+            cursor = waiter.next;
+            if let Some(pi) = waiter.pi
+                && !waiter.cancelled
+                && best.is_none_or(|(_, current)| pi.priority < current.priority)
+            {
+                best = Some((ptr, pi));
+            }
+        }
+        best
+    }
+
+    /// Runs `body` with both queue gates held in address order.
+    ///
+    /// Two PI queues are never the same queue: `FUTEX_CMP_REQUEUE_PI` rejects
+    /// equal addresses with `EINVAL`. Locking in pointer order keeps two
+    /// concurrent requeues between the same pair from deadlocking.
+    fn with_two_gates<T>(a: &Self, b: &Self, body: impl FnOnce() -> T) -> T {
+        if core::ptr::eq(a, b) {
+            let _a = a.gate.lock();
+            body()
+        } else if (a as *const Self as usize) < (b as *const Self as usize) {
+            let _a = a.gate.lock();
+            let _b = b.gate.lock();
+            body()
+        } else {
+            let _b = b.gate.lock();
+            let _a = a.gate.lock();
+            body()
+        }
+    }
+
+    /// Linux `__futex_unlock_pi()`: publish the next state of the futex word
+    /// and, if a PI waiter is queued, hand the futex to the highest-priority
+    /// one (`wake_futex_pi()`).
+    ///
+    /// `publish` runs *inside* the queue gate — that is what makes the word
+    /// transition and the dequeue a single linearization point, so no
+    /// `FUTEX_LOCK_PI` can slip a waiter in between. It is called with
+    /// `Some(tid)` when a waiter must be promoted and `None` when the futex
+    /// becomes unowned; returning `false` means the word changed under us
+    /// (`wake_futex_pi()`'s retry) and nothing is claimed.
+    pub fn pi_unlock<P>(&self, publish: P) -> PiUnlockOutcome
+    where
+        P: FnOnce(Option<u32>) -> bool,
+    {
+        let mut pending_wakers = WakeBatch::default();
+        // No node is retired on this path: the promoted waiter is woken and the
+        // rest stay queued.
+        let retired = DeferredWaiters::default();
+        let mut outcome = PiUnlockOutcome::Aborted;
+        {
+            let _gate = self.gate.lock();
+            let mut queue = self.queue.lock();
+            match Self::pi_top_locked(&queue) {
+                None => {
+                    if publish(None) {
+                        outcome = PiUnlockOutcome::Cleared;
+                    }
+                }
+                Some((target, pi)) => {
+                    if publish(Some(pi.tid)) {
+                        let initial_len = queue.len;
+                        for _ in 0..initial_len {
+                            let Some(waiter) = queue.pop_front() else {
+                                break;
+                            };
+                            if core::ptr::eq(Arc::as_ptr(&waiter), target.as_ptr())
+                                && !waiter.lock().cancelled
+                            {
+                                waiter.lock().awakened = true;
+                                pending_wakers.push(waiter);
+                                outcome = PiUnlockOutcome::HandedOff(pi.tid);
+                                break;
+                            }
+                            queue.push_back(waiter);
+                        }
+                    }
+                }
+            }
+        }
+        pending_wakers.finish();
+        retired.finish();
+        outcome
+    }
+
+    /// Linux `futex_requeue()`'s `requeue_pi` path.
+    ///
+    /// The highest-priority PI waiter of `self` is promoted to owner of
+    /// `target` — `publish` installs `FUTEX_WAITERS | tid` in `target`'s user
+    /// word while both gates are held — and up to `nr_requeue` of the remaining
+    /// PI waiters are moved onto `target`'s queue, where they keep their own
+    /// `rt_mutex_waiter` payload and block until `target`'s unlock hands the
+    /// futex to the strongest of them. Returns `(woken, moved)`, or `None` when
+    /// `publish` lost the race against userspace.
+    pub fn pi_requeue<P>(
+        &self,
+        target: &WaitQueue,
+        target_owner: WaiterOwner,
+        nr_requeue: usize,
+        mut publish: P,
+    ) -> Option<(usize, usize)>
+    where
+        P: FnMut(u32) -> bool,
+    {
+        if core::ptr::eq(self, target) {
+            return None;
+        }
+        let mut pending_wakers = WakeBatch::default();
+        // Waiters are either woken or moved; none is retired here.
+        let retired = DeferredWaiters::default();
+        let result = Self::with_two_gates(self, target, || {
+            let mut src = self.queue.lock();
+            let mut dst = target.queue.lock();
+            let (top, pi) = Self::pi_top_locked(&src)?;
+            if !publish(pi.tid) {
+                return None;
+            }
+            let initial_len = src.len;
+            let mut woke = 0;
+            for _ in 0..initial_len {
+                let Some(waiter) = src.pop_front() else {
+                    break;
+                };
+                let mut entry = waiter.lock();
+                let is_top = core::ptr::eq(Arc::as_ptr(&waiter), top.as_ptr());
+                if is_top && !entry.cancelled {
+                    entry.awakened = true;
+                    woke = 1;
+                    drop(entry);
+                    pending_wakers.push(waiter);
+                    break;
+                }
+                drop(entry);
+                src.push_back(waiter);
+            }
+            let mut moved = 0;
+            let initial_len = src.len;
+            for _ in 0..initial_len {
+                let Some(waiter) = src.pop_front() else {
+                    break;
+                };
+                let mut entry = waiter.lock();
+                if !entry.cancelled && entry.pi.is_some() && moved < nr_requeue {
+                    entry.owner = target_owner.clone();
+                    moved += 1;
+                    drop(entry);
+                    dst.push_back(waiter);
+                } else {
+                    drop(entry);
+                    src.push_back(waiter);
+                }
+            }
+            Some((woke, moved))
+        });
+        pending_wakers.finish();
+        retired.finish();
+        result
     }
 
     /// Wakes up at most `count` tasks whose bitset intersects with the given
     /// bitmask.
     pub fn wake(&self, count: usize, mask: u32) -> usize {
+        self.wake_inner(count, mask, false)
+            .expect("plain futex wake")
+    }
+
+    /// `futex_wake()`'s waiter loop.
+    ///
+    /// Linux refuses to run a *plain* wake over a queue that holds
+    /// priority-inheritance waiters (`if (this->pi_state || this->rt_waiter) {
+    /// ret = -EINVAL; break; }`), because such a waiter is waiting for the
+    /// owner to publish the futex through `wake_futex_pi()` and cannot be
+    /// completed by a bare wakeup. `reject_pi` selects that behaviour; the
+    /// PI paths themselves pass `false`.
+    pub fn wake_inner(&self, count: usize, mask: u32, reject_pi: bool) -> Result<usize, ()> {
         let mut pending_wakers = WakeBatch::default();
         let mut retired = DeferredWaiters::default();
         let woke = {
             let _gate = self.gate.lock();
             let mut queue = self.queue.lock();
+            if reject_pi && Self::pi_top_locked(&queue).is_some() {
+                return Err(());
+            }
             Self::wake_and_requeue_locked(
                 &mut queue,
                 count,
@@ -864,7 +1414,7 @@ impl WaitQueue {
         };
         pending_wakers.finish();
         retired.finish();
-        woke
+        Ok(woke)
     }
 
     /// Runs a nofault atomic operation under both queue gates, always waking
@@ -1129,6 +1679,7 @@ fn wait_on_any_futex_inner(
             task: Arc::downgrade(&current()),
             waker: None,
             next: None,
+            pi: None,
         }))
         .map_err(|_| WaitConditionError::Fault(AxError::NoMemory))?;
         waiters_refs.push(waiter);
@@ -1342,6 +1893,10 @@ impl FutexKey {
 pub struct FutexEntry {
     /// The wait queue associated with this futex.
     pub wq: WaitQueue,
+    /// Linux `struct futex_pi_state`. Created on the first PI operation that
+    /// attaches an owner, and kept for the lifetime of the entry so that a
+    /// later `FUTEX_UNLOCK_PI` can still find the boost it installed.
+    pi: SpinNoIrq<Option<Arc<PiState>>>,
     /// Strong lease for the exact shared backing identity.  This field is
     /// absent only for process-private futexes.
     backing_lease: Option<FutexBackingIdentity>,
@@ -1355,7 +1910,42 @@ impl FutexEntry {
     fn with_backing(backing_lease: Option<FutexBackingIdentity>) -> Self {
         Self {
             wq: WaitQueue::new(),
+            pi: SpinNoIrq::new(None),
             backing_lease,
+        }
+    }
+
+    /// Returns this futex's PI state, creating it on first use.
+    pub fn pi_state(&self) -> Arc<PiState> {
+        let mut slot = self.pi.lock();
+        slot.get_or_insert_with(|| Arc::new(PiState::new())).clone()
+    }
+
+    /// Returns this futex's PI state only if a PI operation ever created one.
+    pub fn existing_pi_state(&self) -> Option<Arc<PiState>> {
+        self.pi.lock().clone()
+    }
+
+    /// True once a PI operation has made this futex a priority-inheritance
+    /// futex. Linux refuses to attach a plain waiter to a PI futex and to
+    /// requeue a PI waiter through the non-PI requeue paths.
+    pub fn is_pi(&self) -> bool {
+        self.pi.lock().is_some()
+    }
+
+    /// Drops the PI state once the futex has no owner and no PI waiter left,
+    /// releasing the boost the owner may still be carrying.
+    pub fn release_pi_state_if_idle(&self) {
+        let idle = {
+            let slot = self.pi.lock();
+            let Some(state) = slot.as_ref() else {
+                return;
+            };
+            state.owner_tid() == 0 && self.wq.pi_top_tid().is_none()
+        };
+        if idle && let Some(state) = self.pi.lock().take() {
+            pi_deboost_owner(&state);
+            state.detach();
         }
     }
 }
@@ -1601,7 +2191,7 @@ mod tests {
         let target = table.get_or_insert_owned(&target_key);
         let registration = source
             .wq
-            .register_waiter_if_condition(source.waiter_owner(), u32::MAX, None, || Ok(true))
+            .register_waiter_if_condition(source.waiter_owner(), u32::MAX, None, None, || Ok(true))
             .unwrap()
             .expect("waiter registration failed");
 
@@ -1903,6 +2493,7 @@ mod tests {
                 task: WeakAxTaskRef::new(),
                 waker: None,
                 next: None,
+                pi: None,
             })));
 
         assert_eq!(src.wq.requeue(1, &dst.wq, owner(&dst)), 0);
@@ -1927,6 +2518,7 @@ mod tests {
                 task: WeakAxTaskRef::new(),
                 waker: None,
                 next: None,
+                pi: None,
             })));
 
         assert_eq!(src.wq.wake(1, u32::MAX), 0);
@@ -1947,6 +2539,7 @@ mod tests {
             task: WeakAxTaskRef::new(),
             waker: None,
             next: None,
+            pi: None,
         }));
 
         // Keep this typed owner while the queue transfers its clone into a
@@ -1988,6 +2581,7 @@ mod tests {
                     task: WeakAxTaskRef::new(),
                     waker: None,
                     next: None,
+                    pi: None,
                 })));
         }
 
@@ -2193,5 +2787,178 @@ mod tests {
         drop(table);
         drop(tables);
         core::mem::forget(pages);
+    }
+}
+
+#[cfg(test)]
+mod pi_tests {
+    use alloc::vec;
+
+    use super::*;
+    use crate::test_support::ensure_scheduler;
+
+    fn add_pi_waiter(entry: &Arc<FutexEntry>, tid: u32, sched: SchedState) -> WaitRegistration {
+        // The registration API is only reachable through the wait path, so the
+        // queue is populated the same way `FUTEX_LOCK_PI` does it: publish a
+        // waiter whose condition supplies the `rt_mutex_waiter` payload.
+        ensure_scheduler();
+        // `FUTEX_LOCK_PI` creates the entry's `futex_pi_state` before it ever
+        // queues a waiter; `is_pi()` observes exactly that.
+        let _pi_state = entry.pi_state();
+        let mut published = None;
+        let registration = entry
+            .wq
+            .register_waiter_if_condition(
+                WaiterOwner::without_table(Arc::downgrade(entry), FutexTableKey::Private(0)),
+                u32::MAX,
+                None,
+                None,
+                || {
+                    published = Some(PiWaiter::new(tid, sched));
+                    Ok(true)
+                },
+            )
+            .expect("PI waiter registration failed")
+            .expect("PI waiter condition rejected");
+        // `register_waiter_if_condition` stores the payload at construction
+        // time, so attach it to the just-published node directly.
+        let node = registration.waiter.as_ref().unwrap();
+        node.lock().pi = published;
+        registration
+    }
+
+    fn fifo(rt_priority: u8) -> SchedState {
+        SchedState {
+            class: SchedClass::Fifo,
+            nice: 0,
+            rt_priority,
+        }
+    }
+
+    fn fair(nice: i8) -> SchedState {
+        SchedState {
+            class: SchedClass::Normal,
+            nice,
+            rt_priority: 0,
+        }
+    }
+
+    #[test]
+    fn rt_priorities_map_to_linux_kernel_priority_domain() {
+        // Linux `rt_mutex_waiter::prio`: 0 is the strongest RT priority and
+        // fair tasks sit above every RT task.
+        assert!(pi_kernel_priority(fifo(99)) < pi_kernel_priority(fifo(1)));
+        assert!(pi_kernel_priority(fifo(1)) < pi_kernel_priority(fair(-20)));
+        assert!(pi_kernel_priority(fair(-20)) < pi_kernel_priority(fair(19)));
+    }
+
+    #[test]
+    fn boost_raises_a_fair_owner_to_the_rt_waiter() {
+        let boosted = pi_boost(fair(0), fifo(10)).expect("RT waiter must boost a fair owner");
+        assert_eq!(boosted.class, SchedClass::Fifo);
+        assert_eq!(boosted.rt_priority, 10);
+        // PI uses the RT class without time slicing, so a RoundRobin waiter
+        // still boosts to FIFO.
+        let boosted = pi_boost(
+            fair(0),
+            SchedState {
+                class: SchedClass::RoundRobin,
+                nice: 0,
+                rt_priority: 5,
+            },
+        )
+        .unwrap();
+        assert_eq!(boosted.class, SchedClass::Fifo);
+    }
+
+    #[test]
+    fn boost_is_monotone_and_idempotent() {
+        // A larger `rt_priority` is a stronger RT task, so the stronger waiter
+        // raises the owner and the weaker one leaves it alone.
+        assert_eq!(pi_boost(fifo(10), fifo(20)), Some(fifo(20)));
+        assert_eq!(pi_boost(fifo(20), fifo(10)), None);
+        // No fair waiter can ever be stronger than an RT owner.
+        assert_eq!(pi_boost(fifo(1), fair(-20)), None);
+        assert_eq!(pi_boost(fifo(1), fifo(255)), Some(fifo(255)));
+        // A fair waiter only moves the owner's nice downwards.
+        assert_eq!(pi_boost(fair(5), fair(0)), Some(fair(0)));
+        assert_eq!(pi_boost(fair(5), fair(9)), None);
+        assert_eq!(
+            pi_boost(fair(5), fifo(1)).map(|s| s.class),
+            Some(SchedClass::Fifo)
+        );
+    }
+
+    #[test]
+    fn deadline_waiters_do_not_produce_a_broken_boost() {
+        // `EevdfTaskParams` carries no deadline reservation, so a deadline
+        // boost would be rejected by `set_sched_state`; the reduction reports
+        // the gap instead of installing it.
+        let deadline = SchedState {
+            class: SchedClass::Deadline,
+            nice: 0,
+            rt_priority: 0,
+        };
+        assert_eq!(pi_boost(fair(0), deadline), None);
+        assert_eq!(pi_boost(fifo(1), deadline), None);
+    }
+
+    #[test]
+    fn top_pi_waiter_is_the_strongest_regardless_of_queue_order() {
+        let entry = Arc::new(FutexEntry::new());
+        // Larger `rt_priority` is stronger, and every RT task beats every
+        // fair task, so TID 13 (FIFO 50) is the top waiter no matter that it
+        // was queued last.
+        let low = add_pi_waiter(&entry, 11, fair(10));
+        let mid = add_pi_waiter(&entry, 12, fifo(2));
+        let high = add_pi_waiter(&entry, 13, fifo(50));
+        assert_eq!(entry.wq.pi_top_tid(), Some(13));
+        assert!(entry.is_pi());
+        drop(high);
+        assert_eq!(entry.wq.pi_top_tid(), Some(12));
+        drop(mid);
+        assert_eq!(entry.wq.pi_top_tid(), Some(11));
+        drop(low);
+        assert_eq!(entry.wq.pi_top_tid(), None);
+    }
+
+    #[test]
+    fn pi_unlock_publishes_the_top_waiter_before_waking_it() {
+        let entry = Arc::new(FutexEntry::new());
+        let _low = add_pi_waiter(&entry, 21, fair(0));
+        let _high = add_pi_waiter(&entry, 22, fifo(3));
+        let mut published = Vec::new();
+        let outcome = entry.wq.pi_unlock(|next| {
+            published.push(next);
+            // Refuse the handoff: nothing may be claimed or woken.
+            false
+        });
+        assert_eq!(outcome, PiUnlockOutcome::Aborted);
+        assert_eq!(published, vec![Some(22)]);
+        // Both waiters are still queued because the publication was refused.
+        assert_eq!(entry.wq.pi_top_tid(), Some(22));
+    }
+
+    #[test]
+    fn pi_unlock_without_waiters_publishes_the_unowned_word() {
+        let entry = Arc::new(FutexEntry::new());
+        let mut published = Vec::new();
+        let outcome = entry.wq.pi_unlock(|next| {
+            published.push(next);
+            true
+        });
+        assert_eq!(outcome, PiUnlockOutcome::Cleared);
+        assert_eq!(published, vec![None]);
+    }
+
+    #[test]
+    fn plain_wake_refuses_a_queue_holding_pi_waiters() {
+        let entry = Arc::new(FutexEntry::new());
+        let _registration = add_pi_waiter(&entry, 31, fifo(1));
+        // Linux `futex_wake()`: `if (this->pi_state || this->rt_waiter)
+        // return -EINVAL;`.
+        assert_eq!(entry.wq.wake_inner(1, u32::MAX, true), Err(()));
+        // The PI paths themselves must still be able to wake.
+        assert_eq!(entry.wq.wake_inner(0, u32::MAX, false), Ok(0));
     }
 }
