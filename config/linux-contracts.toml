@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 312
-implemented = 293
+resolved = 309
+implemented = 290
 explicit_enosys = 19
 fallback = 0
-partial = 73
+partial = 76
 unknown = 0
 
 [[contract]]
@@ -960,8 +960,8 @@ contract = "linux-futex"
 handler = "kernel/src/syscall/sync/futex.rs:sys_futex"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/futex-smoke.c:main", "tests/guest/portable/futex-abi-differential.c:main"]
-validation_gaps = ["the restart classification, the visible owner tid and the requeued-waiter EWOULDBLOCK are covered by futex-abi-opcode, futex-abi-pi-word, futex-abi-pi-signal and futex-abi-requeue-pi-signal; the PI residuals above have no guest-observable primitive"]
-limitations = ["priority inheritance covers the directly blocked owner only: there is no PI chain walk or rt_mutex-style waiter tree, no SCHED_DEADLINE inheritance and no exit_pi_state_list equivalent, and a boost is not published through a scheduler commit path"]
+validation_gaps = ["the restart classification, the visible owner tid and the requeued-waiter EWOULDBLOCK are covered by futex-abi-opcode, futex-abi-pi-word, futex-abi-pi-signal and futex-abi-requeue-pi-signal"]
+limitations = ["priority inheritance covers the directly blocked owner only: there is no rt_mutex-style waiter chain walk, no SCHED_DEADLINE inheritance and no exit_pi_state_list equivalent, and a contended CMP_REQUEUE_PI onto an owned target returns EWOULDBLOCK where Linux queues the promoted waiter"]
 
 [[contract]]
 id = "linux-futex_waitv"
@@ -3485,13 +3485,13 @@ teardown = ["teardown:release imported data and temporary references; timer dele
 [[cell]]
 number = 228
 name = "clock_gettime"
-status = "partial"
+status = "implemented"
 contract = "linux-clock_gettime"
 handler = "kernel/src/syscall/time.rs:sys_clock_gettime"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/time.rs:clock_domain_accepts_linux_encoded_cpu_clock_ids", "tests/guest/portable/time-abi-differential.c:main", "tests/guest/portable/clock-abi-differential.c:main"]
-validation_gaps = ["RAW_TRACKS_MONOTONIC compares zero with zero because no time namespace is mounted, so a kernel that dropped the offset would still agree on both guests"]
-limitations = ["CLOCK_MONOTONIC_RAW does not apply the time-namespace offset that Linux's posix_get_monotonic_raw() adds (kernel/time/posix-timers.c:222-227), and clock-abi.raw-differential can only compare the offset as zero with zero because the differential guest runs in no time namespace; the rest of the clock contract is covered by that case, including the epoch, the timespec normalisation, the boottime floor, the sleep delta and the spin delta"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-clock_getres"
@@ -4336,13 +4336,13 @@ teardown = ["teardown:release poll registrations or temporary mapping capabiliti
 [[cell]]
 number = 440
 name = "process_madvise"
-status = "implemented"
+status = "partial"
 contract = "linux-process_madvise"
 handler = "kernel/src/syscall/mm/process_vm.rs:sys_process_madvise"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mm-contracts-differential.c:main"]
-validation_gaps = ["the remote path of process_madvise returns ENOMEM at the first hole instead of recording unmapped_error and carrying on, but no advice that reaches that path (COLD, PAGEOUT, WILLNEED, COLLAPSE) has an observable effect in the guest, so the divergence is reported rather than asserted"]
-limitations = ["explicit-none"]
+validation_gaps = ["explicit-none"]
+limitations = ["the remote path returns ENOMEM at the first hole instead of recording unmapped_error and carrying on, so advice after a hole is skipped where Linux applies it and returns -ENOMEM afterwards; no advice that reaches that path has an observable effect in the guest, so the divergence is recorded rather than asserted"]
 
 [[contract]]
 id = "linux-map_shadow_stack"
@@ -6337,13 +6337,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 210
 name = "io_cancel"
-status = "implemented"
+status = "partial"
 contract = "linux-io_cancel"
 handler = "kernel/src/syscall/fs/aio.rs:sys_io_cancel"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/fs/aio.rs:context_ids_wrap_skip_live_contexts_and_never_use_zero", "tests/guest/portable/aio-differential.c:main"]
-validation_gaps = ["IO_CANCEL_PENDING_REQUEST exercises the pending-poll cancellation path, but the completion result of the cancelled request is deliberately unasserted because TheKernel reports ECANCELED where Linux delivers 0 for a cancelled poll"]
-limitations = ["explicit-none"]
+validation_gaps = ["IO_CANCEL_VALIDATION and IO_CANCEL_PENDING_REQUEST exercise the argument rules and the pending-poll path, but not the completion result"]
+limitations = ["a cancelled poll request completes with res = -ECANCELED where Linux leaves the mask at zero and publishes res = mangle_poll(0) = 0; the guest case deliberately asserts only the event count and the obj field"]
 
 [[contract]]
 id = "linux-pipe"
@@ -6963,8 +6963,8 @@ contract = "linux-fsmount"
 handler = "kernel/src/syscall/fs/mount.rs:sys_fsmount"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
-validation_gaps = ["The validation order and errno precedence are exercised by the mount-api differential; provider option consumption has no test"]
-limitations = ["FSMOUNT_NAMESPACE is admitted and reports EOPNOTSUPP after the flag, capability and descriptor checks of fs/namespace.c:4435-4471, because there is no mount-namespace creation provider"]
+validation_gaps = ["explicit-none"]
+limitations = ["FSMOUNT_NAMESPACE reports EOPNOTSUPP before the descriptor is fetched, where Linux fetches it first and reports EBADF for a bad one; there is no mount-namespace creation provider"]
 
 [[contract]]
 id = "linux-fspick"
@@ -7372,13 +7372,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 141
 name = "setpriority"
-status = "implemented"
+status = "partial"
 contract = "linux-setpriority"
 handler = "kernel/src/syscall/task/schedule.rs:sys_setpriority"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
-validation_gaps = ["a zombie target cannot report its own RLIMIT_NICE because the ProcessData that owns rlim is retired, so the assertion covers the live target and the capability override only"]
-limitations = ["explicit-none"]
+validation_gaps = ["the guest case covers the live target and the CAP_SYS_NICE override"]
+limitations = ["a zombie target cannot report its own RLIMIT_NICE because the ProcessData that owns rlim is retired, so the caller's limit is consulted instead; Linux reads task_rlimit(target)"]
 
 [[contract]]
 id = "linux-clock_nanosleep"
@@ -7815,7 +7815,7 @@ handler = "kernel/src/syscall/task/ctl.rs:sys_mbind"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["the nodemask is validated before do_mbind's own checks, so MPOL_MF_MOVE_ALL without CAP_SYS_NICE is EINVAL where Linux is EPERM and a zero length with an empty mask is EINVAL where Linux returns 0"]
+limitations = ["a range that spans a hole is rejected with EFAULT even for MPOL_DEFAULT, where Linux sets MPOL_MF_DISCONTIG_OK and returns 0; the MOVE_ALL capability test and the mode validation now match Linux"]
 
 [[contract]]
 id = "linux-set_mempolicy"
@@ -7838,7 +7838,7 @@ handler = "kernel/src/syscall/task/ctl.rs:sys_set_mempolicy"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["MPOL_PREFERRED with a mask that intersects to empty is silently degenerated to MPOL_LOCAL where Linux reports EINVAL"]
+limitations = ["no residual against Linux is known for the validation tables; the cell records the conservative bound rather than a measured divergence"]
 
 [[contract]]
 id = "linux-get_mempolicy"
@@ -7861,7 +7861,7 @@ handler = "kernel/src/syscall/task/ctl.rs:sys_get_mempolicy"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["MPOL_F_MEMS_ALLOWED writes no policy, MPOL_F_NODE writes no nodemask, and the mode flags are dropped from the reported policy"]
+limitations = ["no residual against Linux is known for the reporting paths; the cell records the conservative bound rather than a measured divergence"]
 
 [[contract]]
 id = "linux-migrate_pages"
@@ -8085,13 +8085,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 101
 name = "ptrace"
-status = "implemented"
+status = "partial"
 contract = "linux-ptrace"
 handler = "kernel/src/syscall/task/ptrace.rs:sys_ptrace"
 conditional = "explicit-none"
 tests = ["kernel/src/task/access.rs:process_access_ptrace_enforces_dumpability_image_owner_and_commoncap", "tests/guest/portable/sysadmin-abi-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["explicit-none"]
+validation_gaps = ["the registered case probes PTRACE_GETREGSET with an unknown type only, which both guests refuse with EINVAL, so it cannot see the missing selectors or the missing request arms"]
+limitations = ["PTRACE_PEEKUSER, PTRACE_POKEUSER and PTRACE_LISTEN return fixed EIO; the regset selector admits only NT_X86_SHSTK, so NT_PRSTATUS, NT_PRFPREG and NT_X86_XSTATE are refused; PTRACE_GETREGS, PTRACE_SETREGS, PTRACE_PEEKSIGINFO, PTRACE_GETSIGMASK and PTRACE_SETSIGMASK have no request arm and fall through to EIO"]
 
 [[contract]]
 id = "linux-acct"
@@ -8458,8 +8458,8 @@ contract = "linux-fallocate"
 handler = "kernel/src/syscall/fs/io.rs:sys_fallocate"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/fs-boundary-differential.c:main", "tests/guest/portable/fs-abi-differential.c:main"]
-validation_gaps = ["fallocate mode admission is exercised by the fs-abi raw differential; WRITE_ZEROES has no provider test"]
-limitations = ["FALLOC_FL_WRITE_ZEROES is not implemented where the backing device enables Linux support; UNSHARE_RANGE now matches ext4's refusal"]
+validation_gaps = ["the registered UNSHARE_RANGE_EOPNOTSUPP assertion cannot be produced by this code, so the case cannot pass until either the refusal is propagated or the assertion is withdrawn"]
+limitations = ["FALLOC_FL_WRITE_ZEROES is not implemented where the backing device enables Linux support; FALLOC_FL_UNSHARE_RANGE returns 0 or EINVAL through the generic range emulation because the native ext4 refusal is discarded one frame above it, where Linux ext4 answers EOPNOTSUPP before any range work"]
 
 [[contract]]
 id = "linux-readahead"

@@ -360,9 +360,10 @@ SYSCALL_CASES = {
     311: ("mm-contracts", "process-vm-writev"), 462: ("mm-contracts", "mseal"),
     # Message-transfer flags, byte-stream MSG_WAITALL and recvmmsg deadlines.
     44: ("socket-msg", "socket_msg.send_flags"),
-    45: ("socket-msg", "socket_msg.waitall_stream"), 47: ("socket-msg", "socket_msg.waitall_stream"),
+    45: ("socket-msg", "socket_msg.send_flags"),
+    47: ("socket-msg", "socket_msg.waitall_stream"),
     46: ("socket-msg", "socket_msg.send_flags"),
-    307: ("socket-msg", "socket_msg.sendmmsg_flags"), 45: ("socket-msg", "socket_msg.sendmmsg_flags"),
+    307: ("socket-msg", "socket_msg.sendmmsg_flags"),
     299: ("socket-msg", "socket_msg.recvmmsg_deadline"),
     # prctl and the task-control syscalls it fronts.
     157: ("task-control", "prctl-name"), 158: ("task-control", "arch_prctl"),
@@ -401,13 +402,12 @@ SYSCALL_CASES = {
     230: ("time-abi", "clock_nanosleep"), 228: ("time-abi", "gettimeofday"),
     # Child reaping, scheduler attributes and the memory policy ABI.
     61: ("wait-abi", "wait4"), 247: ("wait-abi", "waitid"),
-    148: ("wait-abi", "sched_rr_get_interval"),
     314: ("wait-abi", "sched_attr"), 315: ("wait-abi", "sched_attr"),
     140: ("wait-abi", "setpriority"), 141: ("wait-abi", "setpriority"),
     143: ("wait-abi", "sched_query"), 145: ("wait-abi", "sched_query"),
-    148: ("wait-abi", "sched_query"), 251: ("wait-abi", "ioprio"),
+    251: ("wait-abi", "ioprio"),
     252: ("wait-abi", "ioprio"), 101: ("wait-abi", "ptrace_stop"),
-    40: ("wait-abi", "sched_rr_get_interval"),
+    40: ("wait-abi", "sched_rr_get_interval"), 148: ("wait-abi", "sched_rr_get_interval"),
     449: ("futex-abi", "futex-abi-waitv-numa"),
     206: ("aio", "aio"), 207: ("aio", "aio"), 208: ("aio", "aio"),
     209: ("aio", "aio"), 210: ("aio", "aio"),
