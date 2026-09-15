@@ -1,14 +1,14 @@
 use axerrno::AxResult;
-use axhal::paging::MappingFlags;
+use axhal::paging::{MappingFlags, PageSize};
 use axtask::current;
 use linux_raw_sys::general::{CAP_IPC_LOCK, RLIMIT_DATA};
-use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, align_up_4k};
+use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange, align_up_4k};
 use tk_linux_mm::{BrkAdmission, classify_brk};
 
 use super::mmap::check_mmap_memlock_limit;
 use crate::{
     config::{USER_SPACE_BASE, USER_SPACE_SIZE},
-    mm::{DeferredUffdWake, check_memory_overcommit, check_rlimit_as_growth},
+    mm::{Backend, DeferredUffdWake, check_memory_overcommit, check_rlimit_as_growth},
     task::AsThread,
 };
 
@@ -87,6 +87,11 @@ pub(crate) fn sys_brk_transaction(addr: usize, publish_layout: bool) -> AxResult
                 && check_mmap_memlock_limit(
                     proc_data,
                     curr.as_thread().has_effective_capability(CAP_IPC_LOCK),
+                    // `brk` has no `MAP_LOCKED` flag of its own: Linux reaches
+                    // `mlock_future_ok()` through `check_brk_limits()`, so the
+                    // zero-limit answer here is `-EAGAIN`, and both errnos are
+                    // an unchanged break anyway.
+                    false,
                     &aspace,
                     expand_start,
                     expand_size,
@@ -104,6 +109,19 @@ pub(crate) fn sys_brk_transaction(addr: usize, publish_layout: bool) -> AxResult
             ) {
                 return Ok(current_top as isize);
             }
+            // Linux `mm/mmap.c:184-191` refuses a growth that would come within
+            // `stack_guard_gap` of the next VMA's `vm_start_gap()` — the space a
+            // `MAP_GROWSDOWN` VMA (or a shadow stack) has reserved below its own
+            // start.  The probe is ordered after the collision check because a
+            // colliding VMA is the same VMA this predicate finds first; both
+            // reach Linux's `out:` label, which restores the old break.
+            if aspace.brk_growth_crosses_next_guard_gap(
+                expand_start,
+                new_top_aligned.into(),
+                heap_base.into(),
+            ) {
+                return Ok(current_top as isize);
+            }
             if check_rlimit_as_growth(proc_data, &aspace, expand_size).is_err() {
                 return Ok(current_top as isize);
             }
@@ -112,29 +130,62 @@ pub(crate) fn sys_brk_transaction(addr: usize, publish_layout: bool) -> AxResult
             }
 
             let populate = locked && !aspace.locks_future_mappings_on_fault();
-            let Some((heap_lineage, mut heap_backend)) = expand_start
+            let heap_tail = expand_start
                 .checked_sub(1)
                 .and_then(|tail| aspace.find_area(tail))
                 .filter(|area| area.end() == expand_start && area.backend().is_private_anonymous())
-                .map(|area| (area.lineage(), area.backend().clone()))
-            else {
-                return Ok(current_top as isize);
+                .map(|area| (area.lineage(), area.backend().clone()));
+            // Linux `mm/vma.c:do_brk_flags()` merges only when the previous VMA
+            // ends exactly at `addr` with matching flags:
+            //
+            // ```c
+            // 	if (vma && vma->vm_end == addr && can_vma_merge_before(...))
+            // 		...
+            // 	vma = vm_area_alloc(mm);
+            // 	vma_set_anonymous(vma);
+            // 	...
+            // 	vma_iter_store(vmi, vma);
+            // ```
+            //
+            // and otherwise allocates a brand-new anonymous VMA.  A heap that was
+            // `munmap`ed — or whose tail page was — has no such neighbour, so the
+            // growth has to create the VMA instead of publishing a break over
+            // unmapped memory.  There is no `VM_SEALED` to carry onto a new VMA.
+            // Whether the failed growth left the address space unchanged.  A
+            // merged heap tail reports that through
+            // `ExistingLineageMapError::published()`; a fresh VMA has no
+            // pre-existing lineage to preserve, so its error is always the
+            // "nothing published" case.  Both then take Linux's `out:` path.
+            let growth_preserved = match heap_tail {
+                Some((heap_lineage, mut heap_backend)) => {
+                    // brk creates a new VMA tail.  Unlike growdown/fork, Linux
+                    // does not carry VM_SEALED onto that newly allocated range.
+                    heap_backend.clear_sealed();
+                    match aspace.map_with_existing_lineage(
+                        expand_start,
+                        expand_size,
+                        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+                        populate,
+                        heap_backend,
+                        locked,
+                        heap_lineage,
+                    ) {
+                        Ok(()) => false,
+                        Err(error) => !error.published(),
+                    }
+                }
+                None => aspace
+                    .map_with_lock_state(
+                        expand_start,
+                        expand_size,
+                        MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
+                        populate,
+                        Backend::new_alloc(expand_start, PageSize::Size4K),
+                        locked,
+                    )
+                    .is_err(),
             };
-            // brk creates a new VMA tail.  Unlike growdown/fork, Linux does
-            // not carry VM_SEALED onto that newly allocated range.
-            heap_backend.clear_sealed();
-            let growth = aspace.map_with_existing_lineage(
-                expand_start,
-                expand_size,
-                MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER,
-                populate,
-                heap_backend,
-                locked,
-                heap_lineage,
-            );
-            if let Err(error) = growth
-                && !error.published()
-            {
+            if growth_preserved {
                 return Ok(current_top as isize);
             }
         }
@@ -143,6 +194,35 @@ pub(crate) fn sys_brk_transaction(addr: usize, publish_layout: bool) -> AxResult
         let shrink_start = VirtAddr::from(initial_heap_end.max(new_top_aligned));
         let shrink_size = current_top_aligned.saturating_sub(shrink_start.as_usize());
         let aspace_handle = proc_data.aspace();
+
+        // Linux `mm/mmap.c:162-179` lets a shrink proceed only when some VMA
+        // intersects the range being given back:
+        //
+        // ```c
+        // 	/* Always allow shrinking brk. */
+        // 	if (brk <= mm->brk) {
+        // 		/* Search one past newbrk */
+        // 		vma_iter_init(&vmi, mm, newbrk);
+        // 		brkvma = vma_find(&vmi, oldbrk);
+        // 		if (!brkvma || brkvma->vm_start >= oldbrk)
+        // 			goto out; /* mapping intersects with an existing non-brk vma. */
+        // ```
+        //
+        // `vma_find(&vmi, oldbrk)` is the first VMA intersecting
+        // `[newbrk, oldbrk)`, so a break that would take back nothing but holes
+        // does not move at all: `out:` restores `mm->brk = origbrk` and returns
+        // it.  Without this the kernel would publish a break below memory it
+        // never owned, and a later growth would fail to account for the gap.
+        {
+            let aspace = aspace_handle.lock();
+            let range = VirtAddrRange::new(
+                VirtAddr::from(new_top_aligned),
+                VirtAddr::from(current_top_aligned),
+            );
+            if aspace.areas_overlapping(range).next().is_none() {
+                return Ok(current_top as isize);
+            }
+        }
 
         let wake = if shrink_size == 0 {
             DeferredUffdWake::empty()
