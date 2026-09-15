@@ -118,6 +118,7 @@ tk-linux-mount = { path = "crates/linux/mount", version = "0.1.0", default-featu
 tk-linux-drm = { path = "crates/linux/drm", version = "0.1.0", default-features = false }
 tk-linux-aio = { path = "crates/linux/aio", version = "0.1.0", default-features = false }
 tk-linux-syslog = { path = "crates/linux/syslog", version = "0.1.0", default-features = false }
+tk-linux-random = { path = "crates/linux/random", version = "0.1.0", default-features = false }
 axtlb = { package = "tk-axtlb", path = "crates/ax/tk-axtlb", version = "0.1.0", default-features = false }
 tk-linux-process-adapter = { version = "0.1.0", path = "crates/process-adapter" }
 tk-linux-profile = { path = "crates/linux/profile", version = "0.1.0" }

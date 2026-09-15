@@ -1,0 +1,18 @@
+[package]
+description = "Linux getrandom ABI flag, length and readiness policy contracts"
+repository.workspace = true
+publish = ["crates-io"]
+name = "tk-linux-random"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+license = "Apache-2.0"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[package.metadata.thekernel]
+layer = "linux_abi"

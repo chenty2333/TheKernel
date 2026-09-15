@@ -123,6 +123,7 @@ tk-linux-mount.workspace = true
 tk-linux-drm.workspace = true
 tk-linux-aio.workspace = true
 tk-linux-syslog.workspace = true
+tk-linux-random.workspace = true
 axtlb.workspace = true
 bitflags = "2.10"
 bitmaps = { version = "3.2", default-features = false }
