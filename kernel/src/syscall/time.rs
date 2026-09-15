@@ -24,7 +24,7 @@ use crate::{
     syscall::RawSigevent,
     task::{
         AlarmClock, AlarmTokenReserveError, AsThread, ITimerType, PosixTimer, PosixTimerClock,
-        PosixTimerNotify, TaskUsage, get_process_itimer, get_visible_task_including_exiting,
+        PosixTimerNotify, TaskUsage, get_process_itimer, get_visible_task,
         poll_timer, refresh_posix_cpu_timer_armed, set_process_itimer, times_clock_ticks,
     },
     time::{
@@ -90,20 +90,22 @@ fn fine_clock_resolution() -> TimeValue {
 
 fn clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
     match clock_id as u32 {
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_COARSE => {
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE => {
             let now = match clock_id as u32 {
                 CLOCK_MONOTONIC_COARSE => {
                     quantize_clock_reading(monotonic_time(), coarse_clock_resolution())
                 }
                 _ => monotonic_time(),
             };
+            // `CLOCK_MONOTONIC_RAW` is namespaced too: Linux's raw reader adds
+            // the monotonic time-namespace offset exactly like the
+            // non-raw one (`posix_get_monotonic_raw()`,
+            // `kernel/time/posix-timers.c:222-227`, via
+            // `timens_add_monotonic()`, `include/linux/time_namespace.h:73-78`).
+            // "Raw" refers to the underlying clocksource being read without NTP
+            // frequency/phase steering, not to the namespace.
             return Ok(current().as_thread().time_ns().apply_monotonic_offset(now));
         }
-        // CLOCK_MONOTONIC_RAW is intentionally outside time-namespace
-        // virtualization.  Its contract is the raw hardware monotonic
-        // timeline; applying the namespace offset here makes it disagree
-        // with Linux and defeats clock-domain comparison by userspace.
-        CLOCK_MONOTONIC_RAW => return Ok(monotonic_time()),
         CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => {
             return Ok(current()
                 .as_thread()
@@ -140,14 +142,18 @@ fn quantize_clock_reading(now: TimeValue, resolution: TimeValue) -> TimeValue {
     TimeValue::from_nanos(now_ns - (now_ns % resolution_ns))
 }
 
+/// The resolution half of `clock_getres(2)`, without the CPU-clock target
+/// lookup that Linux performs first: `posix_cpu_clock_getres()` only reports a
+/// resolution once `validate_clock_permissions()` has resolved the encoded pid
+/// (`kernel/time/posix-cpu-timers.c:57-124,159-176`), which
+/// [`sys_clock_getres`] performs before calling this.
 fn clock_resolution(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
     // `posix_cpu_clock_getres()` reports one nanosecond for the scheduler
     // clock, which covers CLOCK_PROCESS_CPUTIME_ID/CLOCK_THREAD_CPUTIME_ID and
     // their CPUCLOCK_SCHED encodings, and the rounded-up accounting tick for
     // the encoded PROF/VIRT clocks, which are charged once per tick
     // (`kernel/time/posix-cpu-timers.c:159-176`).
-    if clock_id < 0
-        && let Some(clock) = decode_cpu_clock_id(clock_id)
+    if let Some(clock) = decode_cpu_clock_id(clock_id)
         && clock.which != CPUCLOCK_SCHED
     {
         return Ok(TimeValue::from_nanos(
@@ -233,6 +239,37 @@ pub(crate) fn tai_offset_snapshot() -> (i64, u64) {
     (state.value.tai as i64, state.version)
 }
 
+/// `ntp_clear()` (`kernel/time/ntp.c:353-359`) as reached through the
+/// `TK_CLEAR_NTP` bit of `timekeeping_update()` (`kernel/time/timekeeping.c:31-34,
+/// 804-808`).
+///
+/// Linux publishes every new wall clock with `TK_UPDATE_ALL`, so a successful
+/// `settimeofday(2)`, `clock_settime(2)` on `CLOCK_REALTIME` or
+/// `timekeeping_warp_clock()` (`do_settimeofday64()`,
+/// `kernel/time/timekeeping.c:1679`; `__timekeeping_inject_offset()`,
+/// `kernel/time/timekeeping.c:1742`; `timekeeping_warp_clock()`,
+/// `kernel/time/timekeeping.c:1786-1790`) leaves the NTP state unsynchronised:
+/// `adjtimex(2)` then reports `TIME_ERROR` with `STA_UNSYNC` set.  The
+/// `ADJ_SETOFFSET` case is applied by `linux_time::adjust()` itself, because
+/// that call reads the cleared state back in the same syscall.
+///
+/// The TAI rebase gate is taken so this update cannot interleave with a
+/// concurrent `ADJ_TAI` publication; `tai` is untouched here, so no timer is
+/// reprojected.
+pub(crate) fn clear_ntp_state() -> AxResult<()> {
+    let _gate = TAI_TIMER_REBASE_GATE.lock();
+    let mut state = TIMEX_STATE.lock();
+    let cleared = state.value.cleared();
+    if cleared == state.value {
+        return Ok(());
+    }
+    // The version only moves when the state does, so a generation snapshot
+    // taken by an absolute CLOCK_TAI timer still names this publication.
+    state.version = state.version.checked_add(1).ok_or(AxError::OutOfRange)?;
+    state.value = cleared;
+    Ok(())
+}
+
 pub(crate) fn tai_time() -> TimeValue {
     let nanos = wall_time_nanos() as i128 + tai_offset_seconds() as i128 * NANOS_PER_SEC as i128;
     TimeValue::from_nanos(nanos.clamp(0, u64::MAX as i128) as u64)
@@ -294,44 +331,64 @@ fn usage_value_for_cpu_clock(usage: TaskUsage, which: i32) -> TimeValue {
     }
 }
 
-fn cpu_clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
-    let decoded = decode_cpu_clock_id(clock_id).ok_or(AxError::InvalidInput)?;
-    let usage = match decoded.target {
-        CpuClockTarget::Process(0) => current().as_thread().proc_data.self_usage(),
-        CpuClockTarget::Thread(0) => TaskUsage::from_thread(current().as_thread()),
+/// `posix_cpu_clock_get()`'s target half: `pid_for_clock()` plus the clock
+/// resolution Linux performs on it (`kernel/time/posix-cpu-timers.c:57-105`,
+/// `:132-145`).
+///
+/// `gettime` is Linux's second argument: `clock_gettime(2)` passes true, which
+/// additionally accepts the caller's own non-leader TID as a process clock
+/// (`kernel/time/posix-cpu-timers.c:87-93`); `clock_getres(2)` and
+/// `clock_settime(2)` pass false and require a thread-group leader.
+fn resolve_cpu_clock_usage(
+    clock_id: __kernel_clockid_t,
+    gettime: bool,
+) -> AxResult<TaskUsage> {
+    let caller = current();
+    let caller = caller.as_thread();
+    let clock = decode_cpu_clock_id(clock_id).ok_or(AxError::InvalidInput)?;
+    match clock.target {
+        // An encoded pid of 0 targets current, or the process current belongs
+        // to (`pid_for_clock()`, kernel/time/posix-cpu-timers.c:68-72).
+        CpuClockTarget::Process(0) => Ok(caller.proc_data.self_usage()),
+        CpuClockTarget::Thread(0) => Ok(TaskUsage::from_thread(caller)),
         CpuClockTarget::Process(pid) => {
-            let curr = current();
-            let caller = curr.as_thread();
             let tid = caller
                 .pid_ns()
                 .resolve_visible_pid(pid)
                 .ok_or(AxError::InvalidInput)?;
-            let task =
-                get_visible_task_including_exiting(tid).map_err(|_| AxError::InvalidInput)?;
+            let task = get_visible_task(tid).map_err(|_| AxError::InvalidInput)?;
             let target = task.as_thread();
-            // Linux clock_gettime also accepts the caller's own nonleader
-            // TID as a process clock, but other targets must name a leader.
+            // Linux's process lookup requires `pid_has_task(pid, PIDTYPE_TGID)`
+            // and only falls back to the caller's own task id for
+            // `clock_gettime(2)` (`kernel/time/posix-cpu-timers.c:87-101`).
             if target.tid() != caller.tid() && !target.is_thread_group_leader() {
                 return Err(AxError::InvalidInput);
             }
-            target.proc_data.self_usage()
+            if !gettime && target.tid() != caller.tid() {
+                return Err(AxError::InvalidInput);
+            }
+            Ok(target.proc_data.self_usage())
         }
         CpuClockTarget::Thread(tid) => {
-            let curr = current();
-            let caller = curr.as_thread();
             let tid = caller
                 .pid_ns()
                 .resolve_visible_pid(tid)
                 .ok_or(AxError::InvalidInput)?;
-            let task =
-                get_visible_task_including_exiting(tid).map_err(|_| AxError::InvalidInput)?;
+            let task = get_visible_task(tid).map_err(|_| AxError::InvalidInput)?;
             let target = task.as_thread();
+            // "if (thread) ... return (tsk && same_thread_group(tsk, current))
+            // ? pid : NULL" (`kernel/time/posix-cpu-timers.c:80-83`).
             if target.proc_data.proc.pid() != caller.proc_data.proc.pid() {
                 return Err(AxError::InvalidInput);
             }
-            TaskUsage::from_thread(target)
+            Ok(TaskUsage::from_thread(target))
         }
-    };
+    }
+}
+
+fn cpu_clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
+    let decoded = decode_cpu_clock_id(clock_id).ok_or(AxError::InvalidInput)?;
+    let usage = resolve_cpu_clock_usage(clock_id, true)?;
     Ok(usage_value_for_cpu_clock(usage, decoded.which))
 }
 
@@ -438,6 +495,33 @@ pub(crate) fn wake_alarm_admission(
             }
         }),
         Err(linux_time::WakeAlarmReject::NotPermitted) => Err(AxError::OperationNotPermitted),
+        // `admit_wake_alarm()` has no flag test, so this variant is
+        // unreachable here; the arm exists so that adding one is a compile
+        // error rather than a silent EINVAL on the wrong path.
+        Err(linux_time::WakeAlarmReject::BadFlags) => Err(AxError::InvalidInput),
+    }
+}
+
+/// Wake-alarm admission for `clock_nanosleep(2)`, which is the one entry point
+/// whose clock-specific implementation validates the flags itself
+/// (`alarm_timer_nsleep()`, `kernel/time/alarmtimer.c:766-790`): the missing
+/// RTC is EOPNOTSUPP, an unknown flag bit is EINVAL, and a missing
+/// `CAP_WAKE_ALARM` is EPERM, in that order.  Every other clock ignores flag
+/// bits other than `TIMER_ABSTIME`, so this is the only place the mask is
+/// checked.
+pub(crate) fn wake_alarm_nanosleep_admission(
+    clock_id: __kernel_clockid_t,
+    flags: u32,
+) -> AxResult<()> {
+    let rtc_available = crate::pseudofs::dev::rtc::is_available();
+    let cap_wake_alarm = current()
+        .as_thread()
+        .has_effective_capability(CAP_WAKE_ALARM);
+    match linux_time::check_nanosleep_wake_alarm(clock_id, flags, rtc_available, cap_wake_alarm) {
+        Ok(()) => Ok(()),
+        Err(linux_time::WakeAlarmReject::NoRtc) => Err(AxError::OperationNotSupported),
+        Err(linux_time::WakeAlarmReject::BadFlags) => Err(AxError::InvalidInput),
+        Err(linux_time::WakeAlarmReject::NotPermitted) => Err(AxError::OperationNotPermitted),
     }
 }
 
@@ -476,8 +560,17 @@ fn clock_adjtime_core(clock_id: __kernel_clockid_t, timex: &mut KernelOldTimex) 
     let _tai_timer_gate = TAI_TIMER_REBASE_GATE.lock();
     let (output, result, previous_tai, next, changed) = {
         let state = TIMEX_STATE.lock();
-        let update =
-            linux_time::adjust(&state.value, &request, authority).map_err(map_timex_reject)?;
+        // `NTP_INTERVAL_FREQ` is Linux's `HZ` (`include/linux/timex.h:151`), the
+        // rate that both scales and un-scales `ADJ_OFFSET`
+        // (`kernel/time/ntp.c:333,806`).  TheKernel's rate is its configured
+        // tick rate, not the ABI's USER_HZ.
+        let update = linux_time::adjust(
+            &state.value,
+            &request,
+            authority,
+            axconfig::TICKS_PER_SEC as i64,
+        )
+        .map_err(map_timex_reject)?;
         let previous_tai = state.value.tai;
         let next = if update.changed {
             TimexState {
@@ -1176,12 +1269,21 @@ pub fn sys_settimeofday<M: UserMemory + ?Sized>(
     ts: *const timeval,
     tz: *const timezone,
 ) -> AxResult<isize> {
+    // `settimeofday(2)` reads the timeval and validates its sub-second field
+    // before it touches the timezone pointer, so a malformed `tv_usec` is
+    // EINVAL even when `tz` would fault; the seconds are validated later by
+    // `timespec64_valid_settod()` inside `do_sys_settimeofday64()`
+    // (`kernel/time/time.c:199-222`).
     let ts = if let Some(ts) = VmPtr::nullable(ts) {
-        Some(unsafe {
+        let ts = unsafe {
             VmPtr::vm_read_uninit(ts, memory)
                 .map_err(map_usercopy_error)?
                 .assume_init()
-        })
+        };
+        if !(0..1_000_000).contains(&ts.tv_usec) {
+            return Err(AxError::InvalidInput);
+        }
+        Some(ts)
     } else {
         None
     };
@@ -1196,18 +1298,9 @@ pub fn sys_settimeofday<M: UserMemory + ?Sized>(
         None
     };
 
-    // `settimeofday(2)` validates only the sub-second field before it reads
-    // the timezone, so a malformed `tv_usec` is EINVAL even when `tz` would
-    // fault; the seconds are validated later by `timespec64_valid_settod()`
-    // (`kernel/time/time.c:199-222`).
-    let requested_nanos = ts
-        .map(|ts| -> AxResult<i128> {
-            if !(0..1_000_000).contains(&ts.tv_usec) {
-                return Err(AxError::InvalidInput);
-            }
-            Ok(ts.tv_sec as i128 * NANOS_PER_SEC as i128 + ts.tv_usec as i128 * 1_000)
-        })
-        .transpose()?;
+    let requested_nanos = ts.map(|ts| -> i128 {
+        ts.tv_sec as i128 * NANOS_PER_SEC as i128 + ts.tv_usec as i128 * 1_000
+    });
 
     // `timespec64_valid_settod()` runs before the capability test while the
     // CLOCK_MONOTONIC floor runs after it (`kernel/time/time.c:174-197`,
@@ -1232,6 +1325,16 @@ pub fn sys_settimeofday<M: UserMemory + ?Sized>(
             minutes_west: tz.tz_minuteswest,
             dst_time: tz.tz_dsttime,
         });
+        // The first stored timezone warps `CLOCK_REALTIME` by
+        // `tz_minuteswest * 60` seconds, but only when this call does not set
+        // the clock itself (`kernel/time/time.c:194-200`,
+        // `kernel/time/timekeeping.c:1781-1791`).
+        if requested_nanos.is_none() && crate::time::warp_first_timezone(tz.tz_minuteswest)? {
+            // `timekeeping_warp_clock()` reaches `ntp_clear()` through
+            // `timekeeping_inject_offset()` (`kernel/time/timekeeping.c:1786-1790`),
+            // but only when the retained timezone actually moves the clock.
+            clear_ntp_state()?;
+        }
     }
 
     if let Some(requested_nanos) = requested_nanos {
@@ -1239,6 +1342,7 @@ pub fn sys_settimeofday<M: UserMemory + ?Sized>(
             .map_err(map_timex_reject)?;
         // The bound above proves the value fits the wall-clock model.
         set_wall_time(TimeValue::from_nanos(requested_nanos as u64))?;
+        clear_ntp_state()?;
     }
     Ok(0)
 }
@@ -1251,6 +1355,15 @@ pub fn sys_clock_getres<M: UserMemory + ?Sized>(
     // As for clock_gettime(2): a wake-alarm clock does not exist without an
     // RTC (`alarm_clock_getres()`, kernel/time/alarmtimer.c:600-620).
     wake_alarm_admission(clock_id, linux_time::WakeAlarmUse::Read)?;
+    // `posix_cpu_clock_getres()` validates the encoded pid before it reports
+    // anything (`validate_clock_permissions()` -> `pid_for_clock(clock,
+    // false)`, `kernel/time/posix-cpu-timers.c:57-124`), so a clock naming a
+    // pid that does not exist, or a foreign thread, is EINVAL no matter what
+    // the resolution would have been.  `clock_getres(2)` passes
+    // `gettime = false`, which also refuses the caller's own non-leader TID.
+    if decode_cpu_clock_id(clock_id).is_some() {
+        resolve_cpu_clock_usage(clock_id, false)?;
+    }
     let resolution = clock_resolution(clock_id)?;
     if let Some(res) = VmPtr::nullable(res) {
         // SAFETY: `timespec` is a fully initialized two-word ABI value.
@@ -1265,10 +1378,32 @@ pub fn sys_clock_settime<M: UserMemory + ?Sized>(
     clock_id: __kernel_clockid_t,
     ts: *const timespec,
 ) -> AxResult<isize> {
-    // `clock_settime(2)` validates the clock id before copying the value in,
-    // because only the realtime clock has a setter
-    // (`kernel/time/posix-timers.c:1123-1140`).
-    if clock_id as u32 != CLOCK_REALTIME {
+    // `clock_settime(2)` classifies the clock first *only* to decide whether it
+    // has a setter at all: `if (!kc || !kc->clock_set) return -EINVAL` runs
+    // before the timespec is copied (`kernel/time/posix-timers.c:1123-1130`).
+    // That covers every positive clock except CLOCK_REALTIME, whose
+    // `clock_realtime` table is the only one with `.clock_set`.
+    //
+    // The negative (encoded) ids are different: `clockid_to_kclock()` routes
+    // them to `clock_posix_cpu` or `clock_posix_dynamic`
+    // (`kernel/time/posix-timers.c:1541-1554`), and both *do* provide
+    // `.clock_set` (`kernel/time/posix-cpu-timers.c:1706-1718`,
+    // `kernel/time/posix-timers.c:1290-1310`), so the copy-in happens before
+    // they are refused.  A CPU clock can never be reset, but the refusal is
+    // EPERM for a valid target and EINVAL for one that names no task
+    // (`posix_cpu_clock_set()`, `kernel/time/posix-cpu-timers.c:180-189`).
+    if clock_id >= 0 && clock_id as u32 != CLOCK_REALTIME {
+        return Err(AxError::InvalidInput);
+    }
+    // `clockid_to_kclock()` sends every negative id to `clock_posix_cpu` unless
+    // bits 2..0 are all set, which selects `clock_posix_dynamic`
+    // (`kernel/time/posix-timers.c:1541-1554`).  Both carry a `.clock_set`, so
+    // neither is refused before the copy-in; a dynamic clock that names no open
+    // descriptor is EINVAL afterwards, which `decode_cpu_clock_id` already
+    // reports for a CLOCKFD encoding
+    // (`posix_clock_ioctl()`, `kernel/time/posix-clock.c:230-250`).
+    let cpu_clock = decode_cpu_clock_id(clock_id);
+    if clock_id < 0 && (clock_id & CLOCKFD_MASK) != CLOCKFD && cpu_clock.is_none() {
         return Err(AxError::InvalidInput);
     }
     let requested = unsafe {
@@ -1277,6 +1412,14 @@ pub fn sys_clock_settime<M: UserMemory + ?Sized>(
             .assume_init()
     }
     .try_into_time_value()?;
+    if cpu_clock.is_some() {
+        // `posix_cpu_clock_set()` runs the permission lookup and then refuses
+        // with EPERM; it never reads the timespec, because `clock_settime(2)`
+        // has already copied it in (`get_timespec64()`,
+        // `kernel/time/posix-timers.c:1131-1133`).
+        resolve_cpu_clock_usage(clock_id, false)?;
+        return Err(AxError::OperationNotPermitted);
+    }
     let requested_nanos = requested.as_nanos() as i128;
     // `do_sys_settimeofday64()` validates the wall-clock bound before the
     // `CAP_SYS_TIME` test and applies the CLOCK_MONOTONIC floor afterwards
@@ -1288,6 +1431,10 @@ pub fn sys_clock_settime<M: UserMemory + ?Sized>(
     linux_time::validate_settime_floor(requested_nanos, monotonic_time_nanos() as i128)
         .map_err(map_timex_reject)?;
     set_wall_time(requested)?;
+    // `clock_realtime`'s `.clock_set` is `do_sys_settimeofday64()` with a NULL
+    // timezone (`kernel/time/posix-timers.c:1123-1133`), so it publishes with
+    // `TK_UPDATE_ALL` and clears the NTP state the same way.
+    clear_ntp_state()?;
     Ok(0)
 }
 
@@ -1769,6 +1916,10 @@ mod tests {
             clock_resolution(CLOCK_REALTIME_COARSE as _),
             Ok(coarse_clock_resolution())
         );
+        // The resolution itself does not depend on the target, which is what
+        // separates this pure half from the lookup `sys_clock_getres` performs
+        // first (`posix_cpu_clock_getres()`,
+        // kernel/time/posix-cpu-timers.c:159-176).
         assert_eq!(
             clock_resolution(make_thread_cpuclock(123, CPUCLOCK_SCHED)),
             Ok(fine_clock_resolution())
@@ -1882,6 +2033,7 @@ mod tests {
                     &linux_time::TimexState::INITIAL,
                     &request,
                     linux_time::TimexAuthority { cap_sys_time: true },
+                    axconfig::TICKS_PER_SEC as i64,
                 )
                 .is_ok()
             );
@@ -1896,6 +2048,7 @@ mod tests {
                 &linux_time::TimexState::INITIAL,
                 &request,
                 linux_time::TimexAuthority { cap_sys_time: true },
+                axconfig::TICKS_PER_SEC as i64,
             ),
             Err(linux_time::Reject::InvalidMode)
         );

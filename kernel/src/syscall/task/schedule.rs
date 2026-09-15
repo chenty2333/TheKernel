@@ -911,11 +911,13 @@ fn sleep_tai_absolute(deadline: TimeValue) -> AxResult<ClockSleepOutcome> {
     }
 }
 
-fn clock_nanosleep_is_absolute(flags: u32) -> AxResult<bool> {
-    if flags & !TIMER_ABSTIME != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(flags & TIMER_ABSTIME != 0)
+fn clock_nanosleep_is_absolute(flags: u32) -> bool {
+    // Linux reads the single `TIMER_ABSTIME` bit and ignores every other flag
+    // bit on the non-alarm path (`common_nsleep()`,
+    // `kernel/time/posix-timers.c:1355-1363`).  `alarm_timer_nsleep()` is the
+    // only implementation that rejects unknown bits, which
+    // `check_nanosleep_wake_alarm()` applies on that path alone.
+    flags & TIMER_ABSTIME != 0
 }
 
 fn finish_absolute_clock_sleep(
@@ -1248,12 +1250,14 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
             .assume_init()
     }
     .try_into_time_value()?;
-    let absolute = clock_nanosleep_is_absolute(flags)?;
-    // A wake-alarm sleep needs an RTC (EOPNOTSUPP) and CAP_WAKE_ALARM (EPERM)
-    // before it starts (`alarm_timer_nsleep()`,
-    // kernel/time/alarmtimer.c:766-790); the rule itself is shared with
-    // timer_create(2), clock_gettime(2), clock_getres(2) and timerfd_create(2).
-    crate::syscall::time::wake_alarm_admission(clock_id, tk_linux_time::WakeAlarmUse::Arm)?;
+    // Unique flag bits never make this EINVAL: Linux masks flags with
+    // `TIMER_ABSTIME` on every non-alarm path
+    // (`common_nsleep()`, `kernel/time/posix-timers.c:1355-1363`).
+    let absolute = clock_nanosleep_is_absolute(flags);
+    // A wake-alarm sleep needs an RTC (EOPNOTSUPP), then a flags mask that is
+    // only `TIMER_ABSTIME` (EINVAL), then CAP_WAKE_ALARM (EPERM), in that order
+    // (`alarm_timer_nsleep()`, kernel/time/alarmtimer.c:766-790).
+    crate::syscall::time::wake_alarm_nanosleep_admission(clock_id, flags)?;
     debug!("sys_clock_nanosleep <= clock_id: {clock_id}, flags: {flags}, req: {req:?}");
 
     if clock_id as u32 == CLOCK_PROCESS_CPUTIME_ID || clock_id < 0 {
@@ -3072,13 +3076,15 @@ mod tests {
     }
 
     #[test]
-    fn clock_nanosleep_rejects_unknown_flags() {
-        assert_eq!(clock_nanosleep_is_absolute(0), Ok(false));
-        assert_eq!(clock_nanosleep_is_absolute(TIMER_ABSTIME), Ok(true));
-        assert_eq!(
-            clock_nanosleep_is_absolute(TIMER_ABSTIME | 0x8000_0000),
-            Err(AxError::InvalidInput)
-        );
+    fn clock_nanosleep_ignores_every_flag_bit_except_timer_abstime() {
+        // Linux's non-alarm `nsleep` implementations only test `TIMER_ABSTIME`
+        // (`common_nsleep()`, kernel/time/posix-timers.c:1355-1363), so an
+        // unknown bit neither changes the mode nor fails the call.
+        assert!(!clock_nanosleep_is_absolute(0));
+        assert!(clock_nanosleep_is_absolute(TIMER_ABSTIME));
+        assert!(clock_nanosleep_is_absolute(TIMER_ABSTIME | 0x8000_0000));
+        assert!(!clock_nanosleep_is_absolute(0x8000_0000));
+        assert!(clock_nanosleep_is_absolute(0xffff_ffff));
     }
 
     #[test]
