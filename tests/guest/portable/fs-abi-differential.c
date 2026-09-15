@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -245,6 +246,22 @@ int main(void) {
         check(waitpid(child, &status, 0) == child, "waitpid");
         check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "noatime-nonowner");
         mark("SETFL_NOATIME_NONOWNER_EPERM");
+        /* The capability half of `inode_owner_or_capable()` is asked of the
+         * inode, not of a path: every inode created by `inode_init_always()`
+         * starts at GLOBAL_ROOT_UID/GLOBAL_ROOT_GID (fs/inode.c:206-208), so
+         * an anonymous object such as an eventfd is root-owned even though no
+         * vfsmount backs it.  A caller with CAP_FOWNER (here: uid 0) must
+         * therefore be able to set O_NOATIME on it, exactly as on the regular
+         * file above. */
+        int anon = eventfd(0, EFD_CLOEXEC);
+        check(anon >= 0, "eventfd");
+        long anon_base = fcntl(anon, F_GETFL);
+        check(anon_base >= 0, "anon-getfl");
+        check(fcntl(anon, F_SETFL, anon_base | O_NOATIME) == 0, "set-noatime-anon");
+        check((fcntl(anon, F_GETFL) & O_NOATIME) != 0, "noatime-anon-stored");
+        check(fcntl(anon, F_SETFL, anon_base) == 0, "clear-noatime-anon");
+        check(close(anon) == 0, "close-anon");
+        mark("SETFL_NOATIME_ANONYMOUS_OWNER");
     }
     done();
 
