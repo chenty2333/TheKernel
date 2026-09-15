@@ -2293,8 +2293,8 @@ status = "implemented"
 contract = "linux-getuid"
 handler = "kernel/src/syscall/sys.rs:sys_getuid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2316,8 +2316,8 @@ status = "implemented"
 contract = "linux-geteuid"
 handler = "kernel/src/syscall/sys.rs:sys_geteuid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2339,8 +2339,8 @@ status = "implemented"
 contract = "linux-getresuid"
 handler = "kernel/src/syscall/sys.rs:sys_getresuid"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sys.rs:getresids_keeps_first_id_prefix_on_second_fault"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/sys.rs:getresids_keeps_first_id_prefix_on_second_fault", "tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2362,8 +2362,8 @@ status = "implemented"
 contract = "linux-getgid"
 handler = "kernel/src/syscall/sys.rs:sys_getgid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2385,8 +2385,8 @@ status = "implemented"
 contract = "linux-getegid"
 handler = "kernel/src/syscall/sys.rs:sys_getegid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2408,8 +2408,8 @@ status = "implemented"
 contract = "linux-getresgid"
 handler = "kernel/src/syscall/sys.rs:sys_getresgid"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sys.rs:getresids_keeps_first_id_prefix_on_second_fault"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/sys.rs:getresids_keeps_first_id_prefix_on_second_fault", "tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2431,8 +2431,8 @@ status = "implemented"
 contract = "linux-setuid"
 handler = "kernel/src/syscall/sys.rs:sys_setuid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2454,8 +2454,8 @@ status = "implemented"
 contract = "linux-setgid"
 handler = "kernel/src/syscall/sys.rs:sys_setgid"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2477,8 +2477,8 @@ status = "implemented"
 contract = "linux-setfsuid"
 handler = "kernel/src/syscall/sys.rs:sys_setfsuid"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sys.rs:invalid_or_unmapped_setfsid_returns_old_without_calling_writer"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/sys.rs:invalid_or_unmapped_setfsid_returns_old_without_calling_writer", "tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2500,8 +2500,8 @@ status = "implemented"
 contract = "linux-setfsgid"
 handler = "kernel/src/syscall/sys.rs:sys_setfsgid"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sys.rs:invalid_or_unmapped_setfsid_returns_old_without_calling_writer"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/sys.rs:invalid_or_unmapped_setfsid_returns_old_without_calling_writer", "tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2523,8 +2523,8 @@ status = "implemented"
 contract = "linux-getgroups"
 handler = "kernel/src/syscall/sys.rs:sys_getgroups"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sys.rs:getgroups_zero_size_and_empty_groups_do_not_touch_pointer"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/sys.rs:getgroups_zero_size_and_empty_groups_do_not_touch_pointer", "tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2546,8 +2546,8 @@ status = "implemented"
 contract = "linux-setgroups"
 handler = "kernel/src/syscall/sys.rs:sys_setgroups"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sys.rs:setgroups_stops_usercopy_at_first_unmapped_gid"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/sys.rs:setgroups_stops_usercopy_at_first_unmapped_gid", "tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["CAP_SETGID admission order and group-list publication are executed by the registered case; the may_setgroups() half of the admission cannot be probed on the pinned oracle build, whose configuration omits CONFIG_USER_NS so unshare(CLONE_NEWUSER) answers EINVAL and an unpublished or denied gid map is unreachable"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2592,8 +2592,8 @@ status = "implemented"
 contract = "linux-sethostname"
 handler = "kernel/src/syscall/sys.rs:sys_sethostname"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sys.rs:uts_name_len_matches_linux_int_abi"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/sys.rs:uts_name_len_matches_linux_int_abi", "tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2615,8 +2615,8 @@ status = "implemented"
 contract = "linux-setdomainname"
 handler = "kernel/src/syscall/sys.rs:sys_setdomainname"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sys.rs:uts_bytes_before_nul_preserves_non_utf8_bytes"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/sys.rs:uts_bytes_before_nul_preserves_non_utf8_bytes", "tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2638,8 +2638,8 @@ status = "implemented"
 contract = "linux-personality"
 handler = "kernel/src/syscall/sys.rs:sys_personality"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sys.rs:personality_namespace_preserves_arbitrary_native_u32_bits"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/sys.rs:personality_namespace_preserves_arbitrary_native_u32_bits", "tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2684,8 +2684,8 @@ status = "implemented"
 contract = "linux-prlimit64"
 handler = "kernel/src/syscall/resources.rs:sys_prlimit64"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2707,8 +2707,8 @@ status = "implemented"
 contract = "linux-setrlimit"
 handler = "kernel/src/syscall/resources.rs:sys_setrlimit"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/resources.rs:setrlimit_reads_all_16_bytes_and_maps_any_copy_failure_to_efault"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/resources.rs:setrlimit_reads_all_16_bytes_and_maps_any_copy_failure_to_efault", "tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2730,8 +2730,8 @@ status = "implemented"
 contract = "linux-getrlimit"
 handler = "kernel/src/syscall/resources.rs:sys_getrlimit"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/resources.rs:getrlimit_snapshot_contains_the_complete_native_value"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/resources.rs:getrlimit_snapshot_contains_the_complete_native_value", "tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2753,8 +2753,8 @@ status = "implemented"
 contract = "linux-getrusage"
 handler = "kernel/src/syscall/resources.rs:sys_getrusage"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["tests/guest/portable/identity-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
