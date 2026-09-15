@@ -15,7 +15,10 @@ use axsync::Mutex;
 use axtask::current;
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::*;
-use tk_linux_ipc::{MessageSelection, select_message};
+use tk_linux_ipc::{
+    IpcId, IpcIdTable, MessageSelection, ipcid_compose, ipcid_is_stale, ipcid_to_idx,
+    select_message,
+};
 use tk_linux_process_adapter::Pid;
 use tk_linux_usercopy::{
     UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
@@ -328,8 +331,10 @@ fn message_queue_would_exceed(queue: &MessageQueue, data_len: usize) -> bool {
 pub struct MsgManager {
     /// key -> msqid mapping
     key_msqid: BTreeMap<i32, i32>,
-    /// msqid -> message queue structure
+    /// index -> message queue structure, exactly `msg_ids(ns).ipcs_idr`
     msqid_queues: BTreeMap<i32, Arc<Mutex<MessageQueue>>>,
+    /// Linux `struct ipc_ids` bookkeeping for this table.
+    ids: IpcIdTable,
 }
 
 impl MsgManager {
@@ -337,7 +342,38 @@ impl MsgManager {
         MsgManager {
             key_msqid: BTreeMap::new(),
             msqid_queues: BTreeMap::new(),
+            ids: IpcIdTable::new(),
         }
+    }
+
+    /// Allocates the identifier for a new queue.  The caller holds the manager
+    /// lock, which is this table's `ipc_ids.rwsem`.
+    fn allocate_id(&mut self, next_id: &AtomicI32) -> AxResult<IpcId> {
+        let queues = &self.msqid_queues;
+        allocate_ipc_id(next_id, &mut self.ids, |index| queues.contains_key(&index))
+    }
+
+    /// Linux `ipc_obtain_object_idr()`: resolve the identifier's index without
+    /// consulting its sequence number.  This is the lookup `MSG_STAT` and
+    /// `MSG_STAT_ANY` use, because their argument is an index.
+    pub fn get_queue_by_index(&self, index: i32) -> Option<Arc<Mutex<MessageQueue>>> {
+        self.msqid_queues.get(&index).cloned()
+    }
+
+    /// Linux `ipc_obtain_object_check()`: resolve the index **and** verify
+    /// `ipc_checkid()`.  Every identifier that addresses an existing object by
+    /// its published id goes through here, so an id whose sequence no longer
+    /// matches the stored `msg_perm.seq` is rejected with EINVAL.
+    pub fn get_queue_by_msqid(&self, msqid: i32) -> Option<Arc<Mutex<MessageQueue>>> {
+        if msqid < 0 {
+            return None;
+        }
+        let queue = self.get_queue_by_index(ipcid_to_idx(msqid))?;
+        let sequence = queue.lock().msqid_ds.msg_perm.seq as i32;
+        if ipcid_is_stale(msqid, sequence) {
+            return None;
+        }
+        Some(queue)
     }
 
     /// Returns an iterator over all message queues
@@ -358,19 +394,14 @@ impl MsgManager {
         self.key_msqid.get(&key).cloned()
     }
 
-    /// Returns the message queue associated with the given ID.
-    pub fn get_queue_by_msqid(&self, msqid: i32) -> Option<Arc<Mutex<MessageQueue>>> {
-        self.msqid_queues.get(&msqid).cloned()
-    }
-
     /// Inserts a mapping from a key to a message queue ID.
     pub fn insert_key_msqid(&mut self, key: i32, msqid: i32) {
         self.key_msqid.insert(key, msqid);
     }
 
-    /// Inserts a mapping from a message queue ID to its queue.
-    pub fn insert_msqid_queues(&mut self, msqid: i32, msg_queue: Arc<Mutex<MessageQueue>>) {
-        self.msqid_queues.insert(msqid, msg_queue);
+    /// Inserts a mapping from a message queue index to its queue.
+    pub fn insert_msqid_queues(&mut self, index: i32, msg_queue: Arc<Mutex<MessageQueue>>) {
+        self.msqid_queues.insert(index, msg_queue);
     }
 
     /// Returns the current number of message queues.
@@ -378,10 +409,16 @@ impl MsgManager {
         self.msqid_queues.len()
     }
 
-    /// Remove a message queue
+    /// Remove a message queue.  `msqid` is the published identifier; only its
+    /// index names a slot in this table.
     pub fn remove_msqid(&mut self, msqid: i32) {
-        self.key_msqid.retain(|_, &mut v| v != msqid);
-        self.msqid_queues.remove(&msqid);
+        self.key_msqid.retain(|_, value| *value != msqid);
+        self.msqid_queues.remove(&ipcid_to_idx(msqid));
+        // Linux `ipc_rmid()` updates the cached highest index after the IDR
+        // removal, which `MSG_INFO`/`IPC_INFO` report.
+        let queues = &self.msqid_queues;
+        self.ids
+            .release(ipcid_to_idx(msqid), |index| queues.contains_key(&index));
     }
 
     /// get total bytes in all queues
@@ -406,10 +443,9 @@ impl MsgManager {
 
     /// get the largest active IPC index
     pub fn max_active_index(&self) -> isize {
-        self.iter_active_queues()
-            .map(|(msqid, _)| msqid as isize)
-            .max()
-            .unwrap_or(0)
+        // Linux `ipc_get_maxidx()` reports -1 for an empty table and the
+        // syscalls map that to 0.
+        self.ids.max_index().max(0) as isize
     }
 }
 
@@ -462,16 +498,6 @@ impl PreparedMsgSet {
 
 static MSGMNI_LIMIT: AtomicUsize = AtomicUsize::new(MSGMNI);
 
-fn allocate_msg_id(msg_manager: &MsgManager, cursor: &AtomicI32) -> AxResult<i32> {
-    let desired = cursor.swap(-1, Ordering::Relaxed);
-    allocate_ipc_id(
-        cursor,
-        (desired >= 0).then_some(desired),
-        msg_manager.msqid_queues.len(),
-        |id| msg_manager.msqid_queues.contains_key(&id),
-    )
-}
-
 pub(crate) fn msgmni_limit() -> usize {
     MSGMNI_LIMIT.load(Ordering::Relaxed)
 }
@@ -489,14 +515,17 @@ pub(crate) fn msg_next_id() -> i32 {
 }
 
 pub(crate) fn set_msg_next_id(value: i32) -> AxResult<()> {
-    if value < -1 {
+    // Linux `ipc/ipc_sysctl.c`: the entry is `proc_dointvec_minmax` over
+    // `[0, INT_MAX]`, so -1 (the "unset" encoding) is not writable, and the
+    // write needs CAP_CHECKPOINT_RESTORE over the IPC namespace.
+    if value < 0 {
         return Err(AxError::from(LinuxError::EINVAL));
     }
-    current()
-        .as_thread()
-        .ipc_ns()
-        .next_msg_id()
-        .store(value, Ordering::Relaxed);
+    let ipc_ns = current().as_thread().ipc_ns();
+    if !ipc_ns.may_set_next_id() {
+        return Err(AxError::from(LinuxError::EPERM));
+    }
+    ipc_ns.next_msg_id().store(value, Ordering::Relaxed);
     Ok(())
 }
 
@@ -508,9 +537,11 @@ pub(crate) fn sysvipc_msg_snapshot() -> String {
         );
     let ipc_ns = current().as_thread().ipc_ns();
     let msg_manager = ipc_ns.msg_manager().lock();
-    for (msqid, queue) in msg_manager.iter_active_queues() {
+    for (index, queue) in msg_manager.iter_active_queues() {
         let queue = queue.lock();
         let ds = queue.msqid_ds;
+        // The table is keyed by index; `ipcs` prints the published identifier.
+        let msqid = ipcid_compose(index, ds.msg_perm.seq as i32);
         let _ = writeln!(
             out,
             "{:10} {:10} {:5o} {:11} {:10} {:5} {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10}",
@@ -635,7 +666,7 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
         if msg_manager.queue_count() >= msgmni_limit() {
             return Err(AxError::from(LinuxError::ENOSPC)); // ENOSPC
         }
-        let msqid = allocate_msg_id(&msg_manager, ipc_ns.next_msg_id())?;
+        let id = msg_manager.allocate_id(ipc_ns.next_msg_id())?;
         let mut queue = MessageQueue::new(
             key,
             (msgflg & 0o777) as _,
@@ -643,11 +674,11 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
             current_uid,
             current_gid,
         );
-        queue.msqid_ds.msg_perm.seq = ipc_ns.next_sequence();
+        queue.msqid_ds.msg_perm.seq = id.sequence() as _;
         let msg_queue = Arc::new(Mutex::new(queue));
 
-        msg_manager.insert_msqid_queues(msqid, msg_queue);
-        return Ok(msqid as isize);
+        msg_manager.insert_msqid_queues(id.index(), msg_queue);
+        return Ok(id.raw() as isize);
     }
 
     // Look for existing message queue
@@ -657,6 +688,13 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
             .ok_or(AxError::from(LinuxError::ENOENT))?; // ENOENT
 
         let msg_queue = msg_queue.lock();
+
+        // Linux `ipc/util.c:ipcget_public()` rejects an exclusive create
+        // before it checks the requester's access or looks at the object's
+        // removal state.
+        if (msgflg & IPC_EXCL) != 0 && (msgflg & IPC_CREAT) != 0 {
+            return Err(AxError::from(LinuxError::EEXIST)); // EEXIST
+        }
 
         // `msgflg` is an access request when the key already exists; it is
         // not merely the mode used on creation.  In particular, a write-only
@@ -671,11 +709,6 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
             return Err(AxError::from(LinuxError::EIDRM)); // EIDRM
         }
 
-        // Check IPC_EXCL flag
-        if (msgflg & IPC_EXCL) != 0 && (msgflg & IPC_CREAT) != 0 {
-            return Err(AxError::from(LinuxError::EEXIST)); // EEXIST
-        }
-
         return Ok(msqid as isize);
     }
 
@@ -687,7 +720,7 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
         return Err(AxError::from(LinuxError::ENOSPC)); // ENOSPC
     }
 
-    let msqid = allocate_msg_id(&msg_manager, ipc_ns.next_msg_id())?;
+    let id = msg_manager.allocate_id(ipc_ns.next_msg_id())?;
     let mut queue = MessageQueue::new(
         key,
         (msgflg & 0o777) as _,
@@ -695,13 +728,13 @@ pub fn sys_msgget(key: i32, msgflg: i32) -> AxResult<isize> {
         current_uid,
         current_gid,
     );
-    queue.msqid_ds.msg_perm.seq = ipc_ns.next_sequence();
+    queue.msqid_ds.msg_perm.seq = id.sequence() as _;
     let msg_queue = Arc::new(Mutex::new(queue));
 
-    msg_manager.insert_key_msqid(key, msqid);
-    msg_manager.insert_msqid_queues(msqid, msg_queue);
+    msg_manager.insert_key_msqid(key, id.raw());
+    msg_manager.insert_msqid_queues(id.index(), msg_queue);
 
-    Ok(msqid as isize)
+    Ok(id.raw() as isize)
 }
 
 pub fn sys_msgsnd<M: UserMemory + ?Sized>(
@@ -711,9 +744,19 @@ pub fn sys_msgsnd<M: UserMemory + ?Sized>(
     msgsz: usize,
     msgflg: i32,
 ) -> AxResult<isize> {
+    // Linux `ksys_msgsnd()` reads `mtype` first, so a faulting message buffer
+    // is reported before any size or identifier validation.  `do_msgsnd()`
+    // then checks the size and the identifier, rejects a non-positive type and
+    // only afterwards copies the text and resolves the queue.
+    let mtype_ptr = unsafe { core::ptr::addr_of!((*msgp).mtype) };
+    let mtype: i64 = VmPtr::vm_read(mtype_ptr, memory).map_err(map_usercopy_error)?;
+
     // MSGMAX = 8192
-    if msgsz > MSGMAX {
+    if msgsz > MSGMAX || msqid < 0 {
         return Err(AxError::from(LinuxError::EINVAL)); // EINVAL
+    }
+    if mtype <= 0 {
+        return Err(AxError::from(LinuxError::EINVAL)); // EINVAL - invalid message type
     }
     let current = current();
     let thread = current.as_thread();
@@ -723,24 +766,16 @@ pub fn sys_msgsnd<M: UserMemory + ?Sized>(
     let current_pid = proc_data.proc.pid();
     let flags = MsgSndFlags::from_bits_truncate(msgflg);
 
+    // read data part
+    let mtext_ptr = unsafe { core::ptr::addr_of!((*msgp).mtext) };
+    let data_vec = vm_load(memory, mtext_ptr.cast::<u8>(), msgsz).map_err(map_usercopy_error)?;
+
     let msg_queue = {
         let msg_manager = ipc_ns.msg_manager().lock();
         msg_manager
             .get_queue_by_msqid(msqid)
             .ok_or(AxError::from(LinuxError::EINVAL))? // EINVAL - queue does not exist
     };
-
-    // read message from user space
-    let mtype_ptr = unsafe { core::ptr::addr_of!((*msgp).mtype) };
-    let mtype: i64 = VmPtr::vm_read(mtype_ptr, memory).map_err(map_usercopy_error)?;
-
-    if mtype <= 0 {
-        return Err(AxError::from(LinuxError::EINVAL)); // EINVAL - invalid message type
-    }
-
-    // read data part
-    let mtext_ptr = unsafe { core::ptr::addr_of!((*msgp).mtext) };
-    let data_vec = vm_load(memory, mtext_ptr.cast::<u8>(), msgsz).map_err(map_usercopy_error)?;
 
     loop {
         let waiters = {
@@ -899,14 +934,12 @@ pub fn sys_msgrcv<M: UserMemory + ?Sized>(
 
     let flags = MsgRcvFlags::from_bits_truncate(msgflg);
     let selection = select_message(msgtyp).map_err(|_| AxError::InvalidInput)?;
-    let current = current();
-    let thread = current.as_thread();
-    let proc_data = &thread.proc_data;
-    let ipc_ns = thread.ipc_ns();
-    let context = IpcAccessContext::for_ipc_namespace(thread.current_cred(), &ipc_ns);
-    let current_pid = proc_data.proc.pid();
 
-    // Check validity of flag combinations
+    // Linux `do_msgrcv()` validates the identifier and the MSG_COPY flag
+    // combination before it touches the queue.
+    if msqid < 0 {
+        return Err(AxError::from(LinuxError::EINVAL)); // EINVAL
+    }
     if flags.contains(MsgRcvFlags::MSG_COPY) {
         if !flags.contains(MsgRcvFlags::IPC_NOWAIT) {
             return Err(AxError::from(LinuxError::EINVAL)); // EINVAL - MSG_COPY must be used with IPC_NOWAIT
@@ -914,7 +947,20 @@ pub fn sys_msgrcv<M: UserMemory + ?Sized>(
         if flags.contains(MsgRcvFlags::MSG_EXCEPT) {
             return Err(AxError::from(LinuxError::EINVAL)); // EINVAL - MSG_COPY and MSG_EXCEPT are mutually exclusive
         }
+        // `do_msgrcv()` builds its MSG_COPY scratch message with
+        // `load_msg(buf, min(bufsz, msg_ctlmax))`, which reads the caller's
+        // buffer before the queue is looked up.  An unreadable buffer is
+        // therefore EFAULT even when the identifier names nothing.
+        let probe_len = msgsz.min(MSGMAX);
+        vm_load(memory, msgp.cast::<u8>(), probe_len).map_err(map_usercopy_error)?;
     }
+
+    let current = current();
+    let thread = current.as_thread();
+    let proc_data = &thread.proc_data;
+    let ipc_ns = thread.ipc_ns();
+    let context = IpcAccessContext::for_ipc_namespace(thread.current_cred(), &ipc_ns);
+    let current_pid = proc_data.proc.pid();
 
     // Get the message queue
     let msg_queue = {
@@ -986,6 +1032,12 @@ pub fn sys_msgctl<M: UserMemory + ?Sized>(
     let ipc_ns = current.as_thread().ipc_ns();
     let context = IpcAccessContext::for_ipc_namespace(current.as_thread().current_cred(), &ipc_ns);
 
+    // Linux `ksys_msgctl()` rejects a negative identifier before it looks at
+    // the command, including for the table-wide IPC_INFO/MSG_INFO commands.
+    if msqid < 0 {
+        return Err(AxError::from(LinuxError::EINVAL)); // EINVAL
+    }
+
     // Validate command code
     if cmd != IPC_STAT
         && cmd != IPC_SET
@@ -1015,23 +1067,35 @@ pub fn sys_msgctl<M: UserMemory + ?Sized>(
         return Ok(index);
     }
     if cmd == MSG_STAT || cmd == MSG_STAT_ANY {
+        // Linux `msgctl_stat()`: these two commands take an *index*, and
+        // `msq_obtain_object()` resolves it without consulting the sequence
+        // number.  They answer with the object's full identifier so a caller
+        // iterating by index learns the sequence it must use next.
+        let index = ipcid_to_idx(msqid);
         let queue = ipc_ns
             .msg_manager()
             .lock()
-            .get_queue_by_msqid(msqid)
+            .get_queue_by_index(index)
             .ok_or(AxError::from(LinuxError::EINVAL))?;
-        let snapshot = {
+        let (snapshot, published) = {
             let guard = queue.lock();
-            if guard.mark_removed {
-                return Err(AxError::from(LinuxError::EINVAL));
-            }
+            // `MSG_STAT_ANY` is the unprivileged probe and skips the mode
+            // check; `MSG_STAT` requires read permission.
             if cmd == MSG_STAT && !context.allows(&guard.msqid_ds.msg_perm, IpcAccess::Read) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
-            guard.msqid_ds
+            // Linux checks `ipc_valid_object()` after the permission test, so
+            // a queue that is already gone reports EIDRM rather than EACCES.
+            if guard.mark_removed {
+                return Err(AxError::from(LinuxError::EIDRM));
+            }
+            (
+                guard.msqid_ds,
+                ipcid_compose(index, guard.msqid_ds.msg_perm.seq as i32),
+            )
         };
         write_msqid_ds(memory, buf as *mut msqid_ds, snapshot)?;
-        return Ok(msqid as isize);
+        return Ok(published as isize);
     }
 
     // Find message queue by msqid
@@ -1121,6 +1185,43 @@ pub fn sys_msgctl<M: UserMemory + ?Sized>(
 mod credential_caller_tests {
     use super::*;
     use crate::task::{Cred, UserNamespace};
+
+    /// Regression: the queue table used to be keyed by the published
+    /// identifier with nothing validating the sequence, so a retired msqid
+    /// resolved to whichever queue reused its index.
+    #[test]
+    fn queue_lookup_validates_the_sequence_and_stat_uses_the_index() {
+        let _context = crate::test_support::scheduler_test_context();
+        let mut manager = MsgManager::new();
+        let index = 5;
+        let sequence = 7;
+        assert_eq!(
+            manager.allocate_id(&AtomicI32::new(ipcid_compose(index, sequence))),
+            Ok(IpcId::from_parts(index, sequence))
+        );
+        let mut queue = MessageQueue::new(1, 0o600, 1, 0, 0);
+        queue.msqid_ds.msg_perm.seq = sequence as _;
+        manager.insert_msqid_queues(index, Arc::new(Mutex::new(queue)));
+
+        let published = ipcid_compose(index, sequence);
+        assert!(manager.get_queue_by_msqid(published).is_some());
+        // The published identifier is not the index.
+        assert!(manager.get_queue_by_msqid(index).is_none());
+        assert!(
+            manager
+                .get_queue_by_msqid(ipcid_compose(index, sequence + 1))
+                .is_none()
+        );
+        // `MSG_STAT` resolves the index and ignores the sequence.
+        assert!(manager.get_queue_by_index(index).is_some());
+        assert!(manager.get_queue_by_index(index + 1).is_none());
+        assert_eq!(manager.max_active_index(), index as isize);
+
+        manager.remove_msqid(published);
+        assert!(manager.get_queue_by_index(index).is_none());
+        assert_eq!(manager.queue_count(), 0);
+        assert_eq!(manager.max_active_index(), 0);
+    }
 
     #[test]
     fn credential_caller_msg_set_resource_failure_rolls_back_every_field() {

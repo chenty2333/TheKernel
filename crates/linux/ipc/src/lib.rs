@@ -6,8 +6,20 @@ pub const IPC_NOWAIT: u16 = 0o4000;
 pub const SEM_UNDO: u16 = 0x1000;
 pub const SHM_RDONLY: u32 = 0o10000;
 pub const SHM_RND: u32 = 0o20000;
+/// Linux `include/uapi/linux/shm.h`: accept the segment without reserving
+/// swap for it.  It shares its value with `SHM_RDONLY` because they belong to
+/// different syscalls.
+pub const SHM_NORESERVE: u32 = 0o10000;
+pub const SHM_HUGETLB: u32 = 0o4000;
+/// Linux `include/uapi/linux/shm.h`: the `SHM_HUGE_*` page-size hint.
+pub const SHM_HUGE_SHIFT: u32 = 26;
+pub const SHM_HUGE_MASK: u32 = 0x3f;
 pub const SHMLBA: usize = 4096;
 pub const MQ_PRIO_MAX: u32 = 32768;
+/// Linux `ipc/sem.c`: `SEMVMX`, the largest semaphore value, and `SEMAEM`, the
+/// largest magnitude of one `sem_undo` adjustment.
+pub const SEMVMX: i32 = 32767;
+pub const SEMAEM: i32 = SEMVMX;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpcError {
     PermissionDenied,
@@ -19,6 +31,253 @@ pub enum IpcError {
     InvalidQueueName,
     InvalidAttributes,
     InvalidPriority,
+    /// Linux `-ENOSPC` from `ipc_addid()`/`idr_alloc()`.
+    NoSpace,
+}
+
+/// Linux `ipc/util.h`: a published SysV identifier packs an index into the low
+/// `IPCMNI_SHIFT` bits and a per-table sequence number into the bits above it:
+/// bits 0-14 are the index (32k, 15 bits) and bits 15-30 the sequence number
+/// (64k, 16 bits).
+///
+/// `IPCMNI_EXTEND_SHIFT` is Linux's `ipcmni_extend` boot-parameter layout
+/// (24/7 bits).  This kernel does not implement the extension, so the default
+/// split is the only composition it publishes or accepts.
+pub const IPCMNI_SHIFT: u32 = 15;
+pub const IPCMNI_EXTEND_SHIFT: u32 = 24;
+pub const IPCMNI: i32 = 1 << IPCMNI_SHIFT;
+pub const IPCMNI_IDX_MASK: i32 = IPCMNI - 1;
+/// Linux `ipc/ipc_sysctl.c`: `ipc_min_cycle = RADIX_TREE_MAP_SIZE`, the floor
+/// of the cyclic window `idr_alloc_cyclic()` searches.
+pub const IPC_MIN_CYCLE: i32 = 64;
+/// Linux `ipc/util.h:ipcid_seq_max()`, the first sequence value that wraps.
+pub const IPCID_SEQ_MAX: i32 = i32::MAX >> IPCMNI_SHIFT;
+
+/// Linux `ipc/util.h:ipcid_to_idx()`.
+pub const fn ipcid_to_idx(id: i32) -> i32 {
+    id & IPCMNI_IDX_MASK
+}
+
+/// Linux `ipc/util.h:ipcid_to_seqx()`.
+pub const fn ipcid_to_seqx(id: i32) -> i32 {
+    id >> IPCMNI_SHIFT
+}
+
+/// Linux `ipc/util.c:ipc_idr_alloc()`: `new->id = (new->seq <<
+/// ipcmni_seq_shift()) + idx`.
+pub const fn ipcid_compose(index: i32, sequence: i32) -> i32 {
+    (sequence << IPCMNI_SHIFT) + index
+}
+
+/// Linux `ipc/util.h:ipc_checkid()`.
+pub const fn ipcid_is_stale(id: i32, sequence: i32) -> bool {
+    ipcid_to_seqx(id) != sequence
+}
+
+/// The flags Linux `ipc/shm.c:newseg()` derives from a `shmget()` call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShmCreationPlan {
+    /// `shmflg & SHM_HUGETLB`.
+    pub hugetlb: bool,
+    /// The `SHM_HUGE_*` size hint, which Linux only consults for a huge-page
+    /// segment.
+    pub huge_hint: u32,
+    /// `shmflg & SHM_NORESERVE`, which Linux drops under `OVERCOMMIT_NEVER`:
+    /// "Do not allow no accounting for OVERCOMMIT_NEVER, even if it's asked
+    /// for."
+    pub no_reserve: bool,
+}
+
+/// Decodes the creation flags of one `shmget()` call.
+pub const fn shm_creation_plan(flags: u32, overcommit_never: bool) -> ShmCreationPlan {
+    let hugetlb = flags & SHM_HUGETLB != 0;
+    ShmCreationPlan {
+        hugetlb,
+        huge_hint: if hugetlb {
+            (flags >> SHM_HUGE_SHIFT) & SHM_HUGE_MASK
+        } else {
+            0
+        },
+        no_reserve: flags & SHM_NORESERVE != 0 && !overcommit_never,
+    }
+}
+
+/// Whether a `SHM_HUGETLB` segment of the requested size class can be backed.
+///
+/// Linux resolves the hint with `hstate_sizelog()` and rejects a segment whose
+/// hint names no configured huge-page size with EINVAL.  TheKernel has no
+/// huge-page pool, so no hint resolves and every huge-page creation is
+/// rejected - the answer Linux gives for an unconfigured size class.
+pub const fn shm_supports_huge_page_hint(_hint: u32) -> bool {
+    false
+}
+
+/// One allocated SysV identifier, before it is published to userspace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IpcId {
+    index: i32,
+    sequence: i32,
+}
+
+impl IpcId {
+    pub const fn from_parts(index: i32, sequence: i32) -> Self {
+        Self { index, sequence }
+    }
+
+    /// The IDR slot this identifier resolves through.
+    pub const fn index(self) -> i32 {
+        self.index
+    }
+
+    /// The value the object's `ipc_perm.seq` field must hold.
+    pub const fn sequence(self) -> i32 {
+        self.sequence
+    }
+
+    /// The value userspace receives.
+    pub const fn raw(self) -> i32 {
+        ipcid_compose(self.index, self.sequence)
+    }
+}
+
+/// The identifier table for one SysV object type in one IPC namespace: Linux's
+/// `struct ipc_ids`.
+///
+/// It reproduces the observable part of `ipc/util.c:ipc_idr_alloc()` and
+/// `ipc/util.c:ipc_rmid()`.  Indexes are handed out cyclically inside
+/// `[0, max(in_use * 3 / 2, ipc_min_cycle))` capped at `ipc_mni`, and the
+/// sequence number advances only when the new index does not move past the
+/// previous one.  That rule is what makes a retired identifier keep failing
+/// `ipc_checkid()` until the 16-bit sequence finally wraps, so a stale handle
+/// cannot resolve to a successor object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IpcIdTable {
+    in_use: i32,
+    sequence: i32,
+    max_index: i32,
+    last_index: i32,
+    next: i32,
+}
+
+impl Default for IpcIdTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IpcIdTable {
+    pub const fn new() -> Self {
+        Self {
+            in_use: 0,
+            sequence: 0,
+            max_index: -1,
+            last_index: -1,
+            next: 0,
+        }
+    }
+
+    pub const fn in_use(self) -> i32 {
+        self.in_use
+    }
+
+    /// Linux `ipc/util.h:ipc_get_maxidx()`.
+    pub const fn max_index(self) -> i32 {
+        if self.in_use == 0 {
+            -1
+        } else if self.in_use >= IPCMNI {
+            IPCMNI - 1
+        } else {
+            self.max_index
+        }
+    }
+
+    /// Allocates one identifier.  `requested` is the raw `*_next_id` sysctl
+    /// value, if a writer armed one; `is_used` reports whether an index is
+    /// still occupied.
+    ///
+    /// A requested identifier keeps its sequence number and is placed at the
+    /// first free index at or after `ipcid_to_idx(requested)`, exactly as
+    /// Linux' `idr_alloc(..., ipcid_to_idx(next_id), ipc_mni, ...)` does.  It
+    /// does not disturb the cyclic cursor, so the two paths compose the way
+    /// Linux' two branches do.
+    pub fn allocate(
+        &mut self,
+        requested: Option<i32>,
+        is_used: impl Fn(i32) -> bool,
+    ) -> Result<IpcId, IpcError> {
+        if let Some(requested) = requested {
+            let index = first_free(ipcid_to_idx(requested), IPCMNI, &is_used)
+                .ok_or(IpcError::NoSpace)?;
+            self.register(index);
+            return Ok(IpcId {
+                index,
+                sequence: ipcid_to_seqx(requested),
+            });
+        }
+
+        // `max(ids->in_use * 3 / 2, ipc_min_cycle)`, then `min(.., ipc_mni)`.
+        let window = (self.in_use * 3 / 2).clamp(IPC_MIN_CYCLE, IPCMNI);
+        let index = first_free(self.next, window, &is_used)
+            .or_else(|| first_free(0, window, &is_used))
+            .ok_or(IpcError::NoSpace)?;
+        if index <= self.last_index {
+            self.sequence += 1;
+            if self.sequence >= IPCID_SEQ_MAX {
+                self.sequence = 0;
+            }
+        }
+        self.last_index = index;
+        self.next = index + 1;
+        self.register(index);
+        Ok(IpcId {
+            index,
+            sequence: self.sequence,
+        })
+    }
+
+    /// Linux `ipc/util.c:ipc_rmid()`: drop `index` and, when it was the
+    /// highest one, cache the highest remaining index instead.  `is_used` is
+    /// consulted only for that recomputation and must reflect the table after
+    /// the caller removed the object.
+    pub fn release(&mut self, index: i32, is_used: impl Fn(i32) -> bool) {
+        self.in_use = self.in_use.saturating_sub(1);
+        if index == self.max_index {
+            let mut candidate = index - 1;
+            while candidate >= 0 && !is_used(candidate) {
+                candidate -= 1;
+            }
+            self.max_index = candidate;
+        }
+    }
+
+    fn register(&mut self, index: i32) {
+        self.in_use += 1;
+        if index > self.max_index {
+            self.max_index = index;
+        }
+    }
+}
+
+/// The first free index in `from..end`, mirroring `idr_get_free()`'s forward
+/// scan from the start of the range.
+fn first_free(from: i32, end: i32, is_used: &impl Fn(i32) -> bool) -> Option<i32> {
+    let mut index = from.max(0);
+    while index < end {
+        if !is_used(index) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Linux `ipc/sem.c:perform_atomic_semop()`: the deferred adjustment
+/// `semadj - sem_op` must stay inside `[-SEMAEM - 1, SEMAEM]`.  Exceeding the
+/// range fails the whole operation with `-ERANGE` before any semaphore value
+/// changes; the current code clamped instead.
+pub const fn sem_undo_delta_in_range(prior: i32, sem_op: i16) -> bool {
+    let undo = prior - sem_op as i32;
+    undo >= -SEMAEM - 1 && undo <= SEMAEM
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Credentials {
@@ -104,6 +363,7 @@ pub enum SemPlan {
     WaitZero {
         index: u16,
         nowait: bool,
+        undo: bool,
     },
     WaitDecrease {
         index: u16,
@@ -112,34 +372,67 @@ pub enum SemPlan {
         undo: bool,
     },
 }
-pub const fn plan_sem_op(op: SemBuf) -> Result<SemPlan, IpcError> {
-    if op.flags & !(IPC_NOWAIT as i16 | SEM_UNDO as i16) != 0 {
-        return Err(IpcError::InvalidOperation);
+
+impl SemPlan {
+    /// The raw `SEM_UNDO` bit.  Linux validates the deferred-adjustment range
+    /// for every `SEM_UNDO` operation, including a wait-for-zero.
+    pub const fn undo(self) -> bool {
+        match self {
+            Self::Adjust { undo, .. }
+            | Self::WaitZero { undo, .. }
+            | Self::WaitDecrease { undo, .. } => undo,
+        }
     }
+
+    /// Whether the operation registers a deferred adjustment.
+    ///
+    /// Linux `ipc/sem.c:perform_atomic_semop()` stores `semadj - sem_op` for
+    /// every `SEM_UNDO` operation, which is the identity for a wait-for-zero,
+    /// so only a non-zero `sem_op` can change a process's undo list.
+    pub const fn records_undo(self) -> bool {
+        match self {
+            Self::Adjust { undo, .. } | Self::WaitDecrease { undo, .. } => undo,
+            Self::WaitZero { .. } => false,
+        }
+    }
+
+    pub const fn index(self) -> u16 {
+        match self {
+            Self::Adjust { index, .. }
+            | Self::WaitZero { index, .. }
+            | Self::WaitDecrease { index, .. } => index,
+        }
+    }
+}
+
+/// Classifies one `sembuf`.
+///
+/// Linux never validates `sem_flg`: `ipc/sem.c` only ever tests the
+/// `SEM_UNDO` and `IPC_NOWAIT` bits, so every other bit is accepted and
+/// ignored.  A wait-for-zero combined with `SEM_UNDO` is accepted too; its
+/// deferred adjustment is the identity, so it records nothing.
+pub const fn plan_sem_op(op: SemBuf) -> SemPlan {
     let nowait = op.flags & IPC_NOWAIT as i16 != 0;
     let undo = op.flags & SEM_UNDO as i16 != 0;
     if op.op > 0 {
-        Ok(SemPlan::Adjust {
+        SemPlan::Adjust {
             index: op.num,
             delta: op.op,
             undo,
-        })
+        }
     } else if op.op == 0 {
-        if undo {
-            Err(IpcError::InvalidOperation)
-        } else {
-            Ok(SemPlan::WaitZero {
-                index: op.num,
-                nowait,
-            })
+        SemPlan::WaitZero {
+            index: op.num,
+            nowait,
+            undo,
         }
     } else {
-        Ok(SemPlan::WaitDecrease {
+        SemPlan::WaitDecrease {
             index: op.num,
             amount: op.op.unsigned_abs(),
             nowait,
             undo,
-        })
+        }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,6 +525,12 @@ pub const fn validate_priority(priority: u32) -> Result<(), IpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Index occupancy probe with a bounded table for tests.
+    fn used(live: &[bool], index: i32) -> bool {
+        live.get(index as usize).copied().unwrap_or(false)
+    }
+
     #[test]
     fn permissions_and_selection() {
         assert_eq!(
@@ -252,15 +551,334 @@ mod tests {
         );
         assert_eq!(select_message(i64::MIN), Ok(MessageSelection::LowestType));
     }
+
     #[test]
-    fn sem_validation_order() {
+    fn identifier_layout_round_trips() {
+        assert_eq!(IPCMNI, 32768);
+        assert_eq!(IPCMNI_IDX_MASK, 0x7fff);
+        assert_eq!(IPC_MIN_CYCLE, 64);
+        assert_eq!(IPCID_SEQ_MAX, 65535);
+        // Linux `ipc/util.h`: index in the low bits, sequence above it.
+        assert_eq!(ipcid_to_idx(0), 0);
+        assert_eq!(ipcid_to_seqx(0), 0);
+        assert_eq!(ipcid_compose(0, 1), 32768);
+        assert_eq!(ipcid_to_idx(32768), 0);
+        assert_eq!(ipcid_to_seqx(32768), 1);
+        assert_eq!(ipcid_compose(7, 1), 32775);
+        assert_eq!(ipcid_to_idx(32775), 7);
+        assert_eq!(ipcid_to_seqx(32775), 1);
+        for index in [0, 1, 0x7fff] {
+            for sequence in [0, 1, 2, 65534] {
+                let id = ipcid_compose(index, sequence);
+                assert!(id >= 0, "{id} must not go negative");
+                assert_eq!(ipcid_to_idx(id), index);
+                assert_eq!(ipcid_to_seqx(id), sequence);
+                assert!(!ipcid_is_stale(id, sequence));
+                assert!(ipcid_is_stale(id, sequence.wrapping_add(1)));
+            }
+        }
+        // Linux never publishes a negative identifier.
+        assert!(ipcid_compose(IPCMNI - 1, IPCID_SEQ_MAX - 1) > 0);
+    }
+
+    #[test]
+    fn first_identifiers_are_sequential_and_never_reuse_a_live_index() {
+        let mut table = IpcIdTable::new();
+        let mut live = [false; 8];
+        let mut indexes = [0i32; 8];
+        let mut sequences = [0i32; 8];
+        for slot in 0..8 {
+            let id = table
+                .allocate(None, |index| live[index as usize])
+                .expect("table has room");
+            assert!(!live[id.index() as usize]);
+            live[id.index() as usize] = true;
+            indexes[slot] = id.index();
+            sequences[slot] = id.sequence();
+            assert_eq!(id.raw(), id.index());
+        }
+        // Linux `ipc_idr_alloc()`: the sequence only moves when the cyclic
+        // allocation wraps, so a fresh table publishes 0..7 with sequence 0.
+        assert_eq!(indexes, [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(sequences, [0; 8]);
+        assert_eq!(table.in_use(), 8);
+        assert_eq!(table.max_index(), 7);
+    }
+
+    #[test]
+    fn releasing_the_lowest_index_does_not_reissue_it() {
+        let mut table = IpcIdTable::new();
+        let live = [false; 8];
+        let first = table
+            .allocate(None, |index| used(&live, index))
+            .unwrap();
+        let second = table
+            .allocate(None, |index| used(&live, index))
+            .unwrap();
+        assert_eq!((first.index(), second.index()), (0, 1));
+        // `ipc_rmid()` the lowest live index; `idr_alloc_cyclic()` continues
+        // from its cursor, so 0 must stay retired instead of being handed to
+        // the next caller.  The retired identifier names index 0, which the
+        // successor does not.
+        table.release(first.index(), |_| false);
+        assert_eq!(table.in_use(), 1);
+        assert_eq!(table.max_index(), 1);
+        let third = table
+            .allocate(None, |index| index == second.index())
+            .unwrap();
+        assert_eq!(third.index(), 2, "0 must not come back immediately");
+        assert_ne!(third.raw(), first.raw());
+        assert_eq!(ipcid_to_idx(first.raw()), 0);
+    }
+
+    #[test]
+    fn sequence_advances_when_the_cyclic_window_wraps() {
+        let mut table = IpcIdTable::new();
+        // Walk the cursor to the end of the `ipc_min_cycle` window while
+        // releasing every index again, so the window never grows and the next
+        // allocation has to wrap.  This is the create/remove loop an
+        // unprivileged caller can run.
+        for index in 0..IPC_MIN_CYCLE {
+            let id = table.allocate(None, |_| false).unwrap();
+            assert_eq!(id.index(), index);
+            table.release(id.index(), |_| false);
+        }
+        let wrapped = table.allocate(None, |_| false).unwrap();
+        assert_eq!(wrapped.index(), 0);
+        assert_eq!(
+            wrapped.sequence(),
+            1,
+            "`idx <= ids->last_idx` must bump the sequence"
+        );
+        assert_eq!(wrapped.raw(), IPCMNI);
+    }
+
+    #[test]
+    fn a_stale_identifier_stays_stale_across_a_successor_lifetime() {
+        let mut table = IpcIdTable::new();
+        let first = table.allocate(None, |_| false).unwrap();
+        assert_eq!(first.raw(), 0);
+        table.release(first.index(), |_| false);
+        // The successor that eventually receives index 0 keeps the retired
+        // numeric identifier invalid because its sequence differs.
+        for _ in 0..(IPC_MIN_CYCLE - 1) {
+            let id = table.allocate(None, |_| false).unwrap();
+            table.release(id.index(), |_| false);
+        }
+        let successor = table.allocate(None, |_| false).unwrap();
+        assert_eq!(successor.index(), 0);
+        assert!(ipcid_is_stale(first.raw(), successor.sequence()));
+        assert_ne!(first.raw(), successor.raw());
+        assert_eq!(successor.raw(), IPCMNI);
+    }
+
+    #[test]
+    fn requested_identifier_keeps_its_sequence() {
+        let mut table = IpcIdTable::new();
+        // `echo $((5 | (2 << 15))) > /proc/sys/kernel/msg_next_id` publishes
+        // index 5 with sequence 2 on the next create.
+        let requested = ipcid_compose(5, 2);
+        let id = table.allocate(Some(requested), |_| false).unwrap();
+        assert_eq!(id.index(), 5);
+        assert_eq!(id.sequence(), 2);
+        assert_eq!(id.raw(), requested);
+        // The requested path must not disturb the cyclic cursor: the next
+        // ordinary allocation continues from index 0.
+        let next = table.allocate(None, |_| false).unwrap();
+        assert_eq!(next.index(), 0);
+        assert_eq!(next.sequence(), 0);
+    }
+
+    #[test]
+    fn requested_identifier_skips_occupied_indexes_and_reports_exhaustion() {
+        let live = [true, true, false, false];
+        let mut table = IpcIdTable::new();
+        // Linux `idr_alloc(start = ipcid_to_idx(next_id), end = ipc_mni)`
+        // takes the first free index at or after the request.
+        let id = table
+            .allocate(Some(ipcid_compose(0, 1)), |index| used(&live, index))
+            .unwrap();
+        assert_eq!(id.index(), 2);
+        assert_eq!(id.sequence(), 1);
+
+        // The requested path reports exhaustion of the whole index space
+        // instead of silently publishing an unrelated identifier.
+        let mut full = IpcIdTable::new();
+        assert_eq!(
+            full.allocate(Some(ipcid_compose(0, 3)), |_| true),
+            Err(IpcError::NoSpace)
+        );
+        assert_eq!(full.in_use(), 0);
+    }
+
+    #[test]
+    fn allocation_reports_exhaustion_instead_of_reusing_live_indexes() {
+        let mut table = IpcIdTable::new();
+        let live = [true; IPC_MIN_CYCLE as usize];
+        assert_eq!(
+            table.allocate(None, |index| live[index as usize]),
+            Err(IpcError::NoSpace)
+        );
+        // A failed allocation must not consume the table's bookkeeping.
+        assert_eq!(table.in_use(), 0);
+        assert_eq!(table.max_index(), -1);
+    }
+
+    #[test]
+    fn max_index_tracks_the_highest_live_index() {
+        let mut table = IpcIdTable::new();
+        assert_eq!(table.max_index(), -1);
+        let mut live = [false; 8];
+        let mut indexes = [0i32; 4];
+        for slot in 0..4 {
+            let id = table.allocate(None, |index| live[index as usize]).unwrap();
+            live[id.index() as usize] = true;
+            indexes[slot] = id.index();
+        }
+        assert_eq!(table.max_index(), 3);
+        // Removing a lower index leaves the cached maximum alone.
+        live[0] = false;
+        table.release(0, |index| live[index as usize]);
+        assert_eq!(table.max_index(), 3);
+        // Removing the maximum recomputes it from the surviving indexes.
+        live[3] = false;
+        table.release(3, |index| live[index as usize]);
+        assert_eq!(table.max_index(), 2);
+        for index in [indexes[1], indexes[2]] {
+            live[index as usize] = false;
+            table.release(index, |live_index| live[live_index as usize]);
+        }
+        assert_eq!(table.max_index(), -1);
+    }
+
+    #[test]
+    fn shm_creation_flags_split_hugetlb_hint_and_no_reserve() {
+        // Plain segment: neither huge pages nor a no-reserve request.
+        assert_eq!(
+            shm_creation_plan(0o600, false),
+            ShmCreationPlan {
+                hugetlb: false,
+                huge_hint: 0,
+                no_reserve: false
+            }
+        );
+        // `SHM_HUGE_*` occupies bits 26-31 and is only consulted together with
+        // `SHM_HUGETLB`; `SHM_NORESERVE` shares SHM_RDONLY's value but belongs
+        // to `shmget`.
+        assert_eq!(
+            shm_creation_plan(SHM_HUGETLB | 0o600, false),
+            ShmCreationPlan {
+                hugetlb: true,
+                huge_hint: 0,
+                no_reserve: false
+            }
+        );
+        assert_eq!(
+            shm_creation_plan(SHM_HUGETLB | (21 << SHM_HUGE_SHIFT) | 0o600, false),
+            ShmCreationPlan {
+                hugetlb: true,
+                huge_hint: 21,
+                no_reserve: false
+            }
+        );
+        // The hint is ignored without SHM_HUGETLB.
+        assert_eq!(
+            shm_creation_plan((21 << SHM_HUGE_SHIFT) | 0o600, false).huge_hint,
+            0
+        );
+        assert_eq!(
+            shm_creation_plan((21 << SHM_HUGE_SHIFT) | 0o600, false).hugetlb,
+            false
+        );
+        assert_eq!(
+            shm_creation_plan(SHM_NORESERVE | 0o600, false),
+            ShmCreationPlan {
+                hugetlb: false,
+                huge_hint: 0,
+                no_reserve: true
+            }
+        );
+        // "Do not allow no accounting for OVERCOMMIT_NEVER, even if it's asked
+        // for."
+        assert!(!shm_creation_plan(SHM_NORESERVE | 0o600, true).no_reserve);
+        // The hint value is masked to six bits.
+        assert_eq!(
+            shm_creation_plan(SHM_HUGETLB | (0x7f << SHM_HUGE_SHIFT), false).huge_hint,
+            0x3f
+        );
+        // No huge-page size class is backed, so every hint is unsupported.
+        assert!(!shm_supports_huge_page_hint(0));
+        assert!(!shm_supports_huge_page_hint(21));
+    }
+
+    #[test]
+    fn sem_flags_outside_nowait_and_undo_are_ignored() {
+        // Linux never validates `sem_flg`; unknown bits are ignored.
+        assert_eq!(
+            plan_sem_op(SemBuf {
+                num: 3,
+                op: 5,
+                flags: 0x2000,
+            }),
+            SemPlan::Adjust {
+                index: 3,
+                delta: 5,
+                undo: false
+            }
+        );
         assert_eq!(
             plan_sem_op(SemBuf {
                 num: 0,
-                op: 0,
-                flags: SEM_UNDO as i16
+                op: -2,
+                flags: (SEM_UNDO as i16) | 0x4000,
             }),
-            Err(IpcError::InvalidOperation)
+            SemPlan::WaitDecrease {
+                index: 0,
+                amount: 2,
+                nowait: false,
+                undo: true
+            }
         );
+        // A wait-for-zero with SEM_UNDO is accepted and records nothing.
+        let wait = plan_sem_op(SemBuf {
+            num: 1,
+            op: 0,
+            flags: (SEM_UNDO as i16) | (IPC_NOWAIT as i16),
+        });
+        assert_eq!(
+            wait,
+            SemPlan::WaitZero {
+                index: 1,
+                nowait: true,
+                undo: true
+            }
+        );
+        assert!(!wait.records_undo());
+        assert!(!plan_sem_op(SemBuf {
+            num: 0,
+            op: 4,
+            flags: 0
+        })
+        .records_undo());
+        assert!(plan_sem_op(SemBuf {
+            num: 0,
+            op: 4,
+            flags: SEM_UNDO as i16
+        })
+        .records_undo());
+        assert_eq!(wait.index(), 1);
+    }
+
+    #[test]
+    fn sem_undo_range_is_inclusive_at_the_linux_bounds() {
+        // Linux `perform_atomic_semop()`: `undo = semadj - sem_op` must satisfy
+        // `-SEMAEM - 1 <= undo <= SEMAEM`.
+        assert!(sem_undo_delta_in_range(0, -SEMAEM as i16));
+        assert!(sem_undo_delta_in_range(0, SEMAEM as i16));
+        assert!(sem_undo_delta_in_range(-SEMAEM - 1, 0));
+        assert!(!sem_undo_delta_in_range(SEMAEM, -1));
+        assert!(!sem_undo_delta_in_range(-SEMAEM - 1, 1));
+        assert!(sem_undo_delta_in_range(SEMAEM - 1, -1));
+        assert!(sem_undo_delta_in_range(-SEMAEM, 1));
     }
 }
