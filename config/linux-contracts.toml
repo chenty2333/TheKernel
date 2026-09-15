@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 309
-implemented = 290
+resolved = 308
+implemented = 289
 explicit_enosys = 19
 fallback = 0
-partial = 76
+partial = 77
 unknown = 0
 
 [[contract]]
@@ -1047,13 +1047,13 @@ teardown = ["teardown:timeout signal exit and invalidation unlink waiter and rel
 [[cell]]
 number = 456
 name = "futex_requeue"
-status = "implemented"
+status = "partial"
 contract = "linux-futex_requeue"
 handler = "kernel/src/syscall/sync/futex.rs:sys_futex_requeue"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/sync/futex.rs:futex2_only_accepts_private_or_shared_u32_words"]
-validation_gaps = ["The futex2 NUMA and MPOL rules are covered by the futex-abi differential through futex_wake and futex_wait; futex_waitv and futex_requeue have no registered case of their own"]
-limitations = ["explicit-none"]
+validation_gaps = ["the rejection is covered by four host tests that fail on the previous tree; no registered differential case reaches it, so the guest evidence is absent"]
+limitations = ["priority inheritance is only refused where the wake and requeue scans meet a published PI waiter; pi_requeue itself still has no non-PI-waiter rejection because the PI-state handover primitive is absent, and FUTEX_WAKE's pi_top_locked whole-queue rejection remains stricter than Linux"]
 
 [[contract]]
 id = "linux-membarrier"
@@ -5647,13 +5647,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 306
 name = "syncfs"
-status = "implemented"
+status = "partial"
 contract = "linux-syncfs"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_syncfs"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/fs-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["explicit-none"]
+limitations = ["an fsmount descriptor now flushes the filesystem behind it, but neither guest can observe the flush through the page cache: both return 0 whether or not the data reaches the medium, so the correction is carried by review rather than by a differential"]
 
 [[contract]]
 id = "linux-getcwd"
@@ -6964,7 +6964,7 @@ handler = "kernel/src/syscall/fs/mount.rs:sys_fsmount"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["FSMOUNT_NAMESPACE reports EOPNOTSUPP before the descriptor is fetched, where Linux fetches it first and reports EBADF for a bad one; there is no mount-namespace creation provider"]
+limitations = ["FSMOUNT_NAMESPACE reports EOPNOTSUPP after every Linux verdict has been taken, where Linux returns it as the last step of a path this kernel has no mount-namespace constructor for; there is no nsfs descriptor provider"]
 
 [[contract]]
 id = "linux-fspick"
@@ -8453,13 +8453,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 285
 name = "fallocate"
-status = "partial"
+status = "implemented"
 contract = "linux-fallocate"
 handler = "kernel/src/syscall/fs/io.rs:sys_fallocate"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/fs-boundary-differential.c:main", "tests/guest/portable/fs-abi-differential.c:main"]
-validation_gaps = ["the registered UNSHARE_RANGE_EOPNOTSUPP assertion cannot be produced by this code, so the case cannot pass until either the refusal is propagated or the assertion is withdrawn"]
-limitations = ["FALLOC_FL_WRITE_ZEROES is not implemented where the backing device enables Linux support; FALLOC_FL_UNSHARE_RANGE returns 0 or EINVAL through the generic range emulation because the native ext4 refusal is discarded one frame above it, where Linux ext4 answers EOPNOTSUPP before any range work"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-readahead"
