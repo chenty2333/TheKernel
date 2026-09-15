@@ -122,6 +122,7 @@
 
 #define PIDFD_SIGNAL_THREAD 1U
 #define PIDFD_SIGNAL_THREAD_GROUP 2U
+#define PIDFD_SIGNAL_PROCESS_GROUP 4U /* include/uapi/linux/pidfd.h */
 #define PIDFD_SELF_THREAD (-10000)
 
 #define SYSLOG_ACTION_READ 2
@@ -1210,6 +1211,131 @@ int main(void) {
         check(syscall(NR_PIDFD_SEND_SIGNAL, -1, SIGUSR1, &info, 0) == -1 &&
               errno == EBADF, "fd-before-signo");
         mark("FD_BEFORE_SIGNO");
+
+        /* --------------------------------------------------------------
+         * Do the same for the process-group scope:
+         *     case PIDFD_SIGNAL_PROCESS_GROUP:
+         *             type = PIDTYPE_PGID;
+         *             break;                                   (:4044-4046)
+         *     ...
+         *     if (type == PIDTYPE_PGID)
+         *             return kill_pgrp_info(sig, &kinfo, pid); (:4056-4057)
+         * The group addressed is the one whose PGID *is the descriptor's own
+         * PID number*, never the group the target currently belongs to:
+         * __kill_pgrp_info() walks pid->tasks[PIDTYPE_PGID] and reports ESRCH
+         * while that list is empty (:1436-1455).  prepare_kill_siginfo()
+         * synthesizes SI_USER for every scope except PIDTYPE_PID
+         * (:1857-1870).  A zombie leader keeps its group addressable until
+         * release_task() detaches it in __unhash_process()
+         * (kernel/exit.c:140-147), and PIDFD_SELF_THREAD resolves to
+         * get_task_pid(current, PIDTYPE_PID) before the descriptor table
+         * (:4024-4034).
+         * -------------------------------------------------------------- */
+        int group_ready[2], group_ack[2], group_seen[2];
+        check(pipe(group_ready) == 0 && pipe(group_ack) == 0 &&
+              pipe(group_seen) == 0, "group-pipes");
+        errno = 0;
+        pid_t group_leader = fork();
+        check(group_leader >= 0, "group-fork");
+        if (group_leader == 0) {
+            char byte;
+            (void)close(group_ready[0]);
+            (void)close(group_ack[1]);
+            (void)close(group_seen[0]);
+            if (setpgid(0, 0) != 0) _exit(2);
+            sigset_t block, pending;
+            sigemptyset(&block);
+            sigaddset(&block, SIGUSR1);
+            if (sigprocmask(SIG_BLOCK, &block, NULL) != 0) _exit(3);
+            byte = 'R';
+            if (write(group_ready[1], &byte, 1) != 1) _exit(4);
+            if (read(group_ack[0], &byte, 1) != 1) _exit(5);
+            if (sigpending(&pending) != 0) _exit(6);
+            byte = sigismember(&pending, SIGUSR1) == 1 ? 'Y' : 'N';
+            (void)write(group_seen[1], &byte, 1);
+            _exit(0);
+        }
+        (void)close(group_ready[1]);
+        (void)close(group_ack[0]);
+        (void)close(group_seen[1]);
+        {
+            char byte = 0;
+            check(read(group_ready[0], &byte, 1) == 1 && byte == 'R', "group-ready");
+            int group_fd = (int)syscall(SYS_pidfd_open, group_leader, 0);
+            check(group_fd >= 0, "group-pidfd");
+            /* Signal 0 is the existence/permission probe for the group that
+             * carries the descriptor's PID as its PGID. */
+            errno = 0;
+            check(syscall(NR_PIDFD_SEND_SIGNAL, group_fd, 0, NULL,
+                          PIDFD_SIGNAL_PROCESS_GROUP) == 0, "group-probe");
+            mark("PROCESS_GROUP_PROBE_OK");
+            errno = 0;
+            check(syscall(NR_PIDFD_SEND_SIGNAL, group_fd, SIGUSR1, NULL,
+                          PIDFD_SIGNAL_PROCESS_GROUP) == 0, "group-signal");
+            check(write(group_ack[1], "A", 1) == 1, "group-ack");
+            byte = 0;
+            check(read(group_seen[0], &byte, 1) == 1 && byte == 'Y',
+                  "group-member-signalled");
+            mark("PROCESS_GROUP_DELIVERS_SIGUSR1");
+            /* The leader exits unreaped: release_task() has not detached it
+             * from the group yet, so the group still exists. */
+            siginfo_t waited;
+            int status = 0;
+            memset(&waited, 0, sizeof(waited));
+            check(syscall(SYS_waitid, P_PID, group_leader, &waited,
+                          WEXITED | WNOWAIT, NULL) == 0 &&
+                  waited.si_pid == group_leader, "group-wait-nowait");
+            errno = 0;
+            check(syscall(NR_PIDFD_SEND_SIGNAL, group_fd, 0, NULL,
+                          PIDFD_SIGNAL_PROCESS_GROUP) == 0, "group-zombie-probe");
+            mark("PROCESS_GROUP_ZOMBIE_LEADER_OK");
+            check(waitpid(group_leader, &status, 0) == group_leader, "group-reap");
+            /* Reaping detached the group, and no process group carries that
+             * number any more: the pinned descriptor reports ESRCH. */
+            errno = 0;
+            check(syscall(NR_PIDFD_SEND_SIGNAL, group_fd, 0, NULL,
+                          PIDFD_SIGNAL_PROCESS_GROUP) == -1 && errno == ESRCH,
+                  "group-reaped-esrch");
+            mark("PROCESS_GROUP_REAPED_ESRCH");
+            (void)close(group_fd);
+        }
+        /* A descriptor whose PID never led a group does not name one. */
+        errno = 0;
+        pid_t group_absent = fork();
+        check(group_absent > 0, "absent-fork");
+        if (group_absent == 0) {
+            for (;;) pause();
+        }
+        {
+            int absent_fd = (int)syscall(SYS_pidfd_open, group_absent, 0);
+            check(absent_fd >= 0, "absent-pidfd");
+            errno = 0;
+            check(syscall(NR_PIDFD_SEND_SIGNAL, absent_fd, 0, NULL,
+                          PIDFD_SIGNAL_PROCESS_GROUP) == -1 && errno == ESRCH,
+                  "absent-group-esrch");
+            mark("PROCESS_GROUP_ABSENT_ESRCH");
+            (void)close(absent_fd);
+            kill(group_absent, SIGKILL);
+            while (waitpid(group_absent, NULL, 0) < 0 && errno == EINTR) { }
+        }
+        /* PIDFD_SELF_THREAD short-circuits to the caller's own TID, so a fresh
+         * group leader can probe the group it just created. */
+        errno = 0;
+        pid_t group_self = fork();
+        check(group_self >= 0, "self-fork");
+        if (group_self == 0) {
+            if (setpgid(0, 0) != 0) _exit(2);
+            long rc = syscall(NR_PIDFD_SEND_SIGNAL, PIDFD_SELF_THREAD, 0, NULL,
+                              PIDFD_SIGNAL_PROCESS_GROUP);
+            _exit(rc == 0 ? 0 : 1);
+        }
+        {
+            int status = 0;
+            check(waitpid(group_self, &status, 0) == group_self &&
+                  WIFEXITED(status) && WEXITSTATUS(status) == 0,
+                  "self-group-probe");
+            mark("PROCESS_GROUP_SELF_THREAD_OK");
+        }
     }
     done();
 
