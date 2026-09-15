@@ -6,6 +6,7 @@ use core::{
 
 use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
+use axsync::Mutex;
 use lazy_static::lazy_static;
 
 use super::{
@@ -20,6 +21,18 @@ struct ConsoleOutput {
     input_stopped: AtomicBool,
     column: AtomicUsize,
     events: Arc<PollSet>,
+    /// Serializes one console write against another.
+    ///
+    /// The two writers that share this state are a process writing to the
+    /// terminal and the line discipline echoing typed input back; both reach
+    /// the port through [`Console::write`].  The port lock in the platform
+    /// console covers a single driver call, but one write can span several of
+    /// them (the translation emits a batch at a time) and the output column
+    /// below is read-modify-written here, so without a lock over the whole
+    /// call two writers can split each other's lines and corrupt the column
+    /// that tab stops and erases are computed from.  Linux holds
+    /// `tty->atomic_write_lock` over exactly this span.
+    write_gate: Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -41,6 +54,7 @@ impl Console {
                 input_stopped: AtomicBool::new(false),
                 column: AtomicUsize::new(0),
                 events: Arc::new(PollSet::new()),
+                write_gate: Mutex::new(()),
             }),
             vt,
             pending: [0; 80],
@@ -127,6 +141,9 @@ impl TtyWrite for Console {
         {
             return Err(AxError::WouldBlock);
         }
+        // Held until the whole buffer has reached the port, so the bytes of
+        // this write stay contiguous and `column` advances once.
+        let _write_gate = self.output.write_gate.lock();
         let term = self.terminal.load_termios();
         let mut column = self.output.column.load(Ordering::Acquire);
         let mut batch = [0; 256];
