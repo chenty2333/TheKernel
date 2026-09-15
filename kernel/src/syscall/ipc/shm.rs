@@ -3614,6 +3614,45 @@ mod tests {
         assert_eq!(manager.total_page_count(), 0);
     }
 
+    /// Regression: the segment table used to be keyed by the published
+    /// identifier with nothing validating the sequence, and only a flat index
+    /// was ever reported back.
+    #[test]
+    fn segment_lookup_validates_the_sequence_and_stat_uses_the_index() {
+        let index = 5;
+        let sequence = 3;
+        let published = ipcid_compose(index, sequence);
+        let inner = test_segment(1, published, 1);
+        inner.lock().shmid_ds.shm_perm.seq = sequence as _;
+        let mut manager = ShmManager::new();
+
+        assert_eq!(
+            manager.allocate_id(&AtomicI32::new(published)),
+            Ok(IpcId::from_parts(index, sequence))
+        );
+        manager.insert_shmid_inner(index, 1, inner.clone()).unwrap();
+
+        assert!(manager.get_inner_by_shmid(published).is_some());
+        // The index alone is not the published identifier...
+        assert!(manager.get_inner_by_shmid(index).is_none());
+        // ...and a different sequence does not resolve it either.
+        assert!(
+            manager
+                .get_inner_by_shmid(ipcid_compose(index, sequence + 1))
+                .is_none()
+        );
+        // `SHM_STAT` resolves the index regardless of the sequence.
+        assert!(manager.get_inner_by_index(index).is_some());
+        assert_eq!(manager.max_active_index(), index as isize);
+        // A segment that was never attached holds no resident frames.
+        assert_eq!(manager.resident_page_count(), 0);
+
+        manager.remove_shmid(published, 1).unwrap();
+        assert!(manager.get_inner_by_index(index).is_none());
+        assert_eq!(manager.max_active_index(), 0);
+        assert_eq!(manager.total_page_count(), 0);
+    }
+
     #[test]
     fn remove_shmid_underflow_preserves_segment_key_and_page_charge() {
         let key = 42;
