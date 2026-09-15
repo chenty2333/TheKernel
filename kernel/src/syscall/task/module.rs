@@ -1979,6 +1979,51 @@ pub fn sys_finit_module<Mm: UserMemory + ?Sized>(
             .and_then(activate),
     )
 }
+/// Linux `delete_module()`'s four refusal gates, in Linux's order
+/// (kernel/module/main.c:832-858):
+///
+/// ```c
+/// 	if (!list_empty(&mod->source_list)) { ret = -EWOULDBLOCK; goto out; }
+/// 	if (mod->state != MODULE_STATE_LIVE) { ret = -EBUSY; goto out; }
+/// 	if (mod->init && !mod->exit) {
+/// 		forced = try_force_unload(flags);
+/// 		if (!forced) { ret = -EBUSY; goto out; }
+/// 	}
+/// 	ret = try_stop_module(mod, flags, &forced);   /* -EWOULDBLOCK */
+/// ```
+///
+/// The order is what a caller observes when a request violates more than one
+/// gate, so it is a separate function rather than the layout of one `if` chain.
+/// `deps` counts the modules whose dependency list names this one, i.e. exactly
+/// `mod->source_list`; one remaining reference is the loader's `MODULE_REF_BASE`
+/// (main.c:647-648), which `try_release_module_ref()` subtracts before
+/// `try_stop_module()` reports -EWOULDBLOCK (main.c:758-770, 772-785).
+///
+/// `try_force_unload()` is 0 whenever CONFIG_MODULE_FORCE_UNLOAD is off
+/// (main.c:750-755), which is the only configuration the pinned oracle can have
+/// -- CONFIG_MODULE_FORCE_UNLOAD `depends on MODULE_UNLOAD` (kernel/module/Kconfig:142)
+/// and that oracle has `# CONFIG_MODULES is not set` -- so `O_TRUNC` is
+/// ignored, exactly as the syscall ignores every other flag bit: Linux's
+/// `delete_module()` reads `flags` nowhere else (main.c:804-882) and never
+/// reports -EINVAL for them.
+fn delete_module_gate(live: bool, refs: u32, deps: u32, has_exit: bool) -> AxResult<()> {
+    if deps != 0 {
+        return Err(LinuxError::EAGAIN.into());
+    }
+    if !live {
+        return Err(LinuxError::EBUSY.into());
+    }
+    if !has_exit {
+        return Err(LinuxError::EBUSY.into());
+    }
+    // `-EWOULDBLOCK` is spelled `EAGAIN` here because Linux defines the two as
+    // the same errno number (11); `axerrno::LinuxError` keeps the canonical
+    // `EAGAIN` spelling.
+    if refs != 1 {
+        return Err(LinuxError::EAGAIN.into());
+    }
+    Ok(())
+}
 pub fn sys_delete_module<Mm: UserMemory + ?Sized>(
     m: &mut UserMemoryContext<'_, Mm>,
     p: *const c_char,
@@ -2046,33 +2091,21 @@ pub fn sys_delete_module<Mm: UserMemory + ?Sized>(
             .iter()
             .position(|x| x.name == n)
             .ok_or(LinuxError::ENOENT)?;
-        let live = match &v[i].state {
-            State::Live(x) => x,
-            // 	if (mod->state != MODULE_STATE_LIVE) {
-            // 		pr_debug("%s already dying\n", mod->name);
-            // 		ret = -EBUSY;
-            // 		goto out;
-            // 	}
-            _ => return Err(LinuxError::EBUSY.into()),
-        };
+        // The four gates below are Linux's, in Linux's order:
+        //
         // 	if (!list_empty(&mod->source_list)) {
         // 		/* Other modules depend on us: get rid of them first. */
         // 		ret = -EWOULDBLOCK;
         // 		goto out;
         // 	}
-        // ...
-        // 	ret = try_stop_module(mod, flags, &forced);
         //
-        // `try_stop_module()` fails with -EWOULDBLOCK when the module reference
-        // count is still elevated and `try_force_unload()` did not authorise
-        // forcing -- and it never authorises anything without
-        // CONFIG_MODULE_FORCE_UNLOAD -- so this is -EWOULDBLOCK regardless of
-        // the flag word.  `-EWOULDBLOCK` is spelled `EAGAIN` here because Linux
-        // defines the two as the same errno number (11); `axerrno::LinuxError`
-        // keeps the canonical `EAGAIN` spelling.
-        if v[i].refs != 1 || v[i].deps != 0 {
-            return Err(LinuxError::EAGAIN.into());
-        }
+        // 	/* Doing init or already dying? */
+        // 	if (mod->state != MODULE_STATE_LIVE) {
+        // 		pr_debug("%s already dying\n", mod->name);
+        // 		ret = -EBUSY;
+        // 		goto out;
+        // 	}
+        //
         // 	/* If it has an init func, it must have an exit func to unload */
         // 	if (mod->init && !mod->exit) {
         // 		forced = try_force_unload(flags);
@@ -2082,9 +2115,21 @@ pub fn sys_delete_module<Mm: UserMemory + ?Sized>(
         // 			goto out;
         // 		}
         // 	}
-        if live.exit.is_none() {
-            return Err(LinuxError::EBUSY.into());
-        }
+        //
+        // 	ret = try_stop_module(mod, flags, &forced);
+        // 	if (ret != 0)
+        // 		goto out;
+        //
+        // (kernel/module/main.c:832-858).  `deps` counts the modules whose
+        // dependency list names this one, i.e. exactly `mod->source_list`, and
+        // that test comes *before* the state and exit-function tests, so a dying
+        // module with dependents is -EWOULDBLOCK rather than -EBUSY.
+        let live = matches!(&v[i].state, State::Live(_));
+        let has_exit = match &v[i].state {
+            State::Live(x) => x.exit.is_some(),
+            _ => false,
+        };
+        delete_module_gate(live, v[i].refs, v[i].deps, has_exit)?;
         match core::mem::replace(&mut v[i].state, State::Going) {
             State::Live(x) => x,
             _ => unreachable!(),
@@ -2360,6 +2405,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn delete_module_gates_follow_linux_errno_order() {
+        let busy = Err(AxError::from(LinuxError::EBUSY));
+        let would_block = Err(AxError::from(LinuxError::EAGAIN));
+        // Linux checks `!list_empty(&mod->source_list)` (main.c:832-836) before
+        // the state test (838-844), so a module that is already going *and* has
+        // dependents is -EWOULDBLOCK, not -EBUSY.
+        assert_eq!(delete_module_gate(false, 1, 1, true), would_block);
+        assert_eq!(delete_module_gate(false, 1, 0, true), busy);
+        // The exit-function test (846-854) precedes the reference count test in
+        // `try_stop_module()` (856 -> 772-785):
+        assert_eq!(delete_module_gate(true, 2, 0, false), busy);
+        assert_eq!(delete_module_gate(true, 2, 0, true), would_block);
+        // A live, unreferenced module with an exit function passes every gate.
+        assert_eq!(delete_module_gate(true, 1, 0, true), Ok(()));
+        // Dependents and a missing exit function are both refused whatever the
+        // flag word says: `try_force_unload()` is a constant 0 without
+        // CONFIG_MODULE_FORCE_UNLOAD (main.c:750-755).
+        assert_eq!(delete_module_gate(true, 1, 1, false), would_block);
+    }
 
     #[test]
     fn relocations_use_final_addresses_across_text_rodata_and_data() {
