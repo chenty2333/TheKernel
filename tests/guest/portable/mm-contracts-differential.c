@@ -65,6 +65,8 @@ struct cap_data { uint32_t effective, permitted, inheritable; };
    are _IOWR(0xAA, nr, size) for the structures below (24 and 32 bytes). */
 enum { NR_USERFAULTFD = 323 };
 #define UFFD_API_VALUE 0xAAULL
+/* `#define UFFD_USER_MODE_ONLY 1` (include/uapi/linux/userfaultfd.h:384). */
+#define UFFD_USER_MODE_ONLY 1
 #define UFFDIO_REGISTER_MODE_MISSING 1ULL
 #define UFFDIO_API_CMD 0xC018AA3FUL
 #define UFFDIO_REGISTER_CMD 0xC020AA00UL
@@ -941,12 +943,23 @@ static void madvise_extra_case(void) {
        (`mm/userfaultfd.c:2114`), and `userfaultfd_register()` turns that into
        `-EINVAL` (`mm/userfaultfd.c:3658-3661`), so a userfaultfd context can
        never be attached to memory the kernel may drop at any time.
-       The oracle kernel is built without CONFIG_USERFAULTFD
-       (`# CONFIG_USERFAULTFD is not set`), where userfaultfd(2) itself is
-       ENOSYS from the syscall stub, so the unavailable-syscall answer is
-       asserted there and the note line records which branch ran. */
+       `UFFD_USER_MODE_ONLY` is used so the creation itself is allowed without
+       `CAP_SYS_PTRACE` or a permissive `vm.unprivileged_userfaultfd`:
+
+       ```c
+       	if (flags & UFFD_USER_MODE_ONLY)
+       		return true;
+       ```
+
+       (`mm/userfaultfd.c:4481-4494`), which lets this assertion reach the
+       registration decision instead of stopping at the creation gate.  The
+       oracle kernel is built without CONFIG_USERFAULTFD
+       (`# CONFIG_USERFAULTFD is not set`), where userfaultfd(2) is ENOSYS from
+       the syscall stub whatever the flags are, so only there does the
+       unavailable-syscall branch run, and the note line records it. */
     {
-        int uffd = (int)syscall(NR_USERFAULTFD, O_CLOEXEC | O_NONBLOCK);
+        int uffd = (int)syscall(NR_USERFAULTFD,
+                                O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
         if (uffd < 0) {
             check(errno == ENOSYS || errno == EPERM,
                   "madvise-droppable-uffd-unavailable");
@@ -961,13 +974,23 @@ static void madvise_extra_case(void) {
             unsigned char *watch = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
                                         MAP_ANONYMOUS | MAP_DROPPABLE, -1, 0);
             check(watch != MAP_FAILED, "madvise-droppable-uffd-mmap");
+            /* An ordinary anonymous VMA registers, so the refusal below is
+               the droppable property and not a broken registration call. */
+            unsigned char *control = pages(1);
             struct uffdio_register reg;
+            memset(&reg, 0, sizeof(reg));
+            reg.range.start = (uint64_t)(uintptr_t)control;
+            reg.range.len = PAGE;
+            reg.mode = UFFDIO_REGISTER_MODE_MISSING;
+            check(ioctl(uffd, UFFDIO_REGISTER_CMD, &reg) == 0,
+                  "madvise-plain-uffd-register");
             memset(&reg, 0, sizeof(reg));
             reg.range.start = (uint64_t)(uintptr_t)watch;
             reg.range.len = PAGE;
             reg.mode = UFFDIO_REGISTER_MODE_MISSING;
             ERROR(ioctl(uffd, UFFDIO_REGISTER_CMD, &reg), EINVAL,
                   "madvise-droppable-uffd-register");
+            check(munmap(control, PAGE) == 0, "madvise-plain-uffd-cleanup");
             check(munmap(watch, PAGE) == 0, "madvise-droppable-uffd-cleanup");
             check(close(uffd) == 0, "madvise-droppable-uffd-close");
         }
