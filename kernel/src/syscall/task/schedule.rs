@@ -1310,17 +1310,22 @@ pub fn sys_sched_getaffinity<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     let cpusetsize = cpusetsize as u32 as usize;
     let cpu_count = axhal::cpu_num().max(1);
-    let kernel_mask_bytes = linux_cpumask_bytes(cpu_count);
-    if cpusetsize < kernel_mask_bytes || cpusetsize % size_of::<usize>() != 0 {
-        return Err(AxError::InvalidInput);
-    }
+    // SYSCALL_DEFINE3(sched_getaffinity) (kernel/sched/syscalls.c:1309-1341)
+    // admits any length that can hold every possible CPU and is a whole
+    // number of `unsigned long`s, then copies out `min(len, cpumask_size())`
+    // bytes and returns that count.  `nr_cpu_ids` is the configured CPU
+    // ceiling, which is what the per-CPU-slot build fixes at `max_cpu_num`.
+    let kernel_mask_bytes = linux_sched::cpumask_size(axconfig::plat::MAX_CPU_NUM);
+    let admitted = linux_sched::affinity_length(cpusetsize as u32, axconfig::plat::MAX_CPU_NUM)
+        .map_err(|_| AxError::InvalidInput)?;
 
     let mask = live_sched_target(pid)?.cpumask();
+    let copied = admitted.min(kernel_mask_bytes);
     let mut mask_bytes = Vec::new();
     mask_bytes
-        .try_reserve_exact(kernel_mask_bytes)
+        .try_reserve_exact(copied)
         .map_err(|_| AxError::NoMemory)?;
-    mask_bytes.resize(kernel_mask_bytes, 0);
+    mask_bytes.resize(copied, 0);
     for cpu in 0..cpu_count {
         if mask.get(cpu) {
             mask_bytes[cpu / u8::BITS as usize] |= 1 << (cpu % u8::BITS as usize);
@@ -1329,7 +1334,7 @@ pub fn sys_sched_getaffinity<M: UserMemory + ?Sized>(
 
     vm_write_slice(memory, user_mask, &mask_bytes).map_err(map_usercopy_error)?;
 
-    Ok(kernel_mask_bytes as _)
+    Ok(copied as _)
 }
 
 fn linux_cpumask_bytes(cpu_count: usize) -> usize {
@@ -2928,6 +2933,40 @@ mod tests {
         assert_eq!(
             linux_cpumask_bytes(usize::BITS as usize + 1),
             size_of::<usize>() * 2
+        );
+    }
+
+    #[test]
+    fn getaffinity_length_admission_matches_linux() {
+        // kernel/sched/syscalls.c:1317-1324 with nr_cpu_ids == 4 and
+        // cpumask_size() == 8: every whole-word length of at least 8 bytes is
+        // admitted, and the syscall reports min(len, 8).
+        for (len, want) in [(8u32, 8usize), (16, 8), (64, 8)] {
+            let admitted = linux_sched::affinity_length(len, 4).unwrap();
+            assert_eq!(admitted.min(linux_sched::cpumask_size(4)), want);
+        }
+        // Both tests precede the `pid` lookup and the word-alignment test comes
+        // second, so a short length reports its own reason and a length whose
+        // *8 wraps the `unsigned int` product is judged on the wrapped value.
+        assert_eq!(
+            linux_sched::affinity_length(0, 4),
+            Err(linux_sched::AffinityLengthReject::TooSmallForEveryCpu)
+        );
+        assert_eq!(
+            linux_sched::affinity_length(7, 4),
+            Err(linux_sched::AffinityLengthReject::NotWholeWords)
+        );
+        assert_eq!(
+            linux_sched::affinity_length(12, 4),
+            Err(linux_sched::AffinityLengthReject::NotWholeWords)
+        );
+        assert_eq!(
+            linux_sched::affinity_length(4, 5),
+            Err(linux_sched::AffinityLengthReject::TooSmallForEveryCpu)
+        );
+        assert_eq!(
+            linux_sched::affinity_length(u32::MAX, 4),
+            Err(linux_sched::AffinityLengthReject::WordCountOverflow)
         );
     }
 

@@ -558,19 +558,56 @@ pub fn sys_uname<M: UserMemory + ?Sized>(
     name: *mut new_utsname,
 ) -> AxResult<isize> {
     let uts = current_utsname()?;
-    let uname26 = current().as_thread().personality() & UNAME26 != 0;
-    write_utsname(memory, name, uts, uname26)?;
+    let personality = current().as_thread().personality();
+    write_utsname(
+        memory,
+        name,
+        uts,
+        personality & UNAME26 != 0,
+        architecture_override(personality),
+    )?;
     Ok(0)
 }
 
-/// Linux first copies the native `new_utsname`, then overwrites only the
-/// release field for UNAME26. Keep this as two user copies: a fault in the
-/// latter exposes the already copied native result.
+/// `override_architecture()` (kernel/sys.c:1311-1317) resolves to
+/// `copy_to_user(name->machine, COMPAT_UTS_MACHINE, sizeof(COMPAT_UTS_MACHINE))`,
+/// so the copy is two bytes longer than the string it names.  `arch/x86/include/
+/// asm/compat.h:32` defines `COMPAT_UTS_MACHINE "i686\0\0"` as an array of 7, and
+/// the unnamed array that carries the initializer adds the terminating NUL, for
+/// 8.  The native `machine` field is 65 bytes (`__NEW_UTS_LEN + 1`), so the
+/// remaining 57 bytes keep whatever the native copy of `write_utsname()` wrote
+/// there -- `"x86_64\0..."` -- and no zero tail is produced across them.
+const COMPAT_UTS_MACHINE: &[u8] = b"i686\0\0\0";
+const NATIVE_UTS_MACHINE: &[u8] = b"x86_64";
+
+/// The bytes `override_architecture()` (`kernel/sys.c:1310-1317`) writes over
+/// the `machine` field of the native `new_utsname`.
+///
+/// The override applies only when `personality(current->personality) ==
+/// PER_LINUX32`.  A task that sets `PER_LINUX32` at run time therefore gets the
+/// same answer here as one that entered through an `i386` `execve`: the
+/// predicate is `task->personality`, not the executable's ELF class.
+const PER_MASK: u32 = 0x00ff;
+const PER_LINUX32: u32 = 0x0008;
+
+fn architecture_override(personality: u32) -> &'static [u8] {
+    if personality & PER_MASK == PER_LINUX32 {
+        COMPAT_UTS_MACHINE
+    } else {
+        NATIVE_UTS_MACHINE
+    }
+}
+
+/// Linux first copies the native `new_utsname`, then overwrites the release
+/// field for UNAME26 and the machine field for PER_LINUX32. Keep this as
+/// separate user copies, in Linux's order: a fault in either exposes the
+/// copies that already reached user memory.
 fn write_utsname<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     name: *mut new_utsname,
     uts: new_utsname,
     uname26: bool,
+    machine_override: &[u8],
 ) -> AxResult<()> {
     // SAFETY: all fields in `uts` are initialized, including the zero-filled
     // tail bytes, and the checked x86_64 layout has no padding.
@@ -580,6 +617,10 @@ fn write_utsname<M: UserMemory + ?Sized>(
         // `release` begins 130 bytes into the packed native x86_64 layout.
         let release_ptr = (name as *mut u8).wrapping_add(offset_of!(new_utsname, release));
         vm_write_slice(memory, release_ptr, &release).map_err(|_| AxError::BadAddress)?;
+    }
+    if machine_override != NATIVE_UTS_MACHINE {
+        let machine_ptr = (name as *mut u8).wrapping_add(offset_of!(new_utsname, machine));
+        vm_write_slice(memory, machine_ptr, machine_override).map_err(|_| AxError::BadAddress)?;
     }
     Ok(())
 }
@@ -1246,7 +1287,14 @@ mod tests {
             write_error: None,
         };
         let mut memory = UserMemoryContext::new(&mut provider);
-        write_utsname(&mut memory, core::ptr::null_mut(), test_utsname(), false).unwrap();
+        write_utsname(
+            &mut memory,
+            core::ptr::null_mut(),
+            test_utsname(),
+            false,
+            NATIVE_UTS_MACHINE,
+        )
+        .unwrap();
         assert_eq!(memory.memory_mut().writes, &[0]);
         assert_eq!(&memory.memory_mut().bytes[130..195], &[b'R'; 65]);
     }
@@ -1262,7 +1310,14 @@ mod tests {
             write_error: None,
         };
         let mut memory = UserMemoryContext::new(&mut provider);
-        write_utsname(&mut memory, core::ptr::null_mut(), test_utsname(), true).unwrap();
+        write_utsname(
+            &mut memory,
+            core::ptr::null_mut(),
+            test_utsname(),
+            true,
+            NATIVE_UTS_MACHINE,
+        )
+        .unwrap();
         assert_eq!(memory.memory_mut().writes, &[0, 130]);
         assert_eq!(&memory.memory_mut().bytes[130..137], b"2.6.72\0");
         assert_eq!(&memory.memory_mut().bytes[137..195], &[0; 58]);
@@ -1280,11 +1335,84 @@ mod tests {
         };
         let mut memory = UserMemoryContext::new(&mut provider);
         assert_eq!(
-            write_utsname(&mut memory, core::ptr::null_mut(), test_utsname(), true),
+            write_utsname(
+                &mut memory,
+                core::ptr::null_mut(),
+                test_utsname(),
+                true,
+                NATIVE_UTS_MACHINE,
+            ),
             Err(AxError::BadAddress)
         );
         assert_eq!(memory.memory_mut().writes, &[0, 130]);
         assert_eq!(&memory.memory_mut().bytes[130..195], &[b'R'; 65]);
+    }
+
+    #[test]
+    fn per_linux32_machine_override_replaces_the_native_field() {
+        // override_architecture() (kernel/sys.c:1311-1317) fires on the base
+        // personality only and is a `copy_to_user` of `sizeof` the constant:
+        // eight bytes, not the six that spell "i686\0\0".
+        assert_eq!(architecture_override(0), NATIVE_UTS_MACHINE);
+        assert_eq!(architecture_override(PER_LINUX32), COMPAT_UTS_MACHINE);
+        assert_eq!(
+            architecture_override(PER_LINUX32 | UNAME26),
+            COMPAT_UTS_MACHINE
+        );
+        assert_eq!(architecture_override(0x0200_0008), NATIVE_UTS_MACHINE);
+        assert_eq!(COMPAT_UTS_MACHINE.len(), 8);
+
+        let mut provider = GroupMemory {
+            bytes: vec![0; size_of::<new_utsname>()],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: None,
+            write_error: None,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        write_utsname(
+            &mut memory,
+            core::ptr::null_mut(),
+            test_utsname(),
+            false,
+            architecture_override(PER_LINUX32),
+        )
+        .unwrap();
+        // The override is a second copy covering only its own bytes, exactly
+        // as `copy_to_user(name->machine, COMPAT_UTS_MACHINE, sizeof(...))`
+        // does: the rest of the native field is left as the first copy wrote
+        // it, so the tail is the native name's tail, not a zero fill.
+        let machine = offset_of!(new_utsname, machine);
+        assert_eq!(memory.memory_mut().writes, &[0, machine]);
+        assert_eq!(&memory.memory_mut().bytes[machine..machine + 8], b"i686\0\0\0\0");
+        assert_eq!(
+            &memory.memory_mut().bytes[machine + 8..machine + 65],
+            &[b'M'; 57]
+        );
+    }
+
+    #[test]
+    fn architecture_override_does_not_copy_when_already_native() {
+        let mut provider = GroupMemory {
+            bytes: vec![0; size_of::<new_utsname>()],
+            reads: Vec::new(),
+            writes: Vec::new(),
+            read_error: None,
+            fail_write_at: None,
+            write_error: None,
+        };
+        let mut memory = UserMemoryContext::new(&mut provider);
+        write_utsname(
+            &mut memory,
+            core::ptr::null_mut(),
+            test_utsname(),
+            false,
+            architecture_override(0),
+        )
+        .unwrap();
+        assert_eq!(memory.memory_mut().writes, &[0]);
+        assert_eq!(&memory.memory_mut().bytes[260..325], &[b'M'; 65]);
     }
 
     #[test]

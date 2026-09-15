@@ -1487,11 +1487,18 @@ pub(super) fn dispatch_syscall(
             with_user_memory(aspace(), |memory| sys_sysinfo(memory, uctx.arg0() as _))
         }
         Sysno::syslog => with_user_memory(aspace(), |memory| {
+            // `SYSCALL_DEFINE3(syslog, int, type, char __user *, buf, int, len)`
+            // (kernel/printk/printk.c) declares a 32-bit length, so Linux reads
+            // only the low half of the argument register and sign-extends it.
+            // `do_syslog()` then tests that value -- `if (!buf || len < 0)
+            // return -EINVAL;` -- before it looks at `buf`.  Truncating here
+            // keeps a caller that passes `-1` as an `int` a negative length
+            // instead of the huge positive one the raw register holds.
             sys_syslog(
                 memory,
                 uctx.arg0() as _,
                 uctx.arg1() as _,
-                uctx.arg2() as isize,
+                uctx.arg2() as u32 as i32 as isize,
             )
         }),
         Sysno::getrandom => with_user_memory(aspace(), |memory| {
