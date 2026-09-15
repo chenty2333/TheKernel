@@ -2785,13 +2785,33 @@ impl NetlinkSocket {
             })
         });
         if let Some(destination) = destination {
-            if destination.nl_pid != 0 && destination.nl_groups != 0 {
-                return Err(AxError::InvalidInput);
-            }
+            // `netlink_sendmsg` derives *both* destinations from one address
+            // (`net/netlink/af_netlink.c:1844-1898`):
+            //
+            // ```c
+            // 	dst_portid = addr->nl_pid;
+            // 	dst_group = ffs(addr->nl_groups);
+            // 	...
+            // 	if (dst_group) {
+            // 		refcount_inc(&skb->users);
+            // 		netlink_broadcast(sk, skb, dst_portid, dst_group, GFP_KERNEL);
+            // 	}
+            // 	err = netlink_unicast(sk, skb, dst_portid, msg->msg_flags & MSG_DONTWAIT);
+            // ```
+            //
+            // so a `sockaddr_nl` that names a port *and* a group is two
+            // deliveries and not `-EINVAL`, the broadcast result is discarded,
+            // and the syscall returns the unicast result.
             if destination.nl_groups != 0 && self.protocol == NETLINK_USERSOCK {
                 return self.broadcast_usersock(src, actor, sender_pid, destination, nowait);
             }
             if destination.nl_pid != 0 {
+                if destination.nl_groups != 0 {
+                    // Non-USERSOCK multicast addressing still has no
+                    // subscriber registry here, so the address is refused
+                    // instead of being silently reduced to its unicast half.
+                    return Err(AxError::InvalidInput);
+                }
                 return self.write_unicast_with_actor(
                     src,
                     actor,
@@ -2845,19 +2865,36 @@ impl NetlinkSocket {
         data.resize(len, 0);
         src.read_exact(&mut data)?;
         let ids = actor.ids();
-        broadcast_netlink_usersock(
+        let credentials = NetlinkCredentials {
+            pid: sender_pid,
+            uid: ids.ruid.into_raw(),
+            gid: ids.rgid.into_raw(),
+        };
+        // The group delivery happens first and its result is not the
+        // syscall's: `netlink_sendmsg` calls `netlink_broadcast()` without
+        // looking at the value and reports the `netlink_unicast()` result
+        // instead (`net/netlink/af_netlink.c:1893-1898`).  A group with no
+        // subscriber is therefore not an error to the sender, which is why
+        // Linux's `-ESRCH` from `netlink_broadcast_filtered()` is invisible
+        // through `sendto(2)`.
+        let _broadcast = broadcast_netlink_usersock(
             self,
             &data,
             source_port_id,
             destination.nl_pid,
             group,
-            NetlinkCredentials {
-                pid: sender_pid,
-                uid: ids.ruid.into_raw(),
-                gid: ids.rgid.into_raw(),
-            },
+            credentials,
             nowait,
-        )?;
+        );
+        // `netlink_unicast()` for port ID zero resolves the *protocol's*
+        // kernel socket through `netlink_getsockbyportid()`.  `NETLINK_USERSOCK`
+        // is registered as a configuration entry only
+        // (`netlink_add_usersock_entry()`), so the lookup finds no socket and
+        // the address fails with `-ECONNREFUSED`.
+        if destination.nl_pid == 0 {
+            return Err(LinuxError::ECONNREFUSED.into());
+        }
+        self.deliver_unicast(data, source_port_id, destination.nl_pid, credentials, nowait)?;
         Ok(len)
     }
 
@@ -2885,6 +2922,41 @@ impl NetlinkSocket {
         // datagram.  Besides matching the ABI, this prevents peers from
         // observing the otherwise-invalid port ID zero in sockaddr_nl.
         let source_port_id = self.ensure_bound_for_send(sender_pid, nowait)?;
+        // A nonzero destination port is ordinary netlink unicast.  Linux
+        // applies the uevent CAP_SYS_ADMIN gate only to the port-0 synthetic
+        // receive path, not udevd's main-process-to-worker handoff.
+        let mut data = Vec::new();
+        data.try_reserve_exact(len)
+            .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
+        data.resize(len, 0);
+        src.read_exact(&mut data)?;
+        let ids = actor.ids();
+        self.deliver_unicast(
+            data,
+            source_port_id,
+            destination_port_id,
+            NetlinkCredentials {
+                pid: sender_pid,
+                uid: ids.ruid.into_raw(),
+                gid: ids.rgid.into_raw(),
+            },
+            nowait,
+        )?;
+        Ok(len)
+    }
+
+    /// `netlink_unicast()` for an already-imported datagram: resolve the peer
+    /// and hand it the bytes.  Both the plain unicast address and the unicast
+    /// half of a `{nl_pid, nl_groups}` address reach this path, so the connect
+    /// and queue admission rules are stated once.
+    fn deliver_unicast(
+        &self,
+        data: Vec<u8>,
+        source_port_id: u32,
+        destination_port_id: u32,
+        credentials: NetlinkCredentials,
+        nowait: bool,
+    ) -> AxResult {
         let target = find_netlink_peer(self.protocol, &self.net_ns, destination_port_id, nowait)?
             .ok_or(LinuxError::ECONNREFUSED)?;
         // `netlink_getsockbyportid()` refuses a datagram whose destination has
@@ -2907,26 +2979,7 @@ impl NetlinkSocket {
                 return Err(LinuxError::ECONNREFUSED.into());
             }
         }
-        // A nonzero destination port is ordinary netlink unicast.  Linux
-        // applies the uevent CAP_SYS_ADMIN gate only to the port-0 synthetic
-        // receive path, not udevd's main-process-to-worker handoff.
-        let mut data = Vec::new();
-        data.try_reserve_exact(len)
-            .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
-        data.resize(len, 0);
-        src.read_exact(&mut data)?;
-        let ids = actor.ids();
-        target.enqueue_user_from(
-            data,
-            source_port_id,
-            NetlinkCredentials {
-                pid: sender_pid,
-                uid: ids.ruid.into_raw(),
-                gid: ids.rgid.into_raw(),
-            },
-            nowait,
-        )?;
-        Ok(len)
+        target.enqueue_user_from(data, source_port_id, credentials, nowait)
     }
 
     /// Lazily reserve a userspace port ID for sendto/sendmsg.  A NOWAIT send
@@ -4195,6 +4248,14 @@ impl NetlinkSocket {
     fn subscribed_to(&self, group: u32) -> bool {
         self.state.lock().groups & u64::from(group) != 0
     }
+
+    /// `nlk->portid`, or `None` while the socket is still unbound.  An unbound
+    /// socket has no port ID to be addressed by, so it can never be the
+    /// `nl_pid` that `do_one_broadcast()` excludes from a group delivery.
+    fn bound_port_id(&self) -> Option<u32> {
+        let state = self.state.lock();
+        state.bound.then_some(state.port_id)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4892,7 +4953,16 @@ fn broadcast_netlink_usersock(
 
     let mut delivered = false;
     for socket in candidates {
-        if core::ptr::eq(socket.as_ref(), sender) && destination_port_id != 0 {
+        // `do_one_broadcast()` skips the sender (`p->exclude_sk`) and the
+        // socket the address names (`nlk->portid == p->portid`) before it
+        // tests group membership (`net/netlink/af_netlink.c:1429-1431`).  The
+        // named socket is skipped because `netlink_sendmsg` hands it the
+        // `netlink_unicast()` copy instead, which is what makes a
+        // `{nl_pid, nl_groups}` address deliver exactly one datagram to it.
+        if core::ptr::eq(socket.as_ref(), sender) {
+            continue;
+        }
+        if destination_port_id != 0 && socket.bound_port_id() == Some(destination_port_id) {
             continue;
         }
         if !Arc::ptr_eq(&socket.net_ns, &sender.net_ns) {
