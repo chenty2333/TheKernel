@@ -227,14 +227,14 @@ pub(crate) fn credential_fsids_precommit(
 
 pub(crate) fn add_key(
     actor: &KeyActor,
-    kind: KeyTypeKind,
-    description: String,
+    type_name: &str,
+    description: Option<String>,
     payload: Vec<u8>,
     keyring: i32,
 ) -> AxResult<isize> {
     KEY_MANAGER
         .lock()
-        .add_key(actor, kind, description, payload, keyring)
+        .add_key(actor, type_name, description, payload, keyring)
 }
 
 pub(crate) fn request_key(

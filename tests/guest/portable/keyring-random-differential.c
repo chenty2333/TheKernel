@@ -5,8 +5,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
 
 /*
  * Differential coverage for the keyring and getrandom entry points.
@@ -19,14 +24,23 @@
  *                   are -EINVAL before any user access
  *                 - a zero length never touches the buffer and never fails on
  *                   the address, but the address must still be a user address
- *                 - an unreadable destination is -EFAULT
+ *                 - an unreadable destination is -EFAULT, and the whole
+ *                   clamped range is admitted before any byte is copied, so a
+ *                   range whose exclusive end crosses the user ceiling is
+ *                   -EFAULT even when its first pages are mapped
  *                 - GRND_INSECURE is filled without waiting for the CRNG
  *   add_key(2)    security/keys/keyctl.c
  *                 - plen > 1024*1024-1 is -EINVAL before any user access
  *                 - the type name is empty (-EINVAL), dot-prefixed (-EPERM)
  *                   or unknown (-ENODEV)
- *                 - a private "keyring.*" description is -EPERM
- *                 - a "user" payload must be 1..=32767 bytes
+ *                 - a private "keyring.*" description is -EPERM, before the
+ *                   payload copy and before the type is looked up
+ *                 - the payload is copied before the destination keyring is
+ *                   resolved, so an unreadable payload is -EFAULT whatever
+ *                   else is wrong; a missing keyring is -ENOKEY and outranks
+ *                   the unknown-type -ENODEV
+ *                 - a "user" payload must be 1..=32767 bytes, a rule the copy
+ *                   comes first for
  *   request_key(2) security/keys/keyctl.c
  *                 - a NULL callout_info with no cached key is -ENOKEY and
  *                   never starts an upcall
@@ -48,6 +62,11 @@
  *                   -ENOENT
  *                 - KEYCTL_UPDATE is -EINVAL above one page
  *                 - KEYCTL_JOIN_SESSION_KEYRING rejects an empty name
+ *
+ * KEYCTL_GET_SECURITY, KEYCTL_DH_COMPUTE and KEYCTL_WATCH_KEY are
+ * deliberately absent: their answers depend on the build configuration (LSM
+ * choice, CONFIG_KEY_DH_OPERATIONS, CONFIG_KEY_NOTIFICATIONS) rather than on
+ * a rule of the ABI, so no portable assertion exists for them.
  */
 
 #define KEY_SPEC_PROCESS_KEYRING (-2)
@@ -143,6 +162,36 @@ static int test_getrandom_validation(void) {
     if (expect_errno("getrandom-null-destination",
                      do_getrandom(NULL, 16, GRND_INSECURE), EFAULT))
         return 1;
+    /* `import_ubuf()` clamps, then admits the whole range with one
+     * `access_ok()` before copying anything (`lib/iov_iter.c:1445-1453`), and
+     * `valid_user_address()` stops at `USER_PTR_MAX` = TASK_SIZE_MAX
+     * (`arch/x86/include/asm/uaccess_64.h`).  The last user page ends exactly
+     * at 0x7ffffffff000, so a range starting one page lower and running three
+     * pages crosses the ceiling and is -EFAULT even though its first page is
+     * mapped. */
+    void *ceiling_page = mmap((void *)(uintptr_t)0x7fffffffd000ULL, 0x1000,
+                              PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                              -1, 0);
+    if (ceiling_page == MAP_FAILED) {
+        /* Kernels without MAP_FIXED_NOREPLACE fall back to a fixed mapping;
+         * nothing else in this process lives in the last user pages. */
+        ceiling_page = mmap((void *)(uintptr_t)0x7fffffffd000ULL, 0x1000,
+                            PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    }
+    if (ceiling_page != (void *)(uintptr_t)0x7fffffffd000ULL)
+        return fail("getrandom-ceiling-page-mmap");
+    ((volatile char *)ceiling_page)[0] = 0x5a;
+    errno = 0;
+    if (expect_errno("getrandom-range-crosses-user-ceiling",
+                     do_getrandom(ceiling_page, 0x3000, GRND_INSECURE),
+                     EFAULT))
+        return 1;
+    /* A range that ends exactly at the ceiling is still admitted, and the
+     * copy stops at the first unmapped page past it. */
+    if (do_getrandom(ceiling_page, 0x1000, GRND_INSECURE) != 0x1000)
+        return fail("getrandom-range-at-user-ceiling");
     return 0;
 }
 
@@ -203,6 +252,40 @@ static int test_add_key_validation(void) {
                      do_add_key("keyring", ".kr-private", payload, 0,
                                 KEY_SPEC_PROCESS_KEYRING),
                      EPERM))
+        return 1;
+    /* The inline private-name rule runs before the payload copy
+     * (security/keys/keyctl.c:104-108), before `lookup_user_key()` resolves
+     * the destination (:126) and before `key_create_or_update()` looks the
+     * type up, so it survives both. */
+    errno = 0;
+    if (expect_errno("add-key-private-keyring-missing-destination",
+                     do_add_key("keyring", ".kr-private", NULL, 0, 0x7ffffff0),
+                     EPERM))
+        return 1;
+    /* The payload is copied before `lookup_user_key()`, so an unreadable
+     * payload is -EFAULT even for an unknown type. */
+    errno = 0;
+    if (expect_errno("add-key-unreadable-payload-unknown-type",
+                     do_add_key("kr-bogus-type", "kr-desc", NULL, 8,
+                                KEY_SPEC_PROCESS_KEYRING),
+                     EFAULT))
+        return 1;
+    /* The 32767-byte `user` ceiling lives in `user_preparse()`, which runs
+     * inside `key_create_or_update()`: the copy comes first, so an unreadable
+     * oversized payload is -EFAULT rather than -EINVAL. */
+    errno = 0;
+    if (expect_errno("add-key-unreadable-oversized-payload",
+                     do_add_key("user", "kr-desc", NULL, 32768,
+                                KEY_SPEC_PROCESS_KEYRING),
+                     EFAULT))
+        return 1;
+    /* The destination keyring is resolved before `key_create_or_update()`
+     * rewrites the registry's -ENOKEY as -ENODEV, so a missing keyring wins. */
+    errno = 0;
+    if (expect_errno("add-key-missing-keyring-unknown-type",
+                     do_add_key("kr-bogus-type", "kr-desc", payload, 1,
+                                0x7ffffff0),
+                     ENOKEY))
         return 1;
     key = do_add_key("user", "kr-alpha", payload, 8, KEY_SPEC_PROCESS_KEYRING);
     if (key <= 0)
@@ -413,6 +496,16 @@ static int test_keyctl_validation(void) {
                      do_keyctl(KEYCTL_JOIN_SESSION_KEYRING,
                                (unsigned long)(uintptr_t)"", 0, 0, 0), EINVAL))
         return 1;
+
+    /* KEYCTL_DH_COMPUTE and KEYCTL_WATCH_KEY are deliberately not asserted:
+     * their answers are configuration dependent, not ABI constants.  Both
+     * commands are compiled out only when the kernel is built without
+     * CONFIG_KEY_DH_OPERATIONS and CONFIG_KEY_NOTIFICATIONS (the latter
+     * depends on CONFIG_WATCH_QUEUE), in which case their stubs return
+     * -EOPNOTSUPP before looking at an argument (security/keys/internal.h:
+     * 292-298 and :352-358).  With those options enabled the same call
+     * reaches the real implementation, so no single errno is portable. */
+    (void)ring;
     return 0;
 }
 

@@ -3390,9 +3390,6 @@ pub(crate) enum ClassicAioOperation {
         data_only: bool,
         ioprio: u16,
     },
-    Noop {
-        ioprio: u16,
-    },
 }
 
 /// The result of trying to move a classic-AIO read/write into the owned I/O
@@ -3418,8 +3415,7 @@ impl ClassicAioOperation {
             | Self::Write { ioprio, .. }
             | Self::Readv { ioprio, .. }
             | Self::Writev { ioprio, .. }
-            | Self::Sync { ioprio, .. }
-            | Self::Noop { ioprio } => *ioprio,
+            | Self::Sync { ioprio, .. } => *ioprio,
         }
     }
 
@@ -3431,7 +3427,7 @@ impl ClassicAioOperation {
             | Self::Write { context, .. }
             | Self::Readv { context, .. }
             | Self::Writev { context, .. } => context.status().rwf_nowait(),
-            Self::Sync { .. } | Self::Noop { .. } => false,
+            Self::Sync { .. } => false,
         }
     }
 }
@@ -3490,7 +3486,7 @@ pub(crate) fn prepare_classic_aio_owned_operation(
                 validate_direct_iov(file.as_ref(), iov, *offset)
             }
         }
-        ClassicAioOperation::Sync { .. } | ClassicAioOperation::Noop { .. } => Ok(()),
+        ClassicAioOperation::Sync { .. } => Ok(()),
     };
     if let Err(error) = direct_validation {
         return Err((error, completion));
@@ -3561,7 +3557,7 @@ pub(crate) fn prepare_classic_aio_owned_operation(
             };
             (file, context, FileIoOpcode::Write, Box::new(buffer))
         }
-        ClassicAioOperation::Sync { .. } | ClassicAioOperation::Noop { .. } => {
+        ClassicAioOperation::Sync { .. } => {
             return Ok(ClassicAioOwnedPreparation::Unsupported);
         }
     };
@@ -3586,7 +3582,7 @@ pub(crate) fn prepare_classic_aio_owned_operation(
         | ClassicAioOperation::Write { offset, .. }
         | ClassicAioOperation::Readv { offset, .. }
         | ClassicAioOperation::Writev { offset, .. } => *offset,
-        ClassicAioOperation::Sync { .. } | ClassicAioOperation::Noop { .. } => unreachable!(),
+        ClassicAioOperation::Sync { .. } => unreachable!(),
     };
     // Freeze append intent at submit time.  The provider/cache must acquire
     // its append domain later; it must never treat this saved `offset` as an
@@ -3668,6 +3664,18 @@ pub(crate) fn prepare_classic_aio_operation(
     if nbytes > isize::MAX as u64 || offset < 0 {
         return Err(AxError::InvalidInput);
     }
+    // `__io_submit_one()` opens the descriptor *before* it dispatches on the
+    // opcode (`fs/aio.c:2026-2029`):
+    //
+    //     req->ki_filp = fget(iocb->aio_fildes);
+    //     if (unlikely(!req->ki_filp))
+    //             return -EBADF;
+    //
+    // so a closed descriptor is -EBADF for every opcode, including the ones
+    // this kernel does not dispatch.  The per-opcode lookups below stay
+    // because they also apply the type, mode and placement rules that
+    // `aio_read()`/`aio_write()`/`aio_fsync()` apply after their own `fget()`.
+    drop(get_file_like(fd)?);
     let len = nbytes as usize;
     match opcode {
         0 => {
@@ -3732,7 +3740,6 @@ pub(crate) fn prepare_classic_aio_operation(
                 ioprio,
             })
         }
-        6 => Ok(ClassicAioOperation::Noop { ioprio }),
         7 => {
             if flags & !CLASSIC_AIO_READ_RWF != 0 {
                 return Err(AxError::OperationNotSupported);
@@ -3783,6 +3790,11 @@ pub(crate) fn prepare_classic_aio_operation(
                 ioprio,
             })
         }
+        // `io_submit_one()`'s opcode switch has cases for 0..=5 and 7..=8 and
+        // no `case IOCB_CMD_NOOP` at all, so opcode 6 — the `IOCB_CMD_NOOP`
+        // that `include/uapi/linux/aio_abi.h:43` still defines — falls to
+        // `default: return -EINVAL;` (`fs/aio.c:2055-2072`) before any
+        // descriptor or buffer is examined.
         _ => Err(AxError::InvalidInput),
     }
 }
@@ -4004,7 +4016,6 @@ fn execute_classic_aio_operation_with_cancellation(
             Some(operation) => file.sync_cancellable(data_only, operation).map(|()| 0),
             None => file.sync(data_only).map(|()| 0),
         },
-        ClassicAioOperation::Noop { .. } => Ok(0),
     }
 }
 

@@ -788,9 +788,10 @@ pub fn sys_syslog<M: UserMemory + ?Sized>(
 /// The statement order below is the ABI.  `drivers/char/random.c` validates the
 /// flag word, then (`GRND_INSECURE` aside) gates on `crng_ready()` *before* it
 /// calls `import_ubuf()`, and `import_ubuf()` clamps to `MAX_RW_COUNT` rather
-/// than rejecting an oversized request.  Everything after the gate is a copy,
-/// so a fault midway through a large request returns the bytes already copied
-/// instead of an errno.
+/// than rejecting an oversized request, then admits the whole clamped range
+/// with a single `access_ok()` before any byte moves.  Everything after that
+/// admission is a copy, so a fault midway through a large request returns the
+/// bytes already copied instead of an errno.
 pub fn sys_getrandom<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     buf: *mut u8,
@@ -816,13 +817,18 @@ pub fn sys_getrandom<M: UserMemory + ?Sized>(
         }
     }
 
+    // `import_ubuf()` validates the whole clamped range with one `access_ok()`
+    // before a single byte is copied (`lib/iov_iter.c:1445-1453`), so a range
+    // that crosses `USER_PTR_MAX` is -EFAULT even when its first pages are
+    // mapped.  Only the pages `access_ok()` accepted can still fault below.
+    if !tk_linux_random::range_address_is_user(buf as usize, len, user_ptr_max()) {
+        return Err(AxError::BadAddress);
+    }
+
     if len == 0 {
-        // `import_ubuf()` still runs `access_ok()` on an empty request.  The
-        // kernel's own usercopy layer rejects the low page, so the Linux test
-        // (which accepts it) is applied directly.
-        if !tk_linux_random::zero_length_address_is_user(buf as usize, user_ptr_max()) {
-            return Err(AxError::BadAddress);
-        }
+        // The empty request is the same test with a zero size, which accepts
+        // any address up to and including `USER_PTR_MAX` — including the low
+        // page the kernel's own usercopy layer refuses to touch.
         return Ok(0);
     }
 
