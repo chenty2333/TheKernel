@@ -14,13 +14,15 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{FsNameBuf, FsPathBuf};
+use axhal::time::wall_time;
 use axpoll::{IoEvents, PollSet, Pollable};
 #[cfg(not(test))]
 use axsync::Mutex;
-use axtask::current;
+use axtask::{WaitError, WaitQueue, current};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::{
-    __kernel_mode_t, CAP_DAC_OVERRIDE, CAP_FOWNER, O_ACCMODE, O_CLOEXEC, O_CREAT, O_EXCL,
+    __kernel_mode_t, CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_SYS_RESOURCE, O_ACCMODE, O_CLOEXEC, O_CREAT,
+    O_EXCL,
     O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, SI_MESGQ, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD,
     timespec,
 };
@@ -29,7 +31,11 @@ use linux_raw_sys::general::{
 // mutex; blocking/wakeup behavior remains covered only by kernel/guest tests.
 #[cfg(test)]
 use spin::Mutex;
-use tk_linux_ipc::validate_priority;
+use tk_linux_ipc::{
+    MqAttributeError, MqKey, MqLimits, MqNameError, MqUnlinkError, MqUnlinkRequest,
+    authorize_mq_unlink, mq_notify_fires, mqueue_insert_prefix, validate_mq_attributes,
+    validate_mq_name, validate_priority,
+};
 use tk_linux_signal::{PreparedSignal, SignalInfo, SignalRtPayload, Signo};
 use tk_linux_usercopy::{
     UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_load_until_nul_bounded,
@@ -43,7 +49,6 @@ use crate::{
         get_typed_file,
     },
     mm::map_usercopy_error,
-    readiness::block_on_poll_io_until,
     syscall::RawSigevent,
     task::{
         AsThread, Kgid, Kuid, PidNamespace, ProcStateHint, ProcessData, UserNamespace,
@@ -53,16 +58,32 @@ use crate::{
     time::TimeValueLike,
 };
 
-const DEFAULT_MQ_MAXMSG: isize = 10;
-const DEFAULT_MQ_MSGSIZE: isize = 8192;
-const DEFAULT_QUEUES_MAX: usize = 256;
-const DEFAULT_MSG_MAX: usize = 1024;
-const DEFAULT_MSGSIZE_MAX: usize = 1 << 20;
-const MQ_NAME_MAX: usize = 255;
+/// `mq_init_ns()` (`ipc/mqueue.c`) seeds one IPC namespace with these values,
+/// and `/proc/sys/fs/mqueue` only ever publishes what they were set to.
+const DEFAULT_QUEUES_MAX: usize = tk_linux_ipc::MQ_QUEUES_MAX_DEFAULT;
+const DEFAULT_MSG_MAX: usize = tk_linux_ipc::MQ_MSG_MAX_DEFAULT;
+const DEFAULT_MSGSIZE_MAX: usize = tk_linux_ipc::MQ_MSGSIZE_MAX_DEFAULT;
+/// `DFLT_MSG` / `DFLT_MSGSIZE`: the attribute a queue created with a NULL
+/// `mq_attr` inherits, before being clamped by the namespace maxima
+/// (`min(ipc_ns->mq_msg_max, ipc_ns->mq_msg_default)` in `mqueue_get_inode()`).
+const DEFAULT_MQ_MAXMSG: isize = tk_linux_ipc::MQ_MSG_MAX_DEFAULT as isize;
+const DEFAULT_MQ_MSGSIZE: isize = tk_linux_ipc::MQ_MSGSIZE_MAX_DEFAULT as isize;
+/// `NAME_MAX`, the longest queue name `simple_lookup()` accepts.
+const MQ_NAME_MAX: usize = tk_linux_ipc::MQ_NAME_MAX;
+/// `_NSIG` on x86_64, the upper bound Linux `valid_signal()` compares against.
+const LINUX_NSIG: i32 = 64;
 const NOTIFY_COOKIE_LEN: usize = 32;
 const NOTIFY_WOKENUP: u8 = 1;
 const NOTIFY_REMOVED: u8 = 2;
 const MQ_INODE_SIZE: u64 = 80;
+
+/// The mqueuefs root is created by `mqueue_fill_super()` as
+/// `S_IFDIR | S_ISVTX | S_IRWXUGO`, owned by the task that mounted it. TheKernel
+/// mounts the queue filesystem from its initial user namespace, so the
+/// directory owner is uid 0 and `inode_permission(dir, MAY_WRITE | MAY_EXEC)`
+/// always succeeds for the world-writable mode.
+pub(crate) const MQUEUE_DIR_MODE: u16 = 0o1777;
+pub(crate) const MQUEUE_DIR_UID: u32 = 0;
 
 static MQ_NOTIFICATION_ID: AtomicU64 = AtomicU64::new(1);
 static MQ_QUEUES_MAX: AtomicUsize = AtomicUsize::new(DEFAULT_QUEUES_MAX);
@@ -107,6 +128,64 @@ struct MqMessage {
     data: Vec<u8>,
 }
 
+/// A message that has not entered `msg_tree`, i.e. the `struct msg_msg` Linux
+/// holds between `load_msg()` and either `msg_insert()` or `pipelined_send()`.
+struct MqOutgoing {
+    priority: u32,
+    sender: MqSender,
+    data: Vec<u8>,
+}
+
+/// One task sleeping in `mq_timedreceive`, the analogue of Linux
+/// `struct ext_wait_queue` on `info->e_wait_q[RECV]`.
+struct MqReceiver {
+    /// Set while [`PosixMqueue::receivers`] holds this waiter, so repeated
+    /// attempt loops register exactly once.
+    queued: AtomicBool,
+    /// The message `pipelined_send()` handed over. It is written under the
+    /// queue lock and never partially published, so the receiver either sees
+    /// the whole message or nothing.
+    slot: Mutex<Option<MqMessage>>,
+    /// Wakes this task only, matching `wake_q_add_safe(wake_q, task)` in
+    /// `__pipelined_op()`.
+    waker: Arc<WaitQueue>,
+}
+
+/// One task sleeping in `mq_timedsend`, whose message `do_mq_timedsend()` has
+/// already loaded into `ext_wait_queue::msg`.
+struct MqSenderWaiter {
+    /// Set while [`PosixMqueue::senders`] holds this waiter.
+    queued: AtomicBool,
+    /// Set by `pipelined_receive()` once the staged message reached `msg_tree`.
+    handed_off: AtomicBool,
+    /// The staged message, taken exactly once: either by `pipelined_receive()`
+    /// or by the sender's own successful attempt.
+    staged: Mutex<Option<MqOutgoing>>,
+    waker: Arc<WaitQueue>,
+}
+
+/// Wakeups a completed queue operation owes after it releases the queue lock.
+///
+/// This is Linux's `DEFINE_WAKE_Q(wake_q)` plus the `wake_up(&info->wait_q)`
+/// and `__do_notify()` work that `do_mq_timedsend()` performs once
+/// `info->lock` is dropped.
+#[derive(Default)]
+struct MqPublish {
+    /// A receiver served by `pipelined_send()`.
+    receiver: Option<Arc<MqReceiver>>,
+    /// A sender whose staged message `pipelined_receive()` inserted.
+    sender: Option<Arc<MqSenderWaiter>>,
+    /// A message entered `msg_tree`; `__do_notify()` always ends in
+    /// `wake_up(&info->wait_q)`.
+    readable: bool,
+    /// Capacity was freed and no sender was waiting, so Linux falls back to
+    /// `wake_up_interruptible(&info->wait_q)`.
+    writable: bool,
+    /// The one-shot `mq_notify` registration consumed by this operation, with
+    /// the sending task the notification must attribute.
+    notify: Option<(MqNotifier, MqSender)>,
+}
+
 #[derive(Clone)]
 struct MqThreadNotifier {
     netlink: FileHandle<NetlinkSocket>,
@@ -149,6 +228,13 @@ pub(crate) struct PosixMqueue {
     messages: Vec<MqMessage>,
     next_sequence: u64,
     notifier: Option<MqNotifier>,
+    /// `info->e_wait_q[RECV]`: tasks sleeping in `mq_timedreceive`. Linux
+    /// registers a waiter only while `msg_tree` is empty, so the queue never
+    /// holds messages and waiting receivers at the same time.
+    receivers: Vec<Arc<MqReceiver>>,
+    /// `info->e_wait_q[SEND]`: tasks sleeping in `mq_timedsend` whose message
+    /// is already loaded and parked.
+    senders: Vec<Arc<MqSenderWaiter>>,
     readiness: Arc<MqReadiness>,
     /// Weak here avoids manager -> queue -> namespace retention; mqd file
     /// descriptions retain the namespace strongly while they are usable.
@@ -190,6 +276,10 @@ enum MqAccess {
     ReadOnly,
     WriteOnly,
     ReadWrite,
+    /// `O_ACCMODE == O_RDWR | O_WRONLY`. Linux `prepare_open()` accepts this
+    /// only on the create path, where `OPEN_FMODE()` maps it to a descriptor
+    /// with neither `FMODE_READ` nor `FMODE_WRITE`.
+    Unspecified,
 }
 
 impl MqManager {
@@ -250,16 +340,36 @@ pub(crate) fn mqueuefs_unlink(namespace: &IpcNamespace, name: &FsNameBuf) -> AxR
     let queue_guard = queue.lock();
     let curr = current();
     let cred = curr.as_thread().current_cred();
-    if Kuid::from_raw(queue_guard.uid) != Some(cred.ids().fsuid)
-        && !cred.has_effective_capability(CAP_FOWNER)
-    {
-        return Err(AxError::PermissionDenied);
-    }
+    check_unlink_authority(queue_guard.uid, &cred)?;
     drop(queue_guard);
     // `manager` has remained locked, so this removes exactly the object whose
     // ownership was checked above rather than a same-name successor.
     manager.queues.remove(name);
     Ok(())
+}
+
+/// Linux `vfs_unlink()` authority for one mqueuefs name.
+///
+/// `may_delete_dentry()` (`fs/namei.c`) runs `inode_permission(dir,
+/// MAY_WRITE | MAY_EXEC)` first and `check_sticky()` second, and the mqueuefs
+/// root is always the sticky, world-writable `01777` directory
+/// `mqueue_fill_super()` creates. A caller that is neither the queue owner, nor
+/// the owner of that directory, nor `CAP_FOWNER` is therefore rejected with
+/// `-EPERM` rather than `-EACCES`.
+fn check_unlink_authority(queue_uid: u32, cred: &crate::task::Cred) -> AxResult<()> {
+    let request = MqUnlinkRequest {
+        queue_uid,
+        directory_uid: MQUEUE_DIR_UID,
+        fsuid: cred.ids().fsuid.into_raw(),
+        directory_sticky: MQUEUE_DIR_MODE & 0o1000 != 0,
+        directory_write_exec: true,
+        cap_fowner: cred.has_effective_capability(CAP_FOWNER),
+    };
+    match authorize_mq_unlink(request) {
+        Ok(()) => Ok(()),
+        Err(MqUnlinkError::StickyDirectory) => Err(AxError::from(LinuxError::EPERM)),
+        Err(MqUnlinkError::DirectoryInaccessible) => Err(AxError::PermissionDenied),
+    }
 }
 
 pub(crate) fn mqueuefs_metadata(queue: &Arc<Mutex<PosixMqueue>>) -> (u32, u32, u32, u64) {
@@ -271,40 +381,48 @@ pub(crate) fn mqueuefs_read(
     queue: &Arc<Mutex<PosixMqueue>>,
     destination: &mut [u8],
 ) -> AxResult<usize> {
-    let mut queue = queue.lock();
-    if !has_queue_permission(&queue, MqAccess::ReadOnly) {
-        return Err(AxError::PermissionDenied);
-    }
-    if destination.len() < queue.msgsize {
-        return Err(LinuxError::EMSGSIZE.into());
-    }
-    let message = queue.pop_message().ok_or(AxError::WouldBlock)?;
+    let (message, publish, readiness) = {
+        let mut queue = queue.lock();
+        if !has_queue_permission(&queue, MqAccess::ReadOnly) {
+            return Err(AxError::PermissionDenied);
+        }
+        if destination.len() < queue.msgsize {
+            return Err(LinuxError::EMSGSIZE.into());
+        }
+        let (message, publish) = queue.take_message().ok_or(AxError::WouldBlock)?;
+        let readiness = Arc::clone(&queue.readiness);
+        (message, publish, readiness)
+    };
+    publish.publish(&readiness);
     destination[..message.data.len()].copy_from_slice(&message.data);
-    queue.readiness.writable.wake();
     Ok(message.data.len())
 }
 
 pub(crate) fn mqueuefs_write(queue: &Arc<Mutex<PosixMqueue>>, source: &[u8]) -> AxResult<usize> {
-    let mut queue = queue.lock();
-    if !has_queue_permission(&queue, MqAccess::WriteOnly) {
-        return Err(AxError::PermissionDenied);
-    }
-    if source.len() > queue.msgsize {
-        return Err(LinuxError::EMSGSIZE.into());
-    }
-    if queue.messages.len() >= queue.maxmsg {
-        return Err(AxError::WouldBlock);
-    }
-    let sender = current_mq_sender();
     let mut data = Vec::new();
     data.try_reserve_exact(source.len())
         .map_err(|_| AxError::NoMemory)?;
     data.extend_from_slice(source);
-    let became_readable = queue.insert_message(0, sender.clone(), data);
-    let notifier = became_readable.then(|| queue.notifier.take()).flatten();
-    queue.readiness.readable.wake();
-    drop(queue);
-    maybe_notify(notifier, sender);
+    let outgoing = MqOutgoing {
+        priority: 0,
+        sender: current_mq_sender(),
+        data,
+    };
+    let (publish, readiness) = {
+        let mut queue = queue.lock();
+        if !has_queue_permission(&queue, MqAccess::WriteOnly) {
+            return Err(AxError::PermissionDenied);
+        }
+        if source.len() > queue.msgsize {
+            return Err(LinuxError::EMSGSIZE.into());
+        }
+        if queue.messages.len() >= queue.maxmsg {
+            return Err(AxError::WouldBlock);
+        }
+        let readiness = Arc::clone(&queue.readiness);
+        (queue.dispatch_message(outgoing), readiness)
+    };
+    publish.publish(&readiness);
     Ok(source.len())
 }
 
@@ -362,6 +480,8 @@ impl PosixMqueue {
             messages,
             next_sequence: 0,
             notifier: None,
+            receivers: Vec::new(),
+            senders: Vec::new(),
             readiness,
             ipc_ns: Arc::downgrade(ipc_ns),
             charge: None,
@@ -378,29 +498,261 @@ impl PosixMqueue {
         }
     }
 
-    fn insert_message(&mut self, priority: u32, sender: MqSender, data: Vec<u8>) -> bool {
+    /// `msg_insert()` (`ipc/mqueue.c`).
+    ///
+    /// The stored order is the dequeue order decided by
+    /// [`tk_linux_ipc::mqueue_dequeue_precedes`], so insertion into priority
+    /// order also preserves FIFO among equal priorities. Returns whether the
+    /// queue was empty, which is the empty-to-nonempty edge `__do_notify()`
+    /// keys off (`info->attr.mq_curmsgs == 1` after the insert).
+    fn insert_message(&mut self, outgoing: MqOutgoing) -> bool {
         let was_empty = self.messages.is_empty();
-        let message = MqMessage {
-            priority,
+        let key = MqKey {
+            priority: outgoing.priority,
             sequence: self.next_sequence,
-            sender,
-            data,
         };
         self.next_sequence = self.next_sequence.wrapping_add(1);
 
-        let index = self.messages.partition_point(|existing| {
-            existing.priority > message.priority
-                || (existing.priority == message.priority && existing.sequence <= message.sequence)
+        let index = self.messages.partition_point(|stored| {
+            mqueue_insert_prefix(
+                MqKey {
+                    priority: stored.priority,
+                    sequence: stored.sequence,
+                },
+                key,
+            )
         });
-        self.messages.insert(index, message);
+        self.messages.insert(
+            index,
+            MqMessage {
+                priority: outgoing.priority,
+                sequence: key.sequence,
+                sender: outgoing.sender,
+                data: outgoing.data,
+            },
+        );
         was_empty
     }
 
+    /// `msg_get()` (`ipc/mqueue.c`): the rightmost `msg_tree` leaf first, i.e.
+    /// the highest priority with the oldest message at that priority.
     fn pop_message(&mut self) -> Option<MqMessage> {
         if self.messages.is_empty() {
             None
         } else {
             Some(self.messages.remove(0))
+        }
+    }
+
+    /// `pipelined_send()` (`ipc/mqueue.c`): hand `outgoing` straight to the
+    /// task waiting in `mq_timedreceive()` without inserting it into
+    /// `msg_tree`. The caller publishes the returned waiter's wakeup after
+    /// dropping the queue lock.
+    fn pipeline_to_receiver(&mut self, outgoing: MqOutgoing) -> Option<Arc<MqReceiver>> {
+        let receiver = self.receivers.first().cloned()?;
+        self.receivers.remove(0);
+        receiver.queued.store(false, Ordering::Release);
+        let key = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        *receiver.slot.lock() = Some(MqMessage {
+            priority: outgoing.priority,
+            sequence: key,
+            sender: outgoing.sender,
+            data: outgoing.data,
+        });
+        Some(receiver)
+    }
+
+    /// `pipelined_receive()` (`ipc/mqueue.c`): the slot freed by `msg_get()` is
+    /// transferred to the first sleeping sender, whose message is inserted in
+    /// its place instead of waking that sender to contend for the capacity.
+    ///
+    /// Returns `None` when no sender is waiting, which is Linux's
+    /// `wake_up_interruptible(&info->wait_q)` path.
+    fn pipeline_receive(&mut self) -> Option<Arc<MqSenderWaiter>> {
+        let sender = self.senders.first().cloned()?;
+        self.senders.remove(0);
+        sender.queued.store(false, Ordering::Release);
+        match sender.take_staged() {
+            Some(outgoing) => {
+                self.insert_message(outgoing);
+                sender.handed_off.store(true, Ordering::Release);
+                Some(sender)
+            }
+            // A queued sender always has its staged message; Linux refuses to
+            // insert a message-less waiter too and leaves the slot to the
+            // regular readiness wakeup.
+            None => None,
+        }
+    }
+
+    /// `wq_get_first_waiter(info, RECV)` plus the parking `wq_add()` performs.
+    fn park_receiver(&mut self, receiver: &Arc<MqReceiver>) {
+        if !receiver.queued.swap(true, Ordering::AcqRel) {
+            self.receivers.push(receiver.clone());
+        }
+    }
+
+    /// Removes a receiver from `e_wait_q[RECV]`; idempotent, because the
+    /// handoff path may already have taken it.
+    fn drop_receiver(&mut self, receiver: &Arc<MqReceiver>) {
+        if receiver.queued.swap(false, Ordering::AcqRel) {
+            self.receivers
+                .retain(|waiter| !Arc::ptr_eq(waiter, receiver));
+        }
+    }
+
+    fn park_sender(&mut self, sender: &Arc<MqSenderWaiter>) {
+        if !sender.queued.swap(true, Ordering::AcqRel) {
+            self.senders.push(sender.clone());
+        }
+    }
+
+    fn drop_sender(&mut self, sender: &Arc<MqSenderWaiter>) {
+        if sender.queued.swap(false, Ordering::AcqRel) {
+            self.senders.retain(|waiter| !Arc::ptr_eq(waiter, sender));
+        }
+    }
+
+    /// The `msg_insert()` / `pipelined_send()` decision of `do_mq_timedsend()`
+    /// once the caller has established that the queue has room.
+    ///
+    /// Linux consults `wq_get_first_waiter(info, RECV)` before touching
+    /// `msg_tree`, so a blocked receiver is served by a direct handoff: the
+    /// message never becomes visible through `poll()` and never fires the
+    /// one-shot notification.
+    fn dispatch_message(&mut self, outgoing: MqOutgoing) -> MqPublish {
+        // A waiting receiver is served first; the queue never holds messages
+        // and blocked receivers at the same time, so this branch and the
+        // insertion branch are mutually exclusive.
+        if self.receivers.is_empty() {
+            let sender = outgoing.sender.clone();
+            self.insert_message(outgoing);
+            let mut publish = MqPublish {
+                readable: true,
+                ..MqPublish::default()
+            };
+            if mq_notify_fires(self.notifier.is_some(), false, self.messages.len()) {
+                publish.notify = self.notifier.take().map(|notifier| (notifier, sender));
+            }
+            return publish;
+        }
+        MqPublish {
+            receiver: self.pipeline_to_receiver(outgoing),
+            ..MqPublish::default()
+        }
+    }
+
+    /// One `do_mq_timedsend()` attempt with the queue lock held.
+    ///
+    /// Like Linux, a full queue sleeps the sender before the receiver check
+    /// runs, and `park` mirrors `wq_sleep()` being the only path that publishes
+    /// the waiter: the non-blocking `-EAGAIN` path never registers.
+    fn attempt_send(
+        &mut self,
+        waiter: &Arc<MqSenderWaiter>,
+        park: bool,
+    ) -> AxResult<MqSendAttempt> {
+        if waiter.handed_off.load(Ordering::Acquire) {
+            return Ok(MqSendAttempt::Sent(MqPublish::default()));
+        }
+        if self.messages.len() >= self.maxmsg {
+            if park {
+                self.park_sender(waiter);
+            }
+            return Ok(MqSendAttempt::Sleep);
+        }
+        let Some(outgoing) = waiter.take_staged() else {
+            return Err(AxError::BadState);
+        };
+        self.drop_sender(waiter);
+        Ok(MqSendAttempt::Sent(self.dispatch_message(outgoing)))
+    }
+
+    /// The `msg_get()` / `pipelined_receive()` pair of `do_mq_timedreceive()`.
+    fn take_message(&mut self) -> Option<(MqMessage, MqPublish)> {
+        let message = self.pop_message()?;
+        let mut publish = MqPublish::default();
+        match self.pipeline_receive() {
+            Some(sender) => publish.sender = Some(sender),
+            None => publish.writable = true,
+        }
+        Some((message, publish))
+    }
+
+    /// One `do_mq_timedreceive()` attempt with the queue lock held.
+    fn attempt_receive(&mut self, waiter: &Arc<MqReceiver>, park: bool) -> Option<(MqMessage, MqPublish)> {
+        if let Some(message) = waiter.take_slot() {
+            return Some((message, MqPublish::default()));
+        }
+        if let Some(taken) = self.take_message() {
+            return Some(taken);
+        }
+        if park {
+            self.park_receiver(waiter);
+        }
+        None
+    }
+}
+
+impl MqReceiver {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queued: AtomicBool::new(false),
+            slot: Mutex::new(None),
+            waker: Arc::new(WaitQueue::new()),
+        })
+    }
+
+    fn take_slot(&self) -> Option<MqMessage> {
+        self.slot.lock().take()
+    }
+}
+
+impl MqSenderWaiter {
+    fn new(outgoing: MqOutgoing) -> Arc<Self> {
+        Arc::new(Self {
+            queued: AtomicBool::new(false),
+            handed_off: AtomicBool::new(false),
+            staged: Mutex::new(Some(outgoing)),
+            waker: Arc::new(WaitQueue::new()),
+        })
+    }
+
+    fn take_staged(&self) -> Option<MqOutgoing> {
+        self.staged.lock().take()
+    }
+}
+
+/// Outcome of one `do_mq_timedsend()` attempt.
+// `MqPublish` carries its deferred wakeups inline; boxing it would add an
+// allocation to every send, so the variant size difference is accepted.
+#[allow(clippy::large_enum_variant)]
+enum MqSendAttempt {
+    /// The message reached the queue or a receiver.
+    Sent(MqPublish),
+    /// Linux `wq_sleep(info, SEND, timeout, &wait)`.
+    Sleep,
+}
+
+impl MqPublish {
+    /// Publishes every deferred wakeup. Must run after the queue lock is
+    /// dropped, because a woken waiter immediately re-enters the queue.
+    fn publish(self, readiness: &MqReadiness) {
+        if self.readable {
+            readiness.readable.wake();
+        }
+        if self.writable {
+            readiness.writable.wake();
+        }
+        if let Some(receiver) = self.receiver {
+            receiver.waker.notify_one(false);
+        }
+        if let Some(sender) = self.sender {
+            sender.waker.notify_one(false);
+        }
+        if let Some((notifier, sender)) = self.notify {
+            maybe_notify(Some(notifier), sender);
         }
     }
 }
@@ -422,12 +774,16 @@ impl Drop for PosixMqueue {
 }
 
 impl MqAccess {
-    fn from_flags(flags: i32) -> AxResult<Self> {
+    /// Linux `prepare_open()` decodes `oflag & O_ACCMODE` through
+    /// `oflag2acc[]`, whose third entry is `O_RDWR | O_WRONLY`. That value is
+    /// only rejected for an *existing* queue; a create request keeps it and
+    /// `OPEN_FMODE()` then yields a descriptor that can neither read nor write.
+    fn from_flags(flags: i32) -> Self {
         match (flags as u32) & O_ACCMODE {
-            O_RDONLY => Ok(Self::ReadOnly),
-            O_WRONLY => Ok(Self::WriteOnly),
-            O_RDWR => Ok(Self::ReadWrite),
-            _ => Err(AxError::InvalidInput),
+            O_RDONLY => Self::ReadOnly,
+            O_WRONLY => Self::WriteOnly,
+            O_RDWR => Self::ReadWrite,
+            _ => Self::Unspecified,
         }
     }
 
@@ -582,58 +938,100 @@ fn normalize_name<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     name: *const c_char,
 ) -> AxResult<FsNameBuf> {
+    // `do_mq_open()` reads the name with `CLASS(filename, name)(u_name)` and
+    // hands it to `start_creating_noperm(mnt->mnt_root, &QSTR(name->name))`
+    // unchanged: the kernel's queue name is the raw syscall name, so a leading
+    // slash is rejected with `EACCES` like any other slash (libc strips it by
+    // passing `name + 1`). The bound scans one byte past `NAME_MAX` so that an
+    // over-long name reports Linux's `ENAMETOOLONG` instead of running on.
     let raw = vm_load_until_nul_bounded(memory, name.cast::<u8>(), MQ_NAME_MAX + 2)
         .map_err(map_usercopy_error)?;
-    if raw.first() != Some(&b'/') {
-        return Err(AxError::InvalidInput);
-    }
-    let inner = &raw[1..];
-    if inner.is_empty() || inner.contains(&b'/') {
-        return Err(AxError::InvalidInput);
-    }
-    if inner.len() > MQ_NAME_MAX {
-        return Err(AxError::NameTooLong);
+    match validate_mq_name(&raw) {
+        Ok(()) => {}
+        Err(MqNameError::Empty) => return Err(AxError::NotFound),
+        Err(MqNameError::Invalid) => return Err(AxError::PermissionDenied),
+        Err(MqNameError::TooLong) => return Err(AxError::NameTooLong),
     }
     let mut owned = Vec::new();
     owned
-        .try_reserve_exact(inner.len())
+        .try_reserve_exact(raw.len())
         .map_err(|_| AxError::NoMemory)?;
-    owned.extend_from_slice(inner);
+    owned.extend_from_slice(&raw);
     FsNameBuf::from_vec(owned).map_err(Into::into)
 }
 
+/// The attribute `mqueue_get_inode()` gives a queue created without an
+/// `mq_attr`: `min(ipc_ns->mq_msg_max, ipc_ns->mq_msg_default)` and
+/// `min(ipc_ns->mq_msgsize_max, ipc_ns->mq_msgsize_default)`.
 fn default_attr() -> MqAttr {
     MqAttr {
         mq_flags: 0,
-        mq_maxmsg: DEFAULT_MQ_MAXMSG,
-        mq_msgsize: DEFAULT_MQ_MSGSIZE,
+        mq_maxmsg: mq_msg_max().min(DEFAULT_MQ_MAXMSG as usize) as isize,
+        mq_msgsize: mq_msgsize_max().min(DEFAULT_MQ_MSGSIZE as usize) as isize,
         mq_curmsgs: 0,
         __reserved: [0; 4],
     }
 }
 
+/// Reads the create-time `mq_attr`, if any.
+///
+/// Linux `SYSCALL_DEFINE4(mq_open)` copies the whole structure up front, so a
+/// bad pointer is `-EFAULT` even when the queue already exists and the
+/// attributes are ignored. The limits are checked later, only on the create
+/// path, by [`read_created_attributes`].
 fn read_create_attr<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     attr: *const MqAttr,
-) -> AxResult<MqAttr> {
-    let attr = if attr.is_null() {
-        default_attr()
-    } else {
-        VmPtr::vm_read(attr, memory).map_err(map_usercopy_error)?
-    };
-
-    if attr.mq_maxmsg <= 0 || attr.mq_msgsize <= 0 {
-        return Err(AxError::InvalidInput);
+) -> AxResult<Option<MqAttr>> {
+    if attr.is_null() {
+        return Ok(None);
     }
-    if attr.mq_maxmsg as usize > mq_msg_max() || attr.mq_msgsize as usize > mq_msgsize_max() {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(MqAttr {
+    let attr = VmPtr::vm_read(attr, memory).map_err(map_usercopy_error)?;
+    Ok(Some(MqAttr {
         mq_flags: 0,
         mq_curmsgs: 0,
         __reserved: [0; 4],
         ..attr
-    })
+    }))
+}
+
+/// The namespace maxima and the caller's `CAP_SYS_RESOURCE` state.
+fn create_limits() -> (MqLimits, bool) {
+    let curr = current();
+    let thread = curr.as_thread();
+    (
+        MqLimits {
+            queues: mq_queues_max(),
+            max_messages: mq_msg_max(),
+            max_message_size: mq_msgsize_max(),
+        },
+        thread
+            .current_cred()
+            .has_effective_capability(CAP_SYS_RESOURCE),
+    )
+}
+
+/// Applies the `mqueue_get_inode()` admission rules to a requested attribute.
+///
+/// `CAP_SYS_RESOURCE` replaces the namespace maxima with `HARD_MSGMAX` /
+/// `HARD_MSGSIZEMAX`; `EINVAL` from the size checks always precedes the
+/// `EOVERFLOW` of the charge computation.
+fn read_created_attributes(
+    requested: Option<MqAttr>,
+    limits: MqLimits,
+    cap_sys_resource: bool,
+) -> AxResult<MqAttr> {
+    let attr = requested.unwrap_or_else(default_attr);
+    match validate_mq_attributes(
+        attr.mq_maxmsg as i64,
+        attr.mq_msgsize as i64,
+        limits,
+        cap_sys_resource,
+    ) {
+        Ok(_) => Ok(attr),
+        Err(MqAttributeError::Invalid) => Err(AxError::InvalidInput),
+        Err(MqAttributeError::Overflow) => Err(AxError::from(LinuxError::EOVERFLOW)),
+    }
 }
 
 fn has_queue_permission(queue: &PosixMqueue, access: MqAccess) -> bool {
@@ -663,6 +1061,9 @@ fn has_queue_permission(queue: &PosixMqueue, access: MqAccess) -> bool {
         MqAccess::ReadOnly => read_ok,
         MqAccess::WriteOnly => write_ok,
         MqAccess::ReadWrite => read_ok && write_ok,
+        // `prepare_open()` rejects this access mode for an existing queue
+        // before it ever asks for permission.
+        MqAccess::Unspecified => false,
     }
 }
 
@@ -716,11 +1117,20 @@ fn validate_notify_event(event: &RawSigevent) -> AxResult {
     match event.notify() as u32 {
         SIGEV_NONE | SIGEV_THREAD => Ok(()),
         SIGEV_SIGNAL => {
-            // SIGEV_NONE is the no-signal mode; SIGEV_SIGNAL requires an
-            // actual signal, including when registration is one-shot.
-            let accepted = (1..=64).contains(&event.signo())
-                && Signo::from_repr(event.signo() as u8).is_some();
-            if accepted {
+            // `do_mq_notify()` guards the signal mode with Linux `valid_signal()`,
+            // which only checks the upper bound:
+            //
+            //	static inline int valid_signal(unsigned long sig)
+            //	{
+            //		return sig <= _NSIG ? 1 : 0;
+            //	}
+            //
+            // so `sigev_signo == 0` is a *successful* registration even though
+            // `__do_notify()` then skips it ("do_mq_notify() accepts
+            // sigev_signo == 0, why??") and still consumes the one-shot
+            // registration. A negative signo is converted to a huge unsigned
+            // value by that prototype and stays `-EINVAL`.
+            if (0..=LINUX_NSIG).contains(&event.signo()) {
                 Ok(())
             } else {
                 Err(AxError::InvalidInput)
@@ -757,17 +1167,23 @@ fn build_notifier<M: UserMemory + ?Sized>(
     };
 
     if event.notify() == SIGEV_THREAD as i32 {
-        let netlink =
-            NetlinkSocket::from_fd(event.signo()).map_err(|_| AxError::BadFileDescriptor)?;
+        // `do_mq_notify()` copies the notification cookie before it resolves
+        // the netlink descriptor, so a bad cookie pointer is `-EFAULT` and a
+        // bad descriptor is `-EBADF`, never the other way round.
         let cookie_ptr = event.value_ptr_address() as *const u8;
         let cookie_data =
             vm_load(memory, cookie_ptr, NOTIFY_COOKIE_LEN).map_err(map_usercopy_error)?;
         let mut cookie = [0u8; NOTIFY_COOKIE_LEN];
         cookie.copy_from_slice(&cookie_data);
+        let netlink =
+            NetlinkSocket::from_fd(event.signo()).map_err(|_| AxError::BadFileDescriptor)?;
         notifier.thread = Some(MqThreadNotifier { netlink, cookie });
     } else if event.notify() == SIGEV_SIGNAL as i32
         && let Some(signo) = u8::try_from(event.signo()).ok().and_then(Signo::from_repr)
     {
+        // `sigev_signo == 0` passes `valid_signal()` but has no `Signo`, so the
+        // registration stays record-free: `maybe_notify()` consumes it at the
+        // empty edge and sends nothing, exactly like `__do_notify()`.
         // Linux reserves a sigqueue record when mq_notify registers, not when
         // the empty->nonempty edge consumes the one-shot registration. This
         // makes RT siginfo delivery allocation-free. The sender fields are
@@ -793,24 +1209,153 @@ fn build_notifier<M: UserMemory + ?Sized>(
     Ok(notifier)
 }
 
-fn wait_mq_operation<T>(
-    file: &MqFd,
-    events: IoEvents,
+/// One `wq_sleep()` of `ipc/mqueue.c` for a single mqueue waiter.
+///
+/// `attempt` is the operation's own "is the message there / is there room"
+/// test and runs outside the synchronous block session. `abandon` re-tests the
+/// handoff after the wait gives up, because Linux re-checks
+/// `ext_wait_queue::state` under `info->lock` before reporting `-ETIMEDOUT` or
+/// `-ERESTARTSYS`: a message that was pipelined while the waiter was leaving
+/// still completes the syscall, and a message is never orphaned in a slot whose
+/// owner walked away.
+fn mq_sleep<T>(
+    waker: &WaitQueue,
     deadline: Option<Duration>,
-    operation: impl FnMut() -> AxResult<T>,
-) -> AxResult<T> {
+    state: &mut T,
+    mut attempt: impl FnMut(&mut T) -> AxResult<bool>,
+    mut abandon: impl FnMut(&mut T) -> AxResult<bool>,
+) -> AxResult<()> {
+    let mut failure = None;
+    let mut ready = || match attempt(state) {
+        Ok(ready) => ready,
+        Err(error) => {
+            failure = Some(error);
+            true
+        }
+    };
+
+    // The absolute CLOCK_REALTIME deadline is converted to a remaining
+    // duration on every entry, so a spurious wakeup cannot extend the wait and
+    // an already-expired deadline times out immediately.
+    let waited = match deadline {
+        Some(end) => {
+            waker.wait_timeout_until_interruptible(end.saturating_sub(wall_time()), &mut ready)
+        }
+        None => waker.wait_until_interruptible(&mut ready).map(|()| false),
+    };
+
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    match waited {
+        Ok(false) => Ok(()),
+        Ok(true) => {
+            if abandon(state)? {
+                Ok(())
+            } else {
+                Err(AxError::TimedOut)
+            }
+        }
+        Err(WaitError::Interrupted) => {
+            if abandon(state)? {
+                Ok(())
+            } else {
+                Err(AxError::Interrupted)
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Blocks one `mq_timedsend` until its staged message is accepted.
+fn send_blocking(file: &MqFd, waiter: &Arc<MqSenderWaiter>, deadline: Option<Duration>) -> AxResult<()> {
+    let queue_handle = Arc::clone(&file.queue);
+    let readiness = Arc::clone(&file.readiness);
+    let mut completed = false;
     with_proc_state_hint(ProcStateHint::Interruptible, || {
-        block_on_poll_io_until(
-            file,
-            events,
-            file.is_nonblocking(),
-            false,
-            false,
+        mq_sleep(
+            &waiter.waker,
             deadline,
-            operation,
+            &mut completed,
+            |completed| {
+                if *completed {
+                    return Ok(true);
+                }
+                let publish = {
+                    let mut queue = queue_handle.lock();
+                    match queue.attempt_send(waiter, true)? {
+                        MqSendAttempt::Sent(publish) => {
+                            *completed = true;
+                            publish
+                        }
+                        MqSendAttempt::Sleep => MqPublish::default(),
+                    }
+                };
+                publish.publish(&readiness);
+                Ok(*completed)
+            },
+            |completed| {
+                let mut queue = queue_handle.lock();
+                queue.drop_sender(waiter);
+                if waiter.handed_off.load(Ordering::Acquire) {
+                    *completed = true;
+                }
+                Ok(*completed)
+            },
         )
-        .map_err(|_| AxError::TimedOut)?
     })
+}
+
+/// Blocks one `mq_timedreceive` until a message is owned by the caller.
+fn receive_blocking(
+    file: &MqFd,
+    deadline: Option<Duration>,
+    owned: &mut Option<MqMessage>,
+) -> AxResult<()> {
+    let waiter = MqReceiver::new();
+    let queue_handle = Arc::clone(&file.queue);
+    let readiness = Arc::clone(&file.readiness);
+    let wait = with_proc_state_hint(ProcStateHint::Interruptible, || {
+        mq_sleep(
+            &waiter.waker,
+            deadline,
+            owned,
+            |owned| {
+                if owned.is_some() {
+                    return Ok(true);
+                }
+                let (ready, publish) = {
+                    let mut queue = queue_handle.lock();
+                    match queue.attempt_receive(&waiter, true) {
+                        Some((message, publish)) => {
+                            *owned = Some(message);
+                            (true, publish)
+                        }
+                        None => (false, MqPublish::default()),
+                    }
+                };
+                publish.publish(&readiness);
+                Ok(ready)
+            },
+            |owned| {
+                let mut queue = queue_handle.lock();
+                queue.drop_receiver(&waiter);
+                if owned.is_none() {
+                    *owned = waiter.take_slot();
+                }
+                Ok(owned.is_some())
+            },
+        )
+    });
+    // Every exit path, including a failed block session, must leave
+    // `e_wait_q[RECV]`; a slot filled while giving up still wins over the
+    // reported timeout or interruption.
+    if owned.is_none() {
+        let mut queue = file.queue.lock();
+        queue.drop_receiver(&waiter);
+        *owned = waiter.take_slot();
+    }
+    if owned.is_some() { Ok(()) } else { wait }
 }
 
 fn send_thread_notification(thread: &MqThreadNotifier, state: u8) {
@@ -964,8 +1509,12 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
     mode: __kernel_mode_t,
     attr: *const MqAttr,
 ) -> AxResult<isize> {
+    // Linux `SYSCALL_DEFINE4(mq_open)` copies the requested attributes before
+    // the name is resolved, so a bad attribute pointer is `-EFAULT` even for an
+    // open that would ignore it.
+    let requested_attr = read_create_attr(memory, attr)?;
     let name = normalize_name(memory, name)?;
-    let access = MqAccess::from_flags(oflag)?;
+    let access = MqAccess::from_flags(oflag);
     let create = (oflag as u32) & O_CREAT != 0;
     let excl = (oflag as u32) & O_EXCL != 0;
     let nonblocking = (oflag as u32) & O_NONBLOCK != 0;
@@ -973,12 +1522,18 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
     let curr = current();
     let ipc_ns = curr.as_thread().ipc_ns();
 
-    let mut prepared_attr = None;
-    let (queue, created) = loop {
+    let (queue, created) = {
         let mut manager = ipc_ns.mqueue_manager().lock();
         if let Some(queue) = manager.queues.get(&name).cloned() {
+            // `prepare_open()` decides in this order: `O_CREAT | O_EXCL` on an
+            // existing name is `-EEXIST`, then the reserved `O_RDWR|O_WRONLY`
+            // access mode is `-EINVAL`, and only then is access checked against
+            // the inode mode.
             if create && excl {
                 return Err(AxError::AlreadyExists);
+            }
+            if access == MqAccess::Unspecified {
+                return Err(AxError::InvalidInput);
             }
             {
                 let guard = queue.lock();
@@ -986,32 +1541,32 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
                     return Err(AxError::PermissionDenied);
                 }
             }
-            break (queue, false);
+            (queue, false)
         } else {
             if !create {
                 return Err(AxError::NotFound);
             }
-            if manager.queues.len() >= mq_queues_max() {
+            // `mqueue_create_attr()`: `queues_max` is the first admission
+            // check, and `CAP_SYS_RESOURCE` skips it entirely.
+            let (limits, cap_sys_resource) = create_limits();
+            if manager.queues.len() >= limits.queues && !cap_sys_resource {
                 return Err(LinuxError::ENOSPC.into());
             }
-            let Some(create_attr) = prepared_attr.take() else {
-                // Preserve ignored attributes for an existing queue, but never
-                // fault in user pages while holding the namespace registry.
-                drop(manager);
-                prepared_attr = Some(read_create_attr(memory, attr)?);
-                continue;
-            };
-            let attr = create_attr;
+            let attr = read_created_attributes(requested_attr, limits, cap_sys_resource)?;
+            // `mqueue_get_inode()` charges the full Linux footprint against the
+            // creating task's `RLIMIT_MSGQUEUE`: message area plus one
+            // `struct msg_msg` and one priority-tree node per slot.
+            let charge_bytes = tk_linux_ipc::mqueue_charge_bytes(
+                attr.mq_maxmsg as u64,
+                attr.mq_msgsize as u64,
+            )
+            .ok_or(AxError::from(LinuxError::EOVERFLOW))?;
             let (uid, gid) = current_ids();
             let curr = current();
             let thread = curr.as_thread();
-            let charge_bytes = (attr.mq_maxmsg as usize)
-                .checked_mul(attr.mq_msgsize as usize)
-                .and_then(|payload| payload.checked_add(MQ_INODE_SIZE as usize))
-                .ok_or(AxError::NoMemory)?;
             let charge = ipc_ns.try_charge_mqueue(
                 thread.current_cred().ids().ruid,
-                charge_bytes,
+                usize::try_from(charge_bytes).map_err(|_| AxError::NoMemory)?,
                 thread.proc_data.rlim.read()[linux_raw_sys::general::RLIMIT_MSGQUEUE].current,
             )?;
             let create_mode = (mode & !crate::task::current_fs_context().lock().umask()) & 0o777;
@@ -1026,7 +1581,7 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
             .map_err(|_| AxError::NoMemory)?;
             queue.lock().charge = Some(charge);
             manager.queues.insert(name.clone(), queue.clone());
-            break (queue, true);
+            (queue, true)
         }
     };
 
@@ -1075,11 +1630,7 @@ pub fn sys_mq_unlink<M: UserMemory + ?Sized>(
     let queue = queue.lock();
     let curr = current();
     let cred = curr.as_thread().current_cred();
-    if Kuid::from_raw(queue.uid) != Some(cred.ids().fsuid)
-        && !cred.has_effective_capability(CAP_FOWNER)
-    {
-        return Err(AxError::PermissionDenied);
-    }
+    check_unlink_authority(queue.uid, &cred)?;
     drop(queue);
     let removed = manager.queues.remove(&name);
     drop(removed);
@@ -1094,8 +1645,11 @@ pub fn sys_mq_timedsend<M: UserMemory + ?Sized>(
     msg_prio: u32,
     abs_timeout: *const timespec,
 ) -> AxResult<isize> {
-    validate_priority(msg_prio).map_err(|_| AxError::InvalidInput)?;
+    // `SYSCALL_DEFINE5(mq_timedsend)` prepares the absolute timeout before it
+    // enters `do_mq_timedsend()`, so a bad timespec outranks the priority
+    // check even though the priority is the first thing that function tests.
     let deadline = validate_timespec(memory, abs_timeout)?;
+    validate_priority(msg_prio).map_err(|_| AxError::InvalidInput)?;
     let file = get_mq_fd(fd)?;
     if !file.access.can_write() {
         return Err(AxError::BadFileDescriptor);
@@ -1110,66 +1664,39 @@ pub fn sys_mq_timedsend<M: UserMemory + ?Sized>(
         vm_load(memory, msg_ptr, msg_len).map_err(map_usercopy_error)?
     };
 
-    let mut data = Some(data);
-    wait_mq_operation(&file, IoEvents::WRITABLE, deadline, || {
-        // Snapshot the sender for this successful insertion attempt. Do not
-        // retain `current()` in the queue or notification registration.
-        let sender = current_mq_sender();
-        let (notifier, readiness, sender) = {
+    let waiter = MqSenderWaiter::new(MqOutgoing {
+        priority: msg_prio,
+        sender: current_mq_sender(),
+        data,
+    });
+    if file.is_nonblocking() {
+        // Linux answers a full queue with `-EAGAIN` from `do_mq_timedsend()`
+        // and never publishes the loaded message on `e_wait_q[SEND]`.
+        let publish = {
             let mut queue = file.queue.lock();
-            if queue.messages.len() >= queue.maxmsg {
-                return Err(AxError::WouldBlock);
+            match queue.attempt_send(&waiter, false)? {
+                MqSendAttempt::Sent(publish) => publish,
+                MqSendAttempt::Sleep => return Err(AxError::WouldBlock),
             }
-            let payload = data.take().ok_or(AxError::BadState)?;
-            let notification_sender = sender.clone();
-            let was_empty = queue.insert_message(msg_prio, sender, payload);
-            let notification_sender = if was_empty {
-                // Read the snapshot back from the message which crossed the
-                // empty edge, keeping notification attribution tied to queue
-                // state rather than to a later implicit `current()` lookup.
-                queue
-                    .messages
-                    .first()
-                    .expect("successful insertion makes the queue non-empty")
-                    .sender
-                    .clone()
-            } else {
-                notification_sender
-            };
-            let notifier = if was_empty {
-                queue.notifier.take()
-            } else {
-                None
-            };
-            (notifier, Arc::clone(&queue.readiness), notification_sender)
         };
-        readiness.readable.wake();
-        maybe_notify(notifier, sender);
-        Ok(0)
-    })
+        publish.publish(&file.readiness);
+        return Ok(0);
+    }
+
+    send_blocking(&file, &waiter, deadline)?;
+    Ok(0)
 }
 
 fn try_mq_receive<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
-    queue: &Arc<Mutex<PosixMqueue>>,
     msg_ptr: *mut u8,
-    msg_len: usize,
     msg_prio: *mut u32,
+    message: MqMessage,
 ) -> AxResult<isize> {
-    let (message, readiness) = {
-        let mut queue = queue.lock();
-        if queue.messages.is_empty() {
-            return Err(AxError::WouldBlock);
-        }
-        if msg_len < queue.msgsize {
-            return Err(AxError::from(LinuxError::EMSGSIZE));
-        }
-        let message = queue.pop_message().ok_or(AxError::BadState)?;
-        (message, Arc::clone(&queue.readiness))
-    };
     // Dequeue commits free capacity even if either copyout faults.
-    // Linux wakes a waiting sender before copying priority/data to user.
-    readiness.writable.wake();
+    // Linux wakes a waiting sender before copying priority/data to user, and
+    // the priority store short-circuits the message store exactly as
+    // `put_user(...) || store_msg(...)` does.
     if !msg_prio.is_null() {
         VmMutPtr::vm_write(msg_prio, memory, message.priority).map_err(map_usercopy_error)?;
     }
@@ -1190,10 +1717,32 @@ pub fn sys_mq_timedreceive<M: UserMemory + ?Sized>(
     if !file.access.can_read() {
         return Err(AxError::BadFileDescriptor);
     }
+    {
+        // Linux checks `msg_len < info->attr.mq_msgsize` before it takes
+        // `info->lock`, so a buffer that cannot hold the queue's maximum
+        // message is `-EMSGSIZE` even on an empty queue where `O_NONBLOCK`
+        // would otherwise report `-EAGAIN`.
+        let queue = file.queue.lock();
+        if msg_len < queue.msgsize {
+            return Err(AxError::from(LinuxError::EMSGSIZE));
+        }
+    }
 
-    wait_mq_operation(&file, IoEvents::READABLE, deadline, || {
-        try_mq_receive(memory, &file.queue, msg_ptr, msg_len, msg_prio)
-    })
+    let mut owned = None;
+    if file.is_nonblocking() {
+        let (message, publish) = {
+            let mut queue = file.queue.lock();
+            queue.take_message().ok_or(AxError::WouldBlock)?
+        };
+        publish.publish(&file.readiness);
+        owned = Some(message);
+    } else {
+        receive_blocking(&file, deadline, &mut owned)?;
+    }
+    let Some(message) = owned else {
+        return Err(AxError::WouldBlock);
+    };
+    try_mq_receive(memory, msg_ptr, msg_prio, message)
 }
 
 pub fn sys_mq_notify<M: UserMemory + ?Sized>(
@@ -1344,9 +1893,13 @@ mod tests {
     use alloc::vec;
     use core::{mem::MaybeUninit, ops::Range};
 
+    use tk_linux_ipc::{
+        MQ_MSG_MAX_DEFAULT, MQ_MSGSIZE_MAX_DEFAULT, MQ_QUEUES_MAX_DEFAULT,
+    };
     use tk_linux_usercopy::{UserCopyError, VmResult};
 
     use super::*;
+    use crate::task::{Cred, CredentialSlot};
 
     #[test]
     fn attribute_copyout_does_not_hold_queue_or_namespace_locks() {
@@ -1432,15 +1985,15 @@ mod tests {
                 )
                 .unwrap(),
             ));
-            queue.lock().insert_message(
-                3,
-                MqSender {
+            queue.lock().insert_message(MqOutgoing {
+                priority: 3,
+                sender: MqSender {
                     pid: 1,
                     real_uid: Kuid::INITIAL_ROOT,
                     pid_ns: pid_ns.clone(),
                 },
-                vec![1, 2, 3, 4],
-            );
+                data: vec![1, 2, 3, 4],
+            });
             let readiness = queue.lock().readiness.clone();
             let sender = Arc::new(SenderWake {
                 count: AtomicUsize::new(0),
@@ -1457,8 +2010,15 @@ mod tests {
             } else {
                 (8_usize as *mut u8, core::ptr::null_mut())
             };
+            let (message, publish) = queue
+                .lock()
+                .take_message()
+                .expect("the test inserted one message");
+            // Linux frees the capacity and wakes waiters before touching user
+            // memory, so the wake must not be deferred behind the copyout.
+            publish.publish(&readiness);
             assert_eq!(
-                try_mq_receive(&mut memory, &queue, data, 4, priority),
+                try_mq_receive(&mut memory, data, priority, message),
                 Err(AxError::BadAddress)
             );
             drop(memory);
@@ -1469,6 +2029,282 @@ mod tests {
             assert!(queue.lock().messages.is_empty());
             readiness.writable.cancel(token);
         }
+    }
+
+    /// A queue plus the namespaces a handoff test needs. The namespace is
+    /// returned because a queue only holds a weak edge to it.
+    fn handoff_queue(
+        maxmsg: isize,
+        msgsize: isize,
+    ) -> (Arc<Mutex<PosixMqueue>>, Arc<PidNamespace>, Arc<IpcNamespace>) {
+        let user_ns = UserNamespace::try_new_root().unwrap();
+        let pid_ns = PidNamespace::try_new_root(user_ns.clone()).unwrap();
+        let ipc_ns = IpcNamespace::try_new(user_ns).unwrap();
+        let mut attr = default_attr();
+        attr.mq_maxmsg = maxmsg;
+        attr.mq_msgsize = msgsize;
+        let queue = Arc::new(Mutex::new(
+            PosixMqueue::new(
+                FsNameBuf::from_vec(b"handoff".to_vec()).unwrap(),
+                0o600,
+                0,
+                0,
+                attr,
+                &ipc_ns,
+            )
+            .unwrap(),
+        ));
+        (queue, pid_ns, ipc_ns)
+    }
+
+    fn handoff_sender(pid_ns: &Arc<PidNamespace>, priority: u32, data: &[u8]) -> Arc<MqSenderWaiter> {
+        MqSenderWaiter::new(MqOutgoing {
+            priority,
+            sender: MqSender {
+                pid: 1,
+                real_uid: Kuid::INITIAL_ROOT,
+                pid_ns: pid_ns.clone(),
+            },
+            data: data.to_vec(),
+        })
+    }
+
+    /// A registration the queue can hold without a live socket or signal.
+    fn handoff_notifier(ipc_ns: &Arc<IpcNamespace>) -> MqNotifier {
+        MqNotifier {
+            pid: 1,
+            ipc_ns: Some(Arc::downgrade(ipc_ns)),
+            notify: SIGEV_NONE as i32,
+            thread: None,
+            signal: None,
+            registration: new_notification_token().unwrap(),
+        }
+    }
+
+    #[test]
+    fn pipelined_send_bypasses_the_queue_and_the_notification() {
+        let (queue, pid_ns, ipc_ns) = handoff_queue(1, 8);
+        let receiver = MqReceiver::new();
+        {
+            let mut queue = queue.lock();
+            queue.notifier = Some(handoff_notifier(&ipc_ns));
+            queue.park_receiver(&receiver);
+        }
+
+        let waiter = handoff_sender(&pid_ns, 9, b"direct");
+        let publish = {
+            let mut queue = queue.lock();
+            match queue.attempt_send(&waiter, true).unwrap() {
+                MqSendAttempt::Sent(publish) => publish,
+                MqSendAttempt::Sleep => panic!("a parked receiver accepts without queueing"),
+            }
+        };
+
+        // Linux `pipelined_send()` stores into the waiter's message and never
+        // touches `msg_tree`, so the queue stays empty and `__do_notify()` is
+        // not reached: the registration survives for the next empty edge.
+        assert!(queue.lock().messages.is_empty());
+        assert!(queue.lock().notifier.is_some());
+        assert!(publish.receiver.is_some());
+        assert!(!publish.readable);
+        assert!(publish.notify.is_none());
+        assert!(queue.lock().receivers.is_empty());
+        assert!(!receiver.queued.load(Ordering::Acquire));
+
+        let message = receiver.take_slot().expect("the receiver owns the message");
+        assert_eq!(message.priority, 9);
+        assert_eq!(message.data, b"direct".to_vec());
+        assert!(receiver.take_slot().is_none());
+    }
+
+    #[test]
+    fn tree_insert_consumes_the_notification_only_on_the_empty_edge() {
+        let (queue, pid_ns, ipc_ns) = handoff_queue(4, 8);
+        queue.lock().notifier = Some(handoff_notifier(&ipc_ns));
+
+        let first = handoff_sender(&pid_ns, 1, b"one");
+        let publish = {
+            let mut queue = queue.lock();
+            match queue.attempt_send(&first, true).unwrap() {
+                MqSendAttempt::Sent(publish) => publish,
+                MqSendAttempt::Sleep => panic!("an empty queue accepts"),
+            }
+        };
+        assert!(publish.readable);
+        assert!(publish.notify.is_some());
+        assert!(queue.lock().notifier.is_none());
+
+        let second = handoff_sender(&pid_ns, 2, b"two");
+        let publish = {
+            let mut queue = queue.lock();
+            match queue.attempt_send(&second, true).unwrap() {
+                MqSendAttempt::Sent(publish) => publish,
+                MqSendAttempt::Sleep => panic!("a queue below maxmsg accepts"),
+            }
+        };
+        assert!(publish.readable);
+        assert!(publish.notify.is_none());
+        assert_eq!(queue.lock().messages.len(), 2);
+    }
+
+    #[test]
+    fn pipelined_receive_hands_the_freed_slot_to_the_oldest_sender() {
+        let (queue, pid_ns, _ipc_ns) = handoff_queue(1, 8);
+        let first = handoff_sender(&pid_ns, 1, b"first");
+        let second = handoff_sender(&pid_ns, 2, b"second");
+        {
+            let mut queue = queue.lock();
+            queue.insert_message(MqOutgoing {
+                priority: 5,
+                sender: MqSender {
+                    pid: 1,
+                    real_uid: Kuid::INITIAL_ROOT,
+                    pid_ns: pid_ns.clone(),
+                },
+                data: b"stored".to_vec(),
+            });
+            queue.park_sender(&first);
+            queue.park_sender(&second);
+        }
+
+        let (message, publish) = queue.lock().take_message().unwrap();
+        assert_eq!(message.data, b"stored".to_vec());
+        // Linux `pipelined_receive()` inserts the first sleeping sender's
+        // message into the freed slot instead of waking it to contend, and it
+        // wakes `e_wait_q[SEND]` in FIFO order (`wq_add()` appends), so the
+        // older waiter wins.
+        assert!(first.handed_off.load(Ordering::Acquire));
+        assert!(!second.handed_off.load(Ordering::Acquire));
+        assert!(publish.sender.is_some());
+        assert!(!publish.writable);
+        let queue_guard = queue.lock();
+        assert_eq!(queue_guard.messages.len(), 1);
+        assert_eq!(queue_guard.messages[0].data, b"first".to_vec());
+        assert_eq!(queue_guard.senders.len(), 1);
+        assert!(queue_guard.receivers.is_empty());
+        drop(queue_guard);
+        assert!(Arc::ptr_eq(queue.lock().senders.first().unwrap(), &second));
+
+        let publish = {
+            let mut queue = queue.lock();
+            match queue.attempt_send(&first, true).unwrap() {
+                MqSendAttempt::Sent(publish) => publish,
+                MqSendAttempt::Sleep => panic!("the handoff already committed"),
+            }
+        };
+        // The sender's second attempt observes the completed handoff and must
+        // not insert the staged message a second time.
+        assert!(publish.notify.is_none());
+        assert!(!publish.readable);
+        assert_eq!(queue.lock().messages.len(), 1);
+    }
+
+    #[test]
+    fn abandoning_a_receiver_still_claims_a_pipelined_message() {
+        let (queue, pid_ns, _ipc_ns) = handoff_queue(1, 8);
+        let receiver = MqReceiver::new();
+        queue.lock().park_receiver(&receiver);
+
+        let waiter = handoff_sender(&pid_ns, 3, b"kept");
+        let publish = {
+            let mut queue = queue.lock();
+            match queue.attempt_send(&waiter, true).unwrap() {
+                MqSendAttempt::Sent(publish) => publish,
+                MqSendAttempt::Sleep => panic!("a parked receiver accepts"),
+            }
+        };
+        assert!(publish.receiver.is_some());
+
+        // `mq_sleep()`'s abandon path: leave `e_wait_q[RECV]`, then re-check
+        // the handoff. The message must still reach the caller that is timing
+        // out, never the empty queue or a dropped slot.
+        let claimed = {
+            let mut queue = queue.lock();
+            queue.drop_receiver(&receiver);
+            receiver.take_slot()
+        };
+        assert_eq!(claimed.expect("the pipelined message survives").data, b"kept".to_vec());
+        assert!(queue.lock().messages.is_empty());
+    }
+
+    #[test]
+    fn create_attribute_admission_uses_namespace_limits_and_capability() {
+        let limits = MqLimits {
+            queues: MQ_QUEUES_MAX_DEFAULT,
+            max_messages: MQ_MSG_MAX_DEFAULT,
+            max_message_size: MQ_MSGSIZE_MAX_DEFAULT,
+        };
+        let attr = |maxmsg: isize, msgsize: isize| MqAttr {
+            mq_flags: 0,
+            mq_maxmsg: maxmsg,
+            mq_msgsize: msgsize,
+            mq_curmsgs: 0,
+            __reserved: [0; 4],
+        };
+
+        // `EINVAL` from the size checks precedes any arithmetic outcome, and
+        // `CAP_SYS_RESOURCE` replaces the namespace maxima with HARD_MSGMAX /
+        // HARD_MSGSIZEMAX.
+        assert!(matches!(
+            read_created_attributes(Some(attr(0, 64)), limits, true),
+            Err(AxError::InvalidInput)
+        ));
+        assert!(matches!(
+            read_created_attributes(Some(attr(100, 64)), limits, false),
+            Err(AxError::InvalidInput)
+        ));
+        assert!(read_created_attributes(Some(attr(100, 64)), limits, true).is_ok());
+        assert!(read_created_attributes(Some(attr(65_537, 1)), limits, true).is_err());
+        assert!(matches!(
+            read_created_attributes(Some(attr(1, 16 * 1024 * 1024 + 1)), limits, true),
+            Err(AxError::InvalidInput)
+        ));
+        // `ipc/mqueue.c` defaults to `min(mq_msg_max, DFLT_MSGMAX)` rather than
+        // to the raw namespace maximum.
+        let default = read_created_attributes(None, limits, false).unwrap();
+        assert_eq!(default.mq_maxmsg, MQ_MSG_MAX_DEFAULT as isize);
+        assert_eq!(default.mq_msgsize, MQ_MSGSIZE_MAX_DEFAULT as isize);
+    }
+
+    #[test]
+    fn unlink_authority_maps_linux_sticky_directory_outcomes() {
+        let _context = crate::test_support::scheduler_test_context();
+        let namespace = UserNamespace::try_new_root().unwrap();
+        let slot = CredentialSlot::new(Cred::try_root(namespace).unwrap());
+        let owner_fsuid = Kuid::from_raw(1000).unwrap();
+        let owner_fsgid = Kgid::from_raw(1000).unwrap();
+        // `check_sticky()` exemption needs `CAP_FOWNER` to be absent from the
+        // effective set, which only a capability-free credential proves.
+        slot.replace_capabilities_for_test(&[], &[]).unwrap();
+
+        // The queue owner passes both `may_delete_dentry()` and
+        // `check_sticky()`.
+        let queue_owner = slot.replace_fs_ids_for_test(owner_fsuid, owner_fsgid).unwrap();
+        assert_eq!(check_unlink_authority(1000, &queue_owner), Ok(()));
+        // A foreign queue in the root-owned sticky 01777 directory is `-EPERM`
+        // from `check_sticky()`, not the `-EACCES` of a directory permission
+        // failure.
+        assert_eq!(
+            check_unlink_authority(0, &queue_owner),
+            Err(AxError::from(LinuxError::EPERM))
+        );
+        // `check_sticky()` also accepts the owner of the directory itself.
+        let directory_owner = slot
+            .replace_fs_ids_for_test(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT)
+            .unwrap();
+        assert_eq!(check_unlink_authority(1000, &directory_owner), Ok(()));
+        // ... and `CAP_FOWNER` bypasses it entirely.
+        let capable = slot
+            .replace_fs_ids_for_test(owner_fsuid, owner_fsgid)
+            .unwrap();
+        assert_eq!(
+            check_unlink_authority(0, &capable),
+            Err(AxError::from(LinuxError::EPERM))
+        );
+        let capable = slot
+            .replace_capabilities_for_test(&[CAP_FOWNER], &[CAP_FOWNER])
+            .unwrap();
+        assert_eq!(check_unlink_authority(0, &capable), Ok(()));
     }
 
     struct TestMemory {
@@ -1503,21 +2339,37 @@ mod tests {
     }
 
     #[test]
-    fn signal_notification_rejects_zero_signo_but_none_ignores_it() {
+    fn signal_notification_accepts_the_valid_signal_boundary() {
         let mut provider = TestMemory {
             bytes: vec![0; size_of::<RawSigevent>()],
         };
         let notify_offset = core::mem::offset_of!(linux_raw_sys::general::sigevent, sigev_notify);
-        for (notify, expected) in [
-            (SIGEV_SIGNAL, Err(AxError::InvalidInput)),
-            (SIGEV_NONE, Ok(())),
+        let signo_offset = core::mem::offset_of!(linux_raw_sys::general::sigevent, sigev_signo);
+        // Linux `valid_signal()` is `sig <= _NSIG`: 0 and 64 register, a
+        // negative signo or anything above _NSIG is `-EINVAL`.
+        for (notify, signo, expected) in [
+            (SIGEV_SIGNAL, 0, Ok(())),
+            (SIGEV_SIGNAL, 1, Ok(())),
+            (SIGEV_SIGNAL, 64, Ok(())),
+            (SIGEV_SIGNAL, 65, Err(AxError::InvalidInput)),
+            (SIGEV_SIGNAL, -1, Err(AxError::InvalidInput)),
+            (SIGEV_SIGNAL, i32::MIN, Err(AxError::InvalidInput)),
+            (SIGEV_NONE, 0, Ok(())),
+            (SIGEV_THREAD, -1, Ok(())),
         ] {
             provider.bytes[notify_offset..notify_offset + 4]
                 .copy_from_slice(&(notify as i32).to_ne_bytes());
+            provider.bytes[signo_offset..signo_offset + 4]
+                .copy_from_slice(&signo.to_ne_bytes());
             let mut memory = UserMemoryContext::new(&mut provider);
             let event = RawSigevent::read_from_user(&mut memory, core::ptr::null()).unwrap();
-            assert_eq!(validate_notify_event(&event), expected);
+            assert_eq!(validate_notify_event(&event), expected, "{notify}/{signo}");
         }
+        // The accepted zero signo has no `Signo`, so `build_notifier()` leaves
+        // `signal` empty and `maybe_notify()` consumes the one-shot without
+        // delivering anything, like `__do_notify()` does.
+        assert!(Signo::from_repr(0).is_none());
+        assert!(Signo::from_repr(64).is_some());
     }
 
     #[test]
@@ -1526,7 +2378,9 @@ mod tests {
             bytes: vec![0; 128],
         };
         let name_addr = 3;
-        provider.bytes[name_addr..name_addr + 8].copy_from_slice(b"/queue\0\0");
+        // Kernel queue names carry no leading slash: libc strips it before the
+        // syscall, and `lookup_noperm_common()` rejects every '/'.
+        provider.bytes[name_addr..name_addr + 8].copy_from_slice(b"queue\0\0\0");
         let attr_addr = 19;
         let attr = MqAttr {
             mq_flags: O_NONBLOCK as isize,
@@ -1548,6 +2402,7 @@ mod tests {
         };
 
         assert_eq!(name.as_bytes(), b"queue");
+        let copied_attr = copied_attr.expect("a non-null attribute pointer is copied");
         assert_eq!(copied_attr.mq_flags, 0);
         assert_eq!(copied_attr.mq_maxmsg, 4);
         assert_eq!(copied_attr.mq_msgsize, 64);
