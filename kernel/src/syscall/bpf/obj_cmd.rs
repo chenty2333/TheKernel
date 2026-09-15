@@ -4,7 +4,7 @@ use core::mem::{offset_of, size_of};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::FsPathBuf;
-use linux_raw_sys::general::{AT_FDCWD, O_CREAT, O_EXCL, O_RDONLY};
+use linux_raw_sys::general::AT_FDCWD;
 use thekernel_linux_usercopy::{UserMemory, UserMemoryContext};
 
 use crate::{
@@ -22,7 +22,7 @@ use crate::{
         get_file_like, resolve_at,
     },
     mounts,
-    syscall::fs::openat_inner,
+    task::AsThread,
 };
 
 fn object_path<M: UserMemory + ?Sized>(
@@ -127,18 +127,16 @@ pub fn bpf_obj_pin<M: UserMemory + ?Sized>(
         PinnedObject::Program(program.prog.clone())
     } else if let Some(btf) = source.downcast_ref::<BpfBtfFd>() {
         PinnedObject::Btf(btf.object.clone())
-    } else if source.downcast_ref::<BpfPerfEventLink>().is_some() {
-        PinnedObject::PerfEventLink(BpfPerfEventLink::from_fd(attr.bpf_fd as _)?.clone_object())
-    } else if source.downcast_ref::<BpfIterLink>().is_some() {
-        PinnedObject::IterLink(BpfIterLink::from_fd(attr.bpf_fd as _)?.clone_object())
-    } else if source.downcast_ref::<BpfLsmLink>().is_some() {
-        PinnedObject::LsmLink(BpfLsmLink::from_fd(attr.bpf_fd as _)?.clone_object())
-    } else if source.downcast_ref::<BpfNetworkLink>().is_some() {
-        PinnedObject::NetworkLink(BpfNetworkLink::from_fd(attr.bpf_fd as _)?.clone_object())
-    } else if source.downcast_ref::<BpfRawTracepointLink>().is_some() {
-        PinnedObject::RawTracepointLink(
-            BpfRawTracepointLink::from_fd(attr.bpf_fd as _)?.clone_object(),
-        )
+    } else if let Ok(link) = source.clone_object().downcast_arc::<BpfPerfEventLink>() {
+        PinnedObject::PerfEventLink(link)
+    } else if let Ok(link) = source.clone_object().downcast_arc::<BpfIterLink>() {
+        PinnedObject::IterLink(link)
+    } else if let Ok(link) = source.clone_object().downcast_arc::<BpfLsmLink>() {
+        PinnedObject::LsmLink(link)
+    } else if let Ok(link) = source.clone_object().downcast_arc::<BpfNetworkLink>() {
+        PinnedObject::NetworkLink(link)
+    } else if let Ok(link) = source.clone_object().downcast_arc::<BpfRawTracepointLink>() {
+        PinnedObject::RawTracepointLink(link)
     } else {
         return Err(AxError::InvalidInput);
     };
@@ -153,16 +151,31 @@ pub fn bpf_obj_pin<M: UserMemory + ?Sized>(
     parent.check_is_dir()?;
     require_bpffs(&parent)?;
     let mut reservation = reserve_pin_slot()?;
-    let fd = openat_inner(path_fd, &path, (O_RDONLY | O_CREAT | O_EXCL) as i32, 0o600)?;
-    // The just-created inode cannot be raced through this pathname because
-    // O_EXCL made it ours. Resolve it again to obtain the authoritative mount
-    // and generation-aware dentry identity used by the pin registry.
-    let target = resolve_at(path_fd, Some(&path), 0)?
-        .into_file()
-        .ok_or(AxError::InvalidInput)?;
-    require_bpffs(&target)?;
-    publish_pin(&mut reservation, &target, object)?;
-    crate::file::close_file_like(fd as i32)?;
+    let operation = mounts::namespace_operation();
+    let current = axtask::current();
+    let thread = current.as_thread();
+    let security = crate::file::permission::VfsSecurityContext::new(thread.current_cred());
+    let name =
+        axfs_ng_vfs::FsName::new(path.as_bytes().rsplit(|byte| *byte == b'/').next().unwrap());
+    // Create the inode directly: publishing a temporary FD would allow a
+    // CLONE_FILES peer to close/recycle it, and re-resolving the path could pin
+    // an attacker's replacement inode after rename/unlink.
+    let umask = thread.fs_context().lock().umask();
+    let target = crate::file::namespace_mutation::create_named(
+        &operation,
+        &parent,
+        name,
+        axfs_ng_vfs::NodeType::RegularFile,
+        axfs_ng_vfs::NodePermission::from_bits_truncate(0o600),
+        umask,
+        None,
+        &security,
+    )?;
+    if let Err(error) = publish_pin(&mut reservation, &target, object) {
+        // Identity-checked rollback must never unlink a replacement pathname.
+        let _ = parent.unlink_checked(name, false, &target);
+        return Err(error);
+    }
     Ok(0)
 }
 

@@ -100,6 +100,28 @@ struct MapValue {
 struct Reservation {
     map: Arc<dyn BpfMap>,
     data: Vec<u8>,
+    reserved_bytes: usize,
+}
+impl Reservation {
+    fn finish(mut self, submit: bool, flags: u64) -> AxResult<()> {
+        if submit {
+            self.map
+                .ringbuf_submit(core::mem::take(&mut self.data), flags)?;
+        } else {
+            self.map.ringbuf_discard(self.reserved_bytes, flags)?;
+        }
+        self.reserved_bytes = 0;
+        Ok(())
+    }
+}
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if self.reserved_bytes != 0 {
+            // Failed submission (including allocation failure), invalid flags,
+            // and aborted executions must all return their outstanding charge.
+            let _ = self.map.ringbuf_discard(self.reserved_bytes, 0);
+        }
+    }
 }
 #[derive(Default)]
 struct Resources {
@@ -636,14 +658,23 @@ impl LinuxHelpers<'_> {
                 };
                 let size = size as usize;
                 let mut r = self.resources.borrow_mut();
-                if r.remaining < size as u64 || map.ringbuf_reserve(size, flags).is_err() {
+                if r.remaining < size as u64 || size == 0 || size > map.max_entries() as usize {
                     return Ok(axbpf::Value::Scalar(0));
                 }
+                let mut data = Vec::new();
+                if r.reservations.try_reserve(1).is_err()
+                    || data.try_reserve_exact(size).is_err()
+                    || map.ringbuf_reserve(size, flags).is_err()
+                {
+                    return Ok(axbpf::Value::Scalar(0));
+                }
+                data.resize(size, 0);
                 r.remaining -= size as u64;
                 let token = RING_TOKEN_BASE + r.reservations.len() as u64;
                 r.reservations.push(Some(Reservation {
                     map,
-                    data: vec![0; size],
+                    data,
+                    reserved_bytes: size,
                 }));
                 Ok(axbpf::Value::Pointer(axbpf::Capability {
                     region: axbpf::MemoryRegion::RingReservation,
@@ -668,13 +699,7 @@ impl LinuxHelpers<'_> {
                     return Ok(Self::error());
                 };
                 let flags = Self::scalar(a[1]).unwrap_or(0);
-                let out = if id == BPF_FUNC_RINGBUF_SUBMIT {
-                    reservation.map.ringbuf_submit(reservation.data, flags)
-                } else {
-                    reservation
-                        .map
-                        .ringbuf_discard(reservation.data.len(), flags)
-                };
+                let out = reservation.finish(id == BPF_FUNC_RINGBUF_SUBMIT, flags);
                 if out.is_ok() {
                     Ok(axbpf::Value::Scalar(0))
                 } else {
@@ -892,5 +917,55 @@ fn runtime_error(e: axbpf::RuntimeError) -> AxError {
         axbpf::RuntimeError::StepLimit => AxError::ResourceBusy,
         axbpf::RuntimeError::Memory | axbpf::RuntimeError::Bounds => AxError::BadAddress,
         _ => AxError::InvalidInput,
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+
+    fn reserved_map() -> (Arc<dyn BpfMap>, Reservation) {
+        let map =
+            crate::bpf::map::create_map(BPF_MAP_TYPE_RINGBUF, 0, 0, 8, 0, [0; BPF_OBJ_NAME_LEN], 1)
+                .unwrap();
+        map.ringbuf_reserve(4, 0).unwrap();
+        let reservation = Reservation {
+            map: map.clone(),
+            data: vec![0; 4],
+            reserved_bytes: 4,
+        };
+        (map, reservation)
+    }
+
+    #[test]
+    fn failed_submit_refunds_reservation_without_consuming_other_charges() {
+        let (map, reservation) = reserved_map();
+        map.ringbuf_reserve(4, 0).unwrap();
+        assert_eq!(
+            reservation.finish(true, u64::MAX),
+            Err(AxError::InvalidInput)
+        );
+        map.ringbuf_reserve(4, 0).unwrap();
+        assert_eq!(map.ringbuf_reserve(1, 0), Err(AxError::NoMemory));
+        map.ringbuf_discard(8, 0).unwrap();
+    }
+
+    #[test]
+    fn aborted_execution_refunds_pending_reservations() {
+        let (map, reservation) = reserved_map();
+        let mut resources = Resources::default();
+        resources.reservations.push(Some(reservation));
+        drop(resources);
+        map.ringbuf_reserve(8, 0).unwrap();
+    }
+
+    #[test]
+    fn successful_submit_does_not_refund_another_reservation() {
+        let (map, reservation) = reserved_map();
+        map.ringbuf_reserve(4, 0).unwrap();
+        reservation.finish(true, 0).unwrap();
+        assert_eq!(map.ringbuf_reserve(1, 0), Err(AxError::NoMemory));
+        map.ringbuf_discard(4, 0).unwrap();
+        map.ringbuf_reserve(4, 0).unwrap();
     }
 }

@@ -8,14 +8,17 @@ use core::{
 use axerrno::{AxError, AxResult};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::{
-    B38400, CREAD, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ICANON, ICRNL, IGNCR, ISIG, ONLCR, OPOST,
-    VEOF, VEOL, VERASE, VINTR, VKILL, VMIN, VQUIT, VSTART, VSTOP, VTIME, speed_t, tcflag_t,
+    B38400, BRKINT, CREAD, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ICANON, ICRNL, IGNCR, ISIG, NOFLSH,
+    ONLCR, OPOST, VEOF, VEOL, VERASE, VINTR, VKILL, VMIN, VQUIT, VSTART, VSTOP, VSUSP, VTIME,
+    speed_t, tcflag_t,
 };
 use thekernel_linux_signal::Signo;
 
-const SUPPORTED_IFLAG_CHANGES: tcflag_t = ICRNL | IGNCR;
+// These byte-stream transports do not report hardware BREAK events. BRKINT
+// is retained for libc raw/cbreak profiles; a NUL byte is not a BREAK event.
+const SUPPORTED_IFLAG_CHANGES: tcflag_t = ICRNL | IGNCR | BRKINT;
 const SUPPORTED_OFLAG_CHANGES: tcflag_t = OPOST | ONLCR;
-const SUPPORTED_LFLAG_CHANGES: tcflag_t = ICANON | ECHO | ISIG | ECHOE | ECHOK | ECHOCTL;
+const SUPPORTED_LFLAG_CHANGES: tcflag_t = ICANON | ECHO | ISIG | ECHOE | ECHOK | ECHOCTL | NOFLSH;
 
 const _: () = {
     assert!(size_of::<Termio>() == 18);
@@ -143,6 +146,7 @@ impl Default for Termios {
         for (i, ch) in [
             (VINTR, ctl(b'C')),
             (VQUIT, ctl(b'\\')),
+            (VSUSP, ctl(b'Z')),
             (VERASE, b'\x7f'),
             (VKILL, ctl(b'U')),
             (VEOF, ctl(b'D')),
@@ -222,6 +226,8 @@ impl Termios {
             Some(Signo::SIGINT)
         } else if self.matches_special_char(VQUIT, ch) {
             Some(Signo::SIGQUIT)
+        } else if self.matches_special_char(VSUSP, ch) {
+            Some(Signo::SIGTSTP)
         } else {
             None
         }
@@ -238,17 +244,20 @@ impl Termios {
         {
             return Err(AxError::OperationNotSupported);
         }
-        // Canonical signal delivery is implemented. Noncanonical ISIG also
-        // requires Linux's input/output flush and signal-byte consumption
-        // rules, so reject that state instead of publishing a partial mode.
-        if !self.has_lflag(ICANON) && self.has_lflag(ISIG) {
-            return Err(AxError::OperationNotSupported);
-        }
-
         for index in 0..self.c_cc.len() {
             let supported = matches!(
                 index as u32,
-                VINTR | VQUIT | VERASE | VKILL | VEOF | VEOL | VMIN | VTIME | VSTART | VSTOP
+                VINTR
+                    | VQUIT
+                    | VSUSP
+                    | VERASE
+                    | VKILL
+                    | VEOF
+                    | VEOL
+                    | VMIN
+                    | VTIME
+                    | VSTART
+                    | VSTOP
             );
             if !supported && self.c_cc[index] != current.c_cc[index] {
                 return Err(AxError::OperationNotSupported);
@@ -423,12 +432,27 @@ mod tests {
         assert_eq!(current.termios.c_iflag, ICRNL);
         assert_eq!(current.termios.c_cc[VTIME as usize], 0);
 
-        let mut partial_noncanonical_signals = current;
-        partial_noncanonical_signals.termios.c_lflag &= !ICANON;
-        assert_eq!(
-            partial_noncanonical_signals.validate_update(&current),
-            Err(AxError::OperationNotSupported)
-        );
+        let mut cbreak = current;
+        cbreak.termios.c_lflag &= !ICANON;
+        assert_eq!(cbreak.validate_update(&current), Ok(()));
+    }
+
+    #[test]
+    fn cpython_pyrepl_prepare_and_restore_termios_are_supported() {
+        use linux_raw_sys::general::{CSIZE, IEXTEN, INPCK, ISTRIP, PARENB};
+        let current = Termios2::default();
+        let mut raw = current;
+        raw.termios.c_iflag &= !(INPCK | ISTRIP | IXON);
+        raw.termios.c_iflag |= BRKINT;
+        raw.termios.c_oflag &= !OPOST;
+        raw.termios.c_cflag &= !(CSIZE | PARENB);
+        raw.termios.c_cflag |= CS8;
+        raw.termios.c_lflag &= !(ICANON | ECHO | IEXTEN);
+        raw.termios.c_lflag |= ISIG;
+        raw.termios.c_cc[VMIN as usize] = 1;
+        raw.termios.c_cc[VTIME as usize] = 0;
+        assert_eq!(raw.validate_update(&current), Ok(()));
+        assert_eq!(current.validate_update(&raw), Ok(()));
     }
 
     #[test]

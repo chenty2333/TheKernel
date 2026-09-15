@@ -3028,3 +3028,36 @@ fn explicit_unpossessed_search_does_not_borrow_an_independent_possession() {
 fn encrypted_key_type_is_not_advertised_without_a_real_type_backend() {
     assert_eq!(KeyTypeKind::from_name("encrypted"), None);
 }
+
+#[test]
+fn exiting_constructor_retires_key_and_both_authority_indexes() {
+    let mut manager = KeyManager::new();
+    let requester = actor(100, 100, 1000, 1000);
+    let RequestKeyBegin::Construction(request) = manager
+        .begin_request_key(
+            &requester,
+            KeyTypeKind::User,
+            "abandoned",
+            Some("upcall"),
+            0,
+        )
+        .unwrap()
+    else {
+        panic!("expected construction");
+    };
+    manager
+        .install_construction_authority(request.serial, 101)
+        .unwrap();
+    manager
+        .exit_committed(KeyTaskOwner::new(101, 101), true)
+        .unwrap();
+    assert!(!manager.keys.contains_key(&request.serial));
+    assert!(!manager.construction_authorities.contains_key(&101));
+    assert!(
+        !manager
+            .pending_constructions
+            .values()
+            .any(|serial| *serial == request.serial)
+    );
+    assert_accounting_consistent(&manager);
+}

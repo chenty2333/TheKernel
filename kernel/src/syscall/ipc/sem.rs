@@ -809,30 +809,37 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
         IpcAccessContext::for_ipc_namespace(current_task.as_thread().current_cred(), &ipc_ns);
     let cmd = strip_ipc64(cmd);
 
-    if cmd == IPC_INFO {
-        let manager = ipc_ns.sem_manager().lock();
-        write_sem_info(memory, arg as *mut SemInfo, SemInfo::ipc_info())?;
-        return Ok(manager.max_active_index());
-    }
-    if cmd == SEM_INFO {
-        let manager = ipc_ns.sem_manager().lock();
-        write_sem_info(memory, arg as *mut SemInfo, SemInfo::sem_info(&manager))?;
-        return Ok(manager.max_active_index());
+    if cmd == IPC_INFO || cmd == SEM_INFO {
+        let (info, index) = {
+            let manager = ipc_ns.sem_manager().lock();
+            let info = if cmd == IPC_INFO {
+                SemInfo::ipc_info()
+            } else {
+                SemInfo::sem_info(&manager)
+            };
+            (info, manager.max_active_index())
+        };
+        write_sem_info(memory, arg as *mut SemInfo, info)?;
+        return Ok(index);
     }
     if cmd == SEM_STAT || cmd == SEM_STAT_ANY {
-        let manager = ipc_ns.sem_manager().lock();
-        let array = manager
+        let array = ipc_ns
+            .sem_manager()
+            .lock()
             .get_array_by_semid(semid)
             .ok_or(AxError::from(LinuxError::EINVAL))?;
-        let array = array.lock();
-        if array.removed {
-            return Err(AxError::from(LinuxError::EINVAL));
-        }
-        if cmd == SEM_STAT && !array.readable(&context) {
-            return Err(AxError::from(LinuxError::EACCES));
-        }
-        write_semid_ds(memory, arg as *mut SemidDs, array.semid_ds)?;
-        return Ok(array.semid as isize);
+        let (snapshot, id) = {
+            let array = array.lock();
+            if array.removed {
+                return Err(AxError::from(LinuxError::EINVAL));
+            }
+            if cmd == SEM_STAT && !array.readable(&context) {
+                return Err(AxError::from(LinuxError::EACCES));
+            }
+            (array.semid_ds, array.semid)
+        };
+        write_semid_ds(memory, arg as *mut SemidDs, snapshot)?;
+        return Ok(id as isize);
     }
 
     let array = {
@@ -895,7 +902,9 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
             if !array.readable(&context) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
-            write_semid_ds(memory, arg as *mut SemidDs, array.semid_ds)?;
+            let snapshot = array.semid_ds;
+            drop(array);
+            write_semid_ds(memory, arg as *mut SemidDs, snapshot)?;
             Ok(0)
         }
         IPC_SET => {
@@ -951,7 +960,11 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
             if !array.readable(&context) {
                 return Err(AxError::from(LinuxError::EACCES));
             }
-            let values = array.sems.iter().map(|sem| sem.value).collect::<Vec<_>>();
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(array.sems.len())
+                .map_err(|_| AxError::NoMemory)?;
+            values.extend(array.sems.iter().map(|sem| sem.value));
             drop(array);
             copy_sem_values_to_user(memory, arg, &values)?;
             Ok(0)

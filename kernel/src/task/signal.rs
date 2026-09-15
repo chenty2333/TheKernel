@@ -1081,7 +1081,12 @@ pub fn send_signal_to_process_group(pgid: Pid, sig: Option<SignalInfo>) -> AxRes
             if proc.is_zombie() {
                 continue;
             }
-            send_signal_to_process(proc.pid(), Some(sig.clone()))?;
+            match send_signal_to_process(proc.pid(), Some(sig.clone())) {
+                // A group snapshot does not keep its members alive. Losing
+                // one member must not suppress delivery to subsequent ones.
+                Ok(()) | Err(AxError::NoSuchProcess) => {}
+                Err(error) => return Err(error),
+            }
         }
     }
 

@@ -783,7 +783,8 @@ impl<T: GpuTransport> AdapterState<T> {
     where
         T: 'static,
     {
-        self.ensure_render_worker().map_err(axerrno::AxError::from)?;
+        self.ensure_render_worker()
+            .map_err(axerrno::AxError::from)?;
         let mut jobs = self.render_jobs.lock();
         if self.render_dead.load(Ordering::Acquire) {
             return Err(axerrno::AxError::from(DrmError::DeviceLost));
@@ -791,7 +792,8 @@ impl<T: GpuTransport> AdapterState<T> {
         if jobs.len() == 8 {
             return Err(axerrno::AxError::WouldBlock);
         }
-        jobs.try_reserve(1).map_err(|_| axerrno::AxError::NoMemory)?;
+        jobs.try_reserve(1)
+            .map_err(|_| axerrno::AxError::NoMemory)?;
         // Capacity and publication are one transaction. In particular,
         // drmIoctl's EAGAIN retry must not inherit a failed BO reservation
         // from an earlier attempt which never entered this queue.
@@ -2288,6 +2290,7 @@ impl<T: GpuTransport + 'static> DisplayAdapter for VirtioGpuAdapter<T> {
         request: DumbRequest,
         pitch: u32,
         size: u64,
+        allocation_owner: Arc<dyn Send + Sync>,
     ) -> DrmResult<Arc<dyn GemBacking>> {
         self.state.ensure_retirement_worker()?;
         self.state.retry_retired_2d_resources();
@@ -2302,6 +2305,9 @@ impl<T: GpuTransport + 'static> DisplayAdapter for VirtioGpuAdapter<T> {
         let pages =
             Arc::try_new(SharedPages::new_fixed(bytes, PageSize::Size4K).map_err(map_ax_error)?)
                 .map_err(|_| DrmError::NoMemory)?;
+        pages
+            .retain_allocation_owner(allocation_owner)
+            .map_err(map_ax_error)?;
         let mut entries: Vec<(u64, u32)> = Vec::new();
         entries
             .try_reserve_exact(pages.len())
@@ -2782,6 +2788,7 @@ mod tests {
                 },
                 256,
                 16384,
+                Arc::new(()),
             )
             .unwrap();
         let cursor = CursorUpdate {
@@ -2862,6 +2869,7 @@ mod tests {
                 },
                 128,
                 256,
+                Arc::new(()),
             )
             .unwrap();
         let completion = adapter
@@ -2913,6 +2921,7 @@ mod tests {
                 },
                 64,
                 64,
+                Arc::new(()),
             )
             .unwrap();
         drop(backing);
@@ -2943,6 +2952,7 @@ mod tests {
                 },
                 64,
                 64,
+                Arc::new(()),
             )
             .unwrap();
         drop(adapter);

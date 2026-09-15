@@ -20,13 +20,7 @@ mod sound;
 pub mod tty;
 pub(crate) mod tun;
 
-use alloc::{
-    borrow::Cow,
-    format,
-    string::String,
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{borrow::Cow, format, string::String, sync::Arc, vec::Vec};
 use core::{
     any::Any,
     sync::atomic::{AtomicU64, Ordering},
@@ -36,9 +30,9 @@ use axdriver::{SharedBlockDevice, prelude::DevError};
 use axerrno::AxError;
 use axfs::BlockDeviceInfo;
 use axfs_ng_vfs::{
-    CreateDisposition, CreateOutcome, DeviceId, DirEntry, FileNode, Filesystem, FsName,
-    FsNameBuf, Location, MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission,
-    NodeType, Reference, UnlinkRequest, VfsError, VfsResult,
+    CreateDisposition, CreateOutcome, DeviceId, DirEntry, FileNode, Filesystem, FsName, FsNameBuf,
+    Location, MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType,
+    Reference, UnlinkRequest, VfsError, VfsResult,
 };
 use axpoll::Pollable;
 use axsync::Mutex;
@@ -49,6 +43,7 @@ use linux_raw_sys::{
         BLKGETSIZE, BLKGETSIZE64, BLKRAGET, BLKRASET, BLKROGET, BLKROSET, BLKSSZGET, RNDGETENTCNT,
     },
 };
+
 use crate::{
     file::IoctlContext,
     mm::map_usercopy_error,
@@ -98,11 +93,7 @@ impl DevRoot {
         FsNameBuf::from_vec(bytes)
     }
 
-    fn entry_from_ops(
-        parent: &DirEntry,
-        name: &FsName,
-        ops: NodeOpsMux,
-    ) -> VfsResult<DirEntry> {
+    fn entry_from_ops(parent: &DirEntry, name: &FsName, ops: NodeOpsMux) -> VfsResult<DirEntry> {
         let reference = Reference::try_new(Some(parent.clone()), name)?;
         match ops {
             NodeOpsMux::Dir(maker) => Ok(DirEntry::new_dir(
@@ -178,11 +169,7 @@ impl SimpleDirOps for DevRoot {
         if let Some(socket) = sockets.get(name) {
             return match disposition {
                 CreateDisposition::OpenOrCreate => Ok(CreateOutcome {
-                    entry: Self::entry_from_ops(
-                        &parent,
-                        name,
-                        NodeOpsMux::File(socket.clone()),
-                    )?,
+                    entry: Self::entry_from_ops(&parent, name, NodeOpsMux::File(socket.clone()))?,
                     created: false,
                 }),
                 CreateDisposition::Exclusive => Err(VfsError::AlreadyExists),
@@ -213,11 +200,7 @@ impl SimpleDirOps for DevRoot {
             project_id: options.initial_attributes.project_id,
             ..Default::default()
         })?;
-        let entry = Self::entry_from_ops(
-            &parent,
-            name,
-            NodeOpsMux::File(socket.clone()),
-        )?;
+        let entry = Self::entry_from_ops(&parent, name, NodeOpsMux::File(socket.clone()))?;
         options.install_initial_data(&entry)?;
         self.namespace_epoch.fetch_add(1, Ordering::AcqRel);
         sockets.insert(owned_name, socket);
@@ -388,11 +371,18 @@ impl DeviceOps for Zero {
     }
 }
 
-struct Random;
+struct Random {
+    insecure: bool,
+}
 
 impl DeviceOps for Random {
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        crate::random::fill_secure(buf)?;
+        if self.insecure {
+            // /dev/urandom permits pre-initialization output, unlike getrandom.
+            crate::random::fill_insecure(buf);
+        } else {
+            crate::random::fill_secure(buf)?;
+        }
         Ok(buf.len())
     }
 
@@ -614,7 +604,7 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
             fs.clone(),
             NodeType::CharacterDevice,
             DeviceId::new(1, 8),
-            Arc::new(Random),
+            Arc::new(Random { insecure: false }),
         ),
     );
     root.add(
@@ -623,7 +613,7 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
             fs.clone(),
             NodeType::CharacterDevice,
             DeviceId::new(1, 9),
-            Arc::new(Random),
+            Arc::new(Random { insecure: true }),
         ),
     );
     // The FUSE transport is an OFD-owned character device: each daemon open
@@ -738,9 +728,14 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
         );
     }
 
-    root.add("ptmx", SimpleFile::new(fs.clone(), NodeType::Symlink,
-        || Ok("pts/ptmx")));
-    root.add("pts", SimpleDir::new_maker(fs.clone(), Arc::new(DirMapping::new())));
+    root.add(
+        "ptmx",
+        SimpleFile::new(fs.clone(), NodeType::Symlink, || Ok("pts/ptmx")),
+    );
+    root.add(
+        "pts",
+        SimpleDir::new_maker(fs.clone(), Arc::new(DirMapping::new())),
+    );
     #[cfg(feature = "memtrack")]
     root.add(
         "memtrack",
@@ -830,9 +825,10 @@ fn device_namespace(fs: Arc<SimpleFs>) -> DevRoot {
 
 #[cfg(test)]
 mod tests {
+    use axfs_ng_vfs::FsName;
+
     use super::*;
     use crate::task::{Cred, Kgid, Kuid, UserNamespace};
-    use axfs_ng_vfs::FsName;
 
     #[test]
     fn devfs_socket_creation_preserves_shared_memory_mount() {
@@ -875,7 +871,9 @@ mod tests {
         ));
 
         for number in 0..=63 {
-            let node = root.lookup(FsName::new(format!("tty{number}").as_bytes())).unwrap();
+            let node = root
+                .lookup(FsName::new(format!("tty{number}").as_bytes()))
+                .unwrap();
             let metadata = node.metadata().unwrap();
             assert_eq!(metadata.node_type, NodeType::CharacterDevice);
             assert_eq!(metadata.rdev, DeviceId::new(4, number));
@@ -890,11 +888,19 @@ mod tests {
 
         // These existing character devices are separate Linux ABI nodes.
         assert_eq!(
-            root.lookup(FsName::new(b"tty")).unwrap().metadata().unwrap().rdev,
+            root.lookup(FsName::new(b"tty"))
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .rdev,
             DeviceId::new(5, 0)
         );
         assert_eq!(
-            root.lookup(FsName::new(b"console")).unwrap().metadata().unwrap().rdev,
+            root.lookup(FsName::new(b"console"))
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .rdev,
             DeviceId::new(5, 1)
         );
         let console = root.lookup(FsName::new(b"console")).unwrap();
@@ -911,7 +917,11 @@ mod tests {
         let name = FsName::new(b"log");
 
         let socket = root
-            .create(name, NodeType::Socket, NodePermission::from_bits_truncate(0o666))
+            .create(
+                name,
+                NodeType::Socket,
+                NodePermission::from_bits_truncate(0o666),
+            )
             .unwrap();
         assert_eq!(socket.metadata().unwrap().node_type, NodeType::Socket);
         assert_eq!(root.lookup(name).unwrap().object_key(), socket.object_key());

@@ -6,10 +6,15 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
 BUSYBOX_VERSION=1.36.1
 BUSYBOX_URL=https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2
+# busybox.net publishes no checksums, so this pins the tarball the cache was
+# seeded with; every use is verified, not just the first download.
+BUSYBOX_SHA256=b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314
 
 ARCH=""
 OUTPUT=""
-SIZE_MB=96
+SIZE_MB=${THEKERNEL_ROOTFS_SIZE_MB:-96}
+TOOLCHAIN=${THEKERNEL_TOOLCHAIN:-none}
+TOOLS_DIR=${THEKERNEL_ROOTFS_TOOLS_DIR:-}
 SOURCE_CACHE=${THEKERNEL_SOURCE_CACHE:-$REPO_ROOT/.state/source-cache}
 
 export LC_ALL=C
@@ -33,6 +38,12 @@ Environment overrides:
   THEKERNEL_MUSL_LINUX_ARCH_INCLUDE architecture UAPI headers (optional)
   THEKERNEL_ROOTFS_OWNER_MODE image ownership (default: root; use preserve
                                 when fakeroot is intentionally unavailable)
+  THEKERNEL_TOOLCHAIN         guest tool payload name (default: none); it
+                                selects which cases the suite contains, so it
+                                is compiled into the image, not just recorded;
+                                the payload itself is staged separately
+  THEKERNEL_ROOTFS_TOOLS_DIR  tree of guest tools to copy into the image
+  THEKERNEL_ROOTFS_SIZE_MB    image size (default: 96)
   THEKERNEL_SOURCE_CACHE      Download cache
 EOF
 }
@@ -83,6 +94,11 @@ if [ ! -f "$ARCHIVE" ]; then
     mv "$DOWNLOAD" "$ARCHIVE"
     trap - EXIT
 fi
+printf '%s  %s\n' "$BUSYBOX_SHA256" "$ARCHIVE" | sha256sum --check --status || {
+    printf 'checksum mismatch for %s\n  expected %s\n  remove it to refetch\n' \
+        "$ARCHIVE" "$BUSYBOX_SHA256" >&2
+    exit 1
+}
 
 OUTPUT=$(realpath -m "$OUTPUT")
 mkdir -p "$(dirname -- "$OUTPUT")"
@@ -283,7 +299,31 @@ install -m 0644 "$REPO_ROOT/NOTICE" \
 install -m 0755 "$REPO_ROOT/tests/guest/shell-init.sh" \
     "$STAGE/etc/thekernel/shell-init.sh"
 rm -f "$STAGE/sbin/init"
+# The payload selection also selects which cases the suite contains: the
+# native-compilation case is only meaningful when the compiler is installed,
+# and compiling it in only then keeps the case table (and therefore the KTAP
+# plan) a property of the image rather than of what happens to be present.
+#
+# `nested` is a superset of `tcc`: it stages the compiler *and* the system
+# emulator, so its image carries both cases.  Selecting cases this way means
+# `--toolchain nested` runs one more case than `--toolchain tcc`, and the plan
+# line in the transcript always says which image was booted.
+INIT_DEFINES=""
+case "$TOOLCHAIN" in
+    none) ;;
+    tcc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1" ;;
+    nested) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1 -DTHEKERNEL_TOOL_PAYLOAD_NESTED=1" ;;
+    # `glibc` deliberately does not include the tcc case: it is a staging
+    # milestone, and the compiler is a separate payload with its own cost.
+    glibc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_GLIBC=1" ;;
+    # `gcc` is a superset of `glibc`: the compiler is dynamic, so the glibc
+    # loader case runs too and the image proves its own prerequisite.
+    gcc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_GLIBC=1 -DTHEKERNEL_TOOL_PAYLOAD_GCC=1" ;;
+    *) printf 'unknown THEKERNEL_TOOLCHAIN: %s\n' "$TOOLCHAIN" >&2; exit 2 ;;
+esac
+# shellcheck disable=SC2086 # INIT_DEFINES is a deliberate flag list
 "${CROSS_COMPILE}gcc" -O2 -static -s -std=c11 -Wall -Wextra -Werror \
+    $INIT_DEFINES \
     "$REPO_ROOT/tests/guest/system-init.c" \
     -o "$STAGE/sbin/init"
 
@@ -304,6 +344,34 @@ for source in "$REPO_ROOT"/tests/guest/portable/*.c; do
         -pthread "$source" \
         -o "$STAGE/opt/thekernel-tests/portable/$name"
 done
+
+# The optional guest tool payload: a compiler and its development sysroot,
+# built on the host by build-guest-tools.sh and copied in as-is.  Nothing here
+# downloads or installs anything at run time, and the baseline image (no
+# payload requested) is untouched by this step.
+# The nested diagnostics are development evidence, not part of the acceptance
+# criteria, so they are gated on a file that only exists when explicitly asked
+# for.  THEKERNEL_ROOTFS_DIAGNOSTICS=1 builds the image that way.
+if [ "${THEKERNEL_ROOTFS_DIAGNOSTICS:-0}" = "1" ]; then
+    : > "$STAGE/opt/thekernel-tests/run-nested-diagnostics"
+fi
+
+if [ -n "$TOOLS_DIR" ]; then
+    [ "$TOOLCHAIN" != none ] || {
+        printf '%s\n' 'a guest tools directory was given without a payload name' >&2
+        exit 2
+    }
+    [ -d "$TOOLS_DIR" ] || {
+        printf 'guest tools directory does not exist: %s\n' "$TOOLS_DIR" >&2
+        exit 1
+    }
+    TOOLS_DIR=$(realpath -e "$TOOLS_DIR")
+    printf 'build-rootfs: installing %s guest tools from %s\n' \
+        "$TOOLCHAIN" "$TOOLS_DIR" >&2
+    # -a preserves the payload's symlinks, which is what keeps the duplicate
+    # libc.a and header tree from doubling the image size.
+    cp -a "$TOOLS_DIR/." "$STAGE/"
+fi
 
 "$SCRIPT_DIR/create-rootfs-image.sh" \
     --arch "$ARCH" --stage "$STAGE" --output "$IMAGE" --size-mb "$SIZE_MB" \

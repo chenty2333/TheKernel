@@ -80,6 +80,15 @@ fn sysv_duplicate_sources_match(aspace: &AddrSpace, sources: &[SysvDuplicateSour
     })
 }
 
+// Linux permits ordinary file/shared VMAs since 5.13, but not PFN/device
+// or special non-expandable mappings. Do not revive the older anon-only rule.
+fn supports_dontunmap(backend: &Backend) -> bool {
+    !matches!(backend, Backend::Linear(_))
+        && backend.file_like_mapping().is_none()
+        && !backend.is_secret()
+        && !matches!(backend, Backend::Shared(shared) if shared.pages().is_external())
+}
+
 fn collect_remap_segments(
     aspace: &AddrSpace,
     start: VirtAddr,
@@ -886,6 +895,12 @@ fn build_remap_plan(
     // collection: Linux still validates the original VMA before choosing an
     // automatic destination.
     if request.dont_unmap {
+        if source_segments
+            .iter()
+            .any(|segment| !supports_dontunmap(&segment.backend))
+        {
+            return Err(AxError::InvalidInput);
+        }
         let destination = if request.fixed {
             validate_fixed_remap_dst(
                 aspace,
@@ -2119,6 +2134,23 @@ mod tests {
     use memory_addr::PAGE_SIZE_4K;
 
     use super::*;
+
+    #[test]
+    fn dontunmap_rejects_physical_backends_without_rejecting_shared_memory() {
+        let start = VirtAddr::from(0x1000);
+        assert!(supports_dontunmap(&Backend::new_alloc(
+            start,
+            PageSize::Size4K
+        )));
+        let shared =
+            Arc::new(crate::mm::SharedPages::new_shmem(PAGE_SIZE_4K, PageSize::Size4K).unwrap());
+        assert!(supports_dontunmap(&Backend::new_shared(start, shared)));
+        assert!(!supports_dontunmap(&Backend::new_linear(
+            start,
+            memory_addr::PhysAddr::from(0x1000),
+            PAGE_SIZE_4K
+        )));
+    }
 
     #[test]
     fn remap_fragments_share_one_backend_relocation_pair() {

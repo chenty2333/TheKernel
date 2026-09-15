@@ -617,10 +617,12 @@ fn create(file: &DrmFile, copy: &impl super::ioctl::UserCopy, arg: usize) -> AxR
     let mut r: Create = read(copy, arg)?;
     let alloc = resource_backing_size(&r)?;
     let size = alloc as u64;
+    let charge = file.reserve_render_memory(alloc).map_err(drm)?;
     let pages = Arc::try_new(
         SharedPages::new_fixed(alloc, PageSize::Size4K).map_err(|_| AxError::NoMemory)?,
     )
     .map_err(|_| AxError::NoMemory)?;
+    pages.retain_allocation_owner(charge)?;
     let mut entries = Vec::new();
     for i in 0..pages.len() {
         entries.try_reserve(1).map_err(|_| AxError::NoMemory)?;
@@ -715,10 +717,12 @@ fn create_blob(file: &DrmFile, copy: &impl super::ioctl::UserCopy, arg: usize) -
         PageSize::Size4K as usize,
     )
     .ok_or(AxError::InvalidInput)?;
+    let charge = file.reserve_render_memory(alloc).map_err(drm)?;
     let guest_pages = Arc::try_new(
         SharedPages::new_fixed(alloc, PageSize::Size4K).map_err(|_| AxError::NoMemory)?,
     )
     .map_err(|_| AxError::NoMemory)?;
+    guest_pages.retain_allocation_owner(charge)?;
     let mappable = r.blob_flags & BLOB_FLAG_MAPPABLE != 0;
     let mut entries = Vec::new();
     if mem != BlobMem::Host3d {
@@ -1190,11 +1194,17 @@ mod tests {
         assert_eq!(resource_backing_size(&texture), Ok(4096));
         assert_eq!(resource_backing_size(&Create::default()), Ok(4096));
         assert_eq!(
-            resource_backing_size(&Create { bo_handle: 1, ..buffer }),
+            resource_backing_size(&Create {
+                bo_handle: 1,
+                ..buffer
+            }),
             Err(AxError::InvalidInput)
         );
         assert_eq!(
-            resource_backing_size(&Create { res_handle: 1, ..buffer }),
+            resource_backing_size(&Create {
+                res_handle: 1,
+                ..buffer
+            }),
             Err(AxError::InvalidInput)
         );
     }

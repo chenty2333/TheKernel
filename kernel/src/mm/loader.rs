@@ -73,19 +73,23 @@ impl ExecLayout {
         }
     }
 
-    pub(crate) fn randomized() -> Self {
-        fn slide(limit: usize) -> usize {
-            let mut bytes = [0u8; core::mem::size_of::<usize>()];
-            crate::random::fill_insecure(&mut bytes);
-            usize::from_le_bytes(bytes) % (limit / PAGE_SIZE_4K) * PAGE_SIZE_4K
-        }
+    pub(crate) fn randomized() -> AxResult<Self> {
+        let mut entropy = [0u8; 32];
+        // Fail closed rather than silently using clock/address seeds for ASLR.
+        crate::random::fill_secure(&mut entropy)?;
+        Ok(Self::from_entropy(entropy))
+    }
 
+    fn from_entropy(entropy: [u8; 32]) -> Self {
+        let mut words = entropy.chunks_exact(8);
+        let mut slide = |limit: usize| {
+            let word = u64::from_le_bytes(words.next().unwrap().try_into().unwrap()) as usize;
+            word % (limit / PAGE_SIZE_4K) * PAGE_SIZE_4K
+        };
         Self {
             elf_base: crate::config::USER_SPACE_BASE + slide(Self::ELF_SLIDE_MAX),
             interp_base: crate::config::USER_INTERP_BASE + slide(Self::INTERP_SLIDE_MAX),
             stack_top: crate::config::USER_STACK_TOP - slide(Self::STACK_SLIDE_MAX),
-            // The fixed heap's maximum end meets the signal trampoline, so
-            // randomize downward rather than growing into that reservation.
             heap_base: crate::config::USER_HEAP_BASE - slide(Self::HEAP_SLIDE_MAX),
         }
     }
@@ -1133,8 +1137,7 @@ mod tests {
     fn dynamic_linker_entry_uses_elf_entry_while_aux_base_stays_interp_base() {
         let layout = ExecLayout::fixed();
         let linker_bytes = include_bytes!(
-            "../../../crates/ax/thekernel-kernel-elf-parser/tests/ld-linux-x86-64.so.\
-             2"
+            "../../../crates/ax/thekernel-kernel-elf-parser/tests/ld-linux-x86-64.so.2"
         );
         // `include_bytes!` has byte alignment, while xmas-elf's legacy
         // header reader requires its input address to be naturally aligned.
@@ -1175,7 +1178,7 @@ mod tests {
 
     #[test]
     fn randomized_exec_layout_stays_page_aligned_and_in_bounds() {
-        let layout = ExecLayout::randomized();
+        let layout = ExecLayout::from_entropy([0xa5; 32]);
         for address in [
             layout.elf_base,
             layout.interp_base,
@@ -1230,8 +1233,7 @@ mod tests {
     fn dynamic_elf_with_interp(path: &[u8]) -> Vec<u8> {
         assert_eq!(path.last(), Some(&0));
         let mut bytes = include_bytes!(
-            "../../../crates/ax/thekernel-kernel-elf-parser/tests/ld-linux-x86-64.so.\
-             2"
+            "../../../crates/ax/thekernel-kernel-elf-parser/tests/ld-linux-x86-64.so.2"
         )
         .to_vec();
         let note_index = {
@@ -1264,8 +1266,7 @@ mod tests {
             &root,
             "ld.so",
             include_bytes!(
-                "../../../crates/ax/thekernel-kernel-elf-parser/tests/\
-                 ld-linux-x86-64.so.2"
+                "../../../crates/ax/thekernel-kernel-elf-parser/tests/ld-linux-x86-64.so.2"
             ),
         );
         (script, interpreter, dynamic_linker)

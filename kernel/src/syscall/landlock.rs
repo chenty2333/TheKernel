@@ -367,12 +367,13 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
                 ) => unreachable!("validated before descriptor lookup"),
                 Ok(()) => {}
             }
-            ruleset
-                .paths
-                .lock()
-                .try_reserve(1)
-                .map_err(|_| AxError::NoMemory)?;
-            ruleset.paths.lock().push(PathRule {
+            let mut rules = ruleset.paths.lock();
+            // Bound retained inode references and fallible storage per ruleset.
+            if rules.len() >= 4096 {
+                return Err(LinuxError::E2BIG.into());
+            }
+            rules.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            rules.push(PathRule {
                 allowed: a.allowed,
                 location,
             });
@@ -385,12 +386,13 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
             if a.allowed & !ruleset.net != 0 || a.port > u16::MAX as u64 {
                 return Err(AxError::InvalidInput);
             }
-            ruleset
-                .ports
-                .lock()
-                .try_reserve(1)
-                .map_err(|_| AxError::NoMemory)?;
-            ruleset.ports.lock().push(NetRule {
+            let mut rules = ruleset.ports.lock();
+            // Bound retained inode references and fallible storage per ruleset.
+            if rules.len() >= 4096 {
+                return Err(LinuxError::E2BIG.into());
+            }
+            rules.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            rules.push(NetRule {
                 allowed: a.allowed,
                 port: a.port as u16,
             });

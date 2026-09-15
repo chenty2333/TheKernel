@@ -26,6 +26,10 @@ RESOURCE_SCOPE = systemd-run --user --scope --quiet --collect \
 
 .PHONY: run run-gui run-existing build lint test bench clean docker-clean
 
+# The default image carries no tool payload, so the guest shell has no
+# compiler; boot the distribution-compiler image with
+# `make run RUN_ARGS="--toolchain gcc"` (the first build downloads ~100 MiB
+# of pinned RPMs).
 run:
 	$(RESOURCE_SCOPE) \
 		env CARGO_BUILD_JOBS=$(CARGO_JOBS) \

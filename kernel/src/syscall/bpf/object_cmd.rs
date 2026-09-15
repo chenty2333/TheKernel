@@ -282,6 +282,13 @@ pub fn bpf_iter_create<M: UserMemory + ?Sized>(
     a: usize,
     s: u32,
 ) -> AxResult<isize> {
+    // A received FD conveys object access, not authority to inspect global tasks.
+    if !axtask::current()
+        .as_thread()
+        .has_effective_capability(CAP_SYS_ADMIN)
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
     require_bpf_attr_range::<BpfAttrIterCreate>(s, size_of::<BpfAttrIterCreate>())?;
     let x: BpfAttrIterCreate = read_bpf_attr(m, a, s)?;
     if x.flags != 0 {

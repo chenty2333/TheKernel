@@ -716,11 +716,10 @@ fn validate_notify_event(event: &RawSigevent) -> AxResult {
     match event.notify() as u32 {
         SIGEV_NONE | SIGEV_THREAD => Ok(()),
         SIGEV_SIGNAL => {
-            // Signo 0 selects "notify without delivering a signal"; any other
-            // value must name a signal this kernel can actually deliver.
-            let accepted = event.signo() == 0
-                || ((1..=64).contains(&event.signo())
-                    && Signo::from_repr(event.signo() as u8).is_some());
+            // SIGEV_NONE is the no-signal mode; SIGEV_SIGNAL requires an
+            // actual signal, including when registration is one-shot.
+            let accepted = (1..=64).contains(&event.signo())
+                && Signo::from_repr(event.signo() as u8).is_some();
             if accepted {
                 Ok(())
             } else {
@@ -974,7 +973,8 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
     let curr = current();
     let ipc_ns = curr.as_thread().ipc_ns();
 
-    let (queue, created) = {
+    let mut prepared_attr = None;
+    let (queue, created) = loop {
         let mut manager = ipc_ns.mqueue_manager().lock();
         if let Some(queue) = manager.queues.get(&name).cloned() {
             if create && excl {
@@ -986,7 +986,7 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
                     return Err(AxError::PermissionDenied);
                 }
             }
-            (queue, false)
+            break (queue, false);
         } else {
             if !create {
                 return Err(AxError::NotFound);
@@ -994,7 +994,14 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
             if manager.queues.len() >= mq_queues_max() {
                 return Err(LinuxError::ENOSPC.into());
             }
-            let attr = read_create_attr(memory, attr)?;
+            let Some(create_attr) = prepared_attr.take() else {
+                // Preserve ignored attributes for an existing queue, but never
+                // fault in user pages while holding the namespace registry.
+                drop(manager);
+                prepared_attr = Some(read_create_attr(memory, attr)?);
+                continue;
+            };
+            let attr = create_attr;
             let (uid, gid) = current_ids();
             let curr = current();
             let thread = curr.as_thread();
@@ -1019,7 +1026,7 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
             .map_err(|_| AxError::NoMemory)?;
             queue.lock().charge = Some(charge);
             manager.queues.insert(name.clone(), queue.clone());
-            (queue, true)
+            break (queue, true);
         }
     };
 
@@ -1266,6 +1273,18 @@ pub fn sys_mq_notify<M: UserMemory + ?Sized>(
     Ok(0)
 }
 
+fn write_queue_attr<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    queue: &Mutex<PosixMqueue>,
+    flags: isize,
+    destination: *mut MqAttr,
+) -> AxResult<()> {
+    let snapshot = queue.lock().attr(flags);
+    // SAFETY: attr initializes every repr(C) field, including reserved words.
+    unsafe { VmMutPtr::vm_write_unchecked(destination, memory, snapshot) }
+        .map_err(map_usercopy_error)
+}
+
 pub fn sys_mq_getsetattr<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     fd: i32,
@@ -1285,9 +1304,7 @@ pub fn sys_mq_getsetattr<M: UserMemory + ?Sized>(
     if let Ok(file) = get_mq_fd(fd) {
         if !old_attr.is_null() {
             let flags = nonblock_flags(&file);
-            let queue = file.queue.lock();
-            unsafe { VmMutPtr::vm_write_unchecked(old_attr, memory, queue.attr(flags)) }
-                .map_err(map_usercopy_error)?;
+            write_queue_attr(memory, &file.queue, flags, old_attr)?;
         }
         if let Some(attr) = new {
             let nonblocking = attr.mq_flags & O_NONBLOCK as isize != 0;
@@ -1314,11 +1331,7 @@ pub fn sys_mq_getsetattr<M: UserMemory + ?Sized>(
         } else {
             0
         };
-        let queue = queue.lock();
-        // SAFETY: `MqAttr` is a repr(C) array of initialized isize fields;
-        // its reserved words are explicitly zeroed by `attr`.
-        unsafe { VmMutPtr::vm_write_unchecked(old_attr, memory, queue.attr(flags)) }
-            .map_err(map_usercopy_error)?;
+        write_queue_attr(memory, &queue, flags, old_attr)?;
     }
     if let Some(attr) = new {
         file.set_nonblocking(attr.mq_flags & O_NONBLOCK as isize != 0)?;
@@ -1334,6 +1347,52 @@ mod tests {
     use thekernel_linux_usercopy::{UserCopyError, VmResult};
 
     use super::*;
+
+    #[test]
+    fn attribute_copyout_does_not_hold_queue_or_namespace_locks() {
+        struct Probe<'a> {
+            queue: &'a Mutex<PosixMqueue>,
+            namespace: &'a IpcNamespace,
+            writes: usize,
+        }
+        // SAFETY: the probe never reads user memory and fails writes without
+        // claiming that user bytes have been initialized or copied.
+        unsafe impl UserMemory for Probe<'_> {
+            fn read(&mut self, _: usize, _: &mut [MaybeUninit<u8>]) -> VmResult {
+                Err(UserCopyError::BadAddress)
+            }
+            fn write(&mut self, _: usize, _: &[u8]) -> VmResult {
+                assert!(self.queue.try_lock().is_some());
+                assert!(self.namespace.mqueue_manager().try_lock().is_some());
+                self.writes += 1;
+                Err(UserCopyError::BadAddress)
+            }
+        }
+        let namespace = IpcNamespace::try_new(UserNamespace::try_new_root().unwrap()).unwrap();
+        let queue = Mutex::new(
+            PosixMqueue::new(
+                FsNameBuf::from_vec(b"attr-copyout".to_vec()).unwrap(),
+                0o600,
+                0,
+                0,
+                default_attr(),
+                &namespace,
+            )
+            .unwrap(),
+        );
+        let mut probe = Probe {
+            queue: &queue,
+            namespace: &namespace,
+            writes: 0,
+        };
+        let mut memory = UserMemoryContext::new(&mut probe);
+        assert_eq!(
+            write_queue_attr(&mut memory, &queue, 0, 8_usize as *mut MqAttr),
+            Err(AxError::BadAddress)
+        );
+        drop(memory);
+        assert_eq!(probe.writes, 1);
+    }
 
     #[test]
     fn receive_copyout_fault_wakes_sender_after_freeing_capacity() {
@@ -1440,6 +1499,24 @@ mod tests {
             let range = self.range(start, src.len())?;
             self.bytes[range].copy_from_slice(src);
             Ok(())
+        }
+    }
+
+    #[test]
+    fn signal_notification_rejects_zero_signo_but_none_ignores_it() {
+        let mut provider = TestMemory {
+            bytes: vec![0; size_of::<RawSigevent>()],
+        };
+        let notify_offset = core::mem::offset_of!(linux_raw_sys::general::sigevent, sigev_notify);
+        for (notify, expected) in [
+            (SIGEV_SIGNAL, Err(AxError::InvalidInput)),
+            (SIGEV_NONE, Ok(())),
+        ] {
+            provider.bytes[notify_offset..notify_offset + 4]
+                .copy_from_slice(&(notify as i32).to_ne_bytes());
+            let mut memory = UserMemoryContext::new(&mut provider);
+            let event = RawSigevent::read_from_user(&mut memory, core::ptr::null()).unwrap();
+            assert_eq!(validate_notify_event(&event), expected);
         }
     }
 

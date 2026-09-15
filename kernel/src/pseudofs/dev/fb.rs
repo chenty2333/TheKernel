@@ -679,7 +679,7 @@ impl FbconFrame {
         }
     }
 
-    pub(crate) fn glyph(&self, x: usize, y: usize, byte: u8) {
+    pub(crate) fn glyph(&self, x: usize, y: usize, byte: u8, fg: u32, bg: u32, cursor: bool) {
         // A byte with no glyph is drawn blank rather than as a substitute
         // character: the console shows control bytes, UTF-8 continuation bytes
         // and bytes outside the font's range, and a full screen of replacement
@@ -693,10 +693,17 @@ impl FbconFrame {
                 if px >= self.width || py >= self.height {
                     continue;
                 }
-                let color = if bits & (0x80 >> dx) != 0 {
-                    0x00d0_d0d0
+                // A steady underline marks the insertion cell without changing
+                // its stored glyph. Keep the one-pixel cell border clear, like
+                // the font itself, so adjacent cells never visually merge.
+                let cursor_ink = cursor
+                    && dy == super::console_font::GLYPH_HEIGHT - 2
+                    && dx > 0
+                    && dx + 1 < super::console_font::GLYPH_WIDTH;
+                let color = if bits & (0x80 >> dx) != 0 || cursor_ink {
+                    fg
                 } else {
-                    0
+                    bg
                 };
                 if py
                     .checked_mul(self.pitch)
@@ -1163,19 +1170,33 @@ mod tests {
         }
         struct Adapter;
         impl DisplayAdapter for Adapter {
+            fn preferred_mode(&self) -> crate::drm::Mode {
+                // This test exercises ownership/console restoration, not display
+                // capacity. Keep two scanouts within the small host page arena's
+                // production pinned-memory budget.
+                crate::drm::Mode {
+                    width: 64,
+                    height: 64,
+                    refresh_millihz: 60_000,
+                }
+            }
+
             fn create_dumb(
                 &self,
                 _: DumbRequest,
                 _: u32,
                 size: u64,
+                allocation_owner: Arc<dyn Send + Sync>,
             ) -> DrmResult<Arc<dyn GemBacking>> {
-                Ok(Arc::new(Pages(Arc::new(
+                let pages = Arc::new(
                     crate::mm::SharedPages::new_fixed(
                         size as usize,
                         axhal::paging::PageSize::Size4K,
                     )
                     .unwrap(),
-                ))))
+                );
+                pages.retain_allocation_owner(allocation_owner).unwrap();
+                Ok(Arc::new(Pages(pages)))
             }
             fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
                 Ok(Fence::new(true))
@@ -1216,7 +1237,7 @@ mod tests {
         .unwrap();
         assert_eq!(device.state.lock().resources.crtc.framebuffer, Some(fb));
         let user = if explicit_drop {
-            user.drop_master();
+            user.drop_master().unwrap();
             Some(user)
         } else {
             drop(user);

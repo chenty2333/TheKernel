@@ -4912,10 +4912,8 @@ pub fn sys_umount2<M: UserMemory + ?Sized>(
     if !may_mount(&security) {
         return Err(AxError::from(LinuxError::EPERM));
     }
-    if flags & MNT_FORCE != 0 {
-        return Err(AxError::OperationNotSupported);
-    }
-
+    // No mounted backend exposes umount_begin. Like Linux, MNT_FORCE is
+    // then a no-op hint; normal busy/lazy-unmount rules still apply.
     let _mount_operation = mounts::namespace_operation();
     let target = if flags & UMOUNT_NOFOLLOW != 0 {
         current_fs_context()

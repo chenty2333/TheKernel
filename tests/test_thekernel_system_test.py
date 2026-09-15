@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import subprocess
 import tempfile
 from tests.support import test_tmpdir
 import tomllib
@@ -100,6 +102,267 @@ class SystemTestGateTests(unittest.TestCase):
                 source.rename(root / "second" / "probe.c")
                 self.assertNotEqual(before, product_state.rootfs_fingerprint())
 
+    def test_toolchain_flag_selects_the_payload_over_the_environment(self) -> None:
+        """`--toolchain` must reach the artifact layout, not be echoed away.
+
+        The regression this pins: main() used to write the *environment* value
+        back into THEKERNEL_TOOLCHAIN, so an exported default silently replaced
+        the flag and the guest suite built and booted the baseline image while
+        reporting success.
+        """
+
+        product = load_product()
+        for environment, flag, expected in (
+            (None, "tcc", "tcc"),
+            ("none", "tcc", "tcc"),
+            ("tcc", "none", "none"),
+            ("tcc", None, "tcc"),
+        ):
+            with self.subTest(environment=environment, flag=flag), \
+                    test_tmpdir() as directory:
+                argv = ["test", "--suite", "guest", "--no-build"]
+                if flag is not None:
+                    argv += ["--toolchain", flag]
+                with patch.dict(os.environ, {"THEKERNEL_STATE_DIR": directory}, clear=False):
+                    if environment is None:
+                        os.environ.pop("THEKERNEL_TOOLCHAIN", None)
+                    else:
+                        os.environ["THEKERNEL_TOOLCHAIN"] = environment
+                    with patch.object(product, "run_product", return_value=0) as run:
+                        self.assertEqual(product.main(argv), 0)
+                    self.assertEqual(os.environ["THEKERNEL_TOOLCHAIN"], expected)
+                    rootfs = run.call_args.args[0].rootfs
+                    self.assertEqual(
+                        rootfs.name,
+                        "rootfs-x86.img" if expected == "none"
+                        else f"rootfs-x86-{expected}.img",
+                    )
+                    self.assertTrue(rootfs.is_relative_to(directory))
+
+    def test_payload_selects_the_guest_suite_plan(self) -> None:
+        """Each payload's image must carry exactly the cases it can run.
+
+        The case table is the suite's plan, so it is a compile-time property of
+        the image rather than something a run can discover.  An image built for
+        a payload that is missing its tool therefore fails -- which is what
+        makes "the payload works" a testable claim instead of a description.
+        """
+
+        source = REPO_ROOT / "tests" / "guest" / "system-init.c"
+        defines = {
+            "none": [],
+            "tcc": ["-DTHEKERNEL_TOOL_PAYLOAD_TCC=1"],
+            "nested": ["-DTHEKERNEL_TOOL_PAYLOAD_TCC=1",
+                       "-DTHEKERNEL_TOOL_PAYLOAD_NESTED=1"],
+            # `glibc` is a staging milestone and deliberately excludes the
+            # compiler case: it is a separate payload with its own cost.
+            "glibc": ["-DTHEKERNEL_TOOL_PAYLOAD_GLIBC=1"],
+            # `gcc` is a superset: the compiler is a dynamic glibc program, so
+            # the loader case runs in its image too and the image proves its own
+            # prerequisite rather than assuming it.
+            "gcc": ["-DTHEKERNEL_TOOL_PAYLOAD_GLIBC=1",
+                    "-DTHEKERNEL_TOOL_PAYLOAD_GCC=1"],
+        }
+        expected = {
+            "none": [],
+            "tcc": ["compiler-smoke"],
+            "nested": ["compiler-smoke", "nested-tcg-hello", "nested-linux-boot"],
+            "glibc": ["glibc-smoke"],
+            "gcc": ["glibc-smoke", "gcc-smoke"],
+        }
+        with test_tmpdir() as directory:
+            for payload, flags in defines.items():
+                with self.subTest(payload=payload):
+                    out = Path(directory) / f"plan-{payload}.i"
+                    result = subprocess.run(
+                        ["gcc", "-E", "-std=c11", *flags, str(source)],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    text = result.stdout
+                    present = [name for name in ("compiler-smoke", "nested-tcg-hello",
+                                                 "nested-linux-boot", "glibc-smoke",
+                                                 "gcc-smoke")
+                               if f'{{ "{name}",' in text]
+                    self.assertEqual(present, expected[payload])
+                    # Both payloads are supersets of `none`, so the baseline
+                    # cases must survive every selection.
+                    for baseline in ("jit-mem", "proc-shape", "threads-futex",
+                                     "io-uring", "seccomp"):
+                        self.assertIn(f'{{ "{baseline}",', text)
+
+    def test_staged_nested_payload_satisfies_its_interface(self) -> None:
+        """The staged payload must be usable by the guest it is copied into.
+
+        Two of these were real bugs, not hypotheticals: a payload staged
+        without QEMU's data directory boots nothing ("could not load PC BIOS
+        'bios-256k.bin'"), and an emulator that acquires a dynamic loader or a
+        glibc libatomic cannot run in the guest at all.  Rebuilding the payload
+        is minutes of work, so the assembled result is checked here instead of
+        being discovered by a boot that fails for an unrelated-looking reason.
+
+        The payload is a build artifact, so this test skips when it has not
+        been built rather than failing a checkout that never asked for it.
+        """
+
+        state = Path(os.environ.get(
+            "THEKERNEL_STATE_DIR",
+            Path.home() / ".cache" / "thekernel-targets"))
+        payload = state / "guest-tools" / "nested"
+        tools = payload / "opt" / "thekernel-tools"
+        if not (tools / "MANIFEST").is_file():
+            self.skipTest(f"the nested payload has not been staged in {payload}")
+
+        qemu = tools / "bin" / "qemu-system-x86_64"
+        kernel = tools / "payloads" / "hello-acpi.elf"
+        inner_kernel = tools / "payloads" / "vmlinuz-virt"
+        inner_initrd = tools / "payloads" / "alpine-initramfs.cpio.gz"
+        share = tools / "share"
+        for path in (qemu, kernel, inner_kernel, inner_initrd, share / "bios-256k.bin"):
+            with self.subTest(path=path.name):
+                self.assertTrue(path.is_file(), f"missing from the payload: {path}")
+
+        # Every file the manifest names must exist with the recorded hash.
+        listed = 0
+        for line in (tools / "MANIFEST").read_text().splitlines():
+            fields = line.split()
+            if line.startswith("#") or len(fields) != 3:
+                continue  # a comment or a header field, not a file record
+            # The manifest records `path size sha256`, matching what
+            # `sha256sum --check` wants once the fields are reordered.
+            relative, size, digest = fields
+            self.assertEqual(len(digest), 64, f"not a sha256: {line}")
+            listed += 1
+            with self.subTest(file=relative):
+                staged = payload / relative
+                self.assertTrue(staged.is_file())
+                self.assertEqual(staged.stat().st_size, int(size))
+                self.assertEqual(
+                    hashlib.sha256(staged.read_bytes()).hexdigest(), digest)
+        # The emulator, the two inner images and the Alpine initramfs.  A
+        # manifest that lost an entry would otherwise let the payload shrink
+        # silently and fail much later, inside a boot.
+        self.assertEqual(listed, 4)
+
+        # A dynamic emulator cannot start in the guest, and the guest has no
+        # dynamic loader to give it.
+        program_headers = subprocess.run(
+            ["readelf", "-d", str(qemu)], capture_output=True, text=True, check=False)
+        self.assertNotIn("NEEDED", program_headers.stdout)
+
+        # glibc's libatomic must not be linked in.  The only libatomic
+        # reachable on this host is Fedora's, and linking it into a musl binary
+        # produces one that starts, runs, and then dies with no diagnostic.
+        symbols = subprocess.run(
+            ["nm", str(qemu)], capture_output=True, text=True, check=False)
+        self.assertNotIn(" libat_", symbols.stdout)
+
+        # The inner image is an ELF32 multiboot container by construction:
+        # QEMU reloads -kernel images with I386_ELF_MACHINE.
+        header = kernel.read_bytes()[:20]
+        self.assertEqual(header[:4], b"\x7fELF")
+        self.assertEqual(header[4], 1, "the inner image must be ELF32")
+
+        # The Alpine image is a bzImage, which is what QEMU accepts for -kernel.
+        # The Linux boot protocol puts "HdrS" at 0x202; checking it here means a
+        # wrong or truncated download is caught without a 180 s boot attempt.
+        self.assertEqual(inner_kernel.read_bytes()[0x202:0x206], b"HdrS")
+        # A gzip-compressed cpio newc archive, which the kernel unpacks as the
+        # initial root filesystem.
+        initrd = inner_initrd.read_bytes()
+        self.assertEqual(initrd[:2], b"\x1f\x8b", "the initramfs must be gzip")
+        self.assertGreater(len(initrd), 100_000)
+
+    def test_staged_glibc_payload_satisfies_its_interface(self) -> None:
+        """The glibc payload must stage what a dynamic program needs.
+
+        Checked here rather than only in the guest because the interesting
+        failure -- a loader at the wrong path, or a smoke binary that is not
+        actually dynamic -- is a staging bug that looks like a kernel bug when
+        it surfaces two minutes later as an ENOENT inside the guest.
+        """
+
+        root = Path(os.environ.get(
+            "THEKERNEL_STATE_DIR",
+            Path.home() / ".cache" / "thekernel-targets",
+        ))
+        tools = root / "guest-tools" / "glibc"
+        loader = tools / "lib64" / "ld-linux-x86-64.so.2"
+        libc = tools / "lib64" / "libc.so.6"
+        program = tools / "opt/thekernel-tools/bin/glibc-smoke"
+        if not program.is_file():
+            self.skipTest(f"no staged glibc payload at {tools}")
+
+        # PT_INTERP is a fixed string in the executable and the kernel resolves
+        # exactly it, so the staged path has to be that string.
+        self.assertTrue(loader.is_file(), "the loader is not staged where PT_INTERP points")
+        self.assertTrue(libc.is_file())
+        header = program.read_bytes()[:64]
+        self.assertEqual(header[:4], b"\x7fELF")
+        self.assertEqual(header[4], 2, "the smoke program must be ELF64")
+        text = program.read_bytes()
+        self.assertIn(b"/lib64/ld-linux-x86-64.so.2\x00", text,
+                      "the program's PT_INTERP does not name the staged loader")
+        self.assertIn(b"libc.so.6\x00", text,
+                      "the program has no DT_NEEDED for the staged libc")
+
+        # The loader must be able to run first, so it cannot need a loader.
+        self.assertNotIn(b"ld-linux-x86-64.so.2\x00", loader.read_bytes()[:4096],
+                         "the staged loader looks like it has its own PT_INTERP")
+
+    def test_image_reuse_follows_the_payload_it_embeds(self) -> None:
+        """A rebuilt payload must invalidate the image built from it.
+
+        This was a real bug: the reuse decision hashed the repository and the
+        payload *name*, so a payload rebuilt to contain the compiler left the
+        old image in place, and the extra case the image's own plan promised
+        then failed inside the guest with a missing-compiler error that points
+        at the compiler rather than at the image.
+        """
+
+        product_state = load_script_module(
+            "thekernel_product_state_payload", "tools/product_state.py")
+        with test_tmpdir() as directory:
+            root = Path(directory)
+            payload = product_state.guest_tools_dir(root, "nested")
+            self.assertEqual(
+                product_state.guest_tools_fingerprint(root, "nested"), "absent")
+
+            (payload / "usr" / "bin").mkdir(parents=True)
+            compiler = payload / "usr" / "bin" / "tcc"
+            compiler.write_bytes(b"first")
+            first = product_state.guest_tools_fingerprint(root, "nested")
+
+            # The payload is rebuilt on every build, so every file gets a new
+            # timestamp even when its bytes are unchanged.  That must not look
+            # like a change, or every run would rebuild the image and the
+            # before/after comparison inside the build could never agree.
+            stat = compiler.stat()
+            os.utime(compiler, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+            self.assertEqual(
+                product_state.guest_tools_fingerprint(root, "nested"), first)
+
+            # Different bytes must be a change.
+            compiler.write_bytes(b"second")
+            self.assertNotEqual(
+                product_state.guest_tools_fingerprint(root, "nested"), first)
+            compiler.write_bytes(b"first")
+
+            # A different payload name is a different tree.
+            self.assertNotEqual(
+                product_state.guest_tools_fingerprint(root, "tcc"), first)
+
+            # A symlink that moves must be visible: the payload's size depends
+            # on where its symlinks point, because they deduplicate libc.a and
+            # the header tree.
+            link = payload / "usr" / "include"
+            link.symlink_to("lib/tcc/include")
+            with_link = product_state.guest_tools_fingerprint(root, "nested")
+            link.unlink()
+            link.symlink_to("lib/tcc/other")
+            self.assertNotEqual(
+                product_state.guest_tools_fingerprint(root, "nested"), with_link)
+
     def test_clean_rejects_an_active_operation(self) -> None:
         product = load_product()
         with test_tmpdir() as directory, patch.dict(os.environ, {"THEKERNEL_STATE_DIR": directory}):
@@ -120,7 +383,12 @@ class SystemTestGateTests(unittest.TestCase):
             artifacts.rootfs.write_bytes(b"initial")
             artifacts.kernel.write_bytes(b"kernel")
             artifacts.esp.write_bytes(b"esp")
-            product.rootfs_stamp_path(artifacts).write_text(product.rootfs_fingerprint())
+            # The stamp records the whole image identity -- repository inputs
+            # plus the staged payload -- so it is written the same way the
+            # build writes it, through the one function both sides share.
+            product.rootfs_stamp_path(artifacts).write_text(
+                product.rootfs_image_fingerprint(artifacts, "none")
+            )
             stamp = product.artifact_config_stamp(artifacts, "module")
             stamp.write_text(product.artifact_config_key(artifacts, None, "module"))
             product.validate_artifact_config(artifacts, None, "module")
@@ -140,7 +408,12 @@ class SystemTestGateTests(unittest.TestCase):
                 artifacts.rootfs.write_bytes(b"rootfs")
                 artifacts.kernel.write_bytes(b"kernel")
                 artifacts.esp.write_bytes(b"esp")
-                product.rootfs_stamp_path(artifacts).write_text(product.rootfs_fingerprint())
+                # The stamp records the whole image identity -- repository
+                # inputs plus the staged payload -- so it is written the same
+                # way the build writes it, through the shared function.
+                product.rootfs_stamp_path(artifacts).write_text(
+                    product.rootfs_image_fingerprint(artifacts, "none")
+                )
                 product.artifact_config_stamp(artifacts, "module").write_text(
                     product.artifact_config_key(artifacts, None, "module"))
                 getattr(artifacts, changed).write_bytes(b"different")
@@ -234,11 +507,36 @@ class SystemTestGateTests(unittest.TestCase):
         product = load_product()
         with test_tmpdir() as directory:
             artifacts = product.Artifacts(Path(directory), product.Variant("1G"))
-            with patch.object(product, "rootfs_fingerprint", side_effect=["before", "after"]), \
+            # The repository half changes while its own image is being built, so
+            # the image is a mixture of two revisions and no stamp describes it.
+            with patch.object(product, "rootfs_fingerprint",
+                              side_effect=["before", "after"]), \
+                    patch.object(product, "guest_tools_fingerprint",
+                                 return_value="payload"), \
                     patch.object(product, "run_checked"):
                 with self.assertRaisesRegex(product.ProductError, "changed during compilation"):
                     product.build_rootfs(artifacts)
             self.assertFalse(product.rootfs_stamp_path(artifacts).exists())
+
+    def test_rebuilt_payload_does_not_stop_the_stamp_being_written(self) -> None:
+        product = load_product()
+        with test_tmpdir() as directory:
+            artifacts = product.Artifacts(Path(directory), product.Variant("1G"))
+            # The payload is rebuilt during the build, on purpose, and its bytes
+            # are not reproducible -- tcc's own archive differs between two
+            # builds of identical inputs.  That must not be read as the inputs
+            # changing underneath the build, or no tcc image could ever be
+            # published.  The stamp has to describe the payload that was
+            # actually embedded, which is the post-build read.
+            with patch.object(product, "rootfs_fingerprint",
+                              side_effect=["repo", "repo"]), \
+                    patch.object(product, "guest_tools_fingerprint",
+                                 return_value="payload"), \
+                    patch.object(product, "run_checked"):
+                product.build_rootfs(artifacts)
+            stamp = product.rootfs_stamp_path(artifacts)
+            self.assertTrue(stamp.exists())
+            self.assertEqual(stamp.read_text().strip(), "repo:payload")
 
     def test_kernel_inputs_changing_during_build_do_not_publish_success_stamp(self) -> None:
         product = load_product()

@@ -746,6 +746,424 @@ pub fn xsave_layout() -> Result<XsaveLayout, XsaveUnavailable> {
     hosted_xsave_layout()
 }
 
+/// XCR0 bits 1 and 2: the SSE and YMM components.
+///
+/// Every AVX and AVX2 instruction faults unless both are selected, so a kernel
+/// that leaves YMM out of XCR0 must not advertise either instruction set even
+/// when CPUID offers it.
+const XCR0_AVX_STATE: u64 = (1 << 1) | (1 << 2);
+
+// CPUID bits the /proc/cpuinfo flag line is decoded from.  The reported tokens
+// are x86 Linux's cpuinfo spellings, because that text is the ABI a compiler
+// driver and a user-mode emulator already parse.
+const CPUID_1_EDX_FPU: u32 = 1 << 0;
+const CPUID_1_EDX_TSC: u32 = 1 << 4;
+const CPUID_1_ECX_CX16: u32 = 1 << 13;
+const CPUID_1_EDX_SSE2: u32 = 1 << 26;
+const CPUID_1_ECX_SSE3: u32 = 1 << 0;
+const CPUID_1_ECX_SSSE3: u32 = 1 << 9;
+const CPUID_1_ECX_SSE4_1: u32 = 1 << 19;
+const CPUID_1_ECX_SSE4_2: u32 = 1 << 20;
+const CPUID_1_ECX_XSAVE: u32 = 1 << 26;
+const CPUID_1_ECX_OSXSAVE: u32 = 1 << 27;
+const CPUID_1_ECX_AVX: u32 = 1 << 28;
+const CPUID_1_ECX_RDRAND: u32 = 1 << 30;
+const CPUID_7_0_EBX_FSGSBASE: u32 = 1 << 0;
+const CPUID_7_0_EBX_AVX2: u32 = 1 << 5;
+const CPUID_7_0_EBX_RDSEED: u32 = 1 << 18;
+const CPUID_8000_0001_EDX_PDPE1GB: u32 = 1 << 26;
+const CPUID_8000_0001_EDX_LM: u32 = 1 << 29;
+
+// One bit per reported name, so the decode below stays a list of architectural
+// conditions and the print order lives in one table.
+const FLAG_FPU: u32 = 1 << 0;
+const FLAG_TSC: u32 = 1 << 1;
+const FLAG_CX16: u32 = 1 << 2;
+const FLAG_SSE2: u32 = 1 << 3;
+const FLAG_SSE3: u32 = 1 << 4;
+const FLAG_SSSE3: u32 = 1 << 5;
+const FLAG_SSE4_1: u32 = 1 << 6;
+const FLAG_SSE4_2: u32 = 1 << 7;
+const FLAG_RDRAND: u32 = 1 << 8;
+const FLAG_XSAVE: u32 = 1 << 9;
+const FLAG_OSXSAVE: u32 = 1 << 10;
+const FLAG_AVX: u32 = 1 << 11;
+const FLAG_AVX2: u32 = 1 << 12;
+const FLAG_FSGSBASE: u32 = 1 << 13;
+const FLAG_RDSEED: u32 = 1 << 14;
+const FLAG_PDPE1GB: u32 = 1 << 15;
+const FLAG_LM: u32 = 1 << 16;
+
+/// Reported names in print order, each with the bit that selects it.
+///
+/// `pni` and `sse3` are one architectural bit (CPUID.1:ECX.SSE3).  x86 Linux
+/// has always spelled it `pni`, and readers written against Linux grep that
+/// token, while Intel/AMD documentation and newer tools say `sse3`; printing
+/// both keeps either reader correct and still describes exactly one feature.
+const X86_USER_FEATURE_NAMES: &[(&str, u32)] = &[
+    ("fpu", FLAG_FPU),
+    ("tsc", FLAG_TSC),
+    ("cx16", FLAG_CX16),
+    ("sse2", FLAG_SSE2),
+    ("pni", FLAG_SSE3),
+    ("sse3", FLAG_SSE3),
+    ("ssse3", FLAG_SSSE3),
+    ("sse4_1", FLAG_SSE4_1),
+    ("sse4_2", FLAG_SSE4_2),
+    ("rdrand", FLAG_RDRAND),
+    ("xsave", FLAG_XSAVE),
+    ("osxsave", FLAG_OSXSAVE),
+    ("avx", FLAG_AVX),
+    ("avx2", FLAG_AVX2),
+    ("fsgsbase", FLAG_FSGSBASE),
+    ("rdseed", FLAG_RDSEED),
+    ("pdpe1gb", FLAG_PDPE1GB),
+    ("lm", FLAG_LM),
+];
+
+/// Everything [`x86_user_feature_flags`] decodes from: already-read CPUID leaf
+/// values plus the user state this kernel has actually enabled.
+///
+/// Keeping the decoder a pure function of these observations lets host tests
+/// run it against real CPUID values captured on any machine, and keeps the
+/// "does this CPU implement that leaf" decision in one place.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct X86FeatureObservations {
+    /// `CPUID.0:EAX`, the highest basic leaf this CPU implements.
+    pub max_basic_leaf: u32,
+    /// `CPUID.0x80000000:EAX`, the highest extended leaf this CPU implements.
+    pub max_extended_leaf: u32,
+    /// `CPUID.1:ECX`.
+    pub leaf1_ecx: u32,
+    /// `CPUID.1:EDX`.
+    pub leaf1_edx: u32,
+    /// `CPUID.(EAX=7,ECX=0):EBX`, meaningful only when `max_basic_leaf >= 7`.
+    pub leaf7_0_ebx: u32,
+    /// `CPUID.0x80000001:EDX`, meaningful only when `max_extended_leaf`
+    /// covers that leaf.
+    pub leaf_8000_0001_edx: u32,
+    /// XCR0 as [`init_xsave_state`] enabled it for user tasks.  Zero is the
+    /// legacy FXSAVE contract, which preserves x87/SSE but no YMM state.
+    pub enabled_xcr0: u64,
+    /// CR4.FSGSBASE, i.e. user mode may execute RDFSBASE/RDWRFSBASE.
+    pub cr4_fsgsbase: bool,
+}
+
+/// Sets one reported name's bit when its architectural condition holds.
+fn set_feature_flag(flags: &mut u32, present: bool, flag: u32) {
+    if present {
+        *flags |= flag;
+    }
+}
+
+/// Decodes the x86 feature-flag names for one `/proc/cpuinfo` `flags` field.
+///
+/// A name is yielded only when this CPU *and* this kernel can honour it for
+/// user mode.  CPUID returns another leaf's data for a leaf the CPU does not
+/// implement, so nothing is decoded from a leaf outside the bounds the CPU
+/// itself reported; and features whose state the OS owns (`xsave`, `osxsave`,
+/// `avx`, `avx2`, `fsgsbase`) are gated on the state the kernel enabled, never
+/// on CPUID alone.  Names come out in the canonical print order.
+pub fn x86_user_feature_flags(
+    observed: X86FeatureObservations,
+) -> impl Iterator<Item = &'static str> {
+    let mut flags = 0u32;
+
+    // Leaf 1 exists on every CPU that can run this kernel, but the bound is
+    // still honoured so an all-zero observation decodes to nothing instead of
+    // inventing features.
+    if observed.max_basic_leaf >= 1 {
+        let (ecx, edx) = (observed.leaf1_ecx, observed.leaf1_edx);
+        // x87 and SSE state is switched for every user task by the `fp-simd`
+        // product contract (CR4.OSFXSR/OSXMMEXCPT plus the per-task XSAVE or
+        // FXSAVE image), and the kernel never sets CR4.TSD, so these bits are
+        // reported straight from CPUID exactly as Linux's cpuinfo does.
+        set_feature_flag(&mut flags, edx & CPUID_1_EDX_FPU != 0, FLAG_FPU);
+        set_feature_flag(&mut flags, edx & CPUID_1_EDX_TSC != 0, FLAG_TSC);
+        set_feature_flag(&mut flags, ecx & CPUID_1_ECX_CX16 != 0, FLAG_CX16);
+        set_feature_flag(&mut flags, edx & CPUID_1_EDX_SSE2 != 0, FLAG_SSE2);
+        set_feature_flag(&mut flags, ecx & CPUID_1_ECX_SSE3 != 0, FLAG_SSE3);
+        set_feature_flag(&mut flags, ecx & CPUID_1_ECX_SSSE3 != 0, FLAG_SSSE3);
+        set_feature_flag(&mut flags, ecx & CPUID_1_ECX_SSE4_1 != 0, FLAG_SSE4_1);
+        set_feature_flag(&mut flags, ecx & CPUID_1_ECX_SSE4_2 != 0, FLAG_SSE4_2);
+        set_feature_flag(&mut flags, ecx & CPUID_1_ECX_RDRAND != 0, FLAG_RDRAND);
+
+        // XSAVE, OSXSAVE and AVX describe state the OS must have enabled:
+        // CPUID.1:ECX.OSXSAVE *is* CR4.OSXSAVE, and AVX needs the SSE and YMM
+        // components selected in the XCR0 this kernel published.
+        let osxsave = ecx & CPUID_1_ECX_OSXSAVE != 0;
+        set_feature_flag(&mut flags, osxsave, FLAG_OSXSAVE);
+        set_feature_flag(
+            &mut flags,
+            osxsave && ecx & CPUID_1_ECX_XSAVE != 0,
+            FLAG_XSAVE,
+        );
+        let avx = osxsave
+            && ecx & CPUID_1_ECX_AVX != 0
+            && observed.enabled_xcr0 & XCR0_AVX_STATE == XCR0_AVX_STATE;
+        set_feature_flag(&mut flags, avx, FLAG_AVX);
+
+        // AVX2 is a VEX-256 consumer of that same YMM state, so it inherits
+        // every gate AVX just passed.
+        if observed.max_basic_leaf >= 7 {
+            set_feature_flag(
+                &mut flags,
+                avx && observed.leaf7_0_ebx & CPUID_7_0_EBX_AVX2 != 0,
+                FLAG_AVX2,
+            );
+        }
+    }
+
+    if observed.max_basic_leaf >= 7 {
+        let ebx = observed.leaf7_0_ebx;
+        // RDFSBASE/RDWRFSBASE fault at every privilege level while
+        // CR4.FSGSBASE is clear, so the CPUID bit alone would be a lie.
+        set_feature_flag(
+            &mut flags,
+            observed.cr4_fsgsbase && ebx & CPUID_7_0_EBX_FSGSBASE != 0,
+            FLAG_FSGSBASE,
+        );
+        set_feature_flag(&mut flags, ebx & CPUID_7_0_EBX_RDSEED != 0, FLAG_RDSEED);
+    }
+
+    if observed.max_extended_leaf >= 0x8000_0001 {
+        let edx = observed.leaf_8000_0001_edx;
+        set_feature_flag(
+            &mut flags,
+            edx & CPUID_8000_0001_EDX_PDPE1GB != 0,
+            FLAG_PDPE1GB,
+        );
+        set_feature_flag(&mut flags, edx & CPUID_8000_0001_EDX_LM != 0, FLAG_LM);
+    }
+
+    X86_USER_FEATURE_NAMES
+        .iter()
+        .filter_map(move |&(name, flag)| (flags & flag != 0).then_some(name))
+}
+
+/// Reads the local CPU's [`X86FeatureObservations`].
+///
+/// The CPUID.0 and CPUID.0x80000000 bounds are read first and every dependent
+/// leaf is read only when the bound says this CPU implements it.
+pub fn read_x86_feature_observations() -> X86FeatureObservations {
+    let max_basic_leaf = core::arch::x86_64::__cpuid(0).eax;
+    let max_extended_leaf = core::arch::x86_64::__cpuid(0x8000_0000).eax;
+    let (leaf1_ecx, leaf1_edx) = if max_basic_leaf >= 1 {
+        let leaf = core::arch::x86_64::__cpuid(1);
+        (leaf.ecx, leaf.edx)
+    } else {
+        (0, 0)
+    };
+    X86FeatureObservations {
+        max_basic_leaf,
+        max_extended_leaf,
+        leaf1_ecx,
+        leaf1_edx,
+        leaf7_0_ebx: if max_basic_leaf >= 7 {
+            core::arch::x86_64::__cpuid_count(7, 0).ebx
+        } else {
+            0
+        },
+        leaf_8000_0001_edx: if max_extended_leaf >= 0x8000_0001 {
+            core::arch::x86_64::__cpuid(0x8000_0001).edx
+        } else {
+            0
+        },
+        enabled_xcr0: user_enabled_xcr0(),
+        cr4_fsgsbase: user_fsgsbase_enabled(),
+    }
+}
+
+/// The XCR0 bits this kernel has enabled for user tasks, or zero when user
+/// state is switched with the legacy FXSAVE contract.
+///
+/// This reuses [`xsave_layout`] rather than reading XCR0 directly so the flag
+/// line can never describe more state than the scheduler actually switches.
+#[cfg(feature = "fp-simd")]
+fn user_enabled_xcr0() -> u64 {
+    xsave_layout().map_or(0, |layout| layout.xfeatures)
+}
+
+/// Without `fp-simd` no user XSAVE state is enabled at all.
+#[cfg(not(feature = "fp-simd"))]
+fn user_enabled_xcr0() -> u64 {
+    0
+}
+
+/// Whether this CPU lets user mode execute RDFSBASE/RDWRFSBASE.
+///
+/// CR4.FSGSBASE gates those instructions, so this reports the live bit instead
+/// of CPUID's promise: a kernel that never raises the bit must not advertise
+/// `fsgsbase`.  Hosted builds must always return false, because CR4 is not
+/// readable from user mode.
+#[inline]
+pub fn user_fsgsbase_enabled() -> bool {
+    #[cfg(target_os = "none")]
+    {
+        Cr4::read().contains(Cr4Flags::FSGSBASE)
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+mod x86_user_feature_flag_tests {
+    use super::*;
+
+    /// CPUID as an Intel Core Ultra X7 358H (Panther Lake) reports it.  The
+    /// decoder is tested on these real leaf values rather than on invented
+    /// ones, because a compiler driver and a JIT only ever see such machines.
+    const REALISTIC_MAX_BASIC_LEAF: u32 = 0x28;
+    const REALISTIC_MAX_EXTENDED_LEAF: u32 = 0x8000_0008;
+    const REALISTIC_LEAF1_ECX: u32 = 0x7ffa_fbff;
+    const REALISTIC_LEAF1_EDX: u32 = 0xbfeb_fbff;
+    const REALISTIC_LEAF7_0_EBX: u32 = 0x239c_a7eb;
+    const REALISTIC_LEAF_8000_0001_EDX: u32 = 0x2c10_0800;
+
+    /// XCR0 with x87, SSE and YMM selected: the layout `init_xsave_state`
+    /// publishes on a CPU that offers both AVX and the leaf-0xD YMM component.
+    const YMM_ENABLED_XCR0: u64 = (1 << 0) | XCR0_AVX_STATE;
+    /// XCR0 limited to the mandatory x87/SSE components.
+    const FPU_SSE_XCR0: u64 = (1 << 0) | (1 << 1);
+
+    fn decode(observed: X86FeatureObservations) -> Vec<&'static str> {
+        x86_user_feature_flags(observed).collect()
+    }
+
+    #[test]
+    fn cx16_is_ecx_bit_13_not_edx_apic() {
+        let mut observed = X86FeatureObservations {
+            max_basic_leaf: 1,
+            leaf1_edx: 1 << 9,
+            ..Default::default()
+        };
+        assert!(!decode(observed).contains(&"cx16"));
+        observed.leaf1_edx = 0;
+        observed.leaf1_ecx = 1 << 13;
+        assert_eq!(decode(observed), ["cx16"]);
+    }
+
+    #[test]
+    fn zeroed_observations_report_no_flags() {
+        assert!(decode(X86FeatureObservations::default()).is_empty());
+    }
+
+    #[test]
+    fn a_leaf_the_cpu_does_not_implement_never_contributes_flags() {
+        // CPUID.0 stops at leaf 1 and CPUID.0x80000000 at the extended-leaf
+        // root, so the stored leaf-7 and leaf-0x80000001 words are stale data
+        // from some other read, not what this CPU implements.
+        let observed = X86FeatureObservations {
+            max_basic_leaf: 1,
+            max_extended_leaf: 0x8000_0000,
+            leaf1_ecx: REALISTIC_LEAF1_ECX,
+            leaf1_edx: REALISTIC_LEAF1_EDX,
+            leaf7_0_ebx: u32::MAX,
+            leaf_8000_0001_edx: u32::MAX,
+            enabled_xcr0: YMM_ENABLED_XCR0,
+            cr4_fsgsbase: true,
+        };
+        let flags = decode(observed);
+        for absent in ["fsgsbase", "avx2", "rdseed", "pdpe1gb", "lm"] {
+            assert!(
+                !flags.contains(&absent),
+                "{absent} came from an absent leaf"
+            );
+        }
+        // Leaf 1 is implemented, and AVX needs only leaf 1 plus the enabled
+        // XCR0, so that half of the line is still decoded in full.
+        assert_eq!(
+            flags,
+            [
+                "fpu", "tsc", "cx16", "sse2", "pni", "sse3", "ssse3", "sse4_1", "sse4_2", "rdrand",
+                "xsave", "osxsave", "avx",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_realistic_cpuid_reports_exactly_the_usable_flags() {
+        let observed = X86FeatureObservations {
+            max_basic_leaf: REALISTIC_MAX_BASIC_LEAF,
+            max_extended_leaf: REALISTIC_MAX_EXTENDED_LEAF,
+            leaf1_ecx: REALISTIC_LEAF1_ECX,
+            leaf1_edx: REALISTIC_LEAF1_EDX,
+            leaf7_0_ebx: REALISTIC_LEAF7_0_EBX,
+            leaf_8000_0001_edx: REALISTIC_LEAF_8000_0001_EDX,
+            enabled_xcr0: YMM_ENABLED_XCR0,
+            cr4_fsgsbase: true,
+        };
+        assert_eq!(
+            decode(observed),
+            [
+                "fpu", "tsc", "cx16", "sse2", "pni", "sse3", "ssse3", "sse4_1", "sse4_2", "rdrand",
+                "xsave", "osxsave", "avx", "avx2", "fsgsbase", "rdseed", "pdpe1gb", "lm",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_kernel_without_ymm_state_hides_avx_and_avx2() {
+        // The CPU offers AVX, AVX2 and FSGSBASE, but this kernel switched user
+        // state with the x87/SSE layout only and never raised CR4.FSGSBASE.
+        let observed = X86FeatureObservations {
+            max_basic_leaf: REALISTIC_MAX_BASIC_LEAF,
+            max_extended_leaf: REALISTIC_MAX_EXTENDED_LEAF,
+            leaf1_ecx: REALISTIC_LEAF1_ECX,
+            leaf1_edx: REALISTIC_LEAF1_EDX,
+            leaf7_0_ebx: REALISTIC_LEAF7_0_EBX,
+            leaf_8000_0001_edx: REALISTIC_LEAF_8000_0001_EDX,
+            enabled_xcr0: FPU_SSE_XCR0,
+            cr4_fsgsbase: false,
+        };
+        let flags = decode(observed);
+        for absent in ["avx", "avx2", "fsgsbase"] {
+            assert!(
+                !flags.contains(&absent),
+                "{absent} needs state the kernel did not enable"
+            );
+        }
+        assert_eq!(
+            flags,
+            [
+                "fpu", "tsc", "cx16", "sse2", "pni", "sse3", "ssse3", "sse4_1", "sse4_2", "rdrand",
+                "xsave", "osxsave", "rdseed", "pdpe1gb", "lm",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_osxsave_the_kernel_did_not_enable_hides_avx_and_avx2() {
+        // CPUID.1:ECX.OSXSAVE mirrors CR4.OSXSAVE.  Without it no XSETBV ran,
+        // so leaf 7's AVX2 bit and any XCR0 YMM bits describe state user mode
+        // cannot reach.
+        let observed = X86FeatureObservations {
+            max_basic_leaf: REALISTIC_MAX_BASIC_LEAF,
+            max_extended_leaf: REALISTIC_MAX_EXTENDED_LEAF,
+            leaf1_ecx: REALISTIC_LEAF1_ECX & !CPUID_1_ECX_OSXSAVE,
+            leaf1_edx: REALISTIC_LEAF1_EDX,
+            leaf7_0_ebx: REALISTIC_LEAF7_0_EBX | CPUID_7_0_EBX_AVX2,
+            leaf_8000_0001_edx: REALISTIC_LEAF_8000_0001_EDX,
+            enabled_xcr0: YMM_ENABLED_XCR0,
+            cr4_fsgsbase: false,
+        };
+        let flags = decode(observed);
+        for absent in ["xsave", "osxsave", "avx", "avx2"] {
+            assert!(!flags.contains(&absent), "{absent} needs CR4.OSXSAVE");
+        }
+        // RDSEED and the extended-leaf flags need no OS state and survive.
+        assert_eq!(
+            flags,
+            [
+                "fpu", "tsc", "cx16", "sse2", "pni", "sse3", "ssse3", "sse4_1", "sse4_2", "rdrand",
+                "rdseed", "pdpe1gb", "lm",
+            ]
+        );
+    }
+}
+
 /// Saves every enabled user xfeature into a standard XSAVE image.
 #[cfg(feature = "fp-simd")]
 pub fn save_xsave(layout: XsaveLayout, image: &mut [u8]) -> bool {

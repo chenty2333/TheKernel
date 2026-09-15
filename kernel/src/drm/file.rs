@@ -48,10 +48,12 @@ pub enum DrmEvent {
 }
 
 pub struct DrmFile {
+    pinned_memory: Arc<AtomicUsize>,
     device: Arc<DrmDevice>,
     id: OpenId,
     state: Mutex<FileState>,
     events: Arc<EventQueue>,
+    event_read_lock: axsync::Mutex<()>,
     render_node: bool,
     seat_revoked: Arc<AtomicBool>,
     seat_owned_primary: bool,
@@ -215,6 +217,7 @@ impl DrmFile {
         seat_owned_primary: bool,
     ) -> Self {
         Self {
+            pinned_memory: Arc::new(AtomicUsize::new(0)),
             device,
             id,
             state: Mutex::new(FileState {
@@ -229,10 +232,18 @@ impl DrmFile {
                 render_cancelled: Arc::new(AtomicBool::new(false)),
             }),
             events: EventQueue::new(),
+            event_read_lock: axsync::Mutex::new(()),
             render_node,
             seat_revoked: Arc::new(AtomicBool::new(false)),
             seat_owned_primary,
         }
+    }
+
+    pub(crate) fn reserve_render_memory(
+        &self,
+        bytes: usize,
+    ) -> DrmResult<Arc<super::gem::GemMemoryCharge>> {
+        super::gem::GemMemoryCharge::reserve(self.pinned_memory.clone(), bytes)
     }
 
     pub fn id(&self) -> OpenId {
@@ -501,7 +512,7 @@ impl DrmFile {
         self.state.lock().atomic_enabled = true;
     }
     pub(crate) fn create_blob(&self, bytes: alloc::vec::Vec<u8>) -> DrmResult<u32> {
-        self.device.create_property_blob(bytes)
+        self.device.create_property_blob(self.id, bytes)
     }
     pub(crate) fn blob(&self, id: u32) -> Option<alloc::vec::Vec<u8>> {
         self.device.property_blob(id)
@@ -510,7 +521,7 @@ impl DrmFile {
         self.device.live_property_blob(id)
     }
     pub(crate) fn destroy_blob(&self, id: u32) -> DrmResult<()> {
-        self.device.destroy_property_blob(id)
+        self.device.destroy_property_blob(self.id, id)
     }
 
     /// Handles a DRM ioctl using the syscall's captured user memory.
@@ -536,8 +547,11 @@ impl DrmFile {
         self.device.acquire_master(self.id, self.seat_owned_primary)
     }
 
-    pub fn drop_master(&self) {
+    pub fn drop_master(&self) -> DrmResult<()> {
         let mut device = self.device.state.lock();
+        if device.master != Some(self.id) {
+            return Err(DrmError::Invalid);
+        }
         let restore_console = self.seat_owned_primary && device.master == Some(self.id);
         if device.master == Some(self.id) {
             device.set_master(None);
@@ -549,6 +563,7 @@ impl DrmFile {
         if restore_console {
             crate::pseudofs::dev::restore_console_after_master_close();
         }
+        Ok(())
     }
 
     pub fn resources(&self) -> KmsResources {
@@ -585,7 +600,7 @@ impl DrmFile {
             bytes.extend_from_slice(&color[2].to_ne_bytes());
             bytes.extend_from_slice(&0u16.to_ne_bytes());
         }
-        let blob = self.device.create_property_blob(bytes)?;
+        let blob = self.device.create_property_blob(self.id, bytes)?;
         let result = self.submit_legacy_atomic(
             &[super::atomic::Change {
                 object: crtc_id,
@@ -596,13 +611,19 @@ impl DrmFile {
             None,
             false,
         );
-        let destroy = self.device.destroy_property_blob(blob);
+        let destroy = self.device.destroy_property_blob(self.id, blob);
         result.and(destroy)
     }
 
     pub fn create_dumb(&self, request: DumbRequest) -> DrmResult<DumbBuffer> {
         let (pitch, size) = dumb_layout(request)?;
-        let backing = self.device.adapter.create_dumb(request, pitch, size)?;
+        let bytes = usize::try_from(size).map_err(|_| DrmError::Overflow)?;
+        let bytes = crate::mm::checked_align_up(bytes, 4096).ok_or(DrmError::Overflow)?;
+        let charge = self.reserve_render_memory(bytes)?;
+        let backing = self
+            .device
+            .adapter
+            .create_dumb(request, pitch, size, charge)?;
         let mmap_offset = {
             let mut device = self.device.state.lock();
             let offset = device.next_mmap_offset;
@@ -1036,6 +1057,7 @@ impl DrmFile {
         }
         self.device.wait_for_vblank_at_least(target)
     }
+    #[cfg(test)]
     pub fn dequeue_event(&self) -> Option<DrmEvent> {
         self.events.state.lock().events.pop_front()
     }
@@ -1045,9 +1067,26 @@ impl DrmFile {
         if self.seat_owned_primary && self.seat_revoked.load(Ordering::Acquire) {
             return Err(LinuxError::ENODEV.into());
         }
+        // Only readers share this sleeping lock. Producers and seat teardown
+        // never wait for a user page fault. Keep the head charged and queued
+        // until the entire record has been copied, so EFAULT is retryable.
+        use crate::task::AsThread;
+        let _reader = axsync::lock_interruptible(&self.event_read_lock, || {
+            axtask::current().try_as_thread().is_some_and(|thread| {
+                crate::task::has_pending_syscall_signal(thread)
+                    || thread.proc_data.should_exit_for_exec(thread.kernel_tid())
+            })
+        })
+        .ok_or(AxError::Interrupted)?;
         let mut written = 0;
-        let mut state = self.events.state.lock();
-        while let Some(event) = state.events.front().copied() {
+        loop {
+            let event = {
+                let state = self.events.state.lock();
+                let Some(event) = state.events.front().copied() else {
+                    break;
+                };
+                event
+            };
             let bytes = event.to_linux_bytes();
             if dst.remaining_mut() < bytes.len() {
                 if written == 0 {
@@ -1055,8 +1094,19 @@ impl DrmFile {
                 }
                 break;
             }
-            dst.write(&bytes)?;
-            state.events.pop_front();
+            if let Err(error) = dst.write_all(&bytes) {
+                return if written == 0 {
+                    Err(error)
+                } else {
+                    Ok(written)
+                };
+            }
+            let mut state = self.events.state.lock();
+            // Closing may have cleared the queue during usercopy. It cannot
+            // reopen or enqueue another head after that point.
+            if !state.closed {
+                state.events.pop_front();
+            }
             written += bytes.len();
         }
         Ok(written)
@@ -1179,6 +1229,7 @@ impl DrmEvent {
 
 impl Drop for DrmFile {
     fn drop(&mut self) {
+        self.device.release_property_blobs(self.id);
         self.events.begin_close();
         self.device.cancel_file_commits(&self.events);
         self.events.finish_close();
@@ -1228,6 +1279,110 @@ mod tests {
 
     use super::*;
 
+    struct EventWriter<'a> {
+        queue: &'a EventQueue,
+        remaining: usize,
+        fail_after: usize,
+        written: usize,
+    }
+    impl axio::IoBuf for EventWriter<'_> {
+        fn remaining(&self) -> usize {
+            0
+        }
+    }
+    impl axio::IoBufMut for EventWriter<'_> {
+        fn remaining_mut(&self) -> usize {
+            self.remaining
+        }
+    }
+    impl axio::Write for EventWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> AxResult<usize> {
+            assert!(
+                self.queue.state.try_lock().is_some(),
+                "usercopy holds event spin lock"
+            );
+            if self.written >= self.fail_after {
+                return Err(LinuxError::EFAULT.into());
+            }
+            // Exercise legal short writes, too.
+            let n = bytes.len().min(7).min(self.fail_after - self.written);
+            self.written += n;
+            self.remaining -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> AxResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn event_usercopy_fault_retains_record_and_short_writes_are_completed() {
+        let _context = crate::test_support::scheduler_test_context();
+        let file = device().open_primary();
+        let token = file.events.reserve(7).unwrap();
+        file.events.complete(token, 4, 1);
+        let record_len = file.events.state.lock().events[0].to_linux_bytes().len();
+        let mut dst = EventWriter {
+            queue: &file.events,
+            remaining: record_len,
+            fail_after: 7,
+            written: 0,
+        };
+        assert_eq!(file.read_events(&mut dst), Err(LinuxError::EFAULT.into()));
+        assert_eq!(file.events.state.lock().events.len(), 1);
+        dst.remaining = record_len;
+        dst.fail_after = usize::MAX;
+        dst.written = 0;
+        assert_eq!(file.read_events(&mut dst), Ok(record_len));
+        assert_eq!(dst.written, record_len);
+        assert!(file.events.state.lock().events.is_empty());
+    }
+
+    #[test]
+    fn event_usercopy_fault_returns_only_preceding_complete_records() {
+        let _context = crate::test_support::scheduler_test_context();
+        let file = device().open_primary();
+        for user_data in [1, 2] {
+            let token = file.events.reserve(user_data).unwrap();
+            file.events.complete(token, 4, 1);
+        }
+        let record_len = file.events.state.lock().events[0].to_linux_bytes().len();
+        let mut dst = EventWriter {
+            queue: &file.events,
+            remaining: 2 * record_len,
+            fail_after: record_len,
+            written: 0,
+        };
+        assert_eq!(file.read_events(&mut dst), Ok(record_len));
+        assert!(matches!(
+            file.dequeue_event(),
+            Some(DrmEvent::FlipComplete { user_data: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn property_blobs_are_globally_readable_but_destroyed_only_by_the_owner() {
+        let device = device();
+        let owner = device.open_primary();
+        let other = device.open_primary();
+        let id = owner.create_blob(alloc::vec![1, 2, 3]).unwrap();
+        assert_eq!(other.blob(id), Some(alloc::vec![1, 2, 3]));
+        assert!(matches!(
+            other.destroy_blob(id),
+            Err(DrmError::PermissionDenied)
+        ));
+        drop(owner);
+        assert_eq!(other.blob(id), None);
+    }
+
+    #[test]
+    fn dropping_master_requires_current_mastership() {
+        let file = device().open_primary();
+        file.become_master().unwrap();
+        file.drop_master().unwrap();
+        assert!(matches!(file.drop_master(), Err(DrmError::Invalid)));
+    }
+
     struct Backing;
     impl super::super::GemBacking for Backing {
         fn shared_pages(&self) -> DrmResult<Arc<crate::mm::SharedPages>> {
@@ -1241,6 +1396,7 @@ mod tests {
             _: DumbRequest,
             _: u32,
             _: u64,
+            _allocation_owner: Arc<dyn Send + Sync>,
         ) -> DrmResult<Arc<dyn super::super::GemBacking>> {
             Ok(Arc::new(Backing))
         }
@@ -1434,7 +1590,7 @@ mod tests {
     #[test]
     fn gamma_lut_is_per_crtc_and_requires_master_to_change() {
         let file = device().open_primary();
-        file.drop_master();
+        file.drop_master().unwrap();
         let original = file.gamma_lut(3).unwrap();
         let mut replacement = original.clone();
         replacement[0] = 0x1234;
@@ -1460,7 +1616,7 @@ mod tests {
         let second = device.open_primary();
         assert_eq!(second.require_master(), Err(DrmError::PermissionDenied));
         assert_eq!(second.become_master(), Err(DrmError::Busy));
-        first.drop_master();
+        first.drop_master().unwrap();
         console.become_master().unwrap();
         second.become_master().unwrap();
         assert_eq!(console.require_master(), Err(DrmError::PermissionDenied));

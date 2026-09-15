@@ -292,7 +292,7 @@ pub struct SwapPte(u64);
 impl SwapPte {
     const TAG: u64 = 1 << 63;
     fn new(area: u16, slot: usize) -> AxResult<Self> {
-        (slot < (1usize << 48))
+        (area != 0 && area <= 0x7fff && slot < (1usize << 48))
             .then_some(Self(Self::TAG | ((area as u64) << 48) | slot as u64))
             .ok_or(AxError::InvalidInput)
     }
@@ -351,10 +351,10 @@ pub fn activate(location: Location, flags: i32) -> AxResult<()> {
         .map_err(|_| AxError::NoMemory)?;
     refs.resize(slots, 0);
     let id = swaps.next_id;
-    swaps.next_id = swaps.next_id.wrapping_add(1);
-    if id == 0 || swaps.areas.values().any(|area| area.id == id) {
+    if id == 0 || id > 0x7fff || swaps.areas.values().any(|area| area.id == id) {
         return Err(LinuxError::ENOSPC.into());
     }
+    swaps.next_id += 1;
     let flags = flags as u32;
     let priority = if flags & SWAP_FLAG_PREFER != 0 {
         (flags & 0x7fff) as i16
@@ -634,5 +634,19 @@ mod tests {
         assert_eq!(entry.area(), 0x1234);
         assert_eq!(entry.slot(), 0x1234_5678_9abc);
         assert_ne!(entry.raw() & SwapPte::TAG, 0);
+    }
+}
+
+#[cfg(test)]
+mod swap_encoding_bounds_tests {
+    use super::*;
+    #[test]
+    fn area_id_cannot_alias_tag_bit() {
+        assert_eq!(SwapPte::new(0, 0), Err(AxError::InvalidInput));
+        assert_eq!(SwapPte::new(0x8000, 0), Err(AxError::InvalidInput));
+        assert_eq!(SwapPte::new(0xffff, 0), Err(AxError::InvalidInput));
+        let pte = SwapPte::new(0x7fff, (1usize << 48) - 1).unwrap();
+        assert_eq!(pte.area(), 0x7fff);
+        assert_eq!(pte.slot(), (1usize << 48) - 1);
     }
 }

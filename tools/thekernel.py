@@ -26,7 +26,9 @@ from tools.product_state import (
     MACHINE_PROFILES, machine_profile,
     state_root, validate_storage, state_lock, serialized_build, isolated_run,
     artifact_config_stamp, artifact_config_key, artifact_input_key, validate_artifact_config,
-    rootfs_stamp_path, rootfs_fingerprint,
+    rootfs_stamp_path, rootfs_fingerprint, rootfs_image_fingerprint,
+    TOOL_PAYLOADS, selected_tool_payload, rootfs_image_bytes,
+    guest_tools_dir, guest_tools_fingerprint,
 )
 from tools.verification import verify_cmd
 from tools.ktap import COMPLETION_MARKER, KtapError, reject_ktap_skips, validate_ktap_log
@@ -351,7 +353,14 @@ def build_kernel(
 @serialized_build
 def build_rootfs(artifacts: Artifacts) -> None:
     artifacts.rootfs.parent.mkdir(parents=True, exist_ok=True)
-    fingerprint = rootfs_fingerprint()
+    payload = selected_tool_payload()
+    tools_dir = guest_tools_dir(artifacts.root, payload)
+    # The image's identity is the repository inputs plus the staged payload the
+    # image embeds, read from disk before anything is rebuilt so the decision to
+    # reuse an image is made against what is actually there.
+    git_before = rootfs_fingerprint()
+    payload_before = guest_tools_fingerprint(artifacts.root, payload)
+    fingerprint = f"{git_before}:{payload_before}"
     stamp = rootfs_stamp_path(artifacts)
     if (
         artifacts.rootfs.is_file()
@@ -361,10 +370,29 @@ def build_rootfs(artifacts: Artifacts) -> None:
         print(f"thekernel: rootfs unchanged, reusing {artifacts.rootfs}", file=sys.stderr)
         return
     stamp.unlink(missing_ok=True)
+    if payload != "none":
+        run_checked(
+            [
+                "bash",
+                str(REPO_ROOT / "scripts" / "build-guest-tools.sh"),
+                "--payload",
+                payload,
+                "--output",
+                str(tools_dir),
+            ],
+            env={**os.environ, "THEKERNEL_SOURCE_CACHE": str(artifacts.root / "source-cache")},
+        )
     env = {
         **os.environ,
         "THEKERNEL_SOURCE_CACHE": str(artifacts.root / "source-cache"),
+        "THEKERNEL_TOOLCHAIN": payload,
+        "THEKERNEL_ROOTFS_SIZE_MB": str(rootfs_image_bytes(payload) // (1024 * 1024)),
+        # A diagnostic image carries cases the accepted image does not, so the
+        # opt-in is passed through explicitly rather than inherited.
+        "THEKERNEL_ROOTFS_DIAGNOSTICS": os.environ.get("THEKERNEL_ROOTFS_DIAGNOSTICS", "0"),
     }
+    if payload != "none":
+        env["THEKERNEL_ROOTFS_TOOLS_DIR"] = str(tools_dir)
     run_checked(
         [
             "bash",
@@ -376,9 +404,40 @@ def build_rootfs(artifacts: Artifacts) -> None:
         ],
         env=env,
     )
-    if rootfs_fingerprint() != fingerprint:
+    # The stamp records what the image was actually made from: both inputs are
+    # re-read now, because the payload was normally rebuilt just above and
+    # describing it from the pre-build read would name a tree that no longer
+    # exists.  This is the value the next run's reuse decision compares against.
+    #
+    # Nothing here requires the *build* to be reproducible, and that distinction
+    # matters: the tcc payload contains an archive whose bytes differ between
+    # two builds of identical inputs, so demanding pre-build == post-build would
+    # refuse every tcc image.  What has to hold is that the image and its stamp
+    # describe the same tree, and they do, because both are read after the
+    # build.
+    git_after = rootfs_fingerprint()
+    payload_after = guest_tools_fingerprint(artifacts.root, payload)
+    rebuilt = f"{git_after}:{payload_after}"
+    if git_after != git_before:
+        # The repository side must not change while its own image is being
+        # built; if it did, the image is a mixture of two revisions and no
+        # single stamp describes it.  The payload side is deliberately not
+        # compared: it is rebuilt above, on purpose, and its bytes need not be
+        # reproducible for the image and the stamp to agree.
+        if os.environ.get("THEKERNEL_DEBUG_FINGERPRINT"):
+            print(
+                f"fingerprint before: repo={git_before[:16]} payload={payload_before[:16]}\n"
+                f"fingerprint after : repo={git_after[:16]} payload={payload_after[:16]}",
+                file=sys.stderr,
+            )
         raise ProductError("rootfs build inputs changed during compilation; rebuild before running")
-    stamp.write_text(fingerprint + "\n", encoding="utf-8")
+    if os.environ.get("THEKERNEL_DEBUG_FINGERPRINT"):
+        print(
+            f"fingerprint before: repo={git_before[:16]} payload={payload_before[:16]}\n"
+            f"fingerprint after : repo={git_after[:16]} payload={payload_after[:16]}",
+            file=sys.stderr,
+        )
+    stamp.write_text(f"{rebuilt}\n", encoding="utf-8")
 
 
 @serialized_build
@@ -1363,6 +1422,18 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
         help="machine profile to build or boot; it selects the configuration file "
              "and the compile-time CPU admission limit, not the QEMU machine",
     )
+    parser.add_argument(
+        "--toolchain",
+        choices=TOOL_PAYLOADS,
+        default=argparse.SUPPRESS,
+        help="guest tool payload to build into the image; `none` is the baseline "
+             "image, `tcc` adds a native C compiler and its musl sysroot, `nested` "
+             "is `tcc` plus a static system emulator and the image it boots, "
+             "`glibc` adds a dynamic loader, shared libc and a dynamic smoke "
+             "program, and `gcc` is `glibc` plus a real distribution C compiler.  "
+             "The default follows THEKERNEL_TOOLCHAIN, and passing the flag wins "
+             "over it",
+    )
     if profiles:
         parser.add_argument(
             "--profile",
@@ -1473,7 +1544,15 @@ def add_graphics_smoke_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--flavor", choices=graphics_smoke_flavors(), default="headless-abi-smoke")
     parser.add_argument("--screenshot", help="QMP screendump PPM output path")
     parser.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
-    parser.add_argument("--timeout", type=positive_timeout, default=300.0)
+    parser.add_argument(
+        "--timeout",
+        type=positive_timeout,
+        default=None,
+        help="whole-run timeout in seconds; the default is 300, or 900 for the "
+             "guest suite when the `nested` or `gcc` toolchain payload is "
+             "selected, because their longest cases exceed 300.  An explicit "
+             "value always wins",
+    )
     parser.add_argument("--workdir")
     parser.add_argument(
         "--no-build",
@@ -1564,13 +1643,34 @@ def host_test_cmd() -> int:
     return 0
 
 
+def suite_default_timeout(suite: str) -> float:
+    """The whole-run timeout a suite gets when --timeout was not passed.
+
+    An explicit --timeout always wins; this is only the default.  The guest
+    suite's case budgets include 330 s for `gcc-smoke` and `nested-linux-boot`,
+    which exceed the historical 300 s whole-run default: on a loaded host the
+    runner then dies as a total timeout in the middle of a case with no
+    transcript, which is the failure the case timeouts exist to report.  900 s
+    is three times the worst measured loaded boot.  The other suites keep 300.
+    """
+
+    if suite == "guest" and selected_tool_payload() in ("nested", "gcc"):
+        return 900.0
+    return 300.0
+
+
 def test_cmd(args: argparse.Namespace) -> int:
     # `fbcon` is deliberately not part of `all`: it asserts on a firmware
     # framebuffer and therefore fixes the graphics profile and the screenshot
     # path, which the other suites select independently.  Run it as
     # `test --suite fbcon --graphics-profile firmware-fb --screenshot OUT.ppm`.
     suites = ("host", "guest", "abi", "graphics", "cpu") if args.suite == "all" else (args.suite,)
+    explicit_timeout = args.timeout
     for suite in suites:
+        # Resolved per suite rather than once: under `--suite all` the guest
+        # suite's larger default must not leak into the others.
+        args.timeout = (explicit_timeout if explicit_timeout is not None
+                        else suite_default_timeout(suite))
         if suite == "host":
             host_test_cmd()
         elif suite == "guest":
@@ -1937,6 +2037,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
+        # The payload selection changes which rootfs image is built and which
+        # one the kernel embeds, so the parsed `--toolchain` value is exported
+        # before any command resolves artifact paths.  Reading
+        # selected_tool_payload() here instead would just echo the environment
+        # back and silently discard the flag.
+        os.environ["THEKERNEL_TOOLCHAIN"] = selected_tool_payload(
+            getattr(args, "toolchain", None)
+        )
         with state_lock("activity", shared=args.command != "clean", blocking=args.command != "clean"):
             return int(args.func(args))
     except (ProductError, RunnerError, ProcessError, OSError) as error:

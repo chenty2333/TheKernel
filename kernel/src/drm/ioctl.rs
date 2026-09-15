@@ -149,7 +149,7 @@ pub(super) fn dispatch(
         uapi::DRM_IOCTL_GET_MAGIC => get_magic(file, copy, arg)?,
         uapi::DRM_IOCTL_AUTH_MAGIC => auth_magic(file, copy, arg)?,
         uapi::DRM_IOCTL_SET_MASTER => file.become_master().map_err(AxError::from)?,
-        uapi::DRM_IOCTL_DROP_MASTER => file.drop_master(),
+        uapi::DRM_IOCTL_DROP_MASTER => file.drop_master().map_err(AxError::from)?,
         uapi::DRM_IOCTL_GEM_CLOSE => {
             let request: uapi::DrmGemClose = read_pod(copy, arg)?;
             file.close_handle(request.handle).map_err(AxError::from)?;
@@ -1473,6 +1473,7 @@ fn cursor(file: &DrmFile, copy: &impl UserCopy, arg: usize, cursor2: bool) -> Ax
 }
 
 fn dirtyfb(file: &DrmFile, copy: &impl UserCopy, arg: usize) -> AxResult<()> {
+    file.require_master().map_err(AxError::from)?;
     let r: uapi::DrmModeFbDirtyCmd = read_pod(copy, arg)?;
     if r.flags != 0 || r.color != 0 || r.num_clips != 0 || r.clips_ptr != 0 {
         return Err(AxError::InvalidInput);
@@ -1869,6 +1870,7 @@ mod tests {
             _: DumbRequest,
             _: u32,
             _: u64,
+            _allocation_owner: Arc<dyn Send + Sync>,
         ) -> crate::drm::DrmResult<Arc<dyn crate::drm::GemBacking>> {
             Ok(Arc::new(Backing))
         }

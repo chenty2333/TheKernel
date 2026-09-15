@@ -453,6 +453,110 @@ static int test_signal_fp(void) {
         "signal-fp-child");
 }
 
+/* Phase-0 contract probes for the guest toolchain and nested QEMU plan
+ * (docs/design/guest-toolchain-and-nested-qemu.md).  Each one measures a
+ * contract a compiler or an emulator depends on and classifies its own
+ * findings as required or informational, so a non-zero result here means a
+ * required contract failed rather than that a probe was unable to look. */
+static int test_jit_mem(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-jit-mem-smoke",
+        NULL,
+        "jit-mem-child");
+}
+
+static int test_proc_shape(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-proc-shape-smoke",
+        NULL,
+        "proc-shape-child");
+}
+
+static int test_threads_futex(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-threads-futex-smoke",
+        NULL,
+        "threads-futex-child");
+}
+
+#if defined(THEKERNEL_TOOL_PAYLOAD_TCC)
+/* The native C compilation case exists only in an image that carries the tcc
+ * payload.  It is a compile-time selection, not a runtime probe: the case
+ * table is the suite's plan, and a payload image must not be able to report a
+ * different plan than the one it was built for.  An image built for the
+ * payload that is missing the compiler therefore fails, which is what makes
+ * the payload claim testable. */
+static int test_compiler_smoke(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-compiler-smoke",
+        NULL,
+        "compiler-smoke-child");
+}
+#endif
+
+#if defined(THEKERNEL_TOOL_PAYLOAD_GLIBC)
+/* Phase 3, first milestone: a dynamically linked glibc program runs in the
+ * guest.  This is a compile-time selection for the same reason the compiler and
+ * nested cases are: an image built for this payload that cannot run a dynamic
+ * program must fail, not quietly report a smaller plan.
+ *
+ * The helper checks two things separately, because either alone is worthless: a
+ * static binary would exit 0 while proving nothing about a loader, and a loader
+ * that runs while the program never starts would prove nothing about glibc. */
+static int test_glibc_smoke(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-glibc-smoke",
+        NULL,
+        "glibc-smoke-child");
+}
+#endif
+
+#if defined(THEKERNEL_TOOL_PAYLOAD_GCC)
+/* Phase 3, second milestone: a real distribution C compiler runs in the guest.
+ *
+ * `gcc` here is a driver, not a compiler: it locates and runs cc1, as and
+ * collect2 as separate processes.  So this case depends on the payload being
+ * complete in a way the tcc case does not -- gcc's private headers, glibc's
+ * startup objects, the linker scripts and a dozen shared libraries all have to
+ * be present and at the paths the driver and the loader name absolutely. */
+static int test_gcc_smoke(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-gcc-smoke",
+        NULL,
+        "gcc-smoke-child");
+}
+#endif
+
+#if defined(THEKERNEL_TOOL_PAYLOAD_NESTED)
+/* Phase 2a: a system emulator that lives in the guest boots a second kernel in
+ * the guest's own userspace under TCG.  Like the compiler case, this is a
+ * compile-time selection, so an image built for the nested payload that cannot
+ * actually run the emulator fails instead of quietly reporting a smaller plan.
+ *
+ * The case's whole meaning is in the four conditions the helper checks
+ * together: the emulator is static, the inner banner arrives, the inner
+ * machine reached normal shutdown, and the whole thing finished inside its
+ * deadline.  See tests/guest/tools/nested-tcg-hello.c. */
+static int test_nested_tcg_hello(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-nested-tcg-hello",
+        NULL,
+        "nested-tcg-hello-child");
+}
+
+/* Phase 2b: a real Linux distribution -- Alpine, unmodified -- boots inside the
+ * guest under that same emulator.  Its four conditions are the design's: the
+ * inner workload reports INNER_ markers, the inner OS shuts down normally, the
+ * emulator's exit status is checked, and the outer suite still completes.  The
+ * first three belong to the helper; the fourth is this table. */
+static int test_nested_linux_boot(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-nested-linux-boot",
+        NULL,
+        "nested-linux-boot-child");
+}
+#endif
+
 static int test_ioprio(void) {
     return run_guest_program(
         "/opt/thekernel-tests/bin/thekernel-ioprio-smoke",
@@ -508,6 +612,19 @@ static int test_signal_wait_boundary(void) {
         "/opt/thekernel-tests/bin/thekernel-signal-wait-boundary",
         NULL,
         "signal-wait-child");
+}
+
+/* Does a process start a child the way glibc's posix_spawn does?
+ *
+ * Not payload-gated: it needs no payload, and it is the mechanism a
+ * distribution C compiler uses to launch cc1, as and collect2.  Checking it
+ * before staging eighty megabytes of compiler separates "the kernel cannot
+ * launch a child this way" from "a file is missing from the payload". */
+static int test_posix_spawn_smoke(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/bin/thekernel-posix-spawn-smoke",
+        NULL,
+        "posix-spawn-child");
 }
 
 static int test_pause(void) {
@@ -735,6 +852,12 @@ static int test_io_uring_directio_differential(void) {
         NULL, "io-uring-directio-differential-child");
 }
 
+static int test_tty_termios_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/tty-termios-differential", NULL,
+        "tty-termios-differential-child");
+}
+
 static int test_proc_zombie_differential(void) {
     return run_guest_program(
         "/opt/thekernel-tests/portable/proc-zombie-differential", NULL,
@@ -865,6 +988,7 @@ int main(int argc, char **argv) {
         { "vfork", test_vfork, 60 },
         { "signal-mask-alias", test_signal_mask_alias, 60 },
         { "signal-wait", test_signal_wait_boundary, 60 },
+        { "posix-spawn", test_posix_spawn_smoke, 60 },
         { "pause", test_pause, 60 },
         { "alarm", test_alarm, 60 },
         { "wait-boundary", test_wait_boundary, 60 },
@@ -882,12 +1006,35 @@ int main(int argc, char **argv) {
         { "signal-boundary", test_signal_boundary_differential, 60 },
         { "fs-boundary", test_fs_boundary_differential, 60 },
         { "io-uring-directio", test_io_uring_directio_differential, 60 },
+        { "tty-termios", test_tty_termios_differential, 30 },
         { "proc-zombie", test_proc_zombie_differential, 60 },
         { "native-ni", test_native_ni_differential, 60 },
         { "creat", test_creat_differential, 60 },
         { "time", test_time_differential, 60 },
         { "umask", test_umask_differential, 60 },
         { "signal-fp", test_signal_fp, 60 },
+        { "jit-mem", test_jit_mem, 30 },
+        { "proc-shape", test_proc_shape, 30 },
+        { "threads-futex", test_threads_futex, 60 },
+#if defined(THEKERNEL_TOOL_PAYLOAD_TCC)
+        { "compiler-smoke", test_compiler_smoke, 120 },
+#endif
+#if defined(THEKERNEL_TOOL_PAYLOAD_GLIBC)
+        { "glibc-smoke", test_glibc_smoke, 60 },
+#endif
+#if defined(THEKERNEL_TOOL_PAYLOAD_GCC)
+        /* Above the compile deadline the helper enforces, so a compile that
+         * hits its own bound is reported with its transcript instead of being
+         * killed by the suite with nothing to show. */
+        { "gcc-smoke", test_gcc_smoke, 330 },
+#endif
+#if defined(THEKERNEL_TOOL_PAYLOAD_NESTED)
+        { "nested-tcg-hello", test_nested_tcg_hello, 300 },
+        /* The helper's own inner deadline is 300 s plus a 5 s kill grace, so
+         * this must exceed both; otherwise a slow inner boot would be reported
+         * as a runner timeout rather than as the condition that broke. */
+        { "nested-linux-boot", test_nested_linux_boot, 330 },
+#endif
         { "io-uring", test_io_uring, 60 },
         { "io-uring-trace", test_io_uring_trace, 60 },
         { "log-diagnostics", test_log_diagnostics, 60 },

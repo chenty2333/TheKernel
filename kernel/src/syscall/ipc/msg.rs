@@ -999,48 +999,39 @@ pub fn sys_msgctl<M: UserMemory + ?Sized>(
         return Err(AxError::from(LinuxError::EINVAL)); // EINVAL
     }
 
-    // IPC_INFO (put before looking up the queue!)
-    if cmd == IPC_INFO {
-        let msg_manager = ipc_ns.msg_manager().lock();
-        let info = MsgInfo::ipc_info();
-        let ptr = buf as *mut MsgInfo;
-        // SAFETY: `MsgInfo` has an explicit initialized tail field for the
-        // Linux ABI's two-byte trailing padding; its integer layout is fixed
-        // by repr(C) and asserted below.
-        unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, info) }.map_err(map_usercopy_error)?;
-        return Ok(msg_manager.max_active_index());
+    if cmd == IPC_INFO || cmd == MSG_INFO {
+        let (info, index) = {
+            let manager = ipc_ns.msg_manager().lock();
+            let info = if cmd == IPC_INFO {
+                MsgInfo::ipc_info()
+            } else {
+                MsgInfo::msg_info(&manager)
+            };
+            (info, manager.max_active_index())
+        };
+        // SAFETY: MsgInfo includes initialized explicit ABI tail padding.
+        unsafe { VmMutPtr::vm_write_unchecked(buf as *mut MsgInfo, memory, info) }
+            .map_err(map_usercopy_error)?;
+        return Ok(index);
     }
-
-    // MSG_INFO (put before looking up the queue!)
-    if cmd == MSG_INFO {
-        let msg_manager = ipc_ns.msg_manager().lock();
-        let info = MsgInfo::msg_info(&msg_manager);
-        let ptr = buf as *mut MsgInfo;
-        // SAFETY: see the IPC_INFO copyout above.
-        unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, info) }.map_err(map_usercopy_error)?;
-        return Ok(msg_manager.max_active_index());
-    }
-    // MSG_STAT and MSG_STAT_ANY use an IPC index and return the real queue ID.
     if cmd == MSG_STAT || cmd == MSG_STAT_ANY {
-        let msg_manager = ipc_ns.msg_manager().lock();
-
-        let result = msg_manager
+        let queue = ipc_ns
+            .msg_manager()
+            .lock()
             .get_queue_by_msqid(msqid)
-            .ok_or(AxError::from(LinuxError::EINVAL))
-            .map(|queue| (msqid, queue))
-            .and_then(|(actual_msqid, queue)| {
-                let guard = queue.lock();
-
-                if cmd == MSG_STAT && !context.allows(&guard.msqid_ds.msg_perm, IpcAccess::Read) {
-                    return Err(AxError::from(LinuxError::EACCES));
-                }
-
-                let ptr = buf as *mut msqid_ds;
-                write_msqid_ds(memory, ptr, guard.msqid_ds)?;
-                Ok(actual_msqid as isize)
-            });
-
-        return result;
+            .ok_or(AxError::from(LinuxError::EINVAL))?;
+        let snapshot = {
+            let guard = queue.lock();
+            if guard.mark_removed {
+                return Err(AxError::from(LinuxError::EINVAL));
+            }
+            if cmd == MSG_STAT && !context.allows(&guard.msqid_ds.msg_perm, IpcAccess::Read) {
+                return Err(AxError::from(LinuxError::EACCES));
+            }
+            guard.msqid_ds
+        };
+        write_msqid_ds(memory, buf as *mut msqid_ds, snapshot)?;
+        return Ok(msqid as isize);
     }
 
     // Find message queue by msqid
@@ -1083,7 +1074,9 @@ pub fn sys_msgctl<M: UserMemory + ?Sized>(
 
         // Copy queue status to user space
         let ptr = buf as *mut msqid_ds;
-        write_msqid_ds(memory, ptr, msg_queue.msqid_ds)?;
+        let snapshot = msg_queue.msqid_ds;
+        drop(msg_queue);
+        write_msqid_ds(memory, ptr, snapshot)?;
 
         return Ok(0);
     }

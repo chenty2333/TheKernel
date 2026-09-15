@@ -1313,7 +1313,10 @@ impl PidNamespace {
                     .lock()
                     .reserve_publication(global_pid, Some(local_pid))?
             } else {
-                namespace.pids.lock().reserve_publication(global_pid, None)?
+                namespace
+                    .pids
+                    .lock()
+                    .reserve_publication(global_pid, None)?
             };
             let mut reservation = PidNamespaceReservation {
                 namespace: namespace.clone(),
@@ -2067,7 +2070,9 @@ impl NetworkNamespace {
         Self::try_new(NetStack::try_new_loopback_only()?, owner_user_ns)
     }
 
-    pub(crate) fn try_new_network_namespace(owner_user_ns: Arc<UserNamespace>) -> AxResult<Arc<Self>> {
+    pub(crate) fn try_new_network_namespace(
+        owner_user_ns: Arc<UserNamespace>,
+    ) -> AxResult<Arc<Self>> {
         Self::try_new(NetStack::try_new_network_namespace()?, owner_user_ns)
     }
 
@@ -3574,6 +3579,8 @@ pub struct ProcessData {
     ptrace_tracees: SpinNoIrq<PtraceReverseLinks>,
     /// Multi-thread exec coordination state.
     exec_ctl: SpinNoIrq<ExecControlState>,
+    /// Serializes setpgid with successful exec publication; fork starts false.
+    pub(crate) exec_committed: Mutex<bool>,
     /// CLONE_VFORK coordination state.
     vfork_ctl: SpinNoIrq<VforkControlState>,
     /// Woken when threads should resume from stopped state.
@@ -3980,10 +3987,8 @@ impl ProcessData {
         let exit_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let exec_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
         let signal_pending_event = Arc::try_new(PollSet::new()).map_err(|_| AxError::NoMemory)?;
-        let mut signal = ProcessSignalManager::new(
-            signal_actions,
-            crate::config::SIGNAL_TRAMPOLINE,
-        );
+        let mut signal =
+            ProcessSignalManager::new(signal_actions, crate::config::SIGNAL_TRAMPOLINE);
         signal.set_pending_waker(core::task::Waker::from(signal_pending_event.clone()));
         let signal = Arc::try_new(signal).map_err(|_| AxError::NoMemory)?;
         let futex_table = Arc::try_new(FutexTable::new()).map_err(|_| AxError::NoMemory)?;
@@ -4071,6 +4076,7 @@ impl ProcessData {
             ptrace_signal: Mutex::new(None),
             ptrace_tracees: SpinNoIrq::new(PtraceReverseLinks::default()),
             exec_ctl: SpinNoIrq::new(ExecControlState::default()),
+            exec_committed: Mutex::new(false),
             vfork_ctl: SpinNoIrq::new(VforkControlState::default()),
             stop_event,
             vfork_event,
@@ -4442,6 +4448,7 @@ impl ProcessData {
         // thread from being switched out closes the only scheduler race: an
         // on-enter hook can observe either complete publication, but can
         // never run while this task is suspended holding either writer lock.
+        let mut exec_committed = self.exec_committed.lock();
         let _switch_guard = kernel_guard::NoPreemptIrqSave::new();
         self.group_leader_identity
             .replace_landlock_domain(thread.landlock_domain());
@@ -4467,6 +4474,8 @@ impl ProcessData {
         // Both image writer locks are released. Registry cleanup takes the
         // old mm mutex, whose owner may need this CPU's shootdown IPI to run.
         drop(_switch_guard);
+        *exec_committed = true;
+        drop(exec_committed);
         unregister_address_space(&old_aspace);
         ExecImageCommit {
             group_leader,
@@ -8402,9 +8411,9 @@ mod tests {
         let owner = UserNamespace::try_new_root().unwrap();
         let actor = Cred::try_root(owner.clone()).unwrap();
         let domain = super::ProcessDomain::try_new().unwrap();
-        let namespace = PidNamespace::try_new_root_with_reaper_scope(
-            owner, domain.root_reaper_scope(),
-        ).unwrap();
+        let namespace =
+            PidNamespace::try_new_root_with_reaper_scope(owner, domain.root_reaper_scope())
+                .unwrap();
         namespace.reserve_process(100).unwrap().commit();
         let init = domain.try_new_init(100, None).unwrap();
         let weak_init = Arc::downgrade(&init);
@@ -8412,7 +8421,10 @@ mod tests {
         drop(domain);
         assert!(weak_init.upgrade().is_none());
         assert!(!namespace.child_reaper_allows_new_processes());
-        assert!(matches!(namespace.reserve_process(101), Err(AxError::NoMemory)));
+        assert!(matches!(
+            namespace.reserve_process(101),
+            Err(AxError::NoMemory)
+        ));
         assert!(matches!(
             namespace.reserve_process_with_ids(101, &[2], &actor),
             Err(AxError::NoMemory)
@@ -8424,11 +8436,9 @@ mod tests {
         let owner = UserNamespace::try_new_root().unwrap();
         let actor = Cred::try_root(owner.clone()).unwrap();
         let domain = super::ProcessDomain::try_new().unwrap();
-        let root = PidNamespace::try_new_root_with_reaper_scope(
-            owner.clone(),
-            domain.root_reaper_scope(),
-        )
-        .unwrap();
+        let root =
+            PidNamespace::try_new_root_with_reaper_scope(owner.clone(), domain.root_reaper_scope())
+                .unwrap();
         root.reserve_process(100).unwrap().commit();
         let init = domain.try_new_init(100, None).unwrap();
         domain.prepare_thread(&init, 100).unwrap().commit().unwrap();

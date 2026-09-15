@@ -463,7 +463,8 @@ fn kcmp_file_description(
     fd: usize,
 ) -> AxResult<Arc<FileDescription>> {
     thread
-        .fd_table()
+        .try_fd_table()
+        .ok_or(AxError::NoSuchProcess)?
         .get_description_number(u32::try_from(fd).map_err(|_| AxError::BadFileDescriptor)?)
 }
 
@@ -506,8 +507,8 @@ pub fn sys_kcmp<M: UserMemory + ?Sized>(
         validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
             proc2.image_matches(image)
         })?;
-        let fs1 = thread1.fs_context();
-        let fs2 = thread2.fs_context();
+        let fs1 = thread1.try_fs_context().ok_or(AxError::NoSuchProcess)?;
+        let fs2 = thread2.try_fs_context().ok_or(AxError::NoSuchProcess)?;
         validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
             proc1.image_matches(image)
         })?;
@@ -548,8 +549,8 @@ pub fn sys_kcmp<M: UserMemory + ?Sized>(
             validate_kcmp_fd_image(&image2, proc2.exec_in_progress(), |image| {
                 proc2.image_matches(image)
             })?;
-            let files1 = thread1.fd_table();
-            let files2 = thread2.fd_table();
+            let files1 = thread1.try_fd_table().ok_or(AxError::NoSuchProcess)?;
+            let files2 = thread2.try_fd_table().ok_or(AxError::NoSuchProcess)?;
             validate_kcmp_fd_image(&image1, proc1.exec_in_progress(), |image| {
                 proc1.image_matches(image)
             })?;

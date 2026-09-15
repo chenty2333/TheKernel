@@ -97,13 +97,11 @@ pub(crate) struct PacketSendPlan {
     payload_len: usize,
 }
 
-/// One complete AF_PACKET transmit admission.  The legacy OUTPUT and lower
-/// service locks are acquired once, before a TX-ring frame is cleared or a
-/// userspace source is consumed, and are retained until submission.  This is
-/// deliberately not a probe: a RWF_NOWAIT caller either owns both domains or
-/// returns EAGAIN without changing socket/ring state.
+/// AF_PACKET transmit admission. Legacy OUTPUT is decided once, then its
+/// lock is released before source import. Lower service and per-socket
+/// admission are retained until submission; NOWAIT failures precede mutation.
 struct PacketSendPermit<'a> {
-    iptables: crate::syscall::IptablesOutputPermit<'a>,
+    _iptables: crate::syscall::IptablesOutputPermit,
     service: axnet::NetStackServicePermit<'a>,
     state: MutexGuard<'a, PacketSocketState>,
     ring_config: MutexGuard<'a, ()>,
@@ -125,9 +123,6 @@ impl PacketSendPermit<'_> {
         origin: &PacketEndpoint,
         payload: &[u8],
     ) -> AxResult<()> {
-        // `iptables` remains borrowed for the complete payload transaction.
-        // Recheck from the retained table rather than taking a deep lock.
-        self.iptables.verify()?;
         let request = match plan.socket_type {
             PacketSocketType::Raw => PacketSendRequest::Raw {
                 protocol: plan.protocol,
@@ -1020,7 +1015,10 @@ impl PacketSocket {
         self.arm_v3_deadline(deadline.map(TimeValue::from_nanos))
     }
 
-    fn arm_v3_deadline(&self, deadline: Option<TimeValue>) -> Result<(), axpoll::PollRegistrationError> {
+    fn arm_v3_deadline(
+        &self,
+        deadline: Option<TimeValue>,
+    ) -> Result<(), axpoll::PollRegistrationError> {
         let Some(deadline) = deadline else {
             let retired = self.v3_timer.lock().take();
             drop(retired);
@@ -1043,16 +1041,27 @@ impl PacketSocket {
                 future: Box::into_pin(future),
             });
         }
-        let result = timer.as_mut().map(|timer| timer.future.as_mut().poll(&mut context));
-        let retired = if matches!(result, Some(Poll::Ready(_))) { timer.take() } else { None };
+        let result = timer
+            .as_mut()
+            .map(|timer| timer.future.as_mut().poll(&mut context));
+        let retired = if matches!(result, Some(Poll::Ready(_))) {
+            timer.take()
+        } else {
+            None
+        };
         drop(timer);
         drop(retired);
         match result {
-            Some(Poll::Ready(Ok(()))) => { self.v3_timeout.wake(); }
+            Some(Poll::Ready(Ok(()))) => {
+                self.v3_timeout.wake();
+            }
             Some(Poll::Ready(Err(TimerRegistrationError::CapacityExhausted))) => {
                 return Err(axpoll::PollRegistrationError::Quota);
             }
-            Some(Poll::Ready(Err(TimerRegistrationError::TokenSpaceExhausted | TimerRegistrationError::DeadlineOverflow))) => {
+            Some(Poll::Ready(Err(
+                TimerRegistrationError::TokenSpaceExhausted
+                | TimerRegistrationError::DeadlineOverflow,
+            ))) => {
                 return Err(axpoll::PollRegistrationError::InvalidState);
             }
             Some(Poll::Pending) | None => {}
@@ -1675,7 +1684,7 @@ impl PacketSocket {
         let ring_config = self.ring_config.try_lock().ok_or(AxError::WouldBlock)?;
         let tx_ring = self.tx_ring.try_lock().ok_or(AxError::WouldBlock)?;
         Ok(PacketSendPermit {
-            iptables,
+            _iptables: iptables,
             service,
             state,
             ring_config,
@@ -2087,11 +2096,9 @@ mod tests {
     }
 
     fn v3_timer_socket() -> (Arc<PacketSocket>, TimeValue) {
-        let socket = PacketSocket::try_new(
-            PacketSocketType::Raw,
-            ProtocolSelector::All,
-            namespace(),
-        ).unwrap();
+        let socket =
+            PacketSocket::try_new(PacketSocketType::Raw, ProtocolSelector::All, namespace())
+                .unwrap();
         let ring = PacketRxRing::try_new_v3(PacketV3Request {
             block_size: 4096,
             block_nr: 1,
@@ -2101,7 +2108,8 @@ mod tests {
             private_size: 0,
             fill_rxhash: false,
             socket_type: PacketSocketType::Raw,
-        }).unwrap();
+        })
+        .unwrap();
         if let PacketRxRingKind::V3 { state, .. } = &ring.kind {
             let mut state = state.lock();
             state.packets = 1;
@@ -2117,15 +2125,25 @@ mod tests {
         let _context = packet_test_context();
         let (socket, deadline) = v3_timer_socket();
         for (error, expected) in [
-            (TimerRegistrationError::CapacityExhausted, axpoll::PollRegistrationError::Quota),
-            (TimerRegistrationError::TokenSpaceExhausted, axpoll::PollRegistrationError::InvalidState),
-            (TimerRegistrationError::DeadlineOverflow, axpoll::PollRegistrationError::InvalidState),
+            (
+                TimerRegistrationError::CapacityExhausted,
+                axpoll::PollRegistrationError::Quota,
+            ),
+            (
+                TimerRegistrationError::TokenSpaceExhausted,
+                axpoll::PollRegistrationError::InvalidState,
+            ),
+            (
+                TimerRegistrationError::DeadlineOverflow,
+                axpoll::PollRegistrationError::InvalidState,
+            ),
         ] {
             *socket.v3_timer.lock() = Some(PacketV3Timer {
                 deadline,
                 future: Box::pin(core::future::ready(Err(error))),
             });
-            let result = socket.register(&mut Context::from_waker(Waker::noop()), IoEvents::READABLE);
+            let result =
+                socket.register(&mut Context::from_waker(Waker::noop()), IoEvents::READABLE);
             assert!(matches!(result, Err(actual) if actual == expected));
             assert!(socket.v3_timer.lock().is_none());
             assert!(socket.v3_timeout.is_empty());
@@ -2156,8 +2174,12 @@ mod tests {
         let second_waker = Waker::from(Arc::clone(&second));
         let mut first_context = Context::from_waker(&first_waker);
         let mut second_context = Context::from_waker(&second_waker);
-        let first_registration = socket.register(&mut first_context, IoEvents::READABLE).unwrap();
-        let second_registration = socket.register(&mut second_context, IoEvents::READABLE).unwrap();
+        let first_registration = socket
+            .register(&mut first_context, IoEvents::READABLE)
+            .unwrap();
+        let second_registration = socket
+            .register(&mut second_context, IoEvents::READABLE)
+            .unwrap();
         // Exercise the waker actually installed by both timer polls, rather
         // than directly waking the broadcast source. The old shared future
         // retained only second_waker and stranded the first registration.
@@ -2167,8 +2189,12 @@ mod tests {
         assert_eq!(second.wakes.load(Ordering::Relaxed), 1);
         drop(first_registration);
         drop(second_registration);
-        let _first_registration = socket.register(&mut first_context, IoEvents::READABLE).unwrap();
-        let _second_registration = socket.register(&mut second_context, IoEvents::READABLE).unwrap();
+        let _first_registration = socket
+            .register(&mut first_context, IoEvents::READABLE)
+            .unwrap();
+        let _second_registration = socket
+            .register(&mut second_context, IoEvents::READABLE)
+            .unwrap();
         // Also cover synchronous completion while arm_v3_timer owns its gate.
         timer.ready.store(true, Ordering::Release);
         socket.arm_v3_timer().unwrap();
@@ -2210,7 +2236,9 @@ mod tests {
     }
 
     impl axio::IoBuf for FaultDst {
-        fn remaining(&self) -> usize { self.remaining }
+        fn remaining(&self) -> usize {
+            self.remaining
+        }
     }
 
     impl IoBufMut for FaultDst {

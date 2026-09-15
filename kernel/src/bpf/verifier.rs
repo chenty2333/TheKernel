@@ -1,5 +1,6 @@
 //! Linux policy wrapper around AXBPF verification.
 use alloc::{string::String, vec::Vec};
+use core::cell::RefCell;
 
 use axerrno::AxError;
 
@@ -10,17 +11,33 @@ use super::{
 };
 use crate::file::{FileLike, bpf::BpfMapFd};
 
-struct KernelMapResolver;
+struct KernelMapResolver(RefCell<Vec<BpfMapBinding>>);
 impl axbpf::MapResolver for KernelMapResolver {
     fn resolve(&self, r: axbpf::MapRef) -> Option<axbpf::MapInfo> {
         self.resolve_fd(r.fd())
     }
     fn resolve_fd(&self, fd: i32) -> Option<axbpf::MapInfo> {
-        let map = BpfMapFd::from_fd(fd).ok()?;
+        let mut bindings = self.0.borrow_mut();
+        let reference = axbpf::MapRef::from_fd(fd);
+        if !bindings
+            .iter()
+            .any(|binding| binding.reference == reference)
+        {
+            let map = BpfMapFd::from_fd(fd).ok()?;
+            bindings.try_reserve(1).ok()?;
+            bindings.push(BpfMapBinding {
+                reference,
+                map: map.map.clone(),
+                memory_charge: map.memory_charge.clone(),
+            });
+        }
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.reference == reference)?;
         Some(axbpf::MapInfo {
-            key_size: map.map.key_size(),
-            value_size: map.map.value_size(),
-            max_entries: map.map.max_entries(),
+            key_size: binding.map.key_size(),
+            value_size: binding.map.value_size(),
+            max_entries: binding.map.max_entries(),
         })
     }
 }
@@ -125,28 +142,12 @@ pub fn verify_program(
         allow_perf_event: perf_event,
         allow_xdp_redirect: xdp,
     };
-    let mechanism = axbpf::Program::verify(insns, &KernelMapResolver, &helpers, policy)
+    // Resolve each numeric descriptor once and retain that exact object through
+    // verification and execution, even if another thread recycles the FD.
+    let resolver = KernelMapResolver(RefCell::new(Vec::new()));
+    let mechanism = axbpf::Program::verify(insns, &resolver, &helpers, policy)
         .map_err(|_| failure(log_level, "AXBPF rejected program"))?;
-    let mut maps = Vec::new();
-    for decoded in mechanism.decoded() {
-        if let axbpf::Decoded::Map(reference) = *decoded
-            && maps
-                .iter()
-                .all(|binding: &BpfMapBinding| binding.reference != reference)
-        {
-            let fd = reference.fd();
-            let map_fd = BpfMapFd::from_fd(fd).map_err(|_| {
-                failure(log_level, "map descriptor disappeared during program load")
-            })?;
-            let map = map_fd.map.clone();
-            let memory_charge = map_fd.memory_charge.clone();
-            maps.push(BpfMapBinding {
-                reference,
-                map,
-                memory_charge,
-            });
-        }
-    }
+    let maps = resolver.0.into_inner();
     Ok(VerifiedProgram {
         portable: mechanism,
         maps,

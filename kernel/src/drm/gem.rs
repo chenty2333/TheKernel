@@ -125,3 +125,89 @@ impl GemObject {
         }
     }
 }
+
+// Pinned guest render backing is not reclaimable. Keep an admission budget
+// separate from handle statistics: exported buffers and VMAs outlive handles.
+use core::sync::atomic::{AtomicUsize, Ordering};
+static PINNED_GEM_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) struct GemMemoryCharge {
+    owner: Arc<AtomicUsize>,
+    bytes: usize,
+}
+impl GemMemoryCharge {
+    pub(crate) fn reserve(owner: Arc<AtomicUsize>, bytes: usize) -> super::DrmResult<Arc<Self>> {
+        let total = axhal::mem::total_ram_size();
+        let global_limit = (total / 4).min(512 * 1024 * 1024);
+        let file_limit = (total / 8).min(256 * 1024 * 1024);
+        Self::reserve_with_limits(owner, bytes, global_limit, file_limit)
+    }
+    fn reserve_with_limits(
+        owner: Arc<AtomicUsize>,
+        bytes: usize,
+        global_limit: usize,
+        file_limit: usize,
+    ) -> super::DrmResult<Arc<Self>> {
+        owner
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|next| *next <= file_limit)
+            })
+            .map_err(|_| super::DrmError::NoMemory)?;
+        if PINNED_GEM_BYTES
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|next| *next <= global_limit)
+            })
+            .is_err()
+        {
+            owner.fetch_sub(bytes, Ordering::AcqRel);
+            return Err(super::DrmError::NoMemory);
+        }
+        Arc::try_new(Self { owner, bytes }).map_err(|_| super::DrmError::NoMemory)
+    }
+}
+impl Drop for GemMemoryCharge {
+    fn drop(&mut self) {
+        PINNED_GEM_BYTES.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.owner.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod memory_charge_tests {
+    use super::*;
+    #[test]
+    fn global_admission_failure_refunds_the_file_charge() {
+        let owner = Arc::new(AtomicUsize::new(0));
+        assert!(GemMemoryCharge::reserve_with_limits(owner.clone(), 4096, 0, 4096).is_err());
+        assert_eq!(owner.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn page_alias_retains_charge_after_the_originating_owner_closes() {
+        let _context = crate::test_support::scheduler_test_context();
+        let owner = Arc::new(AtomicUsize::new(0));
+        let charge =
+            GemMemoryCharge::reserve_with_limits(owner.clone(), 4096, usize::MAX, 4096).unwrap();
+        let pages =
+            Arc::new(SharedPages::new_fixed(4096, axhal::paging::PageSize::Size4K).unwrap());
+        pages.retain_allocation_owner(charge).unwrap();
+        let mapping = pages.clone();
+        drop(pages);
+        assert_eq!(owner.load(Ordering::Acquire), 4096);
+        drop(mapping);
+        assert_eq!(owner.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn charges_refund_only_after_the_last_reference() {
+        let owner = Arc::new(AtomicUsize::new(0));
+        let charge =
+            GemMemoryCharge::reserve_with_limits(owner.clone(), 4096, usize::MAX, 4096).unwrap();
+        assert!(GemMemoryCharge::reserve_with_limits(owner.clone(), 1, usize::MAX, 4096).is_err());
+        let retained = charge.clone();
+        drop(charge);
+        assert_eq!(owner.load(Ordering::Acquire), 4096);
+        drop(retained);
+        assert_eq!(owner.load(Ordering::Acquire), 0);
+    }
+}

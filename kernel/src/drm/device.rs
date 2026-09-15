@@ -19,6 +19,7 @@ pub const DAMAGE_FULL_THRESHOLD_NUMERATOR: u64 = 1;
 pub const DAMAGE_FULL_THRESHOLD_DENOMINATOR: u64 = 2;
 
 use super::{
+    OpenId,
     fence::Fence,
     gem::{DumbRequest, GemBacking, MmapOffset},
     kms::{CrtcInfo, Framebuffer, FramebufferId, KmsResources, Mode},
@@ -115,11 +116,14 @@ pub trait DisplayAdapter: Send + Sync {
         None
     }
 
+    /// `allocation_owner` is admitted before frame allocation. Implementations
+    /// must retain it on the actual SharedPages before publishing device work.
     fn create_dumb(
         &self,
         request: DumbRequest,
         pitch: u32,
         size: u64,
+        allocation_owner: Arc<dyn Send + Sync>,
     ) -> DrmResult<Arc<dyn GemBacking>>;
     fn present(&self, scanout: Scanout) -> DrmResult<Arc<Fence>>;
     /// A lock-bounded snapshot. Implementations must not drain queues or
@@ -270,6 +274,7 @@ pub(crate) struct DeviceState {
 }
 
 pub(crate) struct PropertyBlob {
+    owner: Option<OpenId>,
     pub(crate) bytes: Vec<u8>,
     pub(crate) references: usize,
     pub(crate) destroyed: bool,
@@ -374,6 +379,7 @@ impl DrmDevice {
                 property_blobs: BTreeMap::from([(
                     1,
                     PropertyBlob {
+                        owner: None,
                         bytes: edid,
                         // The connector owns its immutable EDID for the
                         // lifetime of the device.
@@ -706,13 +712,14 @@ impl DrmDevice {
         Ok(())
     }
 
-    pub(crate) fn create_property_blob(&self, bytes: Vec<u8>) -> DrmResult<u32> {
+    pub(crate) fn create_property_blob(&self, owner: OpenId, bytes: Vec<u8>) -> DrmResult<u32> {
         let mut state = self.state.lock();
         let id = state.next_property_blob;
         state.next_property_blob = id.checked_add(1).ok_or(DrmError::Overflow)?;
         state.property_blobs.insert(
             id,
             PropertyBlob {
+                owner: Some(owner),
                 bytes,
                 references: 0,
                 destroyed: false,
@@ -738,12 +745,15 @@ impl DrmDevice {
             .map(|blob| blob.bytes.clone())
     }
 
-    pub(crate) fn destroy_property_blob(&self, id: u32) -> DrmResult<()> {
+    pub(crate) fn destroy_property_blob(&self, owner: OpenId, id: u32) -> DrmResult<()> {
         let mut state = self.state.lock();
         let blob = state
             .property_blobs
             .get_mut(&id)
             .ok_or(DrmError::NotFound)?;
+        if blob.owner != Some(owner) {
+            return Err(DrmError::PermissionDenied);
+        }
         if blob.destroyed {
             return Err(DrmError::NotFound);
         }
@@ -752,6 +762,15 @@ impl DrmDevice {
             state.property_blobs.remove(&id);
         }
         Ok(())
+    }
+
+    pub(crate) fn release_property_blobs(&self, owner: OpenId) {
+        self.state.lock().property_blobs.retain(|_, blob| {
+            if blob.owner == Some(owner) {
+                blob.destroyed = true;
+            }
+            !(blob.destroyed && blob.references == 0)
+        });
     }
 
     pub(crate) fn queue_atomic_with_completion(
@@ -1499,6 +1518,7 @@ fn replace_connector_edid(state: &mut DeviceState) -> DrmResult<()> {
     state.property_blobs.insert(
         id,
         PropertyBlob {
+            owner: None,
             bytes: default_edid(state.resources.preferred_mode),
             // The connector owns this immutable blob until it is replaced.
             references: 1,
@@ -1712,7 +1732,13 @@ mod tests {
 
     struct Adapter;
     impl DisplayAdapter for Adapter {
-        fn create_dumb(&self, _: DumbRequest, _: u32, _: u64) -> DrmResult<Arc<dyn GemBacking>> {
+        fn create_dumb(
+            &self,
+            _: DumbRequest,
+            _: u32,
+            _: u64,
+            _allocation_owner: Arc<dyn Send + Sync>,
+        ) -> DrmResult<Arc<dyn GemBacking>> {
             Err(DrmError::Unsupported)
         }
         fn present(&self, _: Scanout) -> DrmResult<Arc<Fence>> {
@@ -1838,6 +1864,7 @@ mod tests {
                 _: DumbRequest,
                 _: u32,
                 _: u64,
+                _allocation_owner: Arc<dyn Send + Sync>,
             ) -> DrmResult<Arc<dyn GemBacking>> {
                 Ok(Arc::new(Backing))
             }
@@ -1944,6 +1971,7 @@ mod tests {
                 _: DumbRequest,
                 _: u32,
                 _: u64,
+                _allocation_owner: Arc<dyn Send + Sync>,
             ) -> DrmResult<Arc<dyn GemBacking>> {
                 Ok(Arc::new(Backing))
             }

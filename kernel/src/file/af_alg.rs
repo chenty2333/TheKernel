@@ -1,7 +1,9 @@
+//! AF_ALG address/control parsing only. No cryptographic backend is installed.
+//! Binding and I/O fail closed; never return placeholder digests or plaintext.
+
 use alloc::{
     borrow::Cow,
     string::{String, ToString},
-    vec,
     vec::Vec,
 };
 use core::{
@@ -12,10 +14,8 @@ use core::{
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
-use axio::prelude::*;
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::net::{SOCK_SEQPACKET, cmsghdr, sockaddr, socklen_t};
-use spin::{Mutex, MutexGuard};
 
 use super::{FileLike, Kstat, PseudoInode, try_pseudo_inode_path};
 use crate::{
@@ -33,32 +33,6 @@ pub const ALG_SET_AEAD_ASSOCLEN: u32 = 4;
 
 pub const ALG_OP_DECRYPT: u32 = 0;
 pub const ALG_OP_ENCRYPT: u32 = 1;
-
-const HASH_ALGS: &[&str] = &[
-    "md5",
-    "md5-generic",
-    "sha1",
-    "sha1-generic",
-    "sha224",
-    "sha224-generic",
-    "sha256",
-    "sha256-generic",
-    "sha3-256",
-    "sha3-256-generic",
-    "sha3-512",
-    "sha3-512-generic",
-    "sm3",
-    "sm3-generic",
-];
-
-const VMAC_ALGS: &[&str] = &[
-    "vmac64(aes)",
-    "vmac(aes)",
-    "vmac64(sm4)",
-    "vmac(sm4)",
-    "vmac64(sm4-generic)",
-    "vmac(sm4-generic)",
-];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -103,58 +77,20 @@ impl SockAddrAlg {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AlgFamily {
-    Hash,
-    Skcipher,
-    Aead,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
-enum AlgOperation {
-    Decrypt,
-    #[default]
-    Encrypt,
-}
-
-#[derive(Clone, Debug)]
-struct AlgorithmBinding {
-    family: AlgFamily,
-    alg_name: String,
-    key: Vec<u8>,
-}
-
-#[derive(Default)]
-struct ListenerState {
-    binding: Option<AlgorithmBinding>,
-}
-
-struct RequestState {
-    binding: AlgorithmBinding,
-    op: AlgOperation,
-    iv: Vec<u8>,
-    assoclen: u32,
-    buffer: Vec<u8>,
-    output: Option<Vec<u8>>,
-    output_offset: usize,
-    output_finalized: bool,
-}
-
 pub(crate) struct AfAlgSendRequest {
     payload: Vec<u8>,
-    params: SendParams,
     ancillary_items: usize,
-    has_name: bool,
 }
 
 impl AfAlgSendRequest {
     pub(crate) fn prepare(payload: Vec<u8>, control: &[u8], has_name: bool) -> AxResult<Self> {
-        let (params, ancillary_items) = parse_send_params(control)?;
+        if has_name {
+            return Err(AxError::InvalidInput);
+        }
+        let ancillary_items = validate_send_params(control)?;
         Ok(Self {
             payload,
-            params,
             ancillary_items,
-            has_name,
         })
     }
 
@@ -172,76 +108,14 @@ impl AfAlgSendRequest {
     }
 }
 
-enum SocketKind {
-    Listener(Mutex<ListenerState>),
-    Request(Mutex<RequestState>),
-}
-
 pub struct AfAlgSocket {
-    kind: SocketKind,
     inode: PseudoInode,
     nonblocking: AtomicBool,
 }
 
-/// Retained AF_ALG request admission for one RWF_NOWAIT operation.
-///
-/// The request-state guard is acquired before usercopy and consumed directly
-/// by the operation.  There is consequently no second lock acquisition
-/// between a successful NOWAIT admission and the request-state update.
-pub(crate) struct AfAlgNowaitPermit<'a> {
-    state: MutexGuard<'a, RequestState>,
-}
-
-impl AfAlgNowaitPermit<'_> {
-    fn read_into(mut self, dst: &mut super::IoDst) -> AxResult<usize> {
-        AfAlgSocket::prepare_output(&mut self.state)?;
-        let output_len = self.state.output.as_ref().map_or(0, Vec::len);
-        if self.state.output_offset >= output_len {
-            self.state.output = None;
-            self.state.output_offset = 0;
-            self.state.output_finalized = true;
-            self.state.buffer.clear();
-            return Ok(0);
-        }
-        let written = {
-            let output = self.state.output.as_deref().unwrap_or(&[]);
-            dst.write(&output[self.state.output_offset..])?
-        };
-        self.state.output_offset += written;
-        if self.state.output_offset >= output_len {
-            self.state.output = None;
-            self.state.output_offset = 0;
-            self.state.output_finalized = true;
-            self.state.buffer.clear();
-        }
-        Ok(written)
-    }
-
-    fn write_from(mut self, src: &mut super::IoSrc, mut bounce: Vec<u8>) -> AxResult<usize> {
-        let read = src.read(&mut bounce)?;
-        bounce.truncate(read);
-        self.state.output = None;
-        self.state.output_offset = 0;
-        self.state.output_finalized = false;
-        if self.state.binding.family != AlgFamily::Hash && !bounce.is_empty() {
-            self.state.buffer.extend_from_slice(&bounce);
-        }
-        Ok(read)
-    }
-}
-
 impl AfAlgSocket {
-    pub(crate) fn try_acquire_nowait(&self) -> AxResult<AfAlgNowaitPermit<'_>> {
-        let SocketKind::Request(state) = &self.kind else {
-            return Err(AxError::InvalidInput);
-        };
-        Ok(AfAlgNowaitPermit {
-            state: state.try_lock().ok_or(AxError::WouldBlock)?,
-        })
-    }
     pub fn new_listener() -> Self {
         Self {
-            kind: SocketKind::Listener(Mutex::new(ListenerState::default())),
             inode: PseudoInode::socket(),
             nonblocking: AtomicBool::new(false),
         }
@@ -261,175 +135,40 @@ impl AfAlgSocket {
         Ok(())
     }
 
-    pub fn bind(&self, addr: SockAddrAlg) -> AxResult<()> {
-        let binding = resolve_binding(&addr)?;
-        let SocketKind::Listener(state) = &self.kind else {
-            return Err(AxError::InvalidInput);
-        };
-        state.lock().binding = Some(binding);
-        Ok(())
+    pub fn bind(&self, _addr: SockAddrAlg) -> AxResult<()> {
+        // Linux reports ENOENT when no implementation of the named algorithm
+        // exists. Advertising success here would be a security contract.
+        Err(LinuxError::ENOENT.into())
     }
 
     pub fn accept_request(&self) -> AxResult<Self> {
-        let SocketKind::Listener(state) = &self.kind else {
-            return Err(AxError::InvalidInput);
-        };
-        let binding = state
-            .lock()
-            .binding
-            .clone()
-            .ok_or_else(|| AxError::from(LinuxError::EINVAL))?;
-
-        Ok(Self {
-            kind: SocketKind::Request(Mutex::new(RequestState {
-                binding,
-                op: AlgOperation::Encrypt,
-                iv: Vec::new(),
-                assoclen: 0,
-                buffer: Vec::new(),
-                output: None,
-                output_offset: 0,
-                output_finalized: false,
-            })),
-            inode: PseudoInode::socket(),
-            nonblocking: AtomicBool::new(self.nonblocking()),
-        })
+        Err(AxError::InvalidInput)
     }
 
-    pub fn set_alg_key(&self, key: &[u8]) -> AxResult<()> {
-        let SocketKind::Listener(state) = &self.kind else {
-            return Err(AxError::InvalidInput);
-        };
-        let mut state = state.lock();
-        let binding = state
-            .binding
-            .as_mut()
-            .ok_or_else(|| AxError::from(LinuxError::EINVAL))?;
-        validate_key(binding, key)?;
-        binding.key.clear();
-        binding.key.extend_from_slice(key);
-        Ok(())
+    pub fn set_alg_key(&self, _key: &[u8]) -> AxResult<()> {
+        Err(AxError::InvalidInput)
     }
 
-    pub(crate) fn send_prepared(&self, request: AfAlgSendRequest) -> AxResult<usize> {
-        if request.has_name {
-            return Err(AxError::InvalidInput);
-        }
-
-        let AfAlgSendRequest {
-            payload,
-            params,
-            ancillary_items: _,
-            has_name: _,
-        } = request;
-        let payload_len = payload.len();
-        self.push_request_input(&payload, params)?;
-        Ok(payload_len)
+    pub(crate) fn send_prepared(&self, _request: AfAlgSendRequest) -> AxResult<usize> {
+        Err(AxError::InvalidInput)
     }
 
-    fn push_request_input(&self, data: &[u8], params: SendParams) -> AxResult<()> {
-        let SocketKind::Request(state) = &self.kind else {
-            return Err(AxError::InvalidInput);
-        };
-        let mut state = state.lock();
-        state.output = None;
-        state.output_offset = 0;
-        state.output_finalized = false;
-        if let Some(op) = params.op {
-            state.op = op;
-        }
-        if let Some(iv) = params.iv {
-            state.iv = iv;
-        }
-        if let Some(assoclen) = params.assoclen {
-            state.assoclen = assoclen;
-        }
-
-        if state.binding.family == AlgFamily::Hash {
-            return Ok(());
-        }
-
-        if !data.is_empty() {
-            state.buffer.extend_from_slice(data);
-        }
-        Ok(())
+    pub(crate) fn read_with_nowait(&self, _dst: &mut super::IoDst) -> AxResult<usize> {
+        Err(AxError::InvalidInput)
     }
 
-    fn prepare_output(state: &mut RequestState) -> AxResult<()> {
-        if state.output.is_some() || state.output_finalized {
-            return Ok(());
-        }
-
-        let output = match state.binding.family {
-            AlgFamily::Hash => vec![0; 16],
-            AlgFamily::Skcipher => match state.binding.alg_name.as_str() {
-                "salsa20" => Vec::new(),
-                "cbc(aes-generic)" => {
-                    if !state.buffer.len().is_multiple_of(16) {
-                        return Err(AxError::InvalidInput);
-                    }
-                    state.buffer.clone()
-                }
-                _ => return Err(AxError::from(LinuxError::ENOENT)),
-            },
-            AlgFamily::Aead => state.buffer.clone(),
-        };
-        state.output = Some(output);
-        Ok(())
-    }
-
-    pub(crate) fn read_with_nowait(&self, dst: &mut super::IoDst) -> AxResult<usize> {
-        self.try_acquire_nowait()?.read_into(dst)
-    }
-
-    pub(crate) fn write_with_nowait(&self, src: &mut super::IoSrc) -> AxResult<usize> {
-        let len = src.remaining();
-        let mut bounce = Vec::new();
-        bounce
-            .try_reserve_exact(len)
-            .map_err(|_| AxError::NoMemory)?;
-        bounce.resize(len, 0);
-        self.try_acquire_nowait()?.write_from(src, bounce)
+    pub(crate) fn write_with_nowait(&self, _src: &mut super::IoSrc) -> AxResult<usize> {
+        Err(AxError::InvalidInput)
     }
 }
 
 impl FileLike for AfAlgSocket {
     fn read(&self, dst: &mut super::IoDst) -> AxResult<usize> {
-        let SocketKind::Request(state) = &self.kind else {
-            return Err(AxError::InvalidInput);
-        };
-        let mut state = state.lock();
-        Self::prepare_output(&mut state)?;
-
-        let output_len = state.output.as_ref().map_or(0, Vec::len);
-        if state.output_offset >= output_len {
-            state.output = None;
-            state.output_offset = 0;
-            state.output_finalized = true;
-            state.buffer.clear();
-            return Ok(0);
-        }
-
-        let written = {
-            let output = state.output.as_deref().unwrap_or(&[]);
-            dst.write(&output[state.output_offset..])?
-        };
-        state.output_offset += written;
-        if state.output_offset >= output_len {
-            state.output = None;
-            state.output_offset = 0;
-            state.output_finalized = true;
-            state.buffer.clear();
-        }
-        Ok(written)
+        self.read_with_nowait(dst)
     }
 
     fn write(&self, src: &mut super::IoSrc) -> AxResult<usize> {
-        let mut buf = vec![0; src.remaining()];
-        let read = src.read(&mut buf)?;
-        buf.truncate(read);
-        self.push_request_input(&buf, SendParams::default())?;
-        Ok(read)
+        self.write_with_nowait(src)
     }
 
     fn stat(&self) -> AxResult<Kstat> {
@@ -474,15 +213,7 @@ impl Pollable for AfAlgSocket {
     }
 }
 
-#[derive(Default)]
-struct SendParams {
-    op: Option<AlgOperation>,
-    iv: Option<Vec<u8>>,
-    assoclen: Option<u32>,
-}
-
-fn parse_send_params(control: &[u8]) -> AxResult<(SendParams, usize)> {
-    let mut params = SendParams::default();
+fn validate_send_params(control: &[u8]) -> AxResult<usize> {
     let mut ancillary_items = 0usize;
     let mut offset = 0usize;
     while control.len().saturating_sub(offset) >= size_of::<cmsghdr>() {
@@ -515,11 +246,9 @@ fn parse_send_params(control: &[u8]) -> AxResult<(SendParams, usize)> {
                     return Err(AxError::InvalidInput);
                 }
                 let raw = u32::from_ne_bytes(data.try_into().unwrap());
-                params.op = Some(match raw {
-                    ALG_OP_DECRYPT => AlgOperation::Decrypt,
-                    ALG_OP_ENCRYPT => AlgOperation::Encrypt,
-                    _ => return Err(AxError::InvalidInput),
-                });
+                if !matches!(raw, ALG_OP_DECRYPT | ALG_OP_ENCRYPT) {
+                    return Err(AxError::InvalidInput);
+                }
             }
             ALG_SET_IV => {
                 if data.len() < size_of::<u32>() {
@@ -530,13 +259,11 @@ fn parse_send_params(control: &[u8]) -> AxResult<(SendParams, usize)> {
                 if data.len() < size_of::<u32>() + ivlen {
                     return Err(AxError::InvalidInput);
                 }
-                params.iv = Some(data[size_of::<u32>()..size_of::<u32>() + ivlen].to_vec());
             }
             ALG_SET_AEAD_ASSOCLEN => {
                 if data.len() != size_of::<u32>() {
                     return Err(AxError::InvalidInput);
                 }
-                params.assoclen = Some(u32::from_ne_bytes(data.try_into().unwrap()));
             }
             _ => return Err(AxError::InvalidInput),
         }
@@ -549,7 +276,7 @@ fn parse_send_params(control: &[u8]) -> AxResult<(SendParams, usize)> {
             .ok_or(AxError::InvalidInput)?;
     }
 
-    Ok((params, ancillary_items))
+    Ok(ancillary_items)
 }
 
 fn cmsg_align(len: usize) -> Option<usize> {
@@ -561,53 +288,6 @@ fn parse_c_string_field(bytes: &[u8]) -> AxResult<String> {
     let len = bytes.iter().position(|&it| it == 0).unwrap_or(bytes.len());
     let raw = core::str::from_utf8(&bytes[..len]).map_err(|_| AxError::InvalidInput)?;
     Ok(raw.to_string())
-}
-
-fn resolve_binding(addr: &SockAddrAlg) -> AxResult<AlgorithmBinding> {
-    let family = match addr.alg_type.as_str() {
-        "hash" if has_hash_algorithm(&addr.alg_name) => AlgFamily::Hash,
-        "skcipher" if has_skcipher_algorithm(&addr.alg_name) => AlgFamily::Skcipher,
-        "aead" if has_aead_algorithm(&addr.alg_name) => AlgFamily::Aead,
-        _ => return Err(AxError::from(LinuxError::ENOENT)),
-    };
-
-    Ok(AlgorithmBinding {
-        family,
-        alg_name: addr.alg_name.clone(),
-        key: Vec::new(),
-    })
-}
-
-fn has_hash_algorithm(name: &str) -> bool {
-    if name.starts_with("hmac(hmac(") {
-        return false;
-    }
-
-    if HASH_ALGS.contains(&name) || VMAC_ALGS.contains(&name) {
-        return true;
-    }
-
-    name.strip_prefix("hmac(")
-        .and_then(|inner| inner.strip_suffix(')'))
-        .is_some_and(|inner| HASH_ALGS.contains(&inner))
-}
-
-fn has_skcipher_algorithm(name: &str) -> bool {
-    matches!(name, "salsa20" | "cbc(aes-generic)")
-}
-
-fn has_aead_algorithm(name: &str) -> bool {
-    matches!(
-        name,
-        "rfc7539(chacha20,poly1305)" | "authenc(hmac(sha256),cbc(aes))"
-    )
-}
-
-fn validate_key(binding: &AlgorithmBinding, key: &[u8]) -> AxResult<()> {
-    if binding.alg_name == "authenc(hmac(sha256),cbc(aes))" && key.len() < 12 {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -648,6 +328,35 @@ mod tests {
             salg_mask: 0,
             salg_name: alg_name,
         }
+    }
+
+    #[test]
+    fn unavailable_crypto_fails_closed() {
+        let socket = AfAlgSocket::new_listener();
+        for (alg_type, alg_name) in [
+            ("hash", "sha256"),
+            ("hash", "hmac(sha1)"),
+            ("skcipher", "cbc(aes-generic)"),
+            ("skcipher", "salsa20"),
+            ("aead", "rfc7539(chacha20,poly1305)"),
+        ] {
+            assert_eq!(
+                socket.bind(SockAddrAlg {
+                    alg_type: alg_type.into(),
+                    alg_name: alg_name.into(),
+                }),
+                Err(LinuxError::ENOENT.into())
+            );
+        }
+        assert!(matches!(
+            socket.accept_request(),
+            Err(AxError::InvalidInput)
+        ));
+        assert_eq!(socket.set_alg_key(&[0; 16]), Err(AxError::InvalidInput));
+        assert_eq!(
+            socket.send_prepared(AfAlgSendRequest::prepare(Vec::new(), &[], false).unwrap()),
+            Err(AxError::InvalidInput)
+        );
     }
 
     #[test]
