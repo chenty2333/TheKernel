@@ -31,8 +31,10 @@ use spin::{Lazy, Mutex, MutexGuard};
 #[cfg(test)]
 use tk_linux_net::NETLINK_MAX_MESSAGE_BYTES;
 use tk_linux_net::{
-    NETLINK_DEFAULT_SEND_BUFFER_BYTES, NetlinkQueueAdmission, NetlinkWriteAdmission,
-    admit_netlink_queue, admit_netlink_write,
+    NETLINK_DEFAULT_SEND_BUFFER_BYTES, NL_CFG_F_NONROOT_RECV, NL_CFG_F_NONROOT_SEND,
+    NetlinkQueueAdmission, NetlinkWriteAdmission, SYSCTL_RMEM_DEFAULT, SYSCTL_RMEM_MAX,
+    SYSCTL_WMEM_DEFAULT, SYSCTL_WMEM_MAX, admit_netlink_queue, admit_netlink_write,
+    netlink_allowed, netlink_group_bind_permitted, netlink_protocol_group_capacity,
 };
 
 use crate::{
@@ -49,6 +51,11 @@ const NETLINK_MAX_PROTOCOL: u32 = 31;
 const NETLINK_QUEUE_LIMIT: usize = 128;
 const NETLINK_QUEUE_LIMIT_BYTES: usize = NETLINK_DEFAULT_SEND_BUFFER_BYTES;
 const NETLINK_ROUTE: u32 = 0;
+/// `NETLINK_USERSOCK` (`include/uapi/linux/netlink.h`).  `netlink_proto_init`
+/// registers it with `NL_CFG_F_NONROOT_SEND`, so unprivileged sockets may
+/// address a peer without the `CAP_NET_ADMIN` check that `netlink_allowed`
+/// applies to the kernel-service families.
+const NETLINK_USERSOCK: u32 = 2;
 const NETLINK_SOCK_DIAG: u32 = 4;
 const NETLINK_NETFILTER: u32 = 12;
 const NETLINK_KOBJECT_UEVENT: u32 = 15;
@@ -296,12 +303,133 @@ struct LinkEntry {
 #[derive(Default)]
 struct NetlinkState {
     port_id: u32,
-    groups: u32,
+    /// `nlk->groups[0]`: the multicast subscription word.  Linux keeps it as
+    /// an `unsigned long` and `netlink_update_socket_mc` assigns any bit below
+    /// `nlk->ngroups`, so `RTNLGRP_MAX`'s groups 33..39 live in the high half
+    /// of the word while `struct sockaddr_nl.nl_groups` only carries the low
+    /// 32 bits (`netlink_getname` truncates the same way).
+    groups: u64,
     option_flags: u32,
     passcred: bool,
     bound: bool,
     peer_port_id: u32,
     peer_groups: u32,
+    /// `nlk->ngroups`: the protocol's multicast group capacity once
+    /// `netlink_realloc_groups` has sized the bitmap.  Linux leaves it zero
+    /// until a bind with groups or an ADD/DROP_MEMBERSHIP request runs that
+    /// reallocation, which is why a socket that never subscribed reports an
+    /// empty `NETLINK_LIST_MEMBERSHIPS` bitmap.
+    membership_groups: Option<usize>,
+    /// `struct sock`-level state the generic `sock_setsockopt`/`sk_getsockopt`
+    /// pair owns for every socket, netlink endpoints included.
+    sock: NetlinkSockOptions,
+}
+
+/// Generic `SOL_SOCKET` state Linux stores on every `struct sock`
+/// (`sock_init_data_uid` plus `sk_setsockopt`).  Netlink's own `proto_ops`
+/// never consume most of these values — `netlink_sendmsg` and `netlink_recvmsg`
+/// read none of them — but `sk_getsockopt` reports them back, so an endpoint
+/// that accepted a `setsockopt` must retain the value to answer identically.
+/// `SO_SNDBUF`/`SO_RCVBUF` are the exception: they bound the receive queue,
+/// which is why the endpoint keeps them at all.
+struct NetlinkSockOptions {
+    /// `sk_type`, which `SO_TYPE` reports.  `netlink_create` stores the raw
+    /// requested type (`SOCK_RAW` or `SOCK_DGRAM`).
+    socket_type: u32,
+    /// `sk_reuse`, the `SK_NO_REUSE`/`SK_CAN_REUSE` pair `SO_REUSEADDR` owns.
+    reuse: i32,
+    /// `sk_reuseport`, reachable only through the zero assignment because
+    /// `sk_setsockopt` rejects a nonzero value for non-INET families.
+    reuseport: i32,
+    debug: bool,
+    dontroute: bool,
+    broadcast: bool,
+    keepalive: bool,
+    oobinline: bool,
+    no_check: bool,
+    /// `sk_priority` (`SO_PRIORITY`).
+    priority: i32,
+    /// `sk_mark` (`SO_MARK`).
+    mark: i32,
+    /// `SOCK_LINGER` and `sk_lingertime / HZ` (`SO_LINGER`).
+    linger_on: bool,
+    linger_seconds: i32,
+    /// `sk_rcvlowat` (`SO_RCVLOWAT`).
+    rcvlowat: i32,
+    /// `sk_sndbuf` (`SO_SNDBUF`).
+    sndbuf: i32,
+    /// `sk_rcvbuf` (`SO_RCVBUF`).
+    rcvbuf: i32,
+}
+
+impl Default for NetlinkSockOptions {
+    fn default() -> Self {
+        Self {
+            socket_type: SOCK_RAW,
+            reuse: 0,
+            reuseport: 0,
+            debug: false,
+            dontroute: false,
+            broadcast: false,
+            keepalive: false,
+            oobinline: false,
+            no_check: false,
+            priority: 0,
+            mark: 0,
+            linger_on: false,
+            linger_seconds: 0,
+            // `sock_init_data_uid` seeds `sk_rcvlowat` from one and both
+            // buffers from the global `sysctl_{w,r}mem_default`.
+            rcvlowat: 1,
+            sndbuf: SYSCTL_WMEM_DEFAULT,
+            rcvbuf: SYSCTL_RMEM_DEFAULT,
+        }
+    }
+}
+
+/// Capability answers the generic `SOL_SOCKET` and `SOL_NETLINK` tables
+/// consult.  `sk_setsockopt` uses `capable()` over the *initial* user namespace
+/// for `SO_DEBUG`, `SO_SNDBUFFORCE` and `SO_RCVBUFFORCE`, `ns_capable()` over
+/// the socket's network-namespace user namespace for `SO_PRIORITY` and
+/// `SO_MARK`, and `netlink_allowed()`/`ns_capable()` for the netlink
+/// membership and `NETLINK_LISTEN_ALL_NSID` gates.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct NetlinkOptionAuthority {
+    pub(crate) init_net_admin: bool,
+    pub(crate) net_admin: bool,
+    pub(crate) net_raw: bool,
+    pub(crate) net_broadcast: bool,
+}
+
+impl NetlinkOptionAuthority {
+    /// Full authority, for the in-module tests that exercise the state machine
+    /// rather than the capability gate.
+    #[cfg(test)]
+    const fn testing() -> Self {
+        Self {
+            init_net_admin: true,
+            net_admin: true,
+            net_raw: true,
+            net_broadcast: true,
+        }
+    }
+}
+
+/// One option value this endpoint reports.  `sk_getsockopt` and
+/// `netlink_getsockopt` each copy a per-optname payload and then write back the
+/// number of bytes they copied, so the provider returns the payload and the
+/// syscall layer performs the bounded copyout and the length write-back.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum NetlinkOptionValue {
+    Int(i32),
+    /// `SO_LINGER`: `struct linger { int l_onoff; int l_linger; }`.
+    Linger([i32; 2]),
+    /// `SO_PEERCRED`: `struct ucred { __u32 pid; __u32 uid; __u32 gid; }`.
+    Ucred([i32; 3]),
+    /// `NETLINK_LIST_MEMBERSHIPS`: the group bitmap as 32-bit chunks together
+    /// with the `ALIGN(BITS_TO_BYTES(ngroups), 4)` length Linux reports in
+    /// `*optlen` regardless of how much of it fit in the caller's buffer.
+    Memberships { words: [u32; 2], reported: usize },
 }
 
 pub struct NetlinkSocket {
@@ -415,7 +543,7 @@ impl<'a> NetlinkWritePermit<'a> {
             | Self::Netfilter { state, .. }
             | Self::Audit { state, .. }
             | Self::Uevent { state, .. }
-            | Self::SockDiag { state, .. } => state.groups & group != 0,
+            | Self::SockDiag { state, .. } => state.groups & u64::from(group) != 0,
         }
     }
 
@@ -474,6 +602,14 @@ const KERNEL_UEVENT_CREDENTIALS: NetlinkCredentials = NetlinkCredentials {
 };
 
 static KOBJECT_UEVENT_SOCKETS: Lazy<Mutex<Vec<Weak<NetlinkSocket>>>> =
+    Lazy::new(|| Mutex::new(Vec::new()));
+/// User-to-user transport registrations.  Linux's `NETLINK_USERSOCK` protocol
+/// has no kernel message handler at all: `netlink_unicast` resolves the
+/// destination through `nl_table[NETLINK_USERSOCK].hash` and delivers the
+/// datagram to the peer socket.  The weak registry is the same lifetime-pin
+/// mechanism the kobject-uevent transport uses, so the metadata-only
+/// `NETLINK_PORTS` reservation table keeps its existing meaning.
+static USERSOCK_SOCKETS: Lazy<Mutex<Vec<Weak<NetlinkSocket>>>> =
     Lazy::new(|| Mutex::new(Vec::new()));
 static AUDIT_SOCKETS: Lazy<Mutex<Vec<Weak<NetlinkSocket>>>> = Lazy::new(|| Mutex::new(Vec::new()));
 // Kobject/device discovery is global to init-net.  The namespace is a kernel
@@ -1512,6 +1648,7 @@ impl NetlinkSocket {
             || !matches!(
                 protocol,
                 NETLINK_ROUTE
+                    | NETLINK_USERSOCK
                     | NETLINK_SOCK_DIAG
                     | NETLINK_NETFILTER
                     | NETLINK_AUDIT
@@ -1524,12 +1661,21 @@ impl NetlinkSocket {
         Ok(())
     }
 
-    pub(crate) fn try_new(protocol: u32, net_ns: Arc<NetworkNamespace>) -> AxResult<Arc<Self>> {
+    pub(crate) fn try_new(
+        protocol: u32,
+        socket_type: u32,
+        net_ns: Arc<NetworkNamespace>,
+    ) -> AxResult<Arc<Self>> {
+        let mut initial = NetlinkState::default();
+        // `sock_init_data` copies `sock->type` into `sk_type`; `SO_TYPE` reports
+        // that stored value, so `netlink_create`'s raw accept list is what a
+        // caller reads back.
+        initial.sock.socket_type = socket_type;
         let socket = Arc::try_new(Self {
             protocol,
             net_ns,
             inode: PseudoInode::socket(),
-            state: Mutex::new(NetlinkState::default()),
+            state: Mutex::new(initial),
             queue: Mutex::new(NetlinkQueue {
                 datagrams: VecDeque::new(),
                 bytes: 0,
@@ -1545,6 +1691,11 @@ impl NetlinkSocket {
             sockets.retain(|socket| socket.strong_count() != 0);
             sockets.push(Arc::downgrade(&socket));
         }
+        if protocol == NETLINK_USERSOCK {
+            let mut sockets = USERSOCK_SOCKETS.lock();
+            sockets.retain(|socket| socket.strong_count() != 0);
+            sockets.push(Arc::downgrade(&socket));
+        }
         if protocol == NETLINK_AUDIT {
             let mut sockets = AUDIT_SOCKETS.lock();
             sockets.retain(|socket| socket.strong_count() != 0);
@@ -1553,33 +1704,123 @@ impl NetlinkSocket {
         Ok(socket)
     }
 
-    pub fn bind(&self, port_id: u32, groups: u32) -> AxResult {
-        self.bind_port_id(port_id, groups, port_id == 0)
+    pub fn bind(
+        &self,
+        port_id: u32,
+        groups: u32,
+        authority: NetlinkOptionAuthority,
+    ) -> AxResult {
+        self.bind_port_id(port_id, groups, port_id == 0, authority)
     }
 
     /// Linux treats `nl_pid = 0` as an automatic port-ID request.  Prefer the
     /// caller's TGID, then use a collision-free generated ID when it is taken.
-    pub fn bind_auto(&self, preferred_port_id: u32, groups: u32) -> AxResult {
-        self.bind_port_id(preferred_port_id, groups, true)
+    pub fn bind_auto(
+        &self,
+        preferred_port_id: u32,
+        groups: u32,
+        authority: NetlinkOptionAuthority,
+    ) -> AxResult {
+        self.bind_port_id(preferred_port_id, groups, true, authority)
     }
 
-    fn bind_port_id(&self, preferred_port_id: u32, groups: u32, automatic: bool) -> AxResult {
+    /// `nlk->netlink_bind(net, group)` for one multicast group, the hook
+    /// `netlink_bind` and `NETLINK_ADD_MEMBERSHIP` both run.
+    fn check_group_bind_hook(&self, group: u32, authority: NetlinkOptionAuthority) -> AxResult {
         if self.protocol == NETLINK_AUDIT {
-            // The audit family advertises exactly AUDIT_NLGRP_READLOG.  Do
-            // not let unimplemented group bits become inert, unobservable
-            // subscriptions.
-            if groups & !AUDIT_GROUP != 0 {
-                return Err(AxError::InvalidInput);
-            }
-            // A port-only bind is the auditd command/reply endpoint, so it
-            // has the same global authority requirement as group 1.
+            // `audit_multicast_bind` answers every group with
+            // `if (!capable(CAP_AUDIT_READ)) err = -EPERM;`.
             if !self.audit_listener_authorized() {
                 return Err(LinuxError::EPERM.into());
             }
+            return Ok(());
+        }
+        if !netlink_group_bind_permitted(self.protocol, group, authority.net_admin) {
+            return Err(LinuxError::EPERM.into());
+        }
+        Ok(())
+    }
+
+    /// The `netlink_bind` hook loop: `for (group = 0; group <
+    /// BITS_PER_TYPE(u32); group++)` over the low half of the group word.
+    ///
+    /// "`nl_groups` is a u32, so cap the maximum groups we can bind" is why
+    /// `RTNLGRP_IPV4_MROUTE_R` and `RTNLGRP_IPV6_MROUTE_R` are reachable from
+    /// `bind` even though the group word itself is an `unsigned long`.
+    fn check_group_bind_mask(&self, groups: u64, authority: NetlinkOptionAuthority) -> AxResult {
+        if groups == 0 {
+            return Ok(());
+        }
+        for group in 1..=u32::BITS {
+            if groups & (1_u64 << (group - 1)) == 0 {
+                continue;
+            }
+            self.check_group_bind_hook(group, authority)?;
+        }
+        Ok(())
+    }
+
+    /// `netlink_bind`.  The syscall layer has already enforced
+    /// `addr_len >= sizeof(struct sockaddr_nl)` and `nl_family == AF_NETLINK`;
+    /// the remaining order is Linux's own:
+    ///
+    /// 1. a nonzero group mask requires `netlink_allowed(NL_CFG_F_NONROOT_RECV)`
+    ///    and then `netlink_realloc_groups`, which sizes `nlk->ngroups`;
+    /// 2. a group mask is truncated to `nlk->ngroups` bits;
+    /// 3. an already-bound socket only admits the port ID it already owns, so
+    ///    rebinding is how a caller changes its group subscriptions;
+    /// 4. an unbound socket inserts (or autobinds) its port ID.
+    fn bind_port_id(
+        &self,
+        preferred_port_id: u32,
+        groups: u32,
+        automatic: bool,
+        authority: NetlinkOptionAuthority,
+    ) -> AxResult {
+        let mut groups = u64::from(groups);
+        if groups != 0 {
+            if !netlink_allowed(self.protocol, NL_CFG_F_NONROOT_RECV, authority.net_admin) {
+                return Err(LinuxError::EPERM.into());
+            }
+            let capacity = netlink_protocol_group_capacity(self.protocol);
+            self.state.lock().membership_groups = Some(capacity as usize);
+            // `if (nlk->ngroups < BITS_PER_LONG) groups &= (1UL << nlk->ngroups) - 1;`
+            // The mask is an `unsigned long` operation on Linux, and
+            // `netlink_realloc_groups` only ever raises `ngroups`, so a
+            // request can never widen the word past its protocol's capacity.
+            if (capacity as usize) < u64::BITS as usize {
+                groups &= (1_u64 << capacity) - 1;
+            }
         }
         let mut state = self.state.lock();
-        if state.bound {
+        if state.bound && state.port_id != preferred_port_id {
+            // `if (nladdr->nl_pid != nlk->portid) return -EINVAL;` runs before
+            // the per-group hooks, so a mismatched port ID outranks them.
             return Err(LinuxError::EINVAL.into());
+        }
+        if self.protocol == NETLINK_AUDIT && !self.audit_listener_authorized() {
+            // `audit_multicast_bind` answers `if (!capable(CAP_AUDIT_READ))
+            // err = -EPERM;`, and this port-only request is the auditd
+            // command/reply endpoint.  Linux runs the hook only for a nonzero
+            // group mask, so requiring the same authority for a port-only bind
+            // is deliberately stricter than Linux.
+            return Err(LinuxError::EPERM.into());
+        }
+        // `if (nlk->netlink_bind && groups)` … `for (group = 0; group <
+        // BITS_PER_TYPE(u32); group++)`: the hook runs after the port-ID
+        // comparison and before the insertion, so a rejected group leaves a
+        // fresh socket unbound.
+        self.check_group_bind_mask(groups, authority)?;
+        if state.bound {
+            // `netlink_bind` still reaches the group update when `bound`, so a
+            // repeated bind to the same port ID changes only the mask.
+            // `nlk->groups[0] = (nlk->groups[0] & ~0xffffffffUL) | groups;`
+            // preserves the high half of the word, so a rebind cannot clear a
+            // subscription that ADD_MEMBERSHIP placed above group 32.
+            if groups != 0 || state.groups != 0 {
+                state.groups = (state.groups & !u64::from(u32::MAX)) | groups;
+            }
+            return Ok(());
         }
         let port_id = reserve_netlink_port(self, preferred_port_id, automatic)?;
         state.port_id = port_id;
@@ -1588,30 +1829,58 @@ impl NetlinkSocket {
         Ok(())
     }
 
-    pub fn set_option(&self, optname: u32, value: u32) -> AxResult {
+    /// `netlink_setsockopt`'s `SOL_NETLINK` table.
+    ///
+    /// `optlen` is deliberately absent: Linux reads the value only when
+    /// `optlen >= sizeof(int)` and otherwise proceeds with `val == 0`, so a
+    /// zero-length request is a legal "clear the flag" for every toggle.
+    pub fn set_option(
+        &self,
+        optname: u32,
+        value: u32,
+        authority: NetlinkOptionAuthority,
+    ) -> AxResult {
         match optname {
             // NETLINK_ADD_MEMBERSHIP and NETLINK_DROP_MEMBERSHIP use a multicast group number.
             1 | 2 => {
-                let bit = value
-                    .checked_sub(1)
-                    .filter(|bit| *bit < u32::BITS)
-                    .ok_or(AxError::InvalidInput)?;
-                if self.protocol == NETLINK_AUDIT {
-                    if value != AUDIT_GROUP {
-                        return Err(AxError::InvalidInput);
-                    }
-                    // Recheck both addition and removal: the caller may
-                    // have crossed user/net namespaces after receiving this
-                    // descriptor, and no audit subscription transition may
-                    // be performed outside initial authority.
-                    if !self.audit_listener_authorized() {
-                        return Err(LinuxError::EPERM.into());
-                    }
+                // `netlink_allowed(sock, NL_CFG_F_NONROOT_RECV)` runs before any
+                // group validation, so an unprivileged caller of a
+                // kernel-service family sees EPERM even for a bogus group.
+                if !netlink_allowed(
+                    self.protocol,
+                    NL_CFG_F_NONROOT_RECV,
+                    authority.net_admin,
+                ) {
+                    return Err(LinuxError::EPERM.into());
                 }
+                // `netlink_realloc_groups` sizes `nlk->ngroups` from the
+                // protocol's own group count, which `__netlink_kernel_create`
+                // floors at 32, before the range test compares against it.
+                // `netlink_realloc_groups` runs before the range test, so the
+                // bitmap capacity is observable through NETLINK_LIST_MEMBERSHIPS
+                // even when the requested group is rejected.
+                let ngroups = netlink_protocol_group_capacity(self.protocol);
+                self.state.lock().membership_groups = Some(ngroups as usize);
+                if value == 0 || value > ngroups {
+                    return Err(AxError::InvalidInput);
+                }
+                // `if (optname == NETLINK_ADD_MEMBERSHIP && nlk->netlink_bind)`
+                // — the hook runs after the range test and only for the group
+                // being added; a drop answers through the void unbind hook.
                 if optname == 1 {
-                    self.state.lock().groups |= 1 << bit;
+                    self.check_group_bind_hook(value, authority)?;
+                }
+                let bit = value - 1;
+                // `__assign_bit(group - 1, nlk->groups, new)` addresses the
+                // whole `unsigned long`, so this is a 64-bit shift: the audit
+                // and rtnetlink group masks both reach past bit 31.
+                let Some(mask) = 1_u64.checked_shl(bit) else {
+                    return Err(AxError::InvalidInput);
+                };
+                if optname == 1 {
+                    self.state.lock().groups |= mask;
                 } else {
-                    self.state.lock().groups &= !(1 << bit);
+                    self.state.lock().groups &= !mask;
                 }
             }
             // NETLINK_BROADCAST_ERROR, NETLINK_NO_ENOBUFS, NETLINK_CAP_ACK,
@@ -1624,18 +1893,212 @@ impl NetlinkSocket {
                     self.state.lock().option_flags |= mask;
                 }
             }
+            // NETLINK_PKTINFO is the same boolean toggle.  The receive-side
+            // effect (an `nl_pktinfo` control message) belongs to recvmsg.
+            3 => {
+                let mask = 1 << optname;
+                if value == 0 {
+                    self.state.lock().option_flags &= !mask;
+                } else {
+                    self.state.lock().option_flags |= mask;
+                }
+            }
+            // NETLINK_LISTEN_ALL_NSID is gated on CAP_NET_BROADCAST over the
+            // socket's network namespace, not on CAP_NET_ADMIN.
+            8 => {
+                if !authority.net_broadcast {
+                    return Err(LinuxError::EPERM.into());
+                }
+                let mask = 1 << optname;
+                if value == 0 {
+                    self.state.lock().option_flags &= !mask;
+                } else {
+                    self.state.lock().option_flags |= mask;
+                }
+            }
             _ => return Err(AxError::from(LinuxError::ENOPROTOOPT)),
         }
         Ok(())
     }
 
-    pub fn get_option(&self, optname: u32) -> AxResult<u32> {
+    /// `netlink_getsockopt`'s `SOL_NETLINK` table.  `len` is the caller's
+    /// buffer size; Linux rejects a negative length before the option switch
+    /// and every boolean flag needs a full `int` to be written.
+    pub fn get_option(&self, optname: u32, len: usize) -> AxResult<NetlinkOptionValue> {
         match optname {
-            4 | 5 | 10 | 11 | 12 => Ok(u32::from(
-                self.state.lock().option_flags & (1 << optname) != 0,
-            )),
+            3 | 4 | 5 | 8 | 10 | 11 | 12 => {
+                if len < size_of::<i32>() {
+                    return Err(AxError::InvalidInput);
+                }
+                Ok(NetlinkOptionValue::Int(i32::from(
+                    self.state.lock().option_flags & (1 << optname) != 0,
+                )))
+            }
+            // NETLINK_LIST_MEMBERSHIPS is the only variable-length getter.  It
+            // walks `pos * 8 < nlk->ngroups` in four-byte steps and stops when
+            // the caller's remaining length can no longer hold a chunk, but it
+            // always reports the bitmap's aligned size.
+            9 => {
+                let state = self.state.lock();
+                let ngroups = state.membership_groups.unwrap_or(0);
+                let reported = ngroups.div_ceil(u32::BITS as usize) * size_of::<u32>();
+                let mut words = [0_u32; 2];
+                for (index, word) in words.iter_mut().enumerate() {
+                    if index * u32::BITS as usize >= ngroups
+                        || len < (index + 1) * size_of::<u32>()
+                    {
+                        break;
+                    }
+                    // `netlink_getsockopt` walks the bitmap in four-byte
+                    // chunks over `nlk->groups[0]`, so chunk `index` is the
+                    // `index`-th 32-bit half of the `unsigned long` word.
+                    // Every registered protocol asks for at most
+                    // `RTNLGRP_MAX` groups, so two chunks always suffice.
+                    *word = (state.groups >> (index * u32::BITS as usize)) as u32;
+                }
+                Ok(NetlinkOptionValue::Memberships { words, reported })
+            }
             _ => Err(LinuxError::ENOPROTOOPT.into()),
         }
+    }
+
+    /// `sk_setsockopt`'s generic `SOL_SOCKET` table for this endpoint.
+    pub fn set_sol_socket_option(
+        &self,
+        optname: u32,
+        value: i32,
+        authority: NetlinkOptionAuthority,
+    ) -> AxResult {
+        use tk_linux_net::GenericSocketOption as Option;
+        let option = tk_linux_net::generic_socket_set_option(optname as i32)
+            .ok_or(LinuxError::ENOPROTOOPT)?;
+        let valbool = i32::from(value != 0);
+        let mut state = self.state.lock();
+        match option {
+            Option::Debug => {
+                if value != 0 && !authority.init_net_admin {
+                    return Err(LinuxError::EACCES.into());
+                }
+                state.sock.debug = valbool != 0;
+            }
+            Option::ReuseAddress => state.sock.reuse = valbool,
+            Option::ReusePort => {
+                // `if (valbool && !sk_is_inet(sk)) ret = -EOPNOTSUPP;` — a
+                // netlink socket is never INET, but clearing the flag still
+                // succeeds and is observable through SO_REUSEPORT.
+                if valbool != 0 {
+                    return Err(LinuxError::EOPNOTSUPP.into());
+                }
+                state.sock.reuseport = 0;
+            }
+            Option::DontRoute => state.sock.dontroute = valbool != 0,
+            Option::Broadcast => state.sock.broadcast = valbool != 0,
+            Option::SendBuffer => {
+                let clamped = value.min(SYSCTL_WMEM_MAX);
+                state.sock.sndbuf = tk_linux_net::decode_send_buffer(clamped);
+            }
+            Option::ReceiveBuffer => {
+                let clamped = value.min(SYSCTL_RMEM_MAX);
+                state.sock.rcvbuf = tk_linux_net::decode_receive_buffer(clamped);
+            }
+            Option::KeepAlive => state.sock.keepalive = valbool != 0,
+            Option::OutOfBandInline => state.sock.oobinline = valbool != 0,
+            Option::NoCheck => state.sock.no_check = valbool != 0,
+            Option::Priority => {
+                if !tk_linux_net::priority_set_permitted(
+                    value,
+                    authority.net_raw,
+                    authority.net_admin,
+                ) {
+                    return Err(LinuxError::EPERM.into());
+                }
+                state.sock.priority = value;
+            }
+            Option::Mark => {
+                if !tk_linux_net::mark_set_permitted(authority.net_raw, authority.net_admin) {
+                    return Err(LinuxError::EPERM.into());
+                }
+                state.sock.mark = value;
+            }
+            Option::Linger => unreachable!("SO_LINGER is decoded before the integer table"),
+            Option::PassCredentials => state.passcred = valbool != 0,
+            Option::ReceiveLowWater => {
+                state.sock.rcvlowat = tk_linux_net::decode_receive_low_water(value)
+            }
+            // `SO_SNDLOWAT` is settable in neither table: `sk_setsockopt` has
+            // no case for it, so `generic_socket_set_option` already returned
+            // `None` above and this arm is unreachable.
+            Option::SendLowWater => unreachable!("SO_SNDLOWAT has no setter"),
+            // Read-only names also return `None` from the setter table.
+            Option::Type
+            | Option::Error
+            | Option::AcceptConn
+            | Option::PeerCredentials
+            | Option::Protocol
+            | Option::Domain => unreachable!("read-only SOL_SOCKET names have no setter"),
+        }
+        Ok(())
+    }
+
+    /// `SO_LINGER` is the one generic option whose input is not one `int`:
+    /// `sk_setsockopt` requires `optlen >= sizeof(struct linger)`, zeroes the
+    /// flag when `l_onoff` is zero, and otherwise stores `l_linger * HZ`.
+    /// `sk_setsockopt(SO_LINGER)`: clearing `l_onoff` resets the flag but
+    /// leaves `sk_lingertime` alone, and `sk_getsockopt` reports
+    /// `sk_lingertime / HZ` whether or not the flag is set, so a later
+    /// `{ l_onoff = 0, l_linger = 9 }` request still reads back the seconds of
+    /// the last enabled request.
+    pub fn set_linger_option(&self, onoff: i32, seconds: i32) {
+        let mut state = self.state.lock();
+        if onoff == 0 {
+            state.sock.linger_on = false;
+        } else {
+            state.sock.linger_on = true;
+            state.sock.linger_seconds = seconds;
+        }
+    }
+
+    /// `sk_getsockopt`'s generic `SOL_SOCKET` table for this endpoint.
+    pub fn get_sol_socket_option(&self, optname: u32) -> AxResult<NetlinkOptionValue> {
+        use tk_linux_net::GenericSocketOption as Option;
+        let option = tk_linux_net::generic_socket_get_option(optname as i32)
+            .ok_or(LinuxError::ENOPROTOOPT)?;
+        let state = self.state.lock();
+        let sock = &state.sock;
+        Ok(match option {
+            Option::Debug => NetlinkOptionValue::Int(i32::from(state.sock.debug)),
+            Option::ReuseAddress => NetlinkOptionValue::Int(state.sock.reuse),
+            Option::Type => NetlinkOptionValue::Int(sock.socket_type as i32),
+            // `netlink_sendmsg`/`netlink_recvmsg` never record a pending error
+            // and `netlink_create` leaves `sk_err_soft` clear.
+            Option::Error => NetlinkOptionValue::Int(0),
+            Option::DontRoute => NetlinkOptionValue::Int(i32::from(state.sock.dontroute)),
+            Option::Broadcast => NetlinkOptionValue::Int(i32::from(state.sock.broadcast)),
+            Option::SendBuffer => NetlinkOptionValue::Int(state.sock.sndbuf),
+            Option::ReceiveBuffer => NetlinkOptionValue::Int(state.sock.rcvbuf),
+            Option::KeepAlive => NetlinkOptionValue::Int(i32::from(state.sock.keepalive)),
+            Option::OutOfBandInline => NetlinkOptionValue::Int(i32::from(state.sock.oobinline)),
+            Option::NoCheck => NetlinkOptionValue::Int(i32::from(state.sock.no_check)),
+            Option::Priority => NetlinkOptionValue::Int(state.sock.priority),
+            Option::Mark => NetlinkOptionValue::Int(state.sock.mark),
+            Option::Linger => NetlinkOptionValue::Linger([
+                i32::from(sock.linger_on),
+                sock.linger_seconds,
+            ]),
+            Option::ReusePort => NetlinkOptionValue::Int(state.sock.reuseport),
+            // `sk_may_scm_recv` is true for AF_NETLINK, so SO_PASSCRED is a
+            // real per-description flag rather than an EOPNOTSUPP case.
+            Option::PassCredentials => NetlinkOptionValue::Int(i32::from(state.passcred)),
+            Option::ReceiveLowWater => NetlinkOptionValue::Int(state.sock.rcvlowat),
+            // `case SO_SNDLOWAT: v.val = 1;` — hardcoded, never stored.
+            Option::SendLowWater => NetlinkOptionValue::Int(1),
+            Option::AcceptConn => NetlinkOptionValue::Int(0),
+            Option::Protocol => NetlinkOptionValue::Int(self.protocol as i32),
+            Option::Domain => NetlinkOptionValue::Int(AF_NETLINK as i32),
+            // `sk_peer_pid`/`sk_peer_cred` stay NULL for a netlink socket, and
+            // `cred_to_ucred(NULL, NULL, ..)` reports `{pid 0, uid -1, gid -1}`.
+            Option::PeerCredentials => NetlinkOptionValue::Ucred([0, -1, -1]),
+        })
     }
 
     /// NETLINK sockets expose SO_PASSCRED per open file description.  Sender
@@ -1647,6 +2110,13 @@ impl NetlinkSocket {
 
     pub(crate) fn passcred(&self) -> bool {
         self.state.lock().passcred
+    }
+
+    /// `nlk->nl_groups[0]`, the multicast mask `netlink_getname` and
+    /// `NETLINK_LIST_MEMBERSHIPS` both report.
+    #[cfg(test)]
+    fn local_groups(&self) -> u64 {
+        self.state.lock().groups
     }
 
     pub fn write_local_addr(
@@ -1667,10 +2137,16 @@ impl NetlinkSocket {
         self.write_addr(capability, addr, addrlen, true)
     }
 
+    /// `netlink_connect`: the family and length rules belong to the caller, so
+    /// this is the `NL_CFG_F_NONROOT_SEND` gate followed by the autobind and
+    /// peer write.  The gate is per protocol — `NETLINK_USERSOCK` registers
+    /// that flag, `NETLINK_ROUTE` does not — which is why an unprivileged
+    /// usersock peer is legal while the same peer on rtnetlink is EPERM.
     pub fn connect(&self, address: Option<SockaddrNl>, actor: &Cred, pid: u32) -> AxResult {
         if let Some(address) = address {
+            let net_admin = ns_capable(actor, self.net_ns.owner_user_ns(), CAP_NET_ADMIN);
             if (address.nl_pid != 0 || address.nl_groups != 0)
-                && !ns_capable(actor, self.net_ns.owner_user_ns(), CAP_NET_ADMIN)
+                && !netlink_allowed(self.protocol, NL_CFG_F_NONROOT_SEND, net_admin)
             {
                 return Err(LinuxError::EPERM.into());
             }
@@ -1705,7 +2181,8 @@ impl NetlinkSocket {
             nl_groups: if peer {
                 state.peer_groups
             } else {
-                state.groups
+                // `addr->nl_groups = nlk->groups ? (u32)nlk->groups[0] : 0;`
+                state.groups as u32
             },
         };
         drop(state);
@@ -1920,6 +2397,10 @@ impl NetlinkSocket {
     ) -> AxResult {
         match self.protocol {
             NETLINK_ROUTE | NETLINK_SOCK_DIAG | NETLINK_NETFILTER | NETLINK_GENERIC => {}
+            // `netlink_unicast` with `dst_pid == 0` selects
+            // `netlink_unicast_kernel`; a `NETLINK_USERSOCK` socket has
+            // `nlk->netlink_rcv == NULL`, so Linux answers `-ECONNREFUSED`.
+            NETLINK_USERSOCK => return Err(LinuxError::ECONNREFUSED.into()),
             NETLINK_AUDIT | NETLINK_KOBJECT_UEVENT => return Err(LinuxError::EPERM.into()),
             _ => return Err(AxError::OperationNotSupported),
         }
@@ -2052,7 +2533,8 @@ impl NetlinkSocket {
 
     /// Send a userspace netlink datagram.  A port-ID-only destination is a
     /// unicast peer in this socket's network namespace and protocol family;
-    /// group delivery remains the privileged synthetic uevent path below.
+    /// `NETLINK_USERSOCK` additionally accepts a group destination, while the
+    /// privileged synthetic uevent path keeps its single protocol group.
     pub(crate) fn write_to_with_actor(
         &self,
         src: &mut IoSrc,
@@ -2074,6 +2556,9 @@ impl NetlinkSocket {
             if destination.nl_pid != 0 && destination.nl_groups != 0 {
                 return Err(AxError::InvalidInput);
             }
+            if destination.nl_groups != 0 && self.protocol == NETLINK_USERSOCK {
+                return self.broadcast_usersock(src, actor, sender_pid, destination, nowait);
+            }
             if destination.nl_pid != 0 {
                 return self.write_unicast_with_actor(
                     src,
@@ -2090,6 +2575,58 @@ impl NetlinkSocket {
         self.write_with_actor_admitted(src, actor, sender_pid, nowait)
     }
 
+    /// `netlink_sendmsg`'s group arm: it reduces the `sockaddr_nl` mask to
+    /// `dst_group = ffs(nl_groups)`, requires
+    /// `netlink_allowed(sock, NL_CFG_F_NONROOT_SEND)`, autobinds the sender,
+    /// and then hands the frame to `netlink_broadcast`.
+    fn broadcast_usersock(
+        &self,
+        src: &mut IoSrc,
+        actor: &Cred,
+        sender_pid: u32,
+        destination: SockaddrNl,
+        nowait: bool,
+    ) -> AxResult<usize> {
+        if !netlink_allowed(
+            self.protocol,
+            NL_CFG_F_NONROOT_SEND,
+            ns_capable(actor, self.net_ns.owner_user_ns(), CAP_NET_ADMIN),
+        ) {
+            return Err(LinuxError::EPERM.into());
+        }
+        let len = src.remaining();
+        if len == 0 {
+            return Err(LinuxError::ENODATA.into());
+        }
+        if admit_netlink_write(len) == NetlinkWriteAdmission::MessageTooLarge {
+            return Err(LinuxError::EMSGSIZE.into());
+        }
+        // `netlink_sendmsg` autobinds before it publishes the datagram, so a
+        // peer never observes sender port ID zero.
+        let source_port_id = self.ensure_bound_for_send(sender_pid, nowait)?;
+        let group = 1_u32 << destination.nl_groups.trailing_zeros();
+        let mut data = Vec::new();
+        data.try_reserve_exact(len)
+            .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
+        data.resize(len, 0);
+        src.read_exact(&mut data)?;
+        let ids = actor.ids();
+        broadcast_netlink_usersock(
+            self,
+            &data,
+            source_port_id,
+            destination.nl_pid,
+            group,
+            NetlinkCredentials {
+                pid: sender_pid,
+                uid: ids.ruid.into_raw(),
+                gid: ids.rgid.into_raw(),
+            },
+            nowait,
+        )?;
+        Ok(len)
+    }
+
     fn write_unicast_with_actor(
         &self,
         src: &mut IoSrc,
@@ -2098,7 +2635,7 @@ impl NetlinkSocket {
         destination_port_id: u32,
         nowait: bool,
     ) -> AxResult<usize> {
-        if self.protocol != NETLINK_KOBJECT_UEVENT {
+        if !matches!(self.protocol, NETLINK_KOBJECT_UEVENT | NETLINK_USERSOCK) {
             return Err(AxError::OperationNotSupported);
         }
         let len = src.remaining();
@@ -2319,6 +2856,10 @@ impl NetlinkSocket {
                 })
             }
             NETLINK_GENERIC => Ok(NetlinkWritePermit::Generic { gate, state, queue }),
+            // `NETLINK_USERSOCK` has no kernel message handler, so its write
+            // path needs no protocol state beyond the socket-local lock bundle
+            // that `Generic` already carries.
+            NETLINK_USERSOCK => Ok(NetlinkWritePermit::Generic { gate, state, queue }),
             NETLINK_NETFILTER => {
                 let transaction = if nowait {
                     NFT_TRANSACTION.try_lock().ok_or(AxError::WouldBlock)?
@@ -3392,7 +3933,7 @@ impl NetlinkSocket {
     }
 
     fn subscribed_to(&self, group: u32) -> bool {
-        self.state.lock().groups & group != 0
+        self.state.lock().groups & u64::from(group) != 0
     }
 }
 
@@ -3535,6 +4076,15 @@ impl Drop for NetlinkSocket {
             sockets.retain(|weak| weak.as_ptr() != this && weak.strong_count() != 0);
             // A burst of unprivileged open/close must not permanently retain a
             // large sparse backing allocation for future broadcasts.
+            let retained = sockets.len();
+            if sockets.capacity() > retained.saturating_mul(2).max(16) {
+                sockets.shrink_to(retained.max(16));
+            }
+        }
+        if self.protocol == NETLINK_USERSOCK {
+            let mut sockets = USERSOCK_SOCKETS.lock();
+            let this = core::ptr::from_ref(self);
+            sockets.retain(|weak| weak.as_ptr() != this && weak.strong_count() != 0);
             let retained = sockets.len();
             if sockets.capacity() > retained.saturating_mul(2).max(16) {
                 sockets.shrink_to(retained.max(16));
@@ -3849,7 +4399,7 @@ fn broadcast_user_uevent_nowait_locked(
             socket.poll_rx.wake();
             return true;
         };
-        let subscribed = state.groups & KOBJECT_UEVENT_GROUP != 0;
+        let subscribed = state.groups & u64::from(KOBJECT_UEVENT_GROUP) != 0;
         let suppress_enobufs = state.option_flags & (1 << NETLINK_NO_ENOBUFS) != 0;
         drop(state);
         if !subscribed {
@@ -3910,7 +4460,7 @@ fn broadcast_uevent_to_namespace(
     // before it takes the sender-domain lock, so registry -> peer lock here
     // would otherwise form a cross-sender cycle.
     let mut sockets = KOBJECT_UEVENT_SOCKETS.lock();
-    let listeners = match collect_live_uevent_listeners(&mut sockets) {
+    let listeners = match collect_live_listeners(&mut sockets) {
         Ok(listeners) => listeners,
         Err(error) => {
             // Kernel-originated uevents are best effort.  OOM while taking a
@@ -3942,7 +4492,7 @@ fn broadcast_uevent_to_namespace(
             socket.poll_rx.wake();
             continue;
         };
-        let subscribed = state.groups & KOBJECT_UEVENT_GROUP != 0;
+        let subscribed = state.groups & u64::from(KOBJECT_UEVENT_GROUP) != 0;
         let suppress_enobufs = state.option_flags & (1 << NETLINK_NO_ENOBUFS) != 0;
         drop(state);
         if !subscribed {
@@ -3996,7 +4546,7 @@ fn broadcast_uevent_to_namespace(
 
 /// Snapshot live listeners while holding only the registry lock.  Callers
 /// must release that lock before touching socket-local state or queues.
-fn collect_live_uevent_listeners(
+fn collect_live_listeners(
     sockets: &mut Vec<Weak<NetlinkSocket>>,
 ) -> AxResult<Vec<Arc<NetlinkSocket>>> {
     let mut listeners = Vec::new();
@@ -4019,24 +4569,25 @@ fn find_netlink_peer(
     port_id: u32,
     nowait: bool,
 ) -> AxResult<Option<Arc<NetlinkSocket>>> {
-    // KOBJECT_UEVENT is the one netlink family in this kernel that accepts
-    // user-to-user datagrams.  Its existing weak listener registry provides
-    // a lifetime pin without changing the deliberately metadata-only port
-    // reservation table used by the other kernel-service families.
-    if protocol != NETLINK_KOBJECT_UEVENT {
-        return Ok(None);
-    }
+    // KOBJECT_UEVENT and USERSOCK are the netlink families in this kernel that
+    // accept user-to-user datagrams (`netlink_unicast` resolving a port ID in
+    // `nl_table[protocol].hash`).  Their weak listener registries provide a
+    // lifetime pin without changing the deliberately metadata-only port
+    // reservation table used by the kernel-service families.
+    let registry = match protocol {
+        NETLINK_KOBJECT_UEVENT => &*KOBJECT_UEVENT_SOCKETS,
+        NETLINK_USERSOCK => &*USERSOCK_SOCKETS,
+        _ => return Ok(None),
+    };
     // Binding takes socket state and then the port registry.  Do not invert
-    // that order by holding the uevent registry while inspecting a peer's
+    // that order by holding the transport registry while inspecting a peer's
     // state: clone live candidates first, then drop the registry lock.
     let mut sockets = if nowait {
-        KOBJECT_UEVENT_SOCKETS
-            .try_lock()
-            .ok_or(AxError::WouldBlock)?
+        registry.try_lock().ok_or(AxError::WouldBlock)?
     } else {
-        KOBJECT_UEVENT_SOCKETS.lock()
+        registry.lock()
     };
-    let candidates = collect_live_uevent_listeners(&mut sockets)?;
+    let candidates = collect_live_listeners(&mut sockets)?;
     drop(sockets);
 
     for socket in candidates {
@@ -4054,6 +4605,52 @@ fn find_netlink_peer(
         }
     }
     Ok(None)
+}
+
+/// Deliver one `NETLINK_USERSOCK` datagram to every subscriber of `group` in
+/// this network namespace.  Linux's `netlink_broadcast` walks the same
+/// protocol hash table and filters on `nlk->groups & group` after translating
+/// the reported sender identity and, for `nl_pid != 0`, excluding the sender.
+fn broadcast_netlink_usersock(
+    sender: &NetlinkSocket,
+    data: &[u8],
+    source_port_id: u32,
+    destination_port_id: u32,
+    group: u32,
+    credentials: NetlinkCredentials,
+    nowait: bool,
+) -> AxResult {
+    let mut sockets = if nowait {
+        USERSOCK_SOCKETS.try_lock().ok_or(AxError::WouldBlock)?
+    } else {
+        USERSOCK_SOCKETS.lock()
+    };
+    let candidates = collect_live_listeners(&mut sockets)?;
+    drop(sockets);
+
+    let mut delivered = false;
+    for socket in candidates {
+        if core::ptr::eq(socket.as_ref(), sender) && destination_port_id != 0 {
+            continue;
+        }
+        if !Arc::ptr_eq(&socket.net_ns, &sender.net_ns) {
+            continue;
+        }
+        if !socket.subscribed_to(group) {
+            continue;
+        }
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(data.len())
+            .map_err(|_| AxError::from(LinuxError::ENOBUFS))?;
+        copy.extend_from_slice(data);
+        socket.enqueue_user_from(copy, source_port_id, credentials, nowait)?;
+        delivered = true;
+    }
+    if delivered {
+        Ok(())
+    } else {
+        Err(LinuxError::ESRCH.into())
+    }
 }
 
 #[cfg(test)]
@@ -4712,7 +5309,7 @@ mod tests {
     fn route_socket() -> Arc<NetlinkSocket> {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
-        NetlinkSocket::try_new(0, net_ns).unwrap()
+        NetlinkSocket::try_new(0, SOCK_RAW, net_ns).unwrap()
     }
 
     fn socket_owner_credential(socket: &NetlinkSocket) -> Arc<Cred> {
@@ -4722,8 +5319,8 @@ mod tests {
     fn uevent_socket(groups: u32) -> Arc<NetlinkSocket> {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
-        let socket = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns).unwrap();
-        socket.bind(42, groups).unwrap();
+        let socket = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
+        socket.bind(42, groups, NetlinkOptionAuthority::testing()).unwrap();
         socket
     }
 
@@ -4763,7 +5360,7 @@ mod tests {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
         let weak = Arc::downgrade(&net_ns);
-        let socket = NetlinkSocket::try_new(0, net_ns.clone()).unwrap();
+        let socket = NetlinkSocket::try_new(0, SOCK_RAW, net_ns.clone()).unwrap();
 
         drop(net_ns);
         assert!(weak.upgrade().is_some());
@@ -4775,8 +5372,8 @@ mod tests {
     fn local_addr_uses_explicit_capability_and_reports_native_length() {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
-        let socket = NetlinkSocket::try_new(0, net_ns).unwrap();
-        socket.bind(41, 7).unwrap();
+        let socket = NetlinkSocket::try_new(0, SOCK_RAW, net_ns).unwrap();
+        socket.bind(41, 7, NetlinkOptionAuthority::testing()).unwrap();
         let capability = mapped_capability();
 
         let mut length = 4;
@@ -4854,8 +5451,8 @@ mod tests {
         let owner = UserNamespace::try_new_root().unwrap();
         let namespace = NetworkNamespace::try_new_network_namespace(owner.clone()).unwrap();
         let other = NetworkNamespace::try_new_network_namespace(owner).unwrap();
-        let socket = NetlinkSocket::try_new(0, namespace.clone()).unwrap();
-        socket.bind(123, 0).unwrap();
+        let socket = NetlinkSocket::try_new(0, SOCK_RAW, namespace.clone()).unwrap();
+        socket.bind(123, 0, NetlinkOptionAuthority::testing()).unwrap();
         let actor = socket_owner_credential(&socket);
         let initial = namespace.stack().interfaces();
         assert_eq!(initial.len(), 1);
@@ -4987,10 +5584,11 @@ mod tests {
     fn uevent_port_unicast_preserves_raw_payload_sender_and_credentials() {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
-        let sender = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns.clone()).unwrap();
-        let receiver = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns).unwrap();
-        sender.bind(100, 0).unwrap();
-        receiver.bind(101, 0).unwrap();
+        let sender =
+            NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns.clone()).unwrap();
+        let receiver = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
+        sender.bind(100, 0, NetlinkOptionAuthority::testing()).unwrap();
+        receiver.bind(101, 0, NetlinkOptionAuthority::testing()).unwrap();
         let actor = socket_owner_credential(&sender);
         let payload = b"libudev\0ACTION=add\0DEVNAME=input/event0\0";
         let mut source = &payload[..];
@@ -5035,8 +5633,8 @@ mod tests {
     fn uevent_port_unicast_rejects_absent_peer() {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
-        let sender = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns).unwrap();
-        sender.bind(100, 0).unwrap();
+        let sender = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
+        sender.bind(100, 0, NetlinkOptionAuthority::testing()).unwrap();
         let actor = socket_owner_credential(&sender);
         let mut source = &b"libudev\0ACTION=add\0"[..];
 
@@ -5061,10 +5659,11 @@ mod tests {
     fn uevent_port_unicast_rejects_empty_datagram_without_queueing() {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
-        let sender = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns.clone()).unwrap();
-        let receiver = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns).unwrap();
-        sender.bind(100, 0).unwrap();
-        receiver.bind(101, 0).unwrap();
+        let sender =
+            NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns.clone()).unwrap();
+        let receiver = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
+        sender.bind(100, 0, NetlinkOptionAuthority::testing()).unwrap();
+        receiver.bind(101, 0, NetlinkOptionAuthority::testing()).unwrap();
         let actor = socket_owner_credential(&sender);
         let mut source = &b""[..];
 
@@ -5095,9 +5694,10 @@ mod tests {
     fn uevent_port_unicast_autobinds_and_allows_unprivileged_peer_delivery() {
         let owner = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(owner.clone()).unwrap();
-        let sender = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns.clone()).unwrap();
-        let receiver = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns).unwrap();
-        receiver.bind(101, 0).unwrap();
+        let sender =
+            NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns.clone()).unwrap();
+        let receiver = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
+        receiver.bind(101, 0, NetlinkOptionAuthority::testing()).unwrap();
         let root = Cred::try_root(owner.clone()).unwrap();
         let payload = b"libudev\0ACTION=add\0";
         let mut source = &payload[..];
@@ -5227,7 +5827,7 @@ mod tests {
     fn synthetic_uevent_requires_admin_in_the_socket_namespace_owner() {
         let owner = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(owner.clone()).unwrap();
-        let socket = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns).unwrap();
+        let socket = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
         let child = owner
             .try_fork(Kuid::INITIAL_ROOT, Kgid::INITIAL_ROOT, false)
             .unwrap();
@@ -5243,7 +5843,7 @@ mod tests {
     fn synthetic_uevent_requires_one_complete_nlmsghdr_frame() {
         let owner = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(owner.clone()).unwrap();
-        let socket = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns).unwrap();
+        let socket = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
         let actor = Cred::try_root(owner).unwrap();
 
         assert_eq!(
@@ -5274,11 +5874,12 @@ mod tests {
         let owner = UserNamespace::try_new_root().unwrap();
         let first_ns = NetworkNamespace::try_new_loopback_only(owner.clone()).unwrap();
         let second_ns = NetworkNamespace::try_new_loopback_only(owner.clone()).unwrap();
-        let sender = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, first_ns.clone()).unwrap();
-        let listener = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, first_ns).unwrap();
-        let isolated = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, second_ns).unwrap();
-        listener.bind(101, 1).unwrap();
-        isolated.bind(101, 1).unwrap();
+        let sender =
+            NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, first_ns.clone()).unwrap();
+        let listener = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, first_ns).unwrap();
+        let isolated = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, second_ns).unwrap();
+        listener.bind(101, 1, NetlinkOptionAuthority::testing()).unwrap();
+        isolated.bind(101, 1, NetlinkOptionAuthority::testing()).unwrap();
         let actor = Cred::try_root(owner).unwrap();
         let payload = b"change@/devices/test0\0ACTION=change\0";
 
@@ -5343,19 +5944,27 @@ mod tests {
     fn kobject_uevent_port_ids_are_unique_rebindable_only_after_close() {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
-        let first = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns.clone()).unwrap();
-        let second = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns.clone()).unwrap();
+        let first =
+            NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns.clone()).unwrap();
+        let second =
+            NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns.clone()).unwrap();
 
-        first.bind(42, 1).unwrap();
-        assert_eq!(second.bind(42, 1), Err(LinuxError::EADDRINUSE.into()));
-        assert_eq!(first.bind(43, 1), Err(LinuxError::EINVAL.into()));
+        first.bind(42, 1, NetlinkOptionAuthority::testing()).unwrap();
+        assert_eq!(
+            second.bind(42, 1, NetlinkOptionAuthority::testing()),
+            Err(LinuxError::EADDRINUSE.into())
+        );
+        assert_eq!(
+            first.bind(43, 1, NetlinkOptionAuthority::testing()),
+            Err(LinuxError::EINVAL.into())
+        );
 
-        second.bind_auto(42, 1).unwrap();
+        second.bind_auto(42, 1, NetlinkOptionAuthority::testing()).unwrap();
         assert_ne!(second.state.lock().port_id, 42);
         drop(first);
 
-        let replacement = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns).unwrap();
-        replacement.bind(42, 1).unwrap();
+        let replacement = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns).unwrap();
+        replacement.bind(42, 1, NetlinkOptionAuthority::testing()).unwrap();
     }
 
     #[test]
@@ -5363,10 +5972,11 @@ mod tests {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let first_ns = NetworkNamespace::try_new_loopback_only(user_ns.clone()).unwrap();
         let second_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
-        let first = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, first_ns.clone()).unwrap();
-        let second = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, second_ns).unwrap();
-        first.bind(42, 1).unwrap();
-        second.bind(42, 1).unwrap();
+        let first =
+            NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, first_ns.clone()).unwrap();
+        let second = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, second_ns).unwrap();
+        first.bind(42, 1, NetlinkOptionAuthority::testing()).unwrap();
+        second.bind(42, 1, NetlinkOptionAuthority::testing()).unwrap();
 
         emit_kobject_uevent(&first_ns, "change", "/devices/test0", "test", &[]).unwrap();
         let mut first_bytes = [0_u8; 128];
@@ -5398,10 +6008,12 @@ mod tests {
             Err(AxError::AlreadyExists)
         );
 
-        let init_listener = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, init_net_ns).unwrap();
-        let other_listener = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, other_net_ns).unwrap();
-        init_listener.bind(101, 1).unwrap();
-        other_listener.bind(101, 1).unwrap();
+        let init_listener =
+            NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, init_net_ns).unwrap();
+        let other_listener =
+            NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, other_net_ns).unwrap();
+        init_listener.bind(101, 1, NetlinkOptionAuthority::testing()).unwrap();
+        other_listener.bind(101, 1, NetlinkOptionAuthority::testing()).unwrap();
 
         assert!(
             emit_init_net_kobject_uevent("change", "/devices/test0", "test", &[])
@@ -5427,24 +6039,29 @@ mod tests {
     fn route_and_uevent_port_ids_are_reserved_per_namespace_and_protocol() {
         let user_ns = UserNamespace::try_new_root().unwrap();
         let net_ns = NetworkNamespace::try_new_loopback_only(user_ns).unwrap();
-        let route = NetlinkSocket::try_new(NETLINK_ROUTE, net_ns.clone()).unwrap();
-        let route_collision = NetlinkSocket::try_new(NETLINK_ROUTE, net_ns.clone()).unwrap();
-        let uevent = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, net_ns.clone()).unwrap();
+        let route = NetlinkSocket::try_new(NETLINK_ROUTE, SOCK_RAW, net_ns.clone()).unwrap();
+        let route_collision =
+            NetlinkSocket::try_new(NETLINK_ROUTE, SOCK_RAW, net_ns.clone()).unwrap();
+        let uevent =
+            NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, net_ns.clone()).unwrap();
 
-        route.bind(77, 0).unwrap();
+        route.bind(77, 0, NetlinkOptionAuthority::testing()).unwrap();
         assert_eq!(
-            route_collision.bind(77, 0),
+            route_collision.bind(77, 0, NetlinkOptionAuthority::testing()),
             Err(LinuxError::EADDRINUSE.into())
         );
         // The protocol is part of a netlink port identity.
-        uevent.bind(77, 1).unwrap();
-        assert_eq!(route.bind(78, 0), Err(LinuxError::EINVAL.into()));
-        route_collision.bind_auto(77, 0).unwrap();
+        uevent.bind(77, 1, NetlinkOptionAuthority::testing()).unwrap();
+        assert_eq!(
+            route.bind(78, 0, NetlinkOptionAuthority::testing()),
+            Err(LinuxError::EINVAL.into())
+        );
+        route_collision.bind_auto(77, 0, NetlinkOptionAuthority::testing()).unwrap();
         assert_ne!(route_collision.state.lock().port_id, 77);
 
         drop(route);
-        let replacement = NetlinkSocket::try_new(NETLINK_ROUTE, net_ns).unwrap();
-        replacement.bind(77, 0).unwrap();
+        let replacement = NetlinkSocket::try_new(NETLINK_ROUTE, SOCK_RAW, net_ns).unwrap();
+        replacement.bind(77, 0, NetlinkOptionAuthority::testing()).unwrap();
     }
 
     #[test]
@@ -5465,7 +6082,9 @@ mod tests {
         );
 
         let suppressed = route_socket();
-        suppressed.set_option(NETLINK_NO_ENOBUFS, 1).unwrap();
+        suppressed
+            .set_option(NETLINK_NO_ENOBUFS, 1, NetlinkOptionAuthority::testing())
+            .unwrap();
         for _ in 0..=super::NETLINK_QUEUE_LIMIT {
             suppressed.enqueue_kernel(alloc::vec![1]);
         }
@@ -5492,12 +6111,301 @@ mod tests {
         );
 
         let suppressed = route_socket();
-        suppressed.set_option(NETLINK_NO_ENOBUFS, 1).unwrap();
+        suppressed
+            .set_option(NETLINK_NO_ENOBUFS, 1, NetlinkOptionAuthority::testing())
+            .unwrap();
         suppressed.note_queue_drop();
         assert_eq!(
             suppressed.recv_with_nonblocking(&mut dst, RecvFlags::empty(), true),
             Err(AxError::WouldBlock)
         );
+    }
+
+    /// `sk_getsockopt` reports the `struct sock` defaults `sock_init_data_uid`
+    /// seeds: `SO_TYPE` from `sk_type`, `SO_DOMAIN` from the family,
+    /// `SO_PROTOCOL` from `sk_protocol`, and both buffers from
+    /// `sysctl_{w,r}mem_default`.
+    #[test]
+    fn sol_socket_getters_report_linux_socket_defaults() {
+        let socket = NetlinkSocket::try_new(0, SOCK_DGRAM, route_socket().net_ns.clone()).unwrap();
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_TYPE as u32).unwrap(),
+            NetlinkOptionValue::Int(SOCK_DGRAM as i32)
+        );
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_DOMAIN as u32).unwrap(),
+            NetlinkOptionValue::Int(AF_NETLINK as i32)
+        );
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_PROTOCOL as u32).unwrap(),
+            NetlinkOptionValue::Int(NETLINK_ROUTE as i32)
+        );
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_SNDBUF as u32).unwrap(),
+            NetlinkOptionValue::Int(tk_linux_net::SYSCTL_WMEM_DEFAULT)
+        );
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_RCVBUF as u32).unwrap(),
+            NetlinkOptionValue::Int(tk_linux_net::SYSCTL_RMEM_DEFAULT)
+        );
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_RCVLOWAT as u32).unwrap(),
+            NetlinkOptionValue::Int(1)
+        );
+        // `case SO_SNDLOWAT: v.val = 1;` — hardcoded, never stored.
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_SNDLOWAT as u32).unwrap(),
+            NetlinkOptionValue::Int(1)
+        );
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_ACCEPTCONN as u32).unwrap(),
+            NetlinkOptionValue::Int(0)
+        );
+        // A read-only name with no setter is ENOPROTOOPT on the set path.
+        assert_eq!(
+            socket.set_sol_socket_option(tk_linux_net::SO_TYPE as u32,
+                1,
+                NetlinkOptionAuthority::testing()
+            ),
+            Err(LinuxError::ENOPROTOOPT.into())
+        );
+        // A name outside the modelled `SOL_SOCKET` table stays ENOPROTOOPT.
+        assert_eq!(
+            socket.get_sol_socket_option(49),
+            Err(LinuxError::ENOPROTOOPT.into())
+        );
+    }
+
+    /// `sk_setsockopt` stores what the generic getter returns for the settable
+    /// names, applies the `SO_SNDBUF`/`SO_RCVBUF` decode, and refuses a
+    /// nonzero `SO_REUSEPORT` on a non-INET socket.
+    #[test]
+    fn sol_socket_setters_round_trip_and_keep_reuseport_inet_only() {
+        let socket = route_socket();
+        let authority = NetlinkOptionAuthority::testing();
+        socket
+            .set_sol_socket_option(tk_linux_net::SO_REUSEADDR as u32, 1, authority)
+            .unwrap();
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_REUSEADDR as u32).unwrap(),
+            NetlinkOptionValue::Int(1)
+        );
+        socket
+            .set_sol_socket_option(tk_linux_net::SO_REUSEPORT as u32, 0, authority)
+            .unwrap();
+        assert_eq!(
+            socket.set_sol_socket_option(tk_linux_net::SO_REUSEPORT as u32, 1, authority),
+            Err(LinuxError::EOPNOTSUPP.into())
+        );
+        socket
+            .set_sol_socket_option(tk_linux_net::SO_RCVLOWAT as u32, 7, authority)
+            .unwrap();
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_RCVLOWAT as u32).unwrap(),
+            NetlinkOptionValue::Int(7)
+        );
+        // `case SO_RCVLOWAT: sk->sk_rcvlowat = val ? : 1;`
+        socket
+            .set_sol_socket_option(tk_linux_net::SO_RCVLOWAT as u32, 0, authority)
+            .unwrap();
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_RCVLOWAT as u32).unwrap(),
+            NetlinkOptionValue::Int(1)
+        );
+        // The receive buffer decodes through Linux's shared arithmetic.
+        socket
+            .set_sol_socket_option(tk_linux_net::SO_RCVBUF as u32, 4096, authority)
+            .unwrap();
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_RCVBUF as u32).unwrap(),
+            NetlinkOptionValue::Int(tk_linux_net::decode_receive_buffer(4096))
+        );
+        // `SO_LINGER` stores the flag and seconds as one unit.
+        socket.set_linger_option(1, 3);
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_LINGER as u32).unwrap(),
+            NetlinkOptionValue::Linger([1, 3])
+        );
+        // `if (!ling.l_onoff) sock_reset_flag(sk, SOCK_LINGER);` clears only
+        // the flag, so the previous seconds survive.
+        socket.set_linger_option(0, 9);
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_LINGER as u32).unwrap(),
+            NetlinkOptionValue::Linger([0, 3])
+        );
+        socket.set_linger_option(1, 0);
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_LINGER as u32).unwrap(),
+            NetlinkOptionValue::Linger([1, 0])
+        );
+        // SO_DEBUG needs initial-user-namespace CAP_NET_ADMIN and reports
+        // EACCES, not EPERM, when it is missing.
+        assert_eq!(
+            socket.set_sol_socket_option(tk_linux_net::SO_DEBUG as u32,
+                1,
+                NetlinkOptionAuthority {
+                    net_admin: true,
+                    ..NetlinkOptionAuthority::default()
+                }
+            ),
+            Err(LinuxError::EACCES.into())
+        );
+        // SO_PRIORITY outside [0, 6] needs CAP_NET_RAW or CAP_NET_ADMIN.
+        assert_eq!(
+            socket.set_sol_socket_option(tk_linux_net::SO_PRIORITY as u32,
+                7,
+                NetlinkOptionAuthority::default()
+            ),
+            Err(LinuxError::EPERM.into())
+        );
+        socket
+            .set_sol_socket_option(
+                tk_linux_net::SO_PRIORITY as u32,
+                6,
+                NetlinkOptionAuthority::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            socket.get_sol_socket_option(tk_linux_net::SO_PRIORITY as u32).unwrap(),
+            NetlinkOptionValue::Int(6)
+        );
+    }
+
+    /// `netlink_getsockopt(NETLINK_LIST_MEMBERSHIPS)` walks the group bitmap in
+    /// four-byte chunks bounded by `nlk->ngroups`, which only
+    /// `netlink_realloc_groups` ever sizes — through `netlink_bind` with groups
+    /// or through ADD/DROP_MEMBERSHIP.
+    #[test]
+    fn list_memberships_reports_ngroups_only_after_a_group_transition() {
+        let socket = route_socket();
+        let before_sizing = socket.get_option(9, 64).unwrap();
+        assert_eq!(
+            before_sizing,
+            NetlinkOptionValue::Memberships {
+                words: [0, 0],
+                reported: 0
+            }
+        );
+
+        // NETLINK_ROUTE asks for RTNLGRP_MAX groups, so the bitmap is two
+        // four-byte chunks once it has been sized.
+        let authority = NetlinkOptionAuthority::testing();
+        socket.bind(31, 1, authority).unwrap();
+        assert_eq!(
+            socket.get_option(9, 64).unwrap(),
+            NetlinkOptionValue::Memberships {
+                words: [1, 0],
+                reported: 8
+            }
+        );
+        // A buffer that cannot hold a whole chunk copies none of it but still
+        // reports the full bitmap size.
+        assert_eq!(
+            socket.get_option(9, 3).unwrap(),
+            NetlinkOptionValue::Memberships {
+                words: [1, 0],
+                reported: 8
+            }
+        );
+        // Group membership is bounded by the protocol's own capacity.
+        assert_eq!(
+            socket.set_option(1, 40, authority),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(socket.set_option(1, 39, authority), Ok(()));
+        assert_eq!(socket.set_option(1, 0, authority), Err(AxError::InvalidInput));
+    }
+
+    /// `netlink_bind` refuses a nonzero group mask without
+    /// `NL_CFG_F_NONROOT_RECV` before it validates anything else, and a second
+    /// bind is only legal for the port ID the socket already owns.
+    #[test]
+    fn bind_gates_groups_on_protocol_flags_and_pins_the_port_id() {
+        let namespace = || {
+            let user_ns = UserNamespace::try_new_root().unwrap();
+            NetworkNamespace::try_new_loopback_only(user_ns).unwrap()
+        };
+        let unprivileged = NetlinkOptionAuthority::default();
+        // nfnetlink_net_init registers no flags at all, so an unprivileged
+        // group bind is EPERM even before the port ID is checked.
+        let netfilter =
+            NetlinkSocket::try_new(NETLINK_NETFILTER, SOCK_RAW, namespace()).unwrap();
+        assert_eq!(
+            netfilter.bind(5, 1, unprivileged),
+            Err(LinuxError::EPERM.into())
+        );
+        // uevent_net_init does register `NL_CFG_F_NONROOT_RECV`, so the same
+        // unprivileged group bind is legal on a uevent endpoint.
+        let uevent = NetlinkSocket::try_new(NETLINK_KOBJECT_UEVENT, SOCK_RAW, namespace()).unwrap();
+        uevent.bind(5, 1, unprivileged).unwrap();
+        assert_eq!(uevent.local_groups(), 1);
+
+        let authority = NetlinkOptionAuthority::testing();
+        uevent.bind(5, 0, authority).unwrap();
+        // Rebinding the same port ID changes only the mask.
+        uevent.bind(5, 1, authority).unwrap();
+        assert_eq!(uevent.local_groups(), 1);
+        assert_eq!(uevent.bind(6, 0, authority), Err(LinuxError::EINVAL.into()));
+        assert_eq!(
+            netfilter.set_option(1, 2, unprivileged),
+            Err(LinuxError::EPERM.into())
+        );
+
+        // `rtnetlink_bind` reserves its two reverse-path groups.  The
+        // neighbouring group stays open, and the same hook answers
+        // NETLINK_ADD_MEMBERSHIP.
+        let route = route_socket();
+        route.bind(7, 1 << (tk_linux_net::RTNLGRP_IPV4_MROUTE_R - 2), unprivileged)
+            .unwrap();
+        assert_eq!(
+            route.bind(7, 1 << (tk_linux_net::RTNLGRP_IPV4_MROUTE_R - 1), unprivileged),
+            Err(LinuxError::EPERM.into())
+        );
+        assert_eq!(
+            route.bind(7, 1 << (tk_linux_net::RTNLGRP_IPV6_MROUTE_R - 1), unprivileged),
+            Err(LinuxError::EPERM.into())
+        );
+        assert_eq!(
+            route.set_option(1, tk_linux_net::RTNLGRP_IPV4_MROUTE_R, unprivileged),
+            Err(LinuxError::EPERM.into())
+        );
+        assert_eq!(
+            route.set_option(
+                1,
+                tk_linux_net::RTNLGRP_IPV4_MROUTE_R,
+                NetlinkOptionAuthority {
+                    net_admin: true,
+                    ..NetlinkOptionAuthority::default()
+                }
+            ),
+            Ok(())
+        );
+    }
+
+    /// `nlk->groups[0]` is an `unsigned long`, so `RTNLGRP_MAX`'s groups 33..39
+    /// occupy the high half of the word that `LIST_MEMBERSHIPS` walks in
+    /// four-byte chunks and that `netlink_getname` truncates to the 32-bit
+    /// `struct sockaddr_nl.nl_groups` field.
+    #[test]
+    fn route_groups_above_thirty_two_use_the_high_membership_word() {
+        let socket = route_socket();
+        let authority = NetlinkOptionAuthority::testing();
+        socket.bind(33, 0, authority).unwrap();
+        assert_eq!(socket.set_option(1, 39, authority), Ok(()));
+        assert_eq!(
+            socket.get_option(9, 64).unwrap(),
+            NetlinkOptionValue::Memberships {
+                words: [0, 1 << 6],
+                reported: 8
+            }
+        );
+        assert_eq!(socket.local_groups(), 1 << 38);
+        // `nlk->groups[0] = (nlk->groups[0] & ~0xffffffffUL) | groups` keeps
+        // the high half across a rebind that only carries low bits.
+        socket.bind(33, 1, authority).unwrap();
+        assert_eq!(socket.local_groups(), (1 << 38) | 1);
+        assert_eq!(socket.set_option(2, 39, authority), Ok(()));
+        assert_eq!(socket.local_groups(), 1);
     }
 
     #[test]

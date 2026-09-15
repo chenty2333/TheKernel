@@ -16,9 +16,9 @@ use linux_raw_sys::{
     net::{
         AF_INET, AF_INET6, AF_PACKET, IP_HDRINCL, IPV6_ADDRFORM, SO_ATTACH_BPF, SO_ATTACH_FILTER,
         SO_ATTACH_REUSEPORT_CBPF, SO_ATTACH_REUSEPORT_EBPF, SO_DETACH_BPF, SO_DETACH_REUSEPORT_BPF,
-        SO_DOMAIN, SO_ERROR, SO_LOCK_FILTER, SO_PASSCRED, SO_PROTOCOL, SO_RCVBUF, SO_RCVBUFFORCE,
-        SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE, SOCK_DGRAM, SOCK_RAW, SOL_IPV6, SOL_NETLINK,
-        SOL_PACKET, SOL_SOCKET, socklen_t,
+        SO_BINDTODEVICE, SO_DOMAIN, SO_ERROR, SO_LINGER, SO_LOCK_FILTER, SO_PASSCRED, SO_PROTOCOL,
+        SO_RCVBUF, SO_RCVBUFFORCE, SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE, SOCK_DGRAM, SOCK_RAW,
+        SOL_IPV6, SOL_NETLINK, SOL_PACKET, SOL_SOCKET, socklen_t,
     },
 };
 use spin::{Lazy, Mutex};
@@ -755,6 +755,68 @@ fn read_option_prefix_i32(
         .map_err(map_usercopy_error)
 }
 
+/// Copies one netlink option payload and reports the length Linux writes back
+/// into `*optlen`.
+///
+/// `sk_getsockopt` and `netlink_getsockopt` both clamp the copy to
+/// `min(user_len, optname_len)` and write the *clamped* length, so a short
+/// buffer truncates instead of failing.  `NETLINK_LIST_MEMBERSHIPS` is the one
+/// exception: it clamps the copy the same way but always reports the bitmap's
+/// `ALIGN(BITS_TO_BYTES(ngroups), 4)` size.
+fn write_netlink_option(
+    capability: &UserMemoryCapability,
+    output: UserPtr<u8>,
+    length: &mut socklen_t,
+    value: crate::file::netlink::NetlinkOptionValue,
+) -> AxResult<usize> {
+    use crate::file::netlink::NetlinkOptionValue;
+    let mut raw = [0_u8; 12];
+    // `lv` for this option, plus the length to report when it is not simply
+    // `min(user_len, lv)`.  `NETLINK_LIST_MEMBERSHIPS` is the single netlink
+    // option whose reported length is the fixed
+    // `ALIGN(BITS_TO_BYTES(ngroups), 4)` bitmap size rather than the clamped
+    // copy size.
+    let (available, fixed_reported) = match value {
+        NetlinkOptionValue::Int(value) => {
+            raw[..4].copy_from_slice(&value.to_ne_bytes());
+            (size_of::<i32>(), None)
+        }
+        NetlinkOptionValue::Linger(words) => {
+            for (slot, word) in raw.chunks_exact_mut(4).zip(words) {
+                slot.copy_from_slice(&word.to_ne_bytes());
+            }
+            (tk_linux_net::LINGER_LEN, None)
+        }
+        NetlinkOptionValue::Ucred(words) => {
+            for (slot, word) in raw.chunks_exact_mut(4).zip(words) {
+                slot.copy_from_slice(&word.to_ne_bytes());
+            }
+            (tk_linux_net::UCRED_LEN, None)
+        }
+        NetlinkOptionValue::Memberships { words, reported } => {
+            for (slot, word) in raw.chunks_exact_mut(4).zip(words) {
+                slot.copy_from_slice(&word.to_ne_bytes());
+            }
+            // `for (pos = 0; pos * 8 < nlk->ngroups; pos += sizeof(u32))` with
+            // `if (len - pos < sizeof(u32)) break;` advances in whole
+            // four-byte chunks while the caller's buffer can still hold one.
+            let chunks = (*length as usize) / size_of::<u32>();
+            ((chunks * size_of::<u32>()).min(reported), Some(reported))
+        }
+    };
+    let copied = option_copy_len(*length, available);
+    if copied != 0 {
+        capability
+            .write_bytes(output.address().as_usize(), &raw[..copied])
+            .map_err(map_usercopy_error)?;
+    }
+    // `if (len > lv) len = lv;` … `copy_to_sockptr(optlen, &len, sizeof(int))`:
+    // `sk_getsockopt` reports the clamped copy size, so a four-byte buffer for
+    // `SO_LINGER` reads back four and not eight.
+    *length = fixed_reported.unwrap_or(copied) as socklen_t;
+    Ok(copied)
+}
+
 fn read_sctp_address_vector(
     capability: &UserMemoryCapability,
     value: UserConstPtr<u8>,
@@ -1074,19 +1136,19 @@ pub fn sys_getsockopt(
         return Ok(0);
     }
     if pinned.backend()? == SocketBackendKind::Netlink {
-        if level == SOL_SOCKET && optname == SO_PASSCRED {
-            let value = i32::from(pinned.netlink()?.passcred());
-            write_option(&capability, optval, &mut optlen, value)?;
-            capability
-                .write_value(optlen_ptr.address().as_usize() as *mut socklen_t, optlen)
-                .map_err(map_usercopy_error)?;
-            return Ok(0);
-        }
-        if level != SOL_NETLINK {
+        let socket = pinned.netlink()?;
+        // `do_sock_getsockopt` tests `level == SOL_SOCKET` before it consults
+        // `ops->getsockopt_iter`, so the generic `sk_getsockopt` table serves
+        // netlink endpoints too.  `netlink_getsockopt` then answers everything
+        // outside `SOL_NETLINK` with `ENOPROTOOPT`.
+        let value = if level == SOL_SOCKET {
+            socket.get_sol_socket_option(optname)?
+        } else if level == SOL_NETLINK {
+            socket.get_option(optname, optlen as usize)?
+        } else {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
-        }
-        let value = pinned.netlink()?.get_option(optname)?;
-        write_option(&capability, optval, &mut optlen, value)?;
+        };
+        write_netlink_option(&capability, optval, &mut optlen, value)?;
         capability
             .write_value(optlen_ptr.address().as_usize() as *mut socklen_t, optlen)
             .map_err(map_usercopy_error)?;
@@ -1582,21 +1644,50 @@ pub fn sys_setsockopt(
     }
 
     if pinned.backend()? == SocketBackendKind::Netlink {
-        if level == SOL_SOCKET && optname == SO_PASSCRED {
-            // Linux's sock_setsockopt accepts an int prefix (including a
-            // larger optlen), rejects shorter inputs, and normalizes any
-            // non-zero value to true.
-            pinned
-                .netlink()?
-                .set_passcred(read_option_prefix_i32(&capability, optval, optlen)? != 0);
+        let socket = pinned.netlink()?;
+        let authority = super::netlink_option_authority(&snapshot, &socket);
+        if level == SOL_SOCKET {
+            // `sock_setsockopt`'s global gate, after its SO_BINDTODEVICE
+            // special case: no `SOL_SOCKET` name accepts fewer than four
+            // bytes, and none of them accept a one-byte boolean.
+            if optname == SO_BINDTODEVICE {
+                // `sock_setbindtodevice` resolves the name through
+                // `dev_get_by_name` and stores the resulting ifindex.
+                // Netlink's send and receive paths never consult
+                // `sk_bound_dev_if`, so the value is inert state; reporting
+                // `ENOPROTOOPT` (the errno Linux itself uses when
+                // `CONFIG_NETDEVICES` is unset) keeps the endpoint from
+                // pretending to have bound a device it cannot name.
+                return Err(AxError::from(LinuxError::ENOPROTOOPT));
+            }
+            if (optlen as usize) < size_of::<i32>() {
+                return Err(AxError::InvalidInput);
+            }
+            if optname == SO_LINGER {
+                // `if (optlen < sizeof(ling)) ret = -EINVAL; /* 1003.1g */`
+                if (optlen as usize) < tk_linux_net::LINGER_LEN {
+                    return Err(AxError::InvalidInput);
+                }
+                let linger = read_option::<[i32; 2]>(&capability, optval, optlen)?;
+                socket.set_linger_option(linger[0], linger[1]);
+                return Ok(0);
+            }
+            let value = read_option_prefix_i32(&capability, optval, optlen)?;
+            socket.set_sol_socket_option(optname, value, authority)?;
             return Ok(0);
         }
         if level != SOL_NETLINK {
             return Err(AxError::from(LinuxError::ENOPROTOOPT));
         }
-        pinned
-            .netlink()?
-            .set_option(optname, read_option::<u32>(&capability, optval, optlen)?)?;
+        // `netlink_setsockopt` copies the value only when the caller supplied a
+        // full int; a shorter request proceeds with `val == 0` instead of
+        // failing, which makes it a legal "clear the flag".
+        let value = if (optlen as usize) >= size_of::<u32>() {
+            read_option::<u32>(&capability, optval, optlen)?
+        } else {
+            0
+        };
+        socket.set_option(optname, value, authority)?;
         return Ok(0);
     }
 
@@ -2054,5 +2145,100 @@ mod tests {
             errno(packet_option_error(PacketError::InvalidPacketOptionValue)),
             LinuxError::EINVAL
         );
+    }
+
+    /// A capability over one readable and writable user page at `0x1000`.
+    fn mapped_test_capability() -> UserMemoryCapability {
+        use alloc::sync::Arc;
+
+        use axhal::paging::{MappingFlags, PageSize};
+        use axsync::Mutex;
+        use memory_addr::{PAGE_SIZE_4K, VirtAddr};
+
+        let mut address_space =
+            crate::mm::AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K).unwrap();
+        address_space
+            .map(
+                VirtAddr::from(0x1000),
+                PAGE_SIZE_4K,
+                MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE,
+                false,
+                crate::mm::Backend::new_alloc(VirtAddr::from(0x1000), PageSize::Size4K),
+            )
+            .unwrap();
+        UserMemoryCapability::new(Arc::new(Mutex::new(address_space)))
+    }
+
+    fn read_test_bytes(capability: &UserMemoryCapability, len: usize) -> alloc::vec::Vec<u8> {
+        let mut bytes = alloc::vec![core::mem::MaybeUninit::<u8>::uninit(); len];
+        capability.read_bytes(0x1000, &mut bytes).unwrap();
+        bytes
+            .into_iter()
+            .map(|byte| unsafe { byte.assume_init() })
+            .collect()
+    }
+
+    /// `sk_getsockopt` ends with `if (len > lv) len = lv;` and copies `len`
+    /// bytes, so a short buffer succeeds and reports what it received instead
+    /// of the option's own width.  `NETLINK_LIST_MEMBERSHIPS` is the one
+    /// netlink getter that reports its bitmap size regardless of the copy.
+    #[test]
+    fn netlink_get_option_reports_the_clamped_length() {
+        use crate::file::netlink::NetlinkOptionValue;
+
+        let capability = mapped_test_capability();
+        let output = UserPtr::from(0x1000_usize);
+
+        let mut length = size_of::<i32>() as socklen_t;
+        write_netlink_option(
+            &capability,
+            output,
+            &mut length,
+            NetlinkOptionValue::Int(0x0a0b_0c0d),
+        )
+        .unwrap();
+        assert_eq!(length, size_of::<i32>() as socklen_t);
+        assert_eq!(read_test_bytes(&capability, 4), [0x0d, 0x0c, 0x0b, 0x0a]);
+
+        // Two bytes are enough: the copy is truncated, not rejected, and the
+        // reported length follows the copy.
+        let mut length = 2;
+        write_netlink_option(
+            &capability,
+            output,
+            &mut length,
+            NetlinkOptionValue::Int(0x0a0b_0c0d),
+        )
+        .unwrap();
+        assert_eq!(length, 2);
+        assert_eq!(read_test_bytes(&capability, 2), [0x0d, 0x0c]);
+
+        // `lv` for SO_LINGER is `sizeof(struct linger)`, but a four-byte
+        // buffer still reads back four.
+        let mut length = size_of::<i32>() as socklen_t;
+        write_netlink_option(
+            &capability,
+            output,
+            &mut length,
+            NetlinkOptionValue::Linger([1, 2]),
+        )
+        .unwrap();
+        assert_eq!(length, size_of::<i32>() as socklen_t);
+
+        // LIST_MEMBERSHIPS walks whole four-byte chunks and reports the
+        // protocol's bitmap size even when only one chunk fits.
+        let mut length = size_of::<u32>() as socklen_t;
+        write_netlink_option(
+            &capability,
+            output,
+            &mut length,
+            NetlinkOptionValue::Memberships {
+                words: [1, 1 << 6],
+                reported: 8,
+            },
+        )
+        .unwrap();
+        assert_eq!(length, 8);
+        assert_eq!(read_test_bytes(&capability, 4), [1, 0, 0, 0]);
     }
 }
