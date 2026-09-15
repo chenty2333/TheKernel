@@ -21,11 +21,9 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axhal::uspace::UserContext;
 use axnet::options::{Configurable, GetSocketOption};
 use axtask::current;
-use linux_raw_sys::general::{
-    CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID, FUTEX_CMD_MASK, FUTEX_WAIT,
-    FUTEX_WAIT_BITSET,
-};
+use linux_raw_sys::general::{CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID};
 use syscalls::Sysno;
+use tk_linux_futex::{FutexRestart, restart_class as futex_restart_class};
 pub(crate) use tk_linux_usercopy::RawSigevent;
 
 pub(crate) use self::sync::init_membarrier_ipi;
@@ -67,11 +65,15 @@ fn restart_class_for_fd_io(fd: i32, direction: SocketIoDirection) -> Option<Rest
 }
 
 fn restart_class_for_futex(uctx: &UserContext) -> Option<RestartClass> {
-    let futex_op = uctx.arg1() as u32 & FUTEX_CMD_MASK as u32;
-    if matches!(futex_op, FUTEX_WAIT | FUTEX_WAIT_BITSET) {
-        Some(RestartClass::Sys)
-    } else {
-        None
+    // `do_futex()` masks `op` with the complement of the four modifier bits
+    // (`include/uapi/linux/futex.h`), so an unknown opcode with a stray high
+    // bit stays unknown and must not be truncated into a restartable command.
+    match futex_restart_class(uctx.arg1() as u32)? {
+        FutexRestart::Sys => Some(RestartClass::Sys),
+        // `futex_lock_pi()` reports `-ERESTARTNOINTR` for an interrupted
+        // acquisition, which x86_64's `handle_signal()` replays even when the
+        // handler was not installed with `SA_RESTART`.
+        FutexRestart::NoIntr => Some(RestartClass::NoIntr),
     }
 }
 

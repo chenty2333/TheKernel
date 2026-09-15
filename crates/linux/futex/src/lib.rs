@@ -26,18 +26,12 @@ pub const FUTEX_CLOCK_REALTIME: u32 = 256;
 pub const FUTEX_ROBUST_UNLOCK: u32 = 512;
 pub const FUTEX_ROBUST_LIST32: u32 = 1024;
 
-/// Value of Linux's `FUTEX_CMD_MASK` (`~(FUTEX_PRIVATE_FLAG |
-/// FUTEX_CLOCK_REALTIME | FUTEX_ROBUST_UNLOCK | FUTEX_ROBUST_LIST32)`) as the
-/// low six bits it leaves in place.
-///
-/// It is *not* a field width: Linux masks with the complement of the modifier
-/// bits, so a bit above bit 6 — including the `linux_raw_sys` legacy constant
-/// `FUTEX_CMD_MASK == 0x7f` would mask away — survives into `cmd` and makes the
-/// operation unknown (`-ENOSYS`). Use [`FUTEX_MODIFIER_MASK`] or
-/// [`LegacyOp::decode`] rather than this constant.
-pub const FUTEX_CMD_MASK: u32 = 0x7f;
-
 /// The four modifier bits Linux removes from `op` before dispatching.
+///
+/// Linux's `FUTEX_CMD_MASK` is the *complement* of these
+/// (`include/uapi/linux/futex.h`), not a seven-bit field width: an opcode with
+/// a stray high bit keeps that bit and falls through `do_futex()`'s switch to
+/// `-ENOSYS`. Decode with [`LegacyOp::decode`] rather than masking by hand.
 pub const FUTEX_MODIFIER_MASK: u32 =
     FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME | FUTEX_ROBUST_UNLOCK | FUTEX_ROBUST_LIST32;
 
@@ -104,7 +98,7 @@ pub enum FutexCommand {
 /// Decoded `(op, val, ...)` header of a `sys_futex` call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LegacyOp {
-    /// `None` when `op & FUTEX_CMD_MASK` matches no opcode.
+    /// `None` when `op & !FUTEX_MODIFIER_MASK` matches no opcode.
     pub command: Option<FutexCommand>,
     pub private: bool,
     pub realtime: bool,
@@ -211,6 +205,63 @@ impl LegacyOp {
             value as usize
         }
     }
+}
+
+/// The `-ERESTART*` code an interrupted `sys_futex` operation returns, which is
+/// what decides whether the syscall is replayed behind the handler's back.
+///
+/// `handle_signal()` and `arch_do_signal_or_restart()` on x86_64 restart
+/// `-ERESTARTNOINTR` unconditionally and `-ERESTARTSYS` only when the handler
+/// was installed with `SA_RESTART` (`arch/x86/kernel/signal.c`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FutexRestart {
+    /// `-ERESTARTSYS`: replayed only for an `SA_RESTART` handler.
+    Sys,
+    /// `-ERESTARTNOINTR`: replayed even for a handler without `SA_RESTART`,
+    /// and replayed by the no-handler path like every other restart code.
+    NoIntr,
+}
+
+impl LegacyOp {
+    /// Restart disposition of this opcode when its wait is interrupted.
+    ///
+    /// `None` for an unknown opcode and for every opcode that cannot report an
+    /// interruption:
+    ///
+    /// - `FUTEX_WAIT`/`FUTEX_WAIT_BITSET`: `futex_wait()` returns
+    ///   `-ERESTARTSYS` (`kernel/futex/waitwake.c`).
+    /// - `FUTEX_LOCK_PI`/`FUTEX_LOCK_PI2`: `futex_lock_pi()` ends with
+    ///   `return ret != -EINTR ? ret : -ERESTARTNOINTR;`
+    ///   (`kernel/futex/pi.c:1198`), so an interrupted acquisition *always*
+    ///   resumes; `FUTEX_TRYLOCK_PI` enters the same function but its
+    ///   non-blocking path can never produce `-EINTR`.
+    /// - `FUTEX_WAIT_REQUEUE_PI`: a signal delivered while the waiter is still
+    ///   enqueued on `uaddr` makes `handle_early_requeue_pi_wakeup()` return
+    ///   `-ERESTARTNOINTR` (`kernel/futex/requeue.c:741-742`). A signal
+    ///   delivered after the requeue moved the waiter onto the target's
+    ///   rt_mutex never reaches this classifier: `futex_wait_requeue_pi()`
+    ///   rewrites that `-EINTR` to `-EWOULDBLOCK` first
+    ///   (`kernel/futex/requeue.c:895-902`).
+    ///
+    /// Requeue and wake opcodes do not block and have no interrupted form.
+    pub const fn restart_class(self) -> Option<FutexRestart> {
+        match self.command {
+            Some(FutexCommand::Wait | FutexCommand::WaitBitset) => Some(FutexRestart::Sys),
+            Some(
+                FutexCommand::LockPi | FutexCommand::LockPi2 | FutexCommand::WaitRequeuePi,
+            ) => Some(FutexRestart::NoIntr),
+            _ => None,
+        }
+    }
+}
+
+/// Restart disposition of a raw `sys_futex` `op` argument.
+///
+/// The opcode is decoded with the complement mask, so modifier bits and stray
+/// high bits are handled exactly like `do_futex()`'s `cmd = op &
+/// FUTEX_CMD_MASK`.
+pub const fn restart_class(op: u32) -> Option<FutexRestart> {
+    LegacyOp::decode(op).restart_class()
 }
 
 // ---------------------------------------------------------------------------
@@ -819,6 +870,54 @@ mod tests {
             plan_legacy(3, FUTEX_WAKE, 1, None, 0, 0),
             Err(FutexError::InvalidAddress)
         );
+    }
+
+    /// `do_futex()` masks with `~FUTEX_CMD_MASK`, not with a seven-bit field:
+    /// a stray high bit leaves an unknown opcode, and the classifier must not
+    /// truncate it into a restartable command.
+    #[test]
+    fn restart_class_keeps_high_bits() {
+        assert_eq!(restart_class(FUTEX_WAIT), Some(FutexRestart::Sys));
+        assert_eq!(
+            restart_class(FUTEX_WAIT | FUTEX_PRIVATE_FLAG),
+            Some(FutexRestart::Sys)
+        );
+        // Masking with the legacy seven-bit `FUTEX_CMD_MASK == 0x7f` would
+        // truncate both of these into a valid opcode; the complement mask
+        // leaves them unknown, exactly like `do_futex()`.
+        assert_eq!(restart_class(0x8000 | FUTEX_WAIT), None);
+        assert_eq!(restart_class(0x8000 | FUTEX_LOCK_PI), None);
+        // Only the four modifier bits are stripped: 0x80 alone is the private
+        // form of FUTEX_WAIT, and bit 11 is not a modifier bit.
+        assert_eq!(restart_class(FUTEX_PRIVATE_FLAG), Some(FutexRestart::Sys));
+        assert_eq!(restart_class(0x800), None);
+        assert_eq!(restart_class(FUTEX_WAKE), None);
+        assert_eq!(restart_class(FUTEX_CMP_REQUEUE_PI), None);
+        assert_eq!(
+            restart_class(FUTEX_LOCK_PI | FUTEX_CLOCK_REALTIME),
+            Some(FutexRestart::NoIntr)
+        );
+    }
+
+    /// An interrupted `FUTEX_LOCK_PI`/`FUTEX_LOCK_PI2` is always restarted
+    /// (`kernel/futex/pi.c:1198`), while `FUTEX_WAIT`/`FUTEX_WAIT_BITSET`
+    /// restart only for an `SA_RESTART` handler (`kernel/futex/waitwake.c`).
+    #[test]
+    fn restart_class_follows_each_opcodes_erestart_code() {
+        assert_eq!(restart_class(FUTEX_WAIT_BITSET), Some(FutexRestart::Sys));
+        assert_eq!(
+            restart_class(FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME),
+            Some(FutexRestart::Sys)
+        );
+        assert_eq!(restart_class(FUTEX_LOCK_PI), Some(FutexRestart::NoIntr));
+        assert_eq!(restart_class(FUTEX_LOCK_PI2), Some(FutexRestart::NoIntr));
+        assert_eq!(
+            restart_class(FUTEX_WAIT_REQUEUE_PI),
+            Some(FutexRestart::NoIntr)
+        );
+        // TRYLOCK_PI shares `futex_lock_pi()` but never blocks.
+        assert_eq!(restart_class(FUTEX_TRYLOCK_PI), None);
+        assert_eq!(restart_class(FUTEX_WAKE_BITSET), None);
     }
 
     #[test]
