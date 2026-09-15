@@ -184,7 +184,13 @@ pub(crate) fn uffd_policy_error(error: MmError) -> AxError {
         MmError::Busy | MmError::OwnerBusy | MmError::UffdRegistrationOverlap => {
             AxError::ResourceBusy
         }
-        MmError::AccessDenied => AxError::OperationNotPermitted,
+        // Linux answers a refused userfaultfd(2) creation with -EPERM; this
+        // kernel reuses that errno for the privileged half of the gate it
+        // cannot honour, so the two classes stay indistinguishable to
+        // userspace exactly as Linux's single errno is.
+        MmError::AccessDenied | MmError::UnsupportedUffdKernelFaults => {
+            AxError::OperationNotPermitted
+        }
         MmError::RangeNotMapped | MmError::StaleGeneration => AxError::BadAddress,
         MmError::Closing | MmError::TearingDown | MmError::Closed => AxError::BadState,
         _ => AxError::InvalidInput,
