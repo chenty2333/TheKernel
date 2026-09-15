@@ -79,6 +79,12 @@ pub struct Iocb {
 const _: () = assert!(core::mem::size_of::<Iocb>() == IOCB_BYTES);
 const _: () = assert!(core::mem::align_of::<Iocb>() == 8);
 
+/// The opcodes `io_submit_one()` actually dispatches.
+///
+/// `include/uapi/linux/aio_abi.h:36-44` also defines `IOCB_CMD_NOOP = 6`, but
+/// `io_submit_one()`'s switch has no case for it, so it is rejected by
+/// `default: return -EINVAL;` (`fs/aio.c:2055-2072`) exactly like an
+/// unassigned opcode.  Only the dispatched set is modelled here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AioOpcode {
     Pread,
@@ -86,7 +92,6 @@ pub enum AioOpcode {
     Fsync,
     Fdatasync,
     Poll,
-    Noop,
     Preadv,
     Pwritev,
 }
@@ -99,7 +104,6 @@ impl TryFrom<u16> for AioOpcode {
             2 => Ok(Self::Fsync),
             3 => Ok(Self::Fdatasync),
             5 => Ok(Self::Poll),
-            6 => Ok(Self::Noop),
             7 => Ok(Self::Preadv),
             8 => Ok(Self::Pwritev),
             _ => Err(AioError::InvalidOpcode),
@@ -127,16 +131,7 @@ impl AioRequest {
             return Err(AioError::InvalidFlags);
         }
         let opcode = AioOpcode::try_from(raw.opcode)?;
-        if matches!(opcode, AioOpcode::Noop) {
-            if raw.fd != 0
-                || raw.buffer != 0
-                || raw.nbytes != 0
-                || raw.offset != 0
-                || raw.rw_flags != 0
-            {
-                return Err(AioError::InvalidFd);
-            }
-        } else if raw.fd == u32::MAX {
+        if raw.fd == u32::MAX {
             return Err(AioError::InvalidFd);
         }
         Ok(Self {
@@ -231,11 +226,10 @@ pub fn plan_submit<R: AioResolver>(
         .try_reserve(requests.len())
         .map_err(|_| AioError::Limit)?;
     for &request in requests {
-        let handle = if request.opcode == AioOpcode::Noop {
-            None
-        } else {
-            Some(resolver.resolve(request.fd)?)
-        };
+        // Every dispatched opcode touches a descriptor: the read/write opcodes
+        // through `aio_read()`/`aio_write()` and `aio_fsync()` through its own
+        // `fget()` (`fs/aio.c:2026-2029`), so the fd is resolved per request.
+        let handle = Some(resolver.resolve(request.fd)?);
         resolved.push((request, handle));
     }
     Ok(AioPlan::Submit {
@@ -366,9 +360,9 @@ mod tests {
                 data: 0,
                 key: 0,
                 rw_flags: 0,
-                opcode: 6,
+                opcode: 0,
                 reqprio: 0,
-                fd: 0,
+                fd: 7,
                 buffer: 0,
                 nbytes: 0,
                 offset: 0,
@@ -384,10 +378,26 @@ mod tests {
                 requests, after, ..
             } => {
                 assert_eq!(requests.len(), 1);
-                assert_eq!(requests[0].1, None);
+                // Every dispatched opcode resolves its descriptor.
+                assert_eq!(requests[0].1, Some(7));
                 assert_eq!(after.outstanding(), 1);
             }
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn opcode_six_is_rejected_like_any_other_undispatched_opcode() {
+        // `io_submit_one()` has no `case IOCB_CMD_NOOP`, so the `IOCB_CMD_NOOP`
+        // that `include/uapi/linux/aio_abi.h:43` still defines falls to
+        // `default: return -EINVAL;` (`fs/aio.c:2055-2072`).  The fd is not
+        // consulted: `__io_submit_one()` rejected a closed descriptor with
+        // -EBADF before the switch ever ran.
+        for opcode in [4_u16, 6, 9, u16::MAX] {
+            assert_eq!(AioOpcode::try_from(opcode), Err(AioError::InvalidOpcode));
+        }
+        for opcode in [0_u16, 1, 2, 3, 5, 7, 8] {
+            assert!(AioOpcode::try_from(opcode).is_ok());
         }
     }
 }
