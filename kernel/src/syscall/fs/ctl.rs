@@ -13,14 +13,14 @@ use axtask::current;
 use linux_raw_sys::{
     general::*,
     ioctl::{
-        FIONBIO, FIONREAD, NS_GET_NSTYPE, NS_GET_OWNER_UID, NS_GET_PARENT, NS_GET_USERNS,
-        TIOCGWINSZ, TIOCINQ,
+        FIGETBSZ, FIFREEZE, FITHAW, FIONBIO, FIONREAD, NS_GET_NSTYPE, NS_GET_OWNER_UID,
+        NS_GET_PARENT, NS_GET_USERNS, TIOCGWINSZ, TIOCINQ,
     },
 };
 use tk_linux_cred::{InodeSetattrProposal, InodeTimestampIntent, InodeTimestampValue};
 use tk_linux_usercopy::{
-    UserMemory, UserMemoryContext, VmPtr, vm_load_until_nul, vm_load_until_nul_bounded,
-    vm_write_slice,
+    UserCopyError, UserMemory, UserMemoryContext, VmPtr, vm_load_until_nul,
+    vm_load_until_nul_bounded, vm_write_slice,
 };
 
 use super::admit_chown;
@@ -73,6 +73,13 @@ enum TimeUpdate {
 const SUPPORTED_UNLINKAT_FLAGS: u32 = AT_REMOVEDIR;
 const GETDENTS_NAME_PATH_MAX: usize = 4096;
 const SYSFS_NAME_PATH_MAX: usize = 4096;
+
+/// `_IOR(0x15, 0, struct fsuuid2)` from include/uapi/linux/fs.h, where
+/// `struct fsuuid2 { __u8 len; __u8 uuid[16]; }` is 17 bytes.
+const FS_IOC_GETFSUUID: u32 = 0x8011_1150;
+/// `_IOR(0x15, 1, struct fs_sysfs_path)` from include/uapi/linux/fs.h, where
+/// `struct fs_sysfs_path { __u8 len; char name[128]; }` is 129 bytes.
+const FS_IOC_GETFSSYSFSPATH: u32 = 0x8081_1501;
 
 /// Implements the obsolete `sysfs(2)` filesystem-type catalog syscall.
 pub fn sys_sysfs<M: UserMemory + ?Sized>(
@@ -533,6 +540,70 @@ pub fn sys_ioctl(context: &IoctlContext, fd: i32, cmd: u32, arg: usize) -> AxRes
         && let Some(result) = proc_namespace_ioctl(context, file.inner().location(), cmd, arg)
     {
         return result;
+    }
+    // Linux `do_vfs_ioctl()` decides these commands itself, before it ever
+    // reaches `->unlocked_ioctl`, so they are available on every inode rather
+    // than only on the regular-file provider.  They are reproduced at the same
+    // point of the generic layer here.
+    if cmd == FIGETBSZ {
+        // fs/ioctl.c:
+        //     case FIGETBSZ:
+        //             /* anon_bdev filesystems may not have a block size */
+        //             if (!inode->i_sb->s_blocksize)
+        //                     return -EINVAL;
+        //             return put_user(inode->i_sb->s_blocksize,
+        //                             (int __user *)argp);
+        // Objects without a VFS location live on the pipefs/sockfs/
+        // anon_inodefs/pidfs pseudo-superblocks.  `alloc_super()` leaves
+        // `s_blocksize` zero and none of those filesystems ever sets it, so
+        // the "anon_bdev filesystems may not have a block size" guard is what
+        // such an inode actually hits.
+        let block_size = match f.vfs_location() {
+            Some(location) => location.metadata()?.block_size,
+            None => 0,
+        };
+        if block_size == 0 {
+            return Err(AxError::InvalidInput);
+        }
+        let block_size = i32::try_from(block_size).unwrap_or(i32::MAX);
+        context
+            .user_memory()
+            .write_bytes(arg, &block_size.to_ne_bytes())
+            .map_err(map_usercopy_error)?;
+        return Ok(0);
+    }
+    if cmd == FIFREEZE || cmd == FITHAW {
+        // fs/ioctl.c `ioctl_fsfreeze()` / `ioctl_fsthaw()` both open with
+        //     if (!ns_capable(sb->s_user_ns, CAP_SYS_ADMIN))
+        //             return -EPERM;
+        // `ioctl_fsfreeze()` then answers -EOPNOTSUPP when the superblock
+        // provides neither `->freeze_super` nor `->freeze_fs`, and
+        // `ioctl_fsthaw()` reaches `thaw_super_locked()`, whose
+        //     if (sb->s_writers.frozen != SB_FREEZE_COMPLETE)
+        //             goto out_unlock;          /* error = -EINVAL */
+        // yields -EINVAL for a superblock that was never frozen.  This kernel
+        // has no freeze machinery at all, so those two verdicts are exact.
+        let security = VfsSecurityContext::new(context.caller_cred().clone());
+        if !ns_capable(
+            security.actor(),
+            security.filesystem_owner_user_ns(),
+            CAP_SYS_ADMIN,
+        ) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        return Err(if cmd == FIFREEZE {
+            LinuxError::EOPNOTSUPP.into()
+        } else {
+            AxError::InvalidInput
+        });
+    }
+    if cmd == FS_IOC_GETFSUUID || cmd == FS_IOC_GETFSSYSFSPATH {
+        // fs/ioctl.c `ioctl_getfsuuid()` returns -ENOTTY when
+        // `sb->s_uuid_len == 0`, and `ioctl_get_fs_sysfs_path()` returns
+        // -ENOTTY when `strlen(sb->s_sysfs_name) == 0`.  This kernel populates
+        // neither attribute, so both commands are unknown here exactly as they
+        // are for a Linux superblock that carries neither.
+        return Err(AxError::NotATty);
     }
     let result = f.ioctl(context, cmd, arg).inspect_err(|err| {
         if *err == AxError::NotATty {
@@ -1257,16 +1328,28 @@ pub fn sys_getcwd<M: UserMemory + ?Sized>(
     cwd.try_reserve_exact(1).map_err(|_| AxError::NoMemory)?;
     cwd.push(0);
 
-    if cwd.len() > size {
-        return Err(AxError::OutOfRange);
-    }
+    // Linux `SYSCALL_DEFINE2(getcwd, ...)` in fs/d_path.c renders the current
+    // directory into a fixed kmalloc(PATH_MAX) scratch buffer (`__getname()`)
+    // and then decides:
+    //   len = PATH_MAX - b.len;
+    //   if (unlikely(len > PATH_MAX))      error = -ENAMETOOLONG;
+    //   else if (unlikely(len > size))     error = -ERANGE;
+    //   else if (copy_to_user(buf, b.buf, len)) error = -EFAULT;
+    //   else                               error = len;
+    // `len` includes the trailing NUL, and there is no NULL test before the
+    // length comparison, so getcwd(NULL, 0) is -ERANGE and getcwd(NULL, n) is
+    // -EFAULT. The only place a NULL buf is ever dereferenced is the copy.
+    let len = linux_vfs::getcwd_user_len(cwd.len(), size).map_err(|error| match error {
+        linux_vfs::GetcwdError::NameTooLong => AxError::from(LinuxError::ENAMETOOLONG),
+        linux_vfs::GetcwdError::Range => AxError::OutOfRange,
+    })?;
 
     if buf.is_null() {
         return Err(AxError::BadAddress);
     }
 
     vm_write_slice(memory, buf, &cwd).map_err(map_usercopy_error)?;
-    Ok(cwd.len() as isize)
+    Ok(len as isize)
 }
 
 pub fn sys_symlink<M: UserMemory + ?Sized>(
@@ -2239,7 +2322,17 @@ pub(crate) fn ctrl_alt_delete() {
     }
 }
 
-pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> AxResult<isize> {
+/// `strncpy_from_user(&buffer[0], arg, sizeof(buffer) - 1)` in
+/// `SYSCALL_DEFINE4(reboot, ...)` (kernel/reboot.c), where `char buffer[256]`.
+const REBOOT_RESTART2_SCAN: usize = 255;
+
+pub fn sys_reboot<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    magic1: i32,
+    magic2: i32,
+    cmd: i32,
+    arg: *const c_void,
+) -> AxResult<isize> {
     let curr = current();
     let thread = curr.as_thread();
     // Namespace-local CAP_SYS_BOOT is not authority over physical power.
@@ -2255,15 +2348,60 @@ pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> Ax
         _ => return Err(AxError::InvalidInput),
     }
 
-    // Container reboot needs a namespace-reaper transaction, not platform I/O.
+    // `reboot_pid_ns()` (kernel/pid_namespace.c) runs before the command
+    // switch: outside the initial PID namespace only RESTART, RESTART2, HALT
+    // and POWER_OFF are recognised and everything else is -EINVAL.  The
+    // recognised four are supposed to set `pid_ns->reboot` and SIGKILL the
+    // namespace's child reaper, which needs a namespace-reaper transaction
+    // rather than platform power I/O, so they stay -EOPNOTSUPP here.
     if thread.pid_ns().parent().is_some() {
-        return Err(LinuxError::EOPNOTSUPP.into());
+        return Err(
+            if matches!(
+                cmd as u32,
+                LINUX_REBOOT_CMD_RESTART
+                    | LINUX_REBOOT_CMD_RESTART2
+                    | LINUX_REBOOT_CMD_HALT
+                    | LINUX_REBOOT_CMD_POWER_OFF
+            ) {
+                LinuxError::EOPNOTSUPP.into()
+            } else {
+                AxError::InvalidInput
+            },
+        );
     }
+
+    // RESTART2 hands the restart command to the platform restart handler, so
+    // Linux copies it out of userspace first:
+    //     case LINUX_REBOOT_CMD_RESTART2:
+    //             ret = strncpy_from_user(&buffer[0], arg, sizeof(buffer) - 1);
+    //             if (ret < 0) { ret = -EFAULT; break; }
+    //             buffer[sizeof(buffer) - 1] = '\0';
+    //             kernel_restart(buffer);
+    // A NULL or unreadable `arg` is therefore -EFAULT before anything is
+    // restarted, while a command at least 255 bytes long is truncated to 255
+    // bytes and still restarts (strncpy_from_user reports the truncation as a
+    // byte count, not an error).
+    let restart_command = if cmd as u32 == LINUX_REBOOT_CMD_RESTART2 {
+        match vm_load_until_nul_bounded(memory, arg.cast::<u8>(), REBOOT_RESTART2_SCAN) {
+            Ok(command) => command,
+            Err(UserCopyError::TooLong) => Vec::new(),
+            Err(error) => return Err(map_usercopy_error(error)),
+        }
+    } else {
+        Vec::new()
+    };
 
     match cmd as u32 {
         LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_RESTART2 => {
             sys_sync()?;
-            ax_println!("System is restarting");
+            if restart_command.is_empty() {
+                ax_println!("System is restarting");
+            } else {
+                ax_println!(
+                    "System is restarting with command: {}",
+                    core::str::from_utf8(&restart_command).unwrap_or("<invalid utf-8>")
+                );
+            }
             axhal::power::system_reset();
         }
         LINUX_REBOOT_CMD_HALT => {
