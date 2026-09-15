@@ -10,6 +10,7 @@ use axfs_ng_vfs::{
 };
 use axhal::power::system_off;
 use axtask::current;
+use memory_addr::PAGE_SIZE_4K;
 use linux_raw_sys::{
     general::*,
     ioctl::{
@@ -554,13 +555,19 @@ pub fn sys_ioctl(context: &IoctlContext, fd: i32, cmd: u32, arg: usize) -> AxRes
         //             return put_user(inode->i_sb->s_blocksize,
         //                             (int __user *)argp);
         // Objects without a VFS location live on the pipefs/sockfs/
-        // anon_inodefs/pidfs pseudo-superblocks.  `alloc_super()` leaves
-        // `s_blocksize` zero and none of those filesystems ever sets it, so
-        // the "anon_bdev filesystems may not have a block size" guard is what
-        // such an inode actually hits.
+        // anon_inodefs/pidfs pseudo-superblocks.  Those four are all built by
+        // `init_pseudo()` (fs/pipe.c:1564-1572, net/socket.c:477,
+        // fs/anon_inodes.c:86, fs/pidfs.c:1120), and `pseudo_fs_fill_super()`
+        // sets
+        //     s->s_blocksize = PAGE_SIZE;
+        //     s->s_blocksize_bits = PAGE_SHIFT;
+        // (fs/libfs.c:681-682), so the "anon_bdev filesystems may not have a
+        // block size" guard below is *not* what such an inode hits: it reports
+        // the page size.  The guard only fires for a location whose provider
+        // genuinely exposes no block size.
         let block_size = match f.vfs_location() {
             Some(location) => location.metadata()?.block_size,
-            None => 0,
+            None => PAGE_SIZE_4K as u64,
         };
         if block_size == 0 {
             return Err(AxError::InvalidInput);
