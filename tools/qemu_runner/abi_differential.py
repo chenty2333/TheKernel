@@ -367,6 +367,7 @@ SYSCALL_CASES = {
     297: ("signal-boundary", "rt_tgsigqueueinfo"),
     13: ("signal-boundary", "rt_sigaction"), 131: ("signal-boundary", "sigaltstack"),
     85: ("creat", "creat"), 95: ("umask", "umask"), 201: ("time", "time"),
+    63: ("fs-abi", "uname"), 99: ("fs-abi", "sysinfo"),
     284: ("eventfd", "eventfd"), 290: ("eventfd", "eventfd"),
     463: ("fsattrs", "setxattrat"), 464: ("fsattrs", "getxattrat"),
     465: ("fsattrs", "listxattrat"), 466: ("fsattrs", "removexattrat"),

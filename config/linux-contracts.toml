@@ -2569,8 +2569,8 @@ status = "implemented"
 contract = "linux-uname"
 handler = "kernel/src/syscall/sys.rs:sys_uname"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sys.rs:uname26_second_copy_fault_keeps_native_prefix_visible_and_returns_efault"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/sys.rs:uname26_second_copy_fault_keeps_native_prefix_visible_and_returns_efault", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -2661,8 +2661,8 @@ status = "implemented"
 contract = "linux-sysinfo"
 handler = "kernel/src/syscall/sys.rs:sys_sysinfo"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/sys.rs:sysinfo_memory_fields_use_bytes_and_only_shmem_pages"]
-validation_gaps = ["Direct Linux 7.2.3 guest entry namespace/capability and combined-error matrix is not yet bound and executed"]
+tests = ["kernel/src/syscall/sys.rs:sysinfo_memory_fields_use_bytes_and_only_shmem_pages", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
