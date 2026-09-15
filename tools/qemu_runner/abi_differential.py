@@ -226,6 +226,8 @@ CONTRACTS.update({
     "ptrace_stop": ("raw-differential", "pass", "wait4-traceme-stop-without-wuntraced waitid-traceme-stop-is-cld-trapped ptrace-tracee-resumes-and-reaps-after-detach"),
     "aio": ("portable-differential", "pass", "IO_SETUP_VALIDATION IO_SUBMIT_OPCODE_VALIDATION IO_CANCEL_VALIDATION IO_CANCEL_PENDING_REQUEST IO_DESTROY_VALIDATION"),
     "io-uring-register": ("portable-differential", "pass", "FILES_COUNT_LIMITS"),
+    "io-uring-register-opcodes": ("portable-differential", "pass", "OPCODE_RANGE BLIND_DISPATCH AUXILIARY_RECORDS EVENTFD_DESCRIPTOR RESOURCE_RECORDS"),
+    "io-uring-setup-batch": ("portable-differential", "pass", "SETUP_FLAGS BATCH_STOP SUBMIT_ALL"),
     "console_integrity": ("raw-differential", "pass", "INTERLEAVED_WRITERS"),
     "futex-abi-retry-write-fault": ("portable-differential", "pass", "LOCK_PI_COW UNLOCK_PI_COW LOCK_PI_RO_EFAULT UNLOCK_PI_RO_EFAULT WAKE_OP_COW WAKE_OP_RO_EFAULT CMP_REQUEUE_PI_COW CMP_REQUEUE_PI_RO_EFAULT"),
     "ustat": ("raw-differential", "pass", "VALID_DEVICE_FILLS_COUNTERS NULL_BUF_EFAULT UNKNOWN_DEVICE_EINVAL UNKNOWN_DEVICE_BEFORE_COPYOUT"),
@@ -270,6 +272,8 @@ PROGRAM_CASES = {
     "clock-abi": ("clock-abi",),
     "aio": ("aio",),
     "io-uring-register": ("io-uring-register",),
+    "io-uring-register-opcodes": ("io-uring-register-opcodes",),
+    "io-uring-setup-batch": ("io-uring-setup-batch",),
 }
 # The registry is static: the gate reads it to decide whether a claimed
 # syscall names a program this runner really executes.
@@ -328,6 +332,8 @@ PROGRAM_SUCCESS = {
     "clock-abi": "THEKERNEL_CLOCK_ABI_DIFFERENTIAL_OK",
     "aio": "THEKERNEL_AIO_OK",
     "io-uring-register": "THEKERNEL_IO_URING_REGISTER_OK",
+    "io-uring-register-opcodes": "THEKERNEL_IO_URING_REGISTER_OPCODES_OK",
+    "io-uring-setup-batch": "THEKERNEL_IO_URING_SETUP_BATCH_OK",
 }
 PROGRAM_COMPLETIONS = tuple(PROGRAM_SUCCESS.values())
 
@@ -383,6 +389,7 @@ SYSCALL_CASES = {
     16: ("fs-abi", "ioctl"), 72: ("fs-abi", "fcntl"), 79: ("fs-abi", "getcwd"),
     103: ("fs-abi", "syslog"), 165: ("fs-abi", "mount"), 166: ("fs-abi", "umount2"),
     169: ("fs-abi", "reboot"), 276: ("fs-abi", "tee"), 278: ("fs-abi", "vmsplice"),
+    275: ("fs-abi", "splice"), 276: ("fs-abi", "tee"), 278: ("fs-abi", "vmsplice"),
     293: ("fs-abi", "pipe2"), 306: ("fs-abi", "syncfs"), 424: ("fs-abi", "pidfd-send-signal"),
     327: ("fs-abi", "preadv2"), 328: ("fs-abi", "pwritev2"),
     # Socket provider creation, address length and option-table rules.

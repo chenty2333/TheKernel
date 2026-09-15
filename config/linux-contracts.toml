@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 310
-implemented = 291
+resolved = 313
+implemented = 294
 explicit_enosys = 19
 fallback = 0
-partial = 75
+partial = 72
 unknown = 0
 
 [[contract]]
@@ -4847,8 +4847,8 @@ contract = "linux-fcntl"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_fcntl"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/fs/fd_ops.rs:noatime_requires_owner_match_or_namespace_relative_fowner", "tests/guest/portable/fs-abi-differential.c:main"]
-validation_gaps = ["The F_SETFL mask and O_NOATIME gate are exercised by the fs-abi raw differential; packet mode and the atime effect have no test"]
-limitations = ["Packet-mode O_DIRECT on a pipe or FIFO is rejected rather than implemented, and the F_SETFL O_NOATIME transition is recorded in the descriptor without reaching the open-file atime suppression"]
+validation_gaps = ["The F_SETFL flag mask, the O_NOATIME gate and O_DIRECT packet mode are exercised by the fs-abi raw differential; the atime effect has no test"]
+limitations = ["The F_SETFL O_NOATIME transition is recorded in the descriptor without reaching the open-file atime suppression"]
 
 [[contract]]
 id = "linux-sysfs"
@@ -5950,8 +5950,8 @@ status = "implemented"
 contract = "linux-splice"
 handler = "kernel/src/syscall/fs/io.rs:sys_splice"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent"]
-validation_gaps = ["Existing source/helper coverage does not establish the full splice raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/io/tests.rs:stream_cursor_and_explicit_io_capabilities_are_independent", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6176,13 +6176,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 276
 name = "tee"
-status = "partial"
+status = "implemented"
 contract = "linux-tee"
 handler = "kernel/src/syscall/fs/io.rs:sys_tee"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/fs-abi-differential.c:main"]
-validation_gaps = ["tee's argument order and stream copy are exercised by the fs-abi raw differential; packet mode has no test"]
-limitations = ["Packet-mode pipe-buffer transfers are not supported; anonymous pipes and FIFO stream endpoints are supported"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-vmsplice"
@@ -6199,13 +6199,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 278
 name = "vmsplice"
-status = "partial"
+status = "implemented"
 contract = "linux-vmsplice"
 handler = "kernel/src/syscall/fs/io.rs:sys_vmsplice"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/fs-abi-differential.c:main"]
-validation_gaps = ["vmsplice's argument order and gift path are exercised by the fs-abi raw differential; packet mode has no test"]
-limitations = ["Packet-mode pipe-buffer transfers are not supported; anonymous pipes and FIFO stream endpoints are supported"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-io_setup"
@@ -6383,13 +6383,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 293
 name = "pipe2"
-status = "partial"
+status = "implemented"
 contract = "linux-pipe2"
 handler = "kernel/src/syscall/fs/pipe.rs:sys_pipe2"
 conditional = "explicit-none"
 tests = ["kernel/src/file/pipe.rs:one_write_uses_one_nonblocking_snapshot", "tests/guest/portable/fs-abi-differential.c:main"]
-validation_gaps = ["pipe2 flag admission is exercised by the fs-abi raw differential; packet mode has no test"]
-limitations = ["O_DIRECT does not implement packet-mode buffering"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-pidfd_open"
