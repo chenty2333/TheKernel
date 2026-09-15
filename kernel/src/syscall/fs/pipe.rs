@@ -19,7 +19,8 @@ bitflags! {
         const CLOEXEC = O_CLOEXEC;
         /// Create a non-blocking pipe.
         const NONBLOCK = O_NONBLOCK;
-        /// Request packet mode (not implemented by the byte-stream backend).
+        /// Request packet mode: writes through the write end become
+        /// `PIPE_BUF_FLAG_PACKET` buffers (`fs/pipe.c:507-510`, `:631-634`).
         const DIRECT = O_DIRECT;
         /// `O_NOTIFICATION_PIPE` is an alias of `O_EXCL`
         /// (include/uapi/linux/watch_queue.h), not a distinct bit.
@@ -50,22 +51,25 @@ pub fn sys_pipe2<M: UserMemory + ?Sized>(
         return Err(LinuxError::ENOPKG.into());
     }
 
-    // Do not advertise packet semantics while the backing is a byte stream.
-    if flags.contains(PipeFlags::DIRECT) {
-        return Err(AxError::OperationNotSupported);
-    }
-
     let cloexec = flags.contains(PipeFlags::CLOEXEC);
     let (read_end, write_end) = Pipe::new();
     if flags.contains(PipeFlags::NONBLOCK) {
         read_end.set_nonblocking(true)?;
         write_end.set_nonblocking(true)?;
     }
+    // `create_pipe_files()` gives the write end `O_WRONLY | (flags &
+    // (O_NONBLOCK | O_DIRECT))` and clones the read end with
+    // `O_RDONLY | (flags & O_NONBLOCK)` (fs/pipe.c:1042-1056), so O_DIRECT
+    // packetizes writes through the write end only and `F_GETFL` never reports
+    // it on the read end.
     let mut read_status = O_RDONLY;
     let mut write_status = O_WRONLY;
     if flags.contains(PipeFlags::NONBLOCK) {
         read_status |= O_NONBLOCK;
         write_status |= O_NONBLOCK;
+    }
+    if flags.contains(PipeFlags::DIRECT) {
+        write_status |= O_DIRECT;
     }
     let read_fd = add_file_like_with_flags(Arc::new(read_end), cloexec, read_status)?;
     let write_fd = add_file_like_with_flags(Arc::new(write_end), cloexec, write_status)

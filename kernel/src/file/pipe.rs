@@ -1,7 +1,6 @@
 use alloc::{borrow::Cow, sync::Arc};
 use core::{
     cmp::min,
-    mem,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     task::Context,
 };
@@ -71,8 +70,220 @@ fn default_pipe_capacity() -> usize {
     }
 }
 
-fn pipe_poll_writable(buffer: &HeapRb<u8>) -> bool {
-    buffer.vacant_len() >= PIPE_BUF_SIZE
+/// One Linux `struct pipe_buffer`, as far as a byte ring can describe it.
+///
+/// Linux stores pipe payload in a ring of page-backed `struct pipe_buffer`
+/// objects, each carrying its own `flags` word (`include/linux/pipe_fs_i.h:26-32`).
+/// TheKernel keeps the payload in a byte ring, so a buffer is described by its
+/// byte extent in the pipe's absolute stream position plus that flags word.
+/// Only packetized buffers need an entry: a byte no entry covers belongs to a
+/// `PIPE_BUF_FLAG_CAN_MERGE` buffer, and `read(2)` treats those as one
+/// undelimited byte stream, which is exactly what the byte ring already is.
+#[derive(Clone, Copy)]
+struct PipeBufferMark {
+    /// Absolute stream position of the buffer's first byte (`buf->offset`).
+    start: u64,
+    /// `buf->len`.
+    len: usize,
+    /// `buf->flags`.
+    flags: u8,
+}
+
+/// `PIPE_BUF_FLAG_PACKET`: `read(2)` returns this buffer whole
+/// (`include/linux/pipe_fs_i.h:10`).  `anon_pipe_write()` stamps it on every
+/// buffer a descriptor with `O_DIRECT` creates (`fs/pipe.c:631-634`).
+const PIPE_BUF_FLAG_PACKET: u8 = 0x08;
+/// `PIPE_BUF_FLAG_WHOLE`: `read(2)` must return the whole buffer or `-ENOBUFS`
+/// (`include/linux/pipe_fs_i.h:12`).  Its only producer is `watch_queue`
+/// (`kernel/watch_queue.c:132`), and `pipe2(O_NOTIFICATION_PIPE)` reports
+/// `-ENOPKG` on this build, so no buffer here can carry it.  The read branch
+/// models the rule regardless.
+const PIPE_BUF_FLAG_WHOLE: u8 = 0x20;
+
+/// The pipe payload plus the per-buffer flags Linux keeps beside it.
+///
+/// `bytes.capacity()` is Linux's `pipe->max_usage * PAGE_SIZE`: `F_GETPIPE_SZ`
+/// reports it and `pipe_set_size()` sizes it (`fs/pipe.c:1466-1501`).  `marks`
+/// therefore holds at most `max_usage` entries, which is the count
+/// `pipe_full(head, tail, pipe->max_usage)` tests (`include/linux/pipe_fs_i.h`).
+/// A stream write fills both rings without an entry, because Linux writes such
+/// data into mergeable buffers whose only externally visible property is that
+/// `read(2)` may cross them.
+struct PipeRing {
+    /// Payload bytes, in pipe order.
+    bytes: HeapRb<u8>,
+    /// One entry per packetized buffer, in pipe order.
+    marks: HeapRb<PipeBufferMark>,
+    /// Absolute stream position of the byte ring's write index.
+    write_pos: u64,
+    /// Absolute stream position of the byte ring's read index.  A packet mark
+    /// is expressed against the same index, so the offsets survive an
+    /// `F_SETPIPE_SZ` capacity change, which moves no bytes.
+    read_pos: u64,
+}
+
+impl PipeRing {
+    /// Linux `pipe->max_usage`: the buffer array is sized in `PAGE_SIZE` slots
+    /// (`fs/pipe.c:1440-1446`), and `pipe->max_usage * PAGE_SIZE` is the
+    /// capacity `F_GETPIPE_SZ` reports.
+    fn max_usage(capacity: usize) -> usize {
+        // `round_pipe_size()` never returns less than one page, and
+        // `alloc_pipe_info()` starts at `PIPE_DEF_BUFFERS`, so this floor only
+        // keeps degenerate unit-test capacities usable.
+        (capacity / PIPE_BUF_SIZE).max(1)
+    }
+
+    fn new(capacity: usize) -> Self {
+        Self {
+            bytes: HeapRb::new(capacity),
+            marks: HeapRb::new(Self::max_usage(capacity)),
+            write_pos: 0,
+            read_pos: 0,
+        }
+    }
+
+    fn try_new(capacity: usize) -> Result<Self, alloc::collections::TryReserveError> {
+        Ok(Self {
+            bytes: HeapRb::try_new(capacity)?,
+            marks: HeapRb::try_new(Self::max_usage(capacity))?,
+            write_pos: 0,
+            read_pos: 0,
+        })
+    }
+
+    fn capacity(&self) -> usize {
+        self.bytes.capacity().get()
+    }
+
+    fn occupied_len(&self) -> usize {
+        self.bytes.occupied_len()
+    }
+
+    fn vacant_len(&self) -> usize {
+        self.bytes.vacant_len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Free `pipe_buffer` slots; `pipe_full()` is this reaching zero.
+    /// Buffer slots the pipe has allocated, Linux `pipe_occupancy(head, tail)`:
+    /// one per packetized buffer plus one per page a trailing stream region
+    /// spans.
+    fn occupied_buffers(&self) -> usize {
+        self.marks.occupied_len() + self.tail_stream_len().div_ceil(PIPE_BUF_SIZE)
+    }
+
+    /// Buffer slots still vacant, Linux `pipe->max_usage - pipe_occupancy()`.
+    fn vacant_buffers(&self) -> usize {
+        self.marks
+            .capacity()
+            .get()
+            .saturating_sub(self.occupied_buffers())
+    }
+
+    /// Bytes at the read index that no packetized buffer covers.
+    ///
+    /// Linux walks those as `PIPE_BUF_FLAG_CAN_MERGE` buffers and continues
+    /// into the next buffer until the caller's count is exhausted
+    /// (`fs/pipe.c:413-459`), so the only boundary a stream prefix exposes is
+    /// the packet that follows it.
+    fn head_stream_len(&self) -> usize {
+        match self.marks.try_peek() {
+            Some(mark) => (mark.start - self.read_pos).min(self.occupied_len() as u64) as usize,
+            None => self.occupied_len(),
+        }
+    }
+
+    /// The packetized buffer starting exactly at the read index, as
+    /// `(buf->len, buf->flags)`.
+    fn head_packet(&self) -> Option<(usize, u8)> {
+        self.marks
+            .try_peek()
+            .filter(|mark| mark.start == self.read_pos)
+            .map(|mark| (mark.len, mark.flags))
+    }
+
+    /// Bytes after the last packetized buffer: the mergeable tail.
+    fn tail_stream_len(&self) -> usize {
+        match self.marks.last() {
+            Some(mark) => (self.write_pos - mark.start - mark.len as u64) as usize,
+            None => self.occupied_len(),
+        }
+    }
+
+    /// Consumes `count` bytes from the read index.
+    ///
+    /// Linux keeps a partly read stream buffer in place (`buf->offset += chars;
+    /// buf->len -= chars`) and releases a buffer whose `len` reaches zero
+    /// (`fs/pipe.c:442-453`).  A splice from a pipe copies the same way, so a
+    /// packet buffer can be trimmed; `read(2)` never leaves one behind because
+    /// it zeroes `buf->len` unconditionally.
+    fn advance_read(&mut self, count: usize) {
+        unsafe { self.bytes.advance_read_index(count) };
+        self.read_pos += count as u64;
+        while self
+            .marks
+            .try_peek()
+            .is_some_and(|mark| mark.start + mark.len as u64 <= self.read_pos)
+        {
+            let _ = self.marks.try_pop();
+        }
+        if let Some(mark) = self.marks.first_mut()
+            && mark.start < self.read_pos
+        {
+            mark.len -= (self.read_pos - mark.start) as usize;
+            mark.start = self.read_pos;
+        }
+    }
+
+    /// Copies up to `max_len` bytes from `src` into the vacant region and
+    /// advances the byte write index.
+    fn push_source(&mut self, src: &mut IoSrc, max_len: usize) -> AxResult<usize> {
+        let (left, right) = self.bytes.vacant_slices_mut();
+        // The ring buffer exposes valid writable byte slices here.
+        let left = unsafe {
+            core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len())
+        };
+        let right = unsafe {
+            core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len())
+        };
+        let left_len = left.len().min(max_len);
+        let mut count = src.read(&mut left[..left_len])?;
+        if count == left_len && count < max_len {
+            let right_len = right.len().min(max_len - count);
+            count += src.read(&mut right[..right_len])?;
+        }
+        unsafe { self.bytes.advance_write_index(count) };
+        Ok(count)
+    }
+
+    /// Accounts for `count` bytes just copied in as mergeable stream data.
+    fn commit_stream(&mut self, count: usize) {
+        self.write_pos += count as u64;
+    }
+
+    /// Accounts for `count` bytes just copied in as one packetized buffer.
+    fn commit_packet(&mut self, count: usize, flags: u8) {
+        // Refused only when every slot is taken, which `pipe_full()` rejects
+        // before the bytes are copied in.
+        let _ = self.marks.try_push(PipeBufferMark {
+            start: self.write_pos,
+            len: count,
+            flags,
+        });
+        self.write_pos += count as u64;
+    }
+}
+
+/// Linux `pipe_full(head, tail, pipe->max_usage)`: every buffer slot is taken.
+fn pipe_ring_full(ring: &PipeRing) -> bool {
+    ring.vacant_buffers() == 0
+}
+
+fn pipe_poll_writable(ring: &PipeRing) -> bool {
+    ring.vacant_len() >= PIPE_BUF_SIZE && !pipe_ring_full(ring)
 }
 
 const fn pipe_write_is_complete(written: usize, requested: usize, nonblocking: bool) -> bool {
@@ -150,27 +361,51 @@ fn copy_slices_to_ring(dst: &mut HeapRb<u8>, src: &[&[u8]], max_len: usize) -> u
     copied
 }
 
+/// Bytes a stream write can add before Linux runs out of pipe buffers
+/// (`fs/pipe.c:572-591`, `:598-641`).
+///
+/// The merge step accepts `chars = total_len & (PAGE_SIZE-1)` bytes into the
+/// tail buffer's page without allocating anything, and every loop iteration
+/// after it allocates exactly one buffer and copies at most `PAGE_SIZE` into
+/// it.  A write that finds no free buffer and merges nothing reports a partial
+/// transfer (the merged bytes) or `-EAGAIN` when it has none, so byte capacity
+/// alone over-admits as soon as the marks ring holds buffers: one packet, one
+/// slot, one page.
+fn stream_write_room(ring: &PipeRing, total_len: usize) -> usize {
+    let mut merge_room = 0;
+    let tail = ring.tail_stream_len();
+    if tail > 0 {
+        let tail_used = match tail % PIPE_BUF_SIZE {
+            0 => PIPE_BUF_SIZE,
+            remainder => remainder,
+        };
+        let chars = total_len & (PIPE_BUF_SIZE - 1);
+        if tail_used + chars <= PIPE_BUF_SIZE {
+            merge_room = chars;
+        }
+    }
+    merge_room + ring.vacant_buffers() * PIPE_BUF_SIZE
+}
+
+/// `anon_pipe_write()` without `is_packetized(filp)` (`fs/pipe.c:522-699`).
+///
+/// Linux admits one buffer per iteration and lets a later write append to the
+/// last mergeable buffer inside its page, so a byte ring reproduces the
+/// externally visible result: an undelimited stream whose only admission limit
+/// is `pipe->max_usage * PAGE_SIZE`.
 fn write_pipe_buffer(
-    buffer: &Mutex<HeapRb<u8>>,
+    buffer: &Mutex<PipeRing>,
     src: &mut IoSrc,
     atomic_len: Option<usize>,
 ) -> AxResult<PipeTransfer> {
-    let mut prod = buffer.lock();
-    if atomic_len.is_some_and(|len| prod.vacant_len() < len) {
+    let mut ring = buffer.lock();
+    let room = ring.vacant_len().min(stream_write_room(&ring, src.remaining()));
+    if atomic_len.is_some_and(|len| room < len) {
         return Ok(PipeTransfer::none());
     }
-
-    let (left, right) = prod.vacant_slices_mut();
-    // The ring buffer exposes valid writable byte slices here.
-    let left =
-        unsafe { core::slice::from_raw_parts_mut(left.as_mut_ptr().cast::<u8>(), left.len()) };
-    let right =
-        unsafe { core::slice::from_raw_parts_mut(right.as_mut_ptr().cast::<u8>(), right.len()) };
-    let mut count = src.read(left)?;
-    if count >= left.len() {
-        count += src.read(right)?;
-    }
-    unsafe { prod.advance_write_index(count) };
+    let max_len = atomic_len.unwrap_or(room).min(room);
+    let count = ring.push_source(src, max_len)?;
+    ring.commit_stream(count);
     Ok(PipeTransfer {
         len: count,
         wake_readers: count > 0,
@@ -178,19 +413,155 @@ fn write_pipe_buffer(
     })
 }
 
-fn read_pipe_buffer(buffer: &Mutex<HeapRb<u8>>, dst: &mut IoDst) -> AxResult<PipeTransfer> {
-    let cons = buffer.lock();
-    let was_writable = pipe_poll_writable(&cons);
-    let (left, right) = cons.as_slices();
-    let mut count = dst.write(left)?;
-    if count >= left.len() {
-        count += dst.write(right)?;
+/// `anon_pipe_write()` with `is_packetized(filp)` true (`fs/pipe.c:507-510`,
+/// `:598-640`).
+///
+/// The merge step runs first and only accepts the previous buffer when it
+/// still carries `PIPE_BUF_FLAG_CAN_MERGE`:
+///     chars = total_len & (PAGE_SIZE-1);
+///     if (chars && !was_empty) {
+///             ... if ((buf->flags & PIPE_BUF_FLAG_CAN_MERGE) &&
+///                     offset + chars <= PAGE_SIZE) { ... }
+///     }
+/// A packetized buffer never carries that flag, so a packetized write only
+/// merges its first `total_len & (PAGE_SIZE-1)` bytes into the tail of an
+/// earlier *stream* write.  Every loop iteration then allocates one page,
+/// copies at most `PAGE_SIZE`, and stamps the buffer:
+///     if (is_packetized(filp))
+///             buf->flags = PIPE_BUF_FLAG_PACKET;
+/// A write therefore becomes `ceil(len / PAGE_SIZE)` whole packets, and the
+/// pipe lock is held for the whole loop, so a packet is never split across
+/// writers.
+fn write_pipe_packets(buffer: &Mutex<PipeRing>, src: &mut IoSrc) -> AxResult<PipeTransfer> {
+    let mut ring = buffer.lock();
+    // `was_empty = pipe_empty(head, tail)` is sampled under the pipe lock, so
+    // the merge decision cannot observe another writer's buffer.
+    let was_empty = ring.is_empty();
+    let mut written = 0usize;
+
+    // `chars = total_len & (PAGE_SIZE-1)` merge step.
+    let merge_chars = src.remaining() & (PIPE_BUF_SIZE - 1);
+    if merge_chars > 0 && !was_empty {
+        let tail = ring.tail_stream_len();
+        if tail > 0 {
+            // `offset + buf->len` of the tail buffer.  A stream tail is a whole
+            // number of full pages plus its last partial page, so the used part
+            // of that page is the remainder, or a whole page when the region
+            // ends exactly on a page boundary.
+            let tail_used = match tail % PIPE_BUF_SIZE {
+                0 => PIPE_BUF_SIZE,
+                remainder => remainder,
+            };
+            let merge_len = merge_chars.min(ring.vacant_len());
+            if tail_used + merge_len <= PIPE_BUF_SIZE {
+                let count = ring.push_source(src, merge_len)?;
+                ring.commit_stream(count);
+                written += count;
+            }
+        }
     }
-    unsafe { cons.advance_read_index(count) };
+
+    while src.remaining() > 0 {
+        // `while (!pipe_full(head, tail, pipe->max_usage))`
+        if pipe_ring_full(&ring) {
+            break;
+        }
+        let chunk = src.remaining().min(PIPE_BUF_SIZE);
+        if ring.vacant_len() < chunk {
+            break;
+        }
+        let count = ring.push_source(src, chunk)?;
+        if count == 0 {
+            break;
+        }
+        ring.commit_packet(count, PIPE_BUF_FLAG_PACKET);
+        written += count;
+        if count < chunk {
+            // `copy_page_from_iter()` returned a partial page with data left in
+            // the source; Linux drops the page and reports -EFAULT.  A byte
+            // ring cannot retract the bytes, so the partial packet is the
+            // whole source and the write ends here.
+            break;
+        }
+    }
+
     Ok(PipeTransfer {
-        len: count,
+        len: written,
+        wake_readers: written > 0,
+        became_writable: false,
+    })
+}
+
+/// Copies exactly the leading `len` bytes of the ring into `dst`.
+fn copy_ring_prefix(ring: &PipeRing, len: usize, dst: &mut IoDst) -> AxResult<usize> {
+    let (left, right) = ring.bytes.as_slices();
+    let left_len = left.len().min(len);
+    let mut count = dst.write(&left[..left_len])?;
+    if count == left_len && len > left_len {
+        count += dst.write(&right[..len - left_len])?;
+    }
+    Ok(count)
+}
+
+/// `anon_pipe_read()` (`fs/pipe.c:360-497`).
+///
+/// The walk is buffer by buffer: mergeable buffers contribute `buf->len` bytes
+/// and the loop continues into the next buffer, while a packetized buffer ends
+/// the read by construction:
+///     if (buf->flags & PIPE_BUF_FLAG_PACKET) {
+///             total_len = chars;
+///             buf->len = 0;
+///     }
+/// so a user count smaller than the packet truncates it and discards the
+/// remainder, and a full packet still stops the read after one buffer.
+fn read_pipe_buffer(buffer: &Mutex<PipeRing>, dst: &mut IoDst) -> AxResult<PipeTransfer> {
+    let mut ring = buffer.lock();
+    let was_writable = pipe_poll_writable(&ring);
+    let mut total_len = dst.remaining_mut();
+    let mut read = 0usize;
+
+    // Stream prefix: `chars = buf->len`, then `chars = total_len` when the
+    // caller asked for less, and the loop continues to the next buffer.
+    let stream_len = ring.head_stream_len();
+    if stream_len > 0 && total_len > 0 {
+        let chars = stream_len.min(total_len);
+        let written = copy_ring_prefix(&ring, chars, dst)?;
+        ring.advance_read(written);
+        read += written;
+        total_len -= written;
+    }
+
+    if total_len > 0
+        && let Some((len, flags)) = ring.head_packet()
+    {
+        if len > total_len && flags & PIPE_BUF_FLAG_WHOLE != 0 {
+            // `if (buf->flags & PIPE_BUF_FLAG_WHOLE) { if (ret == 0) ret =
+            // -ENOBUFS; break; }` leaves the buffer untouched, and the break
+            // returns whatever the earlier stream buffers contributed.
+            if read == 0 {
+                return Err(LinuxError::ENOBUFS.into());
+            }
+        } else {
+            let chars = len.min(total_len);
+            let written = copy_ring_prefix(&ring, chars, dst)?;
+            read += written;
+            if written < chars {
+                // `if (written < chars) { if (!ret) ret = -EFAULT; break; }`
+                // happens before `buf->offset` moves, so only what the
+                // destination accepted leaves the pipe.
+                ring.advance_read(written);
+            } else {
+                // `buf->len = 0` releases the whole packet, including the bytes
+                // the caller's count could not take.
+                ring.advance_read(len);
+            }
+        }
+    }
+
+    Ok(PipeTransfer {
+        len: read,
         wake_readers: false,
-        became_writable: !was_writable && pipe_poll_writable(&cons),
+        became_writable: !was_writable && pipe_poll_writable(&ring),
     })
 }
 
@@ -200,8 +571,53 @@ struct PipeReadReservation {
     was_writable: bool,
 }
 
+/// Moves the destination prefix of `src` into `dst`.
+fn move_pipe_buffer(src: &mut PipeRing, dst: &mut PipeRing, max_len: usize) -> PipeTransfer {
+    let (left, right) = src.bytes.as_slices();
+    let written = copy_slices_to_ring(&mut dst.bytes, &[left, right], max_len);
+    dst.commit_stream(written);
+    // `written` came from the currently occupied source slices and therefore
+    // cannot exceed the initialized prefix owned by the consumer.
+    src.advance_read(written);
+    PipeTransfer {
+        len: written,
+        wake_readers: written > 0,
+        became_writable: false,
+    }
+}
+
+/// Copies `max_len` bytes of the current source prefix into `dst`.
+fn copy_pipe_buffer(src: &PipeRing, dst: &mut PipeRing, max_len: usize) -> PipeTransfer {
+    let (left, right) = src.bytes.as_slices();
+    let written = copy_slices_to_ring(&mut dst.bytes, &[left, right], max_len);
+    dst.commit_stream(written);
+    PipeTransfer {
+        len: written,
+        wake_readers: written > 0,
+        became_writable: false,
+    }
+}
+
+/// Reads the pipe as an undelimited byte stream, ignoring buffer flags.
+///
+/// `splice_from_pipe_feed()` is the read side of `splice(2)` from a pipe and of
+/// `vmsplice(2)`: it copies `min(buf->len, sd->total_len)` from each buffer in
+/// turn and stops only when the caller's count is exhausted
+/// (`fs/splice.c:442-490`), so `PIPE_BUF_FLAG_PACKET` has no effect there.
+fn splice_read_pipe_buffer(buffer: &Mutex<PipeRing>, dst: &mut IoDst) -> AxResult<PipeTransfer> {
+    let mut ring = buffer.lock();
+    let was_writable = pipe_poll_writable(&ring);
+    let count = copy_ring_prefix(&ring, ring.occupied_len().min(dst.remaining_mut()), dst)?;
+    ring.advance_read(count);
+    Ok(PipeTransfer {
+        len: count,
+        wake_readers: false,
+        became_writable: !was_writable && pipe_poll_writable(&ring),
+    })
+}
+
 fn reserve_pipe_prefix(
-    source: &HeapRb<u8>,
+    source: &PipeRing,
     dst: &mut [u8],
     source_closed: bool,
 ) -> AxResult<Option<PipeReadReservation>> {
@@ -214,7 +630,7 @@ fn reserve_pipe_prefix(
         };
     }
 
-    let (left, right) = source.as_slices();
+    let (left, right) = source.bytes.as_slices();
     let left_len = left.len().min(available);
     dst[..left_len].copy_from_slice(&left[..left_len]);
     let right_len = available - left_len;
@@ -228,14 +644,14 @@ fn reserve_pipe_prefix(
 }
 
 fn commit_pipe_prefix(
-    source: &HeapRb<u8>,
+    source: &mut PipeRing,
     written: usize,
     reservation: PipeReadReservation,
 ) -> AxResult<PipeTransfer> {
     if source.occupied_len() < written {
         return Err(AxError::BadState);
     }
-    unsafe { source.advance_read_index(written) };
+    source.advance_read(written);
     Ok(PipeTransfer {
         len: written,
         wake_readers: false,
@@ -261,29 +677,6 @@ fn transfer_pipe_prefix(
     Ok((written, written < reservation.available))
 }
 
-fn move_pipe_buffer(src: &mut HeapRb<u8>, dst: &mut HeapRb<u8>, max_len: usize) -> PipeTransfer {
-    let (left, right) = src.as_slices();
-    let written = copy_slices_to_ring(dst, &[left, right], max_len);
-    // `written` came from the currently occupied source slices and therefore
-    // cannot exceed the initialized prefix owned by the consumer.
-    unsafe { src.advance_read_index(written) };
-    PipeTransfer {
-        len: written,
-        wake_readers: written > 0,
-        became_writable: false,
-    }
-}
-
-fn copy_pipe_buffer(src: &HeapRb<u8>, dst: &mut HeapRb<u8>, max_len: usize) -> PipeTransfer {
-    let (left, right) = src.as_slices();
-    let written = copy_slices_to_ring(dst, &[left, right], max_len);
-    PipeTransfer {
-        len: written,
-        wake_readers: written > 0,
-        became_writable: false,
-    }
-}
-
 fn blocked_pipe_transfer_result(
     progress: usize,
     source_empty: bool,
@@ -307,7 +700,7 @@ struct Shared {
     /// Serializes consumers while allowing a transfer to release the ring
     /// lock before invoking an arbitrary destination.
     read_transaction: Mutex<()>,
-    buffer: Mutex<HeapRb<u8>>,
+    buffer: Mutex<PipeRing>,
     poll_rx: PollSet,
     poll_tx: PollSet,
     poll_close: PollSet,
@@ -372,7 +765,7 @@ impl PipeAccess {
 
 struct NamedPipeState {
     read_transaction: Mutex<()>,
-    buffer: Mutex<HeapRb<u8>>,
+    buffer: Mutex<PipeRing>,
     poll_rx: PollSet,
     poll_tx: PollSet,
     poll_open: PollSet,
@@ -385,7 +778,7 @@ impl NamedPipeState {
     fn new() -> Self {
         Self {
             read_transaction: Mutex::new(()),
-            buffer: Mutex::new(HeapRb::new(default_pipe_capacity())),
+            buffer: Mutex::new(PipeRing::new(default_pipe_capacity())),
             poll_rx: PollSet::new(),
             poll_tx: PollSet::new(),
             poll_open: PollSet::new(),
@@ -503,7 +896,7 @@ impl<'a> PipeEndpoint<'a> {
     }
 
     pub fn capacity(&self) -> usize {
-        self.buffer().lock().capacity().get()
+        self.buffer().lock().capacity()
     }
 
     pub fn resize(&self, requested_size: usize) -> AxResult<usize> {
@@ -516,17 +909,38 @@ impl<'a> PipeEndpoint<'a> {
         }
 
         let mut buffer = self.buffer().lock();
-        if new_size == buffer.capacity().get() {
+        if new_size == buffer.capacity() {
             return Ok(new_size);
+        }
+        // `pipe_resize_ring()` refuses a buffer array smaller than the number of
+        // allocated buffers, not smaller than the bytes they hold:
+        //     if (nr_slots < pipe_occupancy(pipe->head, pipe->tail))
+        //             return -EBUSY;
+        // (`fs/pipe.c:1389-1412`).  A stream region occupies one slot per page
+        // it spans and each packetized buffer occupies one.
+        let occupied_buffers = buffer.occupied_buffers();
+        if PipeRing::max_usage(new_size) < occupied_buffers {
+            return Err(AxError::ResourceBusy);
         }
         if new_size < buffer.occupied_len() {
             return Err(AxError::ResourceBusy);
         }
-        let replacement = HeapRb::try_new(new_size).map_err(|_| AxError::NoMemory)?;
-        let old_buffer = mem::replace(&mut *buffer, replacement);
-        let (left, right) = old_buffer.as_slices();
-        buffer.push_slice(left);
-        buffer.push_slice(right);
+        // `pipe_resize_ring()` copies the buffers into the new array and only
+        // rebases the ring indices, so the payload keeps its order and its
+        // flags while the absolute stream positions stay meaningful.
+        let mut replacement = PipeRing::try_new(new_size).map_err(|_| AxError::NoMemory)?;
+        replacement.read_pos = buffer.read_pos;
+        replacement.write_pos = buffer.write_pos;
+        let (left, right) = buffer.bytes.as_slices();
+        replacement.bytes.push_slice(left);
+        replacement.bytes.push_slice(right);
+        let (marks, wrapped) = buffer.marks.as_slices();
+        for mark in marks.iter().chain(wrapped) {
+            // The replacement ring is checked to have at least as many slots as
+            // there are occupied buffers, so no push can be refused.
+            let _ = replacement.marks.try_push(*mark);
+        }
+        *buffer = replacement;
         drop(buffer);
         self.poll_tx().wake();
         Ok(new_size)
@@ -542,7 +956,7 @@ impl<'a> PipeEndpoint<'a> {
 
         block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
             let _transaction = self.read_transaction().lock();
-            let read = read_pipe_buffer(&self.buffer(), dst)?;
+            let read = splice_read_pipe_buffer(&self.buffer(), dst)?;
             if read.len > 0 {
                 notify_pipe_writable(&self.poll_tx(), read);
                 Ok(read.len)
@@ -656,7 +1070,8 @@ impl<'a> PipeEndpoint<'a> {
                     let source = self.buffer().lock();
                     let mut destination = out.buffer().lock();
                     let source_empty = source.occupied_len() == 0;
-                    let destination_full = destination.vacant_len() == 0;
+                    let destination_full =
+                        destination.vacant_len() == 0 || pipe_ring_full(&destination);
                     let count = remaining
                         .min(source.occupied_len())
                         .min(destination.vacant_len());
@@ -669,7 +1084,8 @@ impl<'a> PipeEndpoint<'a> {
                     let mut destination = out.buffer().lock();
                     let source = self.buffer().lock();
                     let source_empty = source.occupied_len() == 0;
-                    let destination_full = destination.vacant_len() == 0;
+                    let destination_full =
+                        destination.vacant_len() == 0 || pipe_ring_full(&destination);
                     let count = remaining
                         .min(source.occupied_len())
                         .min(destination.vacant_len());
@@ -724,7 +1140,7 @@ impl<'a> PipeEndpoint<'a> {
         }
     }
 
-    fn buffer(self) -> &'a Mutex<HeapRb<u8>> {
+    fn buffer(self) -> &'a Mutex<PipeRing> {
         match self {
             Self::Anonymous(pipe) => &pipe.shared.buffer,
             Self::Named(pipe) => &pipe.state.buffer,
@@ -865,7 +1281,8 @@ impl<'a> PipeEndpoint<'a> {
                     let was_writable = pipe_poll_writable(&source);
                     let mut destination = out.buffer().lock();
                     let source_empty = source.occupied_len() == 0;
-                    let destination_full = destination.vacant_len() == 0;
+                    let destination_full =
+                        destination.vacant_len() == 0 || pipe_ring_full(&destination);
                     let count = remaining
                         .min(source.occupied_len())
                         .min(destination.vacant_len());
@@ -881,7 +1298,8 @@ impl<'a> PipeEndpoint<'a> {
                     let mut source = self.buffer().lock();
                     let was_writable = pipe_poll_writable(&source);
                     let source_empty = source.occupied_len() == 0;
-                    let destination_full = destination.vacant_len() == 0;
+                    let destination_full =
+                        destination.vacant_len() == 0 || pipe_ring_full(&destination);
                     let count = remaining
                         .min(source.occupied_len())
                         .min(destination.vacant_len());
@@ -928,7 +1346,7 @@ impl Pipe {
         let shared = Arc::new(Shared {
             inode: PseudoInode::pipe(),
             read_transaction: Mutex::new(()),
-            buffer: Mutex::new(HeapRb::new(default_pipe_capacity())),
+            buffer: Mutex::new(PipeRing::new(default_pipe_capacity())),
             poll_rx: PollSet::new(),
             poll_tx: PollSet::new(),
             poll_close: PollSet::new(),
@@ -1024,9 +1442,6 @@ impl NamedPipe {
     }
 
     pub(crate) fn open(location: Location, flags: u32) -> AxResult<Self> {
-        if flags & O_DIRECT != 0 {
-            return Err(AxError::OperationNotSupported);
-        }
         let access = PipeAccess::from_flags(flags)?;
         let nonblocking = flags & O_NONBLOCK != 0;
         let state = {
@@ -1066,6 +1481,25 @@ impl NamedPipe {
         if let Err(err) = wait_result {
             state.remove_access(access);
             return Err(err);
+        }
+
+        // `open(2)` of a FIFO with O_DIRECT is the one O_DIRECT-on-a-pipe case
+        // Linux refuses: `do_dentry_open()` requires FMODE_CAN_ODIRECT
+        // (fs/open.c:966-968), which comes from the file's own `->open` (e.g.
+        // `ext4_file_open()`, fs/ext4/file.c:937) or from
+        // `f_mapping->a_ops->direct_IO` (fs/open.c:961-962), and `fifo_open()`
+        // (fs/pipe.c) grants neither.  Packetized mode on a FIFO is reachable
+        // through `F_SETFL`, whose O_DIRECT admission exempts
+        // `S_ISFIFO(inode->i_mode)` explicitly (fs/fcntl.c:61-65), and through
+        // `pipe2(O_DIRECT)` for anonymous pipes (fs/pipe.c:1042-1056).
+        //
+        // The rejection comes after the open, not before it: `do_dentry_open()`
+        // runs `f_op->open` first (fs/open.c:946-951) and computes
+        // `FMODE_CAN_ODIRECT` only afterwards (fs/open.c:961), so a blocking
+        // FIFO open waits for its peer and only then fails with -EINVAL.
+        if flags & O_DIRECT != 0 {
+            state.remove_access(access);
+            return Err(AxError::InvalidInput);
         }
 
         Ok(Self {
@@ -1113,19 +1547,10 @@ impl NamedPipe {
 
         block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
             let _transaction = self.state.read_transaction.lock();
-            let read = {
-                let cons = self.state.buffer.lock();
-                let (left, right) = cons.as_slices();
-                let mut count = dst.write(left)?;
-                if count >= left.len() {
-                    count += dst.write(right)?;
-                }
-                unsafe { cons.advance_read_index(count) };
-                count
-            };
-            if read > 0 {
+            let read = read_pipe_buffer(&self.state.buffer, dst)?;
+            if read.len > 0 {
                 self.state.poll_tx.wake();
-                Ok(read)
+                Ok(read.len)
             } else if self.state.writer_count() == 0 {
                 Ok(0)
             } else {
@@ -1139,6 +1564,7 @@ impl NamedPipe {
         src: &mut IoSrc,
         nonblocking: bool,
         suppress_sigpipe: bool,
+        packetized: bool,
     ) -> AxResult<usize> {
         if !self.is_write() {
             return Err(AxError::BadFileDescriptor);
@@ -1158,7 +1584,11 @@ impl NamedPipe {
                 return Err(AxError::BrokenPipe);
             }
 
-            let written = write_pipe_buffer(&self.state.buffer, src, atomic_len)?;
+            let written = if packetized {
+                write_pipe_packets(&self.state.buffer, src)?
+            } else {
+                write_pipe_buffer(&self.state.buffer, src, atomic_len)?
+            };
             if written.len > 0 {
                 self.state.poll_rx.wake();
                 notify_async_readable(&self.state.async_io);
@@ -1210,8 +1640,8 @@ impl NamedPipe {
             },
             write,
             |written, reservation| {
-                let source = self.state.buffer.lock();
-                let transfer = commit_pipe_prefix(&source, written, reservation)?;
+                let mut source = self.state.buffer.lock();
+                let transfer = commit_pipe_prefix(&mut source, written, reservation)?;
                 drop(source);
                 if transfer.became_writable {
                     self.state.poll_tx.wake();
@@ -1249,11 +1679,21 @@ impl Pipe {
         })
     }
 
+    /// `suppress_sigpipe` is set by callers that report `-EPIPE` instead of
+    /// raising `SIGPIPE`, the way `splice_direct_to_actor()` does.
+    ///
+    /// `packetized` is `is_packetized(filp)` of the *open file description*
+    /// being written (`fs/pipe.c:507-510`), sampled by the caller because the
+    /// flag lives in `f_flags` and an `F_SETFL` may have changed it since the
+    /// pipe was opened.  Every write(2) path passes `status.direct()`; the
+    /// transfer paths pass `false` because `splice_to_pipe()` never stamps
+    /// `PIPE_BUF_FLAG_PACKET` (`fs/splice.c:223`).
     pub(crate) fn write_with_nonblocking(
         &self,
         src: &mut IoSrc,
         nonblocking: bool,
         suppress_sigpipe: bool,
+        packetized: bool,
     ) -> AxResult<usize> {
         if !self.is_write() {
             return Err(AxError::BadFileDescriptor);
@@ -1273,7 +1713,11 @@ impl Pipe {
                 return Err(AxError::BrokenPipe);
             }
 
-            let written = write_pipe_buffer(&self.shared.buffer, src, atomic_len)?;
+            let written = if packetized {
+                write_pipe_packets(&self.shared.buffer, src)?
+            } else {
+                write_pipe_buffer(&self.shared.buffer, src, atomic_len)?
+            };
             if written.len > 0 {
                 notify_pipe_readable(&self.shared.poll_rx, &self.shared.async_io, written);
                 total_written += written.len;
@@ -1332,8 +1776,8 @@ impl Pipe {
             },
             write,
             |written, reservation| {
-                let source = self.shared.buffer.lock();
-                let transfer = commit_pipe_prefix(&source, written, reservation)?;
+                let mut source = self.shared.buffer.lock();
+                let transfer = commit_pipe_prefix(&mut source, written, reservation)?;
                 drop(source);
                 notify_pipe_writable(&self.shared.poll_tx, transfer);
                 Ok(())
@@ -1350,7 +1794,10 @@ impl FileLike for Pipe {
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
         let nonblocking = self.nonblocking();
-        self.write_with_nonblocking(src, nonblocking, false)
+        // This hook is not a `->write_iter` caller, so it never packetizes:
+        // `is_packetized(filp)` is sampled from the open file description by
+        // `write_file_like_with_status()`, which every write(2) path uses.
+        self.write_with_nonblocking(src, nonblocking, false, false)
     }
 
     fn stat(&self) -> AxResult<Kstat> {
@@ -1430,7 +1877,10 @@ impl FileLike for NamedPipe {
 
     fn write(&self, src: &mut IoSrc) -> AxResult<usize> {
         let nonblocking = self.nonblocking();
-        self.write_with_nonblocking(src, nonblocking, false)
+        // This hook is not a `->write_iter` caller, so it never packetizes:
+        // `is_packetized(filp)` is sampled from the open file description by
+        // `write_file_like_with_status()`, which every write(2) path uses.
+        self.write_with_nonblocking(src, nonblocking, false, false)
     }
 
     fn stat(&self) -> AxResult<Kstat> {
@@ -1566,9 +2016,11 @@ mod tests {
                 axfs_ng_vfs::NodePermission::from_bits_truncate(0o600),
             )
             .unwrap();
+        // fs/open.c:966-968: O_DIRECT needs FMODE_CAN_ODIRECT, which
+        // `fifo_open()` never grants.
         assert!(matches!(
             NamedPipe::open(location.clone(), O_RDWR | O_DIRECT),
-            Err(AxError::OperationNotSupported)
+            Err(AxError::InvalidInput)
         ));
         let fifo = NamedPipe::open(location, O_RDWR | O_NONBLOCK).unwrap();
         let endpoint = PipeEndpoint::from_file(&fifo).unwrap();
@@ -1591,7 +2043,7 @@ mod tests {
     #[test]
     fn anonymous_hangup_is_visible_before_drain_without_read_hangup() {
         let (reader, writer) = Pipe::new();
-        writer.shared.buffer.lock().push_slice(b"pending");
+        writer.shared.buffer.lock().bytes.push_slice(b"pending");
         drop(writer);
         assert!(
             reader
@@ -1637,7 +2089,7 @@ mod tests {
             remaining: capacity * 2,
         };
         assert_eq!(
-            writer.write_with_nonblocking(&mut source, false, true),
+            writer.write_with_nonblocking(&mut source, false, true, false),
             Ok(capacity)
         );
         assert_eq!(writer.shared.buffer.lock().occupied_len(), capacity);
@@ -1684,8 +2136,8 @@ mod tests {
 
     #[test]
     fn appending_to_a_readable_pipe_wakes_a_rearmed_edge_waiter() {
-        let buffer = Mutex::new(HeapRb::new(8));
-        assert_eq!(buffer.lock().push_slice(b"old"), 3);
+        let buffer = Mutex::new(PipeRing::new(8));
+        assert_eq!(buffer.lock().bytes.push_slice(b"old"), 3);
 
         let poll_rx = PollSet::new();
         let counter = Arc::new(CountingWake(AtomicUsize::new(0)));
@@ -1706,27 +2158,59 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_write_stops_at_the_last_free_pipe_buffer() {
+        // One byte per packet: sixteen packets fill a sixteen-slot pipe long
+        // before its byte capacity is used, and Linux's `anon_pipe_write()`
+        // loop allocates at most one buffer per page of a stream write
+        // (fs/pipe.c:598-641).  A stream write into that state must therefore
+        // stop after the one buffer that is still free, not after the 65521
+        // bytes of ring capacity.
+        let mut ring = PipeRing::new(PIPE_BUF_SIZE * 16);
+        for _ in 0..16 {
+            assert_eq!(ring.bytes.push_slice(b"x"), 1);
+            ring.commit_packet(1, PIPE_BUF_FLAG_PACKET);
+        }
+        assert_eq!(ring.tail_stream_len(), 0);
+        assert_eq!(stream_write_room(&ring, PIPE_BUF_SIZE), 0);
+        assert_eq!(stream_write_room(&ring, PIPE_BUF_SIZE * 2), 0);
+
+        // Draining one packet frees one slot: a stream write may now add a
+        // single page, and a page-aligned request cannot merge into a packet.
+        ring.advance_read(1);
+        assert_eq!(stream_write_room(&ring, PIPE_BUF_SIZE * 2), PIPE_BUF_SIZE);
+
+        // A trailing stream region merges `total_len & (PAGE_SIZE-1)` bytes
+        // into its partial page and allocates one page per remaining slot.
+        let mut ring = PipeRing::new(PIPE_BUF_SIZE * 4);
+        assert_eq!(ring.bytes.push_slice(&[b's'; 100]), 100);
+        ring.commit_stream(100);
+        assert_eq!(stream_write_room(&ring, PIPE_BUF_SIZE + 7), 7 + 3 * PIPE_BUF_SIZE);
+        assert_eq!(stream_write_room(&ring, PIPE_BUF_SIZE * 8), 3 * PIPE_BUF_SIZE);
+    }
+
+    #[test]
     fn pipe_move_consumes_only_the_destination_prefix() {
-        let mut source = HeapRb::new(8);
-        assert_eq!(source.push_slice(b"abcdef"), 6);
-        let mut destination = HeapRb::new(2);
+        let mut source = PipeRing::new(8);
+        assert_eq!(source.bytes.push_slice(b"abcdef"), 6);
+        source.commit_stream(6);
+        let mut destination = PipeRing::new(2);
 
         let moved = move_pipe_buffer(&mut source, &mut destination, 6);
         assert_eq!(moved.len, 2);
         assert!(moved.wake_readers);
 
-        let (left, right) = source.as_slices();
+        let (left, right) = source.bytes.as_slices();
         let remaining = left.iter().chain(right).copied().collect::<Vec<_>>();
         assert_eq!(remaining, b"cdef");
-        let (left, right) = destination.as_slices();
+        let (left, right) = destination.bytes.as_slices();
         let accepted = left.iter().chain(right).copied().collect::<Vec<_>>();
         assert_eq!(accepted, b"ab");
     }
 
     #[test]
     fn pipe_transfer_releases_the_ring_before_destination_admission() {
-        let source = spin::Mutex::new(HeapRb::new(8));
-        source.lock().push_slice(b"abcd");
+        let source = spin::Mutex::new(PipeRing::new(8));
+        source.lock().bytes.push_slice(b"abcd");
         let mut scratch = [0u8; 4];
 
         let (written, short) = transfer_pipe_prefix(
@@ -1741,8 +2225,8 @@ mod tests {
                 Ok(2)
             },
             |written, reservation| {
-                let source = source.lock();
-                commit_pipe_prefix(&source, written, reservation).map(drop)
+                let mut source = source.lock();
+                commit_pipe_prefix(&mut source, written, reservation).map(drop)
             },
         )
         .unwrap();
@@ -1754,8 +2238,8 @@ mod tests {
 
     #[test]
     fn pipe_transfer_does_not_commit_a_destination_would_block() {
-        let source = spin::Mutex::new(HeapRb::new(8));
-        source.lock().push_slice(b"abcd");
+        let source = spin::Mutex::new(PipeRing::new(8));
+        source.lock().bytes.push_slice(b"abcd");
         let mut scratch = [0u8; 4];
         let mut commit_called = false;
 
