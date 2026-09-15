@@ -197,6 +197,110 @@ pub mod clone_flags {
         | EMPTY_MNTNS;
 }
 
+/// `PTRACE_O_*` option bits and the shared admission helper the two request
+/// spellings that accept them must run.
+///
+/// `include/uapi/linux/ptrace.h` defines the bits, `kernel/ptrace.c`
+/// `check_ptrace_options()` decides them, and *both* `ptrace_attach()`
+/// (`PTRACE_SEIZE`) and `ptrace_setoptions()` (`PTRACE_SETOPTIONS`) call that
+/// one helper -- with the single documented difference that unknown bits are
+/// `-EIO` from `SEIZE` and `-EINVAL` from `SETOPTIONS`, which Linux implements
+/// by duplicating the mask test at the `SEIZE` call site.
+pub mod ptrace_options {
+    /// `PTRACE_O_TRACESYSGOOD` (bit 0).
+    pub const TRACESYSGOOD: u32 = 1;
+    /// `PTRACE_O_EXITKILL`: `(1 << 20)`.
+    pub const EXITKILL: u32 = 1 << 20;
+    /// `PTRACE_O_SUSPEND_SECCOMP`: `(1 << 21)`.
+    pub const SUSPEND_SECCOMP: u32 = 1 << 21;
+
+    /// `PTRACE_O_MASK`:
+    ///
+    /// ```c
+    /// #define PTRACE_O_MASK		(\
+    /// 	0x000000ff | PTRACE_O_EXITKILL | PTRACE_O_SUSPEND_SECCOMP)
+    /// ```
+    ///
+    /// `0x000000ff` covers `TRACESYSGOOD`, `TRACEFORK`, `TRACEVFORK`,
+    /// `TRACECLONE`, `TRACEEXEC`, `TRACEVFORKDONE`, `TRACEEXIT` and
+    /// `TRACESECCOMP`, so the whole word is `0x003000ff`.
+    pub const MASK: u32 = 0x0000_00ff | EXITKILL | SUSPEND_SECCOMP;
+
+    /// Why `check_ptrace_options()` refused an option word.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum PtraceOptionReject {
+        /// A bit outside [`MASK`].  `SEIZE` reports this as `-EIO` and
+        /// `SETOPTIONS` as `-EINVAL`.
+        Unknown,
+        /// `PTRACE_O_SUSPEND_SECCOMP` on a kernel built without
+        /// `CONFIG_CHECKPOINT_RESTORE` or without `CONFIG_SECCOMP`.
+        Unsupported,
+        /// `PTRACE_O_SUSPEND_SECCOMP` from a tracer that does not hold
+        /// `CAP_SYS_ADMIN`, that is already filtered, or that already carries
+        /// `PT_SUSPEND_SECCOMP`.
+        NotPermitted,
+    }
+
+    /// The tracer-side facts `check_ptrace_options()` observes.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct SuspendSeccompAdmission {
+        /// `IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) && IS_ENABLED(CONFIG_SECCOMP)`.
+        pub configured: bool,
+        /// `capable(CAP_SYS_ADMIN)`, i.e. `ns_capable(&init_user_ns, ...)`.
+        pub cap_sys_admin: bool,
+        /// `seccomp_mode(&current->seccomp) != SECCOMP_MODE_DISABLED` for the
+        /// *tracer*.
+        pub filtered: bool,
+        /// `current->ptrace & PT_SUSPEND_SECCOMP` for the *tracer*.
+        pub already_suspended: bool,
+    }
+
+    /// Linux `check_ptrace_options()` (`kernel/ptrace.c`):
+    ///
+    /// ```c
+    /// 	if (data & ~(unsigned long)PTRACE_O_MASK)
+    /// 		return -EINVAL;
+    ///
+    /// 	if (unlikely(data & PTRACE_O_SUSPEND_SECCOMP)) {
+    /// 		if (!IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) ||
+    /// 		    !IS_ENABLED(CONFIG_SECCOMP))
+    /// 			return -EINVAL;
+    ///
+    /// 		if (!capable(CAP_SYS_ADMIN))
+    /// 			return -EPERM;
+    ///
+    /// 		if (seccomp_mode(&current->seccomp) != SECCOMP_MODE_DISABLED ||
+    /// 		    current->ptrace & PT_SUSPEND_SECCOMP)
+    /// 			return -EPERM;
+    /// 	}
+    /// 	return 0;
+    /// ```
+    ///
+    /// `current` is the *tracer*: the option only means anything when the
+    /// tracer itself runs unfiltered, and `PT_SUSPEND_SECCOMP` is the tracer's
+    /// own flag bit.
+    pub const fn check(
+        data: u32,
+        suspend_seccomp: SuspendSeccompAdmission,
+    ) -> Result<(), PtraceOptionReject> {
+        if data & !MASK != 0 {
+            return Err(PtraceOptionReject::Unknown);
+        }
+        if data & SUSPEND_SECCOMP != 0 {
+            if !suspend_seccomp.configured {
+                return Err(PtraceOptionReject::Unsupported);
+            }
+            if !suspend_seccomp.cap_sys_admin {
+                return Err(PtraceOptionReject::NotPermitted);
+            }
+            if suspend_seccomp.filtered || suspend_seccomp.already_suspended {
+                return Err(PtraceOptionReject::NotPermitted);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Flags `clone3` accepts that `clone(2)` cannot express.
 ///
 /// `clone3_args_valid()` in kernel/fork.c allows `CLONE_LEGACY_FLAGS` plus
@@ -608,6 +712,124 @@ impl PidfdPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ptrace_option_mask_keeps_the_two_eventless_bits() {
+        use ptrace_options::*;
+        // include/uapi/linux/ptrace.h:
+        // 	#define PTRACE_O_EXITKILL		(1 << 20)
+        // 	#define PTRACE_O_SUSPEND_SECCOMP	(1 << 21)
+        // 	#define PTRACE_O_MASK			(\
+        // 		0x000000ff | PTRACE_O_EXITKILL | PTRACE_O_SUSPEND_SECCOMP)
+        assert_eq!(EXITKILL, 1 << 20);
+        assert_eq!(SUSPEND_SECCOMP, 1 << 21);
+        assert_eq!(MASK, 0x0030_00ff);
+        // The seven event options and TRACESYSGOOD live in the low byte; the
+        // six bits the pre-fix kernel admitted (16..19, 22..23) are not in the
+        // mask at all.
+        assert_eq!(TRACESYSGOOD, 1);
+        for bogus in [1 << 16, 1 << 17, 1 << 18, 1 << 19, 1 << 22, 1 << 23] {
+            assert_eq!(MASK & bogus, 0, "0x{bogus:x} is not an option");
+        }
+        for option in [
+            TRACESYSGOOD,
+            EXITKILL,
+            SUSPEND_SECCOMP,
+            1 << 1,
+            1 << 2,
+            1 << 3,
+            1 << 4,
+            1 << 5,
+            1 << 6,
+            1 << 7,
+        ] {
+            assert_eq!(MASK & option, option, "0x{option:x} must be admitted");
+        }
+    }
+
+    #[test]
+    fn ptrace_option_check_follows_check_ptrace_options() {
+        use ptrace_options::*;
+        let declared = SuspendSeccompAdmission {
+            configured: true,
+            cap_sys_admin: true,
+            filtered: false,
+            already_suspended: false,
+        };
+        // Unknown bits are the first decision, ahead of SUSPEND_SECCOMP.
+        assert_eq!(
+            check(SUSPEND_SECCOMP | (1 << 16), declared),
+            Err(PtraceOptionReject::Unknown)
+        );
+        assert_eq!(check(0, declared), Ok(()));
+        assert_eq!(check(EXITKILL, declared), Ok(()));
+        // PTRACE_O_EXITKILL needs no capability at all.
+        assert_eq!(
+            check(
+                EXITKILL,
+                SuspendSeccompAdmission {
+                    configured: false,
+                    cap_sys_admin: false,
+                    ..declared
+                }
+            ),
+            Ok(())
+        );
+        // Without CONFIG_CHECKPOINT_RESTORE (or CONFIG_SECCOMP) the bit is
+        // -EINVAL for every caller, capability or not.
+        let unconfigured = SuspendSeccompAdmission {
+            configured: false,
+            ..declared
+        };
+        assert_eq!(
+            check(SUSPEND_SECCOMP, unconfigured),
+            Err(PtraceOptionReject::Unsupported)
+        );
+        assert_eq!(
+            check(
+                SUSPEND_SECCOMP,
+                SuspendSeccompAdmission {
+                    cap_sys_admin: false,
+                    ..unconfigured
+                }
+            ),
+            Err(PtraceOptionReject::Unsupported)
+        );
+        // `capable(CAP_SYS_ADMIN)` precedes the tracer's own seccomp state.
+        assert_eq!(
+            check(
+                SUSPEND_SECCOMP,
+                SuspendSeccompAdmission {
+                    cap_sys_admin: false,
+                    ..declared
+                }
+            ),
+            Err(PtraceOptionReject::NotPermitted)
+        );
+        // A filtered tracer, or one that already suspended its filters, is
+        // -EPERM.
+        assert_eq!(
+            check(
+                SUSPEND_SECCOMP,
+                SuspendSeccompAdmission {
+                    filtered: true,
+                    ..declared
+                }
+            ),
+            Err(PtraceOptionReject::NotPermitted)
+        );
+        assert_eq!(
+            check(
+                SUSPEND_SECCOMP,
+                SuspendSeccompAdmission {
+                    already_suspended: true,
+                    ..declared
+                }
+            ),
+            Err(PtraceOptionReject::NotPermitted)
+        );
+        assert_eq!(check(SUSPEND_SECCOMP, declared), Ok(()));
+    }
 
     #[test]
     fn prctl_set_name_truncates_at_fifteen_bytes_and_keeps_raw_bytes() {
