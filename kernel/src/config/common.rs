@@ -8,8 +8,6 @@ pub const USER_STACK_SIZE: usize = 0x800_000;
 pub const USER_HEAP_BASE: usize = 0x4000_0000;
 /// The size of the user heap.
 pub const USER_HEAP_SIZE: usize = 0x1_0000;
-/// The maximum size of the user heap (for brk expansion).
-pub const USER_HEAP_SIZE_MAX: usize = 0x2000_0000;
 
 /// The base address for user interpreter.
 pub const USER_INTERP_BASE: usize = 0x400_0000;

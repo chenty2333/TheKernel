@@ -9,6 +9,10 @@ use axtask::current;
 use linux_raw_sys::general::*;
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 use tk_linux_arch_x86_64::{ArchPolicyError, PKEY_RIGHTS_MASK, PkeyPlan};
+use tk_linux_mm::{
+    MappingKind, MsyncResult, MsyncStep, ReserveRequest, advice_valid, msync_flags_valid,
+    msync_result, msync_step, plan_reserve,
+};
 
 use crate::{
     file::{
@@ -24,7 +28,7 @@ use crate::{
         MadviseReadahead, MadviseThp, PreparedFixedSharedMapping, PreparedProtect,
         SharedFolioDemotionReplacement, SharedFolioPteRedirect, SharedFolioPteReplacement,
         SharedPages, WritableMappingAdmission, check_memory_overcommit, check_rlimit_as_growth,
-        checked_align_up, checked_align_up_4k, remap_user_mapping,
+        checked_align_up, checked_align_up_4k, overcommit_memory_policy, remap_user_mapping,
     },
     pseudofs::{Device, DeviceMmap},
     task::{
@@ -979,10 +983,6 @@ pub fn sys_mmap(
     let has_ipc_lock = actor.has_effective_capability(CAP_IPC_LOCK);
     let aspace_handle = authorized_image.aspace().clone();
 
-    if is_anonymous_mapping && permission_flags.contains(MmapProt::WRITE) {
-        check_memory_overcommit(length)?;
-    }
-
     // Keep type errors at the historical backend-construction point, but
     // classify the exact OFD pinned above instead of looking up `fd` again.
     let has_prepared_fixed_mapping = prepared_fixed_mapping.is_some();
@@ -1007,6 +1007,37 @@ pub fn sys_mmap(
     {
         crate::mm::check_not_active(file.inner().location())?;
     }
+    // Linux charges a mapping against the commit limit exactly when
+    // `mm/vma.c:accountable_mapping()` says so: a private writable mapping that
+    // is not hugetlbfs-backed and does not carry `VM_NORESERVE`.  A private
+    // writable *file* mapping is accounted exactly like a private writable
+    // anonymous one, and `MAP_NORESERVE` is honoured — but only while
+    // `vm.overcommit_memory` is not `OVERCOMMIT_NEVER`, because that mode
+    // deliberately ignores the hint.  The earlier form of this check tested
+    // only anonymous mappings and dropped `MAP_NORESERVE` entirely.
+    let mapping_kind = match (is_anonymous_mapping, map_type) {
+        (true, MmapFlags::PRIVATE) => MappingKind::AnonymousPrivate,
+        (true, _) => MappingKind::AnonymousShared,
+        (false, MmapFlags::PRIVATE) => MappingKind::FilePrivate,
+        (false, _) => MappingKind::FileShared,
+    };
+    let file_is_hugepages = file
+        .as_ref()
+        .is_some_and(|file| file.inner().location().filesystem().name() == "hugetlbfs");
+    let reserve_plan = plan_reserve(
+        ReserveRequest {
+            kind: mapping_kind,
+            writable: permission_flags.contains(MmapProt::WRITE),
+            map_noreserve: map_flags.contains(MmapFlags::NORESERVE),
+            file_is_hugepages,
+            droppable: false,
+        },
+        overcommit_memory_policy() == 2,
+    );
+    if reserve_plan.accountable {
+        check_memory_overcommit(length)?;
+    }
+
     let filesystem_owner_user_ns = file
         .as_ref()
         .map(|_| initial_user_namespace(actor.user_ns()));
@@ -2193,11 +2224,18 @@ pub(crate) fn process_madvise_collect_pageout(
         {
             return Ok(());
         }
-        // PAGEOUT first demotes resident PTEs. Without swap this is the
-        // Linux outcome for private anonymous and shmem leaves: retain data
-        // and make it reclaim-eligible, rather than falsely discarding it or
-        // rejecting an otherwise valid advisory request.
+        // PAGEOUT first demotes resident PTEs, which is the whole of Linux's
+        // effect on a leaf it cannot reclaim.
         aspace.cold_resident_pages(range)?;
+        if !file_backed {
+            // Anonymous leaves are then really swapped out, exactly as
+            // `mm/madvise.c:madvise_pageout_pte_range()` calls `pageout()`.
+            // Leaves the reclaimer cannot take — shared, pinned, or backed by
+            // a backend without swap support — stay resident and the syscall
+            // still succeeds.
+            aspace.reclaim_anonymous_pages_in_range(range.start, range.size())?;
+            return Ok(());
+        }
         // Only shared file PTEs alias an inode cache page. MAP_PRIVATE COW
         // pages have already been demoted above but must not turn PAGEOUT
         // into a source-cache eviction of their original file bytes.
@@ -3053,37 +3091,18 @@ fn process_madvise_collapse_locked(aspace: &mut AddrSpace, addr: usize, length: 
     first_error.map_or(Ok(()), Err)
 }
 
+/// Linux `mm/madvise.c:madvise_behavior_valid()`, honouring the compile-time
+/// advice gates this kernel's feature set corresponds to.
+///
+/// `MADV_MERGEABLE`/`MADV_UNMERGEABLE` are listed only under
+/// `#ifdef CONFIG_KSM`, and this kernel has no KSM merging, so Linux's answer
+/// for them here is `-EINVAL` — not the nominal success this function used to
+/// report. `MADV_SOFT_OFFLINE` is listed only under
+/// `#ifdef CONFIG_MEMORY_FAILURE`, and its effect is a folio migration that
+/// preserves contents; this kernel has no migration mechanism, so it must not
+/// claim the advice instead of silently discarding the pages.
 pub(super) fn madvise_behavior_valid(advice: u32) -> bool {
-    matches!(
-        advice,
-        MADV_NORMAL
-            | MADV_RANDOM
-            | MADV_SEQUENTIAL
-            | MADV_WILLNEED
-            | MADV_DONTNEED
-            | MADV_FREE
-            | MADV_REMOVE
-            | MADV_DONTFORK
-            | MADV_DOFORK
-            | MADV_MERGEABLE
-            | MADV_UNMERGEABLE
-            | MADV_HUGEPAGE
-            | MADV_NOHUGEPAGE
-            | MADV_DONTDUMP
-            | MADV_DODUMP
-            | MADV_WIPEONFORK
-            | MADV_KEEPONFORK
-            | MADV_COLD
-            | MADV_PAGEOUT
-            | MADV_POPULATE_READ
-            | MADV_POPULATE_WRITE
-            | MADV_DONTNEED_LOCKED
-            | MADV_COLLAPSE
-            | MADV_GUARD_INSTALL
-            | MADV_GUARD_REMOVE
-            | MADV_HWPOISON
-            | MADV_SOFT_OFFLINE
-    )
+    advice_valid(advice)
 }
 
 pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
@@ -3153,17 +3172,6 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
         aspace.install_madvise_hwpoison(start, length)?;
         return Ok(0);
     }
-    if advice == MADV_SOFT_OFFLINE {
-        if !curr.as_thread().has_effective_capability(CAP_SYS_ADMIN) {
-            return Err(AxError::OperationNotPermitted);
-        }
-        // There is no NUMA migration target on x86_64 TheKernel.  Retiring
-        // resident pages forces the same allocate-on-next-access migration
-        // outcome without poisoning the virtual address.
-        aspace.discard_pages(start, length)?;
-        return Ok(0);
-    }
-
     if matches!(advice, MADV_POPULATE_READ | MADV_POPULATE_WRITE) {
         let access = if advice == MADV_POPULATE_READ {
             MappingFlags::READ
@@ -3246,13 +3254,11 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
             )?;
             Ok(0)
         }
-        // KSM requires global canonical-frame reverse mappings and a
-        // write-fault COW path. Keep these accepted hints separate from THP:
-        // they must not claim the now-observable THP policy implementation.
-        MADV_MERGEABLE | MADV_UNMERGEABLE => {
-            inspect_madvise_range(&aspace, start, length)?;
-            Ok(0)
-        }
+        // `MADV_MERGEABLE`/`MADV_UNMERGEABLE` never reach this match:
+        // `madvise_behavior_valid()` rejects them, exactly as Linux does when
+        // KSM is not configured. They must not report success, because a
+        // caller that believed its pages were merged would go on to rely on
+        // the sharing and on `MADV_UNMERGEABLE` splitting it again.
         MADV_DONTDUMP | MADV_DODUMP => {
             inspect_madvise_range(&aspace, start, length)?;
             aspace.set_dontdump(start, length, advice == MADV_DONTDUMP)?;
@@ -3315,15 +3321,9 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
 pub fn sys_msync(addr: usize, length: usize, flags: u32) -> AxResult<isize> {
     debug!("sys_msync <= addr: {addr:#x}, length: {length:x}, flags: {flags:#x}");
 
-    if !addr.is_multiple_of(PageSize::Size4K as usize) {
-        return Err(AxError::InvalidInput);
-    }
-    if flags & !(MS_ASYNC | MS_SYNC | MS_INVALIDATE) != 0 {
-        return Err(AxError::InvalidInput);
-    }
-
-    // MS_ASYNC and MS_SYNC are mutually exclusive.
-    if flags & MS_ASYNC != 0 && flags & MS_SYNC != 0 {
+    // `mm/msync.c` rejects an unaligned start and any flag outside
+    // MS_ASYNC|MS_INVALIDATE|MS_SYNC, then MS_ASYNC together with MS_SYNC.
+    if !addr.is_multiple_of(PageSize::Size4K as usize) || !msync_flags_valid(flags) {
         return Err(AxError::InvalidInput);
     }
 
@@ -3343,57 +3343,99 @@ fn msync_address_space(
     const PAGE_SIZE: usize = PageSize::Size4K as usize;
     let length = checked_align_up(length, PAGE_SIZE).ok_or(AxError::NoMemory)?;
     addr.checked_add(length).ok_or(AxError::NoMemory)?;
-    let fail_on_first_unmapped = flags == MS_ASYNC;
-    let (backends, saw_unmapped) = {
+    let (backends, saw_unmapped, busy) = {
         let aspace = aspace_handle.lock();
-        if length > 0 {
+        if length == 0 {
+            (Vec::new(), false, false)
+        } else {
             let start = VirtAddr::from(addr);
-            let (_, saw_unmapped) =
-                aspace.sync_backends_in_range(start, length, fail_on_first_unmapped)?;
-            if flags & MS_INVALIDATE != 0 && aspace.range_is_locked(start, length) {
-                return Err(LinuxError::EBUSY.into());
-            }
-            // Linux only calls vfs_fsync_range for MS_SYNC VM_SHARED file
-            // mappings.  In particular, MS_ASYNC starts no I/O and a private
-            // file COW mapping must not flush its source inode merely because
-            // it intersects an msync range.
+            let end = start + length;
+            // `mm/msync.c` walks the VMAs in ascending address order with
+            // `find_vma()` and, for each one, checks `(flags & MS_INVALIDATE)
+            // && (vma->vm_flags & VM_LOCKED)` *before* the `vfs_fsync_range()`
+            // for that same VMA.  A whole-range VM_LOCKED preflight therefore
+            // reported EBUSY for a range whose earlier shared file mappings
+            // Linux has already flushed by the time it fails. Both effects are
+            // ordered here, and a hole between two VMAs only advances the
+            // cursor to the next VMA's start instead of ending the walk.
             let mut backends = Vec::new();
-            if flags & MS_SYNC != 0 {
-                let end = start + length;
-                // Holes affect the final errno, not the remaining sync
-                // work. Walk every intersecting VMA and clamp its own
-                // overlap so a leading/interior hole cannot stop writeback.
-                for area in aspace.areas_overlapping(VirtAddrRange::new(start, end)) {
-                    let overlap_start = area.start().max(start);
-                    if area
-                        .backend()
-                        .file_mapping()
-                        .is_some_and(|lease| lease.sharing() == FileMappingSharing::Shared)
-                    {
+            let mut saw_unmapped = false;
+            let mut busy = false;
+            let mut cursor = start;
+            for area in aspace.areas_overlapping(VirtAddrRange::new(start, end)) {
+                if area.start() > cursor {
+                    // Linux: `if (start < vma->vm_start) { if (flags ==
+                    // MS_ASYNC) goto out_unlock; start = vma->vm_start; if
+                    // (start >= end) goto out_unlock; unmapped_error =
+                    // -ENOMEM; }`.
+                    match msync_step(flags, true, false, false) {
+                        MsyncStep::Hole { stop: true } => return Err(AxError::NoMemory),
+                        MsyncStep::Hole { stop: false } => saw_unmapped = true,
+                        _ => return Err(AxError::BadState),
+                    }
+                    cursor = area.start();
+                    if cursor >= end {
+                        break;
+                    }
+                }
+                // `vma->vm_flags & VM_LOCKED` is a per-VMA property, so any
+                // overlap with a locked VMA decides the whole request.  This
+                // kernel stores lock coverage as ranges rather than as a VMA
+                // flag, so querying the requested overlap is the closest
+                // equivalent; when `mlock` covered a whole VMA — the case
+                // Linux turns into `VM_LOCKED` — the two agree exactly.
+                let overlap_end = area.end().min(end);
+                let locked = aspace.range_is_locked(cursor, overlap_end.sub_addr(cursor));
+                // Linux only calls vfs_fsync_range for MS_SYNC VM_SHARED file
+                // mappings.  In particular, MS_ASYNC starts no I/O and a
+                // private file COW mapping must not flush its source inode
+                // merely because it intersects an msync range.
+                let shared_file = area
+                    .backend()
+                    .file_mapping()
+                    .is_some_and(|lease| lease.sharing() == FileMappingSharing::Shared);
+                match msync_step(flags, false, locked, shared_file) {
+                    MsyncStep::Hole { .. } => return Err(AxError::BadState),
+                    MsyncStep::Busy => {
+                        busy = true;
+                        break;
+                    }
+                    MsyncStep::Flush => {
                         backends.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-                        let overlap_end = area.end().min(end);
                         let offset = area
                             .backend()
                             .file_mapping()
-                            .and_then(|lease| lease.file_offset_at(overlap_start))
+                            .and_then(|lease| lease.file_offset_at(cursor))
                             .ok_or(AxError::BadState)?;
                         backends.push((
                             area.backend().clone(),
                             offset,
-                            overlap_end.sub_addr(overlap_start) as u64,
+                            overlap_end.sub_addr(cursor) as u64,
                         ));
+                        cursor = overlap_end;
                     }
+                    MsyncStep::Continue => cursor = overlap_end,
                 }
             }
-            (backends, saw_unmapped)
-        } else {
-            (Vec::new(), false)
+            if !busy && cursor < end {
+                // Trailing unmapped tail, same Linux branch as an interior gap.
+                match msync_step(flags, true, false, false) {
+                    MsyncStep::Hole { stop: true } => return Err(AxError::NoMemory),
+                    MsyncStep::Hole { stop: false } => saw_unmapped = true,
+                    _ => return Err(AxError::BadState),
+                }
+            }
+            (backends, saw_unmapped, busy)
         }
     };
 
+    // The filesystem operation runs lock-external so page-cache eviction
+    // callbacks can unmap old PTEs, and Linux's `if (error || start >= end)
+    // goto out` makes an fsync failure win over everything the walk had not
+    // reached yet.
     if flags & MS_SYNC != 0 {
-        for (backend, offset, length) in backends {
-            backend.sync_range(offset, length, false)?;
+        for (backend, offset, sync_length) in backends {
+            backend.sync_range(offset, sync_length, false)?;
         }
     }
 
@@ -3401,18 +3443,18 @@ fn msync_address_space(
     // Recheck after the lock-external filesystem operation so a concurrent
     // mlock cannot race a successful snapshot into an incorrectly successful
     // invalidate request.
-    if flags & MS_INVALIDATE != 0 && length > 0 {
-        let aspace = aspace_handle.lock();
-        if aspace.range_is_locked(VirtAddr::from(addr), length) {
-            return Err(LinuxError::EBUSY.into());
-        }
-    }
+    let busy = busy
+        || (flags & MS_INVALIDATE != 0
+            && length > 0
+            && aspace_handle
+                .lock()
+                .range_is_locked(VirtAddr::from(addr), length));
 
-    if saw_unmapped {
-        return Err(AxError::NoMemory);
+    match msync_result(busy, saw_unmapped) {
+        MsyncResult::Busy => Err(LinuxError::EBUSY.into()),
+        MsyncResult::NoMemory => Err(AxError::NoMemory),
+        MsyncResult::Ok => Ok(0),
     }
-
-    Ok(0)
 }
 
 pub fn sys_mlock(addr: usize, length: usize) -> AxResult<isize> {
@@ -4154,6 +4196,119 @@ mod tests {
         assert_eq!(byte, [42]);
         node.read_at(&mut byte, (PAGE_SIZE_4K * 3) as u64).unwrap();
         assert_eq!(byte, [4], "out-of-range suffix must stay dirty");
+    }
+
+    #[test]
+    fn msync_flushes_an_earlier_shared_range_before_a_locked_vma_reports_ebusy() {
+        // `mm/msync.c` applies MS_SYNC and MS_INVALIDATE per VMA in address
+        // order, so a shared file range in front of a later VM_LOCKED VMA is
+        // already written back when the syscall reports EBUSY.  A whole-range
+        // VM_LOCKED preflight rejected the request before flushing anything.
+        let _context = crate::test_support::scheduler_test_context();
+        let fs = MemoryFs::new().unwrap();
+        let mount = Mountpoint::new_root(&fs);
+        let location = mount
+            .root_location()
+            .create(
+                axfs_ng_vfs::FsName::new(b"msync-locked-order"),
+                NodeType::RegularFile,
+                NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        let backing = location;
+        let provider = Arc::new_cyclic(|this| MsyncBackingFile {
+            this: this.clone(),
+            backing,
+        });
+        let disk = axfs_ng_vfs::Filesystem::new(provider);
+        let location = Mountpoint::new_root(&disk).root_location();
+        let node = location.entry().as_file().unwrap();
+        node.set_len((PAGE_SIZE_4K * 3) as u64).unwrap();
+        let cache = CachedFile::get_or_create(location.clone());
+        for page in 0..3 {
+            cache
+                .write_at_slice(&[page as u8 + 1], (page * PAGE_SIZE_4K) as u64)
+                .unwrap();
+        }
+        let description = FileDescription::new(Arc::new(File::new(axfs::File::new(
+            FileBackend::Cached(cache.clone()),
+            FileFlags::READ | FileFlags::WRITE,
+        ))))
+        .unwrap();
+        let file = FileHandle::<dyn FileLike>::from_description_for_test(description)
+            .downcast::<File>()
+            .unwrap();
+        let owner = UserNamespace::try_new_root().unwrap();
+        let base = VirtAddr::from(0x8000);
+        let aspace = Arc::new(Mutex::new(
+            AddrSpace::new_empty(base, PAGE_SIZE_4K * 3).unwrap(),
+        ));
+        // Two adjacent shared file VMAs so that only the second one is locked.
+        for (page, pages) in [(0, 2), (2, 1)] {
+            let start = base + page * PAGE_SIZE_4K;
+            let lease = FileMappingLease::new(
+                file.clone(),
+                owner.clone(),
+                start,
+                (page * PAGE_SIZE_4K) as u64,
+                MappingFlags::USER | MappingFlags::READ,
+                MappingFlags::READ | MappingFlags::WRITE,
+                FileMappingSharing::Shared,
+            );
+            let backend = Backend::new_file(
+                start,
+                cache.clone(),
+                FileFlags::READ | FileFlags::WRITE,
+                page * PAGE_SIZE_4K,
+                Some((PAGE_SIZE_4K * 3) as u64),
+                &aspace,
+            )
+            .unwrap()
+            .with_file_mapping(lease);
+            aspace
+                .lock()
+                .map(
+                    start,
+                    pages * PAGE_SIZE_4K,
+                    MappingFlags::USER | MappingFlags::READ,
+                    false,
+                    backend,
+                )
+                .unwrap();
+        }
+        // Only the trailing VMA is locked, so the leading range must still be
+        // flushed before the walk reaches the VM_LOCKED one.
+        aspace
+            .lock()
+            .set_locked(base + PAGE_SIZE_4K * 2, PAGE_SIZE_4K, true)
+            .unwrap();
+        assert!(!aspace.lock().range_is_locked(base, PAGE_SIZE_4K * 2));
+        assert!(
+            aspace
+                .lock()
+                .range_is_locked(base + PAGE_SIZE_4K * 2, PAGE_SIZE_4K)
+        );
+
+        let mut byte = [0];
+        for page in 0..3 {
+            node.read_at(&mut byte, (page * PAGE_SIZE_4K) as u64)
+                .unwrap();
+            assert_eq!(byte, [0]);
+        }
+        assert_eq!(
+            msync_address_space(
+                &aspace,
+                base.as_usize(),
+                PAGE_SIZE_4K * 3,
+                MS_SYNC | MS_INVALIDATE,
+            ),
+            Err(LinuxError::EBUSY.into()),
+        );
+        // The shared range in front of the locked VMA was flushed anyway.
+        node.read_at(&mut byte, 0).unwrap();
+        assert_eq!(byte, [1], "leading shared range must flush before EBUSY");
+        node.read_at(&mut byte, (PAGE_SIZE_4K * 2) as u64).unwrap();
+        assert_eq!(byte, [0], "the locked VMA itself must not flush");
     }
 
     #[test]
