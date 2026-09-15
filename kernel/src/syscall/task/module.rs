@@ -7,9 +7,11 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::{WaitQueue, current};
-use linux_raw_sys::general::{CAP_SYS_MODULE, O_ACCMODE, O_TRUNC, O_WRONLY};
+use linux_raw_sys::general::{CAP_SYS_MODULE, O_ACCMODE, O_WRONLY};
 use spin::Lazy;
-use tk_linux_usercopy::{UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded};
+use tk_linux_usercopy::{
+    UserCopyError, UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded,
+};
 
 use crate::{
     file::{File, FileLike, get_typed_file},
@@ -48,7 +50,28 @@ const WEAK: u8 = 2;
 const MODULE_INIT_IGNORE_MODVERSIONS: u32 = 1;
 const MODULE_INIT_IGNORE_VERMAGIC: u32 = 2;
 const MODULE_INIT_COMPRESSED_FILE: u32 = 4;
-const MODULE_RELEASE: &[u8] = b"6.12.103";
+/// TheKernel's `VERMAGIC_STRING` (include/linux/vermagic.h):
+///
+/// ```c
+/// #define VERMAGIC_STRING 						\
+/// 	UTS_RELEASE " "							\
+/// 	MODULE_VERMAGIC_SMP MODULE_VERMAGIC_PREEMPT 			\
+/// 	MODULE_VERMAGIC_MODULE_UNLOAD MODULE_VERMAGIC_MODVERSIONS	\
+/// 	MODULE_ARCH_VERMAGIC						\
+/// 	MODULE_RANDSTRUCT
+/// ```
+///
+/// The release token is the one `uname(2)` reports (`UTS_RELEASE` in
+/// kernel/src/syscall/sys.rs), so a module and the kernel loading it agree on
+/// the release they were built for.  No configuration token is stamped:
+/// `MODULE_ARCH_VERMAGIC` is empty on x86_64 (arch/x86/include/asm/vermagic.h)
+/// and `RANDSTRUCT` is off, while the `SMP`/`preempt`/`mod_unload`/
+/// `modversions` tokens describe Linux `CONFIG_*` options, which TheKernel does
+/// not have; its own module ABI is checked separately (`.modinfo`, the
+/// `.thekernel.param.v1` parameter section and `__versions` CRCs).  The
+/// trailing space belongs to the macro (`UTS_RELEASE " "`) and is therefore
+/// part of the string `same_magic()` compares.
+const MODULE_VERMAGIC: &[u8] = b"6.12.103 ";
 // Linux limits PERF_TYPE_KPROBE function names to KSYM_NAME_LEN.  Keep the
 // same bounded usercopy contract here instead of allowing an attr pointer to
 // drive an unbounded scan.
@@ -386,44 +409,39 @@ struct LoadFlight {
     state: spin::Mutex<Option<i32>>,
     done: WaitQueue,
 }
+/// Identity of one in-flight module load.
+///
+/// Linux `idempotent_init_module()` keys its deduplication cookie on the file
+/// alone -- `idempotent(&idem, file_inode(f))` -- so two requests that name the
+/// same file are one load, and the loser waits for the winner's result without
+/// reading its own parameter string (kernel/module/main.c):
+///
+/// ```c
+/// 	if (!idempotent(&idem, file_inode(f))) {
+/// 		int ret = init_module_from_file(f, uargs, flags);
+/// 		return idempotent_complete(&idem, ret);
+/// 	}
+/// 	return idempotent_wait_for_completion(&idem);
+/// ```
+///
+/// TheKernel uses the open file description where Linux uses the inode, and
+/// keeps neither the parameter string nor the flag word in the identity: the
+/// bytes cannot be read before the image has been validated, and Linux ignores
+/// both when it decides whether a request is a duplicate.
 struct LoadKey {
     ofd: u64,
-    uargs_hash: u64,
-    uargs: Vec<u8>,
-    flags: u32,
 }
 impl LoadKey {
-    fn new(ofd: u64, uargs: Vec<u8>, flags: u32) -> Self {
-        Self {
-            ofd,
-            uargs_hash: uargs_hash(&uargs),
-            uargs,
-            flags,
-        }
+    fn new(ofd: u64) -> Self {
+        Self { ofd }
     }
 
     fn matches(&self, other: &Self) -> bool {
         self.ofd == other.ofd
-            && self.flags == other.flags
-            && self.uargs_hash == other.uargs_hash
-            // The hash only avoids most byte comparisons; exact bytes make
-            // equal hashes collision-safe.
-            && self.uargs == other.uargs
     }
 }
 static LOAD_FLIGHTS: Lazy<spin::Mutex<Vec<Arc<LoadFlight>>>> =
     Lazy::new(|| spin::Mutex::new(Vec::new()));
-
-fn uargs_hash(bytes: &[u8]) -> u64 {
-    // This is an index, not an identity: LoadKey::matches always verifies
-    // complete bytes before sharing a flight.
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash ^ (bytes.len() as u64)
-}
 
 fn load_flight(key: LoadKey) -> AxResult<(Arc<LoadFlight>, bool)> {
     let mut flights = LOAD_FLIGHTS.lock();
@@ -691,13 +709,82 @@ fn modinfo_value<'a>(modinfo: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
         .find_map(|entry| entry.strip_prefix(key))
 }
 
-fn validate_module_identity(modinfo: &[u8], flags: u32) -> AxResult<()> {
+/// Linux `same_magic()` (kernel/module/version.c), the `CONFIG_MODVERSIONS=y`
+/// spelling:
+///
+/// ```c
+/// /* First part is kernel version, which we ignore if module has crcs. */
+/// int same_magic(const char *amagic, const char *bmagic,
+/// 	       bool has_crcs)
+/// {
+/// 	if (has_crcs) {
+/// 		amagic += strcspn(amagic, " ");
+/// 		bmagic += strcspn(bmagic, " ");
+/// 	}
+/// 	return strcmp(amagic, bmagic) == 0;
+/// }
+/// ```
+///
+/// `has_crcs` is `info->index.vers`, i.e. whether the image carries a
+/// `__versions` section, and the skipped prefix is compared *from* the space,
+/// so the configuration tokens (with their leading separator) are what has to
+/// agree once crcs are present.  Without `CONFIG_MODVERSIONS` the whole string
+/// is compared (kernel/module/internal.h):
+///
+/// ```c
+/// static inline int same_magic(const char *amagic, const char *bmagic, bool has_crcs)
+/// {
+/// 	return strcmp(amagic, bmagic) == 0;
+/// }
+/// ```
+///
+/// TheKernel keeps the crc spelling: `validate_modversions()` matches
+/// `__versions` records against its exports, so an image that carries crcs is
+/// held to the same configuration tokens and an image without them to the whole
+/// string.  Comparing only the release token -- the previous behaviour -- let an
+/// image built for a different configuration through whenever its release
+/// happened to match, and let the configuration suffix decide nothing.
+fn same_magic(module_magic: &[u8], has_crcs: bool) -> bool {
+    /// `strcspn(magic, " ")`: everything from the first space, or the empty
+    /// tail when the string holds no space.
+    fn config_tokens(magic: &[u8]) -> &[u8] {
+        let offset = magic
+            .iter()
+            .position(|byte| *byte == b' ')
+            .unwrap_or(magic.len());
+        &magic[offset..]
+    }
+    if has_crcs {
+        config_tokens(module_magic) == config_tokens(MODULE_VERMAGIC)
+    } else {
+        module_magic == MODULE_VERMAGIC
+    }
+}
+
+fn validate_module_identity(modinfo: &[u8], has_crcs: bool, flags: u32) -> AxResult<()> {
     if flags & MODULE_INIT_IGNORE_VERMAGIC == 0 {
+        // 	const char *modmagic = get_modinfo(info, "vermagic");
+        //
+        // 	if (flags & MODULE_INIT_IGNORE_VERMAGIC)
+        // 		modmagic = NULL;
+        //
+        // 	/* This is allowed: modprobe --force will invalidate it. */
+        // 	if (!modmagic) {
+        // 		err = try_to_force_load(mod, "bad vermagic");
+        // 		if (err)
+        // 			return err;
+        // 	} else if (!same_magic(modmagic, vermagic, info->index.vers)) {
+        // 		pr_err("%s: version magic '%s' should be '%s'\n",
+        // 		       info->name, modmagic, vermagic);
+        // 		return -ENOEXEC;
+        // 	}
+        //
+        // A missing `vermagic=` is not a syntax error in Linux: it takes the
+        // forced-load path, which refuses with -ENOEXEC because TheKernel has
+        // no taint/force state (`try_to_force_load()` returns -ENOEXEC when
+        // CONFIG_MODULE_FORCE_LOAD is off).
         let vermagic = modinfo_value(modinfo, b"vermagic=").ok_or(LinuxError::ENOEXEC)?;
-        // The suffix records configuration ABI tokens; this kernel has no
-        // build-time compatibility aliases, so the release token must match
-        // exactly before loading relocatable code.
-        if vermagic.split(|byte| *byte == b' ').next() != Some(MODULE_RELEASE) {
+        if !same_magic(vermagic, has_crcs) {
             return Err(LinuxError::ENOEXEC.into());
         }
     }
@@ -1411,7 +1498,31 @@ fn params(
     }
     r
 }
-fn prep(b: &[u8], av: &[ParamArg], flags: u32) -> AxResult<M> {
+/// Validates and materializes one module image, taking the caller's parameter
+/// string through `fetch_args` at the exact point `load_module()` copies it:
+///
+/// ```c
+/// 	flush_module_icache(mod);
+///
+/// 	/* Now copy in args */
+/// 	mod->args = strndup_user(uargs, ~0UL >> 1);
+/// 	if (IS_ERR(mod->args)) {
+/// 		err = PTR_ERR(mod->args);
+/// 		goto free_arch_cleanup;
+/// 	}
+/// ```
+///
+/// (kernel/module/main.c:3526).  That is after the image has been read, its ELF
+/// structure checked, its modversions and vermagic verified, and its symbols
+/// relocated -- so a request whose image is malformed *and* whose parameter
+/// pointer is unreadable reports the image's error, exactly as Linux does.
+/// Pulling the parameters in earlier (the previous behaviour) reversed that
+/// precedence for `init_module(2)` and made `finit_module(2)` touch the
+/// parameter string before it had even validated the descriptor.
+fn prep<F>(b: &[u8], flags: u32, fetch_args: F) -> AxResult<M>
+where
+    F: FnOnce() -> AxResult<(Vec<u8>, Vec<ParamArg>)>,
+{
     let ss = sh(b)?;
     let names = *ss
         .get(usize::from(u16x(b, 62)?))
@@ -1424,6 +1535,12 @@ fn prep(b: &[u8], av: &[ParamArg], flags: u32) -> AxResult<M> {
         cs(names, s.n as usize)?;
     }
     validate_modversions(b, &ss, names, flags)?;
+    // `info->index.vers`: the `same_magic()` crc test is decided by whether the
+    // image carries a `__versions` section at all, not by whether the request
+    // ignores it.
+    let has_versions = ss
+        .iter()
+        .any(|s| cs(names, s.n as usize).is_ok_and(|x| x == b"__versions"));
     let param_section = ss
         .iter()
         .position(|s| cs(names, s.n as usize).is_ok_and(|x| x == b".thekernel.param.v1"));
@@ -1522,7 +1639,7 @@ fn prep(b: &[u8], av: &[ParamArg], flags: u32) -> AxResult<M> {
         .iter()
         .find(|s| cs(names, s.n as usize).is_ok_and(|x| x == b".modinfo"))
         .ok_or(AxError::InvalidExecutable)?;
-    validate_module_identity(sl(b, mi.o, mi.z)?, flags)?;
+    validate_module_identity(sl(b, mi.o, mi.z)?, has_versions, flags)?;
     let mn = sl(b, mi.o, mi.z)?
         .split(|x| *x == 0)
         .find_map(|x| x.strip_prefix(b"name="))
@@ -1576,6 +1693,9 @@ fn prep(b: &[u8], av: &[ParamArg], flags: u32) -> AxResult<M> {
             dependencies.push(copy_name(&binding.provider)?);
         }
     }
+    // `load_module()`'s `strndup_user(uargs, ...)`: the only fault this can
+    // still raise is the parameter pointer itself.
+    let (_, av) = fetch_args()?;
     let charps = {
         let ro = rodata
             .as_mut()
@@ -1585,7 +1705,7 @@ fn prep(b: &[u8], av: &[ParamArg], flags: u32) -> AxResult<M> {
             .as_mut()
             .map(jit_memory::WritableCode::bytes_mut)
             .unwrap_or(&mut []);
-        params(ro, rb, d, db, &ss, &ps, param_section, av)?
+        params(ro, rb, d, db, &ss, &ps, param_section, &av)?
     };
     let code = text.publish(init.offset).map_err(me)?;
     let rodata = rodata
@@ -1748,10 +1868,12 @@ pub fn sys_init_module<Mm: UserMemory + ?Sized>(
     }
     // kernel/module/main.c `load_module()` copies `uargs` only at
     // `mod->args = strndup_user(uargs, ~0UL >> 1);`, i.e. after the image has
-    // been validated.  The NULL/invalid-pointer -EFAULT is therefore *not* the
-    // second thing init_module checks.
-    let (_, a) = ua(m, a)?;
-    activate(prep(&vm_load(m, p, n).map_err(map_usercopy_error)?, &a, 0)?)
+    // been read *and* validated.  The NULL/invalid-pointer -EFAULT is therefore
+    // not the second thing init_module checks; the image read comes first
+    // (`copy_module_from_user()`), and a malformed image reports its own errno
+    // before the parameter string is touched.
+    let image = vm_load(m, p, n).map_err(map_usercopy_error)?;
+    activate(prep(&image, 0, || ua(m, a))?)
 }
 pub fn sys_finit_module<Mm: UserMemory + ?Sized>(
     m: &mut UserMemoryContext<'_, Mm>,
@@ -1762,6 +1884,23 @@ pub fn sys_finit_module<Mm: UserMemory + ?Sized>(
     if !cap() {
         return Err(AxError::OperationNotPermitted);
     }
+    // kernel/module/main.c `SYSCALL_DEFINE3(finit_module, ...)`, in order:
+    //
+    // 	int err = may_init_module();
+    // 	if (err)
+    // 		return err;
+    // 	if (flags & ~(MODULE_INIT_IGNORE_MODVERSIONS
+    // 		      |MODULE_INIT_IGNORE_VERMAGIC
+    // 		      |MODULE_INIT_COMPRESSED_FILE))
+    // 		return -EINVAL;
+    // 	CLASS(fd, f)(fd);
+    // 	if (fd_empty(f))
+    // 		return -EBADF;
+    // 	return idempotent_init_module(fd_file(f), uargs, flags);
+    //
+    // so the descriptor is admitted *before* the parameter string is read, not
+    // after (the previous order reported the parameter's -EFAULT where Linux
+    // reports the descriptor's -EBADF).
     if fl
         & !(MODULE_INIT_IGNORE_MODVERSIONS
             | MODULE_INIT_IGNORE_VERMAGIC
@@ -1770,13 +1909,24 @@ pub fn sys_finit_module<Mm: UserMemory + ?Sized>(
     {
         return Err(AxError::InvalidInput);
     }
-    let (raw_args, a) = ua(m, a)?;
     let f = get_typed_file::<File>(fd)?;
     f.check_io_access()?;
     if f.status_flags() & O_ACCMODE == O_WRONLY {
         return Err(AxError::BadFileDescriptor);
     }
-    let (flight, owner) = load_flight(LoadKey::new(f.open_file_description_key(), raw_args, fl))?;
+    // `idempotent_init_module()` opens with the file-mode test and then keys the
+    // deduplication on the file alone:
+    //
+    // 	if (!(f->f_mode & FMODE_READ))
+    // 		return -EBADF;
+    // 	if (!idempotent(&idem, file_inode(f))) { ... }
+    //
+    // TheKernel keeps one flight per open file description, exactly as Linux
+    // keeps one per inode.  The parameter string is not part of the identity
+    // and is not read here at all: `load_module()` reads it only after the
+    // image has been validated, and the waiter of a duplicate request must not
+    // read its own copy either.
+    let (flight, owner) = load_flight(LoadKey::new(f.open_file_description_key()))?;
     if !owner {
         return await_flight(flight);
     }
@@ -1806,7 +1956,7 @@ pub fn sys_finit_module<Mm: UserMemory + ?Sized>(
     complete_flight(
         &flight,
         decode_module_image(&b, fl)
-            .and_then(|image| prep(&image, &a, fl))
+            .and_then(|image| prep(&image, fl, || ua(m, a)))
             .and_then(activate),
     )
 }
@@ -1827,10 +1977,50 @@ pub fn sys_delete_module<Mm: UserMemory + ?Sized>(
     // `O_NONBLOCK` when choosing between -EAGAIN and -EBUSY; Linux never reads
     // O_NONBLOCK here and reports -EWOULDBLOCK for both the "other modules
     // depend on us" and the "module is still in use" cases, regardless of the
-    // flag word.
-    let raw = vm_load_until_nul_bounded(m, p.cast(), NAMEMAX + 1).map_err(map_usercopy_error)?;
-    let n = core::str::from_utf8(&raw).map_err(|_| AxError::IllegalBytes)?;
-    let force = fl & O_TRUNC != 0;
+    // flag word.  Without CONFIG_MODULE_FORCE_UNLOAD the helper is a constant:
+    //
+    // 	static inline int try_force_unload(unsigned int flags)
+    // 	{
+    // 		return 0;
+    // 	}
+    //
+    // (kernel/module/main.c:750-753), so `O_TRUNC` forces nothing and the flag
+    // word has no reader at all.  TheKernel used to let `O_TRUNC` unload a
+    // module that has no exit function; the real forced path also has to taint
+    // the kernel with TAINT_FORCED_RMMOD, which TheKernel cannot record.
+    let _ = fl;
+    // 	len = strncpy_from_user(name, name_user, MODULE_NAME_LEN);
+    // 	if (len == 0 || len == MODULE_NAME_LEN)
+    // 		return -ENOENT;
+    // 	if (len < 0)
+    // 		return len;
+    //
+    // `MODULE_NAME_LEN` is `64 - sizeof(unsigned long)` == 56 on x86_64
+    // (include/linux/moduleparam.h) and `strncpy_from_user()` reports the count
+    // itself when no NUL fits inside that window, so an over-long name is
+    // -ENOENT -- never -ENAMETOOLONG, which is the errno a bounded scan would
+    // otherwise produce.
+    let raw = match vm_load_until_nul_bounded(m, p.cast(), NAMEMAX + 1) {
+        Err(UserCopyError::TooLong) => return Err(LinuxError::ENOENT.into()),
+        other => other.map_err(map_usercopy_error)?,
+    };
+    if raw.is_empty() || raw.len() >= NAMEMAX {
+        return Err(LinuxError::ENOENT.into());
+    }
+    // 	mod = find_module(name);
+    // 	if (!mod) {
+    // 		ret = -ENOENT;
+    // 		goto out;
+    // 	}
+    //
+    // `find_module()` compares the copied bytes, so a name that is not valid
+    // UTF-8 is simply not a loaded module's name: TheKernel module names are
+    // UTF-8 by construction (the loader re-validates `name=`), so the answer is
+    // -ENOENT and not -EILSEQ.
+    let n = match core::str::from_utf8(&raw) {
+        Ok(name) => name,
+        Err(_) => return Err(LinuxError::ENOENT.into()),
+    };
     let x = {
         let mut v = MODULES.lock();
         let i = v
@@ -1854,20 +2044,26 @@ pub fn sys_delete_module<Mm: UserMemory + ?Sized>(
         // ...
         // 	ret = try_stop_module(mod, flags, &forced);
         //
-        // `try_stop_module()` fails with -EWOULDBLOCK too when the module
-        // reference count is still elevated and `try_force_unload()` did not
-        // authorise forcing.  O_TRUNC only forces under
-        // CONFIG_MODULE_FORCE_UNLOAD, which is off in the shipped
-        // configuration, so a forced request that cannot actually be honoured
-        // still reports -EWOULDBLOCK -- not -EOPNOTSUPP, which Linux never
-        // returns from this syscall for that reason.
-        // `-EWOULDBLOCK` is spelled `EAGAIN` here because Linux defines the two
-        // as the same errno number (11); `axerrno::LinuxError` keeps the
-        // canonical `EAGAIN` spelling.
+        // `try_stop_module()` fails with -EWOULDBLOCK when the module reference
+        // count is still elevated and `try_force_unload()` did not authorise
+        // forcing -- and it never authorises anything without
+        // CONFIG_MODULE_FORCE_UNLOAD -- so this is -EWOULDBLOCK regardless of
+        // the flag word.  `-EWOULDBLOCK` is spelled `EAGAIN` here because Linux
+        // defines the two as the same errno number (11); `axerrno::LinuxError`
+        // keeps the canonical `EAGAIN` spelling.
         if v[i].refs != 1 || v[i].deps != 0 {
             return Err(LinuxError::EAGAIN.into());
         }
-        if live.exit.is_none() && !force {
+        // 	/* If it has an init func, it must have an exit func to unload */
+        // 	if (mod->init && !mod->exit) {
+        // 		forced = try_force_unload(flags);
+        // 		if (!forced) {
+        // 			/* This module can't be removed */
+        // 			ret = -EBUSY;
+        // 			goto out;
+        // 		}
+        // 	}
+        if live.exit.is_none() {
             return Err(LinuxError::EBUSY.into());
         }
         match core::mem::replace(&mut v[i].state, State::Going) {
@@ -2083,20 +2279,39 @@ mod tests {
     }
 
     #[test]
-    fn load_flights_require_matching_ofd_args_and_flags() {
-        let key = LoadKey::new(7, b"answer=42".to_vec(), 0);
-        assert!(key.matches(&LoadKey::new(7, b"answer=42".to_vec(), 0)));
-        assert!(!key.matches(&LoadKey::new(8, b"answer=42".to_vec(), 0)));
-        assert!(!key.matches(&LoadKey::new(7, b"answer=43".to_vec(), 0)));
-        assert!(!key.matches(&LoadKey::new(7, b"answer=42".to_vec(), 1)));
+    fn load_flights_are_keyed_on_the_open_file_description() {
+        // Linux `idempotent_init_module()` keys its cookie on `file_inode(f)`
+        // alone, so two requests that share the file are one load -- whatever
+        // parameter string or flag word each caller passed -- and a request on
+        // another file is a different load.
+        let key = LoadKey::new(7);
+        assert!(key.matches(&LoadKey::new(7)));
+        assert!(!key.matches(&LoadKey::new(8)));
+    }
 
-        let colliding_hash = LoadKey {
-            ofd: 7,
-            uargs_hash: key.uargs_hash,
-            uargs: b"different".to_vec(),
-            flags: 0,
-        };
-        assert!(!key.matches(&colliding_hash));
+    #[test]
+    fn module_vermagic_follows_same_magic() {
+        // Without a `__versions` section Linux compares the whole string
+        // (kernel/module/internal.h), so the trailing space of
+        // `UTS_RELEASE " "` is part of the identity.
+        assert!(same_magic(b"6.12.103 ", false));
+        assert!(!same_magic(b"6.12.103", false));
+        assert!(!same_magic(b"6.12.103 SMP ", false));
+        assert!(!same_magic(b"7.2.3 ", false));
+        // `strcspn(amagic, " ")` skips the release token on both sides when
+        // the image carries crcs (kernel/module/version.c), so only the
+        // configuration suffix has to agree -- and TheKernel stamps none.
+        assert!(same_magic(b"6.12.103 ", true));
+        assert!(same_magic(b"7.2.3 ", true));
+        // `strcspn()` lands on the NUL when the string holds no space, so a
+        // module that omits the separator compares "" against the kernel's " "
+        // and fails even in the crc form.
+        assert!(!same_magic(b"6.12.103", true));
+        assert!(!same_magic(b"6.12.103 SMP ", true));
+        assert!(!same_magic(b"7.2.3 mod_unload ", true));
+        // The suffix is compared *from* the separator, so an image whose extra
+        // text has no leading space changes the release token, not the suffix.
+        assert!(!same_magic(b"6.12.103SMP", true));
     }
 
     #[test]
