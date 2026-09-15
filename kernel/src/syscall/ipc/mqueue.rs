@@ -585,7 +585,19 @@ impl PosixMqueue {
         }
     }
 
-    /// `wq_get_first_waiter(info, RECV)` plus the parking `wq_add()` performs.
+    /// `wq_sleep()`'s parking half plus the `wq_add()` position rule.
+    ///
+    /// `wq_add()` (`ipc/mqueue.c:689`) inserts before the first waiter whose
+    /// `task->prio` is at least as strong as `current->prio`, and
+    /// `wq_get_first_waiter()` returns the list tail, so Linux serves the
+    /// strongest waiter and the oldest of the equally strong ones. TheKernel
+    /// parks in arrival order and serves `first()`, which reproduces the FIFO
+    /// half of that rule but **not** the scheduler-priority half: two waiters
+    /// with different nice values are served oldest-first here and
+    /// strongest-first by Linux. The primitive Linux orders by exists as
+    /// `tk-axtask::pi_kernel_priority()` (`kernel/src/task/futex.rs`) over
+    /// `task_scheduling_snapshot()`; ordering these vectors by it, with the
+    /// strongest waiter last, is what closing that divergence needs.
     fn park_receiver(&mut self, receiver: &Arc<MqReceiver>) {
         if !receiver.queued.swap(true, Ordering::AcqRel) {
             self.receivers.push(receiver.clone());
@@ -601,6 +613,8 @@ impl PosixMqueue {
         }
     }
 
+    /// Sender-side counterpart of [`Self::park_receiver`], with the same
+    /// `wq_add()` priority divergence.
     fn park_sender(&mut self, sender: &Arc<MqSenderWaiter>) {
         if !sender.queued.swap(true, Ordering::AcqRel) {
             self.senders.push(sender.clone());
@@ -2219,10 +2233,12 @@ mod tests {
 
         let (message, publish) = queue.lock().take_message().unwrap();
         assert_eq!(message.data, b"stored".to_vec());
-        // Linux `pipelined_receive()` inserts the first sleeping sender's
-        // message into the freed slot instead of waking it to contend, and it
-        // wakes `e_wait_q[SEND]` in FIFO order (`wq_add()` appends), so the
-        // older waiter wins.
+        // Linux `pipelined_receive()` inserts the strongest sleeping sender's
+        // message into the freed slot instead of waking it to contend, and
+        // `wq_get_first_waiter()` picks the `e_wait_q[SEND]` tail, so the
+        // oldest of the equally strong waiters wins. TheKernel parks senders in
+        // arrival order, which matches that rule for equal nice values only
+        // (see `park_receiver` for the missing priority ordering).
         assert!(first.handed_off.load(Ordering::Acquire));
         assert!(!second.handed_off.load(Ordering::Acquire));
         assert!(publish.sender.is_some());
