@@ -1045,6 +1045,12 @@ pub(crate) struct MembarrierState {
 }
 
 impl MembarrierState {
+    /// `MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED`. Linux's `membarrier_state`
+    /// also carries non-ready companion bits (`*_READY`, and a
+    /// `MEMBARRIER_STATE_GLOBAL_EXPEDITED` mirror per runqueue); this kernel
+    /// keeps one ready bit per registration command because the registration
+    /// only has to be reported back by `MEMBARRIER_CMD_GET_REGISTRATIONS`.
+    const REGISTER_GLOBAL_EXPEDITED: u32 = 1 << 2;
     const REGISTER_PRIVATE: u32 = 1 << 4;
     const REGISTER_SYNC_CORE: u32 = 1 << 6;
 
@@ -1064,6 +1070,11 @@ impl MembarrierState {
         Self::with_registrations(self.registrations.load(Ordering::Acquire))
     }
 
+    pub(crate) fn register_global(&self) {
+        self.registrations
+            .fetch_or(Self::REGISTER_GLOBAL_EXPEDITED, Ordering::AcqRel);
+    }
+
     pub(crate) fn register_private(&self) {
         self.registrations
             .fetch_or(Self::REGISTER_PRIVATE, Ordering::AcqRel);
@@ -1077,9 +1088,13 @@ impl MembarrierState {
             .fetch_or(Self::REGISTER_SYNC_CORE, Ordering::AcqRel);
     }
 
+    /// The `MEMBARRIER_CMD_REGISTER_*` bits, which are exactly what
+    /// `MEMBARRIER_CMD_GET_REGISTRATIONS` reports (Linux's
+    /// `membarrier_get_registrations()` maps each ready state to its
+    /// registration command bit).
     pub(crate) fn registrations(&self) -> u32 {
         self.registrations.load(Ordering::Acquire)
-            & (Self::REGISTER_PRIVATE | Self::REGISTER_SYNC_CORE)
+            & (Self::REGISTER_GLOBAL_EXPEDITED | Self::REGISTER_PRIVATE | Self::REGISTER_SYNC_CORE)
     }
 
     pub(crate) fn private_registered(&self) -> bool {
