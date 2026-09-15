@@ -788,8 +788,60 @@ impl SocketOps for TcpSocket {
     }
 
     fn shutdown(&self, how: Shutdown) -> AxResult {
-        if !matches!(self.state(), State::Connected | State::Closed) {
-            return Err(AxError::NotConnected);
+        // `inet_shutdown()` (net/ipv4/af_inet.c:899-953) shifts `how` by one so
+        // that its low bit is `RCV_SHUTDOWN` and its second bit is
+        // `SEND_SHUTDOWN`, and handles the non-connected states *before* the
+        // ordinary case:
+        //     switch (sk->sk_state) {
+        //     case TCP_CLOSE:
+        //             err = -ENOTCONN;
+        //             ...
+        //     case TCP_LISTEN:
+        //             if (!(how & RCV_SHUTDOWN))
+        //                     break;
+        //             fallthrough;
+        //     case TCP_SYN_SENT:
+        //             err = sk->sk_prot->disconnect(sk, O_NONBLOCK);
+        //             sock->state = err ? SS_DISCONNECTING : SS_UNCONNECTED;
+        //             break;
+        // A listening socket therefore accepts `SHUT_WR` without error and
+        // without recording any shutdown bit, while `SHUT_RD`/`SHUT_RDWR`
+        // disconnect it and leave it closed.
+        match self.state() {
+            State::Listening => {
+                if how.has_read() {
+                    // `SHUT_RD`/`SHUT_RDWR` fall through to
+                    // `sk->sk_prot->disconnect()`, i.e. `tcp_disconnect()`,
+                    // which stops the listener (`inet_csk_listen_stop()`) and
+                    // leaves the socket in `TCP_CLOSE` while its local address
+                    // stays bound.
+                    self.disconnect()?;
+                } else {
+                    // `SHUT_WR` takes the `break` above: neither the listener
+                    // nor `sk_shutdown` changes, and only `sk_state_change(sk)`
+                    // wakes pollers.
+                    self.poll_rx_closed.wake();
+                    self.stack.poll_interfaces();
+                }
+                return Ok(());
+            }
+            State::Connecting => {
+                // `TCP_SYN_SENT` is handled by the same `disconnect()` arm for
+                // every `how`, so a half-open connection is aborted whether the
+                // caller asked for the read or the write half.
+                self.with_smol_socket(|socket| {
+                    socket.abort();
+                    socket.set_bound_endpoint(IpListenEndpoint::default());
+                });
+                self.rx_closed.store(false, Ordering::Release);
+                self.tx_closed.store(false, Ordering::Release);
+                self.state.set(State::Idle);
+                self.poll_rx_closed.wake();
+                self.stack.poll_interfaces();
+                return Ok(());
+            }
+            State::Idle => return Err(AxError::NotConnected),
+            State::Busy | State::Connected | State::Closed => {}
         }
 
         if how.has_read() {

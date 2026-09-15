@@ -59,8 +59,8 @@ enum {
 #define FSCONFIG_SET_PATH_EMPTY 4U
 #define FSCONFIG_SET_FD 5U
 #define FSCONFIG_CMD_CREATE 6U
-#define FSCONFIG_CMD_CREATE_EXCL 7U
-#define FSCONFIG_CMD_RECONFIGURE 8U
+#define FSCONFIG_CMD_RECONFIGURE 7U
+#define FSCONFIG_CMD_CREATE_EXCL 8U
 #define STATMOUNT_BY_FD 0x1U
 struct mnt_id_req {
     uint32_t size;
@@ -444,6 +444,11 @@ int main(void) {
           "not-a-context");
     ERROR(syscall(NR_FSCONFIG, 1 << 30, FSCONFIG_SET_STRING, "key", "value", 0), EBADF, "bad-fd");
     mark("CONTEXT_FD_EINVAL");
+    /* `vfs_cmd_reconfigure()` requires FS_CONTEXT_RECONF_PARAMS
+     * (fs/fsopen.c:262-263), so a context that is still collecting creation
+     * parameters answers EBUSY rather than EINVAL. */
+    ERROR(syscall(NR_FSCONFIG, ctx, FSCONFIG_CMD_RECONFIGURE, NULL, NULL, 0), EBUSY,
+          "reconfigure-before-create");
     check(close(ctx) == 0, "ctx-close");
     done();
 
@@ -466,9 +471,16 @@ int main(void) {
           "namespace-attributes-after-capability");
     ERROR(syscall(NR_FSMOUNT, -1, FSMOUNT_NAMESPACE, BAD_FLAGS), EINVAL,
           "namespace-attributes-capable");
+    /* fs/namespace.c:4479-4484 fetches the descriptor after the two flag
+     * words, so the FSMOUNT_NAMESPACE form reports the descriptor error too. */
+    ERROR(syscall(NR_FSMOUNT, -1, FSMOUNT_NAMESPACE, 0), EBADF, "namespace-bad-fd");
     ERROR(syscall(NR_FSMOUNT, ctx, 0, 0), EINVAL, "uncreated-context");
     mark("UNCREATED_CONTEXT_EINVAL");
     check(syscall(NR_FSCONFIG, ctx, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == 0, "create");
+    /* The context is now FS_CONTEXT_AWAITING_MOUNT, so the reconfigure gate
+     * refuses it with EBUSY as well. */
+    ERROR(syscall(NR_FSCONFIG, ctx, FSCONFIG_CMD_RECONFIGURE, NULL, NULL, 0), EBUSY,
+          "reconfigure-after-create");
     int mounted = (int)syscall(NR_FSMOUNT, ctx, FSMOUNT_CLOEXEC, 0);
     check(mounted >= 0, "mount");
     check(fcntl(mounted, F_GETFD) == FD_CLOEXEC, "mount-cloexec");
@@ -490,6 +502,12 @@ int main(void) {
     ctx = (int)syscall(NR_FSPICK, AT_FDCWD, "/", FSPICK_CLOEXEC);
     check(ctx >= 0, "pick-root");
     check(fcntl(ctx, F_GETFD) == FD_CLOEXEC, "pick-cloexec");
+    /* fspick(2) leaves the context in `FS_CONTEXT_RECONF_PARAMS`
+     * (fs/fsopen.c:200) while `fc->root` is already the picked superblock root
+     * (fs/fs_context.c:288-291), so fsmount(2) reaches its phase test
+     * (fs/namespace.c:4499-4501) and answers EBUSY instead of mounting the
+     * same superblock a second time. */
+    ERROR(syscall(NR_FSMOUNT, ctx, 0, 0), EBUSY, "reconfigure-context-busy");
     check(close(ctx) == 0, "pick-close");
     mark("CLOEXEC_CONTEXT_FD");
     done();

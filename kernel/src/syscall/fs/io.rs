@@ -2907,7 +2907,7 @@ fn seekable_fd(fd: c_int) -> AxResult<FileHandle<dyn FileLike>> {
     }
 }
 
-fn seek_file_like(
+pub(crate) fn seek_file_like(
     file_like: &FileHandle<dyn FileLike>,
     offset: __kernel_off_t,
     whence: c_int,
