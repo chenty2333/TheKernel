@@ -24,7 +24,7 @@ use tk_linux_usercopy::{
 
 use super::{
     GETALL, GETNCNT, GETPID, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID,
-    IPC_SET, IPC_STAT, IpcAccess, IpcAccessContext, IpcPerm, IpcPermissionUpdateRequest, SEM_INFO,
+    IPC_SET, IPC_STAT, IpcAccess, IpcAccessContext, IpcPerm, SEM_INFO,
     SEM_STAT, SEM_STAT_ANY, SETALL, SETVAL, allocate_ipc_id,
 };
 use crate::{
@@ -1010,21 +1010,35 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
         return Ok(id as isize);
     }
 
+    // Linux `ipc/sem.c:ksys_semctl()` copies the `IPC_SET` record out of
+    // userspace *before* `semctl_down()` resolves the identifier:
+    //
+    // ```c
+    // 	case IPC_SET:
+    // 		if (copy_semid_from_user(&semid64, p, version))
+    // 			return -EFAULT;
+    // 		fallthrough;
+    // 	case IPC_RMID:
+    // 		return semctl_down(ns, semid, cmd, &semid64);
+    // ```
+    //
+    // so a faulting buffer is EFAULT even when the identifier names nothing.
+    let set_perm = if cmd == IPC_SET {
+        let user_ds = VmPtr::vm_read(arg as *const SemidDs, memory).map_err(map_usercopy_error)?;
+        Some((
+            user_ds.sem_perm.uid,
+            user_ds.sem_perm.gid,
+            user_ds.sem_perm.mode,
+        ))
+    } else {
+        None
+    };
+
     let array = {
         let manager = ipc_ns.sem_manager().lock();
         manager
             .get_array_by_semid(semid)
             .ok_or(AxError::from(LinuxError::EINVAL))?
-    };
-    let set_request: Option<IpcPermissionUpdateRequest> = if cmd == IPC_SET {
-        let user_ds = VmPtr::vm_read(arg as *const SemidDs, memory).map_err(map_usercopy_error)?;
-        Some(context.map_permission_update(
-            user_ds.sem_perm.uid,
-            user_ds.sem_perm.gid,
-            user_ds.sem_perm.mode,
-        )?)
-    } else {
-        None
     };
     // SETALL snapshots and validates the complete input before acquiring the
     // array lock.  The lock is reacquired below only to revalidate identity,
@@ -1081,9 +1095,18 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
             Ok(0)
         }
         IPC_SET => {
+            let (uid, gid, mode) = set_perm.expect("IPC_SET copied its record before the lookup");
+            // Linux `semctl_down()` runs `ipcctl_obtain_check()` - the
+            // owner-or-CAP_SYS_ADMIN test - before `ipc_update_perm()`
+            // translates the requested owner ids, so a caller that may not
+            // control the array is refused with EPERM rather than with the
+            // EINVAL an unmappable id would produce.
+            if !context.may_control(&array.semid_ds.sem_perm) {
+                return Err(AxError::from(LinuxError::EPERM));
+            }
             let prepared = context.prepare_permission_update(
                 &array.semid_ds.sem_perm,
-                set_request.expect("IPC_SET request was prepared before locking"),
+                context.map_permission_update(uid, gid, mode)?,
             )?;
             prepared.commit(&mut array.semid_ds.sem_perm);
             array.mark_changed();

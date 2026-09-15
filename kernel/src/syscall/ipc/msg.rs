@@ -29,7 +29,7 @@ use tk_linux_usercopy::{
 
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcAccess,
-    IpcAccessContext, IpcPerm, IpcPermissionUpdateRequest, MSG_INFO, MSG_STAT, MSG_STAT_ANY,
+    IpcAccessContext, IpcPerm, MSG_INFO, MSG_STAT, MSG_STAT_ANY,
     PreparedIpcPermissionUpdate, allocate_ipc_id,
 };
 use crate::{
@@ -474,10 +474,25 @@ pub const MSGMNB: usize = 16384;
 /// Maximum size of a single message
 pub const MSGMAX: usize = 8192;
 
+/// The raw `IPC_SET` record, still in the caller's user-namespace encoding.
 #[derive(Clone, Copy)]
 struct MsgSetRequest {
-    permission: IpcPermissionUpdateRequest,
-    qbytes: __kernel_size_t,
+    uid: __kernel_uid_t,
+    gid: __kernel_gid_t,
+    mode: c_ushort,
+    /// Linux `ipc/msg.c:msgctl_down()` declares this parameter as a plain C
+    /// `int`, so the 64-bit `msg_qbytes` of the user record is truncated at the
+    /// call boundary:
+    ///
+    /// ```c
+    /// static int msgctl_down(struct ipc_namespace *ns, int msqid, int cmd,
+    /// 		       struct ipc64_perm *perm, int msg_qbytes)
+    /// ```
+    ///
+    /// The ceiling test then compares that `int` against the `unsigned int`
+    /// `ns->msg_ctlmnb` (so the sign is dropped) and the store into the
+    /// `unsigned long` `q_qbytes` sign-extends it back.
+    qbytes: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -494,14 +509,35 @@ impl PreparedMsgSet {
         request: MsgSetRequest,
         ctime: __kernel_time_t,
     ) -> AxResult<Self> {
-        let permission =
-            context.prepare_permission_update(&current.msg_perm, request.permission)?;
-        if request.qbytes > MSGMNB as __kernel_size_t && !context.may_raise_resource_limit() {
+        // Linux `ipc/msg.c:msgctl_down()` orders the two remaining refusals:
+        //
+        // ```c
+        // 	if (msg_qbytes > ns->msg_ctlmnb &&
+        // 	    !capable(CAP_SYS_RESOURCE)) {
+        // 		err = -EPERM;
+        // 		goto out_unlock1;
+        // 	}
+        // 	ipc_lock_object(&msq->q_perm);
+        // 	err = ipc_update_perm(perm, ipcp);
+        // ```
+        //
+        // `ipc_update_perm()` is where an owner id with no mapping in the
+        // caller's user namespace becomes EINVAL, so the queue-bytes ceiling
+        // is tested before the ids are translated.  Both sides of the
+        // comparison are 32 bits wide, as in Linux (`int` against the
+        // `unsigned int` `msg_ctlmnb`).
+        if (request.qbytes as u32) > MSGMNB as u32 && !context.may_raise_resource_limit() {
             return Err(AxError::OperationNotPermitted);
         }
+        let permission = context.prepare_permission_update(
+            &current.msg_perm,
+            context.map_permission_update(request.uid, request.gid, request.mode)?,
+        )?;
         Ok(Self {
             permission,
-            qbytes: request.qbytes,
+            // `msq->q_qbytes = msg_qbytes;` widens the signed `int` back into
+            // the `unsigned long` queue field.
+            qbytes: request.qbytes as i64 as __kernel_size_t,
             ctime,
         })
     }
@@ -1125,30 +1161,32 @@ pub fn sys_msgctl<M: UserMemory + ?Sized>(
         return Ok(published as isize);
     }
 
+    // Linux `ipc/msg.c:ksys_msgctl()` copies the `IPC_SET` record out of
+    // userspace *before* `msgctl_down()` resolves the identifier:
+    //
+    // ```c
+    // 	case IPC_SET:
+    // 		if (copy_msqid_from_user(&msqid64, buf, version))
+    // 			return -EFAULT;
+    // 		return msgctl_down(ns, msqid, cmd, &msqid64.msg_perm,
+    // 				   msqid64.msg_qbytes);
+    // ```
+    //
+    // so a faulting buffer is EFAULT even when the identifier names nothing.
+    // The record stays uninterpreted until the queue's own lock is held, so no
+    // queue field is changed before every check has succeeded.
+    let set_record = if cmd == IPC_SET {
+        Some(VmPtr::vm_read(buf as *const msqid_ds, memory).map_err(map_usercopy_error)?)
+    } else {
+        None
+    };
+
     // Find message queue by msqid
     let msg_queue = {
         let msg_manager = ipc_ns.msg_manager().lock();
         msg_manager
             .get_queue_by_msqid(msqid)
             .ok_or(AxError::from(LinuxError::EINVAL))? // EINVAL - Queue does not exist
-    };
-
-    // IPC_SET is a prepare/authorize/commit transaction. Potentially faulting
-    // usercopy and namespace ID mapping happen before the live queue lock is
-    // acquired. No queue field is changed until every check has succeeded.
-    let set_request = if cmd == IPC_SET {
-        let user_buf =
-            VmPtr::vm_read(buf as *const msqid_ds, memory).map_err(map_usercopy_error)?;
-        Some(MsgSetRequest {
-            permission: context.map_permission_update(
-                user_buf.msg_perm.uid,
-                user_buf.msg_perm.gid,
-                user_buf.msg_perm.mode,
-            )?,
-            qbytes: user_buf.msg_qbytes,
-        })
-    } else {
-        None
     };
 
     // Lock the internal structure of the queue
@@ -1177,10 +1215,17 @@ pub fn sys_msgctl<M: UserMemory + ?Sized>(
     }
 
     if cmd == IPC_SET {
+        let user_buf = set_record.expect("IPC_SET copied its record before the lookup");
+        let request = MsgSetRequest {
+            uid: user_buf.msg_perm.uid,
+            gid: user_buf.msg_perm.gid,
+            mode: user_buf.msg_perm.mode,
+            qbytes: user_buf.msg_qbytes as i32,
+        };
         let prepared = PreparedMsgSet::prepare(
             &context,
             &msg_queue.msqid_ds,
-            set_request.expect("IPC_SET request was prepared before locking"),
+            request,
             ipc_time_secs(),
         )?;
         prepared.commit(&mut msg_queue);
@@ -1267,8 +1312,10 @@ mod credential_caller_tests {
             queue.msqid_ds.msg_ctime,
         );
         let request = MsgSetRequest {
-            permission: context.map_permission_update(0, 0, 0o666).unwrap(),
-            qbytes: MSGMNB as __kernel_size_t + 1,
+            uid: context.effective_uid_raw(),
+            gid: context.effective_gid_raw(),
+            mode: 0o666,
+            qbytes: MSGMNB as i32 + 1,
         };
 
         let result = PreparedMsgSet::prepare(&context, &queue.msqid_ds, request, 99)
@@ -1296,8 +1343,10 @@ mod credential_caller_tests {
             ..super::super::IpcAuthority::NONE
         };
         let request = MsgSetRequest {
-            permission: context.map_permission_update(0, 0, 0o600).unwrap(),
-            qbytes: MSGMNB as __kernel_size_t + 1,
+            uid: context.effective_uid_raw(),
+            gid: context.effective_gid_raw(),
+            mode: 0o600,
+            qbytes: MSGMNB as i32 + 1,
         };
 
         let owned = MessageQueue::new(1, 0o600, 1, 0, 0);

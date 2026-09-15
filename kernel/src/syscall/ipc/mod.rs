@@ -12,7 +12,7 @@ mod shm;
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::{
     ctypes::{c_ulong, c_ushort},
-    general::{CAP_CHOWN, CAP_IPC_OWNER, CAP_SYS_ADMIN, CAP_SYS_RESOURCE, *},
+    general::{CAP_IPC_OWNER, CAP_SYS_ADMIN, CAP_SYS_RESOURCE, *},
 };
 use tk_linux_ipc::{IpcId, IpcIdTable};
 
@@ -362,7 +362,6 @@ struct IpcAuthority {
     control_override: bool,
     resource_override: bool,
     lock_override: bool,
-    chown_override: bool,
 }
 
 impl IpcAuthority {
@@ -371,7 +370,6 @@ impl IpcAuthority {
         control_override: false,
         resource_override: false,
         lock_override: false,
-        chown_override: false,
     };
 }
 
@@ -396,10 +394,6 @@ impl IpcIdentity<'_> {
             .filter_map(Kgid::from_raw)
             .any(|gid| gid == self.egid || self.supplementary_groups.binary_search(&gid).is_ok())
     }
-
-    fn may_assume_group(self, gid: Kgid) -> bool {
-        gid == self.egid || self.supplementary_groups.binary_search(&gid).is_ok()
-    }
 }
 
 /// Immutable actor credentials and namespace-relative authority for one SysV
@@ -422,7 +416,6 @@ impl IpcAccessContext {
             control_override: ns_capable(&actor, &governing_user_ns, CAP_SYS_ADMIN),
             resource_override: ns_capable(&actor, &governing_user_ns, CAP_SYS_RESOURCE),
             lock_override: ns_capable(&actor, &governing_user_ns, CAP_IPC_LOCK),
-            chown_override: ns_capable(&actor, &governing_user_ns, CAP_CHOWN),
         };
         Self {
             actor,
@@ -523,24 +516,36 @@ impl IpcAccessContext {
         Ok(IpcPermissionUpdateRequest { uid, gid, mode })
     }
 
+    /// Linux `ipc/util.c:ipc_update_perm()`:
+    ///
+    /// ```c
+    /// 	kuid_t uid = make_kuid(current_user_ns(), in->uid);
+    /// 	kgid_t gid = make_kgid(current_user_ns(), in->gid);
+    /// 	if (!uid_valid(uid) || !gid_valid(gid))
+    /// 		return -EINVAL;
+    ///
+    /// 	out->uid = uid;
+    /// 	out->gid = gid;
+    /// 	out->mode = (out->mode & ~S_IRWXUGO)
+    /// 		| (in->mode & S_IRWXUGO);
+    /// ```
+    ///
+    /// The *right* to change an object is settled earlier, by
+    /// `ipcctl_obtain_check()`'s owner-or-CAP_SYS_ADMIN test; the update
+    /// itself refuses only an owner id that has no mapping in the caller's
+    /// user namespace.  Linux therefore lets a plain owner hand the object to
+    /// any representable uid or gid, and does not require CAP_CHOWN or confine
+    /// the new owner to ids the caller may assume.  `map_permission_update()`
+    /// has already performed the `make_kuid()`/`make_kgid()` translation, so
+    /// the remaining check here is only the authority to touch the object at
+    /// all (repeated because some callers reach this without an explicit
+    /// `may_control()`).
     fn prepare_permission_update(
         &self,
         current: &IpcPerm,
         request: IpcPermissionUpdateRequest,
     ) -> AxResult<PreparedIpcPermissionUpdate> {
         if !self.may_control(current) {
-            return Err(AxError::OperationNotPermitted);
-        }
-        let identity = self.identity();
-        let current_uid = Kuid::from_raw(current.uid).ok_or(AxError::BadState)?;
-        let current_gid = Kgid::from_raw(current.gid).ok_or(AxError::BadState)?;
-        let uid_allowed = request.uid == current_uid
-            || request.uid == identity.euid
-            || self.authority.chown_override;
-        let gid_allowed = request.gid == current_gid
-            || identity.may_assume_group(request.gid)
-            || self.authority.chown_override;
-        if !uid_allowed || !gid_allowed {
             return Err(AxError::OperationNotPermitted);
         }
         Ok(PreparedIpcPermissionUpdate {
@@ -707,10 +712,8 @@ mod credential_caller_tests {
         };
         assert!(admin.control_override);
         assert!(!admin.resource_override);
-        assert!(!admin.chown_override);
         assert!(resource.resource_override);
         assert!(!resource.control_override);
-        assert!(!resource.chown_override);
         assert!(!admin.access_override && !resource.access_override);
     }
 
@@ -737,67 +740,73 @@ mod credential_caller_tests {
         assert_eq!((object.uid, object.gid, object.mode), (2000, 200, 0o640));
     }
 
+    /// Linux `ipc_update_perm()` hands the object to whatever uid and gid the
+    /// owner asked for, as long as both have a mapping in the caller's user
+    /// namespace.  It does not require CAP_CHOWN, it does not confine the new
+    /// owner to ids the caller currently holds, and it does not look at the
+    /// *live* owner ids at all - only the requested ones are translated.  The
+    /// old check here refused an arbitrary owner change with EPERM, which a
+    /// plain owner never sees on Linux.
     #[test]
-    fn credential_caller_arbitrary_owner_change_requires_cap_chown() {
-        let mut context = root_context_with_authority(IpcAuthority::NONE);
-        let object = perm(0, 0, 0o600);
+    fn credential_caller_owner_change_needs_only_a_mappable_id() {
+        let context = root_context_with_authority(IpcAuthority::NONE);
+        let mut object = perm(0, 0, 0o600);
+        object.cuid = context.effective_uid_raw();
         let request = IpcPermissionUpdateRequest {
             uid: kuid(2000),
-            gid: kgid(0),
+            gid: kgid(3000),
             mode: 0o600,
         };
-        assert!(matches!(
-            context.prepare_permission_update(&object, request),
-            Err(AxError::OperationNotPermitted)
-        ));
-        context.authority.chown_override = true;
-        assert!(context.prepare_permission_update(&object, request).is_ok());
+        let prepared = context.prepare_permission_update(&object, request).unwrap();
+        prepared.commit(&mut object);
+        assert_eq!((object.uid, object.gid), (2000, 3000));
     }
 
     #[test]
-    fn credential_caller_cap_sys_admin_control_does_not_imply_cap_chown() {
+    fn credential_caller_control_capability_is_the_only_gate_on_ipc_set() {
         let context = root_context_with_authority(IpcAuthority {
             control_override: true,
             ..IpcAuthority::NONE
         });
         let object = perm(2000, 200, 0o600);
-        let keep_owner = IpcPermissionUpdateRequest {
-            uid: kuid(2000),
-            gid: kgid(200),
-            mode: 0o644,
-        };
-        assert!(
-            context
-                .prepare_permission_update(&object, keep_owner)
-                .is_ok()
-        );
         let change_owner = IpcPermissionUpdateRequest {
             uid: kuid(3000),
-            ..keep_owner
+            gid: kgid(4000),
+            mode: 0o644,
         };
-        assert!(matches!(
-            context.prepare_permission_update(&object, change_owner),
-            Err(AxError::OperationNotPermitted)
-        ));
+        let prepared = context
+            .prepare_permission_update(&object, change_owner)
+            .unwrap();
+        assert_eq!((prepared.uid, prepared.gid), (kuid(3000), kgid(4000)));
     }
 
+    /// A caller that neither owns the object nor holds CAP_SYS_ADMIN is
+    /// refused before the requested ids are translated, exactly as
+    /// `ipcctl_obtain_check()` refuses it ahead of `ipc_update_perm()`.
     #[test]
-    fn credential_caller_invalid_live_owner_ids_fail_closed() {
-        let context = root_context_with_authority(IpcAuthority {
-            control_override: true,
-            chown_override: true,
-            ..IpcAuthority::NONE
-        });
-        let mut object = perm(0, 0, 0o600);
-        object.uid = u32::MAX;
+    fn credential_caller_without_control_is_refused_before_translation() {
+        let context = root_context_with_authority(IpcAuthority::NONE);
+        let object = perm(2000, 200, 0o600);
         let request = IpcPermissionUpdateRequest {
-            uid: kuid(0),
-            gid: kgid(0),
+            uid: kuid(3000),
+            gid: kgid(200),
             mode: 0o600,
         };
         assert!(matches!(
             context.prepare_permission_update(&object, request),
-            Err(AxError::BadState)
+            Err(AxError::OperationNotPermitted)
+        ));
+    }
+
+    /// An owner id with no mapping is refused by `make_kuid()`/
+    /// `make_kgid()`, not by `prepare_permission_update()`; the caller has to
+    /// reach `map_permission_update()` to see the EINVAL.
+    #[test]
+    fn credential_caller_unmappable_owner_ids_are_einval() {
+        let context = root_context_with_authority(IpcAuthority::NONE);
+        assert!(matches!(
+            context.map_permission_update(0, u32::MAX, 0o600),
+            Err(AxError::InvalidInput)
         ));
     }
 
@@ -814,13 +823,11 @@ mod credential_caller_tests {
         assert!(!child_over_root.authority.access_override);
         assert!(!child_over_root.authority.control_override);
         assert!(!child_over_root.authority.resource_override);
-        assert!(!child_over_root.authority.chown_override);
 
         let root_over_child = IpcAccessContext::new(root_cred, child_ns.clone());
         assert!(root_over_child.authority.access_override);
         assert!(root_over_child.authority.control_override);
         assert!(root_over_child.authority.resource_override);
-        assert!(root_over_child.authority.chown_override);
         assert!(Arc::ptr_eq(root_over_child.governing_user_ns(), &child_ns));
     }
 
