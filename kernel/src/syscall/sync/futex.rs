@@ -21,7 +21,7 @@ use crate::{
     },
     task::{
         AlarmClock, AsThread, FutexHandle, FutexKey, FutexWaitRestart, PiUnlockOutcome, PiWaiter,
-        PtraceAccessMode, RestartBlock, WaitConditionError, WaitConditionResult,
+        PtraceAccessMode, RestartBlock, Thread, WaitConditionError, WaitConditionResult,
         check_current_thread_ptrace_image_access, futex_table_for, get_visible_task,
         pi_boost_owner, pi_deboost_owner, wait_on_any_futex_if_atomic,
     },
@@ -503,18 +503,19 @@ fn validate_waitv_timeout(
     }))
 }
 
+/// `futex_parse_waitv()`'s per-descriptor validation.
+///
+/// Linux validates exactly three things here — the flag word, `__reserved` and
+/// whether `val` fits the futex size — and deliberately leaves the address to
+/// `get_futex_key()`, which runs per entry inside
+/// `futex_wait_multiple_setup()` and is where the size-doubled `FUTEX2_NUMA`
+/// alignment rule and the node-word protocol live.
 fn validate_waitv_entry(waiter: &futex_waitv) -> AxResult<()> {
     if waiter.__reserved != 0 {
         return Err(AxError::InvalidInput);
     }
     validate_futex2_flags(waiter.flags)?;
     validate_futex2_value(waiter.val)?;
-    if waiter.uaddr == 0 {
-        return Err(AxError::BadAddress);
-    }
-    if !(waiter.uaddr as *const u32).is_aligned() {
-        return Err(AxError::InvalidInput);
-    }
     Ok(())
 }
 
@@ -552,17 +553,44 @@ pub fn sys_futex_waitv(
     entries
         .try_reserve_exact(nr_futexes as usize)
         .map_err(|_| AxError::NoMemory)?;
+    // `futex_parse_waitv()` runs before any key is resolved, so a descriptor
+    // that cannot be copied or that carries a bad flag word is reported for
+    // the whole call before the first address is looked at.
     for index in 0..nr_futexes as usize {
         let waiter: futex_waitv = read_checked_array_entry(waiters_addr, index, &caller)?;
         validate_waitv_entry(&waiter)?;
-        let address = waiter.uaddr as usize;
-        // Fault in every futex word before any queue gate is acquired. This
-        // also makes a no-fault Retry below an explicit task-context retry.
-        let _ = fault_read_u32(&caller, address)?;
         entries.push(waiter);
     }
 
+    // `futex_wait_multiple_setup()` resolves a key per entry *before* it
+    // compares any value, and `get_futex_key()` is where the `FUTEX2_NUMA`
+    // protocol lives (`kernel/futex/core.c:522-567`): the futex is
+    // `futex_size()` wide and twice that for `FLAGS_NUMA` (`:522-524`), so the
+    // natural alignment rule covers eight bytes (`:530`) and `access_ok()` the
+    // same window (`:533-534`); the node word is then read (`:545-547`), the
+    // node is rejected unless it is `FUTEX_NO_NODE` or possible (`:549-550`),
+    // and `FUTEX_NO_NODE` is rewritten with the resolved node (`:556-567`).
+    // That pass is the *only* place the node protocol runs for a waitv entry:
+    // the value comparison below never touches the node word.
+    //
+    // A retry after a fault repeats `get_futex_key()` for shared entries only
+    // (`waitwake.c:461-465`).
+    let mut retry = false;
     loop {
+        for waiter in &entries {
+            let entry_flags = futex2_core_flags(waiter.flags)?;
+            if retry && entry_flags.private {
+                continue;
+            }
+            let address = waiter.uaddr as *const u32;
+            validate_futex_user_range(address, entry_flags.word_bytes())?;
+            futex_numa_node(&caller, address.addr(), entry_flags)?;
+            // Fault in every futex word before any queue gate is acquired.
+            // This also makes a no-fault Retry an explicit task-context retry.
+            let _ = fault_read_u32(&caller, address.addr())?;
+        }
+        retry = true;
+
         // Capture the process image before resolving shared futex keys. The
         // same address-space snapshot must back both key derivation and the
         // later no-fault comparison attempt; a Retry starts a fresh iteration
@@ -616,13 +644,10 @@ pub fn sys_futex_waitv(
             });
         match result {
             Ok(index) => return Ok(index as isize),
-            Err(WaitConditionError::Retry) => {
-                // `wait_on_any_futex_if_atomic` has released every queue gate and
-                // cleaned up all partial registrations before returning Retry.
-                for waiter in &entries {
-                    let _ = fault_read_u32(&caller, waiter.uaddr as usize)?;
-                }
-            }
+            // `wait_on_any_futex_if_atomic` has released every queue gate and
+            // cleaned up all partial registrations before returning Retry; the
+            // next iteration repeats the key protocol above.
+            Err(WaitConditionError::Retry) => {}
             Err(WaitConditionError::Fault(error)) => return Err(error),
         }
     }
@@ -924,6 +949,18 @@ fn futex_cas_at(
     })
 }
 
+/// Resolves a TID read out of a futex word to the kernel-wide TID used by task
+/// lookup, mirroring `find_get_task_by_vpid()`: a word names its task the way
+/// `gettid()` does ([`Thread::pid_vnr`]), so the namespace translation has to
+/// run before the task table is consulted. A TID that names no task in the
+/// caller's PID namespace is `-ESRCH`.
+fn futex_word_task_tid(thread: &Thread, word_tid: u32) -> AxResult<u32> {
+    thread
+        .pid_ns()
+        .resolve_visible_pid(word_tid)
+        .ok_or(AxError::NoSuchProcess)
+}
+
 /// `FUTEX_LOCK_PI`, `FUTEX_LOCK_PI2` and `FUTEX_TRYLOCK_PI`.
 ///
 /// Linux v7.2.3, `kernel/futex/pi.c`:
@@ -953,7 +990,7 @@ fn do_futex_lock_pi(
 ) -> AxResult<isize> {
     let address = uaddr.addr();
     let self_task = current();
-    let tid = self_task.as_thread().tid();
+    let tid = self_task.as_thread().pid_vnr();
     // `futex_lock_pi()` clamps the deadline to "now" once, so the retry loop
     // below can never extend a timeout that has already elapsed.
     let deadline = deadline.map(|deadline| FutexWaitDeadline {
@@ -991,9 +1028,17 @@ fn do_futex_lock_pi(
             || {
                 // Under the queue gate: re-read the word, then take it over or
                 // publish FUTEX_WAITERS and attach to the live owner.
+                //
+                // `futex_lock_pi()` passes `set_waiters = 0`
+                // (`kernel/futex/pi.c`: `futex_lock_pi_atomic(uaddr, hb,
+                // &q.key, &q.pi_state, current, &exiting, 0)`), so an
+                // uncontended takeover publishes exactly
+                // `(uval & FUTEX_OWNER_DIED) | vpid` and leaves FUTEX_WAITERS
+                // clear until a waiter actually queues. Only
+                // `futex_proxy_trylock_atomic()` asks for the bit.
                 let current_word =
                     nofault_u32_read(address, &caller_aspace, namespace, expected_key.as_ref())?;
-                match plan_pi_acquire(PiWord::decode(current_word), tid, !trylock) {
+                match plan_pi_acquire(PiWord::decode(current_word), tid, false) {
                     PiAcquire::Deadlock => {
                         decided = Some(Err(LinuxError::EDEADLK.into()));
                         Ok(None)
@@ -1046,7 +1091,7 @@ fn do_futex_lock_pi(
                 // `-ESRCH`; a task that is already leaving is `-EAGAIN`, which
                 // is the errno Linux surfaces when the exit-time fixup has not
                 // published `FUTEX_OWNER_DIED` yet.
-                let owner_tid = pi_state.owner_tid();
+                let owner_tid = futex_word_task_tid(self_task.as_thread(), pi_state.owner_tid())?;
                 match crate::task::get_visible_task_including_exiting(owner_tid) {
                     Err(_) => return Err(AxError::NoSuchProcess),
                     Ok(task) if task.as_thread().pending_exit() => {
@@ -1059,7 +1104,7 @@ fn do_futex_lock_pi(
             },
         );
 
-        match result {
+        match result.result {
             Ok(false) => {
                 if let Some(decided) = decided {
                     return decided;
@@ -1128,7 +1173,7 @@ fn do_futex_unlock_pi(
     private: bool,
 ) -> AxResult<isize> {
     let address = uaddr.addr();
-    let tid = current().as_thread().tid();
+    let tid = current().as_thread().pid_vnr();
 
     loop {
         let (key, namespace) = futex_key_from(address, private, &caller_aspace);
@@ -1235,7 +1280,7 @@ fn do_futex_wait_requeue_pi(
     if source == target {
         return Err(AxError::InvalidInput);
     }
-    let tid = current().as_thread().tid();
+    let tid = current().as_thread().pid_vnr();
 
     // `futex_wait_requeue_pi()` resolves and validates `uaddr2` for writing
     // before it validates `*uaddr`, so an inaccessible target is EFAULT even
@@ -1265,7 +1310,7 @@ fn do_futex_wait_requeue_pi(
         let target_pi_state = target_futex.pi_state();
         target_pi_state.attach(target_word.tid);
 
-        let result = source_futex.wq.wait_pi(
+        let outcome = source_futex.wq.wait_pi(
             source_futex.waiter_owner(),
             u32::MAX,
             deadline.map(|deadline| (deadline.clock, deadline.deadline)),
@@ -1287,7 +1332,7 @@ fn do_futex_wait_requeue_pi(
             },
         );
 
-        match result {
+        match outcome.result {
             Ok(false) => {
                 // The publication condition always either waits or fails, so
                 // this is a lost race with the target's unlock.
@@ -1311,6 +1356,16 @@ fn do_futex_wait_requeue_pi(
                     let _ = fault_read_u32(caller, target)?;
                 }
                 let _ = &target_expected;
+            }
+            // `futex_wait_requeue_pi()`'s `Q_REQUEUE_PI_DONE` case: the waiter
+            // was already moved onto the target's rt_mutex, so
+            // `rt_mutex_wait_proxy_lock()`'s `-EINTR` is reported as
+            // `-EWOULDBLOCK` instead of being restarted -- restarting would
+            // re-read `*uaddr` and refuse the wait
+            // (`kernel/futex/requeue.c:895-902`).
+            Err(WaitConditionError::Fault(AxError::Interrupted)) if outcome.requeued => {
+                let _ = fault_read_u32(caller, source)?;
+                return Err(AxError::WouldBlock);
             }
             Err(WaitConditionError::Fault(error)) => return Err(error),
         }
@@ -1368,7 +1423,7 @@ fn do_futex_cmp_requeue_pi(
         return Err(AxError::InvalidInput);
     }
     let nr_requeue = usize::try_from(nr_requeue).map_err(|_| AxError::InvalidInput)?;
-    let tid = current().as_thread().tid();
+    let tid = current().as_thread().pid_vnr();
 
     validate_futex_word_read(uaddr2, size_of::<u32>(), caller)?;
     let observed_source = fault_read_u32(caller, source)?;

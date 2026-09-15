@@ -331,6 +331,29 @@ pub enum PiUnlockOutcome {
     Aborted,
 }
 
+/// Outcome of a priority-inheritance wait.
+///
+/// Linux tells the two interruptions of `FUTEX_WAIT_REQUEUE_PI` apart by the
+/// waiter's `futex_q::requeue_state`. A signal that arrives while the waiter is
+/// still enqueued on `uaddr` (`Q_REQUEUE_PI_IGNORE`) makes
+/// `handle_early_requeue_pi_wakeup()` return `-ERESTARTNOINTR`
+/// (`kernel/futex/requeue.c:741-742`); a signal that arrives after
+/// `FUTEX_CMP_REQUEUE_PI` moved the waiter onto the target's rt_mutex
+/// (`Q_REQUEUE_PI_DONE`) leaves `rt_mutex_wait_proxy_lock()` reporting
+/// `-EINTR`, which `futex_wait_requeue_pi()` rewrites to `-EWOULDBLOCK`
+/// (`kernel/futex/requeue.c:895-902`). `requeued` carries that distinction out
+/// of the wait queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PiWaitOutcome {
+    /// `Ok(true)` when the waiter was woken, `Ok(false)` when the registration
+    /// condition declined to wait, and `Err` when the wait ended in a fault,
+    /// timeout, or signal.
+    pub result: WaitConditionResult<bool>,
+    /// This waiter was moved onto another queue by `pi_requeue()` before the
+    /// wait ended (Linux `Q_REQUEUE_PI_DONE`).
+    pub requeued: bool,
+}
+
 /// Priority-inheritance payload of one queued waiter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PiWaiter {
@@ -420,6 +443,10 @@ impl PiState {
     /// A miss is not cached: the owner may not have been created yet when a
     /// `FUTEX_LOCK_PI` published `FUTEX_WAITERS` against a stale word, and
     /// Linux's `attach_to_pi_owner()` retries the lookup on the blocking path.
+    ///
+    /// `owner_tid` is the TID the user word holds, which is rendered in the
+    /// caller's PID namespace, so the kernel-wide identity is resolved through
+    /// `find_get_task_by_vpid()`'s namespace translation first.
     pub fn resolve_owner(&self) -> Option<AxTaskRef> {
         let (tid, cached) = {
             let inner = self.inner.lock();
@@ -434,7 +461,8 @@ impl PiState {
         if let Some(task) = cached {
             return Some(task);
         }
-        let task = crate::task::get_visible_task(tid).ok()?;
+        let global_tid = current().as_thread().pid_ns().resolve_visible_pid(tid)?;
+        let task = crate::task::get_visible_task(global_tid).ok()?;
         self.inner.lock().owner = Some(Arc::downgrade(&task));
         Some(task)
     }
@@ -518,6 +546,12 @@ struct WaiterEntry {
     /// `FUTEX_LOCK_PI`/`FUTEX_WAIT_REQUEUE_PI`; it carries the `rt_mutex_waiter`
     /// half of Linux's `struct futex_q` (`kernel/futex/pi.c`).
     pi: Option<PiWaiter>,
+    /// Linux `futex_q::requeue_state == Q_REQUEUE_PI_DONE`: a
+    /// `FUTEX_CMP_REQUEUE_PI` moved this waiter from the source queue onto the
+    /// target's queue, so it now blocks on the target's rt_mutex. Set and read
+    /// under this entry's lock, which is the same lock `pi_requeue()` holds
+    /// while it moves the node.
+    requeued_pi: bool,
 }
 
 impl WaiterQueue {
@@ -631,6 +665,13 @@ impl WaitRegistration {
     /// longer move this waiter, so queue cleanup needs only the captured owner
     /// rather than an unbounded owner-chasing retry loop.
     fn resolve_terminal(&mut self) -> WaitTerminalOwnership {
+        self.resolve_terminal_requeued().0
+    }
+
+    /// Resolves the waiter and additionally reports whether a
+    /// `FUTEX_CMP_REQUEUE_PI` had already moved it onto the target's queue
+    /// (Linux `Q_REQUEUE_PI_DONE`).
+    fn resolve_terminal_requeued(&mut self) -> (WaitTerminalOwnership, bool) {
         let waiter = self.waiter.take().expect("live futex registration");
         resolve_waiter_terminal(waiter)
     }
@@ -741,21 +782,24 @@ fn clear_waiter_proc_state(task: &WeakAxTaskRef) {
     }
 }
 
-fn resolve_waiter_terminal(waiter: Arc<SpinNoIrq<WaiterEntry>>) -> WaitTerminalOwnership {
+fn resolve_waiter_terminal(
+    waiter: Arc<SpinNoIrq<WaiterEntry>>,
+) -> (WaitTerminalOwnership, bool) {
     // Mark the waiter as cancelled first so a concurrent wake either already
     // owns completion or observes cancellation and does not count this waiter.
     // Requeue tests `cancelled` while holding the same waiter lock, so the
     // captured owner cannot change after this point.
-    let (owner, task, was_pi) = {
+    let (owner, task, was_pi, requeued) = {
         let mut waiter = waiter.lock();
         if waiter.awakened {
-            return WaitTerminalOwnership::Woken;
+            return (WaitTerminalOwnership::Woken, waiter.requeued_pi);
         }
         waiter.cancelled = true;
         (
             waiter.owner.clone(),
             waiter.task.clone(),
             waiter.pi.is_some(),
+            waiter.requeued_pi,
         )
     };
     // Upgrade/drop the task reference only after the waiter SpinNoIrq lock
@@ -795,17 +839,19 @@ fn resolve_waiter_terminal(waiter: Arc<SpinNoIrq<WaiterEntry>>) -> WaitTerminalO
     drop(owner_entry);
     owner.cleanup_if_idle();
 
-    WaitTerminalOwnership::Cancelled
+    (WaitTerminalOwnership::Cancelled, requeued)
 }
 
 fn resolve_single_wait(
     registration: &mut WaitRegistration,
     result: AxResult<bool>,
-) -> AxResult<bool> {
-    match registration.resolve_terminal() {
+) -> (AxResult<bool>, bool) {
+    let (ownership, requeued) = registration.resolve_terminal_requeued();
+    let result = match ownership {
         WaitTerminalOwnership::Woken => Ok(true),
         WaitTerminalOwnership::Cancelled => result,
-    }
+    };
+    (result, requeued)
 }
 
 fn resolve_wait_any(
@@ -1023,6 +1069,7 @@ impl WaitQueue {
             waker: None,
             next: None,
             pi,
+            requeued_pi: false,
         }))
         .map_err(|_| WaitConditionError::Fault(AxError::NoMemory))?;
         let registration_waiter = waiter.clone();
@@ -1078,12 +1125,14 @@ impl WaitQueue {
     /// Blocks the current task on a futex queue until the waiter is woken.
     ///
     /// Shared by the plain and the priority-inheritance wait paths; the
-    /// registration has already been published under the queue gate.
+    /// registration has already been published under the queue gate. The second
+    /// element of the result reports whether the waiter had been moved onto
+    /// another queue by `pi_requeue()`.
     fn block_registered(
         &self,
         registration: &mut WaitRegistration,
         timeout: Option<(AlarmClock, Duration)>,
-    ) -> WaitConditionResult<bool> {
+    ) -> (WaitConditionResult<bool>, bool) {
         let wait = WaitFuture {
             waiter: registration
                 .waiter
@@ -1094,8 +1143,8 @@ impl WaitQueue {
             Some((clock, deadline)) => match prepare_clock_sleep(clock, deadline) {
                 Ok(sleeper) => Some(sleeper),
                 Err(error) => {
-                    return resolve_single_wait(registration, Err(error))
-                        .map_err(WaitConditionError::Fault);
+                    let (result, requeued) = resolve_single_wait(registration, Err(error));
+                    return (result.map_err(WaitConditionError::Fault), requeued);
                 }
             },
             None => None,
@@ -1121,7 +1170,8 @@ impl WaitQueue {
             Ok(result) => result,
             Err(error) => Err(AxError::from(error)),
         };
-        resolve_single_wait(registration, result).map_err(WaitConditionError::Fault)
+        let (result, requeued) = resolve_single_wait(registration, result);
+        (result.map_err(WaitConditionError::Fault), requeued)
     }
 
     /// Waits if the given condition is met.
@@ -1148,7 +1198,7 @@ impl WaitQueue {
         else {
             return Ok(false);
         };
-        self.block_registered(&mut registration, timeout)
+        self.block_registered(&mut registration, timeout).0
     }
 
     /// Publishes a priority-inheritance waiter and blocks.
@@ -1174,7 +1224,7 @@ impl WaitQueue {
         timeout: Option<(AlarmClock, Duration)>,
         condition: C,
         on_queued: A,
-    ) -> WaitConditionResult<bool>
+    ) -> PiWaitOutcome
     where
         C: FnOnce() -> WaitConditionResult<Option<PiWaiter>>,
         A: FnOnce(&PiWaiter) -> AxResult<()>,
@@ -1185,17 +1235,33 @@ impl WaitQueue {
                 let decided = condition()?;
                 published = decided;
                 Ok(decided.is_some())
-            })?;
-        let Some(mut registration) = registration else {
-            return Ok(false);
+            });
+        let mut registration = match registration {
+            Ok(Some(registration)) => registration,
+            Ok(None) => {
+                return PiWaitOutcome {
+                    result: Ok(false),
+                    requeued: false,
+                };
+            }
+            Err(error) => {
+                return PiWaitOutcome {
+                    result: Err(error),
+                    requeued: false,
+                };
+            }
         };
         if let Some(pi) = published.as_ref()
             && let Err(error) = on_queued(pi)
         {
             let _ = registration.resolve_terminal();
-            return Err(WaitConditionError::Fault(error));
+            return PiWaitOutcome {
+                result: Err(WaitConditionError::Fault(error)),
+                requeued: false,
+            };
         }
-        self.block_registered(&mut registration, timeout)
+        let (result, requeued) = self.block_registered(&mut registration, timeout);
+        PiWaitOutcome { result, requeued }
     }
 
     /// The highest-priority live PI waiter, mirroring `rt_mutex_top_waiter()`.
@@ -1363,6 +1429,10 @@ impl WaitQueue {
                 let mut entry = waiter.lock();
                 if !entry.cancelled && entry.pi.is_some() && moved < nr_requeue {
                     entry.owner = target_owner.clone();
+                    // Linux `futex_requeue_pi_complete(this, 0)`: the waiter is
+                    // queued on the target's rt_mutex, which
+                    // `futex_wait_requeue_pi()` reports as `Q_REQUEUE_PI_DONE`.
+                    entry.requeued_pi = true;
                     moved += 1;
                     drop(entry);
                     dst.push_back(waiter);
@@ -1680,6 +1750,7 @@ fn wait_on_any_futex_inner(
             waker: None,
             next: None,
             pi: None,
+            requeued_pi: false,
         }))
         .map_err(|_| WaitConditionError::Fault(AxError::NoMemory))?;
         waiters_refs.push(waiter);
@@ -2255,7 +2326,7 @@ mod tests {
         assert_eq!(wake_first.wq.wake(1, u32::MAX), 1);
         assert_eq!(
             resolve_single_wait(&mut registration, Err(AxError::Interrupted)),
-            Ok(true)
+            (Ok(true), false)
         );
         assert!(wake_first.wq.is_empty());
 
@@ -2263,7 +2334,7 @@ mod tests {
         let mut registration = register_test_waiter(&error_first);
         assert_eq!(
             resolve_single_wait(&mut registration, Err(AxError::TimedOut)),
-            Err(AxError::TimedOut)
+            (Err(AxError::TimedOut), false)
         );
         assert_eq!(error_first.wq.wake(1, u32::MAX), 0);
         assert!(error_first.wq.is_empty());
@@ -2280,14 +2351,14 @@ mod tests {
         assert_eq!(dst.wq.wake(1, u32::MAX), 1);
         assert_eq!(
             resolve_single_wait(&mut registration, Err(AxError::Interrupted)),
-            Ok(true)
+            (Ok(true), false)
         );
 
         let mut registration = register_test_waiter(&src);
         assert_eq!(src.wq.requeue(1, &dst.wq, owner(&dst)), 1);
         assert_eq!(
             resolve_single_wait(&mut registration, Err(AxError::TimedOut)),
-            Err(AxError::TimedOut)
+            (Err(AxError::TimedOut), false)
         );
         assert_eq!(dst.wq.wake(1, u32::MAX), 0);
         assert!(src.wq.is_empty());
@@ -2494,6 +2565,7 @@ mod tests {
                 waker: None,
                 next: None,
                 pi: None,
+                requeued_pi: false,
             })));
 
         assert_eq!(src.wq.requeue(1, &dst.wq, owner(&dst)), 0);
@@ -2519,6 +2591,7 @@ mod tests {
                 waker: None,
                 next: None,
                 pi: None,
+                requeued_pi: false,
             })));
 
         assert_eq!(src.wq.wake(1, u32::MAX), 0);
@@ -2540,6 +2613,7 @@ mod tests {
             waker: None,
             next: None,
             pi: None,
+            requeued_pi: false,
         }));
 
         // Keep this typed owner while the queue transfers its clone into a
@@ -2551,7 +2625,7 @@ mod tests {
 
         assert_eq!(
             resolve_waiter_terminal(waiter.clone()),
-            WaitTerminalOwnership::Cancelled
+            (WaitTerminalOwnership::Cancelled, false)
         );
 
         // Cancellation is the sole unlinker: DeferredWaiters reconstructs
@@ -2582,6 +2656,7 @@ mod tests {
                     waker: None,
                     next: None,
                     pi: None,
+                    requeued_pi: false,
                 })));
         }
 

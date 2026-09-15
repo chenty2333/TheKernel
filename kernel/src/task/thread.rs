@@ -2354,6 +2354,30 @@ impl Thread {
         self.visible_tid.load(Ordering::Acquire)
     }
 
+    /// Linux `task_pid_vnr()`: the TID this task is known by in the caller's
+    /// PID namespace, which is the number `gettid()` returns.
+    ///
+    /// `kernel/futex/pi.c` publishes exactly this rendering in the user word
+    /// (`vpid = task_pid_vnr(current)`), and `kernel/pid.c` resolves a null
+    /// namespace to the caller's:
+    ///
+    /// ```c
+    /// pid_t __task_pid_nr_ns(struct task_struct *task, enum pid_type type,
+    /// 			struct pid_namespace *ns)
+    /// {
+    /// 	...
+    /// 	if (!ns)
+    /// 		ns = task_active_pid_ns(current);
+    /// ```
+    ///
+    /// Any kernel value userspace compares against `gettid()` — a futex word's
+    /// owner, a robust-list owner — therefore holds this TID, and a lookup of
+    /// such a TID runs `PidNamespace::resolve_visible_pid()` first, the way
+    /// `find_get_task_by_vpid()` does.
+    pub(crate) fn pid_vnr(&self) -> Pid {
+        self.pid_ns().visible_pid(self.tid())
+    }
+
     /// Whether this task currently owns the Linux-visible thread-group ID.
     ///
     /// Scheduler task IDs are an internal allocation detail and can differ
