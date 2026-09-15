@@ -771,6 +771,11 @@ pub trait FileLike: Pollable + DowncastSync {
     /// A filesystem anchor is intentionally independent of ordinary I/O
     /// permission.  syncfs accepts an O_PATH fd when its object belongs to a
     /// mounted filesystem, while anonymous and special descriptors have none.
+    ///
+    /// `None` does not make syncfs fail: such objects have no dirty data and
+    /// no backing store, which is exactly the pseudo-superblock (pipefs,
+    /// sockfs, pidfs, anon_inodefs) that Linux resolves from the descriptor
+    /// and syncs as a no-op.
     fn syncfs_filesystem(&self) -> Option<Filesystem> {
         None
     }
