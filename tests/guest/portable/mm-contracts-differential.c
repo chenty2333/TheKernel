@@ -32,6 +32,16 @@ struct cap_data { uint32_t effective, permitted, inheritable; };
 #ifndef MAP_DROPPABLE
 #define MAP_DROPPABLE 0x08
 #endif
+/* include/uapi/linux/mman.h:16-18 and arch/x86/include/uapi/asm/mman.h. */
+#ifndef MAP_SHARED_VALIDATE
+#define MAP_SHARED_VALIDATE 0x03
+#endif
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+#ifndef MAP_EXECUTABLE
+#define MAP_EXECUTABLE 0x1000
+#endif
 #ifndef MAP_HUGETLB
 #define MAP_HUGETLB 0x040000
 #endif
@@ -738,6 +748,38 @@ static void mmap_extra_case(void) {
     }
     expect_child_errno(pid, 0, "mmap-locked-privileged-zero-limit");
     mark("LOCKED_LIMIT_ERRNOS");
+
+    /* `mm/mmap.c:do_mmap()` dispatches on `flags & MAP_TYPE` once per branch,
+       and the branch depends on whether a file is behind the mapping.  With no
+       file the switch has no MAP_SHARED_VALIDATE case, so it reaches
+       `default: return -EINVAL` whatever the rest of the word says
+       (`mm/mmap.c:505-543`); with a file the whole word is checked against
+       `LEGACY_MAP_MASK` and anything outside it is -EOPNOTSUPP
+       (`mm/mmap.c:425-476`).  MAP_FIXED_NOREPLACE, MAP_SYNC and MAP_DROPPABLE
+       are the bits outside that mask, while MAP_EXECUTABLE is inside it even
+       though the kernel ignores it. */
+    ERROR(mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
+               MAP_SHARED_VALIDATE | MAP_ANONYMOUS, -1, 0),
+          EINVAL, "mmap-shared-validate-anonymous");
+    int validate_fd = (int)syscall(NR_MEMFD_CREATE, "thekernel-mmap-validate", 0);
+    check(validate_fd >= 0, "mmap-shared-validate-memfd");
+    check(ftruncate(validate_fd, PAGE) == 0, "mmap-shared-validate-memfd-size");
+    /* A free address keeps the MAP_FIXED_NOREPLACE EEXIST test out of the way:
+       `do_mmap()` runs it before the MAP_TYPE dispatch (`mm/mmap.c:412-415`). */
+    void *validate_hint = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(validate_hint != MAP_FAILED, "mmap-shared-validate-hint");
+    check(munmap(validate_hint, PAGE) == 0, "mmap-shared-validate-hint-free");
+    ERROR(mmap(validate_hint, PAGE, PROT_READ,
+               MAP_SHARED_VALIDATE | MAP_FIXED_NOREPLACE, validate_fd, 0),
+          EOPNOTSUPP, "mmap-shared-validate-fixed-noreplace");
+    unsigned char *legacy =
+        mmap(NULL, PAGE, PROT_READ, MAP_SHARED_VALIDATE | MAP_EXECUTABLE, validate_fd, 0);
+    check(legacy != MAP_FAILED, "mmap-shared-validate-legacy-bit");
+    check(munmap(legacy, PAGE) == 0, "mmap-shared-validate-legacy-bit-cleanup");
+    check(close(validate_fd) == 0, "mmap-shared-validate-close");
+    mark("SHARED_VALIDATE_FLAG_MASK");
+
     done();
 }
 
