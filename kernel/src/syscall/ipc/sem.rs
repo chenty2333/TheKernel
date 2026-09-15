@@ -1172,12 +1172,19 @@ fn try_apply_single_semop(
 
     let sem = &mut array.sems[index];
     let value = sem.value as i32;
+    let plan = plan_sem_op(abi_sem_buf(&op));
     match op.sem_op {
         delta if delta > 0 => {
             let new_value = value + delta as i32;
             if new_value > SEMVMX as i32 {
                 return Err(AxError::from(LinuxError::ERANGE));
             }
+            // Linux `perform_atomic_semop()` validates the semaphore value and
+            // the deferred adjustment in the same pass and commits only after
+            // the whole vector is valid, so a rejected adjustment leaves the
+            // semaphore untouched.  A would-block result returns before this
+            // check on both kernels.
+            undo.check(plan, op.sem_num, op.sem_op)?;
             sem.value = new_value as u16;
         }
         delta if delta < 0 => {
@@ -1190,6 +1197,7 @@ fn try_apply_single_semop(
                     nowait: op_has_nowait_flag(op.sem_flg),
                 });
             }
+            undo.check(plan, op.sem_num, op.sem_op)?;
             sem.value = (value - amount) as u16;
         }
         _ => {
@@ -1201,9 +1209,9 @@ fn try_apply_single_semop(
                     nowait: op_has_nowait_flag(op.sem_flg),
                 });
             }
+            undo.check(plan, op.sem_num, op.sem_op)?;
         }
     }
-    undo.check(plan_sem_op(abi_sem_buf(&op)), op.sem_num, op.sem_op)?;
 
     sem.pid = pid;
     array.semid_ds.sem_otime = ipc_time_secs();
@@ -1583,6 +1591,45 @@ mod setall_snapshot_tests {
 
     /// Regression: the array table used to be keyed by the published
     /// identifier with nothing validating the sequence.
+    /// Linux `perform_atomic_semop()` validates the deferred adjustment in the
+    /// same pass as the semaphore value and commits only once the whole vector
+    /// is valid: a rejected adjustment must leave the value unchanged, which
+    /// the single-operation fast path used to violate.
+    #[test]
+    fn rejected_undo_adjustment_leaves_a_single_operation_unapplied() {
+        let _context = crate::test_support::scheduler_test_context();
+        let semid = ipcid_compose(2, 0);
+        let mut array = SemArray::new(semid, 1, 1, 0o600, 0, 0);
+        array.sems[0].value = 1;
+        let serial = array.serial;
+        let generation = array.sems[0].undo_generation;
+
+        let mut undo = SemUndo::new();
+        // `-SEMAEM - 1` is the lowest legal adjustment; two increments reach it
+        // exactly, so a third increment is out of range.
+        undo.record(semid, 0, SEMVMX as i16, generation, serial)
+            .unwrap();
+        undo.record(semid, 0, 1, generation, serial).unwrap();
+        assert_eq!(undo.prior(semid, serial, 0), -(SEMAEM as i32) - 1);
+
+        let ops = [Sembuf {
+            sem_num: 0,
+            sem_op: 1,
+            sem_flg: SEM_UNDO,
+        }];
+        let mut check = SemUndoCheck {
+            undo: Some(&undo),
+            semid,
+            serial,
+            staged: Vec::new(),
+        };
+        assert!(matches!(
+            try_apply_semops(&mut array, &ops, 0, &mut check),
+            Err(_)
+        ));
+        assert_eq!(array.sems[0].value, 1);
+    }
+
     /// The bound `semop` applies to the whole vector before it checks
     /// permission: the highest semaphore number, not the first one.
     #[test]
