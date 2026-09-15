@@ -27,6 +27,8 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <linux/capability.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -54,6 +56,10 @@ enum {
     /* An unknown `sem_flg` bit, plus the two defined ones. */
     SEM_FLAG_UNKNOWN = 0x2000,
 };
+
+/* A key used by only one case, so the probe can never observe another case's
+ * object. */
+#define KEY_SEMGET_BOUNDS 0x5eed0001
 
 #define BAD ((void *)(uintptr_t)1)
 /*
@@ -127,6 +133,77 @@ static void reap_child(pid_t child, const char *stage) {
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         fprintf(stderr, "THEKERNEL_SYSVIPC_CHILD %s status=%d exit=%d\n", stage,
                 status, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        fail(stage);
+    }
+}
+
+/*
+ * Reads a `/proc/sys` file into `buf`, which is NUL-terminated, and returns
+ * its length or -1.  Every whitespace run in the result is collapsed to a
+ * single space so a kernel that separates columns with tabs compares equal to
+ * one that uses spaces.
+ */
+static long read_sysctl(const char *path, char *buf, size_t size) {
+    int fd = open(path, O_RDONLY);
+    long total = 0;
+    if (fd < 0) {
+        return -1;
+    }
+    while (total < (long)size - 1) {
+        ssize_t got = read(fd, buf + total, (size_t)((long)size - 1 - total));
+        if (got < 0) {
+            int saved = errno;
+            close(fd);
+            errno = saved;
+            return -1;
+        }
+        if (got == 0) {
+            break;
+        }
+        total += got;
+    }
+    close(fd);
+    buf[total] = '\0';
+    char *read_ptr = buf;
+    char *write_ptr = buf;
+    int pending = 0;
+    while (*read_ptr != '\0') {
+        if (*read_ptr == ' ' || *read_ptr == '\t' || *read_ptr == '\n' ||
+            *read_ptr == '\r') {
+            pending = write_ptr != buf;
+        } else {
+            if (pending) {
+                *write_ptr++ = ' ';
+            }
+            pending = 0;
+            *write_ptr++ = *read_ptr;
+        }
+        read_ptr++;
+    }
+    *write_ptr = '\0';
+    return (long)(write_ptr - buf);
+}
+
+/* Writes `value` to a `/proc/sys` file; -1 with errno on failure. */
+static int write_sysctl(const char *path, const char *value) {
+    int fd = open(path, O_WRONLY);
+    ssize_t written;
+    int saved;
+    if (fd < 0) {
+        return -1;
+    }
+    written = write(fd, value, strlen(value));
+    saved = errno;
+    close(fd);
+    errno = saved;
+    return written == (ssize_t)strlen(value) ? 0 : -1;
+}
+
+/* Requires a `/proc/sys` write to fail with exactly `expected`. */
+static void errno_sysctl(const char *path, const char *value, int expected,
+                         const char *stage) {
+    errno = 0;
+    if (write_sysctl(path, value) != -1 || errno != expected) {
         fail(stage);
     }
 }
@@ -1096,7 +1173,308 @@ static void case_sem_undo_unshare(void) {
     done();
 }
 
+/*
+ * Case: sysvipc-limits.namespace-isolation
+ *
+ * Every SysV ceiling is a member of `struct ipc_namespace` published through
+ * that namespace's own sysctl table:
+ *
+ * 	struct ipc_namespace {
+ * 		int		sem_ctls[4];
+ * 		int		msg_ctlmax, msg_ctlmnb, msg_ctlmni;
+ * 		unsigned long	shm_ctlmax, shm_ctlall;
+ * 		int		shm_ctlmni;
+ * 	};
+ *
+ * (`include/linux/ipc_namespace.h`), copied into the new namespace by
+ * `copy_ipcs()` and rewritten to point at it by `setup_ipc_sysctls()`
+ * (`ipc/ipc_sysctl.c:236-282`).  A write in one namespace therefore cannot be
+ * observed in another, and each namespace starts from the compiled defaults:
+ * `SEMMSL 32000`, `SEMMNS (SEMMNI * SEMMSL)`, `SEMOPM 500`, `SEMMNI 32000`
+ * (`include/uapi/linux/sem.h:80-85`, `ipc/sem.c:249-256`), `MSGMNI 32000`
+ * (`include/uapi/linux/msg.h:64`, `ipc/msg.c:86`), `SHMMNI 4096`
+ * (`include/uapi/linux/shm.h:22`, `ipc/shm.c:114`) and `SHMMAX`/`SHMALL` at
+ * `ULONG_MAX - (1UL << 24)` (`include/uapi/linux/shm.h:19-21`,
+ * `ipc/shm.c:112-113`).
+ *
+ * The child asks for each namespace-local effect and exits with a distinct
+ * status per step: a zero ceiling refuses new objects with ENOSPC
+ * (`ipc/util.c:287-288`, `ipc/sem.c:542`), and a value above `ipc_mni` is
+ * refused by the sysctl handler itself - EINVAL for the count ceiling, ERANGE
+ * for the semaphore tuple (`ipc/ipc_sysctl.c:117-124`, `:262-279`,
+ * `ipc/util.h:248-255`).  The parent then proves that none of it leaked.
+ *
+ * The child also walks the size arithmetic that the default ceiling normally
+ * keeps out of reach: `newseg()` computes `(size + PAGE_SIZE - 1) >> PAGE_SHIFT`
+ * in `size_t`, so a size within one page of `ULONG_MAX` wraps, and the
+ * `numpages << PAGE_SHIFT < size` comparison that follows answers ENOSPC
+ * (`ipc/shm.c:712-721`).  Raising `shmmax` to `ULONG_MAX` is what admits the
+ * size, so the write happens in the child's own namespace.
+ */
+static void case_limit_namespaces(void) {
+    char buf[128];
+    pid_t child;
+    int msqid;
+
+    begin("sysvipc-limits.namespace-isolation");
+
+    check(read_sysctl("/proc/sys/kernel/sem", buf, sizeof buf) > 0, "read-sem");
+    check(strcmp(buf, "32000 1024000000 500 32000") == 0, "sem-ceilings");
+    check(read_sysctl("/proc/sys/kernel/msgmni", buf, sizeof buf) > 0, "read-msgmni");
+    check(strcmp(buf, "32000") == 0, "msgmni-ceiling");
+    check(read_sysctl("/proc/sys/kernel/shmmni", buf, sizeof buf) > 0, "read-shmmni");
+    check(strcmp(buf, "4096") == 0, "shmmni-ceiling");
+    check(read_sysctl("/proc/sys/kernel/shmmax", buf, sizeof buf) > 0, "read-shmmax");
+    check(strtoull(buf, NULL, 10) == (unsigned long long)ULONG_MAX - (1ULL << 24),
+          "shmmax-ceiling");
+    check(read_sysctl("/proc/sys/kernel/shmall", buf, sizeof buf) > 0, "read-shmall");
+    check(strtoull(buf, NULL, 10) == (unsigned long long)ULONG_MAX - (1ULL << 24),
+          "shmall-ceiling");
+    mark("CEILING_DEFAULTS_MATCH_UAPI");
+
+    child = fork();
+    check(child >= 0, "fork");
+    if (child == 0) {
+        /* A private IPC namespace carries its own copy of every ceiling. */
+        if (unshare(CLONE_NEWIPC) != 0)
+            _exit(11);
+        if (write_sysctl("/proc/sys/kernel/msgmni", "0") != 0)
+            _exit(12);
+        errno = 0;
+        if (msgget(IPC_PRIVATE, IPC_CREAT | 0600) != -1 || errno != ENOSPC)
+            _exit(13);
+        if (write_sysctl("/proc/sys/kernel/sem", "32000 1024000000 500 0") != 0)
+            _exit(14);
+        errno = 0;
+        if (semget(IPC_PRIVATE, 1, IPC_CREAT | 0600) != -1 || errno != ENOSPC)
+            _exit(15);
+        /* `msgmni` is clamped to `ipc_mni` (32768) by the sysctl handler. */
+        errno_sysctl("/proc/sys/kernel/msgmni", "32769", EINVAL, "msgmni-above-ipc-mni");
+        /* `semmni` is range-checked separately from the parsed tuple. */
+        errno_sysctl("/proc/sys/kernel/sem", "32000 1024000000 500 32769", ERANGE,
+                     "semmni-above-ipc-mni");
+        /* The written ceiling is the one `ipc_addid()` enforces. */
+        if (write_sysctl("/proc/sys/kernel/msgmni", "1") != 0)
+            _exit(18);
+        if (msgget(IPC_PRIVATE, IPC_CREAT | 0600) < 0)
+            _exit(19);
+        errno = 0;
+        if (msgget(IPC_PRIVATE, IPC_CREAT | 0600) != -1 || errno != ENOSPC)
+            _exit(20);
+        /* `size + PAGE_SIZE - 1` is computed in `size_t`, so a size within a
+         * page of ULONG_MAX wraps to a small page count; `newseg()` compares
+         * the shift back and answers ENOSPC.  The default ceiling is what
+         * normally keeps the region unreachable, so the probe raises it
+         * first and restores it before leaving. */
+        if (write_sysctl("/proc/sys/kernel/shmmax", "18446744073709551615") != 0)
+            _exit(21);
+        errno = 0;
+        if (shmget(IPC_PRIVATE, (size_t)-1, IPC_CREAT | 0600) != -1 || errno != ENOSPC)
+            _exit(22);
+        if (write_sysctl("/proc/sys/kernel/shmmax", "18446744073709534399") != 0)
+            _exit(23);
+        _exit(0);
+    }
+    reap_child(child, "namespace-child");
+
+    /* Nothing the child did is visible here. */
+    check(read_sysctl("/proc/sys/kernel/msgmni", buf, sizeof buf) > 0, "recheck-msgmni");
+    check(strcmp(buf, "32000") == 0, "parent-msgmni-unchanged");
+    check(read_sysctl("/proc/sys/kernel/sem", buf, sizeof buf) > 0, "recheck-sem");
+    check(strcmp(buf, "32000 1024000000 500 32000") == 0, "parent-sem-unchanged");
+    errno = 0;
+    msqid = (int)ok_call(msgget(IPC_PRIVATE, IPC_CREAT | 0600), "parent-msgget");
+    ok_call(msgctl(msqid, IPC_RMID, NULL), "parent-msgctl-rmid");
+    mark("CEILINGS_ARE_IPC_NAMESPACE_LOCAL");
+    mark("ZERO_CEILING_REFUSES_CREATION");
+    mark("CEILING_WRITE_RANGE_ERRORS");
+    mark("WRAPPED_SIZE_IS_ENOSPC");
+
+    done();
+}
+
+/*
+ * Case: sysvipc-semget-bounds.nsems-before-key
+ *
+ * `ksys_semget()` range-checks `nsems` against the namespace's `semmsl`
+ * *before* `ipcget()` looks at the key, so an over-large request is EINVAL
+ * even when the key names nothing at all:
+ *
+ * 	if (nsems < 0 || nsems > ns->sem_ctls[0])
+ * 		return -EINVAL;
+ * 	...
+ * 	err = ipcget(ns, NULL, &sem_ids(ns), &sem_ops, &sem_params);
+ *
+ * (`ipc/sem.c:614-621`).  The check also runs ahead of the `IPC_EXCL` answer,
+ * because `ipcget_public()` is only reached afterwards - an over-large
+ * `nsems` with `IPC_CREAT | IPC_EXCL` on a live key is EINVAL, not EEXIST
+ * (`ipc/util.c:397-433`).  Zero is the "existing set" spelling that
+ * `ipcget_public()` accepts for a live key, while `newary()` rejects it for a
+ * new one (`ipc/sem.c:484-487`).
+ */
+static void case_semget_nsems_bounds(void) {
+    int semid;
+
+    begin("sysvipc-semget-bounds.nsems-before-key");
+
+    /* The key names nothing. */
+    errno = 0;
+    errno_call(semget(KEY_SEMGET_BOUNDS, 40000, 0), EINVAL, "oversize-absent");
+    errno = 0;
+    errno_call(semget(KEY_SEMGET_BOUNDS, 40000, IPC_CREAT), EINVAL, "oversize-create");
+    semid = (int)ok_call(semget(KEY_SEMGET_BOUNDS, 1, IPC_CREAT | 0600), "create-one");
+    /* The key names a live one-semaphore set. */
+    errno = 0;
+    errno_call(semget(KEY_SEMGET_BOUNDS, 40000, IPC_CREAT | IPC_EXCL), EINVAL,
+               "oversize-exclusive");
+    errno = 0;
+    errno_call(semget(KEY_SEMGET_BOUNDS, 40000, 0), EINVAL, "oversize-existing");
+    errno = 0;
+    check(semget(KEY_SEMGET_BOUNDS, 0, 0) == semid, "zero-existing");
+    mark("OVERSIZE_NSEMS_EINVAL_BEFORE_KEY_LOOKUP");
+    mark("ZERO_NSEMS_ACCEPTED_FOR_LIVE_KEY");
+    ok_call(semctl(semid, 0, IPC_RMID, NULL), "semctl-rmid");
+
+    /* A brand-new set has no `sem_nsems` to inherit, so zero is invalid. */
+    errno = 0;
+    errno_call(semget(IPC_PRIVATE, 0, IPC_CREAT | 0600), EINVAL, "zero-new");
+    mark("ZERO_NSEMS_EINVAL_FOR_NEW_SET");
+
+    done();
+}
+
+/*
+ * Case: sysvipc-task-pid.nested-pid-namespace
+ *
+ * `msg_lspid`, `msg_lrpid`, `shm_cpid`, `shm_lpid` and the per-semaphore
+ * `sempid` store a `task_tgid()` and are rendered with `pid_vnr()` on the way
+ * out, so a reader in a nested PID namespace sees its own numbering:
+ *
+ * 	ipc_update_pid(&msq->q_lspid, task_tgid(current));      - ipc/msg.c:574
+ * 	ipc_update_pid(&msq->q_lrpid, task_tgid(current));      - ipc/msg.c:1103
+ * 	ipc_update_pid(&sma->sems[semnum].sempid, task_tgid(current));
+ * 	...
+ * 	err = pid_vnr(...);                                     - ipc/sem.c:1548
+ *
+ * (`ipc/msg.c:574-575`, `:1100-1104`, `ipc/sem.c:1526-1530`, `:1548-1550`;
+ * `pid_vnr()` is `task_pid_nr_ns(pid, task_active_pid_ns(current))`,
+ * `include/linux/pid.h`).  The grandchild below is PID 1 of the namespace it
+ * is born into, so every one of those fields has a single correct rendering.
+ */
+static void case_task_pid_rendering(void) {
+    int msqid;
+    int semid;
+    pid_t child;
+
+    begin("sysvipc-task-pid.nested-pid-namespace");
+
+    msqid = (int)ok_call(msgget(IPC_PRIVATE, IPC_CREAT | 0600), "msgget");
+    semid = (int)ok_call(semget(IPC_PRIVATE, 1, IPC_CREAT | 0600), "semget");
+    ok_call(semctl(semid, 0, SETVAL, 7), "setval");
+
+    child = fork();
+    check(child >= 0, "fork");
+    if (child == 0) {
+        pid_t grandchild;
+        int grand_status = 0;
+        /* Only children born after the unshare join the new namespace. */
+        if (unshare(CLONE_NEWPID) != 0)
+            _exit(21);
+        grandchild = fork();
+        if (grandchild < 0)
+            _exit(22);
+        if (grandchild == 0) {
+            struct {
+                long mtype;
+                char mtext[8];
+            } msg;
+            struct msqid_ds mds;
+            struct sembuf op;
+            if (getpid() != 1)
+                _exit(23);
+            msg.mtype = 1;
+            memcpy(msg.mtext, "pid", 4);
+            if (msgsnd(msqid, &msg, 4, 0) != 0)
+                _exit(24);
+            memset(&mds, 0, sizeof mds);
+            if (msgctl(msqid, IPC_STAT, &mds) != 0)
+                _exit(25);
+            if (mds.msg_lspid != getpid())
+                _exit(26);
+            if (msgrcv(msqid, &msg, sizeof msg.mtext, 0, 0) != 4)
+                _exit(27);
+            memset(&mds, 0, sizeof mds);
+            if (msgctl(msqid, IPC_STAT, &mds) != 0)
+                _exit(28);
+            if (mds.msg_lrpid != getpid())
+                _exit(29);
+            op.sem_num = 0;
+            op.sem_op = -1;
+            op.sem_flg = 0;
+            if (semop(semid, &op, 1) != 0)
+                _exit(30);
+            if (semctl(semid, 0, GETPID) != getpid())
+                _exit(31);
+            _exit(0);
+        }
+        if (waitpid(grandchild, &grand_status, 0) != grandchild)
+            _exit(32);
+        _exit(WIFEXITED(grand_status) ? WEXITSTATUS(grand_status) : 33);
+    }
+    reap_child(child, "nested-pid-child");
+    mark("MSG_LSPID_RENDERS_PID_VNR");
+    mark("MSG_LRPID_RENDERS_PID_VNR");
+    mark("SEM_GETPID_RENDERS_PID_VNR");
+
+    ok_call(msgctl(msqid, IPC_RMID, NULL), "msgctl-rmid");
+    ok_call(semctl(semid, 0, IPC_RMID, NULL), "semctl-rmid");
+    done();
+}
+
+/*
+ * Case: sysvipc-shmat-range.address-limit
+ *
+ * `do_shmat()` applies only the alignment rule itself; the requested range is
+ * handed to `do_mmap()`, whose `mmap_region()` bound check reports ENOMEM:
+ *
+ * 	if (addr & (shmlba - 1)) { ... goto out; }             - EINVAL
+ * 	addr = do_mmap(file, addr, size, prot, flags, ...);
+ * 	...
+ * 	if (addr > TASK_SIZE - len)
+ * 		return -ENOMEM;
+ * 	if (offset_in_page(addr))
+ * 		return -EINVAL;
+ *
+ * (`ipc/shm.c:1541-1560`, `:1655`, `mm/mmap.c:858-860`).  An address above
+ * `TASK_SIZE` is therefore ENOMEM once it is aligned - a distinct errno from
+ * the misaligned case, which never reaches the mapping layer.
+ */
+static void case_shmat_address_range(void) {
+    int shmid;
+
+    begin("sysvipc-shmat-range.address-limit");
+
+    shmid = (int)ok_call(shmget(IPC_PRIVATE, PAGE_BYTES, IPC_CREAT | 0600), "shmget");
+
+    /* TASK_SIZE is 0x00007fffffffffff on x86_64, so 2^47 is past it. */
+    errno = 0;
+    errno_call((long)shmat(shmid, (void *)(uintptr_t)0x800000000001ULL, 0), EINVAL,
+               "misaligned");
+    errno = 0;
+    errno_call((long)shmat(shmid, (void *)(uintptr_t)0x800000000000ULL, 0), ENOMEM,
+               "above-task-size");
+    mark("MISALIGNED_ADDRESS_EINVAL");
+    mark("ALIGNED_ADDRESS_ABOVE_TASK_SIZE_ENOMEM");
+
+    ok_call(shmctl(shmid, IPC_RMID, NULL), "shmctl-rmid");
+    done();
+}
+
 int main(void) {
+    case_limit_namespaces();
+    case_semget_nsems_bounds();
+    case_task_pid_rendering();
+    case_shmat_address_range();
     case_identifier_progression();
     case_stat_index_resolution();
     case_info_max_index();
