@@ -85,6 +85,16 @@
 #define MS_NOUSER (1UL << 31)
 #define MNT_FORCE 1
 #define MNT_DETACH 2
+/* Native x86_64 UAPI.  The mount and sched headers are deliberately not
+ * included: they redefine every MS_ and MNT_ constant this file pins to the
+ * kernel's own numbers, and -Werror rejects the collision. */
+#define CLONE_NEWNS 0x00020000 /**< include/uapi/linux/sched.h */
+#ifndef MS_REC
+#define MS_REC 16384UL
+#endif
+#ifndef MS_PRIVATE
+#define MS_PRIVATE (1UL << 18)
+#endif
 #define MNT_EXPIRE 4
 /* include/uapi/linux/mount.h: UMOUNT_NOFOLLOW.  glibc before 2.34 omits it. */
 #ifndef UMOUNT_NOFOLLOW
@@ -790,12 +800,45 @@ int main(void) {
          * a guest that answers 0 marks the same assertion as a guest that does
          * not, but THEKERNEL_FS_ABI_DETACH_ROOT below says which.  Remove the
          * tolerance once the nullfs root lands.
+         *
+         * The probe is destructive wherever it succeeds, and a mount namespace
+         * is shared by every process that did not unshare one -- so the answer
+         * is collected in a child that first unshares its own namespace.
+         * Without that, a guest that really detaches "/" also detaches /proc,
+         * /sys and /dev from under every later program in the run: on the
+         * Linux 7.2.3 oracle the clock and time programs then read
+         * /proc/uptime and /proc/self/timens_offsets as ENOENT.
+         *
+         * The child's exit status carries the verdict: 0 detached, 1 EINVAL,
+         * 2 anything else, 3 the namespace could not be isolated.
          */
-        errno = 0;
-        long detach_root = syscall(SYS_umount2, "/", MNT_DETACH);
-        check((detach_root == 0) || (detach_root == -1 && errno == EINVAL),
-              "detach-root");
-        mark("DETACH_NAMESPACE_ROOT_EINVAL");
+        int detach_answer = 3;
+        pid_t detach_child = fork();
+        if (detach_child == 0) {
+            if (syscall(SYS_unshare, CLONE_NEWNS) != 0) {
+                _exit(3);
+            }
+            /* Detaching must not propagate back out of the copy. */
+            syscall(SYS_mount, NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+            errno = 0;
+            long detached = syscall(SYS_umount2, "/", MNT_DETACH);
+            _exit(detached == 0 ? 0 : (errno == EINVAL ? 1 : 2));
+        }
+        if (detach_child > 0) {
+            int detach_status = 0;
+            if (waitpid(detach_child, &detach_status, 0) == detach_child &&
+                WIFEXITED(detach_status)) {
+                detach_answer = WEXITSTATUS(detach_status);
+            }
+        }
+        if (detach_answer == 3) {
+            /* No namespace to isolate the probe in; skip it rather than make
+             * an assertion whose side effects cannot be contained. */
+            mark("DETACH_NAMESPACE_ROOT_SKIPPED");
+        } else {
+            check(detach_answer == 0 || detach_answer == 1, "detach-root");
+            mark("DETACH_NAMESPACE_ROOT_EINVAL");
+        }
         errno = 0;
         check(syscall(SYS_umount2, "/nonexistent-thekernel-fs-abi", 0) == -1 &&
               errno == ENOENT, "valid-flags-missing-path");
