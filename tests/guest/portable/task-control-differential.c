@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/statfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -410,6 +411,32 @@ static void move_pages_case(void) {
     ERROR(syscall(NR_MOVE_PAGES, getpid(), 0, (void *)0, (void *)0, (void *)0, ~0UL),
           EINVAL, "invalid-flags");
     mark("EMPTY_REQUEST_AND_FLAGS");
+
+    /* A null `nodes` array selects `do_pages_stat()`, which fills one status
+     * per page.  `do_pages_stat_array()` separates the two ways a page can
+     * have no node (mm/migrate.c:2447-2481): `vma_lookup()` finding no VMA
+     * leaves the status at -EFAULT, while a VMA whose folio
+     * `folio_walk_start()` cannot resolve sets -ENOENT.  A PROT_NONE mapping
+     * and a page that has never been faulted in both take the second path,
+     * and a faulted page reports its node. */
+    long page = sysconf(_SC_PAGESIZE);
+    char *region = mmap((void *)0, (size_t)page * 4, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(region != MAP_FAILED, "stat-mmap");
+    char *touched = region + page;
+    char *protnone = region + page * 2;
+    touched[0] = 1;
+    check(mprotect(protnone, (size_t)page, PROT_NONE) == 0, "stat-mprotect");
+    check(munmap(region + page * 3, (size_t)page) == 0, "stat-munmap");
+    void *pages[4] = { region, touched, protnone, region + page * 3 };
+    int stats[4] = { 12345, 12345, 12345, 12345 };
+    check(syscall(NR_MOVE_PAGES, getpid(), 4, pages, (void *)0, stats, 0) == 0,
+          "stat-request");
+    check(stats[0] == -ENOENT, "stat-untouched-enoent");
+    check(stats[1] >= 0, "stat-touched-reports-node");
+    check(stats[2] == -ENOENT, "stat-prot-none-enoent");
+    check(stats[3] == -EFAULT, "stat-hole-efault");
+    mark("STAT_NODE_VERDICTS");
     done();
 }
 

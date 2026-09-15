@@ -71,10 +71,10 @@ pub use mempolicy::{
     MPOL_F_MEMS_ALLOWED, MPOL_F_NODE, MPOL_F_NUMA_BALANCING, MPOL_F_RELATIVE_NODES,
     MPOL_F_STATIC_NODES, MPOL_INTERLEAVE, MPOL_LOCAL, MPOL_MAX, MPOL_MF_MOVE, MPOL_MF_MOVE_ALL,
     MPOL_MF_STRICT, MPOL_MF_VALID, MPOL_MODE_FLAGS, MPOL_PREFERRED, MPOL_PREFERRED_MANY,
-    MPOL_USER_NODEMASK_FLAGS, MPOL_WEIGHTED_INTERLEAVE, MbindPlan, MempolicyError,
-    MempolicyRequest, NR_NODE_IDS, effective_policy, next_interleave_node, parse_node_mask,
-    plan_mbind, reported_policy, sanitize_mode_flags, scanned_words, stores_user_nodemask, validate,
-    validate_get,
+    MPOL_USER_NODEMASK_FLAGS, MPOL_WEIGHTED_INTERLEAVE, EffectiveMempolicy, MbindPlan,
+    MempolicyError, MempolicyRequest, NR_NODE_IDS, effective_policy, next_interleave_node,
+    parse_node_mask, plan_mbind, rejects_scanned_word, reported_policy, sanitize_mode_flags,
+    scanned_words, stores_user_nodemask, validate, validate_get,
 };
 pub use mincore::MincorePlan;
 pub use mmap::{

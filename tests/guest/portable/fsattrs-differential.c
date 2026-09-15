@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/xattr.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
@@ -29,6 +30,7 @@ static void cleanup(void) {
     if (dfd >= 0) {
         (void)unlinkat(dfd, "file", 0);
         (void)unlinkat(dfd, "fifo", 0);
+        (void)unlinkat(dfd, "link", 0);
         (void)close(dfd);
     }
     (void)rmdir(dir);
@@ -192,6 +194,73 @@ int main(void) {
     mark("ERRORS_PRESERVE_STATE");
     check(fa(NR_FSET, fd, "", &initial, 24, AT_EMPTY_PATH) == 0, "restore");
     same_attr(fd, &initial); mark("RESTORE"); done();
+
+    /* The legacy xattr syscalls -- setxattr(2), lsetxattr(2), fsetxattr(2)
+     * and their get/list/remove counterparts (fs/xattr.c) -- share one
+     * implementation with the *xattrat family above, but they take a pathname
+     * rather than a dirfd/AT_EMPTY_PATH pair, so their resolution, permission
+     * and namespace rules need their own records.  `xattr_permission()`
+     * refuses the user.* namespace on anything that is neither a regular file
+     * nor a directory (fs/xattr.c:129-140), which covers both the FIFO and a
+     * symlink reached through the no-follow variants. */
+    begin("xattr-classic.raw-differential");
+    {
+        char file_path[256], fifo_path[256], link_path[256];
+        char buf[128];
+        const char *key = "user.thekernel.classic";
+        snprintf(file_path, sizeof(file_path), "%s/file", dir);
+        snprintf(fifo_path, sizeof(fifo_path), "%s/fifo", dir);
+        snprintf(link_path, sizeof(link_path), "%s/link", dir);
+        check(symlink("file", link_path) == 0, "symlink");
+
+        check(setxattr(file_path, key, "one", 4, 0) == 0, "set");
+        /* A zero length is the size query, not an empty value. */
+        check(getxattr(file_path, key, buf, 0) == 4, "get-size-query");
+        ERROR(getxattr(file_path, key, buf, 3), ERANGE, "get-short-erange");
+        check(getxattr(file_path, key, buf, sizeof(buf)) == 4, "get");
+        check(memcmp(buf, "one", 4) == 0, "get-value");
+
+        ERROR(getxattr(file_path, "user.thekernel.absent", buf, sizeof(buf)),
+              ENODATA, "get-absent-enodata");
+        ERROR(setxattr(file_path, key, "two", 4, XATTR_CREATE), EEXIST, "create-existing");
+        ERROR(setxattr(file_path, "user.thekernel.absent", "two", 4, XATTR_REPLACE),
+              ENODATA, "replace-absent");
+        ERROR(setxattr(file_path, key, "two", 4, 8), EINVAL, "unknown-flag-bit");
+        mark("SET_GET_CREATE_REPLACE_RULES");
+
+        /* The descriptor variants address the same inode. */
+        check(fsetxattr(fd, key, "two", 4, 0) == 0, "fset");
+        check(fgetxattr(fd, key, buf, sizeof(buf)) == 4, "fget");
+        check(memcmp(buf, "two", 4) == 0, "fget-value");
+        check(flistxattr(fd, buf, sizeof(buf)) > 0, "flist");
+        check(memchr(buf, 0, sizeof(buf)) != NULL, "flist-terminated");
+
+        ssize_t listed = listxattr(file_path, buf, sizeof(buf));
+        check(listed > 0, "list");
+        check(memchr(buf, 0, (size_t)listed) != NULL, "list-terminated");
+        ERROR(listxattr(file_path, buf, 1), ERANGE, "list-short-erange");
+        mark("FD_AND_PATH_VARIANTS_AGREE");
+
+        check(removexattr(file_path, key) == 0, "remove");
+        ERROR(getxattr(file_path, key, buf, sizeof(buf)), ENODATA, "get-after-remove");
+        ERROR(fremovexattr(fd, key), ENODATA, "fremove-after-remove");
+        check(listxattr(file_path, buf, 0) == 0, "list-empty-is-zero");
+        mark("REMOVE_AND_EMPTY_LIST");
+
+        /* user.* is refused on a FIFO and on a symlink reached without
+         * following it, in both directions. */
+        ERROR(setxattr(fifo_path, key, "v", 2, 0), EPERM, "fifo-set-eprem");
+        ERROR(lsetxattr(link_path, key, "v", 2, 0), EPERM, "symlink-lset-eprem");
+        ERROR(lgetxattr(link_path, key, buf, sizeof(buf)), ENODATA, "symlink-lget-enodata");
+        /* The following variant reaches the regular file behind the link. */
+        check(setxattr(link_path, key, "via-link", 8, 0) == 0, "following-set");
+        check(getxattr(link_path, key, buf, sizeof(buf)) == 8, "following-get");
+        mark("FIFO_AND_SYMLINK_NAMESPACE_RULES");
+
+        check(removexattr(file_path, key) == 0, "final-remove");
+        check(unlinkat(dfd, "link", 0) == 0, "unlink-link");
+    }
+    done();
 
     begin("open-tree-attr.raw-differential");
     struct mattr mount = { .set = 1 }; /* MOUNT_ATTR_RDONLY */

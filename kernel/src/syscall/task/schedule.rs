@@ -2196,7 +2196,6 @@ fn setpriority_one(
 /// `getpriority(2)` would report.
 fn setpriority_one_zombie(
     result: &mut AxResult<()>,
-    actor_task: &AxTaskRef,
     actor_cred: &Arc<Cred>,
     process: &Arc<Process>,
     new_nice: i8,
@@ -2204,16 +2203,15 @@ fn setpriority_one_zombie(
     let attempt = (|| -> AxResult<()> {
         let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
         let current_nice = zombie_scheduler_state(process)?.nice;
-        // Known divergence, reported rather than hidden: `can_nice()` reads
-        // `task_rlimit(p, RLIMIT_NICE)` from the *target*, and Linux can still
-        // read it here because `p->signal` outlives the exit. TheKernel retires
-        // the target's `ProcessData` (the sole owner of `rlim`) when the last
-        // thread exits and the zombie payload does not retain
-        // `signal_struct.rlim`, so this path can only consult the caller's
-        // limit. Retaining it would require a new field on the durable zombie
-        // payload (`ZombieSnapshot`/`GroupLeaderSignalOwner`) kept current by
-        // `prlimit64`.
-        let rlimit_nice = actor_task.as_thread().proc_data.rlim.read()[RLIMIT_NICE].current;
+        // `set_one_prio()` authorizes with `can_nice(p, niceval)`
+        // (`kernel/sys.c:243`), i.e. `is_nice_reduction(p, nice) ||
+        // capable(CAP_SYS_NICE)` (`kernel/sched/syscalls.c:105-121`), and the
+        // reduction test reads `task_rlimit(p, RLIMIT_NICE)` from the
+        // *target*'s `signal_struct` (`include/linux/sched/signal.h:758-762`).
+        // That `signal_struct` outlives `do_exit()` until `release_task()`, so
+        // an unreaped zombie is judged by the limits it retained, never by the
+        // caller's.
+        let rlimit_nice = crate::task::zombie_rlimit(process, RLIMIT_NICE)?;
         SchedulerAuthoritySnapshot::new(actor_cred.clone(), snapshot.credential.clone())
             .authorize(SchedulerSecurityOperation::SetNice {
                 current_nice,
@@ -2267,7 +2265,7 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
                     setpriority_one(&mut result, &actor_task, &actor_cred, task, new_nice);
                 } else if let Some(process) = zombie_target_for_setpriority(who as Pid, &caller_pid_ns)
                 {
-                    setpriority_one_zombie(&mut result, &actor_task, &actor_cred, &process, new_nice);
+                    setpriority_one_zombie(&mut result, &actor_cred, &process, new_nice);
                 } else {
                     return Err(AxError::NoSuchProcess);
                 }
@@ -2309,13 +2307,7 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
                 // `thread_group` until `release_task()` runs, so it is still a
                 // valid `set_one_prio()` target.
                 if process.is_zombie() {
-                    setpriority_one_zombie(
-                        &mut result,
-                        &actor_task,
-                        &actor_cred,
-                        &process,
-                        new_nice,
-                    );
+                    setpriority_one_zombie(&mut result, &actor_cred, &process, new_nice);
                     continue;
                 }
                 for tid in process.thread_ids() {
@@ -2345,13 +2337,7 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
                             .zombie_payload()
                             .is_some_and(|snapshot| snapshot.credential.ids().ruid == uid)
                     {
-                        setpriority_one_zombie(
-                            &mut result,
-                            &actor_task,
-                            &actor_cred,
-                            &process,
-                            new_nice,
-                        );
+                        setpriority_one_zombie(&mut result, &actor_cred, &process, new_nice);
                     }
                     continue;
                 }

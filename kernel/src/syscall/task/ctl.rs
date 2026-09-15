@@ -212,6 +212,12 @@ fn get_mempolicy_error(error: GetMempolicyError) -> AxError {
 /// reads, so an unreadable word is `EFAULT` and never a silent zero. `maxnode`
 /// is the caller's count of mask bits; only the words Linux would read are
 /// copied, which bounds this to 513 words without trusting `maxnode`.
+///
+/// The words are read from the top of the window down, and a non-zero word
+/// above `MAX_NUMNODES` is rejected as soon as it is read: `get_nodes()` never
+/// reads a lower word once the in-loop `if (t) return -EINVAL;` fires, so a set
+/// bit above `MAX_NUMNODES` outranks an unreadable low word rather than losing
+/// to its `EFAULT`.
 fn read_nodemask<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     nodemask: *const usize,
@@ -233,11 +239,15 @@ fn read_nodemask<M: UserMemory + ?Sized>(
 
     let mut buffer = [0usize; tk_linux_mm::MAX_NODEMASK_BITS / usize::BITS as usize + 1];
     let window = &mut buffer[..words];
-    for (index, slot) in window.iter_mut().enumerate() {
-        *slot = nodemask
+    for index in (0..words).rev() {
+        let word = nodemask
             .wrapping_add(index)
             .vm_read(memory)
             .map_err(map_usercopy_error)?;
+        window[index] = word;
+        if tk_linux_mm::rejects_scanned_word(index, word) {
+            return Err(mempolicy_error(MempolicyError::NodeOutOfRange));
+        }
     }
     tk_linux_mm::parse_node_mask(maxnode, window, supplied)
         .map(|(mask, _)| mask)
@@ -937,10 +947,16 @@ pub fn sys_unshare(flags: usize) -> AxResult<isize> {
             let private_sem_undo = if let Some(ipc_ns) = private_ipc_ns.as_ref() {
                 Some(crate::task::SemUndoState::try_new(ipc_ns.clone())?)
             } else if flags & CLONE_SYSVSEM != 0 {
-                Some(crate::task::SemUndoState::try_clone_for(
-                    thread.ipc_ns(),
-                    &thread.sem_undo(),
-                )?)
+                // `unshare(CLONE_SYSVSEM)` is equivalent to `sys_exit()` for
+                // the undo list (`kernel/fork.c:3280-3284`): `exit_sem()`
+                // detaches the caller, applies the pending adjustments only
+                // if the caller was the last owner of the list
+                // (`ipc/sem.c:2333-2345`), and leaves the caller with no list
+                // at all, so the next `semop()` starts an empty one.  Cloning
+                // the adjustments here would apply them twice: once when
+                // `retire_sem_undo()` sees the retired state drop to its last
+                // reference, and again when the clone reaches final exit.
+                Some(crate::task::SemUndoState::try_new(thread.ipc_ns())?)
             } else {
                 None
             };
@@ -1513,6 +1529,45 @@ fn numa_page_node(target: &ProcessData, page: usize) -> AxResult<i32> {
     Ok(mempolicy_page_node(policy, start.as_usize()))
 }
 
+/// `do_pages_stat_array()`'s per-page verdict (`mm/migrate.c:2447-2481`).
+///
+/// The two ways a page can have no node are distinct, and the difference is
+/// visible to the caller:
+///
+/// 	vma = vma_lookup(mm, addr);
+/// 	if (!vma)
+/// 		goto set_status;          /* err stays -EFAULT */
+///
+/// 	folio = folio_walk_start(&fw, vma, addr, FW_ZEROPAGE);
+/// 	if (folio) {
+/// 		...
+/// 	} else {
+/// 		err = -ENOENT;
+/// 	}
+///
+/// So a hole is `-EFAULT`, while a page inside a VMA whose folio the walk
+/// cannot resolve is `-ENOENT` -- which is what a `PROT_NONE` mapping and a
+/// mapping whose page has never been faulted in both report.  Only the stat
+/// path uses this: `do_pages_move()` turns every failure of
+/// `add_page_for_migration()` into `-EFAULT` (`mm/migrate.c:2398-2401`).
+fn numa_page_stat_status(target: &ProcessData, page: usize) -> i32 {
+    let start = VirtAddr::from(page).align_down_4k();
+    let aspace_handle = target.aspace();
+    let aspace = aspace_handle.lock();
+    if aspace.find_area(start).is_none() {
+        return -LinuxError::EFAULT.code();
+    }
+    if !aspace.can_access_range(start, 1, MappingFlags::USER)
+        || aspace.page_table().query(start).is_err()
+    {
+        return -LinuxError::ENOENT.code();
+    }
+    let policy = target
+        .mempolicy_for_addr(start.as_usize())
+        .unwrap_or_else(|| target.mempolicy());
+    mempolicy_page_node(policy, start.as_usize())
+}
+
 fn numa_page_is_shareable(target: &ProcessData, page: usize) -> bool {
     let start = VirtAddr::from(page).align_down_4k();
     let aspace_handle = target.aspace();
@@ -1794,8 +1849,9 @@ pub fn sys_get_mempolicy<M: UserMemory + ?Sized>(
 
     if flags & tk_linux_mm::MPOL_F_NODE != 0 {
         let node = if flags & tk_linux_mm::MPOL_F_ADDR != 0 {
-            // Linux resolves the *page's* node with `lookup_node()`, which
-            // faults the address in; a hole is EFAULT.
+            // `lookup_node()` resolves the *page's* node, and it resolves it
+            // with `get_user_pages_fast()`, which faults the page in first.
+            fault_in_mempolicy_page(memory, addr)?;
             numa_page_node(proc_data, addr)? as i32
         } else {
             // Without MPOL_F_ADDR this is the next interleave node, and Linux
@@ -1829,6 +1885,36 @@ pub fn sys_get_mempolicy<M: UserMemory + ?Sized>(
         mempolicy_reported_nodemask(selected),
     )?;
     Ok(0)
+}
+
+/// The read half of Linux's `lookup_node()`.
+///
+/// ```c
+/// ret = get_user_pages_fast(addr & PAGE_MASK, 1, 0, &p);
+/// if (ret > 0) {
+/// 	ret = page_to_nid(p);
+/// 	put_page(p);
+/// }
+/// ```
+///
+/// (`mm/mempolicy.c:1133-1144`). `get_user_pages_fast()` resolves the page by
+/// *faulting it in* on a read fault rather than only looking it up, so an
+/// address inside a VMA whose page is not resident yet is not an error:
+/// `lookup_node()` reports the freshly populated page's node. A hole fails
+/// earlier in `do_get_mempolicy()`'s `vma_lookup()`, and a page the caller may
+/// not read (`PROT_NONE`) fails here in both kernels. Touching one byte
+/// reproduces exactly that fault-in; the reported node itself still comes from
+/// the task's policy for the address, as it does everywhere else in this
+/// single-node kernel.
+fn fault_in_mempolicy_page<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    addr: usize,
+) -> AxResult<()> {
+    let mut probe = MaybeUninit::<u8>::uninit();
+    let start = addr & !(PAGE_SIZE_4K - 1);
+    memory
+        .read_bytes(start, core::slice::from_mut(&mut probe))
+        .map_err(map_usercopy_error)
 }
 
 /// `if (policy && put_user(pval, policy)) return -EFAULT;`
@@ -1879,12 +1965,15 @@ pub fn sys_set_mempolicy<M: UserMemory + ?Sized>(
     let nodes = read_nodemask(memory, nodemask, maxnode)?;
     let request = tk_linux_mm::validate(mode, nodes, !nodemask.is_null(), current_allowed_nodemask())
         .map_err(mempolicy_error)?;
-    let (mode, nodes) = tk_linux_mm::effective_policy(request);
-    // The stored policy keeps the sanitized mode flags and the caller's own
-    // mask, which is what `get_mempolicy(2)` reports back for a
-    // `MPOL_F_STATIC_NODES`/`MPOL_F_RELATIVE_NODES` policy.
+    let effective = tk_linux_mm::effective_policy(request);
+    // The stored policy is the one `mpol_new()` built: it keeps the sanitized
+    // mode flags and the caller's own mask — which is what `get_mempolicy(2)`
+    // reports back for a `MPOL_F_STATIC_NODES`/`MPOL_F_RELATIVE_NODES` policy —
+    // and for `MPOL_DEFAULT` it keeps none of them, because `mpol_new()`
+    // returns NULL there.
     current().as_thread().proc_data.set_mempolicy(
-        Mempolicy::new(mode, nodes).with_request_flags(request.mode_flags, request.user_nodes),
+        Mempolicy::new(effective.mode, effective.nodes)
+            .with_request_flags(effective.mode_flags, effective.user_nodemask),
     );
     Ok(0)
 }
@@ -1900,6 +1989,11 @@ pub fn sys_set_mempolicy<M: UserMemory + ?Sized>(
 /// come last: a zero-length range with a mask that names no allowed node is
 /// `0`, and `MPOL_MF_MOVE_ALL` without `CAP_SYS_NICE` is `EPERM` whatever the
 /// mask says.
+///
+/// The hole verdict is [`mbind_range_rejects_hole`]'s, and it is decided
+/// before any page is examined because `queue_pages_range()` reports a hole
+/// from its `test_walk` callback, ahead of the page scan of the VMA that
+/// callback was entered for.
 pub fn sys_mbind<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     start: usize,
@@ -1930,10 +2024,29 @@ pub fn sys_mbind<M: UserMemory + ?Sized>(
     // user-nodemask flags and the intersection with the allowed set.
     let request = tk_linux_mm::validate(mode, nodes, !nodemask.is_null(), current_allowed_nodemask())
         .map_err(mempolicy_error)?;
-    let (policy_mode, policy_nodes) = tk_linux_mm::effective_policy(request);
-    let policy = Mempolicy::new(policy_mode, policy_nodes)
-        .with_request_flags(request.mode_flags, request.user_nodes);
+    let effective = tk_linux_mm::effective_policy(request);
+    let policy = Mempolicy::new(effective.mode, effective.nodes)
+        .with_request_flags(effective.mode_flags, effective.user_nodemask);
 
+    let curr = current();
+    let proc_data = &curr.as_thread().proc_data;
+    let aspace_handle = proc_data.aspace();
+    let end = plan.start + plan.len;
+    // `do_mbind()` marks a range that only spans holes as acceptable when
+    // `mpol_new()` returned NULL, and that is `MPOL_DEFAULT` alone
+    // (`mm/mempolicy.c:1519-1528`).  The verdict comes first because
+    // `queue_pages_range()`'s `test_walk` reports the hole before the page
+    // scan of the VMA it was entered for.
+    let discontig_ok = sanitized_mode == tk_linux_mm::MPOL_DEFAULT;
+    if mbind_range_rejects_hole(&aspace_handle.lock(), plan.start, end, discontig_ok) {
+        return Err(AxError::BadAddress);
+    }
+
+    // With `ALLOWED_NODEMASK == {0}` every admitted policy's target mask
+    // contains node 0, the only node a resident page can be on, so
+    // `queue_pages_range()`'s `-EIO` for a misplaced page is unreachable and
+    // the walk's hole verdict and its page scan cannot be observed out of
+    // order.
     if plan.flags & tk_linux_mm::MPOL_MF_STRICT != 0
         && plan.flags & (tk_linux_mm::MPOL_MF_MOVE | tk_linux_mm::MPOL_MF_MOVE_ALL) == 0
     {
@@ -1944,15 +2057,60 @@ pub fn sys_mbind<M: UserMemory + ?Sized>(
     // home-node path below does: address-space topology first, then policy
     // intervals.  Revalidate while holding that order so an unmap cannot
     // leave a freshly published policy for a vanished VMA.
-    let curr = current();
-    let proc_data = &curr.as_thread().proc_data;
-    let aspace_handle = proc_data.aspace();
     let aspace = aspace_handle.lock();
-    if !aspace.can_access_range(VirtAddr::from(plan.start), plan.len, MappingFlags::USER) {
+    if mbind_range_rejects_hole(&aspace, plan.start, end, discontig_ok) {
         return Err(AxError::BadAddress);
     }
     proc_data.bind_mempolicy_range(plan.start, plan.len, policy);
     Ok(0)
+}
+
+/// `queue_pages_test_walk()` and `queue_pages_range()`'s hole verdict for the
+/// range `[start, end)`.
+///
+/// `queue_pages_test_walk()` (`mm/mempolicy.c:910-932`) walks the VMAs of the
+/// range in address order and returns `-EFAULT` for a hole at the head of the
+/// range (`qp->start < vma->vm_start` on the first VMA it visits) or after a
+/// visited VMA that does not reach `qp->end`
+/// (`vma->vm_end < qp->end && (!next || vma->vm_end < next->vm_start)`), and
+/// `queue_pages_range()` adds the same error when the walk visited no VMA at
+/// all (`if (!qp.first) err = -EFAULT;`, `mm/mempolicy.c:998-1000`).
+/// `MPOL_MF_DISCONTIG_OK` suppresses the per-VMA reports — so a range with a
+/// hole and at least one VMA is accepted for `MPOL_DEFAULT` — but never the
+/// whole-range one.
+fn mbind_range_rejects_hole(
+    aspace: &AddrSpace,
+    start: usize,
+    end: usize,
+    discontig_ok: bool,
+) -> bool {
+    let mut cursor = start;
+    let mut visited = false;
+    while cursor < end {
+        let Some(area) = aspace
+            .areas()
+            .find(|area| area.end() > VirtAddr::from(cursor))
+        else {
+            break;
+        };
+        let area_start = area.start().as_usize();
+        // The walk stops at the range end, so an area at or past it is not a
+        // VMA of this range at all.
+        if area_start >= end {
+            break;
+        }
+        // The first VMA starting after `start` is the head hole, and a later
+        // one starting after the previous VMA ended is a middle hole.
+        if !discontig_ok && area_start > cursor {
+            return true;
+        }
+        visited = true;
+        cursor = area.end().as_usize().min(end);
+    }
+    // A range no VMA covers at all is `-EFAULT` for every policy; a last VMA
+    // ending before `end` leaves the tail hole that only
+    // `MPOL_MF_DISCONTIG_OK` tolerates.
+    !visited || (!discontig_ok && cursor < end)
 }
 
 /// Linux 6.12 `set_mempolicy_home_node(2)`.
@@ -2067,25 +2225,30 @@ pub fn sys_move_pages<M: UserMemory + ?Sized>(
         for chunk_index in 0..chunk_len {
             let index = offset + chunk_index;
             let page = unsafe { page_values[chunk_index].assume_init() };
-            let status_value = match numa_page_node(&target, page) {
-                Ok(current_node) if nodes.is_null() => current_node,
-                Ok(_) => {
-                    let node = unsafe { node_values[chunk_index].assume_init() };
-                    validate_movable_node(node)?;
-                    if flags & MPOL_MF_MOVE_ALL as usize == 0
-                        && numa_page_is_shareable(&target, page)
-                    {
-                        -LinuxError::EACCES.code()
-                    } else {
-                        target.bind_mempolicy_range(
-                            VirtAddr::from(page).align_down_4k().as_usize(),
-                            4096,
-                            Mempolicy::new(MPOL_BIND as u32, 1usize << node),
-                        );
-                        node
+            let status_value = if nodes.is_null() {
+                // `do_pages_stat()` reports the node of each page; a null
+                // `nodes` array is what selects it (`mm/migrate.c:2506-2512`).
+                numa_page_stat_status(&target, page)
+            } else {
+                match numa_page_node(&target, page) {
+                    Ok(_) => {
+                        let node = unsafe { node_values[chunk_index].assume_init() };
+                        validate_movable_node(node)?;
+                        if flags & MPOL_MF_MOVE_ALL as usize == 0
+                            && numa_page_is_shareable(&target, page)
+                        {
+                            -LinuxError::EACCES.code()
+                        } else {
+                            target.bind_mempolicy_range(
+                                VirtAddr::from(page).align_down_4k().as_usize(),
+                                4096,
+                                Mempolicy::new(MPOL_BIND as u32, 1usize << node),
+                            );
+                            node
+                        }
                     }
+                    Err(_) => -LinuxError::EFAULT.code(),
                 }
-                Err(_) => -LinuxError::EFAULT.code(),
             };
             write_move_pages_status(memory, status, index, status_value)?;
         }

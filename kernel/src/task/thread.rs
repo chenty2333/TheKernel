@@ -427,8 +427,12 @@ fn link_task_parent_locked(
 /// Resolves a live exact-task reaper without retaining or destroying an
 /// `Arc` while the topology spinlock is held. Every hop is an immutable task
 /// identity, so numeric TID reuse cannot redirect the traversal.
-fn resolve_live_task_parent(
-    _publication: &TaskParentPublicationGuard<'_>,
+///
+/// `candidate` and `fallback` are the same walk publication uses; this entry
+/// point is also reached from readers that hold no publication gate, because
+/// each hop is revalidated under the topology lock and the result is only ever
+/// compared against another exact task identity.
+fn resolve_live_task_parent_chain(
     mut candidate: Option<Arc<TaskParentNode>>,
     fallback: Option<&Arc<TaskParentNode>>,
 ) -> Option<Arc<TaskParentNode>> {
@@ -468,6 +472,56 @@ fn resolve_live_task_parent(
         drop(current);
         candidate = next;
     }
+}
+
+/// Resolves a retained exact-task identity to the live task it currently names.
+///
+/// A retained identity is Linux's `p->real_parent`: the parent task may have
+/// exited while the child is still waiting to be reaped, and
+/// `forget_original_parent()`/`exit_notify()` moved the child to a live
+/// replacement before that. The dead node's `exit_reaper` hop is exactly that
+/// replacement, so following it yields the task Linux's `real_parent` would
+/// name now.
+pub(crate) fn resolve_retained_task_parent(
+    candidate: &Arc<TaskParentNode>,
+) -> Option<Arc<TaskParentNode>> {
+    resolve_live_task_parent_chain(Some(candidate.clone()), None)
+}
+
+/// The exact Linux `real_parent` a child published with `choice` must retain.
+///
+/// `copy_process()` sets `p->real_parent = current` unless `CLONE_PARENT` or
+/// `CLONE_THREAD` asked for `current->real_parent` (`kernel/fork.c:2441`,
+/// `:2504`), which are the same two identities [`TaskParentChoice`] publishes.
+pub(crate) fn real_parent_node_for_choice(
+    choice: &TaskParentChoice,
+) -> Option<Arc<TaskParentNode>> {
+    match choice {
+        TaskParentChoice::Caller(caller) => Some(caller.clone()),
+        TaskParentChoice::Inherit(caller) => {
+            let candidate = {
+                let topology = TASK_PARENT_TOPOLOGY.lock();
+                let state = caller.state.lock();
+                let candidate = if state.live {
+                    state.parent.clone()
+                } else {
+                    state.exit_reaper.clone()
+                };
+                drop(state);
+                drop(topology);
+                candidate
+            };
+            resolve_live_task_parent_chain(candidate, None)
+        }
+    }
+}
+
+fn resolve_live_task_parent(
+    _publication: &TaskParentPublicationGuard<'_>,
+    candidate: Option<Arc<TaskParentNode>>,
+    fallback: Option<&Arc<TaskParentNode>>,
+) -> Option<Arc<TaskParentNode>> {
+    resolve_live_task_parent_chain(candidate, fallback)
 }
 
 /// Publishes one private task's exact Linux real-parent relation. Node
@@ -713,20 +767,35 @@ fn reparent_task_parent_children_matching(
 fn finish_task_parent_exit(
     _publication: &TaskParentPublicationGuard<'_>,
     node: &Arc<TaskParentNode>,
+    reaper: Option<Arc<TaskParentNode>>,
 ) -> bool {
-    let topology = TASK_PARENT_TOPOLOGY.lock();
-    let mut state = node.state.lock();
-    if !state.live || state.first_child.is_some() {
+    let (replaced, retired) = {
+        let topology = TASK_PARENT_TOPOLOGY.lock();
+        let mut state = node.state.lock();
+        if !state.live || state.first_child.is_some() {
+            drop(state);
+            drop(topology);
+            return false;
+        }
+        state.live = false;
+        // A child born under this task retains it as its `real_parent`, and
+        // Linux keeps that name until the child is reaped: `forget_original_parent()`
+        // reparents every child to the selected live reaper before
+        // `release_task()` (`kernel/exit.c:684-728`). Keep the same hop on the
+        // dead node so a retained child identity still resolves to that reaper
+        // instead of to nothing.
+        let replaced = match reaper {
+            Some(reaper) => state.exit_reaper.replace(reaper),
+            None => state.exit_reaper.take(),
+        };
+        // `unlink_task_parent_locked` takes this same node's state lock, so the
+        // guard must be released first: a `SpinNoIrq` is not recursive.
         drop(state);
+        let retired = unlink_task_parent_locked(node);
         drop(topology);
-        return false;
-    }
-    state.live = false;
-    let old_exit_reaper = state.exit_reaper.take();
-    drop(state);
-    let retired = unlink_task_parent_locked(node);
-    drop(topology);
-    drop(old_exit_reaper);
+        (replaced, retired)
+    };
+    drop(replaced);
     drop(retired);
     true
 }
@@ -2518,8 +2587,9 @@ impl Thread {
     pub(crate) fn finish_task_parent_exit(
         &self,
         publication: &TaskParentPublicationGuard<'_>,
+        reaper: Option<Arc<TaskParentNode>>,
     ) -> bool {
-        finish_task_parent_exit(publication, &self.task_parent)
+        finish_task_parent_exit(publication, &self.task_parent, reaper)
     }
 
     pub(crate) fn exit_task_parent(
@@ -3314,7 +3384,7 @@ mod task_parent_tests {
             &unrelated,
             TaskParentChoice::Caller(other_parent.clone()),
         );
-        assert!(!super::finish_task_parent_exit(&publication, &parent));
+        assert!(!super::finish_task_parent_exit(&publication, &parent, None));
         let mut delivered = None;
         super::reparent_task_parent_children_matching(
             &publication,
@@ -3334,11 +3404,30 @@ mod task_parent_tests {
             &super::task_parent_node_snapshot(&publication, &unrelated).unwrap(),
             &other_parent
         ));
-        assert!(super::finish_task_parent_exit(&publication, &parent));
+        assert!(super::finish_task_parent_exit(&publication, &parent, None));
         super::exit_task_parent_relation(&publication, &child, None, None, |_, _| {});
         super::exit_task_parent_relation(&publication, &unrelated, None, None, |_, _| {});
         super::exit_task_parent_relation(&publication, &other_parent, None, None, |_, _| {});
         super::exit_task_parent_relation(&publication, &reaper, None, None, |_, _| {});
+        drop(publication);
+    }
+
+    #[test]
+    fn finished_parent_retains_the_reaper_its_children_resolve_through() {
+        let parent = node(221);
+        let reaper = node(222);
+        let publication = lock_task_parent_publication();
+        assert!(super::finish_task_parent_exit(
+            &publication,
+            &parent,
+            Some(reaper.clone())
+        ));
+        // A child's retained `real_parent` identity resolves through the dead
+        // node's hop to the live replacement, as `forget_original_parent()`
+        // installed it (kernel/exit.c:684-728).
+        let resolved = super::resolve_retained_task_parent(&parent).expect("reaper hop");
+        assert!(Arc::ptr_eq(&resolved, &reaper));
+        drop(resolved);
         drop(publication);
     }
 

@@ -244,7 +244,7 @@ pub fn parse_node_mask(
             maxnode = MAX_NUMNODES;
             t &= !mask_below(MAX_NUMNODES % usize::BITS as usize);
         }
-        if t != 0 {
+        if rejects_scanned_word(index, t) {
             return Err(MempolicyError::NodeOutOfRange);
         }
     }
@@ -266,6 +266,25 @@ const fn mask_below(bits: usize) -> usize {
     } else {
         (1usize << bits) - 1
     }
+}
+
+/// `get_nodes()`'s in-loop `if (t) return -EINVAL;` for the word just read at
+/// `index` (`mm/mempolicy.c:1673-1688`).
+///
+/// The scan reads the caller's window from its highest word down to word 0, and
+/// that order is observable: the check runs *before* the next lower word is
+/// read, so a set bit above `MAX_NUMNODES` in a high word is `EINVAL` even when
+/// a lower word of the same window is unreadable — the lower word is never
+/// read, and `EFAULT` never happens. Word 0 is the accepted mask rather than a
+/// check (`get_bitmap(nodes_addr(*nodes), nmask, maxnode)`), and the loop body
+/// only runs while `maxnode > MAX_NUMNODES`, so `index` is never 0 there.
+///
+/// `checked_value` is the value Linux tests: the raw word after the iteration's
+/// `t &= ~(...)` clamp. The clamp only masks a partial top word when
+/// `MAX_NUMNODES` is not a multiple of `BITS_PER_LONG`, which cannot happen
+/// here (`MAX_NUMNODES == BITS_PER_LONG == 64`).
+pub const fn rejects_scanned_word(index: usize, checked_value: usize) -> bool {
+    index > 0 && checked_value != 0
 }
 
 /// How many `usize` words of the user mask `get_nodes()` reads for `maxnode`.
@@ -412,21 +431,72 @@ pub fn validate(
     })
 }
 
-/// `MPOL_PREFERRED`/`MPOL_LOCAL` normalisation performed by `mpol_new()`.
+/// The policy `mpol_new()`/`mpol_set_nodemask()` actually built, which is the
+/// value Linux stores and `get_mempolicy(2)` later reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EffectiveMempolicy {
+    /// `pol->mode`.
+    pub mode: u32,
+    /// `pol->flags & MPOL_MODE_FLAGS`.
+    pub mode_flags: u32,
+    /// `pol->nodes`, the request narrowed to the allowed node set.
+    pub nodes: usize,
+    /// `pol->w.user_nodemask`, reported when `mpol_store_user_nodemask()`
+    /// holds.
+    pub user_nodemask: usize,
+}
+
+/// The `MPOL_DEFAULT`/`MPOL_PREFERRED`/`MPOL_LOCAL` normalisation performed by
+/// `mpol_new()`.
 ///
 /// Linux rewrites an empty `MPOL_PREFERRED` into `MPOL_LOCAL`, and
 /// `mpol_new_preferred()` narrows a preferred list to its first node. Both are
 /// observable through `get_mempolicy(2)`, so the kernel stores the result of
 /// this function rather than the raw request.
-pub const fn effective_policy(request: MempolicyRequest) -> (u32, usize) {
+///
+/// `MPOL_DEFAULT` is the third case, and the reason the whole policy is
+/// returned rather than only its mode: `mpol_new()` returns `NULL` for it
+/// (`mm/mempolicy.c:446-450`, *not* a policy with default fields), so
+/// `do_set_mempolicy()` stores no policy at all (`mm/mempolicy.c:1091-1092`)
+/// and `do_get_mempolicy()` reports `&default_policy`, whose `flags` are zero
+/// (`mm/mempolicy.c:1186-1187`, `mm/mempolicy.c:1219-1225`). The caller's mode
+/// flags are therefore *dropped*:
+/// `set_mempolicy(MPOL_DEFAULT | MPOL_F_STATIC_NODES, NULL, 0)` succeeds and
+/// the following `get_mempolicy(2)` reports a plain `MPOL_DEFAULT`. The mask is
+/// already empty for this mode, because `mpol_new()` rejects a non-empty node
+/// list with `-EINVAL`.
+pub const fn effective_policy(request: MempolicyRequest) -> EffectiveMempolicy {
+    if request.mode == MPOL_DEFAULT {
+        return EffectiveMempolicy {
+            mode: MPOL_DEFAULT,
+            mode_flags: 0,
+            nodes: 0,
+            user_nodemask: 0,
+        };
+    }
     if request.mode == MPOL_PREFERRED {
         if !request.has_nodes || request.nodes == 0 {
-            return (MPOL_LOCAL, 0);
+            return EffectiveMempolicy {
+                mode: MPOL_LOCAL,
+                mode_flags: request.mode_flags,
+                nodes: 0,
+                user_nodemask: request.user_nodes,
+            };
         }
         // `first_node()` is the lowest set bit.
-        return (MPOL_PREFERRED, request.nodes & request.nodes.wrapping_neg());
+        return EffectiveMempolicy {
+            mode: MPOL_PREFERRED,
+            mode_flags: request.mode_flags,
+            nodes: request.nodes & request.nodes.wrapping_neg(),
+            user_nodemask: request.user_nodes,
+        };
     }
-    (request.mode, request.nodes)
+    EffectiveMempolicy {
+        mode: request.mode,
+        mode_flags: request.mode_flags,
+        nodes: request.nodes,
+        user_nodemask: request.user_nodes,
+    }
 }
 
 /// `mpol_store_user_nodemask()`: whether `get_mempolicy(2)` reports the
@@ -699,7 +769,12 @@ mod tests {
         // A non-empty intersection still narrows to its first allowed node.
         assert_eq!(
             effective_policy(validate(MPOL_PREFERRED, 3, true, ALLOWED).unwrap()),
-            (MPOL_PREFERRED, 1)
+            EffectiveMempolicy {
+                mode: MPOL_PREFERRED,
+                mode_flags: 0,
+                nodes: 1,
+                user_nodemask: 3,
+            }
         );
     }
 
@@ -784,7 +859,15 @@ mod tests {
                 validate(mode, 1, true, ALLOWED).unwrap_or_else(|e| panic!("{mode}: {e:?}"));
             assert_eq!(request.mode, mode);
             assert_eq!(request.nodes, 1);
-            assert_eq!(effective_policy(request), (mode, 1));
+            assert_eq!(
+                effective_policy(request),
+                EffectiveMempolicy {
+                    mode,
+                    mode_flags: 0,
+                    nodes: 1,
+                    user_nodemask: 1,
+                }
+            );
         }
     }
 
@@ -898,6 +981,18 @@ mod tests {
         );
         // A window that stops at `MAX_NUMNODES` never reads word 1 at all.
         assert_eq!(parse_node_mask(65, &[1, 1], true), Ok((1, true)));
+    }
+
+    #[test]
+    fn scanned_word_rejection_applies_only_above_word_zero() {
+        // The loop's `if (t)` runs for every word the scan reads above
+        // `MAX_NUMNODES`, and those words are never word 0: word 0 is the
+        // accepted mask the final `get_bitmap()` copies.
+        assert!(rejects_scanned_word(1, 1));
+        assert!(rejects_scanned_word(512, 1usize << 63));
+        assert!(!rejects_scanned_word(1, 0));
+        assert!(!rejects_scanned_word(0, 1));
+        assert!(!rejects_scanned_word(0, usize::MAX));
     }
 
     #[test]
@@ -1056,10 +1151,60 @@ mod tests {
     #[test]
     fn effective_policy_narrows_preferred_to_its_first_node() {
         let request = validate(MPOL_PREFERRED, 1, true, ALLOWED).unwrap();
-        assert_eq!(effective_policy(request), (MPOL_PREFERRED, 1));
+        assert_eq!(
+            effective_policy(request),
+            EffectiveMempolicy {
+                mode: MPOL_PREFERRED,
+                mode_flags: 0,
+                nodes: 1,
+                user_nodemask: 1,
+            }
+        );
         // An empty preferred list becomes MPOL_LOCAL, as `mpol_new()` does.
         let request = validate(MPOL_PREFERRED, 0, false, ALLOWED).unwrap();
-        assert_eq!(effective_policy(request), (MPOL_LOCAL, 0));
+        assert_eq!(
+            effective_policy(request),
+            EffectiveMempolicy {
+                mode: MPOL_LOCAL,
+                mode_flags: 0,
+                nodes: 0,
+                user_nodemask: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn effective_default_policy_drops_the_callers_shaping_flags() {
+        // `mpol_new()` returns NULL for MPOL_DEFAULT, so the mode flags the
+        // caller supplied never reach a `struct mempolicy` and
+        // `do_get_mempolicy()` reports plain `MPOL_DEFAULT`
+        // (`mm/mempolicy.c:446-450`, `mm/mempolicy.c:1219-1225`). A
+        // `MPOL_F_STATIC_NODES`/`MPOL_F_RELATIVE_NODES` bit is therefore not
+        // observable after a successful default request.
+        for flags in [0, MPOL_F_STATIC_NODES, MPOL_F_RELATIVE_NODES] {
+            let request = validate(MPOL_DEFAULT | flags, 0, false, ALLOWED).unwrap();
+            assert_eq!(
+                effective_policy(request),
+                EffectiveMempolicy {
+                    mode: MPOL_DEFAULT,
+                    mode_flags: 0,
+                    nodes: 0,
+                    user_nodemask: 0,
+                },
+                "flags {flags:#x}"
+            );
+        }
+        // The two user-nodemask flags together never reach `mpol_new()`:
+        // `sanitize_mpol_flags()` rejects the combination first.
+        assert_eq!(
+            validate(
+                MPOL_DEFAULT | MPOL_F_STATIC_NODES | MPOL_F_RELATIVE_NODES,
+                0,
+                false,
+                ALLOWED
+            ),
+            Err(MempolicyError::InvalidMode)
+        );
     }
 
     #[test]

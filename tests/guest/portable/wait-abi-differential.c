@@ -11,13 +11,16 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/resource.h>
 #include <sys/types.h>
@@ -54,7 +57,11 @@
 #define MPOL_PREFERRED 1
 #define MPOL_BIND 2
 #define MPOL_INTERLEAVE 3
-#define MPOL_WEIGHTED_INTERLEAVE 4
+/* include/uapi/linux/mempolicy.h: MPOL_LOCAL is 4 and
+ * MPOL_WEIGHTED_INTERLEAVE is 6; MPOL_PREFERRED_MANY is the 5 that sits
+ * between them. */
+#define MPOL_LOCAL 4
+#define MPOL_WEIGHTED_INTERLEAVE 6
 #define MPOL_PREFERRED_MANY 5
 #define MPOL_F_NUMA_BALANCING (1 << 13)
 #define MPOL_F_RELATIVE_NODES (1 << 14)
@@ -65,6 +72,10 @@
 #define MPOL_MF_STRICT (1 << 0)
 #define MPOL_MF_MOVE (1 << 1)
 #define MPOL_MF_MOVE_ALL (1 << 2)
+#endif
+/* The page size every guest in this suite is built for. */
+#ifndef PAGE
+#define PAGE 4096UL
 #endif
 #ifndef __WNOTHREAD
 #define __WNOTHREAD 0x20000000
@@ -163,6 +174,72 @@ static void collect(pid_t pid)
     while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) { }
 }
 
+/* ------------------------------------------------------------------ *
+ * wait4(2) __WNOTHREAD: only this exact task's own relation counts.
+ *
+ * __do_wait() walks `current->children` and `current->ptraced`, and breaks
+ * out of the thread-group loop as soon as the flag is set
+ * (kernel/exit.c:1725-1735); do_wait_pid() admits a named target only through
+ * is_effectively_child(), which requires `current == target->real_parent` for
+ * the thread-group arm and `current == target->parent` for the ptrace arm
+ * (kernel/exit.c:1657-1664, :1672-1697).  A child forked by a sibling thread
+ * is therefore invisible to this thread, and stays invisible after it has
+ * exited, because release_task() has not run yet.
+ * ------------------------------------------------------------------ */
+static atomic_int nothread_stage;
+static pid_t nothread_live_child;
+static pid_t nothread_zombie_child;
+static long nothread_own_rc;
+static int nothread_own_errno;
+static pid_t nothread_zombie_reaper;
+static int nothread_zombie_status;
+
+static void nothread_wait_for(int value)
+{
+    while (atomic_load_explicit(&nothread_stage, memory_order_acquire) != value) {
+        sched_yield();
+    }
+}
+
+static void *nothread_forker(void *unused)
+{
+    (void)unused;
+    pid_t child = fork();
+    if (child == 0) {
+        for (;;) pause();
+    }
+    if (child < 0) _exit(9);
+    nothread_live_child = child;
+    atomic_store_explicit(&nothread_stage, 1, memory_order_release);
+
+    nothread_wait_for(2);
+    /* The thread that forked it is its `real_parent`, so its own
+     * __WNOTHREAD wait still finds the live child. */
+    errno = 0;
+    nothread_own_rc = syscall(SYS_wait4, child, NULL, WNOHANG | __WNOTHREAD, NULL);
+    nothread_own_errno = errno;
+    kill(child, SIGKILL);
+    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) { }
+
+    child = fork();
+    if (child == 0) _exit(7);
+    if (child < 0) _exit(9);
+    {
+        siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        /* WNOWAIT observes the exit without reaping, so the sibling probe
+         * below runs against a real zombie. */
+        if (syscall(SYS_waitid, P_PID, child, &info, WEXITED | WNOWAIT, NULL) != 0) {
+            _exit(9);
+        }
+        if (info.si_pid != child) _exit(9);
+    }
+    nothread_zombie_child = child;
+    atomic_store_explicit(&nothread_stage, 4, memory_order_release);
+    nothread_wait_for(5);
+    return NULL;
+}
+
 int main(void)
 {
     /* ---------------- wait4(2) argument contract ---------------- */
@@ -225,6 +302,52 @@ int main(void)
      * `collect()` sends SIGKILL and reaps without inspecting the status. */
     collect(child);
     EXPECT_ERR("wait4-reaped-child-echild", syscall(SYS_wait4, child, NULL, 0, NULL), ECHILD);
+
+    /* ---------------- wait4(2) __WNOTHREAD ---------------- */
+    pthread_t forker;
+    atomic_store(&nothread_stage, 0);
+    {
+        int created = pthread_create(&forker, NULL, nothread_forker, NULL);
+        check("wait4-wnothread-thread-create", created == 0);
+        nothread_wait_for(1);
+        pid_t sibling_child = nothread_live_child;
+        /* A sibling thread's live child is not this thread's child, so the
+         * walk finds no candidate at all: ECHILD, not 0. */
+        EXPECT_ERR("wait4-wnothread-sibling-echild",
+                   syscall(SYS_wait4, sibling_child, NULL, WNOHANG | __WNOTHREAD, NULL),
+                   ECHILD);
+        /* Without the bit it is still this thread group's child, so the same
+         * live child with no pending event reports success with zero. */
+        errno = 0;
+        {
+            long rc = syscall(SYS_wait4, -1, NULL, WNOHANG, NULL);
+            check("wait4-wnothread-any-live-zero", rc == 0 && errno == 0);
+        }
+        atomic_store_explicit(&nothread_stage, 2, memory_order_release);
+        nothread_wait_for(4);
+        check("wait4-wnothread-own-live-zero",
+              nothread_own_rc == 0 && nothread_own_errno == 0);
+        /* An exited-but-unreaped child of a sibling thread is just as
+         * invisible under the flag: `p->real_parent` is still that thread. */
+        EXPECT_ERR("wait4-wnothread-zombie-sibling-echild",
+                   syscall(SYS_wait4, nothread_zombie_child, NULL,
+                           WNOHANG | __WNOTHREAD, NULL),
+                   ECHILD);
+        /* The group as a whole still owns it, and reaps it as a normal
+         * SIGCHLD child. */
+        {
+            int status = 0;
+            pid_t got = waitpid(nothread_zombie_child, &status, 0);
+            nothread_zombie_reaper = got;
+            nothread_zombie_status = status;
+        }
+        check("wait4-wnothread-zombie-group-reap",
+              nothread_zombie_reaper == nothread_zombie_child &&
+              WIFEXITED(nothread_zombie_status) &&
+              WEXITSTATUS(nothread_zombie_status) == 7);
+        atomic_store_explicit(&nothread_stage, 5, memory_order_release);
+        check("wait4-wnothread-thread-join", pthread_join(forker, NULL) == 0);
+    }
     done();
 
     /* ---------------- waitid(2) argument contract ---------------- */
@@ -546,6 +669,28 @@ int main(void)
                    syscall(SYS_set_mempolicy, MPOL_BIND, high_bit_outside_window, 102),
                    EINVAL);
     }
+    /* "From the end" is observable, not just a description: the in-loop
+     * `if (t) return -EINVAL;` runs before the next lower word is read
+     * (`mm/mempolicy.c:1673-1688`), so a set bit above MAX_NUMNODES in the
+     * high word outranks an unreadable low word -- the low word is never
+     * touched.  `maxnode == 66` leaves 65 bits, so with MAX_NUMNODES == 64
+     * exactly two words are in the window, and this window straddles the
+     * boundary: word 1 is the mapped page's first word and names node 64, word
+     * 0 is the last word of the unmapped page before it.  Reading word 0 first
+     * would be EFAULT; the answer is EINVAL. */
+    {
+        char *pair = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (pair != MAP_FAILED) {
+            if (munmap(pair, PAGE) == 0) {
+                unsigned long *window = (unsigned long *)(pair + PAGE - sizeof(unsigned long));
+                *(unsigned long *)(pair + PAGE) = 1;
+                EXPECT_ERR("set_mempolicy-checks-high-word-first",
+                           syscall(SYS_set_mempolicy, MPOL_BIND, window, 66), EINVAL);
+            }
+            munmap(pair + PAGE, PAGE);
+        }
+    }
     /* An unreadable mask is EFAULT for every mode that reads it -- get_nodes()
      * cannot know the mode and runs first. */
     EXPECT_ERR("set_mempolicy-mask-ptr-fault",
@@ -595,6 +740,62 @@ int main(void)
         unsigned long disallowed = 2;
         EXPECT_OK("mbind-zero-length-skips-mask-validation",
                   syscall(SYS_mbind, 0, 0, MPOL_BIND, &disallowed, 64, 0));
+    }
+    /* A range that spans a hole is not an error by itself.  `do_mbind()` sets
+     * `MPOL_MF_DISCONTIG_OK` whenever `mpol_new()` returned NULL, which is
+     * MPOL_DEFAULT alone (`mm/mempolicy.c:1519-1528`, `mm/mempolicy.c:446-450`),
+     * and `queue_pages_test_walk()` then skips both of its hole reports -- the
+     * head hole (`qp->start < vma->vm_start`) and the middle/tail one
+     * (`vma->vm_end < qp->end && (!next || vma->vm_end < next->vm_start)`) --
+     * at `mm/mempolicy.c:920-932`.  The one report the bit does not suppress is
+     * `queue_pages_range()`'s "the walk entered no VMA at all"
+     * (`mm/mempolicy.c:998-1000`), so a wholly unmapped range stays EFAULT for
+     * every mode.  MPOL_MF_STRICT is cleared for MPOL_DEFAULT
+     * (`mm/mempolicy.c:1508-1509`), so it changes none of this. */
+    {
+        char *triple = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (triple != MAP_FAILED) {
+            unsigned long one_node = 1;
+            if (munmap(triple + PAGE, PAGE) == 0) {
+                /* [p, p+P) and [p+2P, p+3P) are mapped; [p+P, p+2P) is the hole. */
+                EXPECT_OK("mbind-default-spans-middle-hole",
+                          syscall(SYS_mbind, (unsigned long)triple, 3 * PAGE, MPOL_DEFAULT,
+                                  NULL, 0, 0));
+                EXPECT_OK("mbind-default-strict-spans-middle-hole",
+                          syscall(SYS_mbind, (unsigned long)triple, 3 * PAGE, MPOL_DEFAULT,
+                                  NULL, 0, MPOL_MF_STRICT));
+                EXPECT_ERR("mbind-local-rejects-middle-hole",
+                           syscall(SYS_mbind, (unsigned long)triple, 3 * PAGE, MPOL_LOCAL,
+                                   NULL, 0, 0),
+                           EFAULT);
+                EXPECT_ERR("mbind-bind-rejects-middle-hole",
+                           syscall(SYS_mbind, (unsigned long)triple, 3 * PAGE, MPOL_BIND,
+                                   &one_node, 64, 0),
+                           EFAULT);
+                /* The hole on its own is a range no VMA covers. */
+                EXPECT_ERR("mbind-default-whole-range-hole",
+                           syscall(SYS_mbind, (unsigned long)triple + PAGE, PAGE, MPOL_DEFAULT,
+                                   NULL, 0, 0),
+                           EFAULT);
+            }
+            munmap(triple, 3 * PAGE);
+        }
+    }
+    /* The same rule at the head of the range: the first page of this pair is
+     * unmapped, so `qp->start < vma->vm_start` on the first VMA the walk
+     * enters. */
+    {
+        char *pair = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (pair != MAP_FAILED) {
+            if (munmap(pair, PAGE) == 0) {
+                EXPECT_OK("mbind-default-spans-head-hole",
+                          syscall(SYS_mbind, (unsigned long)pair, 2 * PAGE, MPOL_DEFAULT,
+                                  NULL, 0, 0));
+            }
+            munmap(pair + PAGE, PAGE);
+        }
     }
     /* The MPOL_MF_MOVE_ALL capability check is likewise inside `do_mbind()` and
      * precedes `mpol_new()`, so an unprivileged caller gets EPERM for the same
@@ -677,6 +878,123 @@ int main(void)
         check("get_mempolicy-f-node-addr-writes-mask",
               rc == 0 && policy == 0 && mask[0] == 0);
     }
+    /* `lookup_node()` resolves the address with
+     * `get_user_pages_fast(addr & PAGE_MASK, 1, 0, &p)` followed by
+     * `page_to_nid()` (`mm/mempolicy.c:1133-1144`), and GUP *faults the page in*
+     * on a read fault rather than only looking it up: a mapped page that was
+     * never touched reports its node, it is not EFAULT.  A page the caller may
+     * not read fails in GUP itself, so PROT_NONE is EFAULT. */
+    {
+        void *fresh = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void *guarded = mmap(NULL, PAGE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (fresh != MAP_FAILED && guarded != MAP_FAILED) {
+            int policy = -1;
+            errno = 0;
+            long rc = syscall(SYS_get_mempolicy, &policy, NULL, 0, (unsigned long)fresh,
+                              MPOL_F_NODE | MPOL_F_ADDR);
+            check("get_mempolicy-f-node-addr-unpopulated", rc == 0 && policy == 0);
+            EXPECT_ERR("get_mempolicy-f-node-addr-prot-none",
+                       syscall(SYS_get_mempolicy, &policy, NULL, 0, (unsigned long)guarded,
+                               MPOL_F_NODE | MPOL_F_ADDR),
+                       EFAULT);
+            /* The fault-in belongs to the MPOL_F_NODE arm alone: with
+             * MPOL_F_ADDR and no MPOL_F_NODE the policy comes from the VMA and
+             * `lookup_node()` is never called (`mm/mempolicy.c:1182`,
+             * `:1189-1203`), so the same PROT_NONE page still reports the
+             * policy its VMA carries. */
+            {
+                unsigned long one_node = 1;
+                int vma_policy = -1;
+                (void)syscall(SYS_mbind, (unsigned long)guarded, PAGE, MPOL_BIND, &one_node,
+                              64, 0);
+                errno = 0;
+                rc = syscall(SYS_get_mempolicy, &vma_policy, NULL, 0, (unsigned long)guarded,
+                             MPOL_F_ADDR);
+                check("get_mempolicy-f-addr-prot-none-reports-vma-policy",
+                      rc == 0 && vma_policy == MPOL_BIND);
+            }
+        }
+        if (fresh != MAP_FAILED) munmap(fresh, PAGE);
+        if (guarded != MAP_FAILED) munmap(guarded, PAGE);
+    }
+    /* A hole fails before `lookup_node()`: `do_get_mempolicy()` resolves the
+     * address with `vma_lookup()` and returns EFAULT when no VMA covers it
+     * (`mm/mempolicy.c:1176-1181`). */
+    {
+        char *pair = mmap(NULL, 2 * PAGE, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (pair != MAP_FAILED) {
+            int policy = -1;
+            if (munmap(pair, PAGE) == 0) {
+                EXPECT_ERR("get_mempolicy-f-node-addr-hole",
+                           syscall(SYS_get_mempolicy, &policy, NULL, 0, (unsigned long)pair,
+                                   MPOL_F_NODE | MPOL_F_ADDR),
+                           EFAULT);
+            }
+            munmap(pair + PAGE, PAGE);
+        }
+    }
+    /* Without MPOL_F_ADDR, MPOL_F_NODE asks for the task's own next interleave
+     * node -- `next_node_in(current->il_prev, pol->nodes)` for MPOL_INTERLEAVE
+     * and `current->il_prev` for a weighted policy that still holds weight --
+     * and every other mode is EINVAL (`mm/mempolicy.c:1204-1217`).  One node is
+     * the only answer this configuration can give.  Each check reads the mode
+     * back too, so a setup that did not take effect fails its record instead of
+     * silently re-testing the policy before it. */
+    {
+        unsigned long one_node = 1;
+        int mode = -1;
+        int node = -1;
+        long mode_rc;
+        long node_rc;
+        (void)syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, &one_node, 64);
+        mode_rc = syscall(SYS_get_mempolicy, &mode, NULL, 0, 0, 0);
+        errno = 0;
+        node_rc = syscall(SYS_get_mempolicy, &node, NULL, 0, 0, MPOL_F_NODE);
+        check("get_mempolicy-f-node-interleave-task-policy",
+              mode_rc == 0 && mode == MPOL_INTERLEAVE && node_rc == 0 && node == 0);
+        mode = -1;
+        node = -1;
+        (void)syscall(SYS_set_mempolicy, MPOL_WEIGHTED_INTERLEAVE, &one_node, 64);
+        mode_rc = syscall(SYS_get_mempolicy, &mode, NULL, 0, 0, 0);
+        errno = 0;
+        node_rc = syscall(SYS_get_mempolicy, &node, NULL, 0, 0, MPOL_F_NODE);
+        check("get_mempolicy-f-node-weighted-interleave-task-policy",
+              mode_rc == 0 && mode == MPOL_WEIGHTED_INTERLEAVE && node_rc == 0 && node == 0);
+        mode = -1;
+        (void)syscall(SYS_set_mempolicy, MPOL_PREFERRED_MANY, &one_node, 64);
+        mode_rc = syscall(SYS_get_mempolicy, &mode, NULL, 0, 0, 0);
+        errno = 0;
+        node_rc = syscall(SYS_get_mempolicy, &node, NULL, 0, 0, MPOL_F_NODE);
+        check("get_mempolicy-f-node-preferred-many-einval",
+              mode_rc == 0 && mode == MPOL_PREFERRED_MANY && node_rc == -1 && errno == EINVAL);
+        (void)syscall(SYS_set_mempolicy, MPOL_DEFAULT, NULL, 0);
+    }
+    /* `copy_nodes_to_user()` writes `ALIGN(maxnode-1, 64)/8` bytes -- the whole
+     * window the caller named, not just the node bits -- so the words past
+     * `nr_node_ids` are cleared, and a window wider than a page is EINVAL
+     * (`mm/mempolicy.c:1694-1711`) with `*policy` already stored, because
+     * `kernel_get_mempolicy()` writes the policy before the mask
+     * (`mm/mempolicy.c:1228-1240`).  The policy these two read is set up by the
+     * call below rather than by an assertion of its own; a failed setup shows
+     * up as a failed check here. */
+    {
+        unsigned long one_node = 1;
+        unsigned long window[3] = {~0UL, ~0UL, ~0UL};
+        int policy = -1;
+        (void)syscall(SYS_set_mempolicy, MPOL_BIND, &one_node, 64);
+        errno = 0;
+        long rc = syscall(SYS_get_mempolicy, &policy, window, 128, 0, 0);
+        check("get_mempolicy-clears-window-past-node-mask",
+              rc == 0 && policy == MPOL_BIND && window[0] == 1 && window[1] == 0
+                  && window[2] == ~0UL);
+        policy = -1;
+        errno = 0;
+        rc = syscall(SYS_get_mempolicy, &policy, window, 32770, 0, 0);
+        check("get_mempolicy-window-too-long-keeps-policy",
+              rc == -1 && errno == EINVAL && policy == MPOL_BIND);
+    }
     /* The shaping flags stored with the policy come back in *policy, and
      * `mpol_store_user_nodemask()` makes the query report the caller's own mask
      * rather than the intersection: nodes 0 and 1 were requested, only node 0
@@ -694,6 +1012,21 @@ int main(void)
                   && reported[0] == user_mask);
         EXPECT_OK("set_mempolicy-restore-default-after-static",
                   syscall(SYS_set_mempolicy, MPOL_DEFAULT, NULL, 0));
+    }
+    /* `mpol_new()` returns NULL for MPOL_DEFAULT rather than a policy with
+     * default fields (`mm/mempolicy.c:446-450`), so `do_set_mempolicy()` stores
+     * no policy at all and `do_get_mempolicy()` reports `&default_policy`, whose
+     * flags are zero (`mm/mempolicy.c:1186-1187`, `mm/mempolicy.c:1219-1225`).
+     * The shaping flags are therefore dropped: *policy comes back as plain
+     * MPOL_DEFAULT, not MPOL_DEFAULT | MPOL_F_STATIC_NODES. */
+    {
+        int policy = -1;
+        EXPECT_OK("set_mempolicy-default-drops-mode-flags",
+                  syscall(SYS_set_mempolicy, MPOL_DEFAULT | MPOL_F_STATIC_NODES, NULL, 0));
+        errno = 0;
+        long rc = syscall(SYS_get_mempolicy, &policy, NULL, 0, 0, 0);
+        check("get_mempolicy-default-keeps-no-mode-flags",
+              rc == 0 && policy == MPOL_DEFAULT);
     }
     done();
 
@@ -828,6 +1161,71 @@ int main(void)
                           setpriority(PRIO_PROCESS, limited, -5));
                 collect(limited);
             }
+        }
+    }
+    /* The same `task_rlimit(p, RLIMIT_NICE)` read must still reach a target
+     * that has already exited: `p->signal` outlives `do_exit()` until
+     * `release_task()`, so a caller with a narrow limit of its own succeeds
+     * against a zombie that kept a generous one, and is refused for a value
+     * the zombie's own limit excludes. */
+    {
+        pid_t zombie = fork();
+        if (zombie == 0) {
+            struct rlimit thirty = {30, 30};
+            if (prlimit(0, RLIMIT_NICE, &thirty, NULL) != 0) _exit(1);
+            if (setresuid(1000, 1000, 1000) != 0) _exit(1);
+            _exit(0);
+        }
+        if (zombie < 0) {
+            check("setpriority-zombie-fork", 0);
+        } else {
+            siginfo_t info;
+            int status = -1;
+            int reaped;
+            memset(&info, 0, sizeof(info));
+            errno = 0;
+            long waited = syscall(SYS_waitid, P_PID, zombie, &info, WEXITED | WNOWAIT, NULL);
+            check("setpriority-zombie-exited", waited == 0 && info.si_pid == zombie);
+            /* A caller that lowered its own limit to zero and dropped
+             * CAP_SYS_NICE: only the target's retained limit can authorize the
+             * reduction, so 20 - (-5) = 25 <= 30 succeeds. */
+            pid_t caller = fork();
+            if (caller == 0) {
+                struct rlimit none = {0, 0};
+                if (prlimit(0, RLIMIT_NICE, &none, NULL) != 0) _exit(2);
+                if (setresuid(1000, 1000, 1000) != 0) _exit(2);
+                errno = 0;
+                _exit(setpriority(PRIO_PROCESS, zombie, -5) == 0 ? 0 : 1);
+            }
+            do {
+                reaped = waitpid(caller, &status, 0);
+            } while (reaped < 0 && errno == EINTR);
+            check("setpriority-zombie-target-rlimit-nice",
+                  reaped == caller && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+            /* The reduction landed on the retained value.  libc's
+             * `getpriority(2)` undoes the kernel's `nice_to_rlimit()` mapping
+             * (`include/linux/sched/prio.h:33`, `20 - nice`), so the observable
+             * result is the nice value itself, exactly as in `setpriority(2)`. */
+            errno = 0;
+            long prio = getpriority(PRIO_PROCESS, zombie);
+            check("getpriority-zombie-lowered-nice", prio == -5);
+            /* The zombie's own limit is also its ceiling: 20 - (-15) = 35. */
+            pid_t narrow = fork();
+            if (narrow == 0) {
+                struct rlimit none = {0, 0};
+                if (prlimit(0, RLIMIT_NICE, &none, NULL) != 0) _exit(2);
+                if (setresuid(1000, 1000, 1000) != 0) _exit(2);
+                errno = 0;
+                _exit(setpriority(PRIO_PROCESS, zombie, -15) == -1 && errno == EACCES
+                          ? 0
+                          : 1);
+            }
+            do {
+                reaped = waitpid(narrow, &status, 0);
+            } while (reaped < 0 && errno == EINTR);
+            check("setpriority-zombie-above-target-rlimit-eacces",
+                  reaped == narrow && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+            collect(zombie);
         }
     }
     done();

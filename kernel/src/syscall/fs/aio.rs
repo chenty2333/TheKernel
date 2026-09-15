@@ -711,13 +711,20 @@ fn resfd_file(iocb: &Iocb) -> AxResult<Option<FileHandle<EventFd>>> {
 }
 
 fn validate_iocb_common(iocb: &Iocb) -> AxResult {
+    // `io_submit_one()` runs exactly two checks before it hands the request to
+    // `__io_submit_one()` and `fget()`: the forward-compatibility reserved
+    // field and the size overflow test (`fs/aio.c:2085-2100`).
+    //
+    // `aio_flags` is never masked.  Linux reads it only as
+    // `aio_flags & IOCB_FLAG_RESFD` (`fs/aio.c:2030`) and
+    // `aio_flags & IOCB_FLAG_IOPRIO` (`fs/aio.c:1574`), so an unknown bit is
+    // ignored rather than rejected, which is what forward compatibility means
+    // here -- the reserved field, not this word, is the guarded one.
+    //
+    // A non-zero `aio_reqprio` without the IOPRIO flag is ignored for the same
+    // reason: `aio_prep_rw()` takes the `else` arm and uses
+    // `get_current_ioprio()` (`fs/aio.c:1589-1590`).
     if iocb.aio_reserved2 != 0 || iocb.aio_nbytes > isize::MAX as u64 {
-        return Err(AxError::InvalidInput);
-    }
-    if iocb.aio_flags & !(IOCB_FLAG_RESFD | IOCB_FLAG_IOPRIO) != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if iocb.aio_flags & IOCB_FLAG_IOPRIO == 0 && iocb.aio_reqprio != 0 {
         return Err(AxError::InvalidInput);
     }
     Ok(())
@@ -1706,6 +1713,32 @@ pub fn cleanup_process_aio(owner: Pid) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn iocb_flags_and_reqprio_are_ignored_not_rejected() {
+        // Neither word is masked by Linux.  `__io_submit_one()` reads
+        // `aio_flags` only through `& IOCB_FLAG_RESFD` (fs/aio.c:2030) and
+        // `aio_prep_rw()` reads it only through `& IOCB_FLAG_IOPRIO`, taking
+        // the `else` arm and `get_current_ioprio()` when that bit is clear
+        // (fs/aio.c:1589-1590).  So an unknown flag bit and a stray
+        // `aio_reqprio` are both ignored, and only the reserved field and the
+        // size overflow test are errors here (fs/aio.c:2085-2100).
+        let mut iocb = <super::Iocb as bytemuck::Zeroable>::zeroed();
+        iocb.aio_flags = 1 << 7;
+        iocb.aio_reqprio = 42;
+        assert!(super::validate_iocb_common(&iocb).is_ok());
+        iocb.aio_nbytes = isize::MAX as u64 + 1;
+        assert!(matches!(
+            super::validate_iocb_common(&iocb),
+            Err(AxError::InvalidInput)
+        ));
+        iocb.aio_nbytes = 0;
+        iocb.aio_reserved2 = 1;
+        assert!(matches!(
+            super::validate_iocb_common(&iocb),
+            Err(AxError::InvalidInput)
+        ));
+    }
+
     use super::*;
 
     static NEXT_AIO_CTX_TEST_LOCK: Mutex<()> = Mutex::new(());

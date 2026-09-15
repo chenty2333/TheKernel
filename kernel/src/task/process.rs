@@ -172,7 +172,10 @@ use super::{
     resources::Rlimits,
     security::LandlockDomain,
     signal::PtraceSignalRecord,
-    thread::{TaskParentPublicationGuard, lock_task_parent_publication},
+    thread::{
+        TaskParentNode, TaskParentPublicationGuard, lock_task_parent_publication,
+        resolve_retained_task_parent,
+    },
     timer::{ForeignCpuTimerSubscriberPool, PosixTimer, ProcessITimerWorkNode, ProcessITimers},
 };
 use crate::{
@@ -320,6 +323,8 @@ pub(crate) struct GroupLeaderSignalIdentity {
     /// Shared with the durable group-leader binding so an exec replacement is
     /// reflected in the owner retained by a zombie payload.
     landlock: Arc<SpinNoIrq<LandlockDomain>>,
+    /// The process's resource limits, shared with the live `ProcessData`.
+    rlimits: Arc<RwLock<Rlimits>>,
 }
 
 impl GroupLeaderSignalIdentity {
@@ -331,6 +336,7 @@ impl GroupLeaderSignalIdentity {
             scheduler: None,
             scheduler_identity_token: 0,
             landlock: Arc::new(SpinNoIrq::new(LandlockDomain::default())),
+            rlimits: Arc::new(RwLock::default()),
         }
     }
 
@@ -340,6 +346,7 @@ impl GroupLeaderSignalIdentity {
         pid_ns: Option<Arc<PidNamespace>>,
         scheduler: Arc<SpinNoIrq<ZombieSchedulerSnapshot>>,
         landlock: Arc<SpinNoIrq<LandlockDomain>>,
+        rlimits: Arc<RwLock<Rlimits>>,
     ) -> Self {
         Self {
             registration_tid,
@@ -348,6 +355,7 @@ impl GroupLeaderSignalIdentity {
             scheduler: Some(scheduler),
             scheduler_identity_token: 0,
             landlock,
+            rlimits,
         }
     }
 
@@ -361,6 +369,72 @@ impl GroupLeaderSignalIdentity {
 /// payload. Successful reap takes the sole endpoint from this slot even when a
 /// pidfd or wait event still owns the surrounding snapshot.
 pub(crate) type GroupLeaderSignalOwner = Arc<SpinNoIrq<Option<GroupLeaderSignalIdentity>>>;
+
+/// Immutable kernel-owned identity of one Linux process, kept by the core
+/// registry entry from publication until successful reap.
+///
+/// This is deliberately separate from [`ProcessData`], which is retired when
+/// the process becomes a zombie. Everything here is state Linux itself keeps
+/// on the `task_struct`/`struct pid` until `release_task()`, so it stays
+/// observable exactly as long as Linux leaves the task findable:
+/// * `pid_ns` is the namespace the retained identity renders in;
+/// * `real_parent` is `p->real_parent`, which `wait4(2)`'s `__WNOTHREAD` rule
+///   compares against the exact calling task (`kernel/exit.c:1657-1664`,
+///   `:1725-1735`).
+pub(crate) struct ProcessIdentity {
+    pid_ns: Arc<PidNamespace>,
+    real_parent: Option<Arc<TaskParentNode>>,
+}
+
+impl ProcessIdentity {
+    pub(crate) fn try_new(
+        pid_ns: Arc<PidNamespace>,
+        real_parent: Option<Arc<TaskParentNode>>,
+    ) -> AxResult<Self> {
+        Ok(Self {
+            pid_ns,
+            real_parent,
+        })
+    }
+
+    pub(crate) fn pid_ns(&self) -> &Arc<PidNamespace> {
+        &self.pid_ns
+    }
+
+    /// The exact task Linux would name in `p->real_parent` for this process.
+    ///
+    /// The returned identity may belong to a task that has already exited:
+    /// callers must resolve it with
+    /// [`resolve_retained_task_parent`](super::resolve_retained_task_parent)
+    /// before comparing it with a live task.
+    pub(crate) fn real_parent(&self) -> Option<&Arc<TaskParentNode>> {
+        self.real_parent.as_ref()
+    }
+}
+
+/// Reads the retained identity of one registry entry, live or zombie.
+pub(crate) fn process_identity(process: &Process) -> Option<&ProcessIdentity> {
+    process.identity::<ProcessIdentity>()
+}
+
+/// The PID namespace this process's retained identity renders in.
+pub(crate) fn process_identity_pid_ns(process: &Process) -> Option<&Arc<PidNamespace>> {
+    process_identity(process).map(ProcessIdentity::pid_ns)
+}
+
+/// Linux's `__WNOTHREAD` ownership test: `current == p->real_parent`
+/// (`kernel/exit.c:1657-1664`).
+///
+/// Both sides are exact task identities, so a sibling thread of the forking
+/// thread never matches and numeric TID reuse cannot invent a relation. A
+/// parent task that has already exited resolves through its retained reparent
+/// hop to the live replacement Linux would have installed.
+pub(crate) fn is_exact_child_of_thread(process: &Process, caller: &Arc<TaskParentNode>) -> bool {
+    process_identity(process)
+        .and_then(ProcessIdentity::real_parent)
+        .and_then(resolve_retained_task_parent)
+        .is_some_and(|real_parent| Arc::ptr_eq(&real_parent, caller))
+}
 
 /// Linux process identity bound to immutable exit credential and signal-owner
 /// provenance retained in the durable zombie payload.
@@ -516,7 +590,7 @@ pub(crate) fn reap_process(process: &Process) -> AxResult<bool> {
     let group = process.group();
     let group_pgid = group.pgid();
     let session_sid = session.sid();
-    let pid_ns = process.identity::<Arc<PidNamespace>>();
+    let pid_ns = process_identity_pid_ns(process);
     let reaped = process_domain()?.reap(process).map_err(process_error)?;
     if !reaped {
         return Ok(false);
@@ -640,6 +714,25 @@ pub(crate) fn zombie_scheduler_state(process: &Process) -> AxResult<ZombieSchedu
         .and_then(|identity| identity.scheduler.as_ref())
         .map(|scheduler| *scheduler.lock())
         .ok_or(AxError::NoSuchProcess)
+}
+
+/// Returns the resource limit an authoritative unreaped zombie retained.
+///
+/// Linux reads `task_rlimit(p, resource)`, i.e. `p->signal->rlim[resource]`,
+/// which `release_task()` is what finally drops
+/// (`include/linux/sched/signal.h:758-762`); the durable owner identity keeps
+/// the same cell alive for the whole zombie lifetime.
+pub(crate) fn zombie_rlimit(process: &Process, resource: u32) -> AxResult<u64> {
+    ensure_authoritative_zombie(process)?;
+    let limits = process
+        .zombie_payload()
+        .ok_or(AxError::NoSuchProcess)?
+        .reap_owner
+        .lock()
+        .as_ref()
+        .map(|identity| identity.rlimits.clone())
+        .ok_or(AxError::NoSuchProcess)?;
+    Ok(limits.read()[resource].current)
 }
 
 fn ensure_authoritative_zombie(process: &Process) -> AxResult<()> {
@@ -2291,23 +2384,6 @@ impl SemUndoState {
         .map_err(|_| AxError::NoMemory)
     }
 
-    pub(crate) fn try_clone_for(
-        ipc_ns: Arc<IpcNamespace>,
-        source: &Arc<Self>,
-    ) -> AxResult<Arc<Self>> {
-        let undo = source
-            .undo
-            .lock()
-            .as_ref()
-            .map(SemUndo::try_clone)
-            .transpose()?;
-        Arc::try_new(Self {
-            ipc_ns,
-            undo: Mutex::new(undo),
-        })
-        .map_err(|_| AxError::NoMemory)
-    }
-
     pub(crate) fn undo(&self) -> &Mutex<Option<SemUndo>> {
         &self.undo
     }
@@ -2688,6 +2764,16 @@ struct GroupLeaderIdentityBinding {
     identity_token: AtomicU64,
     /// The process PID namespace copied into the durable owner identity.
     pid_ns: Option<Arc<PidNamespace>>,
+    /// `signal_struct::rlim`, shared with the live `ProcessData` that serves
+    /// `prlimit64(2)` and retained through the durable owner identity.
+    ///
+    /// Linux keeps the resource limits on the `signal_struct`, which outlives
+    /// `do_exit()` until `release_task()`, so a lookup that reaches an
+    /// unreaped zombie through `find_task_by_vpid()` still reads the target's
+    /// own limits (`include/linux/sched/signal.h:758-762`, `kernel/sys.c:243`).
+    /// Sharing one cell instead of copying the values keeps every live writer
+    /// authoritative without a second update path.
+    rlimits: Arc<RwLock<Rlimits>>,
     /// Changes with each replacement of the private endpoint that owns the
     /// process's group-leader identity. Access is serialized with `current`
     /// and `signal`, which makes a handoff and its scheduler reseed one
@@ -2711,6 +2797,7 @@ impl GroupLeaderIdentityBinding {
             signal: Arc::try_new(SpinNoIrq::new(None)).map_err(|_| AxError::NoMemory)?,
             landlock: Arc::try_new(SpinNoIrq::new(LandlockDomain::default()))
                 .map_err(|_| AxError::NoMemory)?,
+            rlimits: Arc::try_new(RwLock::default()).map_err(|_| AxError::NoMemory)?,
             identity_token: AtomicU64::new(1),
             pid_ns,
             scheduler_identity_epoch: SpinNoIrq::new(0),
@@ -2747,6 +2834,7 @@ impl GroupLeaderIdentityBinding {
             self.pid_ns.clone(),
             self.scheduler.clone(),
             self.landlock.clone(),
+            self.rlimits.clone(),
         ));
         Ok(())
     }
@@ -2932,6 +3020,9 @@ impl GroupLeaderIdentityBinding {
         let signal = signal.map(|mut signal| {
             signal.pid_ns = self.pid_ns.clone();
             signal.scheduler = Some(self.scheduler.clone());
+            // Exec keeps the process's resource limits, so the replacement
+            // leader endpoint must keep pointing at the same shared cell.
+            signal.rlimits = self.rlimits.clone();
             signal
         });
         let mut current = self.current.lock();
@@ -3568,8 +3659,9 @@ pub struct ProcessData {
     /// parent's `SIGCHLD` disposition is.
     autoreap: AtomicBool,
 
-    /// The resource limits
-    pub rlim: RwLock<Rlimits>,
+    /// The resource limits, shared with the durable group-leader identity so
+    /// an unreaped zombie still reports the target's own limits.
+    pub rlim: Arc<RwLock<Rlimits>>,
 
     /// The child exit wait event
     pub child_exit_event: Arc<PollSet>,
@@ -4082,6 +4174,7 @@ impl ProcessData {
             image.merge_resident_highwater(image.resident_user_bytes() as u64 / 1024);
             image.tlb_state()
         };
+        let rlimits = group_leader_identity.rlimits.clone();
         let data = Self {
             world,
             proc,
@@ -4107,7 +4200,7 @@ impl ProcessData {
             timer_restore_ids: AtomicBool::new(false),
             autoreap: AtomicBool::new(false),
 
-            rlim: RwLock::default(),
+            rlim: rlimits,
 
             child_exit_event,
             exit_event,
