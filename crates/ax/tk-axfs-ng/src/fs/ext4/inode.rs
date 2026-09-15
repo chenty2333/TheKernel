@@ -1221,12 +1221,18 @@ impl FileNodeOps for Inode {
                     .map_err(into_vfs_err)
             }
             FileRangeOperation::UnshareRange => {
-                if end > size {
-                    return Err(VfsError::InvalidInput);
-                }
-                // ext4 has no reflink data extents.  A successfully validated
-                // range is therefore already exclusively owned.
-                Ok(())
+                // `ext4_fallocate()` (fs/ext4/extents.c) rejects the mode
+                // before it takes `inode_lock()`:
+                //     /* Return error if mode is not supported */
+                //     if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE |
+                //                  FALLOC_FL_ZERO_RANGE | FALLOC_FL_COLLAPSE_RANGE |
+                //                  FALLOC_FL_INSERT_RANGE | FALLOC_FL_WRITE_ZEROES))
+                //             return -EOPNOTSUPP;
+                // FALLOC_FL_UNSHARE_RANGE is absent from that mask, so ext4
+                // answers -EOPNOTSUPP even though vfs_fallocate accepts the
+                // mode.  This backend has no reflink extents either, so there
+                // is nothing to unshare and no early-success shortcut.
+                Err(VfsError::OperationNotSupported)
             }
         }
     }

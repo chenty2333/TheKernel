@@ -2418,22 +2418,35 @@ pub fn sys_readahead(fd: c_int, offset: __kernel_off_t, count: usize) -> AxResul
     if file_like.downcast_ref::<PidFd>().is_some() {
         return Err(AxError::InvalidInput);
     }
-    match FileLikeKind::from_file_like(file_like.as_ref()) {
-        FileLikeKind::Regular => {
-            let file = file_like
-                .downcast_ref::<File>()
-                .ok_or(AxError::InvalidInput)?;
-            file.inner().access(FileFlags::READ)?;
-            if offset < 0 {
-                return Err(AxError::InvalidInput);
-            }
-            Ok(0)
-        }
-        FileLikeKind::Fifo
-        | FileLikeKind::Socket
-        | FileLikeKind::Directory
-        | FileLikeKind::Other => Err(AxError::InvalidInput),
+    // Linux `ksys_readahead()` (mm/readahead.c):
+    //     if (!(file->f_mode & FMODE_READ))
+    //             return -EBADF;
+    //     if (!file->f_mapping)                return -EINVAL;
+    //     if (!file->f_mapping->a_ops)         return -EINVAL;
+    //     inode = file_inode(file);
+    //     if (!S_ISREG(inode->i_mode) && !S_ISBLK(inode->i_mode))
+    //             return -EINVAL;
+    //     if (IS_ANON_FILE(inode))             return -EINVAL;
+    //     return vfs_fadvise(fd_file(f), offset, count, POSIX_FADV_WILLNEED);
+    // A readable block-device description therefore follows the same
+    // fadvise(WILLNEED) path as a regular file.  Every other non-regular type
+    // (FIFO, socket, directory, character device) is -EINVAL: mm/fadvise.c has
+    // no S_ISSOCK special case, and the -ESPIPE branch of `generic_fadvise()`
+    // is unreachable from here because FIFOs are rejected one step earlier.
+    let stat = file_like.stat()?;
+    if !matches!(FileLikeKind::from_mode(stat.mode), FileLikeKind::Regular)
+        && stat.mode & linux_raw_sys::general::S_IFMT != linux_raw_sys::general::S_IFBLK
+    {
+        return Err(AxError::InvalidInput);
     }
+    let file = file_like
+        .downcast_ref::<File>()
+        .ok_or(AxError::InvalidInput)?;
+    file.inner().access(FileFlags::READ)?;
+    if offset < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(0)
 }
 
 fn positioned_file_handle(
@@ -3306,9 +3319,13 @@ pub(crate) fn rwf_status(base: OfdIoStatus, flags: u32, write: bool) -> AxResult
     if flags & RWF_APPEND != 0 && flags & RWF_NOAPPEND != 0 {
         return Err(AxError::InvalidInput);
     }
-    // ATOMIC reads are not a defined operation, and this kernel has neither a
-    // polled direct-I/O provider nor atomic-write provider admission yet.
-    if flags & (RWF_HIPRI | RWF_ATOMIC) != 0 {
+    // `kiocb_set_rw_flags()` (include/linux/fs.h) has no RWF_HIPRI branch: the
+    // flag is admitted unconditionally and, on a synchronous kiocb, is a
+    // complete no-op because the polled completion path is only reachable from
+    // io_uring.  RWF_ATOMIC is the only remaining flag needing provider
+    // admission (`rw_type == WRITE && FMODE_CAN_ATOMIC_WRITE`), which this
+    // kernel has no way to grant yet.
+    if flags & RWF_ATOMIC != 0 {
         return Err(AxError::OperationNotSupported);
     }
     let mut status = base.raw();
