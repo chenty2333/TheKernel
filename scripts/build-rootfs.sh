@@ -6,6 +6,9 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
 BUSYBOX_VERSION=1.36.1
 BUSYBOX_URL=https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2
+# busybox.net publishes no checksums, so this pins the tarball the cache was
+# seeded with; every use is verified, not just the first download.
+BUSYBOX_SHA256=b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314
 
 ARCH=""
 OUTPUT=""
@@ -91,6 +94,11 @@ if [ ! -f "$ARCHIVE" ]; then
     mv "$DOWNLOAD" "$ARCHIVE"
     trap - EXIT
 fi
+printf '%s  %s\n' "$BUSYBOX_SHA256" "$ARCHIVE" | sha256sum --check --status || {
+    printf 'checksum mismatch for %s\n  expected %s\n  remove it to refetch\n' \
+        "$ARCHIVE" "$BUSYBOX_SHA256" >&2
+    exit 1
+}
 
 OUTPUT=$(realpath -m "$OUTPUT")
 mkdir -p "$(dirname -- "$OUTPUT")"
