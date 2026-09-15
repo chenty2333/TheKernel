@@ -12,10 +12,11 @@ pub use msg::{
     BatchDeadline, MSG_BATCH, MSG_CMSG_CLOEXEC, MSG_CMSG_COMPAT, MSG_CONFIRM, MSG_CTRUNC,
     MSG_DONTROUTE, MSG_DONTWAIT, MSG_EOR, MSG_ERRQUEUE, MSG_FASTOPEN, MSG_INTERNAL_SENDMSG_FLAGS,
     MSG_MORE, MSG_NOSIGNAL, MSG_OOB, MSG_PEEK, MSG_PROBE, MSG_SPLICE_PAGES, MSG_TRUNC,
-    MSG_WAITALL, MSG_WAITFORONE, MSG_ZEROCOPY, NSEC_PER_SEC, ReceiveStep, Timespec64,
-    absolute_deadline, batch_deadline, compat_flag_errno, packet_recvmsg_flag_errno,
-    receive_wait_target, remaining_timeout, sock_rcvlowat, strip_internal_sendmsg_flags,
-    waitall_continues,
+    MSG_WAITALL, MSG_WAITFORONE, MSG_ZEROCOPY, MessageDirection, MsgOobTransport,
+    NO_URGENT_DATA_ERRNO, NSEC_PER_SEC, OOB_NOT_SUPPORTED_ERRNO, ReceiveStep, Timespec64,
+    absolute_deadline, batch_deadline, compat_flag_errno, msg_oob_errno,
+    packet_recvmsg_flag_errno, receive_wait_target, remaining_timeout, sock_rcvlowat,
+    strip_internal_sendmsg_flags, waitall_continues,
 };
 
 pub const AF_UNSPEC: u16 = 0;
