@@ -21,6 +21,7 @@ use axfs_ng_vfs::{Location, NodeType};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axsync::Mutex as BlockingMutex;
 use axtask::current_may_uninit;
+use linux_raw_sys::general::CAP_SYS_ADMIN;
 use spin::Mutex;
 pub use tk_linux_fsnotify::{
     ALL_FANOTIFY_EVENT_BITS, FAN_ACCESS, FAN_ACCESS_PERM, FAN_CLASS_PRE_CONTENT, FAN_CLOEXEC,
@@ -43,7 +44,7 @@ use crate::{
         inotify::WatchKey, reserve_fd,
     },
     readiness::{block_on_poll_io, block_on_poll_set},
-    task::{AsThread, get_process_data},
+    task::{AsThread, UserNamespace, get_process_data},
 };
 
 pub const MAX_QUEUED_EVENTS: usize = 16384;
@@ -83,6 +84,20 @@ impl FanotifyEventActor {
             self.tgid
         }
     }
+}
+
+/// `ns_capable(group->user_ns, CAP_SYS_ADMIN)` for the calling task
+/// (fs/notify/fanotify/fanotify_user.c:1958-1963).  A kernel task holds no
+/// user credentials of its own and is treated as capable, matching how the
+/// initial user namespace answers `capable()`.
+fn caller_may_admin_group(user_ns: &Arc<UserNamespace>) -> bool {
+    let Some(task) = current_may_uninit() else {
+        return true;
+    };
+    let Some(thread) = task.try_as_thread() else {
+        return true;
+    };
+    crate::task::ns_capable(&thread.current_cred(), user_ns, CAP_SYS_ADMIN)
 }
 
 #[derive(Clone, Copy)]
@@ -195,6 +210,15 @@ impl Drop for CleanupCreditGuard {
 pub struct FanotifyFile {
     flags: u32,
     event_f_flags: u32,
+    /// The user namespace the group was created in.  Every non-inode mark is
+    /// gated on `ns_capable()` *of this namespace* rather than of the caller's
+    /// current one (fs/notify/fanotify/fanotify_user.c:1958-1963).
+    user_ns: Arc<UserNamespace>,
+    /// Linux's internal `FANOTIFY_UNPRIV` group flag, set when the creating
+    /// task was not `CAP_SYS_ADMIN` in the initial user namespace
+    /// (fs/notify/fanotify/fanotify_user.c:1604-1611).  It suppresses the pid
+    /// of every event the listener did not generate itself (:855-862).
+    unprivileged: bool,
     non_blocking: AtomicBool,
     state: Mutex<FanotifyState>,
     read_gate: BlockingMutex<()>,
@@ -314,6 +338,7 @@ pub(crate) fn drain_deferred_cleanup_work() {
 pub(crate) fn map_mark_reject(reject: tk_linux_fsnotify::FanotifyMarkReject) -> AxError {
     match reject {
         tk_linux_fsnotify::FanotifyMarkReject::Invalid => AxError::InvalidInput,
+        tk_linux_fsnotify::FanotifyMarkReject::Permission => AxError::OperationNotPermitted,
         tk_linux_fsnotify::FanotifyMarkReject::NotDirectory => AxError::NotADirectory,
         tk_linux_fsnotify::FanotifyMarkReject::IsDirectory => AxError::IsADirectory,
     }
@@ -330,7 +355,12 @@ pub fn validate_init_flags(flags: u32, event_f_flags: u32) -> AxResult<()> {
 }
 
 impl FanotifyFile {
-    pub fn new(flags: u32, event_f_flags: u32) -> AxResult<Arc<Self>> {
+    pub fn new(
+        flags: u32,
+        event_f_flags: u32,
+        user_ns: Arc<UserNamespace>,
+        unprivileged: bool,
+    ) -> AxResult<Arc<Self>> {
         // Registry slots become reusable as soon as the group Arc dies, while
         // its deferred cleanup can outlive it. A separate transferred credit
         // therefore bounds live groups plus cleanup backlog across churn.
@@ -349,6 +379,8 @@ impl FanotifyFile {
         let file = Arc::try_new(Self {
             flags,
             event_f_flags,
+            user_ns,
+            unprivileged,
             non_blocking: AtomicBool::new(flags & FAN_NONBLOCK != 0),
             state: Mutex::new(FanotifyState {
                 marks: Vec::new(),
@@ -385,8 +417,10 @@ impl FanotifyFile {
     /// Linux completes at this point; every other successful result proceeds
     /// to target resolution and [`Self::mark`].
     pub fn precheck(&self, flags: u32, mask: u64) -> AxResult<bool> {
-        let plan = tk_linux_fsnotify::plan_fanotify_mark(flags, mask, self.flags, None)
-            .map_err(map_mark_reject)?;
+        let group_admin = caller_may_admin_group(&self.user_ns);
+        let plan =
+            tk_linux_fsnotify::plan_fanotify_mark(flags, mask, self.flags, group_admin, None)
+                .map_err(map_mark_reject)?;
         Ok(plan == tk_linux_fsnotify::FanotifyMarkPlan::Flush)
     }
 
@@ -401,8 +435,10 @@ impl FanotifyFile {
     pub fn mark(&self, flags: u32, mask: u64, loc: &Location) -> AxResult<()> {
         let mut state = self.state.lock();
         let is_dir = loc.is_dir();
-        let plan = tk_linux_fsnotify::plan_fanotify_mark(flags, mask, self.flags, Some(is_dir))
-            .map_err(map_mark_reject)?;
+        let group_admin = caller_may_admin_group(&self.user_ns);
+        let plan =
+            tk_linux_fsnotify::plan_fanotify_mark(flags, mask, self.flags, group_admin, Some(is_dir))
+                .map_err(map_mark_reject)?;
         if plan == tk_linux_fsnotify::FanotifyMarkPlan::Flush {
             flush_marks(&mut state, flags);
             return Ok(());
@@ -699,8 +735,21 @@ impl FanotifyFile {
                     return Self::read_result_after_error(written, error);
                 }
             };
+            // For an unprivileged listener, `event->pid` may identify the
+            // events generated by the listener process itself, without
+            // disclosing the pids of other processes
+            // (fs/notify/fanotify/fanotify_user.c:855-861):
+            //   if (FAN_GROUP_FLAG(group, FANOTIFY_UNPRIV) &&
+            //       task_tgid(current) != event->pid)
+            //           metadata.pid = 0;
+            let reader = FanotifyEventActor::current();
+            let event_pid = if self.unprivileged && reader.tgid != event.pid {
+                0
+            } else {
+                event.pid
+            };
             let pidfd = if self.report_pidfd() {
-                Some(prepared_event_pidfd(event.pid))
+                Some(prepared_event_pidfd(event_pid))
             } else {
                 None
             };
@@ -711,7 +760,7 @@ impl FanotifyFile {
                 metadata_len: metadata_len as u16,
                 mask: event.mask,
                 fd: event_fd.value(),
-                pid: event.pid,
+                pid: event_pid,
             };
             let mut encoded =
                 [0_u8; size_of::<FanotifyEventMetadata>() + size_of::<FanotifyEventInfoPidfd>()];
@@ -1518,6 +1567,30 @@ mod tests {
     };
     use crate::file::{FdTable, FileDescription};
 
+    /// A group a listener that is not `CAP_SYS_ADMIN` in the initial user
+    /// namespace creates, which Linux marks `FANOTIFY_UNPRIV`.
+    fn unprivileged_group_file(
+        flags: u32,
+        event_f_flags: u32,
+    ) -> AxResult<alloc::sync::Arc<FanotifyFile>> {
+        group_file(flags, event_f_flags, true)
+    }
+
+    fn group_file(
+        flags: u32,
+        event_f_flags: u32,
+        unprivileged: bool,
+    ) -> AxResult<alloc::sync::Arc<FanotifyFile>> {
+        let user_ns = crate::task::UserNamespace::try_new_root().unwrap();
+        super::FanotifyFile::new(flags, event_f_flags, user_ns, unprivileged)
+    }
+
+    /// A group as an ordinary privileged listener creates it: owned by the
+    /// current user namespace and not `FANOTIFY_UNPRIV`.
+    fn test_group_file(flags: u32, event_f_flags: u32) -> AxResult<alloc::sync::Arc<FanotifyFile>> {
+        group_file(flags, event_f_flags, false)
+    }
+
     #[test]
     fn mark_count_is_released_by_both_group_ownership_paths() {
         use core::sync::atomic::Ordering;
@@ -1528,7 +1601,7 @@ mod tests {
         let count = || super::FANOTIFY_MARKS.load(Ordering::Acquire);
         let before = count();
         for wrapped in [false, true] {
-            let file = FanotifyFile::new(FAN_NONBLOCK, 0).unwrap();
+            let file = test_group_file(FAN_NONBLOCK, 0).unwrap();
             let description = wrapped.then(|| FileDescription::new(file.clone()).unwrap());
             for mask in [FAN_ACCESS, super::FAN_MODIFY] {
                 file.mark(tk_linux_fsnotify::FAN_MARK_ADD, mask, &target)
@@ -1655,7 +1728,7 @@ mod tests {
             usize::from(!cfg!(feature = "io-notify-fastpath"))
         );
 
-        let file = FanotifyFile::new(FAN_NONBLOCK | FAN_CLASS_PRE_CONTENT, 0).unwrap();
+        let file = test_group_file(FAN_NONBLOCK | FAN_CLASS_PRE_CONTENT, 0).unwrap();
         file.mark(tk_linux_fsnotify::FAN_MARK_ADD, FAN_OPEN_PERM, &target)
             .unwrap();
         assert_eq!(super::FANOTIFY_MARKS.load(Ordering::Acquire), 1);
@@ -1706,6 +1779,34 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CapturedWrites {
+        bytes: Vec<u8>,
+    }
+
+    impl Write for CapturedWrites {
+        fn write(&mut self, buf: &[u8]) -> AxResult<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> AxResult<()> {
+            Ok(())
+        }
+    }
+
+    impl axio::IoBuf for CapturedWrites {
+        fn remaining(&self) -> usize {
+            usize::MAX
+        }
+    }
+
+    impl IoBufMut for CapturedWrites {
+        fn remaining_mut(&self) -> usize {
+            usize::MAX
+        }
+    }
+
     fn cleanup_work(id: i32) -> Box<FanotifyCleanupWork> {
         let mut queue = VecDeque::new();
         queue.push_back(FanotifyEvent {
@@ -1753,7 +1854,7 @@ mod tests {
 
     #[test]
     fn read_fault_consumes_event_and_denies_permission_after_prior_record() {
-        let file = FanotifyFile::new(FAN_NONBLOCK, 0).unwrap();
+        let file = test_group_file(FAN_NONBLOCK, 0).unwrap();
         let permission_id = 7;
         let event_len = core::mem::size_of::<super::FanotifyEventMetadata>();
         {
@@ -1792,15 +1893,58 @@ mod tests {
         );
     }
 
+    /// An unprivileged group reports a pid only for the events its own
+    /// process generated (fs/notify/fanotify/fanotify_user.c:855-861).
+    #[test]
+    fn unprivileged_group_masks_foreign_event_pids() {
+        let event_len = core::mem::size_of::<super::FanotifyEventMetadata>();
+        let pid_offset = core::mem::offset_of!(super::FanotifyEventMetadata, pid);
+        let reader_pid = super::FanotifyEventActor::current().process_id() as i32;
+        // A pid that is never the reading task's own, so masking is visible.
+        let foreign_pid = if reader_pid == 4242 { 4243 } else { 4242 };
+        let read_pid = |file: &alloc::sync::Arc<FanotifyFile>| -> i32 {
+            {
+                let mut state = file.state.lock();
+                state.queue.try_reserve(1).unwrap();
+                state.queue.push_back(FanotifyEvent {
+                    mask: FAN_ACCESS,
+                    fd_loc: None,
+                    permission_id: None,
+                    pid: foreign_pid,
+                });
+            }
+            let mut dst = CapturedWrites::default();
+            assert_eq!(file.read_ready(&mut dst), Ok(event_len));
+            i32::from_ne_bytes(
+                dst.bytes[pid_offset..pid_offset + core::mem::size_of::<i32>()]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+
+        let fid = tk_linux_fsnotify::FAN_REPORT_FID;
+        let privileged = test_group_file(FAN_NONBLOCK | fid, 0).unwrap();
+        assert_eq!(read_pid(&privileged), foreign_pid);
+        let unprivileged = unprivileged_group_file(FAN_NONBLOCK | fid, 0).unwrap();
+        assert_eq!(read_pid(&unprivileged), 0);
+    }
+
     #[test]
     fn root_enacts_abi_admission_without_redefining_it() {
         assert_eq!(FAN_ACCESS, tk_linux_fsnotify::FAN_ACCESS);
+        // FAN_UNLIMITED_QUEUE has a provider (fanotify_init(2) raises the
+        // queue budget), so it is admitted; only FAN_REPORT_MNT, which needs
+        // mount-event delivery, is an unsupported facility.
         assert_eq!(
             validate_init_flags(tk_linux_fsnotify::FAN_UNLIMITED_QUEUE, 0),
+            Ok(())
+        );
+        assert_eq!(
+            validate_init_flags(tk_linux_fsnotify::FAN_REPORT_MNT, 0),
             Err(AxError::OperationNotSupported)
         );
 
-        let file = FanotifyFile::new(FAN_NONBLOCK, 0).unwrap();
+        let file = test_group_file(FAN_NONBLOCK, 0).unwrap();
         let table = FdTable::new().unwrap();
         assert_eq!(
             file.handle_permission_response_in_table(
@@ -1818,7 +1962,7 @@ mod tests {
             FANOTIFY_PERMISSION_CLASSES,
             tk_linux_fsnotify::FANOTIFY_PERMISSION_CLASSES
         );
-        let file = FanotifyFile::new(FAN_NONBLOCK | FAN_CLASS_PRE_CONTENT, 0).unwrap();
+        let file = test_group_file(FAN_NONBLOCK | FAN_CLASS_PRE_CONTENT, 0).unwrap();
         let table = FdTable::new().unwrap();
         let description = FileDescription::new(file.clone()).unwrap();
         let description_id = description.id();
@@ -1846,7 +1990,7 @@ mod tests {
             Ok(FanotifyResponsePlan::Deny { errno: Some(5) })
         );
         assert_eq!(fanotify_denial_error(Some(5)), LinuxError::EIO.into());
-        let ordinary = FanotifyFile::new(FAN_NONBLOCK, 0).unwrap();
+        let ordinary = test_group_file(FAN_NONBLOCK, 0).unwrap();
         assert_eq!(
             ordinary.handle_permission_response_in_table(
                 &table,
@@ -1860,13 +2004,13 @@ mod tests {
     #[test]
     fn permission_response_rejects_a_closed_event_fd_reused_for_another_ofd() {
         let table = FdTable::new().unwrap();
-        let original = FileDescription::new(FanotifyFile::new(FAN_NONBLOCK, 0).unwrap()).unwrap();
+        let original = FileDescription::new(test_group_file(FAN_NONBLOCK, 0).unwrap()).unwrap();
         let expected = FanotifyPermissionFd {
             number: 9,
             description_id: original.id(),
         };
         let replacement =
-            FileDescription::new(FanotifyFile::new(FAN_NONBLOCK, 0).unwrap()).unwrap();
+            FileDescription::new(test_group_file(FAN_NONBLOCK, 0).unwrap()).unwrap();
         table.add_at_least(replacement, 9, 10, false).unwrap();
 
         assert!(current_permission_fd(&table, 9).map(|(fd, _)| fd) != Some(expected));

@@ -390,6 +390,8 @@ pub const fn plan_inotify_watch(
 pub enum FanotifyMarkReject {
     /// Mark flags or masks are invalid.
     Invalid,
+    /// The caller is not capable in the group's user namespace.
+    Permission,
     /// The requested operation requires a directory.
     NotDirectory,
     /// The requested ignore form requires a non-directory.
@@ -474,6 +476,7 @@ pub const fn plan_fanotify_mark(
     flags: u32,
     mask: u64,
     group_flags: u32,
+    group_admin: bool,
     target_is_dir: Option<bool>,
 ) -> Result<FanotifyMarkPlan, FanotifyMarkReject> {
     if let Err(reject) = fanotify_mark_scalars(flags, mask) {
@@ -490,6 +493,18 @@ pub const fn plan_fanotify_mark(
         }
     } else if mask & FANOTIFY_MOUNT_EVENTS != 0 || mark_type == FAN_MARK_MNTNS {
         return Err(FanotifyMarkReject::Invalid);
+    }
+    // A user is allowed to setup sb/mount/mntns marks only if it is capable in
+    // the user ns where the group was created
+    // (fs/notify/fanotify/fanotify_user.c:1958-1963):
+    //   if (mark_type != FAN_MARK_INODE &&
+    //       !ns_capable(group->user_ns, CAP_SYS_ADMIN))
+    //           return -EPERM;
+    // The domain is the *group's* user namespace, not the caller's: a group
+    // created in the initial user namespace by a caller without
+    // `CAP_SYS_ADMIN` there can never take one of these mark scopes.
+    if mark_type != FAN_MARK_INODE && !group_admin {
+        return Err(FanotifyMarkReject::Permission);
     }
     let class = group_flags & (FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT);
     if mask & FANOTIFY_PERM_EVENTS != 0 && class == FAN_CLASS_NOTIF {
@@ -633,15 +648,20 @@ pub const fn fanotify_init_grammar(
     Ok(())
 }
 
-/// Facilities TheKernel has no provider for.  They are well-formed Linux
-/// requests, so [`fanotify_init_admission`] reports them as unsupported rather
-/// than invalid:
-///   * `FAN_REPORT_MNT` needs mount-event delivery (see `FAN_MNT_ATTACH`);
-///   * `FAN_REPORT_FD_ERROR` needs error events carrying an errno in `fd`;
-///   * the unlimited queue and mark budgets are fixed in this kernel.
+/// Facilities TheKernel has no provider for.  `FAN_REPORT_MNT` is a
+/// well-formed Linux request that needs mount-event delivery, which this
+/// kernel does not implement, so [`fanotify_init_admission`] reports it as
+/// unsupported rather than invalid.
+///
+/// `FAN_REPORT_FD_ERROR`, `FAN_UNLIMITED_QUEUE` and `FAN_UNLIMITED_MARKS` are
+/// deliberately *not* in this set: Linux implements all three, so answering
+/// them with `EOPNOTSUPP` would be wrong.  The first two are also
+/// `FANOTIFY_ADMIN_INIT_FLAGS`, so they sit behind the `CAP_SYS_ADMIN` gate
+/// (fs/notify/fanotify/fanotify_user.c:1599-1611), and the unlimited budgets
+/// are configured by `fanotify_init(2)` itself (":1709-1714" for the event
+/// queue limit and ":1406-1443" for the mark limit).
 pub const fn fanotify_init_unsupported(flags: u32) -> bool {
-    flags & (FAN_REPORT_MNT | FAN_REPORT_FD_ERROR | FAN_UNLIMITED_QUEUE | FAN_UNLIMITED_MARKS)
-        != 0
+    flags & FAN_REPORT_MNT != 0
 }
 
 /// Validates `fanotify_init` grammar and provider availability together.  The
@@ -1256,7 +1276,7 @@ mod tests {
         // scope is then checked against the group after the fd lookup.
         assert_eq!(fanotify_mark_scalars(FAN_MARK_FLUSH | FAN_MARK_MNTNS, 0), Ok(()));
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_FLUSH | FAN_MARK_MNTNS, 0, 0, None),
+            plan_fanotify_mark(FAN_MARK_FLUSH | FAN_MARK_MNTNS, 0, 0, true, None),
             Err(FanotifyMarkReject::Invalid)
         );
         // FAN_Q_OVERFLOW is outside `valid_mask`.
@@ -1282,50 +1302,50 @@ mod tests {
         let fid_group = FAN_REPORT_DFID_NAME_TARGET;
         // Mount events and mntns marks need a FAN_REPORT_MNT group.
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD, FAN_MNT_ATTACH, fid_group, Some(true)),
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_MNT_ATTACH, fid_group, true, Some(true)),
             Err(FanotifyMarkReject::Invalid)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_MNTNS, FAN_ACCESS, 0, Some(true)),
+            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_MNTNS, FAN_ACCESS, 0, true, Some(true)),
             Err(FanotifyMarkReject::Invalid)
         );
         // Permission events need a permission class: EINVAL, never EPERM.
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD, FAN_OPEN_PERM, 0, Some(false)),
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_OPEN_PERM, 0, true, Some(false)),
             Err(FanotifyMarkReject::Invalid)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD, FAN_OPEN_PERM, FAN_CLASS_CONTENT, Some(false)),
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_OPEN_PERM, FAN_CLASS_CONTENT, true, Some(false)),
             Ok(FanotifyMarkPlan::Add)
         );
         // Pre-content events are rejected for FAN_CLASS_CONTENT.
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD, FAN_PRE_ACCESS, FAN_CLASS_CONTENT, Some(false)),
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_PRE_ACCESS, FAN_CLASS_CONTENT, true, Some(false)),
             Err(FanotifyMarkReject::Invalid)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD, FAN_PRE_ACCESS, FAN_CLASS_PRE_CONTENT, Some(false)),
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_PRE_ACCESS, FAN_CLASS_PRE_CONTENT, true, Some(false)),
             Ok(FanotifyMarkPlan::Add)
         );
         assert_eq!(
             plan_fanotify_mark(
                 FAN_MARK_ADD,
                 FAN_PRE_ACCESS | FAN_ONDIR,
-                FAN_CLASS_PRE_CONTENT,
+                FAN_CLASS_PRE_CONTENT, true,
                 Some(true)
             ),
             Err(FanotifyMarkReject::Invalid)
         );
         // FAN_FS_ERROR is filesystem-scope only.
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD, FAN_FS_ERROR, fid_group, Some(false)),
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_FS_ERROR, fid_group, true, Some(false)),
             Err(FanotifyMarkReject::Invalid)
         );
         assert_eq!(
             plan_fanotify_mark(
                 FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
                 FAN_FS_ERROR,
-                fid_group,
+                fid_group, true,
                 Some(true)
             ),
             Ok(FanotifyMarkPlan::Add)
@@ -1333,33 +1353,33 @@ mod tests {
         // Events without an event fd need a file-identifier group, and are
         // never valid on a mount mark.
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD, FAN_ATTRIB, 0, Some(false)),
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_ATTRIB, 0, true, Some(false)),
             Err(FanotifyMarkReject::Invalid)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD, FAN_ATTRIB, FAN_REPORT_FID, Some(false)),
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_ATTRIB, FAN_REPORT_FID, true, Some(false)),
             Ok(FanotifyMarkPlan::Add)
         );
         assert_eq!(
             plan_fanotify_mark(
                 FAN_MARK_ADD | FAN_MARK_MOUNT,
                 FAN_CREATE,
-                FAN_REPORT_DFID_NAME,
+                FAN_REPORT_DFID_NAME, true,
                 Some(true)
             ),
             Err(FanotifyMarkReject::Invalid)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD, FAN_RENAME, FAN_REPORT_DFID_NAME, Some(true)),
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_RENAME, FAN_REPORT_DFID_NAME, true, Some(true)),
             Ok(FanotifyMarkPlan::Add)
         );
         // The strict dir-only rule is ADD-only and needs a non-directory.
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD, FAN_RENAME, FAN_REPORT_DFID_NAME, Some(false)),
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_RENAME, FAN_REPORT_DFID_NAME, true, Some(false)),
             Err(FanotifyMarkReject::NotDirectory)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_REMOVE, FAN_RENAME, FAN_REPORT_DFID_NAME, Some(false)),
+            plan_fanotify_mark(FAN_MARK_REMOVE, FAN_RENAME, FAN_REPORT_DFID_NAME, true, Some(false)),
             Ok(FanotifyMarkPlan::Remove)
         );
         // Evictable marks are inode marks.
@@ -1367,7 +1387,7 @@ mod tests {
             plan_fanotify_mark(
                 FAN_MARK_ADD | FAN_MARK_EVICTABLE | FAN_MARK_MOUNT,
                 FAN_ACCESS,
-                0,
+                0, true,
                 Some(true)
             ),
             Err(FanotifyMarkReject::Invalid)
@@ -1377,17 +1397,17 @@ mod tests {
             plan_fanotify_mark(
                 FAN_MARK_ADD | FAN_MARK_IGNORE | FAN_MARK_MOUNT,
                 FAN_ACCESS,
-                0,
+                0, true,
                 Some(true)
             ),
             Err(FanotifyMarkReject::Invalid)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_IGNORE, FAN_ACCESS, 0, Some(true)),
+            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_IGNORE, FAN_ACCESS, 0, true, Some(true)),
             Err(FanotifyMarkReject::IsDirectory)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_IGNORE, FAN_ACCESS, 0, Some(false)),
+            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_IGNORE, FAN_ACCESS, 0, true, Some(false)),
             Ok(FanotifyMarkPlan::Ignored)
         );
         // The legacy ignore API accepts a directory without SURV_MODIFY.
@@ -1395,14 +1415,73 @@ mod tests {
             plan_fanotify_mark(
                 FAN_MARK_ADD | FAN_MARK_IGNORED_MASK,
                 FAN_ACCESS,
-                0,
+                0, true,
                 Some(true)
             ),
             Ok(FanotifyMarkPlan::Ignored)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_FLUSH | FAN_MARK_MOUNT, FAN_ACCESS, 0, None),
+            plan_fanotify_mark(FAN_MARK_FLUSH | FAN_MARK_MOUNT, FAN_ACCESS, 0, true, None),
             Ok(FanotifyMarkPlan::Flush)
+        );
+    }
+
+    /// Only `FAN_REPORT_MNT` lacks a provider in this kernel; every other
+    /// recognised init flag is either implemented here or is a plain flag
+    /// Linux's own `fanotify_init(2)` acts on.
+    #[test]
+    fn fanotify_unsupported_init_flags_are_only_mount_events() {
+        assert!(fanotify_init_unsupported(FAN_REPORT_MNT));
+        assert!(fanotify_init_unsupported(FAN_REPORT_MNT | FAN_CLASS_NOTIF));
+        for supported in [
+            FAN_REPORT_FD_ERROR,
+            FAN_UNLIMITED_QUEUE,
+            FAN_UNLIMITED_MARKS,
+            FAN_REPORT_PIDFD,
+            FAN_REPORT_TID,
+            FAN_CLASS_CONTENT,
+            FAN_REPORT_FID,
+            0,
+        ] {
+            assert!(
+                !fanotify_init_unsupported(supported),
+                "0x{supported:x} has a provider"
+            );
+        }
+    }
+
+    /// `do_fanotify_mark()` gates every non-inode mark scope on
+    /// `ns_capable(group->user_ns, CAP_SYS_ADMIN)` and reports `-EPERM`, while
+    /// an inode mark needs no capability at all.
+    #[test]
+    fn fanotify_mount_mark_scopes_require_group_capability() {
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_ACCESS, 0, false, Some(true)),
+            Err(FanotifyMarkReject::Permission)
+        );
+        assert_eq!(
+            plan_fanotify_mark(
+                FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+                FAN_ACCESS,
+                0,
+                false,
+                Some(true)
+            ),
+            Err(FanotifyMarkReject::Permission)
+        );
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_ACCESS, 0, true, Some(true)),
+            Ok(FanotifyMarkPlan::Add)
+        );
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_ACCESS, 0, false, Some(true)),
+            Ok(FanotifyMarkPlan::Add)
+        );
+        // The report-mode rules still run first, and a mount mark with a bad
+        // mask reports EINVAL rather than EPERM.
+        assert_eq!(
+            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_MNTNS, FAN_ACCESS, 0, false, Some(true)),
+            Err(FanotifyMarkReject::Invalid)
         );
     }
 
@@ -1432,10 +1511,12 @@ mod tests {
             fanotify_init_admission(FAN_REPORT_MNT, 0),
             Err(FanotifyInitReject::Unsupported)
         );
-        assert_eq!(
-            fanotify_init_admission(FAN_REPORT_FD_ERROR, 0),
-            Err(FanotifyInitReject::Unsupported)
-        );
+        // FAN_REPORT_FD_ERROR is a Linux feature behind the admin gate, and
+        // FAN_UNLIMITED_QUEUE is implemented by fanotify_init(2) itself, so
+        // neither is an unsupported facility: the flag table and grammar admit
+        // them.
+        assert_eq!(fanotify_init_admission(FAN_REPORT_FD_ERROR, 0), Ok(()));
+        assert_eq!(fanotify_init_admission(FAN_UNLIMITED_QUEUE, 0), Ok(()));
         // event_f_flags outside FANOTIFY_INIT_ALL_EVENT_F_BITS, and O_ACCMODE 3.
         assert_eq!(
             fanotify_init_admission(0, 0x0020_0000),
@@ -1465,10 +1546,7 @@ mod tests {
             fanotify_init_admission(FAN_CLASS_PRE_CONTENT | FAN_CLOEXEC, 0),
             Ok(())
         );
-        assert_eq!(
-            fanotify_init_admission(FAN_UNLIMITED_MARKS, 0),
-            Err(FanotifyInitReject::Unsupported)
-        );
+        assert_eq!(fanotify_init_admission(FAN_UNLIMITED_MARKS, 0), Ok(()));
         // FAN_ENABLE_AUDIT is anchored on CAP_AUDIT_WRITE in Linux, not on the
         // flag table.
         assert_eq!(fanotify_init_admission(FAN_ENABLE_AUDIT, 0), Ok(()));
@@ -1485,7 +1563,7 @@ mod tests {
         assert_eq!(fanotify_init_admission(0x80 | 0x100, 0), Ok(()));
         // FAN_Q_OVERFLOW is not in `valid_mask`.
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD, FAN_Q_OVERFLOW, 0, Some(false)),
+            plan_fanotify_mark(FAN_MARK_ADD, FAN_Q_OVERFLOW, 0, true, Some(false)),
             Err(FanotifyMarkReject::Invalid)
         );
         assert_eq!(
@@ -1496,8 +1574,11 @@ mod tests {
             fanotify_init_admission(FAN_REPORT_FID | FAN_CLASS_CONTENT, 0),
             Err(FanotifyInitReject::Invalid)
         );
+        // 0x10 is FAN_UNLIMITED_QUEUE, which fanotify_init(2) itself
+        // implements by raising the queue budget, so it is admitted.
+        assert_eq!(fanotify_init_admission(FAN_UNLIMITED_QUEUE, 0), Ok(()));
         assert_eq!(
-            fanotify_init_admission(0x10, 0),
+            fanotify_init_admission(FAN_REPORT_MNT, 0),
             Err(FanotifyInitReject::Unsupported)
         );
         assert_eq!(
@@ -1518,56 +1599,56 @@ mod tests {
             Ok(InotifyWatchPlan::Add)
         );
         assert_eq!(
-            plan_fanotify_mark(0x80, 0, 0, None),
+            plan_fanotify_mark(0x80, 0, 0, true, None),
             Ok(FanotifyMarkPlan::Flush)
         );
         assert_eq!(
-            plan_fanotify_mark(1 | 8, 1, 0, Some(false)),
+            plan_fanotify_mark(1 | 8, 1, 0, true, Some(false)),
             Err(FanotifyMarkReject::NotDirectory)
         );
         assert_eq!(
             plan_fanotify_mark(
                 FAN_MARK_ADD | FAN_MARK_EVICTABLE,
                 FAN_ACCESS,
-                0,
+                0, true,
                 Some(false)
             ),
             Ok(FanotifyMarkPlan::Add)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD, 0x2000, 0, Some(false)),
+            plan_fanotify_mark(FAN_MARK_ADD, 0x2000, 0, true, Some(false)),
             Err(FanotifyMarkReject::Invalid)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD, 0, 0, Some(false)),
+            plan_fanotify_mark(FAN_MARK_ADD, 0, 0, true, Some(false)),
             Err(FanotifyMarkReject::Invalid)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_FLUSH | FAN_MARK_DONT_FOLLOW, FAN_ACCESS, 0, None),
+            plan_fanotify_mark(FAN_MARK_FLUSH | FAN_MARK_DONT_FOLLOW, FAN_ACCESS, 0, true, None),
             Err(FanotifyMarkReject::Invalid)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_FLUSH | FAN_MARK_MOUNT, FAN_ACCESS, 0, None),
+            plan_fanotify_mark(FAN_MARK_FLUSH | FAN_MARK_MOUNT, FAN_ACCESS, 0, true, None),
             Ok(FanotifyMarkPlan::Flush)
         );
         assert_eq!(
             plan_fanotify_mark(
                 FAN_MARK_ADD | FAN_MARK_MOUNT | FAN_MARK_IGNORE,
                 FAN_ACCESS,
-                0,
+                0, true,
                 Some(true)
             ),
             Err(FanotifyMarkReject::Invalid)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_IGNORE, FAN_ACCESS, 0, Some(true)),
+            plan_fanotify_mark(FAN_MARK_ADD | FAN_MARK_IGNORE, FAN_ACCESS, 0, true, Some(true)),
             Err(FanotifyMarkReject::IsDirectory)
         );
         assert_eq!(
             plan_fanotify_mark(
                 FAN_MARK_ADD,
                 FAN_RENAME,
-                FAN_REPORT_DFID_NAME | FAN_REPORT_FID,
+                FAN_REPORT_DFID_NAME | FAN_REPORT_FID, true,
                 Some(false)
             ),
             Err(FanotifyMarkReject::NotDirectory)
@@ -1576,13 +1657,13 @@ mod tests {
             plan_fanotify_mark(
                 FAN_MARK_ADD,
                 FAN_CREATE | FAN_MOVED_FROM | FAN_MOVED_TO,
-                FAN_REPORT_DFID_NAME_TARGET,
+                FAN_REPORT_DFID_NAME_TARGET, true,
                 Some(false)
             ),
             Err(FanotifyMarkReject::NotDirectory)
         );
         assert_eq!(
-            plan_fanotify_mark(FAN_MARK_REMOVE | FAN_MARK_IGNORE, FAN_ACCESS, 0, Some(true)),
+            plan_fanotify_mark(FAN_MARK_REMOVE | FAN_MARK_IGNORE, FAN_ACCESS, 0, true, Some(true)),
             Ok(FanotifyMarkPlan::Ignored)
         );
     }

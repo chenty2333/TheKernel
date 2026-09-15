@@ -38,6 +38,52 @@ const Q_SETINFO: u32 = 0x800006;
 const Q_GETQUOTA: u32 = 0x800007;
 const Q_SETQUOTA: u32 = 0x800008;
 const Q_GETNEXTQUOTA: u32 = 0x800009;
+// The XFS quota family is `XQM_CMD(x)`, i.e. `('X' << 8) + x`
+// (include/uapi/linux/dqblk_xfs.h:27-43), so the shifted selector is 0x5801
+// through 0x5809 rather than the 0x8000xx range of the Q_* family.
+const Q_XQUOTAON: u32 = 0x5801;
+const Q_XQUOTAOFF: u32 = 0x5802;
+const Q_XGETQUOTA: u32 = 0x5803;
+const Q_XSETQLIM: u32 = 0x5804;
+const Q_XGETQSTAT: u32 = 0x5805;
+const Q_XQUOTARM: u32 = 0x5806;
+const Q_XQUOTASYNC: u32 = 0x5807;
+const Q_XGETQSTATV: u32 = 0x5808;
+const Q_XGETNEXTQUOTA: u32 = 0x5809;
+// `fs_disk_quota.d_fieldmask` (include/uapi/linux/dqblk_xfs.h:56-104).
+const FS_DQ_ISOFT: u32 = 1 << 0;
+const FS_DQ_IHARD: u32 = 1 << 1;
+const FS_DQ_BSOFT: u32 = 1 << 2;
+const FS_DQ_BHARD: u32 = 1 << 3;
+const FS_DQ_RTBSOFT: u32 = 1 << 4;
+const FS_DQ_RTBHARD: u32 = 1 << 5;
+const FS_DQ_BTIMER: u32 = 1 << 6;
+const FS_DQ_ITIMER: u32 = 1 << 7;
+const FS_DQ_RTBTIMER: u32 = 1 << 8;
+const FS_DQ_BWARNS: u32 = 1 << 9;
+const FS_DQ_IWARNS: u32 = 1 << 10;
+const FS_DQ_RTBWARNS: u32 = 1 << 11;
+const FS_DQ_BCOUNT: u32 = 1 << 12;
+const FS_DQ_ICOUNT: u32 = 1 << 13;
+const FS_DQ_RTBCOUNT: u32 = 1 << 14;
+const FS_DQ_BIGTIME: u32 = 1 << 15;
+// `fs_quota_stat.qs_flags` (include/uapi/linux/dqblk_xfs.h:137-145).
+const FS_QUOTA_UDQ_ACCT: u16 = 1 << 0;
+const FS_QUOTA_UDQ_ENFD: u16 = 1 << 1;
+const FS_QUOTA_GDQ_ACCT: u16 = 1 << 2;
+const FS_QUOTA_GDQ_ENFD: u16 = 1 << 3;
+const FS_QUOTA_PDQ_ACCT: u16 = 1 << 4;
+const FS_QUOTA_PDQ_ENFD: u16 = 1 << 5;
+// `fs_disk_quota.d_flags` / `d_version` and the two stat versions
+// (include/uapi/linux/dqblk_xfs.h:52, :147-157).
+const FS_USER_QUOTA: i8 = 1 << 0;
+const FS_PROJ_QUOTA: i8 = 1 << 1;
+const FS_GROUP_QUOTA: i8 = 1 << 2;
+const FS_DQUOT_VERSION: i8 = 1;
+const FS_QSTAT_VERSION: i8 = 1;
+// `quota_btobb()`/`quota_bbtob()`: fs_disk_quota counts 512-byte basic blocks
+// while the VFS quota structures count bytes (fs/quota/quota.c:522-532).
+const XFS_BB_SHIFT: u32 = 9;
 const QFMT_VFS_V1: u32 = 4;
 const QFMT_VFS_OLD: u32 = 1;
 const QIF_BLIMITS: u32 = 1;
@@ -101,6 +147,103 @@ struct IfNextDqblk {
     itime: u64,
     valid: u32,
     id: u32,
+}
+/// `struct fs_disk_quota` (include/uapi/linux/dqblk_xfs.h:105-131): 112 bytes
+/// of limits, usage and expiry timers in 512-byte basic blocks.
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct XfsDiskQuota {
+    d_version: i8,
+    d_flags: i8,
+    d_fieldmask: u16,
+    d_id: u32,
+    d_blk_hardlimit: u64,
+    d_blk_softlimit: u64,
+    d_ino_hardlimit: u64,
+    d_ino_softlimit: u64,
+    d_bcount: u64,
+    d_icount: u64,
+    d_itimer: i32,
+    d_btimer: i32,
+    d_iwarns: u16,
+    d_bwarns: u16,
+    d_itimer_hi: i8,
+    d_btimer_hi: i8,
+    d_rtbtimer_hi: i8,
+    d_padding2: i8,
+    d_rtb_hardlimit: u64,
+    d_rtb_softlimit: u64,
+    d_rtbcount: u64,
+    d_rtbtimer: i32,
+    d_rtbwarns: u16,
+    d_padding3: i16,
+    d_padding4: [i8; 8],
+}
+/// `struct fs_qfilestat` (include/uapi/linux/dqblk_xfs.h:159-163).
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct XfsQfFileStat {
+    qfs_ino: u64,
+    qfs_nblks: u64,
+    qfs_nextents: u32,
+    _pad: u32,
+}
+/// `struct fs_quota_stat` (include/uapi/linux/dqblk_xfs.h:165-177): the
+/// Q_XGETQSTAT layout, which has room for user and group quotas only.
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct XfsQuotaStat {
+    qs_version: i8,
+    /// The compiler's padding byte before the 2-byte-aligned `qs_flags`.
+    _pad0: u8,
+    qs_flags: u16,
+    qs_pad: i8,
+    /// The three compiler-owned padding bytes between `qs_pad` and the
+    /// 8-byte-aligned `qs_uquota`, and the four that align the whole struct to
+    /// 8 bytes.  Both are spelled out so the type has no implicit padding and
+    /// can be written to user memory by value.
+    _padding: [u8; 3],
+    qs_uquota: XfsQfFileStat,
+    qs_gquota: XfsQfFileStat,
+    qs_incoredqs: u32,
+    qs_btimelimit: i32,
+    qs_itimelimit: i32,
+    qs_rtbtimelimit: i32,
+    qs_bwarnlimit: u16,
+    qs_iwarnlimit: u16,
+    _tail: [u8; 4],
+}
+/// `struct fs_qfilestatv` (include/uapi/linux/dqblk_xfs.h:187-192).
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct XfsQfFileStatV {
+    qfs_ino: u64,
+    qfs_nblks: u64,
+    qfs_nextents: u32,
+    qfs_pad: u32,
+}
+/// `struct fs_quota_statv` (include/uapi/linux/dqblk_xfs.h:183-200): the
+/// versioned layout used by Q_XGETQSTATV, with a project entry and
+/// self-describing padding.
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct XfsQuotaStatV {
+    qs_version: i8,
+    qs_pad1: u8,
+    qs_flags: u16,
+    qs_incoredqs: u32,
+    qs_uquota: XfsQfFileStatV,
+    qs_gquota: XfsQfFileStatV,
+    qs_pquota: XfsQfFileStatV,
+    qs_btimelimit: i32,
+    qs_itimelimit: i32,
+    qs_rtbtimelimit: i32,
+    qs_bwarnlimit: u16,
+    qs_iwarnlimit: u16,
+    qs_rtbwarnlimit: u16,
+    qs_pad3: u16,
+    qs_pad4: u32,
+    qs_pad2: [u64; 7],
 }
 #[derive(Clone, Default)]
 struct QuotaData {
@@ -836,6 +979,215 @@ fn write_struct<M: UserMemory + ?Sized, T: bytemuck::NoUninit>(
     }
     vm_write_slice(memory, addr as *mut u8, bytemuck::bytes_of(value)).map_err(map_usercopy_error)
 }
+/// `quota_btobb()` (fs/quota/quota.c:534-537): bytes to 512-byte basic
+/// blocks, rounding up.
+const fn xfs_blocks_from_bytes(bytes: u64) -> u64 {
+    (bytes + (1 << XFS_BB_SHIFT) - 1) >> XFS_BB_SHIFT
+}
+/// `quota_bbtob()` (fs/quota/quota.c:529-532): basic blocks back to bytes.
+const fn xfs_bytes_from_blocks(blocks: u64) -> u64 {
+    blocks << XFS_BB_SHIFT
+}
+/// `copy_to_if_dqblk()` (fs/quota/quota.c) reports the VFS quota block limits
+/// in KiB while `fs_disk_quota` carries 512-byte blocks, so the wire form of a
+/// KiB limit is exactly twice its value.
+const fn if_dqblk_limit_to_xfs(kib: u64) -> u64 {
+    kib * 2
+}
+/// `copy_from_if_dqblk()`: `d_spc_hardlimit = (u64)dqb_bhardlimit << 10`, which
+/// `copy_to_if_dqblk()` reverses with a truncating `/ 1024`.
+const fn xfs_limit_to_if_dqblk(blocks: u64) -> u64 {
+    xfs_bytes_from_blocks(blocks) / 1024
+}
+/// `copy_from_xfs_dqblk_ts()` (fs/quota/quota.c:539-545): a 40-bit quota timer
+/// is `(u32)timer | (s64)timer_hi << 32` only when `FS_DQ_BIGTIME` is set;
+/// otherwise the 32-bit low half is sign extended.
+const fn xfs_timer_from_wire(low: i32, high: i8, fieldmask: u16) -> u64 {
+    if fieldmask & FS_DQ_BIGTIME as u16 != 0 {
+        (low as u32 as u64) | ((high as i64 as u64) << 32)
+    } else {
+        low as i64 as u64
+    }
+}
+/// `copy_from_xfs_dqblk()` field-mask translation
+/// (fs/quota/quota.c:566-591).  Realtime and warning groups map to `QC_*`
+/// bits that `do_set_dqblk()` accepts but does not act on for a dquot
+/// provider, and `FS_DQ_BIGTIME` is not a field selector, so neither sets a
+/// VFS `dqb_valid` bit.
+const fn qif_valid_from_xfs(fieldmask: u32) -> u32 {
+    let mut valid = 0;
+    if fieldmask & (FS_DQ_BSOFT | FS_DQ_BHARD) != 0 {
+        valid |= QIF_BLIMITS;
+    }
+    if fieldmask & FS_DQ_BCOUNT != 0 {
+        valid |= QIF_SPACE;
+    }
+    if fieldmask & (FS_DQ_ISOFT | FS_DQ_IHARD) != 0 {
+        valid |= QIF_ILIMITS;
+    }
+    if fieldmask & FS_DQ_ICOUNT != 0 {
+        valid |= QIF_INODES;
+    }
+    if fieldmask & FS_DQ_BTIMER != 0 {
+        valid |= QIF_BTIME;
+    }
+    if fieldmask & FS_DQ_ITIMER != 0 {
+        valid |= QIF_ITIME;
+    }
+    valid
+}
+/// `copy_from_xfs_dqblk()` as a whole (fs/quota/quota.c:546-597).
+fn if_dqblk_from_xfs(src: &XfsDiskQuota) -> IfDqblk {
+    IfDqblk {
+        bhardlimit: xfs_limit_to_if_dqblk(src.d_blk_hardlimit),
+        bsoftlimit: xfs_limit_to_if_dqblk(src.d_blk_softlimit),
+        curspace: xfs_bytes_from_blocks(src.d_bcount),
+        ihardlimit: src.d_ino_hardlimit,
+        isoftlimit: src.d_ino_softlimit,
+        curinodes: src.d_icount,
+        btime: xfs_timer_from_wire(src.d_btimer, src.d_btimer_hi, src.d_fieldmask),
+        itime: xfs_timer_from_wire(src.d_itimer, src.d_itimer_hi, src.d_fieldmask),
+        valid: qif_valid_from_xfs(src.d_fieldmask as u32),
+        _pad: 0,
+    }
+}
+/// `copy_to_xfs_dqblk()` (fs/quota/quota.c:672-701).
+fn xfs_disk_quota(data: &QuotaData, ty: usize, id: u32) -> XfsDiskQuota {
+    let record = data
+        .records
+        .get(&(ty as u8, id))
+        .copied()
+        .unwrap_or_default();
+    let bigtime = record.btime > i32::MAX as u64
+        || record.btime < i32::MIN as i64 as u64
+        || record.itime > i32::MAX as u64
+        || record.itime < i32::MIN as i64 as u64;
+    let (btimer_hi, itimer_hi) = if bigtime {
+        ((record.btime >> 32) as i8, (record.itime >> 32) as i8)
+    } else {
+        (0, 0)
+    };
+    XfsDiskQuota {
+        d_version: FS_DQUOT_VERSION,
+        d_flags: match ty {
+            0 => FS_USER_QUOTA,
+            2 => FS_PROJ_QUOTA,
+            _ => FS_GROUP_QUOTA,
+        },
+        d_fieldmask: if bigtime { FS_DQ_BIGTIME as u16 } else { 0 },
+        d_id: id,
+        d_blk_hardlimit: if_dqblk_limit_to_xfs(record.bhardlimit),
+        d_blk_softlimit: if_dqblk_limit_to_xfs(record.bsoftlimit),
+        d_ino_hardlimit: record.ihardlimit,
+        d_ino_softlimit: record.isoftlimit,
+        d_bcount: xfs_blocks_from_bytes(record.curspace),
+        d_icount: record.curinodes,
+        d_itimer: record.itime as u32 as i32,
+        d_btimer: record.btime as u32 as i32,
+        d_itimer_hi: itimer_hi,
+        d_btimer_hi: btimer_hi,
+        ..Default::default()
+    }
+}
+/// `quota_state_to_flags()` (include/linux/quota.h): one accounting bit and one
+/// enforcement bit per active quota type.  Every TheKernel activation is a
+/// `dquot_load_quota_inode(..., DQUOT_USAGE_ENABLED | DQUOT_LIMITS_ENABLED)`,
+/// so an enabled type reports both.
+fn xfs_state_flags(data: &QuotaData) -> u16 {
+    let mut flags = 0;
+    for (ty, enabled) in data.enabled.iter().enumerate() {
+        if !enabled {
+            continue;
+        }
+        flags |= 1u16 << (2 * ty);
+        flags |= 1u16 << (2 * ty + 1);
+    }
+    flags
+}
+/// `dquot_get_state()` fills the quota-file accounting from the live quota
+/// inode: `tstate->ino = dqopt->files[type]->i_ino`,
+/// `tstate->blocks = dqopt->files[type]->i_blocks` and
+/// `tstate->nextents = 1; /* We don't know... */` (fs/quota/dquot.c:2885).
+/// It leaves `s_incoredqs`, every warning limit and every realtime field at
+/// zero, which is what `quota_getstate()` then reports.
+fn xfs_file_stat(data: &QuotaData, ty: usize) -> Option<[u64; 3]> {
+    let metadata = data.quota_files[ty].as_ref()?.metadata().ok()?;
+    Some([metadata.inode, metadata.blocks, 1])
+}
+fn xfs_quota_stat(data: &QuotaData, ty: usize) -> XfsQuotaStat {
+    let file = |ty: usize| -> XfsQfFileStat {
+        match xfs_file_stat(data, ty) {
+            Some([ino, nblks, nextents]) => XfsQfFileStat {
+                qfs_ino: ino,
+                qfs_nblks: nblks,
+                qfs_nextents: nextents as u32,
+                _pad: 0,
+            },
+            None => XfsQfFileStat::default(),
+        }
+    };
+    // `quota_getstate()` (fs/quota/quota.c:377-425): project-quota storage is
+    // reported in the group slot only while group accounting is disabled,
+    // because `fs_quota_stat` has no third slot.
+    let gquota = if data.enabled[1] {
+        file(1)
+    } else {
+        file(2)
+    };
+    XfsQuotaStat {
+        qs_version: FS_QSTAT_VERSION,
+        _pad0: 0,
+        qs_flags: xfs_state_flags(data),
+        qs_pad: 0,
+        _padding: [0; 3],
+        _tail: [0; 4],
+        qs_uquota: file(0),
+        qs_gquota: gquota,
+        qs_incoredqs: 0,
+        qs_btimelimit: data.info[ty].bgrace as u32 as i32,
+        qs_itimelimit: data.info[ty].igrace as u32 as i32,
+        qs_rtbtimelimit: 0,
+        qs_bwarnlimit: 0,
+        qs_iwarnlimit: 0,
+    }
+}
+fn xfs_quota_statv(data: &QuotaData, ty: usize) -> XfsQuotaStatV {
+    let file = |ty: usize| -> XfsQfFileStatV {
+        match xfs_file_stat(data, ty) {
+            Some([ino, nblks, nextents]) => XfsQfFileStatV {
+                qfs_ino: ino,
+                qfs_nblks: nblks,
+                qfs_nextents: nextents as u32,
+                qfs_pad: 0,
+            },
+            None => XfsQfFileStatV::default(),
+        }
+    };
+    XfsQuotaStatV {
+        qs_version: FS_QSTAT_VERSION,
+        qs_pad1: 0,
+        qs_flags: xfs_state_flags(data),
+        qs_incoredqs: 0,
+        qs_uquota: file(0),
+        qs_gquota: file(1),
+        qs_pquota: file(2),
+        qs_btimelimit: data.info[ty].bgrace as u32 as i32,
+        qs_itimelimit: data.info[ty].igrace as u32 as i32,
+        qs_rtbtimelimit: 0,
+        qs_bwarnlimit: 0,
+        qs_iwarnlimit: 0,
+        qs_rtbwarnlimit: 0,
+        qs_pad3: 0,
+        qs_pad4: 0,
+        qs_pad2: [0; 7],
+    }
+}
+/// The Q_XGETQSTAT form of `quota_getstate()`'s "No quota enabled?" test
+/// (fs/quota/quota.c:392-394): one active type anywhere on the superblock is
+/// enough, and the requested type only selects the timer limits.
+fn any_quota_active(data: &QuotaData) -> bool {
+    data.enabled.iter().any(|enabled| *enabled)
+}
 /// `do_quotactl()`: provider support, quota-type support, the permission table
 /// and then the command itself.
 ///
@@ -1075,6 +1427,117 @@ fn quotactl<M: UserMemory + ?Sized>(
                     id: next,
                 },
             )?;
+            Ok(0)
+        }
+        // The XFS family (`XQM_CMD`) is a distinct wire protocol over the same
+        // superblock.  `do_quotactl()` reaches these arms only after the
+        // provider, quota-type and permission decisions, and each one mirrors
+        // its own copy order (fs/quota/quota.c:624-670, :731-786).
+        Q_XQUOTAON | Q_XQUOTAOFF | Q_XQUOTARM => {
+            // quota_enable()/quota_disable()/quota_rmxquota() reserve the flag
+            // word before they ask for a provider method:
+            //   if (copy_from_user(&flags, addr, sizeof(flags))) return -EFAULT;
+            //   if (!sb->s_qcop->quota_enable) return -ENOSYS;
+            // The dquot provider has neither method unless the filesystem set
+            // DQUOT_QUOTA_SYS_FILE (XFS and OCFS2 only), and never has
+            // rm_xquota, so a quota-v2 filesystem answers ENOSYS
+            // (fs/quota/dquot.c:2602-2613, :2641-2648).
+            let _flags: u32 = read_struct(memory, addr)?;
+            Err(LinuxError::ENOSYS.into())
+        }
+        Q_XQUOTASYNC => {
+            //   case Q_XQUOTASYNC:
+            //           if (sb_rdonly(sb)) return -EROFS;
+            //           /* XFS quotas are fully coherent now, making this call a noop */
+            //           return 0;
+            // `quotactl_cmd_write()` exempts it, so a read-only mount reaches
+            // this arm through quotactl_fd() instead of failing with EROFS.
+            if crate::mounts::is_readonly(&root)? {
+                Err(AxError::ReadOnlyFilesystem)
+            } else {
+                Ok(0)
+            }
+        }
+        Q_XGETQSTAT | Q_XGETQSTATV => {
+            // Both selectors check the provider, then read the state and
+            // answer -ENOSYS when no quota type is active; only the V form
+            // probes the caller's version word on the way, after the provider
+            // check and before the state query (fs/quota/quota.c:497-527 with
+            // :466-468, and :434-450 with :369-371):
+            //   if (!sb->s_qcop->get_state) return -ENOSYS;
+            //   if (copy_from_user(&fqs, addr, 1)) return -EFAULT;   /* V only */
+            //   switch (fqs.qs_version) { case FS_QSTATV_VERSION1: break;
+            //                             default: return -EINVAL; }  /* V only */
+            //   /* quota_state_to_flags() == 0 */ return -ENOSYS;    /* inactive */
+            // The dquot provider is always present here, so the version probe is
+            // the first thing a caller can observe.
+            if op == Q_XGETQSTATV {
+                let version: i8 = read_struct(memory, addr)?;
+                if version != FS_QSTAT_VERSION {
+                    return Err(AxError::InvalidInput);
+                }
+            }
+            let q = state.0.lock();
+            if !any_quota_active(&q) {
+                return Err(LinuxError::ENOSYS.into());
+            }
+            if op == Q_XGETQSTATV {
+                write_struct(memory, addr, &xfs_quota_statv(&q, ty))?;
+            } else {
+                write_struct(memory, addr, &xfs_quota_stat(&q, ty))?;
+            }
+            Ok(0)
+        }
+        Q_XGETQUOTA => {
+            let q = state.0.lock();
+            // quota_getxquota(): provider, identifier mapping, then
+            // `dquot_get_dqblk()` -> `dqget()` -> ESRCH for an inactive type,
+            // and the copy out last (fs/quota/quota.c:705-725).
+            if !q.enabled[ty] {
+                return Err(LinuxError::ESRCH.into());
+            }
+            write_struct(memory, addr, &xfs_disk_quota(&q, ty, id))?;
+            Ok(0)
+        }
+        Q_XGETNEXTQUOTA => {
+            let q = state.0.lock();
+            // quota_getnextxquota(): `dquot_get_next_id()` reports ESRCH while
+            // the type is inactive and ENOENT once the identifier space is
+            // exhausted (fs/quota/quota.c:731-753).
+            if !q.enabled[ty] {
+                return Err(LinuxError::ESRCH.into());
+            }
+            // `dquot_get_next_id()` reports the smallest identifier strictly
+            // greater than the requested one, so the search starts after it,
+            // and exhaustion is ENOENT rather than ESRCH.
+            let Some(start) = id.checked_add(1) else {
+                return Err(LinuxError::ENOENT.into());
+            };
+            let Some((&(_, next), _)) = q
+                .records
+                .range((ty as u8, start)..)
+                .find(|((kind, _), _)| *kind == ty as u8)
+            else {
+                return Err(LinuxError::ENOENT.into());
+            };
+            write_struct(memory, addr, &xfs_disk_quota(&q, ty, next))?;
+            Ok(0)
+        }
+        Q_XSETQLIM => {
+            // quota_setxquota() reserves the whole wire structure before it
+            // validates anything, then maps the identifier and reports ESRCH
+            // from `dquot_set_dqblk()` for an inactive type
+            // (fs/quota/quota.c:624-670).
+            let new: XfsDiskQuota = read_struct(memory, addr)?;
+            let mut q = state.0.lock();
+            if !q.enabled[ty] {
+                return Err(LinuxError::ESRCH.into());
+            }
+            merge_record(
+                q.records.entry((ty as u8, id)).or_default(),
+                if_dqblk_from_xfs(&new),
+            );
+            q.dirty = true;
             Ok(0)
         }
         _ => Err(AxError::InvalidInput),

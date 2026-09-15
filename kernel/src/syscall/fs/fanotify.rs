@@ -48,22 +48,28 @@ pub fn sys_fanotify_init(flags: u32, event_f_flags: u32) -> AxResult<isize> {
     {
         return Err(AxError::OperationNotPermitted);
     }
-    // Linux would now admit an unprivileged FAN_REPORT_FID notification group
-    // carrying FANOTIFY_UNPRIV.  TheKernel has no such mode - it never denies
-    // mount or filesystem marks to a group, and always reports `event->pid` -
-    // so it refuses the group instead of granting it Linux's unprivileged
-    // group would not have.
-    if !may_admin {
-        return Err(AxError::OperationNotPermitted);
-    }
     // Facilities with no provider in this kernel are well-formed Linux
     // requests and are reported as unsupported rather than invalid.
     if tk_linux_fsnotify::fanotify_init_unsupported(flags) {
         return Err(AxError::OperationNotSupported);
     }
+    // An unprivileged listener is admitted, but Linux marks the group
+    // FANOTIFY_UNPRIV:
+    //   if (!ns_capable_noaudit(&init_user_ns, CAP_SYS_ADMIN)) {
+    //           /* Setting the internal flag FANOTIFY_UNPRIV on the group
+    //            * prevents setting mount/filesystem marks on this group and
+    //            * prevents reporting pid and open fd in events. */
+    //           internal_flags |= FANOTIFY_UNPRIV;
+    //   }
+    // The group's user namespace is the caller's current one and decides the
+    // mark-scope gate, while `FANOTIFY_UNPRIV` decides the pid masking; the
+    // EPERM rule above already guarantees such a group requested FID or mount
+    // reporting, and mount reporting is the unimplemented case refused here.
+    let unprivileged = !may_admin;
+    let user_ns = thread.current_cred().user_ns().clone();
 
     add_file_like_with_flags(
-        FanotifyFile::new(flags, event_f_flags)?,
+        FanotifyFile::new(flags, event_f_flags, user_ns, unprivileged)?,
         flags & FAN_CLOEXEC != 0,
         O_RDWR
             | if flags & FAN_NONBLOCK != 0 {

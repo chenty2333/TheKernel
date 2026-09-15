@@ -73,6 +73,20 @@ fn current_may_mount() -> bool {
     )
 }
 
+/// Linux's `ns_capable(current_user_ns(), CAP_SYS_ADMIN)`, the capability
+/// `open_tree(OPEN_TREE_NAMESPACE)` (fs/namespace.c:3224-3226) and
+/// `fsmount(FSMOUNT_NAMESPACE)` (:4451-4453) require: privileged over the
+/// caller's *own* user namespace, because the new mount namespace is owned by
+/// it.  `may_mount()` (:2007-2010) is a different domain — the mount
+/// namespace's owning user namespace — and the two are observably distinct:
+/// a caller that unshares only `CLONE_NEWUSER` satisfies this test while
+/// `may_mount()` is still false.
+fn current_user_namespace_may_admin() -> bool {
+    let curr = current();
+    let actor = curr.as_thread().current_cred();
+    ns_capable(&actor, actor.user_ns(), CAP_SYS_ADMIN)
+}
+
 /// One authoritative filesystem-type registry for both legacy mount and the
 /// fsopen family.  A descriptor deliberately names a provider *kind* rather
 /// than duplicating creation code: fsconfig/fsmount and mount(2) dispatch into
@@ -187,7 +201,34 @@ fn filesystem_type(name: &str) -> Option<FilesystemType> {
 /// Resolve a v6.18 `mnt_id_req.ns_id` before looking at a mount.  A caller
 /// may query another live mount namespace only with CAP_SYS_ADMIN in that
 /// namespace's owning user namespace; the topology itself remains isolated.
-fn mount_namespace_for_request(req: MntIdReq) -> AxResult<Arc<crate::task::MountNamespace>> {
+///
+/// Linux's `grab_requested_mnt_ns()` (`fs/namespace.c`:5929-5951) resolves the
+/// namespace from `mnt_ns_id` or `mnt_ns_fd` and leaves the refusal to each
+/// caller, which is why the errno differs: `statmount()` returns `-EPERM`
+/// (`:5988-5991`) while `listmount()` returns `-ENOENT` (`:6153-6156`) for the
+/// same foreign namespace.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ForeignNamespace {
+    /// `if (kreq.mnt_ns_id && (ns != current->nsproxy->mnt_ns) &&
+    /// !ns_capable_noaudit(ns->user_ns, CAP_SYS_ADMIN)) return -EPERM;`
+    Statmount,
+    /// The listmount form of the same test answers `-ENOENT`.
+    Listmount,
+}
+
+impl ForeignNamespace {
+    const fn error(self) -> AxError {
+        match self {
+            Self::Statmount => AxError::OperationNotPermitted,
+            Self::Listmount => AxError::NotFound,
+        }
+    }
+}
+
+fn mount_namespace_for_request(
+    req: MntIdReq,
+    foreign: ForeignNamespace,
+) -> AxResult<Arc<crate::task::MountNamespace>> {
     validate_mnt_id_request(req).map_err(map_mount_uapi)?;
     let current_ns = current_mount_namespace();
     let mount_ns = if req.ns_id == 0 {
@@ -218,7 +259,7 @@ fn mount_namespace_for_request(req: MntIdReq) -> AxResult<Arc<crate::task::Mount
         // ID-based lookup deliberately hides an otherwise live namespace
         // from an unauthorized caller.  An fd-selected namespace instead
         // carries its own possession authority and does not take this gate.
-        return Err(AxError::NotFound);
+        return Err(foreign.error());
     }
     Ok(mount_ns)
 }
@@ -444,20 +485,16 @@ fn requested_namespace_root(
 /// `STATMOUNT_BY_FD` takes a different route through Linux than the
 /// identifier form: `do_statmount()` reads the mount out of the descriptor's
 /// own `f_path`, adopts that mount's namespace, and deliberately skips the
-/// `is_path_reachable()` capability test.  A mount with no namespace (one
-/// detached by `MNT_DETACH`) additionally clears `STATMOUNT_MNT_POINT` and
-/// `STATMOUNT_MNT_NS_ID`.
+/// `is_path_reachable()` capability test (fs/namespace.c:5764-5769).
 struct StatmountTarget {
     topology: mounts::MountTopologySnapshot,
     mount: crate::mounts::Mount,
     mount_ns: Arc<crate::task::MountNamespace>,
     fs_root: FsPathBuf,
-    /// False when the descriptor's mount has no namespace.
-    namespaced: bool,
 }
 
 fn statmount_target_by_id(req: MntIdReq) -> AxResult<StatmountTarget> {
-    let mount_ns = mount_namespace_for_request(req)?;
+    let mount_ns = mount_namespace_for_request(req, ForeignNamespace::Statmount)?;
     let topology = mount_ns.topology().try_snapshot()?;
     let mount = topology
         .mounts
@@ -471,20 +508,47 @@ fn statmount_target_by_id(req: MntIdReq) -> AxResult<StatmountTarget> {
         mount,
         mount_ns,
         fs_root,
-        namespaced: true,
     })
 }
 
 fn statmount_target_by_fd(req: MntIdReq) -> AxResult<StatmountTarget> {
     // `fget_raw(kreq.mnt_fd)` accepts every descriptor kind, including
-    // O_PATH, because only `f_path.mnt` is consumed.
+    // O_PATH, because only `f_path.mnt` is consumed; a descriptor with no
+    // file fails first (fs/namespace.c:5980-5982):
+    //   mnt_file = fget_raw(kreq.mnt_fd);
+    //   if (!mnt_file) return -EBADF;
     let fd = i32::try_from(req.descriptor_word()).map_err(|_| AxError::BadFileDescriptor)?;
     let file = get_file_like(fd)?;
     let (Some(mount_id), Some(topology)) = (file.vfs_mount_id(), file.vfs_mount_topology()) else {
-        // A detached mount descriptor has no namespace topology retained by
-        // the VFS description.  Linux would report the mount with
-        // MNT_POINT/MNT_NS_ID cleared; that ledger is not addressable here.
-        return Err(AxError::OperationNotSupported);
+        // Two descriptor classes reach this point, and Linux distinguishes
+        // them by the mount behind `f_path.mnt`.
+        //
+        // A detached mount descriptor (`open_tree(OPEN_TREE_CLONE)` or
+        // `fsmount`) names a mount that lives in the anonymous namespace its
+        // creation attached it to.  `do_statmount()` adopts that namespace from
+        // the descriptor and then asks `grab_requested_root()` for the
+        // namespace root; an anonymous namespace's root is the detached mount
+        // itself, which has no distinct child mount, so `grab_requested_root()`
+        // reports -ENOENT (fs/namespace.c:5699-5700, reached from :5754-5757).
+        // Measured on Linux 7.2.4 and on the 7.2.3 oracle: both descriptor
+        // kinds answer ENOENT.
+        if file.downcast_ref::<FsMountFd>().is_some() {
+            return Err(AxError::NotFound);
+        }
+        // Every other descriptor kind whose file is not on a namespace mount —
+        // sockets, pipes, eventfds and nsfs descriptors — is refused with the
+        // error its internal mount carries, because `do_statmount()` adopts the
+        // namespace straight from `f_path.mnt`:
+        //   s->mnt = mnt_file->f_path.mnt;
+        //   ns = real_mount(s->mnt)->mnt_ns;
+        //   if (IS_ERR(ns)) return PTR_ERR(ns);
+        // (fs/namespace.c:5733-5736).  An internal mount's `mnt_ns` *is*
+        // `MNT_NS_INTERNAL`, defined as `ERR_PTR(-EINVAL)`
+        // (fs/mount.h:122), so the answer is -EINVAL before any mount property
+        // is rendered.  Measured on Linux 7.2.4 and on the 7.2.3 oracle: pipe,
+        // eventfd, socket and /proc/self/ns/mnt descriptors all answer EINVAL,
+        // while an O_PATH descriptor on a real mount answers 0.
+        return Err(AxError::InvalidInput);
     };
     let topology = topology.try_snapshot()?;
     let mount = topology
@@ -507,7 +571,6 @@ fn statmount_target_by_fd(req: MntIdReq) -> AxResult<StatmountTarget> {
         mount,
         mount_ns,
         fs_root,
-        namespaced: true,
     })
 }
 
@@ -644,15 +707,15 @@ pub fn sys_statmount<M: UserMemory + ?Sized>(
         mount,
         mount_ns,
         fs_root,
-        namespaced,
     } = target;
     let topology = &topology;
     let mount = &mount;
-    let mask = if namespaced {
-        mask
-    } else {
-        mask & !(STATMOUNT_MNT_POINT | STATMOUNT_MNT_NS_ID)
-    };
+    // Linux clears STATMOUNT_MNT_POINT and STATMOUNT_MNT_NS_ID when the
+    // descriptor's mount has no namespace at all, which happens only for a
+    // mount detached by MNT_DETACH (fs/namespace.c:5737-5743).  Every mount
+    // this function can reach is addressable through a namespace record, and a
+    // detached FsMountFd descriptor is refused with ENOENT before rendering, so
+    // the requested mask stands as it is.
     let actor = current().as_thread().current_cred();
     let visible_point = match visible_mount_point(&mount.target, &fs_root)? {
         Some(point) => Some(point),
@@ -913,7 +976,7 @@ pub fn sys_listmount<M: UserMemory + ?Sized>(
     if req.param != 0 {
         validate_unique_mount_id(req.param).map_err(map_mount_uapi)?;
     }
-    let mount_ns = mount_namespace_for_request(req)?;
+    let mount_ns = mount_namespace_for_request(req, ForeignNamespace::Listmount)?;
     let _mount_operation = mounts::namespace_operation();
     let topology = mount_ns.topology().try_snapshot()?;
     let (fs_root, foreign_visible_root) = requested_namespace_root(&mount_ns, &topology)?;
@@ -2016,6 +2079,7 @@ fn map_mount_uapi(error: UapiError) -> AxError {
         UapiError::Unsupported => AxError::OperationNotSupported,
         UapiError::TooBig => LinuxError::E2BIG.into(),
         UapiError::NotFound => AxError::NotFound,
+        UapiError::Permission => LinuxError::EPERM.into(),
     }
 }
 
@@ -3067,8 +3131,9 @@ pub fn sys_fsconfig<M: UserMemory + ?Sized>(
 }
 
 pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
-    // Linux `SYSCALL_DEFINE3(fsmount, ...)` (fs/namespace.c) admits the flag and
-    // attribute words before it looks at the descriptor at all:
+    // Linux `SYSCALL_DEFINE3(fsmount, ...)` (fs/namespace.c:4435-4471) admits the
+    // flag word, then the capability its flag form requires, and only then the
+    // attribute word; the descriptor is read last:
     //   if ((flags & ~(FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE)) != 0) return -EINVAL;
     //   if ((flags & FSMOUNT_NAMESPACE) && !ns_capable(current_user_ns(), CAP_SYS_ADMIN)) return -EPERM;
     //   if (!(flags & FSMOUNT_NAMESPACE) && !may_mount()) return -EPERM;
@@ -3076,21 +3141,25 @@ pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
     //   switch (attr_flags & MOUNT_ATTR__ATIME) { ... default: return -EINVAL; }
     //   CLASS(fd, f)(fs_fd); if (fd_empty(f)) return -EBADF;
     //   if (fd_file(f)->f_op != &fscontext_fops) return -EINVAL;
-    let cloexec = validate_fsmount(flags, mount_attrs).map_err(map_mount_uapi)?;
+    // The two capability tests are different domains: the namespace form needs
+    // the caller's *own* user namespace, the plain form needs the mount
+    // namespace's owner, so an unprivileged caller with malformed attributes
+    // gets EPERM rather than EINVAL.
+    let cloexec = admit_fsmount(
+        flags,
+        mount_attrs,
+        current_user_namespace_may_admin(),
+        current_may_mount(),
+    )
+    .map_err(map_mount_uapi)?;
     if flags & FSMOUNT_NAMESPACE != 0 {
-        // `ns_capable(current_user_ns(), CAP_SYS_ADMIN)` precedes the
-        // namespace-file allocation, and TheKernel has no nsfs descriptor
-        // provider to allocate from.  Report the well-formed request as
-        // unsupported rather than as a malformed one; there is no
-        // fs_context user namespace to be capable in, so the mount capability
-        // is the whole of Linux's check here.
-        if !current_may_mount() {
-            return Err(LinuxError::EPERM.into());
-        }
+        // Both capability tests above have passed.  `create_new_namespace()`
+        // then has to allocate an nsfs descriptor for the new namespace, and
+        // TheKernel has no nsfs descriptor provider to allocate from; report
+        // the well-formed request as unsupported rather than as a malformed
+        // one.  This is the residual named by the `fsmount` cell: the errno is
+        // TheKernel's, not Linux's.
         return Err(AxError::OperationNotSupported);
-    }
-    if !current_may_mount() {
-        return Err(LinuxError::EPERM.into());
     }
 
     let file = get_file_like(fd)?;
@@ -3463,38 +3532,30 @@ fn prepare_open_tree<M: UserMemory + ?Sized>(
     pathname: *const c_char,
     flags: u32,
 ) -> AxResult<(FsMountFd, bool)> {
-    // `vfs_open_tree()` (fs/namespace.c) validates the flag word, then the
-    // clone-namespace capability, then the clone mount capability, and only
-    // then copies the pathname:
+    // `vfs_open_tree()` (fs/namespace.c:3194-3243) validates the flag word, then
+    // the namespace capability, then the clone mount capability, and only then
+    // copies and resolves the pathname:
     //   if (flags & ~(AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_RECURSIVE |
     //                 AT_SYMLINK_NOFOLLOW | OPEN_TREE_CLONE |
     //                 OPEN_TREE_CLOEXEC | OPEN_TREE_NAMESPACE)) return ERR_PTR(-EINVAL);
     //   if ((flags & (AT_RECURSIVE | OPEN_TREE_CLONE | OPEN_TREE_NAMESPACE)) == AT_RECURSIVE)
     //           return ERR_PTR(-EINVAL);
     //   if (hweight32(flags & (OPEN_TREE_CLONE | OPEN_TREE_NAMESPACE)) > 1) return ERR_PTR(-EINVAL);
+    //   /* If we create a new mount namespace with the cloned mount tree we
+    //    * just care about being privileged over our current user namespace.
+    //    * The new mount namespace will be owned by it. */
     //   if ((flags & OPEN_TREE_NAMESPACE) && !ns_capable(current_user_ns(), CAP_SYS_ADMIN))
     //           return ERR_PTR(-EPERM);
     //   if ((flags & OPEN_TREE_CLONE) && !may_mount()) return ERR_PTR(-EPERM);
-    let cloexec = validate_open_tree(flags).map_err(map_mount_uapi)?;
+    let cloexec = admit_open_tree(
+        flags,
+        current_user_namespace_may_admin(),
+        current_may_mount(),
+    )
+    .map_err(map_mount_uapi)?;
     let curr = current();
     let actor = curr.as_thread().current_cred();
-    if flags & OPEN_TREE_NAMESPACE != 0 {
-        let gate_security = VfsSecurityContext::new(actor.clone());
-        if !may_mount(&gate_security) {
-            return Err(LinuxError::EPERM.into());
-        }
-        // open_new_namespace() needs an nsfs descriptor, which TheKernel's
-        // mount code cannot allocate.  A namespace-requesting open_tree is a
-        // well-formed Linux request, so report it as unsupported instead of
-        // malformed.
-        return Err(AxError::OperationNotSupported);
-    }
-    if flags & OPEN_TREE_CLONE != 0 {
-        let gate_security = VfsSecurityContext::new(actor.clone());
-        if !may_mount(&gate_security) {
-            return Err(LinuxError::EPERM.into());
-        }
-    }
+    let namespace_request = flags & OPEN_TREE_NAMESPACE != 0;
 
     // `CLASS(filename_uflags, name)(filename, flags)` (fs/namei.c) copies the
     // pathname with `strncpy_from_user()`, which reports EFAULT for a NULL
@@ -3551,6 +3612,17 @@ fn prepare_open_tree<M: UserMemory + ?Sized>(
         flags & AT_EMPTY_PATH != 0,
         &security,
     )?;
+
+    // Linux resolves the pathname before it calls `open_new_namespace()`, so a
+    // namespace-requesting open_tree reports a bad pathname as EFAULT/ENOENT
+    // rather than as an unimplemented request.  The namespace itself is the
+    // residual: `open_new_namespace()` returns an nsfs descriptor for a
+    // namespace created by `create_new_namespace()`, and TheKernel has no nsfs
+    // descriptor provider to allocate one from.  This errno is TheKernel's,
+    // not Linux's, and the `open-tree`/`open-tree-attr` cells name it.
+    if namespace_request {
+        return Err(AxError::OperationNotSupported);
+    }
 
     // `source_topology` is the sole namespace authority for a relative FD;
     // an absolute path is, as on Linux, resolved in the current namespace.
