@@ -822,6 +822,12 @@ int main(void) {
          * request was refused with EINVAL (a single parentless root mount), 4
          * the first request detached but the repeat was not refused, 2 anything
          * else, 3 the namespace could not be isolated.
+         *
+         * Success is reported as DETACH_NAMESPACE_ROOT_SUCCEEDS.  Status 3
+         * reports DETACH_NAMESPACE_ROOT_SKIPPED for diagnosis and then fails
+         * the case through `detach-namespace-isolated`, because a kernel that
+         * cannot create a mount namespace has not answered this case and must
+         * not be able to hide that behind a skip.
          */
         int detach_answer = 3;
         pid_t detach_child = fork();
@@ -854,12 +860,16 @@ int main(void) {
             }
         }
         if (detach_answer == 3) {
-            /* No namespace to isolate the probe in; skip it rather than make
-             * an assertion whose side effects cannot be contained. */
+            /* No namespace to isolate the probe in.  Report why, then fail the
+             * case: `unshare(CLONE_NEWNS)` is the precondition of the whole
+             * probe, and a skip here once hid a real regression in namespace
+             * creation behind an assertion that never ran.  `check()` exits, so
+             * the case never reaches its THEKERNEL_ABI_RESULT line either. */
             mark("DETACH_NAMESPACE_ROOT_SKIPPED");
+            check(0, "detach-namespace-isolated");
         } else {
             check(detach_answer == 0, "detach-root");
-            mark("DETACH_NAMESPACE_ROOT_EINVAL");
+            mark("DETACH_NAMESPACE_ROOT_SUCCEEDS");
             check(detach_answer != 4, "detach-detached-root");
         }
         errno = 0;
