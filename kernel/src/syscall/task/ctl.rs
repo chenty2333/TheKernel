@@ -201,17 +201,17 @@ fn read_nodemask<M: UserMemory + ?Sized>(
     maxnode: usize,
 ) -> AxResult<usize> {
     let supplied = !nodemask.is_null();
+    // `get_nodes()` decrements `maxnode` before every other test, so a supplied
+    // mask with `maxnode == 0` wraps to `ULONG_MAX` and fails the
+    // `maxnode > PAGE_SIZE * BITS_PER_BYTE` bound with EINVAL; the bound is
+    // always on the decremented value (`32769` is the largest admitted window).
+    if supplied && maxnode.wrapping_sub(1) > tk_linux_mm::MAX_NODEMASK_BITS {
+        return Err(mempolicy_error(MempolicyError::NodeMaskTooLong));
+    }
     let words = scanned_words(maxnode);
     if !supplied || words == 0 {
-        // `get_nodes()` returns an empty mask without reading, but the size
-        // bound is checked first when a mask pointer was supplied.
-        if supplied && maxnode > 0 && maxnode - 1 > tk_linux_mm::MAX_NODEMASK_BITS {
-            return Err(mempolicy_error(MempolicyError::NodeMaskTooLong));
-        }
+        // `get_nodes()` returns an empty mask without reading.
         return Ok(0);
-    }
-    if maxnode - 1 > tk_linux_mm::MAX_NODEMASK_BITS {
-        return Err(mempolicy_error(MempolicyError::NodeMaskTooLong));
     }
 
     let mut buffer = [0usize; tk_linux_mm::MAX_NODEMASK_BITS / usize::BITS as usize + 1];
@@ -1707,6 +1707,12 @@ pub fn sys_setresgid(rgid: u32, egid: u32, sgid: u32) -> AxResult<isize> {
 /// (`kernel_get_mempolicy()`), then `addr` requiring `MPOL_F_ADDR`.
 /// `MPOL_F_NODE` without `MPOL_F_ADDR` needs the task's own interleave policy
 /// and is `EINVAL` for any other mode.
+///
+/// `kernel_get_mempolicy()` then stores `*policy` and `*nmask` in that order
+/// on *every* successful path, including the two that look like early returns
+/// inside `do_get_mempolicy()`: `MPOL_F_MEMS_ALLOWED` stores the initialized
+/// `*policy = 0` before the allowed set, and `MPOL_F_ADDR|MPOL_F_NODE` stores
+/// the resolved node id and still falls through to the mask store.
 pub fn sys_get_mempolicy<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     policy: *mut i32,
@@ -1719,6 +1725,8 @@ pub fn sys_get_mempolicy<M: UserMemory + ?Sized>(
         .map_err(get_mempolicy_error)?;
 
     if flags & tk_linux_mm::MPOL_F_MEMS_ALLOWED != 0 {
+        // `*policy = 0; /* just so it's initialized */` then the allowed set.
+        write_get_mempolicy_policy(memory, policy, 0)?;
         return write_nodemask(memory, nodemask, maxnode, ALLOWED_NODEMASK).map(|()| 0);
     }
 
@@ -1738,29 +1746,35 @@ pub fn sys_get_mempolicy<M: UserMemory + ?Sized>(
     };
 
     if flags & tk_linux_mm::MPOL_F_NODE != 0 {
-        if flags & tk_linux_mm::MPOL_F_ADDR != 0 {
+        let node = if flags & tk_linux_mm::MPOL_F_ADDR != 0 {
             // Linux resolves the *page's* node with `lookup_node()`, which
             // faults the address in; a hole is EFAULT.
-            if !policy.is_null() {
-                VmMutPtr::vm_write(policy, memory, numa_page_node(proc_data, addr)?)
-                    .map_err(map_usercopy_error)?;
-            }
-            return Ok(0);
-        }
-        // Without MPOL_F_ADDR this is the next interleave node, and Linux
-        // accepts it only for the task's own interleave policy.
-        let Some(node) = tk_linux_mm::next_interleave_node(selected.mode, true) else {
-            return Err(AxError::InvalidInput);
+            numa_page_node(proc_data, addr)? as i32
+        } else {
+            // Without MPOL_F_ADDR this is the next interleave node, and Linux
+            // accepts it only for the task's own interleave policy.
+            let Some(node) = tk_linux_mm::next_interleave_node(selected.mode, true) else {
+                return Err(AxError::InvalidInput);
+            };
+            node as i32
         };
-        if !policy.is_null() {
-            VmMutPtr::vm_write(policy, memory, node as i32).map_err(map_usercopy_error)?;
-        }
-        return Ok(0);
+        write_get_mempolicy_policy(memory, policy, node)?;
+        // The `MPOL_F_NODE` arm only replaces `*policy`; Linux still reaches
+        // the `if (nmask)` store at the end of `do_get_mempolicy()`.
+        return write_nodemask(
+            memory,
+            nodemask,
+            maxnode,
+            mempolicy_reported_nodemask(selected),
+        )
+        .map(|()| 0);
     }
 
-    if !policy.is_null() {
-        VmMutPtr::vm_write(policy, memory, selected.mode as i32).map_err(map_usercopy_error)?;
-    }
+    write_get_mempolicy_policy(
+        memory,
+        policy,
+        tk_linux_mm::reported_policy(selected.mode, selected.mode_flags) as i32,
+    )?;
     write_nodemask(
         memory,
         nodemask,
@@ -1770,8 +1784,28 @@ pub fn sys_get_mempolicy<M: UserMemory + ?Sized>(
     Ok(0)
 }
 
-/// `get_policy_nodemask()`: the mask a policy reports to `get_mempolicy(2)`.
+/// `if (policy && put_user(pval, policy)) return -EFAULT;`
+fn write_get_mempolicy_policy<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    policy: *mut i32,
+    value: i32,
+) -> AxResult<()> {
+    if policy.is_null() {
+        return Ok(());
+    }
+    VmMutPtr::vm_write(policy, memory, value).map_err(map_usercopy_error)
+}
+
+/// `do_get_mempolicy()`'s nodemask report.
+///
+/// Linux writes `pol->w.user_nodemask` when `mpol_store_user_nodemask()` holds
+/// -- a `MPOL_F_STATIC_NODES`/`MPOL_F_RELATIVE_NODES` policy keeps the caller's
+/// own mask -- and otherwise asks `get_policy_nodemask()`, which is empty for
+/// `MPOL_DEFAULT`/`MPOL_LOCAL` and the stored node set for every other mode.
 fn mempolicy_reported_nodemask(policy: Mempolicy) -> usize {
+    if tk_linux_mm::stores_user_nodemask(policy.mode_flags) {
+        return policy.user_nodemask;
+    }
     match policy.mode {
         mode if mode == tk_linux_mm::MPOL_LOCAL || mode == tk_linux_mm::MPOL_DEFAULT => 0,
         // `MPOL_PREFERRED` reports the stored `pol->nodes`, which
@@ -1799,10 +1833,12 @@ pub fn sys_set_mempolicy<M: UserMemory + ?Sized>(
     let request = tk_linux_mm::validate(mode, nodes, !nodemask.is_null(), current_allowed_nodemask())
         .map_err(mempolicy_error)?;
     let (mode, nodes) = tk_linux_mm::effective_policy(request);
-    current()
-        .as_thread()
-        .proc_data
-        .set_mempolicy(Mempolicy::new(mode, nodes));
+    // The stored policy keeps the sanitized mode flags and the caller's own
+    // mask, which is what `get_mempolicy(2)` reports back for a
+    // `MPOL_F_STATIC_NODES`/`MPOL_F_RELATIVE_NODES` policy.
+    current().as_thread().proc_data.set_mempolicy(
+        Mempolicy::new(mode, nodes).with_request_flags(request.mode_flags, request.user_nodes),
+    );
     Ok(0)
 }
 
@@ -1812,7 +1848,11 @@ pub fn sys_set_mempolicy<M: UserMemory + ?Sized>(
 /// validates the range, so a zero-length `mbind` still reports an invalid mode
 /// or mask. `do_mbind()` then checks the bind flags, the `MPOL_MF_MOVE_ALL`
 /// capability, the page alignment of `start`, and the aligned range overflow —
-/// in that order — and only then returns early for an empty range.
+/// in that order — and returns early for an empty range *before* it builds the
+/// policy with `mpol_new()`/`mpol_set_nodemask()`. The policy checks therefore
+/// come last: a zero-length range with a mask that names no allowed node is
+/// `0`, and `MPOL_MF_MOVE_ALL` without `CAP_SYS_NICE` is `EPERM` whatever the
+/// mask says.
 pub fn sys_mbind<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     start: usize,
@@ -1823,17 +1863,14 @@ pub fn sys_mbind<M: UserMemory + ?Sized>(
     flags: usize,
 ) -> AxResult<isize> {
     let mode = mode as u32;
-    sanitize_mode_flags(mode).map_err(mempolicy_error)?;
+    let (sanitized_mode, _) = sanitize_mode_flags(mode).map_err(mempolicy_error)?;
     let nodes = read_nodemask(memory, nodemask, maxnode)?;
-    let request = tk_linux_mm::validate(mode, nodes, !nodemask.is_null(), current_allowed_nodemask())
-        .map_err(mempolicy_error)?;
-    let (policy_mode, policy_nodes) = tk_linux_mm::effective_policy(request);
-    let policy = Mempolicy::new(policy_mode, policy_nodes);
 
+    // `do_mbind()`'s range checks run before any policy is created.
     let plan = tk_linux_mm::plan_mbind(
         start,
         len,
-        policy_mode,
+        sanitized_mode,
         flags,
         current_has_capability(CAP_SYS_NICE),
     )
@@ -1841,6 +1878,14 @@ pub fn sys_mbind<M: UserMemory + ?Sized>(
     let Some(plan) = plan else {
         return Ok(0);
     };
+
+    // Only now `mpol_new()` + `mpol_set_nodemask()`: the mode table, the
+    // user-nodemask flags and the intersection with the allowed set.
+    let request = tk_linux_mm::validate(mode, nodes, !nodemask.is_null(), current_allowed_nodemask())
+        .map_err(mempolicy_error)?;
+    let (policy_mode, policy_nodes) = tk_linux_mm::effective_policy(request);
+    let policy = Mempolicy::new(policy_mode, policy_nodes)
+        .with_request_flags(request.mode_flags, request.user_nodes);
 
     if plan.flags & tk_linux_mm::MPOL_MF_STRICT != 0
         && plan.flags & (tk_linux_mm::MPOL_MF_MOVE | tk_linux_mm::MPOL_MF_MOVE_ALL) == 0

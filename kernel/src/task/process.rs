@@ -166,8 +166,8 @@ use super::{
     futex::FutexTable,
     jobctl::{
         ContinueResult, ExecControlState, JobControlState, PtraceControlState,
-        PtraceRelationshipOrigin, PtraceRelationshipSnapshot, PtraceSession, StopKind, StopReport,
-        StopState, VforkControlState,
+        PtraceRelationshipOrigin, PtraceRelationshipSnapshot, PtraceSession, StopFilter, StopKind,
+        StopReport, StopState, VforkControlState,
     },
     resources::Rlimits,
     security::LandlockDomain,
@@ -2343,7 +2343,19 @@ fn apply_time_offset(value: Duration, offset_ns: i64) -> Duration {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Mempolicy {
     pub mode: u32,
+    /// `pol->flags & MPOL_MODE_FLAGS`: the shaping flags the caller supplied
+    /// (`MPOL_F_STATIC_NODES`, `MPOL_F_RELATIVE_NODES`,
+    /// `MPOL_F_NUMA_BALANCING`). `get_mempolicy(2)` reports them ORed into the
+    /// policy word, and a user-nodemask flag also selects which stored mask is
+    /// authoritative.
+    pub mode_flags: u32,
     pub nodemask: usize,
+    /// `pol->w.user_nodemask`: the caller's mask exactly as supplied.
+    ///
+    /// `mpol_set_nodemask()` stores it only for a policy carrying a
+    /// user-nodemask flag, and `do_get_mempolicy()` then reports it instead of
+    /// the intersected `pol->nodes`. It is 0 for every other policy.
+    pub user_nodemask: usize,
     /// Preferred allocation node for `MPOL_BIND` and `MPOL_PREFERRED_MANY`.
     ///
     /// `None` is Linux's `NUMA_NO_NODE`: no home-node preference has been
@@ -2355,9 +2367,20 @@ impl Mempolicy {
     pub const fn new(mode: u32, nodemask: usize) -> Self {
         Self {
             mode,
+            mode_flags: 0,
             nodemask,
+            user_nodemask: 0,
             home_node: None,
         }
+    }
+
+    /// Records the sanitized mode flags and the caller's own mask, the two
+    /// `get_mempolicy(2)` report inputs that the stored `pol->nodes` cannot
+    /// reconstruct.
+    pub const fn with_request_flags(mut self, mode_flags: u32, user_nodemask: usize) -> Self {
+        self.mode_flags = mode_flags;
+        self.user_nodemask = user_nodemask;
+        self
     }
 
     pub const fn with_home_node(mut self, home_node: usize) -> Self {
@@ -5989,40 +6012,33 @@ impl ProcessData {
         continued
     }
 
-    /// Takes the current stopped status for waitpid reporting, if it has not been reported yet.
-    pub(crate) fn take_stop_status(
-        &self,
-        expected_ptrace_session: Option<PtraceSession>,
-    ) -> Option<StopReport> {
-        let mut job_ctl = self.job_ctl.lock();
-        let report = job_ctl.stop_report_for(expected_ptrace_session)?;
-        job_ctl.stop_reported = true;
-        Some(report)
-    }
-
     /// Peeks at the stopped status without consuming it (for WNOWAIT).
-    pub(crate) fn peek_stop_status(
-        &self,
-        expected_ptrace_session: Option<PtraceSession>,
-    ) -> Option<StopReport> {
+    ///
+    /// `filter` carries the waiter's own identity, because
+    /// `wait_consider_task()` decides stop visibility per waiter rather than
+    /// once per task (`StopFilter`).
+    pub(crate) fn peek_stop_status(&self, filter: StopFilter) -> Option<StopReport> {
         let job_ctl = self.job_ctl.lock();
-        job_ctl.stop_report_for(expected_ptrace_session)
+        job_ctl.stop_report_for(filter)
     }
 
-    /// Claims the pending stop report so a waiter can complete userspace copies first.
-    pub(crate) fn claim_stop_status(
-        &self,
-        expected_ptrace_session: Option<PtraceSession>,
-    ) -> Option<StopReport> {
-        self.take_stop_status(expected_ptrace_session)
-    }
-
-    /// Restores a previously claimed stop report after a failed userspace copy.
-    pub(crate) fn restore_stop_status(&self, report: StopReport) {
+    /// Claims one already-selected stop report so a waiter can complete
+    /// userspace copies first.
+    ///
+    /// The report itself identifies the stop, so a stop that was replaced by a
+    /// later relationship — or one another thread of the group already
+    /// reported — is not consumed by a stale waiter.
+    pub(crate) fn claim_stop_status(&self, report: StopReport) -> Option<StopReport> {
         let mut job_ctl = self.job_ctl.lock();
-        if job_ctl.current_stop_report() == Some(report) {
-            job_ctl.stop_reported = false;
+        if job_ctl.stop_reported {
+            return None;
         }
+        let current = job_ctl.current_stop_report()?;
+        if current != report {
+            return None;
+        }
+        job_ctl.stop_reported = true;
+        Some(current)
     }
 
     /// Peeks at the continued flag without consuming it (for WNOWAIT).

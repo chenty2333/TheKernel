@@ -1,4 +1,5 @@
 use alloc::{sync::Arc, vec, vec::Vec};
+use core::mem::{offset_of, size_of};
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::current;
@@ -16,8 +17,9 @@ use crate::{
     pseudofs::cgroup,
     readiness::block_on_poll_set_interruptible_if,
     task::{
-        AsThread, PidNamespace, Process, ProcessData, PtraceSession, StopReport, TaskUsage,
-        ZombieSnapshot, get_process_data, has_pending_syscall_signal, process_domain, reap_process,
+        AsThread, PidNamespace, Process, ProcessData, PtraceSession, StopFilter, StopReport,
+        TaskUsage, ZombieSnapshot, get_process_data, has_pending_syscall_signal, process_domain,
+        reap_process,
     },
 };
 
@@ -131,7 +133,10 @@ impl WaitEvent {
         }
     }
 
-    fn waitid_siginfo(&self, viewer_user_ns: &crate::task::UserNamespace) -> siginfo {
+    fn waitid_siginfo_fields(
+        &self,
+        viewer_user_ns: &crate::task::UserNamespace,
+    ) -> WaitIdSiginfoFields {
         match self {
             WaitEvent::Stopped {
                 pid,
@@ -139,25 +144,38 @@ impl WaitEvent {
                 proc_data,
             } => {
                 let uid = viewer_user_ns.from_kuid_munged(proc_data.group_leader_cred().ids().ruid);
-                fill_siginfo(
-                    *pid,
-                    uid,
-                    if stop.traced() {
-                        CLD_TRAPPED
+                WaitIdSiginfoFields {
+                    signo: SIGCHLD as i32,
+                    code: if stop.traced() {
+                        CLD_TRAPPED as i32
                     } else {
-                        CLD_STOPPED
+                        CLD_STOPPED as i32
                     },
-                    stop.signal as i32,
-                )
+                    pid: *pid as i32,
+                    uid,
+                    status: stop.signal as i32,
+                }
             }
             WaitEvent::Continued { pid, proc_data } => {
                 let uid = viewer_user_ns.from_kuid_munged(proc_data.group_leader_cred().ids().ruid);
-                fill_siginfo(*pid, uid, CLD_CONTINUED, SIGCONT as i32)
+                WaitIdSiginfoFields {
+                    signo: SIGCHLD as i32,
+                    code: CLD_CONTINUED as i32,
+                    pid: *pid as i32,
+                    uid,
+                    status: SIGCONT as i32,
+                }
             }
             WaitEvent::Exited { pid, snapshot, .. } => {
                 let (si_code, si_status) = decode_exit_code(snapshot.wait_status);
                 let uid = viewer_user_ns.from_kuid_munged(snapshot.credential.ids().ruid);
-                fill_siginfo(*pid, uid, si_code, si_status)
+                WaitIdSiginfoFields {
+                    signo: SIGCHLD as i32,
+                    code: si_code as i32,
+                    pid: *pid as i32,
+                    uid,
+                    status: si_status,
+                }
             }
         }
     }
@@ -363,10 +381,14 @@ fn pidfd_wait_candidate(
 /// `allow_exit` and `expected_ptrace_session` are carried by `WaitCandidate`,
 /// and the stop gate below reproduces `wait_task_stopped()`'s rule that a
 /// non-ptrace child's stop is only reportable with `WUNTRACED`.
+/// `waiter_group` is the waiting thread group's identity, which
+/// `wait_consider_task()` compares a tracee's tracer against before it lets a
+/// plain child's waiter see a ptrace stop (`StopFilter`).
 fn select_wait_event(
     candidates: &[WaitCandidate],
     options: &WaitOptions,
     wait_exited: bool,
+    waiter_group: Pid,
 ) -> Option<WaitEvent> {
     let selection = selection_for(options, wait_exited);
     for candidate in candidates {
@@ -384,14 +406,11 @@ fn select_wait_event(
         // or the caller asked for job-control stops with `WUNTRACED`. This is
         // `wait_task_stopped()`'s `if (!ptrace && !(wo->wo_flags & WUNTRACED))
         // return 0;`, with `ptrace` derived from the same session identity.
-        let stop = proc_data.as_ref().and_then(|proc_data| {
-            proc_data
-                .peek_stop_status(candidate.expected_ptrace_session)
-                .filter(|stop| {
-                    wait_candidate_accepts_stop(candidate.expected_ptrace_session, *stop)
-                })
-                .filter(|stop| stop.traced() || selection.stopped)
-        });
+        let filter = stop_filter_for(candidate.expected_ptrace_session, waiter_group);
+        let stop = proc_data
+            .as_ref()
+            .and_then(|proc_data| proc_data.peek_stop_status(filter))
+            .filter(|stop| stop.traced() || selection.stopped);
 
         // `delay_group_leader()`: a zombie group leader is held back while any
         // of its threads is still alive, so its exit is reported only once the
@@ -408,7 +427,12 @@ fn select_wait_event(
         let event = tk_linux_process::select_child_event(
             tk_linux_process::WaitEventState {
                 exited: candidate.allow_exit && zombie.is_some(),
-                stopped: stop.is_some() && selection.stopped,
+                // `stop` is already the per-child gate above, so the selection
+                // must not apply the `WUNTRACED` rule a second time: a ptrace
+                // stop is reported to a bare `wait4(2)` because
+                // `wait_consider_task()` forces `ptrace = 1` for it.
+                stopped: stop.is_some(),
+                ptrace: stop.is_some_and(StopReport::traced),
                 continued: proc_data
                     .as_ref()
                     .is_some_and(|proc_data| proc_data.peek_continued())
@@ -459,12 +483,23 @@ fn selection_for(
     }
 }
 
-fn wait_candidate_accepts_stop(
-    expected_ptrace_session: Option<PtraceSession>,
-    stop: StopReport,
-) -> bool {
-    stop.ptrace_session
-        .is_none_or(|session| Some(session) == expected_ptrace_session)
+/// The stop visibility a candidate's wait request implies.
+///
+/// A candidate that carries a session is a tracee this waiter explicitly waits
+/// for, so only that exact session's stops are its to see. A candidate that
+/// carries none is an ordinary child, and `wait_consider_task()` still forces
+/// `ptrace = 1` for it when the tracee is traced from the waiter's own thread
+/// group: `if (!ptrace_reparented(p)) ptrace = 1;` (`kernel/exit.c:1522-1523`).
+/// That is the `PTRACE_TRACEME` case, where the tracer *is* the real parent, so
+/// its `wait4(2)` must report the stop even though the request named no
+/// session. A stop owned by any other thread group stays hidden, which is what
+/// keeps a separate ptracer's stop from being reported to the real parent as
+/// well, once as a job-control stop and once as a ptrace stop.
+fn stop_filter_for(expected_ptrace_session: Option<PtraceSession>, waiter_group: Pid) -> StopFilter {
+    match expected_ptrace_session {
+        Some(session) => StopFilter::Session(session),
+        None => StopFilter::Natural { group: waiter_group },
+    }
 }
 
 fn write_waitpid_event(
@@ -492,28 +527,25 @@ fn write_waitpid_event(
     Ok(())
 }
 
-fn write_waitid_event(
+/// `if (err > 0) { ...; if (ru && copy_to_user(ru, &r, ...)) return -EFAULT; }`.
+///
+/// The resource usage is the first thing `SYSCALL_DEFINE5(waitid)` copies, and
+/// a fault there returns before the `siginfo_t` is touched at all.
+fn write_waitid_rusage(
     memory: &UserMemoryCapability,
-    event: &WaitEvent,
-    viewer_user_ns: &crate::task::UserNamespace,
-    infop: *mut siginfo,
     rusage_ptr: *mut rusage,
+    event: &WaitEvent,
 ) -> AxResult<()> {
-    if !infop.is_null() {
-        // fill_siginfo starts from zero, including ABI padding/tail bytes.
-        unsafe {
-            memory
-                .write_value_unchecked(infop, event.waitid_siginfo(viewer_user_ns))
-                .map_err(map_usercopy_error)?;
-        }
+    if rusage_ptr.is_null() {
+        return Ok(());
     }
-    if !rusage_ptr.is_null() {
-        let usage = event.usage();
-        unsafe {
-            memory
-                .write_value_unchecked(rusage_ptr, usage.into())
-                .map_err(map_usercopy_error)?;
-        }
+    let usage = event.usage();
+    // TaskUsage's conversion starts from a zeroed rusage and fills every
+    // exposed field, so the complete ABI representation is initialized.
+    unsafe {
+        memory
+            .write_value_unchecked(rusage_ptr, usage.into())
+            .map_err(map_usercopy_error)?;
     }
     Ok(())
 }
@@ -528,11 +560,10 @@ fn claim_wait_event(event: &WaitEvent, parent: &ProcessData, nowait: bool) -> Ax
         WaitEvent::Stopped {
             stop, proc_data, ..
         } => {
-            let Some(claimed) = proc_data.claim_stop_status(stop.ptrace_session) else {
-                return Ok(false);
-            };
-            if claimed != *stop {
-                proc_data.restore_stop_status(claimed);
+            // `claim_stop_status()` matches the report itself: a stop that a
+            // later ptrace relationship replaced, or that another thread of the
+            // group already reaped, must not be consumed by this waiter.
+            if proc_data.claim_stop_status(*stop).is_none() {
                 return Ok(false);
             }
         }
@@ -605,7 +636,7 @@ pub fn sys_waitpid(
             }
         };
 
-        if let Some(event) = select_wait_event(&candidates, &options, true) {
+        if let Some(event) = select_wait_event(&candidates, &options, true, proc.pid()) {
             // Diagnostic: record what this pid-targeted wait is about to
             // return, before the event is consumed. `event.pid()` is the
             // candidate's namespace-visible pid, which may differ from the
@@ -710,18 +741,78 @@ fn decode_exit_code(exit_code: i32) -> (u32, i32) {
     }
 }
 
-/// Fills a siginfo_t struct for waitid.
-fn fill_siginfo(pid: Pid, uid: u32, si_code: u32, si_status: i32) -> siginfo {
-    let mut info: siginfo = unsafe { core::mem::zeroed() };
-    unsafe {
-        let inner = &mut info.__bindgen_anon_1.__bindgen_anon_1;
-        inner.si_signo = SIGCHLD as i32;
-        inner.si_code = si_code as i32;
-        inner._sifields._sigchld._pid = pid as _;
-        inner._sifields._sigchld._uid = uid;
-        inner._sifields._sigchld._status = si_status;
+/// The `siginfo_t` fields Linux's `waitid(2)` wrapper stores.
+///
+/// `do_wait()` fills a `struct waitid_info` that `{.status = 0}` initializes,
+/// and `SYSCALL_DEFINE5(waitid)` then stores `si_signo`, `si_errno`, `si_code`,
+/// `si_pid`, `si_uid` and `si_status` from it. `signo` is `SIGCHLD` only when
+/// `kernel_waitid()` reported an event, so the zero value of this structure is
+/// exactly what a failing `waitid` leaves in those six fields.
+#[derive(Clone, Copy)]
+struct WaitIdSiginfoFields {
+    signo: i32,
+    code: i32,
+    pid: i32,
+    uid: u32,
+    status: i32,
+}
+
+impl WaitIdSiginfoFields {
+    /// `int signo = 0` plus the zero-initialized `struct waitid_info`.
+    const ZERO: Self = Self {
+        signo: 0,
+        code: 0,
+        pid: 0,
+        uid: 0,
+        status: 0,
+    };
+}
+
+/// Offset of the `_sifields` union inside `siginfo_t`.
+///
+/// Linux writes `si_pid`, `si_uid` and `si_status` at the head of the
+/// `_sigchld` member, which every union member shares, so the three fields sit
+/// at this offset and the two after it. Deriving the offset from the same type
+/// `_sifields` is declared in keeps the write independent of the 4 bytes of
+/// ABI padding that follow `si_code`.
+const SIGINFO_SIFIELDS_OFFSET: usize =
+    offset_of!(siginfo, __bindgen_anon_1.__bindgen_anon_1._sifields);
+
+/// Stores the six `siginfo_t` fields `waitid(2)` writes.
+///
+/// Linux pins the whole `sizeof(struct siginfo)` extent with
+/// `user_write_access_begin(infop, sizeof(*infop))` and then stores exactly
+/// those six fields, so the padding after `si_code` and the rest of the union
+/// keep whatever the caller had there, while an inaccessible structure is
+/// `EFAULT` even when all six fields would have fit.
+fn write_waitid_siginfo(
+    memory: &UserMemoryCapability,
+    infop: *mut siginfo,
+    fields: WaitIdSiginfoFields,
+) -> AxResult<()> {
+    if infop.is_null() {
+        return Ok(());
     }
-    info
+    memory
+        .with_memory(|memory| memory.validate_write_range(infop as usize, size_of::<siginfo>()))
+        .map_err(map_usercopy_error)?;
+
+    let mut head = [0u8; size_of::<[i32; 3]>()];
+    head[0..4].copy_from_slice(&fields.signo.to_ne_bytes());
+    // `si_errno` is the constant 0 the wrapper stores.
+    head[8..12].copy_from_slice(&fields.code.to_ne_bytes());
+    let mut tail = [0u8; size_of::<[i32; 3]>()];
+    tail[0..4].copy_from_slice(&fields.pid.to_ne_bytes());
+    tail[4..8].copy_from_slice(&fields.uid.to_ne_bytes());
+    tail[8..12].copy_from_slice(&fields.status.to_ne_bytes());
+
+    memory
+        .write_bytes(infop as usize, &head)
+        .map_err(map_usercopy_error)?;
+    memory
+        .write_bytes(infop as usize + SIGINFO_SIFIELDS_OFFSET, &tail)
+        .map_err(map_usercopy_error)?;
+    Ok(())
 }
 
 pub fn sys_waitid(
@@ -732,16 +823,48 @@ pub fn sys_waitid(
     options: u32,
     rusage_ptr: *mut rusage,
 ) -> AxResult<isize> {
+    let outcome = waitid_claim(idtype, id, options);
+    // `SYSCALL_DEFINE5(waitid)` stores `rusage` only for a reported event and
+    // then stores the six `siginfo_t` fields on *every* path, including the
+    // argument failures raised by `kernel_waitid_prepare()` before the wait
+    // starts. A failed wait therefore leaves a zeroed event in the caller's
+    // buffer instead of the caller's previous contents, and an `EFAULT` from
+    // that mandatory store replaces the in-kernel error, exactly as Linux's
+    // `Efault:` label does.
+    match &outcome {
+        Ok(WaitIdClaim::Event(event)) => {
+            write_waitid_rusage(&memory, rusage_ptr, event)?;
+            let viewer_user_ns = current().as_thread().current_user_namespace();
+            write_waitid_siginfo(&memory, infop, event.waitid_siginfo_fields(&viewer_user_ns))?;
+            Ok(0)
+        }
+        Ok(WaitIdClaim::Empty) => {
+            write_waitid_siginfo(&memory, infop, WaitIdSiginfoFields::ZERO)?;
+            Ok(0)
+        }
+        Err(error) => {
+            write_waitid_siginfo(&memory, infop, WaitIdSiginfoFields::ZERO)?;
+            Err(*error)
+        }
+    }
+}
+
+/// What one `waitid(2)` wait produced before any usercopy.
+enum WaitIdClaim {
+    /// A child event was claimed and must be reported.
+    Event(WaitEvent),
+    /// The wait completed without an event (`WNOHANG`, or `WNOWAIT` finding
+    /// nothing): Linux reports success with the zeroed event.
+    Empty,
+}
+
+/// Runs the wait half of `waitid(2)` and returns the claimed event.
+fn waitid_claim(idtype: u32, id: u32, options: u32) -> AxResult<WaitIdClaim> {
     // `kernel_waitid_prepare()` checks the option mask, then that at least one
     // event bit is set, and only then the `which`/`upid` pair. The order
     // matters because a call failing both reports the *first* failure.
     let options = validate_waitid_options(options)?;
     if options.bits() & tk_linux_process::WAITID_EVENT_FLAGS == 0 {
-        return Err(AxError::InvalidInput);
-    }
-    // Namespace-visible IDs are `pid_t`, so a value that cannot round-trip
-    // through `i32` names nothing and is EINVAL rather than a wrapped lookup.
-    if id > i32::MAX as u32 {
         return Err(AxError::InvalidInput);
     }
     match tk_linux_process::validate_id_type(idtype as i32, id as i32) {
@@ -753,7 +876,6 @@ pub fn sys_waitid(
     }
 
     let curr = current();
-    let viewer_user_ns = curr.as_thread().current_user_namespace();
     let viewer_pid_ns = curr.as_thread().pid_ns();
     let proc_data = &curr.as_thread().proc_data;
     let proc = &proc_data.proc;
@@ -791,7 +913,7 @@ pub fn sys_waitid(
         _ => return Err(AxError::InvalidInput),
     };
 
-    let check_children = || -> AxResult<Option<isize>> {
+    let check_children = || -> AxResult<Option<WaitIdClaim>> {
         let _wait_guard = proc_data.wait_lock.lock();
         let candidates = if let Some(pid) = pid {
             matching_wait_candidates(proc_data, &viewer_pid_ns, pid, &wait_options)?
@@ -803,34 +925,21 @@ pub fn sys_waitid(
             &candidates,
             &wait_options,
             wait_options.contains(WaitOptions::WEXITED),
+            proc.pid(),
         ) {
             if !claim_wait_event(&event, proc_data, nowait)? {
                 return Ok(None);
             }
-            drop(_wait_guard);
-            write_waitid_event(&memory, &event, &viewer_user_ns, infop, rusage_ptr)?;
-
-            return Ok(Some(0));
+            return Ok(Some(WaitIdClaim::Event(event)));
         }
 
         if wait_options.contains(WaitOptions::WNOHANG) {
             if pidfd_nonblocking && !explicit_nohang {
                 return Err(AxError::from(LinuxError::EAGAIN));
             }
-            drop(_wait_guard);
-            if !infop.is_null() {
-                // The zeroed siginfo has a fully initialized ABI
-                // representation, including padding bytes.
-                unsafe {
-                    memory
-                        .write_value_unchecked(infop, core::mem::zeroed::<siginfo>())
-                        .map_err(map_usercopy_error)?;
-                }
-            }
-            Ok(Some(0))
-        } else {
-            Ok(None)
+            return Ok(Some(WaitIdClaim::Empty));
         }
+        Ok(None)
     };
 
     let result = block_on_poll_set_interruptible_if(
@@ -852,8 +961,8 @@ pub fn sys_waitid(
 
 #[cfg(test)]
 mod tests {
-    use super::{WaitPid, wait_candidate_accepts_stop};
-    use crate::task::{PtraceSession, StopReport};
+    use super::{WaitPid, stop_filter_for};
+    use crate::task::{PtraceSession, StopFilter, StopReport};
 
     #[test]
     fn process_access_wait_candidate_does_not_cross_ptrace_generations() {
@@ -883,11 +992,19 @@ mod tests {
             ptrace_session: None,
         };
 
-        assert!(wait_candidate_accepts_stop(Some(old), old_stop));
-        assert!(!wait_candidate_accepts_stop(Some(old), new_stop));
-        assert!(!wait_candidate_accepts_stop(None, old_stop));
-        assert!(wait_candidate_accepts_stop(None, job_control_stop));
-        assert!(wait_candidate_accepts_stop(Some(new), job_control_stop));
+        // A waiter that named a session sees exactly that session's stop.
+        assert!(StopFilter::Session(old).accepts(old_stop.ptrace_session));
+        assert!(!StopFilter::Session(old).accepts(new_stop.ptrace_session));
+        // A waiter that named none is the real parent. `wait_consider_task()`
+        // still reports the ptrace stop to it when the tracer shares its thread
+        // group (`PTRACE_TRACEME`), and hides a separate ptracer's stop.
+        assert!(stop_filter_for(None, 7).accepts(old_stop.ptrace_session));
+        assert!(stop_filter_for(None, 7).accepts(new_stop.ptrace_session));
+        assert!(!stop_filter_for(None, 9).accepts(old_stop.ptrace_session));
+        // Job-control stops are sessionless and visible to every waiter.
+        assert!(stop_filter_for(None, 9).accepts(job_control_stop.ptrace_session));
+        assert!(StopFilter::Session(old).accepts(job_control_stop.ptrace_session));
+        assert!(StopFilter::Session(new).accepts(job_control_stop.ptrace_session));
     }
 
     #[test]

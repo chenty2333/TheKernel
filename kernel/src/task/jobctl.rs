@@ -46,6 +46,52 @@ impl StopReport {
     }
 }
 
+/// Which published stop a waiter is allowed to see.
+///
+/// `wait_task_stopped()` reports a ptrace stop "regardless of options", but
+/// `wait_consider_task()` decides *which* waiter counts as the ptracer for the
+/// child it is examining (`kernel/exit.c:1515-1528`):
+///
+/// ```c
+/// 	if (likely(!ptrace) && unlikely(p->ptrace)) {
+/// 		if (!ptrace_reparented(p))
+/// 			ptrace = 1;
+/// 	}
+/// ```
+///
+/// A wait request that named a session is that session's waiter and must match
+/// it exactly. A request that named none — an ordinary `wait4(2)`/`waitid(2)`
+/// from the real parent — still counts as the ptracer when the tracee is traced
+/// from the waiter's own thread group, which is the `PTRACE_TRACEME` case
+/// (`ptrace_reparented()` is false because the tracer *is* the real parent). A
+/// stop owned by any other thread group stays hidden, which is what keeps a
+/// separate ptracer's stop from being reported to the real parent as well, once
+/// as a job-control stop and once as a ptrace stop.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum StopFilter {
+    /// The waiter resolved this exact session: a tracer waiting for its tracee,
+    /// or a pidfd wait on a task it traces.
+    Session(PtraceSession),
+    /// The waiter named no session. `group` is the waiter's own thread-group
+    /// identity, which is what `ptrace_reparented()` compares the tracer with.
+    Natural { group: Pid },
+}
+
+impl StopFilter {
+    /// `wait_consider_task()`'s visibility test for one published stop.
+    pub(crate) fn accepts(self, ptrace_session: Option<PtraceSession>) -> bool {
+        // A job-control stop belongs to the whole thread group and is not tied
+        // to a ptrace relationship, so every waiter may see it.
+        let Some(session) = ptrace_session else {
+            return true;
+        };
+        match self {
+            Self::Session(expected) => session == expected,
+            Self::Natural { group } => session.tracer == group,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum ContinueResult {
     None,
@@ -75,10 +121,7 @@ impl JobControlState {
             && self.ptrace_session == Some(session)
     }
 
-    pub(in crate::task) fn stop_report_for(
-        &self,
-        expected_ptrace_session: Option<PtraceSession>,
-    ) -> Option<StopReport> {
+    pub(in crate::task) fn stop_report_for(&self, filter: StopFilter) -> Option<StopReport> {
         if self.state != StopState::Stopped || self.stop_reported {
             return None;
         }
@@ -86,7 +129,7 @@ impl JobControlState {
             StopKind::JobControl => None,
             StopKind::Ptrace => Some(self.ptrace_session?),
         };
-        if ptrace_session.is_some() && ptrace_session != expected_ptrace_session {
+        if !filter.accepts(ptrace_session) {
             return None;
         }
         Some(StopReport {
@@ -301,7 +344,8 @@ mod tests {
     use alloc::sync::Arc;
 
     use super::{
-        JobControlState, PtraceControlState, PtraceRelationshipOrigin, StopKind, StopState,
+        JobControlState, PtraceControlState, PtraceRelationshipOrigin, StopFilter, StopKind,
+        StopState,
     };
     use crate::task::{Cred, UserNamespace};
 
@@ -369,7 +413,7 @@ mod tests {
             stop_reported: false,
         };
         assert!(job.is_ptrace_inactive_for(old));
-        let old_report = job.stop_report_for(Some(old)).unwrap();
+        let old_report = job.stop_report_for(StopFilter::Session(old)).unwrap();
         assert!(old_report.traced());
 
         assert!(control.clear_session(old).is_some());
@@ -385,23 +429,39 @@ mod tests {
             .unwrap();
         assert_ne!(new, old);
         assert!(!job.is_ptrace_inactive_for(new));
-        assert_eq!(job.stop_report_for(Some(new)), None);
+        assert_eq!(job.stop_report_for(StopFilter::Session(new)), None);
 
         // A late restore from the old waiter cannot match a newly published
         // stop owned by a later relationship using the same tracer PID.
         job.ptrace_session = Some(new);
         assert_ne!(job.current_stop_report(), Some(old_report));
-        assert_eq!(job.stop_report_for(Some(old)), None);
+        assert_eq!(job.stop_report_for(StopFilter::Session(old)), None);
         assert_eq!(
-            job.stop_report_for(Some(new)).unwrap().ptrace_session,
+            job.stop_report_for(StopFilter::Session(new))
+                .unwrap()
+                .ptrace_session,
             Some(new)
+        );
+        // A waiter with no session of its own is the real parent. It sees the
+        // stop when the tracer shares its thread group, which is the
+        // `PTRACE_TRACEME` case `wait_consider_task()` forces `ptrace = 1` for,
+        // and never sees one owned by a separate ptracer's group.
+        assert!(
+            job.stop_report_for(StopFilter::Natural { group: 7 })
+                .is_some(),
+            "the real parent is the tracer when both share a thread group"
+        );
+        assert_eq!(
+            job.stop_report_for(StopFilter::Natural { group: 9 }),
+            None,
+            "a stop owned by a separate ptracer stays hidden from the real parent"
         );
 
         // Ordinary child job-control reports remain sessionless and are not
         // accidentally hidden merely because the parent is also a tracer.
         job.stop_kind = StopKind::JobControl;
         job.ptrace_session = None;
-        let report = job.stop_report_for(Some(new)).unwrap();
+        let report = job.stop_report_for(StopFilter::Natural { group: 9 }).unwrap();
         assert!(!report.traced());
         assert_eq!(report.ptrace_session, None);
     }

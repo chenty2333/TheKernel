@@ -18,6 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/ptrace.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -25,6 +27,15 @@
 
 #ifndef P_PIDFD
 #define P_PIDFD 3
+#endif
+#ifndef PTRACE_TRACEME
+#define PTRACE_TRACEME 0
+#endif
+#ifndef PTRACE_DETACH
+#define PTRACE_DETACH 17
+#endif
+#ifndef SYS_ptrace
+#define SYS_ptrace 101
 #endif
 #ifndef SCHED_DEADLINE
 #define SCHED_DEADLINE 6
@@ -64,6 +75,22 @@
 #ifndef __WCLONE
 #define __WCLONE 0x80000000
 #endif
+/* linux/ioprio.h */
+#ifndef IOPRIO_CLASS_SHIFT
+#define IOPRIO_CLASS_SHIFT 13
+#endif
+#ifndef IOPRIO_WHO_PROCESS
+#define IOPRIO_WHO_PROCESS 1
+#define IOPRIO_WHO_PGRP 2
+#define IOPRIO_WHO_USER 3
+#endif
+#ifndef IOPRIO_CLASS_NONE
+#define IOPRIO_CLASS_NONE 0
+#define IOPRIO_CLASS_RT 1
+#define IOPRIO_CLASS_BE 2
+#define IOPRIO_CLASS_IDLE 3
+#endif
+#define IOPRIO_VALUE(class, level) (((class) << IOPRIO_CLASS_SHIFT) | (level))
 
 struct sched_attr_local {
     uint32_t size;
@@ -222,6 +249,43 @@ int main(void)
         long rc = syscall(SYS_waitid, P_ALL, -1, &info, WEXITED | WNOHANG | WNOWAIT, NULL);
         check("waitid-p-all-ignores-upid", rc == 0);
     }
+    /* A failing wait still stores the six siginfo fields: `do_wait()` fills a
+     * `struct waitid_info` that `{.status = 0}` initializes and
+     * SYSCALL_DEFINE5(waitid) stores it before returning the error, so a
+     * caller's stale buffer cannot survive. Exactly those six fields are
+     * stored -- the ABI padding after `si_code` and the rest of the union stay
+     * the caller's bytes, which is what the tail probe below proves. */
+    {
+        siginfo_t info;
+        unsigned char *raw = (unsigned char *)&info;
+        int untouched = 1;
+        size_t i;
+        memset(&info, 0xaa, sizeof(info));
+        errno = 0;
+        long rc = syscall(SYS_waitid, P_PID, INT32_MAX, &info, WEXITED | WNOHANG, NULL);
+        for (i = 12; i < 16; i++) untouched = untouched && raw[i] == 0xaa;
+        for (i = 28; i < sizeof(info); i++) untouched = untouched && raw[i] == 0xaa;
+        check("waitid-echild-zeroes-info",
+              rc == -1 && errno == ECHILD && info.si_signo == 0 && info.si_errno == 0
+                  && info.si_code == 0 && info.si_pid == 0 && info.si_uid == 0
+                  && info.si_status == 0 && untouched);
+    }
+    /* The resource usage is copied *before* the siginfo_t, and only for a
+     * reported event, so a faulting `rusage` returns EFAULT with the caller's
+     * siginfo_t untouched rather than half-updated. WNOWAIT keeps the stop
+     * pending for the checks below. */
+    kill(child, SIGSTOP);
+    {
+        siginfo_t info;
+        unsigned char *raw = (unsigned char *)&info;
+        int intact = 1;
+        size_t i;
+        memset(&info, 0xaa, sizeof(info));
+        errno = 0;
+        long rc = syscall(SYS_waitid, P_PID, child, &info, WSTOPPED | WNOWAIT, (void *)1);
+        for (i = 0; i < sizeof(info); i++) intact = intact && raw[i] == 0xaa;
+        check("waitid-rusage-fault-before-info", rc == -1 && errno == EFAULT && intact);
+    }
     /* WNOHANG with a live child and no pending event reports success with a
      * zeroed siginfo rather than an error. */
     {
@@ -233,7 +297,6 @@ int main(void)
     }
     /* waitid with WNOWAIT on a stopped child observes the stop without
      * consuming it, so a second WNOWAIT call reports the same stop again. */
-    kill(child, SIGSTOP);
     {
         siginfo_t first, second;
         memset(&first, 0, sizeof(first));
@@ -372,12 +435,23 @@ int main(void)
              * therefore be a whole page: the kernel fills `min(usize, 56)`
              * bytes and the first field is the reported size. */
             static unsigned char page[4096];
+            uint32_t reported;
+            int tail_cleared = 1;
+            size_t i;
             memset(page, 0, sizeof(page));
             errno = 0;
             long rc = syscall(SYS_sched_getattr, 0, page, sizeof(page), 0);
-            uint32_t reported;
             memcpy(&reported, page, sizeof(reported));
             check("getattr-size-page-accepted", rc == 0 && reported == 56);
+            /* copy_struct_to_user() clears the unknown part of a larger
+             * userspace structure, so every byte of the requested extent is
+             * written and none of the caller's old contents survive. */
+            memset(page, 0xaa, sizeof(page));
+            errno = 0;
+            rc = syscall(SYS_sched_getattr, 0, page, sizeof(page), 0);
+            memcpy(&reported, page, sizeof(reported));
+            for (i = 56; i < sizeof(page); i++) tail_cleared = tail_cleared && page[i] == 0;
+            check("getattr-page-clears-tail", rc == 0 && reported == 56 && tail_cleared);
         }
         EXPECT_ERR("getattr-size-4097-einval", syscall(SYS_sched_getattr, 0, &attr, 4097, 0), EINVAL);
         EXPECT_ERR("getattr-null-attr", syscall(SYS_sched_getattr, 0, NULL, 48, 0), EINVAL);
@@ -387,6 +461,11 @@ int main(void)
         EXPECT_ERR("getattr-unknown-flags", syscall(SYS_sched_getattr, 0, &attr, 48, 2), EINVAL);
         EXPECT_ERR("getattr-dl-dynamic-on-other",
                    syscall(SYS_sched_getattr, 0, &attr, 48, 1), EINVAL);
+        /* The flag check needs the resolved target, so it runs *after* the
+         * lookup: an unknown flag with a pid that names nothing is ESRCH, not
+         * EINVAL. */
+        EXPECT_ERR("getattr-unknown-flag-bad-pid-esrch",
+                   syscall(SYS_sched_getattr, INT32_MAX, &attr, 48, 2), ESRCH);
         /* A plain request round-trips the caller's own non-deadline identity. */
         memset(&attr, 0xaa, sizeof(attr));
         errno = 0;
@@ -482,6 +561,45 @@ int main(void)
         EXPECT_OK("set_mempolicy-restore-default",
                   syscall(SYS_set_mempolicy, MPOL_DEFAULT, NULL, 0));
     }
+    /* MPOL_PREFERRED with a non-empty mask that names no *allowed* node is
+     * EINVAL, not the MPOL_LOCAL rewrite: `mpol_new()` only rewrites an empty
+     * user mask, and the surviving preferred policy is then built by
+     * `mpol_new_preferred()` from the mask intersected with the allowed set.
+     * Node 1 is disallowed on a one-node configuration, so this mask has a
+     * non-empty user value and an empty intersection. */
+    {
+        unsigned long disallowed = 2;
+        EXPECT_ERR("set_mempolicy-preferred-disallowed-mask",
+                   syscall(SYS_set_mempolicy, MPOL_PREFERRED, &disallowed, 64), EINVAL);
+    }
+    /* `do_mbind()` returns for an empty range before `mpol_new()` looks at the
+     * mask's contents, so a zero-length bind with an empty-intersection mask
+     * succeeds on the flag mask and range alone. */
+    {
+        unsigned long disallowed = 2;
+        EXPECT_OK("mbind-zero-length-skips-mask-validation",
+                  syscall(SYS_mbind, 0, 0, MPOL_BIND, &disallowed, 64, 0));
+    }
+    /* The MPOL_MF_MOVE_ALL capability check is likewise inside `do_mbind()` and
+     * precedes `mpol_new()`, so an unprivileged caller gets EPERM for the same
+     * arguments that only the mask check would reject. */
+    {
+        pid_t probe = fork();
+        if (probe == 0) {
+            unsigned long disallowed = 2;
+            if (setresuid(1000, 1000, 1000) != 0) _exit(3);
+            errno = 0;
+            _exit(syscall(SYS_mbind, 0, 0x1000, MPOL_BIND, &disallowed, 64,
+                          MPOL_MF_MOVE_ALL) == -1 && errno == EPERM ? 0 : 1);
+        }
+        int status = -1;
+        int reaped;
+        do {
+            reaped = waitpid(probe, &status, 0);
+        } while (reaped < 0 && errno == EINTR);
+        check("mbind-move-all-unprivileged-eperm",
+              reaped == probe && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
     /* MPOL_F_MEMS_ALLOWED short-circuits before the address check, so a
      * non-zero addr with that flag is not EINVAL. */
     {
@@ -507,6 +625,403 @@ int main(void)
         unsigned long mask = 0;
         EXPECT_ERR("get_mempolicy-tiny-maxnode",
                    syscall(SYS_get_mempolicy, NULL, &mask, 0, 0, 0), EINVAL);
+    }
+    /* That wrapper check is *outside* do_get_mempolicy(), so it also applies to
+     * `MPOL_F_MEMS_ALLOWED`, which only skips the address check. */
+    {
+        unsigned long mask[2] = {0, 0};
+        int policy = -1;
+        EXPECT_ERR("get_mempolicy-mems-allowed-tiny-maxnode",
+                   syscall(SYS_get_mempolicy, &policy, mask, 0, 0, MPOL_F_MEMS_ALLOWED),
+                   EINVAL);
+    }
+    /* `MPOL_F_MEMS_ALLOWED` reports the allowed set and stores 0 -- not the
+     * mode -- in *policy, and an unreadable *policy is still EFAULT. */
+    {
+        unsigned long mask[2] = {0, 0};
+        int policy = 0x7eadbeef;
+        errno = 0;
+        long rc = syscall(SYS_get_mempolicy, &policy, mask, 64, 0, MPOL_F_MEMS_ALLOWED);
+        check("get_mempolicy-mems-allowed-zero-policy",
+              rc == 0 && policy == 0 && (mask[0] & 1UL) != 0);
+        EXPECT_ERR("get_mempolicy-mems-allowed-policy-fault",
+                   syscall(SYS_get_mempolicy, (void *)1, mask, 64, 0, MPOL_F_MEMS_ALLOWED),
+                   EFAULT);
+    }
+    /* `MPOL_F_NODE` replaces *policy with a node id but still stores the
+     * policy's nodemask; the default policy has an empty one, and only the
+     * `nr_node_ids` bits of the caller's buffer are written. */
+    {
+        static unsigned long probe_word;
+        unsigned long mask[2] = {~0UL, ~0UL};
+        int policy = -1;
+        errno = 0;
+        long rc = syscall(SYS_get_mempolicy, &policy, mask, 64,
+                          (unsigned long)&probe_word, MPOL_F_NODE | MPOL_F_ADDR);
+        check("get_mempolicy-f-node-addr-writes-mask",
+              rc == 0 && policy == 0 && mask[0] == 0);
+    }
+    /* The shaping flags stored with the policy come back in *policy, and
+     * `mpol_store_user_nodemask()` makes the query report the caller's own mask
+     * rather than the intersection: nodes 0 and 1 were requested, only node 0
+     * is allowed, and the reported mode keeps MPOL_F_STATIC_NODES. */
+    {
+        unsigned long user_mask = 3;
+        unsigned long reported[2] = {0, 0};
+        int policy = -1;
+        EXPECT_OK("set_mempolicy-static-bind-keeps-user-mask",
+                  syscall(SYS_set_mempolicy, MPOL_BIND | MPOL_F_STATIC_NODES, &user_mask, 64));
+        errno = 0;
+        long rc = syscall(SYS_get_mempolicy, &policy, reported, 64, 0, 0);
+        check("get_mempolicy-reports-mode-and-user-mask",
+              rc == 0 && policy == (MPOL_BIND | MPOL_F_STATIC_NODES)
+                  && reported[0] == user_mask);
+        EXPECT_OK("set_mempolicy-restore-default-after-static",
+                  syscall(SYS_set_mempolicy, MPOL_DEFAULT, NULL, 0));
+    }
+    done();
+
+    /* ---------------- sched_getscheduler(2)/sched_getparam(2) ------------- */
+    begin("sched_query.raw-differential");
+    {
+        struct sched_param param;
+        /* Both wrappers reject their argument shape before the lookup: a
+         * negative pid is EINVAL, and so is a null `param`, while a resolvable
+         * pid that names no process is ESRCH. */
+        EXPECT_ERR("sched-getscheduler-negative-pid",
+                   syscall(SYS_sched_getscheduler, -1), EINVAL);
+        EXPECT_ERR("sched-getscheduler-unknown-pid",
+                   syscall(SYS_sched_getscheduler, INT32_MAX), ESRCH);
+        EXPECT_ERR("sched-getparam-negative-pid",
+                   syscall(SYS_sched_getparam, -1, &param), EINVAL);
+        EXPECT_ERR("sched-getparam-null-param",
+                   syscall(SYS_sched_getparam, 0, NULL), EINVAL);
+        EXPECT_ERR("sched-getparam-unknown-pid",
+                   syscall(SYS_sched_getparam, INT32_MAX, &param), ESRCH);
+        errno = 0;
+        long rc = syscall(SYS_sched_getscheduler, 0);
+        check("sched-getscheduler-self", rc == SCHED_OTHER);
+        memset(&param, 0xaa, sizeof(param));
+        errno = 0;
+        rc = syscall(SYS_sched_getparam, 0, &param);
+        check("sched-getparam-self", rc == 0 && param.sched_priority == 0);
+    }
+    /* A pid that resolves to an unreaped zombie is still
+     * `find_process_by_pid()`-reachable and answers from the scheduler state it
+     * last held, which `release_task()` is what finally removes. */
+    {
+        int ready[2];
+        if (pipe(ready) != 0) {
+            check("sched-query-pipe", 0);
+        } else {
+            pid_t zombie = fork();
+            if (zombie == 0) {
+                struct sched_param param = {.sched_priority = 0};
+                char byte = 'B';
+                close(ready[0]);
+                if (syscall(SYS_sched_setscheduler, 0, SCHED_BATCH, &param) != 0) _exit(1);
+                if (write(ready[1], &byte, 1) != 1) _exit(1);
+                _exit(0);
+            }
+            close(ready[1]);
+            if (zombie < 0) {
+                close(ready[0]);
+                check("sched-query-fork", 0);
+            } else {
+                char byte = 0;
+                siginfo_t info;
+                struct sched_param param;
+                long waited, policy, rc;
+                ssize_t ack = read(ready[0], &byte, 1);
+                close(ready[0]);
+                check("sched-query-child-batch", ack == 1 && byte == 'B');
+                memset(&info, 0, sizeof(info));
+                errno = 0;
+                waited = syscall(SYS_waitid, P_PID, zombie, &info, WEXITED | WNOWAIT, NULL);
+                check("sched-query-zombie-waitid", waited == 0 && info.si_pid == zombie);
+                errno = 0;
+                policy = syscall(SYS_sched_getscheduler, zombie);
+                check("sched-getscheduler-zombie-keeps-policy", policy == SCHED_BATCH);
+                memset(&param, 0xaa, sizeof(param));
+                errno = 0;
+                rc = syscall(SYS_sched_getparam, zombie, &param);
+                check("sched-getparam-zombie-reports-zero",
+                      rc == 0 && param.sched_priority == 0);
+                collect(zombie);
+                EXPECT_ERR("sched-getscheduler-after-reap",
+                           syscall(SYS_sched_getscheduler, zombie), ESRCH);
+                EXPECT_ERR("sched-getparam-after-reap",
+                           syscall(SYS_sched_getparam, zombie, &param), ESRCH);
+            }
+        }
+    }
+    done();
+
+    /* ---------------- setpriority(2) argument contract ---------------- */
+    begin("setpriority.raw-differential");
+    /* `set_one_prio()` authorizes a nicer value with `can_nice(p, niceval)`,
+     * which reads `task_rlimit(p, RLIMIT_NICE)` from the *target*. A caller
+     * holding a generous limit of its own still sees EACCES for a target that
+     * lowered its soft limit, and CAP_SYS_NICE overrides the limit. Both
+     * children below must therefore be scheduled by a process that is not the
+     * one being limited. */
+    {
+        int ready[2];
+        if (pipe(ready) != 0) {
+            check("setpriority-pipe", 0);
+        } else {
+            pid_t limited = fork();
+            if (limited == 0) {
+                struct rlimit none = {0, 0};
+                char byte = 'R';
+                close(ready[0]);
+                if (prlimit(0, RLIMIT_NICE, &none, NULL) != 0) _exit(1);
+                if (setresuid(1000, 1000, 1000) != 0) _exit(1);
+                if (write(ready[1], &byte, 1) != 1) _exit(1);
+                for (;;) pause();
+            }
+            close(ready[1]);
+            if (limited < 0) {
+                close(ready[0]);
+                check("setpriority-fork", 0);
+            } else {
+                char byte = 0;
+                ssize_t got = read(ready[0], &byte, 1);
+                close(ready[0]);
+                check("setpriority-limited-child-ready", got == 1 && byte == 'R');
+                pid_t caller = fork();
+                if (caller == 0) {
+                    /* Raised while still privileged, so the limit is legal and
+                     * survives the uid change below. */
+                    struct rlimit generous = {40, 40};
+                    if (prlimit(0, RLIMIT_NICE, &generous, NULL) != 0) _exit(2);
+                    if (setresuid(1000, 1000, 1000) != 0) _exit(2);
+                    errno = 0;
+                    _exit(setpriority(PRIO_PROCESS, limited, -5) == -1 && errno == EACCES
+                              ? 0
+                              : 1);
+                }
+                int status = -1;
+                int reaped;
+                do {
+                    reaped = waitpid(caller, &status, 0);
+                } while (reaped < 0 && errno == EINTR);
+                check("setpriority-target-rlimit-nice-eacces",
+                      reaped == caller && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+                EXPECT_OK("setpriority-cap-sys-nice-lowers",
+                          setpriority(PRIO_PROCESS, limited, -5));
+                collect(limited);
+            }
+        }
+    }
+    done();
+
+    /* ---------------- ioprio_set(2)/ioprio_get(2) contract ---------------- */
+    begin("ioprio.raw-differential");
+    /* `ioprio_check_cap()` runs before the which/who pair is resolved, so an
+     * unusable class/level word is EINVAL (or EPERM for realtime) even for a
+     * pid that names nothing. */
+    EXPECT_ERR("ioprio-set-none-with-level",
+               syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, INT32_MAX,
+                       IOPRIO_VALUE(IOPRIO_CLASS_NONE, 1)),
+               EINVAL);
+    EXPECT_ERR("ioprio-set-invalid-class",
+               syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, INT32_MAX,
+                       IOPRIO_VALUE(7, 0)),
+               EINVAL);
+    EXPECT_ERR("ioprio-set-bad-which",
+               syscall(SYS_ioprio_set, 9, 0, IOPRIO_VALUE(IOPRIO_CLASS_BE, 3)), EINVAL);
+    EXPECT_ERR("ioprio-get-bad-which", syscall(SYS_ioprio_get, 9, 0), EINVAL);
+    /* WHO_PROCESS reports the stored word verbatim -- an explicit
+     * IOPRIO_CLASS_NONE reads back as 0 -- while WHO_PGRP derives the
+     * class/level from the task's nice value. */
+    {
+        long got;
+        EXPECT_OK("ioprio-set-self",
+                  syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0,
+                          IOPRIO_VALUE(IOPRIO_CLASS_BE, 4)));
+        errno = 0;
+        got = syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0);
+        check("ioprio-get-self-roundtrip", got == IOPRIO_VALUE(IOPRIO_CLASS_BE, 4));
+        EXPECT_OK("ioprio-set-self-none",
+                  syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, IOPRIO_CLASS_NONE));
+        errno = 0;
+        got = syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0);
+        check("ioprio-get-self-reports-stored-none", got == 0);
+    }
+    /* `IOPRIO_WHO_PGRP` resolves its `who` argument as a process-group id and
+     * reports the numerically lowest (`ioprio_best()`) value over every member.
+     * A member that never called ioprio_set has no io_context, so its
+     * contribution is the class/level `task_nice_ioclass()` and
+     * `task_nice_ioprio()` derive from its nice value. The group is a child's
+     * own and the second member is forked *by* that child, so membership is
+     * inherited and exactly known. */
+    {
+        int ready[2], gate[2];
+        if (pipe(ready) != 0 || pipe(gate) != 0) {
+            check("ioprio-group-pipe", 0);
+        } else {
+            pid_t leader = fork();
+            if (leader == 0) {
+                char byte;
+
+                close(ready[0]);
+                close(gate[1]);
+                if (setpgid(0, 0) != 0) _exit(1);
+                /* The group's only member has no io_context yet. */
+                if (write(ready[1], "L", 1) != 1) _exit(1);
+                if (read(gate[0], &byte, 1) != 1) _exit(1);
+                pid_t member = fork();
+                if (member == 0) {
+                    if (syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0,
+                                IOPRIO_VALUE(IOPRIO_CLASS_BE, 2)) != 0) _exit(1);
+                    if (write(ready[1], "M", 1) != 1) _exit(1);
+                    if (read(gate[0], &byte, 1) != 1) _exit(0);
+                    _exit(0);
+                }
+                if (read(gate[0], &byte, 1) != 1) _exit(0);
+                _exit(0);
+            }
+            close(ready[1]);
+            close(gate[0]);
+            if (leader < 0) {
+                close(ready[0]);
+                close(gate[1]);
+                check("ioprio-group-fork", 0);
+            } else {
+                char byte = 0;
+                long got;
+                ssize_t ack = read(ready[0], &byte, 1);
+
+                /* nice 0 for a task with no io_context: `task_nice_ioprio()` is
+                 * (0 + 20) / 5 = 4 in `task_nice_ioclass()`'s class BE. */
+                errno = 0;
+                got = syscall(SYS_ioprio_get, IOPRIO_WHO_PGRP, leader);
+                check("ioprio-get-pgrp-derives-from-nice",
+                      ack == 1 && byte == 'L' && got == IOPRIO_VALUE(IOPRIO_CLASS_BE, 4));
+                if (ack == 1 && byte == 'L' && write(gate[1], "F", 1) == 1) {
+                    /* The member's BE|2 is numerically lower than the derived
+                     * BE|4 of the leader, and `ioprio_best()` is `min()`. */
+                    byte = 0;
+                    ack = read(ready[0], &byte, 1);
+                    errno = 0;
+                    got = syscall(SYS_ioprio_get, IOPRIO_WHO_PGRP, leader);
+                    check("ioprio-get-pgrp-best-of-group",
+                          ack == 1 && byte == 'M'
+                              && got == IOPRIO_VALUE(IOPRIO_CLASS_BE, 2));
+                } else {
+                    check("ioprio-get-pgrp-best-of-group", 0);
+                }
+                /* Both members exit when the gate closes. */
+                close(ready[0]);
+                close(gate[1]);
+                collect(leader);
+            }
+        }
+    }
+    /* An exiting task keeps answering from the terminal state Linux freezes:
+     * `exit_io_context()` drops `io_context`, so a zombie reports
+     * IOPRIO_DEFAULT and `set_task_ioprio()` silently does nothing for it
+     * (blk-ioc.c's `PF_EXITING` early return), and only the reap makes the pid
+     * unreachable. */
+    {
+        pid_t zombie = fork();
+        if (zombie == 0) {
+            if (syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0,
+                        IOPRIO_VALUE(IOPRIO_CLASS_BE, 3)) != 0) _exit(1);
+            _exit(0);
+        }
+        if (zombie < 0) {
+            check("ioprio-zombie-fork", 0);
+        } else {
+            siginfo_t info;
+            long got;
+            memset(&info, 0, sizeof(info));
+            errno = 0;
+            long waited = syscall(SYS_waitid, P_PID, zombie, &info, WEXITED | WNOWAIT, NULL);
+            errno = 0;
+            got = syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, zombie);
+            check("ioprio-zombie-reports-default", waited == 0 && got == 0);
+            EXPECT_OK("ioprio-zombie-set-is-a-noop",
+                      syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, zombie,
+                              IOPRIO_VALUE(IOPRIO_CLASS_BE, 2)));
+            errno = 0;
+            got = syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, zombie);
+            check("ioprio-zombie-keeps-default", got == 0);
+            collect(zombie);
+            EXPECT_ERR("ioprio-get-after-reap",
+                       syscall(SYS_ioprio_get, IOPRIO_WHO_PROCESS, zombie), ESRCH);
+            EXPECT_ERR("ioprio-set-after-reap",
+                       syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, zombie,
+                               IOPRIO_VALUE(IOPRIO_CLASS_BE, 2)),
+                       ESRCH);
+        }
+    }
+    done();
+
+    /* ---------------- a tracee's stop reaches its real parent ---------------
+     * `wait_consider_task()` forces `ptrace = 1` for a child traced from the
+     * waiter's own thread group (`if (!ptrace_reparented(p)) ptrace = 1;`,
+     * kernel/exit.c:1522-1523), and `wait_task_stopped()` then reports that
+     * stop "regardless of options" (kernel/exit.c:1374-1375). A `PTRACE_TRACEME`
+     * child stopped by `raise(SIGSTOP)` must therefore be visible to a bare
+     * `wait4(2)`/`waitid(2)` that names no stop option and no session. */
+    begin("ptrace_stop.raw-differential");
+    {
+        pid_t forked[2];
+        pid_t child;
+        int status = 0;
+        siginfo_t info;
+        long waited;
+        long detached;
+        long reaped;
+        int index;
+
+        /* Two tracees: each stop is consumed by the wait that reports it, so the
+         * `wait4(2)` and the `waitid(2)` observation need one child each. */
+        for (index = 0; index < 2; index++) {
+            forked[index] = fork();
+            if (forked[index] == 0) {
+                if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, 0, 0) != 0) _exit(1);
+                if (raise(SIGSTOP) != 0) _exit(1);
+                _exit(0);
+            }
+        }
+        if (forked[0] < 0 || forked[1] < 0) {
+            check("ptrace-traceme-fork", 0);
+        } else {
+            /* `wait4(2)` with no option bits at all. A stopped tracee reports
+             * WIFSTOPPED with the stop signal. */
+            child = forked[0];
+            errno = 0;
+            waited = syscall(SYS_wait4, child, &status, 0, NULL);
+            check("wait4-traceme-stop-without-wuntraced",
+                  waited == child && WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+            /* `waitid(2)` without `WSTOPPED` sees it too, and the report is
+             * CLD_TRAPPED rather than CLD_STOPPED because the forced `ptrace`
+             * also selects `why` (kernel/exit.c:1414). */
+            child = forked[1];
+            memset(&info, 0, sizeof(info));
+            errno = 0;
+            waited = syscall(SYS_waitid, P_PID, child, &info, WEXITED, NULL);
+            check("waitid-traceme-stop-is-cld-trapped",
+                  waited == 0 && info.si_code == CLD_TRAPPED
+                      && info.si_status == SIGSTOP && info.si_pid == child);
+            /* Detaching resumes a tracee, so its exit is an ordinary one. */
+            errno = 0;
+            detached = syscall(SYS_ptrace, PTRACE_DETACH, forked[0], 0, 0);
+            detached |= syscall(SYS_ptrace, PTRACE_DETACH, forked[1], 0, 0);
+            if (detached == 0) {
+                reaped = waitpid(forked[0], NULL, 0) == forked[0]
+                    && waitpid(forked[1], NULL, 0) == forked[1];
+            } else {
+                reaped = 0;
+            }
+            check("ptrace-tracee-resumes-and-reaps-after-detach", reaped);
+        }
+        for (index = 0; index < 2; index++) {
+            if (forked[index] > 0) collect(forked[index]);
+        }
     }
     done();
 
