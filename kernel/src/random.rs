@@ -31,6 +31,37 @@ pub fn fill_secure(buf: &mut [u8]) -> AxResult<()> {
         .map_err(|()| AxError::WouldBlock)
 }
 
+/// Linux's `crng_ready()`: whether the secure pool may be used without waiting.
+///
+/// This probes readiness without consuming bytes.  A zero-length
+/// `ReseedingDrbg::fill_bytes` neither reseeds nor reports failure, so it must
+/// never be used as the probe.
+pub fn is_ready() -> bool {
+    axdriver::entropy_source_ready() || SECURE_RANDOM.lock().is_seeded()
+}
+
+/// Linux's `wait_for_random_bytes()`: block until the secure pool is ready.
+///
+/// `getrandom(2)` runs this before it looks at the destination buffer, so a
+/// blocking call with `len == 0` waits exactly like a blocking call with a
+/// non-empty buffer.
+pub fn wait_until_ready() -> AxResult<()> {
+    retry_secure_fill(
+        false,
+        || if is_ready() { Ok(()) } else { Err(AxError::WouldBlock) },
+        || {
+            crate::task::with_proc_state_hint(crate::task::ProcStateHint::Interruptible, || {
+                axtask::future::block_on(axtask::future::interruptible(axtask::future::sleep(
+                    core::time::Duration::from_millis(10),
+                )))
+            })
+            .map_err(AxError::from)?
+            .map_err(AxError::from)?
+            .map_err(AxError::from)
+        },
+    )
+}
+
 /// Wait for initial entropy without holding the DRBG lock across a sleep.
 /// The driver interface has no readiness notifier, so retry on a bounded
 /// interruptible timer rather than returning EAGAIN for blocking getrandom.
@@ -91,11 +122,7 @@ pub fn fill_insecure(buf: &mut [u8]) {
 }
 
 pub fn entropy_bits() -> i32 {
-    if axdriver::entropy_source_ready() || SECURE_RANDOM.lock().is_seeded() {
-        ENTROPY_BITS_READY
-    } else {
-        0
-    }
+    if is_ready() { ENTROPY_BITS_READY } else { 0 }
 }
 
 #[cfg(test)]

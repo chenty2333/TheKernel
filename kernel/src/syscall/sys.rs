@@ -9,7 +9,7 @@ use axhal::{time::monotonic_time, uspace::UserContext};
 use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::{
-    general::{CAP_SYS_ADMIN, CAP_SYSLOG, GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, NGROUPS_MAX},
+    general::{CAP_SYS_ADMIN, CAP_SYSLOG, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
 };
 use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_write_slice};
@@ -783,15 +783,14 @@ pub fn sys_syslog<M: UserMemory + ?Sized>(
     }
 }
 
-bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct GetRandomFlags: u32 {
-        const NONBLOCK = GRND_NONBLOCK;
-        const RANDOM = GRND_RANDOM;
-        const INSECURE = GRND_INSECURE;
-    }
-}
-
+/// `sys_getrandom(2)`.
+///
+/// The statement order below is the ABI.  `drivers/char/random.c` validates the
+/// flag word, then (`GRND_INSECURE` aside) gates on `crng_ready()` *before* it
+/// calls `import_ubuf()`, and `import_ubuf()` clamps to `MAX_RW_COUNT` rather
+/// than rejecting an oversized request.  Everything after the gate is a copy,
+/// so a fault midway through a large request returns the bytes already copied
+/// instead of an errno.
 pub fn sys_getrandom<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     buf: *mut u8,
@@ -800,28 +799,46 @@ pub fn sys_getrandom<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     const GETRANDOM_CHUNK_SIZE: usize = 4096;
 
-    let flags = GetRandomFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
-    if flags.contains(GetRandomFlags::RANDOM) && flags.contains(GetRandomFlags::INSECURE) {
-        return Err(AxError::InvalidInput);
+    let request =
+        tk_linux_random::GetRandomRequest::new(flags, len).map_err(|_| AxError::InvalidInput)?;
+    let len = request.len();
+    let insecure = request.insecure();
+
+    if request.gates_zero_length() {
+        match request.readiness() {
+            tk_linux_random::ReadinessPlan::Skip => {}
+            tk_linux_random::ReadinessPlan::FailWouldBlock => {
+                if !crate::random::is_ready() {
+                    return Err(AxError::WouldBlock);
+                }
+            }
+            tk_linux_random::ReadinessPlan::Block => crate::random::wait_until_ready()?,
+        }
     }
+
     if len == 0 {
+        // `import_ubuf()` still runs `access_ok()` on an empty request.  The
+        // kernel's own usercopy layer rejects the low page, so the Linux test
+        // (which accepts it) is applied directly.
+        if !tk_linux_random::zero_length_address_is_user(buf as usize, user_ptr_max()) {
+            return Err(AxError::BadAddress);
+        }
         return Ok(0);
     }
 
-    debug!("sys_getrandom <= buf: {buf:p}, len: {len}, flags: {flags:?}");
+    debug!("sys_getrandom <= buf: {buf:p}, len: {len}, flags: {flags:#x}");
 
     let mut total = 0;
     let mut kbuf = [0u8; GETRANDOM_CHUNK_SIZE];
     while total < len {
         let chunk = (len - total).min(kbuf.len());
-        let fill_result = if flags.contains(GetRandomFlags::INSECURE) {
+        let fill_result = if insecure {
             crate::random::fill_insecure(&mut kbuf[..chunk]);
             Ok(())
         } else {
-            crate::random::fill_secure_wait(
-                &mut kbuf[..chunk],
-                flags.contains(GetRandomFlags::NONBLOCK) || total != 0,
-            )
+            // Readiness was established above; a later reseed failure must not
+            // block once bytes have already reached userspace.
+            crate::random::fill_secure_wait(&mut kbuf[..chunk], total != 0)
         };
         if let Err(error) = fill_result {
             return if total == 0 {
@@ -843,6 +860,12 @@ pub fn sys_getrandom<M: UserMemory + ?Sized>(
     }
 
     Ok(total as isize)
+}
+
+/// `USER_PTR_MAX` from `arch/x86/include/asm/uaccess_64.h`: `TASK_SIZE_MAX`
+/// minus one page.  `access_ok()` accepts any address up to and including it.
+const fn user_ptr_max() -> usize {
+    crate::config::USER_SPACE_BASE + crate::config::USER_SPACE_SIZE - 4096
 }
 
 pub fn sys_restart_syscall(uctx: &UserContext) -> AxResult<isize> {

@@ -1498,15 +1498,23 @@ pub fn sys_io_pgetevents<M: UserMemory + ?Sized>(
     })
 }
 
+/// `aio_key` is the only field of `struct iocb` that `io_cancel(2)` reads, and
+/// `KIOCB_KEY` is the value `io_submit(2)` writes back into it.
+const IOCB_AIO_KEY_OFFSET: usize = 8;
+
 pub fn sys_io_cancel<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ctx: u64,
     iocb: *const Iocb,
-    result: *mut IoEvent,
+    _result: *mut IoEvent,
 ) -> AxResult<isize> {
-    let _ = VmPtr::vm_read(iocb, memory).map_err(map_usercopy_error)?;
-    if result.is_null() {
-        return Err(AxError::BadAddress);
+    // `io_cancel(2)` reads `iocb->aio_key` first: an unreadable (or NULL) iocb
+    // is -EFAULT, and any value other than KIOCB_KEY is -EINVAL.  The
+    // `result` argument is never dereferenced.
+    let key_address = (iocb as *const u8).wrapping_add(IOCB_AIO_KEY_OFFSET) as *const u32;
+    let key = VmPtr::vm_read(key_address, memory).map_err(map_usercopy_error)?;
+    if key != KIOCB_KEY {
+        return Err(AxError::InvalidInput);
     }
     let context = context_for_current(ctx)?;
     let request = context
@@ -1549,7 +1557,7 @@ pub fn sys_io_cancel<M: UserMemory + ?Sized>(
                     .is_err()
                 {
                     *provider = AioProviderState::Terminal;
-                    return Err(LinuxError::EAGAIN.into());
+                    return Err(AxError::InvalidInput);
                 }
                 CancelOwner::Submitted(submitted)
             }
@@ -1557,7 +1565,7 @@ pub fn sys_io_cancel<M: UserMemory + ?Sized>(
             | AioProviderState::InFlight
             | AioProviderState::Terminal) => {
                 *provider = state;
-                return Err(LinuxError::EAGAIN.into());
+                return Err(AxError::InvalidInput);
             }
         }
     };
@@ -1596,12 +1604,14 @@ pub fn sys_io_cancel<M: UserMemory + ?Sized>(
         },
     };
     if !cancelled {
-        return Err(LinuxError::EAGAIN.into());
+        // A request that could not be withdrawn is reported exactly like one
+        // that was never on `active_reqs`: -EINVAL, never -EAGAIN.
+        return Err(AxError::InvalidInput);
     }
     // No external/provider call occurs below this point.  A synchronous
     // provider callback may already have removed the map entry; that is the
     // expected result of the suppressed-CQ path.
-    {
+    let published = {
         let mut state = context.state.lock();
         if state
             .requests
@@ -1611,22 +1621,33 @@ pub fn sys_io_cancel<M: UserMemory + ?Sized>(
             let _ = request.operation.claim_terminal();
             state.requests.remove(&(iocb as u64));
             state.in_flight = state.in_flight.saturating_sub(1);
+            // The cancellation event is delivered through the completion
+            // queue like any other completion; the deprecated `result`
+            // argument stays untouched.
+            if state.accepting {
+                state.events.push_back(IoEvent {
+                    data: request.data,
+                    obj: request.iocb,
+                    res: -LinuxError::ECANCELED.code() as i64,
+                    res2: 0,
+                });
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         }
+    };
+    if published && let Some(event) = &request.resfd {
+        let _ = event.signal(1);
     }
     request.operation.wake_waiters();
-    write_io_event(
-        memory,
-        result,
-        IoEvent {
-            data: request.data,
-            obj: request.iocb,
-            res: -LinuxError::ECANCELED.code() as i64,
-            res2: 0,
-        },
-    )?;
     context.waiters.wake();
     release_context_events(&context);
-    Ok(0)
+    // `io_cancel(2)` reports a successful cancellation as -EINPROGRESS; the
+    // request's own result reaches userspace as res == -ECANCELED.
+    Ok(-(LinuxError::EINPROGRESS.code() as isize))
 }
 
 pub fn cleanup_process_aio(owner: Pid) {

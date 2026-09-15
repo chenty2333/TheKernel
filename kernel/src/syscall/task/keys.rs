@@ -10,7 +10,8 @@ use tk_linux_keyring::uapi::{
     KeyctlUapiError, RawKeyctlArgs, UserBuffer, UserString, capabilities_bytes, decode_keyctl,
 };
 use tk_linux_usercopy::{
-    UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded, vm_write_slice,
+    UserCopyError, UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded,
+    vm_write_slice,
 };
 
 use crate::{
@@ -19,6 +20,16 @@ use crate::{
     task::{AsThread, Cred},
 };
 
+/// `add_key()`'s payload ceiling from `keyctl.c`: `plen > 1024 * 1024 - 1` is
+/// rejected before any user pointer is touched.
+const ADD_KEY_PAYLOAD_MAX: usize = 1024 * 1024 - 1;
+
+/// Loads a NUL-terminated user string with Linux's `strndup_user()` error
+/// contract.
+///
+/// `strndup_user()` reports a string that does not fit in its budget as
+/// `-EINVAL`, not as a distinct length error, and every keyring string is read
+/// that way (`key_get_type_from_user`, `strndup_user`).
 fn load_user_string<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ptr: *const c_char,
@@ -26,7 +37,10 @@ fn load_user_string<M: UserMemory + ?Sized>(
 ) -> AxResult<String> {
     String::from_utf8(
         vm_load_until_nul_bounded(memory, ptr.cast::<u8>(), max_bytes)
-            .map_err(map_usercopy_error)?,
+            .map_err(|error| match error {
+                UserCopyError::TooLong => AxError::InvalidInput,
+                other => map_usercopy_error(other),
+            })?,
     )
     .map_err(|_| AxError::IllegalBytes)
 }
@@ -61,7 +75,7 @@ fn load_keyctl_iov_payload<M: UserMemory + ?Sized>(
             .checked_add(iov.iov_len as usize)
             .ok_or(AxError::InvalidInput)
     })?;
-    if total > tk_linux_keyring::uapi::KEYCTL_UPDATE_PAYLOAD_MAX {
+    if total > tk_linux_keyring::uapi::KEYCTL_INSTANTIATE_PAYLOAD_MAX {
         return Err(AxError::InvalidInput);
     }
     let mut payload = Vec::new();
@@ -93,8 +107,37 @@ fn key_actor_capabilities(credential: &Cred) -> (bool, bool) {
     )
 }
 
-fn parse_add_key_kind(type_name: &str, description: &str) -> AxResult<KeyTypeKind> {
-    if type_name.starts_with("keyring") && description.starts_with('.') {
+/// `key_get_type_from_user()`'s syntax rules for an already-copied name.
+///
+/// The 32-byte ceiling is enforced by the load itself; an empty name is
+/// `-EINVAL` and a leading dot is `-EPERM`.
+fn validate_key_type_encoding(type_name: &str) -> AxResult<()> {
+    if type_name.is_empty() {
+        return Err(AxError::InvalidInput);
+    }
+    if type_name.starts_with('.') {
+        return Err(AxError::OperationNotPermitted);
+    }
+    Ok(())
+}
+
+/// `key_type_lookup()` as every other entry point sees it.
+///
+/// `request_key(2)`, `KEYCTL_SEARCH` and `KEYCTL_RESTRICT_KEYRING` propagate
+/// its `-ENOKEY` for an unregistered type unchanged.
+fn registered_key_type(type_name: &str) -> AxResult<KeyTypeKind> {
+    KeyTypeKind::from_name(type_name).ok_or(AxError::from(LinuxError::ENOKEY))
+}
+
+/// `add_key()`'s extra rule: a description-private keyring name is `-EPERM`.
+///
+/// Linux tests `strncmp(type, "keyring", 7) == 0`, so every `keyring`-prefixed
+/// type name takes part.
+fn parse_add_key_kind(type_name: &str, description: Option<&str>) -> AxResult<KeyTypeKind> {
+    validate_key_type_encoding(type_name)?;
+    // `add_key()` runs the private-name check before `key_create_or_update()`
+    // resolves the type, so it wins even for an unregistered name.
+    if type_name.starts_with("keyring") && description.is_some_and(|desc| desc.starts_with('.')) {
         return Err(AxError::OperationNotPermitted);
     }
     KeyTypeKind::from_name(type_name).ok_or(AxError::NoSuchDevice)
@@ -172,12 +215,15 @@ fn write_keyring_ids<M: UserMemory + ?Sized>(
     ids: &[i32],
 ) -> AxResult<isize> {
     let full_size = core::mem::size_of_val(ids);
-    if size != 0 && !buf.is_null() {
-        let mut bytes = Vec::new();
-        for id in ids.iter().take(size / size_of::<i32>()) {
+    // `keyctl_read_key()` stages the read method's output in a kernel buffer
+    // and only calls `copy_to_user()` when the whole result fits: a short
+    // buffer reports the length and transfers nothing at all.
+    if size >= full_size && !buf.is_null() && full_size != 0 {
+        let mut bytes = Vec::with_capacity(full_size);
+        for id in ids {
             bytes.extend_from_slice(&id.to_ne_bytes());
         }
-        vm_write_slice(memory, buf, &bytes[..bytes.len().min(size)]).map_err(map_usercopy_error)?;
+        vm_write_slice(memory, buf, &bytes).map_err(map_usercopy_error)?;
     }
     Ok(full_size as isize)
 }
@@ -228,9 +274,28 @@ pub fn sys_add_key<M: UserMemory + ?Sized>(
     plen: usize,
     keyring: i32,
 ) -> AxResult<isize> {
+    // `add_key()` order: the payload ceiling is checked before the type name is
+    // even read, so it outranks every EFAULT below it.
+    if plen > ADD_KEY_PAYLOAD_MAX {
+        return Err(AxError::InvalidInput);
+    }
     let type_name = load_user_string(memory, type_name, KEY_TYPE_STRING_MAX)?;
-    let description = load_user_string(memory, description, KEY_DESCRIPTION_STRING_MAX)?;
-    let kind = parse_add_key_kind(&type_name, &description)?;
+    let description = if description.is_null() {
+        None
+    } else {
+        Some(load_user_string(
+            memory,
+            description,
+            KEY_DESCRIPTION_STRING_MAX,
+        )?)
+    };
+    let kind = parse_add_key_kind(&type_name, description.as_deref())?;
+    // Linux normalizes an empty description to NULL and then reaches
+    // `key_alloc()`, which rejects a missing description with -EINVAL. Every
+    // key type this kernel implements needs one.
+    let description = description
+        .filter(|description| !description.is_empty())
+        .ok_or(AxError::InvalidInput)?;
     let payload = validate_key_payload(memory, kind, &description, payload, plen)?;
     keyring::add_key(&current_key_actor(), kind, description, payload, keyring)
 }
@@ -242,8 +307,10 @@ pub fn sys_request_key<M: UserMemory + ?Sized>(
     callout_info: *const c_char,
     dest_keyring: i32,
 ) -> AxResult<isize> {
+    // `request_key()` reads all three strings before it resolves the key type,
+    // so a bad description or callout outranks the unknown-type -ENODEV.
     let type_name = load_user_string(memory, type_name, KEY_TYPE_STRING_MAX)?;
-    let kind = KeyTypeKind::from_name(&type_name).ok_or(AxError::NoSuchDevice)?;
+    validate_key_type_encoding(&type_name)?;
     let description = load_user_string(memory, description, KEY_DESCRIPTION_STRING_MAX)?;
     let callout = if callout_info.is_null() {
         None
@@ -254,6 +321,7 @@ pub fn sys_request_key<M: UserMemory + ?Sized>(
             KEY_CALLOUT_STRING_MAX,
         )?)
     };
+    let kind = registered_key_type(&type_name)?;
     keyring::request_key(
         &current_key_actor(),
         kind,
@@ -311,12 +379,16 @@ pub fn sys_keyctl<M: UserMemory + ?Sized>(
             type_name,
             description,
             destination,
-        } => KeyctlCommand::Search {
-            keyring,
-            type_name: load_planned_string(memory, type_name)?,
-            description: load_planned_string(memory, description)?,
-            destination,
-        },
+        } => {
+            let type_name = load_planned_string(memory, type_name)?;
+            validate_key_type_encoding(&type_name)?;
+            KeyctlCommand::Search {
+                keyring,
+                type_name,
+                description: load_planned_string(memory, description)?,
+                destination,
+            }
+        }
         KeyctlPlan::Read { key, output } => KeyctlCommand::Read {
             key,
             copy_limit: (output.address != 0 && output.len != 0).then_some(output.len),
@@ -374,18 +446,20 @@ pub fn sys_keyctl<M: UserMemory + ?Sized>(
             restriction,
         } => {
             let kind = match (type_name, restriction) {
+                // `keyring_restrict(key_ref, NULL, NULL)` installs
+                // `restrict_link_reject`, which refuses every later link.
                 (None, None) => None,
+                // A typed restriction can only come from a key type that
+                // exports `lookup_restriction`.  No type this kernel
+                // implements does, and `keyring_restrict()` reports a missing
+                // backend as -ENOENT rather than -EOPNOTSUPP.
                 (Some(type_name), Some(restriction)) => {
                     let type_name = load_planned_string(memory, type_name)?;
-                    let restriction = load_planned_string(memory, restriction)?;
-                    // This kernel's supported restriction is deliberately
-                    // typed and exact: `keyring:<key-type>`. Unknown Linux
-                    // restriction backends are rejected, never recorded as a
-                    // generic “restricted” bit that accepts the wrong keys.
-                    if restriction != "type" {
-                        return Err(LinuxError::EOPNOTSUPP.into());
-                    }
-                    Some(KeyTypeKind::from_name(&type_name).ok_or(AxError::NoSuchDevice)?)
+                    let _restriction = load_planned_string(memory, restriction)?;
+                    // The key type is resolved first, and only a registered
+                    // type can reach the missing-backend -ENOENT.
+                    registered_key_type(&type_name)?;
+                    return Err(AxError::NotFound);
                 }
                 _ => return Err(AxError::InvalidInput),
             };
@@ -416,13 +490,19 @@ pub fn sys_keyctl<M: UserMemory + ?Sized>(
             let KeyctlPlan::Read { output, .. } = plan else {
                 unreachable!()
             };
+            // `keyring_read()` rejects a byte count that is not a whole number
+            // of key serials before it copies anything.  A NULL output or a
+            // zero length is the size query and always succeeds.
+            if output.address != 0 && output.len != 0 && output.len % size_of::<i32>() != 0 {
+                return Err(AxError::InvalidInput);
+            }
             write_keyring_ids(memory, output.address as *mut u8, output.len, &ids)
         }
         KeyctlOutput::Payload { full_len, bytes } => {
             let KeyctlPlan::Read { output, .. } = plan else {
                 unreachable!()
             };
-            if output.address != 0 && output.len != 0 {
+            if !bytes.is_empty() && output.address != 0 {
                 vm_write_slice(memory, output.address as *mut u8, &bytes)
                     .map_err(map_usercopy_error)?;
             }
@@ -487,18 +567,49 @@ mod tests {
     #[test]
     fn add_key_adapter_rejects_private_keyring_prefix_before_type_lookup() {
         assert_eq!(
-            parse_add_key_kind("keyring", ".private"),
+            parse_add_key_kind("keyring", Some(".private")),
             Err(AxError::OperationNotPermitted)
         );
         assert_eq!(
-            parse_add_key_kind("keyring.invalid", ".private"),
+            parse_add_key_kind("keyring.invalid", Some(".private")),
             Err(AxError::OperationNotPermitted)
         );
         assert_eq!(
-            parse_add_key_kind("user", ".public-to-keyring-core"),
+            parse_add_key_kind("user", Some(".public-to-keyring-core")),
             Ok(KeyTypeKind::User)
         );
-        assert_eq!(parse_add_key_kind("keyring", ""), Ok(KeyTypeKind::Keyring));
+        assert_eq!(parse_add_key_kind("keyring", Some("")), Ok(KeyTypeKind::Keyring));
+        // A missing description cannot carry the private-name rule.
+        assert_eq!(parse_add_key_kind("keyring", None), Ok(KeyTypeKind::Keyring));
+    }
+
+    #[test]
+    fn key_type_names_follow_key_get_type_from_user() {
+        // `key_get_type_from_user()`: empty is -EINVAL, a leading dot is
+        // -EPERM, and the 32-byte ceiling is applied by the string load.
+        assert_eq!(validate_key_type_encoding(""), Err(AxError::InvalidInput));
+        assert_eq!(
+            validate_key_type_encoding(".x"),
+            Err(AxError::OperationNotPermitted)
+        );
+        assert_eq!(validate_key_type_encoding("logon"), Ok(()));
+        assert_eq!(parse_add_key_kind("", None), Err(AxError::InvalidInput));
+        assert_eq!(
+            parse_add_key_kind(".hidden", None),
+            Err(AxError::OperationNotPermitted)
+        );
+        // `add_key(2)` is the one entry point that rewrites the registry's
+        // -ENOKEY into -ENODEV.
+        assert_eq!(
+            parse_add_key_kind("bogus", None),
+            Err(AxError::NoSuchDevice)
+        );
+        assert_eq!(parse_add_key_kind("user", None), Ok(KeyTypeKind::User));
+        assert_eq!(
+            registered_key_type("bogus"),
+            Err(AxError::from(LinuxError::ENOKEY))
+        );
+        assert_eq!(registered_key_type("user"), Ok(KeyTypeKind::User));
     }
 
     #[test]

@@ -176,9 +176,12 @@ impl SetupRequest {
 
     /// Strictly decodes a copied Linux `io_uring_params` input.
     ///
-    /// Polling and affinity fields require their corresponding setup flags.
-    /// Attached workqueues are unsupported; their descriptor and Linux's three
-    /// reserved words must be zero before any allocation.
+    /// `io_uring_sanitise_params()` only validates the setup-flag word: the
+    /// flag combinations it rejects, plus the reserved words, which the
+    /// `io_uring_setup()` wrapper checks before anything else.  The polling
+    /// affinity fields are ignored by Linux when their flags are absent, so a
+    /// stray `sq_thread_cpu`, `sq_thread_idle` or `wq_fd` is accepted here too
+    /// rather than turned into an `-EINVAL` Linux never returns.
     #[allow(clippy::too_many_arguments)]
     pub const fn from_raw(
         entries: u32,
@@ -186,19 +189,16 @@ impl SetupRequest {
         flags: u32,
         sq_thread_cpu: u32,
         sq_thread_idle: u32,
-        wq_fd: u32,
+        _wq_fd: u32,
         reserved: [u32; 3],
     ) -> Result<Self, IoUringError> {
         let flags = match SetupFlags::from_bits(flags) {
             Ok(flags) => flags,
             Err(error) => return Err(error),
         };
-        if (!flags.contains(SetupFlags::SQPOLL) && (sq_thread_cpu != 0 || sq_thread_idle != 0))
-            || (flags.contains(SetupFlags::SQ_AFF) && !flags.contains(SetupFlags::SQPOLL))
+        if (flags.contains(SetupFlags::SQ_AFF) && !flags.contains(SetupFlags::SQPOLL))
             || (flags.contains(SetupFlags::DEFER_TASKRUN)
                 && !flags.contains(SetupFlags::SINGLE_ISSUER))
-            || (!flags.contains(SetupFlags::SQ_AFF) && sq_thread_cpu != 0)
-            || wq_fd != 0
             || reserved[0] != 0
             || reserved[1] != 0
             || reserved[2] != 0
@@ -670,6 +670,13 @@ mod tests {
             SetupRequest::from_raw(1, 0, SetupFlags::SQ_AFF.bits(), 0, 0, 0, [0; 3]),
             Err(IoUringError::ReservedFieldNonZero)
         );
+        // `io_uring_sanitise_params()` never inspects these fields; Linux
+        // ignores them unless their flags are set.
+        for (cpu, idle, wq_fd) in [(2, 0, 0), (0, 100, 0), (0, 0, 7), (2, 100, 7)] {
+            let ignored = SetupRequest::from_raw(1, 0, 0, cpu, idle, wq_fd, [0; 3]).unwrap();
+            assert_eq!(ignored.sq_thread_cpu(), cpu);
+            assert_eq!(ignored.sq_thread_idle(), idle);
+        }
         let polling = SetupRequest::from_raw(
             1,
             0,

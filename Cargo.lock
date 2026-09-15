@@ -3700,6 +3700,7 @@ dependencies = [
  "tk-linux-process",
  "tk-linux-process-adapter",
  "tk-linux-profile",
+ "tk-linux-random",
  "tk-linux-rseq",
  "tk-linux-sched",
  "tk-linux-seccomp",
@@ -3826,6 +3827,10 @@ dependencies = [
 
 [[package]]
 name = "tk-linux-profile"
+version = "0.1.0"
+
+[[package]]
+name = "tk-linux-random"
 version = "0.1.0"
 
 [[package]]

@@ -15,10 +15,19 @@ pub mod uapi {
     pub const KEY_DESCRIPTION_STRING_MAX: usize = 4096;
     pub const KEY_CALLOUT_STRING_MAX: usize = 4096;
     pub const KEYCTL_UPDATE_PAYLOAD_MAX: usize = 4096;
+    /// `keyctl_instantiate_key_common()`: `plen > 1024 * 1024 - 1` is
+    /// `-EINVAL`.  The per-type limit (`user_preparse`'s 32767,
+    /// `big_key_preparse`'s 1 MiB) is applied later by the key type.
+    pub const KEYCTL_INSTANTIATE_PAYLOAD_MAX: usize = 1024 * 1024 - 1;
     pub const KEYCTL_INSTANTIATE_IOV_MAX: usize = 1024;
 
     const MOVE_EXCL: u32 = 1;
-    const CAPABILITIES: [u8; 2] = [0xf3, 0];
+    /// `keyrings_capabilities` from `keyctl.c`.  Word 0 is
+    /// `CAPABILITIES | BIG_KEY | INVALIDATE | RESTRICT_KEYRING | MOVE` and
+    /// word 1 is `NS_KEYRING_NAME | NS_KEY_TAG`.  The conditional
+    /// PERSISTENT_KEYRINGS, DIFFIE_HELLMAN, PUBLIC_KEY and NOTIFICATIONS bits
+    /// stay clear because this kernel implements none of them.
+    const CAPABILITIES: [u8; 2] = [0xf1, 0x03];
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum KeyctlUapiError {
@@ -224,7 +233,7 @@ pub mod uapi {
                     len: a4,
                 },
             }),
-            12 if a4 <= KEYCTL_UPDATE_PAYLOAD_MAX => Ok(KeyctlPlan::Instantiate {
+            12 if a4 <= KEYCTL_INSTANTIATE_PAYLOAD_MAX => Ok(KeyctlPlan::Instantiate {
                 key: a2 as i32,
                 payload: UserBuffer {
                     address: a3,
@@ -239,6 +248,10 @@ pub mod uapi {
                 destination: a4 as i32,
             }),
             16 => Ok(KeyctlPlan::AssumeAuthority { key: a2 as i32 }),
+            // `KEYCTL_GET_SECURITY` answers with the key's LSM security
+            // context.  There is no LSM-independent behaviour to implement:
+            // the reference kernel's SELinux returns a context string, and a
+            // kernel with no `key_getsecurity` hook returns an empty one.
             17 => Err(KeyctlUapiError::Unsupported),
             19 => Ok(KeyctlPlan::Reject {
                 key: a2 as i32,
@@ -255,6 +268,10 @@ pub mod uapi {
                 destination: a5 as i32,
             }),
             20 => Err(KeyctlUapiError::Invalid),
+            // `KEYCTL_PKEY_QUERY` validates its unused third argument before
+            // it looks at the key at all; every other asymmetric-key command
+            // (and a valid query) needs a key type this kernel does not have.
+            24 if a3 != 0 => Err(KeyctlUapiError::Invalid),
             14 => Ok(KeyctlPlan::SetReqKeyring { setting: a2 as i32 }),
             15 => Ok(KeyctlPlan::SetTimeout {
                 key: a2 as i32,
@@ -1261,6 +1278,102 @@ mod tests {
         assert_eq!(
             plan_missing_session(false),
             MissingSessionPlan::InstallUserSession
+        );
+    }
+
+    #[test]
+    fn capabilities_word1_is_the_unconditional_linux_pair() {
+        // `keyctl.c`:
+        //   [0] = CAPABILITIES | <config bits> | INVALIDATE |
+        //         RESTRICT_KEYRING | MOVE
+        //   [1] = NS_KEYRING_NAME | NS_KEY_TAG | <NOTIFICATIONS>
+        // Word 1 always carries 0x01|0x02; this kernel does not implement
+        // watchable key notifications, so bit 0x04 stays clear.
+        assert_eq!(uapi::capabilities_bytes(), &[0xf1, 0x03]);
+        assert_eq!(uapi::capabilities_bytes()[0] & 0x01, 0x01);
+        assert_eq!(uapi::capabilities_bytes()[0] & 0x20, 0x20);
+        assert_eq!(uapi::capabilities_bytes()[0] & 0x40, 0x40);
+        assert_eq!(uapi::capabilities_bytes()[0] & 0x80, 0x80);
+        // PERSISTENT_KEYRINGS (0x02), DIFFIE_HELLMAN (0x04), PUBLIC_KEY
+        // (0x08) and NOTIFICATIONS (0x04 in word 1) are not advertised.
+        assert_eq!(uapi::capabilities_bytes()[0] & 0x06, 0);
+        assert_eq!(uapi::capabilities_bytes()[0] & 0x08, 0);
+        assert_eq!(uapi::capabilities_bytes()[1] & 0x04, 0);
+    }
+
+    #[test]
+    fn instantiate_length_uses_the_linux_one_megabyte_ceiling() {
+        use uapi::{
+            KEYCTL_INSTANTIATE_PAYLOAD_MAX, KeyctlPlan, KeyctlUapiError, RawKeyctlArgs,
+            decode_keyctl,
+        };
+
+        let instantiate = |len| {
+            decode_keyctl(RawKeyctlArgs {
+                option: 12,
+                arg2: 1,
+                arg3: 0x1000,
+                arg4: len,
+                arg5: 0,
+            })
+        };
+        assert!(matches!(
+            instantiate(KEYCTL_INSTANTIATE_PAYLOAD_MAX),
+            Ok(KeyctlPlan::Instantiate { .. })
+        ));
+        assert_eq!(
+            instantiate(KEYCTL_INSTANTIATE_PAYLOAD_MAX + 1),
+            Err(KeyctlUapiError::Invalid)
+        );
+        // `KEYCTL_INSTANTIATE_IOV` keeps the `UIO_MAXIOV` segment ceiling.
+        assert_eq!(
+            decode_keyctl(RawKeyctlArgs {
+                option: 20,
+                arg2: 1,
+                arg3: 0x1000,
+                arg4: uapi::KEYCTL_INSTANTIATE_IOV_MAX + 1,
+                arg5: 0,
+            }),
+            Err(KeyctlUapiError::Invalid)
+        );
+    }
+
+    #[test]
+    fn get_security_stays_unsupported_and_pkey_query_checks_arg3_first() {
+        use uapi::{KeyctlPlan, KeyctlUapiError, RawKeyctlArgs, decode_keyctl};
+
+        // The LSM supplies the answer, so there is no LSM-free behaviour to
+        // implement; the command stays a declared gap.
+        assert_eq!(
+            decode_keyctl(RawKeyctlArgs {
+                option: 17,
+                arg2: 7,
+                arg3: 0x2000,
+                arg4: 8,
+                arg5: 0,
+            }),
+            Err(KeyctlUapiError::Unsupported)
+        );
+        // `keyctl.c`: `case KEYCTL_PKEY_QUERY: if (arg3 != 0) return -EINVAL;`
+        assert_eq!(
+            decode_keyctl(RawKeyctlArgs {
+                option: 24,
+                arg2: 7,
+                arg3: 1,
+                arg4: 0,
+                arg5: 0,
+            }),
+            Err(KeyctlUapiError::Invalid)
+        );
+        assert_eq!(
+            decode_keyctl(RawKeyctlArgs {
+                option: 24,
+                arg2: 7,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            }),
+            Err(KeyctlUapiError::Unsupported)
         );
     }
 
