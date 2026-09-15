@@ -2032,7 +2032,7 @@ impl SctpSocket {
         }
         drop(s);
         if let Some(a) = o.from {
-            *a = SocketAddrEx::Ip(r.peer)
+            *a = Some(SocketAddrEx::Ip(r.peer))
         }
         *metadata = Some(SctpRecvMetadata {
             stream: r.stream,

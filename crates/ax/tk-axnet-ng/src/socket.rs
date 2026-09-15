@@ -150,10 +150,14 @@ bitflags! {
         const TRUNCATE = 0x02;
         /// Do not wait for receive data for this operation.
         const DONT_WAIT = 0x04;
-        /// `MSG_OOB`: read the urgent-data byte.  A transport that has no
-        /// urgent-data queue reports `EOPNOTSUPP`; datagram transports ignore
-        /// the bit, as Linux's `udp_recvmsg()` does.
-        const OOB = 0x08;
+        // `MSG_OOB` has no bit here on purpose.  Linux gives the flag no
+        // transport-neutral meaning: `tcp_recv_urg()` answers `-EINVAL` when no
+        // urgent byte is queued (`net/ipv4/tcp.c:1480-1483`), `udp_recvmsg()`
+        // never reads the bit (`:1917-1936`), and RAW, netlink and AF_UNIX
+        // datagram refuse it with `-EOPNOTSUPP`.  The socket layer therefore
+        // resolves the flag from the concrete transport before a receive
+        // reaches this interface, so a transport can never be asked to invent
+        // an answer of its own.
     }
 }
 
@@ -290,7 +294,16 @@ pub struct RecvOptions<'a> {
     /// This output choice does not control peer admission. A connected
     /// datagram endpoint filters by its peer whether or not an address is
     /// requested, while an unconnected endpoint accepts any sender.
-    pub from: Option<&'a mut SocketAddrEx>,
+    ///
+    /// `Some` means "write the sender's address if this protocol has one to
+    /// report"; a transport whose protocol never stores a sender address — a
+    /// connected TCP stream, for instance, where Linux documents that
+    /// "msg_name/msg_namelen are ignored on connected socket"
+    /// (`net/ipv4/tcp.c:2910-2912`) — leaves the slot at `None`.  The slot is
+    /// therefore the caller's only way to tell "protocol reported no address"
+    /// from "protocol reported this address", and it must not be pre-filled
+    /// with a placeholder the protocol may not overwrite.
+    pub from: Option<&'a mut Option<SocketAddrEx>>,
     /// Receive flags.
     pub flags: RecvFlags,
     /// If set, ancillary control messages are appended here.

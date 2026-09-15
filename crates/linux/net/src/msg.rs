@@ -95,6 +95,122 @@ pub const fn packet_recvmsg_flag_errno(flags: u32) -> Option<i32> {
     }
 }
 
+/// The protocol one `MSG_OOB`-bearing message reaches.
+///
+/// Linux has no socket-layer `MSG_OOB` policy: `__sys_sendto()` clears only
+/// `MSG_INTERNAL_SENDMSG_FLAGS` and hands the rest to the protocol
+/// (`net/socket.c:2248-2252`), and `__sys_recvfrom()`/`____sys_recvmsg()` do the
+/// same (`:2277-2290`, `:2895-2904`).  Every answer below belongs to the
+/// transport, and only the transport's identity selects it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MsgOobTransport {
+    /// `net/ipv4/tcp.c`
+    Tcp,
+    /// `net/ipv4/udp.c`
+    Udp,
+    /// `net/ipv4/raw.c`
+    Raw,
+    /// `net/netlink/af_netlink.c`
+    Netlink,
+    /// `net/packet/af_packet.c`
+    Packet,
+    /// `net/unix/af_unix.c:unix_stream_sendmsg`/`unix_stream_read_generic`
+    UnixStream,
+    /// `net/unix/af_unix.c:unix_dgram_*`, also reached by `SOCK_SEQPACKET`,
+    /// whose `unix_seqpacket_sendmsg`/`unix_seqpacket_recvmsg` delegate to it
+    UnixDatagram,
+    /// `net/sctp/socket.c`
+    Sctp,
+    /// `net/vmw_vsock/af_vsock.c`
+    Vsock,
+}
+
+/// Which half of a message transfer carries the flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageDirection {
+    /// `sendto`/`sendmsg`/`sendmmsg`.
+    Send,
+    /// `recvfrom`/`recvmsg`/`recvmmsg`.
+    Receive,
+}
+
+/// `tcp_recv_urg()`'s "no URG data to read" answer, `net/ipv4/tcp.c:1480-1483`.
+pub const NO_URGENT_DATA_ERRNO: i32 = 22;
+/// `udp_sendmsg()`'s "Mirror BSD error message compatibility" answer,
+/// `net/ipv4/udp.c:1259-1261`.
+pub const OOB_NOT_SUPPORTED_ERRNO: i32 = 95;
+
+/// Linux's per-protocol `MSG_OOB` answer.
+///
+/// `None` means the protocol consumes or ignores the bit and the transfer
+/// proceeds; `Some(errno)` is the exact failure that protocol raises.
+///
+/// * TCP consumes it on send — `tcp_mark_urg()` runs inside
+///   `tcp_sendmsg_locked()` and no frame on that path rejects the bit
+///   (`net/ipv4/tcp.c:715-718`), so the octets are sent.  On receive the bit is
+///   diverted before the copy loop,
+///
+///   ```c
+///   	/* Urgent data needs to be handled specially. */
+///   	if (flags & MSG_OOB)
+///   		goto recv_urg;
+///   ```
+///
+///   (`net/ipv4/tcp.c:2679-2681`), and `tcp_recv_urg()` answers `-EINVAL`
+///   whenever no urgent byte is pending:
+///
+///   ```c
+///   	if (sock_flag(sk, SOCK_URGINLINE) || !tp->urg_data ||
+///   	    tp->urg_data == TCP_URG_READ)
+///   		return -EINVAL;	/* Yes this is right ! */
+///   ```
+///
+///   (`net/ipv4/tcp.c:1480-1483`).
+/// * UDP rejects it on send (`net/ipv4/udp.c:1259-1261`) and never tests it on
+///   receive, so `udp_recvmsg()` delivers the datagram normally.
+/// * RAW rejects it in both directions (`net/ipv4/raw.c:517`, `:758`).
+/// * Netlink rejects it in both directions (`net/netlink/af_netlink.c:1830`,
+///   `:1917`).
+/// * AF_UNIX stream consumes it when the kernel builds with `CONFIG_AF_UNIX_OOB`:
+///   `unix_stream_sendmsg()` reserves the last octet for `queue_oob()`
+///   (`net/unix/af_unix.c:2392-2400`, `:2496-2502`) and
+///   `unix_stream_read_generic()` routes the receive bit to
+///   `unix_stream_recv_urg()` (`:2929-2934`), which answers `-EINVAL` while
+///   `u->oob_skb` is NULL (`:2776-2782`).  Without that option both directions
+///   are `-EOPNOTSUPP`.  The pinned v7.2.3 oracle sets `CONFIG_AF_UNIX_OOB=y`.
+/// * AF_UNIX datagram and seqpacket always answer `-EOPNOTSUPP`
+///   (`net/unix/af_unix.c:2099-2102`, `:2392-2395`, `:2572-2576`).
+/// * SCTP never tests the bit, so it is consumed like any other unread flag.
+/// * Vsock rejects it in both directions (`net/vmw_vsock/af_vsock.c:2195-2197`,
+///   `:2571-2573`).
+/// * AF_PACKET never tests the bit on send, and its receive path refuses it
+///   through the `packet_recvmsg()` allow-list that
+///   [`packet_recvmsg_flag_errno`] already reports, so both directions are left
+///   to that call.
+pub const fn msg_oob_errno(
+    transport: MsgOobTransport,
+    direction: MessageDirection,
+    unix_oob_supported: bool,
+) -> Option<i32> {
+    match (transport, direction) {
+        (MsgOobTransport::Tcp, MessageDirection::Send) => None,
+        (MsgOobTransport::Tcp, MessageDirection::Receive) => Some(NO_URGENT_DATA_ERRNO),
+        (MsgOobTransport::Udp, MessageDirection::Send) => Some(OOB_NOT_SUPPORTED_ERRNO),
+        (MsgOobTransport::Udp, MessageDirection::Receive) => None,
+        (MsgOobTransport::Raw, _) => Some(OOB_NOT_SUPPORTED_ERRNO),
+        (MsgOobTransport::Netlink, _) => Some(OOB_NOT_SUPPORTED_ERRNO),
+        (MsgOobTransport::UnixStream, MessageDirection::Send) if unix_oob_supported => None,
+        (MsgOobTransport::UnixStream, MessageDirection::Receive) if unix_oob_supported => {
+            Some(NO_URGENT_DATA_ERRNO)
+        }
+        (MsgOobTransport::UnixStream, _) => Some(OOB_NOT_SUPPORTED_ERRNO),
+        (MsgOobTransport::UnixDatagram, _) => Some(OOB_NOT_SUPPORTED_ERRNO),
+        (MsgOobTransport::Sctp, _) => None,
+        (MsgOobTransport::Vsock, _) => Some(OOB_NOT_SUPPORTED_ERRNO),
+        (MsgOobTransport::Packet, _) => None,
+    }
+}
+
 /// `net/socket.c:__sys_sendmsg`, `__sys_sendmmsg`, `__sys_recvmsg` and
 /// `SYSCALL_DEFINE5(recvmmsg)` all run `forbid_cmsg_compat` and return `EINVAL`
 /// for `MSG_CMSG_COMPAT` *before* they resolve `fd`.  `sendto`/`recvfrom` never
@@ -457,5 +573,54 @@ mod tests {
         assert_eq!(packet_recvmsg_flag_errno(MSG_WAITALL), Some(22));
         assert_eq!(packet_recvmsg_flag_errno(MSG_OOB), Some(22));
         assert_eq!(packet_recvmsg_flag_errno(MSG_CMSG_CLOEXEC), Some(22));
+    }
+
+    #[test]
+    fn msg_oob_is_a_per_transport_answer_not_a_socket_layer_refusal() {
+        use MessageDirection::{Receive, Send};
+        use MsgOobTransport::{
+            Netlink, Packet, Raw, Sctp, Tcp, Udp, UnixDatagram, UnixStream, Vsock,
+        };
+
+        // TCP consumes MSG_OOB on send (`net/ipv4/tcp.c:715-718`) and answers
+        // `tcp_recv_urg()`'s -EINVAL when no urgent byte is pending
+        // (`net/ipv4/tcp.c:1480-1483`).
+        assert_eq!(msg_oob_errno(Tcp, Send, false), None);
+        assert_eq!(msg_oob_errno(Tcp, Receive, false), Some(22));
+
+        // UDP mirrors the BSD EOPNOTSUPP on send only; `udp_recvmsg()` never
+        // tests the bit (`net/ipv4/udp.c:1259-1261`).
+        assert_eq!(msg_oob_errno(Udp, Send, false), Some(95));
+        assert_eq!(msg_oob_errno(Udp, Receive, false), None);
+
+        // RAW and netlink reject both directions (`net/ipv4/raw.c:517`, `:758`;
+        // `net/netlink/af_netlink.c:1830`, `:1917`).
+        assert_eq!(msg_oob_errno(Raw, Send, false), Some(95));
+        assert_eq!(msg_oob_errno(Raw, Receive, false), Some(95));
+        assert_eq!(msg_oob_errno(Netlink, Send, false), Some(95));
+        assert_eq!(msg_oob_errno(Netlink, Receive, false), Some(95));
+
+        // AF_UNIX datagram and seqpacket always refuse it
+        // (`net/unix/af_unix.c:2099-2102`, `:2572-2576`).
+        assert_eq!(msg_oob_errno(UnixDatagram, Send, true), Some(95));
+        assert_eq!(msg_oob_errno(UnixDatagram, Receive, true), Some(95));
+
+        // AF_UNIX stream follows CONFIG_AF_UNIX_OOB: on the pinned oracle the
+        // send consumes the bit and a receive with nothing queued is -EINVAL
+        // (`net/unix/af_unix.c:2392-2400`, `:2776-2782`, `:2929-2934`).
+        assert_eq!(msg_oob_errno(UnixStream, Send, true), None);
+        assert_eq!(msg_oob_errno(UnixStream, Receive, true), Some(22));
+        assert_eq!(msg_oob_errno(UnixStream, Send, false), Some(95));
+        assert_eq!(msg_oob_errno(UnixStream, Receive, false), Some(95));
+
+        // SCTP never tests the bit; vsock always refuses it.
+        assert_eq!(msg_oob_errno(Sctp, Send, false), None);
+        assert_eq!(msg_oob_errno(Sctp, Receive, false), None);
+        assert_eq!(msg_oob_errno(Vsock, Send, false), Some(95));
+        assert_eq!(msg_oob_errno(Vsock, Receive, false), Some(95));
+
+        // AF_PACKET is answered by `packet_recvmsg_flag_errno()`.
+        assert_eq!(msg_oob_errno(Packet, Send, false), None);
+        assert_eq!(msg_oob_errno(Packet, Receive, false), None);
     }
 }

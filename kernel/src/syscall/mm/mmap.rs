@@ -28,7 +28,8 @@ use crate::{
         MadviseReadahead, MadviseThp, PreparedFixedSharedMapping, PreparedProtect,
         SharedFolioDemotionReplacement, SharedFolioPteRedirect, SharedFolioPteReplacement,
         SharedPages, WritableMappingAdmission, check_memory_overcommit, check_rlimit_as_growth,
-        checked_align_up, checked_align_up_4k, overcommit_memory_policy, remap_user_mapping,
+        check_rlimit_data_growth, checked_align_up, checked_align_up_4k, overcommit_memory_policy,
+        remap_user_mapping,
     },
     pseudofs::{Device, DeviceMmap},
     task::{
@@ -897,13 +898,11 @@ pub fn sys_mmap(
     // it extends the range downwards.  An undefined bit such as 0x80000000
     // therefore maps PROT_NONE instead of failing with EINVAL.
     let permission_flags = MmapProt::from_bits_truncate(prot);
+    let is_anonymous_mapping = flags & MmapFlags::ANONYMOUS.bits() != 0;
     let map_flags = match MmapFlags::from_bits(flags) {
         Some(flags) => flags,
         None => {
             warn!("unknown mmap flags: {flags}");
-            if (flags & MmapFlags::TYPE.bits()) == MmapFlags::SHARED_VALIDATE.bits() {
-                return Err(AxError::OperationNotSupported);
-            }
             MmapFlags::from_bits_truncate(flags)
         }
     };
@@ -917,7 +916,6 @@ pub fn sys_mmap(
     ) {
         return Err(AxError::InvalidInput);
     }
-    let is_anonymous_mapping = map_flags.contains(MmapFlags::ANONYMOUS);
     if map_type == MmapFlags::DROPPABLE {
         // Linux `mm/mmap.c:505-543`.  `MAP_DROPPABLE` is a member of the
         // `MAP_TYPE` group and is handled in the branch taken when *no* file is
@@ -981,6 +979,29 @@ pub fn sys_mmap(
     };
     if length == 0 {
         return Err(AxError::InvalidInput);
+    }
+    // Linux validates the flag word inside `do_mmap()`'s `MAP_TYPE` dispatch,
+    // which is reached after `ksys_mmap_pgoff()`'s `fget()` and after
+    // `do_mmap()`'s own `if (!len) return -EINVAL` (`mm/mmap.c:348-349`,
+    // `:429-543`).  The branch depends on whether a file is behind the mapping:
+    // the anonymous branch has no `MAP_SHARED_VALIDATE` case at all, so it
+    // reaches `default: return -EINVAL`, while the file branch checks the whole
+    // word against `LEGACY_MAP_MASK` — widened by `MAP_SYNC` only for a
+    // `FOP_MMAP_SYNC` file — and answers `-EOPNOTSUPP` for anything outside it.
+    //
+    // Both are decided from the raw word, because `MAP_EXECUTABLE`,
+    // `MAP_UNINITIALIZED` and `MAP_ABOVE4G` are legacy bits this kernel does
+    // not model yet must still accept under `MAP_SHARED_VALIDATE`.  No file in
+    // this kernel advertises `FOP_MMAP_SYNC`, so `MAP_SYNC` stays a stray bit.
+    if (flags & MmapFlags::TYPE.bits()) == MmapFlags::SHARED_VALIDATE.bits() {
+        if let Some(errno) =
+            tk_linux_mm::map_shared_validate_errno(is_anonymous_mapping, flags as u32, false)
+        {
+            debug!("mmap MAP_SHARED_VALIDATE rejected: flags {flags:#x} -> errno {errno}");
+            return Err(LinuxError::try_from(errno)
+                .map_err(|_| AxError::InvalidInput)?
+                .into());
+        }
     }
     // `arch/x86/kernel/sys_x86_64.c:SYSCALL_DEFINE6(mmap, ...)`:
     //
@@ -1477,6 +1498,21 @@ pub fn sys_mmap(
                     length,
                 )?;
             }
+            // Linux `mm/vma.c:2453` runs `may_expand_vm()` at the final VMA
+            // admission edge: after the memlock checks, after every flag and
+            // file validation, and before any topology change.  The `RLIMIT_AS`
+            // half of that predicate has no mmap-path caller in this kernel
+            // yet; the `RLIMIT_DATA` half is enforced here.
+            check_rlimit_data_growth(
+                proc_data,
+                &aspace,
+                tk_linux_mm::is_data_mapping(
+                    effective_protection.contains(MappingFlags::WRITE),
+                    !matches!(map_type, MmapFlags::PRIVATE | MmapFlags::DROPPABLE),
+                    growdown_private_anon,
+                ),
+                length,
+            )?;
 
             let populate = (map_flags.contains(MmapFlags::POPULATE)
                 && !map_flags.contains(MmapFlags::NONBLOCK))

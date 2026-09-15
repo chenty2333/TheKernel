@@ -2582,12 +2582,13 @@ impl NetlinkSocket {
         flags: RecvFlags,
         nowait: bool,
     ) -> AxResult<NetlinkReceived> {
-        if flags.contains(RecvFlags::OOB) {
-            // `netlink_recvmsg()` refuses urgent data before it touches the
-            // queue: `if (flags&MSG_OOB) return -EOPNOTSUPP;`
-            // (`net/netlink/af_netlink.c:1917-1918`).
-            return Err(LinuxError::EOPNOTSUPP.into());
-        }
+        // `netlink_recvmsg()` refuses urgent data before it touches the queue —
+        // `if (flags&MSG_OOB) return -EOPNOTSUPP;`
+        // (`net/netlink/af_netlink.c:1917-1918`) — but that is a per-protocol
+        // answer rather than a receive flag, so it is decided by
+        // `check_receive_oob()` while the socket is still pinned
+        // (`kernel/src/syscall/net/io.rs`).  Every path into this adapter runs
+        // through `recv_impl()`, which is where that check happens.
         let mut queue = if nowait {
             self.queue.try_lock().ok_or(AxError::WouldBlock)?
         } else {

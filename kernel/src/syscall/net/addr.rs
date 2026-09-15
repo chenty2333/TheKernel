@@ -125,7 +125,7 @@ unsafe fn cast_to_slice<T>(value: &T) -> &[u8] {
 /// length even when the caller's buffer is too small, and it is written back
 /// *before* the copy, so a copy-out fault still updates `*addrlen`.  A negative
 /// request is `EINVAL` and leaves both the buffer and the length untouched.
-fn fill_addr(
+pub(super) fn fill_addr(
     capability: &UserMemoryCapability,
     addr: UserPtr<sockaddr>,
     addrlen: &mut socklen_t,

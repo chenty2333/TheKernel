@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::{
     mem::{MaybeUninit, size_of},
-    net::{IpAddr, Ipv4Addr},
+    net::IpAddr,
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -580,8 +580,8 @@ impl ValidatedRecvFlags {
 /// `MSG_DONTWAIT` (`net/ipv4/udp.c:1917-1936`), and `tcp_recvmsg_locked()` only
 /// at `MSG_OOB`, `MSG_PEEK`, `MSG_WAITALL`, `MSG_TRUNC`, `MSG_ERRQUEUE` and
 /// `MSG_DONTWAIT` (`net/ipv4/tcp.c:2680-2704`).  Bits that no layer knows are
-/// therefore accepted and ignored, which is why the transport, not this
-/// function, owns every rejection.
+/// therefore accepted and ignored; the one bit whose *meaning* is per-transport,
+/// `MSG_OOB`, is answered by [`check_msg_oob`] once the transport is known.
 ///
 /// `MSG_WAITALL` is not a rejection anywhere either: only the byte-stream
 /// transports honour it through `sock_rcvlowat(sk, flags & MSG_WAITALL, len)`,
@@ -600,19 +600,95 @@ fn validate_recvmsg_flags(
     if flags & MSG_DONTWAIT != 0 {
         recv_flags |= RecvFlags::DONT_WAIT;
     }
-    if flags & MSG_OOB != 0 {
-        // `tcp_recvmsg_locked()` diverts to `recv_urg` (`net/ipv4/tcp.c:2680`)
-        // and `unix_stream_read_generic()` to `unix_stream_recv_urg`
-        // (`net/unix/af_unix.c:2929-2933`); this kernel implements neither, so
-        // the transports that own urgent data report EOPNOTSUPP while UDP and
-        // the datagram families keep ignoring the bit as Linux does.
-        recv_flags |= RecvFlags::OOB;
-    }
     Ok(ValidatedRecvFlags {
         raw: flags,
         generic: recv_flags,
         defer_packet_mechanism,
     })
+}
+
+/// The protocol `MSG_OOB` reaches for the concrete transport behind `socket`.
+fn msg_oob_transport(socket: &AxSocket) -> tk_linux_net::MsgOobTransport {
+    match socket {
+        AxSocket::Tcp(_) => tk_linux_net::MsgOobTransport::Tcp,
+        AxSocket::Udp(_) => tk_linux_net::MsgOobTransport::Udp,
+        AxSocket::Raw(_) => tk_linux_net::MsgOobTransport::Raw,
+        // `unix_seqpacket_sendmsg()`/`unix_seqpacket_recvmsg()` are thin
+        // wrappers over the datagram pair (`net/unix/af_unix.c:2541-2551`), so
+        // both record-oriented AF_UNIX types share its `MSG_OOB` answer.
+        AxSocket::Unix(unix) if unix.is_datagram() || unix.is_seqpacket() => {
+            tk_linux_net::MsgOobTransport::UnixDatagram
+        }
+        AxSocket::Unix(_) => tk_linux_net::MsgOobTransport::UnixStream,
+        AxSocket::Sctp(_) => tk_linux_net::MsgOobTransport::Sctp,
+        // Linux v7.2.3 has no DCCP: `net/dccp` and its `IP_DCCP` Kconfig entry
+        // are absent from the tree, so there is no reference answer to copy.
+        // This transport keeps the pre-existing `EOPNOTSUPP`.
+        AxSocket::Dccp(_) => tk_linux_net::MsgOobTransport::UnixDatagram,
+        #[cfg(feature = "vsock")]
+        AxSocket::Vsock(_) => tk_linux_net::MsgOobTransport::Vsock,
+    }
+}
+
+/// `CONFIG_AF_UNIX_OOB` is set in the pinned v7.2.3 oracle's config
+/// (`build-7.2.3/.config`), so the answers this kernel owes are the ones
+/// `unix_stream_sendmsg()`/`unix_stream_recv_urg()` give under that option.
+///
+/// This kernel's AF_UNIX stream has no single-byte urgent queue, so the only
+/// representable state is "nothing queued": a receive answers `EINVAL` exactly
+/// as `unix_stream_recv_urg()` does for a NULL `u->oob_skb`, and a send
+/// consumes the bit and reports the whole length while the final octet travels
+/// in band instead of being held back.  That divergence is recorded, not
+/// hidden: `MSG_OOB` on an AF_UNIX stream is a real answer, but a peer reading
+/// the urgent octet back out of band is not modelled.
+const UNIX_OOB_SUPPORTED: bool = true;
+
+/// Linux's per-protocol `MSG_OOB` answer for one concrete transport.
+///
+/// The table itself is [`tk_linux_net::msg_oob_errno`]; this function only
+/// names the transport.  `AF_PACKET` is deliberately absent: its receive-side
+/// refusal is the `packet_recvmsg()` allow-list that
+/// [`ValidatedRecvFlags::packet_flags`] already applies, and answering here
+/// would move it ahead of the error-queue diversion that allow-list orders it
+/// after.
+fn check_msg_oob(
+    transport: tk_linux_net::MsgOobTransport,
+    direction: tk_linux_net::MessageDirection,
+    flags: u32,
+) -> AxResult<()> {
+    if flags & MSG_OOB == 0 {
+        return Ok(());
+    }
+    match tk_linux_net::msg_oob_errno(transport, direction, UNIX_OOB_SUPPORTED) {
+        Some(errno) => Err(LinuxError::try_from(errno)
+            .map_err(|_| AxError::InvalidInput)?
+            .into()),
+        None => Ok(()),
+    }
+}
+
+/// The receive-side `MSG_OOB` admission for a resolved socket.
+///
+/// The network backend's answer depends on the concrete transport, so the
+/// socket must already be resolved before this runs.
+fn check_receive_oob(socket: &PinnedSocketDescription, flags: u32) -> AxResult<()> {
+    match socket.backend()? {
+        SocketBackendKind::Network => check_msg_oob(
+            msg_oob_transport(&socket.network()?.inner),
+            tk_linux_net::MessageDirection::Receive,
+            flags,
+        ),
+        SocketBackendKind::Netlink => check_msg_oob(
+            tk_linux_net::MsgOobTransport::Netlink,
+            tk_linux_net::MessageDirection::Receive,
+            flags,
+        ),
+        // AF_PACKET's allow-list and the XDP doorbell answer for themselves.
+        // AF_ALG has no receive operation at all — `crypto/af_alg.c:488` binds
+        // `.recvmsg = sock_no_recvmsg` — so its refusal is not a `MSG_OOB`
+        // answer and belongs to whichever stage owns that operation.
+        SocketBackendKind::Packet | SocketBackendKind::Xdp | SocketBackendKind::AfAlg => Ok(()),
+    }
 }
 
 /// `net/socket.c` gives the `msghdr`-shaped entry points
@@ -641,20 +717,18 @@ fn reject_compat_sendmsg_flags(flags: u32) -> AxResult {
 ///   `MSG_MORE` (`:1235`), narrows the route on `MSG_DONTROUTE`
 ///   (`include/net/ip.h:251-260`) and confirms the neighbour on `MSG_CONFIRM`
 ///   (`:1426-1427`).
-/// * TCP rejects nothing: `MSG_EOR` marks the segment (`net/ipv4/tcp.c:1382`),
+/// * TCP rejects nothing: `MSG_OOB` is consumed by `tcp_mark_urg()`
+///   (`net/ipv4/tcp.c:715-718`), `MSG_EOR` marks the segment (`:1382`),
 ///   `MSG_ZEROCOPY` is inert without `SO_ZEROCOPY` (`:1140-1156`), and
 ///   `MSG_FASTOPEN` needs the fast-open machinery this kernel does not have.
 /// * Bits no protocol reads (for example `MSG_SYN`, `MSG_RST`, `MSG_FIN` or
 ///   `MSG_BATCH`) are accepted and ignored.
 ///
-/// `MSG_OOB` is the one bit this layer still refuses: urgent data has no
-/// implementation in any transport here, and every transport that would need it
-/// either rejects it as well (UDP, AF_UNIX, netlink) or would silently drop the
-/// urgent byte (TCP).
+/// `MSG_OOB` carries no [`SendFlags`] bit of its own: the transports that
+/// consume it treat it as a marker on the payload rather than as transfer
+/// policy, and the transports that refuse it are answered by [`check_msg_oob`]
+/// once the socket is resolved.
 fn validate_sendmsg_flags(flags: u32) -> AxResult<SendFlags> {
-    if flags & MSG_OOB != 0 {
-        return Err(LinuxError::EOPNOTSUPP.into());
-    }
     let mut send_flags = SendFlags::empty();
     if flags & MSG_DONTWAIT != 0 {
         send_flags |= SendFlags::DONT_WAIT;
@@ -1173,6 +1247,13 @@ fn send_impl(
     if backend == SocketBackendKind::Netlink {
         let socket = socket.netlink()?;
         debug!("sys_send <= fd: {fd}, flags: {flags}, netlink");
+        // `netlink_sendmsg()` refuses `MSG_OOB` before it looks at anything
+        // else in the message (`net/netlink/af_netlink.c:1830-1831`).
+        check_msg_oob(
+            tk_linux_net::MsgOobTransport::Netlink,
+            tk_linux_net::MessageDirection::Send,
+            flags,
+        )?;
         if !cmsg.is_empty() {
             return Err(AxError::OperationNotSupported);
         }
@@ -1228,6 +1309,15 @@ fn send_impl(
             tk_linux_net::SocketFailure::MessageTooLarge,
         ));
     }
+    // The per-protocol `MSG_OOB` answer.  `udp_sendmsg()` tests the bit only
+    // after its `len > 0xFFFF` bound (`net/ipv4/udp.c:1254-1261`), and every
+    // rejecting protocol returns before its transmit path, so this must precede
+    // the namespace output policy below.
+    check_msg_oob(
+        msg_oob_transport(&socket.inner),
+        tk_linux_net::MessageDirection::Send,
+        flags,
+    )?;
     // Socket transports hand payload to axnet after this boundary, where the
     // IP header is constructed.  Run the namespace OUTPUT policy here so
     // TCP/UDP/raw traffic cannot bypass the same nft/iptables graph that
@@ -1519,6 +1609,12 @@ pub fn sys_sendmsg(
 }
 
 enum ReceivedSocketAddress {
+    /// No provider wrote a source address, so `msg_namelen` stays as the
+    /// receive entry point left it: zero.  `move_addr_to_user()` then reports a
+    /// zero length and copies nothing (`net/socket.c:288-303`), which is what a
+    /// connected stream reports — "According to UNIX98, msg_name/msg_namelen
+    /// are ignored on connected socket." (`net/ipv4/tcp.c:2910-2912`).
+    Unspecified,
     Network(SocketAddrEx),
     Netlink { pid: u32, groups: u32 },
     Packet(tk_linux_packet::SockAddrLl),
@@ -1532,6 +1628,7 @@ impl ReceivedSocketAddress {
         addrlen: &mut socklen_t,
     ) -> AxResult<()> {
         match self {
+            Self::Unspecified => super::addr::fill_addr(capability, addr, addrlen, &[]),
             Self::Network(addr_value) => addr_value.write_to_user(capability, addr, addrlen),
             Self::Netlink { pid, groups } => {
                 let addr_value = SockaddrNl {
@@ -1689,6 +1786,23 @@ fn recv_impl(
 ) -> AxResult<ReceiveOutcome> {
     debug!("sys_recv <= fd: {fd}, flags: {recv_flags:?}");
 
+    // Linux tests the `MSG_OOB` bit inside the protocol, after the descriptor is
+    // resolved, and the two bits it can share a call with are ordered by that
+    // protocol's own entry point.  `tcp_recvmsg()` diverts to the error queue
+    // before it locks the socket — `if (unlikely(flags & MSG_ERRQUEUE)) return
+    // inet_recv_error(sk, msg, len);` (`net/ipv4/tcp.c:2930-2936`) — so TCP
+    // answers the error queue first; `udp_recvmsg()` is the same
+    // (`net/ipv4/udp.c:1984-1986`) but never reads `MSG_OOB` at all.  Every other
+    // protocol that refuses `MSG_OOB` has no error queue to divert to and tests
+    // the bit first (`net/ipv4/raw.c:758-761`, `net/unix/af_unix.c:2574`,
+    // `:2930`, `net/netlink/af_netlink.c:1917`), so its refusal must not be
+    // pre-empted by the diversion below.
+    let error_queue_precedes_oob = matches!(socket.backend()?, SocketBackendKind::Network)
+        && matches!(&socket.network()?.inner, AxSocket::Tcp(_));
+    if !error_queue_precedes_oob {
+        check_receive_oob(socket, recv_flags.raw)?;
+    }
+
     if recv_flags.raw & MSG_ERRQUEUE != 0 {
         if socket.backend()? != SocketBackendKind::Network {
             return Err(AxError::WouldBlock);
@@ -1716,6 +1830,10 @@ fn recv_impl(
                 error.destination,
             ))),
         });
+    }
+
+    if error_queue_precedes_oob {
+        check_receive_oob(socket, recv_flags.raw)?;
     }
 
     if socket.backend()? == SocketBackendKind::Netlink {
@@ -1786,9 +1904,29 @@ fn recv_impl(
     let record_capacity = dst.remaining_mut();
     let mut cmsg = Vec::new();
 
-    let mut remote_addr = want_address.then(|| SocketAddrEx::Ip((Ipv4Addr::UNSPECIFIED, 0).into()));
+    // Linux publishes a peer address only when the transport writes one.
+    // `__sys_recvfrom()` starts from a zeroed `struct msghdr` — the only field
+    // it sets is `.msg_name`, so `msg_namelen` is 0 before the protocol runs
+    // (`net/socket.c:2277-2286`) — and `____sys_recvmsg()` spells that out with
+    // `msg_sys->msg_namelen = 0;` (`net/socket.c:2886-2893`).  The protocols
+    // that store the sender all key on that pointer rather than on the length:
+    // udp_recvmsg(), raw_recvmsg(), sctp_recvmsg(), netlink_recvmsg(),
+    // packet_recvmsg() and unix_dgram_recvmsg() (`net/ipv4/udp.c:2094-2101`,
+    // `net/ipv4/raw.c:784-790`, `net/sctp/socket.c:2153-2155`,
+    // `net/netlink/af_netlink.c:1958-1966`,
+    // `net/packet/af_packet.c:3521-3544`, `net/unix/af_unix.c:2550-2557`).
+    // `tcp_recvmsg_locked()` documents the opposite — "According to UNIX98,
+    // msg_name/msg_namelen are ignored on connected socket."
+    // (`net/ipv4/tcp.c:2910-2912`) — and `unix_stream_read_generic()` never
+    // stores one either.  So the slot itself carries the answer and no
+    // placeholder is ever published in its place.
+    let mut remote_addr = None;
     let options = RecvOptions {
-        from: remote_addr.as_mut(),
+        from: if want_address {
+            Some(&mut remote_addr)
+        } else {
+            None
+        },
         flags: recv_flags.generic,
         cmsg: Some(&mut cmsg),
         nonblocking_override: Some(nonblocking),
@@ -1926,12 +2064,20 @@ fn recv_impl(
     }
 
     debug!("sys_recv => fd: {fd}, recv: {recv}");
+    // A `want_address` receive whose transport never wrote `options.from` still
+    // reports an address slot, but one of length zero: the callers above pass
+    // `Some(&mut None)` and every transport that has a source address to report
+    // assigns it unconditionally, so an untouched slot means "no name"
+    // (`net/socket.c:2277-2302`).
+    let address = want_address.then(|| {
+        remote_addr.map_or(ReceivedSocketAddress::Unspecified, ReceivedSocketAddress::Network)
+    });
     Ok(ReceiveOutcome {
         returned_len: recv as isize,
         message_truncated: seqpacket && record_len > record_capacity,
         message_eor: seqpacket && recv != 0,
         control_truncated,
-        address: remote_addr.map(ReceivedSocketAddress::Network),
+        address,
     })
 }
 
@@ -2995,5 +3141,89 @@ mod tests {
         assert!(!should_raise_sigpipe(AxError::ConnectionRefused, 0));
         assert!(should_raise_sigpipe(AxError::BrokenPipe, 0));
         assert!(!should_raise_sigpipe(AxError::BrokenPipe, MSG_NOSIGNAL));
+    }
+
+    #[test]
+    fn msg_oob_is_a_transport_answer_the_socket_layer_never_owns() {
+        use tk_linux_net::{MessageDirection, MsgOobTransport, NO_URGENT_DATA_ERRNO,
+            OOB_NOT_SUPPORTED_ERRNO};
+
+        // `____sys_sendmsg()` substitutes the call flags for the per-message
+        // word and has no `MSG_OOB` rule (`net/socket.c:2666-2684`), so the bit
+        // must survive this stage for every transport; `__sys_sendto()` is the
+        // same (`:2248-2252`).  The receive side owns no allow-list either
+        // (`:2895-2904`).
+        assert!(validate_sendmsg_flags(MSG_OOB).is_ok());
+        assert!(validate_recvmsg_flags(MSG_OOB, false).is_ok());
+
+        let urgent = || LinuxError::try_from(NO_URGENT_DATA_ERRNO).unwrap();
+        assert_eq!(urgent(), LinuxError::EINVAL);
+        let unsupported = || LinuxError::try_from(OOB_NOT_SUPPORTED_ERRNO).unwrap();
+        assert_eq!(unsupported(), LinuxError::EOPNOTSUPP);
+
+        // TCP: `tcp_sendmsg_locked()` marks the urgent pointer and sends the
+        // octets (`net/ipv4/tcp.c:715-718`); `tcp_recvmsg_locked()` diverts the
+        // bit to `recv_urg()` (`:2679-2681`), which answers EINVAL while no
+        // urgent byte is pending (`:1480-1483`).
+        assert!(check_msg_oob(MsgOobTransport::Tcp, MessageDirection::Send, MSG_OOB).is_ok());
+        assert_eq!(
+            check_msg_oob(MsgOobTransport::Tcp, MessageDirection::Receive, MSG_OOB)
+                .map_err(LinuxError::from),
+            Err(urgent())
+        );
+        // UDP mirrors the BSD refusal on send (`net/ipv4/udp.c:1259-1261`) and
+        // never reads the bit on receive.
+        assert_eq!(
+            check_msg_oob(MsgOobTransport::Udp, MessageDirection::Send, MSG_OOB)
+                .map_err(LinuxError::from),
+            Err(unsupported())
+        );
+        assert!(check_msg_oob(MsgOobTransport::Udp, MessageDirection::Receive, MSG_OOB).is_ok());
+        // Netlink refuses the bit before it reads the queue
+        // (`net/netlink/af_netlink.c:1915-1917`), and a raw socket refuses it
+        // on both sides (`net/ipv4/raw.c:517`, `:758`).
+        assert_eq!(
+            check_msg_oob(MsgOobTransport::Netlink, MessageDirection::Receive, MSG_OOB)
+                .map_err(LinuxError::from),
+            Err(unsupported())
+        );
+        assert_eq!(
+            check_msg_oob(MsgOobTransport::Raw, MessageDirection::Send, MSG_OOB)
+                .map_err(LinuxError::from),
+            Err(unsupported())
+        );
+        // With no `MSG_OOB` bit there is nothing for the transport to answer,
+        // whatever its table says.
+        assert!(check_msg_oob(MsgOobTransport::Udp, MessageDirection::Send, 0).is_ok());
+        assert!(check_msg_oob(MsgOobTransport::Raw, MessageDirection::Receive, MSG_PEEK).is_ok());
+    }
+
+    #[test]
+    fn an_unnamed_source_address_reports_zero_length_without_copying() {
+        let capability = mapped_io_capability();
+        // A connected stream has no source address to report: the entry point
+        // leaves `msg_namelen` at zero and `move_addr_to_user()` copies nothing
+        // for a zero provider length (`net/socket.c:288-303`).  The bogus
+        // destination proves the copy is skipped, because a single byte written
+        // there would fail.
+        let mut requested: socklen_t = 16;
+        assert!(
+            ReceivedSocketAddress::Unspecified
+                .write_to_user(&capability, UserPtr::from(0x1), &mut requested)
+                .is_ok()
+        );
+        assert_eq!(requested, 0);
+
+        // A negative request is the one arm that neither copies nor rewrites
+        // the length.  `socklen_t` is unsigned, so the user value `-1` reaches
+        // this layer as the maximum of the type.
+        let mut negative: socklen_t = socklen_t::MAX;
+        assert_eq!(
+            ReceivedSocketAddress::Unspecified
+                .write_to_user(&capability, UserPtr::from(0x1), &mut negative)
+                .map_err(LinuxError::from),
+            Err(LinuxError::EINVAL)
+        );
+        assert_eq!(negative, socklen_t::MAX);
     }
 }

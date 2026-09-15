@@ -996,6 +996,58 @@ static void null_operations(void) {
              pair[0] >= 0 && pair[1] >= 0 && pair[0] != pair[1]);
 }
 
+/* Reports whether every byte of `buffer` still holds `filler`.  A provider that
+ * never writes a source address must leave the caller's bytes exactly as they
+ * were, so a filled sentinel is the only way to observe it. */
+static int untouched(const void *buffer, size_t length, unsigned char filler) {
+    const unsigned char *bytes = buffer;
+    for (size_t index = 0; index < length; index++) {
+        if (bytes[index] != filler) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Binds a loopback listener, connects `*client` to it and accepts the peer as
+ * `*server`, closing the listener again.  A failure leaves both endpoints at
+ * -1.  The two ends are returned separately because the source address of a
+ * receive is only observable on the end that did not send. */
+static void loopback_stream_pair(int *server, int *client) {
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t length = sizeof(address);
+    *server = -1;
+    *client = -1;
+    int bound = socket(AF_INET, SOCK_STREAM, 0);
+    if (bound < 0 || bind(bound, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        listen(bound, 1) != 0 ||
+        getsockname(bound, (struct sockaddr *)&address, &length) != 0) {
+        if (bound >= 0) {
+            close(bound);
+        }
+        return;
+    }
+    int connected = socket(AF_INET, SOCK_STREAM, 0);
+    if (connected < 0 || connect(connected, (struct sockaddr *)&address, length) != 0) {
+        if (connected >= 0) {
+            close(connected);
+        }
+        close(bound);
+        return;
+    }
+    int accepted = accept(bound, NULL, NULL);
+    close(bound);
+    if (accepted < 0) {
+        close(connected);
+        return;
+    }
+    *server = accepted;
+    *client = connected;
+}
+
 /* `__sys_getsockname`/`__sys_getpeername` run the family's `getname` before
  * `move_addr_to_user` reads `*addrlen` (`net/socket.c:1849-1876`), so a
  * provider error survives an unusable length pointer while a successful
@@ -1070,6 +1122,128 @@ static void name_record(void) {
                  source_length == sizeof(struct sockaddr_in));
     }
     close(receiver);
+
+    /* `__sys_recvfrom()` passes the protocol a zeroed `struct msghdr` and only
+     * `.msg_name` is filled in (`net/socket.c:2277-2302`):
+     *
+     * ```c
+     * 	struct msghdr msg;
+     * 	struct sockaddr_storage address;
+     * 	...
+     * 	memset(&msg, 0, sizeof(msg));
+     * 	if (addr) {
+     * 		msg.msg_name = &address;
+     * 		msg.msg_namelen = sizeof(address);
+     * 	}
+     * ```
+     *
+     * The kernel buffer it imports is then re-exported by `move_addr_to_user()`
+     * with whatever length the protocol stored in `msg_namelen`, so a transport
+     * that never writes a peer address reports a zero length and leaves the
+     * caller's bytes alone.  `tcp_recvmsg_locked()` is that transport —
+     * "According to UNIX98, msg_name/msg_namelen are ignored on connected
+     * socket." (`net/ipv4/tcp.c:2910-2912`) — while `udp_recvmsg()` always
+     * stores the source it dequeued (`net/ipv4/udp.c:2094-2101`). */
+    int server = -1;
+    int client = -1;
+    loopback_stream_pair(&server, &client);
+    check("CONNECTED_STREAM_READY", server >= 0 && client >= 0);
+    if (server >= 0 && client >= 0) {
+        struct sockaddr_in source;
+        socklen_t source_length;
+        char octet = 'r';
+        ssize_t received;
+
+        memset(&source, 0xa5, sizeof(source));
+        check("CONNECTED_STREAM_SENT", send(server, &octet, 1, 0) == 1);
+        source_length = sizeof(source);
+        errno = 0;
+        received = recvfrom(client, &octet, 1, 0, (struct sockaddr *)&source, &source_length);
+        mark("RECVFROM_CONNECTED_STREAM_NAME_ABSENT",
+             received == 1 && source_length == 0 &&
+                 untouched(&source, sizeof(source), 0xa5));
+
+        check("CONNECTED_STREAM_SENT_AGAIN", send(server, &octet, 1, 0) == 1);
+        struct iovec vector = {.iov_base = &octet, .iov_len = 1};
+        struct msghdr header = {.msg_iov = &vector, .msg_iovlen = 1};
+        memset(&source, 0xa5, sizeof(source));
+        header.msg_name = &source;
+        header.msg_namelen = sizeof(source);
+        errno = 0;
+        received = recvmsg(client, &header, 0);
+        mark("RECVMSG_CONNECTED_STREAM_NAME_ABSENT",
+             received == 1 && header.msg_namelen == 0 &&
+                 untouched(&source, sizeof(source), 0xa5));
+
+        /* A negative request is the one arm where `move_addr_to_user()`
+         * neither copies nor writes the length back (`net/socket.c:288-303`);
+         * the zero-length provider reaches it the same way. */
+        check("CONNECTED_STREAM_SENT_THIRD", send(server, &octet, 1, 0) == 1);
+        source_length = (socklen_t)-1;
+        memset(&source, 0xa5, sizeof(source));
+        errno = 0;
+        received = recvfrom(client, &octet, 1, 0, (struct sockaddr *)&source, &source_length);
+        mark("RECVFROM_CONNECTED_STREAM_NEGATIVE_LENGTH_EINVAL",
+             received == -1 && errno == EINVAL && source_length == (socklen_t)-1 &&
+                 untouched(&source, sizeof(source), 0xa5));
+    }
+    if (client >= 0) {
+        close(client);
+    }
+    if (server >= 0) {
+        close(server);
+    }
+
+    /* The datagram half of the same rule: the reported source is the one the
+     * transport stored, with its own address and port.  The sender is bound
+     * explicitly because an implicit bind leaves `inet->inet_saddr` at the
+     * wildcard, so `inet_getname()` reports `0.0.0.0` even though the datagram
+     * the peer dequeued carries the route's source address — comparing the two
+     * would compare two different things. */
+    int datagram_receiver = socket(AF_INET, SOCK_DGRAM, 0);
+    int datagram_sender = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in datagram_address;
+    memset(&datagram_address, 0, sizeof(datagram_address));
+    datagram_address.sin_family = AF_INET;
+    datagram_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t datagram_length = sizeof(datagram_address);
+    int datagram_ready = datagram_receiver >= 0 && datagram_sender >= 0 &&
+                         bind(datagram_receiver, (struct sockaddr *)&datagram_address,
+                              sizeof(datagram_address)) == 0 &&
+                         getsockname(datagram_receiver, (struct sockaddr *)&datagram_address,
+                                     &datagram_length) == 0;
+    check("DATAGRAM_READY", datagram_ready);
+    if (datagram_ready) {
+        struct sockaddr_in sender_address;
+        memset(&sender_address, 0, sizeof(sender_address));
+        sender_address.sin_family = AF_INET;
+        sender_address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t sender_length = sizeof(sender_address);
+        char octet = 's';
+        check("DATAGRAM_SENT",
+              bind(datagram_sender, (struct sockaddr *)&sender_address,
+                   sizeof(sender_address)) == 0 &&
+                  getsockname(datagram_sender, (struct sockaddr *)&sender_address,
+                              &sender_length) == 0 &&
+                  sendto(datagram_sender, &octet, 1, 0, (struct sockaddr *)&datagram_address,
+                         sizeof(datagram_address)) == 1);
+        struct sockaddr_in source;
+        socklen_t source_length = sizeof(source);
+        memset(&source, 0xa5, sizeof(source));
+        errno = 0;
+        ssize_t received =
+            recvfrom(datagram_receiver, &octet, 1, 0, (struct sockaddr *)&source, &source_length);
+        mark("RECVFROM_DATAGRAM_NAME_PRESENT",
+             received == 1 && source_length == sizeof(source) && source.sin_family == AF_INET &&
+                 source.sin_port == sender_address.sin_port &&
+                 source.sin_addr.s_addr == sender_address.sin_addr.s_addr);
+    }
+    if (datagram_sender >= 0) {
+        close(datagram_sender);
+    }
+    if (datagram_receiver >= 0) {
+        close(datagram_receiver);
+    }
 
     int unix_socket = socket(AF_UNIX, SOCK_STREAM, 0);
     check("AUTOBIND_NAME_SOCKET", unix_socket >= 0);
