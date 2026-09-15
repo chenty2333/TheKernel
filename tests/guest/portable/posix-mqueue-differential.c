@@ -172,6 +172,16 @@ static int case_mq_open(void) {
         observed.mq_curmsgs != 0 || observed.mq_flags != 0) {
         return fail_code("default-attributes", observed.mq_maxmsg);
     }
+    /* `do_mq_open()` installs the descriptor with `FD_ADD(O_CLOEXEC, ...)`
+     * (`ipc/mqueue.c:924`), and `FD_ADD` hands that argument straight to
+     * `get_unused_fd_flags()`. The queue descriptor is close-on-exec whether or
+     * not the caller passed `O_CLOEXEC`; `oflag` only reaches
+     * `dentry_open()`'s `f_flags`. */
+    int descriptor_flags = fcntl(fd, F_GETFD);
+    if (descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) == 0) {
+        return fail_code("open-cloexec-unconditional", (long)descriptor_flags);
+    }
+    puts("THEKERNEL_ABI_ASSERT mq_open.raw-differential FD_CLOEXEC_UNCONDITIONAL pass");
     if (close(fd) != 0) {
         return fail("default-close");
     }
@@ -1040,6 +1050,42 @@ static int case_mq_notify(void) {
         return fail("notify-thread-cookie-first");
     }
     puts("THEKERNEL_ABI_ASSERT mq_notify.raw-differential ARGUMENT_VALIDATION pass");
+
+    /* `mqueue_flush_file()` (`ipc/mqueue.c:658`) is this queue's `->flush`:
+     *
+     *	spin_lock(&info->lock);
+     *	if (task_tgid(current) == info->notify_owner)
+     *		remove_notification(info);
+     *
+     * `filp_close()` runs it for *every* descriptor of the queue the owning
+     * process closes, so closing a second, unrelated descriptor disarms the
+     * one-shot registration even though the descriptor the registration named
+     * stays open. A surviving registration would answer the re-registration
+     * below with EBUSY. */
+    event.sigev_notify = SIGEV_SIGNAL;
+    event.sigev_signo = SIGUSR1;
+    event.sigev_value.sival_int = 31;
+    if (raw_mq_notify(fd, &event) != 0) {
+        return fail("notify-flush-register");
+    }
+    errno = 0;
+    if (raw_mq_notify(fd, &event) != -1 || errno != EBUSY) {
+        return fail("notify-flush-busy");
+    }
+    int sibling = raw_mq_open(queue_names[0], O_RDONLY | O_NONBLOCK, 0, NULL);
+    if (sibling < 0) {
+        return fail("notify-flush-open");
+    }
+    if (close(sibling) != 0) {
+        return fail("notify-flush-close");
+    }
+    if (raw_mq_notify(fd, &event) != 0) {
+        return fail("notify-flush-disarmed");
+    }
+    if (raw_mq_notify(fd, NULL) != 0) {
+        return fail("notify-flush-clear");
+    }
+    puts("THEKERNEL_ABI_ASSERT mq_notify.raw-differential DESCRIPTOR_FLUSH_DISARMS pass");
 
     /* A message consumed by an already blocked receiver is handed over
      * directly (`pipelined_send`), so `__do_notify()` never runs and the

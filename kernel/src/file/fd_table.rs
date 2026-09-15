@@ -469,6 +469,11 @@ impl FdTable {
 
     fn finish_close(&self, removed: &FileDescriptor) {
         release_posix_locks_on_close(&removed.description, self.id);
+        // Linux `filp_close()` runs `file->f_op->flush` before it drops the
+        // last reference, and every descriptor-level close path below (plus
+        // `PreparedCloexec::commit()`) reaches this function exactly once per
+        // retired descriptor.
+        removed.description.flush_on_close();
         removed.description.descriptor_closed();
         crate::syscall::collect_scm_rights_cycles();
     }

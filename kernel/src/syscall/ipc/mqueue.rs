@@ -21,8 +21,7 @@ use axsync::Mutex;
 use axtask::{WaitError, WaitQueue, current};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::{
-    __kernel_mode_t, CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_SYS_RESOURCE, O_ACCMODE, O_CLOEXEC, O_CREAT,
-    O_EXCL,
+    __kernel_mode_t, CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_SYS_RESOURCE, O_ACCMODE, O_CREAT, O_EXCL,
     O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, SI_MESGQ, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD,
     timespec,
 };
@@ -586,7 +585,19 @@ impl PosixMqueue {
         }
     }
 
-    /// `wq_get_first_waiter(info, RECV)` plus the parking `wq_add()` performs.
+    /// `wq_sleep()`'s parking half plus the `wq_add()` position rule.
+    ///
+    /// `wq_add()` (`ipc/mqueue.c:689`) inserts before the first waiter whose
+    /// `task->prio` is at least as strong as `current->prio`, and
+    /// `wq_get_first_waiter()` returns the list tail, so Linux serves the
+    /// strongest waiter and the oldest of the equally strong ones. TheKernel
+    /// parks in arrival order and serves `first()`, which reproduces the FIFO
+    /// half of that rule but **not** the scheduler-priority half: two waiters
+    /// with different nice values are served oldest-first here and
+    /// strongest-first by Linux. The primitive Linux orders by exists as
+    /// `tk-axtask::pi_kernel_priority()` (`kernel/src/task/futex.rs`) over
+    /// `task_scheduling_snapshot()`; ordering these vectors by it, with the
+    /// strongest waiter last, is what closing that divergence needs.
     fn park_receiver(&mut self, receiver: &Arc<MqReceiver>) {
         if !receiver.queued.swap(true, Ordering::AcqRel) {
             self.receivers.push(receiver.clone());
@@ -602,6 +613,8 @@ impl PosixMqueue {
         }
     }
 
+    /// Sender-side counterpart of [`Self::park_receiver`], with the same
+    /// `wq_add()` priority divergence.
     fn park_sender(&mut self, sender: &Arc<MqSenderWaiter>) {
         if !sender.queued.swap(true, Ordering::AcqRel) {
             self.senders.push(sender.clone());
@@ -857,6 +870,48 @@ impl FileLike for MqFd {
 
     fn nonblocking(&self) -> bool {
         self.is_nonblocking()
+    }
+
+    /// Linux `mqueue_flush_file()` (`ipc/mqueue.c:658`):
+    ///
+    /// ```c
+    /// 	spin_lock(&info->lock);
+    /// 	if (task_tgid(current) == info->notify_owner)
+    /// 		remove_notification(info);
+    ///
+    /// 	spin_unlock(&info->lock);
+    /// ```
+    ///
+    /// `.flush` runs for *every* descriptor of the queue the owning process
+    /// closes, not only for the last one and not only for the descriptor the
+    /// registration named, so the one-shot `mq_notify` registration is gone
+    /// after `mq_open()` + `close()` of a sibling descriptor. `current()`
+    /// resolves the same `task_tgid` the registration recorded in
+    /// [`MqNotifier::pid`]; a close performed by any other process leaves the
+    /// registration armed.
+    fn flush_on_close(&self) {
+        // Every Linux `filp_close()` site runs in task context. A close that
+        // somehow cannot name a current task has no `task_tgid(current)` to
+        // compare against, so it leaves the registration alone rather than
+        // guessing.
+        if !axtask::can_block_current() {
+            return;
+        }
+        let curr = current();
+        let pid = curr.as_thread().proc_data.proc.pid();
+        let removed = {
+            let mut queue = self.queue.lock();
+            if queue
+                .notifier
+                .as_ref()
+                .is_some_and(|notifier| notifier.pid == pid)
+            {
+                queue.notifier.take()
+            } else {
+                None
+            }
+        };
+        remove_notification(removed);
     }
 
     fn set_nonblocking(&self, nonblocking: bool) -> AxResult {
@@ -1518,7 +1573,6 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
     let create = (oflag as u32) & O_CREAT != 0;
     let excl = (oflag as u32) & O_EXCL != 0;
     let nonblocking = (oflag as u32) & O_NONBLOCK != 0;
-    let cloexec = (oflag as u32) & O_CLOEXEC != 0;
     let curr = current();
     let ipc_ns = curr.as_thread().ipc_ns();
 
@@ -1592,7 +1646,17 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
         nonblocking,
     ));
     let status_flags = ((oflag as u32) & O_NONBLOCK) | ((oflag as u32) & O_ACCMODE);
-    match add_file_like_with_flags(mqfd, cloexec, status_flags) {
+    // `do_mq_open()` installs the descriptor with
+    //
+    //	fd = FD_ADD(O_CLOEXEC, mqueue_file_open(name, mnt, oflag, ro, mode, attr));
+    //
+    // (`ipc/mqueue.c:924`), and `FD_ADD` (`include/linux/file.h:252`) hands that
+    // first argument straight to `get_unused_fd_flags()`. The queue descriptor
+    // is therefore close-on-exec whether or not the caller passed `O_CLOEXEC`;
+    // `oflag` only reaches `dentry_open()`'s `f_flags`. A 7.2.3 oracle guest
+    // confirms it: `F_GETFD` reports `FD_CLOEXEC` for a plain
+    // `O_CREAT|O_RDWR` `mq_open()`.
+    match add_file_like_with_flags(mqfd, true, status_flags) {
         Ok(fd) => Ok(fd as isize),
         Err(err) => {
             if created {
@@ -2169,10 +2233,12 @@ mod tests {
 
         let (message, publish) = queue.lock().take_message().unwrap();
         assert_eq!(message.data, b"stored".to_vec());
-        // Linux `pipelined_receive()` inserts the first sleeping sender's
-        // message into the freed slot instead of waking it to contend, and it
-        // wakes `e_wait_q[SEND]` in FIFO order (`wq_add()` appends), so the
-        // older waiter wins.
+        // Linux `pipelined_receive()` inserts the strongest sleeping sender's
+        // message into the freed slot instead of waking it to contend, and
+        // `wq_get_first_waiter()` picks the `e_wait_q[SEND]` tail, so the
+        // oldest of the equally strong waiters wins. TheKernel parks senders in
+        // arrival order, which matches that rule for equal nice values only
+        // (see `park_receiver` for the missing priority ordering).
         assert!(first.handed_off.load(Ordering::Acquire));
         assert!(!second.handed_off.load(Ordering::Acquire));
         assert!(publish.sender.is_some());
