@@ -1104,7 +1104,7 @@ fn do_futex_lock_pi(
             },
         );
 
-        match result {
+        match result.result {
             Ok(false) => {
                 if let Some(decided) = decided {
                     return decided;
@@ -1310,7 +1310,7 @@ fn do_futex_wait_requeue_pi(
         let target_pi_state = target_futex.pi_state();
         target_pi_state.attach(target_word.tid);
 
-        let result = source_futex.wq.wait_pi(
+        let outcome = source_futex.wq.wait_pi(
             source_futex.waiter_owner(),
             u32::MAX,
             deadline.map(|deadline| (deadline.clock, deadline.deadline)),
@@ -1332,7 +1332,7 @@ fn do_futex_wait_requeue_pi(
             },
         );
 
-        match result {
+        match outcome.result {
             Ok(false) => {
                 // The publication condition always either waits or fails, so
                 // this is a lost race with the target's unlock.
@@ -1356,6 +1356,16 @@ fn do_futex_wait_requeue_pi(
                     let _ = fault_read_u32(caller, target)?;
                 }
                 let _ = &target_expected;
+            }
+            // `futex_wait_requeue_pi()`'s `Q_REQUEUE_PI_DONE` case: the waiter
+            // was already moved onto the target's rt_mutex, so
+            // `rt_mutex_wait_proxy_lock()`'s `-EINTR` is reported as
+            // `-EWOULDBLOCK` instead of being restarted -- restarting would
+            // re-read `*uaddr` and refuse the wait
+            // (`kernel/futex/requeue.c:895-902`).
+            Err(WaitConditionError::Fault(AxError::Interrupted)) if outcome.requeued => {
+                let _ = fault_read_u32(caller, source)?;
+                return Err(AxError::WouldBlock);
             }
             Err(WaitConditionError::Fault(error)) => return Err(error),
         }
