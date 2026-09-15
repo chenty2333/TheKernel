@@ -98,6 +98,8 @@ static const char *const assertions[] = {
     "EPOLLEXCLUSIVE_MOD_BEFORE_LOOKUP",
     "EPOLLEXCLUSIVE_NESTED_EINVAL",
     "EPOLLEXCLUSIVE_DEL_IGNORES_MASK",
+    "EPOLLEXCLUSIVE_UNKNOWN_OP_EINVAL",
+    "EPOLL_EVENT_COPY_BEFORE_FD_LOOKUP",
     "EPOLLMSG_INTEREST_ACCEPTED",
     "EPOLLWAKEUP_INTEREST_ACCEPTED",
     "MEMBARRIER_QUERY_MASK",
@@ -276,6 +278,69 @@ static int check_epoll_admission(void)
     }
 
     close(nested_fd);
+    close(event_fd);
+    close(epoll_fd);
+    return 0;
+}
+
+/* The two ordering rules which decide errno before any operation is
+ * interpreted: the EPOLLEXCLUSIVE admission matches ADD and MOD only, and the
+ * event is copied before either descriptor is resolved. */
+static int check_epoll_ctl_ordering(void)
+{
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    int event_fd = eventfd(0, EFD_CLOEXEC);
+    struct epoll_event exclusive = {.events = EPOLLIN | EPOLLEXCLUSIVE};
+    struct epoll_event plain = {.events = EPOLLIN};
+    /* Address 1 is unmapped in both guests, so the copy must fail. */
+    struct epoll_event *bad = (struct epoll_event *)(uintptr_t)1;
+    long result;
+
+    if (epoll_fd < 0 || event_fd < 0) {
+        return fail("epoll-ordering-create");
+    }
+
+    /* The admission rule is a pair of `if (op == ...)` tests on MOD and ADD;
+     * every other operation -- including one Linux does not define -- falls
+     * through to the switch, whose default arm answers EINVAL
+     * (fs/eventpoll.c:2671-2676, :2725).  A capability errno here would hide
+     * that EINVAL, and there is no exclusive registration for an unknown
+     * operation to refuse. */
+    errno = 0;
+    result = epoll_ctl(epoll_fd, 9, event_fd, &exclusive);
+    if (result != -1 || errno != EINVAL) {
+        return fail_value("epoll-unknown-op-exclusive", result, -1);
+    }
+    /* The same operation with an ordinary mask is EINVAL too. */
+    errno = 0;
+    result = epoll_ctl(epoll_fd, 9, event_fd, &plain);
+    if (result != -1 || errno != EINVAL) {
+        return fail_value("epoll-unknown-op-plain", result, -1);
+    }
+
+    /* `SYSCALL_DEFINE4(epoll_ctl)` copies the event for every operation except
+     * DEL (`ep_op_has_event()`) *before* `do_epoll_ctl()` resolves either
+     * descriptor (fs/eventpoll.c:2746-2751), so an unusable event pointer is
+     * EFAULT even when every descriptor is invalid -- and even when the
+     * operation itself is unknown. */
+    errno = 0;
+    result = epoll_ctl(-1, EPOLL_CTL_ADD, -1, bad);
+    if (result != -1 || errno != EFAULT) {
+        return fail_value("epoll-event-before-fds", result, -1);
+    }
+    errno = 0;
+    result = epoll_ctl(-1, 9, -1, bad);
+    if (result != -1 || errno != EFAULT) {
+        return fail_value("epoll-event-before-unknown-op", result, -1);
+    }
+    /* DEL carries no event at all, so its descriptors are the first thing it
+     * can fail on and the same pointer is never read. */
+    errno = 0;
+    result = epoll_ctl(-1, EPOLL_CTL_DEL, -1, bad);
+    if (result != -1 || errno != EBADF) {
+        return fail_value("epoll-del-no-event-copy", result, -1);
+    }
+
     close(event_fd);
     close(epoll_fd);
     return 0;
@@ -673,6 +738,7 @@ int main(int argc, char **argv)
            thekernel_mode ? "thekernel" : "linux");
 
     failed |= check_epoll_admission();
+    failed |= check_epoll_ctl_ordering();
     failed |= check_membarrier();
     failed |= check_restart_without_block();
     failed |= check_ppoll_without_restart_block();
