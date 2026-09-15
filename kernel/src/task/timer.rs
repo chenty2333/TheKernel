@@ -121,6 +121,20 @@ pub(crate) struct PosixTimer {
     /// Timex generation used to derive `deadline` from `tai_deadline`.
     tai_offset_generation: u64,
     pub deadline: Option<Duration>,
+    /// The expiry a disarmed `SIGEV_NONE` timer still reports.
+    ///
+    /// `common_timer_set()` cancels the hrtimer but leaves its `node.expires`
+    /// in place, and `common_timer_get()` deliberately does not take the early
+    /// return for a disarmed timer whose notification is `SIGEV_NONE`
+    /// (`kernel/time/posix-timers.c:696-707`): it falls through to
+    /// `timer_remaining()`, which subtracts `now` from that stale expiry.  A
+    /// `SIGEV_NONE` timer therefore reads back the remainder it had when it
+    /// was disarmed -- and zero once that moment has passed -- where a timer
+    /// with a real delivery mode reads back zero immediately.
+    ///
+    /// Only `remaining()` consults this.  It never arms an alarm: a disarmed
+    /// timer must not keep waking the task.
+    pub(crate) stale_deadline: Option<Duration>,
     /// Absolute threshold in the advertised CPU-clock domain.  This is kept
     /// separate from `deadline`: CPU time does not advance while a task is
     /// descheduled and therefore cannot be represented by AlarmClock.
@@ -198,6 +212,7 @@ impl PosixTimer {
             tai_deadline: None,
             tai_offset_generation: 0,
             deadline: None,
+            stale_deadline: None,
             cpu_deadline_ns: None,
             cpu_target_task,
             cpu_target_process,
@@ -271,7 +286,11 @@ impl PosixTimer {
         if let Some(deadline) = self.tai_deadline {
             return deadline.saturating_sub(crate::syscall::tai_time());
         }
+        // A disarmed SIGEV_NONE timer keeps reporting the expiry it had when
+        // it was disarmed, saturating at zero once that moment has passed
+        // (`common_timer_get()` never takes its early return for one).
         self.deadline
+            .or(self.stale_deadline)
             .map(|deadline| deadline.saturating_sub(self.effective_clock.now()))
             .unwrap_or(Duration::ZERO)
     }

@@ -67,6 +67,8 @@
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/timerfd.h>
+#include <sys/times.h>
 #include <sys/timex.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -1381,6 +1383,236 @@ static int case_timer_create(void) {
     return 0;
 }
 
+/*
+ * The classic timer syscalls that the cases below used only as setup:
+ * nanosleep(2) 35, getitimer(2) 36, alarm(2) 37, setitimer(2) 38,
+ * times(2) 100, timer_settime(2) 223, timer_gettime(2) 224,
+ * timer_delete(2) 226, timerfd_create(2) 283, timerfd_gettime(2) 287.
+ *
+ *   kernel/time/hrtimer.c:2100-2135   nanosleep validates the request with
+ *     timespec64_valid() before sleeping: a negative or >= 1e9 tv_nsec is
+ *     -EINVAL, and a zero request returns immediately.
+ *   kernel/time/itimer.c:280-320      do_setitimer/do_getitimer switch on
+ *     `which` and answer -EINVAL outside ITIMER_REAL..ITIMER_PROF;
+ *     setitimer(2) copies the request in before that switch, so a bad
+ *     `which` is EINVAL rather than EFAULT.
+ *   kernel/time/itimer.c:216-240      alarm(2) is setitimer(ITIMER_REAL) and
+ *     returns the previously armed remainder.
+ *   kernel/time/time.c:240-255        times(2) accepts a NULL buffer.
+ *   kernel/time/posix-timers.c:1050   timer_settime/timer_gettime answer
+ *     -EINVAL for an id that names no timer.
+ *   kernel/time/posix-timers.c:600    timer_delete is -EINVAL for an
+ *     unknown id.
+ *   fs/timerfd.c:420-470, 250-300     timerfd_create rejects a negative
+ *     clockid and any flag outside TFD_CLOEXEC|TFD_NONBLOCK before it
+ *     allocates, and timerfd_gettime reads the armed remainder.
+ */
+static int case_time_timer(void) {
+    struct itimerval it, back;
+    struct itimerspec its, got;
+    struct sigevent event;
+    struct tms accounting;
+    timer_t id = (timer_t)-1;
+    unsigned int left;
+    int tfd;
+
+    CASE("time-timer");
+
+    memset(&its, 0, sizeof(its));
+    if (syscall(SYS_nanosleep, &its.it_value, NULL) != 0) {
+        return fail("nanosleep-zero");
+    }
+    its.it_value.tv_nsec = 1000000000L;
+    errno = 0;
+    if (syscall(SYS_nanosleep, &its.it_value, NULL) != -1 || errno != EINVAL) {
+        return fail("nanosleep-nsec-einval");
+    }
+    its.it_value.tv_nsec = -1;
+    errno = 0;
+    if (syscall(SYS_nanosleep, &its.it_value, NULL) != -1 || errno != EINVAL) {
+        return fail("nanosleep-negative-einval");
+    }
+    ASSERT("time-timer", "NANOSLEEP_REQUEST_RANGE");
+
+    memset(&it, 0, sizeof(it));
+    if (syscall(SYS_setitimer, ITIMER_REAL, &it, NULL) != 0) {
+        return fail("setitimer-disarm");
+    }
+    if (syscall(SYS_getitimer, ITIMER_REAL, &back) != 0) {
+        return fail("getitimer");
+    }
+    if (back.it_value.tv_sec != 0 || back.it_value.tv_usec != 0) {
+        return fail("getitimer-disarmed");
+    }
+    errno = 0;
+    if (syscall(SYS_getitimer, 4, &back) != -1 || errno != EINVAL) {
+        return fail("getitimer-which-einval");
+    }
+    errno = 0;
+    if (syscall(SYS_setitimer, 4, &it, NULL) != -1 || errno != EINVAL) {
+        return fail("setitimer-which-einval");
+    }
+    /* The switch runs before the out-value is written, and a NULL request
+     * disarms rather than faulting. */
+    errno = 0;
+    if (syscall(SYS_setitimer, 4, NULL, (void *)1) != -1 || errno != EINVAL) {
+        return fail("setitimer-which-before-ovalue");
+    }
+    if (syscall(SYS_setitimer, ITIMER_REAL, NULL, NULL) != 0) {
+        return fail("setitimer-null-value");
+    }
+    ASSERT("time-timer", "ITIMER_WHICH_EINVAL");
+
+    if (syscall(SYS_alarm, 0) != 0) {
+        return fail("alarm-zero");
+    }
+    if (syscall(SYS_alarm, 100) != 0) {
+        return fail("alarm-arm");
+    }
+    left = (unsigned int)syscall(SYS_alarm, 0);
+    if (left == 0 || left > 100) {
+        return fail("alarm-remainder");
+    }
+    ASSERT("time-timer", "ALARM_ARM_AND_REMAINDER");
+
+    if (syscall(SYS_times, NULL) < 0) {
+        return fail("times-null");
+    }
+    if (syscall(SYS_times, &accounting) < 0) {
+        return fail("times-buffer");
+    }
+    errno = 0;
+    if (syscall(SYS_times, (void *)1) != -1 || errno != EFAULT) {
+        return fail("times-bad-buffer");
+    }
+    ASSERT("time-timer", "TIMES_NULL_ACCEPTED");
+
+    /* A timer with a real delivery mode takes common_timer_get()'s early
+     * return once it is disarmed, so the setting it reads back is zeroed
+     * (kernel/time/posix-timers.c:696-707). */
+    memset(&event, 0, sizeof(event));
+    event.sigev_notify = SIGEV_SIGNAL;
+    event.sigev_signo = SIGALRM;
+    if (syscall(SYS_timer_create, CLOCK_MONOTONIC, &event, &id) != 0) {
+        return fail("time-timer-create");
+    }
+    if (syscall(SYS_timer_gettime, id, &got) != 0) {
+        return fail("timer_gettime-fresh");
+    }
+    if (got.it_value.tv_sec != 0 || got.it_value.tv_nsec != 0) {
+        return fail("timer_gettime-fresh-armed");
+    }
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_sec = 3600;
+    if (syscall(SYS_timer_settime, id, 0, &its, NULL) != 0) {
+        return fail("timer_settime-arm");
+    }
+    if (syscall(SYS_timer_gettime, id, &got) != 0) {
+        return fail("timer_gettime-armed");
+    }
+    if (got.it_value.tv_sec == 0 && got.it_value.tv_nsec == 0) {
+        return fail("timer_gettime-armed-zero");
+    }
+    memset(&its, 0, sizeof(its));
+    if (syscall(SYS_timer_settime, id, 0, &its, NULL) != 0) {
+        return fail("timer_settime-disarm");
+    }
+    if (syscall(SYS_timer_gettime, id, &got) != 0) {
+        return fail("timer_gettime-disarmed");
+    }
+    if (got.it_value.tv_sec != 0 || got.it_value.tv_nsec != 0) {
+        return fail("timer_gettime-disarmed-armed");
+    }
+    if (syscall(SYS_timer_delete, id) != 0) {
+        return fail("timer_delete");
+    }
+    errno = 0;
+    if (syscall(SYS_timer_gettime, id, &got) != -1 || errno != EINVAL) {
+        return fail("timer_gettime-deleted");
+    }
+    errno = 0;
+    if (syscall(SYS_timer_delete, (timer_t)-1) != -1 || errno != EINVAL) {
+        return fail("timer_delete-invalid");
+    }
+    ASSERT("time-timer", "TIMER_ARM_READ_BACK_AND_DELETE");
+
+    /* A SIGEV_NONE timer is never queued, so common_timer_get() does *not*
+     * take that early return: it falls through to timer_remaining(), which
+     * subtracts now from the hrtimer expiry left behind by the cancel.  The
+     * disarmed timer therefore reports the remainder it had at the disarm
+     * (and the new interval, which is zero), not zero. */
+    memset(&event, 0, sizeof(event));
+    event.sigev_notify = SIGEV_NONE;
+    if (syscall(SYS_timer_create, CLOCK_MONOTONIC, &event, &id) != 0) {
+        return fail("time-timer-none-create");
+    }
+    errno = 0;
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_sec = 3600;
+    if (syscall(SYS_timer_settime, id, 0, &its, NULL) != 0) {
+        return fail("time-timer-none-arm");
+    }
+    memset(&its, 0, sizeof(its));
+    if (syscall(SYS_timer_settime, id, 0, &its, NULL) != 0) {
+        return fail("time-timer-none-disarm");
+    }
+    if (syscall(SYS_timer_gettime, id, &got) != 0) {
+        return fail("time-timer-none-read");
+    }
+    if (got.it_value.tv_sec == 0 && got.it_value.tv_nsec == 0) {
+        return fail("time-timer-none-stale-zero");
+    }
+    if (got.it_interval.tv_sec != 0 || got.it_interval.tv_nsec != 0) {
+        return fail("time-timer-none-interval");
+    }
+    if (syscall(SYS_timer_delete, id) != 0) {
+        return fail("time-timer-none-delete");
+    }
+    ASSERT("time-timer", "SIGEV_NONE_DISARM_REPORTS_STALE_EXPIRY");
+
+    tfd = (int)syscall(SYS_timerfd_create, CLOCK_MONOTONIC,
+                       TFD_CLOEXEC | TFD_NONBLOCK);
+    if (tfd < 0) {
+        return fail("timerfd_create");
+    }
+    errno = 0;
+    if (syscall(SYS_timerfd_create, -1, 0) != -1 || errno != EINVAL) {
+        return fail("timerfd_create-clock-einval");
+    }
+    errno = 0;
+    if (syscall(SYS_timerfd_create, CLOCK_MONOTONIC, 0x8) != -1 || errno != EINVAL) {
+        return fail("timerfd_create-flag-einval");
+    }
+    if (syscall(SYS_timerfd_gettime, tfd, &got) != 0) {
+        return fail("timerfd_gettime-disarmed");
+    }
+    if (got.it_value.tv_sec != 0 || got.it_value.tv_nsec != 0) {
+        return fail("timerfd_gettime-disarmed-armed");
+    }
+    memset(&its, 0, sizeof(its));
+    its.it_value.tv_sec = 3600;
+    if (syscall(SYS_timerfd_settime, tfd, 0, &its, NULL) != 0) {
+        return fail("timerfd_settime");
+    }
+    if (syscall(SYS_timerfd_gettime, tfd, &got) != 0) {
+        return fail("timerfd_gettime-armed");
+    }
+    if (got.it_value.tv_sec == 0 && got.it_value.tv_nsec == 0) {
+        return fail("timerfd_gettime-armed-zero");
+    }
+    if (close(tfd) != 0) {
+        return fail("timerfd-close");
+    }
+    errno = 0;
+    if (syscall(SYS_timerfd_gettime, tfd, &got) != -1 || errno != EBADF) {
+        return fail("timerfd_gettime-ebadf");
+    }
+    ASSERT("time-timer", "TIMERFD_ARM_READ_BACK");
+
+    RESULT("time-timer");
+    return 0;
+}
+
 static int case_timer_getoverrun(void) {
     struct sigevent event;
     timer_t id = (timer_t)-1;
@@ -1538,7 +1770,8 @@ int main(void) {
     if (case_gettimeofday() || case_settimeofday() || case_clock_settime() ||
         case_clock_getres() || case_clock_nanosleep() || case_adjtimex() ||
         case_clock_adjtime() || case_timer_create() ||
-        case_timer_getoverrun() || case_settimeofday_unprivileged()) {
+        case_timer_getoverrun() || case_settimeofday_unprivileged() ||
+        case_time_timer()) {
         return 1;
     }
     puts("THEKERNEL_TIME_ABI_OK");

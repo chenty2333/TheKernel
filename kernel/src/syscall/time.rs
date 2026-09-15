@@ -1079,6 +1079,19 @@ pub fn sys_timer_settime<M: UserMemory + ?Sized>(
             tai_absolute.then_some(value),
             tai_generation.map_or(0, |(_, generation)| generation),
         );
+        // Linux cancels the hrtimer without clearing its expiry, and a
+        // SIGEV_NONE timer reads that stale remainder back rather than zero
+        // (`kernel/time/posix-timers.c:696-707`).  A timer with a real
+        // delivery mode returns early with a zeroed setting instead, and so
+        // does one that was never armed.
+        timer.stale_deadline = if value.is_zero()
+            && matches!(timer.notify, PosixTimerNotify::None)
+            && !cpu_clock
+        {
+            timer.deadline
+        } else {
+            None
+        };
         timer.deadline = deadline;
         let main_publication = if let Some(deadline) = deadline {
             timer.prepare_main_alarm(
