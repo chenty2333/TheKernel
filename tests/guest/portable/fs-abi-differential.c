@@ -166,6 +166,20 @@ static void cleanup(void) {
         (void)unlinkat(dirfd, "file", 0);
         (void)unlinkat(dirfd, "fifo", 0);
         (void)unlinkat(dirfd, "basic", 0);
+        (void)unlinkat(dirfd, "pdir/pfile", 0);
+        (void)unlinkat(dirfd, "pdir/plink", 0);
+        (void)unlinkat(dirfd, "pdir/phard", 0);
+        (void)unlinkat(dirfd, "pdir/pren2", 0);
+        char p_abs[256];
+        const char *names[] = { "pname", "prenamed", "plinked" };
+        for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            snprintf(p_abs, sizeof(p_abs), "%s/%s", root, names[i]);
+            (void)unlink(p_abs);
+        }
+        (void)unlinkat(dirfd, "pdir/psub/inner", 0);
+        (void)unlinkat(dirfd, "pdir/psub", AT_REMOVEDIR);
+        (void)unlinkat(dirfd, "pdir/pfifo", 0);
+        (void)unlinkat(dirfd, "pdir", AT_REMOVEDIR);
         (void)close(dirfd);
     }
     (void)rmdir(mnt);
@@ -2031,6 +2045,143 @@ int main(void) {
 
         check(close(fd) == 0, "final-close");
         check(unlinkat(dirfd, "basic", 0) == 0, "unlink-basic");
+    }
+    done();
+
+    /* ------------------------------------------------------------------ *
+     * The pathname syscalls -- the directory walk, the link family and the
+     * mode and owner changes -- likewise appeared only as setup elsewhere.
+     * Rules below are from fs/namei.c, fs/open.c and fs/stat.c.
+     * ------------------------------------------------------------------ */
+    begin("fs-path.raw-differential");
+    {
+        char buf[256], target[256];
+        struct stat st;
+        int fds[2];
+        check(mkdirat(dirfd, "pdir", 0700) == 0, "mkdirat");
+        ERROR(mkdirat(dirfd, "pdir", 0700), EEXIST, "mkdirat-again");
+        int pdir = openat(dirfd, "pdir", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        check(pdir >= 0, "pdir-open");
+
+        /* fs/open.c do_sys_open(): O_CREAT|O_EXCL on an existing name is
+         * EEXIST, and the descriptor is usable. */
+        int pf = openat(pdir, "pfile", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+        check(pf >= 0, "openat-excl");
+        ERROR(openat(pdir, "pfile", O_CREAT | O_EXCL | O_RDWR), EEXIST, "excl-again");
+        check(write(pf, "p", 1) == 1, "pfile-write");
+        mark("OPEN_CREATE_EXCLUSIVE");
+
+        /* fs/readdir.c: getdents(2) and getdents64(2) share one walker and
+         * both refuse a regular file. */
+        check(syscall(SYS_getdents64, pdir, buf, sizeof(buf)) > 0, "getdents64-dir");
+        check(lseek(pdir, 0, SEEK_SET) == 0, "pdir-rewind");
+        check(syscall(SYS_getdents, pdir, buf, sizeof(buf)) > 0, "getdents-dir");
+        ERROR(syscall(SYS_getdents64, pf, buf, sizeof(buf)), ENOTDIR, "getdents64-file");
+        ERROR(syscall(SYS_getdents, pf, buf, sizeof(buf)), ENOTDIR, "getdents-file");
+        mark("DIRECTORY_WALK");
+
+        /* fs/open.c: pipe(2) creates a seekable-free pair. */
+        check(pipe(fds) == 0, "pipe");
+        check(write(fds[1], "p", 1) == 1 && read(fds[0], buf, 1) == 1, "pipe-io");
+        ERROR(lseek(fds[0], 0, SEEK_SET), ESPIPE, "pipe-ESPIPE");
+        check(close(fds[0]) == 0 && close(fds[1]) == 0, "pipe-close");
+        mark("PIPE_PAIR");
+
+        /* fs/namei.c: a hard link and a symlink are distinct, and readlink
+         * refuses anything that is not a symbolic link. */
+        check(symlinkat("pfile", pdir, "plink") == 0, "symlinkat");
+        check(linkat(pdir, "pfile", pdir, "phard", 0) == 0, "linkat");
+        check(fstatat(pdir, "phard", &st, 0) == 0 && st.st_nlink == 2, "hard-link-count");
+        memset(target, 0, sizeof(target));
+        check(readlinkat(pdir, "plink", target, sizeof(target)) == 5 &&
+              memcmp(target, "pfile", 5) == 0, "readlinkat");
+        ERROR(readlinkat(pdir, "pfile", target, sizeof(target)), EINVAL, "readlink-not-link");
+        ERROR(readlinkat(pdir, "pmissing", target, sizeof(target)), ENOENT, "readlink-absent");
+        mark("LINK_AND_SYMLINK");
+
+        /* fs/namei.c: RENAME_NOREPLACE refuses an existing destination, the
+         * ordinary rename replaces it, and unlinkat(AT_REMOVEDIR) removes a
+         * directory while plain unlinkat(2) on one is EISDIR. */
+        check(renameat(pdir, "phard", pdir, "pren") == 0, "renameat");
+        check(renameat2(pdir, "pren", pdir, "pfile", RENAME_NOREPLACE) == -1 &&
+              errno == EEXIST, "renameat2-noreplace");
+        check(renameat2(pdir, "pren", pdir, "pren2", RENAME_NOREPLACE) == 0,
+              "renameat2-move");
+        ERROR(unlinkat(pdir, "pren2", AT_REMOVEDIR), ENOTDIR, "unlinkat-dir-as-file");
+        ERROR(renameat2(pdir, "pren2", pdir, "pren", 0x8), EINVAL, "renameat2-bad-flag");
+        mark("RENAME_RULES");
+
+        /* fs/open.c chmod_common()/chown_common(): the mode and owner
+         * round-trip, and both refuse an absent path. */
+        check(fchmodat(pdir, "pfile", 0640, 0) == 0, "fchmodat");
+        check(fstatat(pdir, "pfile", &st, 0) == 0 && (st.st_mode & 07777) == 0640,
+              "fchmodat-mode");
+        check(fchmod(pf, 0604) == 0, "fchmod");
+        check(fstat(pf, &st) == 0 && (st.st_mode & 07777) == 0604, "fchmod-mode");
+        check(fchownat(pdir, "pfile", 0, 0, 0) == 0, "fchownat");
+        check(fchown(pf, 0, 0) == 0, "fchown");
+        ERROR(fchmodat(pdir, "pmissing", 0600, 0), ENOENT, "fchmodat-absent");
+        mark("MODE_AND_OWNER");
+
+        /* fs/namei.c do_mknodat(): a FIFO is creatable and a duplicate name
+         * is EEXIST. */
+        check(mknodat(pdir, "pfifo", S_IFIFO | 0600, 0) == 0, "mknodat-fifo");
+        check(fstatat(pdir, "pfifo", &st, 0) == 0 && S_ISFIFO(st.st_mode), "mknodat-type");
+        ERROR(mknodat(pdir, "pfifo", S_IFIFO | 0600, 0), EEXIST, "mknodat-again");
+        mark("MKNOD_TYPES");
+
+        /* fs/namei.c: rmdir(2) refuses a populated directory, and chdir(2)
+         * followed by fchdir(2) lands back on the same inode. */
+        check(mkdirat(pdir, "psub", 0700) == 0, "psub-mkdir");
+        int inner = openat(pdir, "psub/inner", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+        check(inner >= 0, "psub-inner");
+        check(close(inner) == 0, "psub-inner-close");
+        ERROR(unlinkat(pdir, "psub", AT_REMOVEDIR), ENOTEMPTY, "removedir-populated");
+        check(unlinkat(pdir, "psub/inner", 0) == 0, "psub-inner-unlink");
+        check(unlinkat(pdir, "psub", AT_REMOVEDIR) == 0, "removedir-empty");
+        snprintf(buf, sizeof(buf), "%s/pdir", root);
+        check(chdir(buf) == 0, "chdir");
+        check(chdir("/") == 0, "chdir-root");
+        check(fchdir(pdir) == 0, "fchdir");
+        check(fchdir(dirfd) == 0, "fchdir-back");
+        mark("DIRECTORY_NAVIGATION");
+
+        /* fs/namei.c: the pathname-only forms share one implementation with
+         * the descriptor-relative family, so exercise them through absolute
+         * paths. */
+        {
+            char pa[256], pb[256], pc[256];
+            snprintf(pa, sizeof(pa), "%s/pname", root);
+            snprintf(pb, sizeof(pb), "%s/prenamed", root);
+            snprintf(pc, sizeof(pc), "%s/plinked", root);
+            int of = open(pa, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+            check(of >= 0, "open-path");
+            check(close(of) == 0, "open-path-close");
+            check(chmod(pa, 0640) == 0, "chmod-path");
+            check(stat(pa, &st) == 0 && (st.st_mode & 07777) == 0640, "chmod-path-mode");
+            check(chown(pa, 0, 0) == 0, "chown-path");
+            check(lchown(pa, 0, 0) == 0, "lchown-path");
+            ERROR(readlink(pa, target, sizeof(target)), EINVAL, "readlink-path-not-link");
+            check(rename(pa, pb) == 0, "rename-path");
+            check(link(pb, pc) == 0, "link-path");
+            check(symlink(pb, pa) == 0, "symlink-path");
+            memset(target, 0, sizeof(target));
+            check(readlink(pa, target, sizeof(target)) == (ssize_t)strlen(pb),
+                  "readlink-path");
+            check(unlink(pa) == 0, "unlink-symlink");
+            check(unlink(pc) == 0, "unlink-hardlink");
+            check(unlink(pb) == 0, "unlink-path");
+            check(mkdir(pa, 0700) == 0, "mkdir-path");
+            check(rmdir(pa) == 0, "rmdir-path");
+        }
+        mark("PATHNAME_ONLY_FORMS");
+
+        check(close(pf) == 0, "pfile-close");
+        check(unlinkat(pdir, "pfifo", 0) == 0, "unlink-pfifo");
+        check(unlinkat(pdir, "plink", 0) == 0, "unlink-plink");
+        check(unlinkat(pdir, "pren2", 0) == 0, "unlink-pren2");
+        check(unlinkat(pdir, "pfile", 0) == 0, "unlink-pfile");
+        check(close(pdir) == 0, "pdir-close");
     }
     done();
 

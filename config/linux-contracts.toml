@@ -4616,8 +4616,8 @@ status = "implemented"
 contract = "linux-open"
 handler = "kernel/src/syscall/fs/fd_ops.rs:sys_open"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/fd_ops.rs:creat_is_the_x86_64_openat_alias"]
-validation_gaps = ["Existing source/helper coverage does not establish the full open raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/fd_ops.rs:creat_is_the_x86_64_openat_alias", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -4892,8 +4892,8 @@ status = "implemented"
 contract = "linux-chdir"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_chdir"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax"]
-validation_gaps = ["Existing source/helper coverage does not establish the full chdir raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -4915,8 +4915,8 @@ status = "implemented"
 contract = "linux-fchdir"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_fchdir"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax"]
-validation_gaps = ["Existing source/helper coverage does not establish the full fchdir raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -4961,8 +4961,8 @@ status = "implemented"
 contract = "linux-mkdir"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_mkdir"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax"]
-validation_gaps = ["Existing source/helper coverage does not establish the full mkdir raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -4984,8 +4984,8 @@ status = "implemented"
 contract = "linux-mkdirat"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_mkdirat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax"]
-validation_gaps = ["Existing source/helper coverage does not establish the full mkdirat raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5007,8 +5007,8 @@ status = "implemented"
 contract = "linux-mknodat"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_mknodat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax"]
-validation_gaps = ["Existing source/helper coverage does not establish the full mknodat raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5030,8 +5030,8 @@ status = "implemented"
 contract = "linux-getdents"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_getdents"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax"]
-validation_gaps = ["Existing source/helper coverage does not establish the full getdents raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:named_create_preserves_trailing_and_special_terminal_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5076,8 +5076,8 @@ status = "implemented"
 contract = "linux-link"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_link"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:unlink_target_resolution_never_retargets_trailing_or_dot_syntax"]
-validation_gaps = ["Existing source/helper coverage does not establish the full link raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:unlink_target_resolution_never_retargets_trailing_or_dot_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5099,8 +5099,8 @@ status = "implemented"
 contract = "linux-linkat"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_linkat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:unlink_target_resolution_never_retargets_trailing_or_dot_syntax"]
-validation_gaps = ["Existing source/helper coverage does not establish the full linkat raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:unlink_target_resolution_never_retargets_trailing_or_dot_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5122,8 +5122,8 @@ status = "implemented"
 contract = "linux-unlink"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_unlink"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:unlink_target_resolution_never_retargets_trailing_or_dot_syntax"]
-validation_gaps = ["Existing source/helper coverage does not establish the full unlink raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:unlink_target_resolution_never_retargets_trailing_or_dot_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5145,8 +5145,8 @@ status = "implemented"
 contract = "linux-unlinkat"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_unlinkat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:unlink_target_resolution_never_retargets_trailing_or_dot_syntax"]
-validation_gaps = ["Existing source/helper coverage does not establish the full unlinkat raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:unlink_target_resolution_never_retargets_trailing_or_dot_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5168,8 +5168,8 @@ status = "implemented"
 contract = "linux-rmdir"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_rmdir"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:unlink_target_resolution_never_retargets_trailing_or_dot_syntax"]
-validation_gaps = ["Existing source/helper coverage does not establish the full rmdir raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:unlink_target_resolution_never_retargets_trailing_or_dot_syntax", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5191,8 +5191,8 @@ status = "implemented"
 contract = "linux-symlink"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_symlink"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:symlink_target_uses_linux_empty_and_path_max_rules_without_name_max"]
-validation_gaps = ["Existing source/helper coverage does not establish the full symlink raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:symlink_target_uses_linux_empty_and_path_max_rules_without_name_max", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5214,8 +5214,8 @@ status = "implemented"
 contract = "linux-symlinkat"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_symlinkat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:symlink_target_uses_linux_empty_and_path_max_rules_without_name_max"]
-validation_gaps = ["Existing source/helper coverage does not establish the full symlinkat raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:symlink_target_uses_linux_empty_and_path_max_rules_without_name_max", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5237,8 +5237,8 @@ status = "implemented"
 contract = "linux-readlink"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_readlink"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:symlink_target_uses_linux_empty_and_path_max_rules_without_name_max"]
-validation_gaps = ["Existing source/helper coverage does not establish the full readlink raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:symlink_target_uses_linux_empty_and_path_max_rules_without_name_max", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5260,8 +5260,8 @@ status = "implemented"
 contract = "linux-readlinkat"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_readlinkat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:symlink_target_uses_linux_empty_and_path_max_rules_without_name_max"]
-validation_gaps = ["Existing source/helper coverage does not establish the full readlinkat raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:symlink_target_uses_linux_empty_and_path_max_rules_without_name_max", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5283,8 +5283,8 @@ status = "implemented"
 contract = "linux-chown"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_chown"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer"]
-validation_gaps = ["Existing source/helper coverage does not establish the full chown raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5306,8 +5306,8 @@ status = "implemented"
 contract = "linux-lchown"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_lchown"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer"]
-validation_gaps = ["Existing source/helper coverage does not establish the full lchown raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5329,8 +5329,8 @@ status = "implemented"
 contract = "linux-fchown"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_fchown"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer"]
-validation_gaps = ["Existing source/helper coverage does not establish the full fchown raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5352,8 +5352,8 @@ status = "implemented"
 contract = "linux-fchownat"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_fchownat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer"]
-validation_gaps = ["Existing source/helper coverage does not establish the full fchownat raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5375,8 +5375,8 @@ status = "implemented"
 contract = "linux-chmod"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_chmod"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer"]
-validation_gaps = ["Existing source/helper coverage does not establish the full chmod raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5398,8 +5398,8 @@ status = "implemented"
 contract = "linux-fchmod"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_fchmod"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer"]
-validation_gaps = ["Existing source/helper coverage does not establish the full fchmod raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5421,8 +5421,8 @@ status = "implemented"
 contract = "linux-fchmodat"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_fchmodat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer"]
-validation_gaps = ["Existing source/helper coverage does not establish the full fchmodat raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:metadata_syscalls_reject_invalid_flags_before_faulting_the_path_pointer", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5536,8 +5536,8 @@ status = "implemented"
 contract = "linux-rename"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_rename"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:renameat_preserves_special_components_and_noreplace_errno"]
-validation_gaps = ["Existing source/helper coverage does not establish the full rename raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:renameat_preserves_special_components_and_noreplace_errno", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5559,8 +5559,8 @@ status = "implemented"
 contract = "linux-renameat"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_renameat"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:renameat_preserves_special_components_and_noreplace_errno"]
-validation_gaps = ["Existing source/helper coverage does not establish the full renameat raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:renameat_preserves_special_components_and_noreplace_errno", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -5582,8 +5582,8 @@ status = "implemented"
 contract = "linux-renameat2"
 handler = "kernel/src/syscall/fs/ctl.rs:sys_renameat2"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/ctl.rs:renameat_preserves_special_components_and_noreplace_errno"]
-validation_gaps = ["Existing source/helper coverage does not establish the full renameat2 raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/syscall/fs/ctl.rs:renameat_preserves_special_components_and_noreplace_errno", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6364,8 +6364,8 @@ status = "implemented"
 contract = "linux-pipe"
 handler = "kernel/src/syscall/fs/pipe.rs:sys_pipe2"
 conditional = "explicit-none"
-tests = ["kernel/src/file/pipe.rs:one_write_uses_one_nonblocking_snapshot"]
-validation_gaps = ["Existing source/helper coverage does not establish the full pipe raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["kernel/src/file/pipe.rs:one_write_uses_one_nonblocking_snapshot", "tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -6502,8 +6502,8 @@ status = "implemented"
 contract = "linux-mknod"
 handler = "kernel/src/syscall/dispatch.rs:compat_mknod"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["Existing source/helper coverage does not establish the full mknod raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
+tests = ["tests/guest/portable/fs-abi-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
