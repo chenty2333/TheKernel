@@ -717,6 +717,14 @@ pub(crate) struct AdmittedChmodSetattr<'policy, 'context, 'location> {
 
 impl<'context, 'location> AdmittedChmodSetattr<'_, 'context, 'location> {
     pub(crate) fn prepare(self) -> AxResult<PreparedInodeSetattr<'context, 'location>> {
+        // `mm/shmem.c:shmem_setattr()` runs this after `setattr_prepare()`'s
+        // DAC admission and before applying anything: with `F_SEAL_EXEC`, a
+        // requested mode whose execute bits differ from the inode's is
+        // `-EPERM`. Placing it here keeps an EACCES from the DAC checks first.
+        crate::file::memfd::check_sealed_exec_mode(
+            self.location,
+            self.after_hook.0.plan.request().mode(),
+        )?;
         let prepared = self.after_hook.prepare()?;
         Ok(PreparedInodeSetattr {
             admission: self.admission,

@@ -1192,6 +1192,15 @@ fn userfaultfd_mapping_epoch_lookup_fails_closed_on_inconsistent_fragments() {
 
 #[test]
 fn userfaultfd_create_and_api_negotiation_preserve_linux_error_classes() {
+    let unprivileged = UffdAdmissionFacts {
+        capable_sys_ptrace: false,
+        sysctl_unprivileged_userfaultfd: false,
+        kernel_mode_fault_delivery: true,
+    };
+    let privileged = UffdAdmissionFacts {
+        capable_sys_ptrace: true,
+        ..unprivileged
+    };
     assert_eq!(
         UffdCreateFlags::from_bits(1 << 4),
         Err(MmError::InvalidUffdFlags)
@@ -1199,12 +1208,18 @@ fn userfaultfd_create_and_api_negotiation_preserve_linux_error_classes() {
     assert_eq!(
         UffdCreateFlags::from_bits(UFFD_O_CLOEXEC)
             .unwrap()
-            .validate_profile(),
+            .admit_creation(unprivileged),
         Err(MmError::AccessDenied)
+    );
+    assert_eq!(
+        UffdCreateFlags::from_bits(UFFD_O_CLOEXEC)
+            .unwrap()
+            .admit_creation(privileged),
+        Ok(UffdCreateFlags::from_bits(UFFD_O_CLOEXEC).unwrap())
     );
     let flags = UffdCreateFlags::from_bits(UFFD_USER_MODE_ONLY | UFFD_O_NONBLOCK | UFFD_O_CLOEXEC)
         .unwrap()
-        .validate_profile()
+        .admit_creation(unprivileged)
         .unwrap();
     assert!(flags.user_mode_only());
     assert!(flags.nonblocking());

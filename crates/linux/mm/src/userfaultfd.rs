@@ -27,7 +27,7 @@ impl UffdCreateFlags {
     /// UFFD_USER_MODE_ONLY.
     ///
     /// This is the Linux flag-namespace check only. Call
-    /// [Self::validate_profile] for the initial unprivileged profile gate.
+    /// [Self::admit_creation] for the permission gate.
     pub const fn from_bits(bits: u32) -> Result<Self, MmError> {
         if bits & !UFFD_CREATE_VALID_FLAGS != 0 {
             return Err(MmError::InvalidUffdFlags);
@@ -35,16 +35,14 @@ impl UffdCreateFlags {
         Ok(Self(bits))
     }
 
-    /// Requires the bounded first profile's UFFD_USER_MODE_ONLY flag.
+    /// The Linux creation-permission gate for this flag word.
     ///
-    /// [MmError::AccessDenied] is intentionally distinct from
-    /// [MmError::InvalidUffdFlags], allowing the syscall adapter to map a
-    /// missing user-mode-only gate to EPERM and unknown bits to EINVAL.
-    pub const fn validate_profile(self) -> Result<Self, MmError> {
-        if !self.user_mode_only() {
-            return Err(MmError::AccessDenied);
-        }
-        Ok(self)
+    /// [MmError::AccessDenied] and [MmError::UnsupportedUffdKernelFaults] are
+    /// intentionally distinct from [MmError::InvalidUffdFlags], allowing the
+    /// syscall adapter to map a refused creation to EPERM and unknown bits to
+    /// EINVAL.
+    pub const fn admit_creation(self, facts: UffdAdmissionFacts) -> Result<Self, MmError> {
+        admit_creation(self, facts)
     }
 
     /// Raw Linux flag bits.
@@ -65,6 +63,82 @@ impl UffdCreateFlags {
     /// Whether only user-mode page faults may be intercepted.
     pub const fn user_mode_only(self) -> bool {
         self.0 & UFFD_USER_MODE_ONLY != 0
+    }
+}
+
+/// Caller and kernel facts consulted by Linux's `userfaultfd(2)` permission
+/// gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UffdAdmissionFacts {
+    /// `capable(CAP_SYS_PTRACE)` in the initial user namespace.
+    pub capable_sys_ptrace: bool,
+    /// `sysctl_unprivileged_userfaultfd`, the `vm.unprivileged_userfaultfd`
+    /// sysctl as a boolean (Linux bounds it to 0 and 1; there is no value 2).
+    pub sysctl_unprivileged_userfaultfd: bool,
+    /// Whether this kernel delivers page faults taken in kernel mode — that
+    /// is, without `FAULT_FLAG_USER`, such as a `copy_to_user()` write into a
+    /// registered range — to a userfaultfd handler at all.  This is the *only*
+    /// capability `UFFD_USER_MODE_ONLY` withholds.
+    pub kernel_mode_fault_delivery: bool,
+}
+
+/// Linux v7.2.3 `mm/userfaultfd.c:userfaultfd_syscall_allowed()`, the first
+/// check in `SYSCALL_DEFINE1(userfaultfd)`:
+///
+/// ```c
+/// static inline bool userfaultfd_syscall_allowed(int flags)
+/// {
+/// 	/* Userspace-only page faults are always allowed */
+/// 	if (flags & UFFD_USER_MODE_ONLY)
+/// 		return true;
+///
+/// 	/*
+/// 	 * The user is requesting a userfaultfd which can handle kernel faults.
+/// 	 * Privileged users are always allowed to do this.
+/// 	 */
+/// 	if (capable(CAP_SYS_PTRACE))
+/// 		return true;
+///
+/// 	/* Otherwise, access to kernel fault handling is sysctl controlled. */
+/// 	return sysctl_unprivileged_userfaultfd;
+/// }
+/// ```
+///
+/// Two properties of that order are ABI-visible.  The gate runs *before*
+/// `from_bits()`, so an unprivileged caller whose creation is refused gets
+/// `-EPERM` even when the flag word also contains an unknown bit; and
+/// `capable(CAP_SYS_PTRACE)` is checked against the initial user namespace
+/// (`capable()`, not `ns_capable()`), so it ignores the tunable.
+///
+/// A kernel that cannot deliver kernel-mode faults must not admit the
+/// privileged half of this gate: the resulting context would silently fail to
+/// intercept the very faults the caller asked to intercept.  Such a kernel
+/// reports the same `-EPERM` Linux reports for an unprivileged caller, which
+/// is what a Linux built without kernel-fault delivery would have to do.
+///
+/// The raw word is passed unchanged so that the gate can run before flag
+/// validation, exactly as it does in Linux.
+pub const fn admit_raw_creation(raw_flags: u32, facts: UffdAdmissionFacts) -> Result<(), MmError> {
+    if raw_flags & UFFD_USER_MODE_ONLY != 0 {
+        return Ok(());
+    }
+    if !facts.capable_sys_ptrace && !facts.sysctl_unprivileged_userfaultfd {
+        return Err(MmError::AccessDenied);
+    }
+    if !facts.kernel_mode_fault_delivery {
+        return Err(MmError::UnsupportedUffdKernelFaults);
+    }
+    Ok(())
+}
+
+/// [`admit_raw_creation`] for an already validated flag word.
+pub const fn admit_creation(
+    flags: UffdCreateFlags,
+    facts: UffdAdmissionFacts,
+) -> Result<UffdCreateFlags, MmError> {
+    match admit_raw_creation(flags.bits(), facts) {
+        Ok(()) => Ok(flags),
+        Err(error) => Err(error),
     }
 }
 

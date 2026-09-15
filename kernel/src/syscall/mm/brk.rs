@@ -1,15 +1,27 @@
 use axerrno::AxResult;
 use axhal::paging::MappingFlags;
 use axtask::current;
-use linux_raw_sys::general::{CAP_IPC_LOCK, RLIM_INFINITY, RLIMIT_DATA};
+use linux_raw_sys::general::{CAP_IPC_LOCK, RLIMIT_DATA};
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr, align_up_4k};
+use tk_linux_mm::{BrkAdmission, classify_brk};
 
 use super::mmap::check_mmap_memlock_limit;
 use crate::{
-    config::USER_HEAP_SIZE_MAX,
+    config::{USER_SPACE_BASE, USER_SPACE_SIZE},
     mm::{DeferredUffdWake, check_memory_overcommit, check_rlimit_as_growth},
     task::AsThread,
 };
+
+/// The highest address `brk` may reach, matching this kernel's address-space
+/// upper bound.
+///
+/// Linux bounds growth with `check_brk_limits()` →
+/// `get_unmapped_area(NULL, addr, len, 0, MAP_FIXED)`, whose only fixed-size
+/// test is `len > mmap_end - mmap_min_addr` against the architecture
+/// `TASK_SIZE`.  This kernel expresses the same bound as the end of its user
+/// address space; it has no `vm.mmap_min_addr` floor of its own, and the floor
+/// cannot matter here because the heap starts far above any such floor.
+const USER_ADDRESS_SPACE_END: usize = USER_SPACE_BASE + USER_SPACE_SIZE;
 
 /// Executes the real heap-VMA transaction. PR_SET_MM uses `publish_layout =
 /// false` so its one final layout replacement remains atomic with respect to
@@ -19,25 +31,43 @@ pub(crate) fn sys_brk_transaction(addr: usize, publish_layout: bool) -> AxResult
     let proc_data = &curr.as_thread().proc_data;
     let current_top = proc_data.get_heap_top() as usize;
     let heap_base = proc_data.heap_base();
-    let heap_limit = heap_base + USER_HEAP_SIZE_MAX;
     let initial_heap_end = proc_data.heap_initial_end();
 
     if addr == 0 {
         return Ok(current_top as isize);
     }
 
-    if addr < initial_heap_end || addr > heap_limit {
-        return Ok(current_top as isize);
-    }
-
-    // Linux accounts the complete data segment before page rounding, so an
-    // unaligned request cannot step over RLIMIT_DATA merely because it shares
-    // an already mapped final page.  The initial program data ends at the
-    // heap base in this address-space model.
+    // Linux `SYSCALL_DEFINE1(brk)` checks, in order: `brk < min_brk`,
+    // `check_data_rlimit()` against RLIMIT_DATA, then the
+    // unchanged-page/shrink shortcuts, and only then `check_brk_limits()` for
+    // growth.  There is no kernel-internal ceiling on the heap: an earlier
+    // iteration capped growth at heap_base + 512MiB here, which rejected
+    // requests Linux accepts whenever RLIMIT_DATA and the address space still
+    // had room.  `end_data == start_data == heap_base` in this model, so
+    // RLIMIT_DATA accounts the whole heap and no separate data segment.
     let data_limit = proc_data.rlim.read()[RLIMIT_DATA].current;
-    let data_size = addr.saturating_sub(heap_base) as u64;
-    if data_limit != RLIM_INFINITY as i64 as u64 && data_size > data_limit {
+    // Every limit failure in Linux `SYSCALL_DEFINE1(brk)` reaches the same
+    // `out:` label, which restores `mm->brk` to `origbrk` and returns it, so a
+    // rejected request is not an error — it is an unchanged break.
+    let Ok(admission) = classify_brk(
+        addr as u64,
+        current_top as u64,
+        initial_heap_end as u64,
+        data_limit,
+        heap_base as u64,
+        heap_base as u64,
+        heap_base as u64,
+        PAGE_SIZE_4K as u64,
+        USER_ADDRESS_SPACE_END as u64,
+        0,
+    ) else {
         return Ok(current_top as isize);
+    };
+    match admission {
+        BrkAdmission::BelowMinimum | BrkAdmission::DataLimit => {
+            return Ok(current_top as isize);
+        }
+        BrkAdmission::Shrink | BrkAdmission::Grow { .. } => {}
     }
 
     let new_top_aligned = align_up_4k(addr);

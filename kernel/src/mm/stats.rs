@@ -15,6 +15,26 @@ const OVERCOMMIT_RATIO_DEFAULT: u32 = 50;
 static OVERCOMMIT_MEMORY: AtomicU32 = AtomicU32::new(OVERCOMMIT_MEMORY_DEFAULT);
 static OVERCOMMIT_RATIO: AtomicU32 = AtomicU32::new(OVERCOMMIT_RATIO_DEFAULT);
 
+/// `vm.unprivileged_userfaultfd` bounds.
+///
+/// Linux v7.2.3 declares the sysctl in `mm/userfaultfd.c` with
+/// `extra1 = SYSCTL_ZERO, extra2 = SYSCTL_ONE`, so unlike `vm.memfd_noexec`
+/// there is no value 2, and the default is the plain-zero initialiser.
+const UNPRIVILEGED_USERFAULTFD_DEFAULT: u32 = 0;
+const UNPRIVILEGED_USERFAULTFD_MAX: u32 = 1;
+
+static UNPRIVILEGED_USERFAULTFD: AtomicU32 = AtomicU32::new(UNPRIVILEGED_USERFAULTFD_DEFAULT);
+
+/// `vm.memfd_noexec` bounds, matching Linux's `SYSCTL_ZERO`/`SYSCTL_TWO`.
+///
+/// Linux stores this per pid namespace and reads it with
+/// `pidns_memfd_noexec_scope()` (the maximum over the namespace chain).  This
+/// kernel has one pid namespace, so the stored value is the scope.
+const MEMFD_NOEXEC_SCOPE_DEFAULT: u32 = 0;
+const MEMFD_NOEXEC_SCOPE_MAX: u32 = 2;
+
+static MEMFD_NOEXEC_SCOPE: AtomicU32 = AtomicU32::new(MEMFD_NOEXEC_SCOPE_DEFAULT);
+
 /// Snapshot of system-wide memory statistics backed by the page allocator.
 #[derive(Debug, Clone, Copy)]
 pub struct SystemMemoryStats {
@@ -88,6 +108,37 @@ pub fn set_overcommit_memory_policy(value: u32) -> AxResult<()> {
         return Err(AxError::InvalidInput);
     }
     OVERCOMMIT_MEMORY.store(value, Ordering::Relaxed);
+    Ok(())
+}
+
+/// `vm.memfd_noexec`, the scope Linux's `pidns_memfd_noexec_scope()` returns.
+pub fn memfd_noexec_scope() -> u32 {
+    MEMFD_NOEXEC_SCOPE.load(Ordering::Relaxed)
+}
+
+/// Writes `vm.memfd_noexec`.  Linux bounds the value to `0..=2`; the
+/// CAP_SYS_ADMIN gate and the parent-scope clamp live in the sysctl handler.
+pub fn set_memfd_noexec_scope(value: u32) -> AxResult<()> {
+    if value > MEMFD_NOEXEC_SCOPE_MAX {
+        return Err(AxError::InvalidInput);
+    }
+    MEMFD_NOEXEC_SCOPE.store(value, Ordering::Relaxed);
+    Ok(())
+}
+
+/// `vm.unprivileged_userfaultfd`, read as the boolean Linux's
+/// `userfaultfd_syscall_allowed()` tests.
+pub fn unprivileged_userfaultfd() -> bool {
+    UNPRIVILEGED_USERFAULTFD.load(Ordering::Relaxed) != 0
+}
+
+/// Writes `vm.unprivileged_userfaultfd`.  Linux bounds the value to `0..=1`
+/// and refuses anything else with `-EINVAL`.
+pub fn set_unprivileged_userfaultfd(value: u32) -> AxResult<()> {
+    if value > UNPRIVILEGED_USERFAULTFD_MAX {
+        return Err(AxError::InvalidInput);
+    }
+    UNPRIVILEGED_USERFAULTFD.store(value, Ordering::Relaxed);
     Ok(())
 }
 

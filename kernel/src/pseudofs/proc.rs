@@ -50,10 +50,11 @@ use crate::{
         set_key_root_maxkeys,
     },
     mm::{
-        AddrSpace, Backend, BackendOps, commit_limit_bytes, committed_as_bytes,
+        AddrSpace, Backend, BackendOps, commit_limit_bytes, committed_as_bytes, memfd_noexec_scope,
         memory_pressure_snapshot, memory_watermarks, overcommit_memory_policy, overcommit_ratio,
-        set_overcommit_memory_policy, set_overcommit_ratio,
-        system_memory_stats_with_reclaimable_file_cache, user_io_pin_counters_snapshot,
+        set_memfd_noexec_scope, set_overcommit_memory_policy, set_overcommit_ratio,
+        set_unprivileged_userfaultfd, system_memory_stats_with_reclaimable_file_cache,
+        unprivileged_userfaultfd, user_io_pin_counters_snapshot,
     },
     mounts,
     perf_security::{
@@ -4080,6 +4081,69 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
                             }
                             let value = write_proc_u32(data)?;
                             set_overcommit_ratio(value);
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+
+            // Linux v7.2.3 `mm/userfaultfd.c`: mode 0644, bounds 0..=1,
+            // default 0.  It gates only creations that ask for kernel-mode
+            // fault handling without UFFD_USER_MODE_ONLY.
+            vm.add(
+                "unprivileged_userfaultfd",
+                SimpleFile::new_regular(
+                    fs.clone(),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", u32::from(unprivileged_userfaultfd()))
+                                .into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            let value = write_proc_u32(data)?;
+                            set_unprivileged_userfaultfd(value).map_err(LinuxError::from)?;
+                            Ok(None)
+                        }
+                    }),
+                ),
+            );
+
+            // Linux v7.2.3 `kernel/pid_sysctl.h`: mode 0644, bounds 0..=2, and
+            // writing requires CAP_SYS_ADMIN in the namespace's user
+            // namespace.  This kernel has a single pid namespace, so the
+            // scope is simply the stored value.
+            vm.add(
+                "memfd_noexec",
+                SimpleFile::new_regular_with_permission(
+                    fs.clone(),
+                    NodePermission::from_bits_truncate(0o644),
+                    RwFile::new(move |req| match req {
+                        SimpleFileOperation::Read => Ok(Some(
+                            alloc::format!("{}\n", memfd_noexec_scope()).into_bytes(),
+                        )),
+                        SimpleFileOperation::Write(data) => {
+                            if is_proc_truncate_write(data) {
+                                return Ok(None);
+                            }
+                            // `kernel/pid_sysctl.h:pid_mfd_noexec_dointvec_minmax()`
+                            // refuses the write without CAP_SYS_ADMIN in the
+                            // namespace's user namespace, and clamps the new
+                            // value to at least the parent namespace's scope.
+                            // With a single pid namespace the parent scope is
+                            // always 0, so only the capability check remains.
+                            // This is a global control, authorized by the
+                            // live caller on every write.
+                            let actor = current().as_thread().current_cred();
+                            if !actor.has_effective_capability_in_own_user_ns(
+                                linux_raw_sys::general::CAP_SYS_ADMIN,
+                            ) {
+                                return Err(AxError::OperationNotPermitted);
+                            }
+                            let value = write_proc_u32(data)?;
+                            set_memfd_noexec_scope(value).map_err(LinuxError::from)?;
                             Ok(None)
                         }
                     }),

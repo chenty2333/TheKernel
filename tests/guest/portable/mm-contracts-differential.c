@@ -9,14 +9,34 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/vfs.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 /* Native x86_64 syscall numbers, verified against Linux's syscall_64.tbl. */
-enum { NR_PROTECT = 10, NR_UNMAP = 11, NR_MINCORE = 27,
+enum { NR_PROTECT = 10, NR_UNMAP = 11, NR_MINCORE = 27, NR_MEMFD_CREATE = 319,
        NR_READV = 310, NR_WRITEV = 311, NR_SEAL = 462 };
+/* include/uapi/linux/memfd.h and include/uapi/linux/fcntl.h. */
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING 0x0002U
+#endif
+#ifndef MFD_NOEXEC_SEAL
+#define MFD_NOEXEC_SEAL 0x0008U
+#endif
+#ifndef MFD_EXEC
+#define MFD_EXEC 0x0010U
+#endif
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS 1033
+#endif
+#ifndef F_SEAL_SEAL
+#define F_SEAL_SEAL 0x0001
+#endif
+#ifndef F_SEAL_EXEC
+#define F_SEAL_EXEC 0x0020
+#endif
 #define PAGE 4096UL
 #define BAD ((void *)(uintptr_t)1)
 static const char *active;
@@ -189,7 +209,39 @@ static void mincore_case(void) {
     check(munmap(p, PAGE) == 0 && close(direct) == 0 && close(fd) == 0,
           "redirty-cleanup");
     free(readback);
-    mark("LOCKED_SHARED_FSYNC"); done();
+    mark("LOCKED_SHARED_FSYNC");
+    /* mm/msync.c applies MS_SYNC and MS_INVALIDATE per VMA in address order,
+       so a shared file range in front of a later VM_LOCKED VMA is already
+       written back when the syscall reports EBUSY.  A whole-range VM_LOCKED
+       preflight would fail before flushing anything. */
+    char order_path[] = "/root/thekernel-msync-order-XXXXXX";
+    fd = mkstemp(order_path); check(fd >= 0, "msync-order-create");
+    check(ftruncate(fd, 5 * PAGE) == 0, "msync-order-size");
+    direct = open(order_path, O_RDONLY | O_DIRECT);
+    check(direct >= 0 && unlink(order_path) == 0, "msync-order-direct-reader");
+    check(posix_memalign(&readback, PAGE, PAGE) == 0, "msync-order-buffer");
+    unsigned char *shared = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, fd, 0);
+    check(shared != MAP_FAILED, "msync-order-shared-map");
+    /* Replace the third page with a separate, non-contiguous file range so
+       mlock() cannot leave the dirty page inside the locked VMA. */
+    unsigned char *locked = mmap(shared + 2 * PAGE, PAGE, PROT_READ,
+                                 MAP_SHARED | MAP_FIXED, fd, 4 * PAGE);
+    check(locked == shared + 2 * PAGE, "msync-order-locked-map");
+    memset(shared, 'G', PAGE);
+    check(mlock(locked, PAGE) == 0, "msync-order-mlock");
+    errno = 0;
+    check(msync(shared, 3 * PAGE, MS_SYNC | MS_INVALIDATE) == -1 &&
+          errno == EBUSY, "msync-order-ebusy");
+    check(pread(direct, readback, PAGE, 0) == PAGE, "msync-order-direct-read");
+    for (size_t i = 0; i < PAGE; ++i)
+        check(((unsigned char *)readback)[i] == 'G',
+              "msync-order-flushed-before-ebusy");
+    check(munlock(locked, PAGE) == 0, "msync-order-munlock");
+    check(munmap(shared, 3 * PAGE) == 0 && close(direct) == 0 && close(fd) == 0,
+          "msync-order-cleanup");
+    free(readback);
+    done();
 }
 static void vm_case(int nr, const char *name) {
     begin(name);
@@ -384,6 +436,81 @@ static void lockall_case(void) {
     reap(pid, 0);
     mark("POPULATE_FAILURE_IGNORED"); done();
 }
+/* Returns -1 when the sysctl is unreadable, so every scope-dependent
+   expectation below is gated on an observed value instead of a guess. */
+static int memfd_noexec_scope(void) {
+    int fd = open("/proc/sys/vm/memfd_noexec", O_RDONLY);
+    if (fd < 0) return -1;
+    char buf[8] = {0};
+    ssize_t count = read(fd, buf, sizeof(buf) - 1);
+    check(close(fd) == 0, "memfd-sysctl-close");
+    if (count <= 0 || buf[0] < '0' || buf[0] > '2') return -1;
+    return buf[0] - '0';
+}
+
+static void memfd_case(void) {
+    active = "mm-abi-extras";
+    /* include/uapi/linux/fcntl.h: the seal set is 0x3f and F_SEAL_EXEC is
+       0x20; a memfd is created with F_SEAL_SEAL already set unless
+       MFD_ALLOW_SEALING (or MFD_NOEXEC_SEAL) clears it. */
+    int sealable = (int)syscall(NR_MEMFD_CREATE, "thekernel-sealable",
+                                MFD_ALLOW_SEALING);
+    check(sealable >= 0, "memfd-sealable-create");
+    check(fcntl(sealable, F_ADD_SEALS, F_SEAL_SEAL) == 0, "memfd-sealable-add");
+    check(close(sealable) == 0, "memfd-sealable-close");
+    int fixed = (int)syscall(NR_MEMFD_CREATE, "thekernel-unsealable", 0);
+    check(fixed >= 0, "memfd-unsealable-create");
+    ERROR(fcntl(fixed, F_ADD_SEALS, F_SEAL_SEAL), EPERM, "memfd-unsealable-add");
+    check(close(fixed) == 0, "memfd-unsealable-close");
+    /* Unknown flag bits are outside MFD_ALL_FLAGS for a non-hugetlb memfd. */
+    ERROR(syscall(NR_MEMFD_CREATE, "thekernel-bad-flag", 0x20U), EINVAL,
+          "memfd-unknown-flag");
+    /* mm/memfd.c:sanitize_flags() rejects the two exec bits together. */
+    ERROR(syscall(NR_MEMFD_CREATE, "thekernel-both-exec",
+                  MFD_NOEXEC_SEAL | MFD_EXEC), EINVAL, "memfd-both-exec-bits");
+    /* MFD_NOEXEC_SEAL clears the execute bits of the 0777 shmem inode and
+       adds F_SEAL_EXEC, which makes shmem_setattr() reject any chmod that
+       would change them.  MFD_EXEC keeps 0777. */
+    int noexec = (int)syscall(NR_MEMFD_CREATE, "thekernel-noexec",
+                              MFD_NOEXEC_SEAL);
+    check(noexec >= 0, "memfd-noexec-create");
+    struct stat status;
+    check(fstat(noexec, &status) == 0 && (status.st_mode & 0777) == 0666,
+          "memfd-noexec-mode");
+    ERROR(fchmod(noexec, 0755), EPERM, "memfd-noexec-chmod-exec");
+    check(fchmod(noexec, 0666) == 0, "memfd-noexec-chmod-same-mode");
+    check(close(noexec) == 0, "memfd-noexec-close");
+    if (memfd_noexec_scope() == 0) {
+        /* MFD_ALLOW_SEALING is required to add a seal later: without it the
+           memfd is created with F_SEAL_SEAL already set. */
+        int executable = (int)syscall(NR_MEMFD_CREATE, "thekernel-exec",
+                                      MFD_EXEC | MFD_ALLOW_SEALING);
+        check(executable >= 0, "memfd-exec-create");
+        check(fstat(executable, &status) == 0 && (status.st_mode & 0777) == 0777,
+              "memfd-exec-mode");
+        /* mm/memfd.c:memfd_add_seals() lets F_SEAL_EXEC be added to an
+           executable memfd; the seal then freezes the execute bits. */
+        check(fcntl(executable, F_ADD_SEALS, F_SEAL_EXEC) == 0,
+              "memfd-exec-add-seal");
+        ERROR(fchmod(executable, 0666), EPERM, "memfd-exec-sealed-chmod");
+        check(fchmod(executable, 0777) == 0, "memfd-exec-sealed-same-mode");
+        check(close(executable) == 0, "memfd-exec-close");
+    }
+}
+
+/* A mapping larger than the machine: Linux admits it under the default
+   heuristic overcommit policy only because MAP_NORESERVE sets VM_NORESERVE,
+   which removes it from the accountable set (`mm/vma.c:accountable_mapping()`
+   and `do_mmap()`'s `sysctl_overcommit_memory != OVERCOMMIT_NEVER` gate). */
+static void noreserve_case(void) {
+    active = "mm-abi-extras";
+    const size_t huge = (size_t)8 << 30;
+    void *sparse = mmap(NULL, huge, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    check(sparse != MAP_FAILED, "noreserve-admitted");
+    check(munmap(sparse, huge) == 0, "noreserve-cleanup");
+}
+
 int main(void) {
     active = "mm.setup";
     check(sysconf(_SC_PAGESIZE) == PAGE, "native-page-size");
@@ -392,6 +519,7 @@ int main(void) {
     vm_case(NR_WRITEV, "process-vm-writev.raw-differential");
     seal_case();
     lock_prefix_case(); process_advice_case(); lockall_case();
+    noreserve_case(); memfd_case();
     puts("THEKERNEL_MM_CONTRACTS_OK");
     return 0;
 }

@@ -6,8 +6,9 @@ use axfs_ng_vfs::Location;
 use axsync::spin::SpinNoIrq;
 #[cfg(not(test))]
 use axtask::WaitQueue;
-use linux_raw_sys::general::{
-    F_SEAL_GROW, F_SEAL_SEAL, F_SEAL_SHRINK, F_SEAL_WRITE, MFD_ALLOW_SEALING, MFD_CLOEXEC,
+use linux_raw_sys::general::{F_SEAL_GROW, F_SEAL_SEAL, F_SEAL_SHRINK};
+use tk_linux_mm::{
+    AddSeals, F_ALL_SEALS, F_WRITE_SEALS, plan_add_seals, write_seal_needs_quiescence,
 };
 
 #[cfg(test)]
@@ -16,9 +17,9 @@ extern crate std;
 #[cfg(test)]
 use std::sync::{Condvar, Mutex as StdMutex};
 
-pub(crate) const MEMFD_SUPPORTED_CREATE_FLAGS: u32 = MFD_CLOEXEC | MFD_ALLOW_SEALING;
-pub(crate) const MEMFD_SUPPORTED_SEALS: u32 =
-    F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+/// Every seal Linux v7.2.3 supports, including `F_SEAL_EXEC` and
+/// `F_SEAL_FUTURE_WRITE`.
+pub(crate) const MEMFD_SUPPORTED_SEALS: u32 = F_ALL_SEALS;
 
 #[derive(Debug)]
 struct MemfdSealState {
@@ -242,8 +243,8 @@ impl Drop for MemfdMutationGuard {
 }
 
 impl MemfdState {
-    fn new(allow_sealing: bool) -> Self {
-        let initial = if allow_sealing { 0 } else { F_SEAL_SEAL };
+    fn new(initial_seals: u32) -> Self {
+        let initial = initial_seals;
         Self {
             state: SpinNoIrq::new(MemfdSealState {
                 seals: initial,
@@ -263,8 +264,11 @@ impl MemfdState {
 
     fn add_writable_mapping(&self) -> AxResult<()> {
         let mut state = self.state.lock();
-        if state.seals & F_SEAL_WRITE != 0
-            || state.seal_update_active && state.pending_seals & F_SEAL_WRITE != 0
+        // `F_SEAL_FUTURE_WRITE` denies new writable mappings just like
+        // `F_SEAL_WRITE`; the difference is only that adding it does not first
+        // wait for the mappings that already exist.
+        if state.seals & F_WRITE_SEALS != 0
+            || state.seal_update_active && state.pending_seals & F_WRITE_SEALS != 0
         {
             return Err(AxError::OperationNotPermitted);
         }
@@ -298,7 +302,11 @@ impl MemfdState {
                 if state.seals & F_SEAL_SEAL != 0 {
                     return Err(AxError::OperationNotPermitted);
                 }
-                if seals & F_SEAL_WRITE != 0 && state.writable_shared_mappings != 0 {
+                // `F_SEAL_FUTURE_WRITE` deliberately leaves already-writable
+                // mappings writable, so only `F_SEAL_WRITE` waits for them.
+                if write_seal_needs_quiescence(state.seals, seals)
+                    && state.writable_shared_mappings != 0
+                {
                     return Err(AxError::ResourceBusy);
                 }
                 state.seal_update_active = true;
@@ -366,7 +374,7 @@ impl MemfdState {
             .ok_or(AxError::InvalidInput)?;
         let state = self.state.lock();
         debug_assert!(state.active_writes != 0 || state.resize_active);
-        if state.seals & F_SEAL_WRITE != 0 {
+        if state.seals & F_WRITE_SEALS != 0 {
             return Err(AxError::OperationNotPermitted);
         }
         if state.seals & F_SEAL_GROW != 0 && end > old_len {
@@ -378,7 +386,7 @@ impl MemfdState {
     fn admit_resize(&self, old_len: u64, new_len: u64, writes_content: bool) -> AxResult<()> {
         let state = self.state.lock();
         debug_assert!(state.resize_active);
-        if writes_content && state.seals & F_SEAL_WRITE != 0 {
+        if writes_content && state.seals & F_WRITE_SEALS != 0 {
             return Err(AxError::OperationNotPermitted);
         }
         if new_len < old_len && state.seals & F_SEAL_SHRINK != 0 {
@@ -448,12 +456,14 @@ impl Drop for WritableMappingRegistration {
     }
 }
 
-pub(crate) fn install_memfd_state(
-    loc: &Location,
-    allow_sealing: bool,
-) -> AxResult<Arc<MemfdState>> {
+/// Installs the memfd seal state for a freshly created inode.
+///
+/// `initial_seals` is the exact seal word Linux's `memfd_alloc_file()` leaves
+/// behind: `F_SEAL_SEAL` when the file is not sealable, otherwise
+/// `F_SEAL_EXEC` for `MFD_NOEXEC_SEAL` and zero for `MFD_ALLOW_SEALING`.
+pub(crate) fn install_memfd_state(loc: &Location, initial_seals: u32) -> AxResult<Arc<MemfdState>> {
     let mut guard = loc.user_data();
-    guard.try_get_or_insert_with(|| MemfdState::new(allow_sealing))
+    guard.try_get_or_insert_with(|| MemfdState::new(initial_seals))
 }
 
 pub(crate) fn current_seals(loc: &Location) -> Option<u32> {
@@ -466,20 +476,48 @@ pub(crate) fn get_seals(loc: &Location) -> AxResult<u32> {
 }
 
 pub(crate) fn add_seals(loc: &Location, writable: bool, seals: u32) -> AxResult<u32> {
-    if seals & !MEMFD_SUPPORTED_SEALS != 0 {
-        return Err(AxError::InvalidInput);
-    }
+    // `mm/memfd.c:memfd_add_seals()` checks in this order: the write mode of
+    // the descriptor (-EPERM), then bits outside `F_ALL_SEALS` (-EINVAL), then
+    // whether the inode is sealable at all (-EINVAL), then whether `F_SEAL_SEAL`
+    // is already set (-EPERM). The earlier order answered `-EINVAL` for an
+    // unknown bit on a read-only descriptor where Linux answers `-EPERM`.
+    let sealable = current_seals(loc).is_some();
+    let current = current_seals(loc).unwrap_or(0);
+    let inode_has_exec_bits = loc
+        .metadata()
+        .map(|metadata| metadata.mode.bits() & 0o111 != 0)
+        .unwrap_or(false);
+    let add = match plan_add_seals(current, seals, writable, sealable, inode_has_exec_bits) {
+        AddSeals::Publish(add) => add,
+        AddSeals::ReadOnly | AddSeals::AlreadySealed => {
+            return Err(AxError::OperationNotPermitted);
+        }
+        AddSeals::UnknownSeal | AddSeals::NotSealable => return Err(AxError::InvalidInput),
+    };
 
     let state = {
         let guard = loc.user_data();
         guard.get::<MemfdState>().ok_or(AxError::InvalidInput)?
     };
 
-    if !writable {
+    state.add_seals(add)
+}
+
+/// `mm/shmem.c:shmem_setattr()`'s `F_SEAL_EXEC` rule: once the seal is set, a
+/// mode change that differs from the inode's current execute bits is
+/// `-EPERM`, in either direction.
+pub(crate) fn check_sealed_exec_mode(loc: &Location, requested_mode: u16) -> AxResult<()> {
+    let Some(seals) = current_seals(loc) else {
+        return Ok(());
+    };
+    if seals & tk_linux_mm::F_SEAL_EXEC == 0 {
+        return Ok(());
+    }
+    let current = loc.metadata()?.mode.bits();
+    if (current ^ requested_mode) & 0o111 != 0 {
         return Err(AxError::OperationNotPermitted);
     }
-
-    state.add_seals(seals)
+    Ok(())
 }
 
 fn state_for_location(loc: &Location) -> Option<Arc<MemfdState>> {
@@ -540,7 +578,7 @@ pub(crate) fn begin_write_resize(
 }
 
 pub(crate) fn check_writable_shared_mapping(loc: &Location) -> AxResult<()> {
-    if current_seals(loc).is_some_and(|seals| seals & F_SEAL_WRITE != 0) {
+    if current_seals(loc).is_some_and(|seals| seals & F_WRITE_SEALS != 0) {
         return Err(AxError::OperationNotPermitted);
     }
     Ok(())
@@ -564,6 +602,7 @@ mod tests {
     };
 
     use axfs_ng_vfs::{Location, Mountpoint, NodePermission, NodeType};
+    use linux_raw_sys::general::F_SEAL_WRITE;
 
     use super::*;
     use crate::pseudofs::tmp::MemoryFs;
@@ -580,13 +619,13 @@ mod tests {
             )
             .unwrap();
         location.entry().as_file().unwrap().set_len(len).unwrap();
-        install_memfd_state(&location, true).unwrap();
+        install_memfd_state(&location, 0).unwrap();
         location
     }
 
     #[test]
     fn writable_registration_is_idempotent_and_blocks_seal_write() {
-        let state = Arc::new(MemfdState::new(true));
+        let state = Arc::new(MemfdState::new(0));
         let registration = WritableMappingRegistration::new(state.clone());
 
         registration.set_active(true).unwrap();
@@ -602,7 +641,7 @@ mod tests {
 
     #[test]
     fn existing_seal_write_rejects_registration_without_accounting_it() {
-        let state = Arc::new(MemfdState::new(true));
+        let state = Arc::new(MemfdState::new(0));
         state.add_seals(F_SEAL_WRITE).unwrap();
         let registration = WritableMappingRegistration::new(state.clone());
 
@@ -619,7 +658,7 @@ mod tests {
         use std::sync::Barrier;
 
         for _ in 0..64 {
-            let state = Arc::new(MemfdState::new(true));
+            let state = Arc::new(MemfdState::new(0));
             let registration = Arc::new(WritableMappingRegistration::new(state.clone()));
             let barrier = Arc::new(Barrier::new(3));
 
@@ -661,7 +700,7 @@ mod tests {
 
     #[test]
     fn writable_mapping_count_overflow_fails_without_wrapping() {
-        let state = Arc::new(MemfdState::new(true));
+        let state = Arc::new(MemfdState::new(0));
         state.state.lock().writable_shared_mappings = usize::MAX;
 
         assert_eq!(state.add_writable_mapping(), Err(AxError::NoMemory));
@@ -674,7 +713,7 @@ mod tests {
 
     #[test]
     fn writable_mapping_underflow_poison_is_fail_closed() {
-        let state = Arc::new(MemfdState::new(true));
+        let state = Arc::new(MemfdState::new(0));
 
         assert_eq!(state.remove_writable_mapping(), Err(AxError::BadState));
         assert_eq!(state.state.lock().writable_shared_mappings, usize::MAX);
@@ -735,7 +774,7 @@ mod tests {
 
     #[test]
     fn failed_seal_wait_rolls_back_pending_publication() {
-        let state = Arc::new(MemfdState::new(true));
+        let state = Arc::new(MemfdState::new(0));
         let write = state.reserve_write().unwrap();
         state.changed.fail_next_wait();
 
@@ -754,7 +793,7 @@ mod tests {
 
     #[test]
     fn resize_waits_for_active_write_without_holding_the_state_spinlock() {
-        let state = Arc::new(MemfdState::new(true));
+        let state = Arc::new(MemfdState::new(0));
         let write = state.reserve_write().unwrap();
         let started = Arc::new(Barrier::new(2));
         let (guard_tx, guard_rx) = mpsc::channel();

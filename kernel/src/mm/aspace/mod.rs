@@ -8071,47 +8071,6 @@ impl AddrSpace {
         Ok(reclaimed)
     }
 
-    pub fn sync_backends_in_range(
-        &self,
-        mut start: VirtAddr,
-        size: usize,
-        fail_on_first_unmapped: bool,
-    ) -> AxResult<(Vec<Backend>, bool)> {
-        self.validate_region(start, size)?;
-        let end = start + size;
-        let mut backends = Vec::new();
-        let mut saw_unmapped = false;
-
-        for area in self.areas.iter() {
-            if area.end() <= start {
-                continue;
-            }
-            if area.start() >= end {
-                break;
-            }
-            if area.start() > start {
-                if fail_on_first_unmapped {
-                    ax_bail!(NoMemory);
-                }
-                saw_unmapped = true;
-            }
-            backends.push(area.backend().clone());
-            start = area.end().min(end);
-            if start >= end {
-                break;
-            }
-        }
-
-        if start < end {
-            if fail_on_first_unmapped {
-                ax_bail!(NoMemory);
-            }
-            saw_unmapped = true;
-        }
-
-        Ok((backends, saw_unmapped))
-    }
-
     /// Removes mappings within the specified virtual address range.
     ///
     /// Returns an error if the address range is out of the address space or not
@@ -8943,33 +8902,73 @@ impl AddrSpace {
         false
     }
 
+    /// Swaps out every exclusively-owned 4 KiB anonymous leaf in
+    /// `[start, start + size)`, returning how many were moved.
+    ///
+    /// This is the anonymous half of Linux `MADV_PAGEOUT` /
+    /// `process_madvise(MADV_PAGEOUT)`: `mm/madvise.c:madvise_pageout_pte_range()`
+    /// calls `pageout()` on each eligible leaf and the syscall still reports
+    /// success for every leaf it could not reclaim.  A leaf is eligible here
+    /// only when its backend owns the frame exclusively (see
+    /// `Backend::swap_reclaimable`), which is the local equivalent of Linux's
+    /// `folio_mapcount() == 1` isolated-LRU admission; anything else is left
+    /// resident rather than being discarded.
+    pub(crate) fn reclaim_anonymous_pages_in_range(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+    ) -> AxResult<usize> {
+        let end = start.checked_add(size).ok_or(AxError::InvalidInput)?;
+        let mut page = VirtAddr::from(start.as_usize().next_multiple_of(PAGE_SIZE_4K));
+        let mut reclaimed = 0;
+        while page < end {
+            match self.reclaim_anonymous_page_at(page)? {
+                AnonymousReclaim::Reclaimed => reclaimed += 1,
+                AnonymousReclaim::NotEligible => {}
+                // Without an active swap area Linux's `pageout()` finds no
+                // swap slot, keeps every leaf resident, and still returns
+                // success; stopping here avoids walking a large range for
+                // nothing.
+                AnonymousReclaim::NoSwapArea => break,
+            }
+            page += PAGE_SIZE_4K;
+        }
+        Ok(reclaimed)
+    }
+
     /// Reclaims one exclusively-owned 4 KiB anonymous leaf.  The present PTE
     /// is first invalidated and globally quiesced, so a concurrent CPU cannot
-    /// modify bytes while they are copied to swap.  An I/O failure restores
+    /// modify bytes while they are copied to swap.  A failed pageout restores
     /// the original leaf before returning.
-    pub(crate) fn reclaim_one_anonymous_page(&mut self) -> AxResult<bool> {
-        let candidate = self.areas.iter().find_map(|area| {
-            if area.backend().page_size() != PageSize::Size4K {
-                return None;
-            }
-            let mut page = area.start();
-            while page < area.end() {
-                if let Ok((paddr, _, PageSize::Size4K)) = self.pt.query(page)
-                    && area.backend().swap_reclaimable(paddr)
-                {
-                    return Some((page, paddr, area.flags(), area.backend().clone()));
-                }
-                page += PAGE_SIZE_4K;
-            }
-            None
-        });
-        let Some((page, paddr, _flags, backend)) = candidate else {
-            return Ok(false);
+    ///
+    /// The pageout I/O itself runs under this address space's lock on purpose.
+    /// Linux holds the mmap read lock across `pageout()` for the same reason:
+    /// the swap entry must be recorded before the lock is dropped, because a
+    /// fault on the just-invalidated address would otherwise repopulate it with
+    /// a fresh zero page and silently lose the saved bytes.
+    fn reclaim_anonymous_page_at(&mut self, page: VirtAddr) -> AxResult<AnonymousReclaim> {
+        let (backend, area_page_size) = match self.areas.find(page) {
+            Some(area) => (area.backend().clone(), area.backend().page_size()),
+            None => return Ok(AnonymousReclaim::NotEligible),
         };
+        if area_page_size != PageSize::Size4K {
+            return Ok(AnonymousReclaim::NotEligible);
+        }
+        let Ok((paddr, _, PageSize::Size4K)) = self.pt.query(page) else {
+            return Ok(AnonymousReclaim::NotEligible);
+        };
+        if !backend.swap_reclaimable(paddr) {
+            return Ok(AnonymousReclaim::NotEligible);
+        }
         // A pinned frame may still be modified by in-flight DMA.  Deferring
         // allocator reuse is insufficient: the persisted image would already
         // be stale, so reclaim must reject the victim before pageout.
-        self.check_no_user_io_pin_overlap(page, PAGE_SIZE_4K, InvalidationReason::Discard)?;
+        if self
+            .check_no_user_io_pin_overlap(page, PAGE_SIZE_4K, InvalidationReason::Discard)
+            .is_err()
+        {
+            return Ok(AnonymousReclaim::NotEligible);
+        }
         let (_, leaf_flags, leaf_size) = self.pt.cursor().unmap(page).map_err(AxError::from)?;
         if leaf_size != PageSize::Size4K {
             return Err(AxError::BadState);
@@ -8985,14 +8984,23 @@ impl AddrSpace {
                     .map(page, paddr, PageSize::Size4K, leaf_flags)
                     .map_err(AxError::from)?;
                 drop(self.synchronize_tlb_after_mutation());
-                return Err(error);
+                return Ok(match error.canonicalize() {
+                    // `swap::allocate_slot()` reports both "no active swap
+                    // area" and "every slot is taken" as ENOSPC, which is the
+                    // same admission failure Linux's `pageout()` sees when the
+                    // LRU cannot find a swap slot.
+                    AxError::NoMemory | AxError::StorageFull => AnonymousReclaim::NoSwapArea,
+                    // Any other pageout failure leaves the leaf resident, which
+                    // is what Linux reports as an unreclaimable page.
+                    _ => AnonymousReclaim::NotEligible,
+                });
             }
         };
         self.swapped.insert(page, entry);
         let grace = self.synchronize_tlb_after_mutation();
         backend.release_swapped_frame(paddr);
         drop(grace);
-        Ok(true)
+        Ok(AnonymousReclaim::Reclaimed)
     }
 
     /// Captures and pins all target entries while the caller holds this mm
@@ -10416,6 +10424,17 @@ impl Drop for AddrSpace {
         let _ = self.user_io_pins.begin_teardown();
         let _ = self.user_io_pins.finish_teardown();
     }
+}
+
+/// Result of one anonymous-leaf reclaim attempt.
+enum AnonymousReclaim {
+    /// The leaf was written to swap and its frame retired.
+    Reclaimed,
+    /// The leaf is not exclusively owned, not 4 KiB, not resident, or could
+    /// not be paged out; it stays resident.
+    NotEligible,
+    /// No swap area is active, so no leaf can be paged out.
+    NoSwapArea,
 }
 
 #[cfg(test)]
