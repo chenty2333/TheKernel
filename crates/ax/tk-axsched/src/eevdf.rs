@@ -91,6 +91,15 @@ pub struct DeadlineParameters {
     pub runtime_ns: u64,
     pub deadline_ns: u64,
     pub period_ns: u64,
+    /// Linux's `sched_dl_entity::flags`: the `SCHED_DL_FLAGS` subset of the
+    /// caller's `sched_flags` (`SCHED_FLAG_RECLAIM`, `SCHED_FLAG_DL_OVERRUN`,
+    /// `SCHED_FLAG_SUGOV`).
+    ///
+    /// `__setparam_dl()` stores it and `__getparam_dl()` reports it back
+    /// through `sched_getattr(2)`, so it is ABI state that must survive on the
+    /// entity even though the EEVDF core's own admission and replenishment
+    /// arithmetic does not consult it.
+    pub flags: u32,
 }
 
 /// Shared admission ledger for run queues in one CPU-affinity domain.
@@ -452,6 +461,9 @@ pub struct EevdfTaskPayload<T> {
     deadline_runtime_ns: AtomicU64,
     deadline_ns: AtomicU64,
     deadline_period_ns: AtomicU64,
+    /// Linux's `sched_dl_entity::flags`, stored and reported as-is by the
+    /// deadline parameter ABI. See [`DeadlineParameters::flags`].
+    deadline_flags: AtomicU32,
     queue_owner: AtomicUsize,
     rr_remaining: AtomicUsize,
     state: UnsafeCell<EevdfOwnedState>,
@@ -598,6 +610,7 @@ impl<T> EevdfTaskPayload<T> {
             deadline_runtime_ns: AtomicU64::new(0),
             deadline_ns: AtomicU64::new(0),
             deadline_period_ns: AtomicU64::new(0),
+            deadline_flags: AtomicU32::new(0),
             queue_owner: AtomicUsize::new(UNOWNED),
             rr_remaining: AtomicUsize::new(0),
             state: UnsafeCell::new(EevdfOwnedState {
@@ -642,6 +655,7 @@ impl<T> EevdfTaskPayload<T> {
             runtime_ns: self.deadline_runtime_ns.load(Ordering::Acquire),
             deadline_ns: self.deadline_ns.load(Ordering::Acquire),
             period_ns: self.deadline_period_ns.load(Ordering::Acquire),
+            flags: self.deadline_flags.load(Ordering::Acquire),
         }
     }
 
@@ -651,6 +665,7 @@ impl<T> EevdfTaskPayload<T> {
         self.deadline_ns.store(value.deadline_ns, Ordering::Release);
         self.deadline_period_ns
             .store(value.period_ns, Ordering::Release);
+        self.deadline_flags.store(value.flags, Ordering::Release);
     }
 
     fn apply_validated(&self, params: EevdfTaskParams) {
@@ -6810,11 +6825,13 @@ mod tests {
             runtime_ns: 25,
             deadline_ns: 100,
             period_ns: 120,
+            flags: 0,
         };
         let replacement = DeadlineParameters {
             runtime_ns: 40,
             deadline_ns: 80,
             period_ns: 90,
+            flags: 0,
         };
         scheduler.stage_task_deadline_config(&task, old).unwrap();
         let _ = scheduler
@@ -6866,11 +6883,13 @@ mod tests {
             runtime_ns: 60,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         let contender_config = DeadlineParameters {
             runtime_ns: 50,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         scheduler
             .stage_task_deadline_config(&sleeper, sleeper_config)
@@ -6907,6 +6926,7 @@ mod tests {
             runtime_ns: 25,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         scheduler.stage_task_deadline_config(&task, config).unwrap();
         let _ = scheduler
@@ -6983,11 +7003,13 @@ mod tests {
             runtime_ns: 25,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         let replacement = DeadlineParameters {
             runtime_ns: 40,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         scheduler
             .stage_task_deadline_config(&task, original)
@@ -7021,6 +7043,7 @@ mod tests {
             runtime_ns: 25,
             deadline_ns: 100,
             period_ns: 120,
+            flags: 0,
         };
         scheduler.stage_task_deadline_config(&task, config).unwrap();
         let _ = scheduler
@@ -7053,6 +7076,7 @@ mod tests {
             runtime_ns: 25,
             deadline_ns: 100,
             period_ns: 120,
+            flags: 0,
         };
         scheduler.stage_task_deadline_config(&task, config).unwrap();
         let _ = scheduler
@@ -7107,6 +7131,7 @@ mod tests {
             runtime_ns: 60,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         let mut source = EEVDFScheduler::new();
         let mut destination = EEVDFScheduler::new();
@@ -7139,6 +7164,7 @@ mod tests {
             runtime_ns: 60,
             deadline_ns: 100,
             period_ns: 100,
+            flags: 0,
         };
         let mut first = EEVDFScheduler::new();
         let mut second = EEVDFScheduler::new();

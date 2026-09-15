@@ -17,6 +17,7 @@ mod identity;
 mod madvise;
 mod mapping;
 mod memfd;
+mod mempolicy;
 mod mincore;
 mod msync;
 mod pin;
@@ -62,6 +63,15 @@ pub use memfd::{
     MFD_NAME_COPY_LEN, MFD_NAME_MAX_LEN, MFD_NAME_PREFIX_LEN, MFD_NOEXEC_SEAL, MemfdPlan,
     close_on_exec, inode_mode, name_within_limit, plan_add_seals, sanitize_flags,
     write_seal_needs_quiescence,
+};
+pub use mempolicy::{
+    ALLOWED_NODEMASK, GetMempolicyError, MAX_NODEMASK_BITS, MPOL_BIND, MPOL_DEFAULT, MPOL_F_ADDR,
+    MPOL_F_MEMS_ALLOWED, MPOL_F_NODE, MPOL_F_NUMA_BALANCING, MPOL_F_RELATIVE_NODES,
+    MPOL_F_STATIC_NODES, MPOL_INTERLEAVE, MPOL_LOCAL, MPOL_MAX, MPOL_MF_MOVE, MPOL_MF_MOVE_ALL,
+    MPOL_MF_STRICT, MPOL_MF_VALID, MPOL_MODE_FLAGS, MPOL_PREFERRED, MPOL_PREFERRED_MANY,
+    MPOL_WEIGHTED_INTERLEAVE, MbindPlan, MempolicyError, MempolicyRequest, NR_NODE_IDS,
+    effective_policy, next_interleave_node, parse_node_mask, plan_mbind, sanitize_mode_flags,
+    scanned_words, validate, validate_get,
 };
 pub use mincore::MincorePlan;
 pub use msync::{

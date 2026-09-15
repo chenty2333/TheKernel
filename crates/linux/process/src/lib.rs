@@ -15,6 +15,7 @@ mod linux_abi;
 mod process;
 mod process_group;
 mod session;
+mod wait;
 
 /// A process ID, also used as session ID, process group ID, and thread ID.
 pub type Pid = u32;
@@ -34,3 +35,8 @@ pub use process::{
 };
 pub use process_group::ProcessGroup;
 pub use session::Session;
+pub use wait::{
+    WAIT4_OPTIONS_ALLOWED, WAITID_EVENT_FLAGS, WAITID_OPTIONS_ALLOWED, WaitEventKind,
+    WaitEventSelection, WaitEventState, WaitIdError, WaitIdType, select_child_event,
+    validate_id_type, zombie_is_delayed,
+};

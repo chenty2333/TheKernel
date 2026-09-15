@@ -13,7 +13,13 @@ use crate::{
 };
 
 /// Default tick budget assigned to a round-robin task.
-pub const RR_TIMESLICE_TICKS: usize = 5;
+///
+/// Linux's `include/linux/sched/rt.h` defines `RR_TIMESLICE` as
+/// `100 * HZ / 1000`, so at the 100 Hz tick this kernel runs it is ten ticks.
+/// The value is observable: `sched_rr_get_interval(2)` reports it back to
+/// userspace for a `SCHED_RR` task, and `/proc/sys/kernel/sched_rr_timeslice_ms`
+/// is initialised from it.
+pub const RR_TIMESLICE_TICKS: usize = 10;
 
 // This is intentionally scheduler-global: Linux exposes one RR interval, not
 // a per-runqueue or per-task knob. Existing tasks retain their current budget;

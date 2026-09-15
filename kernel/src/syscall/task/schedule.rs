@@ -43,7 +43,8 @@ use crate::{
             SchedulerSecurityOperation, SecuritySchedulerContext, SecurityTaskGetSchedulerContext,
             dispatch_scheduler, dispatch_task_getscheduler,
         },
-        try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns, zombie_scheduler_state,
+        set_zombie_nice, try_tasks, with_proc_state_hint, zombie_ioprio, zombie_pid_ns,
+        zombie_scheduler_state, ZombieSchedulerSnapshot,
     },
     time::TimeValueLike,
 };
@@ -74,21 +75,96 @@ pub(crate) struct SchedAttr {
     sched_util_max: u32,
 }
 
-fn sched_target(pid: i32) -> AxResult<AxTaskRef> {
-    if pid < 0 {
-        return Err(AxError::InvalidInput);
+/// The scheduler view of a `sched_*(2)` target.
+///
+/// Linux resolves a target with `find_process_by_pid()`, i.e.
+/// `find_task_by_vpid()`, and an unreaped zombie is still findable because
+/// `release_task()` is what removes it from the PID hash. The scheduler state
+/// those queries read (`p->policy`, `p->rt_priority`,
+/// `p->sched_reset_on_fork`, `sched_class->get_rr_interval`) stays valid for
+/// exactly as long as the `task_struct` does, so Linux answers for a zombie
+/// with the values the task last held.
+///
+/// TheKernel drops the live scheduler object when the last thread exits, so a
+/// zombie's terminal scheduler transaction is retained instead, in
+/// `Process::zombie_scheduler_state()`. Reading that is the exact analogue of
+/// Linux reading the still-allocated `task_struct`: it never resurrects the
+/// task, and it exposes nothing the task had not already published.
+enum SchedTarget {
+    Live(AxTaskRef),
+    Zombie(ZombieSchedulerSnapshot),
+}
+
+impl SchedTarget {
+    fn state(&self) -> SchedState {
+        match self {
+            Self::Live(task) => sched_state(task),
+            Self::Zombie(snapshot) => snapshot.state(),
+        }
     }
-    if pid == 0 {
-        Ok(current().clone())
-    } else {
+
+    /// Resolves `pid` for the scheduler queries that Linux answers for a
+    /// zombie (`sched_getscheduler`, `sched_getparam`,
+    /// `sched_rr_get_interval`).
+    ///
+    /// A negative `pid` is `EINVAL` before any lookup, matching
+    /// `SYSCALL_DEFINE1(sched_getscheduler, ...)`'s `if (pid < 0)`.
+    fn resolve(pid: i32) -> AxResult<Self> {
+        if pid < 0 {
+            return Err(AxError::InvalidInput);
+        }
+        if pid == 0 {
+            return Ok(Self::Live(current().clone()));
+        }
         // Namespace IDs name Linux threads, not scheduler task allocations.
         let tid = current()
             .as_thread()
             .pid_ns()
             .resolve_visible_pid(pid as Pid)
             .ok_or(AxError::NoSuchProcess)?;
-        get_visible_task(tid)
+        if let Ok(task) = get_visible_task(tid) {
+            return Ok(Self::Live(task));
+        }
+        zombie_scheduler_target(tid)?.ok_or(AxError::NoSuchProcess)
     }
+}
+
+/// Finds the retained scheduler snapshot of an authoritative unreaped zombie.
+///
+/// Returns `Ok(None)` when no process with this kernel PID is published, so the
+/// caller can report Linux's `ESRCH` rather than a lifecycle error.
+fn zombie_scheduler_target(tid: Pid) -> AxResult<Option<SchedTarget>> {
+    let registry = process_domain()?.registry();
+    let Some(process) = registry.get(tid) else {
+        return Ok(None);
+    };
+    if !process.is_zombie() {
+        return Ok(None);
+    }
+    // `zombie_scheduler_state()` re-validates that this exact registry entry is
+    // still the authoritative zombie, so a reap that wins the race surfaces as
+    // ESRCH exactly as Linux's failed `find_task_by_vpid()` would.
+    match zombie_scheduler_state(&process) {
+        Ok(snapshot) => Ok(Some(SchedTarget::Zombie(snapshot))),
+        Err(AxError::NoSuchProcess) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Resolves `pid` for the scheduler queries Linux restricts to a live task.
+fn live_sched_target(pid: i32) -> AxResult<AxTaskRef> {
+    if pid < 0 {
+        return Err(AxError::InvalidInput);
+    }
+    if pid == 0 {
+        return Ok(current().clone());
+    }
+    let tid = current()
+        .as_thread()
+        .pid_ns()
+        .resolve_visible_pid(pid as Pid)
+        .ok_or(AxError::NoSuchProcess)?;
+    get_visible_task(tid)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -180,6 +256,16 @@ fn sched_reset_on_fork(task: &AxTaskRef) -> AxResult<bool> {
     task_scheduling_snapshot(task)
         .map(|commit| commit.reset_on_spawn)
         .map_err(map_sched_error)
+}
+
+impl SchedTarget {
+    /// `p->sched_reset_on_fork`, sampled from the same transaction as `state()`.
+    fn reset_on_fork(&self) -> AxResult<bool> {
+        match self {
+            Self::Live(task) => sched_reset_on_fork(task),
+            Self::Zombie(snapshot) => Ok(snapshot.reset_on_fork),
+        }
+    }
 }
 
 fn linux_policy_from_state(state: SchedState, reset_on_fork: bool) -> i32 {
@@ -1229,7 +1315,7 @@ pub fn sys_sched_getaffinity<M: UserMemory + ?Sized>(
         return Err(AxError::InvalidInput);
     }
 
-    let mask = sched_target(pid)?.cpumask();
+    let mask = live_sched_target(pid)?.cpumask();
     let mut mask_bytes = Vec::new();
     mask_bytes
         .try_reserve_exact(kernel_mask_bytes)
@@ -1269,7 +1355,7 @@ pub fn sys_sched_setaffinity<M: UserMemory + ?Sized>(
         }
     }
 
-    let task = sched_target(pid)?;
+    let task = live_sched_target(pid)?;
     scheduler_authority_snapshot(&task)?.authorize(SchedulerSecurityOperation::SetAffinity)?;
 
     if pid == 0 {
@@ -1302,9 +1388,20 @@ pub fn sys_getcpu<M: UserMemory + ?Sized>(
     result.map(|()| 0)
 }
 
+/// Linux 7.2.3 `sched_getscheduler(2)` — `SYSCALL_DEFINE1(sched_getscheduler, ...)`.
+///
+/// `security_task_getscheduler()` runs before the policy is returned, so a
+/// security module's denial is not masked by a successful read. `pid == 0`
+/// names the caller; any other `pid` is resolved through the caller's PID
+/// namespace, and an unreaped zombie is answered from its retained snapshot.
 pub fn sys_sched_getscheduler(pid: i32) -> AxResult<isize> {
-    let task = sched_target(pid)?;
-    Ok(linux_policy_from_state(sched_state(&task), sched_reset_on_fork(&task)?) as isize)
+    let target = SchedTarget::resolve(pid)?;
+    // `linux_policy_from_class` ORs in SCHED_RESET_ON_FORK exactly where Linux
+    // does (`if (p->sched_reset_on_fork) retval |= SCHED_RESET_ON_FORK`).
+    Ok(linux_policy_from_class(
+        target.state().class,
+        target.reset_on_fork()?,
+    ) as isize)
 }
 
 pub fn sys_sched_setparam<M: UserMemory + ?Sized>(
@@ -1322,7 +1419,7 @@ pub fn sys_sched_setparam<M: UserMemory + ?Sized>(
             .assume_init()
     }
     .sched_priority;
-    let task = sched_target(pid)?;
+    let task = live_sched_target(pid)?;
     update_sched_param(&task, priority)
 }
 
@@ -1342,19 +1439,25 @@ pub fn sys_sched_setscheduler<M: UserMemory + ?Sized>(
             .assume_init()
     }
     .sched_priority;
-    let task = sched_target(pid)?;
+    let task = live_sched_target(pid)?;
     update_sched_policy(&task, policy, priority)
 }
 
+/// Linux 7.2.3 `sched_getparam(2)` — `SYSCALL_DEFINE2(sched_getparam, ...)`.
+///
+/// `param` and a negative `pid` are rejected before the lookup, and the
+/// priority for a non-RT target is reported as zero (`lp` is initialised to
+/// `{.sched_priority = 0}` and only overwritten for an RT policy). An unreaped
+/// zombie is answered from its retained snapshot.
 pub fn sys_sched_getparam<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     pid: i32,
     param: *mut SchedParam,
 ) -> AxResult<isize> {
-    if param.is_null() {
+    if param.is_null() || pid < 0 {
         return Err(AxError::InvalidInput);
     }
-    let task = sched_target(pid)?;
+    let target = SchedTarget::resolve(pid)?;
     // `SchedParam` is a complete `repr(C)` value containing only its i32
     // priority field, so its initialized representation is safe to copy out
     // through the explicitly bound user-memory context.
@@ -1363,7 +1466,7 @@ pub fn sys_sched_getparam<M: UserMemory + ?Sized>(
             param,
             memory,
             SchedParam {
-                sched_priority: state_static_priority(sched_state(&task)),
+                sched_priority: state_static_priority(target.state()),
             },
         )
         .map_err(map_usercopy_error)?;
@@ -1379,17 +1482,25 @@ pub fn sys_sched_get_priority_min(policy: i32) -> AxResult<isize> {
     Ok(linux_priority_bounds(policy)?.0)
 }
 
+/// Linux 7.2.3 `sched_rr_get_interval(2)` —
+/// `SYSCALL_DEFINE2(sched_rr_get_interval, ...)`.
+///
+/// The interval comes from the target's scheduling class, not from its policy
+/// alone: `get_rr_interval_rt()` returns `sched_rr_timeslice` for `SCHED_RR`
+/// and zero (reported as "infinity") for `SCHED_FIFO`, and the fair and
+/// deadline classes report their own slice. An unreaped zombie is answered from
+/// its retained snapshot, so its last class decides the value.
 pub fn sys_sched_rr_get_interval<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     pid: i32,
     interval: *mut timespec,
 ) -> AxResult<isize> {
-    let task = sched_target(pid)?;
+    let target = SchedTarget::resolve(pid)?;
     unsafe {
         VmMutPtr::vm_write_unchecked(
             interval,
             memory,
-            timespec::from_time_value(rr_interval_for_state(sched_state(&task))),
+            timespec::from_time_value(rr_interval_for_state(target.state())),
         )
         .map_err(map_usercopy_error)?;
     }
@@ -1450,11 +1561,18 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
                 tail_nonzero,
             },
             before,
+            // `SCHED_FLAG_RECLAIM` and `SCHED_FLAG_DL_OVERRUN` are accepted:
+            // `__sched_setscheduler()` only rejects bits outside
+            // `SCHED_FLAG_ALL | SCHED_FLAG_SUGOV`, and `__checkparam_dl()` does
+            // not look at `sched_flags`. The EEVDF core has no reclaim
+            // bandwidth accounting and no overrun report, so the bits are
+            // stored and reported back rather than acted on -- which is what
+            // `__setparam_dl()`/`__getparam_dl()` make observable.
             linux_sched::FeatureSet {
                 deadline: true,
                 util_clamp: true,
-                reclaim: false,
-                dl_overrun: false,
+                reclaim: true,
+                dl_overrun: true,
             },
         )
         .map_err(map_sched_reject)?;
@@ -1526,6 +1644,9 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
         };
         let deadline = if matches!(class, SchedClass::Deadline) {
             if attr.sched_flags & linux_sched::SCHED_FLAG_KEEP_PARAMS != 0 {
+                // `__setscheduler_params()` skips `__setparam_dl()` entirely
+                // for KEEP_PARAMS, so both the reservation and `dl_se->flags`
+                // keep their previous values.
                 old.deadline
             } else {
                 let deadline = plan.deadline.expect("deadline planner returned parameters");
@@ -1533,10 +1654,16 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
                     runtime_ns: deadline.runtime,
                     deadline_ns: deadline.deadline,
                     period_ns: deadline.period,
+                    flags: dl_flags_from_plan(&plan),
                 }
             }
         } else {
-            DeadlineParameters::default()
+            // Leaving the deadline class cannot clear `dl_se->flags` in Linux
+            // either: `__setscheduler_params()` only calls `__setparam_dl()`
+            // for a deadline policy, and `get_params()` only reports the flags
+            // for one. Retain them so re-entering SCHED_DEADLINE without an
+            // explicit flag round-trips what Linux would still hold.
+            old.deadline
         };
         let uclamp = axtask::UclampRequest {
             minimum: plan.uclamp.min as u16,
@@ -1563,6 +1690,22 @@ pub fn sys_sched_setattr<M: UserMemory + ?Sized>(
     }
 }
 
+/// `__setparam_dl()`'s `dl_se->flags = attr->sched_flags & SCHED_DL_FLAGS`.
+///
+/// `SCHED_DL_FLAGS` is `SCHED_FLAG_RECLAIM | SCHED_FLAG_DL_OVERRUN |
+/// SCHED_FLAG_SUGOV`; `SCHED_FLAG_SUGOV` is kernel-internal and rejected for
+/// userspace callers, so only the two public bits can appear here.
+fn dl_flags_from_plan(plan: &linux_sched::SchedUpdatePlan) -> u32 {
+    let mut flags = 0u32;
+    if plan.reclaim {
+        flags |= linux_sched::SCHED_FLAG_RECLAIM as u32;
+    }
+    if plan.dl_overrun {
+        flags |= linux_sched::SCHED_FLAG_DL_OVERRUN as u32;
+    }
+    flags
+}
+
 type SchedAttrSnapshot = (SchedState, bool, u64, u64, u64, u64, u32, u32);
 
 enum SchedGetAttrTarget {
@@ -1581,6 +1724,29 @@ impl SchedGetAttrTarget {
                 .zombie_payload()
                 .ok_or(AxError::NoSuchProcess)
                 .map(|snapshot| snapshot.credential.clone()),
+        }
+    }
+
+    /// `get_params()`'s deadline branch, read from the same scheduler
+    /// transaction as `snapshot()`.
+    ///
+    /// Linux reports `dl_se->flags` only through `__getparam_dl()`, so a
+    /// non-deadline target contributes nothing here even though the retained
+    /// bits may still be present.
+    fn deadline_flags(&self) -> AxResult<u64> {
+        match self {
+            Self::Live(task) => task_scheduling_snapshot(task)
+                .map(|snapshot| u64::from(snapshot.deadline.flags))
+                .map_err(|error| match error {
+                    TaskSchedError::TaskExited => AxError::NoSuchProcess,
+                    TaskSchedError::Unsupported => AxError::OperationNotSupported,
+                    TaskSchedError::RunQueueUnavailable(_) | TaskSchedError::Scheduler(_) => {
+                        AxError::NoSuchProcess
+                    }
+                }),
+            Self::Zombie(process) => {
+                zombie_scheduler_state(process).map(|snapshot| u64::from(snapshot.dl_flags))
+            }
         }
     }
 
@@ -1639,7 +1805,7 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
         || pid < 0
         || !(linux_sched::SCHED_ATTR_SIZE_VER0 as usize..=linux_sched::SCHED_ATTR_MAX_SIZE as usize)
             .contains(&out_size)
-        || flags != 0
+        || flags & !linux_sched::SCHED_GETATTR_FLAG_DL_DYNAMIC != 0
     {
         return Err(AxError::InvalidInput);
     }
@@ -1654,6 +1820,13 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
             SchedGetAttrTarget::Zombie(zombie_for_ioprio(pid as Pid, &caller_pid_ns)?)
         }
     };
+    // `if (flags) { if (!task_has_dl_policy(p) || flags !=
+    // SCHED_GETATTR_FLAG_DL_DYNAMIC) return -EINVAL; }` -- the check needs the
+    // resolved target, so it runs after the task lookup and before the
+    // security hook, exactly as in `SYSCALL_DEFINE5(sched_getattr)`.
+    if flags != 0 && !matches!(target.snapshot()?.0.class, SchedClass::Deadline) {
+        return Err(AxError::InvalidInput);
+    }
     let (_, actor_cred) = scheduler_actor_snapshot();
     let target_cred = target.credential()?;
     dispatch_task_getscheduler(&SecurityTaskGetSchedulerContext::new(
@@ -1670,14 +1843,29 @@ pub fn sys_sched_getattr<M: UserMemory + ?Sized>(
         util_min,
         util_max,
     ) = target.snapshot()?;
+    // `get_params()` only consults the deadline entity for a deadline policy;
+    // every other class leaves the `SCHED_DL_FLAGS` bits clear.
+    //
+    // `SCHED_GETATTR_FLAG_DL_DYNAMIC` asks `__getparam_dl()` for the running
+    // budget and the absolute deadline instead of the configured reservation.
+    // This kernel's EEVDF deadline core has no exposed per-entity runtime
+    // clock, so the configured values below are reported for that flag too;
+    // the flag is accepted so the argument contract matches Linux.
+    let dl_flags = if matches!(state.class, SchedClass::Deadline) {
+        target.deadline_flags()?
+            & (linux_sched::SCHED_FLAG_RECLAIM | linux_sched::SCHED_FLAG_DL_OVERRUN)
+    } else {
+        0
+    };
     let mut out = SchedAttr {
         size: out_size.min(size_of::<SchedAttr>()) as u32,
         sched_policy: linux_policy_from_state(state, reset_on_fork) as u32 & !SCHED_RESET_ON_FORK,
-        sched_flags: if reset_on_fork {
-            linux_sched::SCHED_FLAG_RESET_ON_FORK
-        } else {
-            0
-        },
+        sched_flags: dl_flags
+            | if reset_on_fork {
+                linux_sched::SCHED_FLAG_RESET_ON_FORK
+            } else {
+                0
+            },
         sched_nice: state_nice(state),
         sched_priority: state_static_priority(state) as u32,
         sched_runtime: if matches!(state.class, SchedClass::Deadline) {
@@ -1923,6 +2111,57 @@ fn setpriority_one(
     record_setpriority_result(result, attempt);
 }
 
+/// `set_one_prio()` applied to an unreaped zombie.
+///
+/// Linux reaches a zombie through `find_task_by_vpid()`/`do_each_pid_thread()`
+/// because the `task_struct` outlives the exit, so `setpriority(2)` can still
+/// authorize and store its nice value. TheKernel has no live scheduler entity
+/// to update by then, so the retained terminal transaction is written instead.
+///
+/// Authorization uses the credentials frozen in the zombie snapshot, which is
+/// what `p->cred` still points at in Linux, and the *retained* nice value for
+/// `can_nice()`, so a lowering request is judged against the value
+/// `getpriority(2)` would report.
+fn setpriority_one_zombie(
+    result: &mut AxResult<()>,
+    actor_task: &AxTaskRef,
+    actor_cred: &Arc<Cred>,
+    process: &Arc<Process>,
+    new_nice: i8,
+) {
+    let attempt = (|| -> AxResult<()> {
+        let snapshot = process.zombie_payload().ok_or(AxError::NoSuchProcess)?;
+        let current_nice = zombie_scheduler_state(process)?.nice;
+        let rlimit_nice = actor_task.as_thread().proc_data.rlim.read()[RLIMIT_NICE].current;
+        SchedulerAuthoritySnapshot::new(actor_cred.clone(), snapshot.credential.clone())
+            .authorize(SchedulerSecurityOperation::SetNice {
+                current_nice,
+                requested_nice: new_nice,
+                rlimit_nice,
+            })?;
+        set_zombie_nice(process, new_nice)
+    })();
+    record_setpriority_result(result, attempt);
+}
+
+/// Finds the authoritative unreaped zombie whose visible PID is `who`.
+fn zombie_target_for_setpriority(
+    who: Pid,
+    caller_pid_ns: &Arc<PidNamespace>,
+) -> Option<Arc<Process>> {
+    process_domain()
+        .ok()?
+        .registry()
+        .processes()
+        .find(|process| {
+            process.is_zombie()
+                && zombie_pid_ns(process).is_some_and(|target_pid_ns| {
+                    visible_process_pid_in_namespace(process.pid(), &target_pid_ns, caller_pid_ns)
+                        == Some(who)
+                })
+        })
+}
+
 pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize> {
     let which = syscall_c_int(which);
     let who = syscall_c_int(who);
@@ -1938,15 +2177,22 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
     let mut result = Err(AxError::NoSuchProcess);
     match which as u32 {
         PRIO_PROCESS => {
-            let task = if who == 0 {
-                actor_task.clone()
+            // `who ? find_task_by_vpid(who) : current`: the lookup has no state
+            // filter, so an unreaped zombie is a valid target.
+            if who == 0 {
+                setpriority_one(&mut result, &actor_task, &actor_cred, actor_task.clone(), new_nice);
             } else if who > 0 {
-                visible_live_task_for_getpriority(who as Pid, &caller_pid_ns)
-                    .ok_or(AxError::NoSuchProcess)?
+                if let Some(task) = visible_live_task_for_getpriority(who as Pid, &caller_pid_ns) {
+                    setpriority_one(&mut result, &actor_task, &actor_cred, task, new_nice);
+                } else if let Some(process) = zombie_target_for_setpriority(who as Pid, &caller_pid_ns)
+                {
+                    setpriority_one_zombie(&mut result, &actor_task, &actor_cred, &process, new_nice);
+                } else {
+                    return Err(AxError::NoSuchProcess);
+                }
             } else {
                 return Err(AxError::NoSuchProcess);
-            };
-            setpriority_one(&mut result, &actor_task, &actor_cred, task, new_nice);
+            }
         }
         PRIO_PGRP => {
             if who < 0 {
@@ -1956,10 +2202,10 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
             let target_group = if who == 0 {
                 Some(actor_task.as_thread().proc_data.proc.group())
             } else {
+                // `find_vpid(who)` resolves a process group with no state
+                // filter, so a group named only by zombies still resolves.
                 registry.processes().find_map(|process| {
-                    (!process.is_zombie())
-                        .then(|| process_pid_ns_for_getpriority(&process))
-                        .flatten()
+                    process_pid_ns_for_getpriority(&process)
                         .filter(|pid_ns| {
                             visible_process_pid_in_namespace(
                                 process.group().pgid(),
@@ -1972,7 +2218,20 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
             };
             let target_group = target_group.ok_or(AxError::NoSuchProcess)?;
             for process in registry.processes() {
-                if process.is_zombie() || !Arc::ptr_eq(&process.group(), &target_group) {
+                if !Arc::ptr_eq(&process.group(), &target_group) {
+                    continue;
+                }
+                // `do_each_pid_thread()` yields every task in the group,
+                // including a zombie leader, which `set_one_prio()` then
+                // updates in place.
+                if process.is_zombie() {
+                    setpriority_one_zombie(
+                        &mut result,
+                        &actor_task,
+                        &actor_cred,
+                        &process,
+                        new_nice,
+                    );
                     continue;
                 }
                 for tid in process.thread_ids() {
@@ -1995,7 +2254,24 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
                     .ok_or(AxError::NoSuchProcess)?
             };
             for process in process_domain()?.registry().processes() {
+                // `for_each_process_thread()` walks every task, and the
+                // `task_pid_vnr(p)` guard below only skips a task with no ID
+                // in the caller's namespace -- a zombie leader clears it.
                 if process.is_zombie() {
+                    if zombie_pid_ns(&process)
+                        .is_some_and(|pid_ns| caller_pid_ns.contains(&pid_ns))
+                        && process
+                            .zombie_payload()
+                            .is_some_and(|snapshot| snapshot.credential.ids().ruid == uid)
+                    {
+                        setpriority_one_zombie(
+                            &mut result,
+                            &actor_task,
+                            &actor_cred,
+                            &process,
+                            new_nice,
+                        );
+                    }
                     continue;
                 }
                 for tid in process.thread_ids() {
@@ -2003,7 +2279,9 @@ pub fn sys_setpriority(which: usize, who: usize, prio: usize) -> AxResult<isize>
                         continue;
                     };
                     let thread = task.as_thread();
-                    if thread.pending_exit() || !caller_pid_ns.contains(&thread.pid_ns()) {
+                    // `task_pid_vnr(p)` is zero for a task invisible from the
+                    // caller's namespace, which is what excludes it.
+                    if !caller_pid_ns.contains(&thread.pid_ns()) {
                         continue;
                     }
                     if thread.current_cred().ids().ruid == uid {
@@ -2286,19 +2564,25 @@ fn visible_process_pid_in_namespace(
 /// different global PID; it still scans the authoritative task table rather
 /// than inventing a second task registry.
 fn visible_task_for_ioprio(who: Pid, caller_pid_ns: &Arc<PidNamespace>) -> AxResult<AxTaskRef> {
+    // Linux resolves `IOPRIO_WHO_PROCESS` with `find_task_by_vpid()`, which
+    // matches on identity alone. `PF_EXITING` is therefore not a filter here:
+    // a task between setting `PF_EXITING` and being published as a zombie is
+    // still findable, and `IoprioTarget` already reports the CLASS_NONE default
+    // for that lifecycle window -- `exit_io_context()` has dropped the live
+    // `io_context` by then, so Linux would find the task and read no priority
+    // rather than report ESRCH.
+    //
+    // `get_visible_task()` would hide that window because it excludes
+    // `pending_exit`, so the scan below is the authoritative lookup.
     if let Ok(task) = get_visible_task(who)
         && visible_tid_in_namespace(&task, caller_pid_ns) == Some(who)
-        && !task.as_thread().pending_exit()
     {
         return Ok(task);
     }
 
     try_tasks()?
         .into_iter()
-        .find(|task| {
-            !task.as_thread().pending_exit()
-                && visible_tid_in_namespace(task, caller_pid_ns) == Some(who)
-        })
+        .find(|task| visible_tid_in_namespace(task, caller_pid_ns) == Some(who))
         .ok_or(AxError::NoSuchProcess)
 }
 
@@ -2404,7 +2688,10 @@ fn ioprio_multi_targets(
             let target_group = target_group.ok_or(AxError::NoSuchProcess)?;
             for task in tasks {
                 let thread = task.as_thread();
-                if thread.pending_exit() || !caller_pid_ns.contains(&thread.pid_ns()) {
+                // `do_each_pid_thread()` yields every task in the group with no
+                // `PF_EXITING` filter; `IoprioTarget` already reports the
+                // CLASS_NONE default for a task whose `io_context` is gone.
+                if !caller_pid_ns.contains(&thread.pid_ns()) {
                     continue;
                 }
                 let group = thread.proc_data.proc.group();
@@ -2443,10 +2730,9 @@ fn ioprio_multi_targets(
             };
             for task in tasks {
                 let thread = task.as_thread();
-                if !thread.pending_exit()
-                    && caller_pid_ns.contains(&thread.pid_ns())
-                    && thread.real_uid() == uid
-                {
+                // `for_each_process_thread()` applies only the
+                // `task_pid_vnr(p)` visibility guard, never `PF_EXITING`.
+                if caller_pid_ns.contains(&thread.pid_ns()) && thread.real_uid() == uid {
                     targets.push(IoprioTarget::Live(task));
                 }
             }
