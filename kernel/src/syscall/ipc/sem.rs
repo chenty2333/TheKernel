@@ -886,9 +886,13 @@ fn validate_semnum(array: &SemArray, semnum: i32) -> AxResult<usize> {
 }
 
 pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
-    // Linux rejects negative nsems before looking up a keyed array.  Zero is
-    // valid only for an existing set and remains handled by that branch.
-    if nsems < 0 {
+    // Linux `ksys_semget()` bounds the request against the namespace's
+    // `sc_semmsl` *before* `ipcget()` looks the key up (`ipc/sem.c:614-621`),
+    // so an oversized `nsems` is EINVAL even for an existing key (which would
+    // otherwise answer EEXIST or succeed) and for an absent one (which would
+    // otherwise answer ENOENT).  Zero is only valid against an existing set,
+    // which `newary()` rejects with EINVAL (`ipc/sem.c:534-535`).
+    if nsems < 0 || nsems as usize > semmsl_limit() {
         return Err(AxError::from(LinuxError::EINVAL));
     }
     let current = current();
@@ -930,7 +934,7 @@ pub fn sys_semget(key: i32, nsems: i32, semflg: i32) -> AxResult<isize> {
     if key != IPC_PRIVATE && !create {
         return Err(AxError::from(LinuxError::ENOENT));
     }
-    if nsems <= 0 || nsems as usize > semmsl_limit() {
+    if nsems == 0 {
         return Err(AxError::from(LinuxError::EINVAL));
     }
     if manager.total_semaphores().saturating_add(nsems as usize) > semmns_limit() {
