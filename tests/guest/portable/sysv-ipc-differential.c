@@ -11,9 +11,10 @@
  *   - a *new* key created with SHM_HUGETLB must succeed on Linux and fails on
  *     TheKernel, which has no huge-page backing, so only the existing-key path
  *     (which never reaches newseg() on either kernel) is asserted;
- *   - the `next_id` files under /proc/sys/kernel are gated on
- *     CONFIG_CHECKPOINT_RESTORE in Linux, which is not guaranteed in the
- *     oracle kernel, so the requested-identifier path is not exercised here;
+ *   - the `next_id` files under /proc/sys/kernel and the MSG_COPY flag are
+ *     gated on CONFIG_CHECKPOINT_RESTORE in Linux, which the oracle kernel
+ *     disables, so neither the requested-identifier path nor MSG_COPY's
+ *     argument order is asserted here;
  *   - the number of cyclic wraps needed to observe a sequence bump depends on
  *     how many objects other guests processes hold, so the identifier cases
  *     assert reuse *progression* instead of a fixed sequence value.
@@ -666,11 +667,11 @@ static void case_errno_order(void) {
     check(msgrcv(msqid, &msg, 8, 0, 0) == 8, "msgrcv-ok");
     check(msg.mtype == 1 && memcmp(msg.mtext, "payload", 8) == 0, "msgrcv-data");
 
-    /* MSG_COPY prepares its scratch message from the caller's buffer before it
-     * resolves the queue, so an unreadable buffer wins over the bad id. */
-    errno = 0;
-    errno_call(msgrcv(0x7fff, BAD, 8, 0, MSG_COPY | IPC_NOWAIT), EFAULT,
-               "msgrcv-copy-efault-first");
+    /* MSG_COPY is not asserted: with CONFIG_CHECKPOINT_RESTORE disabled Linux
+     * answers it with ENOSYS before it looks at the buffer at all, and the
+     * oracle kernel has that configuration off. TheKernel's ordering (usercopy
+     * before the queue lookup) was checked against a CHECKPOINT_RESTORE=y
+     * Linux instead. */
 
     /* The table-wide commands still reject a negative identifier. */
     memset(&mds, 0, sizeof(mds));
@@ -736,7 +737,6 @@ static void case_errno_order(void) {
     mark("SEMOP_EFBIG_BEFORE_EACCES");
     mark("MSGSND_FAULTS_BEFORE_VALIDATION");
     mark("MSGSND_SIZE_AND_TYPE_BEFORE_ID");
-    mark("MSGRCV_COPY_FAULT_BEFORE_ID");
     mark("TABLE_COMMANDS_REJECT_NEGATIVE_ID");
     mark("SEMCTL_VALUE_AND_SEMNUM_ORDER");
     mark("SEMTIMEDOP_COUNT_AND_TIMEOUT_ORDER");
