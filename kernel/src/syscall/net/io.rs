@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::{
     mem::{MaybeUninit, size_of},
-    net::{IpAddr, Ipv4Addr},
+    net::IpAddr,
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -1519,6 +1519,12 @@ pub fn sys_sendmsg(
 }
 
 enum ReceivedSocketAddress {
+    /// No provider wrote a source address, so `msg_namelen` stays as the
+    /// receive entry point left it: zero.  `move_addr_to_user()` then reports a
+    /// zero length and copies nothing (`net/socket.c:288-303`), which is what a
+    /// connected stream reports — "According to UNIX98, msg_name/msg_namelen
+    /// are ignored on connected socket." (`net/ipv4/tcp.c:2910-2912`).
+    Unspecified,
     Network(SocketAddrEx),
     Netlink { pid: u32, groups: u32 },
     Packet(tk_linux_packet::SockAddrLl),
@@ -1532,6 +1538,7 @@ impl ReceivedSocketAddress {
         addrlen: &mut socklen_t,
     ) -> AxResult<()> {
         match self {
+            Self::Unspecified => super::addr::fill_addr(capability, addr, addrlen, &[]),
             Self::Network(addr_value) => addr_value.write_to_user(capability, addr, addrlen),
             Self::Netlink { pid, groups } => {
                 let addr_value = SockaddrNl {
@@ -1786,9 +1793,29 @@ fn recv_impl(
     let record_capacity = dst.remaining_mut();
     let mut cmsg = Vec::new();
 
-    let mut remote_addr = want_address.then(|| SocketAddrEx::Ip((Ipv4Addr::UNSPECIFIED, 0).into()));
+    // Linux publishes a peer address only when the transport writes one.
+    // `__sys_recvfrom()` starts from a zeroed `struct msghdr` — the only field
+    // it sets is `.msg_name`, so `msg_namelen` is 0 before the protocol runs
+    // (`net/socket.c:2277-2286`) — and `____sys_recvmsg()` spells that out with
+    // `msg_sys->msg_namelen = 0;` (`net/socket.c:2886-2893`).  The protocols
+    // that store the sender all key on that pointer rather than on the length:
+    // udp_recvmsg(), raw_recvmsg(), sctp_recvmsg(), netlink_recvmsg(),
+    // packet_recvmsg() and unix_dgram_recvmsg() (`net/ipv4/udp.c:2094-2101`,
+    // `net/ipv4/raw.c:784-790`, `net/sctp/socket.c:2153-2155`,
+    // `net/netlink/af_netlink.c:1958-1966`,
+    // `net/packet/af_packet.c:3521-3544`, `net/unix/af_unix.c:2550-2557`).
+    // `tcp_recvmsg_locked()` documents the opposite — "According to UNIX98,
+    // msg_name/msg_namelen are ignored on connected socket."
+    // (`net/ipv4/tcp.c:2910-2912`) — and `unix_stream_read_generic()` never
+    // stores one either.  So the slot itself carries the answer and no
+    // placeholder is ever published in its place.
+    let mut remote_addr = None;
     let options = RecvOptions {
-        from: remote_addr.as_mut(),
+        from: if want_address {
+            Some(&mut remote_addr)
+        } else {
+            None
+        },
         flags: recv_flags.generic,
         cmsg: Some(&mut cmsg),
         nonblocking_override: Some(nonblocking),
@@ -1926,12 +1953,20 @@ fn recv_impl(
     }
 
     debug!("sys_recv => fd: {fd}, recv: {recv}");
+    // A `want_address` receive whose transport never wrote `options.from` still
+    // reports an address slot, but one of length zero: the callers above pass
+    // `Some(&mut None)` and every transport that has a source address to report
+    // assigns it unconditionally, so an untouched slot means "no name"
+    // (`net/socket.c:2277-2302`).
+    let address = want_address.then(|| {
+        remote_addr.map_or(ReceivedSocketAddress::Unspecified, ReceivedSocketAddress::Network)
+    });
     Ok(ReceiveOutcome {
         returned_len: recv as isize,
         message_truncated: seqpacket && record_len > record_capacity,
         message_eor: seqpacket && recv != 0,
         control_truncated,
-        address: remote_addr.map(ReceivedSocketAddress::Network),
+        address,
     })
 }
 
@@ -2995,5 +3030,34 @@ mod tests {
         assert!(!should_raise_sigpipe(AxError::ConnectionRefused, 0));
         assert!(should_raise_sigpipe(AxError::BrokenPipe, 0));
         assert!(!should_raise_sigpipe(AxError::BrokenPipe, MSG_NOSIGNAL));
+    }
+
+    #[test]
+    fn an_unnamed_source_address_reports_zero_length_without_copying() {
+        let capability = mapped_io_capability();
+        // A connected stream has no source address to report: the entry point
+        // leaves `msg_namelen` at zero and `move_addr_to_user()` copies nothing
+        // for a zero provider length (`net/socket.c:288-303`).  The bogus
+        // destination proves the copy is skipped, because a single byte written
+        // there would fail.
+        let mut requested: socklen_t = 16;
+        assert!(
+            ReceivedSocketAddress::Unspecified
+                .write_to_user(&capability, UserPtr::from(0x1), &mut requested)
+                .is_ok()
+        );
+        assert_eq!(requested, 0);
+
+        // A negative request is the one arm that neither copies nor rewrites
+        // the length.  `socklen_t` is unsigned, so the user value `-1` reaches
+        // this layer as the maximum of the type.
+        let mut negative: socklen_t = socklen_t::MAX;
+        assert_eq!(
+            ReceivedSocketAddress::Unspecified
+                .write_to_user(&capability, UserPtr::from(0x1), &mut negative)
+                .map_err(LinuxError::from),
+            Err(LinuxError::EINVAL)
+        );
+        assert_eq!(negative, socklen_t::MAX);
     }
 }
