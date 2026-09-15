@@ -858,6 +858,48 @@ impl FileLike for MqFd {
         self.is_nonblocking()
     }
 
+    /// Linux `mqueue_flush_file()` (`ipc/mqueue.c:658`):
+    ///
+    /// ```c
+    /// 	spin_lock(&info->lock);
+    /// 	if (task_tgid(current) == info->notify_owner)
+    /// 		remove_notification(info);
+    ///
+    /// 	spin_unlock(&info->lock);
+    /// ```
+    ///
+    /// `.flush` runs for *every* descriptor of the queue the owning process
+    /// closes, not only for the last one and not only for the descriptor the
+    /// registration named, so the one-shot `mq_notify` registration is gone
+    /// after `mq_open()` + `close()` of a sibling descriptor. `current()`
+    /// resolves the same `task_tgid` the registration recorded in
+    /// [`MqNotifier::pid`]; a close performed by any other process leaves the
+    /// registration armed.
+    fn flush_on_close(&self) {
+        // Every Linux `filp_close()` site runs in task context. A close that
+        // somehow cannot name a current task has no `task_tgid(current)` to
+        // compare against, so it leaves the registration alone rather than
+        // guessing.
+        if !axtask::can_block_current() {
+            return;
+        }
+        let curr = current();
+        let pid = curr.as_thread().proc_data.proc.pid();
+        let removed = {
+            let mut queue = self.queue.lock();
+            if queue
+                .notifier
+                .as_ref()
+                .is_some_and(|notifier| notifier.pid == pid)
+            {
+                queue.notifier.take()
+            } else {
+                None
+            }
+        };
+        remove_notification(removed);
+    }
+
     fn set_nonblocking(&self, nonblocking: bool) -> AxResult {
         self.nonblocking
             .store(nonblocking as usize, Ordering::Release);

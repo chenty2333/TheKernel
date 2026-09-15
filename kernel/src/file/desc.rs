@@ -1802,6 +1802,15 @@ impl FileDescription {
         })
     }
 
+    /// Linux `filp_close()`'s `f_op->flush` step, run before
+    /// [`Self::descriptor_closed`] retires the descriptor reference.
+    ///
+    /// It is deliberately *not* conditioned on this being the last descriptor:
+    /// `dup(2)` keeps an OFD alive across a close that Linux still flushes.
+    pub(crate) fn flush_on_close(&self) {
+        self.inner.flush_on_close();
+    }
+
     pub(crate) fn descriptor_closed(&self) {
         let (close_source, last_descriptor) = {
             let mut lifetime = self.descriptor_lifetime.lock();

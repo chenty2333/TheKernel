@@ -610,6 +610,18 @@ impl PreparedFileMmap {
 
 #[allow(dead_code)]
 pub trait FileLike: Pollable + DowncastSync {
+    /// Linux `filp_close()`'s `->flush` step, run while the closed descriptor
+    /// is still retained by its caller.
+    ///
+    /// `filp_close()` (`fs/open.c`) runs `file->f_op->flush` for `close(2)`,
+    /// `close_range(2)`, the descriptor `dup2(2)` replaces, the close-on-exec
+    /// sweep an `execve()` performs, and task exit. Unlike
+    /// [`Self::final_close`] this is per *descriptor*, not per open file
+    /// description, so it also runs while duplicates of the same OFD stay
+    /// open. Implementations run in task context and may take the locks the
+    /// subsystem's own close path takes.
+    fn flush_on_close(&self) {}
+
     /// Runs at the task-context last-descriptor boundary, before the final
     /// descriptor reference is retired.  Unlike [`Self::final_close`], this
     /// hook may synchronously quiesce hardware owned by another CPU.  It is
