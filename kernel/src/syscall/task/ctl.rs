@@ -199,6 +199,12 @@ fn get_mempolicy_error(error: GetMempolicyError) -> AxError {
 /// reads, so an unreadable word is `EFAULT` and never a silent zero. `maxnode`
 /// is the caller's count of mask bits; only the words Linux would read are
 /// copied, which bounds this to 513 words without trusting `maxnode`.
+///
+/// The words are read from the top of the window down, and a non-zero word
+/// above `MAX_NUMNODES` is rejected as soon as it is read: `get_nodes()` never
+/// reads a lower word once the in-loop `if (t) return -EINVAL;` fires, so a set
+/// bit above `MAX_NUMNODES` outranks an unreadable low word rather than losing
+/// to its `EFAULT`.
 fn read_nodemask<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     nodemask: *const usize,
@@ -220,11 +226,15 @@ fn read_nodemask<M: UserMemory + ?Sized>(
 
     let mut buffer = [0usize; tk_linux_mm::MAX_NODEMASK_BITS / usize::BITS as usize + 1];
     let window = &mut buffer[..words];
-    for (index, slot) in window.iter_mut().enumerate() {
-        *slot = nodemask
+    for index in (0..words).rev() {
+        let word = nodemask
             .wrapping_add(index)
             .vm_read(memory)
             .map_err(map_usercopy_error)?;
+        window[index] = word;
+        if tk_linux_mm::rejects_scanned_word(index, word) {
+            return Err(mempolicy_error(MempolicyError::NodeOutOfRange));
+        }
     }
     tk_linux_mm::parse_node_mask(maxnode, window, supplied)
         .map(|(mask, _)| mask)

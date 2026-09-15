@@ -244,7 +244,7 @@ pub fn parse_node_mask(
             maxnode = MAX_NUMNODES;
             t &= !mask_below(MAX_NUMNODES % usize::BITS as usize);
         }
-        if t != 0 {
+        if rejects_scanned_word(index, t) {
             return Err(MempolicyError::NodeOutOfRange);
         }
     }
@@ -266,6 +266,25 @@ const fn mask_below(bits: usize) -> usize {
     } else {
         (1usize << bits) - 1
     }
+}
+
+/// `get_nodes()`'s in-loop `if (t) return -EINVAL;` for the word just read at
+/// `index` (`mm/mempolicy.c:1673-1688`).
+///
+/// The scan reads the caller's window from its highest word down to word 0, and
+/// that order is observable: the check runs *before* the next lower word is
+/// read, so a set bit above `MAX_NUMNODES` in a high word is `EINVAL` even when
+/// a lower word of the same window is unreadable — the lower word is never
+/// read, and `EFAULT` never happens. Word 0 is the accepted mask rather than a
+/// check (`get_bitmap(nodes_addr(*nodes), nmask, maxnode)`), and the loop body
+/// only runs while `maxnode > MAX_NUMNODES`, so `index` is never 0 there.
+///
+/// `checked_value` is the value Linux tests: the raw word after the iteration's
+/// `t &= ~(...)` clamp. The clamp only masks a partial top word when
+/// `MAX_NUMNODES` is not a multiple of `BITS_PER_LONG`, which cannot happen
+/// here (`MAX_NUMNODES == BITS_PER_LONG == 64`).
+pub const fn rejects_scanned_word(index: usize, checked_value: usize) -> bool {
+    index > 0 && checked_value != 0
 }
 
 /// How many `usize` words of the user mask `get_nodes()` reads for `maxnode`.
@@ -962,6 +981,18 @@ mod tests {
         );
         // A window that stops at `MAX_NUMNODES` never reads word 1 at all.
         assert_eq!(parse_node_mask(65, &[1, 1], true), Ok((1, true)));
+    }
+
+    #[test]
+    fn scanned_word_rejection_applies_only_above_word_zero() {
+        // The loop's `if (t)` runs for every word the scan reads above
+        // `MAX_NUMNODES`, and those words are never word 0: word 0 is the
+        // accepted mask the final `get_bitmap()` copies.
+        assert!(rejects_scanned_word(1, 1));
+        assert!(rejects_scanned_word(512, 1usize << 63));
+        assert!(!rejects_scanned_word(1, 0));
+        assert!(!rejects_scanned_word(0, 1));
+        assert!(!rejects_scanned_word(0, usize::MAX));
     }
 
     #[test]

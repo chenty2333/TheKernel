@@ -73,8 +73,8 @@ pub use mempolicy::{
     MPOL_MF_STRICT, MPOL_MF_VALID, MPOL_MODE_FLAGS, MPOL_PREFERRED, MPOL_PREFERRED_MANY,
     MPOL_USER_NODEMASK_FLAGS, MPOL_WEIGHTED_INTERLEAVE, EffectiveMempolicy, MbindPlan,
     MempolicyError, MempolicyRequest, NR_NODE_IDS, effective_policy, next_interleave_node,
-    parse_node_mask, plan_mbind, reported_policy, sanitize_mode_flags, scanned_words,
-    stores_user_nodemask, validate, validate_get,
+    parse_node_mask, plan_mbind, rejects_scanned_word, reported_policy, sanitize_mode_flags,
+    scanned_words, stores_user_nodemask, validate, validate_get,
 };
 pub use mincore::MincorePlan;
 pub use mmap::{
