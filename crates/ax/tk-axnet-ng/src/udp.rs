@@ -22,7 +22,7 @@ use smoltcp::{
 use spin::RwLock;
 
 use crate::{
-    RecvFlags, RecvOptions, SendOptions, Shutdown, SocketAddrEx, SocketOps,
+    RecvFlags, RecvOptions, SendFlags, SendOptions, Shutdown, SocketAddrEx, SocketOps,
     buffer::{
         normalized_socket_buffer_size, try_filled_buffer, try_zeroed_socket_buffer,
         udp_packet_slots,
@@ -167,6 +167,23 @@ fn replace_udp_recv_buffer(socket: &mut smol::Socket, requested: usize) -> AxRes
         .map_err(|_| AxError::ResourceBusy)
 }
 
+/// One datagram being accumulated by `MSG_MORE`, the transport half of Linux's
+/// `up->pending` cork.
+///
+/// `net/ipv4/udp.c:udp_sendmsg()` corks when the caller sets `MSG_MORE`
+/// (`:1235`), keeps the first call's resolved `fl4` route for every later
+/// append (`:1263-1271` jumps straight to `do_append_data`, ignoring a new
+/// destination), and only pushes the frames when a call arrives without
+/// `MSG_MORE` (`:1470-1474`).  A socket that is closed while corked discards the
+/// frames instead of sending a partial datagram (`udp_destroy_sock()` calls
+/// `udp_flush_pending_frames()`).
+struct UdpCork {
+    peer_addr: IpEndpoint,
+    source_addr: IpAddress,
+    device_mask: u64,
+    payload: alloc::vec::Vec<u8>,
+}
+
 /// A UDP socket that provides POSIX-like APIs.
 pub struct UdpSocket {
     stack: Arc<NetStack>,
@@ -179,6 +196,8 @@ pub struct UdpSocket {
     rx_shutdown: AtomicBool,
     tx_shutdown: AtomicBool,
     poll_state: PollSet,
+    /// Frames accumulated by `MSG_MORE` but not yet pushed as one datagram.
+    cork: Mutex<Option<UdpCork>>,
 
     general: GeneralOptions,
 }
@@ -260,6 +279,7 @@ impl UdpSocket {
             rx_shutdown: AtomicBool::new(false),
             tx_shutdown: AtomicBool::new(false),
             poll_state: PollSet::new(),
+            cork: Mutex::new(None),
 
             general: GeneralOptions::new(),
         })
@@ -651,27 +671,14 @@ impl SocketOps for UdpSocket {
         if self.tx_shutdown.load(Ordering::Acquire) {
             return Err(AxError::BrokenPipe);
         }
-        let (remote_addr, source_addr, explicit_device_mask) = match options.to {
-            Some(addr) => {
-                let addr = IpEndpoint::from(addr.into_ip().map_err(|_| AxError::InvalidInput)?);
-                self.validate_family(addr.addr)?;
-                let bound_source = self.bound_source_addr();
-                let dont_route = self.general.dont_route();
-                let outbound = self
-                    .stack
-                    .get_service()
-                    .resolve_outbound_with_dont_route(&addr.addr, bound_source, dont_route)
-                    .map_err(crate::service::RouteReject::as_ax_error)?;
-                (addr, outbound.src_addr, Some(outbound.device_mask))
-            }
-            None => {
-                let (remote, source) = self.remote_endpoint()?;
-                (remote, source, None)
-            }
-        };
-        if remote_addr.port == 0 || remote_addr.addr.is_unspecified() {
-            ax_bail!(InvalidInput, "invalid address");
-        }
+        // `int corkreq = udp_test_bit(CORK, sk) || msg->msg_flags & MSG_MORE;`
+        // (`net/ipv4/udp.c:1235`).
+        let cork_requested = options.flags.contains(SendFlags::MORE);
+        // `MSG_DONTROUTE` is `ip_sendmsg_scope()`'s `RT_SCOPE_LINK`
+        // (`include/net/ip.h:251-260`), which refuses a route that needs a
+        // gateway; `SO_DONTROUTE` sets the same scope from the socket option.
+        let dont_route =
+            self.general.dont_route() || options.flags.contains(SendFlags::DONT_ROUTE);
         let payload_len = src.remaining();
         if payload_len > MAX_UDP_SEND_LEN {
             return Err(AxError::OutOfRange);
@@ -682,6 +689,99 @@ impl SocketOps for UdpSocket {
         // datagram in the transmit queue or reach a user-triggerable assert.
         let mut payload = try_filled_buffer(payload_len, 0u8)?;
         src.read_exact(&mut payload)?;
+
+        let mut cork = self.cork.lock();
+        let (remote_addr, source_addr, explicit_device_mask) = match cork.as_mut() {
+            // Pending frames: `udp_sendmsg()` jumps straight to
+            // `do_append_data` with the corked `fl4`, so the destination of this
+            // call is ignored and the payload joins the pending datagram
+            // (`net/ipv4/udp.c:1263-1271`, `:1466-1474`).
+            Some(pending) => {
+                if pending.payload.len() + payload.len() > MAX_UDP_SEND_LEN {
+                    return Err(AxError::OutOfRange);
+                }
+                pending.payload.extend_from_slice(&payload);
+                if cork_requested {
+                    return Ok(payload_len);
+                }
+                // The frame that leaves now is the pending datagram with this
+                // payload appended, so the merged buffer replaces the caller's
+                // one: `do_append_data()` sends `up->len` octets accumulated in
+                // the cork, not just the octets of this call
+                // (`net/ipv4/udp.c:1466-1474`).
+                let pending = cork.take().expect("pending cork removed above");
+                payload = pending.payload;
+                (
+                    pending.peer_addr,
+                    pending.source_addr,
+                    Some(pending.device_mask),
+                )
+            }
+            None => {
+                let route = match options.to {
+                    Some(addr) => {
+                        let addr =
+                            IpEndpoint::from(addr.into_ip().map_err(|_| AxError::InvalidInput)?);
+                        self.validate_family(addr.addr)?;
+                        let bound_source = self.bound_source_addr();
+                        let outbound = self
+                            .stack
+                            .get_service()
+                            .resolve_outbound_with_dont_route(&addr.addr, bound_source, dont_route)
+                            .map_err(crate::service::RouteReject::as_ax_error)?;
+                        (addr, outbound.src_addr, Some(outbound.device_mask))
+                    }
+                    None => {
+                        let (remote, source) = self.remote_endpoint()?;
+                        // A connected socket skips the route lookup, but
+                        // `udp_sendmsg()` clears `connected` when the scope is
+                        // `RT_SCOPE_LINK` (`net/ipv4/udp.c:1367-1368`), so
+                        // `MSG_DONTROUTE` still resolves the link-scope route
+                        // and fails with ENETUNREACH when it needs a gateway.
+                        let device_mask = if dont_route {
+                            Some(
+                                self.stack
+                                    .get_service()
+                                    .resolve_outbound_with_dont_route(
+                                        &remote.addr,
+                                        self.bound_source_addr(),
+                                        true,
+                                    )
+                                    .map_err(crate::service::RouteReject::as_ax_error)?
+                                    .device_mask,
+                            )
+                        } else {
+                            None
+                        };
+                        (remote, source, device_mask)
+                    }
+                };
+                if route.0.port == 0 || route.0.addr.is_unspecified() {
+                    ax_bail!(InvalidInput, "invalid address");
+                }
+                if cork_requested {
+                    *cork = Some(UdpCork {
+                        peer_addr: route.0,
+                        source_addr: route.1,
+                        device_mask: route.2.unwrap_or(0),
+                        payload,
+                    });
+                    return Ok(payload_len);
+                }
+                route
+            }
+        };
+        drop(cork);
+
+        // MSG_PROBE without MSG_CONFIRM is inert; with both, `udp_sendmsg()`
+        // reaches `do_confirm` and returns 0 without transmitting when the
+        // payload is empty (`net/ipv4/udp.c:1426-1427`, `:1499-1504`).
+        if options.flags.contains(SendFlags::CONFIRM)
+            && options.flags.contains(SendFlags::PROBE)
+            && payload.is_empty()
+        {
+            return Ok(0);
+        }
 
         self.ensure_autobound()?;
         if let Some(device_mask) = explicit_device_mask {
@@ -734,7 +834,11 @@ impl SocketOps for UdpSocket {
         if sent > 0 {
             self.note_udp_send_progress(sent);
         }
-        Ok(sent)
+        // `udp_sendmsg()` reports the octets *this call* supplied, even when the
+        // call flushed a corked datagram that carries more: `if (!err) return
+        // len;` with `len` the syscall's payload length
+        // (`net/ipv4/udp.c:1485-1486`).
+        Ok(payload_len)
     }
 
     fn recv(&self, mut dst: impl Write, options: RecvOptions) -> AxResult<usize> {
@@ -745,6 +849,9 @@ impl SocketOps for UdpSocket {
         let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
         let flags = options.flags;
         let mut sender_output = options.from;
+        // `MSG_OOB` is ignored by `udp_recvmsg()`: the flag reaches the
+        // `MSG_ERRQUEUE`/`MSG_PEEK`/`MSG_DONTWAIT` tests and nothing else
+        // (`net/ipv4/udp.c:1917-1936`), so the datagram is delivered normally.
 
         self.general
             .recv_poller_with_effective_nonblocking(self, effective_nonblocking, || {
@@ -864,6 +971,10 @@ impl Pollable for UdpSocket {
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
+        // `udp_destroy_sock()` runs `udp_flush_pending_frames()`: a datagram
+        // still corked by `MSG_MORE` is discarded rather than sent short
+        // (`net/ipv4/udp.c:1756-1757`).
+        drop(self.cork.lock().take());
         self.with_smol_socket(|socket| socket.close());
         self.stack.socket_set.remove(self.handle);
     }

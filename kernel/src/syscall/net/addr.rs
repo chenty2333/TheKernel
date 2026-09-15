@@ -72,7 +72,7 @@ pub(super) fn read_family(
     Ok(__kernel_sa_family_t::from_ne_bytes(family))
 }
 
-fn try_arc_bytes(value: &[u8]) -> AxResult<Arc<Vec<u8>>> {
+pub(super) fn try_arc_bytes(value: &[u8]) -> AxResult<Arc<Vec<u8>>> {
     let mut owned = Vec::new();
     owned
         .try_reserve_exact(value.len())
@@ -103,22 +103,51 @@ unsafe fn cast_to_slice<T>(value: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) }
 }
 
+/// The tail of `move_addr_to_user()` (`net/socket.c:281-310`):
+///
+/// ```c
+/// 	unsafe_get_user(len, ulen, efault_end);      /* int, so a negative
+/// 	                                                request stays negative */
+/// 	if (len > klen)
+/// 		len = klen;
+/// 	/* "fromlen shall refer to the value before truncation.."  1003.1g */
+/// 	if (len >= 0)
+/// 		unsafe_put_user(klen, ulen, efault_end);
+/// 	if (len) {
+/// 		if (len < 0)
+/// 			return -EINVAL;
+/// 		if (copy_to_user(uaddr, kaddr, len))
+/// 			return -EFAULT;
+/// 	}
+/// ```
+///
+/// Two observable consequences: the reported length is the provider's own
+/// length even when the caller's buffer is too small, and it is written back
+/// *before* the copy, so a copy-out fault still updates `*addrlen`.  A negative
+/// request is `EINVAL` and leaves both the buffer and the length untouched.
 fn fill_addr(
     capability: &UserMemoryCapability,
     addr: UserPtr<sockaddr>,
     addrlen: &mut socklen_t,
     data: &[u8],
 ) -> AxResult<()> {
-    if *addrlen > i32::MAX as socklen_t {
-        return Err(AxError::InvalidInput);
+    let requested = *addrlen as i32;
+    let len = if requested > data.len() as i32 {
+        data.len() as i32
+    } else {
+        requested
+    };
+    if len >= 0 {
+        *addrlen = data.len() as _;
     }
-    let len = (*addrlen as usize).min(data.len());
     if len != 0 {
+        if len < 0 {
+            return Err(AxError::InvalidInput);
+        }
         capability
-            .write_bytes(addr.address().as_usize(), &data[..len])
+            .write_bytes(addr.address().as_usize(), &data[..len as usize])
             .map_err(map_usercopy_error)?;
     }
-    *addrlen = data.len() as _;
     Ok(())
 }
 

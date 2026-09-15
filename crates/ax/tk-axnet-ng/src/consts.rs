@@ -16,7 +16,12 @@ pub const LOOPBACK_MTU: usize = 64 * 1024 - 40;
 pub const LOOPBACK_TCP_MSS: usize = LOOPBACK_MTU - 40;
 
 pub const SOCKET_BUFFER_MIN: usize = 4 * 1024;
-pub const SOCKET_BUFFER_MAX: usize = 4 * 1024 * 1024;
+/// Largest buffer `SO_SNDBUF`/`SO_RCVBUF` can ask for, in the units the
+/// getter reports.  Linux stores `max_t(int, val * 2, SOCK_MIN_*BUF)` where
+/// `val = min_t(u32, requested, sysctl_wmem_max)` and `sysctl_wmem_max` is
+/// 4 MiB (`net/core/sock.c:1342-1352`, `:1374`), so 8 MiB is the largest value
+/// a getter can return without `SO_*BUFFORCE`.
+pub const SOCKET_BUFFER_MAX: usize = 8 * 1024 * 1024;
 pub const TCP_RX_BUF_LEN: usize = 128 * 1024;
 pub const TCP_TX_BUF_LEN: usize = 128 * 1024;
 pub const UDP_RX_BUF_LEN: usize = 256 * 1024;

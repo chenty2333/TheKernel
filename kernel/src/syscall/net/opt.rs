@@ -407,6 +407,67 @@ mod conv {
         }
     }
 
+    /// `SO_SNDBUF`'s `int` import.  Linux does not reject a negative value:
+    /// `val = min_t(u32, val, READ_ONCE(sysctl_wmem_max))` (`net/core/sock.c:
+    /// 1342`) compares unsigned, so `-1` lands on the sysctl maximum, and
+    /// `sk->sk_sndbuf` is then `max_t(int, val * 2, SOCK_MIN_SNDBUF)`
+    /// (`:1350-1352`) — which is what the getter reports back.
+    pub struct SendBufferSize;
+
+    impl SendBufferSize {
+        pub fn sys_to_rust(val: i32) -> AxResult<usize> {
+            Ok(tk_linux_net::decode_send_buffer(tk_linux_net::clamp_buffer_request(
+                val,
+                tk_linux_net::SYSCTL_WMEM_MAX,
+            )) as usize)
+        }
+
+        /// `sk_getsockopt()` reports `sk_sndbuf` back as an `int`
+        /// (`net/core/sock.c:1832-1835`), so the transport's stored capacity is
+        /// what userspace reads.
+        pub fn rust_to_sys(val: usize) -> AxResult<i32> {
+            i32::try_from(val).map_err(|_| AxError::InvalidInput)
+        }
+    }
+
+    /// `SO_RCVBUF`'s `int` import: `__sock_set_rcvbuf(sk, min_t(u32, val,
+    /// READ_ONCE(sysctl_rmem_max)))` (`net/core/sock.c:1374`), whose arithmetic
+    /// is `max_t(int, val * 2, SOCK_MIN_RCVBUF)`.
+    pub struct ReceiveBufferSize;
+
+    impl ReceiveBufferSize {
+        pub fn sys_to_rust(val: i32) -> AxResult<usize> {
+            Ok(tk_linux_net::decode_receive_buffer(
+                tk_linux_net::clamp_buffer_request(val, tk_linux_net::SYSCTL_RMEM_MAX),
+            ) as usize)
+        }
+
+        /// The getter counterpart of `sys_to_rust`: `sk_rcvbuf` is an `int`.
+        pub fn rust_to_sys(val: usize) -> AxResult<i32> {
+            i32::try_from(val).map_err(|_| AxError::InvalidInput)
+        }
+    }
+
+    /// The `SO_SNDBUFFORCE`/`SO_RCVBUFFORCE` imports skip the sysctl clamp but
+    /// floor a negative request at zero: `if (val < 0) val = 0;`
+    /// (`net/core/sock.c:1356-1358`, `:1382-1384`).
+    pub struct SendBufferForceSize;
+
+    impl SendBufferForceSize {
+        pub fn sys_to_rust(val: i32) -> AxResult<usize> {
+            Ok(tk_linux_net::decode_send_buffer(tk_linux_net::force_buffer_request(val)) as usize)
+        }
+    }
+
+    pub struct ReceiveBufferForceSize;
+
+    impl ReceiveBufferForceSize {
+        pub fn sys_to_rust(val: i32) -> AxResult<usize> {
+            Ok(tk_linux_net::decode_receive_buffer(tk_linux_net::force_buffer_request(val))
+                as usize)
+        }
+    }
+
     pub struct IntBool;
 
     impl IntBool {
@@ -496,8 +557,8 @@ macro_rules! call_dispatch {
             LinuxSocketOption::ReuseAddress => ReuseAddress as IntBool,
             LinuxSocketOption::PendingError => Error as SocketError,
             LinuxSocketOption::DontRoute => DontRoute as IntBool,
-            LinuxSocketOption::SendBuffer => SendBuffer as Int<usize>,
-            LinuxSocketOption::ReceiveBuffer => ReceiveBuffer as Int<usize>,
+            LinuxSocketOption::SendBuffer => SendBuffer as SendBufferSize,
+            LinuxSocketOption::ReceiveBuffer => ReceiveBuffer as ReceiveBufferSize,
             LinuxSocketOption::KeepAlive => KeepAlive as IntBool,
             LinuxSocketOption::ReceiveTimeout => ReceiveTimeout as Duration,
             LinuxSocketOption::SendTimeout => SendTimeout as Duration,
@@ -1460,6 +1521,16 @@ pub fn sys_setsockopt(
     );
 
     let pinned = PinnedSocketDescription::from_fd(fd)?;
+    // `do_sock_setsockopt()` rejects a negative length before the security hook
+    // and before any protocol reads the option: `if (optlen < 0) return -EINVAL;`
+    // (`net/socket.c:2342-2343`), which `__sys_setsockopt` reaches only after it
+    // resolved the descriptor (`:2330-2339`).  Every later `optlen` test in this
+    // file is a lower bound, so without this a `socklen_t` of -1 would be read
+    // as a huge unsigned length.  The same rule bounds `getsockopt`
+    // (`:2312-2320` for the copyin, `:2366-2367` for the negative check).
+    if !tk_linux_net::option_length_admitted(optlen) {
+        return Err(AxError::InvalidInput);
+    }
     let socket_ref = pinned.security_ref()?;
     dispatch_socket(&SocketSecurityContext::set_option(
         snapshot.actor(),
@@ -1906,8 +1977,11 @@ pub fn sys_setsockopt(
                 ) {
                     return Err(LinuxError::EPERM.into());
                 }
-                let size = (read_option::<u32>(&capability, optval, optlen)? as usize)
-                    .min(i32::MAX as usize);
+                let size = conv::SendBufferForceSize::sys_to_rust(read_option::<i32>(
+                    &capability,
+                    optval,
+                    optlen,
+                )?)?;
                 socket.set_option(SetSocketOption::SendBufferForce(&size))?;
                 return Ok(0);
             }
@@ -1919,8 +1993,11 @@ pub fn sys_setsockopt(
                 ) {
                     return Err(LinuxError::EPERM.into());
                 }
-                let size = (read_option::<u32>(&capability, optval, optlen)? as usize)
-                    .min(i32::MAX as usize);
+                let size = conv::ReceiveBufferForceSize::sys_to_rust(read_option::<i32>(
+                    &capability,
+                    optval,
+                    optlen,
+                )?)?;
                 socket.set_option(SetSocketOption::ReceiveBufferForce(&size))?;
                 return Ok(0);
             }

@@ -758,6 +758,14 @@ pub fn sys_bind(
 ) -> AxResult<isize> {
     let snapshot = SocketSyscallSnapshot::capture();
     let pinned = PinnedSocketDescription::from_fd(fd)?;
+    // `__sys_bind` resolves the descriptor first and only then runs
+    // `move_addr_to_kernel()` (`net/socket.c:1943-1948`), whose bound is
+    // `if (ulen < 0 || ulen > sizeof(struct sockaddr_storage)) return -EINVAL;`
+    // (`:249-250`).  Every family below therefore sees an address no longer
+    // than `struct sockaddr_storage`.
+    if !tk_linux_net::address_import_admitted(addrlen as i32) {
+        return Err(AxError::InvalidInput);
+    }
     let actor = snapshot.actor();
     let socket_ref = pinned.security_ref()?;
     match pinned.backend()? {
@@ -777,10 +785,9 @@ pub fn sys_bind(
             pinned.af_alg()?.bind(addr)?;
         }
         SocketBackendKind::Netlink => {
-            // `netlink_bind` requires `addr_len >= sizeof(struct sockaddr_nl)`.
-            // The upper bound comes from `move_addr_to_kernel`, which already
-            // refused anything above `sockaddr_storage`, so a longer address is
-            // a legal prefix rather than an error.
+            // `netlink_bind` requires `addr_len >= sizeof(struct sockaddr_nl)`;
+            // the upper bound is the `move_addr_to_kernel` test already applied
+            // above, so a longer address is a legal prefix rather than an error.
             if (addrlen as usize) < size_of::<crate::file::netlink::SockaddrNl>() {
                 return Err(AxError::InvalidInput);
             }
@@ -863,6 +870,39 @@ pub fn sys_bind(
         }
         SocketBackendKind::Network => {
             let socket = pinned.network()?;
+            // `unix_bind()` autobinds a family-only AF_UNIX address before it
+            // validates that address at all:
+            //
+            // ```c
+            // 	if (addr_len == offsetof(struct sockaddr_un, sun_path) &&
+            // 	    sunaddr->sun_family == AF_UNIX)
+            // 		return unix_autobind(sk);
+            // ```
+            //
+            // (`net/unix/af_unix.c:1463-1470`; `offsetof(sun_path)` is 2 on
+            // x86_64, so `bind(fd, {AF_UNIX}, 2)` succeeds with an abstract
+            // name).  Any other two-byte record falls through to
+            // `unix_validate_addr()` and its `-EINVAL`.  The security hook has
+            // already run in the generic bind path above; it sees the raw
+            // family-only address, so no name is invented for it here.
+            if let SocketInner::Unix(unix) = &socket.inner
+                && addrlen as usize >= size_of::<linux_raw_sys::net::__kernel_sa_family_t>()
+                && tk_linux_net::unix_autobind_request(
+                    addrlen as usize,
+                    super::addr::read_family(&capability, addr, addrlen)?,
+                )
+            {
+                debug!("sys_bind <= fd: {fd}, autobind");
+                let prepared = PreparedSocketAddress::Unspecified;
+                dispatch_socket(&SocketSecurityContext::bind(
+                    actor,
+                    &socket_ref,
+                    &prepared,
+                    addrlen as usize,
+                ))?;
+                unix_autobind(unix, &pinned.description().clone())?;
+                return Ok(0);
+            }
             let addr = SocketAddrEx::read_from_user(&capability, addr, addrlen)?;
             debug!("sys_bind <= fd: {fd}, addr: {addr:?}");
             let prepared = PreparedSocketAddress::Network(addr);
@@ -985,6 +1025,29 @@ pub fn sys_connect(
         let prepared = PreparedSocketAddress::Packet(address);
         dispatch_socket(&SocketSecurityContext::connect(
             actor,
+            &socket_ref,
+            &prepared,
+            addrlen as usize,
+        ))?;
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+
+    if matches!(
+        pinned.backend()?,
+        SocketBackendKind::AfAlg | SocketBackendKind::Xdp
+    ) {
+        // `alg_proto_ops.connect` (`crypto/af_alg.c:480`) and
+        // `xsk_proto_ops.connect` (`net/xdp/xsk.c:2140`) are both
+        // `sock_no_connect`, which is `return -EOPNOTSUPP;`
+        // (`net/core/sock.c:3536-3539`).  Linux still imports the address and
+        // runs `security_socket_connect()` first, so the family's own address
+        // decode errors keep their precedence.
+        let addr = SocketAddrEx::read_from_user(&capability, addr, addrlen)?;
+        debug!("sys_connect <= fd: {fd}, addr: {addr:?}");
+        let socket_ref = pinned.security_ref()?;
+        let prepared = PreparedSocketAddress::Network(addr);
+        dispatch_socket(&SocketSecurityContext::connect(
+            snapshot.actor(),
             &socket_ref,
             &prepared,
             addrlen as usize,
@@ -1187,6 +1250,68 @@ pub fn sys_connect(
     Ok(0)
 }
 
+/// `unix_autobind()` (`net/unix/af_unix.c:1287-1337`).
+///
+/// A family-only `bind` asks the socket to name itself: Linux builds the
+/// six-byte abstract name `\0%05x` from a 20-bit order number seeded by
+/// `get_random_u32()`, inserts it into the namespace, and retries with the next
+/// number when the name is already taken.  Exhausting the whole space reports
+/// `-ENOSPC`.  A socket that already has a name keeps it and reports success,
+/// because the function returns the `mutex_lock_interruptible()` result zero
+/// through `if (u->addr) goto out;`.
+fn unix_autobind(unix: &UnixSocket, owner: &Arc<FileDescription>) -> AxResult<()> {
+    if unix.is_bound() {
+        return Ok(());
+    }
+    let mut ordernum =
+        unix_autobind_seed() & tk_linux_net::UNIX_AUTOBIND_ORDERNUM_MASK;
+    let lastnum = ordernum;
+    loop {
+        ordernum = (ordernum + 1) & tk_linux_net::UNIX_AUTOBIND_ORDERNUM_MASK;
+        // `unix_autobind_name()` returns Linux's stored `sun_path` bytes, which
+        // begin with the abstract marker.  This kernel's `UnixSocketAddr::
+        // Abstract` payload is what follows that marker (the decode side splits
+        // the same way), so the record `unix_getname()` exports carries exactly
+        // one leading NUL and `addr->len` is `offsetof(sun_path) + 6 = 8`
+        // (`net/unix/af_unix.c:1309-1318`).
+        let address = UnixSocketAddr::Abstract(super::addr::try_arc_bytes(
+            &tk_linux_net::unix_autobind_name(ordernum)[1..],
+        )?);
+        match unix.bind_abstract_with_publish(address, |endpoint| {
+            super::cmsg::prepare_unix_endpoint_owner(endpoint.raw(), owner)
+        }) {
+            Ok(prepared) => {
+                prepared.commit();
+                return Ok(());
+            }
+            Err(AxError::AddrInUse) => {
+                if ordernum == lastnum {
+                    // Every name in the 20-bit space is taken.
+                    return Err(LinuxError::ENOSPC.into());
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The `get_random_u32()` that seeds `unix_autobind()`'s order number
+/// (`net/unix/af_unix.c:1313`).  The value is not a secret — it only picks the
+/// first candidate name — so a not-yet-seeded entropy pool falls back to a
+/// counter that keeps the retry loop making progress instead of failing a bind
+/// that Linux would complete.
+fn unix_autobind_seed() -> u32 {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static FALLBACK: AtomicU32 = AtomicU32::new(1);
+    let mut bytes = [0_u8; size_of::<u32>()];
+    if crate::random::fill_secure(&mut bytes).is_ok() {
+        u32::from_ne_bytes(bytes)
+    } else {
+        FALLBACK.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
 pub fn sys_listen(fd: i32, backlog: i32) -> AxResult<isize> {
     debug!("sys_listen <= fd: {fd}, backlog: {backlog}");
 
@@ -1243,10 +1368,13 @@ pub fn sys_accept4(
 ) -> AxResult<isize> {
     debug!("sys_accept <= fd: {fd}, flags: {flags}");
 
-    let (nonblocking, cloexec) = parse_accept4_flags(flags)?;
+    // `__sys_accept4` resolves the descriptor first (`net/socket.c:2082-2087`)
+    // and only `__sys_accept4_file` tests `flags & ~(SOCK_CLOEXEC |
+    // SOCK_NONBLOCK)` with EINVAL (`:2061-2062`), so `accept4(-1, …, 0x40)` is
+    // EBADF rather than EINVAL.
     let snapshot = SocketSyscallSnapshot::capture();
-
     let pinned = PinnedSocketDescription::from_fd(fd)?;
+    let (nonblocking, cloexec) = parse_accept4_flags(flags)?;
     let actor = snapshot.actor();
     let listening_ref = pinned.security_ref()?;
     if matches!(
@@ -1373,11 +1501,35 @@ pub fn sys_socketpair(
     fds: UserPtr<[i32; 2]>,
 ) -> AxResult<isize> {
     debug!("sys_socketpair <= domain: {domain}, ty: {raw_ty}, proto: {proto}");
-    // `__sys_socketpair` repeats `__sys_socket_create`'s flag validation and
-    // then reaches `__sock_create` through `sock_create`, so the family range
-    // test, the type range test and the obsolete `(PF_INET, SOCK_PACKET)`
-    // rewrite all precede either family's `create` hook.
+    // `__sys_socketpair` validates the type flags, then reserves both descriptor
+    // numbers *and publishes them into `usockvec`* before it creates anything:
+    //
+    // ```c
+    // 	fd1 = get_unused_fd_flags(flags);
+    // 	fd2 = get_unused_fd_flags(flags);
+    // 	err = put_user(fd1, &usockvec[0]);
+    // 	err = put_user(fd2, &usockvec[1]);
+    // 	err = sock_create(family, type, protocol, &sock1);
+    // ```
+    //
+    // (`net/socket.c:1817-1864`).  An unknown family, an unsupported type, a
+    // failed capability test, `sock_no_socketpair`, a rejected security hook or
+    // a failed `sock_alloc_file()` therefore all leave the two reserved numbers
+    // visible in the caller's vector and hand them back to the allocator at
+    // `out:` (`:1896-1899`).  Only the type-flag test above, the two
+    // `get_unused_fd_flags()` calls and the `put_user()` calls themselves can
+    // fail before the vector is written.
     let (ty, nonblocking, cloexec) = parse_socket_type(raw_ty)?;
+    let reserved1 = reserve_fd(cloexec)?;
+    let reserved2 = reserve_fd(cloexec)?;
+    let fd_pair = [reserved1.fd(), reserved2.fd()];
+    capability
+        .write_slice(fds.address().as_usize() as *mut i32, &fd_pair)
+        .map_err(map_usercopy_error)?;
+
+    // `__sock_create` repeats `__sys_socket_create`'s family and type range
+    // tests and the obsolete `(PF_INET, SOCK_PACKET)` rewrite before either
+    // family's `create` hook.
     validate_pre_create_domain(domain)?;
     validate_socket_type_range(ty)?;
     let domain = u32::from(tk_linux_net::socket_creation_family(domain as u16, ty));
@@ -1390,10 +1542,10 @@ pub fn sys_socketpair(
     if domain == AF_PACKET {
         let net_ns = snapshot.net_namespace();
 
-        // Linux's generic socketpair path also exposes pre-reserved descriptor
-        // numbers before the backend pair operation.  TheKernel's existing
-        // generic publication order does not yet model that behavior.  This
-        // unsupported AF_PACKET path deliberately publishes and writes none.
+        // `packet_create` still owns the CAP_NET_RAW test and the protocol
+        // validation here, and the generic pair operation still answers
+        // `EOPNOTSUPP`; both paths run with the descriptors of `usockvec`
+        // already reserved and published, exactly as in Linux.
         return packet_socketpair_after_parse(actor, net_ns, ty, proto, nonblocking, spec);
     }
 
@@ -1520,15 +1672,9 @@ pub fn sys_socketpair(
         ))?;
     }
 
-    // No descriptor number or userspace output exists before every create,
-    // post-create, and pair hook has admitted both private endpoints.
-    let reserved1 = reserve_fd(cloexec)?;
-    let reserved2 = reserve_fd(cloexec)?;
-    let fd_pair = [reserved1.fd(), reserved2.fd()];
-    capability
-        .write_slice(fds.address().as_usize() as *mut i32, &fd_pair)
-        .map_err(map_usercopy_error)?;
-
+    // The descriptors were reserved and published before any creation step, so
+    // the only work left is `fd_install()`: publish the two private endpoints
+    // into the numbers the caller already holds.
     let fd1 = reserved1.publish(socket1.into_description())?;
     if let Err(error) = reserved2.publish(socket2.into_description()) {
         let _ = close_file_like(fd1);

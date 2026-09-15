@@ -199,6 +199,16 @@ pub(crate) struct SockaddrNl {
     pub nl_groups: u32,
 }
 
+impl SockaddrNl {
+    /// The exact bytes `netlink_getname()` leaves in the kernel's
+    /// `sockaddr_storage`, ready for `move_addr_to_user()` to copy out.
+    pub(crate) fn into_bytes(self) -> [u8; size_of::<Self>()] {
+        // SAFETY: `SockaddrNl` is `repr(C)` and has no padding other than the
+        // explicit `nl_pad`, so every byte of the value is initialized.
+        unsafe { core::mem::transmute(self) }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NlMsgHdr {
@@ -312,7 +322,17 @@ struct NetlinkState {
     option_flags: u32,
     passcred: bool,
     bound: bool,
+    /// `sk->sk_state == NETLINK_CONNECTED`: `netlink_connect()` sets it when a
+    /// peer is installed and clears it for `AF_UNSPEC`
+    /// (`net/netlink/af_netlink.c:1083-1100`).  It is deliberately separate
+    /// from `peer_port_id`, because connecting to port ID zero still marks the
+    /// socket connected and still refuses every sender whose own port ID is not
+    /// zero.
+    connected: bool,
+    /// `nlk->dst_portid`: the peer port ID `netlink_connect()` stored.
     peer_port_id: u32,
+    /// `nlk->dst_group`, the `ffs(nl_groups)` index `netlink_getname(peer)`
+    /// turns back into a mask.
     peer_groups: u32,
     /// `nlk->ngroups`: the protocol's multicast group capacity once
     /// `netlink_realloc_groups` has sized the bitmap.  Linux leaves it zero
@@ -1994,11 +2014,15 @@ impl NetlinkSocket {
             Option::DontRoute => state.sock.dontroute = valbool != 0,
             Option::Broadcast => state.sock.broadcast = valbool != 0,
             Option::SendBuffer => {
-                let clamped = value.min(SYSCTL_WMEM_MAX);
+                // `val = min_t(u32, val, READ_ONCE(sysctl_wmem_max))`
+                // (`net/core/sock.c:1342`) is an *unsigned* comparison, so a
+                // negative request is clamped to the sysctl maximum instead of
+                // passing a negative value into `set_sndbuf`'s doubling.
+                let clamped = tk_linux_net::clamp_buffer_request(value, SYSCTL_WMEM_MAX);
                 state.sock.sndbuf = tk_linux_net::decode_send_buffer(clamped);
             }
             Option::ReceiveBuffer => {
-                let clamped = value.min(SYSCTL_RMEM_MAX);
+                let clamped = tk_linux_net::clamp_buffer_request(value, SYSCTL_RMEM_MAX);
                 state.sock.rcvbuf = tk_linux_net::decode_receive_buffer(clamped);
             }
             Option::KeepAlive => state.sock.keepalive = valbool != 0,
@@ -2027,8 +2051,11 @@ impl NetlinkSocket {
             }
             // `SO_SNDLOWAT` is settable in neither table: `sk_setsockopt` has
             // no case for it, so `generic_socket_set_option` already returned
-            // `None` above and this arm is unreachable.
-            Option::SendLowWater => unreachable!("SO_SNDLOWAT has no setter"),
+            // `None` above (`net/core/sock.c:1676-1678`).  The arm answers the
+            // same errno instead of asserting, because a syscall must not be
+            // able to panic the kernel even if a future table edit loses that
+            // exclusion.
+            Option::SendLowWater => return Err(LinuxError::ENOPROTOOPT.into()),
             // Read-only names also return `None` from the setter table.
             Option::Type
             | Option::Error
@@ -2152,25 +2179,31 @@ impl NetlinkSocket {
             }
             self.ensure_bound_for_send(pid, false)?;
             let mut state = self.state.lock();
+            state.connected = true;
             state.peer_port_id = address.nl_pid;
             state.peer_groups = address.nl_groups & address.nl_groups.wrapping_neg();
         } else {
             let mut state = self.state.lock();
+            state.connected = false;
             state.peer_port_id = 0;
             state.peer_groups = 0;
         }
         Ok(())
     }
 
-    fn write_addr(
-        &self,
-        capability: &UserMemoryCapability,
-        addr: UserPtr<sockaddr>,
-        addrlen: &mut socklen_t,
-        peer: bool,
-    ) -> AxResult {
+    /// The `struct sockaddr_nl` that `netlink_getname()` writes into the
+    /// caller's `sockaddr_storage` before returning `sizeof(struct sockaddr_nl)`
+    /// (`net/netlink/af_netlink.c:1105-1127`); the peer form reports
+    /// `nlk->dst_portid` and `netlink_group_mask(nlk->dst_group)` (`:1115-1118`),
+    /// the local form `nlk->portid` and `nlk->groups[0]` (`:1119-1125`).
+    ///
+    /// The record is returned rather than copied out because
+    /// `do_getsockname()` owns the `*addrlen` exchange: `move_addr_to_user()`
+    /// reads the caller's capacity after this provider has already succeeded
+    /// (`net/socket.c:2160-2176`).
+    pub fn name_record(&self, peer: bool) -> SockaddrNl {
         let state = self.state.lock();
-        let nl = SockaddrNl {
+        SockaddrNl {
             nl_family: AF_NETLINK as _,
             nl_pad: 0,
             nl_pid: if peer {
@@ -2184,15 +2217,18 @@ impl NetlinkSocket {
                 // `addr->nl_groups = nlk->groups ? (u32)nlk->groups[0] : 0;`
                 state.groups as u32
             },
-        };
-        drop(state);
+        }
+    }
 
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                (&nl as *const SockaddrNl).cast::<u8>(),
-                size_of::<SockaddrNl>(),
-            )
-        };
+    fn write_addr(
+        &self,
+        capability: &UserMemoryCapability,
+        addr: UserPtr<sockaddr>,
+        addrlen: &mut socklen_t,
+        peer: bool,
+    ) -> AxResult {
+        let nl = self.name_record(peer);
+        let bytes = nl.into_bytes();
         let copy_len = (*addrlen as usize).min(bytes.len());
         if copy_len != 0 {
             capability
@@ -2350,6 +2386,12 @@ impl NetlinkSocket {
         flags: RecvFlags,
         nowait: bool,
     ) -> AxResult<NetlinkReceived> {
+        if flags.contains(RecvFlags::OOB) {
+            // `netlink_recvmsg()` refuses urgent data before it touches the
+            // queue: `if (flags&MSG_OOB) return -EOPNOTSUPP;`
+            // (`net/netlink/af_netlink.c:1917-1918`).
+            return Err(LinuxError::EOPNOTSUPP.into());
+        }
         let mut queue = if nowait {
             self.queue.try_lock().ok_or(AxError::WouldBlock)?
         } else {
@@ -2651,6 +2693,26 @@ impl NetlinkSocket {
         let source_port_id = self.ensure_bound_for_send(sender_pid, nowait)?;
         let target = find_netlink_peer(self.protocol, &self.net_ns, destination_port_id, nowait)?
             .ok_or(LinuxError::ECONNREFUSED)?;
+        // `netlink_getsockbyportid()` refuses a datagram whose destination has
+        // connected to somebody else:
+        //
+        // ```c
+        // 	if (READ_ONCE(sock->sk_state) == NETLINK_CONNECTED &&
+        // 	    READ_ONCE(nlk->dst_portid) != nlk_sk(ssk)->portid) {
+        // 		sock_put(sock);
+        // 		return ERR_PTR(-ECONNREFUSED);
+        // 	}
+        // ```
+        //
+        // (`net/netlink/af_netlink.c:1147-1153`).  The comparison is against the
+        // *sender's* port ID, so a receiver that connected to port ID zero
+        // still refuses every named sender.
+        {
+            let target_state = target.state.lock();
+            if target_state.connected && target_state.peer_port_id != source_port_id {
+                return Err(LinuxError::ECONNREFUSED.into());
+            }
+        }
         // A nonzero destination port is ordinary netlink unicast.  Linux
         // applies the uevent CAP_SYS_ADMIN gate only to the port-0 synthetic
         // receive path, not udevd's main-process-to-worker handoff.

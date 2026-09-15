@@ -112,6 +112,27 @@ bitflags! {
         /// good.  Transports without a neighbour-confirmation cache accept it
         /// and have nothing to refresh.
         const CONFIRM = 0x08;
+        /// `MSG_EOR`: the payload ends a record.  Linux records it on the
+        /// transmit skb (`net/ipv4/tcp.c:1382-1383` sets `TCP_SKB_CB(skb)->eor`,
+        /// which inhibits skb collapsing) and never rejects it, so a transport
+        /// without segment metadata accepts it and sends the payload unchanged.
+        const EOR = 0x10;
+        /// `MSG_PROBE`: do not send, only probe the path.  In Linux the bit is
+        /// inert on its own: `udp_sendmsg()` reaches `do_confirm` only through
+        /// `MSG_CONFIRM` (`net/ipv4/udp.c:1426-1427`) and skips the transmit
+        /// only when `MSG_PROBE` is also set and the payload is empty
+        /// (`:1499-1504`).
+        const PROBE = 0x20;
+        /// `MSG_ZEROCOPY`: use the user buffer in the kernel path.  Without
+        /// `SO_ZEROCOPY` Linux's `tcp_sendmsg_locked()` leaves `zc` clear and
+        /// copies the payload normally (`net/ipv4/tcp.c:1140-1156`), which is
+        /// what a transport without zerocopy does for every send.
+        const ZEROCOPY = 0x40;
+        /// `MSG_FASTOPEN`: send the payload in the SYN.  A transport without
+        /// fast-open support reports `EOPNOTSUPP`, exactly as
+        /// `tcp_sendmsg_fastopen()` does when client fast open is disabled
+        /// (`net/ipv4/tcp.c:1061-1064`).
+        const FASTOPEN = 0x80;
     }
 }
 
@@ -129,6 +150,10 @@ bitflags! {
         const TRUNCATE = 0x02;
         /// Do not wait for receive data for this operation.
         const DONT_WAIT = 0x04;
+        /// `MSG_OOB`: read the urgent-data byte.  A transport that has no
+        /// urgent-data queue reports `EOPNOTSUPP`; datagram transports ignore
+        /// the bit, as Linux's `udp_recvmsg()` does.
+        const OOB = 0x08;
     }
 }
 
@@ -275,6 +300,14 @@ pub struct RecvOptions<'a> {
     /// `None` samples the socket's ordinary mutable state at operation entry.
     /// [`RecvFlags::DONT_WAIT`] always forces nonblocking behavior.
     pub nonblocking_override: Option<bool>,
+    /// Octets to skip past the head of the receive queue for a
+    /// [`RecvFlags::PEEK`] receive.
+    ///
+    /// A `MSG_WAITALL|MSG_PEEK` receive in Linux advances its own cursor
+    /// (`peek_seq`), so the continuation of one syscall's copy resumes after
+    /// the octets already copied from the same queue; a fresh syscall starts at
+    /// zero.  Only a stream whose peek is offset-capable honours this field.
+    pub peek_offset: usize,
 }
 impl RecvOptions<'_> {
     pub(crate) fn effective_nonblocking(&self, socket_nonblocking: bool) -> bool {

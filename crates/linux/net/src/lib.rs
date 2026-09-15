@@ -9,10 +9,13 @@ use core::mem::{align_of, size_of};
 mod msg;
 
 pub use msg::{
-    BatchDeadline, MSG_CMSG_CLOEXEC, MSG_CMSG_COMPAT, MSG_CONFIRM, MSG_DONTROUTE, MSG_DONTWAIT,
-    MSG_INTERNAL_SENDMSG_FLAGS, MSG_MORE, MSG_NOSIGNAL, MSG_OOB, MSG_SPLICE_PAGES, MSG_WAITFORONE,
-    NSEC_PER_SEC, ReceiveStep, Timespec64, absolute_deadline, batch_deadline, compat_flag_errno,
-    remaining_timeout, strip_internal_sendmsg_flags, waitall_applies, waitall_continues,
+    BatchDeadline, MSG_BATCH, MSG_CMSG_CLOEXEC, MSG_CMSG_COMPAT, MSG_CONFIRM, MSG_CTRUNC,
+    MSG_DONTROUTE, MSG_DONTWAIT, MSG_EOR, MSG_ERRQUEUE, MSG_FASTOPEN, MSG_INTERNAL_SENDMSG_FLAGS,
+    MSG_MORE, MSG_NOSIGNAL, MSG_OOB, MSG_PEEK, MSG_PROBE, MSG_SPLICE_PAGES, MSG_TRUNC,
+    MSG_WAITALL, MSG_WAITFORONE, MSG_ZEROCOPY, NSEC_PER_SEC, ReceiveStep, Timespec64,
+    absolute_deadline, batch_deadline, compat_flag_errno, packet_recvmsg_flag_errno,
+    receive_wait_target, remaining_timeout, sock_rcvlowat, strip_internal_sendmsg_flags,
+    waitall_continues,
 };
 
 pub const AF_UNSPEC: u16 = 0;
@@ -315,6 +318,61 @@ pub const fn socket_creation_family(family: u16, ty: u32) -> u16 {
 /// `sizeof(struct sockaddr_storage)`. `move_addr_to_kernel` rejects every
 /// imported address longer than this before a family-specific rule runs.
 pub const SOCKADDR_STORAGE_LEN: usize = 128;
+
+/// `net/socket.c:move_addr_to_kernel()` bounds every socket address argument
+/// before the protocol is reached:
+///
+/// ```c
+/// 	if (ulen < 0 || ulen > sizeof(struct sockaddr_storage))
+/// 		return -EINVAL;
+/// ```
+///
+/// `__sys_bind` calls it at `net/socket.c:1947` after the descriptor lookup,
+/// `__sys_connect` at `:2003` and `__sys_sendto` at `:2242`; the upper bound is
+/// therefore generic socket-layer state and not a family rule. `addrlen` is a
+/// signed `int` on those paths, so `(socklen_t)-1` is the negative length that
+/// this rejects rather than a 4 GiB buffer.
+pub const fn address_import_admitted(addrlen: i32) -> bool {
+    addrlen >= 0 && (addrlen as usize) <= SOCKADDR_STORAGE_LEN
+}
+
+/// `net/socket.c:do_sock_setsockopt()` / `do_sock_getsockopt()` reject a
+/// negative option length before any protocol runs:
+///
+/// ```c
+/// 	if (optlen < 0)
+/// 		return -EINVAL;
+/// ```
+///
+/// `setsockopt` reaches it at `:2342-2343` and `getsockopt` at `:2366-2367`;
+/// the descriptor lookup that precedes both reports EBADF first.  Because
+/// `socklen_t` is unsigned in the ABI, a caller can pass `(socklen_t)-1`, which
+/// every lower-bound test in the option table would otherwise read as a 4 GiB
+/// buffer.
+pub const fn option_length_admitted(optlen: u32) -> bool {
+    (optlen as i32) >= 0
+}
+
+/// `min_t(u32, val, READ_ONCE(sysctl_wmem_max))` (`net/core/sock.c:1342`) and
+/// `min_t(u32, val, READ_ONCE(sysctl_rmem_max))` (`:1374`).
+///
+/// The comparison is unsigned, so a negative request does not stay negative: it
+/// compares above any positive limit and is clamped to the sysctl maximum.  The
+/// `FORCE` variants skip this step and instead floor the request at zero
+/// (`:1356-1358`, `:1382-1384`).
+pub const fn clamp_buffer_request(val: i32, sysctl_max: i32) -> i32 {
+    if (val as u32) < (sysctl_max as u32) {
+        val
+    } else {
+        sysctl_max
+    }
+}
+
+/// `SO_SNDBUFFORCE`/`SO_RCVBUFFORCE`'s `if (val < 0) val = 0;`
+/// (`net/core/sock.c:1356-1358`, `:1382-1384`).
+pub const fn force_buffer_request(val: i32) -> i32 {
+    if val < 0 { 0 } else { val }
+}
 /// `sizeof(struct sockaddr_in)`.
 pub const SOCKADDR_IN_LEN: usize = 16;
 /// `SIN6_LEN_RFC2133` (`include/net/ipv6.h`). IPv6 `bind`/`connect` accept a
@@ -324,8 +382,53 @@ pub const SIN6_LEN_RFC2133: usize = 24;
 pub const SOCKADDR_IN6_LEN: usize = 28;
 /// `sizeof(struct sockaddr_un)`.
 pub const SOCKADDR_UN_LEN: usize = 110;
-/// `offsetof(struct sockaddr_un, sun_path)`.
+/// `offsetof(struct sockaddr_un, sun_path)`, which is also the length of the
+/// family-only address that makes `unix_bind()` autobind.
 pub const SOCKADDR_UN_PATH_OFFSET: usize = 2;
+/// Length of the abstract name `unix_autobind()` generates: the NUL marker plus
+/// the five lowercase hex digits written by
+/// `sprintf(addr->name->sun_path + 1, "%05x", ordernum)`
+/// (`net/unix/af_unix.c:1315-1320`).  Linux stores it as
+/// `addr->len = offsetof(struct sockaddr_un, sun_path) + 6`, i.e. 8, so
+/// `getsockname()` reports 8 for an autobound socket.
+pub const UNIX_AUTOBIND_PATH_LEN: usize = 6;
+/// `ordernum & 0xFFFFF`: `unix_autobind()` retries inside a 20-bit space and
+/// reports `-ENOSPC` once it wraps back to the value it started from
+/// (`net/unix/af_unix.c:1311-1334`).
+pub const UNIX_AUTOBIND_ORDERNUM_MASK: u32 = 0x000F_FFFF;
+
+/// The six abstract-name bytes `unix_autobind()` stores for one order number:
+/// the abstract marker followed by `%05x`.  The marker is part of Linux's
+/// stored `sun_path`; a caller whose abstract-name representation excludes it
+/// — this crate's [`UnixName::Abstract`], which [`UnixSockAddr::decode`] splits
+/// the same way — takes `&name[1..]`.
+pub fn unix_autobind_name(ordernum: u32) -> [u8; UNIX_AUTOBIND_PATH_LEN] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let ordernum = ordernum & UNIX_AUTOBIND_ORDERNUM_MASK;
+    let mut name = [0_u8; UNIX_AUTOBIND_PATH_LEN];
+    for (index, slot) in name[1..].iter_mut().enumerate() {
+        let shift = 4 * (UNIX_AUTOBIND_PATH_LEN - 2 - index);
+        *slot = HEX[((ordernum >> shift) & 0xf) as usize];
+    }
+    name
+}
+
+/// Whether `addrlen` is the family-only AF_UNIX address that `unix_bind()`
+/// turns into an autobind request:
+///
+/// ```c
+/// 	if (addr_len == offsetof(struct sockaddr_un, sun_path) &&
+/// 	    sunaddr->sun_family == AF_UNIX)
+/// 		return unix_autobind(sk);
+/// ```
+///
+/// (`net/unix/af_unix.c:1463-1470`).  The family comparison belongs to the
+/// caller, which has already read the two-byte record; a shorter or longer
+/// address never autobinds, and a two-byte record of any other family falls
+/// through to `unix_validate_addr()`, which reports `-EINVAL`.
+pub const fn unix_autobind_request(addrlen: usize, family: u16) -> bool {
+    addrlen == SOCKADDR_UN_PATH_OFFSET && family as u32 == AF_UNIX as u32
+}
 /// `sizeof(struct sockaddr_nl)`.
 pub const SOCKADDR_NL_LEN: usize = 12;
 /// `sizeof(sa_family_t)`.
@@ -643,10 +746,15 @@ pub const fn generic_socket_get_option(optname: i32) -> Option<GenericSocketOpti
 ///
 /// `SO_TYPE`, `SO_PROTOCOL`, `SO_DOMAIN` and `SO_ERROR` are read-only and
 /// return `-ENOPROTOOPT` from an explicit case, which is the same errno as an
-/// unknown name. `SO_ACCEPTCONN` and `SO_PEERCRED` have no setter at all.
+/// unknown name. `SO_ACCEPTCONN` and `SO_PEERCRED` have no setter at all, and
+/// neither has `SO_SNDLOWAT`: `sk_setsockopt` implements `SO_RCVLOWAT`
+/// (`net/core/sock.c:1450-1464`) but has no case for the send side, so a set
+/// request reaches `default: ret = -ENOPROTOOPT;` (`:1676-1678`) even though
+/// `sk_getsockopt` reports the name (`:1873`).
 pub const fn generic_socket_set_option(optname: i32) -> Option<GenericSocketOption> {
     match optname {
-        SO_TYPE | SO_PROTOCOL | SO_DOMAIN | SO_ERROR | SO_ACCEPTCONN | SO_PEERCRED => None,
+        SO_TYPE | SO_PROTOCOL | SO_DOMAIN | SO_ERROR | SO_ACCEPTCONN | SO_PEERCRED
+        | SO_SNDLOWAT => None,
         _ => generic_socket_get_option(optname),
     }
 }
@@ -1506,7 +1614,9 @@ mod tests {
             Some(GenericSocketOption::SendLowWater)
         );
         // Read-only names have an explicit `-ENOPROTOOPT` case in
-        // `sk_setsockopt`, so they are absent from the setter table.
+        // `sk_setsockopt`, so they are absent from the setter table.  The same
+        // holds for `SO_SNDLOWAT`, which the setter's `default:` answers
+        // (`net/core/sock.c:1676-1678`) while the getter still reports it.
         for optname in [
             SO_TYPE,
             SO_PROTOCOL,
@@ -1514,6 +1624,7 @@ mod tests {
             SO_ERROR,
             SO_ACCEPTCONN,
             SO_PEERCRED,
+            SO_SNDLOWAT,
         ] {
             assert!(generic_socket_get_option(optname).is_some(), "{optname}");
             assert_eq!(generic_socket_set_option(optname), None, "{optname}");

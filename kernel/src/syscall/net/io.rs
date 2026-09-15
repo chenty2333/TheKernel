@@ -25,7 +25,7 @@ use linux_raw_sys::{
 use memory_addr::PAGE_SIZE_4K;
 use tk_linux_net::{
     BatchDeadline, PendingErrorPolicy, ReceiveStep, SocketWaitKind, Timespec64, absolute_deadline,
-    batch_deadline, compat_flag_errno, plan_pending_error, waitall_applies, waitall_continues,
+    batch_deadline, compat_flag_errno, plan_pending_error, receive_wait_target, waitall_continues,
 };
 use tk_linux_packet::ReceiveFlags as PacketReceiveFlags;
 use tk_linux_signal::{SignalInfo, Signo};
@@ -67,15 +67,6 @@ const SCTP_SNDINFO: u32 = 2;
 const SCTP_RCVINFO: u32 = 3;
 const SCTP_NXTINFO: u32 = 4;
 const SCTP_PRINFO: u32 = 5;
-const SUPPORTED_RECVMSG_FLAGS: u32 =
-    MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT | MSG_WAITALL | MSG_CMSG_CLOEXEC | MSG_ERRQUEUE | MSG_OOB;
-// `MSG_MORE`, `MSG_DONTROUTE` and `MSG_CONFIRM` are protocol flags Linux
-// accepts from `__sys_sendto`/`____sys_sendmsg` verbatim: no layer between the
-// syscall entry and the transport rejects them, and the transport decides
-// whether they mean anything.  `MSG_OOB` stays rejected here because urgent
-// data is not implemented, so accepting it would silently drop it.
-const SUPPORTED_SENDMSG_FLAGS: u32 =
-    MSG_DONTWAIT | MSG_NOSIGNAL | MSG_OOB | MSG_MORE | MSG_DONTROUTE | MSG_CONFIRM;
 
 fn remember_socket_error(socket: &PinnedSocketDescription, error: AxError) {
     if socket.backend() == Ok(SocketBackendKind::Network)
@@ -548,21 +539,21 @@ struct ValidatedRecvFlags {
 impl ValidatedRecvFlags {
     fn packet_flags(self) -> AxResult<PacketReceiveFlags> {
         debug_assert!(self.defer_packet_mechanism);
-        // These are valid generic recvmsg flag bits, but AF_PACKET rejects or
-        // short-circuits them in its protocol receive operation. Keep that
-        // mechanism decision after security_socket_recvmsg.
-        if self.raw & !SUPPORTED_RECVMSG_FLAGS != 0 {
-            return Err(AxError::InvalidInput);
-        }
-        if self.raw & MSG_OOB != 0 {
-            return Err(AxError::InvalidInput);
+        // `net/packet/af_packet.c:packet_recvmsg()` is the one protocol that
+        // refuses receive flags it does not consume, with its own allow-list:
+        //   err = -EINVAL;
+        //   if (flags & ~(MSG_PEEK|MSG_DONTWAIT|MSG_TRUNC|MSG_CMSG_COMPAT|MSG_ERRQUEUE))
+        //           goto out;
+        // so `MSG_WAITALL`, `MSG_OOB` and `MSG_CMSG_CLOEXEC` are EINVAL here
+        // even though the other families ignore them.
+        if let Some(errno) = tk_linux_net::packet_recvmsg_flag_errno(self.raw) {
+            return Err(LinuxError::try_from(errno)
+                .map_err(|_| AxError::InvalidInput)?
+                .into());
         }
         if self.raw & MSG_ERRQUEUE != 0 {
             return Err(LinuxError::EAGAIN.into());
         }
-        // `net/packet/af_packet.c:packet_recvmsg()` never inspects
-        // `MSG_WAITALL`; the flag is accepted and the receive stays
-        // single-shot.
         let mut bits = 0;
         if self.generic.contains(RecvFlags::PEEK) {
             bits |= MSG_PEEK;
@@ -579,21 +570,26 @@ impl ValidatedRecvFlags {
     }
 }
 
+/// Maps the raw `MSG_*` receive bits onto the transport-neutral
+/// [`RecvFlags`].
+///
+/// Linux has no socket-layer receive allow-list: `__sys_recvfrom()`
+/// (`net/socket.c:2293-2302`) and `____sys_recvmsg()` (`:2895-2904`) hand
+/// `flags` to the protocol unchanged, and each protocol ignores the bits it does
+/// not consume — `udp_recvmsg()` looks only at `MSG_ERRQUEUE`, `MSG_PEEK` and
+/// `MSG_DONTWAIT` (`net/ipv4/udp.c:1917-1936`), and `tcp_recvmsg_locked()` only
+/// at `MSG_OOB`, `MSG_PEEK`, `MSG_WAITALL`, `MSG_TRUNC`, `MSG_ERRQUEUE` and
+/// `MSG_DONTWAIT` (`net/ipv4/tcp.c:2680-2704`).  Bits that no layer knows are
+/// therefore accepted and ignored, which is why the transport, not this
+/// function, owns every rejection.
+///
+/// `MSG_WAITALL` is not a rejection anywhere either: only the byte-stream
+/// transports honour it through `sock_rcvlowat(sk, flags & MSG_WAITALL, len)`,
+/// and the completion loop lives in `recv_impl`.
 fn validate_recvmsg_flags(
     flags: u32,
     defer_packet_mechanism: bool,
 ) -> AxResult<ValidatedRecvFlags> {
-    if !defer_packet_mechanism && flags & !SUPPORTED_RECVMSG_FLAGS != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if !defer_packet_mechanism && flags & MSG_OOB != 0 && flags & MSG_ERRQUEUE == 0 {
-        return Err(AxError::InvalidInput);
-    }
-    // `MSG_WAITALL` is not a socket-layer rejection in Linux: every protocol
-    // receives it, and only the byte-stream ones honour it through
-    // `sock_rcvlowat(sk, flags & MSG_WAITALL, len)`. The completion loop lives
-    // in `recv_impl`, which leaves datagram, netlink, packet, AF_ALG and error
-    // queue receives single-shot exactly as their protocols do.
     let mut recv_flags = RecvFlags::empty();
     if flags & MSG_PEEK != 0 {
         recv_flags |= RecvFlags::PEEK;
@@ -603,6 +599,14 @@ fn validate_recvmsg_flags(
     }
     if flags & MSG_DONTWAIT != 0 {
         recv_flags |= RecvFlags::DONT_WAIT;
+    }
+    if flags & MSG_OOB != 0 {
+        // `tcp_recvmsg_locked()` diverts to `recv_urg` (`net/ipv4/tcp.c:2680`)
+        // and `unix_stream_read_generic()` to `unix_stream_recv_urg`
+        // (`net/unix/af_unix.c:2929-2933`); this kernel implements neither, so
+        // the transports that own urgent data report EOPNOTSUPP while UDP and
+        // the datagram families keep ignoring the bit as Linux does.
+        recv_flags |= RecvFlags::OOB;
     }
     Ok(ValidatedRecvFlags {
         raw: flags,
@@ -625,10 +629,29 @@ fn reject_compat_sendmsg_flags(flags: u32) -> AxResult {
     }
 }
 
+/// Maps the raw `MSG_*` send bits onto the transport-neutral [`SendFlags`].
+///
+/// `__sys_sendto()` clears only `MSG_INTERNAL_SENDMSG_FLAGS` and passes the rest
+/// through — `flags &= ~MSG_INTERNAL_SENDMSG_FLAGS; … msg.msg_flags = flags;`
+/// (`net/socket.c:2248-2252`) — and `____sys_sendmsg()` does the same
+/// (`:2666-2684`).  There is no socket-layer send allow-list, so each protocol
+/// decides:
+///
+/// * UDP rejects only `MSG_OOB` (`net/ipv4/udp.c:1260-1261`), corks on
+///   `MSG_MORE` (`:1235`), narrows the route on `MSG_DONTROUTE`
+///   (`include/net/ip.h:251-260`) and confirms the neighbour on `MSG_CONFIRM`
+///   (`:1426-1427`).
+/// * TCP rejects nothing: `MSG_EOR` marks the segment (`net/ipv4/tcp.c:1382`),
+///   `MSG_ZEROCOPY` is inert without `SO_ZEROCOPY` (`:1140-1156`), and
+///   `MSG_FASTOPEN` needs the fast-open machinery this kernel does not have.
+/// * Bits no protocol reads (for example `MSG_SYN`, `MSG_RST`, `MSG_FIN` or
+///   `MSG_BATCH`) are accepted and ignored.
+///
+/// `MSG_OOB` is the one bit this layer still refuses: urgent data has no
+/// implementation in any transport here, and every transport that would need it
+/// either rejects it as well (UDP, AF_UNIX, netlink) or would silently drop the
+/// urgent byte (TCP).
 fn validate_sendmsg_flags(flags: u32) -> AxResult<SendFlags> {
-    if flags & !SUPPORTED_SENDMSG_FLAGS != 0 {
-        return Err(AxError::OperationNotSupported);
-    }
     if flags & MSG_OOB != 0 {
         return Err(LinuxError::EOPNOTSUPP.into());
     }
@@ -644,6 +667,18 @@ fn validate_sendmsg_flags(flags: u32) -> AxResult<SendFlags> {
     }
     if flags & MSG_CONFIRM != 0 {
         send_flags |= SendFlags::CONFIRM;
+    }
+    if flags & MSG_EOR != 0 {
+        send_flags |= SendFlags::EOR;
+    }
+    if flags & tk_linux_net::MSG_PROBE != 0 {
+        send_flags |= SendFlags::PROBE;
+    }
+    if flags & tk_linux_net::MSG_ZEROCOPY != 0 {
+        send_flags |= SendFlags::ZEROCOPY;
+    }
+    if flags & tk_linux_net::MSG_FASTOPEN != 0 {
+        send_flags |= SendFlags::FASTOPEN;
     }
     Ok(send_flags)
 }
@@ -1281,7 +1316,13 @@ fn read_netlink_send_address(
 ) -> AxResult<SockaddrNl> {
     // sockaddr APIs accept a larger caller buffer and consume only the
     // address's defined prefix.  Reject truncation, not harmless extension.
-    if addr.is_null() || (addrlen as usize) < size_of::<SockaddrNl>() {
+    // `__sys_sendto` imports the address through `move_addr_to_kernel` before
+    // the protocol runs (`net/socket.c:2241-2247`), so the same
+    // `sockaddr_storage` ceiling that bounds bind also bounds this copy.
+    if addr.is_null()
+        || !tk_linux_net::address_import_admitted(addrlen as i32)
+        || (addrlen as usize) < size_of::<SockaddrNl>()
+    {
         return Err(AxError::InvalidInput);
     }
     let address = unsafe {
@@ -1751,6 +1792,7 @@ fn recv_impl(
         flags: recv_flags.generic,
         cmsg: Some(&mut cmsg),
         nonblocking_override: Some(nonblocking),
+        peek_offset: 0,
     };
     let mut sctp_metadata = None;
     let mut recv = match &socket.inner {
@@ -1760,32 +1802,47 @@ fn recv_impl(
         _ => socket.recv(&mut dst, options)?,
     };
 
-    // `net/ipv4/tcp.c:tcp_recvmsg_locked()` derives the `MSG_WAITALL`
-    // completion target from `sock_rcvlowat(sk, flags & MSG_WAITALL, len)`,
-    // which is the whole request, and keeps copying until that target, a FIN,
-    // a signal, the receive-timeout expiry, or a transport error.  Only the
-    // first attempt publishes the peer address and ancillary data, because
-    // Linux fills the kernel msghdr once and later iterations append payload
-    // only.  A short count is returned as-is for every exit that is not a
-    // completed target; only an error raised before any octet was copied
-    // reaches userspace as an error.
-    if waitall_applies(
+    // `net/ipv4/tcp.c:tcp_recvmsg_locked()` derives the completion target from
+    // `sock_rcvlowat(sk, flags & MSG_WAITALL, len)` and keeps copying until
+    // that target, a FIN, a signal, the receive-timeout expiry, or a transport
+    // error.  Only the first attempt publishes the peer address and ancillary
+    // data, because Linux fills the kernel msghdr once and later iterations
+    // append payload only.  A short count is returned as-is for every exit that
+    // is not a completed target; only an error raised before any octet was
+    // copied reaches userspace as an error.
+    //
+    // The target is a single octet for an ordinary receive, so a plain blocking
+    // `recv` on a stream socket returns as soon as anything is available; only
+    // `MSG_WAITALL` raises it to the whole request.  `SO_RCVLOWAT` raises it
+    // too, but this kernel implements that option for netlink only, so the
+    // network transports keep Linux's default of one.
+    //
+    // A peeking request that waits for the full target resumes after the octets
+    // it already copied: Linux keeps the cursor in `peek_seq`
+    // (`net/ipv4/tcp.c:2701-2702`) and advances it with every copied octet
+    // (`:2874-2877`) even though the receive queue is untouched.  `recv` is
+    // exactly that cursor, so the continuation passes it as `peek_offset`.
+    let recv_target = receive_wait_target(
         is_byte_stream(&socket.inner),
         recv_flags.generic.contains(RecvFlags::PEEK),
+        matches!(&socket.inner, AxSocket::Tcp(_)),
+        recv_flags.raw & MSG_WAITALL != 0,
+        1,
         record_capacity,
-    ) && waitall_continues(ReceiveStep::Copied(recv), recv, record_capacity)
-    {
+    );
+    if waitall_continues(ReceiveStep::Copied(recv), recv, recv_target) {
         loop {
             let more = RecvOptions {
                 from: None,
                 flags: recv_flags.generic,
                 cmsg: None,
                 nonblocking_override: Some(nonblocking),
+                peek_offset: recv,
             };
             match socket.recv(&mut dst, more) {
                 Ok(bytes) => {
                     recv += bytes;
-                    if !waitall_continues(ReceiveStep::Copied(bytes), recv, record_capacity) {
+                    if !waitall_continues(ReceiveStep::Copied(bytes), recv, recv_target) {
                         break;
                     }
                 }
@@ -1967,8 +2024,14 @@ pub fn sys_recvfrom(
                     &capability,
                     UserConstPtr::<socklen_t>::from(addrlen.address().as_usize()),
                 )?;
-                remote_addr.write_to_user(&capability, addr, &mut user_addrlen)?;
-                write_user_copy(&capability, addrlen, user_addrlen)?;
+                let result = remote_addr.write_to_user(&capability, addr, &mut user_addrlen);
+                // `move_addr_to_user()` is the same tail for the receive
+                // source address, and it publishes the provider's length before
+                // the payload copy (`net/socket.c:288-303`).
+                if (user_addrlen as i32) >= 0 {
+                    write_user_copy(&capability, addrlen, user_addrlen)?;
+                }
+                result?;
             }
             Ok(outcome.returned_len)
         },
@@ -2679,31 +2742,39 @@ mod tests {
 
     #[test]
     fn packet_receive_mechanism_flags_are_rejected_only_after_policy_stage() {
-        assert!(validate_recvmsg_flags(MSG_ERRQUEUE | MSG_OOB, false).is_ok());
-        // `MSG_WAITALL` is not a rejection anywhere: `packet_recvmsg()` ignores
-        // it, and the byte-stream completion rule is applied by `recv_impl`.
-        assert!(validate_recvmsg_flags(MSG_WAITALL, false).is_ok());
-        assert!(
-            validate_recvmsg_flags(MSG_WAITALL, true)
-                .unwrap()
-                .packet_flags()
-                .is_ok()
-        );
+        // The socket layer owns no receive allow-list: `MSG_ERRQUEUE`,
+        // `MSG_OOB`, `MSG_WAITALL` and the compat bit all reach the protocol,
+        // which decides (`net/socket.c:2895-2904`).  `MSG_CMSG_COMPAT` is
+        // refused one level above this function, by the `forbid_cmsg_compat`
+        // rule the `msghdr`-shaped syscalls run before the descriptor lookup
+        // (`reject_compat_sendmsg_flags`, `net/socket.c:2687-2690`).
+        for flag in [MSG_ERRQUEUE, MSG_OOB, MSG_WAITALL, 1_u32 << 31] {
+            assert!(validate_recvmsg_flags(flag, false).is_ok(), "{flag}");
+        }
+        // AF_PACKET is the one family that refuses receive flags it does not
+        // consume; its allow-list is
+        //   err = -EINVAL;
+        //   if (flags & ~(MSG_PEEK|MSG_DONTWAIT|MSG_TRUNC|MSG_CMSG_COMPAT|MSG_ERRQUEUE))
+        //           goto out;
+        // (`net/packet/af_packet.c:3452-3454`).  `MSG_WAITALL` and `MSG_OOB`
+        // are therefore `EINVAL` on a packet socket even though every other
+        // family ignores them, and `MSG_ERRQUEUE` diverts to the error queue.
         for (flag, expected) in [
+            (MSG_WAITALL, LinuxError::EINVAL),
             (MSG_OOB, LinuxError::EINVAL),
             (MSG_ERRQUEUE, LinuxError::EAGAIN),
-            (1_u32 << 31, LinuxError::EINVAL),
         ] {
-            if flag != MSG_ERRQUEUE {
-                assert!(validate_recvmsg_flags(flag, false).is_err());
-            } else {
-                assert!(validate_recvmsg_flags(flag, false).is_ok());
-            }
             let deferred = validate_recvmsg_flags(flag, true).unwrap();
             assert_eq!(
                 deferred.packet_flags().map_err(LinuxError::from),
-                Err(expected)
+                Err(expected),
+                "{flag}"
             );
+        }
+        // The bits AF_PACKET does consume survive the mechanism stage.
+        for flag in [MSG_PEEK, MSG_TRUNC, MSG_DONTWAIT, 1_u32 << 31] {
+            let deferred = validate_recvmsg_flags(flag, true).unwrap();
+            assert!(deferred.packet_flags().is_ok(), "{flag}");
         }
     }
 

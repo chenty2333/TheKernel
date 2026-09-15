@@ -1455,6 +1455,26 @@ impl<'a> Socket<'a> {
         Ok(self.rx_buffer.read_allocated(0, data))
     }
 
+    /// Peek at a sequence of received octets starting `offset` octets past the
+    /// head of the receive queue, without removing anything.
+    ///
+    /// This is the transport half of Linux's `peek_seq = tp->copied_seq +
+    /// peek_offset` (`net/ipv4/tcp.c:2701-2702`): a `MSG_WAITALL|MSG_PEEK`
+    /// receive keeps counting the octets it already copied, so its next copy
+    /// must resume where the previous one stopped rather than restart at the
+    /// head of the queue.  An `offset` at or past the queued length yields an
+    /// empty slice, and the ring wrap is the caller's continuation point.
+    pub fn peek_at(&mut self, offset: usize, size: usize) -> Result<&[u8], RecvError> {
+        self.recv_error_check()?;
+
+        let buffer = self.rx_buffer.get_allocated(offset, size);
+        if !buffer.is_empty() {
+            #[cfg(any(test, feature = "verbose"))]
+            tcp_trace!("rx buffer: peeking at {} octets from offset {}", buffer.len(), offset);
+        }
+        Ok(buffer)
+    }
+
     /// Return the amount of octets queued in the transmit buffer.
     ///
     /// Note that the Berkeley sockets interface does not have an equivalent of this API.
