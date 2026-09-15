@@ -616,7 +616,9 @@ int main(void) {
         errno = 0;
         check(ioctl(pathfd, FIONBIO, &on) == -1 && errno == EBADF, "opath-fionbio");
         check((fcntl(pathfd, F_GETFL) & O_NONBLOCK) == 0, "opath-fionbio-invisible");
-        check(close(pathfd) == 0, "opath-close");
+        /* pathfd is closed once, after the commands below; closing it here as
+         * well made the later close a second close of the same descriptor,
+         * which both guests answer with EBADF. */
         /* FIOQSIZE is defined only for directories, symlinks and non-anonymous
          * regular files, while FIOASYNC consults `->fasync` only when the
          * request changes the bit: pipefops has one, a regular file does not. */
