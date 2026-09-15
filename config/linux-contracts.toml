@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 285
-implemented = 266
+resolved = 293
+implemented = 274
 explicit_enosys = 19
 fallback = 0
-partial = 100
+partial = 92
 unknown = 0
 
 [[contract]]
@@ -3255,13 +3255,13 @@ teardown = ["teardown:release imported data and temporary references; timer dele
 [[cell]]
 number = 96
 name = "gettimeofday"
-status = "partial"
+status = "implemented"
 contract = "linux-gettimeofday"
 handler = "kernel/src/syscall/time.rs:sys_gettimeofday"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/time-abi-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["setting a timezone does not apply Linux's timekeeping_warp_clock on the first call, so a guest that sets one observes a different CLOCK_REALTIME than Linux"]
+validation_gaps = ["TIMEZONE_ROUND_TRIP and MONOTONIC_RAW_SHARES_MONOTONIC_OFFSET in tests/guest/portable/time-abi-differential.c run on both guests, but the oracle applies no time namespace to the differential guest, so the monotonic-raw offset is asserted as zero on both sides and a kernel that dropped the offset would still agree"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-times"
@@ -3301,13 +3301,13 @@ teardown = ["teardown:release imported data and temporary references; timer dele
 [[cell]]
 number = 159
 name = "adjtimex"
-status = "partial"
+status = "implemented"
 contract = "linux-adjtimex"
 handler = "kernel/src/syscall/time.rs:sys_adjtimex"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/time.rs:timex_planner_accepts_legacy_singleshot_modes", "tests/guest/portable/time-abi-differential.c:main"]
-validation_gaps = ["The timex state machine, mode validation and clamps are exercised by the time-abi differential; the discipline effect has no test"]
-limitations = ["ADJ_OFFSET is scaled by the ABI's USER_HZ instead of the kernel tick rate, so a nanosecond offset that is not a multiple of the tick reads back one nanosecond higher than Linux reports"]
+validation_gaps = ["the guest cannot discriminate the ADJ_OFFSET rate: config/kernel.toml sets ticks-per-sec to 100 and USER_HZ is 100, so the old constant and the tick rate are the same number and the round trip is scale-invariant. crates/linux/time/src/lib.rs:offset_scaling_uses_ntp_interval_freq_and_is_bounded_by_one_nanosecond falsifies a rate-blind implementation at crate level, and OFFSET_TRUNCATION_BOUNDED_BY_ONE_NANOSECOND only pins the bounded truncation, which differs between the HZ=1000 oracle and this build"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-settimeofday"
@@ -3324,13 +3324,13 @@ teardown = ["teardown:release imported data and temporary references; timer dele
 [[cell]]
 number = 164
 name = "settimeofday"
-status = "partial"
+status = "implemented"
 contract = "linux-settimeofday"
 handler = "kernel/src/syscall/time.rs:sys_settimeofday"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/time-abi-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["the timezone pointer is read before tv_usec is validated, so an out-of-range usec with a bad timezone pointer reports EFAULT where Linux reports EINVAL; the first-timezone warp is missing"]
+validation_gaps = ["SUBSECOND_EINVAL_BEFORE_SECONDS and SUBSECOND_EINVAL_BEFORE_TIMEZONE are discriminating; the first-timezone warp itself is asserted only through the tz_minuteswest round trip, because the warp shifts CLOCK_REALTIME once and the differential measures a bracket rather than an absolute offset"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-timer_create"
@@ -3462,13 +3462,13 @@ teardown = ["teardown:release imported data and temporary references; timer dele
 [[cell]]
 number = 227
 name = "clock_settime"
-status = "partial"
+status = "implemented"
 contract = "linux-clock_settime"
 handler = "kernel/src/syscall/time.rs:sys_clock_settime"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/time-abi-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["every identifier other than CLOCK_REALTIME is rejected with EINVAL before the timespec is copied in, where Linux copies in first and routes an encoded CPU clock to EPERM"]
+validation_gaps = ["CPU_CLOCK_EPERM_AFTER_COPY is discriminating; the other four assertions in clock_settime.raw-differential describe the argument contract rather than the repaired ordering"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-clock_gettime"
@@ -3485,13 +3485,13 @@ teardown = ["teardown:release imported data and temporary references; timer dele
 [[cell]]
 number = 228
 name = "clock_gettime"
-status = "partial"
+status = "implemented"
 contract = "linux-clock_gettime"
 handler = "kernel/src/syscall/time.rs:sys_clock_gettime"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/time.rs:clock_domain_accepts_linux_encoded_cpu_clock_ids", "tests/guest/portable/time-abi-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["CLOCK_MONOTONIC_RAW omits the time-namespace offset Linux applies to it, and no registered case reads a clock other than CLOCK_REALTIME"]
+validation_gaps = ["CLOCK_MONOTONIC_RAW is read only outside a time namespace, so MONOTONIC_RAW_SHARES_MONOTONIC_OFFSET compares zero with zero and the time-namespace offset is covered by no run"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-clock_getres"
@@ -3508,13 +3508,13 @@ teardown = ["teardown:release imported data and temporary references; timer dele
 [[cell]]
 number = 229
 name = "clock_getres"
-status = "partial"
+status = "implemented"
 contract = "linux-clock_getres"
 handler = "kernel/src/syscall/time.rs:sys_clock_getres"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/time.rs:clock_resolution_requires_supported_clock", "tests/guest/portable/time-abi-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["an encoded foreign or stale CPU-clock pid returns a resolution where Linux's pid_for_clock lookup reports EINVAL"]
+validation_gaps = ["PID_RESOLUTION_BEFORE_RESOLUTION_VALUE is discriminating; the remaining three assertions pin the clock-class resolution values rather than the repaired lookup order"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-clock_adjtime"
@@ -3531,13 +3531,13 @@ teardown = ["teardown:release imported data and temporary references; timer dele
 [[cell]]
 number = 305
 name = "clock_adjtime"
-status = "partial"
+status = "implemented"
 contract = "linux-clock_adjtime"
 handler = "kernel/src/syscall/time.rs:sys_clock_adjtime"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/time.rs:clock_adjtime_copies_timex_before_classifying_clock", "tests/guest/portable/time-abi-differential.c:main"]
-validation_gaps = ["The timex state machine, mode validation and clamps are exercised by the time-abi differential; the discipline effect has no test"]
-limitations = ["ADJ_OFFSET is scaled by the ABI's USER_HZ instead of the kernel tick rate, so a nanosecond offset that is not a multiple of the tick reads back one nanosecond higher than Linux reports"]
+validation_gaps = ["the guest cannot discriminate the ADJ_OFFSET rate for the reason recorded in the adjtimex cell; the four assertions in clock_adjtime.raw-differential cover the clock classification, the copy-in ordering and the shared core"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-syslog"
@@ -7395,13 +7395,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 230
 name = "clock_nanosleep"
-status = "partial"
+status = "implemented"
 contract = "linux-clock_nanosleep"
 handler = "kernel/src/syscall/task/schedule.rs:sys_clock_nanosleep"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/time-abi-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["an unknown clock_nanosleep flag bit is rejected with EINVAL where Linux ignores every bit except TIMER_ABSTIME, and the alarm-clock flag check precedes the capability check"]
+validation_gaps = ["UNKNOWN_FLAGS_IGNORED is discriminating; ALARM_OUTCOME_MATCHES_CONFIG passes on the pre-change kernel as well, because the old generic flag check happened to answer EINVAL for the unprivileged alarm case too"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-ioprio_set"
