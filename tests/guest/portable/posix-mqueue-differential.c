@@ -172,6 +172,16 @@ static int case_mq_open(void) {
         observed.mq_curmsgs != 0 || observed.mq_flags != 0) {
         return fail_code("default-attributes", observed.mq_maxmsg);
     }
+    /* `do_mq_open()` installs the descriptor with `FD_ADD(O_CLOEXEC, ...)`
+     * (`ipc/mqueue.c:924`), and `FD_ADD` hands that argument straight to
+     * `get_unused_fd_flags()`. The queue descriptor is close-on-exec whether or
+     * not the caller passed `O_CLOEXEC`; `oflag` only reaches
+     * `dentry_open()`'s `f_flags`. */
+    int descriptor_flags = fcntl(fd, F_GETFD);
+    if (descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) == 0) {
+        return fail_code("open-cloexec-unconditional", (long)descriptor_flags);
+    }
+    puts("THEKERNEL_ABI_ASSERT mq_open.raw-differential FD_CLOEXEC_UNCONDITIONAL pass");
     if (close(fd) != 0) {
         return fail("default-close");
     }

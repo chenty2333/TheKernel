@@ -21,8 +21,7 @@ use axsync::Mutex;
 use axtask::{WaitError, WaitQueue, current};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::{
-    __kernel_mode_t, CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_SYS_RESOURCE, O_ACCMODE, O_CLOEXEC, O_CREAT,
-    O_EXCL,
+    __kernel_mode_t, CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_SYS_RESOURCE, O_ACCMODE, O_CREAT, O_EXCL,
     O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, SI_MESGQ, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD,
     timespec,
 };
@@ -1518,7 +1517,6 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
     let create = (oflag as u32) & O_CREAT != 0;
     let excl = (oflag as u32) & O_EXCL != 0;
     let nonblocking = (oflag as u32) & O_NONBLOCK != 0;
-    let cloexec = (oflag as u32) & O_CLOEXEC != 0;
     let curr = current();
     let ipc_ns = curr.as_thread().ipc_ns();
 
@@ -1592,7 +1590,17 @@ pub fn sys_mq_open<M: UserMemory + ?Sized>(
         nonblocking,
     ));
     let status_flags = ((oflag as u32) & O_NONBLOCK) | ((oflag as u32) & O_ACCMODE);
-    match add_file_like_with_flags(mqfd, cloexec, status_flags) {
+    // `do_mq_open()` installs the descriptor with
+    //
+    //	fd = FD_ADD(O_CLOEXEC, mqueue_file_open(name, mnt, oflag, ro, mode, attr));
+    //
+    // (`ipc/mqueue.c:924`), and `FD_ADD` (`include/linux/file.h:252`) hands that
+    // first argument straight to `get_unused_fd_flags()`. The queue descriptor
+    // is therefore close-on-exec whether or not the caller passed `O_CLOEXEC`;
+    // `oflag` only reaches `dentry_open()`'s `f_flags`. A 7.2.3 oracle guest
+    // confirms it: `F_GETFD` reports `FD_CLOEXEC` for a plain
+    // `O_CREAT|O_RDWR` `mq_open()`.
+    match add_file_like_with_flags(mqfd, true, status_flags) {
         Ok(fd) => Ok(fd as isize),
         Err(err) => {
             if created {
