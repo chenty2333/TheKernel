@@ -1751,8 +1751,9 @@ pub fn sys_get_mempolicy<M: UserMemory + ?Sized>(
 
     if flags & tk_linux_mm::MPOL_F_NODE != 0 {
         let node = if flags & tk_linux_mm::MPOL_F_ADDR != 0 {
-            // Linux resolves the *page's* node with `lookup_node()`, which
-            // faults the address in; a hole is EFAULT.
+            // `lookup_node()` resolves the *page's* node, and it resolves it
+            // with `get_user_pages_fast()`, which faults the page in first.
+            fault_in_mempolicy_page(memory, addr)?;
             numa_page_node(proc_data, addr)? as i32
         } else {
             // Without MPOL_F_ADDR this is the next interleave node, and Linux
@@ -1786,6 +1787,36 @@ pub fn sys_get_mempolicy<M: UserMemory + ?Sized>(
         mempolicy_reported_nodemask(selected),
     )?;
     Ok(0)
+}
+
+/// The read half of Linux's `lookup_node()`.
+///
+/// ```c
+/// ret = get_user_pages_fast(addr & PAGE_MASK, 1, 0, &p);
+/// if (ret > 0) {
+/// 	ret = page_to_nid(p);
+/// 	put_page(p);
+/// }
+/// ```
+///
+/// (`mm/mempolicy.c:1133-1144`). `get_user_pages_fast()` resolves the page by
+/// *faulting it in* on a read fault rather than only looking it up, so an
+/// address inside a VMA whose page is not resident yet is not an error:
+/// `lookup_node()` reports the freshly populated page's node. A hole fails
+/// earlier in `do_get_mempolicy()`'s `vma_lookup()`, and a page the caller may
+/// not read (`PROT_NONE`) fails here in both kernels. Touching one byte
+/// reproduces exactly that fault-in; the reported node itself still comes from
+/// the task's policy for the address, as it does everywhere else in this
+/// single-node kernel.
+fn fault_in_mempolicy_page<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    addr: usize,
+) -> AxResult<()> {
+    let mut probe = MaybeUninit::<u8>::uninit();
+    let start = addr & !(PAGE_SIZE_4K - 1);
+    memory
+        .read_bytes(start, core::slice::from_mut(&mut probe))
+        .map_err(map_usercopy_error)
 }
 
 /// `if (policy && put_user(pval, policy)) return -EFAULT;`
