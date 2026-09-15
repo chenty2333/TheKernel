@@ -58,8 +58,8 @@ pub use crate::timers::{
 #[doc(cfg(feature = "multitask"))]
 pub use crate::{
     task::{
-        CurrentTask, MIN_KERNEL_STACK_SIZE, TaskCreateError, TaskExitQueueFault, TaskId, TaskInner,
-        TaskNameError, TaskState, TaskStateDecodeError, TaskWakeFault,
+        CurrentTask, MIN_KERNEL_STACK_SIZE, TASK_COMM_LEN, TaskCreateError, TaskExitQueueFault,
+        TaskId, TaskInner, TaskName, TaskNameError, TaskState, TaskStateDecodeError, TaskWakeFault,
     },
     wait_queue::{WaitError, WaitQueue},
 };
