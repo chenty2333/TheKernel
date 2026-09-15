@@ -587,29 +587,36 @@ int main(void) {
         check(waitpid(child, &status, 0) == child, "waitpid");
         check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "privilege");
         mark("FREEZE_AND_THAW_EPERM_UNPRIVILEGED");
-        /* `do_vfs_ioctl()` runs its own commands before `->unlocked_ioctl`
-         * (fs/ioctl.c:492-581) and never tests `f_mode`, so an O_PATH
-         * descriptor -- which installs `empty_fops` (fs/open.c:888-901) --
-         * still reaches FIOCLEX/FIONCLEX (:499-505), FIONBIO (:507-508),
-         * FIOQSIZE (:513-522) and FIGETBSZ (:533-538). */
+        /* `SYSCALL_DEFINE3(ioctl, ...)` fetches the descriptor with `fdget()`,
+         * which is `__fget_light(fd, FMODE_PATH)` (fs/file.c:1206-1209); that
+         * mask makes the helper return an empty `struct fd` for an `O_PATH`
+         * descriptor, so the syscall answers -EBADF before dispatching any
+         * command.  No command escapes, not even the ones `do_vfs_ioctl()`
+         * answers itself.  The Linux 7.2.3 oracle returns EBADF for each of
+         * these, and this file asserted the opposite until it was corrected. */
         int pathfd = openat(dirfd, "file", O_PATH | O_CLOEXEC);
         check(pathfd >= 0, "opath-open");
         block_size = 0;
-        check(ioctl(pathfd, FIGETBSZ, &block_size) == 0 && block_size >= 512,
+        errno = 0;
+        check(ioctl(pathfd, FIGETBSZ, &block_size) == -1 && errno == EBADF &&
+              block_size == 0,
               "opath-figetbsz");
         long long qsize = -1;
-        check(ioctl(pathfd, FIOQSIZE, &qsize) == 0 && qsize >= 0 && qsize % 512 == 0,
+        errno = 0;
+        check(ioctl(pathfd, FIOQSIZE, &qsize) == -1 && errno == EBADF && qsize == -1,
               "opath-fioqsize");
         check((fcntl(pathfd, F_GETFD) & FD_CLOEXEC) != 0, "opath-cloexec-baseline");
-        check(ioctl(pathfd, FIONCLEX) == 0 && (fcntl(pathfd, F_GETFD) & FD_CLOEXEC) == 0,
+        errno = 0;
+        check(ioctl(pathfd, FIONCLEX) == -1 && errno == EBADF &&
+              (fcntl(pathfd, F_GETFD) & FD_CLOEXEC) != 0,
               "opath-fionclex");
-        check(ioctl(pathfd, FIOCLEX) == 0 && (fcntl(pathfd, F_GETFD) & FD_CLOEXEC) != 0,
-              "opath-fioclex");
+        errno = 0;
+        check(ioctl(pathfd, FIOCLEX) == -1 && errno == EBADF, "opath-fioclex");
         int on = 1;
-        check(ioctl(pathfd, FIONBIO, &on) == 0, "opath-fionbio");
-        check((fcntl(pathfd, F_GETFL) & O_NONBLOCK) != 0, "opath-fionbio-visible");
-        on = 0;
-        check(ioctl(pathfd, FIONBIO, &on) == 0, "opath-fionbio-clear");
+        errno = 0;
+        check(ioctl(pathfd, FIONBIO, &on) == -1 && errno == EBADF, "opath-fionbio");
+        check((fcntl(pathfd, F_GETFL) & O_NONBLOCK) == 0, "opath-fionbio-invisible");
+        check(close(pathfd) == 0, "opath-close");
         /* FIOQSIZE is defined only for directories, symlinks and non-anonymous
          * regular files, while FIOASYNC consults `->fasync` only when the
          * request changes the bit: pipefops has one, a regular file does not. */

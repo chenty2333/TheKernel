@@ -15,7 +15,7 @@ use linux_raw_sys::{
     general::*,
     ioctl::{
         FICLONE, FICLONERANGE, FIGETBSZ, FIFREEZE, FIOASYNC, FIOCLEX, FIONBIO, FIONCLEX, FIONREAD,
-        FIOQSIZE, FITHAW, FS_IOC_FIEMAP, FS_IOC_FSGETXATTR, FS_IOC_GETFLAGS, NS_GET_NSTYPE,
+        FIOQSIZE, FITHAW, FS_IOC_FIEMAP, NS_GET_NSTYPE,
         NS_GET_OWNER_UID, NS_GET_PARENT, NS_GET_USERNS, TIOCGWINSZ, TIOCINQ,
     },
 };
@@ -601,6 +601,21 @@ fn ioctl_inode_type(f: &crate::file::FileHandle<dyn FileLike>) -> Option<NodeTyp
 pub fn sys_ioctl(context: &IoctlContext, fd: i32, cmd: u32, arg: usize) -> AxResult<isize> {
     debug!("sys_ioctl <= fd: {fd}, cmd: {cmd}, arg: {arg}");
     let f = context.get_file_like(fd)?;
+    // `SYSCALL_DEFINE3(ioctl, ...)` looks the descriptor up with `fdget()`,
+    // which is `__fget_light(fd, FMODE_PATH)` (fs/file.c:1206-1209); the mask
+    // makes that helper return an empty `struct fd` for an `O_PATH`
+    // descriptor, and the syscall answers `-EBADF` before it dispatches any
+    // command at all:
+    //
+    //         struct fd f = fdget(fd);
+    //         if (!f.file) return -EBADF;      (fs/ioctl.c)
+    //
+    // So no command escapes on an `O_PATH` descriptor -- not the ones
+    // `do_vfs_ioctl()` answers itself, and not the ones whose inode operation
+    // would have reported `-EBADF` on its own.  The differential oracle
+    // confirms it: `ioctl(open("/", O_PATH), FIGETBSZ, &n)` is EBADF on
+    // Linux 7.2.3.
+    f.check_io_access()?;
     // `sys_ioctl()` reaches the LSM hook `security_file_ioctl()` before
     // `do_vfs_ioctl()` and therefore before every generic command below.
     if let Some(file) = f.downcast_ref::<File>()
@@ -866,21 +881,10 @@ pub fn sys_ioctl(context: &IoctlContext, fd: i32, cmd: u32, arg: usize) -> AxRes
             return Ok(0);
         }
     }
-    // A command that `do_vfs_ioctl()` answers itself has already returned.  The
-    // remaining cases of its default arm enter the provider or an inode
-    // operation through the generic layer, so the empty `O_PATH` table does not
-    // stop all of them: `ioctl_fiemap()` and `ioctl_getflags()` never test
-    // `f_mode`, while `ioctl_file_clone()` and `ioctl_preallocate()` fail with
-    // their own `-EBADF` (`generic_file_rw_checks()`, `vfs_fallocate()`), which
-    // `check_io_access()` reports here as well.  Every other command is a
-    // provider command and is refused on an `O_PATH` descriptor exactly like
-    // Linux's empty `file_operations`.
-    let reaches_object = matches!(cmd, FS_IOC_FIEMAP | FS_IOC_GETFLAGS | FS_IOC_FSGETXATTR)
-        || (inode_type == Some(NodeType::RegularFile)
-            && (cmd == FIBMAP || preallocate_mode(cmd).is_some()));
-    if !reaches_object {
-        f.check_io_access()?;
-    }
+    // A command that `do_vfs_ioctl()` answers itself has already returned, and
+    // the `O_PATH` refusal above has already removed every descriptor that
+    // cannot reach an object at all.  What remains is an ordinary descriptor
+    // whose provider may still lack the command.
     if let Some(file) = f.downcast_ref::<File>()
         && let Some(result) = proc_namespace_ioctl(context, file.inner().location(), cmd, arg)
     {
