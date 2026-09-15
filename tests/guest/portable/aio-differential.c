@@ -228,6 +228,16 @@ static int test_io_cancel_pending_request(aio_context_t ctx, int read_fd) {
     if (events[0].obj != (uint64_t)(uintptr_t)&iocb)
         return fail_value("io-cancel-pending-event-obj",
                           (long)events[0].obj, (long)(uintptr_t)&iocb);
+    /* A cancelled *poll* request does not publish -ECANCELED.  `aio_poll_cancel()`
+     * sets `req->cancelled` and re-schedules `aio_poll_complete_work()`
+     * (`fs/aio.c:1823-1837`); that work skips `vfs_poll()` for a cancelled
+     * request and publishes `iocb->ki_res.res = mangle_poll(mask)` with `mask`
+     * still at its initialiser (`fs/aio.c:1777-1817`).  `__MAP(0, from, to)` is
+     * zero for every bit, so `mangle_poll(0) == 0`
+     * (`include/linux/poll.h:120-127`).  Only the non-poll completion paths
+     * report -ECANCELED, which is why this value is asserted here. */
+    if (events[0].res != 0)
+        return fail_value("io-cancel-pending-event-res", (long)events[0].res, 0);
     return 0;
 }
 

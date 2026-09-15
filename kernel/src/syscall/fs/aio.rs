@@ -32,7 +32,9 @@ use linux_raw_sys::general::{
 // the same critical sections with a spin mutex.
 #[cfg(test)]
 use spin::Mutex;
-use tk_linux_aio::{AioContextId as AbiAioContextId, AioContextSnapshot, plan_destroy};
+use tk_linux_aio::{
+    AioContextId as AbiAioContextId, AioContextSnapshot, cancelled_completion, plan_destroy,
+};
 use tk_linux_process_adapter::Pid;
 use tk_linux_signal::SignalSet;
 use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
@@ -186,6 +188,10 @@ struct AioRequest {
     /// discards it and leaves `io_cancel` as the sole ECANCELED reporter.
     completion_owner: core::sync::atomic::AtomicU8,
     pending_provider_result: Mutex<Option<i64>>,
+    /// `IOCB_CMD_POLL` (`fs/aio.c:1823-1837`).  It decides only what a
+    /// cancelled request publishes, so it is recorded as the boolean the
+    /// policy rule needs rather than as a second copy of the opcode.
+    is_poll: bool,
 }
 
 const COMPLETION_NORMAL: u8 = 0;
@@ -771,6 +777,7 @@ fn submit_poll_request(
         owned_completion_target,
         completion_owner: core::sync::atomic::AtomicU8::new(COMPLETION_NORMAL),
         pending_provider_result: Mutex::new(None),
+        is_poll: true,
     })
     .map_err(|_| AxError::NoMemory)?;
     let mut name = String::new();
@@ -824,6 +831,7 @@ fn submit_classic_request(
         owned_completion_target,
         completion_owner: core::sync::atomic::AtomicU8::new(COMPLETION_NORMAL),
         pending_provider_result: Mutex::new(None),
+        is_poll: false,
     })
     .map_err(|_| AxError::NoMemory)?;
     *request.owned_completion_target.lock() =
@@ -1628,7 +1636,10 @@ pub fn sys_io_cancel<M: UserMemory + ?Sized>(
                 state.events.push_back(IoEvent {
                     data: request.data,
                     obj: request.iocb,
-                    res: -LinuxError::ECANCELED.code() as i64,
+                    // A cancelled poll request publishes mangle_poll(0) == 0;
+                    // every other request publishes -ECANCELED.  See
+                    // `tk_linux_aio::cancelled_completion`.
+                    res: cancelled_completion(request.is_poll),
                     res2: 0,
                 });
                 true

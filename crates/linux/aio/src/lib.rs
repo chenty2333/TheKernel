@@ -95,6 +95,39 @@ pub enum AioOpcode {
     Preadv,
     Pwritev,
 }
+/// `ECANCELED` (`include/uapi/asm-generic/errno.h`).  A request withdrawn by
+/// `io_cancel(2)` normally completes with this value.
+pub const ECANCELED: i64 = 125;
+
+/// The `res` a request publishes on the completion ring after `io_cancel(2)`
+/// withdrew it.
+///
+/// `io_cancel()` finds the request on `ctx->active_reqs` and calls its
+/// `ki_cancel` hook (`fs/aio.c:2248-2254`); the event itself is published by
+/// whichever completion path that hook drives, and the two differ:
+///
+/// * `aio_poll_cancel()` sets `req->cancelled` and re-schedules
+///   `aio_poll_complete_work()` (`fs/aio.c:1823-1837`).  That work skips
+///   `vfs_poll()` for a cancelled request --
+///
+///   ```text
+///   __poll_t mask = 0;
+///   if (!READ_ONCE(req->cancelled))
+///           mask = vfs_poll(req->file, &pt) & req->events;
+///   ```
+///
+///   -- leaves `mask` at its initialiser, and publishes
+///   `iocb->ki_res.res = mangle_poll(mask)` (`fs/aio.c:1777-1817`).
+///   `mangle_poll()` maps each `EPOLL*` bit onto its `POLL*` counterpart and
+///   `__MAP(0, from, to)` is zero for every bit, so `mangle_poll(0) == 0`
+///   (`include/linux/poll.h:120-127`).
+/// * every other request reaches `aio_complete()` with `-ECANCELED`.
+///
+/// A cancelled poll request therefore reports `res == 0`, not `-ECANCELED`.
+pub const fn cancelled_completion(is_poll: bool) -> i64 {
+    if is_poll { 0 } else { -ECANCELED }
+}
+
 impl TryFrom<u16> for AioOpcode {
     type Error = AioError;
     fn try_from(raw: u16) -> Result<Self, Self::Error> {
@@ -399,5 +432,15 @@ mod tests {
         for opcode in [0_u16, 1, 2, 3, 5, 7, 8] {
             assert!(AioOpcode::try_from(opcode).is_ok());
         }
+    }
+
+    #[test]
+    fn cancelled_poll_publishes_zero_and_other_requests_publish_ecanceled() {
+        // `aio_poll_complete_work()` skips `vfs_poll()` for a cancelled request
+        // and publishes `mangle_poll(mask)` with `mask` at its initialiser, and
+        // `mangle_poll(0)` is 0 (fs/aio.c:1777-1817, include/linux/poll.h:120).
+        assert_eq!(cancelled_completion(true), 0);
+        // Every other completion path reports -ECANCELED.
+        assert_eq!(cancelled_completion(false), -125);
     }
 }
