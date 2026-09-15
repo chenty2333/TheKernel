@@ -13,7 +13,8 @@ use axtask::{
     TaskSchedulingUpdate, current,
     future::{BlockOnError, Interrupted, block_on, interruptible},
     sched_state, set_sched_state_versioned_with_uclamp_constraints, set_task_affinity,
-    set_task_nice as update_task_nice, task_scheduling_snapshot, update_task_scheduling,
+    set_task_nice as update_task_nice, task_reset_on_spawn, task_scheduling_snapshot,
+    update_task_scheduling,
 };
 use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM,
@@ -263,10 +264,21 @@ fn validate_rt_priority(priority: i32) -> AxResult<u8> {
     }
 }
 
+/// `p->sched_reset_on_fork` for a live target.
+///
+/// The bit is read from the task's own durable publication rather than from
+/// `task_scheduling_snapshot()`, which refuses a task whose scheduler entity
+/// has been deactivated (`TaskSchedError::TaskExited`).  Linux answers this
+/// query from the still-hashed `task_struct` for as long as the task object is
+/// addressable -- `SYSCALL_DEFINE1(sched_getscheduler, pid_t, pid)`
+/// (`kernel/sched/syscalls.c:995-1015`) reads `p->policy` and
+/// `p->sched_reset_on_fork` after `find_process_by_pid()` -- so a task that has
+/// started exiting but has not been reaped still reports the policy it last
+/// installed.  Reading the per-task cell is also what keeps a *non-leader*
+/// thread correct: a terminalizing thread's flag lives in its own cell, while
+/// the zombie snapshot of its group leader belongs to a different task.
 fn sched_reset_on_fork(task: &AxTaskRef) -> AxResult<bool> {
-    task_scheduling_snapshot(task)
-        .map(|commit| commit.reset_on_spawn)
-        .map_err(map_sched_error)
+    Ok(axtask::task_reset_on_spawn(task))
 }
 
 impl SchedTarget {

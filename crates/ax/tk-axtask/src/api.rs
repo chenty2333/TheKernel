@@ -968,6 +968,23 @@ pub fn task_scheduling_snapshot(
     crate::run_queue::scheduler_state_snapshot_stable(task)
 }
 
+/// Reads the durable `SCHED_RESET_ON_FORK` publication of one exact task.
+///
+/// The bit is written by every successful scheduling transaction while the
+/// owning run queue's scheduler lock is held, so it stays valid after the task
+/// has terminalized and its scheduler entity has been deactivated, for as long
+/// as the task object itself is addressable.  [`task_scheduling_snapshot`]
+/// deliberately refuses that window with [`TaskSchedError::TaskExited`]
+/// because a *parameter update* may not enter an ownerless representation;
+/// Linux's `sched_getscheduler(2)` instead reads `p->sched_reset_on_fork` from
+/// the still-hashed `task_struct`
+/// (`kernel/sched/syscalls.c:995-1015`), so a query of an exiting task needs
+/// exactly this narrower, read-only cell.
+#[cfg(feature = "sched-eevdf")]
+pub fn task_reset_on_spawn(task: &AxTaskRef) -> bool {
+    task.sched_reset_on_spawn()
+}
+
 /// Returns the target's class and scheduler-owned interval in ticks.
 ///
 /// The value is read while holding the target run queue's scheduler lock, so

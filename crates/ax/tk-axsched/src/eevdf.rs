@@ -4551,7 +4551,24 @@ impl<T> EEVDFScheduler<T> {
         elapsed_ns: u64,
     ) -> Result<bool, SchedulerError> {
         let state = unsafe { current.owned_state().clone() };
-        if state.deadline_throttled || state.deadline_remaining_ns == 0 {
+        if state.deadline_throttled {
+            // The entity exhausted its CBS budget and is waiting for its
+            // replenishment instant, but the reschedule that takes it off the
+            // CPU is requested rather than synchronous
+            // (`kernel/sched/deadline.c:1501-1530`), so the run queue charges
+            // the still-current task once more at that switch boundary. Linux
+            // accepts such a sample -- `dl_se->runtime` only goes further
+            // negative and `replenish_dl_entity()` charges the overrun to the
+            // following period (`kernel/sched/deadline.c:831-834`). Keeping the
+            // entity throttled and asking for the reschedule again is the
+            // equivalent boundary here; the overrun itself is not carried into
+            // the next budget.
+            return Ok(true);
+        }
+        if state.deadline_remaining_ns == 0 {
+            // A zero budget is always published together with the throttle
+            // bit, so this cannot be produced by this scheduler. Report it
+            // rather than deriving a boundary from an impossible state.
             return Err(SchedulerError::InconsistentState);
         }
         let exhausted = elapsed_ns >= state.deadline_remaining_ns;
@@ -7122,6 +7139,42 @@ mod tests {
         assert_eq!(state.deadline_replenish_at_ns, 360);
         assert!(!state.deadline_throttled);
         assert_eq!(domain.utilization.load(Ordering::Acquire), admitted);
+    }
+
+    #[test]
+    fn a_boundary_sample_after_deadline_exhaustion_keeps_the_entity_throttled() {
+        // Exhausting the CBS budget does not switch the task out
+        // synchronously: the sample that observes `dl_runtime_exceeded()`
+        // throttles the entity and requests a reschedule
+        // (`kernel/sched/deadline.c:1501-1530`), and the run queue charges the
+        // still-running task once more at that switch boundary. Linux accepts
+        // that second sample -- `dl_se->runtime` only goes further negative and
+        // `replenish_dl_entity()` charges the overrun to the following period
+        // (`kernel/sched/deadline.c:831-834`) -- so a legal boundary sample
+        // must not be reported as scheduler corruption.
+        let mut scheduler = EEVDFScheduler::new();
+        let task = Arc::new(EEVDFTask::new(1));
+        let config = DeadlineParameters {
+            runtime_ns: 25,
+            deadline_ns: 100,
+            period_ns: 120,
+            flags: 0,
+        };
+        scheduler.stage_task_deadline_config(&task, config).unwrap();
+        let _ = scheduler
+            .set_task_params(&task, rt(EevdfTaskClass::Deadline, 0))
+            .unwrap();
+        scheduler.add_task(Arc::clone(&task)).unwrap();
+        let current = scheduler.pick_next_task().unwrap();
+        assert!(scheduler.account_runtime(&current, RuntimeDelta::new(25, 1)));
+        // The switch-out sample lands before the requested reschedule runs.
+        assert!(scheduler.account_runtime(&current, RuntimeDelta::new(1, 1)));
+        let (throttled, remaining) = unsafe {
+            let state = task.owned_state();
+            (state.deadline_throttled, state.deadline_remaining_ns)
+        };
+        assert!(throttled);
+        assert_eq!(remaining, 0);
     }
 
     #[test]
