@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::future::pending;
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -209,7 +209,7 @@ pub fn sys_rt_sigpending<M: UserMemory + ?Sized>(
     Ok(0)
 }
 
-fn make_siginfo(signo: u32, code: i32) -> AxResult<Option<SignalInfo>> {
+pub(crate) fn make_siginfo(signo: u32, code: i32) -> AxResult<Option<SignalInfo>> {
     if signo == 0 {
         return Ok(None);
     }
@@ -818,6 +818,39 @@ fn send_user_signal_to_targets(
     reducer.finish()
 }
 
+/// Every process currently attached to the process group `pgid`.
+///
+/// This is Linux's `do_each_pid_task(pgrp, PIDTYPE_PGID, p)` walk: the
+/// registry entry for a process group holds its published members, including
+/// an unreaped zombie that is still linked to the group's PID.  A group whose
+/// entry is gone, or which has no members left, is `ESRCH` exactly as an empty
+/// `pid->tasks[PIDTYPE_PGID]` list makes `__kill_pgrp_info()` report.
+pub(crate) fn process_group_targets(pgid: Pid) -> AxResult<Vec<Arc<Process>>> {
+    let targets = get_process_group(pgid)?
+        .try_processes(process_domain()?.registry())
+        .map_err(process_error)?;
+    if targets.is_empty() {
+        return Err(AxError::NoSuchProcess);
+    }
+    Ok(targets)
+}
+
+/// Sends one already-built signal record to an already-resolved process-group
+/// member list with `__kill_pgrp_info()`'s reducer: success if any member
+/// accepted the signal, otherwise the last member's error.
+pub(crate) fn send_user_signal_to_process_group_targets(
+    targets: Vec<Arc<Process>>,
+    signal: Option<SignalInfo>,
+    operation: SignalSecurityOperation,
+) -> AxResult<()> {
+    send_user_signal_to_targets(
+        targets,
+        signal,
+        operation,
+        SignalTargetAggregation::ProcessGroup,
+    )
+}
+
 struct AuthorizedThreadSignalTarget {
     task: AxTaskRef,
     credential: Arc<Cred>,
@@ -1022,15 +1055,11 @@ pub fn sys_kill(pid: i32, signo: u32) -> AxResult<isize> {
             let pgid = caller_ns
                 .resolve_visible_pid(pgid)
                 .ok_or(AxError::NoSuchProcess)?;
-            let targets = get_process_group(pgid)?
-                .try_processes(process_domain()?.registry())
-                .map_err(process_error)?;
-            send_user_signal_to_targets(
-                targets,
-                sig,
-                operation,
-                SignalTargetAggregation::ProcessGroup,
-            )?;
+            // `do_send_specific()`/`kill_pgrp_info()` reach the group through
+            // the PID number, so an unreaped zombie leader still keeps the
+            // group addressable until `release_task()` detaches it.
+            let targets = process_group_targets(pgid)?;
+            send_user_signal_to_process_group_targets(targets, sig, operation)?;
         }
     }
     Ok(0)

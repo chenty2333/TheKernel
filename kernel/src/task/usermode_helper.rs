@@ -28,7 +28,8 @@ use crate::{
     mm::{copy_from_kernel, load_user_app_helper, new_user_aspace_empty},
     task::{
         AsThread, CredentialSlot, Dumpability, FdTableSlot, ProcessAccessState, ProcessData,
-        ProcessInitialAdmission, SchedulerSeed, TaskParentChoice, Thread, linux_pid_from_task_id,
+        ProcessIdentity, ProcessInitialAdmission, SchedulerSeed, TaskParentChoice, Thread,
+        linux_pid_from_task_id,
         lock_task_parent_publication, prepare_task_table_admission, process_domain, process_error,
         set_task_user_address_space, try_new_user_task,
     },
@@ -185,7 +186,7 @@ pub(crate) fn spawn_usermode_helper(spec: UsermodeHelperSpec) -> AxResult<Usermo
                     &reaper_scope,
                     tid,
                     None,
-                    pid_ns,
+                    ProcessIdentity::try_new(pid_ns, Some(caller_thread.task_parent_node().clone()))?,
                 )
                 .map_err(process_error)?
                 .prepare_initial_thread(tid)
@@ -199,7 +200,7 @@ pub(crate) fn spawn_usermode_helper(spec: UsermodeHelperSpec) -> AxResult<Usermo
                     &reaper_scope,
                     tid,
                     None,
-                    pid_ns,
+                    ProcessIdentity::try_new(pid_ns, Some(caller_thread.task_parent_node().clone()))?,
                 )
                 .map_err(process_error)?
                 .prepare_initial_thread(tid)

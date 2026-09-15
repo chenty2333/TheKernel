@@ -18,8 +18,8 @@ use crate::{
     readiness::block_on_poll_set_interruptible_if,
     task::{
         AsThread, PidNamespace, Process, ProcessData, PtraceSession, StopFilter, StopReport,
-        TaskUsage, ZombieSnapshot, get_process_data, has_pending_syscall_signal, process_domain,
-        reap_process,
+        TaskParentNode, TaskUsage, Thread, ZombieSnapshot, get_process_data,
+        has_pending_syscall_signal, is_exact_child_of_thread, process_domain, reap_process,
     },
 };
 
@@ -78,7 +78,7 @@ impl WaitPid {
 /// registry deliberately uses kernel-wide IDs, but wait(2) arguments and
 /// results are namespace-relative.
 pub(crate) fn visible_process_pid(viewer_pid_ns: &PidNamespace, process: &Process) -> Option<Pid> {
-    let target_pid_ns = process.identity::<Arc<PidNamespace>>()?;
+    let target_pid_ns = crate::task::process_identity_pid_ns(process)?;
     viewer_pid_ns.visible_pid_for(target_pid_ns, process.pid())
 }
 
@@ -226,6 +226,41 @@ pub(crate) fn should_wait_for_child(child: &Process, options: &WaitOptions) -> b
     }
 }
 
+/// Linux's `__WNOTHREAD` rule, which restricts a wait to the exact calling
+/// task's own relation instead of the whole thread group's.
+///
+/// `__do_wait()` walks `current->children` and `current->ptraced` and breaks
+/// out of the thread-group loop as soon as the flag is set
+/// (`kernel/exit.c:1725-1735`), while `do_wait_pid()` admits a named target only
+/// through `is_effectively_child()`: `current == target->real_parent` for the
+/// thread-group lookup and `current == target->parent` for the ptrace one
+/// (`kernel/exit.c:1657-1664`, `:1672-1697`). Both are exact *task* identities,
+/// so a sibling thread of the thread that forked never qualifies.
+struct WaitThreadScope {
+    caller_kernel_tid: Pid,
+    caller_node: Arc<TaskParentNode>,
+}
+
+impl WaitThreadScope {
+    fn new(caller: &Thread) -> Self {
+        Self {
+            caller_kernel_tid: caller.kernel_tid(),
+            caller_node: caller.task_parent_node().clone(),
+        }
+    }
+
+    /// `current == p->real_parent`.
+    fn owns_child(&self, child: &Process) -> bool {
+        is_exact_child_of_thread(child, &self.caller_node)
+    }
+
+    /// `current == p->parent` for a `p->ptrace` tracee, which Linux reaches
+    /// through the tracer thread that `ptrace_link()` recorded.
+    fn owns_tracee(&self, session: &PtraceSession) -> bool {
+        session.tracer_kernel_tid == self.caller_kernel_tid
+    }
+}
+
 fn process_error(error: ProcessError) -> AxError {
     match error {
         ProcessError::NoMemory | ProcessError::Capacity => AxError::NoMemory,
@@ -241,8 +276,11 @@ fn matching_wait_candidates(
     viewer_pid_ns: &PidNamespace,
     pid: WaitPid,
     options: &WaitOptions,
+    caller: &Thread,
 ) -> AxResult<Vec<WaitCandidate>> {
     let proc = &proc_data.proc;
+    let nothread = options.contains(WaitOptions::WNOTHREAD);
+    let thread_scope = nothread.then(|| WaitThreadScope::new(caller));
     let children = proc
         .try_children(process_domain()?.registry())
         .map_err(process_error)?;
@@ -263,6 +301,15 @@ fn matching_wait_candidates(
     let mut ok = 0u32;
     let mut invisible = 0u32;
     for process in children {
+        // `__WNOTHREAD` narrows the thread-group walk to the caller itself, so
+        // a child of a sibling thread is not a candidate at all.
+        if thread_scope
+            .as_ref()
+            .is_some_and(|scope| !scope.owns_child(&process))
+        {
+            invisible += 1;
+            continue;
+        }
         let Some(visible_pid) = wait_pid_applies(viewer_pid_ns, pid, &process) else {
             invisible += 1;
             continue;
@@ -281,6 +328,14 @@ fn matching_wait_candidates(
     crate::task::exit_status_note_candidates(seen, pid_ok, ok, tracees.len() as u32, invisible);
 
     for reverse_link in tracees {
+        // `ptrace_do_wait()` walks one task's `ptraced` list, so
+        // `__WNOTHREAD` admits only tracees this exact thread attached.
+        if thread_scope
+            .as_ref()
+            .is_some_and(|scope| !scope.owns_tracee(&reverse_link.session()))
+        {
+            continue;
+        }
         let tracee_pid = reverse_link.tracee();
         let Ok(tracee_data) = get_process_data(tracee_pid) else {
             proc_data.remove_ptrace_tracee(reverse_link);
@@ -333,6 +388,7 @@ fn pidfd_wait_candidate(
     viewer_pid_ns: &PidNamespace,
     pidfd: &PidFd,
     options: &WaitOptions,
+    caller: &Thread,
 ) -> AxResult<WaitCandidate> {
     let target = pidfd.process()?;
     let visible_pid =
@@ -350,10 +406,22 @@ fn pidfd_wait_candidate(
     // tracer, so a *non-parent* ptracer holding a pidfd for a tracee it attached
     // to must still be able to wait on it; requiring `real_parent` alone would
     // report ECHILD and strand the tracee.
-    let is_effectively_child = ptrace
-        || target
-            .parent()
-            .is_some_and(|parent| parent.pid() == proc.pid());
+    // `__WNOTHREAD` replaces both `same_thread_group()` arms of
+    // `is_effectively_child()` with exact task identity: the calling task must
+    // be the target's `real_parent`, or the tracer recorded by `ptrace_link()`
+    // for the `p->ptrace` arm.
+    let is_effectively_child = if options.contains(WaitOptions::WNOTHREAD) {
+        let scope = WaitThreadScope::new(caller);
+        scope.owns_child(&target)
+            || expected_ptrace_session
+                .as_ref()
+                .is_some_and(|session| scope.owns_tracee(session))
+    } else {
+        ptrace
+            || target
+                .parent()
+                .is_some_and(|parent| parent.pid() == proc.pid())
+    };
     // `eligible_child()` returns 1 for a ptrace target regardless of
     // `__WCLONE`/`__WALL`, and otherwise filters on the exit signal.
     let eligible = ptrace || should_wait_for_child(&target, options);
@@ -618,8 +686,10 @@ pub fn sys_waitpid(
     };
     let check_children = || {
         let _wait_guard = proc_data.wait_lock.lock();
-        let candidates = match matching_wait_candidates(proc_data, &viewer_pid_ns, pid, &options) {
-            Ok(candidates) => candidates,
+        let candidates =
+            match matching_wait_candidates(proc_data, &viewer_pid_ns, pid, &options, curr.as_thread())
+            {
+                Ok(candidates) => candidates,
             Err(err) => {
                 // Error codes are recorded symbolically: `errno()` is not
                 // reachable from here, and the only distinction the report
@@ -907,6 +977,7 @@ fn waitid_claim(idtype: u32, id: u32, options: u32) -> AxResult<WaitIdClaim> {
                 &viewer_pid_ns,
                 &pidfd,
                 &wait_options,
+                curr.as_thread(),
             )?);
             None
         }
@@ -916,7 +987,7 @@ fn waitid_claim(idtype: u32, id: u32, options: u32) -> AxResult<WaitIdClaim> {
     let check_children = || -> AxResult<Option<WaitIdClaim>> {
         let _wait_guard = proc_data.wait_lock.lock();
         let candidates = if let Some(pid) = pid {
-            matching_wait_candidates(proc_data, &viewer_pid_ns, pid, &wait_options)?
+            matching_wait_candidates(proc_data, &viewer_pid_ns, pid, &wait_options, curr.as_thread())?
         } else {
             vec![pidfd_candidate.clone().ok_or(AxError::InvalidInput)?]
         };
@@ -1029,7 +1100,11 @@ mod tests {
         outer.reserve_process(100).unwrap().commit();
         let domain = tk_linux_process_adapter::ProcessDomain::try_new().unwrap();
         let root = domain
-            .try_new_init_with_identity(100, None, outer.clone())
+            .try_new_init_with_identity(
+                100,
+                None,
+                crate::task::ProcessIdentity::try_new(outer.clone(), None).unwrap(),
+            )
             .unwrap();
         domain.prepare_thread(&root, 100).unwrap().commit().unwrap();
         let scope = domain.try_new_reaper_scope().unwrap();
@@ -1043,7 +1118,7 @@ mod tests {
                 &scope,
                 200,
                 None,
-                inner.clone(),
+                crate::task::ProcessIdentity::try_new(inner.clone(), None).unwrap(),
             )
             .unwrap();
         let init = admission
@@ -1053,7 +1128,13 @@ mod tests {
             .unwrap();
         inner.reserve_process(201).unwrap().commit();
         let admission = domain
-            .prepare_fork_in_reaper_scope_with_identity(&init, &scope, 201, Some(17), inner.clone())
+            .prepare_fork_in_reaper_scope_with_identity(
+                &init,
+                &scope,
+                201,
+                Some(17),
+                crate::task::ProcessIdentity::try_new(inner.clone(), None).unwrap(),
+            )
             .unwrap();
         let child = admission.process().clone();
         admission.commit();

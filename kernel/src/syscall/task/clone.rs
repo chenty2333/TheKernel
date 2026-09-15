@@ -29,12 +29,12 @@ use crate::{
     task::{
         AsThread, Cred, CredentialSlot, Dumpability, FsContextSlot, InitialProcessThreadAdmission,
         NamespaceProxy, NetworkNamespace, PendingCredentialPublication, PendingThreadPublication,
-        ProcessAccessState, ProcessData, ProcessInitialAdmission, ProcessThreadAdmission,
-        PtraceRelationshipOrigin, SchedulerSeed, SemUndoState, TaskParentChoice, Thread,
-        fs_context_publication, get_process_data, get_task, linux_pid_from_task_id,
-        lock_task_parent_publication, notify_ptrace_attach_stop, prepare_task_table_admission,
-        process_domain, send_signal_thread_inner, set_task_user_address_space, try_new_user_task,
-        try_tasks,
+        ProcessAccessState, ProcessData, ProcessIdentity, ProcessInitialAdmission,
+        ProcessThreadAdmission, PtraceRelationshipOrigin, SchedulerSeed, SemUndoState,
+        TaskParentChoice, Thread, fs_context_publication, get_process_data, get_task,
+        linux_pid_from_task_id, lock_task_parent_publication, notify_ptrace_attach_stop,
+        prepare_task_table_admission, process_domain, real_parent_node_for_choice,
+        send_signal_thread_inner, set_task_user_address_space, try_new_user_task, try_tasks,
     },
 };
 
@@ -44,6 +44,16 @@ const PTRACE_O_TRACECLONE: u32 = 1 << 3;
 const PTRACE_EVENT_FORK: u8 = 1;
 const PTRACE_EVENT_VFORK: u8 = 2;
 const PTRACE_EVENT_CLONE: u8 = 3;
+
+/// The exact-parent choice both the retained `real_parent` identity and the
+/// published relation are derived from, so the two can never disagree.
+fn clone_task_parent_choice(flags: CloneFlags, caller: &Thread) -> TaskParentChoice {
+    if flags.intersects(CloneFlags::PARENT | CloneFlags::THREAD) {
+        TaskParentChoice::Inherit(caller.task_parent_node().clone())
+    } else {
+        TaskParentChoice::Caller(caller.task_parent_node().clone())
+    }
+}
 
 fn clone_ptrace_event(flags: CloneFlags, options: u32) -> Option<u8> {
     if flags.contains(CloneFlags::UNTRACED) {
@@ -1058,6 +1068,18 @@ impl CloneArgs {
             // unshare(CLONE_NEWPID) installs an empty namespace only for
             // children. Its first clone is its PID 1 and must initialize the
             // already reserved reaper scope just like CLONE_NEWPID itself.
+            // Linux installs `p->real_parent = current` for an ordinary fork
+            // and `p->real_parent = current->real_parent` for
+            // CLONE_PARENT/CLONE_THREAD (`kernel/fork.c:2441`, `:2504`, also
+            // `:2507` for the leader-only `children` link). Retaining that same
+            // exact task identity on the published process keeps
+            // `wait4(2)`'s `__WNOTHREAD` ownership answer available after this
+            // process's runtime data is retired, the way `p->real_parent`
+            // survives on the `task_struct` until `release_task()`.
+            let real_parent = real_parent_node_for_choice(&clone_task_parent_choice(
+                flags,
+                calling_thread,
+            ));
             let pid_namespace_init = flags.contains(CloneFlags::NEWPID) || pid_ns.has_no_init();
             if pid_namespace_init && set_tid_size != 0 && set_tid[0] != 1 {
                 return Err(AxError::InvalidInput);
@@ -1080,7 +1102,7 @@ impl CloneArgs {
                             &reaper_scope,
                             tid,
                             child_exit_signal.map(|signo| signo as u8),
-                            pid_ns.clone(),
+                            ProcessIdentity::try_new(pid_ns.clone(), real_parent.clone())?,
                         )
                         .map_err(map_process_error)?
                         .prepare_initial_thread(tid)
@@ -1095,7 +1117,7 @@ impl CloneArgs {
                             &reaper_scope,
                             tid,
                             child_exit_signal.map(|signo| signo as u8),
-                            pid_ns.clone(),
+                            ProcessIdentity::try_new(pid_ns.clone(), real_parent.clone())?,
                         )
                         .map_err(map_process_error)?
                         .prepare_initial_thread(tid)
@@ -1263,11 +1285,6 @@ impl CloneArgs {
                 thr.landlock_domain(),
             )?;
         }
-        let task_parent_choice = if flags.intersects(CloneFlags::PARENT | CloneFlags::THREAD) {
-            TaskParentChoice::Inherit(calling_thread.task_parent_node().clone())
-        } else {
-            TaskParentChoice::Caller(calling_thread.task_parent_node().clone())
-        };
         if flags.contains(CloneFlags::CHILD_SETTID) {
             thr.set_child_tid_address(child_tid);
         }
@@ -1593,8 +1610,10 @@ impl CloneArgs {
         let child_rseq = rseq_fork.commit();
         task.as_thread().install_rseq_state(child_rseq);
         let task_parent_publication = lock_task_parent_publication();
-        task.as_thread()
-            .publish_task_parent(&task_parent_publication, task_parent_choice);
+        task.as_thread().publish_task_parent(
+            &task_parent_publication,
+            clone_task_parent_choice(flags, calling_thread),
+        );
 
         // From this point onward every operation is an allocation-free,
         // infallible publication step. Publish the exact signal endpoint and

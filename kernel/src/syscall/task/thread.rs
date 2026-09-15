@@ -137,7 +137,9 @@ fn render_parent_pid<C, R>(
     let Some(parent) = parent else {
         return 0;
     };
-    let Some(parent_pid_ns) = parent.identity::<alloc::sync::Arc<crate::task::PidNamespace>>()
+    let Some(parent_pid_ns) = parent
+        .identity::<crate::task::ProcessIdentity>()
+        .map(crate::task::ProcessIdentity::pid_ns)
     else {
         return 0;
     };
@@ -547,10 +549,19 @@ mod tests {
         let child_pid_binding = child_pid_ns.reserve_process(20).unwrap();
         let domain = tk_linux_process_adapter::ProcessDomain::<()>::try_new().unwrap();
         let init = domain
-            .try_new_init_with_identity(1, None, root_pid_ns.clone())
+            .try_new_init_with_identity(
+                1,
+                None,
+                crate::task::ProcessIdentity::try_new(root_pid_ns.clone(), None).unwrap(),
+            )
             .unwrap();
         let child = domain
-            .prepare_fork_with_identity(&init, 20, None, child_pid_ns.clone())
+            .prepare_fork_with_identity(
+                &init,
+                20,
+                None,
+                crate::task::ProcessIdentity::try_new(child_pid_ns.clone(), None).unwrap(),
+            )
             .unwrap();
         child.commit();
         child_pid_binding.commit();
