@@ -646,7 +646,7 @@ static void unshare_flag_case(void) {
     expect_errno(UNSHARE_CASE, "UNSHARE_CLEAR_SIGHAND_EINVAL",
                  syscall(SYS_unshare, (long)(CLONE_CLEAR_SIGHAND)), EINVAL);
 
-    puts("THEKERNEL_ABI_RESULT sysadmin-abi.unshare-flags pass");
+    puts("THEKERNEL_ABI_RESULT sysadmin-abi.unshare-flags.raw-differential pass");
 }
 
 /* --- swapon / swapoff validation order --------------------------------- */
@@ -671,7 +671,7 @@ static void swap_flag_case(void) {
     errno = 0;
     expect_errno(SWAP_CASE, "SWAPOFF_EMPTY_PATH_ENOENT", swapoff(""), ENOENT);
 
-    puts("THEKERNEL_ABI_RESULT sysadmin-abi.swap-flags pass");
+    puts("THEKERNEL_ABI_RESULT sysadmin-abi.swap-flags.raw-differential pass");
 }
 
 /* --- module syscall front gates ---------------------------------------- */
@@ -755,7 +755,7 @@ static void module_image_case(void) {
                  syscall(SYS_delete_module, "thekernel_no_such_module", 0x1000U),
                  MODULE_ANSWER(ENOENT));
 
-    puts("THEKERNEL_ABI_RESULT sysadmin-abi.module-image pass");
+    puts("THEKERNEL_ABI_RESULT sysadmin-abi.module-image.raw-differential pass");
 }
 
 int main(void) {
