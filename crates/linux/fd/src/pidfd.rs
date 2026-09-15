@@ -139,6 +139,51 @@ pub const fn pidfd_signal_plan(
     Ok(PidfdSignalPlan { target, scope })
 }
 
+/// Which task Linux `kernel/pid.c:pidfd_get_task()` addresses for a raw pidfd.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PidfdTaskTarget {
+    /// `pidfd == PIDFD_SELF_THREAD`: `get_task_pid(current, PIDTYPE_PID)`.
+    SelfThread,
+    /// `pidfd == PIDFD_SELF_THREAD_GROUP`: `get_task_pid(current, PIDTYPE_TGID)`.
+    SelfThreadGroup,
+    /// Any other value: a real descriptor, resolved through the fd table.
+    Descriptor,
+}
+
+/// Linux v7.2.3 `kernel/pid.c:pidfd_get_task()`:
+///
+/// ```c
+/// 	switch (pidfd) {
+/// 	case  PIDFD_SELF_THREAD:
+/// 		type = PIDTYPE_PID;
+/// 		pid = get_task_pid(current, type);
+/// 		break;
+/// 	case  PIDFD_SELF_THREAD_GROUP:
+/// 		type = PIDTYPE_TGID;
+/// 		pid = get_task_pid(current, type);
+/// 		break;
+/// 	default:
+/// 		pid = pidfd_get_pid(pidfd, &f_flags);
+/// 		if (IS_ERR(pid))
+/// 			return ERR_CAST(pid);
+/// 		type = PIDTYPE_TGID;
+/// 		break;
+/// 	}
+/// ```
+///
+/// Both self identifiers are negative magic numbers matched *before* any
+/// descriptor lookup, so they address the calling thread — and therefore the
+/// calling mm — without ever consulting, or failing against, the fd table.
+/// This is the resolver shared by `process_madvise(2)` and
+/// `process_mrelease(2)`; `pidfd_send_signal(2)` has its own scope rules.
+pub const fn pidfd_task_target(pidfd: i32) -> PidfdTaskTarget {
+    match pidfd {
+        PIDFD_SELF_THREAD => PidfdTaskTarget::SelfThread,
+        PIDFD_SELF_THREAD_GROUP => PidfdTaskTarget::SelfThreadGroup,
+        _ => PidfdTaskTarget::Descriptor,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +202,35 @@ mod tests {
         assert_eq!(PIDFD_SEND_SIGNAL_FLAGS, 7);
         assert_eq!(PIDFD_SELF_THREAD, -10000);
         assert_eq!(PIDFD_SELF_THREAD_GROUP, -10001);
+    }
+
+    #[test]
+    fn pidfd_get_task_resolves_both_self_identifiers_before_the_fd_table() {
+        // kernel/pid.c:pidfd_get_task()'s switch, in its own order.
+        assert_eq!(pidfd_task_target(PIDFD_SELF_THREAD), PidfdTaskTarget::SelfThread);
+        assert_eq!(
+            pidfd_task_target(PIDFD_SELF_THREAD_GROUP),
+            PidfdTaskTarget::SelfThreadGroup
+        );
+        // Only these two values are magic: everything else — including the
+        // neighbouring negative identifiers that other syscalls define — is a
+        // descriptor lookup.
+        for pidfd in [0, 3, -1, -10002, -10009, i32::MIN, i32::MAX] {
+            assert_eq!(pidfd_task_target(pidfd), PidfdTaskTarget::Descriptor);
+        }
+        // The signal decoder keeps its own scope rules for the same values.
+        assert_eq!(
+            pidfd_signal_plan(PIDFD_SELF_THREAD, 0, DESCRIPTOR_TGID)
+                .expect("self thread is a valid target")
+                .scope,
+            SignalScope::Thread
+        );
+        assert_eq!(
+            pidfd_signal_plan(PIDFD_SELF_THREAD_GROUP, 0, DESCRIPTOR_TGID)
+                .expect("self thread group is a valid target")
+                .scope,
+            SignalScope::ThreadGroup
+        );
     }
 
     #[test]

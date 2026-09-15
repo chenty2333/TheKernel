@@ -161,6 +161,99 @@ pub fn classify_brk(
     Ok(BrkAdmission::Grow { growth })
 }
 
+/// Linux's default `stack_guard_gap` in bytes.
+///
+/// Linux v7.2.3 `mm/mmap.c`:
+///
+/// ```c
+/// unsigned long stack_guard_gap = 256UL<<PAGE_SHIFT;
+/// ```
+///
+/// The value is `__ro_after_init` and can only be raised or lowered by the
+/// `stack_guard_gap=` boot parameter, whose parse sets
+/// `stack_guard_gap = val << PAGE_SHIFT`; nothing in the syscall path changes
+/// it, so a kernel that never parses the parameter uses this default.
+pub const STACK_GUARD_GAP_DEFAULT: u64 = 256 << 12;
+
+/// Which arm of Linux's `vm_start_gap()` a following VMA takes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartGap {
+    /// `VM_GROWSDOWN`: the VMA may expand downwards, so it reserves
+    /// `stack_guard_gap` below its start.
+    GrowDown,
+    /// `VM_SHADOW_STACK`: the hardware shadow stack grows downwards by one
+    /// page, so it reserves exactly one page.
+    ShadowStack,
+    /// Any other VMA reserves nothing below its start.
+    None,
+}
+
+/// Linux v7.2.3 `include/linux/mm.h:vm_start_gap()`:
+///
+/// ```c
+/// static inline unsigned long vm_start_gap(struct vm_area_struct *vma)
+/// {
+/// 	unsigned long vm_start = vma->vm_start;
+///
+/// 	if (vma->vm_flags & VM_GROWSDOWN) {
+/// 		vm_start -= stack_guard_gap;
+/// 		if (vm_start > vma->vm_start)
+/// 			vm_start = 0;
+/// 	} else if (vma->vm_flags & VM_SHADOW_STACK) {
+/// 		/* VM_SHADOW_STACK is only supported on arm64 and x86 */
+/// 		vm_start -= PAGE_SIZE;
+/// 		if (vm_start > vma->vm_start)
+/// 			vm_start = 0;
+/// 	}
+///
+/// 	return vm_start;
+/// }
+/// ```
+///
+/// The subtraction is unsigned and saturates at zero, so a VMA close to the
+/// bottom of the address space yields 0 rather than a wrapped address.
+pub const fn vm_start_gap(vm_start: u64, gap: StartGap, stack_guard_gap: u64) -> u64 {
+    match gap {
+        StartGap::None => vm_start,
+        StartGap::GrowDown => vm_start.saturating_sub(stack_guard_gap),
+        StartGap::ShadowStack => vm_start.saturating_sub(4096),
+    }
+}
+
+/// Linux `SYSCALL_DEFINE1(brk)`'s stack-guard-gap rejection:
+///
+/// ```c
+/// 	/*
+/// 	 * Only check if the next VMA is within the stack_guard_gap of the
+/// 	 * expansion area
+/// 	 */
+/// 	vma_iter_init(&vmi, mm, oldbrk);
+/// 	next = vma_find(&vmi, newbrk + PAGE_SIZE + stack_guard_gap);
+/// 	if (next && newbrk + PAGE_SIZE > vm_start_gap(next))
+/// 		goto out;
+/// ```
+///
+/// `next` is the first VMA intersecting `[oldbrk, newbrk + PAGE_SIZE +
+/// stack_guard_gap)`, so the caller passes the start of *that* VMA — the first
+/// one the growth could reach, including the one it would overlap.  The
+/// comparison is strictly `>`, so a VMA whose guarded start is exactly
+/// `newbrk + PAGE_SIZE` is not rejected.  `goto out` restores `mm->brk`, so a
+/// rejected growth is an unchanged break rather than an error.
+pub const fn growth_crosses_next_guard_gap(
+    new_brk: u64,
+    next_start: u64,
+    next_gap: StartGap,
+    stack_guard_gap: u64,
+) -> bool {
+    match new_brk.checked_add(4096) {
+        Some(page_end) => page_end > vm_start_gap(next_start, next_gap, stack_guard_gap),
+        // An unrepresentable `newbrk + PAGE_SIZE` cannot be compared; Linux
+        // would wrap and reject.  `check_brk_limits()` has already refused a
+        // growth that large, so this arm only has to stay conservative.
+        None => true,
+    }
+}
+
 /// Rounds `value` up to `page_size`, which must be a power of two.
 pub const fn align_up(value: u64, page_size: u64) -> Option<u64> {
     if !page_size.is_power_of_two() {
