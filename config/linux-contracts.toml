@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 293
-implemented = 274
+resolved = 301
+implemented = 282
 explicit_enosys = 19
 fallback = 0
-partial = 92
+partial = 84
 unknown = 0
 
 [[contract]]
@@ -794,13 +794,13 @@ teardown = ["teardown:failed preparation releases unpublished backing and leaves
 [[cell]]
 number = 9
 name = "mmap"
-status = "partial"
+status = "implemented"
 contract = "linux-mmap"
 handler = "kernel/src/syscall/mm/mmap.rs:sys_mmap"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/mm/mmap.rs:mmap_hooks_run_file_then_address_and_stop_on_denial"]
-validation_gaps = ["No registered differential case exercises this syscall's newly aligned behaviour; host tests and source agreement against Linux v7.2.3 are the evidence"]
-limitations = ["an anonymous mapping with a non-zero offset is EINVAL where Linux ignores pgoff, an unknown PROT bit is EINVAL where Linux ignores it, MAP_LOCKED with a zero memlock limit is EAGAIN where Linux is EPERM, and MAP_DROPPABLE is missing"]
+tests = ["kernel/src/syscall/mm/mmap.rs:mmap_hooks_run_file_then_address_and_stop_on_denial", "tests/guest/portable/mm-contracts-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-madvise"
@@ -817,13 +817,13 @@ teardown = ["teardown:failed preparation releases unpublished backing and leaves
 [[cell]]
 number = 28
 name = "madvise"
-status = "partial"
+status = "implemented"
 contract = "linux-madvise"
 handler = "kernel/src/syscall/mm/mmap.rs:sys_madvise"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/mm/mmap.rs:mseal_madvise_discard_set_matches_linux_612"]
-validation_gaps = ["No registered differential case exercises this syscall's newly aligned behaviour; host tests and source agreement against Linux v7.2.3 are the evidence"]
-limitations = ["MADV_HWPOISON, MADV_HUGEPAGE, MADV_COLLAPSE, MADV_DONTNEED_LOCKED, MADV_REMOVE on a locked area and MADV_FREE on a locked area do not follow the KSM, transparent-hugepage and memory-failure configuration the oracle runs"]
+tests = ["kernel/src/syscall/mm/mmap.rs:mseal_madvise_discard_set_matches_linux_612", "tests/guest/portable/mm-contracts-differential.c:main"]
+validation_gaps = ["UNAVAILABLE_ADVICES passes on both guests for the same reason rather than because the kernels agree: the oracle is built without KSM, transparent huge pages and memory failure, so both answer EINVAL for those advices and the assertion would hold for a kernel that ignored the configuration"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-select"
@@ -936,9 +936,9 @@ status = "partial"
 contract = "linux-io_uring_register"
 handler = "kernel/src/syscall/fs/io_uring.rs:sys_io_uring_register"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/io_uring.rs:registered_buffer_count_keeps_null_usercopy_precedence_bounded", "tests/guest/tools/io-uring-smoke.c:main"]
-validation_gaps = ["The full setup/enter/registration opcode matrix lacks Linux7.2.3 differential coverage"]
-limitations = ["registration decodes only opcodes0..5,8,12,20,21,34; other opcodes below36 return EOPNOTSUPP; Linux7.2.3 ZCRX_CTRL36 and BPF_FILTER37 are treated as invalid and return EINVAL"]
+tests = ["kernel/src/syscall/fs/io_uring.rs:registered_buffer_count_keeps_null_usercopy_precedence_bounded", "tests/guest/tools/io-uring-smoke.c:main", "tests/guest/portable/io-uring-register-differential.c:main"]
+validation_gaps = ["FILES_COUNT_LIMITS exercises the NULL array, the zero count, both ceilings, the lowered RLIMIT_NOFILE ceiling and the EBUSY ordering"]
+limitations = ["the fixed-file table is capped at 1024 slots by FixedFileSlotCharge, so a count between that cap and the caller's soft RLIMIT_NOFILE is refused with EMFILE where Linux accepts up to min(1<<20, rlimit)"]
 
 [[contract]]
 id = "linux-futex"
@@ -1116,13 +1116,13 @@ teardown = ["teardown:shrink releases removed backing and deferred fault wakeups
 [[cell]]
 number = 12
 name = "brk"
-status = "partial"
+status = "implemented"
 contract = "linux-brk"
 handler = "kernel/src/syscall/mm/brk.rs:sys_brk"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["No registered differential case exercises this syscall; the change is covered by source agreement with Linux v7.2.3"]
-limitations = ["heap growth requires an existing anonymous area ending exactly at the new break, so growing back after the heap was unmapped returns the old break where Linux creates a VMA; a shrink publishes the smaller break where Linux returns the original one; the collision check omits stack_guard_gap"]
+tests = ["crates/linux/mm/src/tests.rs:brk_growth_respects_the_following_vma_guard_gap", "tests/guest/portable/mm-contracts-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-mprotect"
@@ -3600,13 +3600,13 @@ teardown = ["teardown:release imported data and temporary references; timer dele
 [[cell]]
 number = 318
 name = "getrandom"
-status = "partial"
+status = "implemented"
 contract = "linux-getrandom"
 handler = "kernel/src/syscall/sys.rs:sys_getrandom"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/keyring-random-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["the clamped range is validated one 4096-byte chunk at a time instead of with a single access_ok over the whole span, so a buffer crossing the user pointer ceiling returns a short positive count where Linux reports EFAULT"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-getpid"
@@ -4037,13 +4037,13 @@ teardown = ["teardown:release poll registrations or temporary mapping capabiliti
 [[cell]]
 number = 26
 name = "msync"
-status = "partial"
+status = "implemented"
 contract = "linux-msync"
 handler = "kernel/src/syscall/mm/mmap.rs:sys_msync"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/mm/mmap.rs:msync_flushes_shared_file_ranges_after_holes_before_reporting_enomem"]
-validation_gaps = ["No registered differential case exercises this syscall's newly aligned behaviour; host tests and source agreement against Linux v7.2.3 are the evidence"]
-limitations = ["the locked-area probe covers the whole span, so an interior mlock reports EBUSY with no partial flush where Linux flushes the unlocked prefix"]
+tests = ["kernel/src/syscall/mm/mmap.rs:msync_flushes_shared_file_ranges_after_holes_before_reporting_enomem", "tests/guest/portable/mm-contracts-differential.c:main"]
+validation_gaps = ["explicit-none"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-mlock"
@@ -4336,13 +4336,13 @@ teardown = ["teardown:release poll registrations or temporary mapping capabiliti
 [[cell]]
 number = 440
 name = "process_madvise"
-status = "partial"
+status = "implemented"
 contract = "linux-process_madvise"
 handler = "kernel/src/syscall/mm/process_vm.rs:sys_process_madvise"
 conditional = "explicit-none"
-tests = []
-validation_gaps = ["No registered differential case exercises this syscall; the change is covered by source agreement with Linux v7.2.3"]
-limitations = ["inherits the madvise residuals, and PIDFD_SELF_THREAD, PIDFD_SELF_THREAD_GROUP and non-pidfd descriptors are rejected with errno values Linux does not use"]
+tests = ["tests/guest/portable/mm-contracts-differential.c:main"]
+validation_gaps = ["the remote path of process_madvise returns ENOMEM at the first hole instead of recording unmapped_error and carrying on, but no advice that reaches that path (COLD, PAGEOUT, WILLNEED, COLLAPSE) has an observable effect in the guest, so the divergence is reported rather than asserted"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-map_shadow_stack"
@@ -6245,13 +6245,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 209
 name = "io_submit"
-status = "implemented"
+status = "partial"
 contract = "linux-io_submit"
 handler = "kernel/src/syscall/fs/aio.rs:sys_io_submit"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/aio.rs:context_ids_wrap_skip_live_contexts_and_never_use_zero"]
-validation_gaps = ["Existing source/helper coverage does not establish the full io_submit raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["explicit-none"]
+tests = ["kernel/src/syscall/fs/aio.rs:context_ids_wrap_skip_live_contexts_and_never_use_zero", "tests/guest/portable/aio-differential.c:main"]
+validation_gaps = ["IO_SUBMIT_OPCODE_VALIDATION exercises the nr, context, NULL iocb, opcode and descriptor rules"]
+limitations = ["a negative aio_offset is rejected at submission with EINVAL where Linux validates only aio_nbytes and aio_buf and reports the failure in the completion event; the descriptor is opened after the RESFD eventfd lookup and the aio_key write-back, so a closed descriptor combined with an unreadable iocb or a bad resfd reports that error where Linux reports EBADF"]
 
 [[contract]]
 id = "linux-io_getevents"
@@ -6318,9 +6318,9 @@ status = "partial"
 contract = "linux-io_destroy"
 handler = "kernel/src/syscall/fs/aio.rs:sys_io_destroy"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/aio.rs:context_ids_wrap_skip_live_contexts_and_never_use_zero"]
-validation_gaps = ["Existing source/helper coverage does not establish the full io_destroy raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Retires requests without waiting for all in-flight provider operations, unlike Linux kill_ioctx completion wait"]
+tests = ["kernel/src/syscall/fs/aio.rs:context_ids_wrap_skip_live_contexts_and_never_use_zero", "tests/guest/portable/aio-differential.c:main"]
+validation_gaps = ["IO_DESTROY_VALIDATION exercises the zero, unknown, live and owned-context rules"]
+limitations = ["retires requests without waiting for all in-flight provider operations, so io_destroy can return while a provider call that already read the request is still running, where Linux's kill_ioctx waits for the reference count"]
 
 [[contract]]
 id = "linux-io_cancel"
@@ -6341,8 +6341,8 @@ status = "implemented"
 contract = "linux-io_cancel"
 handler = "kernel/src/syscall/fs/aio.rs:sys_io_cancel"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/aio.rs:context_ids_wrap_skip_live_contexts_and_never_use_zero"]
-validation_gaps = ["io_cancel is verified against Linux v7.2.3 by source agreement; the only cited host test exercises AIO context-id allocation and never calls io_cancel"]
+tests = ["kernel/src/syscall/fs/aio.rs:context_ids_wrap_skip_live_contexts_and_never_use_zero", "tests/guest/portable/aio-differential.c:main"]
+validation_gaps = ["IO_CANCEL_PENDING_REQUEST exercises the pending-poll cancellation path, but the completion result of the cancelled request is deliberately unasserted because TheKernel reports ECANCELED where Linux delivers 0 for a cancelled poll"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7372,13 +7372,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 141
 name = "setpriority"
-status = "partial"
+status = "implemented"
 contract = "linux-setpriority"
 handler = "kernel/src/syscall/task/schedule.rs:sys_setpriority"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
-validation_gaps = ["No registered differential case exercises setpriority across all three selection levels"]
-limitations = ["RLIMIT_NICE is read from the calling task instead of the target, so a child that lowered its own limit can still be reniced here where Linux reports EACCES"]
+validation_gaps = ["a zombie target cannot report its own RLIMIT_NICE because the ProcessData that owns rlim is retired, so the assertion covers the live target and the capability override only"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-clock_nanosleep"
@@ -7423,7 +7423,7 @@ contract = "linux-ioprio_set"
 handler = "kernel/src/syscall/task/schedule.rs:sys_ioprio_set"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
-validation_gaps = ["The aligned behaviour is verified by host tests and by agreement with the quoted Linux v7.2.3 source; no registered differential case binds this syscall"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -7446,7 +7446,7 @@ contract = "linux-ioprio_get"
 handler = "kernel/src/syscall/task/schedule.rs:sys_ioprio_get"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
-validation_gaps = ["The aligned behaviour is verified by host tests and by agreement with the quoted Linux v7.2.3 source; no registered differential case binds this syscall"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -8292,13 +8292,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 248
 name = "add_key"
-status = "partial"
+status = "implemented"
 contract = "linux-add_key"
 handler = "kernel/src/syscall/task/keys.rs:sys_add_key"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/task/keys.rs:add_key_adapter_rejects_private_keyring_prefix_before_type_lookup", "tests/guest/portable/keyring-random-differential.c:main"]
-validation_gaps = ["The validation, errno and copy-shape rules are exercised by the keyring-random differential; the missing commands have no test"]
-limitations = ["the key type and description are resolved before the payload is copied and before the destination keyring is resolved, so a bogus type with a NULL payload reports ENODEV where Linux reports EFAULT"]
+validation_gaps = ["ADD_KEY_VALIDATION asserts the type-before-payload and descriptor-before-keyring precedence; the payload preparse and the description rules are covered by host tests rather than by the guest"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-request_key"
@@ -8343,8 +8343,8 @@ contract = "linux-keyctl"
 handler = "kernel/src/syscall/task/keys.rs:sys_keyctl"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/task/keys.rs:keyctl_capabilities_requires_a_non_null_output_for_nonzero_size", "tests/guest/portable/keyring-random-differential.c:main"]
-validation_gaps = ["The validation, errno and copy-shape rules are exercised by the keyring-random differential; the missing commands have no test"]
-limitations = ["KEYCTL_GET_SECURITY, DH_COMPUTE and WATCH_KEY remain EOPNOTSUPP, so the command table is not complete"]
+validation_gaps = ["explicit-none"]
+limitations = ["KEYCTL_GET_SECURITY, KEYCTL_SESSION_TO_PARENT and the KEYCTL_PKEY_* commands return EOPNOTSUPP while the reference kernel implements them: GET_SECURITY answers with the active LSM's context, SESSION_TO_PARENT is unconditional, and the PKEY commands are built by CONFIG_ASYMMETRIC_KEY_TYPE=y. KEYCTL_DH_COMPUTE and KEYCTL_WATCH_KEY do match the reference kernel, which is built without CONFIG_KEY_DH_OPERATIONS and CONFIG_WATCH_QUEUE and answers EOPNOTSUPP from those stubs before reading an argument"]
 
 [[contract]]
 id = "linux-perf_event_open"
@@ -8522,13 +8522,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 247
 name = "waitid"
-status = "partial"
+status = "implemented"
 contract = "linux-waitid"
 handler = "kernel/src/syscall/task/wait.rs:sys_waitid"
 conditional = "explicit-none"
 tests = ["tests/guest/tools/ioprio-smoke.c:test_zombie_ioprio", "tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["siginfo is written before rusage where Linux copies rusage first, and a failing waitid does not write the zeroed siginfo that Linux writes"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-modify_ldt"
@@ -8664,6 +8664,6 @@ status = "implemented"
 contract = "linux-process_mrelease"
 handler = "kernel/src/syscall/mm/process_vm.rs:sys_process_mrelease"
 conditional = "explicit-none"
-tests = ["kernel/src/mm/aspace/tests.rs:oom_reap_drains_private_cow_ptes_but_keeps_vmas"]
-validation_gaps = ["The reordering is verified against Linux v7.2.3 by source agreement; the cited address-space test only drains page tables and passes identically before the change"]
+tests = ["kernel/src/mm/aspace/tests.rs:oom_reap_drains_private_cow_ptes_but_keeps_vmas", "tests/guest/portable/mm-contracts-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
