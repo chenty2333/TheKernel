@@ -530,6 +530,22 @@ int main(void)
                syscall(SYS_set_mempolicy, MPOL_DEFAULT, (void *)1, 32770), EINVAL);
     EXPECT_ERR("set_mempolicy-maxnode-at-bound-faults",
                syscall(SYS_set_mempolicy, MPOL_DEFAULT, (void *)1, 32769), EFAULT);
+    /* Above MAX_NUMNODES the mask is checked one word at a time *from the end*,
+     * and the word holding the top of the window is read whole: `get_nodes()`
+     * calls `get_bitmap(&t, &nmask[(maxnode - 1) / BITS_PER_LONG], bits)` and
+     * the `t &= ~((1UL << (MAX_NUMNODES % BITS_PER_LONG)) - 1)` clamp in that
+     * arm is a no-op whenever MAX_NUMNODES is a multiple of BITS_PER_LONG
+     * (`mm/mempolicy.c:1668-1692`).  `maxnode` counts bits and 102 leaves 101,
+     * so word 1 is read whole and bit 104 is above MAX_NUMNODES
+     * (CONFIG_NODES_SHIFT=6 -> 64) even though it is also above the caller's
+     * own window.  Node 0 alone is a legal MPOL_BIND mask, so the EINVAL here
+     * can only come from the bit the caller did not count. */
+    {
+        unsigned long high_bit_outside_window[2] = {1, 1UL << 40};
+        EXPECT_ERR("set_mempolicy-mask-bit-above-max-numnodes",
+                   syscall(SYS_set_mempolicy, MPOL_BIND, high_bit_outside_window, 102),
+                   EINVAL);
+    }
     /* An unreadable mask is EFAULT for every mode that reads it -- get_nodes()
      * cannot know the mode and runs first. */
     EXPECT_ERR("set_mempolicy-mask-ptr-fault",

@@ -99,6 +99,15 @@ pub enum MempolicyError {
     /// The mode needs a non-empty mask and none of the requested nodes is
     /// allowed, or the mode forbids a mask outright. `EINVAL`.
     EmptyNodeMask,
+    /// A word `get_bitmap()` must read is absent from the supplied window.
+    ///
+    /// `get_bitmap()` copies out of user memory and reports `-EFAULT` when that
+    /// copy fails; the pure contract cannot read memory, so a caller that hands
+    /// over fewer words than `scanned_words(maxnode)` names reports the same
+    /// condition here. `read_nodemask()` faults the window in first and always
+    /// supplies the complete window, so this is a caller-contract failure
+    /// rather than a user-visible errno. `EFAULT`.
+    NodeMaskUnreadable,
     /// `MPOL_MF_MOVE_ALL` was requested without `CAP_SYS_NICE`. `EPERM`.
     MoveAllNotPermitted,
     /// `start` is not page-aligned. `EINVAL`.
@@ -107,18 +116,97 @@ pub enum MempolicyError {
     RangeOverflow,
 }
 
+/// `get_bitmap()` in Linux v7.2.3 `mm/mempolicy.c`.
+///
+/// ```c
+/// static int get_bitmap(unsigned long *mask, const unsigned long __user *nmask,
+/// 		      unsigned long maxnode)
+/// {
+/// 	unsigned long nlongs = BITS_TO_LONGS(maxnode);
+/// 	int ret;
+///
+/// 	if (in_compat_syscall())
+/// 		ret = compat_get_bitmap(mask, ...);
+/// 	else
+/// 		ret = copy_from_user(mask, nmask,
+/// 				     nlongs * sizeof(unsigned long));
+///
+/// 	if (ret)
+/// 		return -EFAULT;
+///
+/// 	if (maxnode % BITS_PER_LONG)
+/// 		mask[nlongs - 1] &= (1UL << (maxnode % BITS_PER_LONG)) - 1;
+///
+/// 	return 0;
+/// }
+/// ```
+///
+/// Only the final partial word is trimmed, and only when the bit count is not
+/// itself a multiple of `BITS_PER_LONG`; every other word is read whole. With
+/// `MAX_NUMNODES == usize::BITS` this configuration's `nodemask_t` is one word
+/// and `get_nodes()` never asks for a window wider than `BITS_PER_LONG`, so the
+/// copy is always the single word `word`.
+fn get_bitmap_word(word: usize, maxnode: usize) -> usize {
+    let partial = maxnode % usize::BITS as usize;
+    if partial == 0 {
+        word
+    } else {
+        word & mask_below(partial)
+    }
+}
+
 /// `get_nodes()` in Linux v7.2.3 `mm/mempolicy.c`.
 ///
-/// `maxnode` is a count of bits, so a mask naming *n* nodes passes *n + 1*.
-/// Linux decrements first, so `maxnode` of 0 or 1 is the "no mask" spelling that
-/// every mode accepts even when `nmask` is non-NULL.
+/// ```c
+/// static int get_nodes(nodemask_t *nodes, const unsigned long __user *nmask,
+/// 		     unsigned long maxnode)
+/// {
+/// 	--maxnode;
+/// 	nodes_clear(*nodes);
+/// 	if (maxnode == 0 || !nmask)
+/// 		return 0;
+/// 	if (maxnode > PAGE_SIZE*BITS_PER_BYTE)
+/// 		return -EINVAL;
 ///
-/// Otherwise the bits from `maxnode - 1` up to capacity are scanned word by
-/// word, *from the end*. Up to `MAX_NUMNODES` they are kept; above it Linux
-/// only verifies that they are zero, and a set bit there is `EINVAL` — the
-/// kernel cannot name a node it does not have. Bits at or above `maxnode` are
-/// read and must also be zero. Because the scan starts at the top, a mask that
-/// sets only a low bit is admitted for any `maxnode`, however large.
+/// 	/*
+/// 	 * When the user specified more nodes than supported just check
+/// 	 * if the non supported part is all zero, one word at a time,
+/// 	 * starting at the end.
+/// 	 */
+/// 	while (maxnode > MAX_NUMNODES) {
+/// 		unsigned long bits = min_t(unsigned long, maxnode, BITS_PER_LONG);
+/// 		unsigned long t;
+///
+/// 		if (get_bitmap(&t, &nmask[(maxnode - 1) / BITS_PER_LONG], bits))
+/// 			return -EFAULT;
+///
+/// 		if (maxnode - bits >= MAX_NUMNODES) {
+/// 			maxnode -= bits;
+/// 		} else {
+/// 			maxnode = MAX_NUMNODES;
+/// 			t &= ~((1UL << (MAX_NUMNODES % BITS_PER_LONG)) - 1);
+/// 		}
+/// 		if (t)
+/// 			return -EINVAL;
+/// 	}
+///
+/// 	return get_bitmap(nodes_addr(*nodes), nmask, maxnode);
+/// }
+/// ```
+///
+/// `maxnode` is a count of bits, so a mask naming *n* nodes passes *n + 1*.
+/// Linux decrements first, which makes the decrement wrap for `maxnode == 0`:
+/// `maxnode` of 1 is the "no mask" spelling, while 0 leaves `ULONG_MAX` and is
+/// rejected by the length bound. A NULL `nmask` is "no mask" for every
+/// `maxnode`.
+///
+/// Otherwise the words from the top of the window down to word 0 are examined.
+/// Words at or above `MAX_NUMNODES` must be zero and are read *whole*: the
+/// `t &= ~((1UL << (MAX_NUMNODES % BITS_PER_LONG)) - 1)` clamp is a no-op when
+/// `MAX_NUMNODES` is a multiple of `BITS_PER_LONG`, so a set bit anywhere in
+/// the word that holds the window's top — including one above the caller's own
+/// `maxnode` — is `EINVAL`. Only the final `get_bitmap()` window (at most
+/// `MAX_NUMNODES` bits, starting at word 0) is trimmed to `maxnode % 64` bits.
 ///
 /// Returns the accepted mask together with whether `nmask` was supplied,
 /// because `mpol_new()` distinguishes "no nodes" from "node 0".
@@ -127,44 +215,48 @@ pub fn parse_node_mask(
     words: &[usize],
     nmask_supplied: bool,
 ) -> Result<(usize, bool), MempolicyError> {
-    // Linux: `--maxnode; if (maxnode == 0 || !nmask) return 0;`
-    let Some(bits) = maxnode.checked_sub(1) else {
-        return Ok((0, false));
-    };
-    if bits == 0 || !nmask_supplied {
+    // `--maxnode; if (maxnode == 0 || !nmask) return 0;`
+    let mut maxnode = maxnode.wrapping_sub(1);
+    if maxnode == 0 || !nmask_supplied {
         return Ok((0, false));
     }
-    // Linux only rejects the size when a mask was actually supplied.
-    if bits > MAX_NODEMASK_BITS {
+    // Linux only rejects the size when a mask was actually supplied, and it
+    // does so on the decremented value: 32769 is the largest admitted window.
+    if maxnode > MAX_NODEMASK_BITS {
         return Err(MempolicyError::NodeMaskTooLong);
     }
 
-    // Linux scans from the highest word down. Everything at or above
-    // `MAX_NUMNODES` is admitted only when zero, because `nodemask_t` cannot
-    // name such a node. At and below it, the bits below `maxnode` are the ones
-    // `get_bitmap()` copies out; the first word is the only one that can hold
-    // them, since `MAX_NUMNODES == usize::BITS` in this configuration.
-    let mut mask = 0usize;
-    for (index, word) in words.iter().copied().enumerate() {
-        let base = index * usize::BITS as usize;
-        if base >= bits {
-            break;
-        }
-        let keep = (bits - base).min(usize::BITS as usize);
-        let masked = (word << (usize::BITS as usize - keep)) >> (usize::BITS as usize - keep);
-        let above_capacity = if base >= MAX_NUMNODES {
-            masked
+    // `while (maxnode > MAX_NUMNODES)`: `bits` is `min(maxnode, BITS_PER_LONG)`,
+    // which can only be `BITS_PER_LONG` while `maxnode` is larger, so every
+    // window this loop reads is one whole word at `(maxnode - 1) / BITS_PER_LONG`
+    // and `get_bitmap()` trims nothing.
+    while maxnode > MAX_NUMNODES {
+        let bits = maxnode.min(usize::BITS as usize);
+        let index = (maxnode - 1) / usize::BITS as usize;
+        let word = words
+            .get(index)
+            .copied()
+            .ok_or(MempolicyError::NodeMaskUnreadable)?;
+        let mut t = get_bitmap_word(word, bits);
+        if maxnode - bits >= MAX_NUMNODES {
+            maxnode -= bits;
         } else {
-            masked & !mask_below((MAX_NUMNODES - base).min(keep))
-        };
-        if above_capacity != 0 {
+            maxnode = MAX_NUMNODES;
+            t &= !mask_below(MAX_NUMNODES % usize::BITS as usize);
+        }
+        if t != 0 {
             return Err(MempolicyError::NodeOutOfRange);
         }
-        if base < usize::BITS as usize {
-            mask |= (masked & mask_below(keep)) << base;
-        }
     }
-    Ok((mask, true))
+
+    // The accepted mask is `get_bitmap(nodes_addr(*nodes), nmask, maxnode)`,
+    // which for `maxnode <= MAX_NUMNODES == BITS_PER_LONG` copies word 0 alone
+    // and trims it to the caller's window.
+    let word = words
+        .first()
+        .copied()
+        .ok_or(MempolicyError::NodeMaskUnreadable)?;
+    Ok((get_bitmap_word(word, maxnode), true))
 }
 
 /// `(1 << bits) - 1`, with `bits == 64` saturated to all ones.
@@ -699,21 +791,38 @@ mod tests {
     #[test]
     fn get_nodes_bounds_are_linux_page_size_times_bits_per_byte() {
         // `maxnode` is a bit count, so `maxnode == 2` is the smallest value
-        // that can carry node 0. 0 and 1 are the "no mask" spellings.
+        // that can carry node 0, while `maxnode == 1` leaves zero after the
+        // decrement and is the "no mask" spelling.
         assert_eq!(parse_node_mask(1, &[0], true), Ok((0, false)));
-        assert_eq!(parse_node_mask(0, &[0], true), Ok((0, false)));
         assert_eq!(parse_node_mask(2, &[1], true), Ok((1, true)));
+        // `--maxnode` wraps to `ULONG_MAX` for `maxnode == 0`, which is not the
+        // zero the "no mask" test looks for: a supplied mask with `maxnode == 0`
+        // fails the length bound with EINVAL (`mm/mempolicy.c:1663-1667`).
+        assert_eq!(
+            parse_node_mask(0, &[0], true),
+            Err(MempolicyError::NodeMaskTooLong)
+        );
+        assert_eq!(parse_node_mask(0, &[0], false), Ok((0, false)));
         // A NULL mask skips the size check entirely.
         assert_eq!(parse_node_mask(usize::MAX, &[0], false), Ok((0, false)));
-        // `bits` is `maxnode - 1`, compared against `PAGE_SIZE * BITS_PER_BYTE`
-        // before anything is read: 32768 bits is admitted, 32769 is EINVAL.
+        // The bound is on the decremented value, before any word is read:
+        // 32769 bits is admitted (and needs all 512 words `get_bitmap()` would
+        // read), 32770 is EINVAL.
+        let mut window = [0usize; MAX_NODEMASK_BITS.div_ceil(usize::BITS as usize)];
+        window[0] = 1;
         assert_eq!(
-            parse_node_mask(MAX_NODEMASK_BITS + 1, &[1], true),
+            parse_node_mask(MAX_NODEMASK_BITS + 1, &window, true),
             Ok((1, true))
         );
         assert_eq!(
             parse_node_mask(MAX_NODEMASK_BITS + 2, &[1], true),
             Err(MempolicyError::NodeMaskTooLong)
+        );
+        // A window shorter than `get_bitmap()` would read is a contract
+        // violation, not a silent zero-fill.
+        assert_eq!(
+            parse_node_mask(MAX_NODEMASK_BITS + 1, &[1], true),
+            Err(MempolicyError::NodeMaskUnreadable)
         );
     }
 
@@ -764,6 +873,31 @@ mod tests {
         let mut words = [0usize; 8];
         words[0] = 1;
         assert_eq!(parse_node_mask(513, &words, true), Ok((1, true)));
+    }
+
+    #[test]
+    fn get_nodes_checks_the_whole_top_word_not_only_bits_below_maxnode() {
+        // `maxnode == 102` leaves 101 bits. The top window is word 1, read
+        // whole because `bits = min(101, BITS_PER_LONG) == BITS_PER_LONG`, and
+        // `MAX_NUMNODES % BITS_PER_LONG == 0` makes the `t &= ~(...)` clamp a
+        // no-op -- so a set bit at position 40 of that word is a node above
+        // `MAX_NUMNODES` even though it also sits above the caller's `maxnode`
+        // of 101. `get_nodes()` returns EINVAL; trimming the word to the
+        // caller's window first would accept `{0, 1 << 40}` as "node 0".
+        assert_eq!(
+            parse_node_mask(102, &[0, 1usize << 40], true),
+            Err(MempolicyError::NodeOutOfRange)
+        );
+        // The same window with the high bit clear keeps word 0's node 0.
+        assert_eq!(parse_node_mask(102, &[0, 0], true), Ok((0, true)));
+        assert_eq!(parse_node_mask(102, &[1, 0], true), Ok((1, true)));
+        // Bits 64..101 are above `MAX_NUMNODES`, so any of them set is EINVAL.
+        assert_eq!(
+            parse_node_mask(102, &[1, 1], true),
+            Err(MempolicyError::NodeOutOfRange)
+        );
+        // A window that stops at `MAX_NUMNODES` never reads word 1 at all.
+        assert_eq!(parse_node_mask(65, &[1, 1], true), Ok((1, true)));
     }
 
     #[test]
