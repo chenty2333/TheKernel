@@ -36,9 +36,9 @@ Default: `page-alloc-256m`. Use `full` for all allocators and `allocator_api`.
 
 ```toml
 [dependencies]
-axallocator = { version = "0.2", features = ["slab", "buddy"] }
+axallocator = { package = "tk-axallocator", version = "0.1", features = ["slab", "buddy"] }
 ```
 
 ## License
 
-GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0. See [LICENSE](LICENSE).
+GPL-3.0-or-later OR Apache-2.0 OR MulanPSL-2.0. See [LICENSES](LICENSES/).

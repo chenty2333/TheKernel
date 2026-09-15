@@ -1,10 +1,13 @@
 # tk-axpoll
 
 Bounded I/O readiness registration and wakeup primitives for `no_std` systems.
-This maintained workspace fork of upstream `axpoll` is not published to
-crates.io (`publish = false`). Its Rust library name remains `axpoll`.
-Use the workspace dependency or the local `crates/ax/tk-axpoll` path; no
-standalone `tk-*` repository or registry release is implied.
+This maintained fork of upstream `axpoll` is packaged as `tk-axpoll`.
+Its Rust library name remains `axpoll`:
+
+```toml
+[dependencies]
+axpoll = { package = "tk-axpoll", version = "0.1" }
+```
 
 The crate uses the root-pinned `nightly-2026-08-23` toolchain
 (`rustc 1.100.0-nightly`, commit `c54751567`, dated 2026-08-22).

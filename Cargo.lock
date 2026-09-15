@@ -3159,7 +3159,7 @@ dependencies = [
 
 [[package]]
 name = "tk-axallocator"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ax_slab_allocator",
  "axerrno 0.1.2",
@@ -3511,7 +3511,7 @@ version = "0.1.0"
 
 [[package]]
 name = "tk-axpoll"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitflags 2.13.1",
  "futures",
