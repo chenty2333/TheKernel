@@ -13,7 +13,9 @@ use axnet::options::SocketCredentials;
 use axtask::current;
 
 pub use self::{cmsg::*, io::*, name::*, opt::*, socket::*};
-use crate::task::{AsThread, Cred, NetworkNamespace, PidNamespace, security::LandlockDomain};
+use crate::task::{
+    AsThread, Cred, NetworkNamespace, PidNamespace, ns_capable, security::LandlockDomain,
+};
 
 /// Keeps pure socket-output syscalls at the Linux hook boundary: policy sees
 /// the exact pinned socket before the adapter reads any userspace output
@@ -151,5 +153,33 @@ mod tests {
 
         assert_eq!(result, Ok(32));
         assert_eq!(imports.get(), 1);
+    }
+}
+
+/// Assembles the capability answers the generic `SOL_SOCKET`/`SOL_NETLINK`
+/// tables consult.
+///
+/// `sk_setsockopt` splits them deliberately: `SO_DEBUG`, `SO_SNDBUFFORCE` and
+/// `SO_RCVBUFFORCE` use `capable()` over the *initial* user namespace, while
+/// `SO_PRIORITY`, `SO_MARK`, `SO_BINDTOIFINDEX` and the netlink membership
+/// gates use `ns_capable()`/`netlink_allowed()` over the socket's own network
+/// namespace.
+pub(super) fn netlink_option_authority(
+    snapshot: &SocketSyscallSnapshot,
+    socket: &crate::file::netlink::NetlinkSocket,
+) -> crate::file::netlink::NetlinkOptionAuthority {
+    use linux_raw_sys::general::{CAP_NET_ADMIN, CAP_NET_BROADCAST, CAP_NET_RAW};
+    let actor = snapshot.actor();
+    let user_ns = socket.net_namespace().owner_user_ns();
+    // `capable(cap)` is `ns_capable(&init_user_ns, cap)`, and `cap_capable`
+    // denies every credential whose own user namespace is below the target, so
+    // this is exactly "already in the initial user namespace with the bit set".
+    let init_net_admin =
+        actor.user_ns().is_initial() && actor.has_effective_capability(CAP_NET_ADMIN);
+    crate::file::netlink::NetlinkOptionAuthority {
+        init_net_admin,
+        net_admin: ns_capable(actor, user_ns, CAP_NET_ADMIN),
+        net_raw: ns_capable(actor, user_ns, CAP_NET_RAW),
+        net_broadcast: ns_capable(actor, user_ns, CAP_NET_BROADCAST),
     }
 }

@@ -1,0 +1,587 @@
+/* Differential coverage for the socket provider and address semantics that
+ * Linux answers before any transport is reached: creation validation order,
+ * the per-family type/protocol tables, and the generic SOL_SOCKET state every
+ * `struct sock` carries plus the SOL_NETLINK option table.
+ *
+ * Every assertion here was read from the Linux 7.2.3 source named in the
+ * comment above it and is expected to hold identically under TheKernel, so a
+ * mismatch is a real provider-semantics divergence rather than a difference in
+ * feature set.  Values that Linux leaves to configuration or to uninitialized
+ * kernel memory (buffer minima, the `sin6_scope_id` tail of a 24-byte IPv6
+ * address) are deliberately not asserted.
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <linux/capability.h>
+#include <linux/netlink.h>
+#include <netinet/in.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#ifndef AF_MAX
+#define AF_MAX 46
+#endif
+#ifndef NETLINK_USERSOCK
+#define NETLINK_USERSOCK 2
+#endif
+
+static const char *active;
+static void begin(const char *name) { active = name; printf("THEKERNEL_ABI_CASE %s\n", name); }
+static void mark(const char *name, int good) {
+    printf("THEKERNEL_ABI_ASSERT %s %s %s\n", active, name, good ? "pass" : "fail");
+    if (!good) { fprintf(stderr, "%s: errno=%d (%s)\n", name, errno, strerror(errno)); exit(1); }
+}
+static void done(void) { printf("THEKERNEL_ABI_RESULT %s pass\n", active); }
+static void check(const char *name, int good) { if (!good) mark(name, 0); }
+
+static int effective_capability(int capability) {
+    struct __user_cap_header_struct header = {.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+    struct __user_cap_data_struct data[2] = {{0}, {0}};
+    if (syscall(SYS_capget, &header, data) != 0) return 0;
+    return (data[capability / 32].effective & (1U << (capability % 32))) != 0;
+}
+
+/* `__sys_socket_create` rejects a flag bit outside
+ * SOCK_CLOEXEC|SOCK_NONBLOCK with EINVAL, `__sock_create` then tests the
+ * family range (EAFNOSUPPORT) before the type range (EINVAL), and only an
+ * in-range family reaches its own `create` hook. */
+static void creation_order(void) {
+    int fd;
+    errno = 0;
+    mark("FLAG_MASK_EINVAL", socket(AF_INET, SOCK_STREAM | 0x40, 0) == -1 && errno == EINVAL);
+    errno = 0;
+    mark("TYPE_AT_SOCK_MAX_EINVAL", socket(AF_INET, 11, 0) == -1 && errno == EINVAL);
+    errno = 0;
+    mark("TYPE_MASK_MAX_EINVAL", socket(AF_INET, 0xf, 0) == -1 && errno == EINVAL);
+    /* Both arguments are out of range: the family range wins. */
+    errno = 0;
+    mark("FAMILY_BEFORE_TYPE", socket(AF_MAX, 11, 0) == -1 && errno == EAFNOSUPPORT);
+    errno = 0;
+    mark("FAMILY_RANGE_EAFNOSUPPORT", socket(AF_MAX, SOCK_STREAM, 0) == -1 && errno == EAFNOSUPPORT);
+    /* Zero and SOCK_RDM are legal *types*; `inet_create` is what refuses them,
+     * through the empty `inetsw[type]` list. */
+    errno = 0;
+    mark("INET_TYPE_ZERO_ESOCKTNOSUPPORT", socket(AF_INET, 0, 0) == -1 && errno == ESOCKTNOSUPPORT);
+    errno = 0;
+    mark("INET_RDM_ESOCKTNOSUPPORT", socket(AF_INET, SOCK_RDM, 0) == -1 && errno == ESOCKTNOSUPPORT);
+    /* `if (protocol < 0 || protocol >= IPPROTO_MAX) return -EINVAL;` runs
+     * before the protocol table is consulted, and the uapi enum makes
+     * IPPROTO_MAX 263 (`IPPROTO_SMC = 256`, `IPPROTO_MPTCP = 262`), so 262 is
+     * a lookup and 263 is the first rejected value. */
+    errno = 0;
+    mark("INET_PROTOCOL_MISS_EPROTONOSUPPORT",
+         socket(AF_INET, SOCK_STREAM, IPPROTO_UDP) == -1 && errno == EPROTONOSUPPORT);
+    errno = 0;
+    mark("INET_PROTOCOL_BELOW_MAX_EPROTONOSUPPORT",
+         socket(AF_INET, SOCK_STREAM, 250) == -1 && errno == EPROTONOSUPPORT);
+    errno = 0;
+    mark("INET_PROTOCOL_RANGE_EINVAL", socket(AF_INET, SOCK_STREAM, 263) == -1 && errno == EINVAL);
+    errno = 0;
+    mark("INET_PROTOCOL_FAR_RANGE_EINVAL", socket(AF_INET, SOCK_STREAM, 65536) == -1 && errno == EINVAL);
+    /* The range test precedes the SOCK_RAW capability gate, so it is EINVAL
+     * for every caller. */
+    errno = 0;
+    mark("INET_RAW_PROTOCOL_RANGE_EINVAL", socket(AF_INET, SOCK_RAW, 263) == -1 && errno == EINVAL);
+    int net_raw = effective_capability(CAP_NET_RAW);
+    errno = 0;
+    int raw = socket(AF_INET, SOCK_RAW, 250);
+    mark("INET_RAW_POLICY", net_raw ? raw >= 0 : (raw == -1 && errno == EPERM));
+    if (raw >= 0) close(raw);
+    fd = socket(AF_INET6, 0, 0);
+    check("INET6_TYPE_ZERO_ESOCKTNOSUPPORT", fd == -1 && errno == ESOCKTNOSUPPORT);
+    fd = socket(AF_INET6, SOCK_DGRAM, 263);
+    check("INET6_PROTOCOL_RANGE_EINVAL", fd == -1 && errno == EINVAL);
+}
+
+/* `unix_create` checks the protocol before its type switch and rewrites the
+ * BSD compatibility spelling SOCK_RAW to SOCK_DGRAM, which SO_TYPE then
+ * reports because `sock_init_data` copies `sock->type` into `sk_type`. */
+static void unix_creation(void) {
+    int value = 0;
+    socklen_t length = sizeof(value);
+    int fd = socket(AF_UNIX, SOCK_RAW, 0);
+    check("UNIX_RAW_CREATES", fd >= 0);
+    check("UNIX_RAW_IS_DGRAM",
+          getsockopt(fd, SOL_SOCKET, SO_TYPE, &value, &length) == 0 && value == SOCK_DGRAM);
+    close(fd);
+    errno = 0;
+    mark("UNIX_PROTOCOL_EPROTONOSUPPORT", socket(AF_UNIX, SOCK_STREAM, IPPROTO_TCP) == -1
+         && errno == EPROTONOSUPPORT);
+    errno = 0;
+    mark("UNIX_TYPE_RDM_ESOCKTNOSUPPORT", socket(AF_UNIX, SOCK_RDM, 0) == -1
+         && errno == ESOCKTNOSUPPORT);
+    /* `protocol` is either zero or the AF_UNIX family number itself. */
+    fd = socket(AF_UNIX, SOCK_STREAM, AF_UNIX);
+    check("UNIX_PROTOCOL_SELF_ADMITTED", fd >= 0);
+    close(fd);
+}
+
+/* `netlink_create` tests the type first (`sock->type != SOCK_RAW &&
+ * sock->type != SOCK_DGRAM` is ESOCKTNOSUPPORT) and only then the protocol
+ * range and registration (EPROTONOSUPPORT).  NETLINK_USERSOCK is registered by
+ * `netlink_add_usersock_entry` with NL_CFG_F_NONROOT_SEND. */
+static void netlink_creation(void) {
+    int value = 0;
+    socklen_t length = sizeof(value);
+    int fd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
+    check("USERSOCK_CREATES", fd >= 0);
+    check("USERSOCK_TYPE",
+          getsockopt(fd, SOL_SOCKET, SO_TYPE, &value, &length) == 0 && value == SOCK_DGRAM);
+    value = -1; length = sizeof(value);
+    check("USERSOCK_PROTOCOL",
+          getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &value, &length) == 0
+          && value == NETLINK_USERSOCK);
+    value = -1; length = sizeof(value);
+    check("USERSOCK_DOMAIN",
+          getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &value, &length) == 0 && value == AF_NETLINK);
+    close(fd);
+    errno = 0;
+    mark("NETLINK_TYPE_ESOCKTNOSUPPORT",
+         socket(AF_NETLINK, SOCK_SEQPACKET, NETLINK_ROUTE) == -1 && errno == ESOCKTNOSUPPORT);
+    /* The type is checked first, so a bad type outranks a bad protocol. */
+    errno = 0;
+    mark("NETLINK_TYPE_BEFORE_PROTOCOL",
+         socket(AF_NETLINK, SOCK_SEQPACKET, 32) == -1 && errno == ESOCKTNOSUPPORT);
+    /* MAX_LINKS is 32, and the range test needs no registration lookup.  An
+     * in-range protocol that this kernel has not registered is deliberately
+     * not asserted: Linux tries `request_module` first, so a modular protocol
+     * legitimately succeeds there. */
+    errno = 0;
+    mark("NETLINK_PROTOCOL_RANGE_EPROTONOSUPPORT",
+         socket(AF_NETLINK, SOCK_RAW, 32) == -1 && errno == EPROTONOSUPPORT);
+}
+
+/* `bind` reaches the socket only after `move_addr_to_kernel` bounded the copy
+ * by `sizeof(struct sockaddr_storage)`, and each family owns the rest:
+ * `inet_bind` needs 16 bytes, IPv6 needs SIN6_LEN_RFC2133 (24) rather than a
+ * whole sockaddr_in6 (28), and `netlink_bind` needs 12 bytes and answers a
+ * family mismatch with EINVAL. */
+static void address_lengths(void) {
+    unsigned char storage[129] = {0};
+    struct sockaddr_in *v4 = (void *)storage;
+    struct sockaddr_in6 *v6 = (void *)storage;
+    struct sockaddr_nl *nl = (void *)storage;
+    int fd;
+
+    v4->sin_family = AF_INET;
+    v4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    check("IPV4_SOCKET", fd >= 0);
+    errno = 0;
+    mark("IPV4_BIND_OVERLONG_EINVAL", syscall(SYS_bind, fd, storage, 129) == -1 && errno == EINVAL);
+    errno = 0;
+    mark("IPV4_BIND_SHORT_EINVAL", syscall(SYS_bind, fd, storage, 12) == -1 && errno == EINVAL);
+    mark("IPV4_BIND_STORAGE_BOUNDARY", syscall(SYS_bind, fd, storage, 128) == 0);
+    close(fd);
+
+    memset(storage, 0, sizeof(storage));
+    v6->sin6_family = AF_INET6;
+    v6->sin6_addr = in6addr_loopback;
+    fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    check("IPV6_SOCKET", fd >= 0);
+    /* 24 is SIN6_LEN_RFC2133: accepted even though struct sockaddr_in6 is 28. */
+    mark("IPV6_BIND_RFC2133", syscall(SYS_bind, fd, storage, 24) == 0);
+    close(fd);
+    fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    check("IPV6_SOCKET_AGAIN", fd >= 0);
+    errno = 0;
+    mark("IPV6_BIND_SHORT_EINVAL", syscall(SYS_bind, fd, storage, 23) == -1 && errno == EINVAL);
+    errno = 0;
+    mark("IPV6_BIND_OVERLONG_EINVAL", syscall(SYS_bind, fd, storage, 129) == -1 && errno == EINVAL);
+    close(fd);
+
+    memset(storage, 0, sizeof(storage));
+    nl->nl_family = AF_NETLINK;
+    fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("NETLINK_SOCKET", fd >= 0);
+    errno = 0;
+    mark("NETLINK_BIND_SHORT_EINVAL", bind(fd, (struct sockaddr *)nl, 11) == -1 && errno == EINVAL);
+    mark("NETLINK_BIND_EXACT", bind(fd, (struct sockaddr *)nl, 12) == 0);
+    close(fd);
+    /* A longer address is a legal prefix, not an error. */
+    fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("NETLINK_SOCKET_LONGER", fd >= 0);
+    mark("NETLINK_BIND_LONGER", bind(fd, (struct sockaddr *)nl, 24) == 0);
+    close(fd);
+    fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("NETLINK_SOCKET_AGAIN", fd >= 0);
+    nl->nl_family = AF_INET;
+    errno = 0;
+    mark("NETLINK_BIND_FAMILY_EINVAL", bind(fd, (struct sockaddr *)nl, 12) == -1 && errno == EINVAL);
+    close(fd);
+
+    /* `unix_bind` treats a two-byte AF_UNIX address as an autobind request,
+     * while `unix_validate_addr` rejects it on every other path. */
+    memset(storage, 0, sizeof(storage));
+    struct sockaddr_un *un = (void *)storage;
+    un->sun_family = AF_UNIX;
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    check("UNIX_SOCKET", fd >= 0);
+    mark("UNIX_BIND_TWO_BYTE_AUTOBINDS", bind(fd, (struct sockaddr *)un, 2) == 0);
+    errno = 0;
+    mark("UNIX_CONNECT_TWO_BYTE_EINVAL",
+         connect(fd, (struct sockaddr *)un, 2) == -1 && errno == EINVAL);
+    close(fd);
+}
+
+/* `netlink_allowed` reads the connecting protocol's own registration flags:
+ * rtnetlink registers NL_CFG_F_NONROOT_RECV, so an unprivileged peer needs
+ * CAP_NET_ADMIN while an unprivileged group bind does not; usersock registers
+ * NL_CFG_F_NONROOT_SEND, which is exactly the reverse. */
+static void netlink_policy(void) {
+    int net_admin = effective_capability(CAP_NET_ADMIN);
+    struct sockaddr_nl peer = {.nl_family = AF_NETLINK, .nl_pid = 12345};
+    struct sockaddr_nl groups = {.nl_family = AF_NETLINK, .nl_groups = 1};
+    int fd, result;
+
+    fd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
+    check("USERSOCK_SOCKET", fd >= 0);
+    errno = 0;
+    result = connect(fd, (struct sockaddr *)&peer, sizeof(peer));
+    mark("USERSOCK_PEER_ALLOWED", result == 0);
+    close(fd);
+
+    fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("ROUTE_SOCKET", fd >= 0);
+    errno = 0;
+    result = connect(fd, (struct sockaddr *)&peer, sizeof(peer));
+    mark("ROUTE_PEER_POLICY", net_admin ? result == 0 : (result == -1 && errno == EPERM));
+    close(fd);
+
+    fd = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK);
+    check("USERSOCK_GROUP_SOCKET", fd >= 0);
+    errno = 0;
+    result = bind(fd, (struct sockaddr *)&groups, sizeof(groups));
+    mark("USERSOCK_GROUP_POLICY", net_admin ? result == 0 : (result == -1 && errno == EPERM));
+    close(fd);
+
+    fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("ROUTE_GROUP_SOCKET", fd >= 0);
+    errno = 0;
+    mark("ROUTE_GROUP_ALLOWED", bind(fd, (struct sockaddr *)&groups, sizeof(groups)) == 0);
+    close(fd);
+}
+
+/* `sk_getsockopt` reports the `struct sock` state `sock_init_data_uid` seeds,
+ * and `sk_setsockopt` stores what those getters return.  Only relations that
+ * hold on every configuration are asserted: the buffer values themselves come
+ * from sysctl_, and the minima from CONFIG_ tunables. */
+static void sol_socket_table(void) {
+    int value = 0, expected = 0;
+    socklen_t length = sizeof(value);
+    struct linger linger = {0};
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("ROUTE_SOCKET", fd >= 0);
+
+    value = -1; length = sizeof(value);
+    check("TYPE", getsockopt(fd, SOL_SOCKET, SO_TYPE, &value, &length) == 0 && value == SOCK_RAW);
+    value = -1; length = sizeof(value);
+    check("DOMAIN", getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &value, &length) == 0 && value == AF_NETLINK);
+    value = -1; length = sizeof(value);
+    check("PROTOCOL", getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &value, &length) == 0 && value == NETLINK_ROUTE);
+    value = -1; length = sizeof(value);
+    check("ERROR_CLEAR", getsockopt(fd, SOL_SOCKET, SO_ERROR, &value, &length) == 0 && value == 0);
+    value = -1; length = sizeof(value);
+    check("ACCEPTCONN", getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &value, &length) == 0 && value == 0);
+    value = -1; length = sizeof(value);
+    check("SNDLOWAT_IS_ONE", getsockopt(fd, SOL_SOCKET, SO_SNDLOWAT, &value, &length) == 0 && value == 1);
+    value = -1; length = sizeof(value);
+    check("RCVLOWAT_STARTS_AT_ONE", getsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &value, &length) == 0 && value == 1);
+    length = sizeof(linger);
+    check("LINGER_FRESH", getsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, &length) == 0
+          && length == sizeof(linger) && linger.l_onoff == 0 && linger.l_linger == 0);
+    value = -1; length = sizeof(value);
+    check("BUFFERS_POSITIVE", getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &value, &length) == 0 && value > 0
+          && getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, &length) == 0 && value > 0);
+
+    /* `sk->sk_rcvbuf = max_t(int, val * 2, SOCK_MIN_RCVBUF)` and the same
+     * doubling for sk_sndbuf, which is what the getter reports back. */
+    value = 4096;
+    check("SET_RCVBUF_DOUBLES", setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, sizeof(value)) == 0);
+    expected = 0; length = sizeof(expected);
+    check("RCVBUF_DOUBLED", getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &expected, &length) == 0
+          && expected == 8192);
+    value = 4096;
+    check("SET_SNDBUF_DOUBLES", setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &value, sizeof(value)) == 0);
+    expected = 0; length = sizeof(expected);
+    check("SNDBUF_DOUBLED", getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &expected, &length) == 0
+          && expected == 8192);
+
+    /* Boolean SOL_SOCKET names round-trip through their own getters. */
+    for (int option = 0; option < 5; ++option) {
+        static const int names[] = {SO_REUSEADDR, SO_DONTROUTE, SO_BROADCAST, SO_KEEPALIVE, SO_OOBINLINE};
+        value = 1;
+        check("BOOL_SET", setsockopt(fd, SOL_SOCKET, names[option], &value, sizeof(value)) == 0);
+        expected = 0; length = sizeof(expected);
+        check("BOOL_ROUND_TRIP", getsockopt(fd, SOL_SOCKET, names[option], &expected, &length) == 0
+              && expected == 1);
+        value = 0;
+        check("BOOL_CLEAR", setsockopt(fd, SOL_SOCKET, names[option], &value, sizeof(value)) == 0);
+        expected = -1; length = sizeof(expected);
+        check("BOOL_CLEARED", getsockopt(fd, SOL_SOCKET, names[option], &expected, &length) == 0
+              && expected == 0);
+    }
+
+    /* SO_LINGER stores both fields, but clearing l_onoff only resets the
+     * SOCK_LINGER flag: `sk_lingertime` keeps the seconds of the last enabled
+     * request and the getter reports them regardless of the flag. */
+    linger.l_onoff = 1; linger.l_linger = 2;
+    check("LINGER_SET", setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger)) == 0);
+    memset(&linger, 0, sizeof(linger)); length = sizeof(linger);
+    check("LINGER_ROUND_TRIP", getsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, &length) == 0
+          && linger.l_onoff == 1 && linger.l_linger == 2);
+    linger.l_onoff = 0; linger.l_linger = 9;
+    check("LINGER_CLEAR", setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger)) == 0);
+    memset(&linger, 0xff, sizeof(linger)); length = sizeof(linger);
+    check("LINGER_DISABLED_KEEPS_SECONDS", getsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, &length) == 0
+          && linger.l_onoff == 0 && linger.l_linger == 2);
+    linger.l_onoff = 1; linger.l_linger = 0;
+    check("LINGER_ENABLED_ZERO_SECONDS", setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger)) == 0);
+    memset(&linger, 0xff, sizeof(linger)); length = sizeof(linger);
+    check("LINGER_ZERO_ROUND_TRIP", getsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, &length) == 0
+          && linger.l_onoff == 1 && linger.l_linger == 0);
+
+    /* `sk_getsockopt` clamps its copy to `min(user_len, lv)` and reports that
+     * same clamped length, so a short buffer truncates instead of failing:
+     * `SO_TYPE` has `lv == sizeof(int)` and still answers a two-byte request
+     * with two. */
+    value = -1; length = 2;
+    memset(&value, 0, sizeof(value));
+    mark("GET_SHORT_REPORTS_COPY", getsockopt(fd, SOL_SOCKET, SO_TYPE, &value, &length) == 0
+         && length == 2 && (value & 0xff) == SOCK_RAW);
+    /* `lv` is a ceiling as well: a larger buffer is clamped down to it. */
+    linger.l_onoff = 1; linger.l_linger = 5;
+    check("LINGER_SET_FOR_CLAMP", setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger)) == 0);
+    value = -1; length = sizeof(value);
+    mark("GET_LINGER_CLAMPED", getsockopt(fd, SOL_SOCKET, SO_LINGER, &value, &length) == 0
+         && length == sizeof(value) && value == 1);
+    value = -1; length = sizeof(linger);
+    check("GET_LINGER_FULL", getsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, &length) == 0
+          && length == sizeof(linger) && linger.l_onoff == 1 && linger.l_linger == 5);
+    /* A zero-length buffer copies nothing and reports nothing. */
+    value = -1; length = 0;
+    mark("GET_ZERO_LENGTH", getsockopt(fd, SOL_SOCKET, SO_TYPE, &value, &length) == 0
+         && length == 0 && value == -1);
+
+    /* SO_PRIORITY is stored verbatim once the capability gate admits it. */
+    value = 6;
+    check("PRIORITY_SET", setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &value, sizeof(value)) == 0);
+    expected = -1; length = sizeof(expected);
+    check("PRIORITY_ROUND_TRIP", getsockopt(fd, SOL_SOCKET, SO_PRIORITY, &expected, &length) == 0
+          && expected == 6);
+
+    /* SO_PASSCRED is a real per-description flag for AF_NETLINK because
+     * `sk_may_scm_recv` admits it. */
+    value = 1;
+    check("PASSCRED_SET", setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &value, sizeof(value)) == 0);
+    expected = 0; length = sizeof(expected);
+    check("PASSCRED_ROUND_TRIP", getsockopt(fd, SOL_SOCKET, SO_PASSCRED, &expected, &length) == 0
+          && expected == 1);
+
+    /* Read-only names and unsettable ones answer ENOPROTOOPT. */
+    value = 1;
+    errno = 0;
+    mark("SET_TYPE_ENOPROTOOPT", setsockopt(fd, SOL_SOCKET, SO_TYPE, &value, sizeof(value)) == -1
+         && errno == ENOPROTOOPT);
+    errno = 0;
+    mark("SET_SNDLOWAT_ENOPROTOOPT", setsockopt(fd, SOL_SOCKET, SO_SNDLOWAT, &value, sizeof(value)) == -1
+         && errno == ENOPROTOOPT);
+    errno = 0;
+    mark("SET_PROTOCOL_ENOPROTOOPT", setsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &value, sizeof(value)) == -1
+         && errno == ENOPROTOOPT);
+    /* Every remaining SOL_SOCKET name needs a whole int, and SO_LINGER needs a
+     * whole struct linger. */
+    errno = 0;
+    mark("SET_SHORT_OPTLEN_EINVAL",
+         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, 2) == -1 && errno == EINVAL);
+    errno = 0;
+    mark("SET_LINGER_SHORT_EINVAL",
+         setsockopt(fd, SOL_SOCKET, SO_LINGER, &value, sizeof(value)) == -1 && errno == EINVAL);
+    /* A level that is neither SOL_SOCKET nor SOL_NETLINK is ENOPROTOOPT on
+     * both the set and the get path. */
+    errno = 0;
+    mark("SET_BAD_LEVEL_ENOPROTOOPT",
+         setsockopt(fd, SOL_IP, SO_REUSEADDR, &value, sizeof(value)) == -1 && errno == ENOPROTOOPT);
+    errno = 0;
+    mark("GET_BAD_LEVEL_ENOPROTOOPT",
+         getsockopt(fd, SOL_IP, SO_REUSEADDR, &value, &length) == -1 && errno == ENOPROTOOPT);
+    close(fd);
+}
+
+/* `netlink_setsockopt`/`netlink_getsockopt` own SOL_NETLINK.  The boolean
+ * flags are `assign_bit`/`test_bit` pairs, a request shorter than an int
+ * clears the flag instead of failing, and NETLINK_LIST_MEMBERSHIPS reports the
+ * bitmap bounds `netlink_realloc_groups` installed, which only a group
+ * transition ever does. */
+static void netlink_option_table(void) {
+    int value = 0;
+    socklen_t length = sizeof(value);
+    unsigned int words[2] = {0, 0};
+    struct sockaddr_nl address = {.nl_family = AF_NETLINK, .nl_pid = 0, .nl_groups = 0};
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("ROUTE_SOCKET", fd >= 0);
+
+    /* Before any group transition `nlk->groups` is NULL and `nlk->ngroups` is
+     * zero, so the getter copies nothing and reports a zero length. */
+    length = sizeof(words);
+    check("MEMBERSHIPS_UNSIZED", getsockopt(fd, SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, words, &length) == 0
+          && length == 0);
+
+    /* NETLINK_ROUTE registers RTNLGRP_MAX (39) groups, so the bitmap becomes
+     * two four-byte chunks. */
+    address.nl_groups = 1;
+    check("BIND_GROUP", bind(fd, (struct sockaddr *)&address, sizeof(address)) == 0);
+    memset(words, 0, sizeof(words));
+    length = sizeof(words);
+    check("MEMBERSHIPS_SIZED", getsockopt(fd, SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, words, &length) == 0
+          && length == 8 && words[0] == 1 && words[1] == 0);
+    /* A buffer that cannot hold a whole chunk copies none of it but still
+     * reports the bitmap size. */
+    memset(words, 0, sizeof(words));
+    length = sizeof(words[0]);
+    check("MEMBERSHIPS_TRUNCATED", getsockopt(fd, SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, words, &length) == 0
+          && length == 8 && words[0] == 1);
+
+    /* Membership transitions are bounded by the protocol's own group count. */
+    value = 40;
+    errno = 0;
+    mark("ADD_ABOVE_NGROUPS_EINVAL", setsockopt(fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &value, sizeof(value)) == -1
+         && errno == EINVAL);
+    value = 0;
+    errno = 0;
+    mark("ADD_ZERO_EINVAL", setsockopt(fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &value, sizeof(value)) == -1
+         && errno == EINVAL);
+    value = 39;
+    check("ADD_LAST_GROUP", setsockopt(fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &value, sizeof(value)) == 0);
+    memset(words, 0, sizeof(words));
+    length = sizeof(words);
+    check("MEMBERSHIPS_BOTH_WORDS", getsockopt(fd, SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, words, &length) == 0
+          && length == 8 && words[0] == 1 && words[1] == (1U << 6));
+    /* Dropping a held group is unchecked and always succeeds. */
+    check("DROP_LAST_GROUP", setsockopt(fd, SOL_NETLINK, NETLINK_DROP_MEMBERSHIP, &value, sizeof(value)) == 0);
+    memset(words, 0, sizeof(words));
+    length = sizeof(words);
+    check("MEMBERSHIPS_AFTER_DROP", getsockopt(fd, SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, words, &length) == 0
+          && length == 8 && words[0] == 1 && words[1] == 0);
+
+    /* The remaining SOL_NETLINK names are int-sized boolean flags. */
+    for (int option = 0; option < 5; ++option) {
+        static const int names[] = {NETLINK_PKTINFO, NETLINK_BROADCAST_ERROR, NETLINK_NO_ENOBUFS,
+                                    NETLINK_CAP_ACK, NETLINK_EXT_ACK};
+        value = 1;
+        check("FLAG_SET", setsockopt(fd, SOL_NETLINK, names[option], &value, sizeof(value)) == 0);
+        value = 0; length = sizeof(value);
+        check("FLAG_ROUND_TRIP", getsockopt(fd, SOL_NETLINK, names[option], &value, &length) == 0
+              && value == 1 && length == sizeof(value));
+        value = 0;
+        check("FLAG_CLEAR", setsockopt(fd, SOL_NETLINK, names[option], &value, sizeof(value)) == 0);
+        value = -1; length = sizeof(value);
+        check("FLAG_CLEARED", getsockopt(fd, SOL_NETLINK, names[option], &value, &length) == 0
+              && value == 0);
+    }
+    /* NETLINK_LISTEN_ALL_NSID is the one boolean flag whose setter checks a
+     * capability, and only the setter checks it. */
+    int net_broadcast = effective_capability(CAP_NET_BROADCAST);
+    value = 1;
+    errno = 0;
+    int enabled = setsockopt(fd, SOL_NETLINK, NETLINK_LISTEN_ALL_NSID, &value, sizeof(value));
+    mark("LISTEN_ALL_NSID_POLICY", net_broadcast ? enabled == 0 : (enabled == -1 && errno == EPERM));
+    value = -1; length = sizeof(value);
+    check("LISTEN_ALL_NSID_GET", getsockopt(fd, SOL_NETLINK, NETLINK_LISTEN_ALL_NSID, &value, &length) == 0
+          && value == (net_broadcast ? 1 : 0));
+
+    /* A request shorter than an int is a legal clear, not EINVAL. */
+    value = 1;
+    check("FLAG_SET_AGAIN", setsockopt(fd, SOL_NETLINK, NETLINK_PKTINFO, &value, sizeof(value)) == 0);
+    check("FLAG_CLEAR_SHORT", setsockopt(fd, SOL_NETLINK, NETLINK_PKTINFO, &value, 1) == 0);
+    value = -1; length = sizeof(value);
+    check("FLAG_SHORT_CLEARED", getsockopt(fd, SOL_NETLINK, NETLINK_PKTINFO, &value, &length) == 0
+          && value == 0);
+    /* An unknown SOL_NETLINK name is ENOPROTOOPT on both paths. */
+    errno = 0;
+    mark("SET_UNKNOWN_ENOPROTOOPT", setsockopt(fd, SOL_NETLINK, 13, &value, sizeof(value)) == -1
+         && errno == ENOPROTOOPT);
+    errno = 0;
+    mark("GET_UNKNOWN_ENOPROTOOPT", getsockopt(fd, SOL_NETLINK, 13, &value, &length) == -1
+         && errno == ENOPROTOOPT);
+    close(fd);
+}
+
+/* A provider without accept/listen/shutdown installs the `sock_no_*` stubs,
+ * which answer EOPNOTSUPP rather than the ENOTSOCK a non-socket descriptor
+ * reports.  `shutdown` reaches that stub before it validates the direction. */
+static void null_operations(void) {
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    check("NETLINK_SOCKET", fd >= 0);
+    errno = 0;
+    mark("NETLINK_LISTEN_EOPNOTSUPP", listen(fd, 1) == -1 && errno == EOPNOTSUPP);
+    errno = 0;
+    mark("NETLINK_ACCEPT_EOPNOTSUPP", accept(fd, NULL, NULL) == -1 && errno == EOPNOTSUPP);
+    errno = 0;
+    mark("NETLINK_ACCEPT4_EOPNOTSUPP", accept4(fd, NULL, NULL, SOCK_CLOEXEC) == -1 && errno == EOPNOTSUPP);
+    errno = 0;
+    mark("NETLINK_SHUTDOWN_EOPNOTSUPP", shutdown(fd, SHUT_RDWR) == -1 && errno == EOPNOTSUPP);
+    errno = 0;
+    mark("NETLINK_SHUTDOWN_INVALID_HOW_EOPNOTSUPP", shutdown(fd, 7) == -1 && errno == EOPNOTSUPP);
+    close(fd);
+
+    int pair[2];
+    errno = 0;
+    mark("NETLINK_SOCKETPAIR_EOPNOTSUPP", socketpair(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE, pair) == -1
+         && errno == EOPNOTSUPP);
+    errno = 0;
+    mark("INET_SOCKETPAIR_EOPNOTSUPP", socketpair(AF_INET, SOCK_STREAM, 0, pair) == -1
+         && errno == EOPNOTSUPP);
+    errno = 0;
+    mark("INET_SOCKETPAIR_PROTOCOL_EPROTONOSUPPORT", socketpair(AF_INET, SOCK_STREAM, IPPROTO_UDP, pair) == -1
+         && errno == EPROTONOSUPPORT);
+    errno = 0;
+    mark("INET_SOCKETPAIR_TYPE_ESOCKTNOSUPPORT", socketpair(AF_INET, SOCK_RDM, 0, pair) == -1
+         && errno == ESOCKTNOSUPPORT);
+    errno = 0;
+    mark("SOCKETPAIR_FLAG_MASK_EINVAL", socketpair(AF_UNIX, SOCK_STREAM | 0x40, 0, pair) == -1
+         && errno == EINVAL);
+}
+
+int main(void) {
+    alarm(30);
+    begin("socket_creation_order.portable-differential");
+    creation_order();
+    done();
+
+    begin("socket_unix_creation.portable-differential");
+    unix_creation();
+    done();
+
+    begin("socket_netlink_creation.portable-differential");
+    netlink_creation();
+    done();
+
+    begin("socket_netlink_policy.portable-differential");
+    netlink_policy();
+    done();
+
+    begin("socket_address_lengths.portable-differential");
+    address_lengths();
+    done();
+
+    begin("socket_sol_socket_table.portable-differential");
+    sol_socket_table();
+    done();
+
+    begin("socket_netlink_option_table.portable-differential");
+    netlink_option_table();
+    done();
+
+    begin("socket_null_operations.portable-differential");
+    null_operations();
+    done();
+
+    puts("THEKERNEL_SOCKET_PROVIDER_PASS");
+    return 0;
+}

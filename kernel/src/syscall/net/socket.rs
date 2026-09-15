@@ -296,21 +296,37 @@ fn check_landlock_tcp_port(socket: &SocketInner, addr: &SocketAddrEx, access: u6
     Ok(())
 }
 
-fn validate_socket_type(ty: u32) -> AxResult<u32> {
-    match ty {
-        SOCK_STREAM | SOCK_DGRAM | SOCK_SEQPACKET | SOCK_RAW | SOCK_DCCP => Ok(ty),
-        _ => Err(AxError::InvalidInput),
-    }
-}
-
+/// `__sys_socket_create`'s flag test followed by `type &= SOCK_TYPE_MASK`.
+///
+/// Linux deliberately keeps this separate from the type *range* test: the flag
+/// test is the very first thing `socket(2)` does, while the range test lives in
+/// `__sock_create` after the family test, so `socket(9999, 11, 0)` reports
+/// `EAFNOSUPPORT` and not `EINVAL`.
 fn parse_socket_type(raw_ty: u32) -> AxResult<(u32, bool, bool)> {
     let flags = raw_ty & !SOCK_TYPE_MASK;
     if flags & !SOCK_CLOEXEC_NONBLOCK_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
 
-    let ty = validate_socket_type(raw_ty & SOCK_TYPE_MASK)?;
-    Ok((ty, flags & O_NONBLOCK != 0, flags & O_CLOEXEC != 0))
+    Ok((
+        raw_ty & SOCK_TYPE_MASK,
+        flags & O_NONBLOCK != 0,
+        flags & O_CLOEXEC != 0,
+    ))
+}
+
+/// `__sock_create`'s own range test.  It runs after the family range test and
+/// before the obsolete `(PF_INET, SOCK_PACKET)` rewrite, and it admits every
+/// masked value below `SOCK_MAX` — including zero, `tk_linux_net::SOCK_RDM` and
+/// `SOCK_PACKET`.  Whether an in-range type is usable is the selected family's
+/// `create` decision, which reports `ESOCKTNOSUPPORT` for the types it has no
+/// protocol table entry for.
+fn validate_socket_type_range(ty: u32) -> AxResult<u32> {
+    if tk_linux_net::socket_type_in_range(ty) {
+        Ok(ty)
+    } else {
+        Err(AxError::InvalidInput)
+    }
 }
 
 fn parse_accept4_flags(flags: u32) -> AxResult<(bool, bool)> {
@@ -350,6 +366,8 @@ pub(crate) fn accept_pinned(
 }
 
 fn validate_pre_create_domain(domain: u32) -> AxResult<()> {
+    // `NPROTO` is `AF_MAX`; `__sock_create` tests the family range before the
+    // type range, so an out-of-range family outranks an out-of-range type.
     if domain >= AF_MAX {
         Err(LinuxError::EAFNOSUPPORT.into())
     } else {
@@ -440,6 +458,10 @@ fn packet_socketpair_after_parse(
     Err(LinuxError::EOPNOTSUPP.into())
 }
 
+/// `IPPROTO_MPTCP`, the last protocol below `IPPROTO_MAX`.
+#[cfg(test)]
+const IPPROTO_MPTCP_BOUNDARY: u32 = 262;
+
 fn supported_stream_protocol(proto: u32) -> bool {
     proto == 0 || proto == IPPROTO_TCP as u32
 }
@@ -448,32 +470,71 @@ fn supported_datagram_protocol(proto: u32) -> bool {
     proto == 0 || proto == IPPROTO_UDP as u32
 }
 
-fn inet_socketpair_error(ty: u32, proto: u32) -> AxError {
-    match ty {
-        SOCK_RAW => AxError::from(LinuxError::EPROTONOSUPPORT),
-        SOCK_DGRAM => {
-            if supported_datagram_protocol(proto) {
-                AxError::from(LinuxError::EOPNOTSUPP)
-            } else {
-                AxError::from(LinuxError::EPROTONOSUPPORT)
+/// `IPPROTO_MAX` (`include/uapi/linux/in.h`): the exclusive upper bound
+/// `inet_create`/`inet6_create` place on the protocol argument.  The enum ends
+/// with `IPPROTO_SMC = 256` and `IPPROTO_MPTCP = 262`, so the bound is 263 and
+/// not 256 — `socket(AF_INET, SOCK_STREAM, 256)` is a *table lookup* that
+/// reports `EPROTONOSUPPORT`, not the `EINVAL` of an out-of-range protocol.
+const IPPROTO_MAX: u32 = 263;
+
+/// The full admission decision `inet_create`/`inet6_create` reach for one
+/// already range-checked request.
+///
+/// Linux applies them in this order, and `inet_create` reaches the capability
+/// gate only after the protocol tables have answered:
+///
+/// 1. `if (protocol < 0 || protocol >= IPPROTO_MAX) return -EINVAL;`
+/// 2. `list_empty(&inetsw[type])` is what leaves `err = -ESOCKTNOSUPPORT`;
+/// 3. the wildcard lookup over `inetsw[type]` — a zero protocol selects the
+///    list head's own protocol, and the `SOCK_RAW` list head is the
+///    `IPPROTO_IP` wildcard entry, so every protocol below `IPPROTO_MAX`
+///    matches it;
+/// 4. `if (sock->type == SOCK_RAW && !kern && !ns_capable(net->user_ns,
+///    CAP_NET_RAW)) return -EPERM;`.
+///
+/// TheKernel implements one transport per type, so a request that Linux would
+/// satisfy from a table entry TheKernel has no provider for (ICMP or UDPLITE
+/// datagrams, for example) still reports `EPROTONOSUPPORT` here.
+fn validate_inet_create(capability_granted: bool, ty: u32, proto: u32) -> AxResult<()> {
+    if proto >= IPPROTO_MAX {
+        return Err(AxError::InvalidInput);
+    }
+    let admitted = match ty {
+        SOCK_STREAM => supported_stream_protocol(proto),
+        SOCK_DGRAM => supported_datagram_protocol(proto),
+        SOCK_DCCP => proto == 0 || proto == IPPROTO_DCCP as u32,
+        SOCK_SEQPACKET => proto == 0 || proto == IPPROTO_SCTP as u32,
+        SOCK_RAW => {
+            // The wildcard `inetsw[SOCK_RAW]` entry admits every in-range
+            // protocol, so only the capability can refuse this type.
+            if !capability_granted {
+                return Err(LinuxError::EPERM.into());
             }
+            return Ok(());
         }
-        SOCK_DCCP => AxError::from(LinuxError::EPROTONOSUPPORT),
-        SOCK_STREAM => {
-            if supported_stream_protocol(proto) {
-                AxError::from(LinuxError::EOPNOTSUPP)
-            } else {
-                AxError::from(LinuxError::EPROTONOSUPPORT)
-            }
-        }
-        _ => AxError::InvalidInput,
+        // `inetsw[type]` has no entry at all for these, which is the one case
+        // `inet_create` reports as ESOCKTNOSUPPORT rather than EPROTONOSUPPORT.
+        _ => return Err(LinuxError::ESOCKTNOSUPPORT.into()),
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err(LinuxError::EPROTONOSUPPORT.into())
     }
 }
 
 pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
     debug!("sys_socket <= domain: {domain}, ty: {raw_ty}, proto: {proto}");
+    // `__sys_socket_create` strips the creation flags first, then `__sock_create`
+    // applies the family range test, the type range test and the obsolete
+    // `(PF_INET, SOCK_PACKET)` rewrite — in that order and all before the LSM
+    // hook.  Linux therefore reports EAFNOSUPPORT for a bad family even when the
+    // type is also out of range, and EINVAL for a bad type only once the family
+    // is known good.
     let (ty, nonblocking, cloexec) = parse_socket_type(raw_ty)?;
     validate_pre_create_domain(domain)?;
+    validate_socket_type_range(ty)?;
+    let domain = u32::from(tk_linux_net::socket_creation_family(domain as u16, ty));
     let snapshot = SocketSyscallSnapshot::capture();
     let spec = SocketCreateSpec::try_new(domain as i32, ty as i32, proto as i32, false)
         .ok_or(AxError::InvalidInput)?;
@@ -491,10 +552,12 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         if !ns_capable(actor, snapshot.net_namespace().owner_user_ns(), CAP_NET_RAW) {
             return Err(AxError::OperationNotPermitted);
         }
-        // AF_XDP is SOCK_RAW/protocol 0 only.  It is a dedicated FileLike
-        // backend because its ABI is setsockopt/bind/mmap rings, not axnet
-        // byte-stream socket operations.
-        if ty != SOCK_RAW || proto != 0 {
+        // `xsk_create` checks the capability before the type, so an
+        // unprivileged caller sees EPERM whatever the type was.
+        if ty != SOCK_RAW {
+            return Err(LinuxError::ESOCKTNOSUPPORT.into());
+        }
+        if proto != 0 {
             return Err(LinuxError::EPROTONOSUPPORT.into());
         }
         let socket = XdpSocket::try_new(snapshot.net_namespace().clone())?;
@@ -523,7 +586,7 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
                 return Err(LinuxError::EPERM.into());
             }
         }
-        let socket = NetlinkSocket::try_new(proto, net_ns)?;
+        let socket = NetlinkSocket::try_new(proto, ty, net_ns)?;
         let socket = prepare_new_socket_arc(socket, nonblocking)?;
         dispatch_socket_post_create(actor, &socket, spec)?;
         return publish_new_socket_like(socket, cloexec).map(|fd| fd as isize);
@@ -531,17 +594,31 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
 
     let net_stack = net_ns.stack().clone();
 
-    let socket = match (domain, ty) {
-        (AF_INET | AF_INET6, SOCK_STREAM) => {
-            if !supported_stream_protocol(proto) {
-                return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
-            }
-            SocketInner::Tcp(TcpSocket::new(net_stack.clone())?)
+    // `unix_create` rewrites its BSD-compatibility spelling to `SOCK_DGRAM`
+    // before it selects a transport, so the raw type never reaches the provider
+    // table.  The security hook above still saw the requested type, exactly as
+    // `security_socket_create` does.
+    let ty = if domain == AF_UNIX {
+        if !tk_linux_net::unix_protocol_admitted(proto) {
+            // `unix_create` checks the protocol before the type switch.
+            return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
         }
+        tk_linux_net::unix_creation_type(ty).ok_or(AxError::from(LinuxError::ESOCKTNOSUPPORT))?
+    } else {
+        ty
+    };
+
+    if matches!(domain, AF_INET | AF_INET6) {
+        validate_inet_create(
+            ns_capable(actor, net_ns.owner_user_ns(), CAP_NET_RAW),
+            ty,
+            proto,
+        )?;
+    }
+
+    let socket = match (domain, ty) {
+        (AF_INET | AF_INET6, SOCK_STREAM) => SocketInner::Tcp(TcpSocket::new(net_stack.clone())?),
         (AF_INET | AF_INET6, SOCK_DGRAM) => {
-            if !supported_datagram_protocol(proto) {
-                return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
-            }
             let family = if domain == AF_INET6 {
                 UdpSocketFamily::Ipv6
             } else {
@@ -550,9 +627,6 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
             SocketInner::Udp(UdpSocket::new_with_family(net_stack.clone(), family)?)
         }
         (AF_INET | AF_INET6, SOCK_DCCP) => {
-            if proto != 0 && proto != IPPROTO_DCCP {
-                return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
-            }
             let family = if domain == AF_INET6 {
                 RawSocketFamily::Ipv6
             } else {
@@ -564,9 +638,6 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
         // selects SCTP for this socket type just as it selects TCP/UDP for the
         // stream/datagram cases.
         (AF_INET | AF_INET6, SOCK_SEQPACKET) => {
-            if proto != 0 && proto != IPPROTO_SCTP {
-                return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
-            }
             let family = if domain == AF_INET6 {
                 RawSocketFamily::Ipv6
             } else {
@@ -575,12 +646,6 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
             SocketInner::Sctp(SctpSocket::new(net_stack.clone(), family)?)
         }
         (AF_INET | AF_INET6, SOCK_RAW) => {
-            if !ns_capable(actor, net_ns.owner_user_ns(), CAP_NET_RAW) {
-                return Err(AxError::from(LinuxError::EPERM));
-            }
-            if proto == 0 || proto > u8::MAX as u32 {
-                return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
-            }
             let family = if domain == AF_INET6 {
                 RawSocketFamily::Ipv6
             } else {
@@ -656,7 +721,11 @@ pub fn sys_bind(
             pinned.af_alg()?.bind(addr)?;
         }
         SocketBackendKind::Netlink => {
-            if addrlen as usize != size_of::<crate::file::netlink::SockaddrNl>() {
+            // `netlink_bind` requires `addr_len >= sizeof(struct sockaddr_nl)`.
+            // The upper bound comes from `move_addr_to_kernel`, which already
+            // refused anything above `sockaddr_storage`, so a longer address is
+            // a legal prefix rather than an error.
+            if (addrlen as usize) < size_of::<crate::file::netlink::SockaddrNl>() {
                 return Err(AxError::InvalidInput);
             }
             let addr = unsafe {
@@ -670,8 +739,10 @@ pub fn sys_bind(
                     .map_err(map_usercopy_error)?
                     .assume_init()
             };
+            // `if (nladdr->nl_family != AF_NETLINK) return -EINVAL;` — the
+            // netlink family check reports EINVAL, not EAFNOSUPPORT.
             if addr.nl_family as u32 != AF_NETLINK {
-                return Err(AxError::from(LinuxError::EAFNOSUPPORT));
+                return Err(AxError::InvalidInput);
             }
             let prepared = PreparedSocketAddress::Netlink(addr);
             dispatch_socket(&SocketSecurityContext::bind(
@@ -680,12 +751,15 @@ pub fn sys_bind(
                 &prepared,
                 addrlen as usize,
             ))?;
+            let authority = super::netlink_option_authority(&snapshot, pinned.netlink()?);
             if addr.nl_pid == 0 {
                 pinned
                     .netlink()?
-                    .bind_auto(snapshot.pid(), addr.nl_groups)?;
+                    .bind_auto(snapshot.pid(), addr.nl_groups, authority)?;
             } else {
-                pinned.netlink()?.bind(addr.nl_pid, addr.nl_groups)?;
+                pinned
+                    .netlink()?
+                    .bind(addr.nl_pid, addr.nl_groups, authority)?;
             }
         }
         SocketBackendKind::Packet => {
@@ -891,6 +965,19 @@ pub fn sys_connect(
     let PreparedSocketAddress::Network(addr) = prepared else {
         unreachable!();
     };
+    if matches!(socket.inner, SocketInner::Unix(_)) {
+        // `unix_dgram_connect` and `unix_stream_connect` both run
+        // `unix_validate_addr`, which rejects a name no longer than the
+        // two-byte family and any family other than AF_UNIX.  Unlike
+        // `unix_bind`, a two-byte AF_UNIX address is not an autobind request on
+        // the connect path.  Linux orders this after security_socket_connect,
+        // which has already run above.
+        if !matches!(addr, SocketAddrEx::Unix(_))
+            || (addrlen as usize) <= tk_linux_net::SOCKADDR_UN_PATH_OFFSET
+        {
+            return Err(AxError::InvalidInput);
+        }
+    }
     validate_network_address(&socket.inner, &addr)?;
     check_landlock_tcp_port(&socket.inner, &addr, LANDLOCK_ACCESS_NET_CONNECT_TCP)?;
     let result = match (&socket.inner, &addr) {
@@ -1052,7 +1139,15 @@ pub fn sys_listen(fd: i32, backlog: i32) -> AxResult<isize> {
         &socket_ref,
         prepared_backlog,
     ))?;
-    if pinned.backend()? == SocketBackendKind::Packet {
+    // AF_PACKET, AF_NETLINK, AF_ALG and AF_XDP all install a null listen
+    // operation, which Linux answers with EOPNOTSUPP after the security hook.
+    if matches!(
+        pinned.backend()?,
+        SocketBackendKind::Packet
+            | SocketBackendKind::Netlink
+            | SocketBackendKind::AfAlg
+            | SocketBackendKind::Xdp
+    ) {
         return Err(LinuxError::EOPNOTSUPP.into());
     }
     let socket = pinned.network()?;
@@ -1089,13 +1184,17 @@ pub fn sys_accept4(
     let pinned = PinnedSocketDescription::from_fd(fd)?;
     let actor = snapshot.actor();
     let listening_ref = pinned.security_ref()?;
-    if pinned.backend()? == SocketBackendKind::Packet {
-        // AF_PACKET installs `sock_no_accept`, but Linux invokes
-        // security_socket_accept() with an otherwise bare `newsock` first.
-        // Preserve that policy ordering without allocating/subscribing an
-        // endpoint which can never be published.
+    if matches!(
+        pinned.backend()?,
+        SocketBackendKind::Packet | SocketBackendKind::Netlink | SocketBackendKind::Xdp
+    ) {
+        // AF_PACKET, AF_NETLINK and AF_XDP install a null accept operation, but
+        // Linux invokes security_socket_accept() with an otherwise bare
+        // `newsock` first.  Preserve that policy ordering without
+        // allocating/subscribing an endpoint which can never be published.
+        // AF_ALG is absent here because `alg_proto_ops.accept` is real.
         let bare_ref = BareAcceptedSocketSecurityRef::new(
-            SocketBackendKind::Packet,
+            pinned.backend()?,
             listening_ref.net_namespace(),
         );
         let accepted_ref = AcceptedSocketSecurityRef::Bare(bare_ref);
@@ -1179,7 +1278,16 @@ pub(crate) fn shutdown_pinned_socket(
         &socket_ref,
         how as i32,
     ))?;
-    if pinned.backend()? == SocketBackendKind::Packet {
+    if matches!(
+        pinned.backend()?,
+        SocketBackendKind::Packet
+            | SocketBackendKind::Netlink
+            | SocketBackendKind::AfAlg
+            | SocketBackendKind::Xdp
+    ) {
+        // `sock_no_shutdown` returns EOPNOTSUPP without inspecting `how`, so an
+        // invalid direction on one of these providers is EOPNOTSUPP rather than
+        // the EINVAL an INET socket reports.
         return Err(LinuxError::EOPNOTSUPP.into());
     }
     let socket = pinned.network()?;
@@ -1200,13 +1308,21 @@ pub fn sys_socketpair(
     fds: UserPtr<[i32; 2]>,
 ) -> AxResult<isize> {
     debug!("sys_socketpair <= domain: {domain}, ty: {raw_ty}, proto: {proto}");
+    // `__sys_socketpair` repeats `__sys_socket_create`'s flag validation and
+    // then reaches `__sock_create` through `sock_create`, so the family range
+    // test, the type range test and the obsolete `(PF_INET, SOCK_PACKET)`
+    // rewrite all precede either family's `create` hook.
     let (ty, nonblocking, cloexec) = parse_socket_type(raw_ty)?;
+    validate_pre_create_domain(domain)?;
+    validate_socket_type_range(ty)?;
+    let domain = u32::from(tk_linux_net::socket_creation_family(domain as u16, ty));
+
+    let snapshot = SocketSyscallSnapshot::capture();
+    let spec = SocketCreateSpec::try_new(domain as i32, ty as i32, proto as i32, false)
+        .ok_or(AxError::InvalidInput)?;
+    let actor = snapshot.actor();
 
     if domain == AF_PACKET {
-        let snapshot = SocketSyscallSnapshot::capture();
-        let spec = SocketCreateSpec::try_new(domain as i32, ty as i32, proto as i32, false)
-            .ok_or(AxError::InvalidInput)?;
-        let actor = snapshot.actor();
         let net_ns = snapshot.net_namespace();
 
         // Linux's generic socketpair path also exposes pre-reserved descriptor
@@ -1216,18 +1332,62 @@ pub fn sys_socketpair(
         return packet_socketpair_after_parse(actor, net_ns, ty, proto, nonblocking, spec);
     }
 
+    // Every remaining family creates both endpoints through `__sock_create`
+    // before `__sys_socketpair` consults `ops->socketpair`, so the family's own
+    // creation errno always outranks the generic unsupported-operation answer
+    // that `sock_no_socketpair` supplies.
     if matches!(domain, AF_INET | AF_INET6) {
-        return Err(inet_socketpair_error(ty, proto));
+        validate_inet_create(
+            ns_capable(actor, snapshot.net_namespace().owner_user_ns(), CAP_NET_RAW),
+            ty,
+            proto,
+        )?;
+        // `inet_stream_ops`, `inet_dgram_ops`, `inet_dccp_ops` and
+        // `inet_sctp_ops` all route `.socketpair` to `sock_no_socketpair`.
+        return Err(AxError::from(LinuxError::EOPNOTSUPP));
+    }
+
+    if domain == af_xdp::AF_XDP {
+        if !ns_capable(actor, snapshot.net_namespace().owner_user_ns(), CAP_NET_RAW) {
+            return Err(AxError::OperationNotPermitted);
+        }
+        if ty != SOCK_RAW {
+            return Err(LinuxError::ESOCKTNOSUPPORT.into());
+        }
+        if proto != 0 {
+            return Err(LinuxError::EPROTONOSUPPORT.into());
+        }
+        return Err(AxError::from(LinuxError::EOPNOTSUPP));
+    }
+
+    if domain == af_alg::AF_ALG {
+        AfAlgSocket::validate_socket_type(ty, proto)?;
+        return Err(AxError::from(LinuxError::EOPNOTSUPP));
+    }
+
+    if domain == AF_NETLINK {
+        NetlinkSocket::validate_socket_type(ty, proto)?;
+        if proto == crate::file::netlink::NETLINK_AUDIT
+            && !NetlinkSocket::audit_socket_creation_authorized(actor)
+        {
+            return Err(AxError::from(LinuxError::EPERM));
+        }
+        return Err(AxError::from(LinuxError::EOPNOTSUPP));
     }
 
     if domain != AF_UNIX {
         return Err(AxError::from(LinuxError::EAFNOSUPPORT));
     }
 
-    let snapshot = SocketSyscallSnapshot::capture();
-    let spec = SocketCreateSpec::try_new(domain as i32, ty as i32, proto as i32, false)
-        .ok_or(AxError::InvalidInput)?;
-    let actor = snapshot.actor();
+    // `unix_create` checks the protocol before its type switch, then rewrites
+    // the BSD compatibility spelling `SOCK_RAW` to `SOCK_DGRAM` before it picks
+    // a transport.  The security hook above still saw the requested type.
+    if !tk_linux_net::unix_protocol_admitted(proto) {
+        return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
+    }
+    let ty =
+        tk_linux_net::unix_creation_type(ty).ok_or(AxError::from(LinuxError::ESOCKTNOSUPPORT))?;
+
     dispatch_socket(&SocketSecurityContext::create(actor, spec))?;
     dispatch_socket(&SocketSecurityContext::create(actor, spec))?;
 
@@ -1256,12 +1416,10 @@ pub fn sys_socketpair(
                 UnixSocket::new(sock2, unix_namespace),
             )
         }
-        SOCK_RAW => {
-            return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
-        }
         _ => {
+            // `unix_create`'s switch has no arm for any other type.
             warn!("Unsupported socketpair type: {ty}");
-            return Err(AxError::InvalidInput);
+            return Err(AxError::from(LinuxError::ESOCKTNOSUPPORT));
         }
     };
     let sock1 = Socket::new(SocketInner::Unix(sock1), net_ns.clone());
@@ -1419,6 +1577,121 @@ mod tests {
             );
         }
         probe.assert_complete_cycles(65);
+    }
+
+    /// `__sock_create` order: the family range test outranks the type range
+    /// test, and a masked type at or above `SOCK_MAX` never reaches a family.
+    #[test]
+    fn creation_ranges_follow_family_then_type() {
+        assert_eq!(
+            validate_pre_create_domain(AF_MAX),
+            Err(LinuxError::EAFNOSUPPORT.into())
+        );
+        assert_eq!(
+            validate_socket_type_range(tk_linux_net::SOCK_MAX),
+            Err(AxError::InvalidInput)
+        );
+        // Zero, `tk_linux_net::SOCK_RDM` and `SOCK_PACKET` are all in range; only a family's
+        // own `create` hook may refuse them.
+        for admitted in [0, tk_linux_net::SOCK_RDM, SOCK_SEQPACKET, tk_linux_net::SOCK_PACKET] {
+            assert!(validate_socket_type_range(admitted).is_ok());
+        }
+    }
+
+    /// `__sock_create` rewrites the obsolete `(PF_INET, SOCK_PACKET)` pair
+    /// before the security hook, so the hook and the provider both see
+    /// `PF_PACKET`.
+    #[test]
+    fn obsolete_pf_inet_sock_packet_becomes_af_packet() {
+        assert_eq!(
+            validate_socket_type_range(tk_linux_net::SOCK_PACKET).unwrap(),
+            tk_linux_net::SOCK_PACKET
+        );
+        assert_eq!(
+            tk_linux_net::socket_creation_family(AF_INET as u16, tk_linux_net::SOCK_PACKET),
+            AF_PACKET as u16
+        );
+        // Every other pairing keeps its family, including the same type on a
+        // different family.
+        for (family, ty) in [
+            (AF_INET6 as u16, tk_linux_net::SOCK_PACKET),
+            (AF_INET as u16, SOCK_RAW),
+            (AF_PACKET as u16, tk_linux_net::SOCK_PACKET),
+        ] {
+            assert_eq!(tk_linux_net::socket_creation_family(family, ty), family);
+        }
+    }
+
+    /// `inet_create`'s decision tree, in its own order: the protocol range test
+    /// is `EINVAL` before any table lookup, an empty `inetsw[type]` list is
+    /// `ESOCKTNOSUPPORT`, a protocol that no `inetsw[type]` entry matches is
+    /// `EPROTONOSUPPORT`, and the `SOCK_RAW` capability gate reports `EPERM`
+    /// only after the wildcard entry has admitted the protocol.
+    #[test]
+    fn inet_creation_errno_precedence_matches_inet_create() {
+        // Protocol range: `protocol >= IPPROTO_MAX` is EINVAL even for a type
+        // whose table is empty and for a raw socket without CAP_NET_RAW.
+        for ty in [SOCK_STREAM, SOCK_RAW, tk_linux_net::SOCK_RDM, 0] {
+            assert_eq!(
+                validate_inet_create(false, ty, IPPROTO_MAX),
+                Err(AxError::InvalidInput)
+            );
+        }
+        // Empty `inetsw[type]`: zero and `tk_linux_net::SOCK_RDM` have no table.
+        for ty in [0, tk_linux_net::SOCK_RDM] {
+            assert_eq!(
+                validate_inet_create(true, ty, 0),
+                Err(LinuxError::ESOCKTNOSUPPORT.into())
+            );
+        }
+        // Protocol table misses.
+        for (ty, proto) in [
+            (SOCK_STREAM, IPPROTO_UDP as u32),
+            (SOCK_DGRAM, IPPROTO_TCP as u32),
+            (SOCK_DCCP, IPPROTO_TCP as u32),
+            (SOCK_SEQPACKET, IPPROTO_TCP as u32),
+        ] {
+            assert_eq!(
+                validate_inet_create(true, ty, proto),
+                Err(LinuxError::EPROTONOSUPPORT.into())
+            );
+        }
+        // The range bound is 263, so IPPROTO_SMC(256) and IPPROTO_MPTCP(262)
+        // reach the table lookup: a reachable protocol with no TheKernel
+        // provider is EPROTONOSUPPORT, never the EINVAL reserved for values at
+        // or above the bound.
+        for proto in [256, IPPROTO_MPTCP_BOUNDARY] {
+            assert_eq!(
+                validate_inet_create(true, SOCK_STREAM, proto),
+                Err(LinuxError::EPROTONOSUPPORT.into())
+            );
+        }
+        assert_eq!(
+            validate_inet_create(true, SOCK_STREAM, IPPROTO_MAX),
+            Err(AxError::InvalidInput)
+        );
+        // Admitted pairings, including the zero-protocol wildcard.
+        for (ty, proto) in [
+            (SOCK_STREAM, 0),
+            (SOCK_STREAM, IPPROTO_TCP as u32),
+            (SOCK_DGRAM, 0),
+            (SOCK_DGRAM, IPPROTO_UDP as u32),
+            (SOCK_DCCP, 0),
+            (SOCK_DCCP, IPPROTO_DCCP as u32),
+            (SOCK_SEQPACKET, 0),
+            (SOCK_SEQPACKET, IPPROTO_SCTP as u32),
+        ] {
+            assert!(validate_inet_create(false, ty, proto).is_ok());
+        }
+        // The `inetsw[SOCK_RAW]` wildcard entry matches every in-range
+        // protocol, so only the capability can refuse the type.
+        for proto in [0, IPPROTO_TCP as u32, 255] {
+            assert_eq!(
+                validate_inet_create(false, SOCK_RAW, proto),
+                Err(LinuxError::EPERM.into())
+            );
+            assert!(validate_inet_create(true, SOCK_RAW, proto).is_ok());
+        }
     }
 
     #[test]

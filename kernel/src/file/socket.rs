@@ -515,7 +515,8 @@ mod tests {
             net_ns.stack().unix_namespace(),
         );
         let network = Socket::new(SocketInner::Unix(unix), net_ns.clone());
-        let netlink = NetlinkSocket::try_new(0, net_ns.clone()).unwrap();
+        let netlink =
+            NetlinkSocket::try_new(0, linux_raw_sys::net::SOCK_RAW, net_ns.clone()).unwrap();
         let packet = PacketSocket::try_new(
             tk_linux_packet::PacketSocketType::Raw,
             tk_linux_packet::ProtocolSelector::Disabled,

@@ -240,15 +240,30 @@ impl SocketAddrExt for SocketAddrV6 {
         addr: UserConstPtr<sockaddr>,
         addrlen: socklen_t,
     ) -> AxResult<Self> {
-        if !has_sockaddr_prefix(addrlen, size_of::<sockaddr_in6>()) {
+        // `inet6_bind` and `inet6_dgram_connect` require
+        // `addr_len >= SIN6_LEN_RFC2133`, which is 24 rather than the full 28
+        // bytes of `struct sockaddr_in6`.  Linux copies only the caller's bytes
+        // into a `sockaddr_storage` and then reads a whole `struct sockaddr_in6`,
+        // so a 24-to-27 byte address leaves `sin6_scope_id` holding
+        // uninitialized kernel stack bytes; zeroing that tail is the
+        // deterministic equivalent of the same bounded prefix.
+        if !has_sockaddr_prefix(addrlen, tk_linux_net::SIN6_LEN_RFC2133) {
             return Err(AxError::InvalidInput);
         }
-        let addr_in6 = unsafe {
-            capability
-                .read_value_uninit(addr.address().as_usize() as *const sockaddr_in6)
-                .map_err(map_usercopy_error)?
-                .assume_init()
+        let mut raw = [0_u8; size_of::<sockaddr_in6>()];
+        let copied = (addrlen as usize).min(raw.len());
+        let destination = unsafe {
+            core::slice::from_raw_parts_mut(
+                raw.as_mut_ptr().cast::<core::mem::MaybeUninit<u8>>(),
+                copied,
+            )
         };
+        capability
+            .read_slice(addr.address().as_usize() as *const u8, destination)
+            .map_err(map_usercopy_error)?;
+        // The zeroed buffer is fully initialized, so the read is defined even
+        // though a `[u8; 28]` carries no alignment guarantee.
+        let addr_in6 = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast::<sockaddr_in6>()) };
         if addr_in6.sin6_family as u32 != AF_INET6 {
             return Err(AxError::from(LinuxError::EAFNOSUPPORT));
         }
