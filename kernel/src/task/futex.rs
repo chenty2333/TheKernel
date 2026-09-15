@@ -577,6 +577,19 @@ struct WaiterEntry {
     requeued_pi: bool,
 }
 
+impl WaiterEntry {
+    /// Whether this waiter carries priority-inheritance state, which makes it
+    /// ineligible for a non-PI wake or requeue.
+    ///
+    /// Linux tests `this->pi_state || this->rt_waiter` (`kernel/futex/requeue.c`
+    /// and `kernel/futex/waitwake.c`); this kernel's single-level reduction of
+    /// `struct futex_pi_state` stores both in [`WaiterEntry::pi`], exactly as
+    /// [`WaitQueue::pi_top_locked`] does for the plain wake path.
+    fn is_pi(&self) -> bool {
+        self.pi.is_some()
+    }
+}
+
 impl WaiterQueue {
     fn push_back(&mut self, waiter: WaiterRef) {
         let ptr = NonNull::from(waiter.as_ref());
@@ -649,6 +662,40 @@ impl WaiterQueue {
 
     fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Borrows the head waiter without unlinking it.
+    ///
+    /// The PI rejection of `futex_requeue()` stops the scan *before* the
+    /// offending waiter is woken or requeued, so the waiter must be inspected
+    /// while it is still in place.
+    fn peek_front(&self) -> Option<WaiterRef> {
+        let ptr = self.head?;
+        // SAFETY: the queue owns a strong reference for every linked node, so
+        // one more count cannot outlive the allocation.
+        unsafe { Arc::increment_strong_count(ptr.as_ptr()) };
+        // SAFETY: the count incremented above is owned by the returned `Arc`.
+        Some(unsafe { Arc::from_raw(ptr.as_ptr()) })
+    }
+
+    /// Whether the waiter at the head would stop a non-PI wake/requeue scan.
+    ///
+    /// kernel/futex/requeue.c:606-609:
+    ///     if ((requeue_pi && !this->rt_waiter) ||
+    ///         (!requeue_pi && this->rt_waiter) ||
+    ///         this->pi_state) {
+    ///             ret = -EINVAL;
+    ///             break;
+    ///     }
+    /// Only a waiter which matches this queue's key, is still live, and would
+    /// still be inside the wake+requeue budget is examined, mirroring the
+    /// `futex_match()`/`task_count` guards of the same loop.
+    fn front_rejects_pi(&self, mask: u32) -> bool {
+        let Some(waiter) = self.peek_front() else {
+            return false;
+        };
+        let waiter = waiter.lock();
+        !waiter.cancelled && (waiter.bitset & mask) != 0 && waiter.is_pi()
     }
 }
 
@@ -965,17 +1012,32 @@ impl WaitQueue {
         wake_count: usize,
         mask: u32,
         mut requeue: Option<RequeueTarget<'_>>,
+        reject_pi: bool,
         pending_wakers: &mut WakeBatch,
         retired: &mut DeferredWaiters,
-    ) -> (usize, usize) {
+    ) -> Result<(usize, usize), ()> {
         let mut woke = 0;
         let mut moved = 0;
         // Kept waiters are appended back to `src`; bound the scan to the
         // entries present when the gate was acquired so a non-woken waiter
         // cannot make this drain loop revisit itself forever.
         let initial_len = src.len;
+        let requeue_limit = requeue.as_ref().map_or(0, |(_, limit, _)| *limit);
 
         for _ in 0..initial_len {
+            // `futex_requeue()` refuses to wake or requeue a waiter that still
+            // carries PI state (kernel/futex/requeue.c:606-609) and `break`s
+            // out of the scan, keeping the waiters it already woke or moved:
+            // the caller's `out_unlock` path still runs `wake_up_q(&wake_q)`.
+            // Its loop stops at the same point this budget does:
+            //     if (task_count - nr_wake >= nr_requeue)
+            //             break;
+            if reject_pi
+                && woke + moved < wake_count + requeue_limit
+                && src.front_rejects_pi(mask)
+            {
+                return Err(());
+            }
             let Some(waiter) = src.pop_front() else {
                 break;
             };
@@ -1021,7 +1083,7 @@ impl WaitQueue {
             }
         }
 
-        (woke, moved)
+        Ok((woke, moved))
     }
 
     /// Applies the wake/requeue accounting for a source and target which are
@@ -1032,9 +1094,10 @@ impl WaitQueue {
         wake_count: usize,
         requeue_count: usize,
         mask: u32,
+        reject_pi: bool,
         pending_wakers: &mut WakeBatch,
         retired: &mut DeferredWaiters,
-    ) -> (usize, usize) {
+    ) -> Result<(usize, usize), ()> {
         let mut woke = 0;
         let mut moved = 0;
         // As in the cross-key path, kept waiters are reinserted at the tail.
@@ -1043,6 +1106,12 @@ impl WaitQueue {
         let initial_len = src.len;
 
         for _ in 0..initial_len {
+            // See `wake_and_requeue_locked`: the PI rejection of
+            // `futex_requeue()` (kernel/futex/requeue.c:606-609) applies while
+            // the scan still has wake or requeue budget left.
+            if reject_pi && woke + moved < wake_count + requeue_count && src.front_rejects_pi(mask) {
+                return Err(());
+            }
             let Some(waiter) = src.pop_front() else {
                 break;
             };
@@ -1069,7 +1138,7 @@ impl WaitQueue {
             }
         }
 
-        (woke, moved)
+        Ok((woke, moved))
     }
 
     /// Publishes a non-PI waiter.  The entry carries no `rt_mutex_waiter`
@@ -1588,14 +1657,20 @@ impl WaitQueue {
             if reject_pi && Self::pi_top_locked(&queue).is_some() {
                 return Err(());
             }
+            // The scan-level rejection below is deliberately disabled here:
+            // the wake path tests the whole queue above, which is the stricter
+            // of the two and keeps `FUTEX_WAKE` from waking anyone before it
+            // reports `-EINVAL`.
             Self::wake_and_requeue_locked(
                 &mut queue,
                 count,
                 mask,
                 None,
+                false,
                 &mut pending_wakers,
                 &mut retired,
             )
+            .expect("a wake-only scan cannot reject PI waiters")
             .0
         };
         pending_wakers.finish();
@@ -1632,31 +1707,55 @@ impl WaitQueue {
                 Some(second.gate.lock())
             };
             let wake_target = operation()?;
-            let woke = Self::wake_and_requeue_locked(
+            // `futex_wake_op()` (kernel/futex/waitwake.c:330-347) applies the
+            // same PI rejection to both chains, and `goto out_unlock` keeps the
+            // wakeups the first chain already recorded while skipping the
+            // second chain entirely.
+            let mut rejected = false;
+            let first = Self::wake_and_requeue_locked(
                 &mut self.queue.lock(),
                 count,
                 u32::MAX,
                 None,
+                true,
                 &mut pending,
                 &mut retired,
-            )
-            .0;
-            woke + if wake_target {
-                Self::wake_and_requeue_locked(
-                    &mut target.queue.lock(),
-                    target_count,
-                    u32::MAX,
-                    None,
-                    &mut pending,
-                    &mut retired,
-                )
-                .0
-            } else {
-                0
-            }
+            );
+            let woke = match first {
+                Ok((woke, _)) => woke,
+                Err(()) => {
+                    rejected = true;
+                    0
+                }
+            };
+            let woke = woke
+                + if wake_target && !rejected {
+                    match Self::wake_and_requeue_locked(
+                        &mut target.queue.lock(),
+                        target_count,
+                        u32::MAX,
+                        None,
+                        true,
+                        &mut pending,
+                        &mut retired,
+                    ) {
+                        Ok((woke, _)) => woke,
+                        Err(()) => {
+                            rejected = true;
+                            0
+                        }
+                    }
+                } else {
+                    0
+                };
+            (woke, rejected)
         };
         pending.finish();
         retired.finish();
+        let (woke, rejected) = woke;
+        if rejected {
+            return Err(WaitConditionError::Fault(AxError::InvalidInput));
+        }
         Ok(woke)
     }
 
@@ -1698,9 +1797,11 @@ impl WaitQueue {
                 0,
                 u32::MAX,
                 Some((&mut dst, count, &target_owner)),
+                false,
                 &mut pending_wakers,
                 &mut retired,
             )
+            .expect("a wake-free requeue cannot reject PI waiters")
             .1
         } else {
             let _target_gate = target.gate.lock();
@@ -1712,9 +1813,11 @@ impl WaitQueue {
                 0,
                 u32::MAX,
                 Some((&mut dst, count, &target_owner)),
+                false,
                 &mut pending_wakers,
                 &mut retired,
             )
+            .expect("a wake-free requeue cannot reject PI waiters")
             .1
         };
         pending_wakers.finish();
@@ -1743,20 +1846,33 @@ impl WaitQueue {
     {
         let mut pending_wakers = WakeBatch::default();
         let mut retired = DeferredWaiters::default();
+        // The PI rejection stops the scan without rolling back what the scan
+        // already did; Linux keeps those wakeups (`goto out_unlock` still runs
+        // `wake_up_q(&wake_q)`) and the requeues `requeue_futex()` performed.
+        // The deferred batches must therefore be released on this path too,
+        // which is why the failure is recorded instead of propagated with `?`.
+        let mut rejected = false;
         let result = if core::ptr::eq(self, target) {
             let _gate = self.gate.lock();
             if !compare()? {
                 return Ok(None);
             }
             let mut queue = self.queue.lock();
-            Self::wake_and_requeue_same_locked(
+            match Self::wake_and_requeue_same_locked(
                 &mut queue,
                 wake_count,
                 requeue_count,
                 mask,
+                true,
                 &mut pending_wakers,
                 &mut retired,
-            )
+            ) {
+                Ok(result) => result,
+                Err(()) => {
+                    rejected = true;
+                    (0, 0)
+                }
+            }
         } else if (self as *const Self as usize) < (target as *const Self as usize) {
             let _self_gate = self.gate.lock();
             let _target_gate = target.gate.lock();
@@ -1765,14 +1881,21 @@ impl WaitQueue {
             }
             let mut src = self.queue.lock();
             let mut dst = target.queue.lock();
-            Self::wake_and_requeue_locked(
+            match Self::wake_and_requeue_locked(
                 &mut src,
                 wake_count,
                 mask,
                 Some((&mut dst, requeue_count, &target_owner)),
+                true,
                 &mut pending_wakers,
                 &mut retired,
-            )
+            ) {
+                Ok(result) => result,
+                Err(()) => {
+                    rejected = true;
+                    (0, 0)
+                }
+            }
         } else {
             let _target_gate = target.gate.lock();
             let _self_gate = self.gate.lock();
@@ -1781,23 +1904,39 @@ impl WaitQueue {
             }
             let mut src = self.queue.lock();
             let mut dst = target.queue.lock();
-            Self::wake_and_requeue_locked(
+            match Self::wake_and_requeue_locked(
                 &mut src,
                 wake_count,
                 mask,
                 Some((&mut dst, requeue_count, &target_owner)),
+                true,
                 &mut pending_wakers,
                 &mut retired,
-            )
+            ) {
+                Ok(result) => result,
+                Err(()) => {
+                    rejected = true;
+                    (0, 0)
+                }
+            }
         };
 
         pending_wakers.finish();
         retired.finish();
+        if rejected {
+            return Err(WaitConditionError::Fault(AxError::InvalidInput));
+        }
         Ok(Some(result))
     }
 
     /// Wakes up at most `wake_count` tasks and requeues up to
     /// `requeue_count` remaining waiters to the target queue atomically.
+    ///
+    /// `FUTEX_REQUEUE` reaches the same `futex_requeue()` loop as the
+    /// comparison form, so the PI rejection applies here as well: a scan that
+    /// meets a waiter still carrying PI state stops with `-EINVAL` after
+    /// keeping the wakeups and requeues it already performed
+    /// (kernel/futex/requeue.c:586-610).
     pub fn wake_and_requeue(
         &self,
         wake_count: usize,
@@ -1805,17 +1944,18 @@ impl WaitQueue {
         target: &WaitQueue,
         target_owner: WaiterOwner,
         mask: u32,
-    ) -> (usize, usize) {
-        self.wake_and_requeue_if(
+    ) -> WaitConditionResult<(usize, usize)> {
+        let scan = self.wake_and_requeue_if(
             wake_count,
             requeue_count,
             target,
             target_owner,
             mask,
             || Ok(true),
-        )
-        .expect("unconditional futex requeue comparison cannot fail")
-        .expect("unconditional futex requeue comparison cannot reject")
+        )?;
+        // The comparison always succeeds, so a refusal is impossible and the
+        // PI rejection above is the only failure this call can report.
+        Ok(scan.expect("an unconditional futex requeue comparison cannot refuse"))
     }
 }
 
@@ -2778,7 +2918,8 @@ mod tests {
 
         let (woke, moved) = src
             .wq
-            .wake_and_requeue(300, 500, &dst.wq, owner(&dst), u32::MAX);
+            .wake_and_requeue(300, 500, &dst.wq, owner(&dst), u32::MAX)
+            .expect("plain waiters are never rejected");
 
         assert_eq!(woke, 300);
         assert_eq!(moved, 500);
@@ -2905,7 +3046,8 @@ mod tests {
         assert_eq!(
             entry
                 .wq
-                .wake_and_requeue(1, 2, &entry.wq, owner(&entry), u32::MAX,),
+                .wake_and_requeue(1, 2, &entry.wq, owner(&entry), u32::MAX,)
+                .expect("plain waiters are never rejected"),
             (1, 2)
         );
         assert_eq!(entry.wq.wake(usize::MAX, u32::MAX), 2);
@@ -3022,6 +3164,137 @@ mod pi_tests {
             nice: 0,
             rt_priority,
         }
+    }
+
+    fn add_plain_waiter(entry: &Arc<FutexEntry>) -> WaitRegistration {
+        ensure_scheduler();
+        entry
+            .wq
+            .register_waiter_if(Arc::downgrade(entry), u32::MAX, None, || Ok(true))
+            .expect("waiter registration failed")
+            .expect("test condition rejected waiter")
+    }
+
+    fn target_owner(entry: &Arc<FutexEntry>) -> WaiterOwner {
+        WaiterOwner::without_table(Arc::downgrade(entry), FutexTableKey::Private(0))
+    }
+
+    #[test]
+    fn requeue_rejects_a_pi_waiter_before_any_effect() {
+        // `futex_requeue()` scans the source hash bucket and refuses a waiter
+        // that still carries PI state (kernel/futex/requeue.c:606-609):
+        //     if ((requeue_pi && !this->rt_waiter) ||
+        //         (!requeue_pi && this->rt_waiter) ||
+        //         this->pi_state) {
+        //             ret = -EINVAL;
+        //             break;
+        //     }
+        // The rejection precedes the unlink, so a plain requeue must neither
+        // wake nor move the PI waiter: the source queue keeps it and the
+        // target queue stays empty.
+        ensure_scheduler();
+        let src = Arc::new(FutexEntry::new());
+        let dst = Arc::new(FutexEntry::new());
+        let pi = add_pi_waiter(&src, 0x51, fifo(1));
+        assert_eq!(src.wq.queue.lock().len, 1);
+        assert_eq!(
+            src.wq.wake_and_requeue_if(
+                1,
+                1,
+                &dst.wq,
+                target_owner(&dst),
+                u32::MAX,
+                || Ok(true),
+            ),
+            Err(WaitConditionError::Fault(AxError::InvalidInput))
+        );
+        assert_eq!(src.wq.queue.lock().len, 1, "the PI waiter must stay queued");
+        assert!(dst.wq.is_empty(), "a rejected scan must not requeue anyone");
+        // The waiter is still the PI waiter, not a demoted plain one.
+        assert_eq!(src.wq.wake_inner(usize::MAX, u32::MAX, true), Err(()));
+        drop(pi);
+    }
+
+    #[test]
+    fn requeue_keeps_the_wakeups_that_precede_a_pi_rejection() {
+        // The `break` above stops the scan without rolling it back: the
+        // caller's `out_unlock` path still runs `wake_up_q(&wake_q)`, so a
+        // waiter that was already woken stays woken while the PI waiter that
+        // stopped the scan stays queued.
+        ensure_scheduler();
+        let src = Arc::new(FutexEntry::new());
+        let dst = Arc::new(FutexEntry::new());
+        let first = add_plain_waiter(&src);
+        let pi = add_pi_waiter(&src, 0x52, fifo(1));
+        assert_eq!(src.wq.queue.lock().len, 2);
+        assert_eq!(
+            src.wq.wake_and_requeue_if(
+                1,
+                1,
+                &dst.wq,
+                target_owner(&dst),
+                u32::MAX,
+                || Ok(true),
+            ),
+            Err(WaitConditionError::Fault(AxError::InvalidInput))
+        );
+        assert_eq!(
+            src.wq.queue.lock().len,
+            1,
+            "the leading non-PI waiter must have been woken"
+        );
+        assert!(dst.wq.is_empty());
+        assert_eq!(src.wq.wake_inner(usize::MAX, u32::MAX, true), Err(()));
+        drop((first, pi));
+    }
+
+    #[test]
+    fn wake_op_rejects_a_pi_waiter_on_either_queue() {
+        // `futex_wake_op()` applies the same rejection to both chains
+        // (kernel/futex/waitwake.c:330-333 and :344-347):
+        //     if ((!requeue_pi && this->rt_waiter) || this->pi_state) {
+        //             ret = -EINVAL;
+        //             goto out_unlock;
+        //     }
+        // and `out_unlock` keeps the wakeups the first chain recorded.
+        ensure_scheduler();
+        let src = Arc::new(FutexEntry::new());
+        let dst = Arc::new(FutexEntry::new());
+        let first = add_plain_waiter(&src);
+        let pi = add_pi_waiter(&dst, 0x53, fifo(1));
+        assert_eq!(
+            src.wq.wake_op(1, &dst.wq, 1, || Ok(true)),
+            Err(WaitConditionError::Fault(AxError::InvalidInput))
+        );
+        assert_eq!(src.wq.queue.lock().len, 0, "the first chain woke its waiter");
+        assert_eq!(dst.wq.queue.lock().len, 1, "the PI waiter must stay queued");
+        drop((first, pi));
+    }
+
+    #[test]
+    fn requeue_without_a_comparison_rejects_a_pi_waiter() {
+        // `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE` share one `futex_requeue()`
+        // loop (kernel/futex/requeue.c:586-610), so the PI rejection is not
+        // limited to the comparison form: the scanned waiter stops the loop
+        // with `-EINVAL` while the wakers that preceded it stay accounted.
+        ensure_scheduler();
+        let src = Arc::new(FutexEntry::new());
+        let dst = Arc::new(FutexEntry::new());
+        let first = add_plain_waiter(&src);
+        let pi = add_pi_waiter(&src, 0x54, fifo(1));
+        assert_eq!(
+            src.wq
+                .wake_and_requeue(1, 1, &dst.wq, target_owner(&dst), u32::MAX),
+            Err(WaitConditionError::Fault(AxError::InvalidInput))
+        );
+        assert_eq!(
+            src.wq.queue.lock().len,
+            1,
+            "the leading non-PI waiter must have been woken"
+        );
+        assert!(dst.wq.is_empty(), "a rejected scan must not requeue anyone");
+        assert_eq!(src.wq.wake_inner(usize::MAX, u32::MAX, true), Err(()));
+        drop((first, pi));
     }
 
     fn fair(nice: i8) -> SchedState {

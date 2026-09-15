@@ -1922,14 +1922,19 @@ pub fn sys_futex(
                 } else if !requeue_mapping_check(private, namespace)
                     && !requeue_mapping_check(private, namespace2)
                 {
-                    let result = futex.wq.wake_and_requeue(
+                    match futex.wq.wake_and_requeue(
                         value as usize,
                         value2,
                         &futex2.wq,
                         futex2.waiter_owner(),
                         u32::MAX,
-                    );
-                    return Ok((result.0 + result.1) as isize);
+                    ) {
+                        Ok(result) => return Ok((result.0 + result.1) as isize),
+                        Err(WaitConditionError::Fault(error)) => return Err(error),
+                        // An unconditional requeue has no user-memory
+                        // comparison that could need a retry.
+                        Err(WaitConditionError::Retry) => continue,
+                    }
                 } else {
                     let result = futex.wq.wake_and_requeue_if(
                         value as usize,
