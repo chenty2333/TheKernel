@@ -99,6 +99,19 @@ bitflags! {
     pub struct SendFlags: u32 {
         /// Do not wait for transmit capacity for this operation.
         const DONT_WAIT = 0x01;
+        /// `MSG_MORE`: the caller will send more, so a partial transmission
+        /// must not be pushed out on account of this operation.  Stream
+        /// transports may hold a short segment, the way Linux's
+        /// `TCP_NAGLE_CORK` does for `tcp_sendmsg_locked()`.
+        const MORE = 0x02;
+        /// `MSG_DONTROUTE`: restrict route selection to a directly reachable
+        /// destination.  Transports without a scope-aware routing table accept
+        /// it and rely on the ordinary on-link decision.
+        const DONT_ROUTE = 0x04;
+        /// `MSG_CONFIRM`: tell the neighbour layer the forward path is still
+        /// good.  Transports without a neighbour-confirmation cache accept it
+        /// and have nothing to refresh.
+        const CONFIRM = 0x08;
     }
 }
 

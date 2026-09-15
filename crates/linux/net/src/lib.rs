@@ -6,6 +6,15 @@
 
 use core::mem::{align_of, size_of};
 
+mod msg;
+
+pub use msg::{
+    BatchDeadline, MSG_CMSG_CLOEXEC, MSG_CMSG_COMPAT, MSG_CONFIRM, MSG_DONTROUTE, MSG_DONTWAIT,
+    MSG_INTERNAL_SENDMSG_FLAGS, MSG_MORE, MSG_NOSIGNAL, MSG_OOB, MSG_SPLICE_PAGES, MSG_WAITFORONE,
+    NSEC_PER_SEC, ReceiveStep, Timespec64, absolute_deadline, batch_deadline, compat_flag_errno,
+    remaining_timeout, strip_internal_sendmsg_flags, waitall_applies, waitall_continues,
+};
+
 pub const AF_UNIX: u16 = 1;
 pub const AF_NETLINK: u16 = 16;
 pub const SOL_SOCKET: i32 = 1;
