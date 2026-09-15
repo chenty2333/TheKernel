@@ -7,24 +7,44 @@ use crate::{
 /// Maximum errno value Linux accepts from `SECCOMP_RET_ERRNO`.
 pub const MAX_ERRNO: u16 = 4095;
 
-/// Actions this kernel can carry out for every task that installs them.
+/// Actions this kernel can carry out, in the order Linux
+/// `seccomp_get_action_avail()` (`kernel/seccomp.c`) accepts them.
 ///
-/// Linux `seccomp_get_action_avail()` (`kernel/seccomp.c`) answers for the
-/// actions its filter engine implements, and includes `SECCOMP_RET_TRACE`
-/// because `__seccomp_filter()` can deliver `PTRACE_EVENT_SECCOMP` to a tracer
-/// that requested the event.  This kernel's ptrace layer has no
-/// `PTRACE_O_TRACESECCOMP` lifecycle, so a `SECCOMP_RET_TRACE` verdict can only
-/// ever take Linux's "no tracer attached" path and skip the syscall with
-/// `ENOSYS`.  Advertising it would let an application rely on an event that
-/// never arrives, which is worse than an honest under-report; it is therefore
-/// deliberately absent.  Every other Linux action, including
-/// `SECCOMP_RET_USER_NOTIF`, is enforced here and must be advertised.
-pub const AVAILABLE_ACTIONS: [u32; 7] = [
+/// The list is the complete set of filter return values Linux answers 0 for:
+///
+/// ```c
+/// 	switch (action) {
+/// 	case SECCOMP_RET_KILL_PROCESS:
+/// 	case SECCOMP_RET_KILL_THREAD:
+/// 	case SECCOMP_RET_TRAP:
+/// 	case SECCOMP_RET_ERRNO:
+/// 	case SECCOMP_RET_USER_NOTIF:
+/// 	case SECCOMP_RET_TRACE:
+/// 	case SECCOMP_RET_LOG:
+/// 	case SECCOMP_RET_ALLOW:
+/// 		break;
+/// 	default:
+/// 		return -EOPNOTSUPP;
+/// 	}
+///
+/// 	return 0;
+/// ```
+///
+/// The answer describes the action table, not the state of any tracer:
+/// `SECCOMP_RET_TRACE` is available in Linux even though a verdict with no
+/// tracer waiting takes the "no tracer attached" path and fails the syscall
+/// with -ENOSYS (kernel/seccomp.c `__seccomp_filter()`).  This kernel enforces
+/// that same path for every `TRACE` verdict, so it advertises the action too.
+/// What it does not have is `PTRACE_EVENT_SECCOMP` delivery to a tracer that
+/// asked for the event with `PTRACE_O_TRACESECCOMP`, so such a tracer sees the
+/// -ENOSYS verdict instead of a stop.
+pub const AVAILABLE_ACTIONS: [u32; 8] = [
     SECCOMP_RET_KILL_PROCESS,
     SECCOMP_RET_KILL_THREAD,
     SECCOMP_RET_TRAP,
     SECCOMP_RET_ERRNO,
     SECCOMP_RET_USER_NOTIF,
+    SECCOMP_RET_TRACE,
     SECCOMP_RET_LOG,
     SECCOMP_RET_ALLOW,
 ];
@@ -176,6 +196,7 @@ mod tests {
             SECCOMP_RET_TRAP,
             SECCOMP_RET_ERRNO,
             SECCOMP_RET_USER_NOTIF,
+            SECCOMP_RET_TRACE,
             SECCOMP_RET_LOG,
             SECCOMP_RET_ALLOW,
         ] {
@@ -189,16 +210,35 @@ mod tests {
     }
 
     #[test]
-    fn trace_is_not_advertised_because_ptrace_cannot_deliver_it() {
-        // Linux answers 0 here; this kernel deliberately answers EOPNOTSUPP
-        // until PTRACE_O_TRACESECCOMP has a real ownership lifecycle.
-        assert!(!action_is_available(SECCOMP_RET_TRACE));
+    fn advertised_actions_are_exactly_linux_seccomp_get_action_avail_switch() {
+        // kernel/seccomp.c `seccomp_get_action_avail()` answers 0 for these
+        // eight values and -EOPNOTSUPP for every other one, so the table must
+        // not grow, shrink, or accept a value with data bits set.
+        assert_eq!(
+            AVAILABLE_ACTIONS,
+            [
+                SECCOMP_RET_KILL_PROCESS,
+                SECCOMP_RET_KILL_THREAD,
+                SECCOMP_RET_TRAP,
+                SECCOMP_RET_ERRNO,
+                SECCOMP_RET_USER_NOTIF,
+                SECCOMP_RET_TRACE,
+                SECCOMP_RET_LOG,
+                SECCOMP_RET_ALLOW,
+            ]
+        );
+        assert_eq!(
+            AVAILABLE_ACTIONS.map(|action| action & !SECCOMP_RET_ACTION_FULL),
+            [0; 8]
+        );
+        assert!(action_is_available(SECCOMP_RET_TRACE));
     }
 
     #[test]
     fn availability_compares_the_complete_value_not_the_action_field() {
         assert!(!action_is_available(SECCOMP_RET_ERRNO | 5));
         assert!(!action_is_available(SECCOMP_RET_ALLOW | 1));
+        assert!(!action_is_available(SECCOMP_RET_TRACE | 0x1234));
         assert!(!action_is_available(0x1234_0000));
     }
 }
