@@ -310,13 +310,65 @@ static int case_gettimeofday(void) {
     ASSERT("gettimeofday", "READ_BRACKETS_CLOCK_REALTIME");
     ASSERT("gettimeofday", "NULL_ARGUMENTS_ACCEPTED");
 
+    /* `firsttime` belongs to the first timezone store, not to the first store
+     * that also sets the clock.  Linux v7.2.3, `do_sys_settimeofday64()`
+     * (kernel/time/time.c:186-193): after the +-15 hour range check it stores
+     * the timezone and then runs
+     *
+     *	if (firsttime) {
+     *		firsttime = 0;
+     *		if (!tv)
+     *			timekeeping_warp_clock();
+     *	}
+     *
+     * so a store that carries both a clock value and a timezone spends the
+     * one-shot without warping anything.  The store below is that first store:
+     * it writes the current wall time (a no-op for the clock, and not a warp on
+     * either guest) together with a timezone. */
+    struct timeval set_tv;
+    if (raw_gettimeofday(&set_tv, NULL) != 0) {
+        return fail("timezone-tv-store-source");
+    }
+    memset(&tz, 0, sizeof(tz));
+    tz.tz_minuteswest = 120;
+    tz.tz_dsttime = 1;
+    errno = 0;
+    if (raw_settimeofday(&set_tv, &tz) != 0) {
+        return fail("timezone-tv-store");
+    }
+    memset(&tz, 0, sizeof(tz));
+    errno = 0;
+    if (raw_gettimeofday(NULL, &tz) != 0 || tz.tz_minuteswest != 120 || tz.tz_dsttime != 1) {
+        return fail("timezone-tv-store-readback");
+    }
+
+    /* With the one-shot spent, a following settimeofday(NULL, tz) must leave
+     * CLOCK_REALTIME exactly where it is.  A kernel that arms the one-shot on
+     * the `tv == NULL` branch instead leaves it armed through the store above
+     * and warps the clock by a full hour here.  The window brackets only the
+     * NULL store, so the clock value the previous store published is outside
+     * it. */
+    memset(&tz, 0, sizeof(tz));
+    tz.tz_minuteswest = 60;
+    tz.tz_dsttime = 1;
+    errno = 0;
+    if (raw_clock_gettime(CLOCK_REALTIME, &before) != 0 ||
+        raw_settimeofday(NULL, &tz) != 0 ||
+        raw_clock_gettime(CLOCK_REALTIME, &after) != 0) {
+        return fail("timezone-first-null-store");
+    }
+    long first_null_warp = realtime_delta(&before, &after);
+    if (first_null_warp < 0 || first_null_warp > 1000000000L) {
+        errno = EPROTO;
+        return fail("timezone-first-null-store-warp");
+    }
+    ASSERT("gettimeofday", "TIMEZONE_ONE_SHOT_SPENT_BY_TV_STORE");
+
     /* settimeofday(NULL, tz) stores the process-wide timezone that
-     * gettimeofday(NULL, tz) then reports, and the *first* stored timezone also
-     * warps CLOCK_REALTIME by `tz_minuteswest * 60` seconds
-     * (do_sys_settimeofday64(), kernel/time/time.c:185-192 ->
-     * timekeeping_warp_clock(), kernel/time/timekeeping.c:1781-1791, which
-     * injects sys_tz.tz_minuteswest * 60 into the wall clock).  This is the
-     * first timezone store in this program, so `firsttime` is still set. */
+     * gettimeofday(NULL, tz) then reports.  The one-shot was spent above by a
+     * store that did not warp, so every later store leaves CLOCK_REALTIME
+     * alone as well -- including this third one, which would add two hours if
+     * the warp were still owed. */
     memset(&tz, 0, sizeof(tz));
     tz.tz_minuteswest = 120;
     tz.tz_dsttime = 1;
@@ -334,7 +386,7 @@ static int case_gettimeofday(void) {
         return fail("timezone-store-clock");
     }
     long warp = realtime_delta(&before, &after);
-    if (warp < 7200000000000L || warp > 7200000000000L + 2000000000L) {
+    if (warp < 0 || warp > 1000000000L) {
         errno = EPROTO;
         return fail("timezone-store-warp");
     }

@@ -1325,11 +1325,24 @@ pub fn sys_settimeofday<M: UserMemory + ?Sized>(
             minutes_west: tz.tz_minuteswest,
             dst_time: tz.tz_dsttime,
         });
-        // The first stored timezone warps `CLOCK_REALTIME` by
-        // `tz_minuteswest * 60` seconds, but only when this call does not set
-        // the clock itself (`kernel/time/time.c:194-200`,
-        // `kernel/time/timekeeping.c:1781-1791`).
-        if requested_nanos.is_none() && crate::time::warp_first_timezone(tz.tz_minuteswest)? {
+        // The `firsttime` one-shot is spent by the *first stored timezone*,
+        // whatever that call does with the clock, and only a store that omits
+        // the clock value warps it:
+        //
+        //     sys_tz = *tz;
+        //     update_vsyscall_tz();
+        //     if (firsttime) {
+        //             firsttime = 0;
+        //             if (!tv)
+        //                     timekeeping_warp_clock();
+        //     }
+        //
+        // (`do_sys_settimeofday64()`, kernel/time/time.c:185-197). Spending the
+        // one-shot only on the `tv == NULL` branch would let a later
+        // `settimeofday(NULL, &tz)` warp `CLOCK_REALTIME` by
+        // `tz_minuteswest * 60` -- up to +-15 hours -- after a call that already
+        // set the clock.
+        if crate::time::warp_first_timezone(tz.tz_minuteswest, requested_nanos.is_none())? {
             // `timekeeping_warp_clock()` reaches `ntp_clear()` through
             // `timekeeping_inject_offset()` (`kernel/time/timekeeping.c:1786-1790`),
             // but only when the retained timezone actually moves the clock.
