@@ -20,12 +20,14 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* Native x86_64 UAPI, independent of the build host's libc headers. */
@@ -43,10 +45,12 @@ enum {
     NR_STATMOUNT = 457,
 };
 #define OPEN_TREE_CLONE 0x1U
+#define OPEN_TREE_NAMESPACE 0x2U
 #define OPEN_TREE_CLOEXEC O_CLOEXEC
 #define AT_RECURSIVE 0x8000
 #define FSOPEN_CLOEXEC 0x1U
 #define FSMOUNT_CLOEXEC 0x1U
+#define FSMOUNT_NAMESPACE 0x2U
 #define FSPICK_CLOEXEC 0x1U
 #define FSCONFIG_SET_FLAG 0U
 #define FSCONFIG_SET_STRING 1U
@@ -96,6 +100,16 @@ _Static_assert(sizeof(struct statmount) == 512, "statmount prefix is 512 bytes")
 #define Q_GETQUOTA 0x800007U
 #define Q_SETQUOTA 0x800008U
 #define Q_GETNEXTQUOTA 0x800009U
+/* XQM_CMD(x) is ('X' << 8) + x, so the XFS selectors are 0x5801..0x5809. */
+#define Q_XQUOTAON 0x5801U
+#define Q_XQUOTAOFF 0x5802U
+#define Q_XGETQUOTA 0x5803U
+#define Q_XSETQLIM 0x5804U
+#define Q_XGETQSTAT 0x5805U
+#define Q_XQUOTARM 0x5806U
+#define Q_XQUOTASYNC 0x5807U
+#define Q_XGETQSTATV 0x5808U
+#define Q_XGETNEXTQUOTA 0x5809U
 #define USRQUOTA 0
 #define QFMT_VFS_V1 4
 #define FAN_CLOEXEC 0x1U
@@ -124,6 +138,9 @@ static const char *active;
 static char dir[] = "/root/thekernel-mount-api-XXXXXX";
 static char file_path[sizeof(dir) + 8];
 static int dfd = -1, file_fd = -1, pipe_fd[2] = { -1, -1 };
+/* Big enough for the largest XFS quota reply (fs_quota_statv, 160 bytes) and
+ * addressable from the unprivileged child bodies. */
+static uint8_t format_buffer[256];
 static int fanotify_absent, quota_absent, quota_active;
 
 static void cleanup(void) {
@@ -163,6 +180,84 @@ static int quota_errno(int inactive, int active_errno) {
 #define QUOTA_ERROR(call, inactive, active_errno, stage) do { errno = 0; long r_ = (long)(call); \
     check(r_ == -1 && errno == quota_errno((inactive), (active_errno)), (stage)); } while (0)
 
+/* Q_XGETQSTAT reports ENOSYS while no quota type is active and renders the
+ * struct once one is; a group without CONFIG_QUOTA is always ENOSYS. */
+#define QUOTA_ACTIVE_ERROR(call, stage) do { errno = 0; long r_ = (long)(call); \
+    check(quota_absent ? (r_ == -1 && errno == ENOSYS) : \
+          (quota_active ? r_ == 0 : (r_ == -1 && errno == ENOSYS)), (stage)); } while (0)
+
+/* The capability decisions of open_tree(2) and fsmount(2), and the privilege
+ * table quotactl_fd shares with quotactl(2), are only observable without
+ * CAP_SYS_ADMIN, so those cells run in a child that dropped to nobody. */
+static int child_probe_rc;
+
+/* Runs `body` in a child with uid/gid 65534 and returns the child call's
+ * non-negative result or its negated errno. */
+static int unprivileged_child(void (*body)(void)) {
+    int fds[2];
+    check(pipe(fds) == 0, "unprivileged-pipe");
+    pid_t child = fork();
+    check(child >= 0, "unprivileged-fork");
+    if (child == 0) {
+        (void)close(fds[0]);
+        int reported = 0;
+        if (setgroups(0, NULL) == 0 && setgid(65534) == 0 && setuid(65534) == 0) {
+            errno = 0;
+            body();
+            reported = child_probe_rc == -1 ? -errno : child_probe_rc;
+        }
+        (void)!write(fds[1], &reported, sizeof(reported));
+        _exit(0);
+    }
+    (void)close(fds[1]);
+    int reported = 0;
+    check(read(fds[0], &reported, sizeof(reported)) == (ssize_t)sizeof(reported), "unprivileged-read");
+    (void)close(fds[0]);
+    int status = 0;
+    check(waitpid(child, &status, 0) == child, "unprivileged-wait");
+    return reported;
+}
+
+static void body_open_tree_namespace(void) {
+    child_probe_rc = (int)syscall(NR_OPEN_TREE, dfd, "", OPEN_TREE_NAMESPACE | AT_EMPTY_PATH);
+}
+static void body_fsmount_attr(void) {
+    child_probe_rc = (int)syscall(NR_FSMOUNT, -1, 0, BAD_FLAGS);
+}
+static void body_fsmount_namespace_attr(void) {
+    child_probe_rc = (int)syscall(NR_FSMOUNT, -1, FSMOUNT_NAMESPACE, BAD_FLAGS);
+}
+static void body_fsmount_flags_attr(void) {
+    child_probe_rc = (int)syscall(NR_FSMOUNT, -1, BAD_FLAGS, BAD_FLAGS);
+}
+static void body_quota_setinfo(void) {
+    child_probe_rc = (int)syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_SETINFO, USRQUOTA), 0, &format_buffer);
+}
+static void body_quota_getquota_other(void) {
+    child_probe_rc = (int)syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_GETQUOTA, USRQUOTA), 0, &format_buffer);
+}
+static void body_quota_getnext(void) {
+    child_probe_rc =
+        (int)syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_GETNEXTQUOTA, USRQUOTA), 0, &format_buffer);
+}
+static void body_quota_xgetquota_other(void) {
+    child_probe_rc =
+        (int)syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_XGETQUOTA, USRQUOTA), 0, &format_buffer);
+}
+static void body_quota_quotaon(void) {
+    child_probe_rc =
+        (int)syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_QUOTAON, USRQUOTA), QFMT_VFS_V1, &format_buffer);
+}
+static void body_quota_xgetqstat(void) {
+    child_probe_rc =
+        (int)syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_XGETQSTAT, USRQUOTA), 0, &format_buffer);
+}
+/* The errno a call that must fail in the unprivileged child left, or 0. */
+static int unprivileged_errno(void (*body)(void)) {
+    int reported = unprivileged_child(body);
+    return reported < 0 ? -reported : 0;
+}
+
 int main(void) {
     active = "mount-api.setup";
     check(mkdtemp(dir) != NULL, "mkdir");
@@ -190,6 +285,12 @@ int main(void) {
     ERROR(syscall(NR_OPEN_TREE, -1, BAD, OPEN_TREE_CLONE | 0x40000000, NULL, 0), EINVAL,
           "unknown-flag-before-path");
     mark("FLAG_BITS_BEFORE_PATH");
+    /* vfs_open_tree() decides the namespace capability before it copies the
+     * pathname, and OPEN_TREE_NAMESPACE is anchored on CAP_SYS_ADMIN in the
+     * caller's current user namespace rather than on may_mount(). */
+    ERROR(syscall(NR_OPEN_TREE, -1, BAD, OPEN_TREE_NAMESPACE, NULL, 0), EFAULT,
+          "namespace-before-path");
+    check(unprivileged_errno(body_open_tree_namespace) == EPERM, "namespace-unprivileged");
     ERROR(syscall(NR_OPEN_TREE, dfd, "", AT_EMPTY_PATH | AT_RECURSIVE, NULL, 0), EINVAL,
           "recursive-without-clone");
     mark("RECURSIVE_REQUIRES_CLONE");
@@ -235,6 +336,15 @@ int main(void) {
     ERROR(syscall(NR_FSMOUNT, -1, 0, 0), EBADF, "bad-fd");
     ERROR(syscall(NR_FSMOUNT, pipe_fd[0], 0, 0), EINVAL, "not-a-context");
     mark("SCALARS_BEFORE_DESCRIPTOR");
+    /* fsmount() checks CAP_SYS_ADMIN in the caller's current user namespace
+     * after the flag word and before the attribute word, for both the
+     * FSMOUNT_NAMESPACE form and the mount-attribute form. */
+    check(unprivileged_errno(body_fsmount_flags_attr) == EINVAL, "flags-before-capability");
+    check(unprivileged_errno(body_fsmount_attr) == EPERM, "attributes-after-capability");
+    check(unprivileged_errno(body_fsmount_namespace_attr) == EPERM,
+          "namespace-attributes-after-capability");
+    ERROR(syscall(NR_FSMOUNT, -1, FSMOUNT_NAMESPACE, BAD_FLAGS), EINVAL,
+          "namespace-attributes-capable");
     ERROR(syscall(NR_FSMOUNT, ctx, 0, 0), EINVAL, "uncreated-context");
     mark("UNCREATED_CONTEXT_EINVAL");
     check(syscall(NR_FSCONFIG, ctx, FSCONFIG_CMD_CREATE, NULL, NULL, 0) == 0, "create");
@@ -289,6 +399,17 @@ int main(void) {
     mark("BY_FD_REQUEST_EXCLUSIVE");
     ERROR(syscall(NR_STATMOUNT, &req, buffer, sizeof(buffer), STATMOUNT_BY_FD), EBADF, "by-fd-bad-fd");
     mark("BY_FD_EBADF");
+    /* do_statmount() has no namespace for a descriptor that is not a mount
+     * (EINVAL) and adopts an anonymous one for a detached mount, whose root
+     * has no child to find (ENOENT). */
+    req.mnt_fd = (uint32_t)pipe_fd[0];
+    ERROR(syscall(NR_STATMOUNT, &req, buffer, sizeof(buffer), STATMOUNT_BY_FD), EINVAL, "by-fd-pipe");
+    int detached = (int)syscall(NR_OPEN_TREE, dfd, "", OPEN_TREE_CLONE | AT_EMPTY_PATH);
+    check(detached >= 0, "detached-open");
+    req.mnt_fd = (uint32_t)detached;
+    ERROR(syscall(NR_STATMOUNT, &req, buffer, sizeof(buffer), STATMOUNT_BY_FD), ENOENT,
+          "by-fd-detached");
+    check(close(detached) == 0, "detached-close");
     req.mnt_fd = (uint32_t)dfd;
     req.param = STATMOUNT_STRING_REQ;
     ERROR(syscall(NR_STATMOUNT, &req, buffer, 512, STATMOUNT_BY_FD), EOVERFLOW, "string-needs-room");
@@ -340,9 +461,46 @@ int main(void) {
     ERROR(syscall(NR_QUOTACTL_FD, pipe_fd[0], QCMD(Q_GETFMT, USRQUOTA), 0, &format), ENOSYS,
           "pipe-provider");
     ERROR(syscall(NR_QUOTACTL_FD, pipe_fd[1], QCMD(Q_SYNC, USRQUOTA), 0, NULL), ENOSYS, "pipe-sync");
+    /* The shifted XFS selectors reach the same provider lookup. */
+    ERROR(syscall(NR_QUOTACTL_FD, pipe_fd[0], QCMD(Q_XGETQUOTA, USRQUOTA), 0, format_buffer), ENOSYS,
+          "pipe-xgetquota");
+    ERROR(syscall(NR_QUOTACTL_FD, pipe_fd[0], QCMD(Q_XQUOTAON, USRQUOTA), 0, format_buffer), ENOSYS,
+          "pipe-xquotaon");
     mark("NON_PATH_FD_ENOSYS");
     QUOTA_ERROR(syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_QUOTAON, USRQUOTA), QFMT_VFS_V1, BAD), EINVAL,
                 EINVAL, "quotaon-path");
+    /* Q_XQUOTAON/Q_XQUOTAOFF/Q_XQUOTARM copy their flag word before the
+     * provider is consulted (EFAULT), and dquot_quota_enable()/disable()/
+     * dquot_rm_xquota() answer ENOSYS because ext4 keeps no quota system
+     * file. */
+    ERROR(syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_XQUOTAON, USRQUOTA), 0, BAD), EFAULT, "xquotaon-copy");
+    QUOTA_ERROR(syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_XQUOTAON, USRQUOTA), 0, format_buffer), ENOSYS,
+                ENOSYS, "xquotaon-provider");
+    QUOTA_ERROR(syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_XQUOTAOFF, USRQUOTA), 0, format_buffer), ENOSYS,
+                ENOSYS, "xquotaoff-provider");
+    QUOTA_ERROR(syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_XQUOTARM, USRQUOTA), 0, format_buffer), ENOSYS,
+                ENOSYS, "xquotarm-provider");
+    /* Q_XGETQSTATV copies the caller's version byte first, so a bad pointer is
+     * EFAULT and an unknown version is EINVAL regardless of provider state. */
+    ERROR(syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_XGETQSTATV, USRQUOTA), 0, BAD), EFAULT,
+          "xgetqstatv-version");
+    format_buffer[0] = 0;
+    ERROR(syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_XGETQSTATV, USRQUOTA), 0, format_buffer), EINVAL,
+          "xgetqstatv-unknown-version");
+    /* Q_XQUOTASYNC only reports the read-only state of the superblock. */
+    check(syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_XQUOTASYNC, USRQUOTA), 0, NULL) == 0, "xquotasync");
+    QUOTA_ACTIVE_ERROR(syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_XGETQSTAT, USRQUOTA), 0, format_buffer),
+                       "xgetqstat-state");
+    /* check_quotactl_permission() lets an unprivileged caller read only its own
+     * identity's quota, exempts Q_XGETQSTAT, and denies everything else before
+     * the provider runs. */
+    check(unprivileged_errno(body_quota_setinfo) == EPERM, "unprivileged-setinfo");
+    check(unprivileged_errno(body_quota_getquota_other) == EPERM, "unprivileged-other-uid");
+    check(unprivileged_errno(body_quota_getnext) == EPERM, "unprivileged-getnext");
+    check(unprivileged_errno(body_quota_xgetquota_other) == EPERM, "unprivileged-xgetquota");
+    check(unprivileged_errno(body_quota_quotaon) == EPERM, "unprivileged-quotaon");
+    check(unprivileged_errno(body_quota_xgetqstat) == quota_errno(ENOSYS, 0),
+          "unprivileged-xgetqstat");
     mark("QUOTAON_DEFERRED_EINVAL");
     QUOTA_ERROR(syscall(NR_QUOTACTL_FD, dfd, QCMD(Q_GETFMT, USRQUOTA), 0, NULL), ESRCH, EFAULT,
                 "state-errno");
