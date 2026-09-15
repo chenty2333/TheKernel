@@ -27,7 +27,10 @@ use crate::{
         PosixTimerNotify, TaskUsage, get_process_itimer, get_visible_task_including_exiting,
         poll_timer, refresh_posix_cpu_timer_armed, set_process_itimer, times_clock_ticks,
     },
-    time::{TimeValueLike, set_wall_time, wall_time, wall_time_nanos},
+    time::{
+        SystemTimezone, TimeValueLike, set_system_timezone, set_wall_time, system_timezone,
+        wall_time, wall_time_nanos,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,7 +46,6 @@ enum ClockDomain {
 
 pub(crate) static TAI_CLOCK_CHANGES: axpoll::PollSet = axpoll::PollSet::new();
 
-const DEFAULT_TAI_OFFSET_SECS: u64 = 37;
 const CPUCLOCK_PROF: i32 = 0;
 const CPUCLOCK_VIRT: i32 = 1;
 const CPUCLOCK_SCHED: i32 = 2;
@@ -139,6 +141,19 @@ fn quantize_clock_reading(now: TimeValue, resolution: TimeValue) -> TimeValue {
 }
 
 fn clock_resolution(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
+    // `posix_cpu_clock_getres()` reports one nanosecond for the scheduler
+    // clock, which covers CLOCK_PROCESS_CPUTIME_ID/CLOCK_THREAD_CPUTIME_ID and
+    // their CPUCLOCK_SCHED encodings, and the rounded-up accounting tick for
+    // the encoded PROF/VIRT clocks, which are charged once per tick
+    // (`kernel/time/posix-cpu-timers.c:159-176`).
+    if clock_id < 0
+        && let Some(clock) = decode_cpu_clock_id(clock_id)
+        && clock.which != CPUCLOCK_SCHED
+    {
+        return Ok(TimeValue::from_nanos(
+            linux_time::accounting_tick_resolution_nanos(axconfig::TICKS_PER_SEC as u32),
+        ));
+    }
     match clock_domain(clock_id)? {
         ClockDomain::RealtimeCoarse | ClockDomain::MonotonicCoarse => Ok(coarse_clock_resolution()),
         ClockDomain::Realtime
@@ -175,22 +190,24 @@ pub struct KernelOldTimex {
     _padding: [i32; 11],
 }
 
+/// The published Linux timex state plus the generation that absolute
+/// CLOCK_TAI timers snapshot, so an `ADJ_TAI` rebase can reproject them.
+///
+/// The initial value is Linux's: `STA_UNSYNC`, time constant 2, both error
+/// estimates at `NTP_PHASE_LIMIT`, one `tick_usec` per `USER_HZ` tick, and a
+/// zero TAI offset until userspace publishes one (`ntp_init()`,
+/// `kernel/time/ntp.c:90-100`; the static timekeeper is zero initialized).
 #[derive(Clone, Copy, Debug)]
 struct TimexState {
     version: u64,
-    value: linux_time::Timex,
+    value: linux_time::TimexState,
 }
 
 impl TimexState {
     const fn new() -> Self {
         Self {
             version: 0,
-            value: linux_time::Timex {
-                precision: 1,
-                tick: (1_000_000 / axconfig::TICKS_PER_SEC as u64) as i64,
-                tai: DEFAULT_TAI_OFFSET_SECS as i32,
-                ..linux_time::Timex::ZERO
-            },
+            value: linux_time::TimexState::INITIAL,
         }
     }
 }
@@ -338,28 +355,34 @@ fn clock_adjtime_is_realtime(clock_id: __kernel_clockid_t) -> AxResult<bool> {
     }
 }
 
-fn timex_tick_bounds() -> (i64, i64) {
-    let hz = axconfig::TICKS_PER_SEC as i64;
-    (900_000 / hz, 1_100_000 / hz)
-}
-
-fn fill_timex_output(timex: &mut KernelOldTimex, plan: linux_time::TimexRenderPlan) {
-    let state = plan.value;
-    timex.modes = if state.status & linux_time::STA_NANO != 0 {
-        linux_time::ADJ_NANO
-    } else {
-        linux_time::ADJ_MICRO
-    };
-    timex.offset = state.offset;
-    timex.freq = state.freq;
-    timex.maxerror = state.maxerror;
-    timex.esterror = state.esterror;
-    timex.status = state.status;
-    timex.constant = state.constant;
-    timex.precision = state.precision;
-    timex.tolerance = state.tolerance;
-    timex.time = timeval::from_time_value(wall_time());
-    timex.tick = state.tick;
+/// Fills the `struct __kernel_timex` fields `ntp_adjtimex()` overwrites
+/// (`kernel/time/ntp.c:809-829`).
+///
+/// `modes` is deliberately left alone: Linux never writes it back, so the
+/// caller keeps exactly the bits it passed.  Without `CONFIG_NTP_PPS`,
+/// `pps_fill_timex()` zeroes the PPS fields (`kernel/time/ntp.c:232-244`).
+fn fill_timex_output(
+    timex: &mut KernelOldTimex,
+    status: i32,
+    output: &linux_time::TimexOutput,
+    sampled: TimeValue,
+) {
+    timex.offset = output.offset;
+    timex.freq = output.freq;
+    timex.maxerror = output.maxerror;
+    timex.esterror = output.esterror;
+    timex.status = output.status;
+    timex.constant = output.constant;
+    timex.precision = output.precision;
+    timex.tolerance = output.tolerance;
+    // `timex.time` reports the wall clock sampled before any `ADJ_SETOFFSET`
+    // discontinuity, and carries nanoseconds in `tv_usec` only in nanosecond
+    // resolution (`kernel/time/ntp.c:829-831`).
+    timex.time = timeval::from_time_value(sampled);
+    if status & linux_time::STA_NANO != 0 {
+        timex.time.tv_usec = sampled.subsec_nanos() as _;
+    }
+    timex.tick = output.tick;
     timex.ppsfreq = 0;
     timex.jitter = 0;
     timex.shift = 0;
@@ -368,11 +391,13 @@ fn fill_timex_output(timex: &mut KernelOldTimex, plan: linux_time::TimexRenderPl
     timex.calcnt = 0;
     timex.errcnt = 0;
     timex.stbcnt = 0;
-    timex.tai = state.tai;
+    timex.tai = output.tai;
 }
 
-fn timex_input(timex: &KernelOldTimex) -> linux_time::Timex {
-    linux_time::Timex {
+/// The `struct __kernel_timex` fields `do_adjtimex(2)` reads
+/// (`kernel/time/ntp.c:728-756`).
+fn timex_request(timex: &KernelOldTimex) -> linux_time::TimexRequest {
+    linux_time::TimexRequest {
         modes: timex.modes,
         offset: timex.offset,
         freq: timex.freq,
@@ -380,98 +405,133 @@ fn timex_input(timex: &KernelOldTimex) -> linux_time::Timex {
         esterror: timex.esterror,
         status: timex.status,
         constant: timex.constant,
-        precision: timex.precision,
-        tolerance: timex.tolerance,
         tick: timex.tick,
-        tai: timex.tai,
+        time_sec: timex.time.tv_sec,
+        time_usec: timex.time.tv_usec,
     }
 }
 
-fn sys_do_clock_adjtime<M: UserMemory + ?Sized>(
-    memory: &mut UserMemoryContext<'_, M>,
+/// Wake-alarm admission for every entry point that names
+/// `CLOCK_REALTIME_ALARM`/`CLOCK_BOOTTIME_ALARM`.
+///
+/// The rule itself (`rtc_available` then `CAP_WAKE_ALARM`, or capability only
+/// for `timerfd_create(2)`) lives in `tk_linux_time::admit_wake_alarm`; only
+/// the errno differs between entry points, and it differs in Linux too:
+/// `clock_gettime(2)`/`clock_getres(2)` report a missing RTC as EINVAL
+/// (`kernel/time/alarmtimer.c:600-620`), `timer_create(2)` and
+/// `clock_nanosleep(2)` as EOPNOTSUPP (`kernel/time/alarmtimer.c:651-665,766-790`),
+/// and every arming path reports a missing capability as EPERM.
+pub(crate) fn wake_alarm_admission(
     clock_id: __kernel_clockid_t,
-    timex_ptr: *mut KernelOldTimex,
-) -> AxResult<isize> {
-    let mut timex = unsafe {
-        VmPtr::vm_read_uninit(timex_ptr, memory)
-            .map_err(map_usercopy_error)?
-            .assume_init()
-    };
+    usage: linux_time::WakeAlarmUse,
+) -> AxResult<()> {
+    let rtc_available = crate::pseudofs::dev::rtc::is_available();
+    let cap_wake_alarm = current()
+        .as_thread()
+        .has_effective_capability(CAP_WAKE_ALARM);
+    match linux_time::admit_wake_alarm(clock_id, usage, rtc_available, cap_wake_alarm) {
+        Ok(()) => Ok(()),
+        Err(linux_time::WakeAlarmReject::NoRtc) => Err(match usage {
+            linux_time::WakeAlarmUse::Read => AxError::InvalidInput,
+            linux_time::WakeAlarmUse::Arm | linux_time::WakeAlarmUse::TimerFd => {
+                AxError::OperationNotSupported
+            }
+        }),
+        Err(linux_time::WakeAlarmReject::NotPermitted) => Err(AxError::OperationNotPermitted),
+    }
+}
+
+/// Maps a timex policy rejection onto the Linux errno.
+///
+/// `timekeeping_validate_timex()` returns `-EPERM` only for a missing
+/// `CAP_SYS_TIME`; every other rejection, including the wall-clock bounds of
+/// `do_settimeofday64()`, is `-EINVAL`
+/// (`kernel/time/timekeeping.c:2830-2901,1665-1690`).
+fn map_timex_reject(reject: linux_time::Reject) -> AxError {
+    match reject {
+        linux_time::Reject::NotPermitted => AxError::OperationNotPermitted,
+        _ => AxError::InvalidInput,
+    }
+}
+
+/// The shared `do_adjtimex()` body (`kernel/time/timekeeping.c:2930-2991`)
+/// used by `adjtimex(2)` and `clock_adjtime(2)`.
+///
+/// The two syscalls differ only in their userspace copy-out policy, which the
+/// wrappers implement.  All validation, including the `CAP_SYS_TIME` decision
+/// and the `ADJ_ADJTIME`/`ADJ_OFFSET_SINGLESHOT` ordering, is
+/// `linux_time::adjust()`'s, because those orderings are observable.
+fn clock_adjtime_core(clock_id: __kernel_clockid_t, timex: &mut KernelOldTimex) -> AxResult<isize> {
     if !clock_adjtime_is_realtime(clock_id)? {
         return Err(AxError::OperationNotSupported);
     }
-    let modes = timex.modes;
-    let privileged = current().as_thread().has_effective_capability(CAP_SYS_TIME);
-
-    if !privileged && modes != 0 && modes != linux_time::ADJ_OFFSET_SS_READ {
-        return Err(AxError::OperationNotPermitted);
-    }
+    let request = timex_request(timex);
+    let authority = linux_time::TimexAuthority {
+        cap_sys_time: current().as_thread().has_effective_capability(CAP_SYS_TIME),
+    };
+    // Linux samples the wall clock once, before the `ADJ_SETOFFSET` injection,
+    // and reports that sample back in `timex.time`.
+    let sampled = wall_time();
 
     let _tai_timer_gate = TAI_TIMER_REBASE_GATE.lock();
-    let state = TIMEX_STATE.lock();
-    let previous_tai = state.value.tai;
-    let mut next_state = *state;
-    if modes != 0 {
-        let (tick_min, tick_max) = timex_tick_bounds();
-        let adjustment = linux_time::plan_adjust(
-            timex_input(&timex),
-            linux_time::TimexSnapshot {
-                version: next_state.version,
-                value: next_state.value,
-                tick_min,
-                tick_max,
-            },
+    let (output, result, previous_tai, next, changed) = {
+        let state = TIMEX_STATE.lock();
+        let update =
+            linux_time::adjust(&state.value, &request, authority).map_err(map_timex_reject)?;
+        let previous_tai = state.value.tai;
+        let next = if update.changed {
+            TimexState {
+                version: state.version.checked_add(1).ok_or(AxError::OutOfRange)?,
+                value: update.next,
+            }
+        } else {
+            *state
+        };
+        (
+            update.output,
+            update.result,
+            previous_tai,
+            next,
+            update.changed,
         )
-        .map_err(|_| AxError::InvalidInput)?;
-        if modes != linux_time::ADJ_OFFSET_SS_READ {
-            let committed = linux_time::commit_adjust(
-                adjustment,
-                linux_time::TimexSnapshot {
-                    version: next_state.version,
-                    value: next_state.value,
-                    tick_min,
-                    tick_max,
-                },
-            )
-            .map_err(|_| AxError::InvalidInput)?;
-            next_state.version = committed.version;
-            next_state.value = committed.value;
-        }
+    };
+
+    // `ADJ_SETOFFSET` injects a wall-clock discontinuity before the modes take
+    // effect (`kernel/time/timekeeping.c:2955-2966`).  The target is validated
+    // against `timespec64_valid_settod()` and the CLOCK_MONOTONIC floor, so an
+    // impossible injection fails without publishing the timex state.
+    if request.modes & linux_time::ADJ_SETOFFSET != 0 {
+        let target = wall_time().as_nanos() as i128 + linux_time::setoffset_delta_ns(&request);
+        linux_time::validate_settime_target(target, monotonic_time_nanos() as i128)
+            .map_err(map_timex_reject)?;
+        // The bound above proves the value fits the wall-clock model.
+        set_wall_time(TimeValue::from_nanos(target as u64))?;
     }
 
-    let render = linux_time::render(linux_time::TimexSnapshot {
-        version: next_state.version,
-        value: next_state.value,
-        tick_min: 0,
-        tick_max: 0,
-    });
-    fill_timex_output(&mut timex, render);
-    let tai_rebase = (next_state.value.tai != previous_tai)
-        .then_some((next_state.version, next_state.value.tai));
+    let tai_rebase = (next.value.tai != previous_tai).then_some((next.version, next.value.tai));
     // Timex and timer owners deliberately have opposing readers: firing and
     // gettime sample the TAI state while holding a timer owner.  Prepare the
     // complete allocation budget before publication, but never hold TIMEX
     // while acquiring those owners.
-    drop(state);
     let rebase_plan = tai_rebase
         .map(|_| crate::task::prepare_tai_absolute_posix_timer_rebase())
         .transpose()?;
-    let mut state = TIMEX_STATE.lock();
-    // The TAI gate excludes another adjusting writer, so the candidate built
-    // above remains current while the preflight allocation ran.
-    state.version = next_state.version;
-    state.value = next_state.value;
-    drop(state);
-    if let (Some((generation, offset_seconds)), Some(plan)) = (tai_rebase, rebase_plan) {
-        plan.apply(generation, offset_seconds as i64);
+    if changed {
+        let mut state = TIMEX_STATE.lock();
+        // The TAI gate excludes another adjusting writer, so the candidate
+        // built above remains current while the preflight allocation ran.
+        state.version = next.version;
+        state.value = next.value;
+        drop(state);
+    }
+    if let (Some((generation, tai)), Some(plan)) = (tai_rebase, rebase_plan) {
+        plan.apply(generation, tai as i64);
         TAI_CLOCK_CHANGES.wake();
     }
     drop(_tai_timer_gate);
-    // SAFETY: `timex` was initialized by the preceding copy-in and every
-    // field update preserves its fully initialized object representation.
-    unsafe { VmMutPtr::vm_write_unchecked(timex_ptr, memory, timex) }
-        .map_err(map_usercopy_error)?;
-    Ok(render.time_state as isize)
+
+    fill_timex_output(timex, output.status, &output, sampled);
+    Ok(result as isize)
 }
 
 fn posix_timer_clock(clock_id: __kernel_clockid_t) -> AxResult<PosixTimerClock> {
@@ -558,11 +618,19 @@ fn decode_timer_notify(event: Option<RawSigevent>) -> AxResult<PosixTimerNotify>
                 value: Some(event.value_ptr_address()),
             })
         }
-        // SIGEV_THREAD is a libc facility, not a kernel timer notification
-        // mode.  Glibc maps it to an internal SIGEV_THREAD_ID timer and runs
-        // the callback in userspace; accepting it here as a process-directed
-        // signal silently loses that contract.
-        SIGEV_THREAD => Err(AxError::InvalidInput),
+        // Linux accepts SIGEV_THREAD and treats it exactly like SIGEV_SIGNAL
+        // with thread-group delivery (`good_sigevent()`,
+        // kernel/time/posix-timers.c:404-420): the C library is what turns the
+        // notification into a callback thread, and the kernel only validates
+        // the signal number.
+        SIGEV_THREAD => {
+            let signo = decode_sigevent_signo(event.signo())?;
+            Ok(PosixTimerNotify::Signal {
+                signo,
+                target_tid: None,
+                value: Some(event.value_ptr_address()),
+            })
+        }
         SIGEV_THREAD_ID => {
             let signo = decode_sigevent_signo(event.signo())?;
             let tid = event.thread_id();
@@ -766,11 +834,6 @@ pub fn sys_timer_create<M: UserMemory + ?Sized>(
     let mut notify = decode_timer_notify(event)?;
     let curr = current();
     let thread = curr.as_thread();
-    if matches!(clock_id as u32, CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM)
-        && !thread.has_effective_capability(CAP_WAKE_ALARM)
-    {
-        return Err(AxError::OperationNotPermitted);
-    }
     if let PosixTimerNotify::Signal {
         target_tid: Some(tid),
         ..
@@ -816,19 +879,30 @@ pub fn sys_timer_create<M: UserMemory + ?Sized>(
         }
     };
 
+    // The slot remains deliberately unpublished while copyout or admission may
+    // fail.  Other threads reject operations on it, so rollback cannot delete a
+    // timer that another thread has observed or recreated.
+    let retire = |timerid: usize| {
+        let mut timers = proc_data.posix_timers.lock();
+        let slot = timers
+            .get_mut(timerid)
+            .expect("reserved POSIX timer slot disappeared during admission");
+        debug_assert!(slot.as_ref().is_some_and(|timer| !timer.is_published()));
+        slot.take()
+    };
+
     if let Err(error) = write_timer_id(memory, timerid_ptr, timerid as i32) {
-        // The slot remains deliberately unpublished while copyout may fault.
-        // Other threads reject operations on it, so rollback cannot delete a
-        // timer that another thread has observed or recreated.
-        let retired = {
-            let mut timers = proc_data.posix_timers.lock();
-            let slot = timers
-                .get_mut(timerid)
-                .expect("reserved POSIX timer slot disappeared during copyout");
-            debug_assert!(slot.as_ref().is_some_and(|timer| !timer.is_published()));
-            slot.take()
-        };
-        drop(retired);
+        drop(retire(timerid));
+        return Err(error);
+    }
+
+    // Linux completes the clock-specific admission only after the identifier
+    // has been copied out (`do_timer_create()`, kernel/time/posix-timers.c:537-548):
+    // the id is already visible to the caller when an alarm clock is refused,
+    // and the refusal is EOPNOTSUPP without an RTC before EPERM without
+    // CAP_WAKE_ALARM (`alarm_timer_create()`, kernel/time/alarmtimer.c:651-665).
+    if let Err(error) = wake_alarm_admission(clock_id, linux_time::WakeAlarmUse::Arm) {
+        drop(retire(timerid));
         return Err(error);
     }
     {
@@ -995,6 +1069,12 @@ pub fn sys_timer_getoverrun(timerid: i32) -> AxResult<isize> {
     }
 
     let proc_data = current().as_thread().proc_data.clone();
+    // Linux reports `it_overrun_last`, the overrun of the notification that
+    // was actually delivered, and zero until one is (`timer_getoverrun()`,
+    // kernel/time/posix-timers.c:279-289; `common_timer_set()` initializes it,
+    // kernel/time/posix-timers.c:882-883).  The accumulating overrun that a
+    // still-pending notification carries is reported through `si_overrun`
+    // instead.
     let overrun = {
         let timers = proc_data.posix_timers.lock();
         timers
@@ -1002,7 +1082,7 @@ pub fn sys_timer_getoverrun(timerid: i32) -> AxResult<isize> {
             .and_then(Option::as_ref)
             .filter(|timer| timer.is_published())
             .ok_or(AxError::InvalidInput)?
-            .overrun
+            .overrun_last
     };
     Ok(overrun as isize)
 }
@@ -1035,6 +1115,10 @@ pub fn sys_clock_gettime<M: UserMemory + ?Sized>(
     clock_id: __kernel_clockid_t,
     ts: *mut timespec,
 ) -> AxResult<isize> {
+    // `clock_gettime(2)` on a wake-alarm clock reports EINVAL when the kernel
+    // has no RTC, before the clock is read (`alarm_clock_get_timespec()`,
+    // kernel/time/alarmtimer.c:600-620); reading needs no capability.
+    wake_alarm_admission(clock_id, linux_time::WakeAlarmUse::Read)?;
     let now = clock_now(clock_id)?;
     // SAFETY: `timespec` is two initialized integer words on the x86_64 Linux
     // ABI; the layout assertions above cover the complete object extent.
@@ -1066,6 +1150,10 @@ pub fn sys_gettimeofday<M: UserMemory + ?Sized>(
             .map_err(map_usercopy_error)?;
     }
     if let Some(tz) = VmPtr::nullable(tz) {
+        // Linux reports the single process-wide timezone retained by
+        // settimeofday(2) in `sys_tz` (`kernel/time/time.c:140-155`); it stays
+        // zero until userspace sets one, and no clock reads it.
+        let retained = system_timezone();
         // SAFETY: `timezone` contains only its two initialized i32 fields;
         // generated linux_raw_sys layout is asserted by the compiler below.
         unsafe {
@@ -1073,8 +1161,8 @@ pub fn sys_gettimeofday<M: UserMemory + ?Sized>(
                 tz,
                 memory,
                 timezone {
-                    tz_minuteswest: 0,
-                    tz_dsttime: 0,
+                    tz_minuteswest: retained.minutes_west,
+                    tz_dsttime: retained.dst_time,
                 },
             )
         }
@@ -1108,19 +1196,49 @@ pub fn sys_settimeofday<M: UserMemory + ?Sized>(
         None
     };
 
-    let ts = ts.map(TimeValueLike::try_into_time_value).transpose()?;
+    // `settimeofday(2)` validates only the sub-second field before it reads
+    // the timezone, so a malformed `tv_usec` is EINVAL even when `tz` would
+    // fault; the seconds are validated later by `timespec64_valid_settod()`
+    // (`kernel/time/time.c:199-222`).
+    let requested_nanos = ts
+        .map(|ts| -> AxResult<i128> {
+            if !(0..1_000_000).contains(&ts.tv_usec) {
+                return Err(AxError::InvalidInput);
+            }
+            Ok(ts.tv_sec as i128 * NANOS_PER_SEC as i128 + ts.tv_usec as i128 * 1_000)
+        })
+        .transpose()?;
+
+    // `timespec64_valid_settod()` runs before the capability test while the
+    // CLOCK_MONOTONIC floor runs after it (`kernel/time/time.c:174-197`,
+    // `kernel/time/timekeeping.c:1665-1690`), so only the bound is checked
+    // here and the floor is applied once the timezone has been retained.
+    if let Some(requested_nanos) = requested_nanos {
+        linux_time::validate_settime_bound(requested_nanos).map_err(map_timex_reject)?;
+    }
+
     if !current().as_thread().has_effective_capability(CAP_SYS_TIME) {
         return Err(AxError::OperationNotPermitted);
     }
 
-    if let Some(tz) = tz
-        && (tz.tz_minuteswest < -15 * 60 || tz.tz_minuteswest > 15 * 60)
-    {
-        return Err(AxError::InvalidInput);
+    if let Some(tz) = tz {
+        if tz.tz_minuteswest < -15 * 60 || tz.tz_minuteswest > 15 * 60 {
+            return Err(AxError::InvalidInput);
+        }
+        // `sys_tz` is stored before the wall clock is touched, so a rejected
+        // time still leaves the retained timezone changed
+        // (`kernel/time/time.c:205-222`).
+        set_system_timezone(SystemTimezone {
+            minutes_west: tz.tz_minuteswest,
+            dst_time: tz.tz_dsttime,
+        });
     }
 
-    if let Some(ts) = ts {
-        set_wall_time(ts)?;
+    if let Some(requested_nanos) = requested_nanos {
+        linux_time::validate_settime_floor(requested_nanos, monotonic_time_nanos() as i128)
+            .map_err(map_timex_reject)?;
+        // The bound above proves the value fits the wall-clock model.
+        set_wall_time(TimeValue::from_nanos(requested_nanos as u64))?;
     }
     Ok(0)
 }
@@ -1130,6 +1248,9 @@ pub fn sys_clock_getres<M: UserMemory + ?Sized>(
     clock_id: __kernel_clockid_t,
     res: *mut timespec,
 ) -> AxResult<isize> {
+    // As for clock_gettime(2): a wake-alarm clock does not exist without an
+    // RTC (`alarm_clock_getres()`, kernel/time/alarmtimer.c:600-620).
+    wake_alarm_admission(clock_id, linux_time::WakeAlarmUse::Read)?;
     let resolution = clock_resolution(clock_id)?;
     if let Some(res) = VmPtr::nullable(res) {
         // SAFETY: `timespec` is a fully initialized two-word ABI value.
@@ -1144,22 +1265,30 @@ pub fn sys_clock_settime<M: UserMemory + ?Sized>(
     clock_id: __kernel_clockid_t,
     ts: *const timespec,
 ) -> AxResult<isize> {
-    match clock_id as u32 {
-        CLOCK_REALTIME => {
-            let ts = unsafe {
-                VmPtr::vm_read_uninit(ts, memory)
-                    .map_err(map_usercopy_error)?
-                    .assume_init()
-            }
-            .try_into_time_value()?;
-            if !current().as_thread().has_effective_capability(CAP_SYS_TIME) {
-                return Err(AxError::OperationNotPermitted);
-            }
-            set_wall_time(ts)?;
-            Ok(0)
-        }
-        _ => Err(AxError::InvalidInput),
+    // `clock_settime(2)` validates the clock id before copying the value in,
+    // because only the realtime clock has a setter
+    // (`kernel/time/posix-timers.c:1123-1140`).
+    if clock_id as u32 != CLOCK_REALTIME {
+        return Err(AxError::InvalidInput);
     }
+    let requested = unsafe {
+        VmPtr::vm_read_uninit(ts, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    }
+    .try_into_time_value()?;
+    let requested_nanos = requested.as_nanos() as i128;
+    // `do_sys_settimeofday64()` validates the wall-clock bound before the
+    // `CAP_SYS_TIME` test and applies the CLOCK_MONOTONIC floor afterwards
+    // (`kernel/time/time.c:174-197`, `kernel/time/timekeeping.c:1665-1690`).
+    linux_time::validate_settime_bound(requested_nanos).map_err(map_timex_reject)?;
+    if !current().as_thread().has_effective_capability(CAP_SYS_TIME) {
+        return Err(AxError::OperationNotPermitted);
+    }
+    linux_time::validate_settime_floor(requested_nanos, monotonic_time_nanos() as i128)
+        .map_err(map_timex_reject)?;
+    set_wall_time(requested)?;
+    Ok(0)
 }
 
 pub fn sys_clock_adjtime<M: UserMemory + ?Sized>(
@@ -1167,14 +1296,39 @@ pub fn sys_clock_adjtime<M: UserMemory + ?Sized>(
     clock_id: __kernel_clockid_t,
     timex_ptr: *mut KernelOldTimex,
 ) -> AxResult<isize> {
-    sys_do_clock_adjtime(memory, clock_id, timex_ptr)
+    // `clock_adjtime(2)` copies the timex in first and, unlike `adjtimex(2)`,
+    // copies it back only when the operation succeeded
+    // (`kernel/time/posix-timers.c:1172-1187`).
+    let mut timex = unsafe {
+        VmPtr::vm_read_uninit(timex_ptr, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
+    let result = clock_adjtime_core(clock_id, &mut timex)?;
+    // SAFETY: `timex` was initialized by the copy-in above and every field
+    // update preserves its fully initialized object representation.
+    unsafe { VmMutPtr::vm_write_unchecked(timex_ptr, memory, timex) }
+        .map_err(map_usercopy_error)?;
+    Ok(result)
 }
 
 pub fn sys_adjtimex<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     timex_ptr: *mut KernelOldTimex,
 ) -> AxResult<isize> {
-    sys_do_clock_adjtime(memory, CLOCK_REALTIME as _, timex_ptr)
+    // `adjtimex(2)` always copies the timex back, even when the operation
+    // failed, and replaces that failure with EFAULT if the copy fails
+    // (`kernel/time/time.c:269-282`).
+    let mut timex = unsafe {
+        VmPtr::vm_read_uninit(timex_ptr, memory)
+            .map_err(map_usercopy_error)?
+            .assume_init()
+    };
+    let result = clock_adjtime_core(CLOCK_REALTIME as _, &mut timex);
+    // SAFETY: as above; a failed operation leaves every field initialized.
+    unsafe { VmMutPtr::vm_write_unchecked(timex_ptr, memory, timex) }
+        .map_err(map_usercopy_error)?;
+    result
 }
 
 #[repr(C)]
@@ -1637,34 +1791,206 @@ mod tests {
         );
     }
 
+    /// Encodes a CPU clock the way `MAKE_PROCESS_CPUCLOCK`/`MAKE_THREAD_CPUCLOCK`
+    /// do in `include/uapi/linux/posix-timers.h`.
+    fn encoded_cpu_clock(tid: i32, which: i32, per_thread: bool) -> __kernel_clockid_t {
+        (!tid << 3)
+            | which
+            | if per_thread {
+                CPUCLOCK_PERTHREAD_MASK
+            } else {
+                0
+            }
+    }
+
+    #[test]
+    fn clock_resolution_matches_linux_cpu_and_coarse_clocks() {
+        let tick = axconfig::TICKS_PER_SEC as u64;
+        let accounting = linux_time::accounting_tick_resolution_nanos(tick as u32);
+        // The plain CPU clock ids are the scheduler clock, which Linux reports
+        // as one nanosecond, as are their CPUCLOCK_SCHED encodings.
+        assert_eq!(
+            clock_resolution(CLOCK_PROCESS_CPUTIME_ID as __kernel_clockid_t)
+                .unwrap()
+                .as_nanos(),
+            1
+        );
+        assert_eq!(
+            clock_resolution(CLOCK_THREAD_CPUTIME_ID as __kernel_clockid_t)
+                .unwrap()
+                .as_nanos(),
+            1
+        );
+        assert_eq!(
+            clock_resolution(encoded_cpu_clock(1, CPUCLOCK_SCHED, true))
+                .unwrap()
+                .as_nanos(),
+            1
+        );
+        assert_eq!(
+            clock_resolution(encoded_cpu_clock(1, CPUCLOCK_SCHED, false))
+                .unwrap()
+                .as_nanos(),
+            1
+        );
+        // The encoded PROF and VIRT clocks are charged once per tick, so their
+        // resolution is the rounded-up accounting tick.
+        for per_thread in [true, false] {
+            for which in [CPUCLOCK_PROF, CPUCLOCK_VIRT] {
+                assert_eq!(
+                    clock_resolution(encoded_cpu_clock(1, which, per_thread))
+                        .unwrap()
+                        .as_nanos() as u64,
+                    accounting
+                );
+            }
+        }
+        assert_eq!(
+            clock_resolution(CLOCK_MONOTONIC as __kernel_clockid_t)
+                .unwrap()
+                .as_nanos(),
+            1
+        );
+        assert_eq!(
+            clock_resolution(CLOCK_MONOTONIC_COARSE as __kernel_clockid_t)
+                .unwrap()
+                .as_nanos() as u64,
+            (NANOS_PER_SEC / tick).max(1)
+        );
+        // A CLOCKFD encoding is not a clock id at all.
+        assert_eq!(
+            clock_resolution(!987 << 3 | CLOCKFD),
+            Err(AxError::InvalidInput)
+        );
+    }
+
     #[test]
     fn timex_planner_accepts_legacy_singleshot_modes() {
-        let snapshot = linux_time::TimexSnapshot {
-            version: 0,
-            value: linux_time::Timex::default(),
-            tick_min: 0,
-            tick_max: i64::MAX,
+        // The two legacy adjtime(3) spellings stay accepted by the policy
+        // layer: ADJ_ADJTIME must be accompanied by the singleshot bit, and
+        // ADJ_OFFSET_SS_READ is that same request in read-only form.
+        for modes in [
+            linux_time::ADJ_ADJTIME | linux_time::ADJ_OFFSET_SINGLESHOT,
+            linux_time::ADJ_OFFSET_SS_READ,
+        ] {
+            let request = linux_time::TimexRequest {
+                modes,
+                ..linux_time::TimexRequest::default()
+            };
+            assert!(
+                linux_time::adjust(
+                    &linux_time::TimexState::INITIAL,
+                    &request,
+                    linux_time::TimexAuthority { cap_sys_time: true },
+                )
+                .is_ok()
+            );
+        }
+        // A bare ADJ_ADJTIME is the one illegal combination.
+        let request = linux_time::TimexRequest {
+            modes: linux_time::ADJ_ADJTIME,
+            ..linux_time::TimexRequest::default()
         };
-        assert!(
-            linux_time::plan_adjust(
-                linux_time::Timex {
-                    modes: linux_time::ADJ_OFFSET_SINGLESHOT,
-                    ..linux_time::Timex::default()
-                },
-                snapshot,
-            )
-            .is_ok()
+        assert_eq!(
+            linux_time::adjust(
+                &linux_time::TimexState::INITIAL,
+                &request,
+                linux_time::TimexAuthority { cap_sys_time: true },
+            ),
+            Err(linux_time::Reject::InvalidMode)
         );
-        assert!(
-            linux_time::plan_adjust(
-                linux_time::Timex {
-                    modes: linux_time::ADJ_OFFSET_SS_READ,
-                    ..linux_time::Timex::default()
-                },
-                snapshot,
-            )
-            .is_ok()
+    }
+
+    #[test]
+    fn timex_request_maps_every_input_field() {
+        // SAFETY: `KernelOldTimex` is a plain C record and zero is a valid
+        // representation for each of its fields.
+        let mut timex: KernelOldTimex = unsafe { core::mem::zeroed() };
+        timex.modes = linux_time::ADJ_OFFSET | linux_time::ADJ_NANO;
+        timex.offset = -4321;
+        timex.freq = 65_536;
+        timex.maxerror = 1;
+        timex.esterror = 2;
+        timex.status = linux_time::STA_PLL;
+        timex.constant = 3;
+        timex.tick = 10_000;
+        timex.time = timeval {
+            tv_sec: 11,
+            tv_usec: 22,
+        };
+
+        let request = timex_request(&timex);
+        assert_eq!(request.modes, linux_time::ADJ_OFFSET | linux_time::ADJ_NANO);
+        assert_eq!(request.offset, -4321);
+        assert_eq!(request.freq, 65_536);
+        assert_eq!(request.maxerror, 1);
+        assert_eq!(request.esterror, 2);
+        assert_eq!(request.status, linux_time::STA_PLL);
+        assert_eq!(request.constant, 3);
+        assert_eq!(request.tick, 10_000);
+        assert_eq!(request.time_sec, 11);
+        assert_eq!(request.time_usec, 22);
+    }
+
+    #[test]
+    fn timex_output_keeps_modes_and_renders_resolution_correct_time() {
+        let output = linux_time::TimexOutput {
+            offset: 1,
+            freq: 2,
+            maxerror: 3,
+            esterror: 4,
+            status: linux_time::STA_NANO,
+            constant: 5,
+            precision: 1,
+            tolerance: linux_time::TOLERANCE,
+            tick: 10_000,
+            tai: 7,
+        };
+        let sampled = TimeValue::new(1, 123_456_789);
+        // SAFETY: as above.
+        let mut timex: KernelOldTimex = unsafe { core::mem::zeroed() };
+        timex.modes = 0x5a5a;
+
+        fill_timex_output(&mut timex, output.status, &output, sampled);
+
+        // Linux never writes `modes` back, so the caller keeps its own bits.
+        assert_eq!(timex.modes, 0x5a5a);
+        assert_eq!(timex.offset, 1);
+        assert_eq!(timex.freq, 2);
+        assert_eq!(timex.maxerror, 3);
+        assert_eq!(timex.esterror, 4);
+        assert_eq!(timex.status, linux_time::STA_NANO);
+        assert_eq!(timex.constant, 5);
+        assert_eq!(timex.precision, 1);
+        assert_eq!(timex.tolerance, linux_time::TOLERANCE);
+        assert_eq!(timex.tick, 10_000);
+        assert_eq!(timex.tai, 7);
+        // Nanosecond resolution carries the sub-second value in `tv_usec`.
+        assert_eq!(timex.time.tv_sec, 1);
+        assert_eq!(timex.time.tv_usec, 123_456_789);
+
+        // Without STA_NANO the same instant renders in microseconds.
+        fill_timex_output(&mut timex, 0, &output, sampled);
+        assert_eq!(timex.time.tv_sec, 1);
+        assert_eq!(timex.time.tv_usec, 123_456);
+    }
+
+    #[test]
+    fn timex_rejections_map_to_linux_errnos() {
+        assert_eq!(
+            map_timex_reject(linux_time::Reject::NotPermitted),
+            AxError::OperationNotPermitted
         );
+        for reject in [
+            linux_time::Reject::InvalidClock,
+            linux_time::Reject::InvalidTime,
+            linux_time::Reject::Overflow,
+            linux_time::Reject::UnsupportedSetClock,
+            linux_time::Reject::InvalidMode,
+            linux_time::Reject::TimeBeforeMonotonic,
+        ] {
+            assert_eq!(map_timex_reject(reject), AxError::InvalidInput);
+        }
     }
 
     #[test]

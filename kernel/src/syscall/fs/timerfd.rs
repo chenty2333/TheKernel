@@ -6,8 +6,9 @@ use core::{
 use axerrno::{AxError, AxResult};
 use bitflags::bitflags;
 use linux_raw_sys::general::{
-    CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, O_NONBLOCK, O_RDWR, TFD_CLOEXEC, TFD_NONBLOCK,
-    TFD_TIMER_ABSTIME, TFD_TIMER_CANCEL_ON_SET, itimerspec, timespec,
+    CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC, CLOCK_REALTIME, CLOCK_REALTIME_ALARM,
+    O_NONBLOCK, O_RDWR, TFD_CLOEXEC, TFD_NONBLOCK, TFD_TIMER_ABSTIME, TFD_TIMER_CANCEL_ON_SET,
+    itimerspec, timespec,
 };
 use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
@@ -44,6 +45,12 @@ fn validate_clockid(clockid: i32) -> AxResult<crate::file::timerfd::TimerClock> 
         CLOCK_REALTIME => Ok(crate::file::timerfd::TimerClock::Realtime),
         CLOCK_MONOTONIC => Ok(crate::file::timerfd::TimerClock::Monotonic),
         CLOCK_BOOTTIME => Ok(crate::file::timerfd::TimerClock::Boottime),
+        // The wake-alarm clocks expire on the same realtime/boottime timeline
+        // through the alarm timer subsystem (`timerfd_setup()`, fs/timerfd.c:245-252).
+        // TheKernel has no suspend state to wake from, so the base clock is the
+        // whole observable behavior.
+        CLOCK_REALTIME_ALARM => Ok(crate::file::timerfd::TimerClock::Realtime),
+        CLOCK_BOOTTIME_ALARM => Ok(crate::file::timerfd::TimerClock::Boottime),
         _ => Err(AxError::InvalidInput),
     }
 }
@@ -69,6 +76,11 @@ pub fn sys_timerfd_create(clockid: i32, flags: u32) -> AxResult<isize> {
 
     let clock = validate_clockid(clockid)?;
     let flags = TimerFdCreateFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
+    // `timerfd_create(2)` admits the wake-alarm clocks with a capability check
+    // only: it accepts the flags and clock first (EINVAL), then requires
+    // CAP_WAKE_ALARM (EPERM), and never tests RTC availability
+    // (`fs/timerfd.c:433-444`).
+    crate::syscall::time::wake_alarm_admission(clockid, tk_linux_time::WakeAlarmUse::TimerFd)?;
 
     let tfd = TimerFd::try_new(clock)?;
     tfd.set_nonblocking(flags.contains(TimerFdCreateFlags::NONBLOCK))?;
