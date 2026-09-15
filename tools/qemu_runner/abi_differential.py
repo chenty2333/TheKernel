@@ -111,7 +111,7 @@ CONTRACTS.update({
     "arch_prctl": ("raw-differential", "pass", "SEGMENT_BASE_EPERM"),
     "iopl": ("raw-differential", "pass", "LEVEL_AND_LOWERING"),
     "capset": ("raw-differential", "pass", "PID_BEFORE_COPY"),
-    "move_pages": ("raw-differential", "pass", "EMPTY_REQUEST_AND_FLAGS"),
+    "move_pages": ("raw-differential", "pass", "EMPTY_REQUEST_AND_FLAGS STAT_NODE_VERDICTS"),
     "modify_ldt": ("raw-differential", "pass", "DEFAULT_LDT WRITE_RULES"),
     "setpgid": ("raw-differential", "pass", "CHILD_OWN_GROUP EXEC_EACCES"),
     "clone3": ("raw-differential", "pass", "FLAG_ADMISSION NEWTIME AUTOREAP"),

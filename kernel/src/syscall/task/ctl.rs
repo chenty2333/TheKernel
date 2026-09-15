@@ -1480,6 +1480,45 @@ fn numa_page_node(target: &ProcessData, page: usize) -> AxResult<i32> {
     Ok(mempolicy_page_node(policy, start.as_usize()))
 }
 
+/// `do_pages_stat_array()`'s per-page verdict (`mm/migrate.c:2447-2481`).
+///
+/// The two ways a page can have no node are distinct, and the difference is
+/// visible to the caller:
+///
+/// 	vma = vma_lookup(mm, addr);
+/// 	if (!vma)
+/// 		goto set_status;          /* err stays -EFAULT */
+///
+/// 	folio = folio_walk_start(&fw, vma, addr, FW_ZEROPAGE);
+/// 	if (folio) {
+/// 		...
+/// 	} else {
+/// 		err = -ENOENT;
+/// 	}
+///
+/// So a hole is `-EFAULT`, while a page inside a VMA whose folio the walk
+/// cannot resolve is `-ENOENT` -- which is what a `PROT_NONE` mapping and a
+/// mapping whose page has never been faulted in both report.  Only the stat
+/// path uses this: `do_pages_move()` turns every failure of
+/// `add_page_for_migration()` into `-EFAULT` (`mm/migrate.c:2398-2401`).
+fn numa_page_stat_status(target: &ProcessData, page: usize) -> i32 {
+    let start = VirtAddr::from(page).align_down_4k();
+    let aspace_handle = target.aspace();
+    let aspace = aspace_handle.lock();
+    if aspace.find_area(start).is_none() {
+        return -LinuxError::EFAULT.code();
+    }
+    if !aspace.can_access_range(start, 1, MappingFlags::USER)
+        || aspace.page_table().query(start).is_err()
+    {
+        return -LinuxError::ENOENT.code();
+    }
+    let policy = target
+        .mempolicy_for_addr(start.as_usize())
+        .unwrap_or_else(|| target.mempolicy());
+    mempolicy_page_node(policy, start.as_usize())
+}
+
 fn numa_page_is_shareable(target: &ProcessData, page: usize) -> bool {
     let start = VirtAddr::from(page).align_down_4k();
     let aspace_handle = target.aspace();
@@ -2137,25 +2176,30 @@ pub fn sys_move_pages<M: UserMemory + ?Sized>(
         for chunk_index in 0..chunk_len {
             let index = offset + chunk_index;
             let page = unsafe { page_values[chunk_index].assume_init() };
-            let status_value = match numa_page_node(&target, page) {
-                Ok(current_node) if nodes.is_null() => current_node,
-                Ok(_) => {
-                    let node = unsafe { node_values[chunk_index].assume_init() };
-                    validate_movable_node(node)?;
-                    if flags & MPOL_MF_MOVE_ALL as usize == 0
-                        && numa_page_is_shareable(&target, page)
-                    {
-                        -LinuxError::EACCES.code()
-                    } else {
-                        target.bind_mempolicy_range(
-                            VirtAddr::from(page).align_down_4k().as_usize(),
-                            4096,
-                            Mempolicy::new(MPOL_BIND as u32, 1usize << node),
-                        );
-                        node
+            let status_value = if nodes.is_null() {
+                // `do_pages_stat()` reports the node of each page; a null
+                // `nodes` array is what selects it (`mm/migrate.c:2506-2512`).
+                numa_page_stat_status(&target, page)
+            } else {
+                match numa_page_node(&target, page) {
+                    Ok(_) => {
+                        let node = unsafe { node_values[chunk_index].assume_init() };
+                        validate_movable_node(node)?;
+                        if flags & MPOL_MF_MOVE_ALL as usize == 0
+                            && numa_page_is_shareable(&target, page)
+                        {
+                            -LinuxError::EACCES.code()
+                        } else {
+                            target.bind_mempolicy_range(
+                                VirtAddr::from(page).align_down_4k().as_usize(),
+                                4096,
+                                Mempolicy::new(MPOL_BIND as u32, 1usize << node),
+                            );
+                            node
+                        }
                     }
+                    Err(_) => -LinuxError::EFAULT.code(),
                 }
-                Err(_) => -LinuxError::EFAULT.code(),
             };
             write_move_pages_status(memory, status, index, status_value)?;
         }
