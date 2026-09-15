@@ -708,6 +708,7 @@ impl MountTopology {
             .iter()
             .find(|record| record.parent_id == 0)
             .ok_or(AxError::NotFound)?;
+        let root_mount_id = root.mount_id;
         let root_source = validate_record_state(root)?;
         let root_old = next_mountinfo_id()?;
         let root_clone = Mountpoint::new_root_at_with_extensions(
@@ -743,7 +744,12 @@ impl MountTopology {
             mountpoint: Arc::downgrade(&root_clone),
         });
         source_identity.insert(root_clone.mount_id(), root.mount_id);
-        let context = axfs::FsContext::new(root_clone.root_location());
+        // Mountinfo targets are absolute paths from the namespace root, but the
+        // namespace root is the immutable nullfs: an empty directory that
+        // resolves nothing.  The tree a task can actually reach hangs off the
+        // mount layered on top of it, so the resolution root is replaced by
+        // that mount's clone as soon as it is attached (see below).
+        let mut context = axfs::FsContext::new(root_clone.root_location());
         let mut pending = source
             .into_iter()
             .filter(|record| record.parent_id != 0)
@@ -761,7 +767,23 @@ impl MountTopology {
                     continue;
                 };
                 let original = validate_record_state(&record)?;
-                let target = context.resolve(&record.target).map_err(|_| AxError::Io)?;
+                // The mount layered directly on the namespace root is attached
+                // at that root's own root directory: mountinfo records the
+                // target "/" for it, and `init_mount_tree()` puts the mutable
+                // rootfs exactly there (`fs/namespace.c`:6212-6223).  Resolving
+                // that path through the namespace root's own context could only
+                // ever find the empty immutable nullfs.
+                let visible_root =
+                    record.parent_id == root_mount_id && record.target.as_bytes() == b"/";
+                let target = if visible_root {
+                    parent
+                        .mountpoint
+                        .upgrade()
+                        .ok_or(AxError::Io)?
+                        .root_location()
+                } else {
+                    context.resolve(&record.target).map_err(|_| AxError::Io)?
+                };
                 if target.mountpoint().mount_id() != parent.mount_id {
                     return Err(AxError::Io);
                 }
@@ -782,6 +804,16 @@ impl MountTopology {
                 )?;
                 register_live_superblock_mount(&clone)?;
                 clone.attach_to(&target)?;
+                // Everything else resolves from the mount a task sees at the
+                // root of the clone from now on, which is the same walk
+                // `copy_mnt_ns()` performs when it keeps the task's root and pwd
+                // on the clone of the mount they were on
+                // (`fs/namespace.c`:4296-4312); without it every nested target
+                // would be resolved against the empty nullfs and fail with
+                // -ENOENT.
+                if visible_root {
+                    context = axfs::FsContext::new(clone.root_location());
+                }
                 cloned.push(MountRecord {
                     mount_id: clone.mount_id(),
                     mount_id_old: old,
