@@ -2145,13 +2145,19 @@ impl NetlinkSocket {
             // able to panic the kernel even if a future table edit loses that
             // exclusion.
             Option::SendLowWater => return Err(LinuxError::ENOPROTOOPT.into()),
-            // Read-only names also return `None` from the setter table.
+            // Read-only names reach `sk_setsockopt`'s `default:` arm, which
+            // answers `-ENOPROTOOPT`; `generic_socket_set_option` returns
+            // `None` for them first, so this arm is unreachable while the
+            // setter table in `crates/linux/net` keeps that exclusion.  Keep
+            // the errno rather than an assertion for the same reason as the
+            // arms above: an unreachable arm whose guard lives in another
+            // crate must degrade, not panic.
             Option::Type
             | Option::Error
             | Option::AcceptConn
             | Option::PeerCredentials
             | Option::Protocol
-            | Option::Domain => unreachable!("read-only SOL_SOCKET names have no setter"),
+            | Option::Domain => return Err(LinuxError::ENOPROTOOPT.into()),
         }
         Ok(())
     }
