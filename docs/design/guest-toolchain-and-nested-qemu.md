@@ -1,18 +1,14 @@
 # Running a compiler and an emulator inside TheKernel userspace
 
-Status: design record; the proposed guest toolchain and nested-QEMU integration
-are **not implemented or guest-validated**. This revision corrects the plan,
-not the kernel. Its source references describe the revision by `edcff91a`;
-the plan is now carried out on branch `feat/guest-toolchain` in the worktree
-`/home/ava/Worktrees/TheKernel/guest-toolchain`, forked from `dev` at
-`44621445`. §2's baseline gate has since been satisfied on that branch (§2,
-last row); nothing else in the plan has been implemented.
-Existing code, old run observations, upstream behaviour and proposed work are
-distinguished below; no VM was started during this document revision. This
-revision adds git-history archaeology for §2 (inspection only, no VM runs),
-selects Alpine's `linux-virt` kernel and minirootfs as the first nested
-Linux guest, and commits to a dynamic-glibc acceptance milestone ahead of
-Phase 3.
+Status: design record. Phases 1–2b (tcc native compilation, nested QEMU
+hello-kernel and Alpine Linux boot) and the Phase 3 glibc and gcc milestones
+have landed on `dev` and been guest-validated; §6 holds the measured results.
+The plan was carried out on branch `feat/guest-toolchain`, forked from `dev`
+at `44621445`, in a worktree that has since been deleted. Earlier revisions
+of this document described the work as not implemented; the remaining open
+items are Phase 2c (only if measured boot time requires it) and the later
+nested TheKernel acceptance target. Existing code, old run observations,
+upstream behaviour and proposed work are distinguished below.
 
 The immediate goals are native C compilation and a nested Linux boot.
 Running TheKernel's own acceptance image inside that nested machine is a
@@ -125,8 +121,9 @@ existing cases) are case behaviour, not new regressions.
    `MFD_CLOEXEC | MFD_ALLOW_SEALING`; `MFD_EXEC` and `MFD_NOEXEC_SEAL`
    are rejected with `EINVAL`. That is not automatically a workload blocker.
    The reviewed [QEMU 10.2.2 memfd helper](https://github.com/qemu/qemu/blob/v10.2.2/util/memfd.c)
-   does not request `MFD_EXEC`; recheck the version and configuration actually
-   selected for delivery.
+   does not request `MFD_EXEC`; rechecked against the pinned 11.1.1
+   (`scripts/build-nested-payload.sh`), which still requests only
+   `MFD_CLOEXEC`, `MFD_ALLOW_SEALING` and the hugeTLB flags.
 4. **There is no guest KVM interface.**
    `kernel/src/pseudofs/dev/mod.rs` provides the synthesized devices, not
    `/dev/kvm`. Use TCG inside TheKernel; host KVM does not expose its device
@@ -323,7 +320,8 @@ runtime support rather than assuming that ordinary ELF output proves `-run`.
 
 QEMU exposes cache and split-WX controls; the reviewed
 [10.2.2 TCG allocator](https://github.com/qemu/qemu/blob/v10.2.2/tcg/region.c)
-has both anonymous and split-WX paths. Pin the selected configuration and
+has both anonymous and split-WX paths, and the pinned 11.1.1
+(`scripts/build-nested-payload.sh`) still does. Pin the selected configuration and
 probe its actual allocation/protection sequence instead of requiring a
 hypothetical `MFD_EXEC` path.
 
@@ -395,7 +393,7 @@ Measured in the guest, `--toolchain glibc`:
 
 | Quantity | Guest |
 |---|---|
-| KTAP plan | `1..46`, 46 ok, 0 skips, `THEKERNEL_SYSTEM_TEST_COMPLETE` |
+| KTAP plan | `1..47` at tip, 47 ok, 0 skips, `THEKERNEL_SYSTEM_TEST_COMPLETE` (measured as `1..46`; the unconditional `posix-spawn` case shifted every plan by +1 after this run) |
 | Runner | `qemu-runner exit=0` (normal shutdown) |
 | `PT_INTERP` | `/lib64/ld-linux-x86-64.so.2`, 1 `DT_NEEDED` |
 | `AT_BASE` (interpreter base) | `0x6c49000` — non-zero, so a loader really ran |
@@ -712,7 +710,9 @@ to find:
    77.5 s for `-vga none -nic none`, so `nodefaults`-style trimming is worth
    keeping even though both work.
 
-The nested Linux boot passes as part of the full suite: `1..48`, no failures, no
+The nested Linux boot passes as part of the full suite: `1..49` at tip
+(`1..48` when measured, before the unconditional `posix-spawn` case shifted
+every plan by +1), no failures, no
 skips, `THEKERNEL_SYSTEM_TEST_COMPLETE`, and `qemu-runner exit=0`. That is the
 whole plan, with the outer suite's own normal shutdown, so all four of Phase
 2b's conditions hold in one run.
@@ -720,13 +720,15 @@ whole plan, with the outer suite's own normal shutdown, so all four of Phase
 
 ## 7. Minimal integration with existing entry points
 
-Use one explicit payload selection, proposed as
-`--toolchain {none,tcc,nested}`, default `none`; `nested` includes tcc and
-the nested-Linux components (QEMU plus the staged Alpine artifacts). **This
-flag is not implemented.** Extend the existing CLI, not a parallel command or
-general profile framework. The name `nested` describes the workload rather
-than listing tools, so a later `gcc` payload — gated on the Phase 3
-dynamic-glibc milestone — extends the enum without redesigning it.
+Use one explicit payload selection, implemented as
+`--toolchain {none,tcc,nested,glibc,gcc}`, default `none`; `nested` includes
+tcc and the nested-Linux components (QEMU plus the staged Alpine artifacts),
+`glibc` stages the dynamic loader milestone, and `gcc` is `glibc` plus the
+distribution compiler. The flag extends the existing CLI, not a parallel
+command or general profile framework. The name `nested` describes the
+workload rather than listing tools, which is what let the later `glibc` and
+`gcc` payloads — gated on the Phase 3 dynamic-glibc milestone — extend the
+enum without redesigning it.
 
 | Concern | Existing mechanism | Required change |
 |---|---|---|
@@ -787,8 +789,8 @@ still need deliberate integration. No second-disk workflow is added now.
    poweroff; `isa-debug-exit` as the early-stage result and abort channel.
 4. musl static for Phase 1/2 tools; a dynamic-glibc acceptance milestone is
    committed as the Phase 3 prerequisite for distro-built GCC/Clang payloads.
-5. Optional rootfs payload first (`--toolchain {none,tcc,nested}`); a second
-   disk only if measured costs require it.
+5. Optional rootfs payload first (`--toolchain {none,tcc,nested,glibc,gcc}`);
+   a second disk only if measured costs require it.
 6. Select versions/options before their host smoke and guest probes; defer
    nested TheKernel acceptance until its consumers are explicit.
 
