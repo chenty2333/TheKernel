@@ -23,7 +23,7 @@ mod chain;
 mod state;
 mod uapi;
 
-pub use action::{Action, ActionClass, MAX_ERRNO};
+pub use action::{AVAILABLE_ACTIONS, Action, ActionClass, MAX_ERRNO, action_is_available};
 pub use bpf::{
     ClassicBpfInstruction, ProgramError, SeccompData, SeccompExecutor, VerifiedProgram,
     opcode as classic_bpf_opcode,

@@ -10,12 +10,10 @@ use linux_raw_sys::general::CAP_SYS_ADMIN;
 use syscalls::Sysno;
 use tk_linux_seccomp::{
     ActionClass, BPF_MAXINSNS, ClassicBpfInstruction, FilterInstallError, FilterMetadata,
-    ProgramError, SECCOMP_FILTER_FLAG_LOG, SECCOMP_FILTER_FLAG_MASK,
-    SECCOMP_FILTER_FLAG_NEW_LISTENER, SECCOMP_FILTER_FLAG_SPEC_ALLOW, SECCOMP_FILTER_FLAG_TSYNC,
-    SECCOMP_FILTER_FLAG_TSYNC_ESRCH, SECCOMP_GET_ACTION_AVAIL, SECCOMP_GET_NOTIF_SIZES,
-    SECCOMP_RET_ALLOW, SECCOMP_RET_ERRNO, SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD,
-    SECCOMP_RET_LOG, SECCOMP_RET_TRAP, SECCOMP_SET_MODE_FILTER, SECCOMP_SET_MODE_STRICT,
-    SeccompData, SeccompMode, VerifiedProgram,
+    ProgramError, SECCOMP_FILTER_FLAG_LOG, SECCOMP_FILTER_FLAG_NEW_LISTENER,
+    SECCOMP_FILTER_FLAG_SPEC_ALLOW, SECCOMP_FILTER_FLAG_TSYNC, SECCOMP_FILTER_FLAG_TSYNC_ESRCH,
+    SECCOMP_GET_ACTION_AVAIL, SECCOMP_GET_NOTIF_SIZES, SECCOMP_SET_MODE_FILTER,
+    SECCOMP_SET_MODE_STRICT, SeccompData, SeccompMode, VerifiedProgram,
 };
 use tk_linux_signal::{SignalInfo, Signo};
 use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
@@ -172,20 +170,9 @@ fn install_filter<M: UserMemory + ?Sized>(
     flags: u32,
     args: *const (),
 ) -> AxResult<isize> {
-    if flags & !SECCOMP_FILTER_FLAG_MASK != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if flags & SECCOMP_FILTER_FLAG_TSYNC_ESRCH != 0 && flags & SECCOMP_FILTER_FLAG_TSYNC == 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if flags & tk_linux_seccomp::SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV != 0
-        && flags & SECCOMP_FILTER_FLAG_NEW_LISTENER == 0
-    {
-        return Err(AxError::InvalidInput);
-    }
-    // A listener is tied to one filter installation and therefore cannot be
-    // atomically transferred to a whole thread group.
-    if flags & SECCOMP_FILTER_FLAG_TSYNC != 0 && flags & SECCOMP_FILTER_FLAG_NEW_LISTENER != 0 {
+    // Linux `seccomp_set_mode_filter()` validates the complete flag word
+    // before it reads any part of the `sock_fprog`.
+    if tk_linux_seccomp::admit_filter_flags(flags).is_err() {
         return Err(AxError::InvalidInput);
     }
 
@@ -323,15 +310,12 @@ fn get_action_available<M: UserMemory + ?Sized>(
     let action = (args as usize as *const u32)
         .vm_read(memory)
         .map_err(map_usercopy_error)?;
-    match action {
-        SECCOMP_RET_KILL_PROCESS
-        | SECCOMP_RET_KILL_THREAD
-        | SECCOMP_RET_TRAP
-        | SECCOMP_RET_ERRNO
-        | SECCOMP_RET_LOG
-        | tk_linux_seccomp::SECCOMP_RET_USER_NOTIF
-        | SECCOMP_RET_ALLOW => Ok(0),
-        _ => Err(LinuxError::EOPNOTSUPP.into()),
+    // The advertised set is owned by the policy crate so it can never drift
+    // from the actions `enforce_syscall_seccomp` below actually performs.
+    if tk_linux_seccomp::action_is_available(action) {
+        Ok(0)
+    } else {
+        Err(LinuxError::EOPNOTSUPP.into())
     }
 }
 
