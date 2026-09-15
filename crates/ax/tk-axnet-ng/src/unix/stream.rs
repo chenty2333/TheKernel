@@ -1063,6 +1063,14 @@ impl TransportOps for StreamTransport {
     }
 
     fn recv(&self, mut dst: impl Write, mut options: RecvOptions) -> AxResult<usize> {
+        if options.flags.contains(RecvFlags::OOB) {
+            // `unix_stream_read_generic()` routes `MSG_OOB` to
+            // `unix_stream_recv_urg()` (`net/unix/af_unix.c:2929-2933`, active
+            // because this kernel builds with `CONFIG_AF_UNIX_OOB`).  Neither
+            // end of this stream has an urgent-data queue, so EOPNOTSUPP is the
+            // honest answer instead of returning ordinary stream bytes.
+            return Err(AxError::OperationNotSupported);
+        }
         let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
         self.general
             .recv_poller_with_effective_nonblocking(self, effective_nonblocking, || {

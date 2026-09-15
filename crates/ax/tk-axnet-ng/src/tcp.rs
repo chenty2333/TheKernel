@@ -654,6 +654,14 @@ impl SocketOps for TcpSocket {
         if !options.cmsg.is_empty() {
             return Err(AxError::OperationNotSupported);
         }
+        if options.flags.contains(SendFlags::FASTOPEN) {
+            // `tcp_sendmsg_locked()` routes `MSG_FASTOPEN` to
+            // `tcp_sendmsg_fastopen()`, which reports EOPNOTSUPP to every caller
+            // that cannot enable client fast open (`net/ipv4/tcp.c:1061-1064`).
+            // This transport has no fast-open request queue, so the payload must
+            // neither ride the SYN nor be reported as sent.
+            return Err(AxError::OperationNotSupported);
+        }
         let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
         if self.tx_closed.load(Ordering::Acquire) {
             return Err(AxError::BrokenPipe);
@@ -700,6 +708,13 @@ impl SocketOps for TcpSocket {
     }
 
     fn recv(&self, mut dst: impl Write + IoBufMut, options: RecvOptions<'_>) -> AxResult<usize> {
+        if options.flags.contains(RecvFlags::OOB) {
+            // `tcp_recvmsg_locked()` sends `MSG_OOB` to `recv_urg`
+            // (`net/ipv4/tcp.c:2680-2681`).  There is no urgent-data queue in
+            // this transport, so reporting EOPNOTSUPP is the honest answer
+            // instead of returning ordinary stream bytes.
+            return Err(AxError::OperationNotSupported);
+        }
         if self.rx_closed.load(Ordering::Acquire) {
             return Ok(0);
         }
@@ -716,15 +731,24 @@ impl SocketOps for TcpSocket {
                 self.stack.poll_interfaces();
                 self.with_smol_socket(|socket| {
                     self.record_transport_failure(socket);
+                    // `peek_seq = tp->copied_seq + peek_offset` (`net/ipv4/tcp.c:2701-2702`):
+                    // a continuation of one `MSG_WAITALL|MSG_PEEK` receive starts
+                    // where the previous copy stopped, while a fresh syscall
+                    // starts at the head of the queue because Linux's
+                    // `sk_peek_off` defaults to -1 (`net/core/sock.c:3776`).
+                    let queued = socket.recv_queue();
                     if !socket.may_recv() {
                         self.general.consume_pending_error()?;
                         Ok(0)
-                    } else if socket.recv_queue() == 0 {
+                    } else if queued == 0
+                        || (options.flags.contains(RecvFlags::PEEK)
+                            && options.peek_offset >= queued)
+                    {
                         Err(AxError::WouldBlock)
                     } else if options.flags.contains(RecvFlags::PEEK) {
                         dst.write(
                             socket
-                                .peek(dst.remaining_mut())
+                                .peek_at(options.peek_offset, dst.remaining_mut())
                                 .map_err(|_| ax_err_type!(NotConnected, "not connected?"))?,
                         )
                     } else {

@@ -18,10 +18,31 @@
 
 /// Linux `MSG_OOB`.
 pub const MSG_OOB: u32 = 0x1;
+/// Linux `MSG_PEEK`.
+pub const MSG_PEEK: u32 = 0x2;
 /// Linux `MSG_DONTROUTE` (also `MSG_TRYHARD`).
 pub const MSG_DONTROUTE: u32 = 0x4;
+/// Linux `MSG_CTRUNC` (receive output only).
+pub const MSG_CTRUNC: u32 = 0x8;
+/// Linux `MSG_PROBE`.
+pub const MSG_PROBE: u32 = 0x10;
+/// Linux `MSG_TRUNC`.
+pub const MSG_TRUNC: u32 = 0x20;
 /// Linux `MSG_DONTWAIT`.
 pub const MSG_DONTWAIT: u32 = 0x40;
+/// Linux `MSG_EOR`.
+pub const MSG_EOR: u32 = 0x80;
+/// Linux `MSG_WAITALL`.
+pub const MSG_WAITALL: u32 = 0x100;
+/// Linux `MSG_ERRQUEUE`.
+pub const MSG_ERRQUEUE: u32 = 0x2000;
+/// Linux `MSG_BATCH`: `do_sendmmsg()` sets it on every message but the last
+/// (`net/socket.c:2813`).
+pub const MSG_BATCH: u32 = 0x4_0000;
+/// Linux `MSG_ZEROCOPY`.
+pub const MSG_ZEROCOPY: u32 = 0x0400_0000;
+/// Linux `MSG_FASTOPEN`.
+pub const MSG_FASTOPEN: u32 = 0x2000_0000;
 /// Linux `MSG_CONFIRM`.
 pub const MSG_CONFIRM: u32 = 0x800;
 /// Linux `MSG_NOSIGNAL`.
@@ -46,6 +67,33 @@ const MSG_SENDPAGE_DECRYPTED: u32 = 0x10_0000;
 /// message, so userspace cannot smuggle them into a transport.
 pub const MSG_INTERNAL_SENDMSG_FLAGS: u32 =
     MSG_SPLICE_PAGES | MSG_SENDPAGE_NOPOLICY | MSG_SENDPAGE_DECRYPTED | MSG_NO_SHARED_FRAGS;
+
+/// The receive flags `net/packet/af_packet.c:packet_recvmsg()` admits.
+///
+/// Every other protocol passes `flags` to its own receive loop and ignores the
+/// bits it does not use, but AF_PACKET alone tests an allow-list before doing
+/// anything else:
+///
+/// ```c
+/// 	err = -EINVAL;
+/// 	if (flags & ~(MSG_PEEK|MSG_DONTWAIT|MSG_TRUNC|MSG_CMSG_COMPAT|MSG_ERRQUEUE))
+/// 		goto out;
+/// ```
+///
+/// so `recv(packet_fd, …, MSG_WAITALL)`, `MSG_OOB` and `MSG_CMSG_CLOEXEC` are
+/// `EINVAL` for this family and a legal no-op for the others.
+pub const PACKET_RECVMSG_FLAGS: u32 =
+    MSG_PEEK | MSG_DONTWAIT | MSG_TRUNC | MSG_CMSG_COMPAT | MSG_ERRQUEUE;
+
+/// `packet_recvmsg()`'s allow-list test: `EINVAL` for any bit it does not
+/// consume.
+pub const fn packet_recvmsg_flag_errno(flags: u32) -> Option<i32> {
+    if flags & !PACKET_RECVMSG_FLAGS != 0 {
+        Some(22)
+    } else {
+        None
+    }
+}
 
 /// `net/socket.c:__sys_sendmsg`, `__sys_sendmmsg`, `__sys_recvmsg` and
 /// `SYSCALL_DEFINE5(recvmmsg)` all run `forbid_cmsg_compat` and return `EINVAL`
@@ -188,12 +236,61 @@ pub const fn waitall_continues(step: ReceiveStep, copied: usize, requested: usiz
     }
 }
 
-/// `MSG_WAITALL` is defined only for a byte stream: every datagram protocol in
-/// Linux ignores it and returns one record.  A zero-length request has nothing
-/// to complete, and a `MSG_PEEK` receive cannot make progress towards the
-/// target because it does not consume octets.
-pub const fn waitall_applies(stream: bool, peek: bool, requested: usize) -> bool {
-    stream && !peek && requested != 0
+/// `sock_rcvlowat()` (`include/net/sock.h:735-741`): the number of octets a
+/// stream receive must have copied before it may stop waiting.
+///
+/// ```c
+/// 	int v = waitall ? len : min_t(int, READ_ONCE(sk->sk_rcvlowat), len);
+/// 	return v ?: 1;
+/// ```
+///
+/// `MSG_WAITALL` therefore raises the target to the whole request, while an
+/// ordinary receive keeps the socket's low-water mark (one octet unless
+/// `SO_RCVLOWAT` says otherwise).  `tcp_recvmsg_locked()` and
+/// `unix_stream_read_generic()` both derive their target this way.
+pub const fn sock_rcvlowat(waitall: bool, receive_low_water: usize, len: usize) -> usize {
+    let target = if waitall {
+        len
+    } else if receive_low_water < len {
+        receive_low_water
+    } else {
+        len
+    };
+    if target == 0 { 1 } else { target }
+}
+
+/// The receive target after the transports' own rules are applied.
+///
+/// `MSG_WAITALL` is defined only for a byte stream: every datagram protocol
+/// ignores it and returns one record, so their target is the single octet that
+/// makes the completion loop stop immediately.
+///
+/// Whether a `MSG_PEEK` receive counts towards the target is likewise the
+/// transport's own decision:
+///
+/// * `net/ipv4/tcp.c:tcp_recvmsg_locked()` counts every octet it copied,
+///   including a peeked one — `copied += used; len -= used;`
+///   (`:2874-2875`) runs before the `if (flags & MSG_PEEK)` split at `:2877` —
+///   and the peek cursor itself advances (`peek_seq = tp->copied_seq +
+///   peek_offset` at `:2701-2702`).  A `recv(MSG_WAITALL|MSG_PEEK)` therefore
+///   blocks until the whole request is readable and then returns it without
+///   consuming anything.
+/// * `net/unix/af_unix.c:unix_stream_read_generic()` does not: the `MSG_PEEK`
+///   arm leaves the copy loop at `:3068-3070` (`if (skb) goto again; … break;`)
+///   when the receive queue runs out, so an AF_UNIX peek returns the available
+///   prefix at once.
+pub const fn receive_wait_target(
+    stream: bool,
+    peek: bool,
+    peek_advances_cursor: bool,
+    waitall: bool,
+    receive_low_water: usize,
+    requested: usize,
+) -> usize {
+    if !stream || (peek && !peek_advances_cursor) {
+        return 1;
+    }
+    sock_rcvlowat(waitall, receive_low_water, requested)
 }
 
 #[cfg(test)]
@@ -322,10 +419,43 @@ mod tests {
     }
 
     #[test]
-    fn waitall_applies_only_to_a_non_peeking_byte_stream_request() {
-        assert!(waitall_applies(true, false, 16));
-        assert!(!waitall_applies(false, false, 16));
-        assert!(!waitall_applies(true, true, 16));
-        assert!(!waitall_applies(true, false, 0));
+    fn sock_rcvlowat_raises_the_target_only_for_waitall() {
+        // `waitall ? len : min_t(int, sk_rcvlowat, len)`, then `?: 1`.
+        assert_eq!(sock_rcvlowat(true, 1, 16), 16);
+        assert_eq!(sock_rcvlowat(false, 1, 16), 1);
+        assert_eq!(sock_rcvlowat(false, 8, 16), 8);
+        assert_eq!(sock_rcvlowat(false, 32, 16), 16);
+        assert_eq!(sock_rcvlowat(false, 0, 16), 1);
+        assert_eq!(sock_rcvlowat(true, 4, 0), 1);
+    }
+
+    #[test]
+    fn receive_target_is_reached_only_where_the_transport_advances_its_peek_cursor() {
+        // TCP: `tcp_recvmsg_locked()` counts peeked octets (net/ipv4/tcp.c:2874-2877).
+        assert_eq!(receive_wait_target(true, false, true, true, 1, 16), 16);
+        assert_eq!(receive_wait_target(true, true, true, true, 1, 16), 16);
+        // AF_UNIX stream: the peek arm leaves the loop before the target wait
+        // (net/unix/af_unix.c:3068-3070), so a peek gets one pass.
+        assert_eq!(receive_wait_target(true, false, false, true, 1, 16), 16);
+        assert_eq!(receive_wait_target(true, true, false, true, 1, 16), 1);
+        // MSG_WAITALL is a byte-stream rule; datagram transports ignore it.
+        assert_eq!(receive_wait_target(false, false, true, true, 1, 16), 1);
+        assert_eq!(receive_wait_target(false, true, true, true, 1, 16), 1);
+        // A plain stream receive keeps the low-water target of one octet.
+        assert_eq!(receive_wait_target(true, false, true, false, 1, 16), 1);
+        // A zero-length request has nothing to complete.
+        assert_eq!(receive_wait_target(true, false, true, true, 1, 0), 1);
+    }
+
+    #[test]
+    fn only_packet_recvmsg_rejects_receive_flags_it_does_not_consume() {
+        // `net/packet/af_packet.c:packet_recvmsg()`'s allow-list.
+        assert_eq!(packet_recvmsg_flag_errno(MSG_PEEK | MSG_DONTWAIT), None);
+        assert_eq!(packet_recvmsg_flag_errno(MSG_TRUNC | MSG_ERRQUEUE), None);
+        assert_eq!(packet_recvmsg_flag_errno(MSG_CMSG_COMPAT), None);
+        // Every other protocol ignores these bits instead of failing.
+        assert_eq!(packet_recvmsg_flag_errno(MSG_WAITALL), Some(22));
+        assert_eq!(packet_recvmsg_flag_errno(MSG_OOB), Some(22));
+        assert_eq!(packet_recvmsg_flag_errno(MSG_CMSG_CLOEXEC), Some(22));
     }
 }

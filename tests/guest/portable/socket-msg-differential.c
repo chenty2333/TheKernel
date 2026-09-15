@@ -237,19 +237,146 @@ static void case_send_flags(void) {
     errno = 0;
     mark("DONTROUTE_SENDMSG", sendmsg(sender, &header, MSG_DONTROUTE | MSG_DONTWAIT) == 1);
 
-    char payload[5] = {0};
+    /* `MSG_EOR` is a stream-position marker the datagram path ignores, an
+     * undefined bit (0x200000 is not allocated in include/linux/socket.h) is
+     * carried past the socket layer, and `MSG_ZEROCOPY` without `SO_ZEROCOPY`
+     * falls back to an ordinary copy: zero-copy completion is only armed when
+     * the socket option is set (`sk_zerocopy`, `net/core/sock.c:1450-1456`),
+     * so none of the three can fail a UDP datagram. */
+    errno = 0;
+    mark("EOR_SENDTO", sendto(sender, "f", 1, MSG_EOR, NULL, 0) == 1);
+    errno = 0;
+    mark("ZEROCOPY_SENDTO", sendto(sender, "g", 1, MSG_ZEROCOPY, NULL, 0) == 1);
+    iov.iov_base = (void *)"h";
+    errno = 0;
+    mark("UNDEFINED_FLAG_SENDMSG", sendmsg(sender, &header, 0x200000) == 1);
+
+    char payload[8] = {0};
     int complete = 1;
-    for (int index = 0; index < 5; index++) {
+    for (int index = 0; index < 8; index++) {
         ssize_t count = recv(receiver, &payload[index], 1, 0);
         if (count != 1) {
             complete = 0;
             break;
         }
     }
-    mark("FLAGGED_DATAGRAMS_DELIVERED", complete && memcmp(payload, "abcde", 5) == 0);
+    mark("FLAGGED_DATAGRAMS_DELIVERED", complete && memcmp(payload, "abcdefgh", 8) == 0);
 
     close(receiver);
     close(sender);
+    done();
+}
+
+/* `__sys_sendmmsg` runs the same send path as sendmsg with its own `flags`
+ * argument for every element: it ORs in `MSG_BATCH` for all but the last
+ * message, and `____sys_sendmsg` then replaces `msg_sys->msg_flags` with those
+ * call flags, keeping only a per-message `MSG_EOR` because that bit is in
+ * `allowed_msghdr_flags` (`net/socket.c:2782-2836`, `:2628-2678`).  A
+ * per-message `MSG_MORE` is therefore discarded, while `MSG_MORE` as the call
+ * flag corks the whole batch into one datagram that the next plain send
+ * flushes (`net/ipv4/udp.c:udp_sendmsg()`). */
+static void case_sendmmsg_flags(void) {
+    begin("socket_msg.sendmmsg_flags.raw-differential");
+    int receiver = -1;
+    int sender = -1;
+    udp_pair(&receiver, &sender);
+
+    char first[4] = "ab";
+    char second[4] = "cde";
+    struct iovec vectors[2] = {{first, 2}, {second, 3}};
+    struct mmsghdr batch[2];
+    memset(batch, 0, sizeof(batch));
+    for (int index = 0; index < 2; index++) {
+        batch[index].msg_hdr.msg_iov = &vectors[index];
+        batch[index].msg_hdr.msg_iovlen = 1;
+    }
+
+    errno = 0;
+    int sent = sendmmsg(sender, batch, 2, 0);
+    mark("SENDMMSG_TWO", sent == 2 && batch[0].msg_len == 2 && batch[1].msg_len == 3);
+    char record[8] = {0};
+    mark("SENDMMSG_TWO_RECORDS",
+         recv(receiver, record, sizeof(record), 0) == 2 && memcmp(record, "ab", 2) == 0 &&
+             recv(receiver, record, sizeof(record), 0) == 3 && memcmp(record, "cde", 3) == 0);
+
+    errno = 0;
+    mark("SENDMMSG_EOR", sendmmsg(sender, batch, 1, MSG_EOR) == 1);
+    mark("SENDMMSG_EOR_RECORD", recv(receiver, record, sizeof(record), 0) == 2);
+    errno = 0;
+    mark("SENDMMSG_UNDEFINED_FLAG", sendmmsg(sender, batch, 1, 0x200000) == 1);
+    mark("SENDMMSG_UNDEFINED_RECORD", recv(receiver, record, sizeof(record), 0) == 2);
+
+    /* A per-message MSG_MORE is not the call flag, so both messages leave as
+     * their own datagram. */
+    batch[0].msg_hdr.msg_flags = MSG_MORE;
+    batch[1].msg_hdr.msg_flags = MSG_MORE;
+    errno = 0;
+    sent = sendmmsg(sender, batch, 2, 0);
+    mark("SENDMMSG_HEADER_FLAGS_IGNORED",
+         sent == 2 && recv(receiver, record, sizeof(record), 0) == 2 &&
+             recv(receiver, record, sizeof(record), 0) == 3);
+    batch[0].msg_hdr.msg_flags = 0;
+    batch[1].msg_hdr.msg_flags = 0;
+
+    /* The call flag corks the batch: nothing is readable until a send without
+     * MSG_MORE flushes the pending payload as one datagram. */
+    errno = 0;
+    sent = sendmmsg(sender, batch, 2, MSG_MORE);
+    mark("SENDMMSG_MORE_CORKS", sent == 2 && batch[0].msg_len == 2 && batch[1].msg_len == 3);
+    errno = 0;
+    mark("SENDMMSG_MORE_PENDING",
+         recv(receiver, record, sizeof(record), MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    errno = 0;
+    mark("SENDMMSG_MORE_FLUSH", send(sender, "z", 1, 0) == 1);
+    memset(record, 0, sizeof(record));
+    mark("SENDMMSG_MORE_MERGED",
+         recv(receiver, record, sizeof(record), 0) == 6 && memcmp(record, "abcdez", 6) == 0);
+
+    close(receiver);
+    close(sender);
+    done();
+}
+
+/* `tcp_recvmsg_locked()` counts the octets a peek copied towards
+ * `sock_rcvlowat(sk, flags & MSG_WAITALL, len)` and advances its `peek_seq`
+ * cursor over them (`net/ipv4/tcp.c:2701-2702`, `:2874-2877`), so a
+ * `MSG_WAITALL|MSG_PEEK` receive blocks until the whole request is readable,
+ * returns it, and consumes nothing: the receive that follows still sees all
+ * ten octets.  An AF_UNIX stream is deliberately not asserted here, because
+ * `unix_stream_read_generic()` leaves its copy loop on a peek that runs out of
+ * queue (`net/unix/af_unix.c:3068-3070`) and returns the available prefix. */
+static void case_peek_waitall_tcp(void) {
+    begin("socket_msg.peek_waitall_tcp.raw-differential");
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t length = sizeof(address);
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    mark("TCP_PEEK_LISTENER",
+         listener >= 0 && bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0 &&
+             listen(listener, 1) == 0 &&
+             getsockname(listener, (struct sockaddr *)&address, &length) == 0);
+
+    struct helper helper = {.listener = listener, .first = "abcd", .first_length = 4,
+                            .second = "efghij", .second_length = 6,
+                            .delay_milliseconds = WAITALL_MILLISECONDS};
+    pthread_t writer;
+    mark("TCP_PEEK_HELPER", pthread_create(&writer, NULL, tcp_writer, &helper) == 0);
+    int client = socket(AF_INET, SOCK_STREAM, 0);
+    mark("TCP_PEEK_CONNECT",
+         client >= 0 && connect(client, (struct sockaddr *)&address, length) == 0);
+    set_receive_timeout(client, 5);
+
+    char payload[16] = {0};
+    errno = 0;
+    ssize_t count = recv(client, payload, 10, MSG_WAITALL | MSG_PEEK);
+    mark("TCP_PEEK_TEN", count == 10 && memcmp(payload, "abcdefghij", 10) == 0);
+    memset(payload, 0, sizeof(payload));
+    errno = 0;
+    count = recv(client, payload, 10, MSG_WAITALL);
+    mark("TCP_PEEK_LEAVES_QUEUE", count == 10 && memcmp(payload, "abcdefghij", 10) == 0);
+
+    close(client);
+    mark("TCP_PEEK_JOIN", pthread_join(writer, NULL) == 0);
+    mark("TCP_PEEK_DONE", helper.verdict == 1);
     done();
 }
 
@@ -530,19 +657,55 @@ static void case_recvmmsg_waitforone(void) {
     done();
 }
 
-int main(void) {
+static const char *only_case;
+
+/* Development affordance: an optional first argument names one case (the
+ * `PROGRAM_CASES` spelling from the differential runner), so a single
+ * divergence can be inspected without the fail-fast `mark()` aborting an
+ * earlier case of the same program.  The registered differential run passes no
+ * argument and therefore still executes and reports every case exactly once. */
+static int case_selected(const char *name) {
+    return only_case == NULL || strcmp(only_case, name) == 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1) {
+        only_case = argv[1];
+    }
     signal(SIGPIPE, SIG_IGN);
     signal(SIGALRM, on_alarm);
     alarm(120);
 
-    case_send_flags();
-    case_tcp_more();
-    case_compat_flag();
-    case_waitall_stream();
-    case_waitall_tcp();
-    case_waitall_datagram();
-    case_recvmmsg_deadline();
-    case_recvmmsg_waitforone();
+    if (case_selected("socket_msg.send_flags")) {
+        case_send_flags();
+    }
+    if (case_selected("socket_msg.sendmmsg_flags")) {
+        case_sendmmsg_flags();
+    }
+    if (case_selected("socket_msg.peek_waitall_tcp")) {
+        case_peek_waitall_tcp();
+    }
+    if (case_selected("socket_msg.tcp_more")) {
+        case_tcp_more();
+    }
+    if (case_selected("socket_msg.compat_flag")) {
+        case_compat_flag();
+    }
+    if (case_selected("socket_msg.waitall_stream")) {
+        case_waitall_stream();
+    }
+    if (case_selected("socket_msg.waitall_tcp")) {
+        case_waitall_tcp();
+    }
+    if (case_selected("socket_msg.waitall_datagram")) {
+        case_waitall_datagram();
+    }
+    if (case_selected("socket_msg.recvmmsg_deadline")) {
+        case_recvmmsg_deadline();
+    }
+    if (case_selected("socket_msg.recvmmsg_waitforone")) {
+        case_recvmmsg_waitforone();
+    }
 
     puts("THEKERNEL_SOCKET_MSG_OK");
     return 0;

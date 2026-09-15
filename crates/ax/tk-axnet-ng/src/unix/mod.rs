@@ -839,8 +839,11 @@ impl UnixSocket {
             .retry_transfer(direction, effective_nonblocking, attempt)
     }
 
-    #[cfg(test)]
-    fn is_bound(&self) -> bool {
+    /// Whether this endpoint already owns a name (`u->addr != NULL`).  Linux's
+    /// `unix_bind()` answers `-EINVAL` for a second bind, while
+    /// `unix_autobind()` treats an already-named socket as success and keeps
+    /// the original name.
+    pub fn is_bound(&self) -> bool {
         self.bind_state.load(Ordering::Acquire) != ENDPOINT_UNBOUND
     }
 
