@@ -1066,6 +1066,15 @@ impl IoUring {
     pub(crate) const fn sqpoll_enabled(&self) -> bool {
         self.sqpoll
     }
+    /// Whether a failed SQE leaves the rest of the batch for the next enter.
+    ///
+    /// `io_submit_sqes()` keeps consuming SQEs after a request whose
+    /// `io_init_req()` failed only when the ring carries
+    /// `IORING_SETUP_SUBMIT_ALL` (`io_uring/io_uring.c:2053-2062`).
+    pub(crate) const fn continues_batch_after_failure(&self) -> bool {
+        self.layout.setup_flags().contains(SetupFlags::SUBMIT_ALL)
+    }
+
     pub(crate) const fn iopoll_enabled(&self) -> bool {
         self.iopoll
     }

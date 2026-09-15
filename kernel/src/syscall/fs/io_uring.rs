@@ -2624,6 +2624,11 @@ fn submit_entries(
     let mut completion_batch = SubmissionCompletionBatch::new(ring);
     let mut examined = 0;
     let mut submitted = 0;
+    // `io_submit_sqes()` stops consuming SQEs after the first request whose
+    // `io_init_req()` failed unless the ring carries
+    // `IORING_SETUP_SUBMIT_ALL`; the failed SQE itself stays consumed and its
+    // CQE is still posted (`io_uring/io_uring.c:2053-2070`).
+    let submit_all = ring.continues_batch_after_failure();
     while examined < requested {
         let dispatch = {
             let step = {
@@ -3100,7 +3105,10 @@ fn submit_entries(
             #[cfg(feature = "io-submit-batch")]
             Some(&mut completion_batch),
         ) {
-            Ok(outcome) if outcome.stops_default_batch() => {
+            // The only outcome a `SUBMIT_ALL` ring keeps consuming SQEs past:
+            // its own CQE is already published by the dispatch above
+            // (`io_uring/io_uring.c:2053-2062`).
+            Ok(outcome) if outcome.stops_default_batch() && !submit_all => {
                 return Ok((submitted, false));
             }
             Ok(_) => {}
