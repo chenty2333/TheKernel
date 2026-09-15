@@ -1786,7 +1786,7 @@ impl SocketOps for DccpSocket {
             };
         };
         if let Some(f) = o.from {
-            *f = SocketAddrEx::Ip(p)
+            *f = Some(SocketAddrEx::Ip(p))
         }
         let n = w.write(&b)?;
         if !o.flags.contains(RecvFlags::PEEK) {

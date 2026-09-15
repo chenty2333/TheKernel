@@ -868,7 +868,7 @@ impl SocketOps for UdpSocket {
                     match result {
                         Ok((src, meta)) => {
                             if let Some(remote_addr) = sender_output.as_deref_mut() {
-                                *remote_addr = SocketAddrEx::Ip(meta.endpoint.into());
+                                *remote_addr = Some(SocketAddrEx::Ip(meta.endpoint.into()));
                             }
 
                             let read = dst.write(src)?;
@@ -1133,7 +1133,7 @@ mod tests {
         assert_eq!(&first[..b"without-address".len()], b"without-address");
 
         send_datagram(&sender, 31_100, b"with-address");
-        let mut source = endpoint(1);
+        let mut source = Some(endpoint(1));
         let mut second = [0_u8; 32];
         assert_eq!(
             receiver
@@ -1149,7 +1149,7 @@ mod tests {
             b"with-address".len()
         );
         assert_eq!(&second[..b"with-address".len()], b"with-address");
-        assert!(matches!(source, SocketAddrEx::Ip(address) if address.ip() == LOOPBACK));
+        assert!(matches!(source, Some(SocketAddrEx::Ip(address)) if address.ip() == LOOPBACK));
     }
 
     #[test]
@@ -1217,7 +1217,7 @@ mod tests {
         send_datagram(&expected, 31_110, b"accept");
         assert!(receiver.poll().contains(IoEvents::READABLE));
 
-        let mut source = endpoint(1);
+        let mut source = Some(endpoint(1));
         let mut output = [0_u8; 16];
         assert_eq!(
             receiver
@@ -1233,7 +1233,7 @@ mod tests {
             b"accept".len()
         );
         assert_eq!(&output[..b"accept".len()], b"accept");
-        assert!(matches!(source, SocketAddrEx::Ip(address) if address.port() == 31_111));
+        assert!(matches!(source, Some(SocketAddrEx::Ip(address)) if address.port() == 31_111));
 
         let mut consumed = [0_u8; 16];
         assert_eq!(
@@ -1287,7 +1287,7 @@ mod tests {
         send_datagram(&first_peer, 31_120, b"rejected-after-reconnect");
         send_datagram(&second_peer, 31_120, b"second-epoch");
 
-        let mut old_source = endpoint(1);
+        let mut old_source = Some(endpoint(1));
         let mut old_output = [0_u8; 32];
         assert_eq!(
             receiver
@@ -1303,7 +1303,7 @@ mod tests {
             b"first-epoch".len()
         );
         assert_eq!(&old_output[..b"first-epoch".len()], b"first-epoch");
-        assert!(matches!(old_source, SocketAddrEx::Ip(address) if address.port() == 31_121));
+        assert!(matches!(old_source, Some(SocketAddrEx::Ip(address)) if address.port() == 31_121));
 
         receiver.disconnect();
         assert_eq!(
@@ -1323,7 +1323,7 @@ mod tests {
             (&b"second-epoch"[..], 31_122),
             (&b"unconnected-epoch"[..], 31_123),
         ] {
-            let mut source = endpoint(1);
+            let mut source = Some(endpoint(1));
             let mut output = [0_u8; 32];
             assert_eq!(
                 receiver
@@ -1339,7 +1339,7 @@ mod tests {
                 payload.len()
             );
             assert_eq!(&output[..payload.len()], payload);
-            assert!(matches!(source, SocketAddrEx::Ip(address) if address.port() == source_port));
+            assert!(matches!(source, Some(SocketAddrEx::Ip(address)) if address.port() == source_port));
         }
         assert!(!receiver.poll().contains(IoEvents::READABLE));
     }

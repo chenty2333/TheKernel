@@ -1138,7 +1138,7 @@ impl TransportOps for DgramTransport {
                     let sender = packet.sender.clone();
                     let count = dst.write(&data)?;
                     if let Some(from) = options.from.as_mut() {
-                        **from = SocketAddrEx::Unix(sender);
+                        **from = Some(SocketAddrEx::Unix(sender));
                     }
                     if let Some(output) = options.cmsg.as_mut() {
                         output
@@ -1207,7 +1207,7 @@ impl TransportOps for DgramTransport {
                 }
 
                 if let Some(from) = options.from.as_mut() {
-                    **from = SocketAddrEx::Unix(sender);
+                    **from = Some(SocketAddrEx::Unix(sender));
                 }
                 if let Some(dst) = options.cmsg.as_mut() {
                     if dst.is_empty() {

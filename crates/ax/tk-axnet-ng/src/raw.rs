@@ -786,11 +786,11 @@ impl SocketOps for RawSocket {
                         socket.recv().map_err(|_| AxError::WouldBlock)?
                     };
                     if let Some(from) = options.from.as_deref_mut() {
-                        *from = socket_address(
+                        *from = Some(socket_address(
                             source_from_packet(packet)
                                 .or(self.endpoints.lock().peer)
                                 .unwrap_or_else(|| self.family.unspecified()),
-                        );
+                        ));
                     }
                     let copied = dst.write(packet)?;
                     self.poll_state.wake();
