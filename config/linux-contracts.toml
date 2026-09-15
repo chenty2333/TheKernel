@@ -2249,7 +2249,7 @@ handler = "kernel/src/syscall/net/opt.rs:sys_getsockopt"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/net/opt.rs:generic_option_copyout_reports_the_copied_short_or_zero_length", "tests/guest/portable/socket-provider-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["an unknown level with an optlen the kernel cannot read reports EINVAL where Linux reports ENOPROTOOPT, and SO_BINDTODEVICE is absent as in the setsockopt cell"]
+limitations = ["SO_BINDTODEVICE is served for network, netlink and AF_PACKET endpoints, but AF_ALG and AF_XDP endpoints still answer ENOPROTOOPT for it and for every other SOL_SOCKET name, where Linux reaches sk_getsockopt through the SOL_SOCKET arm of do_sock_getsockopt"]
 
 [[contract]]
 id = "linux-setsockopt"
@@ -2271,8 +2271,8 @@ contract = "linux-setsockopt"
 handler = "kernel/src/syscall/net/opt.rs:sys_setsockopt"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/socket-provider-differential.c:main"]
-validation_gaps = ["explicit-none"]
-limitations = ["SO_BINDTODEVICE is not modelled and answers ENOPROTOOPT, and the SO_*BUFFORCE variants cannot be asserted because the differential guest holds no CAP_NET_ADMIN in the initial namespace, so the oracle refuses them with EPERM before the buffer policy runs"]
+validation_gaps = ["the AF_ALG and AF_XDP divergence cannot be asserted because the oracle kernel is built without CONFIG_CRYPTO_USER and CONFIG_XDP_SOCKETS, so socket(AF_ALG, ...) and socket(AF_XDP, ...) fail in the differential guest"]
+limitations = ["SO_BINDTODEVICE records and reports the bound interface index on network, netlink and AF_PACKET endpoints, but no transmit or route-selection path consults it yet, so a bound socket still routes by destination; AF_ALG and AF_XDP endpoints answer ENOPROTOOPT for every SOL_SOCKET name, including SO_BINDTODEVICE"]
 
 [[contract]]
 id = "linux-getuid"
