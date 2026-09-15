@@ -644,6 +644,34 @@ fn is_brk_heap_area(area: &MemoryArea<Backend>, heap_base: VirtAddr) -> bool {
         && area.flags().contains(MappingFlags::USER)
 }
 
+/// Linux `mm/vma.h:is_data_mapping_vma_flags()` over one installed mapping.
+///
+/// `VMA_SHARED_BIT` is `VM_SHARED`.  The generic VMA flags of this kernel carry
+/// only hardware permission bits, so sharing comes from the backend that owns
+/// the pages: anonymous shared storage is `Backend::Shared`, and a file mapping
+/// records `FileMappingSharing` on its lease.  A device mapping
+/// (`Backend::Linear`) does not record which of `MAP_SHARED`/`MAP_PRIVATE`
+/// created it and is treated as shared, so a writable `MAP_PRIVATE` device
+/// mapping is the one shape that under-counts.
+fn is_data_mapping_area(
+    flags: MappingFlags,
+    backend: &Backend,
+    start: VirtAddr,
+    growdown_starts: &BTreeSet<VirtAddr>,
+) -> bool {
+    let shared = match backend {
+        Backend::Shared(_) | Backend::Linear(_) => true,
+        Backend::Cow(_) | Backend::File(_) => backend
+            .file_mapping()
+            .is_some_and(|mapping| mapping.sharing() == FileMappingSharing::Shared),
+    };
+    tk_linux_mm::is_data_mapping(
+        flags.contains(MappingFlags::WRITE),
+        shared,
+        growdown_starts.contains(&start),
+    )
+}
+
 fn lineage_is_contained_in_range<B>(
     areas: &MemorySet<B>,
     lineage: MappingLineage,
@@ -5446,6 +5474,39 @@ impl AddrSpace {
 
     pub fn current_mapping_bytes(&self) -> usize {
         self.areas.iter().map(MemoryArea::size).sum()
+    }
+
+    /// Returns the bytes Linux accounts in `mm->data_vm`: the private,
+    /// writable, non-grow-down mappings, as
+    /// `mm/vma.h:is_data_mapping_vma_flags()` defines them.
+    ///
+    /// ```c
+    /// static inline bool is_data_mapping_vma_flags(const vma_flags_t *vma_flags)
+    /// {
+    /// 	return vma_flags_test(vma_flags, VMA_WRITE_BIT) &&
+    /// 		!vma_flags_test_any(vma_flags, VMA_SHARED_BIT, VMA_STACK_BIT);
+    /// }
+    /// ```
+    ///
+    /// Neither tested bit is a hardware permission bit in this kernel, so both
+    /// are derived here: `VM_SHARED` from the concrete backend's sharing mode
+    /// and `VM_GROWSDOWN` from [`AddrSpace::growdown_starts`].  This is the
+    /// accounting `RLIMIT_DATA` is compared against; the kernel keeps no
+    /// incremental counter, so the cost is one walk of the area list and only
+    /// a caller with a finite `RLIMIT_DATA` pays it.
+    pub fn current_data_mapping_bytes(&self) -> usize {
+        self.areas
+            .iter()
+            .filter(|area| {
+                is_data_mapping_area(
+                    area.flags(),
+                    area.backend(),
+                    area.start(),
+                    &self.growdown_starts,
+                )
+            })
+            .map(MemoryArea::size)
+            .sum()
     }
 
     /// Returns the number of VMA bytes already present in an exact virtual

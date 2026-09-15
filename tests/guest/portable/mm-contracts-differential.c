@@ -780,6 +780,37 @@ static void mmap_extra_case(void) {
     check(close(validate_fd) == 0, "mmap-shared-validate-close");
     mark("SHARED_VALIDATE_FLAG_MASK");
 
+    /* `mm/mmap.c:1333-1357:may_expand_vm()` compares
+       `mm->data_vm + npages` with RLIMIT_DATA only for a data mapping —
+       `mm/vma.h:527-534` defines that as VM_WRITE without VM_SHARED or
+       VM_STACK — and it exempts the case where the soft limit is exactly zero,
+       because then `rlimit_max(RLIMIT_DATA)` decides (the Valgrind workaround).
+       A limit of one byte is nonzero and below one page, so every private
+       writable mapping must fail with ENOMEM while a read-only or shared one
+       is not compared with the limit at all. */
+    struct rlimit saved_data_limit;
+    check(getrlimit(RLIMIT_DATA, &saved_data_limit) == 0, "mmap-data-limit-get");
+    struct rlimit data_limit = saved_data_limit;
+    data_limit.rlim_cur = 0;
+    data_limit.rlim_max = RLIM_INFINITY;
+    check(setrlimit(RLIMIT_DATA, &data_limit) == 0, "mmap-data-limit-zero-set");
+    void *unbounded = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(unbounded != MAP_FAILED, "mmap-data-limit-zero-maps");
+    check(munmap(unbounded, PAGE) == 0, "mmap-data-limit-zero-cleanup");
+    data_limit.rlim_cur = 1;
+    check(setrlimit(RLIMIT_DATA, &data_limit) == 0, "mmap-data-limit-one-set");
+    ERROR(mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0),
+          ENOMEM, "mmap-data-limit-private-writable");
+    void *read_only = mmap(NULL, PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(read_only != MAP_FAILED, "mmap-data-limit-read-only");
+    check(munmap(read_only, PAGE) == 0, "mmap-data-limit-read-only-cleanup");
+    void *shared_pages = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
+                              MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    check(shared_pages != MAP_FAILED, "mmap-data-limit-shared");
+    check(munmap(shared_pages, PAGE) == 0, "mmap-data-limit-shared-cleanup");
+    check(setrlimit(RLIMIT_DATA, &saved_data_limit) == 0, "mmap-data-limit-restore");
+    mark("RLIMIT_DATA_GROWTH");
     done();
 }
 

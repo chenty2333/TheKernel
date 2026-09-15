@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use axalloc::{UsageKind, global_allocator};
 use axerrno::{AxError, AxResult};
 use axhal::mem::total_ram_size;
-use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_AS};
+use linux_raw_sys::general::{RLIM_INFINITY, RLIMIT_AS, RLIMIT_DATA};
 use memory_addr::PAGE_SIZE_4K;
 
 use super::aspace::AddrSpace;
@@ -228,4 +228,47 @@ pub fn check_rlimit_as_replacement(
     } else {
         Ok(())
     }
+}
+
+/// Enforces Linux's `RLIMIT_DATA` arm of `may_expand_vm()` for one prospective
+/// data mapping, while the caller holds this address space's mutation lock.
+///
+/// ```c
+/// 	if (is_data_mapping_vma_flags(vma_flags) &&
+/// 	    mm->data_vm + npages > rlimit(RLIMIT_DATA) >> PAGE_SHIFT) {
+/// 		/* Workaround for Valgrind */
+/// 		if (rlimit(RLIMIT_DATA) == 0 &&
+/// 		    mm->data_vm + npages <= rlimit_max(RLIMIT_DATA) >> PAGE_SHIFT)
+/// 			return true;
+/// 		if (!ignore_rlimit_data)
+/// 			return false;
+/// 	}
+/// ```
+///
+/// `may_expand_vm()` is reached from `mmap_region()` (`mm/vma.c:2453`), which
+/// answers `-ENOMEM`; `is_data_mapping` is the caller's frozen
+/// `is_data_mapping_vma_flags()` verdict for the mapping being admitted, and
+/// `growth` is its newly covered length.  A non-data mapping is never compared
+/// with `RLIMIT_DATA` at all, which is why a shared or read-only request is
+/// admitted even when the limit is exhausted.
+pub fn check_rlimit_data_growth(
+    proc_data: &ProcessData,
+    aspace: &AddrSpace,
+    is_data_mapping: bool,
+    growth: usize,
+) -> AxResult<()> {
+    if !is_data_mapping {
+        return Ok(());
+    }
+    let rlimits = proc_data.rlim.read();
+    let soft = rlimits[RLIMIT_DATA].current;
+    if soft == RLIM_INFINITY as i64 as u64 {
+        return Ok(());
+    }
+    let hard = rlimits[RLIMIT_DATA].max;
+    let data_vm =
+        u64::try_from(aspace.current_data_mapping_bytes()).map_err(|_| AxError::NoMemory)?;
+    let growth = u64::try_from(growth).map_err(|_| AxError::NoMemory)?;
+    tk_linux_mm::data_limit_admits_growth(data_vm, growth, soft, hard)
+        .map_err(|_| AxError::NoMemory)
 }

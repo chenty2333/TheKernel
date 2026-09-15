@@ -77,7 +77,10 @@ pub use mempolicy::{
     validate_get,
 };
 pub use mincore::MincorePlan;
-pub use mmap::{LEGACY_MAP_MASK, MAP_SYNC, PAGE_SIZE, map_shared_validate_errno};
+pub use mmap::{
+    LEGACY_MAP_MASK, MAP_SYNC, PAGE_SIZE, data_limit_admits_growth, is_data_mapping,
+    map_shared_validate_errno,
+};
 pub use msync::{
     MS_ASYNC, MS_INVALIDATE, MS_SYNC, MsyncResult, MsyncStep, msync_flags_valid, msync_result,
     msync_step,

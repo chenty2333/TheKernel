@@ -28,7 +28,8 @@ use crate::{
         MadviseReadahead, MadviseThp, PreparedFixedSharedMapping, PreparedProtect,
         SharedFolioDemotionReplacement, SharedFolioPteRedirect, SharedFolioPteReplacement,
         SharedPages, WritableMappingAdmission, check_memory_overcommit, check_rlimit_as_growth,
-        checked_align_up, checked_align_up_4k, overcommit_memory_policy, remap_user_mapping,
+        check_rlimit_data_growth, checked_align_up, checked_align_up_4k, overcommit_memory_policy,
+        remap_user_mapping,
     },
     pseudofs::{Device, DeviceMmap},
     task::{
@@ -1483,6 +1484,21 @@ pub fn sys_mmap(
                     length,
                 )?;
             }
+            // Linux `mm/vma.c:2453` runs `may_expand_vm()` at the final VMA
+            // admission edge: after the memlock checks, after every flag and
+            // file validation, and before any topology change.  The `RLIMIT_AS`
+            // half of that predicate has no mmap-path caller in this kernel
+            // yet; the `RLIMIT_DATA` half is enforced here.
+            check_rlimit_data_growth(
+                proc_data,
+                &aspace,
+                tk_linux_mm::is_data_mapping(
+                    effective_protection.contains(MappingFlags::WRITE),
+                    !matches!(map_type, MmapFlags::PRIVATE | MmapFlags::DROPPABLE),
+                    growdown_private_anon,
+                ),
+                length,
+            )?;
 
             let populate = (map_flags.contains(MmapFlags::POPULATE)
                 && !map_flags.contains(MmapFlags::NONBLOCK))

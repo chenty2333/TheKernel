@@ -1,9 +1,10 @@
 //! Pure `mmap(2)` admission policy.
 //!
-//! Mirrors the decision Linux v7.2.3 `mm/mmap.c:do_mmap()` takes from the raw
-//! `flags` word: which extended bits `MAP_SHARED_VALIDATE` accepts.  The kernel
-//! owns the address space, the descriptor, and the VMA topology; this module owns
-//! only the numbers Linux compares, so every rule here is host-testable.
+//! Mirrors the two decisions Linux v7.2.3 `mm/mmap.c:do_mmap()` takes from the
+//! raw `flags` word: which extended bits `MAP_SHARED_VALIDATE` accepts, and
+//! whether `RLIMIT_DATA` still admits the mapping's pages.  The kernel owns the
+//! address space, the descriptor, and the VMA topology; this module owns only
+//! the numbers Linux compares, so every rule here is host-testable.
 
 use crate::MmError;
 
@@ -144,6 +145,69 @@ pub const fn map_shared_validate_errno(
     }
 }
 
+/// `mm/vma.h:is_data_mapping_vma_flags()`: private, writable, not a stack.
+///
+/// ```c
+/// /*
+///  * Data area - private, writable, not stack
+///  */
+/// static inline bool is_data_mapping(vm_flags_t flags)
+/// {
+/// 	return (flags & (VM_WRITE | VM_SHARED | VM_STACK)) == VM_WRITE;
+/// }
+/// ```
+///
+/// `VM_STACK` is the legacy alias of `VM_GROWSDOWN`, so the stack half is
+/// grow-down identity, not `MAP_STACK`: a `MAP_STACK` mapping without
+/// `MAP_GROWSDOWN` is still data.
+pub const fn is_data_mapping(write: bool, shared: bool, growdown: bool) -> bool {
+    write && !shared && !growdown
+}
+
+/// Whether `RLIMIT_DATA` still admits one growth of a data mapping.
+///
+/// `mm/mmap.c:may_expand_vm()` compares page counts, then exempts the case
+/// where the soft limit is exactly zero — the documented Valgrind workaround:
+///
+/// ```c
+/// 	if (is_data_mapping_vma_flags(vma_flags) &&
+/// 	    mm->data_vm + npages > rlimit(RLIMIT_DATA) >> PAGE_SHIFT) {
+/// 		/* Workaround for Valgrind */
+/// 		if (rlimit(RLIMIT_DATA) == 0 &&
+/// 		    mm->data_vm + npages <= rlimit_max(RLIMIT_DATA) >> PAGE_SHIFT)
+/// 			return true;
+/// 		...
+/// 		if (!ignore_rlimit_data)
+/// 			return false;
+/// 	}
+/// ```
+///
+/// `data_vm_bytes` is the caller's frozen `mm->data_vm` and `growth_bytes` the
+/// newly covered length.  Both are rounded down to pages, as Linux's shift
+/// does, and the caller passes `RLIM_INFINITY` as `u64::MAX` for an unlimited
+/// pair.  `ignore_rlimit_data` is a boot parameter with no equivalent here, so
+/// the default — enforce — is the only arm modelled.  Returns whether the
+/// growth is allowed.
+pub const fn data_limit_admits_growth(
+    data_vm_bytes: u64,
+    growth_bytes: u64,
+    soft_limit: u64,
+    hard_limit: u64,
+) -> Result<(), MmError> {
+    let Some(total_pages) = (data_vm_bytes / PAGE_SIZE).checked_add(growth_bytes / PAGE_SIZE) else {
+        return Err(MmError::Overflow);
+    };
+    if total_pages <= soft_limit / PAGE_SIZE {
+        return Ok(());
+    }
+    // The workaround reads the *hard* limit, so a process whose soft data limit
+    // is zero is bounded only by `rlimit_max(RLIMIT_DATA)`.
+    if soft_limit == 0 && total_pages <= hard_limit / PAGE_SIZE {
+        return Ok(());
+    }
+    Err(MmError::DataRlimitExceeded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +290,42 @@ mod tests {
         // A `MAP_SHARED_VALIDATE` word's `MAP_TYPE` field is part of the word,
         // so the request itself must not be reported as a stray bit.
         assert_eq!(map_shared_validate_errno(false, 0x03, false), None);
+    }
+
+    #[test]
+    fn data_mapping_excludes_shared_and_growdown_but_not_map_stack() {
+        assert!(is_data_mapping(true, false, false));
+        assert!(!is_data_mapping(false, false, false));
+        assert!(!is_data_mapping(true, true, false));
+        assert!(!is_data_mapping(true, false, true));
+        assert!(!is_data_mapping(true, true, true));
+    }
+
+    #[test]
+    fn data_limit_admits_growth_by_page_count_and_keeps_the_valgrind_workaround() {
+        // `mm->data_vm + npages > rlimit(RLIMIT_DATA) >> PAGE_SHIFT` fails.
+        assert_eq!(
+            data_limit_admits_growth(4096, 4096, 4096, u64::MAX),
+            Err(MmError::DataRlimitExceeded)
+        );
+        assert_eq!(data_limit_admits_growth(4096, 4096, 8192, u64::MAX), Ok(()));
+        // The comparison is in whole pages, so a limit of one byte below two
+        // pages still admits a second page.
+        assert_eq!(data_limit_admits_growth(0, 4096, 8191, u64::MAX), Ok(()));
+        assert_eq!(
+            data_limit_admits_growth(0, 8192, 8191, u64::MAX),
+            Err(MmError::DataRlimitExceeded)
+        );
+        // A zero soft limit is the Valgrind workaround: the hard limit decides.
+        assert_eq!(data_limit_admits_growth(4096, 4096, 0, u64::MAX), Ok(()));
+        assert_eq!(
+            data_limit_admits_growth(4096, 4096, 0, 4096),
+            Err(MmError::DataRlimitExceeded)
+        );
+        // RLIM_INFINITY never blocks a representable address space.
+        assert_eq!(
+            data_limit_admits_growth(1 << 40, 4096, u64::MAX, u64::MAX),
+            Ok(())
+        );
     }
 }
