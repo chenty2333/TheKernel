@@ -37,8 +37,9 @@ pub use buffer::{
 pub use enter::{EnterArgument, EnterFlags, EnterRequest, IoUringGeteventsArg, LegacySignalMask};
 pub use error::IoUringError;
 pub use registration::{
-    IORING_MAX_PROBE_OPERATIONS, IORING_MAX_REGISTERED_BUFFERS, PINNED_IORING_REGISTER_LAST,
-    RegistrationOperation, RegistrationRequest,
+    IORING_MAX_PROBE_OPERATIONS, IORING_MAX_REGISTERED_BUFFERS, IORING_MAX_RESTRICTIONS,
+    IORING_MAX_RING_FDS, PINNED_IORING_REGISTER_LAST, RegistrationDispatch, RegistrationHeader,
+    RegistrationOperation, RegistrationRequest, UnsupportedOutcome, UnsupportedRegistration,
 };
 pub use request::{
     CancelSelector, CancellationMode, Completion, CompletionPublication, CompletionToken,

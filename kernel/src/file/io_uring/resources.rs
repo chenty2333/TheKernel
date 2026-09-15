@@ -849,6 +849,15 @@ impl IoUring {
         Ok(())
     }
 
+    /// Whether a completion eventfd is already published.
+    ///
+    /// `io_eventfd_register()` reads this state, and answers `-EBUSY` from it,
+    /// before it copies the caller's descriptor or resolves it
+    /// (`io_uring/eventfd.c:127-134`).
+    pub(crate) fn completion_eventfd_registered(&self) -> bool {
+        self.state.lock().completion_eventfd.is_some()
+    }
+
     pub(crate) fn unregister_completion_eventfd(&self) -> AxResult<()> {
         let _registration = self.registration_serial.lock();
         let eventfd = self

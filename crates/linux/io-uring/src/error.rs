@@ -118,6 +118,13 @@ pub enum IoUringError {
     InvalidBufferRange,
     /// A copied io_uring registration header or argument is malformed.
     InvalidRegistration,
+    /// A copied registration record's `offset + nr_args` overflowed, which
+    /// Linux reports as `-EOVERFLOW` (`io_uring/rsrc.c:426-428`).
+    RegistrationRangeOverflow,
+    /// A copied registration record held a field Linux rejects with
+    /// `-EFAULT`, such as a non-zero reserved word
+    /// (`io_uring/zcrx.c:1434-1435`).
+    RegistrationFault,
     /// A registration opcode is known but not implemented by this profile.
     UnsupportedRegistration,
     /// A registration opcode is outside the pinned Linux UAPI range.
