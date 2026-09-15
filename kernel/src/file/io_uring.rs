@@ -1368,7 +1368,9 @@ impl IoUring {
         self.sqes.read_bytes(offset, &mut bytes)?;
         let copied = CopiedSubmission::new(bytes);
         let descriptor = copied.descriptor();
-        let parsed = copied.parse();
+        let parsed = copied.parse_in(tk_linux_io_uring::SubmissionContext::new(
+            self.iopoll_enabled(),
+        ));
 
         let mut state = self.state.lock();
         let reservation = match state.requests.reserve(descriptor) {

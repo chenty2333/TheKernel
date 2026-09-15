@@ -59,10 +59,11 @@ pub use setup::{
 };
 pub use sqe::{
     AcceptRequest, CloseRequest, CopiedSubmission, FadviseRequest, FallocateRequest, FileTarget,
-    FsyncRequest, IoBuffer, PINNED_IORING_OP_LAST, ParsedSubmission, PollRequest,
+    FsyncRequest, IoBuffer, OpcodeDefinition, PINNED_IORING_OP_LAST, ParsedSubmission, PollRequest,
     ProvideBuffersRequest, ReadWriteRequest, RemoveBuffersRequest, ShutdownRequest,
-    SubmissionDependencies, SubmissionLink, SubmissionOpcodeSupport, SubmissionOperation,
-    SyncFileRangeRequest, TimeoutRequest, UringCmdRequest, classify_submission_opcode,
+    SubmissionContext, SubmissionDependencies, SubmissionLink, SubmissionOpcodeSupport,
+    SubmissionOperation, SyncFileRangeRequest, TimeoutRequest, UringCmdRequest,
+    classify_submission_opcode, opcode_definition,
 };
 pub use uapi::{
     DecodedSubmissionEntry, IO_URING_CQE_BYTES, IO_URING_PARAMS_BYTES, IO_URING_PROBE_HEADER_BYTES,
