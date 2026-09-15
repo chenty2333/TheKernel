@@ -8,6 +8,7 @@ extern crate std;
 mod fs;
 mod mount;
 mod node;
+pub mod nullfs;
 pub mod path;
 mod types;
 
