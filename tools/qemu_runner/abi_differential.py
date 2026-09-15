@@ -131,6 +131,7 @@ CONTRACTS.update({
     "fallocate-mode": ("raw-differential", "pass", "GEOMETRY_BEFORE_MODE_EINVAL UNKNOWN_MODE_EOPNOTSUPP MODE_BEFORE_ACCESS_EOPNOTSUPP PUNCH_REQUIRES_KEEP_SIZE COLLAPSE_REJECTS_KEEP_SIZE UNSHARE_RANGE_EOPNOTSUPP ZERO_RANGE_ACCEPTED"),
     "splice": ("raw-differential", "pass", "FILE_SOURCE_NOT_PACKETIZED PACKET_FLAGS_PRESERVED"),
 
+    "fs-basic": ("raw-differential", "pass", "DESCRIPTOR_IO_AND_SEEK POSITIONED_IO VECTORED_IO_BOUNDS DESCRIPTOR_DUPLICATION TRUNCATE_AND_SYNC NON_SEEKABLE_AND_ADVICE_BOUNDS"),
     "fifo-times": ("raw-differential", "pass", "FIFO_DESCRIPTOR_TIMES_SETTABLE FIFO_WRITE_STAMPS_MTIME FIFO_READ_STAMPS_ATIME"),    "tee": ("raw-differential", "pass", "FLAGS_BEFORE_FD_EINVAL ZERO_LEN_BEFORE_FD FD_BEFORE_TYPE_EINVAL SAME_PIPE_EINVAL COPY_RETAINS_SOURCE PACKET_FLAGS_PRESERVED"),
     "vmsplice": ("raw-differential", "pass", "FLAGS_BEFORE_FD_EINVAL BAD_FD_EBADF NON_PIPE_EBADF EMPTY_IOVEC_ZERO GIFT_AND_READBACK READ_IGNORES_PACKET_MODE WRITE_IGNORES_PACKET_MODE"),
     "readahead-types": ("raw-differential", "pass", "OFFSET_AFTER_TYPE_EINVAL NON_REGULAR_EINVAL REGULAR_ACCEPTED"),
@@ -259,7 +260,7 @@ PROGRAM_CASES = {
     "stat-access": ("access", "faccessat", "faccessat2", "newfstatat", "statx"),
     "socket-msg": ("socket_msg.send_flags", "socket_msg.sendmmsg_flags", "socket_msg.peek_waitall_tcp", "socket_msg.tcp_more", "socket_msg.compat_flag", "socket_msg.waitall_stream", "socket_msg.waitall_tcp", "socket_msg.waitall_datagram", "socket_msg.recvmmsg_deadline", "socket_msg.recvmmsg_waitforone"),
     "task-control": ("prctl-name", "prctl-timing", "prctl-auxv", "prctl-timer-restore-ids", "prctl-cfi", "arch_prctl", "iopl", "capset", "move_pages", "modify_ldt", "setpgid", "clone3"),
-    "fs-abi": ("getcwd", "fcntl", "syslog", "reboot", "ioctl", "mount", "umount2", "pipe2", "syncfs", "preadv2", "pwritev2", "fallocate-mode", "tee", "vmsplice", "readahead-types", "pidfd-send-signal", "ustat", "sysinfo", "uname", "splice", "fifo-times"),
+    "fs-abi": ("fs-basic", "getcwd", "fcntl", "syslog", "reboot", "ioctl", "mount", "umount2", "pipe2", "syncfs", "preadv2", "pwritev2", "fallocate-mode", "tee", "vmsplice", "readahead-types", "pidfd-send-signal", "ustat", "sysinfo", "uname", "splice", "fifo-times"),
     "epoll-membarrier": ("epoll-membarrier",),
     "socket-provider": ("socket_creation_order", "socket_unix_creation", "socket_netlink_creation", "socket_netlink_policy", "socket_address_lengths", "socket_name_record", "socket_sol_socket_table", "socket_netlink_option_table", "socket_null_operations"),
     "lsm-abi": ("lsm-self-attr",),

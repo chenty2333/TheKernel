@@ -165,6 +165,7 @@ static void cleanup(void) {
     if (dirfd >= 0) {
         (void)unlinkat(dirfd, "file", 0);
         (void)unlinkat(dirfd, "fifo", 0);
+        (void)unlinkat(dirfd, "basic", 0);
         (void)close(dirfd);
     }
     (void)rmdir(mnt);
@@ -1937,6 +1938,94 @@ int main(void) {
         check(fstat(fifo, &st) == 0, "fifo-fstat-read");
         check(st.st_atime != 1000000, "fifo-read-stamps-atime");
         mark("FIFO_READ_STAMPS_ATIME");
+    }
+    done();
+
+    /* ------------------------------------------------------------------ *
+     * The classic descriptor syscalls -- open/close/read/write, the seek
+     * family, descriptor duplication and the sync calls -- appear above only
+     * as setup for other cases, so nothing asserted their own contracts.
+     * Every rule below is from fs/read_write.c and fs/open.c.
+     * ------------------------------------------------------------------ */
+    begin("fs-basic.raw-differential");
+    {
+        char buf[64], path[256];
+        struct iovec iov[2];
+        struct stat st;
+        snprintf(path, sizeof(path), "%s/basic", root);
+        int fd = openat(dirfd, "basic", O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+        check(fd >= 0, "openat-create");
+        check(write(fd, "abcdef", 6) == 6, "write");
+        check(lseek(fd, 0, SEEK_CUR) == 6, "write-advances-offset");
+        check(lseek(fd, 2, SEEK_SET) == 2, "seek-set");
+        check(read(fd, buf, 4) == 4 && memcmp(buf, "cdef", 4) == 0, "read");
+        check(lseek(fd, 0, SEEK_CUR) == 6, "read-advances-offset");
+        check(lseek(fd, -2, SEEK_END) == 4, "seek-end");
+        /* read_write.c vfs_llseek(): an unknown whence is -EINVAL.  SEEK_DATA
+         * and SEEK_HOLE are 3 and 4, so the first unsupported value is 5. */
+        ERROR(lseek(fd, 0, 5), EINVAL, "seek-bad-whence");
+        check(read(fd, buf, 0) == 0, "read-zero-count");
+        check(write(fd, buf, 0) == 0, "write-zero-count");
+        mark("DESCRIPTOR_IO_AND_SEEK");
+
+        /* read_write.c ksys_pread64()/ksys_pwrite64(): no offset writeback,
+         * and a negative position is rejected. */
+        check(pread(fd, buf, 2, 0) == 2 && memcmp(buf, "ab", 2) == 0, "pread");
+        check(lseek(fd, 0, SEEK_CUR) == 4, "pread-preserves-offset");
+        check(pwrite(fd, "Z", 1, 4) == 1, "pwrite");
+        check(lseek(fd, 0, SEEK_CUR) == 4, "pwrite-preserves-offset");
+        check(pread(fd, buf, 1, 4) == 1 && buf[0] == 'Z', "pwrite-landed");
+        ERROR(pread(fd, buf, 1, -1), EINVAL, "pread-negative-offset");
+        ERROR(pwrite(fd, buf, 1, -1), EINVAL, "pwrite-negative-offset");
+        mark("POSITIONED_IO");
+
+        /* read_write.c import_iovec(): a zero segment count succeeds without
+         * touching the array, and above UIO_MAXIOV (1024) is -EINVAL. */
+        check(syscall(SYS_readv, fd, iov, 0) == 0, "readv-zero-iov");
+        check(syscall(SYS_writev, fd, iov, 0) == 0, "writev-zero-iov");
+        /* Reached through syscall(2) so the compiler cannot assume the
+         * kernel reads the whole array before rejecting the count. */
+        ERROR(syscall(SYS_readv, fd, iov, 1025), EINVAL, "readv-too-many-iov");
+        ERROR(syscall(SYS_writev, fd, iov, 1025), EINVAL, "writev-too-many-iov");
+        mark("VECTORED_IO_BOUNDS");
+
+        /* fs/file.c: dup() takes the lowest free descriptor, dup2() onto
+         * itself is a no-op, dup3() rejects equal descriptors. */
+        int aliased = dup(fd);
+        check(aliased >= 0 && aliased != fd, "dup");
+        check(dup2(fd, fd) == fd, "dup2-same");
+        ERROR(dup3(fd, fd, 0), EINVAL, "dup3-same");
+        check(close(aliased) == 0, "close-dup");
+        ERROR(close(-1), EBADF, "close-invalid");
+        ERROR(dup(-1), EBADF, "dup-invalid");
+        mark("DESCRIPTOR_DUPLICATION");
+
+        /* fs/open.c do_ftruncate(): growing zero-fills. */
+        check(ftruncate(fd, 3) == 0, "ftruncate-shrink");
+        check(fstat(fd, &st) == 0 && st.st_size == 3, "ftruncate-shrink-size");
+        check(ftruncate(fd, 10) == 0, "ftruncate-grow");
+        check(pread(fd, buf, 1, 9) == 1 && buf[0] == 0, "ftruncate-grow-zero-fills");
+        check(truncate(path, 6) == 0, "truncate-path");
+        check(fstat(fd, &st) == 0 && st.st_size == 6, "truncate-path-size");
+        check(fsync(fd) == 0, "fsync");
+        check(fdatasync(fd) == 0, "fdatasync");
+        mark("TRUNCATE_AND_SYNC");
+
+        /* fs/read_write.c: a pipe is not seekable, fs/open.c rejects
+         * truncating one, and mm/fadvise.c rejects an advice outside the
+         * POSIX range. */
+        ERROR(pread(fifo, buf, 1, 0), ESPIPE, "pread-fifo-ESPIPE");
+        ERROR(pwrite(fifo, buf, 1, 0), ESPIPE, "pwrite-fifo-ESPIPE");
+        ERROR(lseek(fifo, 0, SEEK_SET), ESPIPE, "lseek-fifo-ESPIPE");
+        ERROR(ftruncate(fifo, 0), EINVAL, "ftruncate-fifo-EINVAL");
+        ERROR(syscall(SYS_fadvise64, fd, 0, 0, 99), EINVAL, "fadvise64-bad-advice");
+        /* fs/readdir.c: a regular file has no iterate_shared. */
+        ERROR(syscall(SYS_getdents64, fd, buf, sizeof(buf)), ENOTDIR,
+              "getdents64-regular-ENOTDIR");
+        mark("NON_SEEKABLE_AND_ADVICE_BOUNDS");
+
+        check(close(fd) == 0, "final-close");
+        check(unlinkat(dirfd, "basic", 0) == 0, "unlink-basic");
     }
     done();
 
