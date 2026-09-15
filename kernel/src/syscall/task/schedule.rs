@@ -30,8 +30,9 @@ use crate::{
     mm::map_usercopy_error,
     readiness::block_on_poll_set_interruptible_if,
     task::{
-        AlarmClock, AsThread, Cred, PidNamespace, ProcStateHint, Process, PtraceAccessMode,
-        TaskUsage, Thread, check_current_process_ptrace_access,
+        AlarmClock, AsThread, Cred, NanosleepRestart, PidNamespace, ProcStateHint, Process,
+        PtraceAccessMode, RestartBlock, SleepClock, TaskUsage, Thread,
+        check_current_process_ptrace_access,
         check_current_thread_ptrace_image_access, cpu_clock_sleep_waiters,
         get_process_including_zombie, get_task, get_visible_task,
         get_visible_task_including_exiting, has_pending_syscall_signal, ns_capable,
@@ -665,11 +666,11 @@ fn flatten_clock_sleep_result(
     }
 }
 
-fn sleep_relative(dur: TimeValue) -> AxResult<TimeValue> {
+fn sleep_relative(dur: TimeValue) -> AxResult<(TimeValue, TimeValue)> {
     debug!("sleep_impl <= {dur:?}");
 
     if dur.is_zero() {
-        return Ok(dur);
+        return Ok((dur, AlarmClock::Monotonic.now()));
     }
     let start = AlarmClock::Monotonic.now();
     let deadline = start.checked_add(dur).unwrap_or(Duration::MAX);
@@ -693,7 +694,11 @@ fn sleep_relative(dur: TimeValue) -> AxResult<TimeValue> {
         }
     }
 
-    Ok(AlarmClock::Monotonic.now() - start)
+    // The second element is the absolute expiry this attempt armed, which is
+    // exactly what Linux copies into `restart->nanosleep.expires` from
+    // `hrtimer_get_expires()` so a restarted sleep resumes at the original
+    // deadline instead of sleeping the whole interval again.
+    Ok((AlarmClock::Monotonic.now() - start, deadline))
 }
 
 fn sleep_absolute(clock: AlarmClock, deadline: TimeValue) -> AxResult<ClockSleepOutcome> {
@@ -982,7 +987,7 @@ pub fn sys_nanosleep<M: UserMemory + ?Sized>(
     .try_into_time_value()?;
     debug!("sys_nanosleep <= req: {req:?}");
 
-    let actual = sleep_relative(req)?;
+    let (actual, deadline) = sleep_relative(req)?;
 
     if let Some(diff) = remaining_relative_sleep(req, actual) {
         debug!("sys_nanosleep => rem: {diff:?}");
@@ -992,9 +997,80 @@ pub fn sys_nanosleep<M: UserMemory + ?Sized>(
                     .map_err(map_usercopy_error)?;
             }
         }
+        // Linux `do_nanosleep()` reports `-ERESTART_RESTARTBLOCK` after
+        // `hrtimer_nanosleep()` armed `restart->nanosleep` with the timer's
+        // absolute expiry; `nanosleep` is `-ERESTART_RESTARTBLOCK`, never
+        // `-ERESTARTSYS`, so a handler forces `-EINTR` even under `SA_RESTART`.
+        install_nanosleep_restart(deadline, SleepClock::Wall(AlarmClock::Monotonic), rem);
         Err(AxError::Interrupted)
     } else {
         Ok(0)
+    }
+}
+
+/// Records the `restart->nanosleep` equivalent for a relative sleep.
+///
+/// `rem` is the original user `struct timespec *` handle, or null for Linux's
+/// `TT_NONE` case; `clock` is the clock the interrupted attempt actually armed
+/// (Linux reads it back from `t.timer.base->clockid`).
+fn install_nanosleep_restart(deadline: TimeValue, clock: SleepClock, rem: *mut timespec) {
+    current()
+        .as_thread()
+        .install_restart_block(RestartBlock::Nanosleep(NanosleepRestart {
+            deadline,
+            clock,
+            rem: rem.addr(),
+        }));
+}
+
+/// Resumes a `nanosleep`/`clock_nanosleep` restart block.
+///
+/// This is Linux `hrtimer_nanosleep_restart()`: sleep until the recorded
+/// absolute expiry on the recorded clock, then either report success or, on an
+/// interrupt with time left, copy the remaining time to the original `rmtp`
+/// (`nanosleep_copyout()`) and return `-ERESTART_RESTARTBLOCK` so the next
+/// no-handler signal resume re-enters `restart_syscall` with the same block.
+pub(crate) fn restart_nanosleep<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    block: NanosleepRestart,
+) -> AxResult<isize> {
+    let deadline = block.deadline;
+    let (now, outcome) = match block.clock {
+        SleepClock::Wall(clock) => {
+            let outcome = sleep_absolute(clock, deadline)?;
+            (clock.now(), outcome)
+        }
+        // `posix_cpu_nsleep_restart()` re-resolves the encoded clock and
+        // re-enters `do_cpu_nanosleep()` with `TIMER_ABSTIME` against the
+        // remaining CPU time recorded in `restart->nanosleep.expires`.
+        SleepClock::Cpu(clock_id) => {
+            let target = resolve_cpu_clock_sleep_target(clock_id)?;
+            let outcome = sleep_cpu_clock_until(&target, deadline)?;
+            (target.now(), outcome)
+        }
+    };
+    match outcome {
+        ClockSleepOutcome::Completed => Ok(0),
+        // The remaining time is checked before the copyout, so an
+        // already-expired timer reports success instead of EINTR.
+        ClockSleepOutcome::Interrupted if now >= deadline => Ok(0),
+        ClockSleepOutcome::Interrupted => {
+            if block.rem != 0 {
+                let remaining = deadline - now;
+                // SAFETY: the address was captured from the interrupted
+                // syscall's `rmtp` argument and is revalidated by this explicit
+                // usercopy against the caller's live address space.
+                unsafe {
+                    VmMutPtr::vm_write_unchecked(
+                        block.rem as *mut timespec,
+                        memory,
+                        timespec::from_time_value(remaining),
+                    )
+                    .map_err(map_usercopy_error)?;
+                }
+            }
+            Err(AxError::Interrupted)
+        }
     }
 }
 
@@ -1059,6 +1135,12 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
                             .map_err(map_usercopy_error)?;
                     }
                 }
+                // `do_cpu_nanosleep()` records the timer's remaining CPU time in
+                // `restart->nanosleep.expires` and reports
+                // `-ERESTART_RESTARTBLOCK`; `posix_cpu_nsleep()` only converts
+                // that to `-ERESTARTNOHAND` for `TIMER_ABSTIME`, so a relative
+                // CPU-clock sleep is restarted rather than replayed.
+                install_nanosleep_restart(deadline, SleepClock::Cpu(clock_id), rem);
                 Err(AxError::Interrupted)
             }
         };
@@ -1069,6 +1151,12 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
         return finish_absolute_clock_sleep(outcome, crate::syscall::time::tai_time(), req);
     }
     if absolute {
+        // Linux `hrtimer_nanosleep()` turns the `-ERESTART_RESTARTBLOCK` of an
+        // `HRTIMER_MODE_ABS` sleep into `-ERESTARTNOHAND` ("Absolute timers do
+        // not update the rmtp value and restart"), and `clock_nanosleep()`
+        // forces `rmtp = NULL` for `TIMER_ABSTIME`. The syscall therefore has
+        // no restart block: a no-handler signal resume replays it, which
+        // re-reads the same absolute deadline.
         let deadline = match clock_id as u32 {
             CLOCK_MONOTONIC => current().as_thread().time_ns().host_monotonic_deadline(req),
             CLOCK_BOOTTIME => current().as_thread().time_ns().host_boottime_deadline(req),
@@ -1077,7 +1165,7 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
         let outcome = sleep_absolute(clock, deadline)?;
         finish_absolute_clock_sleep(outcome, clock.now(), deadline)
     } else {
-        let actual = sleep_relative(req)?;
+        let (actual, deadline) = sleep_relative(req)?;
 
         if let Some(diff) = remaining_relative_sleep(req, actual) {
             debug!("sys_clock_nanosleep => rem: {diff:?}");
@@ -1087,6 +1175,11 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
                         .map_err(map_usercopy_error)?;
                 }
             }
+            // A relative `clock_nanosleep()` is `-ERESTART_RESTARTBLOCK` with
+            // the timer's absolute expiry recorded, exactly like `nanosleep()`.
+            // `sleep_relative()` always arms the monotonic clock, which is the
+            // equivalent of Linux reading back `t.timer.base->clockid`.
+            install_nanosleep_restart(deadline, SleepClock::Wall(AlarmClock::Monotonic), rem);
             Err(AxError::Interrupted)
         } else {
             Ok(0)

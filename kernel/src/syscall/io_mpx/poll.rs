@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::mem::{MaybeUninit, offset_of, size_of};
 
 use axerrno::{AxError, AxResult};
@@ -7,16 +7,20 @@ use axhal::{
     uspace::UserContext,
 };
 use axpoll::IoEvents;
+use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::{POLLNVAL, RLIMIT_NOFILE, pollfd, timespec};
 use tk_linux_signal::SignalSet;
 
-use super::{FdPollSet, io_to_linux_poll, linux_poll_events, wait_io_result, wait_signal_only};
+use super::{
+    FdPollSet, io_to_linux_poll, linux_poll_events, select::finish_timeout, wait_io_result,
+    wait_signal_only,
+};
 use crate::{
     file::get_file_like,
-    mm::{UserConstPtr, UserMemoryCapability, UserPtr, map_usercopy_error},
+    mm::{AddrSpace, UserConstPtr, UserMemoryCapability, UserPtr, map_usercopy_error},
     syscall::signal::check_sigset_size,
-    task::AsThread,
+    task::{AsThread, PollRestart, RestartBlock},
     time::TimeValueLike,
 };
 
@@ -218,7 +222,56 @@ pub fn sys_poll(
     } else {
         Some(TimeValue::from_millis(timeout as u64))
     };
-    do_poll(None, &mut poll_fds, timeout, None, &caller, fds)
+    // Linux `SYSCALL_DEFINE3(poll)` converts `-ERESTARTNOHAND` into
+    // `set_restart_fn(restart_block, do_restart_poll)`, i.e.
+    // `-ERESTART_RESTARTBLOCK` with the *absolute* expiry and the original
+    // descriptor array recorded. `ppoll` deliberately does not do this: it
+    // returns `-ERESTARTNOHAND` and relies on the remaining-time write-back to
+    // its `tsp`, so a replay resumes with the shortened timeout.
+    let deadline = timeout.map(|dur| wall_time().saturating_add(dur));
+    let result = do_poll(None, &mut poll_fds, timeout, None, &caller, fds);
+    if matches!(result, Err(AxError::Interrupted)) {
+        // `set_restart_fn()` returns `-ERESTARTNOHAND`, so the block is *armed*
+        // for an explicit `restart_syscall()` while the interrupted call itself
+        // still replays: `arch_do_signal_or_restart()` reloads `orig_ax` and
+        // rewinds the instruction pointer for that code, which re-enters
+        // `sys_poll` with the recorded timeout. `do_restart_poll()` -- and with
+        // it the absolute `end_time` -- is only reachable from userspace.
+        current()
+            .as_thread()
+            .arm_restart_block(RestartBlock::Poll(PollRestart {
+                fds: fds.address().as_usize(),
+                nfds: nfds as u32,
+                deadline,
+            }));
+    }
+    result
+}
+
+/// Resumes a `poll` restart block.
+///
+/// This is Linux `do_restart_poll()`: re-run `do_sys_poll()` with the recorded
+/// user array, descriptor count, and absolute `end_time`. The array is read
+/// again from userspace, so a concurrent change to it is observed on the
+/// restarted invocation exactly as in Linux.
+pub(crate) fn restart_poll(
+    caller_aspace: Arc<Mutex<AddrSpace>>,
+    block: PollRestart,
+) -> AxResult<isize> {
+    let caller = UserMemoryCapability::new(caller_aspace);
+    let nfds = checked_nfds(block.nfds as usize)?;
+    let fds = UserPtr::from(block.fds);
+    let mut poll_fds = snapshot_pollfds(&caller, fds, nfds)?;
+    let timeout = block
+        .deadline
+        .map(|deadline| deadline.saturating_sub(wall_time()));
+    let result = do_poll(None, &mut poll_fds, timeout, None, &caller, fds);
+    if matches!(result, Err(AxError::Interrupted)) {
+        // Linux re-arms the same block from `do_restart_poll()` whenever
+        // `do_sys_poll()` reports `-ERESTARTNOHAND` again.
+        current().as_thread().arm_restart_block(RestartBlock::Poll(block));
+    }
+    result
 }
 
 pub fn sys_ppoll(
@@ -240,7 +293,7 @@ pub fn sys_ppoll(
     };
     let nfds = checked_nfds(nfds.try_into().map_err(|_| AxError::InvalidInput)?)?;
     let mut poll_fds = snapshot_pollfds(&caller, fds, nfds)?;
-    let timeout = if timeout.is_null() {
+    let timeout_value = if timeout.is_null() {
         None
     } else {
         Some(
@@ -248,7 +301,29 @@ pub fn sys_ppoll(
                 .try_into_time_value()?,
         )
     };
-    do_poll(Some(uctx), &mut poll_fds, timeout, sigmask, &caller, fds)
+    let started = axhal::time::monotonic_time();
+    let result = do_poll(
+        Some(uctx),
+        &mut poll_fds,
+        timeout_value,
+        sigmask,
+        &caller,
+        fds,
+    );
+    // Linux `SYSCALL_DEFINE5(ppoll)` ends in
+    // `poll_select_finish(&end_time, tsp, PT_TIMESPEC, ret)`, which writes the
+    // remaining time back to the caller's `tsp` on every return path --
+    // including `-ERESTARTNOHAND`. That write-back is what lets ppoll replay
+    // the syscall instead of carrying a restart block, so it has to happen for
+    // the interrupted case too.
+    finish_timeout(
+        &caller,
+        timeout.address().as_usize(),
+        timeout_value,
+        started,
+        false,
+    );
+    result
 }
 
 #[cfg(test)]
