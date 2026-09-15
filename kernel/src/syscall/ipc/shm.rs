@@ -28,7 +28,7 @@ use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
 use super::{
     IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcAccess,
-    IpcAccessContext, IpcNamespace, IpcPerm, IpcPermissionUpdateRequest, SHM_DEST, SHM_INFO,
+    IpcAccessContext, IpcNamespace, IpcPerm, SHM_DEST, SHM_INFO,
     SHM_LOCK, SHM_LOCKED, SHM_STAT, SHM_STAT_ANY, SHM_UNLOCK, SHMMIN, ShmLockCharge,
     allocate_ipc_id, shmall_limit, shmmax_limit, shmmni_limit,
 };
@@ -3010,8 +3010,33 @@ pub fn sys_shmctl<M: UserMemory + ?Sized>(
         return Ok(published as isize);
     }
 
-    // Preserve the old lookup-before-copyin errno ordering, but do not keep
-    // the transaction lock while usercopy takes the address-space lock.
+    // Linux `ipc/shm.c:ksys_shmctl()` copies the `IPC_SET` record out of
+    // userspace *before* `shmctl_down()` resolves the identifier:
+    //
+    // ```c
+    // 	case IPC_SET:
+    // 		if (copy_shmid_from_user(&sem64, buf, version))
+    // 			return -EFAULT;
+    // 		fallthrough;
+    // 	case IPC_RMID:
+    // 		return shmctl_down(ns, shmid, cmd, &sem64);
+    // ```
+    //
+    // so a faulting buffer is EFAULT even when the identifier names nothing.
+    // The record is not interpreted until the segment's own lock is held.
+    let set_perm = if cmd == IPC_SET {
+        let user_ds = read_shmid_ds(memory, buf as *const ShmidDs)?;
+        Some((
+            user_ds.shm_perm.uid,
+            user_ds.shm_perm.gid,
+            user_ds.shm_perm.mode,
+        ))
+    } else {
+        None
+    };
+
+    // Do not keep the transaction lock while usercopy takes the
+    // address-space lock.
     let shm_inner = {
         let _transaction = ipc_ns.shm_transaction().lock();
         ipc_ns
@@ -3019,16 +3044,6 @@ pub fn sys_shmctl<M: UserMemory + ?Sized>(
             .lock()
             .get_inner_by_shmid(shmid)
             .ok_or(AxError::InvalidInput)?
-    };
-    let set_request: Option<IpcPermissionUpdateRequest> = if cmd == IPC_SET {
-        let user_ds = read_shmid_ds(memory, buf as *const ShmidDs)?;
-        Some(context.map_permission_update(
-            user_ds.shm_perm.uid,
-            user_ds.shm_perm.gid,
-            user_ds.shm_perm.mode,
-        )?)
-    } else {
-        None
     };
 
     let _transaction = ipc_ns.shm_transaction().lock();
@@ -3041,10 +3056,19 @@ pub fn sys_shmctl<M: UserMemory + ?Sized>(
     }
 
     if cmd == IPC_SET {
+        let (uid, gid, mode) = set_perm.expect("IPC_SET copied its record before the lookup");
         let mut state = shm_inner.lock();
+        // Linux `shmctl_down()` runs `ipcctl_obtain_check()` - the
+        // owner-or-CAP_SYS_ADMIN test - before `ipc_update_perm()` translates
+        // the requested owner ids, so a caller that may not control the
+        // segment is refused with EPERM rather than with the EINVAL an
+        // unmappable id would produce.
+        if !context.may_control(&state.shmid_ds.shm_perm) {
+            return Err(AxError::from(LinuxError::EPERM));
+        }
         let prepared = context.prepare_permission_update(
             &state.shmid_ds.shm_perm,
-            set_request.expect("IPC_SET request was prepared before locking"),
+            context.map_permission_update(uid, gid, mode)?,
         )?;
         prepared.commit(&mut state.shmid_ds.shm_perm);
         state.shmid_ds.shm_ctime = wall_time().as_secs() as __kernel_time_t;

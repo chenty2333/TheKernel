@@ -24,7 +24,7 @@ use tk_linux_usercopy::{
 
 use super::{
     GETALL, GETNCNT, GETPID, GETVAL, GETZCNT, IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID,
-    IPC_SET, IPC_STAT, IpcAccess, IpcAccessContext, IpcPerm, IpcPermissionUpdateRequest, SEM_INFO,
+    IPC_SET, IPC_STAT, IpcAccess, IpcAccessContext, IpcPerm, SEM_INFO,
     SEM_STAT, SEM_STAT_ANY, SETALL, SETVAL, allocate_ipc_id,
 };
 use crate::{
@@ -257,7 +257,9 @@ fn monotonic_duration() -> Duration {
 pub struct SemidDs {
     pub sem_perm: IpcPerm,
     pub sem_otime: __kernel_time_t,
+    pub unused1: c_ulong,
     pub sem_ctime: __kernel_time_t,
+    pub unused2: c_ulong,
     pub sem_nsems: c_ulong,
     pub unused3: c_ulong,
     pub unused4: c_ulong,
@@ -266,6 +268,13 @@ pub struct SemidDs {
 // These System V semaphore records contain Linux ABI padding through their
 // embedded `IpcPerm`.  Keep the x86_64 layout checked and serialize a zeroed
 // copy for output so implicit alignment bytes never escape to userspace.
+//
+// The two `__unused` words after `sem_otime` and `sem_ctime` are not
+// decoration: `arch/x86/include/uapi/asm/sembuf.h` carries them on x86_64
+// ("x86_64 and x32 incorrectly added padding here, so the structures are
+// still incompatible with the padding on x86"), which is why Linux's
+// `semid64_ds` is 104 bytes with `sem_ctime` at 64 and `sem_nsems` at 80
+// rather than the 88 bytes a packed reading would give.
 const _: () = {
     assert!(align_of::<IpcPerm>() == 8);
     assert!(size_of::<IpcPerm>() == 48);
@@ -274,13 +283,15 @@ const _: () = {
     assert!(offset_of!(IpcPerm, unused0) == 32);
     assert!(offset_of!(IpcPerm, unused1) == 40);
     assert!(align_of::<SemidDs>() == 8);
-    assert!(size_of::<SemidDs>() == 88);
+    assert!(size_of::<SemidDs>() == 104);
     assert!(offset_of!(SemidDs, sem_perm) == 0);
     assert!(offset_of!(SemidDs, sem_otime) == 48);
-    assert!(offset_of!(SemidDs, sem_ctime) == 56);
-    assert!(offset_of!(SemidDs, sem_nsems) == 64);
-    assert!(offset_of!(SemidDs, unused3) == 72);
-    assert!(offset_of!(SemidDs, unused4) == 80);
+    assert!(offset_of!(SemidDs, unused1) == 56);
+    assert!(offset_of!(SemidDs, sem_ctime) == 64);
+    assert!(offset_of!(SemidDs, unused2) == 72);
+    assert!(offset_of!(SemidDs, sem_nsems) == 80);
+    assert!(offset_of!(SemidDs, unused3) == 88);
+    assert!(offset_of!(SemidDs, unused4) == 96);
 };
 
 fn initialized_semid_ds(value: SemidDs) -> SemidDs {
@@ -301,7 +312,9 @@ fn initialized_semid_ds(value: SemidDs) -> SemidDs {
     perm.unused1 = value.sem_perm.unused1;
     result.sem_perm = perm;
     result.sem_otime = value.sem_otime;
+    result.unused1 = value.unused1;
     result.sem_ctime = value.sem_ctime;
+    result.unused2 = value.unused2;
     result.sem_nsems = value.sem_nsems;
     result.unused3 = value.unused3;
     result.unused4 = value.unused4;
@@ -356,7 +369,9 @@ impl SemidDs {
                 unused1: 0,
             },
             sem_otime: 0,
+            unused1: 0,
             sem_ctime: ipc_time_secs(),
+            unused2: 0,
             sem_nsems: nsems as c_ulong,
             unused3: 0,
             unused4: 0,
@@ -995,21 +1010,35 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
         return Ok(id as isize);
     }
 
+    // Linux `ipc/sem.c:ksys_semctl()` copies the `IPC_SET` record out of
+    // userspace *before* `semctl_down()` resolves the identifier:
+    //
+    // ```c
+    // 	case IPC_SET:
+    // 		if (copy_semid_from_user(&semid64, p, version))
+    // 			return -EFAULT;
+    // 		fallthrough;
+    // 	case IPC_RMID:
+    // 		return semctl_down(ns, semid, cmd, &semid64);
+    // ```
+    //
+    // so a faulting buffer is EFAULT even when the identifier names nothing.
+    let set_perm = if cmd == IPC_SET {
+        let user_ds = VmPtr::vm_read(arg as *const SemidDs, memory).map_err(map_usercopy_error)?;
+        Some((
+            user_ds.sem_perm.uid,
+            user_ds.sem_perm.gid,
+            user_ds.sem_perm.mode,
+        ))
+    } else {
+        None
+    };
+
     let array = {
         let manager = ipc_ns.sem_manager().lock();
         manager
             .get_array_by_semid(semid)
             .ok_or(AxError::from(LinuxError::EINVAL))?
-    };
-    let set_request: Option<IpcPermissionUpdateRequest> = if cmd == IPC_SET {
-        let user_ds = VmPtr::vm_read(arg as *const SemidDs, memory).map_err(map_usercopy_error)?;
-        Some(context.map_permission_update(
-            user_ds.sem_perm.uid,
-            user_ds.sem_perm.gid,
-            user_ds.sem_perm.mode,
-        )?)
-    } else {
-        None
     };
     // SETALL snapshots and validates the complete input before acquiring the
     // array lock.  The lock is reacquired below only to revalidate identity,
@@ -1066,9 +1095,18 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
             Ok(0)
         }
         IPC_SET => {
+            let (uid, gid, mode) = set_perm.expect("IPC_SET copied its record before the lookup");
+            // Linux `semctl_down()` runs `ipcctl_obtain_check()` - the
+            // owner-or-CAP_SYS_ADMIN test - before `ipc_update_perm()`
+            // translates the requested owner ids, so a caller that may not
+            // control the array is refused with EPERM rather than with the
+            // EINVAL an unmappable id would produce.
+            if !context.may_control(&array.semid_ds.sem_perm) {
+                return Err(AxError::from(LinuxError::EPERM));
+            }
             let prepared = context.prepare_permission_update(
                 &array.semid_ds.sem_perm,
-                set_request.expect("IPC_SET request was prepared before locking"),
+                context.map_permission_update(uid, gid, mode)?,
             )?;
             prepared.commit(&mut array.semid_ds.sem_perm);
             array.mark_changed();
@@ -1286,10 +1324,15 @@ fn try_apply_semops(
     Ok(SemTryResult::Ready)
 }
 
-fn validate_timeout<M: UserMemory + ?Sized>(
+/// Linux `ksys_semtimedop()` copies the relative timeout into kernel memory
+/// before it calls `do_semtimedop()`, so an unreadable timeout is EFAULT even
+/// when the operation vector is out of range or absent.  The value is not
+/// interpreted here: `timespec64_valid()` runs much later, in
+/// `__do_semtimedop()`.
+fn read_timeout<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     timeout: *const timespec,
-) -> AxResult<Option<Duration>> {
+) -> AxResult<Option<timespec>> {
     if timeout.is_null() {
         return Ok(None);
     }
@@ -1297,6 +1340,15 @@ fn validate_timeout<M: UserMemory + ?Sized>(
         VmPtr::vm_read_uninit(timeout, memory)
             .map_err(map_usercopy_error)?
             .assume_init()
+    };
+    Ok(Some(timeout))
+}
+
+/// Linux `__do_semtimedop()`: `if (!timespec64_valid(timeout)) return -EINVAL;`
+/// - reached only after the operation vector has been copied in.
+fn timeout_deadline(timeout: Option<timespec>) -> AxResult<Option<Duration>> {
+    let Some(timeout) = timeout else {
+        return Ok(None);
     };
     let tv = timeout.try_into_time_value()?;
     let duration = Duration::from_nanos(tv.as_nanos().min(u64::MAX as u128) as u64);
@@ -1409,7 +1461,7 @@ pub fn sys_semop<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     semid: i32,
     sops: *const Sembuf,
-    nsops: usize,
+    nsops: u32,
 ) -> AxResult<isize> {
     sys_semtimedop(memory, semid, sops, nsops, core::ptr::null())
 }
@@ -1418,19 +1470,56 @@ pub fn sys_semtimedop<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     semid: i32,
     sops: *const Sembuf,
-    nsops: usize,
+    nsops: u32,
     timeout: *const timespec,
 ) -> AxResult<isize> {
-    // Linux `__do_semtimedop()`: `if (nsops < 1 || semid < 0) return -EINVAL;`
+    // Linux `ipc/sem.c` argument order.  `ksys_semtimedop()` fetches the
+    // relative timeout, `do_semtimedop()` bounds and copies the operation
+    // vector, and only `__do_semtimedop()` rejects the identifier and an
+    // invalid `timespec`:
+    //
+    // ```c
+    // 	if (timeout) {
+    // 		struct timespec64 ts;
+    // 		if (get_timespec64(&ts, timeout))
+    // 			return -EFAULT;
+    // 		return do_semtimedop(semid, tsops, nsops, &ts);
+    // 	}
+    // 	return do_semtimedop(semid, tsops, nsops, NULL);
+    //
+    // 	if (nsops > ns->sc_semopm)
+    // 		return -E2BIG;
+    // 	if (nsops < 1)
+    // 		return -EINVAL;
+    // 	if (copy_from_user(sops, tsops, nsops * sizeof(*tsops))) {
+    // 		ret =  -EFAULT;
+    // 		goto out_free;
+    // 	}
+    // 	ret = __do_semtimedop(semid, sops, nsops, timeout, ns);
+    // ```
+    //
+    // The parameter is Linux's `unsigned int nsops`, so the register is
+    // truncated to 32 bits before the bound and the copy agree on a count.
+    let raw_timeout = read_timeout(memory, timeout)?;
+
+    if nsops as usize > semopm_limit() {
+        return Err(AxError::from(LinuxError::E2BIG));
+    }
+    if nsops == 0 {
+        return Err(AxError::from(LinuxError::EINVAL));
+    }
+    let ops = vm_load(memory, sops, nsops as usize).map_err(map_usercopy_error)?;
+
+    // `__do_semtimedop()` repeats both bounds, then rejects a negative
+    // identifier.  Because the vector has already been copied, a faulting
+    // `tsops` is EFAULT even for a negative `semid`.
     if nsops == 0 || semid < 0 {
         return Err(AxError::from(LinuxError::EINVAL));
     }
-    if nsops > semopm_limit() {
+    if nsops as usize > semopm_limit() {
         return Err(AxError::from(LinuxError::E2BIG));
     }
-
-    let deadline = validate_timeout(memory, timeout)?;
-    let ops = vm_load(memory, sops, nsops).map_err(map_usercopy_error)?;
+    let deadline = timeout_deadline(raw_timeout)?;
     let current = current();
     let proc_data = &current.as_thread().proc_data;
     let ipc_ns = current.as_thread().ipc_ns();

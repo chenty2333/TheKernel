@@ -630,6 +630,7 @@ static void case_errno_order(void) {
     struct shmid_ds hds;
     struct sembuf op;
     struct timespec timeout;
+    union semun arg;
 
     begin("sysvipc-errno.order");
 
@@ -658,6 +659,21 @@ static void case_errno_order(void) {
     /* A live queue with an unreadable type is the text copy's EFAULT. */
     errno = 0;
     errno_call(msgsnd(msqid, BAD, 8, 0), EFAULT, "msgsnd-text-efault");
+
+    /* do_msgrcv() reads the buffer size as a *signed* word:
+     * `if (msqid < 0 || (long) bufsz < 0) return -EINVAL;`.  A size with the
+     * sign bit set is therefore EINVAL, and the message must survive the
+     * refusal. */
+    memcpy(msg.mtext, "survive!", 8);
+    errno = 0;
+    ok_call(msgsnd(msqid, &msg, 8, 0), "msgsnd-negative-size-setup");
+    errno = 0;
+    errno_call(msgrcv(msqid, &msg, (size_t)-1, 0, IPC_NOWAIT), EINVAL,
+               "msgrcv-negative-size");
+    memset(&msg, 0, sizeof(msg));
+    errno = 0;
+    check(msgrcv(msqid, &msg, 8, 0, 0) == 8, "msgrcv-negative-size-kept");
+    check(memcmp(msg.mtext, "survive!", 8) == 0, "msgrcv-negative-size-data");
 
     memcpy(msg.mtext, "payload", 8);
     errno = 0;
@@ -729,6 +745,32 @@ static void case_errno_order(void) {
     errno = 0;
     errno_call(shmctl(-1, IPC_INFO, &hds), EINVAL, "shmctl-negative-id-einval");
 
+    /* The three *ctl families copy the IPC_SET record out of userspace before
+     * they resolve the identifier (`ksys_msgctl()`, `ksys_semctl()` and
+     * `ksys_shmctl()` all perform the copy ahead of the `*ctl_down()` call), so
+     * a faulting buffer is EFAULT even for an identifier that names nothing. */
+    errno = 0;
+    errno_call(msgctl(0x7fff, IPC_SET, (struct msqid_ds *)BAD), EFAULT,
+               "msgctl-set-copy-before-id");
+    memset(&arg, 0, sizeof(arg));
+    arg.ptr = BAD;
+    errno = 0;
+    errno_call(semctl(0x7fff, 0, IPC_SET, arg), EFAULT,
+               "semctl-set-copy-before-id");
+    errno = 0;
+    errno_call(shmctl(0x7fff, IPC_SET, (struct shmid_ds *)BAD), EFAULT,
+               "shmctl-set-copy-before-id");
+
+    /* __do_semtimedop() rejects `semid < 0` and an invalid timespec only after
+     * do_semtimedop() has copied the operation vector in, so a faulting vector
+     * is EFAULT in both places. */
+    errno = 0;
+    errno_call(semop(-1, (struct sembuf *)BAD, 1), EFAULT,
+               "semop-vector-before-semid");
+    errno = 0;
+    errno_call(syscall(NR_SEMTIMEDOP, semid, (struct sembuf *)BAD, 1, &timeout),
+               EFAULT, "semtimedop-vector-before-timeout");
+
     errno = 0;
     ok_call(msgctl(msqid, IPC_RMID, NULL), "msgctl-rmid");
     errno = 0;
@@ -737,7 +779,10 @@ static void case_errno_order(void) {
     mark("SEMOP_EFBIG_BEFORE_EACCES");
     mark("MSGSND_FAULTS_BEFORE_VALIDATION");
     mark("MSGSND_SIZE_AND_TYPE_BEFORE_ID");
+    mark("MSGRCV_NEGATIVE_SIZE_EINVAL");
     mark("TABLE_COMMANDS_REJECT_NEGATIVE_ID");
+    mark("IPC_SET_COPY_BEFORE_IDENTIFIER");
+    mark("SEMOP_VECTOR_COPY_BEFORE_VALIDATION");
     mark("SEMCTL_VALUE_AND_SEMNUM_ORDER");
     mark("SEMTIMEDOP_COUNT_AND_TIMEOUT_ORDER");
     done();
@@ -788,6 +833,215 @@ static void case_exclusive_create_order(void) {
     done();
 }
 
+/*
+ * Hands each SysV object this process owns to uid 0 and gid 0 while running as
+ * uid 1, then reads the ownership back.  Every step returns a distinct status
+ * so a failure names the family and the operation that diverged.
+ */
+static int owner_change_unheld_id(void) {
+    struct msqid_ds mds;
+    struct semid_ds sds;
+    struct shmid_ds hds;
+    union semun arg;
+
+    int msqid = msgget(IPC_PRIVATE, IPC_CREAT | 0600);
+    if (msqid < 0) {
+        return 1;
+    }
+    memset(&mds, 0, sizeof(mds));
+    if (msgctl(msqid, IPC_STAT, &mds) != 0) {
+        return 2;
+    }
+    mds.msg_perm.uid = 0;
+    mds.msg_perm.gid = 0;
+    if (msgctl(msqid, IPC_SET, &mds) != 0) {
+        return 3;
+    }
+    memset(&mds, 0, sizeof(mds));
+    if (msgctl(msqid, IPC_STAT, &mds) != 0) {
+        return 4;
+    }
+    if (mds.msg_perm.uid != 0 || mds.msg_perm.gid != 0) {
+        return 5;
+    }
+    msgctl(msqid, IPC_RMID, NULL);
+
+    int semid = semget(IPC_PRIVATE, 1, IPC_CREAT | 0600);
+    if (semid < 0) {
+        return 6;
+    }
+    memset(&arg, 0, sizeof(arg));
+    memset(&sds, 0, sizeof(sds));
+    arg.buf = &sds;
+    if (semctl(semid, 0, IPC_STAT, arg) != 0) {
+        return 7;
+    }
+    sds.sem_perm.uid = 0;
+    sds.sem_perm.gid = 0;
+    if (semctl(semid, 0, IPC_SET, arg) != 0) {
+        return 8;
+    }
+    memset(&sds, 0, sizeof(sds));
+    if (semctl(semid, 0, IPC_STAT, arg) != 0) {
+        return 9;
+    }
+    if (sds.sem_perm.uid != 0 || sds.sem_perm.gid != 0) {
+        return 10;
+    }
+    semctl(semid, 0, IPC_RMID, arg);
+
+    int shmid = shmget(IPC_PRIVATE, PAGE_BYTES, IPC_CREAT | 0600);
+    if (shmid < 0) {
+        return 11;
+    }
+    memset(&hds, 0, sizeof(hds));
+    if (shmctl(shmid, IPC_STAT, &hds) != 0) {
+        return 12;
+    }
+    hds.shm_perm.uid = 0;
+    hds.shm_perm.gid = 0;
+    if (shmctl(shmid, IPC_SET, &hds) != 0) {
+        return 13;
+    }
+    memset(&hds, 0, sizeof(hds));
+    if (shmctl(shmid, IPC_STAT, &hds) != 0) {
+        return 14;
+    }
+    if (hds.shm_perm.uid != 0 || hds.shm_perm.gid != 0) {
+        return 15;
+    }
+    shmctl(shmid, IPC_RMID, NULL);
+    return 0;
+}
+
+/*
+ * Case: sysvipc-owner.set
+ *
+ * `ipc_update_perm()` (ipc/util.c) refuses an IPC_SET only when the requested
+ * owner id has no mapping in the caller's user namespace:
+ *
+ *   kuid_t uid = make_kuid(current_user_ns(), in->uid);
+ *   kgid_t gid = make_kgid(current_user_ns(), in->gid);
+ *   if (!uid_valid(uid) || !gid_valid(gid))
+ *           return -EINVAL;
+ *   out->uid = uid;
+ *   out->gid = gid;
+ *
+ * The right to *change* the object is decided earlier, by
+ * `ipcctl_obtain_check()`'s owner-or-CAP_SYS_ADMIN test.  A plain owner may
+ * therefore hand the object to any representable uid and gid - it needs
+ * neither CAP_CHOWN nor the ids it is handing the object to.  The probe must
+ * run as an unprivileged uid, because for root every candidate rule agrees.
+ */
+static void case_owner_change(void) {
+    begin("sysvipc-owner.set");
+
+    if (geteuid() == 0) {
+        pid_t child = fork();
+        if (child < 0) {
+            fail("fork");
+        }
+        if (child == 0) {
+            if (setresuid(1, 1, 1) != 0) {
+                _exit(20);
+            }
+            _exit(owner_change_unheld_id());
+        }
+        reap_child(child, "owner-change-unheld-id");
+    } else {
+        check(owner_change_unheld_id() == 0, "owner-change-unheld-id");
+    }
+
+    mark("OWNER_HANDS_OBJECT_TO_UNHELD_ID");
+    done();
+}
+
+/*
+ * Case: sysvipc-record.layout
+ *
+ * The control records are the native x86_64 `msqid64_ds`, `semid64_ds` and
+ * `shmid64_ds`.  Their trailing `__unused` words are part of the layout, not
+ * decoration:
+ *
+ *   - `include/uapi/asm-generic/msgbuf.h` leaves "2 miscellaneous 32-bit
+ *     values" after `msg_lrpid`, so `msqid64_ds` is 120 bytes;
+ *   - `arch/x86/include/uapi/asm/sembuf.h` pads after `sem_otime` *and* after
+ *     `sem_ctime` on x86_64 only ("x86_64 and x32 incorrectly added padding
+ *     here, so the structures are still incompatible with the padding on
+ *     x86"), so `semid64_ds` is 104 bytes with `sem_ctime` at 64 and
+ *     `sem_nsems` at 80;
+ *   - `include/uapi/asm-generic/shmbuf.h` leaves two words after `shm_nattch`,
+ *     so `shmid64_ds` is 112 bytes.
+ *
+ * A kernel that packs a record shifts every later field, which is invisible to
+ * a test that only looks at the return value.  Each probe below therefore
+ * pre-fills the caller's record with a non-zero pattern and then checks both
+ * the field values (read through the caller's own header layout) and that the
+ * kernel zeroed the placeholder words it owns.
+ */
+static void case_record_layout(void) {
+    struct msqid_ds mds;
+    struct semid_ds sds;
+    struct shmid_ds hds;
+    union semun arg;
+    static const unsigned char zero[16];
+    int msqid, semid, shmid;
+
+    begin("sysvipc-record.layout");
+
+    /* The struct sizes the checks below rely on, measured in the guest
+     * itself: `sem_nsems` only lands where Linux puts it if the record is 104
+     * bytes. */
+    check(sizeof(struct msqid_ds) == 120, "sizeof-msqid_ds");
+    check(sizeof(struct semid_ds) == 104, "sizeof-semid_ds");
+    check(sizeof(struct shmid_ds) == 112, "sizeof-shmid_ds");
+
+    msqid = (int)ok_call(msgget(IPC_PRIVATE, IPC_CREAT | 0600), "record-msgget");
+    memset(&mds, 0xa5, sizeof(mds));
+    errno = 0;
+    ok_call(msgctl(msqid, IPC_STAT, &mds), "record-msgctl-stat");
+    check(mds.msg_perm.mode == 0600, "msqid-ds-mode");
+    check(mds.msg_qbytes == 16384, "msqid-ds-qbytes");
+    check(mds.msg_qnum == 0 && mds.msg_cbytes == 0, "msqid-ds-empty");
+    check(mds.msg_stime == 0 && mds.msg_rtime == 0, "msqid-ds-times");
+    check(mds.msg_lspid == 0 && mds.msg_lrpid == 0, "msqid-ds-pids");
+    check(memcmp((char *)&mds + 104, zero, sizeof(mds) - 104) == 0,
+          "msqid-ds-unused");
+    ok_call(msgctl(msqid, IPC_RMID, NULL), "record-msgctl-rmid");
+
+    semid = (int)ok_call(semget(IPC_PRIVATE, 3, IPC_CREAT | 0600),
+                         "record-semget");
+    memset(&sds, 0xa5, sizeof(sds));
+    memset(&arg, 0, sizeof(arg));
+    arg.buf = &sds;
+    errno = 0;
+    ok_call(semctl(semid, 0, IPC_STAT, arg), "record-semctl-stat");
+    check(sds.sem_perm.mode == 0600, "semid-ds-mode");
+    check(sds.sem_nsems == 3, "semid-ds-nsems");
+    check(sds.sem_otime == 0, "semid-ds-otime");
+    check(memcmp((char *)&sds + 88, zero, sizeof(sds) - 88) == 0,
+          "semid-ds-unused");
+    ok_call(semctl(semid, 0, IPC_RMID, arg), "record-semctl-rmid");
+
+    shmid = (int)ok_call(shmget(IPC_PRIVATE, PAGE_BYTES + 1, IPC_CREAT | 0600),
+                         "record-shmget");
+    memset(&hds, 0xa5, sizeof(hds));
+    errno = 0;
+    ok_call(shmctl(shmid, IPC_STAT, &hds), "record-shmctl-stat");
+    check(hds.shm_perm.mode == 0600, "shmid-ds-mode");
+    check(hds.shm_segsz == PAGE_BYTES + 1, "shmid-ds-segsz");
+    check(hds.shm_nattch == 0, "shmid-ds-nattch");
+    check(hds.shm_atime == 0 && hds.shm_dtime == 0, "shmid-ds-times");
+    check(memcmp((char *)&hds + 96, zero, sizeof(hds) - 96) == 0,
+          "shmid-ds-unused");
+    ok_call(shmctl(shmid, IPC_RMID, NULL), "record-shmctl-rmid");
+
+    mark("MSQID_DS_LAYOUT_MATCHES_LINUX");
+    mark("SEMID_DS_LAYOUT_MATCHES_LINUX");
+    mark("SHMID_DS_LAYOUT_MATCHES_LINUX");
+    done();
+}
+
 int main(void) {
     case_identifier_progression();
     case_stat_index_resolution();
@@ -800,6 +1054,8 @@ int main(void) {
     case_shm_dest_stat();
     case_errno_order();
     case_exclusive_create_order();
+    case_owner_change();
+    case_record_layout();
     puts("THEKERNEL_SYSVIPC_OK");
     return 0;
 }
