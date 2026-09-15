@@ -13,7 +13,7 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
-use bytemuck::{Pod, Zeroable};
+use bytemuck::{Pod, Zeroable, try_pod_read_unaligned};
 use linux_raw_sys::general::CAP_SYS_ADMIN;
 use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr};
 
@@ -30,18 +30,21 @@ use crate::{
             LANDLOCK_ACCESS_FS_MAKE_DIR, LANDLOCK_ACCESS_FS_MAKE_FIFO, LANDLOCK_ACCESS_FS_MAKE_REG,
             LANDLOCK_ACCESS_FS_MAKE_SOCK, LANDLOCK_ACCESS_FS_MAKE_SYM, LANDLOCK_ACCESS_FS_READ_DIR,
             LANDLOCK_ACCESS_FS_READ_FILE, LANDLOCK_ACCESS_FS_REFER, LANDLOCK_ACCESS_FS_REMOVE_DIR,
-            LANDLOCK_ACCESS_FS_REMOVE_FILE, LANDLOCK_ACCESS_FS_TRUNCATE,
-            LANDLOCK_ACCESS_FS_WRITE_FILE, LANDLOCK_RESTRICT_SELF_LOG_MASK,
+            LANDLOCK_ACCESS_FS_REMOVE_FILE, LANDLOCK_ACCESS_FS_RESOLVE_UNIX,
+            LANDLOCK_ACCESS_FS_TRUNCATE, LANDLOCK_ACCESS_FS_WRITE_FILE,
+            LANDLOCK_ACCESS_NET_BIND_TCP, LANDLOCK_ACCESS_NET_BIND_UDP,
+            LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP, LANDLOCK_ACCESS_NET_CONNECT_TCP,
             LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET, LANDLOCK_SCOPE_SIGNAL, LandlockPolicy,
         },
     },
 };
 
-const LANDLOCK_ABI_VERSION: u32 = 7;
+const LANDLOCK_ABI_VERSION: u32 = 10;
 const CREATE_VERSION: u32 = 1;
 const CREATE_ERRATA: u32 = 2;
-// Linux v6.12.103: security/landlock/errata/abi-1.h fixes erratum 3,
-// abi-4.h fixes erratum 1, and abi-6.h fixes erratum 2.
+// Linux v7.2.3: security/landlock/errata/abi-1.h fixes erratum 3,
+// abi-4.h fixes erratum 1, and abi-6.h fixes erratum 2.  No erratum was added
+// for ABI 10, so the mask is unchanged from the ABI 6..9 value.
 const LANDLOCK_ERRATA_FIXED: u32 = 0b111;
 const RULE_PATH_BENEATH: u32 = 1;
 const RULE_NET_PORT: u32 = 2;
@@ -60,14 +63,13 @@ const FS_ACCESS_MASK: u64 = LANDLOCK_ACCESS_FS_EXECUTE
     | LANDLOCK_ACCESS_FS_MAKE_SYM
     | LANDLOCK_ACCESS_FS_REFER
     | LANDLOCK_ACCESS_FS_TRUNCATE
-    | LANDLOCK_ACCESS_FS_IOCTL_DEV;
-const NET_ACCESS_MASK: u64 = 3;
+    | LANDLOCK_ACCESS_FS_IOCTL_DEV
+    | LANDLOCK_ACCESS_FS_RESOLVE_UNIX;
+const NET_ACCESS_MASK: u64 = LANDLOCK_ACCESS_NET_BIND_TCP
+    | LANDLOCK_ACCESS_NET_CONNECT_TCP
+    | LANDLOCK_ACCESS_NET_BIND_UDP
+    | LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP;
 const SCOPE_MASK: u64 = LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET | LANDLOCK_SCOPE_SIGNAL;
-const NON_DIRECTORY_FS_ACCESS_MASK: u64 = LANDLOCK_ACCESS_FS_EXECUTE
-    | LANDLOCK_ACCESS_FS_WRITE_FILE
-    | LANDLOCK_ACCESS_FS_READ_FILE
-    | LANDLOCK_ACCESS_FS_TRUNCATE
-    | LANDLOCK_ACCESS_FS_IOCTL_DEV;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -75,6 +77,9 @@ struct RulesetAttr {
     fs: u64,
     net: u64,
     scoped: u64,
+    quiet_fs: u64,
+    quiet_net: u64,
+    quiet_scoped: u64,
 }
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -97,7 +102,9 @@ struct LsmCtx {
     ctx_len: u64,
 }
 const _: () = {
-    assert!(size_of::<RulesetAttr>() == 24);
+    // Linux `security/landlock/syscalls.c:build_check_abi()`:
+    // `BUILD_BUG_ON(sizeof(ruleset_attr) != 48)`.
+    assert!(size_of::<RulesetAttr>() == 48);
     assert!(size_of::<PathBeneathAttr>() == 12);
     assert!(size_of::<NetPortAttr>() == 16);
     assert!(size_of::<LsmCtx>() == 32);
@@ -107,16 +114,24 @@ const _: () = {
 struct PathRule {
     allowed: u64,
     location: axfs_ng_vfs::Location,
+    /// `LANDLOCK_ADD_RULE_QUIET`: denials of this object's quiet access bits
+    /// are kept out of the audit log (`security/landlock/audit.c`:
+    /// `landlock_log_denial()`).
+    quiet: bool,
 }
 #[derive(Clone)]
 struct NetRule {
     allowed: u64,
     port: u16,
+    quiet: bool,
 }
 pub(crate) struct LandlockRuleset {
     fs: u64,
     net: u64,
     scoped: u64,
+    quiet_fs: u64,
+    quiet_net: u64,
+    quiet_scoped: u64,
     paths: Mutex<Vec<PathRule>>,
     ports: Mutex<Vec<NetRule>>,
     snapshot_gate: Mutex<()>,
@@ -169,6 +184,9 @@ impl LandlockRuleset {
             fs: self.fs,
             net: self.net,
             scoped: self.scoped,
+            quiet_fs: self.quiet_fs,
+            quiet_net: self.quiet_net,
+            quiet_scoped: self.quiet_scoped,
             paths: Mutex::new(copied_paths),
             ports: Mutex::new(copied_ports),
             snapshot_gate: Mutex::new(()),
@@ -237,6 +255,9 @@ impl LandlockPolicy for LandlockRuleset {
     fn allows_net_port(&self, port: u16, access: u64) -> bool {
         self.allows_net_port(port, access)
     }
+    fn handles_fs_access(&self, access: u64) -> bool {
+        self.fs & access == access
+    }
     fn destination_is_no_less_restrictive(
         &self,
         source: &axfs_ng_vfs::Location,
@@ -244,6 +265,30 @@ impl LandlockPolicy for LandlockRuleset {
         access: u64,
     ) -> bool {
         self.destination_is_no_less_restrictive(source, destination, access)
+    }
+    fn quiets_path_denial(&self, target: &axfs_ng_vfs::Location, access: u64) -> bool {
+        // Linux records one quiet bit per covered object and ORs it when two
+        // rules for the same object are merged (`ruleset.c`: `add_rule()`), so
+        // any quiet rule covering the target marks it for this layer.  The
+        // whole requested mask stands in for the denied bits, which is a
+        // superset: suppression stays at least as strict as Linux.
+        let object_marked_quiet = self
+            .paths
+            .lock()
+            .iter()
+            .any(|rule| rule.quiet && rule.location.is_same_or_ancestor_of(target));
+        tk_linux_landlock::quiet_object_denial(object_marked_quiet, self.quiet_fs, access)
+    }
+    fn quiets_net_denial(&self, port: u16, access: u64) -> bool {
+        let object_marked_quiet = self
+            .ports
+            .lock()
+            .iter()
+            .any(|rule| rule.quiet && rule.port == port);
+        tk_linux_landlock::quiet_object_denial(object_marked_quiet, self.quiet_net, access)
+    }
+    fn quiets_scope_denial(&self, scope: u64) -> bool {
+        tk_linux_landlock::quiet_scope_denial(self.quiet_scoped, scope)
     }
 }
 
@@ -302,16 +347,27 @@ pub fn sys_landlock_create_ruleset<M: UserMemory + ?Sized>(
         return Err(LinuxError::E2BIG.into());
     }
     let a: RulesetAttr = copy_struct_from_user(memory, attr, size)?;
-    if a.fs & !FS_ACCESS_MASK != 0 || a.net & !NET_ACCESS_MASK != 0 || a.scoped & !SCOPE_MASK != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    if a.fs == 0 && a.net == 0 && a.scoped == 0 {
-        return Err(LinuxError::ENOMSG.into());
+    match tk_linux_landlock::admit_ruleset_attr(
+        a.fs,
+        a.net,
+        a.scoped,
+        a.quiet_fs,
+        a.quiet_net,
+        a.quiet_scoped,
+    ) {
+        Ok(()) => {}
+        Err(tk_linux_landlock::RulesetAttrReject::Empty) => {
+            return Err(LinuxError::ENOMSG.into());
+        }
+        Err(_) => return Err(AxError::InvalidInput),
     }
     let ruleset = Arc::try_new(LandlockRuleset {
         fs: a.fs,
         net: a.net,
         scoped: a.scoped,
+        quiet_fs: a.quiet_fs,
+        quiet_net: a.quiet_net,
+        quiet_scoped: a.quiet_scoped,
         paths: Mutex::new(Vec::new()),
         ports: Mutex::new(Vec::new()),
         snapshot_gate: Mutex::new(()),
@@ -327,22 +383,31 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
     rule_attr: *const u8,
     flags: u32,
 ) -> AxResult<isize> {
-    if flags != 0 {
+    // Linux `SYSCALL_DEFINE4(landlock_add_rule, ...)`: the flag word is
+    // validated before the ruleset descriptor is even resolved.
+    if !tk_linux_landlock::admit_add_rule_flags(flags) {
         return Err(AxError::InvalidInput);
     }
+    let quiet = flags & tk_linux_landlock::ADD_RULE_QUIET != 0;
     let ruleset = get_landlock_ruleset(ruleset_fd)?;
     let _snapshot_gate = ruleset.snapshot_gate.lock();
     match rule_type {
         RULE_PATH_BENEATH => {
             let a: PathBeneathAttr = read_value(memory, rule_attr.cast())?;
-            match tk_linux_landlock::admit_path_rule_access(ruleset.fs, a.allowed) {
+            match tk_linux_landlock::admit_path_rule_access(ruleset.fs, a.allowed, quiet) {
                 Err(tk_linux_landlock::PathRuleReject::EmptyAccess) => {
                     return Err(LinuxError::ENOMSG.into());
                 }
-                Err(tk_linux_landlock::PathRuleReject::UnhandledAccess) => {
-                    return Err(AxError::InvalidInput);
-                }
+                Err(
+                    tk_linux_landlock::PathRuleReject::UnhandledAccess
+                    | tk_linux_landlock::PathRuleReject::QuietWithoutQuietMask,
+                ) => return Err(AxError::InvalidInput),
                 Err(tk_linux_landlock::PathRuleReject::NonDirectoryAccess) | Ok(()) => {}
+            }
+            // A quiet rule with an empty access mask still has to name a
+            // ruleset that spends quiet bits on this object type.
+            if quiet && ruleset.quiet_fs == 0 {
+                return Err(AxError::InvalidInput);
             }
             // A present descriptor of an unsupported object type is EBADFD;
             // an absent descriptor remains EBADF.
@@ -356,6 +421,8 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
             match tk_linux_landlock::admit_path_rule(
                 ruleset.fs,
                 a.allowed,
+                quiet,
+                ruleset.quiet_fs,
                 location.is_dir(),
             ) {
                 Err(tk_linux_landlock::PathRuleReject::NonDirectoryAccess) => {
@@ -363,7 +430,8 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
                 }
                 Err(
                     tk_linux_landlock::PathRuleReject::EmptyAccess
-                    | tk_linux_landlock::PathRuleReject::UnhandledAccess,
+                    | tk_linux_landlock::PathRuleReject::UnhandledAccess
+                    | tk_linux_landlock::PathRuleReject::QuietWithoutQuietMask,
                 ) => unreachable!("validated before descriptor lookup"),
                 Ok(()) => {}
             }
@@ -376,15 +444,27 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
             rules.push(PathRule {
                 allowed: a.allowed,
                 location,
+                quiet,
             });
         }
         RULE_NET_PORT => {
             let a: NetPortAttr = read_value(memory, rule_attr.cast())?;
-            if a.allowed == 0 {
-                return Err(LinuxError::ENOMSG.into());
-            }
-            if a.allowed & !ruleset.net != 0 || a.port > u16::MAX as u64 {
-                return Err(AxError::InvalidInput);
+            match tk_linux_landlock::admit_net_rule(
+                ruleset.net,
+                a.allowed,
+                quiet,
+                ruleset.quiet_net,
+                a.port,
+            ) {
+                Err(tk_linux_landlock::NetRuleReject::EmptyAccess) => {
+                    return Err(LinuxError::ENOMSG.into());
+                }
+                Err(
+                    tk_linux_landlock::NetRuleReject::UnhandledAccess
+                    | tk_linux_landlock::NetRuleReject::QuietWithoutQuietMask
+                    | tk_linux_landlock::NetRuleReject::PortOutOfRange,
+                ) => return Err(AxError::InvalidInput),
+                Ok(()) => {}
             }
             let mut rules = ruleset.ports.lock();
             // Bound retained inode references and fallible storage per ruleset.
@@ -395,6 +475,7 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
             rules.push(NetRule {
                 allowed: a.allowed,
                 port: a.port as u16,
+                quiet,
             });
         }
         _ => return Err(AxError::InvalidInput),
@@ -402,10 +483,103 @@ pub fn sys_landlock_add_rule<M: UserMemory + ?Sized>(
     Ok(0)
 }
 
-/// Domain attachment is intentionally fail-closed until the thread credential
-/// owns the domain stack.  Returning EPERM is Linux's normal admission error
-/// when no_new_privs/CAP_SYS_ADMIN is absent, and avoids a ruleset that appears
-/// enforced while it is not.
+/// Number of discovery passes allowed while a sibling thread is still being
+/// published by `clone(CLONE_THREAD)`.  Linux reaches the same guarantee with
+/// a `task_work` barrier in `security/landlock/tsync.c`; this kernel pins the
+/// thread group with the process-lifecycle lock instead and retries the few
+/// publications that are still in flight.
+const LANDLOCK_TSYNC_DISCOVERY_ATTEMPTS: usize = 8;
+
+/// Applies one prepared domain to every live thread of the calling process.
+///
+/// Linux `landlock_restrict_sibling_threads()` (`security/landlock/tsync.c`)
+/// gives all-or-nothing semantics: every thread prepares a credential first,
+/// and only after the last one has prepared does the group commit, so a
+/// failure can never leave the group half-restricted.  This implementation
+/// reaches the same property by completing every fallible step -- thread
+/// discovery, target pinning, and one domain clone per target -- before the
+/// first thread slot is written; the commit itself is infallible.
+///
+/// Returns whether the group-leader identity slot must follow the new domain.
+fn restrict_sibling_threads(
+    caller: &crate::task::Thread,
+    domain: &crate::task::security::LandlockDomain,
+) -> AxResult<bool> {
+    use crate::task::{AsThread, get_task};
+
+    let leader_tid = caller.proc_data.proc.pid();
+    let mut attempt = 0;
+    loop {
+        // The process-lifecycle lock excludes membership publication and
+        // teardown; `clone(CLONE_THREAD)` holds that same lock across its own
+        // domain snapshot, so a sibling either copies the synchronized domain
+        // to a child or is caught by the discovery below.
+        let _lifecycle = caller.proc_data.lock_process_lifecycle();
+        let mut unresolved = false;
+        let mut targets = Vec::new();
+        targets
+            .try_reserve_exact(caller.proc_data.proc.thread_ids().count())
+            .map_err(|_| AxError::NoMemory)?;
+        for tid in caller.proc_data.proc.thread_ids() {
+            if tid == caller.kernel_tid() {
+                continue;
+            }
+            let Ok(task) = get_task(tid) else {
+                // A reserved membership whose task-table entry is published
+                // after clone released the lifecycle lock.
+                unresolved = true;
+                continue;
+            };
+            let Some(thread) = task.try_as_thread() else {
+                continue;
+            };
+            if !Arc::ptr_eq(&thread.proc_data.proc, &caller.proc_data.proc)
+                || thread.kernel_tid() != tid
+            {
+                continue;
+            }
+            // Linux skips threads that already passed PF_EXITING.
+            if thread.pending_exit() {
+                continue;
+            }
+            targets.push(task);
+        }
+        if unresolved && attempt + 1 < LANDLOCK_TSYNC_DISCOVERY_ATTEMPTS {
+            attempt += 1;
+            axtask::yield_now();
+            continue;
+        }
+        // Fallible phase: one clone per target plus the caller's own value.
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(targets.len() + 1)
+            .map_err(|_| AxError::NoMemory)?;
+        for _ in 0..targets.len() {
+            prepared.push(domain.try_clone()?);
+        }
+        let caller_domain = domain.try_clone()?;
+        // Infallible commit: no allocation and no failure path, so the group
+        // is never left with only some threads synchronized.
+        let mut leader_synced = caller.kernel_tid() == leader_tid;
+        caller.replace_landlock_domain(caller_domain);
+        for (task, value) in targets.iter().zip(prepared) {
+            let thread = task
+                .try_as_thread()
+                .expect("TSYNC targets were validated as threads");
+            if thread.kernel_tid() == leader_tid {
+                leader_synced = true;
+            }
+            thread.replace_landlock_domain(value);
+        }
+        return Ok(leader_synced);
+    }
+}
+
+/// Domain attachment.  Linux `SYSCALL_DEFINE2(landlock_restrict_self, ...)`
+/// requires `no_new_privs` or `CAP_SYS_ADMIN`, validates `flags` against
+/// `LANDLOCK_MASK_RESTRICT_SELF`, and only accepts `ruleset_fd == -1` together
+/// with `LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF` (optionally combined with
+/// `LANDLOCK_RESTRICT_SELF_TSYNC`).
 pub fn sys_landlock_restrict_self(ruleset_fd: i32, flags: u32) -> AxResult<isize> {
     let current = axtask::current();
     let caller = current.as_thread();
@@ -415,103 +589,99 @@ pub fn sys_landlock_restrict_self(ruleset_fd: i32, flags: u32) -> AxResult<isize
     {
         return Err(AxError::OperationNotPermitted);
     }
-    if flags & !LANDLOCK_RESTRICT_SELF_LOG_MASK != 0 {
+    if flags | crate::task::security::LANDLOCK_RESTRICT_SELF_MASK
+        != crate::task::security::LANDLOCK_RESTRICT_SELF_MASK
+    {
         return Err(AxError::InvalidInput);
     }
-    if ruleset_fd == -1 {
-        if flags & !crate::task::security::LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF != 0 {
-            return Err(AxError::InvalidInput);
+    let tsync = flags & crate::task::security::LANDLOCK_RESTRICT_SELF_TSYNC != 0;
+    // A ruleset may only be omitted for `-1` with exactly the subdomain-logging
+    // flag, optionally combined with TSYNC.  Any other flag word still has to
+    // resolve the descriptor and therefore reports EBADF.
+    let ruleset_free = tk_linux_landlock::restrict_self_without_ruleset(ruleset_fd, flags);
+    let domain = if ruleset_free {
+        caller.landlock_domain().mute_subdomains()
+    } else {
+        let ruleset = get_landlock_ruleset(ruleset_fd)?;
+        let snapshot = ruleset.snapshot()?;
+        caller.landlock_domain().push(snapshot, flags)?
+    };
+    if tsync {
+        if restrict_sibling_threads(caller, &domain)? {
+            caller.proc_data.replace_group_leader_landlock_domain(domain);
         }
-        let domain = caller.landlock_domain().mute_subdomains();
-        caller.replace_landlock_domain(domain.clone());
+    } else {
+        caller.replace_landlock_domain(domain);
         if caller.proc_data.proc.pid() == caller.kernel_tid() {
             caller
                 .proc_data
-                .replace_group_leader_landlock_domain(domain);
+                .replace_group_leader_landlock_domain(caller.landlock_domain());
         }
-        return Ok(0);
-    }
-    let ruleset = get_landlock_ruleset(ruleset_fd)?;
-    let snapshot = ruleset.snapshot()?;
-    let domain = caller.landlock_domain().push(snapshot, flags)?;
-    caller.replace_landlock_domain(domain);
-    if caller.proc_data.proc.pid() == caller.kernel_tid() {
-        caller
-            .proc_data
-            .replace_group_leader_landlock_domain(caller.landlock_domain());
     }
     Ok(0)
 }
 
+const LSM_ID_UNDEF: u64 = 0;
 const LSM_ID_CAPABILITY: u64 = 100;
 const LSM_ID_LANDLOCK: u64 = 110;
 const LSM_FLAG_SINGLE: u32 = 1;
+const LSM_ATTR_UNDEF: u32 = 0;
 
 // Keep the UAPI registry separate from the implementation's hook registry.
 // The latter owns policy ordering; this one describes exactly which boot
 // active modules may contribute one of the task-label attributes.  Commoncap
 // and Landlock intentionally advertise no label attribute: neither Linux LSM
-// implements `getprocattr`/`setprocattr` semantics for these modules.
-const LSM_ATTR_CURRENT: u32 = 100;
-const LSM_ATTR_EXEC: u32 = 101;
-const LSM_ATTR_FSCREATE: u32 = 102;
-const LSM_ATTR_KEYCREATE: u32 = 103;
-const LSM_ATTR_PREV: u32 = 104;
-const LSM_ATTR_SOCKCREATE: u32 = 105;
-#[derive(Clone, Copy)]
-struct ActiveLsm {
-    id: u64,
-    // Bit `(attr - LSM_ATTR_CURRENT)` means this module owns that context.
-    self_attr_mask: u32,
-}
+// registers `getselfattr`/`setselfattr`.  Linux `security_getselfattr()`
+// therefore skips every module and reports `LSM_RET_DEFAULT(getselfattr)`,
+// which `include/linux/lsm_hook_defs.h` defines as `-EOPNOTSUPP`; the same
+// default applies to `security_setselfattr()`.  An unknown but structurally
+// valid module ID is *not* an error: it simply matches no module.
+const ACTIVE_LSMS: [u64; 2] = [LSM_ID_CAPABILITY, LSM_ID_LANDLOCK];
 
-const ACTIVE_LSMS: [ActiveLsm; 2] = [
-    ActiveLsm {
-        id: LSM_ID_CAPABILITY,
-        self_attr_mask: 0,
-    },
-    ActiveLsm {
-        id: LSM_ID_LANDLOCK,
-        self_attr_mask: 0,
-    },
-];
-
-fn lsm_attr_bit(attr: u32) -> AxResult<u32> {
-    let bit = attr
-        .checked_sub(LSM_ATTR_CURRENT)
-        .ok_or(AxError::InvalidInput)?;
-    if bit >= 6 {
-        Err(AxError::InvalidInput)
-    } else {
-        Ok(1 << bit)
-    }
-}
-
-fn active_lsm(id: u64) -> AxResult<ActiveLsm> {
-    ACTIVE_LSMS
-        .iter()
-        .copied()
-        .find(|lsm| lsm.id == id)
-        .ok_or(AxError::InvalidInput)
-}
-
-fn lsm_context_header<M: UserMemory + ?Sized>(
+/// Copies the whole caller-supplied `struct lsm_ctx` buffer and validates its
+/// structural invariants.
+///
+/// Linux `security_setselfattr()` reaches `memdup_user()` before it looks at
+/// any field, so an inaccessible tail is `-EFAULT` even when the header would
+/// have been rejected: the copy therefore happens first and the checks run on
+/// the copied bytes.  `ctx == NULL` is not special-cased here for the same
+/// reason -- the copy reports `-EFAULT`.
+fn copy_lsm_context<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ctx: *const u8,
     supplied_size: usize,
 ) -> AxResult<LsmCtx> {
-    if ctx.is_null() || supplied_size < size_of::<LsmCtx>() {
-        return Err(AxError::InvalidInput);
+    let mut header = [0u8; size_of::<LsmCtx>()];
+    let mut offset = 0usize;
+    while offset < supplied_size {
+        let chunk_len = (supplied_size - offset).min(size_of::<LsmCtx>());
+        let address = (ctx as usize)
+            .checked_add(offset)
+            .ok_or(AxError::BadAddress)?;
+        let mut chunk = [0u8; size_of::<LsmCtx>()];
+        // SAFETY: the usercopy provider initializes the requested range.
+        memory
+            .read_bytes(address, unsafe {
+                core::slice::from_raw_parts_mut(
+                    chunk.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                    chunk_len,
+                )
+            })
+            .map_err(|_| AxError::BadAddress)?;
+        if offset < header.len() {
+            let head_len = (header.len() - offset).min(chunk_len);
+            header[offset..offset + head_len].copy_from_slice(&chunk[..head_len]);
+        }
+        offset += chunk_len;
     }
-    let header: LsmCtx = read_value(memory, ctx.cast())?;
+    let header = try_pod_read_unaligned::<LsmCtx>(&header).map_err(|_| AxError::InvalidInput)?;
     let minimum = (size_of::<LsmCtx>() as u64)
         .checked_add(header.ctx_len)
         .ok_or(AxError::InvalidInput)?;
     // `len` names the whole individual lsm_ctx record.  It can contain
     // trailing provider-private padding, but it must be wholly within the
     // caller's stated buffer and contain the context payload.
-    if header.id == 0
-        || header.len < minimum
+    if header.len < minimum
         || header.len > supplied_size as u64
         || header.ctx_len > supplied_size as u64 - size_of::<LsmCtx>() as u64
     {
@@ -537,12 +707,23 @@ pub fn sys_lsm_list_modules<M: UserMemory + ?Sized>(
         return Err(AxError::from(LinuxError::E2BIG));
     }
     for (index, lsm) in ACTIVE_LSMS.into_iter().enumerate() {
-        VmMutPtr::vm_write(buffer.wrapping_add(index), memory, lsm.id)
+        VmMutPtr::vm_write(buffer.wrapping_add(index), memory, lsm)
             .map_err(|_| AxError::BadAddress)?;
     }
     Ok(ACTIVE_LSMS.len() as isize)
 }
 
+/// Linux `SYSCALL_DEFINE4(lsm_get_self_attr, ...)` ->
+/// `security_getselfattr()` (`security/security.c`).
+///
+/// The errno order is the ABI: `LSM_ATTR_UNDEF` is the only `attr` value the
+/// core rejects with `-EINVAL`; a NULL `size` is `-EINVAL`; `flags` must be
+/// zero or `LSM_FLAG_SINGLE`, and the single case rejects a NULL context and
+/// an undefined module ID with `-EINVAL` and an unreadable header with
+/// `-EFAULT`.  After the (empty, in this kernel) `getselfattr` pass Linux
+/// writes the produced total back through `size` and only then reports that no
+/// module provided the attribute, which is `-EOPNOTSUPP` -- including for an
+/// unknown but structurally valid module ID.
 pub fn sys_lsm_get_self_attr<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     attr: usize,
@@ -550,36 +731,51 @@ pub fn sys_lsm_get_self_attr<M: UserMemory + ?Sized>(
     size: *mut u32,
     flags: u32,
 ) -> AxResult<isize> {
+    // `SYSCALL_DEFINE4` declares `unsigned int attr`, so the upper 32 bits
+    // never reach the core.
     let attr = attr as u32;
-    let attr_bit = lsm_attr_bit(attr)?;
+    if attr == LSM_ATTR_UNDEF {
+        return Err(AxError::InvalidInput);
+    }
     if size.is_null() {
         return Err(AxError::InvalidInput);
     }
+    // `get_user(left, size)` runs before the flag check, so an unreadable size
+    // pointer is EFAULT even for an unknown flag word.
+    let _supplied = read_value(memory, size.cast_const())?;
     if flags != 0 && flags != LSM_FLAG_SINGLE {
         return Err(AxError::InvalidInput);
     }
-    let supplied = read_value(memory, size.cast_const())? as usize;
-    let selected = if flags == LSM_FLAG_SINGLE {
-        Some(lsm_context_header(memory, ctx.cast_const(), supplied)?)
-    } else {
-        None
-    };
     if flags == LSM_FLAG_SINGLE {
-        let lsm = active_lsm(selected.expect("single context parsed").id)?;
-        if lsm.self_attr_mask & attr_bit == 0 {
-            return Err(AxError::OperationNotSupported);
+        // "Only flag supported is LSM_FLAG_SINGLE" and an absent context is
+        // rejected before its header is read.
+        if ctx.is_null() {
+            return Err(AxError::InvalidInput);
         }
-    } else if !ACTIVE_LSMS
-        .iter()
-        .any(|lsm| lsm.self_attr_mask & attr_bit != 0)
-    {
-        return Err(AxError::OperationNotSupported);
+        let header: LsmCtx = read_value(memory, ctx.cast::<LsmCtx>())?;
+        // "If the LSM ID isn't specified it is an error."
+        if header.id == LSM_ID_UNDEF {
+            return Err(AxError::InvalidInput);
+        }
+        // Linux reads only the ID here.  `len`/`ctx_len` belong to the
+        // producing module and are not validated on the get path.
     }
-    // Every active provider above deliberately has no task-label attribute.
-    // If a provider is registered later, it must install its actual encoder
-    // here rather than inheriting an empty successful response.
+    // No boot-active module registers `getselfattr`, so the pass completes
+    // with a zero total; `put_user(total, size)` still runs and its fault wins
+    // over the "nothing provided this attribute" result.
+    VmMutPtr::vm_write(size, memory, 0u32).map_err(|_| AxError::BadAddress)?;
     Err(AxError::OperationNotSupported)
 }
+
+/// Linux `SYSCALL_DEFINE4(lsm_set_self_attr, ...)` ->
+/// `security_setselfattr()` (`security/security.c`).
+///
+/// The core never inspects `attr`: with no module registering `setselfattr`
+/// every structurally valid request reports the hook default `-EOPNOTSUPP`,
+/// whatever the module ID or attribute.  Structural failures keep their own
+/// errnos: `-EINVAL` for `flags`, for `size` below one `struct lsm_ctx`, and
+/// for an inconsistent `len`/`ctx_len`; `-E2BIG` above one page; `-EFAULT` for
+/// an unreadable buffer, including a NULL one.
 pub fn sys_lsm_set_self_attr<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     attr: usize,
@@ -587,55 +783,42 @@ pub fn sys_lsm_set_self_attr<M: UserMemory + ?Sized>(
     size: u32,
     flags: u32,
 ) -> AxResult<isize> {
-    let attr_bit = lsm_attr_bit(attr as u32)?;
+    // `security_setselfattr()` never inspects @attr.
+    let _ = attr;
     if flags != 0 {
         return Err(AxError::InvalidInput);
     }
-    if size > 4096 {
+    let size = size as usize;
+    if size < size_of::<LsmCtx>() {
+        return Err(AxError::InvalidInput);
+    }
+    if size > COPY_STRUCT_MAX {
         return Err(AxError::from(LinuxError::E2BIG));
     }
-    let supplied = lsm_context_header(memory, ctx, size as usize)?;
-    // lsm_set_self_attr copies the complete caller-provided context, not just
-    // its fixed header.  This preserves EFAULT for an inaccessible tail.
-    let mut offset = 0usize;
-    while offset < size as usize {
-        let count = ((size as usize) - offset).min(32);
-        let mut copied = [0u8; 32];
-        let address = (ctx as usize)
-            .checked_add(offset)
-            .ok_or(AxError::BadAddress)?;
-        // SAFETY: the usercopy provider initializes the requested range.
-        memory
-            .read_bytes(address, unsafe {
-                core::slice::from_raw_parts_mut(
-                    copied.as_mut_ptr().cast::<MaybeUninit<u8>>(),
-                    count,
-                )
-            })
-            .map_err(|_| AxError::BadAddress)?;
-        offset += count;
-    }
-    let lsm = active_lsm(supplied.id)?;
-    if lsm.self_attr_mask & attr_bit == 0 {
-        return Err(AxError::OperationNotSupported);
-    }
+    let _context = copy_lsm_context(memory, ctx, size)?;
+    // No boot-active module registers `setselfattr`, so the loop matches
+    // nothing and `LSM_RET_DEFAULT(setselfattr)` applies.
     Err(AxError::OperationNotSupported)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// `config/linux-contracts.toml` names this symbol, so the entry point
+    /// keeps its historical name while the assertions track the aligned ABI.
     #[test]
     fn abi_shapes_are_linux_612() {
-        assert_eq!(LANDLOCK_ABI_VERSION, 7);
+        assert_eq!(LANDLOCK_ABI_VERSION, 10);
+        assert_eq!(size_of::<RulesetAttr>(), 48);
         assert_eq!(size_of::<PathBeneathAttr>(), 12);
+        assert_eq!(size_of::<NetPortAttr>(), 16);
     }
     #[test]
     fn masks_exclude_unknown_bits() {
-        assert_eq!(FS_ACCESS_MASK, 0xffff);
-        assert_eq!(NET_ACCESS_MASK, 3);
+        assert_eq!(FS_ACCESS_MASK, 0x1_ffff);
+        assert_eq!(NET_ACCESS_MASK, 0xf);
         assert_eq!(SCOPE_MASK, 3);
-        assert_eq!(ACTIVE_LSMS.map(|lsm| lsm.id), [100, 110]);
+        assert_eq!(ACTIVE_LSMS, [100, 110]);
     }
 
     #[test]
@@ -648,5 +831,72 @@ mod tests {
             create_ruleset_query(core::ptr::dangling(), 0, CREATE_ERRATA),
             Some(Err(AxError::InvalidInput))
         );
+        assert_eq!(
+            create_ruleset_query(core::ptr::null(), 0, CREATE_VERSION),
+            Some(Ok(LANDLOCK_ABI_VERSION as isize))
+        );
+    }
+
+    #[test]
+    fn ruleset_attr_decoding_gates_every_abi10_field() {
+        // `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` and the UDP rights are the ABI 9
+        // and ABI 10 additions; both are accepted and unknown bits are not.
+        assert_eq!(
+            tk_linux_landlock::admit_ruleset_attr(0x1_ffff, 0, 0, 0, 0, 0),
+            Ok(())
+        );
+        assert_eq!(
+            tk_linux_landlock::admit_ruleset_attr(1 << 16, 0, 0, 1 << 16, 0, 0),
+            Ok(())
+        );
+        assert_eq!(
+            tk_linux_landlock::admit_ruleset_attr(0, 0xf, 0, 0, 0xf, 0),
+            Ok(())
+        );
+        assert_eq!(
+            tk_linux_landlock::admit_ruleset_attr(0x2_0000, 0, 0, 0, 0, 0),
+            Err(tk_linux_landlock::RulesetAttrReject::UnknownFsAccess)
+        );
+        assert_eq!(
+            tk_linux_landlock::admit_ruleset_attr(0, 0x10, 0, 0, 0, 0),
+            Err(tk_linux_landlock::RulesetAttrReject::UnknownNetAccess)
+        );
+        // A quiet mask outside its handled mask is EINVAL, and an empty
+        // ruleset is ENOMSG -- the two errnos differ, so order matters.
+        assert_eq!(
+            tk_linux_landlock::admit_ruleset_attr(0, 0, 0, 0, 0, 0),
+            Err(tk_linux_landlock::RulesetAttrReject::Empty)
+        );
+        assert_eq!(
+            tk_linux_landlock::admit_ruleset_attr(1, 0, 0, 2, 0, 0),
+            Err(tk_linux_landlock::RulesetAttrReject::QuietFsWithoutHandled)
+        );
+    }
+
+    #[test]
+    fn restrict_self_flag_mask_covers_tsync() {
+        use crate::task::security::{
+            LANDLOCK_RESTRICT_SELF_LOG_MASK, LANDLOCK_RESTRICT_SELF_MASK,
+            LANDLOCK_RESTRICT_SELF_TSYNC,
+        };
+        const SUBDOMAINS_OFF: u32 = 1 << 2;
+        assert_eq!(LANDLOCK_RESTRICT_SELF_MASK, 0b1111);
+        assert_eq!(LANDLOCK_RESTRICT_SELF_TSYNC, 0b1000);
+        assert_eq!(LANDLOCK_RESTRICT_SELF_MASK & !LANDLOCK_RESTRICT_SELF_LOG_MASK, 0b1000);
+        // Unknown flag bits are EINVAL (`flags | MASK != MASK`).
+        let defined = |flags: u32| flags | LANDLOCK_RESTRICT_SELF_MASK == LANDLOCK_RESTRICT_SELF_MASK;
+        assert!(defined(0));
+        assert!(defined(SUBDOMAINS_OFF | LANDLOCK_RESTRICT_SELF_TSYNC));
+        assert!(!defined(1 << 4));
+        // A ruleset-free call needs exactly the subdomain flag, with TSYNC as
+        // an optional companion; every other flag word still resolves the
+        // descriptor, so `-1` is EBADF there.
+        assert!(tk_linux_landlock::restrict_self_without_ruleset(-1, SUBDOMAINS_OFF));
+        assert!(tk_linux_landlock::restrict_self_without_ruleset(
+            -1,
+            SUBDOMAINS_OFF | LANDLOCK_RESTRICT_SELF_TSYNC
+        ));
+        assert!(!tk_linux_landlock::restrict_self_without_ruleset(-1, 0));
+        assert!(!tk_linux_landlock::restrict_self_without_ruleset(0, SUBDOMAINS_OFF));
     }
 }

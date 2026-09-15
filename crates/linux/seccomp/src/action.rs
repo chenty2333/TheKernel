@@ -7,6 +7,44 @@ use crate::{
 /// Maximum errno value Linux accepts from `SECCOMP_RET_ERRNO`.
 pub const MAX_ERRNO: u16 = 4095;
 
+/// Actions this kernel can carry out for every task that installs them.
+///
+/// Linux `seccomp_get_action_avail()` (`kernel/seccomp.c`) answers for the
+/// actions its filter engine implements, and includes `SECCOMP_RET_TRACE`
+/// because `__seccomp_filter()` can deliver `PTRACE_EVENT_SECCOMP` to a tracer
+/// that requested the event.  This kernel's ptrace layer has no
+/// `PTRACE_O_TRACESECCOMP` lifecycle, so a `SECCOMP_RET_TRACE` verdict can only
+/// ever take Linux's "no tracer attached" path and skip the syscall with
+/// `ENOSYS`.  Advertising it would let an application rely on an event that
+/// never arrives, which is worse than an honest under-report; it is therefore
+/// deliberately absent.  Every other Linux action, including
+/// `SECCOMP_RET_USER_NOTIF`, is enforced here and must be advertised.
+pub const AVAILABLE_ACTIONS: [u32; 7] = [
+    SECCOMP_RET_KILL_PROCESS,
+    SECCOMP_RET_KILL_THREAD,
+    SECCOMP_RET_TRAP,
+    SECCOMP_RET_ERRNO,
+    SECCOMP_RET_USER_NOTIF,
+    SECCOMP_RET_LOG,
+    SECCOMP_RET_ALLOW,
+];
+
+/// Answers `SECCOMP_GET_ACTION_AVAIL` for one raw filter return value.
+///
+/// Linux compares the complete value, not a masked action field, so a return
+/// value carrying data bits (`SECCOMP_RET_ERRNO | 5`) is not available.
+#[must_use]
+pub const fn action_is_available(raw: u32) -> bool {
+    let mut index = 0;
+    while index < AVAILABLE_ACTIONS.len() {
+        if AVAILABLE_ACTIONS[index] == raw {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 /// A raw result returned by a seccomp classic-BPF program.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct Action(u32);
@@ -128,5 +166,39 @@ mod tests {
             Action::from_raw(0x1234_5678).classify(),
             ActionClass::Unknown { raw: 0x1234_5678 }
         );
+    }
+
+    #[test]
+    fn action_availability_matches_what_the_filter_engine_enforces() {
+        for action in [
+            SECCOMP_RET_KILL_PROCESS,
+            SECCOMP_RET_KILL_THREAD,
+            SECCOMP_RET_TRAP,
+            SECCOMP_RET_ERRNO,
+            SECCOMP_RET_USER_NOTIF,
+            SECCOMP_RET_LOG,
+            SECCOMP_RET_ALLOW,
+        ] {
+            assert!(action_is_available(action), "0x{action:08x} not advertised");
+            assert_ne!(
+                Action::from_raw(action).classify(),
+                ActionClass::Unknown { raw: action },
+                "0x{action:08x} is advertised but unclassified"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_is_not_advertised_because_ptrace_cannot_deliver_it() {
+        // Linux answers 0 here; this kernel deliberately answers EOPNOTSUPP
+        // until PTRACE_O_TRACESECCOMP has a real ownership lifecycle.
+        assert!(!action_is_available(SECCOMP_RET_TRACE));
+    }
+
+    #[test]
+    fn availability_compares_the_complete_value_not_the_action_field() {
+        assert!(!action_is_available(SECCOMP_RET_ERRNO | 5));
+        assert!(!action_is_available(SECCOMP_RET_ALLOW | 1));
+        assert!(!action_is_available(0x1234_0000));
     }
 }

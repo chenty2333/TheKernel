@@ -1185,6 +1185,9 @@ fn send_impl(
     if let Some(address) = network_addr.as_ref() {
         validate_network_address(&socket.inner, address)?;
     }
+    // Linux runs the Landlock socket_sendmsg hook after the protocol-level
+    // address admission and before the transport sees the payload.
+    super::socket::check_landlock_sendmsg(&socket.inner, network_addr.as_ref())?;
     if matches!(&socket.inner, AxSocket::Udp(_)) && src.remaining() > axnet::udp::MAX_UDP_SEND_LEN {
         return Err(socket_failure(
             tk_linux_net::SocketFailure::MessageTooLarge,
@@ -1216,7 +1219,11 @@ fn send_impl(
             let mut reservation = match options.to.as_ref() {
                 Some(SocketAddrEx::Unix(UnixSocketAddr::Path(path))) => {
                     let security = VfsSecurityContext::new(snapshot.actor().clone());
-                    let target = crate::file::unix_socket::resolve_peer(path.clone(), &security)?;
+                    let target = crate::file::unix_socket::resolve_peer(
+                path.clone(),
+                &security,
+                crate::file::unix_socket::UnixPeerKind::of(unix),
+            )?;
                     unix.prepare_send_to_resolved(options, target)
                         .map_err(|error| map_socket_send_error(&socket.inner, error))?
                 }

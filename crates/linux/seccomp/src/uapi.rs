@@ -100,13 +100,55 @@ pub const SECCOMP_FILTER_FLAG_TSYNC_ESRCH: u32 = 1 << 4;
 /// Use a killable listener wait after a user notification is received.
 pub const SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: u32 = 1 << 5;
 
-/// All flags defined by Linux 6.12.
+/// Every filter flag defined by Linux 7.2.3 `include/uapi/linux/seccomp.h`.
 pub const SECCOMP_FILTER_FLAG_MASK: u32 = SECCOMP_FILTER_FLAG_TSYNC
     | SECCOMP_FILTER_FLAG_LOG
     | SECCOMP_FILTER_FLAG_SPEC_ALLOW
     | SECCOMP_FILTER_FLAG_NEW_LISTENER
     | SECCOMP_FILTER_FLAG_TSYNC_ESRCH
     | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV;
+
+/// Reason a `SECCOMP_SET_MODE_FILTER` flag word is not admissible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilterFlagReject {
+    /// A bit outside [`SECCOMP_FILTER_FLAG_MASK`] was set.
+    UnknownFlag,
+    /// `TSYNC` and `NEW_LISTENER` were combined without `TSYNC_ESRCH`.  A
+    /// successful installation then returns a listener descriptor while a
+    /// failed thread synchronization returns a thread ID, so the caller could
+    /// not tell the two apart.
+    AmbiguousSyncListener,
+    /// `WAIT_KILLABLE_RECV` cannot be honoured without a listener.
+    WaitKillableWithoutListener,
+}
+
+/// Validates the `SECCOMP_SET_MODE_FILTER` flag word.
+///
+/// This mirrors Linux `seccomp_set_mode_filter()` (`kernel/seccomp.c`), which
+/// performs all three checks before touching the `sock_fprog`.  Every reject
+/// is `-EINVAL`; the variants exist so the ABI layer and its host tests can
+/// name the exact rule that fired.
+pub const fn admit_filter_flags(flags: u32) -> Result<(), FilterFlagReject> {
+    if flags & !SECCOMP_FILTER_FLAG_MASK != 0 {
+        return Err(FilterFlagReject::UnknownFlag);
+    }
+    // "In the successful case, NEW_LISTENER returns the new listener fd.  But
+    // in the failure case, TSYNC returns the thread that died.  [...] So,
+    // let's disallow this combination if the user has not explicitly
+    // requested no errors from TSYNC."
+    if flags & SECCOMP_FILTER_FLAG_TSYNC != 0
+        && flags & SECCOMP_FILTER_FLAG_NEW_LISTENER != 0
+        && flags & SECCOMP_FILTER_FLAG_TSYNC_ESRCH == 0
+    {
+        return Err(FilterFlagReject::AmbiguousSyncListener);
+    }
+    if flags & SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV != 0
+        && flags & SECCOMP_FILTER_FLAG_NEW_LISTENER == 0
+    {
+        return Err(FilterFlagReject::WaitKillableWithoutListener);
+    }
+    Ok(())
+}
 
 /// Action mask including the full 16-bit action field.
 pub const SECCOMP_RET_ACTION_FULL: u32 = 0xffff_0000;
@@ -145,3 +187,63 @@ pub const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 
 /// Size of Linux `struct seccomp_data` on supported 64-bit ABIs.
 pub const SECCOMP_DATA_SIZE: usize = 64;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_flags_match_linux_seccomp_set_mode_filter() {
+        assert_eq!(admit_filter_flags(0), Ok(()));
+        assert_eq!(
+            admit_filter_flags(
+                SECCOMP_FILTER_FLAG_TSYNC
+                    | SECCOMP_FILTER_FLAG_LOG
+                    | SECCOMP_FILTER_FLAG_SPEC_ALLOW
+                    | SECCOMP_FILTER_FLAG_NEW_LISTENER
+            ),
+            Err(FilterFlagReject::AmbiguousSyncListener)
+        );
+        assert_eq!(
+            admit_filter_flags(SECCOMP_FILTER_FLAG_TSYNC | SECCOMP_FILTER_FLAG_NEW_LISTENER),
+            Err(FilterFlagReject::AmbiguousSyncListener)
+        );
+        // Linux only rejects the pair when the caller did not ask for ESRCH.
+        assert_eq!(
+            admit_filter_flags(
+                SECCOMP_FILTER_FLAG_TSYNC
+                    | SECCOMP_FILTER_FLAG_NEW_LISTENER
+                    | SECCOMP_FILTER_FLAG_TSYNC_ESRCH
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            admit_filter_flags(SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV),
+            Err(FilterFlagReject::WaitKillableWithoutListener)
+        );
+        assert_eq!(
+            admit_filter_flags(
+                SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV | SECCOMP_FILTER_FLAG_NEW_LISTENER
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            admit_filter_flags(SECCOMP_FILTER_FLAG_MASK | (1 << 6)),
+            Err(FilterFlagReject::UnknownFlag)
+        );
+        assert_eq!(
+            admit_filter_flags(SECCOMP_FILTER_FLAG_TSYNC_ESRCH),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn unknown_flag_precedence_beats_combination_checks() {
+        // Linux validates the mask first, so an unknown bit reports EINVAL
+        // through the same path as an inconsistent combination.
+        assert_eq!(
+            admit_filter_flags(SECCOMP_FILTER_FLAG_TSYNC | SECCOMP_FILTER_FLAG_NEW_LISTENER | (1 << 9)),
+            Err(FilterFlagReject::UnknownFlag)
+        );
+    }
+}

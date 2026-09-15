@@ -42,7 +42,8 @@ use crate::{
     task::{
         NetworkNamespace, ns_capable,
         security::{
-            LANDLOCK_ACCESS_NET_BIND_TCP, LANDLOCK_ACCESS_NET_CONNECT_TCP, SocketCreateSpec,
+            LANDLOCK_ACCESS_NET_BIND_TCP, LANDLOCK_ACCESS_NET_BIND_UDP,
+            LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP, LANDLOCK_ACCESS_NET_CONNECT_TCP, SocketCreateSpec,
             SocketListenBacklog, SocketSecurityContext, check_current_landlock_net_port,
             dispatch_socket,
         },
@@ -287,13 +288,68 @@ fn require_bind_permissions(
     Ok(())
 }
 
-fn check_landlock_tcp_port(socket: &SocketInner, addr: &SocketAddrEx, access: u64) -> AxResult<()> {
-    if let (SocketInner::Tcp(_), SocketAddrEx::Ip(ip_addr)) = (socket, addr)
-        && ip_addr.port() != 0
-    {
+/// Linux `hook_socket_bind()`: `LANDLOCK_ACCESS_NET_BIND_TCP` for TCP and
+/// `LANDLOCK_ACCESS_NET_BIND_UDP` for UDP.  Other families are unhandled and
+/// therefore unrestricted.  Port 0 is an ordinary rule key here: a
+/// `LANDLOCK_ACCESS_NET_BIND_UDP` rule on port 0 is exactly what admits
+/// `bind(2)` on an ephemeral port (`net_test.c`: `bind_ephemeral`).
+fn check_landlock_bind_port(socket: &SocketInner, addr: &SocketAddrEx) -> AxResult<()> {
+    let access = match socket {
+        SocketInner::Tcp(_) => LANDLOCK_ACCESS_NET_BIND_TCP,
+        SocketInner::Udp(_) => LANDLOCK_ACCESS_NET_BIND_UDP,
+        _ => return Ok(()),
+    };
+    if let SocketAddrEx::Ip(ip_addr) = addr {
         check_current_landlock_net_port(ip_addr.port(), access)?;
     }
     Ok(())
+}
+
+/// Linux `hook_socket_connect()`: `LANDLOCK_ACCESS_NET_CONNECT_TCP` for TCP and
+/// `LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP` for UDP, followed for UDP by
+/// `current_check_autobind_udp_socket()`.
+fn check_landlock_connect_port(socket: &SocketInner, addr: &SocketAddrEx) -> AxResult<()> {
+    let access = match socket {
+        SocketInner::Tcp(_) => LANDLOCK_ACCESS_NET_CONNECT_TCP,
+        SocketInner::Udp(_) => LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP,
+        _ => return Ok(()),
+    };
+    if let SocketAddrEx::Ip(ip_addr) = addr {
+        check_current_landlock_net_port(ip_addr.port(), access)?;
+    }
+    if let SocketInner::Udp(udp) = socket {
+        check_landlock_udp_autobind(udp)?;
+    }
+    Ok(())
+}
+
+/// Linux `hook_socket_sendmsg()`: a datagram sent to an explicit destination
+/// consumes `LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP`, and every datagram send
+/// may auto-bind an ephemeral local port.
+pub(super) fn check_landlock_sendmsg(
+    socket: &SocketInner,
+    address: Option<&SocketAddrEx>,
+) -> AxResult<()> {
+    let SocketInner::Udp(udp) = socket else {
+        return Ok(());
+    };
+    if let Some(SocketAddrEx::Ip(ip_addr)) = address {
+        check_current_landlock_net_port(ip_addr.port(), LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP)?;
+    }
+    check_landlock_udp_autobind(udp)
+}
+
+/// Linux `current_check_autobind_udp_socket()`: connecting or sending on an
+/// unbound UDP socket auto-binds an ephemeral port, which must be admitted as
+/// an explicit `bind(0)` would be.  A socket that already owns a local port
+/// never triggers the check.
+fn check_landlock_udp_autobind(udp: &axnet::udp::UdpSocket) -> AxResult<()> {
+    if let SocketAddrEx::Ip(local) = udp.local_addr()?
+        && local.port() != 0
+    {
+        return Ok(());
+    }
+    check_current_landlock_net_port(0, LANDLOCK_ACCESS_NET_BIND_UDP)
 }
 
 /// `__sys_socket_create`'s flag test followed by `type &= SOCK_TYPE_MASK`.
@@ -824,10 +880,15 @@ pub fn sys_bind(
                 (&socket.inner, &addr)
             {
                 let security = VfsSecurityContext::new(actor.clone());
+                // Linux reads the domain from the socket file's `f_cred`,
+                // which was captured when this socket was created, not from
+                // the task that happens to call bind(2).
+                let creator_domain = socket.creator_landlock_domain()?;
                 crate::file::unix_socket::bind_path(
                     unix,
                     path.clone(),
                     &security,
+                    creator_domain,
                     NodePermission::from_bits_truncate(0o777),
                     snapshot.umask(),
                     |endpoint| {
@@ -854,7 +915,7 @@ pub fn sys_bind(
             } else {
                 require_bind_permissions(&addr, socket.net_namespace(), actor)?;
                 validate_network_address(&socket.inner, &addr)?;
-                check_landlock_tcp_port(&socket.inner, &addr, LANDLOCK_ACCESS_NET_BIND_TCP)?;
+                check_landlock_bind_port(&socket.inner, &addr)?;
                 socket
                     .bind(addr)
                     .map_err(|error| map_bind_error(&socket.inner, error))?;
@@ -979,11 +1040,15 @@ pub fn sys_connect(
         }
     }
     validate_network_address(&socket.inner, &addr)?;
-    check_landlock_tcp_port(&socket.inner, &addr, LANDLOCK_ACCESS_NET_CONNECT_TCP)?;
+    check_landlock_connect_port(&socket.inner, &addr)?;
     let result = match (&socket.inner, &addr) {
         (SocketInner::Unix(unix), SocketAddrEx::Unix(UnixSocketAddr::Path(path))) => {
             let security = VfsSecurityContext::new(actor.clone());
-            let target = crate::file::unix_socket::resolve_peer(path.clone(), &security)?;
+            let target = crate::file::unix_socket::resolve_peer(
+                path.clone(),
+                &security,
+                crate::file::unix_socket::UnixPeerKind::of(unix),
+            )?;
             if unix.is_datagram() {
                 unix.connect_resolved_as(target, snapshot.unix_credentials())
             } else if unix.is_seqpacket() {

@@ -315,6 +315,13 @@ impl VfsSecurityContext {
             .is_none_or(|domain| domain.allows_path(location, access))
     }
 
+    /// The Landlock domain frozen with this authority view, if the acting task
+    /// had one.  UNIX socket resolution needs it to compare the connecting
+    /// domain with the domain retained by the socket's creator.
+    pub(crate) fn landlock_domain(&self) -> Option<&crate::task::security::LandlockDomain> {
+        self.landlock_domain.as_ref()
+    }
+
     pub(crate) fn mount_topology(&self) -> Option<Arc<crate::mounts::MountTopology>> {
         self.mount_topology.clone()
     }
