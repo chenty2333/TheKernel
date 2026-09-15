@@ -1304,8 +1304,8 @@ status = "implemented"
 contract = "linux-setxattr"
 handler = "kernel/src/syscall/fs/xattr.rs:sys_setxattr"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records"]
-validation_gaps = ["Legacy pathname symlink and fd syscall entry/error behavior lacks a direct guest differential matrix"]
+tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records", "tests/guest/portable/fsattrs-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -1327,8 +1327,8 @@ status = "implemented"
 contract = "linux-lsetxattr"
 handler = "kernel/src/syscall/fs/xattr.rs:sys_lsetxattr"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records"]
-validation_gaps = ["Legacy pathname symlink and fd syscall entry/error behavior lacks a direct guest differential matrix"]
+tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records", "tests/guest/portable/fsattrs-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -1350,8 +1350,8 @@ status = "implemented"
 contract = "linux-fsetxattr"
 handler = "kernel/src/syscall/fs/xattr.rs:sys_fsetxattr"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records"]
-validation_gaps = ["Legacy pathname symlink and fd syscall entry/error behavior lacks a direct guest differential matrix"]
+tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records", "tests/guest/portable/fsattrs-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -1373,8 +1373,8 @@ status = "implemented"
 contract = "linux-getxattr"
 handler = "kernel/src/syscall/fs/xattr.rs:sys_getxattr"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records"]
-validation_gaps = ["Legacy pathname symlink and fd syscall entry/error behavior lacks a direct guest differential matrix"]
+tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records", "tests/guest/portable/fsattrs-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -1396,8 +1396,8 @@ status = "implemented"
 contract = "linux-lgetxattr"
 handler = "kernel/src/syscall/fs/xattr.rs:sys_lgetxattr"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records"]
-validation_gaps = ["Legacy pathname symlink and fd syscall entry/error behavior lacks a direct guest differential matrix"]
+tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records", "tests/guest/portable/fsattrs-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -1419,8 +1419,8 @@ status = "implemented"
 contract = "linux-fgetxattr"
 handler = "kernel/src/syscall/fs/xattr.rs:sys_fgetxattr"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records"]
-validation_gaps = ["Legacy pathname symlink and fd syscall entry/error behavior lacks a direct guest differential matrix"]
+tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records", "tests/guest/portable/fsattrs-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -1442,8 +1442,8 @@ status = "implemented"
 contract = "linux-listxattr"
 handler = "kernel/src/syscall/fs/xattr.rs:sys_listxattr"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records"]
-validation_gaps = ["Legacy pathname symlink and fd syscall entry/error behavior lacks a direct guest differential matrix"]
+tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records", "tests/guest/portable/fsattrs-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -1465,8 +1465,8 @@ status = "implemented"
 contract = "linux-llistxattr"
 handler = "kernel/src/syscall/fs/xattr.rs:sys_llistxattr"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records"]
-validation_gaps = ["Legacy pathname symlink and fd syscall entry/error behavior lacks a direct guest differential matrix"]
+tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records", "tests/guest/portable/fsattrs-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -1488,8 +1488,8 @@ status = "implemented"
 contract = "linux-flistxattr"
 handler = "kernel/src/syscall/fs/xattr.rs:sys_flistxattr"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records"]
-validation_gaps = ["Legacy pathname symlink and fd syscall entry/error behavior lacks a direct guest differential matrix"]
+tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records", "tests/guest/portable/fsattrs-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -1511,8 +1511,8 @@ status = "implemented"
 contract = "linux-removexattr"
 handler = "kernel/src/syscall/fs/xattr.rs:sys_removexattr"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records"]
-validation_gaps = ["Legacy pathname symlink and fd syscall entry/error behavior lacks a direct guest differential matrix"]
+tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records", "tests/guest/portable/fsattrs-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -1534,8 +1534,8 @@ status = "implemented"
 contract = "linux-lremovexattr"
 handler = "kernel/src/syscall/fs/xattr.rs:sys_lremovexattr"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records"]
-validation_gaps = ["Legacy pathname symlink and fd syscall entry/error behavior lacks a direct guest differential matrix"]
+tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records", "tests/guest/portable/fsattrs-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
@@ -1557,8 +1557,8 @@ status = "implemented"
 contract = "linux-fremovexattr"
 handler = "kernel/src/syscall/fs/xattr.rs:sys_fremovexattr"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records"]
-validation_gaps = ["Legacy pathname symlink and fd syscall entry/error behavior lacks a direct guest differential matrix"]
+tests = ["kernel/src/syscall/fs/xattr.rs:xattr_name_import_requires_only_nonempty_bounded_bytes", "kernel/src/file/xattr_provider.rs:fifo_user_xattr_access_denies_reads_and_preserves_provider_records", "tests/guest/portable/fsattrs-differential.c:main"]
+validation_gaps = ["explicit-none"]
 limitations = ["explicit-none"]
 
 [[contract]]
