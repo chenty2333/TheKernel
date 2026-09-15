@@ -105,4 +105,19 @@ pub enum MmError {
     MemlockDenied,
     /// Caller-supplied current/covered accounting is internally inconsistent.
     InconsistentAccounting,
+    /// `RLIMIT_DATA` rejects the requested break (`check_data_rlimit()`).
+    DataRlimitExceeded,
+    /// A request does not fit below the architecture's `TASK_SIZE`.
+    AddressSpaceExceeded,
+    /// A `memfd_create(2)` flag word contains a bit Linux rejects.
+    InvalidMemfdFlags,
+    /// `vm.memfd_noexec` is enforcing and the request asked for an executable
+    /// anonymous file.
+    MemfdNoexecEnforced,
+    /// No thread of the target process still holds its address space
+    /// (`find_lock_task_mm()`).
+    NoMmOwner,
+    /// The caller asked for a userfaultfd that intercepts kernel-mode faults,
+    /// which this kernel cannot deliver.
+    UnsupportedUffdKernelFaults,
 }
