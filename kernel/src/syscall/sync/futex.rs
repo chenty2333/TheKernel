@@ -503,18 +503,19 @@ fn validate_waitv_timeout(
     }))
 }
 
+/// `futex_parse_waitv()`'s per-descriptor validation.
+///
+/// Linux validates exactly three things here — the flag word, `__reserved` and
+/// whether `val` fits the futex size — and deliberately leaves the address to
+/// `get_futex_key()`, which runs per entry inside
+/// `futex_wait_multiple_setup()` and is where the size-doubled `FUTEX2_NUMA`
+/// alignment rule and the node-word protocol live.
 fn validate_waitv_entry(waiter: &futex_waitv) -> AxResult<()> {
     if waiter.__reserved != 0 {
         return Err(AxError::InvalidInput);
     }
     validate_futex2_flags(waiter.flags)?;
     validate_futex2_value(waiter.val)?;
-    if waiter.uaddr == 0 {
-        return Err(AxError::BadAddress);
-    }
-    if !(waiter.uaddr as *const u32).is_aligned() {
-        return Err(AxError::InvalidInput);
-    }
     Ok(())
 }
 
@@ -552,17 +553,44 @@ pub fn sys_futex_waitv(
     entries
         .try_reserve_exact(nr_futexes as usize)
         .map_err(|_| AxError::NoMemory)?;
+    // `futex_parse_waitv()` runs before any key is resolved, so a descriptor
+    // that cannot be copied or that carries a bad flag word is reported for
+    // the whole call before the first address is looked at.
     for index in 0..nr_futexes as usize {
         let waiter: futex_waitv = read_checked_array_entry(waiters_addr, index, &caller)?;
         validate_waitv_entry(&waiter)?;
-        let address = waiter.uaddr as usize;
-        // Fault in every futex word before any queue gate is acquired. This
-        // also makes a no-fault Retry below an explicit task-context retry.
-        let _ = fault_read_u32(&caller, address)?;
         entries.push(waiter);
     }
 
+    // `futex_wait_multiple_setup()` resolves a key per entry *before* it
+    // compares any value, and `get_futex_key()` is where the `FUTEX2_NUMA`
+    // protocol lives (`kernel/futex/core.c:522-567`): the futex is
+    // `futex_size()` wide and twice that for `FLAGS_NUMA` (`:522-524`), so the
+    // natural alignment rule covers eight bytes (`:530`) and `access_ok()` the
+    // same window (`:533-534`); the node word is then read (`:545-547`), the
+    // node is rejected unless it is `FUTEX_NO_NODE` or possible (`:549-550`),
+    // and `FUTEX_NO_NODE` is rewritten with the resolved node (`:556-567`).
+    // That pass is the *only* place the node protocol runs for a waitv entry:
+    // the value comparison below never touches the node word.
+    //
+    // A retry after a fault repeats `get_futex_key()` for shared entries only
+    // (`waitwake.c:461-465`).
+    let mut retry = false;
     loop {
+        for waiter in &entries {
+            let entry_flags = futex2_core_flags(waiter.flags)?;
+            if retry && entry_flags.private {
+                continue;
+            }
+            let address = waiter.uaddr as *const u32;
+            validate_futex_user_range(address, entry_flags.word_bytes())?;
+            futex_numa_node(&caller, address.addr(), entry_flags)?;
+            // Fault in every futex word before any queue gate is acquired.
+            // This also makes a no-fault Retry an explicit task-context retry.
+            let _ = fault_read_u32(&caller, address.addr())?;
+        }
+        retry = true;
+
         // Capture the process image before resolving shared futex keys. The
         // same address-space snapshot must back both key derivation and the
         // later no-fault comparison attempt; a Retry starts a fresh iteration
@@ -616,13 +644,10 @@ pub fn sys_futex_waitv(
             });
         match result {
             Ok(index) => return Ok(index as isize),
-            Err(WaitConditionError::Retry) => {
-                // `wait_on_any_futex_if_atomic` has released every queue gate and
-                // cleaned up all partial registrations before returning Retry.
-                for waiter in &entries {
-                    let _ = fault_read_u32(&caller, waiter.uaddr as usize)?;
-                }
-            }
+            // `wait_on_any_futex_if_atomic` has released every queue gate and
+            // cleaned up all partial registrations before returning Retry; the
+            // next iteration repeats the key protocol above.
+            Err(WaitConditionError::Retry) => {}
             Err(WaitConditionError::Fault(error)) => return Err(error),
         }
     }
