@@ -8181,9 +8181,9 @@ status = "partial"
 contract = "linux-init_module"
 handler = "kernel/src/syscall/task/module.rs:sys_init_module"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules", "tests/guest/portable/sysadmin-abi-differential.c:main"]
-validation_gaps = ["the oracle has CONFIG_MODULES unset, so its three module syscalls answer ENOSYS and the case compares each kernel's configuration answer rather than module semantics"]
-limitations = ["the kernel stamps no Linux configuration tokens, so an image whose release matches is accepted whenever it carries crcs; the release compared is this kernel's own UTS_RELEASE"]
+tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules", "kernel/src/syscall/task/module.rs:module_vermagic_follows_same_magic", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+validation_gaps = ["the oracle has CONFIG_MODULES unset, so its three module syscalls answer ENOSYS and the case compares each kernel's configuration answer rather than module semantics; the vermagic comparison is reached by no guest probe, so it is covered by module_vermagic_follows_same_magic only"]
+limitations = ["the vermagic tokens are a constant describing the configuration TheKernel projects (SMP, preempt, mod_unload, modversions) rather than one derived from build configuration, and the release token is this kernel's own UTS_RELEASE; an image built for a kernel whose configuration differs is refused with -ENOEXEC, exactly as a Linux kernel with this configuration refuses it (include/linux/vermagic.h:13-46, kernel/module/version.c:97-105)"]
 
 [[contract]]
 id = "linux-finit_module"
@@ -8204,9 +8204,9 @@ status = "partial"
 contract = "linux-finit_module"
 handler = "kernel/src/syscall/task/module.rs:sys_finit_module"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules", "tests/guest/portable/sysadmin-abi-differential.c:main"]
-validation_gaps = ["the oracle has CONFIG_MODULES unset, so its three module syscalls answer ENOSYS and the case compares each kernel's configuration answer rather than module semantics"]
-limitations = ["the kernel stamps no Linux configuration tokens, so an image whose release matches is accepted whenever it carries crcs; the release compared is this kernel's own UTS_RELEASE"]
+tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules", "kernel/src/syscall/task/module.rs:module_vermagic_follows_same_magic", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+validation_gaps = ["the oracle has CONFIG_MODULES unset, so its three module syscalls answer ENOSYS and the case compares each kernel's configuration answer rather than module semantics; the vermagic comparison is reached by no guest probe, so it is covered by module_vermagic_follows_same_magic only"]
+limitations = ["the vermagic tokens are a constant describing the configuration TheKernel projects (SMP, preempt, mod_unload, modversions) rather than one derived from build configuration, and the release token is this kernel's own UTS_RELEASE; an image built for a kernel whose configuration differs is refused with -ENOEXEC, exactly as a Linux kernel with this configuration refuses it (include/linux/vermagic.h:13-46, kernel/module/version.c:97-105)"]
 
 [[contract]]
 id = "linux-delete_module"
@@ -8227,9 +8227,9 @@ status = "partial"
 contract = "linux-delete_module"
 handler = "kernel/src/syscall/task/module.rs:sys_delete_module"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+tests = ["kernel/src/syscall/task/module.rs:module_init_return_matches_linux_zero_negative_and_positive_rules", "kernel/src/syscall/task/module.rs:delete_module_gates_follow_linux_errno_order", "tests/guest/portable/sysadmin-abi-differential.c:main"]
 validation_gaps = ["the oracle has CONFIG_MODULES unset, so its three module syscalls answer ENOSYS and the case compares each kernel's configuration answer rather than module semantics"]
-limitations = ["O_TRUNC cannot force an unload: without CONFIG_MODULE_FORCE_UNLOAD the request is refused with EBUSY or EWOULDBLOCK instead of forcing and tainting"]
+limitations = ["there is no force-unload path: CONFIG_MODULE_FORCE_UNLOAD semantics cannot be implemented because the kernel has no taint state to record TAINT_FORCED_RMMOD with (kernel/module/main.c:743-750, include/linux/panic.h:74); with the option off, the only configuration the pinned oracle can have since CONFIG_MODULE_FORCE_UNLOAD depends on CONFIG_MODULE_UNLOAD (kernel/module/Kconfig:142) and that oracle has CONFIG_MODULES unset, O_TRUNC is ignored and the request is refused with EBUSY or EWOULDBLOCK, which is what Linux does"]
 
 [[contract]]
 id = "linux-kexec_load"
@@ -8250,9 +8250,9 @@ status = "partial"
 contract = "linux-kexec_load"
 handler = "kernel/src/syscall/task/kexec.rs:sys_kexec_load"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/task/kexec.rs:bzimage_requires_64_bit_boot_contract_and_cmdline_capacity", "tests/guest/portable/sysadmin-abi-differential.c:main"]
-validation_gaps = ["kexec_load has no registered differential case; the admitted flag set is covered by host tests only"]
-limitations = ["an out-of-RAM and a zero-length destination are EINVAL here where Linux defers them to the allocator, and the crash-image entry and destinations are not checked against crashk_res (kernel/kexec.c:29-36)"]
+tests = ["kernel/src/syscall/task/kexec.rs:bzimage_requires_64_bit_boot_contract_and_cmdline_capacity", "kernel/src/syscall/task/kexec.rs:empty_destination_segment_is_admitted_like_linux", "kernel/src/syscall/task/kexec.rs:raw_segment_keeps_linux_sanity_check_order_and_errnos", "tests/guest/portable/sysadmin-abi-differential.c:main"]
+validation_gaps = ["the sysadmin-abi.kexec-load differential case pins the reserved flag bit, the unknown architecture, the segment cap, both destination address errors ahead of the buffer-size error, the overlap rule and the zero-length destination on both guests; two further probes stay diagnostics because the guests disagree there by design"]
+limitations = ["an out-of-RAM destination is -EINVAL here where Linux performs no RAM validation at load time at all (kernel/kexec_core.c:126-128, bounded only by KEXEC_DESTINATION_MEMORY_LIMIT at :130-141), and flag bits 32..63 are -EINVAL here where Linux accepts them because KEXEC_ARCH_MASK is `unsigned int` 0xffff0000 so ~KEXEC_ARCH_MASK is 0x0000ffff and `flags & ~KEXEC_ARCH_MASK` cannot see those bits (kernel/kexec.c:226-231, include/uapi/linux/kexec.h:17); TheKernel tests the whole 64-bit flag word, which is what that check's comment intends", "the crash-image entry and destinations are not checked against crashk_res because no crash-kernel region is ever reserved (kernel/kexec.c:29-36 for the entry, kernel/kexec_core.c:199-211 for the destinations), so a crash image may name an entry outside any mapped alias and destinations outside the reserved window", "the LSM and lockdown admission runs after the flag and arch validation here, where Linux runs kexec_load_permitted(), security_kernel_load_data() and security_locked_down() first (kernel/kexec.c:210-224 before :230-244), so a denying policy is answered -EINVAL instead of the policy's errno"]
 
 [[contract]]
 id = "linux-kexec_file_load"
