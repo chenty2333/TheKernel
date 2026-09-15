@@ -257,7 +257,7 @@ handler = "kernel/src/syscall/fs/mount.rs:sys_open_tree_attr"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/fsattrs-differential.c:main", "tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["the shared open-tree validator admits the namespace flag but the caller reports EOPNOTSUPP for it, where Linux with CAP_SYS_ADMIN returns a descriptor"]
+limitations = ["the shared open-tree rule passes the user-namespace capability check and the pathname copy and then reports EOPNOTSUPP, because there is no mount-namespace creation and nsfs publication provider"]
 
 [[cell]]
 number = 468
@@ -6734,7 +6734,7 @@ handler = "kernel/src/syscall/fs/fanotify.rs:sys_fanotify_init"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["The flag grammar, scope rules and errno order are exercised by the mount-api differential; the absent providers have no test"]
-limitations = ["the pinned oracle disables fanotify, so both guests answer ENOSYS and every assertion passes without comparing behaviour; FAN_REPORT_FD_ERROR, FAN_UNLIMITED_QUEUE, FAN_UNLIMITED_MARKS and an unprivileged FAN_REPORT_FID group are refused where Linux admits them"]
+limitations = ["the pinned oracle disables fanotify, so both guests answer ENOSYS and the guest assertions compare nothing; the unprivileged group, FAN_UNLIMITED_QUEUE, FAN_UNLIMITED_MARKS and FAN_REPORT_FD_ERROR are implemented and covered by host unit tests only, and FAN_REPORT_MNT is still refused"]
 
 [[contract]]
 id = "linux-fanotify_mark"
@@ -6757,7 +6757,7 @@ handler = "kernel/src/syscall/fs/fanotify.rs:sys_fanotify_mark"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["The flag grammar, scope rules and errno order are exercised by the mount-api differential; the absent providers have no test"]
-limitations = ["the pinned oracle disables fanotify, so every mark assertion passes without comparing behaviour, and FAN_MARK_MNTNS is unreachable because there is no mount-event provider"]
+limitations = ["the pinned oracle disables fanotify, so every mark assertion passes without comparing behaviour; non-inode scopes are gated on the group's user namespace, and FAN_MARK_MNTNS remains unreachable for lack of a mount-event provider"]
 
 [[contract]]
 id = "linux-quotactl"
@@ -6779,8 +6779,8 @@ contract = "linux-quotactl"
 handler = "kernel/src/syscall/fs/quota.rs:sys_quotactl"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
-validation_gaps = ["The device rule, privilege table, Q_SETINFO validation and Q_QUOTAON order are exercised by the mount-api differential; the XFS-shaped selectors have no provider"]
-limitations = ["the XFS-shaped selectors report errno values the pinned ext4 oracle does not produce: ext4 answers ENOSYS for Q_XGETQSTAT and Q_XGETQSTATV while no quota type is active, and ESRCH only for Q_XGETQUOTA and Q_XGETNEXTQUOTA"]
+validation_gaps = ["explicit-none"]
+limitations = ["the Q_X* selectors are implemented for the dquot provider: ENOSYS while a provider method is absent, ESRCH or ENOENT from the dquot lookup, and copy errors first; XFS-style DQUOT_QUOTA_SYS_FILE filesystems are not modelled"]
 
 [[contract]]
 id = "linux-quotactl_fd"
@@ -6802,8 +6802,8 @@ contract = "linux-quotactl_fd"
 handler = "kernel/src/syscall/fs/quota.rs:sys_quotactl_fd"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
-validation_gaps = ["The device rule, privilege table, Q_SETINFO validation and Q_QUOTAON order are exercised by the mount-api differential; the XFS-shaped selectors have no provider"]
-limitations = ["the XFS-shaped selectors report errno values ext4 does not produce while no quota type is active, and a mount descriptor cannot reach its superblock"]
+validation_gaps = ["explicit-none"]
+limitations = ["the Q_X* selectors are implemented for the dquot provider: ENOSYS while a provider method is absent, ESRCH or ENOENT from the dquot lookup, and copy errors first; XFS-style DQUOT_QUOTA_SYS_FILE filesystems are not modelled, and a mount descriptor still cannot reach its superblock"]
 
 [[contract]]
 id = "linux-mount"
@@ -6872,7 +6872,7 @@ handler = "kernel/src/syscall/fs/mount.rs:sys_open_tree"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["the namespace flag is admitted by the validator but prepare_open_tree reports EOPNOTSUPP for it, where Linux with CAP_SYS_ADMIN returns a descriptor for a new mount namespace"]
+limitations = ["OPEN_TREE_NAMESPACE passes the user-namespace capability check and the pathname copy and then reports EOPNOTSUPP, because there is no mount-namespace creation and nsfs publication provider"]
 
 [[contract]]
 id = "linux-move_mount"
@@ -6964,7 +6964,7 @@ handler = "kernel/src/syscall/fs/mount.rs:sys_fsmount"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["The validation order and errno precedence are exercised by the mount-api differential; provider option consumption has no test"]
-limitations = ["FSMOUNT_NAMESPACE is admitted and reported EOPNOTSUPP, and the attribute word and atime are validated before the capability check, so an unprivileged caller with bad attributes gets EINVAL where Linux gets EPERM"]
+limitations = ["FSMOUNT_NAMESPACE is admitted and reports EOPNOTSUPP after the flag, capability and descriptor checks of fs/namespace.c:4435-4471, because there is no mount-namespace creation provider"]
 
 [[contract]]
 id = "linux-fspick"
@@ -7010,7 +7010,7 @@ handler = "kernel/src/syscall/fs/mount.rs:sys_statmount"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/mount-api-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["STATMOUNT_BY_FD only works for open() descriptors: the mount descriptor returned by open_tree(OPEN_TREE_CLONE) or fsmount keeps no mount ledger and reports EOPNOTSUPP where Linux succeeds; a foreign mnt_ns_id without CAP_SYS_ADMIN reports ENOENT where Linux reports EPERM"]
+limitations = ["STATMOUNT_BY_FD answers ENOENT for a detached mount descriptor and EINVAL for a descriptor whose mount is internal, matching do_statmount() and grab_requested_root(); a foreign mnt_ns_id without CAP_SYS_ADMIN answers EPERM here and ENOENT in listmount, verified from source only because no resolvable foreign live namespace id could be constructed in the guest"]
 
 [[contract]]
 id = "linux-listmount"
