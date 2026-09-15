@@ -1667,7 +1667,19 @@ impl FileDescription {
     /// the synchronous flush itself fails; that primary flush errno wins.
     pub(crate) fn sync_filesystem(&self) -> AxResult<()> {
         let Some(filesystem) = self.inner.syncfs_filesystem() else {
-            return Err(AxError::InvalidInput);
+            // Linux `SYSCALL_DEFINE1(syncfs, int, fd)` (fs/sync.c) resolves
+            // `sb = fd_file(f)->f_path.dentry->d_sb` and never inspects the
+            // file type, so every occupied slot has a superblock: anonymous
+            // pipes carry a pipefs inode, sockets sockfs, pidfds pidfs,
+            // eventfd/epoll/signalfd/io_uring anon_inodefs, and character and
+            // block devices devtmpfs.  Those pseudo-superblocks are not
+            // read-only, have no `->sync_fs` and a NULL `sb->s_bdev`, so
+            // `sync_filesystem()` degrades to `writeback_inodes_sb()` +
+            // `sync_inodes_sb()` + two NULL-safe `sync_blockdev*()` calls and
+            // returns 0.  An object with no anchor at all is that same case,
+            // which is why the only fd-related errno syncfs can produce is
+            // -EBADF from the descriptor lookup.
+            return Ok(());
         };
         let result = filesystem.flush();
         let async_error = self

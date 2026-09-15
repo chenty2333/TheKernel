@@ -178,12 +178,15 @@ pub(super) fn dispatch_syscall(
         }),
         Sysno::sync => sys_sync(),
         Sysno::syncfs => sys_syncfs(uctx.arg0() as _),
-        Sysno::reboot => sys_reboot(
-            uctx.arg0() as _,
-            uctx.arg1() as _,
-            uctx.arg2() as _,
-            uctx.arg3() as _,
-        ),
+        Sysno::reboot => with_user_memory(aspace(), |memory| {
+            sys_reboot(
+                memory,
+                uctx.arg0() as _,
+                uctx.arg1() as _,
+                uctx.arg2() as _,
+                uctx.arg3() as _,
+            )
+        }),
         Sysno::vhangup => sys_vhangup(),
         Sysno::fsopen => with_user_memory(aspace(), |memory| {
             sys_fsopen(memory, uctx.arg0() as _, uctx.arg1() as _)

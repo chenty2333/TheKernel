@@ -1,9 +1,9 @@
 use alloc::sync::Arc;
 use core::ffi::c_int;
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use bitflags::bitflags;
-use linux_raw_sys::general::{O_CLOEXEC, O_DIRECT, O_NONBLOCK, O_RDONLY, O_WRONLY};
+use linux_raw_sys::general::{O_CLOEXEC, O_DIRECT, O_EXCL, O_NONBLOCK, O_RDONLY, O_WRONLY};
 use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr};
 
 use crate::{
@@ -21,6 +21,9 @@ bitflags! {
         const NONBLOCK = O_NONBLOCK;
         /// Request packet mode (not implemented by the byte-stream backend).
         const DIRECT = O_DIRECT;
+        /// `O_NOTIFICATION_PIPE` is an alias of `O_EXCL`
+        /// (include/uapi/linux/watch_queue.h), not a distinct bit.
+        const NOTIFICATION = O_EXCL;
     }
 }
 
@@ -29,7 +32,23 @@ pub fn sys_pipe2<M: UserMemory + ?Sized>(
     fds: *mut [c_int; 2],
     flags: u32,
 ) -> AxResult<isize> {
+    // fs/pipe.c `__do_pipe_flags()` validates the flag word before anything
+    // else happens:
+    //     if (flags & ~(O_CLOEXEC | O_NONBLOCK | O_DIRECT |
+    //                   O_NOTIFICATION_PIPE))
+    //             return -EINVAL;
     let flags = PipeFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
+
+    // `create_pipe_files()` calls `watch_queue_init()` for O_NOTIFICATION_PIPE;
+    // the CONFIG_WATCH_QUEUE=n stub in include/linux/watch_queue.h is
+    //     static inline int watch_queue_init(struct pipe_inode_info *pipe)
+    //     {
+    //             return -ENOPKG;
+    //     }
+    // so -ENOPKG is the exact verdict for the selected build.
+    if flags.contains(PipeFlags::NOTIFICATION) {
+        return Err(LinuxError::ENOPKG.into());
+    }
 
     // Do not advertise packet semantics while the backing is a byte stream.
     if flags.contains(PipeFlags::DIRECT) {

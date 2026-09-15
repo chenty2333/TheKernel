@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 
-use axerrno::{AxError, AxResult};
+use axerrno::{AxError, AxResult, LinuxError};
 use axtask::{AxTaskRef, current};
 use linux_raw_sys::general::SI_TKILL;
 use tk_linux_process::PidfdPlan;
@@ -65,6 +65,14 @@ enum ResolvedPidFdSignalTarget {
         credential: Arc<Cred>,
         visible_tid: u32,
     },
+    /// `pidfd == PIDFD_SELF_THREAD`: the calling thread, addressed without a
+    /// descriptor.  There is no pidfd to re-validate against, so the delivery
+    /// loop never retries this target.
+    SelfThread {
+        task: AxTaskRef,
+        credential: Arc<Cred>,
+        visible_tid: u32,
+    },
 }
 
 impl ResolvedPidFdSignalTarget {
@@ -77,21 +85,25 @@ impl ResolvedPidFdSignalTarget {
             | Self::ExitedLeader {
                 process: identity, ..
             } => identity.pid(),
-            Self::Thread { visible_tid, .. } => *visible_tid,
+            Self::Thread { visible_tid, .. } | Self::SelfThread { visible_tid, .. } => {
+                *visible_tid
+            }
         }
     }
 
     fn delivery_scope(&self) -> SignalDeliveryScope {
         match self {
             Self::Process { .. } | Self::Zombie { .. } => SignalDeliveryScope::ThreadGroup,
-            Self::ExitedLeader { .. } | Self::Thread { .. } => SignalDeliveryScope::Thread,
+            Self::ExitedLeader { .. } | Self::Thread { .. } | Self::SelfThread { .. } => {
+                SignalDeliveryScope::Thread
+            }
         }
     }
 
     fn synthesized_code(&self) -> i32 {
         match self {
             Self::Process { .. } | Self::Zombie { .. } => linux_raw_sys::general::SI_USER as i32,
-            Self::ExitedLeader { .. } | Self::Thread { .. } => SI_TKILL,
+            Self::ExitedLeader { .. } | Self::Thread { .. } | Self::SelfThread { .. } => SI_TKILL,
         }
     }
 }
@@ -389,6 +401,31 @@ fn signal_target_from_fd(fd: i32) -> AxResult<ResolvedPidFdSignalTarget> {
     }
 }
 
+/// Resolves `pidfd == PIDFD_SELF_THREAD`, which Linux short-circuits to
+/// `get_task_pid(current, PIDTYPE_PID)` before any descriptor lookup.
+fn self_thread_signal_target() -> AxResult<ResolvedPidFdSignalTarget> {
+    let task = current().clone();
+    let thread = task.as_thread();
+    Ok(ResolvedPidFdSignalTarget::SelfThread {
+        credential: thread.current_cred(),
+        visible_tid: thread.tid(),
+        task,
+    })
+}
+
+/// Resolves `pidfd == PIDFD_SELF_THREAD_GROUP`, which Linux short-circuits to
+/// `get_task_pid(current, PIDTYPE_TGID)` — the calling process's group leader.
+fn self_thread_group_signal_target() -> AxResult<ResolvedPidFdSignalTarget> {
+    let process = current().as_thread().proc_data.clone();
+    let (credential, leader_signal) = process.group_leader_signal_identity()?;
+    Ok(ResolvedPidFdSignalTarget::Process {
+        identity: process.proc.clone(),
+        process,
+        credential,
+        leader_signal,
+    })
+}
+
 fn retry_pidfd_thread_signal_target(
     pidfd: FileHandle<PidFd>,
     stable_tid: u32,
@@ -472,6 +509,7 @@ fn make_pidfd_signal_info<M: UserMemory + ?Sized>(
     target_id: u32,
     signo: u32,
     sig: *const SignalInfo,
+    process_group_scope: bool,
 ) -> AxResult<PidFdSignalRequest> {
     // `SignalInfo` is the signal crate's fixed-size, layout-checked mirror of
     // Linux siginfo_t (including its union storage).  Read the complete record
@@ -486,7 +524,16 @@ fn make_pidfd_signal_info<M: UserMemory + ?Sized>(
     if i32::try_from(signo).ok() != Some(raw_signo) {
         return Err(AxError::InvalidInput);
     }
-    if current().as_thread().tid() != target_id && (sig.code() >= 0 || sig.code() == SI_TKILL) {
+    // `do_pidfd_send_signal()`:
+    //     /* Only allow sending arbitrary signals to yourself. */
+    //     if ((task_pid(current) != pid || type > PIDTYPE_TGID) &&
+    //         (kinfo.si_code >= 0 || kinfo.si_code == SI_TKILL))
+    //             return -EPERM;
+    // `type > PIDTYPE_TGID` is exactly the process-group scope, which can
+    // never accept a caller-supplied `si_code`.
+    if (current().as_thread().tid() != target_id || process_group_scope)
+        && (sig.code() >= 0 || sig.code() == SI_TKILL)
+    {
         return Err(AxError::OperationNotPermitted);
     }
     let code = sig.code();
@@ -503,11 +550,49 @@ pub fn sys_pidfd_send_signal<M: UserMemory + ?Sized>(
     sig: *mut SignalInfo,
     flags: u32,
 ) -> AxResult<isize> {
-    if flags != 0 {
-        return Err(AxError::InvalidInput);
+    // kernel/signal.c `SYSCALL_DEFINE4(pidfd_send_signal, ...)` validates the
+    // scope word before it touches the descriptor table:
+    //     /* Enforce flags be set to 0 until we add an extension. */
+    //     if (flags & ~PIDFD_SEND_SIGNAL_FLAGS)                     return -EINVAL;
+    //     /* Ensure that only a single signal scope determining flag is set. */
+    //     if (hweight32(flags & PIDFD_SEND_SIGNAL_FLAGS) > 1)       return -EINVAL;
+    // so an unknown bit or two scope flags at once is -EINVAL even for a
+    // nonexistent `pidfd`, and `PIDFD_SELF_THREAD` / `PIDFD_SELF_THREAD_GROUP`
+    // are negative magic descriptors that never reach the descriptor table.
+    let plan = tk_linux_fd::pidfd_signal_plan(pidfd, flags, tk_linux_fd::SignalScope::ThreadGroup)
+        .map_err(|tk_linux_fd::PidfdSignalError::InvalidInput| AxError::InvalidInput)?;
+    // `do_pidfd_send_signal()` overrides the inferred type from the flags:
+    //     case PIDFD_SIGNAL_PROCESS_GROUP:
+    //             type = PIDTYPE_PGID;
+    //             break;
+    // and then delivers with `kill_pgrp_info()`.  This kernel's delivery and
+    // security contract carries no process-group scope, so the request is
+    // refused rather than silently downgraded to a thread-group delivery.
+    if plan.scope.is_process_group() {
+        return Err(LinuxError::EOPNOTSUPP.into());
     }
 
-    let target = signal_target_from_fd(pidfd)?;
+    let (target, scope) = match plan.target {
+        tk_linux_fd::SignalTarget::SelfThread => (self_thread_signal_target()?, plan.scope),
+        tk_linux_fd::SignalTarget::SelfThreadGroup => {
+            (self_thread_group_signal_target()?, plan.scope)
+        }
+        tk_linux_fd::SignalTarget::Descriptor => {
+            let target = signal_target_from_fd(pidfd)?;
+            // A real pidfd's implied scope follows the descriptor kind
+            // (`PIDFD_THREAD` ⇒ PIDTYPE_PID, otherwise PIDTYPE_TGID), which the
+            // resolved target already records.  An explicit scope flag wins.
+            let scope = if flags == 0 {
+                match target.delivery_scope() {
+                    SignalDeliveryScope::Thread => tk_linux_fd::SignalScope::Thread,
+                    SignalDeliveryScope::ThreadGroup => tk_linux_fd::SignalScope::ThreadGroup,
+                }
+            } else {
+                plan.scope
+            };
+            (target, scope)
+        }
+    };
 
     let request = if sig.is_null() {
         if signo == 0 {
@@ -533,12 +618,22 @@ pub fn sys_pidfd_send_signal<M: UserMemory + ?Sized>(
             }
         }
     } else {
-        make_pidfd_signal_info(memory, target.visible_id(), signo, sig)?
+        make_pidfd_signal_info(
+            memory,
+            target.visible_id(),
+            signo,
+            sig,
+            scope.is_process_group(),
+        )?
     };
     let operation = signal_operation(
         request.signal.as_ref().and_then(SignalInfo::try_signo),
         SignalSecuritySource::PidFd { code: request.code },
-        target.delivery_scope(),
+        match scope {
+            tk_linux_fd::SignalScope::Thread => SignalDeliveryScope::Thread,
+            tk_linux_fd::SignalScope::ThreadGroup => SignalDeliveryScope::ThreadGroup,
+            tk_linux_fd::SignalScope::ProcessGroup => return Err(LinuxError::EOPNOTSUPP.into()),
+        },
     )?;
     let sig = request.signal;
     let queue_required = queued_signal_required(&sig);
@@ -664,6 +759,29 @@ pub fn sys_pidfd_send_signal<M: UserMemory + ?Sized>(
                 }
                 break;
             }
+            ResolvedPidFdSignalTarget::SelfThread {
+                task,
+                credential,
+                visible_tid,
+            } => {
+                let thread = task.try_as_thread().ok_or(AxError::NoSuchProcess)?;
+                check_current_pinned_thread_signal_access(
+                    thread,
+                    &task,
+                    &credential,
+                    visible_tid,
+                    SignalTargetKind::PidFdThread,
+                    operation,
+                )?;
+                send_signal_to_authorized_thread(
+                    &task,
+                    &credential,
+                    visible_tid,
+                    sig.clone(),
+                    queue_required,
+                )?;
+                break;
+            }
             ResolvedPidFdSignalTarget::Thread {
                 pidfd,
                 task,
@@ -708,7 +826,7 @@ pub fn sys_pidfd_send_signal<M: UserMemory + ?Sized>(
 mod tests {
     use alloc::sync::Arc;
 
-    use axerrno::{AxError, AxResult};
+    use axerrno::{AxError, AxResult, LinuxError};
 
     use super::{
         PIDFD_THREAD_SIGNAL_RETRY_LIMIT, PidFdLeaderPostHook, PidFdProcessPostHook,

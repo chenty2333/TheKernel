@@ -117,8 +117,16 @@ pub const MS_SUPPORTED_FLAGS: u32 = MS_RDONLY
     | MS_SILENT
     | MS_PROPAGATION_FLAGS
     | MS_RELATIME
-    | MS_STRICTATIME;
-pub const MS_UNSUPPORTED_FLAGS: u32 =
+    | MS_STRICTATIME
+    | MS_SUPERBLOCK_FLAGS;
+/// `MS_NOUSER` — the only legacy flag `path_mount()` rejects outright.
+pub const MS_NOUSER: u32 = 1 << 31;
+/// Superblock-scoped legacy flags.  `path_mount()` folds these into
+/// `sb->s_flags` through
+/// `sb_flags = flags & (SB_RDONLY | SB_SYNCHRONOUS | SB_MANDLOCK | SB_DIRSYNC |
+///                      SB_SILENT | SB_POSIXACL | SB_LAZYTIME | SB_I_VERSION)`;
+/// they are accepted, not refused.  (`1 << 16` is `MS_POSIXACL`.)
+pub const MS_SUPERBLOCK_FLAGS: u32 =
     MS_SYNCHRONOUS | MS_DIRSYNC | (1 << 16) | MS_I_VERSION | MS_LAZYTIME;
 pub const MS_INHERITED_BIND_FLAGS: u32 = MS_RDONLY
     | MS_NOSUID
@@ -344,26 +352,46 @@ pub const fn validate_mount_setattr_flags(flags: u32, size: usize) -> Result<(),
         Ok(())
     }
 }
+/// `ksys_umount()` (fs/namespace.c) performs the whole flag-validity check
+/// before it even loads the pathname:
+///
+/// ```text
+/// 	// basic validity checks done first
+/// 	if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+/// 		return -EINVAL;
+/// ```
+///
+/// The `MNT_EXPIRE` combination rule lives in `do_umount()`, which only runs
+/// after the lookup and permission stages, so it is *not* part of this test.
 pub const fn validate_umount_flags(flags: i32) -> Result<(), UapiError> {
-    if flags & !UMOUNT_FLAGS_VALID != 0
-        || flags & MNT_EXPIRE != 0 && flags & (MNT_FORCE | MNT_DETACH) != 0
-    {
+    if flags & !UMOUNT_FLAGS_VALID != 0 {
         Err(UapiError::Invalid)
     } else {
         Ok(())
     }
 }
+/// `path_mount()` (fs/namespace.c) validates the legacy flag word with exactly
+/// one test:
+///
+/// ```text
+/// 	/* Basic sanity checks */
+/// 	if (data_page)
+/// 		((char *)data_page)[PAGE_SIZE - 1] = 0;
+///
+/// 	if (flags & MS_NOUSER)
+/// 		return -EINVAL;
+/// ```
+///
+/// Nothing else is refused: `MS_SYNCHRONOUS`, `MS_DIRSYNC`, `MS_POSIXACL`,
+/// `MS_I_VERSION` and `MS_LAZYTIME` are all accepted and become superblock
+/// flags, so the legacy entry point must not invent an `EOPNOTSUPP` for them.
 pub const fn validate_mount_flags(raw: i32) -> Result<u32, UapiError> {
     let mut flags = raw as u32;
     if flags & MS_MGC_MSK == MS_MGC_VAL {
         flags &= !MS_MGC_MSK;
     }
-    if flags & (MS_KERNMOUNT | MS_INTERNAL_FLAGS) != 0
-        || flags & !(MS_SUPPORTED_FLAGS | MS_UNSUPPORTED_FLAGS) != 0
-    {
+    if flags & MS_NOUSER != 0 {
         Err(UapiError::Invalid)
-    } else if flags & MS_UNSUPPORTED_FLAGS != 0 {
-        Err(UapiError::Unsupported)
     } else {
         Ok(flags)
     }
@@ -850,12 +878,19 @@ mod tests {
     #[test]
     fn uapi_flag_admission_and_atime_transitions_are_linux_owned() {
         assert_eq!(
-            validate_mount_flags(MS_KERNMOUNT as i32),
+            validate_mount_flags(MS_NOUSER as i32),
             Err(UapiError::Invalid)
         );
+        // Superblock-scoped legacy flags are accepted, not refused.
+        assert_eq!(validate_mount_flags(MS_SYNCHRONOUS as i32), Ok(MS_SYNCHRONOUS));
+        assert_eq!(validate_mount_flags(MS_DIRSYNC as i32), Ok(MS_DIRSYNC));
+        assert_eq!(validate_mount_flags(MS_I_VERSION as i32), Ok(MS_I_VERSION));
+        assert_eq!(validate_mount_flags(MS_LAZYTIME as i32), Ok(MS_LAZYTIME));
+        // Only MS_NOUSER is refused; MS_KERNMOUNT survives untouched even
+        // though userspace has no business setting it.
         assert_eq!(
-            validate_mount_flags(MS_SYNCHRONOUS as i32),
-            Err(UapiError::Unsupported)
+            validate_mount_flags((MS_KERNMOUNT | MS_RDONLY) as i32),
+            Ok(MS_KERNMOUNT | MS_RDONLY)
         );
         assert_eq!(
             validate_mount_flags((MS_MGC_VAL | MS_RDONLY) as i32),

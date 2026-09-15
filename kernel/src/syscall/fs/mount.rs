@@ -4927,8 +4927,53 @@ pub fn sys_umount2<M: UserMemory + ?Sized>(
     if !target.is_root_of_mount() {
         return Err(AxError::InvalidInput);
     }
+    // `do_umount()` (fs/namespace.c) runs these checks after the lookup and
+    // after `can_umount()`:
+    //     if (flags & MNT_EXPIRE) {
+    //             if (&mnt->mnt == current->fs->root.mnt ||
+    //                 flags & (MNT_FORCE | MNT_DETACH))
+    //                     return -EINVAL;
+    // so an expire request aimed at the filesystem root, or combined with
+    // FORCE/DETACH, is -EINVAL rather than -EBUSY or a real unmount.
+    if flags & MNT_EXPIRE != 0 && (target.is_root() || flags & (MNT_FORCE | MNT_DETACH) != 0) {
+        return Err(AxError::InvalidInput);
+    }
+    // MNT_FORCE only ever calls `sb->s_op->umount_begin()`, and no backend
+    // here exposes one, so the bit is a no-op hint exactly as in Linux.
     if target.is_root() {
-        return Err(AxError::from(LinuxError::EBUSY));
+        // `&mnt->mnt == current->fs->root.mnt`: with MNT_DETACH the special
+        // case below is skipped and the later `!mnt_has_parent(mnt)` guard
+        // rejects the namespace root with -EINVAL, since it has no parent to
+        // detach from.
+        if flags & MNT_DETACH != 0 {
+            return Err(AxError::InvalidInput);
+        }
+        // Otherwise Linux "unmounts" the root by trying to remount it
+        // read-only:
+        //     Special case for "unmounting" root ...
+        //     we just try to remount it readonly.
+        //             if (!ns_capable(sb->s_user_ns, CAP_SYS_ADMIN))
+        //                     return -EPERM;
+        //             return do_umount_root(sb);
+        // `do_umount_root()` is a no-op when the superblock is already
+        // read-only, and otherwise reconfigures it with SB_RDONLY.
+        if !ns_capable(
+            security.actor(),
+            security.filesystem_owner_user_ns(),
+            CAP_SYS_ADMIN,
+        ) {
+            return Err(AxError::from(LinuxError::EPERM));
+        }
+        let metadata = mounts::metadata_for_location(&target)?;
+        mounts::remount_with_data(
+            &target,
+            FsPathBuf::new(),
+            String::new(),
+            MS_RDONLY,
+            metadata.data,
+        )?;
+        reconcile_current_mount_topology()?;
+        return Ok(0);
     }
     mounts::unmount_and_remove_records(target, flags & MNT_DETACH != 0, flags & MNT_EXPIRE != 0)?;
     reconcile_current_mount_topology()?;
@@ -5271,14 +5316,25 @@ mod tests {
     }
 
     #[test]
-    fn mount_flag_validation_separates_invalid_and_unsupported_bits() {
+    fn mount_flag_validation_matches_path_mount_ms_nouser_only() {
         assert_eq!(
-            validate_mount_flags(MS_KERNMOUNT as i32).unwrap_err(),
+            validate_mount_flags(MS_NOUSER as i32).unwrap_err(),
             UapiError::Invalid
         );
+        // `path_mount()` folds these into `sb->s_flags` instead of refusing
+        // them, so the legacy entry point must accept them.
         assert_eq!(
-            validate_mount_flags(MS_SYNCHRONOUS as i32).unwrap_err(),
-            UapiError::Unsupported
+            validate_mount_flags(MS_SYNCHRONOUS as i32).unwrap(),
+            MS_SYNCHRONOUS
+        );
+        assert_eq!(validate_mount_flags(MS_DIRSYNC as i32).unwrap(), MS_DIRSYNC);
+        assert_eq!(
+            validate_mount_flags(MS_I_VERSION as i32).unwrap(),
+            MS_I_VERSION
+        );
+        assert_eq!(
+            validate_mount_flags(MS_LAZYTIME as i32).unwrap(),
+            MS_LAZYTIME
         );
         assert_eq!(
             validate_mount_flags((MS_MGC_VAL | MS_RDONLY) as i32).unwrap(),

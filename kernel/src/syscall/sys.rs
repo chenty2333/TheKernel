@@ -726,11 +726,12 @@ fn syslog_copy<M: UserMemory + ?Sized>(
 
 fn syslog_plan(
     action: SyslogAction,
+    buf_present: bool,
     len: isize,
     privileged: bool,
     cursors: SyslogCursors,
 ) -> AxResult<SyslogPlan> {
-    linux_syslog::plan(action, len, privileged, cursors).map_err(|error| match error {
+    linux_syslog::plan(action, buf_present, len, privileged, cursors).map_err(|error| match error {
         SyslogPlanError::InvalidArgument => AxError::InvalidInput,
         SyslogPlanError::PermissionDenied => AxError::OperationNotPermitted,
     })
@@ -747,7 +748,15 @@ pub fn sys_syslog<M: UserMemory + ?Sized>(
     // section, so two blocking READs cannot consume the same log range.
     let _read_guard = matches!(action, SyslogAction::Read).then(|| SYSLOG_READ_LOCK.lock());
     let cursors = *SYSLOG_CURSORS.lock();
-    let plan = syslog_plan(action, len, current_can_read_klog(), cursors)?;
+    // Linux's do_syslog() tests `!buf` for READ/READ_ALL/READ_CLEAR, so a
+    // NULL output is EINVAL even when the length is zero.
+    let plan = syslog_plan(
+        action,
+        !buf.is_null(),
+        len,
+        current_can_read_klog(),
+        cursors,
+    )?;
     match plan {
         SyslogPlan::Noop => Ok(0),
         SyslogPlan::Console { enabled } => {
@@ -975,11 +984,11 @@ mod tests {
     fn syslog_planner_ignores_non_data_lengths_and_keeps_read_cursor_separate() {
         let mut cursors = SyslogCursors { read: 3, clear: 7 };
         assert_eq!(
-            syslog_plan(SyslogAction::Close, -1, true, cursors),
+            syslog_plan(SyslogAction::Close, false, -1, true, cursors),
             Ok(SyslogPlan::Noop)
         );
         assert_eq!(
-            syslog_plan(SyslogAction::ReadClear, 4, true, cursors),
+            syslog_plan(SyslogAction::ReadClear, true, 4, true, cursors),
             Ok(SyslogPlan::Copy {
                 cursor: 7,
                 newest: true,
@@ -989,7 +998,7 @@ mod tests {
         linux_syslog::commit(&mut cursors, SyslogCommit::Clear, 11);
         assert_eq!(cursors, SyslogCursors { read: 3, clear: 11 });
         assert_eq!(
-            syslog_plan(SyslogAction::Clear, -1, true, cursors),
+            syslog_plan(SyslogAction::Clear, false, -1, true, cursors),
             Ok(SyslogPlan::Clear)
         );
     }
@@ -998,10 +1007,10 @@ mod tests {
     fn syslog_read_plan_observes_the_cursor_after_the_prior_serialized_commit() {
         let _read_guard = SYSLOG_READ_LOCK.lock();
         let mut cursors = SyslogCursors { read: 2, clear: 0 };
-        let first = syslog_plan(SyslogAction::Read, 4, true, cursors).unwrap();
+        let first = syslog_plan(SyslogAction::Read, true, 4, true, cursors).unwrap();
         assert!(matches!(first, SyslogPlan::Copy { cursor: 2, .. }));
         linux_syslog::commit(&mut cursors, SyslogCommit::Read, 6);
-        let second = syslog_plan(SyslogAction::Read, 4, true, cursors).unwrap();
+        let second = syslog_plan(SyslogAction::Read, true, 4, true, cursors).unwrap();
         assert!(matches!(second, SyslogPlan::Copy { cursor: 6, .. }));
     }
 

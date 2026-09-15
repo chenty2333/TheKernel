@@ -185,7 +185,18 @@ fn file_open_operation(
     .ok_or(AxError::InvalidInput)
 }
 
-const FCNTL_SETFL_MUTABLE_FLAGS: u32 = O_APPEND | O_NONBLOCK | FASYNC;
+/// Linux `setfl()` (fs/fcntl.c) commits
+/// `filp->f_flags = (arg & SETFL_MASK) | (filp->f_flags & ~SETFL_MASK)`, so the
+/// mutable subset is exactly `SETFL_MASK = O_APPEND | O_NONBLOCK | O_NDELAY |
+/// O_DIRECT | O_NOATIME`.  `FASYNC` is deliberately *not* in `SETFL_MASK`:
+/// Linux lets `->fasync()` maintain that bit itself.  TheKernel models the
+/// fasync registration as an OFD status bit instead, so its effective mutable
+/// subset is `SETFL_MASK | FASYNC`.
+const FCNTL_SETFL_MUTABLE_FLAGS: u32 = tk_linux_fd::SETFL_MASK | FASYNC;
+const _: () = assert!(
+    FCNTL_SETFL_MUTABLE_FLAGS & !FASYNC == tk_linux_fd::SETFL_MASK,
+    "F_SETFL must mutate Linux's SETFL_MASK plus FASYNC"
+);
 
 fn fcntl_allowed_on_path_fd(cmd: u32) -> bool {
     matches!(
@@ -2413,13 +2424,52 @@ pub fn sys_fcntl(
         }
         F_SETFL => {
             let description = get_file_description(fd)?;
-            let requested = (arg as u32) & FCNTL_SETFL_MUTABLE_FLAGS;
+            let current_flags = description.status_flags();
+            // `S_ISFIFO(inode->i_mode)` in fs/fcntl.c:setfl() covers both
+            // anonymous pipes and named FIFOs, because Linux builds both on a
+            // `S_IFIFO` inode.
+            let is_fifo = PipeEndpoint::from_file(&*description.inner).is_some();
+            // `FMODE_CAN_ODIRECT` is granted by `do_dentry_open()` when the
+            // inode's mapping carries `a_ops->direct_IO`, i.e. when the
+            // descriptor is backed by a real filesystem inode rather than a
+            // pseudo object.
+            let can_odirect = description.inner.vfs_location().is_some();
+            // `IS_APPEND(inode)`, taken from the same attribute word that
+            // statx publishes.
+            let append_only =
+                description.inner.stat()?.attributes & u64::from(STATX_ATTR_APPEND) != 0;
+            // `inode_owner_or_capable(file_mnt_idmap(filp), inode)` against the
+            // mount view this exact open file description was created under.
+            let noatime_owner_or_capable = match description.inner.vfs_location() {
+                Some(location) => inode_flags::owner_or_capable_with_idmap(
+                    &location.metadata()?,
+                    &VfsSecurityContext::new(current().as_thread().current_cred()),
+                    description.vfs_mount_idmap().as_deref(),
+                ),
+                None => false,
+            };
+            let plan = tk_linux_fd::plan_setfl(
+                arg as u32,
+                current_flags,
+                append_only,
+                noatime_owner_or_capable,
+                can_odirect,
+                is_fifo,
+            )
+            .map_err(|error| match error {
+                tk_linux_fd::SetFlError::NotPermitted => AxError::OperationNotPermitted,
+                tk_linux_fd::SetFlError::InvalidInput => AxError::InvalidInput,
+            })?;
+            let requested = plan.mutable | ((arg as u32) & FASYNC);
             description.transition_status_flags(
                 |old| (old.raw() & !FCNTL_SETFL_MUTABLE_FLAGS) | requested,
                 |old, new| {
-                    if new.raw() & O_DIRECT != 0
-                        && PipeEndpoint::from_file(&*description.inner).is_some()
-                    {
+                    // Linux reads O_DIRECT on a FIFO as a request for
+                    // packetized pipe mode (`is_packetized()`, fs/pipe.c) and
+                    // admits it unconditionally.  The byte-stream pipe backend
+                    // keeps no per-write framing, so the transition is refused
+                    // rather than silently accepted and then ignored.
+                    if is_fifo && new.raw() & O_DIRECT != 0 {
                         return Err(AxError::OperationNotSupported);
                     }
                     if old.nonblocking() != new.nonblocking() {
