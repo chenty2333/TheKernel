@@ -374,9 +374,19 @@ const IPC_MODE_MASK: c_ushort = 0o777;
 pub(crate) const SHM_DEST: u32 = 0o1000;
 pub(crate) const SHM_LOCKED: u32 = 0o2000;
 pub(crate) const SHMMIN: usize = 1;
-const DEFAULT_SHMMAX: usize = 0xFFFF_FFFF;
+/// `include/uapi/linux/shm.h:19-21`:
+///
+/// ```c
+/// #define SHMMAX (ULONG_MAX - (1UL << 24)) /* max shared seg size (bytes) */
+/// #define SHMALL (ULONG_MAX - (1UL << 24)) /* max shm system wide (pages) */
+/// ```
+///
+/// `shm_init_ns()` seeds every IPC namespace with them (`ipc/shm.c:112-113`),
+/// and the header explains the value: as large as possible without letting
+/// userspace overflow a "read the limit, add X, write it back" adjustment.
+const DEFAULT_SHMMAX: usize = usize::MAX - (1 << 24);
 const DEFAULT_SHMMNI: usize = 4096;
-const DEFAULT_SHMALL: usize = 0xFFFF_FFFF;
+const DEFAULT_SHMALL: usize = usize::MAX - (1 << 24);
 const MAX_SHMMNI: usize = 32_768;
 
 static SHM_MAX_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_SHMMAX);
