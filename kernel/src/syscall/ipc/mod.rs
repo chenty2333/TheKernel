@@ -4,6 +4,8 @@ use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use axerrno::{AxError, AxResult, LinuxError};
 use axsync::Mutex;
 use self::shm::Mutex as ShmMutex;
+use axtask::current;
+use tk_linux_process_adapter::Pid;
 
 mod mqueue;
 mod msg;
@@ -20,6 +22,23 @@ pub use self::{mqueue::*, msg::*, sem::*, shm::*};
 use crate::task::{AsThread, Cred, Kgid, Kuid, UserNamespace, ns_capable};
 
 static IPC_NAMESPACE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Linux `pid_vnr()` for a task-group identity retained by a SysV record.
+///
+/// A SysV object keeps a kernel-wide `struct pid` and renders it in the
+/// *reader's* PID namespace when the record is copied out - `ipc/msg.c:574-575`
+/// (`msg_lspid`/`msg_lrpid`), `ipc/shm.c:1144-1145`
+/// (`shm_cpid`/`shm_lpid`) and `ipc/sem.c:1549` (`GETPID`) all go through
+/// `pid_vnr()`, and `/proc/sysvipc/*` uses `pid_nr_ns()` against the reader's
+/// `current->nsproxy->pid_ns_for_children` (`ipc/msg.c:1355-1356`,
+/// `ipc/shm.c:1869-1870`).  A field that was never written holds no `struct
+/// pid` at all, for which `pid_nr_ns()` reports zero.
+pub(crate) fn render_task_pid(pid: Pid) -> __kernel_pid_t {
+    if pid == 0 {
+        return 0;
+    }
+    current().as_thread().pid_ns().visible_pid(pid) as __kernel_pid_t
+}
 
 /// All IPC objects visible through one Linux IPC namespace.
 ///

@@ -138,6 +138,12 @@ fn write_msqid_ds<M: UserMemory + ?Sized>(
     ptr: *mut msqid_ds,
     value: msqid_ds,
 ) -> AxResult<()> {
+    // `msg_lspid`/`msg_lrpid` are stored as kernel-wide task-group identities
+    // and rendered with `pid_vnr()` for the *reader's* PID namespace
+    // (`ipc/msg.c:574-575`).
+    let mut value = value;
+    value.msg_lspid = super::render_task_pid(value.msg_lspid as Pid);
+    value.msg_lrpid = super::render_task_pid(value.msg_lrpid as Pid);
     // SAFETY: `initialized_msqid_ds` zeroes every byte, including the ABI
     // alignment hole, and the layout assertions cover the complete record.
     unsafe { VmMutPtr::vm_write_unchecked(ptr, memory, initialized_msqid_ds(value)) }
@@ -607,8 +613,8 @@ pub(crate) fn sysvipc_msg_snapshot() -> String {
             ds.msg_perm.mode & 0o777,
             ds.msg_cbytes,
             ds.msg_qnum,
-            ds.msg_lspid,
-            ds.msg_lrpid,
+            super::render_task_pid(ds.msg_lspid as Pid),
+            super::render_task_pid(ds.msg_lrpid as Pid),
             ds.msg_perm.uid,
             ds.msg_perm.gid,
             ds.msg_perm.cuid,

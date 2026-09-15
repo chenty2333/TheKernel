@@ -18,6 +18,7 @@ use tk_linux_ipc::{
     IpcId, IpcIdTable, SemBuf as AbiSemBuf, SemPlan, ipcid_compose, ipcid_is_stale, ipcid_to_idx,
     plan_sem_op, sem_undo_delta_in_range,
 };
+use tk_linux_process_adapter::Pid;
 use tk_linux_usercopy::{
     UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
 };
@@ -1152,7 +1153,9 @@ pub fn sys_semctl<M: UserMemory + ?Sized>(
                 return Err(AxError::from(LinuxError::EACCES));
             }
             let index = validate_semnum(&array, semnum)?;
-            Ok(array.sems[index].pid as isize)
+            // Linux `semctl_main()`: `err = pid_vnr(curr->sempid)`
+            // (`ipc/sem.c:1548-1550`), rendered in the caller's PID namespace.
+            Ok(super::render_task_pid(array.sems[index].pid as Pid) as isize)
         }
         GETNCNT => {
             if !array.readable(&context) {
