@@ -333,6 +333,56 @@ pub fn plan(
     })
 }
 
+/// Why a `sched_getaffinity(2)` length cannot name a CPU mask.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AffinityLengthReject {
+    /// `(len * BITS_PER_BYTE) < nr_cpu_ids`
+    TooSmallForEveryCpu,
+    /// `len & (sizeof(unsigned long) - 1)`
+    NotWholeWords,
+    /// The `unsigned int len` multiply wrapped, so the kernel's `len * 8`
+    /// comparison is evaluated on the wrapped product and fails.
+    WordCountOverflow,
+}
+
+/// Admits the `len` of `sched_getaffinity(2)` and reports how many bytes the
+/// syscall then copies out.
+///
+/// `SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len, unsigned
+/// long __user *, user_mask_ptr)` (`kernel/sched/syscalls.c:1309-1341`) runs
+/// exactly these tests, in this order, before it resolves `pid`:
+///
+/// ```text
+/// 	if ((len * BITS_PER_BYTE) < nr_cpu_ids)
+/// 		return -EINVAL;
+/// 	if (len & (sizeof(unsigned long)-1))
+/// 		return -EINVAL;
+/// ```
+///
+/// On success it copies `min(len, cpumask_size())` bytes and returns that
+/// count, so an over-long request neither writes past the kernel mask nor
+/// reports the longer length.  `nr_cpu_ids` is the configured ceiling rather
+/// than the number of online CPUs, and `cpumask_size()` covers that same
+/// ceiling; the caller supplies both.
+pub fn affinity_length(cpusetsize: u32, max_cpu_num: usize) -> Result<usize, AffinityLengthReject> {
+    let bits = cpusetsize
+        .checked_mul(u8::BITS)
+        .ok_or(AffinityLengthReject::WordCountOverflow)?;
+    if (bits as usize) < max_cpu_num {
+        return Err(AffinityLengthReject::TooSmallForEveryCpu);
+    }
+    if cpusetsize as usize % core::mem::size_of::<usize>() != 0 {
+        return Err(AffinityLengthReject::NotWholeWords);
+    }
+    Ok(cpusetsize as usize)
+}
+
+/// The byte count `cpumask_size()` reports for a given CPU ceiling.
+pub fn cpumask_size(max_cpu_num: usize) -> usize {
+    let word_bits = u8::BITS as usize * core::mem::size_of::<usize>();
+    max_cpu_num.max(1).div_ceil(word_bits) * core::mem::size_of::<usize>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

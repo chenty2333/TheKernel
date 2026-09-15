@@ -19,6 +19,7 @@
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -35,11 +36,16 @@
 #define PIPE_BUF_FLAGS_VALID (O_CLOEXEC | O_NONBLOCK | O_DIRECT | O_EXCL)
 #define O_NOTIFICATION_PIPE O_EXCL /* include/uapi/linux/pipe_fs_i.h */
 
-#define FIGETBSZ 0x00000002UL   /* _IO(0x00, 2) */
-#define FIFREEZE 0xC0045877UL   /* _IOWR('X', 119, int) */
-#define FITHAW 0xC0045878UL     /* _IOWR('X', 120, int) */
-#define FS_IOC_GETFSUUID 0x80111150UL
-#define FS_IOC_GETFSSYSFSPATH 0x80811501UL
+/* include/uapi/linux/fs.h -- these must equal the kernel's numbers, or the
+ * assertions below test a command the kernel never decodes.  FIGETBSZ is one
+ * of the few _IO commands that takes an argument (`_IO(0x00,2)`, so its
+ * encoding carries neither direction nor size); a `_IOR(0x00, 2, int)`
+ * spelling addresses a different, unallocated command instead. */
+#define FIGETBSZ 0x00000002UL               /* _IO(0x00, 2) */
+#define FIFREEZE 0xC0045877UL               /* _IOWR('X', 119, int) */
+#define FITHAW 0xC0045878UL                 /* _IOWR('X', 120, int) */
+#define FS_IOC_GETFSUUID 0x80111500UL       /* _IOR(0x15, 0, struct fsuuid2) */
+#define FS_IOC_GETFSSYSFSPATH 0x80811501UL  /* _IOR(0x15, 1, struct fs_sysfs_path) */
 
 #define MS_RDONLY 1UL
 #define MS_SYNCHRONOUS 16UL
@@ -80,7 +86,9 @@
 #define PIDFD_SIGNAL_THREAD_GROUP 2U
 #define PIDFD_SELF_THREAD (-10000)
 
+#define SYSLOG_ACTION_READ 2
 #define SYSLOG_ACTION_READ_ALL 3
+#define SYSLOG_ACTION_READ_CLEAR 4
 #define SYSLOG_ACTION_CONSOLE_LEVEL 8
 #define SYSLOG_ACTION_SIZE_BUFFER 10
 
@@ -133,9 +141,11 @@ static void done(void) { printf("THEKERNEL_ABI_RESULT %s pass\n", active); }
 
 static void check(int ok, const char *stage) {
     if (!ok) {
+        int saved = errno;
         fprintf(stderr, "THEKERNEL_FS_ABI_FAIL %s %s errno=%d (%s)\n", active,
-                stage, errno, strerror(errno));
-        exit(1);
+                stage, saved, strerror(saved));
+        fflush(NULL);
+        _exit(1);
     }
 }
 
@@ -149,6 +159,11 @@ static void drops_to(void) {
 }
 
 int main(void) {
+    /* Diagnostics must reach the console in one write.  A stdio buffer that
+     * `exit()` flushes afterwards can still be interleaved by a kernel warning
+     * that lands mid-line, which truncates the FAIL record the harness reads. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     check(mkdtemp(root) != NULL, "root-mkdtemp");
     check(mkdtemp(mnt) != NULL, "mnt-mkdtemp");
     check(atexit(cleanup) == 0, "cleanup-register");
@@ -272,29 +287,86 @@ int main(void) {
     /* ------------------------------------------------------------------ *
      * syslog(2) -- kernel/printk/printk.c do_syslog():
      *     error = check_syslog_permissions(type, source);   if (error) return;
-     *     case SYSLOG_ACTION_READ_ALL:
+     *     case SYSLOG_ACTION_READ:            (:1756)
+     *     case SYSLOG_ACTION_READ_CLEAR:      (:1766, falls through)
+     *     case SYSLOG_ACTION_READ_ALL:        (:1770)
      *             if (!buf || len < 0) return -EINVAL;
      *             if (!len)            return 0;
      *             if (!access_ok(buf, len)) return -EFAULT;
      *     case SYSLOG_ACTION_CONSOLE_LEVEL:
      *             if (len < 1 || len > 8) return -EINVAL;
      *     default: error = -EINVAL;
+     * `SYSCALL_DEFINE3(syslog, int, type, char __user *, buf, int, len)`
+     * (:1853) declares `len` as a 32-bit `int`, so the kernel reads only the
+     * low half of the third argument register.  These calls therefore pass the
+     * length as a `long`, which is what glibc's `syscall()` forwards: an `int`
+     * argument is promoted to `int` in the variadic list only, and the ABI
+     * leaves the register's upper half to the caller, so a bare `-1` arrives
+     * zero-extended as 4294967295 and stops being a negative length at all.
+     * All three ring selectors share one guard, so the ordering facts below hold
+     * for each of them: a NULL buffer and a negative length are the same
+     * -EINVAL verdict and neither reaches access_ok().  A 2 GiB length is the
+     * `int` minimum's magnitude and is negative once sign-extended, so it must
+     * not be mistaken for a huge positive request.
      * ------------------------------------------------------------------ */
     begin("syslog.raw-differential");
     {
-        char buf[256];
+        char buf[4096];
+        /* Unprivileged, and evaluated before anything else: for READ the
+         * capability gate is the whole verdict, including for a NULL buffer
+         * and a negative length.  Asserting -EPERM (not -EINVAL) is what
+         * proves check_syslog_permissions() runs ahead of the switch. */
+        pid_t child = fork();
+        check(child >= 0, "fork");
+        if (child == 0) {
+            drops_to();
+            errno = 0;
+            long a = syscall(SYS_syslog, SYSLOG_ACTION_READ, NULL, 256);
+            int null_buf = (a == -1 && errno == EPERM);
+            errno = 0;
+            long b = syscall(SYS_syslog, SYSLOG_ACTION_READ, NULL, -1);
+            int negative = (b == -1 && errno == EPERM);
+            errno = 0;
+            long c = syscall(SYS_syslog, SYSLOG_ACTION_CONSOLE_LEVEL, NULL, 9);
+            int level = (c == -1 && errno == EPERM);
+            _exit(null_buf && negative && level ? 0 : 1);
+        }
+        int status = 0;
+        check(waitpid(child, &status, 0) == child, "waitpid");
+        check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "privilege");
+        mark("PERMISSION_BEFORE_VALIDATION_EPERM");
         errno = 0;
         check(syscall(SYS_syslog, SYSLOG_ACTION_READ_ALL, NULL, 256) == -1 &&
               errno == EINVAL, "null-buf");
         mark("NULL_BUF_EINVAL");
         errno = 0;
+        check(syscall(SYS_syslog, SYSLOG_ACTION_READ, NULL, 256) == -1 &&
+              errno == EINVAL, "read-null-buf");
+        errno = 0;
+        check(syscall(SYS_syslog, SYSLOG_ACTION_READ_CLEAR, NULL, 256) == -1 &&
+              errno == EINVAL, "read-clear-null-buf");
+        mark("NULL_BUF_EINVAL_ALL_SELECTORS");
+        errno = 0;
         check(syscall(SYS_syslog, SYSLOG_ACTION_READ_ALL, buf, -1) == -1 &&
               errno == EINVAL, "negative-len");
         mark("NEGATIVE_LEN_EINVAL");
         errno = 0;
+        check(syscall(SYS_syslog, SYSLOG_ACTION_READ, buf, -1) == -1 &&
+              errno == EINVAL, "negative-len-read");
+        errno = 0;
+        check(syscall(SYS_syslog, SYSLOG_ACTION_READ_CLEAR, buf, -1) == -1 &&
+              errno == EINVAL, "negative-len-read-clear");
+        errno = 0;
+        check(syscall(SYS_syslog, SYSLOG_ACTION_READ, buf, -2147483647 - 1) == -1 &&
+              errno == EINVAL, "negative-len-int-min");
+        mark("NEGATIVE_LEN_EINVAL_ALL_SELECTORS");
+        errno = 0;
         check(syscall(SYS_syslog, SYSLOG_ACTION_READ_ALL, NULL, 0) == -1 &&
               errno == EINVAL, "zero-len-null");
         check(syscall(SYS_syslog, SYSLOG_ACTION_READ_ALL, buf, 0) == 0, "zero-len");
+        check(syscall(SYS_syslog, SYSLOG_ACTION_READ, buf, 0) == 0, "read-zero-len");
+        check(syscall(SYS_syslog, SYSLOG_ACTION_READ_CLEAR, buf, 0) == 0,
+              "read-clear-zero-len");
         mark("ZERO_LEN_NOOP");
         errno = 0;
         check(syscall(SYS_syslog, SYSLOG_ACTION_READ_ALL, BADPTR, 256) == -1 &&
@@ -372,27 +444,42 @@ int main(void) {
 
     /* ------------------------------------------------------------------ *
      * ioctl(2) -- fs/ioctl.c do_vfs_ioctl() before ->unlocked_ioctl:
-     *     case FIGETBSZ:  get_user(b, &inode->i_sb->s_blocksize)
+     *     case FIGETBSZ:
+     *             -- anon_bdev filesystems may not have a block size --
+     *             if (!inode->i_sb->s_blocksize) return -EINVAL;   (:533-538)
+     *             return put_user(inode->i_sb->s_blocksize, ...);
      *     case FIFREEZE:  ioctl_fsfreeze()  EPERM (no CAP_SYS_ADMIN in
      *                     sb->s_user_ns) then EOPNOTSUPP when the superblock
      *                     has neither ->freeze_fs nor ->freeze_super
      *     case FITHAW:    ioctl_fsthaw()    EPERM then EINVAL (never frozen)
      *     case FS_IOC_GETFSUUID / FS_IOC_GETFSSYSFSPATH:
      *                     -ENOTTY when the superblock has no UUID/sysfs name
-     * A pipe has no ->freeze_fs at all and keeps alloc_super()'s default
-     * s_blocksize of 1024.
+     * A pipe lives on pipefs, whose init_fs_context is init_pseudo()
+     * (fs/pipe.c:1564-1572) and whose fill_super is therefore
+     * pseudo_fs_fill_super(), which sets s_blocksize = PAGE_SIZE
+     * (fs/libfs.c:681-682).  FIGETBSZ on a pipe is consequently a successful
+     * read of PAGE_SIZE, not the -EINVAL that a zero block size would give.
      * ------------------------------------------------------------------ */
     begin("ioctl.raw-differential");
     {
         int pp[2];
         int block_size = 0;
-        /* An anonymous pipe lives on pipefs: alloc_super() never gives it a
-         * block size and pipefs never sets ->freeze_fs, ->freeze_super or a
-         * UUID, so the generic layer alone decides every verdict below. */
+        /* An anonymous pipe lives on pipefs: pseudo_fs_fill_super() gives it
+         * PAGE_SIZE and pipefs never sets ->freeze_fs, ->freeze_super or a
+         * UUID, so the generic layer alone decides the refusals below. */
         check(pipe2(pp, O_CLOEXEC) == 0, "pipe");
         errno = 0;
-        check(ioctl(pp[0], FIGETBSZ, &block_size) == -1 && errno == EINVAL,
-              "pipe-blocksize");
+        check(ioctl(pp[0], FIGETBSZ, &block_size) == 0 &&
+              block_size == (int)sysconf(_SC_PAGESIZE) && block_size >= 512 &&
+              (block_size & (block_size - 1)) == 0, "pipe-blocksize");
+        /* The registered contract name still says _EINVAL because it was
+         * written from the zero-block-size reading of fs/ioctl.c:533-538.
+         * Linux 7.2.3 answers success with PAGE_SIZE here: pipefs reaches
+         * pseudo_fs_fill_super() (fs/libfs.c:681-682), which sets
+         * s_blocksize.  The name is left alone so
+         * tests/qemu_runner/test_abi_differential.py keeps matching; the
+         * assertion follows the source.  TheKernel returns -EINVAL, which is
+         * this same assertion's red state. */
         mark("FIGETBSZ_PSEUDO_EINVAL");
         check(ioctl(file, FIGETBSZ, &block_size) == 0 && block_size >= 512 &&
               (block_size & (block_size - 1)) == 0, "fs-blocksize");
@@ -492,6 +579,10 @@ int main(void) {
          * and only runs after user_path_at() has resolved the path.
          */
         errno = 0;
+        /* Every bit here is inside UMOUNT_FLAGS_VALID, so ksys_umount() passes
+         * the mask test and the verdict comes from user_path_at(): ENOENT, not
+         * EINVAL.  The check exists to prove UMOUNT_NOFOLLOW is *accepted*
+         * rather than rejected, so it must assert the path-lookup verdict. */
         check(syscall(SYS_umount2, "/nonexistent-thekernel-fs-abi",
                       MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) == -1 &&
               errno == ENOENT, "flags-no-follow-ok");
@@ -885,6 +976,237 @@ int main(void) {
         check(syscall(NR_PIDFD_SEND_SIGNAL, -1, SIGUSR1, &info, 0) == -1 &&
               errno == EBADF, "fd-before-signo");
         mark("FD_BEFORE_SIGNO");
+    }
+    done();
+
+    /* ------------------------------------------------------------------ *
+     * ustat(2) -- fs/statfs.c SYSCALL_DEFINE2(ustat, unsigned, dev, struct
+     * ustat __user *, ubuf):
+     *     error = vfs_ustat(new_decode_dev(dev), &sbuf);
+     *     if (!error) {
+     *             memset(&tmp, 0, sizeof(struct ustat));
+     *             tmp.f_tfree  = sbuf.f_bfree;   // int, so a 32-bit truncation
+     *             tmp.f_tinode = sbuf.f_ffree;   // unsigned long
+     *             error = copy_to_user(ubuf, &tmp, sizeof(struct ustat)) ?
+     *                     -EFAULT : 0;
+     *     }
+     * The device is resolved before the destination is touched, so an unknown
+     * device is -EINVAL even for a NULL buffer, and f_fname/f_fpack stay zero.
+     * ------------------------------------------------------------------ */
+    begin("ustat.raw-differential");
+    {
+        struct stat root_stat;
+        struct statfs root_statfs;
+        check(stat("/root", &root_stat) == 0, "stat-root");
+        check(statfs("/root", &root_statfs) == 0, "statfs-root");
+        check(root_statfs.f_ffree > 0, "statfs-ffree");
+        unsigned int dev = (unsigned int)root_stat.st_dev;
+
+        struct {
+            int f_tfree;
+            unsigned int f_tfree_pad;
+            unsigned long f_tinode;
+            char f_fname[6];
+            char f_fpack[6];
+            unsigned int f_tail;
+        } u;
+        memset(&u, 0xAA, sizeof(u));
+        check(syscall(SYS_ustat, dev, &u) == 0, "valid-device");
+        check(u.f_tfree == (int)root_statfs.f_bfree, "f-tfree");
+        check(u.f_tinode == (unsigned long)root_statfs.f_ffree, "f-tinode");
+        check(u.f_tinode != 0, "f-tinode-nonzero");
+        check(u.f_fname[0] == 0 && u.f_fname[1] == 0 && u.f_fname[2] == 0 &&
+              u.f_fname[3] == 0 && u.f_fname[4] == 0 && u.f_fname[5] == 0,
+              "f-fname-zero");
+        check(u.f_fpack[0] == 0 && u.f_fpack[1] == 0 && u.f_fpack[2] == 0 &&
+              u.f_fpack[3] == 0 && u.f_fpack[4] == 0 && u.f_fpack[5] == 0,
+              "f-fpack-zero");
+        mark("VALID_DEVICE_FILLS_COUNTERS");
+        errno = 0;
+        check(syscall(SYS_ustat, dev, NULL) == -1 && errno == EFAULT, "null-buf");
+        mark("NULL_BUF_EFAULT");
+        errno = 0;
+        check(syscall(SYS_ustat, 0xffffffffU, &u) == -1 && errno == EINVAL,
+              "unknown-device");
+        mark("UNKNOWN_DEVICE_EINVAL");
+        /* vfs_ustat() runs before copy_to_user(), so the unknown device wins
+         * over the bad destination instead of the other way around. */
+        errno = 0;
+        check(syscall(SYS_ustat, 0xffffffffU, NULL) == -1 && errno == EINVAL,
+              "unknown-device-null-buf");
+        mark("UNKNOWN_DEVICE_BEFORE_COPYOUT");
+    }
+    done();
+
+    /* ------------------------------------------------------------------ *
+     * sysinfo(2) -- kernel/sys.c do_sysinfo():
+     *     if (!info) return -EFAULT;                        (:2947)
+     *     memset(info, 0, sizeof(struct sysinfo));
+     *     ktime_get_boottime_ts64(&info->uptime);
+     *     get_avenrun(info->loads, 0, SI_LOAD_SHIFT - FSHIFT);   (:2963)
+     *     for (i = 0; i < ARRAY_SIZE(info->loads); i++)
+     *             if (info->loads[i]) info->loads[i] += 1 << (SI_LOAD_SHIFT - 1);
+     *     info->totalram = ...; info->freeram = ...;
+     *     if (!info->totalram) return -EFAULT;
+     *     info->sharedram = global_node_page_state(NR_SHMEM) << PAGE_SHIFT;
+     *     info->bufferram = nr_blockdev_pages();            (:2985)
+     *     info->mem_unit = 1;                               (:2993)
+     * Only the layout and the internal consistency of the result are asserted
+     * here: the page counters themselves are hardware- and cache-dependent, so
+     * an exact value would fail on the other guest.  `mem_unit = 1` makes every
+     * memory field a byte count, which is what the scale assertions check.
+     * ------------------------------------------------------------------ */
+    begin("sysinfo.raw-differential");
+    {
+        struct {
+            int64_t uptime;
+            uint64_t loads[3];
+            uint64_t totalram;
+            uint64_t freeram;
+            uint64_t sharedram;
+            uint64_t bufferram;
+            uint64_t totalswap;
+            uint64_t freeswap;
+            uint16_t procs;
+            uint16_t pad;
+            uint64_t totalhigh;
+            uint64_t freehigh;
+            uint32_t mem_unit;
+            char tail[8];
+        } si;
+        memset(&si, 0, sizeof(si));
+        errno = 0;
+        check(syscall(SYS_sysinfo, &si) == 0, "call");
+        check(si.mem_unit == 1 || si.mem_unit == 4096, "mem-unit");
+        check(si.totalram * si.mem_unit > 0, "totalram-nonzero");
+        check(si.freeram * si.mem_unit <= si.totalram * si.mem_unit,
+              "freeram-within-total");
+        check(si.sharedram * si.mem_unit <= si.totalram * si.mem_unit,
+              "sharedram-within-total");
+        check(si.bufferram * si.mem_unit <= si.totalram * si.mem_unit,
+              "bufferram-within-total");
+        check(si.freeswap * si.mem_unit <= si.totalswap * si.mem_unit,
+              "freeswap-within-total");
+        check(si.procs >= 1, "procs-nonzero");
+        check(si.uptime >= 0, "uptime-nonnegative");
+        mark("FIELD_CONSISTENCY");
+        errno = 0;
+        check(syscall(SYS_sysinfo, NULL) == -1 && errno == EFAULT, "null-buf");
+        mark("NULL_BUF_EFAULT");
+        errno = 0;
+        check(syscall(SYS_sysinfo, BADPTR) == -1 && errno == EFAULT, "bad-ptr");
+        mark("BAD_PTR_EFAULT");
+    }
+    done();
+
+    /* ------------------------------------------------------------------ *
+     * personality(2) -- kernel/exec_domain.c SYSCALL_DEFINE1(personality,
+     * unsigned int, personality):
+     *     if (personality != 0xffffffff) set_personality(personality);
+     *     return current->personality;
+     * `set_personality()` is `current->personality = (pers)`
+     * (include/linux/personality.h:15), so every bit pattern except the query
+     * sentinel is stored verbatim, including unknown low bits and the high
+     * bit: there is no validation and no -EINVAL.
+     *
+     * uname(2) -- kernel/sys.c SYSCALL_DEFINE1(newuname, struct new_utsname
+     * __user *, name):
+     *     down_read(&uts_sem);
+     *     if (override_release(name->release, sizeof(name->release)))
+     *             goto out;                                  // -EFAULT
+     *     if (override_architecture(name)) goto out;         // -EFAULT
+     *     error = copy_to_user(name, utsname(), ...);
+     * UNAME26 (0x00020000) rewrites release via override_release(), whose
+     * "2.6.%d" prefix carries the kernel's own patchlevel + 60; PER_LINUX32
+     * (0x8) rewrites machine to COMPAT_UTS_MACHINE, which is "i686" on x86_64
+     * (arch/x86/include/asm/compat.h:32).  Neither flag is asserted by value
+     * here beyond what is arithmetic on the guest's own release string.
+     * ------------------------------------------------------------------ */
+    begin("uname.raw-differential");
+    {
+        struct {
+            char sysname[65];
+            char nodename[65];
+            char release[65];
+            char version[65];
+            char machine[65];
+            char domainname[65];
+        } u;
+        const unsigned int UNAME26 = 0x00020000U;
+        const unsigned int PER_LINUX32 = 0x0008U;
+        const unsigned int ADDR_NO_RANDOMIZE = 0x00040000U;
+
+        /* personality(2) returns the previous value, not zero, so only the
+         * sentinel query has a defined result to compare. */
+        long query = syscall(SYS_personality, 0xffffffffU);
+        check(query >= 0, "personality-query");
+        check((unsigned long)query == 0, "personality-default-per-linux");
+        check(syscall(SYS_personality, 0xdeadbeefU) >= 0, "personality-unknown-bits");
+        check((unsigned long)syscall(SYS_personality, 0xffffffffU) == 0xdeadbeefUL,
+              "personality-roundtrip");
+        check(syscall(SYS_personality, 0x80000000U) == (long)0xdeadbeefU,
+              "personality-high-bit");
+        check((unsigned long)syscall(SYS_personality, 0xffffffffU) == 0x80000000UL,
+              "personality-high-bit-stored");
+        mark("PERSONALITY_ACCEPTS_ANY_PATTERN");
+
+        memset(&u, 0, sizeof(u));
+        check(syscall(SYS_uname, &u) == 0, "uname");
+        check(strcmp(u.sysname, "Linux") == 0, "sysname");
+        check(strcmp(u.machine, "x86_64") == 0, "machine-native");
+        /* The NULs after the native name are data too, and the PER_LINUX32
+         * case below re-copies only eight bytes over them. */
+        {
+            static const char want[65] = "x86_64";
+            check(memcmp(u.machine, want, sizeof(want)) == 0, "machine-native-bytes");
+        }
+        check(u.sysname[64] == 0 && u.release[64] == 0 && u.version[64] == 0 &&
+              u.machine[64] == 0 && u.domainname[64] == 0, "field-termination");
+        char native_release[65];
+        memcpy(native_release, u.release, sizeof(native_release));
+        mark("NATIVE_RESULT");
+
+        check(syscall(SYS_personality, PER_LINUX32) >= 0, "set-per-linux32");
+        memset(&u, 0, sizeof(u));
+        check(syscall(SYS_uname, &u) == 0, "uname-per-linux32");
+        check(strcmp(u.machine, "i686") == 0, "machine-per-linux32");
+        /* override_architecture() copies `sizeof(COMPAT_UTS_MACHINE)` = 8
+         * bytes, so the field is "i686" and five NULs and the *rest of the
+         * field* keeps the native copy ("x86_64\0..."), not a zero fill.
+         * Comparing only up to the NUL would accept garbage here. */
+        {
+            static const char want[65] = "i686";
+            check(memcmp(u.machine, want, sizeof(want)) == 0, "machine-per-linux32-bytes");
+        }
+        check(strcmp(u.release, native_release) == 0, "release-untouched-by-per-linux32");
+        check((unsigned long)syscall(SYS_personality, 0xffffffffU) == PER_LINUX32,
+              "per-linux32-still-stored");
+        mark("PER_LINUX32_MACHINE_OVERRIDE");
+
+        /* The base personality is the low byte: UNAME26 above it must not
+         * change the machine override, and dropping PER_LINUX32 must restore
+         * the native machine string. */
+        check(syscall(SYS_personality, UNAME26) >= 0, "set-uname26");
+        memset(&u, 0, sizeof(u));
+        check(syscall(SYS_uname, &u) == 0, "uname-uname26");
+        check(strcmp(u.machine, "x86_64") == 0, "machine-restored");
+        check(strncmp(u.release, "2.6.", 4) == 0, "release-uname26-prefix");
+        check(strcmp(u.release, native_release) != 0, "release-uname26-rewritten");
+        mark("UNAME26_RELEASE_OVERRIDE");
+
+        check(syscall(SYS_personality, ADDR_NO_RANDOMIZE) >= 0, "set-addr-no-randomize");
+        memset(&u, 0, sizeof(u));
+        check(syscall(SYS_uname, &u) == 0, "uname-addr-no-randomize");
+        check(strcmp(u.machine, "x86_64") == 0, "machine-addr-no-randomize");
+        check(strcmp(u.release, native_release) == 0, "release-addr-no-randomize");
+        mark("ADDR_NO_RANDOMIZE_LEAVES_UNAME");
+
+        check(syscall(SYS_personality, 0) >= 0, "reset");
+        errno = 0;
+        check(syscall(SYS_uname, NULL) == -1 && errno == EFAULT, "uname-null");
+        errno = 0;
+        check(syscall(SYS_uname, BADPTR) == -1 && errno == EFAULT, "uname-bad-ptr");
+        mark("UNAME_NULL_BUF_EFAULT");
     }
     done();
 

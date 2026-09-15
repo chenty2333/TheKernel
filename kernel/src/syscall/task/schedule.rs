@@ -1347,17 +1347,22 @@ pub fn sys_sched_getaffinity<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     let cpusetsize = cpusetsize as u32 as usize;
     let cpu_count = axhal::cpu_num().max(1);
-    let kernel_mask_bytes = linux_cpumask_bytes(cpu_count);
-    if cpusetsize < kernel_mask_bytes || cpusetsize % size_of::<usize>() != 0 {
-        return Err(AxError::InvalidInput);
-    }
+    // SYSCALL_DEFINE3(sched_getaffinity) (kernel/sched/syscalls.c:1309-1341)
+    // admits any length that can hold every possible CPU and is a whole
+    // number of `unsigned long`s, then copies out `min(len, cpumask_size())`
+    // bytes and returns that count.  `nr_cpu_ids` is the configured CPU
+    // ceiling, which is what the per-CPU-slot build fixes at `max_cpu_num`.
+    let kernel_mask_bytes = linux_sched::cpumask_size(axconfig::plat::MAX_CPU_NUM);
+    let admitted = linux_sched::affinity_length(cpusetsize as u32, axconfig::plat::MAX_CPU_NUM)
+        .map_err(|_| AxError::InvalidInput)?;
 
     let mask = live_sched_target(pid)?.cpumask();
+    let copied = admitted.min(kernel_mask_bytes);
     let mut mask_bytes = Vec::new();
     mask_bytes
-        .try_reserve_exact(kernel_mask_bytes)
+        .try_reserve_exact(copied)
         .map_err(|_| AxError::NoMemory)?;
-    mask_bytes.resize(kernel_mask_bytes, 0);
+    mask_bytes.resize(copied, 0);
     for cpu in 0..cpu_count {
         if mask.get(cpu) {
             mask_bytes[cpu / u8::BITS as usize] |= 1 << (cpu % u8::BITS as usize);
@@ -1366,7 +1371,7 @@ pub fn sys_sched_getaffinity<M: UserMemory + ?Sized>(
 
     vm_write_slice(memory, user_mask, &mask_bytes).map_err(map_usercopy_error)?;
 
-    Ok(kernel_mask_bytes as _)
+    Ok(copied as _)
 }
 
 fn linux_cpumask_bytes(cpu_count: usize) -> usize {
@@ -3004,6 +3009,36 @@ mod tests {
         assert_eq!(
             linux_cpumask_bytes(usize::BITS as usize + 1),
             size_of::<usize>() * 2
+        );
+    }
+
+    #[test]
+    fn getaffinity_length_admission_matches_linux() {
+        // kernel/sched/syscalls.c:1317-1324 with nr_cpu_ids == 4 and
+        // cpumask_size() == 8.  Both tests run before the `pid` lookup, and on
+        // success the syscall reports min(len, cpumask_size()), so an over-long
+        // request is admitted but never copies or reports more than the mask.
+        for len in [8u32, 16, 64] {
+            let admitted = linux_sched::affinity_length(len, 4).unwrap();
+            assert!(admitted >= len as usize);
+            assert_eq!(admitted.min(linux_sched::cpumask_size(4)), 8);
+        }
+        // A length that cannot name every possible CPU is refused, and one that
+        // is not a whole number of words is refused for a ceiling it is still
+        // long enough to reach.
+        for len in [0u32, 1, 4] {
+            assert!(linux_sched::affinity_length(len, 4).is_err());
+        }
+        for len in [3u32, 7, 9, 11] {
+            assert!(linux_sched::affinity_length(len, 20).is_err());
+        }
+        assert_eq!(
+            linux_sched::affinity_length(12, 4),
+            Err(linux_sched::AffinityLengthReject::NotWholeWords)
+        );
+        assert_eq!(
+            linux_sched::affinity_length(u32::MAX, 4),
+            Err(linux_sched::AffinityLengthReject::WordCountOverflow)
         );
     }
 

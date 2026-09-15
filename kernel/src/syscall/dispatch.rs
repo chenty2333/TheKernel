@@ -1494,6 +1494,13 @@ pub(super) fn dispatch_syscall(
         // reaches the accessibility check and yields EFAULT where Linux's
         // negative-length test yields EINVAL.
         Sysno::syslog => with_user_memory(aspace(), |memory| {
+            // `SYSCALL_DEFINE3(syslog, int, type, char __user *, buf, int, len)`
+            // (kernel/printk/printk.c) declares a 32-bit length, so Linux reads
+            // only the low half of the argument register and sign-extends it.
+            // `do_syslog()` then tests that value -- `if (!buf || len < 0)
+            // return -EINVAL;` -- before it looks at `buf`.  Truncating here
+            // keeps a caller that passes `-1` as an `int` a negative length
+            // instead of the huge positive one the raw register holds.
             sys_syslog(
                 memory,
                 uctx.arg0() as _,
