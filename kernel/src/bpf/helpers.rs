@@ -813,11 +813,14 @@ impl LinuxHelpers<'_> {
                 let (axbpf::Value::Pointer(c), Some(size)) = (a[0], Self::scalar(a[1])) else {
                     return Ok(Self::error());
                 };
-                let name = current().try_name().map_err(|_| AxError::ResourceBusy)?;
+                // `bpf_get_current_comm()` copies `current->comm` bytes, so the
+                // raw image is what the helper must expose.
+                let comm = current().comm();
                 let size = (size as usize).min(16);
                 let mut out = vec![0; size];
+                let name = comm.as_bytes();
                 let n = name.len().min(size.saturating_sub(1));
-                out[..n].copy_from_slice(&name.as_bytes()[..n]);
+                out[..n].copy_from_slice(&name[..n]);
                 Ok(if m.write(c, c.offset as usize, &out) {
                     axbpf::Value::Scalar(0)
                 } else {

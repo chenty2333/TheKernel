@@ -117,10 +117,10 @@ pub fn render_task_stat(
             thread.tid()
         })
         .ok_or(AxError::NoSuchProcess)?;
-    let comm = task.try_name().map_err(|error| match error {
-        axtask::TaskNameError::OutOfMemory => AxError::NoMemory,
-        axtask::TaskNameError::ConcurrentMutation => AxError::ResourceBusy,
-    })?;
+    // `/proc/<pid>/stat` prints `task_struct::comm` verbatim through
+    // `proc_task_name()`, so a name that is not valid UTF-8 must still be
+    // readable here rather than failing the whole file.
+    let comm = String::from_utf8_lossy(task.comm().as_bytes()).into_owned();
     let comm = comm[..comm.len().min(16)].to_owned();
     let state = task_state(task);
     let ppid = proc

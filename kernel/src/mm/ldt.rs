@@ -84,11 +84,10 @@ impl Ldt {
         if (oldmode && desc.old_empty()) || desc.empty() {
             return Ok(0);
         }
-        // The kernel has no 16-bit compatibility support.
-        if !desc.bit(0) {
-            return Err(AxError::InvalidInput);
-        }
-
+        // `write_ldt()` gates 16-bit segments on `allow_16bit_segments()`,
+        // which is `IS_ENABLED(CONFIG_X86_16BIT)` on a native (non-Xen-PV)
+        // x86_64 kernel. That configuration is y here, so a descriptor with
+        // `seg_32bit` clear is admitted and stored rather than rejected.
         let base = desc.base_addr as u64;
         let limit = desc.limit as u64;
         let ty = (((desc.bit(3) as u64) ^ 1) << 1) | ((desc.contents() as u64) << 2) | 1;
@@ -101,7 +100,9 @@ impl Ldt {
             | ((!desc.bit(5) as u64) << 47)
             | (((limit >> 16) & 0xf) << 48)
             | (((!oldmode && desc.bit(6)) as u64) << 52)
-            | (1 << 54)
+            // DB mirrors `seg_32bit`; the long-mode bit stays clear, matching
+            // `fill_ldt()`'s deliberate `desc->l = 0`.
+            | ((desc.bit(0) as u64) << 54)
             | ((desc.bit(4) as u64) << 55)
             | (((base >> 24) & 0xff) << 56))
     }
@@ -123,29 +124,33 @@ mod tests {
     fn new_and_old_clear_rules_differ() {
         assert_eq!(Ldt::descriptor(EMPTY_NEW, false).unwrap(), 0);
         assert_eq!(Ldt::descriptor(EMPTY_NEW, true).unwrap(), 0);
+        // The old mode clears any descriptor with a zero base and limit, so an
+        // all-zero request removes the entry.
         let zero = UserDesc::default();
         assert_eq!(Ldt::descriptor(zero, true).unwrap(), 0);
-        assert!(Ldt::descriptor(zero, false).is_err());
+        // The new mode only clears on `LDT_empty()`, which also requires
+        // read_exec_only and seg_not_present; an all-zero request is therefore
+        // stored as a present 16-bit read/write data segment. Linux 7.2.3
+        // produces 0x0000_f300_0000_0000 for it.
+        assert_eq!(Ldt::descriptor(zero, false).unwrap(), 0x0000_f300_0000_0000);
     }
 
     #[test]
-    fn contents_three_requires_new_absent_segment() {
+    fn contents_three_needs_an_absent_segment_in_the_new_mode() {
         let absent = UserDesc {
             flags: (3 << 1) | (1 << 5),
             ..UserDesc::default()
         };
+        // `write_ldt()` rejects contents == 3 outright in the old mode and
+        // requires the segment to be marked not-present in the new mode.
         assert!(Ldt::descriptor(absent, true).is_err());
-        assert!(Ldt::descriptor(absent, false).is_err());
-        assert!(
-            Ldt::descriptor(
-                UserDesc {
-                    flags: (3 << 1) | (1 << 5) | 1,
-                    ..UserDesc::default()
-                },
-                false,
-            )
-            .is_ok()
-        );
+        let stored = Ldt::descriptor(absent, false).unwrap();
+        assert_eq!((stored >> 47) & 1, 0, "seg_not_present stores P clear");
+        let present = UserDesc {
+            flags: 3 << 1,
+            ..UserDesc::default()
+        };
+        assert!(Ldt::descriptor(present, false).is_err());
     }
 
     #[test]
@@ -168,5 +173,37 @@ mod tests {
         assert_eq!((descriptor >> 52) & 1, 1);
         assert_eq!((descriptor >> 55) & 1, 1);
         assert_eq!((descriptor >> 56) & 0xff, 0x12);
+        // fill_ldt() stores `seg_32bit` in DB and never sets the L bit.
+        assert_eq!((descriptor >> 54) & 1, 1);
+        assert_eq!((descriptor >> 53) & 1, 0);
+    }
+
+    #[test]
+    fn sixteen_bit_segments_are_stored_with_db_clear() {
+        // CONFIG_X86_16BIT=y: a descriptor with `seg_32bit` clear is stored as
+        // a 16-bit segment (DB clear) instead of being rejected.
+        let sixteen_bit = UserDesc {
+            base_addr: 0x1000,
+            limit: 0xffff,
+            // contents = 0 (data), read_exec_only = 1, present.
+            flags: 1 << 3,
+            ..UserDesc::default()
+        };
+        let descriptor = Ldt::descriptor(sixteen_bit, false).unwrap();
+        assert_eq!((descriptor >> 54) & 1, 0, "DB mirrors seg_32bit");
+        assert_eq!((descriptor >> 53) & 1, 0, "fill_ldt() never sets L");
+        assert_eq!((descriptor >> 40) & 0xf, 1);
+        // The old mode only differs by clearing AVL.
+        assert_eq!((Ldt::descriptor(sixteen_bit, true).unwrap() >> 54) & 1, 0);
+
+        // A 32-bit request keeps DB set, so the two widths stay distinguishable.
+        let thirty_two_bit = UserDesc {
+            flags: (1 << 3) | 1,
+            ..sixteen_bit
+        };
+        assert_eq!(
+            (Ldt::descriptor(thirty_two_bit, false).unwrap() >> 54) & 1,
+            1
+        );
     }
 }

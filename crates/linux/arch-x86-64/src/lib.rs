@@ -22,6 +22,67 @@ pub const ARCH_SHSTK_UNLOCK: i32 = 0x5004;
 /// `siginfo_t.si_code` for an x86 control-protection exception.
 pub const SEGV_CPERR: i32 = 10;
 
+/// Linux `XFEATURE_MAX` from arch/x86/include/asm/fpu/types.h: the number of
+/// xfeature components, and therefore the exclusive bound on the component
+/// index accepted by `ARCH_REQ_XCOMP_PERM`.
+pub const XFEATURE_MAX: u64 = 20;
+/// `XFEATURE_XTILE_DATA`, the only component `xstate_prctl_req[]` maps to a
+/// requestable facility mask; aliased as `ARCH_XCOMP_TILEDATA`.
+pub const XFEATURE_XTILE_DATA: u64 = 18;
+/// `XFEATURE_MASK_XTILE_DATA`: the AMX tile-data facility.
+pub const XFEATURE_MASK_XTILE_DATA: u64 = 1 << XFEATURE_XTILE_DATA;
+/// `XFEATURE_MASK_FP | XFEATURE_MASK_SSE`: the legacy user state that a kernel
+/// without XSAVE still reports through `ARCH_GET_XCOMP_SUPP`.
+pub const XFEATURE_MASK_FPSSE: u64 = 0b11;
+
+/// Why `ARCH_REQ_XCOMP_PERM` / `ARCH_REQ_XCOMP_GUEST_PERM` refuses a request.
+///
+/// `fpu_xstate_prctl()` in arch/x86/kernel/fpu/xstate.c validates the
+/// component index before it consults `xstate_prctl_req[]`, so the two
+/// refusals are distinguishable and both are part of the UAPI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum XcompRequestRejection {
+    /// `idx >= XFEATURE_MAX`: `-EINVAL`.
+    UnknownComponent,
+    /// A known component with no requestable facility, or a facility outside
+    /// this kernel's `fpu_user_cfg.max_features`: `-EOPNOTSUPP`.
+    UnsupportedFacility,
+}
+
+/// Applies `xstate_request_perm()`'s index admission from
+/// arch/x86/kernel/fpu/xstate.c.
+///
+/// `max_features` is this kernel's user-visible xfeature mask (Linux's
+/// `fpu_user_cfg.max_features`). It returns `Ok(facility)` only when the whole
+/// requested facility is already enabled, which is the one case an embedding
+/// kernel may answer without a permission-state transaction.
+pub const fn xcomp_request_admission(
+    index: u64,
+    max_features: u64,
+) -> Result<u64, XcompRequestRejection> {
+    if index >= XFEATURE_MAX {
+        return Err(XcompRequestRejection::UnknownComponent);
+    }
+    // `xstate_prctl_req[]` only carries XFEATURE_XTILE_DATA; every other index
+    // has a zero entry, which Linux maps to -EOPNOTSUPP.
+    if index != XFEATURE_XTILE_DATA {
+        return Err(XcompRequestRejection::UnsupportedFacility);
+    }
+    if max_features & XFEATURE_MASK_XTILE_DATA != XFEATURE_MASK_XTILE_DATA {
+        return Err(XcompRequestRejection::UnsupportedFacility);
+    }
+    Ok(XFEATURE_MASK_XTILE_DATA)
+}
+
+/// Reports whether `ARCH_SET_FS` / `ARCH_SET_GS` accept `base`.
+///
+/// `do_arch_prctl_64()` in arch/x86/kernel/process_64.c rejects
+/// `arg2 >= TASK_SIZE_MAX` with `-EPERM` before it touches either segment
+/// base, and it applies the identical check to both commands.
+pub const fn arch_segment_base_permitted(base: u64, task_size_max: u64) -> bool {
+    base < task_size_max
+}
+
 /// Linux's x86 shadow-stack ptrace regset payload. `NT_X86_SHSTK` has exactly
 /// one eight-byte element: the task's IA32_PL3_SSP value.
 #[repr(C)]
@@ -139,6 +200,16 @@ impl IoPortPlan {
 pub struct IoplPlan {
     level: u8,
 }
+/// How a validated `iopl(2)` request relates to the caller's current level.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IoplTransition {
+    /// The request is a no-op; Linux returns success before any check.
+    Unchanged,
+    /// The request grants I/O access, which is the only privileged direction.
+    Raise,
+    /// The request drops I/O access, which an unprivileged task may always do.
+    Lower,
+}
 impl IoplPlan {
     pub const fn new(level: u8) -> Result<Self, ArchPolicyError> {
         if level > 3 {
@@ -149,6 +220,19 @@ impl IoplPlan {
     }
     pub const fn level(self) -> u8 {
         self.level
+    }
+    /// `SYSCALL_DEFINE1(iopl, ...)` in arch/x86/kernel/ioport.c returns
+    /// `-EINVAL` above level 3, then returns 0 immediately when the level is
+    /// unchanged, and only reaches the `capable(CAP_SYS_RAWIO)` /
+    /// `security_locked_down(LOCKDOWN_IOPORT)` pair when `level > old`.
+    pub const fn transition(self, current_level: u8) -> IoplTransition {
+        if self.level == current_level {
+            IoplTransition::Unchanged
+        } else if self.level > current_level {
+            IoplTransition::Raise
+        } else {
+            IoplTransition::Lower
+        }
     }
 }
 #[cfg(test)]
@@ -163,6 +247,66 @@ mod tests {
             Err(ArchPolicyError::IoPortOverflow)
         );
         assert_eq!(IoPortPlan::new(0, 65_536, true).unwrap().count, 65_536);
+    }
+
+    #[test]
+    fn iopl_only_charges_privilege_when_raising_the_level() {
+        let plan = |level| IoplPlan::new(level).unwrap();
+        assert_eq!(
+            plan(0).transition(0),
+            IoplTransition::Unchanged,
+            "Linux returns before any check when the level is unchanged"
+        );
+        assert_eq!(plan(3).transition(3), IoplTransition::Unchanged);
+        assert_eq!(plan(0).transition(3), IoplTransition::Lower);
+        assert_eq!(plan(2).transition(3), IoplTransition::Lower);
+        assert_eq!(plan(1).transition(0), IoplTransition::Raise);
+        assert_eq!(plan(3).transition(2), IoplTransition::Raise);
+        assert_eq!(IoplPlan::new(4), Err(ArchPolicyError::InvalidIopl));
+    }
+
+    #[test]
+    fn arch_set_segment_base_rejects_addresses_at_or_above_task_size_max() {
+        // Linux's x86_64 TASK_SIZE_MAX is (1 << 47) - PAGE_SIZE.
+        const TASK_SIZE_MAX: u64 = (1 << 47) - 4096;
+        assert!(arch_segment_base_permitted(0, TASK_SIZE_MAX));
+        assert!(arch_segment_base_permitted(
+            TASK_SIZE_MAX - 1,
+            TASK_SIZE_MAX
+        ));
+        assert!(!arch_segment_base_permitted(TASK_SIZE_MAX, TASK_SIZE_MAX));
+        assert!(!arch_segment_base_permitted(u64::MAX, TASK_SIZE_MAX));
+    }
+
+    #[test]
+    fn xcomp_request_distinguishes_einval_from_eopnotsupp() {
+        let no_amx = XFEATURE_MASK_FPSSE | (1 << 9);
+        assert_eq!(
+            xcomp_request_admission(XFEATURE_MAX, no_amx),
+            Err(XcompRequestRejection::UnknownComponent)
+        );
+        assert_eq!(
+            xcomp_request_admission(u64::MAX, no_amx),
+            Err(XcompRequestRejection::UnknownComponent)
+        );
+        // TILECFG has no requestable facility mask, so Linux answers
+        // -EOPNOTSUPP rather than -EINVAL.
+        assert_eq!(
+            xcomp_request_admission(XFEATURE_XTILE_DATA - 1, no_amx),
+            Err(XcompRequestRejection::UnsupportedFacility)
+        );
+        assert_eq!(
+            xcomp_request_admission(0, no_amx),
+            Err(XcompRequestRejection::UnsupportedFacility)
+        );
+        assert_eq!(
+            xcomp_request_admission(XFEATURE_XTILE_DATA, no_amx),
+            Err(XcompRequestRejection::UnsupportedFacility)
+        );
+        assert_eq!(
+            xcomp_request_admission(XFEATURE_XTILE_DATA, no_amx | XFEATURE_MASK_XTILE_DATA),
+            Ok(XFEATURE_MASK_XTILE_DATA)
+        );
     }
 
     #[test]

@@ -105,21 +105,98 @@ pub enum TaskExitQueueFault {
     CorruptLink         = 4,
 }
 
-/// Failure to snapshot or replace a task name.
+/// Failure to snapshot a task name.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TaskNameError {
     /// String storage could not be allocated outside the task-name lock.
     OutOfMemory,
-    /// The name grew between sizing and the single bounded copy attempt.
-    ConcurrentMutation,
 }
 
 impl fmt::Display for TaskNameError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::OutOfMemory => "task name allocation failed",
-            Self::ConcurrentMutation => "task name changed during snapshot",
         })
+    }
+}
+
+/// Linux `TASK_COMM_LEN` from include/linux/sched.h.
+pub const TASK_COMM_LEN: usize = 16;
+
+/// A task name, stored exactly the way Linux stores `task_struct::comm`.
+///
+/// The image is a fixed `TASK_COMM_LEN` byte array that always terminates
+/// inside the array, and the bytes are *not* required to be UTF-8:
+/// `prctl(PR_SET_NAME)` copies them straight out of userspace and
+/// `/proc/<pid>/stat` prints them back. Keeping the raw image here is what
+/// lets a non-UTF-8 name survive a set/get round trip; [`Self::as_str_lossy`]
+/// is only for diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskName {
+    bytes: [u8; TASK_COMM_LEN],
+}
+
+impl TaskName {
+    /// The all-zero image, which reads back as the empty name.
+    pub const EMPTY: Self = Self {
+        bytes: [0; TASK_COMM_LEN],
+    };
+
+    /// Keeps at most `TASK_COMM_LEN - 1` bytes, stops at the first NUL, and
+    /// leaves the remainder zero, matching Linux's `strscpy_pad()`.
+    ///
+    /// The bound is a storage rule rather than ABI policy: callers that carry
+    /// a Linux-visible name must apply the syscall's own read bound first.
+    pub fn from_bytes(source: &[u8]) -> Self {
+        let mut bytes = [0; TASK_COMM_LEN];
+        let bound = source.len().min(TASK_COMM_LEN - 1);
+        let mut index = 0;
+        while index < bound {
+            if source[index] == 0 {
+                break;
+            }
+            bytes[index] = source[index];
+            index += 1;
+        }
+        Self { bytes }
+    }
+
+    /// Builds a name from a display string, truncated to fit the image.
+    pub fn from_str(source: &str) -> Self {
+        Self::from_bytes(source.as_bytes())
+    }
+
+    /// Wraps a name image that was built elsewhere.
+    ///
+    /// The syscall layer owns the ABI rule that produces a Linux `comm` image;
+    /// this constructor adopts such an image without re-deriving it.
+    pub const fn from_raw(bytes: [u8; TASK_COMM_LEN]) -> Self {
+        Self { bytes }
+    }
+
+    /// The complete NUL-padded wire image.
+    pub const fn raw(&self) -> [u8; TASK_COMM_LEN] {
+        self.bytes
+    }
+
+    /// The bytes before the first NUL, or every byte when none is present.
+    pub fn as_bytes(&self) -> &[u8] {
+        let len = self
+            .bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(TASK_COMM_LEN);
+        &self.bytes[..len]
+    }
+
+    /// A lossy UTF-8 view for logs and diagnostics only.
+    pub fn as_str_lossy(&self) -> alloc::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(self.as_bytes())
+    }
+
+    /// Compares against a known-good ASCII name without allocating.
+    pub fn eq_str(&self, other: &str) -> bool {
+        self.as_bytes() == other.as_bytes()
     }
 }
 
@@ -660,7 +737,7 @@ impl SwitchReason {
 /// The inner task structure.
 pub struct TaskInner {
     id: TaskId,
-    name: SpinNoIrq<String>,
+    name: SpinNoIrq<TaskName>,
     is_idle: bool,
     is_init: bool,
     /// A short-lived CPU migration helper runs outside the source scheduler's
@@ -983,7 +1060,7 @@ impl TaskInner {
         t.ctx_mut()
             .init(task_entry as *const () as usize, kstack.top(), tls);
         t.kstack = Some(kstack);
-        if t.name.lock().as_str() == "idle" {
+        if t.name.lock().eq_str("idle") {
             t.is_idle = true;
         }
         Ok(t)
@@ -999,20 +1076,38 @@ impl TaskInner {
         self.try_name()
     }
 
-    /// Fallibly snapshots the task name without allocating under its spin lock.
+    /// Fallibly snapshots the task name as a lossy UTF-8 string.
     pub fn try_name(&self) -> Result<String, TaskNameError> {
+        // The image is a fixed 16-byte value, so the lock only has to cover
+        // the copy out of it: this crate never allocates while the task-name
+        // lock is held, and the string below is built after it is released.
+        let image = *self.name.lock();
+        let text = image.as_str_lossy();
         let mut name = String::new();
-        let required = self.name.lock().len();
-        if name.capacity() < required {
-            name.try_reserve_exact(required)
-                .map_err(|_| TaskNameError::OutOfMemory)?;
-        }
-        let current = self.name.lock();
-        if name.capacity() < current.len() {
-            return Err(TaskNameError::ConcurrentMutation);
-        }
-        name.push_str(&current);
+        name.try_reserve_exact(text.len())
+            .map_err(|_| TaskNameError::OutOfMemory)?;
+        name.push_str(&text);
         Ok(name)
+    }
+
+    /// Snapshots the raw NUL-padded name image without allocating.
+    pub fn comm(&self) -> TaskName {
+        *self.name.lock()
+    }
+
+    /// Replaces the name with an already-built image.
+    ///
+    /// Constructing the replacement before taking the task-name lock keeps
+    /// allocator work out of the spin-locked section. Returning the previous
+    /// image likewise lets callers defer its destructor until after the lock
+    /// has been released.
+    pub fn replace_comm(&self, name: TaskName) -> TaskName {
+        core::mem::replace(&mut *self.name.lock(), name)
+    }
+
+    /// Replaces the name with an already-built image, discarding the old one.
+    pub fn set_comm(&self, name: TaskName) {
+        drop(self.replace_comm(name));
     }
 
     /// Copies a bounded task-name prefix without allocating. Scheduler trace
@@ -1020,31 +1115,22 @@ impl TaskInner {
     /// exceeds `out.len()`.
     pub fn copy_name_into(&self, out: &mut [u8]) -> usize {
         let name = self.name.lock();
-        let len = core::cmp::min(name.len(), out.len());
-        out[..len].copy_from_slice(&name.as_bytes()[..len]);
+        let source = name.as_bytes();
+        let len = core::cmp::min(source.len(), out.len());
+        out[..len].copy_from_slice(&source[..len]);
         len
     }
 
-    /// Set the name of the task.
-    pub fn set_name(&self, name: &str) -> Result<(), TaskNameError> {
-        let mut owned = String::new();
-        owned
-            .try_reserve_exact(name.len())
-            .map_err(|_| TaskNameError::OutOfMemory)?;
-        owned.push_str(name);
-        let name = owned;
-        drop(self.replace_name(name));
-        Ok(())
+    /// Set the name of the task from a display string.
+    pub fn set_name(&self, name: &str) {
+        self.set_comm(TaskName::from_str(name));
     }
 
     /// Replace the task name with an already-owned string.
-    ///
-    /// Constructing the replacement before taking the task-name lock keeps
-    /// allocator work out of the spin-locked section. Returning the previous
-    /// string likewise lets callers defer its destructor until after the lock
-    /// has been released.
     pub fn replace_name(&self, name: String) -> String {
-        core::mem::replace(&mut *self.name.lock(), name)
+        let previous = self.replace_comm(TaskName::from_str(&name));
+        drop(name);
+        String::from_utf8_lossy(previous.as_bytes()).into_owned()
     }
 
     /// Get a combined string of the task ID and name.
@@ -1568,7 +1654,7 @@ impl TaskInner {
         };
         Ok(Self {
             id,
-            name: SpinNoIrq::new(name),
+            name: SpinNoIrq::new(TaskName::from_str(&name)),
             is_idle: false,
             is_init: false,
             is_migration_helper: false,
@@ -1645,7 +1731,7 @@ impl TaskInner {
         t.set_cpu_id(axhal::percpu::this_cpu_id() as u32);
         #[cfg(feature = "smp")]
         t.mark_running_on_cpu();
-        if t.name.lock().as_str() == "idle" {
+        if t.name.lock().eq_str("idle") {
             t.is_idle = true;
         }
         Ok(t)

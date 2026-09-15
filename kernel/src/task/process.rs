@@ -3465,6 +3465,14 @@ pub struct ProcessData {
     exit_fd_table: Arc<FdTable>,
     /// Authoritative Linux ABI memory layout. See [`ProcessMmLayout`].
     mm_layout: RwLock<ProcessMmLayout>,
+    /// `signal_struct::timer_create_restore_ids`, the CRIU timer-restore mode.
+    timer_restore_ids: AtomicBool,
+    /// `signal_struct::autoreap`, set only by `clone3(CLONE_AUTOREAP)`.
+    ///
+    /// The bit belongs to the child, not to its parent: a process created
+    /// this way is reaped as it exits and reports nothing, whatever the
+    /// parent's `SIGCHLD` disposition is.
+    autoreap: AtomicBool,
 
     /// The resource limits
     pub rlim: RwLock<Rlimits>,
@@ -3996,6 +4004,11 @@ impl ProcessData {
             scope: RwLock::new(scope),
             exit_fd_table,
             mm_layout: RwLock::new(ProcessMmLayout::initial()),
+            // `copy_signal()` allocates a zeroed `signal_struct` and copies
+            // neither bit, so every process starts with both off; only
+            // `clone3(CLONE_AUTOREAP)` and the timer prctl turn them on.
+            timer_restore_ids: AtomicBool::new(false),
+            autoreap: AtomicBool::new(false),
 
             rlim: RwLock::default(),
 
@@ -4485,7 +4498,12 @@ impl ProcessData {
     /// Rebuilds ABI layout from the newly published exec address space. This
     /// reads the same VMA topology that faults and `/proc/<pid>/maps` use;
     /// no loader-side shadow ranges survive an exec handoff.
-    pub(crate) fn reset_mm_layout_for_exec(&self, heap_base: usize, stack_pointer: usize) {
+    pub(crate) fn reset_mm_layout_for_exec(
+        &self,
+        heap_base: usize,
+        stack_pointer: usize,
+        saved_auxv: Vec<u8>,
+    ) {
         let aspace_handle = self.aspace();
         let aspace = aspace_handle.lock();
         let mut start_code = usize::MAX;
@@ -4522,7 +4540,7 @@ impl ProcessData {
         layout.arg_end = 0;
         layout.env_start = 0;
         layout.env_end = 0;
-        layout.auxv.clear();
+        layout.auxv = saved_auxv;
         layout.heap_mapping_base = heap_base;
         layout.heap_mapping_initial_end = heap_base + crate::config::USER_HEAP_SIZE;
     }
@@ -4759,6 +4777,38 @@ impl ProcessData {
 
     pub(crate) fn mm_layout(&self) -> ProcessMmLayout {
         self.mm_layout.read().clone()
+    }
+
+    /// Snapshots the exec-installed auxiliary vector image.
+    pub(crate) fn saved_auxv(&self) -> Vec<u8> {
+        self.mm_layout.read().auxv.clone()
+    }
+
+    /// Reads `signal_struct::autoreap`.
+    pub(crate) fn autoreap(&self) -> bool {
+        self.autoreap.load(Ordering::Acquire)
+    }
+
+    /// Sets `signal_struct::autoreap` for a child created by `CLONE_AUTOREAP`.
+    pub(crate) fn set_autoreap(&self) {
+        self.autoreap.store(true, Ordering::Release);
+    }
+
+    /// Reads the `signal_struct::timer_create_restore_ids` bit.
+    pub(crate) fn timer_restore_ids(&self) -> bool {
+        self.timer_restore_ids.load(Ordering::Acquire)
+    }
+
+    /// Writes the `signal_struct::timer_create_restore_ids` bit.
+    ///
+    /// Linux keeps this in `signal_struct`, so it is shared by the whole
+    /// thread group and lives until the group's last thread exits: `do_exit()`
+    /// calls `exit_itimers()` there, and neither exec nor a separate
+    /// `prctl(PR_TIMER_CREATE_RESTORE_IDS_OFF)` is needed to clear it.
+    /// The `timer_create(2)` input-id path that consumes the bit is not
+    /// implemented yet; see the `PR_TIMER_CREATE_RESTORE_IDS` arm.
+    pub(crate) fn set_timer_restore_ids(&self, value: bool) {
+        self.timer_restore_ids.store(value, Ordering::Release);
     }
 
     /// Publishes a fully validated layout after its corresponding VMA/heap

@@ -88,7 +88,7 @@ pub use socket_security::{
     SocketSetOptionContext, SocketShutdownContext, UnixMaySendContext, UnixStreamConnectContext,
 };
 pub use transition::{
-    CapsetAuthority, CapsetPlan, CapsetRequest, GroupIdAuthority, GroupIdTransitionInput,
-    GroupIdTransitionPlan, UserIdAuthority, UserIdTransitionInput, UserIdTransitionPlan,
-    plan_capset, plan_group_id_transition, plan_user_id_transition,
+    CapabilityHeaderPid, CapsetAuthority, CapsetPlan, CapsetRequest, GroupIdAuthority,
+    GroupIdTransitionInput, GroupIdTransitionPlan, UserIdAuthority, UserIdTransitionInput,
+    UserIdTransitionPlan, plan_capset, plan_group_id_transition, plan_user_id_transition,
 };

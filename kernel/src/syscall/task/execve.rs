@@ -794,7 +794,14 @@ fn do_execve(
     };
     drop(old_cmdline);
 
-    proc_data.reset_mm_layout_for_exec(layout.heap_base(), user_stack_base.as_usize());
+    // `mm_struct::saved_auxv` is what `PR_GET_AUXV` and `/proc/<pid>/auxv`
+    // report for the rest of this image's life, so the vector placed on the
+    // stack by the loader is published here rather than dropped.
+    proc_data.reset_mm_layout_for_exec(
+        layout.heap_base(),
+        user_stack_base.as_usize(),
+        loaded.saved_auxv,
+    );
     // A successful exec installs a fresh mm, so no nonzero key allocation or
     // stale mapping key can survive into the new image.
     proc_data.reset_pkeys_for_exec();

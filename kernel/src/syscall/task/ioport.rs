@@ -3,7 +3,7 @@
 use axerrno::{AxError, AxResult};
 use axtask::current;
 use linux_raw_sys::general::CAP_SYS_RAWIO;
-use tk_linux_arch_x86_64::{ArchPolicyError, IoPortPlan, IoplPlan};
+use tk_linux_arch_x86_64::{ArchPolicyError, IoPortPlan, IoplPlan, IoplTransition};
 
 use crate::task::AsThread;
 
@@ -41,19 +41,33 @@ pub fn sys_ioperm(from: usize, num: usize, turn_on: i32) -> AxResult<isize> {
 }
 
 /// Changes the calling thread's emulated I/O privilege level.
+///
+/// Matches `SYSCALL_DEFINE1(iopl, unsigned int, level)` in
+/// arch/x86/kernel/ioport.c: level > 3 is `-EINVAL`, an unchanged level
+/// returns 0 before any capability check, and only a raise is gated on
+/// `capable(CAP_SYS_RAWIO)` plus `security_locked_down(LOCKDOWN_IOPORT)`.
+/// Lowering the level therefore always succeeds for an unprivileged task.
 pub fn sys_iopl(level: u32) -> AxResult<isize> {
     let level = u8::try_from(level)
         .map_err(|_| AxError::InvalidInput)
         .and_then(|level| IoplPlan::new(level).map_err(map_arch_policy_error))?;
-    // Unlike ioperm(2), Linux requires CAP_SYS_RAWIO and the lockdown check
-    // for every iopl(2) invocation, including a reduction or no-op request.
-    if !may_enable_ioports() {
-        return Err(AxError::OperationNotPermitted);
-    }
     let task = current();
     let thread = task.as_thread();
-    thread.set_iopl_level(level.level());
-    Ok(0)
+    match level.transition(thread.iopl_level()) {
+        // Linux returns 0 without touching the bitmap when nothing changes.
+        IoplTransition::Unchanged => Ok(0),
+        IoplTransition::Raise => {
+            if !may_enable_ioports() {
+                return Err(AxError::OperationNotPermitted);
+            }
+            thread.set_iopl_level(level.level());
+            Ok(0)
+        }
+        IoplTransition::Lower => {
+            thread.set_iopl_level(level.level());
+            Ok(0)
+        }
+    }
 }
 
 #[cfg(test)]
