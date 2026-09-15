@@ -290,11 +290,19 @@ def validate_artifact_config(artifacts: Artifacts, rootfs: Path | None, transpor
 
 # Inputs that change the published rootfs image.  The BusyBox version and
 # download URL live in build-rootfs.sh itself, so hashing the script covers
-# them.
+# them.  The payload builders are inputs for the same reason: their pins and
+# staging decisions change the payload the image embeds, and the payload
+# fingerprint only sees the staged result -- editing a pin and reusing an old
+# staging tree would otherwise leave a stamped image in place.
 ROOTFS_INPUT_FILES = (
     "scripts/build-rootfs.sh",
     "scripts/build-guest-tools.sh",
+    "scripts/build-nested-payload.sh",
+    "scripts/build-glibc-payload.sh",
+    "scripts/build-gcc-payload.sh",
+    "scripts/lib/musl-host-compiler.sh",
     "scripts/create-rootfs-image.sh",
+    "tools/nested/alpine/build-initramfs.sh",
     "tests/guest/shell-init.sh",
     "tests/guest/system-init.c",
 )
@@ -302,6 +310,7 @@ ROOTFS_INPUT_GLOBS = (
     "tests/rootfs/busybox-*.config",
     "tests/guest/tools/*.c",
     "tests/guest/portable/*.c",
+    "tools/nested/hello/*",
 )
 # Environment switches that change the toolchain or image ownership.
 ROOTFS_INPUT_ENV = (
@@ -317,10 +326,11 @@ ROOTFS_INPUT_ENV = (
 # The optional guest tool payload selected by --toolchain.  `none` keeps the
 # baseline image and is the only selection the ordinary suites use.  A tool
 # payload adds executables and data to the image, which is tens of MiB: `tcc`
-# adds a native C compiler and its musl sysroot, and `nested` is a superset of
-# it that also adds a static system emulator and the image it boots.  Each
-# selection gets its own image, because the kernel embeds it and the two
-# payloads must never be confused for one another.
+# adds a native C compiler and its musl sysroot, `nested` is a superset of it
+# that also adds a static system emulator and the image it boots, `glibc`
+# stages a dynamic loader and shared libc, and `gcc` is `glibc` plus a real
+# distribution C compiler.  Each selection gets its own image, because the
+# kernel embeds it and the two payloads must never be confused for one another.
 TOOL_PAYLOADS = ("none", "tcc", "nested", "glibc", "gcc")
 
 
@@ -351,7 +361,9 @@ def rootfs_image_bytes(payload: str) -> int:
     """
 
     # `glibc` stages a loader, a shared libc and one dynamic binary: about
-    # 3.5 MiB of content, so it needs no more room than the baseline.
+    # 3.5 MiB of content.  160 MiB is deliberate headroom, not a measurement:
+    # it matches the `tcc` size class, so adding the payload never makes the
+    # image the reason a build or a case fails.
     #
     # `gcc` stages 81 MiB of toolchain on top of a baseline measured at 48.2 MiB
     # used, so it reuses the nested payload's 224 MiB rather than adding a size

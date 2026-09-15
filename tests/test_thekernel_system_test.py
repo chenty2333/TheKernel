@@ -207,7 +207,7 @@ class SystemTestGateTests(unittest.TestCase):
 
         state = Path(os.environ.get(
             "THEKERNEL_STATE_DIR",
-            Path.home() / ".cache/thekernel-targets" / "guest-toolchain"))
+            Path.home() / ".cache" / "thekernel-targets"))
         payload = state / "guest-tools" / "nested"
         tools = payload / "opt" / "thekernel-tools"
         if not (tools / "MANIFEST").is_file():
@@ -284,7 +284,7 @@ class SystemTestGateTests(unittest.TestCase):
 
         root = Path(os.environ.get(
             "THEKERNEL_STATE_DIR",
-            Path.home() / ".cache/thekernel-targets/guest-toolchain",
+            Path.home() / ".cache" / "thekernel-targets",
         ))
         tools = root / "guest-tools" / "glibc"
         loader = tools / "lib64" / "ld-linux-x86-64.so.2"

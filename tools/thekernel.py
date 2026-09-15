@@ -1427,10 +1427,12 @@ def add_variant_arguments(parser: argparse.ArgumentParser, *, profiles: bool = T
         choices=TOOL_PAYLOADS,
         default=argparse.SUPPRESS,
         help="guest tool payload to build into the image; `none` is the baseline "
-             "image, `tcc` adds a native C compiler and its musl sysroot, and "
-             "`nested` is `tcc` plus a static system emulator and the image it "
-             "boots.  The default follows THEKERNEL_TOOLCHAIN, and passing the "
-             "flag wins over it",
+             "image, `tcc` adds a native C compiler and its musl sysroot, `nested` "
+             "is `tcc` plus a static system emulator and the image it boots, "
+             "`glibc` adds a dynamic loader, shared libc and a dynamic smoke "
+             "program, and `gcc` is `glibc` plus a real distribution C compiler.  "
+             "The default follows THEKERNEL_TOOLCHAIN, and passing the flag wins "
+             "over it",
     )
     if profiles:
         parser.add_argument(
@@ -1542,7 +1544,15 @@ def add_graphics_smoke_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--flavor", choices=graphics_smoke_flavors(), default="headless-abi-smoke")
     parser.add_argument("--screenshot", help="QMP screendump PPM output path")
     parser.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
-    parser.add_argument("--timeout", type=positive_timeout, default=300.0)
+    parser.add_argument(
+        "--timeout",
+        type=positive_timeout,
+        default=None,
+        help="whole-run timeout in seconds; the default is 300, or 900 for the "
+             "guest suite when the `nested` or `gcc` toolchain payload is "
+             "selected, because their longest cases exceed 300.  An explicit "
+             "value always wins",
+    )
     parser.add_argument("--workdir")
     parser.add_argument(
         "--no-build",
@@ -1633,13 +1643,34 @@ def host_test_cmd() -> int:
     return 0
 
 
+def suite_default_timeout(suite: str) -> float:
+    """The whole-run timeout a suite gets when --timeout was not passed.
+
+    An explicit --timeout always wins; this is only the default.  The guest
+    suite's case budgets include 330 s for `gcc-smoke` and `nested-linux-boot`,
+    which exceed the historical 300 s whole-run default: on a loaded host the
+    runner then dies as a total timeout in the middle of a case with no
+    transcript, which is the failure the case timeouts exist to report.  900 s
+    is three times the worst measured loaded boot.  The other suites keep 300.
+    """
+
+    if suite == "guest" and selected_tool_payload() in ("nested", "gcc"):
+        return 900.0
+    return 300.0
+
+
 def test_cmd(args: argparse.Namespace) -> int:
     # `fbcon` is deliberately not part of `all`: it asserts on a firmware
     # framebuffer and therefore fixes the graphics profile and the screenshot
     # path, which the other suites select independently.  Run it as
     # `test --suite fbcon --graphics-profile firmware-fb --screenshot OUT.ppm`.
     suites = ("host", "guest", "abi", "graphics", "cpu") if args.suite == "all" else (args.suite,)
+    explicit_timeout = args.timeout
     for suite in suites:
+        # Resolved per suite rather than once: under `--suite all` the guest
+        # suite's larger default must not leak into the others.
+        args.timeout = (explicit_timeout if explicit_timeout is not None
+                        else suite_default_timeout(suite))
         if suite == "host":
             host_test_cmd()
         elif suite == "guest":

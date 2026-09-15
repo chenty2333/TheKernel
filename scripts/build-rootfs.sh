@@ -35,8 +35,10 @@ Environment overrides:
   THEKERNEL_MUSL_LINUX_ARCH_INCLUDE architecture UAPI headers (optional)
   THEKERNEL_ROOTFS_OWNER_MODE image ownership (default: root; use preserve
                                 when fakeroot is intentionally unavailable)
-  THEKERNEL_TOOLCHAIN         guest tool payload name, recorded only (default:
-                                none); the payload itself is staged separately
+  THEKERNEL_TOOLCHAIN         guest tool payload name (default: none); it
+                                selects which cases the suite contains, so it
+                                is compiled into the image, not just recorded;
+                                the payload itself is staged separately
   THEKERNEL_ROOTFS_TOOLS_DIR  tree of guest tools to copy into the image
   THEKERNEL_ROOTFS_SIZE_MB    image size (default: 96)
   THEKERNEL_SOURCE_CACHE      Download cache
@@ -300,6 +302,7 @@ rm -f "$STAGE/sbin/init"
 # line in the transcript always says which image was booted.
 INIT_DEFINES=""
 case "$TOOLCHAIN" in
+    none) ;;
     tcc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1" ;;
     nested) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_TCC=1 -DTHEKERNEL_TOOL_PAYLOAD_NESTED=1" ;;
     # `glibc` deliberately does not include the tcc case: it is a staging
@@ -308,6 +311,7 @@ case "$TOOLCHAIN" in
     # `gcc` is a superset of `glibc`: the compiler is dynamic, so the glibc
     # loader case runs too and the image proves its own prerequisite.
     gcc) INIT_DEFINES="-DTHEKERNEL_TOOL_PAYLOAD_GLIBC=1 -DTHEKERNEL_TOOL_PAYLOAD_GCC=1" ;;
+    *) printf 'unknown THEKERNEL_TOOLCHAIN: %s\n' "$TOOLCHAIN" >&2; exit 2 ;;
 esac
 # shellcheck disable=SC2086 # INIT_DEFINES is a deliberate flag list
 "${CROSS_COMPILE}gcc" -O2 -static -s -std=c11 -Wall -Wextra -Werror \
