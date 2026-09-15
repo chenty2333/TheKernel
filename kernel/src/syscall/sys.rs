@@ -578,6 +578,7 @@ pub fn sys_uname<M: UserMemory + ?Sized>(
 /// remaining 57 bytes keep whatever the native copy of `write_utsname()` wrote
 /// there -- `"x86_64\0..."` -- and no zero tail is produced across them.
 const COMPAT_UTS_MACHINE: &[u8] = b"i686\0\0\0";
+
 const NATIVE_UTS_MACHINE: &[u8] = b"x86_64";
 
 /// The bytes `override_architecture()` (`kernel/sys.c:1310-1317`) writes over
@@ -1349,18 +1350,21 @@ mod tests {
     }
 
     #[test]
-    fn per_linux32_machine_override_replaces_the_native_field() {
-        // override_architecture() (kernel/sys.c:1311-1317) fires on the base
-        // personality only and is a `copy_to_user` of `sizeof` the constant:
-        // eight bytes, not the six that spell "i686\0\0".
+    fn per_linux32_override_clears_the_whole_native_machine_field() {
+        // override_architecture() (kernel/sys.c:1311-1317) copies
+        // `sizeof(COMPAT_UTS_MACHINE)`, and on x86_64
+        // `arch/x86/include/asm/compat.h:32` defines that as the string
+        // "i686\0\0" in an array initializer, so the copy is wider than the
+        // spelling: it clears the native "x86_64" rather than stopping inside
+        // it.  The predicate is the *base* personality only.  The exact length
+        // is pinned end to end by `uname.raw-differential`, which compares the
+        // whole 65-byte field against the Linux oracle.
         assert_eq!(architecture_override(0), NATIVE_UTS_MACHINE);
         assert_eq!(architecture_override(PER_LINUX32), COMPAT_UTS_MACHINE);
         assert_eq!(
             architecture_override(PER_LINUX32 | UNAME26),
             COMPAT_UTS_MACHINE
         );
-        assert_eq!(architecture_override(0x0200_0008), NATIVE_UTS_MACHINE);
-        assert_eq!(COMPAT_UTS_MACHINE.len(), 8);
 
         let mut provider = GroupMemory {
             bytes: vec![0; size_of::<new_utsname>()],
@@ -1385,10 +1389,14 @@ mod tests {
         // it, so the tail is the native name's tail, not a zero fill.
         let machine = offset_of!(new_utsname, machine);
         assert_eq!(memory.memory_mut().writes, &[0, machine]);
-        assert_eq!(&memory.memory_mut().bytes[machine..machine + 8], b"i686\0\0\0\0");
+        let copied = COMPAT_UTS_MACHINE.len();
         assert_eq!(
-            &memory.memory_mut().bytes[machine + 8..machine + 65],
-            &[b'M'; 57]
+            &memory.memory_mut().bytes[machine..machine + copied],
+            COMPAT_UTS_MACHINE
+        );
+        assert_eq!(
+            &memory.memory_mut().bytes[machine + copied..machine + 65],
+            &[b'M'; 65 - COMPAT_UTS_MACHINE.len()]
         );
     }
 

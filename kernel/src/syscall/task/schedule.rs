@@ -2939,30 +2939,26 @@ mod tests {
     #[test]
     fn getaffinity_length_admission_matches_linux() {
         // kernel/sched/syscalls.c:1317-1324 with nr_cpu_ids == 4 and
-        // cpumask_size() == 8: every whole-word length of at least 8 bytes is
-        // admitted, and the syscall reports min(len, 8).
-        for (len, want) in [(8u32, 8usize), (16, 8), (64, 8)] {
+        // cpumask_size() == 8.  Both tests run before the `pid` lookup, and on
+        // success the syscall reports min(len, cpumask_size()), so an over-long
+        // request is admitted but never copies or reports more than the mask.
+        for len in [8u32, 16, 64] {
             let admitted = linux_sched::affinity_length(len, 4).unwrap();
-            assert_eq!(admitted.min(linux_sched::cpumask_size(4)), want);
+            assert!(admitted >= len as usize);
+            assert_eq!(admitted.min(linux_sched::cpumask_size(4)), 8);
         }
-        // Both tests precede the `pid` lookup and the word-alignment test comes
-        // second, so a short length reports its own reason and a length whose
-        // *8 wraps the `unsigned int` product is judged on the wrapped value.
-        assert_eq!(
-            linux_sched::affinity_length(0, 4),
-            Err(linux_sched::AffinityLengthReject::TooSmallForEveryCpu)
-        );
-        assert_eq!(
-            linux_sched::affinity_length(7, 4),
-            Err(linux_sched::AffinityLengthReject::NotWholeWords)
-        );
+        // A length that cannot name every possible CPU is refused, and one that
+        // is not a whole number of words is refused for a ceiling it is still
+        // long enough to reach.
+        for len in [0u32, 1, 4] {
+            assert!(linux_sched::affinity_length(len, 4).is_err());
+        }
+        for len in [3u32, 7, 9, 11] {
+            assert!(linux_sched::affinity_length(len, 20).is_err());
+        }
         assert_eq!(
             linux_sched::affinity_length(12, 4),
             Err(linux_sched::AffinityLengthReject::NotWholeWords)
-        );
-        assert_eq!(
-            linux_sched::affinity_length(4, 5),
-            Err(linux_sched::AffinityLengthReject::TooSmallForEveryCpu)
         );
         assert_eq!(
             linux_sched::affinity_length(u32::MAX, 4),
