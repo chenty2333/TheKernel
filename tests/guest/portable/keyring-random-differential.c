@@ -5,8 +5,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
 
 /*
  * Differential coverage for the keyring and getrandom entry points.
@@ -19,7 +24,10 @@
  *                   are -EINVAL before any user access
  *                 - a zero length never touches the buffer and never fails on
  *                   the address, but the address must still be a user address
- *                 - an unreadable destination is -EFAULT
+ *                 - an unreadable destination is -EFAULT, and the whole
+ *                   clamped range is admitted before any byte is copied, so a
+ *                   range whose exclusive end crosses the user ceiling is
+ *                   -EFAULT even when its first pages are mapped
  *                 - GRND_INSECURE is filled without waiting for the CRNG
  *   add_key(2)    security/keys/keyctl.c
  *                 - plen > 1024*1024-1 is -EINVAL before any user access
@@ -143,6 +151,36 @@ static int test_getrandom_validation(void) {
     if (expect_errno("getrandom-null-destination",
                      do_getrandom(NULL, 16, GRND_INSECURE), EFAULT))
         return 1;
+    /* `import_ubuf()` clamps, then admits the whole range with one
+     * `access_ok()` before copying anything (`lib/iov_iter.c:1445-1453`), and
+     * `valid_user_address()` stops at `USER_PTR_MAX` = TASK_SIZE_MAX
+     * (`arch/x86/include/asm/uaccess_64.h`).  The last user page ends exactly
+     * at 0x7ffffffff000, so a range starting one page lower and running three
+     * pages crosses the ceiling and is -EFAULT even though its first page is
+     * mapped. */
+    void *ceiling_page = mmap((void *)(uintptr_t)0x7fffffffd000ULL, 0x1000,
+                              PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                              -1, 0);
+    if (ceiling_page == MAP_FAILED) {
+        /* Kernels without MAP_FIXED_NOREPLACE fall back to a fixed mapping;
+         * nothing else in this process lives in the last user pages. */
+        ceiling_page = mmap((void *)(uintptr_t)0x7fffffffd000ULL, 0x1000,
+                            PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    }
+    if (ceiling_page != (void *)(uintptr_t)0x7fffffffd000ULL)
+        return fail("getrandom-ceiling-page-mmap");
+    ((volatile char *)ceiling_page)[0] = 0x5a;
+    errno = 0;
+    if (expect_errno("getrandom-range-crosses-user-ceiling",
+                     do_getrandom(ceiling_page, 0x3000, GRND_INSECURE),
+                     EFAULT))
+        return 1;
+    /* A range that ends exactly at the ceiling is still admitted, and the
+     * copy stops at the first unmapped page past it. */
+    if (do_getrandom(ceiling_page, 0x1000, GRND_INSECURE) != 0x1000)
+        return fail("getrandom-range-at-user-ceiling");
     return 0;
 }
 
@@ -413,6 +451,7 @@ static int test_keyctl_validation(void) {
                      do_keyctl(KEYCTL_JOIN_SESSION_KEYRING,
                                (unsigned long)(uintptr_t)"", 0, 0, 0), EINVAL))
         return 1;
+
     return 0;
 }
 

@@ -132,18 +132,49 @@ impl GetRandomRequest {
     }
 }
 
+/// Linux's `access_ok()` test as `import_ubuf()` reaches it
+/// (`lib/iov_iter.c:1445-1453`).
+///
+/// `import_ubuf()` clamps the request to `MAX_RW_COUNT` and then validates the
+/// **whole** clamped range with one `access_ok()` before a single byte is
+/// copied:
+///
+/// ```text
+/// int import_ubuf(int rw, void __user *buf, size_t len, struct iov_iter *i)
+/// {
+///         if (len > MAX_RW_COUNT)
+///                 len = MAX_RW_COUNT;
+///         if (unlikely(!access_ok(buf, len)))
+///                 return -EFAULT;
+///         ...
+/// ```
+///
+/// `arch/x86/include/asm/uaccess_64.h:98-107` implements the runtime-size case
+/// as `sum = size + (unsigned long)ptr; valid_user_address(sum) && sum >= ptr`
+/// with `valid_user_address(x)` meaning `x <= USER_PTR_MAX`, so a range is
+/// accepted exactly when it neither wraps nor ends above `user_ptr_max`.
+///
+/// A zero-length request reduces to `address <= user_ptr_max`, which is what
+/// [`zero_length_address_is_user`] spells out.
+pub const fn range_address_is_user(address: usize, len: usize, user_ptr_max: usize) -> bool {
+    match address.checked_add(len) {
+        Some(end) => end <= user_ptr_max,
+        // `access_ok()`'s `sum >= ptr` re-test rejects a wrapped sum.
+        None => false,
+    }
+}
+
 /// Linux's `access_ok()` test for a **zero-length** request, as reached
 /// through `import_ubuf()` (`lib/iov_iter.c`).
 ///
 /// `arch/x86/include/asm/uaccess_64.h` defines
 /// `valid_user_address(x)` as `x <= USER_PTR_MAX`, where `USER_PTR_MAX` is
-/// `TASK_SIZE_MAX - PAGE_SIZE`. `access_ok()` adds the size and re-tests the
-/// sum, so a zero-length request reduces to `address <= user_ptr_max` — the
-/// first page (and therefore `NULL`) is a valid user address, while an address
-/// at or above the user-space ceiling is `-EFAULT` even though nothing is
-/// copied.
+/// `TASK_SIZE_MAX`. `access_ok()` adds the size and re-tests the sum, so a
+/// zero-length request reduces to `address <= user_ptr_max` — the first page
+/// (and therefore `NULL`) is a valid user address, while an address at or above
+/// the user-space ceiling is `-EFAULT` even though nothing is copied.
 pub const fn zero_length_address_is_user(address: usize, user_ptr_max: usize) -> bool {
-    address <= user_ptr_max
+    range_address_is_user(address, 0, user_ptr_max)
 }
 
 #[cfg(test)]
@@ -249,5 +280,34 @@ mod tests {
         assert!(zero_length_address_is_user(USER_PTR_MAX, USER_PTR_MAX));
         assert!(!zero_length_address_is_user(USER_PTR_MAX + 1, USER_PTR_MAX));
         assert!(!zero_length_address_is_user(usize::MAX, USER_PTR_MAX));
+    }
+
+    #[test]
+    fn whole_range_access_ok_uses_the_exclusive_end() {
+        const USER_PTR_MAX: usize = 0x0000_7fff_ffff_f000;
+        // The end is inclusive of `USER_PTR_MAX` itself, because the test is on
+        // the sum: `sum <= USER_PTR_MAX`.
+        assert!(range_address_is_user(0x1000, 0x1000, USER_PTR_MAX));
+        assert!(range_address_is_user(USER_PTR_MAX - 0x1000, 0x1000, USER_PTR_MAX));
+        assert!(range_address_is_user(USER_PTR_MAX, 0, USER_PTR_MAX));
+        // One byte past the ceiling is rejected, and so is a range that starts
+        // inside the user window and only crosses the ceiling at its end.
+        assert!(!range_address_is_user(
+            USER_PTR_MAX - 0x1000,
+            0x1001,
+            USER_PTR_MAX
+        ));
+        assert!(!range_address_is_user(USER_PTR_MAX, 1, USER_PTR_MAX));
+        assert!(!range_address_is_user(0x7fff_ffff_f000, 16, USER_PTR_MAX));
+        // `access_ok()`'s `sum >= ptr` re-test: a wrapping sum is rejected.
+        assert!(!range_address_is_user(usize::MAX, 2, USER_PTR_MAX));
+        assert!(!range_address_is_user(USER_PTR_MAX, usize::MAX, USER_PTR_MAX));
+        // The empty request is the address test alone, first page included.
+        for address in [0usize, 1, 0x1000, USER_PTR_MAX] {
+            assert_eq!(
+                range_address_is_user(address, 0, USER_PTR_MAX),
+                zero_length_address_is_user(address, USER_PTR_MAX)
+            );
+        }
     }
 }
