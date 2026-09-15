@@ -952,9 +952,19 @@ pub fn sys_msgrcv<M: UserMemory + ?Sized>(
     let flags = MsgRcvFlags::from_bits_truncate(msgflg);
     let selection = select_message(msgtyp).map_err(|_| AxError::InvalidInput)?;
 
-    // Linux `do_msgrcv()` validates the identifier and the MSG_COPY flag
-    // combination before it touches the queue.
-    if msqid < 0 {
+    // Linux `ipc/msg.c:do_msgrcv()`:
+    //
+    // ```c
+    // 	if (msqid < 0 || (long) bufsz < 0)
+    // 		return -EINVAL;
+    // ```
+    //
+    // The buffer size is read as a *signed* word, so a size whose sign bit is
+    // set is a negative buffer and is rejected here, before the MSG_COPY flag
+    // combination is examined.  `do_msgsnd()` tests the same way but also
+    // bounds the size above with `ns->msg_ctlmax`, so its signed test is
+    // subsumed by the bound this implementation already applies.
+    if msqid < 0 || (msgsz as isize) < 0 {
         return Err(AxError::from(LinuxError::EINVAL)); // EINVAL
     }
     if flags.contains(MsgRcvFlags::MSG_COPY) {
