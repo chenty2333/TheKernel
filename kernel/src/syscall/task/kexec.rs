@@ -31,7 +31,30 @@ const KEXEC_ON_CRASH: u64 = 1;
 const KEXEC_PRESERVE_CONTEXT: u64 = 2;
 const KEXEC_UPDATE_ELFCOREHDR: u64 = 4;
 const KEXEC_CRASH_HOTPLUG_SUPPORT: u64 = 8;
+/// `KEXEC_FLAGS` (include/linux/kexec.h) for the `CONFIG_KEXEC_JUMP=n` build
+/// TheKernel and the pinned 7.2.3 oracle are both produced from.
+const KEXEC_FLAGS: u64 = KEXEC_ON_CRASH | KEXEC_UPDATE_ELFCOREHDR | KEXEC_CRASH_HOTPLUG_SUPPORT;
+/// `KEXEC_PRESERVE_CONTEXT` is a legal `kexec_load` flag only under
+/// `CONFIG_KEXEC_JUMP`, so it must stay out of [`KEXEC_FLAGS`] here.
+const _: () = assert!(KEXEC_FLAGS & KEXEC_PRESERVE_CONTEXT == 0);
 const KEXEC_ARCH_MASK: u64 = 0xffff << 16;
+/// `KEXEC_DESTINATION_MEMORY_LIMIT` (arch/x86/include/asm/kexec.h):
+///
+/// ```c
+/// /* Maximum address we can reach in physical address mode */
+/// # define KEXEC_DESTINATION_MEMORY_LIMIT (MAXMEM-1)
+/// ```
+///
+/// with `MAXMEM` from arch/x86/include/asm/pgtable_64_types.h:
+///
+/// ```c
+/// # define MAX_PHYSMEM_BITS	(pgtable_l5_enabled() ? 52 : 46)
+/// # define MAXMEM			(1UL << MAX_PHYSMEM_BITS)
+/// ```
+///
+/// TheKernel programs four-level page tables here (nothing sets `CR4.LA57`,
+/// see crates/ax/tk-axplat-x86-pc/src/boot.rs), so `MAX_PHYSMEM_BITS` is 46.
+const KEXEC_DESTINATION_MEMORY_LIMIT: usize = (1 << 46) - 1;
 const KEXEC_ARCH_X86_64: u64 = 62 << 16;
 const PAGE_SIZE: usize = 4096;
 const KEXEC_FILE_UNLOAD: u64 = 1;
@@ -614,44 +637,33 @@ fn range_end(start: usize, len: usize) -> AxResult<usize> {
     start.checked_add(len).ok_or(AxError::InvalidInput)
 }
 fn valid_flags(flags: u64) -> AxResult<bool> {
-    if !matches!(flags & KEXEC_ARCH_MASK, 0 | KEXEC_ARCH_X86_64)
-        || flags
-            & !(KEXEC_ARCH_MASK
-                | KEXEC_ON_CRASH
-                | KEXEC_PRESERVE_CONTEXT
-                | KEXEC_UPDATE_ELFCOREHDR
-                | KEXEC_CRASH_HOTPLUG_SUPPORT)
-            != 0
-    {
-        return Err(AxError::InvalidInput);
-    }
-    // `KEXEC_PRESERVE_CONTEXT` is rejected above because it is only part of
-    // `KEXEC_FLAGS` when CONFIG_KEXEC_JUMP is enabled:
+    // include/linux/kexec.h:
     //
+    // 	/* List of defined/legal kexec flags */
+    // 	#ifndef CONFIG_KEXEC_JUMP
     // 	#define KEXEC_FLAGS    (KEXEC_ON_CRASH | KEXEC_UPDATE_ELFCOREHDR | KEXEC_CRASH_HOTPLUG_SUPPORT)
     // 	#else
     // 	#define KEXEC_FLAGS    (KEXEC_ON_CRASH | KEXEC_PRESERVE_CONTEXT | KEXEC_UPDATE_ELFCOREHDR | \
     // 				KEXEC_CRASH_HOTPLUG_SUPPORT)
     // 	#endif
     //
-    // `KEXEC_UPDATE_ELFCOREHDR` and `KEXEC_CRASH_HOTPLUG_SUPPORT` are always in
-    // the mask, so they are legal for a default image as well as a crash image:
+    // and kernel/kexec.c `kexec_load_check()` compares the request against it:
     //
-    // 	/*
-    // 	 * Initially, crash hotplug support for kexec_load was added
-    // 	 * with the KEXEC_UPDATE_ELFCOREHDR flag. Later, this
-    // 	 * functionality was expanded to accommodate multiple kexec
-    // 	 * segment updates, leading to the introduction of the
-    // 	 * KEXEC_CRASH_HOTPLUG_SUPPORT kexec flag bit.
-    // 	 */
-    // 	return (kexec_flags & KEXEC_UPDATE_ELFCOREHDR ||
-    // 		kexec_flags & KEXEC_CRASH_HOTPLUG_SUPPORT);
-    // 	(arch/x86/kernel/crash.c `arch_crash_hotplug_support()` only *reads*
-    // 	 these bits; nothing rejects them.)
+    // 	if ((flags & KEXEC_FLAGS) != (flags & ~KEXEC_ARCH_MASK))
+    // 		return -EINVAL;
+    if (flags & KEXEC_FLAGS) != (flags & !KEXEC_ARCH_MASK) {
+        return Err(AxError::InvalidInput);
+    }
+    // The arch test is the next statement of `SYSCALL_DEFINE4(kexec_load)`,
+    // with the same -EINVAL:
     //
-    // TheKernel used to reject both bits unconditionally, which turned a legal
-    // `kexec_load(..., KEXEC_ON_CRASH|KEXEC_UPDATE_ELFCOREHDR)` into -EINVAL.
-    // The image type still depends only on KEXEC_ON_CRASH, matching
+    // 	if (((flags & KEXEC_ARCH_MASK) != KEXEC_ARCH) &&
+    // 		((flags & KEXEC_ARCH_MASK) != KEXEC_ARCH_DEFAULT))
+    // 		return -EINVAL;
+    if !matches!(flags & KEXEC_ARCH_MASK, 0 | KEXEC_ARCH_X86_64) {
+        return Err(AxError::InvalidInput);
+    }
+    // The image type depends only on KEXEC_ON_CRASH, matching
     // `kexec_load_check()`'s `int image_type = (flags & KEXEC_ON_CRASH) ? ...`.
     Ok(flags & KEXEC_ON_CRASH != 0)
 }
@@ -663,7 +675,6 @@ pub fn sys_kexec_load<M: UserMemory + ?Sized>(
     flags: u64,
 ) -> AxResult<isize> {
     let actor = boot_capable()?;
-    let _load_transaction = KEXEC_LOAD_TRANSACTION.try_lock().ok_or(LinuxError::EBUSY)?;
     let crash = valid_flags(flags)?;
     authorize_kernel_load_data(
         &actor,
@@ -674,19 +685,24 @@ pub fn sys_kexec_load<M: UserMemory + ?Sized>(
         },
         false,
     )?;
-    if n == 0 {
-        if crash {
-            publish_crash_image(None)?;
-        } else {
-            *NORMAL.try_lock().ok_or(LinuxError::EBUSY)? = None;
-        }
-        return Ok(0);
-    }
-    if n > KEXEC_SEGMENT_MAX || source.is_null() {
+    // `kexec_load_check()` caps the segment count after the flag and LSM
+    // admission:
+    //
+    // 	/* Put an artificial cap on the number
+    // 	 * of segments passed to kexec_load.
+    // 	 */
+    // 	if (nr_segments > KEXEC_SEGMENT_MAX)
+    // 		return -EINVAL;
+    if n > KEXEC_SEGMENT_MAX {
         return Err(AxError::InvalidInput);
     }
     let mut raw = Vec::new();
     raw.try_reserve_exact(n).map_err(|_| AxError::NoMemory)?;
+    // This loop is `SYSCALL_DEFINE4(kexec_load)`'s `memdup_array_user()`, which
+    // runs before `do_kexec_load()` takes the kexec lock.  A NULL `segments`
+    // pointer is not a separate -EINVAL case: the copy faults, so Linux reports
+    // -EFAULT for `nr_segments > 0` and never looks at the pointer for zero
+    // segments (`memdup_array_user(NULL, 0, ...)` returns ZERO_SIZE_PTR).
     for index in 0..n {
         let address = (source as usize)
             .checked_add(
@@ -700,6 +716,22 @@ pub fn sys_kexec_load<M: UserMemory + ?Sized>(
                 .map_err(|_| AxError::BadAddress)?
                 .assume_init()
         });
+    }
+    // `do_kexec_load()` opens with the serialization `kexec_load_permitted()`
+    // does not cover:
+    //
+    // 	if (!kexec_trylock())
+    // 		return -EBUSY;
+    //
+    // so -EBUSY is reported only once the request itself is well formed.
+    let _load_transaction = KEXEC_LOAD_TRANSACTION.try_lock().ok_or(LinuxError::EBUSY)?;
+    if n == 0 {
+        if crash {
+            publish_crash_image(None)?;
+        } else {
+            *NORMAL.try_lock().ok_or(LinuxError::EBUSY)? = None;
+        }
+        return Ok(0);
     }
     let mut destinations = Vec::new();
     destinations
@@ -749,10 +781,16 @@ pub fn sys_kexec_load<M: UserMemory + ?Sized>(
             owns_pages: crash,
         });
     }
-    if !raw_entry_loaded(entry, &image) {
-        return Err(AxError::InvalidInput);
-    }
     let image = KexecImage {
+        // `kimage_alloc_init()` stores the entry exactly as passed and does not
+        // require it to land inside a destination segment:
+        //
+        // 	image->start = entry;
+        //
+        // (kernel/kexec.c:41).  There is no "entry outside destination" test in
+        // Linux to mirror here; which entry points are usable is decided by the
+        // image itself when it is booted, and `kexec_load` already requires
+        // CAP_SYS_BOOT.
         entry,
         segments: image,
         boot_params: 0,
@@ -766,25 +804,48 @@ pub fn sys_kexec_load<M: UserMemory + ?Sized>(
     }
     Ok(0)
 }
+/// `sanity_check_segment_list()`'s first loop (kernel/kexec_core.c), for one
+/// `struct kexec_segment`:
+///
+/// ```c
+/// 	mstart = image->segment[i].mem;
+/// 	mend   = mstart + image->segment[i].memsz;
+/// 	if (mstart > mend)
+/// 		return -EADDRNOTAVAIL;
+/// 	if ((mstart & ~PAGE_MASK) || (mend & ~PAGE_MASK))
+/// 		return -EADDRNOTAVAIL;
+/// 	if (mend >= KEXEC_DESTINATION_MEMORY_LIMIT)
+/// 		return -EADDRNOTAVAIL;
+/// ```
+///
+/// `mstart > mend` is unsigned wraparound, not a zero length: a segment whose
+/// `memsz` is zero leaves `mend == mstart` and passes every one of these tests.
+/// The loop's own comment leaves RAM validation to the caller, so no test here
+/// consults the platform memory map either; `admit_destination_ranges()` below
+/// is where TheKernel adds that, and where the difference is declared.
 fn validate_raw_segment(segment: KexecSegment) -> AxResult<()> {
-    let end = range_end(segment.mem, segment.memsz)?;
-    if (segment.bufsz != 0 && segment.buf.is_null())
-        || segment.memsz == 0
-        || segment.bufsz > segment.memsz
-        || segment.mem & (PAGE_SIZE - 1) != 0
+    let Some(end) = segment.mem.checked_add(segment.memsz) else {
+        return Err(LinuxError::EADDRNOTAVAIL.into());
+    };
+    if segment.mem & (PAGE_SIZE - 1) != 0
         || end & (PAGE_SIZE - 1) != 0
+        || end >= KEXEC_DESTINATION_MEMORY_LIMIT
     {
+        return Err(LinuxError::EADDRNOTAVAIL.into());
+    }
+    // 	/* Ensure our buffer sizes are strictly less than
+    // 	 * our memory sizes.  This should always be the case,
+    // 	 * and it is easier to check up front than to be surprised
+    // 	 * later on.
+    // 	 */
+    // 	for (i = 0; i < nr_segments; i++) {
+    // 		if (image->segment[i].bufsz > image->segment[i].memsz)
+    // 			return -EINVAL;
+    // 	}
+    if segment.bufsz > segment.memsz {
         return Err(AxError::InvalidInput);
     }
     Ok(())
-}
-fn raw_entry_loaded(entry: usize, image: &[ReservedSegment]) -> bool {
-    image.iter().any(|segment| {
-        segment
-            .paddr
-            .checked_add(segment.pages * PAGE_SIZE)
-            .is_some_and(|end| segment.paddr <= entry && entry < end)
-    })
 }
 fn admit_destination_ranges(ranges: &[(usize, usize)], total_pages: usize) -> AxResult<()> {
     admit_destination_ranges_in(
@@ -806,7 +867,15 @@ fn admit_destination_ranges_in(
         .try_reserve_exact(ranges.len())
         .map_err(|_| AxError::NoMemory)?;
     for &(start, bytes) in ranges {
-        let end = range_end(start, bytes)?;
+        let Some(end) = start.checked_add(bytes) else {
+            return Err(LinuxError::EADDRNOTAVAIL.into());
+        };
+        if start & (PAGE_SIZE - 1) != 0 || end & (PAGE_SIZE - 1) != 0 {
+            return Err(LinuxError::EADDRNOTAVAIL.into());
+        }
+        if end >= KEXEC_DESTINATION_MEMORY_LIMIT {
+            return Err(LinuxError::EADDRNOTAVAIL.into());
+        }
         // A raw kexec segment is a physical-RAM destination, not merely a
         // numerically canonical address.  In particular, accepting an MMIO
         // aperture or a hole below total_ram_size() would let the terminal
@@ -814,6 +883,25 @@ fn admit_destination_ranges_in(
         // stopped.  The platform memory map is the authority here; it still
         // includes pages currently occupied by this kernel, which orderly
         // kexec is explicitly allowed to replace.
+        //
+        // This is stricter than Linux, deliberately and with a declared cost.
+        // `sanity_check_segment_list()` bounds destinations only by
+        // KEXEC_DESTINATION_MEMORY_LIMIT and says why:
+        //
+        // 	/*
+        // 	 * Verify we have good destination addresses.  The caller is
+        // 	 * responsible for making certain we don't attempt to load
+        // 	 * the new image into invalid or reserved areas of RAM.  This
+        // 	 * just verifies it is an address we can use.
+        // 	 */
+        //
+        // so an address below the limit but outside a RAM region is accepted
+        // there (for a *crash* image Linux does require the crash kernel's
+        // reserved window, which TheKernel does not carve out).  TheKernel
+        // answers -EINVAL for both, and a zero-length destination too, which
+        // Linux also accepts: `mend == mstart` passes the alignment, limit and
+        // overlap tests, and the segment then contributes no pages.  Both
+        // differences are declared in the `kexec_load` contract cell.
         let in_ram = end <= total_bytes
             && memory_regions
                 .iter()
@@ -821,7 +909,7 @@ fn admit_destination_ranges_in(
                     base.checked_add(length)
                         .is_some_and(|limit| base <= start && end <= limit)
                 });
-        if bytes == 0 || start & (PAGE_SIZE - 1) != 0 || end & (PAGE_SIZE - 1) != 0 || !in_ram {
+        if bytes == 0 || !in_ram {
             return Err(AxError::InvalidInput);
         }
         sorted.push((start, end));
@@ -830,6 +918,14 @@ fn admit_destination_ranges_in(
     let mut covered = 0usize;
     let mut previous_end = None;
     for (start, end) in sorted {
+        // 	/* Verify our destination addresses do not overlap. */
+        // 	for (i = 0; i < nr_segments; i++) {
+        // 		for (j = 0; j < i; j++) {
+        // 			/* Do the segments overlap ? */
+        // 			if ((mend > pstart) && (mstart < pend))
+        // 				return -EINVAL;
+        // 		}
+        // 	}
         if previous_end.is_some_and(|previous| start < previous) {
             return Err(AxError::InvalidInput);
         }
@@ -838,8 +934,15 @@ fn admit_destination_ranges_in(
             .ok_or(AxError::NoMemory)?;
         previous_end = Some(end);
     }
+    // 	/*
+    // 	 * Verify that no more than half of memory will be consumed. If the
+    // 	 * request from userspace is too large, a large amount of time will be
+    // 	 * wasted allocating pages, which can cause a soft lockup.
+    // 	 */
+    // 	if (total_pages > nr_pages / 2)
+    // 		return -EINVAL;
     if covered > total_pages / 2 {
-        return Err(AxError::NoMemory);
+        return Err(AxError::InvalidInput);
     }
     Ok(())
 }
@@ -1822,24 +1925,127 @@ mod tests {
                 &[(0, PAGE_SIZE), (PAGE_SIZE, PAGE_SIZE)], 4, 4 * PAGE_SIZE, &memory,
             ).is_ok()
         );
-        assert!(matches!(
+        // kernel/kexec_core.c `sanity_check_segment_list()` runs three loops:
+        // every address is checked for wraparound, page alignment and the
+        // KEXEC_DESTINATION_MEMORY_LIMIT first (-EADDRNOTAVAIL), and only then
+        // are overlaps (-EINVAL) and the half-of-memory cap (-EINVAL) checked.
+        // An unaligned *start* therefore reports -EADDRNOTAVAIL even when the
+        // same pair would also overlap:
+        //
+        // 	for (i = 0; i < nr_segments; i++) {
+        // 		mstart = image->segment[i].mem;
+        // 		mend   = mstart + image->segment[i].memsz;
+        // 		if (mstart > mend)
+        // 			return -EADDRNOTAVAIL;
+        // 		if ((mstart & ~PAGE_MASK) || (mend & ~PAGE_MASK))
+        // 			return -EADDRNOTAVAIL;
+        // 		if (mend >= KEXEC_DESTINATION_MEMORY_LIMIT)
+        // 			return -EADDRNOTAVAIL;
+        // 	}
+        assert_eq!(
             admit_destination_ranges_in(
                 &[(0, PAGE_SIZE), (PAGE_SIZE / 2, PAGE_SIZE)], 4, 4 * PAGE_SIZE, &memory,
             ),
+            Err(AxError::from(LinuxError::EADDRNOTAVAIL))
+        );
+        // Page-aligned overlapping destinations reach the overlap loop and are
+        // -EINVAL there:
+        //
+        // 	for (i = 0; i < nr_segments; i++) {
+        // 		...
+        // 		for (j = 0; j < i; j++) {
+        // 			...
+        // 			if ((mend > pstart) && (mstart < pend))
+        // 				return -EINVAL;
+        // 		}
+        // 	}
+        assert_eq!(
+            admit_destination_ranges_in(
+                &[(0, 2 * PAGE_SIZE), (PAGE_SIZE, PAGE_SIZE)], 4, 4 * PAGE_SIZE, &memory,
+            ),
             Err(AxError::InvalidInput)
-        ));
-        assert!(matches!(
+        );
+        // More than half of memory is -EINVAL as well, not -ENOMEM.
+        assert_eq!(
             admit_destination_ranges_in(&[(0, 3 * PAGE_SIZE)], 4, 4 * PAGE_SIZE, &memory),
-            Err(AxError::NoMemory)
-        ));
+            Err(AxError::InvalidInput)
+        );
         // A numeric address below total RAM is insufficient when it lies in
-        // a platform memory-map hole.
+        // a platform memory-map hole.  Linux would accept it (its sanity check
+        // leaves RAM validation to the caller), so this stays -EINVAL as a
+        // declared divergence rather than becoming a fabricated errno.
         assert_eq!(
             admit_destination_ranges_in(
                 &[(PAGE_SIZE, PAGE_SIZE)], 4, 4 * PAGE_SIZE,
                 &[(0, PAGE_SIZE), (2 * PAGE_SIZE, 2 * PAGE_SIZE)],
             ),
             Err(AxError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn destination_addresses_use_eaddrnotavail_not_einval() {
+        let memory = [(0, 4 * PAGE_SIZE)];
+        // 	unlikely(mstart > mend) -> -EADDRNOTAVAIL
+        assert_eq!(
+            admit_destination_ranges_in(&[(0, usize::MAX)], 4, 4 * PAGE_SIZE, &memory),
+            Err(AxError::from(LinuxError::EADDRNOTAVAIL))
+        );
+        // 	unaligned start -> -EADDRNOTAVAIL
+        assert_eq!(
+            admit_destination_ranges_in(&[(1, PAGE_SIZE)], 4, 4 * PAGE_SIZE, &memory),
+            Err(AxError::from(LinuxError::EADDRNOTAVAIL))
+        );
+        // 	unaligned end -> -EADDRNOTAVAIL
+        assert_eq!(
+            admit_destination_ranges_in(&[(0, PAGE_SIZE + 1)], 4, 4 * PAGE_SIZE, &memory),
+            Err(AxError::from(LinuxError::EADDRNOTAVAIL))
+        );
+        // 	mend >= KEXEC_DESTINATION_MEMORY_LIMIT -> -EADDRNOTAVAIL
+        assert_eq!(
+            admit_destination_ranges_in(
+                &[(KEXEC_DESTINATION_MEMORY_LIMIT - PAGE_SIZE, PAGE_SIZE)],
+                4,
+                KEXEC_DESTINATION_MEMORY_LIMIT + PAGE_SIZE,
+                &[(0, KEXEC_DESTINATION_MEMORY_LIMIT + PAGE_SIZE)],
+            ),
+            Err(AxError::from(LinuxError::EADDRNOTAVAIL))
+        );
+    }
+
+    #[test]
+    fn raw_segment_keeps_linux_sanity_check_order_and_errnos() {
+        // A zero-length destination is not a Linux error: `mend == mstart`
+        // passes the wraparound, alignment and limit tests.  TheKernel rejects
+        // it later, in `admit_destination_ranges()`, so segment validation must
+        // not report it as an address problem.
+        let empty = KexecSegment {
+            buf: ptr::null(),
+            bufsz: 0,
+            mem: 2 * PAGE_SIZE,
+            memsz: 0,
+        };
+        assert_eq!(validate_raw_segment(empty), Ok(()));
+        // `bufsz > memsz` is -EINVAL, after the address tests.
+        assert_eq!(
+            validate_raw_segment(KexecSegment {
+                buf: ptr::null(),
+                bufsz: PAGE_SIZE + 1,
+                mem: 2 * PAGE_SIZE,
+                memsz: PAGE_SIZE,
+            }),
+            Err(AxError::InvalidInput)
+        );
+        // A NULL `buf` with a non-zero `bufsz` is *not* -EINVAL here: Linux
+        // faults in `copy_from_user()` and reports -EFAULT at load time.
+        assert_eq!(
+            validate_raw_segment(KexecSegment {
+                buf: ptr::null(),
+                bufsz: PAGE_SIZE,
+                mem: 2 * PAGE_SIZE,
+                memsz: PAGE_SIZE,
+            }),
+            Ok(())
         );
     }
 
