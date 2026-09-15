@@ -2216,6 +2216,11 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
     // already disappeared), so this path must not perform a user write.
     thr.reset_rseq_on_exit();
     thr.proc_data.end_exec(tid);
+    // Linux `do_exit()` calls `synchronize_group_exit()` before
+    // `exit_signals()`, which makes the task "will free memory" observable
+    // from the very start of exit — not only once it is a zombie.  Recorded
+    // here so `process_mrelease(2)` sees the same window.
+    thr.proc_data.note_thread_exit_started();
     let started_group_exit = group_exit && begin_group_exit(&thr.proc_data, exit_code);
     if started_group_exit {
         let sig = SignalInfo::new_kernel(Signo::SIGKILL);

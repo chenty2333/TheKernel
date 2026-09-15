@@ -3572,6 +3572,9 @@ pub struct ProcessData {
     ptrace_tracees: SpinNoIrq<PtraceReverseLinks>,
     /// Multi-thread exec coordination state.
     exec_ctl: SpinNoIrq<ExecControlState>,
+    /// Count of threads that have entered `do_exit()`; the counterpart of
+    /// Linux `signal->quick_threads`.
+    exit_started_threads: AtomicUsize,
     /// Serializes setpgid with successful exec publication; fork starts false.
     pub(crate) exec_committed: Mutex<bool>,
     /// CLONE_VFORK coordination state.
@@ -4045,6 +4048,7 @@ impl ProcessData {
             ptrace_signal: Mutex::new(None),
             ptrace_tracees: SpinNoIrq::new(PtraceReverseLinks::default()),
             exec_ctl: SpinNoIrq::new(ExecControlState::default()),
+            exit_started_threads: AtomicUsize::new(0),
             exec_committed: Mutex::new(false),
             vfork_ctl: SpinNoIrq::new(VforkControlState::default()),
             stop_event,
@@ -4070,11 +4074,43 @@ impl ProcessData {
         self.process_lifecycle.lock()
     }
 
-    /// Returns whether this process has crossed the only exit states for
-    /// which Linux permits `process_mrelease`.  A live sibling sharing an mm
-    /// is rejected by the syscall before this state transition is attempted.
+    /// Whether every live thread of this process has entered `do_exit()`.
+    ///
+    /// This is the local counterpart of Linux `signal->quick_threads == 0`,
+    /// which `synchronize_group_exit()` turns into `SIGNAL_GROUP_EXIT` as the
+    /// very first act of `do_exit()`.  A thread created afterwards raises the
+    /// live count again, just as a new `copy_process()` raises `quick_threads`.
+    pub(crate) fn all_threads_exiting(&self) -> bool {
+        let exiting = self.exit_started_threads.load(Ordering::Acquire);
+        exiting != 0 && exiting >= self.proc.thread_count()
+    }
+
+    /// Returns whether Linux `mm/oom_kill.c:__task_will_free_mem()` would
+    /// accept this process as an OOM-reap victim.
+    ///
+    /// A single-threaded task that called `exit(2)` rather than
+    /// `exit_group(2)` is therefore already dying as far as the predicate is
+    /// concerned, long before it becomes a zombie.  The remaining conjuncts of
+    /// Linux's `task_will_free_mem()` live in the syscall: the mm owner is
+    /// resolved by [`crate::syscall::mm::process_mrelease_has_live_mm_thread`],
+    /// `mm_users > 1` becomes the live `CLONE_VM` sharer scan, and `MMF_OOM_SKIP`
+    /// has no counterpart because this kernel's reaper never runs `exit_mmap`.
     pub(crate) fn oom_reap_eligible(&self) -> bool {
-        self.group_exit_in_progress() || self.proc.is_zombie()
+        tk_linux_mm::task_dying(tk_linux_mm::FreeMemFacts {
+            group_exit: self.group_exit_in_progress() || self.all_threads_exiting(),
+            thread_group_empty: self.proc.thread_count() <= 1,
+            pf_exiting: self.all_threads_exiting(),
+            ..Default::default()
+        })
+    }
+
+    /// Records that one thread of this process has entered `do_exit()`.
+    ///
+    /// The counter is monotone, exactly like Linux's `quick_threads`
+    /// decrement: it is never undone, and thread creation is accounted for by
+    /// comparing against the live thread count instead.
+    pub(crate) fn note_thread_exit_started(&self) {
+        self.exit_started_threads.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(crate) fn allocate_pkey(&self) -> AxResult<u8> {

@@ -7,6 +7,7 @@ use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::general::{CAP_SYS_NICE, MADV_COLD, MADV_COLLAPSE, MADV_PAGEOUT, MADV_WILLNEED};
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
+use tk_linux_mm::{MreleaseEligible, eligibility};
 
 use crate::{
     file::{FileLike, PidFd},
@@ -488,6 +489,10 @@ pub fn sys_process_madvise(
     let target = pidfd.process_data()?;
     let target_image = pidfd.image_access_snapshot()?;
     check_current_ptrace_image_snapshot(&target, &target_image, PtraceAccessMode::ReadFs)?;
+    // `mm/madvise.c:SYSCALL_DEFINE5(process_madvise, ...)` calls
+    // `madvise_behavior_valid(behavior)` for the same-mm case too, before the
+    // remote-only `process_madvise_remote_valid()` and CAP_SYS_NICE gates, so
+    // same-mm advice inherits the `madvise(2)` table exactly.
     if !super::mmap::madvise_behavior_valid(behavior) {
         return Err(AxError::InvalidInput);
     }
@@ -583,11 +588,24 @@ pub fn sys_process_mrelease(pidfd: i32, flags: u32) -> AxResult<isize> {
     // Preserve pidfd_get_task-style descriptor/type/liveness errors exactly.
     let pidfd = PidFd::from_fd(pidfd)?;
     let target = pidfd.process_data()?;
-    if !target.oom_reap_eligible() {
-        return Err(AxError::InvalidInput);
-    }
-    if !process_mrelease_has_live_mm_thread(&target) {
-        return Err(AxError::NoSuchProcess);
+    // Linux `__do_sys_process_mrelease()` resolves the mm owner with
+    // `find_lock_task_mm()` *before* asking `task_will_free_mem()`, so a
+    // target whose threads have all detached the mm reports -ESRCH even when
+    // it is also not dying, and only a target that still holds an mm reaches
+    // the -EINVAL eligibility answer.  The checks used to be in the opposite
+    // order, which turned that -ESRCH into -EINVAL.  `AlreadySkipped` is
+    // unreachable here because nothing in this kernel sets `MMF_OOM_SKIP`; it
+    // is modelled so the errno order stays in one testable place.
+    match eligibility(
+        process_mrelease_has_live_mm_thread(&target),
+        target.oom_reap_eligible(),
+        false,
+    )
+    .map_err(|_| AxError::NoSuchProcess)?
+    {
+        MreleaseEligible::Reap => {}
+        MreleaseEligible::AlreadySkipped => return Ok(0),
+        MreleaseEligible::NotDying => return Err(AxError::InvalidInput),
     }
 
     let aspace = target.aspace();
