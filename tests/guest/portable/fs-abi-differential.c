@@ -931,11 +931,16 @@ int main(void) {
               "fifo");
         mark("NON_REGULAR_EINVAL");
         errno = 0;
-        check(syscall(SYS_readahead, rofile, 0LL, 8) == -1 && errno == EINVAL,
-              "readonly-is-readable");
-        errno = 0;
         check(syscall(SYS_readahead, file, -1LL, 8) == -1 && errno == EINVAL,
               "negative-regular");
+        /*
+         * A read-only descriptor still carries FMODE_READ, and ksys_readahead()
+         * rejects only a descriptor without it, a mapping without a_ops, a
+         * non-regular/non-block inode and an anonymous file before it calls
+         * vfs_fadvise() (mm/readahead.c:724-754).  A read-only regular file is
+         * therefore accepted, which the two checks below assert.  An earlier
+         * duplicate of this check expected EINVAL and contradicted them.
+         */
         check(syscall(SYS_readahead, rofile, 0LL, 8) == 0, "regular");
         check(syscall(SYS_readahead, rofile, 0LL, 0) == 0, "zero-length");
         mark("REGULAR_ACCEPTED");
