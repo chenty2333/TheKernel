@@ -390,6 +390,25 @@ impl Mountpoint {
         Self::new_detached_with_extensions(fs, TypeMap::new())
     }
 
+    /// Creates a detached mount whose extension slot is still uninitialized.
+    ///
+    /// [`Mountpoint::initialize_extensions`] is one-shot and
+    /// [`Mountpoint::new_detached`] spends that slot on an empty map, so a
+    /// caller that must install its own mount state as part of bringing the
+    /// mount up has to claim the slot before anything else fills it.  The boot
+    /// path is such a caller: its mount state type belongs to the kernel crate
+    /// and cannot be passed to this constructor.
+    pub fn new_detached_uninitialized(fs: &Filesystem) -> VfsResult<Arc<Self>> {
+        reserve_non_root_mount()?;
+        match Self::try_new_with_root(fs, fs.root_dir(), None, None, false, true) {
+            Ok(mountpoint) => Ok(mountpoint),
+            Err(error) => {
+                release_non_root_mount_reservation();
+                Err(error)
+            }
+        }
+    }
+
     pub fn new_detached_with_extensions(
         fs: &Filesystem,
         extensions: TypeMap,
@@ -1883,39 +1902,34 @@ impl Location {
         Ok(())
     }
 
-    /// Atomically promotes this mounted tree to namespace root and mounts the
-    /// former root at `put_old`. Both locations must already be stable.
-    pub fn pivot_root_to(&self, put_old: &Self) -> VfsResult<()> {
-        if !self.is_root_of_mount() || !put_old.is_dir() {
+    /// Re-attaches this mounted tree at the mountpoint `old_root` currently
+    /// occupies and mounts `old_root` at `put_old` inside it.
+    ///
+    /// `old_root` is the mount `current->fs->root` names, which is *not* the
+    /// namespace root: `init_mount_tree()` layers the mutable rootfs on top of
+    /// the immutable nullfs, so the mount `path_pivot_root()` moves aside has a
+    /// parent of its own and the namespace root stays where it is
+    /// (`fs/namespace.c`:4725-4734). Both locations must already be stable.
+    pub fn pivot_root_to(&self, old_root: &Arc<Mountpoint>, put_old: &Self) -> VfsResult<()> {
+        if !self.is_root_of_mount() || !put_old.is_dir() || !old_root.root.is_root_of_mount() {
             return Err(VfsError::InvalidInput);
         }
         let new_root = self.mountpoint();
         if new_root.namespace_root.load(Ordering::Acquire)
+            || old_root.namespace_root.load(Ordering::Acquire)
             || !Arc::ptr_eq(put_old.mountpoint(), new_root)
         {
             return Err(VfsError::InvalidInput);
         }
 
         let _tree = mount_tree_write();
-        if new_root.unmounting.load(Ordering::Acquire) {
+        if new_root.unmounting.load(Ordering::Acquire)
+            || old_root.unmounting.load(Ordering::Acquire)
+        {
             return Err(VfsError::ResourceBusy);
         }
         if !entry_is_same_or_ancestor_by_inode(&new_root.root, put_old.entry()) {
             return Err(VfsError::InvalidInput);
-        }
-        let mut old_root = new_root.clone();
-        for _ in 0..=MAX_MOUNT_TREE_DEPTH {
-            if old_root.namespace_root.load(Ordering::Acquire) {
-                break;
-            }
-            old_root = old_root
-                .parent_mountpoint_locked()
-                .ok_or(VfsError::InvalidInput)?;
-        }
-        if !old_root.namespace_root.load(Ordering::Acquire)
-            || old_root.unmounting.load(Ordering::Acquire)
-        {
-            return Err(VfsError::ResourceBusy);
         }
 
         let new_location = new_root.location.lock();
@@ -1933,6 +1947,29 @@ impl Location {
         {
             return Err(VfsError::InvalidInput);
         }
+        drop(new_location);
+
+        // `root_parent = root_mnt->mnt_parent` (`fs/namespace.c`:4694): the
+        // mount the new root takes the old root's place under, and the
+        // mountpoint it inherits.
+        let root_location = old_root.location.lock();
+        let root_at = root_location.as_ref().ok_or(VfsError::InvalidInput)?;
+        let root_parent = root_at
+            .mountpoint
+            .upgrade()
+            .ok_or(VfsError::InvalidInput)?;
+        let root_key = root_at.entry.object_key();
+        let root_entry = root_at.entry.clone();
+        if !root_parent
+            .children
+            .lock()
+            .get(&root_key)
+            .is_some_and(|mount| Arc::ptr_eq(mount, old_root))
+        {
+            return Err(VfsError::InvalidInput);
+        }
+        drop(root_location);
+
         {
             let mut children = new_root.children.lock();
             if children.contains_key(&put_old_key) {
@@ -1943,7 +1980,13 @@ impl Location {
             // the tree completely untouched.
             children.try_reserve(1).map_err(|_| VfsError::NoMemory)?;
         }
-        drop(new_location);
+        // The new root needs a bucket in its new parent as well; it is reserved
+        // after the old root's edge is dropped, so this cannot overshoot.
+        root_parent
+            .children
+            .lock()
+            .try_reserve(1)
+            .map_err(|_| VfsError::NoMemory)?;
 
         // Validate before either edge is changed. The commit below allocates
         // nothing, so it cannot leave a partially pivoted namespace.
@@ -1959,15 +2002,30 @@ impl Location {
             return Err(VfsError::ResourceBusy);
         }
 
+        //     umount_mnt(new_mnt);
+        //     /* mount new_root on / */
+        //     attach_mnt(new_mnt, root_parent, root_mnt->mnt_mp);
+        //     umount_mnt(root_mnt);
+        //     /* mount old root on put_old */
+        //     attach_mnt(root_mnt, old_mnt, old_mp.mp);
+        // (`fs/namespace.c`:4726-4732)
         old_parent.children.lock().remove(&new_key);
         *new_root.location.lock() = None;
-        old_root.namespace_root.store(false, Ordering::Release);
-        *old_root.location.lock() = Some(MountLocation::new(put_old));
+        root_parent.children.lock().remove(&root_key);
+        *old_root.location.lock() = None;
+        root_parent
+            .children
+            .lock()
+            .insert(root_key, new_root.clone());
+        *new_root.location.lock() = Some(MountLocation::new(&Location::new_locked(
+            root_parent.clone(),
+            root_entry,
+        )));
         new_root
             .children
             .lock()
             .insert(put_old_key, old_root.clone());
-        new_root.namespace_root.store(true, Ordering::Release);
+        *old_root.location.lock() = Some(MountLocation::new(put_old));
         Mountpoint::refresh_subtree_handles_locked(&new_subtree);
         Mountpoint::refresh_subtree_handles_locked(&old_subtree);
         Ok(())
@@ -2463,9 +2521,15 @@ mod tests {
     }
 
     #[test]
-    fn pivot_root_replaces_the_namespace_root_without_a_transient_detach() {
-        let parent_filesystem = Filesystem::new(LookupTestFs::new(100));
-        let old_root_mount = Mountpoint::new_root(&parent_filesystem);
+    fn pivot_root_moves_the_filesystem_root_aside_and_keeps_the_namespace_root() {
+        // `init_mount_tree()`: the immutable nullfs is the namespace root and
+        // the mutable rootfs is layered on top of it.
+        let nullfs_filesystem = Filesystem::new(LookupTestFs::new(50));
+        let namespace_root_mount = Mountpoint::new_root(&nullfs_filesystem);
+        let namespace_root = namespace_root_mount.root_location();
+        let rootfs_filesystem = Filesystem::new(LookupTestFs::new(100));
+        let old_root_mount = Mountpoint::new_detached(&rootfs_filesystem).unwrap();
+        old_root_mount.attach_to(&namespace_root).unwrap();
         let old_root = old_root_mount.root_location();
         let mountpoint = old_root
             .lookup_no_follow_in_mount(FsName::new(b"child"))
@@ -2477,10 +2541,27 @@ mod tests {
             .lookup_no_follow_in_mount(FsName::new(b"child"))
             .unwrap();
 
-        new_root.pivot_root_to(&put_old).unwrap();
+        new_root.pivot_root_to(&old_root_mount, &put_old).unwrap();
 
-        assert!(new_mount.is_root());
+        // The namespace root is still the nullfs: `path_pivot_root()` attaches
+        // the new root to `root_parent`, it does not promote it.
+        assert!(namespace_root_mount.is_root());
+        assert!(!new_mount.is_root());
         assert!(!old_root_mount.is_root());
+        // The new root takes over the old root's mountpoint on the nullfs.
+        assert!(new_mount.location().is_some());
+        assert!(Arc::ptr_eq(new_root.mountpoint(), &new_mount));
+        assert_eq!(
+            new_mount
+                .location()
+                .map(|location| location.entry().name().as_bytes().to_vec()),
+            Some(Vec::new())
+        );
+        assert!(Arc::ptr_eq(
+            new_mount.location().unwrap().mountpoint(),
+            &namespace_root_mount
+        ));
+        // The old root is mounted at put_old inside the new root.
         assert!(old_root_mount.location().unwrap().ptr_eq(&put_old));
         assert!(
             new_root
