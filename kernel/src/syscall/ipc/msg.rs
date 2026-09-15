@@ -7,7 +7,7 @@ use alloc::{
 use core::{
     fmt::Write as _,
     mem::{align_of, offset_of, size_of},
-    sync::atomic::{AtomicI32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicI32, Ordering},
 };
 
 use axerrno::{AxError, AxResult, LinuxError};
@@ -549,14 +549,18 @@ impl PreparedMsgSet {
     }
 }
 
-static MSGMNI_LIMIT: AtomicUsize = AtomicUsize::new(MSGMNI);
-
+/// Linux `ns->msg_ctlmni`, the per-IPC-namespace message-queue ceiling.
+///
+/// The sysctl is registered per namespace (`ipc/ipc_sysctl.c:117-124`,
+/// `:262-279`), and `ipc_addid(..., ns->msg_ctlmni)` applies it to every
+/// allocation (`ipc/util.c:287-291`).  Zero is a legal value and refuses every
+/// new queue with ENOSPC; there is no "at least one" floor.
 pub(crate) fn msgmni_limit() -> usize {
-    MSGMNI_LIMIT.load(Ordering::Relaxed)
+    current().as_thread().ipc_ns().msgmni()
 }
 
-pub(crate) fn set_msgmni_limit(value: usize) {
-    MSGMNI_LIMIT.store(value.max(1), Ordering::Relaxed);
+pub(crate) fn set_msgmni_limit(value: usize) -> AxResult<()> {
+    current().as_thread().ipc_ns().set_msgmni(value)
 }
 
 pub(crate) fn msg_next_id() -> i32 {

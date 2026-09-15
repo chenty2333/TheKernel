@@ -41,6 +41,19 @@ pub(crate) struct IpcNamespace {
     msg_next_id: AtomicI32,
     sem_next_id: AtomicI32,
     shm_next_id: AtomicI32,
+    /// Linux `ns->msg_ctlmni`.  Each SysV ceiling is a sysctl of the *IPC
+    /// namespace*: `ipc/ipc_sysctl.c:117-124` registers the entry against
+    /// `init_ipc_ns.msg_ctlmni` and `setup_ipc_sysctls()` (`:262-279`) rebinds
+    /// it to the namespace being created, so a value written inside one
+    /// namespace is never observable in another.
+    msgmni: AtomicUsize,
+    /// Linux `ns->sem_ctls`: `{ semmsl, semmns, semopm, semmni }`, the SysV
+    /// semaphore ceilings of this IPC namespace
+    /// (`ipc/ipc_sysctl.c:145-160`, `ipc/sem.c:249-256`).
+    semmsl: AtomicUsize,
+    semmns: AtomicUsize,
+    semopm: AtomicUsize,
+    semmni: AtomicUsize,
 }
 
 impl IpcNamespace {
@@ -62,6 +75,11 @@ impl IpcNamespace {
             msg_next_id: AtomicI32::new(-1),
             sem_next_id: AtomicI32::new(-1),
             shm_next_id: AtomicI32::new(-1),
+            msgmni: AtomicUsize::new(msg::MSGMNI),
+            semmsl: AtomicUsize::new(sem::SEMMSL),
+            semmns: AtomicUsize::new(sem::SEMMNS),
+            semopm: AtomicUsize::new(sem::SEMOPM),
+            semmni: AtomicUsize::new(sem::SEMMNI),
         })
         .map_err(|_| AxError::NoMemory)
     }
@@ -101,6 +119,59 @@ impl IpcNamespace {
     }
     pub(crate) fn next_shm_id(&self) -> &AtomicI32 {
         &self.shm_next_id
+    }
+
+    /// Linux `ns->msg_ctlmni`.
+    pub(crate) fn msgmni(&self) -> usize {
+        self.msgmni.load(Ordering::Relaxed)
+    }
+
+    /// Store a new `msgmni`.
+    ///
+    /// Linux `ipc/ipc_sysctl.c:120-124` binds the entry to
+    /// `proc_dointvec_minmax` with `extra1 = SYSCTL_ZERO` and
+    /// `extra2 = &ipc_mni`, so a write outside `[0, ipc_mni]` fails with
+    /// EINVAL and leaves the stored value untouched.  `ipc_addid()` clamps
+    /// again defensively (`ipc/util.c:287-288`).
+    pub(crate) fn set_msgmni(&self, value: usize) -> AxResult<()> {
+        if value > tk_linux_ipc::IPCMNI as usize {
+            return Err(AxError::from(LinuxError::EINVAL));
+        }
+        self.msgmni.store(value, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn sem_limits(&self) -> (usize, usize, usize, usize) {
+        (
+            self.semmsl.load(Ordering::Relaxed),
+            self.semmns.load(Ordering::Relaxed),
+            self.semopm.load(Ordering::Relaxed),
+            self.semmni.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Store a new `/proc/sys/kernel/sem` tuple.
+    ///
+    /// Linux `ipc/ipc_sysctl.c:53-70,145-160` writes all four with
+    /// `proc_dointvec()` - no lower or upper bound - and then validates only
+    /// the identifier ceiling with `sem_check_semmni()`, which returns ERANGE
+    /// unless `semmni` is in `[0, ipc_mni]` (`ipc/util.h:248-255`); a failed
+    /// check restores the previous `semmni`.
+    pub(crate) fn set_sem_limits(
+        &self,
+        semmsl: usize,
+        semmns: usize,
+        semopm: usize,
+        semmni: usize,
+    ) -> AxResult<()> {
+        if semmni > tk_linux_ipc::IPCMNI as usize {
+            return Err(AxError::from(LinuxError::ERANGE));
+        }
+        self.semmsl.store(semmsl, Ordering::Relaxed);
+        self.semmns.store(semmns, Ordering::Relaxed);
+        self.semopm.store(semopm, Ordering::Relaxed);
+        self.semmni.store(semmni, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Whether the caller may write `/proc/sys/kernel/*_next_id`.

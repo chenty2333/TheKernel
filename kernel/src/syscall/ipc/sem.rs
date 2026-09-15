@@ -2,7 +2,7 @@ use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::{
     fmt::Write as _,
     mem::{align_of, offset_of, size_of},
-    sync::atomic::{AtomicI32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicI32, Ordering},
     time::Duration,
 };
 
@@ -37,7 +37,9 @@ const IPC_MODE_MASK: c_ushort = 0o777;
 const SEM_UNDO: i16 = 0x1000;
 
 pub const SEMMSL: usize = 32000;
-pub const SEMMNI: usize = 128;
+/// `include/uapi/linux/sem.h:80-81`: `SEMMNI 32000`, `SEMMNS (SEMMNI*SEMMSL)`;
+/// `ipc/sem.c:249-256` seeds each IPC namespace with those defaults.
+pub const SEMMNI: usize = 32000;
 pub const SEMMNS: usize = SEMMSL * SEMMNI;
 pub const SEMOPM: usize = 500;
 pub const SEMVMX: usize = 32767;
@@ -232,11 +234,6 @@ impl Default for SemUndo {
         Self::new()
     }
 }
-
-static SEM_MNI_LIMIT: AtomicUsize = AtomicUsize::new(SEMMNI);
-static SEM_MSL_LIMIT: AtomicUsize = AtomicUsize::new(SEMMSL);
-static SEM_MNS_LIMIT: AtomicUsize = AtomicUsize::new(SEMMNS);
-static SEM_OPM_LIMIT: AtomicUsize = AtomicUsize::new(SEMOPM);
 
 fn ipc_time_secs() -> __kernel_time_t {
     wall_time().as_secs() as __kernel_time_t
@@ -686,30 +683,49 @@ pub(crate) fn apply_sem_undo(manager: &Mutex<SemManager>, undo: &mut SemUndo) {
     }
 }
 
+/// The four ceilings of `/proc/sys/kernel/sem`, read from the caller's IPC
+/// namespace.
+///
+/// Linux keeps them in `struct ipc_namespace` (`ipc/sem.c:249-256`,
+/// `ipc/ipc_sysctl.c:145-160`); every namespace therefore starts from the
+/// `include/uapi/linux/sem.h:80-85` defaults and any sysctl write is local to
+/// it.
+fn sem_limit(index: usize) -> usize {
+    let limits = current().as_thread().ipc_ns().sem_limits();
+    match index {
+        0 => limits.0,
+        1 => limits.1,
+        2 => limits.2,
+        _ => limits.3,
+    }
+}
+
 pub(crate) fn semmni_limit() -> usize {
-    SEM_MNI_LIMIT.load(Ordering::Relaxed)
+    sem_limit(3)
 }
 
 pub(crate) fn semmsl_limit() -> usize {
-    SEM_MSL_LIMIT.load(Ordering::Relaxed)
+    sem_limit(0)
 }
 
 pub(crate) fn semmns_limit() -> usize {
-    SEM_MNS_LIMIT.load(Ordering::Relaxed)
+    sem_limit(1)
 }
 
 pub(crate) fn semopm_limit() -> usize {
-    SEM_OPM_LIMIT.load(Ordering::Relaxed)
+    sem_limit(2)
 }
 
-pub(crate) fn set_sem_limits(semmsl: usize, semmns: usize, semopm: usize, semmni: usize) {
-    let semmni = semmni.max(1);
-    let semmsl = semmsl.max(1);
-    let semmns = semmns.max(1);
-    SEM_MNI_LIMIT.store(semmni, Ordering::Relaxed);
-    SEM_MSL_LIMIT.store(semmsl, Ordering::Relaxed);
-    SEM_MNS_LIMIT.store(semmns, Ordering::Relaxed);
-    SEM_OPM_LIMIT.store(semopm.max(1), Ordering::Relaxed);
+pub(crate) fn set_sem_limits(
+    semmsl: usize,
+    semmns: usize,
+    semopm: usize,
+    semmni: usize,
+) -> AxResult<()> {
+    current()
+        .as_thread()
+        .ipc_ns()
+        .set_sem_limits(semmsl, semmns, semopm, semmni)
 }
 
 pub(crate) fn sem_limits_string() -> String {
