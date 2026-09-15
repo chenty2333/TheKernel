@@ -10,6 +10,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/capability.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -104,6 +105,7 @@
 
 #define SYSLOG_ACTION_READ_ALL 3
 #define SYSLOG_ACTION_CONSOLE_LEVEL 8
+#define SYSLOG_ACTION_SIZE_UNREAD 9
 #define SYSLOG_ACTION_SIZE_BUFFER 10
 
 #define LINUX_REBOOT_MAGIC1 0xfee1dead
@@ -163,6 +165,36 @@ static void check(int ok, const char *stage) {
 
 #define ERROR(call, expected, stage) do { errno = 0; long r_ = (call); \
     check(r_ == -1 && errno == (expected), (stage)); } while (0)
+
+/* The syslog capability test needs a caller that still holds CAP_SYS_ADMIN
+ * but not CAP_SYSLOG, which no uid transition can produce. */
+static int drop_capability(int capability) {
+    struct __user_cap_header_struct header = { .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0 };
+    struct __user_cap_data_struct data[2];
+    if (syscall(SYS_capget, &header, data) != 0) return -1;
+    data[capability / 32].effective &= ~(1U << (capability % 32));
+    return (int)syscall(SYS_capset, &header, data);
+}
+
+/* `struct fiemap` and `struct space_resv` in their native x86_64 layouts
+ * (include/uapi/linux/fiemap.h, include/uapi/linux/fs.h). */
+struct fsabi_fiemap_extent {
+    uint64_t fe_logical, fe_physical, fe_length;
+    uint64_t fe_reserved64[2];
+    uint32_t fe_flags, fe_reserved[3];
+};
+struct fsabi_fiemap {
+    uint64_t fm_start, fm_length;
+    uint32_t fm_flags, fm_mapped_extents, fm_extent_count, fm_reserved;
+    struct fsabi_fiemap_extent fm_extents[1];
+};
+struct fsabi_space_resv {
+    int16_t l_type, l_whence;
+    int64_t l_start, l_len;
+    int32_t l_sysid;
+    uint32_t l_pid;
+    int32_t l_pad[4];
+};
 
 static void drops_to(void) {
     /* Drop every capability so CAP_* gates are exercised for real. */
@@ -318,6 +350,21 @@ int main(void) {
         mark("CONSOLE_LEVEL_EINVAL");
         check(syscall(SYS_syslog, SYSLOG_ACTION_SIZE_BUFFER, NULL, 0) > 0, "size");
         mark("SIZE_BUFFER_POSITIVE");
+        /* `check_syslog_permissions()` (kernel/printk/printk.c:606-629) admits
+         * a restricted action only through `capable(CAP_SYSLOG)`; CAP_SYS_ADMIN
+         * is not an alternative, and SYSLOG_ACTION_SIZE_UNREAD is restricted
+         * because it is neither READ_ALL nor SIZE_BUFFER. */
+        pid_t child = fork();
+        check(child >= 0, "syslog-fork");
+        if (child == 0) {
+            int dropped = drop_capability(CAP_SYSLOG);
+            errno = 0;
+            long r = syscall(SYS_syslog, SYSLOG_ACTION_SIZE_UNREAD, NULL, 0);
+            _exit(dropped == 0 && r == -1 && errno == EPERM ? 0 : 1);
+        }
+        int status = 0;
+        check(waitpid(child, &status, 0) == child, "syslog-waitpid");
+        check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "syslog-cap-syslog-only");
     }
     done();
 

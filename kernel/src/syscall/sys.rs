@@ -9,7 +9,7 @@ use axhal::{time::monotonic_time, uspace::UserContext};
 use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::{
-    general::{CAP_SYS_ADMIN, CAP_SYSLOG, NGROUPS_MAX},
+    general::{CAP_SYSLOG, NGROUPS_MAX},
     system::{new_utsname, sysinfo},
 };
 use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_write_slice};
@@ -686,10 +686,26 @@ async fn wait_for_syslog_data(cursor: u64) {
     }
 }
 
+/// The privilege every `syslog(2)` action except the two unrestricted reads
+/// requires.
+///
+/// kernel/printk/printk.c:605-615 `syslog_action_restricted()` admits exactly
+/// two types without a capability:
+///     return type != SYSLOG_ACTION_READ_ALL &&
+///            type != SYSLOG_ACTION_SIZE_BUFFER;
+/// and kernel/printk/printk.c:617-629 `check_syslog_permissions()` then asks
+/// for one capability and one only:
+///     if (syslog_action_restricted(type)) {
+///             if (capable(CAP_SYSLOG))
+///                     goto ok;
+///             return -EPERM;
+///     }
+/// `CAP_SYS_ADMIN` is deliberately not accepted: `capable(CAP_SYSLOG)` is the
+/// only capability that clears the check.
 fn current_can_read_klog() -> bool {
     let current = current();
     let thread = current.as_thread();
-    thread.has_effective_capability(CAP_SYSLOG) || thread.has_effective_capability(CAP_SYS_ADMIN)
+    thread.has_effective_capability(CAP_SYSLOG)
 }
 
 fn syslog_copy<M: UserMemory + ?Sized>(
