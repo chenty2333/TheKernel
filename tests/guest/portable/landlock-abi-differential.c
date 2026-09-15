@@ -195,6 +195,7 @@ static char probe_socket[PATH_MAX + 16];
     } while (0)
 
 static int restrict_thread_body(void);
+static int restrict_tsync_nnp_body(void);
 static int restrict_single_thread_body(void);
 static int unix_outside_domain_body(void);
 static int unix_allow_rule_body(void);
@@ -221,6 +222,27 @@ static void *probe_thread(void *unused) {
     (void)unused;
     while (atomic_load_explicit(&probe_go, memory_order_acquire) == 0) sched_yield();
     atomic_store_explicit(&probe_result, probe_open(probe_target, O_RDONLY), memory_order_release);
+    return NULL;
+}
+
+static _Atomic int nnp_go;
+static _Atomic int nnp_result;
+
+/* A sibling thread that reports its own `no_new_privs` bit, which TSYNC is also
+ * responsible for setting (security/landlock/tsync.c):
+ *
+ * 	shared_ctx.set_no_new_privs = task_no_new_privs(current);
+ * 	...
+ * 	if (ctx->set_no_new_privs)
+ * 		task_set_no_new_privs(current);
+ *
+ * A synchronised sibling that kept the bit clear would drop the new domain at
+ * its next execve(2), so the bit is part of what TSYNC has to deliver. */
+static void *nnp_probe_thread(void *unused) {
+    (void)unused;
+    while (atomic_load_explicit(&nnp_go, memory_order_acquire) == 0) sched_yield();
+    long result = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+    atomic_store_explicit(&nnp_result, result < 0 ? -errno : (int)result, memory_order_release);
     return NULL;
 }
 
@@ -322,6 +344,31 @@ static int restrict_thread_body(void) {
     caller = probe_open(probe_file, O_RDONLY);
     if (sibling != EACCES) BODY_FAIL();
     if (caller != EACCES) BODY_FAIL();
+    return 0;
+}
+
+/* TSYNC delivers the caller's `no_new_privs` bit to the sibling as well.  The
+ * sibling is created before the caller sets the bit, so a sibling that reports
+ * it set can only have received it from the synchronisation; the pre-change
+ * kernel copied the domain alone and the sibling kept reporting 0. */
+static int restrict_tsync_nnp_body(void) {
+    struct ruleset_attr attr;
+    pthread_t thread;
+    long fd;
+
+    memset(&attr, 0, sizeof(attr));
+    attr.handled_access_fs = LANDLOCK_ACCESS_FS_READ_FILE;
+    atomic_store(&nnp_go, 0);
+    atomic_store(&nnp_result, PROBE_UNSET);
+    if (pthread_create(&thread, NULL, nnp_probe_thread, NULL) != 0) BODY_FAIL();
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) BODY_FAIL();
+    fd = ll_create_ruleset(&attr, sizeof(attr), 0);
+    if (fd < 0) BODY_FAIL();
+    if (ll_restrict_self((int)fd, LANDLOCK_RESTRICT_SELF_TSYNC) != 0) BODY_FAIL();
+    close((int)fd);
+    atomic_store_explicit(&nnp_go, 1, memory_order_release);
+    if (pthread_join(thread, NULL) != 0) BODY_FAIL();
+    if (atomic_load_explicit(&nnp_result, memory_order_acquire) != 1) BODY_FAIL();
     return 0;
 }
 
@@ -980,6 +1027,8 @@ static int restrict_self_case(void) {
 
     if (child_verdict(spawn(restrict_thread_body)) != 0) return fail("tsync-siblings");
     if (assert_ok(name, "TSYNC_SYNCHRONIZES_SIBLINGS")) return 1;
+    if (child_verdict(spawn(restrict_tsync_nnp_body)) != 0) return fail("tsync-no-new-privs");
+    if (assert_ok(name, "TSYNC_PROPAGATES_NO_NEW_PRIVS")) return 1;
     if (child_verdict(spawn(restrict_single_thread_body)) != 0) return fail("no-tsync-siblings");
     if (assert_ok(name, "NO_TSYNC_LEAVES_SIBLING")) return 1;
     return case_close(name);
