@@ -3224,7 +3224,7 @@ impl SimpleDirOps for ThreadDir {
         let pid_ns = self.pid_ns.clone();
         Ok(match name.as_bytes() {
             b"stat" => SimpleFile::new_regular(fs, move || {
-                Ok(render_task_stat(&task, &pid_ns, process_view)?.into_bytes())
+                render_task_stat(&task, &pid_ns, process_view)
             })
             .into(),
             b"status" => SimpleFile::try_new_regular_with_open_credential(fs, move || {

@@ -62,8 +62,27 @@ pub fn set_system_timezone(timezone: SystemTimezone) {
 /// by `do_sys_settimeofday64()` for the first stored timezone when that call
 /// does not set the clock itself (`kernel/time/time.c:194-200`).
 ///
-/// Linux injects `sys_tz.tz_minuteswest * 60` seconds into `CLOCK_REALTIME`
-/// through `timekeeping_inject_offset()`, so a guest that only calls
+/// Linux spends the `firsttime` one-shot on the first stored timezone whatever
+/// that call does with the clock, and warps only a store that carries no clock
+/// value:
+///
+/// ```c
+/// 		sys_tz = *tz;
+/// 		update_vsyscall_tz();
+/// 		if (firsttime) {
+/// 			firsttime = 0;
+/// 			if (!tv)
+/// 				timekeeping_warp_clock();
+/// 		}
+/// 	}
+/// 	if (tv)
+/// 		return do_settimeofday64(tv);
+/// 	return 0;
+/// ```
+///
+/// so `apply` is `tv == NULL` and the flag is consumed either way. Linux
+/// injects `sys_tz.tz_minuteswest * 60` seconds into `CLOCK_REALTIME` through
+/// `timekeeping_inject_offset()`, so a guest that only calls
 /// `settimeofday(NULL, &tz)` still observes a warped `CLOCK_REALTIME`.  The
 /// injection's guard is `timespec64_valid_settod()` on the result
 /// (`kernel/time/timekeeping.c:1714-1721`); the corresponding
@@ -75,25 +94,34 @@ pub fn set_system_timezone(timezone: SystemTimezone) {
 /// has no counterpart because TheKernel has no persistent clock to resume from.
 ///
 /// Returns whether the clock actually moved: a zero timezone, a second or later
-/// store, and a rejected bound all leave `CLOCK_REALTIME` alone.  The caller
-/// needs that distinction because only a real injection runs `ntp_clear()`
+/// store, an injection that would leave the settable range, and a store that
+/// carries a clock value all leave `CLOCK_REALTIME` alone.  The caller needs
+/// that distinction because only a real injection runs `ntp_clear()`
 /// (`timekeeping_inject_offset()`, `kernel/time/timekeeping.c:1786-1790`).
-pub fn warp_first_timezone(minutes_west: i32) -> AxResult<bool> {
+pub fn warp_first_timezone(minutes_west: i32, apply: bool) -> AxResult<bool> {
     // The one-shot is spent by the first stored timezone even when that
     // timezone moves nothing (`if (firsttime) { firsttime = 0; if (!tv)
-    // timekeeping_warp_clock(); }`), so the swap happens before the zero test.
-    // Reading the flag is also what keeps the write in the generated code: a
-    // store to a flag nothing reads is a dead store the optimiser removes.
+    // timekeeping_warp_clock(); }`), so the swap happens before the zero test,
+    // before `apply`, and before the injection can be rejected.  Reading the
+    // flag is also what keeps the write in the generated code: a store to a
+    // flag nothing reads is a dead store the optimiser removes.
     let owed = FIRST_TIMEZONE_WARP_OWED.swap(false, Ordering::AcqRel);
-    if minutes_west == 0 || !owed {
+    if minutes_west == 0 || !owed || !apply {
         return Ok(false);
     }
     let offset_nanos = minutes_west as i128 * 60 * NANOS_PER_SEC as i128;
     let target = wall_time_nanos() as i128 + offset_nanos;
-    // `__timekeeping_inject_offset()`'s `timespec64_valid_settod()` guard
-    // (`kernel/time/timekeeping.c:1717-1721`): the offset is applied before the
-    // timezone is stored, so a rejection leaves neither behind.
-    tk_linux_time::validate_settime_bound(target).map_err(|_| AxError::InvalidInput)?;
+    // `timekeeping_warp_clock()` ignores `timekeeping_inject_offset()`'s return
+    // value (`kernel/time/timekeeping.c:1781-1791`), and the injection fails
+    // exactly when the result leaves the settable range
+    // (`__timekeeping_inject_offset()`'s `timespec64_valid_settod()` guard,
+    // `kernel/time/timekeeping.c:1717-1721`). Linux therefore leaves
+    // `CLOCK_REALTIME` where it is and still returns 0 from
+    // `settimeofday(2)`; propagating `EINVAL` here would be an errno Linux
+    // never produces on this path.
+    if tk_linux_time::validate_settime_bound(target).is_err() {
+        return Ok(false);
+    }
     set_wall_time(TimeValue::from_nanos(target as u64))?;
     Ok(true)
 }

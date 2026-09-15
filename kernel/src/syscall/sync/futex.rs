@@ -360,6 +360,58 @@ fn fault_read_u32(caller: &UserMemoryCapability, address: usize) -> AxResult<u32
         .map_err(map_usercopy_error)
 }
 
+/// `fault_in_user_writeable()`: fault `uaddr` in for writing, or report the
+/// `-EFAULT` it returns.
+///
+/// Linux v7.2.3, `kernel/futex/core.c`:
+///
+/// ```c
+/// /**
+///  * fault_in_user_writeable() - Fault in user address and verify RW access
+///  * @uaddr:	pointer to faulting user space address
+///  *
+///  * Slow path to fixup the fault we just took in the atomic write
+///  * access to @uaddr.
+///  *
+///  * We have no generic implementation of a non-destructive write to the
+///  * user address. We know that we faulted in the atomic pagefault
+///  * disabled section so we can as well avoid the #PF overhead by
+///  * calling get_user_pages() right away.
+///  */
+/// int fault_in_user_writeable(u32 __user *uaddr)
+/// {
+/// 	struct mm_struct *mm = current->mm;
+/// 	int ret;
+///
+/// 	mmap_read_lock(mm);
+/// 	ret = fixup_user_fault(mm, (unsigned long)uaddr,
+/// 			       FAULT_FLAG_WRITE, NULL);
+/// 	mmap_read_unlock(mm);
+///
+/// 	return ret < 0 ? ret : 0;
+/// }
+/// ```
+///
+/// Every futex retry path calls this before looping, because the only fault a
+/// read can observe on a *resident* word is a leaf the caller may write but
+/// which the page table still maps read-only: the COW leaf `fork()` leaves
+/// behind, or one `mprotect(PROT_READ)` made read-only and a later
+/// `mprotect(PROT_READ|PROT_WRITE)` re-allowed. [`nofault_u32_read`] classifies
+/// that leaf as [`WaitConditionError::Retry`], and reading it again cannot clear
+/// it, so a retry step built only from reads spins in the kernel forever. A
+/// write fault either republishes the leaf -- after which the next nofault
+/// access succeeds and the futex call makes progress -- or fails, which is
+/// `-EFAULT` (`fixup_user_fault()` on an address no VMA backs, or on a VMA
+/// without write permission for this caller).
+///
+/// The fault-in is `check_user_writable_with()`, which populates the range for
+/// writing under the caller's capability without writing a byte into it, the
+/// same way `fixup_user_fault()` only makes the page writable: the futex word
+/// still holds whatever the failing nofault access observed.
+fn fault_in_user_writeable(caller: &UserMemoryCapability, address: usize) -> AxResult<()> {
+    check_user_writable_with(caller, address, size_of::<u32>())
+}
+
 fn checked_user_array_address<T>(
     base: *const T,
     count: usize,
@@ -1009,8 +1061,13 @@ fn do_futex_lock_pi(
         let observed =
             match nofault_u32_read(address, &caller_aspace, namespace, expected_key.as_ref()) {
                 Ok(observed) => observed,
+                // `futex_lock_pi_atomic()` reports a faulting word as `-EFAULT`
+                // and `futex_lock_pi()`'s `uaddr_faulted` path answers it with
+                // `fault_in_user_writeable()` -- the word is about to be
+                // written -- so a read-only resident leaf (a COW page) is
+                // repaired here instead of being retried unchanged.
                 Err(WaitConditionError::Retry) => {
-                    let _ = fault_read_u32(caller, address)?;
+                    fault_in_user_writeable(caller, address)?;
                     continue;
                 }
                 Err(WaitConditionError::Fault(error)) => return Err(error),
@@ -1111,10 +1168,22 @@ fn do_futex_lock_pi(
                     return decided;
                 }
                 if retry {
-                    let _ = fault_read_u32(caller, address)?;
+                    // `futex_lock_pi_atomic()`'s cmpxchg lost a race with
+                    // another task's word update and reported `-EAGAIN`, which
+                    // `futex_lock_pi()` retries after `cond_resched()` without
+                    // faulting anything in (`kernel/futex/pi.c:1034-1046`: the
+                    // `-EAGAIN` arm waits for an exiting owner and loops).
                     continue;
                 }
-                // Unreachable: the condition always either decides or waits.
+                // The registration condition always decides (`decided`) or asks
+                // for a retry, so reaching here means the wait queue declined
+                // without saying why.  Fault the word in for writing before
+                // looping, exactly as `futex_lock_pi()`'s `uaddr_faulted`
+                // handler does (`kernel/futex/pi.c:1179-1186`): the loop then
+                // either makes progress on the repaired word or ends in the
+                // `-EFAULT` a page it cannot write raises.  A bare `continue`
+                // would loop on a word this kernel cannot touch.
+                fault_in_user_writeable(caller, address)?;
                 continue;
             }
             Ok(true) => {
@@ -1132,8 +1201,13 @@ fn do_futex_lock_pi(
                 }
                 continue;
             }
+            // `futex_lock_pi()`'s `uaddr_faulted` path: the queue linearization
+            // point could not touch the word, so the page is faulted in for
+            // writing before the operation is retried, and the `-EFAULT`
+            // `fault_in_user_writeable()` reports when it cannot is what the
+            // caller sees instead of an unbreakable spin.
             Err(WaitConditionError::Retry) => {
-                let _ = fault_read_u32(caller, address)?;
+                fault_in_user_writeable(caller, address)?;
                 continue;
             }
             Err(WaitConditionError::Fault(error)) => return Err(error),
@@ -1184,35 +1258,59 @@ fn do_futex_unlock_pi(
         let pi_state = futex.existing_pi_state();
 
         let mut failure: Option<AxError> = None;
+        // `__futex_unlock_pi()` reads the word with `futex_get_value_locked()`
+        // and publishes the handoff with `futex_cmpxchg_value_locked()`; both
+        // report `-EFAULT` when user memory cannot be touched, and that errno
+        // is what `futex_unlock_pi()` returns -- it is never turned into a
+        // silent "the word did not match" retry. A word the caller *may* write
+        // but whose leaf is read-only is the `-EFAULT` those two operations
+        // raise, so it is repaired by `fault_in_user_writeable()` below.
+        fn published(
+            failure: &mut Option<AxError>,
+            result: WaitConditionResult<bool>,
+        ) -> bool {
+            match result {
+                Ok(applied) => applied,
+                Err(WaitConditionError::Fault(error)) => {
+                    *failure = Some(error);
+                    false
+                }
+                Err(WaitConditionError::Retry) => false,
+            }
+        }
         let publish = |next_owner: Option<u32>| -> bool {
             let observed =
                 match nofault_u32_read(address, &caller_aspace, namespace, expected_key.as_ref()) {
                     Ok(observed) => observed,
-                    Err(_) => return false,
+                    Err(error) => return published(&mut failure, Err(error)),
                 };
             match plan_pi_unlock(PiWord::decode(observed), tid, next_owner) {
                 PiUnlock::NotOwner => {
                     failure = Some(LinuxError::EPERM.into());
                     false
                 }
-                PiUnlock::Handoff { new_value } => futex_cas_at(
-                    address,
-                    namespace,
-                    expected_key.as_ref(),
-                    observed,
-                    new_value,
-                    &caller_aspace,
-                )
-                .unwrap_or(false),
-                PiUnlock::Clear { .. } => futex_cas_at(
-                    address,
-                    namespace,
-                    expected_key.as_ref(),
-                    observed,
-                    0,
-                    &caller_aspace,
-                )
-                .unwrap_or(false),
+                PiUnlock::Handoff { new_value } => published(
+                    &mut failure,
+                    futex_cas_at(
+                        address,
+                        namespace,
+                        expected_key.as_ref(),
+                        observed,
+                        new_value,
+                        &caller_aspace,
+                    ),
+                ),
+                PiUnlock::Clear { .. } => published(
+                    &mut failure,
+                    futex_cas_at(
+                        address,
+                        namespace,
+                        expected_key.as_ref(),
+                        observed,
+                        0,
+                        &caller_aspace,
+                    ),
+                ),
             }
         };
 
@@ -1240,7 +1338,12 @@ fn do_futex_unlock_pi(
                 if let Some(error) = failure {
                     return Err(error);
                 }
-                let _ = fault_read_u32(caller, address)?;
+                // `pi_faulted:` -- `fault_in_user_writeable(uaddr)`, then
+                // `goto retry` when it succeeded (`kernel/futex/pi.c:1361-1367`).
+                // A resident word the caller may write whose leaf the page table
+                // still marks read-only is repaired here; a word no VMA backs is
+                // the `-EFAULT` this propagates.
+                fault_in_user_writeable(caller, address)?;
             }
         }
     }
@@ -1475,23 +1578,36 @@ fn do_futex_cmp_requeue_pi(
                     target_expected.as_ref(),
                 ) {
                     Ok(observed) => observed,
-                    Err(_) => return false,
+                    // `futex_proxy_trylock_atomic()` reads the target with
+                    // `get_futex_value_locked()` and takes it with
+                    // `futex_cmpxchg_value_locked()`; both report `-EFAULT` for
+                    // user memory they cannot touch, and `futex_requeue()`
+                    // returns that errno rather than retrying it away.
+                    Err(WaitConditionError::Fault(error)) => {
+                        failure = Some(error);
+                        return false;
+                    }
+                    Err(WaitConditionError::Retry) => return false,
                 };
                 if PiWord::decode(observed).is_owned() {
                     failure = Some(AxError::WouldBlock);
                     return false;
                 }
-                if !futex_cas_at(
+                match futex_cas_at(
                     target,
                     target_namespace,
                     target_expected.as_ref(),
                     observed,
                     pi_handoff_value(top_tid),
                     &caller_aspace,
-                )
-                .unwrap_or(false)
-                {
-                    return false;
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => return false,
+                    Err(WaitConditionError::Fault(error)) => {
+                        failure = Some(error);
+                        return false;
+                    }
+                    Err(WaitConditionError::Retry) => return false,
                 }
                 promoted = Some(top_tid);
                 true
@@ -1541,6 +1657,15 @@ fn do_futex_cmp_requeue_pi(
                     return Err(error);
                 }
                 let _ = &source_expected;
+                // The publication lost the race against userspace, so
+                // `futex_requeue()` loops back to its `retry:` label -- and the
+                // first thing that label does is fault the target word in for
+                // writing, because the next step writes it
+                // (`fault_in_user_writeable(uaddr2)`,
+                // `kernel/futex/requeue.c:559-565`).  A target whose leaf is
+                // read-only although the caller may write it is exactly the
+                // state that makes the read below report a retry forever.
+                fault_in_user_writeable(caller, target)?;
                 if requeue_mapping_check(private, source_namespace) {
                     let _ = fault_read_u32(caller, source)?;
                 }
@@ -1709,6 +1834,17 @@ pub fn sys_futex(
                 match result {
                     Ok(count) => return Ok(count as _),
                     Err(WaitConditionError::Retry) => {
+                        // `futex_wake_op()` reads the failing
+                        // `futex_atomic_op_inuser()` on `uaddr2` as `-EFAULT`
+                        // and repairs it with `fault_in_user_writeable(uaddr2)`
+                        // before retrying; only `-EAGAIN` retries without a
+                        // fault (`kernel/futex/waitwake.c:302-325`).  A word
+                        // the caller may write whose leaf the page table still
+                        // marks read-only raises exactly that `-EFAULT`, so the
+                        // retry below needs the same write fault: reading the
+                        // word again cannot clear the read-only leaf and would
+                        // spin in the kernel forever.
+                        fault_in_user_writeable(&caller, uaddr2.addr())?;
                         let _ = fault_read_u32(&caller, uaddr.addr())?;
                         let _ = fault_read_u32(&caller, uaddr2.addr())?;
                     }

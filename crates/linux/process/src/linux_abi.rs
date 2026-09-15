@@ -110,6 +110,52 @@ pub const fn prctl_set_name_read_bound() -> usize {
     TASK_COMM_LEN - 1
 }
 
+/// The bytes `/proc/<pid>/stat` prints between its field-1 parentheses.
+///
+/// Linux v7.2.3, `fs/proc/array.c`, inside `do_task_stat()`:
+///
+/// ```c
+/// 	seq_puts(m, " (");
+/// 	proc_task_name(m, task, false);
+/// 	seq_puts(m, ") ");
+/// ```
+///
+/// and `proc_task_name()` with `escape = false`:
+///
+/// ```c
+/// void proc_task_name(struct seq_file *m, struct task_struct *p, bool escape)
+/// {
+/// 	char tcomm[64];
+/// 	...
+/// 	else
+/// 		get_task_comm(tcomm, p);
+///
+/// 	if (escape)
+/// 		seq_escape_str(m, tcomm, ESCAPE_SPACE | ESCAPE_SPECIAL, "\n\\");
+/// 	else
+/// 		seq_printf(m, "%.64s", tcomm);
+/// }
+/// ```
+///
+/// `get_task_comm()` is `strscpy_pad()` out of `task_struct::comm` and `%.64s`
+/// stops at the first NUL byte, so the field is the task's raw byte image up to
+/// `TASK_COMM_LEN`. `PR_SET_NAME` copies bytes out of userspace without any
+/// UTF-8 validation, so a name is a byte string: converting it to a `str` here
+/// would fabricate bytes Linux never produces.
+///
+/// `comm` may be the NUL-trimmed name (what [`TaskComm::as_bytes`] produces) or
+/// the complete `TASK_COMM_LEN` image ([`TaskComm::raw`]); the padding is
+/// dropped either way, and the `min(TASK_COMM_LEN)` bound mirrors the fixed
+/// size of the image `strscpy_pad()` writes.
+pub fn proc_stat_comm_field(comm: &[u8]) -> &[u8] {
+    let bounded = &comm[..comm.len().min(TASK_COMM_LEN)];
+    let len = bounded
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bounded.len());
+    &bounded[..len]
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessAbiError {
     InvalidFlags,
@@ -1088,5 +1134,33 @@ mod tests {
         assert_eq!(plan.set_tid.count(), 0);
         assert_eq!(plan.set_tid.address(), 0);
         assert_eq!(plan.set_tid.validate_values(&[]), Ok(()));
+    }
+
+    #[test]
+    fn stat_comm_field_keeps_raw_bytes_and_never_grows() {
+        // `PR_SET_NAME` copies at most `TASK_COMM_LEN - 1` bytes without
+        // validating them, so a fifteen-byte name whose last byte starts a
+        // UTF-8 sequence is a legal `comm`. `proc_task_name()` prints the image
+        // through `%.64s`, which cannot change its length: the field is the
+        // fifteen bytes that were stored, not fourteen plus U+FFFD.
+        let partial = b"aaaaaaaaaaaaaa\xc3";
+        assert_eq!(proc_stat_comm_field(partial), partial);
+        assert_eq!(proc_stat_comm_field(partial).len(), TASK_COMM_LEN - 1);
+        // A two-byte prefix of a three-byte sequence is the other shape of the
+        // same rule.
+        let truncated = b"aaaaaaaaaaaaa\xe2\x82";
+        assert_eq!(proc_stat_comm_field(truncated), truncated);
+        // The complete image is bounded at `TASK_COMM_LEN` and stops at the NUL
+        // `strscpy_pad()` leaves behind, so the padding is not printed.
+        let mut image = [0u8; TASK_COMM_LEN + 4];
+        let stored = b"abc\x80\xffdefghijkl";
+        image[..stored.len()].copy_from_slice(stored);
+        assert_eq!(proc_stat_comm_field(&image), stored);
+        // An image without a NUL is truncated to the field size, never copied
+        // whole.
+        let full = [b'x'; TASK_COMM_LEN + 1];
+        assert_eq!(proc_stat_comm_field(&full).len(), TASK_COMM_LEN);
+        // An empty name prints nothing.
+        assert_eq!(proc_stat_comm_field(&[0; TASK_COMM_LEN]), b"");
     }
 }

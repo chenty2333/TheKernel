@@ -171,6 +171,10 @@ const SETNS_PIDFD_ALLOWED_FLAGS: u32 = CLONE_NEWNS
 fn mempolicy_error(error: MempolicyError) -> AxError {
     match error {
         MempolicyError::MoveAllNotPermitted => AxError::OperationNotPermitted,
+        // `get_bitmap()` reports a failed `copy_from_user()` as `-EFAULT`;
+        // `read_nodemask()` faults the complete window in first, so the crate
+        // only reaches this arm when its own caller-contract is violated.
+        MempolicyError::NodeMaskUnreadable => AxError::BadAddress,
         MempolicyError::InvalidMode
         | MempolicyError::NodeMaskTooLong
         | MempolicyError::NodeOutOfRange
