@@ -827,14 +827,24 @@ int main(void) {
         check(syscall(SYS_tee, file, dst[1], 8, 0) == -1 && errno == EINVAL,
               "non-pipe");
         mark("FD_BEFORE_TYPE_EINVAL");
+        /*
+         * do_tee() tests the descriptor modes before it compares the pipes:
+         *     if (unlikely(!(in->f_mode & FMODE_READ) ||
+         *                  !(out->f_mode & FMODE_WRITE)))
+         *             return -EBADF;
+         *     if (ipipe && opipe && ipipe != opipe) { ... }
+         * so a read end used as the *output* is EBADF even though it names the
+         * same pipe, while the read and write ends of one pipe carry the right
+         * modes and fall through to the initialised -EINVAL.
+         */
         errno = 0;
-        check(syscall(SYS_tee, src[0], src[0], 8, 0) == -1 && errno == EINVAL,
-              "same-pipe");
+        check(syscall(SYS_tee, src[0], src[0], 8, 0) == -1 && errno == EBADF,
+              "same-fd-ebadf");
         errno = 0;
         check(syscall(SYS_tee, src[1], dst[1], 8, 0) == -1 && errno == EBADF,
               "wrong-ends");
-        check(syscall(SYS_tee, src[0], src[1], 8, 0) == -1 && errno == EBADF,
-              "write-to-self");
+        check(syscall(SYS_tee, src[0], src[1], 8, 0) == -1 && errno == EINVAL,
+              "same-pipe-einval");
         mark("SAME_PIPE_EINVAL");
         check(write(src[1], "abcdefgh", 8) == 8, "seed");
         check(syscall(SYS_tee, src[0], dst[1], 8, 0) == 8, "tee");
