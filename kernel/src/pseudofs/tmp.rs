@@ -22,8 +22,9 @@ use axfs_ng_vfs::{
     DirNodeOps, ExportHandle, ExportHandleMode, FileAttr, FileAttrProvider, FileNode, FileNodeOps,
     FileRangeOperation, FileRangeRequest, Filesystem, FilesystemOps, FsName, FsNameBuf, FsPath,
     FsPathBuf, Metadata, MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission,
-    NodeType, NodeUserData, Reference, RenameExchangeRequest, RenameRequest, StatFs, UnlinkRequest,
-    VfsError, VfsResult, WeakDirEntry, XattrProvider, XattrSetMode, path::MAX_NAME_LEN,
+    NodeType, NodeUserData, RangeMutation, Reference, RenameExchangeRequest, RenameRequest, StatFs,
+    UnlinkRequest, VfsError, VfsResult, WeakDirEntry, XattrProvider, XattrSetMode,
+    path::MAX_NAME_LEN,
 };
 use axhal::{mem::total_ram_size, paging::PageSize, time::wall_time};
 use axpoll::{IoEvents, Pollable};
@@ -995,7 +996,7 @@ impl FileContent {
 
     /// Performs a typed native range mutation while retaining tmpfs's sparse
     /// backing and exact page-capacity accounting.
-    fn mutate_range(&self, fs: &MemoryFs, request: FileRangeRequest) -> VfsResult<()> {
+    fn mutate_range(&self, fs: &MemoryFs, request: FileRangeRequest) -> VfsResult<RangeMutation> {
         let _mutation = self.huge_mutation.lock();
         let size = *self.length.lock();
         let end = request.end();
@@ -1110,7 +1111,7 @@ impl FileContent {
                     }
                 }
             }
-            return Ok(());
+            return Ok(RangeMutation::Applied);
         }
         match request.operation {
             FileRangeOperation::Allocate { keep_size } => {
@@ -1174,7 +1175,7 @@ impl FileContent {
                     .map_err(VfsError::from)?;
             }
         }
-        Ok(())
+        Ok(RangeMutation::Applied)
     }
 
     fn collapse_range(&self, fs: &MemoryFs, offset: u64, len: u64) -> AxResult<()> {
@@ -1970,7 +1971,7 @@ impl XattrProvider for MemoryNode {
 }
 
 impl FileNodeOps for MemoryNode {
-    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<()> {
+    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<RangeMutation> {
         let file = self.inode.as_file()?;
         file.mutate_range(&self.fs, request)
     }

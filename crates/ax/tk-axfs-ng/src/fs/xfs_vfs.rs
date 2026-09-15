@@ -21,8 +21,8 @@ use axfs_ng_vfs::{
     ExportHandle, FileAttr, FileAttrProvider, FileNode, FileNodeOps, FileRangeOperation,
     FileRangeRequest, Filesystem, FilesystemOps, FsName, Metadata, MetadataUpdate,
     MetadataUpdateCapabilities, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData,
-    ObjectKey, QuotaOps, QuotaUsage, Reference, StatFs, Timestamp, VfsError, VfsResult,
-    WeakDirEntry, XattrProvider, XattrSetMode,
+    ObjectKey, QuotaOps, QuotaUsage, RangeMutation, Reference, StatFs, Timestamp, VfsError,
+    VfsResult, WeakDirEntry, XattrProvider, XattrSetMode,
 };
 use axhal::time::wall_time;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
@@ -940,7 +940,7 @@ impl FileNodeOps for XfsVfsNode {
             .truncate(self.inode, len)
             .map_err(vfs)
     }
-    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<()> {
+    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<RangeMutation> {
         let mount = self
             .fs
             .mount
@@ -965,7 +965,8 @@ impl FileNodeOps for XfsVfsNode {
             FileRangeOperation::InsertRange => mount
                 .insert_range(self.inode, request.offset, request.length)
                 .map_err(vfs),
-        }
+        }?;
+        Ok(RangeMutation::Applied)
     }
     fn set_symlink(&self, target: &axfs_ng_vfs::FsPath) -> VfsResult<()> {
         let bytes = target.as_bytes();

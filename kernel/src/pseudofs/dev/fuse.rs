@@ -26,8 +26,8 @@ use axfs_ng_vfs::{
     FileAttr, FileAttrProvider, FileLock, FileNode, FileNodeOps, FileRangeOperation,
     FileRangeRequest, Filesystem, FilesystemOps, FsName, FsNameBuf, Location, LockOps, Metadata,
     MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps, NodePermission, NodeType, NodeUserData,
-    NowaitAdmission, ObjectKey, Reference, RenameRequest, StatFs, Timestamp, UnlinkRequest,
-    VfsError, VfsResult, WeakDirEntry, XattrProvider, XattrSetMode,
+    NowaitAdmission, ObjectKey, RangeMutation, Reference, RenameRequest, StatFs, Timestamp,
+    UnlinkRequest, VfsError, VfsResult, WeakDirEntry, XattrProvider, XattrSetMode,
 };
 use axio::prelude::*;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable};
@@ -5215,7 +5215,7 @@ impl FileNodeOps for FuseOpenFile {
     fn nowait_write_admit(&self, _offset: u64, _length: usize) -> VfsResult<NowaitAdmission> {
         Ok(NowaitAdmission::WouldBlock)
     }
-    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<()> {
+    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<RangeMutation> {
         let mode = match request.operation {
             FileRangeOperation::Allocate { keep_size: false } => 0,
             FileRangeOperation::Allocate { keep_size: true } => 0x01,
@@ -5227,6 +5227,7 @@ impl FileNodeOps for FuseOpenFile {
             FileRangeOperation::UnshareRange => 0x40,
         };
         self.fallocate(mode, request.offset, request.length)
+            .map(|()| RangeMutation::Applied)
             .map_err(VfsError::from)
     }
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {

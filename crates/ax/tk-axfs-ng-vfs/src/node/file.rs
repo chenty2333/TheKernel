@@ -35,6 +35,25 @@ pub enum FileRangeOperation {
     UnshareRange,
 }
 
+/// Provider answer to a [`FileNodeOps::mutate_range`] request.
+///
+/// A provider that owns the requested operation answers
+/// [`RangeMutation::Applied`], or an error describing its own refusal.  A
+/// provider that implements no native handler for the operation answers
+/// [`RangeMutation::NotNative`], which lets the Linux adapter run its generic
+/// emulation for that operation.  Reporting a refusal error for an
+/// unimplemented operation instead would erase the distinction Linux draws:
+/// `vfs_fallocate()` answers `EOPNOTSUPP` when the file has no `->fallocate`
+/// at all, while an operation its `->fallocate` owns and rejects reports that
+/// filesystem's own error (`fs/open.c`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RangeMutation {
+    /// The provider performed the mutation natively.
+    Applied,
+    /// The provider implements no native handler for this operation.
+    NotNative,
+}
+
 /// One overflow-checked file range operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileRangeRequest {
@@ -970,10 +989,15 @@ pub trait FileNodeOps: NodeOps + Pollable {
     /// The high-level file layer has already serialized the operation with
     /// page-cache writeback and invalidated aliases.  Providers must commit
     /// data and allocation metadata atomically according to their native
-    /// transaction model; unsupported filesystems return the conservative
-    /// default without changing data.
-    fn mutate_range(&self, _request: FileRangeRequest) -> VfsResult<()> {
-        Err(VfsError::OperationNotSupported)
+    /// transaction model.
+    ///
+    /// Returning [`RangeMutation::NotNative`] states that this provider owns
+    /// no handler for `request.operation`; the Linux adapter then runs the
+    /// generic emulation for it.  A provider that does own the operation must
+    /// report its own refusal as an error rather than as `NotNative`, because
+    /// the two produce different Linux errnos.
+    fn mutate_range(&self, _request: FileRangeRequest) -> VfsResult<RangeMutation> {
+        Ok(RangeMutation::NotNative)
     }
 
     /// Reads a number of bytes starting from a given offset.

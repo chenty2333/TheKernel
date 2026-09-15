@@ -20,8 +20,8 @@ use axfs_ng_vfs::{
     ImmediateFileIoResult, Metadata, MetadataCapabilities, MetadataUpdate, NamedCreateOptions, NodeFlags, NodeOps,
     NodePermission, NodeType, NodeUserData, ObjectKey, PhysicalIoAttempt,
     PhysicalIoNotSubmittedReason, PhysicalIoSegment, PreparedFileIo, PreparedFileIoSubmission,
-    Reference, RenameRequest, SubmittedFileIo, SubmittedFileIoControl, UnlinkRequest, VfsError,
-    VfsResult, WeakDirEntry, WritebackErrorState, XattrProvider, XattrSetMode,
+    RangeMutation, Reference, RenameRequest, SubmittedFileIo, SubmittedFileIoControl, UnlinkRequest,
+    VfsError, VfsResult, WeakDirEntry, WritebackErrorState, XattrProvider, XattrSetMode,
 };
 use axhal::time::wall_time;
 use axpoll::{IoEvents, PollRegistration, PollRegistrationError, Pollable};
@@ -1186,11 +1186,11 @@ impl FileNodeOps for Inode {
         true
     }
 
-    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<()> {
+    fn mutate_range(&self, request: FileRangeRequest) -> VfsResult<RangeMutation> {
         let size = <Self as NodeOps>::len(self)?;
         let end = request.end();
         let mut fs = self.fs.lock();
-        match request.operation {
+        let mutated = match request.operation {
             FileRangeOperation::Allocate { keep_size } => fs
                 .allocate_range(self.ino(), request.offset, request.length, keep_size)
                 .map_err(into_vfs_err),
@@ -1231,10 +1231,14 @@ impl FileNodeOps for Inode {
                 // FALLOC_FL_UNSHARE_RANGE is absent from that mask, so ext4
                 // answers -EOPNOTSUPP even though vfs_fallocate accepts the
                 // mode.  This backend has no reflink extents either, so there
-                // is nothing to unshare and no early-success shortcut.
+                // is nothing to unshare and no early-success shortcut.  This is
+                // the provider's own refusal, not a missing handler: reporting
+                // `NotNative` here would let the generic emulation answer the
+                // mode that ext4 refuses.
                 Err(VfsError::OperationNotSupported)
             }
-        }
+        };
+        mutated.map(|()| RangeMutation::Applied)
     }
 
     fn syncfs_writeback_error_state(&self) -> Option<Arc<WritebackErrorState>> {
