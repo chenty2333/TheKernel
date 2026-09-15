@@ -18,8 +18,8 @@ use smoltcp::{
 };
 
 use crate::{
-    Ipv6AddrFormError, RecvFlags, RecvOptions, SendOptions, Shutdown, Socket, SocketAddrEx,
-    SocketOps,
+    Ipv6AddrFormError, RecvFlags, RecvOptions, SendFlags, SendOptions, Shutdown, Socket,
+    SocketAddrEx, SocketOps,
     buffer::try_zeroed_socket_buffer,
     consts::{LOOPBACK_TCP_MSS, TCP_RX_BUF_LEN, TCP_TX_BUF_LEN},
     general::GeneralOptions,
@@ -62,6 +62,11 @@ pub struct TcpSocket {
     general: GeneralOptions,
     rx_closed: AtomicBool,
     tx_closed: AtomicBool,
+    /// `MSG_MORE` carry-over between sends.  Linux keeps the equivalent
+    /// `TCP_NAGLE_CORK` in `tp->nonagle` for the duration of the corked
+    /// sequence, and `tcp_push()` releases it on the first send that does not
+    /// carry `MSG_MORE`.
+    send_corked: AtomicBool,
     poll_rx_closed: PollSet,
 }
 
@@ -154,6 +159,7 @@ impl TcpSocket {
             general: GeneralOptions::new(),
             rx_closed: AtomicBool::new(false),
             tx_closed: AtomicBool::new(false),
+            send_corked: AtomicBool::new(false),
             poll_rx_closed: PollSet::new(),
         })
     }
@@ -168,6 +174,7 @@ impl TcpSocket {
             general: GeneralOptions::new(),
             rx_closed: AtomicBool::new(false),
             tx_closed: AtomicBool::new(false),
+            send_corked: AtomicBool::new(false),
             poll_rx_closed: PollSet::new(),
         };
         let bound_endpoint = result.with_smol_socket(|socket| socket.get_bound_endpoint());
@@ -651,10 +658,20 @@ impl SocketOps for TcpSocket {
         if self.tx_closed.load(Ordering::Acquire) {
             return Err(AxError::BrokenPipe);
         }
+        // Linux `tcp_sendmsg_locked()` pushes the write queue on entry to the
+        // send with `flags & ~MSG_MORE`, which is what releases a cork left by
+        // an earlier `MSG_MORE` send.  `tcp_push()` then marks the tail segment
+        // for transmission, so the merged buffer leaves as one transmission
+        // instead of the previous partial one being flushed first.
+        let uncork = self
+            .send_corked
+            .swap(options.flags.contains(SendFlags::MORE), Ordering::AcqRel);
         self.general
             .send_poller_with_effective_nonblocking(self, effective_nonblocking, || {
-                self.stack.poll_interfaces();
-                self.with_smol_socket(|socket| {
+                if !uncork {
+                    self.stack.poll_interfaces();
+                }
+                let sent = self.with_smol_socket(|socket| {
                     self.record_transport_failure(socket);
                     self.general.consume_pending_error()?;
                     if !socket.may_send() && self.state() == State::Connected {
@@ -674,7 +691,11 @@ impl SocketOps for TcpSocket {
                             .map_err(|_| ax_err_type!(NotConnected, "not connected?"))??;
                         Ok(len)
                     }
-                })
+                });
+                if uncork {
+                    self.stack.poll_interfaces();
+                }
+                sent
             })
     }
 
