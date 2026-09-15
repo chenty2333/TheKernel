@@ -137,10 +137,23 @@ const UNSHARE_INERT_FLAGS: u32 = CLONE_THREAD | CLONE_SIGHAND | CLONE_VM;
 ///
 /// `CLONE_NS_ALL` is `CLONE_NEWTIME|CLONE_NEWNS|CLONE_NEWCGROUP|CLONE_NEWUTS|
 /// CLONE_NEWIPC|CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET`, all of which are
-/// listed literally in `UNSHARE_SUPPORTED_FLAGS`.  `UNSHARE_EMPTY_MNTNS`
-/// (0x00100000, which aliases `CLONE_PARENT_SETTID`) is the one member of the
-/// Linux mask TheKernel still rejects; it asks for an *empty* mount namespace,
-/// which has no equivalent here.
+/// listed literally in `UNSHARE_SUPPORTED_FLAGS`.  `UNSHARE_EMPTY_MNTNS` is
+/// the one member of the Linux mask TheKernel still rejects, and it is the
+/// 32-bit *unshare-only* spelling at `include/uapi/linux/sched.h:54`:
+///
+/// ```c
+/// #define UNSHARE_EMPTY_MNTNS 0x00100000 /* Unshare an empty mount namespace. */
+/// ```
+///
+/// It is not `CLONE_EMPTY_MNTNS` (`1ULL << 37`, sched.h:42), which is a
+/// `clone3`-only 64-bit flag and is rejected by the argument-width check above
+/// exactly as Linux's `check_unshare_flags()` mask rejects it.  Linux accepts
+/// `UNSHARE_EMPTY_MNTNS` (it aliases `CLONE_PARENT_SETTID`) and converts it to
+/// `CLONE_EMPTY_MNTNS` in `unshare_nsproxy_namespaces()` (kernel/nsproxy.c);
+/// `copy_mnt_ns()` then builds a namespace holding only a clone of the current
+/// root mount and resets `fs->root`/`fs->pwd` to it (fs/namespace.c).  TheKernel
+/// has no root-mount-only mount-namespace constructor, so it still refuses the
+/// bit with -EINVAL instead of creating that namespace.
 const UNSHARE_RECOGNIZED_FLAGS: u32 =
     UNSHARE_SUPPORTED_FLAGS | UNSHARE_INERT_FLAGS;
 const SETNS_PIDFD_ALLOWED_FLAGS: u32 = CLONE_NEWNS
@@ -747,11 +760,25 @@ pub fn sys_unshare(flags: usize) -> AxResult<isize> {
     if flags & !UNSHARE_RECOGNIZED_FLAGS != 0 {
         return Err(AxError::InvalidInput);
     }
-    // Linux rejects this incompatible pair before it prepares any namespace
-    // object or touches user-controlled state.
-    if flags & (CLONE_NEWIPC | CLONE_SYSVSEM) == (CLONE_NEWIPC | CLONE_SYSVSEM) {
-        return Err(AxError::InvalidInput);
-    }
+    // `CLONE_NEWIPC|CLONE_SYSVSEM` is *not* rejected here.  The only pair check
+    // in Linux is in `copy_namespaces()` (kernel/nsproxy.c), which is the
+    // `clone(2)` path:
+    //
+    // 	if ((flags & (CLONE_NEWIPC | CLONE_SYSVSEM)) ==
+    // 		(CLONE_NEWIPC | CLONE_SYSVSEM))
+    // 		return -EINVAL;
+    //
+    // `ksys_unshare()` never calls it: `check_unshare_flags()` admits both bits
+    // (they are in its mask) and `ksys_unshare()` then only records that the
+    // caller has to leave the old semaphore undolist:
+    //
+    // 	if (unshare_flags & (CLONE_NEWIPC|CLONE_SYSVSEM))
+    // 		do_sysvsem = 1;
+    //
+    // so a privileged `unshare(CLONE_NEWIPC|CLONE_SYSVSEM)` succeeds, and an
+    // unprivileged one fails in `unshare_nsproxy_namespaces()` with the
+    // `CAP_SYS_ADMIN` admission below -- -EPERM, not -EINVAL.  Rejecting the
+    // pair here made both callers diverge.
     let curr = current();
     let thread = curr.as_thread();
     // kernel/fork.c `check_unshare_flags()`, the three constraint blocks:
