@@ -300,8 +300,18 @@ fn notify_reaper_of_inherited_zombie(child: &Arc<Process>) {
     let Ok(parent_data) = get_process_data(parent.pid()) else {
         return;
     };
+    let child_autoreap = get_process_data(child.pid()).is_ok_and(|data| {
+        // A traced child still has to stop for its tracer, so `do_notify_parent()`
+        // only honours the bit for an untraced task.
+        data.autoreap() && data.ptrace_active_session().is_none()
+    });
 
-    let (auto_reap, suppress_exit_signal) = if child.exit_signal() == Some(Signo::SIGCHLD as u8) {
+    let (auto_reap, suppress_exit_signal) = if child_autoreap {
+        // `do_notify_parent()` short-circuits on the child's own
+        // `signal_struct::autoreap`: the exit signal is dropped and the child
+        // is released as it exits, whatever the parent asked for.
+        (true, true)
+    } else if child.exit_signal() == Some(Signo::SIGCHLD as u8) {
         parent_sigchld_autoreap(&parent_data)
     } else {
         (false, false)
@@ -2490,15 +2500,20 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         let parent_data = parent
             .as_ref()
             .and_then(|parent| get_process_data(parent.pid()).ok());
-        let (auto_reap, suppress_exit_signal) = if thr.proc_data.exit_signal == Some(Signo::SIGCHLD)
-        {
-            parent_data
-                .as_ref()
-                .map(|parent| parent_sigchld_autoreap(parent))
-                .unwrap_or((false, false))
-        } else {
-            (false, false)
-        };
+        let (auto_reap, suppress_exit_signal) =
+            if thr.proc_data.autoreap() && thr.proc_data.ptrace_active_session().is_none() {
+                // `clone3(CLONE_AUTOREAP)` made this child self-reaping: it drops
+                // its exit signal and is released without becoming a zombie, so
+                // `wait()` on it reports ECHILD rather than a status.
+                (true, true)
+            } else if thr.proc_data.exit_signal == Some(Signo::SIGCHLD) {
+                parent_data
+                    .as_ref()
+                    .map(|parent| parent_sigchld_autoreap(parent))
+                    .unwrap_or((false, false))
+            } else {
+                (false, false)
+            };
 
         for step in child_exit_completion_steps(auto_reap, suppress_exit_signal)
             .into_iter()

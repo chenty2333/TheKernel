@@ -5,7 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{any::Any, ffi::CStr, fmt::Write as _, iter, str, task::Context};
+use core::{any::Any, fmt::Write as _, iter, str, task::Context};
 
 use axdriver::virtio_io_counters_snapshot;
 use axerrno::{AxError, AxResult, LinuxError};
@@ -18,7 +18,7 @@ use axfs_ng_vfs::{
 use axhal::paging::MappingFlags;
 use axpoll::{IoEvents, Pollable};
 use axsync::Mutex;
-use axtask::{AxTaskRef, WeakAxTaskRef, current};
+use axtask::{AxTaskRef, TASK_COMM_LEN, TaskName, WeakAxTaskRef, current};
 use inherit_methods_macro::inherit_methods;
 use linux_raw_sys::{
     general::{
@@ -2004,7 +2004,7 @@ fn task_status(
         .max(1) as usize;
     let cpu_allowed_list = format_mask_list(cpu_mask, cpu_width);
     let mem_allowed_list = format_mask_list(mem_mask, mem_width);
-    let task_name = task.try_name().map_err(|_| VfsError::NoMemory)?;
+    let task_name = String::from_utf8_lossy(task.comm().as_bytes()).into_owned();
     #[cfg(target_arch = "x86_64")]
     let (cet_features_bits, cet_locked_bits) = if Arc::ptr_eq(task, &current()) {
         let state = crate::task::current_user_live_cet_state();
@@ -3402,10 +3402,12 @@ impl SimpleDirOps for ThreadDir {
                 fs,
                 RwFile::new_process_writable(move |req| match req {
                     SimpleFileOperation::Read => {
-                        let name = task.try_name().map_err(|_| VfsError::NoMemory)?;
-                        let copy_len = name.len().min(15);
-                        let mut bytes = Vec::with_capacity(copy_len + 1);
-                        bytes.extend_from_slice(&name.as_bytes()[..copy_len]);
+                        // `comm_show()` prints the raw `task_struct::comm`
+                        // followed by a newline; the bytes are never validated.
+                        let comm = task.comm();
+                        let name = comm.as_bytes();
+                        let mut bytes = Vec::with_capacity(name.len() + 1);
+                        bytes.extend_from_slice(name);
                         bytes.push(b'\n');
                         Ok(Some(bytes))
                     }
@@ -3417,17 +3419,15 @@ impl SimpleDirOps for ThreadDir {
                             ) {
                                 return Err(VfsError::InvalidInput);
                             }
-                            let mut input = [0; 16];
-                            let data = data.strip_suffix(b"\n").unwrap_or(data);
-                            let copy_len = data.len().min(15);
-                            input[..copy_len].copy_from_slice(&data[..copy_len]);
-                            task.set_name(
-                                CStr::from_bytes_until_nul(&input)
-                                    .map_err(|_| VfsError::InvalidInput)?
-                                    .to_str()
-                                    .map_err(|_| VfsError::InvalidInput)?,
-                            )
-                            .map_err(|_| VfsError::NoMemory)?;
+                            // `comm_write()` copies `min(count, TASK_COMM_LEN - 1)`
+                            // bytes into a zeroed buffer and hands them to
+                            // `set_task_comm()`, so the write accepts any byte
+                            // sequence, ignores everything after a NUL, and --
+                            // unlike the read side -- keeps a trailing newline
+                            // as part of the name. `echo`-style writers really
+                            // do end up with the newline in `comm`.
+                            let copy_len = data.len().min(TASK_COMM_LEN - 1);
+                            task.set_comm(TaskName::from_bytes(&data[..copy_len]));
                         }
                         Ok(None)
                     }

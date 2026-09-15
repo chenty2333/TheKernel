@@ -2,8 +2,13 @@ use axerrno::{AxError, AxResult, LinuxError};
 use axhal::paging::{MappingFlags, PageSize};
 use axtask::current;
 use memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
+use tk_linux_arch_x86_64::{
+    XFEATURE_MASK_FPSSE, XFEATURE_MASK_XTILE_DATA, XcompRequestRejection,
+    arch_segment_base_permitted, xcomp_request_admission,
+};
 
 use crate::{
+    config::TASK_SIZE_MAX,
     mm::{
         AddrSpace, Backend, UserMemoryCapability, check_rlimit_as_growth,
         ldt::{BYTES as LDT_BYTES, UserDesc},
@@ -12,7 +17,45 @@ use crate::{
     task::AsThread,
 };
 
+/// Encodes a `modify_ldt(2)` failure the way the syscall's own wrapper does.
+///
+/// `SYSCALL_DEFINE3(modify_ldt, ...)` ends with
+///
+/// ```c
+/// 	/*
+/// 	 * The SYSCALL_DEFINE() macros give us an 'unsigned long'
+/// 	 * return type, but the ABI for sys_modify_ldt() expects
+/// 	 * 'int'.  This cast gives us an int-sized value in %rax
+/// 	 * for the return code.  The 'unsigned' is necessary so
+/// 	 * the compiler does not try to sign-extend the negative
+/// 	 * return codes into the high half of the register when
+/// 	 * taking the value from int->long.
+/// 	 */
+/// 	return (unsigned int)ret;
+/// ```
+///
+/// so `-EINVAL` reaches user space as `0x0000_0000_ffff_ffea`. libc treats
+/// that word as a successful positive result: it leaves `errno` alone and
+/// returns the value, unlike every ordinary system call. Callers that test
+/// `ret == -1` therefore do not see these failures at all, and a kernel that
+/// sign-extends them is observably different.
+fn modify_ldt_error_result(error: AxError) -> isize {
+    (LinuxError::from(error).code() as u32).wrapping_neg() as isize
+}
+
 pub fn sys_modify_ldt(
+    memory: UserMemoryCapability,
+    func: i32,
+    ptr: *mut u8,
+    bytes: usize,
+) -> AxResult<isize> {
+    match modify_ldt_inner(memory, func, ptr, bytes) {
+        Ok(value) => Ok(value),
+        Err(error) => Ok(modify_ldt_error_result(error)),
+    }
+}
+
+fn modify_ldt_inner(
     memory: UserMemoryCapability,
     func: i32,
     ptr: *mut u8,
@@ -118,23 +161,85 @@ pub fn sys_gettid() -> AxResult<isize> {
 #[repr(i32)]
 enum ArchPrctlCode {
     /// Set the GS segment base
-    SetGs        = 0x1001,
+    SetGs             = 0x1001,
     /// Set the FS segment base
-    SetFs        = 0x1002,
+    SetFs             = 0x1002,
     /// Get the FS segment base
-    GetFs        = 0x1003,
+    GetFs             = 0x1003,
     /// Get the GS segment base
-    GetGs        = 0x1004,
+    GetGs             = 0x1004,
     /// The setting of the flag manipulated by ARCH_SET_CPUID
-    GetCpuid     = 0x1011,
+    GetCpuid          = 0x1011,
     /// Enable (addr != 0) or disable (addr == 0) the cpuid instruction for the
     /// calling thread.
-    SetCpuid     = 0x1012,
-    EnableShstk  = 0x5001,
-    DisableShstk = 0x5002,
-    LockShstk    = 0x5003,
-    UnlockShstk  = 0x5004,
-    StatusShstk  = 0x5005,
+    SetCpuid          = 0x1012,
+    /// Mask of xfeatures the kernel supports for userspace.
+    GetXcompSupp      = 0x1021,
+    /// Mask of xfeatures this process is permitted to use.
+    GetXcompPerm      = 0x1022,
+    /// Request permission for an xfeature.
+    ReqXcompPerm      = 0x1023,
+    /// Mask of xfeatures this process is permitted to use in a guest.
+    GetXcompGuestPerm = 0x1024,
+    /// Request guest permission for an xfeature.
+    ReqXcompGuestPerm = 0x1025,
+    EnableShstk       = 0x5001,
+    DisableShstk      = 0x5002,
+    LockShstk         = 0x5003,
+    UnlockShstk       = 0x5004,
+    StatusShstk       = 0x5005,
+}
+
+/// The xfeature mask this kernel exposes to `ARCH_GET_XCOMP_*`.
+///
+/// Linux reports `fpu_user_cfg.max_features | fpu_user_cfg.legacy_features`,
+/// which is the enabled user XSAVE state; a CPU without XSAVE still has the
+/// legacy x87/SSE state. Requestable facilities beyond that mask (AMX) are
+/// reported as unsupported rather than silently granted.
+#[cfg(target_arch = "x86_64")]
+fn user_xcomp_mask() -> u64 {
+    axhal::asm::xsave_layout()
+        .map(|layout| layout.xfeatures)
+        .unwrap_or(XFEATURE_MASK_FPSSE)
+}
+
+/// Handles the `ARCH_GET_XCOMP_*` / `ARCH_REQ_XCOMP_*` family.
+///
+/// Mirrors `fpu_xstate_prctl()` in arch/x86/kernel/fpu/xstate.c: the two query
+/// commands only copy the mask, and the two request commands validate the
+/// component index before consulting the facility table. `permitted` starts as
+/// `max_features` without the dynamic (opt-in) facilities, and this kernel
+/// never grants one, so both permission masks equal the supported mask minus
+/// the AMX tile-data bit.
+#[cfg(target_arch = "x86_64")]
+fn arch_prctl_xcomp(
+    memory: &UserMemoryCapability,
+    code: ArchPrctlCode,
+    arg2: usize,
+) -> AxResult<isize> {
+    let supported = user_xcomp_mask();
+    let permitted = supported & !XFEATURE_MASK_XTILE_DATA;
+    match code {
+        ArchPrctlCode::GetXcompSupp => memory
+            .write_value(arg2 as *mut u64, supported)
+            .map_err(map_usercopy_error)
+            .map(|()| 0),
+        ArchPrctlCode::GetXcompPerm | ArchPrctlCode::GetXcompGuestPerm => memory
+            .write_value(arg2 as *mut u64, permitted)
+            .map_err(map_usercopy_error)
+            .map(|()| 0),
+        ArchPrctlCode::ReqXcompPerm | ArchPrctlCode::ReqXcompGuestPerm => {
+            match xcomp_request_admission(arg2 as u64, supported) {
+                // The facility is already enabled, so the request is a no-op.
+                Ok(_) => Ok(0),
+                Err(XcompRequestRejection::UnknownComponent) => Err(AxError::InvalidInput),
+                Err(XcompRequestRejection::UnsupportedFacility) => {
+                    Err(AxError::OperationNotSupported)
+                }
+            }
+        }
+        _ => Err(AxError::InvalidInput),
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -255,8 +360,14 @@ pub fn sys_arch_prctl(
     debug!("sys_arch_prctl: code = {code:?}, addr = {addr:#x}");
 
     match code {
-        // According to Linux implementation, SetFs & SetGs does not return
-        // error at all
+        // do_arch_prctl_64() in arch/x86/kernel/process_64.c rejects a base at
+        // or above TASK_SIZE_MAX with -EPERM before it installs the selector or
+        // the base, and both ARCH_SET_GS and ARCH_SET_FS carry the check.
+        ArchPrctlCode::SetFs | ArchPrctlCode::SetGs
+            if !arch_segment_base_permitted(addr as u64, TASK_SIZE_MAX as u64) =>
+        {
+            Err(LinuxError::EPERM.into())
+        }
         ArchPrctlCode::GetFs => {
             memory
                 .write_value(addr as *mut usize, uctx.tls())
@@ -277,9 +388,18 @@ pub fn sys_arch_prctl(
             uctx.gs_base = addr as _;
             Ok(0)
         }
+        // GET_CPUID reports whether CPUID faulting is armed for this thread.
+        // This kernel never arms it, so the thread flag Linux reads is clear.
         ArchPrctlCode::GetCpuid => Ok(1),
-        ArchPrctlCode::SetCpuid if addr != 0 => Ok(0),
-        ArchPrctlCode::SetCpuid => Err(axerrno::AxError::NoSuchDevice),
+        // set_cpuid_mode() in arch/x86/kernel/process.c returns -ENODEV when
+        // the processor lacks X86_FEATURE_CPUID_FAULT, and this kernel has no
+        // CPUID-faulting support to offer either value.
+        ArchPrctlCode::SetCpuid => Err(AxError::NoSuchDevice),
+        ArchPrctlCode::GetXcompSupp
+        | ArchPrctlCode::GetXcompPerm
+        | ArchPrctlCode::GetXcompGuestPerm
+        | ArchPrctlCode::ReqXcompPerm
+        | ArchPrctlCode::ReqXcompGuestPerm => arch_prctl_xcomp(&memory, code, addr),
         ArchPrctlCode::EnableShstk => {
             if addr != ARCH_SHSTK_SHSTK && addr != ARCH_SHSTK_WRSS {
                 return Err(AxError::InvalidInput);
@@ -458,6 +578,17 @@ mod tests {
         // A non-zero clone3 stack_size is intentional and is not capped by
         // the default-stack policy.
         assert_eq!(cet_default_shadow_stack_size(page + 1, 1), Ok(page * 2));
+    }
+
+    #[test]
+    fn modify_ldt_failures_use_the_unsigned_wrapper_encoding() {
+        use super::modify_ldt_error_result;
+        // -EINVAL, -EFAULT and -ENOSYS as `(unsigned int)ret` in a 64-bit
+        // register: positive values, no sign extension, no errno.
+        assert_eq!(modify_ldt_error_result(AxError::InvalidInput), 0xffff_ffea);
+        assert_eq!(modify_ldt_error_result(AxError::BadAddress), 0xffff_fff2);
+        assert_eq!(modify_ldt_error_result(AxError::Unsupported), 0xffff_ffda);
+        assert!(modify_ldt_error_result(AxError::InvalidInput) > 0);
     }
 
     #[cfg(target_arch = "x86_64")]

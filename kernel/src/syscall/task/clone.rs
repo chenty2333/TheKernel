@@ -11,7 +11,7 @@ use axtask::{
 };
 use bitflags::bitflags;
 use linux_raw_sys::general::*;
-use tk_linux_process::{ClonePlan as LinuxClonePlan, ProcessAbiError};
+use tk_linux_process::{ClonePlan as LinuxClonePlan, ProcessAbiError, clone_flag_admission};
 use tk_linux_process_adapter::{Pid, ProcessError};
 use tk_linux_sched as linux_sched;
 use tk_linux_signal::{
@@ -405,6 +405,15 @@ bitflags! {
         const INTO_CGROUP = 0x200000000u64;
         /// (Deprecated) Causes the parent not to receive a signal when the child terminated.
         const DETACHED = CLONE_DETACHED as u64;
+        /// The child is reaped as it exits, so it never becomes a zombie and
+        /// never signals its parent.
+        const AUTOREAP = 1 << 34;
+        /// The child starts with `no_new_privs` set.
+        const NNP = 1 << 35;
+        /// The child dies with the pidfd created for it.
+        const PIDFD_AUTOKILL = 1 << 36;
+        /// The child receives a mount namespace with no mounts at all.
+        const EMPTY_MNTNS = 1 << 37;
     }
 }
 
@@ -474,6 +483,21 @@ pub(super) enum CloneApi {
     Clone3,
 }
 
+/// Ambient facts `copy_process()` reads from the calling task instead of from
+/// the request itself.
+///
+/// They are arguments rather than lookups so admission stays a pure function
+/// of its inputs: the host unit tests drive it without a task context, and a
+/// caller cannot accidentally judge one task's request against another task's
+/// state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct CloneCallerState {
+    /// `current->signal->autoreap`, set by the caller's own `CLONE_AUTOREAP`.
+    pub(super) autoreap: bool,
+    /// `capable(CAP_SYS_ADMIN)` for the calling task.
+    pub(super) cap_sys_admin: bool,
+}
+
 impl CloneArgs {
     fn wait_for_vfork(proc_data: &ProcessData) -> AxResult<()> {
         block_on_poll_set_interruptible_if(
@@ -495,7 +519,7 @@ impl CloneArgs {
         )
     }
 
-    pub(super) fn validate_for(&self, api: CloneApi) -> AxResult<()> {
+    pub(super) fn validate_for(&self, api: CloneApi, caller: CloneCallerState) -> AxResult<()> {
         let Self {
             flags,
             set_tid_size,
@@ -508,6 +532,35 @@ impl CloneArgs {
         // a malformed count into an out-of-bounds slice before the namespace
         // reservation transaction is created.
         if *set_tid_size > set_tid.len() {
+            return Err(AxError::InvalidInput);
+        }
+
+        // copy_process() rules for the flags clone3 added past the legacy
+        // mask, evaluated before the older shape checks below because Linux
+        // reaches them first. The caller's own autoreap bit is what matters
+        // here, not the child's: CLONE_PARENT would hand the child to a
+        // grandparent that never asked to reap it.
+        let exit_signal = u8::try_from(self.exit_signal).map_err(|_| AxError::InvalidInput)?;
+        clone_flag_admission(
+            flags.bits(),
+            exit_signal,
+            caller.autoreap,
+            caller.cap_sys_admin,
+        )
+        .map_err(|error| match error {
+            ProcessAbiError::PermissionDenied => AxError::OperationNotPermitted,
+            _ => AxError::InvalidInput,
+        })?;
+        // Residual gaps, reported rather than papered over: these three flags
+        // are admitted by Linux but have no complete lifecycle here, so a
+        // request that uses one is refused instead of being accepted and then
+        // ignored. CLONE_NNP must publish a child credential that differs from
+        // the parent's, and the fork publication path requires a bit-identical
+        // pending credential; CLONE_PIDFD_AUTOKILL must kill the child when
+        // its pidfd is released; CLONE_EMPTY_MNTNS must install a mount
+        // namespace that is empty rather than a copy of the parent's.
+        if flags.intersects(CloneFlags::NNP | CloneFlags::PIDFD_AUTOKILL | CloneFlags::EMPTY_MNTNS)
+        {
             return Err(AxError::InvalidInput);
         }
 
@@ -584,7 +637,15 @@ impl CloneArgs {
         api: CloneApi,
         caller_memory: &UserMemoryCapability,
     ) -> AxResult<isize> {
-        self.validate_for(api)?;
+        let caller = {
+            let curr = current();
+            let thread = curr.as_thread();
+            CloneCallerState {
+                autoreap: thread.proc_data.autoreap(),
+                cap_sys_admin: thread.has_effective_capability(CAP_SYS_ADMIN),
+            }
+        };
+        self.validate_for(api, caller)?;
 
         let Self {
             flags,
@@ -674,6 +735,8 @@ impl CloneArgs {
         // separately prepared module-state clone in its own outer credential.
         let (parent_cred, parent_dumpability, parent_aspace, parent_access_state) =
             old_proc_data.fork_image_credential_snapshot(calling_thread);
+        // A child created with CLONE_NNP starts with `no_new_privs` set, before
+        // anything can publish its credential image.
         let child_cred = if flags.contains(CloneFlags::NEWUSER) {
             // Match Linux current_chrooted(): creating a user namespace from
             // a restricted filesystem root must not create authority which
@@ -761,8 +824,12 @@ impl CloneArgs {
             (minimum.min(maximum), maximum)
         };
 
-        let task_name = curr.try_name().map_err(|_| AxError::NoMemory)?;
+        // The child inherits `comm` byte for byte (`copy_process()` copies
+        // the parent's `task_struct::comm`), so a name that is not valid
+        // UTF-8 must survive the clone unchanged.
+        let task_name = alloc::string::String::from_utf8_lossy(curr.comm().as_bytes()).into_owned();
         let mut new_task = try_new_user_task(task_name, new_uctx)?;
+        new_task.set_comm(curr.comm());
         // PKRU is a per-thread architectural register.  It is inherited by
         // both CLONE_THREAD and fork children, independently of the mm-wide
         // allocation bitmap captured below.
@@ -1106,6 +1173,12 @@ impl CloneArgs {
             proc_data.replace_mm_layout(old_proc_data.mm_layout());
             proc_data.try_inherit_mempolicy_from(old_proc_data)?;
             proc_data.inherit_timerslack_from(old_proc_data);
+            if flags.contains(CloneFlags::AUTOREAP) {
+                // `copy_process()` turns the child's own `signal_struct` into
+                // an auto-reaping one; the parent's disposition is irrelevant,
+                // which is why this cannot be expressed as a wait() policy.
+                proc_data.set_autoreap();
+            }
             let thread_admission = proc_data.prepare_initial_thread_admission(process_admission)?;
             (
                 proc_data,
@@ -1769,7 +1842,8 @@ mod tests {
         clone_inherits_cet_handler_state,
     };
     use super::{
-        CloneApi, CloneArgs, CloneCredentialPublicationKind, CloneFlags, IOPRIO_CLASS_SHIFT,
+        CloneApi, CloneArgs, CloneCallerState, CloneCredentialPublicationKind, CloneFlags,
+        IOPRIO_CLASS_SHIFT,
         clone_credential_publication_kind, clone_io_context_snapshot, clone_namespace_owner,
         clone_process_access_state, clone_signal_altstack, inherited_ioprio,
         release_clone_lifecycle_then, should_yield_after_clone,
@@ -1946,7 +2020,7 @@ mod tests {
             flags: CloneFlags::from_bits_retain(CLONE_DETACHED as u64),
             ..Default::default()
         };
-        assert_eq!(args.validate_for(CloneApi::Clone), Ok(()));
+        assert_eq!(args.validate_for(CloneApi::Clone, CloneCallerState::default()), Ok(()));
     }
 
     #[test]
@@ -1956,7 +2030,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            args.validate_for(CloneApi::Clone),
+            args.validate_for(CloneApi::Clone, CloneCallerState::default()),
             Err(AxError::InvalidInput)
         );
     }
@@ -1968,7 +2042,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            args.validate_for(CloneApi::Clone),
+            args.validate_for(CloneApi::Clone, CloneCallerState::default()),
             Err(AxError::InvalidInput)
         );
     }
@@ -1979,7 +2053,7 @@ mod tests {
             flags: CloneFlags::THREAD | CloneFlags::VM | CloneFlags::SIGHAND,
             ..Default::default()
         };
-        assert_eq!(args.validate_for(CloneApi::Clone), Ok(()));
+        assert_eq!(args.validate_for(CloneApi::Clone, CloneCallerState::default()), Ok(()));
     }
 
     #[test]
@@ -1993,7 +2067,7 @@ mod tests {
                 | CloneFlags::SYSVSEM,
             ..Default::default()
         };
-        assert_eq!(args.validate_for(CloneApi::Clone), Ok(()));
+        assert_eq!(args.validate_for(CloneApi::Clone, CloneCallerState::default()), Ok(()));
     }
 
     #[test]
@@ -2002,7 +2076,7 @@ mod tests {
             flags: CloneFlags::IO,
             ..Default::default()
         };
-        assert_eq!(args.validate_for(CloneApi::Clone), Ok(()));
+        assert_eq!(args.validate_for(CloneApi::Clone, CloneCallerState::default()), Ok(()));
     }
 
     #[test]
@@ -2058,7 +2132,7 @@ mod tests {
             flags: CloneFlags::SYSVSEM,
             ..Default::default()
         };
-        assert_eq!(args.validate_for(CloneApi::Clone), Ok(()));
+        assert_eq!(args.validate_for(CloneApi::Clone, CloneCallerState::default()), Ok(()));
     }
 
     #[test]
@@ -2068,7 +2142,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            args.validate_for(CloneApi::Clone3),
+            args.validate_for(CloneApi::Clone3, CloneCallerState::default()),
             Err(AxError::InvalidInput)
         );
     }
@@ -2085,7 +2159,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            args.validate_for(CloneApi::Clone),
+            args.validate_for(CloneApi::Clone, CloneCallerState::default()),
             Err(AxError::InvalidInput)
         );
     }
@@ -2097,7 +2171,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            args.validate_for(CloneApi::Clone),
+            args.validate_for(CloneApi::Clone, CloneCallerState::default()),
             Err(AxError::InvalidInput)
         );
     }
@@ -2109,7 +2183,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            args.validate_for(CloneApi::Clone),
+            args.validate_for(CloneApi::Clone, CloneCallerState::default()),
             Err(AxError::InvalidInput)
         );
     }
@@ -2132,7 +2206,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                args.validate_for(CloneApi::Clone),
+                args.validate_for(CloneApi::Clone, CloneCallerState::default()),
                 Err(AxError::InvalidInput)
             );
         }

@@ -1464,13 +1464,27 @@ impl Thread {
         }
     }
 
+    /// Applies Linux's task-wide `PR_TASK_PERF_EVENTS_*` policy.
+    ///
+    /// `perf_event_task_enable()`/`_disable()` in kernel/events/core.c iterate
+    /// the calling task's events; the corresponding prctl returns 0 whether or
+    /// not any event existed and regardless of any hardware reconcile result.
+    pub(crate) fn perf_set_task_wide_enabled(&self, enable: bool) -> AxResult<()> {
+        for group in self.perf_events.lock().iter() {
+            group.task_wide_control(enable)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn perf_on_exec(&self) {
         let pid = self.proc_data.proc.pid() as u32;
         let tid = self.kernel_tid() as u32;
-        let name = current().try_name().ok();
+        // Perf names the exec'ing task by its raw `comm`, so the image is
+        // forwarded unchanged instead of going through a UTF-8 conversion.
+        let name = current().comm();
         let mut events = self.perf_events.lock();
         events.retain(|group| {
-            group.on_exec(pid, tid, name.as_deref().unwrap_or_default().as_bytes());
+            group.on_exec(pid, tid, name.as_bytes());
             !group.is_prunable()
         });
     }

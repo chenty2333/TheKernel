@@ -1,4 +1,4 @@
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::{
     mem::{self, MaybeUninit},
     sync::atomic::{AtomicU64, Ordering},
@@ -7,7 +7,7 @@ use core::{
 use axerrno::{AxError, AxResult, LinuxError};
 use axfs_ng_vfs::{FsPathBuf, NodeType};
 use axhal::paging::MappingFlags;
-use axtask::{AxTaskRef, current};
+use axtask::{AxTaskRef, TaskName, current};
 use linux_raw_sys::{
     general::{
         __user_cap_data_struct, __user_cap_header_struct, _LINUX_CAPABILITY_VERSION_1,
@@ -20,10 +20,11 @@ use linux_raw_sys::{
 };
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use tk_linux_cred::{
-    CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CapabilitySets, CapsetRequest,
+    CAPABILITY_VALID_MASK, CAPABILITY_WORDS, CapabilityHeaderPid, CapabilitySets, CapsetRequest,
 };
+use tk_linux_process::{SAVED_AUXV_BYTES, TaskComm, prctl_set_name_read_bound};
 use tk_linux_usercopy::{
-    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load_until_nul, vm_write_slice,
+    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_write_slice,
 };
 
 use crate::{
@@ -39,6 +40,22 @@ use crate::{
         get_process_data, get_task, get_visible_task, ns_capable, process_domain, process_error,
     },
 };
+
+/// `PR_RSEQ_SLICE_EXTENSION`, absent from the `linux-raw-sys` table that
+/// predates Linux 6.19 (include/uapi/linux/prctl.h).
+const PR_RSEQ_SLICE_EXTENSION: u32 = 79;
+/// `PR_GET_CFI` / `PR_SET_CFI` from include/uapi/linux/prctl.h.
+const PR_GET_CFI: u32 = 80;
+const PR_SET_CFI: u32 = 81;
+
+/// `-ENOTSUPP`, the kernel-internal "operation not supported" errno.
+///
+/// Linux keeps `ENOTSUPP` (524) distinct from the userspace `EOPNOTSUPP` (95),
+/// and some syscalls report the former. The `LinuxError` table has no 524
+/// variant, so the value is returned through the syscall result slot, which
+/// the entry path copies to the return register verbatim. Substituting
+/// `EOPNOTSUPP` here would answer a different errno.
+const ENOTSUPP_RESULT: isize = -524;
 
 const NO_ID_CHANGE: u32 = u32::MAX;
 const ALLOWED_NODEMASK: usize = 0b1;
@@ -1397,15 +1414,6 @@ fn resolve_cap_task(header: __user_cap_header_struct) -> AxResult<AxTaskRef> {
     }
 }
 
-fn validate_cap_header<M: UserMemory + ?Sized>(
-    memory: &mut UserMemoryContext<'_, M>,
-    header_ptr: *mut __user_cap_header_struct,
-) -> AxResult<(__user_cap_header_struct, AxTaskRef)> {
-    let header = validate_cap_version(memory, header_ptr)?;
-    let task = resolve_cap_task(header)?;
-    Ok((header, task))
-}
-
 fn write_cap_data<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     data: *mut __user_cap_data_struct,
@@ -1482,14 +1490,21 @@ pub fn sys_capset<M: UserMemory + ?Sized>(
     data: *mut __user_cap_data_struct,
 ) -> AxResult<isize> {
     let curr = current();
-    let current_tid = curr.as_thread().tid();
-    let (header, task) = validate_cap_header(memory, header)?;
-    if header.pid != 0 && task.as_thread().tid() != current_tid {
+    let thread = curr.as_thread();
+    let header = validate_cap_version(memory, header)?;
+    // Linux's SYSCALL_DEFINE2(capset, ...) in kernel/capability.c reads the
+    // header pid and rejects every value that is neither 0 nor
+    // task_pid_vnr(current) with -EPERM *before* it looks the pid up. Probing
+    // a foreign or nonexistent pid must therefore never surface as -ESRCH or
+    // -EINVAL, and a negative pid is -EPERM rather than capget(2)'s -EINVAL.
+    let visible_tid = thread.pid_ns().visible_pid(thread.tid());
+    if !CapabilityHeaderPid::new(header.pid).authorizes_capset(visible_tid) {
         return Err(AxError::OperationNotPermitted);
     }
-
+    // After the pid rule above, the only pid that can still reach the lookup
+    // is the caller's own, so resolving it again can only confirm the target.
     let request = read_cap_data(memory, data, header.version)?;
-    task.as_thread().apply_capset(request)?;
+    thread.apply_capset(request)?;
 
     Ok(0)
 }
@@ -1753,15 +1768,23 @@ pub fn sys_move_pages<M: UserMemory + ?Sized>(
     if flags & MPOL_MF_MOVE_ALL as usize != 0 && !current_has_capability(CAP_SYS_NICE) {
         return Err(AxError::OperationNotPermitted);
     }
+
+    // `kernel_move_pages()` in mm/migrate.c resolves and authorizes the target
+    // through `find_mm_struct()` — the `find_get_task_by_vpid()` ESRCH and the
+    // `ptrace_may_access()` EPERM — *before* it dispatches to `do_pages_move()`
+    // or `do_pages_stat()`. A zero `nr_pages` only makes those loops no-ops;
+    // it never skips target admission, so `move_pages(bogus_pid, 0, ...)` is
+    // ESRCH and an unauthorized target is EPERM rather than 0.
+    let target = numa_target_process(pid)?;
+    check_numa_target_permission(&target)?;
+
     if nr_pages == 0 {
+        // Both loops copy no chunks, so the pointers are never dereferenced.
         return Ok(0);
     }
     if pages.is_null() || status.is_null() {
         return Err(AxError::BadAddress);
     }
-
-    let target = numa_target_process(pid)?;
-    check_numa_target_permission(&target)?;
 
     // Linux processes these arrays in small chunks.  Copy each chunk before
     // applying its page operations, so a later user fault cannot make one
@@ -1843,6 +1866,42 @@ fn pr_get_dumpable_value(
     _arg5: usize,
 ) -> isize {
     dumpability as isize
+}
+
+/// Reads a task name with Linux `strncpy_from_user()` semantics.
+///
+/// `strncpy_from_user(dst, src, count)` copies at most `count` bytes, stops
+/// after the NUL that terminates the source, and returns `-EFAULT` only when a
+/// fault happens before that terminator. It therefore has to be driven one byte
+/// at a time: a single wide read would fault on the unmapped page after a short
+/// name that ends near the end of its mapping, which Linux accepts.
+///
+/// Returns the bytes before the terminator, or exactly
+/// [`prctl_set_name_read_bound`] bytes when the source has no NUL inside the
+/// bound, matching the successful "count reached" result.
+fn load_strncpy_from_user_prefix<M: UserMemory + ?Sized>(
+    memory: &mut UserMemoryContext<'_, M>,
+    address: usize,
+) -> AxResult<Vec<u8>> {
+    let bound = prctl_set_name_read_bound();
+    let mut prefix = Vec::new();
+    prefix
+        .try_reserve_exact(bound)
+        .map_err(|_| AxError::NoMemory)?;
+    for index in 0..bound {
+        let mut byte = [MaybeUninit::<u8>::uninit(); 1];
+        let address = address.checked_add(index).ok_or(AxError::BadAddress)?;
+        memory
+            .read_bytes(address, &mut byte)
+            .map_err(map_usercopy_error)?;
+        // SAFETY: a successful provider read initialized the single byte.
+        let byte = unsafe { byte[0].assume_init() };
+        if byte == 0 {
+            break;
+        }
+        prefix.push(byte);
+    }
+    Ok(prefix)
 }
 
 fn prctl_mm_capable() -> AxResult<()> {
@@ -1978,21 +2037,22 @@ pub fn sys_prctl<M: UserMemory + ?Sized>(
 
     match option {
         PR_SET_NAME => {
-            let s = String::from_utf8(
-                vm_load_until_nul(memory, arg2 as *const u8).map_err(map_usercopy_error)?,
-            )
-            .map_err(|_| AxError::IllegalBytes)?;
-            drop(current().replace_name(s));
+            // kernel/sys.c clears `comm[TASK_COMM_LEN - 1]` and then calls
+            // `strncpy_from_user(comm, arg2, TASK_COMM_LEN - 1)`: at most 15
+            // bytes are read, the copy stops at the first NUL, and a fault
+            // before the terminator is -EFAULT. `set_task_comm()` then stores
+            // the raw bytes through `strscpy_pad()`, so the name is never
+            // validated as UTF-8 and never read past the bound.
+            let prefix = load_strncpy_from_user_prefix(memory, arg2)?;
+            let comm = TaskComm::from_prefix(&prefix);
+            current().set_comm(TaskName::from_raw(comm.raw()));
         }
         PR_GET_NAME => {
-            let name = current().try_name().map_err(|error| match error {
-                axtask::TaskNameError::OutOfMemory => AxError::NoMemory,
-                axtask::TaskNameError::ConcurrentMutation => AxError::ResourceBusy,
-            })?;
-            let len = name.len().min(15);
-            let mut buf = [0; 16];
-            buf[..len].copy_from_slice(&name.as_bytes()[..len]);
-            vm_write_slice(memory, arg2 as _, &buf).map_err(map_usercopy_error)?;
+            // `get_task_comm()` -> `strscpy_pad()` followed by
+            // `copy_to_user(arg2, comm, sizeof(comm))` copies the complete
+            // NUL-padded TASK_COMM_LEN image, not a truncated string.
+            let comm = current().comm();
+            vm_write_slice(memory, arg2 as _, &comm.raw()).map_err(map_usercopy_error)?;
         }
         PR_SET_DUMPABLE => {
             current()
@@ -2133,24 +2193,60 @@ pub fn sys_prctl<M: UserMemory + ?Sized>(
             }
             return Ok(current().as_thread().proc_data.mdwe() as isize);
         }
-        PR_SET_IO_FLUSHER => {
-            if arg2 > 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+        PR_GET_TIMING => {
+            // kernel/sys.c: `case PR_GET_TIMING: error = PR_TIMING_STATISTICAL;`
+            // validates nothing at all -- the four tail arguments are ignored --
+            // because only statistical timing has ever been selectable.
+            return Ok(PR_TIMING_STATISTICAL as isize);
+        }
+        PR_SET_TIMING => {
+            // kernel/sys.c rejects PR_TIMING_TIMESTAMP, the only other defined
+            // value, so a successful call is always the statistical request.
+            if arg2 != PR_TIMING_STATISTICAL as usize {
                 return Err(AxError::InvalidInput);
             }
+        }
+        PR_SET_IO_FLUSHER => {
+            // kernel/sys.c checks `capable(CAP_SYS_RESOURCE)` before it looks at
+            // any argument, so an unprivileged caller sees EPERM even for an
+            // out-of-range mode or a non-zero tail.
             let curr = current();
             let thread = curr.as_thread();
-            // Enabling the allocator/writeback reserve is privileged. Clearing
-            // a bit that this thread already owns is intentionally permitted.
-            if arg2 != 0 && !thread.has_effective_capability(CAP_SYS_RESOURCE) {
+            if !thread.has_effective_capability(CAP_SYS_RESOURCE) {
                 return Err(AxError::OperationNotPermitted);
             }
-            thread.set_io_flusher(arg2 != 0);
+            if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            match arg2 {
+                0 => thread.set_io_flusher(false),
+                1 => thread.set_io_flusher(true),
+                _ => return Err(AxError::InvalidInput),
+            }
         }
         PR_GET_IO_FLUSHER => {
+            // The query is privileged in Linux as well: the flag describes a
+            // writeback-reserve policy rather than a task-visible property.
+            if !current()
+                .as_thread()
+                .has_effective_capability(CAP_SYS_RESOURCE)
+            {
+                return Err(AxError::OperationNotPermitted);
+            }
             if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
                 return Err(AxError::InvalidInput);
             }
             return Ok(current().as_thread().io_flusher() as isize);
+        }
+        PR_TASK_PERF_EVENTS_DISABLE | PR_TASK_PERF_EVENTS_ENABLE => {
+            // `perf_event_task_disable()`/`_enable()` in kernel/events/core.c
+            // walk `current->perf_event_list`, validate no arguments, and
+            // return a literal 0: the operation cannot fail. The enable flag
+            // applies to every group owned by the calling thread.
+            let enable = option == PR_TASK_PERF_EVENTS_ENABLE;
+            if let Err(error) = current().as_thread().perf_set_task_wide_enabled(enable) {
+                warn!("sys_prctl: task-wide perf control failed: {error:?}");
+            }
         }
         PR_MCE_KILL => {
             // Linux accepts CLEAR or SET plus one of LATE/EARLY/DEFAULT.
@@ -2318,6 +2414,117 @@ pub fn sys_prctl<M: UserMemory + ?Sized>(
             }
             prctl_commit_mm_layout(layout)?;
         }
+        PR_GET_AUXV => {
+            // kernel/sys.c: `if (arg4 || arg5) return -EINVAL;` then
+            // `prctl_get_auxv()`. The call always reports the full size of
+            // `mm->saved_auxv` -- never the number of bytes copied -- which is
+            // how a caller with `len == 0` discovers the required size, and a
+            // short `len` truncates the copy without failing.
+            if arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let saved_auxv = current().as_thread().proc_data.saved_auxv();
+            let size = arg3.min(SAVED_AUXV_BYTES);
+            if size != 0 {
+                let mut image = [0u8; SAVED_AUXV_BYTES];
+                let copied = saved_auxv.len().min(size);
+                image[..copied].copy_from_slice(&saved_auxv[..copied]);
+                memory
+                    .write_bytes(arg2, &image[..size])
+                    .map_err(map_usercopy_error)?;
+            }
+            return Ok(SAVED_AUXV_BYTES as isize);
+        }
+        PR_TIMER_CREATE_RESTORE_IDS => {
+            // kernel/sys.c tail-checks, then `posixtimer_create_prctl()`:
+            // OFF clears the bit, ON sets it, GET returns the bit itself (0 or
+            // 1) and anything else is EINVAL. The bit lives in `signal_struct`,
+            // so it is shared by the thread group and survives until exec.
+            if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let curr = current();
+            let proc_data = &curr.as_thread().proc_data;
+            match arg2 as u32 {
+                PR_TIMER_CREATE_RESTORE_IDS_OFF => proc_data.set_timer_restore_ids(false),
+                PR_TIMER_CREATE_RESTORE_IDS_ON => proc_data.set_timer_restore_ids(true),
+                PR_TIMER_CREATE_RESTORE_IDS_GET => {
+                    return Ok(proc_data.timer_restore_ids() as isize);
+                }
+                _ => return Err(AxError::InvalidInput),
+            }
+        }
+        PR_FUTEX_HASH => {
+            // This kernel has no per-mm private futex hash table -- private
+            // futexes are keyed in a growable map, not in a slot array -- which
+            // is exactly the `CONFIG_FUTEX_PRIVATE_HASH=n` configuration of
+            // kernel/futex/core.c. There `futex_hash_allocate()` is
+            // `return -EINVAL` and `futex_hash_get_slots()` is `return 0`.
+            // SET_SLOTS rejects a non-zero arg4 before allocating; GET_SLOTS
+            // validates nothing but arg2, and `futex_hash_prctl()` itself never
+            // looks at arg5.
+            match arg2 as u32 {
+                PR_FUTEX_HASH_SET_SLOTS => {
+                    let _ = arg3;
+                    return Err(AxError::InvalidInput);
+                }
+                PR_FUTEX_HASH_GET_SLOTS => return Ok(0),
+                _ => return Err(AxError::InvalidInput),
+            }
+        }
+        PR_RSEQ_SLICE_EXTENSION => {
+            // kernel/sys.c checks `arg4 || arg5` first, then calls the
+            // `rseq_slice_extension_prctl()` stub that CONFIG_RSEQ_SLICE_EXTENSION=n
+            // (the Kconfig default) selects. That stub ignores both command and
+            // argument and returns -ENOTSUPP, so no request can succeed here.
+            if arg4 != 0 || arg5 != 0 {
+                return Err(AxError::InvalidInput);
+            }
+            let _ = (arg2, arg3);
+            return Ok(ENOTSUPP_RESULT);
+        }
+        PR_GET_CFI | PR_SET_CFI => {
+            // arch/x86 defines neither `arch_prctl_get_branch_landing_pad_state()`
+            // nor `_set_`/`_lock_`, so the `__weak` fallbacks in kernel/sys.c
+            // link and return -EINVAL. They never dereference arg3, which means
+            // the generic tail checks are the only other way to fail.
+            return Err(AxError::InvalidInput);
+        }
+        PR_SET_VMA => {
+            // `prctl_set_vma()` rejects every option but PR_SET_VMA_ANON_NAME
+            // and that one reaches `set_anon_vma_name()`, which is
+            // `return -EINVAL` when CONFIG_ANON_VMA_NAME is off. This kernel
+            // has no anonymous VMA naming, so it matches that configuration:
+            // the option is rejected for every argument vector.
+            let _ = (arg2, arg3, arg4, arg5);
+            return Err(AxError::InvalidInput);
+        }
+        PR_SET_SYSCALL_USER_DISPATCH => {
+            // The dispatch filter is consulted by the syscall entry path; this
+            // kernel has no such hook, which matches the `!CONFIG_GENERIC_ENTRY`
+            // stub in include/linux/syscall_user_dispatch.h that returns -EINVAL
+            // for every argument vector.
+            let _ = (arg2, arg3, arg4, arg5);
+            return Err(AxError::InvalidInput);
+        }
+        PR_SET_TSC | PR_GET_TSC => {
+            // GET_TSC_CTL/SET_TSC_CTL exist on x86 because Linux traps RDTSC by
+            // setting CR4.TSD per task. This kernel never sets CR4.TSD and has
+            // no per-task mode to report, so it matches an architecture that
+            // defines neither macro: kernel/sys.c falls back to `(-EINVAL)`
+            // for both, without dereferencing the pointer of PR_GET_TSC.
+            let _ = (arg2, arg3, arg4, arg5);
+            return Err(AxError::InvalidInput);
+        }
+        PR_GET_SPECULATION_CTRL | PR_SET_SPECULATION_CTRL => {
+            // The x86 implementations program MSR_IA32_SPEC_CTRL and
+            // MSR_IA32_PRED_CMD and track per-task TIF_SPEC_* flags. This kernel
+            // models none of that state, and there is no errno that means
+            // "unsupported" for a valid `which`: the generic `__weak` hooks
+            // return -EINVAL for every request, which is what is reported here.
+            let _ = (arg2, arg3, arg4, arg5);
+            return Err(AxError::InvalidInput);
+        }
         _ => {
             warn!("sys_prctl: unsupported option {option}");
             return Err(AxError::InvalidInput);
@@ -2452,6 +2659,66 @@ mod tests {
         assert_eq!(
             checked_move_pages_element_address::<usize>(0x1000 as *const usize, 2),
             Ok(0x1010)
+        );
+    }
+
+    struct NoUserMemory;
+
+    // SAFETY: the provider reports every access as unmapped; the tests below
+    // only exercise rejection paths that run before the first usercopy.
+    unsafe impl tk_linux_usercopy::UserMemory for NoUserMemory {
+        fn read(
+            &mut self,
+            _start: usize,
+            _dst: &mut [MaybeUninit<u8>],
+        ) -> Result<(), tk_linux_usercopy::UserCopyError> {
+            Err(tk_linux_usercopy::UserCopyError::BadAddress)
+        }
+
+        fn write(
+            &mut self,
+            _start: usize,
+            _src: &[u8],
+        ) -> Result<(), tk_linux_usercopy::UserCopyError> {
+            Err(tk_linux_usercopy::UserCopyError::BadAddress)
+        }
+    }
+
+    #[test]
+    fn move_pages_resolves_the_target_before_an_empty_request() {
+        let mut provider = NoUserMemory;
+        let mut memory = UserMemoryContext::new(&mut provider);
+
+        // kernel_move_pages() in mm/migrate.c calls find_mm_struct() — the
+        // ESRCH lookup plus ptrace_may_access() — before do_pages_stat(), so a
+        // zero page count is still ESRCH for a pid that cannot be resolved and
+        // must never short-circuit to 0.
+        assert_eq!(
+            sys_move_pages(
+                &mut memory,
+                -1,
+                0,
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null_mut(),
+                0,
+            ),
+            Err(AxError::NoSuchProcess)
+        );
+
+        // The flag check is the one precondition that precedes the target
+        // lookup, so an unknown bit wins over the unresolvable pid.
+        assert_eq!(
+            sys_move_pages(
+                &mut memory,
+                -1,
+                0,
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null_mut(),
+                1 << 3,
+            ),
+            Err(AxError::InvalidInput)
         );
     }
 }

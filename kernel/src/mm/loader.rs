@@ -299,6 +299,12 @@ pub(crate) struct LoadedUserApp {
     pub(crate) entry_point: VirtAddr,
     pub(crate) stack_pointer: VirtAddr,
     pub(crate) arguments: Vec<Vec<u8>>,
+    /// The auxiliary vector exactly as it was placed on the new stack.
+    ///
+    /// Linux keeps this image in `mm_struct::saved_auxv` for the lifetime of
+    /// the mm, which is what `PR_GET_AUXV` and `/proc/<pid>/auxv` read back,
+    /// so exec has to publish it rather than dropping it with the loader.
+    pub(crate) saved_auxv: Vec<u8>,
 }
 
 /// Creates a new empty user address space.
@@ -1108,10 +1114,17 @@ pub(crate) fn finish_prepared_user_app(
         &prepared.auxv,
         layout,
     )?;
+    let saved_auxv = tk_linux_process::saved_auxv_image(
+        prepared
+            .auxv
+            .iter()
+            .map(|entry| (entry.get_type() as usize, entry.value())),
+    );
     Ok(LoadedUserApp {
         entry_point,
         stack_pointer,
         arguments: prepared.arguments,
+        saved_auxv,
     })
 }
 
@@ -1136,9 +1149,8 @@ mod tests {
     #[test]
     fn dynamic_linker_entry_uses_elf_entry_while_aux_base_stays_interp_base() {
         let layout = ExecLayout::fixed();
-        let linker_bytes = include_bytes!(
-            "../../../crates/ax/tk-kernel-elf-parser/tests/ld-linux-x86-64.so.2"
-        );
+        let linker_bytes =
+            include_bytes!("../../../crates/ax/tk-kernel-elf-parser/tests/ld-linux-x86-64.so.2");
         // `include_bytes!` has byte alignment, while xmas-elf's legacy
         // header reader requires its input address to be naturally aligned.
         // The real loader accepts byte-aligned files through ELFHeadersBuilder;
@@ -1232,10 +1244,9 @@ mod tests {
 
     fn dynamic_elf_with_interp(path: &[u8]) -> Vec<u8> {
         assert_eq!(path.last(), Some(&0));
-        let mut bytes = include_bytes!(
-            "../../../crates/ax/tk-kernel-elf-parser/tests/ld-linux-x86-64.so.2"
-        )
-        .to_vec();
+        let mut bytes =
+            include_bytes!("../../../crates/ax/tk-kernel-elf-parser/tests/ld-linux-x86-64.so.2")
+                .to_vec();
         let note_index = {
             let elf = xmas_elf::ElfFile::new(&bytes).unwrap();
             elf.program_iter()
@@ -1265,9 +1276,7 @@ mod tests {
         let dynamic_linker = create_test_file(
             &root,
             "ld.so",
-            include_bytes!(
-                "../../../crates/ax/tk-kernel-elf-parser/tests/ld-linux-x86-64.so.2"
-            ),
+            include_bytes!("../../../crates/ax/tk-kernel-elf-parser/tests/ld-linux-x86-64.so.2"),
         );
         (script, interpreter, dynamic_linker)
     }

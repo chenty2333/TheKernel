@@ -1618,14 +1618,20 @@ impl PerfGroup {
         // while close still owns the file, so re-admission cannot reacquire
         // the closing descriptor through its still-live Weak reference.
         state.members.retain(|member| {
-            member.file.upgrade().is_some_and(|file| file.id != member_id)
+            member
+                .file
+                .upgrade()
+                .is_some_and(|file| file.id != member_id)
         });
         state.active.files.truncate(state.members.len());
     }
 
     fn retire_member(&self, member_id: u64) {
         if !self.state.lock().members.iter().any(|member| {
-            member.file.upgrade().is_some_and(|file| file.id == member_id)
+            member
+                .file
+                .upgrade()
+                .is_some_and(|file| file.id == member_id)
         }) {
             return;
         }
@@ -2279,6 +2285,25 @@ impl PerfGroup {
             Self::start_locked(&mut state, now);
         }
         found.then_some(()).ok_or(AxError::BadFileDescriptor)
+    }
+
+    /// Applies Linux's task-wide perf control to every member of this group.
+    ///
+    /// `perf_event_task_enable()` and `perf_event_task_disable()` in
+    /// kernel/events/core.c walk `current->perf_event_list` and apply
+    /// `_perf_event_enable()`/`_perf_event_disable()` to each event in it, so
+    /// every member of every group the task owns is touched. The walk itself
+    /// returns a literal 0, which is why the prctl cannot report a failure;
+    /// the caller decides how to record an error from the hardware reconcile.
+    pub(crate) fn task_wide_control(&self, enable: bool) -> AxResult<()> {
+        let control = if enable {
+            RECONCILE_CONTROL_ENABLE
+        } else {
+            RECONCILE_CONTROL_DISABLE
+        };
+        // The group-wide form reaches inherited members, which have no file
+        // descriptor and therefore no id to select them individually.
+        self.synchronize_hardware_control(self.leader_id, true, control)
     }
 
     #[cfg(not(all(feature = "perf-sampling", target_os = "none")))]
@@ -3611,8 +3636,13 @@ impl PerfEventFile {
     fn emit_source_raw_at(&self, ip: u64, user: bool, raw: &[u8], timestamp: u64) {
         #[cfg(feature = "perf-sampling")]
         if let Some(backend) = &self.sampling {
-            let _ =
-                backend.emit_source_raw_record_at(current().id().as_u64() as u32, ip, user, raw, timestamp);
+            let _ = backend.emit_source_raw_record_at(
+                current().id().as_u64() as u32,
+                ip,
+                user,
+                raw,
+                timestamp,
+            );
         }
     }
     fn emit_comm_exec(&self, pid: u32, tid: u32, comm: &[u8]) {
@@ -5199,7 +5229,9 @@ mod tests {
             // Leave reclamation to the real registry's next open, so a
             // leaked descriptor exhausts its 64 entries on iteration 65.
         }
-        super::CPU_CONTEXT_GROUPS[0].lock().retain(|group| !group.is_prunable());
+        super::CPU_CONTEXT_GROUPS[0]
+            .lock()
+            .retain(|group| !group.is_prunable());
     }
 
     #[test]
@@ -5339,7 +5371,10 @@ mod tests {
     fn cpu_group_publication_requires_live_member_before_registry_pruning() {
         let _context = crate::test_support::scheduler_test_context();
         let group = PerfGroup::new_for_context(PerfContext::Cpu { cpu: 0 }, 1).unwrap();
-        assert_eq!(PerfGroup::attach_cpu_context(&group), Err(super::AxError::InvalidInput));
+        assert_eq!(
+            PerfGroup::attach_cpu_context(&group),
+            Err(super::AxError::InvalidInput)
+        );
         let file = PerfEventFile::new(
             1,
             PerfEvent::Software(SoftwareEvent::CpuMigrations),
@@ -5351,9 +5386,13 @@ mod tests {
         PerfGroup::attach_cpu_context(&group).unwrap();
         // This is the registry sweep that used to run between attaching the
         // empty group and creating its first descriptor member.
-        super::CPU_CONTEXT_GROUPS[0].lock().retain(|entry| !entry.is_prunable());
+        super::CPU_CONTEXT_GROUPS[0]
+            .lock()
+            .retain(|entry| !entry.is_prunable());
         drop(group);
-        let retained = file.group().expect("registry must retain an unopened live member");
+        let retained = file
+            .group()
+            .expect("registry must retain an unopened live member");
         retained
             .synchronize_hardware_control(file.id, false, super::RECONCILE_CONTROL_ENABLE)
             .unwrap();
