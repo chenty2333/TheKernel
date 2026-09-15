@@ -1004,16 +1004,20 @@ fn write_file_like_with_status(
     if let Some(file) = file_like.downcast_ref::<File>() {
         file.write_with_status(status, src, security)
     } else if let Some(pipe) = file_like.downcast_ref::<NamedPipe>() {
+        // `is_packetized(filp)` reads the open file description's `O_DIRECT`
+        // (`fs/pipe.c:507-510`), which `F_SETFL` can change after the open.
         pipe.write_with_nonblocking(
             src,
             status.nonblocking() || status.rwf_nowait(),
             suppress_sigpipe,
+            status.direct(),
         )
     } else if let Some(pipe) = file_like.downcast_ref::<Pipe>() {
         pipe.write_with_nonblocking(
             src,
             status.nonblocking() || status.rwf_nowait(),
             suppress_sigpipe,
+            status.direct(),
         )
     } else if let Some(socket) = file_like.downcast_ref::<Socket>() {
         let result = socket.write_with_sender(
@@ -6098,10 +6102,19 @@ impl SendFile {
                     .transpose()?;
                 file.with_write_credentials_for_status(*status, || {
                     let nonblocking = *nonblocking || force_nonblocking;
+                    // A transfer never packetizes the destination pipe, even
+                    // when its description carries O_DIRECT.  `sendfile(2)` to
+                    // a pipe takes the splice route rather than the write path
+                    // (get_pipe_info(out, true) is true for the output, so
+                    // do_sendfile() takes `splice_file_to_pipe()`,
+                    // fs/read_write.c:1366-1377), and `splice_to_pipe()`
+                    // stamps `buf->flags = 0` on every buffer it creates
+                    // (fs/splice.c:223).  `is_packetized(filp)` is therefore
+                    // only reachable from write(2)/writev(2).
                     if let Some(pipe) = file.downcast_ref::<Pipe>() {
-                        pipe.write_with_nonblocking(&mut buf, nonblocking, false)
+                        pipe.write_with_nonblocking(&mut buf, nonblocking, false, false)
                     } else if let Some(pipe) = file.downcast_ref::<NamedPipe>() {
-                        pipe.write_with_nonblocking(&mut buf, nonblocking, false)
+                        pipe.write_with_nonblocking(&mut buf, nonblocking, false, false)
                     } else if let Some(socket) = file.downcast_ref::<Socket>() {
                         socket.write_with_sender(
                             &mut buf,

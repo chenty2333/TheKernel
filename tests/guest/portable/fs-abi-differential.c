@@ -144,6 +144,9 @@ static const char *active;
 
 static char root[] = "/root/thekernel-fs-abi-XXXXXX";
 static char mnt[] = "/root/thekernel-fs-abi-mnt-XXXXXX";
+/* Packet-mode cases need more than one page in flight, and a page-aligned
+ * boundary is what makes a packet boundary observable at all. */
+static char pkt[8192];
 static int dirfd = -1;
 static int file = -1;
 static int rofile = -1;
@@ -350,6 +353,127 @@ int main(void) {
         check(fcntl(anon, F_SETFL, anon_base) == 0, "clear-noatime-anon");
         check(close(anon) == 0, "close-anon");
         mark("SETFL_NOATIME_ANONYMOUS_OWNER");
+        /*
+         * `S_ISFIFO(inode->i_mode)` covers anonymous pipes too, because
+         * get_pipe_inode() builds them on `S_IFIFO | S_IRUSR | S_IWUSR`
+         * (fs/pipe.c:1010), so F_SETFL always commits O_DIRECT here and the
+         * description switches to packetized mode.
+         */
+        int pfd[2];
+        check(pipe2(pfd, O_NONBLOCK) == 0, "packet-pipe");
+        long pbase = fcntl(pfd[1], F_GETFL);
+        check(pbase >= 0 && (pbase & O_DIRECT) == 0, "packet-base");
+        check(fcntl(pfd[1], F_SETFL, pbase | O_DIRECT) == 0, "packet-set");
+        check((fcntl(pfd[1], F_GETFL) & O_DIRECT) != 0, "packet-stored");
+        mark("SETFL_ODIRECT_PIPE");
+        check(write(pfd[1], "abc", 3) == 3, "packet-1");
+        check(write(pfd[1], "de", 2) == 2, "packet-2");
+        check(read(pfd[0], pkt, 64) == 3, "read-1");
+        check(read(pfd[0], pkt, 64) == 2, "read-2");
+        mark("SETFL_ODIRECT_PACKETIZES");
+        /* Clearing the bit returns the same description to stream mode, where
+         * two writes merge into one buffer and one read returns both. */
+        check(fcntl(pfd[1], F_SETFL, pbase) == 0, "stream-set");
+        check(write(pfd[1], "abc", 3) == 3, "stream-1");
+        check(write(pfd[1], "de", 2) == 2, "stream-2");
+        check(read(pfd[0], pkt, 64) == 5 && memcmp(pkt, "abcde", 5) == 0,
+              "stream-merge");
+        mark("SETFL_ODIRECT_CLEARED_MERGES");
+        close(pfd[0]);
+        close(pfd[1]);
+        /*
+         * The packetized write's merge step only appends to a buffer that
+         * still carries PIPE_BUF_FLAG_CAN_MERGE and only while it stays inside
+         * one page:
+         *     chars = total_len & (PAGE_SIZE-1);
+         *     if (chars && !was_empty) {
+         *             ... buf->flags & PIPE_BUF_FLAG_CAN_MERGE &&
+         *                 offset + buf->len + chars <= PAGE_SIZE ...
+         *     }                                             (fs/pipe.c:572-591)
+         * so a packetized write joins the tail of an earlier *stream* write
+         * instead of starting a packet.  An 8192-byte pipe makes that
+         * observable: without the merge the 3996-byte write would take the
+         * pipe's second buffer slot and the 4096-byte write would have none.
+         */
+        int mfd[2];
+        check(pipe2(mfd, O_NONBLOCK) == 0, "merge-pipe");
+        check(fcntl(mfd[1], F_SETPIPE_SZ, 8192) == 8192, "merge-size");
+        check(write(mfd[1], pkt, 100) == 100, "merge-stream");
+        long mbase = fcntl(mfd[1], F_GETFL);
+        check(fcntl(mfd[1], F_SETFL, mbase | O_DIRECT) == 0, "merge-direct");
+        check(write(mfd[1], pkt, 3996) == 3996, "merge-join");
+        check(write(mfd[1], pkt, 4096) == 4096, "merge-packet");
+        check(read(mfd[0], pkt, 8192) == 8192, "merge-read");
+        errno = 0;
+        check(read(mfd[0], pkt, 8192) == -1 && errno == EAGAIN, "merge-empty");
+        mark("PACKET_WRITE_MERGES_STREAM_TAIL");
+        close(mfd[0]);
+        close(mfd[1]);
+        /*
+         * open(2) of a FIFO with O_DIRECT is the one O_DIRECT-on-a-pipe case
+         * Linux refuses: do_dentry_open() requires FMODE_CAN_ODIRECT
+         * (fs/open.c:966-968), which comes from the file's own ->open (e.g.
+         * ext4_file_open(), fs/ext4/file.c:937) or from
+         * f_mapping->a_ops->direct_IO (fs/open.c:961-962), and fifo_open()
+         * grants neither.  Packetized mode on a FIFO is reachable through
+         * F_SETFL instead, which is exactly what the S_ISFIFO exemption is
+         * for.
+         */
+        errno = 0;
+        int od = openat(dirfd, "fifo", O_RDWR | O_NONBLOCK | O_DIRECT | O_CLOEXEC);
+        check(od == -1 && errno == EINVAL, "fifo-open-direct");
+        mark("FIFO_OPEN_ODIRECT_EINVAL");
+        long fbase = fcntl(fifo, F_GETFL);
+        check(fbase >= 0 && (fbase & O_DIRECT) == 0, "fifo-base");
+        check(fcntl(fifo, F_SETFL, fbase | O_DIRECT) == 0, "fifo-set");
+        check((fcntl(fifo, F_GETFL) & O_DIRECT) != 0, "fifo-stored");
+        mark("SETFL_ODIRECT_FIFO");
+        check(write(fifo, "abc", 3) == 3, "fifo-packet-1");
+        check(write(fifo, "de", 2) == 2, "fifo-packet-2");
+        check(read(fifo, pkt, 64) == 3, "fifo-read-1");
+        check(read(fifo, pkt, 64) == 2, "fifo-read-2");
+        mark("FIFO_PACKET_BOUNDARY");
+        check(fcntl(fifo, F_SETFL, fbase) == 0, "fifo-restore");
+        /*
+         * That rejection happens after the open, not before it:
+         * do_dentry_open() runs `f_op->open` first (fs/open.c:946-951) and
+         * computes FMODE_CAN_ODIRECT only afterwards (fs/open.c:961), so a
+         * *blocking* FIFO open waits for its peer and then fails with -EINVAL
+         * rather than skipping the wait.  A child reports through a pipe that
+         * it has reached open(2), so the parent can tell a completed wait from
+         * an immediate refusal.
+         */
+        check(mkfifoat(dirfd, "fifo2", 0600) == 0, "order-mkfifo");
+        int sync[2];
+        check(pipe(sync) == 0, "order-pipe");
+        pid_t blocked = fork();
+        check(blocked >= 0, "order-fork");
+        if (blocked == 0) {
+            close(sync[0]);
+            char token = 'x';
+            if (write(sync[1], &token, 1) != 1)
+                _exit(2);
+            close(sync[1]);
+            int fd = openat(dirfd, "fifo2", O_WRONLY | O_DIRECT);
+            if (fd >= 0)
+                _exit(3);
+            _exit(errno == EINVAL ? 0 : 1);
+        }
+        close(sync[1]);
+        char token = 0;
+        check(read(sync[0], &token, 1) == 1 && token == 'x', "order-sync");
+        usleep(50000);
+        int blocked_status = 0;
+        check(waitpid(blocked, &blocked_status, WNOHANG) == 0, "order-blocks");
+        int order_reader = openat(dirfd, "fifo2", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        check(order_reader >= 0, "order-reader");
+        check(waitpid(blocked, &blocked_status, 0) == blocked, "order-waitpid");
+        check(WIFEXITED(blocked_status) && WEXITSTATUS(blocked_status) == 0,
+              "order-einval");
+        close(order_reader);
+        close(sync[0]);
+        check(unlinkat(dirfd, "fifo2", 0) == 0, "order-unlink");
+        mark("FIFO_OPEN_ODIRECT_WAITS_THEN_EINVAL");
     }
     done();
 
@@ -885,6 +1009,14 @@ int main(void) {
      *                   O_NOTIFICATION_PIPE))  return -EINVAL;
      * O_NOTIFICATION_PIPE is O_EXCL; with CONFIG_WATCH_QUEUE=n the notification
      * queue constructor is a stub returning -ENOPKG.
+     *
+     * O_DIRECT selects packetized mode.  create_pipe_files() builds the two
+     * descriptions as
+     *     O_WRONLY | (flags & (O_NONBLOCK | O_DIRECT))     (:1042-1043)
+     *     O_RDONLY | (flags & O_NONBLOCK)                  (:1054)
+     * so the bit lands on the write end only, and is_packetized(filp)
+     * (:507-510) is a property of the descriptor being written, not of the
+     * pipe.
      * ------------------------------------------------------------------ */
     begin("pipe2.raw-differential");
     {
@@ -909,6 +1041,62 @@ int main(void) {
         close(fds[0]);
         close(fds[1]);
         mark("FLAG_SPLIT_AND_CLOEXEC");
+
+        check(syscall(SYS_pipe2, fds, O_DIRECT | O_NONBLOCK) == 0, "packet");
+        check((fcntl(fds[1], F_GETFL) & O_DIRECT) != 0, "packet-write-end");
+        check((fcntl(fds[0], F_GETFL) & O_DIRECT) == 0, "packet-read-end");
+        mark("PACKET_MODE_ON_WRITE_END_ONLY");
+        /* anon_pipe_write() stamps every buffer it creates:
+         *     if (is_packetized(filp))
+         *             buf->flags = PIPE_BUF_FLAG_PACKET;        (:631-634)
+         * and anon_pipe_read() ends the read after one such buffer:
+         *     if (buf->flags & PIPE_BUF_FLAG_PACKET) {
+         *             total_len = chars;
+         *             buf->len = 0;
+         *     }                                                 (:444-447)
+         * Two writes are therefore two reads, whatever the caller's count. */
+        check(write(fds[1], "abc", 3) == 3, "packet-1");
+        check(write(fds[1], "de", 2) == 2, "packet-2");
+        check(read(fds[0], pkt, 64) == 3 && memcmp(pkt, "abc", 3) == 0,
+              "read-1");
+        check(read(fds[0], pkt, 64) == 2 && memcmp(pkt, "de", 2) == 0, "read-2");
+        mark("PACKET_WRITE_BOUNDARY");
+        /* One packet is one page at most: the write loop copies at most
+         * PIPE_BUF_SIZE per iteration and never splits one, so 5000 bytes are
+         * a 4096-byte packet followed by a 904-byte one. */
+        memset(pkt, 'x', 5000);
+        check(write(fds[1], pkt, 5000) == 5000, "packet-3");
+        check(read(fds[0], pkt, 8192) == 4096, "packet-page");
+        check(read(fds[0], pkt, 8192) == 904, "packet-tail");
+        errno = 0;
+        check(read(fds[0], pkt, 8192) == -1 && errno == EAGAIN, "packet-empty");
+        mark("PACKET_ONE_PAGE_MAX");
+        /* A short read truncates the packet and discards the remainder, because
+         * `buf->len = 0` releases the buffer whole. */
+        check(write(fds[1], "0123456789", 10) == 10, "packet-4");
+        check(read(fds[0], pkt, 4) == 4 && memcmp(pkt, "0123", 4) == 0, "short");
+        errno = 0;
+        check(read(fds[0], pkt, 64) == -1 && errno == EAGAIN, "discarded");
+        mark("SHORT_READ_DISCARDS_PACKET");
+        /* pipe_full() counts buffers, not bytes: a 65536-byte pipe holds
+         * sixteen buffers, so sixteen one-byte packets fill it and the
+         * seventeenth write has no slot even though 65520 bytes are vacant.
+         * pipe_resize_ring() then refuses a two-slot array with -EBUSY
+         * because `nr_slots < pipe_occupancy(head, tail)`. */
+        for (int i = 0; i < 16; i++)
+            check(write(fds[1], "z", 1) == 1, "slot-fill");
+        errno = 0;
+        check(write(fds[1], "z", 1) == -1 && errno == EAGAIN, "slot-full");
+        errno = 0;
+        check(fcntl(fds[1], F_SETPIPE_SZ, 8192) == -1 && errno == EBUSY,
+              "slot-shrink");
+        check(read(fds[0], pkt, 64) == 1, "slot-free");
+        check(write(fds[1], "z", 1) == 1, "slot-reuse");
+        for (int i = 0; i < 16; i++)
+            check(read(fds[0], pkt, 64) == 1, "slot-drain");
+        mark("PACKET_SLOT_ACCOUNTING");
+        close(fds[0]);
+        close(fds[1]);
     }
     done();
 
@@ -1106,6 +1294,29 @@ int main(void) {
         check(read(dst[0], buf, 8) == 8 && memcmp(buf, "abcdefgh", 8) == 0,
               "copy");
         mark("COPY_RETAINS_SOURCE");
+        /*
+         * link_pipe() moves `*obuf = *ibuf` and clears only the gift and merge
+         * flags:
+         *     obuf->flags &= ~PIPE_BUF_FLAG_GIFT;
+         *     obuf->flags &= ~PIPE_BUF_FLAG_CAN_MERGE;   (fs/splice.c:1907-1908)
+         * so PIPE_BUF_FLAG_PACKET survives and the copy keeps the framing of
+         * the source, which the reader sees as one read per packet.
+         */
+        int psrc[2], pdst[2];
+        check(pipe2(psrc, O_NONBLOCK | O_DIRECT) == 0, "packet-src");
+        check(pipe2(pdst, O_NONBLOCK) == 0, "packet-dst");
+        check(write(psrc[1], "abc", 3) == 3, "packet-1");
+        check(write(psrc[1], "de", 2) == 2, "packet-2");
+        check(syscall(SYS_tee, psrc[0], pdst[1], 64, 0) == 5, "packet-tee");
+        check(read(pdst[0], pkt, 64) == 3, "dst-1");
+        check(read(pdst[0], pkt, 64) == 2, "dst-2");
+        check(read(psrc[0], pkt, 64) == 3, "src-1");
+        check(read(psrc[0], pkt, 64) == 2, "src-2");
+        mark("PACKET_FLAGS_PRESERVED");
+        close(psrc[0]);
+        close(psrc[1]);
+        close(pdst[0]);
+        close(pdst[1]);
         close(src[0]);
         close(src[1]);
         close(dst[0]);
@@ -1152,6 +1363,84 @@ int main(void) {
         mark("GIFT_AND_READBACK");
         close(src[0]);
         close(src[1]);
+        /*
+         * vmsplice() is flag-agnostic in both directions.  Writing,
+         * iter_to_pipe() stamps PIPE_BUF_FLAG_GIFT (or nothing) and never
+         * PIPE_BUF_FLAG_PACKET (fs/splice.c:1534-1553), so an O_DIRECT pipe
+         * still takes one undelimited run that a single read returns whole.
+         * Reading, vmsplice_to_user() runs on splice_from_pipe_feed(), which
+         * copies `min(buf->len, sd->total_len)` per buffer without consulting
+         * buf->flags (fs/splice.c:442-490), so a packet does not end it.
+         */
+        int od[2];
+        check(pipe2(od, O_NONBLOCK | O_DIRECT) == 0, "packet-pipe");
+        memset(pkt, 'q', 4097);
+        iov.iov_base = pkt;
+        iov.iov_len = 4097;
+        check(syscall(SYS_vmsplice, od[1], &iov, 1, 0) == 4097, "packet-write");
+        check(read(od[0], pkt, 4097) == 4097, "packet-single-read");
+        mark("WRITE_IGNORES_PACKET_MODE");
+        check(write(od[1], "abc", 3) == 3, "packet-1");
+        check(write(od[1], "de", 2) == 2, "packet-2");
+        iov.iov_base = pkt;
+        iov.iov_len = 64;
+        check(syscall(SYS_vmsplice, od[0], &iov, 1, 0) == 5, "packet-vmsplice");
+        mark("READ_IGNORES_PACKET_MODE");
+        close(od[0]);
+        close(od[1]);
+    }
+    done();
+
+    /* ------------------------------------------------------------------ *
+     * splice(2) -- fs/splice.c splice_pipe_to_pipe():
+     *     if (len >= ibuf->len) {
+     *             *obuf = *ibuf;                  -- moves the whole buffer
+     *             ...
+     *     } else {
+     *             *obuf = *ibuf;
+     *             obuf->flags &= ~PIPE_BUF_FLAG_GIFT;
+     *             obuf->flags &= ~PIPE_BUF_FLAG_CAN_MERGE;
+     *             obuf->len = len;
+     *     }                                             (:1807-1830)
+     * so a pipe-to-pipe splice carries buf->flags, keeping packets whole,
+     * while splice_to_pipe() stamps `buf->flags = 0` for a file source
+     * (:222) and never consults the destination's O_DIRECT.
+     * ------------------------------------------------------------------ */
+    begin("splice.raw-differential");
+    {
+        int src[2], dst[2];
+        long long off = 0;
+        check(pipe2(src, O_NONBLOCK | O_DIRECT) == 0, "packet-src");
+        check(pipe2(dst, O_NONBLOCK) == 0, "stream-dst");
+        check(write(src[1], "abc", 3) == 3, "packet-1");
+        check(write(src[1], "de", 2) == 2, "packet-2");
+        check(syscall(SYS_splice, src[0], NULL, dst[1], NULL, 64, 0) == 5,
+              "splice");
+        check(read(dst[0], pkt, 64) == 3, "dst-1");
+        check(read(dst[0], pkt, 64) == 2, "dst-2");
+        errno = 0;
+        check(read(src[0], pkt, 64) == -1 && errno == EAGAIN, "src-drained");
+        mark("PACKET_FLAGS_PRESERVED");
+        /* A file source fills the pipe through splice_to_pipe(), which stamps
+         * `buf->flags = 0`; the O_DIRECT write end does not change that, so
+         * one read still returns the whole 8192 bytes. */
+        check(pwrite(file, pkt, 8192, 0) == 8192, "seed");
+        check(syscall(SYS_splice, file, &off, src[1], NULL, 8192, 0) == 8192,
+              "file-splice");
+        check(read(src[0], pkt, 8192) == 8192, "not-packetized");
+        /* sendfile(2) to a pipe takes the same route: do_sendfile() sees
+         * `get_pipe_info(out, true)` and calls splice_file_to_pipe()
+         * (fs/read_write.c:1366-1377) instead of the write path, so the
+         * destination's O_DIRECT is still not consulted. */
+        off = 0;
+        check(syscall(SYS_sendfile, src[1], file, &off, 8192) == 8192,
+              "file-sendfile");
+        check(read(src[0], pkt, 8192) == 8192, "sendfile-not-packetized");
+        mark("FILE_SOURCE_NOT_PACKETIZED");
+        close(src[0]);
+        close(src[1]);
+        close(dst[0]);
+        close(dst[1]);
     }
     done();
 

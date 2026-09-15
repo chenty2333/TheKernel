@@ -19,8 +19,8 @@ use axsync::Mutex as StatusTransitionMutex;
 use axtask::{WeakAxTaskRef, current, current_may_uninit};
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
-    O_APPEND, O_DIRECTORY, O_NONBLOCK, O_PATH, POLL_ERR, POLL_HUP, POLL_IN, POLL_MSG, POLL_OUT,
-    POLL_PRI, POLLERR, POLLHUP, POLLIN, POLLMSG, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM,
+    O_APPEND, O_DIRECT, O_DIRECTORY, O_NONBLOCK, O_PATH, POLL_ERR, POLL_HUP, POLL_IN, POLL_MSG,
+    POLL_OUT, POLL_PRI, POLLERR, POLLHUP, POLLIN, POLLMSG, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM,
     POLLWRBAND, POLLWRNORM, SI_SIGIO,
 };
 use spin::Mutex;
@@ -1191,6 +1191,16 @@ impl OfdIoStatus {
 
     pub(crate) const fn nonblocking(self) -> bool {
         self.raw & O_NONBLOCK != 0
+    }
+
+    /// `O_DIRECT` as `F_GETFL` reports it.
+    ///
+    /// Linux reads the packetized-pipe test straight out of `f_flags`
+    /// (`is_packetized(filp)`, `fs/pipe.c:507-510`), so a write must sample it
+    /// from the description it is writing through and not from any state
+    /// mirrored in the pipe when it was opened.
+    pub(crate) const fn direct(self) -> bool {
+        self.raw & O_DIRECT != 0
     }
 
     pub(crate) const fn rwf_nowait(self) -> bool {

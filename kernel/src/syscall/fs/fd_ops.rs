@@ -2482,10 +2482,14 @@ pub fn sys_fcntl(
             // anonymous pipes and named FIFOs, because Linux builds both on a
             // `S_IFIFO` inode.
             let is_fifo = PipeEndpoint::from_file(&*description.inner).is_some();
-            // `FMODE_CAN_ODIRECT` is granted by `do_dentry_open()` when the
-            // inode's mapping carries `a_ops->direct_IO`, i.e. when the
-            // descriptor is backed by a real filesystem inode rather than a
-            // pseudo object.
+            // `FMODE_CAN_ODIRECT` is granted by `do_dentry_open()` either
+            // from the file's own `->open` (e.g. `ext4_file_open()`,
+            // fs/ext4/file.c:937) or from `f_mapping->a_ops->direct_IO`
+            // (fs/open.c:961-962), so a descriptor backed by a real filesystem
+            // inode has it while a pseudo object does not.  `fifo_open()`
+            // (fs/pipe.c) grants neither, which is why `open(2)` of a FIFO
+            // with O_DIRECT is the one O_DIRECT-on-pipe case that Linux
+            // rejects (fs/open.c:966-968).
             let can_odirect = description.inner.vfs_location().is_some();
             // `IS_APPEND(inode)`, from the descriptor's own inode view; this is
             // the same attribute word statx publishes.
@@ -2521,14 +2525,6 @@ pub fn sys_fcntl(
             description.transition_status_flags(
                 |old| (old.raw() & !FCNTL_SETFL_MUTABLE_FLAGS) | requested,
                 |old, new| {
-                    // Linux reads O_DIRECT on a FIFO as a request for
-                    // packetized pipe mode (`is_packetized()`, fs/pipe.c) and
-                    // admits it unconditionally.  The byte-stream pipe backend
-                    // keeps no per-write framing, so the transition is refused
-                    // rather than silently accepted and then ignored.
-                    if is_fifo && new.raw() & O_DIRECT != 0 {
-                        return Err(AxError::OperationNotSupported);
-                    }
                     if old.nonblocking() != new.nonblocking() {
                         description.inner.set_nonblocking(new.nonblocking())?;
                     }
