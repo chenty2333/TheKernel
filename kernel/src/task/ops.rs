@@ -1198,7 +1198,18 @@ fn handle_futex_death(
         .ok_or(AxError::InvalidInput)?;
     let address: usize = address.try_into().map_err(|_| AxError::InvalidInput)?;
     let uaddr = address as *mut u32;
-    let Some(key) = mark_robust_owner_died(memory, uaddr, current().as_thread().tid())? else {
+    // The robust word names its owner the way `gettid()` does: Linux,
+    // `kernel/futex/core.c`:
+    //
+    // ```c
+    // 	owner = uval & FUTEX_TID_MASK;
+    //
+    // 	if (owner != task_pid_vnr(curr)) {
+    // ```
+    //
+    // so a dying task must compare the word against its namespace-visible TID.
+    let owner_tid = current().as_thread().pid_vnr();
+    let Some(key) = mark_robust_owner_died(memory, uaddr, owner_tid)? else {
         return Ok(());
     };
 

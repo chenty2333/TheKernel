@@ -21,7 +21,7 @@ use crate::{
     },
     task::{
         AlarmClock, AsThread, FutexHandle, FutexKey, FutexWaitRestart, PiUnlockOutcome, PiWaiter,
-        PtraceAccessMode, RestartBlock, WaitConditionError, WaitConditionResult,
+        PtraceAccessMode, RestartBlock, Thread, WaitConditionError, WaitConditionResult,
         check_current_thread_ptrace_image_access, futex_table_for, get_visible_task,
         pi_boost_owner, pi_deboost_owner, wait_on_any_futex_if_atomic,
     },
@@ -924,6 +924,18 @@ fn futex_cas_at(
     })
 }
 
+/// Resolves a TID read out of a futex word to the kernel-wide TID used by task
+/// lookup, mirroring `find_get_task_by_vpid()`: a word names its task the way
+/// `gettid()` does ([`Thread::pid_vnr`]), so the namespace translation has to
+/// run before the task table is consulted. A TID that names no task in the
+/// caller's PID namespace is `-ESRCH`.
+fn futex_word_task_tid(thread: &Thread, word_tid: u32) -> AxResult<u32> {
+    thread
+        .pid_ns()
+        .resolve_visible_pid(word_tid)
+        .ok_or(AxError::NoSuchProcess)
+}
+
 /// `FUTEX_LOCK_PI`, `FUTEX_LOCK_PI2` and `FUTEX_TRYLOCK_PI`.
 ///
 /// Linux v7.2.3, `kernel/futex/pi.c`:
@@ -953,7 +965,7 @@ fn do_futex_lock_pi(
 ) -> AxResult<isize> {
     let address = uaddr.addr();
     let self_task = current();
-    let tid = self_task.as_thread().tid();
+    let tid = self_task.as_thread().pid_vnr();
     // `futex_lock_pi()` clamps the deadline to "now" once, so the retry loop
     // below can never extend a timeout that has already elapsed.
     let deadline = deadline.map(|deadline| FutexWaitDeadline {
@@ -991,9 +1003,17 @@ fn do_futex_lock_pi(
             || {
                 // Under the queue gate: re-read the word, then take it over or
                 // publish FUTEX_WAITERS and attach to the live owner.
+                //
+                // `futex_lock_pi()` passes `set_waiters = 0`
+                // (`kernel/futex/pi.c`: `futex_lock_pi_atomic(uaddr, hb,
+                // &q.key, &q.pi_state, current, &exiting, 0)`), so an
+                // uncontended takeover publishes exactly
+                // `(uval & FUTEX_OWNER_DIED) | vpid` and leaves FUTEX_WAITERS
+                // clear until a waiter actually queues. Only
+                // `futex_proxy_trylock_atomic()` asks for the bit.
                 let current_word =
                     nofault_u32_read(address, &caller_aspace, namespace, expected_key.as_ref())?;
-                match plan_pi_acquire(PiWord::decode(current_word), tid, !trylock) {
+                match plan_pi_acquire(PiWord::decode(current_word), tid, false) {
                     PiAcquire::Deadlock => {
                         decided = Some(Err(LinuxError::EDEADLK.into()));
                         Ok(None)
@@ -1046,7 +1066,7 @@ fn do_futex_lock_pi(
                 // `-ESRCH`; a task that is already leaving is `-EAGAIN`, which
                 // is the errno Linux surfaces when the exit-time fixup has not
                 // published `FUTEX_OWNER_DIED` yet.
-                let owner_tid = pi_state.owner_tid();
+                let owner_tid = futex_word_task_tid(self_task.as_thread(), pi_state.owner_tid())?;
                 match crate::task::get_visible_task_including_exiting(owner_tid) {
                     Err(_) => return Err(AxError::NoSuchProcess),
                     Ok(task) if task.as_thread().pending_exit() => {
@@ -1128,7 +1148,7 @@ fn do_futex_unlock_pi(
     private: bool,
 ) -> AxResult<isize> {
     let address = uaddr.addr();
-    let tid = current().as_thread().tid();
+    let tid = current().as_thread().pid_vnr();
 
     loop {
         let (key, namespace) = futex_key_from(address, private, &caller_aspace);
@@ -1235,7 +1255,7 @@ fn do_futex_wait_requeue_pi(
     if source == target {
         return Err(AxError::InvalidInput);
     }
-    let tid = current().as_thread().tid();
+    let tid = current().as_thread().pid_vnr();
 
     // `futex_wait_requeue_pi()` resolves and validates `uaddr2` for writing
     // before it validates `*uaddr`, so an inaccessible target is EFAULT even
@@ -1368,7 +1388,7 @@ fn do_futex_cmp_requeue_pi(
         return Err(AxError::InvalidInput);
     }
     let nr_requeue = usize::try_from(nr_requeue).map_err(|_| AxError::InvalidInput)?;
-    let tid = current().as_thread().tid();
+    let tid = current().as_thread().pid_vnr();
 
     validate_futex_word_read(uaddr2, size_of::<u32>(), caller)?;
     let observed_source = fault_read_u32(caller, source)?;

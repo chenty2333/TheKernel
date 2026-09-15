@@ -420,6 +420,10 @@ impl PiState {
     /// A miss is not cached: the owner may not have been created yet when a
     /// `FUTEX_LOCK_PI` published `FUTEX_WAITERS` against a stale word, and
     /// Linux's `attach_to_pi_owner()` retries the lookup on the blocking path.
+    ///
+    /// `owner_tid` is the TID the user word holds, which is rendered in the
+    /// caller's PID namespace, so the kernel-wide identity is resolved through
+    /// `find_get_task_by_vpid()`'s namespace translation first.
     pub fn resolve_owner(&self) -> Option<AxTaskRef> {
         let (tid, cached) = {
             let inner = self.inner.lock();
@@ -434,7 +438,8 @@ impl PiState {
         if let Some(task) = cached {
             return Some(task);
         }
-        let task = crate::task::get_visible_task(tid).ok()?;
+        let global_tid = current().as_thread().pid_ns().resolve_visible_pid(tid)?;
+        let task = crate::task::get_visible_task(global_tid).ok()?;
         self.inner.lock().owner = Some(Arc::downgrade(&task));
         Some(task)
     }
