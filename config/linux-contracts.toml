@@ -8,11 +8,11 @@ linux_manifest = "linux-abi.toml"
 
 [progress]
 reviewed = 385
-resolved = 314
-implemented = 295
+resolved = 315
+implemented = 296
 explicit_enosys = 19
 fallback = 0
-partial = 71
+partial = 70
 unknown = 0
 
 [[contract]]
@@ -6245,13 +6245,13 @@ teardown = ["teardown:release temporary references; persistent file and context 
 [[cell]]
 number = 209
 name = "io_submit"
-status = "partial"
+status = "implemented"
 contract = "linux-io_submit"
 handler = "kernel/src/syscall/fs/aio.rs:sys_io_submit"
 conditional = "explicit-none"
-tests = ["kernel/src/syscall/fs/aio.rs:context_ids_wrap_skip_live_contexts_and_never_use_zero", "tests/guest/portable/aio-differential.c:main"]
-validation_gaps = ["IO_SUBMIT_OPCODE_VALIDATION exercises the nr, context, NULL iocb, opcode and descriptor rules, but no case combines a closed descriptor with a second out-of-order failure"]
-limitations = ["the descriptor is opened after the RESFD eventfd lookup, the aio_key write-back and the per-opcode argument validation, where Linux's __io_submit_one does fget() before all three (fs/aio.c:2026-2046), so a closed aio_fildes combined with an invalid aio_resfd, an unwritable aio_key or a negative aio_offset reports that other error where Linux reports EBADF"]
+tests = ["kernel/src/syscall/fs/aio.rs:context_ids_wrap_skip_live_contexts_and_never_use_zero", "kernel/src/syscall/fs/aio.rs:iocb_flags_and_reqprio_are_ignored_not_rejected", "tests/guest/portable/aio-differential.c:main"]
+validation_gaps = ["IO_SUBMIT_OPCODE_VALIDATION exercises the nr, context, NULL iocb, opcode and descriptor rules, but no case combines a closed descriptor with a second out-of-order failure; the flags and reqprio rules are covered by kernel/src/syscall/fs/aio.rs:iocb_flags_and_reqprio_are_ignored_not_rejected rather than by a guest assertion"]
+limitations = ["explicit-none"]
 
 [[contract]]
 id = "linux-io_getevents"
