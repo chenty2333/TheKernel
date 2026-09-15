@@ -1,6 +1,6 @@
 use core::{
     hint::spin_loop,
-    sync::atomic::{AtomicI64, AtomicU64, Ordering, fence},
+    sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering, fence},
 };
 
 use axerrno::{AxError, AxResult};
@@ -36,6 +36,15 @@ static SYSTEM_TIMEZONE: SpinNoIrq<SystemTimezone> = SpinNoIrq::new(SystemTimezon
     dst_time: 0,
 });
 
+/// Whether `do_sys_settimeofday64()`'s `static int firsttime`
+/// (`kernel/time/time.c:171-175`) has already fired: the clock is warped from
+/// local to UTC time the *first* time a timezone is stored, and never again.
+/// The stored value is `true` while a warp is still owed, which is the
+/// complement of Linux's flag; either polarity works as long as the flag is
+/// read, and reading it is what keeps a `store` in this function from being
+/// eliminated as dead.
+static FIRST_TIMEZONE_WARP_OWED: AtomicBool = AtomicBool::new(true);
+
 /// Returns the retained `settimeofday(2)` timezone, zero until it is set.
 pub fn system_timezone() -> SystemTimezone {
     *SYSTEM_TIMEZONE.lock()
@@ -47,6 +56,46 @@ pub fn system_timezone() -> SystemTimezone {
 /// (`kernel/time/time.c:205-222`).
 pub fn set_system_timezone(timezone: SystemTimezone) {
     *SYSTEM_TIMEZONE.lock() = timezone;
+}
+
+/// `timekeeping_warp_clock()` (`kernel/time/timekeeping.c:1781-1791`), called
+/// by `do_sys_settimeofday64()` for the first stored timezone when that call
+/// does not set the clock itself (`kernel/time/time.c:194-200`).
+///
+/// Linux injects `sys_tz.tz_minuteswest * 60` seconds into `CLOCK_REALTIME`
+/// through `timekeeping_inject_offset()`, so a guest that only calls
+/// `settimeofday(NULL, &tz)` still observes a warped `CLOCK_REALTIME`.  The
+/// injection's guard is `timespec64_valid_settod()` on the result
+/// (`kernel/time/timekeeping.c:1714-1721`); the corresponding
+/// `wall_to_monotonic` shift is the same operation seen from `CLOCK_MONOTONIC`,
+/// which is untouched.
+///
+/// Only the clock is warped: `persistent_clock_is_local` (which tells the RTC
+/// class whether the hardware clock is local time, `kernel/time/timekeeping.c:1786`)
+/// has no counterpart because TheKernel has no persistent clock to resume from.
+///
+/// Returns whether the clock actually moved: a zero timezone, a second or later
+/// store, and a rejected bound all leave `CLOCK_REALTIME` alone.  The caller
+/// needs that distinction because only a real injection runs `ntp_clear()`
+/// (`timekeeping_inject_offset()`, `kernel/time/timekeeping.c:1786-1790`).
+pub fn warp_first_timezone(minutes_west: i32) -> AxResult<bool> {
+    // The one-shot is spent by the first stored timezone even when that
+    // timezone moves nothing (`if (firsttime) { firsttime = 0; if (!tv)
+    // timekeeping_warp_clock(); }`), so the swap happens before the zero test.
+    // Reading the flag is also what keeps the write in the generated code: a
+    // store to a flag nothing reads is a dead store the optimiser removes.
+    let owed = FIRST_TIMEZONE_WARP_OWED.swap(false, Ordering::AcqRel);
+    if minutes_west == 0 || !owed {
+        return Ok(false);
+    }
+    let offset_nanos = minutes_west as i128 * 60 * NANOS_PER_SEC as i128;
+    let target = wall_time_nanos() as i128 + offset_nanos;
+    // `__timekeeping_inject_offset()`'s `timespec64_valid_settod()` guard
+    // (`kernel/time/timekeeping.c:1717-1721`): the offset is applied before the
+    // timezone is stored, so a rejection leaves neither behind.
+    tk_linux_time::validate_settime_bound(target).map_err(|_| AxError::InvalidInput)?;
+    set_wall_time(TimeValue::from_nanos(target as u64))?;
+    Ok(true)
 }
 
 /// The largest wall-clock second `settimeofday(2)`, `clock_settime(2)` and

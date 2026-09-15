@@ -13,6 +13,9 @@ pub const CLOCK_BOOTTIME: i32 = 7;
 pub const CLOCK_REALTIME_ALARM: i32 = 8;
 pub const CLOCK_BOOTTIME_ALARM: i32 = 9;
 pub const CLOCK_TAI: i32 = 11;
+/// `TIMER_ABSTIME` (`include/uapi/linux/time.h:12`): the only `clock_nanosleep`
+/// flag Linux defines, and the only one it looks at.
+pub const TIMER_ABSTIME: u32 = 1;
 pub const ADJ_OFFSET: u32 = 0x0001;
 pub const ADJ_FREQUENCY: u32 = 0x0002;
 pub const ADJ_MAXERROR: u32 = 0x0004;
@@ -77,6 +80,16 @@ pub const TIME_ERROR: i32 = 5;
 /// internal tick rate (`timekeeping_validate_timex()`,
 /// `kernel/time/timekeeping.c:2844-2846`).
 pub const USER_HZ: i64 = 100;
+/// `NTP_INTERVAL_FREQ` (`include/linux/timex.h:151`): the rate at which the NTP
+/// phase residual is consumed, which is the kernel's internal tick rate
+/// (`CONFIG_HZ`) and *not* the ABI's `USER_HZ`.  Linux stores
+/// `ntp_data::time_offset` as `offset << NTP_SCALE_SHIFT` nanoseconds divided by
+/// this value and multiplies it back on every read
+/// (`kernel/time/ntp.c:333,806`), so it also has to be the value the
+/// integration layer supplies to [`adjust`].  TheKernel's rate is
+/// `config/kernel.toml`'s `ticks-per-sec`; this constant only exists so pure
+/// callers have a name for it.
+pub const NTP_INTERVAL_FREQ: i64 = 100;
 /// `ADJ_TICK` bounds `900000/USER_HZ ..= 1100000/USER_HZ`
 /// (`kernel/time/timekeeping.c:2844-2846`).
 pub const TICK_MIN: i64 = 900_000 / USER_HZ;
@@ -154,12 +167,46 @@ pub enum WakeAlarmReject {
     NoRtc,
     /// `CAP_WAKE_ALARM` is missing.
     NotPermitted,
+    /// `clock_nanosleep(2)` was given a flag bit other than `TIMER_ABSTIME`.
+    BadFlags,
 }
 
 /// Whether `clock_id` is one of the wake-alarm clocks
 /// (`include/uapi/linux/time.h`).
 pub const fn is_wake_alarm_clock(clock_id: i32) -> bool {
     clock_id == CLOCK_REALTIME_ALARM || clock_id == CLOCK_BOOTTIME_ALARM
+}
+
+/// The wake-alarm sleep admission of `alarm_timer_nsleep()`
+/// (`kernel/time/alarmtimer.c:766-790`), in Linux's own order: the RTC test
+/// returns EOPNOTSUPP, then the ignored-flag test returns EINVAL, and only then
+/// the capability test returns EPERM.
+///
+/// The flag test is deliberately separate from [`admit_wake_alarm`]: Linux
+/// checks `flags & ~TIMER_ABSTIME` only on the alarm path, while every other
+/// clock's `nsleep` reads the single `TIMER_ABSTIME` bit and ignores the rest
+/// (`common_nsleep()`, `kernel/time/posix-timers.c:1355-1363`).  `Err` is the
+/// errno class the caller must produce; `Ok` means the requested deadline may
+/// be armed (`TIMER_ABSTIME` is the only bit that changes it).
+pub const fn check_nanosleep_wake_alarm(
+    clock_id: i32,
+    flags: u32,
+    rtc_available: bool,
+    cap_wake_alarm: bool,
+) -> Result<(), WakeAlarmReject> {
+    if !is_wake_alarm_clock(clock_id) {
+        return Ok(());
+    }
+    if !rtc_available {
+        return Err(WakeAlarmReject::NoRtc);
+    }
+    if flags & !TIMER_ABSTIME != 0 {
+        return Err(WakeAlarmReject::BadFlags);
+    }
+    if !cap_wake_alarm {
+        return Err(WakeAlarmReject::NotPermitted);
+    }
+    Ok(())
 }
 
 /// The single wake-alarm admission rule shared by `timer_create(2)`,
@@ -458,6 +505,34 @@ impl TimexState {
     };
 }
 
+impl TimexState {
+    /// `__ntp_clear()` (`kernel/time/ntp.c:334-352`), the `TK_CLEAR_NTP` half
+    /// of `timekeeping_update()` (`kernel/time/timekeeping.c:31-34, 804-808`).
+    ///
+    /// Every publication of a new wall clock runs it — `do_settimeofday64()`
+    /// and `__timekeeping_inject_offset()` both publish with `TK_UPDATE_ALL`
+    /// (`kernel/time/timekeeping.c:1679, 1742`) — so a successful
+    /// `settimeofday(2)`, `clock_settime(2)` or `ADJ_SETOFFSET` leaves the NTP
+    /// state unsynchronised: `STA_UNSYNC` is added (never removed, so a PPS
+    /// error bit survives), both error estimates return to `NTP_PHASE_LIMIT`,
+    /// and the `adjtime(3)` residual and the phase offset are dropped.
+    ///
+    /// Fields Linux leaves alone stay put: `time_constant`, `time_freq`,
+    /// `tick_usec`, `tai_offset` and `time_state` are untouched by
+    /// `__ntp_clear()`, and the `tick_length`/PPS/next-leap-second fields it
+    /// also resets have no counterpart in TheKernel's wall-clock model.
+    pub const fn cleared(&self) -> Self {
+        Self {
+            status: self.status | STA_UNSYNC,
+            maxerror: NTP_PHASE_LIMIT,
+            esterror: NTP_PHASE_LIMIT,
+            adjust: 0,
+            offset_scaled: 0,
+            ..*self
+        }
+    }
+}
+
 /// `CAP_SYS_TIME` availability of the calling task.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimexAuthority {
@@ -613,7 +688,7 @@ fn update_status(next: &mut TimexState, request: &TimexRequest) {
 /// `ntp_update_offset()` (`kernel/time/ntp.c:266-312`).  The phase update is
 /// ignored unless `STA_PLL` is set, is clamped (never rejected) to
 /// `MAXPHASE`, and is stored exactly as Linux stores it.
-fn update_offset(next: &mut TimexState, request: &TimexRequest) {
+fn update_offset(next: &mut TimexState, request: &TimexRequest, ntp_interval_freq: i64) {
     if next.status & STA_PLL == 0 {
         return;
     }
@@ -625,13 +700,15 @@ fn update_offset(next: &mut TimexState, request: &TimexRequest) {
     // "Scale the phase adjustment and clamp to the operating range."
     let offset = offset.clamp(-MAXPHASE, MAXPHASE);
     // `ntpdata->time_offset = div_s64(offset64 << NTP_SCALE_SHIFT, NTP_INTERVAL_FREQ)`
-    // with `NTP_INTERVAL_FREQ == HZ`; TheKernel has a single tick rate, so the
-    // ABI's USER_HZ is used for it.
-    next.offset_scaled = (((offset as i128) << NTP_SCALE_SHIFT) / USER_HZ as i128) as i64;
+    // with `NTP_INTERVAL_FREQ == HZ`: nanoseconds per tick of the kernel's own
+    // tick rate, never per `USER_HZ` tick.  Linux's `HZ` is
+    // `config/kernel.toml`'s `ticks-per-sec`; the value is a parameter because
+    // the rate is a property of the integration layer, not of this crate.
+    next.offset_scaled = (((offset as i128) << NTP_SCALE_SHIFT) / ntp_interval_freq as i128) as i64;
 }
 
 /// `process_adjtimex_modes()` (`kernel/time/ntp.c:728-756`).
-fn apply_modes(next: &mut TimexState, request: &TimexRequest) {
+fn apply_modes(next: &mut TimexState, request: &TimexRequest, ntp_interval_freq: i64) {
     let modes = request.modes;
     if modes & ADJ_STATUS != 0 {
         update_status(next, request);
@@ -667,7 +744,7 @@ fn apply_modes(next: &mut TimexState, request: &TimexRequest) {
         next.tai = request.constant as i32;
     }
     if modes & ADJ_OFFSET != 0 {
-        update_offset(next, request);
+        update_offset(next, request, ntp_interval_freq);
     }
     if modes & ADJ_TICK != 0 {
         next.tick = request.tick;
@@ -675,9 +752,17 @@ fn apply_modes(next: &mut TimexState, request: &TimexRequest) {
 }
 
 /// `txc->offset` as rendered by `ntp_adjtimex()` (`kernel/time/ntp.c:806-808`).
-fn render_offset(state: &TimexState) -> i64 {
+///
+/// The multiplication by `NTP_INTERVAL_FREQ` is the exact inverse of
+/// [`update_offset`]'s division, so a stored residual round trips through
+/// `(offset << 32) / NTP_INTERVAL_FREQ * NTP_INTERVAL_FREQ >> 32`: exact when
+/// the requested phase is a multiple of the tick rate, and at most one
+/// nanosecond (in the direction of the truncating division) otherwise.  That
+/// truncation, not the choice of rate, is what makes a Linux guest running
+/// `CONFIG_HZ=1000` report `offset + ADJ_NANO` as 25 -> 24.
+fn render_offset(state: &TimexState, ntp_interval_freq: i64) -> i64 {
     let nanos = shift_right(
-        (state.offset_scaled as i128 * USER_HZ as i128) as i64,
+        (state.offset_scaled as i128 * ntp_interval_freq as i128) as i64,
         NTP_SCALE_SHIFT,
     );
     if state.status & STA_NANO != 0 {
@@ -699,17 +784,35 @@ fn render_freq(time_freq: i64) -> i64 {
 /// the request, apply the modes in Linux order, and render the result.
 ///
 /// This is the whole pure policy of the syscall: the caller supplies the
-/// current state, the `CAP_SYS_TIME` decision, and the discontinuity it
-/// applies for `ADJ_SETOFFSET` (`setoffset_delta_ns()`), and publishes
-/// `next` only when `changed` is set.
+/// current state, the `CAP_SYS_TIME` decision, the kernel's own tick rate
+/// (`NTP_INTERVAL_FREQ`, i.e. `CONFIG_HZ`), and the discontinuity it applies
+/// for `ADJ_SETOFFSET` (`setoffset_delta_ns()`), and publishes `next` only when
+/// `changed` is set.  `ntp_interval_freq` must be positive; it is what Linux's
+/// `NTP_INTERVAL_FREQ` names, and a zero or negative value has no Linux
+/// behaviour to mirror.
 pub fn adjust(
     state: &TimexState,
     request: &TimexRequest,
     authority: TimexAuthority,
+    ntp_interval_freq: i64,
 ) -> Result<TimexUpdate, Reject> {
+    assert!(
+        ntp_interval_freq > 0,
+        "NTP_INTERVAL_FREQ must be a positive tick rate"
+    );
     validate(request, authority)?;
     let modes = request.modes;
-    let mut next = *state;
+    // `ADJ_SETOFFSET` injects the discontinuity and publishes the shadow
+    // timekeeper with `TK_UPDATE_ALL` *before* `ntp_adjtimex()` applies the
+    // modes (`kernel/time/timekeeping.c:2957-2966`, `kernel/time/ntp.c:786-806`),
+    // so the modes and the read-back both see the cleared state.  The caller
+    // performs the injection itself and publishes only after it succeeds, so a
+    // rejected injection discards this state along with the rest of the update.
+    let mut next = if modes & ADJ_SETOFFSET != 0 {
+        state.cleared()
+    } else {
+        *state
+    };
     let mut output = TimexOutput::default();
     if modes & ADJ_ADJTIME != 0 {
         // adjtime(3) mode: report the residual being replaced, and never touch
@@ -720,9 +823,9 @@ pub fn adjust(
         }
     } else {
         if modes != 0 {
-            apply_modes(&mut next, request);
+            apply_modes(&mut next, request, ntp_interval_freq);
         }
-        output.offset = render_offset(&next);
+        output.offset = render_offset(&next, ntp_interval_freq);
     }
     output.freq = render_freq(next.freq);
     output.maxerror = next.maxerror;
@@ -766,7 +869,7 @@ mod tests {
     }
 
     fn read(state: &TimexState) -> TimexUpdate {
-        adjust(state, &TimexRequest::default(), root()).unwrap()
+        adjust(state, &TimexRequest::default(), root(), NTP_INTERVAL_FREQ).unwrap()
     }
 
     fn request(modes: u32) -> TimexRequest {
@@ -846,6 +949,7 @@ mod tests {
             TimexAuthority {
                 cap_sys_time: false,
             },
+            NTP_INTERVAL_FREQ,
         )
         .unwrap();
         assert_eq!(unprivileged.result, TIME_ERROR);
@@ -856,7 +960,7 @@ mod tests {
         let mut state = TimexState::INITIAL;
         let mut req = request(ADJ_STATUS);
         req.status = STA_PLL;
-        let update = adjust(&state, &req, root()).unwrap();
+        let update = adjust(&state, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.output.status, STA_PLL);
         assert_eq!(update.result, TIME_OK);
         assert!(update.changed);
@@ -865,7 +969,7 @@ mod tests {
         // merge takes only STA_RONLY bits from the previous value.
         let mut clear = request(ADJ_STATUS);
         clear.status = 0;
-        let update = adjust(&state, &clear, root()).unwrap();
+        let update = adjust(&state, &clear, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.output.status, 0);
         assert_eq!(update.result, TIME_OK);
     }
@@ -879,7 +983,7 @@ mod tests {
         let mut req = request(ADJ_STATUS);
         // STA_MODE, STA_CLOCKERR and the PPS condition bits are read-only.
         req.status = STA_PLL | STA_MODE | STA_CLOCKERR | STA_PPSERROR;
-        let update = adjust(&state, &req, root()).unwrap();
+        let update = adjust(&state, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(
             update.output.status,
             STA_PLL | STA_NANO | STA_CLK | STA_PPSJITTER
@@ -904,16 +1008,16 @@ mod tests {
     #[test]
     fn micro_and_nano_precedence_and_time_constant_offset() {
         // ADJ_NANO selects nanoseconds ...
-        let update = adjust(&TimexState::INITIAL, &request(ADJ_NANO), root()).unwrap();
+        let update = adjust(&TimexState::INITIAL, &request(ADJ_NANO), root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.output.status & STA_NANO, STA_NANO);
         // ... ADJ_MICRO clears it, and a request with both ends up microsecond.
-        let update = adjust(&TimexState::INITIAL, &request(ADJ_MICRO | ADJ_NANO), root()).unwrap();
+        let update = adjust(&TimexState::INITIAL, &request(ADJ_MICRO | ADJ_NANO), root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.output.status & STA_NANO, 0);
         // The time constant is reported four higher in microsecond mode.
         let mut req = request(ADJ_TIMECONST);
         req.constant = 3;
         assert_eq!(
-            adjust(&TimexState::INITIAL, &req, root())
+            adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ)
                 .unwrap()
                 .output
                 .constant,
@@ -922,7 +1026,7 @@ mod tests {
         let mut req = request(ADJ_TIMECONST | ADJ_NANO);
         req.constant = 3;
         assert_eq!(
-            adjust(&TimexState::INITIAL, &req, root())
+            adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ)
                 .unwrap()
                 .output
                 .constant,
@@ -932,7 +1036,7 @@ mod tests {
         let mut req = request(ADJ_TIMECONST);
         req.constant = 10;
         assert_eq!(
-            adjust(&TimexState::INITIAL, &req, root())
+            adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ)
                 .unwrap()
                 .output
                 .constant,
@@ -955,20 +1059,20 @@ mod tests {
         assert_eq!((TICK_MIN, TICK_MAX), (9_000, 11_000));
         let mut ok = request(ADJ_TICK);
         ok.tick = 9_000;
-        assert!(adjust(&TimexState::INITIAL, &ok, root()).is_ok());
+        assert!(adjust(&TimexState::INITIAL, &ok, root(), NTP_INTERVAL_FREQ).is_ok());
         let mut ok = request(ADJ_TICK);
         ok.tick = 11_000;
-        assert!(adjust(&TimexState::INITIAL, &ok, root()).is_ok());
+        assert!(adjust(&TimexState::INITIAL, &ok, root(), NTP_INTERVAL_FREQ).is_ok());
         let mut low = request(ADJ_TICK);
         low.tick = 8_999;
         assert_eq!(
-            adjust(&TimexState::INITIAL, &low, root()),
+            adjust(&TimexState::INITIAL, &low, root(), NTP_INTERVAL_FREQ),
             Err(Reject::InvalidMode)
         );
         let mut high = request(ADJ_TICK);
         high.tick = 11_001;
         assert_eq!(
-            adjust(&TimexState::INITIAL, &high, root()),
+            adjust(&TimexState::INITIAL, &high, root(), NTP_INTERVAL_FREQ),
             Err(Reject::InvalidMode)
         );
     }
@@ -977,7 +1081,7 @@ mod tests {
     fn unknown_mode_bits_are_ignored() {
         let mut req = request(ADJ_TICK | 0x0002_0000 | 0x4000_0000);
         req.tick = 10_000;
-        let update = adjust(&TimexState::INITIAL, &req, root()).unwrap();
+        let update = adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.output.tick, 10_000);
         // Unknown bits alone are still "modes != 0" and need CAP_SYS_TIME.
         assert_eq!(
@@ -986,7 +1090,8 @@ mod tests {
                 &request(0x0002_0000),
                 TimexAuthority {
                     cap_sys_time: false
-                }
+                },
+                NTP_INTERVAL_FREQ
             ),
             Err(Reject::NotPermitted)
         );
@@ -997,36 +1102,85 @@ mod tests {
         // Without STA_PLL the phase update is discarded entirely.
         let mut req = request(ADJ_OFFSET | ADJ_NANO);
         req.offset = 1_234;
-        let update = adjust(&TimexState::INITIAL, &req, root()).unwrap();
+        let update = adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.output.offset, 0);
         // With STA_PLL set in the same call it applies.
         let mut req = request(ADJ_STATUS | ADJ_OFFSET | ADJ_NANO);
         req.status = STA_PLL;
         req.offset = 1_234;
-        let update = adjust(&TimexState::INITIAL, &req, root()).unwrap();
+        let update = adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         // The scaled residual renders one nanosecond low: `time_offset` is
         // `offset << 32 / NTP_INTERVAL_FREQ` and the render multiplies the
         // truncated quotient back, exactly as Linux does.
         assert_eq!(update.output.offset, 1_233);
-        assert_eq!(update.next.offset_scaled, (1_234i128 << 32) as i64 / 100);
+        assert_eq!(
+            update.next.offset_scaled,
+            (1_234i128 << 32) as i64 / NTP_INTERVAL_FREQ
+        );
         // Oversized phases saturate at MAXPHASE rather than failing.
         let mut req = request(ADJ_STATUS | ADJ_OFFSET | ADJ_NANO);
         req.status = STA_PLL;
         req.offset = 1_000_000_000;
-        let update = adjust(&TimexState::INITIAL, &req, root()).unwrap();
+        let update = adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.output.offset, 500_000_000);
         // Microsecond mode clamps to one second before scaling.
         let mut req = request(ADJ_STATUS | ADJ_OFFSET);
         req.status = STA_PLL;
         req.offset = 5_000_000;
-        let update = adjust(&TimexState::INITIAL, &req, root()).unwrap();
+        let update = adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.output.offset, 500_000);
         // A negative phase keeps its sign (truncating, not flooring, shifts).
         let mut req = request(ADJ_STATUS | ADJ_OFFSET | ADJ_NANO);
         req.status = STA_PLL;
         req.offset = -1_234;
-        let update = adjust(&TimexState::INITIAL, &req, root()).unwrap();
+        let update = adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.output.offset, -1_233);
+    }
+
+    #[test]
+    fn offset_scaling_uses_ntp_interval_freq_and_is_bounded_by_one_nanosecond() {
+        // Linux divides by `NTP_INTERVAL_FREQ`, which `include/linux/timex.h:151`
+        // spells `(HZ)`, and multiplies by the same value on the way out
+        // (`kernel/time/ntp.c:333,806`).  Two consequences are asserted here.
+        //
+        // First, the stored residual is divided by the supplied rate and not by
+        // the ABI's `USER_HZ`: a 1000 Hz kernel stores 1/10 of a 100 Hz kernel's
+        // value for the same phase.  A rate-blind implementation (the ABI
+        // constant) keeps the 100 Hz value and so cannot match a Linux guest
+        // whose CONFIG_HZ differs from USER_HZ.
+        let mut req = request(ADJ_STATUS | ADJ_OFFSET | ADJ_NANO);
+        req.status = STA_PLL;
+        req.offset = 1_000_000;
+        let slow = adjust(&TimexState::INITIAL, &req, root(), 100).unwrap();
+        let fast = adjust(&TimexState::INITIAL, &req, root(), 1000).unwrap();
+        assert_eq!(slow.next.offset_scaled, (1_000_000i128 << 32) as i64 / 100);
+        assert_eq!(fast.next.offset_scaled, (1_000_000i128 << 32) as i64 / 1000);
+        assert_eq!(
+            slow.next.offset_scaled,
+            fast.next.offset_scaled * (1000 / 100)
+        );
+        // Second, the phase round trips through that pair of operations, so the
+        // error is bounded by the truncating division: exact for a phase that is
+        // a multiple of the rate, and at most one nanosecond (never worse) in
+        // either direction otherwise.  This is the property that makes
+        // `offset + ADJ_NANO` render as 25 -> 24 on a 1000 Hz Linux guest while
+        // a 100 Hz guest reports 25 back.
+        for rate in [100i64, 250, 300, 1000] {
+            for phase in [1i64, 2, 3, 25, 26, 99, 100, 101, 1_234, 600_000, -1, -25, -26] {
+                let mut req = request(ADJ_STATUS | ADJ_OFFSET | ADJ_NANO);
+                req.status = STA_PLL;
+                req.offset = phase;
+                let update = adjust(&TimexState::INITIAL, &req, root(), rate).unwrap();
+                let rendered = update.output.offset;
+                assert!(
+                    (rendered - phase).abs() <= 1,
+                    "rate {rate} phase {phase} rendered {rendered}"
+                );
+                if phase % rate == 0 {
+                    assert_eq!(rendered, phase, "rate {rate} phase {phase}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1038,13 +1192,13 @@ mod tests {
         // ADJ_OFFSET_SINGLESHOT replaces the residual and reports the old one.
         let mut req = request(ADJ_ADJTIME | ADJ_OFFSET);
         req.offset = -500;
-        let update = adjust(&state, &req, root()).unwrap();
+        let update = adjust(&state, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.output.offset, 1_234);
         assert_eq!(update.next.adjust, -500);
         assert!(update.changed);
         // ADJ_OFFSET_SS_READ reports the residual without replacing it.
         let req = request(ADJ_OFFSET_SS_READ);
-        let update = adjust(&state, &req, root()).unwrap();
+        let update = adjust(&state, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.output.offset, 1_234);
         assert!(!update.changed);
         // The residual is reported in microseconds regardless of STA_NANO.
@@ -1053,7 +1207,7 @@ mod tests {
             adjust: 7,
             ..TimexState::INITIAL
         };
-        assert_eq!(adjust(&state, &req, root()).unwrap().output.offset, 7);
+        assert_eq!(adjust(&state, &req, root(), NTP_INTERVAL_FREQ).unwrap().output.offset, 7);
     }
 
     #[test]
@@ -1064,14 +1218,20 @@ mod tests {
             cap_sys_time: false,
         };
         assert_eq!(
-            adjust(&TimexState::INITIAL, &request(ADJ_ADJTIME), unprivileged),
+            adjust(
+                &TimexState::INITIAL,
+                &request(ADJ_ADJTIME),
+                unprivileged,
+                NTP_INTERVAL_FREQ
+            ),
             Err(Reject::InvalidMode)
         );
         assert_eq!(
             adjust(
                 &TimexState::INITIAL,
                 &request(ADJ_ADJTIME | ADJ_OFFSET),
-                unprivileged
+                unprivileged,
+                NTP_INTERVAL_FREQ
             ),
             Err(Reject::NotPermitted)
         );
@@ -1079,7 +1239,8 @@ mod tests {
             adjust(
                 &TimexState::INITIAL,
                 &request(ADJ_OFFSET_SS_READ),
-                unprivileged
+                unprivileged,
+                NTP_INTERVAL_FREQ
             )
             .is_ok()
         );
@@ -1096,7 +1257,12 @@ mod tests {
             ADJ_SETOFFSET,
         ] {
             assert_eq!(
-                adjust(&TimexState::INITIAL, &request(modes), unprivileged),
+                adjust(
+                    &TimexState::INITIAL,
+                    &request(modes),
+                    unprivileged,
+                    NTP_INTERVAL_FREQ
+                ),
                 Err(Reject::NotPermitted),
                 "modes {modes:#x}"
             );
@@ -1108,38 +1274,38 @@ mod tests {
         let mut req = request(ADJ_MAXERROR | ADJ_ESTERROR);
         req.maxerror = -5;
         req.esterror = i64::MAX;
-        let update = adjust(&TimexState::INITIAL, &req, root()).unwrap();
+        let update = adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.output.maxerror, 0);
         assert_eq!(update.output.esterror, 16_000_000);
         // 1 ppm round-trips through Linux's fixed-point inverse ...
         let mut req = request(ADJ_FREQUENCY);
         req.freq = 65_536;
-        let update = adjust(&TimexState::INITIAL, &req, root()).unwrap();
+        let update = adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.next.freq, 65_536 * PPM_SCALE);
         assert_eq!(update.output.freq, 65_536);
         // ... and 1000 ppm saturates at exactly +MAXFREQ (500 ppm).
         let mut req = request(ADJ_FREQUENCY);
         req.freq = 1_000 * 65_536;
-        let update = adjust(&TimexState::INITIAL, &req, root()).unwrap();
+        let update = adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(update.next.freq, MAXFREQ_SCALED);
         assert_eq!(update.output.freq, 32_768_000);
         // Overflowing operands are rejected, exactly at the Linux boundary.
         let mut req = request(ADJ_FREQUENCY);
         req.freq = i64::MAX / PPM_SCALE;
-        assert!(adjust(&TimexState::INITIAL, &req, root()).is_ok());
+        assert!(adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ).is_ok());
         let mut req = request(ADJ_FREQUENCY);
         req.freq = i64::MAX / PPM_SCALE + 1;
         assert_eq!(
-            adjust(&TimexState::INITIAL, &req, root()),
+            adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ),
             Err(Reject::InvalidMode)
         );
         let mut req = request(ADJ_FREQUENCY);
         req.freq = i64::MIN / PPM_SCALE;
-        assert!(adjust(&TimexState::INITIAL, &req, root()).is_ok());
+        assert!(adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ).is_ok());
         let mut req = request(ADJ_FREQUENCY);
         req.freq = i64::MIN / PPM_SCALE - 1;
         assert_eq!(
-            adjust(&TimexState::INITIAL, &req, root()),
+            adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ),
             Err(Reject::InvalidMode)
         );
     }
@@ -1149,7 +1315,7 @@ mod tests {
         let mut req = request(ADJ_TAI);
         req.constant = MAX_TAI_OFFSET;
         assert_eq!(
-            adjust(&TimexState::INITIAL, &req, root())
+            adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ)
                 .unwrap()
                 .output
                 .tai,
@@ -1158,7 +1324,7 @@ mod tests {
         for constant in [-1, MAX_TAI_OFFSET + 1, i64::MAX, i64::MIN] {
             let mut req = request(ADJ_TAI);
             req.constant = constant;
-            let update = adjust(&TimexState::INITIAL, &req, root()).unwrap();
+            let update = adjust(&TimexState::INITIAL, &req, root(), NTP_INTERVAL_FREQ).unwrap();
             assert_eq!(update.output.tai, 0, "constant {constant}");
             assert!(!update.changed);
         }
@@ -1175,7 +1341,8 @@ mod tests {
                 &req,
                 TimexAuthority {
                     cap_sys_time: false
-                }
+                },
+                NTP_INTERVAL_FREQ
             ),
             Err(Reject::NotPermitted)
         );
@@ -1188,13 +1355,13 @@ mod tests {
         let mut bad = request(ADJ_SETOFFSET);
         bad.time_usec = -1;
         assert_eq!(
-            adjust(&TimexState::INITIAL, &bad, root()),
+            adjust(&TimexState::INITIAL, &bad, root(), NTP_INTERVAL_FREQ),
             Err(Reject::InvalidMode)
         );
         let mut bad = request(ADJ_SETOFFSET);
         bad.time_usec = 1_000_000;
         assert_eq!(
-            adjust(&TimexState::INITIAL, &bad, root()),
+            adjust(&TimexState::INITIAL, &bad, root(), NTP_INTERVAL_FREQ),
             Err(Reject::InvalidMode)
         );
         let mut ok = request(ADJ_SETOFFSET | ADJ_NANO);
@@ -1203,9 +1370,90 @@ mod tests {
         let mut bad = request(ADJ_SETOFFSET | ADJ_NANO);
         bad.time_usec = 1_000_000_000;
         assert_eq!(
-            adjust(&TimexState::INITIAL, &bad, root()),
+            adjust(&TimexState::INITIAL, &bad, root(), NTP_INTERVAL_FREQ),
             Err(Reject::InvalidMode)
         );
+    }
+
+    #[test]
+    fn setoffset_clears_the_ntp_state_before_the_modes_apply() {
+        // `__timekeeping_inject_offset()` publishes with `TK_UPDATE_ALL`, so
+        // the injection runs `ntp_clear()` before `ntp_adjtimex()` reads back
+        // the state: STA_UNSYNC is added, both error estimates return to
+        // NTP_PHASE_LIMIT, and the phase offset and adjtime(3) residual are
+        // dropped.  The returned value is TIME_ERROR, not TIME_OK, and a
+        // preceding synchronous state is lost.
+        let state = TimexState {
+            status: STA_PLL | STA_NANO,
+            state: TIME_OK,
+            offset_scaled: (600_000i64) << 32,
+            adjust: 42,
+            freq: 1 << 16,
+            constant: 7,
+            maxerror: 10,
+            esterror: 20,
+            tick: TICK_USEC,
+            tai: 37,
+        };
+        let mut req = request(ADJ_SETOFFSET | ADJ_MICRO);
+        req.time_sec = 1;
+        let update = adjust(&state, &req, root(), NTP_INTERVAL_FREQ).unwrap();
+        assert_eq!(update.result, TIME_ERROR);
+        assert!(update.changed);
+        assert_eq!(update.next.status, STA_PLL | STA_UNSYNC);
+        assert_eq!(update.next.maxerror, NTP_PHASE_LIMIT);
+        assert_eq!(update.next.esterror, NTP_PHASE_LIMIT);
+        assert_eq!(update.next.offset_scaled, 0);
+        assert_eq!(update.next.adjust, 0);
+        // `__ntp_clear()` leaves the frequency, time constant, tick and TAI
+        // offset alone, and `time_state` is only reset by `process_adj_status`.
+        assert_eq!(update.next.freq, 1 << 16);
+        assert_eq!(update.next.constant, 7);
+        assert_eq!(update.next.tick, TICK_USEC);
+        assert_eq!(update.next.tai, 37);
+        assert_eq!(update.next.state, TIME_OK);
+        // The modes still apply, on top of the cleared state: the offset is
+        // scaled and rendered, and STA_UNSYNC survives because only ADJ_STATUS
+        // may clear it (`process_adj_status()` re-derives the writable bits).
+        let mut both = request(ADJ_SETOFFSET | ADJ_OFFSET | ADJ_NANO);
+        both.time_sec = 1;
+        both.offset = 600_000;
+        let update = adjust(&state, &both, root(), NTP_INTERVAL_FREQ).unwrap();
+        assert_eq!(update.output.offset, 600_000);
+        assert_eq!(update.next.status, STA_PLL | STA_NANO | STA_UNSYNC);
+        assert_eq!(update.result, TIME_ERROR);
+        // A rejected request clears nothing: the injection never ran.
+        let mut bad = request(ADJ_SETOFFSET);
+        bad.time_usec = 1_000_000;
+        assert_eq!(
+            adjust(&state, &bad, root(), NTP_INTERVAL_FREQ),
+            Err(Reject::InvalidMode)
+        );
+    }
+
+    #[test]
+    fn cleared_state_matches_ntp_clear_field_by_field() {
+        // `__ntp_clear()` (kernel/time/ntp.c:334-352) adds STA_UNSYNC without
+        // disturbing the other status bits, including a latched error bit.
+        let state = TimexState {
+            status: STA_PLL | STA_NANO | STA_CLOCKERR,
+            maxerror: 5,
+            esterror: 6,
+            adjust: 7,
+            offset_scaled: 8,
+            ..TimexState::INITIAL
+        };
+        let cleared = state.cleared();
+        assert_eq!(cleared.status, STA_PLL | STA_NANO | STA_CLOCKERR | STA_UNSYNC);
+        assert_eq!(cleared.maxerror, NTP_PHASE_LIMIT);
+        assert_eq!(cleared.esterror, NTP_PHASE_LIMIT);
+        assert_eq!(cleared.adjust, 0);
+        assert_eq!(cleared.offset_scaled, 0);
+        assert_eq!(cleared.constant, state.constant);
+        assert_eq!(cleared.tick, state.tick);
+        assert_eq!(cleared.tai, state.tai);
+        assert_eq!(cleared.state, state.state);
+        assert!(is_error_status(cleared.status));
     }
 
     #[test]
@@ -1300,17 +1548,52 @@ mod tests {
     }
 
     #[test]
+    fn nanosleep_wake_alarm_checks_the_rtc_then_the_flags_then_the_capability() {
+        // `alarm_timer_nsleep()` (kernel/time/alarmtimer.c:766-790) tests RTC,
+        // then `flags & ~TIMER_ABSTIME`, then CAP_WAKE_ALARM, so each earlier
+        // failure hides every later one.
+        assert_eq!(
+            check_nanosleep_wake_alarm(CLOCK_REALTIME_ALARM, 0x2, false, false),
+            Err(WakeAlarmReject::NoRtc)
+        );
+        assert_eq!(
+            check_nanosleep_wake_alarm(CLOCK_REALTIME_ALARM, 0x2, true, false),
+            Err(WakeAlarmReject::BadFlags)
+        );
+        assert_eq!(
+            check_nanosleep_wake_alarm(CLOCK_REALTIME_ALARM, 0x2, true, true),
+            Err(WakeAlarmReject::BadFlags)
+        );
+        assert_eq!(
+            check_nanosleep_wake_alarm(CLOCK_REALTIME_ALARM, 0, true, false),
+            Err(WakeAlarmReject::NotPermitted)
+        );
+        assert_eq!(
+            check_nanosleep_wake_alarm(CLOCK_REALTIME_ALARM, TIMER_ABSTIME, true, true),
+            Ok(())
+        );
+        // Every other clock ignores the whole flags word here: its own nsleep
+        // only masks `TIMER_ABSTIME` (kernel/time/posix-timers.c:1355-1363).
+        for clock_id in [CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME, CLOCK_TAI] {
+            assert_eq!(
+                check_nanosleep_wake_alarm(clock_id, 0xdead_beef, false, false),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
     fn adjust_is_a_pure_function_of_state_and_request() {
         let mut req = request(ADJ_STATUS | ADJ_OFFSET | ADJ_TIMECONST);
         req.status = STA_PLL;
         req.offset = 500_000;
         req.constant = 4;
         let state = TimexState::INITIAL;
-        let first = adjust(&state, &req, root()).unwrap();
-        let second = adjust(&state, &req, root()).unwrap();
+        let first = adjust(&state, &req, root(), NTP_INTERVAL_FREQ).unwrap();
+        let second = adjust(&state, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert_eq!(first, second);
         // Applying the same request to the resulting state is idempotent.
-        let again = adjust(&first.next, &req, root()).unwrap();
+        let again = adjust(&first.next, &req, root(), NTP_INTERVAL_FREQ).unwrap();
         assert!(!again.changed);
         assert_eq!(again.output, first.output);
     }
