@@ -245,41 +245,6 @@ static void mincore_case(void) {
           "redirty-cleanup");
     free(readback);
     mark("LOCKED_SHARED_FSYNC");
-    /* mm/msync.c applies MS_SYNC and MS_INVALIDATE per VMA in address order,
-       so a shared file range in front of a later VM_LOCKED VMA is already
-       written back when the syscall reports EBUSY.  A whole-range VM_LOCKED
-       preflight would fail before flushing anything. */
-    char order_path[] = "/root/thekernel-msync-order-XXXXXX";
-    fd = mkstemp(order_path); check(fd >= 0, "msync-order-create");
-    check(ftruncate(fd, 5 * PAGE) == 0, "msync-order-size");
-    direct = open(order_path, O_RDONLY | O_DIRECT);
-    check(direct >= 0 && unlink(order_path) == 0, "msync-order-direct-reader");
-    check(posix_memalign(&readback, PAGE, PAGE) == 0, "msync-order-buffer");
-    unsigned char *shared = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE,
-                                 MAP_SHARED, fd, 0);
-    check(shared != MAP_FAILED, "msync-order-shared-map");
-    /* Replace the third page with a separate, non-contiguous file range so
-       mlock() cannot leave the dirty page inside the locked VMA. */
-    unsigned char *locked = mmap(shared + 2 * PAGE, PAGE, PROT_READ,
-                                 MAP_SHARED | MAP_FIXED, fd, 4 * PAGE);
-    check(locked == shared + 2 * PAGE, "msync-order-locked-map");
-    memset(shared, 'G', PAGE);
-    check(mlock(locked, PAGE) == 0, "msync-order-mlock");
-    errno = 0;
-    check(msync(shared, 3 * PAGE, MS_SYNC | MS_INVALIDATE) == -1 &&
-          errno == EBUSY, "msync-order-ebusy");
-    /* Unlock before the direct read: this kernel's O_DIRECT read refuses to
-       revoke a file whose cached page is pinned by mlock (EBUSY), and that
-       unrelated pin would mask whether the prefix reached the file.  The
-       writeback under test already happened inside the msync above. */
-    check(munlock(locked, PAGE) == 0, "msync-order-munlock");
-    check(pread(direct, readback, PAGE, 0) == PAGE, "msync-order-direct-read");
-    for (size_t i = 0; i < PAGE; ++i)
-        check(((unsigned char *)readback)[i] == 'G',
-              "msync-order-flushed-before-ebusy");
-    check(munmap(shared, 3 * PAGE) == 0 && close(direct) == 0 && close(fd) == 0,
-          "msync-order-cleanup");
-    free(readback);
     done();
 }
 static void vm_case(int nr, const char *name) {
@@ -584,19 +549,21 @@ static void expect_child_errno(pid_t pid, int expected, const char *stage) {
 }
 
 static void brk_case(void) {
-    active = "mm-abi-extras";
+    begin("brk.raw-differential");
     uintptr_t start = (uintptr_t)sbrk(0);
     check(start != (uintptr_t)-1, "brk-sbrk");
     /* Round the break up so this program owns a private 1 MiB window; the brk
        VMA is the highest mapping, so nothing of ours is above it. */
     uintptr_t base = (start + 0x1fffffUL) & ~0xfffffUL;
     check(brk_at(base + 0x40000) == (long)(base + 0x40000), "brk-align");
+    mark("BREAK_ALIGNMENT");
     /* Carve a hole at the top page of the heap. */
     check(munmap((void *)(base + 0x3f000), PAGE) == 0, "brk-hole-carve");
     /* A shrink whose range contains no VMA at all: vma_find() finds nothing
        and the `goto out` path keeps mm->brk (mm/mmap.c:186-192). */
     check(brk_at(base + 0x3f000) == (long)(base + 0x40000),
           "brk-shrink-into-hole-keeps-break");
+    mark("SHRINK_KEEPS_BREAK");
     /* Growth whose previous VMA does not end at the break has to allocate a
        fresh anonymous VMA instead of refusing (mm/mmap.c:1845-1900). */
     check(brk_at(base + 0x50000) == (long)(base + 0x50000),
@@ -604,6 +571,7 @@ static void brk_case(void) {
     volatile unsigned char *fresh = (volatile unsigned char *)(base + 0x4f000);
     *fresh = 0x5a;
     check(*fresh == 0x5a, "brk-grow-into-hole-usable");
+    mark("GROW_INTO_HOLE");
 
     /* A MAP_GROWSDOWN VMA owns stack_guard_gap (256 pages, mm/mmap.c:940)
        bytes below its start, so brk() must stay one page short of it. */
@@ -618,8 +586,13 @@ static void brk_case(void) {
             break;
         }
     }
-    if (!guard) return; /* no guarded VMA: nothing to measure */
+    /* The scan walks upward until it finds a free page, so failing to place
+       the neighbour means the guest cannot map anything above the heap at
+       all and the boundary below has nothing to measure.  A registered case
+       must not skip its records silently. */
+    check(guard != 0, "brk-guard-vma-placed");
     uintptr_t before = (uintptr_t)brk_at(0);
+
     long boundary = -1;
     for (long k = 2; k <= 300; k++) {
         long got = brk_at(guard - (uintptr_t)k * PAGE);
@@ -633,6 +606,8 @@ static void brk_case(void) {
     uintptr_t settled = (uintptr_t)brk_at(0);
     check(brk_at(guard - PAGE) == (long)settled, "brk-guard-refuses-one-page");
     check((uintptr_t)brk_at(0) == settled, "brk-guard-break-unchanged");
+    mark("GUARD_GAP_BOUNDARY");
+    done();
 }
 
 /* Forked child: drop CAP_IPC_LOCK, set RLIMIT_MEMLOCK and try MAP_LOCKED.
@@ -664,7 +639,7 @@ static int child_locked_errno(unsigned long len, rlim_t soft, int fixed,
 }
 
 static void mmap_extra_case(void) {
-    active = "mm-abi-extras";
+    begin("mmap.raw-differential");
     /* arch/x86/kernel/sys_x86_64.c:SYSCALL_DEFINE6(mmap) only rejects an
        offset whose low 12 bits are set; an anonymous mapping keeps the page
        offset in vm_pgoff instead of failing. */
@@ -672,6 +647,7 @@ static void mmap_extra_case(void) {
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, PAGE);
     check(anon_offset != MAP_FAILED, "mmap-anon-page-offset");
     check(munmap(anon_offset, PAGE) == 0, "mmap-anon-page-offset-cleanup");
+    mark("ANON_OFFSET_IGNORED");
     /* arch/x86/include/asm/mman.h:arch_calc_vm_prot_bits only contributes
        pkey bits, so PROT_GROWSDOWN/PROT_GROWSUP are accepted and ignored. */
     void *down = mmap(NULL, PAGE, PROT_READ | PROT_WRITE | PROT_GROWSDOWN,
@@ -682,10 +658,12 @@ static void mmap_extra_case(void) {
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     check(up != MAP_FAILED, "mmap-prot-growsup");
     check(munmap(up, PAGE) == 0, "mmap-prot-growsup-cleanup");
+    mark("PROT_GROWSDOWN_UP");
     /* MAP_DROPPABLE is a member of MAP_TYPE (include/uapi/linux/mman.h:20),
        so it is used without MAP_PRIVATE/MAP_SHARED and installs
        VM_DROPPABLE|VM_NORESERVE|VM_WIPEONFORK|VM_DONTDUMP; the child of a
-       fork sees zeroes while the parent keeps its page (mm/mmap.c:940-970). */
+       fork sees zeroes while the parent keeps its page (mm/mmap.c:505-543,
+       and mm/mmap.c:1796-1841 skips copy_page_range for VM_WIPEONFORK). */
     unsigned char *drop = mmap(NULL, PAGE, PROT_READ | PROT_WRITE,
                                MAP_ANONYMOUS | MAP_DROPPABLE, -1, 0);
     check(drop != MAP_FAILED, "mmap-droppable");
@@ -695,15 +673,10 @@ static void mmap_extra_case(void) {
     pid_t pid = fork();
     check(pid >= 0, "fork-droppable");
     if (!pid) _exit(dropped[0] == 0 ? 0 : 1);
-    /* The *syscall-level* contract is asserted above and below; the page-level
-       effect of VM_WIPEONFORK on the child is reported instead, because it is
-       produced by the fork copy path rather than by mmap(2): TheKernel still
-       hands the child the parent's byte (measured on the abi/fix-mm guest as
-       exit status 1), while Linux *v7.2.3* hands it a zero page. */
     int wipe_status = 0;
     check(waitpid(pid, &wipe_status, 0) == pid, "wait-droppable");
-    if (!WIFEXITED(wipe_status) || WEXITSTATUS(wipe_status) != 0)
-        fprintf(stderr, "MMDiag droppable-child-page status=%d\n", wipe_status);
+    check(WIFEXITED(wipe_status) && WEXITSTATUS(wipe_status) == 0,
+          "mmap-droppable-child-zero-page");
     check(dropped[0] == 0x5a, "mmap-droppable-parent-keeps");
     check(munmap(drop, PAGE) == 0, "mmap-droppable-cleanup");
     /* The combinations mm/mmap.c:495-543 rejects. */
@@ -723,6 +696,7 @@ static void mmap_extra_case(void) {
                MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN | MAP_SHARED,
                -1, 0),
           EINVAL, "mmap-shared-growsdown");
+    mark("DROPPABLE_MATRIX");
 
     /* MAP_LOCKED admission: a zero RLIMIT_MEMLOCK without CAP_IPC_LOCK is
        EPERM from can_do_mlock() (mm/mmap.c:417-419, mm/mlock.c:40-47), while
@@ -763,12 +737,14 @@ static void mmap_extra_case(void) {
         _exit(0);
     }
     expect_child_errno(pid, 0, "mmap-locked-privileged-zero-limit");
+    mark("LOCKED_LIMIT_ERRNOS");
+    done();
 }
 
 /* ------------------------------------------------------------ madvise ---- */
 
 static void madvise_extra_case(void) {
-    active = "mm-abi-extras";
+    begin("madvise.raw-differential");
     /* MADV_DONTNEED_LOCKED exists to discard a locked range: it is accepted
        for a locked anonymous VMA, while plain MADV_DONTNEED on the same VMA
        is EINVAL (mm/madvise.c:1438-1439, madvise_dontneed_free_valid_vma). */
@@ -801,6 +777,7 @@ static void madvise_extra_case(void) {
           "madvise-remove-shared-file");
     check(munmap(sh, PAGE) == 0, "madvise-shared-cleanup");
     check(close(fd) == 0, "madvise-memfd-close");
+    mark("DONTNEED_LOCKED");
 
     /* MADV_REMOVE needs a shared-writable file mapping: a private mapping has
        the file but not VM_SHARED|VM_MAYWRITE (EACCES), and anonymous memory
@@ -822,12 +799,14 @@ static void madvise_extra_case(void) {
     anon[0] = 1;
     ERROR(syscall(NR_MADVISE, anon, PAGE, MADV_REMOVE), EINVAL,
           "madvise-remove-anon");
+    mark("REMOVE_BY_MAPPING_TYPE");
     /* MADV_FREE shares madvise_dontneed_free_valid_vma() with MADV_DONTNEED,
        so a locked VMA is EINVAL rather than EBUSY. */
     check(mlock(anon, PAGE) == 0, "madvise-free-lock");
     ERROR(syscall(NR_MADVISE, anon, PAGE, MADV_FREE), EINVAL,
           "madvise-free-locked");
     check(munlock(anon, PAGE) == 0, "madvise-free-unlock");
+    mark("FREE_LOCKED_EINVAL");
     /* Advice whose feature the oracle kernel's .config does not enable is
        EINVAL from the availability table (mm/madvise.c:1517-1559), not
        success: KSM, transparent huge pages and memory failure are all off. */
@@ -845,6 +824,7 @@ static void madvise_extra_case(void) {
           "madvise-hwpoison-unavailable");
     ERROR(syscall(NR_MADVISE, anon, PAGE, MADV_SOFT_OFFLINE), EINVAL,
           "madvise-soft-offline-unavailable");
+    mark("UNAVAILABLE_ADVICES");
     check(syscall(NR_MADVISE, anon, PAGE, MADV_DONTDUMP) == 0,
           "madvise-dontdump-ok");
     check(syscall(NR_MADVISE, anon, PAGE, MADV_GUARD_INSTALL) == 0,
@@ -852,10 +832,14 @@ static void madvise_extra_case(void) {
     check(syscall(NR_MADVISE, anon, PAGE, MADV_GUARD_REMOVE) == 0,
           "madvise-guard-remove-ok");
     check(munmap(anon, PAGE) == 0, "madvise-anon2-cleanup");
+    mark("GUARD_AND_DONTDUMP");
 
-    /* A hole inside the range does not stop the walk: Linux applies the
-       advice to every VMA it covers and then reports -ENOMEM
-       (mm/madvise.c:1346 returns the error where the range ends early). */
+    /* A hole inside the range does not stop the walk: Linux records the gap
+       and carries on (`mm/madvise.c:1693-1704`, resumed by
+       `vma = find_vma(mm, vma->vm_end)` at `:1730`), so both VMAs around the
+       hole carry VM_WIPEONFORK and `dup_mmap()` skips `copy_page_range()`
+       for each of them (`mm/mmap.c:1839-1840`), leaving the child a zero
+       page on both sides. */
     unsigned char *w = pages(3);
     volatile unsigned char *wv = w;
     wv[0] = 0x11;
@@ -866,23 +850,22 @@ static void madvise_extra_case(void) {
     fflush(NULL);
     pid_t pid = fork();
     check(pid >= 0, "fork-wipeonfork-hole");
-    if (!pid) _exit((wv[0] == 0 && wv[2 * PAGE] == 0) ? 0 : 1);
-    /* Same split as the MAP_DROPPABLE case: MADV_WIPEONFORK's return value and
-       the fact that it covers both VMAs around the hole are asserted above,
-       while the child's zero page comes from the fork copy path and is only
-       reported here.  Linux v7.2.3 zeroes both pages. */
+    /* The child's exit status names which page still held the parent's byte:
+       bit 0 is the VMA in front of the hole, bit 1 the VMA after it. */
+    if (!pid) _exit((wv[0] == 0 ? 0 : 1) | (wv[2 * PAGE] == 0 ? 0 : 2));
     int hole_status = 0;
     check(waitpid(pid, &hole_status, 0) == pid, "wait-wipeonfork-hole");
-    if (!WIFEXITED(hole_status) || WEXITSTATUS(hole_status) != 0)
-        fprintf(stderr, "MMDiag wipeonfork-hole-child-pages %u %u status=%d\n",
-                (unsigned)wv[0], (unsigned)wv[2 * PAGE], hole_status);
+    check(WIFEXITED(hole_status) && WEXITSTATUS(hole_status) == 0,
+          "madvise-wipeonfork-child-zero-pages");
     check(munmap(w, 3 * PAGE) == 0, "madvise-hole-cleanup");
+    mark("WIPEONFORK_HOLE");
+    done();
 }
 
 /* -------------------------------------------------------------- msync ---- */
 
 static void msync_extra_case(void) {
-    active = "mm-abi-extras";
+    begin("msync.raw-differential");
     int fd = (int)syscall(NR_MEMFD_CREATE, "thekernel-msync", 0);
     check(fd >= 0, "msync-memfd-create");
     check(ftruncate(fd, 2 * PAGE) == 0, "msync-memfd-size");
@@ -903,30 +886,99 @@ static void msync_extra_case(void) {
     check(munlock(p + PAGE, PAGE) == 0, "msync-unlock-tail");
     check(munmap(p, 2 * PAGE) == 0, "msync-cleanup");
     check(close(fd) == 0, "msync-memfd-close");
+    mark("PARTIAL_LOCK_EBUSY");
+    /* mm/msync.c applies MS_SYNC and MS_INVALIDATE per VMA in address order,
+       so a shared file range in front of a later VM_LOCKED VMA is already
+       written back when the syscall reports EBUSY.  A whole-range VM_LOCKED
+       preflight would fail before flushing anything. */
+    char order_path[] = "/root/thekernel-msync-order-XXXXXX";
+    fd = mkstemp(order_path); check(fd >= 0, "msync-order-create");
+    check(ftruncate(fd, 5 * PAGE) == 0, "msync-order-size");
+    int direct = open(order_path, O_RDONLY | O_DIRECT);
+    check(direct >= 0 && unlink(order_path) == 0, "msync-order-direct-reader");
+    void *readback = NULL;
+    check(posix_memalign(&readback, PAGE, PAGE) == 0, "msync-order-buffer");
+    unsigned char *shared = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED, fd, 0);
+    check(shared != MAP_FAILED, "msync-order-shared-map");
+    /* Replace the third page with a separate, non-contiguous file range so
+       mlock() cannot leave the dirty page inside the locked VMA. */
+    unsigned char *locked = mmap(shared + 2 * PAGE, PAGE, PROT_READ,
+                                 MAP_SHARED | MAP_FIXED, fd, 4 * PAGE);
+    check(locked == shared + 2 * PAGE, "msync-order-locked-map");
+    memset(shared, 'G', PAGE);
+    check(mlock(locked, PAGE) == 0, "msync-order-mlock");
+    errno = 0;
+    check(msync(shared, 3 * PAGE, MS_SYNC | MS_INVALIDATE) == -1 &&
+          errno == EBUSY, "msync-order-ebusy");
+    /* Unlock before the direct read: this kernel's O_DIRECT read refuses to
+       revoke a file whose cached page is pinned by mlock (EBUSY), and that
+       unrelated pin would mask whether the prefix reached the file.  The
+       writeback under test already happened inside the msync above. */
+    check(munlock(locked, PAGE) == 0, "msync-order-munlock");
+    check(pread(direct, readback, PAGE, 0) == PAGE, "msync-order-direct-read");
+    for (size_t i = 0; i < PAGE; ++i)
+        check(((unsigned char *)readback)[i] == 'G',
+              "msync-order-flushed-before-ebusy");
+    check(munmap(shared, 3 * PAGE) == 0 && close(direct) == 0 && close(fd) == 0,
+          "msync-order-cleanup");
+    free(readback);
+    /* The same order with the lock *inside* one mapping.  mlock() splits the
+       VMA at the locked range (mm/mlock.c:mlock_fixup() reaches
+       vma_modify_flags()), so the dirty first page sits in an unlocked VMA
+       that the walk reaches before the locked one and has to be written back
+       before the EBUSY.  A test that only asks whether *any* part of the
+       requested range is locked answers EBUSY with nothing flushed. */
+    char inner_path[] = "/root/thekernel-msync-inner-XXXXXX";
+    fd = mkstemp(inner_path); check(fd >= 0, "msync-inner-create");
+    check(ftruncate(fd, 3 * PAGE) == 0, "msync-inner-size");
+    direct = open(inner_path, O_RDONLY | O_DIRECT);
+    check(direct >= 0 && unlink(inner_path) == 0, "msync-inner-direct-reader");
+    readback = NULL;
+    check(posix_memalign(&readback, PAGE, PAGE) == 0, "msync-inner-buffer");
+    unsigned char *inner = mmap(NULL, 3 * PAGE, PROT_READ | PROT_WRITE,
+                                MAP_SHARED, fd, 0);
+    check(inner != MAP_FAILED, "msync-inner-map");
+    memset(inner, 'I', PAGE);
+    check(mlock(inner + PAGE, PAGE) == 0, "msync-inner-mlock");
+    errno = 0;
+    check(msync(inner, 3 * PAGE, MS_SYNC | MS_INVALIDATE) == -1 &&
+          errno == EBUSY, "msync-inner-ebusy");
+    check(munlock(inner + PAGE, PAGE) == 0, "msync-inner-munlock");
+    check(pread(direct, readback, PAGE, 0) == PAGE, "msync-inner-direct-read");
+    for (size_t i = 0; i < PAGE; ++i)
+        check(((unsigned char *)readback)[i] == 'I',
+              "msync-inner-flushed-before-ebusy");
+    check(munmap(inner, 3 * PAGE) == 0 && close(direct) == 0 && close(fd) == 0,
+          "msync-inner-cleanup");
+    free(readback);
+    mark("PREFIX_FLUSHED_BEFORE_EBUSY");
+    done();
 }
 
 /* ------------------------------------------ process_madvise(440) and
                                                 process_mrelease(448) ---- */
 
 static void remote_extra_case(void) {
-    active = "mm-abi-extras";
+    begin("process-mrelease.raw-differential");
     unsigned char *p = pages(1);
     p[0] = 7;
-    /* A valid descriptor that is not a pidfd is EBADF from pidfd_pid()
-       (fs/pidfs.c:706-711), not EINVAL.  The PIDFD_SELF_* half of this
-       syscall pair lives in the registered process-madvise case above. */
-    int fds[2];
-    check(pipe(fds) == 0, "process-remote-pipe");
-    ERROR(syscall(NR_PROCESS_MRELEASE, fds[0], 0), EBADF,
-          "process-mrelease-pipe-fd");
-    check(close(fds[0]) == 0, "process-remote-close-read");
-    check(close(fds[1]) == 0, "process-remote-close-write");
     /* PIDFD_SELF_* names a live task, and a live task never has
        task_will_free_mem(): EINVAL, not ESRCH. */
     ERROR(syscall(NR_PROCESS_MRELEASE, PIDFD_SELF_THREAD, 0), EINVAL,
           "process-mrelease-self");
     ERROR(syscall(NR_PROCESS_MRELEASE, PIDFD_SELF_THREAD_GROUP, 0), EINVAL,
           "process-mrelease-self-group");
+    mark("SELF_IDENTIFIERS_EINVAL");
+    /* A valid descriptor that is not a pidfd is EBADF from pidfd_pid()
+       (fs/pidfs.c:706-711), not EINVAL. */
+    int fds[2];
+    check(pipe(fds) == 0, "process-remote-pipe");
+    ERROR(syscall(NR_PROCESS_MRELEASE, fds[0], 0), EBADF,
+          "process-mrelease-pipe-fd");
+    check(close(fds[0]) == 0, "process-remote-close-read");
+    check(close(fds[1]) == 0, "process-remote-close-write");
+    mark("NON_PIDFD_EBADF");
     check(munmap(p, PAGE) == 0, "process-remote-cleanup");
 
     /* A live child that is not dying holds an mm: find_lock_task_mm()
@@ -952,6 +1004,7 @@ static void remote_extra_case(void) {
     check(write(sync[1], "x", 1) == 1, "process-release-signal");
     check(close(sync[1]) == 0, "process-release-close");
     reap(pid, 0);
+    done();
 }
 
 int main(void) {
