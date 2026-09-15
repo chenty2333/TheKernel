@@ -714,6 +714,15 @@ static int test_epoll_differential(void) {
         "epoll-differential-child");
 }
 
+/* The portable program also runs unchanged on a Linux 7.2.3 oracle, where the
+ * differential runner compares its THEKERNEL_ABI_ records line for line.  This
+ * suite only needs the TheKernel half to agree with the same expectations. */
+static int test_epoll_membarrier_differential(void) {
+    return run_guest_program(
+        "/opt/thekernel-tests/portable/epoll-membarrier-differential",
+        "--thekernel", "epoll-membarrier-differential-child");
+}
+
 static int test_eventfd_differential(void) {
     return run_guest_program(
         "/opt/thekernel-tests/portable/eventfd-differential", NULL,
@@ -1002,6 +1011,7 @@ int main(int argc, char **argv) {
         { "futex", test_futex_differential, 60 },
         { "futex2-waitv-signal", test_futex2_waitv_signal_differential, 60 },
         { "epoll", test_epoll_differential, 60 },
+        { "epoll-membarrier", test_epoll_membarrier_differential, 60 },
         { "eventfd", test_eventfd_differential, 60 },
         { "anon-fd-flags", test_anon_fd_flags, 20 },
         { "select", test_select, 20 },
