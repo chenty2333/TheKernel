@@ -204,11 +204,11 @@ CONTRACTS.update({
     "sysvipc-shm-dest": ("dest-stat", "pass", "DEST_SEGMENT_STILL_STATABLE DEST_SEGMENT_RETURNS_FULL_ID DESTROYED_SEGMENT_EINVAL"),
     "sysvipc-errno": ("order", "pass", "SEMOP_EFBIG_BEFORE_EACCES MSGSND_FAULTS_BEFORE_VALIDATION MSGSND_SIZE_AND_TYPE_BEFORE_ID TABLE_COMMANDS_REJECT_NEGATIVE_ID SEMCTL_VALUE_AND_SEMNUM_ORDER SEMTIMEDOP_COUNT_AND_TIMEOUT_ORDER"),
     "sysvipc-msg": ("exclusive-create-order", "pass", "EXCLUSIVE_CREATE_BEFORE_PERMISSION"),
-    "mq-open": ("raw-differential", "pass", "DEFAULT_ATTRIBUTES HARD_LIMIT_CAPABILITY RLIMIT_CHARGE_BOUNDARY OPEN_EXISTING_PRECEDENCE CREATE_ACCMODE_THREE NAME_SYNTAX NAME_LENGTH_BOUNDARY OPEN_FD_LIFETIME"),
-    "mq-unlink": ("raw-differential", "pass", "UNLINK_NAME_SYNTAX STICKY_DIRECTORY_EPERM OWNER_AND_REUSE OWNER_AUTHORITY"),
-    "mq-timedsend": ("raw-differential", "pass", "ARGUMENT_PRECEDENCE FULL_QUEUE_EAGAIN PRIORITY_ORDER BLOCKED_SENDER_HANDOFF"),
-    "mq-timedreceive": ("raw-differential", "pass", "EMSGSIZE_BEFORE_EAGAIN PRIORITY_ORDER DEQUEUE_BEFORE_COPYOUT"),
-    "mq-notify": ("raw-differential", "pass", "ONE_SHOT_EMPTY_EDGE EMPTY_EDGE_REARM ARGUMENT_VALIDATION PIPELINED_RECEIVE_SKIPS_NOTIFY"),
+    "mq_open": ("raw-differential", "pass", "DEFAULT_ATTRIBUTES HARD_LIMIT_CAPABILITY RLIMIT_CHARGE_BOUNDARY OPEN_EXISTING_PRECEDENCE CREATE_ACCMODE_THREE NAME_SYNTAX NAME_LENGTH_BOUNDARY OPEN_FD_LIFETIME"),
+    "mq_unlink": ("raw-differential", "pass", "UNLINK_NAME_SYNTAX STICKY_DIRECTORY_EPERM OWNER_AND_REUSE OWNER_AUTHORITY"),
+    "mq_timedsend": ("raw-differential", "pass", "ARGUMENT_PRECEDENCE FULL_QUEUE_EAGAIN PRIORITY_ORDER BLOCKED_SENDER_HANDOFF"),
+    "mq_timedreceive": ("raw-differential", "pass", "EMSGSIZE_BEFORE_EAGAIN PRIORITY_ORDER DEQUEUE_BEFORE_COPYOUT"),
+    "mq_notify": ("raw-differential", "pass", "ONE_SHOT_EMPTY_EDGE EMPTY_EDGE_REARM ARGUMENT_VALIDATION PIPELINED_RECEIVE_SKIPS_NOTIFY"),
 })
 PROGRAM_CASES = {
     "tty-job-control": ("tty-job-control",),
@@ -237,7 +237,7 @@ PROGRAM_CASES = {
     "futex-abi": ("futex-abi-opcode", "futex-abi-wake-zero", "futex-abi-requeue", "futex-abi-pi-word", "futex-abi-pi-timeout", "futex-abi-requeue-pi", "futex-abi-futex2-flags"),
     "sysadmin-abi": ("sysadmin-abi.ptrace-requests", "sysadmin-abi.unshare-flags", "sysadmin-abi.swap-flags", "sysadmin-abi.module-image"),
     "sysv-ipc": ("sysvipc-ids", "sysvipc-stat", "sysvipc-info", "sysvipc-sem", "sysvipc-sem-undo", "sysvipc-control", "sysvipc-shm-lock", "sysvipc-shm-hugetlb", "sysvipc-shm-dest", "sysvipc-errno", "sysvipc-msg"),
-    "posix-mqueue": ("mq-open", "mq-unlink", "mq-timedsend", "mq-timedreceive", "mq-notify"),
+    "posix-mqueue": ("mq_open", "mq_unlink", "mq_timedsend", "mq_timedreceive", "mq_notify"),
 }
 # The registry is static: the gate reads it to decide whether a claimed
 # syscall names a program this runner really executes.
@@ -402,9 +402,9 @@ SYSCALL_CASES = {
     29: ("sysv-ipc", "sysvipc-shm-lock"), 30: ("sysv-ipc", "sysvipc-shm-dest"),
     31: ("sysv-ipc", "sysvipc-shm-dest"),
     # POSIX message queues.
-    240: ("posix-mqueue", "mq-open"), 241: ("posix-mqueue", "mq-unlink"),
-    242: ("posix-mqueue", "mq-timedsend"), 243: ("posix-mqueue", "mq-timedreceive"),
-    244: ("posix-mqueue", "mq-notify"),
+    240: ("posix-mqueue", "mq_open"), 241: ("posix-mqueue", "mq_unlink"),
+    242: ("posix-mqueue", "mq_timedsend"), 243: ("posix-mqueue", "mq_timedreceive"),
+    244: ("posix-mqueue", "mq_notify"),
 }
 
 

@@ -368,7 +368,7 @@ static void case_sem_flags(void) {
 static void case_sem_undo_range(void) {
     struct sembuf op;
 
-    begin("sysvipc-sem.undo-range");
+    begin("sysvipc-sem-undo.undo-range");
 
     int semid = (int)ok_call(semget(IPC_PRIVATE, 1, IPC_CREAT | 0600), "semget");
     errno = 0;
@@ -479,7 +479,7 @@ static void case_ipc64_command(void) {
 static void case_shm_lock_memlock(void) {
     struct shmid_ds ds;
 
-    begin("sysvipc-shm.lock-memlock");
+    begin("sysvipc-shm-lock.lock-memlock");
 
     int shmid = (int)ok_call(shmget(IPC_PRIVATE, PAGE_BYTES, IPC_CREAT | 0600),
                              "shmget");
@@ -538,7 +538,7 @@ static void case_shm_lock_memlock(void) {
 static void case_shm_hugetlb_existing_key(void) {
     key_t key = 0x5a5a;
 
-    begin("sysvipc-shm.hugetlb-existing-key");
+    begin("sysvipc-shm-hugetlb.hugetlb-existing-key");
 
     int shmid = (int)ok_call(shmget(key, PAGE_BYTES, IPC_CREAT | 0600), "shmget");
     errno = 0;
@@ -564,7 +564,7 @@ static void case_shm_hugetlb_existing_key(void) {
 static void case_shm_dest_stat(void) {
     struct shmid_ds ds;
 
-    begin("sysvipc-shm.dest-stat");
+    begin("sysvipc-shm-dest.dest-stat");
 
     int shmid = (int)ok_call(shmget(IPC_PRIVATE, PAGE_BYTES, IPC_CREAT | 0600),
                              "shmget");
