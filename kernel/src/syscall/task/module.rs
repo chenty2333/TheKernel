@@ -7,7 +7,7 @@ use core::{
 
 use axerrno::{AxError, AxResult, LinuxError};
 use axtask::{WaitQueue, current};
-use linux_raw_sys::general::{CAP_SYS_MODULE, O_ACCMODE, O_NONBLOCK, O_TRUNC, O_WRONLY};
+use linux_raw_sys::general::{CAP_SYS_MODULE, O_ACCMODE, O_TRUNC, O_WRONLY};
 use spin::Lazy;
 use tk_linux_usercopy::{UserMemory, UserMemoryContext, vm_load, vm_load_until_nul_bounded};
 
@@ -19,7 +19,12 @@ use crate::{
 };
 const MAX: usize = 16 * 1024 * 1024;
 const ARGMAX: usize = 4096;
+/// `MODULE_NAME_LEN` = `__MODULE_NAME_LEN` = `(64 - sizeof(unsigned long))`,
+/// i.e. 56 on x86_64 (include/linux/module.h, include/linux/moduleparam.h).
 const NAMEMAX: usize = 56;
+/// `sizeof(Elf_Ehdr)` on x86_64; `copy_module_from_user()` compares the image
+/// length against it before any other image check.
+const ELF_EHDR_SIZE: usize = 64;
 const EH: usize = 64;
 const SH: usize = 64;
 const SYM: usize = 24;
@@ -39,6 +44,7 @@ const ABS: u16 = 0xfff1;
 const FUNC: u8 = 2;
 const GLOBAL: u8 = 1;
 const WEAK: u8 = 2;
+/// include/uapi/linux/module.h.
 const MODULE_INIT_IGNORE_MODVERSIONS: u32 = 1;
 const MODULE_INIT_IGNORE_VERMAGIC: u32 = 2;
 const MODULE_INIT_COMPRESSED_FILE: u32 = 4;
@@ -1723,9 +1729,27 @@ pub fn sys_init_module<Mm: UserMemory + ?Sized>(
     if !cap() {
         return Err(AxError::OperationNotPermitted);
     }
-    if n == 0 || n > MAX {
-        return Err(AxError::InvalidInput);
+    // kernel/module/main.c `copy_module_from_user()`:
+    //
+    // 	info->len = len;
+    // 	if (info->len < sizeof(*(info->hdr)))
+    // 		return -ENOEXEC;
+    //
+    // `sizeof(Elf_Ehdr)` is 64 on x86_64, so any image shorter than a full ELF
+    // header -- including a zero length -- is -ENOEXEC, not -EINVAL.
+    if n < ELF_EHDR_SIZE {
+        return Err(LinuxError::ENOEXEC.into());
     }
+    // Linux imposes no upper bound here: an over-large image simply fails to
+    // allocate in `__vmalloc()`, which is -ENOMEM.  Report the same errno
+    // instead of inventing -EINVAL for the allocation TheKernel refuses.
+    if n > MAX {
+        return Err(AxError::NoMemory);
+    }
+    // kernel/module/main.c `load_module()` copies `uargs` only at
+    // `mod->args = strndup_user(uargs, ~0UL >> 1);`, i.e. after the image has
+    // been validated.  The NULL/invalid-pointer -EFAULT is therefore *not* the
+    // second thing init_module checks.
     let (_, a) = ua(m, a)?;
     activate(prep(&vm_load(m, p, n).map_err(map_usercopy_error)?, &a, 0)?)
 }
@@ -1794,9 +1818,16 @@ pub fn sys_delete_module<Mm: UserMemory + ?Sized>(
     if !cap() {
         return Err(AxError::OperationNotPermitted);
     }
-    if fl & !(O_NONBLOCK | O_TRUNC) != 0 {
-        return Err(LinuxError::EINVAL.into());
-    }
+    // kernel/module/main.c `SYSCALL_DEFINE2(delete_module, ...)` has no flag
+    // table at all: `flags` is passed straight to `try_force_unload()` /
+    // `try_stop_module()`, where only `O_TRUNC` (and only under
+    // CONFIG_MODULE_FORCE_UNLOAD) has any meaning.  Every other bit is ignored,
+    // so there is no -EINVAL for stray flag bits.  TheKernel used to reject
+    // bits outside `O_NONBLOCK | O_TRUNC` with -EINVAL and to consult
+    // `O_NONBLOCK` when choosing between -EAGAIN and -EBUSY; Linux never reads
+    // O_NONBLOCK here and reports -EWOULDBLOCK for both the "other modules
+    // depend on us" and the "module is still in use" cases, regardless of the
+    // flag word.
     let raw = vm_load_until_nul_bounded(m, p.cast(), NAMEMAX + 1).map_err(map_usercopy_error)?;
     let n = core::str::from_utf8(&raw).map_err(|_| AxError::IllegalBytes)?;
     let force = fl & O_TRUNC != 0;
@@ -1808,24 +1839,33 @@ pub fn sys_delete_module<Mm: UserMemory + ?Sized>(
             .ok_or(LinuxError::ENOENT)?;
         let live = match &v[i].state {
             State::Live(x) => x,
-            _ => {
-                return Err(if fl & O_NONBLOCK != 0 {
-                    LinuxError::EAGAIN
-                } else {
-                    LinuxError::EBUSY
-                }
-                .into());
-            }
+            // 	if (mod->state != MODULE_STATE_LIVE) {
+            // 		pr_debug("%s already dying\n", mod->name);
+            // 		ret = -EBUSY;
+            // 		goto out;
+            // 	}
+            _ => return Err(LinuxError::EBUSY.into()),
         };
+        // 	if (!list_empty(&mod->source_list)) {
+        // 		/* Other modules depend on us: get rid of them first. */
+        // 		ret = -EWOULDBLOCK;
+        // 		goto out;
+        // 	}
+        // ...
+        // 	ret = try_stop_module(mod, flags, &forced);
+        //
+        // `try_stop_module()` fails with -EWOULDBLOCK too when the module
+        // reference count is still elevated and `try_force_unload()` did not
+        // authorise forcing.  O_TRUNC only forces under
+        // CONFIG_MODULE_FORCE_UNLOAD, which is off in the shipped
+        // configuration, so a forced request that cannot actually be honoured
+        // still reports -EWOULDBLOCK -- not -EOPNOTSUPP, which Linux never
+        // returns from this syscall for that reason.
+        // `-EWOULDBLOCK` is spelled `EAGAIN` here because Linux defines the two
+        // as the same errno number (11); `axerrno::LinuxError` keeps the
+        // canonical `EAGAIN` spelling.
         if v[i].refs != 1 || v[i].deps != 0 {
-            return Err(if fl & O_NONBLOCK != 0 {
-                LinuxError::EAGAIN
-            } else if force {
-                LinuxError::EOPNOTSUPP
-            } else {
-                LinuxError::EBUSY
-            }
-            .into());
+            return Err(LinuxError::EAGAIN.into());
         }
         if live.exit.is_none() && !force {
             return Err(LinuxError::EBUSY.into());

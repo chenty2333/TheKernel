@@ -14,7 +14,7 @@ use linux_raw_sys::{
         _LINUX_CAPABILITY_VERSION_2, _LINUX_CAPABILITY_VERSION_3, CAP_SYS_ADMIN, CAP_SYS_CHROOT,
         CAP_SYS_NICE, CAP_SYS_RESOURCE, CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWIPC,
         CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS,
-        CLONE_SYSVSEM,
+        CLONE_SIGHAND, CLONE_SYSVSEM, CLONE_THREAD, CLONE_VM,
     },
     mempolicy::*,
 };
@@ -102,15 +102,29 @@ const UNSHARE_SUPPORTED_FLAGS: u32 = CLONE_FILES
     | CLONE_NEWTIME
     | CLONE_NEWPID
     | CLONE_SYSVSEM;
-const UNSHARE_RECOGNIZED_FLAGS: u32 = UNSHARE_SUPPORTED_FLAGS
-    | CLONE_NEWNS
-    | CLONE_NEWIPC
-    | CLONE_NEWNET
-    | CLONE_NEWPID
-    | CLONE_NEWUSER
-    | CLONE_NEWCGROUP
-    | CLONE_NEWTIME
-    | CLONE_SYSVSEM;
+/// `CLONE_THREAD`, `CLONE_SIGHAND` and `CLONE_VM` are *recognised but inert*:
+/// `check_unshare_flags()` accepts them and then nothing in `ksys_unshare()`
+/// consumes them, so a single-threaded caller gets a successful no-op.  They
+/// are deliberately kept out of `UNSHARE_SUPPORTED_FLAGS`, which is the set
+/// that actually replaces task state below.
+const UNSHARE_INERT_FLAGS: u32 = CLONE_THREAD | CLONE_SIGHAND | CLONE_VM;
+/// Flags that pass `check_unshare_flags()`'s mask test:
+///
+/// ```c
+/// 	if (unshare_flags & ~(CLONE_THREAD|CLONE_FS|CLONE_SIGHAND|
+/// 				CLONE_VM|CLONE_FILES|CLONE_SYSVSEM|
+/// 				CLONE_NS_ALL | UNSHARE_EMPTY_MNTNS))
+/// 		return -EINVAL;
+/// ```
+///
+/// `CLONE_NS_ALL` is `CLONE_NEWTIME|CLONE_NEWNS|CLONE_NEWCGROUP|CLONE_NEWUTS|
+/// CLONE_NEWIPC|CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET`, all of which are
+/// listed literally in `UNSHARE_SUPPORTED_FLAGS`.  `UNSHARE_EMPTY_MNTNS`
+/// (0x00100000, which aliases `CLONE_PARENT_SETTID`) is the one member of the
+/// Linux mask TheKernel still rejects; it asks for an *empty* mount namespace,
+/// which has no equivalent here.
+const UNSHARE_RECOGNIZED_FLAGS: u32 =
+    UNSHARE_SUPPORTED_FLAGS | UNSHARE_INERT_FLAGS;
 const SETNS_PIDFD_ALLOWED_FLAGS: u32 = CLONE_NEWNS
     | CLONE_NEWUTS
     | CLONE_NEWIPC
@@ -631,30 +645,111 @@ pub fn sys_kcmp<M: UserMemory + ?Sized>(
     }
 }
 
-pub fn sys_unshare(flags: u32) -> AxResult<isize> {
+pub fn sys_unshare(flags: usize) -> AxResult<isize> {
     debug!("sys_unshare <= flags: {flags:#x}");
 
-    if flags & !UNSHARE_RECOGNIZED_FLAGS != 0 {
+    // The syscall parameter is `unsigned long` in Linux
+    // (`SYSCALL_DEFINE1(unshare, unsigned long, unshare_flags)`), while the mask
+    // in `check_unshare_flags()` is a 32-bit constant.  Every bit at or above
+    // bit 32 is therefore an unknown flag and must be rejected:
+    //
+    // 	if (unshare_flags & ~(CLONE_THREAD|CLONE_FS|CLONE_SIGHAND|
+    // 				CLONE_VM|CLONE_FILES|CLONE_SYSVSEM|
+    // 				CLONE_NS_ALL | UNSHARE_EMPTY_MNTNS))
+    // 		return -EINVAL;
+    //
+    // Those are the 64-bit clone3 flags (CLONE_CLEAR_SIGHAND 1 << 32,
+    // CLONE_INTO_CGROUP 1 << 33, CLONE_EMPTY_MNTNS 1 << 37, ...), which are not
+    // valid for unshare(2).  Truncating to 32 bits first made
+    // `unshare(CLONE_CLEAR_SIGHAND)` a silent success instead of -EINVAL.
+    if flags >> 32 != 0 {
         return Err(AxError::InvalidInput);
     }
-    if flags & !UNSHARE_SUPPORTED_FLAGS != 0 {
-        return Err(AxError::OperationNotSupported);
+    let flags = flags as u32;
+
+    // kernel/fork.c `ksys_unshare()` applies the flag implications *before*
+    // `check_unshare_flags()`:
+    //
+    // 	/*
+    // 	 * If unsharing a user namespace must also unshare the thread group
+    // 	 * and unshare the filesystem root and working directories.
+    // 	 */
+    // 	if (unshare_flags & CLONE_NEWUSER)
+    // 		unshare_flags |= CLONE_THREAD | CLONE_FS;
+    // 	/*
+    // 	 * If unsharing vm, must also unshare signal handlers.
+    // 	 */
+    // 	if (unshare_flags & CLONE_VM)
+    // 		unshare_flags |= CLONE_SIGHAND;
+    // 	/*
+    // 	 * If unsharing a signal handlers, must also unshare the signal queues.
+    // 	 */
+    // 	if (unshare_flags & CLONE_SIGHAND)
+    // 		unshare_flags |= CLONE_THREAD;
+    // 	/*
+    // 	 * If unsharing namespace, must also unshare filesystem information.
+    // 	 */
+    // 	if (unshare_flags & UNSHARE_EMPTY_MNTNS)
+    // 		unshare_flags |= CLONE_NEWNS;
+    // 	if (unshare_flags & CLONE_NEWNS)
+    // 		unshare_flags |= CLONE_FS;
+    //
+    // The implications matter because the *implied* CLONE_THREAD is what makes
+    // `unshare(CLONE_VM)` and `unshare(CLONE_NEWUSER)` fail with -EINVAL in a
+    // multithreaded caller: the thread-group check below tests the union.
+    let flags = {
+        let mut flags = flags;
+        if flags & CLONE_NEWUSER != 0 {
+            flags |= CLONE_THREAD | CLONE_FS;
+        }
+        if flags & CLONE_VM != 0 {
+            flags |= CLONE_SIGHAND;
+        }
+        if flags & CLONE_SIGHAND != 0 {
+            flags |= CLONE_THREAD;
+        }
+        if flags & CLONE_NEWNS != 0 {
+            flags |= CLONE_FS;
+        }
+        flags
+    };
+    if flags & !UNSHARE_RECOGNIZED_FLAGS != 0 {
+        return Err(AxError::InvalidInput);
     }
     // Linux rejects this incompatible pair before it prepares any namespace
     // object or touches user-controlled state.
     if flags & (CLONE_NEWIPC | CLONE_SYSVSEM) == (CLONE_NEWIPC | CLONE_SYSVSEM) {
         return Err(AxError::InvalidInput);
     }
-    // Entering a user namespace must not retain a CLONE_FS-shared root/cwd:
-    // unshare(NEWUSER) therefore implies CLONE_FS and commits that replacement
-    // with the credential/proxy transition below.
-    let flags = if flags & CLONE_NEWUSER != 0 {
-        flags | CLONE_FS
-    } else {
-        flags
-    };
     let curr = current();
     let thread = curr.as_thread();
+    // kernel/fork.c `check_unshare_flags()`, the three constraint blocks:
+    //
+    // 	if (unshare_flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM)) {
+    // 		if (!thread_group_empty(current))
+    // 			return -EINVAL;
+    // 	}
+    // 	if (unshare_flags & (CLONE_SIGHAND | CLONE_VM)) {
+    // 		if (refcount_read(&current->sighand->count) > 1)
+    // 			return -EINVAL;
+    // 	}
+    // 	if (unshare_flags & CLONE_VM) {
+    // 		if (!current_is_single_threaded())
+    // 			return -EINVAL;
+    // 	}
+    //
+    // TheKernel keeps exactly one signal-handler structure per thread group and
+    // shares it only among that group's threads (`clone()` forces
+    // CLONE_SIGHAND -> CLONE_THREAD), so `thread_group_empty()`,
+    // `sighand->count > 1` and `current_is_single_threaded()` are all decided by
+    // the same fact: whether this is the only live thread of the group.  That
+    // single predicate is therefore applied for all three blocks, which is also
+    // what makes the implied CLONE_THREAD above meaningful.
+    if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0
+        && thread.proc_data.proc.thread_count() != 1
+    {
+        return Err(AxError::InvalidInput);
+    }
     let task_snapshot = thread.namespace_credential_fs_snapshot();
     let actor_cred = task_snapshot.credential;
     let namespace_owner = unshare_namespace_owner(flags, &actor_cred)?;

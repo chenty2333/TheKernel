@@ -625,20 +625,35 @@ fn valid_flags(flags: u64) -> AxResult<bool> {
     {
         return Err(AxError::InvalidInput);
     }
-    if flags & KEXEC_PRESERVE_CONTEXT != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    let crash = flags & KEXEC_ON_CRASH != 0;
-    if !crash && flags & (KEXEC_UPDATE_ELFCOREHDR | KEXEC_CRASH_HOTPLUG_SUPPORT) != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    // The configured x86 product has no crash-hotplug updater in KEXEC_FLAGS.
-    // Linux rejects these operation bits at the flag gate when that facility
-    // is absent; it does not report a generic provider EOPNOTSUPP.
-    if flags & (KEXEC_UPDATE_ELFCOREHDR | KEXEC_CRASH_HOTPLUG_SUPPORT) != 0 {
-        return Err(AxError::InvalidInput);
-    }
-    Ok(crash)
+    // `KEXEC_PRESERVE_CONTEXT` is rejected above because it is only part of
+    // `KEXEC_FLAGS` when CONFIG_KEXEC_JUMP is enabled:
+    //
+    // 	#define KEXEC_FLAGS    (KEXEC_ON_CRASH | KEXEC_UPDATE_ELFCOREHDR | KEXEC_CRASH_HOTPLUG_SUPPORT)
+    // 	#else
+    // 	#define KEXEC_FLAGS    (KEXEC_ON_CRASH | KEXEC_PRESERVE_CONTEXT | KEXEC_UPDATE_ELFCOREHDR | \
+    // 				KEXEC_CRASH_HOTPLUG_SUPPORT)
+    // 	#endif
+    //
+    // `KEXEC_UPDATE_ELFCOREHDR` and `KEXEC_CRASH_HOTPLUG_SUPPORT` are always in
+    // the mask, so they are legal for a default image as well as a crash image:
+    //
+    // 	/*
+    // 	 * Initially, crash hotplug support for kexec_load was added
+    // 	 * with the KEXEC_UPDATE_ELFCOREHDR flag. Later, this
+    // 	 * functionality was expanded to accommodate multiple kexec
+    // 	 * segment updates, leading to the introduction of the
+    // 	 * KEXEC_CRASH_HOTPLUG_SUPPORT kexec flag bit.
+    // 	 */
+    // 	return (kexec_flags & KEXEC_UPDATE_ELFCOREHDR ||
+    // 		kexec_flags & KEXEC_CRASH_HOTPLUG_SUPPORT);
+    // 	(arch/x86/kernel/crash.c `arch_crash_hotplug_support()` only *reads*
+    // 	 these bits; nothing rejects them.)
+    //
+    // TheKernel used to reject both bits unconditionally, which turned a legal
+    // `kexec_load(..., KEXEC_ON_CRASH|KEXEC_UPDATE_ELFCOREHDR)` into -EINVAL.
+    // The image type still depends only on KEXEC_ON_CRASH, matching
+    // `kexec_load_check()`'s `int image_type = (flags & KEXEC_ON_CRASH) ? ...`.
+    Ok(flags & KEXEC_ON_CRASH != 0)
 }
 pub fn sys_kexec_load<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,

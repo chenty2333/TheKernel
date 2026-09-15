@@ -5,6 +5,7 @@ use axtask::{
 };
 use tk_linux_arch_x86_64::{ARCH_SHSTK_UNLOCK, NT_X86_SHSTK, X86ShstkRegset};
 use tk_linux_process_adapter::Pid;
+use tk_linux_seccomp::SeccompMode;
 use tk_linux_signal::{SignalInfo, Signo};
 
 use crate::{
@@ -33,6 +34,19 @@ const PTRACE_ATTACH: u32 = 16;
 const PTRACE_DETACH: u32 = 17;
 const PTRACE_SYSCALL: u32 = 24;
 const PTRACE_ARCH_PRCTL: u32 = 30;
+// include/uapi/linux/ptrace.h: "PTRACE_OLDSETOPTIONS is an alias for
+// PTRACE_SETOPTIONS" -- `#define PTRACE_OLDSETOPTIONS 21` and
+// `#define PTRACE_SETOPTIONS 0x4200` feed the same `ptrace_setoptions()` in
+// kernel/ptrace.c (`case PTRACE_SETOPTIONS: ...`, which lists both).
+// TheKernel accepted neither spelling before, because 21 was not decoded at
+// all and therefore fell through to the "unknown request" arm.
+const PTRACE_OLDSETOPTIONS: u32 = 21;
+// kernel/ptrace.c `ptrace_resume()` handles all six resume spellings:
+// PTRACE_CONT, PTRACE_SYSCALL, PTRACE_SINGLESTEP, PTRACE_SYSEMU,
+// PTRACE_SYSEMU_SINGLESTEP and PTRACE_SINGLEBLOCK.
+const PTRACE_SYSEMU: u32 = 31;
+const PTRACE_SYSEMU_SINGLESTEP: u32 = 32;
+const PTRACE_SINGLEBLOCK: u32 = 33;
 const PTRACE_SETOPTIONS: u32 = 0x4200;
 const PTRACE_GETEVENTMSG: u32 = 0x4201;
 const PTRACE_GETSIGINFO: u32 = 0x4202;
@@ -42,8 +56,153 @@ const PTRACE_SETREGSET: u32 = 0x4205;
 const PTRACE_SEIZE: u32 = 0x4206;
 const PTRACE_INTERRUPT: u32 = 0x4207;
 const PTRACE_LISTEN: u32 = 0x4208;
+const PTRACE_GET_SYSCALL_INFO: u32 = 0x420e;
 
-const PTRACE_O_MASK: usize = 0x2f_ffff;
+// kernel/ptrace.c: `#define PTRACE_O_MASK (0x000000ff | PTRACE_O_EXITKILL |
+// PTRACE_O_SUSPEND_SECCOMP)`, with `PTRACE_O_EXITKILL (1 << 20)` and
+// `PTRACE_O_SUSPEND_SECCOMP (1 << 21)` from include/uapi/linux/ptrace.h.
+// 0x000000ff covers TRACESYSGOOD, TRACEFORK, TRACEVFORK, TRACECLONE,
+// TRACEEXEC, TRACEVFORKDONE, TRACEEXIT and TRACESECCOMP.
+// The previous value (0x2f_ffff) admitted bits 16..21 -- none of which Linux
+// defines -- and rejected PTRACE_O_EXITKILL (1 << 20).
+const PTRACE_O_MASK: usize = 0x0000_00ff | PTRACE_O_EXITKILL | PTRACE_O_SUSPEND_SECCOMP;
+const PTRACE_O_EXITKILL: usize = 1 << 20;
+const PTRACE_O_SUSPEND_SECCOMP: usize = 1 << 21;
+
+/// `AUDIT_ARCH_X86_64` (include/uapi/linux/audit.h) =
+/// `EM_X86_64(62) | __AUDIT_ARCH_64BIT(0x8000_0000) | __AUDIT_ARCH_LE(0x4000_0000)`.
+/// `ptrace_get_syscall_info()` fills `info.arch` from `syscall_get_arch()`,
+/// which is `AUDIT_ARCH_X86_64` on this target (arch/x86/include/asm/syscall.h).
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+
+/// `struct ptrace_syscall_info` op codes (include/uapi/linux/ptrace.h).
+const PTRACE_SYSCALL_INFO_NONE: u8 = 0;
+const PTRACE_SYSCALL_INFO_ENTRY: u8 = 1;
+const PTRACE_SYSCALL_INFO_EXIT: u8 = 2;
+const PTRACE_SYSCALL_INFO_SECCOMP: u8 = 3;
+
+/// Architected `ptrace(PTRACE_GETREGSET/SETREGSET, ..., type, ...)` record
+/// selectors present in the x86_64 `user_regset_view` (arch/x86/kernel/ptrace.c
+/// `x86_64_regsets`). `find_regset()` matches on `regset->core_note_type`, so a
+/// type outside this table is `-EINVAL` (kernel/ptrace.c `ptrace_regset()`:
+/// "if (!regset || (kiov->iov_len % regset->size) != 0) return -EINVAL;").
+const NT_PRSTATUS: usize = 1;
+const NT_PRFPREG: usize = 2;
+const NT_386_IOPERM: usize = 0x201;
+const NT_X86_XSTATE: usize = 0x202;
+
+/// Linux `struct ptrace_syscall_info` (include/uapi/linux/ptrace.h).
+///
+/// ```c
+/// struct ptrace_syscall_info {
+/// 	__u8 op;	/* PTRACE_SYSCALL_INFO_* */
+/// 	__u8 reserved;
+/// 	__u16 flags;
+/// 	__u32 arch;
+/// 	__u64 instruction_pointer;
+/// 	__u64 stack_pointer;
+/// 	union {
+/// 		struct {
+/// 			__u64 nr;
+/// 			__u64 args[6];
+/// 		} entry;
+/// 		struct {
+/// 			__s64 rval;
+/// 			__u8 is_error;
+/// 		} exit;
+/// 		struct {
+/// 			__u64 nr;
+/// 			__u64 args[6];
+/// 			__u32 ret_data;
+/// 		} seccomp;
+/// 	};
+/// };
+/// ```
+///
+/// The payload is a union, so it is modelled as `[u64; 8]`-sized storage plus
+/// typed accessors; the only field TheKernel can currently populate is `op`,
+/// because it has no syscall-entry/exit stop generation.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PtraceSyscallInfo {
+    pub op: u8,
+    pub reserved: u8,
+    pub flags: u16,
+    pub arch: u32,
+    pub instruction_pointer: u64,
+    pub stack_pointer: u64,
+    pub payload: PtraceSyscallInfoPayload,
+}
+
+/// The `union` member of `struct ptrace_syscall_info`. `seccomp` is the largest
+/// member (8 + 6*8 + 4 + 4 = 64 bytes), so the union -- and therefore the whole
+/// structure, at 24 + 64 = 88 bytes -- is sized by it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union PtraceSyscallInfoPayload {
+    pub entry: PtraceSyscallInfoEntry,
+    pub exit: PtraceSyscallInfoExit,
+    pub seccomp: PtraceSyscallInfoSeccomp,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PtraceSyscallInfoEntry {
+    pub nr: u64,
+    pub args: [u64; 6],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PtraceSyscallInfoExit {
+    pub rval: i64,
+    pub is_error: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PtraceSyscallInfoSeccomp {
+    pub nr: u64,
+    pub args: [u64; 6],
+    pub ret_data: u32,
+    pub reserved2: u32,
+}
+
+impl PtraceSyscallInfo {
+    /// Bytes `ptrace_get_syscall_info()` reports as `actual_size`, i.e. the
+    /// `offsetof`/`offsetofend` span of the union member the op selects:
+    ///
+    /// ```c
+    /// 	unsigned long actual_size = offsetof(struct ptrace_syscall_info, entry);
+    /// 	...
+    /// 	if (info.op == PTRACE_SYSCALL_INFO_ENTRY || info.op == PTRACE_SYSCALL_INFO_SECCOMP) {
+    /// 		...
+    /// 		actual_size = offsetofend(struct ptrace_syscall_info, entry);
+    /// 	} else if (info.op == PTRACE_SYSCALL_INFO_EXIT) {
+    /// 		...
+    /// 		actual_size = offsetofend(struct ptrace_syscall_info, exit.is_error);
+    /// 	}
+    /// ```
+    ///
+    /// NONE keeps the initialiser `offsetof(..., entry)`, which is just the
+    /// 24-byte header. EXIT stops after the single `is_error` byte (33 bytes
+    /// total), *not* at the end of the padded `struct ... exit` member.
+    const fn active_size(op: u8) -> usize {
+        /// `offsetof(struct ptrace_syscall_info, entry)`: op + reserved +
+        /// flags + arch + instruction_pointer + stack_pointer.
+        const HEADER: usize = 1 + 1 + 2 + 4 + 8 + 8;
+        /// `offsetofend(struct ptrace_syscall_info, exit.is_error)`.
+        const EXIT_END: usize = HEADER + 8 + 1;
+        /// `offsetofend(struct ptrace_syscall_info, entry)`.
+        const ENTRY_END: usize = HEADER + 8 + 6 * 8;
+        match op {
+            PTRACE_SYSCALL_INFO_EXIT => EXIT_END,
+            PTRACE_SYSCALL_INFO_ENTRY | PTRACE_SYSCALL_INFO_SECCOMP => ENTRY_END,
+            _ => HEADER,
+        }
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_FEATURES: usize = 0b11;
@@ -143,12 +302,28 @@ fn pinned_tracee_memory(
     Ok(UserMemoryCapability::new(aspace_handle))
 }
 
+/// Decode the `data` argument of the resume-family requests.
+///
+/// kernel/ptrace.c `ptrace_resume()`:
+///
+/// ```c
+/// static int ptrace_resume(struct task_struct *child, long request,
+/// 			 unsigned long data)
+/// {
+/// 	if (!valid_signal(data))
+/// 		return -EIO;
+/// ```
+///
+/// `valid_signal(sig)` is `((sig) <= _NSIG)`, so *every* out-of-range signal
+/// number -- not just numbers above `u8` -- is -EIO.  `ptrace_detach()` starts
+/// with the identical test.  TheKernel used to answer -EINVAL for both
+/// `data > 64` and `data > 255`.
 fn parse_signal(data: usize) -> AxResult<Option<SignalInfo>> {
     if data == 0 {
         return Ok(None);
     }
-    let raw = u8::try_from(data).map_err(|_| AxError::InvalidInput)?;
-    let signo = Signo::from_repr(raw).ok_or(AxError::InvalidInput)?;
+    let raw = u8::try_from(data).map_err(|_| ptrace_io_error())?;
+    let signo = Signo::from_repr(raw).ok_or_else(ptrace_io_error)?;
     Ok(Some(SignalInfo::new_kernel(signo)))
 }
 
@@ -300,22 +475,55 @@ fn ptrace_shstk_regset(
             .then_some(())
             .ok_or(AxError::NoSuchProcess)
     })?;
-    if note != NT_X86_SHSTK {
-        return Err(ptrace_io_error());
-    }
-    if !axhal::asm::user_shadow_stack_enabled() {
-        return Err(LinuxError::EOPNOTSUPP.into());
-    }
+    // arch/x86/kernel/ptrace.c decodes GETREGSET/SETREGSET as
+    //
+    // 	struct iovec __user *uiov = (struct iovec __user *)data;
+    //
+    // 	if (!access_ok(uiov, sizeof(*uiov)))
+    // 		return -EFAULT;
+    // 	if (__get_user(kiov.iov_base, &uiov->iov_base) ||
+    // 	    __get_user(kiov.iov_len, &uiov->iov_len))
+    // 		return -EFAULT;
+    // 	ret = ptrace_regset(child, request, addr, &kiov);
+    //
+    // so the iovec is faulted in *before* the regset selector is interpreted:
+    // a bad iovec pointer is -EFAULT even for an unknown record type.
     let mut iov = unsafe {
         tracer_memory
             .read_value_uninit(iov_address as *const IoVec)
             .map_err(map_usercopy_error)?
             .assume_init()
     };
-    let required = core::mem::size_of::<X86ShstkRegset>();
-    if iov.iov_base == 0 || iov.iov_len < required as i64 {
-        return Err(ptrace_io_error());
+    if note != NT_X86_SHSTK {
+        // kernel/ptrace.c `ptrace_regset()`:
+        //
+        // 	const struct user_regset *regset = find_regset(view, type);
+        //
+        // 	if (!regset || (kiov->iov_len % regset->size) != 0)
+        // 		return -EINVAL;
+        //
+        // `find_regset()` walks the x86_64 `user_regset_view`, whose members
+        // are exactly NT_PRSTATUS, NT_PRFPREG, NT_X86_XSTATE, NT_386_IOPERM and
+        // NT_X86_SHSTK, so an unknown type is -EINVAL.  For the architected
+        // records TheKernel cannot produce (Linux answers with the tracee's
+        // register file) fail closed with -EIO -- the errno Linux itself uses
+        // for an inactive regset -- rather than fabricating registers.
+        return Err(match note {
+            NT_PRSTATUS | NT_PRFPREG | NT_X86_XSTATE | NT_386_IOPERM => ptrace_io_error(),
+            _ => AxError::InvalidInput,
+        });
     }
+    if !axhal::asm::user_shadow_stack_enabled() {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    let required = core::mem::size_of::<X86ShstkRegset>();
+    // `ptrace_regset()` rejects a length that is not a whole number of records
+    // (-EINVAL) and `regset_get()` rejects `count + pos > n * size` (-EINVAL);
+    // the length is afterwards clamped to the record size for the write-back.
+    if iov.iov_len < required as i64 || iov.iov_len as usize % required != 0 {
+        return Err(AxError::InvalidInput);
+    }
+    iov.iov_len = required as i64;
     match request {
         PTRACE_GETREGSET => {
             let state = snapshot_inactive_task_user_cet_state(target_task)
@@ -358,6 +566,96 @@ fn ptrace_shstk_regset(
         }
         _ => unreachable!(),
     }
+}
+
+/// Implement `PTRACE_GET_SYSCALL_INFO` (0x420e, include/uapi/linux/ptrace.h).
+///
+/// kernel/ptrace.c:
+///
+/// ```c
+/// static int ptrace_get_syscall_info(struct task_struct *child, unsigned long user_size,
+/// 				   void __user *datavp)
+/// {
+/// 	struct pt_regs *regs = task_pt_regs(child);
+/// 	struct ptrace_syscall_info info = {
+/// 		.op = PTRACE_SYSCALL_INFO_NONE,
+/// 		.arch = syscall_get_arch(child),
+/// 		.instruction_pointer = instruction_pointer(regs),
+/// 		.stack_pointer = user_stack_pointer(regs),
+/// 	};
+/// 	unsigned long actual_size = offsetof(struct ptrace_syscall_info, entry);
+/// 	unsigned long write_size;
+/// 	...
+/// 	if (info.op == PTRACE_SYSCALL_INFO_ENTRY || info.op == PTRACE_SYSCALL_INFO_SECCOMP) {
+/// 		...
+/// 		actual_size = offsetofend(struct ptrace_syscall_info, entry);
+/// 	} else if (info.op == PTRACE_SYSCALL_INFO_EXIT) {
+/// 		...
+/// 		actual_size = offsetofend(struct ptrace_syscall_info, exit.is_error);
+/// 	}
+/// 	write_size = min(actual_size, user_size);
+/// 	if (copy_to_user(datavp, &info, write_size))
+/// 		return -EFAULT;
+/// 	return actual_size;
+/// }
+/// ```
+///
+/// `user_size` arrives in `addr` and the destination pointer in `data`, because
+/// kernel/ptrace.c routes the request as
+/// `ptrace_get_syscall_info(child, addr, datap)`.
+///
+/// TheKernel never publishes a syscall-entry/exit stop, so no stop can be
+/// classified as ENTRY, EXIT or SECCOMP, and `op` is always
+/// `PTRACE_SYSCALL_INFO_NONE`.  That is the truthful answer a caller uses to
+/// detect the absence of syscall stops; it is also what strace checks first.
+/// `instruction_pointer`/`stack_pointer` would come from the stopped tracee's
+/// saved register file, which TheKernel does not retain per stop, so they are
+/// reported as zero instead of being fabricated.
+#[cfg(target_arch = "x86_64")]
+fn ptrace_get_syscall_info(
+    tracer_memory: &UserMemoryCapability,
+    user_size: usize,
+    data: usize,
+) -> AxResult<isize> {
+    let info = PtraceSyscallInfo {
+        op: PTRACE_SYSCALL_INFO_NONE,
+        reserved: 0,
+        flags: 0,
+        arch: AUDIT_ARCH_X86_64,
+        instruction_pointer: 0,
+        stack_pointer: 0,
+        // Initialise the largest union member so that every byte of the
+        // structure is defined; `ptrace_get_syscall_info()` builds `info` with a
+        // designated initialiser, which zero-fills the same bytes.
+        payload: PtraceSyscallInfoPayload {
+            seccomp: PtraceSyscallInfoSeccomp {
+                nr: 0,
+                args: [0; 6],
+                ret_data: 0,
+                reserved2: 0,
+            },
+        },
+    };
+    let actual_size = PtraceSyscallInfo::active_size(info.op);
+    let write_size = actual_size.min(user_size);
+    if write_size != 0 {
+        // SAFETY: `PtraceSyscallInfo` is `#[repr(C)]`, every field (including
+        // the whole union payload) is initialised above, it contains no
+        // padding-invalid bytes, and `write_size <= size_of::<PtraceSyscallInfo>()`.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&info as *const PtraceSyscallInfo).cast::<u8>(),
+                write_size,
+            )
+        };
+        tracer_memory
+            .write_bytes(data, bytes)
+            .map_err(map_usercopy_error)?;
+    }
+    // Linux returns the *actual* size, not the number of bytes copied, so a
+    // short (or even zero-length) user buffer still reports how much the kernel
+    // had to offer.
+    Ok(actual_size as isize)
 }
 
 /// Execute the one x86 arch_prctl operation Linux permits a tracer to apply
@@ -534,7 +832,17 @@ fn sys_ptrace_for_target(
                 return Err(ptrace_io_error());
             }
             if data & !PTRACE_O_MASK != 0 {
-                return Err(AxError::InvalidInput);
+                // kernel/ptrace.c `ptrace_attach()` rejects option bits it
+                // does not know with -EIO, unlike PTRACE_SETOPTIONS which
+                // reports -EINVAL for the same condition:
+                //
+                // 	} else if (request == PTRACE_SEIZE) {
+                // 		if (addr)
+                // 			return -EIO;
+                // 		if (flags & ~(unsigned long)PTRACE_O_MASK)
+                // 			return -EIO;
+                // 		ret = check_ptrace_options(flags);
+                return Err(ptrace_io_error());
             }
             return do_attach(target_thread, true, data as u32);
         }
@@ -550,6 +858,27 @@ fn sys_ptrace_for_target(
         PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP => {
             let session = check_inactive_tracee(&target)?;
             do_continue(&target, session, data, false)?.finish()
+        }
+        // kernel/ptrace.c `ptrace_resume()` also accepts PTRACE_SYSEMU,
+        // PTRACE_SYSEMU_SINGLESTEP and PTRACE_SINGLEBLOCK:
+        //
+        // 	case PTRACE_SYSEMU:
+        // 	case PTRACE_SYSEMU_SINGLESTEP:
+        // 	case PTRACE_SINGLEBLOCK:
+        // 		...
+        // 		ret = ptrace_resume(child, request, data);
+        //
+        // All three need machinery TheKernel does not have -- syscall-entry
+        // emulation (TIF_SYSCALL_EMU, i.e. a syscall stop whose return value is
+        // forced to -ENOSYS with the syscall skipped) and hardware block-step
+        // (arch_has_block_step()).  They are decoded here so that the *stop
+        // generation* check runs first, which is what makes the difference
+        // between -ESRCH (unrelated or running tracee) and -EIO; resuming
+        // without the requested effect would be a silent ABI violation, so the
+        // request still fails closed with -EIO.
+        PTRACE_SYSEMU | PTRACE_SYSEMU_SINGLESTEP | PTRACE_SINGLEBLOCK => {
+            check_inactive_tracee(&target)?;
+            Err(ptrace_io_error())
         }
         PTRACE_DETACH => {
             let session = check_inactive_tracee(&target)?;
@@ -577,10 +906,56 @@ fn sys_ptrace_for_target(
             check_inactive_tracee(&target)?;
             Err(ptrace_io_error())
         }
-        PTRACE_SETOPTIONS => {
+        // PTRACE_OLDSETOPTIONS (21) is the pre-0x4200 spelling of the same
+        // request: kernel/ptrace.c decodes both in one arm.
+        PTRACE_SETOPTIONS | PTRACE_OLDSETOPTIONS => {
             let session = check_inactive_tracee(&target)?;
+            // kernel/ptrace.c `check_ptrace_options()`:
+            //
+            // 	if (data & ~(unsigned long)PTRACE_O_MASK)
+            // 		return -EINVAL;
+            //
+            // 	if (unlikely(data & PTRACE_O_SUSPEND_SECCOMP)) {
+            // 		if (!IS_ENABLED(CONFIG_CHECKPOINT_RESTORE) ||
+            // 		    !IS_ENABLED(CONFIG_SECCOMP))
+            // 			return -EINVAL;
+            //
+            // 		if (!capable(CAP_SYS_ADMIN))
+            // 			return -EPERM;
+            //
+            // 		if (seccomp_mode(&current->seccomp) != SECCOMP_MODE_DISABLED ||
+            // 		    current->ptrace & PT_SUSPEND_SECCOMP)
+            // 			return -EPERM;
+            // 	}
+            // 	return 0;
+            //
+            // Note that `current` here is the *tracer*: the option is only
+            // meaningful when the tracer itself runs unfiltered, and
+            // PT_SUSPEND_SECCOMP is the tracer's own flag bit, so a tracer that
+            // is already suspended cannot suspend again.
             if data & !PTRACE_O_MASK != 0 {
                 return Err(AxError::InvalidInput);
+            }
+            if data & PTRACE_O_SUSPEND_SECCOMP != 0 {
+                // `capable(CAP_SYS_ADMIN)` is the *initial* user namespace
+                // check, matching Linux `capable()` -> `ns_capable(&init_user_ns, ...)`.
+                if !current()
+                    .as_thread()
+                    .has_effective_capability(linux_raw_sys::general::CAP_SYS_ADMIN)
+                {
+                    return Err(AxError::OperationNotPermitted);
+                }
+                // `seccomp_mode(&current->seccomp) != SECCOMP_MODE_DISABLED`.
+                // The remaining Linux sub-condition, `current->ptrace &
+                // PT_SUSPEND_SECCOMP`, is the tracer's own opt-flag copy of this
+                // same bit; TheKernel keeps ptrace options per relationship
+                // rather than as a bit on the traced task, so a tracer that is
+                // itself suspended cannot be detected here. Suspending the
+                // tracee's filters is likewise not implemented, so the bit is
+                // recorded but does not alter seccomp evaluation.
+                if current().as_thread().seccomp_mode() != SeccompMode::Disabled {
+                    return Err(AxError::OperationNotPermitted);
+                }
             }
             if !target.ptrace_set_options(session, data as u32) {
                 return Err(AxError::NoSuchProcess);
@@ -669,8 +1044,27 @@ fn sys_ptrace_for_target(
                 Err(ptrace_io_error())
             }
         }
+        PTRACE_GET_SYSCALL_INFO => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                check_inactive_tracee(&target)?;
+                return ptrace_get_syscall_info(tracer_memory, addr, data);
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                check_inactive_tracee(&target)?;
+                Err(ptrace_io_error())
+            }
+        }
         PTRACE_ATTACH | PTRACE_SEIZE => unreachable!(),
-        _ => Err(AxError::InvalidInput),
+        // kernel/ptrace.c `ptrace_request()` opens with `int ret = -EIO;` and
+        // every unrecognised request reaches `default: break;`, so an unknown
+        // request number is -EIO -- *after* `ptrace_check_attach()` has already
+        // established that the target is our stopped tracee (-ESRCH otherwise).
+        _ => {
+            check_inactive_tracee(&target)?;
+            Err(ptrace_io_error())
+        }
     }
 }
 
@@ -728,5 +1122,108 @@ mod tests {
             scan_tracee_task_states(states),
             Err(axerrno::AxError::NoSuchProcess)
         );
+    }
+
+    #[test]
+    fn ptrace_option_mask_matches_linux() {
+        // kernel/ptrace.c: `#define PTRACE_O_MASK (0x000000ff | PTRACE_O_EXITKILL |
+        // PTRACE_O_SUSPEND_SECCOMP)`.  PTRACE_O_EXITKILL is (1 << 20) and
+        // PTRACE_O_SUSPEND_SECCOMP is (1 << 21), so the mask is 0x003000ff.
+        // The previous TheKernel value 0x2f_ffff rejected EXITKILL and admitted
+        // six undefined bits.
+        assert_eq!(super::PTRACE_O_MASK, 0x0030_00ff);
+        assert_eq!(
+            super::PTRACE_O_EXITKILL | super::PTRACE_O_SUSPEND_SECCOMP,
+            0x0030_0000
+        );
+        // Both bits are accepted by PTRACE_SETOPTIONS...
+        for option in [super::PTRACE_O_EXITKILL, super::PTRACE_O_SUSPEND_SECCOMP] {
+            assert_eq!(super::PTRACE_O_MASK & option, option);
+        }
+        // ...and the undefined bits the old mask admitted are not.
+        for bogus in [1 << 16, 1 << 17, 1 << 18, 1 << 19] {
+            assert_eq!(super::PTRACE_O_MASK & bogus, 0);
+        }
+    }
+
+    #[test]
+    fn ptrace_request_numbers_match_linux_uapi() {
+        // include/uapi/linux/ptrace.h.  PTRACE_OLDSETOPTIONS is an alias of
+        // PTRACE_SETOPTIONS, and the three extra resume spellings sit between
+        // PTRACE_ARCH_PRCTL (30) and the 0x42xx block.
+        assert_eq!(super::PTRACE_OLDSETOPTIONS, 21);
+        assert_eq!(super::PTRACE_SYSEMU, 31);
+        assert_eq!(super::PTRACE_SYSEMU_SINGLESTEP, 32);
+        assert_eq!(super::PTRACE_SINGLEBLOCK, 33);
+        assert_eq!(super::PTRACE_GET_SYSCALL_INFO, 0x420e);
+        // PTRACE_OLDSETOPTIONS is a plain number, not part of the 0x4200
+        // request space, so the two spellings must not collide.
+        assert_ne!(super::PTRACE_OLDSETOPTIONS, super::PTRACE_SETOPTIONS);
+        assert!(super::PTRACE_OLDSETOPTIONS < 0x4200);
+    }
+
+    #[test]
+    fn ptrace_syscall_info_layout_matches_linux() {
+        use core::mem::{align_of, offset_of, size_of};
+
+        use super::{
+            PtraceSyscallInfo, PtraceSyscallInfoEntry, PtraceSyscallInfoSeccomp,
+        };
+
+        // `struct ptrace_syscall_info` (include/uapi/linux/ptrace.h) is 88 bytes
+        // with 8-byte alignment on x86_64: a 24-byte header plus a union whose
+        // largest member is `seccomp` at 64 bytes.
+        assert_eq!(size_of::<PtraceSyscallInfo>(), 88);
+        assert_eq!(align_of::<PtraceSyscallInfo>(), 8);
+        assert_eq!(size_of::<PtraceSyscallInfoEntry>(), 56);
+        assert_eq!(size_of::<PtraceSyscallInfoSeccomp>(), 64);
+        assert_eq!(offset_of!(PtraceSyscallInfo, op), 0);
+        assert_eq!(offset_of!(PtraceSyscallInfo, reserved), 1);
+        assert_eq!(offset_of!(PtraceSyscallInfo, flags), 2);
+        assert_eq!(offset_of!(PtraceSyscallInfo, arch), 4);
+        assert_eq!(offset_of!(PtraceSyscallInfo, instruction_pointer), 8);
+        assert_eq!(offset_of!(PtraceSyscallInfo, stack_pointer), 16);
+        assert_eq!(offset_of!(PtraceSyscallInfo, payload), 24);
+        assert_eq!(offset_of!(PtraceSyscallInfoSeccomp, ret_data), 56);
+        assert_eq!(offset_of!(PtraceSyscallInfoSeccomp, reserved2), 60);
+    }
+
+    #[test]
+    fn ptrace_syscall_info_active_size_matches_linux() {
+        use super::{
+            PTRACE_SYSCALL_INFO_ENTRY, PTRACE_SYSCALL_INFO_EXIT, PTRACE_SYSCALL_INFO_NONE,
+            PTRACE_SYSCALL_INFO_SECCOMP, PtraceSyscallInfo,
+        };
+
+        // `actual_size` starts at `offsetof(struct ptrace_syscall_info, entry)`
+        // (24), grows to `offsetofend(..., entry)` (80) for ENTRY/SECCOMP, and
+        // to `offsetofend(..., exit.is_error)` (33) for EXIT -- note 33, not the
+        // 40 bytes of the padded `struct ... exit` member.
+        assert_eq!(PtraceSyscallInfo::active_size(PTRACE_SYSCALL_INFO_NONE), 24);
+        assert_eq!(PtraceSyscallInfo::active_size(PTRACE_SYSCALL_INFO_ENTRY), 80);
+        assert_eq!(PtraceSyscallInfo::active_size(PTRACE_SYSCALL_INFO_EXIT), 33);
+        assert_eq!(
+            PtraceSyscallInfo::active_size(PTRACE_SYSCALL_INFO_SECCOMP),
+            80
+        );
+        // An unknown op code still yields the header size because the
+        // initialiser is never revisited.
+        assert_eq!(PtraceSyscallInfo::active_size(0xff), 24);
+    }
+
+    #[test]
+    fn ptrace_x86_64_regset_note_types_match_the_arch_view() {
+        // arch/x86/kernel/ptrace.c `x86_64_regsets` members, selected by
+        // `find_regset()` on `core_note_type`.  NT_X86_SHSTK is the only one
+        // TheKernel can serve; the rest must be classified as known-but-inert
+        // rather than unknown, because `ptrace_regset()` answers them
+        // differently (-EIO for an inactive regset, -EINVAL for a missing one).
+        assert_eq!(super::NT_PRSTATUS, 1);
+        assert_eq!(super::NT_PRFPREG, 2);
+        assert_eq!(super::NT_386_IOPERM, 0x201);
+        assert_eq!(super::NT_X86_XSTATE, 0x202);
+        // Note the gap: NT_X86_SHSTK is 0x204 and 0x203 is unassigned.
+        assert_eq!(tk_linux_arch_x86_64::NT_X86_SHSTK, 0x204);
+        assert_eq!(super::AUDIT_ARCH_X86_64, 0xc000_003e);
     }
 }
