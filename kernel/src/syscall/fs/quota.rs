@@ -962,6 +962,8 @@ fn read_struct<M: UserMemory + ?Sized, T: bytemuck::Pod>(
     memory: &mut UserMemoryContext<'_, M>,
     addr: usize,
 ) -> AxResult<T> {
+    // `copy_from_user()` on a NULL pointer is EFAULT, and every caller reaches
+    // this helper only after the command's own validation.
     if addr == 0 {
         return Err(LinuxError::EFAULT.into());
     }
@@ -974,6 +976,7 @@ fn write_struct<M: UserMemory + ?Sized, T: bytemuck::NoUninit>(
     addr: usize,
     value: &T,
 ) -> AxResult<()> {
+    // See `read_struct()`: a NULL destination is EFAULT before any copy.
     if addr == 0 {
         return Err(LinuxError::EFAULT.into());
     }
@@ -1589,7 +1592,17 @@ pub fn sys_quotactl<M: UserMemory + ?Sized>(
     let root = root_for_device(memory, special)?;
     // `quotactl_block()` takes no mount write reference: the path form reaches
     // the provider without `mnt_want_write()`.
-    quotactl(memory, root, cmd, id, 0, on_path, false)
+    //
+    // `addr` is the command's own userspace argument and must be forwarded
+    // unchanged: `SYSCALL_DEFINE4(quotactl)` hands it to `do_quotactl()`, which
+    // copies the command's structure from it -- Q_GETFMT/Q_GETINFO/Q_GETQUOTA/
+    // Q_GETNEXTQUOTA write their result there and Q_SETINFO/Q_SETQUOTA read
+    // their input from it (fs/quota/quota.c:767-830, :107-115).  Only the
+    // Q_QUOTAON arm reinterprets it, as the quota file path, which
+    // `quota_file_for_on()` has already consumed above.  Substituting 0 here
+    // makes every structure command fail with EFAULT before it can reach the
+    // provider.
+    quotactl(memory, root, cmd, id, addr, on_path, false)
 }
 
 pub fn sys_quotactl_fd<M: UserMemory + ?Sized>(
