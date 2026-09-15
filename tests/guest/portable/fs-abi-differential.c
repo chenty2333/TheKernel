@@ -1766,6 +1766,54 @@ int main(void) {
     }
     done();
 
+    /* ------------------------------------------------------------------ *
+     * FIFO timestamps.  A named pipe's times live on the filesystem inode,
+     * and Linux stamps them from the pipe read/write paths:
+     *
+     *   fs/pipe.c fifo_pipe_read():
+     *       int ret = anon_pipe_read(iocb, to);
+     *       if (ret > 0)
+     *               file_accessed(iocb->ki_filp);          -> atime
+     *
+     *   fs/pipe.c fifo_pipe_write():
+     *       int ret = anon_pipe_write(iocb, from);
+     *       if (ret > 0) {
+     *               struct file *filp = iocb->ki_filp;
+     *               ... file_update_time(filp);            -> mtime, ctime
+     *       }
+     *
+     * Seeding a known past time first makes both verdicts independent of the
+     * clock's granularity and of the filesystem's timestamp resolution: the
+     * update either happened or it did not.  1000000 is 2001-09-09, so the
+     * relatime gate in touch_atime() is open on every path.
+     * ------------------------------------------------------------------ */
+    begin("fifo-times.raw-differential");
+    {
+        struct stat st;
+        struct timespec past[2] = { { 1000000, 0 }, { 1000000, 0 } };
+        char byte = 0;
+
+        /* utimensat(2) on the descriptor reaches the same inode, which is
+         * also what the two automatic updates below write to. */
+        check(futimens(fifo, past) == 0, "fifo-futimens");
+        check(fstat(fifo, &st) == 0, "fifo-fstat-seeded");
+        check(st.st_atime == 1000000 && st.st_mtime == 1000000,
+              "fifo-seeded-readback");
+        mark("FIFO_DESCRIPTOR_TIMES_SETTABLE");
+
+        check(write(fifo, "x", 1) == 1, "fifo-write");
+        check(fstat(fifo, &st) == 0, "fifo-fstat-written");
+        check(st.st_mtime != 1000000, "fifo-write-stamps-mtime");
+        mark("FIFO_WRITE_STAMPS_MTIME");
+
+        check(futimens(fifo, past) == 0, "fifo-reseed");
+        check(read(fifo, &byte, 1) == 1, "fifo-read");
+        check(fstat(fifo, &st) == 0, "fifo-fstat-read");
+        check(st.st_atime != 1000000, "fifo-read-stamps-atime");
+        mark("FIFO_READ_STAMPS_ATIME");
+    }
+    done();
+
     puts("THEKERNEL_FS_ABI_OK");
     return 0;
 }

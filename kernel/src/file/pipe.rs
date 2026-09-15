@@ -31,6 +31,7 @@ use crate::{
     file::{IoDst, IoSrc},
     readiness::block_on_poll_io,
     task::{AsThread, send_signal_to_process},
+    time::wall_time,
 };
 
 const PIPE_BUF_SIZE: usize = PAGE_SIZE_4K;
@@ -1616,7 +1617,7 @@ impl NamedPipe {
             return Ok(0);
         }
 
-        block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
+        let read = block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
             let _transaction = self.state.read_transaction.lock();
             let read = read_pipe_buffer(&self.state.buffer, dst)?;
             if read.len > 0 {
@@ -1627,7 +1628,16 @@ impl NamedPipe {
             } else {
                 Err(AxError::WouldBlock)
             }
-        })
+        })?;
+        // `fifo_pipe_read()` calls `file_accessed()` once a read transferred
+        // something (`fs/pipe.c:497-503`), and `file_accessed()` defers to
+        // `touch_atime()`, so the mount and inode flags decide whether the
+        // update happens exactly as they do on the VFS read path.
+        if read > 0 && crate::mounts::should_update_atime(&self.location) {
+            let now = wall_time().into();
+            self.update_timestamps(Some(now), None, now)?;
+        }
+        Ok(read)
     }
 
     pub(crate) fn write_with_nonblocking(
@@ -1670,13 +1680,23 @@ impl NamedPipe {
             }
             Err(AxError::WouldBlock)
         });
-        result.or_else(|error| {
+        let written = result.or_else(|error| {
             if total_written > 0 {
                 Ok(total_written)
             } else {
                 Err(error)
             }
-        })
+        })?;
+        // `fifo_pipe_write()` calls `file_update_time()` once a write
+        // transferred something (`fs/pipe.c:700-713`), which stamps mtime and
+        // ctime; Linux lets that error replace the byte count, so a transfer
+        // the filesystem refuses to timestamp is reported as the update's
+        // error rather than as the byte count.
+        if written > 0 {
+            let now = wall_time().into();
+            self.update_timestamps(None, Some(now), now)?;
+        }
+        Ok(written)
     }
 
     pub(crate) fn splice_read_with(
@@ -1952,6 +1972,27 @@ impl FileLike for NamedPipe {
         // `is_packetized(filp)` is sampled from the open file description by
         // `write_file_like_with_status()`, which every write(2) path uses.
         self.write_with_nonblocking(src, nonblocking, false, false)
+    }
+
+    /// A FIFO's times live on the filesystem inode the descriptor was opened
+    /// from, not on a pseudo-inode, so they are written through to the
+    /// location.  Linux reaches the same inode from `file_accessed()` and
+    /// `file_update_time()` in `fifo_pipe_read()`/`fifo_pipe_write()`, and
+    /// from `utimensat()` on the descriptor.
+    fn update_timestamps(
+        &self,
+        atime: Option<axfs_ng_vfs::Timestamp>,
+        mtime: Option<axfs_ng_vfs::Timestamp>,
+        ctime: axfs_ng_vfs::Timestamp,
+    ) -> AxResult<()> {
+        self.location
+            .update_metadata(axfs_ng_vfs::MetadataUpdate {
+                atime,
+                mtime,
+                ctime: Some(ctime),
+                ..Default::default()
+            })
+            .map_err(AxError::from)
     }
 
     fn stat(&self) -> AxResult<Kstat> {
