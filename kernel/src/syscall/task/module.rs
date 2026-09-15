@@ -17,6 +17,7 @@ use crate::{
     file::{File, FileLike, get_typed_file},
     jit_memory::{self, ExecutableCode, MemoryError},
     mm::map_usercopy_error,
+    syscall::sys::UTS_RELEASE,
     task::AsThread,
 };
 const MAX: usize = 16 * 1024 * 1024;
@@ -50,7 +51,8 @@ const WEAK: u8 = 2;
 const MODULE_INIT_IGNORE_MODVERSIONS: u32 = 1;
 const MODULE_INIT_IGNORE_VERMAGIC: u32 = 2;
 const MODULE_INIT_COMPRESSED_FILE: u32 = 4;
-/// TheKernel's `VERMAGIC_STRING` (include/linux/vermagic.h):
+/// The configuration tokens of TheKernel's `VERMAGIC_STRING`
+/// (include/linux/vermagic.h):
 ///
 /// ```c
 /// #define VERMAGIC_STRING 						\
@@ -61,17 +63,32 @@ const MODULE_INIT_COMPRESSED_FILE: u32 = 4;
 /// 	MODULE_RANDSTRUCT
 /// ```
 ///
-/// The release token is the one `uname(2)` reports (`UTS_RELEASE` in
-/// kernel/src/syscall/sys.rs), so a module and the kernel loading it agree on
-/// the release they were built for.  No configuration token is stamped:
-/// `MODULE_ARCH_VERMAGIC` is empty on x86_64 (arch/x86/include/asm/vermagic.h)
-/// and `RANDSTRUCT` is off, while the `SMP`/`preempt`/`mod_unload`/
-/// `modversions` tokens describe Linux `CONFIG_*` options, which TheKernel does
-/// not have; its own module ABI is checked separately (`.modinfo`, the
-/// `.thekernel.param.v1` parameter section and `__versions` CRCs).  The
-/// trailing space belongs to the macro (`UTS_RELEASE " "`) and is therefore
-/// part of the string `same_magic()` compares.
-const MODULE_VERMAGIC: &[u8] = b"6.12.103 ";
+/// (vermagic.h:41-46), instantiated once per kernel at kernel/module/main.c:1105:
+///
+/// 	static const char vermagic[] = VERMAGIC_STRING;
+///
+/// Each token macro is defined with a trailing space and expands to text only
+/// when its `CONFIG_*` option is on (vermagic.h:13-34).  `MODULE_ARCH_VERMAGIC`
+/// is empty on x86_64 (arch/x86/include/asm/vermagic.h:46-50) and RANDSTRUCT is
+/// off (vermagic.h:35-39), so the whole string is
+/// `UTS_RELEASE " SMP preempt mod_unload modversions "` for an SMP kernel built
+/// with CONFIG_PREEMPT_BUILD, CONFIG_MODULE_UNLOAD and CONFIG_MODVERSIONS.
+///
+/// TheKernel stamps that token set because it is the configuration TheKernel
+/// projects: its `UTS_VERSION` reports "SMP PREEMPT_DYNAMIC" (the same
+/// `uname(2)` version token the pinned oracle reports), module unloading is
+/// implemented by `sys_delete_module()`, and versioned symbols are enforced by
+/// `version_for()`/`resolve_external_symbol()`, which compare the image's
+/// `__versions` CRCs against the kernel's and the live modules' exports exactly
+/// as CONFIG_MODVERSIONS does.  The release token is `UTS_RELEASE` itself, the
+/// constant `uname(2)` reports, so the two cannot disagree.
+///
+/// Leaving the token set empty -- the previous behaviour -- left the crc form of
+/// `same_magic()` comparing "" against "" for every image, so *any* image
+/// carrying a `__versions` section passed the vermagic check whatever release
+/// it named, while a genuine module of the equivalent Linux configuration was
+/// rejected on tokens the kernel had not stamped.
+const MODULE_VERMAGIC_TOKENS: &[u8] = b" SMP preempt mod_unload modversions ";
 // Linux limits PERF_TYPE_KPROBE function names to KSYM_NAME_LEN.  Keep the
 // same bounded usercopy contract here instead of allowing an attr pointer to
 // drive an unbounded scan.
@@ -709,8 +726,8 @@ fn modinfo_value<'a>(modinfo: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
         .find_map(|entry| entry.strip_prefix(key))
 }
 
-/// Linux `same_magic()` (kernel/module/version.c), the `CONFIG_MODVERSIONS=y`
-/// spelling:
+/// Linux `same_magic()` (kernel/module/version.c:97-105), the
+/// `CONFIG_MODVERSIONS=y` spelling:
 ///
 /// ```c
 /// /* First part is kernel version, which we ignore if module has crcs. */
@@ -729,7 +746,7 @@ fn modinfo_value<'a>(modinfo: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
 /// `__versions` section, and the skipped prefix is compared *from* the space,
 /// so the configuration tokens (with their leading separator) are what has to
 /// agree once crcs are present.  Without `CONFIG_MODVERSIONS` the whole string
-/// is compared (kernel/module/internal.h):
+/// is compared (kernel/module/internal.h:419-422):
 ///
 /// ```c
 /// static inline int same_magic(const char *amagic, const char *bmagic, bool has_crcs)
@@ -738,12 +755,10 @@ fn modinfo_value<'a>(modinfo: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
 /// }
 /// ```
 ///
-/// TheKernel keeps the crc spelling: `validate_modversions()` matches
-/// `__versions` records against its exports, so an image that carries crcs is
-/// held to the same configuration tokens and an image without them to the whole
-/// string.  Comparing only the release token -- the previous behaviour -- let an
-/// image built for a different configuration through whenever its release
-/// happened to match, and let the configuration suffix decide nothing.
+/// `bmagic` is the kernel's own `vermagic` (kernel/module/main.c:1105), i.e.
+/// `UTS_RELEASE " " <tokens>`; TheKernel compares the module's string against
+/// that same composition built from `UTS_RELEASE` and `MODULE_VERMAGIC_TOKENS`,
+/// which is exactly `strcmp()` against the two pieces in order.
 fn same_magic(module_magic: &[u8], has_crcs: bool) -> bool {
     /// `strcspn(magic, " ")`: everything from the first space, or the empty
     /// tail when the string holds no space.
@@ -755,9 +770,13 @@ fn same_magic(module_magic: &[u8], has_crcs: bool) -> bool {
         &magic[offset..]
     }
     if has_crcs {
-        config_tokens(module_magic) == config_tokens(MODULE_VERMAGIC)
+        config_tokens(module_magic) == MODULE_VERMAGIC_TOKENS
     } else {
-        module_magic == MODULE_VERMAGIC
+        // The release token is `UTS_RELEASE " "` and the tokens follow it, so
+        // the whole-string comparison is that prefix split in two.
+        module_magic
+            .strip_prefix(UTS_RELEASE.as_bytes())
+            .is_some_and(|rest| rest == MODULE_VERMAGIC_TOKENS)
     }
 }
 
@@ -2291,27 +2310,44 @@ mod tests {
 
     #[test]
     fn module_vermagic_follows_same_magic() {
+        // The kernel's `vermagic` is `VERMAGIC_STRING`
+        // (include/linux/vermagic.h:41-46), i.e. `UTS_RELEASE " "` followed by
+        // the configuration tokens; building it from the same `UTS_RELEASE`
+        // constant `uname(2)` reports is what makes the release token the
+        // kernel's own rather than a second literal that can drift.
+        let full = alloc::format!(
+            "{}{}",
+            UTS_RELEASE,
+            core::str::from_utf8(MODULE_VERMAGIC_TOKENS).unwrap()
+        );
         // Without a `__versions` section Linux compares the whole string
-        // (kernel/module/internal.h), so the trailing space of
-        // `UTS_RELEASE " "` is part of the identity.
-        assert!(same_magic(b"6.12.103 ", false));
+        // (kernel/module/internal.h:419-422), so the release is part of the
+        // identity and the trailing space of `MODULE_VERMAGIC_MODVERSIONS` is
+        // too.
+        assert!(same_magic(full.as_bytes(), false));
+        assert!(!same_magic(b"6.12.103 SMP preempt mod_unload modversions", false));
+        assert!(!same_magic(b"6.12.103 ", false));
         assert!(!same_magic(b"6.12.103", false));
-        assert!(!same_magic(b"6.12.103 SMP ", false));
-        assert!(!same_magic(b"7.2.3 ", false));
-        // `strcspn(amagic, " ")` skips the release token on both sides when
-        // the image carries crcs (kernel/module/version.c), so only the
-        // configuration suffix has to agree -- and TheKernel stamps none.
-        assert!(same_magic(b"6.12.103 ", true));
-        assert!(same_magic(b"7.2.3 ", true));
-        // `strcspn()` lands on the NUL when the string holds no space, so a
-        // module that omits the separator compares "" against the kernel's " "
-        // and fails even in the crc form.
+        assert!(!same_magic(b"7.2.3 SMP preempt mod_unload modversions ", false));
+        // `strcspn(amagic, " ")` skips the release token on both sides when the
+        // image carries crcs (kernel/module/version.c:100-103), so only the
+        // configuration suffix has to agree -- a module built for another
+        // release of the same configuration is admitted, exactly as on Linux,
+        // and the crcs of its `__versions` section are what pin the ABI.
+        assert!(same_magic(b"7.2.3 SMP preempt mod_unload modversions ", true));
+        // The suffix has to be the kernel's own; an empty one, a truncated one
+        // or a differently configured one is rejected -- and rejecting the
+        // empty suffix is what stops an image from naming an unrelated release
+        // and skipping the configuration comparison altogether.
+        assert!(!same_magic(b"6.12.103 ", true));
         assert!(!same_magic(b"6.12.103", true));
+        assert!(!same_magic(b"7.2.3 ", true));
         assert!(!same_magic(b"6.12.103 SMP ", true));
-        assert!(!same_magic(b"7.2.3 mod_unload ", true));
+        assert!(!same_magic(b"6.12.103 SMP preempt mod_unload ", true));
+        assert!(!same_magic(b"6.12.103 SMP preempt mod_unload modversions extra ", true));
         // The suffix is compared *from* the separator, so an image whose extra
         // text has no leading space changes the release token, not the suffix.
-        assert!(!same_magic(b"6.12.103SMP", true));
+        assert!(!same_magic(b"6.12.103SMP preempt mod_unload modversions ", true));
     }
 
     #[test]
@@ -2323,6 +2359,7 @@ mod tests {
             LinuxError::ENOMEM
         );
     }
+
 
     #[test]
     fn relocations_use_final_addresses_across_text_rodata_and_data() {
