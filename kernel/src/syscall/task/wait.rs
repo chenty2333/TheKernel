@@ -21,10 +21,9 @@ use crate::{
     },
 };
 
-const WAITPID_ALLOWED_BITS: u32 =
-    WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WALL | __WCLONE;
-const WAITID_ALLOWED_BITS: u32 =
-    WNOHANG | WEXITED | WUNTRACED | WCONTINUED | WNOWAIT | __WNOTHREAD | __WALL | __WCLONE;
+// The accepted option masks live in `tk_linux_process::wait`, where they are
+// host-tested against `kernel_wait4()` and `kernel_waitid_prepare()`; the bits
+// themselves stay here as `WaitOptions`.
 const POST_WAIT_RECLAIM_YIELDS: usize = 4;
 
 bitflags! {
@@ -173,15 +172,23 @@ impl WaitEvent {
     }
 }
 
+/// `kernel_wait4()`'s option check: unknown bits are `EINVAL`, and there is no
+/// requirement that any event bit be set because `kernel_wait4()` ORs in
+/// `WEXITED` itself.
 fn validate_waitpid_options(options: u32) -> AxResult<WaitOptions> {
-    if options & !WAITPID_ALLOWED_BITS != 0 {
+    if options & !tk_linux_process::WAIT4_OPTIONS_ALLOWED != 0 {
         return Err(AxError::InvalidInput);
     }
-    Ok(WaitOptions::from_bits_truncate(options))
+    Ok(WaitOptions::from_bits_truncate(options) | WaitOptions::WEXITED)
 }
 
+/// `kernel_waitid_prepare()`'s option-mask check.
+///
+/// The separate "at least one of `WEXITED|WSTOPPED|WCONTINUED`" requirement is
+/// enforced by `sys_waitid()` itself, in Linux's order, so that both halves of
+/// the check stay visible next to the call they guard.
 fn validate_waitid_options(options: u32) -> AxResult<WaitOptions> {
-    if options & !WAITID_ALLOWED_BITS != 0 {
+    if options & !tk_linux_process::WAITID_OPTIONS_ALLOWED != 0 {
         return Err(AxError::InvalidInput);
     }
     Ok(WaitOptions::from_bits_truncate(options))
@@ -313,17 +320,28 @@ fn pidfd_wait_candidate(
     let visible_pid =
         visible_process_pid(viewer_pid_ns, &target).ok_or(AxError::from(LinuxError::ECHILD))?;
 
-    if target
-        .parent()
-        .is_none_or(|parent| parent.pid() != proc.pid())
-        || !should_wait_for_child(&target, options)
-    {
-        return Err(AxError::from(LinuxError::ECHILD));
-    }
-
     let expected_ptrace_session = get_process_data(target.pid())
         .ok()
         .and_then(|target| target.ptrace_session_if_traced_by_process(proc.pid()));
+    let ptrace = expected_ptrace_session.is_some();
+
+    // `P_PIDFD` takes `do_wait_pid()`'s PIDTYPE_TGID branch, which admits the
+    // target when it is the caller's `real_parent` child, and then the
+    // PIDTYPE_PID branch, which admits a `p->ptrace` target under
+    // `target->parent` instead. `ptrace_link()` reparents the tracee onto the
+    // tracer, so a *non-parent* ptracer holding a pidfd for a tracee it attached
+    // to must still be able to wait on it; requiring `real_parent` alone would
+    // report ECHILD and strand the tracee.
+    let is_effectively_child = ptrace
+        || target
+            .parent()
+            .is_some_and(|parent| parent.pid() == proc.pid());
+    // `eligible_child()` returns 1 for a ptrace target regardless of
+    // `__WCLONE`/`__WALL`, and otherwise filters on the exit signal.
+    let eligible = ptrace || should_wait_for_child(&target, options);
+    if !is_effectively_child || !eligible {
+        return Err(AxError::from(LinuxError::ECHILD));
+    }
 
     Ok(WaitCandidate {
         process: target,
@@ -333,57 +351,99 @@ fn pidfd_wait_candidate(
     })
 }
 
+/// Linux's `wait_consider_task()` event selection, applied per child.
+///
+/// The three events are not ranked globally: `wait_consider_task()` is called
+/// once per child and returns as soon as that child has anything to report, so
+/// the *first* child in the child list with any selected event wins. Collecting
+/// all stopped children first would report a later stopped sibling ahead of an
+/// earlier exited one, which is observable whenever two children have different
+/// pending events.
+///
+/// `allow_exit` and `expected_ptrace_session` are carried by `WaitCandidate`,
+/// and the stop gate below reproduces `wait_task_stopped()`'s rule that a
+/// non-ptrace child's stop is only reportable with `WUNTRACED`.
 fn select_wait_event(
     candidates: &[WaitCandidate],
     options: &WaitOptions,
     wait_exited: bool,
 ) -> Option<WaitEvent> {
+    let selection = selection_for(options, wait_exited);
     for candidate in candidates {
-        if let Ok(proc_data) = get_process_data(candidate.process.pid())
-            && let Some(stop) = proc_data.peek_stop_status(candidate.expected_ptrace_session)
-            && wait_candidate_accepts_stop(candidate.expected_ptrace_session, stop)
-            && (stop.traced() || options.contains(WaitOptions::WUNTRACED))
-        {
-            return Some(WaitEvent::Stopped {
-                pid: candidate.visible_pid,
-                stop,
-                proc_data,
-            });
-        }
-    }
+        let Ok(proc_data) = get_process_data(candidate.process.pid()) else {
+            continue;
+        };
+        // A stop is reportable when it belongs to this waiter's ptrace session
+        // (if any) and either it is a ptrace stop — which is always reported —
+        // or the caller asked for job-control stops with `WUNTRACED`. This is
+        // `wait_task_stopped()`'s `if (!ptrace && !(wo->wo_flags & WUNTRACED))
+        // return 0;`, with `ptrace` derived from the same session identity.
+        let stop = proc_data
+            .peek_stop_status(candidate.expected_ptrace_session)
+            .filter(|stop| wait_candidate_accepts_stop(candidate.expected_ptrace_session, *stop))
+            .filter(|stop| stop.traced() || selection.stopped);
 
-    if options.contains(WaitOptions::WCONTINUED) {
-        for candidate in candidates {
-            if let Ok(proc_data) = get_process_data(candidate.process.pid())
-                && proc_data.peek_continued()
-            {
+        // `delay_group_leader()`: a zombie group leader is held back while any
+        // of its threads is still alive, so its exit is reported only once the
+        // whole thread group is gone.
+        let zombie = candidate
+            .process
+            .is_zombie()
+            .then(|| candidate.process.zombie_payload())
+            .flatten()
+            .filter(|_| {
+                !tk_linux_process::zombie_is_delayed(true, candidate.process.thread_count())
+            });
+
+        let event = tk_linux_process::select_child_event(
+            tk_linux_process::WaitEventState {
+                exited: candidate.allow_exit && zombie.is_some(),
+                stopped: stop.is_some() && selection.stopped,
+                continued: proc_data.peek_continued() && selection.continued,
+            },
+            selection,
+        );
+
+        match event {
+            Some(tk_linux_process::WaitEventKind::Exited) => {
+                return Some(WaitEvent::Exited {
+                    pid: candidate.visible_pid,
+                    child: candidate.process.clone(),
+                    snapshot: zombie?,
+                });
+            }
+            Some(tk_linux_process::WaitEventKind::Stopped) => {
+                return Some(WaitEvent::Stopped {
+                    pid: candidate.visible_pid,
+                    stop: stop?,
+                    proc_data,
+                });
+            }
+            Some(tk_linux_process::WaitEventKind::Continued) => {
                 return Some(WaitEvent::Continued {
                     pid: candidate.visible_pid,
                     proc_data,
                 });
             }
-        }
-    }
-
-    if wait_exited {
-        for candidate in candidates {
-            if !candidate.allow_exit {
-                continue;
-            }
-            let child = &candidate.process;
-            if child.is_zombie()
-                && let Some(snapshot) = child.zombie_payload()
-            {
-                return Some(WaitEvent::Exited {
-                    pid: candidate.visible_pid,
-                    child: child.clone(),
-                    snapshot,
-                });
-            }
+            None => {}
         }
     }
 
     None
+}
+
+/// Maps the kernel's option bits onto the crate's event selection.
+fn selection_for(
+    options: &WaitOptions,
+    wait_exited: bool,
+) -> tk_linux_process::WaitEventSelection {
+    tk_linux_process::WaitEventSelection {
+        exited: wait_exited || options.contains(WaitOptions::WEXITED),
+        // `wait4(2)` spells `WSTOPPED` as `WUNTRACED`; they are the same bit,
+        // so one test covers both spellings.
+        stopped: options.contains(WaitOptions::WUNTRACED),
+        continued: options.contains(WaitOptions::WCONTINUED),
+    }
 }
 
 fn wait_candidate_accepts_stop(
@@ -659,11 +719,24 @@ pub fn sys_waitid(
     options: u32,
     rusage_ptr: *mut rusage,
 ) -> AxResult<isize> {
+    // `kernel_waitid_prepare()` checks the option mask, then that at least one
+    // event bit is set, and only then the `which`/`upid` pair. The order
+    // matters because a call failing both reports the *first* failure.
     let options = validate_waitid_options(options)?;
-
-    if !options.intersects(WaitOptions::WEXITED | WaitOptions::WUNTRACED | WaitOptions::WCONTINUED)
-    {
+    if options.bits() & tk_linux_process::WAITID_EVENT_FLAGS == 0 {
         return Err(AxError::InvalidInput);
+    }
+    // Namespace-visible IDs are `pid_t`, so a value that cannot round-trip
+    // through `i32` names nothing and is EINVAL rather than a wrapped lookup.
+    if id > i32::MAX as u32 {
+        return Err(AxError::InvalidInput);
+    }
+    match tk_linux_process::validate_id_type(idtype as i32, id as i32) {
+        Ok(tk_linux_process::WaitIdType::All) => debug_assert_eq!(idtype, P_ALL),
+        Ok(tk_linux_process::WaitIdType::Pid(_)) => debug_assert_eq!(idtype, P_PID),
+        Ok(tk_linux_process::WaitIdType::Pgid(_)) => debug_assert_eq!(idtype, P_PGID),
+        Ok(tk_linux_process::WaitIdType::PidFd) => debug_assert_eq!(idtype, P_PIDFD),
+        Err(_) => return Err(AxError::InvalidInput),
     }
 
     let curr = current();
@@ -679,18 +752,9 @@ pub fn sys_waitid(
     let mut pidfd_candidate = None;
     let pid = match idtype {
         P_ALL => Some(WaitPid::Any),
-        P_PID => {
-            let pid = id as i32;
-            if pid <= 0 {
-                return Err(AxError::InvalidInput);
-            }
-            Some(WaitPid::Pid(pid as _))
-        }
+        P_PID => Some(WaitPid::Pid(id as _)),
         P_PGID => {
             let pgid = id as i32;
-            if pgid < 0 {
-                return Err(AxError::InvalidInput);
-            }
             Some(if pgid == 0 {
                 WaitPid::Pgid(proc.group().pgid())
             } else {
@@ -698,9 +762,6 @@ pub fn sys_waitid(
             })
         }
         P_PIDFD => {
-            if id > i32::MAX as u32 {
-                return Err(AxError::InvalidInput);
-            }
             let pidfd = waitid_pidfd(id as i32)?;
             pidfd_nonblocking = pidfd.nonblocking();
             if pidfd_nonblocking {
