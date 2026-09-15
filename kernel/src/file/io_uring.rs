@@ -42,11 +42,11 @@ use ouroboros::self_referencing;
 use spin::Once;
 use tk_linux_io_uring::{
     BufferLeaseRelease, BufferSlot, BufferTableId, CancelSelector, CompletionPublication,
-    CompletionToken, CopiedSubmission, FileSlot, FileTableId, IoUringError, IssuedRequest,
-    LeaseRelease, MappingRegion, ParsedSubmission, PreparedRequest, ProviderCancelOutcome,
-    ReadWriteRequest, RegisteredBufferLease, RegisteredBufferTable, RegisteredFileLease,
-    RegisteredFileTable, RequestDescriptor, RequestId, RequestIssueError, RequestRegistry,
-    RequestReservation, RingId, RingLayout, SetupFlags, TerminalCause,
+    CompletionToken, CopiedSubmission, FileSlot, FileTableId, IORING_MAX_FIXED_FILES, IoUringError,
+    IssuedRequest, LeaseRelease, MappingRegion, ParsedSubmission, PreparedRequest,
+    ProviderCancelOutcome, ReadWriteRequest, RegisteredBufferLease, RegisteredBufferTable,
+    RegisteredFileLease, RegisteredFileTable, RequestDescriptor, RequestId, RequestIssueError,
+    RequestRegistry, RequestReservation, RingId, RingLayout, SetupFlags, TerminalCause,
 };
 use tk_linux_process_adapter::Pid;
 use tk_linux_signal::SignalSet;

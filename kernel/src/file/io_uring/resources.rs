@@ -938,6 +938,40 @@ impl IoUring {
         Ok(removed)
     }
 
+    /// `io_sqe_files_register()`'s admission checks, in Linux's order.
+    ///
+    /// ```text
+    /// if (ctx->file_table.data.nr)
+    ///         return -EBUSY;
+    /// if (!nr_args)
+    ///         return -EINVAL;
+    /// if (nr_args > IORING_MAX_FIXED_FILES)
+    ///         return -EMFILE;
+    /// if (nr_args > rlimit(RLIMIT_NOFILE))
+    ///         return -EMFILE;
+    /// ```
+    ///
+    /// (`io_uring/rsrc.c:624-631`).  The table's own state is therefore judged
+    /// before both count ceilings, and all of it before the descriptor array
+    /// is read.  `nofile_limit` is the caller's soft `RLIMIT_NOFILE`, which
+    /// only the syscall layer can observe.
+    pub(crate) fn admit_registered_files(
+        &self,
+        count: u32,
+        nofile_limit: usize,
+    ) -> AxResult<()> {
+        if self.state.lock().fixed_files.is_some() {
+            return Err(AxError::ResourceBusy);
+        }
+        if count == 0 {
+            return Err(AxError::InvalidInput);
+        }
+        if count > IORING_MAX_FIXED_FILES || count as usize > nofile_limit {
+            return Err(AxError::from(LinuxError::EMFILE));
+        }
+        Ok(())
+    }
+
     pub(crate) fn register_files(&self, files: Vec<Option<Arc<FileDescription>>>) -> AxResult<()> {
         let _registration = self.registration_serial.lock();
         if files.is_empty() {

@@ -284,15 +284,30 @@ pub fn sys_io_uring_setup(
     Ok(publication.commit() as isize)
 }
 
+/// The caller's soft `RLIMIT_NOFILE`, as `rlimit(RLIMIT_NOFILE)` reads it.
+///
+/// `io_sqe_files_register()` rejects a fixed-file count above this limit with
+/// `-EMFILE` (`io_uring/rsrc.c:630-631`), using the *current* (soft) limit of
+/// the submitting task.
+fn current_nofile_soft_limit() -> usize {
+    axtask::current().as_thread().proc_data.rlim.read()
+        [linux_raw_sys::general::RLIMIT_NOFILE]
+        .current as usize
+}
+
+/// Imports a fixed-file descriptor array after the registration is admitted.
+///
+/// Every `nr_args` ceiling has already been applied by
+/// `IoUring::admit_registered_files()` and the NULL array by the dispatcher
+/// check, both ahead of this read (`io_uring/register.c:786-790`,
+/// `io_uring/rsrc.c:624-631`).  Only the per-descriptor rules remain: a
+/// readable array of `i32` descriptors in which `-1` marks a sparse slot.
 fn copy_registered_files(
     capability: &UserMemoryCapability,
     argument: u64,
     count: u32,
 ) -> AxResult<Vec<Option<Arc<FileDescription>>>> {
     let count = usize::try_from(count).map_err(|_| AxError::InvalidInput)?;
-    if count > crate::task::AX_FILE_LIMIT {
-        return Err(AxError::from(LinuxError::EMFILE));
-    }
     let address = usize::try_from(argument).map_err(|_| AxError::BadAddress)?;
     let mut descriptors = Vec::<MaybeUninit<i32>>::new();
     descriptors
@@ -745,6 +760,20 @@ pub fn sys_io_uring_register(
         }
         RegistrationOperation::UnregisterBuffers => ring.unregister_buffers()?,
         RegistrationOperation::RegisterFiles { argument, count } => {
+            // `io_uring_register()`'s dispatcher answers a NULL descriptor
+            // array with -EFAULT before `io_sqe_files_register()` runs at all
+            // (`io_uring/register.c:786-790`):
+            //
+            //     case IORING_REGISTER_FILES:
+            //             ret = -EFAULT;
+            //             if (!arg)
+            //                     break;
+            if argument == 0 {
+                return Err(AxError::BadAddress);
+            }
+            // The table's own state and both `nr_args` ceilings are then
+            // judged before the array is read (`io_uring/rsrc.c:624-631`).
+            ring.admit_registered_files(count, current_nofile_soft_limit())?;
             let files = copy_registered_files(&capability, argument, count)?;
             ring.register_files(files)?;
         }

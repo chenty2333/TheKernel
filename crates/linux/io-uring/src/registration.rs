@@ -1,4 +1,4 @@
-use crate::{IORING_MAX_FIXED_FILES, IoUringError};
+use crate::IoUringError;
 
 const IORING_REGISTER_BUFFERS: u32 = 0;
 const IORING_UNREGISTER_BUFFERS: u32 = 1;
@@ -154,12 +154,24 @@ impl RegistrationRequest {
                 }
             }
             IORING_REGISTER_FILES => {
-                if self.argument == 0 || self.count == 0 {
-                    return Err(IoUringError::InvalidRegistration);
-                }
-                if self.count > IORING_MAX_FIXED_FILES {
-                    return Err(IoUringError::InvalidFileTableCapacity);
-                }
+                // Two header fields are checked by two different layers, and
+                // they do not share an errno:
+                //
+                //     case IORING_REGISTER_FILES:
+                //             ret = -EFAULT;
+                //             if (!arg)
+                //                     break;
+                //             ret = io_sqe_files_register(ctx, arg, nr_args, NULL);
+                //
+                // (`io_uring/register.c:786-790`) rejects a NULL descriptor
+                // array with -EFAULT before the table routine runs, while
+                // `io_sqe_files_register()` itself owns -EINVAL for a zero
+                // `nr_args`, -EBUSY for an already-registered table and
+                // -EMFILE for both `nr_args` ceilings — the last of which is
+                // the caller's `RLIMIT_NOFILE`
+                // (`io_uring/rsrc.c:624-631`).  Neither value is judged here:
+                // both travel to the syscall adapter, which owns the caller's
+                // address space and resource limits.
                 Ok(RegistrationOperation::RegisterFiles {
                     argument: self.argument,
                     count: self.count,
@@ -255,9 +267,22 @@ mod tests {
                 count: 4
             })
         );
+        // A NULL array is the dispatcher's -EFAULT and a zero count is
+        // `io_sqe_files_register()`'s -EINVAL, so neither is collapsed into a
+        // malformed-header error here.
         assert_eq!(
             RegistrationRequest::new(IORING_REGISTER_FILES, 0, 4).decode(),
-            Err(IoUringError::InvalidRegistration)
+            Ok(RegistrationOperation::RegisterFiles {
+                argument: 0,
+                count: 4
+            })
+        );
+        assert_eq!(
+            RegistrationRequest::new(IORING_REGISTER_FILES, 0x1000, 0).decode(),
+            Ok(RegistrationOperation::RegisterFiles {
+                argument: 0x1000,
+                count: 0
+            })
         );
         assert_eq!(
             RegistrationRequest::new(IORING_UNREGISTER_FILES, 0, 0).decode(),
@@ -267,6 +292,23 @@ mod tests {
             RegistrationRequest::new(IORING_UNREGISTER_FILES, 1, 0).decode(),
             Err(IoUringError::InvalidRegistration)
         );
+    }
+
+    #[test]
+    fn file_registration_limits_are_decoded_for_the_adapter() {
+        // `io_sqe_files_register()` answers -EMFILE for both `nr_args`
+        // ceilings (`io_uring/rsrc.c:628-631`), so decoding must not collapse
+        // an oversized count into the generic -EINVAL of a malformed header.
+        // `RegisteredFileTable::new` still refuses to build such a table.
+        for count in [1 << 20, (1 << 20) + 1, u32::MAX] {
+            assert_eq!(
+                RegistrationRequest::new(IORING_REGISTER_FILES, 0x1000, count).decode(),
+                Ok(RegistrationOperation::RegisterFiles {
+                    argument: 0x1000,
+                    count,
+                })
+            );
+        }
     }
 
     #[test]
