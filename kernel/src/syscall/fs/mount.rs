@@ -439,6 +439,78 @@ fn requested_namespace_root(
     Ok((visible.target.clone(), Some(visible.id)))
 }
 
+/// Select the mount record and namespace root that `statmount` must describe.
+///
+/// `STATMOUNT_BY_FD` takes a different route through Linux than the
+/// identifier form: `do_statmount()` reads the mount out of the descriptor's
+/// own `f_path`, adopts that mount's namespace, and deliberately skips the
+/// `is_path_reachable()` capability test.  A mount with no namespace (one
+/// detached by `MNT_DETACH`) additionally clears `STATMOUNT_MNT_POINT` and
+/// `STATMOUNT_MNT_NS_ID`.
+struct StatmountTarget {
+    topology: mounts::MountTopologySnapshot,
+    mount: crate::mounts::Mount,
+    mount_ns: Arc<crate::task::MountNamespace>,
+    fs_root: FsPathBuf,
+    /// False when the descriptor's mount has no namespace.
+    namespaced: bool,
+}
+
+fn statmount_target_by_id(req: MntIdReq) -> AxResult<StatmountTarget> {
+    let mount_ns = mount_namespace_for_request(req)?;
+    let topology = mount_ns.topology().try_snapshot()?;
+    let mount = topology
+        .mounts
+        .iter()
+        .find(|mount| mount.id == req.mnt_id)
+        .cloned()
+        .ok_or(AxError::NotFound)?;
+    let (fs_root, _) = requested_namespace_root(&mount_ns, &topology)?;
+    Ok(StatmountTarget {
+        topology,
+        mount,
+        mount_ns,
+        fs_root,
+        namespaced: true,
+    })
+}
+
+fn statmount_target_by_fd(req: MntIdReq) -> AxResult<StatmountTarget> {
+    // `fget_raw(kreq.mnt_fd)` accepts every descriptor kind, including
+    // O_PATH, because only `f_path.mnt` is consumed.
+    let fd = i32::try_from(req.descriptor_word()).map_err(|_| AxError::BadFileDescriptor)?;
+    let file = get_file_like(fd)?;
+    let (Some(mount_id), Some(topology)) = (file.vfs_mount_id(), file.vfs_mount_topology()) else {
+        // A detached mount descriptor has no namespace topology retained by
+        // the VFS description.  Linux would report the mount with
+        // MNT_POINT/MNT_NS_ID cleared; that ledger is not addressable here.
+        return Err(AxError::OperationNotSupported);
+    };
+    let topology = topology.try_snapshot()?;
+    let mount = topology
+        .mounts
+        .iter()
+        .find(|mount| mount.id == mount_id)
+        .cloned()
+        .ok_or(AxError::NotFound)?;
+    let current_ns = current_mount_namespace();
+    let mount_ns = if topology.namespace_id == current_ns.id() {
+        current_ns
+    } else {
+        // `grab_requested_root()` resolves a foreign namespace by identity,
+        // and the descriptor itself carries the possession authority.
+        crate::task::MountNamespace::lookup(topology.namespace_id)?
+    };
+    let (fs_root, _) = requested_namespace_root(&mount_ns, &topology)?;
+    Ok(StatmountTarget {
+        topology,
+        mount,
+        mount_ns,
+        fs_root,
+        namespaced: true,
+    })
+}
+
 fn append_statmount_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> AxResult<u32> {
     // Linux reserves str[0] as the empty-string sentinel, so an unset offset
     // remains distinguishable from the first populated string.
@@ -545,9 +617,14 @@ pub fn sys_statmount<M: UserMemory + ?Sized>(
     bufsize: usize,
     flags: u32,
 ) -> AxResult<isize> {
-    validate_statmount_flags(flags).map_err(map_mount_uapi)?;
+    let by_fd = validate_statmount_flags(flags).map_err(map_mount_uapi)?;
     let req = read_mnt_id_req(memory, req)?;
-    let mount_ns = mount_namespace_for_request(req)?;
+    validate_statmount_request(req, by_fd).map_err(map_mount_uapi)?;
+    let target = if by_fd {
+        statmount_target_by_fd(req)?
+    } else {
+        statmount_target_by_id(req)?
+    };
     memory
         .validate_write_range(buf as usize, bufsize)
         .map_err(map_usercopy_error)?;
@@ -562,19 +639,27 @@ pub fn sys_statmount<M: UserMemory + ?Sized>(
         return Err(LinuxError::EOVERFLOW.into());
     }
     let _mount_operation = mounts::namespace_operation();
-    let topology = mount_ns.topology().try_snapshot()?;
-    let (fs_root, _) = requested_namespace_root(&mount_ns, &topology)?;
-    let mount = topology
-        .mounts
-        .iter()
-        .find(|mount| mount.id == req.mnt_id)
-        .ok_or(AxError::NotFound)?;
+    let StatmountTarget {
+        topology,
+        mount,
+        mount_ns,
+        fs_root,
+        namespaced,
+    } = target;
+    let topology = &topology;
+    let mount = &mount;
+    let mask = if namespaced {
+        mask
+    } else {
+        mask & !(STATMOUNT_MNT_POINT | STATMOUNT_MNT_NS_ID)
+    };
     let actor = current().as_thread().current_cred();
     let visible_point = match visible_mount_point(&mount.target, &fs_root)? {
         Some(point) => Some(point),
         // Capability admits the query, but seq_path_root() still skips an
         // unreachable pathname.  Leave MNT_POINT and its mask bit unset.
-        None if ns_capable(&actor, mount_ns.owner_user_ns(), CAP_SYS_ADMIN) => None,
+        // `do_statmount()` applies this test only to the identifier form.
+        None if by_fd || ns_capable(&actor, mount_ns.owner_user_ns(), CAP_SYS_ADMIN) => None,
         None => return Err(LinuxError::EPERM.into()),
     };
     let mut returned_mask = 0u64;
@@ -2982,20 +3067,42 @@ pub fn sys_fsconfig<M: UserMemory + ?Sized>(
 }
 
 pub fn sys_fsmount(fd: i32, flags: u32, mount_attrs: u32) -> AxResult<isize> {
-    if fd < 0 {
-        return Err(AxError::BadFileDescriptor);
+    // Linux `SYSCALL_DEFINE3(fsmount, ...)` (fs/namespace.c) admits the flag and
+    // attribute words before it looks at the descriptor at all:
+    //   if ((flags & ~(FSMOUNT_CLOEXEC | FSMOUNT_NAMESPACE)) != 0) return -EINVAL;
+    //   if ((flags & FSMOUNT_NAMESPACE) && !ns_capable(current_user_ns(), CAP_SYS_ADMIN)) return -EPERM;
+    //   if (!(flags & FSMOUNT_NAMESPACE) && !may_mount()) return -EPERM;
+    //   if (attr_flags & ~FSMOUNT_VALID_FLAGS) return -EINVAL;
+    //   switch (attr_flags & MOUNT_ATTR__ATIME) { ... default: return -EINVAL; }
+    //   CLASS(fd, f)(fs_fd); if (fd_empty(f)) return -EBADF;
+    //   if (fd_file(f)->f_op != &fscontext_fops) return -EINVAL;
+    let cloexec = validate_fsmount(flags, mount_attrs).map_err(map_mount_uapi)?;
+    if flags & FSMOUNT_NAMESPACE != 0 {
+        // `ns_capable(current_user_ns(), CAP_SYS_ADMIN)` precedes the
+        // namespace-file allocation, and TheKernel has no nsfs descriptor
+        // provider to allocate from.  Report the well-formed request as
+        // unsupported rather than as a malformed one; there is no
+        // fs_context user namespace to be capable in, so the mount capability
+        // is the whole of Linux's check here.
+        if !current_may_mount() {
+            return Err(LinuxError::EPERM.into());
+        }
+        return Err(AxError::OperationNotSupported);
     }
     if !current_may_mount() {
         return Err(LinuxError::EPERM.into());
     }
 
     let file = get_file_like(fd)?;
+    // A descriptor that is not an fs_context is `-EINVAL`, not `-EBADF`.
     let fsopen = file
         .downcast_ref::<FsOpenFd>()
-        .ok_or(AxError::BadFileDescriptor)?;
+        .ok_or(AxError::InvalidInput)?;
     let state = fsopen.0.lock();
 
-    let cloexec = validate_fsmount(flags, mount_attrs).map_err(map_mount_uapi)?;
+    // `fc->root == NULL` means fsconfig(FSCONFIG_CMD_CREATE) never completed
+    // for this context, which Linux reports as `-EINVAL` before it examines
+    // the context phase.
     if !state.created {
         return Err(AxError::InvalidInput);
     }
@@ -3268,24 +3375,22 @@ pub fn sys_fspick<M: UserMemory + ?Sized>(
     pathname: *const c_char,
     flags: u32,
 ) -> AxResult<isize> {
-    const FSPICK_CLOEXEC: u32 = 0x1;
-    const FSPICK_SYMLINK_NOFOLLOW: u32 = 0x2;
-    const FSPICK_NO_AUTOMOUNT: u32 = 0x4;
-    const FSPICK_EMPTY_PATH: u32 = 0x8;
-    if flags & !(FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW | FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH)
-        != 0
-    {
-        return Err(AxError::InvalidInput);
-    }
+    // Linux `SYSCALL_DEFINE3(fspick, ...)` (fs/fsopen.c) performs
+    // `may_mount()` before it validates the flag word, and both precede the
+    // pathname copy and walk:
+    //   if (!may_mount()) return -EPERM;
+    //   if ((flags & ~(FSPICK_CLOEXEC | FSPICK_SYMLINK_NOFOLLOW |
+    //                  FSPICK_NO_AUTOMOUNT | FSPICK_EMPTY_PATH)) != 0) return -EINVAL;
     let security = VfsSecurityContext::new(current().as_thread().current_cred());
-    if !may_mount(&security) {
-        return Err(LinuxError::EPERM.into());
-    }
-    let path = if pathname.is_null() && flags & FSPICK_EMPTY_PATH != 0 {
-        FsPathBuf::new()
-    } else {
-        load_user_path(memory, pathname)?
+    let cloexec = match validate_fspick(flags, may_mount(&security)) {
+        Ok(cloexec) => cloexec,
+        Err(FspickReject::NotCapable) => return Err(LinuxError::EPERM.into()),
+        Err(FspickReject::InvalidFlags) => return Err(AxError::InvalidInput),
     };
+    // `CLASS(filename_flags, filename)(path, LOOKUP_EMPTY)` copies the pathname
+    // with `strncpy_from_user()`, which faults on a NULL pointer regardless of
+    // FSPICK_EMPTY_PATH; an empty string is the empty-path request.
+    let path = load_user_path(memory, pathname)?;
     if path.as_bytes().is_empty() && flags & FSPICK_EMPTY_PATH == 0 {
         return Err(AxError::NotFound);
     }
@@ -3305,6 +3410,13 @@ pub fn sys_fspick<M: UserMemory + ?Sized>(
     let loc = resolve_at_with_security(dirfd, Some(path.as_ref()), resolve_flags, &security)?
         .into_file()
         .ok_or(AxError::InvalidInput)?;
+    // fspick can only reconfigure an existing superblock, so Linux requires the
+    // looked-up dentry to be the root of its mount:
+    //   ret = -EINVAL;
+    //   if (target.mnt->mnt_root != target.dentry) goto err_path;
+    if !loc.is_root_of_mount() {
+        return Err(AxError::InvalidInput);
+    }
     let metadata = mounts::clone_metadata_for_bind(&loc)?;
     let fuse_connection = if metadata.fs_type == "fuse" {
         Some(
@@ -3341,7 +3453,7 @@ pub fn sys_fspick<M: UserMemory + ?Sized>(
         paths: Vec::new(),
         reconfigure_mount: Some(loc),
     }))
-    .add_to_fd_table(flags & FSPICK_CLOEXEC != 0)
+    .add_to_fd_table(cloexec)
     .map(|fd| fd as isize)
 }
 
@@ -3351,9 +3463,32 @@ fn prepare_open_tree<M: UserMemory + ?Sized>(
     pathname: *const c_char,
     flags: u32,
 ) -> AxResult<(FsMountFd, bool)> {
+    // `vfs_open_tree()` (fs/namespace.c) validates the flag word, then the
+    // clone-namespace capability, then the clone mount capability, and only
+    // then copies the pathname:
+    //   if (flags & ~(AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_RECURSIVE |
+    //                 AT_SYMLINK_NOFOLLOW | OPEN_TREE_CLONE |
+    //                 OPEN_TREE_CLOEXEC | OPEN_TREE_NAMESPACE)) return ERR_PTR(-EINVAL);
+    //   if ((flags & (AT_RECURSIVE | OPEN_TREE_CLONE | OPEN_TREE_NAMESPACE)) == AT_RECURSIVE)
+    //           return ERR_PTR(-EINVAL);
+    //   if (hweight32(flags & (OPEN_TREE_CLONE | OPEN_TREE_NAMESPACE)) > 1) return ERR_PTR(-EINVAL);
+    //   if ((flags & OPEN_TREE_NAMESPACE) && !ns_capable(current_user_ns(), CAP_SYS_ADMIN))
+    //           return ERR_PTR(-EPERM);
+    //   if ((flags & OPEN_TREE_CLONE) && !may_mount()) return ERR_PTR(-EPERM);
     let cloexec = validate_open_tree(flags).map_err(map_mount_uapi)?;
     let curr = current();
     let actor = curr.as_thread().current_cred();
+    if flags & OPEN_TREE_NAMESPACE != 0 {
+        let gate_security = VfsSecurityContext::new(actor.clone());
+        if !may_mount(&gate_security) {
+            return Err(LinuxError::EPERM.into());
+        }
+        // open_new_namespace() needs an nsfs descriptor, which TheKernel's
+        // mount code cannot allocate.  A namespace-requesting open_tree is a
+        // well-formed Linux request, so report it as unsupported instead of
+        // malformed.
+        return Err(AxError::OperationNotSupported);
+    }
     if flags & OPEN_TREE_CLONE != 0 {
         let gate_security = VfsSecurityContext::new(actor.clone());
         if !may_mount(&gate_security) {
@@ -3361,13 +3496,11 @@ fn prepare_open_tree<M: UserMemory + ?Sized>(
         }
     }
 
-    // AT_EMPTY_PATH permits a NULL pathname, which is how open_tree_attr
-    // applies attributes to its just-created detached mount FD.
-    let path = if pathname.is_null() && flags & AT_EMPTY_PATH != 0 {
-        FsPathBuf::new()
-    } else {
-        load_user_path(memory, pathname)?
-    };
+    // `CLASS(filename_uflags, name)(filename, flags)` (fs/namei.c) copies the
+    // pathname with `strncpy_from_user()`, which reports EFAULT for a NULL
+    // pointer even when AT_EMPTY_PATH is set; an empty string is the
+    // empty-path request.
+    let path = load_user_path(memory, pathname)?;
     debug!("sys_open_tree <= dirfd: {dirfd}, path: {path:?}, flags: {flags:#x}");
     // Every path that may also touch an FsMountTreeState observes the
     // namespace operation first.  move_mount and mount_setattr use the same
@@ -4841,12 +4974,10 @@ pub fn sys_pivot_root<M: UserMemory + ?Sized>(
     new_root: *const c_char,
     put_old: *const c_char,
 ) -> AxResult<isize> {
-    // Linux checks namespace authority before either pathname copy.  Besides
-    // matching the observable EPERM/EFAULT order, this avoids user-memory
-    // access for callers that cannot mount in the first place.
-    if !current_may_mount() {
-        return Err(LinuxError::EPERM.into());
-    }
+    // Linux `SYSCALL_DEFINE2(pivot_root, ...)` resolves both pathnames with
+    // LOOKUP_FOLLOW|LOOKUP_DIRECTORY before `path_pivot_root()` reaches its
+    // `if (!may_mount()) return -EPERM;`.  A bad pointer or a missing path
+    // therefore reports EFAULT/ENOENT/ENOTDIR ahead of the capability check.
     let new_root = load_user_path(memory, new_root)?;
     if new_root.as_bytes().is_empty() {
         return Err(AxError::NotFound);
@@ -4879,6 +5010,11 @@ pub fn sys_pivot_root<M: UserMemory + ?Sized>(
         .lock()
         .resolve_security(put_old.as_ref(), &security)?;
     put_old_loc.check_is_dir()?;
+    // Linux defers the capability check until after both walks: `path_pivot_root`
+    // begins with `if (!may_mount()) return -EPERM;`.
+    if !current_may_mount() {
+        return Err(LinuxError::EPERM.into());
+    }
     // Keep every live task pinned before the irreversible topology commit.
     // The subsequent per-context updates are allocation-free, matching
     // chroot_fs_refs(): only root/cwd references exactly at the old root move.

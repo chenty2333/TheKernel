@@ -419,9 +419,153 @@ impl QuotaUsage {
         }
     }
 }
+/// The subset of `lookup_bdev()` and `user_get_super()` that `quotactl` uses
+/// to name its target filesystem, as an ordered policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotaDeviceReject {
+    /// The resolved path is not a block device: `lookup_bdev()` -> `-ENOTBLK`.
+    NotBlockDevice,
+    /// The mount carrying the device node is `nodev`: `-EACCES`.
+    Nodev,
+    /// No live superblock is backed by the device: `user_get_super()` ->
+    /// `-ENODEV`.
+    NoSuperblock,
+}
+
+/// Applies `lookup_bdev()` and `user_get_super()` in Linux's order.  A caller
+/// that resolves `special` itself supplies whether the result is a block
+/// device, whether its mount forbids device access, and whether a live
+/// superblock is backed by its device number.
+pub const fn admit_quota_device(
+    is_block_device: bool,
+    nodev: bool,
+    has_superblock: bool,
+) -> Result<(), QuotaDeviceReject> {
+    if !is_block_device {
+        return Err(QuotaDeviceReject::NotBlockDevice);
+    }
+    if nodev {
+        return Err(QuotaDeviceReject::Nodev);
+    }
+    if !has_superblock {
+        return Err(QuotaDeviceReject::NoSuperblock);
+    }
+    Ok(())
+}
+
+/// `check_quotactl_permission()` classes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotaCommandPrivilege {
+    /// No privilege is required (`Q_GETFMT`, `Q_SYNC`, `Q_GETINFO`,
+    /// `Q_XGETQSTAT`, `Q_XGETQSTATV`, `Q_XQUOTASYNC`).
+    None,
+    /// The caller's own identifier is enough (`Q_GETQUOTA`, `Q_XGETQUOTA`).
+    OwnIdentity,
+    /// `CAP_SYS_ADMIN` is required.
+    Admin,
+}
+
+/// `check_quotactl_permission()` as a pure function of the command selector.
+/// `Q_GETNEXTQUOTA` deliberately falls into the default branch, so it is an
+/// admin command even though `Q_GETQUOTA` is not.
+pub const fn quota_command_privilege(command: u32) -> QuotaCommandPrivilege {
+    // `command` is already shifted down by SUBCMDSHIFT, so `QCMD(Q_GETQUOTA,
+    // USRQUOTA)` arrives here as 0x800007 and `QCMD(Q_XGETQSTAT, USRQUOTA)` as
+    // 0x5805 (`XQM_CMD(5)`).
+    match command {
+        0x80_0001 // Q_SYNC
+        | 0x80_0004 // Q_GETFMT
+        | 0x80_0005 // Q_GETINFO
+        | 0x58_05 // Q_XGETQSTAT
+        | 0x58_07 // Q_XQUOTASYNC
+        | 0x58_08 // Q_XGETQSTATV
+        => QuotaCommandPrivilege::None,
+        0x80_0007 // Q_GETQUOTA
+        | 0x58_03 // Q_XGETQUOTA
+        => QuotaCommandPrivilege::OwnIdentity,
+        _ => QuotaCommandPrivilege::Admin,
+    }
+}
+
+/// `quotactl_cmd_write()`: the commands that need write access to the mount
+/// before the provider runs.  The set is deliberately not the privilege table:
+/// `Q_GETQUOTA` and `Q_GETNEXTQUOTA` are read-only for the caller yet still
+/// write, because `dquot_acquire()` may allocate the on-disk structure.
+pub const fn quota_command_is_write(command: u32) -> bool {
+    !matches!(
+        command,
+        0x80_0001 // Q_SYNC
+        | 0x80_0004 // Q_GETFMT
+        | 0x80_0005 // Q_GETINFO
+        | 0x58_03 // Q_XGETQUOTA
+        | 0x58_05 // Q_XGETQSTAT
+        | 0x58_07 // Q_XQUOTASYNC
+        | 0x58_08 // Q_XGETQSTATV
+        | 0x58_09 // Q_XGETNEXTQUOTA
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_write_table_matches_quotactl_cmd_write() {
+        for command in [0x80_0001, 0x80_0004, 0x80_0005, 0x58_03, 0x58_05, 0x58_07, 0x58_08, 0x58_09]
+        {
+            assert!(!quota_command_is_write(command));
+        }
+        // Q_GETQUOTA is a write command even though it needs no privilege.
+        for command in [0x80_0007, 0x80_0002, 0x80_0003, 0x80_0006, 0x80_0008] {
+            assert!(quota_command_is_write(command));
+        }
+    }
+
+    #[test]
+    fn quota_device_admission_follows_lookup_bdev_order() {
+        assert_eq!(
+            admit_quota_device(false, false, true),
+            Err(QuotaDeviceReject::NotBlockDevice)
+        );
+        // A nodev mount outranks a missing superblock.
+        assert_eq!(
+            admit_quota_device(true, true, false),
+            Err(QuotaDeviceReject::Nodev)
+        );
+        assert_eq!(
+            admit_quota_device(true, false, false),
+            Err(QuotaDeviceReject::NoSuperblock)
+        );
+        assert_eq!(admit_quota_device(true, false, true), Ok(()));
+    }
+
+    #[test]
+    fn quota_privilege_table_matches_check_quotactl_permission() {
+        for command in [0x80_0001, 0x80_0004, 0x80_0005, 0x58_05, 0x58_07, 0x58_08] {
+            assert_eq!(
+                quota_command_privilege(command),
+                QuotaCommandPrivilege::None
+            );
+        }
+        for command in [0x80_0007, 0x58_03] {
+            assert_eq!(
+                quota_command_privilege(command),
+                QuotaCommandPrivilege::OwnIdentity
+            );
+        }
+        // Q_GETNEXTQUOTA and Q_XGETNEXTQUOTA are not in the unprivileged list,
+        // and the remaining commands all fall into the default branch.
+        for command in [
+            0x80_0009, 0x58_09, 0x80_0002, 0x80_0003, 0x80_0006, 0x80_0008, 0x58_01, 0x58_02,
+            0x58_04, 0x58_06,
+        ] {
+            assert_eq!(
+                quota_command_privilege(command),
+                QuotaCommandPrivilege::Admin
+            );
+        }
+    }
+
     #[test]
     fn bounds() {
         assert_eq!(FileRange::new(-1, 0), Err(LinuxVfsError::InvalidRange));
