@@ -7815,7 +7815,7 @@ handler = "kernel/src/syscall/task/ctl.rs:sys_mbind"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["a range that spans a hole is rejected with EFAULT even for MPOL_DEFAULT, where Linux sets MPOL_MF_DISCONTIG_OK and returns 0; the MOVE_ALL capability test and the mode validation now match Linux"]
+limitations = ["MPOL_MF_MOVE and MPOL_MF_MOVE_ALL install the range policy without migrating resident pages, and the MPOL_MF_STRICT residency report comes from a page scan rather than from the walk's own report; neither is observable while the allowed set is node 0 alone, the only node a page can be resident on and a member of every admitted target mask; a range that spans a hole now reproduces Linux's MPOL_MF_DISCONTIG_OK verdict, including the EFAULT of a range no VMA covers at all"]
 
 [[contract]]
 id = "linux-set_mempolicy"
@@ -7838,7 +7838,7 @@ handler = "kernel/src/syscall/task/ctl.rs:sys_set_mempolicy"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["no residual against Linux is known for the validation tables; the cell records the conservative bound rather than a measured divergence"]
+limitations = ["the node-mask window is read from its highest word down, as get_nodes()'s descending scan reads it, so a set bit above MAX_NUMNODES in a high word is EINVAL even when a lower word of the same window is unreadable (measured: maxnode 66, high word mapped, low word unmapped); MPOL_DEFAULT stores the default policy, so a caller's shaping flags are dropped rather than reported back by get_mempolicy(2); no other residual is known for the validation tables on the single-node configuration the differential runs"]
 
 [[contract]]
 id = "linux-get_mempolicy"
@@ -7861,7 +7861,7 @@ handler = "kernel/src/syscall/task/ctl.rs:sys_get_mempolicy"
 conditional = "explicit-none"
 tests = ["tests/guest/portable/wait-abi-differential.c:main"]
 validation_gaps = ["explicit-none"]
-limitations = ["no residual against Linux is known for the reporting paths; the cell records the conservative bound rather than a measured divergence"]
+limitations = ["MPOL_F_NODE with MPOL_F_ADDR faults the page in before reporting its node, as lookup_node() does, and that fault-in stays confined to that arm, so a hole or a page that cannot be populated is EFAULT while a mapped but untouched page reports its node; MPOL_F_NODE without MPOL_F_ADDR follows do_get_mempolicy()'s mode table and the reported window clears the words past nr_node_ids; the paths that need more than one node are unobservable in the single-node configuration the differential runs"]
 
 [[contract]]
 id = "linux-migrate_pages"
