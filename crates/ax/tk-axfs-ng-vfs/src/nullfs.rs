@@ -31,8 +31,9 @@ use crate::path::{FsName, MAX_NAME_LEN};
 use crate::{
     CreateDisposition, CreateOutcome, DirEntry, DirEntrySink, DirNode, DirNodeOps, FileAttr,
     FileAttrProvider, Filesystem, FilesystemOps, Metadata, MetadataUpdate,
-    MetadataUpdateCapabilities, NamedCreateOptions, NodeOps, NodePermission, NodeType, Reference,
-    RenameRequest, StatFs, Timestamp, UnlinkRequest, VfsError, VfsResult,
+    MetadataUpdateCapabilities, NamedCreateOptions, NodeOps, NodePermission, NodeType,
+    NodeUserData, Reference, RenameRequest, StatFs, Timestamp, UnlinkRequest, VfsError, VfsResult,
+    WritebackErrorState,
 };
 
 /// Linux `NULL_FS_MAGIC` (`include/uapi/linux/magic.h`:107).
@@ -65,11 +66,22 @@ pub fn filesystem() -> VfsResult<Filesystem> {
 
 struct NullFs {
     root: Once<DirEntry>,
+    /// Linux keeps the superblock's errseq in `sb->s_wb_err`, and the
+    /// immutable nullfs root is the whole superblock (`fs/nullfs.c`:12-34),
+    /// so node-scoped and `syncfs`-scoped writeback reporting are the same
+    /// sequence here.  Without persistent inode data the ordinary
+    /// `NodeOps::writeback_error_state()` would answer `EOPNOTSUPP` to every
+    /// open of the root, which Linux never does.
+    user_data: NodeUserData,
 }
 
 impl NullFs {
     fn new() -> VfsResult<Arc<Self>> {
-        let filesystem = Arc::try_new(Self { root: Once::new() }).map_err(|_| VfsError::NoMemory)?;
+        let filesystem = Arc::try_new(Self {
+            root: Once::new(),
+            user_data: NodeUserData::new(),
+        })
+        .map_err(|_| VfsError::NoMemory)?;
         let root = DirEntry::new_dir(
             {
                 let filesystem = filesystem.clone();
@@ -114,6 +126,12 @@ impl FilesystemOps for NullFs {
     /// Everything about nullfs is fixed at `nullfs_fs_fill_super()` time.
     fn metadata_update_capabilities(&self) -> MetadataUpdateCapabilities {
         MetadataUpdateCapabilities::empty()
+    }
+
+    /// `sb->s_wb_err` for the single-inode superblock: the very sequence the
+    /// root node reports, so `syncfs` and an open description never disagree.
+    fn syncfs_writeback_error_state(&self) -> Option<Arc<WritebackErrorState>> {
+        self.user_data.writeback_error_state().ok()
     }
 }
 
@@ -163,6 +181,18 @@ impl NodeOps for NullDir {
 
     fn file_attr_provider(&self) -> Option<&dyn FileAttrProvider> {
         Some(&NULLFS_FILE_ATTR)
+    }
+
+    /// The root is a real inode of a real superblock, so it carries the
+    /// superblock's persistent data.  `Location`'s file-attribute and
+    /// writeback-error facades require it; Linux's `simple_*` inodes have
+    /// always had their `i_private`/errseq equivalents available.
+    fn persistent_user_data(&self) -> Option<&NodeUserData> {
+        Some(&self.filesystem.user_data)
+    }
+
+    fn writeback_error_state(&self) -> VfsResult<Arc<WritebackErrorState>> {
+        self.filesystem.user_data.writeback_error_state()
     }
 
     fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
