@@ -29,7 +29,8 @@ use super::{
     ProcStateHint, Process, ProcessAccessState, ProcessData, ProcessGroup, ProcessReparentBatch,
     PtraceRelationshipSnapshot, Session, TaskParentNode, TaskUsage, Thread, ThreadExitTransition,
     TimerState, fs_context_publication, futex_table_for, lock_task_parent_publication,
-    process_domain, reap_process, request_process_cpu_evaluation, send_signal_to_process,
+    process_domain, process_identity_pid_ns, reap_process, request_process_cpu_evaluation,
+    send_signal_to_process,
     send_signal_to_process_data, send_signal_to_thread, user::linux_pid_from_task_id,
 };
 use crate::{
@@ -2025,7 +2026,7 @@ fn publish_final_process_exit(
     exit: super::process::PreparedZombieExit,
     self_usage: TaskUsage,
     child_usage: TaskUsage,
-) -> CommittedProcessExit {
+) -> (CommittedProcessExit, Option<Arc<TaskParentNode>>) {
     // Scheduler syscalls publish the durable process snapshot only after the
     // scheduler transaction succeeds.  Preserve that exact last publication
     // through final exit.  Re-sampling ambient `current()` here would create a
@@ -2033,15 +2034,27 @@ fn publish_final_process_exit(
     // and after teardown has crossed blocking/context-switch boundaries.
     let wait_status = process.exit_code();
     exit_status_trace_publish(process, wait_status);
-    exit.commit_with_reparent_handoff(
+    // The authoritative reparent batch names the live exact task Linux's
+    // `forget_original_parent()` installs as `real_parent` for every child
+    // (`kernel/exit.c:684-728`). Keep that hop on the departing exact node so a
+    // child's retained `real_parent` identity still resolves to it.
+    let mut reparent_reaper = None;
+    let committed = exit.commit_with_reparent_handoff(
         wait_status,
         self_usage.into(),
         child_usage.into(),
         proc_data.group_leader_cred(),
         proc_data.group_leader_signal_owner(),
         |child| notify_reaper_of_inherited_zombie(&child),
-        |batch| reparent_exact_children_from_core_batch(departing, task_parent_publication, batch),
-    )
+        |batch| {
+            reparent_reaper = reparent_exact_children_from_core_batch(
+                departing,
+                task_parent_publication,
+                batch,
+            );
+        },
+    );
+    (committed, reparent_reaper)
 }
 
 fn begin_group_exit(proc_data: &ProcessData, exit_code: i32) -> bool {
@@ -2089,8 +2102,7 @@ fn zap_pid_namespace(proc_data: &ProcessData) -> AxResult<()> {
     let registry = process_domain()?.registry();
     for process in registry.processes_through_current_max() {
         if process.pid() != proc_data.proc.pid()
-            && process
-                .identity::<Arc<super::PidNamespace>>()
+            && process_identity_pid_ns(&process)
                 .is_some_and(|target| namespace.contains(target))
             && let Ok(target) = get_process_data(process.pid())
         {
@@ -2102,8 +2114,7 @@ fn zap_pid_namespace(proc_data: &ProcessData) -> AxResult<()> {
         let mut remaining = false;
         for process in registry.processes_through_current_max() {
             if process.pid() == proc_data.proc.pid()
-                || !process
-                    .identity::<Arc<super::PidNamespace>>()
+                || !process_identity_pid_ns(&process)
                     .is_some_and(|target| namespace.contains(target))
             {
                 continue;
@@ -2160,7 +2171,7 @@ fn reparent_exact_children_from_core_batch(
     departing: &Thread,
     publication: &super::TaskParentPublicationGuard<'_>,
     batch: &ProcessReparentBatch,
-) {
+) -> Option<Arc<TaskParentNode>> {
     let reaper = exact_parent_thread_in_process(batch.reaper(), Some(departing.kernel_tid()))
         .expect("core-selected process reaper has no exact live task endpoint");
 
@@ -2189,6 +2200,7 @@ fn reparent_exact_children_from_core_batch(
         },
         deliver_exact_parent_death,
     );
+    Some(reaper)
 }
 
 fn deliver_exact_parent_death(child: Arc<TaskParentNode>, raw_signo: u32) {
@@ -2519,7 +2531,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
             !thr.seccomp_active(),
             "waitable zombie publication preceded seccomp slot retirement"
         );
-        let committed = publish_final_process_exit(
+        let (committed, reparent_reaper) = publish_final_process_exit(
             &thr.proc_data,
             process,
             thr,
@@ -2530,7 +2542,7 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         );
         debug_assert_eq!(committed.outcome(), ExitOutcome::BecameZombie);
         assert!(
-            thr.finish_task_parent_exit(task_parent_guard),
+            thr.finish_task_parent_exit(task_parent_guard, reparent_reaper),
             "authoritative process reparent handoff left exact children behind"
         );
         drop(task_parent_publication.take());

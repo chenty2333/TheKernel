@@ -74,7 +74,8 @@ fn resolve_getsid_target(pid: Pid, caller_ns: &PidNamespace) -> AxResult<GetsidT
 
     let process = get_process_including_zombie(global_pid)?;
     let target_ns = process
-        .identity::<alloc::sync::Arc<PidNamespace>>()
+        .identity::<crate::task::ProcessIdentity>()
+        .map(crate::task::ProcessIdentity::pid_ns)
         .ok_or(AxError::NoSuchProcess)?;
     if process.is_zombie() && caller_ns.contains(target_ns) {
         Ok(GetsidTarget::Zombie(process))
@@ -92,7 +93,8 @@ pub fn sys_getsid(pid: Pid) -> AxResult<isize> {
         // form; security_task_getsid is only invoked after a nonzero lookup.
         let process = &caller_thread.proc_data.proc;
         let target_ns = process
-            .identity::<alloc::sync::Arc<PidNamespace>>()
+            .identity::<crate::task::ProcessIdentity>()
+            .map(crate::task::ProcessIdentity::pid_ns)
             .ok_or(AxError::NoSuchProcess)?;
         return Ok(caller_ns
             .visible_pid_for(target_ns, process.group().session().sid())
@@ -103,7 +105,8 @@ pub fn sys_getsid(pid: Pid) -> AxResult<isize> {
     let target = resolve_getsid_target(pid, &caller_ns)?;
     let process = target.process();
     let target_ns = process
-        .identity::<alloc::sync::Arc<PidNamespace>>()
+        .identity::<crate::task::ProcessIdentity>()
+        .map(crate::task::ProcessIdentity::pid_ns)
         .ok_or(AxError::NoSuchProcess)?;
     let credential = target.credential()?;
     dispatch_task_getsid(&SecurityTaskGetsidContext::new(&credential))?;
@@ -152,7 +155,8 @@ pub fn sys_getpgid(pid: Pid) -> AxResult<isize> {
     if pid == 0 {
         let process = &caller_thread.proc_data.proc;
         let target_ns = process
-            .identity::<alloc::sync::Arc<PidNamespace>>()
+            .identity::<crate::task::ProcessIdentity>()
+            .map(crate::task::ProcessIdentity::pid_ns)
             .ok_or(AxError::NoSuchProcess)?;
         return Ok(caller_ns
             .visible_pid_for(target_ns, process.group().pgid())
@@ -165,7 +169,8 @@ pub fn sys_getpgid(pid: Pid) -> AxResult<isize> {
     let target = resolve_getsid_target(pid, &caller_ns)?;
     let process = target.process();
     let target_ns = process
-        .identity::<alloc::sync::Arc<PidNamespace>>()
+        .identity::<crate::task::ProcessIdentity>()
+        .map(crate::task::ProcessIdentity::pid_ns)
         .ok_or(AxError::NoSuchProcess)?;
     let credential = target.credential()?;
     dispatch_task_getpgid(&SecurityTaskGetpgidContext::new(&credential))?;

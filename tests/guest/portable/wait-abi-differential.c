@@ -11,8 +11,10 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -163,6 +165,72 @@ static void collect(pid_t pid)
     while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) { }
 }
 
+/* ------------------------------------------------------------------ *
+ * wait4(2) __WNOTHREAD: only this exact task's own relation counts.
+ *
+ * __do_wait() walks `current->children` and `current->ptraced`, and breaks
+ * out of the thread-group loop as soon as the flag is set
+ * (kernel/exit.c:1725-1735); do_wait_pid() admits a named target only through
+ * is_effectively_child(), which requires `current == target->real_parent` for
+ * the thread-group arm and `current == target->parent` for the ptrace arm
+ * (kernel/exit.c:1657-1664, :1672-1697).  A child forked by a sibling thread
+ * is therefore invisible to this thread, and stays invisible after it has
+ * exited, because release_task() has not run yet.
+ * ------------------------------------------------------------------ */
+static atomic_int nothread_stage;
+static pid_t nothread_live_child;
+static pid_t nothread_zombie_child;
+static long nothread_own_rc;
+static int nothread_own_errno;
+static pid_t nothread_zombie_reaper;
+static int nothread_zombie_status;
+
+static void nothread_wait_for(int value)
+{
+    while (atomic_load_explicit(&nothread_stage, memory_order_acquire) != value) {
+        sched_yield();
+    }
+}
+
+static void *nothread_forker(void *unused)
+{
+    (void)unused;
+    pid_t child = fork();
+    if (child == 0) {
+        for (;;) pause();
+    }
+    if (child < 0) _exit(9);
+    nothread_live_child = child;
+    atomic_store_explicit(&nothread_stage, 1, memory_order_release);
+
+    nothread_wait_for(2);
+    /* The thread that forked it is its `real_parent`, so its own
+     * __WNOTHREAD wait still finds the live child. */
+    errno = 0;
+    nothread_own_rc = syscall(SYS_wait4, child, NULL, WNOHANG | __WNOTHREAD, NULL);
+    nothread_own_errno = errno;
+    kill(child, SIGKILL);
+    while (waitpid(child, NULL, 0) < 0 && errno == EINTR) { }
+
+    child = fork();
+    if (child == 0) _exit(7);
+    if (child < 0) _exit(9);
+    {
+        siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        /* WNOWAIT observes the exit without reaping, so the sibling probe
+         * below runs against a real zombie. */
+        if (syscall(SYS_waitid, P_PID, child, &info, WEXITED | WNOWAIT, NULL) != 0) {
+            _exit(9);
+        }
+        if (info.si_pid != child) _exit(9);
+    }
+    nothread_zombie_child = child;
+    atomic_store_explicit(&nothread_stage, 4, memory_order_release);
+    nothread_wait_for(5);
+    return NULL;
+}
+
 int main(void)
 {
     /* ---------------- wait4(2) argument contract ---------------- */
@@ -225,6 +293,52 @@ int main(void)
      * `collect()` sends SIGKILL and reaps without inspecting the status. */
     collect(child);
     EXPECT_ERR("wait4-reaped-child-echild", syscall(SYS_wait4, child, NULL, 0, NULL), ECHILD);
+
+    /* ---------------- wait4(2) __WNOTHREAD ---------------- */
+    pthread_t forker;
+    atomic_store(&nothread_stage, 0);
+    {
+        int created = pthread_create(&forker, NULL, nothread_forker, NULL);
+        check("wait4-wnothread-thread-create", created == 0);
+        nothread_wait_for(1);
+        pid_t sibling_child = nothread_live_child;
+        /* A sibling thread's live child is not this thread's child, so the
+         * walk finds no candidate at all: ECHILD, not 0. */
+        EXPECT_ERR("wait4-wnothread-sibling-echild",
+                   syscall(SYS_wait4, sibling_child, NULL, WNOHANG | __WNOTHREAD, NULL),
+                   ECHILD);
+        /* Without the bit it is still this thread group's child, so the same
+         * live child with no pending event reports success with zero. */
+        errno = 0;
+        {
+            long rc = syscall(SYS_wait4, -1, NULL, WNOHANG, NULL);
+            check("wait4-wnothread-any-live-zero", rc == 0 && errno == 0);
+        }
+        atomic_store_explicit(&nothread_stage, 2, memory_order_release);
+        nothread_wait_for(4);
+        check("wait4-wnothread-own-live-zero",
+              nothread_own_rc == 0 && nothread_own_errno == 0);
+        /* An exited-but-unreaped child of a sibling thread is just as
+         * invisible under the flag: `p->real_parent` is still that thread. */
+        EXPECT_ERR("wait4-wnothread-zombie-sibling-echild",
+                   syscall(SYS_wait4, nothread_zombie_child, NULL,
+                           WNOHANG | __WNOTHREAD, NULL),
+                   ECHILD);
+        /* The group as a whole still owns it, and reaps it as a normal
+         * SIGCHLD child. */
+        {
+            int status = 0;
+            pid_t got = waitpid(nothread_zombie_child, &status, 0);
+            nothread_zombie_reaper = got;
+            nothread_zombie_status = status;
+        }
+        check("wait4-wnothread-zombie-group-reap",
+              nothread_zombie_reaper == nothread_zombie_child &&
+              WIFEXITED(nothread_zombie_status) &&
+              WEXITSTATUS(nothread_zombie_status) == 7);
+        atomic_store_explicit(&nothread_stage, 5, memory_order_release);
+        check("wait4-wnothread-thread-join", pthread_join(forker, NULL) == 0);
+    }
     done();
 
     /* ---------------- waitid(2) argument contract ---------------- */

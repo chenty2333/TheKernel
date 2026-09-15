@@ -22,7 +22,8 @@ use crate::{
     task::{
         CgroupNamespace, Cred, CredentialSlot, Dumpability, FsContextSlot, MountNamespace,
         NamespaceProxy, NetworkNamespace, PidNamespace, ProcessAccessState, ProcessData,
-        SchedulerSeed, Thread, TimeNamespace, UserNamespace, UtsNamespace, init_process_domain,
+        ProcessIdentity, SchedulerSeed, Thread, TimeNamespace, UserNamespace, UtsNamespace,
+        init_process_domain,
         init_seccomp_filter_budget, linux_pid_from_task_id, prepare_task_table_admission,
         set_task_user_address_space, spawn_alarm_task, try_new_user_task,
     },
@@ -175,8 +176,15 @@ pub fn init(args: &[String], envs: &[String]) {
     let init_pid_reservation = init_pid_ns
         .reserve_process(INIT_PID)
         .expect("Failed to reserve init pid namespace identity");
+    // The domain root has no exact parent task, exactly like Linux's
+    // `init_task.real_parent == NULL` before the idle task adopts init.
     let proc = process_domain
-        .try_new_init_with_identity(INIT_PID, None, init_pid_ns.clone())
+        .try_new_init_with_identity(
+            INIT_PID,
+            None,
+            ProcessIdentity::try_new(init_pid_ns.clone(), None)
+                .expect("init process identity is allocation-free"),
+        )
         .expect("Failed to allocate init process");
 
     // N_TTY owns only the physical input pump; init's controlling terminal
