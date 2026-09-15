@@ -400,9 +400,7 @@ impl PreparedProcessSignalSend {
                                 || endpoint.thread.signal_real_blocked(signo))
                     });
                     let actions = actions_owner.lock();
-                    if !ProcessSignalManager::action_ignored(&actions, signo)
-                        || blocked_by_any_thread
-                    {
+                    if !process.action_ignored(&actions, signo) || blocked_by_any_thread {
                         let outcome = process
                             .pending
                             .lock()
@@ -513,6 +511,8 @@ impl From<AllocError> for SignalActionUpdateError {
 
 /// Process-level signal manager.
 pub struct ProcessSignalManager {
+    global_init: AtomicBool,
+    unkillable: AtomicBool,
     /// Readiness notification independent of unblocked signal delivery.
     pending_waker: Option<Waker>,
     /// The process-level shared pending signals
@@ -620,11 +620,29 @@ impl ProcessSignalManager {
         }
     }
 
-    pub(crate) fn action_ignored(actions: &SignalActions, signo: Signo) -> bool {
+    /// Protect the initial system reaper; not inherited by newly created managers.
+    pub fn protect_global_init(&self) {
+        self.global_init.store(true, Ordering::Release);
+        self.unkillable.store(true, Ordering::Release);
+    }
+
+    /// A synchronous fatal fault must not be hidden by init's default-action protection.
+    pub fn allow_forced_default_signal(&self) {
+        self.unkillable.store(false, Ordering::Release);
+    }
+
+    fn protected_default(&self, signo: Signo) -> bool {
+        self.unkillable.load(Ordering::Acquire)
+            || (self.global_init.load(Ordering::Acquire)
+                && matches!(signo, Signo::SIGKILL | Signo::SIGSTOP))
+    }
+
+    pub(crate) fn action_ignored(&self, actions: &SignalActions, signo: Signo) -> bool {
         match actions.effective_action(signo).disposition {
             SignalDisposition::Ignore => true,
             SignalDisposition::Default => {
-                matches!(signo.default_action(), DefaultSignalAction::Ignore)
+                self.protected_default(signo)
+                    || matches!(signo.default_action(), DefaultSignalAction::Ignore)
             }
             _ => false,
         }
@@ -696,6 +714,8 @@ impl ProcessSignalManager {
         thread_limit: usize,
     ) -> Self {
         Self {
+            global_init: AtomicBool::new(false),
+            unkillable: AtomicBool::new(false),
             pending_waker: None,
             pending: SpinNoIrq::new(PendingSignals::default()),
             lifecycle: SpinNoIrq::new(PROCESS_ENDPOINT_ACTIVE),
@@ -784,7 +804,11 @@ impl ProcessSignalManager {
         };
         drop(owner_update);
         drop(manager_update);
-        let (action, claim) = result;
+        let (mut action, claim) = result;
+        if matches!(action.disposition, SignalDisposition::Default) && self.protected_default(signo)
+        {
+            action.disposition = SignalDisposition::Ignore;
+        }
         (
             action,
             claim.map(|claim| OwnedResetDeliveryClaim { owner, claim }),
@@ -938,7 +962,7 @@ impl ProcessSignalManager {
                     Ok(old_action) => old_action,
                     Err(error) => return Err((error, children)),
                 };
-                if Self::action_ignored(&actions, signo) {
+                if self.action_ignored(&actions, signo) {
                     let empty = {
                         let mut pending = self.pending.lock();
                         pending.detach_signal_into(signo, &mut detached);
@@ -1019,7 +1043,7 @@ impl ProcessSignalManager {
 
     /// Checks if a signal is ignored by the process.
     pub fn signal_ignored(&self, signo: Signo) -> bool {
-        self.with_action_table(|actions| Self::action_ignored(actions, signo))
+        self.with_action_table(|actions| self.action_ignored(actions, signo))
     }
 
     /// Checks if syscalls interrupted by the given signal can be restarted.
@@ -1098,7 +1122,7 @@ impl ProcessSignalManager {
             }
             let blocked_by_any_thread = self.blocked_by_any_thread(signo);
             let actions = owner.lock();
-            if Self::action_ignored(&actions, signo) && !blocked_by_any_thread {
+            if self.action_ignored(&actions, signo) && !blocked_by_any_thread {
                 drop(actions);
                 drop(lifecycle);
                 return (Some(inactive()), generation_detached);
@@ -1143,7 +1167,7 @@ impl ProcessSignalManager {
             }
             let blocked_by_any_thread = self.blocked_by_any_thread(signo);
             let actions = owner.lock();
-            let ignored = Self::action_ignored(&actions, signo) && !blocked_by_any_thread;
+            let ignored = self.action_ignored(&actions, signo) && !blocked_by_any_thread;
             let mut outcome = None;
             if !ignored {
                 let mut pending = self.pending.lock();
@@ -1240,6 +1264,38 @@ mod tests {
             flags: SignalActionFlags::RESETHAND,
             ..SignalAction::default()
         }
+    }
+
+    #[test]
+    fn global_init_ignores_default_signals_but_accepts_handlers_and_forced_faults() {
+        let actions = SharedSignalActions::try_new(SignalActions::default()).unwrap();
+        let init = ProcessSignalManager::new(actions.clone(), 0);
+        init.protect_global_init();
+        for signo in [
+            Signo::SIGKILL,
+            Signo::SIGSTOP,
+            Signo::SIGTERM,
+            Signo::SIGTSTP,
+        ] {
+            assert!(init.signal_ignored(signo));
+            assert!(matches!(
+                init.claim_delivery(signo).0.disposition,
+                SignalDisposition::Ignore
+            ));
+        }
+        init.try_replace_action(Signo::SIGTERM, reset_action(1))
+            .unwrap();
+        assert!(!init.signal_ignored(Signo::SIGTERM));
+        let (action, reservation) = init.claim_delivery(Signo::SIGTERM);
+        assert!(matches!(action.disposition, SignalDisposition::Handler(1)));
+        init.finish_delivery(reservation.unwrap(), true);
+        assert!(init.signal_ignored(Signo::SIGTERM));
+        init.allow_forced_default_signal();
+        assert!(!init.signal_ignored(Signo::SIGSEGV));
+        assert!(init.signal_ignored(Signo::SIGKILL));
+        assert!(init.signal_ignored(Signo::SIGSTOP));
+        let ordinary = ProcessSignalManager::new(actions, 0);
+        assert!(!ordinary.signal_ignored(Signo::SIGKILL));
     }
 
     #[test]

@@ -2,19 +2,20 @@
 // the parts of RFC 1122 that discuss TCP, as well as RFC 7323 for some of the TCP options.
 // Consult RFC 7414 when implementing a new feature.
 
-use core::fmt::Display;
 #[cfg(feature = "async")]
 use core::task::Waker;
-use core::{fmt, mem};
+use core::{fmt, fmt::Display, mem};
 
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
-use crate::socket::{Context, PollAt};
-use crate::storage::{Assembler, RingBuffer};
-use crate::time::{Duration, Instant};
-use crate::wire::{
-    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TcpControl, TcpRepr, TcpSeqNumber,
-    TcpTimestampGenerator, TcpTimestampRepr, TCP_HEADER_LEN,
+use crate::{
+    socket::{Context, PollAt},
+    storage::{Assembler, RingBuffer},
+    time::{Duration, Instant},
+    wire::{
+        IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, TCP_HEADER_LEN, TcpControl,
+        TcpRepr, TcpSeqNumber, TcpTimestampGenerator, TcpTimestampRepr,
+    },
 };
 
 mod congestion;
@@ -482,6 +483,9 @@ pub struct Socket<'a> {
     listen_endpoint: IpListenEndpoint,
     /// Address passed to bind(). Record the binding address of the socket.
     bound_endpoint: IpListenEndpoint,
+    bound_reuse_address: bool,
+    bound_listener: bool,
+    failure_reason: Option<FailureReason>,
     /// Current 4-tuple (local and remote endpoints).
     tuple: Option<Tuple>,
     /// The sequence number corresponding to the beginning of the transmit buffer.
@@ -547,6 +551,14 @@ pub struct Socket<'a> {
     tx_waker: WakerRegistration,
 }
 
+/// Terminal transport failure, retained until the socket API observes it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailureReason {
+    ConnectionRefused,
+    Reset,
+    TimedOut,
+}
+
 const DEFAULT_MSS: usize = 536;
 
 impl<'a> Socket<'a> {
@@ -582,6 +594,9 @@ impl<'a> Socket<'a> {
             hop_limit: None,
             listen_endpoint: IpListenEndpoint::default(),
             bound_endpoint: IpListenEndpoint::default(),
+            bound_reuse_address: false,
+            bound_listener: false,
+            failure_reason: None,
             tuple: None,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
@@ -874,7 +889,32 @@ impl<'a> Socket<'a> {
     /// set bound endpoint.
     #[inline]
     pub fn set_bound_endpoint(&mut self, bound_endpoint: IpListenEndpoint) {
-        self.bound_endpoint = bound_endpoint
+        self.bound_endpoint = bound_endpoint;
+        if bound_endpoint.port == 0 {
+            self.bound_listener = false;
+            self.bound_reuse_address = false;
+        }
+    }
+
+    /// Local bind admission metadata; independent of the TCP wire state.
+    pub fn set_bound_reuse_address(&mut self, reuse: bool) {
+        self.bound_reuse_address = reuse;
+    }
+
+    pub fn bound_reuse_address(&self) -> bool {
+        self.bound_reuse_address
+    }
+
+    pub fn set_bound_listener(&mut self, listening: bool) {
+        self.bound_listener = listening;
+    }
+
+    pub fn bound_listener(&self) -> bool {
+        self.bound_listener
+    }
+
+    pub fn take_failure_reason(&mut self) -> Option<FailureReason> {
+        self.failure_reason.take()
     }
 
     /// Return the connection state, in terms of the TCP state machine.
@@ -888,6 +928,7 @@ impl<'a> Socket<'a> {
             mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
 
         self.state = State::Closed;
+        self.failure_reason = None;
         self.timer = Timer::new();
         self.rtte = RttEstimator::default();
         self.assembler = Assembler::new();
@@ -987,11 +1028,13 @@ impl<'a> Socket<'a> {
     /// #
     /// # let mut iface: Interface = todo!();
     /// #
-    /// socket.connect(
-    ///     iface.context(),
-    ///     (IpAddress::v4(10, 0, 0, 1), 80),
-    ///     get_ephemeral_port()
-    /// ).unwrap();
+    /// socket
+    ///     .connect(
+    ///         iface.context(),
+    ///         (IpAddress::v4(10, 0, 0, 1), 80),
+    ///         get_ephemeral_port(),
+    ///     )
+    ///     .unwrap();
     /// # }
     /// ```
     ///
@@ -1662,7 +1705,7 @@ impl<'a> Socket<'a> {
                 return Some(Self::rst_reply(ip_repr, repr));
             }
             // Anything else in the SYN-SENT state is invalid.
-            (State::SynSent, _, _) => {
+            (State::SynSent, ..) => {
                 net_debug!("expecting a SYN|ACK");
                 return None;
             }
@@ -1727,57 +1770,60 @@ impl<'a> Socket<'a> {
             State::Listen | State::SynSent => (&[][..], 0),
             _ => {
                 // https://www.rfc-editor.org/rfc/rfc9293.html#name-segment-acceptability-tests
-                let segment_in_window = match (
-                    segment_start == segment_end,
-                    window_start == window_end,
-                ) {
-                    (true, _) if segment_end == window_start - 1 => {
-                        net_debug!(
-                            "received a keep-alive or window probe packet, will send an ACK"
-                        );
-                        false
-                    }
-                    (true, true) => {
-                        if window_start == segment_start {
-                            true
-                        } else {
+                let segment_in_window =
+                    match (segment_start == segment_end, window_start == window_end) {
+                        (true, _) if segment_end == window_start - 1 => {
                             net_debug!(
-                                "zero-length segment not inside zero-length window, will send an ACK."
+                                "received a keep-alive or window probe packet, will send an ACK"
                             );
                             false
                         }
-                    }
-                    (true, false) => {
-                        if window_start <= segment_start && segment_start < window_end {
-                            true
-                        } else {
-                            net_debug!("zero-length segment not inside window, will send an ACK.");
-                            false
+                        (true, true) => {
+                            if window_start == segment_start {
+                                true
+                            } else {
+                                net_debug!(
+                                    "zero-length segment not inside zero-length window, will send \
+                                     an ACK."
+                                );
+                                false
+                            }
                         }
-                    }
-                    (false, true) => {
-                        net_debug!(
-                            "non-zero-length segment with zero receive window, will only send an ACK"
-                        );
-                        false
-                    }
-                    (false, false) => {
-                        if (window_start <= segment_start && segment_start < window_end)
-                            || (window_start < segment_end && segment_end <= window_end)
-                        {
-                            true
-                        } else {
+                        (true, false) => {
+                            if window_start <= segment_start && segment_start < window_end {
+                                true
+                            } else {
+                                net_debug!(
+                                    "zero-length segment not inside window, will send an ACK."
+                                );
+                                false
+                            }
+                        }
+                        (false, true) => {
                             net_debug!(
-                                "segment not in receive window ({}..{} not intersecting {}..{}), will send challenge ACK",
-                                segment_start,
-                                segment_end,
-                                window_start,
-                                window_end
+                                "non-zero-length segment with zero receive window, will only send \
+                                 an ACK"
                             );
                             false
                         }
-                    }
-                };
+                        (false, false) => {
+                            if (window_start <= segment_start && segment_start < window_end)
+                                || (window_start < segment_end && segment_end <= window_end)
+                            {
+                                true
+                            } else {
+                                net_debug!(
+                                    "segment not in receive window ({}..{} not intersecting \
+                                     {}..{}), will send challenge ACK",
+                                    segment_start,
+                                    segment_end,
+                                    window_start,
+                                    window_end
+                                );
+                                false
+                            }
+                        }
+                    };
 
                 if segment_in_window {
                     let overlap_start = window_start.max(segment_start);
@@ -1844,7 +1890,12 @@ impl<'a> Socket<'a> {
         // If a FIN is received at the end of the current segment, but
         // we have a hole in the assembler before the current segment, disregard this FIN.
         if control == TcpControl::Fin && window_start < segment_start {
-            tcp_trace!("ignoring FIN because we don't have full data yet. window_start={} segment_start={}", window_start, segment_start);
+            tcp_trace!(
+                "ignoring FIN because we don't have full data yet. window_start={} \
+                 segment_start={}",
+                window_start,
+                segment_start
+            );
             control = TcpControl::None;
         }
 
@@ -1867,6 +1918,13 @@ impl<'a> Socket<'a> {
             // RSTs in any other state close the socket.
             (_, TcpControl::Rst) => {
                 tcp_trace!("received RST");
+                self.failure_reason = Some(
+                    if matches!(self.state, State::SynSent | State::SynReceived) {
+                        FailureReason::ConnectionRefused
+                    } else {
+                        FailureReason::Reset
+                    },
+                );
                 self.set_state(State::Closed);
                 self.tuple = None;
                 return None;
@@ -2249,7 +2307,7 @@ impl<'a> Socket<'a> {
     fn timed_out(&self, timestamp: Instant) -> bool {
         match (self.remote_last_ts, self.timeout) {
             (Some(remote_last_ts), Some(timeout)) => timestamp >= remote_last_ts + timeout,
-            (_, _) => false,
+            (..) => false,
         }
     }
 
@@ -2405,6 +2463,7 @@ impl<'a> Socket<'a> {
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
             net_debug!("timeout exceeded");
+            self.failure_reason = Some(FailureReason::TimedOut);
             self.set_state(State::Closed);
         } else if !self.seq_to_transmit(cx) && self.timer.should_retransmit(cx.now()) {
             // If a retransmit timer expired, we should resend data starting at the last ACK.
@@ -2727,7 +2786,7 @@ impl<'a> Socket<'a> {
                 // when the timeout would expire.
                 (Some(remote_last_ts), Some(timeout)) => PollAt::Time(remote_last_ts + timeout),
                 // Otherwise we have no timeout.
-                (_, _) => PollAt::Ingress,
+                (..) => PollAt::Ingress,
             };
 
             // We wait for the earliest of our timers to fire.
@@ -2755,10 +2814,13 @@ impl<'a> fmt::Write for Socket<'a> {
 // tests in here, which I didn't had the time for at the moment.
 #[cfg(all(test, feature = "medium-ip"))]
 mod test {
+    use std::{
+        ops::{Deref, DerefMut},
+        vec::Vec,
+    };
+
     use super::*;
     use crate::wire::IpRepr;
-    use std::ops::{Deref, DerefMut};
-    use std::vec::Vec;
 
     // =========================================================================================//
     // Constants
@@ -3018,7 +3080,7 @@ mod test {
     }
 
     fn socket_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
-        let (iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);
+        let (iface, ..) = crate::tests::setup(crate::phy::Medium::Ip);
 
         let rx_buffer = SocketBuffer::new(vec![0; rx_len]);
         let tx_buffer = SocketBuffer::new(vec![0; tx_len]);
@@ -3903,6 +3965,11 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Closed);
+        assert_eq!(
+            s.take_failure_reason(),
+            Some(FailureReason::ConnectionRefused)
+        );
+        assert_eq!(s.take_failure_reason(), None);
     }
 
     #[test]
@@ -4863,6 +4930,8 @@ mod test {
             }
         );
         assert_eq!(s.state, State::Closed);
+        assert_eq!(s.take_failure_reason(), Some(FailureReason::Reset));
+        assert_eq!(s.take_failure_reason(), None);
     }
 
     #[test]

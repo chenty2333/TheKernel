@@ -9,10 +9,10 @@ use axtask::current;
 use kernel_guard::NoPreemptIrqSave;
 use kspin::SpinNoIrq;
 use linux_raw_sys::general::{
-    __kernel_clockid_t, __kernel_old_time_t, CAP_SYS_TIME, CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM,
-    CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID,
-    CLOCK_REALTIME, CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE, CLOCK_TAI,
-    CLOCK_THREAD_CPUTIME_ID, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD, SIGEV_THREAD_ID,
+    __kernel_clockid_t, __kernel_old_time_t, CAP_SYS_TIME, CAP_WAKE_ALARM, CLOCK_BOOTTIME,
+    CLOCK_BOOTTIME_ALARM, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW,
+    CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_ALARM, CLOCK_REALTIME_COARSE,
+    CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD, SIGEV_THREAD_ID,
     TIMER_ABSTIME, itimerspec, itimerval, timespec, timeval, timezone,
 };
 use tk_linux_signal::Signo;
@@ -24,8 +24,8 @@ use crate::{
     syscall::RawSigevent,
     task::{
         AlarmClock, AlarmTokenReserveError, AsThread, ITimerType, PosixTimer, PosixTimerClock,
-        PosixTimerNotify, TaskUsage, get_process_itimer, get_visible_task_including_exiting, poll_timer,
-        refresh_posix_cpu_timer_armed, set_process_itimer, times_clock_ticks,
+        PosixTimerNotify, TaskUsage, get_process_itimer, get_visible_task_including_exiting,
+        poll_timer, refresh_posix_cpu_timer_armed, set_process_itimer, times_clock_ticks,
     },
     time::{TimeValueLike, set_wall_time, wall_time, wall_time_nanos},
 };
@@ -40,6 +40,8 @@ enum ClockDomain {
     ThreadCpu,
     Tai,
 }
+
+pub(crate) static TAI_CLOCK_CHANGES: axpoll::PollSet = axpoll::PollSet::new();
 
 const DEFAULT_TAI_OFFSET_SECS: u64 = 37;
 const CPUCLOCK_PROF: i32 = 0;
@@ -287,7 +289,8 @@ fn cpu_clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
                 .pid_ns()
                 .resolve_visible_pid(pid)
                 .ok_or(AxError::InvalidInput)?;
-            let task = get_visible_task_including_exiting(tid).map_err(|_| AxError::InvalidInput)?;
+            let task =
+                get_visible_task_including_exiting(tid).map_err(|_| AxError::InvalidInput)?;
             let target = task.as_thread();
             // Linux clock_gettime also accepts the caller's own nonleader
             // TID as a process clock, but other targets must name a leader.
@@ -303,7 +306,8 @@ fn cpu_clock_now(clock_id: __kernel_clockid_t) -> AxResult<TimeValue> {
                 .pid_ns()
                 .resolve_visible_pid(tid)
                 .ok_or(AxError::InvalidInput)?;
-            let task = get_visible_task_including_exiting(tid).map_err(|_| AxError::InvalidInput)?;
+            let task =
+                get_visible_task_including_exiting(tid).map_err(|_| AxError::InvalidInput)?;
             let target = task.as_thread();
             if target.proc_data.proc.pid() != caller.proc_data.proc.pid() {
                 return Err(AxError::InvalidInput);
@@ -460,7 +464,9 @@ fn sys_do_clock_adjtime<M: UserMemory + ?Sized>(
     drop(state);
     if let (Some((generation, offset_seconds)), Some(plan)) = (tai_rebase, rebase_plan) {
         plan.apply(generation, offset_seconds as i64);
+        TAI_CLOCK_CHANGES.wake();
     }
+    drop(_tai_timer_gate);
     // SAFETY: `timex` was initialized by the preceding copy-in and every
     // field update preserves its fully initialized object representation.
     unsafe { VmMutPtr::vm_write_unchecked(timex_ptr, memory, timex) }
@@ -469,8 +475,14 @@ fn sys_do_clock_adjtime<M: UserMemory + ?Sized>(
 }
 
 fn posix_timer_clock(clock_id: __kernel_clockid_t) -> AxResult<PosixTimerClock> {
-    if matches!(clock_id as u32, CLOCK_MONOTONIC_RAW | CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE) {
+    if matches!(
+        clock_id as u32,
+        CLOCK_MONOTONIC_RAW | CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE
+    ) {
         return Err(LinuxError::EOPNOTSUPP.into());
+    }
+    if matches!(clock_id as u32, CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM) {
+        return Ok(PosixTimerClock::Boottime);
     }
     match clock_domain(clock_id)? {
         ClockDomain::Realtime | ClockDomain::RealtimeCoarse => Ok(PosixTimerClock::Realtime),
@@ -519,7 +531,7 @@ fn saturating_sub_duration(lhs: Duration, rhs: Duration) -> Duration {
     lhs.checked_sub(rhs).unwrap_or(Duration::ZERO)
 }
 
-fn tai_deadline_as_realtime(deadline: Duration, offset_seconds: i64) -> Duration {
+pub(crate) fn tai_deadline_as_realtime(deadline: Duration, offset_seconds: i64) -> Duration {
     if offset_seconds >= 0 {
         saturating_sub_duration(deadline, duration_from_secs(offset_seconds as u64))
     } else {
@@ -587,6 +599,10 @@ fn timer_absolute_deadline(clock: PosixTimerClock, value: Duration) -> AxResult<
             .as_thread()
             .time_ns()
             .host_monotonic_deadline(value),
+        PosixTimerClock::Boottime => current()
+            .as_thread()
+            .time_ns()
+            .host_boottime_deadline(value),
         // CPU-clock absolute values are already expressed in their accounting
         // domain; `timer_settime` arms them through PosixTimer::arm_cpu.
         PosixTimerClock::ProcessCpu | PosixTimerClock::ThreadCpu => value,
@@ -684,8 +700,8 @@ fn read_timer_spec<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ptr: *const itimerspec,
 ) -> AxResult<itimerspec> {
-    let value = tk_linux_usercopy::VmPtr::vm_read_uninit(ptr, memory)
-        .map_err(map_timer_usercopy_error)?;
+    let value =
+        tk_linux_usercopy::VmPtr::vm_read_uninit(ptr, memory).map_err(map_timer_usercopy_error)?;
     // SAFETY: the explicit provider initialized every byte of the value, and
     // `itimerspec` contains only integer fields on the supported x86_64 ABI.
     Ok(unsafe { value.assume_init() })
@@ -696,8 +712,7 @@ fn write_timer_id<M: UserMemory + ?Sized>(
     ptr: *mut i32,
     timerid: i32,
 ) -> AxResult<()> {
-    tk_linux_usercopy::VmMutPtr::vm_write(ptr, memory, timerid)
-        .map_err(map_timer_usercopy_error)
+    tk_linux_usercopy::VmMutPtr::vm_write(ptr, memory, timerid).map_err(map_timer_usercopy_error)
 }
 
 fn write_timer_spec<M: UserMemory + ?Sized>(
@@ -716,8 +731,8 @@ fn read_itimer_value<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     ptr: *const itimerval,
 ) -> AxResult<itimerval> {
-    let value = tk_linux_usercopy::VmPtr::vm_read_uninit(ptr, memory)
-        .map_err(map_timer_usercopy_error)?;
+    let value =
+        tk_linux_usercopy::VmPtr::vm_read_uninit(ptr, memory).map_err(map_timer_usercopy_error)?;
     // SAFETY: the explicit provider initialized every byte of the value, and
     // `itimerval` contains only integer fields on the supported x86_64 ABI.
     Ok(unsafe { value.assume_init() })
@@ -748,7 +763,35 @@ pub fn sys_timer_create<M: UserMemory + ?Sized>(
         None
     };
     let clock = posix_timer_clock(clock_id)?;
-    let notify = decode_timer_notify(event)?;
+    let mut notify = decode_timer_notify(event)?;
+    let curr = current();
+    let thread = curr.as_thread();
+    if matches!(clock_id as u32, CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM)
+        && !thread.has_effective_capability(CAP_WAKE_ALARM)
+    {
+        return Err(AxError::OperationNotPermitted);
+    }
+    if let PosixTimerNotify::Signal {
+        target_tid: Some(tid),
+        ..
+    } = &mut notify
+    {
+        // sigev_notify_thread_id is namespace-local, while timer delivery and
+        // task lookup retain the kernel-wide identity. Resolve exactly once at
+        // syscall entry, just as tgkill does; a numeric local TID must never be
+        // interpreted as some unrelated global task ID.
+        let global_tid = thread
+            .pid_ns()
+            .resolve_visible_pid(*tid)
+            .ok_or(AxError::InvalidInput)?;
+        let target =
+            crate::task::get_visible_task(global_tid).map_err(|_| AxError::InvalidInput)?;
+        let target = target.try_as_thread().ok_or(AxError::InvalidInput)?;
+        if target.proc_data.proc.pid() != thread.proc_data.proc.pid() || target.pending_exit() {
+            return Err(AxError::InvalidInput);
+        }
+        *tid = global_tid;
+    }
 
     let proc_data = current().as_thread().proc_data.clone();
     // Main and optional signal-retry alarm leases are acquired atomically
@@ -1313,6 +1356,17 @@ mod tests {
             self.bytes[range].copy_from_slice(src);
             Ok(())
         }
+    }
+
+    #[test]
+    fn boottime_timer_retains_its_namespace_clock_domain() {
+        for clock in [CLOCK_BOOTTIME, CLOCK_BOOTTIME_ALARM] {
+            assert_eq!(posix_timer_clock(clock as _), Ok(PosixTimerClock::Boottime));
+        }
+        assert_eq!(
+            PosixTimerClock::Boottime.absolute_alarm_clock(),
+            AlarmClock::Monotonic
+        );
     }
 
     #[test]

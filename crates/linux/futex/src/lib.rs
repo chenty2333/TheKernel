@@ -9,6 +9,7 @@ pub const FUTEX_WAIT: u32 = 0;
 pub const FUTEX_WAKE: u32 = 1;
 pub const FUTEX_REQUEUE: u32 = 3;
 pub const FUTEX_CMP_REQUEUE: u32 = 4;
+pub const FUTEX_WAKE_OP: u32 = 5;
 pub const FUTEX_WAIT_BITSET: u32 = 9;
 pub const FUTEX_WAKE_BITSET: u32 = 10;
 pub const FUTEX2_SIZE_U32: u32 = 2;
@@ -25,6 +26,61 @@ pub enum FutexError {
     TooManyWaiters,
     DuplicateAddress,
 }
+/// Decoded legacy FUTEX_WAKE_OP. The comparison is deliberately validated
+/// after the RMW, as Linux still updates the word for an unknown comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WakeOp {
+    operation: u8,
+    comparison: u8,
+    argument: u32,
+    compare_argument: i32,
+}
+
+impl WakeOp {
+    pub fn decode(encoded: u32) -> Result<Self, FutexError> {
+        let operation = ((encoded >> 28) & 7) as u8;
+        if operation > 4 {
+            return Err(FutexError::InvalidCommand);
+        }
+        let argument = ((encoded << 8) as i32) >> 20;
+        Ok(Self {
+            operation,
+            comparison: ((encoded >> 24) & 15) as u8,
+            // Linux masks even invalid signed shift arguments to five bits.
+            argument: if encoded & (1 << 31) != 0 {
+                1u32 << (argument as u32 & 31)
+            } else {
+                argument as u32
+            },
+            compare_argument: ((encoded << 20) as i32) >> 20,
+        })
+    }
+
+    pub fn updated(self, old: u32) -> u32 {
+        match self.operation {
+            0 => self.argument,
+            1 => old.wrapping_add(self.argument),
+            2 => old | self.argument,
+            3 => old & !self.argument,
+            4 => old ^ self.argument,
+            _ => unreachable!("validated wake operation"),
+        }
+    }
+
+    pub fn compare(self, old: u32) -> Result<bool, FutexError> {
+        let old = old as i32;
+        Ok(match self.comparison {
+            0 => old == self.compare_argument,
+            1 => old != self.compare_argument,
+            2 => old < self.compare_argument,
+            3 => old <= self.compare_argument,
+            4 => old > self.compare_argument,
+            5 => old >= self.compare_argument,
+            _ => return Err(FutexError::InvalidCommand),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Clock {
     Monotonic,
@@ -76,6 +132,14 @@ pub enum LegacyPlan {
         address: usize,
         count: usize,
         bitset: u32,
+        private: bool,
+    },
+    WakeOp {
+        source: usize,
+        target: usize,
+        wake: usize,
+        wake2: usize,
+        operation: WakeOp,
         private: bool,
     },
     Requeue {
@@ -145,6 +209,22 @@ pub fn plan_legacy(
                 private,
             })
         }
+        FUTEX_WAKE_OP => {
+            if realtime {
+                return Err(FutexError::InvalidFlags);
+            }
+            if address2 & 3 != 0 {
+                return Err(FutexError::InvalidAddress);
+            }
+            Ok(LegacyPlan::WakeOp {
+                source: address,
+                target: address2,
+                wake: wake_op_count(value),
+                wake2: wake_op_count(timeout.map_or(0, |v| v.seconds as u32)),
+                operation: WakeOp::decode(value3)?,
+                private,
+            })
+        }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             if address2 & 3 != 0 {
                 return Err(FutexError::InvalidAddress);
@@ -165,6 +245,15 @@ pub fn plan_legacy(
         _ => Err(FutexError::InvalidCommand),
     }
 }
+/// WAKE_OP tests the limit after each matching wake, unlike strict futex2.
+pub const fn wake_op_count(value: u32) -> usize {
+    if (value as i32) <= 0 {
+        1
+    } else {
+        value as usize
+    }
+}
+
 const fn legacy_count(v: u32) -> usize {
     if (v as i32) < 0 { 1 } else { v as usize }
 }
@@ -379,5 +468,85 @@ mod tests {
             plan_requeue(source, invalid_target, 0, 0, 0),
             Err(FutexError::InvalidFlags)
         );
+    }
+}
+
+#[cfg(test)]
+mod wake_op_tests {
+    use super::*;
+
+    fn encoded(op: u32, cmp: u32, arg: i32, compare: i32) -> u32 {
+        (op << 28) | (cmp << 24) | ((arg as u32 & 0xfff) << 12) | (compare as u32 & 0xfff)
+    }
+
+    #[test]
+    fn wake_op_legacy_plan_preserves_zero_and_signed_wake_limits() {
+        assert_eq!(wake_op_count(0), 1);
+        assert_eq!(wake_op_count(u32::MAX), 1);
+        assert_eq!(wake_op_count(7), 7);
+        assert!(matches!(
+            plan_legacy(
+                0x1000,
+                FUTEX_WAKE_OP | FUTEX_PRIVATE_FLAG,
+                0,
+                None,
+                0x2000,
+                encoded(1, 0, 1, 0)
+            ),
+            Ok(LegacyPlan::WakeOp {
+                wake: 1,
+                wake2: 1,
+                private: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn wake_op_decodes_signed_arguments_and_all_operations() {
+        for (op, expected) in [(0, u32::MAX), (1, 4), (2, u32::MAX), (3, 0), (4, !5)] {
+            let operation = WakeOp::decode(encoded(op, 0, -1, -1)).unwrap();
+            assert_eq!(operation.updated(5), expected);
+            assert_eq!(operation.compare(u32::MAX), Ok(true));
+        }
+        assert_eq!(
+            WakeOp::decode(encoded(1, 0, 1, 0))
+                .unwrap()
+                .updated(u32::MAX),
+            0
+        );
+    }
+
+    #[test]
+    fn wake_op_comparisons_use_signed_pre_update_value() {
+        for (cmp, expected) in [
+            (0, false),
+            (1, true),
+            (2, true),
+            (3, true),
+            (4, false),
+            (5, false),
+        ] {
+            assert_eq!(
+                WakeOp::decode(encoded(0, cmp, 0, 0))
+                    .unwrap()
+                    .compare(u32::MAX),
+                Ok(expected)
+            );
+        }
+        for shift in [-1, 31, 63] {
+            assert_eq!(
+                WakeOp::decode(encoded(8, 0, shift, 0)).unwrap().updated(0),
+                1 << 31
+            );
+        }
+        assert_eq!(WakeOp::decode(encoded(8, 0, 32, 0)).unwrap().updated(0), 1);
+        assert_eq!(
+            WakeOp::decode(encoded(7, 0, 0, 0)),
+            Err(FutexError::InvalidCommand)
+        );
+        let invalid_compare = WakeOp::decode(encoded(0, 15, 7, 0)).unwrap();
+        assert_eq!(invalid_compare.updated(1), 7);
+        assert_eq!(invalid_compare.compare(1), Err(FutexError::InvalidCommand));
     }
 }

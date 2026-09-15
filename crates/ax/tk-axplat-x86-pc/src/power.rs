@@ -49,3 +49,19 @@ impl PowerIf for PowerImpl {
         crate::cpu::cpu_num()
     }
 }
+
+/// Reset the x86 platform rather than using the ACPI power-off port.
+pub fn system_reset() -> ! {
+    crate::console::flush_diagnostic();
+    axcpu::asm::disable_irqs();
+    // Q35/ICH reset-control register: assert system reset, then CPU reset.
+    unsafe {
+        PortWriteOnly::new(0xcf9).write(0x02u8);
+        PortWriteOnly::new(0xcf9).write(0x06u8);
+        // Legacy 8042 fallback, also supported by the QEMU pc machine.
+        PortWriteOnly::new(0x64).write(0xfeu8);
+    }
+    loop {
+        axcpu::asm::halt();
+    }
+}

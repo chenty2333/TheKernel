@@ -944,7 +944,7 @@ limitations = ["registration decodes only opcodes0..5,8,12,20,21,34; other opcod
 id = "linux-futex"
 flags = ["flag:private/shared u32 futex keys and bitset masks; selected realtime deadlines"]
 structs = ["struct:u32 futex word; native timespec; futex_waitv value/address/flags/reserved descriptors"]
-multiplexer_commands = ["mux:WAIT WAIT_BITSET WAKE WAKE_BITSET REQUEUE CMP_REQUEUE and futex2 wait/wake/requeue"]
+multiplexer_commands = ["mux:WAIT WAIT_BITSET WAKE WAKE_BITSET WAKE_OP REQUEUE CMP_REQUEUE and futex2 wait/wake/requeue"]
 provider_ioctls = ["explicit-none"]
 errno_order = ["errno:flag/value/alignment validation before user-word snapshot and wait-queue mutation"]
 usercopy = ["usercopy:caller-owned user memory capability; waitv descriptor snapshot before queue admission"]
@@ -4848,7 +4848,7 @@ handler = "kernel/src/syscall/fs/fd_ops.rs:sys_fcntl"
 conditional = "explicit-none"
 tests = ["kernel/src/syscall/fs/fd_ops.rs:noatime_requires_owner_match_or_namespace_relative_fowner"]
 validation_gaps = ["Existing source/helper coverage does not establish the full fcntl raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["F_GETPIPE_SZ/F_SETPIPE_SZ handle anonymous pipes but not FIFO; nonpipe error differs from Linux EBADF; F_SETFL omits mutable O_NOATIME/O_DIRECT including packet-mode pipe transitions"]
+limitations = ["F_SETFL omits mutable O_NOATIME; packet-mode O_DIRECT transitions are explicitly rejected rather than implemented"]
 
 [[contract]]
 id = "linux-sysfs"
@@ -5699,7 +5699,7 @@ handler = "kernel/src/syscall/fs/ctl.rs:sys_reboot"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Existing source/helper coverage does not establish the full reboot raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["CAD_ON/CAD_OFF return EOPNOTSUPP; RESTART2 ignores its user argument rather than copying and forwarding the restart command"]
+limitations = ["PID namespace reboot and SMP HALT are explicitly unsupported; RESTART2 ignores its user argument rather than copying and forwarding the restart command"]
 
 [[contract]]
 id = "linux-read"
@@ -6182,7 +6182,7 @@ handler = "kernel/src/syscall/fs/io.rs:sys_tee"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Existing source/helper coverage does not establish the full tee raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Only anonymous Pipe open-file descriptions are accepted; named FIFO pipe-buffer transfer is missing"]
+limitations = ["Packet-mode pipe-buffer transfers are not supported; anonymous pipes and FIFO stream endpoints are supported"]
 
 [[contract]]
 id = "linux-vmsplice"
@@ -6205,7 +6205,7 @@ handler = "kernel/src/syscall/fs/io.rs:sys_vmsplice"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Existing source/helper coverage does not establish the full vmsplice raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Only anonymous Pipe open-file descriptions are accepted; named FIFO pipe-buffer transfer is missing"]
+limitations = ["Packet-mode pipe-buffer transfers are not supported; anonymous pipes and FIFO stream endpoints are supported"]
 
 [[contract]]
 id = "linux-io_setup"
@@ -7401,7 +7401,7 @@ handler = "kernel/src/syscall/task/schedule.rs:sys_clock_nanosleep"
 conditional = "explicit-none"
 tests = []
 validation_gaps = ["Existing source/helper coverage does not establish the full clock_nanosleep raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["CLOCK_TAI is missing; THREAD_CPUTIME_ID/RAW/COARSE unsupported sleep clocks have incorrect admission or errno; REALTIME_ALARM/BOOTTIME_ALARM and CAP_WAKE_ALARM admission are missing"]
+limitations = ["THREAD_CPUTIME_ID/RAW/COARSE unsupported sleep clocks have incorrect admission or errno; REALTIME_ALARM/BOOTTIME_ALARM and CAP_WAKE_ALARM admission are missing"]
 
 [[contract]]
 id = "linux-ioprio_set"
@@ -8528,7 +8528,7 @@ handler = "kernel/src/syscall/task/wait.rs:sys_waitid"
 conditional = "explicit-none"
 tests = ["tests/guest/tools/ioprio-smoke.c:test_zombie_ioprio"]
 validation_gaps = ["Existing source/helper coverage does not establish the full waitid raw syscall contract in current paired Linux7.2.3 and TheKernel guest execution"]
-limitations = ["Copyout writes siginfo before rusage and reaps afterward, unlike Linux ordering; P_PIDFD excludes non-parent ptrace tracees"]
+limitations = ["Copyout writes siginfo before rusage, unlike Linux ordering; P_PIDFD excludes non-parent ptrace tracees"]
 
 [[contract]]
 id = "linux-modify_ldt"

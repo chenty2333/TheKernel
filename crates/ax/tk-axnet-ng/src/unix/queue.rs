@@ -179,9 +179,13 @@ impl<T> Sender<T> {
     }
 
     pub(super) fn is_full(&self) -> bool {
+        self.is_full_at_limit(self.shared.capacity)
+    }
+
+    pub(super) fn is_full_at_limit(&self, limit: usize) -> bool {
         let state = self.shared.state.lock();
         state.items.len() + state.reserved + usize::from(state.receive_reserved)
-            >= self.shared.capacity
+            >= limit.min(self.shared.capacity)
     }
 
     pub(super) fn is_closed(&self) -> bool {

@@ -72,6 +72,13 @@ pub fn putchar(c: u8) {
     COM1.lock().send(c)
 }
 
+/// TTY output has already passed through termios. Do not expand LF or erase
+/// bytes again (SerialPort::send would expand both LF and backspace).
+pub fn write_tty_bytes(bytes: &[u8]) {
+    if !available() { return; }
+    for &byte in bytes { COM1.lock().send_raw(byte); }
+}
+
 /// Reads a byte from the console.
 ///
 /// Returns [`None`] when no input is available *and* when there is no UART to

@@ -1000,6 +1000,15 @@ impl FileBackend {
         &mut self.2
     }
 
+    pub(crate) fn proc_file_mapping(
+        &self,
+        address: VirtAddr,
+    ) -> Option<(&axfs_ng_vfs::Location, u64)> {
+        let delta = address.as_usize().checked_sub(self.0.start.as_usize())?;
+        let offset = self.0.offset_page as u64 * PAGE_SIZE_4K as u64;
+        Some((self.location(), offset.checked_add(delta as u64)?))
+    }
+
     pub(crate) fn location(&self) -> &axfs_ng_vfs::Location {
         self.0.cache.location()
     }
@@ -1787,6 +1796,17 @@ mod tests {
             map_id,
             futex_handle,
         ))
+    }
+
+    #[test]
+    fn proc_file_mapping_keeps_offset_when_vma_is_split() {
+        let _context = test_context();
+        let loc = test_location("proc-offset");
+        let backend = test_backend(&loc, Arc::new(()));
+        let (mapped, offset) = backend.proc_file_mapping(VirtAddr::from(0x3000)).unwrap();
+        assert!(mapped.ptr_eq(&loc));
+        assert_eq!(offset, 0x2000);
+        assert!(backend.proc_file_mapping(VirtAddr::from(0)).is_none());
     }
 
     fn test_mapping_lease(loc: &Location) -> FileMappingLease {

@@ -4,18 +4,18 @@ use alloc::{boxed::Box, string::String};
 use core::{
     cmp::min,
     mem::size_of,
-    ptr::{addr_of, NonNull},
+    ptr::{NonNull, addr_of},
 };
 
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 use super::common::Feature;
 use crate::{
+    Error,
     hal::Hal,
     queue::VirtQueue,
     transport::Transport,
-    volatile::{volread, volwrite, ReadOnly, VolatileReadable, WriteOnly},
-    Error,
+    volatile::{ReadOnly, VolatileReadable, WriteOnly, volread, volwrite},
 };
 
 /// Virtual human interface devices such as keyboards, mice and tablets.
@@ -25,16 +25,16 @@ use crate::{
 /// making pass-through implementations on top of evdev easy.
 pub struct VirtIOInput<H: Hal, T: Transport> {
     transport: T,
-    event_queue: VirtQueue<H, QUEUE_SIZE>,
-    status_queue: VirtQueue<H, QUEUE_SIZE>,
-    event_buf: Box<[InputEvent; 32]>,
+    event_queue: VirtQueue<H, EVENT_QUEUE_SIZE>,
+    status_queue: VirtQueue<H, STATUS_QUEUE_SIZE>,
+    event_buf: Box<[InputEvent; EVENT_QUEUE_SIZE]>,
     config: NonNull<Config>,
 }
 
 impl<H: Hal, T: Transport> VirtIOInput<H, T> {
     /// Create a new VirtIO-Input driver.
     pub fn new(mut transport: T) -> Result<Self, Error> {
-        let mut event_buf = Box::new([InputEvent::default(); QUEUE_SIZE]);
+        let mut event_buf = Box::new([InputEvent::default(); EVENT_QUEUE_SIZE]);
 
         let negotiated_features = transport.begin_init(SUPPORTED_FEATURES);
 
@@ -211,14 +211,18 @@ impl<H: Hal, T: Transport> VirtIOInput<H, T> {
 }
 
 // SAFETY: The config space can be accessed from any thread.
-unsafe impl<H: Hal, T: Transport + Send> Send for VirtIOInput<H, T> where
-    VirtQueue<H, QUEUE_SIZE>: Send
+unsafe impl<H: Hal, T: Transport + Send> Send for VirtIOInput<H, T>
+where
+    VirtQueue<H, EVENT_QUEUE_SIZE>: Send,
+    VirtQueue<H, STATUS_QUEUE_SIZE>: Send,
 {
 }
 
 // SAFETY: An '&VirtIOInput` can't do anything, all methods take `&mut self`.
-unsafe impl<H: Hal, T: Transport + Sync> Sync for VirtIOInput<H, T> where
-    VirtQueue<H, QUEUE_SIZE>: Sync
+unsafe impl<H: Hal, T: Transport + Sync> Sync for VirtIOInput<H, T>
+where
+    VirtQueue<H, EVENT_QUEUE_SIZE>: Sync,
+    VirtQueue<H, STATUS_QUEUE_SIZE>: Sync,
 {
 }
 
@@ -238,7 +242,7 @@ const CONFIG_DATA_MAX_LENGTH: usize = 128;
 #[derive(Debug, Clone, Copy)]
 pub enum InputConfigSelect {
     /// Returns the name of the device, in u.string. subsel is zero.
-    IdName = 0x01,
+    IdName   = 0x01,
     /// Returns the serial number of the device, in u.string. subsel is zero.
     IdSerial = 0x02,
     /// Returns ID information of the device, in u.ids. subsel is zero.
@@ -252,10 +256,10 @@ pub enum InputConfigSelect {
     /// and a bitmap of supported event codes is returned in u.bitmap. Individual
     /// bits in the bitmap correspond to implementation-defined input event codes,
     /// for example keys or pointing device axes.
-    EvBits = 0x11,
+    EvBits   = 0x11,
     /// subsel specifies the absolute axis using ABS_* constants in the underlying
     /// evdev implementation. Information about the axis will be returned in u.abs.
-    AbsInfo = 0x12,
+    AbsInfo  = 0x12,
 }
 
 #[repr(C)]
@@ -314,8 +318,11 @@ const QUEUE_EVENT: u16 = 0;
 const QUEUE_STATUS: u16 = 1;
 const SUPPORTED_FEATURES: Feature = Feature::RING_EVENT_IDX.union(Feature::RING_INDIRECT_DESC);
 
-// a parameter that can change
-const QUEUE_SIZE: usize = 32;
+// Match Linux virtio_input's 64 posted event buffers. QEMU reserves a whole
+// SYN_REPORT frame at once, so 32 key events plus SYN cannot fit in 32 slots.
+const EVENT_QUEUE_SIZE: usize = 64;
+// Status traffic is independent; do not increase its device-size requirement.
+const STATUS_QUEUE_SIZE: usize = 32;
 
 #[cfg(test)]
 mod tests {
@@ -327,10 +334,78 @@ mod tests {
     use crate::{
         hal::fake::FakeHal,
         transport::{
-            fake::{FakeTransport, QueueStatus, State},
             DeviceType,
+            fake::{FakeTransport, QueueStatus, State},
         },
     };
+
+    fn empty_config() -> Config {
+        Config {
+            select: WriteOnly::default(),
+            subsel: WriteOnly::default(),
+            size: ReadOnly::new(0),
+            _reserved: Default::default(),
+            data: [const { ReadOnly::new(0) }; 128],
+        }
+    }
+
+    #[test]
+    fn event_queue_accepts_and_reposts_a_full_linux_sized_burst() {
+        let mut config_space = empty_config();
+        let state = Arc::new(Mutex::new(State {
+            queues: vec![QueueStatus::default(), QueueStatus::default()],
+            ..Default::default()
+        }));
+        let transport = FakeTransport {
+            device_type: DeviceType::Input,
+            max_queue_size: EVENT_QUEUE_SIZE as u32,
+            device_features: 0,
+            config_space: NonNull::from(&mut config_space),
+            state: state.clone(),
+        };
+        let mut input = VirtIOInput::<FakeHal, _>::new(transport).unwrap();
+        assert_eq!(state.lock().unwrap().queues[QUEUE_EVENT as usize].size, 64);
+        assert_eq!(state.lock().unwrap().queues[QUEUE_STATUS as usize].size, 32);
+        for cycle in 0..3 {
+            // Fill every descriptor before allowing the guest to replenish.
+            for code in 0..EVENT_QUEUE_SIZE {
+                let event = InputEvent {
+                    event_type: 1,
+                    code: code as u16,
+                    value: cycle,
+                };
+                state
+                    .lock()
+                    .unwrap()
+                    .write_to_queue::<EVENT_QUEUE_SIZE>(QUEUE_EVENT, event.as_bytes());
+            }
+            for code in 0..EVENT_QUEUE_SIZE {
+                let event = input.pop_pending_event().unwrap();
+                assert_eq!(event.code, code as u16);
+                assert_eq!(event.value, cycle);
+            }
+            assert!(input.pop_pending_event().is_none());
+        }
+    }
+
+    #[test]
+    fn undersized_device_event_queue_returns_an_error() {
+        let mut config_space = empty_config();
+        let transport = FakeTransport {
+            device_type: DeviceType::Input,
+            max_queue_size: 32,
+            device_features: 0,
+            config_space: NonNull::from(&mut config_space),
+            state: Arc::new(Mutex::new(State {
+                queues: vec![QueueStatus::default(), QueueStatus::default()],
+                ..Default::default()
+            })),
+        };
+        assert!(matches!(
+            VirtIOInput::<FakeHal, _>::new(transport),
+            Err(Error::InvalidParam)
+        ));
+    }
 
     #[test]
     fn config() {
@@ -348,7 +423,7 @@ mod tests {
         }));
         let transport = FakeTransport {
             device_type: DeviceType::Block,
-            max_queue_size: QUEUE_SIZE.try_into().unwrap(),
+            max_queue_size: EVENT_QUEUE_SIZE.try_into().unwrap(),
             device_features: 0,
             config_space: NonNull::from(&mut config_space),
             state: state.clone(),

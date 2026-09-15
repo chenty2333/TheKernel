@@ -478,39 +478,20 @@ fn requested_chown_ids(
 }
 
 fn path_from_root(loc: Location, root: &Location) -> AxResult<FsPathBuf> {
-    if loc.ptr_eq(root) {
-        return Ok(FsPathBuf::from_vec(Vec::from(b"/".as_slice())));
+    if loc.metadata()?.nlink == 0 {
+        return Err(AxError::NotFound);
     }
-
-    let loc_path = loc.absolute_path()?;
-    if root.is_root() {
-        return Ok(loc_path);
+    let (path, reachable) = loc.path_relative_to(root)?;
+    if reachable {
+        return Ok(path);
     }
-
-    let root_path = root.absolute_path()?;
-    if loc_path == root_path {
-        return Ok(FsPathBuf::from_vec(Vec::from(b"/".as_slice())));
-    }
-
-    let prefix = if root_path.as_bytes() == b"/" {
-        FsPathBuf::from_vec(Vec::from(b"/".as_slice()))
-    } else {
-        let mut prefix = root_path.into_vec();
-        prefix.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-        prefix.push(b'/');
-        FsPathBuf::from_vec(prefix)
-    };
-    let rest = loc_path
-        .as_bytes()
-        .strip_prefix(prefix.as_bytes())
-        .ok_or(AxError::NotFound)?;
-    let mut result = Vec::new();
-    result
-        .try_reserve_exact(rest.len().saturating_add(1))
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(b"(unreachable)".len().saturating_add(path.as_bytes().len()))
         .map_err(|_| AxError::NoMemory)?;
-    result.push(b'/');
-    result.extend_from_slice(rest);
-    Ok(FsPathBuf::from_vec(result))
+    bytes.extend_from_slice(b"(unreachable)");
+    bytes.extend_from_slice(path.as_bytes());
+    Ok(FsPathBuf::from_vec(bytes))
 }
 
 /// The ioctl() system call manipulates the underlying device parameters
@@ -2225,11 +2206,8 @@ pub fn sys_renameat2<M: UserMemory + ?Sized>(
 }
 
 pub fn sys_sync() -> AxResult<isize> {
-    current_fs_context()
-        .lock()
-        .root_dir()
-        .mountpoint()
-        .flush_all_filesystems()?;
+    let mount = current_fs_context().lock().root_dir().mountpoint().clone();
+    mount.flush_all_filesystems()?;
     Ok(0)
 }
 
@@ -2241,8 +2219,31 @@ pub fn sys_syncfs(fd: i32) -> AxResult<isize> {
     Ok(0)
 }
 
+static CAD_REBOOT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Called by the physical keyboard worker, never under an input/VT lock.
+pub(crate) fn ctrl_alt_delete() {
+    if CAD_REBOOT.load(core::sync::atomic::Ordering::Acquire) {
+        let mount = axfs::FS_CONTEXT.lock().root_dir().mountpoint().clone();
+        let _ = mount.flush_all_filesystems();
+        axhal::power::system_reset();
+    } else {
+        // The initial PID namespace owns CAD even if a keyboard ioctl caller
+        // happens to reside in a nested namespace.
+        let _ = crate::task::send_signal_to_process(
+            1,
+            Some(tk_linux_signal::SignalInfo::new_kernel(
+                tk_linux_signal::Signo::SIGINT,
+            )),
+        );
+    }
+}
+
 pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> AxResult<isize> {
-    if !current_has_capability(CAP_SYS_BOOT) {
+    let curr = current();
+    let thread = curr.as_thread();
+    // Namespace-local CAP_SYS_BOOT is not authority over physical power.
+    if !thread.current_cred().user_ns().is_initial() || !current_has_capability(CAP_SYS_BOOT) {
         return Err(AxError::OperationNotPermitted);
     }
     if magic1 as u32 != LINUX_REBOOT_MAGIC1 {
@@ -2254,20 +2255,44 @@ pub fn sys_reboot(magic1: i32, magic2: i32, cmd: i32, _arg: *const c_void) -> Ax
         _ => return Err(AxError::InvalidInput),
     }
 
+    // Container reboot needs a namespace-reaper transaction, not platform I/O.
+    if thread.pid_ns().parent().is_some() {
+        return Err(LinuxError::EOPNOTSUPP.into());
+    }
+
     match cmd as u32 {
-        LINUX_REBOOT_CMD_RESTART
-        | LINUX_REBOOT_CMD_HALT
-        | LINUX_REBOOT_CMD_POWER_OFF
-        | LINUX_REBOOT_CMD_RESTART2 => {
+        LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_RESTART2 => {
             sys_sync()?;
-            ax_println!("System is shutting down");
+            ax_println!("System is restarting");
+            axhal::power::system_reset();
+        }
+        LINUX_REBOOT_CMD_HALT => {
+            // Do not strand only the calling CPU while other CPUs continue
+            // running userspace. A fleet-wide terminal stop protocol is needed
+            // before SMP HALT can be offered honestly.
+            if axhal::cpu_num() > 1 {
+                return Err(LinuxError::EOPNOTSUPP.into());
+            }
+            sys_sync()?;
+            ax_println!("System is halted");
+            axhal::power::system_halt();
+        }
+        LINUX_REBOOT_CMD_POWER_OFF => {
+            sys_sync()?;
+            ax_println!("System is powering off");
             system_off();
         }
         LINUX_REBOOT_CMD_KEXEC => {
             sys_sync()?;
             crate::syscall::task::execute_loaded()
         }
-        LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => Err(LinuxError::EOPNOTSUPP.into()),
+        LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => {
+            CAD_REBOOT.store(
+                cmd as u32 == LINUX_REBOOT_CMD_CAD_ON,
+                core::sync::atomic::Ordering::Release,
+            );
+            Ok(0)
+        }
         _ => Err(AxError::InvalidInput),
     }
 }

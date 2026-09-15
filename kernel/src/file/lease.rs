@@ -241,20 +241,19 @@ fn update_breaking_state(state: &mut LeaseState, conflict: ConflictType) -> bool
     }
 }
 
-fn mark_breaking_lease(id: InodeId, breaker_pid: u32, conflict: ConflictType) -> Option<u32> {
+fn mark_breaking_lease(id: InodeId, conflict: ConflictType) -> Option<u32> {
     let mut table = LEASE_TABLE.lock();
     let state = table.leases.get_mut(&id)?;
-    if state.holder_pid == breaker_pid || !lease_conflicts(state.lease_type, conflict) {
+    if !lease_conflicts(state.lease_type, conflict) {
         return None;
     }
     update_breaking_state(state, conflict).then_some(state.holder_pid)
 }
 
-fn conflict_cleared(id: InodeId, breaker_pid: u32, conflict: ConflictType) -> bool {
+fn conflict_cleared(id: InodeId, conflict: ConflictType) -> bool {
     let table = LEASE_TABLE.lock();
     match table.leases.get(&id) {
         None => true,
-        Some(state) if state.holder_pid == breaker_pid => true,
         Some(state) => !lease_conflicts(state.lease_type, conflict),
     }
 }
@@ -274,16 +273,27 @@ fn force_break_lease(id: InodeId) {
     drop(removed);
 }
 
-fn wait_for_conflict(id: InodeId, conflict: ConflictType) -> AxResult<()> {
-    let breaker_pid = current_pid();
+fn wait_for_conflict(id: InodeId, conflict: ConflictType, nonblocking: bool) -> AxResult<()> {
     let deadline = wall_time().saturating_add(Duration::from_secs(lease_break_time_secs() as u64));
 
-    if let Some(holder_pid) = mark_breaking_lease(id, breaker_pid, conflict) {
+    if let Some(holder_pid) = mark_breaking_lease(id, conflict) {
         let _ = send_signal_to_process(holder_pid, Some(SignalInfo::new_kernel(Signo::SIGIO)));
     }
 
+    // PID equality never exempts an open: another OFD in the same process
+    // conflicts too. As in Linux, only O_NONBLOCK avoids waiting.
+    // Nonblocking open still notifies the holder, but must not sleep or force
+    // away its lease merely because the caller requested O_NONBLOCK.
+    if nonblocking {
+        return if conflict_cleared(id, conflict) {
+            Ok(())
+        } else {
+            Err(AxError::WouldBlock)
+        };
+    }
+
     match block_on_poll_set_until(&LEASE_WAITERS, Some(deadline), || {
-        if conflict_cleared(id, breaker_pid, conflict) {
+        if conflict_cleared(id, conflict) {
             Ok(())
         } else {
             Err(AxError::WouldBlock)
@@ -405,14 +415,15 @@ impl LeaseTable {
 
 fn try_register_open_admission(
     id: InodeId,
-    breaker_pid: u32,
     pending_conflict: ConflictType,
     visible_conflict: Option<ConflictType>,
 ) -> AxResult<OpenLeaseAdmission> {
     let mut table = LEASE_TABLE.lock();
-    if table.leases.get(&id).is_some_and(|state| {
-        state.holder_pid != breaker_pid && lease_conflicts(state.lease_type, pending_conflict)
-    }) {
+    if table
+        .leases
+        .get(&id)
+        .is_some_and(|state| lease_conflicts(state.lease_type, pending_conflict))
+    {
         return Err(AxError::WouldBlock);
     }
     let key = table.try_register_open(id, pending_conflict, visible_conflict)?;
@@ -426,12 +437,12 @@ fn admit_conflict(
     loc: &Location,
     pending_conflict: ConflictType,
     visible_conflict: Option<ConflictType>,
+    nonblocking: bool,
 ) -> AxResult<OpenLeaseAdmission> {
     let id = lease_id(loc);
-    let breaker_pid = current_pid();
     loop {
-        wait_for_conflict(id, pending_conflict)?;
-        match try_register_open_admission(id, breaker_pid, pending_conflict, visible_conflict) {
+        wait_for_conflict(id, pending_conflict, nonblocking)?;
+        match try_register_open_admission(id, pending_conflict, visible_conflict) {
             Ok(admission) => return Ok(admission),
             Err(AxError::WouldBlock) => continue,
             Err(error) => return Err(error),
@@ -523,14 +534,19 @@ pub(crate) fn admit_open(loc: &Location, flags: i32) -> AxResult<OpenLeaseAdmiss
         return Ok(OpenLeaseAdmission::none());
     };
     let visible_conflict = visible_conflict_from_open_flags(flags).ok_or(AxError::BadState)?;
-    admit_conflict(loc, pending_conflict, Some(visible_conflict))
+    admit_conflict(
+        loc,
+        pending_conflict,
+        Some(visible_conflict),
+        flags & linux_raw_sys::general::O_NONBLOCK as i32 != 0,
+    )
 }
 
 pub(crate) fn admit_truncate(loc: &Location) -> AxResult<OpenLeaseAdmission> {
     if !is_regular_file(loc) {
         return Ok(OpenLeaseAdmission::none());
     }
-    admit_conflict(loc, ConflictType::WriteAccess, None)
+    admit_conflict(loc, ConflictType::WriteAccess, None, false)
 }
 
 pub(crate) fn set_lease(file: &File, owner: LeaseOwner, arg: i32) -> AxResult<()> {
@@ -695,6 +711,57 @@ mod tests {
             open_file_refs: 0,
             next_open_token: 1,
         }
+    }
+
+    #[test]
+    fn lease_holder_cannot_bypass_a_conflicting_open_admission() {
+        let id = (u64::MAX - 26, 1);
+        let holder_pid = 42;
+        LEASE_TABLE.lock().leases.insert(
+            id,
+            LeaseState {
+                owner: u64::MAX - 26,
+                holder_pid,
+                lease_type: LeaseType::Write,
+                breaking: None,
+            },
+        );
+
+        // These paths no longer accept a caller PID: even the lease holder
+        // must break the lease before opening another description.
+        assert!(!conflict_cleared(id, ConflictType::ReadOpen));
+        assert_eq!(
+            mark_breaking_lease(id, ConflictType::ReadOpen),
+            Some(holder_pid)
+        );
+        assert_eq!(mark_breaking_lease(id, ConflictType::ReadOpen), None);
+        assert!(matches!(
+            try_register_open_admission(id, ConflictType::ReadOpen, Some(ConflictType::ReadOpen)),
+            Err(AxError::WouldBlock)
+        ));
+        // Already marked breaking, so the nonblocking path needs no current
+        // task or signal delivery fixture and must still refuse admission.
+        assert_eq!(
+            wait_for_conflict(id, ConflictType::ReadOpen, true),
+            Err(AxError::WouldBlock)
+        );
+
+        LEASE_TABLE.lock().leases.get_mut(&id).unwrap().lease_type = LeaseType::Read;
+        assert!(conflict_cleared(id, ConflictType::ReadOpen));
+        assert_eq!(wait_for_conflict(id, ConflictType::ReadOpen, true), Ok(()));
+        assert!(matches!(
+            try_register_open_admission(
+                id,
+                ConflictType::WriteAccess,
+                Some(ConflictType::WriteAccess)
+            ),
+            Err(AxError::WouldBlock)
+        ));
+        LEASE_TABLE.lock().leases.remove(&id);
+        let admission =
+            try_register_open_admission(id, ConflictType::ReadOpen, Some(ConflictType::ReadOpen))
+                .unwrap();
+        drop(admission);
     }
 
     #[test]

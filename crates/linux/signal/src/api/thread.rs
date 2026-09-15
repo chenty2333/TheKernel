@@ -120,7 +120,7 @@ impl PreparedThreadSignalSend {
 
             let blocked = thread.signal_blocked(signo);
             let actions = owner.lock();
-            let ignored = ProcessSignalManager::action_ignored(&actions, signo)
+            let ignored = thread.proc.action_ignored(&actions, signo)
                 && !blocked
                 && !thread.signal_real_blocked(signo);
             if !ignored {
@@ -1796,7 +1796,7 @@ impl ThreadSignalManager {
             }
             let blocked = self.signal_blocked(signo);
             let actions = owner.lock();
-            let ignored = ProcessSignalManager::action_ignored(&actions, signo)
+            let ignored = self.proc.action_ignored(&actions, signo)
                 && !blocked
                 && !self.signal_real_blocked(signo);
             if ignored {
@@ -1853,7 +1853,7 @@ impl ThreadSignalManager {
 
                 let blocked = self.signal_blocked(signo);
                 let actions = owner.lock();
-                let ignored = ProcessSignalManager::action_ignored(&actions, signo)
+                let ignored = self.proc.action_ignored(&actions, signo)
                     && !blocked
                     && !self.signal_real_blocked(signo);
                 let mut outcome = None;

@@ -867,6 +867,63 @@ impl WaitQueue {
         woke
     }
 
+    /// Runs a nofault atomic operation under both queue gates, always waking
+    /// the first queue and conditionally waking the second. Same-key calls
+    /// consume successive waiters from one queue, never waking a waiter twice.
+    pub fn wake_op<F>(
+        &self,
+        count: usize,
+        target: &WaitQueue,
+        target_count: usize,
+        operation: F,
+    ) -> WaitConditionResult<usize>
+    where
+        F: FnOnce() -> WaitConditionResult<bool>,
+    {
+        let mut pending = WakeBatch::default();
+        let mut retired = DeferredWaiters::default();
+        let woke = {
+            let (first, second) =
+                if (self as *const Self as usize) <= (target as *const Self as usize) {
+                    (self, target)
+                } else {
+                    (target, self)
+                };
+            let _first_gate = first.gate.lock();
+            let _second_gate = if core::ptr::eq(self, target) {
+                None
+            } else {
+                Some(second.gate.lock())
+            };
+            let wake_target = operation()?;
+            let woke = Self::wake_and_requeue_locked(
+                &mut self.queue.lock(),
+                count,
+                u32::MAX,
+                None,
+                &mut pending,
+                &mut retired,
+            )
+            .0;
+            woke + if wake_target {
+                Self::wake_and_requeue_locked(
+                    &mut target.queue.lock(),
+                    target_count,
+                    u32::MAX,
+                    None,
+                    &mut pending,
+                    &mut retired,
+                )
+                .0
+            } else {
+                0
+            }
+        };
+        pending.finish();
+        retired.finish();
+        Ok(woke)
+    }
+
     /// Checks if the wait queue is empty.
     pub fn is_empty(&self) -> bool {
         self.queue.lock().is_empty()
@@ -1944,6 +2001,65 @@ mod tests {
         assert!(src.wq.is_empty());
         assert_eq!(dst.wq.wake(usize::MAX, u32::MAX), 500);
         assert!(dst.wq.is_empty());
+    }
+
+    #[test]
+    fn wake_op_updates_under_both_gates_and_wakes_conditionally() {
+        init_scheduler();
+        for compare in [false, true] {
+            let src = Arc::new(FutexEntry::new());
+            let dst = Arc::new(FutexEntry::new());
+            let first = register_test_waiter(&src);
+            let second = register_test_waiter(&dst);
+            let result = src.wq.wake_op(1, &dst.wq, 1, || {
+                assert!(src.wq.gate.try_lock().is_none());
+                assert!(dst.wq.gate.try_lock().is_none());
+                Ok(compare)
+            });
+            assert_eq!(result, Ok(if compare { 2 } else { 1 }));
+            assert!(src.wq.is_empty());
+            assert_eq!(dst.wq.is_empty(), compare);
+            drop((first, second));
+        }
+    }
+
+    #[test]
+    fn wake_op_retry_leaves_both_queues_unchanged() {
+        init_scheduler();
+        let src = Arc::new(FutexEntry::new());
+        let dst = Arc::new(FutexEntry::new());
+        let first = register_test_waiter(&src);
+        let second = register_test_waiter(&dst);
+        assert_eq!(
+            src.wq
+                .wake_op(1, &dst.wq, 1, || Err(WaitConditionError::Retry)),
+            Err(WaitConditionError::Retry)
+        );
+        assert!(!src.wq.is_empty());
+        assert!(!dst.wq.is_empty());
+        assert!(src.wq.gate.try_lock().is_some());
+        assert!(dst.wq.gate.try_lock().is_some());
+        drop((first, second));
+    }
+
+    #[test]
+    fn wake_op_same_queue_wakes_successive_waiters_once() {
+        init_scheduler();
+        let entry = Arc::new(FutexEntry::new());
+        let first = register_test_waiter(&entry);
+        let second = register_test_waiter(&entry);
+        let third = register_test_waiter(&entry);
+        let mut calls = 0;
+        assert_eq!(
+            entry.wq.wake_op(1, &entry.wq, 1, || {
+                calls += 1;
+                Ok(true)
+            }),
+            Ok(2)
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(entry.wq.wake(usize::MAX, u32::MAX), 1);
+        drop((first, second, third));
     }
 
     #[test]

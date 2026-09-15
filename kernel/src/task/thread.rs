@@ -39,8 +39,7 @@ use super::{
 };
 use crate::{deferred_work::DeferredWorkAccount, file::OpenCredentials};
 
-const TASK_PARENT_RELATION_HARD_LIMIT: usize =
-    tk_linux_process_adapter::PROCESS_MEMBERSHIP_LIMIT;
+const TASK_PARENT_RELATION_HARD_LIMIT: usize = tk_linux_process_adapter::PROCESS_MEMBERSHIP_LIMIT;
 static LIVE_TASK_PARENT_RELATIONS: AtomicUsize = AtomicUsize::new(0);
 static TASK_PARENT_TOPOLOGY: SpinNoIrq<()> = SpinNoIrq::new(());
 
@@ -888,7 +887,11 @@ impl FdTableSlot {
         self.task_users.fetch_add(1, Ordering::Relaxed);
     }
     fn release_task(&self) {
-        self.task_users.fetch_sub(1, Ordering::Relaxed);
+        if self.task_users.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // A task exit/unshare cannot release a CLONE_FILES peer's locks.
+            // Only the last task slot relinquishes this files_struct owner.
+            crate::file::flock::release_posix_owner(self.table.id());
+        }
     }
     pub(crate) fn table(&self) -> Arc<crate::file::FdTable> {
         self.table.clone()
@@ -2982,6 +2985,59 @@ impl OomScoreAdjustment {
 #[cfg(test)]
 mod retired_task_resource_tests {
     use super::*;
+
+    #[test]
+    fn clone_files_lock_owner_survives_one_tgid_exit_but_not_the_last_slot() {
+        use linux_raw_sys::general::{F_UNLCK, F_WRLCK, flock64};
+
+        use crate::file::flock::{self, RecordLockOwner};
+        let _context = crate::test_support::scheduler_test_context();
+        let table = Arc::new(crate::file::FdTable::new().unwrap());
+        let first = FdTableSlot::new(table.clone());
+        first.acquire_task();
+        let second = FdTableSlot::share_for_task(&first);
+        second.acquire_task();
+        let inode = (u64::MAX - 1200, 1);
+        let owner = RecordLockOwner::Posix(table.id());
+        let request = flock64 {
+            l_type: F_WRLCK as _,
+            l_whence: 0,
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+        };
+        flock::set_record_lock(inode, owner, 100, 0, 0, &request, false).unwrap();
+        // A different TGID sharing files_struct is the same lock owner.
+        flock::set_record_lock(
+            inode,
+            RecordLockOwner::Posix(second.table.id()),
+            200,
+            0,
+            0,
+            &request,
+            false,
+        )
+        .unwrap();
+        let mut query = request;
+        flock::get_record_lock(inode, owner, 0, 0, &mut query).unwrap();
+        assert_eq!(query.l_type, F_UNLCK as i16);
+        let unshared = table.fork_copy().unwrap();
+        let observer = RecordLockOwner::Posix(unshared.id());
+        query = request;
+        flock::get_record_lock(inode, observer, 0, 0, &mut query).unwrap();
+        assert_eq!(query.l_pid, 200);
+        first.release_task();
+        drop(first);
+        query = request;
+        flock::get_record_lock(inode, observer, 0, 0, &mut query).unwrap();
+        assert_eq!(query.l_type, F_WRLCK as i16);
+        second.release_task();
+        query = request;
+        flock::get_record_lock(inode, observer, 0, 0, &mut query).unwrap();
+        assert_eq!(query.l_type, F_UNLCK as i16);
+        // A retained syscall snapshot is not a Linux task user.
+        assert!(Arc::strong_count(&table) > 1);
+    }
 
     #[test]
     fn files_snapshot_survives_retirement_while_new_inspection_returns_none() {

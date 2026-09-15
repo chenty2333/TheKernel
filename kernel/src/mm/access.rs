@@ -1767,6 +1767,90 @@ mod tests {
     use crate::mm::SharedPages;
 
     #[test]
+    fn futex_nofault_rmw_retries_before_population_and_revalidates_mapping() {
+        let _context = crate::test_support::scheduler_test_context();
+        let mut aspace =
+            super::AddrSpace::new_empty(VirtAddr::from(0x1000), PAGE_SIZE_4K * 2).unwrap();
+        for (address, flags) in [
+            (0x1000, MappingFlags::READ | MappingFlags::WRITE),
+            (0x2000, MappingFlags::READ),
+        ] {
+            aspace
+                .map(
+                    VirtAddr::from(address),
+                    PAGE_SIZE_4K,
+                    MappingFlags::USER | flags,
+                    false,
+                    Backend::new_alloc(VirtAddr::from(address), PageSize::Size4K),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            super::try_update_user_u32_nofault_locked(&aspace, 0x1000, None, None, |old| old + 1),
+            Err(super::UserU32NofaultError::Retry)
+        );
+        let aspace = Arc::new(axsync::Mutex::new(aspace));
+        let caller = super::UserMemoryCapability::new(aspace.clone());
+        caller.write_bytes(0x1000, &7u32.to_ne_bytes()).unwrap();
+        let aspace = aspace.lock();
+        assert_eq!(
+            super::try_update_user_u32_nofault_locked(&aspace, 0x1001, None, None, |_| 99),
+            Err(super::UserU32NofaultError::BadAddress)
+        );
+        assert_eq!(
+            super::try_update_user_u32_nofault_locked(&aspace, 0x2000, None, None, |_| 99),
+            Err(super::UserU32NofaultError::BadAddress)
+        );
+        assert_eq!(
+            super::try_update_user_u32_nofault_locked(
+                &aspace,
+                0x1000,
+                Some(FutexMappingNamespace::Shared),
+                None,
+                |_| 99
+            ),
+            Err(super::UserU32NofaultError::Retry)
+        );
+        assert_eq!(
+            super::try_update_user_u32_nofault_locked(
+                &aspace,
+                0x1000,
+                Some(FutexMappingNamespace::Private),
+                None,
+                |old| old + 1
+            ),
+            Ok(7)
+        );
+        assert_eq!(
+            super::try_read_user_u32_nofault_locked(&aspace, 0x1000, None, None),
+            Ok(8)
+        );
+    }
+
+    #[test]
+    fn futex_atomic_rmw_returns_old_value_and_preserves_concurrent_updates() {
+        extern crate std;
+        use core::sync::atomic::{AtomicU32, Ordering};
+        let word = Arc::new(AtomicU32::new(u32::MAX));
+        assert_eq!(
+            super::atomic_update_user_u32(&word, |old| old.wrapping_add(1)),
+            u32::MAX
+        );
+        assert_eq!(word.load(Ordering::SeqCst), 0);
+        let other = word.clone();
+        let thread = std::thread::spawn(move || {
+            for _ in 0..10_000 {
+                other.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        for _ in 0..10_000 {
+            super::atomic_update_user_u32(&word, |old| old.wrapping_add(1));
+        }
+        thread.join().unwrap();
+        assert_eq!(word.load(Ordering::SeqCst), 20_000);
+    }
+
+    #[test]
     fn user_io_pin_provenance_is_private_only_for_anonymous_cow() {
         let _context = crate::test_support::scheduler_test_context();
         let anonymous = Backend::new_alloc(VirtAddr::from(0x4000), PageSize::Size4K);
@@ -2306,6 +2390,60 @@ pub fn try_read_user_u32_nofault_locked(
     })?;
     copy_from_user_nofault_pages(start, &mut bytes, &pages[..page_count]);
     Ok(u32::from_ne_bytes(bytes))
+}
+
+/// Atomically updates an aligned resident futex word without faulting. The
+/// address-space guard pins its mapping through the RMW; writable PTE preflight
+/// rejects unresolved COW/write-protection before any user memory is changed.
+pub fn try_update_user_u32_nofault_locked(
+    aspace: &AddrSpace,
+    start: usize,
+    expected_namespace: Option<FutexMappingNamespace>,
+    expected: Option<&SharedFutexKey>,
+    update: impl Fn(u32) -> u32,
+) -> Result<u32, UserU32NofaultError> {
+    if start & (size_of::<u32>() - 1) != 0 {
+        return Err(UserU32NofaultError::BadAddress);
+    }
+    validate_futex_mapping_locked(aspace, start, expected_namespace, expected)?;
+    let mut pages = core::array::from_fn(|_| NofaultPage::EMPTY);
+    prepare_user_nofault_span(
+        aspace,
+        start,
+        size_of::<u32>(),
+        MappingFlags::WRITE,
+        false,
+        &mut pages,
+    )
+    .map_err(|error| match error {
+        UserNofaultError::Retry => UserU32NofaultError::Retry,
+        UserNofaultError::BadAddress => UserU32NofaultError::BadAddress,
+    })?;
+    let NofaultPage::Direct {
+        start: page_start,
+        paddr,
+    } = &pages[0]
+    else {
+        return Err(UserU32NofaultError::BadAddress);
+    };
+    let ptr = phys_to_virt(*paddr + (start - *page_start))
+        .as_mut_ptr()
+        .cast::<u32>();
+    // SAFETY: the aligned word is wholly inside one resident writable direct
+    // page. The caller retains the address-space guard, preventing unmap/COW
+    // changes, and all accesses here are atomic, including races with userspace.
+    let word = unsafe { core::sync::atomic::AtomicU32::from_ptr(ptr) };
+    Ok(atomic_update_user_u32(word, update))
+}
+
+fn atomic_update_user_u32(
+    word: &core::sync::atomic::AtomicU32,
+    update: impl Fn(u32) -> u32,
+) -> u32 {
+    use core::sync::atomic::Ordering;
+    // The closure always produces a new value, so failure is impossible. The
+    // CAS loop retries against user-space modifications rather than losing them.
+    word.update(Ordering::SeqCst, Ordering::SeqCst, update)
 }
 
 /// Validates one futex mapping under an already-held address-space guard,

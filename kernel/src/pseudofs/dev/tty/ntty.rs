@@ -1,5 +1,8 @@
 use alloc::{boxed::Box, sync::Arc};
-use core::task::Waker;
+use core::{
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    task::Waker,
+};
 
 use axerrno::{AxError, AxResult};
 use axpoll::PollSet;
@@ -12,8 +15,17 @@ use super::{
 
 pub type NTtyDriver = Tty<Console, Console>;
 
-#[derive(Clone, Copy)]
+struct ConsoleOutput {
+    stopped: AtomicBool,
+    input_stopped: AtomicBool,
+    column: AtomicUsize,
+    events: Arc<PollSet>,
+}
+
+#[derive(Clone)]
 pub struct Console {
+    terminal: Arc<super::terminal::Terminal>,
+    output: Arc<ConsoleOutput>,
     vt: Option<u16>,
     pending: [u8; 80],
     pending_len: usize,
@@ -21,8 +33,15 @@ pub struct Console {
 }
 
 impl Console {
-    fn new(vt: Option<u16>) -> Self {
+    fn new(vt: Option<u16>, terminal: Arc<super::terminal::Terminal>) -> Self {
         Self {
+            terminal,
+            output: Arc::new(ConsoleOutput {
+                stopped: AtomicBool::new(false),
+                input_stopped: AtomicBool::new(false),
+                column: AtomicUsize::new(0),
+                events: Arc::new(PollSet::new()),
+            }),
             vt,
             pending: [0; 80],
             pending_len: 0,
@@ -88,17 +107,65 @@ impl TtyRead for Console {
         self.pending_len = 0;
     }
 }
-impl TtyWrite for Console {
-    fn write(&self, buf: &[u8]) -> AxResult<usize> {
-        axhal::console::write_bytes(buf);
+impl Console {
+    fn emit(&self, bytes: &[u8]) {
+        axhal::console::write_tty_bytes(bytes);
         let vt = self.vt.unwrap_or_else(|| super::VT_MANAGER.active());
         super::fbcon::write(
             vt,
-            buf,
+            bytes,
             super::VT_MANAGER.active(),
             super::VT_MANAGER.graphics(vt),
         );
+    }
+}
+
+impl TtyWrite for Console {
+    fn write(&self, buf: &[u8]) -> AxResult<usize> {
+        if self.output.stopped.load(Ordering::Acquire)
+            || self.output.input_stopped.load(Ordering::Acquire)
+        {
+            return Err(AxError::WouldBlock);
+        }
+        let term = self.terminal.load_termios();
+        let mut column = self.output.column.load(Ordering::Acquire);
+        let mut batch = [0; 256];
+        let mut used = 0;
+        for &byte in buf {
+            let mut output = [0; 8];
+            let count =
+                super::terminal::ldisc::process_output_char(&term, &mut column, byte, &mut output);
+            if used + count > batch.len() {
+                self.emit(&batch[..used]);
+                used = 0;
+            }
+            batch[used..used + count].copy_from_slice(&output[..count]);
+            used += count;
+        }
+        if used != 0 {
+            self.emit(&batch[..used]);
+        }
+        self.output.column.store(column, Ordering::Release);
         Ok(buf.len())
+    }
+
+    fn poll_write(&self) -> bool {
+        !(self.output.stopped.load(Ordering::Acquire)
+            || self.output.input_stopped.load(Ordering::Acquire))
+    }
+    fn tx_poll_source(&self) -> Option<&Arc<PollSet>> {
+        Some(&self.output.events)
+    }
+    fn set_output_stopped(&self, stopped: bool) {
+        self.output.stopped.store(stopped, Ordering::Release);
+        self.output.events.wake();
+    }
+    fn set_input_flow_stopped(&self, stopped: bool) {
+        self.output.input_stopped.store(stopped, Ordering::Release);
+        self.output.events.wake();
+    }
+    fn output_column(&self) -> Option<usize> {
+        Some(self.output.column.load(Ordering::Acquire))
     }
 }
 
@@ -121,7 +188,8 @@ pub(super) fn wake_console_input() {
 }
 
 fn new_n_tty() -> Arc<NTtyDriver> {
-    let terminal = Arc::try_new(Default::default()).expect("failed to allocate console terminal");
+    let terminal = Arc::try_new(super::terminal::Terminal::default())
+        .expect("failed to allocate console terminal");
     let process_mode = if let Some(irq) = axhal::console::irq_num() {
         // One stable readiness source covers both fresh UART input and
         // capacity released by the active VT. Initialize it before enabling
@@ -140,10 +208,10 @@ fn new_n_tty() -> Arc<NTtyDriver> {
         ProcessMode::Manual
     };
     Tty::try_new(
-        terminal,
+        terminal.clone(),
         TtyConfig {
-            reader: Console::new(None),
-            writer: Console::new(None),
+            reader: Console::new(None, terminal.clone()),
+            writer: Console::new(None, terminal),
             process_mode,
         },
         None,
@@ -155,11 +223,13 @@ fn new_n_tty() -> Arc<NTtyDriver> {
 /// still comes from the hardware console, but termios/job-control/session
 /// state belongs to this VT alone.
 pub(crate) fn new_virtual_tty(number: u16) -> Arc<NTtyDriver> {
+    let terminal =
+        Arc::try_new(super::terminal::Terminal::default()).expect("failed to allocate VT terminal");
     Tty::try_new(
-        Arc::try_new(Default::default()).expect("failed to allocate VT terminal"),
+        terminal.clone(),
         TtyConfig {
-            reader: Console::new(Some(number)),
-            writer: Console::new(Some(number)),
+            reader: Console::new(Some(number), terminal.clone()),
+            writer: Console::new(Some(number), terminal),
             process_mode: ProcessMode::Manual,
         },
         None,
@@ -183,7 +253,7 @@ mod tests {
 
     #[test]
     fn revoked_pending_batch_is_discarded_before_reading_new_input() {
-        let mut root = Console::new(None);
+        let mut root = Console::new(None, Arc::new(Default::default()));
         assert_eq!(
             root.route_input(
                 |buf| {
@@ -233,15 +303,15 @@ mod tests {
         let tty = Tty::try_new(
             terminal,
             TtyConfig {
-                reader: Console::new(Some(1)),
-                writer: Console::new(Some(1)),
+                reader: Console::new(Some(1), Arc::new(Default::default())),
+                writer: Console::new(Some(1), Arc::new(Default::default())),
                 process_mode: ProcessMode::Manual,
             },
             None,
         )
         .unwrap();
-        let mut root = Console::new(None);
-        let mut input = vec![b'x'; 4096];
+        let mut root = Console::new(None, Arc::new(Default::default()));
+        let mut input = vec![b'x'; 8192];
         // Vary every byte to expose duplicated or reordered retained prefixes.
         for (i, b) in input.iter_mut().enumerate() {
             *b = b'a' + (i % 26) as u8;
@@ -261,13 +331,20 @@ mod tests {
             )
             .unwrap()
         };
-        assert!(route(&mut root).1);
-        assert!(route(&mut root).1);
-        assert!(!route(&mut root).1);
+        let mut accepted_batches = 0;
+        while route(&mut root).1 {
+            accepted_batches += 1;
+            assert!(
+                accepted_batches < input.len() / 80,
+                "bounded discipline must apply backpressure"
+            );
+        }
+        assert!(accepted_batches > 0);
         assert!(!route(&mut root).1);
         drop(route);
         assert_eq!(
-            read_calls, 3,
+            read_calls,
+            accepted_batches + 1,
             "blocked batch must not read or discard more UART data"
         );
         assert_eq!(root.pending_len, 80);

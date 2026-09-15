@@ -6,8 +6,8 @@ use event_listener::Event;
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
     socket::{AnySocket, Socket},
-    wire::IpAddress,
     time::{Duration, Instant},
+    wire::IpAddress,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,6 +112,44 @@ impl<'a> SocketSetWrapper<'a> {
         }
     }
 
+    /// Validate and publish TCP bind under the same socket-set lock. Reuse
+    /// requires consent from both binders and never bypasses a live listener.
+    pub fn bind_tcp(
+        &self,
+        handle: SocketHandle,
+        endpoint: smoltcp::wire::IpListenEndpoint,
+        reuse: bool,
+    ) -> AxResult {
+        let mut sockets = self.inner.lock();
+        if sockets
+            .get::<smoltcp::socket::tcp::Socket>(handle)
+            .get_bound_endpoint()
+            .port
+            != 0
+        {
+            return Err(AxError::InvalidInput);
+        }
+        for (existing_handle, socket) in sockets.iter() {
+            if existing_handle == handle {
+                continue;
+            }
+            let Socket::Tcp(socket) = socket else {
+                continue;
+            };
+            let bound = socket.get_bound_endpoint();
+            if bound.port == endpoint.port
+                && addrs_conflict(bound.addr, endpoint.addr)
+                && (socket.bound_listener() || !reuse || !socket.bound_reuse_address())
+            {
+                return Err(AxError::AddrInUse);
+            }
+        }
+        let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+        socket.set_bound_endpoint(endpoint);
+        socket.set_bound_reuse_address(reuse);
+        Ok(())
+    }
+
     pub fn bind_check(&self, transport: Transport, addr: Option<IpAddress>, port: u16) -> AxResult {
         if port == 0 {
             return Ok(());
@@ -148,7 +186,9 @@ impl<'a> SocketSetWrapper<'a> {
         let mut sockets = self.inner.lock();
         let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
         socket.close();
-        if socket.state() == smoltcp::socket::tcp::State::Closed && socket.remote_endpoint().is_none() {
+        if socket.state() == smoltcp::socket::tcp::State::Closed
+            && socket.remote_endpoint().is_none()
+        {
             sockets.remove(handle);
         } else {
             // Preserve an explicitly configured transport timeout. The orphan
@@ -168,7 +208,11 @@ impl<'a> SocketSetWrapper<'a> {
     }
 
     pub fn closing_tcp_deadline(&self) -> Option<Instant> {
-        self.closing_tcp.lock().iter().map(|entry| entry.deadline).min()
+        self.closing_tcp
+            .lock()
+            .iter()
+            .map(|entry| entry.deadline)
+            .min()
     }
 
     /// Called while the service owns `inner`, after processing TCP timers and

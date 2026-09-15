@@ -927,6 +927,15 @@ impl CowBackend {
         self.size == PageSize::Size4K && self.file.is_none()
     }
 
+    pub(crate) fn proc_file_mapping(
+        &self,
+        address: VirtAddr,
+    ) -> Option<(&axfs_ng_vfs::Location, u64)> {
+        let (file, offset, ..) = self.file.as_ref()?;
+        let delta = address.as_usize().checked_sub(self.start.as_usize())?;
+        Some((file.location(), offset.checked_add(delta as u64)?))
+    }
+
     pub(crate) fn has_file_backing(&self) -> bool {
         self.file.is_some()
     }

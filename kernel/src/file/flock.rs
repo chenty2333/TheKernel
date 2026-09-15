@@ -7,6 +7,7 @@ use axtask::current_may_uninit;
 use hashbrown::{HashMap, HashSet};
 use lazy_static::lazy_static;
 use linux_raw_sys::general::{F_RDLCK, F_UNLCK, F_WRLCK, SEEK_CUR, SEEK_END, SEEK_SET, flock64};
+use tk_linux_fd::FdTableId;
 use tk_linux_process_adapter::Pid;
 
 use crate::readiness::block_on_poll_set;
@@ -41,12 +42,12 @@ static FLOCK_WAITERS: PollSet = PollSet::new();
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RecordLockOwner {
-    Posix(Pid),
+    Posix(FdTableId),
     Ofd(u64),
 }
 
 /// Record-lock identities which one fd-backed I/O operation owns at the same
-/// time. POSIX locks are process-owned while OFD locks follow the exact open
+/// time. POSIX locks are files-table-owned while OFD locks follow the exact open
 /// file description, so mandatory access must exempt both in one table scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MandatoryOwners {
@@ -55,9 +56,9 @@ pub struct MandatoryOwners {
 }
 
 impl MandatoryOwners {
-    pub const fn new(pid: Pid, ofd: u64) -> Self {
+    pub const fn new(files: FdTableId, ofd: u64) -> Self {
         Self {
-            posix: RecordLockOwner::Posix(pid),
+            posix: RecordLockOwner::Posix(files),
             ofd: RecordLockOwner::Ofd(ofd),
         }
     }
@@ -91,6 +92,7 @@ struct RecordRange {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RecordLockRequest {
+    report_pid: Pid,
     ty: i16,
     range: RecordRange,
 }
@@ -108,6 +110,7 @@ pub struct MandatoryLockWait {
 
 #[derive(Clone, Copy)]
 struct RecordLock {
+    report_pid: Pid,
     owner: RecordLockOwner,
     ty: i16,
     range: RecordRange,
@@ -115,6 +118,7 @@ struct RecordLock {
 
 #[derive(Clone, Copy)]
 struct RecordLockWait {
+    owner: RecordLockOwner,
     id: InodeId,
     req: RecordLockRequest,
 }
@@ -122,7 +126,8 @@ struct RecordLockWait {
 struct RecordLockTableInner {
     locks: HashMap<InodeId, Vec<RecordLock>>,
     owners: HashMap<RecordLockOwner, HashSet<InodeId>>,
-    wait_requests: HashMap<RecordLockOwner, RecordLockWait>,
+    wait_requests: HashMap<u64, RecordLockWait>,
+    next_wait_id: u64,
     record_count: usize,
 }
 
@@ -131,6 +136,7 @@ lazy_static! {
         locks: HashMap::new(),
         owners: HashMap::new(),
         wait_requests: HashMap::new(),
+        next_wait_id: 1,
         record_count: 0,
     });
 }
@@ -181,6 +187,7 @@ impl RecordLockRequest {
         }
         let start = start.try_into().map_err(|_| AxError::InvalidInput)?;
         Ok(Self {
+            report_pid: 0,
             ty,
             range: RecordRange { start, end },
         })
@@ -265,24 +272,29 @@ fn record_lock_would_deadlock(
         if !matches!(blocker, RecordLockOwner::Posix(_)) {
             continue;
         }
-        if !seen.insert(blocker) {
+        if seen.contains(&blocker) {
             continue;
         }
-        let Some(wait) = table.wait_requests.get(&blocker) else {
-            continue;
-        };
-        if let Some(locks) = table.locks.get(&wait.id) {
-            for lock in locks {
-                if !record_lock_conflicts(lock, blocker, wait.req) {
-                    continue;
+        seen.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+        seen.insert(blocker);
+        for wait in table
+            .wait_requests
+            .values()
+            .filter(|wait| wait.owner == blocker)
+        {
+            if let Some(locks) = table.locks.get(&wait.id) {
+                for lock in locks {
+                    if !record_lock_conflicts(lock, blocker, wait.req) {
+                        continue;
+                    }
+                    if stack.len() >= MAX_RECORD_WAIT_REQUESTS {
+                        // Linux's deadlock detector is intentionally bounded too.
+                        // Conservatively reject an over-deep dependency graph.
+                        return Ok(true);
+                    }
+                    stack.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+                    stack.push(lock.owner);
                 }
-                if stack.len() >= MAX_RECORD_WAIT_REQUESTS {
-                    // Linux's deadlock detector is intentionally bounded too.
-                    // Conservatively reject an over-deep dependency graph.
-                    return Ok(true);
-                }
-                stack.try_reserve(1).map_err(|_| AxError::NoMemory)?;
-                stack.push(lock.owner);
             }
         }
     }
@@ -330,6 +342,7 @@ fn build_record_locks(
     }
     if req.ty != F_UNLCK as i16 {
         updated.push(RecordLock {
+            report_pid: req.report_pid,
             owner,
             ty: req.ty,
             range: req.range,
@@ -425,7 +438,6 @@ fn try_set_record_lock_inner(
         retired.locks = table.locks.insert(id, updated);
     }
     table.record_count = new_count;
-    table.wait_requests.remove(&owner);
 
     if had_owner && !has_owner {
         let empty = if let Some(ids) = table.owners.get_mut(&owner) {
@@ -462,6 +474,14 @@ fn record_lock_blocking(
     owner: RecordLockOwner,
     req: RecordLockRequest,
 ) -> AxResult<()> {
+    // One registration per syscall, not per owner: sibling threads can
+    // wait on different locks concurrently and all graph edges must survive.
+    let wait_id = {
+        let mut table = RECORD_LOCK_TABLE.lock();
+        let id = table.next_wait_id;
+        table.next_wait_id = id.checked_add(1).ok_or(LinuxError::ENOLCK)?;
+        id
+    };
     let result = block_on_poll_set(&RECORD_LOCK_WAITERS, || {
         match try_set_record_lock(id, owner, req) {
             Ok(true) => return Ok(()),
@@ -474,14 +494,13 @@ fn record_lock_blocking(
             if matches!(owner, RecordLockOwner::Posix(_)) {
                 match record_lock_would_deadlock(&table, owner, id, req) {
                     Ok(true) => {
-                        table.wait_requests.remove(&owner);
                         return Err(LinuxError::EDEADLK.into());
                     }
                     Ok(false) => {}
                     Err(error) => return Err(error),
                 }
             }
-            if !table.wait_requests.contains_key(&owner) {
+            if !table.wait_requests.contains_key(&wait_id) {
                 if table.wait_requests.len() >= MAX_RECORD_WAIT_REQUESTS {
                     return Err(LinuxError::ENOLCK.into());
                 }
@@ -492,27 +511,28 @@ fn record_lock_blocking(
             }
             table
                 .wait_requests
-                .insert(owner, RecordLockWait { id, req });
+                .insert(wait_id, RecordLockWait { owner, id, req });
             Ok(())
         })();
         admission?;
         Err(AxError::WouldBlock)
     });
-    if result.is_err() {
-        let _ = RECORD_LOCK_TABLE.lock().wait_requests.remove(&owner);
-    }
+    // Completion, signal and admission failure retire only this request.
+    RECORD_LOCK_TABLE.lock().wait_requests.remove(&wait_id);
     result
 }
 
 pub fn set_record_lock(
     id: InodeId,
     owner: RecordLockOwner,
+    report_pid: Pid,
     file_size: u64,
     current_offset: u64,
     lock: &flock64,
     blocking: bool,
 ) -> AxResult<()> {
-    let req = RecordLockRequest::from_flock(lock, file_size, current_offset)?;
+    let mut req = RecordLockRequest::from_flock(lock, file_size, current_offset)?;
+    req.report_pid = report_pid;
     if blocking {
         record_lock_blocking(id, owner, req)
     } else {
@@ -549,7 +569,7 @@ pub fn get_record_lock(
             (conflict.range.end - conflict.range.start) as _
         };
         lock.l_pid = match conflict.owner {
-            RecordLockOwner::Posix(pid) => pid as _,
+            RecordLockOwner::Posix(_) => conflict.report_pid as _,
             RecordLockOwner::Ofd(_) => -1,
         };
     } else {
@@ -593,6 +613,7 @@ fn mandatory_access_conflict_in(
     }
     let end = start.checked_add(len).ok_or(AxError::InvalidInput)?;
     let req = RecordLockRequest {
+        report_pid: 0,
         ty: access.lock_type(),
         range: RecordRange { start, end },
     };
@@ -649,6 +670,7 @@ pub fn mandatory_write_lock_conflicts(
         RecordRange { start, end }
     };
     let req = RecordLockRequest {
+        report_pid: 0,
         ty: F_WRLCK as i16,
         range,
     };
@@ -656,28 +678,26 @@ pub fn mandatory_write_lock_conflicts(
     record_lock_has_conflict(&table, id, requester, req)
 }
 
-pub fn release_posix_owner(pid: Pid) {
-    while !release_record_owner_batch(RecordLockOwner::Posix(pid), 16) {
+pub fn release_posix_owner(files: FdTableId) {
+    while !release_record_owner_batch(RecordLockOwner::Posix(files), 16) {
         if current_may_uninit().is_some() {
             axtask::yield_now();
         }
     }
 }
 
-pub fn release_posix_owner_on_inode(pid: Pid, id: InodeId) {
-    release_record_owner_on_inode(RecordLockOwner::Posix(pid), id);
+pub fn release_posix_owner_on_inode(files: FdTableId, id: InodeId) {
+    release_record_owner_on_inode(RecordLockOwner::Posix(files), id);
 }
 
 struct RetiredRecordRelease {
     locks: Option<Vec<RecordLock>>,
     owner_ids: Option<HashSet<InodeId>>,
-    wait: Option<RecordLockWait>,
 }
 
 fn release_record_owner_on_inode(owner: RecordLockOwner, id: InodeId) {
     let (changed, retired) = {
         let mut table = RECORD_LOCK_TABLE.lock();
-        let wait = table.wait_requests.remove(&owner);
         let Some(locks) = table.locks.get_mut(&id) else {
             return;
         };
@@ -696,22 +716,10 @@ fn release_record_owner_on_inode(owner: RecordLockOwner, id: InodeId) {
             false
         };
         let owner_ids = empty_owner.then(|| table.owners.remove(&owner)).flatten();
-        (
-            removed != 0,
-            RetiredRecordRelease {
-                locks,
-                owner_ids,
-                wait,
-            },
-        )
+        (removed != 0, RetiredRecordRelease { locks, owner_ids })
     };
-    let RetiredRecordRelease {
-        locks,
-        owner_ids,
-        wait,
-    } = retired;
+    let RetiredRecordRelease { locks, owner_ids } = retired;
     drop((locks, owner_ids));
-    let _ = wait;
     if changed {
         RECORD_LOCK_WAITERS.wake();
     }
@@ -722,7 +730,6 @@ fn release_record_owner_batch(owner: RecordLockOwner, budget: usize) -> bool {
     for _ in 0..budget.max(1) {
         let (done, removed, retired) = {
             let mut table = RECORD_LOCK_TABLE.lock();
-            let wait = table.wait_requests.remove(&owner);
             let id = table
                 .owners
                 .get(&owner)
@@ -750,11 +757,7 @@ fn release_record_owner_batch(owner: RecordLockOwner, budget: usize) -> bool {
                 (
                     empty_owner,
                     removed != 0,
-                    RetiredRecordRelease {
-                        locks,
-                        owner_ids,
-                        wait,
-                    },
+                    RetiredRecordRelease { locks, owner_ids },
                 )
             } else {
                 let owner_ids = table.owners.remove(&owner);
@@ -764,19 +767,13 @@ fn release_record_owner_batch(owner: RecordLockOwner, budget: usize) -> bool {
                     RetiredRecordRelease {
                         locks: None,
                         owner_ids,
-                        wait,
                     },
                 )
             }
         };
         changed |= removed;
-        let RetiredRecordRelease {
-            locks,
-            owner_ids,
-            wait,
-        } = retired;
+        let RetiredRecordRelease { locks, owner_ids } = retired;
         drop((locks, owner_ids));
-        let _ = wait;
         if done {
             if changed {
                 RECORD_LOCK_WAITERS.wake();
@@ -1083,8 +1080,16 @@ mod tests {
 
     use super::*;
 
+    fn test_files_id(pid: Pid) -> FdTableId {
+        FdTableId::new(u64::from(pid)).unwrap()
+    }
+    fn posix_owner(pid: Pid) -> RecordLockOwner {
+        RecordLockOwner::Posix(test_files_id(pid))
+    }
+
     fn test_record_lock(owner: RecordLockOwner, ty: u32, start: u64, end: u64) -> RecordLock {
         RecordLock {
+            report_pid: 0,
             owner,
             ty: ty as _,
             range: RecordRange { start, end },
@@ -1097,6 +1102,7 @@ mod tests {
             locks: HashMap::new(),
             owners: HashMap::new(),
             wait_requests: HashMap::new(),
+            next_wait_id: 1,
             record_count,
         };
         assert!(table.locks.insert(id, locks).is_none());
@@ -1118,6 +1124,58 @@ mod tests {
     }
 
     #[test]
+    fn same_owner_waits_keep_independent_deadlock_edges() {
+        let a = posix_owner(10);
+        let b = posix_owner(20);
+        let c = posix_owner(30);
+        let req = RecordLockRequest {
+            report_pid: 0,
+            ty: F_WRLCK as _,
+            range: RecordRange { start: 0, end: 10 },
+        };
+        let mut table = test_record_table((1, 1), Vec::from([test_record_lock(b, F_WRLCK, 0, 10)]));
+        table
+            .locks
+            .insert((1, 2), Vec::from([test_record_lock(a, F_WRLCK, 0, 10)]));
+        table
+            .locks
+            .insert((1, 3), Vec::from([test_record_lock(c, F_WRLCK, 0, 10)]));
+        table.record_count = 3;
+        table.wait_requests.insert(
+            1,
+            RecordLockWait {
+                owner: b,
+                id: (1, 2),
+                req,
+            },
+        );
+        table.wait_requests.insert(
+            2,
+            RecordLockWait {
+                owner: b,
+                id: (1, 3),
+                req,
+            },
+        );
+        assert_eq!(record_lock_would_deadlock(&table, a, (1, 1), req), Ok(true));
+        // A successful unrelated lock operation by B must not unregister
+        // either of B's other threads' blocked requests.
+        assert!(
+            try_set_record_lock_inner(&mut table, (1, 4), b, req)
+                .unwrap()
+                .0
+        );
+        assert_eq!(table.wait_requests.len(), 2);
+        table.wait_requests.remove(&2);
+        assert_eq!(record_lock_would_deadlock(&table, a, (1, 1), req), Ok(true));
+        table.wait_requests.remove(&1);
+        assert_eq!(
+            record_lock_would_deadlock(&table, a, (1, 1), req),
+            Ok(false)
+        );
+    }
+
+    #[test]
     fn mandatory_access_exempts_posix_and_endpoint_ofd_together() {
         const PID: Pid = u32::MAX - 100;
         const OFD: u64 = u64::MAX - 300;
@@ -1128,7 +1186,7 @@ mod tests {
         let table = test_record_table(
             ID,
             Vec::from([
-                test_record_lock(RecordLockOwner::Posix(PID), F_WRLCK, 0, 4),
+                test_record_lock(posix_owner(PID), F_WRLCK, 0, 4),
                 test_record_lock(RecordLockOwner::Ofd(OFD), F_WRLCK, 4, 8),
             ]),
         );
@@ -1137,7 +1195,7 @@ mod tests {
             mandatory_access_conflict_in(
                 &table,
                 ID,
-                MandatoryOwners::new(PID, OFD),
+                MandatoryOwners::new(test_files_id(PID), OFD),
                 MandatoryAccess::Read,
                 0,
                 8,
@@ -1148,7 +1206,7 @@ mod tests {
             mandatory_access_conflict_in(
                 &table,
                 ID,
-                MandatoryOwners::new(PID, OTHER_OFD),
+                MandatoryOwners::new(test_files_id(PID), OTHER_OFD),
                 MandatoryAccess::Read,
                 0,
                 8,
@@ -1160,7 +1218,7 @@ mod tests {
             mandatory_access_conflict_in(
                 &table,
                 ID,
-                MandatoryOwners::new(PID - 1, OFD),
+                MandatoryOwners::new(test_files_id(PID - 1), OFD),
                 MandatoryAccess::Read,
                 0,
                 8,
@@ -1177,7 +1235,7 @@ mod tests {
         const FOREIGN: u64 = u64::MAX - 311;
         const DEVICE: u64 = u64::MAX - 312;
         const ID: InodeId = (DEVICE, 1);
-        let owners = MandatoryOwners::new(PID, OFD);
+        let owners = MandatoryOwners::new(test_files_id(PID), OFD);
 
         let table = test_record_table(
             ID,
@@ -1216,7 +1274,7 @@ mod tests {
         const PID: Pid = u32::MAX - 120;
         const OFD: u64 = u64::MAX - 320;
         const DEVICE: u64 = u64::MAX - 321;
-        let owners = MandatoryOwners::new(PID, OFD);
+        let owners = MandatoryOwners::new(test_files_id(PID), OFD);
         let table = test_record_table((DEVICE, 1), Vec::new());
 
         assert_eq!(
@@ -1250,7 +1308,7 @@ mod tests {
         const FOREIGN: u64 = u64::MAX - 331;
         const DEVICE: u64 = u64::MAX - 332;
         const ID: InodeId = (DEVICE, 1);
-        let owners = MandatoryOwners::new(PID, OFD);
+        let owners = MandatoryOwners::new(test_files_id(PID), OFD);
 
         let mut table = test_record_table(
             ID,
@@ -1287,6 +1345,7 @@ mod tests {
             set_record_lock(
                 (DEVICE, inode),
                 RecordLockOwner::Ofd(OWNER),
+                0,
                 0,
                 0,
                 &request,

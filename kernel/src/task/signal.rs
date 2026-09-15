@@ -81,13 +81,37 @@ pub(crate) fn apply_signal_context(context: &mut UserContext, signal: &SignalUse
     context.ss = signal.ss;
 }
 
-fn notify_tracer_or_parent_stop_continue(proc_data: &ProcessData) {
+fn notify_tracer_or_parent_stop_continue(proc_data: &ProcessData, code: u32, status: i32) {
     let notify_pid = proc_data
         .ptrace_tracer()
         .or_else(|| proc_data.proc.parent().map(|parent| parent.pid()));
     if let Some(pid) = notify_pid {
-        let _ = send_signal_to_process(pid, Some(SignalInfo::new_kernel(Signo::SIGCHLD)));
         if let Ok(waiter) = get_process_data(pid) {
+            let child_pid = waiter
+                .pid_ns()
+                .visible_pid_checked(proc_data.proc.pid())
+                .unwrap_or(0);
+            let uid = waiter
+                .user_ns()
+                .from_kuid_munged(proc_data.group_leader_cred().ids().ruid);
+            let suppress = proc_data.ptrace_tracer().is_none()
+                && waiter
+                    .signal
+                    .action(Signo::SIGCHLD)
+                    .flags
+                    .contains(tk_linux_signal::SignalActionFlags::NOCLDSTOP);
+            if !suppress {
+                let _ = send_signal_to_process(
+                    pid,
+                    Some(SignalInfo::new_child(
+                        Signo::SIGCHLD,
+                        code as i32,
+                        child_pid,
+                        uid,
+                        status,
+                    )),
+                );
+            }
             waiter.child_exit_event.wake();
         }
     }
@@ -111,7 +135,11 @@ fn try_ptrace_signal_stop(
         proc_data.proc.pid(),
         signo as u8
     );
-    notify_tracer_or_parent_stop_continue(proc_data);
+    notify_tracer_or_parent_stop_continue(
+        proc_data,
+        linux_raw_sys::general::CLD_TRAPPED,
+        signo as i32,
+    );
     interrupt_stop_siblings(proc_data);
     Ok(())
 }
@@ -1157,6 +1185,10 @@ fn force_signal_current_thread_inner(
         thr.signal.set_blocked(blocked);
     }
 
+    if !retain_handler && thr.proc_data.ptrace_tracer().is_none() {
+        thr.proc_data.signal.allow_forced_default_signal();
+    }
+
     let published_generation = send_signal_thread_inner_with(
         &curr,
         thr,
@@ -1194,7 +1226,11 @@ fn do_stop(thr: &Thread, uctx: &mut UserContext, signo: u8) {
     );
 
     if proc_data.finish_stop() {
-        notify_tracer_or_parent_stop_continue(proc_data);
+        notify_tracer_or_parent_stop_continue(
+            proc_data,
+            linux_raw_sys::general::CLD_STOPPED,
+            signo as i32,
+        );
         interrupt_stop_siblings(proc_data);
     }
 
@@ -1214,7 +1250,11 @@ fn do_continue(proc_data: &ProcessData) {
         }
         ContinueResult::ResumedStopped => {
             info!("Continuing process {}", proc_data.proc.pid());
-            notify_tracer_or_parent_stop_continue(proc_data);
+            notify_tracer_or_parent_stop_continue(
+                proc_data,
+                linux_raw_sys::general::CLD_CONTINUED,
+                Signo::SIGCONT as i32,
+            );
         }
     }
 }
@@ -1291,7 +1331,11 @@ fn handle_stopped_interrupt(thr: &Thread, uctx: &mut UserContext) {
 }
 
 pub fn notify_ptrace_attach_stop(proc_data: &ProcessData) {
-    notify_tracer_or_parent_stop_continue(proc_data);
+    notify_tracer_or_parent_stop_continue(
+        proc_data,
+        linux_raw_sys::general::CLD_TRAPPED,
+        Signo::SIGSTOP as i32,
+    );
 }
 
 #[cfg(test)]

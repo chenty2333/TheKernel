@@ -5,7 +5,7 @@ use core::{
     task::Context,
 };
 
-use axerrno::{AxError, AxResult, ax_bail, ax_err_type};
+use axerrno::{AxError, AxResult, LinuxError, ax_bail, ax_err_type};
 use axio::prelude::*;
 use axpoll::{
     IoEvents, PollRegistration, PollRegistrationError, PollSet, Pollable, PreparedPollRegistration,
@@ -26,7 +26,6 @@ use crate::{
     net_stack::NetStack,
     options::{Configurable, GetSocketOption, SetSocketOption, SocketFault},
     state::*,
-    wrapper::Transport,
 };
 
 pub(crate) fn new_tcp_socket() -> AxResult<smol::Socket<'static>> {
@@ -48,6 +47,10 @@ fn replace_tcp_recv_buffer(socket: &mut smol::Socket, requested: usize) -> AxRes
     socket
         .replace_recv_buffer(buffer)
         .map_err(|_| AxError::ResourceBusy)
+}
+
+fn connect_handshake_pending(state: smol::State) -> bool {
+    matches!(state, smol::State::SynSent | smol::State::SynReceived)
 }
 
 /// A TCP socket that provides POSIX-like APIs.
@@ -248,32 +251,44 @@ impl TcpSocket {
         })
     }
 
+    fn record_transport_failure(&self, socket: &mut smol::Socket<'_>) {
+        if let Some(reason) = socket.take_failure_reason() {
+            let fault = match reason {
+                smol::FailureReason::ConnectionRefused => SocketFault::ConnectionRefused,
+                smol::FailureReason::Reset => SocketFault::ConnectionReset,
+                smol::FailureReason::TimedOut => SocketFault::TimedOut,
+            };
+            self.general.set_pending_error(fault);
+        }
+    }
+
     fn poll_connect(&self) -> IoEvents {
         let mut events = IoEvents::empty();
-        let writable = self.with_smol_socket(|socket| match socket.state() {
-            smol::State::SynSent => false, // wait for connection
-            smol::State::Established
-            | smol::State::FinWait1
-            | smol::State::FinWait2
-            | smol::State::CloseWait
-            | smol::State::Closing
-            | smol::State::LastAck
-            | smol::State::TimeWait => {
-                // Linux connect() succeeds once the handshake completed, even
-                // if the peer closes immediately afterwards. Preserve a
-                // successful handshake across that post-connect close race.
-                self.state.set(State::Connected); // connected
-                self.general.clear_pending_error();
-                if let Some(remote) = socket.remote_endpoint() {
-                    debug!("TCP socket {}: connected to {}", self.handle, remote);
+        let writable = self.with_smol_socket(|socket| {
+            self.record_transport_failure(socket);
+            match socket.state() {
+                state if connect_handshake_pending(state) => false, // wait for connection
+                smol::State::Established
+                | smol::State::FinWait1
+                | smol::State::FinWait2
+                | smol::State::CloseWait
+                | smol::State::Closing
+                | smol::State::LastAck
+                | smol::State::TimeWait => {
+                    // Linux connect() succeeds once the handshake completed, even
+                    // if the peer closes immediately afterwards. Preserve a
+                    // successful handshake across that post-connect close race.
+                    self.state.set(State::Connected); // connected
+                    self.general.clear_pending_error();
+                    if let Some(remote) = socket.remote_endpoint() {
+                        debug!("TCP socket {}: connected to {}", self.handle, remote);
+                    }
+                    true
                 }
-                true
-            }
-            _ => {
-                self.state.set(State::Closed); // connection failed
-                self.general
-                    .set_pending_error(SocketFault::ConnectionRefused);
-                true
+                _ => {
+                    self.state.set(State::Closed); // connection failed
+                    true
+                }
             }
         });
         events.set(IoEvents::WRITABLE, writable);
@@ -283,6 +298,7 @@ impl TcpSocket {
     fn poll_stream(&self) -> IoEvents {
         let mut events = IoEvents::empty();
         self.with_smol_socket(|socket| {
+            self.record_transport_failure(socket);
             events.set(
                 IoEvents::READABLE,
                 !self.rx_closed.load(Ordering::Acquire)
@@ -384,6 +400,10 @@ impl Configurable for TcpSocket {
     fn get_option_inner(&self, option: &mut GetSocketOption) -> AxResult<bool> {
         use GetSocketOption as O;
 
+        if matches!(option, O::Error(_)) {
+            self.stack.poll_interfaces();
+            self.with_smol_socket(|socket| self.record_transport_failure(socket));
+        }
         if self.general.get_option_inner(option)? {
             return Ok(true);
         }
@@ -455,13 +475,6 @@ impl SocketOps for TcpSocket {
                 self.stack
                     .get_service()
                     .validate_bind_addr(local_addr.ip().into())?;
-                if !self.general.reuse_address() {
-                    self.stack.socket_set.bind_check(
-                        Transport::Tcp,
-                        (!local_addr.ip().is_unspecified()).then_some(local_addr.ip().into()),
-                        local_addr.port(),
-                    )?;
-                }
                 let endpoint = IpListenEndpoint {
                     addr: if local_addr.ip().is_unspecified() {
                         None
@@ -472,13 +485,11 @@ impl SocketOps for TcpSocket {
                 };
                 let device_mask = self.stack.get_service().device_mask_for(&endpoint);
 
-                self.with_smol_socket(|socket| {
-                    if socket.get_bound_endpoint().port != 0 {
-                        return Err(AxError::InvalidInput);
-                    }
-                    socket.set_bound_endpoint(endpoint);
-                    Ok(())
-                })?;
+                self.stack.socket_set.bind_tcp(
+                    self.handle,
+                    endpoint,
+                    self.general.reuse_address(),
+                )?;
                 self.general.set_device_mask(device_mask);
                 debug!("TCP socket {}: binding to {}", self.handle, local_addr);
                 Ok(())
@@ -495,14 +506,32 @@ impl SocketOps for TcpSocket {
             }
             addr => addr,
         };
+        if self.state() == State::Connecting {
+            self.stack.poll_interfaces();
+            self.poll_connect();
+            return match self.state() {
+                State::Connecting => Err(LinuxError::EALREADY.into()),
+                State::Connected => Ok(()),
+                _ => Err(self
+                    .general
+                    .take_pending_error()
+                    .map_or(AxError::ConnectionRefused, SocketFault::as_ax_error)),
+            };
+        }
         self.state
             .lock(State::Idle)
+            .or_else(|state| {
+                if state == State::Closed {
+                    self.state.lock(State::Closed)
+                } else {
+                    Err(state)
+                }
+            })
             .map_err(|state| {
                 if state == State::Connecting {
-                    AxError::InProgress
+                    LinuxError::EALREADY.into()
                 } else {
-                    // TODO(mivik): error code
-                    ax_err_type!(AlreadyConnected)
+                    AxError::AlreadyConnected
                 }
             })?
             .transit(State::Connecting, || {
@@ -530,8 +559,6 @@ impl SocketOps for TcpSocket {
                             break;
                         }
                     }
-                } else if bound_endpoint.port == remote_endpoint.port {
-                    ax_bail!(ConnectionRefused, "same local/remote port");
                 }
                 info!("TCP connection from {bound_endpoint} to {remote_endpoint}");
 
@@ -566,7 +593,10 @@ impl SocketOps for TcpSocket {
             } else if self.state() == State::Connected {
                 Ok(())
             } else {
-                Err(ax_err_type!(ConnectionRefused, "connection refused"))
+                Err(self
+                    .general
+                    .take_pending_error()
+                    .map_or(AxError::ConnectionRefused, SocketFault::as_ax_error))
             }
         })
     }
@@ -594,6 +624,7 @@ impl SocketOps for TcpSocket {
             self.stack
                 .listen_table
                 .listen(bound_endpoint, backlog, &self.stack.socket_set)?;
+            self.with_smol_socket(|socket| socket.set_bound_listener(true));
             debug!("listening on {bound_endpoint}");
             Ok(())
         })
@@ -624,7 +655,11 @@ impl SocketOps for TcpSocket {
             .send_poller_with_effective_nonblocking(self, effective_nonblocking, || {
                 self.stack.poll_interfaces();
                 self.with_smol_socket(|socket| {
-                    if !socket.is_active() {
+                    self.record_transport_failure(socket);
+                    self.general.consume_pending_error()?;
+                    if !socket.may_send() && self.state() == State::Connected {
+                        Err(AxError::BrokenPipe)
+                    } else if !socket.is_active() {
                         Err(AxError::NotConnected)
                     } else if !socket.can_send() {
                         Err(AxError::WouldBlock)
@@ -656,10 +691,12 @@ impl SocketOps for TcpSocket {
         }
         let effective_nonblocking = options.effective_nonblocking(self.general.nonblocking());
         self.general
-            .recv_poller_with_effective_nonblocking(self, effective_nonblocking, || {
+            .recv_poller_data_first_with_effective_nonblocking(self, effective_nonblocking, || {
                 self.stack.poll_interfaces();
                 self.with_smol_socket(|socket| {
+                    self.record_transport_failure(socket);
                     if !socket.may_recv() {
+                        self.general.consume_pending_error()?;
                         Ok(0)
                     } else if socket.recv_queue() == 0 {
                         Err(AxError::WouldBlock)
@@ -793,7 +830,9 @@ impl Drop for TcpSocket {
         }
         // close(2) releases the descriptor, not the transport's queued bytes.
         // Keep TCP alive in the bounded socket set until FIN/timers complete.
-        self.stack.socket_set.close_tcp(self.handle, crate::service::now());
+        self.stack
+            .socket_set
+            .close_tcp(self.handle, crate::service::now());
         self.stack.wake_protocol_worker();
         self.stack.poll_interfaces();
     }
@@ -828,6 +867,160 @@ mod tests {
     }
 
     #[test]
+    fn simultaneous_open_remains_pending_until_established() {
+        assert!(connect_handshake_pending(smol::State::SynSent));
+        assert!(connect_handshake_pending(smol::State::SynReceived));
+        assert!(!connect_handshake_pending(smol::State::Established));
+        assert!(!connect_handshake_pending(smol::State::Closed));
+    }
+
+    #[test]
+    fn tcp_reuse_requires_both_binders_and_does_not_bypass_listener() {
+        for (first_reuse, second_reuse) in [(false, true), (true, false), (true, true)] {
+            let stack = NetStack::new_loopback_only();
+            let first = TcpSocket::new(stack.clone()).unwrap();
+            let second = TcpSocket::new(stack).unwrap();
+            let address = SocketAddrEx::Ip(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 32490));
+            first
+                .set_option(SetSocketOption::ReuseAddress(&first_reuse))
+                .unwrap();
+            second
+                .set_option(SetSocketOption::ReuseAddress(&second_reuse))
+                .unwrap();
+            first.bind(address.clone()).unwrap();
+            assert_eq!(
+                second.bind(address.clone()),
+                if first_reuse && second_reuse {
+                    Ok(())
+                } else {
+                    Err(AxError::AddrInUse)
+                }
+            );
+        }
+        let stack = NetStack::new_loopback_only();
+        let first = TcpSocket::new(stack.clone()).unwrap();
+        let second = TcpSocket::new(stack).unwrap();
+        let address = SocketAddrEx::Ip(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 32491));
+        first
+            .set_option(SetSocketOption::ReuseAddress(&true))
+            .unwrap();
+        second
+            .set_option(SetSocketOption::ReuseAddress(&true))
+            .unwrap();
+        first.bind(address.clone()).unwrap();
+        first.listen(1).unwrap();
+        assert_eq!(second.bind(address), Err(AxError::AddrInUse));
+    }
+
+    fn connected_pair_for_reset() -> (Arc<NetStack>, TcpSocket, TcpSocket) {
+        let stack = NetStack::new_loopback_only();
+        let listener = TcpSocket::new(stack.clone()).unwrap();
+        listener
+            .bind(SocketAddrEx::Ip(SocketAddr::new(
+                Ipv4Addr::LOCALHOST.into(),
+                32492,
+            )))
+            .unwrap();
+        listener.listen(1).unwrap();
+        listener
+            .set_option(SetSocketOption::NonBlocking(&true))
+            .unwrap();
+        let client = TcpSocket::new(stack.clone()).unwrap();
+        client
+            .set_option(SetSocketOption::NonBlocking(&true))
+            .unwrap();
+        client.with_service_and_smol_socket(|service, socket| {
+            socket
+                .connect(
+                    service.iface.context(),
+                    (smoltcp::wire::Ipv4Address::LOCALHOST, 32492),
+                    (smoltcp::wire::Ipv4Address::LOCALHOST, 32493),
+                )
+                .unwrap();
+        });
+        client.state.set(State::Connecting);
+        for _ in 0..16 {
+            stack.poll_interfaces();
+        }
+        assert!(client.poll_connect().contains(IoEvents::WRITABLE));
+        assert_eq!(client.state(), State::Connected);
+        let Socket::Tcp(server) = listener.accept().unwrap() else {
+            panic!("TCP expected")
+        };
+        (stack, client, server)
+    }
+
+    #[test]
+    fn tcp_reset_is_one_shot_error_after_buffered_receive_data() {
+        let (stack, client, server) = connected_pair_for_reset();
+        assert_eq!(server.send(&b"queued"[..], SendOptions::default()), Ok(6));
+        for _ in 0..16 {
+            stack.poll_interfaces();
+        }
+        server.with_smol_socket(|socket| socket.abort());
+        for _ in 0..16 {
+            stack.poll_interfaces();
+        }
+        assert!(client.poll().contains(IoEvents::ERROR));
+        let mut data = [0; 6];
+        assert_eq!(client.recv(&mut data[..], RecvOptions::default()), Ok(6));
+        assert_eq!(&data, b"queued");
+        assert_eq!(
+            client.recv(&mut data[..], RecvOptions::default()),
+            Err(AxError::ConnectionReset)
+        );
+        assert_eq!(client.recv(&mut data[..], RecvOptions::default()), Ok(0));
+        assert_eq!(
+            client.send(&b"x"[..], SendOptions::default()),
+            Err(AxError::BrokenPipe)
+        );
+    }
+
+    #[test]
+    fn tcp_reset_is_reported_and_consumed_by_so_error() {
+        let (stack, client, server) = connected_pair_for_reset();
+        server.with_smol_socket(|socket| socket.abort());
+        for _ in 0..16 {
+            stack.poll_interfaces();
+        }
+        let mut error = None;
+        assert!(
+            client
+                .get_option_inner(&mut GetSocketOption::Error(&mut error))
+                .unwrap()
+        );
+        assert_eq!(error, Some(SocketFault::ConnectionReset));
+        client
+            .get_option_inner(&mut GetSocketOption::Error(&mut error))
+            .unwrap();
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn repeated_connect_reports_already_in_progress() {
+        let stack = NetStack::new_loopback_only();
+        let client = TcpSocket::new(stack).unwrap();
+        client.with_service_and_smol_socket(|service, socket| {
+            socket
+                .connect(
+                    service.iface.context(),
+                    (smoltcp::wire::Ipv4Address::new(192, 0, 2, 1), 80),
+                    (smoltcp::wire::Ipv4Address::LOCALHOST, 32494),
+                )
+                .unwrap();
+        });
+        client.state.set(State::Connecting);
+        assert_eq!(
+            client.connect(SocketAddrEx::Ip(SocketAddr::new(
+                Ipv4Addr::new(192, 0, 2, 1).into(),
+                80
+            ))),
+            Err(LinuxError::EALREADY.into())
+        );
+        assert_eq!(client.state(), State::Connecting);
+    }
+
+    #[test]
     fn replacement_changes_tcp_storage_capacity() {
         let mut socket = new_tcp_socket().unwrap();
 
@@ -847,35 +1040,55 @@ mod tests {
         let address = SocketAddrEx::Ip(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 32481));
         listener.bind(address.clone()).unwrap();
         listener.listen(1).unwrap();
-        listener.set_option(SetSocketOption::NonBlocking(&true)).unwrap();
+        listener
+            .set_option(SetSocketOption::NonBlocking(&true))
+            .unwrap();
         let client = TcpSocket::new(stack.clone()).unwrap();
-        client.set_option(SetSocketOption::NonBlocking(&true)).unwrap();
+        client
+            .set_option(SetSocketOption::NonBlocking(&true))
+            .unwrap();
         client.with_service_and_smol_socket(|service, socket| {
-            socket.connect(service.iface.context(),
-                (smoltcp::wire::Ipv4Address::LOCALHOST, 32481),
-                (smoltcp::wire::Ipv4Address::LOCALHOST, 32482)).unwrap();
+            socket
+                .connect(
+                    service.iface.context(),
+                    (smoltcp::wire::Ipv4Address::LOCALHOST, 32481),
+                    (smoltcp::wire::Ipv4Address::LOCALHOST, 32482),
+                )
+                .unwrap();
         });
         for _ in 0..16 {
             stack.poll_interfaces();
         }
-        let Socket::Tcp(sender) = listener.accept().unwrap() else { panic!("expected TCP") };
+        let Socket::Tcp(sender) = listener.accept().unwrap() else {
+            panic!("expected TCP")
+        };
         let handle = sender.handle;
         sender.with_smol_socket(|socket| socket.set_timeout(Some(Duration::from_secs(3))));
         drop(sender);
         assert!(stack.socket_set.closing_tcp_deadline().is_some());
-        stack.socket_set.with_socket::<smol::Socket, _, _>(handle, |socket| {
-            assert_eq!(socket.timeout(), Some(Duration::from_secs(3)));
-            assert_ne!(socket.state(), smol::State::Closed);
-        });
+        stack
+            .socket_set
+            .with_socket::<smol::Socket, _, _>(handle, |socket| {
+                assert_eq!(socket.timeout(), Some(Duration::from_secs(3)));
+                assert_ne!(socket.state(), smol::State::Closed);
+            });
         let after_timeout = crate::service::now() + Duration::from_secs(4);
         let mut sockets = stack.socket_set.inner.lock();
-        assert!(stack.socket_set.reap_closed_tcp(&mut sockets, after_timeout));
+        assert!(
+            stack
+                .socket_set
+                .reap_closed_tcp(&mut sockets, after_timeout)
+        );
         let orphan = sockets.get::<smol::Socket>(handle);
         assert_eq!(orphan.state(), smol::State::Closed);
         assert!(orphan.remote_endpoint().is_some());
         // Simulate the following service pass having no TX capacity for RST.
         // An expired owner still has a finite lifetime and no stale deadline.
-        assert!(!stack.socket_set.reap_closed_tcp(&mut sockets, after_timeout));
+        assert!(
+            !stack
+                .socket_set
+                .reap_closed_tcp(&mut sockets, after_timeout)
+        );
         assert!(sockets.iter().all(|(id, _)| id != handle));
         drop(sockets);
         assert!(stack.socket_set.closing_tcp_deadline().is_none());

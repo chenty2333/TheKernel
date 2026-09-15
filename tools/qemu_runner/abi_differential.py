@@ -23,6 +23,7 @@ COMPLETE_MARKER = "THEKERNEL_ABI_EXIT_ZERO"
 # Explicit expectations prevent an accidentally deleted guest assertion from
 # reducing acceptance coverage. Keep these aligned with tests/guest/portable.
 CONTRACTS = {
+    "tty-job-control": ("portable-differential", "pass", "AUTO_CTTY_NOCTTY SIGTTIN_SIGTTOU PTPEER_PACKET_HANGUP"),
     "tty-termios": ("portable-differential", "pass", "PYREPL_PREPARE_RESTORE CBREAK_SIGINT_FLUSH NOFLSH_PRESERVES_INPUT RAW_ESCAPE_CR_BYTES WINSIZE_SIGWINCH_NOOP"),
     "unix-write-credentials": ("raw-differential", "pass", "UNIX_SOCKET_IDENTITY PEER_PID_EFFECTIVE_IDS WRITE_SENDER_PID_REAL_IDS WRITEV_SENDER_PID_REAL_IDS SENDMSG_SENDER_PID_REAL_IDS CHILD_EXIT_CLEAN REAL_EFFECTIVE_IDS RIGHTS_RECEIVER_LIFETIME"),
     "eventfd": ("portable-differential", "pass", "LEGACY_FLAGS IO_ERRNO_STATE COUNTER_POLL SEMAPHORE CLOEXEC_TEARDOWN"),
@@ -94,6 +95,7 @@ CONTRACTS.update({
     "sched_get_priority_min": ("raw-differential", "pass", "ext-priority-min"),
 })
 PROGRAM_CASES = {
+    "tty-job-control": ("tty-job-control",),
     "tty-termios": ("tty-termios",),
     "unix-write-credentials": ("unix-write-credentials",),
     "scheduler-basic": ('sched_getaffinity', 'sched_setaffinity', 'getcpu', 'sched_setparam', 'sched_setscheduler', 'sched_get_priority_max', 'sched_get_priority_min'),
@@ -108,6 +110,7 @@ PROGRAM_CASES = {
 }
 PROGRAMS = tuple(PROGRAM_CASES)
 PROGRAM_SUCCESS = {
+    "tty-job-control": "THEKERNEL_TTY_JOB_CONTROL_OK",
     "tty-termios": "THEKERNEL_TTY_TERMIOS_OK",
     "unix-write-credentials": "THEKERNEL_UNIX_WRITE_CREDENTIALS_OK",
     "scheduler-basic": "THEKERNEL_SCHEDULER_BASIC_DIFFERENTIAL_OK",

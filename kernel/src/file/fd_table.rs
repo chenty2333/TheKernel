@@ -14,7 +14,6 @@ use tk_linux_fd::{
     FdTableError, PreparedCloseOnExec as LinuxPreparedCloseOnExec,
     PreparedPublication as LinuxPreparedPublication, ReservationToken,
 };
-use tk_linux_process_adapter::Pid;
 
 use super::{
     desc::{
@@ -468,17 +467,8 @@ impl FdTable {
             .mark_close_on_exec_range(FdNumber::new(first), FdNumber::new(last));
     }
 
-    fn finish_close_for_process(&self, removed: &FileDescriptor, pid: Pid) {
-        release_posix_locks_on_close_for_process(&removed.description, pid);
-        removed.description.descriptor_closed();
-        // A close, exec-close, and table teardown all converge here. Run the
-        // Unix SCM mark/sweep after removing the descriptor root so queued
-        // Socket/Epoll SCCs cannot survive solely by their ancillary edges.
-        crate::syscall::collect_scm_rights_cycles();
-    }
-
     fn finish_close(&self, removed: &FileDescriptor) {
-        release_posix_locks_on_close(&removed.description);
+        release_posix_locks_on_close(&removed.description, self.id);
         removed.description.descriptor_closed();
         crate::syscall::collect_scm_rights_cycles();
     }
@@ -498,27 +488,6 @@ impl FdTable {
         Ok(removed)
     }
 
-    /// Table-bound close for a retained asynchronous actor.  Unlike
-    /// `close_file_like`, this never samples the worker task's files table or
-    /// POSIX-lock owner.
-    pub(crate) fn close_for_process(&self, fd: c_int, pid: Pid) -> AxResult<FileDescriptor> {
-        let fd = fd_number(fd)?;
-        let (entry, dnotify) = {
-            let mut entries = self.entries.write();
-            let entry = entries.close(fd).map_err(map_fd_table_error)?;
-            let dnotify = crate::file::dnotify::detach_watch(self.id, entry.description().id());
-            (entry, dnotify)
-        };
-        drop(dnotify);
-        let (description, _) = entry.into_parts();
-        let removed = FileDescriptor { description };
-        self.finish_close_for_process(&removed, pid);
-        Ok(removed)
-    }
-
-    /// Closes only the exact OFD still occupying `fd`. This is used to roll
-    /// back post-publication initialization without ever closing a numeric fd
-    /// that a sibling has already reused.
     pub(crate) fn close_if_same(
         &self,
         fd: c_int,
@@ -755,6 +724,9 @@ impl PreparedCloexec {
 
 impl Drop for FdTable {
     fn drop(&mut self) {
+        // Also cover unpublished/test tables with no task slot. Drop the
+        // files_struct lock ownership before any final close notifications.
+        flock::release_posix_owner(self.id);
         let entries = self.entries.get_mut();
         for fd in 0..AX_FILE_LIMIT {
             if let Ok(entry) = entries.close(FdNumber::new(fd as u32)) {
@@ -927,20 +899,9 @@ pub(crate) fn prepare_file_description_with_open_lease(
     )
 }
 
-pub(crate) fn release_posix_locks_on_close(description: &FileDescription) {
-    // Descriptions without inode metadata cannot own POSIX inode locks.
-    // Resolve the process only after establishing that there is an inode.
+fn release_posix_locks_on_close(description: &FileDescription, files: FdTableId) {
     if let Ok(stat) = description.inner.stat() {
-        flock::release_posix_owner_on_inode(
-            current().as_thread().proc_data.proc.pid(),
-            (stat.dev, stat.ino),
-        );
-    }
-}
-
-pub(crate) fn release_posix_locks_on_close_for_process(description: &FileDescription, pid: Pid) {
-    if let Ok(stat) = description.inner.stat() {
-        flock::release_posix_owner_on_inode(pid, (stat.dev, stat.ino));
+        flock::release_posix_owner_on_inode(files, (stat.dev, stat.ino));
     }
 }
 
@@ -956,22 +917,6 @@ pub fn close_file_like(fd: c_int) -> AxResult {
 
 pub(crate) fn close_fd_table(table: &FdTable) -> AxResult<CloseBatch> {
     table.close_all()
-}
-
-/// Releases process-owned record locks before dropping this process's
-/// `files_struct` reference. Dropping the final reference can publish deferred
-/// close notifications, so callers must not drain that work until this returns.
-fn release_process_fd_table_with(
-    pid: Pid,
-    fd_table: Arc<FdTable>,
-    release_locks: impl FnOnce(Pid),
-) {
-    release_locks(pid);
-    drop(fd_table);
-}
-
-pub(crate) fn release_process_fd_table(pid: Pid, fd_table: Arc<FdTable>) {
-    release_process_fd_table_with(pid, fd_table, flock::release_posix_owner);
 }
 
 #[cfg(test)]
@@ -995,7 +940,7 @@ mod tests {
     }
 
     struct LockOrderFile {
-        locks_released: Arc<AtomicBool>,
+        lock_inode: (u64, u64),
         locks_released_before_drop: Arc<AtomicBool>,
     }
 
@@ -1023,8 +968,25 @@ mod tests {
 
     impl Drop for LockOrderFile {
         fn drop(&mut self) {
-            self.locks_released_before_drop
-                .store(self.locks_released.load(Ordering::SeqCst), Ordering::SeqCst);
+            let mut query = linux_raw_sys::general::flock64 {
+                l_type: linux_raw_sys::general::F_WRLCK as _,
+                l_whence: 0,
+                l_start: 0,
+                l_len: 0,
+                l_pid: 0,
+            };
+            flock::get_record_lock(
+                self.lock_inode,
+                flock::RecordLockOwner::Ofd(u64::MAX),
+                0,
+                0,
+                &mut query,
+            )
+            .unwrap();
+            self.locks_released_before_drop.store(
+                query.l_type == linux_raw_sys::general::F_UNLCK as i16,
+                Ordering::SeqCst,
+            );
         }
     }
 
@@ -1074,7 +1036,11 @@ mod tests {
 
     impl FileLike for LockOrderFile {
         fn stat(&self) -> AxResult<crate::file::Kstat> {
-            Err(AxError::InvalidInput)
+            Ok(crate::file::Kstat {
+                dev: self.lock_inode.0,
+                ino: self.lock_inode.1,
+                ..Default::default()
+            })
         }
 
         fn path(&self) -> AxResult<Cow<'_, axfs_ng_vfs::FsPath>> {
@@ -1155,25 +1121,104 @@ mod tests {
     }
 
     #[test]
-    fn process_locks_are_released_before_fd_table_drop() {
-        const EXITING_PID: Pid = 0x7fff_ff00;
-
-        let locks_released = Arc::new(AtomicBool::new(false));
-        let locks_released_before_drop = Arc::new(AtomicBool::new(false));
+    fn files_locks_are_released_before_fd_table_drop() {
+        let _context = crate::test_support::scheduler_test_context();
+        let inode = (u64::MAX - 400, 1);
+        let released = Arc::new(AtomicBool::new(false));
         let table = Arc::new(FdTable::new().unwrap());
         let description = FileDescription::new(Arc::new(LockOrderFile {
-            locks_released: locks_released.clone(),
-            locks_released_before_drop: locks_released_before_drop.clone(),
+            lock_inode: inode,
+            locks_released_before_drop: released.clone(),
         }))
         .unwrap();
         table.add_at_least(description, 0, 1, false).unwrap();
+        let request = linux_raw_sys::general::flock64 {
+            l_type: linux_raw_sys::general::F_WRLCK as _,
+            l_whence: 0,
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+        };
+        flock::set_record_lock(
+            inode,
+            flock::RecordLockOwner::Posix(table.id()),
+            77,
+            0,
+            0,
+            &request,
+            false,
+        )
+        .unwrap();
+        drop(table);
+        assert!(released.load(Ordering::SeqCst));
+    }
 
-        release_process_fd_table_with(EXITING_PID, table, |pid| {
-            assert_eq!(pid, EXITING_PID);
-            locks_released.store(true, Ordering::SeqCst);
-        });
-
-        assert!(locks_released_before_drop.load(Ordering::SeqCst));
+    #[test]
+    fn close_uses_the_exact_files_table_not_the_current_tgid() {
+        use linux_raw_sys::general::{F_RDLCK, F_UNLCK, F_WRLCK, flock64};
+        let _context = crate::test_support::scheduler_test_context();
+        let inode = (u64::MAX - 1201, 1);
+        let table = Arc::new(FdTable::new().unwrap());
+        let description = FileDescription::new(Arc::new(LockOrderFile {
+            lock_inode: inode,
+            locks_released_before_drop: Arc::new(AtomicBool::new(false)),
+        }))
+        .unwrap();
+        let fd = table.add_at_least(description, 0, 1, false).unwrap();
+        let forked = table.fork_copy().unwrap();
+        let request = flock64 {
+            l_type: F_RDLCK as _,
+            l_whence: 0,
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+        };
+        flock::set_record_lock(
+            inode,
+            flock::RecordLockOwner::Posix(table.id()),
+            101,
+            0,
+            0,
+            &request,
+            false,
+        )
+        .unwrap();
+        flock::set_record_lock(
+            inode,
+            flock::RecordLockOwner::Posix(forked.id()),
+            202,
+            0,
+            0,
+            &request,
+            false,
+        )
+        .unwrap();
+        let peer = table.clone();
+        drop(peer.close(fd).unwrap());
+        let mut query = flock64 {
+            l_type: F_WRLCK as _,
+            ..request
+        };
+        flock::get_record_lock(
+            inode,
+            flock::RecordLockOwner::Ofd(u64::MAX),
+            0,
+            0,
+            &mut query,
+        )
+        .unwrap();
+        assert_eq!(query.l_pid, 202);
+        drop(forked.close(fd).unwrap());
+        query.l_type = F_WRLCK as _;
+        flock::get_record_lock(
+            inode,
+            flock::RecordLockOwner::Ofd(u64::MAX),
+            0,
+            0,
+            &mut query,
+        )
+        .unwrap();
+        assert_eq!(query.l_type, F_UNLCK as i16);
     }
 
     #[test]

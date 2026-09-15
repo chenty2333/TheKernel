@@ -52,7 +52,7 @@ use crate::{
             check_pathwalk_search_permission_with_vfs_security, check_writable_mount,
             initial_named_create_owner_mode_with_security_at,
         },
-        pipe::NamedPipe,
+        pipe::{NamedPipe, PipeEndpoint},
         prepare_file_description_with_open_lease, reserve_fd_in, resolve_at, with_path_fs,
     },
     mm::{UserMemoryCapability, map_usercopy_error},
@@ -786,11 +786,9 @@ fn prepare_open_description(
                         let inner = device.inner().as_any();
                         if let Some(ptmx) = inner.downcast_ref::<tty::Ptmx>() {
                             // Opening /dev/ptmx creates a new pseudo-terminal
-                            let (master, master_tty, pty_number) = ptmx.create_pty(file.location())?;
-                            let pts = file
-                                .location()
-                                .parent()
-                                .ok_or(AxError::NotFound)?;
+                            let (master, master_tty, pty_number) =
+                                ptmx.create_pty(file.location())?;
+                            let pts = file.location().parent().ok_or(AxError::NotFound)?;
                             let pty_name =
                                 FsNameBuf::from_vec(try_pty_name(pty_number)?.into_bytes())
                                     .map_err(AxError::from)?;
@@ -1338,6 +1336,28 @@ fn open_resolved_location_with_policy(
     security: &OpenPathSecurityContext,
     fd_snapshot: &OpenFdSnapshot,
 ) -> AxResult<isize> {
+    open_resolved_location_with_policy_inner(
+        path,
+        loc,
+        created,
+        flags,
+        mode,
+        security,
+        fd_snapshot,
+        true,
+    )
+}
+
+fn open_resolved_location_with_policy_inner(
+    path: &FsPath,
+    loc: Location,
+    created: bool,
+    flags: i32,
+    mode: __kernel_mode_t,
+    security: &OpenPathSecurityContext,
+    fd_snapshot: &OpenFdSnapshot,
+    check_dac: bool,
+) -> AxResult<isize> {
     let credentials = security.credentials();
     let uid = credentials.uid().into_raw();
     let gid = credentials.gid().into_raw();
@@ -1374,11 +1394,13 @@ fn open_resolved_location_with_policy(
             return Err(AxError::IsADirectory);
         }
         if opened_existing {
-            check_open_permissions_with_vfs_security(
-                &loc,
-                open_access_mask(flags),
-                security.vfs_security(),
-            )?;
+            if check_dac {
+                check_open_permissions_with_vfs_security(
+                    &loc,
+                    open_access_mask(flags),
+                    security.vfs_security(),
+                )?;
+            }
             if open_requires_writable_mount(flags) {
                 check_writable_mount(&loc)?;
             }
@@ -1513,6 +1535,42 @@ fn open_resolved_location_with_policy(
     }
 
     Ok(fd)
+}
+
+/// TIOCGPTPEER holds the exact peer inode, so it needs no pathname walk or
+/// DAC recheck (Linux dentry_open). All file-open hooks, mount checks and OFD
+/// publication still use the ordinary open transaction.
+pub(crate) fn open_pty_peer(
+    context: &crate::file::IoctlContext,
+    loc: Location,
+    flags: u32,
+) -> AxResult<usize> {
+    let thread = context.caller_task().as_thread();
+    let snapshot = thread.namespace_credential_fs_snapshot();
+    let security = OpenPathSecurityContext::with_execution_actor(
+        context.caller_cred().clone(),
+        snapshot.fs_context.lock().umask(),
+        snapshot.mount_topology,
+        snapshot.landlock_domain,
+        snapshot.controlling_terminal,
+        crate::file::fanotify::FanotifyEventActor::current(),
+    );
+    let limit = context.caller_process().rlim.read()[RLIMIT_NOFILE].current as usize;
+    let files = OpenFdSnapshot::new(context.files().clone(), limit);
+    // dentry_open ignores creation/truncation requests: the exact peer already
+    // exists and is a character device. Keep descriptor/status flags intact.
+    let flags = flags & !(O_CREAT | O_EXCL | O_TRUNC);
+    open_resolved_location_with_policy_inner(
+        FsPath::new(b"pty-peer"),
+        loc,
+        false,
+        flags as i32,
+        0,
+        &security,
+        &files,
+        false,
+    )
+    .map(|fd| fd as usize)
 }
 
 /// Open or create a file.
@@ -2168,11 +2226,12 @@ pub fn sys_fcntl(
             let current_offset = record_lock_current_offset(&description, &lock)?;
             let owner = match cmd {
                 F_OFD_SETLK | F_OFD_SETLKW => RecordLockOwner::Ofd(description.flock_owner()),
-                _ => RecordLockOwner::Posix(current().as_thread().proc_data.proc.pid()),
+                _ => RecordLockOwner::Posix(current_fd_table().id()),
             };
             flock::set_record_lock(
                 (stat.dev, stat.ino),
                 owner,
+                current().as_thread().proc_data.proc.pid(),
                 stat.size,
                 current_offset,
                 &lock,
@@ -2193,7 +2252,7 @@ pub fn sys_fcntl(
             let owner = if cmd == F_OFD_GETLK {
                 RecordLockOwner::Ofd(description.flock_owner())
             } else {
-                RecordLockOwner::Posix(current().as_thread().proc_data.proc.pid())
+                RecordLockOwner::Posix(current_fd_table().id())
             };
             flock::get_record_lock(
                 (stat.dev, stat.ino),
@@ -2358,6 +2417,11 @@ pub fn sys_fcntl(
             description.transition_status_flags(
                 |old| (old.raw() & !FCNTL_SETFL_MUTABLE_FLAGS) | requested,
                 |old, new| {
+                    if new.raw() & O_DIRECT != 0
+                        && PipeEndpoint::from_file(&*description.inner).is_some()
+                    {
+                        return Err(AxError::OperationNotSupported);
+                    }
                     if old.nonblocking() != new.nonblocking() {
                         description.inner.set_nonblocking(new.nonblocking())?;
                     }
@@ -2381,11 +2445,13 @@ pub fn sys_fcntl(
             Ok(0)
         }
         F_GETPIPE_SZ => {
-            let pipe = Pipe::from_fd(fd)?;
+            let file = get_file_like(fd)?;
+            let pipe = PipeEndpoint::from_file(&*file).ok_or(AxError::BadFileDescriptor)?;
             Ok(pipe.capacity() as _)
         }
         F_SETPIPE_SZ => {
-            let pipe = Pipe::from_fd(fd)?;
+            let file = get_file_like(fd)?;
+            let pipe = PipeEndpoint::from_file(&*file).ok_or(AxError::BadFileDescriptor)?;
             Ok(pipe.resize(arg)? as _)
         }
         F_ADD_SEALS => {

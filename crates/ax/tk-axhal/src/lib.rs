@@ -599,6 +599,15 @@ pub mod console {
     #[cfg(feature = "irq")]
     pub use axplat::console::irq_num;
     pub use axplat::console::{read_bytes, write_bytes};
+
+    /// Byte-exact terminal transport, distinct from formatted kernel logging.
+    pub fn write_tty_bytes(bytes: &[u8]) {
+        #[cfg(all(target_os = "none", feature = "defplat"))]
+        axplat_x86_pc::write_tty_bytes(bytes);
+        #[cfg(not(all(target_os = "none", feature = "defplat")))]
+        axplat::console::write_bytes(bytes);
+    }
+
 }
 
 /// CPU power management.
@@ -606,6 +615,22 @@ pub mod power {
     #[cfg(feature = "smp")]
     pub use axplat::power::cpu_boot;
     pub use axplat::power::system_off;
+
+    /// Restart the supported x86 default platform.
+    pub fn system_reset() -> ! {
+        #[cfg(all(target_os = "none", feature = "defplat"))]
+        axplat_x86_pc::system_reset();
+        #[cfg(not(all(target_os = "none", feature = "defplat")))]
+        panic!("system reset requires the x86 default platform");
+    }
+
+    /// Halt without requesting either reset or power removal.
+    pub fn system_halt() -> ! {
+        axcpu::asm::disable_irqs();
+        loop {
+            axcpu::asm::halt();
+        }
+    }
 }
 
 /// Terminal x86_64 kexec platform operations.

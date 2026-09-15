@@ -1025,7 +1025,7 @@ pub fn sys_connect(
         _ => socket.connect(addr.clone()),
     };
     result.map_err(|error| {
-        if error == AxError::WouldBlock {
+        if error == AxError::WouldBlock && !matches!(&socket.inner, SocketInner::Unix(_)) {
             AxError::InProgress
         } else {
             map_connect_error(&socket.inner, error)

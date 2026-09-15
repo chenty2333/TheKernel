@@ -41,8 +41,8 @@ use crate::mm::asid_switch_diagnostics_snapshot;
 use crate::mm::{MmLockStage, mm_lock_diagnostics_snapshot};
 use crate::{
     file::{
-        FileDescription, PidFd, current_file_operation_security_credential, fanotify::FanotifyFile,
-        inotify::InotifyFile, lease, pipe, try_path_into_owned,
+        Directory, File, FileDescription, PidFd, current_file_operation_security_credential,
+        fanotify::FanotifyFile, inotify::InotifyFile, lease, pipe, try_path_into_owned,
     },
     keyring::{
         KeyUserRecord, key_maxbytes, key_maxkeys, key_root_maxbytes, key_root_maxkeys,
@@ -2119,17 +2119,68 @@ fn render_task_limits(task: &AxTaskRef) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn render_task_maps(aspace_handle: &Arc<Mutex<AddrSpace>>, include_smaps: bool) -> String {
-    let aspace = aspace_handle.lock();
-    let mut out = String::new();
-
-    for area in aspace.areas() {
-        if !area.flags().contains(MappingFlags::USER) {
-            continue;
+fn render_task_maps(
+    aspace_handle: &Arc<Mutex<AddrSpace>>,
+    layout: &crate::task::ProcessMmLayout,
+    include_smaps: bool,
+) -> VfsResult<String> {
+    // Only snapshot VMA/PTE data under the mm lock. Filesystem metadata and
+    // pathname resolution can block and must never retain that lock.
+    let rows = {
+        let aspace = aspace_handle.lock();
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(aspace.areas().count())
+            .map_err(|_| VfsError::NoMemory)?;
+        for area in aspace.areas() {
+            if !area.flags().contains(MappingFlags::USER) {
+                continue;
+            }
+            let file = area
+                .backend()
+                .file_mapping()
+                .and_then(|lease| {
+                    Some((
+                        lease.file().inner().location(),
+                        lease.file_offset_at(area.start())?,
+                    ))
+                })
+                .or_else(|| match area.backend() {
+                    // ELF image mappings can originate before a userspace OFD exists.
+                    Backend::Cow(backend) => backend.proc_file_mapping(area.start()),
+                    Backend::File(backend) => backend.proc_file_mapping(area.start()),
+                    _ => None,
+                });
+            let file = file.map(|(location, offset)| (location.clone(), offset));
+            let (resident_bytes, locked_bytes) = if include_smaps {
+                let page_size = area.backend().page_size() as usize;
+                let mut resident_bytes = 0;
+                let mut cursor = area.start();
+                while cursor < area.end() {
+                    let step = page_size.min(area.end().sub_addr(cursor));
+                    if aspace.page_table().query_mapped(cursor).is_ok() {
+                        resident_bytes += step;
+                    }
+                    cursor += page_size;
+                }
+                let locked_bytes = aspace.locked_bytes_in_range(area.start(), area.size());
+                (resident_bytes, locked_bytes)
+            } else {
+                (0, 0)
+            };
+            rows.push((
+                area.start().as_usize(),
+                area.end().as_usize(),
+                area.flags(),
+                is_shared_user_mapping(area.backend()),
+                file,
+                resident_bytes,
+                locked_bytes,
+            ));
         }
-        let start = area.start().as_usize();
-        let end = start + area.size();
-        let flags = area.flags();
+        rows
+    };
+    let mut out = String::new();
+    for (start, end, flags, shared, file, resident_bytes, locked_bytes) in rows {
         let r = if flags.contains(MappingFlags::READ) {
             'r'
         } else {
@@ -2145,37 +2196,50 @@ fn render_task_maps(aspace_handle: &Arc<Mutex<AddrSpace>>, include_smaps: bool) 
         } else {
             '-'
         };
-        let shared = is_shared_user_mapping(area.backend());
         let p = if shared { 's' } else { 'p' };
-        let name = match area.backend() {
-            Backend::Shared(_) => " [shared]",
-            Backend::Linear(_) => "",
-            Backend::Cow(_) | Backend::File(_) => "",
+        let (offset, dev, inode, name) = if let Some((location, offset)) = file {
+            let dev = DeviceId(location.mountpoint().device());
+            let inode = location.entry().inode();
+            let mut name = location
+                .absolute_path()
+                .map(|path| String::from_utf8_lossy(path.as_bytes()).into_owned())
+                .unwrap_or_default();
+            // A maps line is one record even when an inode name contains LF.
+            name = name.replace('\n', "\\012");
+            if location
+                .metadata()
+                .is_ok_and(|metadata| metadata.nlink == 0)
+            {
+                name.push_str(" (deleted)");
+            }
+            (offset, dev, inode, name)
+        } else {
+            let name = if start <= layout.start_stack && layout.start_stack < end {
+                "[stack]"
+            } else if start < layout.brk && end > layout.start_brk {
+                "[heap]"
+            } else {
+                ""
+            };
+            (0, DeviceId(0), 0, String::from(name))
         };
         let _ = writeln!(
             out,
-            "{start:08x}-{end:08x} {r}{w}{x}{p} 00000000 00:00 0{name:>10}",
+            "{start:08x}-{end:08x} {r}{w}{x}{p} {offset:08x} {:02x}:{:02x} {inode}{}{}",
+            dev.major(),
+            dev.minor(),
+            if name.is_empty() { "" } else { " " },
+            name
         );
 
         if include_smaps {
-            let page_size = area.backend().page_size() as usize;
-            let mut resident_bytes = 0;
-            let mut cursor = area.start();
-            while cursor < area.end() {
-                let step = page_size.min(area.end().sub_addr(cursor));
-                if aspace.page_table().query_mapped(cursor).is_ok() {
-                    resident_bytes += step;
-                }
-                cursor += page_size;
-            }
-            let locked_bytes = aspace.locked_bytes_in_range(area.start(), area.size());
-            let _ = writeln!(out, "Size:           {:>8} kB", area.size() / 1024);
+            let _ = writeln!(out, "Size:           {:>8} kB", (end - start) / 1024);
             let _ = writeln!(out, "Rss:            {:>8} kB", resident_bytes / 1024);
             let _ = writeln!(out, "Locked:         {:>8} kB", locked_bytes / 1024);
         }
     }
 
-    out
+    Ok(out)
 }
 
 fn mempolicy_effective_mask(policy: Mempolicy) -> usize {
@@ -2305,8 +2369,24 @@ impl SimpleFileOps for PreparedFdMagicLink {
             .get_description_number(self.fd)
             .map_err(|_| VfsError::NotFound)?;
         let target: FsPathBuf = try_path_into_owned(description.inner.path()?)?;
+        let deleted = description
+            .inner
+            .downcast_ref::<File>()
+            .is_some_and(|file| {
+                file.inner()
+                    .location()
+                    .metadata()
+                    .is_ok_and(|metadata| metadata.nlink == 0)
+            });
+        let mut bytes = target.into_vec();
+        if deleted {
+            bytes
+                .try_reserve(b" (deleted)".len())
+                .map_err(|_| VfsError::NoMemory)?;
+            bytes.extend_from_slice(b" (deleted)");
+        }
         validate_proc_fd_image(&task, &authorized_image)?;
-        Ok(Cow::Owned(target.as_bytes().to_vec()))
+        Ok(Cow::Owned(bytes))
     }
 
     fn write_all(&self, _data: &[u8]) -> VfsResult<()> {
@@ -2390,8 +2470,15 @@ impl ThreadFdInfoDir {
     fn render_fdinfo(description: &FileDescription) -> String {
         let stat = description.inner.stat().ok();
         let mnt_id = stat.map_or(0, |stat| stat.mnt_id);
+        let position = if let Some(file) = description.inner.downcast_ref::<File>() {
+            file.inner().with_current_position(Ok).unwrap_or(0)
+        } else if let Some(dir) = description.inner.downcast_ref::<Directory>() {
+            *dir.offset.lock()
+        } else {
+            0
+        };
         let mut out = format!(
-            "pos:\t0\nflags:\t{:o}\nmnt_id:\t{}\n",
+            "pos:\t{position}\nflags:\t{:o}\nmnt_id:\t{}\n",
             description.status_flags(),
             mnt_id
         );
@@ -3117,6 +3204,8 @@ impl SimpleDirOps for ThreadDir {
                 Some(b"timens_offsets".as_slice()),
                 Some(b"comm".as_slice()),
                 Some(b"exe".as_slice()),
+                Some(b"cwd".as_slice()),
+                Some(b"root".as_slice()),
                 Some(b"fd".as_slice()),
                 Some(b"fdinfo".as_slice()),
                 Some(b"ns".as_slice()),
@@ -3183,7 +3272,7 @@ impl SimpleDirOps for ThreadDir {
                 fs,
                 RwFile::new_process_writable(move |req| match req {
                     SimpleFileOperation::Read => Ok(Some(
-                        task.as_thread().oom_score_adj().to_string().into_bytes(),
+                        format!("{}\n", task.as_thread().oom_score_adj()).into_bytes(),
                     )),
                     SimpleFileOperation::Write(data) => {
                         if !data.is_empty() {
@@ -3230,11 +3319,16 @@ impl SimpleDirOps for ThreadDir {
             .into(),
             b"maps" => {
                 let aspace = proc_image_access(&task, process_view)?.into_aspace();
-                SimpleFile::new_regular(fs, move || Ok(render_task_maps(&aspace, false))).into()
+                let layout = task.as_thread().proc_data.mm_layout();
+                validate_proc_fd_image(&task, &aspace)?;
+                SimpleFile::new_regular(fs, move || render_task_maps(&aspace, &layout, false))
+                    .into()
             }
             b"smaps" => {
                 let aspace = proc_image_access(&task, process_view)?.into_aspace();
-                SimpleFile::new_regular(fs, move || Ok(render_task_maps(&aspace, true))).into()
+                let layout = task.as_thread().proc_data.mm_layout();
+                validate_proc_fd_image(&task, &aspace)?;
+                SimpleFile::new_regular(fs, move || render_task_maps(&aspace, &layout, true)).into()
             }
             b"numa_maps" => {
                 let aspace = proc_image_access(&task, process_view)?.into_aspace();
@@ -3340,6 +3434,29 @@ impl SimpleDirOps for ThreadDir {
                 }),
             )
             .into(),
+            b"cwd" | b"root" => {
+                drop(proc_image_access(&task, process_view)?);
+                let root = name.as_bytes() == b"root";
+                SimpleFile::new_magic_link(fs, move || {
+                    let image = proc_fd_image_access(&task, process_view)?;
+                    let context = task
+                        .as_thread()
+                        .try_fs_context()
+                        .ok_or(VfsError::NotFound)?;
+                    let location = {
+                        let context = context.lock();
+                        if root {
+                            context.root_dir().clone()
+                        } else {
+                            context.current_dir().clone()
+                        }
+                    };
+                    let path = location.absolute_path()?.into_vec();
+                    validate_proc_fd_image(&task, &image)?;
+                    Ok(path)
+                })
+                .into()
+            }
             b"exe" => {
                 drop(proc_image_access(&task, process_view)?);
                 SimpleFile::new_magic_link(fs, move || {
@@ -3418,6 +3535,7 @@ impl SimpleDirOps for ProcFsHandler {
             )?));
         }
         names.push(Cow::Borrowed(FsName::new(b"self")));
+        names.push(Cow::Borrowed(FsName::new(b"thread-self")));
         names.push(Cow::Borrowed(FsName::new(b"bpf_stats")));
         try_boxed_names(names.into_iter())
     }
@@ -3425,6 +3543,21 @@ impl SimpleDirOps for ProcFsHandler {
     fn lookup_child(&self, name: &FsName) -> VfsResult<NodeOpsMux> {
         if name.as_bytes() == b"bpf_stats" {
             return ProcBpfStatsFile::try_new(self.0.clone()).map(Into::into);
+        }
+        if name.as_bytes() == b"thread-self" {
+            let pid_ns = self.1.clone();
+            return Ok(SimpleFile::new(self.0.clone(), NodeType::Symlink, move || {
+                let curr = current();
+                let thread = curr.as_thread();
+                let pid = pid_ns
+                    .visible_pid_checked(thread.proc_data.proc.pid())
+                    .ok_or(VfsError::NotFound)?;
+                let tid = pid_ns
+                    .visible_pid_checked(thread.kernel_tid())
+                    .ok_or(VfsError::NotFound)?;
+                Ok(format!("{pid}/task/{tid}"))
+            })
+            .into());
         }
         if name.as_bytes() == b"self" {
             let pid_ns = self.1.clone();
@@ -3967,10 +4100,8 @@ fn builder(fs: Arc<SimpleFs>, pid_ns: Arc<PidNamespace>) -> DirMaker {
                         fs.clone(),
                         NodePermission::from_bits_truncate(0o444),
                         || {
-                            Ok(
-                                format!("{}\n", tk_linux_cred::USER_NAMESPACE_OVERFLOW_ID)
-                                    .into_bytes(),
-                            )
+                            Ok(format!("{}\n", tk_linux_cred::USER_NAMESPACE_OVERFLOW_ID)
+                                .into_bytes())
                         },
                     ),
                 );

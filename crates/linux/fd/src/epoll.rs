@@ -332,6 +332,15 @@ impl ReadyQueue {
         (self.len != 0).then(|| self.items[self.head])
     }
 
+    fn replace(&mut self, old: EpollToken, new: EpollToken) {
+        for offset in 0..self.len {
+            let index = (self.head + offset) % self.capacity();
+            if self.items[index] == old {
+                self.items[index] = new;
+            }
+        }
+    }
+
     fn remove(&mut self, token: EpollToken) {
         if self.len == 0 {
             return;
@@ -565,20 +574,33 @@ impl<U, S> EpollCore<U, S> {
                 });
             }
         };
-        self.ready.remove(token);
         let Some(old) = self.entries[slot].take() else {
             return Err(EpollPublishError {
                 error: EpollError::StaleToken,
                 interest: replacement,
             });
         };
+        let new_token = EpollToken {
+            epoll: self.id,
+            slot,
+            generation,
+        };
+        // MOD changes the subscription generation, not its place in the ready
+        // list. Preserve an already queued edge with the replacement mask/data.
+        let ready = old.ready.deliverable(replacement.interest);
+        let queued = old.queued && !ready.is_empty();
+        if queued {
+            self.ready.replace(token, new_token);
+        } else {
+            self.ready.remove(token);
+        }
         self.entries[slot] = Some(Entry {
             generation,
             interest: replacement,
             enabled: true,
-            queued: false,
+            queued,
             in_delivery: None,
-            ready: ReadyMask::EMPTY,
+            ready,
             during_delivery: ReadyMask::EMPTY,
         });
         Ok((
@@ -863,6 +885,36 @@ mod tests {
         drops: &Arc<AtomicUsize>,
     ) -> EpollInterest<u64, Subscription> {
         EpollInterest::new(key, InterestMask::IN, mode, 99, Subscription(drops.clone()))
+    }
+
+    #[test]
+    fn modify_preserves_a_queued_edge_with_new_user_data() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let key = EpollKey {
+            ofd: ofd(1),
+            fd: FdNumber::new(3),
+        };
+        let mut core = EpollCore::try_new(id(1), 1).unwrap();
+        let mode = InterestMode {
+            edge: true,
+            ..InterestMode::default()
+        };
+        let old = core.add(interest(key, mode, &drops)).unwrap();
+        core.notify(old, ReadyMask::IN).unwrap();
+        let replacement = EpollInterest::new(
+            key,
+            InterestMask::IN,
+            mode,
+            123,
+            Subscription(drops.clone()),
+        );
+        let (new, retired) = core.modify(old, replacement).unwrap();
+        drop(retired);
+        let event = core.begin_delivery().unwrap().unwrap();
+        assert_eq!(event.events, ReadyMask::IN);
+        assert_eq!(event.user_data, 123);
+        assert_eq!(event.delivery.interest, new);
+        assert_eq!(core.notify(old, ReadyMask::IN), Err(EpollError::StaleToken));
     }
 
     #[test]

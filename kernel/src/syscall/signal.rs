@@ -1809,6 +1809,15 @@ pub fn sys_rt_sigtimedwait<M: UserMemory + ?Sized>(
                         return Err(AxError::Interrupted);
                     }
                     SignalWaitStep::Retry => {
+                        let aspace = thr.proc_data.aspace();
+                        if thr.prepare_rseq_retry(&aspace).is_err() {
+                            if !force_rseq_fault_signal_current_thread() {
+                                terminate_rseq_fault_current_thread();
+                                return Err(AxError::Interrupted);
+                            }
+                        } else {
+                            axtask::resched_if_needed();
+                        }
                         retry_delivery = true;
                         continue;
                     }
@@ -1817,7 +1826,14 @@ pub fn sys_rt_sigtimedwait<M: UserMemory + ?Sized>(
                         continue;
                     }
                     SignalWaitStep::Fatal => return Err(AxError::Interrupted),
-                    SignalWaitStep::Fault => return Err(AxError::BadAddress),
+                    SignalWaitStep::Fault => {
+                        if !force_rseq_fault_signal_current_thread() {
+                            terminate_rseq_fault_current_thread();
+                            return Err(AxError::Interrupted);
+                        }
+                        retry_delivery = true;
+                        continue;
+                    }
                     SignalWaitStep::Block if thr.pending_exit() => {
                         return Err(AxError::Interrupted);
                     }

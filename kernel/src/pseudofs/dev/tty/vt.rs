@@ -55,8 +55,8 @@ fn read_vt_mode(context: &IoctlContext, address: usize) -> AxResult<[u8; 8]> {
 }
 
 fn vt_number_from_arg(arg: usize) -> AxResult<u16> {
-    let number = u16::try_from(arg).map_err(|_| AxError::InvalidInput)?;
-    VtManager::check_vt(number)?;
+    let number = u16::try_from(arg).map_err(|_| AxError::from(axerrno::LinuxError::ENXIO))?;
+    VtManager::check_vt(number).map_err(|_| AxError::from(axerrno::LinuxError::ENXIO))?;
     Ok(number)
 }
 
@@ -369,6 +369,82 @@ impl VtManager {
         Ok(())
     }
 
+    #[cfg(feature = "input")]
+    pub(crate) fn keyboard_target(&self) -> super::keyboard::KeyboardTarget {
+        let _route = self.route.lock();
+        let state = self.state.lock();
+        let vt = state.active;
+        let route_generation = state.input_generation;
+        let tty = state.vts[vt as usize - 1].tty.clone();
+        let mode = state.vts[vt as usize - 1].kb_mode;
+        drop(state);
+        let flush_generation = tty.ldisc.lock().input_generation();
+        super::keyboard::KeyboardTarget {
+            stamp: ConsoleInputStamp {
+                vt,
+                route_generation,
+                flush_generation,
+            },
+            mode,
+        }
+    }
+
+    #[cfg(feature = "input")]
+    pub(crate) fn keyboard_event(
+        &self,
+        keyboard: &mut super::keyboard::KeyboardState,
+        code: u16,
+        value: i32,
+        grabbed: bool,
+        target: super::keyboard::KeyboardTarget,
+    ) -> Option<super::keyboard::KeyboardInput> {
+        use super::keyboard::KeyAction;
+        let route = self.route.lock();
+        let state = self.state.lock();
+        let valid = state.active == target.stamp.vt
+            && state.input_generation == target.stamp.route_generation;
+        drop(state);
+        // Even a revoked batch updates modifier releases exactly once, but
+        // must not inject text or perform a hotkey in the replacement VT.
+        let mode = if grabbed || !valid {
+            K_OFF
+        } else {
+            target.mode
+        };
+        let action = keyboard.key(code, value, mode);
+        match action {
+            KeyAction::Bytes(bytes, len) => {
+                return Some(super::keyboard::KeyboardInput {
+                    stamp: target.stamp,
+                    bytes,
+                    len,
+                });
+            }
+            KeyAction::Switch(target) => {
+                drop(route);
+                if let Ok(signal) = self.activate(target) {
+                    self.deliver_switch_signal(signal);
+                    self.reconcile_seat();
+                    self.present_active();
+                }
+            }
+            KeyAction::Reboot => {
+                drop(route);
+                crate::syscall::fs::ctrl_alt_delete();
+            }
+            KeyAction::None => {}
+        }
+        None
+    }
+
+    #[cfg(feature = "input")]
+    pub(crate) fn route_keyboard_input(
+        &self,
+        input: &super::keyboard::KeyboardInput,
+    ) -> AxResult<()> {
+        self.route_console_input(input.stamp, &input.bytes[..input.len])
+    }
+
     /// Observes the selected VT after dropping the state spin lock.
     pub fn present_active(&self) {
         let _presentation = self.presentation.lock();
@@ -539,7 +615,7 @@ impl VtManager {
             match pending.phase {
                 SwitchPhase::Release { owner } => {
                     if owner != caller || reply == VT_ACKACQ {
-                        return Err(AxError::PermissionDenied);
+                        return Err(AxError::InvalidInput);
                     }
                     if reply == 0 {
                         state.pending = None;
@@ -552,7 +628,7 @@ impl VtManager {
                 }
                 SwitchPhase::Acquire { owner } => {
                     if owner != caller || reply != VT_ACKACQ {
-                        return Err(AxError::PermissionDenied);
+                        return Err(AxError::InvalidInput);
                     }
                     state.pending = None;
                     return Ok(None);
@@ -935,11 +1011,11 @@ struct VtFile {
 }
 
 impl VtDevice {
-    fn open_description(&self, location: &Location) -> AxResult<DeviceOpen> {
+    fn open_description(&self, location: &Location, flags: u32) -> AxResult<DeviceOpen> {
         let number = self.selected();
         VT_MANAGER.opened(number)?;
         let tty = VT_MANAGER.tty_for(number);
-        let tty_file = match TtyFile::try_new(tty, location.clone()) {
+        let tty_file = match TtyFile::try_new(tty.clone(), location.clone()) {
             Ok(file) => file,
             Err(error) => {
                 VT_MANAGER.closed(number);
@@ -959,6 +1035,11 @@ impl VtDevice {
                 return Err(AxError::NoMemory);
             }
         };
+        // Linux never implicitly acquires a controlling terminal through
+        // tty0 or /dev/console. Only an explicitly selected ttyN can do so.
+        if !self.is_active_alias() {
+            tty.maybe_acquire_controlling_terminal(flags);
+        }
         Ok(DeviceOpen::new(
             file,
             Some(Box::new(VtOpenGuard {
@@ -1063,8 +1144,8 @@ impl Pollable for VtDevice {
 }
 
 impl DeviceOps for VtDevice {
-    fn open_description(&self, location: &Location, _flags: u32) -> VfsResult<Option<DeviceOpen>> {
-        Ok(Some(self.open_description(location)?))
+    fn open_description(&self, location: &Location, flags: u32) -> VfsResult<Option<DeviceOpen>> {
+        Ok(Some(self.open_description(location, flags)?))
     }
     fn read_at(&self, buf: &mut [u8], offset: u64) -> AxResult<usize> {
         DeviceOps::read_at(VT_MANAGER.tty_for(self.selected()).as_ref(), buf, offset)
@@ -1075,7 +1156,7 @@ impl DeviceOps for VtDevice {
         // not route through N_TTY's `/dev/console` fbcon mirror: an inactive
         // ttyN write belongs to ttyN, not the currently selected VT.
         let _ = offset;
-        axhal::console::write_bytes(buf);
+        axhal::console::write_tty_bytes(buf);
         super::fbcon::write(
             number,
             buf,
@@ -1196,7 +1277,14 @@ impl DeviceOps for VtDevice {
                 if !(0..=K_OFF).contains(&mode) {
                     return Err(AxError::InvalidInput);
                 }
-                VT_MANAGER.state.lock().vts[VtManager::check_vt(number)?].kb_mode = mode
+                let _route = VT_MANAGER.route.lock();
+                let mut state = VT_MANAGER.state.lock();
+                let generation = state
+                    .input_generation
+                    .checked_add(1)
+                    .ok_or(AxError::from(axerrno::LinuxError::EOVERFLOW))?;
+                state.vts[VtManager::check_vt(number)?].kb_mode = mode;
+                state.input_generation = generation;
             }
             _ => return DeviceOps::ioctl(VT_MANAGER.tty_for(number).as_ref(), context, cmd, arg),
         };
@@ -1442,6 +1530,41 @@ mod tests {
         assert!(m.state.lock().pending.is_none());
     }
 
+    #[cfg(feature = "input")]
+    #[test]
+    fn retained_keyboard_input_is_revoked_by_flush_mode_change_and_switch() {
+        let _context = crate::test_support::scheduler_test_context();
+        let m = VtManager::new();
+        let mut keyboard = super::super::keyboard::KeyboardState::default();
+        let target = m.keyboard_target();
+        let input = m
+            .keyboard_event(&mut keyboard, 30, 1, false, target)
+            .unwrap();
+        m.active_tty().0.ldisc.lock().flush_input().unwrap();
+        assert_eq!(m.route_keyboard_input(&input), Err(AxError::Interrupted));
+        let target = m.keyboard_target();
+        let input = m
+            .keyboard_event(&mut keyboard, 30, 1, false, target)
+            .unwrap();
+        {
+            let _route = m.route.lock();
+            let mut state = m.state.lock();
+            state.input_generation += 1; // KDSKBMODE's revocation edge.
+            state.vts[0].kb_mode = 0; // K_RAW
+        }
+        assert_eq!(m.route_keyboard_input(&input), Err(AxError::Interrupted));
+        assert!(
+            m.keyboard_event(&mut keyboard, 30, 1, false, target)
+                .is_none()
+        );
+        let target = m.keyboard_target();
+        let input = m
+            .keyboard_event(&mut keyboard, 30, 1, false, target)
+            .unwrap();
+        assert_eq!(m.activate(2), Ok(None));
+        assert_eq!(m.route_keyboard_input(&input), Err(AxError::Interrupted));
+    }
+
     #[test]
     fn retained_console_batch_is_revoked_by_flush_and_vt_switch_aba() {
         let _context = crate::test_support::scheduler_test_context();
@@ -1549,7 +1672,7 @@ mod tests {
         assert_switch_signal(m.activate(2).unwrap(), (7, 1));
         assert_switch_signal(m.release_reply(7, 1).unwrap(), (9, 2));
         assert_eq!(m.active(), 2);
-        assert_eq!(m.release_reply(9, 1), Err(AxError::PermissionDenied));
+        assert_eq!(m.release_reply(9, 1), Err(AxError::InvalidInput));
         assert_eq!(m.release_reply(9, VT_ACKACQ), Ok(None));
         assert_eq!(m.release_reply(9, VT_ACKACQ), Err(AxError::InvalidInput));
     }
@@ -1624,7 +1747,10 @@ mod tests {
 
     #[test]
     fn ioctl_number_and_mode_arguments_do_not_truncate() {
-        assert_eq!(vt_number_from_arg(65_537), Err(AxError::InvalidInput));
+        assert_eq!(
+            vt_number_from_arg(65_537),
+            Err(axerrno::LinuxError::ENXIO.into())
+        );
         assert_eq!(kd_mode_from_arg(usize::MAX), Err(AxError::InvalidInput));
     }
 

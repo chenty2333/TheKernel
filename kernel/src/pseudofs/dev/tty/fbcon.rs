@@ -90,6 +90,9 @@ struct Screen {
     param: usize,
     private: bool,
     malformed: bool,
+    utf8: [u8; 4],
+    utf8_len: usize,
+    utf8_need: usize,
 }
 
 impl Screen {
@@ -114,6 +117,9 @@ impl Screen {
             param: 0,
             private: false,
             malformed: false,
+            utf8: [0; 4],
+            utf8_len: 0,
+            utf8_need: 0,
         })
     }
 
@@ -129,6 +135,8 @@ impl Screen {
         self.autowrap = true;
         self.cursor_visible = true;
         self.escape = 0;
+        self.utf8_len = 0;
+        self.utf8_need = 0;
     }
 
     fn scroll(&mut self, rows: usize, count: usize, down: bool) {
@@ -298,6 +306,40 @@ impl Screen {
     }
 
     fn put(&mut self, byte: u8, cols: usize, rows: usize) {
+        // Decode across write boundaries. The built-in font is ASCII-only;
+        // render one visible fallback per non-ASCII scalar rather than silently
+        // dropping text or interpreting continuation bytes as terminal controls.
+        if self.utf8_len != 0 {
+            if byte & 0xc0 == 0x80 {
+                self.utf8[self.utf8_len] = byte;
+                self.utf8_len += 1;
+                if self.utf8_len == self.utf8_need {
+                    self.utf8_len = 0;
+                    self.put_byte(b'?', cols, rows);
+                }
+                return;
+            }
+            self.utf8_len = 0;
+            self.put_byte(b'?', cols, rows);
+        }
+        if self.escape == 0 && byte >= 0x80 {
+            self.utf8_need = match byte {
+                0xc2..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf4 => 4,
+                _ => {
+                    self.put_byte(b'?', cols, rows);
+                    return;
+                }
+            };
+            self.utf8[0] = byte;
+            self.utf8_len = 1;
+            return;
+        }
+        self.put_byte(byte, cols, rows);
+    }
+
+    fn put_byte(&mut self, byte: u8, cols: usize, rows: usize) {
         let cols = cols.clamp(1, MAX_COLS);
         let rows = rows.clamp(1, MAX_ROWS);
         self.row = self.row.min(rows - 1);
@@ -382,10 +424,7 @@ impl Screen {
                 self.col = 0;
                 self.wrap_pending = false;
             }
-            b'\n' => {
-                self.col = 0;
-                self.linefeed(rows);
-            }
+            b'\n' => self.linefeed(rows),
             8 => {
                 self.col = self.col.saturating_sub(1);
                 self.wrap_pending = false;
@@ -594,7 +633,17 @@ fn mirror_new_log_bytes(cursor: &mut u64) -> bool {
             break;
         }
         *cursor = next;
-        write_active(&bytes[..count]);
+        // Kernel logs bypass termios, so apply their CRLF presentation here,
+        // not in the VT parser used by raw-mode applications.
+        let mut start = 0;
+        for (index, byte) in bytes[..count].iter().enumerate() {
+            if *byte == b'\n' {
+                write_active(&bytes[start..index]);
+                write_active(b"\r\n");
+                start = index + 1;
+            }
+        }
+        write_active(&bytes[start..count]);
         chunks += 1;
     }
     LOG_MIRROR_WRITING.store(false, Ordering::Release);
@@ -785,6 +834,20 @@ mod tests {
     }
 
     #[test]
+    fn raw_lf_preserves_column_and_utf8_survives_split_writes() {
+        let mut screen = Screen::try_new().unwrap();
+        feed(&mut screen, b"ab\nC", 8, 4);
+        assert_eq!((screen.row, screen.col), (1, 3));
+        assert_eq!(screen.cells[MAX_COLS + 2].byte, b'C');
+        feed(&mut screen, &[0xe4, 0xb8], 8, 4);
+        assert_eq!(screen.col, 3);
+        feed(&mut screen, &[0xad], 8, 4);
+        assert_eq!(screen.cells[MAX_COLS + 3].byte, b'?');
+        feed(&mut screen, &[0xc2, 0x1b, b'[', b'2', b'J'], 8, 4);
+        assert!(screen.cells.iter().all(|cell| cell.byte == b' '));
+    }
+
+    #[test]
     fn a_pass_is_bounded_and_reports_that_it_was() {
         // The mirror reads a ring it also writes the console from.  If
         // anything on that path ever logs, the ring grows at least as fast as
@@ -918,7 +981,7 @@ mod tests {
     #[test]
     fn wrap_is_deferred_and_scroll_region_preserves_the_status_line() {
         let mut screen = Screen::try_new().unwrap();
-        feed(&mut screen, b"ab\n", 2, 2);
+        feed(&mut screen, b"ab\r\n", 2, 2);
         assert_eq!(screen.cells[0].byte, b'a');
         assert_eq!((screen.row, screen.col), (1, 0));
         screen.clear();

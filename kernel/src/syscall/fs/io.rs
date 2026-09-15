@@ -2618,8 +2618,8 @@ fn admit_mandatory_transfer_range(
 
     let len = u64::try_from(len).map_err(|_| AxError::InvalidInput)?;
     let metadata = loc.metadata()?;
-    let pid = axtask::current().as_thread().proc_data.proc.pid();
-    let owners = flock::MandatoryOwners::new(pid, ofd_key);
+    let files = axtask::current().as_thread().fd_table();
+    let owners = flock::MandatoryOwners::new(files.id(), ofd_key);
     match flock::mandatory_access_conflict(
         (metadata.device, metadata.inode),
         owners,
@@ -2674,8 +2674,8 @@ pub(crate) fn check_mandatory_fd_truncate_lock(
         return Ok(());
     }
     let metadata = loc.metadata()?;
-    let pid = axtask::current().as_thread().proc_data.proc.pid();
-    let owners = flock::MandatoryOwners::new(pid, ofd_key);
+    let files = axtask::current().as_thread().fd_table();
+    let owners = flock::MandatoryOwners::new(files.id(), ofd_key);
     let wait = flock::mandatory_access_conflict(
         (metadata.device, metadata.inode),
         owners,
@@ -4030,10 +4030,10 @@ pub fn sys_lseek(fd: c_int, offset: __kernel_off_t, whence: c_int) -> AxResult<i
     match whence {
         0..=2 => seek_file_like(&seekable_fd(fd)?, offset, whence),
         SEEK_DATA | SEEK_HOLE => {
-            if offset < 0 {
-                return Err(AxError::InvalidInput);
-            }
             let file = positioned_file(fd, FileFlags::empty())?;
+            if offset < 0 {
+                return Err(LinuxError::ENXIO.into());
+            }
             if !file.inner().supports_seek() {
                 return Err(LinuxError::ESPIPE.into());
             }
@@ -4120,7 +4120,6 @@ pub fn sys_truncate(
         return Err(AxError::InvalidInput);
     }
     let curr = axtask::current();
-    let proc_data = &curr.as_thread().proc_data;
     let security = VfsSecurityContext::new(curr.as_thread().current_cred());
     let loc = current_fs_context()
         .lock()
@@ -4149,7 +4148,7 @@ pub fn sys_truncate(
         check_mandatory_truncate_lock(
             &loc,
             length as u64,
-            flock::RecordLockOwner::Posix(proc_data.proc.pid()),
+            flock::RecordLockOwner::Posix(curr.as_thread().fd_table().id()),
         )?;
         let file = OpenOptions::new()
             .write(true)
@@ -6902,11 +6901,6 @@ fn validate_splice_endpoint(
     Err(AxError::InvalidInput)
 }
 
-fn pipe_from_fd(fd: c_int, non_pipe_error: AxError) -> AxResult<FileHandle<Pipe>> {
-    let file = get_file_like(fd).map_err(|_| AxError::BadFileDescriptor)?;
-    file.downcast::<Pipe>().map_err(|_| non_pipe_error)
-}
-
 pub fn sys_sendfile(
     capability: UserMemoryCapability,
     out_fd: c_int,
@@ -7271,10 +7265,10 @@ pub fn sys_splice(
     let security = current_vfs_security();
     let actor = FanotifyEventActor::current();
 
+    validate_splice_flags(_flags)?;
     if len == 0 {
         return Ok(0);
     }
-    validate_splice_flags(_flags)?;
 
     let src_handle = get_file_like(fd_in)?;
     let src_status = src_handle.io_status_snapshot();
@@ -7438,11 +7432,13 @@ pub fn sys_tee(fd_in: c_int, fd_out: c_int, len: usize, flags: u32) -> AxResult<
         return Ok(0);
     }
 
-    let src = pipe_from_fd(fd_in, AxError::InvalidInput)?;
-    let dst = pipe_from_fd(fd_out, AxError::InvalidInput)?;
+    let src_file = get_file_like(fd_in)?;
+    let dst_file = get_file_like(fd_out)?;
+    let src = PipeEndpoint::from_file(&*src_file).ok_or(AxError::InvalidInput)?;
+    let dst = PipeEndpoint::from_file(&*dst_file).ok_or(AxError::InvalidInput)?;
     let nonblocking = flags & SPLICE_F_NONBLOCK != 0
-        || src.io_status_snapshot().nonblocking()
-        || dst.io_status_snapshot().nonblocking();
+        || src_file.io_status_snapshot().nonblocking()
+        || dst_file.io_status_snapshot().nonblocking();
     src.tee_to(&dst, len, nonblocking).map(|n| n as _)
 }
 
@@ -7457,9 +7453,11 @@ pub fn sys_vmsplice(
 
     validate_splice_flags(flags)?;
 
-    let pipe = pipe_from_fd(fd, AxError::BadFileDescriptor)?;
+    let pipe_file = get_file_like(fd)?;
+    let pipe = PipeEndpoint::from_file(&*pipe_file).ok_or(AxError::BadFileDescriptor)?;
     let mut io = IoVectorBuf::new(capability, iov, nr_segs)?.into_io();
-    let nonblocking = flags & SPLICE_F_NONBLOCK != 0 || pipe.io_status_snapshot().nonblocking();
+    let nonblocking =
+        flags & SPLICE_F_NONBLOCK != 0 || pipe_file.io_status_snapshot().nonblocking();
 
     let result = if pipe.is_write() {
         pipe.vmsplice_write(&mut io, nonblocking)

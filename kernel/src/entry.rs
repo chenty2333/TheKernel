@@ -137,8 +137,7 @@ pub fn init(args: &[String], envs: &[String]) {
     }
     {
         let fs = FS_CONTEXT.lock();
-        pseudofs::mount_all(&fs, init_pid_ns.clone())
-        .expect("Failed to mount pseudofs");
+        pseudofs::mount_all(&fs, init_pid_ns.clone()).expect("Failed to mount pseudofs");
     }
 
     let loc = FS_CONTEXT
@@ -257,6 +256,7 @@ pub fn init(args: &[String], envs: &[String]) {
         init_namespaces,
     )
     .expect("Failed to allocate init process runtime state");
+    proc.signal.protect_global_init();
     init_pid_reservation.commit();
 
     crate::file::add_stdio(&init_fd_table, &init_fs_context.lock()).expect("Failed to add stdio");
@@ -309,7 +309,11 @@ pub fn init(args: &[String], envs: &[String]) {
 
     // TODO: wait for all processes to finish
     let exit_code = task.join().expect("Failed to join init task");
-    info!("Init process exited with code: {exit_code}");
+    if exit_code == 0 {
+        info!("Init exited normally; shutting down by boot-shell policy");
+    } else {
+        error!("Init terminated unexpectedly (status {exit_code}); shutting down");
+    }
 
     let cx = init_fs_context.lock();
     cx.root_dir()

@@ -16,7 +16,9 @@ use axtask::{
     },
 };
 use linux_raw_sys::general::{
-    ECHOCTL, ECHOE, ECHOK, ICRNL, IGNCR, ISIG, NOFLSH, ONLCR, OPOST, VEOF, VERASE, VKILL,
+    ECHOCTL, ECHOE, ECHOK, ECHOKE, ECHONL, ICRNL, IEXTEN, IGNCR, INLCR, ISIG, ISTRIP, IUCLC, IUTF8,
+    IXANY, IXON, NOFLSH, OCRNL, OLCUC, ONLCR, ONLRET, ONOCR, OPOST, VEOF, VERASE, VKILL, VLNEXT,
+    VMIN, VREPRINT, VSTART, VSTOP, VTIME, VWERASE,
 };
 use ringbuf::{
     CachingCons, CachingProd,
@@ -33,7 +35,8 @@ const CANONICAL_LINE_MAX: usize = CANONICAL_BUF_SIZE - 1;
 const ECHO_BUF_SIZE: usize = 4096;
 const EXTERNAL_PROGRESS_BUDGET: usize = 64;
 
-type ReadBuf = Arc<ringbuf::StaticRb<u8, BUF_SIZE>>;
+const READ_BUF_SIZE: usize = 4096;
+type ReadBuf = Arc<ringbuf::StaticRb<u8, READ_BUF_SIZE>>;
 pub type ExternalRegister = Box<
     dyn for<'a> Fn(&'a Waker) -> Result<ExternalRegistration, ExternalRegisterError> + Send + Sync,
 >;
@@ -194,9 +197,88 @@ pub trait TtyWrite: Send + Sync + 'static {
     /// Drop accepted output which has not reached the peer.
     fn flush_output(&self) {}
 
+    /// Column after accepted output, if tracked by this transport. Echo erase
+    /// uses this to preserve a prompt before an expanded tab.
+    fn output_column(&self) -> Option<usize> {
+        None
+    }
+
     /// Apply local software output flow control. A stopped writer must apply
     /// backpressure until it is resumed, rather than pretending output drained.
     fn set_output_stopped(&self, _stopped: bool) {}
+
+    /// IXON stop/start is independent of an explicit tcflow(TCOOFF).
+    fn set_input_flow_stopped(&self, _stopped: bool) {}
+}
+
+/// Tracks the terminal's conventional byte columns after output processing.
+/// ANSI cursor addressing belongs to the display emulator, not N_TTY.
+pub(crate) fn output_column_after(mut column: usize, bytes: &[u8]) -> usize {
+    for &byte in bytes {
+        match byte {
+            b'\r' => column = 0,
+            b'\x08' => column = column.saturating_sub(1),
+            b'\t' => column = column.saturating_add(8 - column % 8),
+            byte if !byte.is_ascii_control() && byte & 0xc0 != 0x80 => {
+                column = column.saturating_add(1)
+            }
+            _ => {}
+        }
+    }
+    column
+}
+
+/// One N_TTY output byte expands to at most one tab stop (eight spaces).
+/// Callers retain a short pending suffix when the transport applies pressure.
+pub(crate) fn process_output_char(
+    term: &Termios2,
+    column: &mut usize,
+    mut byte: u8,
+    output: &mut [u8; 8],
+) -> usize {
+    if !term.has_oflag(OPOST) {
+        output[0] = byte;
+        *column = output_column_after(*column, &output[..1]);
+        return 1;
+    }
+    if term.has_oflag(OLCUC) {
+        byte = byte.to_ascii_uppercase();
+    }
+    match byte {
+        b'\n' => {
+            if term.has_oflag(ONLCR) {
+                output[..2].copy_from_slice(b"\r\n");
+                *column = 0;
+                return 2;
+            }
+            if term.has_oflag(ONLRET) {
+                *column = 0;
+            }
+        }
+        b'\r' => {
+            if term.has_oflag(ONOCR) && *column == 0 {
+                return 0;
+            }
+            if term.has_oflag(OCRNL) {
+                output[0] = b'\n';
+                if term.has_oflag(ONLRET) {
+                    *column = 0;
+                }
+                return 1; // OCRNL does not recursively apply ONLCR.
+            }
+            *column = 0;
+        }
+        b'\t' if term.output_tab_expansion() => {
+            let count = 8 - *column % 8;
+            output[..count].fill(b' ');
+            *column = column.saturating_add(count);
+            return count;
+        }
+        _ => {}
+    }
+    output[0] = byte;
+    *column = output_column_after(*column, &output[..1]);
+    1
 }
 
 struct InputReader<R, W> {
@@ -211,7 +293,10 @@ struct InputReader<R, W> {
     // Linux N_TTY bounds a canonical input line to 4096 bytes. Reserving the
     // entire limit during admission means input processing never allocates.
     line_buf: Vec<u8>,
+    line_widths: Vec<u8>,
     line_read: Option<usize>,
+    literal_next: bool,
+    ixon_stopped: bool,
     echo_buf: VecDeque<u8>,
     empty_eof_pending: Arc<AtomicBool>,
     source_drained: Arc<AtomicBool>,
@@ -223,7 +308,9 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
         self.reader.flush_input();
         self.read_range = 0..0;
         self.line_buf.clear();
+        self.line_widths.clear();
         self.line_read = None;
+        self.literal_next = false;
         self.echo_buf.clear();
         self.echo_pending.store(0, Ordering::Release);
         self.empty_eof_pending.store(false, Ordering::Release);
@@ -243,6 +330,13 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
             progressed |= read != 0 || transport_progress;
         }
         let term = self.terminal.load_termios();
+        if self.ixon_stopped && !term.has_iflag(IXON) {
+            self.ixon_stopped = false;
+            self.writer.set_input_flow_stopped(false);
+        }
+        if !term.has_lflag(IEXTEN) {
+            self.literal_next = false;
+        }
         if term.canonical()
             && self.reader.input_eof()
             && self.read_range.is_empty()
@@ -266,6 +360,7 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
                 if *offset == self.line_buf.len() {
                     self.line_read = None;
                     self.line_buf.clear();
+                    self.line_widths.clear();
                 }
                 continue;
             }
@@ -277,44 +372,117 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
             self.read_range.start += 1;
             progressed = true;
 
-            if ch == b'\r' {
-                if term.has_iflag(IGNCR) {
+            if term.has_iflag(ISTRIP) {
+                ch &= 0x7f;
+            }
+            if term.has_iflag(IUCLC) && term.has_lflag(IEXTEN) {
+                ch = ch.to_ascii_lowercase();
+            }
+            let literal = core::mem::take(&mut self.literal_next);
+            if !literal {
+                if ch == b'\r' {
+                    if term.has_iflag(IGNCR) {
+                        continue;
+                    }
+                    if term.has_iflag(ICRNL) {
+                        ch = b'\n';
+                    }
+                } else if ch == b'\n' && term.has_iflag(INLCR) {
+                    ch = b'\r';
+                }
+                if term.has_iflag(IXON) {
+                    if term.matches_special_char(VSTOP, ch) {
+                        self.ixon_stopped = true;
+                        self.writer.set_input_flow_stopped(true);
+                        continue;
+                    }
+                    if term.matches_special_char(VSTART, ch) {
+                        self.ixon_stopped = false;
+                        self.writer.set_input_flow_stopped(false);
+                        continue;
+                    }
+                    if self.ixon_stopped && term.has_iflag(IXANY) {
+                        self.ixon_stopped = false;
+                        self.writer.set_input_flow_stopped(false);
+                    }
+                }
+                if self.check_send_signal(&term, ch) {
                     continue;
                 }
-                if term.has_iflag(ICRNL) {
-                    ch = b'\n';
-                }
-            }
-
-            if self.check_send_signal(&term, ch) {
-                continue;
-            }
-
-            if term.echo() {
-                self.output_char(&term, ch);
             }
             if !term.canonical() {
+                if term.echo() {
+                    self.output_char(&term, ch);
+                }
                 if self.buf_tx.try_push(ch).is_ok() {
                     self.produced = self.produced.wrapping_add(1);
                 }
                 continue;
             }
-
-            if term.matches_special_char(VKILL, ch) {
-                self.line_buf.clear();
-                if term.has_lflag(ECHOK) && term.echo() {
-                    self.queue_echo(b"\n");
+            if !literal {
+                if term.has_lflag(IEXTEN) && term.matches_special_char(VLNEXT, ch) {
+                    self.literal_next = true;
+                    if term.echo() && term.has_lflag(ECHOCTL) {
+                        self.queue_echo(b"^\x08");
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if term.matches_special_char(VERASE, ch) {
-                self.line_buf.pop();
-                continue;
+                if term.matches_special_char(VERASE, ch) {
+                    self.erase_character(&term, false);
+                    continue;
+                }
+                if term.matches_special_char(VKILL, ch) {
+                    if self.line_buf.is_empty() {
+                        continue;
+                    }
+                    if term.echo()
+                        && !(term.has_lflag(ECHOK)
+                            && term.has_lflag(ECHOKE)
+                            && term.has_lflag(ECHOE))
+                    {
+                        self.line_buf.clear();
+                        self.line_widths.clear();
+                        self.output_char(&term, ch);
+                        if term.has_lflag(ECHOK) {
+                            self.queue_echo(b"\n");
+                        }
+                    } else {
+                        while !self.line_buf.is_empty() {
+                            self.erase_character(&term, true);
+                        }
+                    }
+                    continue;
+                }
+                if term.has_lflag(IEXTEN) && term.matches_special_char(VWERASE, ch) {
+                    let mut seen_word = false;
+                    while let Some(&last) = self.line_buf.last() {
+                        if last.is_ascii_alphanumeric() || last == b'_' {
+                            seen_word = true;
+                        } else if seen_word {
+                            break;
+                        }
+                        self.erase_character(&term, true);
+                    }
+                    continue;
+                }
+                if term.has_lflag(IEXTEN) && term.matches_special_char(VREPRINT, ch) {
+                    if term.echo() {
+                        self.output_char(&term, ch);
+                        self.queue_echo(b"\n");
+                        for i in 0..self.line_buf.len() {
+                            self.output_char(&term, self.line_buf[i]);
+                        }
+                    }
+                    continue;
+                }
             }
 
-            let is_veof = term.matches_special_char(VEOF, ch);
-            if term.is_eol(ch) || is_veof {
+            let is_veof = !literal && term.matches_special_char(VEOF, ch);
+            if (!literal && term.is_eol(ch)) || is_veof {
                 if !is_veof && self.line_buf.len() < CANONICAL_BUF_SIZE {
+                    if term.echo() || (ch == b'\n' && term.has_lflag(ECHONL)) {
+                        self.output_char(&term, ch);
+                    }
                     self.line_buf.push(ch);
                 }
                 if self.line_buf.is_empty() && is_veof {
@@ -336,8 +504,32 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
             // Match N_TTY's bounded overflow behavior: keep accepting control
             // processing but do not grow a canonical line beyond 4095 bytes,
             // leaving one slot for its delimiter.
-            if (ch == b' ' || ch.is_ascii_graphic()) && self.line_buf.len() < CANONICAL_LINE_MAX {
+            if self.line_buf.len() < CANONICAL_LINE_MAX {
+                let column = self
+                    .writer
+                    .output_column()
+                    .map(|column| output_column_after(column, self.echo_buf.make_contiguous()));
+                let width = if ch == b'\t' {
+                    // Without a transport column snapshot, retreat only one
+                    // column rather than risk erasing an application prompt.
+                    column.map_or(1, |column| 8 - column % 8)
+                } else if ch.is_ascii_control() {
+                    if term.has_lflag(ECHOCTL) { 2 } else { 0 }
+                } else if term.has_iflag(IUTF8) && ch & 0xc0 == 0x80 {
+                    0
+                } else {
+                    1
+                };
+                self.line_widths
+                    .push(if term.echo() { width as u8 } else { 0 });
+                if term.echo() {
+                    self.output_char(&term, ch);
+                }
                 self.line_buf.push(ch);
+            } else if term.echo() {
+                // Linux N_TTY rings on canonical overflow independently of
+                // the retained IMAXBEL flag; control processing stays live.
+                self.queue_echo(b"\x07");
             }
         }
 
@@ -363,6 +555,8 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
         };
         if !term.has_lflag(NOFLSH) {
             self.line_buf.clear();
+            self.line_widths.clear();
+            self.literal_next = false;
             self.line_read = None;
             self.echo_buf.clear();
             self.echo_pending.store(0, Ordering::Release);
@@ -387,30 +581,41 @@ impl<R: TtyRead, W: TtyWrite> InputReader<R, W> {
         true
     }
 
+    fn erase_character(&mut self, term: &Termios2, visual: bool) {
+        let Some(mut erased) = self.line_buf.pop() else {
+            return;
+        };
+        let mut width = self.line_widths.pop().unwrap_or(0);
+        if term.has_iflag(IUTF8) {
+            while erased & 0xc0 == 0x80 {
+                let Some(previous) = self.line_buf.pop() else {
+                    break;
+                };
+                width = width.saturating_add(self.line_widths.pop().unwrap_or(0));
+                erased = previous;
+            }
+        }
+        if !term.echo() {
+            return;
+        }
+        if !visual && !term.has_lflag(ECHOE) {
+            self.output_char(term, term.special_char(VERASE));
+        } else {
+            for _ in 0..width {
+                if erased == b'\t' {
+                    self.queue_echo(b"\x08");
+                } else {
+                    self.queue_echo(b"\x08 \x08");
+                }
+            }
+        }
+    }
+
     fn output_char(&mut self, term: &Termios2, ch: u8) {
-        match ch {
-            b'\n' => self.queue_echo(b"\n"),
-            b'\r' => self.queue_echo(b"\r\n"),
-            ch if term.canonical()
-                && term.matches_special_char(VERASE, ch)
-                && term.has_lflag(ECHOE) =>
-            {
-                self.queue_echo(b"\x08 \x08")
-            }
-            ch if term.canonical()
-                && term.matches_special_char(VERASE, ch)
-                && term.has_lflag(ECHOCTL) =>
-            {
-                self.queue_echo(b"^?")
-            }
-            ch if term.canonical() && term.matches_special_char(VERASE, ch) => {}
-            ch if ch == b' ' || ch.is_ascii_graphic() => self.queue_echo(&[ch]),
-            ch if ch.is_ascii_control() && term.has_lflag(ECHOCTL) => {
-                self.queue_echo(&[b'^', ch + 0x40]);
-            }
-            other => {
-                warn!("Ignored echo char: {other:#x}");
-            }
+        if ch.is_ascii_control() && !matches!(ch, b'\n' | b'\t') && term.has_lflag(ECHOCTL) {
+            self.queue_echo(&[b'^', ch ^ 0x40]);
+        } else {
+            self.queue_echo(&[ch]);
         }
     }
 
@@ -472,7 +677,9 @@ struct SimpleReader<R> {
     reader: R,
     read_buf: [u8; BUF_SIZE],
     read_range: Range<usize>,
-    pending: Option<u8>,
+    pending: [u8; 8],
+    pending_range: Range<usize>,
+    output_column: usize,
     buf_tx: CachingProd<ReadBuf>,
 }
 
@@ -483,34 +690,27 @@ impl<R: TtyRead> SimpleReader<R> {
             self.read_range = 0..read;
         }
 
-        if let Some(pending) = self.pending.take()
-            && self.buf_tx.try_push(pending).is_err()
-        {
-            self.pending = Some(pending);
-            return Ok(());
-        }
-
         let term = self.terminal.load_termios();
-        let map_newline = term.has_oflag(OPOST) && term.has_oflag(ONLCR);
-        while !self.buf_tx.is_full() && !self.read_range.is_empty() {
-            let ch = self.read_buf[self.read_range.start];
-            self.read_range.start += 1;
-            if ch == b'\n' && map_newline {
-                // Preserve both bytes of the master-side CRLF expansion even
-                // when only one line-discipline slot remains.
-                if self.buf_tx.try_push(b'\r').is_err() {
-                    self.read_range.start -= 1;
-                    break;
+        loop {
+            while !self.pending_range.is_empty() {
+                if self
+                    .buf_tx
+                    .try_push(self.pending[self.pending_range.start])
+                    .is_err()
+                {
+                    return Ok(());
                 }
-                if self.buf_tx.try_push(b'\n').is_err() {
-                    self.pending = Some(b'\n');
-                    break;
-                }
-            } else if self.buf_tx.try_push(ch).is_err() {
-                self.read_range.start -= 1;
+                self.pending_range.start += 1;
+            }
+            if self.buf_tx.is_full() || self.read_range.is_empty() {
                 break;
             }
+            let ch = self.read_buf[self.read_range.start];
+            self.read_range.start += 1;
+            let count = process_output_char(&term, &mut self.output_column, ch, &mut self.pending);
+            self.pending_range = 0..count;
         }
+
         Ok(())
     }
 }
@@ -858,7 +1058,7 @@ pub struct LineDiscipline<R, W> {
 
 impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
     pub fn try_new(terminal: Arc<Terminal>, config: TtyConfig<R, W>) -> AxResult<Self> {
-        let read_buf = Arc::try_new(ringbuf::StaticRb::<u8, BUF_SIZE>::default())
+        let read_buf = Arc::try_new(ringbuf::StaticRb::<u8, READ_BUF_SIZE>::default())
             .map_err(|_| AxError::NoMemory)?;
         let (buf_tx, buf_rx) = read_buf.split();
 
@@ -869,6 +1069,10 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             Arc::try_new(core::sync::atomic::AtomicUsize::new(0)).map_err(|_| AxError::NoMemory)?;
         let mut line_buf = Vec::new();
         line_buf
+            .try_reserve_exact(CANONICAL_BUF_SIZE)
+            .map_err(|_| AxError::NoMemory)?;
+        let mut line_widths = Vec::new();
+        line_widths
             .try_reserve_exact(CANONICAL_BUF_SIZE)
             .map_err(|_| AxError::NoMemory)?;
         let mut echo_buf = VecDeque::new();
@@ -886,7 +1090,10 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             read_buf: [0; BUF_SIZE],
             read_range: 0..0,
             line_buf,
+            line_widths,
             line_read: None,
+            literal_next: false,
+            ixon_stopped: false,
             echo_buf,
             empty_eof_pending: empty_eof_pending.clone(),
             source_drained: source_drained.clone(),
@@ -938,7 +1145,9 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
                     reader: reader.reader,
                     read_buf: [0; BUF_SIZE],
                     read_range: 0..0,
-                    pending: None,
+                    pending: [0; 8],
+                    pending_range: 0..0,
+                    output_column: 0,
                     buf_tx: reader.buf_tx,
                 },
                 poll_rx,
@@ -969,13 +1178,32 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
 
     pub fn poll_read(&mut self) -> bool {
         let _ = self.refill_read_buffer();
-        !self.buf_rx.is_empty() || self.empty_eof_pending.load(Ordering::Acquire)
+        if self.empty_eof_pending.load(Ordering::Acquire) {
+            return true;
+        }
+        let term = self.terminal.load_termios();
+        let threshold = if matches!(self.processor, Processor::None(_, _))
+            || term.canonical()
+            || term.special_char(VTIME) != 0
+        {
+            1
+        } else {
+            usize::from(term.special_char(VMIN)).max(1)
+        };
+        self.buf_rx.occupied_len() >= threshold
     }
 
     fn refill_read_buffer(&mut self) -> AxResult<()> {
         match &mut self.processor {
             Processor::Manual(reader) => {
-                reader.poll()?;
+                // Drain already available chunks before reporting readiness;
+                // otherwise VMIN > the transport chunk size can strand data
+                // behind a level-triggered poll with no future producer wake.
+                for _ in 0..EXTERNAL_PROGRESS_BUDGET {
+                    if !reader.poll()? {
+                        break;
+                    }
+                }
             }
             Processor::None(reader, _) => reader.poll()?,
             Processor::External(processor) => {
@@ -1070,7 +1298,7 @@ impl<R: TtyRead, W: TtyWrite> LineDiscipline<R, W> {
             Processor::None(reader, _) => {
                 reader.reader.flush_input();
                 reader.read_range = 0..0;
-                reader.pending = None;
+                reader.pending_range = 0..0;
             }
             Processor::External(_) => {}
         }
@@ -1309,6 +1537,34 @@ mod tests {
     }
 
     #[test]
+    fn output_processing_handles_common_stty_flags() {
+        let mut term = Termios2::default();
+        edit_flags(
+            &mut term,
+            4,
+            ONOCR | OCRNL | OLCUC | ONLRET | linux_raw_sys::general::TAB3,
+            0,
+        );
+        let mut column = 0;
+        let mut output = Vec::new();
+        for &byte in b"\ra\tb\n" {
+            let mut chunk = [0; 8];
+            let count = process_output_char(&term, &mut column, byte, &mut chunk);
+            output.extend_from_slice(&chunk[..count]);
+        }
+        assert_eq!(output, b"A       B\r\n");
+        assert_eq!(column, 0);
+        column = 4;
+        let mut chunk = [0; 8];
+        assert_eq!(
+            process_output_char(&term, &mut column, b'\r', &mut chunk),
+            1
+        );
+        assert_eq!(chunk[0], b'\n');
+        assert_eq!(column, 0);
+    }
+
+    #[test]
     fn master_side_newline_mapping_obeys_opost_and_onlcr() {
         assert_eq!(master_side_output(true, true), b"\r\n");
         assert_eq!(master_side_output(false, true), b"\n");
@@ -1330,10 +1586,14 @@ mod tests {
 
     #[test]
     fn external_worker_yields_at_progress_budget_and_then_observes_cancel() {
-        let read_buf = Arc::try_new(ringbuf::StaticRb::<u8, BUF_SIZE>::default()).unwrap();
+        let read_buf = Arc::try_new(ringbuf::StaticRb::<u8, READ_BUF_SIZE>::default()).unwrap();
         let (buf_tx, _buf_rx) = read_buf.split();
         let mut line_buf = Vec::new();
         line_buf.try_reserve_exact(CANONICAL_BUF_SIZE).unwrap();
+        let mut line_widths = Vec::new();
+        line_widths
+            .try_reserve_exact(CANONICAL_BUF_SIZE)
+            .unwrap_or_else(|_| panic!("tty echo width admission"));
         let mut echo_buf = VecDeque::new();
         echo_buf.try_reserve_exact(ECHO_BUF_SIZE).unwrap();
         let reads = Arc::try_new(AtomicUsize::new(0)).unwrap();
@@ -1347,7 +1607,10 @@ mod tests {
             read_buf: [0; BUF_SIZE],
             read_range: 0..0,
             line_buf,
+            line_widths,
             line_read: None,
+            literal_next: false,
+            ixon_stopped: false,
             echo_buf,
             echo_pending: Arc::try_new(AtomicUsize::new(0)).unwrap(),
             empty_eof_pending: Arc::try_new(AtomicBool::new(false)).unwrap(),
@@ -1428,10 +1691,14 @@ mod tests {
 
     #[test]
     fn external_worker_drains_all_stages_then_cancels_and_joins() {
-        let read_buf = Arc::try_new(ringbuf::StaticRb::<u8, BUF_SIZE>::default()).unwrap();
+        let read_buf = Arc::try_new(ringbuf::StaticRb::<u8, READ_BUF_SIZE>::default()).unwrap();
         let (buf_tx, mut buf_rx) = read_buf.split();
         let mut line_buf = Vec::new();
         line_buf.try_reserve_exact(CANONICAL_BUF_SIZE).unwrap();
+        let mut line_widths = Vec::new();
+        line_widths
+            .try_reserve_exact(CANONICAL_BUF_SIZE)
+            .unwrap_or_else(|_| panic!("tty echo width admission"));
         let mut echo_buf = VecDeque::new();
         echo_buf.try_reserve_exact(ECHO_BUF_SIZE).unwrap();
         let consumed = Arc::try_new(AtomicUsize::new(0)).unwrap();
@@ -1451,7 +1718,10 @@ mod tests {
             read_buf: [0; BUF_SIZE],
             read_range: 0..0,
             line_buf,
+            line_widths,
             line_read: None,
+            literal_next: false,
+            ixon_stopped: false,
             echo_buf,
             echo_pending: Arc::try_new(AtomicUsize::new(0)).unwrap(),
             empty_eof_pending: Arc::try_new(AtomicBool::new(false)).unwrap(),
@@ -1532,6 +1802,153 @@ mod tests {
         worker.join().unwrap();
         assert!(control.cancelled.load(Ordering::Acquire));
         assert!(control.terminated.load(Ordering::Acquire));
+    }
+
+    #[derive(Clone)]
+    struct RecordingSink {
+        output: Arc<SpinNoIrq<Vec<u8>>>,
+        stopped: Arc<AtomicBool>,
+    }
+    impl TtyWrite for RecordingSink {
+        fn write(&self, bytes: &[u8]) -> AxResult<usize> {
+            if self.stopped.load(Ordering::Acquire) {
+                return Err(AxError::WouldBlock);
+            }
+            self.output.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn set_input_flow_stopped(&self, stopped: bool) {
+            self.stopped.store(stopped, Ordering::Release);
+        }
+        fn output_column(&self) -> Option<usize> {
+            Some(output_column_after(0, &self.output.lock()))
+        }
+    }
+
+    fn input_with_echo(
+        input: &[u8],
+        flags: impl FnOnce(&mut Termios2),
+    ) -> (LineDiscipline<VecReader, RecordingSink>, RecordingSink) {
+        let terminal = Arc::new(Terminal::default());
+        flags(&mut terminal.termios.lock());
+        let sink = RecordingSink {
+            output: Arc::new(SpinNoIrq::new(Vec::new())),
+            stopped: Arc::new(AtomicBool::new(false)),
+        };
+        let discipline = LineDiscipline::try_new(
+            terminal,
+            TtyConfig {
+                reader: VecReader {
+                    input: input.to_vec(),
+                    offset: 0,
+                    eof: false,
+                },
+                writer: sink.clone(),
+                process_mode: ProcessMode::Manual,
+            },
+        )
+        .unwrap();
+        (discipline, sink)
+    }
+
+    fn edit_flags(term: &mut Termios2, offset: usize, set: u32, clear: u32) {
+        let mut bytes = term.to_user_bytes();
+        let flags = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        bytes[offset..offset + 4].copy_from_slice(&((flags | set) & !clear).to_ne_bytes());
+        *term = Termios2::from_user_bytes(bytes);
+    }
+
+    #[test]
+    fn canonical_preserves_tabs_nuls_controls_and_non_ascii() {
+        let input = b"a\t\0\x01\x1b\x80\xff\n";
+        let (mut discipline, sink) = input_with_echo(input, |_| {});
+        let mut data = [0; 32];
+        assert_eq!(discipline.read(&mut data), Ok(input.len()));
+        assert_eq!(&data[..input.len()], input);
+        assert_eq!(sink.output.lock().as_slice(), b"a\t^@^A^[\x80\xff\n");
+    }
+
+    #[test]
+    fn empty_erase_and_kill_never_erase_the_prompt() {
+        let (mut discipline, sink) = input_with_echo(b"\x7f\x15", |_| {});
+        sink.output.lock().extend_from_slice(b"prompt> ");
+        assert!(!discipline.poll_read());
+        assert_eq!(sink.output.lock().as_slice(), b"prompt> ");
+    }
+
+    #[test]
+    fn canonical_visual_erase_handles_control_width_tab_and_utf8() {
+        let (mut discipline, sink) = input_with_echo(b"\t\x7f\x01\x7f\xc3\xa9\x7f\n", |term| {
+            edit_flags(term, 0, IUTF8, 0)
+        });
+        sink.output.lock().extend_from_slice(b"> ");
+        let mut data = [0; 8];
+        assert_eq!(discipline.read(&mut data), Ok(1));
+        assert_eq!(data[0], b'\n');
+        assert_eq!(
+            sink.output.lock().as_slice(),
+            b"> \t\x08\x08\x08\x08\x08\x08^A\x08 \x08\x08 \x08\xc3\xa9\x08 \x08\n"
+        );
+    }
+
+    #[test]
+    fn extended_editing_word_kill_and_literal_next_have_real_semantics() {
+        let (mut discipline, _) = input_with_echo(b"one two\x17X\x15\x16\x03\n", |_| {});
+        let mut data = [0; 32];
+        assert_eq!(discipline.read(&mut data), Ok(2));
+        assert_eq!(&data[..2], b"\x03\n");
+        let (mut discipline, sink) = input_with_echo(b"abc\x15", |_| {});
+        assert!(!discipline.poll_read());
+        assert_eq!(
+            sink.output.lock().as_slice(),
+            b"abc\x08 \x08\x08 \x08\x08 \x08"
+        );
+    }
+
+    #[test]
+    fn echonl_echoes_only_newline_with_echo_disabled() {
+        let (mut discipline, sink) = input_with_echo(b"abc\n", |term| {
+            edit_flags(term, 12, ECHONL, linux_raw_sys::general::ECHO)
+        });
+        assert!(discipline.poll_read());
+        assert_eq!(sink.output.lock().as_slice(), b"\n");
+    }
+
+    #[test]
+    fn ixon_consumes_stop_start_and_resumes_deferred_echo() {
+        let (mut discipline, sink) = input_with_echo(b"\x13abc\n", |_| {});
+        assert!(discipline.poll_read());
+        assert!(sink.stopped.load(Ordering::Acquire));
+        assert!(sink.output.lock().is_empty());
+        discipline.inject_input(b"\x11").unwrap();
+        assert!(!sink.stopped.load(Ordering::Acquire));
+        discipline.poll_read();
+        assert_eq!(sink.output.lock().as_slice(), b"abc\n");
+        let mut data = [0; 16];
+        assert_eq!(discipline.read(&mut data), Ok(4));
+        assert_eq!(&data[..4], b"abc\n");
+    }
+
+    #[test]
+    fn noncanonical_poll_uses_vmin_only_without_vtime() {
+        let (mut discipline, _) = input_with_echo(b"ab", |term| {
+            term.set_canonical_for_test(false);
+            term.set_special_char_for_test(VMIN, 3);
+        });
+        assert!(!discipline.poll_read());
+        discipline.inject_input(b"c").unwrap();
+        assert!(discipline.poll_read());
+        let (mut timed, _) = input_with_echo(b"a", |term| {
+            term.set_canonical_for_test(false);
+            term.set_special_char_for_test(VMIN, 255);
+            term.set_special_char_for_test(VTIME, 1);
+        });
+        assert!(timed.poll_read());
+        let (mut full_minimum, _) = input_with_echo(&[b'a'; 255], |term| {
+            term.set_canonical_for_test(false);
+            term.set_special_char_for_test(VMIN, 255);
+        });
+        assert!(full_minimum.poll_read());
     }
 
     #[test]

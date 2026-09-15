@@ -229,6 +229,27 @@ struct Listener {
 #[derive(Clone)]
 pub struct Bind(Arc<Listener>);
 
+impl Pollable for Bind {
+    fn poll(&self) -> IoEvents {
+        let backlog = self.0.backlog.load(Ordering::Acquire);
+        if backlog == 0 || self.0.conn_tx.is_closed() || !self.0.conn_tx.is_full_at_limit(backlog) {
+            IoEvents::WRITABLE
+        } else {
+            IoEvents::empty()
+        }
+    }
+
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        _events: IoEvents,
+    ) -> Result<PollRegistration<'a>, PollRegistrationError> {
+        let mut prepared = PreparedPollRegistration::try_new(1)?;
+        prepared.arm_owned(self.0.conn_tx.write_poll_source(), context.waker())?;
+        prepared.commit()
+    }
+}
+
 impl Bind {
     fn try_new(conn_tx: Sender<ConnRequest>, passcred: Arc<AtomicBool>) -> AxResult<Self> {
         Arc::try_new(Listener {
@@ -242,10 +263,17 @@ impl Bind {
     }
 
     fn reserve(&self) -> AxResult<SendPermit<ConnRequest>> {
+        let backlog = self.0.backlog.load(Ordering::Acquire);
+        if backlog == 0 || self.0.conn_tx.is_closed() {
+            return Err(AxError::ConnectionRefused);
+        }
         self.0
             .conn_tx
-            .try_reserve(self.0.backlog.load(Ordering::Acquire))
-            .map_err(|_| AxError::ConnectionRefused)
+            .try_reserve(backlog)
+            .map_err(|error| match error {
+                super::queue::ReserveError::Full => AxError::WouldBlock,
+                super::queue::ReserveError::Closed => AxError::ConnectionRefused,
+            })
     }
 
     pub(super) fn identity(&self) -> usize {
@@ -264,6 +292,7 @@ impl Bind {
         self.0
             .backlog
             .store(backlog.clamp(1, LISTEN_QUEUE_SIZE), Ordering::Release);
+        self.0.conn_tx.write_poll_source().wake();
         Ok(())
     }
 }
@@ -760,7 +789,11 @@ impl StreamTransport {
             } else {
                 return Err(AxError::ConnectionRefused);
             };
-            let permit = bind.reserve()?;
+            let permit = self.general.send_poller_with_effective_nonblocking(
+                &bind,
+                self.general.nonblocking(),
+                || bind.reserve(),
+            )?;
             let listener_credentials = *bind.0.credentials.lock();
             let (mut client_channel, mut server_channel) =
                 new_channels(credentials, listener_credentials)?;
@@ -1169,7 +1202,7 @@ impl TransportOps for StreamTransport {
                 let poll_update = (count > 0).then(|| chan.poll_update.clone());
                 let result = if count > 0 {
                     Ok(count)
-                } else if peer_write_closed {
+                } else if peer_write_closed || self.rx_closed.load(Ordering::Acquire) {
                     Ok(0)
                 } else {
                     Err(AxError::WouldBlock)
@@ -1183,16 +1216,15 @@ impl TransportOps for StreamTransport {
     }
 
     fn shutdown(&self, how: Shutdown) -> AxResult<()> {
-        let (retired_rx, retired_tx, retired_segments_rx, retired_segments_tx, poll_update) = {
+        let (retired_tx, retired_segments_tx, poll_update) = {
             let mut channel = self.channel.lock();
             let channel = channel.as_mut().ok_or(AxError::NotConnected)?;
-            let retired_rx = if how.has_read() {
+            if how.has_read() {
                 self.rx_closed.store(true, Ordering::Release);
                 channel.publish_read_close();
-                channel.rx.take()
-            } else {
-                None
-            };
+                // Keep already queued bytes and their ancillary intervals.
+                // The peer observes read-close and cannot enqueue more bytes.
+            }
             let retired_tx = if how.has_write() {
                 self.tx_closed.store(true, Ordering::Release);
                 channel.publish_write_close();
@@ -1200,24 +1232,10 @@ impl TransportOps for StreamTransport {
             } else {
                 None
             };
-            let (retired_segments_rx, retired_segments_tx) =
-                channel.retire_ancillary(how.has_read(), how.has_write());
-            (
-                retired_rx,
-                retired_tx,
-                retired_segments_rx,
-                retired_segments_tx,
-                channel.poll_update.clone(),
-            )
+            let (_, retired_segments_tx) = channel.retire_ancillary(false, how.has_write());
+            (retired_tx, retired_segments_tx, channel.poll_update.clone())
         };
-        drop(retired_rx);
         drop(retired_tx);
-        if let Some(receiver) = retired_segments_rx {
-            receiver.close();
-            while let Ok(segment) = receiver.try_recv() {
-                drop(segment);
-            }
-        }
         drop(retired_segments_tx);
         poll_update.wake();
         self.poll_state.wake();
@@ -2431,7 +2449,7 @@ mod tests {
 
         bind.start_listening(1, credentials).unwrap();
         let permit = bind.reserve().unwrap();
-        assert_eq!(bind.reserve().err().unwrap(), AxError::ConnectionRefused);
+        assert_eq!(bind.reserve().err().unwrap(), AxError::WouldBlock);
         permit
             .send(ConnRequest {
                 channel: new_channels(credentials, credentials).unwrap().1,
@@ -2472,22 +2490,19 @@ mod tests {
     }
 
     #[test]
-    fn stream_read_shutdown_breaks_peer_writes() {
+    fn stream_read_shutdown_preserves_queued_data_and_breaks_peer_writes() {
         let credentials = SocketCredentials::new(1, 2, 3);
         let (left, right) = StreamTransport::new_pair(credentials).unwrap();
-
+        left.send(&b"queued"[..], SendOptions::default()).unwrap();
         right.shutdown(Shutdown::Read).unwrap();
-        assert!(right.channel.lock().as_ref().unwrap().rx.is_none());
-        assert!(
-            !left
-                .channel
-                .lock()
-                .as_ref()
-                .unwrap()
-                .tx
-                .as_ref()
-                .unwrap()
-                .read_is_held()
+        assert!(right.channel.lock().as_ref().unwrap().rx.is_some());
+        assert_eq!(
+            left.send(&b"later"[..], SendOptions::default()),
+            Err(AxError::BrokenPipe)
         );
+        let mut output = [0; 6];
+        assert_eq!(right.recv(&mut output[..], RecvOptions::default()), Ok(6));
+        assert_eq!(&output, b"queued");
+        assert_eq!(right.recv(&mut output[..], RecvOptions::default()), Ok(0));
     }
 }

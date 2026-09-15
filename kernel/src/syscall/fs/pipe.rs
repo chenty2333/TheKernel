@@ -19,7 +19,7 @@ bitflags! {
         const CLOEXEC = O_CLOEXEC;
         /// Create a non-blocking pipe.
         const NONBLOCK = O_NONBLOCK;
-        /// Enable packet mode for the pipe. We currently expose the flag via F_GETFL.
+        /// Request packet mode (not implemented by the byte-stream backend).
         const DIRECT = O_DIRECT;
     }
 }
@@ -30,6 +30,11 @@ pub fn sys_pipe2<M: UserMemory + ?Sized>(
     flags: u32,
 ) -> AxResult<isize> {
     let flags = PipeFlags::from_bits(flags).ok_or(AxError::InvalidInput)?;
+
+    // Do not advertise packet semantics while the backing is a byte stream.
+    if flags.contains(PipeFlags::DIRECT) {
+        return Err(AxError::OperationNotSupported);
+    }
 
     let cloexec = flags.contains(PipeFlags::CLOEXEC);
     let (read_end, write_end) = Pipe::new();
@@ -43,10 +48,6 @@ pub fn sys_pipe2<M: UserMemory + ?Sized>(
         read_status |= O_NONBLOCK;
         write_status |= O_NONBLOCK;
     }
-    if flags.contains(PipeFlags::DIRECT) {
-        write_status |= O_DIRECT;
-    }
-
     let read_fd = add_file_like_with_flags(Arc::new(read_end), cloexec, read_status)?;
     let write_fd = add_file_like_with_flags(Arc::new(write_end), cloexec, write_status)
         .inspect_err(|_| {

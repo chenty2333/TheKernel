@@ -475,3 +475,55 @@ fn prepared_exit_excludes_competing_lifecycle_work_and_rolls_back() {
     );
     assert!(domain.reap(&child).unwrap());
 }
+
+#[test]
+fn last_thread_status_matches_linux_group_exit_synchronization() {
+    for transactional in [false, true] {
+        let domain = domain();
+        let init = init(&domain);
+        let process = child(&domain, &init, 2);
+        for tid in [2, 3] {
+            domain
+                .prepare_thread(&process, tid)
+                .unwrap()
+                .commit()
+                .unwrap();
+        }
+        if transactional {
+            assert!(matches!(
+                domain.exit_thread(&process, 2, 42).unwrap(),
+                tk_linux_process::ThreadExitTransition::LiveThreadsRemain
+            ));
+            let final_exit = domain.exit_thread(&process, 3, 0).unwrap();
+            assert_eq!(process.exit_code(), 0);
+            drop(final_exit);
+            assert_eq!(process.exit_code(), 0);
+        } else {
+            assert_eq!(
+                process.exit_thread(2, 42),
+                ThreadExitOutcome::LiveThreadsRemain
+            );
+            assert_eq!(process.exit_thread(3, 0), ThreadExitOutcome::FinalThread);
+            assert_eq!(process.exit_code(), 0);
+        }
+    }
+}
+
+#[test]
+fn explicit_group_exit_overrides_prior_worker_status() {
+    let domain = domain();
+    let init = init(&domain);
+    let process = child(&domain, &init, 2);
+    for tid in [2, 3] {
+        domain
+            .prepare_thread(&process, tid)
+            .unwrap()
+            .commit()
+            .unwrap();
+    }
+    process.exit_thread(3, 99);
+    assert_eq!(process.exit_code(), 99);
+    process.group_exit(9);
+    process.exit_thread(2, 42);
+    assert_eq!(process.exit_code(), 9);
+}

@@ -66,6 +66,7 @@ impl AlarmClock {
 pub(crate) enum PosixTimerClock {
     Realtime,
     Monotonic,
+    Boottime,
     Tai,
     /// Thread-group CPU-time clock.  Expiry is evaluated by the existing
     /// deferred accounting worker, never by a wall-clock alarm.
@@ -80,7 +81,9 @@ impl PosixTimerClock {
     pub(crate) fn absolute_alarm_clock(self) -> AlarmClock {
         match self {
             Self::Realtime | Self::Tai => AlarmClock::Realtime,
-            Self::Monotonic | Self::ProcessCpu | Self::ThreadCpu => AlarmClock::Monotonic,
+            Self::Monotonic | Self::Boottime | Self::ProcessCpu | Self::ThreadCpu => {
+                AlarmClock::Monotonic
+            }
         }
     }
 }

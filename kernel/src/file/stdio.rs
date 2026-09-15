@@ -14,10 +14,10 @@ pub fn add_stdio(fd_table: &FdTable, cx: &FsContext) -> AxResult<()> {
         )
     };
 
-    let stdin = open(OpenOptions::new().read(true).write(false), 0)?;
-    let tty_out = open(OpenOptions::new().read(false).write(true), 1)?;
-    let stdout = tty_out.clone();
-    let stderr = tty_out;
+    // One O_RDWR open-file description, duplicated onto the three standard fds.
+    let stdin = open(OpenOptions::new().read(true).write(true), 2)?;
+    let stdout = stdin.clone();
+    let stderr = stdin.clone();
 
     if fd_table.add_at_least(stdin, 0, 1, false)? != 0
         || fd_table.add_at_least(stdout, 1, 2, false)? != 1

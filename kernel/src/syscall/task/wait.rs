@@ -163,10 +163,12 @@ impl WaitEvent {
         }
     }
 
-    fn exited_usage(&self) -> Option<TaskUsage> {
+    fn usage(&self) -> TaskUsage {
         match self {
-            WaitEvent::Exited { snapshot, .. } => Some(snapshot.total_usage().into()),
-            _ => None,
+            WaitEvent::Exited { snapshot, .. } => snapshot.total_usage().into(),
+            WaitEvent::Stopped { proc_data, .. } | WaitEvent::Continued { proc_data, .. } => {
+                proc_data.total_usage()
+            }
         }
     }
 }
@@ -251,13 +253,7 @@ fn matching_wait_candidates(
             });
         }
     }
-    crate::task::exit_status_note_candidates(
-        seen,
-        pid_ok,
-        ok,
-        tracees.len() as u32,
-        invisible,
-    );
+    crate::task::exit_status_note_candidates(seen, pid_ok, ok, tracees.len() as u32, invisible);
 
     for reverse_link in tracees {
         let tracee_pid = reverse_link.tracee();
@@ -409,9 +405,8 @@ fn write_waitpid_event(
             .write_value(exit_code, event.waitpid_status())
             .map_err(map_usercopy_error)?;
     }
-    if let Some(usage) = event.exited_usage()
-        && !rusage_ptr.is_null()
-    {
+    if !rusage_ptr.is_null() {
+        let usage = event.usage();
         // TaskUsage's conversion starts from a zeroed rusage and fills
         // every exposed field, so the complete ABI representation is
         // initialized for this unchecked copyout.
@@ -439,9 +434,8 @@ fn write_waitid_event(
                 .map_err(map_usercopy_error)?;
         }
     }
-    if let Some(usage) = event.exited_usage()
-        && !rusage_ptr.is_null()
-    {
+    if !rusage_ptr.is_null() {
+        let usage = event.usage();
         unsafe {
             memory
                 .write_value_unchecked(rusage_ptr, usage.into())
@@ -451,14 +445,40 @@ fn write_waitid_event(
     Ok(())
 }
 
-fn restore_wait_event(event: &WaitEvent) {
+/// Claim the event before any usercopy. As in Linux, EFAULT does not undo a
+/// consumed wait event; WNOWAIT alone leaves it available to another waiter.
+fn claim_wait_event(event: &WaitEvent, parent: &ProcessData, nowait: bool) -> AxResult<bool> {
+    if nowait {
+        return Ok(true);
+    }
     match event {
         WaitEvent::Stopped {
             stop, proc_data, ..
-        } => proc_data.restore_stop_status(*stop),
-        WaitEvent::Continued { proc_data, .. } => proc_data.restore_continued(),
-        WaitEvent::Exited { .. } => {}
+        } => {
+            let Some(claimed) = proc_data.claim_stop_status(stop.ptrace_session) else {
+                return Ok(false);
+            };
+            if claimed != *stop {
+                proc_data.restore_stop_status(claimed);
+                return Ok(false);
+            }
+        }
+        WaitEvent::Continued { proc_data, .. } => {
+            if !proc_data.claim_continued() {
+                return Ok(false);
+            }
+        }
+        WaitEvent::Exited {
+            child, snapshot, ..
+        } => {
+            if !reap_child(child)? {
+                return Ok(false);
+            }
+            cgroup::detach_process(child);
+            parent.account_waited_child(snapshot.total_usage().into());
+        }
     }
+    Ok(true)
 }
 
 fn reap_child(child: &Process) -> AxResult<bool> {
@@ -522,48 +542,22 @@ pub fn sys_waitpid(
                 WaitEvent::Stopped { stop, .. } => (2, i32::from(stop.signal)),
                 WaitEvent::Continued { .. } => (3, 0),
             };
-            trace_wait(pid, i64::from(event.pid()), status, &options, event_kind, 0, 0);
-            let claimed_event = match &event {
-                WaitEvent::Stopped {
-                    stop, proc_data, ..
-                } => {
-                    let Some(claimed_stop) = proc_data.claim_stop_status(stop.ptrace_session)
-                    else {
-                        return Ok(None);
-                    };
-                    if claimed_stop != *stop {
-                        proc_data.restore_stop_status(claimed_stop);
-                        return Ok(None);
-                    }
-                    Some(event.clone())
-                }
-                WaitEvent::Continued { proc_data, .. } => {
-                    if !proc_data.claim_continued() {
-                        return Ok(None);
-                    }
-                    Some(event.clone())
-                }
-                WaitEvent::Exited { .. } => None,
-            };
-
-            if let Err(err) = write_waitpid_event(&memory, &event, exit_code, rusage_ptr) {
-                if let Some(claimed_event) = &claimed_event {
-                    restore_wait_event(claimed_event);
-                }
-                return Err(err);
+            trace_wait(
+                pid,
+                i64::from(event.pid()),
+                status,
+                &options,
+                event_kind,
+                0,
+                0,
+            );
+            if !claim_wait_event(&event, proc_data, false)? {
+                return Ok(None);
             }
-
-            if let WaitEvent::Exited {
-                child, snapshot, ..
-            } = &event
-            {
-                let reaped = reap_child(child)?;
-                if !reaped {
-                    return Ok(None);
-                }
-                cgroup::detach_process(child);
-                proc_data.account_waited_child(snapshot.total_usage().into());
-            }
+            // The immutable snapshot and consumed-event claim now suffice;
+            // a userfaultfd stall must not hold the parent's wait mutex.
+            drop(_wait_guard);
+            write_waitpid_event(&memory, &event, exit_code, rusage_ptr)?;
 
             return Ok(Some(event.pid() as isize));
         }
@@ -736,54 +730,11 @@ pub fn sys_waitid(
             &wait_options,
             wait_options.contains(WaitOptions::WEXITED),
         ) {
-            let claimed_event = if nowait {
-                None
-            } else {
-                match &event {
-                    WaitEvent::Stopped {
-                        stop, proc_data, ..
-                    } => {
-                        let Some(claimed_stop) = proc_data.claim_stop_status(stop.ptrace_session)
-                        else {
-                            return Ok(None);
-                        };
-                        if claimed_stop != *stop {
-                            proc_data.restore_stop_status(claimed_stop);
-                            return Ok(None);
-                        }
-                        Some(event.clone())
-                    }
-                    WaitEvent::Continued { proc_data, .. } => {
-                        if !proc_data.claim_continued() {
-                            return Ok(None);
-                        }
-                        Some(event.clone())
-                    }
-                    WaitEvent::Exited { .. } => None,
-                }
-            };
-
-            if let Err(err) =
-                write_waitid_event(&memory, &event, &viewer_user_ns, infop, rusage_ptr)
-            {
-                if let Some(claimed_event) = &claimed_event {
-                    restore_wait_event(claimed_event);
-                }
-                return Err(err);
+            if !claim_wait_event(&event, proc_data, nowait)? {
+                return Ok(None);
             }
-
-            match &event {
-                WaitEvent::Exited {
-                    child, snapshot, ..
-                } if !nowait => {
-                    if !reap_child(child)? {
-                        return Ok(None);
-                    }
-                    cgroup::detach_process(child);
-                    proc_data.account_waited_child(snapshot.total_usage().into());
-                }
-                _ => {}
-            }
+            drop(_wait_guard);
+            write_waitid_event(&memory, &event, &viewer_user_ns, infop, rusage_ptr)?;
 
             return Ok(Some(0));
         }
@@ -792,6 +743,7 @@ pub fn sys_waitid(
             if pidfd_nonblocking && !explicit_nohang {
                 return Err(AxError::from(LinuxError::EAGAIN));
             }
+            drop(_wait_guard);
             if !infop.is_null() {
                 // The zeroed siginfo has a fully initialized ABI
                 // representation, including padding bytes.

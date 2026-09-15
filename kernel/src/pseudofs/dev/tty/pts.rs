@@ -6,43 +6,43 @@ use axfs_ng_vfs::{
     DeviceId, Filesystem, FsName, FsNameBuf, MetadataUpdate, NodeOps, NodePermission, NodeType,
     VfsResult,
 };
-use bitmaps::{Bits, BitsImpl};
-use flatten_objects::FlattenObjects;
-use kspin::SpinNoIrq;
+use axsync::Mutex;
 
 use crate::pseudofs::{
     ChildNames, Device, NodeOpsMux, SimpleDirOps, SimpleFs, dev::tty::pty::PtyDriver,
     try_boxed_names,
 };
 
-const PTS_CAPACITY: usize = 16;
+const PTS_CAPACITY: usize = 4096;
 
-/// A fixed-capacity reservation table. `None` is a private reserved slot and
-/// `Some` is an atomically published devpts entry. It never allocates while
-/// holding its IRQ-safe lock.
-pub(super) struct SlotTable<T: ?Sized, const CAP: usize>
-where
-    BitsImpl<CAP>: Bits,
-{
-    slots: SpinNoIrq<FlattenObjects<Option<Arc<T>>, CAP>>,
+/// Lazily allocated, fallible reservations with a hard per-devpts limit.
+/// The sleepable mutex permits growth without allocating under an IRQ lock.
+/// Outer None is free; Some(None) is an unpublished reservation.
+pub(super) struct SlotTable<T: ?Sized, const CAP: usize> {
+    slots: Mutex<Vec<Option<Option<Arc<T>>>>>,
 }
 
-impl<T: ?Sized, const CAP: usize> SlotTable<T, CAP>
-where
-    BitsImpl<CAP>: Bits,
-{
+impl<T: ?Sized, const CAP: usize> SlotTable<T, CAP> {
     const fn new() -> Self {
         Self {
-            slots: SpinNoIrq::new(FlattenObjects::new()),
+            slots: Mutex::new(Vec::new()),
         }
     }
 
     fn reserve(self: &Arc<Self>) -> AxResult<SlotLease<T, CAP>> {
-        let id = self
-            .slots
-            .lock()
-            .add(None)
-            .map_err(|_| AxError::StorageFull)?;
+        let mut slots = self.slots.lock();
+        let id = if let Some(id) = slots.iter().position(Option::is_none) {
+            slots[id] = Some(None);
+            id
+        } else {
+            if slots.len() == CAP {
+                return Err(AxError::StorageFull);
+            }
+            slots.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            let id = slots.len();
+            slots.push(Some(None));
+            id
+        };
         Ok(SlotLease {
             table: self.clone(),
             id,
@@ -51,62 +51,61 @@ where
     }
 
     fn publish(&self, id: usize, value: Arc<T>) -> Result<(), Arc<T>> {
-        {
-            let mut slots = self.slots.lock();
-            match slots.get_mut(id) {
-                Some(slot) if slot.is_none() => {
-                    *slot = Some(value);
-                    Ok(())
-                }
-                _ => Err(value),
+        let mut slots = self.slots.lock();
+        match slots.get_mut(id) {
+            Some(Some(slot)) if slot.is_none() => {
+                *slot = Some(value);
+                Ok(())
             }
+            _ => Err(value),
         }
     }
 
     fn lookup(&self, id: usize) -> Option<Arc<T>> {
-        self.slots.lock().get(id).and_then(Option::as_ref).cloned()
+        self.slots
+            .lock()
+            .get(id)
+            .and_then(Option::as_ref)
+            .and_then(Option::as_ref)
+            .cloned()
     }
 
     fn remove(&self, id: usize) {
-        // Removing transfers the Arc out of the table. Its destructor runs
-        // only after the spin guard has gone away.
-        let removed = {
-            let mut slots = self.slots.lock();
-            slots.remove(id)
-        };
+        let removed = self.slots.lock().get_mut(id).and_then(Option::take);
         drop(removed);
     }
 
-    fn assigned_ids(&self) -> [Option<usize>; CAP] {
-        let mut snapshot = [None; CAP];
+    fn assigned_ids(&self) -> AxResult<Vec<usize>> {
         let slots = self.slots.lock();
-        for (dst, id) in snapshot.iter_mut().zip(slots.ids()) {
-            if slots.get(id).is_some_and(Option::is_some) {
-                *dst = Some(id);
-            }
-        }
-        snapshot
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(slots.len())
+            .map_err(|_| AxError::NoMemory)?;
+        ids.extend(
+            slots
+                .iter()
+                .enumerate()
+                .filter_map(|(id, slot)| slot.as_ref().is_some_and(Option::is_some).then_some(id)),
+        );
+        Ok(ids)
     }
 
     #[cfg(test)]
     fn is_reserved(&self, id: usize) -> bool {
-        self.slots.lock().get(id).is_some()
+        self.slots.lock().get(id).is_some_and(Option::is_some)
     }
 }
 
-pub(super) struct SlotLease<T: ?Sized, const CAP: usize>
-where
-    BitsImpl<CAP>: Bits,
-{
+pub(super) struct SlotLease<T: ?Sized, const CAP: usize> {
     table: Arc<SlotTable<T, CAP>>,
     id: usize,
     active: bool,
 }
 
-impl<T: ?Sized, const CAP: usize> SlotLease<T, CAP>
-where
-    BitsImpl<CAP>: Bits,
-{
+impl<T: ?Sized, const CAP: usize> SlotLease<T, CAP> {
+    pub(super) fn device(&self) -> Option<Arc<T>> {
+        self.table.lookup(self.id)
+    }
+
     fn id(&self) -> usize {
         self.id
     }
@@ -116,10 +115,7 @@ where
     }
 }
 
-impl<T: ?Sized, const CAP: usize> Drop for SlotLease<T, CAP>
-where
-    BitsImpl<CAP>: Bits,
-{
+impl<T: ?Sized, const CAP: usize> Drop for SlotLease<T, CAP> {
     fn drop(&mut self) {
         if self.active {
             self.active = false;
@@ -293,14 +289,14 @@ impl SimpleDirOps for PtsDir {
     }
 
     fn child_names<'a>(&'a self) -> VfsResult<ChildNames<'a>> {
-        let snapshot = self.table.assigned_ids();
-        let count = snapshot.iter().flatten().count() + 1;
+        let snapshot = self.table.assigned_ids()?;
+        let count = snapshot.len() + 1;
         let mut names = Vec::new();
         names
             .try_reserve_exact(count)
             .map_err(|_| AxError::NoMemory)?;
         names.push(Cow::Borrowed(FsName::new(b"ptmx")));
-        for id in snapshot.into_iter().flatten() {
+        for id in snapshot {
             let mut name = String::new();
             name.try_reserve_exact(20).map_err(|_| AxError::NoMemory)?;
             write!(&mut name, "{id}").map_err(|_| AxError::NoMemory)?;
@@ -549,6 +545,8 @@ mod tests {
     #[test]
     fn reservation_limit_is_honest_and_all_slots_roll_back() {
         let table = Arc::new(SlotTable::<Marker, PTS_CAPACITY>::new());
+        assert_eq!(PTS_CAPACITY, 4096);
+        assert_eq!(table.slots.lock().capacity(), 0);
         let mut leases = Vec::new();
         leases.try_reserve_exact(PTS_CAPACITY).unwrap();
         for expected in 0..PTS_CAPACITY {

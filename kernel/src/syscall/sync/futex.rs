@@ -7,16 +7,18 @@ use axtask::current;
 use linux_raw_sys::general::{
     __kernel_clockid_t, CLOCK_MONOTONIC, CLOCK_REALTIME, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK,
     FUTEX_CMP_REQUEUE, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_WAIT, FUTEX_WAIT_BITSET,
-    FUTEX_WAITV_MAX, FUTEX_WAKE, FUTEX_WAKE_BITSET, futex_waitv, robust_list_head, timespec,
+    FUTEX_WAITV_MAX, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, futex_waitv, robust_list_head,
+    timespec,
 };
 use tk_linux_futex::{
-    Futex2Flags, FutexWaitV, parse_futex2_flags, plan_requeue, validate_requeue_flags,
+    Futex2Flags, FutexWaitV, WakeOp, parse_futex2_flags, plan_requeue, validate_requeue_flags,
+    wake_op_count,
 };
 
 use crate::{
     mm::{
         AddrSpace, FutexMappingNamespace, SharedFutexKey, UserMemoryCapability,
-        check_user_readable_with, map_usercopy_error,
+        check_user_readable_with, check_user_writable_with, map_usercopy_error,
     },
     task::{
         AlarmClock, AsThread, FutexHandle, FutexKey, FutexWaitRestart, PtraceAccessMode,
@@ -827,6 +829,69 @@ pub fn sys_futex(
                 &caller,
             )?;
             Ok(count as _)
+        }
+        FUTEX_WAKE_OP => {
+            validate_futex_key_access(uaddr, private, &caller)?;
+            validate_futex_user_range(uaddr2.cast_const(), &caller)?;
+            check_user_writable_with(&caller, uaddr2.addr(), size_of::<u32>())?;
+            let operation = WakeOp::decode(value3).map_err(|_| LinuxError::ENOSYS)?;
+            // Legacy WAKE_OP checks its signed limits after each wake: even a
+            // zero or negative limit wakes one matching waiter when present.
+            let wake_count = wake_op_count(value);
+            let wake_count2 = wake_op_count(timeout.addr() as u32);
+            loop {
+                let (key, namespace) = futex_key_from(uaddr.addr(), private, &caller_aspace);
+                let expected = key.shared_key().cloned();
+                let table = futex_table_for(&key);
+                let futex = table.get_or_insert_owned(&key);
+                let (key2, namespace2) = futex_key_from(uaddr2.addr(), private, &caller_aspace);
+                let expected2 = key2.shared_key().cloned();
+                let table2 = futex_table_for(&key2);
+                let futex2 = table2.get_or_insert_owned(&key2);
+                let result = futex.wq.wake_op(wake_count, &futex2.wq, wake_count2, || {
+                    let aspace = caller_aspace.try_lock().ok_or(WaitConditionError::Retry)?;
+                    let convert = |error| match error {
+                        crate::mm::UserU32NofaultError::Retry => WaitConditionError::Retry,
+                        crate::mm::UserU32NofaultError::BadAddress => {
+                            WaitConditionError::Fault(AxError::BadAddress)
+                        }
+                    };
+                    if !private {
+                        crate::mm::try_validate_futex_mapping_nofault_locked(
+                            &aspace,
+                            uaddr.addr(),
+                            namespace,
+                            expected.as_ref(),
+                        )
+                        .map_err(convert)?;
+                    }
+                    let old = crate::mm::try_update_user_u32_nofault_locked(
+                        &aspace,
+                        uaddr2.addr(),
+                        namespace2,
+                        expected2.as_ref(),
+                        |old| operation.updated(old),
+                    )
+                    .map_err(convert)?;
+                    operation
+                        .compare(old)
+                        .map_err(|_| WaitConditionError::Fault(LinuxError::ENOSYS.into()))
+                });
+                match result {
+                    Ok(woke) => return Ok(woke as isize),
+                    Err(WaitConditionError::Fault(error)) => return Err(error),
+                    Err(WaitConditionError::Retry) => {
+                        // Drop queue ownership before any fault/userfaultfd wait;
+                        // neither queue was changed and the RMW has not occurred.
+                        drop(futex);
+                        drop(futex2);
+                        if !private {
+                            let _ = fault_read_u32(&caller, uaddr.addr())?;
+                        }
+                        check_user_writable_with(&caller, uaddr2.addr(), size_of::<u32>())?;
+                    }
+                }
+            }
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
             if command == FUTEX_CMP_REQUEUE {

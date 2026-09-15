@@ -12,7 +12,9 @@ use axpoll::{IoEvents, PollSet, Pollable};
 use axsync::Mutex;
 use axtask::current;
 use linux_raw_sys::{
-    general::{CAP_SYS_RESOURCE, O_ACCMODE, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, POLL_IN},
+    general::{
+        CAP_SYS_RESOURCE, O_ACCMODE, O_DIRECT, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY, POLL_IN,
+    },
     ioctl::FIONREAD,
 };
 use memory_addr::PAGE_SIZE_4K;
@@ -36,7 +38,7 @@ const PIPE_BUF_SIZE: usize = PAGE_SIZE_4K;
 const RING_BUFFER_INIT_SIZE: usize = 65536; // 64 KiB
 const PIPE_MAX_CAPACITY_ARG: usize = 1 << 31;
 
-static PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(RING_BUFFER_INIT_SIZE);
+static PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(1024 * 1024);
 
 fn round_pipe_size(size: usize) -> AxResult<usize> {
     if size > PIPE_MAX_CAPACITY_ARG {
@@ -474,15 +476,234 @@ pub(crate) enum PipeEndpoint<'a> {
     Named(&'a NamedPipe),
 }
 
+impl Pollable for PipeEndpoint<'_> {
+    fn poll(&self) -> IoEvents {
+        match self {
+            Self::Anonymous(pipe) => pipe.poll(),
+            Self::Named(pipe) => pipe.poll(),
+        }
+    }
+    fn register<'a>(
+        &'a self,
+        context: &mut Context<'_>,
+        events: IoEvents,
+    ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+        match self {
+            Self::Anonymous(pipe) => pipe.register(context, events),
+            Self::Named(pipe) => pipe.register(context, events),
+        }
+    }
+}
+
 impl<'a> PipeEndpoint<'a> {
-    fn is_read(self) -> bool {
+    pub(crate) fn from_file(file: &'a dyn FileLike) -> Option<Self> {
+        file.downcast_ref::<Pipe>()
+            .map(Self::Anonymous)
+            .or_else(|| file.downcast_ref::<NamedPipe>().map(Self::Named))
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.buffer().lock().capacity().get()
+    }
+
+    pub fn resize(&self, requested_size: usize) -> AxResult<usize> {
+        let new_size = round_pipe_size(requested_size)?;
+
+        if current().try_as_thread().is_some_and(|thr| {
+            !thr.has_effective_capability(CAP_SYS_RESOURCE) && new_size > pipe_capacity_limit()
+        }) {
+            return Err(AxError::OperationNotPermitted);
+        }
+
+        let mut buffer = self.buffer().lock();
+        if new_size == buffer.capacity().get() {
+            return Ok(new_size);
+        }
+        if new_size < buffer.occupied_len() {
+            return Err(AxError::ResourceBusy);
+        }
+        let replacement = HeapRb::try_new(new_size).map_err(|_| AxError::NoMemory)?;
+        let old_buffer = mem::replace(&mut *buffer, replacement);
+        let (left, right) = old_buffer.as_slices();
+        buffer.push_slice(left);
+        buffer.push_slice(right);
+        drop(buffer);
+        self.poll_tx().wake();
+        Ok(new_size)
+    }
+
+    pub fn vmsplice_read(&self, dst: &mut IoDst, nonblocking: bool) -> AxResult<usize> {
+        if !self.is_read() {
+            return Err(AxError::BadFileDescriptor);
+        }
+        if dst.is_full() {
+            return Ok(0);
+        }
+
+        block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
+            let _transaction = self.read_transaction().lock();
+            let read = read_pipe_buffer(&self.buffer(), dst)?;
+            if read.len > 0 {
+                notify_pipe_writable(&self.poll_tx(), read);
+                Ok(read.len)
+            } else if self.source_closed() {
+                Ok(0)
+            } else {
+                Err(AxError::WouldBlock)
+            }
+        })
+    }
+
+    pub fn vmsplice_write(&self, src: &mut IoSrc, nonblocking: bool) -> AxResult<usize> {
+        if !self.is_write() {
+            return Err(AxError::BadFileDescriptor);
+        }
+        if src.remaining() == 0 {
+            return Ok(0);
+        }
+
+        block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
+            if self.destination_closed() {
+                raise_pipe();
+                return Err(AxError::BrokenPipe);
+            }
+
+            let written = write_pipe_buffer(&self.buffer(), src, None)?;
+            if written.len > 0 {
+                notify_pipe_readable(&self.poll_rx(), &self.async_io(), written);
+                Ok(written.len)
+            } else {
+                Err(AxError::WouldBlock)
+            }
+        })
+    }
+
+    pub fn tee_to(&self, out: &Self, len: usize, nonblocking: bool) -> AxResult<usize> {
+        if !self.is_read() || !out.is_write() {
+            return Err(AxError::BadFileDescriptor);
+        }
+        if len == 0 {
+            return Ok(0);
+        }
+        if self.state_key() == out.state_key() {
+            return Err(AxError::InvalidInput);
+        }
+
+        struct TeePoll<'a> {
+            src: PipeEndpoint<'a>,
+            dst: PipeEndpoint<'a>,
+        }
+
+        impl Pollable for TeePoll<'_> {
+            fn poll(&self) -> IoEvents {
+                let mut events = IoEvents::empty();
+                let src = self.src.buffer().lock();
+                events.set(IoEvents::READABLE, src.occupied_len() > 0);
+                drop(src);
+                let dst = self.dst.buffer().lock();
+                events.set(IoEvents::WRITABLE, pipe_poll_writable(&dst));
+                events
+            }
+
+            fn register<'a>(
+                &'a self,
+                context: &mut Context<'_>,
+                events: IoEvents,
+            ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
+                let read = events.contains(IoEvents::READABLE);
+                let write = events.contains(IoEvents::WRITABLE);
+                let mut prepared =
+                    axpoll::PreparedPollRegistration::try_new(2 + read as usize + write as usize)?;
+                if read {
+                    prepared.arm(&self.src.poll_rx(), context.waker())?;
+                }
+                if write {
+                    prepared.arm(&self.dst.poll_tx(), context.waker())?;
+                }
+                prepared.arm(&self.src.poll_close(), context.waker())?;
+                prepared.arm(&self.dst.poll_close(), context.waker())?;
+                prepared.commit()
+            }
+        }
+
+        let poller = TeePoll {
+            src: *self,
+            dst: *out,
+        };
+        let mut total_copied = 0usize;
+        block_on_poll_io(
+            &poller,
+            IoEvents::READABLE | IoEvents::WRITABLE,
+            nonblocking,
+            || {
+                let _transaction = self.read_transaction().lock();
+                if out.destination_closed() {
+                    if total_copied > 0 {
+                        return Ok(total_copied);
+                    }
+                    raise_pipe();
+                    return Err(AxError::BrokenPipe);
+                }
+                let remaining = len - total_copied;
+                if remaining == 0 {
+                    return Ok(total_copied);
+                }
+
+                // tee and splice share the same address order so concurrent
+                // opposite-direction operations cannot form an ABBA cycle.
+                let source_first = self.state_key() < out.state_key();
+                let (written, source_empty, destination_full) = if source_first {
+                    let source = self.buffer().lock();
+                    let mut destination = out.buffer().lock();
+                    let source_empty = source.occupied_len() == 0;
+                    let destination_full = destination.vacant_len() == 0;
+                    let count = remaining
+                        .min(source.occupied_len())
+                        .min(destination.vacant_len());
+                    (
+                        copy_pipe_buffer(&source, &mut destination, count),
+                        source_empty,
+                        destination_full,
+                    )
+                } else {
+                    let mut destination = out.buffer().lock();
+                    let source = self.buffer().lock();
+                    let source_empty = source.occupied_len() == 0;
+                    let destination_full = destination.vacant_len() == 0;
+                    let count = remaining
+                        .min(source.occupied_len())
+                        .min(destination.vacant_len());
+                    (
+                        copy_pipe_buffer(&source, &mut destination, count),
+                        source_empty,
+                        destination_full,
+                    )
+                };
+                if written.len == 0 {
+                    return blocked_pipe_transfer_result(
+                        total_copied,
+                        source_empty,
+                        self.source_closed(),
+                        destination_full,
+                    );
+                }
+                notify_pipe_readable(&out.poll_rx(), &out.async_io(), written);
+                total_copied += written.len;
+                // Linux returns an available prefix instead of waiting to fill
+                // the caller's entire requested length.
+                Ok(total_copied)
+            },
+        )
+    }
+
+    pub(crate) fn is_read(self) -> bool {
         match self {
             Self::Anonymous(pipe) => pipe.is_read(),
             Self::Named(pipe) => pipe.is_read(),
         }
     }
 
-    fn is_write(self) -> bool {
+    pub(crate) fn is_write(self) -> bool {
         match self {
             Self::Anonymous(pipe) => pipe.is_write(),
             Self::Named(pipe) => pipe.is_write(),
@@ -745,30 +966,10 @@ impl Pipe {
     }
 
     pub fn capacity(&self) -> usize {
-        self.shared.buffer.lock().capacity().get()
+        PipeEndpoint::Anonymous(self).capacity()
     }
-
-    pub fn resize(&self, requested_size: usize) -> AxResult<usize> {
-        let new_size = round_pipe_size(requested_size)?;
-
-        if current().try_as_thread().is_some_and(|thr| {
-            !thr.has_effective_capability(CAP_SYS_RESOURCE) && new_size > pipe_capacity_limit()
-        }) {
-            return Err(AxError::OperationNotPermitted);
-        }
-
-        let mut buffer = self.shared.buffer.lock();
-        if new_size == buffer.capacity().get() {
-            return Ok(new_size);
-        }
-        if new_size < buffer.occupied_len() {
-            return Err(AxError::ResourceBusy);
-        }
-        let old_buffer = mem::replace(&mut *buffer, HeapRb::new(new_size));
-        let (left, right) = old_buffer.as_slices();
-        buffer.push_slice(left);
-        buffer.push_slice(right);
-        Ok(new_size)
+    pub fn resize(&self, size: usize) -> AxResult<usize> {
+        PipeEndpoint::Anonymous(self).resize(size)
     }
 
     pub(crate) fn set_async_io(&self, enabled: bool, state: AsyncIoState, fd: i32) {
@@ -778,167 +979,13 @@ impl Pipe {
     }
 
     pub fn vmsplice_read(&self, dst: &mut IoDst, nonblocking: bool) -> AxResult<usize> {
-        if !self.is_read() {
-            return Err(AxError::BadFileDescriptor);
-        }
-        if dst.is_full() {
-            return Ok(0);
-        }
-
-        block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
-            let _transaction = self.shared.read_transaction.lock();
-            let read = read_pipe_buffer(&self.shared.buffer, dst)?;
-            if read.len > 0 {
-                notify_pipe_writable(&self.shared.poll_tx, read);
-                Ok(read.len)
-            } else if self.closed() {
-                Ok(0)
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        })
+        PipeEndpoint::Anonymous(self).vmsplice_read(dst, nonblocking)
     }
-
     pub fn vmsplice_write(&self, src: &mut IoSrc, nonblocking: bool) -> AxResult<usize> {
-        if !self.is_write() {
-            return Err(AxError::BadFileDescriptor);
-        }
-        if src.remaining() == 0 {
-            return Ok(0);
-        }
-
-        block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
-            if self.closed() {
-                raise_pipe();
-                return Err(AxError::BrokenPipe);
-            }
-
-            let written = write_pipe_buffer(&self.shared.buffer, src, None)?;
-            if written.len > 0 {
-                notify_pipe_readable(&self.shared.poll_rx, &self.shared.async_io, written);
-                Ok(written.len)
-            } else {
-                Err(AxError::WouldBlock)
-            }
-        })
+        PipeEndpoint::Anonymous(self).vmsplice_write(src, nonblocking)
     }
-
     pub fn tee_to(&self, out: &Self, len: usize, nonblocking: bool) -> AxResult<usize> {
-        if !self.is_read() || !out.is_write() {
-            return Err(AxError::BadFileDescriptor);
-        }
-        if len == 0 {
-            return Ok(0);
-        }
-        if Arc::ptr_eq(&self.shared, &out.shared) {
-            return Err(AxError::InvalidInput);
-        }
-
-        struct TeePoll<'a> {
-            src: &'a Pipe,
-            dst: &'a Pipe,
-        }
-
-        impl Pollable for TeePoll<'_> {
-            fn poll(&self) -> IoEvents {
-                let mut events = IoEvents::empty();
-                let src = self.src.shared.buffer.lock();
-                events.set(IoEvents::READABLE, src.occupied_len() > 0);
-                drop(src);
-                let dst = self.dst.shared.buffer.lock();
-                events.set(IoEvents::WRITABLE, pipe_poll_writable(&dst));
-                events
-            }
-
-            fn register<'a>(
-                &'a self,
-                context: &mut Context<'_>,
-                events: IoEvents,
-            ) -> Result<axpoll::PollRegistration<'a>, axpoll::PollRegistrationError> {
-                let read = events.contains(IoEvents::READABLE);
-                let write = events.contains(IoEvents::WRITABLE);
-                let mut prepared =
-                    axpoll::PreparedPollRegistration::try_new(2 + read as usize + write as usize)?;
-                if read {
-                    prepared.arm(&self.src.shared.poll_rx, context.waker())?;
-                }
-                if write {
-                    prepared.arm(&self.dst.shared.poll_tx, context.waker())?;
-                }
-                prepared.arm(&self.src.shared.poll_close, context.waker())?;
-                prepared.arm(&self.dst.shared.poll_close, context.waker())?;
-                prepared.commit()
-            }
-        }
-
-        let poller = TeePoll {
-            src: self,
-            dst: out,
-        };
-        let mut total_copied = 0usize;
-        block_on_poll_io(
-            &poller,
-            IoEvents::READABLE | IoEvents::WRITABLE,
-            nonblocking,
-            || {
-                let _transaction = self.shared.read_transaction.lock();
-                if out.closed() {
-                    if total_copied > 0 {
-                        return Ok(total_copied);
-                    }
-                    raise_pipe();
-                    return Err(AxError::BrokenPipe);
-                }
-                let remaining = len - total_copied;
-                if remaining == 0 {
-                    return Ok(total_copied);
-                }
-
-                // tee and splice share the same address order so concurrent
-                // opposite-direction operations cannot form an ABBA cycle.
-                let source_first = Arc::as_ptr(&self.shared) < Arc::as_ptr(&out.shared);
-                let (written, source_empty, destination_full) = if source_first {
-                    let source = self.shared.buffer.lock();
-                    let mut destination = out.shared.buffer.lock();
-                    let source_empty = source.occupied_len() == 0;
-                    let destination_full = destination.vacant_len() == 0;
-                    let count = remaining
-                        .min(source.occupied_len())
-                        .min(destination.vacant_len());
-                    (
-                        copy_pipe_buffer(&source, &mut destination, count),
-                        source_empty,
-                        destination_full,
-                    )
-                } else {
-                    let mut destination = out.shared.buffer.lock();
-                    let source = self.shared.buffer.lock();
-                    let source_empty = source.occupied_len() == 0;
-                    let destination_full = destination.vacant_len() == 0;
-                    let count = remaining
-                        .min(source.occupied_len())
-                        .min(destination.vacant_len());
-                    (
-                        copy_pipe_buffer(&source, &mut destination, count),
-                        source_empty,
-                        destination_full,
-                    )
-                };
-                if written.len == 0 {
-                    return blocked_pipe_transfer_result(
-                        total_copied,
-                        source_empty,
-                        self.closed(),
-                        destination_full,
-                    );
-                }
-                notify_pipe_readable(&out.shared.poll_rx, &out.shared.async_io, written);
-                total_copied += written.len;
-                // Linux returns an available prefix instead of waiting to fill
-                // the caller's entire requested length.
-                Ok(total_copied)
-            },
-        )
+        PipeEndpoint::Anonymous(self).tee_to(&PipeEndpoint::Anonymous(out), len, nonblocking)
     }
 }
 
@@ -977,6 +1024,9 @@ impl NamedPipe {
     }
 
     pub(crate) fn open(location: Location, flags: u32) -> AxResult<Self> {
+        if flags & O_DIRECT != 0 {
+            return Err(AxError::OperationNotSupported);
+        }
         let access = PipeAccess::from_flags(flags)?;
         let nonblocking = flags & O_NONBLOCK != 0;
         let state = {
@@ -1100,7 +1150,7 @@ impl NamedPipe {
 
         let atomic_len = (size <= PIPE_BUF_SIZE).then_some(size);
         let mut total_written = 0;
-        block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
+        let result = block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
             if self.state.reader_count() == 0 {
                 if !suppress_sigpipe {
                     raise_pipe();
@@ -1118,6 +1168,13 @@ impl NamedPipe {
                 }
             }
             Err(AxError::WouldBlock)
+        });
+        result.or_else(|error| {
+            if total_written > 0 {
+                Ok(total_written)
+            } else {
+                Err(error)
+            }
         })
     }
 
@@ -1208,7 +1265,7 @@ impl Pipe {
 
         let atomic_len = (size <= PIPE_BUF_SIZE).then_some(size);
         let mut total_written = 0;
-        block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
+        let result = block_on_poll_io(self, IoEvents::WRITABLE, nonblocking, || {
             if self.closed() {
                 if !suppress_sigpipe {
                     raise_pipe();
@@ -1225,6 +1282,13 @@ impl Pipe {
                 }
             }
             Err(AxError::WouldBlock)
+        });
+        result.or_else(|error| {
+            if total_written > 0 {
+                Ok(total_written)
+            } else {
+                Err(error)
+            }
         })
     }
 
@@ -1488,6 +1552,107 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn fifo_endpoints_share_capacity_vmsplice_and_tee_with_anonymous_pipes() {
+        let _context = crate::test_support::scheduler_test_context();
+        let fs = crate::pseudofs::tmp::MemoryFs::new().unwrap();
+        let root = axfs_ng_vfs::Mountpoint::new_root(&fs).root_location();
+        let location = root
+            .create(
+                axfs_ng_vfs::FsName::new(b"fifo"),
+                axfs_ng_vfs::NodeType::Fifo,
+                axfs_ng_vfs::NodePermission::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        assert!(matches!(
+            NamedPipe::open(location.clone(), O_RDWR | O_DIRECT),
+            Err(AxError::OperationNotSupported)
+        ));
+        let fifo = NamedPipe::open(location, O_RDWR | O_NONBLOCK).unwrap();
+        let endpoint = PipeEndpoint::from_file(&fifo).unwrap();
+        assert_eq!(endpoint.resize(4096), Ok(4096));
+        assert_eq!(endpoint.capacity(), 4096);
+        let mut source = SliceSource {
+            bytes: b"fifo",
+            position: 0,
+        };
+        assert_eq!(endpoint.vmsplice_write(&mut source, true), Ok(4));
+        let (reader, writer) = Pipe::new();
+        assert_eq!(
+            endpoint.tee_to(&PipeEndpoint::Anonymous(&writer), 4, true),
+            Ok(4)
+        );
+        assert_eq!(fifo.state.buffer.lock().occupied_len(), 4);
+        assert_eq!(reader.shared.buffer.lock().occupied_len(), 4);
+    }
+
+    #[test]
+    fn anonymous_hangup_is_visible_before_drain_without_read_hangup() {
+        let (reader, writer) = Pipe::new();
+        writer.shared.buffer.lock().push_slice(b"pending");
+        drop(writer);
+        assert!(
+            reader
+                .poll()
+                .contains(IoEvents::READABLE | IoEvents::HANGUP)
+        );
+        assert!(!reader.poll().contains(IoEvents::READ_HANGUP));
+    }
+
+    #[test]
+    fn pipe_capacity_rounding_matches_linux_power_of_two_pages() {
+        assert_eq!(round_pipe_size(1), Ok(PAGE_SIZE_4K));
+        assert_eq!(round_pipe_size(PAGE_SIZE_4K * 3), Ok(PAGE_SIZE_4K * 4));
+    }
+
+    #[test]
+    fn blocked_large_write_returns_progress_when_the_reader_closes() {
+        let _context = crate::test_support::scheduler_test_context();
+        struct ClosingSource {
+            reader: Option<Pipe>,
+            remaining: usize,
+        }
+        impl IoBuf for ClosingSource {
+            fn remaining(&self) -> usize {
+                self.remaining
+            }
+        }
+        impl Read for ClosingSource {
+            fn read(&mut self, dst: &mut [u8]) -> axio::Result<usize> {
+                let count = self.remaining.min(dst.len());
+                dst[..count].fill(7);
+                self.remaining -= count;
+                if count > 0 {
+                    drop(self.reader.take());
+                }
+                Ok(count)
+            }
+        }
+        let (reader, writer) = Pipe::new();
+        let capacity = writer.capacity();
+        let mut source = ClosingSource {
+            reader: Some(reader),
+            remaining: capacity * 2,
+        };
+        assert_eq!(
+            writer.write_with_nonblocking(&mut source, false, true),
+            Ok(capacity)
+        );
+        assert_eq!(writer.shared.buffer.lock().occupied_len(), capacity);
+    }
+
+    #[test]
+    fn blocking_vmsplice_returns_an_available_prefix() {
+        let (reader, writer) = Pipe::new();
+        let capacity = writer.capacity();
+        let mut source = SliceSource {
+            bytes: &[1; RING_BUFFER_INIT_SIZE * 2],
+            position: 0,
+        };
+        assert_eq!(writer.vmsplice_write(&mut source, false), Ok(capacity));
+        assert_eq!(reader.shared.buffer.lock().occupied_len(), capacity);
     }
 
     #[test]

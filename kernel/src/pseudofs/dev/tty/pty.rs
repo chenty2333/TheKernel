@@ -34,6 +34,8 @@ struct PtyPairState {
     master_closed: bool,
     slave_open_count: usize,
     slave_ever_opened: bool,
+    packet_enabled: bool,
+    packet_status: u8,
 }
 
 struct PtyLifecycle {
@@ -50,6 +52,8 @@ impl PtyLifecycle {
                 master_closed: false,
                 slave_open_count: 0,
                 slave_ever_opened: false,
+                packet_enabled: false,
+                packet_status: 0,
             }),
             master_waiters: PollSet::new(),
             slave_waiters: PollSet::new(),
@@ -81,6 +85,49 @@ impl PtyEndpoint {
 
     pub(super) fn is_master(&self) -> bool {
         self.side == PtySide::Master
+    }
+
+    pub(super) fn set_packet_mode(&self, enabled: bool) -> AxResult<()> {
+        if !self.is_master() {
+            return Err(AxError::NotATty);
+        }
+        let mut state = self.lifecycle.state.lock();
+        if state.packet_enabled != enabled {
+            state.packet_status = 0;
+        }
+        state.packet_enabled = enabled;
+        drop(state);
+        self.lifecycle.master_waiters.wake();
+        Ok(())
+    }
+
+    pub(super) fn packet_mode(&self) -> bool {
+        self.is_master() && self.lifecycle.state.lock().packet_enabled
+    }
+
+    pub(super) fn packet_status(&self, take: bool) -> u8 {
+        if !self.is_master() {
+            return 0;
+        }
+        let mut state = self.lifecycle.state.lock();
+        if !state.packet_enabled {
+            return 0;
+        }
+        let status = state.packet_status;
+        if take {
+            state.packet_status = 0;
+        }
+        status
+    }
+
+    pub(super) fn packet_event(&self, event: u8, clear: u8) {
+        let mut state = self.lifecycle.state.lock();
+        if !state.packet_enabled {
+            return;
+        }
+        state.packet_status = (state.packet_status & !clear) | event;
+        drop(state);
+        self.lifecycle.master_waiters.wake();
     }
 
     pub(super) fn open(&self) -> AxResult<()> {
@@ -188,15 +235,23 @@ struct ChannelState {
     /// discards this prefix before exposing later writes.
     discard: AtomicUsize,
     stopped: AtomicBool,
+    input_stopped: AtomicBool,
+    column: AtomicUsize,
     gate: SpinNoIrq<()>,
 }
 
 impl ChannelState {
+    fn output_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire) || self.input_stopped.load(Ordering::Acquire)
+    }
+
     fn new() -> Self {
         Self {
             pending: AtomicUsize::new(0),
             discard: AtomicUsize::new(0),
             stopped: AtomicBool::new(false),
+            input_stopped: AtomicBool::new(false),
+            column: AtomicUsize::new(0),
             gate: SpinNoIrq::new(()),
         }
     }
@@ -259,6 +314,9 @@ impl TtyRead for PtyReader {
         let _gate = self.state.gate.lock();
         let pending = self.state.pending.swap(0, Ordering::AcqRel);
         self.state.discard.fetch_add(pending, Ordering::AcqRel);
+        if !self.endpoint.is_master() {
+            self.endpoint.packet_event(1, 0);
+        }
         self.events.wake_all();
     }
 }
@@ -268,6 +326,7 @@ struct PtyWriterInner {
     events: Arc<ChannelEvents>,
     state: Arc<ChannelState>,
     endpoint: PtyEndpoint,
+    terminal: Arc<Terminal>,
 }
 
 #[derive(Clone)]
@@ -279,12 +338,14 @@ impl PtyWriter {
         events: Arc<ChannelEvents>,
         state: Arc<ChannelState>,
         endpoint: PtyEndpoint,
+        terminal: Arc<Terminal>,
     ) -> AxResult<Self> {
         Arc::try_new(PtyWriterInner {
             producer: SpinNoPreempt::new(Prod::new(buffer)),
             events,
             state,
             endpoint,
+            terminal,
         })
         .map(Self)
         .map_err(|_| AxError::NoMemory)
@@ -299,17 +360,31 @@ impl TtyWrite for PtyWriter {
         if self.0.endpoint.write_error() {
             return Err(AxError::Io);
         }
-        if self.0.state.stopped.load(Ordering::Acquire) {
+        if self.0.state.output_stopped() {
             return Err(AxError::WouldBlock);
         }
+        let term = self.0.terminal.load_termios();
         let written = {
             let _gate = self.0.state.gate.lock();
-            if self.0.state.stopped.load(Ordering::Acquire) {
+            if self.0.state.output_stopped() {
                 return Err(AxError::WouldBlock);
             }
             let mut producer = self.0.producer.lock();
             let written = producer.push_slice(buf);
             self.0.state.pending.fetch_add(written, Ordering::AcqRel);
+            if !self.0.endpoint.is_master() {
+                let mut column = self.0.state.column.load(Ordering::Relaxed);
+                let mut output = [0; 8];
+                for &byte in &buf[..written] {
+                    super::terminal::ldisc::process_output_char(
+                        &term,
+                        &mut column,
+                        byte,
+                        &mut output,
+                    );
+                }
+                self.0.state.column.store(column, Ordering::Release);
+            }
             written
         };
         if written == 0 {
@@ -320,7 +395,7 @@ impl TtyWrite for PtyWriter {
     }
 
     fn poll_write(&self) -> bool {
-        !self.0.state.stopped.load(Ordering::Acquire) && !self.0.producer.lock().is_full()
+        !self.0.state.output_stopped() && !self.0.producer.lock().is_full()
     }
 
     fn tx_poll_source(&self) -> Option<&Arc<PollSet>> {
@@ -343,11 +418,40 @@ impl TtyWrite for PtyWriter {
         let _gate = self.0.state.gate.lock();
         let pending = self.0.state.pending.swap(0, Ordering::AcqRel);
         self.0.state.discard.fetch_add(pending, Ordering::AcqRel);
+        if !self.0.endpoint.is_master() {
+            self.0.endpoint.packet_event(2, 0);
+        }
         self.0.events.wake_all();
     }
 
     fn set_output_stopped(&self, stopped: bool) {
-        self.0.state.stopped.store(stopped, Ordering::Release);
+        self.change_output_stop(stopped, false);
+    }
+    fn set_input_flow_stopped(&self, stopped: bool) {
+        self.change_output_stop(stopped, true);
+    }
+    fn output_column(&self) -> Option<usize> {
+        (!self.0.endpoint.is_master()).then(|| self.0.state.column.load(Ordering::Acquire))
+    }
+}
+
+impl PtyWriter {
+    fn change_output_stop(&self, stopped: bool, input_flow: bool) {
+        {
+            let _gate = self.0.state.gate.lock();
+            let previous = self.0.state.output_stopped();
+            if input_flow {
+                self.0.state.input_stopped.store(stopped, Ordering::Release);
+            } else {
+                self.0.state.stopped.store(stopped, Ordering::Release);
+            }
+            let current = self.0.state.output_stopped();
+            if previous != current && !self.0.endpoint.is_master() {
+                self.0
+                    .endpoint
+                    .packet_event(if current { 4 } else { 8 }, if current { 8 } else { 4 });
+            }
+        }
         self.0.events.wake_all();
     }
 }
@@ -355,6 +459,7 @@ impl TtyWrite for PtyWriter {
 fn try_channel(
     reader_endpoint: PtyEndpoint,
     writer_endpoint: PtyEndpoint,
+    terminal: Arc<Terminal>,
 ) -> AxResult<(PtyReader, PtyWriter, Arc<ChannelEvents>)> {
     let buffer = Arc::try_new(HeapRb::try_new(PTY_BUF_SIZE).map_err(|_| AxError::NoMemory)?)
         .map_err(|_| AxError::NoMemory)?;
@@ -366,7 +471,7 @@ fn try_channel(
         state: state.clone(),
         endpoint: reader_endpoint,
     };
-    let writer = PtyWriter::try_new(buffer, events.clone(), state, writer_endpoint)?;
+    let writer = PtyWriter::try_new(buffer, events.clone(), state, writer_endpoint, terminal)?;
     Ok((reader, writer, events))
 }
 
@@ -377,12 +482,17 @@ fn create_pty_pair_with_external_reader(
     let master_endpoint = PtyEndpoint::new(lifecycle.clone(), PtySide::Master);
     let slave_endpoint = PtyEndpoint::new(lifecycle, PtySide::Slave);
 
-    let (master_to_slave_reader, master_to_slave_writer, master_to_slave_events) =
-        try_channel(slave_endpoint.clone(), master_endpoint.clone())?;
-    let (slave_to_master_reader, slave_to_master_writer, slave_to_master_events) =
-        try_channel(master_endpoint.clone(), slave_endpoint.clone())?;
-
     let terminal = Arc::try_new(Terminal::default()).map_err(|_| AxError::NoMemory)?;
+    let (master_to_slave_reader, master_to_slave_writer, master_to_slave_events) = try_channel(
+        slave_endpoint.clone(),
+        master_endpoint.clone(),
+        terminal.clone(),
+    )?;
+    let (slave_to_master_reader, slave_to_master_writer, slave_to_master_events) = try_channel(
+        master_endpoint.clone(),
+        slave_endpoint.clone(),
+        terminal.clone(),
+    )?;
 
     let master = Tty::try_new(
         terminal.clone(),
@@ -450,8 +560,31 @@ mod tests {
         let slave = PtyEndpoint::new(lifecycle, PtySide::Slave);
         master.open().unwrap();
         slave.open().unwrap();
-        let (reader, writer, _) = try_channel(slave.clone(), master.clone()).unwrap();
+        let (reader, writer, _) =
+            try_channel(slave.clone(), master.clone(), Arc::new(Terminal::default())).unwrap();
         (master, slave, reader, writer)
+    }
+
+    #[test]
+    fn explicit_and_input_flow_stops_cannot_clear_each_other() {
+        let (master, slave, _reader, _writer) = channel();
+        let (_, writer, _) = try_channel(master, slave, Arc::new(Terminal::default())).unwrap();
+        writer.set_output_stopped(true);
+        writer.set_input_flow_stopped(true);
+        writer.set_input_flow_stopped(false);
+        assert!(!writer.poll_write());
+        assert_eq!(writer.write(b"x"), Err(AxError::WouldBlock));
+        writer.set_input_flow_stopped(true);
+        writer.set_output_stopped(false);
+        assert!(!writer.poll_write());
+        writer.set_input_flow_stopped(false);
+        assert!(writer.poll_write());
+        assert_eq!(writer.write(b"> "), Ok(2));
+        assert_eq!(writer.output_column(), Some(2));
+        assert_eq!(writer.write(b"\t"), Ok(1));
+        assert_eq!(writer.output_column(), Some(8));
+        assert_eq!(writer.write(b"\r\n"), Ok(2));
+        assert_eq!(writer.output_column(), Some(0));
     }
 
     #[test]
@@ -489,7 +622,8 @@ mod tests {
     #[test]
     fn lifecycle_matches_master_and_slave_hangup_rules() {
         let (master, slave, mut reader, writer) = channel();
-        let (_master_reader, slave_writer, _) = try_channel(master.clone(), slave.clone()).unwrap();
+        let (_master_reader, slave_writer, _) =
+            try_channel(master.clone(), slave.clone(), Arc::new(Terminal::default())).unwrap();
         assert!(master.hangup_events().is_empty());
         assert!(slave.hangup_events().is_empty());
 

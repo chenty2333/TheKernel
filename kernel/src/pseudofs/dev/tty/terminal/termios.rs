@@ -8,17 +8,33 @@ use core::{
 use axerrno::{AxError, AxResult};
 use bytemuck::AnyBitPattern;
 use linux_raw_sys::general::{
-    B38400, BRKINT, CREAD, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ICANON, ICRNL, IGNCR, ISIG, NOFLSH,
-    ONLCR, OPOST, VEOF, VEOL, VERASE, VINTR, VKILL, VMIN, VQUIT, VSTART, VSTOP, VSUSP, VTIME,
-    speed_t, tcflag_t,
+    B38400, BOTHER, CBAUD, CIBAUD, CREAD, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ECHOKE, HUPCL, ICANON,
+    ICRNL, IEXTEN, ISIG, IXON, ONLCR, OPOST, VDISCARD, VEOF, VEOL, VEOL2, VERASE, VINTR, VKILL,
+    VLNEXT, VMIN, VQUIT, VREPRINT, VSTART, VSTOP, VSUSP, VWERASE, speed_t, tcflag_t,
+};
+#[cfg(test)]
+use linux_raw_sys::general::{
+    BRKINT, CSIZE, ECHONL, IGNCR, IMAXBEL, INPCK, ISTRIP, IUTF8, PARENB, TABDLY, TOSTOP,
 };
 use tk_linux_signal::Signo;
 
-// These byte-stream transports do not report hardware BREAK events. BRKINT
-// is retained for libc raw/cbreak profiles; a NUL byte is not a BREAK event.
-const SUPPORTED_IFLAG_CHANGES: tcflag_t = ICRNL | IGNCR | BRKINT;
-const SUPPORTED_OFLAG_CHANGES: tcflag_t = OPOST | ONLCR;
-const SUPPORTED_LFLAG_CHANGES: tcflag_t = ICANON | ECHO | ISIG | ECHOE | ECHOK | ECHOCTL | NOFLSH;
+// Byte-stream TTYs retain serial framing and baud settings for ioctl round
+// trips. No hardware parity/BREAK events are fabricated from ordinary bytes.
+fn baud_rate(selector: u32, other: speed_t) -> speed_t {
+    const BASE: [u32; 16] = [
+        0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400,
+    ];
+    const EXTENDED: [u32; 15] = [
+        57600, 115200, 230400, 460800, 500000, 576000, 921600, 1000000, 1152000, 1500000, 2000000,
+        2500000, 3000000, 3500000, 4000000,
+    ];
+    match selector {
+        0..=15 => BASE[selector as usize],
+        BOTHER => other,
+        4097..=4111 => EXTENDED[(selector - 4097) as usize],
+        _ => other,
+    }
+}
 
 const _: () = {
     assert!(size_of::<Termio>() == 18);
@@ -129,13 +145,10 @@ impl Termios {
 impl Default for Termios {
     fn default() -> Self {
         let mut result = Self {
-            // Only advertise defaults which the PTY line discipline actually
-            // enforces. Flow control and extended editing remain disabled
-            // until their state machines exist.
-            c_iflag: ICRNL,
+            c_iflag: ICRNL | IXON,
             c_oflag: OPOST | ONLCR,
-            c_cflag: B38400 | CS8 | CREAD,
-            c_lflag: ICANON | ECHO | ISIG | ECHOE | ECHOK | ECHOCTL,
+            c_cflag: B38400 | CS8 | CREAD | HUPCL,
+            c_lflag: ICANON | ECHO | ISIG | ECHOE | ECHOK | ECHOCTL | IEXTEN | ECHOKE,
             c_line: 0,
             c_cc: [0; 19],
         };
@@ -153,6 +166,11 @@ impl Default for Termios {
             (VEOL, b'\0'),
             (VSTART, ctl(b'Q')),
             (VSTOP, ctl(b'S')),
+            (VWERASE, ctl(b'W')),
+            (VREPRINT, ctl(b'R')),
+            (VLNEXT, ctl(b'V')),
+            (VDISCARD, ctl(b'O')),
+            (VMIN, 1),
         ] {
             result.c_cc[i as usize] = ch;
         }
@@ -176,10 +194,10 @@ impl Termios {
     }
 
     pub fn apply_termio(&mut self, termio: Termio) {
-        self.c_iflag = termio.c_iflag as tcflag_t;
-        self.c_oflag = termio.c_oflag as tcflag_t;
-        self.c_cflag = termio.c_cflag as tcflag_t;
-        self.c_lflag = termio.c_lflag as tcflag_t;
+        self.c_iflag = (self.c_iflag & !0xffff) | termio.c_iflag as tcflag_t;
+        self.c_oflag = (self.c_oflag & !0xffff) | termio.c_oflag as tcflag_t;
+        self.c_cflag = (self.c_cflag & !0xffff) | termio.c_cflag as tcflag_t;
+        self.c_lflag = (self.c_lflag & !0xffff) | termio.c_lflag as tcflag_t;
         self.c_line = termio.c_line;
         self.c_cc[..8].copy_from_slice(&termio.c_cc);
     }
@@ -201,6 +219,10 @@ impl Termios {
         self.c_oflag & flag != 0
     }
 
+    pub fn output_tab_expansion(&self) -> bool {
+        self.c_oflag & linux_raw_sys::general::TABDLY == linux_raw_sys::general::TAB3
+    }
+
     pub fn has_cflag(&self, flag: u32) -> bool {
         self.c_cflag & flag != 0
     }
@@ -218,7 +240,9 @@ impl Termios {
     }
 
     pub fn is_eol(&self, ch: u8) -> bool {
-        ch == b'\n' || self.matches_special_char(VEOL, ch)
+        ch == b'\n'
+            || self.matches_special_char(VEOL, ch)
+            || (self.has_lflag(IEXTEN) && self.matches_special_char(VEOL2, ch))
     }
 
     pub fn signo_for(&self, ch: u8) -> Option<Signo> {
@@ -237,32 +261,17 @@ impl Termios {
         if self.c_line != current.c_line {
             return Err(AxError::OperationNotSupported);
         }
-        if (self.c_iflag ^ current.c_iflag) & !SUPPORTED_IFLAG_CHANGES != 0
-            || (self.c_oflag ^ current.c_oflag) & !SUPPORTED_OFLAG_CHANGES != 0
-            || self.c_cflag != current.c_cflag
-            || (self.c_lflag ^ current.c_lflag) & !SUPPORTED_LFLAG_CHANGES != 0
+        // Linux generic termios stores reserved bits. Preserve those for ioctl
+        // round trips, without claiming that they enable any behavior. Known
+        // modes whose semantics are not implemented still fail explicitly.
+        use linux_raw_sys::general::{ECHOPRT, EXTPROC, FLUSHO, IXOFF, PARMRK, PENDIN};
+        if (self.c_iflag ^ current.c_iflag) & (PARMRK | IXOFF) != 0
+            || (self.c_lflag ^ current.c_lflag) & (ECHOPRT | FLUSHO | PENDIN | EXTPROC) != 0
         {
             return Err(AxError::OperationNotSupported);
         }
-        for index in 0..self.c_cc.len() {
-            let supported = matches!(
-                index as u32,
-                VINTR
-                    | VQUIT
-                    | VSUSP
-                    | VERASE
-                    | VKILL
-                    | VEOF
-                    | VEOL
-                    | VMIN
-                    | VTIME
-                    | VSTART
-                    | VSTOP
-            );
-            if !supported && self.c_cc[index] != current.c_cc[index] {
-                return Err(AxError::OperationNotSupported);
-            }
-        }
+        // N_TTY ignores unimplemented/reserved c_cc slots, but the ABI still
+        // stores them (including legacy VSWTC). They are not mode flags.
         Ok(())
     }
 }
@@ -286,11 +295,13 @@ impl Termios2 {
                 .expect("termios2 wire prefix has the Linux termios size"),
         );
         let read_u32 = |offset| u32::from_ne_bytes(bytes[offset..][..4].try_into().unwrap());
-        Self {
+        let mut result = Self {
             termios,
             c_ispeed: read_u32(offset_of!(Self, c_ispeed)) as speed_t,
             c_ospeed: read_u32(offset_of!(Self, c_ospeed)) as speed_t,
-        }
+        };
+        result.refresh_baud_rates();
+        result
     }
 
     /// Encodes `termios2` from field bytes and keeps every ABI byte
@@ -329,12 +340,14 @@ impl Termios2 {
     pub fn from_termio(termio: Termio, current: &Self) -> Self {
         let mut result = *current;
         result.termios.apply_termio(termio);
+        result.refresh_baud_rates();
         result
     }
 
     pub fn from_termios(termios: Termios, current: &Self) -> Self {
         let mut result = *current;
         result.termios = termios;
+        result.refresh_baud_rates();
         result
     }
 
@@ -342,11 +355,18 @@ impl Termios2 {
         self.termios.as_termio()
     }
 
+    fn refresh_baud_rates(&mut self) {
+        self.c_ospeed = baud_rate(self.c_cflag & CBAUD, self.c_ospeed);
+        let input = (self.c_cflag & CIBAUD) >> 16;
+        self.c_ispeed = if input == 0 {
+            self.c_ospeed
+        } else {
+            baud_rate(input, self.c_ispeed)
+        };
+    }
+
     pub fn validate_update(&self, current: &Self) -> AxResult<()> {
         self.termios.validate_update(&current.termios)?;
-        if self.c_ispeed != current.c_ispeed || self.c_ospeed != current.c_ospeed {
-            return Err(AxError::OperationNotSupported);
-        }
         Ok(())
     }
 }
@@ -397,6 +417,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn defaults_and_common_stty_modes_are_supported() {
+        let current = Termios2::default();
+        assert_eq!(current.special_char(VMIN), 1);
+        assert!(current.has_iflag(IXON));
+        assert!(current.has_lflag(IEXTEN | ECHOKE));
+        let mut next = current;
+        next.termios.c_lflag |= TOSTOP | ECHONL;
+        next.termios.c_iflag |= IMAXBEL | IUTF8;
+        next.termios.c_cc[VWERASE as usize] = 0x17;
+        next.termios.c_cflag = (next.termios.c_cflag & !(CBAUD | CSIZE))
+            | linux_raw_sys::general::B115200
+            | linux_raw_sys::general::CS7;
+        next = Termios2::from_termios(next.termios, &current);
+        assert_eq!(next.validate_update(&current), Ok(()));
+        assert_eq!(next.c_ispeed, 115200);
+        assert_eq!(next.c_ospeed, 115200);
+        assert_eq!(next.c_cflag & CSIZE, linux_raw_sys::general::CS7);
+        next.termios.c_cflag = (next.termios.c_cflag & !(CBAUD | CIBAUD)) | BOTHER | (BOTHER << 16);
+        next.c_ispeed = 12345;
+        next.c_ospeed = 56789;
+        let restored = Termios2::from_user_bytes(next.to_user_bytes());
+        assert_eq!(restored.validate_update(&current), Ok(()));
+        assert_eq!(restored.c_ispeed, 12345);
+        assert_eq!(restored.c_ospeed, 56789);
+    }
+
+    #[test]
     fn implemented_termios_changes_validate_atomically() {
         let current = Termios2::default();
         let mut next = current;
@@ -409,11 +456,27 @@ mod tests {
     }
 
     #[test]
+    fn reserved_flags_round_trip_without_enabling_known_unsupported_modes() {
+        let current = Termios2::default();
+        let mut next = current;
+        next.termios.c_iflag |= 1 << 31;
+        next.termios.c_oflag |= 1 << 31;
+        next.termios.c_lflag |= 1 << 31;
+        next.termios.c_cflag |= 1 << 23;
+        assert_eq!(next.validate_update(&current), Ok(()));
+        let restored = Termios2::from_user_bytes(next.to_user_bytes());
+        assert_eq!(restored.c_iflag, next.c_iflag);
+        assert_eq!(restored.c_oflag, next.c_oflag);
+        assert_eq!(restored.c_lflag, next.c_lflag);
+        assert_eq!(restored.c_cflag, next.c_cflag);
+    }
+
+    #[test]
     fn unsupported_termios_changes_are_rejected_without_mutating_current() {
         let current = Termios2::default();
 
         let mut flow_control = current;
-        flow_control.termios.c_iflag |= IXON;
+        flow_control.termios.c_iflag |= linux_raw_sys::general::IXOFF;
         assert_eq!(
             flow_control.validate_update(&current),
             Err(AxError::OperationNotSupported)
@@ -421,15 +484,12 @@ mod tests {
 
         let mut unsupported_cc = current;
         unsupported_cc.termios.c_cc[VWERASE as usize] = 0x17;
-        assert_eq!(
-            unsupported_cc.validate_update(&current),
-            Err(AxError::OperationNotSupported)
-        );
+        assert_eq!(unsupported_cc.validate_update(&current), Ok(()));
 
         let mut timed_read = current;
         timed_read.termios.c_cc[VTIME as usize] = 1;
         assert_eq!(timed_read.validate_update(&current), Ok(()));
-        assert_eq!(current.termios.c_iflag, ICRNL);
+        assert_eq!(current.termios.c_iflag, ICRNL | IXON);
         assert_eq!(current.termios.c_cc[VTIME as usize], 0);
 
         let mut cbreak = current;

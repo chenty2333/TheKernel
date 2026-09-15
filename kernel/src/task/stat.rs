@@ -111,7 +111,11 @@ pub fn render_task_stat(
     let proc_data = &thread.proc_data;
     let proc = &proc_data.proc;
     let pid = pid_ns
-        .visible_pid_checked(if process_view { proc.pid() } else { thread.tid() })
+        .visible_pid_checked(if process_view {
+            proc.pid()
+        } else {
+            thread.tid()
+        })
         .ok_or(AxError::NoSuchProcess)?;
     let comm = task.try_name().map_err(|error| match error {
         axtask::TaskNameError::OutOfMemory => AxError::NoMemory,
@@ -171,17 +175,16 @@ pub fn render_zombie_stat(process: &Process, pid_ns: &PidNamespace) -> AxResult<
     let pid = pid_ns
         .visible_pid_checked(process.pid())
         .ok_or(AxError::NoSuchProcess)?;
-    let comm = "zombie";
-    let state = 'Z';
     let ppid = process
         .parent()
         .and_then(|parent| pid_ns.visible_pid_checked(parent.pid()))
         .unwrap_or(0);
-    let pgrp = pid_ns.visible_pid_checked(process.group().pgid()).unwrap_or(0);
+    let pgrp = pid_ns
+        .visible_pid_checked(process.group().pgid())
+        .unwrap_or(0);
     let session = pid_ns
         .visible_pid_checked(process.group().session().sid())
         .unwrap_or(0);
-    let num_threads = 1;
     let self_usage: TaskUsage = snapshot.self_usage.into();
     let child_usage: TaskUsage = snapshot.child_usage.into();
     let scheduler = zombie_scheduler_state(process)?;
@@ -190,20 +193,78 @@ pub fn render_zombie_stat(process: &Process, pid_ns: &PidNamespace) -> AxResult<
     let exit_signal = process.exit_signal().unwrap_or(Signo::SIGCHLD as u8);
     let exit_code = snapshot.wait_status;
 
-    Ok(format!(
+    Ok(format_zombie_stat(
+        pid,
+        ppid,
+        pgrp,
+        session,
+        self_usage,
+        child_usage,
+        priority,
+        nice,
+        rt_priority,
+        policy,
+        exit_signal,
+        exit_code,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_zombie_stat(
+    pid: u32,
+    ppid: u32,
+    pgrp: u32,
+    session: u32,
+    self_usage: TaskUsage,
+    child_usage: TaskUsage,
+    priority: i32,
+    nice: i8,
+    rt_priority: u8,
+    policy: u32,
+    exit_signal: u8,
+    exit_code: i32,
+) -> String {
+    let comm = "zombie";
+    let state = 'Z';
+    let num_threads = 1;
+    format!(
         "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 0 0 0 0 0 0 {} {} {} {} {priority} \
-         {nice} {num_threads} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {exit_signal} 0 {rt_priority} \
+         {nice} {num_threads} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 {exit_signal} 0 {rt_priority} \
          {policy} 0 0 0 0 0 0 0 0 0 0 {exit_code}\n",
         self_usage.utime_ticks(),
         self_usage.stime_ticks(),
         child_usage.utime_ticks(),
         child_usage.stime_ticks(),
-    ))
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zombie_stat_has_all_linux_fields() {
+        let text = format_zombie_stat(
+            2,
+            1,
+            2,
+            2,
+            TaskUsage::default(),
+            TaskUsage::default(),
+            20,
+            0,
+            7,
+            1,
+            17,
+            42 << 8,
+        );
+        let fields: alloc::vec::Vec<_> = text.split_whitespace().collect();
+        assert_eq!(fields.len(), 52);
+        assert_eq!(fields[37], "17");
+        assert_eq!(fields[39], "7");
+        assert_eq!(fields[40], "1");
+        assert_eq!(fields[51], "10752");
+    }
 
     #[test]
     fn deadline_sched_stat_uses_linux_deadline_priority() {

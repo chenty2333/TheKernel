@@ -271,6 +271,28 @@ fn child_exit_completion_steps(
     ]
 }
 
+fn child_exit_signal_info(child: &Process, parent: &ProcessData, signo: Signo) -> SignalInfo {
+    let Some(snapshot) = child.zombie_payload() else {
+        return SignalInfo::new_kernel(signo);
+    };
+    let status = snapshot.wait_status;
+    let (code, status) = if status & 0x7f == 0 {
+        (linux_raw_sys::general::CLD_EXITED, (status >> 8) & 0xff)
+    } else if status & 0x80 != 0 {
+        (linux_raw_sys::general::CLD_DUMPED, status & 0x7f)
+    } else {
+        (linux_raw_sys::general::CLD_KILLED, status & 0x7f)
+    };
+    let pid = parent
+        .pid_ns()
+        .visible_pid_checked(child.pid())
+        .unwrap_or(0);
+    let uid = parent
+        .user_ns()
+        .from_kuid_munged(snapshot.credential.ids().ruid);
+    SignalInfo::new_child(signo, code as i32, pid, uid, status)
+}
+
 fn notify_reaper_of_inherited_zombie(child: &Arc<Process>) {
     let Some(parent) = child.parent() else {
         return;
@@ -292,8 +314,10 @@ fn notify_reaper_of_inherited_zombie(child: &Arc<Process>) {
         match step {
             ChildExitCompletionStep::Notify => {
                 if let Some(signo) = child.exit_signal().and_then(Signo::from_repr) {
-                    let _ =
-                        send_signal_to_process(parent.pid(), Some(SignalInfo::new_kernel(signo)));
+                    let _ = send_signal_to_process(
+                        parent.pid(),
+                        Some(child_exit_signal_info(child, &parent_data, signo)),
+                    );
                 }
             }
             ChildExitCompletionStep::Reap => match reap_process(child) {
@@ -1729,11 +1753,13 @@ pub(crate) fn exit_status_trace_record(
                 let resolved_child = viewer_pid_ns
                     .resolve_visible_pid(requested_pid)
                     .and_then(registry_get_for_probe)
-                    .map(|process| u8::from(
-                        process
-                            .parent()
-                            .is_some_and(|parent| parent.pid() == process_pid),
-                    ))
+                    .map(|process| {
+                        u8::from(
+                            process
+                                .parent()
+                                .is_some_and(|parent| parent.pid() == process_pid),
+                        )
+                    })
                     .unwrap_or(0);
                 record.resolved_is_my_child = resolved_child;
                 if let Ok(children) = data.proc.try_children(domain.registry()) {
@@ -1752,8 +1778,7 @@ pub(crate) fn exit_status_trace_record(
                         record.child_matched[slot] = u8::from(
                             i32::try_from(requested_pid).ok() == Some(record.child_visible[slot]),
                         );
-                        record.child_exit_signal[slot] =
-                            child.exit_signal().map_or(-1, i32::from);
+                        record.child_exit_signal[slot] = child.exit_signal().map_or(-1, i32::from);
                         record.child_accepts[slot] = u8::from(should_wait_for_child(
                             child,
                             &WaitOptions::from_bits_truncate(options),
@@ -1934,7 +1959,6 @@ pub(crate) fn exit_status_trace_dump() -> AxResult<Vec<u8>> {
     Ok(out)
 }
 
-
 fn process_lifecycle_error(error: ProcessError) -> AxError {
     match error {
         ProcessError::NoMemory | ProcessError::Capacity => AxError::NoMemory,
@@ -2025,10 +2049,8 @@ fn zap_pid_namespace(proc_data: &ProcessData) -> AxResult<()> {
                 .is_some_and(|target| namespace.contains(target))
             && let Ok(target) = get_process_data(process.pid())
         {
-            let _ = send_signal_to_process_data(
-                &target,
-                Some(SignalInfo::new_kernel(Signo::SIGKILL)),
-            );
+            let _ =
+                send_signal_to_process_data(&target, Some(SignalInfo::new_kernel(Signo::SIGKILL)));
         }
     }
     loop {
@@ -2433,13 +2455,9 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
         let closed_fds = retired_fd_table
             .take()
             .expect("final exit retains files_struct");
-        // wait(2) may return as soon as the parent observes the zombie state.
-        // Release process-owned POSIX locks before the old files_struct can
-        // drop its descriptions. Their Drop path publishes IN_CLOSE/FAN_CLOSE
-        // work, which must only become observable after those locks are gone.
-        crate::file::release_process_fd_table(process.pid(), closed_fds.table());
-        // Retire the slot itself before close notifications or zombie
-        // publication: it is the remaining table Arc after the lock release.
+        // The last task-slot retirement released this files_struct's POSIX
+        // locks. Shared CLONE_FILES peers retain their ownership and entries.
+        // Drop the retired slot before publishing close notifications/zombie.
         drop(closed_fds);
         crate::file::inotify::wait_current_close_notifications();
         ptrace_retirements.process = Some(detach_ptrace_links_on_process_exit(&thr.proc_data));
@@ -2490,10 +2508,11 @@ pub fn do_exit(exit_code: i32, group_exit: bool) -> AxResult<()> {
                 ChildExitCompletionStep::Notify => {
                     if let Some(parent) = parent.as_ref()
                         && let Some(signo) = thr.proc_data.exit_signal
+                        && let Some(parent_data) = parent_data.as_ref()
                     {
                         let _ = send_signal_to_process(
                             parent.pid(),
-                            Some(SignalInfo::new_kernel(signo)),
+                            Some(child_exit_signal_info(process, parent_data, signo)),
                         );
                     }
                 }
@@ -2576,7 +2595,9 @@ mod tests {
                 started_tx.send(()).unwrap();
                 // CLONE_PARENT takes the parent's gate before PID allocation.
                 let _parent = gate.lock().unwrap();
-                let result = namespace.reserve_process(22).map(|reservation| reservation.commit());
+                let result = namespace
+                    .reserve_process(22)
+                    .map(|reservation| reservation.commit());
                 admitted.commit();
                 done_tx.send(result).unwrap();
             });

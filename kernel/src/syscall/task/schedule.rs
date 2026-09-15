@@ -17,16 +17,14 @@ use axtask::{
 };
 use linux_raw_sys::general::{
     __kernel_clockid_t, CAP_SYS_ADMIN, CAP_SYS_NICE, CLOCK_BOOTTIME, CLOCK_MONOTONIC,
-    CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP, PRIO_PROCESS,
-    PRIO_USER, RLIMIT_NICE, RLIMIT_RTPRIO, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO, SCHED_IDLE,
-    SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
+    CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID, PRIO_PGRP,
+    PRIO_PROCESS, PRIO_USER, RLIMIT_NICE, RLIMIT_RTPRIO, SCHED_BATCH, SCHED_DEADLINE, SCHED_FIFO,
+    SCHED_IDLE, SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR, TIMER_ABSTIME, timespec,
 };
 use tk_linux_process_adapter::{Pid, ProcessError};
 use tk_linux_sched as linux_sched;
 use tk_linux_signal::{DefaultSignalAction, SignalDisposition, Signo};
-use tk_linux_usercopy::{
-    UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice,
-};
+use tk_linux_usercopy::{UserMemory, UserMemoryContext, VmMutPtr, VmPtr, vm_load, vm_write_slice};
 
 use crate::{
     mm::map_usercopy_error,
@@ -718,6 +716,75 @@ fn sleep_absolute(clock: AlarmClock, deadline: TimeValue) -> AxResult<ClockSleep
     }
 }
 
+/// TAI sleeps share the realtime timer service, but an ADJ_TAI publication
+/// must wake and reproject them rather than leave a stale realtime deadline.
+fn sleep_tai_absolute(deadline: TimeValue) -> AxResult<ClockSleepOutcome> {
+    use core::{
+        future::{Future, poll_fn},
+        pin::Pin,
+        task::Poll,
+    };
+
+    use crate::syscall::time::{
+        TAI_CLOCK_CHANGES, tai_deadline_as_realtime, tai_offset_snapshot, tai_time,
+    };
+
+    loop {
+        if tai_time() >= deadline {
+            return Ok(ClockSleepOutcome::Completed);
+        }
+        let (offset, generation) = tai_offset_snapshot();
+        let mut sleeper = prepare_clock_sleep(
+            AlarmClock::Realtime,
+            tai_deadline_as_realtime(deadline, offset),
+        )?;
+        let mut registration = None;
+        let wait = poll_fn(|cx| {
+            // Arm before checking generation: a concurrent adjustment cannot
+            // fall between projection and waiter registration unnoticed.
+            drop(registration.take());
+            let armed = (|| {
+                let mut prepared = axpoll::PreparedPollRegistration::try_new(1)?;
+                prepared.arm(&TAI_CLOCK_CHANGES, cx.waker())?;
+                prepared.commit()
+            })();
+            registration = match armed {
+                Ok(armed) => Some(armed),
+                Err(error) => return Poll::Ready(Err(crate::readiness::registration_error(error))),
+            };
+            if tai_offset_snapshot().1 != generation {
+                return Poll::Ready(Ok(false));
+            }
+            if tai_time() >= deadline {
+                return Poll::Ready(Ok(true));
+            }
+            match Pin::new(&mut sleeper).poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Ok(tai_time() >= deadline)),
+                Poll::Pending => Poll::Pending,
+            }
+        });
+        let result = with_proc_state_hint(ProcStateHint::Interruptible, || {
+            block_on(interruptible(wait))
+        });
+        drop(registration);
+        match result {
+            Err(error) => return Err(error.into()),
+            Ok(Ok(Err(error))) => return Err(error),
+            Ok(Ok(Ok(true))) => return Ok(ClockSleepOutcome::Completed),
+            Ok(Ok(Ok(false))) => continue,
+            Ok(Err(_))
+                if matches!(
+                    current_clock_sleep_interrupt_disposition(),
+                    ClockSleepInterruptDisposition::Retry
+                ) =>
+            {
+                continue;
+            }
+            Ok(Err(_)) => return Ok(ClockSleepOutcome::Interrupted),
+        }
+    }
+}
+
 fn clock_nanosleep_is_absolute(flags: u32) -> AxResult<bool> {
     if flags & !TIMER_ABSTIME != 0 {
         return Err(AxError::InvalidInput);
@@ -940,7 +1007,7 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
 ) -> AxResult<isize> {
     let absolute = clock_nanosleep_is_absolute(flags)?;
     let clock = match clock_id as u32 {
-        CLOCK_REALTIME => AlarmClock::Realtime,
+        CLOCK_REALTIME | CLOCK_TAI => AlarmClock::Realtime,
         CLOCK_MONOTONIC | CLOCK_BOOTTIME => AlarmClock::Monotonic,
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => AlarmClock::Monotonic,
         _ => {
@@ -976,9 +1043,12 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
             start.checked_add(req).unwrap_or(Duration::MAX)
         };
         let outcome = sleep_cpu_clock_until(&target, deadline)?;
+        if absolute {
+            return finish_absolute_clock_sleep(outcome, target.now(), deadline);
+        }
         return match outcome {
             ClockSleepOutcome::Completed => Ok(0),
-            ClockSleepOutcome::Interrupted if absolute || target.now() >= deadline => Ok(0),
+            ClockSleepOutcome::Interrupted if target.now() >= deadline => Ok(0),
             ClockSleepOutcome::Interrupted => {
                 let actual = target.now() - start;
                 if let Some(diff) = remaining_relative_sleep(req, actual)
@@ -994,6 +1064,10 @@ pub fn sys_clock_nanosleep<M: UserMemory + ?Sized>(
         };
     }
 
+    if absolute && clock_id as u32 == CLOCK_TAI {
+        let outcome = sleep_tai_absolute(req)?;
+        return finish_absolute_clock_sleep(outcome, crate::syscall::time::tai_time(), req);
+    }
     if absolute {
         let deadline = match clock_id as u32 {
             CLOCK_MONOTONIC => current().as_thread().time_ns().host_monotonic_deadline(req),
@@ -1063,7 +1137,8 @@ pub fn sys_sched_setaffinity<M: UserMemory + ?Sized>(
     let cpusetsize = cpusetsize as u32 as usize;
     let cpu_count = axhal::cpu_num().max(1);
     let kernel_mask_bytes = linux_cpumask_bytes(cpu_count);
-    let user_mask = vm_load(memory, user_mask, cpusetsize.min(kernel_mask_bytes)).map_err(map_usercopy_error)?;
+    let user_mask = vm_load(memory, user_mask, cpusetsize.min(kernel_mask_bytes))
+        .map_err(map_usercopy_error)?;
     let mut cpu_mask = AxCpuMask::new();
 
     for i in 0..cpu_count {

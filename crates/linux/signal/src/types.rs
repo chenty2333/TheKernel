@@ -297,6 +297,19 @@ impl SignalInfo {
         result
     }
 
+    /// Builds a fully initialized child-state notification (CLD_* code).
+    pub fn new_child(signo: Signo, code: i32, pid: u32, uid: u32, status: i32) -> Self {
+        let mut result = Self::new_user(signo, code, pid, uid);
+        result
+            .raw_mut()
+            .__bindgen_anon_1
+            .__bindgen_anon_1
+            ._sifields
+            ._sigchld
+            ._status = status;
+        result
+    }
+
     pub fn new_user(signo: Signo, code: i32, pid: u32, uid: u32) -> Self {
         let mut result = Self([0; 128]);
         result.set_signo(signo);
@@ -766,3 +779,27 @@ const _: [(); 8] = [(); mem::align_of::<SignalStack>()];
 const _: [(); 0] = [(); mem::offset_of!(SignalStack, sp)];
 const _: [(); 8] = [(); mem::offset_of!(SignalStack, flags)];
 const _: [(); 16] = [(); mem::offset_of!(SignalStack, size)];
+
+#[cfg(test)]
+mod child_info_tests {
+    use super::*;
+
+    #[test]
+    fn child_record_contains_linux_sigchld_payload() {
+        let info = SignalInfo::new_child(Signo::SIGCHLD, 1, 42, 1000, 17);
+        assert_eq!(info.signo(), Signo::SIGCHLD);
+        assert_eq!(info.pid(), 42);
+        assert_eq!(info.uid(), 1000);
+        // The constructor initializes the complete record before writing this arm.
+        let child = unsafe {
+            info.as_raw()
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                ._sifields
+                ._sigchld
+        };
+        assert_eq!(child._status, 17);
+        assert_eq!(child._utime, 0);
+        assert_eq!(child._stime, 0);
+    }
+}

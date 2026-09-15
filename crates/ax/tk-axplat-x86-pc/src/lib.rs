@@ -22,6 +22,7 @@ mod boot_info;
 /// Fleet-wide CET capability probing and commit.
 pub mod cet;
 pub mod console;
+pub use console::write_tty_bytes;
 /// x86 logical-CPU identity and immutable topology snapshots.
 pub mod cpu;
 #[cfg(feature = "hwp")]
@@ -31,6 +32,7 @@ pub mod kexec;
 mod mem;
 pub mod pci;
 mod power;
+pub use power::system_reset;
 mod time;
 
 pub use boot_info::{ColorField, FramebufferInfo, FramebufferRejection, ModuleInfo};

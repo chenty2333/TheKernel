@@ -1850,11 +1850,7 @@ fn execute_submission(
                 // owner. The retained actor linearizes both against setup's
                 // exact process instead.
                 ring.sqpoll_actor()
-                    .and_then(|actor| {
-                        actor
-                            .files()
-                            .close_for_process(request.fd(), actor.process_id())
-                    })
+                    .and_then(|actor| actor.files().close(request.fd()))
                     .map(|_| 0)
             } else {
                 crate::file::close_file_like(request.fd()).and_then(|_| {
@@ -3506,11 +3502,8 @@ mod tests {
         );
         assert_eq!(
             LinuxError::from(
-                registered_buffer_count(
-                    1,
-                    tk_linux_io_uring::IORING_MAX_REGISTERED_BUFFERS + 1,
-                )
-                .unwrap_err(),
+                registered_buffer_count(1, tk_linux_io_uring::IORING_MAX_REGISTERED_BUFFERS + 1,)
+                    .unwrap_err(),
             ),
             LinuxError::EINVAL
         );
@@ -3637,7 +3630,8 @@ mod tests {
         bytes[0] = 4; // IORING_OP_READ_FIXED
         bytes[16..24].copy_from_slice(&0x1180_u64.to_le_bytes());
         bytes[24..28].copy_from_slice(&0x40_u32.to_le_bytes());
-        let SubmissionOperation::Read(request) = ParsedSubmission::parse(bytes).unwrap().operation()
+        let SubmissionOperation::Read(request) =
+            ParsedSubmission::parse(bytes).unwrap().operation()
         else {
             panic!("expected fixed read");
         };
@@ -3648,9 +3642,10 @@ mod tests {
         for retiring in [false, true] {
             if retiring {
                 ring.unregister_buffers().unwrap();
-                assert!(ring
-                    .acquire_registered_buffer(world, BufferSlot::new(0), 0x1120, 0x20)
-                    .is_err());
+                assert!(
+                    ring.acquire_registered_buffer(world, BufferSlot::new(0), 0x1120, 0x20)
+                        .is_err()
+                );
                 assert_eq!(
                     ring.register_buffers(world, &caller, alloc::vec![(0x1100, 0x100)]),
                     Err(AxError::ResourceBusy)
@@ -3659,8 +3654,14 @@ mod tests {
             let (selected, range) =
                 submission_io_geometry(&caller, request, Some(&lease), true).unwrap();
             assert_eq!(range, (0x1120, 0x20));
-            assert!(Arc::ptr_eq(selected.address_space(), registered.address_space()));
-            assert!(!Arc::ptr_eq(selected.address_space(), caller.address_space()));
+            assert!(Arc::ptr_eq(
+                selected.address_space(),
+                registered.address_space()
+            ));
+            assert!(!Arc::ptr_eq(
+                selected.address_space(),
+                caller.address_space()
+            ));
         }
         drop(lease);
         ring.register_buffers(world, &caller, alloc::vec![(0x1100, 0x100)])
@@ -3671,7 +3672,10 @@ mod tests {
         let (selected, range) =
             submission_io_geometry(&registered, request, Some(&replacement), true).unwrap();
         assert_eq!(range, (0x1180, 0x10));
-        assert!(Arc::ptr_eq(selected.address_space(), caller.address_space()));
+        assert!(Arc::ptr_eq(
+            selected.address_space(),
+            caller.address_space()
+        ));
         drop(replacement);
         ring.unregister_buffers().unwrap();
     }

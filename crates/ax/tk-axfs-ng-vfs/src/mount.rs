@@ -1272,6 +1272,17 @@ impl Location {
     }
 
     pub fn absolute_path(&self) -> VfsResult<FsPathBuf> {
+        self.path_from_root(None).map(|(path, _)| path)
+    }
+
+    /// Builds a path relative to an exact mount/dentry root. If it is not an
+    /// ancestor, returns the global path and `false`, without string-prefix
+    /// comparisons or a second topology snapshot.
+    pub fn path_relative_to(&self, root: &Location) -> VfsResult<(FsPathBuf, bool)> {
+        self.path_from_root(Some(root))
+    }
+
+    fn path_from_root(&self, root: Option<&Location>) -> VfsResult<(FsPathBuf, bool)> {
         let _tree = MOUNT_TREE_LOCK.read();
         let mut components = Vec::new();
         let mut cur = self.clone();
@@ -1284,14 +1295,25 @@ impl Location {
                 return Err(VfsError::FilesystemLoop);
             }
             let mut entry = cur.entry.clone();
-            while !entry.ptr_eq(&cur.mountpoint().root) {
+            loop {
+                if root.is_some_and(|root| {
+                    Arc::ptr_eq(cur.mountpoint(), root.mountpoint()) && entry.ptr_eq(root.entry())
+                }) {
+                    return Ok((try_build_absolute_path(&components, DirEntry::name)?, true));
+                }
+                if entry.ptr_eq(&cur.mountpoint().root) {
+                    break;
+                }
                 try_push_path_component(&mut components, &entry)?;
                 entry = entry.parent().ok_or(VfsError::InvalidInput)?;
             }
             cur = match cur.mountpoint().location_locked() {
                 Some(loc) => loc,
                 None => {
-                    return try_build_absolute_path(&components, DirEntry::name);
+                    return Ok((
+                        try_build_absolute_path(&components, DirEntry::name)?,
+                        root.is_none(),
+                    ));
                 }
             };
         }
@@ -2337,6 +2359,34 @@ mod tests {
         fn rename(&self, _request: RenameRequest<'_>) -> VfsResult<()> {
             Err(VfsError::Unsupported)
         }
+    }
+
+    #[test]
+    fn relative_path_uses_exact_mount_identity() {
+        let filesystem = Filesystem::new(LookupTestFs::new(100));
+        let mount = Mountpoint::new_root(&filesystem);
+        let root = mount.root_location();
+        let covered = root
+            .lookup_no_follow_in_mount(FsName::new(b"child"))
+            .unwrap();
+        let other_fs = Filesystem::new(LookupTestFs::new(200));
+        let mounted = covered.mount(&other_fs).unwrap().root_location();
+        assert_eq!(
+            mounted.absolute_path().unwrap(),
+            covered.absolute_path().unwrap()
+        );
+        let (path, reachable) = mounted.path_relative_to(&root).unwrap();
+        assert!(reachable);
+        assert_eq!(path.as_bytes(), b"/child");
+        let (path, reachable) = mounted.path_relative_to(&mounted).unwrap();
+        assert!(reachable);
+        assert_eq!(path.as_bytes(), b"/");
+        let (path, reachable) = covered.path_relative_to(&mounted).unwrap();
+        assert!(!reachable);
+        assert_eq!(path.as_bytes(), b"/child");
+        let (path, reachable) = root.path_relative_to(&mounted).unwrap();
+        assert!(!reachable);
+        assert_eq!(path.as_bytes(), b"/");
     }
 
     #[test]

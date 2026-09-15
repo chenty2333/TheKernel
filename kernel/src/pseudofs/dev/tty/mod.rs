@@ -1,4 +1,5 @@
 pub(crate) mod fbcon;
+pub(crate) mod keyboard;
 mod ntty;
 mod ptm;
 mod pts;
@@ -247,6 +248,10 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
     }
 
     pub fn bind_to(self: &Arc<Self>, proc: &Process) -> AxResult<()> {
+        self.bind_to_with_steal(proc, false)
+    }
+
+    fn bind_to_with_steal(self: &Arc<Self>, proc: &Process, steal: bool) -> AxResult<()> {
         let _lifecycle = self.terminal.lifecycle.lock();
         self.ensure_bindable()?;
         let pg = proc.group();
@@ -261,9 +266,22 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
                 return Err(AxError::OperationNotPermitted);
             }
             self.terminal.job_control.claim_session(&session)?;
-            return self.terminal.job_control.set_foreground(&pg);
+            return Ok(());
         }
 
+        if let Some(previous) = self.terminal.job_control.session()
+            && !Arc::ptr_eq(&previous, &session)
+        {
+            if !steal {
+                return Err(AxError::OperationNotPermitted);
+            }
+            // TIOCSCTTY(1) with CAP_SYS_ADMIN steals the association, not the
+            // transport: do not mark old descriptors hung up or flush data.
+            if let Some(terminal) = previous.terminal() {
+                previous.unset_terminal(&terminal);
+            }
+            self.terminal.job_control.release_session(&previous);
+        }
         let claimed = self.terminal.job_control.claim_session(&session)?;
         if !session.set_terminal_with(|| tty.clone()) {
             if claimed {
@@ -345,14 +363,35 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
         if flush_input {
             self.ldisc.lock().flush_input()?;
         }
-        {
+        let (restart_output, flow_control_changed) = {
             let mut current = self.terminal.termios.lock();
             next.validate_update(&current)?;
+            let restart = current.has_iflag(linux_raw_sys::general::IXON)
+                && !next.has_iflag(linux_raw_sys::general::IXON);
+            let standard_flow = |term: &Termios2| {
+                term.has_iflag(linux_raw_sys::general::IXON)
+                    && term.special_char(linux_raw_sys::general::VSTART) == 17
+                    && term.special_char(linux_raw_sys::general::VSTOP) == 19
+            };
+            let changed =
+                (standard_flow(&current) != standard_flow(&next)).then_some(standard_flow(&next));
             *current = next;
             // Readers take epoch/termios/epoch snapshots; keep the version
             // publication inside this lock so no new termios image is ever
             // observable with the old epoch.
             self.terminal.termios_epoch.fetch_add(1, Ordering::AcqRel);
+            (restart, changed)
+        };
+        if restart_output {
+            self.writer.set_input_flow_stopped(false);
+        }
+        if let Some(standard) = flow_control_changed
+            && let Some(endpoint) = &self.endpoint
+        {
+            endpoint.packet_event(
+                if standard { 32 } else { 16 },
+                if standard { 16 } else { 32 },
+            );
         }
         self.terminal.termios_waiters.wake();
         Ok(())
@@ -424,11 +463,14 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
             .downcast_ref::<Self>()
             .expect("validated controlling tty type")
             .hangup_io();
-        if let Some(foreground) = released {
-            let pgid = foreground.pgid();
-            let _ = send_signal_to_process_group(pgid, Some(SignalInfo::new_kernel(Signo::SIGHUP)));
-            let _ =
-                send_signal_to_process_group(pgid, Some(SignalInfo::new_kernel(Signo::SIGCONT)));
+        drop(released);
+        // tty_vhangup signals the session leader, not an unrelated foreground
+        // job. TIOCNOTTY's explicit disassociation has separate group semantics.
+        for signal in [Signo::SIGHUP, Signo::SIGCONT] {
+            let _ = crate::task::send_signal_to_process(
+                expected.sid(),
+                Some(SignalInfo::new_kernel(signal)),
+            );
         }
     }
 
@@ -560,6 +602,18 @@ impl<R: TtyRead, W: TtyWrite> TtyFile<R, W> {
     }
 
     fn read_once(&self, out: &mut [u8]) -> AxResult<usize> {
+        if self.tty.hung_up.load(Ordering::Acquire)
+            || self
+                .tty
+                .endpoint
+                .as_ref()
+                .is_some_and(PtyEndpoint::read_hangup)
+        {
+            return DeviceOps::read_at(self.tty.as_ref(), out, 0);
+        }
+        if !self.tty.is_ptm && !self.tty.hung_up.load(Ordering::Acquire) {
+            self.tty.terminal.job_control.check_access(Signo::SIGTTIN)?;
+        }
         let (epoch, term) = self.tty.terminal.termios_snapshot();
         if self.read_state.termios_epoch.swap(epoch, Ordering::AcqRel) != epoch {
             self.read_state.cancel();
@@ -616,7 +670,11 @@ impl<R: TtyRead, W: TtyWrite> TtyFile<R, W> {
         }
         let result =
             crate::readiness::block_on_poll_io(self, IoEvents::READABLE, nonblocking, || {
-                self.read_once(&mut bytes[..length])
+                if nonblocking {
+                    DeviceOps::read_at(self.tty.as_ref(), &mut bytes[..length], 0)
+                } else {
+                    self.read_once(&mut bytes[..length])
+                }
             });
         self.read_state.cancel();
         let read = result?;
@@ -708,6 +766,25 @@ impl<R: TtyRead, W: TtyWrite> Pollable for TtyFile<R, W> {
 }
 
 impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
+    pub(crate) fn maybe_acquire_controlling_terminal(&self, flags: u32) {
+        use linux_raw_sys::general::{O_ACCMODE, O_NOCTTY, O_PATH, O_WRONLY};
+        if !self.is_ptm && flags & (O_NOCTTY | O_PATH) == 0 && flags & O_ACCMODE != O_WRONLY {
+            if let Some(task) = axtask::current_may_uninit()
+                && let Some(thread) = task.try_as_thread()
+            {
+                let process = &thread.proc_data.proc;
+                if process.group().session().terminal().is_none()
+                    && self.terminal.job_control.session().is_none()
+                {
+                    // Failure to acquire a ctty never fails an otherwise valid open.
+                    if let Ok(tty) = self.this_arc() {
+                        let _ = tty.bind_to(process);
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn open_transport_description(&self) -> AxResult<Option<PtyOpenGuard<R, W>>> {
         let Some(endpoint) = self.endpoint.clone() else {
             return Ok(None);
@@ -723,11 +800,15 @@ impl<R: TtyRead, W: TtyWrite> Tty<R, W> {
 }
 
 impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
-    fn open_description(&self, location: &Location, _flags: u32) -> VfsResult<Option<DeviceOpen>> {
+    fn open_description(&self, location: &Location, flags: u32) -> VfsResult<Option<DeviceOpen>> {
+        if self.is_locked_pty_slave() {
+            return Err(AxError::Io);
+        }
         let tty = self.this_arc()?;
         let file: Arc<dyn FileLike> = TtyFile::try_new(tty, location.clone())?;
         let guard = self.open_transport_description()?;
         let resource = guard.map(|guard| Box::new(guard) as DescriptionResource);
+        self.maybe_acquire_controlling_terminal(flags);
         Ok(Some(DeviceOpen::new(file, resource)))
     }
 
@@ -740,18 +821,47 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
             .as_ref()
             .is_some_and(|endpoint| !endpoint.is_master() && endpoint.read_hangup());
         if slave_hangup {
-            // A master hangup does not discard bytes which were already
-            // accepted into the raw channel or any line-discipline stage.
-            // EOF becomes visible only after the worker confirms every stage,
-            // including the public ring, has drained.
-            let mut ldisc = self.ldisc.lock();
-            return match ldisc.read(buf) {
-                Err(AxError::WouldBlock) if ldisc.input_drained() => Ok(0),
-                result => result,
-            };
+            // Linux vhangup discards unread slave input, including complete
+            // canonical records. Only master-side reads may drain after HUP.
+            return Ok(0);
         }
-        if self.is_ptm || self.terminal.job_control.current_in_foreground() {
-            let result = self.ldisc.lock().read(buf);
+        if !self.is_ptm {
+            self.terminal.job_control.check_access(Signo::SIGTTIN)?;
+        }
+        {
+            let packet = self.endpoint.as_ref().is_some_and(PtyEndpoint::packet_mode);
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            if packet {
+                let status = self.endpoint.as_ref().unwrap().packet_status(true);
+                if status != 0 {
+                    buf[0] = status;
+                    return Ok(1);
+                }
+            }
+            let mut ldisc = self.ldisc.lock();
+            let result = if packet {
+                if buf.len() == 1 {
+                    if ldisc.poll_read() {
+                        buf[0] = 0;
+                        Ok(1)
+                    } else {
+                        Err(AxError::WouldBlock)
+                    }
+                } else {
+                    ldisc.read(&mut buf[1..]).map(|count| {
+                        if count == 0 {
+                            0
+                        } else {
+                            buf[0] = 0;
+                            count + 1
+                        }
+                    })
+                }
+            } else {
+                ldisc.read(buf)
+            };
             if matches!(result, Err(AxError::WouldBlock))
                 && self
                     .endpoint
@@ -762,14 +872,20 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
             } else {
                 result
             }
-        } else {
-            Err(AxError::WouldBlock)
         }
     }
 
     fn write_at(&self, buf: &[u8], _offset: u64) -> AxResult<usize> {
         if self.hung_up.load(Ordering::Acquire) {
             return Err(AxError::Io);
+        }
+        if !self.is_ptm
+            && self
+                .terminal
+                .load_termios()
+                .has_lflag(linux_raw_sys::general::TOSTOP)
+        {
+            self.terminal.job_control.check_access(Signo::SIGTTOU)?;
         }
         self.writer.write(buf)
     }
@@ -779,6 +895,26 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
             general::{CAP_SYS_ADMIN, TCIFLUSH, TCIOFF, TCIOFLUSH, TCION, TCOFLUSH, TCOOFF, TCOON},
             ioctl::*,
         };
+        if !self.is_ptm
+            && matches!(
+                cmd,
+                TIOCSPGRP
+                    | TCSETS
+                    | TCSETSW
+                    | TCSETSF
+                    | TCSETS2
+                    | TCSETSW2
+                    | TCSETSF2
+                    | TCSETA
+                    | TCSETAW
+                    | TCSETAF
+                    | TCFLSH
+                    | TCXONC
+                    | TIOCSETD
+            )
+        {
+            self.terminal.job_control.check_access(Signo::SIGTTOU)?;
+        }
         match cmd {
             TCGETA => {
                 let bytes = self.terminal.termios.lock().as_termio().to_user_bytes();
@@ -883,7 +1019,9 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 _ => return Err(AxError::InvalidInput),
             },
             TIOCGPGRP => {
-                self.controlling_session(context.caller_session())?;
+                if !self.is_ptm {
+                    self.controlling_session(context.caller_session())?;
+                }
                 let foreground = self
                     .terminal
                     .job_control
@@ -961,11 +1099,54 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                     .write_bytes(arg, &self.pty_number().to_ne_bytes())
                     .map_err(map_usercopy_error)?;
             }
-            TIOCSCTTY => {
-                if arg != 0 {
-                    return Err(AxError::OperationNotSupported);
+            TIOCPKT => {
+                let endpoint = self
+                    .endpoint
+                    .as_ref()
+                    .filter(|e| e.is_master())
+                    .ok_or(AxError::NotATty)?;
+                let enabled = context
+                    .user_memory()
+                    .read_value(arg as *const i32)
+                    .map_err(map_usercopy_error)?
+                    != 0;
+                endpoint.set_packet_mode(enabled)?;
+            }
+            TIOCGPKT => {
+                let endpoint = self
+                    .endpoint
+                    .as_ref()
+                    .filter(|e| e.is_master())
+                    .ok_or(AxError::NotATty)?;
+                context
+                    .user_memory()
+                    .write_bytes(arg, &(endpoint.packet_mode() as i32).to_ne_bytes())
+                    .map_err(map_usercopy_error)?;
+            }
+            TIOCGPTPEER => {
+                if !self.is_ptm {
+                    return Err(AxError::Io);
                 }
-                self.this_arc()?.bind_to(&context.caller_process().proc)?;
+                let device = self
+                    .pts_lease
+                    .lock()
+                    .as_ref()
+                    .and_then(PtsLease::device)
+                    .ok_or(AxError::Io)?;
+                let slave = device
+                    .inner()
+                    .as_any()
+                    .downcast_ref::<PtyDriver>()
+                    .ok_or(AxError::Io)?;
+                return crate::syscall::open_pty_peer(context, slave.pts_location()?, arg as u32);
+            }
+            TIOCSCTTY => {
+                let steal = arg == 1
+                    && context
+                        .caller_cred()
+                        .has_effective_capability(CAP_SYS_ADMIN);
+                self.this_arc()?
+                    .bind_to_with_steal(&context.caller_process().proc, steal)?;
             }
             TIOCNOTTY => {
                 let _lifecycle = self.terminal.lifecycle.lock();
@@ -1003,6 +1184,9 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                 }
             }
             TIOCGSID => {
+                if !self.is_ptm {
+                    self.controlling_session(context.caller_session())?;
+                }
                 let session = self
                     .terminal
                     .job_control
@@ -1010,7 +1194,15 @@ impl<R: TtyRead, W: TtyWrite> DeviceOps for Tty<R, W> {
                     .ok_or(AxError::NotATty)?;
                 context
                     .user_memory()
-                    .write_bytes(arg, &session.sid().to_ne_bytes())
+                    .write_bytes(
+                        arg,
+                        &{
+                            let ns = context.caller_task().as_thread().pid_ns();
+                            ns.visible_pid_for(&ns, session.sid())
+                                .ok_or(AxError::NoSuchProcess)?
+                        }
+                        .to_ne_bytes(),
+                    )
                     .map_err(map_usercopy_error)?;
             }
             TIOCVHANGUP => {
@@ -1058,22 +1250,17 @@ impl<R: TtyRead, W: TtyWrite> Pollable for Tty<R, W> {
             .endpoint
             .as_ref()
             .map_or(IoEvents::empty(), PtyEndpoint::hangup_events);
-        let (mut events, foreground) = if self.is_ptm {
-            // The master endpoint is never subject to slave foreground job
-            // control and must remain pollable without a current user task.
-            (IoEvents::empty(), true)
-        } else if hangup_events.contains(IoEvents::HANGUP) {
-            // Hangup readiness is terminal state, independent of which task
-            // happens to poll the orphaned slave.
-            (IoEvents::empty(), true)
-        } else {
-            let events = self.terminal.job_control.poll();
-            let foreground = events.contains(IoEvents::READABLE);
-            (events, foreground)
-        };
+        // poll is not a job-control operation: readiness is independent of
+        // the polling process's foreground status (and safe for epoll workers).
+        let mut events = IoEvents::empty();
         events.set(IoEvents::WRITABLE, self.writer.poll_write());
-        if foreground {
-            events.set(IoEvents::READABLE, self.ldisc.lock().poll_read());
+        events.set(IoEvents::READABLE, self.ldisc.lock().poll_read());
+        if self
+            .endpoint
+            .as_ref()
+            .is_some_and(|e| e.packet_status(false) != 0)
+        {
+            events |= IoEvents::READABLE | IoEvents::PRIORITY;
         }
         events |= hangup_events;
         events
@@ -1218,6 +1405,70 @@ mod tests {
                 .iter()
                 .all(|&byte| byte == 0xa5)
         );
+    }
+
+    #[test]
+    fn packet_master_reports_control_priority_and_prefixes_data() {
+        let (master, slave) = pty::create_pty_pair_for_test().unwrap();
+        let master_open = master.open_transport_description().unwrap().unwrap();
+        let slave_open = slave.open_transport_description().unwrap().unwrap();
+        let endpoint = master.endpoint.as_ref().unwrap();
+        endpoint.set_packet_mode(true).unwrap();
+        assert_eq!(
+            slave.endpoint.as_ref().unwrap().set_packet_mode(true),
+            Err(AxError::NotATty)
+        );
+        slave.writer.set_output_stopped(true);
+        assert!(
+            master
+                .poll()
+                .contains(IoEvents::READABLE | IoEvents::PRIORITY)
+        );
+        let mut out = [0; 16];
+        assert_eq!(master.read_at(&mut out, 0), Ok(1));
+        assert_eq!(out[0], linux_raw_sys::general::TIOCPKT_STOP as u8);
+        assert!(!master.poll().contains(IoEvents::PRIORITY));
+        slave.writer.set_output_stopped(false);
+        assert_eq!(master.read_at(&mut out, 0), Ok(1));
+        assert_eq!(out[0], linux_raw_sys::general::TIOCPKT_START as u8);
+        slave.writer.write(b"abc").unwrap();
+        assert_eq!(master.read_at(&mut out, 0), Ok(4));
+        assert_eq!(&out[..4], b"\0abc");
+        slave.writer.flush_output();
+        assert_eq!(master.read_at(&mut out, 0), Ok(1));
+        assert_eq!(out[0], linux_raw_sys::general::TIOCPKT_FLUSHWRITE as u8);
+        endpoint.packet_event(linux_raw_sys::general::TIOCPKT_DOSTOP as u8, 0);
+        endpoint.set_packet_mode(false).unwrap();
+        assert!(!master.poll().contains(IoEvents::PRIORITY));
+        slave.writer.write(b"raw").unwrap();
+        assert_eq!(master.read_at(&mut out, 0), Ok(3));
+        assert_eq!(&out[..3], b"raw");
+        drop(slave_open);
+        drop(master_open);
+    }
+
+    #[test]
+    fn master_close_discards_slave_input_without_a_controlling_session() {
+        let (master, slave) = pty::create_pty_pair_for_test().unwrap();
+        let master_open = master.open_transport_description().unwrap().unwrap();
+        let slave_open = slave.open_transport_description().unwrap().unwrap();
+        // Cover a line already processed into the public discipline as well
+        // as bytes still in the raw channel at close.
+        slave.inject_input(b"cooked\n").unwrap();
+        assert!(slave.ldisc.lock().readable_len() != 0);
+        master.writer.write(b"raw\n").unwrap();
+        drop(master_open);
+        let mut output = [0; 32];
+        assert_eq!(slave.read_at(&mut output, 0), Ok(0));
+        assert_eq!(slave.write_at(b"x", 0), Err(AxError::Io));
+        drop(slave_open);
+    }
+
+    #[test]
+    fn slave_poll_needs_no_current_task_or_foreground_membership() {
+        let (_master, slave) = pty::create_pty_pair_for_test().unwrap();
+        slave.inject_input(b"ready\n").unwrap();
+        assert!(slave.poll().contains(IoEvents::READABLE));
     }
 
     #[test]

@@ -5,8 +5,9 @@ use axerrno::{AxError, AxResult};
 use axpoll::{IoEvents, PollSet, Pollable};
 use axtask::current;
 use kspin::SpinNoIrq;
+use tk_linux_signal::{SignalDisposition, SignalInfo, Signo};
 
-use crate::task::{AsThread, ProcessGroup, Session};
+use crate::task::{AsThread, ProcessGroup, Session, process_domain, send_signal_to_process_group};
 
 pub struct JobControl {
     foreground: SpinNoIrq<Weak<ProcessGroup>>,
@@ -20,6 +21,22 @@ pub enum SessionRelease {
     NotReleased,
     /// This caller performed the retirement and owns any foreground signals.
     Released(Option<Arc<ProcessGroup>>),
+}
+
+// Linux permits ignored/blocked SIGTTOU operations, but never background
+// reads with ignored/blocked SIGTTIN. Orphaned groups cannot stop for either.
+fn background_access_error(signal: Signo, ignored: bool, orphaned: bool) -> AxResult<()> {
+    if ignored {
+        if signal == Signo::SIGTTIN {
+            Err(AxError::Io)
+        } else {
+            Ok(())
+        }
+    } else if orphaned {
+        Err(AxError::Io)
+    } else {
+        Err(AxError::Interrupted)
+    }
 }
 
 impl Default for JobControl {
@@ -47,6 +64,44 @@ impl JobControl {
             guard.upgrade()
         };
         foreground.is_none_or(|pg| Arc::ptr_eq(&current().as_thread().proc_data.proc.group(), &pg))
+    }
+
+    /// Job-control checks apply only to the caller's controlling terminal,
+    /// never to a different session's terminal or to poll readiness.
+    pub fn check_access(&self, signal: Signo) -> AxResult<()> {
+        let Some(session) = self.session() else {
+            return Ok(());
+        };
+        let task = current();
+        let thread = task.as_thread();
+        let group = thread.proc_data.proc.group();
+        if !Arc::ptr_eq(&session, &group.session()) || self.current_in_foreground() {
+            return Ok(());
+        }
+        let ignored = thread.signal.signal_blocked(signal)
+            || matches!(
+                thread.proc_data.signal.action(signal).disposition,
+                SignalDisposition::Ignore
+            );
+        if ignored {
+            return background_access_error(signal, true, false);
+        }
+        let registry = process_domain()?.registry();
+        let has_parent_in_session = group
+            .any_process(registry, |process| {
+                !process.is_zombie()
+                    && process.parent().is_some_and(|parent| {
+                        parent.pid() != 1
+                            && !Arc::ptr_eq(&parent.group(), &group)
+                            && Arc::ptr_eq(&parent.group().session(), &session)
+                    })
+            })
+            .map_err(crate::task::process_error)?;
+        if !has_parent_in_session {
+            return background_access_error(signal, false, true);
+        }
+        send_signal_to_process_group(group.pgid(), Some(SignalInfo::new_kernel(signal)))?;
+        Err(AxError::Interrupted)
     }
 
     pub fn foreground(&self) -> Option<Arc<ProcessGroup>> {
@@ -165,5 +220,28 @@ impl Pollable for JobControl {
         } else {
             axpoll::PollRegistration::empty()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn background_signal_policy_matches_linux() {
+        for signal in [Signo::SIGTTIN, Signo::SIGTTOU] {
+            assert_eq!(
+                background_access_error(signal, false, false),
+                Err(AxError::Interrupted)
+            );
+            assert_eq!(
+                background_access_error(signal, false, true),
+                Err(AxError::Io)
+            );
+        }
+        assert_eq!(
+            background_access_error(Signo::SIGTTIN, true, false),
+            Err(AxError::Io)
+        );
+        assert_eq!(background_access_error(Signo::SIGTTOU, true, true), Ok(()));
     }
 }

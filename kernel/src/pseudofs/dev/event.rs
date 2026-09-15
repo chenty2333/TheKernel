@@ -134,6 +134,8 @@ struct EvdevDeviceState {
 /// created with [`EvdevDevice::open_client`]; they must never read the driver
 /// directly, otherwise competing readers lose events.
 pub struct EvdevDevice {
+    pump_gate: Mutex<()>,
+    keyboard: Mutex<super::tty::keyboard::KeyboardState>,
     state: Mutex<EvdevDeviceState>,
     next_client: AtomicU64,
     irq: Option<usize>,
@@ -191,6 +193,8 @@ impl EvdevDevice {
             axhal::irq::set_enable(irq, true);
         }
         Arc::new_cyclic(|weak| Self {
+            pump_gate: Mutex::new(()),
+            keyboard: Mutex::new(Default::default()),
             state: Mutex::new(EvdevDeviceState {
                 device,
                 key_state: Bitmap::new(),
@@ -216,6 +220,35 @@ impl EvdevDevice {
             irq_waker: core::task::Waker::from(Arc::new(InputIrqWake(weak.clone()))),
             irq_registration: spin::Mutex::new(None),
         })
+    }
+
+    #[cfg(target_os = "none")]
+    fn start_console_keyboard(self: &Arc<Self>) {
+        let mut keys = [0u8; KEY_CNT / 8];
+        if !matches!(self.event_bits(EventType::Key, &mut keys), Ok(true))
+            || keys[30 / 8] & (1 << (30 % 8)) == 0
+        {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        if axtask::try_spawn_with_name(
+            move || {
+                while let Some(device) = weak.upgrade() {
+                    if device.disconnected() {
+                        break;
+                    }
+                    let _ = device.pump();
+                    drop(device);
+                    // USB boot keyboards may have no dedicated IRQ source.
+                    let _ = axtask::sleep(core::time::Duration::from_millis(10));
+                }
+            },
+            "console-keyboard".into(),
+        )
+        .is_err()
+        {
+            warn!("unable to start console keyboard input worker");
+        }
     }
 
     /// Open-factory integration hook.  The VFS/OFD layer owns when this is
@@ -322,23 +355,45 @@ impl EvdevDevice {
     /// Drains pending hardware input and fans out only complete SYN_REPORT
     /// frames.  It is safe to call from read and poll paths.
     pub fn pump(&self) -> AxResult<()> {
+        let _pump = self.pump_gate.lock();
         if self.disconnected() {
             return Err(LinuxError::ENODEV.into());
         }
         if self.paused() {
             return Ok(());
         }
+        {
+            let mut keyboard = self.keyboard.lock();
+            if !keyboard
+                .retry_pending(|input| super::tty::VT_MANAGER.route_keyboard_input(input))?
+            {
+                // The periodic console worker retries within 10ms; evdev
+                // poll/read callers also retry. Never drain another batch
+                // while bytes from this exact recipient are backpressured.
+                return Ok(());
+            }
+            keyboard.prepare_batch(EVDEV_PUMP_EVENTS)?;
+        }
+        let keyboard_target = super::tty::VT_MANAGER.keyboard_target();
         self.irq_pending.store(false, Ordering::Release);
         let mut state = self.state.lock();
         let mut drained = 0;
+        let mut read_error = None;
+        let mut keys = [(0u16, 0i32); EVDEV_PUMP_EVENTS];
+        let mut key_count = 0;
         for _ in 0..EVDEV_PUMP_EVENTS {
             let event = match state.device.read_event() {
                 Ok(event) => event,
                 Err(DevError::Again) => break,
-                Err(error) => return Err(map_dev_error(error)),
+                Err(error) => {
+                    read_error = Some(map_dev_error(error));
+                    break;
+                }
             };
             drained += 1;
             if event.event_type == EventType::Key as u16 {
+                keys[key_count] = (event.code, event.value as i32);
+                key_count += 1;
                 match event.value {
                     0 => {
                         if (event.code as usize) < KEY_CNT {
@@ -382,9 +437,10 @@ impl EvdevDevice {
                     let slot = state.mt_current_slot;
                     let slots = state.mt_slots.entry(event.code as u8).or_default();
                     if slot >= slots.len() {
-                        slots
-                            .try_reserve(slot + 1 - slots.len())
-                            .map_err(|_| AxError::NoMemory)?;
+                        if slots.try_reserve(slot + 1 - slots.len()).is_err() {
+                            read_error = Some(AxError::NoMemory);
+                            break;
+                        }
                         slots.resize(slot + 1, 0);
                     }
                     slots[slot] = event.value as i32;
@@ -421,6 +477,29 @@ impl EvdevDevice {
                     true
                 });
             }
+        }
+        let grabbed = state.grab_owner.is_some();
+        drop(state);
+        // Key handling may switch seats (and pause this very device); never
+        // execute it while holding the input device lock.
+        if key_count != 0 {
+            let mut keyboard = self.keyboard.lock();
+            for &(code, value) in &keys[..key_count] {
+                if let Some(input) = super::tty::VT_MANAGER.keyboard_event(
+                    &mut keyboard,
+                    code,
+                    value,
+                    grabbed,
+                    keyboard_target,
+                ) {
+                    keyboard.queue_input(input);
+                }
+            }
+            let _ = keyboard
+                .retry_pending(|input| super::tty::VT_MANAGER.route_keyboard_input(input))?;
+        }
+        if let Some(error) = read_error {
+            return Err(error);
         }
         // A bounded drain leaves any excess work for the next task-context
         // poll/read pass rather than monopolising an IRQ wakeup.
@@ -1581,7 +1660,7 @@ impl InputManager {
                 InputSlot {
                     key,
                     minor,
-                    event,
+                    event: event.clone(),
                     node,
                     transport_handles,
                     parent_handle,
@@ -1593,6 +1672,8 @@ impl InputManager {
             unreachable!("duplicate token admitted after identity allocation");
         }
         drop(state);
+        #[cfg(target_os = "none")]
+        event.start_console_keyboard();
         // `/dev/input/eventN` now resolves through the manager before either
         // uevent becomes observable to udev/libinput.
         if let Some([pci_handle, virtio_handle]) = transport_handles {

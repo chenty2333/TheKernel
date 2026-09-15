@@ -3,6 +3,8 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -73,6 +75,35 @@ static int concurrent_clone_exit(void)
     return failed;
 }
 
+static int late_worker(void *unused)
+{
+    (void)unused;
+    struct timespec delay = {.tv_nsec = 50000000};
+    syscall(SYS_nanosleep, &delay, NULL);
+    syscall(SYS_exit, 0);
+    return 0;
+}
+
+static int leader_exits_first(void)
+{
+    pid_t child = fork();
+    if (child < 0) return 1;
+    if (!child) {
+        void *stack = malloc(65536);
+        if (!stack || clone(late_worker, (char *)stack + 65536,
+                CLONE_VM | CLONE_SIGHAND | CLONE_THREAD, NULL) < 0)
+            _exit(127);
+        syscall(SYS_exit, 42);
+        _exit(127);
+    }
+    int status = -1;
+    if (waitpid(child, &status, 0) != child || status != 0) {
+        fprintf(stderr, "THEKERNEL_EXIT_STATUS_FAIL leader-first status=%x\n", status);
+        return 1;
+    }
+    return 0;
+}
+
 int main(void)
 {
     const int values[] = {0, 0x123456ab, -1, -2147483647 - 1};
@@ -96,7 +127,7 @@ int main(void)
             }
         }
     }
-    if (concurrent_clone_exit())
+    if (leader_exits_first() || concurrent_clone_exit())
         return 1;
     alarm(0);
     puts("THEKERNEL_EXIT_STATUS_OK");

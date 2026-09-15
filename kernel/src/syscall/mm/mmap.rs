@@ -49,6 +49,14 @@ fn physical_mmap_window(
     Ok((start, size))
 }
 
+// Device VMAs cannot silently map fewer bytes than mmap promised the caller.
+fn validate_device_mmap_length(length: usize, available: usize) -> AxResult<()> {
+    if length == 0 || length > available {
+        return Err(AxError::InvalidInput);
+    }
+    Ok(())
+}
+
 const READ_IMPLIES_EXEC: u32 = 0x0040_0000;
 /// Use Linux's bottom-up compatibility mmap placement rather than the normal
 /// append-biased layout.
@@ -483,7 +491,7 @@ fn prepare_file_mmap_backend(
     permission_flags: MmapProt,
     offset: usize,
     page_size: PageSize,
-    length: &mut usize,
+    length: usize,
 ) -> AxResult<PreparedFileMmapBackend> {
     let inner = file.inner();
     let file_backend = inner.backend()?.clone();
@@ -505,7 +513,7 @@ fn prepare_file_mmap_backend(
             match device.mmap() {
                 DeviceMmap::None => Err(AxError::NoSuchDevice),
                 DeviceMmap::Anonymous => Ok(PreparedFileMmapBackend::SharedAnonymous {
-                    pages: Arc::try_new(SharedPages::new_shmem(*length, page_size)?)
+                    pages: Arc::try_new(SharedPages::new_shmem(length, page_size)?)
                         .map_err(|_| AxError::NoMemory)?,
                     may_protect: may_protect_from_file_flags(inner.flags()),
                 }),
@@ -522,14 +530,20 @@ fn prepare_file_mmap_backend(
                         page_size as usize,
                     )?;
                     range.start = start.into();
-                    *length = (*length).min(max_size);
+                    validate_device_mmap_length(length, max_size)?;
                     Ok(PreparedFileMmapBackend::Linear {
                         physical_start: range.start,
                         max_size,
                     })
                 }
                 DeviceMmap::SharedPages(pages) if offset == 0 => {
-                    *length = (*length).min(pages.len().saturating_mul(PAGE_SIZE_4K));
+                    validate_device_mmap_length(
+                        length,
+                        pages
+                            .len()
+                            .checked_mul(PAGE_SIZE_4K)
+                            .ok_or(AxError::InvalidInput)?,
+                    )?;
                     Ok(PreparedFileMmapBackend::DeviceSharedPages(pages))
                 }
                 DeviceMmap::SharedPages(_) => Err(AxError::InvalidInput),
@@ -557,14 +571,20 @@ fn prepare_file_mmap_backend(
                         page_size as usize,
                     )?;
                     range.start = start.into();
-                    *length = (*length).min(max_size);
+                    validate_device_mmap_length(length, max_size)?;
                     Ok(PreparedFileMmapBackend::Linear {
                         physical_start: range.start,
                         max_size,
                     })
                 }
                 Some(DeviceMmap::SharedPages(pages)) if offset == 0 => {
-                    *length = (*length).min(pages.len().saturating_mul(PAGE_SIZE_4K));
+                    validate_device_mmap_length(
+                        length,
+                        pages
+                            .len()
+                            .checked_mul(PAGE_SIZE_4K)
+                            .ok_or(AxError::InvalidInput)?,
+                    )?;
                     Ok(PreparedFileMmapBackend::DeviceSharedPages(pages))
                 }
                 Some(DeviceMmap::SharedPages(_)) => Err(AxError::InvalidInput),
@@ -685,11 +705,14 @@ fn may_protect_from_file_flags(open_flags: FileFlags) -> MappingFlags {
 struct MadviseRangeInfo {
     all_private_anonymous: bool,
     has_shared_mapping: bool,
+    has_physical_mapping: bool,
 }
 
 fn classify_madvise_backend(backend: &Backend) -> MadviseRangeInfo {
     MadviseRangeInfo {
         all_private_anonymous: backend.is_private_anonymous(),
+        has_physical_mapping: matches!(backend, Backend::Linear(_))
+            || matches!(backend, Backend::Shared(shared) if shared.pages().is_external()),
         has_shared_mapping: matches!(
             backend,
             Backend::Linear(_) | Backend::Shared(_) | Backend::File(_)
@@ -707,6 +730,7 @@ fn inspect_madvise_range(
     let mut info = MadviseRangeInfo {
         all_private_anonymous: true,
         has_shared_mapping: false,
+        has_physical_mapping: false,
     };
 
     while cursor < end {
@@ -720,6 +744,7 @@ fn inspect_madvise_range(
         let area_info = classify_madvise_backend(area.backend());
         info.all_private_anonymous &= area_info.all_private_anonymous;
         info.has_shared_mapping |= area_info.has_shared_mapping;
+        info.has_physical_mapping |= area_info.has_physical_mapping;
 
         cursor = area.end().min(end);
     }
@@ -872,7 +897,7 @@ pub fn sys_mmap(
         .checked_add(length)
         .and_then(|end| checked_align_up(end, page_size as usize))
         .ok_or(AxError::NoMemory)?;
-    let mut length = normalized_end - normalized_start;
+    let length = normalized_end - normalized_start;
     let requested_protection: MappingFlags = permission_flags.into();
     let file_mmap_protection = {
         let mut protection = FileMmapProtection::empty();
@@ -996,7 +1021,7 @@ pub fn sys_mmap(
                     permission_flags,
                     offset,
                     page_size,
-                    &mut length,
+                    length,
                 )
             })
             .transpose()?
@@ -3179,7 +3204,7 @@ pub fn sys_madvise(addr: usize, length: usize, advice: u32) -> AxResult<isize> {
         MADV_POPULATE_READ | MADV_POPULATE_WRITE => unreachable!("handled above"),
         MADV_DONTNEED => {
             let info = inspect_madvise_range(&aspace, start, length)?;
-            if info.has_shared_mapping || aspace.range_is_locked(start, length) {
+            if info.has_physical_mapping || aspace.range_is_locked(start, length) {
                 return Err(AxError::InvalidInput);
             }
             aspace.discard_pages(start, length)?;
@@ -3630,6 +3655,41 @@ mod tests {
         pseudofs::tmp::MemoryFs,
         task::UserNamespace,
     };
+
+    #[test]
+    fn dontneed_distinguishes_shmem_from_external_device_pages() {
+        let base = VirtAddr::from(0x4000);
+        let shmem = Backend::new_shared(
+            base,
+            Arc::new(SharedPages::new_shmem(PAGE_SIZE_4K, PageSize::Size4K).unwrap()),
+        );
+        let info = classify_madvise_backend(&shmem);
+        assert!(info.has_shared_mapping);
+        assert!(!info.has_physical_mapping);
+        let lease = Arc::new(crate::mm::ExternalPageLease::new(Arc::new(())));
+        let pages = SharedPages::new_external_4k(
+            alloc::vec![memory_addr::PhysAddr::from(0x1000)],
+            lease,
+            MappingFlags::DEVICE | MappingFlags::UNCACHED,
+        )
+        .unwrap();
+        let device = Backend::new_shared(base, Arc::new(pages));
+        assert!(classify_madvise_backend(&device).has_physical_mapping);
+    }
+
+    #[test]
+    fn device_mmap_rejects_partial_windows() {
+        assert_eq!(validate_device_mmap_length(4096, 4096), Ok(()));
+        assert_eq!(validate_device_mmap_length(4096, 8192), Ok(()));
+        assert_eq!(
+            validate_device_mmap_length(8192, 4096),
+            Err(AxError::InvalidInput)
+        );
+        assert_eq!(
+            validate_device_mmap_length(0, 4096),
+            Err(AxError::InvalidInput)
+        );
+    }
 
     #[test]
     fn physical_mmap_rejects_wrapped_and_out_of_window_offsets() {
