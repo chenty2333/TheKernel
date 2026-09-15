@@ -55,7 +55,7 @@ pub(crate) use self::{
     },
     jobctl::{
         ContinueResult, PtraceRelationshipOrigin, PtraceRelationshipSnapshot, PtraceSession,
-        StopReport,
+        StopFilter, StopReport,
     },
     loadavg::{load_average_sample_now, load_average_sysinfo, proc_loadavg},
     process::{

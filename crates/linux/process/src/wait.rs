@@ -42,6 +42,18 @@ pub struct WaitEventState {
     pub exited: bool,
     /// The child has an unreported stop.
     pub stopped: bool,
+    /// `wait_consider_task()`'s per-child `ptrace` argument for `stopped`: this
+    /// caller is the child's ptracer, or is treated as one because the tracee
+    /// is traced from its own thread group (`if (!ptrace_reparented(p))
+    /// ptrace = 1;`, `kernel/exit.c:1522-1523`). `wait_task_stopped()` reports
+    /// such a stop regardless of `WUNTRACED`:
+    ///
+    /// ```c
+    /// 	/* Traditionally we see ptrace'd stopped tasks regardless of options. */
+    /// 	if (!ptrace && !(wo->wo_flags & WUNTRACED))
+    /// 		return 0;
+    /// ```
+    pub ptrace: bool,
     /// The child has an unreported continue.
     pub continued: bool,
 }
@@ -80,7 +92,7 @@ pub const fn select_child_event(
     if state.exited && selection.exited {
         return Some(WaitEventKind::Exited);
     }
-    if state.stopped && selection.stopped {
+    if state.stopped && (state.ptrace || selection.stopped) {
         return Some(WaitEventKind::Stopped);
     }
     if state.continued && selection.continued {
@@ -199,6 +211,7 @@ mod tests {
         let state = WaitEventState {
             exited: true,
             stopped: true,
+            ptrace: false,
             continued: true,
         };
         assert_eq!(select_child_event(state, ALL), Some(WaitEventKind::Exited));
@@ -209,6 +222,7 @@ mod tests {
         let state = WaitEventState {
             exited: false,
             stopped: true,
+            ptrace: false,
             continued: true,
         };
         assert_eq!(select_child_event(state, ALL), Some(WaitEventKind::Stopped));
@@ -219,6 +233,7 @@ mod tests {
         let state = WaitEventState {
             exited: true,
             stopped: true,
+            ptrace: false,
             continued: true,
         };
         assert_eq!(select_child_event(state, EXITED_ONLY), {
@@ -240,6 +255,7 @@ mod tests {
         let state = WaitEventState {
             exited: false,
             stopped: true,
+            ptrace: false,
             continued: true,
         };
         assert_eq!(
@@ -256,6 +272,38 @@ mod tests {
     }
 
     #[test]
+    fn a_ptrace_stop_is_reported_without_wuntraced() {
+        // `wait_task_stopped()`: "Traditionally we see ptrace'd stopped tasks
+        // regardless of options." `wait4(2)` passes no option bits at all, so a
+        // tracer waiting for a `PTRACE_TRACEME` child that stopped must still
+        // be told about the stop.
+        let state = WaitEventState {
+            exited: false,
+            stopped: true,
+            ptrace: true,
+            continued: false,
+        };
+        let bare = WaitEventSelection {
+            exited: true,
+            stopped: false,
+            continued: false,
+        };
+        assert_eq!(select_child_event(state, bare), Some(WaitEventKind::Stopped));
+        // A job-control stop of a non-ptrace child keeps the option gate, so
+        // the same bare request reports nothing for it.
+        assert_eq!(
+            select_child_event(
+                WaitEventState {
+                    ptrace: false,
+                    ..state
+                },
+                bare
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn a_stopped_child_beats_a_later_exited_sibling_in_per_child_order() {
         // The regression this guards: child A is stopped, child B has exited.
         // Linux reports A (first child, stopped); a global exited-first pass
@@ -263,11 +311,13 @@ mod tests {
         let a = WaitEventState {
             exited: false,
             stopped: true,
+            ptrace: false,
             continued: false,
         };
         let b = WaitEventState {
             exited: true,
             stopped: false,
+            ptrace: false,
             continued: false,
         };
         let per_child = [a, b]
