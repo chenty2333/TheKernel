@@ -35,6 +35,7 @@
 #include <sys/ipc.h>
 #include <sys/msg.h>
 #include <sys/resource.h>
+#include <sched.h>
 #include <sys/sem.h>
 #include <sys/shm.h>
 #include <sys/syscall.h>
@@ -1042,12 +1043,66 @@ static void case_record_layout(void) {
     done();
 }
 
+/*
+ * Case: sysvipc-sem-undo.unshare-detaches
+ *
+ * `unshare(CLONE_SYSVSEM)` is equivalent to `sys_exit()` for the undo list
+ * (kernel/fork.c:3280-3284): `exit_sem()` detaches the caller, applies the
+ * pending adjustments only when the caller was the list's last owner
+ * (ipc/sem.c:2333-2345, where a shared list is merely unreferenced), and
+ * leaves the caller with *no* list, so the next `semop()` starts an empty one
+ * and nothing is applied a second time at exit.
+ *
+ * The verdict therefore has to outlive the task that unshares: a child makes
+ * the adjustment, observes the value return when it unshares, and exits; the
+ * parent then reads the value once more.  A kernel that kept a copy of the
+ * adjustments would restore them again here.
+ */
+static void case_sem_undo_unshare(void) {
+    struct sembuf op;
+    int status = 0;
+
+    begin("sysvipc-sem-undo-unshare.unshare-detaches");
+
+    int semid = (int)ok_call(semget(IPC_PRIVATE, 1, IPC_CREAT | 0600), "semget");
+    errno = 0;
+    ok_call(semctl(semid, 0, SETVAL, 5), "setval-five");
+
+    pid_t child = fork();
+    check(child >= 0, "fork");
+    if (child == 0) {
+        op.sem_num = 0;
+        op.sem_op = -1;
+        op.sem_flg = SEM_UNDO;
+        if (semop(semid, &op, 1) != 0)
+            _exit(1);
+        if (semctl(semid, 0, GETVAL) != 4)
+            _exit(2);
+        /* exit_sem() applies the pending adjustment here. */
+        if (unshare(CLONE_SYSVSEM) != 0)
+            _exit(3);
+        if (semctl(semid, 0, GETVAL) != 5)
+            _exit(4);
+        _exit(0);
+    }
+    check(waitpid(child, &status, 0) == child, "wait-child");
+    check(WIFEXITED(status) && WEXITSTATUS(status) == 0, "child-verdict");
+    errno = 0;
+    check(semctl(semid, 0, GETVAL) == 5, "value-after-child-exit");
+    mark("UNSHARE_APPLIES_UNDO_ONCE");
+
+    errno = 0;
+    ok_call(semctl(semid, 0, IPC_RMID, NULL), "semctl-rmid");
+    done();
+}
+
 int main(void) {
     case_identifier_progression();
     case_stat_index_resolution();
     case_info_max_index();
     case_sem_flags();
     case_sem_undo_range();
+    case_sem_undo_unshare();
     case_ipc64_command();
     case_shm_lock_memlock();
     case_shm_hugetlb_existing_key();

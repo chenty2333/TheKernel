@@ -2281,23 +2281,6 @@ impl SemUndoState {
         .map_err(|_| AxError::NoMemory)
     }
 
-    pub(crate) fn try_clone_for(
-        ipc_ns: Arc<IpcNamespace>,
-        source: &Arc<Self>,
-    ) -> AxResult<Arc<Self>> {
-        let undo = source
-            .undo
-            .lock()
-            .as_ref()
-            .map(SemUndo::try_clone)
-            .transpose()?;
-        Arc::try_new(Self {
-            ipc_ns,
-            undo: Mutex::new(undo),
-        })
-        .map_err(|_| AxError::NoMemory)
-    }
-
     pub(crate) fn undo(&self) -> &Mutex<Option<SemUndo>> {
         &self.undo
     }

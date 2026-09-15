@@ -1223,7 +1223,8 @@ impl CloneArgs {
             } else {
                 // fork/clone starts with no SEM_UNDO adjustments.  Only
                 // CLONE_SYSVSEM shares an existing adjustment list; unshare
-                // is the operation that snapshots it into private state.
+                // applies the caller's list and detaches from it, so the
+                // unsharing caller also starts empty (`exit_sem()`).
                 SemUndoState::try_new(calling_thread.ipc_ns())?
             };
             thr.replace_sem_undo(child_sem_undo);

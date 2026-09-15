@@ -904,10 +904,16 @@ pub fn sys_unshare(flags: usize) -> AxResult<isize> {
             let private_sem_undo = if let Some(ipc_ns) = private_ipc_ns.as_ref() {
                 Some(crate::task::SemUndoState::try_new(ipc_ns.clone())?)
             } else if flags & CLONE_SYSVSEM != 0 {
-                Some(crate::task::SemUndoState::try_clone_for(
-                    thread.ipc_ns(),
-                    &thread.sem_undo(),
-                )?)
+                // `unshare(CLONE_SYSVSEM)` is equivalent to `sys_exit()` for
+                // the undo list (`kernel/fork.c:3280-3284`): `exit_sem()`
+                // detaches the caller, applies the pending adjustments only
+                // if the caller was the last owner of the list
+                // (`ipc/sem.c:2333-2345`), and leaves the caller with no list
+                // at all, so the next `semop()` starts an empty one.  Cloning
+                // the adjustments here would apply them twice: once when
+                // `retire_sem_undo()` sees the retired state drop to its last
+                // reference, and again when the clone reaches final exit.
+                Some(crate::task::SemUndoState::try_new(thread.ipc_ns())?)
             } else {
                 None
             };
