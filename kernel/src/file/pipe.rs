@@ -571,29 +571,100 @@ struct PipeReadReservation {
     was_writable: bool,
 }
 
-/// Moves the destination prefix of `src` into `dst`.
+/// The buffer at the read index as one run of bytes.
+///
+/// `flags` is `Some` exactly when the run is one packetized buffer.
+#[derive(Clone, Copy)]
+struct PipeRun {
+    len: usize,
+    flags: Option<u8>,
+}
+
+/// `pipe_buf(pipe, pipe->tail)` seen through the byte ring.
+fn head_run(ring: &PipeRing) -> PipeRun {
+    match ring.head_packet() {
+        Some((len, flags)) => PipeRun {
+            len,
+            flags: Some(flags),
+        },
+        None => PipeRun {
+            len: ring.head_stream_len(),
+            flags: None,
+        },
+    }
+}
+
+/// Copies `run` into `dst`, preserving its buffer flags.
+///
+/// `link_pipe()` (tee) and `splice_pipe_to_pipe()` both carry `buf->flags`
+/// across, clearing only `PIPE_BUF_FLAG_GIFT` and `PIPE_BUF_FLAG_CAN_MERGE`
+/// (`fs/splice.c:1818-1819`, `:1907-1908`), so a packetized buffer stays
+/// packetized in the destination pipe.
+fn copy_pipe_run(
+    src: &PipeRing,
+    dst: &mut PipeRing,
+    run: PipeRun,
+    max_len: usize,
+) -> usize {
+    if run.len == 0 {
+        return 0;
+    }
+    // `link_pipe()` and `splice_pipe_to_pipe()` admit one destination buffer per
+    // free slot (`pipe_full(o_head, o_tail, opipe->max_usage)`) and one buffer
+    // holds at most a page, so a free slot is worth at most `PAGE_SIZE` bytes of
+    // room however much byte vacancy the ring reports.
+    let room = dst
+        .vacant_len()
+        .min(dst.vacant_buffers().saturating_mul(PIPE_BUF_SIZE));
+    let take = run.len.min(max_len).min(room);
+    if take == 0 {
+        return 0;
+    }
+    let written = {
+        let (left, right) = src.bytes.as_slices();
+        copy_slices_to_ring(&mut dst.bytes, &[left, right], take)
+    };
+    if written == 0 {
+        return 0;
+    }
+    match run.flags {
+        Some(flags) => dst.commit_packet(written, flags),
+        None => dst.commit_stream(written),
+    }
+    written
+}
+
 fn move_pipe_buffer(src: &mut PipeRing, dst: &mut PipeRing, max_len: usize) -> PipeTransfer {
-    let (left, right) = src.bytes.as_slices();
-    let written = copy_slices_to_ring(&mut dst.bytes, &[left, right], max_len);
-    dst.commit_stream(written);
-    // `written` came from the currently occupied source slices and therefore
-    // cannot exceed the initialized prefix owned by the consumer.
-    src.advance_read(written);
+    let mut total = 0usize;
+    while total < max_len {
+        let run = head_run(src);
+        let written = copy_pipe_run(src, dst, run, max_len - total);
+        if written == 0 {
+            break;
+        }
+        src.advance_read(written);
+        total += written;
+    }
     PipeTransfer {
-        len: written,
-        wake_readers: written > 0,
+        len: total,
+        wake_readers: total > 0,
         became_writable: false,
     }
 }
 
-/// Copies `max_len` bytes of the current source prefix into `dst`.
 fn copy_pipe_buffer(src: &PipeRing, dst: &mut PipeRing, max_len: usize) -> PipeTransfer {
-    let (left, right) = src.bytes.as_slices();
-    let written = copy_slices_to_ring(&mut dst.bytes, &[left, right], max_len);
-    dst.commit_stream(written);
+    let mut total = 0usize;
+    while total < max_len {
+        let run = head_run(src);
+        let written = copy_pipe_run(src, dst, run, max_len - total);
+        if written == 0 {
+            break;
+        }
+        total += written;
+    }
     PipeTransfer {
-        len: written,
-        wake_readers: written > 0,
+        len: total,
+        wake_readers: total > 0,
         became_writable: false,
     }
 }
