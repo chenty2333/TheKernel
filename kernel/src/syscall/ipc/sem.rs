@@ -172,6 +172,15 @@ impl SemUndo {
     }
 }
 
+/// The highest semaphore number one `semop` vector names.
+///
+/// Linux `__do_semtimedop()` accumulates `max` over the vector while it
+/// copies it in and bounds it against `sma->sem_nsems` with EFBIG before it
+/// checks permission.
+fn highest_sem_num(ops: &[Sembuf]) -> u16 {
+    ops.iter().map(|op| op.sem_num).max().unwrap_or(0)
+}
+
 /// Translates one userspace `sembuf` into the ABI crate's view.
 fn abi_sem_buf(op: &Sembuf) -> AbiSemBuf {
     AbiSemBuf {
@@ -1428,6 +1437,13 @@ pub fn sys_semtimedop<M: UserMemory + ?Sized>(
             .get_array_by_semid(semid)
             .ok_or(AxError::from(LinuxError::EINVAL))?
     };
+    // Linux `__do_semtimedop()` bounds the vector against the array with
+    // EFBIG *before* `ipcperms()`, so an operation that names a semaphore
+    // outside the set reports EFBIG even when the caller also lacks write
+    // permission.  `sem_nsems` is fixed at creation, so one check suffices.
+    if highest_sem_num(&ops) as usize >= array.lock().nsems() {
+        return Err(AxError::from(LinuxError::EFBIG));
+    }
     let mut wait_guard = None;
     let mut wait_key = None;
 
@@ -1567,6 +1583,22 @@ mod setall_snapshot_tests {
 
     /// Regression: the array table used to be keyed by the published
     /// identifier with nothing validating the sequence.
+    /// The bound `semop` applies to the whole vector before it checks
+    /// permission: the highest semaphore number, not the first one.
+    #[test]
+    fn highest_semaphore_number_bounds_the_operation_vector() {
+        let op = |sem_num, sem_op| Sembuf {
+            sem_num,
+            sem_op,
+            sem_flg: 0,
+        };
+        assert_eq!(highest_sem_num(&[op(0, 1)]), 0);
+        assert_eq!(highest_sem_num(&[op(0, 1), op(4, 1), op(2, 1)]), 4);
+        // `nsops < 1` is rejected before the bound is consulted, so the empty
+        // vector's placeholder cannot be observed.
+        assert_eq!(highest_sem_num(&[]), 0);
+    }
+
     #[test]
     fn array_lookup_validates_the_sequence_and_stat_uses_the_index() {
         let _context = crate::test_support::scheduler_test_context();

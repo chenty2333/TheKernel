@@ -590,6 +590,29 @@ static void case_shm_dest_stat(void) {
 }
 
 /*
+ * The out-of-range bound and the permission check, in Linux's order: EFBIG
+ * for a `sem_num` outside the set, EACCES for the same operation inside it.
+ * Returns 0 on success and a distinct status per failing probe.
+ */
+static int semop_bound_precedes_permission(int semid) {
+    struct sembuf op;
+
+    memset(&op, 0, sizeof(op));
+    op.sem_num = 5;
+    op.sem_op = -1;
+    errno = 0;
+    if (semop(semid, &op, 1) != -1 || errno != EFBIG) {
+        return 3;
+    }
+    op.sem_num = 0;
+    errno = 0;
+    if (semop(semid, &op, 1) != -1 || errno != EACCES) {
+        return 4;
+    }
+    return 0;
+}
+
+/*
  * Case: sysvipc-errno.order
  *
  * Argument validation order is the ABI.  Each probe below pairs an invalid
@@ -666,6 +689,28 @@ static void case_errno_order(void) {
     errno_call(semctl(semid, 5, SETVAL, 1), EINVAL,
                "semctl-setval-semnum-first");
 
+    /* __do_semtimedop() bounds the vector against the array with EFBIG before
+     * ipcperms(), so an out-of-range sem_num wins over the read-only mode.
+     * The order is only observable for a caller the mode excludes, so the
+     * probe drops to uid 1 when the suite runs as root (CAP_IPC_OWNER would
+     * otherwise bypass the mode check and the first probe would succeed). */
+    if (geteuid() == 0) {
+        pid_t child = fork();
+        if (child < 0) {
+            fail("fork");
+        }
+        if (child == 0) {
+            if (setresuid(1, 1, 1) != 0) {
+                _exit(2);
+            }
+            _exit(semop_bound_precedes_permission(semid));
+        }
+        reap_child(child, "semop-efbig-before-eacces");
+    } else {
+        check(semop_bound_precedes_permission(semid) == 0,
+              "semop-efbig-before-eacces");
+    }
+
     /* __do_semtimedop() validates the count, then the timeout, then the
      * operations, and only then resolves the array. */
     memset(&op, 0, sizeof(op));
@@ -688,6 +733,7 @@ static void case_errno_order(void) {
     errno = 0;
     ok_call(semctl(semid, 0, IPC_RMID, NULL), "semctl-rmid");
 
+    mark("SEMOP_EFBIG_BEFORE_EACCES");
     mark("MSGSND_FAULTS_BEFORE_VALIDATION");
     mark("MSGSND_SIZE_AND_TYPE_BEFORE_ID");
     mark("MSGRCV_COPY_FAULT_BEFORE_ID");
