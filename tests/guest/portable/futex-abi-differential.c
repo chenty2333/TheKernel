@@ -44,6 +44,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -133,6 +134,31 @@
 
 #ifndef FUTEX_32
 #define FUTEX_32 2
+#endif
+
+#ifndef FUTEX_WAKE_OP
+#define FUTEX_WAKE_OP 5
+#endif
+
+/* FUTEX_WAKE_OP's encoded operation.  include/uapi/linux/futex.h:
+ *
+ *	#define FUTEX_OP(op, oparg, cmp, cmparg) \
+ *					(((op & 0xf) << 28) | ((cmp & 0xf) << 24)	\
+ *					| ((oparg & 0xfff) << 12) | (cmparg & 0xfff))
+ *
+ * with FUTEX_OP_SET, FUTEX_OP_CMP_EQ and FUTEX_OP_CMP_NE all zero. */
+#ifndef FUTEX_OP_SET
+#define FUTEX_OP_SET 0
+#endif
+
+#ifndef FUTEX_OP_CMP_EQ
+#define FUTEX_OP_CMP_EQ 0
+#endif
+
+#ifndef FUTEX_OP
+#define FUTEX_OP(op, oparg, cmp, cmparg)                                       \
+    ((((op) & 0xf) << 28) | (((cmp) & 0xf) << 24) | (((oparg) & 0xfff) << 12)  \
+     | ((cmparg) & 0xfff))
 #endif
 
 /* futex2 flag bits (the size field lives in the low two bits). */
@@ -1918,6 +1944,344 @@ static int test_requeue_pi_signal(void) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* H. A resident word whose page-table leaf is not writable           */
+/* ------------------------------------------------------------------ */
+
+/* Linux v7.2.3, `kernel/futex/core.c`:
+ *
+ *	int fault_in_user_writeable(u32 __user *uaddr)
+ *	{
+ *		struct mm_struct *mm = current->mm;
+ *		int ret;
+ *
+ *		mmap_read_lock(mm);
+ *		ret = fixup_user_fault(mm, (unsigned long)uaddr,
+ *				       FAULT_FLAG_WRITE, NULL);
+ *		mmap_read_unlock(mm);
+ *
+ *		return ret < 0 ? ret : 0;
+ *	}
+ *
+ * Every futex opcode that must write the word takes this slow path when its
+ * atomic access faults, and the page state decides the outcome:
+ *
+ *  - the copy-on-write leaf `fork()` leaves in the parent, where the VMA
+ *    allows writes and the fault succeeds, so the operation is retried and
+ *    completes, and
+ *  - a word `mprotect(PROT_READ)` made read-only, where the fault cannot be
+ *    satisfied and the operation reports EFAULT with the word untouched.
+ *
+ * The fault is also the only thing that clears the first state: the word stays
+ * readable throughout, so an operation that answers the fault with another
+ * read re-classifies the same leaf and never leaves its retry loop.  Each
+ * stage below therefore prints its RAW progress line before entering the
+ * kernel, so a kernel that spins is named by the last line it printed. */
+
+/* fork() without touching the parent's words: every page the child inherits
+ * becomes copy-on-write for the parent. */
+static int fork_untouched(const char *stage) {
+    pid_t child = fork();
+    if (child < 0) {
+        return fail(stage, errno);
+    }
+    if (child == 0) {
+        _exit(0);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+        return fail(stage, errno);
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        return fail(stage, EPROTO);
+    }
+    return 0;
+}
+
+/* A word whose leaf is present but not writable because fork() write-protected
+ * it.  The word is stored first so the parent's leaf is a private copy-on-write
+ * page rather than the shared read-only zero page. */
+static int cow_word_page(uint32_t *word, const char *stage) {
+    *word = 0;
+    return fork_untouched(stage);
+}
+
+static int read_only_word_page(uint32_t *word, const char *stage) {
+    if (mprotect(word, 4096, PROT_READ) != 0) {
+        return fail(stage, errno);
+    }
+    return 0;
+}
+
+static void raw_stage(const char *stage) {
+    printf("THEKERNEL_FUTEX_ABI_DIFFERENTIAL_RETRY_RAW stage=%s\n", stage);
+    fflush(stdout);
+}
+
+static int test_retry_write_fault(void) {
+    const uint32_t self = (uint32_t)syscall(SYS_gettid);
+    /* One page per word: mprotect() and the COW split both work on pages, and
+     * keeping the words apart means a read-only stage cannot change the page
+     * state another stage observes. */
+    uint32_t *pages = mmap(NULL, 4096 * 12, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pages == MAP_FAILED) {
+        return fail("retry-write-fault-map", errno);
+    }
+    uint32_t *lock_cow = pages + 1024 * 0;
+    uint32_t *unlock_cow = pages + 1024 * 1;
+    uint32_t *lock_ro = pages + 1024 * 2;
+    uint32_t *unlock_ro = pages + 1024 * 3;
+    uint32_t *wake_op_source = pages + 1024 * 4;
+    uint32_t *wake_op_cow = pages + 1024 * 5;
+    uint32_t *wake_op_ro = pages + 1024 * 6;
+    uint32_t *cmp_source_cow = pages + 1024 * 7;
+    uint32_t *cmp_target_cow = pages + 1024 * 8;
+    uint32_t *cmp_source_ro = pages + 1024 * 9;
+    uint32_t *cmp_target_ro = pages + 1024 * 10;
+
+    /* FUTEX_LOCK_PI on a free word that fork() write-protected: the word is
+     * readable, so the caller is queued for an uncontended takeover and only
+     * the write fault can publish it.  Linux returns 0 and the word names the
+     * caller. */
+    if (cow_word_page(lock_cow, "retry-write-fault-lock-cow-fork") != 0) {
+        return 1;
+    }
+    if (*lock_cow != 0) {
+        return fail("retry-write-fault-lock-cow-precondition", EPROTO);
+    }
+    raw_stage("lock-pi-cow");
+    if (expect_futex_zero("retry-write-fault-lock-cow", lock_cow,
+                          FUTEX_LOCK_PI | PRIVATE, 0, NULL, NULL, 0) != 0) {
+        return 1;
+    }
+    if ((*lock_cow & FUTEX_TID_MASK) != self) {
+        return fail("retry-write-fault-lock-cow-word", EPROTO);
+    }
+    if (expect_futex_zero("retry-write-fault-unlock-after-cow", lock_cow,
+                          FUTEX_UNLOCK_PI | PRIVATE, 0, NULL, NULL, 0) != 0) {
+        return 1;
+    }
+
+    /* FUTEX_UNLOCK_PI on a word the caller already owns and fork() then
+     * write-protected: taking the lock made the leaf writable, so the fork is
+     * the only thing standing between the unlock and its handoff.  Linux
+     * returns 0 and clears the word. */
+    if (expect_futex_zero("retry-write-fault-lock-before-cow", unlock_cow,
+                          FUTEX_LOCK_PI | PRIVATE, 0, NULL, NULL, 0) != 0) {
+        return 1;
+    }
+    if (fork_untouched("retry-write-fault-unlock-cow-fork") != 0) {
+        return 1;
+    }
+    raw_stage("unlock-pi-cow");
+    if (expect_futex_zero("retry-write-fault-unlock-cow", unlock_cow,
+                          FUTEX_UNLOCK_PI | PRIVATE, 0, NULL, NULL, 0) != 0) {
+        return 1;
+    }
+    if (*unlock_cow != 0) {
+        return fail("retry-write-fault-unlock-cow-word", EPROTO);
+    }
+
+    /* The same two operations on a word mprotect() made read-only: the write
+     * fault cannot be satisfied, so Linux reports EFAULT and leaves the word
+     * exactly as it was. */
+    if (read_only_word_page(lock_ro, "retry-write-fault-lock-ro-protect") !=
+        0) {
+        return 1;
+    }
+    raw_stage("lock-pi-read-only");
+    if (expect_futex_errno("retry-write-fault-lock-ro", lock_ro,
+                           FUTEX_LOCK_PI | PRIVATE, 0, NULL, NULL, 0,
+                           EFAULT) != 0) {
+        return 1;
+    }
+    if (*lock_ro != 0) {
+        return fail("retry-write-fault-lock-ro-word", EPROTO);
+    }
+
+    if (expect_futex_zero("retry-write-fault-lock-before-ro", unlock_ro,
+                          FUTEX_LOCK_PI | PRIVATE, 0, NULL, NULL, 0) != 0) {
+        return 1;
+    }
+    const uint32_t ro_owner = *unlock_ro;
+    if (read_only_word_page(unlock_ro, "retry-write-fault-unlock-ro-protect") !=
+        0) {
+        return 1;
+    }
+    raw_stage("unlock-pi-read-only");
+    if (expect_futex_errno("retry-write-fault-unlock-ro", unlock_ro,
+                           FUTEX_UNLOCK_PI | PRIVATE, 0, NULL, NULL, 0,
+                           EFAULT) != 0) {
+        return 1;
+    }
+    if (*unlock_ro != ro_owner) {
+        return fail("retry-write-fault-unlock-ro-word", EPROTO);
+    }
+    /* The rejected unlock left the lock owned, so restoring write access must
+     * let the same caller hand it back. */
+    if (mprotect(unlock_ro, 4096, PROT_READ | PROT_WRITE) != 0) {
+        return fail("retry-write-fault-unlock-ro-restore", errno);
+    }
+    if (expect_futex_zero("retry-write-fault-unlock-ro-repaired", unlock_ro,
+                          FUTEX_UNLOCK_PI | PRIVATE, 0, NULL, NULL, 0) != 0) {
+        return 1;
+    }
+    if (*unlock_ro != 0) {
+        return fail("retry-write-fault-unlock-ro-repaired-word", EPROTO);
+    }
+
+    /* FUTEX_WAKE_OP modifies uaddr2 with its encoded operation.  `SET 7` makes
+     * the update visible, so the COW stage proves the write fault was taken
+     * and the read-only stage proves the word was left alone. */
+    const uint32_t set_seven = FUTEX_OP(FUTEX_OP_SET, 7, FUTEX_OP_CMP_EQ, 0);
+    *wake_op_source = 0;
+    if (cow_word_page(wake_op_cow, "retry-write-fault-wake-op-cow-fork") != 0) {
+        return 1;
+    }
+    raw_stage("wake-op-cow");
+    if (expect_futex_zero("retry-write-fault-wake-op-cow", wake_op_source,
+                          FUTEX_WAKE_OP | PRIVATE, 1, NULL, wake_op_cow,
+                          set_seven) != 0) {
+        return 1;
+    }
+    if (*wake_op_cow != 7) {
+        return fail("retry-write-fault-wake-op-cow-word", EPROTO);
+    }
+
+    *wake_op_ro = 0;
+    if (read_only_word_page(wake_op_ro, "retry-write-fault-wake-op-ro-protect") !=
+        0) {
+        return 1;
+    }
+    raw_stage("wake-op-read-only");
+    if (expect_futex_errno("retry-write-fault-wake-op-ro", wake_op_source,
+                           FUTEX_WAKE_OP | PRIVATE, 1, NULL, wake_op_ro,
+                           set_seven, EFAULT) != 0) {
+        return 1;
+    }
+    if (*wake_op_ro != 0) {
+        return fail("retry-write-fault-wake-op-ro-word", EPROTO);
+    }
+
+    /* FUTEX_CMP_REQUEUE_PI promoting a queued waiter onto the target writes
+     * the target word with the new owner.  The waiter is a real
+     * FUTEX_WAIT_REQUEUE_PI waiter, so the promotion really happens. */
+    struct requeue_pi_case test;
+    memset(&test, 0, sizeof(test));
+    test.source = cmp_source_cow;
+    test.target = cmp_target_cow;
+    *cmp_source_cow = 0;
+    if (cow_word_page(cmp_target_cow, "retry-write-fault-cmp-cow-fork") != 0) {
+        return 1;
+    }
+    if (absolute_bound(&test.timeout, WAIT_BOUND_NS) != 0) {
+        return fail("retry-write-fault-cmp-cow-clock", errno);
+    }
+    if (start_blocked(&test.blocked, requeue_pi_waiter_main, &test,
+                      "retry-write-fault-cmp-cow-create") != 0) {
+        return 1;
+    }
+    if (wait_until_blocked(&test.blocked,
+                           "retry-write-fault-cmp-cow-block") != 0) {
+        return 1;
+    }
+    if (*cmp_source_cow != 0 || *cmp_target_cow != 0) {
+        return fail("retry-write-fault-cmp-cow-precondition", EPROTO);
+    }
+    raw_stage("cmp-requeue-pi-cow");
+    errno = 0;
+    long promoted = sys_futex(cmp_source_cow, FUTEX_CMP_REQUEUE_PI | PRIVATE, 1,
+                              (const struct timespec *)(uintptr_t)1,
+                              cmp_target_cow, 0);
+    int promoted_errno = errno;
+    if (promoted != 1) {
+        return fail("retry-write-fault-cmp-cow",
+                    promoted == -1 ? promoted_errno : EPROTO);
+    }
+    const uint32_t waiter_tid =
+        (uint32_t)atomic_load_explicit(&test.blocked.tid, memory_order_acquire);
+    if ((*cmp_target_cow & FUTEX_TID_MASK) != waiter_tid) {
+        return fail("retry-write-fault-cmp-cow-word", EPROTO);
+    }
+    if (release_parked_thread(&test.control,
+                              "retry-write-fault-cmp-cow-release") != 0) {
+        return 1;
+    }
+    if (join_blocked(&test.blocked, "retry-write-fault-cmp-cow-join") != 0) {
+        return 1;
+    }
+    if (test.wait_result != 0 || test.unlock_result != 0 ||
+        !parked_wait_succeeded(test.control_result, test.control_errno)) {
+        return fail("retry-write-fault-cmp-cow-waiter-result",
+                    test.wait_errno != 0      ? test.wait_errno
+                    : test.unlock_errno != 0  ? test.unlock_errno
+                    : test.control_errno != 0 ? test.control_errno
+                                              : EPROTO);
+    }
+    if (*cmp_target_cow != 0) {
+        return fail("retry-write-fault-cmp-cow-unlocked", EPROTO);
+    }
+
+    /* The same promotion onto a read-only target: futex_requeue() returns
+     * EFAULT before any waiter moves, so both words keep their values and the
+     * waiter stays queued until its own bound expires.  FUTEX_WAKE is not a
+     * substitute: waking a queue that holds a PI waiter is EINVAL
+     * (`kernel/futex/waitwake.c`, the `this->pi_state || this->rt_waiter`
+     * branch in `futex_wake()`), so the bound is the only exit. */
+    struct requeue_pi_case readonly;
+    memset(&readonly, 0, sizeof(readonly));
+    readonly.source = cmp_source_ro;
+    readonly.target = cmp_target_ro;
+    *cmp_source_ro = 0;
+    *cmp_target_ro = 0;
+    if (read_only_word_page(cmp_target_ro,
+                            "retry-write-fault-cmp-ro-protect") != 0) {
+        return 1;
+    }
+    if (absolute_bound(&readonly.timeout, RETRY_BOUND_NS) != 0) {
+        return fail("retry-write-fault-cmp-ro-clock", errno);
+    }
+    if (start_blocked(&readonly.blocked, requeue_pi_waiter_main, &readonly,
+                      "retry-write-fault-cmp-ro-create") != 0) {
+        return 1;
+    }
+    if (wait_until_blocked(&readonly.blocked,
+                           "retry-write-fault-cmp-ro-block") != 0) {
+        return 1;
+    }
+    raw_stage("cmp-requeue-pi-read-only");
+    if (expect_futex_errno("retry-write-fault-cmp-ro", cmp_source_ro,
+                           FUTEX_CMP_REQUEUE_PI | PRIVATE, 1,
+                           (const struct timespec *)(uintptr_t)1,
+                           cmp_target_ro, 0, EFAULT) != 0) {
+        return 1;
+    }
+    if (*cmp_source_ro != 0 || *cmp_target_ro != 0) {
+        return fail("retry-write-fault-cmp-ro-word", EPROTO);
+    }
+    if (join_blocked(&readonly.blocked, "retry-write-fault-cmp-ro-join") != 0) {
+        return 1;
+    }
+    if (readonly.wait_result != -1 || readonly.wait_errno != ETIMEDOUT) {
+        return fail("retry-write-fault-cmp-ro-waiter",
+                    readonly.wait_errno != 0 ? readonly.wait_errno : EPROTO);
+    }
+
+    if (munmap(pages, 4096 * 12) != 0) {
+        return fail("retry-write-fault-unmap", errno);
+    }
+    record("futex-abi-retry-write-fault",
+           "LOCK_PI_COW UNLOCK_PI_COW LOCK_PI_RO_EFAULT UNLOCK_PI_RO_EFAULT "
+           "WAKE_OP_COW WAKE_OP_RO_EFAULT CMP_REQUEUE_PI_COW "
+           "CMP_REQUEUE_PI_RO_EFAULT",
+           "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_RETRY_WRITE_FAULT_OK "
+           "lock_pi_cow=1 unlock_pi_cow=1 lock_pi_ro_efault=1 "
+           "unlock_pi_ro_efault=1 wake_op_cow=1 wake_op_ro_efault=1 "
+           "cmp_requeue_pi_cow=1 cmp_requeue_pi_ro_efault=1");
+    return 0;
+}
+
 /* Optional single-case selection: `futex-abi-differential <case>` runs only
  * that case.  The differential harness never passes an argument, so the
  * registered run still executes every case in order and still stops at the
@@ -1957,10 +2321,10 @@ int main(int argc, char **argv) {
         return result;
     }
     /* The coverage added with the futex fixes runs before the pre-existing
-     * PI requeue case so that neither an unrelated earlier failure nor the
-     * unbounded spin that case can trigger on a waiter-less source can mask
-     * it.  `pi-signal` is last among them: it is the one whose assertion can
-     * be blocked by a second, unrelated kernel defect. */
+     * PI requeue case so that neither an unrelated earlier failure nor a
+     * defect in that case can mask it.  `pi-signal` is last among them: it is
+     * the one whose assertion can be blocked by a second, unrelated kernel
+     * defect. */
     result = want_case("waitv-numa") ? test_waitv_numa() : 0;
     if (result != 0) {
         return result;
@@ -1978,6 +2342,14 @@ int main(int argc, char **argv) {
         return result;
     }
     result = want_case("requeue-pi") ? test_requeue_pi() : 0;
+    if (result != 0) {
+        return result;
+    }
+    /* A word whose page-table leaf is not writable is the last case: a kernel
+     * that answers that fault with a read instead of a write fault spins
+     * inside the syscall, and every marker below would be lost with it.  All
+     * earlier cases then still report their own records before this one runs. */
+    result = want_case("retry-write-fault") ? test_retry_write_fault() : 0;
     if (result != 0) {
         return result;
     }
