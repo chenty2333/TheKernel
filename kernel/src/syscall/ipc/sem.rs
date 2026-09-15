@@ -1324,10 +1324,15 @@ fn try_apply_semops(
     Ok(SemTryResult::Ready)
 }
 
-fn validate_timeout<M: UserMemory + ?Sized>(
+/// Linux `ksys_semtimedop()` copies the relative timeout into kernel memory
+/// before it calls `do_semtimedop()`, so an unreadable timeout is EFAULT even
+/// when the operation vector is out of range or absent.  The value is not
+/// interpreted here: `timespec64_valid()` runs much later, in
+/// `__do_semtimedop()`.
+fn read_timeout<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     timeout: *const timespec,
-) -> AxResult<Option<Duration>> {
+) -> AxResult<Option<timespec>> {
     if timeout.is_null() {
         return Ok(None);
     }
@@ -1335,6 +1340,15 @@ fn validate_timeout<M: UserMemory + ?Sized>(
         VmPtr::vm_read_uninit(timeout, memory)
             .map_err(map_usercopy_error)?
             .assume_init()
+    };
+    Ok(Some(timeout))
+}
+
+/// Linux `__do_semtimedop()`: `if (!timespec64_valid(timeout)) return -EINVAL;`
+/// - reached only after the operation vector has been copied in.
+fn timeout_deadline(timeout: Option<timespec>) -> AxResult<Option<Duration>> {
+    let Some(timeout) = timeout else {
+        return Ok(None);
     };
     let tv = timeout.try_into_time_value()?;
     let duration = Duration::from_nanos(tv.as_nanos().min(u64::MAX as u128) as u64);
@@ -1447,7 +1461,7 @@ pub fn sys_semop<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     semid: i32,
     sops: *const Sembuf,
-    nsops: usize,
+    nsops: u32,
 ) -> AxResult<isize> {
     sys_semtimedop(memory, semid, sops, nsops, core::ptr::null())
 }
@@ -1456,19 +1470,56 @@ pub fn sys_semtimedop<M: UserMemory + ?Sized>(
     memory: &mut UserMemoryContext<'_, M>,
     semid: i32,
     sops: *const Sembuf,
-    nsops: usize,
+    nsops: u32,
     timeout: *const timespec,
 ) -> AxResult<isize> {
-    // Linux `__do_semtimedop()`: `if (nsops < 1 || semid < 0) return -EINVAL;`
+    // Linux `ipc/sem.c` argument order.  `ksys_semtimedop()` fetches the
+    // relative timeout, `do_semtimedop()` bounds and copies the operation
+    // vector, and only `__do_semtimedop()` rejects the identifier and an
+    // invalid `timespec`:
+    //
+    // ```c
+    // 	if (timeout) {
+    // 		struct timespec64 ts;
+    // 		if (get_timespec64(&ts, timeout))
+    // 			return -EFAULT;
+    // 		return do_semtimedop(semid, tsops, nsops, &ts);
+    // 	}
+    // 	return do_semtimedop(semid, tsops, nsops, NULL);
+    //
+    // 	if (nsops > ns->sc_semopm)
+    // 		return -E2BIG;
+    // 	if (nsops < 1)
+    // 		return -EINVAL;
+    // 	if (copy_from_user(sops, tsops, nsops * sizeof(*tsops))) {
+    // 		ret =  -EFAULT;
+    // 		goto out_free;
+    // 	}
+    // 	ret = __do_semtimedop(semid, sops, nsops, timeout, ns);
+    // ```
+    //
+    // The parameter is Linux's `unsigned int nsops`, so the register is
+    // truncated to 32 bits before the bound and the copy agree on a count.
+    let raw_timeout = read_timeout(memory, timeout)?;
+
+    if nsops as usize > semopm_limit() {
+        return Err(AxError::from(LinuxError::E2BIG));
+    }
+    if nsops == 0 {
+        return Err(AxError::from(LinuxError::EINVAL));
+    }
+    let ops = vm_load(memory, sops, nsops as usize).map_err(map_usercopy_error)?;
+
+    // `__do_semtimedop()` repeats both bounds, then rejects a negative
+    // identifier.  Because the vector has already been copied, a faulting
+    // `tsops` is EFAULT even for a negative `semid`.
     if nsops == 0 || semid < 0 {
         return Err(AxError::from(LinuxError::EINVAL));
     }
-    if nsops > semopm_limit() {
+    if nsops as usize > semopm_limit() {
         return Err(AxError::from(LinuxError::E2BIG));
     }
-
-    let deadline = validate_timeout(memory, timeout)?;
-    let ops = vm_load(memory, sops, nsops).map_err(map_usercopy_error)?;
+    let deadline = timeout_deadline(raw_timeout)?;
     let current = current();
     let proc_data = &current.as_thread().proc_data;
     let ipc_ns = current.as_thread().ipc_ns();
