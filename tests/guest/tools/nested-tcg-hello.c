@@ -216,7 +216,14 @@ static void fail(const char *operation, const char *condition, const char *forma
     va_start(arguments, format);
     vfprintf(stdout, format, arguments);
     va_end(arguments);
-    fprintf(stdout, " errno=%d (%s)\n", saved, strerror(saved));
+    /* The errno tail is printed only when errno is nonzero: several conditions
+     * fail on a value the case computed (a missing marker, an exit status)
+     * rather than on a syscall, and there a stale errno from an unrelated
+     * earlier call would read as evidence it is not. */
+    if (saved != 0) {
+        fprintf(stdout, " errno=%d (%s)", saved, strerror(saved));
+    }
+    fputc('\n', stdout);
     fflush(stdout);
 }
 

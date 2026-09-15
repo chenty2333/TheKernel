@@ -187,7 +187,14 @@ static void fail(const char *operation, const char *condition, const char *forma
     va_start(arguments, format);
     vfprintf(stdout, format, arguments);
     va_end(arguments);
-    fprintf(stdout, " errno=%d (%s)\n", saved, strerror(saved));
+    /* The errno tail is printed only when errno is nonzero: several conditions
+     * fail on a value the case computed (a missing marker, an exit status)
+     * rather than on a syscall, and there a stale errno from an unrelated
+     * earlier call would read as evidence it is not. */
+    if (saved != 0) {
+        fprintf(stdout, " errno=%d (%s)", saved, strerror(saved));
+    }
+    fputc('\n', stdout);
     fflush(stdout);
 }
 static int read_exact_at(int fd, uint64_t offset, void *buffer, size_t bytes)
@@ -318,9 +325,17 @@ static void child_reap(struct child *child)
         return;
     }
     /* The emulator owns a process group: kill the group, not just the leader,
-     * so no helper thread process survives into the next case. */
-    kill(-child->pid, SIGKILL);
-    for (attempts = 0; attempts < 100; attempts++) {
+     * so no helper thread process survives into the next case.  If the group
+     * does not exist (setpgid failed in both parent and child) the group kill
+     * is ESRCH, so the child itself is killed directly or the wait below
+     * would hang past the point the kill was meant to enforce. */
+    if (kill(-child->pid, SIGKILL) != 0) {
+        kill(child->pid, SIGKILL);
+    }
+    /* SIGKILL guarantees the exit, but a load-starved TCG emulator can take
+     * far longer than 100 ms to actually die; giving up early leaves a zombie
+     * behind and closes the serial pipe out from under a live process. */
+    for (attempts = 0; attempts < 5000; attempts++) {
         pid_t done = waitpid(child->pid, &status, WNOHANG);
 
         if (done == child->pid || (done < 0 && errno == ECHILD)) {
@@ -450,10 +465,19 @@ static int run_emulator(struct child *child, const char *qemu, const char *kerne
             return 1;
         }
 
-        descriptor.fd = child->fd;
-        descriptor.events = drained ? 0 : POLLIN;
-        descriptor.revents = 0;
-        ready = poll(&descriptor, 1, POLL_SLICE_MS);
+        /* Once the pipe has been drained it sits at POLLHUP, which poll
+         * reports regardless of the requested events: polling the descriptor
+         * anyway would return at once and spin at 100% CPU until the emulator
+         * exits.  With nothing left to read, poll on no descriptors purely
+         * for the bounded slice. */
+        if (drained) {
+            ready = poll(NULL, 0, POLL_SLICE_MS);
+        } else {
+            descriptor.fd = child->fd;
+            descriptor.events = POLLIN;
+            descriptor.revents = 0;
+            ready = poll(&descriptor, 1, POLL_SLICE_MS);
+        }
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
@@ -492,13 +516,27 @@ static int run_emulator(struct child *child, const char *qemu, const char *kerne
 
             if (done == child->pid) {
                 /* Drain whatever is still buffered, bounded by the deadline
-                 * re-checked on every iteration. */
+                 * re-checked on every iteration.  The read must not block on
+                 * its own: a grandchild that inherited the write end would
+                 * otherwise keep this loop here long after the deadline. */
                 for (;;) {
                     char chunk[1024];
                     ssize_t bytes;
+                    struct pollfd drain_fd;
+                    int drain_ready;
 
                     now = monotonic_ms();
                     if (now < 0 || now >= deadline) {
+                        break;
+                    }
+                    drain_fd.fd = child->fd;
+                    drain_fd.events = POLLIN;
+                    drain_fd.revents = 0;
+                    drain_ready = poll(&drain_fd, 1, (int)(deadline - now));
+                    if (drain_ready < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    if (drain_ready <= 0) {
                         break;
                     }
                     bytes = read(child->fd, chunk, sizeof(chunk));
