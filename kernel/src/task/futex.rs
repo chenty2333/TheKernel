@@ -336,14 +336,20 @@ pub enum PiUnlockOutcome {
 /// `futex_requeue()` (`kernel/futex/requeue.c:495-903`) distinguishes the case
 /// where the source queue holds no waiter to promote from the case where the
 /// publication raced against userspace, and from a source queue whose waiters
-/// publication raced against userspace: the first ends the syscall with the
-/// waiter count it managed to move, and only the second loops back to `retry`.
+/// are not `FUTEX_WAIT_REQUEUE_PI` waiters: the first ends the syscall with the
+/// waiter count it managed to move, only the second loops back to `retry`, and
+/// the third is `-EINVAL`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PiRequeueOutcome {
     /// The source queue has no live PI waiter, so there is nothing to promote
     /// and nothing to move. `futex_requeue()` skips the chain walk and returns
     /// its `task_count`, which is 0.
     NoWaiters,
+    /// The first live waiter of the source queue is not a
+    /// `FUTEX_WAIT_REQUEUE_PI` waiter, which `futex_requeue()` refuses with
+    /// `-EINVAL` before it touches the target
+    /// (`kernel/futex/requeue.c:314-315`).
+    Invalid,
     /// The publication lost the race against userspace; retry the operation.
     Retry,
     /// The top waiter was woken and `moved` further waiters were requeued.
@@ -717,6 +723,35 @@ impl WaiterQueue {
         !waiter.cancelled && (waiter.bitset & mask) != 0 && waiter.is_pi()
     }
 
+    /// Whether the first live waiter of this queue is *not* a
+    /// `FUTEX_WAIT_REQUEUE_PI` waiter.
+    ///
+    /// `futex_proxy_trylock_atomic()` promotes `futex_top_waiter()`, Linux's
+    /// priority-ordered `plist` head, and refuses the whole operation with
+    /// `-EINVAL` when that waiter has no `rt_waiter`
+    /// (`kernel/futex/requeue.c:305-316`). This queue keeps FIFO order and
+    /// records no priority for plain waiters, so its head stands in for the
+    /// plist head; a plain waiter queued behind a PI waiter is caught by the
+    /// scan instead (`kernel/futex/requeue.c:605-610`).
+    fn front_is_plain(&self) -> bool {
+        let mut cursor = self.head;
+        let mut seen = 0;
+        while let Some(ptr) = cursor {
+            if seen >= self.len {
+                break;
+            }
+            seen += 1;
+            // SAFETY: the queue owns a strong reference for every linked
+            // pointer and the queue lock is held for the whole walk.
+            let node = unsafe { ptr.as_ref() };
+            let waiter = node.lock();
+            cursor = waiter.next;
+            if !waiter.cancelled {
+                return !waiter.is_pi();
+            }
+        }
+        false
+    }
 }
 
 impl Drop for WaiterQueue {
@@ -1579,8 +1614,9 @@ impl WaitQueue {
     ///
     /// The outcomes mirror the ways `futex_requeue()` can leave its `retry`
     /// loop: `NoWaiters` when `futex_proxy_trylock_atomic()` found nothing to
-    /// promote, `Retry` after a lost publication race, and `Done` for the
-    /// completed move.
+    /// promote, `Invalid` when the queue's waiters are not
+    /// `FUTEX_WAIT_REQUEUE_PI` waiters, `Retry` after a lost publication race,
+    /// and `Done` for the completed move.
     pub fn pi_requeue<P>(
         &self,
         target: &WaitQueue,
@@ -1606,6 +1642,14 @@ impl WaitQueue {
         let result = Self::with_two_gates(self, target, || {
             let mut src = self.queue.lock();
             let mut dst = target.queue.lock();
+            // `futex_proxy_trylock_atomic()` inspects `futex_top_waiter()`
+            // first and refuses the operation when that waiter is not a
+            // `FUTEX_WAIT_REQUEUE_PI` waiter
+            // (`kernel/futex/requeue.c:305-316`), so a queue whose head is a
+            // plain waiter never reaches the promotion below.
+            if src.front_is_plain() {
+                return PiRequeueOutcome::Invalid;
+            }
             let Some((top, pi)) = Self::pi_top_locked(&src) else {
                 return PiRequeueOutcome::NoWaiters;
             };
@@ -1660,6 +1704,13 @@ impl WaitQueue {
                     drop(entry);
                     src.push_back(waiter);
                     break;
+                }
+                if !entry.pi.is_some() {
+                    // `(requeue_pi && !this->rt_waiter) || ... -> -EINVAL`
+                    // (`kernel/futex/requeue.c:605-610`).
+                    drop(entry);
+                    src.push_back(waiter);
+                    return PiRequeueOutcome::Invalid;
                 }
                 entry.owner = target_owner.clone();
                 // Linux `futex_requeue_pi_complete(this, 0)`: the waiter is

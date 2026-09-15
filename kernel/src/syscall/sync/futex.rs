@@ -1685,6 +1685,13 @@ fn do_futex_cmp_requeue_pi(
                 }
                 return Ok(0);
             }
+            PiRequeueOutcome::Invalid => {
+                // `futex_requeue()` refuses a source queue whose waiters are
+                // not `FUTEX_WAIT_REQUEUE_PI` waiters before it publishes
+                // anything to the target, so the caller sees `-EINVAL` and no
+                // waiter moves (`kernel/futex/requeue.c:305-316`, `605-610`).
+                return Err(AxError::InvalidInput);
+            }
             PiRequeueOutcome::Retry => {
                 if let Some(error) = failure {
                     return Err(error);

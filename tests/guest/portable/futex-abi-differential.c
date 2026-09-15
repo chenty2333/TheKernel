@@ -1554,6 +1554,66 @@ static int test_requeue_pi_held(void) {
     return 0;
 }
 
+/* A source queue holding a waiter that is *not* a FUTEX_WAIT_REQUEUE_PI
+ * waiter is refused with -EINVAL before the target is touched:
+ * futex_proxy_trylock_atomic() tests `!top_waiter->rt_waiter`
+ * (kernel/futex/requeue.c:314-315) and the chain walk repeats it
+ * (kernel/futex/requeue.c:605-610). */
+static int test_requeue_pi_plain(void) {
+    uint32_t source = 0;
+    uint32_t target = 0;
+    struct futex_waiter plain;
+    struct timespec timeout = relative_bound(WAIT_BOUND_NS);
+
+    if (start_futex_waiter(&plain, &source, FUTEX_WAIT | PRIVATE, 0, &timeout,
+                           NULL, 0, "requeue-pi-plain-create") != 0) {
+        return 1;
+    }
+    if (wait_until_blocked(&plain.blocked, "requeue-pi-plain-block") != 0) {
+        return 1;
+    }
+
+    errno = 0;
+    long refused = sys_futex(&source, FUTEX_CMP_REQUEUE_PI | PRIVATE, 1,
+                             (const struct timespec *)(uintptr_t)1, &target, 0);
+    int saved = errno;
+    printf("THEKERNEL_FUTEX_ABI_DIFFERENTIAL_REQUEUE_PI_PLAIN_RAW rc=%ld "
+           "errno=%d target=%#x source=%#x\n",
+           refused, saved, target, source);
+    fflush(stdout);
+    if (refused != -1 || saved != EINVAL) {
+        /* Leave nothing blocked behind before reporting: the plain waiter is
+         * woken either way by the plain wake below. */
+        (void)sys_futex(&source, FUTEX_WAKE | PRIVATE, 1, NULL, NULL, 0);
+        return fail("requeue-pi-plain-refusal",
+                    refused == -1 ? (saved != EINVAL ? saved : EPROTO) : EPROTO);
+    }
+    if (target != 0) {
+        return fail("requeue-pi-plain-target", EPROTO);
+    }
+
+    errno = 0;
+    long woken = sys_futex(&source, FUTEX_WAKE | PRIVATE, 1, NULL, NULL, 0);
+    int wake_errno = errno;
+    if (woken != 1) {
+        return fail("requeue-pi-plain-wake",
+                    woken == -1 ? wake_errno : EPROTO);
+    }
+    if (await_blocked(&plain.blocked, "requeue-pi-plain-join") != 0) {
+        return 1;
+    }
+    if (plain.result != 0) {
+        return fail("requeue-pi-plain-waiter",
+                    plain.result == -1 ? plain.result_errno : EPROTO);
+    }
+
+    record("futex-abi-requeue-pi-plain",
+           "PLAIN_SOURCE_EINVAL TARGET_UNTOUCHED WAKE_RC WAITER_RC",
+           "THEKERNEL_FUTEX_ABI_DIFFERENTIAL_REQUEUE_PI_PLAIN_OK refused=1 "
+           "target_untouched=1 wake_rc=1 waiter_rc=0");
+    return 0;
+}
+
 static int test_requeue_pi(void) {
     uint32_t source = 0;
     uint32_t target = 0;
@@ -2662,6 +2722,10 @@ int main(int argc, char **argv) {
         return result;
     }
     result = want_case("requeue-pi-held") ? test_requeue_pi_held() : 0;
+    if (result != 0) {
+        return result;
+    }
+    result = want_case("requeue-pi-plain") ? test_requeue_pi_plain() : 0;
     if (result != 0) {
         return result;
     }
